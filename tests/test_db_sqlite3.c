@@ -2738,6 +2738,128 @@ static void test_audit_actor(void) {
     sqlite3_close(db);
 }
 
+/* ---------------------------------------------------------------- signer-wait (0.6.0 item C) */
+
+/* a driver that has scan_metadata_in (PostgreSQL has it; SQLite3 does not): the batch branch of zones_are_signers() */
+static int sw_meta_in(db_conn_t *c, const int64_t *ids, size_t n, db_meta_cb cb, void *ud) {
+    for (size_t i = 0; i < n; i++) {
+        int rc = db_driver_sqlite3.scan_metadata(c, &ids[i], cb, ud);
+        if (rc != 0) return rc;
+    }
+    return 0;
+}
+static int sw_meta_fail(db_conn_t *c, const int64_t *id, db_meta_cb cb, void *ud) {
+    (void)c;
+    (void)id;
+    (void)cb;
+    (void)ud;
+    return -1;
+}
+static int sw_meta_in_fail(db_conn_t *c, const int64_t *ids, size_t n, db_meta_cb cb, void *ud) {
+    (void)c;
+    (void)ids;
+    (void)n;
+    (void)cb;
+    (void)ud;
+    return -1;
+}
+
+static bool sw_has_names(const vstate_t *vs, const char *expect) {      /* the set is exactly these names (comma separated), in id order */
+    char got[200] = "";
+    for (size_t i = 0; i < vs->nsigw; i++) snprintf(got + strlen(got), sizeof(got) - strlen(got), "%s%s", i ? "," : "", vs->sigw[i].name);
+    if (strcmp(got, expect) != 0) printf("    set is '%s', wanted '%s'\n", got, expect);
+    return strcmp(got, expect) == 0;
+}
+
+static void test_signer_wait(void) {
+    printf("signer-wait (item C): which zones are the signer's, and the set of the zones that wait\n");
+    char path[600], err[DB_ERRLEN];
+    sqlite3 *db = make_db("sigw.db", path, sizeof(path));
+    if (!db) return;
+    add_simple_zone(db, 1, 10, "a.test");
+    add_simple_zone(db, 2, 20, "b.test");
+    add_simple_zone(db, 3, 30, "c.test");
+    add_simple_zone(db, 4, 40, "d.test");
+    add_simple_zone(db, 5, 50, "e.test");
+    sqlf(db, "INSERT INTO domainmetadata (domain_id, kind, content) VALUES (1, 'X-KARIDNS-SIGNER', '1'), (2, 'x-karidns-signer', ' 1 '), (3, 'X-KARIDNS-SIGNER', '0'), "
+             "(4, 'X-KARIDNS-SIGNER', '1'), (4, 'X-KARIDNS-SIGNER', '1'), (5, 'X-KARIDNS-SIGNER', '11'), (2, 'PRESIGNED', '1')");
+    sqlite3_close(db);
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL);
+    if (!c) return;
+    zinfo_t zs[5];
+    memset(zs, 0, sizeof(zs));
+    static const char *const nm[5] = { "a.test.", "b.test.", "c.test.", "d.test.", "e.test." };
+    for (int i = 0; i < 5; i++) {
+        zs[i].id = i + 1;
+        zs[i].name = (char *)nm[i];
+    }
+    ctx_t x;
+    memset(&x, 0, sizeof(x));
+    x.drv = &db_driver_sqlite3;
+    x.conn = c;
+    x.zones = zs;
+    x.nz = 5;
+    int64_t all[5] = { 0, 1, 2, 3, 4 }, one[1] = { 2 };
+    bool yes[5];
+    CHECK(db_driver_sqlite3.begin_snapshot(c) == 0);
+    zones_are_signers(&x, all, 5, yes);                                  /* per zone: SQLite3 has no scan_metadata_in */
+    CHECK_MSG(yes[0] && yes[1] && !yes[2] && yes[3] && !yes[4], "%d %d %d %d %d", yes[0], yes[1], yes[2], yes[3], yes[4]);       /* kind without regard to case, blanks around the 1, exactly 1 */
+    zones_are_signers(&x, one, 1, yes);
+    CHECK(!yes[0]);
+    db_driver_t d2 = db_driver_sqlite3;
+    d2.scan_metadata_in = sw_meta_in;                                    /* the batch branch */
+    x.drv = &d2;
+    zones_are_signers(&x, all, 5, yes);
+    CHECK(yes[0] && yes[1] && !yes[2] && yes[3] && !yes[4]);
+    d2.scan_metadata_in = sw_meta_in_fail;                               /* a failed read: no zone is taken for the signer's (it is read, and its errors are reported as always) */
+    zones_are_signers(&x, all, 5, yes);
+    CHECK(!yes[0] && !yes[1] && !yes[2] && !yes[3] && !yes[4]);
+    d2.scan_metadata_in = NULL;
+    d2.scan_metadata = sw_meta_fail;
+    zones_are_signers(&x, all, 5, yes);
+    CHECK(!yes[0] && !yes[1] && !yes[3]);
+    x.drv = &db_driver_sqlite3;
+    CHECK(db_driver_sqlite3.end_snapshot(c) == 0);
+    db_driver_sqlite3.close(c);
+
+    /* the set of the zones that wait: a plan of the whole list, a plan of one zone */
+    struct lio *io = calloc(1, sizeof(*io));
+    vstate_t vs;
+    memset(&vs, 0, sizeof(vs));
+    int64_t skip[3];
+    CHECK(sigw_update(io, &vs, &x, false, NULL, 0) == 0 && vs.nsigw == 0 && !io->status_dirty);                       /* nothing to do */
+    skip[0] = 0;
+    skip[1] = 1;
+    CHECK(sigw_update(io, &vs, &x, false, skip, 2) == 0 && io->status_dirty && sw_has_names(&vs, "a.test.,b.test."));  /* the zones skipped in this plan */
+    CHECK(sigw_has(&vs, 1) && sigw_has(&vs, 2) && !sigw_has(&vs, 3) && !sigw_has(&vs, 0));
+    io->status_dirty = false;
+    CHECK(sigw_update(io, &vs, &x, false, skip, 2) == 0 && !io->status_dirty && sw_has_names(&vs, "a.test.,b.test."));    /* the same again: nothing changed */
+    zs[0].want = false;                                                  /* a plan of the whole list that reads b.test and does not read a.test: a.test still waits, b.test is read now */
+    zs[1].want = true;
+    CHECK(sigw_update(io, &vs, &x, false, NULL, 0) == 0 && io->status_dirty && sw_has_names(&vs, "a.test."));
+    io->status_dirty = false;
+    skip[0] = 3;
+    CHECK(sigw_update(io, &vs, &x, false, skip, 1) == 0 && io->status_dirty && sw_has_names(&vs, "a.test.,d.test."));     /* a new one in the middle of the order */
+    skip[0] = 2;
+    io->status_dirty = false;
+    CHECK(sigw_update(io, &vs, &x, true, skip, 1) == 0 && io->status_dirty && sw_has_names(&vs, "a.test.,c.test.,d.test."));   /* a plan of one zone keeps the others */
+    zs[0].want = true;                                                   /* ... but a one-zone plan that reads a zone drops it */
+    io->status_dirty = false;
+    CHECK(sigw_update(io, &vs, &x, true, NULL, 0) == 0 && io->status_dirty && sw_has_names(&vs, "c.test.,d.test."));
+    x.nz = 3;                                                            /* d.test is no longer listed: a whole-list plan forgets it, a one-zone plan does not */
+    io->status_dirty = false;
+    CHECK(sigw_update(io, &vs, &x, true, NULL, 0) == 0 && !io->status_dirty && sw_has_names(&vs, "c.test.,d.test."));
+    CHECK(sigw_update(io, &vs, &x, false, NULL, 0) == 0 && io->status_dirty && sw_has_names(&vs, "c.test."));
+    x.nz = 5;
+    zs[3].name = NULL;                                                   /* a zone without a name still gets an entry */
+    skip[0] = 3;
+    CHECK(sigw_update(io, &vs, &x, false, skip, 1) == 0 && sw_has_names(&vs, "c.test.,?"));
+    sigw_free(&vs);
+    CHECK(vs.nsigw == 0 && vs.sigw == NULL);
+    free(io);
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/db";
     snprintf(g_schema, sizeof(g_schema), "%s/pdns_schema.sqlite3.sql", dir);
@@ -2775,6 +2897,7 @@ int main(int argc, char **argv) {
     test_requests_batch();
     test_server_id();
     test_status_entry();
+    test_signer_wait();
     test_hot_part();
     test_check_mode();
     test_scan_failures();

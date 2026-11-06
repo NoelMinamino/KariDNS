@@ -164,13 +164,30 @@ static int zx_cb_zone(void *ud, const db_zone_row_t *r) {
     return 0;
 }
 
-/* the rows of the zone into the reader; a bad row stops the scan (the reader keeps the reason) */
-static int zx_cb_rec(void *ud, int64_t did, const db_record_row_t *r) {
-    (void)did;
-    return pdns_zone_add_record(ud, r) != 0;
+/* the rows of the zone into the reader; a bad row stops the scan (the reader keeps the reason).  plain: the DNSSEC records (and metadata) a signer
+ * owns are left out, so the zone is read as the unsigned zone it holds (ZX_PLAIN_*) */
+typedef struct { pdns_zone_t *z; unsigned plain; } zx_feed_t;
+
+static bool zx_skip_type(unsigned plain, const char *t) {
+    if (!plain || !t) return false;
+    static const char *const dnssec[] = { "RRSIG", "NSEC", "NSEC3", "NSEC3PARAM", "DNSKEY" };
+    for (size_t i = 0; i < sizeof(dnssec) / sizeof(dnssec[0]); i++)
+        if (strcasecmp(t, dnssec[i]) == 0) return true;
+    return (plain & ZX_PLAIN_CDS) && (strcasecmp(t, "CDS") == 0 || strcasecmp(t, "CDNSKEY") == 0);
 }
 
-static int zx_cb_meta(void *ud, const db_meta_row_t *m) { return pdns_zone_add_meta(ud, m) != 0; }
+static int zx_cb_rec(void *ud, int64_t did, const db_record_row_t *r) {
+    (void)did;
+    zx_feed_t *f = ud;
+    if (zx_skip_type(f->plain, r->type)) return 0;
+    return pdns_zone_add_record(f->z, r) != 0;
+}
+
+static int zx_cb_meta(void *ud, const db_meta_row_t *m) {
+    zx_feed_t *f = ud;
+    if (f->plain && m->kind && (strcasecmp(m->kind, "PRESIGNED") == 0 || strcasecmp(m->kind, "NSEC3PARAM") == 0)) return 0;
+    return pdns_zone_add_meta(f->z, m) != 0;
+}
 static int zx_cb_tags(void *ud, int64_t did, const db_tag_row_t *r) {
     (void)did;
     return pdns_zone_add_tags(ud, r) != 0;
@@ -191,15 +208,17 @@ static int zx_cb_key(void *ud, int64_t did) {
     return 0;
 }
 
-int zx_read_zone(const db_driver_t *d, db_conn_t *c, bool has_ext, const char *name, int64_t id, const pdns_opts_t *opts, pdns_zone_t **out, bool *has_keys) {
+int zx_read_zone_ex(const db_driver_t *d, db_conn_t *c, bool has_ext, const char *name, int64_t id, const pdns_opts_t *opts, unsigned plain, pdns_zone_t **out,
+                    bool *has_keys) {
     pdns_opts_t zero;
     memset(&zero, 0, sizeof(zero));
     *out = NULL;
     pdns_zone_t *z = pdns_zone_new(name, opts ? opts : &zero);
     if (!z) return ZX_READ_OOM;
+    zx_feed_t feed = { z, plain };
     int rc = 0;
-    if (!z->failed) rc = d->scan_records(c, &id, zx_cb_rec, z);
-    if (rc == 0 && !z->failed) rc = d->scan_metadata(c, &id, zx_cb_meta, z);
+    if (!z->failed) rc = d->scan_records(c, &id, zx_cb_rec, &feed);
+    if (rc == 0 && !z->failed) rc = d->scan_metadata(c, &id, zx_cb_meta, &feed);
     if (rc == 0 && !z->failed && has_ext) {
         db_ext_sink_t sk = { zx_cb_tags, zx_cb_tdns, zx_cb_defs, z };
         rc = d->scan_ext(c, &id, &sk);
@@ -214,6 +233,10 @@ int zx_read_zone(const db_driver_t *d, db_conn_t *c, bool has_ext, const char *n
     *out = z;
     if (z->failed || pdns_zone_finish(z) != 0) return ZX_READ_ZONE;
     return ZX_READ_OK;
+}
+
+int zx_read_zone(const db_driver_t *d, db_conn_t *c, bool has_ext, const char *name, int64_t id, const pdns_opts_t *opts, pdns_zone_t **out, bool *has_keys) {
+    return zx_read_zone_ex(d, c, has_ext, name, id, opts, 0, out, has_keys);
 }
 
 int zx_export_zone(zx_t *x, const char *zone, const char *view, const dzt_opts_t *fmt, dzt_sink_t sink, void *ud) {

@@ -55,13 +55,13 @@ struct db_conn {
     bool has_ext;
     bool writable;              /* M2: opened with open_write() (no PRAGMA query_only) */
     bool in_wtxn;               /* M2: w_begin() is open (in_snapshot is set too, so the reads of the zone work inside it) */
-    sqlite3_stmt *st_w[8];      /* M2: the statements of the write functions that run once per row (W_* below) */
+    sqlite3_stmt *st_w[9];      /* M2: the statements of the write functions that run once per row (W_* below) */
     const char *audit_actor;    /* w_set_audit(): the db_role of the actor row (borrowed: it outlives the connection); NULL = no actor row */
     bool actor_set;             /* the row of karidns_audit_actor was written in the open write transaction (w_commit deletes it) */
 };
 
 /* M2: the statements kept for the per-row write functions */
-enum { W_INS_REC, W_INS_TAGS, W_INS_TD, W_DEL_TAGS_ID, W_DEL_TD_ID, W_DEL_REC_ID, W_INS_TAGDEF, W_INS_META };
+enum { W_INS_REC, W_INS_TAGS, W_INS_TD, W_DEL_TAGS_ID, W_DEL_TD_ID, W_DEL_REC_ID, W_INS_TAGDEF, W_INS_META, W_UPD_REC };
 
 /* ------------------------------------------------------------------------------------------------------------- */
 /* errors                                                                                                         */
@@ -1348,6 +1348,123 @@ static int sq_w_zone_has_keys(db_conn_t *c, int64_t domain_id, bool *has) {
     return ret;
 }
 
+/* ---- item C, the signer (dns_db_driver.h): the authoritative flags, one record's ordername / auth / content, the id of the write ---- */
+static int sq_w_scan_auth(db_conn_t *c, int64_t domain_id, db_auth_cb cb, void *ud) {
+    int ret = wcheck(c, "w_scan_auth");
+    if (ret != 0) return ret;
+    sqlite3_stmt *st = NULL;
+    if ((ret = prep(c, &st, "SELECT id, auth FROM records WHERE domain_id = ?1 ORDER BY id")) != 0) return ret;
+    sqlite3_bind_int64(st, 1, domain_id);
+    for (;;) {
+        int rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE) break;
+        if (rc != SQLITE_ROW) {
+            ret = sql_fail(c, rc, "w_scan_auth");
+            break;
+        }
+        if (cb(ud, sqlite3_column_int64(st, 0), sqlite3_column_type(st, 1) == SQLITE_NULL || sqlite3_column_int64(st, 1) != 0) != 0) {
+            ret = DB_STOPPED;
+            break;
+        }
+    }
+    sqlite3_finalize(st);
+    return ret;
+}
+
+static int sq_w_update_record(db_conn_t *c, int64_t domain_id, int64_t id, const char *content, const char *ordername, bool auth) {
+    int ret = wcheck(c, "w_update_record");
+    if (ret != 0) return ret;
+    if ((ret = prep(c, &c->st_w[W_UPD_REC], "UPDATE records SET content = coalesce(?3, content), ordername = ?4, auth = ?5 WHERE id = ?1 AND domain_id = ?2")) != 0) return ret;
+    sqlite3_stmt *st = c->st_w[W_UPD_REC];
+    sqlite3_bind_int64(st, 1, id);
+    sqlite3_bind_int64(st, 2, domain_id);
+    bind_txt(st, 3, content);
+    bind_txt(st, 4, ordername);
+    sqlite3_bind_int(st, 5, auth ? 1 : 0);
+    ret = wstep(c, st, "w_update_record");
+    if (ret == 0 && sqlite3_changes(c->db) != 1) {
+        set_err(c, "w_update_record: record %lld is not in zone %lld", (long long)id, (long long)domain_id);
+        ret = DB_ERR_CONFLICT;
+    }
+    return ret;
+}
+
+static int sq_w_update_orders(db_conn_t *c, int64_t domain_id, const db_order_t *v, size_t n) {
+    int ret = wcheck(c, "w_update_orders");
+    for (size_t i = 0; i < n && ret == 0; i++) ret = sq_w_update_record(c, domain_id, v[i].id, NULL, v[i].ordername, v[i].auth);
+    return ret;
+}
+
+static int sq_w_insert_dnssec(db_conn_t *c, int64_t domain_id, const db_ins_t *v, size_t n) {
+    int ret = wcheck(c, "w_insert_dnssec");
+    for (size_t i = 0; i < n && ret == 0; i++) {
+        int64_t id;
+        ret = sq_w_insert_record(c, domain_id, v[i].row, v[i].auth, &id);
+    }
+    return ret;
+}
+
+static int sq_w_set_snapshot(db_conn_t *c, bool on) {
+    (void)on;                           /* BEGIN IMMEDIATE: one writer, nothing changes under it */
+    if (!c->writable || c->in_wtxn) {
+        set_err(c, "w_set_snapshot: needs a writable connection outside a transaction");
+        return -1;
+    }
+    return 0;
+}
+
+static int sq_w_delete_dnssec(db_conn_t *c, int64_t domain_id, const int64_t *ids, size_t n) {
+    int ret = wcheck(c, "w_delete_dnssec");
+    if (ret != 0) return ret;
+    if ((ret = prep(c, &c->st_w[W_DEL_REC_ID], "DELETE FROM records WHERE id = ?1 AND domain_id = ?2")) != 0) return ret;
+    for (size_t i = 0; i < n && ret == 0; i++) {
+        sqlite3_stmt *st = c->st_w[W_DEL_REC_ID];
+        sqlite3_bind_int64(st, 1, ids[i]);
+        sqlite3_bind_int64(st, 2, domain_id);
+        ret = wstep(c, st, "w_delete_dnssec");
+    }
+    return ret;
+}
+
+/* the highest seq of karidns_changes (0: none, or no such table) */
+static int change_max(db_conn_t *c, uint64_t *seq) {
+    *seq = 0;
+    if (!c->has_changes) return 0;
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(c->db, "SELECT coalesce(max(seq), 0) FROM karidns_changes", -1, &st, NULL);
+    if (rc != SQLITE_OK) return sql_fail(c, rc, "prepare");
+    int ret = 0;
+    rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) *seq = (uint64_t)sqlite3_column_int64(st, 0);
+    else ret = sql_fail(c, rc, "w_mark");
+    sqlite3_finalize(st);
+    return ret;
+}
+
+static int sq_w_mark(db_conn_t *c, uint64_t *mark) {
+    int ret = wcheck(c, "w_mark");
+    return ret != 0 ? ret : change_max(c, mark);
+}
+
+static int sq_w_write_id(db_conn_t *c, uint64_t mark, db_write_id_t *id) {
+    memset(id, 0, sizeof(*id));
+    int ret = wcheck(c, "w_write_id");
+    if (ret != 0 || !c->has_changes) return ret;
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(c->db, "SELECT coalesce(min(seq), 0), coalesce(max(seq), 0) FROM karidns_changes WHERE seq > ?1", -1, &st, NULL);
+    if (rc != SQLITE_OK) return sql_fail(c, rc, "prepare");
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)mark);
+    rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) {
+        id->seq_first = (uint64_t)sqlite3_column_int64(st, 0);
+        id->seq_last = (uint64_t)sqlite3_column_int64(st, 1);
+    } else {
+        ret = sql_fail(c, rc, "w_write_id");
+    }
+    sqlite3_finalize(st);
+    return ret;
+}
+
 const db_driver_t db_driver_sqlite3 = {
     "sqlite3",       sq_open,         sq_close,           sq_errmsg,           sq_check_schema,
     sq_begin_snapshot, sq_end_snapshot, sq_list_zones,    sq_scan_records,     sq_scan_metadata,
@@ -1364,6 +1481,8 @@ const db_driver_t db_driver_sqlite3 = {
     sq_w_insert_tinydns, sq_w_delete_tagdefs, sq_w_insert_tagdef, sq_w_delete_meta, sq_w_insert_meta, sq_w_set_view, sq_w_request_reload,
     sq_w_zone_has_keys,
     sq_w_set_audit,     /* schema version 3 */
+    sq_w_scan_auth, sq_w_update_record, sq_w_mark, sq_w_write_id, sq_w_delete_dnssec,       /* item C, the signer */
+    sq_w_update_orders, sq_w_insert_dnssec, sq_w_set_snapshot,
 };
 
 #endif /* KARIDNS_DB_SQLITE3 */

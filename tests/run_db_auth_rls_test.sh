@@ -15,6 +15,10 @@
 #   - the signer role: what it reads (the keys too) and the writes it may and may not do, also with karidns.principal set (RESTRICTIVE policies), the
 #     trigger that lets it change the serial of an SOA only; the role scripts refusing a role RLS would not bind; the maintenance triggers running as the owner
 #     (no right on karidns_changes, reload requests pruned, the change log filled); TYPEnn aliases; INSERT ... ON CONFLICT; trailing-dot domains;
+#   - item C (the signer): the signer reads the change log and adds keys but changes none; the key requests (filed by a global master or the domain master of the
+#     zone as themselves, answered by the signer, unchangeable by the API) and the signer state (read by any grant on the zone, written by the signer); the columns of
+#     a record (a trigger lets the signer change ordername and auth of any record, a DNSSEC record in any column, the SOA's serial); karidns-zone import --signer as
+#     the signer role with RLS on (a second database): signed, re-signed, a stale file = exit status 3, an ordinary import refused;
 #   - credentials unreadable for the loader, writer and signer roles; the loader and karidns-zone (writer role) read and write everything with RLS on, in both
 #     script orders; a role that is not trusted sees nothing; one real dump with karidns-dbloader as the loader role and one import with karidns-zone.
 # SKIP (exit 0, with the reason) when PostgreSQL is not reachable, the role may not create roles, or the user is not a superuser (the sessions are SET ROLE ... and
@@ -52,8 +56,8 @@ fi
 psql -X -q -d "$PGMAINT" -c "DROP ROLE kt_probe_$$" > /dev/null 2>&1
 [ "$(psql -X -q -At -d "$PGMAINT" -c "SELECT count(*) FROM pg_roles WHERE rolname = 'karidns_rls_trusted'")" = "0" ] && TRUSTED_NEW=1
 
-API=kt_api_$$; SIG=kt_sig_$$; APIM=kt_apim_$$; BARE=kt_bare_$$; LD2=kt_ld2_$$; WR2=kt_wr2_$$; LD1=kt_ld1_$$; WR1=kt_wr1_$$; LGN=kt_lgn_$$; OTH=kt_oth_$$
-ROLES="$API $SIG $APIM $BARE $LD2 $WR2 $LD1 $WR1 $LGN $OTH"
+API=kt_api_$$; SIG=kt_sig_$$; APIM=kt_apim_$$; BARE=kt_bare_$$; LD2=kt_ld2_$$; WR2=kt_wr2_$$; LD1=kt_ld1_$$; WR1=kt_wr1_$$; LGN=kt_lgn_$$; OTH=kt_oth_$$; SG1=kt_sg1_$$
+ROLES="$API $SIG $APIM $BARE $LD2 $WR2 $LD1 $WR1 $LGN $OTH $SG1"
 HASH_A='$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHQ$aGFzaGhhc2g'
 O=$T/o.out; E=$T/o.err
 
@@ -173,12 +177,12 @@ echo "-- the role scripts"
 if rs karidns_api_role.pgsql.sql $API public; then pass "db/karidns_api_role.pgsql.sql applies (the role is created)"; else fail "the API role script"; head -5 "$T/rs.err"; fi
 if rs karidns_api_role.pgsql.sql $API public; then pass "...and can be applied again"; else fail "second application of the API role script"; head -5 "$T/rs.err"; fi
 if rs karidns_signer_role.pgsql.sql $SIG public && rs karidns_signer_role.pgsql.sql $SIG public; then pass "db/karidns_signer_role.pgsql.sql applies, twice"; else fail "the signer role script"; head -5 "$T/rs.err"; fi
-oeq "the policies exist: 31 for the API on the schema's tables, 21 on karidns_auth, 1 for the trusted role on each of the 15 tables, 22 for the signer (3 + 3 permissive and restrictive on records and domainmetadata, 9 SELECT, 1 INSERT)" \
-    "31 21 15 22" "SELECT (SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE c.relnamespace = 'public'::regnamespace AND p.polname LIKE 'karidns\_rls\_%' AND p.polname <> 'karidns_rls_trusted' AND p.polroles = '{0}')::text || ' ' || (SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE c.relnamespace = 'karidns_auth'::regnamespace AND p.polname LIKE 'karidns\_rls\_%' AND p.polname <> 'karidns_rls_trusted' AND p.polroles = '{0}')::text || ' ' || (SELECT count(*) FROM pg_policy WHERE polname = 'karidns_rls_trusted')::text || ' ' || (SELECT count(*) FROM pg_policy WHERE polname LIKE 'karidns\_signer\_%')::text"
-oeq "RLS is on for the 9 tables of the schema and the 6 of karidns_auth, and for nothing else" "15" "SELECT count(*) FROM pg_class WHERE relrowsecurity AND relnamespace IN ('public'::regnamespace, 'karidns_auth'::regnamespace)"
+oeq "the policies exist: 34 for the API on the schema's tables, 21 on karidns_auth, 1 for the trusted role on each of the 17 tables, 29 for the signer (3 + 3 permissive and restrictive on records and domainmetadata, 11 SELECT, 1 INSERT on reload requests, 1 on cryptokeys, 1 UPDATE on key requests, 3 on the signer state)" \
+    "34 21 17 29" "SELECT (SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE c.relnamespace = 'public'::regnamespace AND p.polname LIKE 'karidns\_rls\_%' AND p.polname <> 'karidns_rls_trusted' AND p.polroles = '{0}')::text || ' ' || (SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE c.relnamespace = 'karidns_auth'::regnamespace AND p.polname LIKE 'karidns\_rls\_%' AND p.polname <> 'karidns_rls_trusted' AND p.polroles = '{0}')::text || ' ' || (SELECT count(*) FROM pg_policy WHERE polname = 'karidns_rls_trusted')::text || ' ' || (SELECT count(*) FROM pg_policy WHERE polname LIKE 'karidns\_signer\_%')::text"
+oeq "RLS is on for the 11 tables of the schema and the 6 of karidns_auth, and for nothing else" "17" "SELECT count(*) FROM pg_class WHERE relrowsecurity AND relnamespace IN ('public'::regnamespace, 'karidns_auth'::regnamespace)"
 oeq "...and not forced (the owner is exempt)" "0" "SELECT count(*) FROM pg_class WHERE relforcerowsecurity"
-oeq "the audit triggers are attached to the schema" "8" "SELECT count(DISTINCT tgrelid) FROM pg_trigger WHERE tgname = 'karidns_audit_row' AND tgrelid::regclass::text IN ('domains','records','domainmetadata','cryptokeys','karidns_record_tags','karidns_record_tinydns','karidns_zone_tagdefs','karidns_domain_views')"
-oeq "the API and signer role are in audit_restricted_roles; the API role is in api_roles (the signer is not)" "true|true|true|false" \
+oeq "the audit triggers are attached to the schema (the eight PowerDNS and KariDNS data tables and the two tables of the signer)" "10" "SELECT count(DISTINCT tgrelid) FROM pg_trigger WHERE tgname = 'karidns_audit_row' AND tgrelid::regclass::text IN ('domains','records','domainmetadata','cryptokeys','karidns_record_tags','karidns_record_tinydns','karidns_zone_tagdefs','karidns_domain_views','karidns_key_requests','karidns_signer_state')"
+oeq "only the API role is in audit_restricted_roles (the signer is a trusted daemon that asks for summary mode); the API role is in api_roles (the signer is not)" "true|false|true|false" \
     "SELECT (SELECT count(*) = 1 FROM karidns_auth.audit_restricted_roles WHERE role_name = '$API') || '|' || (SELECT count(*) = 1 FROM karidns_auth.audit_restricted_roles WHERE role_name = '$SIG') || '|' || (SELECT count(*) = 1 FROM karidns_auth.api_roles WHERE role_name = '$API') || '|' || (SELECT count(*) = 1 FROM karidns_auth.api_roles WHERE role_name = '$SIG')"
 oeq "karidns_rls_trusted exists, NOLOGIN" "f" "SELECT rolcanlogin FROM pg_roles WHERE rolname = 'karidns_rls_trusted'"
 oeq "the API role is NOLOGIN (created by the script)" "f" "SELECT rolcanlogin FROM pg_roles WHERE rolname = '$API'"
@@ -214,9 +218,15 @@ rs karidns_api_role.pgsql.sql $API public && rs karidns_signer_role.pgsql.sql $S
 oeq "the API role: no TRUNCATE, no table-level or column SELECT on the keys, nothing on karidns_profiles or the change log or its sequence" "false|false|false|false|false|false" \
     "SELECT has_table_privilege('$API', 'records', 'TRUNCATE') || '|' || has_column_privilege('$API', 'cryptokeys', 'content', 'SELECT') || '|' || has_table_privilege('$API', 'cryptokeys', 'SELECT') || '|' || has_table_privilege('$API', 'karidns_profiles', 'SELECT') || '|' || has_table_privilege('$API', 'karidns_changes', 'SELECT') || '|' || has_sequence_privilege('$API', 'karidns_changes_seq_seq', 'USAGE')"
 oeq "...and still the column privilege on id, domain_id, flags, active, published" "t" "SELECT has_column_privilege('$API', 'cryptokeys', 'domain_id', 'SELECT') AND has_column_privilege('$API', 'cryptokeys', 'published', 'SELECT')"
-oeq "the signer role: no write on the keys, nothing on the change log or karidns_profiles, no DELETE on reload requests" "false|false|false|false|false|false" \
+oeq "the signer role: no UPDATE or DELETE of the keys, SELECT but no DELETE on the change log, nothing on karidns_profiles, no DELETE on reload requests" "false|false|true|false|false|false" \
     "SELECT has_table_privilege('$SIG', 'cryptokeys', 'UPDATE') || '|' || has_table_privilege('$SIG', 'cryptokeys', 'DELETE') || '|' || has_table_privilege('$SIG', 'karidns_changes', 'SELECT') || '|' || has_table_privilege('$SIG', 'karidns_changes', 'DELETE') || '|' || has_table_privilege('$SIG', 'karidns_profiles', 'INSERT') || '|' || has_table_privilege('$SIG', 'karidns_reload_requests', 'DELETE')"
 oeq "...and it still reads the keys and writes records" "t" "SELECT has_column_privilege('$SIG', 'cryptokeys', 'content', 'SELECT') AND has_table_privilege('$SIG', 'records', 'INSERT')"
+oeq "the signer role (item C): INSERT on the keys; SELECT, and UPDATE only of columns (no table-wide UPDATE), not INSERT or DELETE, on the key requests; all four on its state" "true|true|false|false|false|true|true|true|true" \
+    "SELECT has_table_privilege('$SIG', 'cryptokeys', 'INSERT') || '|' || has_table_privilege('$SIG', 'karidns_key_requests', 'SELECT') || '|' || has_table_privilege('$SIG', 'karidns_key_requests', 'UPDATE') || '|' || has_table_privilege('$SIG', 'karidns_key_requests', 'INSERT') || '|' || has_table_privilege('$SIG', 'karidns_key_requests', 'DELETE') || '|' || has_table_privilege('$SIG', 'karidns_signer_state', 'SELECT') || '|' || has_table_privilege('$SIG', 'karidns_signer_state', 'INSERT') || '|' || has_table_privilege('$SIG', 'karidns_signer_state', 'UPDATE') || '|' || has_table_privilege('$SIG', 'karidns_signer_state', 'DELETE')"
+oeq "the API role (item C): SELECT, and INSERT only of columns (no table-wide INSERT), not UPDATE or DELETE, on the key requests; only SELECT on the signer state; no INSERT on the keys" "true|false|false|false|true|false|false|false|false" \
+    "SELECT has_table_privilege('$API', 'karidns_key_requests', 'SELECT') || '|' || has_table_privilege('$API', 'karidns_key_requests', 'INSERT') || '|' || has_table_privilege('$API', 'karidns_key_requests', 'UPDATE') || '|' || has_table_privilege('$API', 'karidns_key_requests', 'DELETE') || '|' || has_table_privilege('$API', 'karidns_signer_state', 'SELECT') || '|' || has_table_privilege('$API', 'karidns_signer_state', 'INSERT') || '|' || has_table_privilege('$API', 'karidns_signer_state', 'UPDATE') || '|' || has_table_privilege('$API', 'karidns_signer_state', 'DELETE') || '|' || has_table_privilege('$API', 'cryptokeys', 'INSERT')"
+oeq "the signer updates state, message and done_at of a key request, nothing else; the API role inserts domain_id, kind, algorithm, bits, key_type, nsec and requested_by, not the state, the message, done_at or the id" "true|true|true|false|false|false|false|true|true|true|true|true|true|true|false|false|false|false" \
+    "SELECT has_column_privilege('$SIG', 'karidns_key_requests', 'state', 'UPDATE') || '|' || has_column_privilege('$SIG', 'karidns_key_requests', 'message', 'UPDATE') || '|' || has_column_privilege('$SIG', 'karidns_key_requests', 'done_at', 'UPDATE') || '|' || has_column_privilege('$SIG', 'karidns_key_requests', 'domain_id', 'UPDATE') || '|' || has_column_privilege('$SIG', 'karidns_key_requests', 'algorithm', 'UPDATE') || '|' || has_column_privilege('$SIG', 'karidns_key_requests', 'requested_by', 'UPDATE') || '|' || has_column_privilege('$SIG', 'karidns_key_requests', 'id', 'UPDATE') || '|' || has_column_privilege('$API', 'karidns_key_requests', 'domain_id', 'INSERT') || '|' || has_column_privilege('$API', 'karidns_key_requests', 'kind', 'INSERT') || '|' || has_column_privilege('$API', 'karidns_key_requests', 'algorithm', 'INSERT') || '|' || has_column_privilege('$API', 'karidns_key_requests', 'bits', 'INSERT') || '|' || has_column_privilege('$API', 'karidns_key_requests', 'key_type', 'INSERT') || '|' || has_column_privilege('$API', 'karidns_key_requests', 'nsec', 'INSERT') || '|' || has_column_privilege('$API', 'karidns_key_requests', 'requested_by', 'INSERT') || '|' || has_column_privilege('$API', 'karidns_key_requests', 'state', 'INSERT') || '|' || has_column_privilege('$API', 'karidns_key_requests', 'message', 'INSERT') || '|' || has_column_privilege('$API', 'karidns_key_requests', 'done_at', 'INSERT') || '|' || has_column_privilege('$API', 'karidns_key_requests', 'id', 'INSERT')"
 oeq "the maintenance triggers of the data tables run as the owner (the roles need no right on the change log)" "0" "SELECT count(*) FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace AND (p.proname LIKE 'karidns\_trg\_%\_fn' OR p.proname IN ('karidns_log_domains', 'karidns_changes_prune_fn', 'karidns_reload_requests_lock_fn', 'karidns_reload_requests_notify_fn', 'karidns_reload_requests_prune_fn')) AND NOT p.prosecdef"
 
 echo "-- the acting principal"
@@ -682,8 +692,8 @@ a_err "...nor an NS record" "$RLSERR" $SIG NONE "$(ri $EX sx.example.com NS ns.x
 a_err "...nor an SOA record (the trigger on SOA rows says no before the policy does)" "cannot insert an SOA" $SIG NONE "$(ri $EX example.com SOA 'ns1.example.com hm.example.com 1 2 3 4 5' 300)"
 a_n "the signer updates a DNSSEC record" 1 $SIG NONE "UPDATE records SET ttl = 301 WHERE name = 's-rrsig.example.com'"
 a_n "...and the SOA (the serial)" 1 $SIG NONE "UPDATE records SET content = 'ns1.example.com hostmaster.example.com 200 7200 3600 1209600 300' WHERE domain_id = $EX AND type = 'SOA'"
-a_n "...but not an A record: no row" 0 $SIG NONE "UPDATE records SET ttl = 301 WHERE name = 'www.example.com' AND type = 'A'"
-a_n "...nor the NS record: no row" 0 $SIG NONE "UPDATE records SET ttl = 301 WHERE type = 'NS'"
+a_err "...but not another column of an A record (the trigger: only ordername and auth)" "ordername and auth" $SIG NONE "UPDATE records SET ttl = 301 WHERE name = 'www.example.com' AND type = 'A'"
+a_err "...nor of the NS record" "ordername and auth" $SIG NONE "UPDATE records SET ttl = 301 WHERE type = 'NS'"
 a_n "the signer deletes a DNSSEC record" 1 $SIG NONE "DELETE FROM records WHERE name = 's-nsec.example.com'"
 a_n "...not an A record: no row" 0 $SIG NONE "DELETE FROM records WHERE name = 'www.example.com' AND type = 'A'"
 a_n "...not the SOA: no row" 0 $SIG NONE "DELETE FROM records WHERE type = 'SOA'"
@@ -697,7 +707,7 @@ a_n "...deletes its own" 4 $SIG NONE "DELETE FROM domainmetadata WHERE domain_id
 a_ok "the signer asks for a reload" $SIG NONE "INSERT INTO karidns_reload_requests (zone) VALUES ('example.com')"
 a_err "...cannot write a zone" "permission denied" $SIG NONE "INSERT INTO domains (name, type) VALUES ('sig.test', 'NATIVE')"
 a_err "...cannot write a tag table" "permission denied" $SIG NONE "DELETE FROM karidns_record_tags"
-a_err "...cannot write cryptokeys (key generation comes with the key tooling)" "permission denied" $SIG NONE "UPDATE cryptokeys SET active = false"
+a_err "...cannot change a key (it only adds new ones)" "permission denied" $SIG NONE "UPDATE cryptokeys SET active = false"
 a_err "...has nothing on grants" "permission denied" $SIG NONE "SELECT count(*) FROM karidns_auth.grants"
 a_err "...nothing on credentials" "permission denied" $SIG NONE "SELECT count(*) FROM karidns_auth.credentials"
 a_err "...nothing on principals" "permission denied" $SIG NONE "SELECT count(*) FROM karidns_auth.principals"
@@ -706,7 +716,7 @@ a_ok "the signer, with a principal set, is still the signer (the API policies sa
 a_n "...and sees all rows" 1 $SIG $NOG "UPDATE records SET ttl = 303 WHERE name = 's-rrsig.example.com'"
 # the permissive policies of the API must not widen the signer: karidns.principal changes nothing (RESTRICTIVE policies)
 a_err "the signer with karidns.principal = a global master still cannot INSERT an A record" "$RLSERR" $SIG $GM "$(ri $EX sx2.example.com A 192.0.2.62 300)"
-a_n "...nor UPDATE one" 0 $SIG $GM "UPDATE records SET ttl = 302 WHERE name = 'www.example.com' AND type = 'A'"
+a_err "...nor UPDATE one (the trigger)" "ordername and auth" $SIG $GM "UPDATE records SET ttl = 302 WHERE name = 'www.example.com' AND type = 'A'"
 a_n "...nor DELETE one" 0 $SIG $GM "DELETE FROM records WHERE name = 'www.example.com' AND type = 'A'"
 a_err "...nor INSERT an NS record" "$RLSERR" $SIG $GM "$(ri $EX del9.example.com NS ns.x.test 300)"
 a_err "...nor write ALLOW-AXFR-FROM" "$RLSERR" $SIG $GM "INSERT INTO domainmetadata (domain_id, kind, content) VALUES ($OTHER, 'ALLOW-AXFR-FROM', '1')"
@@ -746,13 +756,101 @@ CL1=$(pq "SELECT coalesce(max(seq), 0) FROM karidns_changes")
 a_ok "the signer writes an RRSIG" $SIG NONE "$(ri $EX s-log.example.com RRSIG x 300)"
 oeq "...the change log got a row (the trigger runs as the owner, the signer has no right on the log)" "t" "SELECT count(*) >= 1 FROM karidns_changes WHERE seq > $CL1 AND domain_id = $EX"
 oq "DELETE FROM records WHERE name = 's-log.example.com'" > /dev/null
-a_err "the signer cannot read the change log" "permission denied" $SIG NONE "SELECT count(*) FROM karidns_changes"
-a_err "...nor write it" "permission denied" $SIG NONE "INSERT INTO karidns_changes (domain_id, changed_at) VALUES ($EX, 0)"
+a_eq "the signer reads the change log (it follows it to see which zones changed)" "$(sg_cnt karidns_changes)" $SIG NONE "SELECT count(*) FROM karidns_changes"
+a_eq "...with the xid of each row" "t" $SIG NONE "SELECT bool_and(xid IS NOT NULL) FROM karidns_changes"
+a_err "...but cannot write it" "permission denied" $SIG NONE "INSERT INTO karidns_changes (domain_id, changed_at) VALUES ($EX, 0)"
+a_err "...nor delete from it" "permission denied" $SIG NONE "DELETE FROM karidns_changes"
 a_err "...nor delete reload requests" "permission denied" $SIG NONE "DELETE FROM karidns_reload_requests"
 oeq "the audit rows of the signer name its database role" "$SIG" "SELECT DISTINCT db_role FROM karidns_auth.audit_log WHERE table_name = 'records' AND db_role = '$SIG'"
-a_ok "the signer cannot turn the audit detail off (karidns.audit = summary is ignored)" $SIG NONE "SET LOCAL karidns.audit = 'summary'; $(ri $EX sum1.example.com RRSIG x 300); $(ri $EX sum2.example.com RRSIG x 300)"
-oeq "...two row records, not one summary row" "2" "SELECT count(*) FROM karidns_auth.audit_log WHERE table_name = 'records' AND op = 'I' AND db_role = '$SIG' AND (after ->> 'summary') IS NULL AND after ->> 'name' IN ('sum1.example.com', 'sum2.example.com')"
+a_ok "the signer may turn the audit detail off (it is not a restricted role: karidns-zone import --signer asks for summary mode)" $SIG NONE "SET LOCAL karidns.audit = 'summary'; $(ri $EX sum1.example.com RRSIG x 300); $(ri $EX sum2.example.com RRSIG x 300)"
+oeq "...one summary row for the two inserts (2 statements, 2 rows), no row records of them" "1|2|2|0" "SELECT count(*) || '|' || max((after ->> 'statements')::int) || '|' || max((after ->> 'rows')::int) || '|' || (SELECT count(*) FROM karidns_auth.audit_log WHERE table_name = 'records' AND op = 'I' AND db_role = '$SIG' AND (after ->> 'summary') IS NULL AND after ->> 'name' IN ('sum1.example.com', 'sum2.example.com')) FROM karidns_auth.audit_log WHERE table_name = 'records' AND op = 'I' AND db_role = '$SIG' AND (after ->> 'summary') IS NOT NULL"
 oq "DELETE FROM records WHERE name LIKE 's-%.example.com' OR name IN ('sum1.example.com', 'sum2.example.com', 'sigins.example.com')" > /dev/null
+
+echo "-- key requests, the signer's state, new keys and the columns of a record (item C)"
+oq "TRUNCATE karidns_auth.audit_log; INSERT INTO karidns_key_requests (domain_id, requested_by, state, done_at) VALUES ($EX, $GM, 'done', now());
+    INSERT INTO karidns_key_requests (domain_id, requested_by) VALUES ($OTHER, $GM);
+    INSERT INTO karidns_signer_state (domain_id, signed_serial) VALUES ($EX, 100), ($OTHER, 200), ($THIRD, 300)" > /dev/null
+a_eq "the API: a global master sees every request" "2" $API $GM "SELECT count(*) FROM karidns_key_requests"
+a_eq "...the domain master of example.com sees one request" "1" $API $DM "SELECT count(*) FROM karidns_key_requests"
+a_eq "...a domain master through a group (eve in g_ops: other.test) sees that zone's request" "$OTHER" $API $EVE "SELECT domain_id FROM karidns_key_requests"
+a_eq "...a subdomain master sees none" "0" $API $SM "SELECT count(*) FROM karidns_key_requests"
+a_eq "...a principal without grants sees none" "0" $API $NOG "SELECT count(*) FROM karidns_key_requests"
+a_eq "...no principal sees none" "0" $API NONE "SELECT count(*) FROM karidns_key_requests"
+a_eq "...a disabled principal sees none" "0" $API $DIS "SELECT count(*) FROM karidns_key_requests"
+a_ok "a global master files a request for any zone" $API $GM "INSERT INTO karidns_key_requests (domain_id, requested_by) VALUES ($THIRD, $GM)"
+a_ok "a domain master files one for its zone (KSK, ECDSA P-384, NSEC3)" $API $DM "INSERT INTO karidns_key_requests (domain_id, algorithm, key_type, nsec, requested_by) VALUES ($EX, 14, 'ksk', 'nsec3', $DM)"
+a_err "...not for another zone" "$RLSERR" $API $DM "INSERT INTO karidns_key_requests (domain_id, requested_by) VALUES ($OTHER, $DM)"
+a_err "a second pending request for a zone is refused (one open request per zone)" "duplicate key|unique" $API $DM "INSERT INTO karidns_key_requests (domain_id, requested_by) VALUES ($EX, $DM)"
+a_err "a subdomain master cannot file one" "$RLSERR" $API $SM "INSERT INTO karidns_key_requests (domain_id, requested_by) VALUES ($EX, $SM)"
+a_err "a principal without grants cannot" "$RLSERR" $API $NOG "INSERT INTO karidns_key_requests (domain_id, requested_by) VALUES ($EX, $NOG)"
+a_err "no principal cannot" "$RLSERR" $API NONE "INSERT INTO karidns_key_requests (domain_id) VALUES ($EX)"
+a_err "a disabled principal cannot" "$RLSERR" $API $DIS "INSERT INTO karidns_key_requests (domain_id, requested_by) VALUES ($EX, $DIS)"
+a_err "a request in the name of another principal is refused" "$RLSERR" $API $DM "INSERT INTO karidns_key_requests (domain_id, requested_by) VALUES ($EX, $GM)"
+a_err "...also without a requester" "$RLSERR" $API $DM "INSERT INTO karidns_key_requests (domain_id) VALUES ($EX)"
+a_err "a request that is already answered is refused (the state and done_at are not columns the API may write)" "permission denied" $API $DM "INSERT INTO karidns_key_requests (domain_id, state, done_at, requested_by) VALUES ($EX, 'done', now(), $DM)"
+a_err "...also one with a message" "permission denied" $API $DM "INSERT INTO karidns_key_requests (domain_id, message, requested_by) VALUES ($EX, 'x', $DM)"
+a_err "...nor one that sets the id" "permission denied" $API $DM "INSERT INTO karidns_key_requests (id, domain_id, requested_by) VALUES (99999, $EX, $DM)"
+a_err "the CHECKs of the table still apply (algorithm 5)" "check constraint" $API $GM "INSERT INTO karidns_key_requests (domain_id, algorithm, requested_by) VALUES ($EX, 5, $GM)"
+a_err "the API cannot change a request" "permission denied" $API $GM "UPDATE karidns_key_requests SET state = 'done', done_at = now()"
+a_err "...nor delete one" "permission denied" $API $GM "DELETE FROM karidns_key_requests"
+a_eq "the API: the state of a zone is read by the principals that have a grant on it (dm: example.com only)" "$EX" $API $DM "SELECT domain_id FROM karidns_signer_state"
+a_eq "...a global master sees all three" "3" $API $GM "SELECT count(*) FROM karidns_signer_state"
+a_eq "...a subdomain master the state of its zone" "100" $API $SM "SELECT signed_serial FROM karidns_signer_state"
+a_eq "...eve the state of other.test" "200" $API $EVE "SELECT signed_serial FROM karidns_signer_state"
+a_eq "...a principal without grants none" "0" $API $NOG "SELECT count(*) FROM karidns_signer_state"
+a_err "...the API cannot write the state: INSERT" "permission denied" $API $GM "INSERT INTO karidns_signer_state (domain_id) VALUES ($NOSOA)"
+a_err "...UPDATE" "permission denied" $API $GM "UPDATE karidns_signer_state SET attempts = 5"
+a_err "...DELETE" "permission denied" $API $GM "DELETE FROM karidns_signer_state"
+a_err "the API cannot add a key" "permission denied" $API $GM "INSERT INTO cryptokeys (domain_id, flags, active, published, content) VALUES ($EX, 257, true, true, 'API-KEY')"
+# the signer
+a_eq "the signer reads every request and every state row" "4|3" $SIG NONE "SELECT (SELECT count(*) FROM karidns_key_requests) || '|' || (SELECT count(*) FROM karidns_signer_state)"
+a_n "the signer answers a request" 1 $SIG NONE "UPDATE karidns_key_requests SET state = 'done', done_at = now(), message = 'ok' WHERE domain_id = $OTHER"
+a_n "...also with the principal of a global master set (the API's policies do not widen it, nor narrow it)" 1 $SIG $GM "UPDATE karidns_key_requests SET state = 'failed', done_at = now(), message = 'no' WHERE domain_id = $THIRD"
+a_err "...the check of the table applies: done without done_at" "check constraint" $SIG NONE "UPDATE karidns_key_requests SET state = 'done', done_at = NULL WHERE domain_id = $EX AND algorithm = 13"
+a_err "the signer changes only state, message and done_at: not the algorithm" "permission denied" $SIG NONE "UPDATE karidns_key_requests SET algorithm = 8 WHERE domain_id = $OTHER"
+a_err "...not the zone" "permission denied" $SIG NONE "UPDATE karidns_key_requests SET domain_id = $THIRD WHERE domain_id = $OTHER"
+a_err "...not the requester" "permission denied" $SIG NONE "UPDATE karidns_key_requests SET requested_by = NULL WHERE domain_id = $OTHER"
+a_err "the signer cannot file a request" "permission denied" $SIG NONE "INSERT INTO karidns_key_requests (domain_id) VALUES ($EX)"
+a_err "...nor with a principal set" "permission denied" $SIG $GM "INSERT INTO karidns_key_requests (domain_id, requested_by) VALUES ($EX, $GM)"
+a_err "...nor delete one" "permission denied" $SIG NONE "DELETE FROM karidns_key_requests"
+a_ok "the signer writes its state: INSERT" $SIG NONE "INSERT INTO karidns_signer_state (domain_id, signed_serial, next_due) VALUES ($NOSOA, 5, now())"
+a_n "...UPDATE" 1 $SIG NONE "UPDATE karidns_signer_state SET attempts = 2, last_error = 'dnssec-signzone failed' WHERE domain_id = $NOSOA"
+a_n "...also with a principal set" 1 $SIG $NOG "UPDATE karidns_signer_state SET attempts = 3 WHERE domain_id = $NOSOA"
+a_n "...DELETE" 1 $SIG NONE "DELETE FROM karidns_signer_state WHERE domain_id = $NOSOA"
+a_ok "the signer adds a key" $SIG NONE "INSERT INTO cryptokeys (domain_id, flags, active, published, content) VALUES ($NOSOA, 257, true, true, 'NEWKEY')"
+a_err "...but changes none" "permission denied" $SIG NONE "UPDATE cryptokeys SET active = false WHERE content = 'NEWKEY'"
+a_err "...and deletes none" "permission denied" $SIG NONE "DELETE FROM cryptokeys WHERE content = 'NEWKEY'"
+oeq "the key went into the change log (the trigger of cryptokeys runs as the owner)" "t" "SELECT count(*) >= 1 FROM karidns_changes WHERE seq > $CL1 AND domain_id = $NOSOA"
+oeq "its state and the key are audited under the signer's role, the key without its content" "true|<redacted>" \
+    "SELECT (SELECT count(*) > 0 FROM karidns_auth.audit_log WHERE table_name = 'karidns_signer_state' AND db_role = '$SIG') || '|' || (SELECT after ->> 'content' FROM karidns_auth.audit_log WHERE table_name = 'cryptokeys' AND db_role = '$SIG' AND op = 'I' ORDER BY id DESC LIMIT 1)"
+oeq "the answers to the requests are audited too" "t" "SELECT count(*) > 0 FROM karidns_auth.audit_log WHERE table_name = 'karidns_key_requests' AND op = 'U' AND db_role = '$SIG'"
+# the columns of a record: ordername and auth of any record, a DNSSEC record as a whole, the SOA's serial
+oq "$(ri $EX sigcol.example.com RRSIG x 300); INSERT INTO records (domain_id, name, type, content, ttl) VALUES ($EX, 'ent.example.com', NULL, NULL, NULL)" > /dev/null
+a_n "the signer sets the ordername and auth of an A record" 1 $SIG NONE "UPDATE records SET ordername = 'abc', auth = false WHERE name = 'www.example.com' AND type = 'A'"
+a_n "...of the apex NS" 1 $SIG NONE "UPDATE records SET ordername = 'abc', auth = true WHERE type = 'NS' AND domain_id = $EX"
+a_n "...of the SOA (its serial and content are unchanged)" 1 $SIG NONE "UPDATE records SET ordername = 'abc', auth = true WHERE type = 'SOA' AND domain_id = $EX"
+a_n "...of an empty non-terminal (a row without type)" 1 $SIG NONE "UPDATE records SET ordername = 'ent', auth = true WHERE name = 'ent.example.com'"
+a_n "...of an MX record, with a principal set" 1 $SIG $NOG "UPDATE records SET ordername = 'mail', auth = true WHERE name = 'mail.example.com'"
+a_n "...of a whole zone at once (like pdnsutil rectify-zone)" "$(pq "SELECT count(*) FROM records WHERE domain_id = $EX")" $SIG NONE "UPDATE records SET ordername = ordername, auth = auth WHERE domain_id = $EX"
+a_n "...and NULL again" 1 $SIG NONE "UPDATE records SET ordername = NULL WHERE name = 'www.example.com' AND type = 'A'"
+a_err "but not the TTL of an A record" "ordername and auth" $SIG NONE "UPDATE records SET ttl = 1 WHERE name = 'www.example.com' AND type = 'A'"
+a_err "...not the content" "ordername and auth" $SIG NONE "UPDATE records SET content = '192.0.2.66' WHERE name = 'www.example.com' AND type = 'A'"
+a_err "...not the name" "ordername and auth" $SIG NONE "UPDATE records SET name = 'x.example.com' WHERE name = 'www.example.com' AND type = 'A'"
+a_err "...not the type (A to TXT)" "ordername and auth" $SIG NONE "UPDATE records SET type = 'TXT' WHERE name = 'www.example.com' AND type = 'A'"
+a_err "...not the zone" "ordername and auth" $SIG NONE "UPDATE records SET domain_id = $OTHER WHERE name = 'www.example.com' AND type = 'A'"
+a_err "...not the priority of an MX record" "ordername and auth" $SIG NONE "UPDATE records SET prio = 20 WHERE name = 'mail.example.com'"
+a_err "...not the disabled flag" "ordername and auth" $SIG NONE "UPDATE records SET disabled = true WHERE name = 'www.example.com' AND type = 'A'"
+a_err "...also when ordername and auth are set in the same statement" "ordername and auth" $SIG NONE "UPDATE records SET ordername = 'q', ttl = 1 WHERE name = 'www.example.com' AND type = 'A'"
+a_err "...not an A record turned into a DNSSEC record" "ordername and auth" $SIG NONE "UPDATE records SET type = 'RRSIG' WHERE name = 'www.example.com' AND type = 'A'"
+a_err "...nor a DNSSEC record turned into an A record" "ordername and auth" $SIG NONE "UPDATE records SET type = 'A', content = '192.0.2.67' WHERE name = 'sigcol.example.com'"
+a_err "...not a typeless row given a type" "ordername and auth" $SIG NONE "UPDATE records SET type = 'A', content = '192.0.2.68' WHERE name = 'ent.example.com'"
+a_err "...with the principal of a global master set it is the same" "ordername and auth" $SIG $GM "UPDATE records SET ttl = 1 WHERE name = 'www.example.com' AND type = 'A'"
+a_n "a DNSSEC record may change in any column" 1 $SIG NONE "UPDATE records SET ttl = 7, content = 'y', name = 'sigcol2.example.com' WHERE name = 'sigcol.example.com'"
+a_err "the SOA's TTL stays" "may change only the serial" $SIG NONE "UPDATE records SET ttl = 1 WHERE type = 'SOA' AND domain_id = $EX"
+a_err "...and so does its disabled flag" "may change only the serial" $SIG NONE "UPDATE records SET disabled = true WHERE type = 'SOA' AND domain_id = $EX"
+a_n "...the serial changes together with the ordername and auth" 1 $SIG NONE "UPDATE records SET content = '$SOAC 205 7200 3600 1209600 300', ordername = 'z', auth = true WHERE domain_id = $EX AND type = 'SOA'"
+oq "DELETE FROM records WHERE name IN ('sigcol2.example.com', 'ent.example.com'); UPDATE records SET ordername = NULL, auth = true WHERE domain_id = $EX; UPDATE records SET content = '$SOAC 201 7200 3600 1209600 300' WHERE domain_id = $EX AND type = 'SOA';
+    DELETE FROM cryptokeys WHERE content = 'NEWKEY'; DELETE FROM karidns_key_requests; DELETE FROM karidns_signer_state" > /dev/null
 
 echo "-- credentials, and every other role; the loader and karidns-zone (writer) roles with RLS on (the API script ran first)"
 psql -X -q -d "$PGMAINT" -c "CREATE ROLE $LD2 NOLOGIN; CREATE ROLE $WR2 NOLOGIN" > /dev/null 2>&1
@@ -798,11 +896,11 @@ if psql -X -q -d "$PGMAINT" -c "CREATE DATABASE $DB2" > /dev/null 2>&1; then
     P2() { psql -X -q -At -v ON_ERROR_STOP=1 "$PGC2" "$@"; }
     P2 -f tests/db/pdns_schema.pgsql.sql > /dev/null && P2 -f db/karidns_ext.pgsql.sql > /dev/null || fail "cannot create the second database"
     PW2="pw$$x"
-    psql -X -q -d "$PGMAINT" -c "CREATE ROLE $LD1 LOGIN PASSWORD '$PW2'; CREATE ROLE $WR1 LOGIN PASSWORD '$PW2'" > /dev/null 2>&1
+    psql -X -q -d "$PGMAINT" -c "CREATE ROLE $LD1 LOGIN PASSWORD '$PW2'; CREATE ROLE $WR1 LOGIN PASSWORD '$PW2'; CREATE ROLE $SG1 LOGIN PASSWORD '$PW2'" > /dev/null 2>&1
     P2 -c "INSERT INTO domains (name, type) VALUES ('o1.test', 'NATIVE');
            INSERT INTO records (domain_id, name, type, content, ttl) SELECT id, v.n, v.t, v.c, 3600 FROM domains, (VALUES ('o1.test', 'SOA', 'ns1.o1.test hostmaster.o1.test 1 7200 3600 1209600 300'), ('o1.test', 'NS', 'ns1.o1.test'), ('ns1.o1.test', 'A', '192.0.2.1'), ('www.o1.test', 'A', '192.0.2.2')) AS v(n, t, c) WHERE domains.name = 'o1.test'" > /dev/null
     if rs karidns_loader_role.pgsql.sql $LD1 public "$PGC2" && rs karidns_writer_role.pgsql.sql $WR1 public "$PGC2"; then pass "the loader and writer scripts apply before RLS exists"; else fail "role scripts first"; head -3 "$T/rs.err"; fi
-    if rs karidns_api_role.pgsql.sql $API public "$PGC2" && rs karidns_signer_role.pgsql.sql $SIG public "$PGC2"; then pass "the API and signer scripts apply after them"; else fail "API script second"; head -3 "$T/rs.err"; fi
+    if rs karidns_api_role.pgsql.sql $API public "$PGC2" && rs karidns_signer_role.pgsql.sql $SIG public "$PGC2" && rs karidns_signer_role.pgsql.sql $SG1 public "$PGC2"; then pass "the API and signer scripts apply after them"; else fail "API script second"; head -3 "$T/rs.err"; fi
     q2() { P2 -c "SET ROLE $1; $2" 2> "$E" | tr '\n' ' ' | sed 's/ $//'; }
     g=$(q2 $LD1 "SELECT count(*) FROM records; SELECT count(*) FROM domains"); [ "$g" = "4 1" ] && pass "the loader role still reads everything (RLS on, API script second)" || fail "loader role in the second order: '$g' $(head -c 200 "$E")"
     g=$(q2 $WR1 "INSERT INTO records (domain_id, name, type, content, ttl) SELECT id, 'wr.o1.test', 'A', '192.0.2.9', 60 FROM domains; UPDATE records SET ttl = 61 WHERE name = 'wr.o1.test'; SELECT count(*) FROM records; DELETE FROM records WHERE name = 'wr.o1.test'")
@@ -816,6 +914,7 @@ if psql -X -q -d "$PGMAINT" -c "CREATE DATABASE $DB2" > /dev/null 2>&1; then
     PORT=$(pq "SHOW port")
     RCL="host=127.0.0.1 port=$PORT user=$LD1 password=$PW2 dbname=$DB2"
     RCW="host=127.0.0.1 port=$PORT user=$WR1 password=$PW2 dbname=$DB2"
+    RCS="host=127.0.0.1 port=$PORT user=$SG1 password=$PW2 dbname=$DB2"
     if ! PGCONNECT_TIMEOUT=5 psql -X -q -At "$RCL" -c "SELECT 1" > /dev/null 2>&1; then
         skip "the server does not accept a password login over 127.0.0.1:$PORT: the dump and the import are not tested"
     else
@@ -861,6 +960,49 @@ EOF
             if [ "$st" = 0 ] && grep -q "192.0.2.3" "$T/zt.out"; then pass "...and an export"; else fail "karidns-zone export: exit $st"; head -3 "$T/zt.err"; fi
             g=$(P2 -c "SELECT count(*) > 0 FROM karidns_auth.audit_log WHERE db_role = '$WR1' AND zone_name = 'rls.test'")
             [ "$g" = "t" ] && pass "...and the import is in the audit log under the writer role" || fail "no audit row of the import ('$g')"
+            # item C: karidns-zone import --signer with the rights of the signer role alone (RLS on)
+            printf '%s\n' "$RCS" > "$T/ci_sg"; [ -n "$PG_AS" ] && chown "$PG_AS" "$T/ci_sg"; chmod 600 "$T/ci_sg"
+            for n in 3 4 5; do
+                cat > "$T/in/rls_s$n.zone" <<EOF
+\$ORIGIN rls.test.
+\$TTL 3600
+@ IN SOA ns1.rls.test. hostmaster.rls.test. $n 7200 3600 1209600 300
+@ IN NS ns1.rls.test.
+@ IN DNSKEY 257 3 8 AwEAAcvPyrbeMXE2CxVFJhnpJAWoJJJMiqpbRVvIgN0o
+@ IN NSEC ns1.rls.test. NS SOA RRSIG NSEC DNSKEY
+ns1 IN A 192.0.2.1
+ns1 IN NSEC www.rls.test. A RRSIG NSEC
+www IN A 192.0.2.3
+www IN NSEC rls.test. A RRSIG NSEC
+@ IN RRSIG SOA 8 2 3600 2030010${n}000000 20200101000000 12345 rls.test. AwEAAcvPyrbeMXE2CxVFJhnpJAWoJJJMiqpbRVvIgN0o
+@ IN RRSIG NS 8 2 3600 20300601000000 20200101000000 12345 rls.test. AwEAAcvPyrbeMXE2CxVFJhnpJAWoJJJMiqpbRVvIgN0o
+@ IN RRSIG DNSKEY 8 2 3600 20300601000000 20200101000000 12345 rls.test. AwEAAcvPyrbeMXE2CxVFJhnpJAWoJJJMiqpbRVvIgN0o
+@ IN RRSIG NSEC 8 2 3600 20300601000000 20200101000000 12345 rls.test. AwEAAcvPyrbeMXE2CxVFJhnpJAWoJJJMiqpbRVvIgN0o
+ns1 IN RRSIG A 8 3 3600 20300601000000 20200101000000 12345 rls.test. AwEAAcvPyrbeMXE2CxVFJhnpJAWoJJJMiqpbRVvIgN0o
+ns1 IN RRSIG NSEC 8 3 3600 20300601000000 20200101000000 12345 rls.test. AwEAAcvPyrbeMXE2CxVFJhnpJAWoJJJMiqpbRVvIgN0o
+www IN RRSIG A 8 3 3600 20300601000000 20200101000000 12345 rls.test. AwEAAcvPyrbeMXE2CxVFJhnpJAWoJJJMiqpbRVvIgN0o
+www IN RRSIG NSEC 8 3 3600 20300601000000 20200101000000 12345 rls.test. AwEAAcvPyrbeMXE2CxVFJhnpJAWoJJJMiqpbRVvIgN0o
+EOF
+            done
+            chmod 644 "$T"/in/*
+            zs() { as_pg "$Z" "$@" --no-config --conninfo-file "$T/ci_sg" > "$T/zs.out" 2> "$T/zs.err" < /dev/null; st=$?; }
+            zs import --signer --json rls.test "$T/in/rls_s3.zone"
+            if [ "$st" = 0 ] && [ "$(P2 -c "SELECT content FROM records WHERE name = 'rls.test' AND type = 'SOA'")" = "ns1.rls.test hostmaster.rls.test 3 7200 3600 1209600 300" ]; then pass "karidns-zone import --signer as the signer role with RLS on: the zone is signed (SOA serial 2 -> 3)"; else fail "import --signer: exit $st"; head -5 "$T/zs.err" "$T/zs.out"; fi
+            g=$(P2 -c "SELECT (SELECT count(*) FROM records WHERE name LIKE '%rls.test' AND type = 'RRSIG') || '|' || (SELECT count(*) FROM records WHERE type = 'DNSKEY' AND name = 'rls.test') || '|' || (SELECT string_agg(kind || '=' || content, ',' ORDER BY kind) FROM domainmetadata m JOIN domains d ON d.id = m.domain_id WHERE d.name = 'rls.test') || '|' || (SELECT ordername FROM records WHERE name = 'www.rls.test' AND type = 'A')")
+            [ "$g" = "8|1|PRESIGNED=1,X-KARIDNS-SIGNER=1|www" ] && pass "...8 RRSIGs, the DNSKEY, PRESIGNED and X-KARIDNS-SIGNER, the ordername of www" || fail "after import --signer: '$g'"
+            xid=$(sed -n 's/.*"xid": "\([0-9][0-9]*\)".*/\1/p' "$T/zs.out")
+            g=$(P2 -c "SELECT count(*) > 0 FROM karidns_changes WHERE xid = '${xid:-0}'::xid8 AND domain_id = (SELECT id FROM domains WHERE name = 'rls.test')")
+            [ -n "$xid" ] && [ "$g" = "t" ] && pass "...--json: the write id ($xid) is the xid of its rows in karidns_changes" || fail "write id '$xid' ($g): $(cat "$T/zs.out" | tr '\n' ' ' | cut -c1-300)"
+            grep -q '"earliest_expire": "2030-01-03T00:00:00Z"' "$T/zs.out" && grep -q '"serial": 3' "$T/zs.out" && pass "...and the new serial and the earliest RRSIG expiration" || fail "json result: $(cat "$T/zs.out" | tr '\n' ' ' | cut -c1-400)"
+            g=$(P2 -c "SELECT count(*) > 0 FROM karidns_auth.audit_log WHERE db_role = '$SG1' AND zone_name = 'rls.test' AND table_name = 'records'")
+            [ "$g" = "t" ] && pass "...the import is in the audit log under the signer role" || fail "no audit row of the signer's import ('$g')"
+            zs import --signer rls.test "$T/in/rls_s4.zone"
+            if [ "$st" = 0 ] && [ "$(P2 -c "SELECT count(*) FROM records WHERE name LIKE '%rls.test' AND type = 'RRSIG'")" = "8" ] && [ "$(P2 -c "SELECT split_part(content, ' ', 3) FROM records WHERE name = 'rls.test' AND type = 'SOA'")" = "4" ]; then pass "...a second run replaces the signatures (serial 4)"; else fail "second import --signer: exit $st"; head -5 "$T/zs.err"; fi
+            P2 -c "UPDATE records SET content = '192.0.2.77' WHERE name = 'www.rls.test' AND type = 'A'" > /dev/null
+            zs import --signer rls.test "$T/in/rls_s5.zone"
+            if [ "$st" = 3 ] && grep -q "changed" "$T/zs.err" && [ "$(P2 -c "SELECT split_part(content, ' ', 3) FROM records WHERE name = 'rls.test' AND type = 'SOA'")" = "4" ]; then pass "...a change of the zone since the file was made: exit status 3, nothing written"; else fail "import --signer of a stale file: exit $st"; head -3 "$T/zs.err"; fi
+            zs import rls.test "$T/in/rls1.zone"
+            if [ "$st" = 1 ] && [ "$(P2 -c "SELECT content FROM records WHERE name = 'www.rls.test' AND type = 'A'")" = "192.0.2.77" ]; then pass "the signer role cannot do an ordinary import (it may not write an A record): refused, nothing changed"; else fail "ordinary import as the signer role: exit $st"; head -3 "$T/zs.err"; fi
         fi
     fi
 else
@@ -868,10 +1010,10 @@ else
 fi
 
 echo "-- switching RLS off and on again"
-oeq "disable_rls('public') and ('karidns_auth') turn it off on 9 + 6 tables" "9 6" "SELECT karidns_auth.disable_rls('public') || ' ' || karidns_auth.disable_rls('karidns_auth')"
+oeq "disable_rls('public') and ('karidns_auth') turn it off on 11 + 6 tables" "11 6" "SELECT karidns_auth.disable_rls('public') || ' ' || karidns_auth.disable_rls('karidns_auth')"
 oq "GRANT SELECT ON domains, records TO $BARE" > /dev/null
 a_eq "...a role that is not trusted sees the rows again" "$(sg_cnt records)" $BARE NONE "SELECT count(*) FROM records"
-oeq "enable_rls() switches it on again" "9 6" "SELECT karidns_auth.enable_rls('public') || ' ' || karidns_auth.enable_rls('karidns_auth')"
+oeq "enable_rls() switches it on again" "11 6" "SELECT karidns_auth.enable_rls('public') || ' ' || karidns_auth.enable_rls('karidns_auth')"
 a_err "...and the bare role is refused again" "permission denied for function|row-level security" $BARE NONE "SELECT count(*) FROM records"
 
 echo

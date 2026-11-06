@@ -49,7 +49,8 @@ sub check_schema {
     my $tool = exists $doc->{"karidns-zone"} ? "karidns-zone" : "karicheck";    # the first key names the tool
     my @top = ($tool, qw(version command result counts truncated messages zones));
     for my $k (@top) { fail("missing key $k") unless exists $doc->{$k}; }
-    fail("unexpected keys: " . join(',', grep { my $x = $_; !grep { $_ eq $x } @top } sort keys %$doc)) if keys %$doc != @top;
+    my $has_signer = $tool eq "karidns-zone" && exists $doc->{signer};          # import --signer: the result of the write, after zones
+    fail("unexpected keys: " . join(',', grep { my $x = $_; !grep { $_ eq $x } (@top, $has_signer ? ("signer") : ()) } sort keys %$doc)) if keys %$doc != @top + ($has_signer ? 1 : 0);
     fail("$tool is not 1") unless is_int($doc->{$tool}) && $doc->{$tool} == 1;
     fail("version is not a string") unless is_str($doc->{version}) && length $doc->{version};
     my $cmds = $tool eq "karidns-zone" ? "import|export" : "conf|zones|zone|db";
@@ -88,6 +89,31 @@ sub check_schema {
         fail("truncated without dropped messages or zones") unless $c->{dropped} > 0 || @{ $doc->{zones} } >= 100000;
     }
     fail("result ok with errors") if $doc->{result} eq 'ok' && $c->{error} > 0;
+    if ($has_signer) {
+        my $s = $doc->{signer};
+        fail("signer is not an object") unless ref $s eq 'HASH';
+        fail("signer.zone is not a string") unless is_str($s->{zone});
+        fail("signer.changed / committed are not booleans") unless ref $s->{changed} eq 'JSON::PP::Boolean' && ref $s->{committed} eq 'JSON::PP::Boolean';
+        if ($s->{changed}) {
+            fail("signer: a changed zone has no other key") if keys %$s != 3 || $s->{committed};
+        } elsif (exists $s->{busy}) {
+            fail("signer: a busy zone has the keys zone, changed, committed, busy") if keys %$s != 4 || $s->{committed} || ref $s->{busy} ne 'JSON::PP::Boolean' || !$s->{busy};
+        } else {
+            for my $k (qw(serial old_serial dnssec_records_written dnssec_records_removed records_updated rrsets_added rrsets_replaced rrsets_deleted earliest_expire earliest_expire_epoch write_id)) {
+                fail("signer has no $k") unless exists $s->{$k};
+            }
+            fail("signer has unexpected keys") if keys %$s != 14;
+            for my $k (qw(serial old_serial dnssec_records_written dnssec_records_removed records_updated rrsets_added rrsets_replaced rrsets_deleted)) {
+                fail("signer.$k is not a non-negative integer") unless is_int($s->{$k});
+            }
+            fail("signer.earliest_expire is not a UTC time") unless is_str($s->{earliest_expire}) && $s->{earliest_expire} =~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/;
+            fail("signer.earliest_expire_epoch is not an integer") unless defined $s->{earliest_expire_epoch} && !ref $s->{earliest_expire_epoch} && $s->{earliest_expire_epoch} =~ /^-?[0-9]+$/;
+            my $w = $s->{write_id};
+            fail("signer.write_id is not an object") unless ref $w eq 'HASH' && keys %$w == 3;
+            fail("signer.write_id.xid") unless !defined $w->{xid} || ($w->{xid} =~ /^[0-9]+$/);
+            for my $k (qw(seq_first seq_last)) { fail("signer.write_id.$k") unless !defined $w->{$k} || is_int($w->{$k}); }
+        }
+    }
     $i = 0;
     for my $z (@{ $doc->{zones} }) {
         fail("zones[$i] is not an object") unless ref $z eq 'HASH';

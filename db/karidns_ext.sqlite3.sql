@@ -25,8 +25,8 @@
 -- Foreign keys are only enforced when the connection runs PRAGMA foreign_keys=ON (PowerDNS can, the sqlite3 shell does not).
 --
 -- Version 1 had no karidns_zone_tagdefs.id (the rowid gave the order); db/karidns_ext_v1_to_v2.sqlite3.sql converts a database.
--- Version 3 (0.6.0 item B) adds the audit tables karidns_audit_log and karidns_audit_actor.  The loader reads versions 1 to 3 and uses
--- nothing of version 3.
+-- Version 3 (0.6.0 item B) adds the audit tables karidns_audit_log and karidns_audit_actor; item C (the signer) adds karidns_key_requests and
+-- karidns_signer_state (apply this file again to a version 3 file that lacks them).  The loader reads versions 1 to 3 and uses nothing of version 3.
 --
 -- The retention is the number 1000000 in karidns_changes_prune below; tests/run_db_ddl_test.sh replaces it by 5 to test
 -- the pruning on a small scale.
@@ -229,6 +229,50 @@ BEGIN
     SELECT domain_id, strftime('%s', 'now') FROM domainmetadata
      WHERE domain_id IS NOT NULL AND upper(kind) = 'X-KARIDNS-PROFILE' AND trim(content, ' ' || char(9)) = OLD.name;
 END;
+
+-- ---------------------------------------------------------------------------------------------------------------------------------
+-- The signer (0.6.0 item C, docs/karidns-signer.md; schema version 3): the work queue and the schedule of karidns-signer.  They are NOT zone data: no
+-- trigger writes karidns_changes for them (the signer writes its state after every run, and a signer that followed its own state would never stop).
+-- SQLite3 has no roles: the WebAdmin API does the checks of who may file a request.  Times are unix seconds (INTEGER), like karidns_changes.changed_at.
+--
+--   karidns_key_requests   a request for keys, filed by the WebAdmin or an operator, answered by the signer.  kind: 'enable' = start signing the zone
+--                          (generate the first key or keys, set the metadata, sign), 'add' = one more key.  algorithm: 8, 10 (RSA; bits 1024..8192), 13,
+--                          14 (ECDSA), 15, 16 (EdDSA); key_type 'csk' (one key signs everything), 'ksk' or 'zsk'; nsec 'nsec3' (the default of the
+--                          signer) or 'nsec' for an 'enable' request.  state: 'pending' -> 'done' or 'failed' (message says why); done_at is set with the
+--                          state.  requested_by: the principal id of the requester.
+--   karidns_signer_state   one row per signed zone: when it was signed, the SOA serial it wrote, the earliest RRSIG expiration of the zone (min_expire),
+--                          when the signer wants to look at the zone again (next_due), the failed attempts since the last success and the last error.
+-- Both go away with their zone when the connection runs PRAGMA foreign_keys=ON (ON DELETE CASCADE).
+CREATE TABLE IF NOT EXISTS karidns_key_requests (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  domain_id    INTEGER NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+  kind         VARCHAR(6) NOT NULL DEFAULT 'enable' CHECK (kind IN ('enable', 'add')),
+  algorithm    INTEGER NOT NULL DEFAULT 13 CHECK (algorithm IN (8, 10, 13, 14, 15, 16)),
+  bits         INTEGER NULL CHECK (bits IS NULL OR (bits BETWEEN 1024 AND 8192 AND algorithm IN (8, 10))),
+  key_type     VARCHAR(3) NOT NULL DEFAULT 'csk' CHECK (key_type IN ('csk', 'ksk', 'zsk')),
+  nsec         VARCHAR(5) NULL CHECK (nsec IS NULL OR (nsec IN ('nsec3', 'nsec') AND kind = 'enable')),
+  state        VARCHAR(7) NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'done', 'failed')),
+  message      TEXT NULL,
+  requested_by INTEGER NULL,
+  created_at   INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER)),
+  done_at      INTEGER NULL,
+  CONSTRAINT karidns_key_requests_done_chk CHECK ((state = 'pending') = (done_at IS NULL))
+);
+CREATE INDEX IF NOT EXISTS karidns_key_requests_domain_idx ON karidns_key_requests (domain_id);
+CREATE INDEX IF NOT EXISTS karidns_key_requests_pending_idx ON karidns_key_requests (id) WHERE state = 'pending';
+CREATE UNIQUE INDEX IF NOT EXISTS karidns_key_requests_one_pending_idx ON karidns_key_requests (domain_id) WHERE state = 'pending';       -- one open request per zone
+
+CREATE TABLE IF NOT EXISTS karidns_signer_state (
+  domain_id        INTEGER PRIMARY KEY REFERENCES domains(id) ON DELETE CASCADE,
+  signed_at        INTEGER NULL,
+  signed_serial    INTEGER NULL CHECK (signed_serial IS NULL OR signed_serial BETWEEN 0 AND 4294967295),
+  min_expire       INTEGER NULL,
+  next_due         INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER)),
+  attempts         INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  last_error       TEXT NULL,
+  last_duration_ms INTEGER NULL CHECK (last_duration_ms IS NULL OR last_duration_ms >= 0)
+);
+CREATE INDEX IF NOT EXISTS karidns_signer_state_due_idx ON karidns_signer_state (next_due);
 
 -- ---------------------------------------------------------------------------------------------------------------------------------
 -- == audit tables (schema version 3) ==    0.6.0 item B.  Everything above is version 2.

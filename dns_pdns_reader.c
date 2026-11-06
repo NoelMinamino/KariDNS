@@ -1306,6 +1306,9 @@ static bool build_settings(pdns_zone_t *z) {
             if (strcasecmp(content, "tinydns") == 0) z->flags |= PDNS_F_TINYDNS;
             else if (strcasecmp(content, "bind") != 0 && strcasecmp(content, "zone") != 0)
                 zwarn(z, false, 0, "X-KARIDNS-FORMAT value '%.32s' unknown, ignored", content);
+        } else if (strcasecmp(kind, "X-KARIDNS-SIGNER") == 0) {
+            /* 0.6.0 item C: the zone is kept signed by karidns-signer.  Nothing for the Backend to know: the signer's zone is served as it is (presigned); the
+             * loader reads the kind itself (a change of the zone is not reloaded until the signer asks, karidns_dbloader.c) */
         } else if (strcasecmp(kind, "ENABLE-LUA-RECORDS") == 0) {
             /* B9a, D13: LUA records are not run.  PowerDNS answers them when this metadata is 1; here that would silently change the answers, so the
              * zone is refused (the version in service stays) until the operator takes the metadata away.  The rows themselves are kept for the

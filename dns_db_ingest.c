@@ -388,6 +388,8 @@ typedef struct {
   bool req_ok;
   char req_err[AS_ERR];
   int64_t req_time;
+  uint32_t sig_wait;                 /* item C: zones that wait for the signer, and the first few names */
+  char sig_names[AS_ERR];
 } as_data_t;
 
 static struct as_ent {
@@ -403,6 +405,8 @@ static struct as_ent {
   _Atomic bool req_ok;
   _Atomic char req_err[AS_ERR];
   _Atomic int64_t req_time;
+  _Atomic uint32_t sig_wait;
+  _Atomic char sig_names[AS_ERR];
 } g_as[KARIDNS_DB_MAX_VIEWS];
 
 /* printable ASCII only, whatever the loader sent */
@@ -413,7 +417,8 @@ static void as_put_str(_Atomic char *dst, size_t cap, const char *src, size_t n)
   atomic_store_explicit(&dst[i], '\0', memory_order_relaxed);
 }
 
-static void as_set(struct as_ent *a, const as_data_t *d, const char *err, size_t errn, const char *sid, size_t sidn, const char *rerr, size_t rerrn) {
+static void as_set(struct as_ent *a, const as_data_t *d, const char *err, size_t errn, const char *sid, size_t sidn, const char *rerr, size_t rerrn,
+                   const char *snames, size_t snamesn) {
   uint32_t s = atomic_load_explicit(&a->seq, memory_order_relaxed);
   atomic_store_explicit(&a->seq, s + 1, memory_order_release);
   atomic_thread_fence(memory_order_seq_cst);
@@ -427,6 +432,8 @@ static void as_set(struct as_ent *a, const as_data_t *d, const char *err, size_t
   atomic_store_explicit(&a->req_ok, d->req_ok, memory_order_relaxed);
   as_put_str(a->req_err, AS_ERR, rerr, rerrn);
   atomic_store_explicit(&a->req_time, d->req_time, memory_order_relaxed);
+  atomic_store_explicit(&a->sig_wait, d->sig_wait, memory_order_relaxed);
+  as_put_str(a->sig_names, AS_ERR, snames, snamesn);
   atomic_store_explicit(&a->valid, true, memory_order_relaxed);
   atomic_store_explicit(&a->seq, s + 2, memory_order_release);
 }
@@ -446,6 +453,8 @@ static bool as_get(struct as_ent *a, as_data_t *d) {
     d->req_ok = atomic_load_explicit(&a->req_ok, memory_order_relaxed);
     st_str_get(a->req_err, d->req_err, sizeof(d->req_err));
     d->req_time = atomic_load_explicit(&a->req_time, memory_order_relaxed);
+    d->sig_wait = atomic_load_explicit(&a->sig_wait, memory_order_relaxed);
+    st_str_get(a->sig_names, d->sig_names, sizeof(d->sig_names));
     atomic_thread_fence(memory_order_seq_cst);
     if (atomic_load_explicit(&a->seq, memory_order_acquire) == s1) return valid;
   }
@@ -581,6 +590,7 @@ static bool build_config(ing_t *g, ing_cfg_t *snap) {
     kdb_enc_u8(&g->enc, 6, (uint8_t)db->bulk_threshold);
     kdb_enc_u32(&g->enc, 7, db->loader_threads);
     if (db->memory_limit) kdb_enc_u8(&g->enc, 8, 1);       /* D1a milestone 4: the directory only for the zones that are not in memory (design 3.3) */
+    kdb_enc_u8(&g->enc, 9, db->signer_wait ? 1 : 0);        /* 0.6.0 item C: a changed zone of the signer waits for the signer */
     ok =kdb_enc_end(&g->enc) == 0 && idx <= 0xFFFF && (snap->nviews == 0 || (g->view_names && g->view_db));
   }
   rcu_aux_read_unlock();
@@ -1921,7 +1931,8 @@ static void on_auto_status(const kdb_msg_t *m) {
     d.req_generation = e.req_generation;
     d.req_ok = e.req_ok;
     d.req_time = (int64_t)e.req_time;
-    as_set(&g_as[e.view], &d, e.error.p, e.error.len, e.server_id.p, e.server_id.len, e.req_error.p, e.req_error.len);
+    d.sig_wait = e.sig_wait;
+    as_set(&g_as[e.view], &d, e.error.p, e.error.len, e.server_id.p, e.server_id.len, e.req_error.p, e.req_error.len, e.sig_names.p, e.sig_names.len);
   }
 }
 
@@ -3829,6 +3840,8 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
       fmt_time(ad.last_poll, tp, sizeof(tp));
       st_append(&c, "  view %.64s: last poll %s, applied change seq %llu, pending changes %u, last error: %s\n",
                 v->name ? v->name : "?", tp, (unsigned long long)ad.applied_seq, ad.pending, ad.err[0] ? ad.err : "none");
+      if (ad.sig_wait)                                  /* item C: zones changed in the database that wait for karidns-signer (X-KARIDNS-SIGNER=1) */
+        st_append(&c, "    waiting for the signer: %u zone(s)%s%s\n", ad.sig_wait, ad.sig_names[0] ? ": " : "", ad.sig_names);
     }
     rcu_aux_read_unlock();
   }

@@ -1797,7 +1797,7 @@ static void test_audit(void) {
     printf("audit log (w_set_audit)\n");
     Q("TRUNCATE domains, records, domainmetadata, karidns_changes, karidns_domain_views, karidns_record_tags, karidns_record_tinydns, karidns_zone_tagdefs, "
       "karidns_reload_requests RESTART IDENTITY CASCADE");
-    CHECK(pg_count("SELECT karidns_auth.enable_audit('public')") == 8);
+    CHECK(pg_count("SELECT karidns_auth.enable_audit('public')") == 10);
     Q("DELETE FROM karidns_auth.audit_log");
     db_source_t src = { "postgresql", NULL, g_ci, NULL, 300 };
     char err[DB_ERRLEN], v[64];

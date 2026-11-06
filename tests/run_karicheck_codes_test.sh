@@ -322,6 +322,9 @@ db.import.verify
 db.import.not-primary
 db.import.summary
 db.import.change
+db.import.changed
+db.import.signer
+db.import.signer-zone
 db.export.done
 db.zone.driver
 db.zone.no-source

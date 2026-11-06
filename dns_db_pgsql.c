@@ -99,6 +99,7 @@ struct db_conn {
     bool in_wtxn;                   /* M2: w_begin() is open (in_snapshot is set too, so the reads of the zone work inside it) */
     uint32_t w_prepared;            /* M2: bit i = the statement W_STMT[i] is prepared on this session */
     bool audit_summary;             /* open_write(): every write transaction starts with SET LOCAL karidns.audit = 'summary' (w_set_audit) */
+    bool repeatable;                /* open_write(): every write transaction is REPEATABLE READ (w_set_snapshot: the signer) */
 };
 static bool pg_has_soa_cover_index(db_conn_t *c);
 
@@ -135,6 +136,10 @@ static int pq_fail(db_conn_t *c, PGresult *r, const char *what) {
     first_line(r ? PQresultErrorMessage(r) : PQerrorMessage(c->pg), line, sizeof(line));
     if (!line[0]) first_line(PQerrorMessage(c->pg), line, sizeof(line));
     const char *state = r ? PQresultErrorField(r, PG_DIAG_SQLSTATE) : NULL;
+    if (state && strcmp(state, "40001") == 0 && PQstatus(c->pg) == CONNECTION_OK) {         /* a concurrent change under a REPEATABLE READ snapshot */
+        set_err(c, "postgresql %s: %s (changed concurrently)", what, line);
+        return DB_ERR_CONFLICT;
+    }
     bool retry = PQstatus(c->pg) != CONNECTION_OK || sqlstate_transient(state);
     set_err(c, "postgresql %s: %s%s", what, line, retry ? " (retry later)" : "");
     return retry ? DB_ERR_RETRY : -1;
@@ -1451,7 +1456,7 @@ static int pg_report_status(db_conn_t *c, const db_status_t *st) {
  * parameters, never part of the SQL text.  A prepared statement outlives a rolled back transaction. */
 enum {
     W_LOCK, W_CREATE, W_DEL_ALL_TAGS, W_DEL_ALL_TD, W_DEL_ALL_REC, W_DEL_IDS_TAGS, W_DEL_IDS_TD, W_DEL_IDS_REC, W_INS_REC, W_INS_TAGS,
-    W_INS_TD, W_DEL_TAGDEFS, W_INS_TAGDEF, W_DEL_META, W_INS_META, W_SET_VIEW, W_REQ, W_HAS_KEYS, W_N
+    W_INS_TD, W_DEL_TAGDEFS, W_INS_TAGDEF, W_DEL_META, W_INS_META, W_SET_VIEW, W_REQ, W_HAS_KEYS, W_UPD_REC, W_UPD_ORD, W_INS_DNSSEC, W_N
 };
 static const struct { const char *sql; int np; } W_STMT[W_N] = {
     [W_LOCK] = { "SELECT pg_advisory_xact_lock(hashtextextended('karidns-zone:' || $1::text, 0))", 1 },
@@ -1474,6 +1479,12 @@ static const struct { const char *sql; int np; } W_STMT[W_N] = {
     [W_SET_VIEW] = { "INSERT INTO karidns_domain_views (domain_id, view_name) VALUES ($1::bigint, $2) ON CONFLICT DO NOTHING", 2 },
     [W_REQ] = { "INSERT INTO karidns_reload_requests (zone, force) VALUES ($1, $2::boolean)", 2 },
     [W_HAS_KEYS] = { "SELECT EXISTS (SELECT 1 FROM cryptokeys WHERE domain_id = $1::bigint)", 1 },
+    [W_UPD_REC] = { "UPDATE records SET content = coalesce($3::text, content), ordername = $4::text, auth = $5::boolean WHERE id = $1::bigint AND domain_id = $2::bigint", 5 },
+    [W_UPD_ORD] = { "UPDATE records r SET ordername = u.o, auth = u.a FROM unnest($1::bigint[], $2::text[], $3::boolean[]) AS u(id, o, a) "
+                    "WHERE r.id = u.id AND r.domain_id = $4::bigint", 4 },
+    [W_INS_DNSSEC] = { "INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled, auth, ordername) "
+                       "SELECT $1::bigint, u.n, u.t, u.c, u.ttl, u.prio, false, u.a, u.o "
+                       "FROM unnest($2::text[], $3::text[], $4::text[], $5::bigint[], $6::bigint[], $7::boolean[], $8::text[]) AS u(n, t, c, ttl, prio, a, o)", 8 },
 };
 
 /* run statement `idx` with the parameters pv (text, NULL = SQL NULL); the result (when out is set) is for the caller to clear */
@@ -1524,7 +1535,7 @@ static int pg_w_begin(db_conn_t *c, const char *zone) {
         set_err(c, "w_begin: a transaction is already open");
         return -1;
     }
-    int rc = exec_cmd(c, "BEGIN READ WRITE", "w_begin");
+    int rc = exec_cmd(c, c->repeatable ? "BEGIN ISOLATION LEVEL REPEATABLE READ READ WRITE" : "BEGIN READ WRITE", "w_begin");
     if (rc != 0) return rc;
     /* the lock against a concurrent importer of the same zone (also one that creates it): a transaction-level advisory lock on the name,
      * which waits lock_timeout (open_write) and ends with the transaction */
@@ -1577,6 +1588,7 @@ static int pg_w_create_zone(db_conn_t *c, const char *name, const char *type, in
 }
 
 #define W_DEL_CHUNK 1000
+#define W_DEL_DNSSEC_CHUNK 200000        /* ids of a DNSSEC delete: 4 MB of text, a statement for a hundred thousand signatures */
 
 static int pg_w_delete_records(db_conn_t *c, int64_t domain_id, const int64_t *ids, size_t n) {
     int ret = wcheck(c, "w_delete_records");
@@ -1727,6 +1739,244 @@ static int pg_w_zone_has_keys(db_conn_t *c, int64_t domain_id, bool *has) {
     return 0;
 }
 
+/* ---- item C, the signer (dns_db_driver.h): the authoritative flags, one record's ordername / auth / content, the id of the write ---- */
+typedef struct { db_auth_cb cb; void *ud; } au_t;
+
+static int au_row(db_conn_t *c, PGresult *r, int i, void *ud) {
+    (void)c;
+    au_t *a = ud;
+    return a->cb(a->ud, cell_i64(r, i, 0), PQgetisnull(r, i, 1) || cell_true(r, i, 1)) != 0 ? DB_STOPPED : 0;
+}
+
+static int pg_w_scan_auth(db_conn_t *c, int64_t domain_id, db_auth_cb cb, void *ud) {
+    int ret = wcheck(c, "w_scan_auth");
+    if (ret != 0) return ret;
+    char did[32];
+    i64_text(did, sizeof(did), domain_id);
+    const char *pv[1] = { did };
+    au_t a = { cb, ud };
+    return pg_scan(c, "w_scan_auth", "SELECT id, auth FROM records WHERE domain_id = $1::bigint ORDER BY id", 1, pv, au_row, &a);
+}
+
+static int pg_w_update_record(db_conn_t *c, int64_t domain_id, int64_t id, const char *content, const char *ordername, bool auth) {
+    int ret = wcheck(c, "w_update_record");
+    if (ret != 0) return ret;
+    char rid[32], did[32];
+    i64_text(rid, sizeof(rid), id);
+    i64_text(did, sizeof(did), domain_id);
+    const char *pv[5] = { rid, did, content, ordername, auth ? "t" : "f" };
+    PGresult *r = NULL;
+    if ((ret = wq(c, W_UPD_REC, pv, &r, PGRES_COMMAND_OK, "w_update_record")) != 0) return ret;
+    bool one = strcmp(PQcmdTuples(r), "1") == 0;
+    PQclear(r);
+    if (!one) {
+        set_err(c, "w_update_record: record %lld is not in zone %lld, was deleted meanwhile, or the role may not change it", (long long)id, (long long)domain_id);
+        return DB_ERR_CONFLICT;
+    }
+    return 0;
+}
+
+/* ---- text in a PostgreSQL array literal: {"a","b",NULL} ---- */
+typedef struct { char *p; size_t n, cap; bool oom; } abuf_t;
+
+static void ab_put(abuf_t *b, const char *s, size_t len) {
+    if (b->oom) return;
+    if (b->n + len + 1 > b->cap) {
+        size_t nc = (b->cap ? b->cap : 4096) * 2;
+        while (nc < b->n + len + 1) nc *= 2;
+        char *np = realloc(b->p, nc);
+        if (!np) {
+            b->oom = true;
+            return;
+        }
+        b->p = np;
+        b->cap = nc;
+    }
+    memcpy(b->p + b->n, s, len);
+    b->n += len;
+    b->p[b->n] = '\0';
+}
+
+/* one element (NULL = NULL); a comma first when it is not the first */
+static void ab_elem(abuf_t *b, bool first, const char *s) {
+    if (!first) ab_put(b, ",", 1);
+    if (!s) {
+        ab_put(b, "NULL", 4);
+        return;
+    }
+    ab_put(b, "\"", 1);
+    for (const char *q = s; *q;) {
+        size_t run = strcspn(q, "\"\\");
+        ab_put(b, q, run);
+        q += run;
+        if (*q) {
+            ab_put(b, "\\", 1);
+            ab_put(b, q, 1);
+            q++;
+        }
+    }
+    ab_put(b, "\"", 1);
+}
+
+static void ab_begin(abuf_t *b) {
+    b->n = 0;
+    ab_put(b, "{", 1);
+}
+static void ab_end(abuf_t *b) { ab_put(b, "}", 1); }
+
+#define W_ROWS_CHUNK 20000              /* rows of text per statement (the statement is as big as the text) */
+
+static int pg_w_update_orders(db_conn_t *c, int64_t domain_id, const db_order_t *v, size_t n) {
+    int ret = wcheck(c, "w_update_orders");
+    if (ret != 0) return ret;
+    char did[32];
+    i64_text(did, sizeof(did), domain_id);
+    abuf_t ids = {0}, ons = {0}, aus = {0};
+    for (size_t i = 0; i < n && ret == 0; i += W_ROWS_CHUNK) {
+        size_t k = n - i < W_ROWS_CHUNK ? n - i : W_ROWS_CHUNK;
+        ab_begin(&ids);
+        ab_begin(&ons);
+        ab_begin(&aus);
+        for (size_t j = 0; j < k; j++) {
+            char idt[32];
+            i64_text(idt, sizeof(idt), v[i + j].id);
+            ab_elem(&ids, j == 0, idt);
+            ab_elem(&ons, j == 0, v[i + j].ordername);
+            ab_elem(&aus, j == 0, v[i + j].auth ? "t" : "f");
+        }
+        ab_end(&ids);
+        ab_end(&ons);
+        ab_end(&aus);
+        if (ids.oom || ons.oom || aus.oom) {
+            set_err(c, "out of memory");
+            ret = -1;
+            break;
+        }
+        const char *pv[4] = { ids.p, ons.p, aus.p, did };
+        PGresult *r = NULL;
+        if ((ret = wq(c, W_UPD_ORD, pv, &r, PGRES_COMMAND_OK, "w_update_orders")) != 0) break;
+        bool all = strtoull(PQcmdTuples(r), NULL, 10) == k;
+        PQclear(r);
+        if (!all) {
+            set_err(c, "w_update_orders: a record of zone %lld is gone, or the role may not change it", (long long)domain_id);
+            ret = DB_ERR_CONFLICT;
+        }
+    }
+    free(ids.p);
+    free(ons.p);
+    free(aus.p);
+    return ret;
+}
+
+static int pg_w_insert_dnssec(db_conn_t *c, int64_t domain_id, const db_ins_t *v, size_t n) {
+    int ret = wcheck(c, "w_insert_dnssec");
+    if (ret != 0) return ret;
+    char did[32];
+    i64_text(did, sizeof(did), domain_id);
+    abuf_t nm = {0}, ty = {0}, ct = {0}, tt = {0}, pr = {0}, au = {0}, on = {0};
+    for (size_t i = 0; i < n && ret == 0; i += W_ROWS_CHUNK) {
+        size_t k = n - i < W_ROWS_CHUNK ? n - i : W_ROWS_CHUNK;
+        ab_begin(&nm);
+        ab_begin(&ty);
+        ab_begin(&ct);
+        ab_begin(&tt);
+        ab_begin(&pr);
+        ab_begin(&au);
+        ab_begin(&on);
+        for (size_t j = 0; j < k; j++) {
+            const db_record_row_t *r = v[i + j].row;
+            char t[32], p[32];
+            i64_text(t, sizeof(t), r->ttl);
+            i64_text(p, sizeof(p), r->prio);
+            ab_elem(&nm, j == 0, r->name);
+            ab_elem(&ty, j == 0, r->type);
+            ab_elem(&ct, j == 0, r->content);
+            ab_elem(&tt, j == 0, r->ttl_null ? NULL : t);
+            ab_elem(&pr, j == 0, r->prio_null ? NULL : p);
+            ab_elem(&au, j == 0, v[i + j].auth ? "t" : "f");
+            ab_elem(&on, j == 0, r->ordername);
+        }
+        ab_end(&nm);
+        ab_end(&ty);
+        ab_end(&ct);
+        ab_end(&tt);
+        ab_end(&pr);
+        ab_end(&au);
+        ab_end(&on);
+        if (nm.oom || ty.oom || ct.oom || tt.oom || pr.oom || au.oom || on.oom) {
+            set_err(c, "out of memory");
+            ret = -1;
+            break;
+        }
+        const char *pv[8] = { did, nm.p, ty.p, ct.p, tt.p, pr.p, au.p, on.p };
+        PGresult *r = NULL;
+        if ((ret = wq(c, W_INS_DNSSEC, pv, &r, PGRES_COMMAND_OK, "w_insert_dnssec")) != 0) break;
+        bool all = strtoull(PQcmdTuples(r), NULL, 10) == k;
+        PQclear(r);
+        if (!all) {
+            set_err(c, "w_insert_dnssec: fewer rows were inserted than given");
+            ret = -1;
+        }
+    }
+    free(nm.p);
+    free(ty.p);
+    free(ct.p);
+    free(tt.p);
+    free(pr.p);
+    free(au.p);
+    free(on.p);
+    return ret;
+}
+
+static int pg_w_set_snapshot(db_conn_t *c, bool on) {
+    if (!c->writable || c->in_wtxn) {
+        set_err(c, "w_set_snapshot: needs a writable connection outside a transaction");
+        return -1;
+    }
+    c->repeatable = on;
+    return 0;
+}
+
+static int pg_w_delete_dnssec(db_conn_t *c, int64_t domain_id, const int64_t *ids, size_t n) {
+    int ret = wcheck(c, "w_delete_dnssec");
+    if (ret != 0) return ret;
+    char did[32];
+    i64_text(did, sizeof(did), domain_id);
+    char *arr = malloc((size_t)W_DEL_DNSSEC_CHUNK * 21 + 4);
+    if (!arr) {
+        set_err(c, "out of memory");
+        return -1;
+    }
+    for (size_t i = 0; i < n && ret == 0; i += W_DEL_DNSSEC_CHUNK) {
+        size_t k = n - i < W_DEL_DNSSEC_CHUNK ? n - i : W_DEL_DNSSEC_CHUNK, o = 0;
+        arr[o++] = '{';
+        for (size_t j = 0; j < k; j++) o += (size_t)snprintf(arr + o, 24, "%s%lld", j ? "," : "", (long long)ids[i + j]);
+        arr[o++] = '}';
+        arr[o] = '\0';
+        const char *pv[2] = { arr, did };
+        ret = wq(c, W_DEL_IDS_REC, pv, NULL, PGRES_COMMAND_OK, "w_delete_dnssec");
+    }
+    free(arr);
+    return ret;
+}
+
+static int pg_w_mark(db_conn_t *c, uint64_t *mark) {
+    *mark = 0;                                      /* the transaction id is the mark */
+    return wcheck(c, "w_mark");
+}
+
+static int pg_w_write_id(db_conn_t *c, uint64_t mark, db_write_id_t *id) {
+    (void)mark;
+    memset(id, 0, sizeof(*id));
+    int ret = wcheck(c, "w_write_id");
+    if (ret != 0) return ret;
+    PGresult *r = NULL;
+    if ((ret = exec_rows(c, "SELECT pg_current_xact_id()::text", 0, NULL, &r, "w_write_id")) != 0) return ret;
+    snprintf(id->xid, sizeof(id->xid), "%s", PQgetvalue(r, 0, 0));
+    PQclear(r);
+    return 0;
+}
+
 const db_driver_t db_driver_postgresql = {
     "postgresql",    pg_open,         pg_close,           pg_errmsg,           pg_check_schema,
     pg_begin_snapshot, pg_end_snapshot, pg_list_zones,    pg_scan_records,     pg_scan_metadata,
@@ -1743,6 +1993,8 @@ const db_driver_t db_driver_postgresql = {
     pg_w_insert_tinydns, pg_w_delete_tagdefs, pg_w_insert_tagdef, pg_w_delete_meta, pg_w_insert_meta, pg_w_set_view, pg_w_request_reload,
     pg_w_zone_has_keys,
     pg_w_set_audit,       /* schema version 3 */
+    pg_w_scan_auth, pg_w_update_record, pg_w_mark, pg_w_write_id, pg_w_delete_dnssec,       /* item C, the signer */
+    pg_w_update_orders, pg_w_insert_dnssec, pg_w_set_snapshot,
 };
 
 #endif /* KARIDNS_DB_POSTGRESQL */

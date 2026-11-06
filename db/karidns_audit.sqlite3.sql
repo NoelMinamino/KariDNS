@@ -7,7 +7,7 @@
 -- version 2 database: without them every write would fail); db/karidns_ext.sqlite3.sql (version 3) creates the same tables.
 --
 -- What it does: AFTER INSERT / UPDATE / DELETE triggers on domains, records, domainmetadata, cryptokeys, karidns_record_tags,
--- karidns_record_tinydns, karidns_zone_tagdefs and karidns_domain_views write one row per changed row to karidns_audit_log: who (the one
+-- karidns_record_tinydns, karidns_zone_tagdefs, karidns_domain_views, karidns_key_requests and karidns_signer_state write one row per changed row to karidns_audit_log: who (the one
 -- row of karidns_audit_actor, if the writer put it there; NULLs if not), when, the table, the operation (I, U, D), the zone, the row id and
 -- before / after as JSON.  cryptokeys.content (the private key) is written as "<redacted>".  The log has no summary mode (the
 -- triggers are row level, like those of karidns_changes).
@@ -279,5 +279,63 @@ BEGIN
   VALUES ((SELECT db_role FROM karidns_audit_actor), (SELECT principal_id FROM karidns_audit_actor), (SELECT principal_name FROM karidns_audit_actor),
           (SELECT change_set FROM karidns_audit_actor), 'karidns_domain_views', 'D', coalesce((SELECT lower(name) FROM domains WHERE id = OLD.domain_id), (SELECT zone_name FROM karidns_audit_log WHERE table_name = 'domains' AND op = 'D' AND row_id = OLD.domain_id ORDER BY id DESC LIMIT 1)), NULL,
           json_object('domain_id', OLD.domain_id, 'view_name', OLD.view_name),
+          NULL);
+END;
+
+-- karidns_key_requests
+DROP TRIGGER IF EXISTS karidns_audit_karidns_key_requests_ins;
+CREATE TRIGGER karidns_audit_karidns_key_requests_ins AFTER INSERT ON karidns_key_requests
+BEGIN
+  INSERT INTO karidns_audit_log (db_role, principal_id, principal_name, change_set, table_name, op, zone_name, row_id, before, after)
+  VALUES ((SELECT db_role FROM karidns_audit_actor), (SELECT principal_id FROM karidns_audit_actor), (SELECT principal_name FROM karidns_audit_actor),
+          (SELECT change_set FROM karidns_audit_actor), 'karidns_key_requests', 'I', (SELECT lower(name) FROM domains WHERE id = NEW.domain_id), NEW.id,
+          NULL,
+          json_object('id', NEW.id, 'domain_id', NEW.domain_id, 'kind', NEW.kind, 'algorithm', NEW.algorithm, 'bits', NEW.bits, 'key_type', NEW.key_type, 'nsec', NEW.nsec, 'state', NEW.state, 'message', NEW.message, 'requested_by', NEW.requested_by, 'created_at', NEW.created_at, 'done_at', NEW.done_at));
+END;
+DROP TRIGGER IF EXISTS karidns_audit_karidns_key_requests_upd;
+CREATE TRIGGER karidns_audit_karidns_key_requests_upd AFTER UPDATE ON karidns_key_requests
+BEGIN
+  INSERT INTO karidns_audit_log (db_role, principal_id, principal_name, change_set, table_name, op, zone_name, row_id, before, after)
+  VALUES ((SELECT db_role FROM karidns_audit_actor), (SELECT principal_id FROM karidns_audit_actor), (SELECT principal_name FROM karidns_audit_actor),
+          (SELECT change_set FROM karidns_audit_actor), 'karidns_key_requests', 'U', (SELECT lower(name) FROM domains WHERE id = NEW.domain_id), NEW.id,
+          json_object('id', OLD.id, 'domain_id', OLD.domain_id, 'kind', OLD.kind, 'algorithm', OLD.algorithm, 'bits', OLD.bits, 'key_type', OLD.key_type, 'nsec', OLD.nsec, 'state', OLD.state, 'message', OLD.message, 'requested_by', OLD.requested_by, 'created_at', OLD.created_at, 'done_at', OLD.done_at),
+          json_object('id', NEW.id, 'domain_id', NEW.domain_id, 'kind', NEW.kind, 'algorithm', NEW.algorithm, 'bits', NEW.bits, 'key_type', NEW.key_type, 'nsec', NEW.nsec, 'state', NEW.state, 'message', NEW.message, 'requested_by', NEW.requested_by, 'created_at', NEW.created_at, 'done_at', NEW.done_at));
+END;
+DROP TRIGGER IF EXISTS karidns_audit_karidns_key_requests_del;
+CREATE TRIGGER karidns_audit_karidns_key_requests_del AFTER DELETE ON karidns_key_requests
+BEGIN
+  INSERT INTO karidns_audit_log (db_role, principal_id, principal_name, change_set, table_name, op, zone_name, row_id, before, after)
+  VALUES ((SELECT db_role FROM karidns_audit_actor), (SELECT principal_id FROM karidns_audit_actor), (SELECT principal_name FROM karidns_audit_actor),
+          (SELECT change_set FROM karidns_audit_actor), 'karidns_key_requests', 'D', coalesce((SELECT lower(name) FROM domains WHERE id = OLD.domain_id), (SELECT zone_name FROM karidns_audit_log WHERE table_name = 'domains' AND op = 'D' AND row_id = OLD.domain_id ORDER BY id DESC LIMIT 1)), OLD.id,
+          json_object('id', OLD.id, 'domain_id', OLD.domain_id, 'kind', OLD.kind, 'algorithm', OLD.algorithm, 'bits', OLD.bits, 'key_type', OLD.key_type, 'nsec', OLD.nsec, 'state', OLD.state, 'message', OLD.message, 'requested_by', OLD.requested_by, 'created_at', OLD.created_at, 'done_at', OLD.done_at),
+          NULL);
+END;
+
+-- karidns_signer_state
+DROP TRIGGER IF EXISTS karidns_audit_karidns_signer_state_ins;
+CREATE TRIGGER karidns_audit_karidns_signer_state_ins AFTER INSERT ON karidns_signer_state
+BEGIN
+  INSERT INTO karidns_audit_log (db_role, principal_id, principal_name, change_set, table_name, op, zone_name, row_id, before, after)
+  VALUES ((SELECT db_role FROM karidns_audit_actor), (SELECT principal_id FROM karidns_audit_actor), (SELECT principal_name FROM karidns_audit_actor),
+          (SELECT change_set FROM karidns_audit_actor), 'karidns_signer_state', 'I', (SELECT lower(name) FROM domains WHERE id = NEW.domain_id), NEW.domain_id,
+          NULL,
+          json_object('domain_id', NEW.domain_id, 'signed_at', NEW.signed_at, 'signed_serial', NEW.signed_serial, 'min_expire', NEW.min_expire, 'next_due', NEW.next_due, 'attempts', NEW.attempts, 'last_error', NEW.last_error, 'last_duration_ms', NEW.last_duration_ms));
+END;
+DROP TRIGGER IF EXISTS karidns_audit_karidns_signer_state_upd;
+CREATE TRIGGER karidns_audit_karidns_signer_state_upd AFTER UPDATE ON karidns_signer_state
+BEGIN
+  INSERT INTO karidns_audit_log (db_role, principal_id, principal_name, change_set, table_name, op, zone_name, row_id, before, after)
+  VALUES ((SELECT db_role FROM karidns_audit_actor), (SELECT principal_id FROM karidns_audit_actor), (SELECT principal_name FROM karidns_audit_actor),
+          (SELECT change_set FROM karidns_audit_actor), 'karidns_signer_state', 'U', (SELECT lower(name) FROM domains WHERE id = NEW.domain_id), NEW.domain_id,
+          json_object('domain_id', OLD.domain_id, 'signed_at', OLD.signed_at, 'signed_serial', OLD.signed_serial, 'min_expire', OLD.min_expire, 'next_due', OLD.next_due, 'attempts', OLD.attempts, 'last_error', OLD.last_error, 'last_duration_ms', OLD.last_duration_ms),
+          json_object('domain_id', NEW.domain_id, 'signed_at', NEW.signed_at, 'signed_serial', NEW.signed_serial, 'min_expire', NEW.min_expire, 'next_due', NEW.next_due, 'attempts', NEW.attempts, 'last_error', NEW.last_error, 'last_duration_ms', NEW.last_duration_ms));
+END;
+DROP TRIGGER IF EXISTS karidns_audit_karidns_signer_state_del;
+CREATE TRIGGER karidns_audit_karidns_signer_state_del AFTER DELETE ON karidns_signer_state
+BEGIN
+  INSERT INTO karidns_audit_log (db_role, principal_id, principal_name, change_set, table_name, op, zone_name, row_id, before, after)
+  VALUES ((SELECT db_role FROM karidns_audit_actor), (SELECT principal_id FROM karidns_audit_actor), (SELECT principal_name FROM karidns_audit_actor),
+          (SELECT change_set FROM karidns_audit_actor), 'karidns_signer_state', 'D', coalesce((SELECT lower(name) FROM domains WHERE id = OLD.domain_id), (SELECT zone_name FROM karidns_audit_log WHERE table_name = 'domains' AND op = 'D' AND row_id = OLD.domain_id ORDER BY id DESC LIMIT 1)), OLD.domain_id,
+          json_object('domain_id', OLD.domain_id, 'signed_at', OLD.signed_at, 'signed_serial', OLD.signed_serial, 'min_expire', OLD.min_expire, 'next_due', OLD.next_due, 'attempts', OLD.attempts, 'last_error', OLD.last_error, 'last_duration_ms', OLD.last_duration_ms),
           NULL);
 END;

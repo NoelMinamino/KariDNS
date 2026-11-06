@@ -341,6 +341,21 @@ static void test_json_document(void) {
     CHECK(doc && strstr(doc, "\"code\": null, \"text\": \"a message without a code\""));
     free(doc);
     dns_diag_json_reset();
+
+    /* one more key at the end (karidns-zone import --signer): after zones, replaced by a second call, gone after a reset */
+    dns_diag_json_start("import", "1");
+    dns_diag_json_tool("karidns-zone");
+    dns_diag_zone_result("ex.test.", NULL, "f", "bind", dns_diag_mark());
+    dns_diag_json_extra("signer", "{ \"a\": 1 }");
+    dns_diag_json_extra("signer", "{ \"a\": 2 }");
+    doc = finish_to_string(0);
+    CHECK(doc && strstr(doc, "\"errors\": 0, \"warnings\": 0 }\n  ],\n  \"signer\": { \"a\": 2 }\n}\n") && !strstr(doc, "\"a\": 1"));
+    free(doc);
+    dns_diag_json_start("import", "1");
+    doc = finish_to_string(0);
+    CHECK(doc && !strstr(doc, "signer") && strstr(doc, "\"zones\": []\n}\n"));
+    free(doc);
+    dns_diag_json_reset();
 }
 
 static void test_limits(void) {

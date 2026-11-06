@@ -79,6 +79,9 @@ dns_diag_mark_t dns_diag_mark(void);        /* the error and warning counts so f
 /* Add an entry to zones[]: the messages (errors, warnings) counted since `since` decide the result.  view / file / format may be NULL. */
 void dns_diag_zone_result(const char *zone, const char *view, const char *file, const char *format, dns_diag_mark_t since);
 void dns_diag_counts(unsigned checked, unsigned skipped);
+/* One more top-level key at the end of the document (after "zones"): json_value is JSON text (an object), copied; a second call replaces it.  karidns-zone import --signer
+ * puts its result there.  JSON mode only. */
+void dns_diag_json_extra(const char *key, const char *json_value);
 /* Write the document and leave JSON mode's state as it is.  status: the exit status of the run (0 ok, 1 fail, 2 usage error).
  * Returns 0, or -1 when the document could not be written. */
 int dns_diag_json_finish(FILE *fp, int status);

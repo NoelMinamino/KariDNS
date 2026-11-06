@@ -553,6 +553,7 @@ static void test_database_block(void) {
     if (parse_ok("options { database { driver sqlite3; database-file \"/x.db\"; }; };", &cfg)) {
         const database_config_t *d = &cfg.database;
         CHECK(!d->auto_reload && d->poll_interval == 2 && d->coalesce_ms == 1000 && d->default_ttl == 3600);
+        CHECK(d->signer_wait);                                                        /* 0.6.0 item C: signer-wait defaults to yes */
         CHECK(d->bulk_threshold == 25 && d->max_zone_records == 10000000ull && d->max_zone_bytes == 1ull << 30);
         CHECK(d->db_reload_timeout == 30 && d->ingest_threads == 1 && d->loader_threads == 1);
         CHECK(d->park_max == 0 && d->park_timeout_ms == 0);                          /* (0: the worker's defaults, 1024 and 1500 ms) */
@@ -562,7 +563,16 @@ static void test_database_block(void) {
         CHECK_STR(db_loader_path(&cfg), KARIDNS_DB_DEFAULT_LOADER_PATH);
         free_server_config_fields(&cfg);
     }
+    if (parse_ok("options { database { driver sqlite3; database-file \"/x.db\"; signer-wait no; }; };", &cfg)) {
+        CHECK(!cfg.database.signer_wait);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { database { driver sqlite3; database-file \"/x.db\"; signer-wait yes; }; };", &cfg)) {
+        CHECK(cfg.database.signer_wait);
+        free_server_config_fields(&cfg);
+    }
 #define DBP "options { database { driver sqlite3; database-file \"/x\"; "
+    expect_reject("signer-wait maybe", DBP "signer-wait maybe; }; };");
     /* ranges */
     expect_reject("poll-interval 0", DBP "poll-interval 0; }; };");
     expect_reject("poll-interval 61", DBP "poll-interval 61; }; };");

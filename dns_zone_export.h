@@ -41,6 +41,12 @@ int zx_export_zone(zx_t *x, const char *zone, const char *view, const dzt_opts_t
  * cryptokeys.  opts may be NULL (all zero).  ZX_READ_OK: *out is the finished zone.  ZX_READ_ZONE: the reader refused the zone, *out is the failed zone and out->error says why.  ZX_READ_DB: a read failed (the driver's
  * errmsg), ZX_READ_OOM: out of memory; *out is NULL.  Free *out with pdns_zone_free(). */
 enum { ZX_READ_OK = 0, ZX_READ_ZONE, ZX_READ_DB, ZX_READ_OOM };
+/* The same with the DNSSEC records a signer owns left out, so that the zone is read as the plain zone it holds (0.6.0 item C): ZX_PLAIN_DNSSEC leaves out the rows of
+ * RRSIG, NSEC, NSEC3, NSEC3PARAM and DNSKEY and the metadata PRESIGNED and NSEC3PARAM (no chain to rebuild or check); ZX_PLAIN_CDS also CDS and CDNSKEY. */
+#define ZX_PLAIN_DNSSEC 1u
+#define ZX_PLAIN_CDS 2u
+int zx_read_zone_ex(const db_driver_t *d, db_conn_t *c, bool has_ext, const char *name, int64_t id, const pdns_opts_t *opts, unsigned plain, pdns_zone_t **out,
+                    bool *has_keys);
 int zx_read_zone(const db_driver_t *d, db_conn_t *c, bool has_ext, const char *name, int64_t id, const pdns_opts_t *opts, pdns_zone_t **out, bool *has_keys);
 
 #endif

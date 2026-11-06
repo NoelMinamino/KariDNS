@@ -393,6 +393,7 @@ static void test_roundtrip_backend(void) {
         case 0: {
             CHECK(m.u.config.generation == 5 && m.u.config.n_views == 2);
             CHECK(m.u.config.driver.len == 7 && m.u.config.server_id.len == 3);
+            CHECK(m.u.config.signer_wait);                                      /* tag 9 absent = yes (item C) */
             kdb_iter_t it;
             kdb_config_view_t v;
             kdb_config_views(&m, &it);
@@ -757,6 +758,18 @@ static void test_backend_direction_rejects(void) {
     kdb_enc_u32(&e, 7, 1); kdb_enc_u64(&e, 8, 1); kdb_enc_u64(&e, 9, 1);
     kdb_enc_nest_end(&e); kdb_enc_end(&e);
     CHECK_RC("auto_reload 2", decode_backend(&e, 2), KDB_E_RANGE);
+    /* signer_wait (item C): 0 and 1, not 2; absent = 1 */
+    for (unsigned sw = 0; sw < 3; sw++) {
+        kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_CONFIG);
+        kdb_enc_u64(&e, 1, 1); kdb_enc_str(&e, 2, "sqlite3");
+        kdb_enc_nest_begin(&e, 4);
+        kdb_enc_u16(&e, 1, 0); kdb_enc_str(&e, 2, "v"); kdb_enc_u8(&e, 5, 1); kdb_enc_u32(&e, 6, 1);
+        kdb_enc_u32(&e, 7, 1); kdb_enc_u64(&e, 8, 1); kdb_enc_u64(&e, 9, 1);
+        kdb_enc_nest_end(&e);
+        kdb_enc_u8(&e, 9, (uint8_t)sw);
+        kdb_enc_end(&e);
+        CHECK_RC("signer_wait", decode_backend(&e, 2), sw < 2 ? KDB_OK : KDB_E_RANGE);
+    }
     /* RELOAD_REQ scope / target consistency */
     kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_RELOAD_REQ);
     kdb_enc_u64(&e, 1, 1); kdb_enc_u8(&e, 2, 1); kdb_enc_u8(&e, 5, 0); kdb_enc_end(&e);
@@ -1384,9 +1397,35 @@ static void test_auto_status(void) {
     CHECK_RC("pending of 2 bytes", send_enc(KDB_S_READY, &e), KDB_E_TLV_LEN);
     kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
     kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
-    kdb_enc_u8(&e, 12, 1); kdb_enc_nest_end(&e);
+    kdb_enc_u8(&e, 14, 1); kdb_enc_nest_end(&e);
     kdb_enc_end(&e);
-    CHECK_RC("unknown tag 12", send_enc(KDB_S_READY, &e), KDB_E_TLV_UNKNOWN);
+    CHECK_RC("unknown tag 14", send_enc(KDB_S_READY, &e), KDB_E_TLV_UNKNOWN);
+    /* item C (the signer): the optional tags 12 (zones that wait for the signer) and 13 (their first names) */
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
+    kdb_enc_u32(&e, 12, 3); kdb_enc_str(&e, 13, "a.test, b.test, and 1 more"); kdb_enc_nest_end(&e);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 1); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    {
+        sess_t *ss = malloc(sizeof(*ss));
+        kdb_iter_t sit;
+        kdb_auto_status_entry_t sen;
+        sess_init(ss, &LIM);
+        sess_to(ss, KDB_S_READY);
+        CHECK_RC("signer wait fields", sess_feed(ss, e.buf, e.len, 0), KDB_OK);
+        kdb_auto_status_entries(&ss->m, &sit);
+        CHECK(kdb_auto_status_entries_next(&sit, &sen));
+        CHECK(sen.view == 0 && sen.sig_wait == 3 && sen.sig_names.len == 26 && memcmp(sen.sig_names.p, "a.test, b.test, and 1 more", 26) == 0);
+        CHECK(kdb_auto_status_entries_next(&sit, &sen));
+        CHECK(sen.view == 1 && sen.sig_wait == 0 && sen.sig_names.p == NULL);            /* absent = none wait */
+        CHECK(!kdb_auto_status_entries_next(&sit, &sen));
+        free(ss);
+    }
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
+    kdb_enc_u8(&e, 12, 3); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("sig_wait of 1 byte", send_enc(KDB_S_READY, &e), KDB_E_TLV_LEN);
     /* B11: the optional tags 6..11 (reload requests of a multi-server database) */
     kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
     kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 1); kdb_enc_u64(&e, 2, 0); kdb_enc_u64(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
