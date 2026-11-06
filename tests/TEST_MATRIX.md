@@ -561,6 +561,7 @@ make coverage-clean   # Remove previous raw and HTML coverage files
 make coverage-build   # Compile all targets with instrumentation
 make coverage-run     # Run tests/run_all_suite.sh (excluding COV_SUITE_EXCLUDE) and the fuzz corpora with LLVM_PROFILE_FILE
 make coverage-report  # Merge .profraw files, generate coverage_html/ and run tests/coverage_gate.pl
+make coverage-suite-check  # Fail unless the suite of coverage-run ended with failed=0 (lists the failed tests)
 ```
 
-HTML coverage reports with line and branch-level precision will be written to `coverage_html/index.html`. `coverage-run` needs root for the integration tests that use loopback aliases. The CI job "Coverage gate" checks the per-tier thresholds with `perl tests/coverage_gate.pl --phase=2 --strict`; the latest measured values are in [`docs/COVERAGE_STATUS.md`](../docs/COVERAGE_STATUS.md).
+HTML coverage reports with line and branch-level precision will be written to `coverage_html/index.html`. `coverage-run` needs root for the integration tests that use loopback aliases. The CI job "Coverage gate" checks the per-tier thresholds with `perl tests/coverage_gate.pl --phase=2 --strict` and fails when a test of the suite failed (`make coverage-suite-check`: only `failed=0` passes); the latest measured values are in [`docs/COVERAGE_STATUS.md`](../docs/COVERAGE_STATUS.md).

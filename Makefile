@@ -144,7 +144,7 @@ FUZZ_DAG_TCP_REASSEMBLY_SRCS = tests/fuzz/fuzz_dag_tcp_reassembly.c tools/dag_tc
 	fuzz_dag_all fuzz_dag_test fuzz_karidns fuzz_karidns_test fuzz_all fuzz_test \
 	pdns_reader_test presigned_test zone_text_test zone_import_test db_supervisor_test zone2sql karicheck_matrix_test unit-tests unit-tests-asan unit-tests-portable unit-tests-portable-asan test test-all rfc_vectors_test cidr_test tinydns_test asan_test include_test config_directives_test dns_diag_test wire_helpers_test zone_image_test zone_parser_paths_test tinydns_paths_test sig0_sign_test snapshot_rebuild_test dnssec_proofs_test qe_protocol_test dag_format_test dag_iter_test dag_reassembly_test hash_test vulnerability_test \
 	dnstap_test edns_ecs_test dynamic_update_test axfr_ixfr_test rrl_test query_expanded_test sweep-tests unit-test-bins coverage_sweep_test coverage_sweep_dag_test coverage_sweep_net_test coverage_sweep_tools_test \
-	coverage coverage-build coverage-run coverage-report coverage-clean
+	coverage coverage-build coverage-run coverage-report coverage-clean coverage-suite-check
 
 all: $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck
 
@@ -1338,7 +1338,7 @@ coverage-run:
 	@# (no status file: e.g. a shell error while registering them) would only show up as very low coverage: fail here with the reason.
 	@test -s coverage_suite.status || { echo "Error: tests/run_all_suite.sh stopped before it ran the tests (no coverage_suite.status); see its output above."; exit 1; }
 	@grep -q '^total=[1-9]' coverage_suite.status || { echo "Error: tests/run_all_suite.sh ran no test: $$(cat coverage_suite.status)"; exit 1; }
-	@echo "Test suite: $$(cat coverage_suite.status)"
+	@echo "Test suite: $$(head -n 1 coverage_suite.status)"
 	@$(MAKE) coverage-fuzz-run || true
 	@echo "Profile files in $(COV_DIR): $$(ls $(COV_DIR) | wc -l | tr -d ' ') (continuous mode: one file per instrumented binary)"
 
@@ -1356,7 +1356,15 @@ coverage-report:
 	@echo "Full HTML coverage report available at: $(COV_HTML_DIR)/index.html"
 	@if [ -f tests/coverage_gate.pl ]; then perl tests/coverage_gate.pl --llvm-cov=$(LLVM_COV) --profdata=$(COV_DATA) || true; fi
 
-coverage: coverage-clean coverage-build coverage-run coverage-report
+# The suite result of coverage-run: success only with failed=0.  It runs after the report, so that a failing test still leaves the
+# coverage numbers (coverage-run keeps going past failing tests for that reason).
+coverage-suite-check:
+	@test -s coverage_suite.status || { echo "Error: no coverage_suite.status (run make coverage-run first)."; exit 1; }
+	@if grep -q '^total=[0-9]* passed=[0-9]* failed=0 ' coverage_suite.status; then echo "Test suite: $$(head -n 1 coverage_suite.status)"; \
+	else echo "Error: the test suite has failing tests: $$(head -n 1 coverage_suite.status)"; \
+	     sed -n 's/^failed_tests=//p' coverage_suite.status | tr ' ' '\n' | sed 's/^/  FAILED: /'; exit 1; fi
+
+coverage: coverage-clean coverage-build coverage-run coverage-report coverage-suite-check
 
 bench_serialize: tests/bench_serialize.c dns_wire.o dns_utils.o dns_zone_parser.o dns_tinydns_parser.o dns_config_parser.o dns_diag.o dns_cidr.o dns_tsig_acl.o
 	$(CC) $(CFLAGS) tests/bench_serialize.c dns_wire.o dns_utils.o dns_zone_parser.o dns_tinydns_parser.o dns_config_parser.o dns_diag.o dns_cidr.o dns_tsig_acl.o -o bench_serialize $(LDFLAGS) -lssl -lcrypto -lz

@@ -303,6 +303,8 @@ jobs:
   # The test suite itself runs `tests/run_all_suite.sh -j <ncpu>` (COV_JOBS in the
   # Makefile): one port window and temporary directory per slot, tests registered
   # "serial" one by one after the parallel batch (tests/TEST_MATRIX.md).
+  # The job fails when the gate's thresholds are not met or when a test of the
+  # suite fails (make coverage-suite-check: success only with failed=0).
   # ---------------------------------------------------------------------------
   coverage-freebsd:
     name: Coverage gate (FreeBSD 15.1)
@@ -340,13 +342,23 @@ jobs:
             echo "::group::🧪 [Coverage] make coverage"
             # the suite runs with -j $(sysctl -n hw.ncpu) (Makefile: COV_JOBS; make coverage COV_JOBS=1 runs it one test at a time)
             START=$(date +%s)
-            make coverage < /dev/null
+            # the steps of `make coverage` without its last one, coverage-suite-check: it runs after the gate, so that both results are shown
+            make coverage-clean coverage-build coverage-run coverage-report < /dev/null
             echo "make coverage took $(( $(date +%s) - START ))s"
             echo "::endgroup::"
 
             echo "::group::🚦 [Gate] Phase 2 thresholds"
-            perl tests/coverage_gate.pl --llvm-cov="llvm-cov${V}" --profdata=coverage.profdata --phase=2 --strict
+            GATE=0
+            perl tests/coverage_gate.pl --llvm-cov="llvm-cov${V}" --profdata=coverage.profdata --phase=2 --strict || GATE=$?
             echo "::endgroup::"
+
+            echo "::group::🧪 [Suite] the result of tests/run_all_suite.sh (success only with failed=0)"
+            SUITE=0
+            make coverage-suite-check || SUITE=$?
+            echo "::endgroup::"
+            [ "$SUITE" -eq 0 ] || echo "::error title=Test suite::failing tests: $(sed -n 's/^failed_tests=//p' coverage_suite.status)"
+            [ "$GATE" -eq 0 ] || echo "::error title=Coverage gate::the phase 2 thresholds are not met"
+            [ "$GATE" -eq 0 ] && [ "$SUITE" -eq 0 ]
 
       - name: Upload HTML coverage report
         if: always()
