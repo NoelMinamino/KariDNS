@@ -1463,14 +1463,16 @@ int main(void) {
                 { 9, 1, "notify no;", 1, -1, "notify no: no apex (the control thread sends nothing)" },
             };
             for (size_t si = 0; si < sizeof(steps) / sizeof(steps[0]); si++) {
-                static server_config_t cfgN;
+                /* (one configuration per step: the active one is read by the ingest threads at any time, so the next step must not parse into it) */
+                static server_config_t cfgNs[sizeof(steps) / sizeof(steps[0])];
+                server_config_t *cfgN = &cfgNs[si];
                 char txt[600];
                 snprintf(txt, sizeof(txt), "options { %s database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; }; };\n"
                          "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", steps[si].notify);
-                CHECK(parse_named_conf(txt, &cfgN) == 0);
-                cfgN.database.memory_limit = 1ull << 40;
-                cfgN.database.transfer_fetch_timeout_ms = 1500;
-                atomic_store_explicit(&g_config_db.active, &cfgN, memory_order_release);
+                CHECK(parse_named_conf(txt, cfgN) == 0);
+                cfgN->database.memory_limit = 1ull << 40;
+                cfgN->database.transfer_fetch_timeout_ms = 1500;
+                atomic_store_explicit(&g_config_db.active, cfgN, memory_order_release);
                 kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
                 kdb_enc_u64(&e, 1, 40 + si); kdb_enc_u8(&e, 2, KDB_BATCH_DIFF); kdb_enc_u64(&e, 3, 0);
                 kdb_enc_end(&e);
