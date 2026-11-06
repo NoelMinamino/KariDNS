@@ -128,6 +128,11 @@ zi_t *zi_open(const zi_opts_t *o) {
         zi_close(z);
         return NULL;
     }
+    if (z->drv->w_set_audit && (o->audit_summary || o->audit_actor) && z->drv->w_set_audit(z->conn, o->audit_summary, o->audit_actor) != 0) {
+        zmsg_emit(&m, DIAG_ERROR, DC_DB_IMPORT_OPEN, NULL, "%s", z->drv->errmsg(z->conn));
+        zi_close(z);
+        return NULL;
+    }
     if (z->drv->check_schema(z->conn, &z->si) != 0) {
         zmsg_emit(&m, DIAG_ERROR, DC_DB_IMPORT_SCHEMA, NULL, "%s", z->drv->errmsg(z->conn));
         zi_close(z);

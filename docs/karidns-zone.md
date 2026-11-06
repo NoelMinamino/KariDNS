@@ -113,6 +113,9 @@ A signed (PRESIGNED) zone is exported as the server serves it, with the NSEC3PAR
 `--type NATIVE|MASTER`
 : `domains.type` of a **new** zone (default `NATIVE`).
 
+`--audit rows|summary`
+: `import`: how the audit log sees this import (default `rows`; see AUDIT below). Any other value is a usage error, and so is the option with `export`.
+
 `--format bind|tinydns|auto`
 : Above.
 
@@ -144,6 +147,24 @@ The BIND text is `$ORIGIN`, `$TTL` (the TTL most records have), the tag definiti
 ## JSON OUTPUT
 
 `karidns-zone --json <command> ...` writes the document of [`karicheck --json`](karicheck.md#json-output) with the first key `"karidns-zone": 1` and `"command": "import"` or `"export"`; `messages[]`, `counts` and `zones[]` are as there (`zones[]` has one entry per zone imported or exported; `format` is `bind`, `tinydns`, or `database` for a zone that failed before its format was known; `file` is the input or output file). Standard output carries only the document, standard error nothing; the exit status is the one of the text mode. The codes are those of [`karicheck(1)`](karicheck.md) (`usage.*`, `io.*`, `conf.*`, `zone.*`, `db.import.*`, `db.export.*`, `db.zone.*`; the list is in the manual of `karicheck`).
+
+## AUDIT
+
+A database of schema version 3 (`db/karidns_ext.*.sql`) has an audit log: `karidns_auth.audit_log` on PostgreSQL, `karidns_audit_log` on SQLite3. It is empty and stays empty until the audit triggers are attached (PostgreSQL: `SELECT karidns_auth.enable_audit('public')`, which the role scripts of the WebAdmin do; SQLite3: apply `db/karidns_audit.sqlite3.sql`). With the triggers on, every row `karidns-zone import` changes is logged: the table, the operation (`I`, `U`, `D`), the zone, the row before and after as JSON, and who did it.
+
+**Who.** PostgreSQL: the database role of the connection (`db_role`), and no principal. SQLite3: triggers can only read their own database, so the importer writes one row to the table `karidns_audit_actor` first in its transaction and deletes it before the commit; the row says `karidns-zone:<OS user>`. A database without that table (schema version 2) gets no row and the import is as before. The importer does not set `karidns.principal`: a session that does (the WebAdmin) is logged under that principal.
+
+`--audit rows` (the default)
+: One audit row per changed record, tag, tag definition and metadata row. A replace-import of a zone of a million records writes two million rows.
+
+`--audit summary`
+: PostgreSQL: each write transaction of the run begins with `SET LOCAL karidns.audit = 'summary'`. The audit then writes one row for the transaction, the table, the operation and the zone, which counts the statements and the rows (`{"summary": true, "statements": 1000000, "rows": 1000000}` in `after`); the first statement inserts the row and the totals are written into it when the transaction commits. The roles of the WebAdmin (`karidns_api`) and of the signer (`karidns_signer`) cannot turn the detail off, and neither can a login role that is a member of one of them, also after `SET ROLE` to another role: the restricted roles are the rows of the table `karidns_auth.audit_restricted_roles` (owner only; the role scripts of the WebAdmin add the role name they were given). The importer's role can. SQLite3: the audit has rows only; the option is accepted and the actor row is written as with `rows`.
+
+**Zone names in the log.** Every audit row of a zone's data names the zone (`zone_name`), also the rows that a zone delete removes through foreign keys (records, metadata, tag definitions, views). The one exception: the rows of `karidns_record_tags` and `karidns_record_tinydns` that go with their record (when the record or its zone is deleted) have `zone_name` NULL, because the record is gone when they are deleted. The `D` row of the record carries the zone, and its `row_id` is the `record_id` of those rows. (PostgreSQL remembers the name of a zone that is being deleted in a transaction-local setting `karidns.zc_<hash of the schema>_<domain id>`; it ends with the transaction.)
+
+**Row level security.** When the role script of the WebAdmin or of the signer has switched row level security on (PostgreSQL), the importer's role must be a member of `karidns_rls_trusted`, or it sees no rows. `db/karidns_writer_role.pgsql.sql` makes its role a member, whichever script ran first. See THE AUTH SCHEMA, ROLES AND THE AUDIT LOG in [`karidns-dbloader(8)`](karidns-dbloader.md).
+
+**Cost.** A replace-import of 100,000 records into PostgreSQL 18 (one `INSERT` per record, one transaction) took 17 s without the audit, 36 s with `--audit rows` and 36 s with `--audit summary`. Summary mode saves space in the log, not time.
 
 ## EXIT STATUS
 

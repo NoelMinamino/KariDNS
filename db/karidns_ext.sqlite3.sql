@@ -1,12 +1,13 @@
 -- karidns_ext.sqlite3.sql - the KariDNS extension tables and the change-log triggers for a PowerDNS 5.1 gsqlite3 database
--- (beta design 3.7, 5.1, 6; milestones B6a, B10).  Schema version 2.
+-- (beta design 3.7, 5.1, 6; milestones B6a, B10).  Schema version 3.
 --
 -- Manual: docs/karidns-dbloader.md (the schema and trigger files, the privileges, the drivers) and the database chapter of
 -- docs/karidns.md.  The packages karidns-sqlite3, karidns-postgresql and karidns-db install this file in /usr/local/share/karidns/db/.
 --
 -- Apply it once, as the owner of the database, after the PowerDNS schema (schema.sqlite3.sql):
 --     sqlite3 /var/db/karidns/zones.sqlite3 < karidns_ext.sqlite3.sql
--- It can be applied again (CREATE ... IF NOT EXISTS); the version row is only inserted once.
+-- It can be applied again (CREATE ... IF NOT EXISTS); the version row is only inserted once.  Applied to a version 2 database it adds
+-- the two audit tables (the end of this file) and moves the version row to 3.
 --
 -- What it gives karidns-dbloader:
 --   karidns_changes   a log of "domain D changed" (seq, domain_id, changed_at), written by AFTER INSERT / UPDATE / DELETE
@@ -24,12 +25,14 @@
 -- Foreign keys are only enforced when the connection runs PRAGMA foreign_keys=ON (PowerDNS can, the sqlite3 shell does not).
 --
 -- Version 1 had no karidns_zone_tagdefs.id (the rowid gave the order); db/karidns_ext_v1_to_v2.sqlite3.sql converts a database.
--- The loader reads both versions.
+-- Version 3 (0.6.0 item B) adds the audit tables karidns_audit_log and karidns_audit_actor.  The loader reads versions 1 to 3 and uses
+-- nothing of version 3.
 --
 -- The retention is the number 1000000 in karidns_changes_prune below; tests/run_db_ddl_test.sh replaces it by 5 to test
 -- the pruning on a small scale.
 
 CREATE TABLE IF NOT EXISTS karidns_schema_version (version INTEGER NOT NULL);
+-- a fresh database starts as version 2; the last statement of this file (after the audit tables exist) makes it 3
 INSERT INTO karidns_schema_version (version) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM karidns_schema_version);
 
 CREATE TABLE IF NOT EXISTS karidns_changes (
@@ -226,3 +229,48 @@ BEGIN
     SELECT domain_id, strftime('%s', 'now') FROM domainmetadata
      WHERE domain_id IS NOT NULL AND upper(kind) = 'X-KARIDNS-PROFILE' AND trim(content, ' ' || char(9)) = OLD.name;
 END;
+
+-- ---------------------------------------------------------------------------------------------------------------------------------
+-- == audit tables (schema version 3) ==    0.6.0 item B.  Everything above is version 2.
+--
+-- The audit log of the WebAdmin / API and of karidns-zone.  This file only creates the two tables; the triggers that fill the log are in
+-- db/karidns_audit.sqlite3.sql, applied to this file when the WebAdmin (or the signer) is used, so that a site without them logs nothing.
+--
+--   karidns_audit_log    who changed what: the same columns as karidns_auth.audit_log on PostgreSQL (docs/karidns-auth.md), before / after
+--                        as JSON text, cryptokeys.content replaced by "<redacted>"; no xid.
+--   karidns_audit_actor  at most one row (id is always 1): who is writing.  A persistent trigger can only read its own database, so
+--                        the writer puts the actor here first in its transaction and deletes it last (SQLite has one writer at a
+--                        time: BEGIN IMMEDIATE).  karidns-zone writes db_role 'karidns-zone:<OS user>' and no principal.  A writer
+--                        that writes no row is logged with all four columns NULL.
+CREATE TABLE IF NOT EXISTS karidns_audit_log (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+  db_role        TEXT NULL,
+  principal_id   INTEGER NULL,
+  principal_name TEXT NULL,
+  change_set     TEXT NULL,
+  data_schema    TEXT NOT NULL DEFAULT 'main',
+  table_name     TEXT NOT NULL,
+  op             TEXT NOT NULL CHECK (op IN ('I', 'U', 'D')),
+  zone_name      TEXT NULL,
+  row_id         INTEGER NULL,
+  before         TEXT NULL,
+  after          TEXT NULL
+);
+CREATE INDEX IF NOT EXISTS karidns_audit_log_zone_idx ON karidns_audit_log (zone_name, at);
+CREATE INDEX IF NOT EXISTS karidns_audit_log_principal_idx ON karidns_audit_log (principal_id, at);
+CREATE INDEX IF NOT EXISTS karidns_audit_log_change_set_idx ON karidns_audit_log (change_set);
+-- the triggers of db/karidns_audit.sqlite3.sql find the name of a zone that is being deleted in the log row of its domains DELETE; the terms of
+-- the WHERE are those of the lookup (table_name = 'domains' AND op = 'D'), which is how SQLite knows it may use the index
+CREATE INDEX IF NOT EXISTS karidns_audit_log_zdel_idx ON karidns_audit_log (row_id) WHERE table_name = 'domains' AND op = 'D';
+
+CREATE TABLE IF NOT EXISTS karidns_audit_actor (
+  id             INTEGER PRIMARY KEY CHECK (id = 1),
+  principal_id   INTEGER NULL,
+  principal_name TEXT NULL,
+  change_set     TEXT NULL,
+  db_role        TEXT NULL
+);
+
+-- the data schema is at version 3 (a version 1 database is not touched: it needs db/karidns_ext_v1_to_v2.sqlite3.sql first)
+UPDATE karidns_schema_version SET version = 3 WHERE version = 2;

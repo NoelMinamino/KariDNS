@@ -19,17 +19,18 @@ PG_TRIED=""
 PGDB=""
 PGMAINT=${KARIDNS_TEST_PG:-postgres}
 
-# psql, as PG_AS when set: the arguments travel in the environment so that nothing has to be quoted for su
+# psql, as PG_AS when set: the arguments travel in the environment so that nothing has to be quoted for su.
+# sh has no local variables: the helpers use _pgl_* names only, so a caller's loop counter (i, a, cmd) is never changed.
 psql() {
     if [ -z "$PG_AS" ]; then command psql "$@"; return $?; fi
-    cmd="exec psql"
-    i=0
-    for a in "$@"; do
-        i=$((i + 1))
-        export "PSQLA$i=$a"
-        cmd="$cmd \"\$PSQLA$i\""
+    _pgl_cmd="exec psql"
+    _pgl_i=0
+    for _pgl_a in "$@"; do
+        _pgl_i=$((_pgl_i + 1))
+        export "PSQLA$_pgl_i=$_pgl_a"
+        _pgl_cmd="$_pgl_cmd \"\$PSQLA$_pgl_i\""
     done
-    su -m "$PG_AS" -c "$cmd"
+    su -m "$PG_AS" -c "$_pgl_cmd"
 }
 
 pg_pick_user() {
@@ -86,14 +87,14 @@ pg_setup() {
 # belongs to that user (UNIX socket peer authentication)
 as_pg() {
     if [ -z "$PG_AS" ]; then "$@"; return $?; fi
-    cmd="exec"
-    i=0
-    for a in "$@"; do
-        i=$((i + 1))
-        export "PSQLA$i=$a"
-        cmd="$cmd \"\$PSQLA$i\""
+    _pgl_cmd="exec"
+    _pgl_i=0
+    for _pgl_a in "$@"; do
+        _pgl_i=$((_pgl_i + 1))
+        export "PSQLA$_pgl_i=$_pgl_a"
+        _pgl_cmd="$_pgl_cmd \"\$PSQLA$_pgl_i\""
     done
-    su -m "$PG_AS" -c "$cmd"
+    su -m "$PG_AS" -c "$_pgl_cmd"
 }
 
 pq() { psql -X -q -At -v ON_ERROR_STOP=1 "$PGC" -c "$1"; }

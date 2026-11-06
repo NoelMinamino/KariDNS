@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <pwd.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -120,6 +121,8 @@ static void kz_usage(FILE *fp) {
         "      --type NATIVE|MASTER  domains.type of a NEW zone (default NATIVE; an existing zone keeps its type)\n"
         "      --format bind|tinydns|auto  the input format (auto: tinydns for a name ending in .tinydns or .data or called data, else bind)\n"
         "      --verbose           list the changed RRsets of a real import too\n"
+        "      --audit rows|summary  the audit log (docs/karidns-zone.md, AUDIT): rows (default) logs every changed row; summary logs one\n"
+        "                          row per transaction, table and operation (PostgreSQL; on SQLite3 the log always has rows)\n"
         "\n"
         "export options:\n"
         "      --format bind|tinydns|auto  the output format (auto: tinydns for a zone with X-KARIDNS-FORMAT tinydns, else bind)\n"
@@ -159,14 +162,14 @@ static int kz_usage_error(bool json, dns_diag_code_t code, const char *fmt, ...)
 
 typedef struct {
     bool json, verbose, dry_run, strict, reload, all, force, no_config, help, version;
-    const char *conf, *view, *sqlite, *conninfo, *schema, *mode, *types, *serial, *type, *format, *dir;
+    const char *conf, *view, *sqlite, *conninfo, *schema, *mode, *types, *serial, *type, *format, *dir, *audit;
     int nargs;
     char **args;
     char perr[100];                         /* why the options could not be read */
 } kz_args_t;
 
 enum { KO_NOCONFIG = 256, KO_VIEW, KO_SQLITE, KO_CONNINFO, KO_SCHEMA, KO_ALL, KO_MODE, KO_TYPES, KO_SERIAL, KO_STRICT, KO_RELOAD, KO_TYPE, KO_FORMAT, KO_VERBOSE, KO_DIR,
-       KO_FORCE };
+       KO_FORCE, KO_AUDIT };
 
 static const struct option k_long[] = {
     { "config", required_argument, NULL, 'c' }, { "no-config", no_argument, NULL, KO_NOCONFIG }, { "view", required_argument, NULL, KO_VIEW },
@@ -174,7 +177,7 @@ static const struct option k_long[] = {
     { "all", no_argument, NULL, KO_ALL }, { "mode", required_argument, NULL, KO_MODE }, { "types", required_argument, NULL, KO_TYPES },
     { "dry-run", no_argument, NULL, 'n' }, { "serial", required_argument, NULL, KO_SERIAL }, { "strict", no_argument, NULL, KO_STRICT },
     { "reload", no_argument, NULL, KO_RELOAD }, { "type", required_argument, NULL, KO_TYPE }, { "format", required_argument, NULL, KO_FORMAT },
-    { "verbose", no_argument, NULL, KO_VERBOSE }, { "dir", required_argument, NULL, KO_DIR }, { "force", no_argument, NULL, KO_FORCE },
+    { "verbose", no_argument, NULL, KO_VERBOSE }, { "dir", required_argument, NULL, KO_DIR }, { "force", no_argument, NULL, KO_FORCE }, { "audit", required_argument, NULL, KO_AUDIT },
     { "help", no_argument, NULL, 'h' }, { "version", no_argument, NULL, 'v' }, { NULL, 0, NULL, 0 }
 };
 
@@ -223,6 +226,7 @@ static int kz_parse(int argc, char **argv, const char **cmd, kz_args_t *a) {
         case KO_VERBOSE: a->verbose = true; break;
         case KO_DIR: a->dir = optarg; break;
         case KO_FORCE: a->force = true; break;
+        case KO_AUDIT: a->audit = optarg; break;
         case ':': snprintf(a->perr, sizeof(a->perr), "the option %.60s needs a value", argv[optind - 1]); return 2;
         default: snprintf(a->perr, sizeof(a->perr), "unknown option %.60s", argv[optind - 1]); return 2;
         }
@@ -246,6 +250,7 @@ typedef struct {
     const char *zone_view;                  /* the view name import puts a zone in / export lists (NULL: none) */
     zone_veff_t veff;
     zone_limits_t limits;
+    char actor[96];                         /* the db_role of the SQLite3 audit actor row: karidns-zone:<OS user> */
     pdns_opts_t reader;
     const char **file_zones;                /* the master zones of the configuration (the view's, or all) */
     size_t nfile_zones;
@@ -371,6 +376,9 @@ static int kz_resolve(const kz_args_t *a, kz_ctx_t *x) {
     }
     if (!shared) x->zone_view = NULL;                       /* a view with a source of its own ignores karidns_domain_views */
     x->src.driver = x->drv->name;
+    const struct passwd *pw = getpwuid(geteuid());
+    if (pw && pw->pw_name) snprintf(x->actor, sizeof(x->actor), "karidns-zone:%.60s", pw->pw_name);
+    else snprintf(x->actor, sizeof(x->actor), "karidns-zone:uid%lu", (unsigned long)geteuid());
     if (x->have_cfg) {
         const char *vn = x->view ? x->view->name : NULL;
         zone_vopts_effective(&x->cfg, NULL, vn, &x->veff);
@@ -470,6 +478,8 @@ static int kz_cmd_import(const kz_args_t *a, kz_ctx_t *x) {
     memset(&o, 0, sizeof(o));
     o.drv = x->drv;
     o.src = x->src;
+    o.audit_summary = a->audit && kz_ieq(a->audit, "summary");
+    o.audit_actor = x->actor;
     o.mode = a->mode && kz_ieq(a->mode, "merge") ? ZI_MERGE : ZI_REPLACE;
     o.serial = a->serial && kz_ieq(a->serial, "increment") ? ZI_SERIAL_INCREMENT : a->serial && kz_ieq(a->serial, "keep") ? ZI_SERIAL_KEEP : ZI_SERIAL_GROW;
     o.dry_run = a->dry_run;
@@ -803,11 +813,12 @@ static int kz_check_args(const kz_args_t *a, bool import) {
         if (a->serial && !kz_ieq(a->serial, "grow") && !kz_ieq(a->serial, "increment") && !kz_ieq(a->serial, "keep"))
             return kz_usage_error(j, DC_USAGE_OPTION, "--serial must be grow, increment or keep");
         if (a->type && !kz_ieq(a->type, "NATIVE") && !kz_ieq(a->type, "MASTER")) return kz_usage_error(j, DC_USAGE_OPTION, "--type must be NATIVE or MASTER");
+        if (a->audit && !kz_ieq(a->audit, "rows") && !kz_ieq(a->audit, "summary")) return kz_usage_error(j, DC_USAGE_OPTION, "--audit must be rows or summary");
         if (a->all && a->format && kz_ieq(a->format, "bind")) return kz_usage_error(j, DC_USAGE_OPTION, "--all reads a tinydns data file: --format bind cannot be used with it");
         if (a->all ? a->nargs != 1 : a->nargs != 2) return kz_usage_error(j, DC_USAGE_ARGS, a->all ? "import --all takes one argument: the tinydns data file" : "import takes a zone name and a file (or -)");
     } else {
-        if (a->mode || a->types || a->dry_run || a->serial || a->strict || a->reload || a->type || a->verbose)
-            return kz_usage_error(j, DC_USAGE_OPTION, "--mode, --types, --dry-run, --serial, --strict, --reload, --type and --verbose are options of import");
+        if (a->mode || a->types || a->dry_run || a->serial || a->strict || a->reload || a->type || a->verbose || a->audit)
+            return kz_usage_error(j, DC_USAGE_OPTION, "--mode, --types, --dry-run, --serial, --strict, --reload, --type, --verbose and --audit are options of import");
         if (a->dir && !a->all) return kz_usage_error(j, DC_USAGE_OPTION, "--dir is for export --all");
         if (a->all && (!a->dir || a->nargs != 0)) return kz_usage_error(j, DC_USAGE_ARGS, "export --all takes no argument and needs --dir DIR");
         if (!a->all && (a->nargs < 1 || a->nargs > 2)) return kz_usage_error(j, DC_USAGE_ARGS, "export takes a zone name and an optional file");

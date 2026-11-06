@@ -56,6 +56,8 @@ struct db_conn {
     bool writable;              /* M2: opened with open_write() (no PRAGMA query_only) */
     bool in_wtxn;               /* M2: w_begin() is open (in_snapshot is set too, so the reads of the zone work inside it) */
     sqlite3_stmt *st_w[8];      /* M2: the statements of the write functions that run once per row (W_* below) */
+    const char *audit_actor;    /* w_set_audit(): the db_role of the actor row (borrowed: it outlives the connection); NULL = no actor row */
+    bool actor_set;             /* the row of karidns_audit_actor was written in the open write transaction (w_commit deletes it) */
 };
 
 /* M2: the statements kept for the per-row write functions */
@@ -321,8 +323,8 @@ static int sq_check_schema(db_conn_t *c, db_schema_info_t *out) {
         out->has_ext = c->has_ext;
         out->has_reload_requests = out->has_server_status = false;     /* B11: the multi-server tables are PostgreSQL only */
     }
-    /* B10: schema version 1 and 2 (v2 adds karidns_zone_tagdefs.id; the order of the definitions is the rowid either way);
-     * a newer version was written for a later loader */
+    /* B10: schema versions 1 to 3 (v2 adds karidns_zone_tagdefs.id; the order of the definitions is the rowid either way; v3 adds the
+     * audit tables, which the loader never uses); a newer version was written for a later loader */
     static const char *const sv_cols[] = { "version", NULL };
     if ((rc = table_columns(c, "karidns_schema_version", sv_cols, &found, &rows)) != 0) return rc;
     if (rows > 0 && found == 1u) {
@@ -332,8 +334,8 @@ static int sq_check_schema(db_conn_t *c, db_schema_info_t *out) {
         if (rc == SQLITE_ROW) {
             sqlite3_int64 v = sqlite3_column_type(st, 0) == SQLITE_NULL ? 0 : sqlite3_column_int64(st, 0);
             sqlite3_finalize(st);
-            if (v > 2) {
-                set_err(c, "schema: karidns_schema_version is %lld; this loader reads versions 1 and 2", (long long)v);
+            if (v > 3) {
+                set_err(c, "schema: karidns_schema_version is %lld; this loader reads versions 1 to 3", (long long)v);
                 return -1;
             }
             return 0;
@@ -411,7 +413,7 @@ static int sq_schema_findings(db_conn_t *c, const db_check_opts_t *o, db_finding
         long long v = sqlite3_column_type(st, 0) == SQLITE_NULL ? 0 : sqlite3_column_int64(st, 0);
         sqlite3_finalize(st);
         if (v == 0) fnd(cb, ud, 'W', "karidns_schema_version has no row");
-        else if (v > 2) fnd(cb, ud, 'E', "karidns_schema_version is %lld; this loader reads versions 1 and 2", v);
+        else if (v > 3) fnd(cb, ud, 'E', "karidns_schema_version is %lld; this loader reads versions 1 to 3", v);
         else fnd(cb, ud, 'I', "karidns_* schema version %lld", v);
     }
     if (o && o->auto_reload) {
@@ -1083,6 +1085,37 @@ static int wstep1(db_conn_t *c, sqlite3_stmt *st, const char *what) {
     return ret;
 }
 
+/* Who is writing, for the audit triggers of db/karidns_audit.sqlite3.sql: the one row (id 1) of karidns_audit_actor, written first in the
+ * transaction and deleted by w_commit().  A database without the table (schema version 2, or an older file) gets no row.  Inside
+ * BEGIN IMMEDIATE, so no other writer can see the row. */
+static int put_actor(db_conn_t *c) {
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(c->db, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'karidns_audit_actor'", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc == SQLITE_DONE) return 0;
+    if (rc != SQLITE_ROW) return sql_fail(c, rc, "karidns_audit_actor");
+    st = NULL;
+    rc = sqlite3_prepare_v2(c->db, "INSERT OR REPLACE INTO karidns_audit_actor (id, principal_id, principal_name, change_set, db_role) "
+                                   "VALUES (1, NULL, NULL, NULL, ?1)", -1, &st, NULL);
+    if (rc != SQLITE_OK) return sql_fail(c, rc, "karidns_audit_actor");
+    sqlite3_bind_text(st, 1, c->audit_actor, -1, SQLITE_STATIC);
+    int ret = wstep1(c, st, "karidns_audit_actor");
+    c->actor_set = ret == 0;
+    return ret;
+}
+
+/* karidns-zone --audit (dns_db_driver.h): the actor the next w_begin() writes; summary does not exist on SQLite3 */
+static int sq_w_set_audit(db_conn_t *c, bool summary, const char *actor) {
+    (void)summary;
+    if (!c->writable || c->in_wtxn) {
+        set_err(c, "w_set_audit: needs a writable connection outside a transaction");
+        return -1;
+    }
+    c->audit_actor = actor;
+    return 0;
+}
+
 static int sq_w_begin(db_conn_t *c, const char *zone) {
     (void)zone;                         /* the lock is the whole database: BEGIN IMMEDIATE takes SQLite's one write lock */
     if (!c->writable) {
@@ -1095,6 +1128,10 @@ static int sq_w_begin(db_conn_t *c, const char *zone) {
     }
     int rc = exec(c, "BEGIN IMMEDIATE");
     if (rc != 0) return rc;
+    if (c->audit_actor && (rc = put_actor(c)) != 0) {
+        sqlite3_exec(c->db, "ROLLBACK", NULL, NULL, NULL);          /* a failed w_begin leaves no transaction open */
+        return rc;
+    }
     c->in_wtxn = c->in_snapshot = true;
     return 0;
 }
@@ -1103,6 +1140,14 @@ static int sq_w_commit(db_conn_t *c) {
     int ret = wcheck(c, "w_commit");
     if (ret != 0) return ret;
     rearm_all(c);
+    if (c->actor_set) {
+        c->actor_set = false;
+        if ((ret = exec(c, "DELETE FROM karidns_audit_actor WHERE id = 1")) != 0) {
+            c->in_wtxn = c->in_snapshot = false;
+            sqlite3_exec(c->db, "ROLLBACK", NULL, NULL, NULL);
+            return ret;
+        }
+    }
     c->in_wtxn = c->in_snapshot = false;
     ret = exec(c, "COMMIT");
     if (ret != 0) sqlite3_exec(c->db, "ROLLBACK", NULL, NULL, NULL);       /* a failed COMMIT can leave the transaction open */
@@ -1115,6 +1160,7 @@ static int sq_w_rollback(db_conn_t *c) {
     for (size_t i = 0; i < sizeof(c->st_w) / sizeof(c->st_w[0]); i++)
         if (c->st_w[i]) rearm(c->st_w[i]);
     c->in_wtxn = c->in_snapshot = false;
+    c->actor_set = false;                       /* the ROLLBACK takes the actor row with the rest */
     return exec(c, "ROLLBACK");
 }
 
@@ -1317,6 +1363,7 @@ const db_driver_t db_driver_sqlite3 = {
     sq_open_write, sq_w_begin, sq_w_commit, sq_w_rollback, sq_w_create_zone, sq_w_delete_records, sq_w_insert_record, sq_w_insert_tags,
     sq_w_insert_tinydns, sq_w_delete_tagdefs, sq_w_insert_tagdef, sq_w_delete_meta, sq_w_insert_meta, sq_w_set_view, sq_w_request_reload,
     sq_w_zone_has_keys,
+    sq_w_set_audit,     /* schema version 3 */
 };
 
 #endif /* KARIDNS_DB_SQLITE3 */

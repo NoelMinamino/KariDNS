@@ -179,9 +179,13 @@ if [ $BACKEND = sqlite3 ]; then sql "DROP TABLE karidns_profiles"; else sql "DRO
 conf; run
 warn "one extension table missing" "table karidns_profiles is missing or incomplete"
 db_reset
-sql "INSERT INTO karidns_schema_version (version) VALUES (3)"
+sql "INSERT INTO karidns_schema_version (version) VALUES (4)"
 conf; run
-err "a newer schema version" "karidns_schema_version is 3"
+err "a newer schema version" "karidns_schema_version is 4"
+db_reset
+sql "UPDATE karidns_schema_version SET version = 3"
+conf; run
+has "version 3 is read" "karidns_[*] schema version 3"
 db_reset
 conf; run
 has "the schema version is reported" "karidns_\* schema version"

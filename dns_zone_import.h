@@ -77,6 +77,8 @@ typedef struct {
     int n_loc_tags;
     zone_limits_t limits;               /* max-records, max-records-per-type, max-types-per-name, max-zone-ttl; 0 = no limit */
     pdns_opts_t reader;                 /* default-ttl, max-zone-records and max-zone-bytes of options { database { } } for the read-back; zero = the loader's defaults */
+    bool audit_summary;                 /* the audit log (schema version 3): PostgreSQL logs one row per statement and table instead of one per row */
+    const char *audit_actor;            /* SQLite3: the db_role of the row of karidns_audit_actor each write transaction carries (NULL: no row); must outlive the import */
     zi_report_fn report;                /* NULL: no report */
     void *report_ud;
     zmsg_t msg;                         /* where the messages go; zero: dns_diag */

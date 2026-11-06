@@ -2475,6 +2475,7 @@ static void test_scan_apex_cross(void) {
 
 /* M2 (the 0.6.0 ZoneImporter): the write functions of an open_write() connection.  The loader's connections (open) are read only and refuse them. */
 static char g_ext_path[600];                /* db/karidns_ext.sqlite3.sql */
+static char g_audit_path[600];              /* db/karidns_audit.sqlite3.sql */
 
 static long sq_count(sqlite3 *db, const char *sql) {
     sqlite3_stmt *st = NULL;
@@ -2591,6 +2592,152 @@ static void test_writes(void) {
     sqlite3_close(db);
 }
 
+
+/* schema version 3 (0.6.0 item B): versions 1 to 3 are read, 4 is refused (check_schema and schema_findings) */
+static void sv_finding(void *ud, char level, const char *text) {
+    char *buf = ud;
+    size_t l = strlen(buf);
+    snprintf(buf + l, 600 - l, "%c:%s\n", level, text);
+}
+
+static void test_schema_versions(void) {
+    printf("schema versions 1 to 3 (item B)\n");
+    char path[600], err[DB_ERRLEN];
+    sqlite3 *db = make_db("versions.db", path, sizeof(path));
+    char *ext = slurp(g_ext_path);
+    CHECK(ext != NULL);
+    if (ext) raw_exec(db, ext);
+    free(ext);
+    const db_driver_t *D = &db_driver_sqlite3;
+    CHECK(sq_count(db, "SELECT version FROM karidns_schema_version") == 3);
+    CHECK(sq_count(db, "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('karidns_audit_log', 'karidns_audit_actor')") == 2);
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL);
+    if (!c) {
+        sqlite3_close(db);
+        return;
+    }
+    db_schema_info_t si;
+    db_check_opts_t o = { false, NULL };
+    char buf[600];
+    for (int v = 1; v <= 3; v++) {
+        sqlf(db, "UPDATE karidns_schema_version SET version = %d", v);
+        CHECK(D->check_schema(c, &si) == 0);
+        buf[0] = '\0';
+        CHECK(D->schema_findings(c, &o, sv_finding, buf) == 0);
+        char want[40];
+        snprintf(want, sizeof(want), "I:karidns_* schema version %d", v);
+        CHECK_HAS(buf, want);
+    }
+    sqlf(db, "UPDATE karidns_schema_version SET version = 4");
+    CHECK(D->check_schema(c, &si) == -1);
+    CHECK_HAS(D->errmsg(c), "versions 1 to 3");
+    buf[0] = '\0';
+    CHECK(D->schema_findings(c, &o, sv_finding, buf) == 0);
+    CHECK_HAS(buf, "E:karidns_schema_version is 4; this loader reads versions 1 to 3");
+    D->close(c);
+    sqlite3_close(db);
+}
+
+/* the SQLite3 audit actor (w_set_audit): the row is written first in the write transaction, the audit triggers of
+ * db/karidns_audit.sqlite3.sql name it, and w_commit deletes it */
+static long sq_text_eq(sqlite3 *db, const char *sql, const char *want) {
+    sqlite3_stmt *st = NULL;
+    long ok = 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) {
+        const char *t = (const char *)sqlite3_column_text(st, 0);
+        ok = want ? (t && strcmp(t, want) == 0) : sqlite3_column_type(st, 0) == SQLITE_NULL;
+    }
+    sqlite3_finalize(st);
+    return ok;
+}
+
+static void test_audit_actor(void) {
+    printf("audit actor (w_set_audit)\n");
+    char path[600], err[DB_ERRLEN];
+    sqlite3 *db = make_db("actor.db", path, sizeof(path));
+    char *ext = slurp(g_ext_path), *aud = slurp(g_audit_path);
+    CHECK(ext != NULL && aud != NULL);
+    if (ext) raw_exec(db, ext);
+    if (aud) raw_exec(db, aud);
+    free(ext);
+    free(aud);
+    const db_driver_t *D = &db_driver_sqlite3;
+    db_conn_t *ro = open_driver(path, 0, err, sizeof(err), NULL), *c = NULL;
+    db_source_t src = { "sqlite3", path, NULL, NULL, 200 };
+    CHECK(ro != NULL && D->open_write(&c, &src, err, sizeof(err)) == 0);
+    if (!ro || !c) {
+        sqlite3_close(db);
+        return;
+    }
+    int64_t did = 0, rid = 0;
+    db_record_row_t row = { 0, 300, 10, false, false, false, "a.act.test", "MX", "mx.act.test", NULL };
+    CHECK(D->w_set_audit(ro, false, "karidns-zone:x") == -1);
+    CHECK_HAS(D->errmsg(ro), "writable connection");
+    /* no actor given: the rows are logged with NULLs */
+    CHECK(D->w_begin(c, "act.test") == 0 && D->w_create_zone(c, "act.test", NULL, &did) == 0 && D->w_commit(c) == 0);
+    CHECK(sq_count(db, "SELECT count(*) FROM karidns_audit_log WHERE table_name = 'domains' AND op = 'I' AND zone_name = 'act.test' AND db_role IS NULL") == 1);
+    CHECK(sq_count(db, "SELECT count(*) FROM karidns_audit_actor") == 0);
+    /* an actor: one row inside the transaction, none after the commit, and the audit rows carry it */
+    CHECK(D->w_set_audit(c, true, "karidns-zone:tester") == 0);
+    CHECK(D->w_begin(c, "act.test") == 0);
+    CHECK(D->w_set_audit(c, false, "other") == -1);                      /* not inside a transaction */
+    CHECK(D->w_insert_record(c, did, &row, true, &rid) == 0 && D->w_commit(c) == 0);
+    CHECK(sq_count(db, "SELECT count(*) FROM karidns_audit_actor") == 0);
+    CHECK(sq_text_eq(db, "SELECT db_role FROM karidns_audit_log WHERE table_name = 'records' AND op = 'I'", "karidns-zone:tester"));
+    CHECK(sq_text_eq(db, "SELECT zone_name FROM karidns_audit_log WHERE table_name = 'records' AND op = 'I'", "act.test"));
+    CHECK(sq_text_eq(db, "SELECT json_extract(after, '$.content') FROM karidns_audit_log WHERE table_name = 'records' AND op = 'I'", "mx.act.test"));
+    CHECK(sq_text_eq(db, "SELECT principal_id FROM karidns_audit_log WHERE table_name = 'records' AND op = 'I'", NULL));
+    /* a rolled back transaction leaves neither the actor row nor an audit row */
+    long before = sq_count(db, "SELECT count(*) FROM karidns_audit_log");
+    CHECK(D->w_begin(c, "act.test") == 0 && D->w_delete_records(c, did, NULL, 0) == 0 && D->w_rollback(c) == 0);
+    CHECK(sq_count(db, "SELECT count(*) FROM karidns_audit_actor") == 0 && sq_count(db, "SELECT count(*) FROM karidns_audit_log") == before);
+    /* the next transaction after the rollback works as before (the actor is written again) */
+    CHECK(D->w_begin(c, "act.test") == 0 && D->w_delete_records(c, did, NULL, 0) == 0 && D->w_commit(c) == 0);
+    CHECK(sq_text_eq(db, "SELECT db_role FROM karidns_audit_log WHERE table_name = 'records' AND op = 'D'", "karidns-zone:tester"));
+    /* a stale row of a crashed writer is replaced, not an error */
+    raw_exec(db, "INSERT INTO karidns_audit_actor (id, db_role) VALUES (1, 'stale')");
+    CHECK(D->w_begin(c, "act.test") == 0 && D->w_commit(c) == 0);
+    CHECK(sq_count(db, "SELECT count(*) FROM karidns_audit_actor") == 0);
+    D->close(c);
+    D->close(ro);
+    sqlite3_close(db);
+    /* a database without the table (schema version 2): the actor is ignored */
+    db = make_db("actor_noext.db", path, sizeof(path));
+    src.database_file = path;
+    c = NULL;
+    CHECK(D->open_write(&c, &src, err, sizeof(err)) == 0 && D->w_set_audit(c, false, "karidns-zone:tester") == 0);
+    CHECK(D->w_begin(c, "x.test") == 0 && D->w_create_zone(c, "x.test", NULL, &did) == 0 && D->w_commit(c) == 0);
+    CHECK(sq_count(db, "SELECT count(*) FROM domains") == 1);
+    D->close(c);
+    sqlite3_close(db);
+    /* a table of that name that cannot take the row: w_begin fails and leaves no transaction open */
+    db = make_db("actor_bad.db", path, sizeof(path));
+    raw_exec(db, "CREATE TABLE karidns_audit_actor (x INTEGER)");
+    src.database_file = path;
+    c = NULL;
+    CHECK(D->open_write(&c, &src, err, sizeof(err)) == 0 && D->w_set_audit(c, false, "karidns-zone:tester") == 0);
+    CHECK(D->w_begin(c, "x.test") == -1);
+    CHECK_HAS(D->errmsg(c), "karidns_audit_actor");
+    CHECK(D->w_set_audit(c, false, NULL) == 0 && D->w_begin(c, "x.test") == 0 && D->w_commit(c) == 0);       /* without an actor it works */
+    D->close(c);
+    sqlite3_close(db);
+    /* the row cannot be deleted: the commit fails and nothing is committed */
+    db = make_db("actor_del.db", path, sizeof(path));
+    raw_exec(db, "CREATE TABLE karidns_audit_actor (id INTEGER PRIMARY KEY, principal_id INTEGER, principal_name TEXT, change_set TEXT, db_role TEXT);"
+                 "CREATE TRIGGER karidns_test_nodel BEFORE DELETE ON karidns_audit_actor BEGIN SELECT RAISE(ABORT, 'no delete'); END");
+    src.database_file = path;
+    c = NULL;
+    CHECK(D->open_write(&c, &src, err, sizeof(err)) == 0 && D->w_set_audit(c, false, "karidns-zone:tester") == 0);
+    CHECK(D->w_begin(c, "x.test") == 0 && D->w_create_zone(c, "x.test", NULL, &did) == 0);
+    CHECK(D->w_commit(c) == -1);
+    CHECK_HAS(D->errmsg(c), "no delete");
+    CHECK(sq_count(db, "SELECT count(*) FROM domains") == 0 && sq_count(db, "SELECT count(*) FROM karidns_audit_actor") == 0);
+    CHECK(D->w_rollback(c) == 0);
+    D->close(c);
+    sqlite3_close(db);
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/db";
     snprintf(g_schema, sizeof(g_schema), "%s/pdns_schema.sqlite3.sql", dir);
@@ -2634,7 +2781,10 @@ int main(int argc, char **argv) {
     test_profiles_and_views();
     test_driver_faults();
     snprintf(g_ext_path, sizeof(g_ext_path), "%s/../../db/karidns_ext.sqlite3.sql", dir);
+    snprintf(g_audit_path, sizeof(g_audit_path), "%s/../../db/karidns_audit.sqlite3.sql", dir);
     test_writes();
+    test_schema_versions();
+    test_audit_actor();
     test_cli();
     free(g_schema_sql);
     rm_tree(g_dir);

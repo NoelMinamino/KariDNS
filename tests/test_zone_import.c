@@ -1136,6 +1136,14 @@ static void t_inputs(void) {
     zi_close(z);
 }
 
+/* a w_set_audit that fails (item B) */
+static int audit_fails(db_conn_t *c, bool summary, const char *actor) {
+    (void)c;
+    (void)summary;
+    (void)actor;
+    return -1;
+}
+
 static void t_options(void) {
     printf("  options, the file zone warning, keys\n");
     be_fresh(true);
@@ -1158,6 +1166,31 @@ static void t_options(void) {
     CHECK(zi_open(&o) == NULL);
     LOG_HAS("db.import.open");
     o.drv = g_drv;
+    /* the audit options (item B): w_set_audit is called when one is asked for; a driver without it is fine, one that fails is an open error */
+    {
+        db_driver_t fd = *g_drv;
+        o.audit_summary = true;
+        o.audit_actor = "karidns-zone:test";
+        zi_t *az = zi_open(&o);                                 /* the real driver */
+        CHECK(az != NULL);
+        zi_close(az);
+        fd.w_set_audit = NULL;
+        o.drv = &fd;
+        az = zi_open(&o);
+        CHECK(az != NULL);
+        zi_close(az);
+        fd.w_set_audit = audit_fails;
+        o.drv = &fd;
+        log_reset();
+        CHECK(zi_open(&o) == NULL);
+        LOG_HAS("db.import.open");
+        o.audit_summary = false;
+        o.audit_actor = NULL;
+        az = zi_open(&o);                                       /* nothing asked for: not called */
+        CHECK(az != NULL);
+        zi_close(az);
+        o.drv = g_drv;
+    }
     /* a database that cannot be opened / has no PowerDNS tables */
     zi_opts_t bad = o;
     if (g_be == BE_SQLITE) bad.src.database_file = "/nonexistent/dir/x.db";
