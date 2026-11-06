@@ -410,13 +410,15 @@ int main(int argc, char **argv) {
         }
         fflush(stdout);
     }
-    close(g_fetch.fd);
+    /* the end of the Backend: the first stream is closed first and the fetch stream only once the loader has gone.  Closed together, the loader may see the
+     * fetch stream go before the first one and end with an error status ("the fetch stream is gone"), as it should for a fetch stream lost on its own */
     close(g_main.fd);
     int64_t end = now_ms() + 15000;
     while (!g_child_gone && now_ms() < end) {
         if (waitpid(g_pid, &g_child_status, WNOHANG) == g_pid) g_child_gone = true;
         else usleep(20000);
     }
+    close(g_fetch.fd);
     if (!g_child_gone) {
         kill(g_pid, SIGKILL);
         waitpid(g_pid, &g_child_status, 0);

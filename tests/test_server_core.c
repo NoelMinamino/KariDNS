@@ -56,6 +56,7 @@ static pid_t quiet_fork(void) {
 void run_frontend_router(pid_t backend_pid, int router_id);
 void backend_sig_handler(int sig);
 void backend_sighup_noop(int sig);
+bool sighup_decide(int drained, bool from_manager, long delivered, bool *last_reload);
 void daemonize(void);
 void supervisor_sig_handler(int sig);
 void cleanup_pid_file(void);
@@ -3886,6 +3887,30 @@ static void test_backend_sighup_noop(void) {
     printf("  -> SIGHUP handler passed.\n");
 }
 
+/* P5: SIGHUP to every process (pkill -HUP) reaches the Backend twice, directly and forwarded by the manager.  A standard signal that
+ * arrives while one is pending merges into it, and kqueue reports that delivery again: one reload in every order of the two. */
+static void test_sighup_decide(void) {
+    printf("[TEST] Server Core: SIGHUP from the manager and directly: one reload whatever merges...\n");
+    bool last = false;
+    /* separate events: direct (ignored), then forwarded (reload) */
+    assert(!sighup_decide(1, false, 1, &last));
+    assert(sighup_decide(1, true, 1, &last));
+    /* forwarded taken, the direct one merged into it and reported again with nothing to take: no second reload */
+    assert(sighup_decide(1, true, 1, &last));
+    assert(!sighup_decide(0, false, 1, &last));
+    /* direct taken (ignored), the forwarded one merged into it: the second event reloads */
+    assert(!sighup_decide(1, false, 1, &last));
+    assert(sighup_decide(0, false, 1, &last));
+    /* both delivered before the event was read, the direct one is what is pending: reload (the merged one may be the manager's) */
+    last = false;
+    assert(sighup_decide(1, false, 2, &last));
+    assert(!sighup_decide(0, false, 1, &last));
+    /* no drain before any decision (the first event): reload, as before */
+    last = false;
+    assert(sighup_decide(0, false, 1, &last));
+    printf("  -> SIGHUP decisions passed.\n");
+}
+
 static void test_control_zonestatus_empty_and_populated(void) {
     printf("[TEST] Server Core: Control ZONESTATUS formatting...\n");
     zone_db_entry_t entry;
@@ -6648,6 +6673,7 @@ int main(void) {
     test_acquire_release_config_snapshot_concurrency();
     test_server_core_sighup_sigusr1_handlers();
     test_backend_sighup_noop();
+    test_sighup_decide();
     test_control_zonestatus_empty_and_populated();
     test_broker_connect_error_branches();
     test_control_socket_eof_handling();
