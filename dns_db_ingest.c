@@ -2642,13 +2642,15 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
     syslog(LOG_WARNING, "[DB] fetch of zone '%s' (view '%s') failed: %s", done.zone, done.view_name, why && why[0] ? why : "no reason given");
   if (dbreg_pending_count() > 0) apply_delta(g);         /* a zone that was new to the index becomes visible before its queries are woken */
   if (ok && !done.quiet && done.mode == KDB_FETCH_FULL) dbreg_touch_loaded(done.view_name, done.zone);
-  /* a zone that only a background fetch (a CNAME or glue that leads into it, step 8) brought is the first to go, as one that a transfer brought (design 7): N cold name
-   * servers behind the glue of one zone must not push the zones the queries use out of memory.  The mark is dropped by the cache manager when a query is answered from the zone. */
+  /* a zone that only a background fetch (a CNAME or glue that leads into it, step 8) brought is the first to go when memory-limit needs room (BGLOAD): N cold name
+   * servers behind the glue of one zone must not push the zones the queries use out of memory.  Unlike a zone a transfer brought (design 7) it stays while there
+   * is room: the next query that follows the chain or wants the glue is why it was asked for.  The mark is dropped by the cache manager when a query is answered
+   * from the zone. */
   /* a zone of the hot list starts with a frequency of its rank (the list is read hottest first: the first has the number of zones in the list, the last 1), not 0: a zone
    * with no queries yet is the cache manager's first victim, and the warm-up must not read the zones that matter most only to lose them first.  The queries that follow
    * add to it. */
   if (ok && done.hot && !done.dropped && done.mode == KDB_FETCH_FULL) dbreg_warm_freq(done.view_name, done.zone, g->wl_count > done.hrank ? g->wl_count - done.hrank : 1);
-  if (ok && !done.dropped && !done.quiet && done.mode == KDB_FETCH_FULL && done.prio == KDB_FETCH_PRIO_BACKGROUND) dbreg_xfr_loaded(done.view_name, done.zone);
+  if (ok && !done.dropped && !done.quiet && done.mode == KDB_FETCH_FULL && done.prio == KDB_FETCH_PRIO_BACKGROUND) dbreg_bg_loaded(done.view_name, done.zone);
   if ((!ok || done.dropped) && done.want_summary) warm_add(g, done.view_name, done.zone);     /* (the summary that was not asked for because this request was on its way) */
   if (!done.quiet) park_wake_broadcast(done.view_name, done.zone, !ok);      /* (the summary for the apex wakes nobody: no query waits for it, and the queries that wait for the data are not woken for nothing) */
 }

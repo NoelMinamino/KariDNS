@@ -2154,6 +2154,38 @@ static void test_zone_bytes(void) {
     CHECK(ot.resident <= ot0.resident + 1 && ot.retired == ot0.retired);                 /* the file zone left with its snapshot */
 }
 
+/* ---- D1a step 8: a zone that only a background fetch brought (BGLOAD) stays while there is room and is the first to go under pressure ---- */
+static void test_bgload_cache(void) {
+    printf("[TEST] cache manager: a zone that only a background fetch brought stays while there is room and goes first under memory pressure...\n");
+    dbreg_reset();
+    rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+    const char *names[3] = { "bg0.test.", "bg1.test.", "bg2.test." };
+    zone_db_entry_t *z[3];
+    for (int i = 0; i < 3; i++) {
+        z[i] = add_zone("default", names[i], 1, 100, 9400 + i);
+        CHECK(z[i] != NULL && snapshot_apply_db_delta() == 1);
+    }
+    dbreg_bg_loaded("default", "bg1.test.");                                     /* (bg0 and bg2: as any zone a query loaded) */
+    usleep(200 * 1000);                                                           /* (a zone is not taken out within 100 ms of its load) */
+    zone_bytes_t d;
+    zone_bytes_get(ZBYTES_DB, &d);
+    uint64_t used = d.resident + d.retired + d.previous;
+    dbreg_cache_set_limit(used * 2);                                              /* room: nothing to do, the marked zone stays */
+    CHECK(dbreg_cache_round() == 0 && dbreg_lookup_entry("default", "bg1.test.") == z[1]);
+    dbreg_cache_set_limit(used * 100 / 96);                                       /* above the high-water mark, less than one zone to free */
+    CHECK(dbreg_cache_round() == 1);
+    CHECK(dbreg_lookup_entry("default", "bg1.test.") == NULL && dbreg_lookup_entry("default", "bg0.test.") == z[0] &&
+          dbreg_lookup_entry("default", "bg2.test.") == z[2]);                   /* the marked one went first, only it */
+    dbreg_cache_set_limit(0);
+    zone_retire_process(true);
+    dbreg_reset();
+    rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+}
+
 /* ---- karictl rollback for DB zones: prev from a database install, the memory limit drops it first, a rollback pins the zone ---- */
 static void test_prev_db(void) {
     printf("[TEST] rollback of DB zones: prev from an install, the cache manager drops it before it evicts a zone, a rollback pins the zone...\n");
@@ -2296,6 +2328,7 @@ int main(void) {
     test_dir_bytes_per_zone();
     test_zone_bytes();
     test_prev_db();
+    test_bgload_cache();
     test_prev_concurrent();
     test_concurrent();
     gc_snapshot_wait_idle();      /* join the cleanup threads: none is left running (or leaked, for ThreadSanitizer) at exit */

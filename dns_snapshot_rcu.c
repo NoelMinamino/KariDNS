@@ -2445,7 +2445,7 @@ int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, boo
     z->shadowed = sh;
     z->shadow_by = sh_cfg ? DBREG_SH_CONFIG : sh_cat ? DBREG_SH_CATALOG : DBREG_SH_NONE;
     if (created) {                                                  /* new data in memory: the cache manager starts counting from here */
-        z->flags &= (uint16_t)~(ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD);
+        z->flags &= (uint16_t)~(ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD | ZDIR_F_BGLOAD);
         z->qseen = 0;
         z->t_load = (uint32_t)cache_mono_ms();
     }
@@ -3040,7 +3040,9 @@ zone_db_entry_t *dbreg_xfr_acquire(zdir_elem_t *z) {
     return e;
 }
 
-void dbreg_xfr_loaded(const char *view, const char *zone) {
+/* bg: a background fetch brought the zone (BGLOAD: the first to go under memory pressure, kept while there is room); else a transfer (EVICT_NEXT | XFRLOAD:
+ * taken out when the transfer is over).  Both count in marked= of karictl dbstatus. */
+static void dbreg_mark_loaded(const char *view, const char *zone, bool bg) {
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
     dbreg_view_t *rv = dbreg_view_get(view, false);
     dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
@@ -3050,14 +3052,21 @@ void dbreg_xfr_loaded(const char *view, const char *zone) {
     if (e && (uint32_t)atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed) != z->qseen) e = NULL;
     /* a pinned zone and one a dynamic UPDATE changed are never taken out; a zone that queries asked for more often than the zones the manager took out
      * last is worth its memory whoever loaded it; one that is marked already (admission) needs nothing */
-    if (e && !(z->flags & (ZDIR_F_PIN | ZDIR_F_NOCACHE | ZDIR_F_EVICT_NEXT | ZDIR_F_DELETED)) && !atomic_load_explicit(&e->updated, memory_order_relaxed) &&
+    if (e && !(z->flags & (ZDIR_F_PIN | ZDIR_F_NOCACHE | ZDIR_F_EVICT_NEXT | ZDIR_F_BGLOAD | ZDIR_F_DELETED)) && !atomic_load_explicit(&e->updated, memory_order_relaxed) &&
         atomic_load_explicit(&z->freq, memory_order_relaxed) <= atomic_load_explicit(&g_victim_freq, memory_order_relaxed)) {
-        z->flags |= ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD;
-        cache_note_next();
+        if (bg) {
+            z->flags |= ZDIR_F_BGLOAD;                 /* (no hint: without memory pressure the manager has nothing to do with it) */
+        } else {
+            z->flags |= ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD;
+            cache_note_next();
+        }
         atomic_fetch_add_explicit(&g_xfr_marked, 1, memory_order_relaxed);
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
 }
+
+void dbreg_xfr_loaded(const char *view, const char *zone) { dbreg_mark_loaded(view, zone, false); }
+void dbreg_bg_loaded(const char *view, const char *zone) { dbreg_mark_loaded(view, zone, true); }
 
 void dbreg_xfr_note(int kind) {
     if (kind >= 0 && kind < 4) atomic_fetch_add_explicit(&g_xfr_count[kind], 1, memory_order_relaxed);
@@ -3156,6 +3165,7 @@ typedef struct {
     dbreg_view_t *rv;
     dbreg_zone_t *z;
     double prio;                  /* GDSF: the lowest goes first; negative: take out first */
+    bool next;                    /* EVICT_NEXT / no-cache: taken out whatever is still to be freed (BGLOAD only goes first: prio < 0, next false) */
     uint64_t bytes;
     uint32_t freq;
     bool young;                   /* in memory for less than CACHE_MIN_RESIDENT_MS: it is not taken out yet */
@@ -3284,8 +3294,8 @@ uint32_t dbreg_cache_round(void) {
                 pinned_now += bytes;
                 continue;
             }
-            if ((z->flags & ZDIR_F_XFRLOAD) && dq > 0)         /* queries use the zone that a transfer brought: it is no transfer-only read, GDSF decides (design 7) */
-                z->flags &= (uint16_t)~(ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD);
+            if ((z->flags & (ZDIR_F_XFRLOAD | ZDIR_F_BGLOAD)) && dq > 0)   /* queries use the zone that a transfer or a background fetch brought: GDSF decides (design 7) */
+                z->flags &= (uint16_t)~(ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD | ZDIR_F_BGLOAD);
             if (z->flags & ZDIR_F_EVICT_NEXT) g_cycle_seen_next = true;
             if (bytes == 0) continue;
             if (nc == s_cand_cap) {
@@ -3300,7 +3310,8 @@ uint32_t dbreg_cache_round(void) {
             s_cand[nc].bytes = bytes;
             s_cand[nc].freq = f;
             s_cand[nc].young = now32 - z->t_load < CACHE_MIN_RESIDENT_MS;
-            s_cand[nc].prio = (z->flags & (ZDIR_F_EVICT_NEXT | ZDIR_F_NOCACHE)) ? -1.0
+            s_cand[nc].next = (z->flags & (ZDIR_F_EVICT_NEXT | ZDIR_F_NOCACHE)) != 0;
+            s_cand[nc].prio = s_cand[nc].next ? -2.0 : (z->flags & ZDIR_F_BGLOAD) ? -1.0
                                                                                 : ((double)f + 1.0) * (4096.0 + (double)bytes / 4.0) / (double)bytes;
             nc++;
         }
@@ -3315,7 +3326,7 @@ uint32_t dbreg_cache_round(void) {
     uint64_t young_bytes = 0;              /* the bytes of the unflagged zones seen so far that are only too young to go (they would be taken out before the ones that follow) */
     for (size_t i = 0; i < nc; i++) {
         cache_cand_t *c = &s_cand[i];
-        bool flagged = c->prio < 0;
+        bool flagged = c->next;
         if (c->young) {
             if (!flagged) young_bytes += c->bytes;
             continue;
