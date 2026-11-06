@@ -11,7 +11,8 @@
 #      the share; karictl notify / observatory name the zone once with `shared to views`; view-level minimal-responses differs per view (and
 #      the shared response cache does not mix them up); removing the in-view stops the answers in that view and putting it back starts them
 #   V  in-view-settings view (KariDNS): the in-view zone's own allow-transfer / allow-update / allow-query decide first, then the owner zone's, then
-#      the referencing view's (not the owner view's), then options'; a refused client is not served from the response cache
+#      the referencing view's (not the owner view's), then options'; a refused client is not served from the response cache; an UPDATE is
+#      checked against the in-view zone's allow-query before its allow-update (BIND lib/ns/update.c checkqueryacl())
 #   G  the glue of a shared zone's NS in a sibling zone comes from the client's view (BIND query_getzonedb(): client->view), never from the
 #      owner view's siblings, also through the response cache (queries in both orders)
 # The loopback aliases 127.0.0.2 .. 127.0.0.5 are added when run as root and removed on exit; without them O, V and G are SKIPped.
@@ -256,8 +257,8 @@ view va { match-clients { 127.0.0.2; }; allow-transfer { 127.0.0.2; 127.0.0.4; }
   zone "shr.test" { type master; file "$W/shr.zone"; allow-update { 127.0.0.2; 127.0.0.3; }; allow-transfer { 127.0.0.2; 127.0.0.5; }; };
   zone "inh.test" { type master; file "$W/inh.zone"; allow-transfer { 127.0.0.4; }; };
   zone "inh2.test" { type master; file "$W/inh2.zone"; }; };
-view vb { match-clients { 127.0.0.3; 127.0.0.4; }; allow-transfer { 127.0.0.3; 127.0.0.4; };
-  zone "shr.test" { in-view "va"; allow-transfer { 127.0.0.3; }; allow-update { 127.0.0.4; }; allow-query { 127.0.0.3; }; };
+view vb { match-clients { 127.0.0.3; 127.0.0.4; 127.0.0.5; }; allow-transfer { 127.0.0.3; 127.0.0.4; };
+  zone "shr.test" { in-view "va"; allow-transfer { 127.0.0.3; }; allow-update { 127.0.0.4; 127.0.0.5; }; allow-query { 127.0.0.3; 127.0.0.5; }; };
   zone "inh.test" { in-view "va"; };
   zone "inh2.test" { in-view "va"; }; };
 view vc { match-clients { any; }; zone "ready.test" { type master; file "$W/ready.zone"; }; };
@@ -284,13 +285,17 @@ axfr_ok $PV 127.0.0.3 inh.test && fail "V8: AXFR of inh.test from 127.0.0.3 was 
 axfr_ok $PV 127.0.0.3 inh2.test && pass "V9: neither the in-view zone nor the owner zone has a list: the referencing view's allow-transfer decides (127.0.0.3)" || fail "V9: AXFR of inh2.test from 127.0.0.3"
 axfr_ok $PV 127.0.0.2 inh2.test && pass "V10: ... and the owner view's applies to its own clients (127.0.0.2)" || fail "V10: AXFR of inh2.test from 127.0.0.2"
 
-upd_ok $PV 127.0.0.4 shr.test v1 && pass "V11: an UPDATE through vb: the in-view zone's allow-update lists 127.0.0.4" || fail "V11: UPDATE from 127.0.0.4"
+upd_ok $PV 127.0.0.5 shr.test v1 && pass "V11: an UPDATE through vb: the in-view zone's allow-update lists 127.0.0.5" || fail "V11: UPDATE from 127.0.0.5"
+# BIND lib/ns/update.c checkqueryacl(): the in-view zone's allow-query is checked before its allow-update
+upd_ok $PV 127.0.0.4 shr.test v4 && fail "V11b: an UPDATE from 127.0.0.4 was accepted (allow-update lists it, the in-view zone's allow-query does not)" \
+    || { kari_wait_log "$W/pv.log" "client 127.0.0.4#.*update 'shr.test/IN' denied due to allow-query" 5 \
+         && pass "V11b: an UPDATE from 127.0.0.4 is refused by the in-view zone's allow-query before its allow-update" || fail "V11b: refused, but not due to allow-query"; }
 upd_ok $PV 127.0.0.3 shr.test v2 && fail "V12: an UPDATE from 127.0.0.3 was accepted (the owner zone lists it, the in-view zone's own list overrides)" \
     || pass "V12: an UPDATE from 127.0.0.3 is refused: the in-view zone's own allow-update overrides the owner zone's"
 upd_ok $PV 127.0.0.2 shr.test v3 && pass "V13: through the owner view the owner zone's allow-update applies" || fail "V13: UPDATE from 127.0.0.2"
 sleep 2
-[ "$(q $PV 127.0.0.3 v1.shr.test)" = 192.0.2.99 ] && [ "$(q $PV 127.0.0.2 v1.shr.test)" = 192.0.2.99 ] && [ "$(q $PV 127.0.0.2 v3.shr.test)" = 192.0.2.99 ] && [ -z "$(q $PV 127.0.0.3 v2.shr.test)" ] \
-    && pass "V14: the accepted UPDATEs are in both views, the refused one nowhere" || fail "V14: data after the UPDATEs"
+[ "$(q $PV 127.0.0.3 v1.shr.test)" = 192.0.2.99 ] && [ "$(q $PV 127.0.0.2 v1.shr.test)" = 192.0.2.99 ] && [ "$(q $PV 127.0.0.2 v3.shr.test)" = 192.0.2.99 ] && [ -z "$(q $PV 127.0.0.3 v2.shr.test)" ] && [ -z "$(q $PV 127.0.0.2 v4.shr.test)" ] \
+    && pass "V14: the accepted UPDATEs are in both views, the refused ones nowhere" || fail "V14: data after the UPDATEs"
 
 out=$(ctl pv observatory shr.test)
 echo "$out" | grep -q "^Zone: shr.test. (view: va, shared to views: vb)$" && pass "V15: karictl observatory in view mode: the zone once, shared to vb" || fail "V15: $out"
