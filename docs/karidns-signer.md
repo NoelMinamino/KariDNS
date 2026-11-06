@@ -192,7 +192,7 @@ The key may reload one named zone (`karictl reload <zone>`), never all, and can 
 
 ## SECURITY
 
-* **No shell.** Every child process is `spawn(file, argv)` with absolute paths, a fixed environment (`PATH`, `LANG=C`, `LC_ALL=C`, `TZ=UTC`, `HOME`), a timeout and a cap of 1 MB on each output stream.
+* **No shell.** Every child process is `spawn(file, argv)` with absolute paths, a fixed environment (`PATH`, `LANG=C`, `LC_ALL=C`, `TZ=UTC`, `HOME`, and `LLVM_PROFILE_FILE` when it is set, which only a coverage build reads), a timeout and a cap of 1 MB on each output stream.
 * **Zone names** are checked (canonical, plain LDH, no leading hyphen) before they reach a file name or an argv word.
 * **Key material** exists only in the database, in the `0700` work directory (on tmpfs) for the time a zone is signed, and in the memory of `dnssec-signzone`. The files are overwritten and unlinked after each zone and on every error path; leftovers of a crash (`kill -9`) are wiped at the next start. The rc script and the wrapper set `ulimit -c 0`. Keys and key text are never logged; messages of the tools are cut to 1 KB.
 * **Privilege.** Its own user, no root. The database role cannot write user data (above). The conninfo file is checked like the loader's.

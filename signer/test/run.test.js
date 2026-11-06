@@ -19,12 +19,14 @@ test('no shell: metacharacters are plain argv words', async () => {
 });
 
 test('the environment is fixed', async () => {
-  const r = await runChild(NODE, ['-e', 'console.log(JSON.stringify(process.env))'], { env: childEnv('/home/signer') });
+  const r = await runChild(NODE, ['-e', 'console.log(JSON.stringify(process.env))'], { env: childEnv('/home/signer', '') });
   const env = JSON.parse(r.stdout);
   for (const [k, v] of Object.entries(ENV)) assert.equal(env[k], v);
   assert.equal(env.HOME, '/home/signer');
   assert.ok(!('SECRET_FROM_PARENT' in env));
-  assert.deepEqual(childEnv(''), { ...ENV });
+  assert.ok(!('LLVM_PROFILE_FILE' in env));
+  assert.deepEqual(childEnv('', ''), { ...ENV });
+  assert.deepEqual(childEnv('', '/cov/cov_%c%m.profraw'), { ...ENV, LLVM_PROFILE_FILE: '/cov/cov_%c%m.profraw' });
   assert.equal(Object.isFrozen(ENV), true);
 });
 

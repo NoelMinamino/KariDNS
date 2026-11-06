@@ -10,9 +10,12 @@ export const ENV = Object.freeze({
   TZ: 'UTC',
 });
 
-// The environment of a child: the fixed one plus HOME (libpq reads ~/.pgpass, the tools their defaults).
-export function childEnv(home = process.env.HOME) {
-  return home ? { ...ENV, HOME: home } : { ...ENV };
+// The environment of a child: the fixed one plus HOME (libpq reads ~/.pgpass, the tools their defaults) and LLVM_PROFILE_FILE (only a
+// coverage build of karidns-zone / karicheck reads it: `make coverage` collects their profiles from the file it names).
+export function childEnv(home = process.env.HOME, profile = process.env.LLVM_PROFILE_FILE) {
+  const env = home ? { ...ENV, HOME: home } : { ...ENV };
+  if (profile) env.LLVM_PROFILE_FILE = profile;
+  return env;
 }
 
 // -> Promise<{ code, signal, stdout, stderr, truncated, timedOut, spawnError }>; never rejects.  The output is kept up to maxOutput octets per stream;
