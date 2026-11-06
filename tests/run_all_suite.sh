@@ -27,8 +27,8 @@
 #   -l, --list              List all registered test cases with categories.
 #   -h, --help              Show this help message.
 #
-# Environment: KARI_SUITE_STATUS=<file>  write "total=N passed=N failed=N skipped=N" there when every test has run
-# (make coverage-run fails when the file is missing, i.e. the suite stopped early).
+# Environment: KARI_SUITE_STATUS=<file>  write "total=N passed=N failed=N skipped=N" and a line "failed_tests=<the failed tests>" there when every test has run
+# (make coverage-run fails when the file is missing, i.e. the suite stopped early; make coverage-suite-check fails unless failed=0).
 # ==============================================================================
 
 set -u
@@ -1127,13 +1127,14 @@ TOTAL_COUNT=0
 PASSED_COUNT=0
 FAILED_COUNT=0
 SKIPPED_COUNT=0
+FAILED_TESTS=""
 
 while IFS='|' read -r _s _c _cat _t _code _d _skip_r; do
     [ -z "${_s}" ] && continue
     TOTAL_COUNT=$((TOTAL_COUNT + 1))
     case "${_s}" in
         PASS) PASSED_COUNT=$((PASSED_COUNT + 1)) ;;
-        FAIL) FAILED_COUNT=$((FAILED_COUNT + 1)) ;;
+        FAIL) FAILED_COUNT=$((FAILED_COUNT + 1)); FAILED_TESTS="${FAILED_TESTS:+${FAILED_TESTS} }${_c}" ;;
         SKIP) SKIPPED_COUNT=$((SKIPPED_COUNT + 1)) ;;
     esac
 done < "${SUMMARY_FILE}"
@@ -1141,7 +1142,7 @@ done < "${SUMMARY_FILE}"
 # KARI_SUITE_STATUS=<file>: the counts are written there once every test has run, so a caller that ignores the exit status (make
 # coverage-run) can tell a suite that finished, with or without failing tests, from one that stopped before running them (the file is missing).
 if [ -n "${KARI_SUITE_STATUS:-}" ]; then
-    printf 'total=%d passed=%d failed=%d skipped=%d\n' "${TOTAL_COUNT}" "${PASSED_COUNT}" "${FAILED_COUNT}" "${SKIPPED_COUNT}" > "${KARI_SUITE_STATUS}" ||
+    printf 'total=%d passed=%d failed=%d skipped=%d\nfailed_tests=%s\n' "${TOTAL_COUNT}" "${PASSED_COUNT}" "${FAILED_COUNT}" "${SKIPPED_COUNT}" "${FAILED_TESTS}" > "${KARI_SUITE_STATUS}" ||
         echo "WARN: could not write ${KARI_SUITE_STATUS}" >&2
 fi
 
