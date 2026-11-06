@@ -197,7 +197,7 @@ run_suite_for_tool() {
 
     # Section 3: Name Compression & Pointer Anomalies
     # ptr-chain-N: N - 1 pointers in a row that point at pointers; dig 9.20.30 and dag stop after 2 (CVE-2026-19630,
-    # "bad compression pointer"), dig 9.20.29 and earlier follow them all
+    # "bad compression pointer"; compression-deep-chain likewise)
     printf "${BOLD}[3. Name Compression & Pointer Safety]${NC}\n"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Direct pointer compression loop" \
         "compression-loop.anomaly.test" "A" "" "(malformed|bad packet|loop|error)"
@@ -208,15 +208,15 @@ run_suite_for_tool() {
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Reserved/unsupported label bits (0x40/0x80)" \
         "compression-bad-bits.anomaly.test" "A" "" "(malformed|bad packet|error)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Deep 60-hop pointer compression chain" \
-        "compression-deep-chain.anomaly.test" "A" "" "(192\.0\.2\.1|malformed|bad packet|error)"
+        "compression-deep-chain.anomaly.test" "A" "" "(bad compression pointer)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Pointer chain 16 hops" \
-        "ptr-chain-16.anomaly.test" "NULL" "" "(Pointer chain|ANSWER|bad compression pointer)"
+        "ptr-chain-16.anomaly.test" "NULL" "" "(bad compression pointer)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Pointer chain 17 hops" \
-        "ptr-chain-17.anomaly.test" "NULL" "" "(Pointer chain|ANSWER|bad compression pointer)"
+        "ptr-chain-17.anomaly.test" "NULL" "" "(bad compression pointer)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Pointer chain 1024 hops" \
-        "ptr-chain-1024.anomaly.test" "NULL" "" "(Pointer chain|ANSWER|bad compression pointer)"
+        "ptr-chain-1024.anomaly.test" "NULL" "" "(bad compression pointer)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Pointer chain 8192 hops" \
-        "ptr-chain-8192.anomaly.test" "NULL" "" "(Pointer chain|ANSWER|bad compression pointer)"
+        "ptr-chain-8192.anomaly.test" "NULL" "" "(bad compression pointer)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Pointer chain exceeding 255-octet name limit" \
         "ptr-chain-name-overflow.anomaly.test" "NULL" "" "(malformed|bad packet|error)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Misaligned pointer target into middle of compression tag" \
