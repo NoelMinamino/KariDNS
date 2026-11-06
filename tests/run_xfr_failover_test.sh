@@ -254,18 +254,26 @@ ZONES="big.test:$W/big.zone"
 primary so "$SO" "transfers-out 1; max-transfer-idle-out 1;"
 start so KARIDNS_XFER_MINUTE_SECS=3
 kari_wait_answer "$DAG" "$SO" big.test. || true
-perl "$DIR/lib_slow_axfr_client.pl" "$SO" big.test 9 > "$W/slow.out" 2>&1 &
+# the client holds its connection without reading for HOLD s; the slot must be free well before it reads again (else O2 would only see the end of its transfer)
+HOLD=20
+t0=$(date +%s)
+perl "$DIR/lib_slow_axfr_client.pl" "$SO" big.test $HOLD > "$W/slow.out" 2>&1 &
 PIDS="$PIDS $!"
 sleep 1
 out=$("$DAG" @127.0.0.1 -p "$SO" big.test AXFR +nohexdump +time=3 2>&1 | head -40)
 if echo "$out" | grep -qi "refused\|Transfer failed"; then pass "O1: transfers-out 1: a second transfer while one is in progress is refused"
 else fail "O1: the second AXFR was not refused"; echo "$out" | head -8; fi
-sleep 5   # max-transfer-idle-out 1 minute = 3 s: the client that does not read is dropped
-n=$("$DAG" @127.0.0.1 -p "$SO" big.test AXFR +nohexdump +time=10 2>&1 | grep -c "TXT")
-if [ "$n" -ge 30000 ]; then pass "O2: max-transfer-idle-out freed the slot of the client that does not read: the next transfer completed ($n records)"
-else fail "O2: after max-transfer-idle-out the next AXFR returned $n TXT records (expected 30000)"; fi
-sleep 5
-if grep -q "BYTES=" "$W/slow.out"; then
+# max-transfer-idle-out 1 minute = 3 s: the client that does not read is dropped 3 s after the server's send blocks; on a loaded host that is
+# later than 3 s after the start, so the next transfer is tried until it completes, at most until HOLD - 4 s
+while :; do
+    n=$("$DAG" @127.0.0.1 -p "$SO" big.test AXFR +nohexdump +time=10 2>&1 | grep -c "TXT")
+    el=$(($(date +%s) - t0))
+    [ "$n" -ge 30000 ] || [ "$el" -ge $((HOLD - 4)) ] && break
+    sleep 1
+done
+if [ "$n" -ge 30000 ] && [ "$el" -lt "$HOLD" ]; then pass "O2: max-transfer-idle-out freed the slot of the client that does not read: the next transfer completed ($n records, $el s after the stalled client started)"
+else fail "O2: after max-transfer-idle-out the next AXFR returned $n TXT records (expected 30000), $el s after the stalled client started (it reads again after $HOLD s)"; fi
+if wait_grep "BYTES=" "$W/slow.out" $((HOLD + 10)); then
     b=$(sed -n 's/.*BYTES=\([0-9]*\).*/\1/p' "$W/slow.out")
     [ "${b:-0}" -lt 3000000 ] && pass "O3: the stalled client was cut off (it got $b bytes of a zone of about 7 MB)" || fail "O3: the stalled client received the whole zone ($b bytes)"
 else fail "O3: no result of the slow client"; cat "$W/slow.out"; fi

@@ -578,6 +578,8 @@ enum { ZDIR_ST_ABSENT = 0, ZDIR_ST_RESIDENT, ZDIR_ST_LOADING, ZDIR_ST_ERROR };
 #define ZDIR_F_BUSY      0x0080u   /* the ingest thread is installing a new version into the zone's entry (dbreg_lookup_entry_busy() .. dbreg_commit() / dbreg_reject()): it is not taken out of memory meanwhile */
 #define ZDIR_F_QUEUED    0x1000u   /* a registry element waiting in the queue of additions */
 #define ZDIR_F_DELETED   0x2000u   /* a registry element that left the registry (waiting to leave the index) */
+#define ZDIR_F_BGLOAD    0x4000u   /* D1a step 8: only a background fetch (a CNAME or glue that leads into the zone) brought it into memory: the first to go when memory-limit needs room, but
+                                    * kept while there is room (unlike EVICT_NEXT); the mark is dropped when queries ask for the zone (the cache manager's scan) */
 #define ZDIR_F_TICK      0x4000u   /* the control thread's tick looks at the zone (secondary, catalog member) */
 /* (flags are changed under g_zone_db_rebuild_lock; a reader that needs one while a writer may change it reads it with an atomic load of
  * the whole word, a later milestone's job.  What a reader looks at today is in `kind`, which never changes.) */
@@ -1148,10 +1150,12 @@ void dbreg_cache_test_set_victim_freq(uint32_t f);                 /* TEST ONLY:
  * holds it with dbreg_xfr_acquire(): under the registry lock it reads the element's entry and counts the transfer in the entry's active_axfr, so that the
  * cache manager's eviction (same lock) cannot take the zone out between the two.  NULL: no data in memory now.  dbreg_xfr_loaded(): the zone is in memory
  * because a transfer asked for it: it is marked evict-next (and XFRLOAD) unless it is pinned, was changed by an UPDATE, or is asked for more often than the zones
- * the manager took out last (frequency); the first query that arrives drops the mark (the scan of the manager).  dbreg_xfr_note(): the counters of
- * karictl dbstatus. */
+ * the manager took out last (frequency); the first query that arrives drops the mark (the scan of the manager).  dbreg_bg_loaded(): the same for a zone that
+ * only a background fetch brought (D1a step 8), marked BGLOAD instead: the first to go under memory pressure, kept while there is room.  dbreg_xfr_note():
+ * the counters of karictl dbstatus. */
 zone_db_entry_t *dbreg_xfr_acquire(zdir_elem_t *z);
 void dbreg_xfr_loaded(const char *view, const char *zone);
+void dbreg_bg_loaded(const char *view, const char *zone);
 enum { DBREG_XFR_WAITED = 0, DBREG_XFR_LOADED, DBREG_XFR_FAILED, DBREG_XFR_SUMMARY };   /* waited for a fetch; got the zone; gave up (SERVFAIL); answered an IXFR from the summary */
 void dbreg_xfr_note(int kind);
 void dbreg_cache_note_miss(void);                                 /* a query had to wait for a zone (the worker) */

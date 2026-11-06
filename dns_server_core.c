@@ -3976,9 +3976,21 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
  * 保留分を sigtimedwait() で取り出して送信元を見る。pkill -HUP karidns のように全プロセスへ
  * 送られると、直接届いたものとマネージャーが転送したものの2つになり、両方でリロードすると
  * 2回になる。マネージャーからのもの (転送) だけをリロードの合図にし、それ以外は無視する。
- * 何も取り出せなかった (どこかのスレッドがブロックしておらずハンドラで消費された) 場合は
- * 送信元が分からないので従来どおりリロードする。 */
-static bool sighup_from_manager(void) {
+ * SIGHUP は標準シグナルなので、保留中に届いた次の1つは保留中のものにまとまり (送信元は先のものだけが残る)、kqueue は
+ * その配送で EVFILT_SIGNAL をもう一度上げる。取り出せる数 (drained) が配送の数 (delivered: kevent の data) より少ない分は
+ * 送信元が分からない:
+ *   - drained == 0: その配送は前回の取り出しにまとまった。前回リロードしたなら、それはまとまった分の後なので済んでいる
+ *     (マネージャーからの転送と直接のものが続いて届き、両方でリロードすると2回になる)。前回無視したなら、まとまったのは
+ *     マネージャーからの転送かもしれないのでリロードする (無視すると1回もリロードしない)。
+ *   - drained < delivered: 取り出した送信元がマネージャーでなくても、まとまった分がそうかもしれないのでリロードする。 */
+STATIC_TEST bool sighup_decide(int drained, bool from_manager, long delivered, bool *last_reload) {
+  bool reload = drained == 0 ? !*last_reload : (from_manager || delivered > drained);
+  *last_reload = reload;
+  return reload;
+}
+
+static bool sighup_from_manager(long delivered) {
+  static bool last_reload;
   sigset_t set;
   sigemptyset(&set);
   sigaddset(&set, SIGHUP);
@@ -3994,8 +4006,12 @@ static bool sighup_from_manager(void) {
     else
       other = si.si_pid;
   }
-  if (drained == 0 || from_manager)
+  if (sighup_decide(drained, from_manager, delivered, &last_reload))
     return true;
+  if (drained == 0) {
+    syslog(LOG_NOTICE, "[Config] a SIGHUP already taken with the previous one is ignored (the reload after it has run)");
+    return false;
+  }
   syslog(LOG_NOTICE, "[Config] SIGHUP from pid %d sent to the backend directly is ignored; "
                      "the manager forwards SIGHUP (send it to the manager or use karictl reload)",
          (int)other);
@@ -4622,7 +4638,7 @@ void *control_thread_func(void *arg) {
          * data に回数を入れる。リロード中に届いた SIGHUP は次の1回のリロードにまとめる */
         if (ev_list[i].data > 1)
           syslog(LOG_NOTICE, "[Config] %ld SIGHUP signals arrived while busy; reloading once", (long)ev_list[i].data);
-        if (sighup_from_manager())
+        if (sighup_from_manager((long)ev_list[i].data))
           run_config_reload(true);
       } else if (ev_list[i].filter == EVFILT_SIGNAL &&
                  (ev_list[i].ident == SIGTERM || ev_list[i].ident == SIGINT)) {

@@ -1394,6 +1394,30 @@ int main(void) {
                   (elem_flags("s.test.") & (ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD)) == 0);
         }
 
+        /* D1a step 8: a zone that only a background fetch brought is marked BGLOAD, not EVICT_NEXT: the first to go under memory pressure, but it stays while
+         * there is room (a zone that only a transfer brought is taken out at once, above); a query that is answered from it drops the mark */
+        {
+            dbreg_cache_stats(&cs1);
+            uint64_t mb0 = cs1.xfr_marked;
+            atomic_store(&xe->freq, 0);                                            /* (the queries of the block above are in its frequency) */
+            CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_FULL));
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && m.u.fetch_req.mode == KDB_FETCH_FULL &&
+                  m.u.fetch_req.priority == KDB_FETCH_PRIO_BACKGROUND);
+            send_zone(f[0], &e, 0, "r.test.", 12, m.u.fetch_req.request_id, 11);
+            CHECK(wake_next(&k, 5000) && strcmp(k.zone, "r.test.") == 0 && !k.failed);
+            CHECK(zdir_entry(xe) != NULL && (elem_flags("r.test.") & (ZDIR_F_BGLOAD | ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD)) == ZDIR_F_BGLOAD);
+            dbreg_cache_stats(&cs1);
+            CHECK(cs1.xfr_marked == mb0 + 1);
+            dbreg_bg_loaded("default", "r.test.");                                 /* (marked already: counted once) */
+            dbreg_cache_stats(&cs1);
+            CHECK(cs1.xfr_marked == mb0 + 1);
+            uint64_t evb = dbreg_evictions();
+            usleep(700000);                                                        /* (several rounds of the manager: no pressure) */
+            CHECK(zdir_entry(xe) != NULL && dbreg_evictions() == evb && (elem_flags("r.test.") & ZDIR_F_BGLOAD));
+            CHECK(dbreg_test_evict("default", "r.test."));
+            for (int i = 0; i < 200 && dbreg_evict_inflight() != 0; i++) usleep(50000);
+        }
+
         /* D1a review 7c: a zone that a query loaded (the woken query was answered: the entry has counted it) is no transfer-only read, even when the transfer asked
          * for it as well: a transfer that finds the zone in memory marks nothing (the wait of a transfer is shared with the parked queries) */
         {
