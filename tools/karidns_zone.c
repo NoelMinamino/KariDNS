@@ -92,7 +92,7 @@ static void kz_usage(FILE *fp) {
         "  karidns-zone import [options] <zone> <file|->\n"
         "  karidns-zone import --all [options] <tinydns-data-file>\n"
         "  karidns-zone import --signer [options] <zone> <signed-zone-file|->\n"
-        "  karidns-zone export [options] <zone> [<file>]\n"
+        "  karidns-zone export [--signer] [options] <zone> [<file>]\n"
         "  karidns-zone export --all --dir <dir> [options]\n"
         "  karidns-zone --version | -h | --help\n"
         "\n"
@@ -137,6 +137,9 @@ static void kz_usage(FILE *fp) {
         "      --all --dir DIR     every primary zone, one file per zone in DIR (created when it does not exist): <name>.zone, or\n"
         "                          <name>.tinydns for a tinydns zone; unusual characters of a name are written as %%XX\n"
         "      --force             replace output files that exist (otherwise an existing file is an error and is never touched)\n"
+        "      --signer            the zone as the input of dnssec-signzone (karidns-signer): the NSEC / NSEC3 chain, its signatures and the PRESIGNED /\n"
+        "                          NSEC3PARAM metadata are left out, the other signatures and the DNSKEY records stay; a zone that was changed after it\n"
+        "                          was signed (a name with no NSEC3 yet) can be exported this way\n"
         "\n"
         "Output:\n"
         "      --json              one JSON document on standard output (docs/karicheck.md, JSON OUTPUT; first key \"karidns-zone\");\n"
@@ -739,7 +742,7 @@ static int kz_export_one(void *ud, const char *zone) {
         } else {
             kz_out_t out;
             kz_out_init(&out, e->dir_fd);
-            int rc = zx_export_zone(e->x, zone, e->view, e->fmt, kz_sink, &out);
+            int rc = zx_export_zone_ex(e->x, zone, e->view, e->fmt, kz_sink, &out, e->a->signer ? ZX_PLAIN_CHAIN : 0);
             if (rc != 0) {
                 if (out.err) dns_diag(DIAG_ERROR, DC_DB_ZONE_OUTPUT, bind_name, 0, "Could not write the file of zone '%.100s': %s\n", zone, strerror(out.err));
                 kz_out_abort(&out);
@@ -827,7 +830,7 @@ static int kz_cmd_export(const kz_args_t *a, kz_ctx_t *x) {
         }
         if (ok) {
             kz_out_init(&out, dir_fd);
-            ok = zx_export_zone(zx, zone, x->zone_view, &fmt, kz_sink, &out) == 0;
+            ok = zx_export_zone_ex(zx, zone, x->zone_view, &fmt, kz_sink, &out, a->signer ? ZX_PLAIN_CHAIN : 0) == 0;
             if (!ok) {
                 if (out.err) dns_diag(DIAG_ERROR, DC_DB_ZONE_OUTPUT, to_stdout ? "standard output" : file, 0, "Could not write the zone: %s\n", strerror(out.err));
                 kz_out_abort(&out);
@@ -878,8 +881,8 @@ static int kz_check_args(const kz_args_t *a, bool import) {
         }
         if (a->all ? a->nargs != 1 : a->nargs != 2) return kz_usage_error(j, DC_USAGE_ARGS, a->all ? "import --all takes one argument: the tinydns data file" : "import takes a zone name and a file (or -)");
     } else {
-        if (a->mode || a->types || a->dry_run || a->serial || a->strict || a->reload || a->type || a->verbose || a->audit || a->signer)
-            return kz_usage_error(j, DC_USAGE_OPTION, "--mode, --types, --dry-run, --serial, --strict, --reload, --type, --verbose, --audit and --signer are options of import");
+        if (a->mode || a->types || a->dry_run || a->serial || a->strict || a->reload || a->type || a->verbose || a->audit)
+            return kz_usage_error(j, DC_USAGE_OPTION, "--mode, --types, --dry-run, --serial, --strict, --reload, --type, --verbose and --audit are options of import");
         if (a->dir && !a->all) return kz_usage_error(j, DC_USAGE_OPTION, "--dir is for export --all");
         if (a->all && (!a->dir || a->nargs != 0)) return kz_usage_error(j, DC_USAGE_ARGS, "export --all takes no argument and needs --dir DIR");
         if (!a->all && (a->nargs < 1 || a->nargs > 2)) return kz_usage_error(j, DC_USAGE_ARGS, "export takes a zone name and an optional file");

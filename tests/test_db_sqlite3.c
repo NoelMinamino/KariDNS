@@ -2860,6 +2860,106 @@ static void test_signer_wait(void) {
     free(io);
 }
 
+/* ---------------------------------------------------------------- signer-wait: the rows a one-zone reload has read (vstate_t.cov) */
+
+static bool cv_is(const vstate_t *vs, const char *expect) {            /* "id:m,id:m" in id order */
+    char got[200] = "";
+    for (size_t i = 0; i < vs->ncov; i++) snprintf(got + strlen(got), sizeof(got) - strlen(got), "%s%lld:%llu", i ? "," : "", (long long)vs->cov[i].id, (unsigned long long)vs->cov[i].m);
+    if (strcmp(got, expect) != 0) printf("    marks are '%s', wanted '%s'\n", got, expect);
+    return strcmp(got, expect) == 0;
+}
+
+static void test_signer_cover(void) {
+    printf("signer-wait (item C): a one-zone reload covers the change rows it has read\n");
+    vstate_t vs;
+    memset(&vs, 0, sizeof(vs));
+    CHECK(!cov_covers(&vs, false, 1, 0) && vs.ncov == 0);                                  /* no marks: nothing is covered */
+    CHECK(cov_set(&vs, 5, 50) == 0 && cov_set(&vs, 2, 20) == 0 && cov_set(&vs, 9, 90) == 0 && cv_is(&vs, "2:20,5:50,9:90"));    /* sorted by domain id */
+    CHECK(cov_set(&vs, 5, 40) == 0 && cv_is(&vs, "2:20,5:50,9:90"));                         /* a mark never goes back */
+    CHECK(cov_set(&vs, 5, 60) == 0 && cv_is(&vs, "2:20,5:60,9:90"));                         /* it moves forward */
+    CHECK(cov_covers(&vs, false, 5, 60) && cov_covers(&vs, false, 5, 1) && !cov_covers(&vs, false, 5, 61));        /* SQLite3: the cursor is the highest seq, pos <= m */
+    CHECK(!cov_covers(&vs, true, 5, 60) && cov_covers(&vs, true, 5, 59) && !cov_covers(&vs, true, 5, 61));         /* PostgreSQL: the xmin, every xid below it is in the snapshot */
+    CHECK(!cov_covers(&vs, false, 3, 1) && !cov_covers(&vs, false, 10, 1) && !cov_covers(&vs, false, 0, 1));       /* a zone without a mark */
+    cov_del(&vs, 3);                                                                       /* not there: nothing */
+    cov_del(&vs, 5);
+    CHECK(cv_is(&vs, "2:20,9:90") && !cov_covers(&vs, false, 5, 1));
+    cov_del(&vs, 9);
+    cov_del(&vs, 2);
+    CHECK(vs.ncov == 0);
+
+    /* the zones that are gone from the database lose their marks when the whole list is planned */
+    CHECK(cov_set(&vs, 1, 10) == 0 && cov_set(&vs, 2, 20) == 0 && cov_set(&vs, 3, 30) == 0 && cov_set(&vs, 4, 40) == 0);
+    zinfo_t zs[3];
+    memset(zs, 0, sizeof(zs));
+    zs[0].id = 2;
+    zs[1].id = 3;
+    zs[2].id = 7;
+    ctx_t x;
+    memset(&x, 0, sizeof(x));
+    x.zones = zs;
+    x.nz = 3;
+    cov_prune(&vs, &x);
+    CHECK(cv_is(&vs, "2:20,3:30"));
+    x.nz = 0;
+    cov_prune(&vs, &x);
+    CHECK(vs.ncov == 0);
+    CHECK(cov_set(&vs, 1, 10) == 0);
+    cov_clear(&vs);                                                                        /* the change log was reset */
+    CHECK(vs.ncov == 0 && vs.cov == NULL);
+
+    /* chg_cb on the rows of a real change log: the rows of zone 1 up to the mark are not changes of it */
+    char path[600], err[DB_ERRLEN];
+    sqlite3 *db = make_db("cover.db", path, sizeof(path));
+    if (!db) return;
+    raw_exec(db, "CREATE TABLE karidns_changes (seq INTEGER PRIMARY KEY AUTOINCREMENT, domain_id INTEGER NOT NULL, changed_at INTEGER NOT NULL)");
+    raw_exec(db, "INSERT INTO karidns_changes (domain_id, changed_at) VALUES (1, 1), (2, 1), (1, 1), (3, 1)");           /* seq 1 - 4 */
+    sqlite3_close(db);
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL);
+    if (!c) return;
+    CHECK(db_driver_sqlite3.check_schema(c, NULL) == 0);
+    struct lio *io = calloc(1, sizeof(*io));
+    io->vst = calloc(1, sizeof(*io->vst));
+    memset(&x, 0, sizeof(x));
+    x.drv = &db_driver_sqlite3;
+    x.conn = c;
+    x.io = io;
+    x.vslot = 0;
+    uint64_t last = 0, mx = 0;
+    bool gap = false;
+    CHECK(db_driver_sqlite3.begin_snapshot(c) == 0 && db_driver_sqlite3.changes_max(c, &mx) == 0 && mx == 4);
+    CHECK(cov_set(&io->vst[0], 1, mx) == 0);                                               /* a reload of zone 1 read the log up to seq 4 */
+    CHECK(db_driver_sqlite3.changes_since(c, 0, chg_cb, &x, &last, &gap) == 0);
+    CHECK_MSG(x.nchg == 2 && x.chg[0] == 2 && x.chg[1] == 3, "%zu rows", x.nchg);        /* zone 2 and zone 3 changed; the rows of zone 1 are in what was read */
+    CHECK(db_driver_sqlite3.end_snapshot(c) == 0);
+    db_driver_sqlite3.close(c);
+    sqlite3 *db2 = raw_open(path, SQLITE_OPEN_READWRITE);
+    raw_exec(db2, "INSERT INTO karidns_changes (domain_id, changed_at) VALUES (1, 2)");                                  /* seq 5: a change after the reload */
+    sqlite3_close(db2);
+    c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL);
+    if (!c) return;
+    CHECK(db_driver_sqlite3.check_schema(c, NULL) == 0);
+    x.conn = c;
+    free(x.chg);
+    x.chg = NULL;
+    x.nchg = x.cchg = 0;
+    CHECK(db_driver_sqlite3.begin_snapshot(c) == 0 && db_driver_sqlite3.changes_since(c, 0, chg_cb, &x, &last, &gap) == 0);
+    CHECK_MSG(x.nchg == 3 && x.chg[2] == 1, "%zu rows", x.nchg);                           /* ... and that one is a change of zone 1 */
+    CHECK(db_driver_sqlite3.end_snapshot(c) == 0);
+    db_driver_sqlite3.close(c);
+    x.io = NULL;                                                                           /* a dump has no io: nothing is covered, nothing breaks */
+    x.nchg = 0;
+    x.conn = NULL;
+    chg_cb(&x, &(db_change_row_t){ 9, 1, 9 });
+    CHECK(x.nchg == 1);
+    free(x.chg);
+    sigw_free(&io->vst[0]);
+    free(io->vst);
+    free(io);
+    cov_clear(&vs);
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/db";
     snprintf(g_schema, sizeof(g_schema), "%s/pdns_schema.sqlite3.sql", dir);
@@ -2898,6 +2998,7 @@ int main(int argc, char **argv) {
     test_server_id();
     test_status_entry();
     test_signer_wait();
+    test_signer_cover();
     test_hot_part();
     test_check_mode();
     test_scan_failures();

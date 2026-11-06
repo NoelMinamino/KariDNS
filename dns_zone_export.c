@@ -168,8 +168,28 @@ static int zx_cb_zone(void *ud, const db_zone_row_t *r) {
  * owns are left out, so the zone is read as the unsigned zone it holds (ZX_PLAIN_*) */
 typedef struct { pdns_zone_t *z; unsigned plain; } zx_feed_t;
 
-static bool zx_skip_type(unsigned plain, const char *t) {
+/* ZX_PLAIN_CHAIN: the chain types, and an RRSIG over them (the type an RRSIG row covers is the first word of its content) */
+static bool zx_chain_type(const char *t) {
+    return strcasecmp(t, "NSEC") == 0 || strcasecmp(t, "NSEC3") == 0 || strcasecmp(t, "NSEC3PARAM") == 0 || strcasecmp(t, "TYPE47") == 0 ||
+           strcasecmp(t, "TYPE50") == 0 || strcasecmp(t, "TYPE51") == 0;
+}
+
+static bool zx_skip_type(unsigned plain, const db_record_row_t *r) {
+    const char *t = r->type;
     if (!plain || !t) return false;
+    if (plain == ZX_PLAIN_CHAIN) {
+        if (strcasecmp(t, "RRSIG") != 0) return zx_chain_type(t);
+        char w[16];
+        size_t n = 0;
+        const char *c = r->content ? r->content : "";
+        while (*c == ' ') c++;
+        while (c[n] && c[n] != ' ' && n < sizeof(w) - 1) {
+            w[n] = c[n];
+            n++;
+        }
+        w[n] = '\0';
+        return zx_chain_type(w);
+    }
     static const char *const dnssec[] = { "RRSIG", "NSEC", "NSEC3", "NSEC3PARAM", "DNSKEY" };
     for (size_t i = 0; i < sizeof(dnssec) / sizeof(dnssec[0]); i++)
         if (strcasecmp(t, dnssec[i]) == 0) return true;
@@ -179,7 +199,7 @@ static bool zx_skip_type(unsigned plain, const char *t) {
 static int zx_cb_rec(void *ud, int64_t did, const db_record_row_t *r) {
     (void)did;
     zx_feed_t *f = ud;
-    if (zx_skip_type(f->plain, r->type)) return 0;
+    if (zx_skip_type(f->plain, r)) return 0;
     return pdns_zone_add_record(f->z, r) != 0;
 }
 
@@ -239,7 +259,7 @@ int zx_read_zone(const db_driver_t *d, db_conn_t *c, bool has_ext, const char *n
     return zx_read_zone_ex(d, c, has_ext, name, id, opts, 0, out, has_keys);
 }
 
-int zx_export_zone(zx_t *x, const char *zone, const char *view, const dzt_opts_t *fmt, dzt_sink_t sink, void *ud) {
+int zx_export_zone_ex(zx_t *x, const char *zone, const char *view, const dzt_opts_t *fmt, dzt_sink_t sink, void *ud, unsigned plain) {
     const db_driver_t *d = x->drv;
     db_conn_t *c = x->conn;
     zfind_t zf = { zone, false, false, 0, NULL, NULL };
@@ -278,7 +298,7 @@ int zx_export_zone(zx_t *x, const char *zone, const char *view, const dzt_opts_t
         goto out;
     }
     bool has_keys = false;
-    switch (zx_read_zone(d, c, x->si.has_ext, zf.name, zf.id, &x->reader, &z, &has_keys)) {
+    switch (zx_read_zone_ex(d, c, x->si.has_ext, zf.name, zf.id, &x->reader, plain, &z, &has_keys)) {
     case ZX_READ_OK: break;
     case ZX_READ_OOM:
         ZX_ERR(x, DC_INTERNAL_OOM, "out of memory");
@@ -291,7 +311,7 @@ int zx_export_zone(zx_t *x, const char *zone, const char *view, const dzt_opts_t
         goto out;
     }
     for (size_t i = 0; i < z->n_warnings; i++) zmsg_emit(&x->msg, DIAG_WARNING, DC_DB_EXPORT_WARNING, NULL, "%s", z->warnings[i]);
-    if (has_keys && !(z->flags & PDNS_F_PRESIGNED)) {
+    if (has_keys && !plain && !(z->flags & PDNS_F_PRESIGNED)) {
         ZX_ERR(x, DC_DB_EXPORT_ZONE, "Zone '%s' has cryptokeys but no PRESIGNED=1 metadata (online signing is not supported): the server does not serve it", zone);
         goto out;
     }
@@ -307,4 +327,8 @@ out:
     free(zf.name);
     free(zf.type);
     return ret;
+}
+
+int zx_export_zone(zx_t *x, const char *zone, const char *view, const dzt_opts_t *fmt, dzt_sink_t sink, void *ud) {
+    return zx_export_zone_ex(x, zone, view, fmt, sink, ud, 0);
 }

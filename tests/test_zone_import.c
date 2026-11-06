@@ -1819,6 +1819,72 @@ static bool signer_base(void) {
     return ok;
 }
 
+/* the zone as text through the exporter with ZX_PLAIN_* flags (karidns-zone export --signer) */
+static char *do_export_ex(const char *zone, unsigned plain) {
+    zmsg_t m = { msg_cb, NULL };
+    zx_t *x = zx_open(g_drv, &g_src, &m);
+    if (!x) return NULL;
+    sbuf_t b = {0};
+    int rc = zx_export_zone_ex(x, zone, NULL, NULL, sb_sink, &b, plain);
+    zx_close(x);
+    if (rc != 0) {
+        free(b.p);
+        return NULL;
+    }
+    if (!b.p) b.p = strdup("");
+    return b.p;
+}
+
+/* export --signer (ZX_PLAIN_CHAIN, 0.6.0 item C): the input of dnssec-signzone.  A signed zone that someone changed has no complete chain (the new name has no RRSIG(NSEC)),
+ * so the reader and the plain export refuse it; without the chain the zone can be read, and the other signatures stay. */
+static void t_export_signer(void) {
+    printf("  export --signer (ZX_PLAIN_CHAIN)\n");
+    if (!signer_base()) return;
+    char *s11 = signed_text(11, "20300101000000", "20300601000000", K_SOA_TAIL);
+    zi_opts_t o = signer_opts();
+    zi_result_t r;
+    CHECK(imp_signed(&o, s11, &r) == ZI_OK);
+    free(s11);
+    char *plain = do_export("example.test", NULL, NULL);
+    CHECK(plain != NULL && strstr(plain, " NSEC ") != NULL);
+    char *chainless = do_export_ex("example.test", ZX_PLAIN_CHAIN);
+    CHECK(chainless != NULL);
+    if (chainless) {
+        CHECK(strstr(chainless, " NSEC ") == NULL && strstr(chainless, "NSEC3") == NULL);              /* no chain, ... */
+        CHECK(strstr(chainless, " RRSIG NSEC") == NULL && strstr(chainless, "RRSIG\tNSEC") == NULL);   /* ... no signature over it ... */
+        CHECK_HAS(chainless, "192.0.2.80");
+        CHECK(strstr(chainless, "RRSIG") != NULL && strstr(chainless, "DNSKEY") != NULL);              /* ... the other signatures and the key stay */
+        free(chainless);
+    }
+    free(plain);
+    be_exec("INSERT INTO records (domain_id, name, type, content, ttl) SELECT id, 'new.example.test', 'A', '192.0.2.99', 3600 FROM domains WHERE name = 'example.test'");
+    log_reset();
+    CHECK(do_export("example.test", NULL, NULL) == NULL);                    /* the chain is out of date: the zone is not one the server would serve */
+    LOG_HAS("db.export.zone");
+    chainless = do_export_ex("example.test", ZX_PLAIN_CHAIN);
+    CHECK(chainless != NULL);
+    if (chainless) {
+        CHECK_HAS(chainless, "192.0.2.99");
+        CHECK(strstr(chainless, " NSEC ") == NULL && strstr(chainless, "RRSIG") != NULL);
+        free(chainless);
+    }
+    /* a zone with keys and no PRESIGNED is refused by the plain export, not by the signer's */
+    be_exec("DELETE FROM domainmetadata WHERE kind IN ('PRESIGNED', 'NSEC3PARAM', 'X-KARIDNS-SIGNER')");
+    be_exec("INSERT INTO cryptokeys (domain_id, flags, active, content) SELECT id, 257, true, 'k' FROM domains WHERE name = 'example.test'");
+    log_reset();
+    CHECK(do_export("example.test", NULL, NULL) == NULL);
+    chainless = do_export_ex("example.test", ZX_PLAIN_CHAIN);
+    CHECK(chainless != NULL);
+    free(chainless);
+    /* the type an RRSIG covers: TYPE50 spelling, and an RRSIG with no content */
+    be_exec("DELETE FROM cryptokeys");
+    be_exec("INSERT INTO records (domain_id, name, type, content, ttl) SELECT id, 'x.example.test', 'RRSIG', 'TYPE50 8 3 3600 20300601000000 20200101000000 1 example.test. AAAA', 3600 FROM domains WHERE name = 'example.test'");
+    be_exec("INSERT INTO records (domain_id, name, type, content, ttl) SELECT id, 'y.example.test', 'RRSIG', NULL, 3600 FROM domains WHERE name = 'example.test'");
+    chainless = do_export_ex("example.test", ZX_PLAIN_CHAIN);
+    CHECK(chainless == NULL || strstr(chainless, "TYPE50") == NULL);
+    free(chainless);
+}
+
 static void t_signer(void) {
     printf("  import --signer\n");
     if (!signer_base()) return;
@@ -2466,6 +2532,7 @@ static void run_scenarios(void) {
     t_export();
     t_driver();
     t_signer();
+    t_export_signer();
     t_signer_canonical();
     t_signer_zone_import();
     t_signer_driver();

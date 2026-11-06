@@ -11,6 +11,7 @@ karidns-zone import [options] <zone> <file|->
 karidns-zone import --all [options] <tinydns-data-file>
 karidns-zone import --signer [options] <zone> <signed-zone-file|->
 karidns-zone export [options] <zone> [<file>]
+karidns-zone export --signer [options] <zone> [<file>]
 karidns-zone export --all --dir <dir> [options]
 karidns-zone --version | -h | --help
 ```
@@ -140,6 +141,7 @@ A signed (PRESIGNED) zone is exported as the server serves it, with the NSEC3PAR
 
 `--signer`
 : `import`: the file is a zone signed by `karidns-signer`; write its DNSSEC records and nothing else (above). Exit status 3 when the zone changed since the file was made, 4 when the zone is busy. The audit is in summary mode unless `--audit rows` is given.
+: `export`: the zone as the input of `dnssec-signzone` (below, "Export for the signer"): the NSEC / NSEC3 chain, the signatures over it and the metadata `PRESIGNED` and `NSEC3PARAM` are left out, the other signatures and the DNSKEY records stay.
 
 `--strict`
 : A warning of the zone checks fails the import. Without it warnings are printed and the import goes on. An error always fails.
@@ -180,6 +182,10 @@ The BIND text is `$ORIGIN`, `$TTL` (the TTL most records have), the tag definiti
 **Files.** A file is written to a temporary file in its directory and moved into place: a zone that cannot be read leaves nothing, and a reader never sees half a file. Without `--force` the name is taken with `link(2)`, so a file that appeared in between is never replaced. Output files are never opened through a symbolic link: an existing link is not followed (without `--force` it is an error, with `--force` the link itself is replaced). With `--json` the zone text cannot go to standard output: give a file.
 
 **`export --all --dir DIR`** writes `<name>.zone` (BIND format) or `<name>.tinydns` (a tinydns data file) for every primary zone, in the order of the names. The name is the zone name with every byte that is not a letter, digit, `-`, `_` or `.` (a dot as the first character included) written as `%XX`, so a name never contains a path separator, starts with a dot or contains a control character, and two zones never give the same file. A zone that cannot be exported (the reader refuses its rows) is reported and the others are written; the exit status is 1. With `--view` only the zones of the view are written.
+
+### Export for the signer (`--signer`)
+
+`karidns-zone export --signer <zone> <file>` writes the zone as the **input of `dnssec-signzone`**, which is what `karidns-signer` needs. The plain export is the zone as the server serves it, and the server serves a signed zone only when its NSEC3 chain is complete: a zone that someone changed after it was signed (a new name has no NSEC3 record and no signature over it yet) is refused by the reader (`presigned zone: no RRSIG(NSEC3) owner for 'new.example.test.'`), and so by the plain export. With `--signer` the rows are read without the chain: the NSEC, NSEC3 and NSEC3PARAM records, the RRSIG records that cover them and the metadata `PRESIGNED` and `NSEC3PARAM` are left out, so there is nothing to rebuild or check. The other RRSIG records and the DNSKEY, CDS and CDNSKEY records stay, so that `dnssec-signzone -i` keeps the signatures that are still good (an RRset that changed has a signature that no longer verifies, and is signed again); the signer makes the chain again. The text is the data of the database as it is, signed and unsigned alike; the check "a zone with a row in `cryptokeys` but without `PRESIGNED` is refused" is not made, because the metadata is not read. On an unsigned zone `--signer` gives the same text as the plain export. It takes the options of `export` (`--all --dir` as well) and none of `import`.
 
 ## JSON OUTPUT
 
@@ -267,7 +273,7 @@ karidns-zone export -c /usr/local/etc/karidns/karidns.conf example.test > exampl
 Write a zone that `dnssec-signzone` signed from an export of it (what `karidns-signer` does; the exit status is 3 when the zone changed meanwhile):
 
 ```text
-karidns-zone export -c karidns.conf example.test example.test.in
+karidns-zone export --signer -c karidns.conf example.test example.test.in
 dnssec-signzone -o example.test -f example.test.signed -N increment -3 - -H 0 -K keys example.test.in Kexample.test.+013+11111 Kexample.test.+013+22222
 karidns-zone import --signer --json -c karidns.conf example.test example.test.signed
 ```

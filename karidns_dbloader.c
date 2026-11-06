@@ -401,6 +401,11 @@ typedef struct {
      * because of it; they wait for the signer's reload request.  Sorted by domain id; `dbstatus` shows how many and the first few names. */
     struct sigw { int64_t id; char *name; } *sigw;
     size_t nsigw;
+    /* A one-zone reload (a reload request, karictl reload <zone>) reads a signer zone as it is, up to the change log position m (the cursor of changes_max() in its
+     * snapshot).  The rows of that zone up to m are in what it read; when the poll of the auto reload reaches them later they are not a change of the zone, and the
+     * zone must not go back on the list above.  One entry per zone of the signer that was reloaded so; sorted by domain id. */
+    struct cov { int64_t id; uint64_t m; } *cov;
+    size_t ncov;
 } vstate_t;
 
 typedef struct {
@@ -798,6 +803,9 @@ static void sigw_free(vstate_t *vs) {
     free(vs->sigw);
     vs->sigw = NULL;
     vs->nsigw = 0;
+    free(vs->cov);
+    vs->cov = NULL;
+    vs->ncov = 0;
 }
 
 static void io_free_views(struct lio *io) {
@@ -986,8 +994,60 @@ static int zone_cb(void *ud, const db_zone_row_t *r) {
     return x->only_name ? 1 : 0;                    /* one zone wanted: stop after it (names are unique) */
 }
 
+/* 0.6.0 item C: the zones a one-zone reload has read up to a change log position (vstate_t.cov).  A row is covered when it is in what the reload read: SQLite3 the
+ * cursor is the highest seq, so pos <= m; PostgreSQL the cursor is the xmin of the snapshot, every transaction below it was finished and is in the snapshot,
+ * so pos < m (changes_unsettled tells which). */
+static size_t cov_find(const vstate_t *vs, int64_t id) {
+    size_t lo = 0, hi = vs->ncov;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (vs->cov[mid].id < id) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+static bool cov_covers(const vstate_t *vs, bool unsettled, int64_t id, uint64_t pos) {
+    if (!vs->ncov) return false;
+    size_t i = cov_find(vs, id);
+    if (i >= vs->ncov || vs->cov[i].id != id) return false;
+    return unsettled ? pos < vs->cov[i].m : pos <= vs->cov[i].m;
+}
+
+/* remember (or move forward) the position the zone was read up to; -1 on out of memory */
+static int cov_set(vstate_t *vs, int64_t id, uint64_t m) {
+    size_t i = cov_find(vs, id);
+    if (i < vs->ncov && vs->cov[i].id == id) {
+        if (m > vs->cov[i].m) vs->cov[i].m = m;
+        return 0;
+    }
+    struct cov *n = realloc(vs->cov, (vs->ncov + 1) * sizeof(*n));
+    if (!n) return -1;
+    vs->cov = n;
+    memmove(&n[i + 1], &n[i], (vs->ncov - i) * sizeof(*n));
+    n[i].id = id;
+    n[i].m = m;
+    vs->ncov++;
+    return 0;
+}
+
+static void cov_del(vstate_t *vs, int64_t id) {
+    size_t i = cov_find(vs, id);
+    if (i >= vs->ncov || vs->cov[i].id != id) return;
+    memmove(&vs->cov[i], &vs->cov[i + 1], (vs->ncov - i - 1) * sizeof(*vs->cov));
+    vs->ncov--;
+}
+
+/* the positions mean nothing any more (the change log was reset or pruned, or could not be read) */
+static void cov_clear(vstate_t *vs) {
+    free(vs->cov);
+    vs->cov = NULL;
+    vs->ncov = 0;
+}
+
 static int chg_cb(void *ud, const db_change_row_t *r) {
     ctx_t *x = ud;
+    if (x->io && cov_covers(&x->io->vst[x->vslot], x->drv->changes_unsettled, r->domain_id, r->pos)) return 0;       /* a one-zone reload has read it */
     if (x->nchg >= x->cchg) {
         size_t nc = x->cchg ? x->cchg * 2 : 256;
         int64_t *n = realloc(x->chg, nc * sizeof(*n));
@@ -2486,6 +2546,21 @@ static int sigw_update(struct lio *io, vstate_t *vs, const ctx_t *x, bool one, c
     return 0;
 }
 
+/* a plan of the whole list: the entries of the zones that are no longer listed (deleted from the database) go; x->zones is sorted by id */
+static void cov_prune(vstate_t *vs, const ctx_t *x) {
+    size_t w = 0;
+    for (size_t i = 0; i < vs->ncov; i++) {
+        size_t lo = 0, hi = x->nz;
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            if (x->zones[mid].id < vs->cov[i].id) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo < x->nz && x->zones[lo].id == vs->cov[i].id) vs->cov[w++] = vs->cov[i];
+    }
+    vs->ncov = w;
+}
+
 /* Stream mode, one source: which zones to read (zinfo.want) and which to delete.  Called inside the snapshot, after
  * list_zones.  compare_all: read every listed zone (the digest gate then decides what is sent). */
 static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone, gone_t **gone_out, size_t *ngone_out,
@@ -2493,6 +2568,7 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
     struct lio *io = x->io;
     vstate_t *vs = &io->vst[x->vslot];
     bool compare_all = x->reconcile || x->force || only_zone != NULL;
+    bool lost = false;                       /* the positions of vstate_t.cov mean nothing: the change log was reset, pruned or could not be read */
     *have_seq = false;
     if (!only_zone) {
         if (si->has_changes) {
@@ -2507,6 +2583,7 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
                     lg(LOG_NOTICE, "view '%s': the change log was reset (seq %llu < %llu); comparing every zone",
                        io->vnames[x->vslot], (unsigned long long)mx, (unsigned long long)vs->seq);
                     compare_all = true;
+                    lost = true;
                 } else if (mx > vs->seq || x->drv->changes_unsettled) {      /* PostgreSQL: rows beyond the cursor may be visible */
                     uint64_t last = 0;
                     bool gap = false;
@@ -2516,16 +2593,19 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
                         lg(LOG_WARNING, "view '%s': cannot read the change log (%s); comparing every zone",
                            io->vnames[x->vslot], x->drv->errmsg(x->conn));
                         compare_all = true;
+                        lost = true;
                     } else if (gap) {
                         lg(LOG_NOTICE, "view '%s': rows of the change log after seq %llu were pruned; comparing every zone",
                            io->vnames[x->vslot], (unsigned long long)vs->seq);
                         compare_all = true;
+                        lost = true;
                     }
                 }
             } else {
                 lg(LOG_WARNING, "view '%s': cannot read the change log (%s); comparing every zone", io->vnames[x->vslot],
                    x->drv->errmsg(x->conn));
                 compare_all = true;
+                lost = true;
             }
         } else if (!vs->nolog_warned) {
             vs->nolog_warned = true;
@@ -2534,7 +2614,23 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
                            "serial; 'karictl reload <zone>' reads one zone)",
                io->vnames[x->vslot]);
         }
+        if (lost) cov_clear(vs);
         if (x->nchg > 1) qsort(x->chg, x->nchg, sizeof(int64_t), cmp_i64);
+    }
+    /* item C: a one-zone reload reads a signer zone as it is; the rows of its change log up to now are in what it reads (the snapshot is open: the zone is read in the
+     * same one), so the poll of the auto reload must not take them for a change later.  Only the signer's zones are remembered (a few entries, not one per zone). */
+    if (only_zone && x->nz == 1 && si->has_changes && x->io->cfg.signer_wait && x->drv->changes_max) {
+        uint64_t m = 0;
+        int64_t zero = 0;
+        bool yes = false;
+        if (x->drv->changes_max(x->conn, &m) == 0) {
+            zones_are_signers(x, &zero, 1, &yes);
+            if (yes) {
+                if (cov_set(vs, x->zones[0].id, m) != 0) return -1;
+            } else {
+                cov_del(vs, x->zones[0].id);
+            }
+        }
     }
     uint32_t gen = ++io->gen;
     fev_drain(io, false);
@@ -2610,6 +2706,7 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
         free(yes);
         nskip = w;
     }
+    if (!only_zone) cov_prune(vs, x);
     if (sigw_update(io, vs, x, only_zone != NULL, skip, nskip) != 0) {
         free(skip);
         return -1;

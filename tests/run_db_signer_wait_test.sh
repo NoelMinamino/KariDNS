@@ -13,6 +13,7 @@
 #       - a restart reads the changed zone as it is (the full comparison of the start);
 #       - a waiting zone that loses the metadata X-KARIDNS-SIGNER is read as it is at the next batch and leaves the list;
 #   S2  signer-wait no: the same change is served by auto reload, nothing waits; karictl reconfig switches between the two;
+#   S4  a reload request that comes before the poll of the loader has read the change rows: the zone does not go on the list afterwards; a later change does;
 #   S3  two views (loopback aliases 127.0.0.2 and 127.0.0.3): every view has its own set of waiting zones; a zone of view a that waits does not hold back the
 #       same name in view b, an ordinary zone follows in both, and `karictl reload <zone>` clears only the view that has the zone.
 #
@@ -122,7 +123,7 @@ conf() {   # conf "DATABASE-OPTIONS" [views]
     cat > "$T/s.conf" <<EOF
 options {
     user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT;
-    database { driver sqlite3; database-file "$DB"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; db-reload-timeout 10; auto-reload yes; poll-interval 1; coalesce 300; $1 };
+    database { driver sqlite3; database-file "$DB"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; db-reload-timeout 10; auto-reload yes; poll-interval ${POLL:-1}; coalesce 300; $1 };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
 EOF
@@ -297,6 +298,40 @@ else
     SRCB=127.0.0.3; check_ans "...and serves the old answer of vb.test" "192.0.2.30" www.vb.test
     SRCB=""
 fi
+
+# ================================================================ S4
+# The signer writes the zone and asks for the reload at once: the request comes before the poll of the loader has read the change rows.  The reload reads the zone
+# as it is, so those rows are in what it read; when the poll reaches them they must not put the zone on the list again.  (A poll interval of 6 s makes it certain
+# that the poll is later than the request.)  A change made after the reload is a change.
+echo "== S4: a reload request that comes before the poll has read the change rows"
+stop_server
+POLL=6
+newdb
+addsigned sg4.test 1 192.0.2.20
+addsigned sg4b.test 1 192.0.2.30
+conf ""
+start_server
+sleep 7
+sq "UPDATE records SET content = '192.0.2.21' WHERE name = 'www.sg4.test' AND type = 'A'"
+bump sg4.test 1 2
+$KCTL reload sg4.test > /dev/null 2>&1
+wait_ans www.sg4.test 192.0.2.21 8 && pass "the reload request serves the change at once" || fail "the reload request did not serve the change"
+sleep 9
+nowait && pass "the poll of the loader has read the rows of the change: sg4.test does not wait" || { fail "sg4.test is on the list of the zones that wait for the signer"; dbst | sed 's/^/         /'; }
+sq "UPDATE records SET content = '192.0.2.22' WHERE name = 'www.sg4.test' AND type = 'A'"
+wait_dbst "^    waiting for the signer: 1 zone(s): sg4.test$" 12 && pass "a change after the reload is a change: sg4.test waits" || { fail "a change after the reload is not noticed"; dbst | sed 's/^/         /'; }
+check_ans "...and is not served" "192.0.2.21" www.sg4.test
+$KCTL reload sg4.test > /dev/null 2>&1
+wait_ans www.sg4.test 192.0.2.22 8 && pass "...until the reload request" || fail "the second reload request did not serve the change"
+sleep 9
+nowait && pass "...and then the list is empty again" || { fail "the list is not empty after the second reload"; dbst | sed 's/^/         /'; }
+# a deleted zone loses its mark: a zone of the same name that is created again waits for the signer like any other
+sq "DELETE FROM records WHERE domain_id = (SELECT id FROM domains WHERE name = 'sg4b.test'); DELETE FROM domainmetadata WHERE domain_id = (SELECT id FROM domains WHERE name = 'sg4b.test'); DELETE FROM domains WHERE name = 'sg4b.test'"
+sleep 8
+nowait && pass "a deleted zone is not on the list" || fail "a deleted zone is on the list"
+POLL=1
+stop_server
+
 
 if grep -q "killed by signal\|AddressSanitizer\|ThreadSanitizer" "$LOG"; then fail "the loader crashed"; grep -E "killed by signal|Sanitizer|#[0-9] " "$LOG" | head -12 | sed 's/^/         /'; fi
 

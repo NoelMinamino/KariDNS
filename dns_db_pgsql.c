@@ -1216,6 +1216,7 @@ static int cl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
     db_change_row_t row;
     row.seq = (uint64_t)cell_i64(r, i, 0);
     row.domain_id = cell_i64(r, i, 1);
+    row.pos = PQgetisnull(r, i, 2) ? 0 : strtoull(PQgetvalue(r, i, 2), NULL, 10);
     return l->cb(l->ud, &row) != 0 ? DB_STOPPED : 0;
 }
 
@@ -1242,7 +1243,7 @@ static int pg_changes_since(db_conn_t *c, uint64_t after, db_change_cb cb, void 
         PQclear(r);
     }
     cl_t l = { cb, ud };
-    ret = pg_scan(c, "changes_since", "SELECT seq, domain_id FROM karidns_changes WHERE xid >= $1::xid8 ORDER BY seq", 1, pv, cl_row, &l);
+    ret = pg_scan(c, "changes_since", "SELECT seq, domain_id, xid::text FROM karidns_changes WHERE xid >= $1::xid8 ORDER BY seq", 1, pv, cl_row, &l);
     if (last_seq) *last_seq = xmin;
     if (gap) *gap = g;
     return ret;

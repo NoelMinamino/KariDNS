@@ -35,6 +35,8 @@ int zx_list_zones(zx_t *x, const char *view, zx_zone_fn fn, void *ud);
 /* One zone to sink, in the format fmt (NULL: automatic, verified).  zone: the name with or without the final dot, any case.  With view, a zone
  * that is not in that view is "not found".  0, or -1 (a message was given; nothing was handed to the sink when the verified write failed). */
 int zx_export_zone(zx_t *x, const char *zone, const char *view, const dzt_opts_t *fmt, dzt_sink_t sink, void *ud);
+/* The same with ZX_PLAIN_* (0: the zone as the server serves it).  ZX_PLAIN_CHAIN also skips the check that a zone with cryptokeys is PRESIGNED (the metadata is not read). */
+int zx_export_zone_ex(zx_t *x, const char *zone, const char *view, const dzt_opts_t *fmt, dzt_sink_t sink, void *ud, unsigned plain);
 
 /* One zone of the database through the loader's reader: the rows of the zone id called name (domains.name) are read with scan_records / scan_metadata / scan_ext on c, inside an open snapshot or write transaction (the importer
  * reads back what it wrote before it commits), added to a pdns_zone_t and finished (every row checked, a presigned zone rebuilt, the checks of the zone).  has_keys (may be NULL) is set to whether the zone has a row in
@@ -45,6 +47,10 @@ enum { ZX_READ_OK = 0, ZX_READ_ZONE, ZX_READ_DB, ZX_READ_OOM };
  * RRSIG, NSEC, NSEC3, NSEC3PARAM and DNSKEY and the metadata PRESIGNED and NSEC3PARAM (no chain to rebuild or check); ZX_PLAIN_CDS also CDS and CDNSKEY. */
 #define ZX_PLAIN_DNSSEC 1u
 #define ZX_PLAIN_CDS 2u
+/* ZX_PLAIN_CHAIN (alone): the zone as the input of dnssec-signzone (karidns-zone export --signer): the NSEC, NSEC3 and NSEC3PARAM rows, the RRSIG rows over them and the metadata PRESIGNED and NSEC3PARAM are left out, so there is no
+ * chain to rebuild or check and a zone that someone changed after it was signed can be read (a new name has no RRSIG(NSEC3) yet; the reader refuses such a zone).  The other RRSIG rows and the DNSKEY, CDS and CDNSKEY rows stay, so
+ * that dnssec-signzone -i keeps the signatures that are still good; the signer makes the chain again. */
+#define ZX_PLAIN_CHAIN 4u
 int zx_read_zone_ex(const db_driver_t *d, db_conn_t *c, bool has_ext, const char *name, int64_t id, const pdns_opts_t *opts, unsigned plain, pdns_zone_t **out,
                     bool *has_keys);
 int zx_read_zone(const db_driver_t *d, db_conn_t *c, bool has_ext, const char *name, int64_t id, const pdns_opts_t *opts, pdns_zone_t **out, bool *has_keys);

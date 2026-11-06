@@ -867,6 +867,7 @@ static int sq_changes_since(db_conn_t *c, uint64_t after, db_change_cb cb, void 
         }
         db_change_row_t row;
         row.seq = (uint64_t)sqlite3_column_int64(st, 0);
+        row.pos = row.seq;
         row.domain_id = sqlite3_column_int64(st, 1);
         if (first && after > 0 && row.seq > after + 1) g = true;      /* rows after `after` were pruned */
         first = false;

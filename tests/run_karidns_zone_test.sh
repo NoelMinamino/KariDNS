@@ -114,7 +114,7 @@ run "--signer with --view" 2 import --signer --view v --no-config --sqlite3 "$DB
 run "--signer with --all" 2 import --signer --all --no-config --sqlite3 "$DB" "$T/ex.zone"
 run "--signer with a tinydns data file name" 2 import --signer --no-config --sqlite3 "$DB" example.test "$T/data.tinydns"
 run "--signer with --format tinydns" 2 import --signer --format tinydns --no-config --sqlite3 "$DB" example.test "$T/ex.zone"
-run "--signer on export" 2 export --signer --no-config --sqlite3 "$DB" example.test
+run "--mode on export --signer" 2 export --signer --mode merge --no-config --sqlite3 "$DB" example.test
 run "export without a zone" 2 export --no-config --sqlite3 "$DB"
 run "export with three arguments" 2 export --no-config --sqlite3 "$DB" a b c
 run "export --all without --dir" 2 export --all --no-config --sqlite3 "$DB"
@@ -970,6 +970,64 @@ if command -v dnssec-keygen >/dev/null 2>&1 && command -v dnssec-signzone >/dev/
     else
         ok "e2f: dnssec-keygen made no keys here (skipped)"
     fi
+fi
+
+# export --signer (0.6.0 item C): a zone that was changed after it was signed has no complete NSEC3 chain, so the plain export (the zone as the server serves it)
+# refuses it; the signer needs the zone anyway, to sign it again.  --signer leaves the chain and its signatures out and keeps the other signatures.
+echo "== export --signer"
+newdb "$DB"
+mkzone "$T/xs.zone" xs.test. 1 'www IN A 192.0.2.2
+mail IN MX 10 www
+a.b.c IN A 192.0.2.3'
+expect "xs: an unsigned zone" 0 import xs.test "$T/xs.zone"
+kz export xs.test "$T/xs.plain"
+kz export --signer xs.test "$T/xs.sg"
+same "xs: on an unsigned zone --signer gives the same text as the plain export" "$(cat "$T/xs.sg")" "$(cat "$T/xs.plain")"
+if command -v dnssec-keygen >/dev/null 2>&1 && command -v dnssec-signzone >/dev/null 2>&1 && command -v dnssec-verify >/dev/null 2>&1; then
+    newdb "$DB"
+    mkdir "$T/keys3"
+    expect "xs3: an unsigned zone" 0 import xs.test "$T/xs.zone"
+    kz export xs.test "$T/xs3.in"
+    (cd "$T/keys3" && dnssec-keygen -q -a ECDSAP256SHA256 -f KSK xs.test > ksk.name 2>/dev/null && dnssec-keygen -q -a ECDSAP256SHA256 xs.test > zsk.name 2>/dev/null)
+    if [ -s "$T/keys3/ksk.name" ] && [ -s "$T/keys3/zsk.name" ]; then
+        cat "$T"/keys3/K*.key >> "$T/xs3.in"
+        (cd "$T" && dnssec-signzone -q -o xs.test -f xs3.out -O full -K keys3 -e now+14d -N increment -3 - -H 0 -x xs3.in "$(cat keys3/ksk.name)" "$(cat keys3/zsk.name)" > /dev/null 2>&1)
+        expect "xs3: the signed zone is written (NSEC3, KSK + ZSK)" 0 import --signer xs.test "$T/xs3.out"
+        # a new name and a name that goes: the chain is wrong now
+        printf '$ORIGIN xs.test.\n$TTL 300\nnewname IN A 192.0.2.50\nwww IN A 192.0.2.99\n' > "$T/xs3.part"
+        expect "xs3: a name is added and a record changed (merge)" 0 import --mode merge xs.test "$T/xs3.part"
+        q "DELETE FROM records WHERE name = 'mail.xs.test' AND type = 'MX'"
+        kz export xs.test "$T/xs3.bad"
+        if [ "$st" != 0 ]; then ok "xs3: the plain export refuses the zone (status $st)"; else bad "xs3: the plain export of a zone with a chain that is out of date should fail"; fi
+        grep -q "no RRSIG(NSEC3) owner" "$ERR" && ok "...because the new name has no NSEC3" || bad "...the reason" "$(cat "$ERR")"
+        kz export --signer xs.test "$T/xs3.sg"
+        if [ "$st" = 0 ]; then ok "xs3: export --signer works"; else bad "xs3: export --signer" "$(cat "$ERR")"; fi
+        [ "$(grep -c ' NSEC3 \|NSEC3PARAM\| NSEC ' "$T/xs3.sg")" = 0 ] && ok "xs3: no NSEC3, NSEC3PARAM or NSEC record" || bad "xs3: chain records in the text" "$(grep ' NSEC' "$T/xs3.sg" | head -3)"
+        [ "$(grep -c ' RRSIG NSEC' "$T/xs3.sg")" = 0 ] && ok "xs3: no signature over the chain" || bad "xs3: RRSIG(NSEC3) in the text"
+        [ "$(grep -c ' RRSIG A \| RRSIG SOA \| RRSIG DNSKEY \| RRSIG MX ' "$T/xs3.sg")" -gt 3 ] && ok "xs3: the other signatures stay" || bad "xs3: the other signatures are gone"
+        [ "$(grep -c ' DNSKEY ' "$T/xs3.sg")" -ge 2 ] && ok "xs3: and the DNSKEY records" || bad "xs3: no DNSKEY"
+        grep -q '^newname A ' "$T/xs3.sg" && ! grep -q '^mail MX ' "$T/xs3.sg" && ok "xs3: the data is the data of the database (new name there, the deleted record gone)" || bad "xs3: data" "$(grep -E '^(newname|mail)' "$T/xs3.sg")"
+        # the text signed again by BIND's tool, with the signatures that are still good kept (-i), is taken back
+        (cd "$T" && dnssec-signzone -q -o xs.test -f xs3b.out -O full -K keys3 -e now+14d -i 259200 -N increment -3 - -H 0 -x xs3.sg "$(cat keys3/ksk.name)" "$(cat keys3/zsk.name)" > /dev/null 2>&1)
+        if grep -qE '[[:space:]]MX[[:space:]]' "$T/xs3b.out"; then bad "xs3: dnssec-signzone kept the deleted MX RRset or its signature"; else ok "xs3: dnssec-signzone dropped the signature of the deleted RRset (it was in the text)"; fi
+        expect "xs3: the zone signed again from export --signer is written back" 0 import --signer --json xs.test "$T/xs3b.out"
+        jget "xs3: the serial grew by one" "signer.serial" 3
+        kz export xs.test "$T/xs3.good"
+        if [ "$st" = 0 ]; then ok "xs3: the plain export works again"; else bad "xs3: plain export after the signature" "$(cat "$ERR")"; fi
+        if dnssec-verify -o xs.test "$T/xs3.good" > "$T/xs3.verify" 2>&1; then ok "xs3: dnssec-verify accepts the zone as the database exports it"; else bad "xs3: dnssec-verify" "$(head -c 400 "$T/xs3.verify")"; fi
+        # a zone with keys and without PRESIGNED: refused by the plain export, fine for --signer (the signer decides what to do with it)
+        newdb "$DB"
+        expect "xs4: an unsigned zone" 0 import xs.test "$T/xs.zone"
+        q "INSERT INTO cryptokeys (domain_id, flags, active, published, content) SELECT id, 257, 1, 1, 'x' FROM domains WHERE name = 'xs.test'"
+        kz export xs.test "$T/xs4.plain"
+        [ "$st" != 0 ] && ok "xs4: a zone with keys and no PRESIGNED: the plain export refuses it" || bad "xs4: plain export should refuse"
+        kz export --signer xs.test "$T/xs4.sg"
+        [ "$st" = 0 ] && ok "xs4: ...and export --signer does not look at the keys" || bad "xs4: export --signer" "$(cat "$ERR")"
+    else
+        ok "xs3: dnssec-keygen made no keys here (skipped)"
+    fi
+else
+    ok "xs3: BIND's dnssec tools are not installed (skipped)"
 fi
 
 echo
