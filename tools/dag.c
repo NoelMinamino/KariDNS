@@ -2493,9 +2493,22 @@ static const char *dag_name_error_text(int e) {
     }
 }
 
-/* Name at off; labels before the first pointer must lie below lim. *next is the offset after the name. */
-static int dag_check_name(const uint8_t *pkt, size_t len, size_t off, size_t lim, size_t *next) {
+/* BIND 9.20.30 (CVE-2026-19630, GL #5932) bounds the work of decompression, and dig with it; each limit exceeded is
+ * "bad compression pointer" (DNS_R_BADPOINTER):
+ *   - at most DAG_NAME_MAXHOPS pointers while decompressing one name (DNS_NAME_MAXHOPS = DNS_NAME_MAXLABELS),
+ *   - at most DAG_NAME_MAXINDIRECTS pointers in a row whose target is another pointer (DNS_NAME_MAXINDIRECTS; the
+ *     count starts again at a pointer whose target is a label),
+ *   - at most DAG_MSG_MAXHOPSPERBYTE pointers per octet of the message over all its names (DNS_MESSAGE_MAXHOPSPERBYTE,
+ *     the budget of dns_message_parse()). */
+#define DAG_NAME_MAXHOPS 128
+#define DAG_NAME_MAXINDIRECTS 2
+#define DAG_MSG_MAXHOPSPERBYTE 4
+
+/* Name at off; labels before the first pointer must lie below lim. *next is the offset after the name. *budget is
+ * what is left of the message's pointer budget. */
+static int dag_check_name(const uint8_t *pkt, size_t len, size_t off, size_t lim, size_t *next, size_t *budget) {
     size_t pos = off, marker = off, total = 0;
+    unsigned hops = 0, indirects = 0;
     bool jumped = false;
     for (;;) {
         size_t end = jumped ? len : lim;
@@ -2503,8 +2516,12 @@ static int dag_check_name(const uint8_t *pkt, size_t len, size_t off, size_t lim
         uint8_t b = pkt[pos];
         if ((b & 0xC0) == 0xC0) {
             if (pos + 1 >= end) return DAG_NAME_END;
+            if (hops++ >= DAG_NAME_MAXHOPS || *budget == 0) return DAG_NAME_BADPTR;
+            (*budget)--;
             size_t ptr = ((size_t)(b & 0x3F) << 8) | pkt[pos + 1];
             if (ptr >= marker) return DAG_NAME_BADPTR;
+            if (pkt[ptr] < 0xC0) indirects = 0;
+            else if (++indirects > DAG_NAME_MAXINDIRECTS) return DAG_NAME_BADPTR;
             if (!jumped) *next = pos + 2;
             jumped = true;
             marker = ptr;
@@ -2524,10 +2541,10 @@ static int dag_check_name(const uint8_t *pkt, size_t len, size_t off, size_t lim
 }
 
 /* RDATA check for the types whose layout dig enforces. Returns DAG_NAME_OK, a fatal name error, or -1 (malformed). */
-static int dag_check_rdata(const uint8_t *pkt, size_t len, uint16_t type, uint16_t klass, size_t r, size_t rend) {
+static int dag_check_rdata(const uint8_t *pkt, size_t len, uint16_t type, uint16_t klass, size_t r, size_t rend, size_t *budget) {
     size_t p = r, next = 0;
     int e;
-#define DAG_NAME_AT(pos_) do { e = dag_check_name(pkt, len, (pos_), rend, &next); \
+#define DAG_NAME_AT(pos_) do { e = dag_check_name(pkt, len, (pos_), rend, &next, budget); \
         if (e == DAG_NAME_END) return -1; \
         if (e != DAG_NAME_OK) return e; \
         p = next; } while (0)
@@ -2592,9 +2609,10 @@ void dag_parse_message(const uint8_t *pkt, size_t len, dag_parse_t *out) {
     uint16_t counts[4] = { (uint16_t)((pkt[4] << 8) | pkt[5]), (uint16_t)((pkt[6] << 8) | pkt[7]),
                            (uint16_t)((pkt[8] << 8) | pkt[9]), (uint16_t)((pkt[10] << 8) | pkt[11]) };
     size_t pos = 12, next = 0;
+    size_t budget = DAG_MSG_MAXHOPSPERBYTE * len;            /* dns_message_parse(): 4 pointers per octet of the message */
     uint16_t qclass = 0;
     for (int i = 0; i < counts[0]; i++) {
-        int e = dag_check_name(pkt, len, pos, len, &next);
+        int e = dag_check_name(pkt, len, pos, len, &next, &budget);
         if (e == DAG_NAME_END || (e == DAG_NAME_OK && len - next < 4)) {
             out->malformed = true;
             out->end = pos;
@@ -2609,7 +2627,7 @@ void dag_parse_message(const uint8_t *pkt, size_t len, dag_parse_t *out) {
     for (int s = 1; s < 4; s++) {
         for (int i = 0; i < counts[s]; i++) {
             size_t start = pos;
-            int e = dag_check_name(pkt, len, pos, len, &next);
+            int e = dag_check_name(pkt, len, pos, len, &next, &budget);
             if (e == DAG_NAME_END) { out->malformed = true; out->end = start; return; }
             if (e != DAG_NAME_OK) { out->fatal = dag_name_error_text(e); return; }
             if (len - next < 10) { out->malformed = true; out->end = next; return; }
@@ -2618,7 +2636,7 @@ void dag_parse_message(const uint8_t *pkt, size_t len, dag_parse_t *out) {
             uint16_t rdlen = (pkt[next + 8] << 8) | pkt[next + 9];
             size_t r = next + 10;
             if (len - r < rdlen) { out->malformed = true; out->end = r; return; }
-            e = dag_check_rdata(pkt, len, type, klass, r, r + rdlen);
+            e = dag_check_rdata(pkt, len, type, klass, r, r + rdlen, &budget);
             if (e < 0) { out->malformed = true; out->end = r; return; }
             if (e != DAG_NAME_OK) { out->fatal = dag_name_error_text(e); return; }
             if (type == 41) {

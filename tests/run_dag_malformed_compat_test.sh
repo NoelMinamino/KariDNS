@@ -4,7 +4,8 @@
 #
 # T-12: dag reports malformed responses like dig 9.20 (BIND dns_message_parse()).
 # KariDNS serves tests/mock_anomalous_dns_server.pl as a "type program" zone; every
-# check below was written from the output of dig 9.20.29 for the same scenario
+# check below was written from the output of dig 9.20.29 for the same scenario (compression-deep-chain:
+# dig 9.20.30, which bounds decompression; the comparison with an older dig leaves it out)
 # (options +tries=1 +time=2 +nocookie +noedns, display +noall +answer +comments).
 # When dig 9.20 is installed, every scenario is also compared with dig directly.
 # ==============================================================================
@@ -101,8 +102,9 @@ run opcode-status;      has ";; Warning: Opcode mismatch: expected QUERY, got ST
 run opcode-unassigned;  has ";; Warning: Opcode mismatch: expected QUERY, got RESERVED3" && ok
 run short-header;       has ";; Warning: short (< header size) message received" && has "$REACH" && ok
 run flag-no-qr;         has ";; Warning: query response not set" && has "Got answer" && ok
-# names that make the message unusable
-for sc in compression-loop compression-indirect-loop compression-forward-ptr; do
+# names that make the message unusable (compression-deep-chain: 60 pointers in a row that point at pointers;
+# BIND 9.20.30, CVE-2026-19630, follows at most 2 of them, dig 9.20.29 followed them all)
+for sc in compression-loop compression-indirect-loop compression-forward-ptr compression-deep-chain; do
     run $sc;            has ";; Got bad packet: bad compression pointer" && has " bytes" && hasnt "Got answer" && ok
 done
 for sc in compression-bad-bits compression-misaligned label-overflow; do
@@ -176,6 +178,9 @@ run rcode-badkey +yaml;      has "status: 17" && hasnt "status: ?17" && ok
 # direct comparison with dig 9.20 (optional)
 if command -v dig >/dev/null 2>&1 && dig -v 2>&1 | grep -q "DiG 9\.20\."; then
     echo "=== comparison with $(dig -v 2>&1) ==="
+    # dig before 9.20.30 follows any number of pointers to pointers (CVE-2026-19630); dag follows 9.20.30
+    DIG_PATCH=$(dig -v 2>&1 | sed -n 's/.*DiG 9\.20\.\([0-9]*\).*/\1/p')
+    OLD_DIG_SKIP=""; [ "${DIG_PATCH:-0}" -lt 30 ] && OLD_DIG_SKIP="compression-deep-chain"
     norm() {
         sed -E -e 's/^; <<>> .*/; <<>> BANNER/' -e '/^;; global options/d' -e '/^; \([0-9] server found\)/d' \
             -e 's/(query_time|response_time): !!timestamp .*/\1: T/' \
@@ -187,7 +192,7 @@ if command -v dig >/dev/null 2>&1 && dig -v 2>&1 | grep -q "DiG 9\.20\."; then
     # class-mismatch depends on the random query ID (its RDATA points into the header) and is checked above
     for mode in "" "+short" "+yaml" "+tcp"; do
         for sc in $(perl -ne 'print "$1\n" if /^\s+"  ([a-z0-9-]+)\.\$display_zone/' "$SCRIPT_DIR/mock_anomalous_dns_server.pl" |
-                    grep -v '^drop$\|^what-is-my-ip$\|^tcp-max-65535$\|^class-mismatch$'); do
+                    grep -v '^drop$\|^what-is-my-ip$\|^tcp-max-65535$\|^class-mismatch$' | grep -vx "${OLD_DIG_SKIP:-@none@}"); do
             dig @127.0.0.1 -p "$PORT" "$sc.anomaly.test" A $OPTS $mode > "$TMP_DIR/dig.raw" 2>&1
             drc=$?
             "$DAG" @127.0.0.1 -p "$PORT" "$sc.anomaly.test" A $OPTS $mode +nohexdump > "$TMP_DIR/dag.raw" 2>&1
@@ -225,6 +230,7 @@ if command -v dig >/dev/null 2>&1 && dig -v 2>&1 | grep -q "DiG 9\.20\."; then
         done
     done
     [ -n "$TC_NOT_COMPARED" ] && echo "NOTE: +short not compared with dig after a TC retry (intentional difference):$TC_NOT_COMPARED"
+    [ -n "$OLD_DIG_SKIP" ] && echo "NOTE: not compared with this dig (older than 9.20.30, CVE-2026-19630): $OLD_DIG_SKIP"
 else
     echo "SKIP: dig 9.20 not installed; direct comparison not run"
 fi

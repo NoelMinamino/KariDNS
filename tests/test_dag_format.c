@@ -941,9 +941,111 @@ static void test_txt_like_wire_check(void) {
     printf("  -> TXT-like wire check passed.\n");
 }
 
+/* The limits of BIND 9.20.30 (CVE-2026-19630) on decompression, as dig applies them: 2 pointers in a row that point at
+ * pointers, 128 pointers for one name, 4 pointers per octet of the message.  The pointers live in the RDATA of a NULL
+ * record (BIND does not decompress it) and the owner names of the records after it point into them. */
+static size_t pc_rr_head(uint8_t *pkt, size_t off, uint16_t type, uint16_t rdlen) {
+    pkt[off++] = (uint8_t)(type >> 8); pkt[off++] = (uint8_t)type;
+    pkt[off++] = 0; pkt[off++] = 1;                 /* IN */
+    off += 4;                                       /* TTL */
+    pkt[off++] = (uint8_t)(rdlen >> 8); pkt[off++] = (uint8_t)rdlen;
+    return off;
+}
+static size_t pc_ptr(uint8_t *pkt, size_t off, size_t target) {
+    pkt[off++] = (uint8_t)(0xC0 | (target >> 8)); pkt[off++] = (uint8_t)target;
+    return off;
+}
+/* Header, question (the root, A IN), and a NULL record owned by the root whose RDATA the caller fills; returns the
+ * offset of the RDATA.  *rdlen_at is where the RDLENGTH goes. */
+static size_t pc_start(uint8_t *pkt, size_t *rdlen_at) {
+    pkt[2] = 0x84;
+    pkt[5] = 1;                                     /* QDCOUNT */
+    size_t off = 12;
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0; pkt[off++] = 1;
+    pkt[off++] = 0;                                 /* owner of the NULL record */
+    off = pc_rr_head(pkt, off, 10, 0);
+    *rdlen_at = off - 2;
+    return off;
+}
+static const char *pc_parse(const uint8_t *pkt, size_t len, int expect_count) {
+    dag_parse_t ps;
+    dag_parse_message(pkt, len, &ps);
+    if (!ps.fatal) { assert(!ps.malformed); assert(ps.count[1] == expect_count); }
+    return ps.fatal;
+}
+
+static void test_compression_limits(void) {
+    printf("[TEST] dag: decompression limits of BIND 9.20.30 (indirect pointers, hops per name, budget per message)...\n");
+    static uint8_t pkt[16384];
+    /* 1. pointers to pointers: the RDATA is a root label and n pointers, each to the one before it (the first to the
+     *    root); the owner of an A record points at the last one, so the name has n pointers in a row aimed at pointers. */
+    for (int n = 0; n <= 4; n++) {
+        memset(pkt, 0, sizeof(pkt));
+        size_t rdlen_at, r = pc_start(pkt, &rdlen_at), off = r, last = r;
+        pkt[off++] = 0;
+        for (int i = 0; i < n; i++) { size_t at = off; off = pc_ptr(pkt, off, last); last = at; }
+        pkt[rdlen_at] = (uint8_t)((off - r) >> 8); pkt[rdlen_at + 1] = (uint8_t)(off - r);
+        off = pc_ptr(pkt, off, last);
+        off = pc_rr_head(pkt, off, 1, 4);
+        off += 4;
+        pkt[7] = 2;                                 /* ANCOUNT */
+        const char *f = pc_parse(pkt, off, 2);
+        if (n <= 2) assert(f == NULL);
+        else assert(f && strcmp(f, "bad compression pointer") == 0);
+    }
+    /* 2. hops per name: unit i is [Y: pointer to unit i-1] [X: pointer to Y] [U: label "a", pointer to X], so every
+     *    label of the name costs 3 pointers and no more than 2 of them aim at pointers in a row.  The owner pointing
+     *    at Y_N has 3N - 1 pointers, at X_N 3N, at U_N 3N + 1.  N = 43: 128 pass, 129 and 130 do not. */
+    for (int aim = 0; aim < 3; aim++) {
+        memset(pkt, 0, sizeof(pkt));
+        size_t rdlen_at, r = pc_start(pkt, &rdlen_at), off = r;
+        size_t u = off;
+        pkt[off++] = 1; pkt[off++] = 'a'; pkt[off++] = 0;         /* unit 0: "a." */
+        size_t x = 0, y = 0;
+        for (int i = 1; i <= 43; i++) {
+            y = off; off = pc_ptr(pkt, off, u);
+            x = off; off = pc_ptr(pkt, off, y);
+            u = off; pkt[off++] = 1; pkt[off++] = 'a'; off = pc_ptr(pkt, off, x);
+        }
+        pkt[rdlen_at] = (uint8_t)((off - r) >> 8); pkt[rdlen_at + 1] = (uint8_t)(off - r);
+        off = pc_ptr(pkt, off, aim == 0 ? y : aim == 1 ? x : u);
+        off = pc_rr_head(pkt, off, 1, 4);
+        off += 4;
+        pkt[7] = 2;
+        const char *f = pc_parse(pkt, off, 2);
+        if (aim == 0) assert(f == NULL);
+        else assert(f && strcmp(f, "bad compression pointer") == 0);
+    }
+    /* 3. the budget of the message: the 42-unit chain costs 127 pointers per owner name; k A records owned by it.
+     *    The message is refused exactly when 127 k exceeds 4 octets times its length. */
+    int first_bad = 0;
+    for (int k = 1; k <= 64; k++) {
+        memset(pkt, 0, sizeof(pkt));
+        size_t rdlen_at, r = pc_start(pkt, &rdlen_at), off = r;
+        size_t u = off;
+        pkt[off++] = 1; pkt[off++] = 'a'; pkt[off++] = 0;
+        for (int i = 1; i <= 42; i++) {
+            size_t y = off; off = pc_ptr(pkt, off, u);
+            size_t x = off; off = pc_ptr(pkt, off, y);
+            u = off; pkt[off++] = 1; pkt[off++] = 'a'; off = pc_ptr(pkt, off, x);
+        }
+        pkt[rdlen_at] = (uint8_t)((off - r) >> 8); pkt[rdlen_at + 1] = (uint8_t)(off - r);
+        for (int j = 0; j < k; j++) { off = pc_ptr(pkt, off, u); off = pc_rr_head(pkt, off, 1, 4); off += 4; }
+        pkt[7] = (uint8_t)(k + 1);
+        const char *f = pc_parse(pkt, off, k + 1);
+        bool over = (size_t)127 * (size_t)k > 4 * off;
+        assert(over == (f != NULL));
+        if (f) assert(strcmp(f, "bad compression pointer") == 0);
+        if (over && !first_bad) first_bad = k;
+    }
+    assert(first_bad > 1);                          /* both sides of the bound were seen */
+    printf("  -> decompression limits passed (budget first exceeded with %d owner names).\n", first_bad);
+}
+
 int main(void) {
     printf("=== Starting dag RDATA Display Tests ===\n");
     test_character_string_escaping();
+    test_compression_limits();
     test_txt_like_wire_check();
     test_amtrelay_layout();
     test_dig_compat_formatting();
