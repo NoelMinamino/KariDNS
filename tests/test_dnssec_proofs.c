@@ -548,6 +548,12 @@ static void test_nsec3_rfc5155_appendix_b(void) {
     CHECK(&r, r.rcode == 0 && !r.aa && gr_count(&r, 1, -1) == 0 && gr_count(&r, 2, 2) == 2);
     EXPECT_N3(&r, "B.3 opt-out referral", H_EXAMPLE, H_A);   /* match example., cover c.example. */
 
+    /* RFC 5155 7.2.4: DS at the unsigned delegation c.example. (Opt-Out span, no NSEC3 matches it): NODATA from the
+     * parent with the closest provable encloser proof, the same NSEC3 RRs as the referral (review query_engine [9]) */
+    gr_query("c.example.", 43, true, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && gr_count(&r, 1, -1) == 0 && gr_count(&r, 2, 6) == 1);
+    EXPECT_N3(&r, "7.2.4 DS at an opt-out delegation", H_EXAMPLE, H_A);
+
     /* B.4 wildcard expansion: the answer is synthesized, the next closer name z.w.example. is proven absent */
     gr_query("a.z.w.example.", 15, true, &r);
     CHECK(&r, r.rcode == 0 && r.aa && gr_count(&r, 1, 15) == 1);
@@ -1656,6 +1662,46 @@ static const char *ZONE_OTHER =
     "$ORIGIN other.test.\n$TTL 300\n@ SOA ns1 h 1 3600 600 86400 60\n@ NS ns1\nns1 A 192.0.2.9\n"
     "alias CNAME sec.pn.test.\n";
 
+/* Review query_engine [2]: the extra QTYPEs of an RFC 10029 MQTYPE query come from a wildcard only when the QNAME does
+ * not exist (RFC 4592 2.2.1); at an existing name a type it lacks is simply not answered. */
+static void mq_query(const char *qname, uint16_t qtype, uint16_t mqtype, gr_resp_t *r) {
+    uint8_t req[512];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 0x4592, qname, qtype, true);
+    req[req_len - 1] = 6;   // OPT RDLEN
+    const uint8_t mq[6] = { 0x00, 0x14, 0x00, 0x02, (uint8_t)(mqtype >> 8), (uint8_t)mqtype };
+    memcpy(req + req_len, mq, sizeof(mq));
+    req_len += sizeof(mq);
+    g_gr.cfg.rfc10029_mqtype_enable = true;
+    g_gr.cfg.max_mqtypes = 4;
+    gr_query_raw(req, req_len, qname, qtype, "192.0.2.100", false, r);
+    g_gr.cfg.rfc10029_mqtype_enable = false;
+}
+
+static void test_mqtype_wildcard_existing_name(void) {
+    printf("[TEST] DNSSEC: MQTYPE extra types use a wildcard only for a name that does not exist (RFC 4592)...\n");
+    gr_setup("mq.test.",
+             "$ORIGIN mq.test.\n"
+             "$TTL 300\n"
+             "@ SOA ns1 hostmaster 1 3600 600 86400 300\n"
+             "@ NS ns1\n"
+             "ns1 A 192.0.2.1\n"
+             "host A 192.0.2.5\n"
+             "* A 192.0.2.99\n"
+             "* TXT \"wild\"\n");
+    gr_resp_t r;
+    /* host exists with A only: A answered, no TXT synthesized from *.mq.test. */
+    mq_query("host.mq.test.", 1, 16, &r);
+    CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 1) == 1 && gr_count(&r, 1, 16) == 0);
+    CHECK(&r, !t_query_rrl_info.wildcard);   /* RRL counts it under the name, not "*.mq.test." */
+    /* a name that does not exist: both types from the wildcard, owned by the QNAME */
+    mq_query("other.mq.test.", 1, 16, &r);
+    CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 1) == 1 && gr_count(&r, 1, 16) == 1);
+    CHECK(&r, strcasecmp(gr_first(&r, 1, 16)->name, "other.mq.test.") == 0 && t_query_rrl_info.wildcard);
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> MQTYPE wildcard only for a name that does not exist.\n");
+}
+
 static void test_ds_from_parent_zone(void) {
     printf("[TEST] DNSSEC: DS at a child apex answered from the hosted parent (R-32)...\n");
     gr_resp_t r;
@@ -1739,6 +1785,7 @@ int main(void) {
     test_dnssec_rrsig_sections();
     test_dnssec_rrsig_size_limits();
     test_ds_from_parent_zone();
+    test_mqtype_wildcard_existing_name();
     printf("=== All DNSSEC Negative-Proof Tests PASSED ===\n");
     return 0;
 }

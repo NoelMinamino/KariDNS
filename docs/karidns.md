@@ -348,7 +348,7 @@ Responses are counted like BIND (`lib/dns/rrl.c`): clients are grouped by addres
 | Errors (SERVFAIL, REFUSED, FORMERR, ...) | the client prefix only |
 | `all-per-second` | the client prefix only, all responses |
 
-Differences from BIND: the table has a fixed size of 131072 entries (`min-table-size` / `max-table-size` are accepted and ignored); `qps-scale` is accepted and ignored; `nxdomains-per-second` and `errors-per-second` default to `0` (no limit) instead of `responses-per-second`; responses that carry a valid server cookie are limited like any other.
+Differences from BIND: the table has a fixed size of 131072 entries (`min-table-size` / `max-table-size` are accepted and ignored); when the four slots a key can use are taken by other keys, the one used least recently is taken over (BIND reuses the oldest entry of its table); `qps-scale` is accepted and ignored; `nxdomains-per-second` and `errors-per-second` default to `0` (no limit) instead of `responses-per-second`; responses that carry a valid server cookie are limited like any other.
 
 | Option | Default | Description |
 |---|---|---|
@@ -361,7 +361,7 @@ Differences from BIND: the table has a fixed size of 131072 entries (`min-table-
 | `ipv4-prefix-length <n>;` | `24` | 0–32. IPv4 clients in the same prefix share their budgets. |
 | `ipv6-prefix-length <n>;` | `56` | 0–128. IPv6 clients in the same prefix share their budgets. |
 | `qps-scale`, `min-table-size`, `max-table-size` | — | Accepted for BIND compatibility; no effect (warning). |
-| `window <seconds>;` | `15` | Accounting window (maximum 3600). |
+| `window <seconds>;` | `15` | Accounting window (maximum 3600). As in BIND 9: the budget of a key starts at its per-second rate and never holds more than one second of responses; every response is counted, also a limited one, so the balance goes down to -window × rate and a client that keeps sending stays limited until it has been quiet for up to the window; a key unused for longer than the window starts again at the rate. |
 | `slip <n>;` | `2` | Every *n*-th limited UDP response is sent truncated (TC=1) instead of being dropped; `0` drops all. |
 | `log-only yes\|no;` | `no` | Only log what would be limited. |
 | `early-drop yes\|no;` | `no` | For `type program` zones: drop UDP queries before they are passed to the program when the client's budget for a positive answer to this QNAME/QTYPE (or its `all-per-second` budget) is already exhausted. |

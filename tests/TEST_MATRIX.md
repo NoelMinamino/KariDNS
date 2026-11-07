@@ -210,7 +210,7 @@ The complete inventory of all test targets registered in `tests/run_all_suite.sh
 
 | ID | Test Target | Subsystems / Files | RFC / Spec | Test Classification | Verification Objective |
 |:---:|:---|:---|:---|:---|:---|
-| 54 | [`run_rrl_window_test.sh`](run_rrl_window_test.sh) | `dns_rrl.c`, `dns_server_core.c` | RRL Draft, RFC 5452 | **Positive / Anti-DoS** | Keyed hash bucket sliding window rate limiting and SLIP truncated (TC=1) response generation. |
+| 54 | [`run_rrl_window_test.sh`](run_rrl_window_test.sh) | `dns_rrl.c`, `dns_server_core.c` | RRL Draft, RFC 5452 | **Positive / Anti-DoS** | Keyed hash bucket rate limiting with BIND 9's balance (starts and is capped at the rate, debited down to -window × rate, a key unused for the window starts again) and SLIP truncated (TC=1) response generation. |
 | 55 | [`run_query_log_rate_limit_test.sh`](run_query_log_rate_limit_test.sh) | `dns_server_core.c` | Operational Practice | **Positive / Resource** | Query log ring buffer throttling to prevent disk I/O exhaustion under flood attack. Two channels with their own `max-qps` in `category queries` (either order): each is held to its own limit. |
 | 56 | [`run_glue_truncation_test.sh`](run_glue_truncation_test.sh) | `dns_query_engine.c`, `dns_wire.c` | RFC 1035 §4.1.1, RFC 6891 | **Positive / Boundary** | Additional section glue truncation and TC bit setting when exceeding UDP buffer size. |
 
