@@ -141,15 +141,17 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, const zone_confi
     snprintf(version_txt, sizeof(version_txt), "version.%s", catalog_entry->domain);
     bool found_version = false;
     {
-        uint32_t vid = zone_image_find_name(img, version_txt);
-        for (uint32_t k = vid == ZONE_IMAGE_NONE ? ZONE_IMAGE_NONE : zone_image_rrset_next(img, vid, 16, zone_image_name_first_rr(img, vid));
-             k != ZONE_IMAGE_NONE; k = zone_image_rrset_next(img, vid, 16, k + 1)) {
-            char v[8];
-            if (catalog_txt_first(img, k, v, sizeof(v)) && strcmp(v, "2") == 0) {
-                found_version = true;
-                break;
-            }
+        /* RFC 9432 §4.1, §5.1: the catalog zone has exactly one version TXT RR; several make the catalog zone broken even if one says "2" */
+        uint32_t vrr;
+        int vcount = catalog_count(img, version_txt, 16, &vrr);
+        if (vcount > 1) {
+            syslog(LOG_ERR, "[Catalog] Zone '%s': '%s' has %d TXT records (RFC 9432 requires exactly 1); catalog zone is broken and will NOT be processed",
+                   catalog_entry->domain, version_txt, vcount);
+            rcu_aux_read_unlock();
+            return;
         }
+        char v[8];
+        found_version = vcount == 1 && catalog_txt_first(img, vrr, v, sizeof(v)) && strcmp(v, "2") == 0;
     }
 
     if (!found_version) {
@@ -333,6 +335,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, const zone_confi
     }
 
     rcu_aux_read_unlock();
+    /* the list (and the group strings in it) belongs to rebuild_zone_db_snapshot() from here: the entry keeps it on success and the rebuild frees it on a NULL return */
     zone_db_snapshot_t *new_snap = rebuild_zone_db_snapshot(NULL, view_name, catalog_entry, catalog_cfg, new_desired, new_desired_count);
     if (!new_snap) {
         syslog(LOG_ERR, "[Catalog] Failed to rebuild zone DB snapshot; catalog membership update skipped for '%s'", catalog_entry->domain);

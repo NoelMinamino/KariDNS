@@ -177,6 +177,7 @@ typedef struct {
   ing_job_t *cur;
   uint32_t zones_logged;
   uint32_t rejects_logged;
+  uint32_t shadows_logged;     /* hidden zones logged one by one in this batch (ING_REJECTS_LOGGED, like the rejected ones) */
   ing_profile_t *profiles;     /* of the current batch */
   size_t nprof, cprof, prof_bytes;
   /* batch */
@@ -360,6 +361,9 @@ static void st_set_strings(const char *err, const char *ver) {
 }
 
 static void st_get_strings(char *err, size_t en, char *ver, size_t vn, int64_t *err_time) {
+  if (en) err[0] = '\0';      /* (all 1000 tries can see a write in progress: the caller gets empty strings, not stack bytes) */
+  if (vn) ver[0] = '\0';
+  *err_time = 0;
   for (int tries = 0; tries < 1000; tries++) {
     uint32_t s1 = atomic_load_explicit(&g_st.seq, memory_order_acquire);
     if (s1 & 1) continue;
@@ -647,6 +651,13 @@ static void send_enc(ing_t *g) {
     return;
   }
   if (g->out_off > 0 && g->out_off == g->out_len) g->out_len = g->out_off = 0;
+  if (g->out_off > 0 && g->out_len + g->enc.len > g->out_cap) {
+    /* the sent head of the buffer is dead: move the live bytes to the start before the buffer grows, so that its size follows the
+     * queued bytes (bounded by ING_MAX_OUT above) and not out_len, which a slow reader's out_off never lets go back to 0 */
+    memmove(g->out, g->out + g->out_off, g->out_len - g->out_off);
+    g->out_len -= g->out_off;
+    g->out_off = 0;
+  }
   if (g->out_len + g->enc.len > g->out_cap) {
     size_t nc = g->out_cap ? g->out_cap : 4096;
     while (nc < g->out_len + g->enc.len) nc *= 2;
@@ -1158,9 +1169,10 @@ static void job_finish(ing_t *g, ing_job_t *j) {
     g->b_shadowed++;
     atomic_fetch_add_explicit(&g_st.tot_shadowed, 1, memory_order_relaxed);
     g->since_retire++;
-    {
+    if (g->shadows_logged < ING_REJECTS_LOGGED) {        /* the rest is in the count of the batch summary (on_batch_end) */
       dbreg_info_t si;
       bool cat = dbreg_find_info(j->view_name, j->zone, &si, 1) > 0 && si.shadow_by == DBREG_SH_CATALOG;
+      g->shadows_logged++;
       syslog(LOG_WARNING, "[DB] zone '%s' (view '%s'): loaded, but hidden by %s", j->zone, j->view_name,
              cat ? "a catalog member of the same name" : "the zone in karidns.conf");
     }
@@ -1593,6 +1605,7 @@ static void on_batch_begin(ing_t *g, const kdb_msg_t *m) {
   g->b_applied = g->b_rejected = g->b_shadowed = g->b_deleted = g->b_failed = 0;
   clear_profiles(g);                                     /* B7a: the profiles of the previous batch */
   g->rejects_logged = 0;
+  g->shadows_logged = 0;
   if (m->u.batch_begin.change_seq != 0)                  /* a one-zone batch does not read the log */
     atomic_store_explicit(&g_last_change_seq, m->u.batch_begin.change_seq, memory_order_relaxed);
   g->cur_req = -1;
@@ -1897,6 +1910,9 @@ static void on_batch_end(ing_t *g, const kdb_msg_t *m) {
                    "%u failed in the loader, %u deleted",
          (unsigned long long)b->batch_id, b->n_zones, g->b_applied, g->b_shadowed, g->b_rejected, b->n_failed,
          g->b_deleted);
+  if (g->b_shadowed > g->shadows_logged)
+    syslog(LOG_WARNING, "[DB] batch %llu: %u more zone(s) are loaded but hidden by a zone in karidns.conf or a catalog member (not logged one by one; "
+                        "see `karictl dbstatus`)", (unsigned long long)b->batch_id, g->b_shadowed - g->shadows_logged);
   if (g->batch_kind == KDB_BATCH_STARTUP) {
     /* the loader may have sent nothing (a restarted loader finds the Backend up to date): count the registry */
     size_t total, rej, shc, shk;
@@ -2105,6 +2121,7 @@ static void adopt_stream(ing_t *g, int fd) {
   g->hello_done = false;
   g->zones_logged = 0;
   g->rejects_logged = 0;
+  g->shadows_logged = 0;
   g->wl_open = false;                                    /* a new loader: its WARM_LIST is still to come */
   atomic_store_explicit(&g_wl_received, false, memory_order_release);
   g->inv_active = false;

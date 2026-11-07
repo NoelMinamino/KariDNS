@@ -177,6 +177,9 @@ typedef struct {
   bool parked, resume_pending, not_ready_now;
   uint16_t resume_len;
   int64_t park_deadline_ms;         /* of the request that was parked first (0: none); a second park of the same request keeps it */
+  /* AXFR/IXFR-in (handle_axfr_event): max-transfer-time-in as a wall-clock time_t (0 = none).  read_dns_tcp_message() gives up when it is
+   * passed, also inside one message: SO_RCVTIMEO restarts on every recv(), so a primary dripping bytes would never time out */
+  time_t read_deadline;
   /* buf は最後に置く: プールから払い出すときはこの手前までだけを 0 にする (D-04) */
   uint8_t buf[65536 + 2];
   uint32_t gen;                     /* changes every time the context is given out (after buf: not cleared); a parked entry names (slot, gen) */
@@ -222,7 +225,7 @@ typedef struct {
   char current_ecs_tag[64];
   bool has_current_ecs_tag;
   uint32_t out_of_zone_skipped; /* R-27: 読み飛ばしたゾーン外 RR の数 */
-  bool trailing_rrs;      /* AXFR: 終わりの SOA の後ろに同じメッセージの RR が続いていた (取り込み側は拒否する) */
+  bool trailing_rrs;      /* AXFR: 終わりの SOA の後ろに同じメッセージの RR が続いていた (parse_xfr_packet() が転送を拒否し、この印で理由が分かる) */
   uint16_t query_id;      /* R-19: 送った要求の ID と QTYPE (xfr_check_response_header() が照合する) */
   uint16_t query_type;
   bool got_first_msg;

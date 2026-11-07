@@ -63,7 +63,7 @@ int db_zone_build_feed(db_zone_build_t *b, const uint8_t *msg, size_t len, char 
     return -1;
   }
   if (parse_xfr_packet(msg, len, &b->arena, NULL, &b->sess, b->zone) != 0) {
-    set_why(why, whylen, "malformed zone data");
+    set_why(why, whylen, b->sess.trailing_rrs ? "records after the final SOA" : "malformed zone data");   // parse_xfr_packet() refuses a record after the final SOA
     return -1;
   }
   /* the Extended AXFR records (tags, tinydns) are only accepted for a zone that announced them: ZONE_BEGIN flag extended */
@@ -73,10 +73,6 @@ int db_zone_build_feed(db_zone_build_t *b, const uint8_t *msg, size_t len, char 
   }
   if (b->sess.out_of_zone_skipped > 0) {
     set_why(why, whylen, "record with an owner outside the zone");
-    return -1;
-  }
-  if (b->sess.trailing_rrs) {
-    set_why(why, whylen, "records after the final SOA");
     return -1;
   }
   return 0;

@@ -68,7 +68,8 @@
 #define KARIDNS_VERSION "dev"
 #endif
 
-enum { EXIT_OK = 0, EXIT_ZONES_FAILED = 1, EXIT_USAGE = 2, EXIT_ERROR = 3, EXIT_RETRY = 4 };
+enum { EXIT_OK = 0, EXIT_ZONES_FAILED = 1, EXIT_USAGE = 2, EXIT_ERROR = 3, EXIT_RETRY = 4,
+       EXIT_AGAIN = 90 };   /* (inside the process only: run_view_once() asks run_view() to read the source again, see run_pool()) */
 
 /* Messages.  Dump mode: stderr with the program prefix (the lines the dump tests expect).  Stream mode: syslog
  * (openlog() has LOG_PERROR, so a foreground server still shows them on stderr), each text starting with "[DB] " like the other components
@@ -444,6 +445,11 @@ typedef struct {
     bool fetch_summary;
     const char *fetch_vname;          /* D1a: the view of the request being served (the fetch thread tells the inventory what it served) */
     bool dir_only;                    /* D1a milestone 4: CONFIG dir_only (memory-limit): zones the Backend has no data of are sent as summaries */
+    /* loader-threads > 1: the position of the change log in this thread's snapshot (pos_valid: the driver has an exact one, SQLite3).  The workers' snapshots are
+     * later than this one; when the position of any of them differs, a commit came in between and the zones would be a mix of two commits: run_pool() asks
+     * run_view() to read the source again (pool_retry_ok: while the tries last; the last one goes on and logs it). */
+    bool pos_valid, pool_retry_ok;
+    uint64_t pos_m;
     uint64_t fetch_req;
     uint64_t batch_id;
     uint8_t batch_kind;
@@ -1726,7 +1732,7 @@ static int rec_cb(void *ud, int64_t did, const db_record_row_t *row) {
 static int send_hello(ctx_t *x, const char *driver_list, uint32_t pid);
 static int db_err_c(const db_driver_t *drv, db_conn_t *conn, char *errtext, size_t cap, int rc, const char *what);
 
-enum { TK_FATAL = -1 };      /* a task returns 0, an EXIT_* status of a database error, or this */
+enum { TK_FATAL = -1, TK_AGAIN = -2 };      /* a task returns 0, an EXIT_* status of a database error, TK_FATAL, or (the pool only) TK_AGAIN: read the source again */
 
 /* The extension rows of a group of zones (scan_ext_in) into e. */
 static int eset_load_in(const db_driver_t *drv, db_conn_t *conn, const int64_t *ids, size_t n, eset_t *e) {
@@ -1860,6 +1866,12 @@ static int deliver_check(wk_t *w, size_t pos, zres_t *r) {
  * and short sleeps (the main thread also polls the socket, so the Backend's answers are read while it waits). */
 #define POOL_BUDGET (256u << 20)         /* bytes of finished zones waiting for their turn (the next one in line is always taken) */
 #define POOL_MAX 16
+#define POOL_SNAPSHOT_TRIES 3            /* readings of a source whose change log moved while the workers started (run_view()); the last one reads on */
+
+static unsigned g_pool_again;            /* the sources read again so far (tests look at it) */
+#ifdef KARIDNS_UNIT_TEST
+static void (*g_pool_hook)(void);        /* a test: called once, after the main thread's snapshot and before the workers start */
+#endif
 
 typedef struct { _Atomic int state; zres_t r; } zslot_t;       /* 0 empty, 1 full */
 
@@ -1873,6 +1885,13 @@ typedef struct pool {
     _Atomic bool stop;
     _Atomic int failed;                  /* the first EXIT_* status of a worker, 0 = none */
     _Atomic bool oom;
+    /* the check of the change log position (ctx_t.pos_valid): every worker reads the position of its snapshot and waits for the verdict of the main thread
+     * before it reads a zone, so that nothing has been sent when the source is read again */
+    bool check;
+    uint64_t pos_m;
+    _Atomic size_t checked;
+    _Atomic bool moved;
+    _Atomic int verdict;                 /* 0 waiting, 1 read the zones, 2 leave (the source is read again) */
     wk_t wk[POOL_MAX];
     char errtext[240];                   /* of the first failing worker (written once, under the CAS on `failed`) */
     pthread_t tid[POOL_MAX];
@@ -1944,7 +1963,18 @@ static void *worker_main(void *arg) {
         w->conn = NULL;
         return NULL;
     }
-    while (!atomic_load_explicit(&p->stop, memory_order_acquire)) {
+    bool read_zones = true;
+    if (p->check) {
+        /* the position of the change log in this snapshot, against the main thread's: a commit between the two snapshots (the zone list, the metadata and the
+         * keys are the main thread's, the rows are ours) makes a zone a mix of two commits.  The main thread decides once every worker has looked. */
+        uint64_t wpos = 0;
+        if (w->drv->changes_max(w->conn, &wpos) == 0 && wpos != p->pos_m) atomic_store(&p->moved, true);
+        atomic_fetch_add(&p->checked, 1);
+        unsigned spins = 0;
+        while (atomic_load_explicit(&p->verdict, memory_order_acquire) == 0 && !atomic_load_explicit(&p->stop, memory_order_acquire)) nap(&spins);
+        read_zones = atomic_load_explicit(&p->verdict, memory_order_acquire) == 1;
+    }
+    while (read_zones && !atomic_load_explicit(&p->stop, memory_order_acquire)) {
         size_t t = atomic_fetch_add_explicit(&p->next_task, 1, memory_order_relaxed);
         size_t a = t * p->chunk;
         if (a >= p->n_want) break;
@@ -2007,16 +2037,27 @@ static int run_pool(ctx_t *x, const db_source_t *src, bool bulk, size_t n_want, 
     if (p->chunk < 1) p->chunk = 1;
     if (p->chunk > cmax) p->chunk = cmax;
     p->win = nthr * p->chunk * 3 + 8;
+    p->check = x->pos_valid;
+    p->pos_m = x->pos_m;
+    atomic_store(&p->verdict, p->check ? 0 : 1);
     p->slots = calloc(p->win, sizeof(*p->slots));
     if (!p->slots) {
         free(p);
         x->oom = true;
         return TK_FATAL;
     }
+#ifdef KARIDNS_UNIT_TEST
+    if (g_pool_hook) {                                                 /* a test commits a change here: after the main thread's snapshot, before the workers' */
+        void (*h)(void) = g_pool_hook;
+        g_pool_hook = NULL;
+        h();
+    }
+#endif
     sigset_t all, old;
     sigfillset(&all);
     pthread_sigmask(SIG_BLOCK, &all, &old);                            /* workers take no signals: SIGTERM is for the main thread */
     size_t started = 0;
+    int rc_create = 0;
     for (size_t i = 0; i < nthr; i++) {
         wk_t *w = &p->wk[i];
         w->x = x;
@@ -2024,16 +2065,32 @@ static int run_pool(ctx_t *x, const db_source_t *src, bool bulk, size_t n_want, 
         w->bulk_meta = bulk ? &x->meta : NULL;
         w->deliver = deliver_slot;
         w->dud = p;
-        if (pthread_create(&p->tid[i], NULL, worker_main, w) != 0) break;
+        rc_create = pthread_create(&p->tid[i], NULL, worker_main, w);       /* (returns the error; errno is not set) */
+        if (rc_create != 0) break;
         started++;
     }
     pthread_sigmask(SIG_SETMASK, &old, NULL);
     int result = 0;
+    bool again = false;
     if (started == 0) {
-        lg(LOG_ERR, "cannot start the loader threads: %s", strerror(errno));
+        lg(LOG_ERR, "cannot start the loader threads: %s", strerror(rc_create));
         snprintf(x->errtext, sizeof(x->errtext), "cannot start the loader threads");
         result = EXIT_ERROR;
         atomic_store(&p->stop, true);
+    }
+    if (started && p->check) {
+        unsigned bspins = 0;
+        while (atomic_load_explicit(&p->checked, memory_order_acquire) < started) {
+            if (atomic_load_explicit(&p->failed, memory_order_acquire) || pool_wait(x, &bspins) != 0) goto drain;
+        }
+        if (atomic_load(&p->moved)) {
+            again = x->pool_retry_ok;
+            if (again) g_pool_again++;
+            else lg(LOG_WARNING, "the database changed while the loader threads started their snapshots, again and again; reading on: a zone can be a mix "
+                                 "of two commits until the next reload reads it");
+        }
+        atomic_store_explicit(&p->verdict, again ? 2 : 1, memory_order_release);
+        if (again) goto drain;
     }
     for (size_t pos = 0; started && pos < n_want; pos++) {
         zslot_t *s = &p->slots[pos % p->win];
@@ -2060,6 +2117,8 @@ drain:
         result = atomic_load(&p->failed);
         snprintf(x->errtext, sizeof(x->errtext), "%s", p->errtext);
         if (x->oom) result = TK_FATAL;
+    } else if (again) {
+        result = TK_AGAIN;
     }
     for (size_t i = 0; i < nthr; i++) wk_free(&p->wk[i]);
     for (size_t i = 0; i < p->win; i++) zres_free(&p->slots[i].r);
@@ -2924,7 +2983,7 @@ write_failed:
     return EXIT_ERROR;
 }
 
-static int run_view(ctx_t *x, const db_source_t *src, const char *only_zone, bool whole) {
+static int run_view_once(ctx_t *x, const db_source_t *src, const char *only_zone, bool whole) {
     char err[DB_ERRLEN];
     ctx_view_reset(x);
     x->only_name = only_zone;
@@ -2950,6 +3009,9 @@ static int run_view(ctx_t *x, const db_source_t *src, const char *only_zone, boo
         goto out;
     }
     x->has_ext = si.has_ext && x->drv->scan_ext;
+    /* the position of the change log in this snapshot, for the pool's workers to compare with (run_pool()); only a driver whose position is exact (SQLite3: the
+     * highest seq; a PostgreSQL cursor is the xmin of the snapshot, which says nothing about commits in between) */
+    x->pos_valid = x->nthreads > 1 && si.has_changes && x->drv->changes_max && !x->drv->changes_unsettled && x->drv->changes_max(x->conn, &x->pos_m) == 0;
     /* B13: a one-zone request looks the zone up by name (index) instead of listing every zone of the source, so its cost does
      * not grow with the number of zones; a missing zone is the same empty result as before (nz == 0: a deletion in stream mode) */
     rc = x->only_name && x->drv->find_zone ? x->drv->find_zone(x->conn, x->only_name, zone_cb, x) : x->drv->list_zones(x->conn, zone_cb, x);
@@ -3048,6 +3110,9 @@ static int run_view(ctx_t *x, const db_source_t *src, const char *only_zone, boo
             int st = run_zones(x, src, bulk, n_want);
             if (st == TK_FATAL) {
                 fatal = 1;
+            } else if (st == TK_AGAIN) {                     /* nothing was committed: run_view() reads the source again */
+                status = EXIT_AGAIN;
+                goto out_snap;
             } else if (st != 0) {
                 status = st;
                 goto out_snap;
@@ -3084,6 +3149,23 @@ out:
     x->drv->close(x->conn);
     x->conn = NULL;
     return status;
+}
+
+/* One source, read as run_view_once() does, again while the loader threads found that a commit came in between the main thread's snapshot and
+ * theirs (run_pool(): the change log position of their snapshot is not the main thread's).  The zone list, the metadata and the keys are the
+ * main thread's and the rows are the workers', so such a source would give zones that mix two commits.  Nothing of the failed reading was
+ * committed (the workers look before they read a zone), so it is read from the start; the counters it touched are put back.  The last of
+ * POOL_SNAPSHOT_TRIES readings goes on whatever the position says (a source that is written all the time), and says so. */
+static int run_view(ctx_t *x, const db_source_t *src, const char *only_zone, bool whole) {
+    for (int attempt = 1;; attempt++) {
+        const uint32_t n_zones = x->n_zones, n_failed = x->n_failed, n_unwritten = x->n_unwritten, n_unchanged = x->n_unchanged, n_deleted = x->n_deleted,
+                       n_read = x->n_read;
+        x->pool_retry_ok = attempt < POOL_SNAPSHOT_TRIES;
+        int st = run_view_once(x, src, only_zone, whole);
+        if (st != EXIT_AGAIN) return st;
+        x->n_zones = n_zones; x->n_failed = n_failed; x->n_unwritten = n_unwritten; x->n_unchanged = n_unchanged; x->n_deleted = n_deleted; x->n_read = n_read;
+        lg(LOG_NOTICE, "the database changed while the loader threads started their snapshots; reading the source again (%d of %d)", attempt, POOL_SNAPSHOT_TRIES);
+    }
 }
 
 /* The whole dump.  Returns an exit status. */
@@ -4874,8 +4956,9 @@ static int rw_process(ctx_t *x, struct lio *io, rw_t *r) {
     }
     if (gap) b->all = true;                                  /* requests between were pruned or rolled back: do not guess */
     fz_reset(&io->fz, true);
+    static const char bad_name_reason[] = "not a valid zone name; the request is ignored";    /* (sizeof - 1: the length of the text, not a count written by hand) */
     for (unsigned i = 0; i < b->nbad && i < 4; i++)
-        fz_add(&io->fz, r->views[0], b->bad[i], "not a valid zone name; the request is ignored", 44);
+        fz_add(&io->fz, r->views[0], b->bad[i], bad_name_reason, sizeof(bad_name_reason) - 1);
     int fail = 0;
     for (size_t vi = 0; vi < r->nv && !fail && !g_stop; vi++) {
         int lrc = 0;

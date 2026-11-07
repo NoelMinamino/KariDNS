@@ -279,7 +279,10 @@ static int pg_open_mode(db_conn_t **out, const db_source_t *src, char *err, size
         return -1;
     }
     char conninfo[PG_CONNINFO_MAX];
-    if (read_conninfo(src->conninfo_file, conninfo, sizeof(conninfo), err, errlen) != 0) return -1;
+    if (read_conninfo(src->conninfo_file, conninfo, sizeof(conninfo), err, errlen) != 0) {
+        wipe(conninfo, sizeof(conninfo));       /* (a NUL byte or a file of comments only: the buffer may hold the rest of a password) */
+        return -1;
+    }
     char *perr = NULL;
     PQconninfoOption *opts = PQconninfoParse(conninfo, &perr);
     if (!opts) {

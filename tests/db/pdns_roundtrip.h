@@ -199,6 +199,10 @@ static bool pdns_roundtrip(const pdns_zone_t *z, rt_info_t *info, char *why, siz
             static const uint8_t ftag[] = "KDB1-TINYDNS";
             EVP_DigestUpdate(md, ftag, sizeof(ftag));
         }
+        if (inf.flags & KDB_ZF_PRESIGNED) {                     /* L2: so is the PRESIGNED flag (a toggle with unchanged rows must change the digest) */
+            static const uint8_t ptag[] = "KDB1-PRESIGNED";
+            EVP_DigestUpdate(md, ptag, sizeof(ptag));
+        }
         uint8_t dg[EVP_MAX_MD_SIZE];
         unsigned dl = 0;
         if (EVP_DigestFinal_ex(md, dg, &dl) != 1 || dl != KDB_DIGEST_LEN || memcmp(dg, inf.digest, dl) != 0)

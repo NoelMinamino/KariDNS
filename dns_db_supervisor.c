@@ -347,10 +347,7 @@ static void child_exec(const db_sup_t *s, int stream_fd, int fetch_fd, int log_w
   int hf = fetch_fd >= 0 ? fcntl(fetch_fd, F_DUPFD, 10) : -1;
   if (fetch_fd >= 0 && hf < 0) _exit(127);
   int dn = open("/dev/null", O_RDWR);
-  if (dn >= 0) {
-    dup2(dn, 0);
-    dup2(dn, 1);
-  }
+  if (dn < 0 || dup2(dn, 0) < 0 || dup2(dn, 1) < 0) _exit(127);   /* (the loader must not keep the manager's stdin / stdout) */
   if (hw >= 0 && dup2(hw, 2) < 0) _exit(127);
   if (dup2(hi, 3) < 0) _exit(127);
   if (hf >= 0 && dup2(hf, 4) < 0) _exit(127);
