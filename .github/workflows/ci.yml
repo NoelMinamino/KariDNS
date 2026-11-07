@@ -436,12 +436,14 @@ jobs:
 
             echo "::group::🚦 [Gate] Phase 2 thresholds"
             GATE=0
-            perl tests/coverage_gate.pl --llvm-cov="llvm-cov${V}" --profdata=coverage.profdata --phase=2 --strict || GATE=$?
+            # stdin is the rest of this script (the VM action pipes it to sh): coverage_gate.pl reads a JSON summary from a piped stdin, which ate
+            # the lines below ("Failed to parse JSON coverage summary", then "sh: Syntax error: Unterminated quoted string")
+            perl tests/coverage_gate.pl --llvm-cov="llvm-cov${V}" --profdata=coverage.profdata --phase=2 --strict < /dev/null || GATE=$?
             echo "::endgroup::"
 
             echo "::group::🧪 [Suite] the result of tests/run_all_suite.sh (success only with failed=0)"
             SUITE=0
-            make coverage-suite-check || SUITE=$?
+            make coverage-suite-check < /dev/null || SUITE=$?
             echo "::endgroup::"
             [ "$SUITE" -eq 0 ] || echo "::error title=Test suite::failing tests: $(sed -n 's/^failed_tests=//p' coverage_suite.status)"
             [ "$GATE" -eq 0 ] || echo "::error title=Coverage gate::the phase 2 thresholds are not met"
