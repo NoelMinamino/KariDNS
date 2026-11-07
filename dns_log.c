@@ -49,7 +49,8 @@ static const struct { const char *prefix; int cat; } k_prefix_cat[] = {
   { "QueryLog", LOGC_GENERAL }, { "Control", LOGC_GENERAL }, { "Catalog", LOGC_GENERAL }, { "Manager", LOGC_GENERAL }, { "Backend", LOGC_GENERAL },
   { "Frontend", LOGC_GENERAL }, { "Core", LOGC_GENERAL }, { "Startup", LOGC_GENERAL }, { "Broker", LOGC_GENERAL },
   { "IPC", LOGC_GENERAL }, { "EpochRCU", LOGC_GENERAL }, { "GC", LOGC_GENERAL }, { "Logging", LOGC_GENERAL },
-  { "Plugin", LOGC_GENERAL }, { "Alias", LOGC_GENERAL }, { "Forward", LOGC_GENERAL },
+  { "Plugin", LOGC_GENERAL }, { "Alias", LOGC_GENERAL }, { "Forward", LOGC_GENERAL }, { "Worker", LOGC_GENERAL },
+  { "Sandbox", LOGC_SECURITY },
 };
 
 int klog_category_for_message(const char *fmt) {

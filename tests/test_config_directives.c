@@ -4868,9 +4868,9 @@ static void test_low_l1(void) {
         longp[0] = '/';
         longp[299] = '\0';
         snprintf(txt, sizeof(txt), "options { dnstap { auth; }; dnstap-output unix \"%s\"; };", longp);
-        expect_an_error("dnstap-output long path", txt, "longer than");
+        expect_an_error("dnstap-output long path", txt, "a UNIX socket path holds at most");
         snprintf(txt, sizeof(txt), "options { dnstap { socket \"%s\"; }; };", longp);
-        expect_an_error("dnstap socket long path", txt, "longer than");
+        expect_an_error("dnstap socket long path", txt, "a UNIX socket path holds at most");
         if (parse_ok("options { dnstap { auth; }; dnstap-output unix \"/var/run/karidns/dnstap.sock\"; };", &cfg)) free_server_config_fields(&cfg);
     }
 

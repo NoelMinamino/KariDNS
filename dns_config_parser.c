@@ -5967,7 +5967,8 @@ static bool dnstap_is_bind_type(const char *w) {
 static bool dnstap_socket_path_fits(token_ctx_t *ctx, const char *what, const char *path) {
   const size_t max = sizeof(((struct sockaddr_un *)0)->sun_path);
   if (strlen(path) < max) return true;
-  conf_error(ctx, what, "the socket path '%.64s...' is longer than %zu bytes (the limit of a UNIX socket address)", path, max - 1);
+  conf_error(ctx, what, "the socket path '%.64s...' is %zu bytes long; a UNIX socket path holds at most %zu bytes (sun_path)", path,
+             strlen(path), max - 1);
   return false;
 }
 

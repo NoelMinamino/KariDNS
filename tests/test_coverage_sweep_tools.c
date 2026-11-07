@@ -544,7 +544,7 @@ static void test_lint_messages(void) {
     lint_expect("sshfp empty", &o, "(line 9): SSHFP invalid fingerprint hex string ''");
     lint_zone(&o, "", "_k.a.test.:0:300:0123\n", fix_tinydns);
     lint_expect("sshfp fp_type range", &o, "SSHFP fp_type '300' out of range (0-255)");
-    lint_expect("sshfp algorithm 0", &o, "SSHFP algorithm '0' is outside standard RFC assignments (1-4)");
+    lint_expect("sshfp algorithm 0", &o, "SSHFP algorithm '0' is outside standard RFC assignments (1-4, 6)");
 
     /* the apex SOA that no client sees */
     lint_zone(&o, "", "", fix_soa_restricted);
