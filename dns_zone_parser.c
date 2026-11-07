@@ -87,22 +87,28 @@ void *arena_alloc(zone_arena_t *arena, size_t size) {
       arena->data_pools = pools;
       arena->data_pool_cap = cap;
     }
+    /* review zone_parser [1]: the new size is stored only once the pool is there: after a failed malloc the arena
+     * keeps the old pool and its size, so a later small allocation does not write past it */
+    size_t new_cap = arena->current_pool_cap;
     if (arena->data_pool_count == 0)
-      arena->current_pool_cap = arena->first_pool_cap ? arena->first_pool_cap : 64 * 1024;
+      new_cap = arena->first_pool_cap ? arena->first_pool_cap : 64 * 1024;
     else if (arena->first_pool_cap && arena->data_pool_count < 4)
       /* S4: 最初のプールを見積もったときは、少し足りなかった分を半分の大きさで足す (倍にすると
        * 小さいゾーンの多くで半分が空く)。見積もりが大きく外れたら倍に戻る */
-      arena->current_pool_cap = arena->first_pool_cap / 2 > 1024 ? arena->first_pool_cap / 2 : 1024;
+      new_cap = arena->first_pool_cap / 2 > 1024 ? arena->first_pool_cap / 2 : 1024;
     else {
-      arena->current_pool_cap *= 2;
-      if (arena->current_pool_cap > 64 * 1024 * 1024)
-        arena->current_pool_cap = 64 * 1024 * 1024;
+      new_cap *= 2;
+      if (new_cap > 64 * 1024 * 1024)
+        new_cap = 64 * 1024 * 1024;
     }
-    if (aligned_size > arena->current_pool_cap)
-      arena->current_pool_cap = aligned_size + (1024 * 1024);
-    arena->data_pools[arena->data_pool_count] = malloc(arena->current_pool_cap);
+    if (aligned_size > new_cap) {
+      if (aligned_size > SIZE_MAX - 1024 * 1024) return NULL;
+      new_cap = aligned_size + (1024 * 1024);
+    }
+    arena->data_pools[arena->data_pool_count] = malloc(new_cap);
     if (!arena->data_pools[arena->data_pool_count])
       return NULL;
+    arena->current_pool_cap = new_cap;
     arena->pool_bytes += arena->current_pool_cap;
     aligned_idx = 0;
     arena->data_pool_count++;
@@ -1128,6 +1134,12 @@ STATE_START_LINE:
     }
   }
   if (IS_SPACE(*p)) {
+    /* review zone_parser [2]: a line of blanks, or blanks and a comment, is an empty line (RFC 1035 5.1, as BIND
+     * reads it), not a record of the previous owner without a type */
+    if (scan >= end || IS_NEWLINE(*scan) || *scan == ';') {
+      p = scan;
+      goto STATE_FIND_TOKEN;
+    }
     if (*prev_owner_io)
       fields[field_idx++] = *prev_owner_io;
     goto SKIP_WHITESPACE;

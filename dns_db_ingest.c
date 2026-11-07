@@ -181,6 +181,7 @@ typedef struct {
   size_t nprof, cprof, prof_bytes;
   /* batch */
   bool in_batch;
+  bool config_pending;         /* karidns.conf was reloaded during a batch: CONFIG goes out at its end (review db_ingest [1]) */
   uint64_t batch_id;
   uint8_t batch_kind;
   uint32_t b_applied, b_rejected, b_shadowed, b_deleted, b_failed;
@@ -1443,6 +1444,7 @@ static void cleanup_stream_state(ing_t *g) {
 
 static void send_config(ing_t *g, const char *why) {
   ing_cfg_t snap;
+  g->config_pending = false;
   if (!build_config(g, &snap)) {
     syslog(LOG_ERR, "[DB] cannot build CONFIG for the loader (no database block, or more than %d views); "
                     "closing the stream", KDB_MAX_CONFIG_VIEWS);
@@ -1905,6 +1907,10 @@ static void on_batch_end(ing_t *g, const kdb_msg_t *m) {
   }
   answer_request(g);
   g->in_batch = false;
+  if (g->config_pending) {
+    send_config(g, "configuration reloaded during the batch");
+    if (g->stream_fd < 0) return;
+  }
   kdb_enc_reset(&g->enc);
   if (kdb_enc_begin(&g->enc, KDB_T_BATCH_RESULT) != 0 || kdb_enc_u64(&g->enc, 1, b->batch_id) != 0 ||
       kdb_enc_u32(&g->enc, 3, g->b_applied + g->b_shadowed) != 0 || kdb_enc_u32(&g->enc, 4, 0) != 0 ||
@@ -2286,7 +2292,14 @@ static void on_config_event(ing_t *g) {
   atomic_store_explicit(&g_apex_walking, true, memory_order_relaxed);
   atomic_fetch_add_explicit(&g_apex_walks, 1, memory_order_relaxed);
   memset(&g->apex_cur, 0, sizeof(g->apex_cur));
-  if (g->stream_fd >= 0 && g->hello_done) send_config(g, "configuration reloaded");
+  /* review db_ingest [1]: CONFIG renumbers the views (build_config), and the loader adopts it only between two batches:
+   * during a batch the ZONE_BEGIN / ZONE_FAILED / ZONE_DELETE still to come carry the indexes of the CONFIG the batch was
+   * made with, so the new one is sent when the batch ends (on_batch_end, before BATCH_RESULT: the loader has read it
+   * when it starts its next batch) */
+  if (g->stream_fd >= 0 && g->hello_done) {
+    if (g->in_batch) g->config_pending = true;
+    else send_config(g, "configuration reloaded");
+  }
   /* otherwise the CONFIG of the handshake reads the new configuration */
 }
 

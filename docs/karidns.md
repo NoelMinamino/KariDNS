@@ -956,7 +956,7 @@ A zone in `karidns.conf` takes its per-zone options from its `zone { }` statemen
 |---|---|---|
 | `ALLOW-AXFR-FROM` (one address or prefix per row) | `allow-transfer { <addr>; };` | `AUTO-NS`, a name or anything else that is not an address or prefix is left out with a warning of the loader (the list never becomes wider). |
 | `TSIG-ALLOW-AXFR` (one key name per row) | `allow-transfer { key "<name>"; };` | Both kinds: `allow-transfer { ...; key "..."; }; transfer-acl-match any;` |
-| `ALLOW-DNSUPDATE-FROM`, `TSIG-ALLOW-DNSUPDATE` | `allow-update { ... };` | Both kinds: `update-acl-match all;` is added. |
+| `ALLOW-DNSUPDATE-FROM`, `TSIG-ALLOW-DNSUPDATE` | `allow-update { ... };` | Both kinds: `update-acl-match all;` is added. A row that is not an address or prefix (or not a valid key name) is left out with a warning; a kind whose rows are all left out makes it `allow-update { none; };` (with a warning), so that the other kind alone does not allow more than was written. |
 | `ALSO-NOTIFY` | `also-notify { ... };` | `ip`, `ip:port`, `[ip]:port`. Addresses only (no list name, no key); without it the zone uses the `options` / view `also-notify`. |
 | `AXFR-MASTER-TSIG` | `tsig-key "<name>";` | The key of the primary of a secondary zone (`SLAVE` / `CONSUMER`, milestone B7b). It is **not** a key that may transfer the zone. |
 | `domains.master` (a column, not metadata) | `masters { <addr> [port <n>]; ... };` | Only for `SLAVE` and `CONSUMER` zones: see "Database zone types". `masters` and `primaries` are the same statement. |

@@ -499,6 +499,59 @@ static bool is_strict_subdomain_of(const char *name, const char *parent) {
  * 重複の検査は NS と MX/SRV で分ける (同じ名前の MX が先にあっても NS のエラーを隠さない)。 */
 static uint8_t lint_sev(const zone_lint_in_t *in, int c) { return (in && in->chk) ? in->chk[c] : CHK_DEFAULT; }
 
+/* review zone_lint: the checks below used to scan every record for every record (O(n^2): hours for a zone of 10^5+ RRs).
+ * They look names up in the arena's hash index instead (build_zone_index(): case-insensitive FNV-1a of the owner,
+ * chains in record order).  A name is looked up in its two root forms ("a.example." / "a.example"), as
+ * domain_names_match_ci() compares them, and the smallest matching index is taken, so the findings come out in the
+ * order of the old scans.  Without an index (no caller lints one) the arena is scanned. */
+typedef bool (*lint_pred_t)(const dns_record_t *r, const void *ctx);
+
+/* the smallest index >= from (other than skip) of a record named `name` for which pred holds (pred NULL: any); -1 if none */
+static long lint_at_from(const zone_arena_t *a, const char *name, size_t from, size_t skip, lint_pred_t pred,
+                         const void *ctx) {
+    if (!name) return -1;
+    if (!a->hash_table || a->hash_size == 0) {
+        for (size_t j = from; j < a->count; j++)
+            if (j != skip && a->records[j].name && domain_names_match_ci(a->records[j].name, name) &&
+                (!pred || pred(&a->records[j], ctx)))
+                return (long)j;
+        return -1;
+    }
+    size_t slots[2] = { calc_fnv1a_str(name) & (a->hash_size - 1), calc_fnv1a_other_root_form(name) & (a->hash_size - 1) };
+    long best = -1;
+    for (int s = 0; s < (slots[1] == slots[0] ? 1 : 2); s++) {
+        for (int j = a->hash_table[slots[s]]; j != -1; j = a->records[j].next_record) {
+            if (best >= 0 && j >= best) break;   /* the chain is in record order */
+            const dns_record_t *r = &a->records[j];
+            if ((size_t)j < from || (size_t)j == skip || !r->name || !domain_names_match_ci(r->name, name) ||
+                (pred && !pred(r, ctx)))
+                continue;
+            best = j;
+            break;
+        }
+    }
+    return best;
+}
+
+static long lint_first_at(const zone_arena_t *a, const char *name, size_t skip, lint_pred_t pred, const void *ctx) {
+    return lint_at_from(a, name, 0, skip, pred, ctx);
+}
+
+static bool lint_is_cname(const dns_record_t *r, const void *ctx) { (void)ctx; return r->type_code == 5; }
+static bool lint_is_ns(const dns_record_t *r, const void *ctx) { (void)ctx; return r->type_code == 2; }
+static bool lint_is_ptr(const dns_record_t *r, const void *ctx) { (void)ctx; return r->type_code == 12; }
+static bool lint_is_address(const dns_record_t *r, const void *ctx) { (void)ctx; return r->type_code == 1 || r->type_code == 28; }
+/* a type that may not share its owner with a CNAME: not CNAME and not RRSIG, NSEC, NSEC3, SIG, KEY (RFC 2181 10.1, RFC 4035 2.5) */
+static bool lint_not_beside_cname(const dns_record_t *r, const void *ctx) {
+    (void)ctx;
+    return r->type_code != 5 && r->type_code != 46 && r->type_code != 47 && r->type_code != 50 && r->type_code != 24 &&
+           r->type_code != 25;
+}
+/* an NS record whose target is the name ctx (the glue test of a delegation) */
+static bool lint_ns_to(const dns_record_t *r, const void *ctx) {
+    return r->type_code == 2 && r->rdata_count >= 1 && domain_names_match_ci((const char *)ctx, r->rdata[0]);
+}
+
 static void lint_glue_consistency(const zone_lint_in_t *in, const char *domain, zone_arena_t *arena, kc_tally_t *t) {
     if (lint_sev(in, ZC_INTEGRITY) == CHK_IGNORE) return;   /* check-integrity no: neither the NS glue nor the MX / SRV addresses are looked for */
     char checked_targets[2][64][256];
@@ -534,24 +587,8 @@ static void lint_glue_consistency(const zone_lint_in_t *in, const char *domain, 
         }
 
         // If target points to a CNAME, it will be flagged as ERROR by lint_cname_targets (RFC 2181 §10.3).
-        bool target_is_cname = false;
-        for (size_t j = 0; j < arena->count; j++) {
-            if (arena->records[j].type_code == 5 && domain_names_match_ci(arena->records[j].name, target)) {
-                target_is_cname = true;
-                break;
-            }
-        }
-        if (target_is_cname) continue;
-
-        bool found_address = false;
-        for (size_t j = 0; j < arena->count; j++) {
-            dns_record_t *ar = &arena->records[j];
-            if ((ar->type_code == 1 || ar->type_code == 28) && domain_names_match_ci(ar->name, target)) {
-                found_address = true;
-                break;
-            }
-        }
-        if (found_address) continue;
+        if (lint_first_at(arena, target, SIZE_MAX, lint_is_cname, NULL) >= 0) continue;
+        if (lint_first_at(arena, target, SIZE_MAX, lint_is_address, NULL) >= 0) continue;
         if (kind == 0) {
             kc_error(t, DC_ZONE_GLUE_MISSING, "In-bailiwick NS target '%s' lacks A/AAAA glue record in zone '%s'\n", target, domain);
         } else {
@@ -567,50 +604,67 @@ static void lint_cname_coexistence(const char *domain, zone_arena_t *arena, kc_t
     for (size_t i = 0; i < arena->count; i++) {
         dns_record_t *r1 = &arena->records[i];
         if (r1->type_code != 5) continue; // CNAME
-        for (size_t j = 0; j < arena->count; j++) {
-            if (i == j) continue;
-            dns_record_t *r2 = &arena->records[j];
-            if (!domain_names_match_ci(r1->name, r2->name)) continue;
-            // Exceptions: RRSIG (46), NSEC (47), NSEC3 (50), SIG (24), KEY (25)
-            if (r2->type_code == 46 || r2->type_code == 47 || r2->type_code == 50 ||
-                r2->type_code == 24 || r2->type_code == 25) continue;
-            if (r2->type_code == 5) continue;
+        // Exceptions: RRSIG (46), NSEC (47), NSEC3 (50), SIG (24), KEY (25)
+        long j = lint_first_at(arena, r1->name, i, lint_not_beside_cname, NULL);
+        if (j >= 0) {
+            const dns_record_t *r2 = &arena->records[j];
             kc_error(t, DC_ZONE_CNAME_COEXISTS, "CNAME record at '%s' coexists with other record type '%s'\n",
                     r1->name, r2->type ? r2->type : "<unknown>");
-            break;
         }
     }
 }
 
+/* (NS record, occluded record): one warning each, in the order of the old scan (NS record first, then the record) */
+typedef struct { size_t ns, rec; } lint_occ_t;
+
+static int lint_occ_cmp(const void *pa, const void *pb) {
+    const lint_occ_t *a = pa, *b = pb;
+    if (a->ns != b->ns) return a->ns < b->ns ? -1 : 1;
+    return a->rec < b->rec ? -1 : (a->rec > b->rec);
+}
+
+/* every record strictly below a delegation (an NS RRset other than the apex's) is occluded, except the glue: an
+ * address record whose name is the target of an NS record of that delegation (RFC 1034 4.2.1).  Each record looks for
+ * the delegations above it (its ancestors in the hash index) instead of each NS record scanning the zone. */
 static void lint_delegation_occlusion(const char *domain, zone_arena_t *arena, kc_tally_t *t) {
-    for (size_t i = 0; i < arena->count; i++) {
-        dns_record_t *del_ns = &arena->records[i];
-        if (del_ns->type_code != 2) continue; // NS
-        if (domain_names_match_ci(del_ns->name, domain)) continue; // apex NS is not child delegation
-
-        const char *del_name = del_ns->name;
-        for (size_t j = 0; j < arena->count; j++) {
-            dns_record_t *r = &arena->records[j];
-            if (!is_strict_subdomain_of(r->name, del_name)) continue;
-
-            bool is_glue = false;
-            if (r->type_code == 1 || r->type_code == 28) {
-                for (size_t k = 0; k < arena->count; k++) {
-                    dns_record_t *ns = &arena->records[k];
-                    if (ns->type_code == 2 && domain_names_match_ci(ns->name, del_name)) {
-                        if (ns->rdata_count >= 1 && domain_names_match_ci(r->name, ns->rdata[0])) {
-                            is_glue = true;
-                            break;
-                        }
-                    }
+    lint_occ_t *occ = NULL;
+    size_t n_occ = 0, cap_occ = 0;
+    bool oom = false;
+    for (size_t j = 0; j < arena->count && !oom; j++) {
+        const dns_record_t *r = &arena->records[j];
+        if (!r->name) continue;
+        for (const char *anc = strchr_unescaped(r->name, '.'); anc && anc[1] && !oom; anc = strchr_unescaped(anc + 1, '.')) {
+            const char *del_name = anc + 1;
+            if (domain_names_match_ci(del_name, domain)) break; // apex NS is not child delegation
+            if (!is_strict_subdomain_of(del_name, domain)) break;
+            if (lint_first_at(arena, del_name, SIZE_MAX, lint_is_ns, NULL) < 0) continue;   /* no delegation here */
+            bool is_glue = (r->type_code == 1 || r->type_code == 28) &&
+                           lint_first_at(arena, del_name, SIZE_MAX, lint_ns_to, r->name) >= 0;
+            if (is_glue) continue;
+            /* every NS record at del_name (each one gave its own warning in the old scan) */
+            for (long i = lint_at_from(arena, del_name, 0, SIZE_MAX, lint_is_ns, NULL); i >= 0;
+                 i = lint_at_from(arena, del_name, (size_t)i + 1, SIZE_MAX, lint_is_ns, NULL)) {
+                if (n_occ == cap_occ) {
+                    size_t nc = cap_occ ? cap_occ * 2 : 64;
+                    lint_occ_t *p = realloc(occ, nc * sizeof(*occ));
+                    if (!p) { oom = true; break; }
+                    occ = p;
+                    cap_occ = nc;
                 }
-            }
-            if (!is_glue) {
-                kc_warning(t, DC_ZONE_RECORD_OCCLUDED, "Record '%s %s' is occluded by delegation at '%s'\n",
-                        r->name, r->type ? r->type : "<type>", del_name);
+                occ[n_occ].ns = (size_t)i;
+                occ[n_occ].rec = j;
+                n_occ++;
             }
         }
     }
+    if (oom) kc_error(t, DC_ZONE_RECORD_OCCLUDED, "out of memory while checking delegations in zone '%s'\n", domain);
+    if (n_occ > 1) qsort(occ, n_occ, sizeof(*occ), lint_occ_cmp);
+    for (size_t k = 0; k < n_occ; k++) {
+        const dns_record_t *r = &arena->records[occ[k].rec];
+        kc_warning(t, DC_ZONE_RECORD_OCCLUDED, "Record '%s %s' is occluded by delegation at '%s'\n",
+                r->name, r->type ? r->type : "<type>", arena->records[occ[k].ns].name);
+    }
+    free(occ);
 }
 
 static void lint_cname_targets(const zone_lint_in_t *in, const char *domain, zone_arena_t *arena, kc_tally_t *t) {
@@ -629,14 +683,10 @@ static void lint_cname_targets(const zone_lint_in_t *in, const char *domain, zon
         }
         if (!target) continue;
 
-        for (size_t j = 0; j < arena->count; j++) {
-            dns_record_t *c = &arena->records[j];
-            if (c->type_code == 5 && domain_names_match_ci(c->name, target)) {
-                /* an NS target that is an alias always fails; check-mx-cname sets the severity of an MX target (BIND default warn, here error) */
-                kc_finding(t, rec->type_code == 15 ? lint_sev(in, ZC_MX_CNAME) : (uint8_t)CHK_DEFAULT, 'E', DC_ZONE_CNAME_TARGET,
-                           "%s record '%s' points to CNAME target '%s' (RFC 2181 section 10.3)\n", type_name, rec->name, target);
-                break;
-            }
+        if (lint_first_at(arena, target, SIZE_MAX, lint_is_cname, NULL) >= 0) {
+            /* an NS target that is an alias always fails; check-mx-cname sets the severity of an MX target (BIND default warn, here error) */
+            kc_finding(t, rec->type_code == 15 ? lint_sev(in, ZC_MX_CNAME) : (uint8_t)CHK_DEFAULT, 'E', DC_ZONE_CNAME_TARGET,
+                       "%s record '%s' points to CNAME target '%s' (RFC 2181 section 10.3)\n", type_name, rec->name, target);
         }
     }
 
@@ -645,13 +695,8 @@ static void lint_cname_targets(const zone_lint_in_t *in, const char *domain, zon
     for (size_t i = 0; i < arena->count; i++) {
         dns_record_t *rec = &arena->records[i];
         if (rec->type_code != 33 || rec->rdata_count < 4 || !rec->rdata[3] || strcmp(rec->rdata[3], ".") == 0) continue;
-        for (size_t j = 0; j < arena->count; j++) {
-            dns_record_t *c = &arena->records[j];
-            if (c->type_code == 5 && domain_names_match_ci(c->name, rec->rdata[3])) {
-                kc_finding(t, lint_sev(in, ZC_SRV_CNAME), 'W', DC_ZONE_SRV_CNAME, "SRV record '%s' points to CNAME target '%s' (RFC 2782)\n", rec->name, rec->rdata[3]);
-                break;
-            }
-        }
+        if (lint_first_at(arena, rec->rdata[3], SIZE_MAX, lint_is_cname, NULL) >= 0)
+            kc_finding(t, lint_sev(in, ZC_SRV_CNAME), 'W', DC_ZONE_SRV_CNAME, "SRV record '%s' points to CNAME target '%s' (RFC 2782)\n", rec->name, rec->rdata[3]);
     }
 
     // 2. CNAME loops (ERROR) and CNAME chains (WARNING)
@@ -666,15 +711,9 @@ static void lint_cname_targets(const zone_lint_in_t *in, const char *domain, zon
             continue;
         }
 
-        for (size_t j = 0; j < arena->count; j++) {
-            if (i == j) continue;
-            dns_record_t *t_rec = &arena->records[j];
-            if (t_rec->type_code == 5 && domain_names_match_ci(t_rec->name, target)) {
-                kc_warning(t, DC_ZONE_CNAME_CHAIN, "CNAME chain detected: '%s' points to CNAME '%s'\n",
-                        cname->name, target);
-                break;
-            }
-        }
+        if (lint_first_at(arena, target, i, lint_is_cname, NULL) >= 0)
+            kc_warning(t, DC_ZONE_CNAME_CHAIN, "CNAME chain detected: '%s' points to CNAME '%s'\n",
+                    cname->name, target);
     }
 }
 
@@ -701,8 +740,7 @@ static void lint_wildcard(const zone_lint_in_t *in, zone_arena_t *arena, kc_tall
     for (size_t i = 0; i < arena->count; i++) {
         const dns_record_t *r = &arena->records[i];
         if (!r->name || !lint_internal_wildcard(r->name)) continue;
-        bool seen = false;   /* once per name */
-        for (size_t j = 0; j < i && !seen; j++) seen = arena->records[j].name && domain_names_match_ci(arena->records[j].name, r->name);
+        bool seen = lint_first_at(arena, r->name, SIZE_MAX, NULL, NULL) < (long)i;   /* once per name */
         if (!seen) kc_finding(t, CHK_WARN, 'W', DC_ZONE_WILDCARD_NON_TERMINAL, "ownername '%s' contains a non-terminal wildcard (check-wildcard)\n", r->name);
     }
 }
@@ -1615,13 +1653,7 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                         strncpy(ptr_name, arena->records[i].name + 6, ptr_name_len);
                         ptr_name[ptr_name_len] = '\0';
                         
-                        bool has_ptr = false;
-                        for (size_t j = 0; j < arena->count; j++) {
-                            if (arena->records[j].type_code == 12 && strcasecmp(arena->records[j].name, ptr_name) == 0) {
-                                has_ptr = true;
-                                break;
-                            }
-                        }
+                        bool has_ptr = lint_first_at(arena, ptr_name, SIZE_MAX, lint_is_ptr, NULL) >= 0;
                         if (!has_ptr) {
                             kc_warning(t, DC_ZONE_CATALOG_ORPHAN_GROUP, "Orphaned group TXT record '%s' (no corresponding PTR record '%s')\n", arena->records[i].name, ptr_name);
                         }
