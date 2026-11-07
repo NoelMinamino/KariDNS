@@ -1,0 +1,56 @@
+# karidns-signer.conf: the configuration of karidns-signer (docs/karidns-signer.md).
+# Lines are `key = value`; `#` starts a comment; a value may be in double quotes.  Durations are a number with an optional unit
+# s, m, h, d or w (a bare number is seconds).  Copy this file to /usr/local/etc/karidns/karidns-signer.conf and edit it.
+# Check it with:  karidns-signer --check -c /usr/local/etc/karidns/karidns-signer.conf
+
+# --- the database (one of the two) ---------------------------------------------------------------------------------------------------
+database = pg
+# PostgreSQL: a file with the connection string of the signer's role (db/karidns_signer_role.pgsql.sql).  It must be a regular file
+# owned by the user the signer runs as, mode 0600 or 0400.  Example content:
+#   host=db.example.test port=5432 dbname=pdns user=karidns_signer password=... sslmode=verify-full
+conninfo-file = /usr/local/etc/karidns/signer.conninfo
+# schema = public
+
+# SQLite3 instead (database = sqlite3): the database file, and the control-channel configuration of the restricted key that asks the
+# server to reload a zone (karictl -c; the server needs control-channel { keys { "signer" read-only yes allow-commands { reload-zone; }; }; })
+# database = sqlite3
+# sqlite-file = /var/db/karidns/zones.sqlite3
+# karictl-config = /usr/local/etc/karidns/signer-karictl.conf
+# karictl-socket = /var/run/karidns/karidns.sock
+
+# --- where it works ------------------------------------------------------------------------------------------------------------------
+# The work directory holds the key files while a zone is signed: its own, mode 0700, on tmpfs (the rc script mounts one).
+# work-dir = /var/db/karidns-signer/work
+# Zones signed at a time (default: half of the CPUs, at least 1).
+# workers = 2
+# karidns-zone = /usr/local/bin/karidns-zone
+# karicheck = /usr/local/bin/karicheck
+# karictl = /usr/local/bin/karictl
+# The directory of dnssec-keygen and dnssec-signzone (bind-tools, BIND 9.20).
+# bind-tools = /usr/local/bin
+# Seconds a child process (dnssec-signzone, karidns-zone, ...) may run (default 1800).
+# timeout = 30m
+# Seconds after the last change before a changed zone is signed again (default 5).
+# debounce = 5
+# stderr, or a syslog facility (daemon, local0 ... local7, ...).
+log = daemon
+
+# --- the signatures (defaults of every zone; each can be set per zone below) ---------------------------------------------------------------
+# How long a signature is valid (default 14d).
+# validity = 14d
+# A signature is made again when this much is left (default 3.5 days = 302400 seconds).
+# refresh = 302400
+# A random part of this is taken off the due time, so that many zones spread out (default 1d).
+# jitter = 1d
+# Check the signed zone with the verification of dnssec-signzone (default yes).
+# verify = yes
+# NSEC3 Opt-Out for a zone whose first signing is by key request (default no).
+# nsec3-opt-out = no
+
+# --- per zone ------------------------------------------------------------------------------------------------------------------------
+# [zone example.test]
+# validity = 30d
+# refresh = 7d
+# jitter = 2d
+# verify = yes
+# nsec3-opt-out = no

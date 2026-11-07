@@ -65,7 +65,7 @@ static const kdb_tspec_t sp_batch_end[] = { S(KT_U64, KS_REQ, 0), S(KT_U32, KS_R
 static const kdb_tspec_t sp_auto_entry[] = {
     S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_U64, KS_REQ, 0), S(KT_U64, KS_REQ, 0), S(KT_U32, KS_REQ, 0), S(KT_STR, 0, 255),
     S(KT_U8, KS_MAXV, KDB_AS_AUTO | KDB_AS_REQ), S(KT_STR, KS_NE, 64), S(KT_U64, 0, 0), S(KT_U8, KS_MAXV, 1), S(KT_STR, 0, 255),
-    S(KT_U64, 0, 0) };
+    S(KT_U64, 0, 0), S(KT_U32, 0, 0), S(KT_STR, 0, 255) };
 TDEF(td_auto_entry, "AUTO_STATUS.ENTRY", sp_auto_entry);
 static const kdb_tspec_t sp_auto_status[] = { { KT_NEST, 0, KDB_MAX_CONFIG_VIEWS, &td_auto_entry } };
 TDEF(td_auto_status, "AUTO_STATUS", sp_auto_status);
@@ -87,7 +87,7 @@ TDEF(td_cfg_view, "CONFIG.VIEW", sp_cfg_view);
 static const kdb_tspec_t sp_config[] = {
     S(KT_U64, KS_REQ, 0), S(KT_STR, KS_REQ | KS_NE, 32), S(KT_STR, 0, 64),
     { KT_NEST, 0, KDB_MAX_CONFIG_VIEWS, &td_cfg_view },
-    S(KT_U32, KS_MAXV, 2147483647u), S(KT_U8, KS_MAXV, 100), S(KT_U32, KS_MAXV, 16), S(KT_U8, KS_MAXV, 1) };
+    S(KT_U32, KS_MAXV, 2147483647u), S(KT_U8, KS_MAXV, 100), S(KT_U32, KS_MAXV, 16), S(KT_U8, KS_MAXV, 1), S(KT_U8, KS_MAXV, 1) };
 TDEF(td_config, "CONFIG", sp_config);
 static const kdb_tspec_t sp_reload_req[] = {
     S(KT_U64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 1), S(KT_U16, KS_VIEW, 0), S(KT_NAME, 0, 0), S(KT_U8, KS_REQ | KS_MAXV, 1) };
@@ -531,6 +531,7 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         m->u.config.bulk_threshold = V(6).present ? (int)V(6).u : -1;
         m->u.config.loader_threads = V(7).present ? (uint32_t)V(7).u : 0;
         m->u.config.dir_only = V(8).present && V(8).u != 0;
+        m->u.config.signer_wait = !V(9).present || V(9).u != 0;
         m->u.config.n_views = nrep;
         m->u.config.body = fr->body;
         m->u.config.body_len = fr->len;
@@ -641,6 +642,8 @@ bool kdb_auto_status_entries_next(kdb_iter_t *it, kdb_auto_status_entry_t *o) {
     o->req_ok = V(9).present && V(9).u != 0;
     o->req_error = gstr(&V(10));
     o->req_time = V(11).present ? V(11).u : 0;
+    o->sig_wait = V(12).present ? (uint32_t)V(12).u : 0;
+    o->sig_names = gstr(&V(13));
     return true;
 }
 

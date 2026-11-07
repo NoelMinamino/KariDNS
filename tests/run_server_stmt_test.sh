@@ -501,7 +501,7 @@ for z in c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 d1 d2 d3 f1; do zone "$W/$z.zone" "$
 CPORT=$(kari_port 40)       # 40 .. 59: one port per target, UDP and TCP on it
 cp_of() { echo $((CPORT + $1)); }
 # sink A (UDP answers; TCP by mode): c1 answer | c2 close | c3 garble | c4 short | c5 bigprefix | c6 badid | c7 unsigned | c8 badsig | c9 stall | c10 partial
-# d1: UDP answered, d3: UDP answered without a TSIG although the NOTIFY is signed; both TCP answer
+# d1: UDP answered, d3: UDP answered without a TSIG although the NOTIFY is signed; both TCP answer (d1: notify-retry-interval 5, so that a slow host answers before the first retransmission; d2 has the 1 s of options)
 # c11: stall like c9, but the zone has notify-tcp-timeout 3 (both attempts are over after about 6 s, not 30 s)
 perl "$DIR/mock_notify_sink.pl" --log "$W/sinkc.log" --key "xk:$XK" --answer \
     --ports "$(cp_of 1),$(cp_of 2),$(cp_of 3),$(cp_of 4),$(cp_of 5),$(cp_of 6),$(cp_of 7),$(cp_of 8),$(cp_of 9),$(cp_of 10),$(cp_of 11),$(cp_of 13)" \
@@ -530,7 +530,7 @@ PIDS="$PIDS $!"
     echo "options { port $(cp_of 31); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; notify-retries 1; notify-retry-interval 1; };"
     ctlblock pc2
     keydef xk "$XK"
-    echo "zone \"d1.test\" { type master; file \"$W/d1.zone\"; also-notify { 127.0.0.1 port $(cp_of 11); }; };"
+    echo "zone \"d1.test\" { type master; file \"$W/d1.zone\"; notify-retry-interval 5; also-notify { 127.0.0.1 port $(cp_of 11); }; };"
     echo "zone \"d2.test\" { type master; file \"$W/d2.zone\"; also-notify { 127.0.0.1 port $(cp_of 12); }; };"
     echo "zone \"d3.test\" { type master; file \"$W/d3.zone\"; tsig-key xk; notify-retries 5; notify-retry-interval 60; also-notify { 127.0.0.1 port $(cp_of 13); }; };"
 } > "$W/pc2.conf"

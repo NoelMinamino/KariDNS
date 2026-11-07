@@ -9,7 +9,9 @@
 ```text
 karidns-zone import [options] <zone> <file|->
 karidns-zone import --all [options] <tinydns-data-file>
+karidns-zone import --signer [options] <zone> <signed-zone-file|->
 karidns-zone export [options] <zone> [<file>]
+karidns-zone export --signer [options] <zone> [<file>]
 karidns-zone export --all --dir <dir> [options]
 karidns-zone --version | -h | --help
 ```
@@ -40,7 +42,7 @@ The type of an existing zone (`domains.type`) is never changed; a new zone is `N
 : **RRset merge.** Every (owner, type) in the file replaces that RRset in the database; the RRsets that are not in the file stay. Deleting needs replace mode. The file may be a part of the zone: the checks of the file do not demand SOA, NS and glue then (the whole zone is checked when it is read back). The owned metadata the file declares replaces the database's.
 
 `--types T1,T2`
-: Limits either mode to records of these types: only they are deleted and only they are written; metadata and tag definitions are not touched. (The later signer uses `--mode merge --types RRSIG,NSEC3,DNSKEY,...`.) Up to 64 types, case does not matter.
+: Limits either mode to records of these types: only they are deleted and only they are written; metadata and tag definitions are not touched. (The signer does not use it: it has `--signer`, below.) Up to 64 types, case does not matter.
 
 `--dry-run` (`-n`)
 : Does everything except the commit. The RRsets that would be added, replaced or deleted are listed (`db.import.change`, notes), and the summary says `dry run, nothing was written`. `--verbose` lists them for a real import too.
@@ -59,6 +61,39 @@ For an existing zone whose SOA is written, the new serial must be **greater** th
 : Writes the file's serial as it is (restoring a backup, importing an export of the same zone).
 
 A new zone takes the file's serial. A merge or a `--types` import that does not write the SOA does not touch the serial.
+
+### Signer mode (`--signer`)
+
+`karidns-zone import --signer <zone> <file>` writes a zone that [`karidns-signer`](karidns-signer.md) signed (0.6.0 item C). The file is the zone as `dnssec-signzone` wrote it from an **export** of the zone; the tool takes from it the DNSSEC records and nothing else, so it works with the rights of the signer role alone (below) and cannot change the data of the zone. In ONE transaction:
+
+1. The `RRSIG`, `NSEC`, `NSEC3`, `NSEC3PARAM` and `DNSKEY` records of the database are replaced by the file's, in the layout PowerDNS stores a presigned zone in (no `NSEC`, `NSEC3` or `NSEC3PARAM` rows, the chain is rebuilt by the reader; `ordername` is the NSEC3 hash, or the reversed relative name of an NSEC zone). `CDS` and `CDNSKEY` are not touched.
+2. The SOA of the file must be the database's SOA but for the serial, which must be **greater** (RFC 1982); it is written with `UPDATE`.
+3. **Every other record of the file must equal the database's**, compared as RRsets in canonical form (RFC 4034 section 6.2): owner (without regard to case), type, class, the RDATA in wire form with the names inside the RDATA of the types that section lists in lower case, and the TTL of the RRset (the lowest of its records, RFC 2181 section 5.2: the TTL the server serves). Both sides are read the way the server reads a zone (the zone parser for the file, the loader's reader for the rows; the DNSSEC records left out), so the way a row is spelled does not matter: hex or names in upper case, an AAAA that is not compressed, a TXT without quotes or with escapes, the same row twice, an RRset whose rows have different TTLs, a NULL TTL (the default TTL of the loader), a disabled row (not served, not compared). An export of a zone, signed and given back, is accepted whatever the rows look like; a real change is not. If the zone changed since the export, nothing is written: the message is `db.import.changed` (it names the first RRset that differs), the `--json` document has `"signer": {"changed": true}` and the exit status is **3**. The signer then signs the zone again. The same goes for a serial that does not grow, and for a change that another session commits while the tool writes: on PostgreSQL the transaction is `REPEATABLE READ`, so a row it writes that another session changed after the tool read the zone (SQLSTATE 40001, or a record that is gone) is a change of the zone, not a failure; on SQLite3 the one write lock rules it out.
+4. `ordername` and `auth` of the records that stay (and of the empty non-terminals the database holds) are set as a presigned zone has them (`auth` 0 for the NS records of a delegation and the names below it), with `UPDATE` where they differ.
+5. The metadata `PRESIGNED` = 1, `NSEC3PARAM` (none for an NSEC zone) and `X-KARIDNS-SIGNER` = 1 are written. A running server then no longer reloads the zone because of the change log, only on a reload request ([`karidns(8)`](karidns.md), `signer-wait`).
+6. The zone is read back through the loader's reader as for any import; a zone the loader would refuse is not committed.
+
+`--signer` takes a zone that exists, is a primary zone (`NATIVE` or `MASTER`) and has one SOA at the apex, and a file in BIND format that is signed (RRSIG records and a complete NSEC or NSEC3 chain; otherwise `db.import.signer`). It cannot be combined with `--mode`, `--types`, `--serial`, `--view`, `--type`, `--all` or a tinydns data file: those are usage errors (exit status 2). `--dry-run`, `--reload` (PostgreSQL: the reload request is committed with the data, so the loader sees both together), `--strict`, `--verbose`, `--audit` and `--json` work as for any import. A signer import writes a whole zone again (every signature), so on PostgreSQL it asks for the audit in **summary mode** unless `--audit rows` is given, and it writes ordername and auth, the DNSSEC rows and the metadata in a few statements (`unnest()` of arrays): the change log gets a few rows and `karidns_changes` one `NOTIFY` per statement, not one per record. (SQLite3 triggers fire per row whatever the statements: the change log and the audit have a row per changed row.)
+
+The first signing needs nothing in the database but the zone: no `cryptokeys` rows and no `PRESIGNED` metadata. `karidns-zone export` writes the zone as the unsigned zone it is, and `import --signer` of the signed text then sets `PRESIGNED`, `NSEC3PARAM` (NSEC3) and `X-KARIDNS-SIGNER`; the signer inserts the keys it signed with after that.
+
+**A normal import into a zone the signer signs.** A zone with the metadata `X-KARIDNS-SIGNER` = 1 keeps its DNSSEC records when an operator imports into it with a plain `karidns-zone import` (replace or merge): the `RRSIG`, `NSEC`, `NSEC3`, `NSEC3PARAM`, `DNSKEY`, `CDS` and `CDNSKEY` rows and the metadata `PRESIGNED` and `NSEC3PARAM` stay as they are, and only the other data is replaced (or merged); a file with DNSSEC records of its own is taken without them (the message `db.import.signer-zone` says how many were ignored). The read-back checks the zone without its DNSSEC records. The loader does not serve the new data before the signer has signed it (`signer-wait`); the signer notices the change in the change log and signs the zone again.
+
+**Result.** The text output ends with `Zone 'x' signed: SOA serial A -> B, N DNSSEC record(s) written, M removed, K record(s) updated (ordername, auth); the earliest RRSIG expires T`. With `--json` the document has one more key, `signer`, after `zones`:
+
+```json
+"signer": { "zone": "example.test", "changed": false, "committed": true, "serial": 11, "old_serial": 10,
+            "dnssec_records_written": 20, "dnssec_records_removed": 0, "records_updated": 9,
+            "rrsets_added": 16, "rrsets_replaced": 0, "rrsets_deleted": 0,
+            "earliest_expire": "2026-11-20T02:29:12Z", "earliest_expire_epoch": 1795141752,
+            "write_id": { "xid": null, "seq_first": 11, "seq_last": 42 } }
+```
+
+- `earliest_expire` is the earliest signature expiration of the zone **after** the write, as a UTC time (and `earliest_expire_epoch`, unix seconds). The expiration field of an RRSIG is a 32-bit number of seconds modulo 2^32, compared with serial number arithmetic (RFC 4034 section 3.1.5, RFC 1982), so the earliest is the one that comes first in that order, and the 32-bit value is put into the 64-bit time nearest to now. The signer schedules the next run from it: the earliest expiration minus its refresh interval.
+- `write_id` says which rows of `karidns_changes` this write made, so that the signer does not take its own write for a change of the zone. PostgreSQL: `xid` is `pg_current_xact_id()` of the write transaction (the `xid` column of the rows the triggers wrote), `seq_first` and `seq_last` are null. SQLite3: `seq_first` and `seq_last` are the first and the last `karidns_changes.seq` of the transaction (the transaction holds the one write lock, so all rows between them are its own; both null when it wrote no row, and `xid` is null).
+- With `changed` true there is no other key but `zone` and `committed` (false). A dry run gives the same numbers with `committed` false.
+
+**Busy.** When another importer holds the zone, or the database is locked for longer than the tool waits (SQLite3: 5 seconds; PostgreSQL: `lock_timeout`, 10 seconds), nothing is written and the exit status is **4** (`db.import.busy`; `"signer": {"changed": false, "committed": false, "busy": true}` with `--json`), not 1: try again. Any other import exits with 1 in this case.
 
 ### Views and the database
 
@@ -104,6 +139,10 @@ A signed (PRESIGNED) zone is exported as the server serves it, with the NSEC3PAR
 `--mode replace|merge`, `--types T1,T2`, `--dry-run` (`-n`), `--serial grow|increment|keep`, `--verbose`
 : Above.
 
+`--signer`
+: `import`: the file is a zone signed by `karidns-signer`; write its DNSSEC records and nothing else (above). Exit status 3 when the zone changed since the file was made, 4 when the zone is busy. The audit is in summary mode unless `--audit rows` is given.
+: `export`: the zone as the input of `dnssec-signzone` (below, "Export for the signer"): the NSEC / NSEC3 chain, the signatures over it and the metadata `PRESIGNED` and `NSEC3PARAM` are left out, the other signatures and the DNSKEY records stay.
+
 `--strict`
 : A warning of the zone checks fails the import. Without it warnings are printed and the import goes on. An error always fails.
 
@@ -144,9 +183,13 @@ The BIND text is `$ORIGIN`, `$TTL` (the TTL most records have), the tag definiti
 
 **`export --all --dir DIR`** writes `<name>.zone` (BIND format) or `<name>.tinydns` (a tinydns data file) for every primary zone, in the order of the names. The name is the zone name with every byte that is not a letter, digit, `-`, `_` or `.` (a dot as the first character included) written as `%XX`, so a name never contains a path separator, starts with a dot or contains a control character, and two zones never give the same file. A zone that cannot be exported (the reader refuses its rows) is reported and the others are written; the exit status is 1. With `--view` only the zones of the view are written.
 
+### Export for the signer (`--signer`)
+
+`karidns-zone export --signer <zone> <file>` writes the zone as the **input of `dnssec-signzone`**, which is what `karidns-signer` needs. The plain export is the zone as the server serves it, and the server serves a signed zone only when its NSEC3 chain is complete: a zone that someone changed after it was signed (a new name has no NSEC3 record and no signature over it yet) is refused by the reader (`presigned zone: no RRSIG(NSEC3) owner for 'new.example.test.'`), and so by the plain export. With `--signer` the rows are read without the chain: the NSEC, NSEC3 and NSEC3PARAM records, the RRSIG records that cover them and the metadata `PRESIGNED` and `NSEC3PARAM` are left out, so there is nothing to rebuild or check. The other RRSIG records and the DNSKEY, CDS and CDNSKEY records stay, so that `dnssec-signzone -i` keeps the signatures that are still good (an RRset that changed has a signature that no longer verifies, and is signed again); the signer makes the chain again. The text is the data of the database as it is, signed and unsigned alike; the check "a zone with a row in `cryptokeys` but without `PRESIGNED` is refused" is not made, because the metadata is not read. On an unsigned zone `--signer` gives the same text as the plain export. It takes the options of `export` (`--all --dir` as well) and none of `import`.
+
 ## JSON OUTPUT
 
-`karidns-zone --json <command> ...` writes the document of [`karicheck --json`](karicheck.md#json-output) with the first key `"karidns-zone": 1` and `"command": "import"` or `"export"`; `messages[]`, `counts` and `zones[]` are as there (`zones[]` has one entry per zone imported or exported; `format` is `bind`, `tinydns`, or `database` for a zone that failed before its format was known; `file` is the input or output file). Standard output carries only the document, standard error nothing; the exit status is the one of the text mode. The codes are those of [`karicheck(1)`](karicheck.md) (`usage.*`, `io.*`, `conf.*`, `zone.*`, `db.import.*`, `db.export.*`, `db.zone.*`; the list is in the manual of `karicheck`).
+`karidns-zone --json <command> ...` writes the document of [`karicheck --json`](karicheck.md#json-output) with the first key `"karidns-zone": 1` and `"command": "import"` or `"export"`; `import --signer` adds the key `signer` after `zones` (above); `messages[]`, `counts` and `zones[]` are as there (`zones[]` has one entry per zone imported or exported; `format` is `bind`, `tinydns`, or `database` for a zone that failed before its format was known; `file` is the input or output file). Standard output carries only the document, standard error nothing; the exit status is the one of the text mode. The codes are those of [`karicheck(1)`](karicheck.md) (`usage.*`, `io.*`, `conf.*`, `zone.*`, `db.import.*`, `db.export.*`, `db.zone.*`; the list is in the manual of `karicheck`).
 
 ## AUDIT
 
@@ -158,7 +201,7 @@ A database of schema version 3 (`db/karidns_ext.*.sql`) has an audit log: `karid
 : One audit row per changed record, tag, tag definition and metadata row. A replace-import of a zone of a million records writes two million rows.
 
 `--audit summary`
-: PostgreSQL: each write transaction of the run begins with `SET LOCAL karidns.audit = 'summary'`. The audit then writes one row for the transaction, the table, the operation and the zone, which counts the statements and the rows (`{"summary": true, "statements": 1000000, "rows": 1000000}` in `after`); the first statement inserts the row and the totals are written into it when the transaction commits. The roles of the WebAdmin (`karidns_api`) and of the signer (`karidns_signer`) cannot turn the detail off, and neither can a login role that is a member of one of them, also after `SET ROLE` to another role: the restricted roles are the rows of the table `karidns_auth.audit_restricted_roles` (owner only; the role scripts of the WebAdmin add the role name they were given). The importer's role can. SQLite3: the audit has rows only; the option is accepted and the actor row is written as with `rows`.
+: PostgreSQL: each write transaction of the run begins with `SET LOCAL karidns.audit = 'summary'`. The audit then writes one row for the transaction, the table, the operation and the zone, which counts the statements and the rows (`{"summary": true, "statements": 1000000, "rows": 1000000}` in `after`); the first statement inserts the row and the totals are written into it when the transaction commits. The role of the WebAdmin (`karidns_api`) cannot turn the detail off, and neither can a login role that is a member of it, also after `SET ROLE` to another role: the restricted roles are the rows of the table `karidns_auth.audit_restricted_roles` (owner only; the role script of the WebAdmin adds the role name it was given). The importer's role can, and so can the signer's (`karidns_signer`: a trusted daemon whose output is machine made; `import --signer` uses summary mode by default). SQLite3: the audit has rows only; the option is accepted and the actor row is written as with `rows`.
 
 **Zone names in the log.** Every audit row of a zone's data names the zone (`zone_name`), also the rows that a zone delete removes through foreign keys (records, metadata, tag definitions, views). The one exception: the rows of `karidns_record_tags` and `karidns_record_tinydns` that go with their record (when the record or its zone is deleted) have `zone_name` NULL, because the record is gone when they are deleted. The `D` row of the record carries the zone, and its `row_id` is the `record_id` of those rows. (PostgreSQL remembers the name of a zone that is being deleted in a transaction-local setting `karidns.zc_<hash of the schema>_<domain id>`; it ends with the transaction.)
 
@@ -175,7 +218,13 @@ A database of schema version 3 (`db/karidns_ext.*.sql`) has an audit log: `karid
 : Something failed: an error of the zone checks, a serial that does not grow, a zone the loader would refuse, the database, a configuration that cannot be read, an output file. Nothing of a failed zone was written to the database.
 
 `2`
-: Usage error (an unknown option or command, a missing value, an option of the other command, a wrong number of arguments, `--json` with an export to standard output). The usage goes to standard error (the message only, in the document, with `--json`); nothing was done.
+: Usage error (an unknown option or command, a missing value, an option of the other command, a wrong number of arguments, `--json` with an export to standard output, `--signer` with `--mode`, `--types`, `--serial`, `--view`, `--type` or `--all`). The usage goes to standard error (the message only, in the document, with `--json`); nothing was done.
+
+`3`
+: `import --signer` only: the zone in the database is no longer the zone the signed file was made from (a record or the SOA differs, or the serial does not grow, or another session changed the zone while the tool wrote it). Nothing was written (`db.import.changed`). Sign the zone again.
+
+`4`
+: `import --signer` only: the zone is locked by another import, or the database is busy for longer than the tool waits. Nothing was written (`db.import.busy`). Try again.
 
 ## THE WRITER ROLE (PostgreSQL)
 
@@ -194,6 +243,10 @@ host=/var/run/postgresql dbname=karidns user=karidns_writer
 ```
 
 `karidns-zone import --conninfo-file /usr/local/etc/karidns/writer.conninfo example.test example.test.zone`. SQLite3 has no roles: the user running the tool needs read and write access to the database file and its directory.
+
+### The signer role
+
+`import --signer` needs less: `db/karidns_signer_role.pgsql.sql` (see [`karidns-dbloader(8)`](karidns-dbloader.md), "Roles and row level security") gives the signer's role `SELECT` on everything, `INSERT` and `DELETE` on the DNSSEC records, `UPDATE` of records (a trigger lets it change only `ordername` and `auth` of a record that is not a DNSSEC record, and of an SOA record only the serial besides), and the three metadata kinds it owns. The tool deletes the DNSSEC records by id and never touches the tag tables, so that role is enough, with row level security on.
 
 ## EXAMPLES
 
@@ -215,6 +268,14 @@ Import every zone of a tinydns data file (each in its own transaction), then exp
 ```text
 karidns-zone import --all --sqlite3 /var/db/karidns/pdns.sqlite3 /var/tinydns/root/data
 karidns-zone export -c /usr/local/etc/karidns/karidns.conf example.test > example.test.zone
+```
+
+Write a zone that `dnssec-signzone` signed from an export of it (what `karidns-signer` does; the exit status is 3 when the zone changed meanwhile):
+
+```text
+karidns-zone export --signer -c karidns.conf example.test example.test.in
+dnssec-signzone -o example.test -f example.test.signed -N increment -3 - -H 0 -K keys example.test.in Kexample.test.+013+11111 Kexample.test.+013+22222
+karidns-zone import --signer --json -c karidns.conf example.test example.test.signed
 ```
 
 Take the serial from the database (a changed file whose serial was not raised), or restore a backup as it was:
@@ -269,6 +330,7 @@ then `karictl reconfig`. A signed zone is exported with its signatures and the N
 ## SEE ALSO
 
 - [`karidns-dbloader(8)`](karidns-dbloader.md) — the loader that reads the zones the importer writes; the SQL files, the packages
+- [`karidns-signer(8)`](karidns-signer.md) — the daemon that runs `export --signer` and `import --signer` and keeps the zones signed
 - [`karicheck(1)`](karicheck.md) — the zone checks (`karicheck zone`), `karicheck db`, the JSON document and the message codes
 - [`karictl(8)`](karictl.md) — `reload`, `dbstatus`, `rollback`
 - [`karidns(8)`](karidns.md) — the `database` block, views, database zones, `check-*` options and limits

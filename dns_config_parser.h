@@ -674,6 +674,7 @@ typedef struct {
   int acl_ceiling_keys_count;
   uint8_t acl_ceiling_match;   /* acl-ceiling-match: ACL_MATCH_DEFAULT/ANY = address OR key (B7a), ACL_MATCH_ALL = address AND key */
   bool auto_reload;
+  bool signer_wait;            /* signer-wait (default yes; 0.6.0 item C): the loader does not reload a zone with metadata X-KARIDNS-SIGNER=1 because of the change log, it waits for the signer's reload request */
   uint32_t poll_interval;      /* seconds, 1..60 */
   uint32_t coalesce_ms;        /* 0..10000 */
   uint32_t default_ttl;        /* 1..2147483647 */

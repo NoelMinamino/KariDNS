@@ -200,7 +200,8 @@ if [ $BACKEND = sqlite3 ]; then
     err "a required table is missing" "table cryptokeys is missing"
 else
     db_reset
-    sql "ALTER TABLE records DROP COLUMN prio"
+    # CASCADE: the signer's trigger (BEFORE UPDATE OF every column but ordername and auth) depends on the column
+    sql "ALTER TABLE records DROP COLUMN prio CASCADE"
     conf; run
     err "a required column is missing" "table records has no column prio"
     db_reset

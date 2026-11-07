@@ -175,6 +175,7 @@ static struct {
     diag_zone_t *zones;
     size_t nzones, czones, zones_dropped;
     unsigned checked, skipped;
+    char extra_key[24], *extra_val;             /* dns_diag_json_extra(): one more key at the end of the document */
     char ctx_zone[CTX_ZONE_MAX], ctx_view[CTX_VIEW_MAX], ctx_file[CTX_FILE_MAX];
     long ctx_line;
 } g;
@@ -229,7 +230,16 @@ void dns_diag_json_reset(void) {
         free(g.zones[i].file);
     }
     free(g.zones);
+    free(g.extra_val);
     memset(&g, 0, sizeof(g));
+}
+
+void dns_diag_json_extra(const char *key, const char *json_value) {
+    char *v = strdup(json_value);
+    if (!v) return;
+    free(g.extra_val);
+    g.extra_val = v;
+    snprintf(g.extra_key, sizeof(g.extra_key), "%s", key);
 }
 
 void dns_diag_json_tool(const char *tool) {
@@ -513,6 +523,12 @@ int dns_diag_json_finish(FILE *fp, int status) {
         json_str(fp, z->format);
         fprintf(fp, ", \"result\": \"%s\", \"errors\": %zu, \"warnings\": %zu }", z->errors ? "fail" : "ok", z->errors, z->warnings);
     }
-    fputs(g.nzones ? "\n  ]\n}\n" : "]\n}\n", fp);
+    fputs(g.nzones ? "\n  ]" : "]", fp);
+    if (g.extra_val) {
+        fputs(",\n  ", fp);
+        json_str(fp, g.extra_key);
+        fprintf(fp, ": %s", g.extra_val);
+    }
+    fputs("\n}\n", fp);
     return fflush(fp) == 0 && !ferror(fp) ? 0 : -1;
 }

@@ -204,12 +204,13 @@ static int cb_rec(void *ud, int64_t did, const db_record_row_t *r) {
     return 0;
 }
 
-typedef struct { int n; int64_t v[64]; uint64_t seq[64]; } cacc_t;
+typedef struct { int n; int64_t v[64]; uint64_t seq[64], pos[64]; } cacc_t;
 static int cb_chg(void *ud, const db_change_row_t *r) {
     cacc_t *a = ud;
     if (a->n < 64) {
         a->v[a->n] = r->domain_id;
         a->seq[a->n] = r->seq;
+        a->pos[a->n] = r->pos;
     }
     a->n++;
     return 0;
@@ -976,6 +977,7 @@ static void test_changes(void) {
     uint64_t cur1 = snap_since(c, cur0, &a, &gap);
     CHECK_MSG(a.n == 1 && a.v[0] == 1 && !gap, "plain edit: %d rows", a.n);
     CHECK(cur1 > cur0);
+    CHECK_MSG(a.pos[0] >= cur0 && a.pos[0] < cur1, "pos (the xid8 of the writing transaction) %llu is in [%llu, %llu)", (unsigned long long)a.pos[0], (unsigned long long)cur0, (unsigned long long)cur1);     /* the edit is in every snapshot whose cursor is cur1 (item C: a one-zone reload covers it) */
     uint64_t cur1b = snap_since(c, cur1, &a, &gap);
     CHECK_MSG(a.n == 0 && cur1b == cur1, "nothing new: %d rows", a.n);
 
@@ -1797,7 +1799,7 @@ static void test_audit(void) {
     printf("audit log (w_set_audit)\n");
     Q("TRUNCATE domains, records, domainmetadata, karidns_changes, karidns_domain_views, karidns_record_tags, karidns_record_tinydns, karidns_zone_tagdefs, "
       "karidns_reload_requests RESTART IDENTITY CASCADE");
-    CHECK(pg_count("SELECT karidns_auth.enable_audit('public')") == 8);
+    CHECK(pg_count("SELECT karidns_auth.enable_audit('public')") == 10);
     Q("DELETE FROM karidns_auth.audit_log");
     db_source_t src = { "postgresql", NULL, g_ci, NULL, 300 };
     char err[DB_ERRLEN], v[64];

@@ -11,7 +11,8 @@
 -- version 2 database it adds the schema karidns_auth (the end of this file) and moves the version row to 3.
 --
 -- Schema version 3 (0.6.0 item B) adds the schema karidns_auth: the users, groups, grants and the audit log of the WebAdmin.  The loader and
--- karicheck db read versions 1 to 3 and use nothing of it; the end of this file says what it holds.
+-- karicheck db read versions 1 to 3 and use nothing of it; the end of this file says what it holds.  Item C (the signer) adds the tables
+-- karidns_key_requests and karidns_signer_state (before the karidns_auth part) to version 3: apply this file again to a version 3 database that lacks them.
 --
 -- What it gives karidns-dbloader:
 --   karidns_changes   a log of "domain D changed" (seq, domain_id, changed_at).  Statement-level AFTER INSERT / UPDATE /
@@ -344,15 +345,66 @@ DROP TRIGGER IF EXISTS karidns_reload_requests_notify ON karidns_reload_requests
 CREATE TRIGGER karidns_reload_requests_notify AFTER INSERT ON karidns_reload_requests
   REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION karidns_reload_requests_notify_fn();
 
--- prune: keep the newest 1000 requests
+-- prune: keep the newest 1000 requests.  Two transactions that insert at the same time (the signer with several workers, importers) both prune the same old
+-- rows; the lock above is taken after the second one has its snapshot, so under REPEATABLE READ it fails with "could not serialize access due to
+-- concurrent delete" and the whole write is rolled back.  The rows are gone then (the first transaction deleted them): the prune is best effort.
 CREATE OR REPLACE FUNCTION karidns_reload_requests_prune_fn() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
-  DELETE FROM karidns_reload_requests WHERE generation <= (SELECT max(generation) FROM new_rows) - 1000;
+  BEGIN
+    DELETE FROM karidns_reload_requests WHERE generation <= (SELECT max(generation) FROM new_rows) - 1000;
+  EXCEPTION WHEN serialization_failure THEN
+    NULL;
+  END;
   RETURN NULL;
 END $$;
 DROP TRIGGER IF EXISTS karidns_reload_requests_prune ON karidns_reload_requests;
 CREATE TRIGGER karidns_reload_requests_prune AFTER INSERT ON karidns_reload_requests
   REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION karidns_reload_requests_prune_fn();
+
+-- ---------------------------------------------------------------------------------------------------------------------------------
+-- The signer (0.6.0 item C, docs/karidns-signer.md; schema version 3): the work queue and the schedule of karidns-signer.  Both tables are per data
+-- schema, like the other karidns_* tables.  They are NOT zone data: no trigger writes karidns_changes for them (the signer writes its state after every
+-- run, and a signer that followed its own state would never stop).  The audit log (karidns_auth.enable_audit) covers them.
+--
+--   karidns_key_requests   a request for keys, filed by the WebAdmin (a global master or the domain master of the zone) or by an operator, answered by the
+--                          signer.  kind: 'enable' = start signing the zone (generate the first key or keys, set the metadata, sign), 'add' = one more key.
+--                          algorithm: 8, 10 (RSA; bits 1024..8192), 13, 14 (ECDSA), 15, 16 (EdDSA); key_type 'csk' (one key signs everything), 'ksk' or
+--                          'zsk'; nsec 'nsec3' (the default of the signer) or 'nsec' for an 'enable' request.  state: 'pending' -> 'done' or 'failed'
+--                          (message says why); done_at is set with the state.  requested_by: the principal id (karidns_auth.principals) of the requester.
+--   karidns_signer_state   one row per signed zone: when it was signed (signed_at), the SOA serial it wrote, the earliest RRSIG expiration of the zone
+--                          (min_expire), when the signer wants to look at the zone again (next_due: the index serves "the zones that are due"), the failed
+--                          attempts since the last success and the last error.
+-- Both go away with their zone (ON DELETE CASCADE).
+CREATE TABLE IF NOT EXISTS karidns_key_requests (
+  id           BIGSERIAL PRIMARY KEY,
+  domain_id    INTEGER NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+  kind         VARCHAR(6) NOT NULL DEFAULT 'enable' CHECK (kind IN ('enable', 'add')),
+  algorithm    SMALLINT NOT NULL DEFAULT 13 CHECK (algorithm IN (8, 10, 13, 14, 15, 16)),
+  bits         INTEGER NULL CHECK (bits IS NULL OR (bits BETWEEN 1024 AND 8192 AND algorithm IN (8, 10))),
+  key_type     VARCHAR(3) NOT NULL DEFAULT 'csk' CHECK (key_type IN ('csk', 'ksk', 'zsk')),
+  nsec         VARCHAR(5) NULL CHECK (nsec IS NULL OR (nsec IN ('nsec3', 'nsec') AND kind = 'enable')),
+  state        VARCHAR(7) NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'done', 'failed')),
+  message      TEXT NULL,
+  requested_by BIGINT NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  done_at      TIMESTAMPTZ NULL,
+  CONSTRAINT karidns_key_requests_done_chk CHECK ((state = 'pending') = (done_at IS NULL))
+);
+CREATE INDEX IF NOT EXISTS karidns_key_requests_domain_idx ON karidns_key_requests (domain_id);
+CREATE INDEX IF NOT EXISTS karidns_key_requests_pending_idx ON karidns_key_requests (id) WHERE state = 'pending';
+CREATE UNIQUE INDEX IF NOT EXISTS karidns_key_requests_one_pending_idx ON karidns_key_requests (domain_id) WHERE state = 'pending';       -- one open request per zone
+
+CREATE TABLE IF NOT EXISTS karidns_signer_state (
+  domain_id        INTEGER PRIMARY KEY REFERENCES domains(id) ON DELETE CASCADE,
+  signed_at        TIMESTAMPTZ NULL,
+  signed_serial    BIGINT NULL CHECK (signed_serial IS NULL OR signed_serial BETWEEN 0 AND 4294967295),
+  min_expire       TIMESTAMPTZ NULL,
+  next_due         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  attempts         INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  last_error       TEXT NULL,
+  last_duration_ms INTEGER NULL CHECK (last_duration_ms IS NULL OR last_duration_ms >= 0)
+);
+CREATE INDEX IF NOT EXISTS karidns_signer_state_due_idx ON karidns_signer_state (next_due);
 
 -- ---------------------------------------------------------------------------------------------------------------------------------
 -- == karidns_auth (schema version 3) ==    0.6.0 item B, milestone M1.  Everything above is version 2.
@@ -667,16 +719,17 @@ $$;
 
 -- `SET LOCAL karidns.audit = 'summary'` (karidns-zone --audit summary): instead of one audit row per changed row, one row per transaction,
 -- table, operation and zone, which counts the statements and the rows (before / after = {"summary": true, "statements": S, "rows": N}).
--- (karidns-zone writes a zone one row per statement, so one row per statement would not shrink the log.)  The WebAdmin's and the signer's
--- roles (karidns_api, karidns_signer, or a member of them) cannot turn the detail off.
+-- (karidns-zone writes a zone one row per statement, so one row per statement would not shrink the log.)  The WebAdmin's roles (karidns_api, or a
+-- member of it) cannot turn the detail off.  The signer is a trusted daemon whose output is machine generated (a re-sign writes every signature
+-- again): `karidns-zone import --signer` asks for summary mode, and its role is not restricted.
 CREATE UNIQUE INDEX IF NOT EXISTS audit_log_summary_uq ON karidns_auth.audit_log (xid, data_schema, table_name, op, (coalesce(zone_name, '')))
   WHERE ((coalesce(after, before) ->> 'summary') = 'true');
--- The roles that cannot turn the detail off are the rows of audit_restricted_roles (owner only; the role scripts of the WebAdmin and the signer add
--- the name they were given with -v role=).  Summary is refused when the login role (session_user) or the SET ROLE role is one of them or a
+-- The roles that cannot turn the detail off are the rows of audit_restricted_roles (owner only; the role script of the WebAdmin adds the name it was
+-- given with -v role=).  Summary is refused when the login role (session_user) or the SET ROLE role is one of them or a
 -- member of one, through any chain of memberships: a member of karidns_api cannot SET ROLE to another role to get rid of the restriction.
 -- (Inside a SECURITY DEFINER trigger current_user is the owner, so it cannot be looked at.)
 CREATE TABLE IF NOT EXISTS karidns_auth.audit_restricted_roles (role_name name PRIMARY KEY);
-INSERT INTO karidns_auth.audit_restricted_roles (role_name) VALUES ('karidns_api'), ('karidns_signer') ON CONFLICT DO NOTHING;
+INSERT INTO karidns_auth.audit_restricted_roles (role_name) VALUES ('karidns_api') ON CONFLICT DO NOTHING;
 REVOKE ALL ON karidns_auth.audit_restricted_roles FROM PUBLIC;
 CREATE OR REPLACE FUNCTION karidns_auth.audit_summary() RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
   SELECT coalesce(current_setting('karidns.audit', true), '') = 'summary'
@@ -853,7 +906,7 @@ DECLARE
 BEGIN
   FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants']
                            ELSE ARRAY['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_record_tags', 'karidns_record_tinydns',
-                                      'karidns_zone_tagdefs', 'karidns_domain_views'] END) LOOP
+                                      'karidns_zone_tagdefs', 'karidns_domain_views', 'karidns_key_requests', 'karidns_signer_state'] END) LOOP
     IF to_regclass(format('%I.%I', sch, t)) IS NULL THEN CONTINUE; END IF;
     EXECUTE format('DROP TRIGGER IF EXISTS karidns_audit_row ON %I.%I', sch, t);
     EXECUTE format('CREATE TRIGGER karidns_audit_row AFTER INSERT OR UPDATE OR DELETE ON %I.%I FOR EACH ROW EXECUTE FUNCTION karidns_auth.audit_row()', sch, t);
@@ -882,7 +935,7 @@ DECLARE
 BEGIN
   FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants']
                            ELSE ARRAY['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_record_tags', 'karidns_record_tinydns',
-                                      'karidns_zone_tagdefs', 'karidns_domain_views'] END) LOOP
+                                      'karidns_zone_tagdefs', 'karidns_domain_views', 'karidns_key_requests', 'karidns_signer_state'] END) LOOP
     IF to_regclass(format('%I.%I', sch, t)) IS NULL THEN CONTINUE; END IF;
     FOREACH tg IN ARRAY ARRAY['karidns_audit_row', 'karidns_audit_ins', 'karidns_audit_upd', 'karidns_audit_del', 'karidns_audit_zone'] LOOP
       EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I.%I', tg, sch, t);
@@ -1113,13 +1166,32 @@ CREATE OR REPLACE FUNCTION karidns_auth.is_api_caller() RETURNS boolean LANGUAGE
                  SELECT 1 FROM m JOIN pg_roles r ON r.oid = m.roleid JOIN karidns_auth.api_roles x ON x.role_name = r.rolname)
 $$;
 
--- the same for the signer roles (the trigger on SOA rows)
-CREATE OR REPLACE FUNCTION karidns_auth.is_signer_caller() RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
-  SELECT EXISTS (WITH RECURSIVE m(roleid) AS (SELECT oid FROM pg_roles WHERE rolname IN (session_user::text, current_setting('role'))
-                                              UNION
-                                              SELECT am.roleid FROM pg_auth_members am JOIN m ON am.member = m.roleid)
-                 SELECT 1 FROM m JOIN pg_roles r ON r.oid = m.roleid JOIN karidns_auth.signer_roles x ON x.role_name = r.rolname)
-$$;
+-- the same for the signer roles (the trigger on records).  It runs once per row an UPDATE of a data column changes, for every role: the roles of an
+-- operator and of PowerDNS pay for it too.  So no recursive query: pg_has_role(..., 'MEMBER') walks the memberships through the backend's own cache of
+-- the roles a role belongs to.  A superuser is a member of every role as far as pg_has_role() is concerned, so a superuser (the operator; the role scripts
+-- refuse a superuser as the signer) is never counted: the plain case (no SET ROLE) is answered from the server's is_superuser setting, which follows the
+-- current role, and with SET ROLE in use the login role's rolsuper is looked up (a rare case).  The answer is NOT cached in a setting for the rest of the
+-- transaction: any session can set a custom setting, so the signer could have written "I am no signer" first.
+CREATE OR REPLACE FUNCTION karidns_auth.is_signer_caller() RETURNS boolean LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+DECLARE
+  ro oid;
+  rl text := current_setting('role');
+  su boolean := current_setting('is_superuser') = 'on';      -- the current role (the login role unless SET ROLE)
+  t_session boolean := true;                                 -- is the login role looked at?
+  t_role boolean := false;                                   -- is the SET ROLE role looked at?
+BEGIN
+  IF rl = 'none' THEN
+    IF su THEN RETURN false; END IF;
+  ELSE
+    t_role := NOT su;
+    t_session := NOT (SELECT rolsuper FROM pg_roles WHERE rolname = session_user);
+    IF NOT t_role AND NOT t_session THEN RETURN false; END IF;
+  END IF;
+  FOR ro IN SELECT r.oid FROM karidns_auth.signer_roles s JOIN pg_roles r ON r.rolname = s.role_name LOOP
+    IF (t_session AND pg_has_role(session_user, ro, 'MEMBER')) OR (t_role AND pg_has_role(rl, ro, 'MEMBER')) THEN RETURN true; END IF;
+  END LOOP;
+  RETURN false;
+END $$;
 
 -- is policy `sub` no wider than policy `sup`?  (types a subset, each flag not more, ttl_min not lower, ttl_max not higher, max_rr not higher; NULL = no limit)
 CREATE OR REPLACE FUNCTION karidns_auth.policy_subset(sub bigint, sup bigint) RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
@@ -1184,9 +1256,13 @@ CREATE TRIGGER karidns_grants_escalation BEFORE INSERT OR UPDATE OR DELETE ON ka
   FOR EACH ROW EXECUTE FUNCTION karidns_auth.grants_escalation_fn();
 
 -- ---- the signer and the SOA: for the sessions of the signer roles (karidns_auth.signer_roles), a BEFORE trigger on the records of this schema lets an
--- SOA row change in its serial only: it keeps its type, name and domain_id, the rest of its content is the same, a record cannot become an SOA (nor
--- an SOA another type), and the signer cannot insert or delete an SOA.  (The policies of the signer allow UPDATE of SOA rows; a policy cannot look at
--- columns.)  The trigger fires only for rows that are, or become, an SOA.
+-- SOA row change in its serial only (and its ordername and auth): it keeps its type, name, domain_id, TTL, prio and disabled flag, the rest of its content
+-- is the same, a record cannot become an SOA (nor an SOA another type), and the signer cannot insert or delete an SOA.  The same trigger holds the signer
+-- to its columns on every other record (item C): the policies of the signer allow UPDATE of every row (a policy cannot look at columns, and the signer
+-- must set the ordername and auth of the records of a zone it signs: the NSEC3 hash of the owner, authoritative or not); the trigger lets a record that is
+-- no DNSSEC record change in those two columns only, and a DNSSEC record change in any.  The UPDATE trigger is BEFORE UPDATE OF every column but
+-- those two (it is made at the end of this block), so an UPDATE of the two alone, like pdnsutil rectify-zone, costs it nothing; for the others it
+-- costs is_signer_caller() per row (measured in docs/karidns-dbloader.md).
 CREATE OR REPLACE FUNCTION karidns_auth.signer_soa_fn() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
 DECLARE
   mo  text[];
@@ -1196,10 +1272,22 @@ BEGIN
   IF NOT karidns_auth.is_signer_caller() THEN
     RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
   END IF;
+  -- the UPDATE trigger fires for an UPDATE that names a column other than ordername and auth, whether or not it changes the value
+  IF TG_OP = 'UPDATE' AND (to_jsonb(NEW) - 'ordername' - 'auth') = (to_jsonb(OLD) - 'ordername' - 'auth') THEN
+    RETURN NEW;
+  END IF;
   IF TG_OP = 'INSERT' THEN
     RAISE EXCEPTION 'karidns_auth.signer: the signer cannot insert an SOA record' USING ERRCODE = 'insufficient_privilege';
   ELSIF TG_OP = 'DELETE' THEN
     RAISE EXCEPTION 'karidns_auth.signer: the signer cannot delete an SOA record' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  IF karidns_auth.canon_type(OLD.type) IS DISTINCT FROM 'SOA' AND karidns_auth.canon_type(NEW.type) IS DISTINCT FROM 'SOA' THEN
+    -- a record that is no SOA before or after (the trigger fires for those only when a column other than ordername and auth changed): the signer owns
+    -- DNSSEC records and may change them as it likes; every other record is the data of the zone, and only its ordername and auth are the signer's
+    IF karidns_auth.is_dnssec_type(OLD.type) AND karidns_auth.is_dnssec_type(NEW.type) THEN
+      RETURN NEW;
+    END IF;
+    RAISE EXCEPTION 'karidns_auth.signer: the signer may change only the ordername and auth of a record that is not a DNSSEC record' USING ERRCODE = 'insufficient_privilege';
   END IF;
   IF karidns_auth.canon_type(OLD.type) IS DISTINCT FROM 'SOA' THEN
     RAISE EXCEPTION 'karidns_auth.signer: a record cannot become an SOA record' USING ERRCODE = 'insufficient_privilege';
@@ -1212,8 +1300,9 @@ BEGIN
   END IF;
   mo := regexp_match(OLD.content, pat);
   mn := regexp_match(NEW.content, pat);
-  IF mo IS NULL OR mn IS NULL OR mo[1] <> mn[1] OR coalesce(mo[3], '') <> coalesce(mn[3], '') THEN
-    RAISE EXCEPTION 'karidns_auth.signer: the signer may change only the serial of an SOA record' USING ERRCODE = 'insufficient_privilege';
+  IF mo IS NULL OR mn IS NULL OR mo[1] <> mn[1] OR coalesce(mo[3], '') <> coalesce(mn[3], '')
+     OR NEW.ttl IS DISTINCT FROM OLD.ttl OR NEW.prio IS DISTINCT FROM OLD.prio OR NEW.disabled IS DISTINCT FROM OLD.disabled THEN
+    RAISE EXCEPTION 'karidns_auth.signer: the signer may change only the serial of an SOA record (and its ordername and auth)' USING ERRCODE = 'insufficient_privilege';
   END IF;
   RETURN NEW;
 END $$;
@@ -1222,10 +1311,20 @@ DROP TRIGGER IF EXISTS karidns_signer_soa_upd ON records;
 DROP TRIGGER IF EXISTS karidns_signer_soa_del ON records;
 CREATE TRIGGER karidns_signer_soa_ins BEFORE INSERT ON records FOR EACH ROW WHEN (karidns_auth.canon_type(NEW.type) = 'SOA')
   EXECUTE FUNCTION karidns_auth.signer_soa_fn();
-CREATE TRIGGER karidns_signer_soa_upd BEFORE UPDATE ON records FOR EACH ROW WHEN (karidns_auth.canon_type(OLD.type) = 'SOA' OR karidns_auth.canon_type(NEW.type) = 'SOA')
-  EXECUTE FUNCTION karidns_auth.signer_soa_fn();
+-- (the UPDATE trigger is made below: its column list is read from the table)
 CREATE TRIGGER karidns_signer_soa_del BEFORE DELETE ON records FOR EACH ROW WHEN (karidns_auth.canon_type(OLD.type) = 'SOA')
   EXECUTE FUNCTION karidns_auth.signer_soa_fn();
+-- BEFORE UPDATE OF every column of records but ordername and auth: an UPDATE of just those two (pdnsutil rectify-zone, the signer's own) never
+-- fires it, and nothing is evaluated per row.  The column list is the table's own, so a column a later PowerDNS adds is covered when this file is
+-- applied again.
+DO $$
+DECLARE
+  cols text;
+BEGIN
+  SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum) INTO cols
+    FROM pg_attribute WHERE attrelid = 'records'::regclass AND attnum > 0 AND NOT attisdropped AND attname NOT IN ('ordername', 'auth');
+  EXECUTE 'CREATE TRIGGER karidns_signer_soa_upd BEFORE UPDATE OF ' || cols || ' ON records FOR EACH ROW EXECUTE FUNCTION karidns_auth.signer_soa_fn()';
+END $$;
 
 -- ---- the role scripts of the API and the signer call this first: the role must be one that RLS binds.  It is refused when it is a superuser or has
 -- BYPASSRLS, when it is (directly or through other roles) a member of karidns_rls_trusted, or when it is, or is a member of, the owner of the tables
@@ -1411,6 +1510,22 @@ BEGIN
     PERFORM karidns_auth.set_policy(rel, 'karidns_rls_insert', 'INSERT', NULL, w);
     cnt := cnt + 1;
   END IF;
+  -- karidns_key_requests (item C): a global master or the domain master of the zone files a request (state 'pending', requested by the principal itself;
+  -- the signer answers it) and sees the requests of the zones it is a master of.  No UPDATE, no DELETE for the API: the signer owns the state.
+  IF to_regclass(format('%I.karidns_key_requests', sch)) IS NOT NULL THEN
+    rel := format('%I.karidns_key_requests', sch)::regclass;
+    w := format('karidns_auth.zone_grant(%s, %s) IN (''global_master'', ''domain_master'')', lit, format(zr, 'karidns_key_requests'));
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_select', 'SELECT', w, NULL);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_insert', 'INSERT', NULL,
+      w || ' AND karidns_key_requests.state = ''pending'' AND karidns_key_requests.message IS NULL AND karidns_key_requests.requested_by = karidns_auth.current_principal()');
+    cnt := cnt + 1;
+  END IF;
+  -- karidns_signer_state: read by the principals that have a grant on the zone; written by the signer only
+  IF to_regclass(format('%I.karidns_signer_state', sch)) IS NOT NULL THEN
+    rel := format('%I.karidns_signer_state', sch)::regclass;
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_select', 'SELECT', format('karidns_auth.zone_grant(%s, %s) IS NOT NULL', lit, format(zr, 'karidns_signer_state')), NULL);
+    cnt := cnt + 1;
+  END IF;
   -- cryptokeys: the rows of the zones the principal has a grant on; the role has the column privilege SELECT (id, domain_id, flags, active, published) only
   IF to_regclass(format('%I.cryptokeys', sch)) IS NOT NULL THEN
     rel := format('%I.cryptokeys', sch)::regclass;
@@ -1421,9 +1536,11 @@ BEGIN
 END $$;
 
 -- The policies of the signer role (db/karidns_signer_role.pgsql.sql): it reads everything and writes only what it owns: records of DNSSEC-managed types
--- (and UPDATE of SOA rows, whose serial is all the trigger signer_soa_fn lets it change), the domainmetadata kinds PRESIGNED, NSEC3PARAM and
--- X-KARIDNS-SIGNER, reload requests.  It is not bound by grants.  Every write policy exists twice, PERMISSIVE (what it may do) and RESTRICTIVE (what
--- every write must also pass, so the permissive policies of the API, which are OR-ed with these, cannot widen them: karidns.principal changes nothing).
+-- (and UPDATE of every row of records: the trigger signer_soa_fn lets it change the ordername and auth of any record, a DNSSEC record as a whole, and of
+-- an SOA row the serial), the domainmetadata kinds PRESIGNED, NSEC3PARAM and X-KARIDNS-SIGNER, reload requests (INSERT), new keys (INSERT into
+-- cryptokeys), the state of the key requests (UPDATE) and its own schedule (karidns_signer_state).  It is not bound by grants.  The write policies of
+-- records and domainmetadata exist twice, PERMISSIVE (what it may do) and RESTRICTIVE (what every write must also pass, so the permissive policies of the
+-- API, which are OR-ed with these, cannot widen them: karidns.principal changes nothing); the API has no policy that writes the other tables.
 CREATE OR REPLACE FUNCTION karidns_auth.create_signer_policies(sch text, rol text) RETURNS integer LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
   cnt integer := 0;
@@ -1434,7 +1551,7 @@ DECLARE
   pm  text;
 BEGIN
   FOREACH nm IN ARRAY ARRAY['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_record_tags', 'karidns_record_tinydns', 'karidns_zone_tagdefs',
-                            'karidns_domain_views', 'karidns_reload_requests'] LOOP
+                            'karidns_domain_views', 'karidns_reload_requests', 'karidns_key_requests', 'karidns_signer_state'] LOOP
     IF to_regclass(format('%I.%I', sch, nm)) IS NULL THEN CONTINUE; END IF;
     rel := format('%I.%I', sch, nm)::regclass;
     PERFORM karidns_auth.set_policy(rel, 'karidns_signer_select_' || sfx, 'SELECT', 'true', NULL, rol);
@@ -1443,7 +1560,7 @@ BEGIN
   IF to_regclass(format('%I.records', sch)) IS NOT NULL THEN
     rel := format('%I.records', sch)::regclass;
     pr := 'karidns_auth.is_dnssec_type(records.type)';
-    pm := 'karidns_auth.is_dnssec_type(records.type) OR karidns_auth.canon_type(records.type) = ''SOA''';
+    pm := 'true';                            -- every row: the trigger signer_soa_fn decides which columns change (ordername and auth of any record, a DNSSEC record as a whole, the serial of the SOA)
     PERFORM karidns_auth.set_policy(rel, 'karidns_signer_insert_' || sfx, 'INSERT', NULL, pr, rol);
     PERFORM karidns_auth.set_policy(rel, 'karidns_signer_update_' || sfx, 'UPDATE', pm, pm, rol);
     PERFORM karidns_auth.set_policy(rel, 'karidns_signer_delete_' || sfx, 'DELETE', pr, NULL, rol);
@@ -1465,6 +1582,18 @@ BEGIN
     rel := format('%I.karidns_reload_requests', sch)::regclass;
     PERFORM karidns_auth.set_policy(rel, 'karidns_signer_insert_' || sfx, 'INSERT', NULL, 'true', rol);
   END IF;
+  IF to_regclass(format('%I.cryptokeys', sch)) IS NOT NULL THEN                   -- the key tooling: new keys, no change of an existing one
+    PERFORM karidns_auth.set_policy(format('%I.cryptokeys', sch)::regclass, 'karidns_signer_insert_' || sfx, 'INSERT', NULL, 'true', rol);
+  END IF;
+  IF to_regclass(format('%I.karidns_key_requests', sch)) IS NOT NULL THEN         -- answers the requests (the API files them)
+    PERFORM karidns_auth.set_policy(format('%I.karidns_key_requests', sch)::regclass, 'karidns_signer_update_' || sfx, 'UPDATE', 'true', 'true', rol);
+  END IF;
+  IF to_regclass(format('%I.karidns_signer_state', sch)) IS NOT NULL THEN          -- its own schedule
+    rel := format('%I.karidns_signer_state', sch)::regclass;
+    PERFORM karidns_auth.set_policy(rel, 'karidns_signer_insert_' || sfx, 'INSERT', NULL, 'true', rol);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_signer_update_' || sfx, 'UPDATE', 'true', 'true', rol);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_signer_delete_' || sfx, 'DELETE', 'true', NULL, rol);
+  END IF;
   RETURN cnt;
 END $$;
 
@@ -1480,7 +1609,7 @@ BEGIN
   END IF;
   FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'audit_log']
                            ELSE ARRAY['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_record_tags', 'karidns_record_tinydns',
-                                      'karidns_zone_tagdefs', 'karidns_domain_views', 'karidns_reload_requests'] END) LOOP
+                                      'karidns_zone_tagdefs', 'karidns_domain_views', 'karidns_reload_requests', 'karidns_key_requests', 'karidns_signer_state'] END) LOOP
     IF to_regclass(format('%I.%I', sch, t)) IS NULL THEN CONTINUE; END IF;
     EXECUTE format('ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY', sch, t);
     EXECUTE format('DROP POLICY IF EXISTS karidns_rls_trusted ON %I.%I', sch, t);
@@ -1497,7 +1626,7 @@ DECLARE
 BEGIN
   FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'audit_log']
                            ELSE ARRAY['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_record_tags', 'karidns_record_tinydns',
-                                      'karidns_zone_tagdefs', 'karidns_domain_views', 'karidns_reload_requests'] END) LOOP
+                                      'karidns_zone_tagdefs', 'karidns_domain_views', 'karidns_reload_requests', 'karidns_key_requests', 'karidns_signer_state'] END) LOOP
     IF to_regclass(format('%I.%I', sch, t)) IS NULL THEN CONTINUE; END IF;
     EXECUTE format('ALTER TABLE %I.%I DISABLE ROW LEVEL SECURITY', sch, t);
     cnt := cnt + 1;
@@ -1509,8 +1638,8 @@ END $$;
 DO $$ BEGIN PERFORM karidns_auth.create_policies('karidns_auth'); PERFORM karidns_auth.create_policies(current_schema()); END $$;
 
 -- The maintenance triggers of the data tables (the change log, its prune, the reload requests: all of the version 2 part of this file) run as the owner,
--- not as the role that writes: the roles of the API and the signer need no right on karidns_changes (and cannot read or forge the log the loader's
--- auto reload depends on) and cannot delete reload requests.  Their search_path is pinned to pg_catalog, this schema, pg_temp (the temporary schema
+-- not as the role that writes: the roles of the API and the signer need no right to write karidns_changes (the signer may read it, to see which zones
+-- changed; neither can forge the log the loader's auto reload depends on) and cannot delete reload requests.  Their search_path is pinned to pg_catalog, this schema, pg_temp (the temporary schema
 -- last: a temporary table cannot shadow a table of the log); a SECURITY DEFINER function must not use the writer's path.
 DO $$
 DECLARE

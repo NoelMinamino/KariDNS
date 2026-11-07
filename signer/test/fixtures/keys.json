@@ -1,0 +1,119 @@
+{
+ "generator": "dnssec-keygen 9.20.29; pdnsutil 5.1.4",
+ "bind": [
+  {
+   "file": "Kexample.test.+008+17404",
+   "algorithm": 8,
+   "tag": 17404,
+   "flags": 256,
+   "private": "Private-key-format: v1.3\nAlgorithm: 8 (RSASHA256)\nModulus: xsBin80Wa1ekBuGF2wPrIJWX7cdwX/+8S19lTemhmqgedwqaAiCKsHoar1+fzay4Yx9JyLVjjGma3fV5r7neG9sjOt3rnK1/aGSs4GwNJx+OK9WS3tIFouAV6O4RiCBKaw3+9/cvtNba7UC7mJFyEX8/3eBZD7aTNUkM2d/NMfgqF4BRb6MamE7TDM6b+a17y4RUVBUpXt+mJPj3SdCWVozL+j9b15FzPuQrsgQ4WkJ00VT5tffZsFdyI0gzR92hY4n2/X2onp6GiyGbZfJPV9akjHFygcV1vCk9y8QjctRTkNO/B9LCzY2gFoY5XZE7N2kpnnkXLrUZdjG5g7eumw==\nPublicExponent: AQAB\nPrivateExponent: FGwENkNOgG0a75IQvPZkHI8Cc25Av7x5To1YzW6qKkgICVdPh9RsK8IAJ/D9bJbIw3adkEADIJRhU1k7zbCdf+M+dXgEE69IHiPqF41CtLhrVVm2o6qU5a180thTeNdIjkN75WLCxiQljqdOH1kijWWz3EqHHDQ4YAtHhMOYQ//7cAshFMz0dej3peA1uyrudghoLO9c/7UmWZI9lY7qOAzPGTfCxb78y3QyunEL1G6gkMqVfkTHnPseGavzKebbD+os3zE7AGjF4h1Aqc9YYLb/LruW2dV/R1VITvnBEQTvHhAW8VeJ1yjQzRXFP2xh/RzKxZIKJSDYiTn/oZy4MQ==\nPrime1: 8HUxiIxKNEnE9dEtxAQPaFhoAdpGkXzuzWbbtTgP3It0/ssXMpyMBWS42DShJRMBNs68mA8eZGxTH76QtCTNjSYjj6hp7dmQOm+d81PndsCYsV7DpNim4+ACNLTVfzaUiTFucZ4HBxh8UNh9SSPrq6fuwygxtSA3yQvq0Ey3Cnc=\nPrime2: 05kWGRrF9S0bLaSO1sQ/WqexG+joS238ejUVALB9JEcP7TFUQpFnHBnYrB5ueETN8I4480v7EZjDzjg8cem73/n9Eb6HmFdGK3S7limcqx8PHjkN7Hm8+nLTpFZXLx3WGcnLc4bl1+N/jrueQLKgt5KQ1Yf2pdUzHpyDjU6PIf0=\nExponent1: IcUTs82gDj/d/XfnKYQ4dbsUwE3bY0tcblRnvsek0qBzSeVT2LPLpmZC33pkt0Q4A259Zg2ZgxkDg43L3MDebVhR3jcUyWaorsxGLoo2E6Nwzlg0uc4DgjVPmf9bjIYpziq3DBXZftGdg+0ji0YULwNisN3QPVPNAds+mwprGnk=\nExponent2: jtst9ikDOTIIxVnyLcE03KmWgzdNjY9mA8POuDZvZoyrjgHd10t/h5NTm3C4OG6Lczsx6+CCUzEGETYaaPXap66JUu+FcC6L607WTt0tLsK7XDY81kiic5wOk0bPebn1EFgTCZ4rkwO+3MiCYT+4Dfff3Kn8tZ0o9CPLFR3SuKk=\nCoefficient: lVZrfCYEi1ljP6qIgUx5ensPCPssJKMhJCaVhNCmHIovm0Veo68ocsfqLZ6slFENaK9SnO52N+0mxMTO/bX8NGCOpLVnjw/jYAS9JglCqxvPT+xcR4q27BUfxrlGTvJ3hvlD1zx+Xw4ONBpIxJ8bw8TeD0wEW3skMs2zTJfcyH4=\nCreated: 20261106045710\nPublish: 20261106045710\nActivate: 20261106045710\n",
+   "key": "; This is a zone-signing key, keyid 17404, for example.test.\n; Created: 20261106045710 (Fri Nov  6 04:57:10 2026)\n; Publish: 20261106045710 (Fri Nov  6 04:57:10 2026)\n; Activate: 20261106045710 (Fri Nov  6 04:57:10 2026)\nexample.test. IN DNSKEY 256 3 8 AwEAAcbAYp/NFmtXpAbhhdsD6yCVl+3HcF//vEtfZU3poZqoHncKmgIg irB6Gq9fn82suGMfSci1Y4xpmt31ea+53hvbIzrd65ytf2hkrOBsDScf jivVkt7SBaLgFejuEYggSmsN/vf3L7TW2u1Au5iRchF/P93gWQ+2kzVJ DNnfzTH4KheAUW+jGphO0wzOm/mte8uEVFQVKV7fpiT490nQllaMy/o/ W9eRcz7kK7IEOFpCdNFU+bX32bBXciNIM0fdoWOJ9v19qJ6ehoshm2Xy T1fWpIxxcoHFdbwpPcvEI3LUU5DTvwfSws2NoBaGOV2ROzdpKZ55Fy61 GXYxuYO3rps=\n"
+  },
+  {
+   "file": "Kexample.test.+008+57314",
+   "algorithm": 8,
+   "tag": 57314,
+   "flags": 257,
+   "private": "Private-key-format: v1.3\nAlgorithm: 8 (RSASHA256)\nModulus: xLoxmN/2Q+ELWMDrJ5kbLvI3XT+nlUo7QR4+PQ4TQIDqsKP2hSRU7ZltV11r4Cn0gIS9lo+QJ3+YJo8z9crYmJ/SaCvgvHMHey/QVINhBJZCdTLK/EDOZh8GpbXn6AXTygMACyE7v3t12Qo0SXlukPWL9+ebiOjket9bbJa34sk=\nPublicExponent: AQAB\nPrivateExponent: lobpoFHt+y5dIkIrLJdoR1mqpz0nm4G7KS5c7RayAG8kJJiw7ltIaK03Dtw6yMERhq0K7ANZh/+HiimU1oOpinSkLZ/PejfTTjEK5YtlCbLFsGb3YouTWTAQR/n+/ydhnmkgiBp/SHHUcrXLNFczBV2E51x435HFgp5XhyhEsAE=\nPrime1: /1Z/ptRp1/y0c0rVWvR00GefQbOxgWtW55UHWs+QISBBhzLK7kD00vngRXgAWWm6bincgLxRKkRAxOnQk0EjAQ==\nPrime2: xTzJnREsIIMX0u1h4kG2zrCUeH/jO1lwAxvvOrQSzJIYiQogueE4c+rsT5L0QYWTSsD3I3FTRzjy7cifiX5nyQ==\nExponent1: xjKnXaEuE4jFrWSeHj742bhFh2NrWpEuYQ5uKhBJyVzXYJGNscjcAVQSwPm4E6+dFdwKnCcRPaTDPdZcn6EFAQ==\nExponent2: Tjo62KH793UnGNBv1zYrFDUy3cwTSvHBHGqS6pyLLDnxo0CyFCdApbESQslNOUOKVMbN/m+vEPuEVk0RAY5yCQ==\nCoefficient: ZV59K6Zi2kPtxmRilH0mlypGMb9yKZUsme6JIBbPKEHG2Bd8axuI6LsrT/wmx+g29VM2Xf+C5QRxCF5Ose4xew==\nCreated: 20261106045710\nPublish: 20261106045710\nActivate: 20261106045710\n",
+   "key": "; This is a key-signing key, keyid 57314, for example.test.\n; Created: 20261106045710 (Fri Nov  6 04:57:10 2026)\n; Publish: 20261106045710 (Fri Nov  6 04:57:10 2026)\n; Activate: 20261106045710 (Fri Nov  6 04:57:10 2026)\nexample.test. IN DNSKEY 257 3 8 AwEAAcS6MZjf9kPhC1jA6yeZGy7yN10/p5VKO0EePj0OE0CA6rCj9oUk VO2ZbVdda+Ap9ICEvZaPkCd/mCaPM/XK2Jif0mgr4LxzB3sv0FSDYQSW QnUyyvxAzmYfBqW15+gF08oDAAshO797ddkKNEl5bpD1i/fnm4jo5Hrf W2yWt+LJ\n"
+  },
+  {
+   "file": "Kexample.test.+010+53750",
+   "algorithm": 10,
+   "tag": 53750,
+   "flags": 256,
+   "private": "Private-key-format: v1.3\nAlgorithm: 10 (RSASHA512)\nModulus: kzBwpwEzThFioErUrFEJzaGD9AUu8yEqkcveF/iEf+TVHXAnHAww5P+GEc8RwaYSY0ydR/UzL8p5gunzA7dDyJfBp1wEzy6bHeHjEUGs16BSxzkmboho10qETG0Gc58dnpg2WQVGlFefdO/mQo9/RBOfcZyguIxwmwv9ayRvVtQMRt+BOkjIeZ3DFZgf9/Acw7qJgqOqHs1Q13rIfE5ymYNYXswdptYSehqawAKLlj6LfNJMRnInM+BRpjq9moesRQ8poo6DiFmp2wQRg1c140WoN480J+PmzgMYAAQz4BtA39mllkchgTy0CvOpRYm5xcwyGuIiBAoaEHZ4fJtMcw==\nPublicExponent: AQAB\nPrivateExponent: AbxNL8DNxTunUClIH9SzU4ZtuoVxQj9j5vG8J4O81Qc7GL+7f2QiV5fZeBbBeYtPdqmMxie9Plcvja11hr4fsoW3Tlna6zIVyjhQR7/6Ms0YYy5CKskn+5XmL4bIHMsa4hJaiF5A2267VZMFZBRljN7p9o2N8maaES2xlMfOs+IUw1Liw0lnj5WTI9N0Q6dBbEM9LzCU9WjfFM7feTHtgRj++1cr7IOl3jFPwiXF1gbn+tTUEO9KKRkd15+Ein16HuwoyJgcgz4NJ+gORgH8UubAjvs1ADLHDIPZgfeIwljLrlmpeomiMOURP2yTx7XDl06eEowLFvlUu56iM+P4iQ==\nPrime1: x0lS5wLOPeY2Nvcn6H9j7hoQ7IQakgTQ4GECFxe6wRRLbh8l8OZhelhlU0YgeWxajNF69ut6tXTKznGseJutjzsmGDxfuWJo7TftrdUJTwubjTO2g2jhoEYCKnaIFfyqiWCg4Kr43ZhmAq2NAdQz3UOabYVB1mKi2G1XjiCY7Ck=\nPrime2: vROpkk7r/Ozkio/IAiTQ88cXtAUBsjboXe3YhspKKUH1Py0Ozc/6x0rIQWqOhGkBy+TnQ14/85EkuhLgyqFQwFB6o+TxMR/eKfB7Iy6nlxBrktwrvIyB4P9MCwEStOyLFpdpraFnnt5toXdjDYNxDxIvzyF/SbyKBCKmyXShxzs=\nExponent1: Nn9kvmvT/rVv6gQY08nSiBB0xFkz8u6COHoO2kXQ+nAUWJ8H/yLhUVXPD8DDrLDm6k928wNeYTT5KQ+I/MqF4f9o4YPRIZ851nVO+BSkIQuplCmqJbGO0geTHA2iFXEtKbhVBlt7Bw5gBydywidHr6CHIKAqavg6VDlCkklzyFE=\nExponent2: H0bWYR5vCRrCv20DX99pNTo04JGHc0yD6a3DiKCD3glMIVQ5w6/owvjK4Y9X3e1k366Q1uMLXyYeVi1zQ/GlYvqtHtlrUH3+CR//rpU0IdgUg2mqTnlLrsVsddGKn6UVaPpI//DYLD6NEg2mtACPPjf68p+O58qpZf+5aU/Cxys=\nCoefficient: fnUy1PWLVluZ2mExXG7u76Xjf1GyyjShilH388hLNYFU7CdbMgqFc3W9M8M5di+cJawMDVyprchSWbg7hs9ZG28N8pr1CN/8sQKPVXQ7Oe7zexI+7AO0smoGmaWtu4ezU4FVV0BUUCi6mC5muMcTJ58uhCTt35/x/XrIVeGL/PA=\nCreated: 20261106045710\nPublish: 20261106045710\nActivate: 20261106045710\n",
+   "key": "; This is a zone-signing key, keyid 53750, for example.test.\n; Created: 20261106045710 (Fri Nov  6 04:57:10 2026)\n; Publish: 20261106045710 (Fri Nov  6 04:57:10 2026)\n; Activate: 20261106045710 (Fri Nov  6 04:57:10 2026)\nexample.test. IN DNSKEY 256 3 10 AwEAAZMwcKcBM04RYqBK1KxRCc2hg/QFLvMhKpHL3hf4hH/k1R1wJxwM MOT/hhHPEcGmEmNMnUf1My/KeYLp8wO3Q8iXwadcBM8umx3h4xFBrNeg Usc5Jm6IaNdKhExtBnOfHZ6YNlkFRpRXn3Tv5kKPf0QTn3GcoLiMcJsL /Wskb1bUDEbfgTpIyHmdwxWYH/fwHMO6iYKjqh7NUNd6yHxOcpmDWF7M HabWEnoamsACi5Y+i3zSTEZyJzPgUaY6vZqHrEUPKaKOg4hZqdsEEYNX NeNFqDePNCfj5s4DGAAEM+AbQN/ZpZZHIYE8tArzqUWJucXMMhriIgQK GhB2eHybTHM=\n"
+  },
+  {
+   "file": "Kexample.test.+013+24806",
+   "algorithm": 13,
+   "tag": 24806,
+   "flags": 256,
+   "private": "Private-key-format: v1.3\nAlgorithm: 13 (ECDSAP256SHA256)\nPrivateKey: ftMWysSTuUz9APbrcsT18BCm0V+bhe/muY4SYSqLYS8=\nCreated: 20261106045710\nPublish: 20261106045710\nActivate: 20261106045710\n",
+   "key": "; This is a zone-signing key, keyid 24806, for example.test.\n; Created: 20261106045710 (Fri Nov  6 04:57:10 2026)\n; Publish: 20261106045710 (Fri Nov  6 04:57:10 2026)\n; Activate: 20261106045710 (Fri Nov  6 04:57:10 2026)\nexample.test. IN DNSKEY 256 3 13 9fCahFy9CHn2RC3f+DN8MSiiN8wYgFJkuzDnH/tO5Hwh7m7ccalOD2q9 Yq8TCbOnDgA5slJSh2tAymoTXLJzkw==\n"
+  },
+  {
+   "file": "Kexample.test.+013+60622",
+   "algorithm": 13,
+   "tag": 60622,
+   "flags": 257,
+   "private": "Private-key-format: v1.3\nAlgorithm: 13 (ECDSAP256SHA256)\nPrivateKey: j0xO6lbyYKLIsU1L5oA1Tec25HBPbHPpG5HUqwES48g=\nCreated: 20261106045710\nPublish: 20261106045710\nActivate: 20261106045710\n",
+   "key": "; This is a key-signing key, keyid 60622, for example.test.\n; Created: 20261106045710 (Fri Nov  6 04:57:10 2026)\n; Publish: 20261106045710 (Fri Nov  6 04:57:10 2026)\n; Activate: 20261106045710 (Fri Nov  6 04:57:10 2026)\nexample.test. IN DNSKEY 257 3 13 gmrj+v8fV9IfoxTVjTMF68Z78iVhY7gEP/b5RAvBnRZXeS15JSlXYWX3 X7qo7elvGTwJklneVHcfhLUEU8BcvA==\n"
+  },
+  {
+   "file": "Kexample.test.+014+29401",
+   "algorithm": 14,
+   "tag": 29401,
+   "flags": 256,
+   "private": "Private-key-format: v1.3\nAlgorithm: 14 (ECDSAP384SHA384)\nPrivateKey: t50vckYEmRY5qGA3jaq3QIzinJ+Ns2h94EjcXzj385xvUvRpzV5jjeZBUIvpZBRk\nCreated: 20261106045710\nPublish: 20261106045710\nActivate: 20261106045710\n",
+   "key": "; This is a zone-signing key, keyid 29401, for example.test.\n; Created: 20261106045710 (Fri Nov  6 04:57:10 2026)\n; Publish: 20261106045710 (Fri Nov  6 04:57:10 2026)\n; Activate: 20261106045710 (Fri Nov  6 04:57:10 2026)\nexample.test. IN DNSKEY 256 3 14 JFFLAxuWmqeG6Q0EreuF6ip5ueq+dSdwzN+Tei1Q06jHob49A7Ibbq6X 9/e+aKsEgANmXiy02RjdObMQ6WRVEfwplQwVdqpyo3KXLF+38NnAy8vZ qIU15eSrMDfJT8BY\n"
+  },
+  {
+   "file": "Kexample.test.+015+04970",
+   "algorithm": 15,
+   "tag": 4970,
+   "flags": 256,
+   "private": "Private-key-format: v1.3\nAlgorithm: 15 (ED25519)\nPrivateKey: F4qtgqMRHMaNH5+MVZ4o4AZqI8kxw8wc7ZAfXrSg6y0=\nCreated: 20261106045710\nPublish: 20261106045710\nActivate: 20261106045710\n",
+   "key": "; This is a zone-signing key, keyid 4970, for example.test.\n; Created: 20261106045710 (Fri Nov  6 04:57:10 2026)\n; Publish: 20261106045710 (Fri Nov  6 04:57:10 2026)\n; Activate: 20261106045710 (Fri Nov  6 04:57:10 2026)\nexample.test. IN DNSKEY 256 3 15 Mf4Zh4rDk1ostR1P3cWLZ0FYM2UtHD9UQE6rrfo7KyA=\n"
+  },
+  {
+   "file": "Kexample.test.+016+50374",
+   "algorithm": 16,
+   "tag": 50374,
+   "flags": 256,
+   "private": "Private-key-format: v1.3\nAlgorithm: 16 (ED448)\nPrivateKey: TZRL0AZZMeM7Qdprg+ypClgRKK9uPSjQnX9yG4Omr/CDr1topgPbG4E1wcGo0H3rQ5CJ4q9fhvhn\nCreated: 20261106045710\nPublish: 20261106045710\nActivate: 20261106045710\n",
+   "key": "; This is a zone-signing key, keyid 50374, for example.test.\n; Created: 20261106045710 (Fri Nov  6 04:57:10 2026)\n; Publish: 20261106045710 (Fri Nov  6 04:57:10 2026)\n; Activate: 20261106045710 (Fri Nov  6 04:57:10 2026)\nexample.test. IN DNSKEY 256 3 16 zEYyqJHRw4BGDfLOF0EdL+AVGjnPll1d1BNeQjaHSxKPwuj/sb7ZRApo 67BfrFxER+dSxhNmQBKA\n"
+  }
+ ],
+ "powerdns": [
+  {
+   "id": 1,
+   "flags": 257,
+   "algorithm": 8,
+   "tag": 6791,
+   "content": "Private-key-format: v1.2\nAlgorithm: 8 (RSASHA256)\nModulus: sSrPfIUMBuV3L3U/p+j0d+qecdp9aPjZagv42xnHNJWxwpgldCbrL0PipmyURLa4WLG9z9gYGBpicWxWYtpXhZvrw0YJIKt93jUv7LihwCE3sIFGl4idr2nd2n/JYBH8GmfU/JG8gLzqTZd3ZM1OOrnOXCP+UljuDbWnzLwMgagwF1yD/qFak4HuUChNZXAIEF3Or5oqfhYIXX1pwyInjkP+JGnN0TiK3Ji3wa45joaEMFz0YvHSxsnfL7sg/osphbhSbEbi+KxJMcHDckX18O9A6ekKqBj42m36kZsZXYJE7Ln0lJkSdYPnKgORXaqRt30RKldPLx7yZfd9lS2/Kw==\nPublicExponent: AQAB\nPrivateExponent: A6rDrauhUpk4TNKr9SFEwiCok+m2U9Bmy6OgzIQtk+CPU9xLViqiDpHkpJY1wXBYw3k2WRF7ejA9nmRkK1qimiDekeWmtbbm/YzzR36Q1oW5fd1HJUbOIL3bujSP6f2lTrSce3fWw4FlhiKe9YasWlnTNCQIlRLDJqR+ayXvSlW0jCyYI/WJ52ZN+j9lXSAV3S30x5sWenXUJQOy+E8YTbVU66CKOImkfwhSW9uEjoTXukA+/0DsrpHzH01m/3JPBnUXUzBeeZTI/VmcuNObSg2HjPCRv706/j9kVNkguEsddrXHQ0aQDjWBrJSd7m2jLLeKeabwoyARORLt9w658Q==\nPrime1: 1QW2MjdlD98EV75+cLioZxmCpnUSSflJmocvsLOxjKVb3nOs1M8mA1WUb+WpumZLga/OfbZm7LDMBS6zzxEcs1/fBX5d552vpOigTxvpv54nAsaGMWegzzf7WJhZ+GN630+RnoPJdlAOaSL65d5M3iL1lEU2RxBLrev/a+Kq2TE=\nPrime2: 1Ok8k4mVlSrHft/piMjQgCvThYoaBol1aK1JSnfiehwGS3s+RnaiI8FdqRx9MzClx4JatQvciGMPLXcpzJ/nV7ark6WX5TCqEB073J4DHTGB1I39qJkT6G+DypkDr/KbBcbRt+hE1mjqPP8loub1+tmPeOU9SQcyUTA+pLaghxs=\nExponent1: cNW3rl29QGznBfs3Sknlmcbfd4BnkZtkK2AUGMr17wPf57LqB0c6YWXBXIwQHVX2BNm0zM4DMrhrOQuF3ta3lyPfJC/NWdQip304/O5SIFeLXmL9zcmQWnLSxhjc/z7iZMrm3Un9OpgpKfOHZp8bpEZsQn9uwrGVBKkPAHxt9uE=\nExponent2: TZbNv4p1G44ic2cQCQv9h6fxBopEX7t6MPJtchjsTMmntZwtHqqe/d66ziUWry/8Sg+EFNREwuMupcf2UJ65ROrJ7h17lEc+wm6U4RooUlw3TwmLtgRLD/qLkapfgKAtxFYnGRko9OX47s+gnJQEci0Urt8DjXh06sdlHMt9Bp8=\nCoefficient: Vw4ot3NNeDAOsJL2ZTP+fxV1Pg3pLJ2b4j8dS4CHehk/aMzrGcN4IhquM4Y7tYC0TGaWuo2HIc6ZGx34ECXEa4JbvlbBiJlaidBshB1OhkomMixgKJ7CdKV0yGfjHlAYLtd4QtCLYVOC8BUrEKn1gIjN4AABJWHwu+xIO1IX/fM=\n",
+   "dnskey": "example.test IN DNSKEY 257 3 8 AwEAAbEqz3yFDAbldy91P6fo9HfqnnHafWj42WoL+NsZxzSVscKYJXQm6y9D4qZslES2uFixvc/YGBgaYnFsVmLaV4Wb68NGCSCrfd41L+y4ocAhN7CBRpeIna9p3dp/yWAR/Bpn1PyRvIC86k2Xd2TNTjq5zlwj/lJY7g21p8y8DIGoMBdcg/6hWpOB7lAoTWVwCBBdzq+aKn4WCF19acMiJ45D/iRpzdE4ityYt8GuOY6GhDBc9GLx0sbJ3y+7IP6LKYW4UmxG4visSTHBw3JF9fDvQOnpCqgY+Npt+pGbGV2CROy59JSZEnWD5yoDkV2qkbd9ESpXTy8e8mX3fZUtvys="
+  },
+  {
+   "id": 2,
+   "flags": 256,
+   "algorithm": 10,
+   "tag": 28211,
+   "content": "Private-key-format: v1.2\nAlgorithm: 10 (RSASHA512)\nModulus: vSlaGQqnP5UteWVjEFdwLBvvMdajDaGr55NpEWETHx8jp4tFkcGrLgeaeiSTxVnjfPejlbEFMNvsI4tgSqPI+ZdrnoVV2WG17MnVvrYkZcG84j7IxYDJH1PQ+vNIKgIVng/ijpyZ+tbOFtiC7jxyvpd8Ir0lNe56TUHPB/JLHa8vd4C3wiPbNJxBCijD7j6oYPjobn6R3wHfG7SJ6/lzsNtkR5eLlBRXwlKWQmx1vSxMJvvK+R8O9T05mF6w1GmpwUM/Wo6bK/8lxKS9RAS8S+awLe8VWuX7Egv+WDE44TzI/JMDsWwcweo+spAGI7Xasb4KPhTUW9Cf7RGQtW23nQ==\nPublicExponent: AQAB\nPrivateExponent: AyX0yq1ndrKyKM7T7QHzizxkyQDQQmoSLR7CNSiXM6GmS4PRItmlEnVMcCN7NSHnnB0YAyYI1tUWM0o+zkc3EVZgk2kXMnDCoSAD13J7HRlyHhba6xSXZFbWB9M0PIS/3NtZUzPOiUL5d55fYX0ukLb/OSnKPIFNVktV2YVCFEqehKKgfUQB8AjdBVc7WIU9XH9QQ5WRt2+mf8nRYC2LqxPk4HZ1k2QphdqvwFDe6vwQY5EbBtGB399Yy8HndEJNdQ/D8s3m6167jqTNK3fzKcVQj35uAXOtGoeCkjLcy9pPBv1IHGecJ5Txl3fPzFUKcepQdWjXdfoUk6IjX/9ayQ==\nPrime1: 8rp1yaoZwa3GpEJS+fxX74ik+81Q1L0BdT1GAdbIlUCDx+7NOxuPdkO7x3UNZuJHcVjRmVITMvluGDdA76j9iPBbRN1qC4tYaZXvvxSumilZU06Tt8oMHj/6sOFIFHR3t3qcuhDzI/WCpnmVm57/T9p5bb0tzlB344WnqLjvjKU=\nPrime2: x4EZ6/K5BYIv5ovPSnFw7hEGlnWuSMdSKc9WJJIR+7BXnxRa0oe4AdIX7V8XiWchyg1b/L7NRCkN7pnO53I95mhLbj0axLkzVob82uqZhS+GTXxfxChs1LvclrNroxzjX3nK2Cn0li3XVIg2YNyldiOLKyYtwfcJCtx6oG3qtZk=\nExponent1: DEUyySQJM0pGnW0g5rRD+b7toDEL4gU/+p5DWLpz31+oicXfqBpHkVHxPy8Co23S8L7tsZN9lvkXALBiXvsq/e4wnvWWc8jyijvjJ8Sy4uYuNtDlFMho/mp7kM+Cpk4Q8zyGib1rnSi/Fw1Ua86I14+SzeJfW2uj8+OAyz22FmU=\nExponent2: Vkb4pNdlOIKioHtZ/AGvKuVmCe9+na7FU5t8z3f0GvqaCgvNczqKUw8+lcMH9L4LGMxKObVyI8X1ZnhRyDnZlykHZfc6+lR1ZTgfZbULC1QQKrZc3AH3ftB3hxy0seeuVP3gwTbztXbBpqb5jU4eqEaayuBJ7ZYd7PqIdZTTahE=\nCoefficient: hXsH96K4MrgSil353FPArVA52cm864sAS+ZMOsjeqQiMkld7HtSDw6qUElNLQ9bNuvo79j8VY1z7Uj7t/9ScdjQhE2f+hrgl532cjNn496f3UcUS5bkDsjxM5hxSLXmjWTMg96zTVWe+CsTj1WfHkKmIkaa28K+kU4tOG7f9As8=\n",
+   "dnskey": "example.test IN DNSKEY 256 3 10 AwEAAb0pWhkKpz+VLXllYxBXcCwb7zHWow2hq+eTaRFhEx8fI6eLRZHBqy4Hmnokk8VZ43z3o5WxBTDb7COLYEqjyPmXa56FVdlhtezJ1b62JGXBvOI+yMWAyR9T0PrzSCoCFZ4P4o6cmfrWzhbYgu48cr6XfCK9JTXuek1BzwfySx2vL3eAt8Ij2zScQQoow+4+qGD46G5+kd8B3xu0iev5c7DbZEeXi5QUV8JSlkJsdb0sTCb7yvkfDvU9OZhesNRpqcFDP1qOmyv/JcSkvUQEvEvmsC3vFVrl+xIL/lgxOOE8yPyTA7FsHMHqPrKQBiO12rG+Cj4U1FvQn+0RkLVtt50="
+  },
+  {
+   "id": 3,
+   "flags": 257,
+   "algorithm": 13,
+   "tag": 8248,
+   "content": "Private-key-format: v1.2\nAlgorithm: 13 (ECDSAP256SHA256)\nPrivateKey: Nfh5li7QIMXIdYoQUnbIkf8hg+3Go2yYPAiOSNmNg7o=\n",
+   "dnskey": "example.test IN DNSKEY 257 3 13 NXJ+vLPeNXUhRpaUsU1y7Io60rLv+58ypz2/zOpD0h/xEDHuTBiCSR2LtfZYg7XGzynE9BREaQqwbG9AOOxV1Q=="
+  },
+  {
+   "id": 4,
+   "flags": 256,
+   "algorithm": 14,
+   "tag": 11423,
+   "content": "Private-key-format: v1.2\nAlgorithm: 14 (ECDSAP384SHA384)\nPrivateKey: 7ISnlpPqiPaJqAFsKx5hXxZkWKHbr1M/KiskShlPPF6htjmqAQRrUYgB9/8zRPzl\n",
+   "dnskey": "example.test IN DNSKEY 256 3 14 CFlLsS/zyyLrQO/NNq16m/vUhhYvi0KOm9zogXQ4Ll7njygrDsx4UTo187QrpaNftW3Rl74oqXju9ymlg8rAOkjSJSyMm/hKAU/NVszjjDkjvcSJkuglLpHloWUBVWNo"
+  },
+  {
+   "id": 5,
+   "flags": 257,
+   "algorithm": 15,
+   "tag": 20373,
+   "content": "Private-key-format: v1.2\nAlgorithm: 15 (ED25519)\nPrivateKey: 2uR41amtg4+nLWZAuIR0pg0bL43nBmVv4er9wHDYJKs=\n",
+   "dnskey": "example.test IN DNSKEY 257 3 15 bwgQl2TnXlF1R18jVdNGL/YUmkgPjx36kfXnRfhNaM8="
+  },
+  {
+   "id": 6,
+   "flags": 256,
+   "algorithm": 16,
+   "tag": 53378,
+   "content": "Private-key-format: v1.2\nAlgorithm: 16 (ED448)\nPrivateKey: QTTNC8k0BZ2RV9lR1sypO/w22YEEjHKEk8LXyjgld1BiJ+VRFfsGSbG1aSeiY2s0jnH/8+0JqEvi\n",
+   "dnskey": "example.test IN DNSKEY 256 3 16 2YJgGSn61N5paJXu7JqL4TlqJwyH3bg1c6q02TJqXU825BVSHl51tswb2C7pXFKnl0g26IxrKCyA"
+  }
+ ]
+}

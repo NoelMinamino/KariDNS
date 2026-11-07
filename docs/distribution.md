@@ -60,9 +60,11 @@ Use `pkg add -f` to replace an already installed version in place.
 - **Manuals:**
   - `/usr/local/share/doc/karidns/` (`karidns.md`, `karictl.md`, `karicheck.md`, `dag.md`, `dag_replay.md`)
 - **Database packages only** (§2.5):
-$1  - `/usr/local/bin/karidns-zone` (the zone importer and exporter, with the same drivers, root:wheel, 0555)
+  - `/usr/local/libexec/karidns-dbloader` (the database loader, root:wheel, 0555)
+  - `/usr/local/bin/karidns-zone` (the zone importer and exporter, with the same drivers, root:wheel, 0555)
   - `/usr/local/share/karidns/db/*.sql` (extension tables, change-log triggers, role script of the packaged drivers)
-$1  - `/usr/local/share/doc/karidns/karidns-zone.md`
+  - `/usr/local/share/doc/karidns/karidns-dbloader.md`
+  - `/usr/local/share/doc/karidns/karidns-zone.md`
 
 ### 2.3 Starting the Service
 1. Copy the configuration and sample zone, then edit them (`user`, `group`, secrets, zones):
@@ -97,6 +99,7 @@ Zones can be served from a PowerDNS 5.1 SQLite3 or PostgreSQL database ([`karidn
 | `karidns-postgresql` | `postgresql` | PostgreSQL driver | `databases/postgresqlNN-client` (libpq; NN is the version installed on the build host) |
 | `karidns-db` | `both` | both drivers | both |
 
+
 The release workflow builds and publishes all four packages for each FreeBSD version (the database packages with `build_pkg.sh --db sqlite3`, `--db postgresql` and `--db both` in a VM that has `sqlite3` and `postgresql17-client` installed, so the PostgreSQL packages depend on `postgresql17-client`), and checks that the loader of each reports exactly the drivers of its package. To build one yourself, use a FreeBSD host that has the library, as a normal user, from the top of the source tree (each run starts with `make clean`; the version is the first argument and is only used for the file name and the package metadata):
 
 ```sh
@@ -105,6 +108,10 @@ pkg add ./dist/karidns-sqlite3-0.5.0-FreeBSD-15-amd64.pkg
 ```
 
 `pkg add` of a downloaded file does not fetch dependencies: install `libidn2` and `sqlite3` (or `postgresqlNN-client`) first, as in §2.1. The packages with a loader also install the SQL files that create the KariDNS tables and triggers (`/usr/local/share/karidns/db/`, for example `sqlite3 /var/db/karidns/zones.sqlite3 < /usr/local/share/karidns/db/karidns_ext.sqlite3.sql`) and the manual. `karidns` refuses a `database { driver x; }` that the installed loader does not have, and `karicheck db` in the plain package says `DB support is not installed`. To go from one package to another, remove the installed one first (`pkg delete karidns`) and install the other; the configuration files you created are not touched.
+
+### 2.6 The signer package
+
+[`karidns-signer`](karidns-signer.md) (the daemon that keeps database zones signed) is a package of its own, built by `packaging/freebsd/build_signer_pkg.sh [version] [output_dir]` (Node.js, no compiler; the build host needs `node24`, `npm-node24` and `bind-tools`; the script runs `npm ci --omit=dev --ignore-scripts` in `signer/`). It installs `/usr/local/libexec/karidns-signer/` (the program and its `node_modules`, root:wheel), `/usr/local/sbin/karidns-signer` (wrapper), `/usr/local/etc/rc.d/karidns_signer`, `/usr/local/etc/karidns/karidns-signer.conf.sample` and `/usr/local/share/doc/karidns/karidns-signer.md`, and creates the user and group `karidns-signer` (pre-install script). It depends on `node24` and `bind-tools`. It also needs `karidns-zone`, which `karidns-sqlite3`, `karidns-postgresql` and `karidns-db` install; those three conflict with each other, so the dependency cannot name one of them, and the pre-install script refuses the installation when `/usr/local/bin/karidns-zone` is missing. Install a database package first (`pkg add` of a downloaded file does not fetch dependencies: install `node24` and `bind-tools` first, as in §2.1), then the signer; `karidns-zone` must have the driver of the signer's database (`karidns-signer --check` says if not). The release workflow builds and installs it for each FreeBSD version.
 
 ---
 

@@ -4,9 +4,11 @@
 #
 # T-12: dag reports malformed responses like dig 9.20 (BIND dns_message_parse()).
 # KariDNS serves tests/mock_anomalous_dns_server.pl as a "type program" zone; every
-# check below was written from the output of dig 9.20.29 for the same scenario
+# check below was written from the output of dig 9.20.29 for the same scenario (compression-deep-chain:
+# dig 9.20.30, which bounds decompression, CVE-2026-19630)
 # (options +tries=1 +time=2 +nocookie +noedns, display +noall +answer +comments).
-# When dig 9.20 is installed, every scenario is also compared with dig directly.
+# When dig 9.20 is installed, every scenario is also compared with dig directly (9.20.30 or later:
+# an older dig follows every pointer of compression-deep-chain).
 # ==============================================================================
 
 . "$(dirname "$0")/lib_proc.sh"
@@ -101,8 +103,9 @@ run opcode-status;      has ";; Warning: Opcode mismatch: expected QUERY, got ST
 run opcode-unassigned;  has ";; Warning: Opcode mismatch: expected QUERY, got RESERVED3" && ok
 run short-header;       has ";; Warning: short (< header size) message received" && has "$REACH" && ok
 run flag-no-qr;         has ";; Warning: query response not set" && has "Got answer" && ok
-# names that make the message unusable
-for sc in compression-loop compression-indirect-loop compression-forward-ptr; do
+# names that make the message unusable (compression-deep-chain: 60 pointers in a row that point at pointers;
+# BIND 9.20.30, CVE-2026-19630, follows at most 2 of them, dig 9.20.29 followed them all)
+for sc in compression-loop compression-indirect-loop compression-forward-ptr compression-deep-chain; do
     run $sc;            has ";; Got bad packet: bad compression pointer" && has " bytes" && hasnt "Got answer" && ok
 done
 for sc in compression-bad-bits compression-misaligned label-overflow; do

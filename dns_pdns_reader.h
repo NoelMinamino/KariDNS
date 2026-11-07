@@ -91,7 +91,9 @@ typedef struct { int64_t domain_id; const char *kind, *content; } db_meta_row_t;
 typedef struct { int64_t record_id; const char *location_tag, *ecs_tag; } db_tag_row_t;
 typedef struct { int64_t record_id; bool ttd_null; int64_t ttd; const char *loc; bool countdown; } db_tinydns_row_t;
 typedef struct { const char *kind, *tag, *cidr; } db_tagdef_row_t;
-typedef struct { uint64_t seq; int64_t domain_id; } db_change_row_t;
+/* pos: where the row is in the order that the cursor of changes_max() / changes_since() is in (0.6.0 item C): SQLite3 the seq (the cursor is the highest seq, a row is read by a snapshot whose cursor is >= pos); PostgreSQL the xid8 of the
+ * transaction that wrote the row (the cursor is the xmin of a snapshot: the row is in every snapshot whose xmin is > pos) */
+typedef struct { uint64_t seq; int64_t domain_id; uint64_t pos; } db_change_row_t;
 /* Strings in rows stay valid until the callback returns (zero copy from sqlite3_column_text / PQgetvalue).  They
  * are C strings: a driver must reject (or never pass) a value that has an embedded NUL (sqlite3_column_bytes() !=
  * strlen()); pdns_text_check() rejects NUL for callers that have a length. */

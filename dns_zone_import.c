@@ -82,6 +82,10 @@ zi_t *zi_open(const zi_opts_t *o) {
             zmsg_emit(&m, DIAG_ERROR, DC_DB_IMPORT_OPTION, NULL, "'%.40s' is not a record type name (letters, digits and '-')", o->types[i]);
             return NULL;
         }
+    if (o->signer && (o->mode != ZI_REPLACE || o->ntypes > 0 || o->serial != ZI_SERIAL_GROW || o->view || o->zone_type)) {
+        zmsg_emit(&m, DIAG_ERROR, DC_DB_IMPORT_OPTION, NULL, "a signer import takes no merge mode, types filter, serial rule, view or zone type");
+        return NULL;
+    }
     if (o->view && !zi_view_ok(o->view)) {
         zmsg_emit(&m, DIAG_ERROR, DC_DB_IMPORT_OPTION, NULL, "the view name must be 1 to 64 printable characters without blanks");
         return NULL;
@@ -140,6 +144,12 @@ zi_t *zi_open(const zi_opts_t *o) {
     }
     if (o->view && !z->si.has_domain_views) {
         zmsg_emit(&m, DIAG_ERROR, DC_DB_IMPORT_SCHEMA, NULL, "a view was asked for but the database has no karidns_domain_views table (apply db/karidns_ext.*.sql)");
+        zi_close(z);
+        return NULL;
+    }
+    /* a signer import reads the zone and writes it as one snapshot (PostgreSQL: REPEATABLE READ), so that a change made in between is an error, not a lost update */
+    if (o->signer && z->drv->w_set_snapshot && z->drv->w_set_snapshot(z->conn, true) != 0) {
+        zmsg_emit(&m, DIAG_ERROR, DC_DB_IMPORT_OPEN, NULL, "%s", z->drv->errmsg(z->conn));
         zi_close(z);
         return NULL;
     }
@@ -358,9 +368,11 @@ typedef struct {
     int64_t id;
     char *owner, *type, *content;                       /* owner: lower case, no final dot; type: upper case, "" for an empty non-terminal */
     int64_t ttl, prio;                                  /* -1 = NULL */
+    char *ordername;                                    /* only when the collector has order set (signer mode); NULL = NULL */
+    bool disabled;
 } dbrec_t;
 
-typedef struct { dbrec_t *v; size_t n, cap; bool oom; } dbrecs_t;
+typedef struct { dbrec_t *v; size_t n, cap; bool oom; bool order; } dbrecs_t;
 
 /* the form of a name the comparisons use: ASCII lower case, one final dot dropped (the root stays "") */
 static char *zi_canon(const char *s, bool upper) {
@@ -390,10 +402,13 @@ static int zi_cb_rec(void *ud, int64_t did, const db_record_row_t *r) {
     d->content = strdup(r->content ? r->content : "");
     d->ttl = r->ttl_null ? -1 : r->ttl;
     d->prio = r->prio_null ? -1 : r->prio;
-    if (!d->owner || !d->type || !d->content) {
+    d->disabled = r->disabled;
+    d->ordername = a->order && r->ordername ? strdup(r->ordername) : NULL;
+    if (!d->owner || !d->type || !d->content || (a->order && r->ordername && !d->ordername)) {
         free(d->owner);
         free(d->type);
         free(d->content);
+        free(d->ordername);
         return a->oom = true;
     }
     a->n++;
@@ -405,6 +420,7 @@ static void zi_recs_free(dbrecs_t *a) {
         free(a->v[i].owner);
         free(a->v[i].type);
         free(a->v[i].content);
+        free(a->v[i].ordername);
     }
     free(a->v);
     memset(a, 0, sizeof(*a));
@@ -447,11 +463,11 @@ static int zi_cmp_rrv(const void *x, const void *y) {
 typedef struct { char what; const char *owner, *type; } zi_item_t;
 
 /* The RRsets of the rows a (deleted) against those of b (inserted): in a only '-', in b only '+', in both with other rows '~'. */
-static bool zi_diff(rrv_t *a, size_t na, rrv_t *b, size_t nb, zi_item_t **out, size_t *nout, zi_result_t *res) {
+static bool zi_diff(rrv_t *a, size_t na, rrv_t *b, size_t nb, bool want_items, zi_item_t **out, size_t *nout, zi_result_t *res) {
     qsort(a, na, sizeof(*a), zi_cmp_rrv);
     qsort(b, nb, sizeof(*b), zi_cmp_rrv);
-    zi_item_t *items = malloc((na + nb + 1) * sizeof(*items));
-    if (!items) return false;
+    zi_item_t *items = want_items ? malloc((na + nb + 1) * sizeof(*items)) : NULL;      /* without a report only the counts are needed */
+    if (want_items && !items) return false;
     size_t n = 0, i = 0, j = 0;
     while (i < na || j < nb) {
         int c = i >= na ? 1 : j >= nb ? -1 : zi_cmp_key(&a[i], &b[j]);
@@ -461,16 +477,19 @@ static bool zi_diff(rrv_t *a, size_t na, rrv_t *b, size_t nb, zi_item_t **out, s
         if (c >= 0)
             while (je < nb && zi_cmp_key(&b[je], &b[j]) == 0) je++;
         if (c < 0) {
-            items[n++] = (zi_item_t){ '-', a[i].owner, a[i].type };
+            if (items) items[n] = (zi_item_t){ '-', a[i].owner, a[i].type };
+            n++;
             res->rrsets_deleted++;
         } else if (c > 0) {
-            items[n++] = (zi_item_t){ '+', b[j].owner, b[j].type };
+            if (items) items[n] = (zi_item_t){ '+', b[j].owner, b[j].type };
+            n++;
             res->rrsets_added++;
         } else {
             bool same = ie - i == je - j;
             for (size_t k = 0; same && k < ie - i; k++) same = zi_cmp_rrv(&a[i + k], &b[j + k]) == 0;
             if (!same) {
-                items[n++] = (zi_item_t){ '~', b[j].owner, b[j].type };
+                if (items) items[n] = (zi_item_t){ '~', b[j].owner, b[j].type };
+                n++;
                 res->rrsets_replaced++;
             }
         }
@@ -478,7 +497,7 @@ static bool zi_diff(rrv_t *a, size_t na, rrv_t *b, size_t nb, zi_item_t **out, s
         j = je;
     }
     *out = items;
-    *nout = n;
+    *nout = items ? n : 0;
     return true;
 }
 
@@ -564,9 +583,9 @@ static void zi_verify_sink(void *ud, char level, dns_diag_code_t code, const cha
  * checks of `karicheck db` (zone_lint_records with the check-* severities of the configuration).  An error refuses the import.  The warnings
  * of a whole zone are the ones the checks of the file gave already; of a part (merge, types) they are about the rest of the zone and are shown
  * (and fail in strict mode).  false: a message was given. */
-static bool zi_verify(zi_t *z, const char *zone, int64_t did, const char *shown, bool partial, zi_result_t *res) {
+static bool zi_verify(zi_t *z, const char *zone, int64_t did, const char *shown, bool partial, unsigned plain, zi_result_t *res) {
     pdns_zone_t *pz = NULL;
-    switch (zx_read_zone(z->drv, z->conn, z->si.has_ext, zone, did, &z->o.reader, &pz, NULL)) {
+    switch (zx_read_zone_ex(z->drv, z->conn, z->si.has_ext, zone, did, &z->o.reader, plain, &pz, NULL)) {
     case ZX_READ_OK: break;
     case ZX_READ_OOM:
         ZI_ERR(z, DC_INTERNAL_OOM, shown, "out of memory");
@@ -616,6 +635,17 @@ out:
 
 static const char *const ZI_OWNED_META[3] = { "PRESIGNED", "NSEC3PARAM", "X-KARIDNS-FORMAT" };
 
+static bool zi_managed_type(const char *t);
+
+/* A zone that karidns-signer signs (metadata X-KARIDNS-SIGNER=1; item C): a normal import replaces its data and leaves the DNSSEC records and the metadata the
+ * signer owns as they are.  The types: those of import --signer and CDS / CDNSKEY (a key rollover the signer announces). */
+static bool zi_signer_kept(const char *t) { return t && (zi_managed_type(t) || strcasecmp(t, "CDS") == 0 || strcasecmp(t, "CDNSKEY") == 0); }
+
+static int zi_cb_signer_meta(void *ud, const db_meta_row_t *m) {
+    if (m->kind && m->content && strcasecmp(m->kind, "X-KARIDNS-SIGNER") == 0 && strcmp(m->content, "1") == 0) *(bool *)ud = true;
+    return 0;
+}
+
 /* Everything in the transaction.  Returns ZI_OK, ZI_FAIL or ZI_BUSY; the caller rolls back unless this committed (res->committed). */
 static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res) {
     const db_driver_t *d = z->drv;
@@ -634,6 +664,8 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
     char **soa_new = NULL;                              /* SOA contents rewritten for --serial increment (owned here) */
     size_t nsoa_new = 0;
     bool in_tx = false;
+    bool szone = false;                                 /* the zone is signed by karidns-signer: its DNSSEC records and signer metadata stay */
+    size_t nignored = 0;                                /* DNSSEC records of the input that a signer zone does not take */
 
     if ((rows->tags || rows->td || rows->ndefs) && !z->si.has_ext) {
         ZI_ERR(z, DC_DB_IMPORT_SCHEMA, shown, "Zone '%s' has tags, tinydns attributes or tag definitions, but the database has no karidns_record_tags / "
@@ -679,6 +711,18 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
         goto out;
     }
     if (db.oom) goto oom;
+    if (zf.found && d->scan_metadata(c, &zf.id, zi_cb_signer_meta, &szone) != 0) {
+        zi_dbfail(z, "reading the metadata of the zone");
+        goto out;
+    }
+    if (szone) {                                        /* the DNSSEC records of the input are the signer's business: ignored */
+        size_t w = 0;
+        for (size_t k = 0; k < nins; k++) {
+            if (zi_signer_kept(rows->rows[ins[k]].type)) nignored++;
+            else ins[w++] = ins[k];
+        }
+        nins = w;
+    }
 
     /* the SOA serial (RFC 1982) of a zone that exists and whose SOA is written */
     if (zf.found && zf.soa) {
@@ -718,7 +762,7 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
     }
 
     /* what is deleted: replace = every record (or those of the types), merge = the RRsets of the file */
-    const bool delete_all = zf.found && z->o.mode == ZI_REPLACE && whole;
+    const bool delete_all = zf.found && z->o.mode == ZI_REPLACE && whole && !szone;
     va = malloc((db.n ? db.n : 1) * sizeof(*va));
     del_ids = malloc((db.n ? db.n : 1) * sizeof(*del_ids));
     if (!va || !del_ids) goto oom;
@@ -726,6 +770,7 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
     for (size_t i = 0; i < db.n; i++) {
         const dbrec_t *r = &db.v[i];
         bool del;
+        if (szone && zi_signer_kept(r->type)) continue;
         if (z->o.mode == ZI_REPLACE) {
             del = zi_type_wanted(z, r->type);
         } else {
@@ -748,9 +793,9 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
     }
     res->records_deleted = ndel;
     res->records_inserted = nins;
-    if (!zi_diff(va, nva, vb, nins, &items, &nitems, res)) goto oom;
+    if (!zi_diff(va, nva, vb, nins, true, &items, &nitems, res)) goto oom;
 
-    if (zf.found && whole && z->o.mode == ZI_REPLACE && !rows->presigned) {
+    if (zf.found && whole && z->o.mode == ZI_REPLACE && !rows->presigned && !szone) {
         bool keys = false;
         if (d->w_zone_has_keys(c, zf.id, &keys) != 0) {
             zi_dbfail(z, "looking for cryptokeys");
@@ -780,6 +825,7 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
     }
     if (whole && zf.found) {
         for (size_t m = 0; m < 3; m++) {
+            if (szone && m < 2) continue;               /* PRESIGNED and NSEC3PARAM belong to the signer */
             bool declared = m == 0 ? rows->presigned : m == 1 ? rows->nsec3param != NULL : rows->tinydns;
             if ((z->o.mode == ZI_REPLACE || declared) && d->w_delete_meta(c, did, ZI_OWNED_META[m]) != 0) {
                 zi_dbfail(z, "deleting metadata");
@@ -828,8 +874,8 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
                 zi_dbfail(z, "inserting a tag definition");
                 goto out;
             }
-        if ((rows->presigned && d->w_insert_meta(c, did, "PRESIGNED", "1") != 0) ||
-            (rows->nsec3param && d->w_insert_meta(c, did, "NSEC3PARAM", rows->nsec3param) != 0) ||
+        if ((rows->presigned && !szone && d->w_insert_meta(c, did, "PRESIGNED", "1") != 0) ||
+            (rows->nsec3param && !szone && d->w_insert_meta(c, did, "NSEC3PARAM", rows->nsec3param) != 0) ||
             (rows->tinydns && d->w_insert_meta(c, did, "X-KARIDNS-FORMAT", "tinydns") != 0)) {
             zi_dbfail(z, "inserting metadata");
             goto out;
@@ -851,7 +897,7 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
         }
     }
     if (zf.found ? zi_primary_type(zf.type) : (!z->zone_type[0] || zi_primary_type(z->zone_type))) {
-        if (!zi_verify(z, rows->zone, did, shown, !whole || z->o.mode == ZI_MERGE, res)) goto out;
+        if (!zi_verify(z, rows->zone, did, shown, !whole || z->o.mode == ZI_MERGE, szone ? ZX_PLAIN_DNSSEC | ZX_PLAIN_CDS : 0, res)) goto out;
     } else {
         ZI_WARN(z, DC_DB_IMPORT_NOT_PRIMARY, shown, "Zone '%s' has domains.type %s: the server does not serve the records of such a zone, so they were not checked", rows->zone,
                 zf.found && zf.type[0] ? zf.type : z->zone_type);
@@ -878,6 +924,13 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
               "Zone '%s'%s: %zu RRset(s) added, %zu replaced, %zu deleted (%zu record(s) written, %zu removed)%s%s", rows->zone, res->created ? " (new)" : "",
               res->rrsets_added, res->rrsets_replaced, res->rrsets_deleted, res->records_inserted, res->records_deleted, sn,
               z->o.dry_run ? "; dry run, nothing was written" : "");
+    if (szone) {
+        char ig[120] = "";
+        if (nignored) snprintf(ig, sizeof(ig), "; %zu DNSSEC record(s) of the input were ignored", nignored);
+        zmsg_emit(&z->msg, DIAG_INFO, DC_DB_IMPORT_SIGNER_ZONE, shown,
+                  "Zone '%s' is signed by karidns-signer: its DNSSEC records and the metadata PRESIGNED and NSEC3PARAM were kept%s; the server serves the zone again after the next signing",
+                  rows->zone, ig);
+    }
     goto out;
 oom:
     ZI_ERR(z, DC_INTERNAL_OOM, shown, "out of memory");
@@ -901,6 +954,607 @@ out:
 /* entry points                                                                                                   */
 /* ------------------------------------------------------------------------------------------------------------- */
 
+/* ------------------------------------------------------------------------------------------------------------- */
+/* import --signer                                                                                                */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* the types the signer replaces (RFC 4034 3, RFC 5155 3 and 4; CDS and CDNSKEY, RFC 7344, are not the signer's here) */
+static bool zi_managed_type(const char *t) {
+    static const char *const k[] = { "RRSIG", "NSEC", "NSEC3", "NSEC3PARAM", "DNSKEY" };
+    if (!t) return false;
+    for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++)
+        if (strcasecmp(t, k[i]) == 0) return true;
+    return false;
+}
+
+/* days from 1970-01-01 to the civil date y-m-d (proleptic Gregorian calendar) */
+static int64_t zi_days_from_civil(int64_t y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153u * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+/* The Signature Expiration field of the content of an RRSIG row ("covered alg labels ttl expiration inception tag signer signature", RFC 4034 3.2):
+ * seconds since the epoch as a decimal number, or YYYYMMDDHHmmSS in UTC.  The value is a 32 bit number of seconds modulo 2^32 (RFC 4034 3.1.5). */
+static bool zi_rrsig_expire(const char *content, uint32_t *out) {
+    const char *p = content;
+    for (int f = 0; f < 4; f++) {
+        while (*p == ' ' || *p == '\t') p++;
+        while (*p && *p != ' ' && *p != '\t') p++;
+    }
+    while (*p == ' ' || *p == '\t') p++;
+    size_t n = 0;
+    while (p[n] >= '0' && p[n] <= '9') n++;
+    if (n == 0 || (p[n] && p[n] != ' ' && p[n] != '\t')) return false;
+    if (n == 14) {
+        unsigned f[6];
+        static const unsigned len[6] = { 4, 2, 2, 2, 2, 2 };
+        size_t o = 0;
+        for (int i = 0; i < 6; i++) {
+            f[i] = 0;
+            for (unsigned j = 0; j < len[i]; j++) f[i] = f[i] * 10 + (unsigned)(p[o++] - '0');
+        }
+        if (f[1] < 1 || f[1] > 12 || f[2] < 1 || f[2] > 31 || f[3] > 23 || f[4] > 59 || f[5] > 60) return false;
+        int64_t t = zi_days_from_civil(f[0], f[1], f[2]) * 86400 + (int64_t)f[3] * 3600 + (int64_t)f[4] * 60 + (int64_t)f[5];
+        *out = (uint32_t)(uint64_t)t;                   /* modulo 2^32 */
+        return true;
+    }
+    if (n > 10) return false;
+    unsigned long long v = strtoull(p, NULL, 10);
+    if (v > 0xFFFFFFFFull) return false;
+    *out = (uint32_t)v;
+    return true;
+}
+
+/* the time (seconds since the epoch) a 32 bit RRSIG time stands for: the one within 2^31 seconds of now */
+static time_t zi_time_near(uint32_t t32, time_t now) {
+    int64_t diff = (int64_t)t32 - (int64_t)(uint32_t)((uint64_t)now & 0xFFFFFFFFu);
+    if (diff > 0x7FFFFFFFLL) diff -= 0x100000000LL;
+    else if (diff < -0x80000000LL) diff += 0x100000000LL;
+    return (time_t)((int64_t)now + diff);
+}
+
+/* ---- the zone as the signed file saw it: RRsets in canonical form (RFC 4034 6.2) ---- */
+
+/* an RR as the comparison sees it: the record, its RDATA in the canonical form (not compressed, the names inside the RDATA of the types RFC 4034 6.2
+ * lists in lower case; dns_record_canonical_rdata()), and the TTL of its RRset (the lowest of it: RFC 2181 5.2, what the server serves) */
+typedef struct { const dns_record_t *r; size_t off; const uint8_t *rd; size_t rdlen; uint32_t ttl; } crr_t;
+typedef struct { crr_t *v; size_t n; uint8_t *blob; const dns_record_t *soa; } crrs_t;
+
+static int zi_cmp_str_null(const char *a, const char *b) {
+    if (!a || !b) return (a != NULL) - (b != NULL);
+    int c = strcasecmp(a, b);
+    return c < 0 ? -1 : c > 0;
+}
+
+/* the RRset an RR belongs to: owner (without regard to case), type, class, and the visibility tags / tinydns attributes the server separates RRs by */
+static int zi_cmp_crr_key(const crr_t *a, const crr_t *b) {
+    int c = zi_cmp_str_null(a->r->name, b->r->name);
+    if (c) return c;
+    if (a->r->type_code != b->r->type_code) return a->r->type_code < b->r->type_code ? -1 : 1;
+    const unsigned ca = a->r->class_val ? a->r->class_val : 1, cb = b->r->class_val ? b->r->class_val : 1;
+    if (ca != cb) return ca < cb ? -1 : 1;
+    if ((c = zi_cmp_str_null(a->r->bind_location_tag, b->r->bind_location_tag)) != 0) return c;
+    if ((c = zi_cmp_str_null(a->r->ecs_subnet_tag, b->r->ecs_subnet_tag)) != 0) return c;
+    if (a->r->tinydns_ttd != b->r->tinydns_ttd) return a->r->tinydns_ttd < b->r->tinydns_ttd ? -1 : 1;
+    if (a->r->tinydns_ttl_countdown != b->r->tinydns_ttl_countdown) return a->r->tinydns_ttl_countdown ? 1 : -1;
+    if ((c = memcmp(a->r->tinydns_loc, b->r->tinydns_loc, 2)) != 0) return c < 0 ? -1 : 1;
+    return 0;
+}
+
+static int zi_cmp_crr(const void *x, const void *y) {
+    const crr_t *a = x, *b = y;
+    int c = zi_cmp_crr_key(a, b);
+    if (c) return c;
+    size_t m = a->rdlen < b->rdlen ? a->rdlen : b->rdlen;
+    if (m && (c = memcmp(a->rd, b->rd, m)) != 0) return c < 0 ? -1 : 1;
+    return a->rdlen == b->rdlen ? 0 : a->rdlen < b->rdlen ? -1 : 1;
+}
+
+static void zi_crrs_free(crrs_t *s) {
+    free(s->v);
+    free(s->blob);
+    memset(s, 0, sizeof(*s));
+}
+
+/* The RRs of a zone arena that the signer leaves alone, sorted and made a set: every type but RRSIG, NSEC, NSEC3, NSEC3PARAM, DNSKEY and the SOA (which is
+ * returned in ->soa); identical RRs are one; the TTL of each is the lowest of its RRset.  false: *why says why (out of memory, or an RDATA that has no
+ * canonical form). */
+static bool zi_crrs_from_arena(const zone_arena_t *a, crrs_t *out, char *why, size_t whylen) {
+    memset(out, 0, sizeof(*out));
+    uint8_t *tmp = malloc(65535);
+    out->v = malloc((a->count ? a->count : 1) * sizeof(*out->v));
+    if (!tmp || !out->v) {
+        snprintf(why, whylen, "out of memory");
+        free(tmp);
+        zi_crrs_free(out);
+        return false;
+    }
+    size_t bcap = 0, bn = 0;
+    for (size_t i = 0; i < a->count; i++) {
+        const dns_record_t *r = &a->records[i];
+        if (!r->name || r->type_code == 46 || r->type_code == 47 || r->type_code == 48 || r->type_code == 50 || r->type_code == 51) continue;
+        if (r->type_code == 6) {
+            if (!out->soa) out->soa = r;
+            continue;
+        }
+        long l = dns_record_canonical_rdata(r, tmp, 65535);
+        if (l < 0) {
+            snprintf(why, whylen, "the RDATA of a %.20s record of '%.200s' has no canonical form", r->type ? r->type : "?", r->name);
+            free(tmp);
+            zi_crrs_free(out);
+            return false;
+        }
+        if (bn + (size_t)l + 1 > bcap) {
+            size_t nc = bcap ? bcap * 2 : 65536;
+            while (nc < bn + (size_t)l + 1) nc *= 2;
+            uint8_t *nb = realloc(out->blob, nc);
+            if (!nb) {
+                snprintf(why, whylen, "out of memory");
+                free(tmp);
+                zi_crrs_free(out);
+                return false;
+            }
+            out->blob = nb;
+            bcap = nc;
+        }
+        memcpy(out->blob + bn, tmp, (size_t)l);
+        out->v[out->n++] = (crr_t){ r, bn, NULL, (size_t)l, r->ttl_value };
+        bn += (size_t)l;
+    }
+    free(tmp);
+    for (size_t i = 0; i < out->n; i++) out->v[i].rd = out->blob + out->v[i].off;
+    qsort(out->v, out->n, sizeof(*out->v), zi_cmp_crr);
+    size_t w = 0;
+    for (size_t i = 0; i < out->n;) {
+        size_t j = i, gs = w;
+        uint32_t m = out->v[i].ttl;
+        while (j + 1 < out->n && zi_cmp_crr_key(&out->v[i], &out->v[j + 1]) == 0) {
+            j++;
+            if (out->v[j].ttl < m) m = out->v[j].ttl;
+        }
+        for (size_t k = i; k <= j; k++) {
+            if (w > gs && zi_cmp_crr(&out->v[w - 1], &out->v[k]) == 0) continue;           /* the same RR twice is one */
+            out->v[w] = out->v[k];
+            out->v[w].ttl = m;
+            w++;
+        }
+        i = j + 1;
+    }
+    out->n = w;
+    return true;
+}
+
+/* the RDATA of an SOA in canonical form with the serial set to 0, and the serial; -1 if it is not an SOA RDATA */
+static long zi_soa_canon(const dns_record_t *r, uint8_t *buf, size_t cap, uint32_t *serial) {
+    long l = dns_record_canonical_rdata(r, buf, cap);
+    if (l < 0) return -1;
+    size_t i = 0;
+    for (int k = 0; k < 2; k++) {
+        while (i < (size_t)l && buf[i]) i += (size_t)buf[i] + 1;
+        i++;
+    }
+    if (i + 20 != (size_t)l) return -1;
+    *serial = ((uint32_t)buf[i] << 24) | ((uint32_t)buf[i + 1] << 16) | ((uint32_t)buf[i + 2] << 8) | (uint32_t)buf[i + 3];
+    memset(buf + i, 0, 4);
+    return l;
+}
+
+/* an owner and type for a message */
+static void zi_rr_name(const dns_record_t *r, char *owner, size_t ocap, char *type, size_t tcap) {
+    snprintf(owner, ocap, "%.200s", r->name && r->name[0] && strcmp(r->name, ".") != 0 ? r->name : "(apex)");
+    if (r->type && r->type[0]) snprintf(type, tcap, "%.20s", r->type);
+    else snprintf(type, tcap, "TYPE%u", (unsigned)r->type_code);
+}
+
+/* The two sets must be equal, TTLs included.  0 when they are; else a message in why that names the first RRset that differs. */
+static bool zi_crrs_equal(const crrs_t *dbr, const crrs_t *fir, char *why, size_t whylen) {
+    size_t n = dbr->n > fir->n ? dbr->n : fir->n;
+    for (size_t i = 0; i < n; i++) {
+        const crr_t *a = i < dbr->n ? &dbr->v[i] : NULL, *b = i < fir->n ? &fir->v[i] : NULL;
+        int c = !a ? 1 : !b ? -1 : zi_cmp_crr(a, b);
+        if (c == 0 && a->ttl == b->ttl) continue;
+        const crr_t *w = c == 0 ? a : c < 0 ? a : b;
+        char o[220], t[32];
+        zi_rr_name(w->r, o, sizeof(o), t, sizeof(t));
+        if (c == 0) snprintf(why, whylen, "the TTL of '%s' %s is %u in the database and %u in the file", o, t, (unsigned)a->ttl, (unsigned)b->ttl);
+        else snprintf(why, whylen, "'%s' %s %s", o, t, c < 0 ? "is in the database and not in the file" : "is in the file and not in the database");
+        return false;
+    }
+    return true;
+}
+
+/* where the new ordername and auth of a record of the database come from: the file's row of the same owner and type */
+typedef struct { const char *name, *type; size_t idx; } fmrow_t;
+static int zi_cmp_fmrow(const void *x, const void *y) {
+    const fmrow_t *a = x, *b = y;
+    int c = strcasecmp(a->name, b->name);
+    return c ? c : strcasecmp(a->type, b->type);
+}
+
+typedef struct { int64_t id; bool auth; } dbauth_t;
+typedef struct { dbauth_t *v; size_t n, cap; bool oom; } dbauths_t;
+
+static int zi_cb_auth(void *ud, int64_t id, bool auth) {
+    dbauths_t *a = ud;
+    if (a->n == a->cap) {
+        size_t nc = a->cap ? a->cap * 2 : 256;
+        dbauth_t *nv = realloc(a->v, nc * sizeof(*nv));
+        if (!nv) return a->oom = true;
+        a->v = nv;
+        a->cap = nc;
+    }
+    a->v[a->n++] = (dbauth_t){ id, auth };
+    return 0;
+}
+
+static int zi_cmp_auth_id(const void *k, const void *e) {
+    const int64_t id = *(const int64_t *)k;
+    const dbauth_t *a = e;
+    return id < a->id ? -1 : id > a->id;
+}
+
+static bool zi_same_text(const char *a, const char *b) { return (a == NULL && b == NULL) || (a && b && strcmp(a, b) == 0); }
+
+/* the status of a failed step of the signer's transaction: a concurrent change is "the zone changed" (the signer signs again), the rest a failure */
+static int zi_sfail(zi_t *z, const char *what, int rc, const char *shown, const char *zone) {
+    if (rc == DB_ERR_CONFLICT) {
+        ZI_ERR(z, DC_DB_IMPORT_CHANGED, shown, "Zone '%s' changed while the signed file was being written (%s: %s); nothing was written; sign the zone again", zone, what,
+               z->drv->errmsg(z->conn));
+        return ZI_CHANGED;
+    }
+    return zi_dbfail(z, what);
+}
+
+#define ZI_SFAIL(what, rc) do { status = zi_sfail(z, (what), (rc), shown, rows->zone); goto out; } while (0)
+
+/* Everything of a signer import in the transaction.  ZI_OK, ZI_FAIL, ZI_BUSY, ZI_CHANGED; the caller rolls back unless this committed.  farena: the parsed file. */
+/* farena: the zone arena of the file; it is destroyed here as soon as it has been compared (the caller's destroy of the emptied arena is harmless).  The memory
+ * of a big signed zone is the point: the file's arena, the rows made from it, the database's rows and the zone read from them are not held while the written
+ * rows are read back (zi_verify), which needs as much again. */
+static int zi_apply_signer(zi_t *z, zrows_t *rows, zone_arena_t *farena, const char *shown, zi_result_t *res) {
+    const db_driver_t *d = z->drv;
+    db_conn_t *c = z->conn;
+    int status = ZI_FAIL;
+    bool in_tx = false;
+    dbrecs_t db = {0};
+    db.order = true;
+    dbauths_t au = {0};
+    zfind_t zf = {0};
+    fmrow_t *fm = NULL, *fe = NULL;                     /* the file's other records / empty non-terminals by owner and type, sorted */
+    size_t nfm = 0, nfe = 0;
+    size_t *fdn = NULL, nfdn = 0;                       /* the file's DNSSEC rows (indexes): written */
+    int64_t *del_ids = NULL;
+    size_t ndel = 0;
+    size_t isoa_f = (size_t)-1;                         /* the file's apex SOA */
+    const dbrec_t *soa_d = NULL;                        /* the database's apex SOA */
+    size_t nsoa_d = 0;
+    rrv_t *va = NULL, *vb = NULL;
+    size_t nva = 0;
+    zi_item_t *items = NULL;
+    size_t nitems = 0;
+    char *soa_new = NULL;
+    bool have_exp = false;
+    uint32_t exp_best = 0;
+    uint64_t mark = 0;
+    pdns_zone_t *pz = NULL;
+    crrs_t dbr = {0}, fir = {0};
+    db_order_t *ords = NULL;
+    size_t nords = 0;
+    db_ins_t *ins = NULL;
+    char why[400];
+    char zone[DNS_NAME_TEXT_SIZE];
+    int rc;
+
+    snprintf(zone, sizeof(zone), "%s", rows->zone);
+    if (!rows->presigned) {
+        ZI_ERR(z, DC_DB_IMPORT_SIGNER, shown, "Zone '%s': the file is not a signed zone (it needs RRSIG records and a complete NSEC or NSEC3 chain); nothing was written", rows->zone);
+        return ZI_FAIL;
+    }
+    /* the file's rows: DNSSEC records (written), the apex SOA, empty non-terminals and the others (where ordername and auth come from) */
+    fm = malloc((rows->n ? rows->n : 1) * sizeof(*fm));
+    fe = malloc((rows->n ? rows->n : 1) * sizeof(*fe));
+    fdn = malloc((rows->n ? rows->n : 1) * sizeof(*fdn));
+    if (!fm || !fe || !fdn) goto oom;
+    for (size_t i = 0; i < rows->n; i++) {
+        const db_record_row_t *r = &rows->rows[i];
+        if (!r->type) {
+            fe[nfe++] = (fmrow_t){ r->name, "", i };
+        } else if (zi_managed_type(r->type)) {
+            fdn[nfdn++] = i;
+            if (strcasecmp(r->type, "RRSIG") == 0) {
+                uint32_t e;
+                if (!r->content || !zi_rrsig_expire(r->content, &e)) {
+                    ZI_ERR(z, DC_DB_IMPORT_SIGNER, shown, "Zone '%s': cannot read the expiration time of the RRSIG record of '%.100s'; nothing was written", rows->zone, r->name);
+                    goto out;
+                }
+                if (!have_exp || zi_serial_gt(exp_best, e)) {
+                    exp_best = e;
+                    have_exp = true;
+                }
+            }
+        } else if (strcasecmp(r->type, "SOA") == 0 && strcmp(r->name, rows->zone) == 0) {
+            if (isoa_f != (size_t)-1) {
+                ZI_ERR(z, DC_DB_IMPORT_SIGNER, shown, "Zone '%s': the file has more than one SOA record at the apex; nothing was written", rows->zone);
+                goto out;
+            }
+            isoa_f = i;
+        } else {
+            fm[nfm++] = (fmrow_t){ r->name, r->type, i };
+        }
+    }
+    if (isoa_f == (size_t)-1 || !have_exp) {
+        ZI_ERR(z, DC_DB_IMPORT_SIGNER, shown, "Zone '%s': the file has %s; nothing was written", rows->zone, isoa_f == (size_t)-1 ? "no SOA record at the apex" : "no RRSIG record");
+        goto out;
+    }
+    qsort(fm, nfm, sizeof(*fm), zi_cmp_fmrow);
+    qsort(fe, nfe, sizeof(*fe), zi_cmp_fmrow);
+
+    rc = d->w_begin(c, rows->zone);
+    if (rc != 0) {
+        if (rc == DB_ERR_RETRY) {
+            ZI_ERR(z, DC_DB_IMPORT_BUSY, shown, "Zone '%s' is locked by another import or the database is busy: %s", rows->zone, d->errmsg(c));
+            status = ZI_BUSY;
+        } else {
+            zi_dbfail(z, "begin");
+        }
+        goto out;
+    }
+    in_tx = true;
+    if ((rc = d->w_mark(c, &mark)) != 0) ZI_SFAIL("marking the change log", rc);
+    zf.want = rows->zone;
+    if (d->find_zone(c, rows->zone, zi_cb_zone, &zf) != 0) {
+        zi_dbfail(z, "finding the zone");
+        goto out;
+    }
+    if (zf.ambiguous) {
+        ZI_ERR(z, DC_DB_IMPORT_WRITE, shown, "More than one domains row is called '%s' (names that differ in case); nothing was written", rows->zone);
+        goto out;
+    }
+    if (!zf.found) {
+        ZI_ERR(z, DC_DB_IMPORT_SIGNER, shown, "Zone '%s' is not in the database: the signer signs a zone that exists; nothing was written", rows->zone);
+        goto out;
+    }
+    if (!zi_primary_type(zf.type)) {
+        ZI_ERR(z, DC_DB_IMPORT_SIGNER, shown, "Zone '%s' has domains.type %s: only a primary zone (NATIVE or MASTER) is signed; nothing was written", rows->zone, zf.type);
+        goto out;
+    }
+    res->domain_id = zf.id;
+    if (d->scan_records(c, &zf.id, zi_cb_rec, &db) != 0) {
+        zi_dbfail(z, "reading the records of the zone");
+        goto out;
+    }
+    if (db.oom) goto oom;
+    if (d->w_scan_auth(c, zf.id, zi_cb_auth, &au) != 0) {
+        zi_dbfail(z, "reading the authoritative flags of the zone");
+        goto out;
+    }
+    if (au.oom) goto oom;
+
+    /* the database's rows: DNSSEC records (deleted: a disabled one too), the apex SOA, the others (their ordername and auth are set below) */
+    del_ids = malloc((db.n ? db.n : 1) * sizeof(*del_ids));
+    va = malloc((db.n ? db.n : 1) * sizeof(*va));
+    ords = malloc((db.n ? db.n : 1) * sizeof(*ords));
+    if (!del_ids || !va || !ords) goto oom;
+    for (size_t i = 0; i < db.n; i++) {
+        const dbrec_t *r = &db.v[i];
+        if (zi_managed_type(r->type)) {
+            del_ids[ndel++] = r->id;
+            if (!r->disabled) va[nva++] = (rrv_t){ r->owner, r->type, r->content, r->ttl < 0 ? 0 : r->ttl, r->prio < 0 ? 0 : r->prio };
+        } else if (!r->disabled && strcmp(r->type, "SOA") == 0 && strcmp(r->owner, rows->zone) == 0) {
+            soa_d = r;
+            nsoa_d++;
+        }
+    }
+    if (nsoa_d != 1) {
+        ZI_ERR(z, DC_DB_IMPORT_SIGNER, shown, "Zone '%s' has %s SOA record at the apex in the database; nothing was written", rows->zone, nsoa_d ? "more than one" : "no");
+        goto out;
+    }
+
+    /* The zone must be what the file was made from.  Both sides are read the way the server reads a zone (the zone parser for the file, the loader's reader for
+     * the rows of the database, the DNSSEC records left out) and compared as sets of RRs in canonical form with the TTLs the server serves: how the text of a
+     * row is spelled (case of names and hex, an uncompressed AAAA, quoting of a TXT) does not matter, a real change does. */
+    switch (zx_read_zone_ex(d, c, z->si.has_ext, rows->zone, zf.id, &z->o.reader, ZX_PLAIN_DNSSEC, &pz, NULL)) {
+    case ZX_READ_OK: break;
+    case ZX_READ_OOM: goto oom;
+    case ZX_READ_DB:
+        zi_dbfail(z, "reading the zone");
+        goto out;
+    default:
+        ZI_ERR(z, DC_DB_IMPORT_VERIFY, shown, "Zone '%s': the loader's reader refuses the rows of the zone in the database: %s; nothing was written", rows->zone, pz ? pz->error : "?");
+        goto out;
+    }
+    if (!zi_crrs_from_arena(&pz->arena, &dbr, why, sizeof(why)) || !zi_crrs_from_arena(farena, &fir, why, sizeof(why))) {
+        ZI_ERR(z, DC_DB_IMPORT_SIGNER, shown, "Zone '%s': %s; nothing was written", rows->zone, why);
+        goto out;
+    }
+    if (!zi_crrs_equal(&dbr, &fir, why, sizeof(why))) {
+        ZI_ERR(z, DC_DB_IMPORT_CHANGED, shown, "Zone '%s' changed since the signed file was made (%s); nothing was written; sign the zone again", rows->zone, why);
+        status = ZI_CHANGED;
+        goto out;
+    }
+    /* the SOA: the same but for the serial, which grows (RFC 1982) */
+    {
+        uint8_t *ba = malloc(65535), *bb = malloc(65535);
+        uint32_t s_old = 0, s_new = 0;
+        long la = -1, lb = -1;
+        if (!ba || !bb) {
+            free(ba);
+            free(bb);
+            goto oom;
+        }
+        if (dbr.soa && fir.soa) {
+            la = zi_soa_canon(dbr.soa, ba, 65535, &s_old);
+            lb = zi_soa_canon(fir.soa, bb, 65535, &s_new);
+        }
+        bool same = la >= 0 && la == lb && memcmp(ba, bb, (size_t)la) == 0 && dbr.soa->ttl_value == fir.soa->ttl_value;
+        free(ba);
+        free(bb);
+        if (!same) {
+            ZI_ERR(z, DC_DB_IMPORT_CHANGED, shown, "Zone '%s' changed since the signed file was made (the SOA record differs by more than the serial); nothing was written; sign the zone again", rows->zone);
+            status = ZI_CHANGED;
+            goto out;
+        }
+        if (!zi_serial_gt(s_new, s_old)) {
+            ZI_ERR(z, DC_DB_IMPORT_CHANGED, shown, "Zone '%s': the SOA serial %u of the signed file does not grow past the serial %u in the database (RFC 1982), so the zone changed since the file was made; "
+                   "nothing was written; sign the zone again", rows->zone, (unsigned)s_new, (unsigned)s_old);
+            status = ZI_CHANGED;
+            goto out;
+        }
+        res->has_old_serial = true;
+        res->old_serial = s_old;
+        res->new_serial = s_new;
+        res->wrote_soa = true;
+        if (!(soa_new = zi_soa_with_serial(soa_d->content, s_new))) {
+            ZI_ERR(z, DC_DB_IMPORT_SIGNER, shown, "Zone '%s': the SOA record in the database has no serial field to change; nothing was written", rows->zone);
+            goto out;
+        }
+    }
+
+    /* compared: the file's arena, the zone read from the database and the sets made of them are not needed any more */
+    zi_crrs_free(&dbr);
+    zi_crrs_free(&fir);
+    pdns_zone_free(pz);
+    pz = NULL;
+    zone_arena_destroy(farena);
+    zone_arena_init(farena);
+
+    /* the RRsets of the DNSSEC records, for the report and the counts */
+    vb = malloc((nfdn ? nfdn : 1) * sizeof(*vb));
+    ins = malloc((nfdn ? nfdn : 1) * sizeof(*ins));
+    if (!vb || !ins) goto oom;
+    for (size_t k = 0; k < nfdn; k++) {
+        const db_record_row_t *r = &rows->rows[fdn[k]];
+        vb[k] = (rrv_t){ r->name, r->type, r->content ? r->content : "", r->ttl_null ? -1 : r->ttl, r->prio_null ? 0 : r->prio };
+        ins[k] = (db_ins_t){ r, !rows->auth || rows->auth[fdn[k]] != 0 };
+    }
+    if (!zi_diff(va, nva, vb, nfdn, z->o.report != NULL, &items, &nitems, res)) goto oom;
+    res->records_deleted = ndel;
+    res->records_inserted = nfdn;
+    res->has_expire = true;
+    res->min_expire = zi_time_near(exp_best, z->o.now ? z->o.now : time(NULL));
+
+    for (size_t i = 0; i < z->o.nfile_zones; i++)
+        if (zrows_names_equal(z->o.file_zones[i], rows->zone)) {
+            ZI_WARN(z, DC_DB_IMPORT_FILE_ZONE, shown, "Zone '%s' is also a file zone of the server configuration; the server serves the file zone, not the database zone", rows->zone);
+            break;
+        }
+
+    /* ---- writes ---- */
+    if (ndel && (rc = d->w_delete_dnssec(c, zf.id, del_ids, ndel)) != 0) ZI_SFAIL("deleting the DNSSEC records", rc);
+    if (nfdn && (rc = d->w_insert_dnssec(c, zf.id, ins, nfdn)) != 0) ZI_SFAIL("inserting the DNSSEC records", rc);
+    /* the apex SOA with its new serial, and the ordername and auth of the records that stay, as a presigned zone has them */
+    if ((rc = d->w_update_record(c, zf.id, soa_d->id, soa_new, rows->rows[isoa_f].ordername, !rows->auth || rows->auth[isoa_f] != 0)) != 0) ZI_SFAIL("updating the SOA record", rc);
+    res->rows_updated++;
+    for (size_t i = 0; i < db.n; i++) {
+        const dbrec_t *dr = &db.v[i];
+        if (dr->disabled || zi_managed_type(dr->type) || dr == soa_d || (strcmp(dr->type, "SOA") == 0 && strcmp(dr->owner, rows->zone) == 0)) continue;
+        /* an empty non-terminal the database holds (the loader derives the others): the ordername of its owner, and authoritative; every other record: the
+         * file's row of the same owner and type (a record the file does not have, because the export leaves it out, is left as it is) */
+        const bool ent = !dr->type[0];
+        fmrow_t key = { dr->owner, ent ? "" : dr->type, 0 };
+        const fmrow_t *hit = bsearch(&key, ent ? fe : fm, ent ? nfe : nfm, sizeof(*fm), zi_cmp_fmrow);
+        if (!hit) continue;
+        const db_record_row_t *fr = &rows->rows[hit->idx];
+        const bool fauth = ent || !rows->auth || rows->auth[hit->idx] != 0;
+        const dbauth_t *ca = bsearch(&dr->id, au.v, au.n, sizeof(*au.v), zi_cmp_auth_id);
+        if (zi_same_text(fr->ordername, dr->ordername) && fauth == (ca ? ca->auth : true)) continue;
+        ords[nords++] = (db_order_t){ dr->id, fr->ordername, fauth };
+    }
+    if (nords && (rc = d->w_update_orders(c, zf.id, ords, nords)) != 0) ZI_SFAIL("updating ordername and auth", rc);
+    res->rows_updated += nords;
+
+    /* the metadata the signer owns */
+    if (d->w_delete_meta(c, zf.id, "PRESIGNED") != 0 || d->w_delete_meta(c, zf.id, "NSEC3PARAM") != 0 || d->w_delete_meta(c, zf.id, "X-KARIDNS-SIGNER") != 0) {
+        zi_dbfail(z, "deleting metadata");
+        goto out;
+    }
+    if (d->w_insert_meta(c, zf.id, "PRESIGNED", "1") != 0 || (rows->nsec3param && d->w_insert_meta(c, zf.id, "NSEC3PARAM", rows->nsec3param) != 0) ||
+        d->w_insert_meta(c, zf.id, "X-KARIDNS-SIGNER", "1") != 0) {
+        zi_dbfail(z, "inserting metadata");
+        goto out;
+    }
+    if (z->o.reload) {
+        if (z->si.has_reload_requests) {
+            if (d->w_request_reload(c, rows->zone, false) != 0) {
+                zi_dbfail(z, "adding a reload request");
+                goto out;
+            }
+        } else {
+            ZI_WARN(z, DC_DB_IMPORT_NO_RELOAD, shown, "A reload request was asked for, but the database has no karidns_reload_requests table (PostgreSQL, "
+                    "db/karidns_ext.pgsql.sql); a running server notices the change through the change log");
+        }
+    }
+    if (!z->o.report) {
+        /* no report names the RRsets (items point into these): the rest of the memory goes before the zone is read back */
+        free(ins); ins = NULL;
+        free(ords); ords = NULL;
+        free(vb); vb = NULL;
+        free(va); va = NULL;
+        free(del_ids); del_ids = NULL;
+        free(fm); fm = NULL;
+        free(fe); fe = NULL;
+        free(fdn); fdn = NULL;
+        free(au.v); au.v = NULL;
+        zi_recs_free(&db);
+        soa_d = NULL;
+        zrows_free(rows);
+    }
+    if (!zi_verify(z, zone, zf.id, shown, false, 0, res)) goto out;
+    if (d->w_write_id(c, mark, &res->write_id) != 0) {
+        zi_dbfail(z, "reading the id of the write");
+        goto out;
+    }
+    res->has_write_id = true;
+    if (z->o.dry_run) {
+        status = ZI_OK;
+    } else {
+        in_tx = false;                                  /* commit ends the transaction whatever happens */
+        if ((rc = d->w_commit(c)) != 0) ZI_SFAIL("commit", rc);
+        res->committed = true;
+        status = ZI_OK;
+    }
+    if (z->o.report)
+        for (size_t i = 0; i < nitems; i++) z->o.report(z->o.report_ud, items[i].what, items[i].owner, items[i].type);
+    {
+        char ex[40] = "";
+        struct tm tmv;
+        time_t et = res->min_expire;
+        if (gmtime_r(&et, &tmv)) strftime(ex, sizeof(ex), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+        zmsg_emit(&z->msg, DIAG_INFO, z->o.dry_run ? DC_DB_IMPORT_DRY_RUN : DC_DB_IMPORT_DONE, shown,
+                  "Zone '%s' signed: SOA serial %u -> %u, %zu DNSSEC record(s) written, %zu removed, %zu record(s) updated (ordername, auth); the earliest RRSIG expires %s%s",
+                  zone, (unsigned)res->old_serial, (unsigned)res->new_serial, res->records_inserted, res->records_deleted, res->rows_updated, ex,
+                  z->o.dry_run ? "; dry run, nothing was written" : "");
+    }
+    goto out;
+oom:
+    ZI_ERR(z, DC_INTERNAL_OOM, shown, "out of memory");
+out:
+    if (in_tx) d->w_rollback(c);
+    pdns_zone_free(pz);
+    zi_crrs_free(&dbr);
+    zi_crrs_free(&fir);
+    free(ins);
+    free(ords);
+    free(soa_new);
+    free(items);
+    free(vb);
+    free(va);
+    free(del_ids);
+    free(fm);
+    free(fe);
+    free(fdn);
+    free(au.v);
+    free(zf.name);
+    free(zf.type);
+    free(zf.soa);
+    zi_recs_free(&db);
+    return status;
+}
+
 /* An arena that was loaded: check it, make the rows, write them.  The caller frees arena. */
 static int zi_import_arena(zi_t *z, zone_arena_t *arena, const char *apex, const zi_text_t *t, bool tinydns, const zrows_info_t *info, zi_result_t *res) {
     zrows_t rows;
@@ -910,7 +1564,7 @@ static int zi_import_arena(zi_t *z, zone_arena_t *arena, const char *apex, const
     if (zi_check_zone(z, arena, apex, t->shown, t->text, tinydns, info, &rows, res)) {
         snprintf(res->zone, sizeof(res->zone), "%s", rows.zone);
         res->dry_run = z->o.dry_run;
-        status = zi_apply(z, &rows, t->shown, res);
+        status = z->o.signer ? zi_apply_signer(z, &rows, arena, t->shown, res) : zi_apply(z, &rows, t->shown, res);
     } else if (rows.zone[0]) {
         snprintf(res->zone, sizeof(res->zone), "%s", rows.zone);
     }
@@ -946,6 +1600,13 @@ int zi_import_zone(zi_t *z, const zi_input_t *in, const char *zone, zi_result_t 
         ZI_ERR(z, info.include_refused ? DC_ZONE_INCLUDE_STDIN : DC_ZONE_SYNTAX, t.shown, "%s",
                info.include_refused ? "$INCLUDE is refused in a zone read from standard input" : err);
     } else {
+        /* The arena has its own copy of the text, and the checks of a BIND zone do not read the raw text (zone_lint_in_t.raw_text is for tinydns): a signed zone is
+         * big, so the second copy goes now when the signer imports it. */
+        if (z->o.signer) {
+            free(t.text);
+            t.text = NULL;
+            t.len = 0;
+        }
         status = zi_import_arena(z, &arena, apex, &t, false, &info, res);
         zone_arena_destroy(&arena);
     }
@@ -955,6 +1616,10 @@ int zi_import_zone(zi_t *z, const zi_input_t *in, const char *zone, zi_result_t 
 
 int zi_import_tinydns(zi_t *z, const zi_input_t *in, const char *zone, zi_result_fn fn, void *ud) {
     char want[DNS_NAME_TEXT_SIZE];
+    if (z->o.signer) {
+        ZI_ERR(z, DC_DB_IMPORT_OPTION, NULL, "a signer import takes a zone file, not a tinydns data file");
+        return ZI_FAIL;
+    }
     if (zone && !zi_apex_name(zone, want)) {
         ZI_ERR(z, DC_DB_IMPORT_ZONE_NAME, NULL, "'%.100s' is not a valid zone name", zone);
         return ZI_FAIL;

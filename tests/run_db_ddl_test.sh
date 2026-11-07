@@ -261,8 +261,8 @@ else
         [ "$(pq "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND t.tgname LIKE 'karidns_audit%' AND c.relnamespace = current_schema()::regnamespace")" = "0" ] &&
             [ "$(pq "SELECT count(*) FROM pg_class WHERE relrowsecurity AND relnamespace IN (current_schema()::regnamespace, 'karidns_auth'::regnamespace)")" = "0" ] &&
             pass "the file attaches no audit trigger to the PowerDNS tables and enables no row level security" || fail "audit triggers or RLS enabled by the ext file"
-        [ "$(pq "SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE p.polname LIKE 'karidns_rls_%' AND c.relnamespace IN (current_schema()::regnamespace, 'karidns_auth'::regnamespace)")" = "52" ] &&
-            pass "...but creates its 52 policies (31 on the schema's tables, 21 on karidns_auth), inactive while RLS is off" || fail "the RLS policies of the ext file"
+        [ "$(pq "SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE p.polname LIKE 'karidns_rls_%' AND c.relnamespace IN (current_schema()::regnamespace, 'karidns_auth'::regnamespace)")" = "55" ] &&
+            pass "...but creates its 55 policies (34 on the schema's tables, 21 on karidns_auth), inactive while RLS is off" || fail "the RLS policies of the ext file"
         [ "$(pq "SELECT count(*) FROM pg_proc WHERE pronamespace = 'karidns_auth'::regnamespace AND prokind = 'f' AND proconfig IS NULL")" = "0" ] && pass "every karidns_auth function pins its search_path" || fail "unpinned karidns_auth functions"
         [ "$(pq "SELECT count(*) FROM pg_proc p JOIN pg_trigger t ON t.tgfoid = p.oid WHERE p.pronamespace = 'karidns_auth'::regnamespace AND NOT p.prosecdef AND p.proname <> 'audit_zone_fn'")" = "0" ] &&
             pass "the trigger functions of karidns_auth are SECURITY DEFINER" || fail "a karidns_auth trigger function is not SECURITY DEFINER"

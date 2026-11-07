@@ -19,8 +19,9 @@
 -- What it does:
 --   * role: every earlier privilege of the role on the tables and sequences of the schema is revoked first, then: USAGE on the schema and on karidns_auth.
 --     Data schema: SELECT, INSERT, UPDATE, DELETE on domains, records, domainmetadata, karidns_record_tags, karidns_record_tinydns, karidns_zone_tagdefs,
---     karidns_domain_views; SELECT and INSERT on karidns_reload_requests (the rows it sees and inserts are those of the zones it has a grant on); SELECT on
---     karidns_schema_version; on cryptokeys only the COLUMN privilege SELECT (id, domain_id, flags, active, published), never `content`; USAGE on the
+--     karidns_domain_views; SELECT and INSERT on karidns_reload_requests (the rows it sees and inserts are those of the zones it has a grant on); SELECT and INSERT on
+--     karidns_key_requests (a global master or the domain master of the zone files a request for keys; the signer answers it); SELECT on karidns_signer_state
+--     (the signer's schedule and last error of the zones it has a grant on; the signer writes it); SELECT on karidns_schema_version; on cryptokeys only the COLUMN privilege SELECT (id, domain_id, flags, active, published), never `content`; USAGE on the
 --     sequences behind the serial columns.  Nothing on karidns_changes: the change log and the prune of the reload requests are written by the
 --     triggers of the data tables, which run as the owner.  karidns_auth: SELECT, INSERT, UPDATE, DELETE on principals, memberships, rr_policies, grants and
 --     credentials (the only role that reads them); SELECT on principal_closure, audit_log and schema_version; EXECUTE on the RLS functions and
@@ -28,7 +29,7 @@
 --   * the role's name is added to karidns_auth.audit_restricted_roles (it cannot turn the detail of the audit log off) and karidns_auth.api_roles (the trigger
 --     on grants applies the no-escalation rules to its sessions, and to the sessions of the roles that are members of it).
 --   * RLS is switched on (ALTER TABLE ... ENABLE ROW LEVEL SECURITY; the table owner is exempt) for domains, records, domainmetadata, cryptokeys,
---     karidns_record_tags, karidns_record_tinydns, karidns_zone_tagdefs, karidns_domain_views, karidns_reload_requests of the schema and for principals,
+--     karidns_record_tags, karidns_record_tinydns, karidns_zone_tagdefs, karidns_domain_views, karidns_reload_requests, karidns_key_requests, karidns_signer_state of the schema and for principals,
 --     credentials, memberships, rr_policies, grants and audit_log of karidns_auth.  The policies themselves are created by db/karidns_ext.pgsql.sql; the role
 --     karidns_rls_trusted gets a policy `USING (true) WITH CHECK (true)` on each table.  The audit triggers are attached (karidns_auth.enable_audit).
 --
@@ -64,6 +65,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON :"schema".domains, :"schema".records, :"
   :"schema".karidns_record_tinydns, :"schema".karidns_zone_tagdefs, :"schema".karidns_domain_views TO :"role";
 GRANT SELECT, INSERT ON :"schema".karidns_reload_requests TO :"role";
 GRANT SELECT ON :"schema".karidns_schema_version TO :"role";
+GRANT SELECT ON :"schema".karidns_key_requests TO :"role";
+GRANT INSERT (domain_id, kind, algorithm, bits, key_type, nsec, requested_by) ON :"schema".karidns_key_requests TO :"role";     -- a request, not its answer (state, message, done_at, created_at keep their defaults)
+GRANT SELECT ON :"schema".karidns_signer_state TO :"role";                         -- when a zone was signed, and why it was not (the signer owns the table)
 GRANT SELECT (id, domain_id, flags, active, published) ON :"schema".cryptokeys TO :"role";
 
 -- the sequences behind the serial columns of the tables the role inserts into (karidns_reload_requests has an identity column: no grant needed)
@@ -73,7 +77,7 @@ SELECT format('GRANT USAGE ON SEQUENCE %I.%I TO %I', n.nspname, s.relname, :'rol
   JOIN pg_depend d ON d.objid = s.oid AND d.deptype IN ('a', 'i')
   JOIN pg_class t ON t.oid = d.refobjid AND t.relnamespace = n.oid
  WHERE s.relkind = 'S' AND n.nspname = :'schema'
-   AND t.relname IN ('domains', 'records', 'domainmetadata', 'karidns_zone_tagdefs')
+   AND t.relname IN ('domains', 'records', 'domainmetadata', 'karidns_zone_tagdefs', 'karidns_key_requests')
 \gexec
 
 -- karidns_auth: a clean slate first, then exactly the rights below

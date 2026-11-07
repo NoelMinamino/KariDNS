@@ -95,7 +95,8 @@ jobs:
             set -e
             # sqlite3: libsqlite3 for the SQLite3 driver; postgresql17-client: libpq for the PostgreSQL driver
             # (the same version as the coverage job of ci.yml; build_pkg.sh takes the dependency from the libpq it linked)
-            pkg install -y pkgconf libidn2 sqlite3 postgresql17-client
+            pkg install -y pkgconf libidn2 sqlite3 postgresql17-client node24 npm-node24 bind-tools
+            # (node24, npm-node24 and bind-tools: for the package karidns-signer, built below)
             # the binaries must link the base system OpenSSL (see the step above)
             if pkg info -e openssl; then pkg delete -fy openssl; fi
             mkdir -p dist-db
@@ -104,6 +105,7 @@ jobs:
             ./packaging/freebsd/build_pkg.sh --db sqlite3 "$TAG_VER" ./dist-db
             ./packaging/freebsd/build_pkg.sh --db postgresql "$TAG_VER" ./dist-db
             ./packaging/freebsd/build_pkg.sh --db both "$TAG_VER" ./dist-db
+            sh packaging/freebsd/build_signer_pkg.sh "$TAG_VER" ./dist-db
             ls -l dist-db
 
             echo "::group::🧪 [Verification] Test installing the database packages on ${{ matrix.release }}"
@@ -130,6 +132,17 @@ jobs:
               fi
               pkg delete -y "$name"
             done
+            # karidns-signer: needs karidns-zone from a database package; the wrapper, the program with its dependency, the rc script and the user
+            pkg add dist-db/karidns-sqlite3-[0-9]*.pkg
+            pkg add dist-db/karidns-signer-[0-9]*.pkg
+            pkg info -d karidns-signer
+            test -x /usr/local/sbin/karidns-signer
+            test -x /usr/local/libexec/karidns-signer/bin/karidns-signer.js
+            test -d /usr/local/libexec/karidns-signer/node_modules/pg
+            test -x /usr/local/etc/rc.d/karidns_signer
+            pw usershow karidns-signer > /dev/null
+            /usr/local/sbin/karidns-signer --version
+            pkg delete -y karidns-signer karidns-sqlite3
             echo "::endgroup::"
 
       - name: Upload FreeBSD ${{ matrix.release }} Database Package Artifacts

@@ -3,18 +3,19 @@
 # (s = 1: the zone of rank r is asked for 1/r as often as the first), each answer checked against what the database holds.
 #
 #   cache_stress.pl HOST PORT NZONES NHOSTS COUNT SEED       random queries
-#   cache_stress.pl HOST PORT NZONES NHOSTS sweep            one query for every zone, in order
+#   cache_stress.pl HOST PORT NZONES NHOSTS sweep            one query for every zone, in order; a SERVFAIL is asked again (10 times, 100 ms apart)
 #
 # Zone z (0-based) is "zNNNN.test." (4 digits); its host hK (K 0-based) has the address 10.(z % 200 + 1).(K / 200).(K % 200 + 1), the same
 # arithmetic as in the SQL that fills the database.  The answer is: ok (NOERROR, one A record with that address), wrong (anything else
 # that is an answer: this is a failure of the test), notready (SERVFAIL, which is what a query gets when its zone could not be had in time),
-# timeout (no answer in 5 s).  Prints one line: "ok=N wrong=N notready=N timeout=N".
+# timeout (no answer in 5 s).  Prints one line: "ok=N wrong=N notready=N timeout=N retried=N" (retried: the sweep's repeated questions).
 use strict;
 use warnings;
 use IO::Socket::INET;
 use IO::Select;
 use Time::HiRes qw(time usleep);
 my $delay_us = ($ENV{CACHE_STRESS_DELAY_MS} || 0) * 1000;           # a pause between two queries of this client
+my $sweep_retries = 10;                                               # sweep: a SERVFAIL (shed, not ready) is asked again this often, 100 ms apart
 
 my ($host, $port, $nz, $nh, $count_or_sweep, $seed) = @ARGV;
 die "usage\n" unless defined $nh;
@@ -47,32 +48,39 @@ sub query {
     return $q . pack('Cnn', 0, 1, 1);
 }
 
-my %n = (ok => 0, wrong => 0, notready => 0, timeout => 0);
+my %n = (ok => 0, wrong => 0, notready => 0, timeout => 0, retried => 0);
 for my $i (0 .. $count - 1) {
     my $z = $sweep ? $i : pick_zone();
     my $k = $sweep ? 0 : int(rand($nh));
     my $name = sprintf('h%d.z%04d.test', $k, $z);
     my $want = sprintf('10.%d.%d.%d', $z % 200 + 1, int($k / 200), $k % 200 + 1);
     usleep($delay_us) if $delay_us;
-    my $id = int(rand(65536));
-    my $q = query($id, $name);
-    my $got;
-    for my $try (1 .. 2) {
-        send($sock, $q, 0);
-        my $deadline = time() + 5;
-        while (time() < $deadline) {
-            next unless $sel->can_read($deadline - time());
-            my $r;
-            next unless defined recv($sock, $r, 4096, 0);
-            next unless length($r) >= 12 && unpack('n', $r) == $id;
-            $got = $r;
-            last;
+    my ($got, $rcode, $an);
+    for my $again (0 .. ($sweep ? $sweep_retries : 0)) {
+        if ($again) { $n{retried}++; usleep(100_000); }
+        my $id = int(rand(65536));
+        my $q = query($id, $name);
+        $got = undef;
+        for my $try (1 .. 2) {
+            send($sock, $q, 0);
+            my $deadline = time() + 5;
+            while (time() < $deadline) {
+                next unless $sel->can_read($deadline - time());
+                my $r;
+                next unless defined recv($sock, $r, 4096, 0);
+                next unless length($r) >= 12 && unpack('n', $r) == $id;
+                $got = $r;
+                last;
+            }
+            last if defined $got;
         }
-        last if defined $got;
+        last unless defined $got;
+        my $fl;
+        ($fl, undef, $an) = unpack('x2nnn', $got);
+        $rcode = $fl & 0xF;
+        last if $rcode != 2;
     }
     if (!defined $got) { $n{timeout}++; next; }
-    my ($fl, $qd, $an) = unpack('x2nnn', $got);
-    my $rcode = $fl & 0xF;
     if ($rcode == 2) { $n{notready}++; next; }
     my $ip = '';
     if ($rcode == 0 && $an == 1) {
@@ -86,4 +94,4 @@ for my $i (0 .. $count - 1) {
     }
     if ($ip eq $want) { $n{ok}++ } else { $n{wrong}++; print STDERR "wrong answer for $name: rcode $rcode an $an ip '$ip' want $want\n"; }
 }
-printf("ok=%d wrong=%d notready=%d timeout=%d\n", @n{qw(ok wrong notready timeout)});
+printf("ok=%d wrong=%d notready=%d timeout=%d retried=%d\n", @n{qw(ok wrong notready timeout retried)});

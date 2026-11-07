@@ -17,6 +17,9 @@
 #     database whose rows hold line feeds, comment characters and directives.
 #  7. the round trip: file -> import -> export -> import -> export for the signed, tagged, tinydns, $GENERATE and $INCLUDE zones of tests/: the two
 #     exports are byte for byte the same, and the records are those of the original (test_zone_text --dump).
+#  8. import --signer (0.6.0 item C): the usage errors, a signed zone written over an unsigned one (serial, DNSSEC rows, ordername / auth, the metadata),
+#     the --json result (new serial, counts, earliest RRSIG expiration, write id), standard input, a dry run, a zone that changed since the file was made
+#     (exit status 3, nothing written), a file that is not signed, and, with BIND's dnssec-keygen / dnssec-signzone / dnssec-verify, a real signed zone.
 #
 # Environment: ZONE (default ./karidns-zone; ./karidns-zone-asan runs the ASan build), TZT (./test_zone_text).  SKIP (exit 0, with the reason)
 # without the binary or the sqlite3 command line tool, or with a karidns-zone without the SQLite3 driver.  The json part SKIPs without perl
@@ -102,6 +105,16 @@ run "--dir on import" 2 import --no-config --sqlite3 "$DB" --dir "$T" example.te
 run "--force on import" 2 import --no-config --sqlite3 "$DB" --force example.test "$T/ex.zone"
 types65=$(i=0; while [ $i -lt 65 ]; do printf 'A,'; i=$((i + 1)); done)A
 run "more than 64 types" 2 import --no-config --sqlite3 "$DB" --types "$types65" example.test "$T/ex.zone"
+run "--signer with --mode" 2 import --signer --mode merge --no-config --sqlite3 "$DB" example.test "$T/ex.zone"
+errhas "...says which options do not go with it" "cannot be used with --mode, --types, --serial"
+run "--signer with --types" 2 import --signer --types RRSIG --no-config --sqlite3 "$DB" example.test "$T/ex.zone"
+run "--signer with --serial" 2 import --signer --serial increment --no-config --sqlite3 "$DB" example.test "$T/ex.zone"
+run "--signer with --type" 2 import --signer --type MASTER --no-config --sqlite3 "$DB" example.test "$T/ex.zone"
+run "--signer with --view" 2 import --signer --view v --no-config --sqlite3 "$DB" example.test "$T/ex.zone"
+run "--signer with --all" 2 import --signer --all --no-config --sqlite3 "$DB" "$T/ex.zone"
+run "--signer with a tinydns data file name" 2 import --signer --no-config --sqlite3 "$DB" example.test "$T/data.tinydns"
+run "--signer with --format tinydns" 2 import --signer --format tinydns --no-config --sqlite3 "$DB" example.test "$T/ex.zone"
+run "--mode on export --signer" 2 export --signer --mode merge --no-config --sqlite3 "$DB" example.test
 run "export without a zone" 2 export --no-config --sqlite3 "$DB"
 run "export with three arguments" 2 export --no-config --sqlite3 "$DB" a b c
 run "export --all without --dir" 2 export --all --no-config --sqlite3 "$DB"
@@ -131,6 +144,7 @@ same "...the dry run wrote nothing" "$(q "SELECT count(*) FROM domains")" 0
 printf 'Zexample.test:ns1.example.test:hostmaster.example.test:10:7200:3600:1209600:300:300\n&example.test::ns1.example.test:300\n+ns1.example.test:192.0.2.1:300\n+www.example.test:192.0.2.2:300\n' > "$T/data"
 run "help example: import --all a tinydns data file" 0 import --all --no-config --sqlite3 "$DB" "$T/data"
 same "...the zone is in the database" "$(q "SELECT count(*) FROM domains")" 1
+run "help example: import --signer (a configuration that is not there)" 1 import --signer --json -c "$T/none.conf" example.test "$T/ex.zone"
 run "help example: export to standard output" 0 export --no-config --sqlite3 "$DB" example.test
 outhas "...the zone text (a data file: the zone came from one)" "+ns1.example.test.:192.0.2.1"
 run "help example: export --all --dir" 0 export --all --dir "$T/ex" --no-config --sqlite3 "$DB"
@@ -768,6 +782,253 @@ sig=$(q "SELECT count(*) FROM records WHERE type = 'RRSIG'")
 "$ZONE" export --no-config --sqlite3 "$DB" example.com > "$T/sig.out" 2>/dev/null
 [ "$sig" -gt 0 ] && [ "$(grep -c ' RRSIG ' "$T/sig.out")" -gt 0 ] && ok "signed_nsec3: the signatures are in the database and in the export" || bad "signed_nsec3: no RRSIG ($sig in the database)"
 grep -q ' NSEC3PARAM ' "$T/sig.out" && ok "signed_nsec3: NSEC3PARAM is in the export (the file alone can serve the zone)" || bad "signed_nsec3: no NSEC3PARAM in the export"
+
+# ================================================================ 8. import --signer
+echo "== import --signer"
+newdb "$DB"
+IN=/dev/null
+mkzone "$T/sg.zone" sig.test. 10 'www IN A 192.0.2.2
+sub IN NS ns.sub.example.net.'
+expect "an unsigned zone, serial 10" 0 import sig.test "$T/sg.zone"
+mksigned() {    # mksigned FILE SERIAL EXPIRE: the zone signed (an NSEC chain, fake signatures)
+    sig=AwEAAcvPyrbeMXE2CxVFJhnpJAWoJJJMiqpbRVvIgN0o
+    cat > "$1" <<EOF
+\$ORIGIN sig.test.
+\$TTL 300
+@ IN SOA ns1 hostmaster $2 7200 3600 1209600 300
+@ IN NS ns1
+@ IN DNSKEY 257 3 8 $sig
+@ IN NSEC ns1.sig.test. NS SOA RRSIG NSEC DNSKEY
+ns1 IN A 192.0.2.1
+ns1 IN NSEC sub.sig.test. A RRSIG NSEC
+sub IN NS ns.sub.example.net.
+sub IN NSEC www.sig.test. NS RRSIG NSEC
+www IN A 192.0.2.2
+www IN NSEC sig.test. A RRSIG NSEC
+@ IN RRSIG SOA 8 2 300 $3 20200101000000 12345 sig.test. $sig
+@ IN RRSIG NS 8 2 300 20300601000000 20200101000000 12345 sig.test. $sig
+@ IN RRSIG DNSKEY 8 2 300 20300601000000 20200101000000 12345 sig.test. $sig
+@ IN RRSIG NSEC 8 2 300 20300601000000 20200101000000 12345 sig.test. $sig
+ns1 IN RRSIG A 8 3 300 20300601000000 20200101000000 12345 sig.test. $sig
+ns1 IN RRSIG NSEC 8 3 300 20300601000000 20200101000000 12345 sig.test. $sig
+sub IN RRSIG NSEC 8 3 300 20300601000000 20200101000000 12345 sig.test. $sig
+www IN RRSIG A 8 3 300 20300601000000 20200101000000 12345 sig.test. $sig
+www IN RRSIG NSEC 8 3 300 20300601000000 20200101000000 12345 sig.test. $sig
+EOF
+}
+mksigned "$T/sg11.zone" 11 20300101000000
+CHG0=$(chg)
+expect "--signer --dry-run" 0 import --signer --dry-run sig.test "$T/sg11.zone"
+outhas "...says it is a dry run" "dry run, nothing was written"
+same "...and writes nothing (serial 10, no RRSIG)" "$(serial sig.test)|$(q "SELECT count(*) FROM records WHERE type = 'RRSIG'")|$(chg)" "10|0|$CHG0"
+expect "--signer --dry-run lists the RRsets it adds (--verbose style)" 0 import --signer --dry-run --verbose sig.test "$T/sg11.zone"
+errhas "...an RRSIG RRset" "add sig.test RRSIG"
+expect "import --signer" 0 import --signer --json sig.test "$T/sg11.zone"
+jvalid "import --signer --json"
+jget "...the result is ok" "result" ok
+jget "...the new serial" "signer.serial" 11
+jget "...the old serial" "signer.old_serial" 10
+jget "...committed, not changed" "signer.committed" true
+jget "...the DNSSEC records written (9 RRSIG and the DNSKEY)" "signer.dnssec_records_written" 10
+jget "...none removed" "signer.dnssec_records_removed" 0
+jget "...the ordername and auth updates (the 5 records that stay)" "signer.records_updated" 5
+jget "...the earliest RRSIG expiration (2030-01-01T00:00:00Z)" "signer.earliest_expire" 2030-01-01T00:00:00Z
+jget "...and its unix time" "signer.earliest_expire_epoch" 1893456000
+jget "...the write id: no transaction id on SQLite3" "signer.write_id.xid" null
+LASTSEQ=$(q "SELECT max(seq) FROM karidns_changes")
+jget "...the last change log row of the write" "signer.write_id.seq_last" "$LASTSEQ"
+if [ $HAVE_JSON = 1 ]; then
+    FIRST=$($JC "$OUT" get signer.write_id.seq_first 2>/dev/null)
+    same "...and the first one: the rows between them are all the write's ($CHG0 before)" "$((FIRST - 1))" "$CHG0"
+fi
+same "the serial is 11" "$(serial sig.test)" 11
+same "the RRSIG, DNSKEY and NSEC rows: 9, 1, none (the presigned layout)" "$(q "SELECT count(*) FROM records WHERE type = 'RRSIG'")|$(q "SELECT count(*) FROM records WHERE type = 'DNSKEY'")|$(q "SELECT count(*) FROM records WHERE type IN ('NSEC', 'NSEC3', 'NSEC3PARAM')")" "9|1|0"
+same "ordername (the NSEC zone's reversed relative name) and auth (0 at the delegation)" "$(q "SELECT ordername FROM records WHERE name = 'www.sig.test' AND type = 'A'")|$(q "SELECT CAST(auth AS integer) FROM records WHERE name = 'sub.sig.test' AND type = 'NS'")" "www|0"
+same "the metadata: PRESIGNED and X-KARIDNS-SIGNER, no NSEC3PARAM" "$(q "SELECT group_concat(kind || '=' || content, ',') FROM (SELECT kind, content FROM domainmetadata ORDER BY kind)")" "PRESIGNED=1,X-KARIDNS-SIGNER=1"
+kz export sig.test
+outhas "the zone exports as the signed zone" " DNSKEY "
+mksigned "$T/sg12.zone" 12 20300301000000
+IN="$T/sg12.zone"
+expect "--signer from standard input (a re-signed zone)" 0 import --signer --verbose sig.test -
+IN=/dev/null
+same "...serial 12, and the signatures were replaced" "$(serial sig.test)|$(q "SELECT count(*) FROM records WHERE type = 'RRSIG'")" "12|9"
+errhas "...the RRSIG RRsets are listed as replaced" "replace sig.test RRSIG"
+expect "the same file again: the serial does not grow, so the zone changed (exit status 3)" 3 import --signer --json sig.test "$T/sg12.zone"
+jvalid "...the document"
+jget "...the result is fail" "result" fail
+jhas "...with db.import.changed" db.import.changed
+jget "...and changed: true" "signer.changed" true
+same "...nothing was written" "$(serial sig.test)" 12
+mksigned "$T/sg13.zone" 13 20300301000000
+q "UPDATE records SET content = '192.0.2.99' WHERE name = 'www.sig.test' AND type = 'A'"
+expect "a record that changed since the file was made: exit status 3" 3 import --signer sig.test "$T/sg13.zone"
+errhas "...names it" "www.sig.test"
+q "UPDATE records SET content = '192.0.2.2' WHERE name = 'www.sig.test' AND type = 'A'"
+expect "...and with the record as it was, the file is taken" 0 import --signer sig.test "$T/sg13.zone"
+printf '$ORIGIN sig.test.\n$TTL 300\n@ IN SOA ns1 hostmaster 14 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\nwww IN A 192.0.2.2\nsub IN NS ns.sub.example.net.\n' > "$T/sg14.zone"
+expect "a file that is not signed is refused" 1 import --signer sig.test "$T/sg14.zone"
+errhas "...says so" "not a signed zone"
+expect "a zone that is not in the database is refused" 1 import --signer nosuch.test "$T/sg13.zone"
+same "...nothing changed (serial 13)" "$(serial sig.test)" 13
+# another writer holds the database: "busy" is its own exit status (4), nothing is written
+mksigned "$T/sg15.zone" 14 20300301000000
+# (the tool waits 5 s for a lock before it gives up: the other writer holds it for 12 s, long enough for two attempts)
+printf 'BEGIN IMMEDIATE;\n.system sleep 12\nCOMMIT;\n' > "$T/hold.sql"
+sqlite3 "$DB" < "$T/hold.sql" > /dev/null 2>&1 &
+HOLD=$!
+sleep 1
+CHG1=$(chg)
+expect "import --signer while another writer holds the database: busy, exit status 4 (not 1)" 4 import --signer --json sig.test "$T/sg15.zone"
+jvalid "...the document"
+jhas "...with db.import.busy" db.import.busy
+jget "...signer.busy is true" "signer.busy" true
+jget "...nothing was committed" "signer.committed" false
+expect "...and a normal import that is busy is still exit status 1" 1 import --serial keep sig.test "$T/sg.zone"
+wait $HOLD 2>/dev/null
+same "...nothing was written (serial 13, the change log as it was)" "$(serial sig.test)|$(chg)" "13|$CHG1"
+expect "the signer's import goes through again once the database is free" 0 import --signer sig.test "$T/sg15.zone"
+same "...serial 14" "$(serial sig.test)" 14
+
+# a normal import into a zone the signer signs: the data is replaced, the DNSSEC records and the signer's metadata stay
+q "INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'NSEC3PARAM', '1 0 0 -' FROM domains WHERE name = 'sig.test'"
+DNSSEC0=$(q "SELECT count(*) FROM records WHERE type IN ('RRSIG', 'DNSKEY', 'NSEC', 'NSEC3', 'NSEC3PARAM', 'CDS', 'CDNSKEY')")
+mkzone "$T/sg20.zone" sig.test. 30 'www IN A 192.0.2.77
+new IN A 192.0.2.78'
+expect "a normal import into the signer's zone" 0 import sig.test "$T/sg20.zone"
+if grep -q "signed by karidns-signer" "$OUT" "$ERR"; then ok "...the note says the zone is signed by karidns-signer (db.import.signer-zone)"; else bad "...no note" "$(cat "$ERR"; head -c 400 "$OUT")"; fi
+same "...the data is replaced (www, new; serial 30)" "$(q "SELECT group_concat(content, ',') FROM (SELECT content FROM records WHERE name IN ('www.sig.test', 'new.sig.test') AND type = 'A' ORDER BY name)")|$(serial sig.test)" "192.0.2.78,192.0.2.77|30"
+same "...the DNSSEC records stay" "$(q "SELECT count(*) FROM records WHERE type IN ('RRSIG', 'DNSKEY', 'NSEC', 'NSEC3', 'NSEC3PARAM', 'CDS', 'CDNSKEY')")" "$DNSSEC0"
+same "...and the metadata PRESIGNED, NSEC3PARAM and X-KARIDNS-SIGNER" "$(q "SELECT group_concat(kind, ',') FROM (SELECT kind FROM domainmetadata ORDER BY kind)")" "NSEC3PARAM,PRESIGNED,X-KARIDNS-SIGNER"
+mksigned "$T/sg21.zone" 31 20300501000000
+expect "a signed file given to a normal import: its DNSSEC records are ignored, with a count" 0 import --mode merge sig.test "$T/sg21.zone"
+if grep -q "DNSSEC record(s) of the input were ignored" "$OUT" "$ERR"; then ok "...the note counts them"; else bad "...no count" "$(cat "$ERR"; head -c 400 "$OUT")"; fi
+same "...the old signatures stay" "$(q "SELECT count(*) FROM records WHERE type = 'RRSIG' AND content LIKE '%20300501000000%'")|$(q "SELECT count(*) FROM records WHERE type IN ('RRSIG', 'DNSKEY', 'NSEC', 'NSEC3', 'NSEC3PARAM', 'CDS', 'CDNSKEY')")" "0|$DNSSEC0"
+
+# BIND's tools: a zone exported from the database, signed (NSEC3, KSK + ZSK), written back, exported, verified
+if command -v dnssec-keygen >/dev/null 2>&1 && command -v dnssec-signzone >/dev/null 2>&1; then
+    newdb "$DB"
+    mkdir "$T/keys"
+    printf '$ORIGIN e2e.test.\n$TTL 300\n@ IN SOA ns1 hostmaster 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\nwww IN A 192.0.2.2\na.b.c IN A 192.0.2.3\nsub IN NS ns.sub.example.net.\nmail IN MX 10 www\n' > "$T/e2e.zone"
+    expect "e2e: an unsigned zone" 0 import e2e.test "$T/e2e.zone"
+    kz export e2e.test "$T/e2e.in"
+    (cd "$T/keys" && dnssec-keygen -q -a ECDSAP256SHA256 -f KSK e2e.test > ksk.name 2>/dev/null && dnssec-keygen -q -a ECDSAP256SHA256 e2e.test > zsk.name 2>/dev/null)
+    if [ -s "$T/keys/ksk.name" ] && [ -s "$T/keys/zsk.name" ]; then
+        cat "$T"/keys/K*.key >> "$T/e2e.in"
+        (cd "$T" && dnssec-signzone -q -o e2e.test -f e2e.out -O full -K keys -e now+14d -N increment -3 - -H 0 -x e2e.in "$(cat keys/ksk.name)" "$(cat keys/zsk.name)" > /dev/null 2>&1)
+        if [ -s "$T/e2e.out" ]; then
+            expect "e2e: the zone signed by dnssec-signzone (NSEC3, KSK + ZSK) is written back" 0 import --signer --json e2e.test "$T/e2e.out"
+            jget "e2e: the serial grew by one" "signer.serial" 2
+            same "e2e: the NSEC3PARAM metadata" "$(q "SELECT content FROM domainmetadata WHERE kind = 'NSEC3PARAM'")" "1 0 0 -"
+            kz export e2e.test "$T/e2e.back"
+            grep -q ' NSEC3 ' "$T/e2e.back" && ok "e2e: the export has the NSEC3 chain (rebuilt by the loader's reader)" || bad "e2e: no NSEC3 in the export"
+            if command -v dnssec-verify >/dev/null 2>&1; then
+                if dnssec-verify -o e2e.test "$T/e2e.back" > "$T/e2e.verify" 2>&1; then ok "e2e: dnssec-verify accepts the zone as the database exports it"; else bad "e2e: dnssec-verify" "$(head -c 600 "$T/e2e.verify")"; fi
+            fi
+            (cd "$T" && dnssec-signzone -q -o e2e.test -f e2e2.out -O full -K keys -e now+14d -i 259200 -N increment -3 - -H 0 -x e2e.back "$(cat keys/ksk.name)" "$(cat keys/zsk.name)" > /dev/null 2>&1)
+            expect "e2e: the zone signed again (kept signatures) is written back" 0 import --signer e2e.test "$T/e2e2.out"
+            same "e2e: serial 3" "$(serial e2e.test)" 3
+        else
+            ok "e2e: dnssec-signzone could not sign the zone here (skipped)"
+        fi
+    else
+        ok "e2e: dnssec-keygen made no keys here (skipped)"
+    fi
+else
+    ok "e2e: BIND's dnssec-keygen / dnssec-signzone are not installed (skipped)"
+fi
+
+# the same, with rows whose text is not the canonical one (upper case names and hex, an uncompressed AAAA, an RRset with two TTLs, a row twice): the zone is
+# exported (canonical), signed by BIND's tool and taken back; a real change since the export is still refused with exit status 3
+if command -v dnssec-keygen >/dev/null 2>&1 && command -v dnssec-signzone >/dev/null 2>&1; then
+    newdb "$DB"
+    mkdir "$T/keys2"
+    printf '$ORIGIN e2f.test.\n$TTL 300\n@ IN SOA ns1 hostmaster 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\nwww IN A 192.0.2.2\nv6 IN AAAA 2001:db8::1\nmail IN MX 10 www\nalias IN CNAME www\nmulti 300 IN A 192.0.2.6\ndup IN A 192.0.2.5\ntxt IN TXT "abc"\nsub IN NS ns.sub.example.net.\n' > "$T/e2f.zone"
+    expect "e2f: an unsigned zone" 0 import e2f.test "$T/e2f.zone"
+    DID=$(q "SELECT id FROM domains WHERE name = 'e2f.test'")
+    q "UPDATE records SET content = '2001:0DB8:0:0:0:0:0:1' WHERE name = 'v6.e2f.test'; UPDATE records SET content = 'WWW.E2F.TEST.' WHERE type = 'CNAME'; UPDATE records SET content = 'WWW.E2F.TEST' WHERE type = 'MX'; UPDATE records SET content = 'abc' WHERE type = 'TXT'"
+    q "INSERT INTO records (domain_id, name, type, content, ttl, disabled, auth) VALUES ($DID, 'multi.e2f.test', 'A', '192.0.2.7', 600, 0, 1), ($DID, 'dup.e2f.test', 'A', '192.0.2.5', 300, 0, 1), ($DID, 'off.e2f.test', 'A', '192.0.2.99', 300, 1, 1)"
+    kz export e2f.test "$T/e2f.in"
+    if [ "$st" = 0 ]; then ok "e2f: the zone with such rows exports"; else bad "e2f: export" "$(cat "$ERR")"; fi
+    (cd "$T/keys2" && dnssec-keygen -q -a ECDSAP256SHA256 -f KSK e2f.test > ksk.name 2>/dev/null && dnssec-keygen -q -a ECDSAP256SHA256 e2f.test > zsk.name 2>/dev/null)
+    if [ -s "$T/keys2/ksk.name" ] && [ -s "$T/keys2/zsk.name" ]; then
+        cat "$T"/keys2/K*.key >> "$T/e2f.in"
+        (cd "$T" && dnssec-signzone -q -o e2f.test -f e2f.out -O full -K keys2 -e now+14d -N increment -3 - -H 0 -x e2f.in "$(cat keys2/ksk.name)" "$(cat keys2/zsk.name)" > /dev/null 2>&1)
+        if [ -s "$T/e2f.out" ]; then
+            q "UPDATE records SET content = '192.0.2.88' WHERE name = 'www.e2f.test'"
+            expect "e2f: a real change since the export: refused, exit status 3" 3 import --signer e2f.test "$T/e2f.out"
+            q "UPDATE records SET content = '192.0.2.2' WHERE name = 'www.e2f.test'"
+            expect "e2f: with the record as it was, the signed zone is written back" 0 import --signer --json e2f.test "$T/e2f.out"
+            jget "e2f: the serial grew by one" "signer.serial" 2
+            same "e2f: the rows keep the spelling they had" "$(q "SELECT content FROM records WHERE name = 'v6.e2f.test' AND type = 'AAAA'")" "2001:0DB8:0:0:0:0:0:1"
+            kz export e2f.test "$T/e2f.back"
+            grep -q ' NSEC3 ' "$T/e2f.back" && ok "e2f: the export has the NSEC3 chain" || bad "e2f: no NSEC3 in the export"
+            (cd "$T" && dnssec-signzone -q -o e2f.test -f e2f2.out -O full -K keys2 -e now+14d -i 259200 -N increment -3 - -H 0 -x e2f.back "$(cat keys2/ksk.name)" "$(cat keys2/zsk.name)" > /dev/null 2>&1)
+            expect "e2f: the zone signed again is written back" 0 import --signer e2f.test "$T/e2f2.out"
+        else
+            ok "e2f: dnssec-signzone could not sign the zone here (skipped)"
+        fi
+    else
+        ok "e2f: dnssec-keygen made no keys here (skipped)"
+    fi
+fi
+
+# export --signer (0.6.0 item C): a zone that was changed after it was signed has no complete NSEC3 chain, so the plain export (the zone as the server serves it)
+# refuses it; the signer needs the zone anyway, to sign it again.  --signer leaves the chain and its signatures out and keeps the other signatures.
+echo "== export --signer"
+newdb "$DB"
+mkzone "$T/xs.zone" xs.test. 1 'www IN A 192.0.2.2
+mail IN MX 10 www
+a.b.c IN A 192.0.2.3'
+expect "xs: an unsigned zone" 0 import xs.test "$T/xs.zone"
+kz export xs.test "$T/xs.plain"
+kz export --signer xs.test "$T/xs.sg"
+same "xs: on an unsigned zone --signer gives the same text as the plain export" "$(cat "$T/xs.sg")" "$(cat "$T/xs.plain")"
+if command -v dnssec-keygen >/dev/null 2>&1 && command -v dnssec-signzone >/dev/null 2>&1 && command -v dnssec-verify >/dev/null 2>&1; then
+    newdb "$DB"
+    mkdir "$T/keys3"
+    expect "xs3: an unsigned zone" 0 import xs.test "$T/xs.zone"
+    kz export xs.test "$T/xs3.in"
+    (cd "$T/keys3" && dnssec-keygen -q -a ECDSAP256SHA256 -f KSK xs.test > ksk.name 2>/dev/null && dnssec-keygen -q -a ECDSAP256SHA256 xs.test > zsk.name 2>/dev/null)
+    if [ -s "$T/keys3/ksk.name" ] && [ -s "$T/keys3/zsk.name" ]; then
+        cat "$T"/keys3/K*.key >> "$T/xs3.in"
+        (cd "$T" && dnssec-signzone -q -o xs.test -f xs3.out -O full -K keys3 -e now+14d -N increment -3 - -H 0 -x xs3.in "$(cat keys3/ksk.name)" "$(cat keys3/zsk.name)" > /dev/null 2>&1)
+        expect "xs3: the signed zone is written (NSEC3, KSK + ZSK)" 0 import --signer xs.test "$T/xs3.out"
+        # a new name and a name that goes: the chain is wrong now
+        printf '$ORIGIN xs.test.\n$TTL 300\nnewname IN A 192.0.2.50\nwww IN A 192.0.2.99\n' > "$T/xs3.part"
+        expect "xs3: a name is added and a record changed (merge)" 0 import --mode merge xs.test "$T/xs3.part"
+        q "DELETE FROM records WHERE name = 'mail.xs.test' AND type = 'MX'"
+        kz export xs.test "$T/xs3.bad"
+        if [ "$st" != 0 ]; then ok "xs3: the plain export refuses the zone (status $st)"; else bad "xs3: the plain export of a zone with a chain that is out of date should fail"; fi
+        grep -q "no RRSIG(NSEC3) owner" "$ERR" && ok "...because the new name has no NSEC3" || bad "...the reason" "$(cat "$ERR")"
+        kz export --signer xs.test "$T/xs3.sg"
+        if [ "$st" = 0 ]; then ok "xs3: export --signer works"; else bad "xs3: export --signer" "$(cat "$ERR")"; fi
+        [ "$(grep -c ' NSEC3 \|NSEC3PARAM\| NSEC ' "$T/xs3.sg")" = 0 ] && ok "xs3: no NSEC3, NSEC3PARAM or NSEC record" || bad "xs3: chain records in the text" "$(grep ' NSEC' "$T/xs3.sg" | head -3)"
+        [ "$(grep -c ' RRSIG NSEC' "$T/xs3.sg")" = 0 ] && ok "xs3: no signature over the chain" || bad "xs3: RRSIG(NSEC3) in the text"
+        [ "$(grep -c ' RRSIG A \| RRSIG SOA \| RRSIG DNSKEY \| RRSIG MX ' "$T/xs3.sg")" -gt 3 ] && ok "xs3: the other signatures stay" || bad "xs3: the other signatures are gone"
+        [ "$(grep -c ' DNSKEY ' "$T/xs3.sg")" -ge 2 ] && ok "xs3: and the DNSKEY records" || bad "xs3: no DNSKEY"
+        grep -q '^newname A ' "$T/xs3.sg" && ! grep -q '^mail MX ' "$T/xs3.sg" && ok "xs3: the data is the data of the database (new name there, the deleted record gone)" || bad "xs3: data" "$(grep -E '^(newname|mail)' "$T/xs3.sg")"
+        # the text signed again by BIND's tool, with the signatures that are still good kept (-i), is taken back
+        (cd "$T" && dnssec-signzone -q -o xs.test -f xs3b.out -O full -K keys3 -e now+14d -i 259200 -N increment -3 - -H 0 -x xs3.sg "$(cat keys3/ksk.name)" "$(cat keys3/zsk.name)" > /dev/null 2>&1)
+        if grep -qE '[[:space:]]MX[[:space:]]' "$T/xs3b.out"; then bad "xs3: dnssec-signzone kept the deleted MX RRset or its signature"; else ok "xs3: dnssec-signzone dropped the signature of the deleted RRset (it was in the text)"; fi
+        expect "xs3: the zone signed again from export --signer is written back" 0 import --signer --json xs.test "$T/xs3b.out"
+        jget "xs3: the serial grew by one" "signer.serial" 3
+        kz export xs.test "$T/xs3.good"
+        if [ "$st" = 0 ]; then ok "xs3: the plain export works again"; else bad "xs3: plain export after the signature" "$(cat "$ERR")"; fi
+        if dnssec-verify -o xs.test "$T/xs3.good" > "$T/xs3.verify" 2>&1; then ok "xs3: dnssec-verify accepts the zone as the database exports it"; else bad "xs3: dnssec-verify" "$(head -c 400 "$T/xs3.verify")"; fi
+        # a zone with keys and without PRESIGNED: refused by the plain export, fine for --signer (the signer decides what to do with it)
+        newdb "$DB"
+        expect "xs4: an unsigned zone" 0 import xs.test "$T/xs.zone"
+        q "INSERT INTO cryptokeys (domain_id, flags, active, published, content) SELECT id, 257, 1, 1, 'x' FROM domains WHERE name = 'xs.test'"
+        kz export xs.test "$T/xs4.plain"
+        [ "$st" != 0 ] && ok "xs4: a zone with keys and no PRESIGNED: the plain export refuses it" || bad "xs4: plain export should refuse"
+        kz export --signer xs.test "$T/xs4.sg"
+        [ "$st" = 0 ] && ok "xs4: ...and export --signer does not look at the keys" || bad "xs4: export --signer" "$(cat "$ERR")"
+    else
+        ok "xs3: dnssec-keygen made no keys here (skipped)"
+    fi
+else
+    ok "xs3: BIND's dnssec tools are not installed (skipped)"
+fi
 
 echo
 if [ "$FAILS" -eq 0 ]; then echo "=== run_karidns_zone_test: all $PASS checks passed ==="; exit 0; fi

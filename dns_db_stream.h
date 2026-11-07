@@ -79,6 +79,8 @@
  *                     under) | 8 req_generation u64 (the last reload request applied; 0 = none) | 9 req_ok u8 (0/1: every zone of
  *                     that reload loaded) | 10 req_error str<=255 (why the last read of the requests or write of the status
  *                     row failed, absent = none) | 11 req_time u64 (unix seconds of the last status row written, 0 = never).
+ *                     Item C (the signer), optional: 12 sig_wait u32 (the zones with the metadata X-KARIDNS-SIGNER=1 that changed and are not reloaded until the
+ *                     signer asks) | 13 sig_names str<=255 (the first few of their names, "a, b, c, and N more").
  *                     An entry is sent for a view that has auto reload on or whose source has the multi-server tables.
  *   WARM_LIST (13)    D1a step 7 (design 8.4); only between batches (state READY), no state change.  The zones the loader's state file lists, in the
  *                     order the Backend should read them, sent once after the startup load (an empty list when there is none), in parts:
@@ -97,7 +99,8 @@
  *                         10 shared_source u8 O (0/1; B6b: the source is the global one, so karidns_domain_views maps zones to this view)
  *                     5 default_ttl u32 O (<= 2147483647; B4a) | 6 bulk_threshold u8 O (<= 100) | 7 loader_threads u32 O (<= 16) |
  *                     8 dir_only u8 O (0/1; D1a milestone 4: memory-limit is set, so a zone the Backend does not have in memory is sent as a
- *                         summary (ZONE_BEGIN with the summary flag, settings and SOA timers, no ZONE_DATA) also in a batch)
+ *                         summary (ZONE_BEGIN with the summary flag, settings and SOA timers, no ZONE_DATA) also in a batch) |
+ *                     9 signer_wait u8 O (0/1; 0.6.0 item C: database { signer-wait }; absent = 1)
  *   RELOAD_REQ (0x8002) 1 request_id u64 R | 2 scope u8 R (0 all, 1 one zone) | 3 view view O | 4 zone name O |
  *                     5 force u8 R (0/1); scope 1 needs tags 3 and 4, scope 0 forbids them
  *   INVENTORY (0x8003) 1 ENTRY nested, repeatable: 1 view view R | 2 zone name R | 3 source_id i64 R |
@@ -289,6 +292,7 @@ typedef struct {
     int bulk_threshold;         /* percent; -1 = tag absent */
     uint32_t loader_threads;    /* 0 = tag absent */
     bool dir_only;              /* tag 8 (D1a milestone 4): memory-limit is set; the loader sends the summary only (no ZONE_DATA) for a zone the Backend does not have in memory */
+    bool signer_wait;           /* tag 9 (0.6.0 item C): the loader does not reload a zone with the metadata X-KARIDNS-SIGNER=1 because of the change log; absent = true */
     uint32_t n_views;
     const uint8_t *body; uint32_t body_len;       /* for kdb_config_views() */
 } kdb_config_t;
@@ -353,6 +357,7 @@ typedef struct {
 typedef struct {
     uint16_t view; uint64_t last_poll, applied_seq; uint32_t pending; kdb_str_t error;
     uint8_t flags; kdb_str_t server_id; uint64_t req_generation; bool req_ok; kdb_str_t req_error; uint64_t req_time;   /* B11 */
+    uint32_t sig_wait; kdb_str_t sig_names;      /* item C: the zones that wait for the signer (tags 12, 13); 0 / empty = absent */
 } kdb_auto_status_entry_t;
 void kdb_auto_status_entries(const kdb_msg_t *m, kdb_iter_t *it);
 bool kdb_auto_status_entries_next(kdb_iter_t *it, kdb_auto_status_entry_t *out);

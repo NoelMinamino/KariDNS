@@ -1,0 +1,131 @@
+#!/bin/sh
+#
+# PROVIDE: karidns_signer
+# REQUIRE: DAEMON NETWORKING
+# BEFORE: LOGIN
+# KEYWORD: shutdown
+#
+# karidns-signer (docs/karidns-signer.md) keeps the zones of a KariDNS database signed.  It runs as its own user, in a work directory on tmpfs.
+# Add the following lines to /etc/rc.conf to enable it:
+#
+# karidns_signer_enable="YES"
+# karidns_signer_config="/usr/local/etc/karidns/karidns-signer.conf"   # the configuration file
+# karidns_signer_user="karidns-signer"                                 # the user the daemon runs as (created by the package)
+# karidns_signer_tmpfs="YES"                                           # mount a tmpfs on the work-dir of the configuration file
+# karidns_signer_tmpfs_size="256m"                                     # its size
+# karidns_signer_cpuset=""                                             # cpuset(1) CPU list (for example "2-3"): keeps the signer off the CPUs of the server
+# karidns_signer_flags=""                                              # more options of karidns-signer
+#
+# service karidns_signer reload      reads the configuration file again (SIGHUP)
+# service karidns_signer configtest  karidns-signer --check
+#
+
+. /etc/rc.subr
+
+name="karidns_signer"
+rcvar="karidns_signer_enable"
+
+load_rc_config "${name}"
+
+: ${karidns_signer_enable:="NO"}
+: ${karidns_signer_config:="/usr/local/etc/karidns/karidns-signer.conf"}
+: ${karidns_signer_user:="karidns-signer"}
+: ${karidns_signer_tmpfs:="YES"}
+: ${karidns_signer_tmpfs_size:="256m"}
+: ${karidns_signer_flags:=""}
+
+signer_program="${karidns_signer_wrapper:-/usr/local/sbin/karidns-signer}"      # (karidns_signer_wrapper is for tests with another build; not karidns_signer_program, which rc.subr takes for `command`)
+rundir="/var/run/${name}"                          # daemon(8) writes both pid files after it has dropped privileges (-u): a directory of the signer's user
+pidfile="${rundir}/supervisor.pid"                  # daemon(8)'s supervisor: stop sends SIGTERM to it, it passes the signal on
+childpidfile="${rundir}/child.pid"                  # the daemon itself: reload sends SIGHUP to it
+# -r: start it again if it dies (after 10 seconds); -f: standard input, output and error to /dev/null (the daemon logs to syslog, see `log` in the configuration file)
+command="/usr/sbin/daemon"
+: ${karidns_signer_cpuset:=""}
+signer_command="${signer_program}"
+[ -n "${karidns_signer_cpuset}" ] && signer_command="/usr/bin/cpuset -l ${karidns_signer_cpuset} ${signer_program}"      # cpuset(1) execs the program: the pid is the same
+command_args="-r -R 10 -f -P ${pidfile} -p ${childpidfile} -u ${karidns_signer_user} -t karidns-signer -- ${signer_command} -c ${karidns_signer_config} ${karidns_signer_flags}"
+
+required_files="${karidns_signer_config}"
+extra_commands="reload configtest"
+reload_cmd="karidns_signer_reload"
+configtest_cmd="karidns_signer_configtest"
+start_precmd="karidns_signer_prestart"
+stop_postcmd="karidns_signer_poststop"
+
+# the work-dir of the configuration file (the global value, before the first [zone ...] section), else the default of karidns-signer
+karidns_signer_workdir()
+{
+    _wd=$(awk '
+        /^[ \t]*\[/ { exit }
+        /^[ \t]*work-dir[ \t]*=/ {
+            v = $0; sub(/^[^=]*=[ \t]*/, "", v)
+            if (v ~ /^"/) { sub(/^"/, "", v); sub(/".*$/, "", v) } else { sub(/[ \t]+#.*$/, "", v); sub(/[ \t]+$/, "", v) }
+            print v; exit
+        }' "${karidns_signer_config}")
+    echo "${_wd:-/var/db/karidns-signer/work}"
+}
+
+karidns_signer_mounted()
+{
+    mount -p | awk -v d="$1" '$2 == d && $3 == "tmpfs" { found = 1 } END { exit !found }'
+}
+
+# the work directory and its parent: the user's, closed to others (also for configtest, which checks them)
+karidns_signer_dirs()
+{
+    if ! id -u "${karidns_signer_user}" >/dev/null 2>&1; then
+        warn "the user ${karidns_signer_user} does not exist"
+        return 1
+    fi
+    _wd=$(karidns_signer_workdir)
+    _group=$(id -gn "${karidns_signer_user}")
+    install -d -o "${karidns_signer_user}" -g "${_group}" -m 0700 "$(dirname "${_wd}")" || return 1
+    install -d -o "${karidns_signer_user}" -g "${_group}" -m 0700 "${_wd}" || return 1
+    install -d -o "${karidns_signer_user}" -g "${_group}" -m 0755 "${rundir}" || return 1
+}
+
+karidns_signer_prestart()
+{
+    # no core dump: the process memory holds private keys while a zone is signed
+    ulimit -c 0
+    karidns_signer_dirs || return 1
+    if checkyesno karidns_signer_tmpfs && ! karidns_signer_mounted "${_wd}"; then
+        mount -t tmpfs -o "size=${karidns_signer_tmpfs_size},mode=0700,uid=${karidns_signer_user},gid=${_group}" tmpfs "${_wd}" || return 1
+    fi
+    # an old pidfile of a daemon that died must not stop a start (rc.subr checks the supervisor's)
+    rm -f "${childpidfile}"
+}
+
+karidns_signer_poststop()
+{
+    rm -f "${childpidfile}"
+    # the key files are wiped after every zone; unmounting drops what a crash left in memory
+    if checkyesno karidns_signer_tmpfs; then
+        _wd=$(karidns_signer_workdir)
+        if karidns_signer_mounted "${_wd}"; then
+            umount "${_wd}" || warn "cannot unmount ${_wd}"
+        fi
+    fi
+    return 0
+}
+
+karidns_signer_reload()
+{
+    _pid=$(cat "${childpidfile}" 2>/dev/null)
+    if [ -z "${_pid}" ] || ! kill -0 "${_pid}" 2>/dev/null; then
+        echo "${name} is not running."
+        return 1
+    fi
+    echo "Reloading ${name} (SIGHUP)."
+    kill -HUP "${_pid}"
+}
+
+karidns_signer_configtest()
+{
+    echo "Checking configuration: ${karidns_signer_config}"
+    karidns_signer_dirs || return 1
+    # as the user the daemon runs as: the checks of the files are about that user
+    su -m "${karidns_signer_user}" -c "${signer_program} --check -c ${karidns_signer_config}"
+}
+
+run_rc_command "$1"

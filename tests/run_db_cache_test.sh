@@ -12,7 +12,8 @@
 #   - the cache works: the miss rate of the Zipf load is far below what a cache that keeps nothing would have (every query for a zone that is out
 #     of memory is a miss), zones were taken out (evictions) and some came cold at the start
 #   - a pinned zone (metadata X-KARIDNS-CACHE pin) stays in memory
-#   - a sweep over every zone, one query each, is answered correctly (the zones are loaded one after the other)
+#   - a sweep over every zone, one query each, is answered correctly (the zones are loaded one after the other; a query that is shed
+#     because the cache is above its hard limit (SERVFAIL + EDE 14) is asked again, as a resolver would)
 # Needs root (the loader runs as nobody).  SKIP without karidns, dag, karictl, karidns-dbloader (SQLite3), sqlite3 or perl.
 . "$(dirname "$0")/lib_proc.sh"
 set -u

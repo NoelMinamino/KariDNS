@@ -15,7 +15,7 @@
  *   3. in ONE transaction (dns_db_driver.h, open_write): locks the zone against a concurrent importer, finds it or creates it (a new zone is
  *      NATIVE unless a type is given; the type of an existing zone is never changed), applies the serial rule, deletes and inserts rows,
  *      puts the zone in a view, adds a reload request, READS THE ZONE BACK in the same transaction through the loader's path (dns_zone_export.c
- *      zx_read_zone(): dns_pdns_reader.c, the checks of `karicheck db`, and the size limits of the server) and commits only when the loader
+ *      zx_read_zone_ex(): dns_pdns_reader.c, the checks of `karicheck db`, and the size limits of the server) and commits only when the loader
  *      would load what was written (a merge that put a CNAME beside other data, an ALIAS beside an A record, a zone over max-records: refused,
  *      rolled back).  A dry run does the same.  Any error rolls back: nothing is written.
  *
@@ -26,9 +26,22 @@
  *                         owned metadata the file declares replaces the database's (what the file does not declare is kept); the tag
  *                         definitions the file makes replace those of the same kind and tag.
  *   types                 limits either mode to records of these types (both the rows deleted and the rows inserted); metadata and tag
- *                         definitions are then not touched.  The signer of a later milestone uses this.
+ *                         definitions are then not touched.  (The signer has its own mode, below.)
  *   dry_run               everything but the commit (the transaction is rolled back) and the same report.
  * The report (zi_report_fn) names every RRset the import adds ('+'), replaces with other data ('~') or deletes ('-'), in owner, type order.
+ *
+ * Signer mode (0.6.0 item C, o.signer; docs/karidns-zone.md "import --signer"): the file is the zone as dnssec-signzone signed it, made from an export
+ * of the zone; the import writes what the signer owns and nothing else, in one transaction, with the rights of the signer role alone:
+ *   - the RRSIG, NSEC, NSEC3, NSEC3PARAM and DNSKEY records of the database are replaced by the file's (CDS and CDNSKEY are not touched), as the PowerDNS
+ *     presigned layout stores them (dns_zone_rows.c: no NSEC / NSEC3 / NSEC3PARAM rows, the chain is rebuilt by the reader);
+ *   - the SOA must be the database's but for the serial, which must be greater (RFC 1982); it is written with UPDATE;
+ *   - every other record of the file must equal the database's (owner, type, TTL, priority, content): else nothing is written and the status is
+ *     ZI_CHANGED ("the zone changed since the file was made": the signer signs again);
+ *   - the ordername and auth of the other records (and of the empty non-terminals the database holds) are set as a presigned zone has them, with UPDATE
+ *     where they differ;
+ *   - the metadata PRESIGNED=1, NSEC3PARAM (none for NSEC) and X-KARIDNS-SIGNER=1.
+ * The result has the new serial, the counts, the earliest RRSIG expiration of the zone after the write and the id of the write (dns_db_driver.h,
+ * w_write_id).  Not with mode merge, types, a serial rule other than grow, a view, a zone type or a tinydns file (zi_open refuses them).
  *
  * Serial (RFC 1982): for an existing zone whose SOA is written, the new SOA serial must be greater than the one in the database (the serial
  * the zone list shows: the enabled SOA at the apex), else the import fails (ZI_SERIAL_GROW); ZI_SERIAL_INCREMENT writes database serial + 1;
@@ -60,6 +73,8 @@ typedef struct {
     const char *const *types;           /* record types that limit the import (ASCII case-insensitive), ntypes of them; NULL / 0: no limit */
     size_t ntypes;
     bool dry_run;
+    bool signer;                        /* import --signer (see "Signer mode" above) */
+    time_t now;                         /* signer mode: the time the 32 bit RRSIG expiration is put near (RFC 4034 3.1.5); 0 = the time of the call (tests set it) */
     bool strict;                        /* a warning of the zone checks fails the import */
     bool reload;                        /* also add a row to karidns_reload_requests (PostgreSQL); a warning when the table is missing */
     const char *view;                   /* NULL, or the view (karidns_domain_views) the zone is put in */
@@ -105,9 +120,15 @@ typedef struct {
     uint32_t old_serial, new_serial;    /* new_serial: the SOA written (0 when none) */
     bool wrote_soa;
     size_t warnings;                    /* of the zone checks */
+    /* signer mode: records_inserted / records_deleted count the DNSSEC records, rrsets_* the DNSSEC RRsets; old_serial / new_serial / wrote_soa as above */
+    size_t rows_updated;                /* records whose ordername / auth (the SOA: also the serial) were updated */
+    bool has_expire;
+    time_t min_expire;                  /* the earliest RRSIG expiration of the zone after the write (RFC 4034 3.1.5: 32 bit serial number arithmetic, put near now) */
+    bool has_write_id;
+    db_write_id_t write_id;             /* dns_db_driver.h w_write_id() */
 } zi_result_t;
 
-typedef enum { ZI_OK = 0, ZI_FAIL = 1, ZI_BUSY = 2 } zi_status_t;      /* ZI_BUSY: another importer holds the zone; try again */
+typedef enum { ZI_OK = 0, ZI_FAIL = 1, ZI_BUSY = 2, ZI_CHANGED = 3 } zi_status_t;      /* ZI_BUSY: another importer holds the zone; try again.  ZI_CHANGED: signer mode, the zone's data differs from the file's: nothing was written */
 
 typedef struct zi_s zi_t;
 
@@ -116,7 +137,7 @@ typedef struct zi_s zi_t;
 zi_t *zi_open(const zi_opts_t *o);
 void zi_close(zi_t *z);
 
-/* One zone from a BIND zone file.  zone: its name (NULL: the owner of the first SOA).  res may be NULL.  ZI_OK, ZI_FAIL, ZI_BUSY. */
+/* One zone from a BIND zone file.  zone: its name (NULL: the owner of the first SOA).  res may be NULL.  ZI_OK, ZI_FAIL, ZI_BUSY, ZI_CHANGED. */
 int zi_import_zone(zi_t *z, const zi_input_t *in, const char *zone, zi_result_t *res);
 
 /* The zones of a tinydns data file, each in a transaction of its own: zone, or every zone with an SOA (. or Z line) when zone is NULL (the

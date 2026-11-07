@@ -15,7 +15,9 @@
 #   - a zone that cannot be read (more records than max-zone-records) is answered SERVFAIL (RFC 5936 2.2; EDE 14) after `transfer-fetch-timeout`
 #   - a zone that a query loaded is transferred from memory and stays in memory (it is not marked)
 #   - a load of AXFR and IXFR clients (tests/db/xfer_stress.pl) and queries (tests/db/cache_stress.pl) at the same time under a small memory-limit: every
-#     transfer that completes is complete, no query is answered wrong, the limit's slack holds, nothing breaks (run with karidns-tsan: run_rcu_tsan_test.sh)
+#     transfer that completes is complete, no query is answered wrong, the resident bytes keep to the limit's slack, the retired ones (taken out, not
+#     freed yet: not part of the hard limit, docs/karidns.md; how many depends on the speed of the host) are all freed after the load, nothing breaks
+#     (run with karidns-tsan: run_rcu_tsan_test.sh)
 # Needs root (the loader runs as nobody).  SKIP without karidns, dag, karictl, karidns-dbloader (SQLite3), sqlite3 or perl.
 . "$(dirname "$0")/lib_proc.sh"
 set -u
@@ -255,12 +257,17 @@ while [ $c -le 2 ]; do
     CPIDS="$CPIDS $!"
     c=$((c + 1))
 done
-MAXUSED=0
+MAXUSED=0; MAXRES=0; MAXRET=0
 LIMIT=$((1024 * 1024))
 t=0
 while [ $t -lt $((SECS * 5)) ]; do
-    U=$($KCTL dbstatus 2>/dev/null | grep '^cache:' | sed -n 's/.* resident=\([0-9]*\) retired=\([0-9]*\).*/\1 \2/p' | awk '{ print $1 + $2 }')
-    [ -n "$U" ] && [ "$U" -gt "$MAXUSED" ] && MAXUSED=$U
+    RR=$($KCTL dbstatus 2>/dev/null | grep '^cache:' | sed -n 's/.* resident=\([0-9]*\) retired=\([0-9]*\).*/\1 \2/p')
+    if [ -n "$RR" ]; then
+        R1=${RR% *}; R2=${RR#* }
+        [ "$R1" -gt "$MAXRES" ] && MAXRES=$R1
+        [ "$R2" -gt "$MAXRET" ] && MAXRET=$R2
+        [ $((R1 + R2)) -gt "$MAXUSED" ] && MAXUSED=$((R1 + R2))
+    fi
     sleep 0.2; t=$((t + 1))
 done
 for p in $CPIDS; do wait "$p"; done
@@ -283,9 +290,14 @@ echo "  queries: ok $QOK, wrong $QW, not ready $QNR, timeout $QTO"
 [ "$BAD" -eq 0 ] && [ "$RF" -eq 0 ] && [ "$OT" -eq 0 ] && pass "every transfer was complete or the one error message (no wrong, refused or broken transfer)" || { fail "transfers: wrong $BAD, refused $RF, other $OT"; head -3 "$T"/xc*.err; }
 [ "$OK" -gt 20 ] && [ "$OK1" -gt 5 ] && pass "transfers went through: $OK whole zones, $OK1 one-SOA answers" || fail "only $OK whole zones and $OK1 one-SOA answers"
 [ "$QW" -eq 0 ] && pass "no query was answered wrong" || fail "$QW wrong answers: $(head -3 "$T"/qc*.err)"
-echo "  largest resident + retired seen: $MAXUSED (limit $LIMIT); transfers: waited $(xstat waited), loaded $(xstat loaded), failed $(xstat failed), summary answers $(xstat summary_answers), marked $(xstat marked)"
+echo "  largest resident seen: $MAXRES, retired: $MAXRET, resident + retired: $MAXUSED (limit $LIMIT); transfers: waited $(xstat waited), loaded $(xstat loaded), failed $(xstat failed), summary answers $(xstat summary_answers), marked $(xstat marked)"
 SLACK=$((LIMIT / 100 * 15 + 256 * 1024))
-[ "$MAXUSED" -le $((LIMIT + SLACK + 1024 * 1024)) ] && pass "the memory stayed near the limit under the load (transfers hold their zones: slack $SLACK + 1 MB)" || fail "resident + retired reached $MAXUSED (limit $LIMIT)"
+[ "$MAXRES" -le $((LIMIT + SLACK + 1024 * 1024)) ] && pass "the resident zones stayed near the limit under the load (transfers hold their zones: slack $SLACK + 1 MB)" || fail "resident reached $MAXRES (limit $LIMIT)"
+# the retired bytes are the evictions the retire stack has not freed yet (a reader, a transfer of the zone, the grace period): a backlog that
+# grows with the pace of evictions and the speed of the host (about 0.9 MB on the build host, more in a slow CI VM), not a limit; they must all go
+RET=""; t=0
+while [ $t -lt 50 ]; do RET=$(stat retired); [ "$RET" = "0" ] && break; sleep 0.2; t=$((t + 1)); done
+[ "$RET" = "0" ] && pass "the retired bytes were all freed after the load (largest backlog $MAXRET)" || fail "retired=${RET:-?} 10 s after the load (largest $MAXRET)"
 [ "$(xstat loaded)" -gt 5 ] && [ "$(stat evictions)" -gt 5 ] && pass "zones were read for transfers and taken out of memory ($(stat evictions) evictions)" || fail "loaded $(xstat loaded), evictions $(stat evictions)"
 kill -0 "$SRV" 2>/dev/null && pass "the server is running" || fail "the server is gone"
 grep -q "AddressSanitizer\|runtime error:\|ThreadSanitizer" "$T/srv.log" 2>/dev/null && fail "sanitizer report in the server log" || pass "no sanitizer report in the server log"

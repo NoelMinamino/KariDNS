@@ -208,6 +208,46 @@ if [ $HAVE_SQLITE = 0 ]; then echo "  (no sqlite3 tool or no SQLite3 driver: ski
     cmp_one tinydns tdz.test "$T/in/tdz.test.data" tinydns
 fi
 
+echo "== import --signer: a zone with 2000 hosts is written in a few statements (0.6.0 item C)"
+N=2000
+{
+    printf '$ORIGIN big.test.\n$TTL 300\n@ IN SOA ns1 hostmaster 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n'
+    awk -v n=$N 'BEGIN { for (i = 1; i <= n; i++) printf "h%04d IN A 192.0.2.%d\n", i, i % 250 + 1 }'
+} > "$T/big.zone"
+# the signed zone: an NSEC chain in canonical order (apex, h0001 ... h2000, ns1) and a fake signature for every RRset
+awk -v n=$N 'BEGIN {
+    sig = "AwEAAcvPyrbeMXE2CxVFJhnpJAWoJJJMiqpbRVvIgN0o"
+    r3 = " 8 3 300 20350101000000 20250101000000 12345 big.test. " sig
+    r2 = " 8 2 300 20350101000000 20250101000000 12345 big.test. " sig
+    printf "$ORIGIN big.test.\n$TTL 300\n@ IN SOA ns1 hostmaster 2 7200 3600 1209600 300\n@ IN NS ns1\n@ IN DNSKEY 257 3 8 %s\n", sig
+    printf "@ IN NSEC h0001.big.test. NS SOA RRSIG NSEC DNSKEY\n@ IN RRSIG SOA%s\n@ IN RRSIG NS%s\n@ IN RRSIG DNSKEY%s\n@ IN RRSIG NSEC%s\n", r2, r2, r2, r2
+    for (i = 1; i <= n; i++) {
+        nxt = (i < n) ? sprintf("h%04d.big.test.", i + 1) : "ns1.big.test."
+        printf "h%04d IN A 192.0.2.%d\nh%04d IN NSEC %s A RRSIG NSEC\nh%04d IN RRSIG A%s\nh%04d IN RRSIG NSEC%s\n", i, i % 250 + 1, i, nxt, i, r3, i, r3
+    }
+    printf "ns1 IN A 192.0.2.1\nns1 IN NSEC big.test. A RRSIG NSEC\nns1 IN RRSIG A%s\nns1 IN RRSIG NSEC%s\n", r3, r3
+}' > "$T/big.signed"
+chmod 644 "$T/big.zone" "$T/big.signed"
+expect "a zone with $N hosts" 0 import big.test "$T/big.zone"
+pq "SELECT karidns_auth.enable_audit('public')" > /dev/null
+C0=$(pq "SELECT count(*) FROM karidns_changes"); A0=$(pq "SELECT count(*) FROM karidns_auth.audit_log")
+expect "import --signer writes the signed zone" 0 import --signer big.test "$T/big.signed"
+C1=$(pq "SELECT count(*) FROM karidns_changes"); A1=$(pq "SELECT count(*) FROM karidns_auth.audit_log")
+same "...the serial grew by one, the signatures are in (2 per host, 2 for ns1, 4 at the apex)" "$(zone_serial big.test)|$(pq "SELECT count(*) FROM records WHERE type = 'RRSIG' AND name LIKE '%big.test'")" "2|$((2 * N + 6))"
+same "...ordername of the hosts (NSEC zone: the reversed relative name)" "$(pq "SELECT ordername FROM records WHERE name = 'h0007.big.test' AND type = 'A'")" h0007
+if [ $((C1 - C0)) -ge 1 ] && [ $((C1 - C0)) -le 40 ]; then ok "...the change log got $((C1 - C0)) rows for $((2 * N + 6)) DNSSEC rows and $N updated ones (statement level, not one per row)"; else bad "...the change log grew by $((C1 - C0)) rows"; fi
+if [ $((A1 - A0)) -ge 1 ] && [ $((A1 - A0)) -le 40 ]; then ok "...the audit log got $((A1 - A0)) rows (summary mode is the default of --signer)"; else bad "...the audit log grew by $((A1 - A0)) rows"; fi
+same "...the audit rows are summaries" "$(pq "SELECT count(*) FROM (SELECT * FROM karidns_auth.audit_log ORDER BY id DESC LIMIT $((A1 - A0))) a WHERE (after ->> 'summary') IS NULL AND table_name = 'records'")" 0
+mkzone "$T/big.zone2" big.test. 3
+expect "an import of unsigned data into the signed zone keeps its DNSSEC rows (the signer's zone)" 0 import big.test "$T/big.zone2"
+same "...the signatures are still there" "$(pq "SELECT count(*) FROM records WHERE type = 'RRSIG' AND name LIKE '%big.test'")" "$((2 * N + 6))"
+same "...and the metadata PRESIGNED and X-KARIDNS-SIGNER" "$(pq "SELECT string_agg(kind, ',' ORDER BY kind) FROM domainmetadata WHERE domain_id = (SELECT id FROM domains WHERE name = 'big.test')")" "PRESIGNED,X-KARIDNS-SIGNER"
+if grep -q "signed by karidns-signer" "$OUT" "$ERR"; then ok "...and the note says so (db.import.signer-zone)"; else bad "...no note about the signer's zone" "$(cat "$ERR"; head -c 400 "$OUT")"; fi
+C2=$(pq "SELECT count(*) FROM karidns_changes")
+mkzone "$T/big.signed3" big.test. 5
+expect "--audit rows is accepted with --signer (here a dry run of a file that is not signed: refused)" 1 import --signer --audit rows --dry-run big.test "$T/big.signed3"
+same "...nothing was written" "$(pq "SELECT count(*) FROM karidns_changes")" "$C2"
+
 echo
 if [ "$FAILS" -eq 0 ]; then echo "=== run_karidns_zone_pg_test: all $PASS checks passed ==="; exit 0; fi
 echo "=== run_karidns_zone_pg_test: $FAILS check(s) FAILED ($PASS passed) ==="

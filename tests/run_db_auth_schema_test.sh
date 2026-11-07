@@ -17,6 +17,8 @@
 #   and the secrets of credentials written as "<redacted>", summary mode (one row per transaction, table, operation and zone; ignored for a role named
 #   karidns_api), the audit log is append only for a role that is not the owner, a writer without any right on karidns_auth can still change the data, and
 #   karidns-zone --audit rows|summary (usage errors included).
+# Both dialects, item C (the signer): the tables karidns_key_requests and karidns_signer_state (their CHECKs, the foreign keys and the cascade of a zone delete, the
+#   indexes, the audit rows of both, and that neither writes the change log).
 # SQLite3 only: the audit triggers of the zone file (I / U / D, redaction, the cascade of a zone delete, the actor row), karidns-zone writing its actor row
 #   (karidns-zone:<OS user>) and deleting it, a database without the actor table, the auth file's own audit with its actor row, and the principals delete
 #   trigger with foreign keys off.
@@ -272,12 +274,12 @@ else
     eq "the global master is still there" "1" "SELECT count(*) FROM karidns_auth.grants WHERE role = 'global_master'"
     pq "DELETE FROM oth.domains WHERE name = 'example.com'" > /dev/null
     eq "deleting oth's zone deletes oth's grant" "0" "SELECT count(*) FROM karidns_auth.grants WHERE data_schema = 'oth'"
-    eq "enable_audit('oth') attaches the second data schema's 8 tables" "8" "SELECT karidns_auth.enable_audit('oth')"
+    eq "enable_audit('oth') attaches the second data schema's 10 tables" "10" "SELECT karidns_auth.enable_audit('oth')"
     pq "TRUNCATE karidns_auth.audit_log; INSERT INTO oth.domains (name, type) VALUES ('othaud.test', 'NATIVE');
         INSERT INTO oth.records (domain_id, name, type, content, ttl) SELECT id, 'a.othaud.test', 'A', '192.0.2.1', 60 FROM oth.domains WHERE name = 'othaud.test';
         INSERT INTO domains (name, type) VALUES ('pubaud.test', 'NATIVE')" > /dev/null
     eq "its rows are logged with data_schema oth and the zone; the audit of public is not on" "oth:domains:othaud.test|oth:records:othaud.test" "SELECT string_agg(data_schema || ':' || table_name || ':' || zone_name, '|' ORDER BY id) FROM karidns_auth.audit_log"
-    eq "disable_audit('oth') takes it off again" "8" "SELECT karidns_auth.disable_audit('oth')"
+    eq "disable_audit('oth') takes it off again" "10" "SELECT karidns_auth.disable_audit('oth')"
     pq "DELETE FROM domains WHERE name = 'pubaud.test'; DELETE FROM karidns_auth.grants WHERE data_schema = 'oth'" > /dev/null
     eq "the grants of the other zones are still there (keep.test, the renamed zone)" "3" "SELECT count(*) FROM karidns_auth.grants WHERE zone_name IN ('keep.test', 'deeper.renamed.test')"
     pq "INSERT INTO domains (name, type) VALUES ('example.com', 'NATIVE')" > /dev/null
@@ -291,8 +293,8 @@ else
     pq "INSERT INTO domains (name, type) VALUES ('nolog.test', 'NATIVE'); DELETE FROM domains WHERE name = 'nolog.test'" > /dev/null
     eq "so a change of the PowerDNS tables is not logged" "0" "SELECT count(*) FROM karidns_auth.audit_log"
     eq "the audit of the karidns_auth tables is attached (5 tables)" "5" "SELECT count(*) FROM pg_trigger WHERE tgname = 'karidns_audit_row' AND tgrelid::regclass::text LIKE 'karidns_auth.%'"
-    eq "enable_audit('public') attaches 8 tables (cryptokeys included)" "8" "SELECT karidns_auth.enable_audit('public')"
-    eq "enable_audit is idempotent" "8" "SELECT karidns_auth.enable_audit('public')"
+    eq "enable_audit('public') attaches 10 tables (cryptokeys, the key requests and the signer state included)" "10" "SELECT karidns_auth.enable_audit('public')"
+    eq "enable_audit is idempotent" "10" "SELECT karidns_auth.enable_audit('public')"
     eq "...with one row trigger, three statement triggers and the zone trigger on domains" "5" "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'karidns_audit%' AND tgrelid = 'domains'::regclass"
     eq "...and four on records" "4" "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'karidns_audit%' AND tgrelid = 'records'::regclass"
     eq "enable_audit of a schema that has no such tables attaches none" "0" "SELECT karidns_auth.enable_audit('pg_catalog_nosuch')"
@@ -354,11 +356,57 @@ else
     eq "the log keeps the rows of a deleted principal (principal_name is a copy)" "1" "SELECT count(*) FROM karidns_auth.audit_log WHERE table_name = 'principals' AND op = 'D' AND (before ->> 'name') = 'sec'"
 
     # ---- disable_audit
-    eq "disable_audit('public') takes it off the 8 tables" "8" "SELECT karidns_auth.disable_audit('public')"
+    eq "disable_audit('public') takes it off the 10 tables" "10" "SELECT karidns_auth.disable_audit('public')"
     eq "...no audit trigger is left on the PowerDNS tables" "0" "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'karidns_audit%' AND tgrelid = 'domains'::regclass"
     pq "TRUNCATE karidns_auth.audit_log; INSERT INTO domains (name, type) VALUES ('off.test', 'NATIVE'); DELETE FROM domains WHERE name = 'off.test'" > /dev/null
     eq "so nothing is logged again" "0" "SELECT count(*) FROM karidns_auth.audit_log"
     pq "SELECT karidns_auth.enable_audit('public')" > /dev/null
+
+    # ---- the tables of the signer (item C): karidns_key_requests, karidns_signer_state
+    echo "-- the signer tables"
+    pq "DELETE FROM domains; TRUNCATE karidns_auth.audit_log; INSERT INTO domains (name, type) VALUES ('sig.test', 'NATIVE'), ('sig2.test', 'NATIVE')" > /dev/null
+    SD=$(pq "SELECT id FROM domains WHERE name = 'sig.test'")
+    SD2=$(pq "SELECT id FROM domains WHERE name = 'sig2.test'")
+    X_OK "INSERT INTO karidns_key_requests (domain_id) VALUES ($SD)" && pass "a key request with the defaults (enable, 13, csk, pending)" || fail "key request defaults"
+    eq "...the defaults are kind enable, algorithm 13, key type csk, state pending, no nsec, no done_at" "enable|13|csk|pending||true" \
+       "SELECT kind || '|' || algorithm || '|' || key_type || '|' || state || '|' || coalesce(nsec, '') || '|' || (done_at IS NULL AND created_at IS NOT NULL) FROM karidns_key_requests"
+    X_ERR "a second pending request for a zone is refused (one open request per zone)" "unique|duplicate" "INSERT INTO karidns_key_requests (domain_id, kind) VALUES ($SD, 'add')"
+    pq "UPDATE karidns_key_requests SET state = 'done', done_at = now() WHERE domain_id = $SD" > /dev/null
+    ok "an add request with RSA and bits (the first one is done)" "INSERT INTO karidns_key_requests (domain_id, kind, algorithm, bits, key_type) VALUES ($SD, 'add', 8, 2048, 'zsk')"
+    X_ERR "...and again one pending request per zone" "unique|duplicate" "INSERT INTO karidns_key_requests (domain_id, algorithm) VALUES ($SD, 8)"
+    ok "an enable request with NSEC" "INSERT INTO karidns_key_requests (domain_id, algorithm, nsec) VALUES ($SD2, 15, 'nsec')"
+    X_ERR "a kind other than enable / add is refused" "check constraint" "INSERT INTO karidns_key_requests (domain_id, kind) VALUES ($SD, 'roll')"
+    X_ERR "an algorithm the signer does not sign with (RSASHA1, 5) is refused" "check constraint" "INSERT INTO karidns_key_requests (domain_id, algorithm) VALUES ($SD, 5)"
+    X_ERR "bits only for RSA" "check constraint" "INSERT INTO karidns_key_requests (domain_id, algorithm, bits) VALUES ($SD, 13, 2048)"
+    X_ERR "bits under 1024" "check constraint" "INSERT INTO karidns_key_requests (domain_id, algorithm, bits) VALUES ($SD, 8, 512)"
+    X_ERR "a key type other than csk / ksk / zsk" "check constraint" "INSERT INTO karidns_key_requests (domain_id, key_type) VALUES ($SD, 'kzk')"
+    X_ERR "nsec only nsec3 or nsec" "check constraint" "INSERT INTO karidns_key_requests (domain_id, nsec) VALUES ($SD, 'nsec5')"
+    X_ERR "nsec only for an enable request" "check constraint" "INSERT INTO karidns_key_requests (domain_id, kind, nsec) VALUES ($SD, 'add', 'nsec3')"
+    X_ERR "a state other than pending / done / failed" "check constraint" "INSERT INTO karidns_key_requests (domain_id, state, done_at) VALUES ($SD, 'running', now())"
+    X_ERR "a pending request has no done_at" "check constraint" "INSERT INTO karidns_key_requests (domain_id, done_at) VALUES ($SD, now())"
+    X_ERR "a request that is done has a done_at" "check constraint" "INSERT INTO karidns_key_requests (domain_id, state) VALUES ($SD, 'done')"
+    ok "...and a failed one with a message" "INSERT INTO karidns_key_requests (domain_id, state, message, done_at) VALUES ($SD, 'failed', 'dnssec-keygen failed', now())"
+    X_ERR "a request for a zone that does not exist" "foreign key" "INSERT INTO karidns_key_requests (domain_id) VALUES (999999)"
+    eq "the key requests have an index on the zone, one on the pending ones and the unique one (one pending request per zone)" "karidns_key_requests_domain_idx|karidns_key_requests_one_pending_idx|karidns_key_requests_pending_idx" \
+       "SELECT string_agg(indexname, '|' ORDER BY indexname) FROM pg_indexes WHERE tablename = 'karidns_key_requests' AND indexname LIKE 'karidns_key_requests_%' AND indexname <> 'karidns_key_requests_pkey'"
+    ok "the signer state of a zone" "INSERT INTO karidns_signer_state (domain_id, signed_at, signed_serial, min_expire, next_due, attempts, last_duration_ms) VALUES ($SD, now(), 11, now() + interval '14 days', now() + interval '10 days', 0, 1500)"
+    eq "...next_due and attempts have defaults" "true|0" "SELECT (next_due IS NOT NULL) || '|' || attempts FROM karidns_signer_state WHERE domain_id = $SD"
+    X_ERR "one state row per zone" "unique|duplicate|primary" "INSERT INTO karidns_signer_state (domain_id) VALUES ($SD)"
+    X_ERR "a serial over 32 bits is refused" "check constraint" "INSERT INTO karidns_signer_state (domain_id, signed_serial) VALUES ($SD2, 4294967296)"
+    X_ERR "a negative attempts count is refused" "check constraint" "INSERT INTO karidns_signer_state (domain_id, attempts) VALUES ($SD2, -1)"
+    X_ERR "a state row of a zone that does not exist" "foreign key" "INSERT INTO karidns_signer_state (domain_id) VALUES (999999)"
+    eq "the state table has the index on next_due" "karidns_signer_state_due_idx" "SELECT indexname FROM pg_indexes WHERE tablename = 'karidns_signer_state' AND indexname = 'karidns_signer_state_due_idx'"
+
+    eq "the audit of the two tables is on: the inserts above were logged with the zone" "karidns_key_requests:sig.test|karidns_key_requests:sig2.test|karidns_signer_state:sig.test" \
+       "SELECT string_agg(DISTINCT table_name || ':' || zone_name, '|') FROM karidns_auth.audit_log WHERE table_name IN ('karidns_key_requests', 'karidns_signer_state')"
+    eq "...an UPDATE of the state is logged with before and after" "11>12" "UPDATE karidns_signer_state SET signed_serial = 12 WHERE domain_id = $SD; SELECT (before ->> 'signed_serial') || '>' || (after ->> 'signed_serial') FROM karidns_auth.audit_log WHERE table_name = 'karidns_signer_state' AND op = 'U'"
+    eq "neither table writes the change log (the signer would follow its own state)" "0" "SELECT count(*) FROM pg_trigger WHERE tgrelid IN ('karidns_key_requests'::regclass, 'karidns_signer_state'::regclass) AND tgname LIKE 'karidns_trg_%'"
+    pq "DELETE FROM karidns_changes" > /dev/null
+    pq "UPDATE karidns_signer_state SET attempts = 1 WHERE domain_id = $SD; UPDATE karidns_key_requests SET state = 'done', done_at = now() WHERE domain_id = $SD AND state = 'pending'" > /dev/null
+    eq "...an UPDATE of either table leaves the change log as it is" "0" "SELECT count(*) FROM karidns_changes"
+    pq "DELETE FROM domains WHERE name = 'sig.test'" > /dev/null
+    eq "deleting the zone deletes its key requests and its state row (ON DELETE CASCADE)" "1|0" "SELECT (SELECT count(*) FROM karidns_key_requests) || '|' || (SELECT count(*) FROM karidns_signer_state)"
+    pq "DELETE FROM domains; TRUNCATE karidns_auth.audit_log" > /dev/null
 
     # ---- summary mode
     echo "-- summary mode"
@@ -402,7 +450,7 @@ else
         eq "...the owner's own transaction in summary mode is one row" "1" "SELECT count(*) FROM karidns_auth.audit_log WHERE table_name = 'records'"
         if mkrole karidns_signer && grant_data karidns_signer; then
             pq "TRUNCATE karidns_auth.audit_log; SET LOCAL ROLE karidns_signer; SET LOCAL karidns.audit = 'summary'; INSERT INTO records (domain_id, name, type, content, ttl) SELECT id, 'h' || g || '.sig.test', 'A', '192.0.2.1', 60 FROM domains, generate_series(1, 3) g WHERE name = 'sum.test'" > /dev/null
-            eq "...nor for karidns_signer" "3|karidns_signer" "SELECT count(*) || '|' || min(db_role) FROM karidns_auth.audit_log WHERE table_name = 'records'"
+            eq "...but the signer (a trusted daemon, not in audit_restricted_roles) may: karidns-zone import --signer writes a zone in one summary row" "1|karidns_signer" "SELECT count(*) || '|' || min(db_role) FROM karidns_auth.audit_log WHERE table_name = 'records' AND (after ->> 'summary') IS NOT NULL"
         fi
     else
         skip "cannot create (or SET ROLE to) a role named karidns_api: the summary override is not tested"
@@ -413,7 +461,7 @@ else
     LM=karidns_t_lm_$$; OT=karidns_t_ot_$$; CU=karidns_t_cu_$$
     if mkrole karidns_api && mkrolel $LM && mkrolel $OT && mkrolel $CU && grant_data $LM && grant_data $OT && grant_data $CU &&
        pq "GRANT karidns_api TO $LM; GRANT $OT TO $LM; GRANT $CU TO $LM" > /dev/null 2>&1 && pq "SET SESSION AUTHORIZATION $LM; SELECT 1" > /dev/null 2>&1; then
-        eq "audit_restricted_roles is seeded with karidns_api and karidns_signer" "karidns_api|karidns_signer" "SELECT string_agg(role_name, '|' ORDER BY role_name) FROM karidns_auth.audit_restricted_roles"
+        eq "audit_restricted_roles is seeded with karidns_api (only the WebAdmin's role is restricted)" "karidns_api" "SELECT string_agg(role_name, '|' ORDER BY role_name) FROM karidns_auth.audit_restricted_roles"
         RINS="INSERT INTO records (domain_id, name, type, content, ttl) SELECT id, 'h' || g || '.rr.test', 'A', '192.0.2.1', 60 FROM domains, generate_series(1, 3) g WHERE name = 'sum.test'"
 
         pq "TRUNCATE karidns_auth.audit_log; SET SESSION AUTHORIZATION $LM; SET karidns.audit = 'summary'; $RINS" > /dev/null
@@ -597,7 +645,7 @@ else
     sqlite3 "$ZDB" "INSERT INTO domains (name, type) VALUES ('plain.test', 'NATIVE'); DELETE FROM domains"
     [ "$(sqlite3 "$ZDB" "SELECT count(*) FROM karidns_audit_log")" = "0" ] && pass "so nothing is logged before the audit file is applied" || fail "log without triggers"
     sqlite3 "$ZDB" < db/karidns_audit.sqlite3.sql && sqlite3 "$ZDB" < db/karidns_audit.sqlite3.sql && pass "the audit file applies, twice" || fail "the audit file"
-    [ "$(sqlite3 "$ZDB" "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'karidns_audit%'")" = "24" ] && pass "24 audit triggers (8 tables x I / U / D)" || fail "audit trigger count $(sqlite3 "$ZDB" "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'karidns_audit%'")"
+    [ "$(sqlite3 "$ZDB" "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'karidns_audit%'")" = "30" ] && pass "30 audit triggers (10 tables x I / U / D)" || fail "audit trigger count $(sqlite3 "$ZDB" "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'karidns_audit%'")"
     sqz() { sqlite3 "$ZDB" "PRAGMA foreign_keys = ON;" "$1" 2>&1; }
     ZQ() { sqlite3 "$ZDB" "$1" 2>&1; }
     zeq() { got=$(ZQ "$3"); if [ "$got" = "$2" ]; then pass "$1"; else fail "$1: got '$got', wanted '$2'"; fi; }
@@ -630,6 +678,47 @@ else
         "SELECT group_concat(t, '|') FROM (SELECT DISTINCT table_name AS t FROM karidns_audit_log WHERE op = 'D' AND zone_name = 'aud.test' ORDER BY 1)"
     zeq "...except the tags and tinydns rows that go with their record: zone_name NULL (the record is gone by then)" "2|0" "SELECT (SELECT count(*) FROM karidns_audit_log WHERE op = 'D' AND table_name IN ('karidns_record_tags', 'karidns_record_tinydns') AND zone_name IS NULL) || '|' || (SELECT count(*) FROM karidns_audit_log WHERE op = 'D' AND table_name IN ('karidns_record_tags', 'karidns_record_tinydns') AND zone_name IS NOT NULL)"
     zeq "...the D row of the record has the zone, and its row_id is the record_id of those rows" "aud.test|1" "SELECT r.zone_name || '|' || (SELECT count(DISTINCT t.row_id) FROM karidns_audit_log t WHERE t.table_name = 'karidns_record_tags' AND t.row_id = r.row_id) FROM karidns_audit_log r WHERE r.table_name = 'records' AND r.op = 'D' AND json_extract(r.before, '\$.name') = 'noactor.aud.test'"
+    # the tables of the signer (item C): the same CHECKs as on PostgreSQL, the cascade, the audit with the actor, no change log row
+    echo "-- the signer tables"
+    sqz "DELETE FROM karidns_audit_log; INSERT INTO domains (name, type) VALUES ('sigz.test', 'NATIVE'), ('sigz2.test', 'NATIVE')" > /dev/null
+    SZ=$(ZQ "SELECT id FROM domains WHERE name = 'sigz.test'")
+    SZ2=$(ZQ "SELECT id FROM domains WHERE name = 'sigz2.test'")
+    ZINS() { if out=$(sqz "$1" 2>&1); then fail "$2: accepted"; else case $out in *"CHECK constraint"*|*"FOREIGN KEY"*|*UNIQUE*|*"constraint failed"*) pass "$2" ;; *) fail "$2: $out" ;; esac; fi; }
+    sqz "INSERT INTO karidns_key_requests (domain_id) VALUES ($SZ)" > /dev/null
+    zeq "a key request with the defaults (enable, 13, csk, pending)" "enable|13|csk|pending||1" "SELECT kind || '|' || algorithm || '|' || key_type || '|' || state || '|' || coalesce(nsec, '') || '|' || (done_at IS NULL AND created_at > 1700000000) FROM karidns_key_requests"
+    ZINS "INSERT INTO karidns_key_requests (domain_id, kind) VALUES ($SZ, 'add')" "a second pending request for a zone is refused (one open request per zone)"
+    sqz "UPDATE karidns_key_requests SET state = 'done', done_at = 5 WHERE domain_id = $SZ" > /dev/null
+    sqz "INSERT INTO karidns_key_requests (domain_id, kind, algorithm, bits, key_type) VALUES ($SZ, 'add', 8, 2048, 'zsk'); INSERT INTO karidns_key_requests (domain_id, algorithm, nsec) VALUES ($SZ2, 15, 'nsec')" > /dev/null
+    ZINS "INSERT INTO karidns_key_requests (domain_id, algorithm) VALUES ($SZ, 8)" "...and again one pending request per zone"
+    zeq "an add request with RSA bits and an enable request with NSEC" "3" "SELECT count(*) FROM karidns_key_requests"
+    ZINS "INSERT INTO karidns_key_requests (domain_id, kind) VALUES ($SZ, 'roll')" "a kind other than enable / add is refused"
+    ZINS "INSERT INTO karidns_key_requests (domain_id, algorithm) VALUES ($SZ, 5)" "an algorithm the signer does not sign with is refused"
+    ZINS "INSERT INTO karidns_key_requests (domain_id, algorithm, bits) VALUES ($SZ, 13, 2048)" "bits only for RSA"
+    ZINS "INSERT INTO karidns_key_requests (domain_id, algorithm, bits) VALUES ($SZ, 8, 512)" "bits under 1024"
+    ZINS "INSERT INTO karidns_key_requests (domain_id, key_type) VALUES ($SZ, 'kzk')" "a key type other than csk / ksk / zsk"
+    ZINS "INSERT INTO karidns_key_requests (domain_id, kind, nsec) VALUES ($SZ, 'add', 'nsec3')" "nsec only for an enable request"
+    ZINS "INSERT INTO karidns_key_requests (domain_id, done_at) VALUES ($SZ, 1)" "a pending request has no done_at"
+    ZINS "INSERT INTO karidns_key_requests (domain_id, state) VALUES ($SZ, 'done')" "a request that is done has a done_at"
+    ZINS "INSERT INTO karidns_key_requests (domain_id) VALUES (999999)" "a request for a zone that does not exist"
+    sqz "INSERT INTO karidns_signer_state (domain_id, signed_at, signed_serial, min_expire, next_due, attempts) VALUES ($SZ, 1, 11, 2, 3, 0)" > /dev/null
+    ZINS "INSERT INTO karidns_signer_state (domain_id) VALUES ($SZ)" "one state row per zone"
+    ZINS "INSERT INTO karidns_signer_state (domain_id, signed_serial) VALUES ($SZ2, 4294967296)" "a serial over 32 bits is refused"
+    ZINS "INSERT INTO karidns_signer_state (domain_id, attempts) VALUES ($SZ2, -1)" "a negative attempts count is refused"
+    zeq "the indexes: requests by zone, pending, one pending per zone; the state by next_due" "karidns_key_requests_domain_idx|karidns_key_requests_one_pending_idx|karidns_key_requests_pending_idx|karidns_signer_state_due_idx" "SELECT group_concat(name, '|') FROM (SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('karidns_key_requests_domain_idx', 'karidns_key_requests_one_pending_idx', 'karidns_key_requests_pending_idx', 'karidns_signer_state_due_idx') ORDER BY name)"
+    ZP=$(sqlite3 "$ZDB" "EXPLAIN QUERY PLAN SELECT domain_id FROM karidns_signer_state WHERE next_due <= 100 ORDER BY next_due LIMIT 10")
+    case $ZP in *karidns_signer_state_due_idx*) pass "the due zones are found by the index" ;; *) fail "the due query does not use the index: $ZP" ;; esac
+    zeq "the audit of the two tables is on: the inserts were logged with the zone" "karidns_key_requests:sigz.test|karidns_key_requests:sigz2.test|karidns_signer_state:sigz.test" "SELECT group_concat(x, '|') FROM (SELECT DISTINCT table_name || ':' || zone_name AS x FROM karidns_audit_log WHERE table_name IN ('karidns_key_requests', 'karidns_signer_state') ORDER BY 1)"
+    sqz "UPDATE karidns_signer_state SET signed_serial = 12 WHERE domain_id = $SZ" > /dev/null
+    zeq "...an UPDATE of the state is logged with before and after" "11>12" "SELECT json_extract(before, '\$.signed_serial') || '>' || json_extract(after, '\$.signed_serial') FROM karidns_audit_log WHERE table_name = 'karidns_signer_state' AND op = 'U'"
+    zeq "...and the key request's columns are in the JSON" "enable|13|csk" "SELECT json_extract(after, '\$.kind') || '|' || json_extract(after, '\$.algorithm') || '|' || json_extract(after, '\$.key_type') FROM karidns_audit_log WHERE table_name = 'karidns_key_requests' AND op = 'I' ORDER BY id LIMIT 1"
+    zeq "neither table writes the change log" "0" "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND tbl_name IN ('karidns_key_requests', 'karidns_signer_state') AND name LIKE 'karidns_trg_%'"
+    CL0=$(ZQ "SELECT coalesce(max(seq), 0) FROM karidns_changes")
+    sqz "UPDATE karidns_signer_state SET attempts = 1 WHERE domain_id = $SZ; UPDATE karidns_key_requests SET state = 'done', done_at = 5 WHERE domain_id = $SZ AND state = 'pending'" > /dev/null
+    zeq "...an UPDATE of either table leaves the change log as it is" "$CL0" "SELECT coalesce(max(seq), 0) FROM karidns_changes"
+    sqz "DELETE FROM domains WHERE name = 'sigz.test'" > /dev/null
+    zeq "deleting the zone deletes its key requests and its state row (foreign keys on)" "1|0" "SELECT (SELECT count(*) FROM karidns_key_requests) || '|' || (SELECT count(*) FROM karidns_signer_state)"
+    sqz "DELETE FROM domains WHERE name = 'sigz2.test'; DELETE FROM karidns_audit_log" > /dev/null
+
     # a zone of 20000 records is deleted in a time that does not grow with the square of its size (the lookup of the zone's name is an index seek)
     zeq "the lookup of a deleted zone's name uses the partial index" "1" "SELECT count(*) > 0 FROM pragma_index_list('karidns_audit_log') WHERE name = 'karidns_audit_log_zdel_idx' AND partial = 1"
     ZP=$(sqlite3 "$ZDB" "EXPLAIN QUERY PLAN SELECT zone_name FROM karidns_audit_log WHERE table_name = 'domains' AND op = 'D' AND row_id = 1 ORDER BY id DESC LIMIT 1")

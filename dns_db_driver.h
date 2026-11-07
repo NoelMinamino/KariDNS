@@ -41,6 +41,7 @@
 #define DB_STOPPED 1
 #define DB_ERR_RETRY (-2)
 #define DB_ERR_UNAVAILABLE (-3)
+#define DB_ERR_CONFLICT (-4)        /* a write that met a concurrent change: PostgreSQL serialization failure (40001) in a REPEATABLE READ transaction, or a row to update that is gone */
 #define DB_ERRLEN 400
 
 /* Where the data is.  Paths are UTF-8, used byte for byte: '%XX' is not decoded and a SQLite3 path is never read as a
@@ -125,6 +126,12 @@ typedef int (*db_record_cb)(void *ud, int64_t domain_id, const db_record_row_t *
 typedef int (*db_meta_cb)(void *ud, const db_meta_row_t *row);
 typedef int (*db_key_cb)(void *ud, int64_t domain_id);
 typedef int (*db_change_cb)(void *ud, const db_change_row_t *row);
+typedef int (*db_auth_cb)(void *ud, int64_t id, bool auth);                  /* item C: records.id, records.auth */
+typedef struct { int64_t id; const char *ordername; bool auth; } db_order_t;  /* item C: the new ordername (NULL = NULL) and auth of record id */
+typedef struct { const db_record_row_t *row; bool auth; } db_ins_t;          /* item C: a record to insert, with its auth */
+/* item C: what w_write_id() returns.  xid: PostgreSQL pg_current_xact_id() as decimal text ("" on SQLite3); seq_first, seq_last: SQLite3 the range of
+ * karidns_changes.seq the transaction wrote (0, 0 = none; PostgreSQL always 0). */
+typedef struct { char xid[24]; uint64_t seq_first, seq_last; } db_write_id_t;
 typedef int (*db_reload_cb)(void *ud, const db_reload_row_t *row);
 typedef int (*db_domain_view_cb)(void *ud, int64_t domain_id, const char *view_name);
 typedef struct { const char *name, *settings; } db_profile_row_t;       /* one row of karidns_profiles */
@@ -289,6 +296,37 @@ typedef struct db_driver {
      * (db/karidns_audit.sqlite3.sql) name the writer; actor is not copied and must stay valid until close(); summary is ignored.
      * -1 on a connection that is read only or inside a transaction. */
     int (*w_set_audit)(db_conn_t *c, bool summary, const char *actor);
+
+    /* ----------------------------------------------------------------------------------------------------------------------------
+     * 0.6.0 item C, the signer (karidns-zone import --signer): inside a w_begin() transaction, on an open_write() connection.
+     * ---------------------------------------------------------------------------------------------------------------------------- */
+    /* records.id and records.auth (NULL counts as true) of every record of the zone, ORDER BY id (scan_records does not carry auth, and the
+     * loader's hot path must not pay for a column it never uses).  0, DB_STOPPED (the callback stopped it), -1. */
+    int (*w_scan_auth)(db_conn_t *c, int64_t domain_id, db_auth_cb cb, void *ud);
+    /* UPDATE one record of the zone: ordername (NULL = SQL NULL) and auth always, content when it is not NULL (the SOA serial: the signer role may
+     * change nothing else of a record).  A record that is not in the zone, that the role may not see, or that a concurrent transaction deleted, is
+     * DB_ERR_CONFLICT (no row was changed). */
+    int (*w_update_record)(db_conn_t *c, int64_t domain_id, int64_t id, const char *content, const char *ordername, bool auth);
+    /* The id of what the transaction wrote, for the signer to recognise its own change-log rows: call w_mark() right after w_begin() and w_write_id()
+     * before w_commit().  PostgreSQL: the xid8 of the transaction (the xid column of the rows the triggers wrote to karidns_changes), as text; the mark
+     * is not used.  SQLite3: the rows of karidns_changes with a seq above the mark (the highest seq when w_mark() was called; a transaction holds the
+     * one write lock, so they are all this transaction's): seq_first .. seq_last, both 0 when it wrote none (or there is no karidns_changes).
+     * 0, -1. */
+    int (*w_mark)(db_conn_t *c, uint64_t *mark);
+    int (*w_write_id)(db_conn_t *c, uint64_t mark, db_write_id_t *id);
+    /* Delete the n records with these ids of the zone, and nothing else (w_delete_records also deletes the rows of the extension tables first, which the
+     * signer role may not write): for DNSSEC records, which have no such rows.  The ids must belong to the zone (a statement says so, as there). */
+    int (*w_delete_dnssec)(db_conn_t *c, int64_t domain_id, const int64_t *ids, size_t n);
+    /* The signer writes a whole zone in a few statements, not one per row: a statement-level trigger (the change log, the audit summary) fires once
+     * per statement.  PostgreSQL: unnest() of arrays, a statement per chunk of rows (at most a few hundred thousand ids, or twenty thousand rows
+     * with their text); SQLite3: its row triggers fire per row whatever the statements, so it runs the single-row statements.
+     *   w_update_orders  ordername and auth of n records of the zone (DB_ERR_CONFLICT if one is not there)
+     *   w_insert_dnssec  n records (DNSSEC records: no id is returned, no extension rows); the rows' ordername, ttl, prio as w_insert_record
+     * The next w_begin() of the connection is a REPEATABLE READ transaction when w_set_snapshot(c, true) (PostgreSQL; SQLite3: always one writer): the
+     * signer compares the zone and writes in one snapshot, and a concurrent change of a row it writes is DB_ERR_CONFLICT (40001).  Outside a transaction. */
+    int (*w_update_orders)(db_conn_t *c, int64_t domain_id, const db_order_t *v, size_t n);
+    int (*w_insert_dnssec)(db_conn_t *c, int64_t domain_id, const db_ins_t *v, size_t n);
+    int (*w_set_snapshot)(db_conn_t *c, bool on);
 } db_driver_t;
 
 #define DB_IN_MAX 128u        /* the most zones of one scan_*_in call */

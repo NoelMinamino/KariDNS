@@ -6135,6 +6135,7 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
   if (strcmp(key, "loader-path") == 0) return db_take_string(ctx, "database", key, KARIDNS_DB_PATH_MAX, &db->loader_path);
   if (strcmp(key, "server-id") == 0) return db_take_string(ctx, "database", key, 64, &db->server_id);
   if (strcmp(key, "auto-reload") == 0) return parse_bool_statement(ctx, NULL, key, &db->auto_reload);
+  if (strcmp(key, "signer-wait") == 0) return parse_bool_statement(ctx, NULL, key, &db->signer_wait);
   if (strcmp(key, "poll-interval") == 0) {
     if (db_take_uint(ctx, key, false, KARIDNS_DB_POLL_MIN, KARIDNS_DB_POLL_MAX, &u) != 0) return -1;
     db->poll_interval = (uint32_t)u;
@@ -6270,6 +6271,7 @@ static int parse_database_block(token_ctx_t *ctx, server_config_t *config) {
     return -1;
   }
   db->enabled = true;
+  db->signer_wait = true;      /* 0.6.0 item C: a changed zone of the signer waits for the signer */
   db->poll_interval = 2;
   db->coalesce_ms = 1000;
   db->default_ttl = 3600;

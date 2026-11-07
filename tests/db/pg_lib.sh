@@ -94,6 +94,13 @@ as_pg() {
         export "PSQLA$_pgl_i=$_pgl_a"
         _pgl_cmd="$_pgl_cmd \"\$PSQLA$_pgl_i\""
     done
+    # a coverage build: a profile file per process, which PG_AS creates (the suite's file of a binary, cov_%c%m, is shared by
+    # every process of that binary and may have been created by root: PG_AS cannot open it and the profile is lost, as the
+    # karidns-zone runs of the signer were). The signer passes the variable on to the programs it runs.
+    if [ -n "${LLVM_PROFILE_FILE:-}" ]; then
+        LLVM_PROFILE_FILE="${LLVM_PROFILE_FILE%/*}/cov_pgas_%p%c.profraw" su -m "$PG_AS" -c "$_pgl_cmd"
+        return $?
+    fi
     su -m "$PG_AS" -c "$_pgl_cmd"
 }
 

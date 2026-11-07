@@ -3,6 +3,7 @@
  *
  *   karidns-zone import [options] <zone> <file|->
  *   karidns-zone import --all [options] <tinydns-data-file>
+ *   karidns-zone import --signer [options] <zone> <signed-zone-file|->
  *   karidns-zone export [options] <zone> [<file>]
  *   karidns-zone export --all --dir <dir> [options]
  *
@@ -11,7 +12,8 @@
  * karicheck db does (options { database { } } and the views of karidns.conf, or --sqlite3 / --conninfo-file), applies the check-* options and the
  * size limits of the configuration, writes output files safely and reports through dns_diag (text, or one JSON document with --json).
  *
- * Ordinary process code (malloc allowed); it runs as an ordinary user and never needs root.  Exit status 0 ok, 1 failed, 2 usage error.
+ * Ordinary process code (malloc allowed); it runs as an ordinary user and never needs root.  Exit status 0 ok, 1 failed, 2 usage error, 3 (import
+ * --signer) the zone changed since the signed file was made, 4 (import --signer) the zone is locked by another import or the database is busy: try again.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -89,7 +91,8 @@ static void kz_usage(FILE *fp) {
         "Usage:\n"
         "  karidns-zone import [options] <zone> <file|->\n"
         "  karidns-zone import --all [options] <tinydns-data-file>\n"
-        "  karidns-zone export [options] <zone> [<file>]\n"
+        "  karidns-zone import --signer [options] <zone> <signed-zone-file|->\n"
+        "  karidns-zone export [--signer] [options] <zone> [<file>]\n"
         "  karidns-zone export --all --dir <dir> [options]\n"
         "  karidns-zone --version | -h | --help\n"
         "\n"
@@ -117,28 +120,39 @@ static void kz_usage(FILE *fp) {
         "      --serial grow|increment|keep  an existing zone's SOA serial must grow (RFC 1982; default); increment writes the\n"
         "                          database serial + 1; keep writes the file's as it is (a restore)\n"
         "      --strict            a warning of the zone checks fails the import\n"
+        "      --signer            write a zone the signer signed (karidns-signer): the DNSSEC records (RRSIG, NSEC, NSEC3, NSEC3PARAM, DNSKEY) are\n"
+        "                          replaced, the SOA serial grows, ordername and auth are set, PRESIGNED and X-KARIDNS-SIGNER are put in the\n"
+        "                          metadata; every other record of the file must equal the database's (else exit status 3, nothing written).\n"
+        "                          Works with the rights of the signer role.  Not with --mode, --types, --serial, --view, --type, --all\n"
         "      --reload            also add a row to karidns_reload_requests (PostgreSQL)\n"
         "      --type NATIVE|MASTER  domains.type of a NEW zone (default NATIVE; an existing zone keeps its type)\n"
         "      --format bind|tinydns|auto  the input format (auto: tinydns for a name ending in .tinydns or .data or called data, else bind)\n"
         "      --verbose           list the changed RRsets of a real import too\n"
         "      --audit rows|summary  the audit log (docs/karidns-zone.md, AUDIT): rows (default) logs every changed row; summary logs one\n"
-        "                          row per transaction, table and operation (PostgreSQL; on SQLite3 the log always has rows)\n"
+        "                          row per transaction, table and operation (PostgreSQL; on SQLite3 the log always has rows).  --signer: summary\n"
+        "                          unless --audit rows is given\n"
         "\n"
         "export options:\n"
         "      --format bind|tinydns|auto  the output format (auto: tinydns for a zone with X-KARIDNS-FORMAT tinydns, else bind)\n"
         "      --all --dir DIR     every primary zone, one file per zone in DIR (created when it does not exist): <name>.zone, or\n"
         "                          <name>.tinydns for a tinydns zone; unusual characters of a name are written as %%XX\n"
         "      --force             replace output files that exist (otherwise an existing file is an error and is never touched)\n"
+        "      --signer            the zone as the input of dnssec-signzone (karidns-signer): the NSEC / NSEC3 chain, its signatures and the PRESIGNED /\n"
+        "                          NSEC3PARAM metadata are left out, the other signatures and the DNSKEY records stay; a zone that was changed after it\n"
+        "                          was signed (a name with no NSEC3 yet) can be exported this way\n"
         "\n"
         "Output:\n"
         "      --json              one JSON document on standard output (docs/karicheck.md, JSON OUTPUT; first key \"karidns-zone\");\n"
         "                          export of a single zone then needs a <file>\n"
         "\n"
-        "Exit status: 0 ok, 1 failed (an error in a zone, the database or an output file), 2 usage error.\n"
+        "Exit status: 0 ok, 1 failed (an error in a zone, the database or an output file), 2 usage error, 3 import --signer: the zone changed\n"
+        "since the signed file was made (nothing was written; sign the zone again), 4 import --signer: the zone is locked by another import or the\n"
+        "database is busy (nothing was written; try again).\n"
         "Examples:\n"
         "  karidns-zone import -c /usr/local/etc/karidns/karidns.conf example.test /var/zones/example.test.zone\n"
         "  karidns-zone import --sqlite3 /var/db/karidns/pdns.sqlite3 --dry-run --mode merge example.test -\n"
         "  karidns-zone import --all --sqlite3 /var/db/karidns/pdns.sqlite3 /var/tinydns/root/data\n"
+        "  karidns-zone import --signer --json -c /usr/local/etc/karidns/karidns.conf example.test /tmp/example.test.signed\n"
         "  karidns-zone export -c /usr/local/etc/karidns/karidns.conf example.test > example.test.zone\n"
         "  karidns-zone export --all --dir /var/backups/zones --sqlite3 /var/db/karidns/pdns.sqlite3\n");
 }
@@ -161,7 +175,7 @@ static int kz_usage_error(bool json, dns_diag_code_t code, const char *fmt, ...)
 /* ------------------------------------------------------------------------------------------------------------- */
 
 typedef struct {
-    bool json, verbose, dry_run, strict, reload, all, force, no_config, help, version;
+    bool json, verbose, dry_run, strict, reload, all, force, no_config, help, version, signer;
     const char *conf, *view, *sqlite, *conninfo, *schema, *mode, *types, *serial, *type, *format, *dir, *audit;
     int nargs;
     char **args;
@@ -169,7 +183,7 @@ typedef struct {
 } kz_args_t;
 
 enum { KO_NOCONFIG = 256, KO_VIEW, KO_SQLITE, KO_CONNINFO, KO_SCHEMA, KO_ALL, KO_MODE, KO_TYPES, KO_SERIAL, KO_STRICT, KO_RELOAD, KO_TYPE, KO_FORMAT, KO_VERBOSE, KO_DIR,
-       KO_FORCE, KO_AUDIT };
+       KO_FORCE, KO_AUDIT, KO_SIGNER };
 
 static const struct option k_long[] = {
     { "config", required_argument, NULL, 'c' }, { "no-config", no_argument, NULL, KO_NOCONFIG }, { "view", required_argument, NULL, KO_VIEW },
@@ -178,6 +192,7 @@ static const struct option k_long[] = {
     { "dry-run", no_argument, NULL, 'n' }, { "serial", required_argument, NULL, KO_SERIAL }, { "strict", no_argument, NULL, KO_STRICT },
     { "reload", no_argument, NULL, KO_RELOAD }, { "type", required_argument, NULL, KO_TYPE }, { "format", required_argument, NULL, KO_FORMAT },
     { "verbose", no_argument, NULL, KO_VERBOSE }, { "dir", required_argument, NULL, KO_DIR }, { "force", no_argument, NULL, KO_FORCE }, { "audit", required_argument, NULL, KO_AUDIT },
+    { "signer", no_argument, NULL, KO_SIGNER },
     { "help", no_argument, NULL, 'h' }, { "version", no_argument, NULL, 'v' }, { NULL, 0, NULL, 0 }
 };
 
@@ -227,6 +242,7 @@ static int kz_parse(int argc, char **argv, const char **cmd, kz_args_t *a) {
         case KO_DIR: a->dir = optarg; break;
         case KO_FORCE: a->force = true; break;
         case KO_AUDIT: a->audit = optarg; break;
+        case KO_SIGNER: a->signer = true; break;
         case ':': snprintf(a->perr, sizeof(a->perr), "the option %.60s needs a value", argv[optind - 1]); return 2;
         default: snprintf(a->perr, sizeof(a->perr), "unknown option %.60s", argv[optind - 1]); return 2;
         }
@@ -471,6 +487,45 @@ static void kz_tinydns_result(void *ud, const zi_result_t *res, int status) {
     kz_imp_result(s, res->zone[0] ? res->zone : "?", status);
 }
 
+/* import --signer --json: the result of the write as the key "signer" of the document (docs/karidns-zone.md): the new serial, the counts, the earliest
+ * RRSIG expiration of the zone after the write (UTC and unix time) and the id of the write (PostgreSQL: the transaction id; SQLite3: the first and last
+ * karidns_changes.seq) */
+static void kz_signer_json(const zi_result_t *res, int status, bool dry_run) {
+    if (!dns_diag_json_enabled()) return;
+    char zone[2 * DNS_NAME_TEXT_SIZE], body[1600];
+    int n = 0;                                          /* snprintf: what was written, or what would have been (a document cut short is not JSON) */
+    dns_diag_json_escape(zone, sizeof(zone), res->zone, strlen(res->zone));
+    if (status == ZI_CHANGED) {
+        n = snprintf(body, sizeof(body), "{ \"zone\": \"%s\", \"changed\": true, \"committed\": false }", zone);
+    } else if (status == ZI_BUSY) {
+        n = snprintf(body, sizeof(body), "{ \"zone\": \"%s\", \"changed\": false, \"committed\": false, \"busy\": true }", zone);
+    } else if (status == ZI_OK) {
+        char ex[40] = "", wid[160];
+        int nw;
+        struct tm tmv;
+        time_t et = res->min_expire;
+        if (res->has_expire && gmtime_r(&et, &tmv)) strftime(ex, sizeof(ex), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+        if (res->has_write_id && res->write_id.xid[0])
+            nw = snprintf(wid, sizeof(wid), "{ \"xid\": \"%s\", \"seq_first\": null, \"seq_last\": null }", res->write_id.xid);
+        else if (res->has_write_id && res->write_id.seq_last)
+            nw = snprintf(wid, sizeof(wid), "{ \"xid\": null, \"seq_first\": %llu, \"seq_last\": %llu }", (unsigned long long)res->write_id.seq_first,
+                     (unsigned long long)res->write_id.seq_last);
+        else
+            nw = snprintf(wid, sizeof(wid), "{ \"xid\": null, \"seq_first\": null, \"seq_last\": null }");
+        if (nw < 0 || (size_t)nw >= sizeof(wid)) return;
+        n = snprintf(body, sizeof(body),
+                 "{ \"zone\": \"%s\", \"changed\": false, \"committed\": %s, \"serial\": %u, \"old_serial\": %u, \"dnssec_records_written\": %zu, "
+                 "\"dnssec_records_removed\": %zu, \"records_updated\": %zu, \"rrsets_added\": %zu, \"rrsets_replaced\": %zu, \"rrsets_deleted\": %zu, "
+                 "\"earliest_expire\": \"%s\", \"earliest_expire_epoch\": %lld, \"write_id\": %s }",
+                 zone, res->committed && !dry_run ? "true" : "false", (unsigned)res->new_serial, (unsigned)res->old_serial, res->records_inserted, res->records_deleted,
+                 res->rows_updated, res->rrsets_added, res->rrsets_replaced, res->rrsets_deleted, ex, (long long)res->min_expire, wid);
+    } else {
+        return;
+    }
+    if (n < 0 || (size_t)n >= sizeof(body)) return;
+    dns_diag_json_extra("signer", body);
+}
+
 static int kz_cmd_import(const kz_args_t *a, kz_ctx_t *x) {
     const char *zone = a->all ? NULL : a->args[0];
     const char *file = a->args[a->nargs - 1];
@@ -478,11 +533,12 @@ static int kz_cmd_import(const kz_args_t *a, kz_ctx_t *x) {
     memset(&o, 0, sizeof(o));
     o.drv = x->drv;
     o.src = x->src;
-    o.audit_summary = a->audit && kz_ieq(a->audit, "summary");
+    o.audit_summary = a->audit ? kz_ieq(a->audit, "summary") : a->signer;      /* the signer re-signs a whole zone: one audit row per table and operation, not one per signature */
     o.audit_actor = x->actor;
     o.mode = a->mode && kz_ieq(a->mode, "merge") ? ZI_MERGE : ZI_REPLACE;
     o.serial = a->serial && kz_ieq(a->serial, "increment") ? ZI_SERIAL_INCREMENT : a->serial && kz_ieq(a->serial, "keep") ? ZI_SERIAL_KEEP : ZI_SERIAL_GROW;
     o.dry_run = a->dry_run;
+    o.signer = a->signer;
     o.strict = a->strict;
     o.reload = a->reload;
     o.view = x->zone_view;
@@ -528,6 +584,7 @@ static int kz_cmd_import(const kz_args_t *a, kz_ctx_t *x) {
         dns_diag_set_zone(zone, x->zone_view);
         rc = zi_import_zone(z, &in, zone, &res);
         kz_imp_result(&s, res.zone[0] ? res.zone : zone, rc);
+        if (a->signer) kz_signer_json(&res, rc, a->dry_run);
         dns_diag_set_zone(NULL, NULL);
     }
     dns_diag_set_file(NULL);
@@ -535,7 +592,7 @@ static int kz_cmd_import(const kz_args_t *a, kz_ctx_t *x) {
     dns_diag_counts(s.checked, 0);
     if (a->all)
         dns_diag(DIAG_INFO, DC_DB_IMPORT_SUMMARY, NULL, 0, "%u zone(s) imported, %u failed\n", s.done, s.failed);
-    return rc == ZI_OK ? 0 : 1;
+    return rc == ZI_OK ? 0 : rc == ZI_CHANGED ? 3 : rc == ZI_BUSY && a->signer ? 4 : 1;
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -685,7 +742,7 @@ static int kz_export_one(void *ud, const char *zone) {
         } else {
             kz_out_t out;
             kz_out_init(&out, e->dir_fd);
-            int rc = zx_export_zone(e->x, zone, e->view, e->fmt, kz_sink, &out);
+            int rc = zx_export_zone_ex(e->x, zone, e->view, e->fmt, kz_sink, &out, e->a->signer ? ZX_PLAIN_CHAIN : 0);
             if (rc != 0) {
                 if (out.err) dns_diag(DIAG_ERROR, DC_DB_ZONE_OUTPUT, bind_name, 0, "Could not write the file of zone '%.100s': %s\n", zone, strerror(out.err));
                 kz_out_abort(&out);
@@ -773,7 +830,7 @@ static int kz_cmd_export(const kz_args_t *a, kz_ctx_t *x) {
         }
         if (ok) {
             kz_out_init(&out, dir_fd);
-            ok = zx_export_zone(zx, zone, x->zone_view, &fmt, kz_sink, &out) == 0;
+            ok = zx_export_zone_ex(zx, zone, x->zone_view, &fmt, kz_sink, &out, a->signer ? ZX_PLAIN_CHAIN : 0) == 0;
             if (!ok) {
                 if (out.err) dns_diag(DIAG_ERROR, DC_DB_ZONE_OUTPUT, to_stdout ? "standard output" : file, 0, "Could not write the zone: %s\n", strerror(out.err));
                 kz_out_abort(&out);
@@ -815,6 +872,13 @@ static int kz_check_args(const kz_args_t *a, bool import) {
         if (a->type && !kz_ieq(a->type, "NATIVE") && !kz_ieq(a->type, "MASTER")) return kz_usage_error(j, DC_USAGE_OPTION, "--type must be NATIVE or MASTER");
         if (a->audit && !kz_ieq(a->audit, "rows") && !kz_ieq(a->audit, "summary")) return kz_usage_error(j, DC_USAGE_OPTION, "--audit must be rows or summary");
         if (a->all && a->format && kz_ieq(a->format, "bind")) return kz_usage_error(j, DC_USAGE_OPTION, "--all reads a tinydns data file: --format bind cannot be used with it");
+        if (a->signer) {
+            if (a->mode || a->types || a->serial || a->view || a->type || a->all)
+                return kz_usage_error(j, DC_USAGE_OPTION, "--signer cannot be used with --mode, --types, --serial, --view, --type or --all (a signed zone replaces the DNSSEC records of a zone that exists)");
+            if (a->format && kz_ieq(a->format, "tinydns")) return kz_usage_error(j, DC_USAGE_OPTION, "--signer takes a zone file in BIND format, not a tinydns data file");
+            if (a->nargs == 2 && kz_file_is_tinydns(a->args[1]) && !(a->format && kz_ieq(a->format, "bind")))
+                return kz_usage_error(j, DC_USAGE_OPTION, "--signer takes a zone file in BIND format (this file name is a tinydns data file's: use --format bind)");
+        }
         if (a->all ? a->nargs != 1 : a->nargs != 2) return kz_usage_error(j, DC_USAGE_ARGS, a->all ? "import --all takes one argument: the tinydns data file" : "import takes a zone name and a file (or -)");
     } else {
         if (a->mode || a->types || a->dry_run || a->serial || a->strict || a->reload || a->type || a->verbose || a->audit)
