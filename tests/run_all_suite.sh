@@ -946,10 +946,11 @@ print_result() {
         printf "  [ ${C_YELLOW}SKIP${C_RESET} ] %-42s (${_skip_reason})\n" "${_cmd}"
     else
         printf "  [ ${C_RED}FAIL${C_RESET} ] %-42s (${T_ELAPSED}s) ${C_RED}%s (Exit: ${_exit_code})${C_RESET}\n" "${_cmd}" "${_desc}"
-        # the failed checks first: a test that dumps its server logs when it fails pushes them out of the tail
-        if grep -Eq '^ *(FAIL:|\[FAIL\])' "${LOG_DIR}/test_${_pi}.log"; then
+        # the failed checks first (with the two lines after each, where many tests print the details): a test that dumps its server logs
+        # when it fails pushes them out of the tail.  "FAIL:", "[FAIL]" and "  FAIL name" (about 25 tests print that one)
+        if grep -Eq '^ *(FAIL:|\[FAIL\]|FAIL )' "${LOG_DIR}/test_${_pi}.log"; then
             echo "  ${C_RED}------------------------- [ Failed checks: ${_cmd} ] -------------------------${C_RESET}"
-            grep -E '^ *(FAIL:|\[FAIL\])' "${LOG_DIR}/test_${_pi}.log" | head -n 20 | sed 's/^/    /'
+            grep -E -A2 '^ *(FAIL:|\[FAIL\]|FAIL )' "${LOG_DIR}/test_${_pi}.log" | head -n 30 | sed 's/^/    /'
         fi
         echo "  ${C_RED}------------------------- [ Error Log Tail: ${_cmd} ] -------------------------${C_RESET}"
         tail -n 25 "${LOG_DIR}/test_${_pi}.log" | sed 's/^/    /'
