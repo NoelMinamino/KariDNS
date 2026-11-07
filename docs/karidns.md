@@ -76,7 +76,7 @@ karidns [-v | --version | -V] [-f] [-p port | -p pid_file] [-P pid_file] [-c con
 | Started as | `options { user ...; }` | Behavior |
 |---|---|---|
 | root | set | Binds sockets and opens files as root, then drops to `user`/`group` (recommended for port 53). |
-| root | not set | Refused: running as root without a privilege drop is not permitted. |
+| root | not set | Refused: running as root without a privilege drop is not permitted (also with only `group` set, which would keep uid 0). |
 | non-root user *U* | not set | Runs as *U*. |
 | non-root user *U* | `user "U";` (itself) | Runs as *U*; the privilege drop is skipped. |
 | non-root user *U* | another user | Refused: a non-root process cannot switch users. |
@@ -88,7 +88,8 @@ Everything the process needs must then be usable by that user. **karidns refuses
 - the listen port cannot be bound over UDP **or** TCP — ports below 1024 (such as 53) require root, so use e.g. `port 10053;` or `-p 10053`; a port already in use by another process is refused too;
 - a `logging { channel { file "..."; }; }` file cannot be opened (e.g. under `/var/log`); choose a directory the user can write to;
 - the PID file cannot be created: when daemonized, the default is `/var/run/karidns/karidns.pid`, so pass `-P <path>` / `pid-file "<path>";`, or `pid-file "none";`;
-- `control-channel` is enabled and its UNIX socket cannot be bound: the default is `/var/run/karidns/control.sock`, so set `control-channel { socket "<path>"; ... };` to a path in a directory the user can write to (and point `karictl` at the same path).
+- `control-channel` is enabled and its UNIX socket cannot be bound: the default is `/var/run/karidns/control.sock`, so set `control-channel { socket "<path>"; ... };` to a path in a directory the user can write to (and point `karictl` at the same path);
+- another instance is running: its PID file is locked, or a server answers on the control socket (`Another KariDNS instance is already running`). The running instance's PID file and control socket are left as they are.
 
 These checks run **before** the process daemonizes, so in daemon mode the failure is reported to the invoking shell/rc script as well. The same fail-closed rules apply when started as root (a log file that cannot be opened, an unbindable port or control socket all abort startup). On `karictl reconfig` / `SIGHUP`, a configuration whose log files cannot be opened is rejected and the running configuration is kept.
 

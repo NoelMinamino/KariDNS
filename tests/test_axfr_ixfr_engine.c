@@ -1918,6 +1918,122 @@ static void test_extended_axfr_and_intermediate_tsig_cases(void) {
     printf("  -> extended AXFR tags passed.\n");
 }
 
+/* the RR types of the answers of every message in g_tcp_out ([length][message] ...), in order; returns how many */
+static int tcp_out_answer_types(uint16_t *types, int max) {
+    int n = 0;
+    size_t pos = 0;
+    while (pos + 2 <= g_tcp_out_len) {
+        size_t mlen = ((size_t)g_tcp_out[pos] << 8) | g_tcp_out[pos + 1];
+        const uint8_t *m = g_tcp_out + pos + 2;
+        if (pos + 2 + mlen > g_tcp_out_len || mlen < 12) break;
+        int qd = (m[4] << 8) | m[5], an = (m[6] << 8) | m[7];
+        size_t o = 12;
+        for (int s = 0; s < qd + an && o < mlen; s++) {
+            while (o < mlen && m[o] != 0 && (m[o] & 0xC0) != 0xC0) o += 1 + m[o];
+            o += (o < mlen && (m[o] & 0xC0) == 0xC0) ? 2 : 1;
+            if (s < qd) { o += 4; continue; }
+            if (o + 10 > mlen) break;
+            if (n < max) types[n++] = (uint16_t)((m[o] << 8) | m[o + 1]);
+            o += 10 + (((size_t)m[o + 8] << 8) | m[o + 9]);
+        }
+        pos += 2 + mlen;
+    }
+    return n;
+}
+
+/* review [8]: in an Extended IXFR the SOA that opens the added part comes after the deleted RRs: the LOC / ECS state of a tagged deleted RR
+ * must be reset before it (the SOA is sent as it is), or the receiver gives the new apex SOA that tag */
+static void test_extended_ixfr_soa_state(void) {
+    printf("[TEST] AXFR/IXFR: Extended IXFR resets the tag state before the SOA of the added part...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "tagged.example.", sizeof(entry.domain));
+    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    pthread_mutex_init(&entry.writer_lock, NULL);
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+    init_axfr_zone(test_zone_slot(&entry, 0), "tagged.example.", "300");
+    atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
+    atomic_store_explicit(&entry.serial, 300, memory_order_release);
+
+    /* serial 200 had a record of location "tokyo" and ECS tag "subnet-a"; 300 has not */
+    zone_arena_t old_v, new_v;
+    init_axfr_zone(&old_v, "tagged.example.", "200");
+    init_axfr_zone(&new_v, "tagged.example.", "300");
+    dns_record_t r;
+    memset(&r, 0, sizeof(r));
+    DNS_RECORD_BIND_RDATA(r);
+    r.name = arena_strdup(&old_v, "geo.tagged.example.");
+    r.type = arena_strdup(&old_v, "A");
+    r.type_code = 1;
+    r.class_str = arena_strdup(&old_v, "IN");
+    r.class_val = 1;
+    r.ttl = arena_strdup(&old_v, "300");
+    r.ttl_value = 300;
+    r.rdata_count = 1;
+    r.rdata[0] = arena_strdup(&old_v, "192.0.2.1");
+    r.bind_location_tag = arena_strdup(&old_v, "tokyo");
+    r.ecs_subnet_tag = arena_strdup(&old_v, "subnet-a");
+    if (old_v.records_cap < old_v.count + 1) {
+        old_v.records_cap = old_v.count + 8;
+        old_v.records = realloc(old_v.records, sizeof(dns_record_t) * old_v.records_cap);
+    }
+    old_v.records[old_v.count++] = r;
+    build_zone_index(&old_v, true);
+    compute_ixfr_diff(&entry, &old_v, &new_v);
+    zone_arena_destroy(&old_v);
+    zone_arena_destroy(&new_v);
+
+    /* IXFR from 200 with the Extended AXFR option (65153) */
+    uint8_t req[512] = {0};
+    req[0] = 0x77; req[1] = 0x88;
+    req[5] = 1; req[9] = 1; req[11] = 1;          /* QDCOUNT, NSCOUNT (the client's SOA), ARCOUNT (OPT) */
+    size_t q = 12;
+    q += write_uncompressed_name(req, q, sizeof(req), "tagged.example.");
+    req[q++] = 0; req[q++] = 251; req[q++] = 0; req[q++] = 1;
+    q += write_uncompressed_name(req, q, sizeof(req), "tagged.example.");
+    req[q++] = 0; req[q++] = 6; req[q++] = 0; req[q++] = 1;
+    req[q++] = 0; req[q++] = 0; req[q++] = 1; req[q++] = 0x2C;
+    size_t rdp = q; q += 2;
+    q += write_uncompressed_name(req, q, sizeof(req), "ns1.example.com.");
+    q += write_uncompressed_name(req, q, sizeof(req), "admin.example.com.");
+    req[q++] = 0; req[q++] = 0; req[q++] = 0; req[q++] = 200;
+    for (int k = 0; k < 4; k++) { req[q++] = 0; req[q++] = 0; req[q++] = 0; req[q++] = 10; }
+    req[rdp] = (uint8_t)((q - rdp - 2) >> 8); req[rdp + 1] = (uint8_t)((q - rdp - 2) & 0xFF);
+    req[q++] = 0; req[q++] = 0; req[q++] = 41; req[q++] = 0x10; req[q++] = 0x00;
+    req[q++] = 0; req[q++] = 0; req[q++] = 0; req[q++] = 0;
+    size_t op = q; q += 2;
+    req[q++] = 0xFE; req[q++] = 0x81; req[q++] = 0x00; req[q++] = 0x05;
+    req[q++] = KARIDNS_EXT_VERSION;
+    uint32_t zh = calc_fnv1a_str("tagged.example.");
+    req[q++] = (zh >> 24) & 0xFF; req[q++] = (zh >> 16) & 0xFF; req[q++] = (zh >> 8) & 0xFF; req[q++] = zh & 0xFF;
+    req[op] = (uint8_t)((q - op - 2) >> 8); req[op + 1] = (uint8_t)((q - op - 2) & 0xFF);
+
+    g_tcp_out_len = 0;
+    g_tcp_send_count = 0;
+    send_axfr_response(-1, "tagged.example.", req, q, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    uint16_t t[256];
+    int n = tcp_out_answer_types(t, 256);
+    /* the deleted A, then (state markers) the SOA of the added part: a LOC_STATE and an ECS_STATE between them reset the tags */
+    int a = -1;
+    for (int i = 0; i < n; i++) if (t[i] == 1) { a = i; break; }
+    assert(a >= 0);
+    int soa = -1;
+    for (int i = a + 1; i < n; i++) if (t[i] == 6) { soa = i; break; }
+    assert(soa > a);
+    bool loc_reset = false, ecs_reset = false;
+    for (int i = a + 1; i < soa; i++) {
+        if (t[i] == DNS_TYPE_KARIDNS_LOC_STATE) loc_reset = true;
+        if (t[i] == DNS_TYPE_KARIDNS_ECS_STATE) ecs_reset = true;
+    }
+    assert(loc_reset && ecs_reset);
+
+    ixfr_history_clear(&entry.ixfr_history);
+    zone_arena_destroy(test_zone_slot(&entry, 0));
+    pthread_mutex_destroy(&entry.writer_lock);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+    printf("  -> the tag state is reset before the SOA (%d answer RRs).\n", n);
+}
+
 static void test_send_axfr_response_full_matrix(void) {
     printf("[TEST] AXFR/IXFR: send_axfr_response() full extended & IXFR delta sending...\n");
     zone_db_entry_t entry;
@@ -8099,6 +8215,7 @@ int main(void) {
     test_extended_axfr_and_intermediate_tsig_cases();
     test_send_axfr_response_ixfr_and_extended();
     test_send_axfr_response_full_matrix();
+    test_extended_ixfr_soa_state();
     test_send_axfr_response_large_multi_chunk_tsig();
     test_send_axfr_response_error_and_edge_branches();
     test_handle_axfr_event_multi_message_and_tsig();
