@@ -1344,8 +1344,26 @@ static void test_batch_request_id(void) {
     kdb_enc_u64(&e, 1, 5); kdb_enc_u8(&e, 2, 3); kdb_enc_u64(&e, 3, 0); kdb_enc_u32(&e, 4, 1); kdb_enc_end(&e);
     CHECK_RC("request_id of 4 bytes", send_enc(KDB_S_READY, &e), KDB_E_TLV_LEN);
     kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
-    kdb_enc_u64(&e, 1, 5); kdb_enc_u8(&e, 2, 3); kdb_enc_u64(&e, 3, 0); kdb_enc_u64(&e, 4, 1); kdb_enc_u64(&e, 5, 1); kdb_enc_end(&e);
-    CHECK_RC("tag 5 is unknown", send_enc(KDB_S_READY, &e), KDB_E_TLV_UNKNOWN);
+    kdb_enc_u64(&e, 1, 5); kdb_enc_u8(&e, 2, 3); kdb_enc_u64(&e, 3, 0); kdb_enc_u64(&e, 4, 1); kdb_enc_u64(&e, 6, 1); kdb_enc_end(&e);
+    CHECK_RC("tag 6 is unknown", send_enc(KDB_S_READY, &e), KDB_E_TLV_UNKNOWN);
+    /* review db_ingest [1]: tag 5, the CONFIG generation the batch numbers its views with (optional u64; 0 without it) */
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+    kdb_enc_u64(&e, 1, 5); kdb_enc_u8(&e, 2, KDB_BATCH_DIFF); kdb_enc_u64(&e, 3, 0); kdb_enc_u64(&e, 5, 42); kdb_enc_end(&e);
+    kdb_framer_init(&f, KDB_FROM_LOADER, g_rbuf, sizeof(g_rbuf));
+    CHECK_RC("feed3", kdb_framer_feed(&f, e.buf, e.len), KDB_OK);
+    CHECK_RC("next3", kdb_framer_next(&f, &fr), KDB_OK);
+    CHECK_RC("decode with the CONFIG generation", kdb_decode(&fr, NVIEWS, &m, why, sizeof(why)), KDB_OK);
+    CHECK(m.u.batch_begin.cfg_generation == 42 && m.u.batch_begin.request_id == 0);
+    CHECK_RC("state machine (generation)", send_enc(KDB_S_READY, &e), KDB_OK);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+    kdb_enc_u64(&e, 1, 5); kdb_enc_u8(&e, 2, 3); kdb_enc_u64(&e, 3, 0); kdb_enc_u32(&e, 5, 1); kdb_enc_end(&e);
+    CHECK_RC("generation of 4 bytes", send_enc(KDB_S_READY, &e), KDB_E_TLV_LEN);
+    kdb_enc_reset(&e); m_batch_begin(&e, 5);
+    kdb_framer_init(&f, KDB_FROM_LOADER, g_rbuf, sizeof(g_rbuf));
+    CHECK_RC("feed4", kdb_framer_feed(&f, e.buf, e.len), KDB_OK);
+    CHECK_RC("next4", kdb_framer_next(&f, &fr), KDB_OK);
+    CHECK_RC("decode without the generation", kdb_decode(&fr, NVIEWS, &m, why, sizeof(why)), KDB_OK);
+    CHECK(m.u.batch_begin.cfg_generation == 0);
     kdb_enc_free(&e);
 }
 

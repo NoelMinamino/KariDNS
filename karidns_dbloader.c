@@ -2157,7 +2157,10 @@ static int send_hello(ctx_t *x, const char *driver_list, uint32_t pid) {
 static int send_batch_begin(ctx_t *x, uint64_t id, uint8_t kind, uint64_t change_seq) {
     if (kdb_enc_begin(&x->enc, KDB_T_BATCH_BEGIN) != 0 || kdb_enc_u64(&x->enc, 1, id) != 0 ||
         kdb_enc_u8(&x->enc, 2, kind) != 0 || kdb_enc_u64(&x->enc, 3, change_seq) != 0 ||
-        (x->req_id && kdb_enc_u64(&x->enc, 4, x->req_id) != 0) || kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
+        (x->req_id && kdb_enc_u64(&x->enc, 4, x->req_id) != 0) ||
+        /* the CONFIG this batch numbers its views with: the Backend may have sent a newer one meanwhile (review db_ingest [1]) */
+        (x->io && x->io->cfg.generation && kdb_enc_u64(&x->enc, 5, x->io->cfg.generation) != 0) ||
+        kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
         return -1;
     return 0;
 }

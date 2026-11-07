@@ -256,7 +256,8 @@ kdb_rc_t kdb_framer_next(kdb_framer_t *f, kdb_frame_t *out);
 typedef struct { const char *p; uint32_t len; } kdb_str_t;     /* p == NULL: absent */
 
 typedef struct { uint16_t proto; kdb_str_t loader_version, driver; uint32_t pid; } kdb_hello_t;
-typedef struct { uint64_t batch_id; uint8_t kind; uint64_t change_seq; uint64_t request_id; /* 0 = none */ } kdb_batch_begin_t;
+typedef struct { uint64_t batch_id; uint8_t kind; uint64_t change_seq; uint64_t request_id; /* 0 = none */
+                 uint64_t cfg_generation; /* the CONFIG the loader made the batch with (tag 5; 0 = not sent) */ } kdb_batch_begin_t;
 typedef struct {
     uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id; uint8_t zone_kind; uint32_t serial;
     uint32_t flags; uint64_t rr_count; uint8_t digest[KDB_DIGEST_LEN]; kdb_str_t settings, profile;

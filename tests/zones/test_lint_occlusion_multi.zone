@@ -1,0 +1,9 @@
+$ORIGIN example.test.
+$TTL 300
+@        IN SOA ns1.example.test. hostmaster.example.test. ( 2026110801 3600 900 1209600 300 )
+         IN NS  ns1.example.test.
+ns1      IN A   192.0.2.1
+deep.sub IN TXT "below the cut, written before it"
+sub      IN NS  ns1.other.test.
+sub      IN NS  ns2.other.test.
+a.sub    IN A   192.0.2.5
