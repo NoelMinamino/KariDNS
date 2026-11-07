@@ -586,7 +586,11 @@ static bool notify_tcp_attempt(notify_pending_t *p, unsigned *rcode, char *why, 
     snprintf(why, whysz, "cannot connect%s", p->has_src ? " (from the configured notify source address)" : "");
     return false;
   }
-  limit_client_socket_rights(fd);
+  if (!limit_client_socket_rights(fd)) {          /* logged: a socket with wide rights is not used */
+    close(fd);
+    snprintf(why, whysz, "cannot limit the rights of the socket");
+    return false;
+  }
   uint8_t resp[NOTIFY_TCP_RESP_MAX];
   size_t rlen = 0;
   int64_t left = deadline - notify_now_ms();

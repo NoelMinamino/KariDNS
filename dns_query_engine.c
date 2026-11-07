@@ -980,6 +980,46 @@ static int answer_alias(const zone_image_t *img, uint32_t name_id, uint64_t key,
   return written;
 }
 
+/* A wildcard CNAME that was expanded on the way: the name that did not exist, and the zone (version, apex) the wildcard is in.  Every one of
+ * them needs its own proof that the name is not there (RFC 4035 §3.1.3.3, RFC 5155 §7.2.6), also when the chain goes on through other wildcard
+ * CNAMEs, so the proofs are made when the chain has ended.  The names live in a pool: one entry per step of the chain (16 at most), and the
+ * pool is large enough for any chain of ordinary names. */
+#define WC_PROOF_MAX 16
+#define WC_PROOF_POOL 4096
+typedef struct {
+  const char *qname;
+  const char *apex;
+  zone_version_t *zone;
+} wc_proof_t;
+
+typedef struct {
+  wc_proof_t e[WC_PROOF_MAX];
+  int n;
+  char pool[WC_PROOF_POOL];
+  size_t used;
+  bool overflow;              /* an entry did not fit: the chain cannot be proved, the answer is cut (TC) */
+} wc_proofs_t;
+
+static const char *wc_proof_dup(wc_proofs_t *p, const char *s) {
+  size_t l = strlen(s) + 1;
+  if (l > sizeof(p->pool) - p->used) return NULL;
+  char *d = p->pool + p->used;
+  memcpy(d, s, l);
+  p->used += l;
+  return d;
+}
+
+static void wc_proof_add(wc_proofs_t *p, const char *qname, const char *apex, zone_version_t *zone) {
+  if (p->n >= WC_PROOF_MAX) { p->overflow = true; return; }
+  const char *q = wc_proof_dup(p, qname);
+  const char *a = q ? wc_proof_dup(p, apex) : NULL;
+  if (!q || !a) { p->overflow = true; return; }
+  p->e[p->n].qname = q;
+  p->e[p->n].apex = a;
+  p->e[p->n].zone = zone;
+  p->n++;
+}
+
 static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16_t *qtypes, int num_qtypes,
                          zone_db_entry_t **db_entry_ptr,
                          zone_version_t **current_zone_ptr, uint8_t *res,
@@ -1016,10 +1056,10 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
     if (qtypes[k] == 46) rrsig_requested = true;
   bool sign_answers = dnssec_ok && !rrsig_requested;
   bool chain_exhausted = true;
-  bool any_cname_wc_expanded = false;
-  char first_wc_qname[DNS_NAME_TEXT_SIZE] = {0};
-  zone_version_t *first_wc_zone = NULL;
-  char first_wc_apex[DNS_NAME_TEXT_SIZE] = {0};
+  wc_proofs_t wc_proofs;
+  wc_proofs.n = 0;
+  wc_proofs.used = 0;
+  wc_proofs.overflow = false;
   for (int depth = 0; depth < 16; depth++) {
     zone_db_entry_t *db_entry = *db_entry_ptr;
     zone_version_t *current_zone = *current_zone_ptr;
@@ -1110,6 +1150,18 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
       }
     }
 
+    /* RFC 4035 §2.5 / RFC 2181 §10.1: a CNAME owner may also hold NSEC and RRSIG records, and a question for one of those types is about the
+     * name itself, not about what the CNAME points to: the NSEC (RRSIG) RRset the name has is the answer, whichever of the records comes first
+     * in the zone.  A name without such an RRset still follows its CNAME (a question for NSEC in an unsigned zone is an ordinary type). */
+    bool qtype_is_at_cname_owner = false;
+    if (qtypes[0] == 47 || qtypes[0] == 46) {
+      for (uint32_t k = q_first; k < q_end; k++) {
+        if (img_rrs[k].type != qtypes[0] || !(qclass == 255 || qclass == img_rrs[k].class_val) || rr_not_served(img, k)) continue;
+        uint32_t eff_ttl;
+        if (rr_valid(img, k, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) { qtype_is_at_cname_owner = true; break; }
+      }
+    }
+
     uint16_t minimal_any_chosen_type = 0;
     for (uint32_t k = q_first; k < q_end; k++) {
       uint16_t r_class = img_rrs[k].class_val;
@@ -1124,7 +1176,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
       uint16_t rec_type = img_rrs[k].type;
       bool follow_cname = false;
       if (rec_type == 5) {
-        if (qtypes[0] != 5 && qtypes[0] != 255) { follow_cname = true; }
+        if (qtypes[0] != 5 && qtypes[0] != 255 && !qtype_is_at_cname_owner) { follow_cname = true; }
       }
       if (follow_cname) {
         if (image_serialize_rr(img, k, res, max_res_len, offset, comp_ctx, NULL, eff_ttl) < 0) {
@@ -1336,14 +1388,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
                 if (qtypes[0] != 5 && qtypes[0] != 255) { follow_cname = true; }
               }
               if (follow_cname) {
-                if (!any_cname_wc_expanded) {
-                  any_cname_wc_expanded = true;
-                  strncpy(first_wc_qname, current_qname, sizeof(first_wc_qname) - 1);
-                  first_wc_qname[sizeof(first_wc_qname) - 1] = '\0';
-                  first_wc_zone = current_zone;
-                  strncpy(first_wc_apex, db_entry->domain, sizeof(first_wc_apex) - 1);
-                  first_wc_apex[sizeof(first_wc_apex) - 1] = '\0';
-                }
+                wc_proof_add(&wc_proofs, current_qname, db_entry->domain, current_zone);   /* one proof per expansion (see wc_proof_t) */
                 if (image_serialize_rr(img, k, res, max_res_len, offset, comp_ctx, current_qname, eff_ttl) < 0) {
                   res[2] |= 0x02;
                   return;
@@ -1744,10 +1789,15 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
       }
     }
 
-    if (dnssec_ok && any_cname_wc_expanded && !nsec_failed) {
-      zone_version_t *wc_zone = first_wc_zone ? first_wc_zone : current_zone;
+    /* The wildcard CNAMEs expanded on the way here, each with the proof that its name does not exist (RFC 4035 §3.1.3.3, RFC 5155 §7.2.6): one
+     * for every expansion, not only the first (a chain can go through several wildcards, also in other zones).  A chain with more of them
+     * than can be recorded is not proved: the answer is cut (TC) like any proof that does not fit. */
+    if (dnssec_ok && wc_proofs.overflow) nsec_failed = true;
+    for (int wi = 0; dnssec_ok && wi < wc_proofs.n && !nsec_failed; wi++) {
+      const char *first_wc_qname = wc_proofs.e[wi].qname;
+      zone_version_t *wc_zone = wc_proofs.e[wi].zone ? wc_proofs.e[wi].zone : current_zone;
       const zone_image_t *wc_img = wc_zone->image;
-      const char *wc_apex = first_wc_apex[0] ? first_wc_apex : db_entry->domain;
+      const char *wc_apex = wc_proofs.e[wi].apex;
       zone_n3_t wc_n3;
       if (!zone_nsec3(wc_img, wc_apex, &wc_n3)) {
         uint32_t cover = find_covering_nsec(wc_img, first_wc_qname);
@@ -2264,19 +2314,20 @@ STATIC_TEST ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss
   int64_t deadline = monotonic_ms() + timeout_ms;
   int fd = broker_connect_opts(ss->ss_family, SOCK_STREAM, (struct sockaddr *)ss, ss_len, &copts);
   if (fd < 0) return -1;
-  timeout_ms = remaining_ms(deadline);
 
-  if (query_len > 65535 || write_dns_tcp_timeout(fd, query, query_len, timeout_ms) != (ssize_t)query_len) {
+  /* write, length prefix and body share the one deadline: write_dns_tcp_timeout() and read_all_timeout() each start their own clock, so
+   * each gets what is left (0 = already late: they fail at once) */
+  if (query_len > 65535 || write_dns_tcp_timeout(fd, query, query_len, remaining_ms(deadline)) != (ssize_t)query_len) {
     close(fd);
     return -1;
   }
 
   uint8_t resp_len_prefix[2];
-  if (read_all_timeout(fd, resp_len_prefix, 2, timeout_ms) != 2) { close(fd); return -1; }
+  if (read_all_timeout(fd, resp_len_prefix, 2, remaining_ms(deadline)) != 2) { close(fd); return -1; }
   uint16_t resp_len = (resp_len_prefix[0] << 8) | resp_len_prefix[1];
   if (resp_len == 0 || resp_len > resp_out_cap) { close(fd); return -1; }
 
-  ssize_t got = read_all_timeout(fd, resp_out, resp_len, timeout_ms);
+  ssize_t got = read_all_timeout(fd, resp_out, resp_len, remaining_ms(deadline));
   close(fd);
   return got;
 }
@@ -2473,10 +2524,26 @@ bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, progra
 
   int in_pipe[2];  // parent(karidns) write -> child(script) stdin
   int out_pipe[2]; // child(script) stdout -> parent(karidns) read
-  if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0) {
+  if (pipe(in_pipe) != 0) {
     syslog(LOG_ERR, "[Plugin] pipe() failed for zone '%s': %m", zcfg->domain);
     return false;
   }
+  if (pipe(out_pipe) != 0) {
+    syslog(LOG_ERR, "[Plugin] pipe() failed for zone '%s': %m", zcfg->domain);
+    close(in_pipe[0]); close(in_pipe[1]);          /* the first pair would leak */
+    return false;
+  }
+
+  /* The child writes its two messages with write(2) from text made here: after pdfork() the Backend's other threads exist, and stdio
+   * (its locks, malloc) is not safe in the child of a multithreaded process. */
+  char child_msg_root[256], child_msg_user[256];
+  size_t child_msg_root_len = (size_t)snprintf(child_msg_root, sizeof(child_msg_root),
+      "[FATAL] Zone '%s': 'program-user' is not set and karidns is running as root; refusing to exec plugin as root.\n", zcfg->domain);
+  size_t child_msg_user_len = (size_t)snprintf(child_msg_user, sizeof(child_msg_user),
+      "[FATAL] Zone '%s': program-user '%s' differs from the non-root user karidns runs as; refusing to exec plugin.\n",
+      zcfg->domain, x->program_user ? x->program_user : "");
+  if (child_msg_root_len >= sizeof(child_msg_root)) child_msg_root_len = sizeof(child_msg_root) - 1;
+  if (child_msg_user_len >= sizeof(child_msg_user)) child_msg_user_len = sizeof(child_msg_user) - 1;
 
   int proc_fd = -1;
 #ifdef __FreeBSD__
@@ -2512,8 +2579,7 @@ bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, progra
     // 「root起動でuser/group未設定なら拒否する」既存ポリシーと同様に禁止する。
     if (!x->program_user && geteuid() == 0) {
       // 標準エラーはまだ生きている(closefromはSTDERR_FILENO+1から)ので出力可能
-      fprintf(stderr, "[FATAL] Zone '%s': 'program-user' is not set and karidns is running "
-              "as root; refusing to exec plugin as root.\n", zcfg->domain);
+      (void)!write(STDERR_FILENO, child_msg_root, child_msg_root_len);
       _exit(125);
     }
 
@@ -2526,8 +2592,7 @@ bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, progra
       } else if (prog_uid != geteuid() || prog_uid != getuid()) {
         // 非root起動では別ユーザーへ切り替えられない。main()の起動前検証
         // (validate_program_zone_users) で弾かれるはずだが念のため fail-closed。
-        fprintf(stderr, "[FATAL] Zone '%s': program-user '%s' differs from the non-root user "
-                "karidns runs as; refusing to exec plugin.\n", zcfg->domain, x->program_user);
+        (void)!write(STDERR_FILENO, child_msg_user, child_msg_user_len);
         _exit(126);
       }
     }
@@ -3982,10 +4047,12 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   /* Built-in CHAOS zones (version.bind, hostname.bind, id.server).  BIND answers a CHAOS question from its "_bind" view whatever the zones of the
    * other views are, so this comes before the zone of the IN view.  A zone of the same name in the configuration is served instead.  allow-query
    * of options (or the view the client matches) applies, as BIND's configure_view_acl() gives the _bind view the options' ACLs. */
+  bool ch_zone_here = false;                 /* a configured zone that carries the name of a built-in CHAOS zone is served instead of it */
   if (qclass == 3 && cfg) {
     bool at_apex = false;
     int zi = chaos_zone_of(current_qname_lc, &at_apex);
-    if (zi >= 0 && !(db_entry && domain_names_match_ci(db_entry->domain, k_chaos_apex[zi]))) {
+    ch_zone_here = zi >= 0 && db_entry && domain_names_match_ci(db_entry->domain, k_chaos_apex[zi]);
+    if (zi >= 0 && !ch_zone_here) {
       if (!zone_query_permitted(cfg, NULL, view ? view->name : NULL, client_ip)) {
         add_ede(&edns, send_ede, 18, "Query refused due to access control");
         return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
@@ -3998,6 +4065,26 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       if (is_badcookie) return build_badcookie_response(res, max_res_len, (uint16_t)q_offset, &edns, ext_rcode_out, is_tcp, cfg);
       return chaos_build_response(cfg, res, body_max_len, max_res_len, q_offset, zi, at_apex, qtype, &edns, is_tcp, ext_rcode_out, cfg);
     }
+  }
+  /* Every other question in class CH: all the zones of this server are of class IN (the "_bind" view of BIND is the only one in class CH and
+   * holds only the built-in zones), so there is no zone for it.  BIND finds no zone for the name in a CH view and does not recurse: REFUSED,
+   * AA=0 (RFC 1035 §4.1.1), with EDE 20 Not Authoritative (RFC 8914 §4.21).  It used to be looked up in the IN zone that holds the name and
+   * answered NOERROR / NXDOMAIN with AA=1, or relayed to a forwarder. */
+  if (qclass == 3 && !ch_zone_here && db_entry && current_zone && current_zone->image) {
+    /* a zone of class CH (its apex records are in class CH) is looked up like any other */
+    const zone_image_t *cimg = current_zone->image;
+    uint32_t apex_id = zone_image_find_name(cimg, db_entry->domain);
+    if (apex_id != ZONE_IMAGE_NONE) {
+      const zone_image_name_t *cn = &zone_image_names(cimg)[apex_id];
+      uint32_t ck = cn->first_rr, cend = ck + (cn->rr_count_flags & ZONE_IMAGE_NAME_COUNT_MASK);
+      for (; ck < cend; ck++)
+        if (zone_image_rrs(cimg)[ck].class_val == 3) { ch_zone_here = true; break; }
+    }
+  }
+  if (qclass == 3 && !ch_zone_here) {
+    if (is_badcookie) return build_badcookie_response(res, max_res_len, (uint16_t)q_offset, &edns, ext_rcode_out, is_tcp, cfg);
+    add_ede(&edns, send_ede, 20, "This server is not authoritative for the queried zone");
+    return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
   }
   if (db_entry && view) {
     const zone_config_t *zcfg = zone_cfg_any;

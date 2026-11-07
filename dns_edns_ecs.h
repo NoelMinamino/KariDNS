@@ -32,7 +32,7 @@ extern _Atomic uint64_t g_ede_other_total;
 typedef enum {
     SERVER_COOKIE_INVALID = 0,      /* wrong length/version, stale/too-far-future, or bad hash  */
     SERVER_COOKIE_VALID,            /* valid and fresh                                          */
-    SERVER_COOKIE_VALID_REFRESH     /* valid but older than 30 min: caller should send a new one */
+    SERVER_COOKIE_VALID_REFRESH     /* valid but older than 30 min, or made with a secret that is not the first: caller should send a new one */
 } server_cookie_status_t;
 
 void init_server_cookie_secret(void);

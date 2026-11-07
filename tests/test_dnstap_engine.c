@@ -188,6 +188,29 @@ static void test_dnstap_build_message(void) {
     out_len = dnstap_build_message(&meta_v4_srv, dummy_wire, sizeof(dummy_wire), out_buf, sizeof(out_buf));
     assert(out_len > 0);
 
+    /* low batch L3, dns_dnstap.c [1]: the largest message (a 64 KB wire of an AXFR message, IPv6 addresses both ways, a 255 octet
+     * query_zone) fits the buffers of the sender thread; the wire is in the frame whole.  When a field does not fit, the frame is
+     * not built at all (0), instead of going out with the field missing. */
+    {
+        uint8_t *big_wire = malloc(65535);
+        uint8_t *big_out = malloc(DNSTAP_FRAME_BUF_SIZE);
+        assert(big_wire && big_out);
+        memset(big_wire, 0x5A, 65535);
+        dnstap_event_meta_t m = meta_v6_r;
+        m.query_zone_len = sizeof(m.query_zone);
+        memset(m.query_zone, 0x01, sizeof(m.query_zone));
+        size_t n = dnstap_build_message(&m, big_wire, 65535, big_out, DNSTAP_FRAME_BUF_SIZE);
+        assert(n > 65535 && n < DNSTAP_FRAME_BUF_SIZE);
+        /* the 65535 octets of the wire and the 255 of the zone name are in it */
+        assert(memmem(big_out, n, big_wire, 65535) != NULL);
+        assert(memmem(big_out, n, m.query_zone, sizeof(m.query_zone)) != NULL);
+        assert(dnstap_build_message(&m, big_wire, 65535, big_out, 65535) == 0);        /* the wire alone does not fit: nothing is built */
+        assert(dnstap_build_message(&m, big_wire, 65535, big_out, 20) == 0);
+        assert(dnstap_build_message(&m, dummy_wire, sizeof(dummy_wire), big_out, 20) == 0);   /* ... a small one that does not fit either */
+        free(big_wire);
+        free(big_out);
+    }
+
     printf("  -> dnstap_build_message passed.\n");
 }
 

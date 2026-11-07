@@ -6,7 +6,7 @@
 #include <sys/capsicum.h> /* 再接続したソケットの権利を絞る (Capsicum は FreeBSD のみ) */
 #endif
 
-int g_dnstap_sock = -1;
+_Atomic int g_dnstap_sock = -1;
 _Atomic bool g_dnstap_connected = ATOMIC_VAR_INIT(false);
 _Atomic uint64_t g_dnstap_truncated_total = ATOMIC_VAR_INIT(0);
 _Atomic uint32_t g_dnstap_message_mask =
@@ -130,89 +130,93 @@ static bool dnstap_handshake(int sock) {
     return true;
 }
 
+/* pb_encode_* return 0 when a field does not fit: the frame is dropped (the caller gets 0) instead of going out with the field missing */
+#define PB_ADD(off, call) do { size_t pb_n_ = (call); if (pb_n_ == 0) return 0; (off) += pb_n_; } while (0)
+
 size_t dnstap_build_message(const dnstap_event_meta_t *meta,
                             const uint8_t *wire, size_t wire_len,
                             uint8_t *out_buf, size_t out_cap) {
-    uint8_t msg_buf[65535 + 256];
+    uint8_t msg_buf[DNSTAP_MSG_BUF_SIZE];
     size_t msg_offset = 0;
 
     // Message.type (field 1, required, varint): 1 = AUTH_QUERY, 2 = AUTH_RESPONSE
-    msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 1, meta->message_type);
+    PB_ADD(msg_offset, pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 1, meta->message_type));
 
     // Message.socket_family (field 2, varint): 1 = INET, 2 = INET6
     uint32_t fam = (meta->client_addr.ss_family == AF_INET6) ? 2 : 1;
-    msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 2, fam);
+    PB_ADD(msg_offset, pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 2, fam));
 
     // Message.socket_protocol (field 3, varint): 1 = UDP, 2 = TCP
     uint32_t proto = (meta->protocol == IPPROTO_TCP) ? 2 : 1;
-    msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 3, proto);
+    PB_ADD(msg_offset, pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 3, proto));
 
     // Message.query_address (field 4, bytes) & query_port (field 6, varint)
     if (meta->client_addr.ss_family == AF_INET) {
         struct sockaddr_in *sin = (struct sockaddr_in *)&meta->client_addr;
-        msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 4,
-                                            (const uint8_t *)&sin->sin_addr, 4);
-        msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 6,
-                                             ntohs(sin->sin_port));
+        PB_ADD(msg_offset, pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 4,
+                                            (const uint8_t *)&sin->sin_addr, 4));
+        PB_ADD(msg_offset, pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 6,
+                                             ntohs(sin->sin_port)));
     } else if (meta->client_addr.ss_family == AF_INET6) {
         struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&meta->client_addr;
-        msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 4,
-                                            (const uint8_t *)&sin6->sin6_addr, 16);
-        msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 6,
-                                             ntohs(sin6->sin6_port));
+        PB_ADD(msg_offset, pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 4,
+                                            (const uint8_t *)&sin6->sin6_addr, 16));
+        PB_ADD(msg_offset, pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 6,
+                                             ntohs(sin6->sin6_port)));
     }
 
     // Message.response_address (field 5, bytes) & response_port (field 7, varint)
     if (meta->has_server_addr) {
         if (meta->server_addr.ss_family == AF_INET) {
             struct sockaddr_in *sin = (struct sockaddr_in *)&meta->server_addr;
-            msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 5,
-                                                (const uint8_t *)&sin->sin_addr, 4);
+            PB_ADD(msg_offset, pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 5,
+                                                (const uint8_t *)&sin->sin_addr, 4));
             if (sin->sin_port != 0) {
-                msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 7,
-                                                     ntohs(sin->sin_port));
+                PB_ADD(msg_offset, pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 7,
+                                                     ntohs(sin->sin_port)));
             }
         } else if (meta->server_addr.ss_family == AF_INET6) {
             struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&meta->server_addr;
-            msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 5,
-                                                (const uint8_t *)&sin6->sin6_addr, 16);
+            PB_ADD(msg_offset, pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 5,
+                                                (const uint8_t *)&sin6->sin6_addr, 16));
             if (sin6->sin6_port != 0) {
-                msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 7,
-                                                     ntohs(sin6->sin6_port));
+                PB_ADD(msg_offset, pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 7,
+                                                     ntohs(sin6->sin6_port)));
             }
         }
     }
 
     if (meta->message_type == 1 /* AUTH_QUERY */) {
-        msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 8, (uint64_t)meta->ts.tv_sec);
-        msg_offset += pb_encode_fixed32_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 9, (uint32_t)meta->ts.tv_nsec);
-        msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 10, wire, wire_len);
+        PB_ADD(msg_offset, pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 8, (uint64_t)meta->ts.tv_sec));
+        PB_ADD(msg_offset, pb_encode_fixed32_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 9, (uint32_t)meta->ts.tv_nsec));
+        PB_ADD(msg_offset, pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 10, wire, wire_len));
     } else { // AUTH_RESPONSE
-        msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 12, (uint64_t)meta->ts.tv_sec);
-        msg_offset += pb_encode_fixed32_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 13, (uint32_t)meta->ts.tv_nsec);
-        msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 14, wire, wire_len);
+        PB_ADD(msg_offset, pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 12, (uint64_t)meta->ts.tv_sec));
+        PB_ADD(msg_offset, pb_encode_fixed32_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 13, (uint32_t)meta->ts.tv_nsec));
+        PB_ADD(msg_offset, pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 14, wire, wire_len));
     }
     // Message.query_zone (field 11, bytes): クエリが属するゾーンのワイヤ形式の名前 (dnstap.proto)
     if (meta->query_zone_len > 0 && meta->query_zone_len <= sizeof(meta->query_zone)) {
-        msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 11,
-                                            meta->query_zone, meta->query_zone_len);
+        PB_ADD(msg_offset, pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 11,
+                                            meta->query_zone, meta->query_zone_len));
     }
 
     // Top-level Dnstap: field 1 (identity), field 2 (version), field 15 (type = 1, MESSAGE, required), field 14 (message)
     size_t out_offset = 0;
     if (g_dnstap_identity[0]) {
-        out_offset += pb_encode_bytes_field(out_buf + out_offset, out_cap - out_offset, 1,
-                                            (const uint8_t *)g_dnstap_identity, strlen(g_dnstap_identity));
+        PB_ADD(out_offset, pb_encode_bytes_field(out_buf + out_offset, out_cap - out_offset, 1,
+                                            (const uint8_t *)g_dnstap_identity, strlen(g_dnstap_identity)));
     }
     if (g_dnstap_version[0]) {
-        out_offset += pb_encode_bytes_field(out_buf + out_offset, out_cap - out_offset, 2,
-                                            (const uint8_t *)g_dnstap_version, strlen(g_dnstap_version));
+        PB_ADD(out_offset, pb_encode_bytes_field(out_buf + out_offset, out_cap - out_offset, 2,
+                                            (const uint8_t *)g_dnstap_version, strlen(g_dnstap_version)));
     }
-    out_offset += pb_encode_varint_field(out_buf + out_offset, out_cap - out_offset, 15, 1);
-    out_offset += pb_encode_bytes_field(out_buf + out_offset, out_cap - out_offset, 14, msg_buf, msg_offset);
+    PB_ADD(out_offset, pb_encode_varint_field(out_buf + out_offset, out_cap - out_offset, 15, 1));
+    PB_ADD(out_offset, pb_encode_bytes_field(out_buf + out_offset, out_cap - out_offset, 14, msg_buf, msg_offset));
 
     return out_offset;
 }
+#undef PB_ADD
 
 bool dnstap_send_frame(const dnstap_event_meta_t *meta,
                        const uint8_t *wire, size_t wire_len,
@@ -519,7 +523,7 @@ static int64_t dnstap_now_ms(void) {
 
 void *dnstap_sender_thread_func(void *arg) {
     (void)arg;
-    static uint8_t g_dnstap_scratch_buf[65535 + 128]; // 送信スレッドは1本のみなので競合しない
+    static uint8_t g_dnstap_scratch_buf[DNSTAP_FRAME_BUF_SIZE]; // 送信スレッドは1本のみなので競合しない
     int64_t next_retry_ms = 0;
     int backoff_ms = 1000;
     while (1) {

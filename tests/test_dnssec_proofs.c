@@ -1769,8 +1769,169 @@ static void test_ds_from_parent_zone(void) {
     printf("  -> DS comes from the parent when it is served, otherwise from the child apex.\n");
 }
 
+/* ---- low batch L3, dns_query_engine.c [3]: NSEC / RRSIG questions at the owner of a CNAME ------------------------------------------------
+ * RFC 4035 §2.5 (and RFC 2181 §10.1): a CNAME owner of a signed zone also holds NSEC and RRSIG records.  A question for NSEC or RRSIG is about
+ * the name itself and is answered with them, whichever record comes first in the zone; a name without such an RRset follows its CNAME. */
+static const char *ZONE_CNAME_NSEC =
+    "$ORIGIN cn.test.\n$TTL 300\n"
+    "@ SOA ns1.out.test. h 1 3600 600 86400 60\n"
+    "@ RRSIG SOA 8 2 300 " P9_SIG " cn.test. AAAAAAAA\n"
+    "@ NS ns1.out.test.\n"
+    "@ RRSIG NS 8 2 300 " P9_SIG " cn.test. AAAAAAAA\n"
+    "@ NSEC c1.cn.test. NS SOA RRSIG NSEC\n"
+    "@ RRSIG NSEC 8 2 300 " P9_SIG " cn.test. AAAAAAAA\n"
+    /* the CNAME comes before the NSEC ... */
+    "c1 CNAME t\n"
+    "c1 RRSIG CNAME 8 3 300 " P9_SIG " cn.test. AAAAAAAA\n"
+    "c1 NSEC c2.cn.test. CNAME RRSIG NSEC\n"
+    "c1 RRSIG NSEC 8 3 300 " P9_SIG " cn.test. AAAAAAAA\n"
+    /* ... and after it */
+    "c2 NSEC c3.cn.test. CNAME RRSIG NSEC\n"
+    "c2 RRSIG NSEC 8 3 300 " P9_SIG " cn.test. AAAAAAAA\n"
+    "c2 CNAME t\n"
+    "c2 RRSIG CNAME 8 3 300 " P9_SIG " cn.test. AAAAAAAA\n"
+    /* no NSEC at this name */
+    "c3 CNAME t\n"
+    "t A 192.0.2.2\n"
+    "t RRSIG A 8 3 300 " P9_SIG " cn.test. AAAAAAAA\n"
+    "t NSEC cn.test. A RRSIG NSEC\n"
+    "t RRSIG NSEC 8 3 300 " P9_SIG " cn.test. AAAAAAAA\n";
+
+static void test_cname_owner_nsec_rrsig_questions(void) {
+    printf("[TEST] DNSSEC: QTYPE NSEC / RRSIG at the owner of a CNAME answers the name's own records (RFC 4035 2.5)...\n");
+    gr_setup("cn.test.", ZONE_CNAME_NSEC);
+    gr_resp_t r;
+    static const char *const names[] = { "c1.cn.test.", "c2.cn.test." };
+    for (size_t i = 0; i < 2; i++) {
+        gr_query(names[i], 47, true, &r);               /* NSEC + its RRSIG, no CNAME, whatever the order in the zone */
+        CHECK(&r, r.rcode == 0 && r.aa && gr_count(&r, 1, 47) == 1 && gr_count(&r, 1, 46) == 1 && gr_count(&r, 1, -1) == 2);
+        CHECK(&r, p9_count_owner(&r, 1, 47, names[i]) == 1);
+        gr_query(names[i], 47, false, &r);
+        CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 47) == 1 && gr_count(&r, 1, -1) == 1);
+        gr_query(names[i], 46, true, &r);               /* RRSIG: the signatures of the CNAME and of the NSEC, nothing else */
+        CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 46) == 2 && gr_count(&r, 1, -1) == 2);
+        gr_query(names[i], 1, true, &r);                /* any other type follows the CNAME */
+        CHECK(&r, gr_count(&r, 1, 5) == 1 && gr_count(&r, 1, 1) == 1);
+        gr_query(names[i], 5, true, &r);                /* CNAME itself: the CNAME only */
+        CHECK(&r, gr_count(&r, 1, 5) == 1 && gr_count(&r, 1, 1) == 0);
+    }
+    gr_query("c3.cn.test.", 47, true, &r);              /* no NSEC at c3: the CNAME is followed, the NSEC is the target's */
+    CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 5) == 1 && p9_count_owner(&r, 1, 47, "t.cn.test.") == 1);
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> NSEC / RRSIG questions at a CNAME owner.\n");
+}
+
+/* ---- low batch L3, dns_query_engine.c [10]: a proof for every wildcard expansion of a CNAME chain -----------------------------------------
+ * q.a -> (*.a CNAME) x.b -> (*.b CNAME) t -> A.  RFC 4035 §3.1.3.3: each expanded name needs the proof that it does not exist (NSEC: the NSEC
+ * that covers it; RFC 5155 §7.2.6, NSEC3: the closest encloser and the cover of the next closer name).  Only the first expansion used to have one. */
+static const char *ZONE_WC_CHAIN =
+    "$ORIGIN wc.test.\n$TTL 300\n"
+    "@ SOA ns1.out.test. h 1 3600 600 86400 60\n"
+    "@ RRSIG SOA 8 2 300 " P9_SIG " wc.test. AAAAAAAA\n"
+    "@ NS ns1.out.test.\n"
+    "@ RRSIG NS 8 2 300 " P9_SIG " wc.test. AAAAAAAA\n"
+    "@ NSEC *.a.wc.test. NS SOA RRSIG NSEC\n"
+    "@ RRSIG NSEC 8 2 300 " P9_SIG " wc.test. AAAAAAAA\n"
+    "*.a CNAME x.b.wc.test.\n"
+    "*.a RRSIG CNAME 8 3 300 " P9_SIG " wc.test. AAAAAAAA\n"
+    "*.a NSEC *.b.wc.test. CNAME RRSIG NSEC\n"
+    "*.a RRSIG NSEC 8 3 300 " P9_SIG " wc.test. AAAAAAAA\n"
+    "*.b CNAME t.wc.test.\n"
+    "*.b RRSIG CNAME 8 3 300 " P9_SIG " wc.test. AAAAAAAA\n"
+    "*.b NSEC t.wc.test. CNAME RRSIG NSEC\n"
+    "*.b RRSIG NSEC 8 3 300 " P9_SIG " wc.test. AAAAAAAA\n"
+    "t A 192.0.2.1\n"
+    "t RRSIG A 8 3 300 " P9_SIG " wc.test. AAAAAAAA\n"
+    "t NSEC wc.test. A RRSIG NSEC\n"
+    "t RRSIG NSEC 8 3 300 " P9_SIG " wc.test. AAAAAAAA\n";
+
+static void test_wildcard_cname_chain_proofs_nsec(void) {
+    printf("[TEST] DNSSEC: every wildcard CNAME expansion of a chain has its NSEC proof (RFC 4035 3.1.3.3)...\n");
+    gr_setup("wc.test.", ZONE_WC_CHAIN);
+    gr_resp_t r;
+    gr_query("q.a.wc.test.", 1, true, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && gr_count(&r, 1, 5) == 2 && gr_count(&r, 1, 1) == 1);
+    CHECK(&r, p9_count_owner(&r, 1, 5, "q.a.wc.test.") == 1 && p9_count_owner(&r, 1, 5, "x.b.wc.test.") == 1);   /* owners are the expanded names */
+    CHECK(&r, p9_count_owner(&r, 2, 47, "*.a.wc.test.") == 1);       /* covers q.a.wc.test. (the first expansion, as before) */
+    CHECK(&r, p9_count_owner(&r, 2, 47, "*.b.wc.test.") == 1);       /* covers x.b.wc.test. (the second one) */
+    CHECK(&r, gr_count(&r, 2, 47) == 2);
+    p9_expect_grouped(&r, 2, "wildcard chain authority");
+    /* one expansion: unchanged */
+    gr_query("q.b.wc.test.", 1, true, &r);
+    CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 5) == 1 && gr_count(&r, 1, 1) == 1 && gr_count(&r, 2, 47) == 1);
+    CHECK(&r, p9_count_owner(&r, 2, 47, "*.b.wc.test.") == 1);
+    /* DO=0: no proofs */
+    gr_query("q.a.wc.test.", 1, false, &r);
+    CHECK(&r, gr_count(&r, 1, 5) == 2 && gr_count(&r, 2, 47) == 0);
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> two expansions, two NSEC proofs.\n");
+}
+
+typedef struct { const char *name; char hash[33]; } wcn3_name_t;
+static int wcn3_cmp(const void *a, const void *b) { return strcmp(((const wcn3_name_t *)a)->hash, ((const wcn3_name_t *)b)->hash); }
+
+static bool wcn3_has_owner_hash(const gr_resp_t *r, int sect, const char *hash) {
+    for (int i = 0; i < r->nrr; i++)
+        if (r->rr[i].sect == sect && r->rr[i].type == 50 && strncasecmp(r->rr[i].name, hash, 32) == 0) return true;
+    return false;
+}
+
+static void test_wildcard_cname_chain_proofs_nsec3(void) {
+    printf("[TEST] DNSSEC: every wildcard CNAME expansion of a chain has its NSEC3 proof (RFC 5155 7.2.6)...\n");
+    wcn3_name_t nm[] = { { "wc3.test.", "" }, { "a.wc3.test.", "" }, { "*.a.wc3.test.", "" },
+                         { "b.wc3.test.", "" }, { "*.b.wc3.test.", "" }, { "t.wc3.test.", "" } };
+    const size_t n = sizeof(nm) / sizeof(nm[0]);
+    for (size_t i = 0; i < n; i++) {
+        assert(compute_nsec3_hash(nm[i].name, 1, 0, (const uint8_t *)"", 0, nm[i].hash, sizeof(nm[i].hash)));
+        for (char *p = nm[i].hash; *p; p++) *p = (char)toupper((unsigned char)*p);
+    }
+    char hash_a[33], hash_b[33];
+    memcpy(hash_a, nm[1].hash, 33);
+    memcpy(hash_b, nm[3].hash, 33);
+    qsort(nm, n, sizeof(nm[0]), wcn3_cmp);
+    char zone[8192];
+    int w = snprintf(zone, sizeof(zone),
+        "$ORIGIN wc3.test.\n$TTL 300\n"
+        "@ SOA ns1.out.test. h 1 3600 600 86400 60\n"
+        "@ RRSIG SOA 8 2 300 " P9_SIG " wc3.test. AAAAAAAA\n"
+        "@ NS ns1.out.test.\n"
+        "@ RRSIG NS 8 2 300 " P9_SIG " wc3.test. AAAAAAAA\n"
+        "@ NSEC3PARAM 1 0 0 -\n"
+        "*.a CNAME x.b.wc3.test.\n"
+        "*.a RRSIG CNAME 8 3 300 " P9_SIG " wc3.test. AAAAAAAA\n"
+        "*.b CNAME t.wc3.test.\n"
+        "*.b RRSIG CNAME 8 3 300 " P9_SIG " wc3.test. AAAAAAAA\n"
+        "t A 192.0.2.1\n"
+        "t RRSIG A 8 3 300 " P9_SIG " wc3.test. AAAAAAAA\n");
+    assert(w > 0);
+    for (size_t i = 0; i < n; i++) {
+        const char *types = strcmp(nm[i].name, "wc3.test.") == 0 ? " NS SOA RRSIG NSEC3PARAM"
+                          : (strcmp(nm[i].name, "a.wc3.test.") == 0 || strcmp(nm[i].name, "b.wc3.test.") == 0) ? ""
+                          : (strcmp(nm[i].name, "t.wc3.test.") == 0) ? " A RRSIG" : " CNAME RRSIG";
+        int x = snprintf(zone + w, sizeof(zone) - (size_t)w, "%s NSEC3 1 0 0 - %s%s\n%s RRSIG NSEC3 8 3 300 " P9_SIG " wc3.test. AAAAAAAA\n",
+                         nm[i].hash, nm[(i + 1) % n].hash, types, nm[i].hash);
+        assert(x > 0 && (size_t)x < sizeof(zone) - (size_t)w);
+        w += x;
+    }
+    gr_setup("wc3.test.", zone);
+    gr_resp_t r;
+    gr_query("q.a.wc3.test.", 1, true, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && gr_count(&r, 1, 5) == 2 && gr_count(&r, 1, 1) == 1);
+    CHECK(&r, wcn3_has_owner_hash(&r, 2, hash_a));     /* the closest encloser of q.a (a.wc3.test.) */
+    CHECK(&r, wcn3_has_owner_hash(&r, 2, hash_b));     /* the closest encloser of x.b (b.wc3.test.): the second expansion */
+    CHECK(&r, gr_count(&r, 2, 50) >= 3);               /* + the covers of the two next closer names (one record may serve both) */
+    p9_expect_grouped(&r, 2, "wildcard chain NSEC3 authority");
+    gr_query("q.b.wc3.test.", 1, true, &r);           /* one expansion */
+    CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 5) == 1 && wcn3_has_owner_hash(&r, 2, hash_b) && !wcn3_has_owner_hash(&r, 2, hash_a));
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> two expansions, two NSEC3 proofs.\n");
+}
+
 int main(void) {
     printf("=== Starting DNSSEC Negative-Proof Tests ===\n");
+    test_cname_owner_nsec_rrsig_questions();
+    test_wildcard_cname_chain_proofs_nsec();
+    test_wildcard_cname_chain_proofs_nsec3();
     test_dnssec_wire_decode_roundtrip();
     test_dnssec_wire_decode_usable();
     test_dnssec_wire_decode_malformed();

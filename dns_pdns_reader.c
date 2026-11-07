@@ -1595,6 +1595,8 @@ static int apply_presigned(pdns_zone_t *z) {
         goto done;
     }
     z->presigned_mode = out.mode;
+    if (out.param_ttl_from_soa)
+        zwarn(z, false, 0, "presigned zone: no RRSIG(NSEC3PARAM) at the apex; the NSEC3PARAM TTL is the SOA MINIMUM (the TTL the signer used is unknown)");
     if (out.mode == PS_NSEC3 && z->nsec3param) {      /* open item 3: the cap stays 2500 (RFC 5155 s10.3); RFC 9276 s3.1 says 0 */
         presigned_n3param_t np;
         const char *why = NULL;

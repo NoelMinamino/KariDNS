@@ -1492,7 +1492,10 @@ static int xfr_connect(axfr_bg_ctx_t *ctx, const xfr_primary_t *p, struct sockad
            p->has_src ? " (from the configured transfer source address)" : "");
     return -1;
   }
-  limit_client_socket_rights(tcp_fd);
+  if (!limit_client_socket_rights(tcp_fd)) {      /* logged: a socket with wide rights is not used */
+    close(tcp_fd);
+    return -1;
+  }
   struct timeval tv;
   tv.tv_sec = 30;
   tv.tv_usec = 0;

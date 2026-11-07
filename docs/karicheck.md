@@ -181,6 +181,7 @@ Every database gets a line `[RESULT] Database ...: N zone(s) read, E error(s), W
 | `cryptokeys` rows without `PRESIGNED=1` (PowerDNS would sign online, KariDNS serves signed data only) | error |
 | `NSEC3PARAM` metadata with a bad syntax; a presigned NSEC3 or NSEC chain that does not match the zone (a name without its `RRSIG(NSEC3)` owner, an `ordername` that is not the hash, parameters outside RFC 5155 §10.3) | error |
 | NSEC3 iterations other than 0 (RFC 9276) | warning |
+| a presigned NSEC3 zone without an `RRSIG(NSEC3PARAM)` at the apex: the TTL of the rebuilt `NSEC3PARAM` is the SOA MINIMUM, because the TTL the signer used is unknown | warning |
 | **Settings (metadata and profiles)** | |
 | the settings text of a zone or of its profile (`karidns_profiles`) does not parse in restricted mode, the profile is not defined | error |
 | the settings name a TSIG key that `karidns.conf` does not define | error |

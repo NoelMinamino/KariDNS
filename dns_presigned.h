@@ -37,7 +37,8 @@
  *   - type bit map = the types at the original owner name plus RRSIG when the name has RRSIGs, never NSEC3; the apex
  *     also gets NSEC3PARAM; at a delegation only NS, DS and RRSIG (RFC 4034 s4.1.2); empty for an ENT;
  *   - TTL of an NSEC3 = the Original TTL of its RRSIG(NSEC3) (RFC 4034 s3.1.4: the signature covers that TTL; this is
- *     what the signer used, RFC 9077 s3); NSEC3PARAM: Original TTL of RRSIG(NSEC3PARAM) at the apex, else SOA MINIMUM.
+ *     what the signer used, RFC 9077 s3); NSEC3PARAM: Original TTL of RRSIG(NSEC3PARAM) at the apex, else SOA MINIMUM (out->param_ttl_from_soa; the reader warns).
+ *   Only an NS cut occludes names (as PowerDNS does): a name below a DNAME needs its own NSEC3 owner.
  * Rebuild, NSEC (RFC 4034 s4, s6.1): chain owners are the owners of the RRSIG(NSEC) rows and must be exactly the names
  *   that are not occluded by a delegation (s4.1.2: no NSEC for a name that only holds glue); ENTs are not in an NSEC
  *   chain; next domain name = the next owner in canonical order, the last wraps to the apex; type bit map = the types at
@@ -64,6 +65,8 @@ typedef struct {
     size_t *anchor;             /* per line: index (in the arena) of the stored RRSIG row that covers the RRset the line
                                  * stands for; the line belongs right before that row (a signer writes an RRset and then its
                                  * RRSIG, so ANY answers and transfers list the RRsets in the signer's order); SIZE_MAX: at the end */
+    bool param_ttl_from_soa;    /* NSEC3: there is no RRSIG(NSEC3PARAM) at the apex, so the NSEC3PARAM TTL is the SOA MINIMUM; the
+                                 * caller logs a warning (the TTL the signer used is unknown) */
 } presigned_out_t;
 
 typedef struct {

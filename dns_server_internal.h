@@ -1293,8 +1293,8 @@ bool ensure_priv_dir_safe(const char *dir_buf);
  * hand_off_logging_channels()). */
 int log_open_channels(log_channel_t *list, bool hand_off);
 /* the files of the installed runtime: give them to the run user (root start-up with `user`), and take away the fchown right */
-void hand_off_logging_channels(void);
-void logging_drop_fchown(void);
+bool hand_off_logging_channels(void);
+bool logging_drop_fchown(void);
 
 /* dns_log.c: the operational log (see the top of that file) */
 typedef struct log_runtime log_runtime_t;
