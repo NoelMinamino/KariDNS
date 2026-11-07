@@ -1183,6 +1183,68 @@ static void test_rcache_cut_additional_not_cached(void) {
     printf("  [PASS] cut Additional section not cached (plain AR=%u, EDNS AR=%u)\n", ar_small, ar_big);
 }
 
+/* Review query_engine [5]: an answer synthesized from a wildcard keeps its wildcard mark when it comes from the cache,
+ * so that RRL counts it under "*.<zone>" (D-05) on a hit as on the first query. */
+static void test_rcache_wildcard_mark_kept(void) {
+    printf("[TEST] Shared response cache: a cached wildcard answer is still counted by RRL as a wildcard...\n");
+    static char text[] =
+        "wc.example. 3600 IN SOA ns.wc.example. h.wc.example. 1 7200 3600 1209600 3600\n"
+        "wc.example. 3600 IN NS ns.wc.example.\n"
+        "ns.wc.example. 3600 IN A 192.0.2.1\n"
+        "*.wc.example. 3600 IN A 192.0.2.9\n";
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "wc.example.", .is_standalone_mode = true, .err_out = &err };
+    assert(parse_zone_fast(text, strlen(text), &arena, &ctx) >= 0);
+    assert(test_build_index(&arena, true) == 0);
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    build_zone_response_cache(&arena.ver, &cfg, tst_entry(NULL, "wc.example."));
+    assert(arena.rcache_ok);
+    zone_db_entry_t e;
+    memset(&e, 0, sizeof(e));
+    strncpy(e.domain, "wc.example.", sizeof(e.domain) - 1);
+    atomic_store_explicit(&e.rcu.active, &arena.ver, memory_order_release);
+    zone_db_entry_t *entries[1] = { &e };
+    char *any_acl[1] = { (char *)"any" };
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view_set_entries(&view, entries, 1);
+    view.match_clients = any_acl;
+    view.match_clients_count = 1;
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+
+    uint8_t req[512], res[4096];
+    size_t req_len = 0;
+    compress_ctx_t cc = {0};
+    zone_db_entry_t *matched = NULL;
+    for (int round = 0; round < 2; round++) {
+        uint64_t hits0 = atomic_load(&e.observatory.wirecache_hits);
+        build_simple_query(req, &req_len, (uint16_t)(0x5201 + round), "rnd.wc.example.", 1);
+        compress_ctx_init_packet(&cc);
+        int len = process_dns_query_impl(req, req_len, res, 512, "rnd.wc.example.", 1,
+                                         "127.0.0.1", &cc, false, NULL, &snap, &cfg, &matched);
+        assert(len > 12 && (res[3] & 0x0F) == 0 && res[7] == 1);
+        assert(atomic_load(&e.observatory.wirecache_hits) == hits0 + (uint64_t)round);   /* the second is a hit */
+        assert(t_query_rrl_info.wildcard);
+    }
+    /* an answer that is not from a wildcard is not marked, from the cache either */
+    for (int round = 0; round < 2; round++) {
+        build_simple_query(req, &req_len, (uint16_t)(0x5211 + round), "ns.wc.example.", 1);
+        compress_ctx_init_packet(&cc);
+        int len = process_dns_query_impl(req, req_len, res, 512, "ns.wc.example.", 1,
+                                         "127.0.0.1", &cc, false, NULL, &snap, &cfg, &matched);
+        assert(len > 12 && !t_query_rrl_info.wildcard);
+    }
+    zone_arena_destroy(&arena);
+    printf("  [PASS] wildcard mark kept on a cache hit\n");
+}
+
 /* Two or three zones of one view (additional-from-auth yes, the default) for the sibling glue tests. */
 typedef struct {
     zone_arena_t arena[3];
@@ -1686,38 +1748,39 @@ static void test_rcache_store_layout(void) {
     assert(got > 0 && got <= 1400);
     uint8_t body[512], out[512];
     uint16_t an, ns, ar;
+    bool wc;
     int hits_total = 0;
     for (uint64_t k = 1; k <= 400; k++) {
         size_t len = 1 + (k * 37) % 300;
         for (size_t i = 0; i < len; i++) body[i] = (uint8_t)(k * 13 + i);
-        rcache_store(k, 7, 1, body, len, (uint16_t)k, 2, 3);
+        rcache_store(k, 7, 1, body, len, (uint16_t)k, 2, 3, (k & 1) != 0);
         /* the entry just stored is always there */
-        int l = rcache_lookup(k, 7, 1, out, sizeof(out), &an, &ns, &ar);
-        assert(l == (int)len && an == (uint16_t)k && ns == 2 && ar == 3 && memcmp(out, body, len) == 0);
+        int l = rcache_lookup(k, 7, 1, out, sizeof(out), &an, &ns, &ar, &wc);
+        assert(l == (int)len && an == (uint16_t)k && ns == 2 && ar == 3 && wc == ((k & 1) != 0) && memcmp(out, body, len) == 0);
         /* older entries either hit with their own bytes or miss */
         for (uint64_t j = (k > 12 ? k - 12 : 1); j < k; j++) {
             size_t jl = 1 + (j * 37) % 300;
-            l = rcache_lookup(j, 7, 1, out, sizeof(out), &an, &ns, &ar);
+            l = rcache_lookup(j, 7, 1, out, sizeof(out), &an, &ns, &ar, &wc);
             if (l < 0) continue;
             assert(l == (int)jl && an == (uint16_t)j);
             for (size_t i = 0; i < jl; i++) assert(out[i] == (uint8_t)(j * 13 + i));
             hits_total++;
         }
         /* wrong generation, wrong qtype, too little room: miss */
-        assert(rcache_lookup(k, 8, 1, out, sizeof(out), &an, &ns, &ar) < 0);
-        assert(rcache_lookup(k, 7, 28, out, sizeof(out), &an, &ns, &ar) < 0);
-        assert(rcache_lookup(k, 7, 1, out, len - 1, &an, &ns, &ar) < 0 || len == 0);
+        assert(rcache_lookup(k, 8, 1, out, sizeof(out), &an, &ns, &ar, &wc) < 0);
+        assert(rcache_lookup(k, 7, 28, out, sizeof(out), &an, &ns, &ar, &wc) < 0);
+        assert(rcache_lookup(k, 7, 1, out, len - 1, &an, &ns, &ar, &wc) < 0 || len == 0);
     }
     assert(hits_total > 0);
     /* the same key stored again replaces the old body */
     memset(body, 0xAB, 40);
-    rcache_store(9999, 7, 1, body, 40, 1, 0, 0);
+    rcache_store(9999, 7, 1, body, 40, 1, 0, 0, false);
     memset(body, 0xCD, 24);
-    rcache_store(9999, 7, 1, body, 24, 1, 0, 0);
-    assert(rcache_lookup(9999, 7, 1, out, sizeof(out), &an, &ns, &ar) == 24 && out[0] == 0xCD && out[23] == 0xCD);
+    rcache_store(9999, 7, 1, body, 24, 1, 0, 0, false);
+    assert(rcache_lookup(9999, 7, 1, out, sizeof(out), &an, &ns, &ar, &wc) == 24 && out[0] == 0xCD && out[23] == 0xCD);
     /* bodies over the limit are not stored */
-    rcache_store(4242, 7, 1, body, 497, 1, 0, 0);
-    assert(rcache_lookup(4242, 7, 1, out, sizeof(out), &an, &ns, &ar) < 0);
+    rcache_store(4242, 7, 1, body, 497, 1, 0, 0, false);
+    assert(rcache_lookup(4242, 7, 1, out, sizeof(out), &an, &ns, &ar, &wc) < 0);
     printf("  [PASS] variable-length store, wrap-around and eviction\n");
 }
 
@@ -1843,6 +1906,7 @@ int main(void) {
     test_wire_cache_observatory_counters();
     test_rcache_cross_zone_cname_not_cached();
     test_rcache_cut_additional_not_cached();
+    test_rcache_wildcard_mark_kept();
     test_rcache_sibling_glue_not_cached();
     test_rcache_sibling_tagged_glue_not_cached();
     test_referral_tc_only_for_in_domain_glue();

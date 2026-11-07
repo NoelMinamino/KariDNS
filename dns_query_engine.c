@@ -753,6 +753,31 @@ STATIC_TEST bool attach_nsec3_record(const zone_image_t *img, uint32_t rr,
                                 attached, attached_count);
 }
 
+/* RFC 5155 §7.2.3 / §7.2.4: no NSEC3 matches `name` (an unsigned delegation in an Opt-Out span): the closest provable
+ * encloser proof, the NSEC3 that matches the closest encloser and the one that covers the next closer name (§7.2.1;
+ * the cover has the Opt-Out bit). Shared by the referral (find_delegation) and the NODATA answer to a DS query at
+ * that delegation. false = it did not fit (the caller sets TC). */
+static bool attach_nsec3_optout_proof(const zone_image_t *img, const zone_n3_t *n3, const char *name,
+                                      const char *zone_apex, const char client_loc[2], const char *client_ecs_tag,
+                                      const char *client_loc_tag, uint8_t *res, size_t max_res_len, uint16_t *offset,
+                                      compress_ctx_t *comp_ctx, uint16_t *nscount,
+                                      const zone_image_rr_t **attached, int *attached_count) {
+  const char *encloser = find_closest_encloser(img, name, zone_apex, client_loc, client_ecs_tag, client_loc_tag);
+  if (!encloser) return true;
+  char h[64];
+  if (compute_nsec3_hash(encloser, n3->algorithm, n3->iterations, n3->salt, n3->salt_len, h, sizeof(h)) &&
+      !attach_nsec3_record(img, find_matching_nsec3(img, n3->chain, h, zone_apex), res, max_res_len, offset, comp_ctx,
+                           nscount, attached, attached_count))
+    return false;
+  char nc_name[DNS_NAME_TEXT_SIZE];
+  if (find_next_closer_name(name, encloser, nc_name, sizeof(nc_name)) &&
+      compute_nsec3_hash(nc_name, n3->algorithm, n3->iterations, n3->salt, n3->salt_len, h, sizeof(h)) &&
+      !attach_nsec3_record(img, find_covering_nsec3(img, n3->chain, h), res, max_res_len, offset, comp_ctx, nscount,
+                           attached, attached_count))
+    return false;
+  return true;
+}
+
 /* 委任 (referral) の応答を作る。qname から apex の手前まで順に、NS RRset のある名前 (ゾーンカット) を探し、
  * あれば Authority に NS、DS または DS の不在の証明、Additional にグルーを書いて true を返す。 */
 STATIC_TEST bool find_delegation(const zone_image_t *img, const char *qname,
@@ -839,28 +864,12 @@ STATIC_TEST bool find_delegation(const zone_image_t *img, const char *qname,
                       res[2] |= 0x02;
                       return true;
                     }
-                  } else {
-                    // Opt-Out: Next Closer covering NSEC3 and Closest Provable Encloser matching NSEC3 (RFC 5155 §7.2.3)
-                    uint32_t c_rec = find_covering_nsec3(img, n3.chain, q_hash);
-                    if (c_rec != ZONE_IMAGE_NONE) {
-                      if (!attach_nsec3_record(img, c_rec, res, max_res_len, offset, comp_ctx, nscount, attached, &attached_cnt)) {
-                        res[2] |= 0x02;
-                        return true;
-                      }
-                    }
-                    const char *encloser = find_closest_encloser(img, name, zone_apex, client_loc, client_ecs_tag, client_loc_tag);
-                    if (encloser) {
-                      char ce_hash[64];
-                      if (compute_nsec3_hash(encloser, n3.algorithm, n3.iterations, n3.salt, n3.salt_len, ce_hash, sizeof(ce_hash))) {
-                        uint32_t ce_rec = find_matching_nsec3(img, n3.chain, ce_hash, zone_apex);
-                        if (ce_rec != ZONE_IMAGE_NONE) {
-                          if (!attach_nsec3_record(img, ce_rec, res, max_res_len, offset, comp_ctx, nscount, attached, &attached_cnt)) {
-                            res[2] |= 0x02;
-                            return true;
-                          }
-                        }
-                      }
-                    }
+                  } else if (!attach_nsec3_optout_proof(img, &n3, name, zone_apex, client_loc, client_ecs_tag,
+                                                        client_loc_tag, res, max_res_len, offset, comp_ctx, nscount,
+                                                        attached, &attached_cnt)) {
+                    // Opt-Out: Closest Provable Encloser matching NSEC3 and Next Closer covering NSEC3 (RFC 5155 §7.2.3)
+                    res[2] |= 0x02;
+                    return true;
                   }
                 }
               }
@@ -1459,7 +1468,11 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
           else if (wa > 0) qtx_matched = true;
         }
 
-        if (!qtx_matched && !this_qtx_failed && (img->flags & ZONE_IMAGE_F_WILDCARD)) {
+        /* RFC 4592 2.2.1 / 3.3.1: a wildcard answers only for a name that does not exist (the same check as phase 4);
+         * at an existing name a type it lacks is NODATA for that type.  The flag is local: the wc_found of the
+         * first QTYPE decides the proofs of phase 8 (review query_engine [2]). */
+        if (!qtx_matched && !this_qtx_failed && (img->flags & ZONE_IMAGE_F_WILDCARD) &&
+            !name_exists_in_zone(img, current_qname, client_loc, client_ecs_tag, client_loc_tag)) {
           const char *parent = current_qname;
           char wc_name[DNS_NAME_TEXT_SIZE];
           wc_name[0] = '*'; wc_name[1] = '.';
@@ -1467,17 +1480,17 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
             parent++; if (*parent == '\0') break;
             size_t parent_len = current_qname_len - (size_t)(parent - current_qname);
             if (parent_len + 3 > sizeof(wc_name)) break;
-            wc_found = false;
+            bool wcx_found = false;
             memcpy(&wc_name[2], parent, parent_len + 1);
             uint32_t wc_id = zone_image_find_name(img, wc_name);
             if (wc_id != ZONE_IMAGE_NONE) {
               int ww = emit_rrset(img, wc_id, current_qname, qtx, qclass, &flt, qtx_mode,
                                   res, max_res_len, offset, comp_ctx, ancount, &glue);
               if (ww < 0) this_qtx_failed = true;
-              else if (ww > 0) wc_found = qtx_matched = true;
-              if (wc_found) t_query_rrl_info.wildcard = true; /* D-05 */
+              else if (ww > 0) wcx_found = qtx_matched = true;
+              if (wcx_found) t_query_rrl_info.wildcard = true; /* D-05 */
             }
-            if (wc_found || this_qtx_failed) break;
+            if (wcx_found || this_qtx_failed) break;
 
             // ★重要: RFC 4592 準拠 (親存在チェック)
             if (name_exists_in_zone(img, parent, client_loc, client_ecs_tag, client_loc_tag))
@@ -1680,6 +1693,13 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
               if (!attach_nsec3_record(img, m_rec, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                 nsec_failed = true;
               }
+            } else if (qtypes[0] == 43 &&
+                       !attach_nsec3_optout_proof(img, &n3, current_qname, db_entry->domain, client_loc, client_ecs_tag,
+                                                  client_loc_tag, res, max_res_len, offset, comp_ctx, nscount,
+                                                  attached_nsec3, &attached_nsec3_cnt)) {
+              /* RFC 5155 §7.2.4: DS at an unsigned delegation in an Opt-Out span has no matching NSEC3; the closest
+               * provable encloser proof instead (review query_engine [9]) */
+              nsec_failed = true;
             }
           }
         } else if (!found) {
@@ -1994,6 +2014,9 @@ STATIC_TEST ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t 
   return (ssize_t)nread;
 }
 
+#define PLUGIN_STALE_FRAMES 4 /* late replies dropped before the reply to this query */
+STATIC_TEST bool question_section_matches(const uint8_t *resp, size_t resp_len, const uint8_t *req, size_t req_len);
+
 /* max_res_len: 応答の上限 (UDP ではクライアントの上限。超えたら TC=1 に切り詰める)。
  * res_cap: res の容量。disable-auto-tc-flag yes のときは max_res_len を超えてもそのまま返すが、
  * res_cap は超えない (O-01)。res_cap を超える応答は TC=1 に切り詰める。 */
@@ -2008,6 +2031,21 @@ STATIC_TEST int dispatch_to_program_zone(const char *view_name, const char *doma
   }
 
   pthread_mutex_lock(&plugin->lock);
+  /* Review query_engine [1]: another worker may have marked the plugin dead while this one waited for the lock */
+  if (atomic_load_explicit(&plugin->dead, memory_order_acquire)) {
+    pthread_mutex_unlock(&plugin->lock);
+    return build_synthetic_servfail(req, req_len, res, max_res_len);
+  }
+  /* after a failure (a timeout) the pipe may hold the rest of a reply that came too late: drop what is there before
+   * the query, and check the reply of this query (below) */
+  bool strict = plugin->resync;
+  if (strict) {
+    uint8_t junk[512];
+    struct pollfd pfd = { .fd = plugin->stdout_fd, .events = POLLIN, .revents = 0 };
+    while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN) && read(plugin->stdout_fd, junk, sizeof(junk)) > 0) {
+    }
+    plugin->resync = false;
+  }
 
   // H-3: 1クエリ全体で共有する絶対締切。以降の全I/O呼び出しは
   // 「plugin->timeout_ms」ではなく「この締切までの残り時間」を使う。
@@ -2025,33 +2063,32 @@ STATIC_TEST int dispatch_to_program_zone(const char *view_name, const char *doma
   if (ok && write_all_timeout(plugin->stdin_fd, req, req_len, remaining_ms(deadline)) != (ssize_t)req_len) ok = false;
 
   int result_len = 0;
-  if (ok) {
+  /* Review query_engine [1]: after a failure a reply is taken as the answer to this query only if it carries the
+   * query's ID, QR=1 and the same question (RFC 1035 7.3, as dispatch_forward_zone checks).  A reply that came too
+   * late for the query that failed is a whole frame: it is dropped and the next frame is read, within the deadline;
+   * more than PLUGIN_STALE_FRAMES of them is a failure.  Otherwise the reply is passed on as the plugin wrote it:
+   * program zones are for testing, and a plugin may send a malformed reply on purpose (docs/karidns.md). */
+  uint16_t qdcount = (uint16_t)((req[4] << 8) | req[5]);
+  size_t req_qend = get_question_end_offset(req, req_len, qdcount);
+  for (int frame = 0; ok && frame <= PLUGIN_STALE_FRAMES; frame++) {
+    bool truncated = false;
+    size_t raw_len = 0;
     uint8_t resp_len_prefix[2];
     if (read_all_timeout(plugin->stdout_fd, resp_len_prefix, 2, remaining_ms(deadline)) == 2) {
       uint32_t resp_len = ((uint32_t)resp_len_prefix[0] << 8) | resp_len_prefix[1];
       if (resp_len == 0) {
         result_len = 0; // 意図的な無応答
         ok = true;
+        break;
       } else if (resp_len > 65535) {
         syslog(LOG_ERR, "[Plugin] zone '%s' returned response > 65535 bytes (%u); rejecting with SERVFAIL",
                domain, (unsigned int)resp_len);
         ok = false;
-      } else if (plugin->disable_auto_tc_flag && resp_len <= res_cap) {
+      } else if ((plugin->disable_auto_tc_flag && resp_len <= res_cap) || resp_len <= max_res_len) {
         // disable-auto-tc-flag yes (default: no): do not truncate or force TC=1; send full response as-is
         // (up to 65535, but never more than the response buffer holds: O-01)
-        if (read_all_timeout(plugin->stdout_fd, res, resp_len, remaining_ms(deadline)) == (ssize_t)resp_len) {
-          result_len = (int)resp_len;
-          ok = true;
-        } else {
-          ok = false;
-        }
-      } else if (resp_len <= max_res_len) {
-        if (read_all_timeout(plugin->stdout_fd, res, resp_len, remaining_ms(deadline)) == (ssize_t)resp_len) {
-          result_len = (int)resp_len;
-          ok = true;
-        } else {
-          ok = false;
-        }
+        ok = read_all_timeout(plugin->stdout_fd, res, resp_len, remaining_ms(deadline)) == (ssize_t)resp_len;
+        raw_len = resp_len;
       } else {
         syslog(LOG_INFO, "[Plugin] zone '%s' returned oversized response (%u > %zu); truncating with TC=1",
                domain, (unsigned int)resp_len, plugin->disable_auto_tc_flag ? res_cap : max_res_len);
@@ -2069,27 +2106,8 @@ STATIC_TEST int dispatch_to_program_zone(const char *view_name, const char *doma
             }
             remaining -= chunk;
           }
-          if (ok) {
-            // TCビットをセットし、質問セクション以降をクリアして切り詰め応答とする
-            res[0] = req[0]; res[1] = req[1]; // クエリのトランザクションIDを反映
-            res[2] |= 0x82;                   // QR=1, TC=1
-            res[4] = req[4]; res[5] = req[5]; // QDCOUNT
-            res[6] = 0; res[7] = 0;           // ANCOUNT=0
-            res[8] = 0; res[9] = 0;           // NSCOUNT=0
-            res[10] = 0; res[11] = 0;         // ARCOUNT=0
-            uint16_t qdcount = (req[4] << 8) | req[5];
-            size_t qlen = get_question_end_offset(res, first_chunk, qdcount);
-            if (qlen < DNS_HEADER_SIZE || qlen > first_chunk) {
-              size_t req_qlen = get_question_end_offset(req, req_len, qdcount);
-              if (req_qlen >= DNS_HEADER_SIZE && req_qlen <= max_res_len) {
-                memcpy(res + DNS_HEADER_SIZE, req + DNS_HEADER_SIZE, req_qlen - DNS_HEADER_SIZE);
-                qlen = req_qlen;
-              } else {
-                qlen = DNS_HEADER_SIZE;
-              }
-            }
-            result_len = (int)qlen;
-          }
+          raw_len = first_chunk;
+          truncated = true;
         } else {
           ok = false;
         }
@@ -2097,10 +2115,45 @@ STATIC_TEST int dispatch_to_program_zone(const char *view_name, const char *doma
     } else {
       ok = false;
     }
+    if (!ok) break;
+
+    /* a cut reply whose first part is shorter than the question can be checked by its header only */
+    bool answers = !strict || (raw_len >= DNS_HEADER_SIZE && res[0] == req[0] && res[1] == req[1] && (res[2] & 0x80) &&
+                   (question_section_matches(res, raw_len, req, req_len) || (truncated && raw_len < req_qend)));
+    if (!answers) {
+      syslog(LOG_WARNING, "[Plugin] zone '%s' sent a reply that does not answer this query (ID %02x%02x, "
+             "a late reply to an earlier query?); dropped", domain, res[0], res[1]);
+      if (frame == PLUGIN_STALE_FRAMES) ok = false;
+      continue;
+    }
+    if (truncated) {
+      // TCビットをセットし、質問セクション以降をクリアして切り詰め応答とする
+      size_t first_chunk = raw_len;
+      res[0] = req[0]; res[1] = req[1]; // クエリのトランザクションIDを反映
+      res[2] |= 0x82;                   // QR=1, TC=1
+      res[4] = req[4]; res[5] = req[5]; // QDCOUNT
+      res[6] = 0; res[7] = 0;           // ANCOUNT=0
+      res[8] = 0; res[9] = 0;           // NSCOUNT=0
+      res[10] = 0; res[11] = 0;         // ARCOUNT=0
+      size_t qlen = get_question_end_offset(res, first_chunk, qdcount);
+      if (qlen < DNS_HEADER_SIZE || qlen > first_chunk) {
+        if (req_qend >= DNS_HEADER_SIZE && req_qend <= max_res_len) {
+          memcpy(res + DNS_HEADER_SIZE, req + DNS_HEADER_SIZE, req_qend - DNS_HEADER_SIZE);
+          qlen = req_qend;
+        } else {
+          qlen = DNS_HEADER_SIZE;
+        }
+      }
+      result_len = (int)qlen;
+    } else {
+      result_len = (int)raw_len;
+    }
+    break;
   }
 
   if (!ok) {
     unsigned int f = atomic_fetch_add_explicit(&plugin->consecutive_failures, 1, memory_order_acq_rel) + 1;
+    plugin->resync = true;
     syslog(LOG_ERR, "[Plugin] zone '%s' communication failure (%u/%u)", domain, f, plugin->max_failures);
     if (f >= plugin->max_failures) {
       atomic_store_explicit(&plugin->dead, true, memory_order_release);
@@ -2658,7 +2711,7 @@ view_snapshot_t *select_view_req(zone_db_snapshot_t *snap, const server_config_t
 typedef struct {
   _Atomic uint64_t tag;    /* 鍵の SipHash。0 = 空き */
   _Atomic uint64_t gen;    /* ゾーンのデータの版 */
-  _Atomic uint64_t counts; /* ancount | nscount << 16 | arcount << 32 */
+  _Atomic uint64_t counts; /* ancount | nscount << 16 | arcount << 32 | (wildcard answer) << 48 */
   _Atomic uint32_t meta;   /* qtype << 16 | 本体の長さ */
   _Atomic uint32_t off;    /* データ領域の語の位置 */
 } rcache_ent_t;
@@ -2718,7 +2771,7 @@ static rcache_set_t *rcache_set_of(uint64_t tag) {
 
 /* 見つかれば本体を dst に写して長さを返す。無い/入りきらない/書き込み中なら -1 */
 STATIC_TEST int rcache_lookup(uint64_t tag, uint64_t gen, uint16_t qtype, uint8_t *dst, size_t room,
-                         uint16_t *an, uint16_t *ns, uint16_t *ar) {
+                         uint16_t *an, uint16_t *ns, uint16_t *ar, bool *wildcard) {
   rcache_set_t *set = rcache_set_of(tag);
   uint32_t s1 = atomic_load_explicit(&set->seq, memory_order_acquire);
   if (s1 & 1) return -1;
@@ -2743,13 +2796,14 @@ STATIC_TEST int rcache_lookup(uint64_t tag, uint64_t gen, uint16_t qtype, uint8_
     *an = (uint16_t)counts;
     *ns = (uint16_t)(counts >> 16);
     *ar = (uint16_t)(counts >> 32);
+    *wildcard = (counts >> 48) & 1;
     return (int)len;
   }
   return -1;
 }
 
 STATIC_TEST void rcache_store(uint64_t tag, uint64_t gen, uint16_t qtype, const uint8_t *body, size_t len,
-                         uint16_t an, uint16_t ns, uint16_t ar) {
+                         uint16_t an, uint16_t ns, uint16_t ar, bool wildcard) {
   if (len == 0 || len > RCACHE_BODY_MAX) return;
   rcache_set_t *set = rcache_set_of(tag);
   uint32_t s0 = atomic_load_explicit(&set->seq, memory_order_relaxed);
@@ -2791,7 +2845,8 @@ STATIC_TEST void rcache_store(uint64_t tag, uint64_t gen, uint16_t qtype, const 
   atomic_store_explicit(&e->gen, gen, memory_order_relaxed);
   atomic_store_explicit(&e->meta, ((uint32_t)qtype << 16) | (uint32_t)len, memory_order_relaxed);
   atomic_store_explicit(&e->off, off, memory_order_relaxed);
-  atomic_store_explicit(&e->counts, (uint64_t)an | ((uint64_t)ns << 16) | ((uint64_t)ar << 32), memory_order_relaxed);
+  atomic_store_explicit(&e->counts, (uint64_t)an | ((uint64_t)ns << 16) | ((uint64_t)ar << 32) |
+                        ((uint64_t)wildcard << 48), memory_order_relaxed);
   atomic_store_explicit(&set->head, off + words, memory_order_relaxed);
   atomic_store_explicit(&set->seq, s0 + 2, memory_order_release);
 }
@@ -4230,8 +4285,11 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
      * setting. */
     rc_tag = rcache_tag(current_qname_lc, qtype, (uint16_t)(qclass | (mr_mode << 12)), rc_gen, cfg ? cfg->generation : 0);
     uint16_t c_an, c_ns, c_ar;
-    int blen = rcache_lookup(rc_tag, rc_gen, qtype, res + q_offset, body_max_len - q_offset, &c_an, &c_ns, &c_ar);
+    bool c_wc;
+    int blen = rcache_lookup(rc_tag, rc_gen, qtype, res + q_offset, body_max_len - q_offset, &c_an, &c_ns, &c_ar, &c_wc);
     if (blen > 0) {
+      /* review query_engine [5]: an answer from a wildcard is counted by RRL under "*.<zone>" (D-05), also from the cache */
+      t_query_rrl_info.wildcard = c_wc;
       uint16_t body_offset = (uint16_t)(q_offset + blen);
       uint16_t arcount = c_ar;
       res[2] |= 0x04; /* 入れるのは AA の応答だけ */
@@ -4317,7 +4375,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
    * (ヒットした応答は UDP の 512 オクテットに入る大きさに限る)。別のゾーンへ移った応答と、Additional を打ち切った応答、兄弟ゾーンのグルーを使った応答 (C1) は入れない */
   if (rc_tag && !t_resolve_crossed_zone && !t_resolve_additional_cut && !t_resolve_sibling_glue && !t_resolve_alias_expanded && (res[3] & 0x0F) == 0 && (res[2] & 0x04) && !(res[2] & 0x02) && ancount > 0 &&
       edns.ede_count == 0 && offset > q_offset && offset <= UDP_DEFAULT_MAX_RES_LEN) {
-    rcache_store(rc_tag, rc_gen, qtype, res + q_offset, (size_t)(offset - q_offset), ancount, nscount, arcount);
+    rcache_store(rc_tag, rc_gen, qtype, res + q_offset, (size_t)(offset - q_offset), ancount, nscount, arcount,
+                 t_query_rrl_info.wildcard);
   }
 
   if (edns.present) {

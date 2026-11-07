@@ -22,7 +22,8 @@
 typedef struct {
   atomic_flag lock;
   _Atomic uint64_t key_hash;
-  int64_t last_refill_ms;
+  int64_t last_refill_ms; /* 残高を数え終えた時刻 (端数の時間を持ち越すので、最後に使った時刻より前のことがある) */
+  int64_t last_used_ms;   /* 最後に応答を数えた時刻: 窓の失効と、追い出す枠の選択 (LRU) */
   int32_t tokens;
   uint32_t slip_counter;
 } rrl_bucket_t;
@@ -215,9 +216,43 @@ static void rrl_unlock(rrl_bucket_t *b) {
   atomic_flag_clear_explicit(&b->lock, memory_order_release);
 }
 
-/* キーのバケットからトークンを1つ使う。戻り値: 1 = 許可、0 = 制限 (*out_slip は slip の番か)、
- * -1 = 候補のバケットがすべて使用中 (制限しない: 他のクライアントのトークンを奪わない)。 */
-static int rrl_debit(uint64_t hash, uint32_t rate, uint32_t window_sec, uint32_t slip,
+/* BIND 9 (lib/dns/rrl.c debit_rrl_entry()) の残高の数え方。残高は経過時間 1 秒ごとに rate 増え、上限は
+ * rate (1 秒分の応答)。新しいキーと、window より長く使われなかったキーは rate から始まる。応答 1 つごとに
+ * 1 減らし (制限した応答も数える)、下限は -window*rate: 送り続けるクライアントは、最長 window 秒
+ * 黙るまで制限されたまま。*out_ms は残高を数え終えた時刻 (端数の時間は次に持ち越す)。 */
+static int64_t rrl_balance(const rrl_bucket_t *b, uint32_t rate, uint32_t window_sec, int64_t now_ms,
+                           int64_t *out_ms, bool *out_full) {
+  int64_t elapsed_ms = now_ms - b->last_refill_ms;
+  *out_full = false;
+  *out_ms = b->last_refill_ms;
+  if (elapsed_ms > (int64_t)window_sec * 1000) {
+    *out_ms = now_ms;
+    *out_full = true;
+    return rate;
+  }
+  int64_t t = b->tokens;
+  if (elapsed_ms > 0) {
+    int64_t add = elapsed_ms * (int64_t)rate / 1000;
+    t += add;
+    if (t >= (int64_t)rate) {
+      *out_ms = now_ms;
+      *out_full = true;
+      return rate;
+    }
+    *out_ms = b->last_refill_ms + add * 1000 / (int64_t)rate;
+  }
+  return t;
+}
+
+/* キーのバケットから応答 1 つ分を引く。戻り値: 1 = 許可、0 = 制限 (*out_slip は slip の番か)。
+ * 候補の RRL_PROBE_WAYS 個がすべて他のキーで使用中なら、いちばん長く使われていないものを取る
+ * (BIND は LRU の末尾を使い回す。制限を外す fail-open にはしない)。 */
+#ifdef KARIDNS_UNIT_TEST
+int rrl_debit(uint64_t hash, uint32_t rate, uint32_t window_sec, uint32_t slip, int64_t now_ms, bool *out_slip);
+#else
+static
+#endif
+int rrl_debit(uint64_t hash, uint32_t rate, uint32_t window_sec, uint32_t slip,
                      int64_t now_ms, bool *out_slip) {
   *out_slip = false;
   rrl_bucket_t *selected = NULL;
@@ -233,54 +268,55 @@ static int rrl_debit(uint64_t hash, uint32_t rate, uint32_t window_sec, uint32_t
     }
     rrl_unlock(b);
   }
-  // 2nd Pass: If no exact match, look for an empty or expired bucket
+  // 2nd Pass: an empty or expired bucket, else the one used least recently
   if (!selected) {
+    rrl_bucket_t *oldest = NULL;
+    int64_t oldest_ms = 0;
     for (int probe = 0; probe < RRL_PROBE_WAYS; probe++) {
       rrl_bucket_t *b = &g_rrl_table[(base_idx + (size_t)probe) & (RRL_TABLE_SIZE - 1)];
       rrl_lock(b);
       if (atomic_load_explicit(&b->key_hash, memory_order_relaxed) == 0 ||
-          now_ms - b->last_refill_ms > (int64_t)window_sec * 1000) {
+          now_ms - b->last_used_ms > (int64_t)window_sec * 1000) {
         selected = b;
         break;
       }
+      if (!oldest || b->last_used_ms < oldest_ms) {
+        oldest = b;
+        oldest_ms = b->last_used_ms;
+      }
       rrl_unlock(b);
     }
+    if (!selected) {
+      selected = oldest;
+      rrl_lock(selected);
+    }
   }
-  // All candidate slots are busy active collisions.
-  // Bypass RRL to prevent token-stealing / collateral DoS on legitimate users.
-  if (!selected) return -1;
 
   rrl_bucket_t *b = selected;
-  uint64_t max_cap = (uint64_t)rate * window_sec;
-  if (max_cap > 0x7FFFFFFF) max_cap = 0x7FFFFFFF;
+  int64_t min = -(int64_t)window_sec * rate;
+  if (min < INT32_MIN) min = INT32_MIN;
+  int64_t t;
   if (atomic_load_explicit(&b->key_hash, memory_order_relaxed) != hash) {
     atomic_store_explicit(&b->key_hash, hash, memory_order_relaxed);
     b->last_refill_ms = now_ms;
-    b->tokens = (int32_t)max_cap;
     b->slip_counter = 0;
+    t = rate;
   } else {
-    int64_t elapsed_ms = now_ms - b->last_refill_ms;
-    if (elapsed_ms > 0) {
-      uint64_t add_t = ((uint64_t)elapsed_ms * rate) / 1000;
-      if (add_t > 0) {
-        if (add_t > max_cap) add_t = max_cap;
-        int64_t t = (int64_t)b->tokens + (int64_t)add_t;
-        if (t > (int64_t)max_cap) t = (int64_t)max_cap;
-        if (t < 0) t = 0;
-        b->tokens = (int32_t)t;
-        b->last_refill_ms = now_ms;
-      }
-    }
+    bool full;
+    t = rrl_balance(b, rate, window_sec, now_ms, &b->last_refill_ms, &full);
+    if (full) b->slip_counter = 0;
   }
 
   int allow = 0;
-  if (b->tokens > 0) {
-    b->tokens--;
+  if (--t >= 0) {
     allow = 1;
   } else {
+    if (t < min) t = min;
     b->slip_counter++;
     if (slip > 0 && (b->slip_counter % slip) == 0) *out_slip = true;
   }
+  b->tokens = (int32_t)(t > INT32_MAX ? INT32_MAX : t);
+  b->last_used_ms = now_ms;
   rrl_unlock(b);
   return allow;
 }
@@ -355,14 +391,20 @@ bool rrl_check(const void *client_addr_ptr, rrl_response_class_t cls, const rate
   return rrl_check_key(client_addr_ptr, &key, cfg, out_slip);
 }
 
-/* バケットの残りトークンを見る (使わない)。 */
-static bool rrl_bucket_empty(uint64_t hash) {
+/* キーのバケットに応答 1 つ分の残高が無いか (early-drop 用)。残高は rrl_debit と同じく経過時間で数える:
+ * 捨てたクエリは引かないので、ここで補充を見ないと一度尽きたキーは捨てられ続ける。 */
+static bool rrl_bucket_empty(uint64_t hash, uint32_t rate, uint32_t window_sec, int64_t now_ms) {
   size_t base_idx = hash & (RRL_TABLE_SIZE - 1);
   for (int probe = 0; probe < RRL_PROBE_WAYS; probe++) {
     rrl_bucket_t *b = &g_rrl_table[(base_idx + (size_t)probe) & (RRL_TABLE_SIZE - 1)];
     if (atomic_load_explicit(&b->key_hash, memory_order_relaxed) != hash) continue;
     rrl_lock(b);
-    bool empty = atomic_load_explicit(&b->key_hash, memory_order_relaxed) == hash && b->tokens <= 0;
+    bool empty = false;
+    if (atomic_load_explicit(&b->key_hash, memory_order_relaxed) == hash) {
+      int64_t ms;
+      bool full;
+      empty = rrl_balance(b, rate, window_sec, now_ms, &ms, &full) <= 0;
+    }
     rrl_unlock(b);
     if (empty) return true;
   }
@@ -373,13 +415,15 @@ bool rrl_key_exhausted(const void *client_addr_ptr, const rrl_key_t *key, const 
   if (!cfg || !cfg->configured || !key) return false;
   const struct sockaddr *client_addr = (const struct sockaddr *)client_addr_ptr;
   if (!client_addr || (client_addr->sa_family != AF_INET && client_addr->sa_family != AF_INET6)) return false;
-  bool has_rate = rrl_rate(cfg, key->cls) > 0;
-  if (!has_rate && cfg->all_per_second == 0) return false;
+  uint32_t rate = rrl_rate(cfg, key->cls);
+  if (rate == 0 && cfg->all_per_second == 0) return false;
   if (rrl_is_exempt(client_addr, cfg)) return false;
-  if (has_rate && rrl_bucket_empty(rrl_key_hash(client_addr, key, cfg))) return true;
+  int64_t now_ms = rrl_now_ms();
+  uint32_t window_sec = rrl_window(cfg);
+  if (rate > 0 && rrl_bucket_empty(rrl_key_hash(client_addr, key, cfg), rate, window_sec, now_ms)) return true;
   if (cfg->all_per_second > 0) {
     rrl_key_t all = { .cls = RRL_RESP_ALL };
-    if (rrl_bucket_empty(rrl_key_hash(client_addr, &all, cfg))) return true;
+    if (rrl_bucket_empty(rrl_key_hash(client_addr, &all, cfg), cfg->all_per_second, window_sec, now_ms)) return true;
   }
   return false;
 }

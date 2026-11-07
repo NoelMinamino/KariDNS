@@ -40,7 +40,7 @@ void rrl_make_key(rrl_key_t *key, const uint8_t *res, size_t res_len, const char
                   uint16_t qtype, uint16_t qclass, const char *zone, bool wildcard,
                   char *namebuf, size_t namebuf_cap);
 bool rrl_check_key(const void *client_addr, const rrl_key_t *key, const rate_limit_config_t *cfg, bool *out_slip);
-/* キーのバケット (または all-per-second のバケット) のトークンが尽きているか (使わない)。 */
+/* キーのバケット (または all-per-second のバケット) の残高が尽きているか (program ゾーンの early-drop)。 */
 bool rrl_key_exhausted(const void *client_addr, const rrl_key_t *key, const rate_limit_config_t *cfg);
 /* 名前を含まないキー (クライアント + 応答の種類) で数える版 */
 bool rrl_check(const void *client_addr, rrl_response_class_t cls, const rate_limit_config_t *cfg, bool *out_slip);
