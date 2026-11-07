@@ -314,7 +314,7 @@ static void test_nsec3(const char *z, const char *label, bool optout) {
     size_t synth = expect_same_as_file("rebuild", &f, pz, PS_NSEC3);
     CHECK_MSG((int)synth == nrs + 1, "%zu rebuilt RRs, %d chain owners + NSEC3PARAM", synth, nrs);
     (void)check_upper_hash_owners(label, &pz->arena);
-    {   /* open item 3: the loader warns about NSEC3PARAM metadata with iterations > 0 (RFC 9276 s3.1); the cap stays 2500 */
+    {   /* open item 3: the loader warns about NSEC3PARAM metadata with iterations > 0 (RFC 9276 s3.1); the cap is 150 (ZONE_MAX_NSEC3_ITERATIONS) */
         unsigned alg = 0, fl = 0, iters = 0;
         CHECK(sscanf(f.z.nsec3param, "%u %u %u", &alg, &fl, &iters) == 3);
         bool warned = false;
@@ -426,7 +426,7 @@ static void test_nsec3(const char *z, const char *label, bool optout) {
             { "1 0 3 aa bb", "more than four" },
             { "2 0 3 aa", "not 1" },
             { "1 2 3 aa", "flags must be 0 or 1" },
-            { "1 0 2501 aa", "exceed 2500" },
+            { "1 0 151 aa", "exceed 150" },
             { "1 0 x aa", "decimal" },
             { "1 0 3 abc", "even number of hex digits" },
             { "1 0 3 zz", "not hexadecimal" },

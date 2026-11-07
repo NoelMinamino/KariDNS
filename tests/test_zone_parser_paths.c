@@ -2415,8 +2415,233 @@ static void test_blank_and_comment_lines(void) {
     zt_free(&z);
 }
 
+/* ---------------------------------------------------------------- review low batch L4 (zone parser, wire encoders) */
+static void must_reject_with(const char *text, const char *needle) {
+    zt_t z;
+    zt_load(&z, text);
+    if (z.rc >= 0) { fprintf(stderr, "must be rejected (%s):\n%s", needle, text); assert(0); }
+    if (!z.err.error_message || !strstr(z.err.error_message, needle)) {
+        fprintf(stderr, "wrong error for:\n%s  got \"%s\", wanted \"%s\"\n", text, z.err.error_message ? z.err.error_message : "(none)", needle);
+        assert(0);
+    }
+    zt_free(&z);
+}
+
+/* the RDATA of "t1 <line>" in hex; NULL when the loader refuses the line or the record does not serialize (a static buffer) */
+static const char *line_rdata_hex(const char *line) {
+    static char hex[8192];
+    zt_t z;
+    zt_load_line(&z, line);
+    hex[0] = '\0';
+    if (z.rc < 0) { zt_free(&z); return NULL; }
+    uint8_t wire[16384];
+    const uint8_t *rd;
+    size_t rdlen;
+    if (ser_rdata(&z.arena.records[z.arena.count - 1], wire, sizeof(wire), &rd, &rdlen) != 0) { zt_free(&z); return NULL; }
+    assert(rdlen * 2 < sizeof(hex));
+    for (size_t i = 0; i < rdlen; i++) sprintf(hex + 2 * i, "%02x", rd[i]);
+    zt_free(&z);
+    return hex;
+}
+static void rdata_is(const char *line, const char *want_hex) {
+    const char *got = line_rdata_hex(line);
+    if (!got || strcmp(got, want_hex) != 0) { fprintf(stderr, "RDATA of \"%s\": got %s, wanted %s\n", line, got ? got : "(refused)", want_hex); assert(0); }
+}
+static void refused(const char *line) {
+    if (line_rdata_hex(line)) { fprintf(stderr, "must be refused: %s\n", line); assert(0); }
+}
+
+static void test_low_l4_zone_parser(void) {
+    printf("[TEST] Zone parser: review low batch L4 (owner, escapes, \\#, names, directives, tags)...\n");
+    zt_t z;
+
+    /* [3] a line that starts with a blank takes the owner of the record before it; with none it is an error (BIND: "no current owner name") */
+    must_reject_with("$TTL 300\n  IN A 192.0.2.1\n", "no current owner name");
+    must_reject_with("$ORIGIN example.\n 300 IN A 192.0.2.1\n", "no current owner name");
+    zt_load(&z, "$TTL 300\nh IN A 192.0.2.1\n  IN A 192.0.2.2\n");
+    ASSERT_PARSED(&z);
+    assert(zt_count(&z, "h.example.", 1) == 2);
+    zt_free(&z);
+
+    /* [4] \DDD is 000-255: \300 is an error, \255 an octet; \000 is an error where the field is a C string, an octet in a TXT string */
+    refused("TXT \"a\\300b\"");
+    refused("TXT \"a\\256\"");
+    rdata_is("TXT \"\\255\\001\"", "02ff01");
+    refused("HINFO \"a\\000b\" \"x\"");
+    refused("CAA 0 issue \"a\\000b\"");
+    rdata_is("TXT \"a\\000b\" \"c\"", "03610062" "0163");
+    rdata_is("SPF \"\\000\"", "0100");
+    {   /* many strings and a NUL: the I5 path keeps the octets as well */
+        char line[2048] = "TXT";
+        for (int i = 0; i < 60; i++) strcat(line, i == 7 ? " \"n\\000n\"" : " \"s\"");
+        const char *got = line_rdata_hex(line);
+        assert(got && strlen(got) == 2 * (59 * 2 + 4) && strncmp(got + 2 * (7 * 2), "036e006e", 8) == 0);
+    }
+
+    /* [5] only the unquoted token \# right after the type is RFC 3597; quoted "#" / "\#" are TXT text */
+    rdata_is("TXT \"#\" \"1\" \"ab\"", "0123" "0131" "026162");
+    rdata_is("TXT \"\\#\" \"1\"", "0123" "0131");
+    rdata_is("TXT \"\\\\#\" \"1\"", "025c23" "0131");
+    rdata_is("TXT \\# 3 026162", "026162");                      /* still RFC 3597 */
+    rdata_is("A \\# 4 c0000201", "c0000201");
+    refused("A \"\\#\" 4 c0000201");                               /* quoted: not the generic form, and not an address */
+    refused("A # 4 c0000201");                                   /* a bare # was never RFC 3597 either */
+    rdata_is("EID 0102 0304", "01020304");                       /* (rewritten into the generic form inside the parser) */
+
+    /* [6] a name in the RDATA keeps its escapes: "a\.b" is one label, in SVCB / HTTPS, IPSECKEY, AMTRELAY and the HIP servers */
+    rdata_is("SVCB 1 a\\.b.example. alpn=h2", "0001" "03612e62" "076578616d706c65" "00" "00010003026832");
+    rdata_is("HTTPS 1 a\\.b.example. alpn=h2", "0001" "03612e62" "076578616d706c65" "00" "00010003026832");
+    {
+        const char *got = line_rdata_hex("IPSECKEY 10 3 2 g\\.w.example. AQNRU3mG7TVTO2BkR47usntb102uFJtugbo6BSGvgqt4AQ==");
+        assert(got && strncmp(got, "0a0302" "03672e77" "076578616d706c65" "00", 6 + 8 + 16 + 2) == 0);
+        got = line_rdata_hex("AMTRELAY 10 0 3 g\\.w.example.");
+        assert(got && strcmp(got, "0a03" "03672e77" "076578616d706c65" "00") == 0);
+        const char *pk = "AwEAAbdxyhNuSutc5EMzxTs9LBPCIkOFH8cIvM4p9+LrV4e19WzK00+CI6zBCQTdtWsuxKbWIy87UOoJTwkUs7lBu+Upr1gsNrut79ryra+bSRGQb1slImA8YVJyuIDsj7kwzG7jnERNqnWxZ48AWkskmdHaVDP4BcelrTI3rMXdXF5D";
+        char line[1024];
+        /* D17: the public key is one token, the Rendezvous Servers are the tokens after it, a relative name without a dot too */
+        snprintf(line, sizeof(line), "HIP 2 200100107B1A74DF365639CC39F1D578 %s rvs", pk);
+        got = line_rdata_hex(line);
+        assert(got && strlen(got) > 26 && strcmp(got + strlen(got) - 26, "0372767307" "6578616d706c65" "00") == 0);
+        snprintf(line, sizeof(line), "HIP 2 200100107B1A74DF365639CC39F1D578 %s rv\\.s rvs2.example.net.", pk);
+        got = line_rdata_hex(line);
+        {
+            const char *tail = "0472762e73" "076578616d706c65" "00" "0472767332" "076578616d706c65" "036e6574" "00";
+            assert(got && strlen(got) > strlen(tail) && strcmp(got + strlen(got) - strlen(tail), tail) == 0);
+        }
+    }
+
+    /* [13] $WORD that is none of the directives, and $ORIGIN without a name, are errors (BIND master.c) */
+    must_reject_with("$ORIGIN example.\n$TTL 300\n$foo bar\n", "unknown directive");
+    must_reject_with("$ORIGIN example.\n$TTL 300\n$INCLUDES x\n", "unknown directive");
+    must_reject_with("$ORIGIN example.\n$TTL 300\n$ORIGIN\n", "$ORIGIN requires");
+    zt_load(&z, "$ORIGIN example.\n$TTL 300\n$origin sub\na A 192.0.2.1\n");   /* directives are case-insensitive; a relative $ORIGIN is under the current one */
+    ASSERT_PARSED(&z);
+    assert(zt_find(&z, "a.sub.example.", 1));
+    zt_free(&z);
+
+    /* [8] an entry of a tag definition that is not an address or CIDR is an error, with the entry named */
+    must_reject_with("$ORIGIN example.\n$TTL 300\n$LOCATION-TAG lo 127.0.0.0/8 notacidr\n", "'notacidr' is not an address or CIDR");
+    must_reject_with("$ORIGIN example.\n$TTL 300\n$ECS-SUBNET-TAG eu 192.0.2.0/24 2001:db8::/129\n", "is not an address or CIDR");
+    zt_load(&z, "$ORIGIN example.\n$TTL 300\n$ECS-SUBNET-TAG eu 192.0.2.0/24 2001:db8::/32 any\n");
+    ASSERT_PARSED(&z);
+    zt_free(&z);
+    printf("  -> owner, escapes, \\#, names, directives and tags passed.\n");
+}
+
+static int validate_text(const char *body, char *detail, size_t cap) {
+    char text[4096];
+    zt_t z;
+    snprintf(text, sizeof(text), "%s%s", SOA_HEAD, body);
+    zt_load(&z, text);
+    assert(z.rc >= 0 && build_zone_index(&z.arena, true) == 0);
+    parse_error_t e = {0};
+    int rc = validate_zone_pdns_types(&z.arena, &e, detail, cap);
+    zt_free(&z);
+    return rc;
+}
+
+/* review low L4 dns_zone_lint.c [B5] and decisions D10-D12: the checks every publish path makes (freeze, database reader, karicheck) */
+static void test_low_l4_zone_validation(void) {
+    printf("[TEST] Zone validation: CNAME / DNAME singletons and the NSEC3 iteration cap...\n");
+    char d[400];
+    /* two different CNAMEs (or DNAMEs) at one name: BIND "multiple RRs of singleton type" */
+    assert(validate_text("a CNAME b.example.\na CNAME c.example.\n", d, sizeof(d)) < 0 && strstr(d, "more than one CNAME"));
+    assert(validate_text("a DNAME b.example.\na DNAME c.example.\n", d, sizeof(d)) < 0 && strstr(d, "more than one DNAME"));
+    assert(validate_text("a CNAME b.example.\nA CNAME b.example.\n", d, sizeof(d)) == 0);          /* the same RR twice is one RR */
+    assert(validate_text("a CNAME b.example.\na2 CNAME c.example.\n", d, sizeof(d)) == 0);         /* different owners */
+    assert(validate_text("a CNAME b.example.\na DNAME b.example.\n", d, sizeof(d)) == 0);          /* (CNAME beside DNAME is validate_zone_dname()'s rule) */
+    /* kept apart by a tag: a query gets the one that fits the client */
+    assert(validate_text("$LOCATION-TAG lo 127.0.0.0/8\n$LOCATION lo\nb CNAME x.example.\n$LOCATION\nb CNAME y.example.\n", d, sizeof(d)) == 0);
+    /* an UPDATE replaces a CNAME (RFC 2136 3.4.2.2): no second one is ever left in the zone, so the check cannot refuse it */
+
+    /* NSEC3 iterations above 150 (RFC 9276 3.2): NSEC3PARAM and NSEC3, 150 itself passes */
+    assert(validate_text("@ NSEC3PARAM 1 0 150 -\n", d, sizeof(d)) == 0);
+    assert(validate_text("@ NSEC3PARAM 1 0 151 -\n", d, sizeof(d)) < 0 && strstr(d, "151 NSEC3 iterations") && strstr(d, "more than 150"));
+    assert(validate_text("@ NSEC3PARAM 1 0 65535 AABB\n", d, sizeof(d)) < 0);
+    assert(validate_text("0p9mhaveqvm6t7vbl5lop2u3t2rp3tom NSEC3 1 0 150 - 2vptu5timamqttgl4luu9kg21e0aor3s A\n", d, sizeof(d)) == 0);
+    assert(validate_text("0p9mhaveqvm6t7vbl5lop2u3t2rp3tom NSEC3 1 0 500 - 2vptu5timamqttgl4luu9kg21e0aor3s A\n", d, sizeof(d)) < 0 && strstr(d, "NSEC3 at"));
+    assert(validate_text("@ NSEC3PARAM \\# 5 0100009600\n", d, sizeof(d)) == 0);                     /* generic form of 150 */
+    assert(validate_text("@ NSEC3PARAM \\# 5 0100009700\n", d, sizeof(d)) < 0);                      /* generic form of 151 */
+    printf("  -> singleton and NSEC3 iteration validation passed.\n");
+}
+
+/* review low L4 dns_wire.c [8] [9] [10] [11]: the encoders */
+static void test_low_l4_wire_encoders(void) {
+    printf("[TEST] Wire encoders: LOC range, long hex, character-strings, NSEC3 next hash, SvcParamKeys...\n");
+    /* [10] RFC 1876 3: altitude -100000.00 .. 42849672.95 m, size / precisions 0 .. 90000000.00 m */
+    refused("LOC 52 22 23.000 N 4 53 32.000 E 42849672.96m");
+    refused("LOC 52 22 23.000 N 4 53 32.000 E -100000.01m");
+    refused("LOC 52 22 23.000 N 4 53 32.000 E 0m 90000000.01m");
+    refused("LOC 52 22 23.000 N 4 53 32.000 E 0m 1m 90000000.01m");
+    refused("LOC 52 22 23.000 N 4 53 32.000 E 0m 1m 1m 90000000.01m");
+    refused("LOC 52 22 23.000 N 4 53 32.000 E 0m -1m");
+    refused("LOC 52 22 23.000 N 4 53 32.000 E 99999999999999999999m");
+    {
+        char lo[64] = "";
+        const char *l = line_rdata_hex("LOC 52 22 23.000 N 4 53 32.000 E -100000.00m 0m 0m 0m");   /* (a static buffer: copy) */
+        assert(l && strlen(l) < sizeof(lo));
+        strcpy(lo, l);
+        const char *hi = line_rdata_hex("LOC 52 22 23.000 N 4 53 32.000 E 42849672.95m 90000000.00m 90000000.00m 90000000.00m");
+        assert(strlen(lo) == 32 && strcmp(lo + 24, "00000000") == 0);                       /* altitude 0 = 100000 m below the spheroid */
+        assert(hi && strlen(hi) == 32 && strcmp(hi + 24, "ffffffff") == 0);                       /* altitude 4294967295 */
+        assert(strncmp(hi, "00" "999999", 8) == 0);                                              /* 9e9 cm = mantissa 9, exponent 9 */
+    }
+    /* [8] a 1500-octet TLSA certificate association (3000 hex digits) used to fail at the 2048-character scratch buffer */
+    {
+        char line[4096] = "TLSA 3 0 0 ";
+        size_t n = strlen(line);
+        for (int i = 0; i < 1500; i++) { line[n++] = "0123456789abcdef"[(i * 7) & 15]; line[n++] = "0123456789abcdef"[(i * 3 + 1) & 15]; }
+        line[n] = '\0';
+        const char *got = line_rdata_hex(line);
+        assert(got && strlen(got) == 2 * (3 + 1500) && strncmp(got, "030000", 6) == 0 && strcmp(got + 6, line + 11) == 0);
+        refused("TLSA 3 0 0 abc");                                                              /* odd digit count stays an error */
+        refused("TLSA 3 0 0 abcd zz");                                                          /* and so does a non-hex character */
+        rdata_is("TLSA 3 0 0 ab c dEf01", "030000" "abcdef01");                                 /* the fields are joined */
+    }
+    /* [9] a <character-string> is at most 255 octets: HINFO / X25 / ISDN / GPOS / NAPTR strings are no longer cut */
+    {
+        char s255[256], line[600];
+        memset(s255, 'x', 255); s255[255] = '\0';
+        char d255[256];
+        memset(d255, '1', 255); d255[255] = '\0';
+        snprintf(line, sizeof(line), "X25 \"%s\"", d255);
+        assert(line_rdata_hex(line) != NULL);
+        snprintf(line, sizeof(line), "X25 \"%s1\"", d255);
+        refused(line);
+        snprintf(line, sizeof(line), "HINFO \"%sx\" \"y\"", s255);
+        refused(line);
+        snprintf(line, sizeof(line), "GPOS \"%sx\" 1 1", s255);
+        refused(line);
+    }
+    /* [9] RFC 5155 3.2: the next hashed owner name is base32hex; a character outside the alphabet or non-zero padding bits is an error */
+    {
+        const char *good = "2t7b4g4vsa5smi47k61mv5bv1a22bojr";
+        char line[200];
+        snprintf(line, sizeof(line), "NSEC3 1 0 0 - %s A", good);
+        assert(line_rdata_hex(line) != NULL);
+        refused("NSEC3 1 0 0 - 2t7b4g4vsa5smi47k61mv5bv1a22bo!r A");
+        refused("NSEC3 1 0 0 - 2t7b4g4vsa5smi47k61mv5bv1a22bojw A");                            /* w is outside 0-9a-v */
+        refused("NSEC3 1 0 0 - 2t7b4g4vsa5smi47k61mv5bv1a22bojr= A");                           /* no padding in NSEC3 */
+        assert(line_rdata_hex("NSEC3 1 0 0 - AAAAAAAAAAAG A") != NULL);                         /* 60 bits: 7 octets and 4 zero padding bits */
+        refused("NSEC3 1 0 0 - AAAAAAAAAAAB A");                                                /* ... non-zero padding bits */
+    }
+    /* [11] RFC 9460 2.1: an unknown SvcParamKey name is an error (it was dropped), keyNNN is not */
+    refused("SVCB 1 svc.example. alnp=h2");
+    refused("SVCB 1 svc.example. alpn=h2 foo");
+    refused("SVCB 1 svc.example. key=x");
+    refused("SVCB 1 svc.example. key+1=x");
+    refused("SVCB 1 svc.example. key65535=x");
+    refused("SVCB 1 svc.example. mandatory=alnp alpn=h2");
+    assert(line_rdata_hex("SVCB 1 svc.example. alpn=h2 key667=hello") != NULL);
+    assert(line_rdata_hex("SVCB 1 svc.example. mandatory=key667 key667=hello") != NULL);
+    printf("  -> LOC, long hex, character-strings, NSEC3 hash and SvcParamKey checks passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Zone Parser Path Coverage Tests ===\n");
+    test_low_l4_zone_parser();
+    test_low_l4_zone_validation();
+    test_low_l4_wire_encoders();
     test_blank_and_comment_lines();
     test_x37_rdata_name_case();
     test_x38_wks_port_names();

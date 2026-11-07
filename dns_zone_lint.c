@@ -148,22 +148,29 @@ static int cmp_rec_by_name_type(const void *pa, const void *pb) {
     return 0;
 }
 
-typedef struct { int alg_num; const char *name; const char *status; } dnssec_alg_info_t;
+typedef struct { int alg_num; const char *name; const char *status; bool discouraged; } dnssec_alg_info_t;
 
+/* IANA "DNS Security Algorithm Numbers"; discouraged = RFC 8624 MUST NOT / NOT RECOMMENDED (the warning).  17 SM2SM3 (RFC 9563),
+ * 23 ECC-GOST12 (RFC 9558) and the private algorithms 252 INDIRECT, 253 PRIVATEDNS, 254 PRIVATEOID (RFC 4034 appendix A.1) are valid. */
 static const dnssec_alg_info_t KNOWN_DNSSEC_ALGS[] = {
-    {1,  "RSAMD5",              "MUST NOT (非推奨・危殆化)"},
-    {3,  "DSA",                 "MUST NOT (非推奨)"},
-    {5,  "RSASHA1",             "NOT RECOMMENDED"},
-    {6,  "DSA-NSEC3-SHA1",      "MUST NOT (非推奨)"},
-    {7,  "RSASHA1-NSEC3-SHA1",  "NOT RECOMMENDED"},
-    {8,  "RSASHA256",           "MUST"},
-    {10, "RSASHA512",           "NOT RECOMMENDED"},
-    {12, "ECC-GOST",            "MUST NOT (非推奨)"},
-    {13, "ECDSAP256SHA256",     "MUST"},
-    {14, "ECDSAP384SHA384",     "MAY"},
-    {15, "ED25519",             "RECOMMENDED"},
-    {16, "ED448",               "MAY"},
-    {18, "MLDSA44",             "MAY"},  // draft-westerbaan-dnssec-mldsa (IANA: MAY for signing and validation)
+    {1,  "RSAMD5",              "MUST NOT (非推奨・危殆化)", true},
+    {3,  "DSA",                 "MUST NOT (非推奨)", true},
+    {5,  "RSASHA1",             "NOT RECOMMENDED", true},
+    {6,  "DSA-NSEC3-SHA1",      "MUST NOT (非推奨)", true},
+    {7,  "RSASHA1-NSEC3-SHA1",  "NOT RECOMMENDED", true},
+    {8,  "RSASHA256",           "MUST", false},
+    {10, "RSASHA512",           "NOT RECOMMENDED", true},
+    {12, "ECC-GOST",            "MUST NOT (非推奨)", true},
+    {13, "ECDSAP256SHA256",     "MUST", false},
+    {14, "ECDSAP384SHA384",     "MAY", false},
+    {15, "ED25519",             "RECOMMENDED", false},
+    {16, "ED448",               "MAY", false},
+    {17, "SM2SM3",              "MAY", false},
+    {18, "MLDSA44",             "MAY", false},  // draft-westerbaan-dnssec-mldsa (IANA: MAY for signing and validation)
+    {23, "ECC-GOST12",          "MAY", false},
+    {252, "INDIRECT",           "MAY", false},
+    {253, "PRIVATEDNS",         "MAY", false},
+    {254, "PRIVATEOID",         "MAY", false},
 };
 
 static void check_dnssec_algorithm(kc_tally_t *t, int alg_num, const char *rec_name, const char *rec_type, int flags, int protocol) {
@@ -173,8 +180,7 @@ static void check_dnssec_algorithm(kc_tally_t *t, int alg_num, const char *rec_n
     }
     for (size_t i = 0; i < sizeof(KNOWN_DNSSEC_ALGS)/sizeof(KNOWN_DNSSEC_ALGS[0]); i++) {
         if (KNOWN_DNSSEC_ALGS[i].alg_num == alg_num) {
-            if (strstr(KNOWN_DNSSEC_ALGS[i].status, "MUST NOT") ||
-                strstr(KNOWN_DNSSEC_ALGS[i].status, "NOT RECOMMENDED")) {
+            if (KNOWN_DNSSEC_ALGS[i].discouraged) {
                 kc_warning(t, DC_ZONE_DNSSEC_ALGORITHM_DEPRECATED, "%s '%s': DNSSEC algorithm %d (%s) is %s (RFC 8624)\n",
                         rec_type, rec_name, alg_num, KNOWN_DNSSEC_ALGS[i].name, KNOWN_DNSSEC_ALGS[i].status);
             }
@@ -217,16 +223,29 @@ static void check_dnssec_blob_length(kc_tally_t *t, int alg_num, const char *rec
     }
 }
 
-typedef struct { int digest_type; const char *name; const char *status; } ds_digest_info_t;
+typedef struct { int digest_type; const char *name; const char *status; int octets; } ds_digest_info_t;
+/* octets: the length of the digest, RFC 4034 5.1.4 (SHA-1), RFC 4509 2 (SHA-256), RFC 5933 4 (GOST), RFC 6605 5 (SHA-384) */
 static const ds_digest_info_t KNOWN_DS_DIGESTS[] = {
-    {1, "SHA-1",            "MUST NOT (非推奨・危殆化, RFC 8624 §3.3)"},
-    {2, "SHA-256",          "MUST"},
-    {3, "GOST R 34.11-94",  "MUST NOT (非推奨, RFC 8624 §3.3)"},
-    {4, "SHA-384",          "MAY"},
+    {1, "SHA-1",            "MUST NOT (非推奨・危殆化, RFC 8624 §3.3)", 20},
+    {2, "SHA-256",          "MUST", 32},
+    {3, "GOST R 34.11-94",  "MUST NOT (非推奨, RFC 8624 §3.3)", 32},
+    {4, "SHA-384",          "MAY", 48},
 };
 
+/* The number of octets the hex text of fields[0..count-1] (joined, as the zone parser joins them) stands for; -1 when it is not an even
+ * number of hex digits (the zone parser refused such a record already, so the length is simply not checked). */
+static long hex_fields_octets(char *const *fields, int count) {
+    size_t digits = 0;
+    for (int i = 0; i < count; i++)
+        for (const char *c = fields[i]; *c; c++) {
+            if (!isxdigit((unsigned char)*c)) return -1;
+            digits++;
+        }
+    return (digits % 2 == 0) ? (long)(digits / 2) : -1;
+}
+
 static void check_ds_digest_type(kc_tally_t *t, int digest_type, int algorithm, int key_tag,
-                                 const char *rec_name, const char *rec_type) {
+                                 const char *rec_name, const char *rec_type, char *const *digest_fields, int digest_count) {
     // RFC 8078 §4: CDS delete signal (digest_type=0, algorithm=0, key_tag=0)
     if (strcmp(rec_type, "CDS") == 0 && digest_type == 0 &&
         algorithm == 0 && key_tag == 0) {
@@ -244,6 +263,11 @@ static void check_ds_digest_type(kc_tally_t *t, int digest_type, int algorithm, 
                         rec_type, rec_name, digest_type,
                         KNOWN_DS_DIGESTS[i].name, KNOWN_DS_DIGESTS[i].status);
             }
+            /* BIND (ds_43.c) refuses a digest of the wrong length for the digest type */
+            long got = hex_fields_octets(digest_fields, digest_count);
+            if (got >= 0 && got != KNOWN_DS_DIGESTS[i].octets)
+                kc_error(t, DC_ZONE_DS_DIGEST_LENGTH, "%s '%s': a %s digest is %d octets, found %ld (RFC 4034 5.1.4, RFC 4509 2, RFC 6605 5)\n",
+                         rec_type, rec_name, KNOWN_DS_DIGESTS[i].name, KNOWN_DS_DIGESTS[i].octets, got);
             return;
         }
     }
@@ -623,13 +647,22 @@ static int lint_occ_cmp(const void *pa, const void *pb) {
     return a->rec < b->rec ? -1 : (a->rec > b->rec);
 }
 
+static int lint_name_cmp(const void *pa, const void *pb) {
+    return compare_canonical_name(*(const char *const *)pa, *(const char *const *)pb);
+}
+
 /* every record strictly below a delegation (an NS RRset other than the apex's) is occluded, except the glue: an
- * address record whose name is the target of an NS record of that delegation (RFC 1034 4.2.1).  Each record looks for
+ * address record whose name is the target of an NS record of that delegation (RFC 1034 4.2.1) or of another delegation of the
+ * zone (sibling glue, RFC 9471 s2.1; BIND's named-checkzone does not call it occluded either).  Each record looks for
  * the delegations above it (its ancestors in the hash index) instead of each NS record scanning the zone. */
 static void lint_delegation_occlusion(const char *domain, zone_arena_t *arena, kc_tally_t *t) {
     lint_occ_t *occ = NULL;
     size_t n_occ = 0, cap_occ = 0;
     bool oom = false;
+    /* the targets of the NS records of the delegations, sorted, built when the first address record below a delegation needs them */
+    const char **ns_targets = NULL;
+    size_t n_targets = 0;
+    bool targets_built = false;
     for (size_t j = 0; j < arena->count && !oom; j++) {
         const dns_record_t *r = &arena->records[j];
         if (!r->name) continue;
@@ -640,6 +673,21 @@ static void lint_delegation_occlusion(const char *domain, zone_arena_t *arena, k
             if (lint_first_at(arena, del_name, SIZE_MAX, lint_is_ns, NULL) < 0) continue;   /* no delegation here */
             bool is_glue = (r->type_code == 1 || r->type_code == 28) &&
                            lint_first_at(arena, del_name, SIZE_MAX, lint_ns_to, r->name) >= 0;
+            if (!is_glue && (r->type_code == 1 || r->type_code == 28)) {
+                if (!targets_built) {
+                    targets_built = true;
+                    ns_targets = malloc((arena->count ? arena->count : 1) * sizeof(*ns_targets));
+                    if (!ns_targets) { oom = true; break; }
+                    for (size_t k = 0; k < arena->count; k++) {
+                        const dns_record_t *ns = &arena->records[k];
+                        if (ns->type_code == 2 && ns->name && ns->rdata_count >= 1 && ns->rdata[0] &&
+                            is_strict_subdomain_of(ns->name, domain))
+                            ns_targets[n_targets++] = ns->rdata[0];
+                    }
+                    if (n_targets > 1) qsort(ns_targets, n_targets, sizeof(*ns_targets), lint_name_cmp);
+                }
+                is_glue = n_targets > 0 && bsearch(&r->name, ns_targets, n_targets, sizeof(*ns_targets), lint_name_cmp) != NULL;
+            }
             if (is_glue) continue;
             /* every NS record at del_name (each one gave its own warning in the old scan) */
             for (long i = lint_at_from(arena, del_name, 0, SIZE_MAX, lint_is_ns, NULL); i >= 0;
@@ -665,6 +713,7 @@ static void lint_delegation_occlusion(const char *domain, zone_arena_t *arena, k
                 r->name, r->type ? r->type : "<type>", arena->records[occ[k].ns].name);
     }
     free(occ);
+    free(ns_targets);
 }
 
 static void lint_cname_targets(const zone_lint_in_t *in, const char *domain, zone_arena_t *arena, kc_tally_t *t) {
@@ -1143,8 +1192,8 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                             if (*endp != '\0' || alg > 255) {
                                 kc_error(t, DC_ZONE_SSHFP_ALGORITHM_RANGE, "Zone '%s' (line %lu): SSHFP algorithm '%s' out of range (0-255)\n",
                                         domain, linenum, fld[1]);
-                            } else if (alg == 0 || alg > 4) {
-                                kc_warning(t, DC_ZONE_SSHFP_ALGORITHM_UNASSIGNED, "Zone '%s' (line %lu): SSHFP algorithm '%lu' is outside standard RFC assignments (1-4)\n",
+                            } else if (alg == 0 || alg == 5 || alg > 6) {   /* 6 = Ed448, RFC 8709 */
+                                kc_warning(t, DC_ZONE_SSHFP_ALGORITHM_UNASSIGNED, "Zone '%s' (line %lu): SSHFP algorithm '%lu' is outside standard RFC assignments (1-4, 6)\n",
                                         domain, linenum, alg);
                             }
                         }
@@ -1159,11 +1208,18 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                                         domain, linenum, fpt);
                             }
                         }
-                        uint8_t fp_bin[64];
-                        size_t dec_len = hex_decode(fld[3], fp_bin, sizeof(fp_bin));
-                        if (flen[3] == 0 || dec_len == 0 || dec_len == (size_t)-1) {
+                        char *const fp_field[1] = { fld[3] };
+                        long fplen = hex_fields_octets(fp_field, 1);
+                        if (flen[3] == 0 || fplen <= 0) {
                             kc_error(t, DC_ZONE_SSHFP_FINGERPRINT_HEX, "Zone '%s' (line %lu): SSHFP invalid fingerprint hex string '%s'\n",
                                     domain, linenum, fld[3]);
+                        } else if (flen[2] > 0) {
+                            /* RFC 4255 3.1.2 (SHA-1: 20 octets), RFC 6594 5 (SHA-256: 32) */
+                            char *endp;
+                            unsigned long fpt = strtoul(fld[2], &endp, 10);
+                            if (*endp == '\0' && (fpt == 1 || fpt == 2) && fplen != (fpt == 1 ? 20 : 32))
+                                kc_error(t, DC_ZONE_SSHFP_FINGERPRINT_LENGTH, "Zone '%s' (line %lu): SSHFP fingerprint is %ld octets, a %s fingerprint is %d (RFC 4255 3.1.2, RFC 6594 5)\n",
+                                        domain, linenum, fplen, fpt == 1 ? "SHA-1" : "SHA-256", fpt == 1 ? 20 : 32);
                         }
                     }
                 }
@@ -1292,7 +1348,7 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                 int algorithm = (int)strtol(rdata[1], NULL, 10);
                 int digest_type = (int)strtol(rdata[2], NULL, 10);
                 check_ds_digest_type(t, digest_type, algorithm, key_tag,
-                                     arena->records[i].name, tcode == 43 ? "DS" : "CDS");
+                                     arena->records[i].name, tcode == 43 ? "DS" : "CDS", &rdata[3], rcount - 3);
             }
         }
         if (tcode == 46) { // RRSIG
@@ -1307,19 +1363,11 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
             if (rcount < 3) {
                 kc_warning(t, DC_ZONE_HIP_FIELDS, "HIP record requires at least 3 fields: HIT algorithm, HIT (hex), and public key (base64) for name '%s'\n", arena->records[i].name);
             } else {
-                /* Reconstruct the concatenated public-key base64 token the same way
-                 * the server's serializer does, and reject lengths that are not a
-                 * non-zero multiple of 4: such input makes EVP_DecodeBlock's
-                 * returned length smaller than the base64 padding count, which
-                 * underflows the RR's public-key length field at response time. */
-                size_t pk_b64_len = 0;
-                bool pk_finished = false;
-                for (int r_idx = 2; r_idx < rcount && !pk_finished; r_idx++) {
-                    if (strchr(rdata[r_idx], '.') != NULL) break;
-                    size_t tlen = strlen(rdata[r_idx]);
-                    pk_b64_len += tlen;
-                    if (tlen > 0 && rdata[r_idx][tlen - 1] == '=') pk_finished = true;
-                }
+                /* The public key is the one base64 token rdata[2] (RFC 8005 s5; the serializer reads it so; the tokens after it are the
+                 * Rendezvous Servers).  Reject lengths that are not a non-zero multiple of 4: such input makes EVP_DecodeBlock's
+                 * returned length smaller than the base64 padding count, which underflows the RR's public-key length field at
+                 * response time. */
+                size_t pk_b64_len = strlen(rdata[2]);
                 if (pk_b64_len == 0 || (pk_b64_len % 4) != 0) {
                     kc_error(t, DC_ZONE_HIP_KEY_BASE64, "HIP record public key for name '%s' is not valid base64 (length %zu is not a non-zero multiple of 4) in zone '%s'\n",
                             arena->records[i].name, pk_b64_len, domain);
@@ -1447,7 +1495,9 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                                       strcasecmp(caa_tag, "issuewild") == 0 ||
                                       strcasecmp(caa_tag, "iodef") == 0 ||
                                       strcasecmp(caa_tag, "contactemail") == 0 ||
-                                      strcasecmp(caa_tag, "contactphone") == 0);
+                                      strcasecmp(caa_tag, "contactphone") == 0 ||
+                                      strcasecmp(caa_tag, "issuemail") == 0 ||      /* RFC 9495 */
+                                      strcasecmp(caa_tag, "issuevmc") == 0);        /* IANA "Certification Authority Restriction Properties" */
                     if (!known_tag) {
                         bool is_critical = ((strtoul(rdata[0], NULL, 10) & 0x80) != 0);
                         if (is_critical) {
@@ -1456,7 +1506,7 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                                     arena->records[i].name, caa_tag);
                         } else {
                             kc_warning(t, DC_ZONE_CAA_TAG_UNKNOWN, "CAA record for '%s' has unrecognized tag '%s' "
-                                    "(not one of issue/issuewild/iodef/contactemail/contactphone)\n",
+                                    "(not one of issue/issuewild/issuemail/issuevmc/iodef/contactemail/contactphone)\n",
                                     arena->records[i].name, caa_tag);
                         }
                     }
@@ -1473,8 +1523,8 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                 if (*endp != '\0' || alg > 255) {
                     kc_error(t, DC_ZONE_SSHFP_ALGORITHM_RANGE, "SSHFP algorithm '%s' out of range (0-255) for name '%s' in zone '%s'\n",
                             rdata[0], arena->records[i].name, domain);
-                } else if (alg == 0 || alg > 4) {
-                    kc_warning(t, DC_ZONE_SSHFP_ALGORITHM_UNASSIGNED, "SSHFP record for '%s' uses algorithm '%lu' which is outside standard RFC assignments (1=RSA, 2=DSA, 3=ECDSA, 4=Ed25519)\n",
+                } else if (alg == 0 || alg == 5 || alg > 6) {   /* 6 = Ed448, RFC 8709 */
+                    kc_warning(t, DC_ZONE_SSHFP_ALGORITHM_UNASSIGNED, "SSHFP record for '%s' uses algorithm '%lu' which is outside standard RFC assignments (1=RSA, 2=DSA, 3=ECDSA, 4=Ed25519, 6=Ed448)\n",
                             arena->records[i].name, alg);
                 }
                 unsigned long fpt = strtoul(rdata[1], &endp, 10);
@@ -1485,11 +1535,15 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                     kc_warning(t, DC_ZONE_SSHFP_FPTYPE_UNASSIGNED, "SSHFP record for '%s' uses fp_type '%lu' which is outside standard RFC assignments (1=SHA-1, 2=SHA-256)\n",
                             arena->records[i].name, fpt);
                 }
-                uint8_t fp_bin[64];
-                size_t dec_len = hex_decode(rdata[2], fp_bin, sizeof(fp_bin));
-                if (dec_len == 0 || dec_len == (size_t)-1) {
+                long fplen = hex_fields_octets(&rdata[2], rcount - 2);
+                if (fplen <= 0) {
                     kc_error(t, DC_ZONE_SSHFP_FINGERPRINT_HEX, "SSHFP invalid fingerprint hex string '%s' for name '%s' in zone '%s'\n",
                             rdata[2], arena->records[i].name, domain);
+                } else if (*endp == '\0' && (fpt == 1 || fpt == 2)) {
+                    /* RFC 4255 3.1.2 (SHA-1: 20 octets), RFC 6594 5 (SHA-256: 32); BIND refuses the other lengths */
+                    if (fplen != (fpt == 1 ? 20 : 32))
+                        kc_error(t, DC_ZONE_SSHFP_FINGERPRINT_LENGTH, "SSHFP fingerprint for '%s' is %ld octets, a %s fingerprint is %d (RFC 4255 3.1.2, RFC 6594 5)\n",
+                                arena->records[i].name, fplen, fpt == 1 ? "SHA-1" : "SHA-256", fpt == 1 ? 20 : 32);
                 }
             }
         }

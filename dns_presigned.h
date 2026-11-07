@@ -74,7 +74,7 @@ typedef struct {
     uint8_t salt_len;
 } presigned_n3param_t;
 
-#define PRESIGNED_MAX_ITERATIONS 2500u   /* RFC 5155 s10.3: the largest value for a 4096 bit key; a bigger one is a DoS on the loader */
+#define PRESIGNED_MAX_ITERATIONS ZONE_MAX_NSEC3_ITERATIONS   /* RFC 9276 s3.2 (150, one limit for every zone: dns_zone_parser.h); a bigger one is a DoS on the loader and on every NSEC3 proof */
 
 /* "alg flags iterations salt" (salt "-" = empty).  false: *why says why (static text). */
 bool presigned_parse_n3param(const char *s, presigned_n3param_t *p, const char **why);

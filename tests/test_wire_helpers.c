@@ -1107,6 +1107,51 @@ static void test_parse_edns_opt_nsid_and_keepalive(void) {
     CHECK(edns.has_keepalive_query == true);
 }
 
+/* review low L4 dns_wire.c [2] [3] (decisions D15, D16): a query whose OPT RDATA has an option that overruns it, or 1-3 octets after the last
+ * option, is marked (BIND's OPT fromwire refuses both: FORMERR; RFC 6891 6.1.2); edns-tcp-keepalive with a length in a query is marked
+ * (RFC 7828 3.2.1).  The options before the bad one are still read (dag reads responses with this function). */
+static size_t edns_query_with_opt_rdata(uint8_t *pkt, const uint8_t *rdata, size_t rdlen) {
+    memset(pkt, 0, 128);
+    pkt[5] = 1; pkt[11] = 1;
+    pkt[12] = 1; pkt[13] = 'a'; pkt[14] = 0; pkt[16] = 1; pkt[18] = 1;     /* a. IN A */
+    size_t o = 19;
+    pkt[o++] = 0; pkt[o++] = 0; pkt[o++] = 41; pkt[o++] = 16; pkt[o++] = 0;
+    pkt[o++] = 0; pkt[o++] = 0; pkt[o++] = 0; pkt[o++] = 0;
+    pkt[o++] = (uint8_t)(rdlen >> 8); pkt[o++] = (uint8_t)rdlen;
+    memcpy(pkt + o, rdata, rdlen);
+    return o + rdlen;
+}
+
+static void test_parse_edns_opt_overrun_and_keepalive_length(void) {
+    printf("[TEST] Wire: parse_edns_opt marks an option overrunning the OPT RDATA and a keepalive with a length...\n");
+    uint8_t pkt[128];
+    edns_info_t e;
+    {   /* NSID, then an option whose length (8) overruns the 4 octets left */
+        const uint8_t rd[] = { 0, 3, 0, 0,   0, 10, 0, 8, 1, 2, 3, 4 };
+        size_t n = edns_query_with_opt_rdata(pkt, rd, sizeof(rd));
+        CHECK(parse_edns_opt(pkt, n, 1, 0, 0, 1, &e) == 0);
+        CHECK(e.has_opt_overrun && e.has_nsid_query);
+    }
+    {   /* a good option and 3 stray octets */
+        const uint8_t rd[] = { 0, 3, 0, 0,   1, 2, 3 };
+        size_t n = edns_query_with_opt_rdata(pkt, rd, sizeof(rd));
+        CHECK(parse_edns_opt(pkt, n, 1, 0, 0, 1, &e) == 0);
+        CHECK(e.has_opt_overrun && e.has_nsid_query);
+    }
+    {   /* well-formed options only: not marked */
+        const uint8_t rd[] = { 0, 3, 0, 0,   0, 11, 0, 0 };
+        size_t n = edns_query_with_opt_rdata(pkt, rd, sizeof(rd));
+        CHECK(parse_edns_opt(pkt, n, 1, 0, 0, 1, &e) == 0);
+        CHECK(!e.has_opt_overrun && !e.has_keepalive_nonzero && e.has_keepalive_query);
+    }
+    {   /* keepalive with OPTION-LENGTH 2 (a TIMEOUT: right in a response, FORMERR in a query), then NSID: both are read */
+        const uint8_t rd[] = { 0, 11, 0, 2, 0, 50,   0, 3, 0, 0 };
+        size_t n = edns_query_with_opt_rdata(pkt, rd, sizeof(rd));
+        CHECK(parse_edns_opt(pkt, n, 1, 0, 0, 1, &e) == 0);
+        CHECK(e.has_keepalive_nonzero && e.has_keepalive_query && e.has_nsid_query && !e.has_opt_overrun);
+    }
+}
+
 static void test_parse_edns_opt_multiple_qtypes_rfc10029(void) {
     printf("[TEST] Wire: parse_edns_opt Multiple QTYPEs (RFC 10029)...\n");
     uint8_t pkt[512] = { 0 };
@@ -3379,6 +3424,7 @@ int main(void) {
     test_extract_wire_name_to_buffer_boundaries();
     test_skip_wire_name_reserved_labels();
     test_parse_edns_opt_nsid_and_keepalive();
+    test_parse_edns_opt_overrun_and_keepalive_length();
     test_parse_edns_opt_multiple_qtypes_rfc10029();
     test_parse_edns_opt_ede_list_extraction();
     test_parse_edns_opt_ecs_ipv4_ipv6_scope();

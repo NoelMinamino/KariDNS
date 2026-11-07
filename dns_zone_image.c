@@ -1026,7 +1026,12 @@ static int thaw_zattr(const zone_image_t *img, zone_arena_t *a) {
         if (!a->bind_ecs_trusted_resolvers) return -1;
         a->bind_ecs_trusted_resolver_count = (int)ntr;
         for (uint32_t i = 0; i < ntr && !c.bad; i++) a->bind_ecs_trusted_resolvers[i] = get_str(&c);
-        if (!c.bad) a->bind_ecs_trusted_resolvers_parsed = acl_list_parse(a->bind_ecs_trusted_resolvers, (int)ntr);
+        if (!c.bad) {
+            a->bind_ecs_trusted_resolvers_parsed = acl_list_parse(a->bind_ecs_trusted_resolvers, (int)ntr);
+            /* NULL is out of memory: the zone must not thaw without its own list (it would fall back to the server's;
+             * freeze fails the same way) */
+            if (!a->bind_ecs_trusted_resolvers_parsed) return -1;
+        }
     }
     return c.bad ? -1 : 0;
 }

@@ -1206,6 +1206,30 @@ static void test_response_header_and_error_builder(void) {
     check_hdr(&r, &q, 1, false, true);
     CHECK(&r, gr_count(&r, 3, 41) == 1 && !gr_has_option(&r, 10));
 
+    /* review low L4 dns_wire.c [2] (D15): an option that overruns the OPT RDATA (here: length 8, 2 octets left), or octets after the last one,
+     * make the OPT unusable as in BIND (the OPT fromwire fails): FORMERR without OPT, the question echoed */
+    static const uint8_t opt_overrun[] = { 0, 10, 0, 8, 1, 2 };
+    static const uint8_t opt_stray[] = { 0, 3, 0, 0, 9, 9 };
+    static const uint8_t *const bad_opt_rdata[2] = { opt_overrun, opt_stray };
+    static const size_t bad_opt_len[2] = { sizeof(opt_overrun), sizeof(opt_stray) };
+    for (int k = 0; k < 2; k++) {
+        put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 1, 0, 0, 1); put_question(&q, "www.example.", 1, 1); put_opt(&q, 0, 0, 0, bad_opt_rdata[k], bad_opt_len[k]);
+        ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
+        check_hdr(&r, &q, 1, false, true);
+        CHECK(&r, r.counts[2] == 0 && r.len == DNS_HEADER_SIZE + 17);
+    }
+    /* review low L4 dns_wire.c [3] (D16, RFC 7828 3.2.1): edns-tcp-keepalive with an OPTION-LENGTH in a query is FORMERR with OPT (RFC 6891 7);
+     * with length 0 the query is answered */
+    static const uint8_t bad_keepalive[] = { 0, 11, 0, 2, 0, 50 };
+    static const uint8_t good_keepalive[] = { 0, 11, 0, 0 };
+    put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 1, 0, 0, 1); put_question(&q, "www.example.", 1, 1); put_opt(&q, 0, 0, 0, bad_keepalive, sizeof(bad_keepalive));
+    ask(&q, "www.example.", 1, "192.0.2.100", true, &r);
+    check_hdr(&r, &q, 1, false, true);
+    CHECK(&r, gr_count(&r, 3, 41) == 1);
+    put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 1, 0, 0, 1); put_question(&q, "www.example.", 1, 1); put_opt(&q, 0, 0, 0, good_keepalive, sizeof(good_keepalive));
+    ask(&q, "www.example.", 1, "192.0.2.100", true, &r);
+    check_hdr(&r, &q, 0, true, true);
+
     /* OPT itself unusable (owner is not the root): FORMERR without OPT (RFC 6891 §6.1.1), the question echoed (§7: header and question, as BIND
      * answers a message whose question it could parse); "www.example." IN A is 17 octets */
     put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 1, 0, 0, 1); put_question(&q, "www.example.", 1, 1);

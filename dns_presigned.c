@@ -123,7 +123,7 @@ bool presigned_parse_n3param(const char *s, presigned_n3param_t *p, const char *
         return false;
     }
     if (iter > PRESIGNED_MAX_ITERATIONS) {
-        *why = "NSEC3PARAM iterations exceed 2500 (RFC 5155 s10.3, RFC 9276 s3)";
+        *why = "NSEC3PARAM iterations exceed 150 (RFC 9276 s3.2)";
         return false;
     }
     p->alg = (uint8_t)alg;

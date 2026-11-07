@@ -136,10 +136,10 @@ run_check "ECDSA P-256 auto-detected Alg 13 and Type Covered 0" \
     "$DAG example.com @127.0.0.1 +sig0-pkey=ecdsa.key +sig0-name=update-key.example.com. +fuzztime=1700000000 +qr +timeout=1" \
     "\.[[:space:]]+0[[:space:]]+ANY[[:space:]]+SIG[[:space:]]+0[[:space:]]+13[[:space:]]+0[[:space:]]+0"
 
-# Verify deterministic timestamp from +fuzztime (1700000000 -> Expiration 20231114221820, Inception 20231114221320)
+# Verify deterministic timestamp from +fuzztime (1700000000 -> Expiration 20231114221820, Inception 20231114220820 = now - 300 s fudge, as BIND)
 run_check "Deterministic inception/expiration timestamps via +fuzztime" \
     "$DAG example.com @127.0.0.1 +sig0-pkey=ecdsa.key +sig0-name=update-key.example.com. +fuzztime=1700000000 +qr +timeout=1" \
-    "20231114221820[[:space:]]+20231114221320"
+    "20231114221820[[:space:]]+20231114220820"
 
 # Verify Signer Name in SIG record
 run_check "Signer name present in SIG record" \
