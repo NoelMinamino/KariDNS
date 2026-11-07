@@ -2608,6 +2608,48 @@ static void test_notify_tcp_busy(void) {
     printf("  -> NOTIFY over TCP busy passed.\n");
 }
 
+/* L2: the list of NOTIFY destinations holds 64 addresses; a longer one leaves the others out and says so (it used to drop them without a
+ * word, and those secondaries got no NOTIFY) */
+bool notify_dropped_last_round(void);
+static void test_notify_destination_cap(void) {
+    printf("[TEST] NOTIFY: more than 64 destinations are cut at 64 and the cut is reported...\n");
+    nt_ipc_open();
+    {   /* 64 datagrams wait in the queue before the test reads them */
+        int bufsz = 1 << 20;
+        (void)setsockopt(g_notify_ipc[0], SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz));
+        (void)setsockopt(g_notify_ipc[1], SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
+    }
+    nt_drain_pending();
+    static char names[70][24];
+    const char *many[70];
+    static notify_target_t big[70];
+    static nt_dgram_t dg[80];
+    static size_t dl[80];
+    for (int i = 0; i < 70; i++) {
+        snprintf(names[i], sizeof(names[i]), "198.51.100.%d", 1 + i);
+        many[i] = names[i];
+    }
+    static const int totals[] = { 63, 64, 65, 70 };
+    for (size_t k = 0; k < sizeof(totals) / sizeof(totals[0]); k++) {
+        const int total = totals[k];
+        peers_reset();
+        zone_db_entry_t *z = nt_setup(many, 2, false, false, 0);
+        memset(big, 0, sizeof(big));
+        for (int i = 0; i < total; i++) { big[i].ip = names[i]; big[i].port = 53; }
+        tzx(&nt_zone)->also_notify = big;
+        tzx(&nt_zone)->also_notify_count = total;
+        send_notify_to_all(z);
+        int got = nt_drain_ipc(dg, dl, 80);
+        if (got != (total < 64 ? total : 64)) fprintf(stderr, "destinations %d: %d datagrams\n", total, got);
+        assert(got == (total < 64 ? total : 64));
+        assert(notify_dropped_last_round() == (total > 64));
+        nt_teardown();
+        nt_drain_pending();
+    }
+    nt_ipc_close();
+    printf("  -> NOTIFY destination cap passed.\n");
+}
+
 /* ---- BIND compatibility, batch 7: serial-update-method (BIND 9.20 lib/dns/update.c dns_update_soaserial()), and max-records,
  * max-records-per-type, max-zone-ttl for an UPDATE (lib/ns/update.c: "reducing TTL to the configured max-zone-ttl", DNS_R_TOOMANYRECORDS) ---- */
 static void test_serial_update_methods(void) {
@@ -2832,6 +2874,7 @@ int main(void) {
     test_notify_zone_out_of_memory();
     test_notify_tcp_roundtrip();
     test_notify_tcp_flow();
+    test_notify_destination_cap();
     test_notify_tcp_failures();
     test_notify_tcp_after_udp();
     test_notify_tcp_timeout_config();

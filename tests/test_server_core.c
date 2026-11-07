@@ -351,6 +351,58 @@ static void test_read_dns_tcp_message_and_send(void) {
     printf("  -> read_dns_tcp_message & send_tcp_robust passed.\n");
 }
 
+/* L2: max-transfer-time-in of an inbound transfer (ctx->read_deadline) holds inside one message.  SO_RCVTIMEO restarts on every recv(), so
+ * a primary that sends one octet every 200 ms never trips it; the deadline stops the read after the second the transfer may take. */
+static void *l2_drip_thread(void *arg) {
+    int fd = *(int *)arg;
+    uint8_t msg[2 + 8];
+    msg[0] = 0; msg[1] = 8;
+    for (int i = 0; i < 8; i++) msg[2 + i] = (uint8_t)i;
+    for (size_t i = 0; i < sizeof(msg); i++) {
+        if (send(fd, &msg[i], 1, MSG_NOSIGNAL) != 1) break;
+        usleep(200 * 1000);
+    }
+    return NULL;
+}
+
+static void test_read_dns_tcp_message_deadline(void) {
+    printf("[TEST] Server Core: read_dns_tcp_message gives up at ctx->read_deadline inside one message (max-transfer-time-in)...\n");
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);      /* blocking, as the inbound transfer's socket is */
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    assert(setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0);
+
+    tcp_stream_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    assert(ctx);
+    ctx->state = TCP_STATE_READ_LEN;
+    ctx->read_deadline = time(NULL) + 1;
+    pthread_t th;
+    assert(pthread_create(&th, NULL, l2_drip_thread, &sv[1]) == 0);
+    uint8_t *msg_out = NULL;
+    uint16_t len_out = 0;
+    time_t t0 = time(NULL);
+    int ret = read_dns_tcp_message(sv[0], ctx, &msg_out, &len_out);
+    assert(ret == -1);                                          /* the whole message would take 2 s */
+    assert(time(NULL) - t0 <= 3);
+    close(sv[0]);                                               /* the dripping thread's send() fails and it ends */
+    pthread_join(th, NULL);
+    close(sv[1]);
+
+    /* no deadline: the same slow message is read to its end */
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    assert(setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0);
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->state = TCP_STATE_READ_LEN;
+    assert(pthread_create(&th, NULL, l2_drip_thread, &sv[1]) == 0);
+    ret = read_dns_tcp_message(sv[0], ctx, &msg_out, &len_out);
+    assert(ret == 1 && len_out == 8 && msg_out[7] == 7);
+    pthread_join(th, NULL);
+    close(sv[0]);
+    close(sv[1]);
+    free(ctx);
+    printf("  -> read_dns_tcp_message deadline passed.\n");
+}
+
 // ----------------------------------------------------------------------------
 // 6. Query Log Max QPS & Circuit Breaker Test
 // ----------------------------------------------------------------------------
@@ -6808,6 +6860,7 @@ int main(void) {
     test_resolve_ip_port_to_sockaddr();
     test_tcp_client_tracking();
     test_read_dns_tcp_message_and_send();
+    test_read_dns_tcp_message_deadline();
     test_query_log_max_qps_and_circuit_breaker();
     test_submit_response_log();
     test_log_write_rotated();

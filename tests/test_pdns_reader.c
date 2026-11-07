@@ -717,6 +717,27 @@ static void test_disabled_and_ent(void) {
         CHECK(z->ents[1].ordername == NULL);
     }
     pdns_zone_free(z);
+    {   /* L2: the ordername of an ENT is held to the length of the column like that of the other rows (255; longer = the marker) */
+        static char big[100000];
+        memset(big, 'A', sizeof(big) - 1);
+        big[sizeof(big) - 1] = '\0';
+        db_record_row_t er[] = { R(4, "b.z.test", NULL, NULL, 0, 0), R(5, "c.z.test", NULL, NULL, 0, 0), R(6, "d.z.test", NULL, NULL, 0, 0) };
+        er[0].ordername = big;
+        er[1].ordername = "ABCDEF";
+        char ok255[256];
+        memset(ok255, 'B', 255);
+        ok255[255] = '\0';
+        er[2].ordername = ok255;
+        z = build(er, 3, NULL, 0, NULL);
+        CHECK_MSG(!z->failed, "%s", z->error);
+        CHECK(z->n_ents == 3);
+        if (z->n_ents == 3) {
+            CHECK_MSG(z->ents[0].ordername && strlen(z->ents[0].ordername) <= 255, "an ENT ordername of 99,999 octets is not kept whole");
+            CHECK_STR(z->ents[1].ordername, "ABCDEF");
+            CHECK_MSG(z->ents[2].ordername && strlen(z->ents[2].ordername) == 255, "255 octets are kept");
+        }
+        pdns_zone_free(z);
+    }
 }
 
 static void test_zone_level(void) {
@@ -1223,6 +1244,23 @@ static void test_kdb(void) {
         CHECK(memcmp(gb.digest, gc.digest, KDB_DIGEST_LEN) != 0);
         CHECK(memcmp(gb.digest, gd.digest, KDB_DIGEST_LEN) == 0);
         pdns_zone_free(za); pdns_zone_free(zb); pdns_zone_free(zc); pdns_zone_free(zd);
+    }
+    {   /* L2: PRESIGNED is part of the digest: toggling it on a zone whose rows do not change leaves the bodies and the settings text
+         * alone, and the diff must still see the zone as changed (ZONE_BEGIN carries the flag) */
+        db_meta_row_t pm[] = { M("PRESIGNED", "1") };
+        pdns_zone_t *za = build(NULL, 0, NULL, 0, NULL), *zb = build(NULL, 0, pm, 1, NULL), *zc = build(NULL, 0, pm, 1, NULL);
+        CHECK(!za->failed && !zb->failed && (zb->flags & PDNS_F_PRESIGNED));
+        gate_seen_t ga = { 0, 0, { 0 }, 1 }, gb = ga, gc = ga;
+        pdns_kdb_params_t pa = { 0, 1, KDB_ZK_PRIMARY, NULL, test_gate, &ga, NULL, 0 }, pb = pa, pc = pa;
+        pb.gate_ud = &gb; pc.gate_ud = &gc;
+        char err[200];
+        rt_buf_t nb = {0};
+        CHECK(pdns_zone_encode_kdb(za, &pa, rt_emit, &nb, err, sizeof(err)) == 1);
+        CHECK(pdns_zone_encode_kdb(zb, &pb, rt_emit, &nb, err, sizeof(err)) == 1);
+        CHECK(pdns_zone_encode_kdb(zc, &pc, rt_emit, &nb, err, sizeof(err)) == 1);
+        CHECK(memcmp(ga.digest, gb.digest, KDB_DIGEST_LEN) != 0);
+        CHECK(memcmp(gb.digest, gc.digest, KDB_DIGEST_LEN) == 0);
+        pdns_zone_free(za); pdns_zone_free(zb); pdns_zone_free(zc);
     }
     /* big RDATA through the generic form (one token, up to 65535 octets): messages are filled to the limit, an RR is
      * never split, and one that cannot fit a message of its own is refused with its row id */

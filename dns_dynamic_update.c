@@ -858,6 +858,10 @@ typedef struct {
   const notify_target_t *tpl;
 } notify_dest_t;
 
+/* set by notify_add_target() when the list was full and an address was left out; notify_send_zone() (the control thread only, like every caller
+ * of notify_add_target()) clears it before it builds the list and logs it after */
+static bool g_notify_dropped;
+
 /* 宛先の一覧に重複なく加える */
 static void notify_add_target(notify_dest_t *targets, int *count, int max, int family, const char *ip, uint16_t port,
                               const tsig_key_t *tkey, const notify_target_t *tpl) {
@@ -879,6 +883,8 @@ static void notify_add_target(notify_dest_t *targets, int *count, int max, int f
     targets[*count].key = tkey;
     targets[*count].tpl = tpl;
     targets[(*count)++].addr = d;
+  } else {
+    g_notify_dropped = true;
   }
 }
 
@@ -1033,6 +1039,7 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
 
   notify_dest_t targets[64];
   int ntargets = 0;
+  g_notify_dropped = false;
 
   // 1. also-notify servers: the zone's list, else its view's, else options' (BIND 9.20 ARM).  An address with its own `key` is signed
   // with that key; the others with the zone's tsig-key (as the NS-derived targets below).
@@ -1087,6 +1094,10 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
     if (ap) notify_apex_targets(el, ap, view, eff.notify_to_soa, key, ns_port, targets, &ntargets, 64);
   }
 
+  if (g_notify_dropped)
+    syslog(LOG_WARNING, "[Notify] zone '%s': more than %d NOTIFY destinations (also-notify and the NS hosts); the others get no NOTIFY and find the "
+                        "change at their next refresh", domain, (int)(sizeof(targets) / sizeof(targets[0])));
+
   for (int i = 0; i < ntargets; i++) {
     /* the local address of this NOTIFY: the `source` of the also-notify list the address is written in, else notify-source(-v6).  Only an
      * address that was in the configuration at start-up has a pre-bound socket (config_xfr_source_allowed()); another one is ignored with a
@@ -1135,3 +1146,8 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
 void send_notify_to_all(zone_db_entry_t *entry) { notify_send_zone(entry, NULL, entry->view_name); }
 
 void notify_send_nonresident(const zdir_elem_t *el, const char *view_name) { notify_send_zone(NULL, el, view_name); }
+
+#ifdef KARIDNS_UNIT_TEST
+/* unit tests: did the last notify_send_zone() leave a NOTIFY destination out because the list (64) was full? */
+bool notify_dropped_last_round(void) { return g_notify_dropped; }
+#endif

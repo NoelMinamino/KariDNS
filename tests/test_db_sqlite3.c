@@ -459,6 +459,159 @@ static void test_nul(void) {
     }
 }
 
+static int l2_apex_count(void *ud, const db_apex_row_t *r) { (void)r; ((cnt_t *)ud)->n++; return 0; }
+
+/* L2: SQLite is dynamically typed.  A TEXT or REAL cell where the schema has an integer must fail the zone, not read as 0 or as a cut
+ * number (TEXT 'false' in disabled used to mean "enabled" for the loader while the SQL joins' `disabled = 0` saw a disabled row); NULL
+ * stays what it was (ttl / prio unset, disabled).  The error names the table, the row and the column. */
+static void test_column_types(void) {
+    printf("column types: a cell that is not an integer fails the zone\n");
+    static const struct { const char *set; const char *col; } bad[] = {
+        { "disabled = 'false'",   "disabled" },
+        { "disabled = 0.5",       "disabled" },
+        { "ttl = 'abc'",          "ttl" },
+        { "ttl = 3.5",            "ttl" },
+        { "prio = 'x'",           "prio" },
+        { "domain_id = 'two'",    "domain_id" },
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        char path[600], err[DB_ERRLEN], sql[200];
+        { char fp[700]; snprintf(fp, sizeof(fp), "%s/coltype.db", g_dir); unlink(fp); strlcat(fp, "-wal", sizeof(fp)); unlink(fp); fp[strlen(fp) - 4] = 0; strlcat(fp, "-shm", sizeof(fp)); unlink(fp); }   /* a new file for every case */
+        sqlite3 *db = make_db("coltype.db", path, sizeof(path));
+        CHECK(db != NULL);
+        if (!db) return;
+        add_zone(db, 1, "t.test", "NATIVE");
+        add_rec(db, 1, 1, "t.test", "SOA", SOA_K, 3600, -1, 0, NULL);
+        add_rec(db, 77, 1, "www.t.test", "A", "192.0.2.1", 300, -1, 0, NULL);
+        snprintf(sql, sizeof(sql), "UPDATE records SET %s WHERE id = 77", bad[i].set);
+        raw_exec(db, sql);
+        sqlite3_close(db);
+        db_conn_t *c = open_driver(path, 0, err, sizeof(err), NULL);
+        CHECK(c != NULL);
+        if (!c) continue;
+        recs_t a = {0};
+        int rc = db_driver_sqlite3.scan_records(c, NULL, rec_collect, &a);
+        CHECK_MSG(rc == -1, "%s: scan_records failed (%d)", bad[i].set, rc);
+        CHECK_HAS(db_driver_sqlite3.errmsg(c), "records");
+        CHECK_HAS(db_driver_sqlite3.errmsg(c), "id 77");
+        CHECK_HAS(db_driver_sqlite3.errmsg(c), bad[i].col);
+        CHECK_HAS(db_driver_sqlite3.errmsg(c), "not an integer");
+        recs_free(&a);
+        if (strcmp(bad[i].col, "domain_id") != 0) {                 /* the per-zone scan finds a row by its domain_id: this one is not found */
+            int64_t one = 1;
+            CHECK(db_driver_sqlite3.scan_records(c, &one, rec_collect, &a) == -1);
+            recs_free(&a);
+        }
+        db_driver_sqlite3.close(c);
+    }
+    /* NULLs keep their meaning: ttl and prio unset, disabled rows are not an error */
+    {
+        char path[600], err[DB_ERRLEN];
+        sqlite3 *db = make_db("coltype_null.db", path, sizeof(path));
+        CHECK(db != NULL);
+        if (!db) return;
+        add_zone(db, 1, "t.test", "NATIVE");
+        add_rec(db, 1, 1, "t.test", "SOA", SOA_K, 3600, -1, 0, NULL);
+        add_rec(db, 2, 1, "n.t.test", "A", "192.0.2.2", -1, -1, 0, NULL);
+        raw_exec(db, "UPDATE records SET disabled = NULL WHERE id = 2");
+        sqlite3_close(db);
+        db_conn_t *c = open_driver(path, 0, err, sizeof(err), NULL);
+        CHECK(c != NULL);
+        if (c) {
+            recs_t a = {0};
+            CHECK(db_driver_sqlite3.scan_records(c, NULL, rec_collect, &a) == 0 && a.n == 2);
+            CHECK(a.n == 2 && a.v[1].ttl_null && a.v[1].prio_null && a.v[1].disabled);
+            recs_free(&a);
+            db_driver_sqlite3.close(c);
+        }
+    }
+    /* scan_apex: a TEXT domain_id or ttl of an apex row */
+    {
+        char path[600], err[DB_ERRLEN];
+        sqlite3 *db = make_db("coltype_apex.db", path, sizeof(path));
+        CHECK(db != NULL);
+        if (!db) return;
+        add_zone(db, 1, "t.test", "NATIVE");
+        add_rec(db, 1, 1, "t.test", "SOA", SOA_K, 3600, -1, 0, NULL);
+        add_rec(db, 2, 1, "t.test", "NS", "ns1.t.test", 3600, -1, 0, NULL);
+        raw_exec(db, "UPDATE records SET ttl = 'soon' WHERE id = 2");
+        sqlite3_close(db);
+        db_conn_t *c = open_driver(path, 0, err, sizeof(err), NULL);
+        CHECK(c != NULL);
+        if (c) {
+            CHECK(db_driver_sqlite3.begin_snapshot(c) == 0);
+            cnt_t cn = {0};
+            CHECK(db_driver_sqlite3.scan_apex(c, NULL, l2_apex_count, &cn) == -1);
+            CHECK_HAS(db_driver_sqlite3.errmsg(c), "id 2");
+            CHECK_HAS(db_driver_sqlite3.errmsg(c), "ttl");
+            CHECK(db_driver_sqlite3.end_snapshot(c) == 0);
+            db_driver_sqlite3.close(c);
+        }
+    }
+}
+
+/* L2: a bad SOA cell in the zone list is reported with the id of the SOA row (the table the message names), not the id of the domain */
+static void test_zone_soa_cell_error(void) {
+    printf("zone list: the error of a bad SOA cell names the SOA row\n");
+    char path[600], err[DB_ERRLEN];
+    sqlite3 *db = make_db("soacell.db", path, sizeof(path));
+    CHECK(db != NULL);
+    if (!db) return;
+    add_zone(db, 9, "z.test", "NATIVE");
+    raw_exec(db, "INSERT INTO records (id, domain_id, name, type, content, ttl, prio, disabled)"
+                 " VALUES (55, 9, 'z.test', 'SOA', 'a' || char(0) || 'b', 5, 0, 0)");
+    sqlite3_close(db);
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL);
+    if (!c) return;
+    zl_t l = {0};
+    CHECK(db_driver_sqlite3.list_zones(c, zl_collect, &l) == -1);
+    CHECK_HAS(db_driver_sqlite3.errmsg(c), "records id 55");
+    CHECK_HAS(db_driver_sqlite3.errmsg(c), "content");
+    zl_free(&l);
+    CHECK(db_driver_sqlite3.find_zone(c, "z.test", zl_collect, &l) == -1);
+    CHECK_HAS(db_driver_sqlite3.errmsg(c), "records id 55");
+    zl_free(&l);
+    db_driver_sqlite3.close(c);
+}
+
+/* L2: the loader's connection does not trust the schema of a file other users can write: a view that calls a function not marked
+ * SQLITE_INNOCUOUS is refused, where a connection with the default setting reads it.  The function is registered for every new connection
+ * (sqlite3_auto_extension), the driver's included; SQLite has no built-in function that is neither innocuous nor direct-only. */
+#ifdef SQLITE_DBCONFIG_TRUSTED_SCHEMA
+static void l2_unsafe_fn(sqlite3_context *ctx, int n, sqlite3_value **v) { (void)n; (void)v; sqlite3_result_text(ctx, "x", -1, SQLITE_STATIC); }
+static int l2_ext_init(sqlite3 *db, char **err, const sqlite3_api_routines *api) {
+    (void)err; (void)api;
+    return sqlite3_create_function(db, "l2_unsafe", 0, SQLITE_UTF8, NULL, l2_unsafe_fn, NULL, NULL);
+}
+#endif
+static void test_trusted_schema(void) {
+    printf("open: trusted_schema is off for the loader's connection\n");
+#ifdef SQLITE_DBCONFIG_TRUSTED_SCHEMA
+    char path[600], err[DB_ERRLEN];
+    CHECK(sqlite3_auto_extension((void (*)(void))l2_ext_init) == SQLITE_OK);
+    sqlite3 *db = make_db("trusted.db", path, sizeof(path));
+    CHECK(db != NULL);
+    if (!db) { sqlite3_cancel_auto_extension((void (*)(void))l2_ext_init); return; }
+    add_simple_zone(db, 1, 10, "s1.test");
+    raw_exec(db, "CREATE VIEW karidns_profiles AS SELECT 'p1' AS name, l2_unsafe() AS settings");
+    int on = -1;
+    CHECK(sqlite3_db_config(db, SQLITE_DBCONFIG_TRUSTED_SCHEMA, -1, &on) == SQLITE_OK && on == 1);   /* the default is on */
+    CHECK(sqlite3_exec(db, "SELECT name, settings FROM karidns_profiles", NULL, NULL, NULL) == SQLITE_OK);   /* so the view is read by a default connection */
+    sqlite3_close(db);
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL);
+    if (c) {
+        /* the schema check looks at the table (PRAGMA table_info expands the view): refused, not read */
+        int rc = db_driver_sqlite3.check_schema(c, NULL);
+        CHECK_MSG(rc != 0, "the view that calls an unsafe function is refused (rc %d)", rc);
+        CHECK_HAS(db_driver_sqlite3.errmsg(c), "unsafe use of");
+        db_driver_sqlite3.close(c);
+    }
+    sqlite3_cancel_auto_extension((void (*)(void))l2_ext_init);
+#endif
+}
+
 /* ------------------------------------------------------------------ 3b. find_zone is an index search */
 /* "WHERE d.name COLLATE NOCASE = ?1 OR d.name COLLATE NOCASE = ?2" made SQLite scan all of domains (SCAN d: 8,400 pages and 60 ms at
  * 1,000,000 zones); the IN list is a SEARCH on name_index.  With 200,000 zones a scan costs 10 ms or more, a search microseconds: 300
@@ -2026,6 +2179,49 @@ static int ff_check(const db_driver_t *drv, const db_source_t *src, char **out) 
     return st;
 }
 
+/* L2 (D20): with loader-threads > 1 the workers' snapshots are later than the main thread's (zone list, metadata, keys).  A commit in between
+ * (seen as a different position of the change log in a worker's snapshot) would give a zone that mixes two commits; the source is read
+ * again from the start, before anything of it is committed, and the result is the state after the commit. */
+static char g_l2_path[600];
+static void l2_commit(void) {
+    sqlite3 *db = raw_open(g_l2_path, SQLITE_OPEN_READWRITE);
+    if (!db) return;
+    raw_exec(db, "UPDATE records SET content = '192.0.2.99' WHERE id = 40");
+    raw_exec(db, "INSERT INTO karidns_changes (domain_id, changed_at) VALUES (1, 3)");
+    sqlite3_close(db);
+}
+
+static void test_pool_snapshot_moved(void) {
+    printf("loader-threads: a commit between the main thread's snapshot and the workers' reads the source again\n");
+    char path[600];
+    sqlite3 *db = cov_make_db("l2pool.db", path, sizeof(path));
+    CHECK(db != NULL);
+    if (!db) return;
+    add_rec(db, 40, 1, "www.s1.test", "A", "192.0.2.1", 300, -1, 0, NULL);
+    sqlite3_close(db);
+    snprintf(g_l2_path, sizeof(g_l2_path), "%s", path);
+
+    g_threads = 2;
+    dump_t d0, d1, d2;
+    unsigned again0 = g_pool_again;
+    run_dump_mem(path, NULL, &d0);                                     /* a quiet source: read once */
+    CHECK_MSG(d0.status == 0 && d0.stream_ok, "quiet source: exit %d (%s)", d0.status, d0.sm_reason);
+    CHECK_MSG(g_pool_again == again0, "a quiet source is not read again (%u)", g_pool_again - again0);
+    g_pool_hook = l2_commit;
+    run_dump_mem(path, NULL, &d1);
+    CHECK_MSG(g_pool_again == again0 + 1, "the commit between the snapshots made one more reading (%u)", g_pool_again - again0);
+    CHECK_MSG(d1.status == 0 && d1.stream_ok, "after the commit: exit %d (%s)", d1.status, d1.sm_reason);
+    run_dump_mem(path, NULL, &d2);                                     /* the database as it is now */
+    CHECK_MSG(g_pool_again == again0 + 1, "no further reading (%u)", g_pool_again - again0);
+    CHECK_MSG(d1.len == d2.len && d1.len > 0 && memcmp(d1.bytes, d2.bytes, d1.len) == 0,
+              "the dump read after the commit is the state after the commit (%zu bytes, now %zu)", d1.len, d2.len);
+    CHECK_MSG(d0.len > 0 && (d0.len != d1.len || memcmp(d0.bytes, d1.bytes, d0.len) != 0), "the commit is in the dump");
+    g_threads = 1;
+    dump_free(&d0);
+    dump_free(&d1);
+    dump_free(&d2);
+}
+
 static void test_driver_faults(void) {
     printf("loader: a driver call that fails (dump, loader-threads, check)\n");
     ff_init();
@@ -2980,6 +3176,9 @@ int main(int argc, char **argv) {
     test_schema();
     test_rows();
     test_nul();
+    test_column_types();
+    test_zone_soa_cell_error();
+    test_trusted_schema();
     test_scans();
     test_find_zone_index();
     test_scan_apex();
@@ -3003,6 +3202,7 @@ int main(int argc, char **argv) {
     test_check_mode();
     test_scan_failures();
     test_profiles_and_views();
+    test_pool_snapshot_moved();
     test_driver_faults();
     snprintf(g_ext_path, sizeof(g_ext_path), "%s/../../db/karidns_ext.sqlite3.sql", dir);
     snprintf(g_audit_path, sizeof(g_audit_path), "%s/../../db/karidns_audit.sqlite3.sql", dir);

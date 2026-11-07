@@ -577,6 +577,7 @@ size_t resolve_ip_port_to_sockaddr(const char *ip, int port,
 int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out,
                          uint16_t *len_out) {
   while (1) {
+    if (ctx->read_deadline && time(NULL) >= ctx->read_deadline) return -1;   /* max-transfer-time-in, also inside one message */
     if (ctx->state == TCP_STATE_READ_LEN) {
       ssize_t n =
           recv(fd, &ctx->buf[ctx->accumulated], 2 - ctx->accumulated, 0);
