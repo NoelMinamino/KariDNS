@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -45,6 +46,33 @@ char *karictl_read_entire_file(const char *path) {
   return buf;
 }
 
+/* 設定ファイル中で、コメント (# // /＊ ＊/) と引用符内の文字列を除いた最初の単語 word を探し、
+ * その直後を返す。サンプルの説明コメントに書かれた secret "..."; や socket "..."; を拾わないため。 */
+static char *karictl_find_word(char *cfg, const char *word) {
+    size_t wl = strlen(word);
+    char *p = cfg;
+    while (*p) {
+        if (*p == '#' || (*p == '/' && p[1] == '/')) {
+            while (*p && *p != '\n') p++;
+        } else if (*p == '/' && p[1] == '*') {
+            p += 2;
+            while (*p && !(*p == '*' && p[1] == '/')) p++;
+            if (*p) p += 2;
+        } else if (*p == '"') {
+            p++;
+            while (*p && *p != '"') p++;
+            if (*p) p++;
+        } else if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '{' || *p == '}' || *p == ';') {
+            p++;
+        } else {
+            char *start = p;
+            while (*p && !strchr(" \t\r\n{};\"#", *p) && !(*p == '/' && (p[1] == '/' || p[1] == '*'))) p++;
+            if ((size_t)(p - start) == wl && memcmp(start, word, wl) == 0) return p;
+        }
+    }
+    return NULL;
+}
+
 char* extract_secret_from_config(const char* path) {
     struct stat st;
     if (stat(path, &st) == 0) {
@@ -59,9 +87,8 @@ char* extract_secret_from_config(const char* path) {
     if (!cfg) return NULL;
     
     char *secret = NULL;
-    char *p = strstr(cfg, "secret");
+    char *p = karictl_find_word(cfg, "secret");
     if (p) {
-        p += 6;
         while (*p == ' ' || *p == '\t' || *p == '\n') p++;
         if (*p == '"') {
             p++;
@@ -89,9 +116,8 @@ char* extract_socket_from_config(const char* path) {
     if (!cfg) return NULL;
     
     char *sock = NULL;
-    char *p = strstr(cfg, "socket");
+    char *p = karictl_find_word(cfg, "socket");
     if (p) {
-        p += 6;
         while (*p == ' ' || *p == '\t' || *p == '\n') p++;
         if (*p == '"') {
             p++;
@@ -117,9 +143,8 @@ char* extract_algorithm_from_config(const char* path) {
     if (!cfg) return NULL;
 
     char *alg = NULL;
-    char *p = strstr(cfg, "algorithm");
+    char *p = karictl_find_word(cfg, "algorithm");
     if (p) {
-        p += 9;
         while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
         bool quoted = (*p == '"');
         if (quoted) p++;
@@ -290,8 +315,10 @@ int main(int argc, char **argv) {
         return 2;
     }
     int padding = 0;
-    if (b64_len > 0 && secret_b64[b64_len - 1] == '=') padding++;
-    if (b64_len > 1 && secret_b64[b64_len - 2] == '=') padding++;
+    size_t pl = b64_len;   // EVP_DecodeBlock は前後の空白を読み飛ばす: '=' は空白を除いた末尾で数える (karidns 側の b64_padding と同じ)
+    while (pl > 0 && isspace((unsigned char)secret_b64[pl - 1])) pl--;
+    if (pl > 0 && secret_b64[pl - 1] == '=') padding++;
+    if (pl > 1 && secret_b64[pl - 2] == '=') padding++;
     size_t secret_decoded_len = len - padding;
     explicit_bzero(secret_b64, b64_len);
     free(secret_b64);

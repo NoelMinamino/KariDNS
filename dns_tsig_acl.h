@@ -44,6 +44,8 @@ struct aml {
     bool has_addr;     /* some non-key element can match (an address, any, none, localhost ... or a nested list that has one) */
     bool has_key;      /* some key element, also inside nested lists */
     bool has_neg_key;  /* a negated key element somewhere (the flat lists of transfer-acl-match cannot say that) */
+    bool has_any;      /* an `any` element, also inside nested lists */
+    bool has_neg_any;  /* an `any` inside a negated nested list somewhere: the flat lists cannot say that (aml_flatten() sets *inexact) */
 };
 
 aml_t *aml_new(void);
