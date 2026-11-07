@@ -53,6 +53,5 @@ enum { ZX_READ_OK = 0, ZX_READ_ZONE, ZX_READ_DB, ZX_READ_OOM };
 #define ZX_PLAIN_CHAIN 4u
 int zx_read_zone_ex(const db_driver_t *d, db_conn_t *c, bool has_ext, const char *name, int64_t id, const pdns_opts_t *opts, unsigned plain, pdns_zone_t **out,
                     bool *has_keys);
-int zx_read_zone(const db_driver_t *d, db_conn_t *c, bool has_ext, const char *name, int64_t id, const pdns_opts_t *opts, pdns_zone_t **out, bool *has_keys);
 
 #endif

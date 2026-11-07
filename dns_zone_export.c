@@ -255,10 +255,6 @@ int zx_read_zone_ex(const db_driver_t *d, db_conn_t *c, bool has_ext, const char
     return ZX_READ_OK;
 }
 
-int zx_read_zone(const db_driver_t *d, db_conn_t *c, bool has_ext, const char *name, int64_t id, const pdns_opts_t *opts, pdns_zone_t **out, bool *has_keys) {
-    return zx_read_zone_ex(d, c, has_ext, name, id, opts, 0, out, has_keys);
-}
-
 int zx_export_zone_ex(zx_t *x, const char *zone, const char *view, const dzt_opts_t *fmt, dzt_sink_t sink, void *ud, unsigned plain) {
     const db_driver_t *d = x->drv;
     db_conn_t *c = x->conn;

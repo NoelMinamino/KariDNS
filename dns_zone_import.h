@@ -15,7 +15,7 @@
  *   3. in ONE transaction (dns_db_driver.h, open_write): locks the zone against a concurrent importer, finds it or creates it (a new zone is
  *      NATIVE unless a type is given; the type of an existing zone is never changed), applies the serial rule, deletes and inserts rows,
  *      puts the zone in a view, adds a reload request, READS THE ZONE BACK in the same transaction through the loader's path (dns_zone_export.c
- *      zx_read_zone(): dns_pdns_reader.c, the checks of `karicheck db`, and the size limits of the server) and commits only when the loader
+ *      zx_read_zone_ex(): dns_pdns_reader.c, the checks of `karicheck db`, and the size limits of the server) and commits only when the loader
  *      would load what was written (a merge that put a CNAME beside other data, an ALIAS beside an A record, a zone over max-records: refused,
  *      rolled back).  A dry run does the same.  Any error rolls back: nothing is written.
  *
