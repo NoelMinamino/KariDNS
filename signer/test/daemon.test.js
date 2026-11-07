@@ -454,3 +454,35 @@ test('changes read before a run are covered when it signs the zone; when it does
   // a.test was signed: its row is covered; b.test (busy) and c.test (the result could not be recorded) keep theirs
   assert.deepEqual(find(m.calls, 'signerZones').at(-1)[1].sort(), [2, 3]);
 });
+
+test('a pass reads the change log before its first run: a change committed just before the run is covered, not signed again', async () => {
+  const m = make();
+  m.db.signer = [{ id: 1, name: 'a.test' }];
+  // the zone was made and the request filed; the change loop has not read those rows yet
+  m.db.rows = [{ domainId: 1, seq: 1, xid: '60' }];
+  m.db.reqs = [{ id: 1, domainId: 1, zone: 'a.test', kind: 'enable' }];
+  await m.d.tick();
+  assert.equal(m.d.cursor, 'c1', 'read before the run');
+  await idle(m.d);
+  m.clock.now += 10;
+  await m.d.flushChanges();
+  assert.equal(find(m.calls, 'markDue').length, 0);
+  // nothing to start: the change log is not read by the pass (the change loop does that)
+  const n = find(m.calls, 'changesSince').length;
+  m.db.reqs = [];
+  m.clock.now += 10;
+  await m.d.tick();
+  assert.equal(find(m.calls, 'changesSince').length, n);
+  // a change log that cannot be read does not keep the run from starting
+  m.db.failChanges = true;
+  m.db.due = [{ domainId: 1, zone: 'a.test', attempts: 0 }];
+  await m.d.tick();
+  await idle(m.d);
+  assert.equal(m.signed.length, 2);
+  assert.ok(m.logs.some((l) => /error reading the change log failed: db down/.test(l)));
+  // two reads at a time are made one after the other
+  m.db.failChanges = false;
+  m.db.rows = [{ domainId: 1, seq: 2, xid: '61' }];
+  await Promise.all([m.d.ingest(), m.d.ingest()]);
+  assert.equal(m.d.debounce.size, 1);
+});

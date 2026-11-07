@@ -95,7 +95,14 @@ export class Daemon {
     this.lastCatchUp = this.clock();
   }
 
-  async ingest() {
+  // the change loop and tick() (before it starts runs) both read the change log: one read at a time, each from the position the last one left
+  ingest() {
+    const p = (this.ingesting ?? Promise.resolve()).then(() => this.ingest1());
+    this.ingesting = p.catch(() => {});
+    return p;
+  }
+
+  async ingest1() {
     const { rows, cursor, gap } = await this.db.changesSince(this.cursor);
     this.cursor = cursor;
     const now = this.clock();
@@ -148,6 +155,21 @@ export class Daemon {
     let free = this.workers - this.inflight.size;
     if (free <= 0) return;
     const ready = (id) => !this.inflight.has(id) && (this.notBefore.get(id) ?? 0) <= now;
+    // before the first run of this pass, the change log is read up to now, so that a run takes (start1) every row committed before it: a change
+    // made just before a key request (the zone was created, then the request filed) is covered by the run, not signed a second time when the
+    // poll of the change log brings it in after the run
+    let fresh = false;
+    const start = async (job) => {
+      if (!fresh) {
+        fresh = true;
+        try {
+          await this.ingest();
+        } catch (e) {
+          this.log.error(`reading the change log failed: ${e.message}`);
+        }
+      }
+      if (!this.stopping) this.start1(job);
+    };
     if (now - this.lastRequests >= REQUEST_POLL || this.requestsDue) {
       this.requestsDue = false;
       this.requests = await this.db.pendingRequests(REQUEST_BATCH);
@@ -157,7 +179,7 @@ export class Daemon {
     for (const r of this.requests) {
       if (free <= 0) break;
       if (!ready(r.domainId)) continue;
-      this.start1({ domainId: r.domainId, zone: r.zone, request: r });
+      await start({ domainId: r.domainId, zone: r.zone, request: r });
       this.requests = this.requests.filter((x) => x !== r);
       free--;
     }
@@ -168,7 +190,7 @@ export class Daemon {
     for (const z of due) {
       if (free <= 0) break;
       if (!ready(z.domainId)) continue;
-      this.start1({ domainId: z.domainId, zone: z.zone, request: null });
+      await start({ domainId: z.domainId, zone: z.zone, request: null });
       free--;
     }
   }

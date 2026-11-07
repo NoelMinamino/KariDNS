@@ -293,8 +293,13 @@ sg_phase_resign() {
     sg_wait 30 "fast.test: exported" 'sg_try_export fast.test; [ -n "$(sg_sig "$T/out/fast.test.zone" "@" SOA exp)" ]'
     e0=$(sg_sig "$T/out/fast.test.zone" '@' SOA exp | sort -n | tail -1)
     a0=$(sg_signed_at fast.test); s0=$(sg_serial fast.test)
+    d0=$(sg_state fast.test "$(echo "$SG_SIGNED_AT" | sed 's/signed_at/next_due/')")
     sg_has "fast.test: next_due is before the earliest expiration (min_expire - refresh)" "$(dbq "SELECT CASE WHEN next_due < min_expire THEN 'before' ELSE 'after' END FROM karidns_signer_state WHERE domain_id = (SELECT id FROM domains WHERE name = 'fast.test')")" before
     sg_wait 75 "fast.test: the signer signed it again (signed_at moved)" '[ "$(sg_signed_at fast.test)" != "'"$a0"'" ]'
+    # not before it was due: the rows of the zone's creation, made just before the key request, are covered by the first run (Daemon.tick reads
+    # the change log before it starts a run), they do not make the zone due a second time
+    a1=$(sg_signed_at fast.test)
+    sg_eq "fast.test: signed again when it was due, not before (signed_at $a1, next_due $d0)" "$([ -n "$d0" ] && [ "$a1" -ge "$d0" ] && echo due)" due
     sg_wait 30 "fast.test: the SOA signature expires later now" 'sg_try_export fast.test; e1=$(sg_sig "$T/out/fast.test.zone" "@" SOA exp | sort -n | tail -1); [ -n "$e1" ] && [ "$e1" -gt "$e0" ]'
     sg_eq "fast.test: the serial grew" "$([ "$(sg_serial fast.test)" -gt "$s0" ] && echo grew)" grew
     sg_verify fast.test
