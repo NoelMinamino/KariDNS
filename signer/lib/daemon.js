@@ -174,6 +174,7 @@ export class Daemon {
   }
 
   start1(job) {
+    job.changes = this.debounce.take(job.domainId);       // what the change log said about the zone before this run (Debounce.take)
     const p = this.runJob(job).finally(() => {
       this.inflight.delete(job.domainId);
       // a poll that happened while the job ran listed its request again (it is pending until the job has answered it): not a second job for it
@@ -190,12 +191,16 @@ export class Daemon {
     } catch (e) {
       out = { status: 'failed', error: `unexpected error: ${e.message}`, request: job.request ? { state: 'failed', message: e.message } : null };
     }
+    let recorded = true;
     try {
       await this.handle(job, out);
     } catch (e) {
+      recorded = false;
       this.log.error(`${job.zone}: cannot record the result (${out.status}): ${e.message}`);
       this.notBefore.set(job.domainId, this.clock() + 30);          // do not hammer a database that does not answer
     }
+    // the changes read before the run: covered when it signed the zone, else they still make it due (the debounce looks at them again)
+    if (!(recorded && out.status === 'signed')) this.debounce.putBack(job.domainId, job.changes);
   }
 
   // one place for every outcome of a run (the callers of the pipeline's exit statuses)

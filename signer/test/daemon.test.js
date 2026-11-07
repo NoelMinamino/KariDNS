@@ -432,3 +432,25 @@ test('the sleep of the pipeline (retries of a key INSERT) does not hold up a sto
   await m.ctx.sleep(60000);
   assert.deepEqual(slept, [1000]);
 });
+
+test('changes read before a run are covered when it signs the zone; when it does not, they still make the zone due', async () => {
+  const m = make();
+  m.db.signer = [{ id: 1, name: 'a.test' }, { id: 2, name: 'b.test' }, { id: 3, name: 'c.test' }];
+  // somebody made the zones and filed key requests; the signer starts at once, before the debounce of those rows is over
+  m.db.rows = [{ domainId: 1, seq: 1, xid: '50' }, { domainId: 2, seq: 2, xid: '51' }, { domainId: 3, seq: 3, xid: '52' }];
+  await m.d.ingest();
+  m.outcomes.set(2, { status: 'busy' });
+  m.db.reqs = [{ id: 1, domainId: 1, zone: 'a.test', kind: 'enable' }, { id: 2, domainId: 2, zone: 'b.test', kind: 'enable' }];
+  const rec = m.db.recordSuccess.bind(m.db);
+  m.db.recordSuccess = async (id, s) => { if (id === 3) throw new Error('cannot write'); return rec(id, s); };
+  await m.d.tick();
+  await idle(m.d);
+  m.db.reqs = [];
+  m.db.due = [{ domainId: 3, zone: 'c.test', attempts: 0 }];
+  await m.d.tick();
+  await idle(m.d);
+  m.clock.now += 5;
+  await m.d.flushChanges();
+  // a.test was signed: its row is covered; b.test (busy) and c.test (the result could not be recorded) keep theirs
+  assert.deepEqual(find(m.calls, 'signerZones').at(-1)[1].sort(), [2, 3]);
+});

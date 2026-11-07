@@ -159,3 +159,32 @@ test('change-log position: a change is not a change of the zone when its write i
   d.add(3, { seq: 13, xid: null }, 40);
   assert.deepEqual(d.flush(50, (r) => w.isOwn(r)), [3]);
 });
+
+test('debounce: take() hands the rows of a zone to a run, putBack() returns them and keeps what came meanwhile', () => {
+  const d = new Debounce(5);
+  assert.equal(d.take(1), null);
+  d.add(1, { seq: 1, xid: null }, 0);
+  d.add(2, { seq: 2, xid: null }, 0);
+  const z = d.take(1);
+  assert.deepEqual(z.rows, [{ seq: 1, seqEnd: 1, xid: null }]);
+  assert.deepEqual(d.flush(10, () => false), [2], 'the taken zone is not flushed');
+  d.putBack(1, null);
+  assert.equal(d.size, 0);
+  d.putBack(1, z);
+  assert.deepEqual(d.flush(10, () => false), [1]);
+  // back next to rows that came while the run went on: the older first, the burst from the older row
+  d.add(1, { seq: 1, xid: null }, 0);
+  const z2 = d.take(1);
+  d.add(1, { seq: 9, xid: '9' }, 8);
+  d.putBack(1, z2);
+  assert.deepEqual(d.zones.get(1).rows.map((r) => r.seq), [1, 9]);
+  assert.equal(d.zones.get(1).first, 0);
+  assert.deepEqual(d.flush(13, (r) => r.xid === '9'), [1], 'the returned row is not ours');
+  // more than 256 runs together: the zone counts as overflowed
+  for (let i = 0; i < 200; i++) d.add(1, { seq: 1000 + 2 * i, xid: null }, 20);
+  const z3 = d.take(1);
+  for (let i = 0; i < 100; i++) d.add(1, { seq: 5000 + 2 * i, xid: null }, 21);
+  d.putBack(1, z3);
+  assert.equal(d.zones.get(1).rows.length, 256);
+  assert.equal(d.zones.get(1).overflow, true);
+});

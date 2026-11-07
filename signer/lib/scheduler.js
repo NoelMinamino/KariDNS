@@ -69,6 +69,26 @@ export class Debounce {
     return out;
   }
 
+  // a run of the zone starts: the rows read so far were committed before its export, so a run that signs the zone covers them (a change after the
+  // export makes import --signer exit with status 3).  The entry is handed to the run; putBack() returns it when the run did not sign the zone.
+  take(domainId) {
+    const z = this.zones.get(domainId) ?? null;
+    this.zones.delete(domainId);
+    return z;
+  }
+
+  putBack(domainId, z) {
+    if (!z) return;
+    const cur = this.zones.get(domainId);
+    if (!cur) {
+      this.zones.set(domainId, z);
+      return;
+    }
+    cur.first = Math.min(cur.first, z.first);
+    cur.overflow = cur.overflow || z.overflow || z.rows.length + cur.rows.length > 256;
+    cur.rows = [...z.rows, ...cur.rows].slice(0, 256);
+  }
+
   get size() { return this.zones.size; }
 }
 
