@@ -120,15 +120,19 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
    - PowerDNS ALIAS and LUA records (TYPE65401 / TYPE65402 of CLASS IN, see karidns(8) "POWERDNS ALIAS AND LUA RECORDS"): an ALIAS name that also owns an A or AAAA RRset, an ALIAS in a zone with DNSKEY, RRSIG, NSEC, NSEC3 or NSEC3PARAM records, and malformed ALIAS / LUA RDATA are errors (the server does not load such a zone); an `[INFO]` line counts the ALIAS records (A and AAAA at those names are NODATA unless an `alias-resolver` is configured), and a warning says that LUA records are kept for transfers and never answered
    - The `check-*` options of the zone's configuration set the severity of some of the findings above and add checks that report nothing without them (karidns(8) "BIND option values"): `check-integrity` (the NS glue and the MX / SRV addresses; `no` skips them), `check-mx-cname` (an MX target that is a CNAME: error without the option), `check-srv-cname` (warning without the option), `check-wildcard` (a `*` label that is not the first), `check-dup-records` (the same RR twice), `check-mx` (an MX target that is an IP address) and `check-names` (host names of A, AAAA and MX owners and of NS, MX, SRV and SOA MNAME targets). The size limits `max-records`, `max-records-per-type`, `max-types-per-name` and `max-zone-ttl` (primary zones) are errors here because the server does not load such a zone. `karicheck db` passes the options-level severities to `karidns-dbloader --check --zone-checks`.
    - Every record must be serializable to wire format
+   - A name with two different CNAME records, or two different DNAME records, is an error (`zone.pdns-types`; BIND: "multiple RRs of singleton type"); the same RR twice, and records that tinydns locations or `$LOCATION-TAG` / `$ECS-SUBNET-TAG` tags keep apart, are not
+   - Zone file syntax that BIND also refuses: a `$` word that is not a directive, `$ORIGIN` without a name, a record line that starts with a blank before any record ("no current owner name"), a `\DDD` escape above 255, `\000` in a field that is not a TXT string, an entry of a `$LOCATION-TAG` / `$ECS-SUBNET-TAG` definition that is not an address or CIDR; in tinydns data a TTL that is not decimal digits and more than 4096 `%` location lines
    - Catalog zones (`catalog-zone yes;`): `version.<zone> TXT "2"` is required, and group TXT records without a member PTR record give warnings
 3. **Record Field Validation**:
    - A/AAAA addresses; SRV, NAPTR, CAA (RFC 8659 tags and flags), SSHFP, HIP, WKS, GPOS, X25, ISDN, EUI48/EUI64, CSYNC, DSYNC and SVCB/HTTPS target fields
    - WKS: the protocol is a number (0-255) or `TCP` / `UDP` (any case), as the server reads it; a port is a number (0-65535) or a service name from the server's built-in table (RFC 1035 §3.4.2; the IANA names of the common ports, e.g. `smtp`, `http`, `domain`); any other port gives a warning, and the record is reported as an error because the server cannot load it
-   - NSEC3PARAM at the apex: Flags other than 0 are an error (RFC 5155 §4.1.2: such an NSEC3PARAM MUST be ignored, and the server ignores it); a hash algorithm other than 1 (SHA-1), an iteration count other than 0 (RFC 9276 §3.1: MUST be 0) and a non-empty salt (RFC 9276 §3.1: SHOULD NOT) give warnings; more than 100 iterations are an error. A warning is also given when no NSEC3PARAM is usable, or when the one the server uses has no NSEC3 RRs
+   - NSEC3PARAM at the apex: Flags other than 0 are an error (RFC 5155 §4.1.2: such an NSEC3PARAM MUST be ignored, and the server ignores it); a hash algorithm other than 1 (SHA-1), an iteration count other than 0 (RFC 9276 §3.1: MUST be 0) and a non-empty salt (RFC 9276 §3.1: SHOULD NOT) give warnings; more than 100 iterations are an error, and more than 150 (RFC 9276 §3.2) are refused with `zone.pdns-types` because the server does not load such a zone (a zone file, a transfer and a database or presigned zone are all held to this limit; BIND 9.20 only warns above 50 and loads the zone). A warning is also given when no NSEC3PARAM is usable, or when the one the server uses has no NSEC3 RRs
    - NSEC3 records are checked once per chain (RRs with the same hash algorithm, iterations and salt), not once per RR: hash algorithm, reserved flag bits, opt-out (RFC 9276 §3.1), iterations and salt as above, and a warning for a chain that matches no NSEC3PARAM with Flags 0 (the server does not use it)
 4. **DNSSEC Algorithm & Digest Verification (RFC 8624 / RFC 8078)**:
    - Evaluates DNSSEC algorithms in DNSKEY and RRSIG records against RFC 8624 status recommendations (e.g., flagging deprecated SHA-1 or MD5 algorithms)
-   - Validates DS digest types (warning on deprecated digests)
+   - Validates DS digest types (warning on deprecated digests) and, for the known types, the length of the DS / CDS digest (SHA-1 20, SHA-256 32, GOST 32, SHA-384 48 octets: RFC 4034 §5.1.4, RFC 4509 §2, RFC 6605 §5; an error, as BIND refuses it); SSHFP fingerprints are checked the same way (SHA-1 20, SHA-256 32 octets: RFC 4255 §3.1.2, RFC 6594 §5), in a zone file and in a tinydns `_` line
+   - The algorithm numbers of the IANA registry are known: 17 (SM2SM3), 23 (ECC-GOST12) and the private 252-254 draw no "unknown algorithm" warning; SSHFP algorithm 6 (Ed448, RFC 8709) is assigned; CAA `issuemail` (RFC 9495) and `issuevmc` are known tags
+   - The address records that another delegation of the zone names as an NS target (sibling glue, RFC 9471) are not reported as occluded; BIND does not report them either
    - ML-DSA-44 (algorithm 18, draft-westerbaan-dnssec-mldsa): warns when a DNSKEY/CDNSKEY public key is not 1312 octets or an RRSIG signature is not 2420 octets
    - Recognizes RFC 8078 CDS and CDNSKEY delete signals (Algorithm=0 / DigestType=0) without false-positive warnings
 5. **RFC 8976 ZONEMD Message Digest Verification**:
@@ -411,7 +415,7 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `zone.ttl.missing` | warning | records have no TTL and no $TTL |
 | `zone.string.long` | warning | a character-string of more than 255 octets |
 | `zone.limits` | error | the zone breaks a size limit of the configuration |
-| `zone.pdns-types` | error | ALIAS or LUA records that the server does not accept |
+| `zone.pdns-types` | error | records the server does not accept: bad ALIAS or LUA, a second CNAME / DNAME / RESINFO at a name, NSEC3 iterations above 150 |
 | `zone.program-skipped` | info | a program zone has no zone file to validate |
 | `zone.dnssec.algorithm-deprecated` | warning | a DNSSEC algorithm that RFC 8624 forbids or does not recommend |
 | `zone.dnssec.algorithm-unknown` | warning | an unknown DNSSEC algorithm number |
@@ -420,6 +424,7 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `zone.ds.digest-null` | warning | DS digest type 0 outside of the CDS delete signal |
 | `zone.ds.digest-deprecated` | warning | a DS digest type that is deprecated |
 | `zone.ds.digest-unknown` | warning | an unknown DS digest type |
+| `zone.ds.digest-length` | error | a DS or CDS digest whose length does not fit its digest type |
 | `zone.zonemd.scheme-invalid` | warning | the ZONEMD scheme is not a number from 0 to 255 |
 | `zone.zonemd.hash-invalid` | warning | the ZONEMD hash algorithm is not a number from 0 to 255 |
 | `zone.zonemd.canonical` | error | a record cannot be put in canonical form, so the ZONEMD digest is not computed |
@@ -506,6 +511,7 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `zone.sshfp.fptype-range` | error | the fingerprint type of an SSHFP record is out of range |
 | `zone.sshfp.fptype-unassigned` | warning | an SSHFP fingerprint type that is not assigned |
 | `zone.sshfp.fingerprint-hex` | error | the fingerprint of an SSHFP record is not hexadecimal |
+| `zone.sshfp.fingerprint-length` | error | the fingerprint of an SSHFP record does not have the length of its fingerprint type |
 | `zone.soa.mname-cname` | warning | the SOA MNAME points to a CNAME |
 | `zone.meta-type` | error | a meta-type appears as a standalone RRset |
 | `zone.dsync.type-unknown` | warning | a DSYNC record names an unknown RR type |

@@ -156,7 +156,7 @@ zone_case csync_type  0 "CSYNC record contains unknown type 'BOGUS'" '@ CSYNC 66
 zone_case n3p_optout  1 "MUST be ignored (RFC 5155 section 4.1.2), so the server ignores it" '@ NSEC3PARAM 1 1 0 -'
 zone_case n3p_flags   1 "has Flags 2; the Flags field must be 0" '@ NSEC3PARAM 1 2 0 -'
 zone_case n3p_unusable 1 "None of the 1 NSEC3PARAM RRs of zone 'z.example.' is usable" '@ NSEC3PARAM 1 1 0 -'
-zone_case n3p_high    1 "iterations value is excessively high" '@ NSEC3PARAM 1 0 5000 -'
+zone_case n3p_high    1 "iterations value is excessively high" '@ NSEC3PARAM 1 0 150 -'   # (above 150 the zone is refused: run_karicheck_low_l4_test.sh)
 
 # ---- NSEC3 chains (K-05): checked once per chain, against the NSEC3PARAM the server uses ------------------
 N3A='0p9mhaveqvm6t7vbl5lop2u3t2rp3tom'
@@ -234,7 +234,7 @@ esac
 td_case hex3       1 "type '3' requires a 32-character hexadecimal IPv6 address" '3www.example.com:20010db8:300'
 td_case hex6_info  0 "type '6' generates deprecated PTR" '6www.example.com:20010db8000000000000000000000001:300'
 td_case srv_range  1 "out of range (0-65535)" 'Sexample.com:5.srv.example.com:5060:70000:20:300'
-td_case naptr_pref 1 "NAPTR preference '70000' out of range" 'Nexample.com:1:70000:u:E2U+sip:!^.*$!sip:a@b!:.:300'
+td_case naptr_pref 1 "NAPTR preference '70000' out of range" 'Nexample.com:1:70000:u:E2U+sip:!^.*$!sip\072a@b!:.:300'
 td_case sshfp_gen  1 "SSHFP record requires 3 fields" ':sshfp.example.com:44:\001\001\252\273:300'
 td_case loc_dup    0 "Duplicate location code 'lo'" '%lo:10.0
 %lo:10.1'

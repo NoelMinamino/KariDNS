@@ -543,7 +543,7 @@ static int dnssec_rdata_bitmap(const uint8_t *rd, size_t rdlen, size_t pos, zone
         pos += blen;
     }
     if (truncated)
-        syslog(LOG_WARNING, "[AXFR] %s %s: type bitmap has more types than the text form holds (%d); wire RDATA kept",
+        syslog(LOG_WARNING, "RR from wire: %s %s: type bitmap has more types than the text form holds (%d); wire RDATA kept",
                rec->name ? rec->name : "?", rec->type_code == 47 ? "NSEC" : "NSEC3", MAX_RDATA);
     return 0;
 }
@@ -620,13 +620,13 @@ static int decode_dnssec_rdata(const uint8_t *rd, size_t rdlen, zone_arena_t *ar
 }
 
 static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_len, size_t *offset, zone_arena_t *arena, dns_record_t *rec, uint16_t *type_out) {
-    char *name; if (expand_wire_name(packet, packet_len, *offset, offset, arena, &name) != 0) { syslog(LOG_ERR, "[AXFR] parse_resource_record: expand_wire_name failed for owner name"); return -1; }
-    rec->name = name; if (*offset + 10 > packet_len) { syslog(LOG_ERR, "[AXFR] parse_resource_record: packet too short for header"); return -1; }
+    char *name; if (expand_wire_name(packet, packet_len, *offset, offset, arena, &name) != 0) { syslog(LOG_ERR, "RR from wire: expand_wire_name failed for owner name"); return -1; }
+    rec->name = name; if (*offset + 10 > packet_len) { syslog(LOG_ERR, "RR from wire: packet too short for header"); return -1; }
     uint16_t type = (packet[*offset] << 8) | packet[*offset + 1];
     uint16_t class_val = (packet[*offset + 2] << 8) | packet[*offset + 3];
     uint32_t ttl = ((uint32_t)packet[*offset + 4] << 24) | ((uint32_t)packet[*offset + 5] << 16) | ((uint32_t)packet[*offset + 6] << 8) | packet[*offset + 7];
     uint16_t rdlen = (packet[*offset + 8] << 8) | packet[*offset + 9]; *offset += 10;
-    if (*offset + rdlen > packet_len) { syslog(LOG_ERR, "[AXFR] parse_resource_record: rdlen %u goes out of bounds (len=%zu)", rdlen, packet_len); return -1; }
+    if (*offset + rdlen > packet_len) { syslog(LOG_ERR, "RR from wire: rdlen %u goes out of bounds (len=%zu)", rdlen, packet_len); return -1; }
 
     *type_out = type; rec->type_code = type;
     rec->class_str = (class_val == 1) ? "IN" : ((class_val == DNS_CLASS_KARIDNS_EXT) ? "KARIDNS" : "CH");
@@ -649,18 +649,18 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
 
     if (type == 6) {
         size_t rdata_p = *offset; char *mname, *rname;
-        if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &mname) != 0) { syslog(LOG_ERR, "[AXFR] parse_resource_record: SOA mname expand failed"); return -1; }
-        if (rdata_p > *offset + rdlen) { syslog(LOG_ERR, "[AXFR] parse_resource_record: SOA mname exceeds rdlen"); return -1; }
-        if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &rname) != 0) { syslog(LOG_ERR, "[AXFR] parse_resource_record: SOA rname expand failed"); return -1; }
-        if (rdata_p > *offset + rdlen) { syslog(LOG_ERR, "[AXFR] parse_resource_record: SOA rname exceeds rdlen"); return -1; }
+        if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &mname) != 0) { syslog(LOG_ERR, "RR from wire: SOA mname expand failed"); return -1; }
+        if (rdata_p > *offset + rdlen) { syslog(LOG_ERR, "RR from wire: SOA mname exceeds rdlen"); return -1; }
+        if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &rname) != 0) { syslog(LOG_ERR, "RR from wire: SOA rname expand failed"); return -1; }
+        if (rdata_p > *offset + rdlen) { syslog(LOG_ERR, "RR from wire: SOA rname exceeds rdlen"); return -1; }
         rec->rdata[0] = mname; rec->rdata[1] = rname; rec->rdata_count = 2;
         for (int j = 0; j < 5; j++) {
-            if (rdata_p + 4 > *offset + rdlen) { syslog(LOG_ERR, "[AXFR] parse_resource_record: SOA numbers out of bounds"); return -1; }
+            if (rdata_p + 4 > *offset + rdlen) { syslog(LOG_ERR, "RR from wire: SOA numbers out of bounds"); return -1; }
             uint32_t val = ((uint32_t)packet[rdata_p] << 24) | ((uint32_t)packet[rdata_p+1] << 16) | ((uint32_t)packet[rdata_p+2] << 8) | packet[rdata_p+3];
             char *val_buf = arena_alloc(arena, 16); if (!val_buf) return -1; snprintf(val_buf, 16, "%u", val); rec->rdata[rec->rdata_count++] = val_buf; rdata_p += 4;
         }
     } else if (type == 1) {
-        if (rdlen != 4) { syslog(LOG_ERR, "[AXFR] parse_resource_record: A record rdlen != 4"); return -1; }
+        if (rdlen != 4) { syslog(LOG_ERR, "RR from wire: A record rdlen != 4"); return -1; }
         char *ip_buf = arena_alloc(arena, 16); if (!ip_buf) return -1;
         snprintf(ip_buf, 16, "%d.%d.%d.%d", packet[*offset], packet[*offset+1], packet[*offset+2], packet[*offset+3]);
         rec->rdata[0] = ip_buf; rec->rdata_count = 1;
@@ -668,8 +668,8 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
                type == 8 || type == 9 || type == 12 || type == 23 || type == 39) {
         // NS, MD, MF, CNAME, MB, MG, MR, PTR, NSAP-PTR, DNAME
         size_t rdata_p = *offset; char *target;
-        if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &target) != 0) { syslog(LOG_ERR, "[AXFR] parse_resource_record: NAME expand failed"); return -1; }
-        if (rdata_p > *offset + rdlen) { syslog(LOG_ERR, "[AXFR] parse_resource_record: NAME exceeds rdlen"); return -1; }
+        if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &target) != 0) { syslog(LOG_ERR, "RR from wire: NAME expand failed"); return -1; }
+        if (rdata_p > *offset + rdlen) { syslog(LOG_ERR, "RR from wire: NAME exceeds rdlen"); return -1; }
         rec->rdata[0] = target; rec->rdata_count = 1;
     } else if (type == 14 || type == 17) {
         // MINFO, RP: 2 domain names
@@ -831,7 +831,7 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
         if (rc == -2) return -1;
         if (rc != 0) {
             rec->rdata_count = 0;
-            syslog(LOG_WARNING, "[AXFR] %s %s: malformed RDATA (%u octets); kept as opaque data, not used for DNSSEC",
+            syslog(LOG_WARNING, "RR from wire: %s %s: malformed RDATA (%u octets); kept as opaque data, not used for DNSSEC",
                    rec->name, rec->type ? rec->type : "?", rdlen);
         }
     }
@@ -1316,10 +1316,11 @@ static size_t base32hex_decode(const char *in, uint8_t *out, size_t out_cap) {
     int bits_left = 0;
     for (size_t i = 0; i < in_len; i++) {
         uint8_t c = (uint8_t)in[i];
-        if (c == '=') break;
+        /* RFC 5155 s3.2: the next hashed owner name is base32hex without padding; review low L4 dns_wire.c [9]: a
+         * character outside the alphabet (a typo) was skipped and the zone loaded with a different hash */
         int val = map[c];
-        if (val == -1) continue; // Skip invalid or whitespace
-        buffer = (buffer << 5) | val;
+        if (val == -1) return (size_t)-1;
+        buffer = ((buffer << 5) | (uint32_t)val) & 0xFFFF;
         bits_left += 5;
         if (bits_left >= 8) {
             if (out_len >= out_cap) return (size_t)-1;
@@ -1327,6 +1328,8 @@ static size_t base32hex_decode(const char *in, uint8_t *out, size_t out_cap) {
             bits_left -= 8;
         }
     }
+    /* the bits left over (fewer than 5) are padding and must be zero (as BIND's base32 decoder) */
+    if (bits_left > 0 && (buffer & ((1u << bits_left) - 1)) != 0) return (size_t)-1;
     return out_len;
 }
 
@@ -1950,7 +1953,9 @@ int sig0_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, sig0_k
     uint64_t now = (key->fuzztime > 0) ? (uint64_t)key->fuzztime : (uint64_t)time(NULL);
     uint32_t fudge = 300;
     uint32_t expire = (uint32_t)(now + fudge);
-    uint32_t inception = (uint32_t)now;
+    /* BIND dns_dnssec_signmessage: the validity window is now +- fudge, so a verifier whose clock is a few seconds
+     * behind does not see an inception in the future (review low L4 dns_wire.c [16]) */
+    uint32_t inception = (uint32_t)(now - fudge);
     sig_rdata_prefix[p++] = (uint8_t)((expire >> 24) & 0xFF);
     sig_rdata_prefix[p++] = (uint8_t)((expire >> 16) & 0xFF);
     sig_rdata_prefix[p++] = (uint8_t)((expire >> 8) & 0xFF);
@@ -2212,7 +2217,8 @@ static int encode_type_bitmap(uint8_t *res, size_t max_res_len, uint16_t *offset
 // 追加するヘルパー関数
 static int write_char_string(uint8_t *res, size_t max_res_len, uint16_t *offset, const char *str) {
     size_t len = strlen(str);
-    if (len > 255) len = 255;
+    /* RFC 1035 s3.3: a <character-string> is at most 255 octets (review low L4 dns_wire.c [9]: it used to be cut) */
+    if (len > 255) return -1;
     if (*offset + 1 + len > max_res_len) return -1;
     res[(*offset)++] = (uint8_t)len;
     memcpy(&res[*offset], str, len);
@@ -2283,20 +2289,34 @@ static int loc_parse_coord(char *const *rdata, int rdata_count, int *idx, double
     return 0;
 }
 
-static const uint32_t loc_poweroften[10] = {
+static const uint64_t loc_poweroften[10] = {
     1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000
 };
 
+/* RFC 1876 s3: SIZE / HORIZ PRE / VERT PRE are 0 .. 90000000.00 m (9e9 cm, more than a uint32); the caller checks the
+ * range first (loc_precsize_ok) */
 static uint8_t loc_encode_precsize(double meters) {
     if (meters < 0) meters = 0;
-    uint32_t cm = (uint32_t)llround(meters * 100.0);
+    uint64_t cm = (uint64_t)llround(meters * 100.0);
     int exponent;
     for (exponent = 0; exponent < 9; exponent++) {
         if (cm < loc_poweroften[exponent + 1]) break;
     }
-    uint32_t mantissa = cm / loc_poweroften[exponent];
+    uint64_t mantissa = cm / loc_poweroften[exponent];
     if (mantissa > 9) mantissa = 9;
     return (uint8_t)((mantissa << 4) | exponent);
+}
+
+/* RFC 1876 s3 (as BIND loc_29.c): size, horizontal and vertical precision are 0.00 .. 90000000.00 m */
+static bool loc_precsize_ok(double meters) {
+    double cm = meters * 100.0;
+    return cm >= 0.0 && cm <= 9000000000.0 + 0.5;
+}
+
+/* RFC 1876 s3: altitude is -100000.00 .. 42849672.95 m, i.e. 0 .. 4294967295 after the +100000.00 m offset */
+static bool loc_altitude_ok(double meters) {
+    double cm = meters * 100.0;
+    return cm >= -10000000.0 - 0.5 && cm <= 4284967295.0 + 0.5;
 }
 
 
@@ -2360,24 +2380,25 @@ static int decode_b64_buffer(const char *b64, size_t b64_len, uint8_t *res, size
 static int decode_concat_hex_rdata(char *const *fields, int count, uint8_t *res,
                                     size_t max_res_len, size_t *offset) {
     if (!fields || !res || !offset || *offset > max_res_len) return -1;
-    char hex[2048] = "";
-    size_t hex_len = 0;
-    for (int i = 0; i < count; i++) {
-        size_t flen = strlen(fields[i]);
-        if (hex_len + flen >= sizeof(hex)) return -1;
-        memcpy(hex + hex_len, fields[i], flen);
-        hex_len += flen;
-        hex[hex_len] = '\0';
-    }
     /* review utils [3]: the hex of DS / CDS / SSHFP / TLSA / SMIMEA / ZONEMD is an even number of hex digits (RFC 4034
      * 5.3, RFC 4255 3.2, RFC 6698 2.2, RFC 8976 2.3): a typo is an error, as in BIND, not a digest that is quietly
-     * cut (hex_decode skips other characters and drops an odd digit) */
-    if (hex_len % 2 != 0) return -1;
-    for (size_t i = 0; i < hex_len; i++)
-        if (!isxdigit((unsigned char)hex[i])) return -1;
-    size_t dec_len = hex_decode(hex, &res[*offset], max_res_len - *offset);
-    if (dec_len == (size_t)-1) return -1;
-    *offset += dec_len;
+     * cut (hex_decode skips other characters and drops an odd digit).
+     * review low L4 dns_wire.c [8]: the fields are decoded one by one (the nibble of an odd-length field is carried
+     * into the next), so a full certificate (TLSA 0 0 0, over 1 KiB) is not limited by a scratch buffer */
+    size_t pos = *offset;
+    int high = -1;
+    for (int i = 0; i < count; i++) {
+        for (const char *p = fields[i]; *p; p++) {
+            if (!isxdigit((unsigned char)*p)) return -1;
+            int v = hex_char_to_val(*p);
+            if (high < 0) { high = v; continue; }
+            if (pos >= max_res_len) return -1;
+            res[pos++] = (uint8_t)((high << 4) | v);
+            high = -1;
+        }
+    }
+    if (high >= 0) return -1;
+    *offset = pos;
     return 0;
 }
 
@@ -2754,6 +2775,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (idx < rec->rdata_count) size_m = parse_double_c(rec->rdata[idx++], NULL);
                 if (idx < rec->rdata_count) hp_m   = parse_double_c(rec->rdata[idx++], NULL);
                 if (idx < rec->rdata_count) vp_m   = parse_double_c(rec->rdata[idx++], NULL);
+                /* review low L4 dns_wire.c [10]: out-of-range values used to wrap into the uint32 / exponent bytes */
+                if (!loc_altitude_ok(alt_m) || !loc_precsize_ok(size_m) ||
+                    !loc_precsize_ok(hp_m) || !loc_precsize_ok(vp_m)) return -1;
 
                 uint8_t size_b = loc_encode_precsize(size_m);
                 uint8_t hp_b   = loc_encode_precsize(hp_m);
@@ -3223,25 +3247,11 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 size_t hit_len = hex_decode(rec->rdata[1], hit, sizeof(hit));
                 if (hit_len == (size_t)-1) return -1;
                 
-                // rdata[2] 以降の Base64 トークンを連結
-                char pk_b64[4096] = "";
-                size_t pk_b64_len = 0;
-                int r_idx = 2;
-                bool pk_finished = false;
-                while (r_idx < rec->rdata_count && !pk_finished) {
-                    if (strchr(rec->rdata[r_idx], '.') != NULL) {
-                        break; // ドメイン名に到達したら終了
-                    }
-                    size_t tlen = strlen(rec->rdata[r_idx]);
-                    if (pk_b64_len + tlen >= sizeof(pk_b64)) return -1;
-                    memcpy(pk_b64 + pk_b64_len, rec->rdata[r_idx], tlen);
-                    pk_b64_len += tlen;
-                    pk_b64[pk_b64_len] = '\0';
-                    if (tlen > 0 && rec->rdata[r_idx][tlen - 1] == '=') {
-                        pk_finished = true;
-                    }
-                    r_idx++;
-                }
+                /* RFC 8005 s5: the public key is one base64 token (BIND hip_55.c reads one token), the Rendezvous Servers are the
+                 * tokens after it - dotted or not, a relative name is made absolute by the zone parser (review low L4, D17) */
+                const char *pk_b64 = rec->rdata[2];
+                size_t pk_b64_len = strlen(pk_b64);
+                int r_idx = 3;
 
                 // pk_b64 must be a well-formed base64 quantum (non-empty, multiple of 4)
                 // or EVP_DecodeBlock's returned length can be smaller than the padding
@@ -3338,10 +3348,12 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     else if (strcasecmp(key_str, "ipv6hint") == 0) key = 6;
                     else if (strncasecmp(key_str, "key", 3) == 0) {
                         char *endptr;
+                        if (!isdigit((unsigned char)key_str[3])) return -1; // "key", "key+1", "key 1"
                         long kval = strtol(key_str + 3, &endptr, 10);
                         if (*endptr != '\0' || kval < 0 || kval > 65535) return -1; // 不正なkeyNNN
                         key = (uint16_t)kval;
-                    } else continue;
+                    } else return -1; /* RFC 9460 s2.1: a key is a registered name or keyNNN; review low L4 dns_wire.c [11]:
+                                       * a typo ("alnp=h2") was dropped and the record loaded without it (BIND rejects) */
 
                     // RFC 9460 §14.3.2: 65535 は "Invalid key" として予約されており使用不可
                     if (key == 65535) return -1;
@@ -3375,6 +3387,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                                 else if (strcasecmp(mkey_str, "ipv6hint") == 0) mkey = 6;
                                 else if (strncasecmp(mkey_str, "key", 3) == 0) {
                                     char *endptr;
+                                    if (!isdigit((unsigned char)mkey_str[3])) return -1;
                                     long kval = strtol(mkey_str + 3, &endptr, 10);
                                     if (*endptr != '\0' || kval <= 0 || kval >= 65535) return -1;
                                     mkey = (uint16_t)kval;
@@ -3984,11 +3997,16 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                     size_t rdata_end = rdata_offset + rdlen;
                     if (rdata_end > req_len) return -1; // Truncated OPT record
                     
-                    while (rdata_offset + 4 <= rdata_end) {
+                    while (rdata_offset < rdata_end) {
+                        /* RFC 6891 s6.1.2: the RDATA is a sequence of {code, length, data}; BIND's OPT fromwire refuses an option
+                         * that overruns it and the 1-3 octets that cannot hold a header (FORMERR). Marked here instead of a -1
+                         * because dag reads responses with this function and wants the options before the bad one (review low L4
+                         * dns_wire.c [2]) */
+                        if (rdata_end - rdata_offset < 4) { edns->has_opt_overrun = true; break; }
                         uint16_t opt_code = (req[rdata_offset] << 8) | req[rdata_offset+1];
                         uint16_t opt_len = (req[rdata_offset+2] << 8) | req[rdata_offset+3];
                         rdata_offset += 4;
-                        if (rdata_offset + opt_len > rdata_end) break;
+                        if (opt_len > rdata_end - rdata_offset) { edns->has_opt_overrun = true; break; }
                         
                         if (opt_code == 10) { // DNS Cookie
                             if (edns->has_cookie || edns->has_malformed_cookie) {
@@ -4027,6 +4045,9 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                         } else if (opt_code == 3) { // NSID
                             edns->has_nsid_query = true;
                         } else if (opt_code == 11) { // edns-tcp-keepalive
+                            /* RFC 7828 s3.2.1: a query carries it with OPTION-LENGTH 0; anything else is FORMERR (the server
+                             * checks it; a response has a TIMEOUT, so this function only marks it) (review low L4 dns_wire.c [3]) */
+                            if (opt_len != 0) edns->has_keepalive_nonzero = true;
                             if (edns->has_keepalive_query) {
                                 rdata_offset += opt_len;
                                 continue;

@@ -340,6 +340,8 @@ typedef struct {
     // NSID and Keepalive
     bool has_nsid_query;
     bool has_keepalive_query;
+    bool has_keepalive_nonzero;  // 受信: edns-tcp-keepalive に長さがある (RFC 7828 3.2.1: 問い合わせでは 0。FORMERR)
+    bool has_opt_overrun;        // 受信: オプションの長さが OPT RDATA を越える、または 4 オクテット未満の端が残る (BIND は FORMERR)
     
     // Multiple QTYPEs (RFC 10029)
     bool has_mqtype_query;

@@ -107,7 +107,8 @@ static void check_and_verify(const uint8_t *pkt, size_t total, size_t orig_len, 
     assert(!pkt[o + 4] && !pkt[o + 5] && !pkt[o + 6] && !pkt[o + 7]);   /* original TTL 0 */
     uint32_t exp = ((uint32_t)pkt[o + 8] << 24) | (pkt[o + 9] << 16) | (pkt[o + 10] << 8) | pkt[o + 11];
     uint32_t inc = ((uint32_t)pkt[o + 12] << 24) | (pkt[o + 13] << 16) | (pkt[o + 14] << 8) | pkt[o + 15];
-    assert(inc == (uint32_t)FUZZ && exp == (uint32_t)FUZZ + 300);
+    /* the window is now +- 300 s (BIND dns_dnssec_signmessage), so a verifier a few seconds behind does not see an inception in the future */
+    assert(inc == (uint32_t)FUZZ - 300 && exp == (uint32_t)FUZZ + 300);
     assert((uint16_t)((pkt[o + 16] << 8) | pkt[o + 17]) == expect_tag);
     assert(memcmp(pkt + o + 18, signer_wire, signer_wire_len) == 0);          /* canonical (lower-case) signer name */
     size_t prefix_len = 18 + signer_wire_len;

@@ -572,8 +572,57 @@ static void test_fi_gc_thread_start(void) {
     printf("  -> cleanup thread that cannot be started: kept, then freed by the next publish and by the tick\n");
 }
 
+/* review low L4 dns_zone_image.c [3]: thaw_zone_arena() of an image with the zone's own ECS trusted-resolver list, with the Nth allocation failing, for
+ * every N.  The thaw either fails or gives the zone its list: it must not succeed with the parsed list missing (the zone would fall back to the
+ * server's trusted-resolver list). */
+static void test_fi_thaw_trusted_resolvers(void) {
+    static char text[] = "$ORIGIN fi.test.\n$TTL 300\n@ SOA ns h 1 2 3 4 5\n@ NS ns\nns A 192.0.2.1\n";
+    zone_arena_t a;
+    zone_arena_init(&a);
+    parse_error_t err = {0};
+    char *root_ttl = NULL, *root_ecs = NULL, *root_loc = NULL;
+    char *visited_paths[4] = { 0 };
+    dev_t visited_devs[4] = { 0 };
+    ino_t visited_inos[4] = { 0 };
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "fi.test.", .is_standalone_mode = true, .err_out = &err,
+                            .visited_paths = visited_paths, .visited_devs = visited_devs, .visited_inos = visited_inos,
+                            .visited_count = 0, .visited_cap = 4,
+                            .shared_ttl_io = &root_ttl, .shared_ecs_tag_io = &root_ecs, .shared_loc_tag_io = &root_loc };
+    fi_reset();
+    assert(parse_zone_fast(text, strlen(text), &a, &ctx) >= 0);
+    a.bind_ecs_trusted_resolver_count = 2;
+    a.bind_ecs_trusted_resolvers = calloc(2, sizeof(char *));
+    assert(a.bind_ecs_trusted_resolvers);
+    a.bind_ecs_trusted_resolvers[0] = strdup("192.0.2.53");
+    a.bind_ecs_trusted_resolvers[1] = strdup("2001:db8::/32");
+    assert(build_zone_index(&a, true) == 0);
+    a.image = zone_image_freeze(&a, "fi.test.");
+    assert(a.image);
+    zone_version_t v;
+    memset(&v, 0, sizeof(v));
+    v.image = a.image;
+
+    unsigned thawed = 0, refused = 0;
+    FI_SWEEP({
+        zone_arena_t b;
+        zone_arena_init(&b);
+        if (thaw_zone_arena(&v, &b) == 0) {
+            assert(b.bind_ecs_trusted_resolver_count == 2 && b.bind_ecs_trusted_resolvers_parsed != NULL);
+            thawed++;
+        } else {
+            refused++;
+        }
+        zone_arena_destroy(&b);
+    });
+    fi_reset();
+    assert(thawed >= 1 && refused >= 1);
+    zone_arena_destroy(&a);
+    printf("  -> thaw with a failing allocation: %u thawed with the list, %u refused\n", thawed, refused);
+}
+
 int main(void) {
     printf("[*] Running test_fi_snapshot...\n");
+    test_fi_thaw_trusted_resolvers();
     test_fi_snapshot_rebuild();
     test_fi_directory_delta();
     test_fi_delta_hide();

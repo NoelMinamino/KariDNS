@@ -3542,6 +3542,11 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     qe_why("the OPT record cannot be used (owner name, section, number or RDATA)");
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), NULL, is_tcp, cfg);
   }
+  if (edns.has_opt_overrun) {
+    /* an option longer than the OPT RDATA, or 1-3 octets after the last one: BIND's OPT fromwire fails, so the message is FORMERR without an OPT (review low L4 dns_wire.c [2], RFC 6891 6.1.2) */
+    qe_why("an EDNS option overruns the OPT RDATA");
+    return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), NULL, is_tcp, cfg);
+  }
   edns.ede_count = 0; // 反射防止
   /* R-13: ecs-enable no のサーバーは ECS を実装していないものとして扱い、オプションを無視する
    * (AUDIT_FINDINGS §8 の決定。RFC 6891 §6.1.2: 知らないオプションは無視する)。 */
@@ -3614,8 +3619,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
 
   /* 長さが不正な COOKIE (RFC 7873 §5.2.2)、不正な ECS (RFC 7871 §6、§7.2.1) は FORMERR。
    * RFC 6891 §7: オプションの不正による FORMERR には OPT を付ける (R-13)。 */
-  if (edns.has_malformed_cookie || edns.has_malformed_ecs) {
-    qe_why(edns.has_malformed_cookie ? "malformed COOKIE option (RFC 7873 5.2.2)" : "malformed EDNS Client Subnet option (RFC 7871 6)");
+  if (edns.has_malformed_cookie || edns.has_malformed_ecs || edns.has_keepalive_nonzero) {
+    qe_why(edns.has_malformed_cookie ? "malformed COOKIE option (RFC 7873 5.2.2)" : edns.has_malformed_ecs ? "malformed EDNS Client Subnet option (RFC 7871 6)" : "edns-tcp-keepalive with a length in a query (RFC 7828 3.2.1)");
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg);
   }
 

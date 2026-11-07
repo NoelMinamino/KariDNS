@@ -664,8 +664,15 @@ static void test_location_directive_and_records(void) {
         for (int i = 0; i < 4100; i++) {
             bpos += sprintf(bigbuf + bpos, "%%xx:10.0.%d.%d\n", (i >> 8) & 0xFF, i & 0xFF);
         }
-        parse_tinydns_data(bigbuf, bpos, &arena4k, &ctx);
-        TEST_ASSERT(arena4k.location_count == 4096, "location_count capped at 4096");
+        /* review low L4 [15] (D14): the 4097th location line fails the load (it used to be dropped with a warning) */
+        TEST_ASSERT(parse_tinydns_data(bigbuf, bpos, &arena4k, &ctx) < 0, "more than 4096 location lines are a parse error");
+        TEST_ASSERT(ctx.err_out && ctx.err_out->error_message && strstr(ctx.err_out->error_message, "Too many location lines"), "...with a message");
+        TEST_ASSERT(arena4k.location_count == 4096, "location_count stays at 4096");
+        bpos = 0;
+        for (int i = 0; i < 4096; i++) bpos += sprintf(bigbuf + bpos, "%%xx:10.0.%d.%d\n", (i >> 8) & 0xFF, i & 0xFF);
+        zone_arena_destroy(&arena4k);
+        zone_arena_init(&arena4k);
+        TEST_ASSERT(parse_tinydns_data(bigbuf, bpos, &arena4k, &ctx) >= 0 && arena4k.location_count == 4096, "exactly 4096 location lines load");
         zone_arena_destroy(&arena4k);
         free(bigbuf);
     }
@@ -899,11 +906,151 @@ static void test_soa_serial_from_source_mtime(void) {
     }
 }
 
+/* ============================================================================
+ * review low batch L4: TXT with a NUL octet, SOA TTL 0 as a number, hostmaster.<zone> too long, the out-of-zone count,
+ * non-numeric / signed TTL (D13)
+ * ============================================================================ */
+static int tl4_parse(const char *data, parse_context_t *ctx, zone_arena_t *arena) {
+    char *buf = strdup(data);
+    zone_arena_init(arena);
+    int rc = parse_tinydns_data(buf, strlen(buf), arena, ctx);
+    free(buf);
+    return rc;
+}
+
+static const dns_record_t *tl4_find(const zone_arena_t *a, const char *name, uint16_t type) {
+    for (size_t i = 0; i < a->count; i++)
+        if (a->records[i].type_code == type && strcmp(a->records[i].name, name) == 0) return &a->records[i];
+    return NULL;
+}
+
+static void test_low_l4_tinydns(void) {
+    printf("--- Test L4: review low batch L4 ---\n");
+    zone_arena_t arena;
+    parse_error_t err = {0};
+    parse_context_t ctx = { .default_origin = "example.com.", .err_out = &err };
+
+    /* [3] a NUL octet (\000) in a TXT string used to end its chunk: the octets are kept, in 127-octet strings as tinydns does */
+    TEST_ASSERT(tl4_parse("'t.example.com:a\\000b:300\n", &ctx, &arena) > 0, "TXT with \\000 parses");
+    {
+        const dns_record_t *t = tl4_find(&arena, "t.example.com.", 16);
+        TEST_ASSERT(t != NULL, "TXT record exists");
+        uint8_t wire[512];
+        uint16_t off = 0;
+        if (t && serialize_dns_record(wire, sizeof(wire), &off, t, NULL, NULL, 0xFFFFFFFF) == 0) {
+            size_t p = 0;
+            while (wire[p]) p += 1 + wire[p];
+            p++;
+            size_t rdlen = ((size_t)wire[p + 8] << 8) | wire[p + 9];
+            static const uint8_t want[] = { 3, 'a', 0, 'b' };
+            TEST_ASSERT(rdlen == sizeof(want) && memcmp(wire + p + 10, want, sizeof(want)) == 0, "TXT RDATA is 03 61 00 62");
+        } else {
+            TEST_ASSERT(false, "TXT with \\000 serializes");
+        }
+    }
+    zone_arena_destroy(&arena);
+    {   /* 300 octets with a NUL in the middle: strings of 127, 127 and 46 */
+        char line[1024] = "'long.example.com:";
+        size_t n = strlen(line);
+        for (int i = 0; i < 300; i++) {
+            if (i == 150) { memcpy(line + n, "\\000", 4); n += 4; }
+            else line[n++] = 'q';
+        }
+        strcpy(line + n, ":300\n");
+        TEST_ASSERT(tl4_parse(line, &ctx, &arena) > 0, "long TXT with \\000 parses");
+        const dns_record_t *t = tl4_find(&arena, "long.example.com.", 16);
+        uint8_t wire[1024];
+        uint16_t off = 0;
+        TEST_ASSERT(t && serialize_dns_record(wire, sizeof(wire), &off, t, NULL, NULL, 0xFFFFFFFF) == 0, "...and serializes");
+        if (t) {
+            size_t p = 0;
+            while (wire[p]) p += 1 + wire[p];
+            p++;
+            size_t rdlen = ((size_t)wire[p + 8] << 8) | wire[p + 9];
+            const uint8_t *rd = wire + p + 10;
+            TEST_ASSERT(rdlen == 300 + 3 && rd[0] == 127 && rd[128] == 127 && rd[256] == 46 && rd[152] == 0, "127-octet strings, the NUL kept");
+        }
+        zone_arena_destroy(&arena);
+    }
+
+    /* [5] the SOA TTL of a '.' line is 0 when the field is the number 0 ("0", "00"), 2560 otherwise */
+    {
+        static const struct { const char *line; unsigned ttl; } soa[] = {
+            { ".example.com:192.0.2.1:a:0\n", 0 }, { ".example.com:192.0.2.1:a:00\n", 0 },
+            { ".example.com:192.0.2.1:a:5\n", 2560 }, { ".example.com:192.0.2.1:a\n", 2560 },
+        };
+        for (size_t i = 0; i < sizeof(soa) / sizeof(soa[0]); i++) {
+            TEST_ASSERT(tl4_parse(soa[i].line, &ctx, &arena) > 0, "'.' line parses");
+            const dns_record_t *s = tl4_find(&arena, "example.com.", 6);
+            TEST_ASSERT(s && s->ttl_value == soa[i].ttl, "SOA TTL of a '.' line");
+            zone_arena_destroy(&arena);
+        }
+    }
+
+    /* [6] hostmaster.<zone> that does not fit 255 octets is an error (the SOA RNAME used to become "hostmaster.") */
+    {
+        char zone[300], line[400];
+        size_t n = 0;
+        for (int lab = 0; lab < 4; lab++) {
+            int len = lab == 3 ? 60 : 61;                       /* wire: 3 x 62 + 61 + root = 248 octets */
+            memset(zone + n, 'z', (size_t)len); n += (size_t)len;
+            zone[n++] = '.';
+        }
+        zone[n] = '\0';
+        snprintf(line, sizeof(line), ".%s:192.0.2.1:a\n", zone);
+        parse_error_t e2 = {0};
+        parse_context_t c2 = { .default_origin = zone, .err_out = &e2 };
+        TEST_ASSERT(tl4_parse(line, &c2, &arena) < 0, "hostmaster.<zone> over 255 octets fails the line");
+        TEST_ASSERT(e2.error_message && strstr(e2.error_message, "Name too long"), "...with a message");
+        zone_arena_destroy(&arena);
+        snprintf(line, sizeof(line), "&%s:192.0.2.1:a\n", zone);       /* an NS line has no RNAME and the name fits */
+        TEST_ASSERT(tl4_parse(line, &c2, &arena) > 0, "the same zone name in an '&' line loads");
+        zone_arena_destroy(&arena);
+    }
+
+    /* [10] a '.' line outside every zone is counted once */
+    {
+        const char *zones[1] = { "example.com." };
+        parse_error_t e3 = {0};
+        parse_context_t c3 = { .default_origin = "example.com.", .err_out = &e3, .all_zone_names = zones, .all_zone_count = 1 };
+        TEST_ASSERT(tl4_parse(".other.test::a\n", &c3, &arena) >= 0, "out-of-zone '.' line is skipped");
+        TEST_ASSERT(c3.out_of_zone_count == 1, "...and counted once");
+        zone_arena_destroy(&arena);
+        c3.out_of_zone_count = 0;
+        TEST_ASSERT(tl4_parse("&other.test::a\n", &c3, &arena) >= 0 && c3.out_of_zone_count == 1, "an out-of-zone '&' line is counted once");
+        zone_arena_destroy(&arena);
+    }
+
+    /* [1] (D13) a TTL (or SOA time) that is not decimal digits is a parse error, never 0 or a huge value */
+    {
+        static const char *const bad[] = {
+            "+www.example.com:192.0.2.1:abc\n", "+www.example.com:192.0.2.1:-1\n", "+www.example.com:192.0.2.1:+5\n",
+            "+www.example.com:192.0.2.1:12x\n", ".example.com:192.0.2.1:a:x\n", "@example.com:192.0.2.1:mx:10:abc\n",
+            "'t.example.com:txt:1.5\n", "Calias.example.com:www.example.com:-3\n",
+            "Zexample.com:a.ns.example.com.:h.example.com.:1:abc:900:604800:300:300\n",
+            "Zexample.com:a.ns.example.com.:h.example.com.:1:3600:900:604800:300:-1\n",
+        };
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+            parse_error_t e4 = {0};
+            parse_context_t c4 = { .default_origin = "example.com.", .err_out = &e4 };
+            if (tl4_parse(bad[i], &c4, &arena) >= 0) { printf("  must fail: %s", bad[i]); TEST_ASSERT(false, "bad TTL accepted"); }
+            else TEST_ASSERT(e4.error_message && strstr(e4.error_message, "Invalid TTL"), "bad TTL message");
+            zone_arena_destroy(&arena);
+        }
+        /* empty keeps the default, a huge number is cut to 2147483647 (RFC 8767 4) */
+        TEST_ASSERT(tl4_parse("+www.example.com:192.0.2.1:\n+big.example.com:192.0.2.2:99999999999\n", &ctx, &arena) > 0, "empty and huge TTLs load");
+        const dns_record_t *w = tl4_find(&arena, "www.example.com.", 1), *b = tl4_find(&arena, "big.example.com.", 1);
+        TEST_ASSERT(w && w->ttl_value == TTL_POSITIVE && b && b->ttl_value == 2147483647u, "default TTL and clamped TTL");
+        zone_arena_destroy(&arena);
+    }
+}
+
 int main(void) {
     printf("==================================================\n");
     printf(" Running KariDNS tinydns Parser Tests (djbdns 1.05)\n");
     printf("==================================================\n");
 
+    test_low_l4_tinydns();
     test_basic_records();
     test_txt_127_byte_chunking();
     test_loose_ip4_scan();

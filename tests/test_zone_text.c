@@ -510,19 +510,21 @@ static void test_hostile(void) {
     const char *in = "$ORIGIN example.test.\n$TTL 300\n@ SOA ns1 h 1 2 3 4 5\n@ NS ns1\nns1 A 192.0.2.1\n"
          "ev\\010il\\;x\\(y\\)\\$z\\@w\\\"q\\ \\\\ A 192.0.2.7\n"
          "c CNAME ev\\010il\\;x\\(y\\)\\$z\\@w\\\"q\\ \\\\\n"
-         "t TXT \"line1\\010$INCLUDE /etc/passwd\" \"semi;colon\" \"paren(\" \")x\" \"quote\\\"s\" \"back\\\\slash\" \"nul\\000x\" \"hi\\200\" \"\\013\\013\"\n"
+         "t TXT \"line1\\010$INCLUDE /etc/passwd\" \"semi;colon\" \"paren(\" \")x\" \"quote\\\"s\" \"back\\\\slash\" \"hi\\200\" \"\\013\\013\"\n"
+         "n TXT \"nul\\000x\"\n"      /* a NUL octet: the RDATA is kept as the octets, so the writer prints the RFC 3597 form (review low L4) */
          "\\$INCLUDE TXT \"no\"\n\\$ORIGIN TXT \"no\"\n\\;x TXT \"no\"\n";
     char *w = roundtrip("hostile escapes", in, "example.test.", DZT_BIND);
     if (w) {
         /* one line per record, the two header lines, and no other directive or comment */
-        CHECK_MSG(count_char(w, '\n') == 2 + 9, "%zu lines", count_char(w, '\n'));
+        CHECK_MSG(count_char(w, '\n') == 2 + 10, "%zu lines", count_char(w, '\n'));
         CHECK_LACKS(w, "\n$INCLUDE");
         CHECK_LACKS(w, "\n$ORIGIN");
         CHECK_LACKS(w, "\n;");
         CHECK_HAS(w, "\\$INCLUDE TXT \"no\"\n");
         CHECK_HAS(w, "\"line1\\010$INCLUDE /etc/passwd\"");
         CHECK(parse_bind(w, &b, err, sizeof(err)));
-        CHECK_MSG(b.count == 9, "%zu records", b.count);
+        CHECK_MSG(b.count == 10, "%zu records", b.count);
+        CHECK_HAS(w, "n TXT \\# 6 056e756c0078");
         zone_arena_destroy(&b);
     }
     free(w);

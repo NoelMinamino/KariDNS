@@ -286,6 +286,9 @@ int validate_zone_dname(zone_arena_t *arena, parse_error_t *err);
 int validate_zone_name_lengths(zone_arena_t *arena, parse_error_t *err);
 /* B9a: ALIAS / LUA rules (RDATA, ALIAS beside A/AAAA, ALIAS beside DNSSEC records); -1 with the reason in detail (err->error_message points to it) */
 int validate_zone_pdns_types(const zone_arena_t *arena, parse_error_t *err, char *detail, size_t detail_cap);
+/* The largest NSEC3 iteration count a zone may carry (NSEC3PARAM or NSEC3 RR): RFC 9276 s3.2, the same limit for a zone file, a transfer, a
+ * database zone and a presigned zone.  validate_zone_pdns_types() refuses a zone above it, so the query-time hashing never sees more. */
+#define ZONE_MAX_NSEC3_ITERATIONS 150u
 void free_ecs_tags_array(ecs_tag_def_t *tags, int count);
 ecs_tag_def_t *clone_ecs_tags_array(const ecs_tag_def_t *src, int count);
 
