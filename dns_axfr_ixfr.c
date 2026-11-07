@@ -588,6 +588,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
     }
   }
 
+  bool trailing = false;      /* the final SOA was not the last RR of the message */
   for (int i = 0; i < ancount; i++) {
     if (standby->count >= standby->records_cap) {
       size_t new_cap =
@@ -934,10 +935,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
         if (current_serial == session->initial_soa_serial && session->ixfr_expected_serial == session->initial_soa_serial) {
           session->is_finished = true;
           standby->count--;
-          if (i != ancount - 1) {          /* RFC 1995 §4: the last SOA ends the response; nothing follows it (see the AXFR case below) */
-            session->trailing_rrs = true;
-            return xfr_ext_reject(domain, "records after the final SOA");
-          }
+          if (i != ancount - 1) trailing = true;          /* RFC 1995 §4: the last SOA ends the response; nothing follows it (see the AXFR case below) */
         } else if (current_serial != session->ixfr_expected_serial) {
           /* I1, RFC 1995 §4: "the differential sequences are the history of changes ... ordered oldest first newest last":
            * a deletion sequence must start where the previous one ended */
@@ -958,10 +956,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
           standby->count--;
           /* RFC 5936 §2.2: the final SOA is the last RR of the transfer; a primary that goes on in the same message is not sending
            * the zone it announced (BIND xfrin.c: DNS_R_EXTRADATA).  The database loader's stream is held to it too: it reports the reason */
-          if (i != ancount - 1) {
-            session->trailing_rrs = true;
-            return xfr_ext_reject(domain, "records after the final SOA");
-          }
+          if (i != ancount - 1) trailing = true;
         }
       }
     } else {
@@ -977,6 +972,11 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
         }
       }
     }
+  }
+  /* judged after the loop: a message whose later RRs are malformed (ANCOUNT too large) is a malformed message, not one with records after the SOA */
+  if (trailing) {
+    session->trailing_rrs = true;
+    return xfr_ext_reject(domain, "records after the final SOA");
   }
   return 0;
 }
