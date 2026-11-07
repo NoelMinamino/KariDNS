@@ -5,6 +5,7 @@
 
 /* view 名の上限 (NUL 込みのバイト数)。zone_db_entry_t などが view 名をこの長さの配列で持つ */
 #define KARIDNS_VIEW_NAME_MAX 64
+#define KARIDNS_KEY_NAME_MAX 255   /* the longest name of a TSIG key (a DNS name: 255 bytes on the wire); a longer one is a configuration error */
 
 /* tcp-mss / tcp-window / udp-bufsize と zone-tcp-* / zone-udp-bufsize の許容範囲 */
 #define KARIDNS_TCP_MSS_MIN      536                 /* RFC 1122 §3.3.3 の既定 MSS */
@@ -723,6 +724,7 @@ typedef struct {
 #define KARIDNS_DB_HOT_INTERVAL_DEFAULT 60
 #define KARIDNS_DB_PARK_TIMEOUT_MIN 10
 #define KARIDNS_DB_PARK_TIMEOUT_MAX 60000
+#define KARIDNS_DB_CONFIG_BODY_MAX (1u << 20)   /* the body of the CONFIG message (KDB_MAX_BODY); db_config_body_size() in the parser computes what build_config() sends */
 #define KARIDNS_DB_MAX_VIEWS 1024   /* views that take DB zones: the CONFIG message of the loader link lists at most this many (KDB_MAX_CONFIG_VIEWS) */
 #define KARIDNS_DB_MAX_ZONE_RECORDS_DEFAULT 10000000ull   /* the database block and options { max-zone-records } (I2) */
 #define KARIDNS_DB_MAX_ZONE_BYTES_DEFAULT (1ull << 30)     /* the database block and options { max-zone-bytes } (I2) */
@@ -954,6 +956,7 @@ typedef struct {
   dev_t dev;            // 循環検出用
   ino_t ino;            // 循環検出用
   bool via_rel;         // this file was reached by an include with a relative name (options { directory } check)
+  int lex_err;          // an error the lexer cannot go on from (LEXERR_*); get_next_token() reports it
 } config_file_frame_t;
 
 typedef struct {

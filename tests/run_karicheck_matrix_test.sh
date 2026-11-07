@@ -276,10 +276,28 @@ conf_case zones_nofile  zones 1 "Could not open file" 'zone "m.example" { type m
 zone "s.example" { type slave; file "s"; masters { 192.0.2.1; }; };'
 out=$("$KC" conf /nonexistent/x.conf 2>&1); rc=$?
 check "conf:missing" 1 "Could not open file" "$out" "$rc"
-# the shipped sample must stay loadable; its placeholder secrets are flagged but are not errors
+# the shipped sample is not usable as it is: the control-channel secret is still the placeholder, which is an error (a key nobody uses only warns)
 out=$("$KC" conf karidns.conf.sample 2>&1); rc=$?
+check "conf:sample-placeholder" 1 "control-channel: secret is still the sample placeholder" "$out" "$rc"
+# with a real secret in the control-channel (the 2nd and 3rd secrets of the sample are keys: one unused, which only warns) it loads
+perl -pe 'if (!$d && s/UkVQTEFDRS1NRTpvcGVuc3NsLXJhbmQtYmFzZTY0LTMy/c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0/) { $d = 1 }' karidns.conf.sample > "$TMP/sample_real.conf"
+out=$("$KC" conf "$TMP/sample_real.conf" 2>&1); rc=$?
 check "conf:sample" 0 "is valid" "$out" "$rc"
-check "conf:sample-placeholder" 0 "secret is still the sample placeholder" "$out" "$rc"
+check "conf:sample-unused-key-warning" 0 "key 'tsig-key-example': secret is still the sample placeholder" "$out" "$rc"
+# a key that an ACL uses with the placeholder is an error
+printf 'key "k" { algorithm hmac-sha256; secret "UkVQTEFDRS1NRTpvcGVuc3NsLXJhbmQtYmFzZTY0LTMy"; };\nzone "z.example" { type master; file "z"; allow-transfer { key k; }; };\n' > "$TMP/used_key.conf"
+out=$("$KC" conf "$TMP/used_key.conf" 2>&1); rc=$?
+check "conf:placeholder-key-used" 1 "key 'k' is used here but its secret is still the sample placeholder" "$out" "$rc"
+# S6 / F4 / D1 / S10 of the review fixes
+printf 'options { port 5300; };\n/* never closed\n' > "$TMP/open_comment.conf"
+out=$("$KC" conf "$TMP/open_comment.conf" 2>&1); rc=$?
+check "conf:unterminated-comment" 1 "unterminated /* comment" "$out" "$rc"
+printf 'options { port 5300; };\nzonee "a.example" { type master; file "x"; };\n' > "$TMP/typo.conf"
+out=$("$KC" conf "$TMP/typo.conf" 2>&1); rc=$?
+check "conf:unknown-statement" 0 "unknown statement 'zonee' is skipped" "$out" "$rc"
+printf 'options { allow-query { 10.0.0.1/8; }; };\n' > "$TMP/hostbits.conf"
+out=$("$KC" conf "$TMP/hostbits.conf" 2>&1); rc=$?
+check "conf:host-bits" 0 "'10.0.0.1/8' has host bits set" "$out" "$rc"
 conf_case tcp_opts      conf 0 "is valid" 'options { tcp-mss 1220; tcp-window 256K; udp-bufsize 1232; };
 zone "t.example" { type master; file "t.zone"; zone-tcp-mss 1200; zone-tcp-window 128K; zone-tcp-sndbuf 2M; zone-udp-bufsize 1400; };'
 conf_case tcp_opts_bad  conf 1 "invalid zone-tcp-sndbuf value" 'zone "t.example" { type master; file "t.zone"; zone-tcp-sndbuf 2MB; };'

@@ -417,8 +417,8 @@ static inline zone_kind_t zone_kind_from_type(const char *type) {
 typedef struct {
   char ip[64];
   int port;
-  char key[64];
-  char zone_key[64];
+  char key[KARIDNS_KEY_NAME_MAX + 1];       /* a key name longer than that is refused when the key is defined (parse_key_block()), so none is cut */
+  char zone_key[KARIDNS_KEY_NAME_MAX + 1];
 } catalog_master_t;
 
 /* ゾーンエントリの出どころ (zone_db_entry_t.source)。ZONE_SRC_DB はまだ使われない */

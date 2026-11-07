@@ -40,6 +40,7 @@
 #include "dns_snapshot_rcu.h"
 
 _Static_assert(KARIDNS_DB_MAX_VIEWS == KDB_MAX_CONFIG_VIEWS, "the configuration check and the CONFIG message must agree");
+_Static_assert(KARIDNS_DB_CONFIG_BODY_MAX == KDB_MAX_BODY, "the configuration check and the CONFIG message must agree on the body limit");
 _Static_assert(ZDIR_APEX_NS_MAX == KDB_APEX_NS_MAX, "the apex block and the ZONE_BEGIN apex agree on the number of NS names");
 _Static_assert(ZDIR_APEX_GLUE_PER_NS == KDB_APEX_GLUE_PER_NS && ZDIR_APEX_GLUE_MAX <= KDB_APEX_GLUE_BYTES, "... and on the glue");
 _Static_assert(ZDIR_APEX_GLUE_PER_NS == KDB_NOTIFY_ADDR_PER_NS && ZDIR_APEX_NADDR_MAX == KDB_NOTIFY_ADDR_BYTES, "... and on the NOTIFY addresses");

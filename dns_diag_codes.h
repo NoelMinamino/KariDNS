@@ -51,6 +51,7 @@ X (CONF_TSIG_ALGORITHM, "conf.tsig.algorithm", 'E', "a TSIG algorithm that KariD
 X (CONF_TSIG_SECRET_LENGTH, "conf.tsig.secret-length", 'E', "a TSIG secret is too long for its algorithm")
 X (CONF_TSIG_SECRET_BASE64, "conf.tsig.secret-base64", 'E', "a TSIG secret is not valid base64")
 X (CONF_TSIG_SECRET_PLACEHOLDER, "conf.tsig.secret-placeholder", 'W', "a secret is still the placeholder of the sample configuration")
+X (CONF_TSIG_SECRET_PLACEHOLDER_USED, "conf.tsig.secret-placeholder-used", 'E', "the secret of the control channel, or of a key that an ACL or an update-policy rule uses, is the placeholder of the sample configuration")
 X (CONF_ZONE_NAME, "conf.zone.name", 'E', "a zone name is not valid (bad escape, empty label, or too long)")
 X (CONF_ZONE_DUPLICATE, "conf.zone.duplicate", 'E', "a zone is defined twice")
 X (CONF_ZONE_TYPE_RESOLVER, "conf.zone.type-resolver", 'W', "a BIND zone type for resolvers is not loaded")

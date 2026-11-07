@@ -4703,6 +4703,300 @@ static void test_in_view(void) {
     }
 }
 
+/* ------------------------------------------------------------------------ */
+/* Review fixes, low batch L1 (config parser) */
+
+/* db_settings_parse() with stderr captured into msg (the settings text of a database zone is hostile input) */
+static zone_ext_shared_t *db_parse_capture(const char *text, char *err, size_t errlen, char *msg, size_t msglen) {
+    char path[] = "/tmp/an_l1_XXXXXX";
+    int tmp = mkstemp(path);
+    msg[0] = '\0';
+    fflush(stderr);
+    int saved = dup(2);
+    if (tmp >= 0) dup2(tmp, 2);
+    zone_ext_shared_t *sh = db_settings_parse(text, strlen(text), err, errlen);
+    fflush(stderr);
+    if (saved >= 0) { dup2(saved, 2); close(saved); }
+    if (tmp >= 0) {
+        ssize_t n = pread(tmp, msg, msglen - 1, 0);
+        msg[n > 0 ? n : 0] = '\0';
+        close(tmp);
+        unlink(path);
+    }
+    return sh;
+}
+
+static void test_low_l1(void) {
+    printf("[TEST] review fixes, low batch L1 (config parser)...\n");
+    server_config_t cfg;
+    char msg[4096], err[200];
+
+    /* S1: an `any` inside a negated list cannot be written in the flat list (it used to be dropped: !{ any; } with 192.0.2.1 gave 192.0.2.1) */
+    expect_db_reject("allow-transfer { !{ any; }; 192.0.2.1; };", "allow-transfer");
+    if (parse_ok("zone \"a.test\" { type master; file \"f\"; allow-transfer { !{ any; }; 192.0.2.1; }; };", &cfg)) {
+        const zone_config_t *z = first_zone(&cfg);
+        char out[1024];
+        size_t rn = z ? zone_settings_render(&cfg, z, false, out, sizeof(out)) : 0;
+        CHECK(rn > 0 && strstr(out, "allow-transfer { none; };\n") != NULL);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("zone \"a.test\" { type master; file \"f\"; allow-transfer { !any; 192.0.2.1; }; };", &cfg)) {   /* !any itself is exact */
+        char out[1024];
+        const zone_config_t *z = first_zone(&cfg);
+        size_t rn = z ? zone_settings_render(&cfg, z, false, out, sizeof(out)) : 0;
+        CHECK(rn > 0 && strstr(out, "allow-transfer { none; };\n") == NULL);
+        free_server_config_fields(&cfg);
+    }
+
+    /* S4: a hostile value in the settings text reaches neither stderr nor the error text */
+    {
+        static const char *const bad[] = {
+            "additional-from-auth HOSTILEVALUE;", "ixfr-history HOSTILEVALUE;", "notify-retry-backoff HOSTILEVALUE;",
+            "transfer-acl-match HOSTILEVALUE;", "zone-tcp-mss HOSTILEVALUE;" };
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+            zone_ext_shared_t *sh = db_parse_capture(bad[i], err, sizeof(err), msg, sizeof(msg));
+            CHECK(sh == NULL);
+            if (sh) zone_ext_shared_unref(sh);
+            CHECK_MSG(strstr(msg, "HOSTILEVALUE") == NULL && strstr(err, "HOSTILEVALUE") == NULL, "%s: value echoed: %s | %s", bad[i], msg, err);
+        }
+        int rc = parse_capture("options { ixfr-history HOSTILEVALUE; };", &cfg, msg, sizeof(msg));   /* (a configuration file still names the value) */
+        CHECK(rc == -1 && strstr(msg, "HOSTILEVALUE") != NULL);
+    }
+
+    /* S6: an unterminated comment or string and a token over 4096 bytes are syntax errors */
+    expect_an_error("unterminated comment", "options { port 5300; };\n/* zone \"a.test\" { type master; file \"f\"; };\n", "unterminated /* comment");
+    expect_an_error("unterminated comment in options", "options { port 5300; /* the rest of the file is lost\n", "unterminated /* comment");
+    expect_an_error("unterminated string", "options { version \"abc; };\n", "unterminated quoted string");
+    {
+        char *big = malloc(5400);
+        CHECK(big != NULL);
+        if (big) {
+            int n = snprintf(big, 64, "acl \"");
+            memset(big + n, 'a', 4097); n += 4097;
+            snprintf(big + n, 64, "\" { 192.0.2.1; };");
+            expect_an_error("quoted token of 4097 bytes", big, "token longer than 4096");
+            n = snprintf(big, 64, "acl ");
+            memset(big + n, 'b', 4097); n += 4097;
+            snprintf(big + n, 64, " { 192.0.2.1; };");
+            expect_an_error("bare token of 4097 bytes", big, "token longer than 4096");
+            n = snprintf(big, 64, "acl \"");
+            memset(big + n, 'c', 4096); n += 4096;
+            snprintf(big + n, 64, "\" { 192.0.2.1; };");
+            if (parse_ok(big, &cfg)) free_server_config_fields(&cfg);   /* exactly 4096 is fine */
+            free(big);
+        }
+    }
+    if (parse_ok("options { port 5300; }; /* closed */ // line\n# hash\n", &cfg)) free_server_config_fields(&cfg);
+
+    /* S8: an include path over PATH_MAX is an error, not a truncated path */
+    {
+        char *big = malloc(PATH_MAX + 128);
+        CHECK(big != NULL);
+        if (big) {
+            int n = snprintf(big, 32, "include \"/");
+            memset(big + n, 'x', PATH_MAX + 20); n += PATH_MAX + 20;
+            snprintf(big + n, 16, "\";");
+            expect_an_error("include path over PATH_MAX", big, "include path is longer than");
+            free(big);
+        }
+    }
+
+    /* S10: a tag entry that is not an address or prefix is an error (it used to become an entry that never matches) */
+    expect_an_error("ecs-tags bad prefix", "options { ecs-enable yes; ecs-tags { tag \"a\" { 192.0.2.0/24; 999.0.0.0/8; }; }; };", "Invalid CIDR '999.0.0.0/8' in options.ecs-tags tag 'a'");
+    expect_an_error("location-tags bad text", "options { location-tags { tag \"a\" { not-an-address; }; }; };", "Invalid CIDR 'not-an-address' in options.location-tags tag 'a'");
+    expect_an_error("zone ecs-tags bad prefix", "zone \"z.test\" { type master; file \"f\"; ecs-tags { tag \"b\" { 10.0.0.0/99; }; }; };", "Invalid CIDR '10.0.0.0/99' in ecs-tags tag 'b'");
+
+    /* R1: minimal-any-ttl is a TTL (RFC 2181 section 8: 0..2^31-1) */
+    if (parse_ok("options { minimal-any-ttl 2147483647; };", &cfg)) {
+        CHECK(cfg.minimal_any_ttl == 2147483647u);
+        free_server_config_fields(&cfg);
+    }
+    expect_reject("minimal-any-ttl 2^31", "options { minimal-any-ttl 2147483648; };");
+    expect_reject("minimal-any-ttl 2^32", "options { minimal-any-ttl 4294967296; };");
+    expect_reject("minimal-any-ttl 2^64", "options { minimal-any-ttl 18446744073709551616; };");
+    expect_reject("minimal-any-ttl empty", "options { minimal-any-ttl \"\"; };");
+
+    /* R5: white space after the padding of a secret does not change its length (25 bytes, "WA==") */
+    {
+        static const char *const sec[] = { "c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0WA==", "c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0WA== ", "c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0WA==\t \n" };
+        char txt[512];
+        for (size_t i = 0; i < 3; i++) {
+            snprintf(txt, sizeof(txt), "key \"k\" { algorithm hmac-sha256; secret \"%s\"; };", sec[i]);
+            if (parse_ok(txt, &cfg)) {
+                CHECK(cfg.keys && cfg.keys->secret_decoded_len == 25);
+                free_server_config_fields(&cfg);
+            }
+            snprintf(txt, sizeof(txt), "control-channel { algorithm hmac-sha256; secret \"%s\"; };", sec[i]);
+            if (parse_ok(txt, &cfg)) {
+                CHECK(cfg.control.secret_decoded_len == 25);
+                free_server_config_fields(&cfg);
+            }
+        }
+    }
+
+    /* F1: the second rate-limit block replaces the first and frees its exempt-clients (LSan sees a leak) */
+    if (parse_ok("options { rate-limit { responses-per-second 5; exempt-clients { 192.0.2.1; 192.0.2.3; }; }; "
+                 "rate-limit { responses-per-second 7; exempt-clients { 192.0.2.2; }; }; };", &cfg)) {
+        CHECK(cfg.rrl.responses_per_second == 7 && cfg.rrl.exempt_clients_count == 1);
+        CHECK(cfg.rrl.exempt_clients_count == 1 && strcmp(cfg.rrl.exempt_clients[0].ip, "192.0.2.2") == 0);
+        free_server_config_fields(&cfg);
+    }
+
+    /* F4: a statement that is skipped is named, with file:line */
+    {
+        int rc = parse_capture("options { port 5300; };\nzonee \"a.test\" { type master; file \"f\"; };\n", &cfg, msg, sizeof(msg));
+        CHECK(rc == 0);
+        CHECK_MSG(strstr(msg, "unknown statement 'zonee' is skipped") != NULL && strstr(msg, "line 2") != NULL, "%s", msg);
+        if (rc == 0) free_server_config_fields(&cfg);
+        rc = parse_capture("statistics-channels { inet 127.0.0.1 port 8053; };\ntrust-anchors { };\n", &cfg, msg, sizeof(msg));
+        CHECK(rc == 0 && strstr(msg, "statistics-channels") != NULL && strstr(msg, "unknown statement 'trust-anchors'") != NULL);
+        if (rc == 0) free_server_config_fields(&cfg);
+    }
+
+    /* F7: a wrong token after the value (the token is freed; LSan sees a leak) */
+    expect_reject("minimal-any-ttl two values", "options { minimal-any-ttl 5 6; };");
+    expect_reject("query-log-max-qps two values", "options { query-log-max-qps 5 6; };");
+    expect_reject("query-log-buffer-size two values", "options { query-log-buffer-size 2048 x; };");
+    expect_reject("max-mqtypes two values", "options { max-mqtypes 2 3; };");
+    expect_reject("wire-cache-max-records two values", "options { wire-cache-max-records 5 6; };");
+    expect_reject("additional-from-auth two values", "options { additional-from-auth yes no; };");
+
+    /* dnstap: a socket path longer than sockaddr_un.sun_path is an error (it was cut: another socket was connected) */
+    {
+        char longp[300], txt[700];
+        memset(longp, 'p', sizeof(longp));
+        longp[0] = '/';
+        longp[299] = '\0';
+        snprintf(txt, sizeof(txt), "options { dnstap { auth; }; dnstap-output unix \"%s\"; };", longp);
+        expect_an_error("dnstap-output long path", txt, "longer than");
+        snprintf(txt, sizeof(txt), "options { dnstap { socket \"%s\"; }; };", longp);
+        expect_an_error("dnstap socket long path", txt, "longer than");
+        if (parse_ok("options { dnstap { auth; }; dnstap-output unix \"/var/run/karidns/dnstap.sock\"; };", &cfg)) free_server_config_fields(&cfg);
+    }
+
+    /* catalog member transfers keep the key names in fixed buffers: a name over 255 bytes is refused where the key is defined */
+    {
+        char kn[400], txt[900];
+        memset(kn, 'k', sizeof(kn));
+        kn[256] = '\0';
+        snprintf(txt, sizeof(txt), "key \"%s\" { algorithm hmac-sha256; secret \"%s\"; };", kn, SECRET_OK);
+        expect_an_error("key name of 256 bytes", txt, "longer than 255");
+        kn[255] = '\0';
+        snprintf(txt, sizeof(txt), "key \"%s\" { algorithm hmac-sha256; secret \"%s\"; };", kn, SECRET_OK);
+        if (parse_ok(txt, &cfg)) free_server_config_fields(&cfg);
+    }
+
+    /* D1: host bits below the prefix length: a warning with file:line, still accepted */
+    {
+        int rc = parse_capture("options { allow-query { 192.0.2.0/24; 10.0.0.1/8; }; };\n", &cfg, msg, sizeof(msg));
+        CHECK(rc == 0 && strstr(msg, "'10.0.0.1/8' has host bits set") != NULL && strstr(msg, "'192.0.2.0/24'") == NULL);
+        if (rc == 0) free_server_config_fields(&cfg);
+        rc = parse_capture("options { allow-query { 2001:db8::1/32; 192.0.2.1; 192.0.2.1/32; ::/0; }; };\n", &cfg, msg, sizeof(msg));
+        CHECK(rc == 0 && strstr(msg, "'2001:db8::1/32' has host bits set") != NULL && strstr(msg, "'192.0.2.1'") == NULL && strstr(msg, "'192.0.2.1/32'") == NULL);
+        if (rc == 0) free_server_config_fields(&cfg);
+    }
+
+    /* D18/D19: the placeholder secret is an error where something trusts the key, a warning where nobody does */
+    {
+#define PH "UkVQTEFDRS1NRTpvcGVuc3NsLXJhbmQtYmFzZTY0LTMy"
+        int rc = parse_capture("control-channel { algorithm hmac-sha256; secret \"" PH "\"; };", &cfg, msg, sizeof(msg));
+        CHECK(rc == -1 && strstr(msg, "control-channel: secret is still the sample placeholder") != NULL);
+        rc = parse_capture("key \"k\" { algorithm hmac-sha256; secret \"" PH "\"; };", &cfg, msg, sizeof(msg));
+        CHECK(rc == 0 && strstr(msg, "still the sample placeholder") != NULL);   /* nobody uses it: a warning */
+        if (rc == 0) free_server_config_fields(&cfg);
+        static const char *const used[] = {
+            "zone \"a.test\" { type master; file \"f\"; allow-transfer { key k; }; };",
+            "zone \"a.test\" { type master; file \"f\"; allow-update { key k; }; };",
+            "zone \"a.test\" { type master; file \"f\"; allow-update { k; }; };",
+            "zone \"a.test\" { type master; file \"f\"; update-policy { grant k zonesub ANY; }; };",
+            "acl \"trusted\" { key k; };",
+            "options { allow-query { key k; }; };",
+            "options { database { driver sqlite3; database-file \"/x.db\"; acl-ceiling { key \"k\"; }; }; };",
+            "control-channel { algorithm hmac-sha256; secret \"" SECRET_OK "\"; keys { \"k\" read-only yes; }; };",
+        };
+        for (size_t i = 0; i < sizeof(used) / sizeof(used[0]); i++) {
+            char txt[1024];
+            snprintf(txt, sizeof(txt), "key \"k\" { algorithm hmac-sha256; secret \"" PH "\"; };\n%s", used[i]);
+            rc = parse_capture(txt, &cfg, msg, sizeof(msg));
+            CHECK_MSG(rc == -1 && strstr(msg, "sample placeholder") != NULL, "%s: rc=%d %s", used[i], rc, msg);
+            if (rc == 0) free_server_config_fields(&cfg);
+        }
+        /* the same text with a real secret is fine */
+        if (parse_ok("key \"k\" { algorithm hmac-sha256; secret \"" SECRET_OK "\"; };\nzone \"a.test\" { type master; file \"f\"; allow-transfer { key k; }; };", &cfg))
+            free_server_config_fields(&cfg);
+#undef PH
+    }
+}
+
+/* D2: a prefix is inside the acl-ceiling only if one non-negated entry covers all of it (and no negated entry touches it) */
+static void test_low_l1_ceiling(void) {
+    printf("[TEST] review fixes, low batch L1 (acl-ceiling covers the whole prefix)...\n");
+    static const struct { const char *ceiling, *zone_acl; bool written; } cases[] = {
+        { "10.0.0.0/8;", "10.0.0.0/8;", true },
+        { "10.0.0.0/8;", "10.1.0.0/16;", true },
+        { "10.0.0.0/9; 10.128.0.0/9;", "10.0.0.0/8;", false },      /* the ends are inside, the whole prefix is only covered by two entries */
+        { "10.0.0.0/8; !10.1.0.0/16;", "10.0.0.0/8;", false },      /* a hole in the middle */
+        { "10.0.0.0/8; !10.1.0.0/16;", "10.2.0.0/16;", true },
+        { "10.0.0.0/8; !10.1.0.0/16;", "10.1.2.0/24;", false },
+        { "10.0.0.0/16;", "10.0.0.0/8;", false },                    /* the ceiling is narrower */
+        { "any;", "192.0.2.0/24;", true },
+        { "0.0.0.0/0;", "any;", false },                             /* any needs both families */
+        { "0.0.0.0/0; ::/0;", "any;", true },
+        { "any;", "any;", true },
+        { "2001:db8::/32;", "2001:db8:1::/48;", true },
+        { "2001:db8::/32;", "2001:db8::/31;", false },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char txt[512], out[1024], err[200];
+        server_config_t cc;
+        snprintf(txt, sizeof(txt), "options { database { driver sqlite3; database-file \"/x.db\"; acl-ceiling { %s }; }; };", cases[i].ceiling);
+        if (!parse_ok(txt, &cc)) continue;
+        snprintf(txt, sizeof(txt), "allow-transfer { %s };", cases[i].zone_acl);
+        zone_ext_shared_t *sh = db_settings_parse(txt, strlen(txt), err, sizeof(err));
+        CHECK_MSG(sh != NULL, "%s", txt);
+        if (sh) {
+            zone_config_t *z = calloc(1, sizeof(*z));
+            z->domain = strdup("db.test.");
+            z->type = strdup("master");
+            z->ext = &sh->ext;
+            z->ext_shared = true;
+            size_t rn = zone_settings_render(&cc, z, false, out, sizeof(out));
+            bool written = rn > 0 && strstr(out, "allow-transfer { none; };\n") == NULL;
+            CHECK_MSG(written == cases[i].written, "ceiling { %s } zone { %s }: rendered: %s", cases[i].ceiling, cases[i].zone_acl, out);
+            free_zone_config(z);
+        }
+        free_server_config_fields(&cc);
+    }
+}
+
+/* D6: a configuration whose CONFIG message for the loader would not fit KDB_MAX_BODY is refused when it is read */
+static void test_low_l1_config_body(void) {
+    printf("[TEST] review fixes, low batch L1 (database CONFIG message size)...\n");
+    char path[1100];
+    memset(path, 'd', 1000);
+    path[0] = '/';
+    path[1000] = '\0';
+    for (int views = 900; views <= 1000; views += 100) {
+        size_t cap = (size_t)views * 1200 + 256;
+        char *txt = malloc(cap), *p = txt;
+        CHECK(txt != NULL);
+        if (!txt) return;
+        p += snprintf(p, cap, "options { database { driver sqlite3; database-file \"/x.db\"; }; };\n");
+        for (int v = 0; v < views; v++)
+            p += snprintf(p, cap - (size_t)(p - txt), "view \"v%d\" { database-file \"%s\"; };\n", v, path);
+        server_config_t c;
+        char msg[2048];
+        int rc = parse_capture(txt, &c, msg, sizeof(msg));
+        if (views == 900) {            /* about 960 KB: fits */
+            CHECK_MSG(rc == 0, "%d views: %s", views, msg);
+            if (rc == 0) free_server_config_fields(&c);
+        } else {                       /* about 1.07 MB: does not */
+            CHECK_MSG(rc == -1 && strstr(msg, "CONFIG message for the loader would be") != NULL, "%d views: rc=%d %s", views, rc, msg);
+        }
+        free(txt);
+    }
+}
+
 int main(void) {
     printf("=== Starting Config Directive Tests ===\n");
     test_in_view();
@@ -4760,6 +5054,9 @@ int main(void) {
     test_strict_options_and_key();
     test_bind_compat_paths();
     test_bind_logging();
+    test_low_l1();
+    test_low_l1_ceiling();
+    test_low_l1_config_body();
 
     printf("[*] %d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) {

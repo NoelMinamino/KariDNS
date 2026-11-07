@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <netinet/in.h>
 #include <openssl/evp.h>
 #include <sys/stat.h>
@@ -29,6 +30,10 @@ static int hex_nibble_value(char c) {
   return -1;
 }
 
+/* Out of memory while the configuration is read ends the process (exit(1)), at start-up and on a reload alike: the parser builds a new
+ * server_config_t piece by piece and has no way back from a failed allocation that every caller would handle the same; a half-read
+ * configuration must never be applied, and a server that cannot allocate a few kilobytes of configuration cannot serve either.
+ * (docs/karidns.md, "A reload ..."; the unit tests build with KARIDNS_UNIT_TEST and get NULL instead.) */
 static void *safe_realloc_or_die(void *ptr, size_t size) {
   if (size == 0) {
     free(ptr);
@@ -87,6 +92,26 @@ void *safe_calloc_or_die_test_wrapper(size_t nmemb, size_t size) {
         (arr)[(cnt)++] = _val_dup; \
     } while (0)
 
+#define LEX_TOKEN_MAX 4096   /* the longest token (bytes); a longer one is a syntax error, not truncated */
+enum { LEXERR_NONE = 0, LEXERR_COMMENT, LEXERR_STRING, LEXERR_TOKEN };
+
+/* The lexer stopped on a malformed token: report it once (the place is the file of the frame), make it fatal and return true.  In
+ * restricted mode (the settings text of a database zone, hostile input) only the statement is recorded, not the text. */
+static bool lex_failed(token_ctx_t *ctx, config_file_frame_t *frame) {
+  if (!frame->lex_err) return false;
+  static const char *const what[] = {"", "unterminated /* comment", "unterminated quoted string", "token longer than 4096 bytes"};
+  if (ctx->restricted) {
+    if (!ctx->restricted_err[0])
+      snprintf(ctx->restricted_err, sizeof(ctx->restricted_err), "syntax error or invalid value in the settings text");
+  } else {
+    syslog(LOG_ERR, "[Config] %s: syntax error: %s", frame->file_path ? frame->file_path : "<string>", what[frame->lex_err]);
+    dns_diag_at(DIAG_ERROR, DC_CONF_SYNTAX, frame->file_path, "%s: syntax error: %s\n", frame->file_path ? frame->file_path : "<string>", what[frame->lex_err]);
+  }
+  frame->lex_err = LEXERR_NONE;
+  ctx->error_occurred = true;
+  return true;
+}
+
 static void skip_spaces_and_comments_in_frame(config_file_frame_t *frame) {
   while (frame->pos < frame->len) {
     char c = frame->src[frame->pos];
@@ -106,8 +131,13 @@ static void skip_spaces_and_comments_in_frame(config_file_frame_t *frame) {
         if (frame->src[frame->pos] == '\0') break;
         frame->pos++;
       }
-      if (frame->pos + 1 < frame->len && frame->src[frame->pos] == '*' && frame->src[frame->pos + 1] == '/')
+      if (frame->pos + 1 < frame->len && frame->src[frame->pos] == '*' && frame->src[frame->pos + 1] == '/') {
         frame->pos += 2;
+      } else {   /* never closed: the rest of the file would silently be a comment (BIND: unexpected end of input) */
+        frame->lex_err = LEXERR_COMMENT;
+        frame->pos = frame->len;
+        break;
+      }
     } else {
       break;
     }
@@ -144,10 +174,14 @@ static conf_token_t get_raw_token_from_frame(config_file_frame_t *frame) {
     while (frame->pos < frame->len && frame->src[frame->pos] != '"' && frame->src[frame->pos] != '\0')
       frame->pos++;
     size_t str_len = frame->pos - start;
-    if (str_len > 4096) {
-      syslog(LOG_WARNING, "[Config] Token length (%zu bytes) exceeds maximum limit (4096 bytes), truncating in '%s'",
-             str_len, frame->file_path ? frame->file_path : "<string>");
-      str_len = 4096;
+    if (frame->pos >= frame->len || frame->src[frame->pos] != '"') {   /* no closing quote */
+      frame->lex_err = LEXERR_STRING;
+      return tok;
+    }
+    if (str_len > LEX_TOKEN_MAX) {
+      frame->lex_err = LEXERR_TOKEN;
+      frame->pos++;
+      return tok;
     }
     tok.type = TOKEN_STRING;
     tok.is_quoted = true;
@@ -179,10 +213,9 @@ static conf_token_t get_raw_token_from_frame(config_file_frame_t *frame) {
     frame->pos++;
     str_len = 1;
   }
-  if (str_len > 4096) {
-    syslog(LOG_WARNING, "[Config] Token length (%zu bytes) exceeds maximum limit (4096 bytes), truncating in '%s'",
-           str_len, frame->file_path ? frame->file_path : "<string>");
-    str_len = 4096;
+  if (str_len > LEX_TOKEN_MAX) {
+    frame->lex_err = LEXERR_TOKEN;
+    return tok;
   }
   tok.type = TOKEN_STRING;
   tok.is_quoted = false;
@@ -232,6 +265,10 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
 
     config_file_frame_t *frame = &ctx->stack[ctx->depth];
     conf_token_t tok = get_raw_token_from_frame(frame);
+    if (lex_failed(ctx, frame)) {
+      free_token(&tok);
+      return (conf_token_t){TOKEN_EOF, NULL, false};
+    }
 
     if (tok.type == TOKEN_EOF || (tok.type == TOKEN_STRING && !tok.value)) {
       if (tok.type == TOKEN_STRING && !tok.value) {
@@ -267,6 +304,10 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
       }
 
       conf_token_t tok_file = get_raw_token_from_frame(frame);
+      if (lex_failed(ctx, frame)) {
+        free_token(&tok_file);
+        return (conf_token_t){TOKEN_EOF, NULL, false};
+      }
       if (tok_file.type != TOKEN_STRING) {
         syslog(LOG_ERR, "[Config] syntax error: expected filename after 'include'");
         free_token(&tok_file);
@@ -275,6 +316,11 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
       }
 
       conf_token_t tok_semi = get_raw_token_from_frame(frame);
+      if (lex_failed(ctx, frame)) {
+        free_token(&tok_file);
+        free_token(&tok_semi);
+        return (conf_token_t){TOKEN_EOF, NULL, false};
+      }
       if (tok_semi.type != TOKEN_SEMICOLON) {
         syslog(LOG_ERR, "[Config] syntax error: missing ';' after include filename '%s'", tok_file.value);
         free_token(&tok_file);
@@ -290,15 +336,22 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
       char *base_dir = ctx->directory ? strdup(ctx->directory) : parent_path ? get_base_dir(parent_path) : strdup(".");
       char resolved[PATH_MAX];
       bool was_rel = false;
+      int rn;
       if (tok_file.value[0] == '/') {
-        snprintf(resolved, sizeof(resolved), "%s", tok_file.value);
+        rn = snprintf(resolved, sizeof(resolved), "%s", tok_file.value);
       } else {
         was_rel = true;
         ctx->rel_includes++;
-        snprintf(resolved, sizeof(resolved), "%s/%s", base_dir ? base_dir : ".", tok_file.value);
+        rn = snprintf(resolved, sizeof(resolved), "%s/%s", base_dir ? base_dir : ".", tok_file.value);
       }
       if (base_dir) free(base_dir);
       free_token(&tok_file);
+      if (rn < 0 || (size_t)rn >= sizeof(resolved)) {   /* a truncated path would open another file */
+        syslog(LOG_ERR, "[Config] include path is longer than %d bytes", PATH_MAX - 1);
+        dns_diag_at(DIAG_ERROR, DC_CONF_SYNTAX, NULL, "include path is longer than %d bytes\n", PATH_MAX - 1);
+        ctx->error_occurred = true;
+        return (conf_token_t){TOKEN_EOF, NULL, false};
+      }
 
       if (ctx->depth + 1 >= MAX_INCLUDE_DEPTH) {
         syslog(LOG_ERR, "[Config] include depth exceeded (max %d): '%s'", MAX_INCLUDE_DEPTH, resolved);
@@ -741,6 +794,40 @@ static bool key_is_defined(const token_ctx_t *ctx, const server_config_t *cfg, c
   return key_name_is_defined(cfg->keys, name) || (ctx && key_name_is_defined(ctx->scope_keys, name));
 }
 
+static void cfg_diag(const token_ctx_t *ctx, int sev, dns_diag_code_t code, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+
+/* The number of '=' (0..2) that end the base64 text s, not counting white space after them (EVP_DecodeBlock() ignores it, and its
+ * result counts the padding bytes). */
+static int b64_padding(const char *s, size_t n) {
+  while (n > 0 && isspace((unsigned char)s[n - 1])) n--;
+  int p = 0;
+  if (n > 0 && s[n - 1] == '=') p++;
+  if (n > 1 && s[n - 2] == '=') p++;
+  return p;
+}
+
+/* The key `name` (global, or in the view being checked) still has the secret of the shipped sample.  A key that something trusts (an ACL, an
+ * update-policy rule, the control channel) must not have it: anyone who has read the sample can sign with it.  A key nobody uses only warns
+ * (parse_key). */
+static const char *key_secret_of(const token_ctx_t *ctx, const server_config_t *cfg, const char *name) {
+  for (const tsig_key_t *k = cfg->keys; k; k = k->next)
+    if (k->name && name && domain_names_match_ci(k->name, name)) return k->secret;
+  for (const tsig_key_t *k = ctx ? ctx->scope_keys : NULL; k; k = k->next)
+    if (k->name && name && domain_names_match_ci(k->name, name)) return k->secret;
+  return NULL;
+}
+
+static bool key_placeholder_used(token_ctx_t *ctx, const server_config_t *cfg, const char *where, const char *name) {
+  const char *s = key_secret_of(ctx, cfg, name);
+  if (!s || strcmp(s, KARIDNS_SAMPLE_SECRET_PLACEHOLDER) != 0) return false;
+  syslog(LOG_ERR, "[Config] %s: key '%.64s' is used here but its secret is still the sample placeholder; "
+         "replace it with the output of 'openssl rand -base64 32'", where, name);
+  cfg_diag(ctx, DIAG_ERROR, DC_CONF_TSIG_SECRET_PLACEHOLDER_USED, "%s: key '%.64s' is used here but its secret is still the sample placeholder; "
+           "replace it with the output of 'openssl rand -base64 32'\n", where, name);
+  if (ctx) ctx->error_occurred = true;
+  return true;
+}
+
 /* D-22: BIND の組み込み ACL 名。any と none は要素として使える。localhost と localnets は
  * インターフェイスのアドレスに依存し、サンドボックス内のリロードで求め直せないので未対応 */
 static bool acl_name_is_builtin(const char *name) {
@@ -796,6 +883,7 @@ static int acl_expand_into(token_ctx_t *ctx, const server_config_t *cfg, const c
       if (!key_is_defined(ctx, cfg, kname))
         return acl_reject(ctx, where, kname, "names a key that is not defined in any key {} block");
       if (use == ACL_USE_ADDRESS) return acl_reject(ctx, where, kname, "is a key; only addresses can be used here");
+      if (key_placeholder_used(ctx, cfg, where, kname)) return -1;
       if (use == ACL_USE_TRANSFER) {
         APPEND_STR(*keys_out, *keys_count, strdup(kname));
       } else {
@@ -851,6 +939,7 @@ static int acl_expand_into(token_ctx_t *ctx, const server_config_t *cfg, const c
     }
     /* allow-update は従来どおり鍵名だけの要素も受け付ける (key "name" と同じ意味) */
     if (use == ACL_USE_UPDATE && !neg && key_is_defined(ctx, cfg, t)) {
+      if (key_placeholder_used(ctx, cfg, where, t)) return -1;
       APPEND_STR(*out, *out_count, strdup(t));
       continue;
     }
@@ -909,7 +998,7 @@ static int aml_resolve(token_ctx_t *ctx, server_config_t *cfg, aml_t *l, const c
     aml_report(ctx, NULL, what, "address match lists are nested too deeply");
     return -1;
   }
-  l->has_addr = l->has_key = l->has_neg_key = false;
+  l->has_addr = l->has_key = l->has_neg_key = l->has_any = l->has_neg_any = false;
   l->depth = 1;
   for (int i = 0; i < l->count; i++) {
     aml_elem_t *e = &l->elems[i];
@@ -922,6 +1011,7 @@ static int aml_resolve(token_ctx_t *ctx, server_config_t *cfg, aml_t *l, const c
         e->kind = AML_E_LIST;
         e->u.list = aml_ref(a->aml);
       } else if (bare_keys && !e->neg && key_is_defined(ctx, cfg, e->text)) {
+        if (key_placeholder_used(ctx, cfg, what, e->text)) return -1;
         e->kind = AML_E_KEY;
       } else {
         aml_report(ctx, e->loc, what, "entry '%.64s' is not an address, prefix, any, none, localhost, localnets or a defined acl%s", e->text,
@@ -933,6 +1023,7 @@ static int aml_resolve(token_ctx_t *ctx, server_config_t *cfg, aml_t *l, const c
         aml_report(ctx, e->loc, what, "key '%.64s' is not defined in any key {} block", e->text);
         return -1;
       }
+      if (key_placeholder_used(ctx, cfg, what, e->text)) return -1;
     } else if (e->kind == AML_E_LIST && e->u.list->depth == 0) {
       if (aml_resolve(ctx, cfg, e->u.list, what, bare_keys, depth + 1) != 0) return -1;
     }
@@ -948,11 +1039,14 @@ static int aml_resolve(token_ctx_t *ctx, server_config_t *cfg, aml_t *l, const c
       if (c->has_addr) l->has_addr = true;
       if (c->has_key) l->has_key = true;
       if (c->has_neg_key || (e->neg && c->has_key)) l->has_neg_key = true;
+      if (c->has_any) l->has_any = true;
+      if (c->has_neg_any || (e->neg && c->has_any)) l->has_neg_any = true;
       if (c->depth + 1 > l->depth) l->depth = (uint8_t)(c->depth + 1);
       break;
     }
     default:
       l->has_addr = true;
+      if (e->kind == AML_E_ANY) l->has_any = true;
       break;
     }
   }
@@ -1076,6 +1170,9 @@ static int resolve_all_acl_lists(token_ctx_t *ctx, server_config_t *cfg) {
       snprintf(label, sizeof(label), "zone '%.255s'", z->domain);
       if (acl_set_resolve(ctx, cfg, &zx->acl, label) != 0) return -1;
       if (zx->acl.query || zx->acl.query_on) cfg->acl_query_active = true;
+      if (zx->upd_policy)   /* update-policy: the identity of a rule is a key name */
+        for (int r = 0; r < zx->upd_policy->count; r++)
+          if (key_placeholder_used(ctx, cfg, "update-policy", zx->upd_policy->rules[r].identity)) return -1;
       if (zx->transfer_acl_match != ACL_MATCH_DEFAULT) {
         const aml_t *l = config_acl_for(cfg, z, v->name, AML_ACL_TRANSFER);
         if (l && l->has_neg_key) {
@@ -1391,6 +1488,12 @@ static bool parse_additional_from_auth(const char *s, additional_from_auth_t *ou
 /* 不正な値を報告して設定エラーにする。zone が NULL でなければゾーン名を付ける。 */
 static void report_bad_value(token_ctx_t *ctx, const char *zone, const char *name, const char *val,
                              const char *expected) {
+  if (ctx && ctx->restricted) {   /* the value is hostile input: neither logged nor printed, as conf_error() does */
+    if (!ctx->restricted_err[0])
+      snprintf(ctx->restricted_err, sizeof(ctx->restricted_err), "%s: syntax error or invalid value", name);
+    ctx->error_occurred = true;
+    return;
+  }
   if (zone) {
     syslog(LOG_ERR, "[Config] zone '%s': invalid %s value '%s' (expected %s)", zone, name, val ? val : "", expected);
     cfg_diag(ctx, DIAG_ERROR, DC_CONF_VALUE_INVALID, "zone '%s': invalid %s value '%s' (expected %s)\n", zone, name, val ? val : "", expected);
@@ -1707,6 +1810,7 @@ static bool aml_text_is(const char *t, const char *name) {
 }
 
 /* `what`: for the messages.  The '{' has been read; reads up to and including the matching '}'.  NULL after reporting an error. */
+static void conf_warn_here(const token_ctx_t *ctx, const char *what, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 static aml_t *parse_aml_body(token_ctx_t *ctx, const char *what, int depth) {
   aml_t *l = aml_new();
   char db[96];
@@ -1776,6 +1880,13 @@ static aml_t *parse_aml_body(token_ctx_t *ctx, const char *what, int depth) {
         e.kind = AML_E_LOCALNETS;
       } else if (cidr_entry_parse(&e.u.net, tok.value)) {
         e.kind = AML_E_NET;
+        /* host bits below the prefix (10.0.0.1/8): BIND also accepts it and matches the network, but it is usually a typo */
+        if (!ctx->restricted && strchr(tok.value, '/')) {
+          bool hb = false;
+          for (int b = 0; b < 16; b++)
+            if (e.u.net.addr[b] & ~e.u.net.mask[b]) hb = true;
+          if (hb) conf_warn_here(ctx, what, "'%.64s' has host bits set below the prefix length; the whole network is matched", tok.value);
+        }
       } else {
         e.kind = AML_E_NAME;
       }
@@ -2398,7 +2509,10 @@ static int aml_flatten(token_ctx_t *ctx, const aml_t *l, bool negate, acl_key_mo
       }
       continue;
     }
-    if (e->kind == AML_E_ANY && negate) continue;   /* `any` inside a negated list is dropped */
+    if (e->kind == AML_E_ANY && negate) {   /* `any` inside a negated list cannot be said in the flat list (dropping it would widen it): *inexact */
+      *inexact = true;
+      continue;
+    }
     size_t n = strlen(e->text);
     char *v = malloc(n + 2);
     if (!v) {
@@ -2464,7 +2578,7 @@ static int parse_zone_acl_stmt(token_ctx_t *ctx, zone_config_t *zone, zone_ext_t
   /* a negated key cannot be written in the flat lists: the list has_neg_key once resolved and zone_settings_render() then writes
    * `none`; the settings text of a database zone has only the flat lists, so it is refused there */
   if (inexact && ctx->restricted) {
-    conf_error(ctx, what, "a negated key is not allowed here");
+    conf_error(ctx, what, "a negated key, or an any inside a negated list, is not allowed here");
     aml_unref(l);
     return -1;
   }
@@ -2860,6 +2974,7 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
   rrl->ipv6_prefix_length_set = false;
   rrl->window_seconds = 15;
   rrl->slip = 2;
+  free_rate_limit_config(rrl);   /* a second rate-limit block replaces the first: its exempt-clients are freed, not dropped */
   rrl->exempt_clients = NULL;
   rrl->exempt_clients_count = 0;
   rrl->exempt_clients_parsed = NULL;
@@ -3004,7 +3119,7 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
   return 0;
 }
 
-static int parse_ecs_tags_block(token_ctx_t *ctx, ecs_tag_def_t **out_tags, int *out_count) {
+static int parse_ecs_tags_block(token_ctx_t *ctx, const char *what, ecs_tag_def_t **out_tags, int *out_count) {
   conf_token_t tok = get_next_token(ctx);
   if (tok.type != TOKEN_LBRACE) {
     free_token(&tok);
@@ -3066,10 +3181,22 @@ static int parse_ecs_tags_block(token_ctx_t *ctx, ecs_tag_def_t **out_tags, int 
       cidrs[cidr_count].cidr = tok.value;
       tok.value = NULL;
       free_token(&tok);
-      if (cidrs[cidr_count].cidr) {
-        cidr_entry_parse(&cidrs[cidr_count].parsed, cidrs[cidr_count].cidr);
-      }
+      bool cidr_ok = cidrs[cidr_count].cidr && cidr_entry_parse(&cidrs[cidr_count].parsed, cidrs[cidr_count].cidr);
       cidr_count++;
+      if (!cidr_ok) {   /* an entry that does not parse would never match: no diagnostic at all before */
+        const char *bad = cidrs[cidr_count - 1].cidr ? cidrs[cidr_count - 1].cidr : "";
+        if (ctx && ctx->restricted) {
+          conf_error(ctx, what, "invalid CIDR");
+        } else {
+          char loc[300];
+          ctx_location(ctx, loc, sizeof(loc));
+          syslog(LOG_ERR, "[Config] %s: Invalid CIDR '%.64s' in %s tag '%.64s'", loc, bad, what, tag_name);
+          cfg_diag(ctx, DIAG_ERROR, DC_CONF_TAG_CIDR, "Invalid CIDR '%.64s' in %s tag '%.64s'\n", bad, what, tag_name);
+          if (ctx) ctx->error_occurred = true;
+        }
+        cidr_err = true;
+        break;
+      }
 
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_SEMICOLON) {
@@ -3149,6 +3276,11 @@ static int parse_transport_param(token_ctx_t *ctx, const char *zone_domain, cons
     }
   }
   if (!ok) {
+    if (ctx && ctx->restricted) {   /* hostile settings text: the value is not echoed (see report_bad_value) */
+      report_bad_value(ctx, NULL, name, NULL, "a number in range");
+      free_token(&tok);
+      return -1;
+    }
     const char *suffix_hint = allow_suffix ? ", K/M/G suffix allowed" : "";
     char loc[300] = "";
     if (ctx) {
@@ -3263,6 +3395,11 @@ static int parse_notify_retry_option(token_ctx_t *ctx, const char *zone_domain, 
             (strcasecmp(tok.value, "fixed") == 0 || strcasecmp(tok.value, "exponential") == 0);
   if (!ok) {
     const char *v = (tok.type == TOKEN_STRING && tok.value) ? tok.value : "";
+    if (ctx && ctx->restricted) {   /* hostile settings text: the value is not echoed (see report_bad_value) */
+      report_bad_value(ctx, NULL, "notify-retry-backoff", NULL, "fixed or exponential");
+      free_token(&tok);
+      return -1;
+    }
     if (zone_domain) {
       syslog(LOG_ERR, "[Config] zone '%s': invalid notify-retry-backoff value '%s' (expected fixed or exponential)",
              zone_domain, v);
@@ -4752,6 +4889,10 @@ static tsig_key_t *parse_key_block(token_ctx_t *ctx) {
   free_token(&tok);
   char what[160];
   snprintf(what, sizeof(what), "key '%.64s'", tsig->name);
+  if (strlen(tsig->name) > KARIDNS_KEY_NAME_MAX) {   /* catalog_master_t and the transfer code keep key names in fixed buffers */
+    conf_error(ctx, what, "the key name is longer than %d bytes", KARIDNS_KEY_NAME_MAX);
+    goto fail;
+  }
   tok = get_next_token(ctx);
   if (tok.type != TOKEN_LBRACE) {
     free_token(&tok);
@@ -4815,11 +4956,8 @@ static tsig_key_t *parse_key_block(token_ctx_t *ctx) {
           cfg_diag(ctx, DIAG_ERROR, DC_CONF_TSIG_SECRET_BASE64, "key '%s': secret is not valid base64\n", tsig->name);
           goto fail;
         }
-        int padding = 0;
-        if (slen > 0 && val[slen - 1] == '=')
-          padding++;
-        if (slen > 1 && val[slen - 2] == '=')
-          padding++;
+        /* EVP_DecodeBlock() skips leading and trailing white space: the '=' are counted on the text without it */
+        int padding = b64_padding(val, slen);
         tsig->secret_decoded_len = len - padding;
         if (strcmp(val, KARIDNS_SAMPLE_SECRET_PLACEHOLDER) == 0) {
           syslog(LOG_WARNING, "[Config] key '%s': secret is still the sample placeholder; "
@@ -5391,13 +5529,13 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
         return -1;
       }
     } else if (strcmp(key, "ecs-tags") == 0) {
-      if (parse_ecs_tags_block(ctx, &x->ecs_tags, &x->ecs_tag_count) != 0) {
+      if (parse_ecs_tags_block(ctx, "ecs-tags", &x->ecs_tags, &x->ecs_tag_count) != 0) {
         free(key);
         free_zone_config(zone);
         return -1;
       }
     } else if (strcmp(key, "location-tags") == 0) {
-      if (parse_ecs_tags_block(ctx, &x->location_tags, &x->location_tag_count) != 0) {
+      if (parse_ecs_tags_block(ctx, "location-tags", &x->location_tags, &x->location_tag_count) != 0) {
         free(key);
         free_zone_config(zone);
         return -1;
@@ -5825,6 +5963,14 @@ static bool dnstap_is_bind_type(const char *w) {
   return false;
 }
 
+/* The dnstap socket is connect()ed by the path in sockaddr_un.sun_path: a longer one would be cut and another socket reached. */
+static bool dnstap_socket_path_fits(token_ctx_t *ctx, const char *what, const char *path) {
+  const size_t max = sizeof(((struct sockaddr_un *)0)->sun_path);
+  if (strlen(path) < max) return true;
+  conf_error(ctx, what, "the socket path '%.64s...' is longer than %zu bytes (the limit of a UNIX socket address)", path, max - 1);
+  return false;
+}
+
 /* set a dnstap string from one of the two grammars; a value that differs from one the other grammar set is an error */
 static int dnstap_set_string(token_ctx_t *ctx, char **field, char *origin, char from, const char *what, const char *val) {
   if (*field && *origin && *origin != from && strcmp(*field, val) != 0) {
@@ -5926,6 +6072,8 @@ static int parse_dnstap_output(token_ctx_t *ctx, server_config_t *config) {
   } else if (extra) {
     conf_error(ctx, "options dnstap-output", "size, versions and suffix cannot be set with mode unix");
     rc = -1;
+  } else if (!dnstap_socket_path_fits(ctx, "options dnstap-output", path)) {
+    rc = -1;
   } else {
     rc = dnstap_set_string(ctx, &config->dnstap.socket_path, &config->dnstap.origin_socket, 'b', "options dnstap-output", path);
   }
@@ -5996,6 +6144,7 @@ static int parse_dnstap_block(token_ctx_t *ctx, server_config_t *config) {
 
     if (strcmp(key_prop, "socket") == 0 || strcmp(key_prop, "socket-path") == 0 || strcmp(key_prop, "identity") == 0 || strcmp(key_prop, "version") == 0) {
       bool is_sock = key_prop[0] == 's', is_id = key_prop[0] == 'i';
+      if (is_sock && !dnstap_socket_path_fits(ctx, "dnstap", val)) { free(val); free(key_prop); return -1; }
       int src = dnstap_set_string(ctx, is_sock ? &config->dnstap.socket_path : is_id ? &config->dnstap.identity : &config->dnstap.version,
                                   is_sock ? &config->dnstap.origin_socket : is_id ? &config->dnstap.origin_identity : &config->dnstap.origin_version, 'k',
                                   "dnstap", val);
@@ -6318,6 +6467,31 @@ static int parse_view_database_option(token_ctx_t *ctx, view_config_t *view, con
   return 0;
 }
 
+/* The size of the body of the CONFIG message that build_config() (dns_db_ingest.c) sends for this configuration: every TLV is 4 bytes + its
+ * value (dns_db_stream.c enc_tlv()); keep the two in step.  A body above KDB_MAX_BODY cannot be encoded, and the loader would be restarted
+ * forever, so validate_database_config() refuses such a configuration. */
+static size_t db_config_body_size(const server_config_t *config) {
+  const database_config_t *db = &config->database;
+  bool sqlite = db->driver && strcmp(db->driver, "sqlite3") == 0;
+  size_t n = 12 + (4 + strlen(db->driver ? db->driver : ""));          /* generation, driver */
+  if (db->server_id) n += 4 + (strlen(db->server_id) < 255 ? strlen(db->server_id) : 255);
+  unsigned listed = 0;
+  for (const view_config_t *v = config->views; v; v = v->next) {
+    if (v->database_none) continue;
+    if (listed++ >= KARIDNS_DB_MAX_VIEWS) break;
+    const char *src = sqlite ? (v->database_file ? v->database_file : db->database_file)
+                             : (v->database_schema ? v->database_schema : db->schema);
+    size_t vn = 6 + 4 + (v->name && strlen(v->name) < 255 ? strlen(v->name) : 255);   /* index, name */
+    if (src) vn += 4 + strlen(src);
+    if (!sqlite && db->conninfo_file) vn += 4 + strlen(db->conninfo_file);
+    vn += 5 + 8 + 8 + 12 + 12;                                          /* auto-reload, poll, coalesce, max records, max bytes */
+    if (sqlite ? !v->database_file : !v->database_schema) vn += 5;      /* a view on the global source */
+    n += 4 + vn;
+  }
+  n += 8 + 5 + 8 + (db->memory_limit ? 5 : 0) + 5;                      /* default ttl, bulk threshold, loader threads, memory limit, signer wait */
+  return n;
+}
+
 /* The rules that need the whole configuration (design 7.1): required fields per driver, driver / view option
  * consistency, view options without a database block. */
 static int validate_database_config(token_ctx_t *ctx, server_config_t *config) {
@@ -6356,6 +6530,12 @@ static int validate_database_config(token_ctx_t *ctx, server_config_t *config) {
   }
   if (!db->driver) {
     db_cfg_error(ctx, "database: 'driver' is required (sqlite3 or postgresql)");
+    return -1;
+  }
+  size_t cfg_body = db_config_body_size(config);
+  if (cfg_body > KARIDNS_DB_CONFIG_BODY_MAX) {
+    db_cfg_error(ctx, "database: the CONFIG message for the loader would be %zu bytes, above the limit of %u (fewer views, shorter paths, "
+                      "or mark views with \"database none;\")", cfg_body, KARIDNS_DB_CONFIG_BODY_MAX);
     return -1;
   }
   if (sqlite) {
@@ -7835,6 +8015,11 @@ static int control_keys_resolve(token_ctx_t *ctx, server_config_t *cfg) {
       aml_report(ctx, k->loc, "control-channel keys", "key '%.64s' has an empty secret", k->name);
       return -1;
     }
+    if (def->secret && strcmp(def->secret, KARIDNS_SAMPLE_SECRET_PLACEHOLDER) == 0) {
+      aml_report(ctx, k->loc, "control-channel keys", "key '%.64s': the secret is still the sample placeholder; "
+                 "replace it with the output of 'openssl rand -base64 32'", k->name);
+      return -1;
+    }
     if (cc->secret_decoded_len == def->secret_decoded_len && memcmp(cc->secret_decoded, def->secret_decoded, def->secret_decoded_len) == 0) {
       aml_report(ctx, k->loc, "control-channel keys", "key '%.64s' has the same secret as the control-channel secret", k->name);
       return -1;
@@ -8066,12 +8251,12 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           free(config->ecs_trusted_resolvers_parsed);
           config->ecs_trusted_resolvers_parsed = acl_list_parse(config->ecs_trusted_resolvers, config->ecs_trusted_resolvers_count);
         } else if (strcmp(key, "ecs-tags") == 0) {
-          if (parse_ecs_tags_block(ctx, &config->ecs_tags, &config->ecs_tag_count) != 0) {
+          if (parse_ecs_tags_block(ctx, "options.ecs-tags", &config->ecs_tags, &config->ecs_tag_count) != 0) {
             free(key);
             return -1;
           }
         } else if (strcmp(key, "location-tags") == 0) {
-          if (parse_ecs_tags_block(ctx, &config->location_tags, &config->location_tag_count) != 0) {
+          if (parse_ecs_tags_block(ctx, "options.location-tags", &config->location_tags, &config->location_tag_count) != 0) {
             free(key);
             return -1;
           }
@@ -8220,6 +8405,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
             free(key);
+            free_token(&tok);
             return -1;
           }
           free_token(&tok);
@@ -8245,6 +8431,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
             free(key);
+            free_token(&tok);
             return -1;
           }
           free_token(&tok);
@@ -8270,6 +8457,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
             free(key);
+            free_token(&tok);
             return -1;
           }
           free_token(&tok);
@@ -8296,6 +8484,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
             free(key);
+            free_token(&tok);
             return -1;
           }
           free_token(&tok);
@@ -8307,10 +8496,13 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           char *endptr;
+          errno = 0;
           unsigned long v = strtoul(tok.value, &endptr, 10);
-          if (*endptr != '\0' || tok.value[0] == '-' || isspace((unsigned char)tok.value[0])) {
-            syslog(LOG_ERR, "[Config] Invalid minimal-any-ttl value '%s' (must be a non-negative integer)", tok.value);
-            cfg_diag(ctx, DIAG_ERROR, DC_CONF_MINIMAL_ANY_TTL, "Invalid minimal-any-ttl value '%s' (must be a non-negative integer)\n", tok.value);
+          /* RFC 2181 section 8: a TTL is 0..2^31-1 (a value above is out of range, also when strtoul saturates) */
+          if (*endptr != '\0' || endptr == tok.value || errno == ERANGE || v > 2147483647UL || tok.value[0] == '-' ||
+              isspace((unsigned char)tok.value[0])) {
+            syslog(LOG_ERR, "[Config] Invalid minimal-any-ttl value '%s' (must be an integer from 0 to 2147483647)", tok.value);
+            cfg_diag(ctx, DIAG_ERROR, DC_CONF_MINIMAL_ANY_TTL, "Invalid minimal-any-ttl value '%s' (must be an integer from 0 to 2147483647)\n", tok.value);
             free(key); free_token(&tok); return -1;
           }
           config->minimal_any_ttl = (uint32_t)v;
@@ -8318,6 +8510,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
             free(key);
+            free_token(&tok);
             return -1;
           }
           free_token(&tok);
@@ -8340,6 +8533,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
             free(key);
+            free_token(&tok);
             return -1;
           }
           free_token(&tok);
@@ -8998,17 +9192,19 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
               config->control.secret = NULL;
               return -1;
             }
-            int padding = 0;
-            if (slen > 0 && config->control.secret[slen - 1] == '=')
-              padding++;
-            if (slen > 1 && config->control.secret[slen - 2] == '=')
-              padding++;
+            int padding = b64_padding(config->control.secret, slen);
             config->control.secret_decoded_len = len - padding;
             if (strcmp(config->control.secret, KARIDNS_SAMPLE_SECRET_PLACEHOLDER) == 0) {
-              syslog(LOG_WARNING, "[Config] control-channel: secret is still the sample placeholder; "
+              /* anyone who has read the sample can sign a control command with it: not a warning but an error */
+              syslog(LOG_ERR, "[Config] control-channel: secret is still the sample placeholder; "
                      "replace it with the output of 'openssl rand -base64 32'");
-              cfg_diag(ctx, DIAG_WARNING, DC_CONF_TSIG_SECRET_PLACEHOLDER, "control-channel: secret is still the sample placeholder; "
+              cfg_diag(ctx, DIAG_ERROR, DC_CONF_TSIG_SECRET_PLACEHOLDER_USED, "control-channel: secret is still the sample placeholder; "
                       "replace it with the output of 'openssl rand -base64 32'\n");
+              if (ctx) ctx->error_occurred = true;
+              free(key_prop);
+              free(config->control.secret);
+              config->control.secret = NULL;
+              return -1;
             }
           }
         } else {
@@ -9048,6 +9244,10 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       free_token(&tok);
       skip_unknown_block(ctx);
     } else {
+      /* BIND refuses an unknown statement; this server skips it (a BIND statement it does not implement), but a misspelt `zonee` must not go unnoticed */
+      char loc[300];
+      ctx_location(ctx, loc, sizeof(loc));
+      conf_warn_loc(loc, "configuration", "unknown statement '%.64s' is skipped (up to its ';' or its closing '}')", tok.value);
       free_token(&tok);
       skip_unknown_block(ctx);
     }
@@ -9143,6 +9343,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
                      config->database.acl_ceiling_keys[i]);
         return -1;
       }
+      if (key_placeholder_used(ctx, config, "database acl-ceiling", config->database.acl_ceiling_keys[i])) return -1;
     }
     for (view_config_t *v = config->views; v; v = v->next) {
       ctx->scope_keys = v->keys;
@@ -9383,22 +9584,41 @@ static bool settings_key_name_ok(const char *k) {
   return true;
 }
 
-/* Is every address of the prefix inside options { database { acl-ceiling } }?  The first and the last address decide (and the
- * ends of the whole address space for "any"): a prefix the ceiling only partly covers is not sent. */
+/* Do the leading `bits` bits of the two addresses agree? */
+static bool prefix_bits_equal(const uint8_t *a, const uint8_t *b, int bits) {
+  int full = bits / 8, rem = bits % 8;
+  if (full > 0 && memcmp(a, b, (size_t)full) != 0) return false;
+  if (rem == 0) return true;
+  uint8_t m = (uint8_t)(0xff << (8 - rem));
+  return ((a[full] ^ b[full]) & m) == 0;
+}
+
+/* Is every address of the prefix inside options { database { acl-ceiling } }?  Only if one non-negated ceiling entry covers the whole prefix
+ * (it is as short as the prefix or shorter and the same network) and no negated entry overlaps the prefix at all: a prefix the ceiling
+ * covers only in parts (several narrower entries, or a hole made by a negated entry) is not sent.  An "any" prefix needs an entry that covers
+ * both address families.  The first and last address were checked before, which let a prefix with a hole in the middle through. */
 static bool cidr_inside_ceiling(const server_config_t *cfg, const cidr_entry_t *e) {
-  char ip[INET6_ADDRSTRLEN];
+  const database_config_t *d = &cfg->database;
   for (int fam = 0; fam < 2; fam++) {
     int af = fam == 0 ? AF_INET : AF_INET6;
     if (!e->is_any && e->family != af) continue;
-    size_t n = fam == 0 ? 4 : 16;
-    uint8_t lo[16] = {0}, hi[16] = {0};
-    for (size_t i = 0; i < n; i++) {
-      uint8_t a = e->is_any ? 0 : e->addr[i], m = e->is_any ? 0 : e->mask[i];
-      lo[i] = a & m;
-      hi[i] = (uint8_t)(a | (uint8_t)~m);
+    int plen = e->is_any ? 0 : e->prefix;
+    uint8_t zero[16] = {0};
+    const uint8_t *paddr = e->is_any ? zero : e->addr;
+    bool covered = false;
+    for (int i = 0; i < d->acl_ceiling_count && d->acl_ceiling_parsed; i++) {
+      const acl_entry_t *c = &d->acl_ceiling_parsed[i];
+      if (!c->cidr.valid) continue;
+      bool same_family = c->cidr.is_any || c->cidr.family == af;
+      if (!same_family) continue;
+      int clen = c->cidr.is_any ? 0 : c->cidr.prefix;
+      int common = clen < plen ? clen : plen;
+      bool overlap = c->cidr.is_any || prefix_bits_equal(c->cidr.addr, paddr, common);
+      if (!overlap) continue;
+      if (c->is_deny) return false;
+      if (clen <= plen) covered = true;
     }
-    if (!inet_ntop(af, lo, ip, sizeof(ip)) || !db_ceiling_allows_address(cfg, ip)) return false;
-    if (!inet_ntop(af, hi, ip, sizeof(ip)) || !db_ceiling_allows_address(cfg, ip)) return false;
+    if (!covered) return false;
   }
   return true;
 }
@@ -9471,7 +9691,7 @@ size_t zone_settings_render(const server_config_t *cfg, const zone_config_t *zcf
   /* allow-transfer: the addresses, the keys, and (file zone of type master) the zone's tsig-key, which also may transfer */
   const char *zone_key = (is_master && !ceil && x->tsig_key) ? x->tsig_key : NULL;
   if (x->allow_transfer_count > 0 || x->tsig_keys_count > 0 || zone_key) {
-    if (no_ceiling || (x->acl.transfer && x->acl.transfer->has_neg_key)) {   /* a negated key cannot be written in the flat form: nobody */
+    if (no_ceiling || (x->acl.transfer && (x->acl.transfer->has_neg_key || x->acl.transfer->has_neg_any))) {   /* a negated key, or an any inside a negated list, cannot be written in the flat form: nobody */
       rs_add(&r, "allow-transfer { none; };\n");
     } else {
       rs_acl(&r, "allow-transfer", x->allow_transfer, x->allow_transfer_count, x->tsig_keys, x->tsig_keys_count, zone_key, ceil, cfg);
