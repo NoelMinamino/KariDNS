@@ -4788,13 +4788,15 @@ static void test_low_l1(void) {
     }
     if (parse_ok("options { port 5300; }; /* closed */ // line\n# hash\n", &cfg)) free_server_config_fields(&cfg);
 
-    /* S8: an include path over PATH_MAX is an error, not a truncated path */
+    /* S8: an include path over PATH_MAX is an error, not a truncated path.  The token itself stays within the 4096-byte
+     * token limit (Linux has PATH_MAX 4096, FreeBSD 1024): a relative name of PATH_MAX - 1 bytes is over the limit only once
+     * it is resolved ("./" + name). */
     {
         char *big = malloc(PATH_MAX + 128);
         CHECK(big != NULL);
         if (big) {
-            int n = snprintf(big, 32, "include \"/");
-            memset(big + n, 'x', PATH_MAX + 20); n += PATH_MAX + 20;
+            int n = snprintf(big, 32, "include \"");
+            memset(big + n, 'x', PATH_MAX - 1); n += PATH_MAX - 1;
             snprintf(big + n, 16, "\";");
             expect_an_error("include path over PATH_MAX", big, "include path is longer than");
             free(big);
