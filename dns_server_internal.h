@@ -1430,9 +1430,11 @@ void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd);
 void backend_sig_handler(int sig);
 void supervisor_sig_handler(int sig);
 void cleanup_pid_file(void);
+bool control_socket_in_use(const char *path);
 void daemonize(void);
 void setup_ipc_tables(int num_workers);
 void run_frontend_router(pid_t backend_pid, int router_id);
+int allowed_cpu(int index);
 void *worker_thread_func(void *arg);
 #endif
 

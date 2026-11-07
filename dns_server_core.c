@@ -150,6 +150,21 @@ STATIC_TEST void capture_host_status_info(void) {
   long n = sysconf(_SC_NPROCESSORS_ONLN);
   g_host_status_info.ncpus = n > 0 ? (int)n : 1;
 }
+
+/* M3: the CPU for router or worker `index`: the index-th (modulo their count) of the CPUs in the cpuset of this process, which in a jail or under
+ * cpuset(1) need not be 0..N-1.  -1 when the set cannot be read or is empty (the caller then runs unpinned). */
+STATIC_TEST int allowed_cpu(int index) {
+  cpuset_t set;
+  CPU_ZERO(&set);
+  if (index < 0 || cpuset_getaffinity(CPU_LEVEL_CPUSET, CPU_WHICH_PID, -1, sizeof(set), &set) != 0) return -1;
+  int count = CPU_COUNT(&set);
+  if (count <= 0) return -1;
+  int want = index % count;
+  for (int c = 0; c < CPU_SETSIZE; c++) {
+    if (CPU_ISSET(c, &set) && want-- == 0) return c;
+  }
+  return -1;
+}
 _Atomic int g_xfers_running = ATOMIC_VAR_INIT(0);
 _Atomic int g_tcp_clients = ATOMIC_VAR_INIT(0);
 _Atomic int g_tcp_high_water = ATOMIC_VAR_INIT(0);
@@ -289,6 +304,9 @@ STATIC_TEST _Atomic int g_worker_start_failures = 0;
 // Broker
 STATIC_TEST int g_broker_sock = -1;
 STATIC_TEST pid_t g_broker_pid = -1;
+STATIC_TEST char g_pid_file_path[1024];   /* defined below, with the supervisor's state */
+STATIC_TEST int g_pid_fd;
+
 __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
   int sv[2];
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
@@ -318,6 +336,12 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
   if (pid == 0) {
     klog_set_role(KLOG_ROLE_AUX);
     close(sv[0]);
+    /* the PID file is locked before the broker is started (M4): its lock must go with the manager, as in the other children */
+    g_pid_file_path[0] = '\0';
+    if (g_pid_fd >= 0) {
+      close(g_pid_fd);
+      g_pid_fd = -1;
+    }
     if (need_drop) {
       char id_err[256];
       if (!g_run_identity.privileged || !g_run_identity.has_user ||
@@ -2448,14 +2472,16 @@ void *worker_thread_func(void *arg) {
 #ifndef CPU_SETSIZE
 #define CPU_SETSIZE 256
 #endif
-  cpuset_t cpuset;
-  CPU_ZERO(&cpuset);
-  if (ctx->core_id >= 0 && ctx->core_id < (int)CPU_SETSIZE) {
-    CPU_SET(ctx->core_id, &cpuset);
+  /* M3: the core of the worker is taken from the CPUs the process may use (a jail's cpuset need not be 0..N-1); a worker that cannot be pinned runs
+   * unpinned, as a router does, instead of stopping the start */
+  int cpu = allowed_cpu(ctx->core_id);
+  if (cpu >= 0) {
+    cpuset_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(cpu, &cpuset);
+    if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, sizeof(cpuset_t), &cpuset) != 0)
+      syslog(LOG_WARNING, "[Worker %d] Failed to set CPU affinity to CPU %d: %m; running unpinned", ctx->thread_id, cpu);
   }
-  if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, sizeof(cpuset_t),
-                         &cpuset) != 0)
-    goto worker_startup_failed;
 
   /* D-04: TCP 応答の組み立て用バッファはワーカーごとに起動時に1つ確保する
    * (以前はクエリごとに malloc(65535))。 */
@@ -3138,14 +3164,15 @@ process_tcp_client: ;
                                  &ctx_tcp->client_addr, ctx_tcp->client_len,
                                  ctx_tcp->has_server_addr ? &ctx_tcp->server_addr : NULL,
                                  ctx_tcp->has_server_addr, IPPROTO_TCP);
-              (void)send_tcp_dns_message(client_fd, res_buf, copy_len); /* 失敗しても下で閉じる */
-
               submit_response_log(LOG_ACT_SENT, ctx_tcp->client_ip, client_port, qname,
                                   qclass, qtype, res_buf[3] & 0x0F, has_edns, dnssec_ok);
+              /* H2: the answer is in res_buf; a client that does not read may keep the send waiting, outside the read section (the grace
+               * period of the writers does not wait for it) */
+              rcu_reader_exit(ctx);
+              (void)send_tcp_dns_message(client_fd, res_buf, copy_len); /* 失敗しても下で閉じる */
 
               tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
               client_closed = true;
-              rcu_reader_exit(ctx);
               break;
             }
           } else {
@@ -3266,28 +3293,28 @@ process_tcp_client: ;
                                   tcp_res_buf[3] & 0x0F, has_edns, dnssec_ok);
               write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, tcp_res_buf, res_len, &ctx_tcp->client_addr, ctx_tcp->client_len,
                                  ctx_tcp->has_server_addr ? &ctx_tcp->server_addr : NULL, ctx_tcp->has_server_addr, IPPROTO_TCP);
-              if (send_tcp_dns_message(client_fd, tcp_res_buf, (size_t)res_len) < 0) {
-                tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
-                client_closed = true;
-                rcu_reader_exit(ctx);
-                break;
-              }
             } else {
               submit_response_log(LOG_ACT_DROP_MALFORMED, ctx_tcp->client_ip, client_port, "<malformed>",
                                   0, 0, 0, false, false);
             }
-
+            /* the configuration is read in the read section only (config_standby_reap()) */
             server_config_t *cfg = acquire_config_snapshot();
             bool reuse = (cfg && cfg->tcp_connection_reuse);
             release_config_snapshot(cfg);
+            /* H2: the answer is in this worker's tcp_res_buf and nothing below reads the zone data or the configuration: the send, which a client
+             * that does not read keeps waiting (up to 30 s), is outside the read section, so the grace period of the writers does not wait for it */
+            rcu_reader_exit(ctx);
+            if (res_len > 0 && send_tcp_dns_message(client_fd, tcp_res_buf, (size_t)res_len) < 0) {
+              tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
+              client_closed = true;
+              break;
+            }
             if (!reuse) {
               tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
               client_closed = true;
-              rcu_reader_exit(ctx);
               break;
             }
 
-            rcu_reader_exit(ctx);
             ctx_tcp->state = TCP_STATE_READ_LEN;
             ctx_tcp->accumulated = 0;
             ctx_tcp->msg_len = 0;
@@ -4993,13 +5020,14 @@ int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], b
 
 STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
   (void)backend_pid;
-  cpuset_t cpuset;
-  CPU_ZERO(&cpuset);
-  if (router_id >= 0 && router_id < (int)CPU_SETSIZE) {
-    CPU_SET(router_id, &cpuset);
-  }
-  if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(cpuset), &cpuset) < 0) {
-    syslog(LOG_WARNING, "[Frontend %d] Failed to set CPU affinity: %m", router_id);
+  int cpu = allowed_cpu(router_id);
+  if (cpu >= 0) {
+    cpuset_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(cpu, &cpuset);
+    if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(cpuset), &cpuset) < 0) {
+      syslog(LOG_WARNING, "[Frontend %d] Failed to set CPU affinity: %m", router_id);
+    }
   }
 
   if (g_control_sock >= 0) {
@@ -5598,6 +5626,21 @@ STATIC_TEST void supervisor_sig_handler(int sig) {
 /* SIGCHLD only has to stay pending for the supervisor's sigtimedwait(); the children are collected with waitpid() */
 STATIC_TEST void supervisor_sigchld_handler(int sig) {
   (void)sig;
+}
+
+/* M4: true when a server accepts connections on the UNIX socket `path` (a running instance's control socket, which the start must not unlink);
+ * false when there is no such file, nobody listens on it (a stale file from a crash), or the path does not fit. */
+STATIC_TEST bool control_socket_in_use(const char *path) {
+  struct sockaddr_un un;
+  memset(&un, 0, sizeof(un));
+  un.sun_family = AF_UNIX;
+  if (!path || strlen(path) >= sizeof(un.sun_path)) return false;
+  strncpy(un.sun_path, path, sizeof(un.sun_path) - 1);
+  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) return false;
+  bool in_use = connect(fd, (struct sockaddr *)&un, sizeof(un)) == 0;
+  close(fd);
+  return in_use;
 }
 
 STATIC_TEST void cleanup_pid_file(void) {
@@ -6224,22 +6267,19 @@ int main(int argc, char **argv) {
   config_set_startup_xfr_sources(&g_config_db.config_a);
   // ---------------------------------------------------------------------------
 
-  if (!foreground) {
-    daemonize();
+  /* M4: a second instance is refused here, before daemonize(), so that the refusal reaches the terminal with a non-zero exit status, and it
+   * touches nothing of the running instance: the PID file is locked first (flock is kept across the fork of daemonize(), the PID is written
+   * after it), and a control socket that a server answers on is not unlinked. */
+  if (g_config_db.config_a.control.enabled) {
+    const char *sock_path = g_config_db.config_a.control.socket_path ? g_config_db.config_a.control.socket_path : "/var/run/karidns/control.sock";
+    if (control_socket_in_use(sock_path)) {
+      syslog(LOG_ERR, "Another KariDNS instance is already running (control socket %s answers)", sock_path);
+      fprintf(stderr, "Another KariDNS instance is already running (control socket %s answers).\n", sock_path);
+      free_server_config_fields(&g_config_db.config_a);
+      return 1;
+    }
   }
-  start_connect_broker();
-
-  sigset_t set;
-  sigemptyset(&set);
-  sigaddset(&set, SIGHUP);
-  sigprocmask(SIG_BLOCK, &set, NULL);
-
   if (effective_pid_file && strcmp(effective_pid_file, "none") != 0 && effective_pid_file[0] != '\0') {
-    strncpy(g_pid_file_path, effective_pid_file, sizeof(g_pid_file_path) - 1);
-    g_pid_file_path[sizeof(g_pid_file_path) - 1] = '\0';
-    g_supervisor_pid = getpid();
-    atexit(cleanup_pid_file);
-
     char dir_buf[1024];
     strncpy(dir_buf, effective_pid_file, sizeof(dir_buf) - 1);
     dir_buf[sizeof(dir_buf) - 1] = '\0';
@@ -6275,10 +6315,29 @@ int main(int argc, char **argv) {
     if (flock(g_pid_fd, LOCK_EX | LOCK_NB) < 0) {
       syslog(LOG_ERR, "Another KariDNS instance is already running (pidfile %s locked)", effective_pid_file);
       fprintf(stderr, "Another KariDNS instance is already running (pidfile %s locked).\n", effective_pid_file);
-      cleanup_pid_file();
+      close(g_pid_fd);                  /* the file is the running instance's: not unlinked (g_supervisor_pid is not set yet) */
+      g_pid_fd = -1;
       free_server_config_fields(&g_config_db.config_a);
       return 1;
     }
+  }
+
+  if (!foreground) {
+    daemonize();
+  }
+  start_connect_broker();
+
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, SIGHUP);
+  sigprocmask(SIG_BLOCK, &set, NULL);
+
+  if (g_pid_fd >= 0) {
+    /* the PID of the daemon, after the fork; from here on the file is ours and goes when we exit */
+    strncpy(g_pid_file_path, effective_pid_file, sizeof(g_pid_file_path) - 1);
+    g_pid_file_path[sizeof(g_pid_file_path) - 1] = '\0';
+    g_supervisor_pid = getpid();
+    atexit(cleanup_pid_file);
     ftruncate(g_pid_fd, 0);
     char pid_str[32];
     snprintf(pid_str, sizeof(pid_str), "%d\n", (int)getpid());

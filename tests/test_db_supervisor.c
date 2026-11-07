@@ -146,7 +146,7 @@ static void test_init(void) {
         CHECK_HAS(err, "is gid 0");
         cfg.database.loader_group = (char *)"nobody";                                  /* a group alone would leave the loader root */
         CHECK(!db_sup_init(&s, &cfg, err, sizeof(err)));
-        CHECK_HAS(err, "loader-group without loader-user");
+        CHECK_HAS(err, "database loader: running as root with 'group' but no 'user'");   /* resolve_run_identity() refuses it */
     } else {
         cfg.database.loader_user = (char *)"no-such-user-karidns-test";      /* not the user running karidns */
         CHECK(!db_sup_init(&s, &cfg, err, sizeof(err)));

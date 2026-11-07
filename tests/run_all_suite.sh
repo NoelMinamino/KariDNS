@@ -467,6 +467,7 @@ register_test "core" "sh" "tests/run_config_acl_bool_test.sh" "named.conf boolea
 register_test "core" "sh" "tests/run_zone_path_dotdot_test.sh" "zone and log file paths with ../ inside the sandbox (D-24)"
 register_test "core" "sh" "tests/run_log_rotation_timestamp_test.sh" "suffix timestamp log rotation never overwrites, versions prunes (D-21)"
 register_test "core" "sh" "tests/run_tcp_timeouts_test.sh" "TCP first-message and idle timeouts, partial messages do not extend them (D-06, R-24)"
+register_test "core" "sh" "tests/run_tcp_stall_rcu_test.sh" "A TCP client that does not read its large answers: the worker's send waits outside the read section, two reloads in a row are not postponed (review H2)"
 register_test "core" "sh" "tests/run_forward_failover_test.sh" "Forward zones share forward-timeout between forwarders, mismatched replies ignored (D-20)"
 register_test "core" "sh" "tests/run_dnstap_lifecycle_test.sh" "dnstap query_zone, reconnect through the broker, STOP/FINISH at shutdown (O-03)"
 register_test "core" "sh" "tests/run_rrl_bind_keys_test.sh" "RRL keyed like BIND: name, zone for NXDOMAIN, wildcard, client prefix length (D-05)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
