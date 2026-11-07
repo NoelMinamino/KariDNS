@@ -9387,6 +9387,112 @@ static void test_query_engine_program_zone_reply_bounded_by_buffer(void) {
     printf("  -> Program zone reply bound passed.\n");
 }
 
+/* Review query_engine [1]: after a timeout the reply that comes too late answers the query that failed, not the next
+ * one.  The next query drops what the pipe holds and skips frames whose ID / QR / question do not match; other queries
+ * pass the plugin's reply on as written (program zones are for testing malformed replies). */
+typedef struct { int fd; int delay_ms; const uint8_t *data; size_t len; } pz_late_t;
+
+static void *pz_late_writer(void *arg) {
+    pz_late_t *w = arg;
+    struct timespec ts = { 0, (long)w->delay_ms * 1000000L };
+    nanosleep(&ts, NULL);
+    assert(write(w->fd, w->data, w->len) == (ssize_t)w->len);
+    return NULL;
+}
+
+static size_t pz_frame(uint8_t *out, const uint8_t *req, size_t req_len, uint16_t id, uint8_t last_octet) {
+    /* a reply to req with ID `id` and one A record 192.0.2.<last_octet>, with its 2-byte length in front */
+    uint8_t *m = out + 2;
+    memcpy(m, req, req_len);
+    m[0] = (uint8_t)(id >> 8); m[1] = (uint8_t)id;
+    m[2] = 0x84; m[3] = 0x00; m[7] = 1;
+    size_t n = req_len;
+    const uint8_t rr[] = { 0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, last_octet };
+    memcpy(m + n, rr, sizeof(rr));
+    n += sizeof(rr);
+    out[0] = (uint8_t)(n >> 8); out[1] = (uint8_t)n;
+    return n + 2;
+}
+
+static void test_query_engine_program_zone_late_reply(void) {
+    printf("[TEST] Query Engine: Program zone late reply after a timeout is not the next answer...\n");
+    int in_p[2], out_p[2];
+    assert(pipe(in_p) == 0 && pipe(out_p) == 0);
+    /* the query lines go nowhere: give the writing side room */
+    program_plugin_t plugin;
+    memset(&plugin, 0, sizeof(plugin));
+    strncpy(plugin.domain, "plugtest.example.", sizeof(plugin.domain) - 1);
+    plugin.pid = -1;
+    plugin.proc_fd = -1;
+    plugin.stdin_fd = in_p[1];
+    plugin.stdout_fd = out_p[0];
+    pthread_mutex_init(&plugin.lock, NULL);
+    plugin.timeout_ms = 150;
+    plugin.max_failures = 5;
+    atomic_init(&plugin.consecutive_failures, 0);
+    atomic_init(&plugin.dead, false);
+    g_program_plugins = &plugin;
+    g_program_plugins_count = 1;
+
+    uint8_t q1[64], q2[64], q3[64], res[512], frames[512];
+    size_t l1 = 0, l2 = 0, l3 = 0;
+    build_dns_query(q1, &l1, 0x1111, "a.plugtest.example.", 1, false);
+    build_dns_query(q2, &l2, 0x2222, "b.plugtest.example.", 1, false);
+    build_dns_query(q3, &l3, 0x3333, "c.plugtest.example.", 1, false);
+
+    /* 1. q1 times out: SERVFAIL */
+    int n = dispatch_to_program_zone("", "plugtest.example.", q1, l1, res, sizeof(res), sizeof(res), "127.0.0.1", false);
+    assert(n >= 12 && (res[3] & 0x0F) == 2 && plugin.resync);
+
+    /* 2. the late reply to q1 and then the reply to q2 arrive after q2 was written (after the drain): q2 gets its own */
+    size_t fl = pz_frame(frames, q1, l1, 0x1111, 1);
+    fl += pz_frame(frames + fl, q2, l2, 0x2222, 2);
+    pz_late_t w = { out_p[1], 30, frames, fl };
+    pthread_t t;
+    pthread_create(&t, NULL, pz_late_writer, &w);
+    n = dispatch_to_program_zone("", "plugtest.example.", q2, l2, res, sizeof(res), sizeof(res), "127.0.0.1", false);
+    pthread_join(t, NULL);
+    assert(n > 12 && res[0] == 0x22 && res[1] == 0x22 && (res[3] & 0x0F) == 0);
+    assert(res[n - 1] == 2);   /* the A record of q2's reply, not q1's (192.0.2.1) */
+    assert(!plugin.resync && atomic_load(&plugin.consecutive_failures) == 0);
+
+    /* 3. a stale reply that is already in the pipe is drained before the query */
+    n = dispatch_to_program_zone("", "plugtest.example.", q1, l1, res, sizeof(res), sizeof(res), "127.0.0.1", false);
+    assert(n >= 12 && (res[3] & 0x0F) == 2 && plugin.resync);   /* timeout again */
+    fl = pz_frame(frames, q1, l1, 0x1111, 1);
+    assert(write(out_p[1], frames, fl) == (ssize_t)fl);
+    fl = pz_frame(frames, q3, l3, 0x3333, 3);
+    w = (pz_late_t){ out_p[1], 30, frames, fl };
+    pthread_create(&t, NULL, pz_late_writer, &w);
+    n = dispatch_to_program_zone("", "plugtest.example.", q3, l3, res, sizeof(res), sizeof(res), "127.0.0.1", false);
+    pthread_join(t, NULL);
+    assert(n > 12 && res[0] == 0x33 && res[1] == 0x33 && res[n - 1] == 3);
+
+    /* 4. without a failure before it, a reply with another ID is passed on as the plugin wrote it */
+    fl = pz_frame(frames, q2, l2, 0xBEEF, 4);
+    assert(write(out_p[1], frames, fl) == (ssize_t)fl);
+    n = dispatch_to_program_zone("", "plugtest.example.", q2, l2, res, sizeof(res), sizeof(res), "127.0.0.1", false);
+    assert(n > 12 && res[0] == 0xBE && res[1] == 0xEF && res[n - 1] == 4);
+
+    /* 5. after a failure, frames that never answer the query: SERVFAIL after PLUGIN_STALE_FRAMES + 1 of them */
+    n = dispatch_to_program_zone("", "plugtest.example.", q1, l1, res, sizeof(res), sizeof(res), "127.0.0.1", false);
+    assert((res[3] & 0x0F) == 2 && plugin.resync);
+    fl = 0;
+    for (int i = 0; i < 5; i++) fl += pz_frame(frames + fl, q1, l1, 0x1111, 9);
+    w = (pz_late_t){ out_p[1], 30, frames, fl };
+    pthread_create(&t, NULL, pz_late_writer, &w);
+    n = dispatch_to_program_zone("", "plugtest.example.", q2, l2, res, sizeof(res), sizeof(res), "127.0.0.1", false);
+    pthread_join(t, NULL);
+    assert(n >= 12 && res[0] == 0x22 && (res[3] & 0x0F) == 2 && plugin.resync);
+
+    pthread_mutex_destroy(&plugin.lock);
+    close(in_p[0]); close(in_p[1]);
+    close(out_p[0]); close(out_p[1]);
+    g_program_plugins = NULL;
+    g_program_plugins_count = 0;
+    printf("  -> Program zone late reply passed.\n");
+}
+
 static void test_query_engine_opcode_header_validations(void) {
     printf("[TEST] Query Engine: Opcode NOTIFY / UPDATE packet header validations...\n");
 
@@ -10590,6 +10696,7 @@ int main(void) {
     test_query_engine_dname_cname_wildcard_truncation();
     test_query_engine_program_zone_plugin_pipe_timeout_and_dead_mark();
     test_query_engine_program_zone_reply_bounded_by_buffer();
+    test_query_engine_program_zone_late_reply();
     test_query_engine_opcode_header_validations();
     test_all_rr_types_and_resolution();
     test_dnssec_negative_and_delegation_proofs();
