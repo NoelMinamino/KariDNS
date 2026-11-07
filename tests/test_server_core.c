@@ -24,6 +24,8 @@
 #include <signal.h>
 #ifdef __FreeBSD__
 #include <sys/capsicum.h>
+#include <sys/param.h>
+#include <sys/cpuset.h>
 #include <sys/procctl.h>
 #endif
 
@@ -78,6 +80,27 @@ int sendmmsg_skip_failed(int fd, struct mmsghdr *msgs, int n, const char *path, 
 // ----------------------------------------------------------------------------
 // 1. fast_ipv4_to_str Test
 // ----------------------------------------------------------------------------
+/* M3: the CPU of router / worker i is the i-th CPU of the process's cpuset (modulo their count), not i itself */
+static void test_allowed_cpu(void) {
+    printf("Running test_allowed_cpu...\n");
+    cpuset_t set;
+    CPU_ZERO(&set);
+    assert(cpuset_getaffinity(CPU_LEVEL_CPUSET, CPU_WHICH_PID, -1, sizeof(set), &set) == 0);
+    int count = CPU_COUNT(&set);
+    assert(count > 0);
+    assert(allowed_cpu(-1) == -1);
+    int prev = -1;
+    for (int i = 0; i < count; i++) {
+        int c = allowed_cpu(i);
+        assert(c >= 0 && CPU_ISSET(c, &set));
+        assert(c > prev);                       /* in order, each CPU once */
+        prev = c;
+    }
+    assert(allowed_cpu(count) == allowed_cpu(0));          /* wraps */
+    assert(allowed_cpu(count + 1) == allowed_cpu(1 % count));
+    printf("test_allowed_cpu passed (%d CPUs in the set)\n", count);
+}
+
 static void test_fast_ipv4_to_str(void) {
     printf("[TEST] Server Core: fast_ipv4_to_str conversion...\n");
     const char *test_ips[] = {
@@ -2570,16 +2593,8 @@ static void test_server_core_process_lifecycle_and_signals(void) {
     waitpid(cpid2, &status2, 0);
     assert(WIFEXITED(status2) && WEXITSTATUS(status2) == 0);
 
-    // 6. worker_thread_func with invalid core affinity in pthread
-    pthread_t w_th;
-    worker_ctx_t dummy_worker;
-    memset(&dummy_worker, 0, sizeof(dummy_worker));
-    dummy_worker.core_id = 999999;
-    int pct = pthread_create(&w_th, NULL, worker_thread_func, &dummy_worker);
-    assert(pct == 0);
-    void *wres = NULL;
-    pthread_join(w_th, &wres);
-    assert(wres == NULL);
+    // 6. (a worker with a core number outside the CPUs used to stop its start here; since review M3 the core is taken from the
+    //    process's cpuset and the worker runs, so this is test_allowed_cpu now)
 
     // 7. run_frontend_router in child process
     pid_t cpid3 = quiet_fork();
@@ -6679,6 +6694,7 @@ int main(void) {
     }
 
     test_crypto_prewarm_survives_capability_mode();
+    test_allowed_cpu();
     test_fast_ipv4_to_str();
     test_escape_qname_for_log();
     test_resolve_ip_port_to_sockaddr();

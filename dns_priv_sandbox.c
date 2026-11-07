@@ -414,6 +414,12 @@ bool resolve_run_identity(const char *user, const char *group, run_identity_t *i
                             "refusing to continue without privilege drop");
       return false;
     }
+    /* group だけでは setgid しか行わず uid 0 のまま残る。呼び出し側 (起動前検証、ローダーの supervisor) にも同じ検査があるが、
+     * 降格の可否はここで一度に決める */
+    if (!user) {
+      snprintf(err, errlen, "running as root with 'group' but no 'user': the process would keep uid 0; configure the user as well");
+      return false;
+    }
     id->privileged = true;
     return true;
   }
@@ -459,6 +465,15 @@ bool apply_run_identity_id(const run_identity_t *id, char *err, size_t errlen) {
   if ((id->has_user && (getuid() != id->uid || geteuid() != id->uid)) ||
       getgid() != id->gid || getegid() != id->gid) {
     snprintf(err, errlen, "privilege drop verification failed");
+    return false;
+  }
+  /* 降格が戻せないこと: root に戻れず (setuid(0) が失敗する)、補助グループも残っていない
+   * (FreeBSD 14 までは getgroups() が実効 GID を先頭に返す。15 以降は補助グループだけ: 0 個) */
+  gid_t groups[2];
+  int ngroups = getgroups(2, groups);
+  bool groups_ok = ngroups == 0 || (ngroups == 1 && groups[0] == getegid());
+  if ((id->uid != 0 && setuid(0) == 0) || !groups_ok) {
+    snprintf(err, errlen, "privilege drop verification failed: root can be regained or supplementary groups remain");
     return false;
   }
   return true;

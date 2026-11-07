@@ -1330,11 +1330,31 @@ static size_t base32hex_decode(const char *in, uint8_t *out, size_t out_cap) {
     return out_len;
 }
 
-static uint32_t parse_dnssec_time(const char *str) {
+/* RFC 4034 §3.2: the expiration and inception times are either YYYYMMDDHHmmSS in UTC (always exactly 14 digits) or an
+ * unsigned decimal number of seconds since 1970-01-01 (at most 10 digits, a 32-bit value). Anything else is an error
+ * (review wire [7]; it used to give 0). A date is checked field by field and, as in BIND (dns_time32_fromtext), kept
+ * modulo 2^32 (serial number arithmetic, RFC 4034 §3.1.5). */
+static bool parse_dnssec_time(const char *str, uint32_t *out) {
+    size_t len = strlen(str);
+    if (len == 0) return false;
+    for (size_t i = 0; i < len; i++)
+        if (str[i] < '0' || str[i] > '9') return false;
+    if (len <= 10) {
+        unsigned long long v = strtoull(str, NULL, 10);
+        if (v > UINT32_MAX) return false;
+        *out = (uint32_t)v;
+        return true;
+    }
+    if (len != 14) return false;
     int year, month, day, hour, min, sec;
     if (sscanf(str, "%4d%2d%2d%2d%2d%2d", &year, &month, &day, &hour, &min, &sec) != 6) {
-        return 0;
+        return false;
     }
+    static const int mdays[12] = { 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (year < 1970 || month < 1 || month > 12 || day < 1 || day > mdays[month - 1] ||
+        (month == 2 && day == 29 && !((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) ||
+        hour > 23 || min > 59 || sec > 60)
+        return false;
     // "days from civil" algorithm (Howard Hinnant)
     int64_t y = year;
     if (month <= 2) y -= 1;
@@ -1346,7 +1366,8 @@ static uint32_t parse_dnssec_time(const char *str) {
     int64_t days_since_epoch = era * 146097 + (int64_t)doe - 719468;
 
     int64_t total_seconds = days_since_epoch * 86400LL + hour * 3600LL + min * 60LL + sec;
-    return (uint32_t)total_seconds;
+    *out = (uint32_t)total_seconds;
+    return true;
 }
 
 static bool cert_type_to_num(const char *s, uint16_t *out) {
@@ -2348,6 +2369,12 @@ static int decode_concat_hex_rdata(char *const *fields, int count, uint8_t *res,
         hex_len += flen;
         hex[hex_len] = '\0';
     }
+    /* review utils [3]: the hex of DS / CDS / SSHFP / TLSA / SMIMEA / ZONEMD is an even number of hex digits (RFC 4034
+     * 5.3, RFC 4255 3.2, RFC 6698 2.2, RFC 8976 2.3): a typo is an error, as in BIND, not a digest that is quietly
+     * cut (hex_decode skips other characters and drops an odd digit) */
+    if (hex_len % 2 != 0) return -1;
+    for (size_t i = 0; i < hex_len; i++)
+        if (!isxdigit((unsigned char)hex[i])) return -1;
     size_t dec_len = hex_decode(hex, &res[*offset], max_res_len - *offset);
     if (dec_len == (size_t)-1) return -1;
     *offset += dec_len;
@@ -3047,8 +3074,8 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     if (!parse_u8(rec->rdata[1], &algorithm) ||
                         !parse_u8(rec->rdata[2], &labels)) return -1;
                     orig_ttl = strtoul(rec->rdata[3], NULL, 10);
-                    sig_exp = parse_dnssec_time(rec->rdata[4]);
-                    sig_inc = parse_dnssec_time(rec->rdata[5]);
+                    if (!parse_dnssec_time(rec->rdata[4], &sig_exp) ||
+                        !parse_dnssec_time(rec->rdata[5], &sig_inc)) return -1;
                     if (!parse_u16(rec->rdata[6], &key_tag)) return -1;
                     signer = rec->rdata[7];
                 }
@@ -4963,11 +4990,11 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
                 rec->rdata[7] && rec->rdata[8]) {
                 if (parse_u8(rec->rdata[1], &rec->cache.rrsig.algorithm) &&
                     parse_u8(rec->rdata[2], &rec->cache.rrsig.labels) &&
-                    parse_u16(rec->rdata[6], &rec->cache.rrsig.key_tag)) {
+                    parse_u16(rec->rdata[6], &rec->cache.rrsig.key_tag) &&
+                    parse_dnssec_time(rec->rdata[4], &rec->cache.rrsig.sig_exp) &&
+                    parse_dnssec_time(rec->rdata[5], &rec->cache.rrsig.sig_inc)) {
                     rec->cache.rrsig.type_covered = get_type_code(rec->rdata[0]);
                     rec->cache.rrsig.orig_ttl = strtoul(rec->rdata[3], NULL, 10);
-                    rec->cache.rrsig.sig_exp = parse_dnssec_time(rec->rdata[4]);
-                    rec->cache.rrsig.sig_inc = parse_dnssec_time(rec->rdata[5]);
                     rec->cache.rrsig.signer = rec->rdata[7];
                     rec->cache.rrsig.signature = NULL; 
                     rec->cache.rrsig.signature_len = 0;

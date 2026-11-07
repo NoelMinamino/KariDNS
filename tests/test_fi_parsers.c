@@ -121,8 +121,36 @@ static void test_fi_tinydns_parser(void) {
     });
 }
 
+/* review zone_parser [1]: after a pool whose malloc failed the arena keeps its old pool size, so the next small
+ * allocations do not write past the old pool (they used to: the failed size was kept as the size of the old pool) */
+static void test_fi_arena_pool_failure(void) {
+    zone_arena_t a;
+    zone_arena_init(&a);
+    fi_reset();
+    assert(arena_alloc(&a, 16) != NULL);
+    size_t cap = a.current_pool_cap;
+    assert(cap > 0 && cap < (1u << 20));
+    fi_reset();
+    fi_arm_nth(FI_ALLOC, 1);
+    assert(arena_alloc(&a, 2u << 20) == NULL);   /* a new pool of 3 MiB: its malloc fails */
+    assert(fi_fired_kind(FI_ALLOC));
+    assert(a.current_pool_cap == cap);
+    fi_reset();
+    size_t used_pools = (size_t)a.data_pool_count;
+    for (size_t total = 0; total < cap * 3; total += 1000) {   /* past the old pool: new pools, every byte written */
+        uint8_t *p = arena_alloc(&a, 1000);
+        assert(p);
+        assert(a.current_pool_idx <= a.current_pool_cap);
+        memset(p, 0x5A, 1000);
+    }
+    assert((size_t)a.data_pool_count > used_pools);
+    zone_arena_destroy(&a);
+}
+
 int main(void) {
     printf("[*] Running test_fi_parsers...\n");
+    printf("  -> test_fi_arena_pool_failure\n");
+    test_fi_arena_pool_failure();
     printf("  -> test_fi_zone_parser\n");
     test_fi_zone_parser();
     printf("  -> test_fi_conf_parser\n");

@@ -162,9 +162,9 @@ program_plugin_t *find_program_plugin(const char *view_name, const char *domain)
 
 #ifdef KARIDNS_UNIT_TEST
 int rcache_lookup(uint64_t tag, uint64_t gen, uint16_t qtype, uint8_t *dst, size_t room,
-                  uint16_t *an, uint16_t *ns, uint16_t *ar);
+                  uint16_t *an, uint16_t *ns, uint16_t *ar, bool *wildcard);
 void rcache_store(uint64_t tag, uint64_t gen, uint16_t qtype, const uint8_t *body, size_t len,
-                  uint16_t an, uint16_t ns, uint16_t ar);
+                  uint16_t an, uint16_t ns, uint16_t ar, bool wildcard);
 void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
                         uint16_t *ancount, uint16_t *nscount, uint16_t *arcount);
 bool image_rr_currently_valid(const zone_image_t *img, uint32_t rr, time_t now,

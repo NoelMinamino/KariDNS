@@ -76,7 +76,7 @@ karidns [-v | --version | -V] [-f] [-p port | -p pid_file] [-P pid_file] [-c con
 | Started as | `options { user ...; }` | Behavior |
 |---|---|---|
 | root | set | Binds sockets and opens files as root, then drops to `user`/`group` (recommended for port 53). |
-| root | not set | Refused: running as root without a privilege drop is not permitted. |
+| root | not set | Refused: running as root without a privilege drop is not permitted (also with only `group` set, which would keep uid 0). |
 | non-root user *U* | not set | Runs as *U*. |
 | non-root user *U* | `user "U";` (itself) | Runs as *U*; the privilege drop is skipped. |
 | non-root user *U* | another user | Refused: a non-root process cannot switch users. |
@@ -88,7 +88,8 @@ Everything the process needs must then be usable by that user. **karidns refuses
 - the listen port cannot be bound over UDP **or** TCP — ports below 1024 (such as 53) require root, so use e.g. `port 10053;` or `-p 10053`; a port already in use by another process is refused too;
 - a `logging { channel { file "..."; }; }` file cannot be opened (e.g. under `/var/log`); choose a directory the user can write to;
 - the PID file cannot be created: when daemonized, the default is `/var/run/karidns/karidns.pid`, so pass `-P <path>` / `pid-file "<path>";`, or `pid-file "none";`;
-- `control-channel` is enabled and its UNIX socket cannot be bound: the default is `/var/run/karidns/control.sock`, so set `control-channel { socket "<path>"; ... };` to a path in a directory the user can write to (and point `karictl` at the same path).
+- `control-channel` is enabled and its UNIX socket cannot be bound: the default is `/var/run/karidns/control.sock`, so set `control-channel { socket "<path>"; ... };` to a path in a directory the user can write to (and point `karictl` at the same path);
+- another instance is running: its PID file is locked, or a server answers on the control socket (`Another KariDNS instance is already running`). The running instance's PID file and control socket are left as they are.
 
 These checks run **before** the process daemonizes, so in daemon mode the failure is reported to the invoking shell/rc script as well. The same fail-closed rules apply when started as root (a log file that cannot be opened, an unbindable port or control socket all abort startup). On `karictl reconfig` / `SIGHUP`, a configuration whose log files cannot be opened is rejected and the running configuration is kept.
 
@@ -348,7 +349,7 @@ Responses are counted like BIND (`lib/dns/rrl.c`): clients are grouped by addres
 | Errors (SERVFAIL, REFUSED, FORMERR, ...) | the client prefix only |
 | `all-per-second` | the client prefix only, all responses |
 
-Differences from BIND: the table has a fixed size of 131072 entries (`min-table-size` / `max-table-size` are accepted and ignored); `qps-scale` is accepted and ignored; `nxdomains-per-second` and `errors-per-second` default to `0` (no limit) instead of `responses-per-second`; responses that carry a valid server cookie are limited like any other.
+Differences from BIND: the table has a fixed size of 131072 entries (`min-table-size` / `max-table-size` are accepted and ignored); when the four slots a key can use are taken by other keys, the one used least recently is taken over (BIND reuses the oldest entry of its table); `qps-scale` is accepted and ignored; `nxdomains-per-second` and `errors-per-second` default to `0` (no limit) instead of `responses-per-second`; responses that carry a valid server cookie are limited like any other.
 
 | Option | Default | Description |
 |---|---|---|
@@ -361,7 +362,7 @@ Differences from BIND: the table has a fixed size of 131072 entries (`min-table-
 | `ipv4-prefix-length <n>;` | `24` | 0–32. IPv4 clients in the same prefix share their budgets. |
 | `ipv6-prefix-length <n>;` | `56` | 0–128. IPv6 clients in the same prefix share their budgets. |
 | `qps-scale`, `min-table-size`, `max-table-size` | — | Accepted for BIND compatibility; no effect (warning). |
-| `window <seconds>;` | `15` | Accounting window (maximum 3600). |
+| `window <seconds>;` | `15` | Accounting window (maximum 3600). As in BIND 9: the budget of a key starts at its per-second rate and never holds more than one second of responses; every response is counted, also a limited one, so the balance goes down to -window × rate and a client that keeps sending stays limited until it has been quiet for up to the window; a key unused for longer than the window starts again at the rate. |
 | `slip <n>;` | `2` | Every *n*-th limited UDP response is sent truncated (TC=1) instead of being dropped; `0` drops all. |
 | `log-only yes\|no;` | `no` | Only log what would be limited. |
 | `early-drop yes\|no;` | `no` | For `type program` zones: drop UDP queries before they are passed to the program when the client's budget for a positive answer to this QNAME/QTYPE (or its `all-per-second` budget) is already exhausted. |
@@ -956,7 +957,7 @@ A zone in `karidns.conf` takes its per-zone options from its `zone { }` statemen
 |---|---|---|
 | `ALLOW-AXFR-FROM` (one address or prefix per row) | `allow-transfer { <addr>; };` | `AUTO-NS`, a name or anything else that is not an address or prefix is left out with a warning of the loader (the list never becomes wider). |
 | `TSIG-ALLOW-AXFR` (one key name per row) | `allow-transfer { key "<name>"; };` | Both kinds: `allow-transfer { ...; key "..."; }; transfer-acl-match any;` |
-| `ALLOW-DNSUPDATE-FROM`, `TSIG-ALLOW-DNSUPDATE` | `allow-update { ... };` | Both kinds: `update-acl-match all;` is added. |
+| `ALLOW-DNSUPDATE-FROM`, `TSIG-ALLOW-DNSUPDATE` | `allow-update { ... };` | Both kinds: `update-acl-match all;` is added. A row that is not an address or prefix (or not a valid key name) is left out with a warning; a kind whose rows are all left out makes it `allow-update { none; };` (with a warning), so that the other kind alone does not allow more than was written. |
 | `ALSO-NOTIFY` | `also-notify { ... };` | `ip`, `ip:port`, `[ip]:port`. Addresses only (no list name, no key); without it the zone uses the `options` / view `also-notify`. |
 | `AXFR-MASTER-TSIG` | `tsig-key "<name>";` | The key of the primary of a secondary zone (`SLAVE` / `CONSUMER`, milestone B7b). It is **not** a key that may transfer the zone. |
 | `domains.master` (a column, not metadata) | `masters { <addr> [port <n>]; ... };` | Only for `SLAVE` and `CONSUMER` zones: see "Database zone types". `masters` and `primaries` are the same statement. |

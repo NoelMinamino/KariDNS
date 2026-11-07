@@ -201,6 +201,29 @@ static void test_catalog_process_membership_rfc9432(void) {
     catalog_process_membership(&cat_entry, &cat_cfg, "default");
     assert(cat_entry.catalog_member_count == 0); // Duplicate target domain rejected!
 
+    // 3b. review catalog_zone [12] (sorted check): the duplicate is found when the two are not neighbours in the
+    // catalog and differ in case
+    zone_arena_t a_dup_far;
+    memset(&a_dup_far, 0, sizeof(a_dup_far));
+    zone_arena_init(&a_dup_far);
+    a_dup_far.records = malloc(sizeof(dns_record_t) * 8);
+    a_dup_far.records_cap = 8;
+    a_dup_far.records[a_dup_far.count++] = r_ver;
+    static const char *const far_targets[4] = { "Zeta.example.", "alpha.example.", "mid.example.", "zeta.EXAMPLE." };
+    for (int k = 0; k < 4; k++) {
+        char node[64];
+        snprintf(node, sizeof(node), "n%d.zones.catalog.example.", k);
+        dns_record_t r; memset(&r, 0, sizeof(r));
+        DNS_RECORD_BIND_RDATA(r);
+        r.name = arena_strdup(&a_dup_far, node);
+        r.type_code = 12; r.rdata_count = 1;
+        r.rdata[0] = arena_strdup(&a_dup_far, far_targets[k]);
+        a_dup_far.records[a_dup_far.count++] = r;
+    }
+    atomic_store_explicit(&cat_entry.rcu.active, &a_dup_far.ver, memory_order_release);
+    catalog_process_membership(&cat_entry, &cat_cfg, "default");
+    assert(cat_entry.catalog_member_count == 0); // zeta twice (first and last, other case): rejected
+
     // 4. Static config collision skipping
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));

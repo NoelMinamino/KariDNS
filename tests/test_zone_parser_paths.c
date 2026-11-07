@@ -2392,8 +2392,32 @@ static void test_bind_zonefile_batch11(void) {
     printf("  -> batch 11 passed.\n");
 }
 
+/* review zone_parser [2]: a line of blanks, or blanks and a comment, after a record is an empty line (BIND reads it so);
+ * it used to become a record of the previous owner with no type ("Missing record type"). */
+static void test_blank_and_comment_lines(void) {
+    printf("[TEST] Zone parser: lines of blanks / blanks and a comment are empty lines...\n");
+    zt_t z;
+    zt_load(&z, "$TTL 300\n"
+                "@ IN SOA ns1 hostmaster 1 3600 600 86400 300\n"
+                "\t; a comment after a tab\n"
+                "  \n"
+                "\t\n"
+                "    ; indented comment\n"
+                "@ IN NS ns1\n"
+                "ns1 A 192.0.2.1\n"
+                "\t; again\n"
+                "\tAAAA 2001:db8::1\n"
+                "   ");
+    ASSERT_PARSED(&z);
+    assert(zt_count(&z, "example.", 6) == 1 && zt_count(&z, "example.", 2) == 1);
+    assert(zt_find(&z, "ns1.example.", 1) && zt_find(&z, "ns1.example.", 28));   /* the owner carries over the comment */
+    assert(z.arena.count == 4);
+    zt_free(&z);
+}
+
 int main(void) {
     printf("=== Starting Zone Parser Path Coverage Tests ===\n");
+    test_blank_and_comment_lines();
     test_x37_rdata_name_case();
     test_x38_wks_port_names();
     test_x32_drop_unencodable();

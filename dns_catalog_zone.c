@@ -89,6 +89,13 @@ STATIC_TEST void free_catalog_desired_list(catalog_member_id_t *list, int count)
 /* RFC 9432 §4.1: a member node is exactly one label (<unique-N>) directly below
  * "zones.<catalog>". PTR records deeper in the tree (e.g. the "coo" property at
  * coo.<unique-N>.zones.<catalog>) are properties, not members. */
+/* qsort() of pointers to members by their zone name, ignoring case (the duplicate check) */
+static int catalog_member_cmp(const void *a, const void *b) {
+    const catalog_member_id_t *x = *(const catalog_member_id_t *const *)a;
+    const catalog_member_id_t *y = *(const catalog_member_id_t *const *)b;
+    return strcasecmp(x->domain, y->domain);
+}
+
 static bool catalog_prefix_is_single_label(const char *name, size_t prefix_len) {
     if (prefix_len == 0) return false;
     if (dns_char_is_escaped(name, prefix_len)) return false; /* 続く ".zones." の '.' がラベルの一部 */
@@ -233,15 +240,27 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, const zone_confi
     }
 
     // (2) 異なる<unique-N>が同一ターゲットを指していないか
-    for (int a = 0; a < new_desired_count && !catalog_broken; a++) {
-        for (int b = a + 1; b < new_desired_count; b++) {
-            if (strcasecmp(new_desired[a].domain, new_desired[b].domain) == 0) {
+    // review catalog_zone [12]: sort pointers to the members by name and compare neighbours (O(n log n); the pairwise
+    // comparison was O(n^2) for catalogs of tens of thousands of members). The list itself keeps its order.
+    if (!catalog_broken && new_desired_count > 1) {
+        const catalog_member_id_t **by_name = malloc((size_t)new_desired_count * sizeof(*by_name));
+        if (!by_name) {
+            syslog(LOG_ERR, "[Catalog] Zone '%s': out of memory checking the member names", catalog_entry->domain);
+            free_catalog_desired_list(new_desired, new_desired_count);
+            rcu_aux_read_unlock();
+            return;
+        }
+        for (int a = 0; a < new_desired_count; a++) by_name[a] = &new_desired[a];
+        qsort(by_name, (size_t)new_desired_count, sizeof(*by_name), catalog_member_cmp);
+        for (int a = 0; a + 1 < new_desired_count; a++) {
+            if (strcasecmp(by_name[a]->domain, by_name[a + 1]->domain) == 0) {
                 syslog(LOG_ERR, "[Catalog] Zone '%s': member zone '%s' is referenced by both '%s' and '%s' labels; catalog zone is broken and will NOT be processed",
-                       catalog_entry->domain, new_desired[a].domain, new_desired[a].unique_id, new_desired[b].unique_id);
+                       catalog_entry->domain, by_name[a]->domain, by_name[a]->unique_id, by_name[a + 1]->unique_id);
                 catalog_broken = true;
                 break;
             }
         }
+        free(by_name);
     }
 
     if (catalog_broken) {

@@ -407,6 +407,89 @@ static void test_rrl_bind_keys(void) {
     printf("  -> BIND-compatible keys passed.\n");
 }
 
+/* ---------------------------------------------------------------------------
+ * Review rrl [1][2][8]: BIND 9 lib/dns/rrl.c debit_rrl_entry(): a new key starts at `rate` and the balance is capped at
+ * `rate`; every response is debited (also a limited one) down to -window*rate; the balance is credited by rate per
+ * second of age; a key older than the window starts again at `rate`.  With all probe slots taken by other keys the
+ * least recently used one is taken (no fail-open).  Times are passed in, so no sleeping.
+ * ------------------------------------------------------------------------- */
+int rrl_debit(uint64_t hash, uint32_t rate, uint32_t window_sec, uint32_t slip, int64_t now_ms, bool *out_slip);
+
+static int burst(uint64_t h, uint32_t rate, uint32_t window, int64_t now, int n) {
+    int ok = 0;
+    bool slip;
+    for (int i = 0; i < n; i++) ok += rrl_debit(h, rate, window, 0, now, &slip);
+    return ok;
+}
+
+static void test_rrl_bind_balance(void) {
+    printf("[TEST] RRL: BIND balance model (start/cap at rate, debit to -window*rate), LRU eviction, early-drop refill...\n");
+    const uint64_t T = 1000000;   /* table size is 131072: hashes T + k * 131072 share one probe range */
+    int64_t t0 = 10000000;
+
+    /* rate 5, window 15: the first burst gets 5 (BIND), not 5 * 15 */
+    uint64_t h = T + 1;
+    assert(burst(h, 5, 15, t0, 100) == 5);
+    /* 95 debits past zero: the balance is clamped at -75; 1 s later +5 = -70: still limited */
+    assert(burst(h, 5, 15, t0 + 1000, 1) == 0);
+    /* 14 s after the burst: -71 + 13*5 < 0: still limited (a client that keeps sending stays limited) */
+    assert(burst(h, 5, 15, t0 + 14000, 1) == 0);
+    /* more than the window without a response: a new start at rate */
+    assert(burst(h, 5, 15, t0 + 14000 + 15001, 10) == 5);
+
+    /* the cap is rate: a long pause inside the window does not give more than one second's worth */
+    h = T + 2;
+    assert(burst(h, 4, 15, t0, 1) == 1);
+    assert(burst(h, 4, 15, t0 + 10000, 10) == 4);
+    /* refill: 375 ms at 4/s = 1 response and 125 ms that are kept: 125 ms later another one */
+    h = T + 3;
+    assert(burst(h, 4, 15, t0, 4) == 4);
+    assert(burst(h, 4, 15, t0 + 375, 1) == 1);
+    assert(burst(h, 4, 15, t0 + 500, 1) == 1);
+
+    /* eviction: four keys fill the probe range of base T + 16; a fifth key takes the least recently used slot */
+    uint64_t base = T + 16, k[5];
+    for (int i = 0; i < 5; i++) k[i] = base + (uint64_t)i * 131072u;
+    for (int i = 0; i < 4; i++) assert(burst(k[i], 1, 15, t0 + i, 2) == 1);   /* each key: 1 allowed, 1 limited */
+    assert(burst(k[4], 1, 15, t0 + 10, 2) == 1);   /* the fifth key is counted (old: always allowed) */
+    assert(burst(k[4], 1, 15, t0 + 10, 1) == 0);
+    /* k[0] was the oldest: it was taken, so it starts again (and takes k[1]'s slot, now the oldest);
+     * k[2] keeps its limited state */
+    assert(burst(k[0], 1, 15, t0 + 20, 1) == 1);
+    assert(burst(k[2], 1, 15, t0 + 20, 1) == 0);
+
+    /* "least recently used" is the last response counted, not the last refill: a key that keeps sending while its
+     * balance is negative (no refill yet) is not taken, so it cannot win a fresh start by being evicted */
+    base = T + 64;
+    for (int i = 0; i < 5; i++) k[i] = base + (uint64_t)i * 131072u;
+    assert(burst(k[0], 1, 15, t0, 2) == 1);                 /* balance -1, last refill t0 */
+    for (int i = 1; i < 4; i++) assert(burst(k[i], 1, 15, t0 + 100 * i, 1) == 1);
+    assert(burst(k[0], 1, 15, t0 + 500, 1) == 0);           /* used at t0 + 500, no refill (500 ms at 1/s) */
+    assert(burst(k[4], 1, 15, t0 + 600, 1) == 1);           /* takes k[1] (used at t0 + 100) */
+    assert(burst(k[0], 1, 15, t0 + 700, 1) == 0);           /* k[0] is still limited */
+
+    /* early-drop (rrl_key_exhausted) sees the refill: a key that ran out is not dropped forever */
+    rate_limit_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.configured = true;
+    cfg.responses_per_second = 20;
+    cfg.window_seconds = 1;
+    struct sockaddr_in c;
+    memset(&c, 0, sizeof(c));
+    c.sin_family = AF_INET;
+    inet_pton(AF_INET, "192.0.2.77", &c.sin_addr);
+    rrl_key_t key = { .cls = RRL_RESP_NOERROR, .name = "ed.example.test", .qtype = 1, .qclass = 1 };
+    bool slip;
+    for (int i = 0; i < 21; i++) (void)rrl_check_key(&c, &key, &cfg, &slip);   /* balance -1 */
+    assert(rrl_key_exhausted(&c, &key, &cfg));
+    struct timespec ts = { 0, 300 * 1000 * 1000 };   /* 300 ms at 20/s = +6 */
+    nanosleep(&ts, NULL);
+    assert(!rrl_key_exhausted(&c, &key, &cfg));   /* old: tokens <= 0 forever, as the dropped query debits nothing */
+    assert(rrl_check_key(&c, &key, &cfg, &slip));
+
+    printf("  -> BIND balance model, LRU eviction and early-drop refill passed.\n");
+}
+
 int main(void) {
     printf("=== Starting RRL Engine Unit Tests ===\n");
     test_siphash_and_init();
@@ -414,6 +497,7 @@ int main(void) {
     test_rrl_rate_limiting_and_slip();
     test_rrl_client_exhaustion_and_shutdown();
     test_rrl_bind_keys();
+    test_rrl_bind_balance();
     printf("=== All RRL Engine Unit Tests PASSED ===\n");
     return 0;
 }

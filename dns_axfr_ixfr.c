@@ -1976,6 +1976,13 @@ static int axfr_emit_zone_record(axfr_emit_ctx_t *ec, const dns_record_t *rec_it
   return axfr_emit_zone_item(ec, rec_item, NULL, 0);
 }
 
+/* The SOA that opens the deleted or the added part of an IXFR difference (RFC 1995 §4): sent as it is (not wrapped), but in an Extended
+ * transfer the LOC / ECS state is set to the SOA's own tags first, so that it does not take the tag of the RR sent before it. */
+static int axfr_emit_ixfr_soa(axfr_emit_ctx_t *ec, const dns_record_t *soa) {
+  if (ec->is_extended_axfr && xext_select(&ec->xe, soa->bind_location_tag, soa->ecs_subnet_tag) < 0) return -1;
+  return axfr_emit_record(ec, soa);
+}
+
 /* 転送要求への1通だけのエラー応答 (RFC 5936 §2.2: 質問セクションを写し、それで転送を終える)。
  * 質問セクションまで (写す数は BIND と同じ: dns_error_qd_echo()) で切り (Rule 3)、要求に OPT があれば OPT と、send_ede (send-extended-errors) なら
  * EDE を付け (RFC 6891 §6.1.1、RFC 8914)、検証できた TSIG があれば同じ鍵で署名する (RFC 8945 §5.3)。aa は応答の AA ビット。
@@ -2509,7 +2516,7 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
         if (txn->deleted[i].type_code == 6) { soa_del_idx = i; break; }
       }
       if (soa_del_idx >= 0) {
-        if (axfr_emit_record(&ec, &txn->deleted[soa_del_idx]) < 0) goto axfr_error;
+        if (axfr_emit_ixfr_soa(&ec, &txn->deleted[soa_del_idx]) < 0) goto axfr_error;
       }
       for (int i = 0; i < txn->deleted_count; i++) {
         if (i == soa_del_idx) continue;
@@ -2520,7 +2527,7 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
         if (txn->added[i].type_code == 6) { soa_add_idx = i; break; }
       }
       if (soa_add_idx >= 0) {
-        if (axfr_emit_record(&ec, &txn->added[soa_add_idx]) < 0) goto axfr_error;
+        if (axfr_emit_ixfr_soa(&ec, &txn->added[soa_add_idx]) < 0) goto axfr_error;
       }
       for (int i = 0; i < txn->added_count; i++) {
         if (i == soa_add_idx) continue;

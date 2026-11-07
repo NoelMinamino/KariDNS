@@ -827,7 +827,9 @@ static int pg_list_zones(db_conn_t *c, db_zone_cb cb, void *ud) {
     if (ret != 0) return ret;
     ret = pg_scan(c, "list_zones", PG_ZONE_SELECT "ORDER BY d.id, r.id", 0, NULL, zl_row, &z);
     if (ret == 0 || ret == DB_STOPPED) {
-        int rc = exec_cmd(c, "RESET cursor_tuple_fraction", "list_zones");
+        /* back to the session's value (1, set at connect) for the rest of the snapshot: RESET would give the server's
+         * default (0.1) to the bulk scans that follow in this transaction (review db_pgsql [1.1]) */
+        int rc = exec_cmd(c, "SET LOCAL cursor_tuple_fraction = 1", "list_zones");
         if (ret == 0) ret = rc;
     }
     return ret;

@@ -320,6 +320,21 @@ else
     fi
 fi
 
+# M4: the refused instance leaves the running one's PID file alone, also as a daemon (the refusal comes before daemonize(): exit status 1, not 0)
+echo -n "The PID file still names the primary instance ... "
+if [ -f "$SHARED_PID_FILE" ] && [ "$(tr -d '\n' < "$SHARED_PID_FILE")" = "$PRIM_PID" ]; then echo "OK"
+else echo "FAILED (pid file: '$(cat "$SHARED_PID_FILE" 2>/dev/null)', primary $PRIM_PID)"; FAILED=$((FAILED + 1)); fi
+echo -n "Attempting a duplicate daemon (no -f) with the same PID file (must exit non-zero) ... "
+rc=0; "$KARIDNS" -P "$SHARED_PID_FILE" "$TMP_DIR/server2.conf" > "$TMP_DIR/dupd.log" 2>&1 || rc=$?
+if [ "$rc" -ne 0 ] && grep -q -i "already running" "$TMP_DIR/dupd.log"; then echo "OK (exit $rc)"
+else echo "FAILED (exit $rc)"; cat "$TMP_DIR/dupd.log"; FAILED=$((FAILED + 1)); kari_kill_conf "$TMP_DIR/server2.conf"; fi
+# M4: a second instance with another PID file but the same control socket is refused and does not take the socket over
+echo -n "Attempting a duplicate on the primary's control socket (must be rejected, the socket keeps answering) ... "
+rc=0; "$KARIDNS" -f -P "$TMP_DIR/other.pid" "$TMP_DIR/server1.conf" > "$TMP_DIR/dups.log" 2>&1 || rc=$?
+STATUS1=$("$KARICTL" -f "$TMP_DIR/karictl.conf" -s "$TMP_DIR/ctl1.sock" status 2>&1 || true)
+if [ "$rc" -ne 0 ] && grep -q "control socket .* answers" "$TMP_DIR/dups.log" && echo "$STATUS1" | grep -q "server is up and running"; then echo "OK (exit $rc)"
+else echo "FAILED (exit $rc; status: $STATUS1)"; cat "$TMP_DIR/dups.log"; FAILED=$((FAILED + 1)); fi
+
 # Stop primary instance
 kari_kill_tree "$PRIM_PID"
 PRIM_PID=""

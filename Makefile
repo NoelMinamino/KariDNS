@@ -166,7 +166,11 @@ KARICHECK_CODELOG_SRCS = tools/karicheck.c dns_config_parser.c dns_zone_parser.c
 karicheck-codelog: $(KARICHECK_CODELOG_SRCS)
 	$(CC) $(CFLAGS) -DKARIDNS_DIAG_CODELOG $(KARICHECK_CODELOG_SRCS) -o karicheck-codelog $(LDFLAGS) -lcrypto
 
-$(OBJS) $(DAG_OBJS) $(KARICTL_OBJS): dns_wire.h dns_config_parser.h dns_diag.h dns_diag_codes.h dns_zone_parser.h dns_utils.h dns_zone_image.h dns_alias.h
+# Every object depends on every header (review Makefile [1]): coarse, but a change of a struct in any header rebuilds
+# what uses it (the list named 8 headers, and a stale object with an old struct layout links without a word).
+HDRS != ls *.h tools/*.h tests/*.h 2>/dev/null
+ALL_C != ls *.c tools/*.c tests/*.c tests/fuzz/*.c 2>/dev/null
+$(ALL_C:.c=.o) $(ALL_C:.c=.uta.o) $(ALL_C:.c=.utn.o) $(ALL_C:.c=.fz.o) $(ALL_C:.c=.asan.o) $(ALL_C:.c=.tsan.o) $(ALL_C:.c=.ev.o): $(HDRS)
 
 .SUFFIXES: .c .o
 

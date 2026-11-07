@@ -44,7 +44,7 @@ zone "rrl.test" {
 };
 EOF
 
-echo "[*] Starting KariDNS with RRL (rps=5, window=3 -> capacity=15)..."
+echo "[*] Starting KariDNS with RRL (rps=5, window=3: start at 5, down to -15)..."
 $BIN -f -c "$CONF" > "$DIR/server_rrl.log" 2>&1 &
 SERVER_PID=$!
 
@@ -99,39 +99,43 @@ send_instant_burst() {
     ' "$1" "${2:-1}"
 }
 
-# 1. Initial burst of 25 queries (capacity is 15 -> exactly 15 accepted, 10 dropped)
+# The balance follows BIND 9 (lib/dns/rrl.c debit_rrl_entry()): a key starts at `responses-per-second` and its balance is
+# capped there (one second of responses); every response is debited, also a limited one, down to -window*rate; the
+# balance is credited by the rate per second; a key unused for longer than the window starts again at the rate.
+
+# 1. Initial burst of 25 queries (start at the rate: 5 accepted; the balance goes down to -15 = -window*rate)
 echo "[*] Step 1: Sending initial instant burst of 25 queries (NOERROR)..."
 BURST1_RES=$(send_instant_burst 25 1)
-echo "[*] Step 1 responses received: $BURST1_RES / 25 (expected 15)"
+echo "[*] Step 1 responses received: $BURST1_RES / 25 (expected 5)"
 
-if [ "$BURST1_RES" -lt 15 ] || [ "$BURST1_RES" -gt 16 ]; then
-    echo "[FAIL] Expected 15 responses for burst (rps=5, window=3), but received $BURST1_RES!"
+if [ "$BURST1_RES" -lt 5 ] || [ "$BURST1_RES" -gt 6 ]; then
+    echo "[FAIL] Expected 5 responses for the first burst (rps=5), but received $BURST1_RES!"
     exit 1
 fi
 
-# 2. Wait 3.5 seconds (full window refill to max capacity 15 tokens)
-echo "[*] Step 2: Waiting 3.5s for full window refill..."
+# 2. Wait 3.5 seconds (longer than the window: the key starts again at the rate)
+echo "[*] Step 2: Waiting 3.5s (longer than the window)..."
 sleep 3.5
 
-echo "[*] Step 2: Sending second instant burst of 25 queries after full refill..."
+echo "[*] Step 2: Sending second instant burst of 25 queries..."
 BURST2_RES=$(send_instant_burst 25 1)
-echo "[*] Step 2 responses received: $BURST2_RES / 25 (expected 15)"
+echo "[*] Step 2 responses received: $BURST2_RES / 25 (expected 5)"
 
-if [ "$BURST2_RES" -lt 15 ] || [ "$BURST2_RES" -gt 16 ]; then
-    echo "[FAIL] Expected 15 responses after full window refill, but received $BURST2_RES!"
+if [ "$BURST2_RES" -lt 5 ] || [ "$BURST2_RES" -gt 6 ]; then
+    echo "[FAIL] Expected 5 responses after the window, but received $BURST2_RES!"
     exit 1
 fi
 
-# 3. Wait 1.0 second (partial refill: exactly 5 tokens at 5 rps)
-echo "[*] Step 3: Waiting 1.0s for partial refill (5 tokens)..."
+# 3. Wait 1.0 second: +5 on a balance of -15 is still negative, so a client that kept sending stays limited
+echo "[*] Step 3: Waiting 1.0s (the balance is -15 + 5)..."
 sleep 1.0
 
-echo "[*] Step 3: Sending instant burst of 10 queries after 1.0s partial refill..."
+echo "[*] Step 3: Sending instant burst of 10 queries..."
 BURST3_RES=$(send_instant_burst 10 1)
-echo "[*] Step 3 responses received: $BURST3_RES / 10 (expected 5)"
+echo "[*] Step 3 responses received: $BURST3_RES / 10 (expected 0)"
 
-if [ "$BURST3_RES" -lt 5 ] || [ "$BURST3_RES" -gt 6 ]; then
-    echo "[FAIL] Expected 5 responses after 1.0s refill (5 rps), but received $BURST3_RES!"
+if [ "$BURST3_RES" -gt 1 ]; then
+    echo "[FAIL] Expected no response 1.0s after a burst that took the balance to -window*rate, but received $BURST3_RES!"
     exit 1
 fi
 
@@ -163,23 +167,23 @@ $BIN -f -c "$CONF" > "$DIR/server_rrl.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
 
-# 4a. NODATA burst test (qtype 28 AAAA on www.rrl.test -> NODATA: cap = 3 rps * 2s = 6 tokens)
+# 4a. NODATA burst test (qtype 28 AAAA on www.rrl.test -> NODATA: the rate: 3)
 echo "[*] Step 4a: Sending burst of 20 NODATA queries (qtype=28 AAAA)..."
 NODATA_RES=$(send_instant_burst 20 28)
-echo "[*] Step 4a NODATA responses received: $NODATA_RES / 20 (expected 6)"
+echo "[*] Step 4a NODATA responses received: $NODATA_RES / 20 (expected 3)"
 
-if [ "$NODATA_RES" -lt 6 ] || [ "$NODATA_RES" -gt 7 ]; then
-    echo "[FAIL] Expected 6 responses for NODATA burst (nodata_rps=3, window=2), but received $NODATA_RES!"
+if [ "$NODATA_RES" -lt 3 ] || [ "$NODATA_RES" -gt 4 ]; then
+    echo "[FAIL] Expected 3 responses for NODATA burst (nodata_rps=3), but received $NODATA_RES!"
     exit 1
 fi
 
-# 4b. NOERROR burst test (qtype 1 A on www.rrl.test -> NOERROR: cap = 10 rps * 2s = 20 tokens)
+# 4b. NOERROR burst test (qtype 1 A on www.rrl.test -> NOERROR: the rate: 10)
 echo "[*] Step 4b: Sending burst of 30 NOERROR queries (qtype=1 A)..."
 NOERROR_RES=$(send_instant_burst 30 1)
-echo "[*] Step 4b NOERROR responses received: $NOERROR_RES / 30 (expected 20)"
+echo "[*] Step 4b NOERROR responses received: $NOERROR_RES / 30 (expected 10)"
 
-if [ "$NOERROR_RES" -lt 20 ] || [ "$NOERROR_RES" -gt 21 ]; then
-    echo "[FAIL] Expected 20 responses for NOERROR burst (responses_rps=10, window=2), but received $NOERROR_RES!"
+if [ "$NOERROR_RES" -lt 10 ] || [ "$NOERROR_RES" -gt 11 ]; then
+    echo "[FAIL] Expected 10 responses for NOERROR burst (responses_rps=10), but received $NOERROR_RES!"
     exit 1
 fi
 

@@ -835,6 +835,7 @@ typedef struct program_plugin {
   bool disable_auto_tc_flag;
   _Atomic unsigned int consecutive_failures;
   _Atomic bool dead;        /* max_failures超過、またはexec失敗でtrueになったら以後SERVFAIL固定 */
+  bool resync;             /* a query failed: drop what the pipe holds before the next one (under lock) */
   char config_fingerprint[512]; /* M-4: reload時の設定変更検知用 */
 } program_plugin_t;
 
@@ -1433,9 +1434,11 @@ void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd);
 void backend_sig_handler(int sig);
 void supervisor_sig_handler(int sig);
 void cleanup_pid_file(void);
+bool control_socket_in_use(const char *path);
 void daemonize(void);
 void setup_ipc_tables(int num_workers);
 void run_frontend_router(pid_t backend_pid, int router_id);
+int allowed_cpu(int index);
 void *worker_thread_func(void *arg);
 #endif
 

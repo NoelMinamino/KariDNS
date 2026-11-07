@@ -205,10 +205,6 @@ bool db_sup_init(db_sup_t *s, const server_config_t *cfg, char *err, size_t errl
     snprintf(err, errlen, "database loader: %s", tmp);
     return false;
   }
-  if (geteuid() == 0 && s->id.has_group && !s->id.has_user) {
-    snprintf(err, errlen, "database loader: loader-group without loader-user would leave the loader running as root");
-    return false;
-  }
   snprintf(s->path, sizeof(s->path), "%s", db_loader_path(cfg));
   snprintf(s->state_file, sizeof(s->state_file), "%s", cfg->database.loader_state_file ? cfg->database.loader_state_file : "");
   if (!check_loader_path(s->path, err, errlen)) return false;

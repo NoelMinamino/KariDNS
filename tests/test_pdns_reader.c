@@ -995,6 +995,17 @@ static void test_metadata(void) {
         /* PowerDNS requires address AND key (D14, B7a): update-acl-match all, no warning, not closed */
         db_meta_row_t m3[] = { M("TSIG-ALLOW-DNSUPDATE", "upd"), M("ALLOW-DNSUPDATE-FROM", "192.0.2.0/24") };
         expect_settings("allow-update both", m3, 2, "allow-update { 192.0.2.0/24; key \"upd\"; }; update-acl-match all;", 0);
+        /* review pdns_reader [1]: a kind whose rows are all unusable allows nobody; the other kind alone would allow
+         * more than was written (any address with the key / any key from the address) */
+        db_meta_row_t m4[] = { M("TSIG-ALLOW-DNSUPDATE", "upd"), M("ALLOW-DNSUPDATE-FROM", "AUTO-NS") };
+        expect_settings("allow-update keys, addresses all invalid", m4, 2, "allow-update { none; };", 2);
+        db_meta_row_t m5[] = { M("TSIG-ALLOW-DNSUPDATE", "bad key;"), M("ALLOW-DNSUPDATE-FROM", "192.0.2.0/24") };
+        expect_settings("allow-update addresses, keys all invalid", m5, 2, "allow-update { none; };", 2);
+        /* one invalid row beside a valid one of the same kind: the valid one stays */
+        db_meta_row_t m6[] = { M("TSIG-ALLOW-DNSUPDATE", "upd"), M("ALLOW-DNSUPDATE-FROM", "AUTO-NS"),
+                               M("ALLOW-DNSUPDATE-FROM", "192.0.2.0/24") };
+        expect_settings("allow-update one invalid address", m6, 3,
+                        "allow-update { 192.0.2.0/24; key \"upd\"; }; update-acl-match all;", 1);
     }
     {
         db_meta_row_t m[] = { M("AXFR-MASTER-TSIG", "master-key"), M("AXFR-MASTER-TSIG", "other") };
