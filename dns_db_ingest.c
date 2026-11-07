@@ -47,6 +47,7 @@ _Static_assert(ZDIR_APEX_GLUE_PER_NS == KDB_NOTIFY_ADDR_PER_NS && ZDIR_APEX_NADD
 #define ING_MAX_OUT (32u << 20)  /* queued answers the loader has not read: above this the loader is dropped */
 #define ING_ZONES_LOGGED 16       /* zones logged one by one per connection */
 #define ING_REJECTS_LOGGED 100    /* rejected zones logged one by one per batch */
+#define ING_VIEW_HIST 8           /* view tables of earlier CONFIGs kept for a batch the loader began with one of them */
 #define ING_READ_ROUNDS 16
 #define ING_EVT_CONFIG 1          /* EVFILT_USER idents of the main kqueue */
 #define ING_EVT_RESULT 2
@@ -181,7 +182,13 @@ typedef struct {
   size_t nprof, cprof, prof_bytes;
   /* batch */
   bool in_batch;
-  bool config_pending;         /* karidns.conf was reloaded during a batch: CONFIG goes out at its end (review db_ingest [1]) */
+  /* review db_ingest [1]: CONFIG renumbers the views, and the loader adopts a CONFIG only between two batches, so a batch
+   * that started before it had read the newest one carries the numbers of an older one.  BATCH_BEGIN says which (tag 5);
+   * the batch reads its view numbers in a copy of that CONFIG's table: the current one or one of the last ING_VIEW_HIST. */
+  uint64_t view_gen;           /* the CONFIG generation view_names was built for */
+  struct { uint64_t gen; uint32_t n; char (*names)[KARIDNS_VIEW_NAME_MAX]; } vhist[ING_VIEW_HIST];
+  char (*b_names)[KARIDNS_VIEW_NAME_MAX];   /* the table of the batch in progress (a copy) */
+  uint32_t b_n;
   uint64_t batch_id;
   uint8_t batch_kind;
   uint32_t b_applied, b_rejected, b_shadowed, b_deleted, b_failed;
@@ -554,7 +561,14 @@ static bool build_config(ing_t *g, ing_cfg_t *snap) {
     const database_config_t *db = &cfg->database;
     bool sqlite = db->driver && strcmp(db->driver, "sqlite3") == 0;
     fill_snap(cfg, snap);
-    free(g->view_names);
+    if (g->view_names) {   /* the table of the previous CONFIG goes to the history (the loader may still read with it) */
+      free(g->vhist[ING_VIEW_HIST - 1].names);
+      memmove(&g->vhist[1], &g->vhist[0], (ING_VIEW_HIST - 1) * sizeof(g->vhist[0]));
+      g->vhist[0].gen = g->view_gen;
+      g->vhist[0].n = g->nview_names;
+      g->vhist[0].names = g->view_names;
+    }
+    g->view_gen = cfg->generation;
     free(g->view_db);
     g->view_names = snap->nviews ? calloc(snap->nviews, sizeof(*g->view_names)) : NULL;
     g->view_db = snap->nviews ? calloc(snap->nviews, 1) : NULL;
@@ -596,6 +610,53 @@ static bool build_config(ing_t *g, ing_cfg_t *snap) {
   }
   rcu_aux_read_unlock();
   return ok;
+}
+
+/* BATCH_BEGIN: the view numbers of the batch are those of the CONFIG the loader made it with (gen; 0 = not said: the
+ * newest).  A copy, so that CONFIGs sent during the batch do not change it.  The state machine checks the view numbers
+ * of the batch against that table. */
+static void batch_table_begin(ing_t *g, uint64_t gen) {
+  free(g->b_names);
+  g->b_names = NULL;
+  g->b_n = 0;
+  char (*src)[KARIDNS_VIEW_NAME_MAX] = g->view_names;
+  uint32_t n = g->nview_names;
+  if (gen != 0 && gen != g->view_gen) {
+    src = NULL;
+    for (int i = 0; i < ING_VIEW_HIST && !src; i++)
+      if (g->vhist[i].names && g->vhist[i].gen == gen) {
+        src = g->vhist[i].names;
+        n = g->vhist[i].n;
+      }
+    if (!src) {   /* older than every table kept: no view number of this batch can be trusted */
+      syslog(LOG_ERR, "[DB] batch %llu was made with CONFIG generation %llu, which is no longer known; its zones are not "
+                      "installed (the next reload sends them again)", (unsigned long long)g->batch_id, (unsigned long long)gen);
+      n = 0;
+    } else {
+      syslog(LOG_INFO, "[DB] batch %llu numbers its views as CONFIG generation %llu did (the newest sent is %llu)",
+             (unsigned long long)g->batch_id, (unsigned long long)gen, (unsigned long long)g->view_gen);
+    }
+  }
+  if (src && n > 0) {
+    g->b_names = malloc((size_t)n * sizeof(*g->b_names));
+    if (g->b_names) {
+      memcpy(g->b_names, src, (size_t)n * sizeof(*g->b_names));
+      g->b_n = n;
+    } else {
+      syslog(LOG_ERR, "[DB] out of memory for the view table of batch %llu; its zones are not installed",
+             (unsigned long long)g->batch_id);
+    }
+  }
+  /* a batch whose table is not known: its zones are rejected one by one ("the view is not in the configuration"), the
+   * stream stays */
+  g->sm.lim.view_count = g->b_n ? g->b_n : g->nview_names;
+}
+
+static void batch_table_end(ing_t *g) {
+  free(g->b_names);
+  g->b_names = NULL;
+  g->b_n = 0;
+  g->sm.lim.view_count = g->nview_names;
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -1436,6 +1497,7 @@ static void cleanup_stream_state(ing_t *g) {
   job_free(g->cur);
   g->cur = NULL;
   g->in_batch = false;
+  batch_table_end(g);
   clear_profiles(g);
   drain_all(g);
   apply_delta(g);
@@ -1444,18 +1506,19 @@ static void cleanup_stream_state(ing_t *g) {
 
 static void send_config(ing_t *g, const char *why) {
   ing_cfg_t snap;
-  g->config_pending = false;
   if (!build_config(g, &snap)) {
     syslog(LOG_ERR, "[DB] cannot build CONFIG for the loader (no database block, or more than %d views); "
                     "closing the stream", KDB_MAX_CONFIG_VIEWS);
     drop_stream(g);
     return;
   }
-  /* the state machine checks view indexes and limits against the configuration it was sent */
-  g->sm.lim.view_count = snap.nviews;
+  /* the state machine checks view indexes and limits against the configuration it was sent; a batch in progress keeps
+   * the view count of its own CONFIG (batch_table_begin) */
+  if (!g->in_batch) g->sm.lim.view_count = snap.nviews;
   g->sm.lim.max_zone_records = snap.max_zone_records;
   g->sm.lim.max_zone_bytes = snap.max_zone_bytes;
   g->fsm.lim = g->sm.lim;                  /* the fetch stream's machine checks against the same configuration */
+  g->fsm.lim.view_count = snap.nviews;     /* (the newest one, also during a batch of the first stream) */
   syslog(LOG_INFO, "[DB] sent CONFIG generation %llu to the loader (%s): driver %s, %u view(s)",
          (unsigned long long)snap.generation, why, snap.driver, snap.nviews);
   send_enc(g);
@@ -1591,6 +1654,7 @@ static void on_batch_begin(ing_t *g, const kdb_msg_t *m) {
   drain_all(g);
   g->in_batch = true;
   g->batch_id = m->u.batch_begin.batch_id;
+  batch_table_begin(g, m->u.batch_begin.cfg_generation);
   g->batch_kind = m->u.batch_begin.kind;
   g->b_applied = g->b_rejected = g->b_shadowed = g->b_deleted = g->b_failed = 0;
   clear_profiles(g);                                     /* B7a: the profiles of the previous batch */
@@ -1719,8 +1783,15 @@ static zdir_apex_t *apex_from_begin(const kdb_zone_begin_t *zb, bool want_naddr)
   return a;
 }
 
+/* The name of view number v as the loader meant it ("" = none): a zone message of a batch reads the table of the batch's
+ * CONFIG (batch_table_begin), the fetch stream the newest one (its requests name the views of the newest CONFIG). */
+static const char *view_name_at(const ing_t *g, uint32_t v, bool of_batch) {
+  if (of_batch && g->in_batch) return v < g->b_n ? g->b_names[v] : "";
+  return v < g->nview_names ? g->view_names[v] : "";
+}
+
 /* the job of a ZONE_BEGIN (either stream), with its settings resolved; NULL: out of memory */
-static ing_job_t *job_from_begin(ing_t *g, const kdb_zone_begin_t *zb) {
+static ing_job_t *job_from_begin(ing_t *g, const kdb_zone_begin_t *zb, bool of_batch) {
   ing_job_t *j = calloc(1, sizeof(*j));
   if (!j) return NULL;
   j->view = zb->view;
@@ -1730,7 +1801,7 @@ static ing_job_t *job_from_begin(ing_t *g, const kdb_zone_begin_t *zb) {
   j->rr_count = zb->rr_count;
   j->fetch_id = zb->request_id;
   memcpy(j->digest, zb->digest, KDB_DIGEST_LEN);
-  if (zb->view < g->nview_names) snprintf(j->view_name, sizeof(j->view_name), "%s", g->view_names[zb->view]);
+  snprintf(j->view_name, sizeof(j->view_name), "%s", view_name_at(g, zb->view, of_batch));
   if (j->view_name[0] == '\0') {
     j->skip = true;
     job_reject(j, "the view is not in the configuration");
@@ -1794,7 +1865,7 @@ static ing_job_t *job_from_begin(ing_t *g, const kdb_zone_begin_t *zb) {
 }
 
 static void on_zone_begin(ing_t *g, const kdb_msg_t *m) {
-  ing_job_t *j = job_from_begin(g, &m->u.zone_begin);
+  ing_job_t *j = job_from_begin(g, &m->u.zone_begin, true);
   if (!j) {
     syslog(LOG_ERR, "[DB] out of memory; closing the stream");
     drop_stream(g);
@@ -1853,10 +1924,11 @@ static void on_zone_failed(ing_t *g, const kdb_msg_t *m) {
   atomic_fetch_add_explicit(&g_st.tot_failed, 1, memory_order_relaxed);
   syslog(LOG_WARNING, "[DB] the loader could not read zone '%s' (view %u, id %lld): %s", zf->name,
          (unsigned)zf->view, (long long)zf->source_id, reason);
-  if (zf->view < g->nview_names && g->view_names[zf->view][0]) {
+  const char *vname = view_name_at(g, zf->view, true);
+  if (vname[0]) {
     /* a zone of the same name in flight must be finished first (it would race on the record) */
     drain_all(g);
-    (void)dbreg_reject(g->view_names[zf->view], zf->name, zf->source_id, reason);
+    (void)dbreg_reject(vname, zf->name, zf->source_id, reason);
   }
   if (g->cur_req >= 0 && g->reqs[g->cur_req].view == zf->view && domain_names_match_ci(g->reqs[g->cur_req].zone, zf->name)) {
     g->req_outcome = ROUT_FAILED;
@@ -1867,16 +1939,17 @@ static void on_zone_failed(ing_t *g, const kdb_msg_t *m) {
 static void on_zone_delete(ing_t *g, const kdb_msg_t *m) {
   const kdb_zone_delete_t *zd = &m->u.zone_delete;
   uint8_t st = KDB_ST_UNCHANGED;
-  if (zd->view < g->nview_names && g->view_names[zd->view][0]) {
+  const char *vname = view_name_at(g, zd->view, true);
+  if (vname[0]) {
     drain_all(g);                                        /* a zone of the same name may be in flight */
-    int r = dbreg_delete(g->view_names[zd->view], zd->name, zd->source_id);
+    int r = dbreg_delete(vname, zd->name, zd->source_id);
     if (r > 0) {
       st = KDB_ST_DELETED;
       if (g->cur_req >= 0 && g->reqs[g->cur_req].view == zd->view && domain_names_match_ci(g->reqs[g->cur_req].zone, zd->name))
         g->req_outcome = ROUT_DELETED;
       g->b_deleted++;
       atomic_fetch_add_explicit(&g_st.tot_deleted, 1, memory_order_relaxed);
-      syslog(LOG_INFO, "[DB] zone '%s' (view '%s') deleted", zd->name, g->view_names[zd->view]);
+      syslog(LOG_INFO, "[DB] zone '%s' (view '%s') deleted", zd->name, vname);
     } else if (r == 0) {
       syslog(LOG_NOTICE, "[DB] delete of zone '%s' (view %u, id %lld) ignored: not registered with that id",
              zd->name, (unsigned)zd->view, (long long)zd->source_id);
@@ -1907,10 +1980,7 @@ static void on_batch_end(ing_t *g, const kdb_msg_t *m) {
   }
   answer_request(g);
   g->in_batch = false;
-  if (g->config_pending) {
-    send_config(g, "configuration reloaded during the batch");
-    if (g->stream_fd < 0) return;
-  }
+  batch_table_end(g);
   kdb_enc_reset(&g->enc);
   if (kdb_enc_begin(&g->enc, KDB_T_BATCH_RESULT) != 0 || kdb_enc_u64(&g->enc, 1, b->batch_id) != 0 ||
       kdb_enc_u32(&g->enc, 3, g->b_applied + g->b_shadowed) != 0 || kdb_enc_u32(&g->enc, 4, 0) != 0 ||
@@ -2292,14 +2362,8 @@ static void on_config_event(ing_t *g) {
   atomic_store_explicit(&g_apex_walking, true, memory_order_relaxed);
   atomic_fetch_add_explicit(&g_apex_walks, 1, memory_order_relaxed);
   memset(&g->apex_cur, 0, sizeof(g->apex_cur));
-  /* review db_ingest [1]: CONFIG renumbers the views (build_config), and the loader adopts it only between two batches:
-   * during a batch the ZONE_BEGIN / ZONE_FAILED / ZONE_DELETE still to come carry the indexes of the CONFIG the batch was
-   * made with, so the new one is sent when the batch ends (on_batch_end, before BATCH_RESULT: the loader has read it
-   * when it starts its next batch) */
-  if (g->stream_fd >= 0 && g->hello_done) {
-    if (g->in_batch) g->config_pending = true;
-    else send_config(g, "configuration reloaded");
-  }
+  /* a batch in progress keeps the view numbers of its own CONFIG (b_names, review db_ingest [1]) */
+  if (g->stream_fd >= 0 && g->hello_done) send_config(g, "configuration reloaded");
   /* otherwise the CONFIG of the handshake reads the new configuration */
 }
 
@@ -2985,7 +3049,7 @@ static void on_fetch_begin(ing_t *g, const kdb_zone_begin_t *zb) {
     return;
   }
   prof_swap(g);
-  ing_job_t *j = job_from_begin(g, zb);
+  ing_job_t *j = job_from_begin(g, zb, false);
   prof_swap(g);
   if (!j) {
     syslog(LOG_ERR, "[DB] out of memory; closing the fetch stream");

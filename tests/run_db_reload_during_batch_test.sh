@@ -5,11 +5,12 @@
 # CONFIG numbers the views by their position in karidns.conf, and ZONE_BEGIN names its view by that number.  The loader
 # adopts a new CONFIG only between two batches, so the zones still to come in a running batch carry the numbers of the
 # old one.  The Backend used to rebuild its table of view numbers as soon as it sent the new CONFIG: a reconfig that
-# swaps two views during a batch put the rest of the batch into the other view.  Now the CONFIG is sent when the batch
-# ends (before BATCH_RESULT, so that the loader has it before its next batch).
+# swaps two views during a batch (or between the handshake and the first BATCH_BEGIN) put the batch into the other view.
+# Now BATCH_BEGIN says which CONFIG generation the batch numbers its views with, and the Backend reads them in that
+# CONFIG's table (it keeps the last few).
 #   - view "a" (127.0.0.2) reads a.db with 30000 zones, view "b" (127.0.0.3) reads b.db with one zone;
 #   - right after the start (the startup batch is running) karidns.conf is rewritten with b before a and `karictl reconfig`;
-#   - the log says that the CONFIG waited for the end of the batch;
+#   - when the reconfig came before the batch was done, the log says the batch kept the older numbering;
 #   - the last zone of a.db is in view a only, and answers there; b.db's zone is in view b only.
 #
 # Needs root (the server starts as root and drops to nobody; loopback aliases 127.0.0.2-3 are added and removed).  SKIP
@@ -109,10 +110,10 @@ printf '%s\n' "$OUT" | grep -q "^OK" && pass "reconfig: $OUT" || fail "reconfig:
 if kari_wait_log "$T/srv.log" "\[DB\] initial load complete" 120; then pass "the startup batch is complete"; else fail "no 'initial load complete' line"; tail -20 "$T/srv.log" | sed 's/^/         /'; fi
 cfg_line=$(grep -n "sent CONFIG generation .* (configuration reloaded)" "$T/srv.log" | head -1 | cut -d: -f1)
 done_line=$(grep -n "\[DB\] batch 1 complete" "$T/srv.log" | head -1 | cut -d: -f1)
-if grep -q "sent CONFIG generation .* (configuration reloaded during the batch)" "$T/srv.log"; then
-    pass "the CONFIG of the reconfig waited for the end of the batch"
+if grep -q "\[DB\] batch 1 numbers its views as CONFIG generation" "$T/srv.log"; then
+    pass "the startup batch kept the numbering of the CONFIG it was made with"
 elif [ -n "$cfg_line" ] && [ -n "$done_line" ] && [ "$cfg_line" -lt "$done_line" ]; then
-    fail "the CONFIG of the reconfig was sent during the batch (log line $cfg_line, batch end $done_line)"
+    pass "the CONFIG came after BATCH_BEGIN (log line $cfg_line, batch end $done_line): the batch kept the table it began with"
 else
     echo "  [INFO] the reconfig did not come during the batch (the batch was too short): the placement checks still run"
 fi
