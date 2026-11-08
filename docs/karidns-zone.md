@@ -16,6 +16,7 @@ karidns-zone export --all --dir <dir> [options]
 karidns-zone apply [options] --changes <file|-> <zone>
 karidns-zone apply [options] --zone-file <file|-> [--delete-others] <zone>
 karidns-zone --types-list [--json]
+karidns-zone render --json <zone>
 karidns-zone --version | -h | --help
 ```
 
@@ -163,6 +164,27 @@ delete <owner> <type>
 
 **`--types-list`** prints the record types a change file may name, one per line (with `--json`: the key `types`, `"command": "types"`).
 
+### render (0.6.0 item F, the WebAdmin GUI)
+
+`karidns-zone render --json <zone>` turns **stored PowerDNS records** into the text a change file takes as `rdata`. It reads no database and no configuration: it is a filter, and it is what the WebAdmin API runs (one run for a page of RRsets) for `GET .../rrsets?rdata=1`, so that what a client read can be sent back in a change set unchanged. The stored form (`records.content`) is not that form: names have no final dot (the change file reads them relative to the zone), and the priority of MX and SRV is in a column of its own.
+
+Standard input has one record a line, four fields separated by one TAB, lines ended by LF (the last may lack it):
+
+```text
+<owner> TAB <type> TAB <prio> TAB <content>
+```
+
+`owner` and `type` are `records.name` and `records.type`, `prio` is `records.prio` as decimal digits (an optional `-` sign) or `-` for NULL, `content` is `records.content`, the rest of the line (it may hold TABs). A line that does not have this shape, or more than 200,000 lines, refuses the whole input (exit status 1, `db.render.input`, nothing on standard output but the document); it is the caller's mistake. A record that the loader's reader refuses is not: each record is judged alone.
+
+Each record is read as the loader reads a row (`dns_pdns_reader.c`: the line-safety rules of RFC 1035 section 5.1, the priority of MX and SRV put in front, the zone parser), inside a zone of its own for `<zone>`, and written by the zone-file writer of the exporter (`dns_zone_text.c`: every name absolute, the root name as `.`, strings quoted and escaped, RFC 3597 generic form for the types that have none). The text is given only if it **reads back as the same record**: it is read again, as a record with the priority in its content (the way a change set brings it back), and must be the same type and the same canonical RDATA (RFC 4034 section 6.2). There is no second RDATA parser. PowerDNS `ALIAS` and `LUA` have no text of their own and are refused (shown as stored).
+
+```json
+"render": { "rdata": [ "10 mail2.example.test.", null, "\"hello\" \"wor ld\"" ],
+            "errors": [ { "index": 1, "text": "invalid IPv4 address literal in A record" } ] }
+```
+
+`rdata` has one entry for each input line, in order: the text, or `null`; `errors` says why for each `null` (the reader's reason without the zone or the row; `index` counts from 0). The exit status is 0 when the input was understood, whatever became of the records. `--json` is required, and no other option is (the answer is a document of the schema of `karicheck --json`, `"command": "render"`). The input path is fuzzed (`tests/fuzz/fuzz_zone_changes.c`, which also checks that a rendered text is one safe line that renders again, to a fixed point).
+
 ## OPTIONS
 
 `-c`, `--config FILE`
@@ -266,7 +288,7 @@ The BIND text is `$ORIGIN`, `$TTL` (the TTL most records have), the tag definiti
 
 ## JSON OUTPUT
 
-`karidns-zone --json <command> ...` writes the document of [`karicheck --json`](karicheck.md#json-output) with the first key `"karidns-zone": 1` and `"command": "import"`, `"export"`, `"apply"` or `"types"`; `import --signer` adds the key `signer` after `zones` (above), `apply` the key `apply` (above), `--types-list` the key `types`; `messages[]`, `counts` and `zones[]` are as there (`zones[]` has one entry per zone imported or exported; `format` is `bind`, `tinydns`, or `database` for a zone that failed before its format was known; `file` is the input or output file). Standard output carries only the document, standard error nothing; the exit status is the one of the text mode. The codes are those of [`karicheck(1)`](karicheck.md) (`usage.*`, `io.*`, `conf.*`, `zone.*`, `db.import.*`, `db.export.*`, `db.zone.*`; the list is in the manual of `karicheck`).
+`karidns-zone --json <command> ...` writes the document of [`karicheck --json`](karicheck.md#json-output) with the first key `"karidns-zone": 1` and `"command": "import"`, `"export"`, `"apply"`, `"render"` or `"types"`; `import --signer` adds the key `signer` after `zones` (above), `apply` the key `apply` (above), `render` the key `render` (above), `--types-list` the key `types`; `messages[]`, `counts` and `zones[]` are as there (`zones[]` has one entry per zone imported or exported; `format` is `bind`, `tinydns`, or `database` for a zone that failed before its format was known; `file` is the input or output file). Standard output carries only the document, standard error nothing; the exit status is the one of the text mode. The codes are those of [`karicheck(1)`](karicheck.md) (`usage.*`, `io.*`, `conf.*`, `zone.*`, `db.import.*`, `db.export.*`, `db.zone.*`; the list is in the manual of `karicheck`).
 
 ## AUDIT
 
@@ -353,6 +375,12 @@ Write a zone that `dnssec-signzone` signed from an export of it (what `karidns-s
 karidns-zone export --signer -c karidns.conf example.test example.test.in
 dnssec-signzone -o example.test -f example.test.signed -N increment -3 - -H 0 -K keys example.test.in Kexample.test.+013+11111 Kexample.test.+013+22222
 karidns-zone import --signer --json -c karidns.conf example.test example.test.signed
+```
+
+See a stored MX record as a change set takes it (the priority in front, every name absolute):
+
+```text
+printf 'mail.example.test\tMX\t10\tmail2.example.test\n' | karidns-zone render --json example.test
 ```
 
 Take the serial from the database (a changed file whose serial was not raised), or restore a backup as it was:

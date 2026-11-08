@@ -8,7 +8,7 @@
 # the commit run (the API repeats; a zone that changes every time: 409), preconditions, a signer zone that the API does not reload (the operator's karictl does),
 # the import, a zone made and deleted (its grants go), metadata, key requests, the audit log, and the cost of a change set of a small and of a zone of 20,000
 # records (planning assumption 13.7: the lines "[COST]").
-# Environment: ZONE (default ./karidns-zone), KARICHECK, KARIDNS, LOADER, NODE, BIG (records of the big zone, default 20000).  Needs root; SKIP (exit 0, with the
+# Environment: ZONE (default ./karidns-zone), KARICHECK, KARIDNS, LOADER, NODE, BIG (records of the big zone, default 20000), ZONES (more, empty zones for the cost of the search in the zone list, default 0).  Needs root; SKIP (exit 0, with the
 # reason) otherwise and without node 22.13, the sqlite3 tool, the user nobody or a binary.  About 2 minutes.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -21,6 +21,7 @@ KARICHECK=${KARICHECK:-$ROOT/karicheck}
 KARIDNS=${KARIDNS:-$ROOT/karidns}
 LOADER=${LOADER:-$ROOT/karidns-dbloader}
 BIG=${BIG:-20000}
+ZONES=${ZONES:-0}
 for v in ZONE KARICHECK KARIDNS LOADER; do eval "p=\$$v"; case $p in /*) ;; *) eval "$v=$ROOT/\${p#./}" ;; esac; done
 [ "$(id -u)" = "0" ] || { echo "SKIP: needs root (the server drops to nobody; the loader must be root-owned)"; exit 0; }
 command -v "$NODE" >/dev/null 2>&1 || { echo "SKIP: node is not installed"; exit 0; }
@@ -83,6 +84,8 @@ for z in example other signed; do
     "$ZONE" import --no-config --sqlite3 "$DB" "$z.test" "$T/$z.test.zone" > "$T/import.out" 2>&1 && ok "$z.test is imported" || bad "import of $z" "$(cat "$T/import.out")"
 done
 sqlite3 "$DB" "INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'X-KARIDNS-SIGNER', '1' FROM domains WHERE name = 'signed.test'"
+# the zone of the round trip (the text form of the records, item F): every kind of RDATA whose text is not its stored form
+"$ZONE" import --no-config --sqlite3 "$DB" rt.test "$ROOT/webadmin/test/rt.test.zone" > "$T/import.out" 2>&1 && ok "rt.test (the round trip zone) is imported" || bad "import of rt.test" "$(cat "$T/import.out")"
 chmod 666 "$DB"*
 
 # ---------------------------------------------------------------- karidns, its loader, the control keys
@@ -170,10 +173,15 @@ if [ "$BIG" -gt 0 ]; then
     "$ZONE" import --no-config --sqlite3 "$DB" big.test "$T/big.zone" > "$T/import.out" 2>&1 && ok "big.test is imported (about $BIG records, $(( $(date +%s) - s )) s)" || bad "import of big.test" "$(tail -3 "$T/import.out")"
     chmod 666 "$DB"*
 fi
+# many zones, for the cost of the search in the zone list (zones with no records: the server was told nothing about them); ZONES=10000 for the measurement
+if [ "$ZONES" -gt 0 ]; then
+    awk -v n="$ZONES" 'BEGIN { print "BEGIN;"; for (i = 0; i < n; i++) printf "INSERT INTO domains (name, type) VALUES (\x27z%04d.bulk.test\x27, \x27NATIVE\x27);\n", i; print "COMMIT;" }' | sqlite3 "$DB" && ok "$ZONES empty zones are in the database" || bad "the empty zones"
+    chmod 666 "$DB"*
+fi
 
 echo "-- the scenarios (webadmin/test/it_write.mjs)"
 IT_BASE="http://127.0.0.1:$WPORT/api/v1" IT_ORIGIN="http://127.0.0.1:$WPORT" IT_ADMIN_PASSWORD="$ADMIN_PW" IT_DNS_PORT=$PORT IT_DAG="$ROOT/dag" IT_DIR="$T/ctl" \
-    IT_KARICTL="$ROOT/karictl" IT_KARICTL_CONF="$T/main-karictl.conf" IT_KARICTL_SOCK="$T/ctl.sock" IT_DB=sqlite IT_BIG="$BIG" "$NODE" webadmin/test/it_write.mjs > "$T/it.out" 2>&1
+    IT_KARICTL="$ROOT/karictl" IT_KARICTL_CONF="$T/main-karictl.conf" IT_KARICTL_SOCK="$T/ctl.sock" IT_DB=sqlite IT_BIG="$BIG" IT_ZONES="$ZONES" "$NODE" webadmin/test/it_write.mjs > "$T/it.out" 2>&1
 IT_RC=$?
 cat "$T/it.out"
 [ $IT_RC = 0 ] && ok "the integration scenarios (webadmin/test/it_write.mjs)" || bad "the integration scenarios failed"

@@ -7,7 +7,8 @@ import * as S from '../store.js';
 import { reply } from '../http.js';
 import { isGlobal, zoneGrant, rrVisible, auditVisible } from '../perm.js';
 import { canonicalOwner, inZone, absolute } from '../names.js';
-import { exportArgv } from '../tools.js';
+import { exportArgv, renderArgv } from '../tools.js';
+import { contentProblem, MAX_RRSETS, MAX_RECORDS, ZONE_TEXT_LIMIT } from '../changes.js';
 import { VERSION } from '../app.js';
 import { dataset, zoneParam, zoneGrants, page } from './common.js';
 import { grantView } from './auth.js';
@@ -24,7 +25,7 @@ const NAME_CURSOR = (o) => typeof o?.n === 'string' && o.n.length <= 255;
 export async function zonesList(ctx) {
   const ds = dataset(ctx);
   const q = query(ctx.query, {
-    limit: LIMIT, cursor: CURSOR, prefix: { type: 'string', min: 1, max: 255, re: /^[A-Za-z0-9_.-]+$/ },
+    limit: LIMIT, cursor: CURSOR, prefix: { type: 'string', min: 1, max: 255, re: /^[A-Za-z0-9_.-]+$/ }, contains: { type: 'string', min: 1, max: 255, re: /^[A-Za-z0-9_.-]+$/ },
     kind: { type: 'string', values: ['NATIVE', 'MASTER', 'SLAVE', 'PRODUCER', 'CONSUMER'] }, signed: { type: 'bool' },
   });
   const limit = q.limit ?? 100;
@@ -32,7 +33,7 @@ export async function zonesList(ctx) {
   if (gs.length === 0) return { zones: [], next_cursor: null };
   const names = isGlobal(gs) ? null : [...new Set(gs.map((g) => g.zone_name))];
   const after = q.cursor === undefined ? undefined : decodeCursor(q.cursor, NAME_CURSOR).n;
-  const rows = await ctx.db((tx) => S.listZones(tx, ds.schema, { names, prefix: q.prefix, kind: q.kind, signed: q.signed, after, limit }));
+  const rows = await ctx.db((tx) => S.listZones(tx, ds.schema, { names, prefix: q.prefix, contains: q.contains, kind: q.kind, signed: q.signed, after, limit }));
   const p = page(rows, limit, (r) => ({ n: r.raw }));
   const zones = [];
   for (const z of p.items) {
@@ -66,44 +67,80 @@ function recordText(type, content, prio) {
 }
 
 const RR_CURSOR = (o) => typeof o?.n === 'string' && typeof o?.t === 'string' && o.n.length <= 255 && o.t.length <= 32;
+const OWNER_TEXT = { type: 'string', min: 1, max: 255, re: /^[A-Za-z0-9_.*/-]+$/, reText: 'letters, digits and . _ * / - (a part of a name; a final dot is not needed)' };
+
+// G2: the records of these RRsets as the text a change set takes (karidns-zone render: the loader's reader and the zone-file writer, one run for the page).  A record
+// that cannot be rendered (the reader refuses it, a type that has no other form, a text a change set would refuse) gets rdata null: the client shows the stored content
+// and treats the RRset as one it does not edit.  A tool that fails is not that: it is a broken installation (500, logged).
+async function addRdata(ctx, zone, sets) {
+  const { app } = ctx;
+  const recs = sets.flatMap((s) => s.records.map((rec, i) => ({ rec, row: s.rows[i], owner: s.name, type: s.type })));
+  for (const x of recs) x.rec.rdata = null;
+  // a field the line framing cannot carry is not sent (the reader would refuse such a record anyway): a TAB or LF in an owner or a type, LF or NUL in a content
+  const ok = recs.filter((x) => !/[\t\n\0]/.test(x.owner) && !/[\t\n\0]/.test(x.type) && typeof x.row.content === 'string' && x.row.content.length > 0 && !/[\n\0]/.test(x.row.content));
+  if (ok.length === 0) return;
+  const input = ok.map((x) => `${x.owner}\t${x.type}\t${Number.isSafeInteger(x.row.prio) ? x.row.prio : '-'}\t${x.row.content}\n`).join('');
+  const r = await app.runTool(app.settings['karidns-zone'], renderArgv(zone), { input, timeoutMs: 60000, maxOutput: 64 << 20 });
+  let doc = null;
+  try { doc = JSON.parse(r.stdout); } catch { /* reported below */ }
+  const list = doc?.render?.rdata;
+  if (r.spawnError || r.timedOut || r.truncated || r.code !== 0 || !Array.isArray(list) || list.length !== ok.length) {
+    const why = r.spawnError ? `did not start: ${r.spawnError}` : r.timedOut ? 'ran too long' : r.truncated ? 'wrote too much' : `failed (exit status ${r.code}, ${list ? `${list.length} results for ${ok.length} records` : 'no document'}): ${String(r.stderr).slice(0, 200).replace(/\s+/g, ' ')}`;
+    app.log.error(`${ctx.id}: karidns-zone render ${why}`);
+    throw new ApiError(500, 'internal');
+  }
+  // (the text is judged again by the rules of a change set: what the API would refuse as the content of a record is not offered as one)
+  ok.forEach((x, i) => { if (typeof list[i] === 'string' && list[i].length <= 65535 && contentProblem(list[i]) === null) x.rec.rdata = list[i]; });
+}
 
 export async function rrsetsList(ctx) {
   const ds = dataset(ctx);
   const zone = zoneParam(ctx);
   const gs = zoneGrants(ctx, ds, zone);
-  const q = query(ctx.query, { limit: LIMIT, cursor: CURSOR, name: { type: 'string', min: 1, max: 255 }, type: { type: 'string', min: 1, max: 32, re: /^[A-Za-z][A-Za-z0-9]*$/ } });
+  const q = query(ctx.query, {
+    limit: LIMIT, cursor: CURSOR, name: { type: 'string', min: 1, max: 255 }, type: { type: 'string', min: 1, max: 32, re: /^[A-Za-z][A-Za-z0-9]*$/ },
+    from: OWNER_TEXT, contains: OWNER_TEXT, rdata: { type: 'bool' },
+  });
   const limit = q.limit ?? 100;
   let name;
   if (q.name !== undefined) {
     try { name = canonicalOwner(q.name); } catch (e) { throw badRequest(e.message, '?name'); }
     if (!inZone(name, zone)) throw badRequest('the name is not in the zone', '?name');
   }
+  // G3: the first owner to list, as stored (lower case, no final dot), and a part of an owner (any case)
+  const from = q.from === undefined ? undefined : q.from.toLowerCase().replace(/\.$/, '');
+  const contains = q.contains === undefined ? undefined : q.contains.toLowerCase();
   const cur = q.cursor === undefined ? undefined : decodeCursor(q.cursor, RR_CURSOR);
   const after = cur && { name: cur.n, type: cur.t };
   // a global or domain master reads the whole zone; a subdomain master the names under its suffixes (and the apex SOA and NS)
   const whole = gs.some((g) => g.role !== 'subdomain_master');
   const visibility = whole ? null : { suffixes: [...new Set(gs.map((g) => g.name_suffix))] };
-  const rows = await ctx.db(async (tx) => {
+  const found = await ctx.db(async (tx) => {
     const id = await S.zoneId(tx, ds.schema, zone);
-    return id === undefined ? null : S.listRRsets(tx, ds.schema, id, { zone, name, type: q.type?.toUpperCase(), visibility, after, limit });
+    if (id === undefined) return null;
+    const rows = await S.listRRsets(tx, ds.schema, id, { zone, name, type: q.type?.toUpperCase(), visibility, after, limit, from, contains });
+    // G4: the RRsets with a location / ECS tag or a tinydns attribute are read-only (A-18); the page says which
+    const pairs = [...new Map(rows.map((r) => [`${r.name} ${r.type}`, { name: r.name, type: r.type }])).values()];
+    const tagged = pairs.length ? new Set((await S.taggedRRsets(tx, ds.schema, id, pairs)).map((t) => `${t.name} ${t.type}`)) : new Set();
+    return { rows, tagged };
   });
-  if (rows === null) throw notFound('no such zone');
+  if (found === null) throw notFound('no such zone');
   // the rows are in (name, type) order; `limit` RRsets are given, a further one only shows that there is more
   const sets = [];
-  for (const r of rows) {
+  for (const r of found.rows) {
     const last = sets[sets.length - 1];
     if (last && last.name === r.name && last.type === r.type) last.rows.push(r);
     else sets.push({ name: r.name, type: r.type, rows: [r] });
   }
   const more = sets.length > limit;
   const shown = sets.slice(0, limit);
-  const rrsets = shown.filter((s) => rrVisible(gs, { schema: ds.schema, zone, name: s.name, type: s.type })).map((s) => {
+  const visible = shown.filter((s) => rrVisible(gs, { schema: ds.schema, zone, name: s.name, type: s.type }));
+  const rrsets = visible.map((s) => {
     const ttls = s.rows.map((r) => r.ttl).filter((t) => t !== null);
-    return {
-      name: absolute(s.name), type: s.type, ttl: ttls.length ? Math.min(...ttls) : null,
-      records: s.rows.map((r) => ({ content: recordText(s.type, r.content, r.prio), disabled: r.disabled, ttl: r.ttl })),
-    };
+    s.records = s.rows.map((r) => ({ content: recordText(s.type, r.content, r.prio), disabled: r.disabled, ttl: r.ttl }));
+    return { name: absolute(s.name), type: s.type, ttl: ttls.length ? Math.min(...ttls) : null, tagged: found.tagged.has(`${s.name} ${s.type}`), records: s.records };
   });
+  if (q.rdata === true) await addRdata(ctx, zone, visible);
   const lastShown = shown[shown.length - 1];
   return { rrsets, next_cursor: more ? encodeCursor({ n: lastShown.name, t: lastShown.type }) : null };
 }
@@ -226,6 +263,13 @@ export async function health(ctx) {
   return reply(ok ? 200 : 503, { status: ok ? 'ok' : 'unavailable', database: ok ? 'ok' : 'error' });
 }
 
+// G5: what a client (the GUI) needs to follow the service: the record types a change set takes (karidns-zone's own list; null when the service could not ask) and the
+// settings and limits that change what a form should offer
 export function version(ctx) {
-  return { version: VERSION, tools: ctx.app.versions, datasets: ctx.app.datasets.map((d) => d.name) };
+  const { app } = ctx;
+  const s = app.settings;
+  return {
+    version: VERSION, tools: app.versions, datasets: app.datasets.map((d) => d.name), types: app.types ? [...app.types].sort() : null,
+    ui: { reload_after_change: s['reload-after-change'], require_totp: s['require-totp'], max_rrsets: MAX_RRSETS, max_records: MAX_RECORDS, zone_text_limit: ZONE_TEXT_LIMIT },
+  };
 }

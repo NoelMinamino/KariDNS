@@ -12,6 +12,7 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { hotp, totpStep, base32Decode } from '../lib/crypto.js';
 
 const BASE = process.env.IT_BASE;
 const ORIGIN = process.env.IT_ORIGIN;
@@ -229,6 +230,114 @@ const aud = (await admin('GET', `/audit?change_set=${c1.body.change_set}&limit=1
 check('the audit log has the rows of the change set under the principal', aud.length > 0 && aud.every((r) => r.principal === 'dom' && r.change_set === c1.body.change_set) && aud.some((r) => r.table === 'records' && r.op === 'D'), () => JSON.stringify(aud.slice(0, 2)));
 if (PG) check('...and the database role of the API', aud.every((r) => r.db_role === process.env.IT_API_ROLE), () => aud[0]?.db_role);
 
+// ---------------------------------------------------------------------------------------------------------------------------------- the server side of the GUI (item F, M1)
+console.log('-- the web interface: the text form of the records (G2), search (G3), tagged (G4), /version (G5), credentials (G6), the files (G1)');
+const RT = '/datasets/main/zones/rt.test';
+// every page of a list
+const allPages = async (who, p) => {
+  const out = [];
+  let cursor = '';
+  for (let i = 0; i < 200; i++) {
+    const r = await who('GET', `${p}${p.includes('?') ? '&' : '?'}limit=500${cursor}`);
+    if (r.status !== 200) { bad(`GET ${p}`, `${r.status} ${r.text.slice(0, 200)}`); break; }
+    out.push(...r.body.rrsets);
+    if (!r.body.next_cursor) break;
+    cursor = `&cursor=${r.body.next_cursor}`;
+  }
+  return out;
+};
+const rt = await allPages(admin, `${RT}/rrsets?rdata=1`);
+const flat = rt.flatMap((s) => s.records.map((r) => ({ s, r })));
+check('rt.test: every record has rdata', rt.length === 37 && flat.length === 42 && flat.every(({ r }) => typeof r.rdata === 'string' && r.rdata.length > 0), () => JSON.stringify(flat.filter(({ r }) => typeof r.rdata !== 'string').map(({ s }) => `${s.name} ${s.type}`)));
+check('...none is tagged', rt.every((s) => s.tagged === false));
+const rdOf = (name, t) => rt.find((s) => s.name === name && s.type === t)?.records.map((r) => r.rdata);
+eq('...an MX: the priority in front, the name absolute', rdOf('rt.test.', 'MX'), ['10 mail.rt.test.', '20 mail2.rt.test.']);
+eq('...the null MX has the root name, not "@"', rdOf('nomail.rt.test.', 'MX'), ['0 .']);
+eq('...an SRV with no target', rdOf('_no._tcp.rt.test.', 'SRV'), ['0 0 0 .']);
+eq('...an SRV', rdOf('_sip._tcp.rt.test.', 'SRV'), ['10 60 5060 sip.rt.test.', '20 0 5060 sip2.rt.test.']);
+eq('...a NAPTR with the root as its replacement', rdOf('naptr.rt.test.', 'NAPTR'), ['100 10 "u" "E2U+sip" "!^.*$!sip:info@example.test!" .']);
+eq('...a CNAME', rdOf('www.rt.test.', 'CNAME'), ['web.rt.test.']);
+eq('...strings with quotes and a backslash', rdOf('txt.rt.test.', 'TXT'), ['"hello world" "second" "with \\"quotes\\" and \\\\ backslash"']);
+eq('...a semicolon inside quotes', rdOf('semi.rt.test.', 'TXT'), ['"a;b" "(paren)"']);
+eq('...the stored content is as before (names without the dot)', rt.find((s) => s.name === 'rt.test.' && s.type === 'MX').records.map((r) => r.content), ['10 mail.rt.test', '20 mail2.rt.test']);
+
+// the round trip: every RRset read (but the SOA, below), sent back as the change set with its own records as `expect`: nothing differs, nothing is written
+const body = (over = {}) => ({
+  rrsets: rt.filter((s) => s.type !== 'SOA').map((s) => ({
+    name: s.name, type: s.type, changetype: 'REPLACE', ttl: s.ttl, records: s.records.map((r) => ({ content: r.rdata })), expect: s.records.map((r) => ({ ttl: r.ttl, content: r.rdata })),
+  })),
+  ...over,
+});
+const dryRt = await admin('PATCH', `${RT}/rrsets`, { body: body({ dry_run: true }) });
+eq('round trip, dry run: allowed, no difference', [dryRt.status, dryRt.body.allowed, dryRt.body.diff], [200, true, []]);
+if (dryRt.status !== 200) console.log(`         ${dryRt.text.slice(0, 1500)}`);
+const realRt = await admin('PATCH', `${RT}/rrsets`, { body: body({ comment: 'round trip' }) });
+eq('round trip, for real: nothing changed, nothing written', [realRt.status, realRt.body.committed, realRt.body.changed, realRt.body.diff], [200, false, false, []]);
+eq('...the serial and the generation are as they were', [(await admin('GET', RT)).body.zone.serial], [1]);
+// the SOA is the exception: a change set that names it writes it with the next serial, so sending it back is a change and an `expect` on it never matches
+const soaRt = rt.find((s) => s.type === 'SOA');
+const soaBack = await admin('PATCH', `${RT}/rrsets`, { body: { dry_run: true, rrsets: [{ name: soaRt.name, type: 'SOA', changetype: 'REPLACE', ttl: soaRt.ttl, records: [{ content: soaRt.records[0].rdata }] }] } });
+eq('the SOA sent back is a change (the serial grows), as documented', [soaBack.status, soaBack.body.diff.map((d) => d.type), soaBack.body.serial.after], [200, ['SOA'], soaBack.body.serial.before + 1]);
+// a change made from what was read: the MX priority
+const mxNew = await admin('PATCH', `${RT}/rrsets`, { body: { rrsets: [{ name: 'rt.test.', type: 'MX', changetype: 'REPLACE', ttl: 300, records: [{ content: '15 mail.rt.test.' }, { content: rdOf('rt.test.', 'MX')[1] }], expect: rt.find((s) => s.name === 'rt.test.' && s.type === 'MX').records.map((r) => ({ ttl: r.ttl, content: r.rdata })) }] } });
+eq('an edit made from rdata: the diff shows the one record that changed', [mxNew.status, mxNew.body.diff.map((d) => [d.before.map((x) => x.content), d.after.map((x) => x.content)])], [200, [[['10 mail.rt.test.', '20 mail2.rt.test.'], ['15 mail.rt.test.', '20 mail2.rt.test.']]]]);
+eq('...and rdata shows it', (await admin('GET', `${RT}/rrsets?rdata=1&name=rt.test&type=MX`)).body.rrsets[0].records.map((r) => r.rdata), ['15 mail.rt.test.', '20 mail2.rt.test.']);
+// a stale expectation made from content (the stored form) is what rdata exists to avoid
+const stale = await admin('PATCH', `${RT}/rrsets`, { body: { rrsets: [{ name: 'rt.test.', type: 'MX', changetype: 'REPLACE', ttl: 300, records: [{ content: '15 mail.rt.test.' }], expect: [{ ttl: 300, content: '15 mail' }] }] } });
+eq('...an expect made from the stored content does not match', type(stale), 'precondition-failed');
+
+// G3
+const contains = (await admin('GET', `${RT}/rrsets?contains=MAIL`)).body.rrsets.map((s) => `${s.name} ${s.type}`);
+eq('contains: any case, owners only', contains, ['mail.rt.test. A', 'mail2.rt.test. A', 'nomail.rt.test. MX']);
+const fromWeb = (await admin('GET', `${RT}/rrsets?from=web&limit=2`)).body;
+eq('from: the first owner >= web, and a cursor', [fromWeb.rrsets.map((s) => s.name), Boolean(fromWeb.next_cursor)], [['web.rt.test.', 'web.rt.test.'], true]);
+eq('zones?contains=', (await admin('GET', '/datasets/main/zones?contains=RT.')).body.zones.map((z) => z.name), ['rt.test.']);
+eq('...a domain master sees its own zones only', (await D('GET', '/datasets/main/zones?contains=test')).body.zones.map((z) => z.name).sort(), ['example.test.']);
+// G5
+const ver = (await admin('GET', '/version')).body;
+check('/version has the record types and the settings of the GUI', ['A', 'MX', 'TXT', 'SRV'].every((t) => ver.types.includes(t)) && !ver.types.includes('RRSIG') && ver.ui.max_rrsets === 1000 && ver.ui.require_totp === 'none' && ver.ui.zone_text_limit === 16777216, () => JSON.stringify(ver).slice(0, 300));
+
+// G6 on a user of its own (the sessions of the others are used below)
+const gu = (await mk('/principals', { kind: 'user', name: 'guiuser', password: 'Quartz-Lantern-9081' })).principal.id;
+const G1 = await login('guiuser', 'Quartz-Lantern-9081');
+const en = await G1('POST', '/auth/totp', { body: { action: 'enroll' } });
+const nowMs = Date.now();
+const code = (b32, step) => hotp(base32Decode(b32), totpStep(nowMs / 1000) + step);
+const cf = await G1('POST', '/auth/totp', { body: { action: 'confirm', code: code(en.body.secret, 0) } });
+eq('a user enrols TOTP', [cf.status, cf.body.totp], [200, { enabled: true, enrollment_required: false }]);
+const noCode = await call('POST', '/auth/login', { body: { user: 'guiuser', password: 'Quartz-Lantern-9081' } });
+eq('...the login asks for the code', type(noCode), 'totp-required');
+const l3 = await call('POST', '/auth/login', { body: { user: 'guiuser', password: 'Quartz-Lantern-9081', totp: code(en.body.secret, 1) } });
+const s3 = /karidns_session=([^;]+)/.exec(l3.headers.get('set-cookie') ?? '')?.[1];
+const G3 = (method, p, o = {}) => call(method, p, { cookie: s3, csrf: l3.body?.csrf, origin: ORIGIN, ...o });
+eq('...and a login with the code works', [l3.status, (await G3('GET', '/auth/me')).status], [200, 200]);
+const reset = await admin('POST', `/principals/${gu}/credentials`, { body: { action: 'reset-totp' } });
+eq('an administrator resets it', [reset.status, reset.body.credentials], [200, { password: true, totp_enabled: false, failed_logins: 0, locked: false }]);
+eq('...the user\'s session ended', (await G3('GET', '/auth/me')).status, 401);
+const relog = await call('POST', '/auth/login', { body: { user: 'guiuser', password: 'Quartz-Lantern-9081' } });
+eq('...and the login needs no code', [relog.status, relog.body.totp], [200, { enabled: false, enrollment_required: false }]);
+eq('...not one\'s own TOTP', type(await admin('POST', `/principals/${(await admin('GET', '/auth/me')).body.principal.id}/credentials`, { body: { action: 'reset-totp' } })), 'self');
+eq('...a domain master may not', type(await D('POST', `/principals/${gu}/credentials`, { body: { action: 'unlock' } })), 'forbidden');
+for (let i = 0; i < 10; i++) await call('POST', '/auth/login', { body: { user: 'guiuser', password: 'wrong password 1234' } });
+eq('ten failures lock the account', (await call('POST', '/auth/login', { body: { user: 'guiuser', password: 'Quartz-Lantern-9081' } })).status, 401);
+eq('...an administrator sees it', (await admin('GET', `/principals/${gu}`)).body.credentials.locked, true);
+const un = await admin('POST', `/principals/${gu}/credentials`, { body: { action: 'unlock' } });
+eq('...and unlocks it', [un.status, un.body.credentials.locked, un.body.credentials.failed_logins], [200, false, 0]);
+eq('...the user is in again', (await call('POST', '/auth/login', { body: { user: 'guiuser', password: 'Quartz-Lantern-9081' } })).status, 200);
+const ca = (await admin('GET', '/audit?table=credentials&limit=100')).body.audit.filter((r) => r.op === 'U' && (r.row_id === gu || r.after?.principal_id === gu));       // (PostgreSQL has no row_id for a row without an id column)
+check('...the credentials rows of the audit log name the administrator', ca.some((r) => r.principal === 'admin'), () => JSON.stringify(ca.slice(0, 2)));
+
+// G1: the files
+const origin = new URL(BASE).origin;
+const page = await fetch(`${origin}/`);
+const csp = page.headers.get('content-security-policy') ?? '';
+check('GET / is the page, with the policy of the GUI', page.status === 200 && /^text\/html/.test(page.headers.get('content-type')) && csp.startsWith("default-src 'none'; script-src 'self'") && page.headers.get('cache-control') === 'no-store' && page.headers.get('x-frame-options') === 'DENY', () => `${page.status} ${csp}`);
+const css = await fetch(`${origin}/ui/app.css`);
+const css2 = await fetch(`${origin}/ui/app.css`, { headers: { 'If-None-Match': css.headers.get('etag') } });
+eq('/ui/ files: an ETag, and a 304 for it', [css.status, css.headers.get('cache-control'), css2.status], [200, 'no-cache', 304]);
+eq('...nothing outside the files', [(await fetch(`${origin}/ui/../etc/passwd`)).status, (await fetch(`${origin}/ui/%2e%2e/etc/passwd`)).status, (await fetch(`${origin}/etc/passwd`)).status], [404, 404, 404]);
+
+
 // ---------------------------------------------------------------------------------------------------------------------------------- cost (planning 2.3, assumption 13.7)
 console.log('-- the cost of a change set');
 const time = async (fn) => {
@@ -297,6 +406,39 @@ if (BIG > 0) {
   console.log(`  [COST] ${label}, ${gm.ms.length} pages of 500 RRsets of the big zone (${gm.rrsets} RRsets): global master median ${median(gm.ms).toFixed(0)} ms a page (${gm.total.toFixed(0)} ms in all), domain master median ${median(dm.ms).toFixed(0)} ms a page (${dm.total.toFixed(0)} ms in all, ${(dm.total / gm.total).toFixed(1)} times)`);
   console.log(`  [COST] ${label}, a subdomain master (the names under sub1.big.test, half of the zone): ${sm.ms.length} pages, ${sm.rrsets} RRsets, median ${median(sm.ms).toFixed(0)} ms a page (${sm.total.toFixed(0)} ms in all)`);
   check('the domain master reads as many RRsets as the global master', dm.rrsets === gm.rrsets, () => `${dm.rrsets} / ${gm.rrsets}`);
+  // item F: what the reads of the GUI cost on the big zone (G2 rdata, G3 from / contains) and on a database of many zones
+  const med = async (fn, n = 3) => {
+    const xs = [];
+    for (let i = 0; i < n; i++) xs.push((await time(fn)).ms);
+    return median(xs);
+  };
+  const cost = async (what, who, p) => {
+    let last;
+    const ms = await med(async () => { last = await who('GET', p); return last; });
+    if (last.status !== 200) bad(what, `${last.status} ${last.text.slice(0, 200)}`);
+    console.log(`  [COST] ${label}, ${what}: median ${ms.toFixed(0)} ms (${last.body.rrsets?.length ?? last.body.zones?.length} items)`);
+    return { ms, body: last.body };
+  };
+  const plain = await cost('a page of 500 RRsets of the big zone, global master', admin, `${BP}?limit=500`);
+  const rend = await cost('...the same with rdata=1 (one run of karidns-zone render for the page)', admin, `${BP}?limit=500&rdata=1`);
+  check('...every record of the page has rdata', rend.body.rrsets.every((s) => s.records.every((r) => typeof r.rdata === 'string')));
+  await cost('from= the middle of the zone, a page of 500', admin, `${BP}?limit=500&from=h10000`);
+  const rare = await cost('contains= a rare text (h12345, a scan of the whole zone)', admin, `${BP}?limit=500&contains=h12345`);
+  check('...it finds the owners that have it', rare.body.rrsets.length > 0 && rare.body.rrsets.every((s) => s.name.includes('h12345')) || BIG < 24690, () => rare.body.rrsets.length);
+  await cost('contains= a text that is not there (the worst case: the whole zone scanned, nothing found)', admin, `${BP}?limit=500&contains=nomatchxyz`);
+  await cost('contains= a text half of the zone has (sub1), the first page of 500', admin, `${BP}?limit=500&contains=sub1`);
+  await cost('contains= a text that is not there, domain master (on PostgreSQL row level security tests the rows)', BD, `${BP}?limit=500&contains=nomatchxyz`);
+  await cost('contains= a text that is not there, subdomain master', BS, `${BP}?limit=500&contains=nomatchxyz`);
+  const ZONES = Number(process.env.IT_ZONES ?? 0);
+  if (ZONES > 0) {
+    console.log(`  [COST] ${label}, ${ZONES} more zones in the database`);
+    const zl = await cost('zones?limit=100, global master', admin, '/datasets/main/zones?limit=100');
+    const zc = await cost('zones?contains= a text a few zones have (z0099), global master', admin, '/datasets/main/zones?limit=100&contains=z0099');
+    const zn = await cost('zones?contains= a text no zone has, global master (the whole list scanned)', admin, '/datasets/main/zones?limit=100&contains=nomatchxyz');
+    const zp = await cost('zones?prefix= (the comparison)', admin, '/datasets/main/zones?limit=100&prefix=z0099');
+    check('...the zones that have the text are found', zc.body.zones.length > 0 && zc.body.zones.every((z) => z.name.includes('z0099')) && zn.body.zones.length === 0 && zl.body.zones.length === 100 && zp.body.zones.length > 0);
+    await cost('zones?contains= a text no zone has, a domain master (two zones)', BD, '/datasets/main/zones?limit=100&contains=nomatchxyz');
+  }
 }
 
 console.log(`\n${pass} passed, ${fails} failed`);

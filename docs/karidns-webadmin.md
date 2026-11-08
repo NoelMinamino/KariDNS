@@ -49,6 +49,7 @@ From a source tree (no package): `cd webadmin && npm ci --ignore-scripts`, then 
 |---|---|---|
 | `/usr/local/etc/karidns/karidns-webadmin.conf` | root:karidns-webadmin, 0640 | the settings (no secret) |
 | `api.conninfo`, `check.conninfo` (PostgreSQL) | karidns-webadmin, **0600** | the connection of the roles `karidns_api` and the check role, with passwords if the database needs them; `--check` and the start refuse any other owner or mode |
+| `/usr/local/libexec/karidns-webadmin/webadmin/ui/` | root, 0444 files in 0755 directories | the files of the web interface (`ui-dir`); read once at the start, served under `/` and `/ui/` |
 | `/var/db/karidns-webadmin/totp.key` | karidns-webadmin, **0600** | the AES-256 key that wraps the TOTP secrets in the database; made at the first start; the directory is made by the rc script (0700) |
 | the auth file, `auth.sqlite3` (SQLite3) | karidns-webadmin, **0600** | users, password hashes, grants, sessions, tokens, templates; `--check` refuses a wider mode |
 | the zone file, `zones.sqlite3` (SQLite3) | karidns-webadmin, group of the loader, 0660, directory writable by that group | the zones; SQLite3 opens it read-write even to read (WAL mode) |
@@ -132,7 +133,9 @@ chown karidns-webadmin /usr/local/etc/karidns/api.conninfo /usr/local/etc/karidn
 service karidns_webadmin oneconfigtest       # karidns-webadmin --check as the service user: files and modes, tools, the database schema (the "one" prefix: it works before the service is enabled)
 ```
 
-`configtest` says `ok:` for what is fine and `problem:` for what is not, and exits 1 on a problem. It checks the files and their modes, that `karidns-zone` has the driver of the database and speaks the JSON schema this version expects, that `karicheck` runs, and that the database is at schema version 3 with every table the service uses.
+**The files of the web interface.** The service also serves the files of its web interface from memory: it reads the directory `webadmin/ui/` of the installation (or the directory `ui-dir` names) **once, when it starts**, and answers `/` (the page) and `/ui/...` (the rest) from what it read; there is no file access at request time, so a change of the files needs a restart. Names are letters, digits, `.`, `_` and `-`, only regular files, only the types the interface uses (`html css js mjs json svg png ico txt`), at most 512 files and 8 MiB, and an `index.html`; anything else keeps the service from starting (`configtest` says which file). `ui = no` switches the interface off (`/` is then a 404 and only `/api/v1/` is served), for an operator who serves the files from elsewhere. The files carry their own security headers (no inline script, no outside origin, no framing; [API reference](karidns-api.md), "THE WEB INTERFACE"), so a proxy must not add scripts or rewrite them.
+
+`configtest` says `ok:` for what is fine and `problem:` for what is not, and exits 1 on a problem. It checks the files and their modes, that `karidns-zone` has the driver of the database and speaks the JSON schema this version expects (and has the `render` command of the web interface), that the files of the web interface can be read, that `karicheck` runs, and that the database is at schema version 3 with every table the service uses.
 
 ### The first administrator
 
@@ -280,7 +283,8 @@ One line per request, to syslog (`logger(1)`, tag `karidns-webadmin`, `notice`):
 | Case | Remedy |
 |---|---|
 | a user forgot the password | an administrator: `PUT /api/v1/principals/{id}/password` (this also ends the lock and the user's sessions) |
-| a user lost the TOTP device | the user disables TOTP with password and a code (not possible without the device), or as the database owner: `UPDATE karidns_auth.credentials SET totp_enabled = false, totp_secret = NULL WHERE principal_id = <id>;` — a global master then enrols again at the next login |
+| a user lost the TOTP device | an administrator: `POST /api/v1/principals/{id}/credentials {"action":"reset-totp"}` (TOTP is off, the secret is gone, the user's sessions end; a global master enrols again at the next login). Not for oneself: ask another global master. Without an administrator who can log in, as the database owner: `UPDATE karidns_auth.credentials SET totp_enabled = false, totp_secret = NULL WHERE principal_id = <id>;` |
+| an account is locked (ten failed logins) | an administrator: `POST /api/v1/principals/{id}/credentials {"action":"unlock"}` (the count and the lock go, the password stays); or wait out the lock (15 minutes, twice as long for every further failure, a day at most) |
 | every administrator is locked out | `karidns-webadmin --create-admin another-name` (PostgreSQL: with `--bootstrap-conninfo-file`) as above |
 | a token leaked | `DELETE /api/v1/tokens/{id}` (the owner or an administrator); disabling a user revokes its tokens and ends its sessions |
 
@@ -325,6 +329,23 @@ A subdomain master pays about the same (SQLite3: 581 ms at 100,000 records) or l
 | subdomain master (half of the zone) | 38 ms | 103 to 237 ms |
 
 Zone of 1,000 records, one page of 500: 5 to 7 ms (SQLite3), 8 to 17 ms (PostgreSQL). A page costs a pass over the zone's rows after the cursor (the keys are sorted, the first 501 kept), so every page of a big zone costs about the same, not more the deeper it is. On PostgreSQL the policy of a global master tests every row with the function `name_in_zone` (the exact name test of A-23: a row of the zone's `domain_id` whose name is outside the zone stays invisible), which is why a global master reads *slower* than a domain master, whose rows are covered by a grant on the zone with no function call per row; both are a few times what SQLite3 costs without any policy.
+
+**Reading for the web interface** (item F; the same host and method, measured on 2026-11-09 by `tests/run_webadmin_write_test.sh` and `..._write_pg_test.sh` with `BIG=100000 ZONES=10000`: a zone of 100,000 records and 10,000 more zones with no records; a global master unless said; the median of 3):
+
+| Request | SQLite3 | PostgreSQL |
+|---|---|---|
+| `GET .../rrsets?limit=500` (the comparison) | 39 ms | 191 ms |
+| ... with `rdata=1` (one run of `karidns-zone render` for the 500 RRsets) | 56 ms | 202 ms |
+| ... with `from=` the middle of the zone | 43 ms | 187 ms |
+| ... with `contains=` a text no owner has (the whole zone scanned) | 33 ms | 742 ms |
+| ... with `contains=` a text half of the zone has, the first page | 49 ms | 501 ms |
+| ... `contains=` a text no owner has, as a domain master / a subdomain master | 30 / 31 ms | 174 / 207 ms |
+| `GET .../zones?limit=100` of 10,002 zones | 16 ms | 1113 ms |
+| ... with `contains=` a text one zone has | 3 ms | 362 ms |
+| ... with `prefix=` (the comparison) | 3 ms | 357 ms |
+| ... with `contains=` a text no zone has | 3 ms | 32 ms |
+
+`rdata` costs about 20 to 35 microseconds a record (17 ms for a page of 500 records on SQLite3, 11 ms on PostgreSQL): each record is read by the loader's reader inside a small zone of its own and written by the zone-file writer, twice (the second time to prove that the text reads back as the same record). `contains` on RRsets is a scan of the zone's rows: on SQLite3 it costs no more than a page, on PostgreSQL a global master's scan costs 3 to 4 pages (the policy of a global master tests every row, above) and a domain or subdomain master's scan about what a page of its own costs; it is one request for a search box, not something a page load makes. `from` is an index range and costs a page. On the zone list the scan for `contains` is as cheap as the `prefix` comparison.
 
 **Statistics matter.** A table that has just been filled (`karidns-zone import` of a big zone) has no statistics for the planner until the analyze of autovacuum has run (within about a minute of the load). An earlier version of the page query joined the keys with the records, and without statistics PostgreSQL planned a nested loop that tested the policy 500,000 times: **2.9 seconds** for one page of a zone of 1000 records, and 0.9 s (global master) for a zone of 100,000. The query is two statements now (the keys, then the records of those names): without statistics, 21 ms at 1000 records and 0.7 s at 100,000 (global master). After a big import you can run `ANALYZE` on the PowerDNS tables by hand; nothing breaks if you do not.
 

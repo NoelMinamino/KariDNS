@@ -34,7 +34,7 @@ done
 WEBADMIN_DIR="usr/local/libexec/karidns-webadmin"
 (cd webadmin && npm ci --omit=dev --ignore-scripts) || { echo "ERROR: npm ci in webadmin/ failed (pkg install npm-node24)" >&2; exit 1; }
 mkdir -p "${STAGE_DIR}/${WEBADMIN_DIR}/webadmin" "${STAGE_DIR}/${WEBADMIN_DIR}/node" "${STAGE_DIR}/usr/local/sbin" "${STAGE_DIR}/usr/local/etc/rc.d" "${STAGE_DIR}/usr/local/etc/karidns" "${STAGE_DIR}/usr/local/share/doc/karidns" "${OUT_DIR}"
-cp -R webadmin/bin webadmin/lib webadmin/package.json webadmin/package-lock.json "${STAGE_DIR}/${WEBADMIN_DIR}/webadmin/"
+cp -R webadmin/bin webadmin/lib webadmin/ui webadmin/package.json webadmin/package-lock.json "${STAGE_DIR}/${WEBADMIN_DIR}/webadmin/"
 # the code webadmin/ shares with karidns-signer (node/lib: webadmin/lib imports ../../node/lib), and the one dependency, next to both
 cp -R node/lib node/package.json "${STAGE_DIR}/${WEBADMIN_DIR}/node/"
 cp -R webadmin/node_modules "${STAGE_DIR}/${WEBADMIN_DIR}/"

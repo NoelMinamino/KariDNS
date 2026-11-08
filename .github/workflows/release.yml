@@ -151,6 +151,7 @@ jobs:
             pkg info -d karidns-webadmin
             test -x /usr/local/sbin/karidns-webadmin
             test -x /usr/local/libexec/karidns-webadmin/webadmin/bin/karidns-webadmin.js
+            test -f /usr/local/libexec/karidns-webadmin/webadmin/ui/index.html
             test -f /usr/local/libexec/karidns-webadmin/node/lib/run.js
             test -d /usr/local/libexec/karidns-webadmin/node_modules/pg
             test -x /usr/local/etc/rc.d/karidns_webadmin

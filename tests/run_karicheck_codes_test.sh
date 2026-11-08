@@ -325,6 +325,7 @@ db.import.not-primary
 db.import.summary
 db.import.change
 db.import.changed
+db.render.input
 db.import.signer
 db.import.signer-zone
 db.export.done

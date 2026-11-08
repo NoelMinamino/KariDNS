@@ -85,7 +85,7 @@ export function makeFiles(dir) {
 }
 
 // A running deployment: { app, backend, server, base, dir, request(), login(), close() }.  settings: more (or other) lines of the configuration; now: a clock.
-export async function deploy({ settings, now, run = runChild, key = Buffer.alloc(32, 7) } = {}) {
+export async function deploy({ settings, now, run = runChild, key = Buffer.alloc(32, 7), ui = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kw-'));
   makeFiles(dir);
   const config = parseConfig(confText(dir, settings));
@@ -94,10 +94,11 @@ export async function deploy({ settings, now, run = runChild, key = Buffer.alloc
   const backend = new SqliteBackend({ sqlite, file: config.settings['sqlite-file'], authFile: config.settings['auth-file'] });
   backend.open();
   const log = memLog();
-  const app = new App({ config, backend, log, run, key, now });
+  const app = new App({ config, backend, log, run, key, now, ui });
   const server = await listen(app, new Router(ROUTES));
-  const base = `http://127.0.0.1:${server.address().port}/api/v1`;
-  const d = { app, backend, server, base, dir, log, config };
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const base = `${origin}/api/v1`;
+  const d = { app, backend, server, base, origin, dir, log, config };
 
   // fetch with JSON in and out: -> { status, headers, body (parsed JSON, or text for text/plain), text }
   d.request = async (method, p, { body, cookie, token, csrf, origin, headers = {}, raw } = {}) => {

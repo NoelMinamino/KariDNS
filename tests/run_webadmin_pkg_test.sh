@@ -52,7 +52,7 @@ trap "exit 130" INT TERM
 echo "-- the package"
 # a copy of what the script reads, so that `npm ci` does not touch the working copy
 mkdir -p "$T/src/webadmin" "$T/src/node" "$T/src/packaging" "$T/src/docs" "$T/out"
-cp -R webadmin/bin webadmin/lib webadmin/package.json webadmin/package-lock.json "$T/src/webadmin/"
+cp -R webadmin/bin webadmin/lib webadmin/ui webadmin/package.json webadmin/package-lock.json "$T/src/webadmin/"
 cp -R node/lib node/package.json "$T/src/node/"
 cp -R packaging/freebsd "$T/src/packaging/"
 cp docs/karidns-webadmin.md docs/karidns-api.md "$T/src/docs/"
@@ -68,7 +68,7 @@ pkg info -d -F "$PKG" 2> /dev/null | grep -q 'node24-' && ok "it depends on node
 pkg info -d -F "$PKG" 2> /dev/null | grep -q 'bind-tools' && bad "it depends on bind-tools (only the signer needs them)" || ok "...and on nothing else it does not use"
 pkg info -l -F "$PKG" 2> /dev/null | tail -n +2 | sed 's/^[[:space:]]*//' > "$T/files.txt"
 for f in /usr/local/sbin/karidns-webadmin /usr/local/etc/rc.d/karidns_webadmin /usr/local/etc/karidns/karidns-webadmin.conf.sample /usr/local/share/doc/karidns/karidns-webadmin.md \
-         /usr/local/share/doc/karidns/karidns-api.md /usr/local/libexec/karidns-webadmin/webadmin/bin/karidns-webadmin.js /usr/local/libexec/karidns-webadmin/webadmin/lib/cli.js \
+         /usr/local/share/doc/karidns/karidns-api.md /usr/local/libexec/karidns-webadmin/webadmin/bin/karidns-webadmin.js /usr/local/libexec/karidns-webadmin/webadmin/lib/cli.js /usr/local/libexec/karidns-webadmin/webadmin/ui/index.html \
          /usr/local/libexec/karidns-webadmin/node/lib/run.js /usr/local/libexec/karidns-webadmin/node/package.json /usr/local/libexec/karidns-webadmin/node_modules/pg/package.json; do
     grep -qx "$f" "$T/files.txt" && ok "the package holds $f" || bad "the package does not hold $f"
 done

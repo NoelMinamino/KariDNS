@@ -99,7 +99,7 @@ test('RRsets: a domain master reads the zone, a subdomain master its names and t
     'a.sub.example.test. TXT', 'evilsub.example.test. A', 'example.test. MX', 'example.test. NS', 'example.test. SOA', 'ns1.example.test. A', 'off.example.test. A', 'sub.example.test. A', 'www.example.test. A',
   ]);
   const www = r.body.rrsets.find((s) => s.name === 'www.example.test.');
-  assert.deepEqual(www, { name: 'www.example.test.', type: 'A', ttl: 300, records: [{ content: '192.0.2.10', disabled: false, ttl: 300 }, { content: '192.0.2.11', disabled: false, ttl: 300 }] });
+  assert.deepEqual(www, { name: 'www.example.test.', type: 'A', ttl: 300, tagged: false, records: [{ content: '192.0.2.10', disabled: false, ttl: 300 }, { content: '192.0.2.11', disabled: false, ttl: 300 }] });
   assert.equal(r.body.rrsets.find((s) => s.type === 'MX').records[0].content, '10 mail.example.test', 'the priority is part of the content');
   assert.equal(r.body.rrsets.find((s) => s.name === 'off.example.test.').records[0].disabled, true);
   assert.equal(r.body.next_cursor, null);
@@ -287,7 +287,16 @@ test('health needs no login and says when the database is gone; /version needs o
   assert.deepEqual(h.body, { api: 1, status: 'ok', database: 'ok' });
   d.app.versions = { karicheck: 'karicheck 0.6.0' };
   const v = await sub('GET', '/version');
-  assert.deepEqual(v.body, { api: 1, version: '0.6.0', tools: { karicheck: 'karicheck 0.6.0' }, datasets: ['main'] });
+  // (G5: the record types karidns-zone's change file takes, when the service has asked it, and the settings and limits a client follows)
+  assert.deepEqual(v.body, {
+    api: 1, version: '0.6.0', tools: { karicheck: 'karicheck 0.6.0' }, datasets: ['main'], types: null,
+    ui: { reload_after_change: false, require_totp: 'none', max_rrsets: 1000, max_records: 1000, zone_text_limit: 16777216 },
+  });
+  d.app.types = new Set(['TXT', 'A', 'MX']);
+  d.config.settings['reload-after-change'] = true;
+  const v2 = await sub('GET', '/version');
+  assert.deepEqual(v2.body.types, ['A', 'MX', 'TXT'], 'sorted');
+  assert.equal(v2.body.ui.reload_after_change, true);
   is(await d.request('GET', '/version'), 401, 'unauthenticated');
   const sql = new sqlite.DatabaseSync(':memory:');
   assert.ok(sql);

@@ -11,6 +11,13 @@
  *     that swallows the next line, or hide the rest of its line);
  *   - a refused file leaves nothing behind.
  * A file the parser refuses, and a text the zone parser refuses (a bad RDATA), are fine.  Seeds: tests/fuzz/corpus_fuzz_zone_changes/.
+ *
+ * The same bytes are also the standard input of `karidns-zone render` (dns_zone_render.c: stored records -> the text a change file takes, item F, the GUI):
+ *   - an input is refused as a whole (nothing left behind) or gives one result for each line;
+ *   - a text that is given is one non-empty line, safe for the change file by the reader's rules (pdns_text_check), and no longer than a change file's RDATA;
+ *   - it goes back in: sent back as the content of the same owner and type (the priority is in it now) it renders again, and what that gives is a fixed point
+ *     (the round trip of the GUI: read a record, send it back, no change; that the text is the same record is proved inside render itself, by reading it back).
+ * Seeds of this part (tab separated lines) are in the same directory, files render_*.
  */
 #include <stdbool.h>
 #include <stdint.h>
@@ -20,8 +27,10 @@
 #include <strings.h>
 
 #include "../db/xfr_mocks.h"
+#include "../../dns_pdns_reader.h"
 #include "../../dns_zone_changes.h"
 #include "../../dns_zone_parser.h"
+#include "../../dns_zone_render.h"
 
 void syslog(int priority, const char *format, ...) {
     (void)priority;
@@ -30,8 +39,67 @@ void syslog(int priority, const char *format, ...) {
 
 #define ZONE "fuzz.test."
 
+/* "owner TAB type" (pre octets of s) and text as the content, prio NULL: the text it renders to (malloc'd), or NULL when it is refused */
+static char *render_again(const char *s, size_t pre, const char *text) {
+    size_t rl = strlen(text);
+    char *in = malloc(pre + 3 + rl + 1);
+    if (!in) abort();
+    memcpy(in, s, pre);
+    memcpy(in + pre, "\t-\t", 3);
+    memcpy(in + pre + 3, text, rl);
+    in[pre + 3 + rl] = '\n';
+    zr_result_t *r = NULL;
+    size_t n = 0;
+    char err[200];
+    char *out = NULL;
+    if (zr_render(ZONE, in, pre + 3 + rl + 1, &r, &n, err, sizeof(err)) == 0 && n == 1 && r[0].rdata) out = strdup(r[0].rdata);
+    zr_free(r, n);
+    free(in);
+    return out;
+}
+
+
+static void fuzz_render(const uint8_t *data, size_t size) {
+    if (size > (1u << 14)) return;                           /* each record is a small zone of its own: a few thousand lines are plenty */
+    zr_result_t *r = (zr_result_t *)1;
+    size_t n = 7;
+    char err[200];
+    if (zr_render(ZONE, (const char *)data, size, &r, &n, err, sizeof(err)) != 0) {
+        if (r != NULL || n != 0) abort();                    /* a refused input leaves nothing behind */
+        return;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (r[i].rdata == NULL) {
+            if (r[i].err[0] == '\0') abort();                /* a record that is not rendered says why */
+            continue;
+        }
+        size_t len = strlen(r[i].rdata);
+        if (len == 0 || len > 65535 || strpbrk(r[i].rdata, "\r\n") || pdns_text_check(r[i].rdata, len, false) != NULL) abort();
+    }
+    /* the first line, again with its own result as the content: the text goes back in (it is rendered again, which proves it reads back as the same record), and
+     * what comes out of that is a fixed point.  (The first text itself need not be: a name with a '.' inside a label is written with its final dot dropped, which
+     * reads back as the same name but is spelt with the dot the second time.) */
+    if (n > 0 && r[0].rdata) {
+        const char *s = (const char *)data;
+        const char *nl = memchr(s, '\n', size);
+        size_t ll = nl ? (size_t)(nl - s) : size;
+        const char *t1 = memchr(s, '\t', ll);
+        const char *t2 = t1 ? memchr(t1 + 1, '\t', ll - (size_t)(t1 + 1 - s)) : NULL;
+        if (t2) {
+            char *text2 = render_again(s, (size_t)(t2 - s), r[0].rdata);
+            if (!text2) abort();
+            char *text3 = render_again(s, (size_t)(t2 - s), text2);
+            if (!text3 || strcmp(text3, text2) != 0) abort();
+            free(text2);
+            free(text3);
+        }
+    }
+    zr_free(r, n);
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size > (1u << 18)) return 0;
+    fuzz_render(data, size);
     zc_changes_t c;
     char err[400];
     if (!zc_parse((const char *)data, size, ZONE, &c, err, sizeof(err))) {

@@ -8,6 +8,7 @@ import https from 'node:https';
 import { ApiError, problem, mapDbError } from './errors.js';
 import { authenticate } from './session.js';
 import { listenHost } from './config.js';
+import { serveStatic } from './static.js';
 
 export const PREFIX = '/api/v1';
 const BODY_LIMIT = 1 << 20;
@@ -142,7 +143,8 @@ function send(ctx, status, headers, payload) {
   const extra = { ...SECURITY, 'X-Request-Id': ctx.id, ...headers };
   if (app.settings['public-origin'].startsWith('https:')) extra['Strict-Transport-Security'] = 'max-age=31536000';
   ctx.status = status;
-  res.writeHead(status, { ...extra, 'Content-Length': Buffer.byteLength(payload) });
+  // (no Content-Length in a 204 or a 304: RFC 9110 section 8.6 and 15.4.5; a HEAD answer keeps the length of the body it does not send)
+  res.writeHead(status, status === 204 || status === 304 ? extra : { ...extra, 'Content-Length': Buffer.byteLength(payload) });
   res.end(payload);
 }
 
@@ -170,7 +172,14 @@ export async function dispatch(app, router, req, res) {
   // a handler's way to the database: a transaction as the principal of the request
   ctx.db = (fn, { write = false, changeSet = null } = {}) => app.backend.tx({ principal: ctx.auth?.principal.id ?? null, name: ctx.auth?.principal.name ?? null, changeSet, write }, fn);
   try {
-    if (!req.url.startsWith(`${PREFIX}/`)) throw new ApiError(404, 'not-found', 'there is nothing here; the API is under /api/v1/');
+    if (!req.url.startsWith(`${PREFIX}/`)) {
+      // the files of the GUI (static.js), when the service has them: no login, no database, answered from memory
+      const page = app.ui ? serveStatic(app.ui, req) : null;
+      if (!page) throw new ApiError(404, 'not-found', 'there is nothing here; the API is under /api/v1/');
+      ctx.route = { template: `${req.method} the GUI` };
+      sendReply(ctx, new Reply(page.status, null, { text: page.body, type: page.type, headers: page.headers }));       // (text may be a Buffer: only its length and bytes are used)
+      return;
+    }
     const url = new URL(req.url, 'http://localhost');
     ctx.query = url.searchParams;
     const m = router.match(req.method, url.pathname.slice(PREFIX.length));

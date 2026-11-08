@@ -8,7 +8,7 @@ import { hashPassword } from '../crypto.js';
 import { reply } from '../http.js';
 import { isGlobal, zoneGrant, maySetGrant } from '../perm.js';
 import { canonicalZone, canonicalOwner, inZone, absolute } from '../names.js';
-import { requireGlobal, idParam, idCursor, page } from './common.js';
+import { requireGlobal, idParam, idCursor, page, clean } from './common.js';
 import { checkPassword, principalView, policyView } from './auth.js';
 
 const PASSWORD = { type: 'string', min: 12, max: 1024, noControl: false };
@@ -45,6 +45,11 @@ export async function principalCreate(ctx) {
   return reply(201, { principal: principalView(await ctx.db((tx) => S.getPrincipal(tx, id))) });
 }
 
+// what an administrator (and the user itself) may know of the credentials: no hash, no secret
+const credentialsView = (c, now) => (c
+  ? { password: Boolean(c.password_hash), totp_enabled: c.totp_enabled, failed_logins: c.failed_logins, locked: Boolean(c.locked_until && c.locked_until > now) }
+  : { password: false, totp_enabled: false, failed_logins: 0, locked: false });
+
 export async function principalGet(ctx) {
   const id = idParam(ctx);
   const self = id === ctx.auth.principal.id;
@@ -55,8 +60,36 @@ export async function principalGet(ctx) {
   });
   if (!r) throw notFound('no such principal');
   const out = { principal: { ...principalView(r.p), created_at: r.p.created_at, created_by: r.p.created_by }, groups: r.groups };
-  if (r.creds !== undefined) out.credentials = r.creds ? { password: Boolean(r.creds.password_hash), totp_enabled: r.creds.totp_enabled, failed_logins: r.creds.failed_logins, locked: Boolean(r.creds.locked_until && r.creds.locked_until > ctx.app.now()) } : { password: false, totp_enabled: false, failed_logins: 0, locked: false };
+  if (r.creds !== undefined) out.credentials = credentialsView(r.creds, ctx.app.now());
   return out;
+}
+
+// G6: what an administrator does for a user who cannot get in: reset-totp (a lost device: TOTP off, the secret gone, the sessions end; the next login enrols again where
+// require-totp says so) and unlock (the account was locked by failed logins: the count and the lock go, the password stays).  Global masters only (F-15); one's own TOTP
+// is switched off from the account (password and code), not reset by oneself.  The credentials triggers of the database write the audit rows.
+export async function principalCredentials(ctx) {
+  requireGlobal(ctx);
+  const id = idParam(ctx);
+  const body = shape(ctx.body, { action: { type: 'string', required: true, values: ['reset-totp', 'unlock'] } });
+  if (body.action === 'reset-totp' && id === ctx.auth.principal.id) throw conflict('you cannot reset your own TOTP here: switch it off from your account (password and code), or ask another global master', 'self');
+  const r = await ctx.db(async (tx) => {
+    const p = await S.getPrincipal(tx, id);
+    if (!p) return null;
+    if (p.kind !== 'user') throw conflict('only a user has credentials', 'not-a-user');
+    const c = await S.getCredentials(tx, id);
+    if (!c) throw conflict('this user has no password, so no credentials to change', 'no-password');
+    if (body.action === 'unlock') {
+      await S.clearLock(tx, id);
+    } else {
+      if (!c.totp_enabled && !c.totp_secret) throw conflict('TOTP is not on for this user', 'totp-disabled');
+      await S.setTotp(tx, id, null, false);
+      await S.deleteSessionsOf(tx, id);
+    }
+    return { p, creds: await S.getCredentials(tx, id) };
+  }, { write: true });
+  if (!r) throw notFound('no such principal');
+  ctx.app.log.info(`auth: ${clean(ctx.auth.principal.name)} did ${body.action} for ${clean(r.p.name)}`);
+  return { credentials: credentialsView(r.creds, ctx.app.now()) };
 }
 
 export async function principalUpdate(ctx) {

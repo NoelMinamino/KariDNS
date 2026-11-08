@@ -88,6 +88,7 @@ typedef struct {
     char apex[DNS_NAME_TEXT_SIZE];      /* canonical absolute */
     size_t apex_len;
     bool apex_root;
+    bool absolute_only;                 /* dns_zone_text_rrset_lines(): no origin at all, every name is written absolute (the root as ".", never "@") */
     dzt_out_t out;
     char *err;
     size_t errlen;
@@ -260,6 +261,7 @@ static bool name_canonical(const char *name) {
  * relative, so reading the text gives the very same bytes back (the parser appends the $ORIGIN text). */
 static int name_rel(const dzt_t *z, const char *name, size_t *relen) {
     size_t nl = strlen(name);
+    if (z->absolute_only) return 0;
     if (z->apex_root) return (nl == 1 && name[0] == '.') ? 1 : 0;
     if (nl == z->apex_len && memcmp(name, z->apex, nl) == 0) return 1;
     if (nl > z->apex_len + 1 && memcmp(name + nl - z->apex_len, z->apex, z->apex_len) == 0) {
@@ -961,6 +963,7 @@ char *dns_zone_text_rrset_lines(const dns_record_t *const *recs, size_t n, char 
     snprintf(z.apex, sizeof(z.apex), ".");                 /* no zone to be relative to: every name is written absolute */
     z.apex_len = 1;
     z.apex_root = true;
+    z.absolute_only = true;         /* the root name in an RDATA (a null MX, the replacement of a NAPTR) is ".": an "@" would be the origin of whatever zone the line is read for */
     dzt_key_t *keys = calloc(n ? n : 1, sizeof(*keys));
     uint8_t *tmp = malloc(65535), *pool = NULL;
     size_t plen = 0, pcap = 0;

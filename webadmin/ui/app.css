@@ -1,0 +1,5 @@
+/* KariDNS WebAdmin: the placeholder style of the page that is served until the GUI itself is in. */
+body {
+  font-family: system-ui, sans-serif;
+  margin: 2rem;
+}

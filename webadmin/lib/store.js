@@ -20,6 +20,9 @@ class Q {
 // "name = x OR name = x." : PowerDNS stores a zone name without the final dot, but a database may hold it with
 const zoneNames = (zone) => [zone, `${zone}.`];
 
+// "the column contains the text, whatever the case": LIKE with its own characters escaped (the callers only pass names, but the escape is cheap and complete)
+const containsText = (q, col, text) => `lower(${col}) LIKE ${q.add(`%${text.toLowerCase().replace(/[\\%_]/g, '\\$&')}%`)} ESCAPE '\\'`;
+
 const principal = (r) => ({ id: r.id, kind: r.kind, name: r.name, display_name: r.display_name, email: r.email, disabled: bool(r.disabled), created_at: toIso(r.created_at), created_by: r.created_by });
 const PCOLS = 'p.id, p.kind, p.name, p.display_name, p.email, p.disabled, p.created_at, p.created_by';
 
@@ -87,6 +90,9 @@ export async function setPassword(tx, id, hash, nowMs) {
   const r = await tx.run(`UPDATE ${tx.A}credentials SET password_hash = $2, password_changed_at = $3, failed_logins = 0, locked_until = NULL WHERE principal_id = $1`, [id, hash, tx.ts(nowMs)]);
   if (r.changes === 0) await tx.run(`INSERT INTO ${tx.A}credentials (principal_id, password_hash, password_changed_at) VALUES ($1, $2, $3)`, [id, hash, tx.ts(nowMs)]);
 }
+
+// an administrator ends the lock of an account (and the count of failures that led to it) without a new password
+export const clearLock = (tx, id) => tx.run(`UPDATE ${tx.A}credentials SET failed_logins = 0, locked_until = NULL WHERE principal_id = $1`, [id]);
 
 export const setTotp = (tx, id, wrapped, enabled) => tx.run(`UPDATE ${tx.A}credentials SET totp_secret = $2, totp_enabled = $3 WHERE principal_id = $1`, [id, wrapped, enabled]);
 
@@ -283,13 +289,14 @@ const zoneRow = (r) => ({
 });
 
 // names: the zones to list (a principal that is not a global master sees the zones it has a grant on), or null for all
-export async function listZones(tx, schema, { names, prefix, kind, signed, after, limit }) {
+export async function listZones(tx, schema, { names, prefix, contains, kind, signed, after, limit }) {
   const Z = tx.z(schema);
   const q = new Q();
   const w = ['1 = 1'];
   if (names) w.push(q.list(tx, 'd.name', names.flatMap(zoneNames)));
   if (after !== undefined) w.push(`d.name > ${q.add(after)}`);
   if (prefix) w.push(`substr(lower(d.name), 1, ${prefix.length}) = ${q.add(prefix.toLowerCase())}`);
+  if (contains) w.push(containsText(q, 'd.name', contains));          // (a scan of the zones the principal sees)
   if (kind) w.push(`d.type = ${q.add(kind)}`);
   if (signed === true) w.push(`(${META(Z, 'PRESIGNED')} OR ${META(Z, 'X-KARIDNS-SIGNER')})`);
   if (signed === false) w.push(`NOT (${META(Z, 'PRESIGNED')} OR ${META(Z, 'X-KARIDNS-SIGNER')})`);
@@ -328,7 +335,8 @@ export async function getZone(tx, schema, zone) {
 
 // How RRsets are read (planning 2.2, A-23): by domain_id, the RRsets in (name, type) order after the cursor, `limit` of them plus one to know whether there is more.
 // visibility: null = every row of the zone; else { zone, suffixes: [...] } = the names under these suffixes and the apex SOA / NS (a subdomain master).
-export async function listRRsets(tx, schema, domainId, { zone, name, type, visibility, after, limit }) {
+// from: the first owner to list (names >= from, the order of the cursor: an index range, cheap); contains: the owner has this text in it (a scan of the zone, G3)
+export async function listRRsets(tx, schema, domainId, { zone, name, type, visibility, after, limit, from, contains }) {
   const Z = tx.z(schema);
   const q = new Q();
   const id = q.add(domainId);
@@ -336,6 +344,8 @@ export async function listRRsets(tx, schema, domainId, { zone, name, type, visib
   const sfx = (col, s) => `(${col} = ${q.add(s)} OR substr(${col}, length(${col}) - ${s.length}) = ${q.add(`.${s}`)})`;
   w.push(sfx('k.name', zone));
   if (name) w.push(`k.name = ${q.add(name)}`);
+  if (from) w.push(`k.name >= ${q.add(from)}`);
+  if (contains) w.push(containsText(q, 'k.name', contains));
   if (type) w.push(`upper(k.type) = ${q.add(type)}`);
   if (visibility) {
     const alts = visibility.suffixes.map((s) => sfx('k.name', s));

@@ -10,7 +10,9 @@ export const VERSION = '0.6.0';
 
 export class App {
   // config: { settings, datasets }; backend: db.js; log: the logger; run: runChild; key: the Buffer that wraps TOTP secrets
-  constructor({ config, backend, log, run, key, now = () => Date.now() }) {
+  // ui: the files of the GUI (static.js loadStatic) or null for none (`ui = no`)
+  constructor({ config, backend, log, run, key, now = () => Date.now(), ui = null }) {
+    this.ui = ui;
     this.backend = backend;
     this.log = log;
     this.run = run;

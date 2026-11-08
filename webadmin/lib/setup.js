@@ -8,7 +8,8 @@ import { clip } from '../../node/lib/run.js';
 import { SqliteBackend, PgBackend } from './db.js';
 import * as S from './store.js';
 import { hashPassword, randomToken } from './crypto.js';
-import { typesArgv } from './tools.js';
+import { typesArgv, renderArgv } from './tools.js';
+import { loadStatic, defaultUiDir } from './static.js';
 
 const PROGRAM = 'karidns-webadmin';
 
@@ -44,7 +45,8 @@ export async function inspect(config, { backend, run, st = {}, uid = process.get
   const notes = [];
   const versions = {};
   let types = null;                         // the record types karidns-zone's change file takes (its own list, planning 8.1)
-  if (problems.length) return { problems, notes, versions, types };
+  let ui = null;                            // the files of the GUI (static.js), read here once and kept by the service
+  if (problems.length) return { problems, notes, versions, types, ui };
 
   const checkFile = (what, file, stat) => {
     const p = checkConninfoFile(file, stat, uid, PROGRAM);
@@ -78,6 +80,18 @@ export async function inspect(config, { backend, run, st = {}, uid = process.get
     else problems.push(`totp-key-file ${s['totp-key-file']}: ${e.code ?? e.message}`);
   }
 
+  if (s.ui) {
+    const dir = s['ui-dir'] ?? defaultUiDir();
+    try {
+      ui = loadStatic(dir);
+      notes.push(`ui ${dir}: ${ui.size} files, ${[...ui.values()].reduce((n, f) => n + f.body.length, 0)} bytes`);
+    } catch (e) {
+      problems.push(`ui ${dir}: ${e.message} (ui = no switches the GUI off)`);
+    }
+  } else {
+    notes.push('ui: off (ui = no)');
+  }
+
   if (run) {
     const want = s.database === 'pg' ? 'postgresql' : 'sqlite3';
     const z = await run(s['karidns-zone'], ['--version'], { timeoutMs: 10000, maxOutput: 8192 });
@@ -95,6 +109,11 @@ export async function inspect(config, { backend, run, st = {}, uid = process.get
         versions['karidns-zone-json'] = doc['karidns-zone'];
         types = doc.types.filter((x) => typeof x === 'string').map((x) => x.toUpperCase());
       }
+      // `render` (G2, the GUI): a karidns-zone of an older release does not have it, and GET .../rrsets?rdata=1 would fail on every call
+      const r = await run(s['karidns-zone'], renderArgv('example.test'), { timeoutMs: 10000, maxOutput: 1 << 16, input: '' });
+      let rdoc = null;
+      try { rdoc = JSON.parse(r.stdout); } catch { /* reported below */ }
+      if (rdoc?.['karidns-zone'] !== 1 || !Array.isArray(rdoc.render?.rdata)) problems.push(`karidns-zone render --json did not give a document of schema 1 (${clip(r.stdout || r.stderr, 120)}): is karidns-zone of this release?`);
     }
     const k = await run(s.karicheck, ['--version'], { timeoutMs: 10000, maxOutput: 8192 });
     if (k.spawnError || k.code !== 0) problems.push(`karicheck (${s.karicheck}): ${k.spawnError ?? `exit status ${k.code}`}`);
@@ -123,7 +142,7 @@ export async function inspect(config, { backend, run, st = {}, uid = process.get
       problems.push(`the database: ${e.message}`);
     }
   }
-  return { problems, notes, versions, types };
+  return { problems, notes, versions, types, ui };
 }
 
 const FALLBACK_TYPES = ['A', 'AAAA', 'AFSDB', 'CAA', 'CNAME', 'DNAME', 'DS', 'HINFO', 'HTTPS', 'LOC', 'MX', 'NAPTR', 'NS', 'PTR', 'SOA', 'SPF', 'SRV', 'SSHFP', 'SVCB', 'TLSA', 'TXT', 'URI'];

@@ -60,5 +60,10 @@ check-conninfo-file = /usr/local/etc/karidns/check.conninfo
 # The cost of a new password hash, 2^n (14 to 20, default 17: about 128 MiB each, two at a time).
 # scrypt-ln = 17
 
+# --- the web interface -------------------------------------------------------------------------------------------------------------------
+# The files of the web interface are read once at the start and served under / and /ui/ (no login is needed for them).  `no` serves only /api/v1/.
+# ui = yes
+# ui-dir = /usr/local/libexec/karidns-webadmin/webadmin/ui
+
 # stderr, or a syslog facility (daemon, local0 ... local7, ...).
 log = daemon

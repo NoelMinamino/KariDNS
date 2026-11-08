@@ -80,8 +80,8 @@ export function query(params, spec) {
       if (!/^\d{1,10}$/.test(raw)) throw fail(`?${k}`, 'an integer is expected');
       out[k] = value(Number(raw), s, `?${k}`);
     } else if (s.type === 'bool') {
-      if (raw !== 'true' && raw !== 'false') throw fail(`?${k}`, 'true or false is expected');
-      out[k] = raw === 'true';
+      if (!['true', 'false', '1', '0'].includes(raw)) throw fail(`?${k}`, 'true or false (or 1 or 0) is expected');
+      out[k] = raw === 'true' || raw === '1';
     } else {
       out[k] = value(raw, s, `?${k}`);
     }

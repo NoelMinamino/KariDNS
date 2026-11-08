@@ -64,6 +64,8 @@ const GLOBAL_KEYS = {
   'rate-api': parseInt1,
   'rate-write': parseInt1,
   'scrypt-ln': parseScryptLn,
+  ui: parseBool,
+  'ui-dir': parseAbsPath,
   log: parseLog,
 };
 
@@ -95,6 +97,8 @@ export function defaults() {
     'rate-api': 20,
     'rate-write': 2,
     'scrypt-ln': 17,
+    ui: true,
+    'ui-dir': undefined,
     log: 'stderr',
   };
 }
@@ -159,6 +163,7 @@ export function validate(cfg) {
   if (s['session-idle'] < 1) problems.push('session-idle must be at least 1 second');
   if (s['session-max'] < s['session-idle']) problems.push('session-max must not be shorter than session-idle');
   if (Boolean(s['tls-cert']) !== Boolean(s['tls-key'])) problems.push("'tls-cert' and 'tls-key' go together");
+  if (s['ui-dir'] && !s.ui) problems.push("'ui-dir' names the files of the GUI, and ui = no switches the GUI off");
   if (s.listen) {
     const host = listenHost(s.listen);
     if (host !== null && !isLoopbackHost(host) && !s['tls-cert']) problems.push(`listen ${s.listen} is not a loopback address: plain HTTP is only allowed on 127.0.0.1, ::1 or a UNIX socket (put a TLS proxy in front, or set tls-cert and tls-key)`);

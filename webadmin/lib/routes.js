@@ -8,8 +8,7 @@ import * as write from './handlers/write.js';
 import * as versions from './handlers/versions.js';
 import * as templates from './handlers/templates.js';
 import { IMPORT_MS } from './http.js';
-
-const ZIP = 16 << 20;                       // a zone text travels in a JSON string: 16 MiB, received within 5 minutes (planning 8.2)
+import { ZONE_TEXT_LIMIT as ZIP } from './changes.js';           // a zone text travels in a JSON string: 16 MiB, received within 5 minutes (planning 8.2)
 
 export const ROUTES = [
   { method: 'GET', path: '/health', auth: 'none', handler: zones.health },
@@ -31,6 +30,7 @@ export const ROUTES = [
   { method: 'PATCH', path: '/principals/:id', handler: admin.principalUpdate },
   { method: 'DELETE', path: '/principals/:id', handler: admin.principalDelete },
   { method: 'PUT', path: '/principals/:id/password', handler: admin.principalPassword },
+  { method: 'POST', path: '/principals/:id/credentials', handler: admin.principalCredentials },
   { method: 'GET', path: '/principals/:id/members', handler: admin.membersList },
   { method: 'POST', path: '/principals/:id/members', handler: admin.memberAdd },
   { method: 'DELETE', path: '/principals/:id/members/:mid', handler: admin.memberRemove },

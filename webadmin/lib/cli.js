@@ -141,7 +141,7 @@ export async function main(argv, io = {}) {
     log.close();
     return 1;
   }
-  const app = new App({ config, backend, log, run: d.run, key });
+  const app = new App({ config, backend, log, run: d.run, key, ui: checked.ui });
   app.versions = checked.versions;
   app.types = checked.types ? new Set(checked.types) : null;
   let server;
