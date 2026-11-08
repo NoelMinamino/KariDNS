@@ -26,7 +26,9 @@
 --
 -- Version 1 had no karidns_zone_tagdefs.id (the rowid gave the order); db/karidns_ext_v1_to_v2.sqlite3.sql converts a database.
 -- Version 3 (0.6.0 item B) adds the audit tables karidns_audit_log and karidns_audit_actor; item C (the signer) adds karidns_key_requests and
--- karidns_signer_state (apply this file again to a version 3 file that lacks them).  The loader reads versions 1 to 3 and uses nothing of version 3.
+-- karidns_signer_state; items D and E (the API, zone versions) add karidns_zone_state (the zone generation, grown by the trigger karidns_changes_generation),
+-- karidns_zone_versions and karidns_zone_version_rrsets (apply this file again to a version 3 file that lacks them).  The loader reads versions 1 to 3 and
+-- uses nothing of version 3.
 --
 -- The retention is the number 1000000 in karidns_changes_prune below; tests/run_db_ddl_test.sh replaces it by 5 to test
 -- the pruning on a small scale.
@@ -40,6 +42,19 @@ CREATE TABLE IF NOT EXISTS karidns_changes (
   domain_id  INTEGER NOT NULL,
   changed_at INTEGER NOT NULL
 );
+
+-- The zone generation (0.6.0 items D and E, schema version 3): one row per zone with a number that grows whenever a row of the zone changes (records,
+-- domainmetadata, the karidns_* zone tables: the set that writes karidns_changes; the trigger karidns_changes_generation below follows the log).  The API
+-- (karidns-zone apply --expect-generation) validates a change against the generation it read and commits only when nobody changed the zone in between
+-- (SQLite3 has one writer at a time, so the check and the commit run cannot overlap; the generation tells that someone wrote between them).  It grows once
+-- per changed row (SQLite3 triggers are row level); only equality counts.  Every writer bumps it, the signer too (docs/karidns-dbloader.md).  A zone with no row
+-- has generation 0.
+CREATE TABLE IF NOT EXISTS karidns_zone_state (
+  domain_id  INTEGER PRIMARY KEY REFERENCES domains(id) ON UPDATE CASCADE ON DELETE CASCADE,
+  generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
+  changed_at INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO karidns_zone_state (domain_id) SELECT id FROM domains;
 
 CREATE TABLE IF NOT EXISTS karidns_domain_views (
   domain_id INTEGER NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
@@ -80,6 +95,21 @@ CREATE INDEX IF NOT EXISTS karidns_zone_tagdefs_domain_idx ON karidns_zone_tagde
 CREATE TRIGGER IF NOT EXISTS karidns_changes_prune AFTER INSERT ON karidns_changes
 BEGIN
   DELETE FROM karidns_changes WHERE seq <= NEW.seq - 1000000;
+END;
+
+-- the generation follows the change log: every row the log gets grows the generation of its zone, if the zone still exists (a zone that is deleted loses its
+-- state row and its versions with it: the foreign keys do it when PRAGMA foreign_keys=ON, the second trigger when it is off)
+CREATE TRIGGER IF NOT EXISTS karidns_changes_generation AFTER INSERT ON karidns_changes
+BEGIN
+  INSERT INTO karidns_zone_state (domain_id, generation, changed_at)
+    SELECT NEW.domain_id, 1, NEW.changed_at WHERE EXISTS (SELECT 1 FROM domains WHERE id = NEW.domain_id)
+    ON CONFLICT (domain_id) DO UPDATE SET generation = generation + 1, changed_at = excluded.changed_at;
+END;
+CREATE TRIGGER IF NOT EXISTS karidns_zone_state_del AFTER DELETE ON domains
+BEGIN
+  DELETE FROM karidns_zone_state WHERE domain_id = OLD.id;
+  DELETE FROM karidns_zone_version_rrsets WHERE version_id IN (SELECT id FROM karidns_zone_versions WHERE domain_id = OLD.id);
+  DELETE FROM karidns_zone_versions WHERE domain_id = OLD.id;
 END;
 
 -- domains (the key is id)
@@ -273,6 +303,51 @@ CREATE TABLE IF NOT EXISTS karidns_signer_state (
   last_duration_ms INTEGER NULL CHECK (last_duration_ms IS NULL OR last_duration_ms >= 0)
 );
 CREATE INDEX IF NOT EXISTS karidns_signer_state_due_idx ON karidns_signer_state (next_due);
+
+-- ---------------------------------------------------------------------------------------------------------------------------------
+-- Zone versions (0.6.0 item E, docs/karidns-zone.md "Versions"; schema version 3): one row per committed change set of one zone, written by
+-- `karidns-zone apply` (and `import`) in the transaction of the change itself.  Version numbers are per zone, from 1.  The same tables as on PostgreSQL
+-- (db/karidns_ext.pgsql.sql), with db_role written by the tool ('karidns-zone:<OS user>') and the API's principal in principal_id / principal_name.
+--   karidns_zone_versions         who, when, kind ('create' 'edit' 'template' 'import' 'rollback'), the change set id, the comment, the SOA serial and the zone
+--                                 generation before and after, rollback_of (the version a rollback restores), delta_complete (0: too big to store).
+--   karidns_zone_version_rrsets   the delta: for each RRset the version changed, the RRset before and after as canonical lines "<ttl> <TYPE> <rdata>" joined by
+--                                 LF (names absolute), NULL = absent.  DNSSEC types and a change of the SOA serial alone are not versioned.
+-- The newest 100 versions of a zone are kept: the number in the trigger karidns_zone_versions_prune (tests/run_db_ddl_test.sh replaces it).
+CREATE TABLE IF NOT EXISTS karidns_zone_versions (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  domain_id         INTEGER NOT NULL REFERENCES domains(id) ON UPDATE CASCADE ON DELETE CASCADE,
+  version           INTEGER NOT NULL CHECK (version >= 1),
+  kind              TEXT NOT NULL CHECK (kind IN ('create', 'edit', 'template', 'import', 'rollback')),
+  change_set        TEXT NULL CHECK (change_set IS NULL OR length(change_set) <= 64),
+  principal_id      INTEGER NULL,
+  principal_name    TEXT NULL CHECK (principal_name IS NULL OR length(principal_name) <= 255),
+  db_role           TEXT NULL,
+  at                TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+  comment           TEXT NULL CHECK (comment IS NULL OR length(CAST(comment AS BLOB)) <= 1024),
+  serial_before     INTEGER NULL CHECK (serial_before IS NULL OR serial_before BETWEEN 0 AND 4294967295),
+  serial_after      INTEGER NULL CHECK (serial_after IS NULL OR serial_after BETWEEN 0 AND 4294967295),
+  generation_before INTEGER NOT NULL,
+  generation_after  INTEGER NOT NULL,
+  rollback_of       INTEGER NULL CHECK (rollback_of IS NULL OR rollback_of >= 1),
+  delta_complete    INTEGER NOT NULL DEFAULT 1 CHECK (delta_complete IN (0, 1)),
+  UNIQUE (domain_id, version),
+  CONSTRAINT karidns_zone_versions_rollback_chk CHECK ((kind = 'rollback') = (rollback_of IS NOT NULL))
+);
+CREATE TABLE IF NOT EXISTS karidns_zone_version_rrsets (
+  version_id INTEGER NOT NULL REFERENCES karidns_zone_versions(id) ON DELETE CASCADE,
+  owner      TEXT NOT NULL CHECK (length(CAST(owner AS BLOB)) BETWEEN 1 AND 253),       -- lower case, no final dot (the form of records.name)
+  type       TEXT NOT NULL CHECK (length(type) BETWEEN 1 AND 32),
+  before     TEXT NULL,
+  after      TEXT NULL,
+  PRIMARY KEY (version_id, owner, type),
+  CHECK (before IS NOT NULL OR after IS NOT NULL)
+);
+-- prune: keep the newest 100 versions of the zone (the rows of their RRsets first: the foreign key does not do it unless PRAGMA foreign_keys=ON)
+CREATE TRIGGER IF NOT EXISTS karidns_zone_versions_prune AFTER INSERT ON karidns_zone_versions
+BEGIN
+  DELETE FROM karidns_zone_version_rrsets WHERE version_id IN (SELECT id FROM karidns_zone_versions WHERE domain_id = NEW.domain_id AND version <= NEW.version - 100);
+  DELETE FROM karidns_zone_versions WHERE domain_id = NEW.domain_id AND version <= NEW.version - 100;
+END;
 
 -- ---------------------------------------------------------------------------------------------------------------------------------
 -- == audit tables (schema version 3) ==    0.6.0 item B.  Everything above is version 2.

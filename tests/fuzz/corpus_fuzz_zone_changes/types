@@ -1,0 +1,6 @@
+# a comment
+
+rr fuzz.test. 3600 MX 10 mail
+rr fuzz.test. 3600 TXT "v=spf1 -all"
+rr _dmarc.fuzz.test. 300 TXT "v=DMARC1; p=none"
+rr *.fuzz.test. 60 CNAME www

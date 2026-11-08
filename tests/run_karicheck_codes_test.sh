@@ -294,8 +294,10 @@ cp "$T/exc.txt" "$T/skip.txt"
 [ $SWEEP = 1 ] || cat "$T/sweep.txt" >> "$T/skip.txt"
 # printed by the ZoneImporter / ZoneExporter (dns_zone_import.c, dns_zone_export.c) and by tools/karidns_zone.c, never by karicheck: tests/test_zone_import.c
 # checks that it printed each db.import.* and db.export.* of the library (all but db.import.rows, the rows of a parsed zone that cannot be written as
-# PowerDNS rows, and the three the tool prints), tests/run_karidns_zone_test.sh the codes of the tool
+# PowerDNS rows, and the three the tool prints), tests/run_karidns_zone_test.sh the codes of the tool; db.apply.* are printed by karidns-zone apply (tests/test_zone_import.c, tests/run_karidns_zone_apply_test.sh)
 cat > "$T/zonetool.txt" <<'EOF'
+db.apply.changes
+db.apply.zone
 db.export.not-found
 db.export.open
 db.export.read

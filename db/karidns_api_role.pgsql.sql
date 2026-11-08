@@ -24,8 +24,10 @@
 --     (the signer's schedule and last error of the zones it has a grant on; the signer writes it); SELECT on karidns_schema_version; on cryptokeys only the COLUMN privilege SELECT (id, domain_id, flags, active, published), never `content`; USAGE on the
 --     sequences behind the serial columns.  Nothing on karidns_changes: the change log and the prune of the reload requests are written by the
 --     triggers of the data tables, which run as the owner.  karidns_auth: SELECT, INSERT, UPDATE, DELETE on principals, memberships, rr_policies, grants and
---     credentials (the only role that reads them); SELECT on principal_closure, audit_log and schema_version; EXECUTE on the RLS functions and
---     bump_serial.  Nothing else: no TRUNCATE, no write to the audit log, nothing on the key material, karidns_profiles or karidns_server_status.
+--     credentials (the only role that reads them); SELECT, INSERT, UPDATE, DELETE on sessions, api_tokens, templates and template_records;
+--     SELECT on principal_closure, audit_log and schema_version; EXECUTE on the RLS functions, bump_serial, session_lookup and api_token_lookup.  Data schema, besides:
+--     SELECT on karidns_server_status and karidns_zone_state, SELECT and INSERT on karidns_zone_versions and karidns_zone_version_rrsets (item E).
+--     Nothing else: no TRUNCATE, no write to the audit log, nothing on the key material or karidns_profiles.
 --   * the role's name is added to karidns_auth.audit_restricted_roles (it cannot turn the detail of the audit log off) and karidns_auth.api_roles (the trigger
 --     on grants applies the no-escalation rules to its sessions, and to the sessions of the roles that are members of it).
 --   * RLS is switched on (ALTER TABLE ... ENABLE ROW LEVEL SECURITY; the table owner is exempt) for domains, records, domainmetadata, cryptokeys,
@@ -68,6 +70,9 @@ GRANT SELECT ON :"schema".karidns_schema_version TO :"role";
 GRANT SELECT ON :"schema".karidns_key_requests TO :"role";
 GRANT INSERT (domain_id, kind, algorithm, bits, key_type, nsec, requested_by) ON :"schema".karidns_key_requests TO :"role";     -- a request, not its answer (state, message, done_at, created_at keep their defaults)
 GRANT SELECT ON :"schema".karidns_signer_state TO :"role";                         -- when a zone was signed, and why it was not (the signer owns the table)
+GRANT SELECT ON :"schema".karidns_server_status TO :"role";                        -- per server: the generation it applied, ok, the zones that failed (the loaders write it)
+GRANT SELECT ON :"schema".karidns_zone_state TO :"role";                            -- the generation of the zones it has a grant on (the triggers of the owner write it)
+GRANT SELECT, INSERT ON :"schema".karidns_zone_versions, :"schema".karidns_zone_version_rrsets TO :"role";   -- the history of a zone: read it, append to it; no UPDATE, no DELETE
 GRANT SELECT (id, domain_id, flags, active, published) ON :"schema".cryptokeys TO :"role";
 
 -- the sequences behind the serial columns of the tables the role inserts into (karidns_reload_requests has an identity column: no grant needed)
@@ -77,7 +82,7 @@ SELECT format('GRANT USAGE ON SEQUENCE %I.%I TO %I', n.nspname, s.relname, :'rol
   JOIN pg_depend d ON d.objid = s.oid AND d.deptype IN ('a', 'i')
   JOIN pg_class t ON t.oid = d.refobjid AND t.relnamespace = n.oid
  WHERE s.relkind = 'S' AND n.nspname = :'schema'
-   AND t.relname IN ('domains', 'records', 'domainmetadata', 'karidns_zone_tagdefs', 'karidns_key_requests')
+   AND t.relname IN ('domains', 'records', 'domainmetadata', 'karidns_zone_tagdefs', 'karidns_key_requests', 'karidns_zone_versions')
 \gexec
 
 -- karidns_auth: a clean slate first, then exactly the rights below
@@ -87,7 +92,9 @@ REVOKE ALL ON ALL SEQUENCES IN SCHEMA karidns_auth FROM :"role";
 GRANT SELECT, INSERT, UPDATE, DELETE ON karidns_auth.principals, karidns_auth.memberships, karidns_auth.rr_policies, karidns_auth.grants,
   karidns_auth.credentials TO :"role";
 GRANT SELECT ON karidns_auth.principal_closure, karidns_auth.audit_log, karidns_auth.schema_version TO :"role";
-GRANT USAGE ON SEQUENCE karidns_auth.principals_id_seq, karidns_auth.rr_policies_id_seq, karidns_auth.grants_id_seq TO :"role";
+GRANT SELECT, INSERT, UPDATE, DELETE ON karidns_auth.sessions, karidns_auth.api_tokens, karidns_auth.templates, karidns_auth.template_records TO :"role";
+GRANT USAGE ON SEQUENCE karidns_auth.principals_id_seq, karidns_auth.rr_policies_id_seq, karidns_auth.grants_id_seq, karidns_auth.api_tokens_id_seq,
+  karidns_auth.templates_id_seq TO :"role";
 
 -- the functions the policies call run as the role that runs the statement
 GRANT EXECUTE ON FUNCTION karidns_auth.current_principal(), karidns_auth.my_groups(), karidns_auth.zone_grant(text, text), karidns_auth.is_global(),
@@ -98,6 +105,8 @@ SELECT format('GRANT EXECUTE ON FUNCTION %s(), %s(bigint, text) TO %I, karidns_r
               karidns_auth.fast_fn(:'schema', 'name_in_zone'), :'role')
 \gexec
 GRANT EXECUTE ON FUNCTION karidns_auth.bump_serial(text, integer) TO :"role";
+-- the lookups of a session by the hash of its cookie and of a token by its id and the hash of its secret (the policies show a principal its own rows only)
+GRANT EXECUTE ON FUNCTION karidns_auth.session_lookup(bytea), karidns_auth.api_token_lookup(bigint, bytea) TO :"role";
 
 -- the audit log cannot be switched to summary mode by the role, and the grant trigger applies to it
 INSERT INTO karidns_auth.audit_restricted_roles (role_name) VALUES (:'role') ON CONFLICT DO NOTHING;

@@ -31,6 +31,9 @@ struct zi_s {
     char zone_type[16];                             /* upper case, "" = NATIVE */
     zmsg_t msg;
     int demoted;                                    /* findings of the zone checks that a partial file (merge, types) is not judged by */
+    const zi_apply_in_t *ap;                        /* apply: the change set being applied (NULL for an import) */
+    char **delkeys;                                 /* apply: owner (lower case, no final dot) and type (upper case) of the RRsets to delete, one after the other */
+    size_t ndelkeys;                                /* the number of strings (twice the number of RRsets) */
 };
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -68,6 +71,8 @@ void zi_close(zi_t *z) {
     if (z->conn) z->drv->close(z->conn);
     for (size_t i = 0; i < z->ntypes; i++) free(z->types[i]);
     free(z->types);
+    for (size_t i = 0; i < z->ndelkeys; i++) free(z->delkeys[i]);
+    free(z->delkeys);
     free(z);
 }
 
@@ -148,7 +153,7 @@ zi_t *zi_open(const zi_opts_t *o) {
         return NULL;
     }
     /* a signer import reads the zone and writes it as one snapshot (PostgreSQL: REPEATABLE READ), so that a change made in between is an error, not a lost update */
-    if (o->signer && z->drv->w_set_snapshot && z->drv->w_set_snapshot(z->conn, true) != 0) {
+    if ((o->signer || o->snapshot) && z->drv->w_set_snapshot && z->drv->w_set_snapshot(z->conn, true) != 0) {
         zmsg_emit(&m, DIAG_ERROR, DC_DB_IMPORT_OPEN, NULL, "%s", z->drv->errmsg(z->conn));
         zi_close(z);
         return NULL;
@@ -444,7 +449,7 @@ static int zi_cb_zone(void *ud, const db_zone_row_t *r) {
 }
 
 /* one record as the comparisons and the report see it */
-typedef struct { const char *owner, *type, *content; int64_t ttl, prio; } rrv_t;
+typedef struct { const char *owner, *type, *content; int64_t ttl, prio; int64_t id; bool disabled; } rrv_t;      /* id: records.id of a row of the database; the index into ins[] of a row to insert */
 
 static int zi_cmp_key(const rrv_t *a, const rrv_t *b) {
     int c = strcmp(a->owner, b->owner);
@@ -460,7 +465,7 @@ static int zi_cmp_rrv(const void *x, const void *y) {
     return strcmp(a->content, b->content);
 }
 
-typedef struct { char what; const char *owner, *type; } zi_item_t;
+typedef struct { char what; const char *owner, *type; size_t alo, ahi, blo, bhi; } zi_item_t;     /* [alo, ahi) of the sorted old rows, [blo, bhi) of the sorted new rows */
 
 /* The RRsets of the rows a (deleted) against those of b (inserted): in a only '-', in b only '+', in both with other rows '~'. */
 static bool zi_diff(rrv_t *a, size_t na, rrv_t *b, size_t nb, bool want_items, zi_item_t **out, size_t *nout, zi_result_t *res) {
@@ -477,18 +482,18 @@ static bool zi_diff(rrv_t *a, size_t na, rrv_t *b, size_t nb, bool want_items, z
         if (c >= 0)
             while (je < nb && zi_cmp_key(&b[je], &b[j]) == 0) je++;
         if (c < 0) {
-            if (items) items[n] = (zi_item_t){ '-', a[i].owner, a[i].type };
+            if (items) items[n] = (zi_item_t){ '-', a[i].owner, a[i].type, i, ie, 0, 0 };
             n++;
             res->rrsets_deleted++;
         } else if (c > 0) {
-            if (items) items[n] = (zi_item_t){ '+', b[j].owner, b[j].type };
+            if (items) items[n] = (zi_item_t){ '+', b[j].owner, b[j].type, 0, 0, j, je };
             n++;
             res->rrsets_added++;
         } else {
             bool same = ie - i == je - j;
             for (size_t k = 0; same && k < ie - i; k++) same = zi_cmp_rrv(&a[i + k], &b[j + k]) == 0;
             if (!same) {
-                if (items) items[n] = (zi_item_t){ '~', b[j].owner, b[j].type };
+                if (items) items[n] = (zi_item_t){ '~', b[j].owner, b[j].type, i, ie, j, je };
                 n++;
                 res->rrsets_replaced++;
             }
@@ -499,6 +504,17 @@ static bool zi_diff(rrv_t *a, size_t na, rrv_t *b, size_t nb, bool want_items, z
     *out = items;
     *nout = items ? n : 0;
     return true;
+}
+
+/* is there a row of key's RRset (owner, type) in v, which is sorted by zi_cmp_rrv? */
+static bool zi_has_key(const rrv_t *v, size_t n, const rrv_t *key) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (zi_cmp_key(&v[mid], key) < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < n && zi_cmp_key(&v[lo], key) == 0;
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -534,10 +550,31 @@ static char *zi_soa_with_serial(const char *content, uint32_t serial) {
 /* one zone into the database                                                                                     */
 /* ------------------------------------------------------------------------------------------------------------- */
 
+/* What a failed driver call was (the drivers end the message of a conflict with "(changed concurrently)" and of a transient condition with "(retry later)"): for an
+ * apply a conflict is ZI_CHANGED and a transient condition ZI_BUSY, so that the caller can try again; an import has only ZI_FAIL */
+static int zi_err_class(const char *m) {
+    static const char conflict[] = "(changed concurrently)", retry[] = "(retry later)";
+    size_t n = strlen(m);
+    if (n >= sizeof(conflict) - 1 && strcmp(m + n - (sizeof(conflict) - 1), conflict) == 0) return DB_ERR_CONFLICT;
+    if (n >= sizeof(retry) - 1 && strcmp(m + n - (sizeof(retry) - 1), retry) == 0) return DB_ERR_RETRY;
+    return 0;
+}
+
 static int zi_dbfail(zi_t *z, const char *what) {
-    ZI_ERR(z, DC_DB_IMPORT_WRITE, NULL, "%s: %s; the transaction was rolled back and nothing was written", what, z->drv->errmsg(z->conn));
+    const char *m = z->drv->errmsg(z->conn);
+    int cls = z->ap ? zi_err_class(m) : 0;
+    if (cls == DB_ERR_CONFLICT) {
+        ZI_ERR(z, DC_DB_IMPORT_CHANGED, NULL, "Zone changed while the change was being written (%s: %s); nothing was written; try again", what, m);
+        return ZI_CHANGED;
+    }
+    if (cls == DB_ERR_RETRY) {
+        ZI_ERR(z, DC_DB_IMPORT_BUSY, NULL, "The database is busy (%s: %s); nothing was written; try again", what, m);
+        return ZI_BUSY;
+    }
+    ZI_ERR(z, DC_DB_IMPORT_WRITE, NULL, "%s: %s; the transaction was rolled back and nothing was written", what, m);
     return ZI_FAIL;
 }
+
 
 static bool zi_type_wanted(const zi_t *z, const char *type) {
     if (z->ntypes == 0) return true;
@@ -646,6 +683,359 @@ static int zi_cb_signer_meta(void *ud, const db_meta_row_t *m) {
     return 0;
 }
 
+/* ------------------------------------------------------------------------------------------------------------- */
+/* apply (items D and E): the serial, the narrow read-back, the RRsets changed and the version row                 */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+#define ZI_DELTA_MAX 10000u                             /* RRsets of one change that a version stores (A-13); more: delta_complete = false */
+
+static void zi_change_free(zi_change_t *c) {
+    free(c->owner);
+    free(c->type);
+    free(c->before);
+    free(c->after);
+    memset(c, 0, sizeof(*c));
+}
+
+void zi_result_free(zi_result_t *res) {
+    for (size_t i = 0; i < res->n_items; i++) zi_change_free(&res->items[i]);
+    free(res->items);
+    res->items = NULL;
+    res->n_items = 0;
+}
+
+/* the content of the enabled SOA record at the apex of the zone in the rows read; NULL if there is none */
+static const char *zi_apex_soa(const dbrecs_t *db, const char *zone) {
+    for (size_t i = 0; i < db->n; i++)
+        if (!db->v[i].disabled && strcmp(db->v[i].type, "SOA") == 0 && strcmp(db->v[i].owner, zone) == 0) return db->v[i].content;
+    return NULL;
+}
+
+/* Raise the serial of the apex SOA by one (RFC 1982 section 3.1: 4294967295 + 1 = 0).  The API's role may not write an SOA row; it calls karidns_auth.bump_serial(),
+ * which does the same.  false: a message was given (*status says what the caller reports). */
+static bool zi_bump_serial(zi_t *z, const dbrecs_t *db, const char *zone, int64_t did, bool api, const char *shown, zi_result_t *res, int *status) {
+    const dbrec_t *soa = NULL;
+    uint32_t s = 0;
+    for (size_t i = 0; i < db->n && !soa; i++)
+        if (!db->v[i].disabled && strcmp(db->v[i].type, "SOA") == 0 && strcmp(db->v[i].owner, zone) == 0) soa = &db->v[i];
+    if (!soa || !pdns_soa_serial(soa->content, &s)) {
+        ZI_ERR(z, DC_DB_IMPORT_SERIAL, shown, "Zone '%s' has no SOA record with a serial that can be raised", zone);
+        return false;
+    }
+    const uint32_t ns = s + 1u;
+    char *nc = zi_soa_with_serial(soa->content, ns);
+    if (!nc) {
+        ZI_ERR(z, DC_INTERNAL_OOM, shown, "out of memory");
+        return false;
+    }
+    uint32_t got = ns;
+    int rc = z->drv->w_bump_serial(z->conn, did, soa->id, nc, api, &got);
+    free(nc);
+    if (rc != 0) {
+        *status = zi_dbfail(z, "raising the SOA serial");
+        return false;
+    }
+    if (got != ns) {
+        ZI_ERR(z, DC_DB_IMPORT_WRITE, shown, "Zone '%s': the SOA serial became %u, not %u; the transaction was rolled back and nothing was written", zone, (unsigned)got, (unsigned)ns);
+        return false;
+    }
+    res->has_old_serial = true;
+    res->old_serial = s;
+    res->new_serial = ns;
+    res->serial_bumped = true;
+    return true;
+}
+
+static int zi_cmp_i64(const void *x, const void *y) {
+    int64_t a = *(const int64_t *)x, b = *(const int64_t *)y;
+    return a < b ? -1 : a > b;
+}
+
+/* a record row that holds the apex SOA of the zone, to make a few rows a zone for the loader's reader */
+static void zi_soa_row(db_record_row_t *row, int64_t id, const char *zone, const char *content) {
+    memset(row, 0, sizeof(*row));
+    row->id = id;
+    row->name = zone;
+    row->type = "SOA";
+    row->content = content;
+    row->ttl = 3600;
+}
+
+typedef struct { pdns_zone_t *pz; const int64_t *ids; size_t nids, seen; } zvc_t;
+
+static int zi_cb_changed(void *ud, int64_t did, const db_record_row_t *r) {
+    zvc_t *v = ud;
+    (void)did;
+    if (!bsearch(&r->id, v->ids, v->nids, sizeof(*v->ids), zi_cmp_i64)) return 0;
+    v->seen++;
+    return pdns_zone_add_record(v->pz, r) != 0;
+}
+
+/* The read-back of the commit run of the API: only the rows this transaction wrote (rids), read from the database and handed to the loader's reader, which checks each
+ * (the line-safety rules, the TTL, the RDATA, the decoder of the Backend) - together with the zone's SOA, so that they are a zone for it.  The checks of the whole zone
+ * (a CNAME beside other data, the size limits, karicheck db) were made by the check run, at the same generation; row level security shows the API's session only the
+ * part of the zone its principal has a grant on, so a read-back of the whole zone would judge a part.  That every row written is read back is checked too: a row that
+ * is not there was changed or hidden by a trigger or a policy. */
+static bool zi_verify_changed(zi_t *z, const char *zone, int64_t did, const char *shown, const int64_t *rids, size_t nrids, const char *soa_content, zi_result_t *res) {
+    int64_t *ids = malloc((nrids ? nrids : 1) * sizeof(*ids));
+    pdns_zone_t *pz = pdns_zone_new(zone, &z->o.reader);
+    bool ok = false;
+    if (!ids || !pz) {
+        ZI_ERR(z, DC_INTERNAL_OOM, shown, "out of memory");
+        goto out;
+    }
+    memcpy(ids, rids, nrids * sizeof(*ids));
+    qsort(ids, nrids, sizeof(*ids), zi_cmp_i64);
+    zvc_t v = { pz, ids, nrids, 0 };
+    int rc = z->drv->scan_records(z->conn, &did, zi_cb_changed, &v);
+    if (rc != 0 && rc != DB_STOPPED) {
+        zi_dbfail(z, "reading back the rows written");
+        goto out;
+    }
+    if (pz->failed) {
+        ZI_ERR(z, DC_DB_IMPORT_VERIFY, shown, "Zone '%s': the loader's reader refuses the rows just written: %s; the transaction was rolled back and nothing was written", zone, pz->error);
+        goto out;
+    }
+    if (v.seen != nrids) {
+        ZI_ERR(z, DC_DB_IMPORT_VERIFY, shown, "Zone '%s': %zu of the %zu rows just written could be read back (a trigger or row level security changed or hid the rest); the transaction was rolled back "
+               "and nothing was written", zone, v.seen, nrids);
+        goto out;
+    }
+    if (!res->wrote_soa) {
+        db_record_row_t soa;
+        if (!soa_content) {
+            ZI_ERR(z, DC_DB_IMPORT_VERIFY, shown, "Zone '%s' has no SOA record; the transaction was rolled back and nothing was written", zone);
+            goto out;
+        }
+        zi_soa_row(&soa, INT64_C(1) << 62, zone, soa_content);
+        if (pdns_zone_add_record(pz, &soa) != 0) {
+            ZI_ERR(z, DC_DB_IMPORT_VERIFY, shown, "Zone '%s': %s; the transaction was rolled back and nothing was written", zone, pz->error);
+            goto out;
+        }
+    }
+    if (pdns_zone_finish(pz) != 0) {
+        ZI_ERR(z, DC_DB_IMPORT_VERIFY, shown, "Zone '%s': the loader's reader refuses the rows just written: %s; the transaction was rolled back and nothing was written", zone, pz->error);
+        goto out;
+    }
+    ok = true;
+out:
+    pdns_zone_free(pz);
+    free(ids);
+    return ok;
+}
+
+/* The canonical lines of the RRsets of items, one side: after == false the rows deleted (the ranges [alo, ahi) of v), true the rows inserted ([blo, bhi)).  The rows of
+ * all the items make one small zone with the zone's SOA, which the loader's reader turns into records (so MX and SRV priorities, names and strings are what the exporter
+ * would write); texts[i] is NULL for an item that has no row on that side.  false: err says why. */
+static bool zi_side(zi_t *z, const char *zone, const char *soa_content, const rrv_t *v, const zi_item_t *it, size_t nit, bool after, char **texts, char *err, size_t errlen) {
+    bool ok = false;
+    pdns_zone_t *pz = pdns_zone_new(zone, &z->o.reader);
+    size_t *base = calloc(nit ? nit : 1, sizeof(*base)), *cnt = calloc(nit ? nit : 1, sizeof(*cnt));
+    const dns_record_t **recs = NULL;
+    int64_t next = 1;
+    bool has_soa = false;
+    if (!pz || !base || !cnt) {
+        snprintf(err, errlen, "out of memory");
+        goto out;
+    }
+    for (size_t i = 0; i < nit; i++) {
+        const bool wanted = after ? (it[i].what == '+' || it[i].what == '~') : (it[i].what == '-' || it[i].what == '~');
+        const size_t lo = after ? it[i].blo : it[i].alo, hi = after ? it[i].bhi : it[i].ahi;
+        texts[i] = NULL;
+        if (!wanted || !it[i].type[0]) continue;
+        base[i] = (size_t)next;
+        for (size_t j = lo; j < hi; j++) {
+            const rrv_t *r = &v[j];
+            if (r->disabled) continue;
+            db_record_row_t row;
+            memset(&row, 0, sizeof(row));
+            row.id = next++;
+            row.name = r->owner;
+            row.type = r->type;
+            row.content = r->content;
+            row.ttl_null = r->ttl < 0;
+            row.ttl = r->ttl < 0 ? 0 : r->ttl;
+            row.prio_null = r->prio < 0;
+            row.prio = r->prio < 0 ? 0 : r->prio;
+            if (strcmp(r->type, "SOA") == 0 && strcmp(r->owner, zone) == 0) has_soa = true;
+            cnt[i]++;
+            if (pdns_zone_add_record(pz, &row) != 0) {
+                snprintf(err, errlen, "%s", pz->error);
+                goto out;
+            }
+        }
+    }
+    if (next == 1) {                                    /* no row on this side (a new zone has nothing before): nothing to write */
+        ok = true;
+        goto out;
+    }
+    if (!has_soa) {
+        db_record_row_t soa;
+        if (!soa_content) {
+            snprintf(err, errlen, "the zone has no SOA record");
+            goto out;
+        }
+        zi_soa_row(&soa, next++, zone, soa_content);
+        if (pdns_zone_add_record(pz, &soa) != 0) {
+            snprintf(err, errlen, "%s", pz->error);
+            goto out;
+        }
+    }
+    if (pdns_zone_finish(pz) != 0) {
+        snprintf(err, errlen, "%s", pz->error);
+        goto out;
+    }
+    recs = malloc((pz->n_rows + 1) * sizeof(*recs));
+    if (!recs) {
+        snprintf(err, errlen, "out of memory");
+        goto out;
+    }
+    size_t k = 0;
+    for (size_t i = 0; i < nit; i++) {
+        if (!cnt[i]) continue;
+        size_t nr = 0;
+        while (k < pz->n_rows && (size_t)pz->line_id[k] < base[i]) k++;
+        while (k < pz->n_rows && (size_t)pz->line_id[k] < base[i] + cnt[i]) recs[nr++] = &pz->arena.records[k++];
+        if (nr != cnt[i]) {
+            snprintf(err, errlen, "the loader's reader made %zu records of the %zu rows of %s %s", nr, cnt[i], it[i].owner, it[i].type);
+            goto out;
+        }
+        if (!(texts[i] = dns_zone_text_rrset_lines(recs, nr, err, errlen))) goto out;
+    }
+    ok = true;
+out:
+    free(recs);
+    free(base);
+    free(cnt);
+    pdns_zone_free(pz);
+    return ok;
+}
+
+/* "<ttl> SOA <mname> <rname> <serial> <refresh> ..." without the serial, for the comparison of two SOA lines; false if the line is not one */
+static bool zi_soa_noserial(const char *line, char *out, size_t cap) {
+    const char *p = line;
+    size_t w = 0;
+    for (int f = 0; f < 5; f++) {
+        const char *e = p;
+        while (*e && *e != ' ') e++;
+        if (f != 4) {
+            if (w + (size_t)(e - p) + 2 > cap) return false;
+            memcpy(out + w, p, (size_t)(e - p));
+            w += (size_t)(e - p);
+            out[w++] = ' ';
+        }
+        if (!*e && f < 4) return false;
+        p = *e ? e + 1 : e;
+    }
+    if (w + strlen(p) + 1 > cap) return false;
+    strcpy(out + w, p);
+    return true;
+}
+
+/* is the change of this SOA RRset the serial alone?  (the serial is not versioned: a rollback always raises it, CK-8) */
+static bool zi_soa_serial_only(const zi_change_t *c) {
+    char a[1024], b[1024];
+    if (strcmp(c->type, "SOA") != 0 || !c->before || !c->after) return false;
+    return zi_soa_noserial(c->before, a, sizeof(a)) && zi_soa_noserial(c->after, b, sizeof(b)) && strcmp(a, b) == 0;
+}
+
+/* The RRsets of the change with their lines, and the version row with its RRset rows (before the commit; a dry run rolls them back with the rest).  An import keeps the items
+ * for the version only and writes them while the change is not bigger than ZI_DELTA_MAX RRsets; an apply always has them.  false: a message was given. */
+static bool zi_record_change(zi_t *z, const char *zone, int64_t did, const char *soa_content, const rrv_t *va, const rrv_t *vb, const zi_item_t *it, size_t nit, uint64_t gen0, bool has_gen,
+                             const zi_apply_in_t *ap, zi_result_t *res, zi_change_t **chg, size_t *nchg, int *status) {
+    const db_driver_t *d = z->drv;
+    const bool full = ap != NULL || nit <= ZI_DELTA_MAX;
+    char **bt = NULL, **at = NULL;
+    char err[600] = "";
+    bool ok = false;
+    if (full) {
+        bt = calloc(nit ? nit : 1, sizeof(*bt));
+        at = calloc(nit ? nit : 1, sizeof(*at));
+        *chg = calloc(nit ? nit : 1, sizeof(**chg));
+        if (!bt || !at || !*chg) {
+            ZI_ERR(z, DC_INTERNAL_OOM, NULL, "out of memory");
+            goto out;
+        }
+        if (!zi_side(z, zone, soa_content, va, it, nit, false, bt, err, sizeof(err)) || !zi_side(z, zone, soa_content, vb, it, nit, true, at, err, sizeof(err))) {
+            ZI_ERR(z, DC_DB_IMPORT_VERIFY, NULL, "Zone '%s': the RRsets of the change cannot be written as text: %s; the transaction was rolled back and nothing was written", zone, err);
+            goto out;
+        }
+        for (size_t i = 0; i < nit; i++) {
+            if (!it[i].type[0]) continue;                       /* an empty non-terminal is no RRset */
+            zi_change_t *c = &(*chg)[(*nchg)++];
+            c->what = it[i].what;
+            c->owner = strdup(it[i].owner);
+            c->type = strdup(it[i].type);
+            c->before = bt[i];
+            c->after = at[i];
+            bt[i] = at[i] = NULL;
+            if (!c->owner || !c->type) {
+                ZI_ERR(z, DC_INTERNAL_OOM, NULL, "out of memory");
+                goto out;
+            }
+        }
+    }
+    res->delta_complete = full;
+    if (z->si.has_versions) {
+        size_t nver = 0;
+        for (size_t i = 0; i < *nchg; i++)
+            if (!zi_soa_serial_only(&(*chg)[i])) nver++;
+        if (full && nver == 0) {                              /* nothing but the serial of the SOA changed: no version */
+            ok = true;
+            goto out;
+        }
+        uint64_t gen_after = 0;
+        if (has_gen && d->w_zone_generation(z->conn, did, &gen_after) != 0) {
+            *status = zi_dbfail(z, "reading the generation of the zone");
+            goto out;
+        }
+        db_version_t v;
+        memset(&v, 0, sizeof(v));
+        v.kind = ap ? (ap->create ? "create" : ap->kind ? ap->kind : "edit") : "import";
+        v.has_serial_before = res->has_old_serial;
+        v.serial_before = res->old_serial;
+        v.has_serial_after = res->wrote_soa || res->serial_bumped || res->has_old_serial;
+        v.serial_after = res->wrote_soa || res->serial_bumped ? res->new_serial : res->old_serial;
+        v.generation_before = gen0;
+        v.generation_after = gen_after;
+        v.delta_complete = full;
+        v.db_role = strcmp(d->name, "postgresql") == 0 ? NULL : z->o.audit_actor;      /* PostgreSQL: the database session's own role, as the audit log has it */
+        if (ap) {
+            v.change_set = ap->actor.change_set;
+            v.has_principal = ap->actor.has_principal;
+            v.principal_id = ap->actor.principal_id;
+            v.principal_name = ap->actor.principal_name;
+            v.comment = ap->comment;
+            v.rollback_of = ap->rollback_of;
+        }
+        uint32_t number = 0;
+        int64_t vid = 0;
+        if (d->w_insert_version(z->conn, did, &v, &number, &vid) != 0) {
+            *status = zi_dbfail(z, "writing the version of the zone");
+            goto out;
+        }
+        for (size_t i = 0; full && i < *nchg; i++) {
+            const zi_change_t *c = &(*chg)[i];
+            if (zi_soa_serial_only(c)) continue;
+            if (d->w_insert_version_rrset(z->conn, vid, c->owner, c->type, c->before, c->after) != 0) {
+                *status = zi_dbfail(z, "writing the RRsets of the version of the zone");
+                goto out;
+            }
+        }
+        res->has_version = true;
+        res->version = number;
+    }
+    ok = true;
+out:
+    if (bt)
+        for (size_t i = 0; i < nit; i++) free(bt[i]);
+    if (at)
+        for (size_t i = 0; i < nit; i++) free(at[i]);
+    free(bt);
+    free(at);
+    return ok;
+}
+
 /* Everything in the transaction.  Returns ZI_OK, ZI_FAIL or ZI_BUSY; the caller rolls back unless this committed (res->committed). */
 static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res) {
     const db_driver_t *d = z->drv;
@@ -666,6 +1056,15 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
     bool in_tx = false;
     bool szone = false;                                 /* the zone is signed by karidns-signer: its DNSSEC records and signer metadata stay */
     size_t nignored = 0;                                /* DNSSEC records of the input that a signer zone does not take */
+    const zi_apply_in_t *ap = z->ap;
+    rrv_t *dk = NULL;                                   /* apply: the RRsets the change file deletes, sorted */
+    size_t ndk = 0;
+    int64_t *rids = NULL;                               /* the records.id of each row inserted (parallel to ins) */
+    uint64_t gen0 = 0;
+    bool has_gen = false;
+    uint64_t nrec_before = 0, nrec_del = 0;
+    zi_change_t *chg = NULL;                            /* the RRsets changed, with their lines (an import keeps them for the version only) */
+    size_t nchg = 0;
 
     if ((rows->tags || rows->td || rows->ndefs) && !z->si.has_ext) {
         ZI_ERR(z, DC_DB_IMPORT_SCHEMA, shown, "Zone '%s' has tags, tinydns attributes or tag definitions, but the database has no karidns_record_tags / "
@@ -691,7 +1090,7 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
             ZI_ERR(z, DC_DB_IMPORT_BUSY, shown, "Zone '%s' is locked by another import or the database is busy: %s", rows->zone, d->errmsg(c));
             status = ZI_BUSY;
         } else {
-            zi_dbfail(z, "begin");
+            status = zi_dbfail(z, "begin");
         }
         goto out;
     }
@@ -699,20 +1098,56 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
 
     zf.want = rows->zone;
     if ((rc = d->find_zone(c, rows->zone, zi_cb_zone, &zf)) != 0) {
-        zi_dbfail(z, "finding the zone");
+        status = zi_dbfail(z, "finding the zone");
         goto out;
     }
     if (zf.ambiguous) {
         ZI_ERR(z, DC_DB_IMPORT_WRITE, shown, "More than one domains row is called '%s' (names that differ in case); nothing was written", rows->zone);
         goto out;
     }
+    if (ap) {
+        if (ap->create && zf.found) {
+            ZI_ERR(z, DC_DB_APPLY_ZONE, shown, "Zone '%s' exists already; --create makes a new zone", rows->zone);
+            goto out;
+        }
+        if (!ap->create && !zf.found) {
+            ZI_ERR(z, DC_DB_APPLY_ZONE, shown, "Zone '%s' is not in the database (--create makes a new zone)", rows->zone);
+            goto out;
+        }
+        if (zf.found && !zi_primary_type(zf.type)) {
+            ZI_ERR(z, DC_DB_APPLY_ZONE, shown, "Zone '%s' has domains.type %s: a change set is applied to a primary zone (NATIVE or MASTER)", rows->zone, zf.type);
+            goto out;
+        }
+    }
+    /* the generation of the zone (item D): read first, in the snapshot of the transaction, so that the answer is the zone the rest of this transaction sees */
+    if (z->si.has_zone_state) {
+        if (zf.found && d->w_zone_generation(c, zf.id, &gen0) != 0) {
+            status = zi_dbfail(z, "reading the generation of the zone");
+            goto out;
+        }
+        has_gen = true;
+    }
+    if (ap && ap->have_expect) {
+        if (!has_gen) {
+            ZI_ERR(z, DC_DB_IMPORT_SCHEMA, shown, "--expect-generation was given but the database has no karidns_zone_state table (apply db/karidns_ext.*.sql)");
+            goto out;
+        }
+        if (gen0 != ap->expect_generation) {
+            ZI_ERR(z, DC_DB_IMPORT_CHANGED, shown, "Zone '%s' is at generation %llu, not at %llu as expected; nothing was written", rows->zone, (unsigned long long)gen0,
+                   (unsigned long long)ap->expect_generation);
+            status = ZI_CHANGED;
+            goto out;
+        }
+    }
     if (zf.found && d->scan_records(c, &zf.id, zi_cb_rec, &db) != 0) {
-        zi_dbfail(z, "reading the records of the zone");
+        status = zi_dbfail(z, "reading the records of the zone");
         goto out;
     }
     if (db.oom) goto oom;
+    for (size_t i = 0; i < db.n; i++)
+        if (!db.v[i].disabled && db.v[i].type[0]) nrec_before++;
     if (zf.found && d->scan_metadata(c, &zf.id, zi_cb_signer_meta, &szone) != 0) {
-        zi_dbfail(z, "reading the metadata of the zone");
+        status = zi_dbfail(z, "reading the metadata of the zone");
         goto out;
     }
     if (szone) {                                        /* the DNSSEC records of the input are the signer's business: ignored */
@@ -755,10 +1190,11 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
     }
 
     vb = malloc((nins ? nins : 1) * sizeof(*vb));
-    if (!vb) goto oom;
+    rids = malloc((nins ? nins : 1) * sizeof(*rids));
+    if (!vb || !rids) goto oom;
     for (size_t k = 0; k < nins; k++) {
         const db_record_row_t *r = &rows->rows[ins[k]];
-        vb[k] = (rrv_t){ r->name, r->type ? r->type : "", r->content ? r->content : "", r->ttl_null ? -1 : r->ttl, r->prio_null ? -1 : r->prio };
+        vb[k] = (rrv_t){ r->name, r->type ? r->type : "", r->content ? r->content : "", r->ttl_null ? -1 : r->ttl, r->prio_null ? -1 : r->prio, (int64_t)k, false };
     }
 
     /* what is deleted: replace = every record (or those of the types), merge = the RRsets of the file */
@@ -767,6 +1203,13 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
     del_ids = malloc((db.n ? db.n : 1) * sizeof(*del_ids));
     if (!va || !del_ids) goto oom;
     qsort(vb, nins, sizeof(*vb), zi_cmp_rrv);           /* by key for the merge lookup; the insert order is in ins[] */
+    if (ap && z->ndelkeys) {
+        ndk = z->ndelkeys / 2;
+        dk = malloc(ndk * sizeof(*dk));
+        if (!dk) goto oom;
+        for (size_t i = 0; i < ndk; i++) dk[i] = (rrv_t){ z->delkeys[2 * i], z->delkeys[2 * i + 1], "", 0, 0, 0, false };
+        qsort(dk, ndk, sizeof(*dk), zi_cmp_rrv);
+    }
     for (size_t i = 0; i < db.n; i++) {
         const dbrec_t *r = &db.v[i];
         bool del;
@@ -774,20 +1217,13 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
         if (z->o.mode == ZI_REPLACE) {
             del = zi_type_wanted(z, r->type);
         } else {
-            rrv_t key = { r->owner, r->type, "", 0, 0 };
+            rrv_t key = { r->owner, r->type, "", 0, 0, 0, false };
             del = zi_type_wanted(z, r->type);           /* nothing outside the types is touched */
-            if (del) {
-                size_t lo = 0, hi = nins;
-                while (lo < hi) {
-                    size_t mid = lo + (hi - lo) / 2;
-                    if (zi_cmp_key(&vb[mid], &key) < 0) lo = mid + 1;
-                    else hi = mid;
-                }
-                del = lo < nins && zi_cmp_key(&vb[lo], &key) == 0;
-            }
+            if (del) del = zi_has_key(vb, nins, &key) || (ndk && zi_has_key(dk, ndk, &key));
         }
         if (!del) continue;
-        va[nva] = (rrv_t){ r->owner, r->type, r->content, r->ttl, r->prio };
+        va[nva] = (rrv_t){ r->owner, r->type, r->content, r->ttl, r->prio, r->id, r->disabled };
+        if (!r->disabled && r->type[0]) nrec_del++;
         del_ids[ndel++] = r->id;
         nva++;
     }
@@ -798,7 +1234,7 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
     if (zf.found && whole && z->o.mode == ZI_REPLACE && !rows->presigned && !szone) {
         bool keys = false;
         if (d->w_zone_has_keys(c, zf.id, &keys) != 0) {
-            zi_dbfail(z, "looking for cryptokeys");
+            status = zi_dbfail(z, "looking for cryptokeys");
             goto out;
         }
         if (keys)
@@ -813,14 +1249,14 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
         res->domain_id = did;
     } else {
         if (d->w_create_zone(c, rows->zone, z->zone_type[0] ? z->zone_type : NULL, &did) != 0) {
-            zi_dbfail(z, "creating the zone");
+            status = zi_dbfail(z, "creating the zone");
             goto out;
         }
         res->domain_id = did;
         res->created = true;
     }
     if (zf.found && (delete_all ? d->w_delete_records(c, did, NULL, 0) : (ndel ? d->w_delete_records(c, did, del_ids, ndel) : 0)) != 0) {
-        zi_dbfail(z, "deleting records");
+        status = zi_dbfail(z, "deleting records");
         goto out;
     }
     if (whole && zf.found) {
@@ -828,14 +1264,14 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
             if (szone && m < 2) continue;               /* PRESIGNED and NSEC3PARAM belong to the signer */
             bool declared = m == 0 ? rows->presigned : m == 1 ? rows->nsec3param != NULL : rows->tinydns;
             if ((z->o.mode == ZI_REPLACE || declared) && d->w_delete_meta(c, did, ZI_OWNED_META[m]) != 0) {
-                zi_dbfail(z, "deleting metadata");
+                status = zi_dbfail(z, "deleting metadata");
                 goto out;
             }
         }
         if (z->si.has_ext) {
             if (z->o.mode == ZI_REPLACE) {
                 if (d->w_delete_tagdefs(c, did, NULL, NULL) != 0) {
-                    zi_dbfail(z, "deleting tag definitions");
+                    status = zi_dbfail(z, "deleting tag definitions");
                     goto out;
                 }
             } else {
@@ -844,7 +1280,7 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
                     for (size_t j = 0; j < i && !seen; j++)
                         seen = strcmp(rows->defs[j].kind, rows->defs[i].kind) == 0 && strcasecmp(rows->defs[j].tag, rows->defs[i].tag) == 0;
                     if (!seen && d->w_delete_tagdefs(c, did, rows->defs[i].kind, rows->defs[i].tag) != 0) {
-                        zi_dbfail(z, "deleting tag definitions");
+                        status = zi_dbfail(z, "deleting tag definitions");
                         goto out;
                     }
                 }
@@ -855,40 +1291,41 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
         const size_t i = ins[k];
         int64_t rid;
         if (d->w_insert_record(c, did, &rows->rows[i], !rows->auth || rows->auth[i] != 0, &rid) != 0) {
-            zi_dbfail(z, "inserting a record");
+            status = zi_dbfail(z, "inserting a record");
             goto out;
         }
+        rids[k] = rid;
         if (rows->tags && (rows->tags[i].loc || rows->tags[i].ecs) && d->w_insert_tags(c, rid, rows->tags[i].loc, rows->tags[i].ecs) != 0) {
-            zi_dbfail(z, "inserting a record tag");
+            status = zi_dbfail(z, "inserting a record tag");
             goto out;
         }
         if (rows->td && rows->td[i].has &&
             d->w_insert_tinydns(c, rid, rows->td[i].ttd, rows->td[i].loc[0] ? rows->td[i].loc : NULL, rows->td[i].countdown) != 0) {
-            zi_dbfail(z, "inserting tinydns attributes");
+            status = zi_dbfail(z, "inserting tinydns attributes");
             goto out;
         }
     }
     if (whole) {
         for (size_t i = 0; i < rows->ndefs; i++)
             if (d->w_insert_tagdef(c, did, rows->defs[i].kind, rows->defs[i].tag, rows->defs[i].cidr) != 0) {
-                zi_dbfail(z, "inserting a tag definition");
+                status = zi_dbfail(z, "inserting a tag definition");
                 goto out;
             }
         if ((rows->presigned && !szone && d->w_insert_meta(c, did, "PRESIGNED", "1") != 0) ||
             (rows->nsec3param && !szone && d->w_insert_meta(c, did, "NSEC3PARAM", rows->nsec3param) != 0) ||
             (rows->tinydns && d->w_insert_meta(c, did, "X-KARIDNS-FORMAT", "tinydns") != 0)) {
-            zi_dbfail(z, "inserting metadata");
+            status = zi_dbfail(z, "inserting metadata");
             goto out;
         }
     }
     if (z->o.view && d->w_set_view(c, did, z->o.view) != 0) {
-        zi_dbfail(z, "putting the zone in the view");
+        status = zi_dbfail(z, "putting the zone in the view");
         goto out;
     }
     if (z->o.reload) {
         if (z->si.has_reload_requests) {
             if (d->w_request_reload(c, rows->zone, false) != 0) {
-                zi_dbfail(z, "adding a reload request");
+                status = zi_dbfail(z, "adding a reload request");
                 goto out;
             }
         } else {
@@ -896,27 +1333,46 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
                     "db/karidns_ext.pgsql.sql); a running server notices the change through the change log");
         }
     }
+    res->has_generation = has_gen;
+    res->generation = gen0;
+    res->records_before = nrec_before;
+    res->records_after = nrec_before - nrec_del + nins;
+    /* an apply that changed the zone and wrote no SOA of its own raises the serial by one (RFC 1982 section 3.1; secondaries and IXFR see a change only when it grows) */
+    if (ap && nitems > 0 && !res->wrote_soa && !ap->create && z->o.serial == ZI_SERIAL_INCREMENT && !zi_bump_serial(z, &db, rows->zone, did, ap->api_serial, shown, res, &status))
+        goto out;
     if (zf.found ? zi_primary_type(zf.type) : (!z->zone_type[0] || zi_primary_type(z->zone_type))) {
-        if (!zi_verify(z, rows->zone, did, shown, !whole || z->o.mode == ZI_MERGE, szone ? ZX_PLAIN_DNSSEC | ZX_PLAIN_CDS : 0, res)) goto out;
+        bool back = ap && ap->readback_changed
+                        ? zi_verify_changed(z, rows->zone, did, shown, rids, nins, zi_apex_soa(&db, rows->zone), res)
+                        : zi_verify(z, rows->zone, did, shown, !whole || z->o.mode == ZI_MERGE, szone ? ZX_PLAIN_DNSSEC | ZX_PLAIN_CDS : 0, res);
+        if (!back) goto out;
     } else {
+
         ZI_WARN(z, DC_DB_IMPORT_NOT_PRIMARY, shown, "Zone '%s' has domains.type %s: the server does not serve the records of such a zone, so they were not checked", rows->zone,
                 zf.found && zf.type[0] ? zf.type : z->zone_type);
+    }
+    /* the RRsets changed with their records before and after, and the version row of the change (item E) */
+    if (nitems > 0 && (ap || z->si.has_versions) && !zi_record_change(z, rows->zone, did, zi_apex_soa(&db, rows->zone), va, vb, items, nitems, gen0, has_gen, ap, res, &chg, &nchg, &status))
+        goto out;
+    if (has_gen && z->drv->w_zone_generation(c, did, &res->generation_after) != 0) {
+        status = zi_dbfail(z, "reading the generation of the zone");
+        goto out;
     }
     if (z->o.dry_run) {
         status = ZI_OK;
     } else {
         in_tx = false;                                   /* commit ends the transaction whatever happens */
         if (d->w_commit(c) != 0) {
-            zi_dbfail(z, "commit");
+            status = zi_dbfail(z, "commit");
             goto out;
         }
+
         res->committed = true;
         status = ZI_OK;
     }
     if (z->o.report)
         for (size_t i = 0; i < nitems; i++) z->o.report(z->o.report_ud, items[i].what, items[i].owner, items[i].type[0] ? items[i].type : "ENT");
     char sn[80] = "";
-    if (res->wrote_soa) {
+    if (res->wrote_soa || res->serial_bumped) {
         if (res->has_old_serial) snprintf(sn, sizeof(sn), ", SOA serial %u -> %u", (unsigned)res->old_serial, (unsigned)res->new_serial);
         else snprintf(sn, sizeof(sn), ", SOA serial %u", (unsigned)res->new_serial);
     }
@@ -936,6 +1392,15 @@ oom:
     ZI_ERR(z, DC_INTERNAL_OOM, shown, "out of memory");
 out:
     if (in_tx) d->w_rollback(c);                         /* a failed import, and a dry run: nothing stays */
+    if (ap && status == ZI_OK) {                         /* the caller takes the items */
+        res->items = chg;
+        res->n_items = nchg;
+    } else {
+        for (size_t i = 0; i < nchg; i++) zi_change_free(&chg[i]);
+        free(chg);
+    }
+    free(rids);
+    free(dk);
     for (size_t i = 0; i < nsoa_new; i++) free(soa_new[i]);
     free(soa_new);
     free(items);
@@ -1343,7 +1808,7 @@ static int zi_apply_signer(zi_t *z, zrows_t *rows, zone_arena_t *farena, const c
         const dbrec_t *r = &db.v[i];
         if (zi_managed_type(r->type)) {
             del_ids[ndel++] = r->id;
-            if (!r->disabled) va[nva++] = (rrv_t){ r->owner, r->type, r->content, r->ttl < 0 ? 0 : r->ttl, r->prio < 0 ? 0 : r->prio };
+            if (!r->disabled) va[nva++] = (rrv_t){ r->owner, r->type, r->content, r->ttl < 0 ? 0 : r->ttl, r->prio < 0 ? 0 : r->prio, 0, false };
         } else if (!r->disabled && strcmp(r->type, "SOA") == 0 && strcmp(r->owner, rows->zone) == 0) {
             soa_d = r;
             nsoa_d++;
@@ -1428,7 +1893,7 @@ static int zi_apply_signer(zi_t *z, zrows_t *rows, zone_arena_t *farena, const c
     if (!vb || !ins) goto oom;
     for (size_t k = 0; k < nfdn; k++) {
         const db_record_row_t *r = &rows->rows[fdn[k]];
-        vb[k] = (rrv_t){ r->name, r->type, r->content ? r->content : "", r->ttl_null ? -1 : r->ttl, r->prio_null ? 0 : r->prio };
+        vb[k] = (rrv_t){ r->name, r->type, r->content ? r->content : "", r->ttl_null ? -1 : r->ttl, r->prio_null ? 0 : r->prio, 0, false };
         ins[k] = (db_ins_t){ r, !rows->auth || rows->auth[fdn[k]] != 0 };
     }
     if (!zi_diff(va, nva, vb, nfdn, z->o.report != NULL, &items, &nitems, res)) goto oom;
@@ -1664,4 +2129,95 @@ int zi_import_tinydns(zi_t *z, const zi_input_t *in, const char *zone, zi_result
     free(names);
     free(t.text);
     return worst;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* apply                                                                                                          */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+int zi_apply_changes(zi_t *z, const zi_apply_in_t *in, zi_result_t *res) {
+    const zc_changes_t *ch = in->changes;
+    const char *shown = in->shown ? in->shown : "change file";
+    memset(res, 0, sizeof(*res));
+    char dbname[DNS_NAME_TEXT_SIZE];
+    size_t zl = strlen(in->zone);
+    if (zl < 2 || zl >= sizeof(dbname) || in->zone[zl - 1] != '.') {
+        ZI_ERR(z, DC_DB_IMPORT_ZONE_NAME, NULL, "'%.100s' is not a valid zone name", in->zone);
+        return ZI_FAIL;
+    }
+    for (size_t i = 0; i + 1 < zl; i++) dbname[i] = (char)tolower((unsigned char)in->zone[i]);
+    dbname[zl - 1] = '\0';
+    snprintf(res->zone, sizeof(res->zone), "%s", dbname);
+    if (in->create && ch->n_rr == 0) {
+        ZI_ERR(z, DC_DB_APPLY_CHANGES, shown, "--create needs the records of the new zone (rr lines)");
+        return ZI_FAIL;
+    }
+    if (in->create && ch->n_delete > 0) {
+        ZI_ERR(z, DC_DB_APPLY_CHANGES, shown, "a new zone has nothing to delete (delete lines with --create)");
+        return ZI_FAIL;
+    }
+    for (size_t i = 0; i < z->ndelkeys; i++) free(z->delkeys[i]);
+    free(z->delkeys);
+    z->delkeys = NULL;
+    z->ndelkeys = 0;
+    if (ch->n_delete) {
+        z->delkeys = calloc(2 * ch->n_delete, sizeof(char *));
+        if (!z->delkeys) {
+            ZI_ERR(z, DC_INTERNAL_OOM, shown, "out of memory");
+            return ZI_FAIL;
+        }
+        for (size_t i = 0; i < ch->n; i++) {
+            const zc_op_t *op = &ch->ops[i];
+            if (op->kind != ZC_DELETE) continue;
+            if (strcmp(op->owner, in->zone) == 0 && strcmp(op->type, "SOA") == 0) {
+                ZI_ERR(z, DC_DB_APPLY_ZONE, shown, "line %zu: the SOA record of zone '%s' cannot be deleted", op->line, dbname);
+                return ZI_FAIL;
+            }
+            char *o = zi_canon(op->owner, false), *t = strdup(op->type);          /* lower case, the final dot dropped, as records.name has it */
+            if (!o || !t) {
+                free(o);
+                free(t);
+                ZI_ERR(z, DC_INTERNAL_OOM, shown, "out of memory");
+                return ZI_FAIL;
+            }
+            z->delkeys[z->ndelkeys++] = o;
+            z->delkeys[z->ndelkeys++] = t;
+        }
+    }
+    if (z->drv->w_set_actor && z->drv->w_set_actor(z->conn, &in->actor) != 0) {
+        ZI_ERR(z, DC_DB_IMPORT_OPEN, shown, "%s", z->drv->errmsg(z->conn));
+        return ZI_FAIL;
+    }
+    z->ap = in;
+    z->o.mode = in->create ? ZI_REPLACE : ZI_MERGE;
+    zrows_t rows;
+    memset(&rows, 0, sizeof(rows));
+    zone_arena_t arena;
+    zrows_info_t info;
+    memset(&info, 0, sizeof(info));
+    bool have_arena = false;
+    int status = ZI_FAIL;
+    if (ch->n_rr) {
+        size_t tl = 0;
+        char *text = zc_zone_text(ch, in->zone, &tl), apex[DNS_NAME_TEXT_SIZE], err[600];
+        if (!text) {
+            ZI_ERR(z, DC_INTERNAL_OOM, shown, "out of memory");
+        } else if (!zrows_load_zone_text(text, tl, NULL, in->zone, &arena, apex, sizeof(apex), &info, err, sizeof(err))) {
+            ZI_ERR(z, DC_DB_APPLY_CHANGES, shown, "%s", err);
+        } else {
+            have_arena = true;
+            res->dry_run = z->o.dry_run;
+            if (zi_check_zone(z, &arena, apex, shown, text, false, &info, &rows, res)) status = zi_apply(z, &rows, shown, res);
+        }
+        free(text);
+    } else {
+        snprintf(rows.zone, sizeof(rows.zone), "%s", dbname);               /* nothing but deletes: no rows, no zone checks of a file */
+        res->dry_run = z->o.dry_run;
+        status = zi_apply(z, &rows, shown, res);
+    }
+    if (rows.zone[0]) snprintf(res->zone, sizeof(res->zone), "%s", rows.zone);
+    zrows_free(&rows);
+    if (have_arena) zone_arena_destroy(&arena);
+    z->ap = NULL;
+    return status;
 }

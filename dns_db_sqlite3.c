@@ -58,6 +58,10 @@ struct db_conn {
     sqlite3_stmt *st_w[9];      /* M2: the statements of the write functions that run once per row (W_* below) */
     const char *audit_actor;    /* w_set_audit(): the db_role of the actor row (borrowed: it outlives the connection); NULL = no actor row */
     bool actor_set;             /* the row of karidns_audit_actor was written in the open write transaction (w_commit deletes it) */
+    bool has_zone_state, has_versions;      /* items D and E: karidns_zone_state; karidns_zone_versions and karidns_zone_version_rrsets */
+    bool have_actor, actor_has_pid, actor_has_pname, actor_has_cs;      /* w_set_actor(): the principal and the change set of the actor row */
+    int64_t actor_pid;
+    char actor_pname[260], actor_cs[80];
 };
 
 /* M2: the statements kept for the per-row write functions */
@@ -348,10 +352,25 @@ static int sq_check_schema(db_conn_t *c, db_schema_info_t *out) {
         (rc = table_columns(c, "karidns_zone_tagdefs", xg_cols, &f3, &r3)) != 0)
         return rc;
     c->has_ext = r1 > 0 && f1 == 7u && r2 > 0 && f2 == 15u && r3 > 0 && f3 == 15u;
+    /* items D and E: the zone generation and the zone versions (db/karidns_ext.sqlite3.sql); the versions need both tables */
+    static const char *const zs_cols[] = { "domain_id", "generation", NULL };
+    static const char *const zv_cols[] = { "id", "domain_id", "version", "kind", "change_set", "principal_id", "principal_name", "db_role", "comment", "serial_before",
+                                           "serial_after", "generation_before", "generation_after", "rollback_of", "delta_complete", NULL };
+    static const char *const zr_cols[] = { "version_id", "owner", "type", "before", "after", NULL };
+    unsigned f4, f5;
+    int r4, r5;
+    if ((rc = table_columns(c, "karidns_zone_state", zs_cols, &found, &rows)) != 0 || (rc = table_columns(c, "karidns_zone_versions", zv_cols, &f4, &r4)) != 0 ||
+        (rc = table_columns(c, "karidns_zone_version_rrsets", zr_cols, &f5, &r5)) != 0)
+        return rc;
+    c->has_zone_state = rows > 0 && found == 3u;
+    c->has_versions = r4 > 0 && f4 == 0x7FFFu && r5 > 0 && f5 == 31u;
     if (out) {
         out->has_ext = c->has_ext;
         out->has_reload_requests = out->has_server_status = false;     /* B11: the multi-server tables are PostgreSQL only */
+        out->has_zone_state = c->has_zone_state;
+        out->has_versions = c->has_versions;
     }
+
     /* B10: schema versions 1 to 3 (v2 adds karidns_zone_tagdefs.id; the order of the definitions is the rowid either way; v3 adds the
      * audit tables, which the loader never uses); a newer version was written for a later loader */
     static const char *const sv_cols[] = { "version", NULL };
@@ -1129,9 +1148,13 @@ static int put_actor(db_conn_t *c) {
     if (rc != SQLITE_ROW) return sql_fail(c, rc, "karidns_audit_actor");
     st = NULL;
     rc = sqlite3_prepare_v2(c->db, "INSERT OR REPLACE INTO karidns_audit_actor (id, principal_id, principal_name, change_set, db_role) "
-                                   "VALUES (1, NULL, NULL, NULL, ?1)", -1, &st, NULL);
+                                   "VALUES (1, ?2, ?3, ?4, ?1)", -1, &st, NULL);
     if (rc != SQLITE_OK) return sql_fail(c, rc, "karidns_audit_actor");
-    sqlite3_bind_text(st, 1, c->audit_actor, -1, SQLITE_STATIC);
+    bind_txt(st, 1, c->audit_actor);
+    if (c->actor_has_pid) sqlite3_bind_int64(st, 2, c->actor_pid);
+    else sqlite3_bind_null(st, 2);
+    bind_txt(st, 3, c->actor_has_pname ? c->actor_pname : NULL);
+    bind_txt(st, 4, c->actor_has_cs ? c->actor_cs : NULL);
     int ret = wstep1(c, st, "karidns_audit_actor");
     c->actor_set = ret == 0;
     return ret;
@@ -1160,7 +1183,7 @@ static int sq_w_begin(db_conn_t *c, const char *zone) {
     }
     int rc = exec(c, "BEGIN IMMEDIATE");
     if (rc != 0) return rc;
-    if (c->audit_actor && (rc = put_actor(c)) != 0) {
+    if ((c->audit_actor || c->have_actor) && (rc = put_actor(c)) != 0) {
         sqlite3_exec(c->db, "ROLLBACK", NULL, NULL, NULL);          /* a failed w_begin leaves no transaction open */
         return rc;
     }
@@ -1497,6 +1520,116 @@ static int sq_w_write_id(db_conn_t *c, uint64_t mark, db_write_id_t *id) {
     return ret;
 }
 
+/* ---- items D and E: karidns-zone apply (dns_db_driver.h) ---- */
+static int sq_w_set_actor(db_conn_t *c, const db_actor_t *a) {
+    if (!c->writable || c->in_wtxn) {
+        set_err(c, "w_set_actor: needs a writable connection outside a transaction");
+        return -1;
+    }
+    c->have_actor = c->actor_has_pid = c->actor_has_pname = c->actor_has_cs = false;
+    if (!a) return 0;
+    c->have_actor = a->has_principal || a->principal_name || a->change_set;
+    c->actor_has_pid = a->has_principal;
+    c->actor_pid = a->principal_id;
+    if ((c->actor_has_pname = a->principal_name != NULL)) snprintf(c->actor_pname, sizeof(c->actor_pname), "%s", a->principal_name);
+    if ((c->actor_has_cs = a->change_set != NULL)) snprintf(c->actor_cs, sizeof(c->actor_cs), "%s", a->change_set);
+    return 0;
+}
+
+static int sq_w_zone_generation(db_conn_t *c, int64_t domain_id, uint64_t *generation) {
+    int ret = wcheck(c, "w_zone_generation");
+    if (ret != 0) return ret;
+    *generation = 0;
+    if (!c->has_zone_state) {
+        set_err(c, "karidns_zone_state does not exist in this database (apply db/karidns_ext.sqlite3.sql)");
+        return DB_ERR_UNAVAILABLE;
+    }
+    sqlite3_stmt *st = NULL;
+    if ((ret = prep(c, &st, "SELECT generation FROM karidns_zone_state WHERE domain_id = ?1")) != 0) return ret;
+    sqlite3_bind_int64(st, 1, domain_id);
+    int rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) *generation = (uint64_t)sqlite3_column_int64(st, 0);
+    else if (rc != SQLITE_DONE) ret = sql_fail(c, rc, "w_zone_generation");
+    sqlite3_finalize(st);
+    return ret;
+}
+
+static int sq_w_bump_serial(db_conn_t *c, int64_t domain_id, int64_t soa_id, const char *new_content, bool via_api, uint32_t *serial) {
+    (void)via_api;                      /* SQLite3 has no roles: the API checks, and writes the row itself */
+    (void)serial;                       /* the row has the serial the caller wrote */
+    int ret = wcheck(c, "w_bump_serial");
+    if (ret != 0) return ret;
+    sqlite3_stmt *st = NULL;
+    if ((ret = prep(c, &st, "UPDATE records SET content = ?3 WHERE id = ?1 AND domain_id = ?2")) != 0) return ret;
+    sqlite3_bind_int64(st, 1, soa_id);
+    sqlite3_bind_int64(st, 2, domain_id);
+    bind_txt(st, 3, new_content);
+    int rc = sqlite3_step(st);
+    if (rc != SQLITE_DONE) {
+        ret = sql_fail(c, rc, "w_bump_serial");
+    } else if (sqlite3_changes(c->db) != 1) {
+        set_err(c, "w_bump_serial: the SOA record %lld is not in zone %lld", (long long)soa_id, (long long)domain_id);
+        ret = DB_ERR_CONFLICT;
+    }
+    sqlite3_finalize(st);
+    return ret;
+}
+
+static int sq_w_insert_version(db_conn_t *c, int64_t domain_id, const db_version_t *v, uint32_t *number, int64_t *id) {
+    int ret = wcheck(c, "w_insert_version");
+    if (ret != 0) return ret;
+    if (!c->has_versions) {
+        set_err(c, "karidns_zone_versions does not exist in this database (apply db/karidns_ext.sqlite3.sql)");
+        return DB_ERR_UNAVAILABLE;
+    }
+    sqlite3_stmt *st = NULL;
+    ret = prep(c, &st, "INSERT INTO karidns_zone_versions (domain_id, version, kind, change_set, principal_id, principal_name, db_role, comment, serial_before, serial_after, "
+                       "generation_before, generation_after, rollback_of, delta_complete) "
+                       "SELECT ?1, coalesce(max(version), 0) + 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13 FROM karidns_zone_versions WHERE domain_id = ?1");
+    if (ret != 0) return ret;
+    sqlite3_bind_int64(st, 1, domain_id);
+    bind_txt(st, 2, v->kind);
+    bind_txt(st, 3, v->change_set);
+    if (v->has_principal) sqlite3_bind_int64(st, 4, v->principal_id);
+    else sqlite3_bind_null(st, 4);
+    bind_txt(st, 5, v->principal_name);
+    bind_txt(st, 6, v->db_role);
+    bind_txt(st, 7, v->comment);
+    if (v->has_serial_before) sqlite3_bind_int64(st, 8, (sqlite3_int64)v->serial_before);
+    else sqlite3_bind_null(st, 8);
+    if (v->has_serial_after) sqlite3_bind_int64(st, 9, (sqlite3_int64)v->serial_after);
+    else sqlite3_bind_null(st, 9);
+    sqlite3_bind_int64(st, 10, (sqlite3_int64)v->generation_before);
+    sqlite3_bind_int64(st, 11, (sqlite3_int64)v->generation_after);
+    if (v->rollback_of) sqlite3_bind_int64(st, 12, (sqlite3_int64)v->rollback_of);
+    else sqlite3_bind_null(st, 12);
+    sqlite3_bind_int(st, 13, v->delta_complete ? 1 : 0);
+    ret = wstep1(c, st, "w_insert_version");
+    if (ret != 0) return ret;
+    *id = (int64_t)sqlite3_last_insert_rowid(c->db);
+    st = NULL;
+    if ((ret = prep(c, &st, "SELECT version FROM karidns_zone_versions WHERE id = ?1")) != 0) return ret;
+    sqlite3_bind_int64(st, 1, *id);
+    int rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) *number = (uint32_t)sqlite3_column_int64(st, 0);
+    else ret = sql_fail(c, rc, "w_insert_version");
+    sqlite3_finalize(st);
+    return ret;
+}
+
+static int sq_w_insert_version_rrset(db_conn_t *c, int64_t version_id, const char *owner, const char *type, const char *before, const char *after) {
+    int ret = wcheck(c, "w_insert_version_rrset");
+    if (ret != 0) return ret;
+    sqlite3_stmt *st = NULL;
+    if ((ret = prep(c, &st, "INSERT INTO karidns_zone_version_rrsets (version_id, owner, type, before, after) VALUES (?1, ?2, ?3, ?4, ?5)")) != 0) return ret;
+    sqlite3_bind_int64(st, 1, version_id);
+    bind_txt(st, 2, owner);
+    bind_txt(st, 3, type);
+    bind_txt(st, 4, before);
+    bind_txt(st, 5, after);
+    return wstep1(c, st, "w_insert_version_rrset");
+}
+
 const db_driver_t db_driver_sqlite3 = {
     "sqlite3",       sq_open,         sq_close,           sq_errmsg,           sq_check_schema,
     sq_begin_snapshot, sq_end_snapshot, sq_list_zones,    sq_scan_records,     sq_scan_metadata,
@@ -1515,6 +1648,7 @@ const db_driver_t db_driver_sqlite3 = {
     sq_w_set_audit,     /* schema version 3 */
     sq_w_scan_auth, sq_w_update_record, sq_w_mark, sq_w_write_id, sq_w_delete_dnssec,       /* item C, the signer */
     sq_w_update_orders, sq_w_insert_dnssec, sq_w_set_snapshot,
+    sq_w_set_actor, sq_w_zone_generation, sq_w_bump_serial, sq_w_insert_version, sq_w_insert_version_rrset,        /* items D and E */
 };
 
 #endif /* KARIDNS_DB_SQLITE3 */

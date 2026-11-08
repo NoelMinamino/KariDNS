@@ -292,7 +292,7 @@ else
     pq "TRUNCATE karidns_auth.audit_log" > /dev/null
     pq "INSERT INTO domains (name, type) VALUES ('nolog.test', 'NATIVE'); DELETE FROM domains WHERE name = 'nolog.test'" > /dev/null
     eq "so a change of the PowerDNS tables is not logged" "0" "SELECT count(*) FROM karidns_auth.audit_log"
-    eq "the audit of the karidns_auth tables is attached (5 tables)" "5" "SELECT count(*) FROM pg_trigger WHERE tgname = 'karidns_audit_row' AND tgrelid::regclass::text LIKE 'karidns_auth.%'"
+    eq "the audit of the karidns_auth tables is attached (9 tables)" "9" "SELECT count(*) FROM pg_trigger WHERE tgname = 'karidns_audit_row' AND tgrelid::regclass::text LIKE 'karidns_auth.%'"
     eq "enable_audit('public') attaches 10 tables (cryptokeys, the key requests and the signer state included)" "10" "SELECT karidns_auth.enable_audit('public')"
     eq "enable_audit is idempotent" "10" "SELECT karidns_auth.enable_audit('public')"
     eq "...with one row trigger, three statement triggers and the zone trigger on domains" "5" "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'karidns_audit%' AND tgrelid = 'domains'::regclass"

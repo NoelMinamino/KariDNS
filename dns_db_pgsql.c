@@ -100,6 +100,9 @@ struct db_conn {
     uint32_t w_prepared;            /* M2: bit i = the statement W_STMT[i] is prepared on this session */
     bool audit_summary;             /* open_write(): every write transaction starts with SET LOCAL karidns.audit = 'summary' (w_set_audit) */
     bool repeatable;                /* open_write(): every write transaction is REPEATABLE READ (w_set_snapshot: the signer) */
+    bool has_zone_state, has_versions;      /* items D and E (open_write() connections only): karidns_zone_state; karidns_zone_versions and karidns_zone_version_rrsets */
+    bool have_actor;                /* w_set_actor(): every write transaction starts with SET LOCAL karidns.principal / karidns.change_set */
+    char actor_pid[24], actor_cs[80];
 };
 static bool pg_has_soa_cover_index(db_conn_t *c);
 
@@ -485,6 +488,17 @@ static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
             return -1;
         }
     }
+    /* items D and E: the zone generation and the zone versions.  Only a connection that writes (karidns-zone) cares; they are no tables the loader reads, so they
+     * are no entries of k_tables (the loader's privilege check of `karicheck db` would ask for them) */
+    c->has_zone_state = c->has_versions = false;
+    if (c->writable) {
+        ret = exec_rows(c, "SELECT to_regclass('karidns_zone_state') IS NOT NULL, to_regclass('karidns_zone_versions') IS NOT NULL AND to_regclass('karidns_zone_version_rrsets') IS NOT NULL",
+                        0, NULL, &r, "schema");
+        if (ret != 0) return ret;
+        c->has_zone_state = cell_true(r, 0, 0);
+        c->has_versions = cell_true(r, 0, 1);
+        PQclear(r);
+    }
     if (out) {
         out->has_changes = c->has_changes;
         out->has_domain_views = c->has_domain_views;
@@ -492,6 +506,8 @@ static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
         out->has_ext = c->has_ext;
         out->has_reload_requests = c->has_reload_requests;
         out->has_server_status = c->has_server_status;
+        out->has_zone_state = c->has_zone_state;
+        out->has_versions = c->has_versions;
     }
     return 0;
 }
@@ -1462,7 +1478,8 @@ static int pg_report_status(db_conn_t *c, const db_status_t *st) {
  * parameters, never part of the SQL text.  A prepared statement outlives a rolled back transaction. */
 enum {
     W_LOCK, W_CREATE, W_DEL_ALL_TAGS, W_DEL_ALL_TD, W_DEL_ALL_REC, W_DEL_IDS_TAGS, W_DEL_IDS_TD, W_DEL_IDS_REC, W_INS_REC, W_INS_TAGS,
-    W_INS_TD, W_DEL_TAGDEFS, W_INS_TAGDEF, W_DEL_META, W_INS_META, W_SET_VIEW, W_REQ, W_HAS_KEYS, W_UPD_REC, W_UPD_ORD, W_INS_DNSSEC, W_N
+    W_INS_TD, W_DEL_TAGDEFS, W_INS_TAGDEF, W_DEL_META, W_INS_META, W_SET_VIEW, W_REQ, W_HAS_KEYS, W_UPD_REC, W_UPD_ORD, W_INS_DNSSEC,
+    W_ACTOR, W_ZGEN, W_BUMP_API, W_SET_SOA, W_INS_VER, W_INS_VERR, W_N
 };
 static const struct { const char *sql; int np; } W_STMT[W_N] = {
     [W_LOCK] = { "SELECT pg_advisory_xact_lock(hashtextextended('karidns-zone:' || $1::text, 0))", 1 },
@@ -1491,6 +1508,16 @@ static const struct { const char *sql; int np; } W_STMT[W_N] = {
     [W_INS_DNSSEC] = { "INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled, auth, ordername) "
                        "SELECT $1::bigint, u.n, u.t, u.c, u.ttl, u.prio, false, u.a, u.o "
                        "FROM unnest($2::text[], $3::text[], $4::text[], $5::bigint[], $6::bigint[], $7::boolean[], $8::text[]) AS u(n, t, c, ttl, prio, a, o)", 8 },
+    /* items D and E */
+    [W_ACTOR] = { "SELECT set_config('karidns.principal', $1, true), set_config('karidns.change_set', $2, true)", 2 },
+    [W_ZGEN] = { "SELECT coalesce((SELECT generation FROM karidns_zone_state WHERE domain_id = $1::bigint), 0)", 1 },
+    [W_BUMP_API] = { "SELECT karidns_auth.bump_serial(current_schema()::text, $1::integer)", 1 },
+    [W_SET_SOA] = { "UPDATE records SET content = $3::text WHERE id = $1::bigint AND domain_id = $2::bigint", 3 },
+    [W_INS_VER] = { "INSERT INTO karidns_zone_versions (domain_id, version, kind, change_set, principal_id, principal_name, db_role, comment, serial_before, serial_after, "
+                    "generation_before, generation_after, rollback_of, delta_complete) "
+                    "SELECT $1::integer, coalesce(max(version), 0) + 1, $2, $3, $4::bigint, $5, coalesce($6::text, session_user::text), $7, $8::bigint, $9::bigint, $10::bigint, $11::bigint, "
+                    "$12::integer, $13::boolean FROM karidns_zone_versions WHERE domain_id = $1::integer RETURNING id, version", 13 },
+    [W_INS_VERR] = { "INSERT INTO karidns_zone_version_rrsets (version_id, owner, type, before, after) VALUES ($1::bigint, $2, $3, $4, $5)", 5 },
 };
 
 /* run statement `idx` with the parameters pv (text, NULL = SQL NULL); the result (when out is set) is for the caller to clear */
@@ -1550,6 +1577,11 @@ static int pg_w_begin(db_conn_t *c, const char *zone) {
     /* karidns-zone --audit summary: the audit triggers (db/karidns_ext.pgsql.sql, karidns_auth.enable_audit) log one row per statement and
      * table for this transaction; SET LOCAL ends with it */
     if (rc == 0 && c->audit_summary) rc = exec_cmd(c, "SET LOCAL karidns.audit = 'summary'", "w_begin (audit)");
+    /* items D and E: for whom the transaction is: the audit triggers log it, the row level security of the API role reads it */
+    if (rc == 0 && c->have_actor) {
+        const char *pa[2] = { c->actor_pid, c->actor_cs };
+        rc = wq(c, W_ACTOR, pa, NULL, PGRES_TUPLES_OK, "w_begin (actor)");
+    }
     if (rc != 0) {
         PQclear(PQexec(c->pg, "ROLLBACK"));            /* a failed w_begin leaves no transaction open */
         return rc;
@@ -1983,6 +2015,99 @@ static int pg_w_write_id(db_conn_t *c, uint64_t mark, db_write_id_t *id) {
     return 0;
 }
 
+/* ---- items D and E: karidns-zone apply (dns_db_driver.h) ---- */
+static int pg_w_set_actor(db_conn_t *c, const db_actor_t *a) {
+    if (!c->writable || c->in_wtxn) {
+        set_err(c, "w_set_actor: needs a writable connection outside a transaction");
+        return -1;
+    }
+    c->have_actor = false;
+    c->actor_pid[0] = c->actor_cs[0] = '\0';
+    if (!a) return 0;
+    if (a->has_principal) snprintf(c->actor_pid, sizeof(c->actor_pid), "%lld", (long long)a->principal_id);
+    if (a->change_set) snprintf(c->actor_cs, sizeof(c->actor_cs), "%s", a->change_set);
+    c->have_actor = a->has_principal || a->change_set;          /* the name is looked up by the audit trigger: karidns_auth.principals */
+    return 0;
+}
+
+static int pg_w_zone_generation(db_conn_t *c, int64_t domain_id, uint64_t *generation) {
+    int ret = wcheck(c, "w_zone_generation");
+    if (ret != 0) return ret;
+    *generation = 0;
+    if (!c->has_zone_state) {
+        set_err(c, "karidns_zone_state does not exist in this database (apply db/karidns_ext.pgsql.sql)");
+        return DB_ERR_UNAVAILABLE;
+    }
+    char did[32];
+    i64_text(did, sizeof(did), domain_id);
+    const char *pv[1] = { did };
+    PGresult *r = NULL;
+    if ((ret = wq(c, W_ZGEN, pv, &r, PGRES_TUPLES_OK, "w_zone_generation")) != 0) return ret;
+    *generation = (uint64_t)cell_i64(r, 0, 0);
+    PQclear(r);
+    return 0;
+}
+
+static int pg_w_bump_serial(db_conn_t *c, int64_t domain_id, int64_t soa_id, const char *new_content, bool via_api, uint32_t *serial) {
+    int ret = wcheck(c, "w_bump_serial");
+    if (ret != 0) return ret;
+    char did[32], sid[32];
+    i64_text(did, sizeof(did), domain_id);
+    i64_text(sid, sizeof(sid), soa_id);
+    if (via_api) {
+        const char *pv[1] = { did };
+        PGresult *r = NULL;
+        if ((ret = wq(c, W_BUMP_API, pv, &r, PGRES_TUPLES_OK, "w_bump_serial")) != 0) return ret;
+        *serial = (uint32_t)cell_i64(r, 0, 0);
+        PQclear(r);
+        return 0;
+    }
+    const char *pv[3] = { sid, did, new_content };
+    PGresult *r = NULL;
+    if ((ret = wq(c, W_SET_SOA, pv, &r, PGRES_COMMAND_OK, "w_bump_serial")) != 0) return ret;
+    bool one = strcmp(PQcmdTuples(r), "1") == 0;
+    PQclear(r);
+    if (!one) {
+        set_err(c, "w_bump_serial: the SOA record %lld is not in zone %lld, or the role may not change it", (long long)soa_id, (long long)domain_id);
+        return DB_ERR_CONFLICT;
+    }
+    return 0;
+}
+
+static int pg_w_insert_version(db_conn_t *c, int64_t domain_id, const db_version_t *v, uint32_t *number, int64_t *id) {
+    int ret = wcheck(c, "w_insert_version");
+    if (ret != 0) return ret;
+    if (!c->has_versions) {
+        set_err(c, "karidns_zone_versions does not exist in this database (apply db/karidns_ext.pgsql.sql)");
+        return DB_ERR_UNAVAILABLE;
+    }
+    char did[32], pid[32], sb[32], sa[32], gb[32], ga[32], rb[16];
+    i64_text(did, sizeof(did), domain_id);
+    i64_text(pid, sizeof(pid), v->principal_id);
+    i64_text(sb, sizeof(sb), v->serial_before);
+    i64_text(sa, sizeof(sa), v->serial_after);
+    i64_text(gb, sizeof(gb), (int64_t)v->generation_before);
+    i64_text(ga, sizeof(ga), (int64_t)v->generation_after);
+    snprintf(rb, sizeof(rb), "%u", (unsigned)v->rollback_of);
+    const char *pv[13] = { did, v->kind, v->change_set, v->has_principal ? pid : NULL, v->principal_name, v->db_role, v->comment, v->has_serial_before ? sb : NULL,
+                           v->has_serial_after ? sa : NULL, gb, ga, v->rollback_of ? rb : NULL, v->delta_complete ? "t" : "f" };
+    PGresult *r = NULL;
+    if ((ret = wq(c, W_INS_VER, pv, &r, PGRES_TUPLES_OK, "w_insert_version")) != 0) return ret;
+    *id = cell_i64(r, 0, 0);
+    *number = (uint32_t)cell_i64(r, 0, 1);
+    PQclear(r);
+    return 0;
+}
+
+static int pg_w_insert_version_rrset(db_conn_t *c, int64_t version_id, const char *owner, const char *type, const char *before, const char *after) {
+    int ret = wcheck(c, "w_insert_version_rrset");
+    if (ret != 0) return ret;
+    char vid[32];
+    i64_text(vid, sizeof(vid), version_id);
+    const char *pv[5] = { vid, owner, type, before, after };
+    return wq(c, W_INS_VERR, pv, NULL, PGRES_COMMAND_OK, "w_insert_version_rrset");
+}
+
 const db_driver_t db_driver_postgresql = {
     "postgresql",    pg_open,         pg_close,           pg_errmsg,           pg_check_schema,
     pg_begin_snapshot, pg_end_snapshot, pg_list_zones,    pg_scan_records,     pg_scan_metadata,
@@ -2001,6 +2126,7 @@ const db_driver_t db_driver_postgresql = {
     pg_w_set_audit,       /* schema version 3 */
     pg_w_scan_auth, pg_w_update_record, pg_w_mark, pg_w_write_id, pg_w_delete_dnssec,       /* item C, the signer */
     pg_w_update_orders, pg_w_insert_dnssec, pg_w_set_snapshot,
+    pg_w_set_actor, pg_w_zone_generation, pg_w_bump_serial, pg_w_insert_version, pg_w_insert_version_rrset,        /* items D and E */
 };
 
 #endif /* KARIDNS_DB_POSTGRESQL */

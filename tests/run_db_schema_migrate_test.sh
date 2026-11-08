@@ -97,6 +97,20 @@ else
     sqlite3 "$DB" < db/karidns_ext.sqlite3.sql > /dev/null 2>&1 && [ "$(sqlite3 "$DB" "SELECT version FROM karidns_schema_version")" = "3" ] && pass "the version 3 file applies to a migrated database: version 3 (idempotent)" || fail "version 3 file on a migrated database"
     "$LOADER" --dump "$T/s3b.kdb" --driver sqlite3 --database-file "$DB" 2> "$T/s3b.err"; r=$?
     [ "$r" -eq 0 ] && pass "the loader reads the version 3 database (exit 0)" || { fail "version 3 database: exit $r"; head -2 "$T/s3b.err"; }
+    # items D and E: a version 3 file made before the generation and the versions gets them when the ext file is applied again
+    sqlite3 "$DB" "DROP TRIGGER karidns_changes_generation; DROP TRIGGER karidns_zone_state_del; DROP TRIGGER karidns_zone_versions_prune; DROP TABLE karidns_zone_version_rrsets; DROP TABLE karidns_zone_versions; DROP TABLE karidns_zone_state" > /dev/null 2>&1
+    [ "$(sqlite3 "$DB" "SELECT count(*) FROM sqlite_master WHERE name LIKE 'karidns_zone_state%' OR name LIKE 'karidns_zone_version%'")" = "0" ] && pass "D and E: a version 3 database without the generation and the versions" || fail "D and E: the objects are still there"
+    "$LOADER" --dump "$T/s5.kdb" --driver sqlite3 --database-file "$DB" 2> /dev/null; r=$?
+    [ "$r" -eq 0 ] && cmp -s "$T/s3b.kdb" "$T/s5.kdb" && pass "D and E: the loader reads it as before" || fail "D and E: loader without the new tables (exit $r)"
+    sqlite3 "$DB" < db/karidns_ext.sqlite3.sql > /dev/null 2> "$T/m5.err" && pass "D and E: the ext file applies again" || { fail "D and E: applying the ext file: $(head -2 "$T/m5.err")"; }
+    [ "$(sqlite3 "$DB" "SELECT version FROM karidns_schema_version")" = "3" ] && [ "$(sqlite3 "$DB" "SELECT count(*) FROM karidns_zone_state")" = "$(sqlite3 "$DB" "SELECT count(*) FROM domains")" ] && pass "D and E: version 3, a generation row (0) for every zone" || fail "D and E: version row or the rows of karidns_zone_state"
+    [ "$(sqlite3 "$DB" "SELECT sum(generation) FROM karidns_zone_state")" = "0" ] && pass "D and E: the generation of a zone nobody changed is 0" || fail "D and E: generation not 0"
+    sqlite3 "$DB" "INSERT INTO domainmetadata (domain_id, kind, content) VALUES (1, 'X-MIG', '1')" > /dev/null
+    [ "$(sqlite3 "$DB" "SELECT generation > 0 FROM karidns_zone_state WHERE domain_id = 1")" = "1" ] && pass "D and E: a change of the zone grows its generation" || fail "D and E: the generation trigger"
+    sqlite3 "$DB" "DELETE FROM domainmetadata WHERE kind = 'X-MIG'" > /dev/null
+    sqlite3 "$DB" < db/karidns_ext.sqlite3.sql > /dev/null 2>&1 && [ "$(sqlite3 "$DB" "SELECT count(*) FROM sqlite_master WHERE type = 'trigger'")" = "31" ] && pass "D and E: and again: nothing is added twice (31 triggers)" || fail "D and E: applied twice"
+    "$LOADER" --dump "$T/s6.kdb" --driver sqlite3 --database-file "$DB" 2> /dev/null; r=$?
+    [ "$r" -eq 0 ] && cmp -s "$T/s3b.kdb" "$T/s6.kdb" && pass "D and E: the dump is the same bytes" || fail "D and E: the dump changed (exit $r)"
     sqlite3 "$DB" "UPDATE karidns_schema_version SET version = 4" > /dev/null
     "$LOADER" --dump "$T/s4.kdb" --driver sqlite3 --database-file "$DB" 2> "$T/s4.err"; r=$?
     [ "$r" -eq 3 ] && grep -q "versions 1 to 3" "$T/s4.err" && pass "version 4 is refused (exit 3, 'versions 1 to 3')" || { fail "version 4: exit $r"; head -2 "$T/s4.err"; }
@@ -140,6 +154,18 @@ else
         pf db/karidns_ext.pgsql.sql > /dev/null 2>&1 && [ "$(pq "SELECT version FROM karidns_schema_version")" = "3" ] && pass "the version 3 file applies to a migrated database: version 3 (idempotent)" || fail "version 3 file on a migrated database"
         as_pg "$PGLOADER" --dump "$T/p3b.kdb" --driver postgresql --conninfo-file "$T/ci" 2> "$T/p3b.err"; r=$?
         [ "$r" -eq 0 ] && pass "the loader reads the version 3 database (exit 0)" || { fail "version 3 database: exit $r"; head -2 "$T/p3b.err"; }
+        # items D and E: a version 3 database made before the generation and the versions gets them when the ext file is applied again
+        pq "DROP TABLE karidns_zone_version_rrsets, karidns_zone_versions, karidns_zone_state; DROP FUNCTION karidns_zone_versions_prune_fn()" > /dev/null
+        [ "$(pq "SELECT count(*) FROM pg_class WHERE relname LIKE 'karidns_zone_state%' OR relname LIKE 'karidns_zone_version%'")" = "0" ] && pass "D and E: a version 3 database without the generation and the versions" || fail "D and E: the objects are still there"
+        pf db/karidns_ext.pgsql.sql > /dev/null 2> "$T/pm5.err" && pass "D and E: the ext file applies again" || { fail "D and E: applying the ext file"; head -3 "$T/pm5.err"; }
+        [ "$(pq "SELECT version FROM karidns_schema_version")" = "3" ] && [ "$(pq "SELECT count(*) FROM karidns_zone_state")" = "$(pq "SELECT count(*) FROM domains")" ] && pass "D and E: version 3, a generation row (0) for every zone" || fail "D and E: version row or the rows of karidns_zone_state"
+        pq "INSERT INTO domainmetadata (domain_id, kind, content) VALUES (1, 'X-MIG', '1')" > /dev/null
+        [ "$(pq "SELECT generation FROM karidns_zone_state WHERE domain_id = 1")" = "1" ] && pass "D and E: a change of the zone grows its generation" || fail "D and E: the generation trigger"
+        pq "BEGIN; INSERT INTO domainmetadata (domain_id, kind, content) VALUES (1, 'X-MIG', '2'); INSERT INTO domainmetadata (domain_id, kind, content) VALUES (1, 'X-MIG', '3'); COMMIT" > /dev/null
+        [ "$(pq "SELECT generation FROM karidns_zone_state WHERE domain_id = 1")" = "2" ] && pass "D and E: once per transaction, however many statements" || fail "D and E: the generation per transaction"
+        pq "DELETE FROM domainmetadata WHERE kind = 'X-MIG'" > /dev/null
+        as_pg "$PGLOADER" --dump "$T/p5.kdb" --driver postgresql --conninfo-file "$T/ci" 2> "$T/p5.err"; r=$?
+        [ "$r" -eq 0 ] && cmp -s "$T/p3b.kdb" "$T/p5.kdb" && pass "D and E: the loader reads it, the dump is the same bytes" || fail "D and E: the dump changed (exit $r)"
         pq "UPDATE karidns_schema_version SET version = 4" > /dev/null
         as_pg "$PGLOADER" --dump "$T/p4.kdb" --driver postgresql --conninfo-file "$T/ci" 2> "$T/p4.err"; r=$?
         [ "$r" -eq 3 ] && grep -q "versions 1 to 3" "$T/p4.err" && pass "version 4 is refused (exit 3, 'versions 1 to 3')" || { fail "version 4: exit $r"; head -2 "$T/p4.err"; }

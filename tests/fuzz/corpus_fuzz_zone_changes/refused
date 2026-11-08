@@ -1,0 +1,6 @@
+rr www.fuzz.test. 300 RRSIG A 13 3 300 20300101000000 20200101000000 1 fuzz.test. AAAA
+rr www.fuzz.test. 300 TYPE46 \# 1 00
+rr www.fuzz.test. 99999999999 A 192.0.2.1
+rr www.evil.test. 300 A 192.0.2.1
+rr wwwfuzz.test. 300 A 192.0.2.1
+rr www.fuzz.test.. 300 A 192.0.2.1

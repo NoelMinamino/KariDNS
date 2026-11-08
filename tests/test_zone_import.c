@@ -14,6 +14,9 @@
  * input, $INCLUDE, the options, the strict mode, the warnings (file zone, keys, no reload table), a database without the extension tables, the
  * read-back verification (CNAME / ALIAS beside other data, a limit, a check-* option), the exporter (views, zone types, keys without PRESIGNED), and on PostgreSQL the writer role (db/karidns_writer_role.pgsql.sql).
  *
+ * apply (items D and E): the change file parser (dns_zone_changes.c: every field it refuses, the zone text it makes), karidns-zone apply (the generation, the diff with the records
+ * before and after, the serial, the version rows and their retention, create, the narrow read-back, the zone that is locked or not there) and the driver functions behind it.
+ *
  * Usage: test_zone_import [tests/db]   (the directory of pdns_schema.*.sql)
  */
 #ifndef _GNU_SOURCE
@@ -31,6 +34,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
+#include "../dns_zone_changes.h"
 #include "../dns_zone_import.h"
 #include "../dns_zone_export.h"
 #include "../dns_zone_rows.h"
@@ -2513,7 +2517,362 @@ static void t_signer_driver(void) {
     g_drv->close(c);
 }
 
+/* ------------------------------------------------------------------------------------------------------------- */
+/* karidns-zone apply (items D and E): the change file, the generation, the diff, the versions                    */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+static void t_changes_parser(void) {
+    printf("  change file parser\n");
+    zc_changes_t c;
+    char err[300];
+    const char *Z = "example.test.";
+    const char *good = "# a comment\n\n  rr www.example.test. 300 A 192.0.2.1\r\nrr WWW.Example.TEST.\t300\ta  192.0.2.2   \ndelete old.example.test. txt\nrr example.test. 0 TXT \"v=spf1 -all\"\n"
+                       "rr _x.example.test. 2147483647 TYPE65400 \\# 3 010203\nrr *.example.test. 1 MX 10 mail\nrr a-b/c.example.test. 5 TXT \"a;b ( c\"";
+    CHECK(zc_parse(good, strlen(good), Z, &c, err, sizeof(err)));
+    CHECK(c.n == 7 && c.n_rr == 6 && c.n_delete == 1);
+    CHECK(strcmp(c.ops[1].owner, "www.example.test.") == 0 && strcmp(c.ops[1].type, "A") == 0 && strcmp(c.ops[1].rdata, "192.0.2.2") == 0);
+    CHECK(strcmp(c.ops[2].type, "TXT") == 0 && c.ops[2].kind == ZC_DELETE && c.ops[2].line == 5);
+    size_t tl = 0;
+    char *text = zc_zone_text(&c, Z, &tl);
+    CHECK(text && strncmp(text, "$ORIGIN example.test.\nwww.example.test. 300 IN A 192.0.2.1\n", 58) == 0 && strstr(text, "\n_x.example.test. 2147483647 IN TYPE65400 \\# 3 010203\n"));
+    free(text);
+    zc_free(&c);
+    CHECK(c.ops == NULL && c.n == 0);
+    static const struct { const char *text, *why; } bad[] = {
+        { "frob x\n", "unknown operation" },
+        { "rr www 300 A 192.0.2.1\n", "absolute" },
+        { "rr www.example.org. 300 A 192.0.2.1\n", "not in the zone" },
+        { "rr wwwexample.test. 300 A 192.0.2.1\n", "not in the zone" },
+        { "rr exampxe.test. 300 A 192.0.2.1\n", "not in the zone" },                /* as long as the zone's name, but not its name */
+        { "rr www.example.test.. 300 A 192.0.2.1\n", "empty label" },
+        { "rr w$w.example.test. 300 A 192.0.2.1\n", "character" },
+        { "rr www.example.test. 3x A 192.0.2.1\n", "TTL" },
+        { "rr www.example.test. 2147483648 A 192.0.2.1\n", "2147483647" },
+        { "rr www.example.test. 300\n", "type is missing" },
+        { "rr www.example.test. 300 RRSIG A\n", "DNSSEC types" },
+        { "rr www.example.test. 300 TYPE0047 \\# 0\n", "DNSSEC types" },
+        { "rr www.example.test. 300 any 1.2.3.4\n", "meta types" },
+        { "rr www.example.test. 300 1A x\n", "record type name" },
+        { "rr www.example.test. 300 A\n", "RDATA is missing" },
+        { "rr www.example.test. 300 TXT \"a\" ; $INCLUDE /etc/passwd\n", "not safe" },
+        { "rr www.example.test. 300 TXT \"open\n", "not safe" },
+        { "rr www.example.test. 300 TXT ( a\n", "not safe" },
+        { "rr www.example.test. 300 TXT a\\\n", "not safe" },
+        { "rr www.example.test. 300 TXT $ORIGIN\n", "not safe" },
+        { "rr www.example.test. 300 TXT a\rb\n", "not safe" },
+        { "delete www.example.test. A 300\n", "nothing more" },
+        { "delete www.example.test.\n", "type is missing" },
+        { "delete\n", "owner is missing" },
+        { "delete www.example.test. A\nrr www.example.test. 300 A 192.0.2.1\n", "deleted here" },
+        { "rr www.example.test. 300 A 192.0.2.1\ndelete www.example.test. a\n", "deleted here" },
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        bool ok = zc_parse(bad[i].text, strlen(bad[i].text), Z, &c, err, sizeof(err));
+        CHECK_MSG(!ok && strstr(err, bad[i].why) != NULL, "'%.60s': %s", bad[i].text, ok ? "accepted" : err);
+        CHECK(c.n == 0 && c.ops == NULL);
+    }
+    CHECK(!zc_parse("rr www.example.test. 300 A 1\0 2\n", 33, Z, &c, err, sizeof(err)) && strstr(err, "NUL"));
+    char *big = malloc(ZC_MAX_LINE + 200);
+    memset(big, 'a', ZC_MAX_LINE + 100);
+    memcpy(big, "rr www.example.test. 300 TXT ", 29);
+    big[ZC_MAX_LINE + 100] = '\0';
+    CHECK(!zc_parse(big, strlen(big), Z, &c, err, sizeof(err)) && strstr(err, "longer than"));
+    free(big);
+    CHECK(zc_type_refused("NSEC3PARAM") && zc_type_refused("TYPE250") && !zc_type_refused("TYPE65400") && !zc_type_refused("TYPE12x") && !zc_type_refused("A"));
+}
+
+/* apply with a connection of its own: ZI_OK / ZI_FAIL / ZI_BUSY / ZI_CHANGED, -2 when the change file is refused, -1 when the options were */
+static int app(const zi_opts_t *o, const char *zone, const char *changes, const zi_apply_in_t *tmpl, zi_result_t *r) {
+    zc_changes_t ch;
+    char err[300];
+    if (!zc_parse(changes, strlen(changes), zone, &ch, err, sizeof(err))) {
+        printf("  [FAIL] change file: %s\n", err);
+        g_failed++;
+        return -2;
+    }
+    zi_t *z = zi_open(o);
+    if (!z) {
+        zc_free(&ch);
+        return -1;
+    }
+    zi_apply_in_t in;
+    memset(&in, 0, sizeof(in));
+    if (tmpl) in = *tmpl;
+    in.zone = zone;
+    in.changes = &ch;
+    in.shown = "changes";
+    int st = zi_apply_changes(z, &in, r);
+    zi_close(z);
+    zc_free(&ch);
+    return st;
+}
+
+static const zi_change_t *item_of(const zi_result_t *r, const char *owner, const char *type) {
+    for (size_t i = 0; i < r->n_items; i++)
+        if (strcmp(r->items[i].owner, owner) == 0 && strcmp(r->items[i].type, type) == 0) return &r->items[i];
+    return NULL;
+}
+
+static void t_apply(void) {
+    printf("  apply\n");
+    be_fresh(true);
+    zi_opts_t o = base_opts();
+    CHECK(imp_zone(&o, "example.test", 10, K_BODY, NULL) == ZI_OK);
+    CHECK(qn("SELECT count(*) FROM karidns_zone_versions") == 1);
+    CHECK(qn("SELECT count(*) FROM karidns_zone_version_rrsets WHERE version_id = (SELECT id FROM karidns_zone_versions)") == 6);        /* the import is version 1: every RRset, SOA included */
+    CHECK(qn("SELECT count(*) FROM karidns_zone_versions WHERE version = 1 AND kind = 'import' AND serial_before IS NULL AND serial_after = 10 AND generation_before = 0 "
+             "AND generation_after > 0 AND delta_complete") == 1);
+    o.serial = ZI_SERIAL_INCREMENT;
+    o.snapshot = true;
+    const char *Z = "example.test.";
+    const char *chg = "rr www.example.test. 300 A 192.0.2.10\nrr www.example.test. 300 A 192.0.2.11\ndelete mail.example.test. MX\nrr new.example.test. 60 TXT \"hello world\"\n";
+    zi_result_t r;
+    long recs = nrec("example.test"), vers = qn("SELECT count(*) FROM karidns_zone_versions"), chgs = nchg();
+
+    /* a dry run: the diff and the version it would write, nothing stays */
+    zi_opts_t od = o;
+    od.dry_run = true;
+    CHECK(app(&od, Z, chg, NULL, &r) == ZI_OK);
+    CHECK(r.has_generation && r.generation > 0 && r.generation_after > r.generation && r.has_version && r.version == 2 && r.serial_bumped && r.old_serial == 10 && r.new_serial == 11);
+    CHECK(r.n_items == 3 && r.rrsets_added == 1 && r.rrsets_replaced == 1 && r.rrsets_deleted == 1 && !r.committed && r.delta_complete);
+    const zi_change_t *w = item_of(&r, "www.example.test", "A");
+    CHECK(w && w->what == '~' && w->before && strcmp(w->before, "3600 A 192.0.2.80") == 0 && w->after && strcmp(w->after, "300 A 192.0.2.10\n300 A 192.0.2.11") == 0);
+    const zi_change_t *m = item_of(&r, "mail.example.test", "MX");
+    CHECK(m && m->what == '-' && strcmp(m->before, "3600 MX 10 mx.example.test.") == 0 && m->after == NULL);
+    const zi_change_t *n = item_of(&r, "new.example.test", "TXT");
+    CHECK(n && n->what == '+' && n->before == NULL && strcmp(n->after, "60 TXT \"hello world\"") == 0);
+    CHECK(r.records_before == 6 && r.records_after == 6 + 1 - 1 + 1);
+    uint64_t gen0 = r.generation;
+    zi_result_free(&r);
+    CHECK(nrec("example.test") == recs && qn("SELECT count(*) FROM karidns_zone_versions") == vers && nchg() == chgs && serial_of("example.test") == 10);
+
+    /* the generation the caller expects */
+    zi_apply_in_t in;
+    memset(&in, 0, sizeof(in));
+    in.have_expect = true;
+    in.expect_generation = gen0 + 1;
+    log_reset();
+    CHECK(app(&o, Z, chg, &in, &r) == ZI_CHANGED);
+    LOG_HAS("db.import.changed");
+    zi_result_free(&r);
+    CHECK(nrec("example.test") == recs && serial_of("example.test") == 10);
+
+    /* the real change: the principal, the change set, the comment */
+    in.expect_generation = gen0;
+    in.actor.has_principal = true;
+    in.actor.principal_id = 42;
+    in.actor.principal_name = "alice";
+    in.actor.change_set = "cs-1";
+    in.comment = "move www";
+    log_reset();
+    CHECK(app(&o, Z, chg, &in, &r) == ZI_OK);
+    CHECK(r.committed && r.has_version && r.version == 2 && r.generation == gen0 && r.generation_after > gen0 && r.serial_bumped && serial_of("example.test") == 11);
+    CHECK(qn("SELECT count(*) FROM records WHERE name = 'www.example.test' AND type = 'A' AND ttl = 300") == 2 && qn("SELECT count(*) FROM records WHERE type = 'MX'") == 0);
+    CHECK(qn("SELECT count(*) FROM karidns_zone_versions WHERE version = 2 AND kind = 'edit' AND change_set = 'cs-1' AND principal_id = 42 AND comment = 'move www' "
+             "AND serial_before = 10 AND serial_after = 11 AND generation_before = %lld AND generation_after = %lld AND rollback_of IS NULL", (long long)gen0, (long long)r.generation_after) == 1);
+    CHECK(qn("SELECT count(*) FROM karidns_zone_version_rrsets WHERE version_id = (SELECT id FROM karidns_zone_versions WHERE version = 2)") == 3);       /* the serial of the SOA is not versioned */
+    CHECK(qn("SELECT count(*) FROM karidns_zone_version_rrsets s JOIN karidns_zone_versions v ON v.id = s.version_id WHERE v.version = 2 AND s.owner = 'mail.example.test' "
+             "AND s.type = 'MX' AND s.before = '3600 MX 10 mx.example.test.' AND s.after IS NULL") == 1);
+    zi_result_free(&r);
+    CHECK(app(&o, Z, chg, NULL, &r) == ZI_OK && r.n_items == 0);                  /* the same change again changes nothing */
+    zi_result_free(&r);
+
+    /* nothing changes: no items, no version, no new serial */
+    memset(&in, 0, sizeof(in));
+    CHECK(app(&o, Z, "rr new.example.test. 60 TXT \"hello world\"\ndelete nothing.example.test. A\n", &in, &r) == ZI_OK);
+    CHECK(r.n_items == 0 && !r.has_version && !r.serial_bumped && r.committed && serial_of("example.test") == 11 && qn("SELECT count(*) FROM karidns_zone_versions") == 2);
+    zi_result_free(&r);
+
+    /* an SOA in the change set: the serial rule of the import; the SOA RRset is in the diff, its serial alone is not versioned */
+    CHECK(app(&o, Z, "rr example.test. 3600 SOA ns1.example.test. hostmaster.example.test. 500 7200 3600 1209600 300\n", NULL, &r) == ZI_OK);
+    CHECK(!r.serial_bumped && r.wrote_soa && r.new_serial == 12 && serial_of("example.test") == 12 && r.n_items == 1 && !r.has_version);          /* increment: database serial + 1 */
+    zi_result_free(&r);
+    zi_opts_t og = o;
+    og.serial = ZI_SERIAL_GROW;
+    CHECK(app(&og, Z, "rr example.test. 3600 SOA ns1.example.test. hostmaster.example.test. 3 7200 3600 1209600 300\n", NULL, &r) == ZI_FAIL);
+    zi_result_free(&r);
+    CHECK(app(&og, Z, "rr example.test. 3600 SOA ns1.example.test. hostmaster.example.test. 20 7200 3600 1209600 301\n", NULL, &r) == ZI_OK);
+    CHECK(r.has_version && serial_of("example.test") == 20 && item_of(&r, "example.test", "SOA") != NULL);                                           /* a real change of the SOA is a version */
+    zi_result_free(&r);
+
+    /* the zone must be there / must not be there / must be primary; the SOA stays */
+    log_reset();
+    CHECK(app(&o, "nozone.test.", "rr www.nozone.test. 60 A 192.0.2.1\n", NULL, &r) == ZI_FAIL);
+    LOG_HAS("db.apply.zone");
+    zi_result_free(&r);
+    zi_apply_in_t cr;
+    memset(&cr, 0, sizeof(cr));
+    cr.create = true;
+    log_reset();
+    CHECK(app(&o, Z, "rr example.test. 3600 SOA ns1.example.test. h.example.test. 1 1 1 1 1\nrr example.test. 3600 NS ns1.example.test.\nrr ns1.example.test. 3600 A 192.0.2.1\n", &cr, &r) == ZI_FAIL);
+    LOG_HAS("db.apply.zone");
+    zi_result_free(&r);
+    log_reset();
+    CHECK(app(&o, Z, "delete example.test. SOA\n", NULL, &r) == ZI_FAIL);
+    LOG_HAS("db.apply.zone");
+    zi_result_free(&r);
+    be_exec("INSERT INTO domains (name, type, master) VALUES ('slave.test', 'SLAVE', '192.0.2.99')");
+    log_reset();
+    CHECK(app(&o, "slave.test.", "rr www.slave.test. 60 A 192.0.2.1\n", NULL, &r) == ZI_FAIL);
+    LOG_HAS("db.apply.zone");
+    zi_result_free(&r);
+
+    /* create: a new zone is the whole change file, checked as a whole zone, with version 1 of kind create */
+    log_reset();
+    CHECK(app(&o, "made.test.", "rr made.test. 3600 SOA ns1.made.test. hostmaster.made.test. 7 7200 3600 1209600 300\nrr made.test. 3600 NS ns1.made.test.\nrr ns1.made.test. 3600 A 192.0.2.7\n"
+              "rr www.made.test. 60 A 192.0.2.8\n", &cr, &r) == ZI_OK);
+    CHECK(r.created && r.committed && r.generation == 0 && r.generation_after > 0 && r.has_version && r.version == 1 && r.n_items == 4 && serial_of("made.test") == 7);
+    CHECK(qn("SELECT count(*) FROM karidns_zone_versions v JOIN domains d ON d.id = v.domain_id WHERE d.name = 'made.test' AND v.kind = 'create' AND v.version = 1") == 1);
+    zi_result_free(&r);
+    log_reset();
+    CHECK(app(&o, "made2.test.", "rr www.made2.test. 60 A 192.0.2.8\n", &cr, &r) == ZI_FAIL);                  /* a whole zone needs SOA and NS: the zone checks */
+    LOG_HAS("zone.soa.missing");
+    zi_result_free(&r);
+    CHECK(qn("SELECT count(*) FROM domains WHERE name = 'made2.test'") == 0);
+
+    /* the narrow read-back of the commit run: the rows written are read back and checked */
+    zi_apply_in_t nr;
+    memset(&nr, 0, sizeof(nr));
+    nr.readback_changed = true;
+    CHECK(app(&o, Z, "rr more.example.test. 60 MX 5 mail.example.test.\n", &nr, &r) == ZI_OK);
+    CHECK(r.committed && r.has_version && qn("SELECT count(*) FROM records WHERE name = 'more.example.test' AND type = 'MX' AND prio = 5") == 1);
+    zi_result_free(&r);
+    /* ... and the whole-zone read-back refuses a CNAME beside other data, rolled back with its version row */
+    long v_before = qn("SELECT count(*) FROM karidns_zone_versions");
+    log_reset();
+    CHECK(app(&o, Z, "rr www.example.test. 60 CNAME other.example.test.\n", NULL, &r) == ZI_FAIL);
+    CHECK(qn("SELECT count(*) FROM karidns_zone_versions") == v_before && qn("SELECT count(*) FROM records WHERE name = 'www.example.test' AND type = 'A'") == 2);
+    zi_result_free(&r);
+    /* a TTL 0 / a record the zone checks refuse */
+    log_reset();
+    CHECK(app(&o, Z, "rr bad.example.test. 60 MX 10\n", NULL, &r) == ZI_FAIL);
+    zi_result_free(&r);
+
+    /* a database without the version tables or the generation: the change is made, there is no version */
+    be_fresh(false);
+    CHECK(imp_zone(&o, "plain.test", 5, K_BODY, NULL) == ZI_OK);
+    CHECK(app(&o, "plain.test.", "rr x.plain.test. 60 A 192.0.2.5\n", NULL, &r) == ZI_OK);
+    CHECK(!r.has_generation && !r.has_version && r.serial_bumped && serial_of("plain.test") == 6);
+    zi_result_free(&r);
+    in.have_expect = true;
+    in.expect_generation = 1;
+    log_reset();
+    CHECK(app(&o, "plain.test.", "rr y.plain.test. 60 A 192.0.2.5\n", &in, &r) == ZI_FAIL);
+    LOG_HAS("db.import.schema");
+    zi_result_free(&r);
+
+    /* the zone is locked by another writer */
+    be_fresh(true);
+    CHECK(imp_zone(&o, "example.test", 10, K_BODY, NULL) == ZI_OK);
+    {
+        char err[DB_ERRLEN];
+        db_conn_t *c = NULL;
+        CHECK(g_drv->open_write(&c, &g_src, err, sizeof(err)) == 0 && g_drv->w_begin(c, "example.test") == 0);
+        log_reset();
+        CHECK(app(&o, Z, "rr y.example.test. 60 A 192.0.2.5\n", NULL, &r) == ZI_BUSY);
+        LOG_HAS("db.import.busy");
+        zi_result_free(&r);
+        CHECK(g_drv->w_rollback(c) == 0);
+        g_drv->close(c);
+    }
+}
+
+/* the driver functions of items D and E: the generation, the version rows and their numbers, the retention, the actor, the SOA serial */
+static void t_apply_driver(void) {
+    printf("  generation, versions, retention\n");
+    be_fresh(true);
+    zi_opts_t o = base_opts();
+    CHECK(imp_zone(&o, "example.test", 10, K_BODY, NULL) == ZI_OK);
+    char err[DB_ERRLEN];
+    db_conn_t *c = NULL;
+    db_schema_info_t si;
+    CHECK(g_drv->open_write(&c, &g_src, err, sizeof(err)) == 0 && g_drv->check_schema(c, &si) == 0 && si.has_zone_state && si.has_versions);
+    long did = qn("SELECT id FROM domains WHERE name = 'example.test'");
+    uint64_t g0 = 0, g1 = 0, g2 = 0;
+    uint32_t num = 0;
+    int64_t vid = 0;
+    CHECK(g_drv->w_zone_generation(c, did, &g0) == -1);                                               /* not in a transaction */
+    CHECK(g_drv->w_begin(c, "example.test") == 0 && g_drv->w_zone_generation(c, did, &g0) == 0 && g0 > 0);
+    CHECK(g_drv->w_zone_generation(c, 9999, &g1) == 0 && g1 == 0);                                    /* a zone with no row has generation 0 */
+    CHECK(g_drv->w_set_actor(c, NULL) == -1);                                                         /* inside a transaction */
+    CHECK(g_drv->w_set_snapshot(c, false) == -1);
+    CHECK(g_drv->w_rollback(c) == 0);
+    /* a write grows the generation (once per transaction on PostgreSQL, per row on SQLite3: only the change counts) */
+    db_actor_t a = { true, 42, "alice", "cs-9" };
+    CHECK(g_drv->w_set_actor(c, &a) == 0);
+    CHECK(g_drv->w_begin(c, "example.test") == 0 && g_drv->w_insert_meta(c, did, "X-TEST", "1") == 0 && g_drv->w_zone_generation(c, did, &g1) == 0 && g1 > g0);
+    CHECK(g_drv->w_insert_meta(c, did, "X-TEST", "2") == 0 && g_drv->w_zone_generation(c, did, &g2) == 0 && g2 >= g1);
+    if (g_be == BE_PG) CHECK(g2 == g1);                                                               /* the first change of the transaction bumped it */
+    /* a version row: the number is the zone's highest + 1; its RRset rows */
+    db_version_t v;
+    memset(&v, 0, sizeof(v));
+    v.kind = "edit";
+    v.change_set = "cs-9";
+    v.has_principal = true;
+    v.principal_id = 42;
+    v.principal_name = "alice";
+    v.db_role = g_be == BE_SQLITE ? "tester" : NULL;
+    v.comment = "driver test";
+    v.has_serial_before = v.has_serial_after = true;
+    v.serial_before = 10;
+    v.serial_after = 11;
+    v.generation_before = g0;
+    v.generation_after = g2;
+    v.delta_complete = true;
+    CHECK(g_drv->w_insert_version(c, did, &v, &num, &vid) == 0 && num == 2);                          /* the import made version 1 */
+    CHECK(g_drv->w_insert_version_rrset(c, vid, "a.example.test", "A", NULL, "300 A 192.0.2.1") == 0);
+    CHECK(g_drv->w_insert_version_rrset(c, vid, "a.example.test", "A", "x", "y") != 0);               /* the key is (version, owner, type) */
+    CHECK(g_drv->w_rollback(c) == 0);
+    CHECK(qn("SELECT count(*) FROM karidns_zone_versions") == 1 && qn("SELECT count(*) FROM domainmetadata WHERE kind = 'X-TEST'") == 0);
+    /* the retention: the newest N versions of a zone (the number in the trigger; here 3) */
+    if (g_be == BE_SQLITE) {
+        be_exec("DROP TRIGGER karidns_zone_versions_prune; CREATE TRIGGER karidns_zone_versions_prune AFTER INSERT ON karidns_zone_versions BEGIN "
+                "DELETE FROM karidns_zone_version_rrsets WHERE version_id IN (SELECT id FROM karidns_zone_versions WHERE domain_id = NEW.domain_id AND version <= NEW.version - 3); "
+                "DELETE FROM karidns_zone_versions WHERE domain_id = NEW.domain_id AND version <= NEW.version - 3; END");
+    } else {
+        be_exec("CREATE OR REPLACE FUNCTION karidns_zone_versions_prune_fn() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$ BEGIN "
+                "DELETE FROM karidns_zone_versions WHERE domain_id = NEW.domain_id AND version <= NEW.version - 3; RETURN NULL; END $$");
+    }
+    for (int i = 0; i < 6; i++) {
+        CHECK(g_drv->w_begin(c, "example.test") == 0 && g_drv->w_insert_version(c, did, &v, &num, &vid) == 0 && num == (uint32_t)(i + 2));
+        CHECK(g_drv->w_insert_version_rrset(c, vid, "a.example.test", "A", NULL, "300 A 192.0.2.1") == 0 && g_drv->w_commit(c) == 0);
+    }
+    CHECK(qn("SELECT count(*) FROM karidns_zone_versions") == 3 && qn("SELECT min(version) FROM karidns_zone_versions") == 5);
+    CHECK(qn("SELECT count(*) FROM karidns_zone_version_rrsets") == 3);                               /* the rows of the pruned versions went with them */
+    CHECK(qn("SELECT count(*) FROM karidns_zone_versions WHERE principal_id = 42 AND principal_name = 'alice' AND change_set = 'cs-9'") == 3);
+    /* the serial of the SOA */
+    long sid = qn("SELECT id FROM records WHERE type = 'SOA'");
+    uint32_t ser = 11;
+    CHECK(g_drv->w_begin(c, "example.test") == 0 && g_drv->w_bump_serial(c, did, sid, "ns1.example.test hostmaster.example.test 11 7200 3600 1209600 300", false, &ser) == 0 && g_drv->w_commit(c) == 0);
+    CHECK(serial_of("example.test") == 11);
+    CHECK(g_drv->w_begin(c, "example.test") == 0 && g_drv->w_bump_serial(c, did, 987654, "x", false, &ser) == DB_ERR_CONFLICT && g_drv->w_rollback(c) == 0);
+    /* a zone that is deleted takes its state and its versions with it */
+    be_exec("DELETE FROM domains WHERE name = 'example.test'");
+    CHECK(qn("SELECT count(*) FROM karidns_zone_state") == 0 && qn("SELECT count(*) FROM karidns_zone_versions") == 0 && qn("SELECT count(*) FROM karidns_zone_version_rrsets") == 0);
+    g_drv->close(c);
+    /* the SQLite3 actor row: the principal, the name and the change set go to the audit log */
+    if (g_be == BE_SQLITE) {
+        be_fresh(true);
+        sql_file("../../db/karidns_audit.sqlite3.sql");
+        zi_opts_t oa = base_opts();
+        oa.audit_actor = "karidns-zone:tester";
+        zi_opts_t ob = oa;
+        CHECK(imp_zone(&ob, "example.test", 10, K_BODY, NULL) == ZI_OK);
+        oa.serial = ZI_SERIAL_INCREMENT;
+        zi_result_t r;
+        zi_apply_in_t in;
+        memset(&in, 0, sizeof(in));
+        in.actor = (db_actor_t){ true, 7, "bob", "cs-7" };
+        CHECK(app(&oa, "example.test.", "rr q.example.test. 60 A 192.0.2.3\n", &in, &r) == ZI_OK);
+        zi_result_free(&r);
+        CHECK(qn("SELECT count(*) FROM karidns_audit_log WHERE principal_id = 7 AND principal_name = 'bob' AND change_set = 'cs-7' AND db_role = 'karidns-zone:tester' AND table_name = 'records'") == 2);
+        CHECK(qn("SELECT count(*) FROM karidns_audit_actor") == 0);
+        CHECK(qn("SELECT count(*) FROM karidns_zone_versions WHERE db_role = 'karidns-zone:tester' AND principal_name = 'bob'") == 1);
+    }
+}
+
 static void run_scenarios(void) {
+    if (g_be == BE_SQLITE) t_changes_parser();
     t_new_zone();
     t_replace_merge();
     t_types();
@@ -2536,6 +2895,8 @@ static void run_scenarios(void) {
     t_signer_canonical();
     t_signer_zone_import();
     t_signer_driver();
+    t_apply();
+    t_apply_driver();
 #ifdef KARIDNS_DB_POSTGRESQL
     if (g_be == BE_PG) {
         t_pg_session();

@@ -6,6 +6,8 @@
  *   karidns-zone import --signer [options] <zone> <signed-zone-file|->
  *   karidns-zone export [options] <zone> [<file>]
  *   karidns-zone export --all --dir <dir> [options]
+ *   karidns-zone apply [options] --changes <file|-> <zone>
+ *   karidns-zone --types-list
  *
  * A thin shell over dns_zone_import.c (zone file -> PowerDNS rows, one transaction per zone, the checks of karicheck, the read-back through the
  * loader's reader) and dns_zone_export.c (rows -> zone file text, canonical order, verified).  This file reads the database settings the way
@@ -13,11 +15,13 @@
  * size limits of the configuration, writes output files safely and reports through dns_diag (text, or one JSON document with --json).
  *
  * Ordinary process code (malloc allowed); it runs as an ordinary user and never needs root.  Exit status 0 ok, 1 failed, 2 usage error, 3 (import
- * --signer) the zone changed since the signed file was made, 4 (import --signer) the zone is locked by another import or the database is busy: try again.
+ * --signer, apply) the zone changed since the signed file was made / is not at the generation --expect-generation named, 4 (import --signer, apply) the zone is locked by
+ * another import or the database is busy: try again.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -34,6 +38,8 @@
 #include "dns_config_parser.h"
 #include "dns_db_driver.h"
 #include "dns_diag.h"
+#include "dns_utils.h"
+#include "dns_zone_changes.h"
 #include "dns_zone_export.h"
 #include "dns_zone_import.h"
 #include "dns_zone_text.h"
@@ -94,6 +100,8 @@ static void kz_usage(FILE *fp) {
         "  karidns-zone import --signer [options] <zone> <signed-zone-file|->\n"
         "  karidns-zone export [--signer] [options] <zone> [<file>]\n"
         "  karidns-zone export --all --dir <dir> [options]\n"
+        "  karidns-zone apply [options] --changes <file|-> <zone>\n"
+        "  karidns-zone --types-list [--json]\n"
         "  karidns-zone --version | -h | --help\n"
         "\n"
         "import reads a zone file (BIND format, or a tinydns data file) and writes the zone to the PowerDNS database in one transaction; export\n"
@@ -141,20 +149,42 @@ static void kz_usage(FILE *fp) {
         "                          NSEC3PARAM metadata are left out, the other signatures and the DNSKEY records stay; a zone that was changed after it\n"
         "                          was signed (a name with no NSEC3 yet) can be exported this way\n"
         "\n"
+        "apply options (the API of the WebAdmin and operators; docs/karidns-zone.md, \"apply\" and \"The change file\"):\n"
+        "      --changes FILE      the change file (- = standard input): lines `rr <owner> <ttl> <type> <rdata>` replace the RRset (owner, type), lines\n"
+        "                          `delete <owner> <type>` delete it; owners are absolute names in the zone\n"
+        "      --create            the zone must not exist and is made (--type NATIVE|MASTER); the rr lines are the whole zone\n"
+        "      --expect-generation N  fail with exit status 3 unless the zone has this generation (karidns_zone_state); the dry run prints the generation\n"
+        "  -n, --dry-run           everything but the commit: the diff (the RRsets with their records before and after) and the version it would write\n"
+        "      --serial grow|increment|keep  as for import, but the default is increment: a change that wrote no SOA raises the serial by one\n"
+        "      --principal ID      the acting principal (karidns_auth.principals.id): the audit log and the version row name it; on PostgreSQL the serial is\n"
+        "                          raised with karidns_auth.bump_serial() (the API's role may not write an SOA row)\n"
+        "      --principal-name N  the principal's name for the SQLite3 audit actor and the version row\n"
+        "      --change-set ID     the id of the change set (1 to 64 of letters, digits, '.', '_', ':' and '-') in the audit log and the version row\n"
+        "      --readback zone|changed  zone (default): read the whole zone back through the loader's reader; changed: only the rows written (the commit run of\n"
+        "                          the API, after a check run at the same generation)\n"
+        "      --version-kind K    edit (default), template or rollback: the kind of the version row; --rollback-of N names the version a rollback restores\n"
+        "      --comment TEXT      the comment of the version row (at most 1024 octets)\n"
+        "      --view, --reload, --strict, --verbose, --audit  as for import\n"
+        "\n"
+        "      --types-list        print the record types a change file may name (one per line, or in the JSON document) and exit\n"
+        "\n"
         "Output:\n"
         "      --json              one JSON document on standard output (docs/karicheck.md, JSON OUTPUT; first key \"karidns-zone\");\n"
         "                          export of a single zone then needs a <file>\n"
         "\n"
         "Exit status: 0 ok, 1 failed (an error in a zone, the database or an output file), 2 usage error, 3 import --signer: the zone changed\n"
-        "since the signed file was made (nothing was written; sign the zone again), 4 import --signer: the zone is locked by another import or the\n"
-        "database is busy (nothing was written; try again).\n"
+        "since the signed file was made, apply: the zone is not at --expect-generation or was changed while the tool wrote (nothing was written; sign the\n"
+        "zone again / check again), 4 import --signer, apply: the zone is locked by another import or the database is busy (nothing was written; try again).\n"
         "Examples:\n"
         "  karidns-zone import -c /usr/local/etc/karidns/karidns.conf example.test /var/zones/example.test.zone\n"
         "  karidns-zone import --sqlite3 /var/db/karidns/pdns.sqlite3 --dry-run --mode merge example.test -\n"
         "  karidns-zone import --all --sqlite3 /var/db/karidns/pdns.sqlite3 /var/tinydns/root/data\n"
         "  karidns-zone import --signer --json -c /usr/local/etc/karidns/karidns.conf example.test /tmp/example.test.signed\n"
         "  karidns-zone export -c /usr/local/etc/karidns/karidns.conf example.test > example.test.zone\n"
-        "  karidns-zone export --all --dir /var/backups/zones --sqlite3 /var/db/karidns/pdns.sqlite3\n");
+        "  karidns-zone export --all --dir /var/backups/zones --sqlite3 /var/db/karidns/pdns.sqlite3\n"
+        "  karidns-zone apply --dry-run --json --sqlite3 /var/db/karidns/pdns.sqlite3 --changes - example.test < changes.txt\n"
+        "  karidns-zone apply -c /usr/local/etc/karidns/karidns.conf --expect-generation 17 --changes changes.txt example.test\n"
+        "  karidns-zone --types-list\n");
 }
 
 /* A usage error: one message and the usage text on stderr; with --json only the message goes into the document.  Exit status 2. */
@@ -175,15 +205,16 @@ static int kz_usage_error(bool json, dns_diag_code_t code, const char *fmt, ...)
 /* ------------------------------------------------------------------------------------------------------------- */
 
 typedef struct {
-    bool json, verbose, dry_run, strict, reload, all, force, no_config, help, version, signer;
+    bool json, verbose, dry_run, strict, reload, all, force, no_config, help, version, signer, create, types_list;
     const char *conf, *view, *sqlite, *conninfo, *schema, *mode, *types, *serial, *type, *format, *dir, *audit;
+    const char *changes, *expect, *principal, *pname, *change_set, *readback, *vkind, *comment, *rollback_of;      /* apply */
     int nargs;
     char **args;
     char perr[100];                         /* why the options could not be read */
 } kz_args_t;
 
 enum { KO_NOCONFIG = 256, KO_VIEW, KO_SQLITE, KO_CONNINFO, KO_SCHEMA, KO_ALL, KO_MODE, KO_TYPES, KO_SERIAL, KO_STRICT, KO_RELOAD, KO_TYPE, KO_FORMAT, KO_VERBOSE, KO_DIR,
-       KO_FORCE, KO_AUDIT, KO_SIGNER };
+       KO_FORCE, KO_AUDIT, KO_SIGNER, KO_CHANGES, KO_CREATE, KO_EXPECT, KO_PRINCIPAL, KO_PNAME, KO_CHANGESET, KO_READBACK, KO_VKIND, KO_COMMENT, KO_ROLLBACKOF, KO_TYPESLIST };
 
 static const struct option k_long[] = {
     { "config", required_argument, NULL, 'c' }, { "no-config", no_argument, NULL, KO_NOCONFIG }, { "view", required_argument, NULL, KO_VIEW },
@@ -193,6 +224,10 @@ static const struct option k_long[] = {
     { "reload", no_argument, NULL, KO_RELOAD }, { "type", required_argument, NULL, KO_TYPE }, { "format", required_argument, NULL, KO_FORMAT },
     { "verbose", no_argument, NULL, KO_VERBOSE }, { "dir", required_argument, NULL, KO_DIR }, { "force", no_argument, NULL, KO_FORCE }, { "audit", required_argument, NULL, KO_AUDIT },
     { "signer", no_argument, NULL, KO_SIGNER },
+    { "changes", required_argument, NULL, KO_CHANGES }, { "create", no_argument, NULL, KO_CREATE }, { "expect-generation", required_argument, NULL, KO_EXPECT },
+    { "principal", required_argument, NULL, KO_PRINCIPAL }, { "principal-name", required_argument, NULL, KO_PNAME }, { "change-set", required_argument, NULL, KO_CHANGESET },
+    { "readback", required_argument, NULL, KO_READBACK }, { "version-kind", required_argument, NULL, KO_VKIND }, { "comment", required_argument, NULL, KO_COMMENT },
+    { "rollback-of", required_argument, NULL, KO_ROLLBACKOF }, { "types-list", no_argument, NULL, KO_TYPESLIST },
     { "help", no_argument, NULL, 'h' }, { "version", no_argument, NULL, 'v' }, { NULL, 0, NULL, 0 }
 };
 
@@ -243,6 +278,17 @@ static int kz_parse(int argc, char **argv, const char **cmd, kz_args_t *a) {
         case KO_FORCE: a->force = true; break;
         case KO_AUDIT: a->audit = optarg; break;
         case KO_SIGNER: a->signer = true; break;
+        case KO_CHANGES: a->changes = optarg; break;
+        case KO_CREATE: a->create = true; break;
+        case KO_EXPECT: a->expect = optarg; break;
+        case KO_PRINCIPAL: a->principal = optarg; break;
+        case KO_PNAME: a->pname = optarg; break;
+        case KO_CHANGESET: a->change_set = optarg; break;
+        case KO_READBACK: a->readback = optarg; break;
+        case KO_VKIND: a->vkind = optarg; break;
+        case KO_COMMENT: a->comment = optarg; break;
+        case KO_ROLLBACKOF: a->rollback_of = optarg; break;
+        case KO_TYPESLIST: a->types_list = true; break;
         case ':': snprintf(a->perr, sizeof(a->perr), "the option %.60s needs a value", argv[optind - 1]); return 2;
         default: snprintf(a->perr, sizeof(a->perr), "unknown option %.60s", argv[optind - 1]); return 2;
         }
@@ -526,12 +572,12 @@ static void kz_signer_json(const zi_result_t *res, int status, bool dry_run) {
     dns_diag_json_extra("signer", body);
 }
 
-static int kz_cmd_import(const kz_args_t *a, kz_ctx_t *x) {
-    const char *zone = a->all ? NULL : a->args[0];
-    const char *file = a->args[a->nargs - 1];
+/* the options of the importer from the command line and the configuration (import and apply) */
+static void kz_fill_opts(const kz_args_t *a, kz_ctx_t *x, zi_opts_t *op) {
     zi_opts_t o;
     memset(&o, 0, sizeof(o));
     o.drv = x->drv;
+
     o.src = x->src;
     o.audit_summary = a->audit ? kz_ieq(a->audit, "summary") : a->signer;      /* the signer re-signs a whole zone: one audit row per table and operation, not one per signature */
     o.audit_actor = x->actor;
@@ -556,7 +602,16 @@ static int kz_cmd_import(const kz_args_t *a, kz_ctx_t *x) {
     }
     o.limits = x->limits;
     o.reader = x->reader;
+    *op = o;
+}
+
+static int kz_cmd_import(const kz_args_t *a, kz_ctx_t *x) {
+    const char *zone = a->all ? NULL : a->args[0];
+    const char *file = a->args[a->nargs - 1];
+    zi_opts_t o;
+    kz_fill_opts(a, x, &o);
     const char *tnames[KZ_MAX_TYPES];
+
     char *tcopy = NULL;
     if (a->types) {
         int rc = kz_split_types(a->types, &tcopy, tnames, &o.ntypes);
@@ -593,6 +648,271 @@ static int kz_cmd_import(const kz_args_t *a, kz_ctx_t *x) {
     if (a->all)
         dns_diag(DIAG_INFO, DC_DB_IMPORT_SUMMARY, NULL, 0, "%u zone(s) imported, %u failed\n", s.done, s.failed);
     return rc == ZI_OK ? 0 : rc == ZI_CHANGED ? 3 : rc == ZI_BUSY && a->signer ? 4 : 1;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* apply (items D and E)                                                                                          */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* the file (or standard input, "-") into memory: at most 64 MiB; NULL with a message */
+static char *kz_read_all(const char *path, size_t *len) {
+    const bool in = strcmp(path, "-") == 0;
+    int fd = in ? 0 : open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        dns_diag(DIAG_ERROR, DC_IO_OPEN, path, 0, "Could not open %s: %s\n", path, strerror(errno));
+        return NULL;
+    }
+    size_t cap = 65536, n = 0;
+    char *buf = malloc(cap + 1);
+    while (buf) {
+        if (n == cap) {
+            if (cap >= ((size_t)64 << 20)) {
+                dns_diag(DIAG_ERROR, DC_IO_STDIN_TOO_LARGE, path, 0, "The change file is larger than %zu bytes\n", cap);
+                free(buf);
+                buf = NULL;
+                break;
+            }
+            char *nb = realloc(buf, cap * 2 + 1);
+            if (!nb) {
+                free(buf);
+                buf = NULL;
+                break;
+            }
+            buf = nb;
+            cap *= 2;
+        }
+        ssize_t got = read(fd, buf + n, cap - n);
+        if (got < 0 && errno == EINTR) continue;
+        if (got < 0) {
+            dns_diag(DIAG_ERROR, DC_IO_READ, path, 0, "Could not read %s: %s\n", path, strerror(errno));
+            free(buf);
+            buf = NULL;
+            break;
+        }
+        if (got == 0) break;
+        n += (size_t)got;
+    }
+    if (!in) close(fd);
+    if (!buf) {
+        if (errno == ENOMEM || !errno) dns_diag(DIAG_ERROR, DC_INTERNAL_OOM, path, 0, "out of memory\n");
+        return NULL;
+    }
+    buf[n] = '\0';
+    *len = n;
+    return buf;
+}
+
+/* a growing JSON text */
+typedef struct { char *p; size_t len, cap; bool oom; } kz_jb_t;
+
+static void kz_jb_add(kz_jb_t *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void kz_jb_add(kz_jb_t *b, const char *fmt, ...) {
+    char tmp[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+    if (b->oom || n < 0 || (size_t)n >= sizeof(tmp)) {
+        b->oom = true;
+        return;
+    }
+    if (b->len + (size_t)n + 1 > b->cap) {
+        size_t nc = b->cap ? b->cap * 2 : 4096;
+        while (nc < b->len + (size_t)n + 1) nc *= 2;
+        char *np = realloc(b->p, nc);
+        if (!np) {
+            b->oom = true;
+            return;
+        }
+        b->p = np;
+        b->cap = nc;
+    }
+    memcpy(b->p + b->len, tmp, (size_t)n + 1);
+    b->len += (size_t)n;
+}
+
+/* a JSON string of s[0..n) */
+static void kz_jb_str(kz_jb_t *b, const char *s, size_t n) {
+    size_t cap = 6 * n + 3;
+    char *tmp = malloc(cap);
+    if (!tmp) {
+        b->oom = true;
+        return;
+    }
+    dns_diag_json_escape(tmp, cap, s, n);
+    kz_jb_add(b, "\"");
+    if (!b->oom) {
+        size_t l = strlen(tmp);
+        if (b->len + l + 1 > b->cap) {
+            size_t nc = b->cap ? b->cap * 2 : 4096;
+            while (nc < b->len + l + 1) nc *= 2;
+            char *np = realloc(b->p, nc);
+            if (!np) b->oom = true;
+            else {
+                b->p = np;
+                b->cap = nc;
+            }
+        }
+        if (!b->oom) {
+            memcpy(b->p + b->len, tmp, l + 1);
+            b->len += l;
+        }
+    }
+    kz_jb_add(b, "\"");
+    free(tmp);
+}
+
+/* the lines of an RRset text ("<ttl> <TYPE> <rdata>" joined by LF) as a JSON array, or null */
+static void kz_jb_lines(kz_jb_t *b, const char *text) {
+    if (!text) {
+        kz_jb_add(b, "null");
+        return;
+    }
+    kz_jb_add(b, "[");
+    for (const char *p = text; ; ) {
+        const char *e = strchr(p, '\n');
+        kz_jb_str(b, p, e ? (size_t)(e - p) : strlen(p));
+        if (!e) break;
+        kz_jb_add(b, ", ");
+        p = e + 1;
+    }
+    kz_jb_add(b, "]");
+}
+
+/* the document key "apply": docs/karidns-zone.md ("apply", "JSON OUTPUT") */
+static void kz_apply_json(const zi_result_t *res, int status, bool dry_run) {
+    if (!dns_diag_json_enabled()) return;
+    kz_jb_t b = { NULL, 0, 0, false };
+    kz_jb_add(&b, "{ \"zone\": ");
+    char zone[DNS_NAME_TEXT_SIZE + 2];
+    snprintf(zone, sizeof(zone), "%s.", res->zone);
+    kz_jb_str(&b, zone, strlen(zone));
+    kz_jb_add(&b, ", \"dry_run\": %s, \"committed\": %s, \"changed\": %s, \"busy\": %s, \"created\": %s", dry_run ? "true" : "false", res->committed && !dry_run ? "true" : "false",
+              status == ZI_CHANGED ? "true" : "false", status == ZI_BUSY ? "true" : "false", res->created ? "true" : "false");
+    if (status == ZI_OK) {
+        if (res->has_generation) kz_jb_add(&b, ", \"generation\": %llu, \"generation_after\": %llu", (unsigned long long)res->generation, (unsigned long long)res->generation_after);
+        else kz_jb_add(&b, ", \"generation\": null, \"generation_after\": null");
+        kz_jb_add(&b, ", \"serial\": { \"before\": ");
+        if (res->has_old_serial) kz_jb_add(&b, "%u", (unsigned)res->old_serial);
+        else kz_jb_add(&b, "null");
+        kz_jb_add(&b, ", \"after\": ");
+        if (res->wrote_soa || res->serial_bumped || res->has_old_serial) kz_jb_add(&b, "%u", (unsigned)(res->wrote_soa || res->serial_bumped ? res->new_serial : res->old_serial));
+        else kz_jb_add(&b, "null");
+        kz_jb_add(&b, " }, \"serial_bumped\": %s", res->serial_bumped ? "true" : "false");
+        if (res->has_version) kz_jb_add(&b, ", \"version\": %u", (unsigned)res->version);
+        else kz_jb_add(&b, ", \"version\": null");
+        kz_jb_add(&b, ", \"delta_complete\": %s, \"records_before\": %llu, \"records_after\": %llu, \"warnings\": %zu, \"diff\": [", res->delta_complete ? "true" : "false",
+                  (unsigned long long)res->records_before, (unsigned long long)res->records_after, res->warnings);
+        for (size_t i = 0; i < res->n_items; i++) {
+            const zi_change_t *c = &res->items[i];
+            char owner[DNS_NAME_TEXT_SIZE + 2];
+            snprintf(owner, sizeof(owner), "%s.", c->owner);
+            kz_jb_add(&b, "%s{ \"owner\": ", i ? ", " : "");
+            kz_jb_str(&b, owner, strlen(owner));
+            kz_jb_add(&b, ", \"type\": ");
+            kz_jb_str(&b, c->type, strlen(c->type));
+            kz_jb_add(&b, ", \"change\": \"%s\", \"before\": ", c->what == '+' ? "add" : c->what == '-' ? "delete" : "replace");
+            kz_jb_lines(&b, c->before);
+            kz_jb_add(&b, ", \"after\": ");
+            kz_jb_lines(&b, c->after);
+            kz_jb_add(&b, " }");
+        }
+        kz_jb_add(&b, "]");
+    }
+    kz_jb_add(&b, " }");
+    if (!b.oom) dns_diag_json_extra("apply", b.p);
+    free(b.p);
+}
+
+static int kz_cmd_apply(const kz_args_t *a, kz_ctx_t *x) {
+    char canon[DNS_NAME_TEXT_SIZE];
+    if (!pdns_canonical_zone_name(a->args[0], canon)) {
+        dns_diag(DIAG_ERROR, DC_DB_IMPORT_ZONE_NAME, NULL, 0, "'%.100s' is not a valid zone name\n", a->args[0]);
+        return 1;
+    }
+    char zone[DNS_NAME_TEXT_SIZE + 2];
+    snprintf(zone, sizeof(zone), "%s", canon);
+    for (char *p = zone; *p; p++) *p = (char)tolower((unsigned char)*p);
+    size_t zl = strlen(zone);
+    if (zl == 0 || zone[zl - 1] != '.') {
+        zone[zl++] = '.';
+        zone[zl] = '\0';
+    }
+    const char *shown = strcmp(a->changes, "-") == 0 ? "standard input" : a->changes;
+    size_t len = 0;
+    char *text = kz_read_all(a->changes, &len);
+    if (!text) return 1;
+    zc_changes_t ch;
+    char err[400];
+    if (!zc_parse(text, len, zone, &ch, err, sizeof(err))) {
+        dns_diag(DIAG_ERROR, DC_DB_APPLY_CHANGES, shown, 0, "%s: %s\n", shown, err);
+        free(text);
+        return 1;
+    }
+    free(text);
+    zi_opts_t o;
+    kz_fill_opts(a, x, &o);
+    o.serial = a->serial && kz_ieq(a->serial, "grow") ? ZI_SERIAL_GROW : a->serial && kz_ieq(a->serial, "keep") ? ZI_SERIAL_KEEP : ZI_SERIAL_INCREMENT;
+    o.snapshot = true;
+    if (a->dry_run || a->verbose) o.report = kz_report;
+    zi_t *zt = zi_open(&o);
+    if (!zt) {
+        zc_free(&ch);
+        return 1;
+    }
+    zi_apply_in_t in;
+    memset(&in, 0, sizeof(in));
+    in.zone = zone;
+    in.changes = &ch;
+    in.create = a->create;
+    in.have_expect = a->expect != NULL;
+    if (a->expect) in.expect_generation = strtoull(a->expect, NULL, 10);
+    in.readback_changed = a->readback && kz_ieq(a->readback, "changed");
+    in.actor.has_principal = a->principal != NULL;
+    if (a->principal) in.actor.principal_id = (int64_t)strtoll(a->principal, NULL, 10);
+    in.actor.principal_name = a->pname;
+    in.actor.change_set = a->change_set;
+    in.api_serial = a->principal != NULL;
+    in.kind = a->vkind;
+    in.comment = a->comment;
+    if (a->rollback_of) in.rollback_of = (uint32_t)strtoul(a->rollback_of, NULL, 10);
+    in.shown = shown;
+    zi_result_t res;
+    dns_diag_set_file(shown);
+    dns_diag_set_zone(zone, x->zone_view);
+    dns_diag_mark_t mark = dns_diag_mark();
+    int rc = zi_apply_changes(zt, &in, &res);
+    dns_diag_zone_result(res.zone[0] ? res.zone : zone, x->zone_view, shown, "bind", mark);
+    dns_diag_set_zone(NULL, NULL);
+    dns_diag_set_file(NULL);
+    kz_apply_json(&res, rc, a->dry_run);
+    dns_diag_counts(1, 0);
+    zi_result_free(&res);
+    zi_close(zt);
+    zc_free(&ch);
+    return rc == ZI_OK ? 0 : rc == ZI_CHANGED ? 3 : rc == ZI_BUSY ? 4 : 1;
+}
+
+/* --types-list: the record types a change file may name, in the order of their codes */
+static int kz_types_list(bool json) {
+    kz_jb_t b = { NULL, 0, 0, false };
+    kz_jb_add(&b, "[");
+    unsigned n = 0;
+    for (unsigned code = 1; code <= 65535; code++) {
+        const char *name = dns_type_to_string((uint16_t)code);
+        if (strncmp(name, "TYPE", 4) == 0 || get_type_code(name) != code || zc_type_refused(name)) continue;
+        if (json) {
+            kz_jb_add(&b, "%s", n ? ", " : "");
+            kz_jb_str(&b, name, strlen(name));
+        } else {
+            printf("%s\n", name);
+        }
+        n++;
+    }
+    kz_jb_add(&b, "]");
+    if (json && !b.oom) dns_diag_json_extra("types", b.p);
+    free(b.p);
+    return 0;
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -856,6 +1176,56 @@ static int kz_cmd_export(const kz_args_t *a, kz_ctx_t *x) {
 /* main                                                                                                           */
 /* ------------------------------------------------------------------------------------------------------------- */
 
+/* an option that only apply takes */
+static bool kz_apply_only(const kz_args_t *a) {
+    return a->changes || a->create || a->expect || a->principal || a->pname || a->change_set || a->readback || a->vkind || a->comment || a->rollback_of;
+}
+
+static bool kz_all_digits(const char *s, size_t min, size_t max) {
+    size_t n = strlen(s);
+    if (n < min || n > max) return false;
+    for (size_t i = 0; i < n; i++)
+        if (s[i] < '0' || s[i] > '9') return false;
+    return true;
+}
+
+/* the options of apply: 0, or 2 (usage error) */
+static int kz_check_apply_args(const kz_args_t *a) {
+    const bool j = a->json;
+    if (a->format && !kz_ieq(a->format, "bind") && !kz_ieq(a->format, "auto")) return kz_usage_error(j, DC_USAGE_OPTION, "apply reads a change file: --format does not apply");
+    if (a->sqlite && a->conninfo) return kz_usage_error(j, DC_USAGE_OPTION, "--sqlite3 and --conninfo-file name different drivers: give one");
+    if (a->schema && a->sqlite) return kz_usage_error(j, DC_USAGE_OPTION, "--schema is for PostgreSQL, not for --sqlite3");
+    if (a->conf && a->no_config) return kz_usage_error(j, DC_USAGE_OPTION, "-c and --no-config exclude each other");
+    if (a->all || a->signer || a->mode || a->types || a->dir || a->force || a->format)
+        return kz_usage_error(j, DC_USAGE_OPTION, "--all, --signer, --mode, --types, --format, --dir and --force are not options of apply");
+    if (a->nargs != 1) return kz_usage_error(j, DC_USAGE_ARGS, "apply takes a zone name (and --changes FILE)");
+    if (!a->changes) return kz_usage_error(j, DC_USAGE_ARGS, "apply needs --changes FILE (- = standard input)");
+    if (a->serial && !kz_ieq(a->serial, "grow") && !kz_ieq(a->serial, "increment") && !kz_ieq(a->serial, "keep")) return kz_usage_error(j, DC_USAGE_OPTION, "--serial must be grow, increment or keep");
+    if (a->type && !a->create) return kz_usage_error(j, DC_USAGE_OPTION, "--type is for --create (an existing zone keeps its type)");
+    if (a->type && !kz_ieq(a->type, "NATIVE") && !kz_ieq(a->type, "MASTER")) return kz_usage_error(j, DC_USAGE_OPTION, "--type must be NATIVE or MASTER");
+    if (a->audit && !kz_ieq(a->audit, "rows") && !kz_ieq(a->audit, "summary")) return kz_usage_error(j, DC_USAGE_OPTION, "--audit must be rows or summary");
+    if (a->expect && (!kz_all_digits(a->expect, 1, 19) || a->create)) return kz_usage_error(j, DC_USAGE_OPTION, "--expect-generation takes a number, and not with --create (a new zone has no generation)");
+    if (a->principal && !kz_all_digits(a->principal, 1, 18)) return kz_usage_error(j, DC_USAGE_OPTION, "--principal takes the id of a principal (1 to 18 digits)");
+    if (a->pname && (!a->principal || strlen(a->pname) > 255 || strlen(a->pname) == 0)) return kz_usage_error(j, DC_USAGE_OPTION, "--principal-name needs --principal and is at most 255 octets");
+    if (a->change_set) {
+        size_t n = strlen(a->change_set);
+        bool good = n >= 1 && n <= 64;
+        for (size_t i = 0; good && i < n; i++) {
+            unsigned char c = (unsigned char)a->change_set[i];
+            good = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ':' || c == '-';
+        }
+        if (!good) return kz_usage_error(j, DC_USAGE_OPTION, "--change-set takes 1 to 64 of letters, digits, '.', '_', ':' and '-'");
+    }
+    if (a->readback && !kz_ieq(a->readback, "zone") && !kz_ieq(a->readback, "changed")) return kz_usage_error(j, DC_USAGE_OPTION, "--readback must be zone or changed");
+    if (a->vkind && !kz_ieq(a->vkind, "edit") && !kz_ieq(a->vkind, "template") && !kz_ieq(a->vkind, "rollback"))
+        return kz_usage_error(j, DC_USAGE_OPTION, "--version-kind must be edit, template or rollback");
+    if (a->create && a->vkind) return kz_usage_error(j, DC_USAGE_OPTION, "a zone made with --create has a version of kind create: no --version-kind");
+    if ((a->vkind && kz_ieq(a->vkind, "rollback")) != (a->rollback_of != NULL)) return kz_usage_error(j, DC_USAGE_OPTION, "--rollback-of names the version of a rollback, and a rollback needs it");
+    if (a->rollback_of && (!kz_all_digits(a->rollback_of, 1, 9) || strtoul(a->rollback_of, NULL, 10) < 1)) return kz_usage_error(j, DC_USAGE_OPTION, "--rollback-of takes a version number");
+    if (a->comment && strlen(a->comment) > 1024) return kz_usage_error(j, DC_USAGE_OPTION, "--comment is at most 1024 octets");
+    return 0;
+}
+
 /* the values of the options, before anything is opened: 0, or 2 (usage error) */
 static int kz_check_args(const kz_args_t *a, bool import) {
     const bool j = a->json;
@@ -866,6 +1236,7 @@ static int kz_check_args(const kz_args_t *a, bool import) {
     if (a->conf && a->no_config) return kz_usage_error(j, DC_USAGE_OPTION, "-c and --no-config exclude each other");
     if (import) {
         if (a->dir || a->force) return kz_usage_error(j, DC_USAGE_OPTION, "--dir and --force are options of export");
+        if (kz_apply_only(a)) return kz_usage_error(j, DC_USAGE_OPTION, "--changes, --create, --expect-generation, --principal, --principal-name, --change-set, --readback, --version-kind, --comment and --rollback-of are options of apply");
         if (a->mode && !kz_ieq(a->mode, "replace") && !kz_ieq(a->mode, "merge")) return kz_usage_error(j, DC_USAGE_OPTION, "--mode must be replace or merge");
         if (a->serial && !kz_ieq(a->serial, "grow") && !kz_ieq(a->serial, "increment") && !kz_ieq(a->serial, "keep"))
             return kz_usage_error(j, DC_USAGE_OPTION, "--serial must be grow, increment or keep");
@@ -881,8 +1252,8 @@ static int kz_check_args(const kz_args_t *a, bool import) {
         }
         if (a->all ? a->nargs != 1 : a->nargs != 2) return kz_usage_error(j, DC_USAGE_ARGS, a->all ? "import --all takes one argument: the tinydns data file" : "import takes a zone name and a file (or -)");
     } else {
-        if (a->mode || a->types || a->dry_run || a->serial || a->strict || a->reload || a->type || a->verbose || a->audit)
-            return kz_usage_error(j, DC_USAGE_OPTION, "--mode, --types, --dry-run, --serial, --strict, --reload, --type, --verbose and --audit are options of import");
+        if (a->mode || a->types || a->dry_run || a->serial || a->strict || a->reload || a->type || a->verbose || a->audit || kz_apply_only(a))
+            return kz_usage_error(j, DC_USAGE_OPTION, "--mode, --types, --dry-run, --serial, --strict, --reload, --type, --verbose, --audit and the options of apply are options of import");
         if (a->dir && !a->all) return kz_usage_error(j, DC_USAGE_OPTION, "--dir is for export --all");
         if (a->all && (!a->dir || a->nargs != 0)) return kz_usage_error(j, DC_USAGE_ARGS, "export --all takes no argument and needs --dir DIR");
         if (!a->all && (a->nargs < 1 || a->nargs > 2)) return kz_usage_error(j, DC_USAGE_ARGS, "export takes a zone name and an optional file");
@@ -897,7 +1268,8 @@ static int kz_run(int argc, char **argv, bool *json_out) {
     const char *cmd;
     int perr = kz_parse(argc, argv, &cmd, &a);
     *json_out = a.json;
-    const char *known = cmd && (strcmp(cmd, "import") == 0 || strcmp(cmd, "export") == 0) ? cmd : NULL;
+    const char *known = cmd && (strcmp(cmd, "import") == 0 || strcmp(cmd, "export") == 0 || strcmp(cmd, "apply") == 0) ? cmd : NULL;
+    if (a.types_list && !known) known = "types";
     if (a.json) {
         dns_diag_json_start(known, KARIDNS_VERSION);
         dns_diag_json_tool("karidns-zone");
@@ -914,15 +1286,21 @@ static int kz_run(int argc, char **argv, bool *json_out) {
         return 0;
     }
     if (a.help || a.version) return kz_usage_error(true, DC_USAGE_OPTION, "-h and --version are not available with --json");
-    if (!cmd) return kz_usage_error(a.json, DC_USAGE_COMMAND_MISSING, "no command given (import or export)");
-    if (!known) return kz_usage_error(a.json, DC_USAGE_COMMAND_UNKNOWN, "unknown command '%.64s' (import or export)", cmd);
+    if (a.types_list) {
+        if (cmd || a.nargs) return kz_usage_error(a.json, DC_USAGE_OPTION, "--types-list takes no command and no argument");
+        return kz_types_list(a.json);
+    }
+    if (!cmd) return kz_usage_error(a.json, DC_USAGE_COMMAND_MISSING, "no command given (import, export or apply)");
+    if (!known) return kz_usage_error(a.json, DC_USAGE_COMMAND_UNKNOWN, "unknown command '%.64s' (import, export or apply)", cmd);
     const bool import = strcmp(cmd, "import") == 0;
-    int rc = kz_check_args(&a, import);
+    const bool apply = strcmp(cmd, "apply") == 0;
+    int rc = apply ? kz_check_apply_args(&a) : kz_check_args(&a, import);
     if (rc != 0) return rc;
+
     kz_ctx_t x;
     memset(&x, 0, sizeof(x));
     rc = kz_load_config(&a, &x) || kz_resolve(&a, &x) ? 1 : 0;
-    if (rc == 0) rc = import ? kz_cmd_import(&a, &x) : kz_cmd_export(&a, &x);
+    if (rc == 0) rc = import ? kz_cmd_import(&a, &x) : apply ? kz_cmd_apply(&a, &x) : kz_cmd_export(&a, &x);
     kz_ctx_free(&x);
     return rc;
 }

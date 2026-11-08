@@ -1,0 +1,2 @@
+delete www.fuzz.test. A
+rr www.fuzz.test. 300 A 192.0.2.1
