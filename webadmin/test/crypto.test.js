@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import {
   sha256, randomToken, safeEqual, Semaphore, hashPassword, verifyPassword, base32, base32Decode, hotp, totpStep, totpVerify, otpauthUri, wrapSecret, unwrapSecret,
-  loadKeyFile, sessionHash, csrfToken, csrfHash, tokenText, parseToken, tokenHash,
+  loadKeyFile, sessionHash, csrfToken, csrfHash, tokenText, parseToken, tokenHash, argon2Available,
 } from '../lib/crypto.js';
 
 test('sha256, random tokens, constant time comparison', () => {
@@ -75,7 +75,7 @@ test('passwords: a hash we cannot read or whose cost is out of bounds is "no"', 
   assert.equal(await verifyPassword(await hashPassword('pw-1234567890', { ln: 10, r: 8 }), 'pw-1234567890'), true);
 });
 
-test('passwords: argon2id strings are verified when node:crypto has argon2', { skip: typeof crypto.argon2 !== 'function' }, async () => {
+test('passwords: argon2id strings are verified when node:crypto has argon2', { skip: !argon2Available && "node:crypto has no usable argon2 (OpenSSL without it)" }, async () => {
   const nonce = crypto.randomBytes(16);
   const tag = crypto.argon2Sync('argon2id', { message: Buffer.from('secret password'), nonce, parallelism: 2, tagLength: 32, memory: 64, passes: 2 });
   const b = (x) => x.toString('base64').replace(/=+$/, '');

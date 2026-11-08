@@ -63,6 +63,18 @@ const argon2 = (opts) => new Promise((resolve, reject) => {
   crypto.argon2('argon2id', opts, (err, key) => (err ? reject(err) : resolve(key)));
 });
 
+// node:crypto has argon2 as a function also where the OpenSSL it is linked with lacks the algorithm (OpenSSL 3.0, FreeBSD
+// 14): then every call throws ERR_CRYPTO_ARGON2_NOT_SUPPORTED.  One small hash says which.
+export const argon2Available = (() => {
+  if (typeof crypto.argon2Sync !== 'function') return false;
+  try {
+    crypto.argon2Sync('argon2id', { message: Buffer.alloc(1), nonce: Buffer.alloc(16), parallelism: 1, tagLength: 16, memory: 8, passes: 1 });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
 // -> true / false; a hash we cannot read or whose parameters are out of bounds is false (never an exception: the caller treats it like a wrong password)
 export function verifyPassword(phc, pw) {
   return hashing.run(async () => {
@@ -76,7 +88,7 @@ export function verifyPassword(phc, pw) {
         const want = unb64(f[4]);
         return want.length === 32 && safeEqual(await scrypt(pw, unb64(f[3]), ln, r, p), want);
       }
-      if (f[1] === 'argon2id' && f.length === 6 && typeof crypto.argon2 === 'function') {
+      if (f[1] === 'argon2id' && f.length === 6 && argon2Available) {
         const m = /^m=(\d{1,6}),t=(\d{1,2}),p=(\d{1,2})$/.exec(f[3]);
         if (!m || f[2] !== 'v=19') return false;
         const [memory, passes, parallelism] = [Number(m[1]), Number(m[2]), Number(m[3])];

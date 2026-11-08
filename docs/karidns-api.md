@@ -121,7 +121,7 @@ Connection files (`api-conninfo-file`, `check-conninfo-file`, `--bootstrap-conni
 
 A request carries **either** a session cookie (a browser) **or** `Authorization: Bearer kdt_<id>_<secret>` (automation), never both (400). Without one: 401, except `/health` and `/auth/login`.
 
-**Passwords** are scrypt hashes (`$scrypt$ln=17,r=8,p=1$...`, `node:crypto`; no package); `$argon2id$` hashes made elsewhere are verified where Node has argon2 (24.7 or newer). A password has at least 12 characters and does not contain the user name. Hashing runs two at a time (about 128 MiB each); more than 64 waiting is a 503.
+**Passwords** are scrypt hashes (`$scrypt$ln=17,r=8,p=1$...`, `node:crypto`; no package); `$argon2id$` hashes made elsewhere are verified where Node has argon2 (24.7 or newer) and its OpenSSL has the algorithm (OpenSSL 3.2 or newer: not FreeBSD 14, whose base OpenSSL is 3.0); elsewhere such a hash never matches. A password has at least 12 characters and does not contain the user name. Hashing runs two at a time (about 128 MiB each); more than 64 waiting is a 503.
 
 **Login** (`POST /auth/login {user, password, totp}`) answers the same 401 `invalid-credentials` for an unknown user, a wrong password, a disabled user, a group, a locked account and a wrong code, and does the same amount of work for each. Ten failures in a row lock the account for 15 minutes, twice as long for every further failure, a day at most; a success resets the count. The session cookie is `karidns_session` (256 random bits; the database holds only their SHA-256), `HttpOnly; SameSite=Strict; Path=/api/` and `Secure` when `public-origin` is https. The answer carries the CSRF token.
 

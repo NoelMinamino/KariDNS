@@ -278,8 +278,9 @@ else
         return 1
     }
     vnone() { ! dbst | awk -v v="$1" 'index($0, "  view " v ":") == 1 { f = 1; next } /^  view / { f = 0 } /^[^ ]/ { f = 0 } f' | grep -q "waiting for the signer"; }
-    SRCB=127.0.0.2; check_ans "view a serves its signer zone" "192.0.2.20" www.va.test
-    SRCB=127.0.0.3; check_ans "view b serves its signer zone" "192.0.2.30" www.vb.test
+    # the first queries after the start may go unanswered on a slow host (the coverage build in CI): wait for the answer
+    SRCB=127.0.0.2; wait_ans www.va.test 192.0.2.20 10 && pass "view a serves its signer zone" || fail "view a serves its signer zone (got '$(qa www.va.test)', want '192.0.2.20')"
+    SRCB=127.0.0.3; wait_ans www.vb.test 192.0.2.30 10 && pass "view b serves its signer zone" || fail "view b serves its signer zone (got '$(qa www.vb.test)', want '192.0.2.30')"
     sq "UPDATE records SET content = '192.0.2.21' WHERE name = 'www.va.test' AND type = 'A'"
     sq "UPDATE records SET content = '192.0.2.11' WHERE name = 'www.plain.test'"
     SRCB=127.0.0.2; wait_ans www.plain.test 192.0.2.11 8 && pass "an ordinary zone follows in view a" || fail "plain.test in view a"
