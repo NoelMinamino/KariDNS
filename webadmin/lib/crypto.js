@@ -6,6 +6,7 @@
 // database's, and a wrong row must not make the API allocate gigabytes.
 
 import crypto from 'node:crypto';
+import { promisify } from 'node:util';
 import { ApiError } from './errors.js';
 
 export const sha256 = (data) => crypto.createHash('sha256').update(data).digest();
@@ -59,10 +60,6 @@ export function hashPassword(pw, { ln = 17, r = 8, p = 1, salt = crypto.randomBy
   return hashing.run(async () => `$scrypt$ln=${ln},r=${r},p=${p}$${b64(salt)}$${b64(await scrypt(pw, salt, ln, r, p))}`);
 }
 
-const argon2 = (opts) => new Promise((resolve, reject) => {
-  crypto.argon2('argon2id', opts, (err, key) => (err ? reject(err) : resolve(key)));
-});
-
 // node:crypto has argon2 as a function also where the OpenSSL it is linked with lacks the algorithm (OpenSSL 3.0, FreeBSD
 // 14): then every call throws ERR_CRYPTO_ARGON2_NOT_SUPPORTED.  One small hash says which.
 export const argon2Available = (() => {
@@ -95,7 +92,8 @@ export function verifyPassword(phc, pw) {
         if (memory < 8 * parallelism || memory > 262144 || passes < 1 || passes > 10 || parallelism < 1 || parallelism > 16) return false;
         const want = unb64(f[5]);
         if (want.length < 16 || want.length > 64) return false;
-        return safeEqual(await argon2({ message: Buffer.from(pw.normalize('NFKC')), nonce: unb64(f[4]), parallelism, tagLength: want.length, memory, passes }), want);
+        /* promisify here, not a wrapper of ours: where argon2 is unusable no function of this file goes unrun (the coverage gate) */
+        return safeEqual(await promisify(crypto.argon2)('argon2id', { message: Buffer.from(pw.normalize('NFKC')), nonce: unb64(f[4]), parallelism, tagLength: want.length, memory, passes }), want);
       }
     } catch {
       return false;
