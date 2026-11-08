@@ -85,6 +85,33 @@ export function totpView(ctx, { forced = false } = {}) {
     }
   }
 
-  start();
+  // A session made by a sign-in with an identity provider, for a person whose TOTP is on: nothing to set up, the code is all that is asked (POST /auth/totp {verify}).
+  function verify() {
+    const code = field({ label: t('totp.code'), name: 'code', autocomplete: 'one-time-code', inputmode: 'numeric', maxlength: 6, required: true, hint: t('totp.code-hint') });
+    const go = h('button', { type: 'submit', class: 'primary' }, t('totp.verify'));
+    const form = h('form', { class: 'stack', novalidate: true }, code.node, error.node, h('div', { class: 'actions' }, go));
+    form.addEventListener('submit', (ev) => {
+      ev.preventDefault();
+      error.set(null);
+      code.setError(null);
+      const c = code.input.value.trim();
+      if (!/^\d{6}$/.test(c)) { code.setError(t('totp.bad-code')); code.focus(); return; }
+      busy(go, async () => {
+        try {
+          const done = await api.post('/auth/totp', { action: 'verify', code: c });
+          await session.replaced(done);
+          ctx.announce(t('totp.verify-done'));
+        } catch (e) {
+          error.setNodes(...problemNodes(i18n, e));
+          code.input.value = '';
+          code.focus();
+        }
+      });
+    });
+    fill(root, h('h1', { id: 'totp-title' }, t('totp.verify-title')), h('p', { class: 'notice' }, t('totp.verify-text')), form);
+    code.focus();
+  }
+
+  if (session.state.me?.session?.totp_step === 'verify') verify(); else start();
   return { node: root, dispose: wipe };
 }

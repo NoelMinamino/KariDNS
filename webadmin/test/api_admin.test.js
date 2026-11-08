@@ -58,13 +58,13 @@ test('principals: create, read, change, delete; only a global master writes', wi
   is(await root('POST', '/principals', { body: { kind: 'user', name: 'e', email: 'not an address' } }), 400, 'bad-request');
   // reading: credentials only for a global master and for oneself
   const asRoot = await root('GET', `/principals/${id}`);
-  assert.deepEqual(asRoot.body.credentials, { password: true, totp_enabled: false, failed_logins: 0, locked: false });
+  assert.deepEqual(asRoot.body.credentials, { password: true, totp_enabled: false, failed_logins: 0, locked: false, oidc: null });
   assert.equal(asRoot.body.principal.created_by, 1);
   assert.equal((await dom('GET', `/principals/${id}`)).body.credentials, undefined);
   assert.notEqual((await dom('GET', '/principals/2')).body.credentials, undefined);
-  assert.deepEqual((await root('GET', '/principals/3')).body.credentials, { password: true, totp_enabled: false, failed_logins: 0, locked: false });
+  assert.deepEqual((await root('GET', '/principals/3')).body.credentials, { password: true, totp_enabled: false, failed_logins: 0, locked: false, oidc: null });
   const group = (await root('POST', '/principals', { body: { kind: 'group', name: 'nocreds' } })).body.principal.id;
-  assert.deepEqual((await root('GET', `/principals/${group}`)).body.credentials, { password: false, totp_enabled: false, failed_logins: 0, locked: false });
+  assert.deepEqual((await root('GET', `/principals/${group}`)).body.credentials, { password: false, totp_enabled: false, failed_logins: 0, locked: false, oidc: null });
   is(await root('GET', '/principals/999'), 404, 'not-found');
   is(await root('GET', '/principals/x'), 404, 'not-found');
   // changing

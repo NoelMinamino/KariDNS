@@ -4,7 +4,7 @@
 
 import { h, link, fill } from '../dom.js';
 import { render, plain, timeNode } from '../format.js';
-import { field, checkbox, message, problemNodes, confirmButton, busy, isGlobal } from '../widgets.js';
+import { field, checkbox, select, message, problemNodes, confirmButton, busy, isGlobal } from '../widgets.js';
 import { placeOnFields } from '../pointer.js';
 import { lookupPrincipal, principalLabel } from '../adminlib.js';
 import { grantsTable, grantForm } from './grants.js';
@@ -116,6 +116,60 @@ export function principalView(ctx, { params }) {
       err.node, h('h3', null, t('admin.password')), pwForm);
   }
 
+  // ---------------------------------------------------------------------------------------------------------------------------- identity at a provider (users, F-16)
+  // A global master links a user to (issuer, subject) or removes the link; nobody is made by a sign-in.  The issuers are those of the providers the service has
+  // (GET /auth/providers); the service refuses any other.
+  function identity(p, creds) {
+    const err = message('error');
+    const link = creds?.oidc ?? null;
+    const box = h('section', { class: 'card', 'aria-labelledby': 'oi-title' }, h('h2', { id: 'oi-title' }, t('admin.oidc-title')), h('p', { class: 'hint' }, t('admin.oidc-intro')));
+    const act = async (fn, text) => {
+      err.set(null);
+      try {
+        await fn();
+        await say(text);
+      } catch (e) {
+        err.setNodes(...problemNodes(i18n, e));
+      }
+    };
+    if (link) {
+      box.append(h('dl', null,
+        h('dt', null, t('admin.oidc-provider')), h('dd', null, link.provider ? render(link.provider.label) : t('admin.oidc-gone')),
+        h('dt', null, t('account.oidc-issuer')), h('dd', null, h('code', null, render(link.issuer))),
+        h('dt', null, t('admin.oidc-subject')), h('dd', null, h('code', null, render(link.subject)))),
+      h('p', { class: 'actions' }, confirmButton({ label: t('admin.oidc-unlink'), confirmLabel: t('admin.oidc-unlink-ask'), yes: t('common.yes'), no: t('common.no'), onConfirm: () => act(() => api.del(`/principals/${id}/oidc`), t('admin.oidc-unlinked')) })));
+    } else {
+      box.append(h('p', null, t('admin.oidc-none')));
+    }
+    const slot = h('div');
+    box.append(slot, err.node);
+    (ctx.providers?.() ?? Promise.resolve([])).then((list) => {
+      if (!alive) return;
+      if (list.length === 0) { fill(slot, link ? null : h('p', { class: 'hint' }, t('admin.oidc-no-providers'))); return; }
+      const which = select({ label: t('admin.oidc-provider'), name: 'provider', value: link?.issuer ?? list[0].issuer, options: list.map((x) => ({ value: x.issuer, label: plain(x.label) })) });
+      const subject = field({ label: t('admin.oidc-subject'), name: 'subject', value: '', required: true, maxlength: 255, spellcheck: false, autocapitalize: 'none', hint: t('admin.oidc-subject-hint') });
+      const submit = h('button', { type: 'submit' }, t('admin.oidc-link'));
+      const form = h('form', { class: 'stack', novalidate: true }, h('h3', null, t('admin.oidc-link')), which.node, subject.node, link ? h('p', { class: 'hint' }, t('admin.oidc-change-note')) : null, h('div', { class: 'actions' }, submit));
+      form.addEventListener('submit', (ev) => {
+        ev.preventDefault();
+        busy(submit, async () => {
+          subject.setError(null);
+          err.set(null);
+          const s = subject.input.value.trim();
+          if (s === '') { subject.setError(t('admin.oidc-need-subject')); subject.focus(); return; }
+          try {
+            await api.put(`/principals/${id}/oidc`, { issuer: which.input.value, subject: s });
+            await say(t('admin.oidc-linked'));
+          } catch (e) {
+            if (e.status === 409 || e.status === 400) subject.setError(i18n.errorText(e)); else err.setNodes(...problemNodes(i18n, e));
+          }
+        });
+      });
+      fill(slot, form);
+    });
+    return box;
+  }
+
   // ---------------------------------------------------------------------------------------------------------------------------- groups and members
   function groupsOf(groups) {
     return h('section', { class: 'card', 'aria-labelledby': 'gr-title' }, h('h2', { id: 'gr-title' }, t('admin.in-groups')),
@@ -200,7 +254,7 @@ export function principalView(ctx, { params }) {
         said ? h('p', { class: 'msg ok', role: 'status' }, said) : null,
         h('h2', null, t(p.kind === 'user' ? 'admin.kind-user' : 'admin.kind-group'), ': ', render(p.name)),
         attributes(p, r.principal),
-        p.kind === 'user' ? signIn(p, r.credentials ?? null) : members(p, mem.members),
+        p.kind === 'user' ? [signIn(p, r.credentials ?? null), identity(p, r.credentials ?? null)] : members(p, mem.members),
         p.kind === 'user' ? groupsOf(r.groups ?? []) : null,
         grants(p, list.grants, policies.policies, datasets.datasets),
         self ? null : danger(p));

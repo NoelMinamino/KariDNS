@@ -232,7 +232,7 @@ test('credentials: reset-totp switches TOTP off, ends the sessions, and is audit
   // the reset
   const r = await root('POST', `/principals/${ids.dom}/credentials`, { body: { action: 'reset-totp' } });
   is(r, 200);
-  assert.deepEqual(r.body.credentials, { password: true, totp_enabled: false, failed_logins: 0, locked: false });
+  assert.deepEqual(r.body.credentials, { password: true, totp_enabled: false, failed_logins: 0, locked: false, oidc: null });
   is(await open('GET', '/auth/me'), 401, 'unauthenticated');                           // the sessions ended
   assert.equal((await d.login('dom', 'dom password 12345')).status, 200, 'no code is asked for any more');
   assert.equal((await info(ids.dom)).totp_enabled, false);
@@ -251,7 +251,7 @@ test('credentials: reset-totp switches TOTP off, ends the sessions, and is audit
   assert.equal((await d.login('sub', 'sub password 12345')).status, 401);
   const u = await root('POST', `/principals/${ids.sub}/credentials`, { body: { action: 'unlock' } });
   is(u, 200);
-  assert.deepEqual(u.body.credentials, { password: true, totp_enabled: false, failed_logins: 0, locked: false });
+  assert.deepEqual(u.body.credentials, { password: true, totp_enabled: false, failed_logins: 0, locked: false, oidc: null });
   assert.equal((await d.login('sub', 'sub password 12345')).status, 200);
   assert.ok(d.log.lines.some((l) => /^info auth: root did reset-totp for dom$/.test(l)));
   assert.ok(d.log.lines.some((l) => /^info auth: root did unlock for sub$/.test(l)));

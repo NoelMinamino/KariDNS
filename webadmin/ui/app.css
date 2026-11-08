@@ -103,6 +103,8 @@ dd { margin: 0; overflow-wrap: anywhere; }
 .marker { font-family: var(--mono); font-size: .85em; background: var(--notice-bg); border: 1px solid var(--notice-line); border-radius: 3px; padding: 0 .2em; }
 .token, .key code { display: block; padding: .6rem; background: var(--bg); border: 1px solid var(--line); border-radius: 5px; overflow-wrap: anywhere; user-select: all; }
 .secret { border: 2px solid var(--notice-line); border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+.oidc { margin-top: 1.5rem; border-top: 1px solid var(--line); padding-top: 1rem; }
+ul.providers { list-style: none; margin: .5rem 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: .5rem; }
 .steps { padding-left: 1.25rem; }
 .steps li + li { margin-top: 1.25rem; }
 .qr { width: 15rem; max-width: 100%; height: auto; display: block; margin: .75rem 0; background: #ffffff; border: 1px solid var(--line); }

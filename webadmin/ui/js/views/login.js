@@ -2,11 +2,14 @@
 // the service asks for it (401 totp-required) or when the user says they have one.  The service gives one answer for every refusal (wrong name, wrong password,
 // disabled, locked, wrong code), and so does this screen.  A 429 disables the button until Retry-After has passed.
 
-import { h } from '../dom.js';
+import { h, fill, oidcLink } from '../dom.js';
 import { field, message, problemNodes } from '../widgets.js';
+import { render } from '../format.js';
 
 // -> { node, focus(), dispose() }.  onDone(result) is called after a sign-in ({ enrollmentRequired, samePrincipal }); a form given onCancel has a Cancel button (the dialog).
-export function loginForm(ctx, { onDone, onCancel }) {
+// Below the form: one button for every identity provider the service has (GET /auth/providers; none when it has none or cannot be asked).  A button is a link that leaves the
+// page for the provider; route is the place to come back to.
+export function loginForm(ctx, { onDone, onCancel, route = '/' }) {
   const { i18n, session, timers } = ctx;
   const t = i18n.t;
   const user = field({ label: t('login.user'), name: 'user', autocomplete: 'username', required: true, maxlength: 255, spellcheck: false, autocapitalize: 'none' });
@@ -19,6 +22,14 @@ export function loginForm(ctx, { onDone, onCancel }) {
   const form = h('form', { class: 'stack', novalidate: true, 'aria-label': t('login.title') }, user.node, password.node, codeRow, error.node, h('div', { class: 'actions' }, submit, onCancel ? h('button', { type: 'button', on: { click: onCancel } }, t('common.cancel')) : null, haveCode));
   let waiting = null;                                     // the countdown of a 429
   let running = false;
+  let alive = true;
+  const oidc = h('div', { class: 'stack oidc', hidden: true });
+  ctx.providers?.().then((list) => {
+    if (!alive || list.length === 0) return;
+    fill(oidc, h('p', { class: 'hint' }, t('login.or')), h('ul', { class: 'providers', role: 'group', 'aria-label': t('login.oidc-group') },
+      list.map((p) => h('li', null, oidcLink(p.name, route, { class: 'button' }, ...i18n.parts('login.oidc-button', { label: render(p.label) }))))));
+    oidc.hidden = false;
+  });
 
   function showCode() {
     codeRow.hidden = false;
@@ -85,5 +96,5 @@ export function loginForm(ctx, { onDone, onCancel }) {
     if (waiting === null) submit.disabled = false;
   });
 
-  return { node: form, focus: () => user.focus(), dispose: stopWaiting };
+  return { node: h('div', null, form, oidc), focus: () => user.focus(), dispose: () => { alive = false; stopWaiting(); } };
 }

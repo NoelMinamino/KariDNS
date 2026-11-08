@@ -2,6 +2,7 @@
 // session that has not done its TOTP step yet may call it.  sessionOnly: a token may not (it would make tokens that make tokens).
 
 import * as auth from './handlers/auth.js';
+import * as oidc from './handlers/oidc.js';
 import * as admin from './handlers/admin.js';
 import * as zones from './handlers/zones.js';
 import * as write from './handlers/write.js';
@@ -19,6 +20,9 @@ export const ROUTES = [
   { method: 'GET', path: '/auth/me', preTotp: true, handler: auth.me },
   { method: 'POST', path: '/auth/totp', preTotp: true, sessionOnly: true, handler: auth.totp },
   { method: 'POST', path: '/auth/password', sessionOnly: true, handler: auth.password },
+  { method: 'GET', path: '/auth/providers', auth: 'none', handler: oidc.providers },
+  { method: 'GET', path: '/auth/oidc/:name/start', auth: 'none', handler: oidc.start },
+  { method: 'GET', path: '/auth/oidc/:name/callback', auth: 'none', handler: oidc.callback },
 
   { method: 'GET', path: '/tokens', handler: auth.tokensList },
   { method: 'POST', path: '/tokens', sessionOnly: true, handler: auth.tokenCreate },
@@ -31,6 +35,8 @@ export const ROUTES = [
   { method: 'DELETE', path: '/principals/:id', handler: admin.principalDelete },
   { method: 'PUT', path: '/principals/:id/password', handler: admin.principalPassword },
   { method: 'POST', path: '/principals/:id/credentials', handler: admin.principalCredentials },
+  { method: 'PUT', path: '/principals/:id/oidc', handler: admin.principalOidcPut },
+  { method: 'DELETE', path: '/principals/:id/oidc', handler: admin.principalOidcDelete },
   { method: 'GET', path: '/principals/:id/members', handler: admin.membersList },
   { method: 'POST', path: '/principals/:id/members', handler: admin.memberAdd },
   { method: 'DELETE', path: '/principals/:id/members/:mid', handler: admin.memberRemove },

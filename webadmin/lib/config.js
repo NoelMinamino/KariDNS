@@ -71,6 +71,31 @@ const GLOBAL_KEYS = {
 
 const DATASET_KEYS = { schema: parseSchema, views: parseNames };
 
+// [oidc <name>] (item F, milestone M5): one OpenID Connect provider.  The issuer is compared with the `iss` claim as a string, so it is kept exactly as written.
+const parseIssuer = (v) => {
+  let u;
+  try { u = new URL(v); } catch { throw new Error(`expected the issuer identifier, an https URL, got ${JSON.stringify(v)}`); }
+  if ((u.protocol !== 'https:' && u.protocol !== 'http:') || u.search || u.hash || u.username || u.password || v.includes('#') || v.includes('?') || v.length > 255) {
+    throw new Error(`expected an https URL without a query, a fragment or credentials, got ${JSON.stringify(v)}`);
+  }
+  return v;
+};
+// RFC 6749 section 3.3: a scope token is printable ASCII without space, double quote and backslash
+const parseScopes = (v) => {
+  const out = v.split(/[\s,]+/).filter(Boolean);
+  if (out.length === 0 || out.length > 16 || out.some((s) => !/^[\x21\x23-\x5b\x5d-\x7e]{1,64}$/.test(s))) throw new Error(`expected up to 16 scope names separated by spaces, got ${JSON.stringify(v)}`);
+  return out;
+};
+const parseLabel = (v) => {
+  if (v.length === 0 || [...v].length > 64 || /[\0-\x1f\x7f-\x9f]/.test(v)) throw new Error('expected 1 to 64 characters without control characters');
+  return v;
+};
+const parseClientId = (v) => {
+  if (v.length === 0 || v.length > 255 || /[^\x21-\x7e]/.test(v)) throw new Error('expected the client id: printable ASCII without spaces, at most 255 characters');
+  return v;
+};
+const OIDC_KEYS = { issuer: parseIssuer, 'client-id': parseClientId, 'client-secret-file': parseAbsPath, scopes: parseScopes, label: parseLabel, mfa: parseEnum('totp', 'idp') };
+
 export function defaults() {
   return {
     listen: undefined,
@@ -103,10 +128,12 @@ export function defaults() {
   };
 }
 
-// text -> { settings, datasets: Map(name -> { schema, views }) }; throws Error("line N: ...") on the first mistake.  validate() checks what the whole must satisfy.
+// text -> { settings, datasets: Map(name -> { schema, views }), oidc: Map(name -> { issuer, client-id, client-secret-file, scopes, label, mfa }) }; throws Error("line N: ...")
+// on the first mistake.  validate() checks what the whole must satisfy.
 export function parseConfig(text) {
   const settings = defaults();
   const datasets = new Map();
+  const oidc = new Map();
   let section = null;
   const seen = new Set();
   const lines = text.split(/\r?\n/);
@@ -118,20 +145,28 @@ export function parseConfig(text) {
     if (m) {
       if (!/^[a-z][a-z0-9_-]{0,31}$/.test(m[1])) throw new Error(`${where}: a dataset name is 1 to 32 characters: lower case letters, digits, '-' and '_', starting with a letter`);
       if (datasets.has(m[1])) throw new Error(`${where}: dataset section '${m[1]}' appears twice`);
-      section = { name: m[1], schema: undefined, views: [], seen: new Set() };
+      section = { name: m[1], schema: undefined, views: [], seen: new Set(), table: DATASET_KEYS };
       datasets.set(m[1], section);
       continue;
     }
-    if (line.startsWith('[')) throw new Error(`${where}: expected [dataset <name>]`);
+    m = /^\[\s*oidc\s+(\S+)\s*\]$/i.exec(line);
+    if (m) {
+      if (!/^[a-z][a-z0-9_-]{0,31}$/.test(m[1])) throw new Error(`${where}: a provider name is 1 to 32 characters: lower case letters, digits, '-' and '_', starting with a letter`);
+      if (oidc.has(m[1])) throw new Error(`${where}: oidc section '${m[1]}' appears twice`);
+      section = { name: m[1], issuer: undefined, 'client-id': undefined, 'client-secret-file': undefined, scopes: ['openid'], label: m[1], mfa: 'totp', seen: new Set(), table: OIDC_KEYS, oidc: true };
+      oidc.set(m[1], section);
+      continue;
+    }
+    if (line.startsWith('[')) throw new Error(`${where}: expected [dataset <name>] or [oidc <name>]`);
     m = /^([A-Za-z0-9-]+)\s*=\s*(.*)$/.exec(line);
     if (!m) throw new Error(`${where}: expected 'key = value'`);
     const key = m[1].toLowerCase();
     let value = m[2].trim();
     if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
     else value = value.replace(/\s+#.*$/, '');
-    const table = section ? DATASET_KEYS : GLOBAL_KEYS;
+    const table = section ? section.table : GLOBAL_KEYS;
     const fn = table[key];
-    if (!fn) throw new Error(`${where}: unknown option '${key}'${section ? ` in [dataset ${section.name}]` : ''}`);
+    if (!fn) throw new Error(`${where}: unknown option '${key}'${section ? ` in [${section.oidc ? 'oidc' : 'dataset'} ${section.name}]` : ''}`);
     const seenKeys = section ? section.seen : seen;
     if (seenKeys.has(key)) throw new Error(`${where}: '${key}' is set twice`);
     seenKeys.add(key);
@@ -140,8 +175,8 @@ export function parseConfig(text) {
     if (section) section[key] = v;
     else settings[key] = v;
   }
-  for (const d of datasets.values()) delete d.seen;
-  return { settings, datasets };
+  for (const d of [...datasets.values(), ...oidc.values()]) { delete d.seen; delete d.table; delete d.oidc; }
+  return { settings, datasets, oidc };
 }
 
 const isLoopbackHost = (h) => h === '127.0.0.1' || h === 'localhost' || h === '::1' || h === '[::1]' || /^127\.\d+\.\d+\.\d+$/.test(h);
@@ -185,6 +220,17 @@ export function validate(cfg) {
     if (cfg.datasets.size) problems.push('database = sqlite3 has one dataset (main): there are no [dataset] sections');
   }
   for (const d of cfg.datasets.values()) if (!d.schema) problems.push(`[dataset ${d.name}] needs 'schema'`);
+  const issuers = new Map();
+  for (const o of cfg.oidc?.values() ?? []) {
+    for (const k of ['issuer', 'client-id', 'client-secret-file']) if (!o[k]) problems.push(`[oidc ${o.name}] needs '${k}'`);
+    if (o.issuer) {
+      const u = new URL(o.issuer);
+      if (u.protocol === 'http:' && !isLoopbackHost(u.hostname)) problems.push(`[oidc ${o.name}] issuer must be an https URL (http is only for a provider on this machine: localhost, 127.0.0.1, ::1)`);
+      if (issuers.has(o.issuer)) problems.push(`[oidc ${o.name}] has the issuer of [oidc ${issuers.get(o.issuer)}]: an identity is linked to an issuer, so a provider may be configured once`);
+      else issuers.set(o.issuer, o.name);
+    }
+  }
+  if (cfg.oidc?.size > 8) problems.push('at most 8 [oidc] sections');
   return problems;
 }
 

@@ -55,6 +55,7 @@ From a source tree (no package): `cd webadmin && npm ci --ignore-scripts`, then 
 | the zone file, `zones.sqlite3` (SQLite3) | karidns-webadmin, group of the loader, 0660, directory writable by that group | the zones; SQLite3 opens it read-write even to read (WAL mode) |
 | `tls.key` (only for the built-in TLS) | karidns-webadmin, **0600** | the certificate key; `--check` refuses any other owner or mode |
 | `webadmin-karictl.conf` (SQLite3, optional) | karidns-webadmin, **0600** | the restricted control key for the reload |
+| `oidc.secret` (one for each `[oidc]` section, optional) | karidns-webadmin, **0600** | the client secret that the identity provider gave the service; one line; `--check` and the start refuse any other owner or mode |
 
 ### PostgreSQL
 
@@ -268,8 +269,66 @@ All record data, names, comments and error texts are drawn as text: C0 and C1 ch
 
 - **Sessions.** Nothing in the page asks the service on its own, so the idle time of `session-idle` means what it says: the page counts down from its last request, warns two minutes before (a minute earlier than the service ends it, which writes the time of the last request at most once a minute), and "Stay signed in" is one request made because the person asked. When the session has ended, a 401 on any page opens the sign-in over what is on the screen; the same person goes on, another person starts at the start page. A sign-out in one tab signs out the others (a `BroadcastChannel`).
 - **Browsers.** Firefox ESR, Chrome and Edge (current and previous), Safari 17 or newer. The automated tests run Firefox (`tests/run_webadmin_gui_test.sh` on SQLite3 and `tests/run_webadmin_gui_pg_test.sh` on PostgreSQL, headless through geckodriver; the screens of zones need root and a real `karidns`, so that the update button is checked with `dag`; on the FreeBSD build host that needs `pkg install firefox geckodriver dejavu`: Firefox crashes at the start on a system without a font).
+- **Identity providers** (item F, milestone M5; set-up under SIGNING IN WITH AN IDENTITY PROVIDER). With `[oidc]` sections the sign-in screen has a button for each provider below the password form ("Sign in with Corp ID"), and the sign-in dialog that opens after a 401 has them too (a click leaves the page; the browser asks first if there is a draft). The button is a plain link to the service, which sends the browser to the provider and back to the page the person was at; if it did not work, the screen says so with one message in the person's language. A person whose TOTP is on and who comes in through a provider is asked for the code on a page of its own; a person with no password sees no password form in the account and gives the code alone to switch TOTP off. The account shows the identity the user is linked to (read only: a global master links and unlinks, in the user's page under *Administration*). A group has no identity.
 - **Storage.** The page keeps the chosen language in `localStorage` and nothing else: no token, no zone data, no secret.
 - **Files.** The interface is in the package (`webadmin/ui/`); the page asks for the version of the service after the sign-in and tells the person to reload when it differs from its own (the service was upgraded while the page was open).
+
+## SIGNING IN WITH AN IDENTITY PROVIDER
+
+People can sign in with an OpenID Connect identity provider (Keycloak, an enterprise IdP, ...) instead of, or besides, a password. The service is a confidential client of the authorization code flow with PKCE. It makes no account for a person who signs in: a **global master links** a user of the service to the person's identity at the provider, and a sign-in whose identity is linked to nobody is refused. Setting it up takes four steps; the examples use the invented provider `idp.example.test`.
+
+**1. Register the service at the provider.** Make a client of the type "confidential" with the authorization code flow and PKCE (S256), and give it this redirect URI, exactly (the provider compares it as text):
+
+```
+https://dns.example.test/api/v1/auth/oidc/corp/callback
+```
+
+that is `public-origin`, `/api/v1/auth/oidc/`, the name you give the provider in the next step, and `/callback`. Note the client id and the client secret. The provider must sign ID tokens with RS256, ES256 or EdDSA (the usual default is RS256) and publish a discovery document at `<issuer>/.well-known/openid-configuration`.
+
+**2. Put the secret in a file and the provider in the configuration.**
+
+```
+install -o karidns-webadmin -g karidns-webadmin -m 0600 /dev/null /usr/local/etc/karidns/oidc-corp.secret
+printf '%s\n' 'the-client-secret' > /usr/local/etc/karidns/oidc-corp.secret     # one line
+```
+
+and at the end of `karidns-webadmin.conf` (after the global settings):
+
+```
+[oidc corp]
+issuer = https://idp.example.test/realms/corp
+client-id = karidns-webadmin
+client-secret-file = /usr/local/etc/karidns/oidc-corp.secret
+label = Corp ID
+# scopes = openid                (default; "openid" is always asked for)
+# mfa = totp                     (default; see below)
+```
+
+`issuer` is the issuer identifier **exactly as the provider writes it** in its discovery document and in its ID tokens (a trailing slash counts: some providers have one). `label` is the text of the button on the sign-in screen ("Sign in with Corp ID"). Up to 8 providers; each name is 1 to 32 characters (lower case letters, digits, `-`, `_`) and each issuer once. `service karidns_webadmin oneconfigtest` checks that the secret file is the service user's and has mode 0600 or 0400, and names the redirect URI of each provider; **it does not contact the provider**. Restart the service (or send SIGHUP: the sections and the secret files are read again, and a mistake in them keeps the old ones). The service fetches the discovery document and the key set when it starts and says so in the log (`oidc: provider corp (...) is reachable`, or `... cannot be used yet: <why>`); a provider that is down at that moment does not stop the service, and is asked again at the next sign-in, at most every ten seconds.
+
+**3. Allow the egress.** The service now makes outbound HTTPS requests: to the host of the issuer (the discovery document), and to the hosts the discovery document names for the key set (`jwks_uri`) and the token endpoint (`token_endpoint`), which are often, but not always, the same host. If the machine's firewall (`pf`) restricts outgoing connections, allow `karidns-webadmin` to reach those. Each request has 10 seconds and a size limit, follows no redirect, and refuses an address that is not https, has credentials, or is an IP address. The proxy in front of the service needs nothing new: the browser, not the service, talks to the provider's authorization endpoint, and it comes back to `public-origin` like any visitor.
+
+**4. Link the users.** In the web interface: *Administration*, the user, *Identity at a provider*: the provider, the **subject**, *Link the identity*. The subject is the `sub` claim of the person's ID token, the provider's own identifier for them (many providers show it in the user's page; it is **not** the e-mail address or the login name, which can change hands: the service never matches on those). The same through the API:
+
+```
+curl -b jar -H "X-KariDNS-CSRF: $CSRF" -H "Origin: https://dns.example.test" -H 'Content-Type: application/json' \
+     -X PUT -d '{"issuer":"https://idp.example.test/realms/corp","subject":"8f14e45f-ceea-4672-a1b0-0c5f4a1f6c11"}' \
+     https://dns.example.test/api/v1/principals/12/oidc
+```
+
+If you do not know the subject yet, have the person press the button: the sign-in is refused, and the log says which subject it came with (`auth: oidc corp: sign-in refused from 192.0.2.7: no user is linked to the subject 8f14e45f-...`); link that. A user may be made without a password (`POST /principals` without `password`): such a user signs in with the provider only. Unlinking an identity (or linking another one) signs the user out; **disable the user** to lock a person out for good (their sessions end and the sign-in is refused).
+
+**The second step.** `require-totp` applies to a sign-in with a provider as it does to a password: where it makes TOTP mandatory for a user (every global master with the default `global`), or where the user has TOTP on, the session made by the sign-in can do nothing but the second step: the user sets TOTP up the first time, and gives the code of the authenticator app afterwards (the redirect from the provider has no room for a code field, so the page asks after it). If the provider itself requires two factors and says so in the ID token (`amr`, RFC 8176), set `mfa = idp` in the section: then the step is left out for sign-ins whose token shows two factors (`mfa`, or two of password/PIN, OTP/hardware key/SMS/smart card, fingerprint/face/iris), and only for them. Do that only if you trust the provider's policy as you trust your own: it is then the only second factor.
+
+**What a failed sign-in looks like.** The person returns to the sign-in screen with one message ("The sign-in with the identity provider was not accepted"), whatever the reason: a subject that is linked to nobody, a disabled or locked user, an ID token with a bad signature, a wrong audience or nonce, a state that is used already or too old, a callback address that was handed to another browser. The reason is in the log (`auth: oidc corp: sign-in refused from <address>: <reason>`), without secrets; read it to answer "why can't Taro sign in?". The message "cannot be reached" means the provider or the database did not answer; "too many attempts" means the rate limit of logins (`rate-login`, a minute, per address; the start and the callback each count) was hit.
+
+**Operating notes.**
+
+- A provider that rotates its signing keys needs nothing from you: a token with a `kid` the service does not know makes it fetch the key set again (at most once a minute).
+- A provider that changes its issuer or a client secret that is renewed: edit the section and send SIGHUP. Identities are linked to the **issuer string**; if the issuer changes, link the users again.
+- Clocks: the service accepts an ID token a minute either side of its time (`exp`, `iat`). Keep the clock of the machine right (`ntpd`).
+- The unfinished sign-ins are in `karidns_auth.oidc_states` (PostgreSQL) or the table `oidc_states` of the auth file (SQLite3): ten minutes each, at most 1000, deleted when used and swept every hour. The table is not audited and holds no secret that the provider's answer could use (the PKCE verifier is useless without the provider's code and the client secret).
+- On PostgreSQL the API role has no right on that table: `db/karidns_ext.pgsql.sql` (schema version 3) makes it and the three functions the role calls; **run it again** (and `db/karidns_api_role.pgsql.sql`, which grants `EXECUTE`) when you upgrade from a build made before the sign-in with a provider. On SQLite3 run `db/karidns_auth.sqlite3.sql` again; `--check` names a missing table.
 
 ## RUNNING IT
 
@@ -301,7 +360,8 @@ One line per request, to syslog (`logger(1)`, tag `karidns-webadmin`, `notice`):
 - `GET /api/v1/health` (no login): 200, or 503 when the database does not answer within 3 seconds. It is cheap and may be polled once a second.
 - `GET /api/v1/servers` (PostgreSQL): per DNS server the generation it applied and the zones that failed to load.
 - Errors with code `internal` (500) and the lines above; `busy` (503) answers mean the tools pool (`workers`, 64 more may wait) or the database is saturated.
-- The sessions table stays small by itself: the service deletes expired sessions at the start and every hour.
+- The sessions table stays small by itself: the service deletes expired sessions (and, with identity providers, the sign-ins that never came back) at the start and every hour.
+- Lines `auth: oidc NAME: sign-in refused from ADDRESS: REASON` are the answer to "why can't she sign in?"; many of them from one address are somebody trying; `oidc: provider NAME ... cannot be used yet` is the provider's documents not coming (the egress, the issuer, the provider down).
 - Disk: the audit log (`karidns_auth.audit_log`, or `karidns_audit_log` and `karidns_auth_audit` on SQLite3) grows with every change and is never pruned by the service. Prune it as the owner when your policy says so: `DELETE FROM karidns_auth.audit_log WHERE at < now() - interval '1 year'`.
 
 ## BACKUP, RESTORE, UPGRADE
@@ -332,6 +392,7 @@ What the service does, in short (the details are in the [API reference](karidns-
 - **Sessions.** A 256-bit cookie (`HttpOnly`, `SameSite=Strict`, `Secure` under https, `Path=/api/`); the database keeps only its SHA-256. Idle time 30 minutes, 12 hours at most; a new session at the login and after the TOTP step; a disabled user's sessions end. Cookie plus token in one request is refused. CSRF: the `X-KariDNS-CSRF` token, the `Origin`, and `application/json`.
 - **Passwords** are scrypt hashes (128 MiB, two at a time); a wrong user and a wrong password cost the same time and give the same answer; ten failures lock the account for 15 minutes and longer. Asking for the password again (change it, switch TOTP off) is limited like a login.
 - **Rate limits** (in memory): 5 logins a minute per address and per user name, 20 requests a second and 2 writes a second per principal. A flood of requests with bad credentials is limited per address but still costs a database lookup each: put a rate limit in the proxy (the nginx example does).
+- **Identity providers**: an ID token is accepted only with a signature of the provider's own key set (never `none`, never a shared secret), for this client, with the nonce of this sign-in, and for a user a global master linked to that identity; no account is made by a sign-in. The state of a sign-in is single use and tied to the browser that began it. The provider can sign in as the users linked to it and do nothing else; its documents are read with size and time limits, without redirects, and only from https names. The details are in the [API reference](karidns-api.md), "OpenID Connect".
 - **Secrets**: see the table of files. The service never logs a secret and never reads the key material of the DNSSEC keys.
 
 What it does **not** do, so that you can decide:

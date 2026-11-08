@@ -184,6 +184,28 @@ test('the server: a configuration that is wrong at SIGHUP is not taken; PostgreS
   assert.deepEqual(g.events.filter((e) => e[0] === 'tx' || e[0] === 'sql'), [['tx', true], ['sql', 'SELECT karidns_auth.sweep_expired() AS n']]);
 });
 
+test('the server: the providers of the [oidc] sections are set up at the start (their documents asked for at once) and again at SIGHUP, which a bad secret file does not change', async () => {
+  const prov = (secret) => [{ name: 'gone', issuer: 'http://127.0.0.1:1', clientId: 'c', clientSecret: secret, scopes: ['openid'], label: 'Gone', mfa: 'totp' }];
+  let reads = 0;
+  const f = fakes({ inspect: async () => ({ problems: [], notes: [], versions: {}, oidc: prov('s1') }), readOidc: () => { reads++; return reads === 1 ? { list: prov('s2'), problems: [] } : { list: [], problems: ['oidc gone: client-secret-file: has mode 0644'] }; } });
+  let app;
+  f.deps.listen = async (a) => { app = a; return { close: (cb) => cb(), closeIdleConnections: () => {} }; };
+  const p = main([], { stdout: sink(), stderr: sink(), proc: f.proc, deps: f.deps });
+  await sleep(300);
+  assert.deepEqual(app.oidc.list(), [{ name: 'gone', label: 'Gone', issuer: 'http://127.0.0.1:1' }]);
+  assert.equal(app.oidc.get('gone').clientSecret, 's1');
+  assert.ok(f.log.lines.some((l) => /oidc: provider gone .* cannot be used yet/.test(l)));
+  f.proc.emit('SIGHUP');
+  await sleep(300);
+  assert.equal(app.oidc.get('gone').clientSecret, 's2');
+  f.proc.emit('SIGHUP');
+  await sleep(50);
+  assert.equal(app.oidc.get('gone').clientSecret, 's2');
+  assert.ok(f.log.lines.some((l) => /the configuration was not read: oidc gone: client-secret-file: has mode 0644/.test(l)));
+  f.proc.emit('SIGTERM');
+  assert.equal(await p, 0);
+});
+
 test('the server: it does not start with a configuration, a key, a database, a schema or a port that is wrong', async () => {
   let f = fakes({ loadConfig: () => parseConfig('') });
   let r = await run([], f.deps);

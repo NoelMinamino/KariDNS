@@ -68,20 +68,22 @@ function totpSection(ctx, creds) {
       box.append(h('p', { class: 'notice' }, t('account.totp-mandatory')));
       return;
     }
+    // (a person with no password, who signs in with an identity provider, gives the code alone)
+    const hasPassword = creds?.password !== false;
     const pw = field({ label: t('account.pw-current'), type: 'password', name: 'password', autocomplete: 'current-password', required: true, maxlength: 1024 });
     const code = field({ label: t('totp.code'), name: 'code', autocomplete: 'one-time-code', inputmode: 'numeric', maxlength: 6, required: true });
     const go = h('button', { type: 'submit', class: 'danger' }, t('account.totp-disable'));
-    const form = h('form', { class: 'stack', novalidate: true }, h('h3', null, t('account.totp-disable-title')), pw.node, code.node, err.node, h('div', { class: 'actions' }, go));
+    const form = h('form', { class: 'stack', novalidate: true }, h('h3', null, t('account.totp-disable-title')), hasPassword ? pw.node : h('p', { class: 'hint' }, t('account.totp-code-only')), code.node, err.node, h('div', { class: 'actions' }, go));
     form.addEventListener('submit', (ev) => {
       ev.preventDefault();
       err.set(null);
       pw.setError(null);
       code.setError(null);
-      if (!pw.input.value) { pw.setError(t('account.pw-need-current')); pw.focus(); return; }
+      if (hasPassword && !pw.input.value) { pw.setError(t('account.pw-need-current')); pw.focus(); return; }
       if (!/^\d{6}$/.test(code.input.value.trim())) { code.setError(t('totp.bad-code')); code.focus(); return; }
       busy(go, async () => {
         try {
-          await api.post('/auth/totp', { action: 'disable', password: pw.input.value, code: code.input.value.trim() });
+          await api.post('/auth/totp', { action: 'disable', ...(hasPassword ? { password: pw.input.value } : {}), code: code.input.value.trim() });
           ctx.announce(t('account.totp-disabled'));
           draw(false);
         } catch (e) {
@@ -95,6 +97,23 @@ function totpSection(ctx, creds) {
   };
   draw(creds?.totp_enabled === true);
   return box;
+}
+
+// The identity provider the account is linked to (read only: a global master links and unlinks it, F-16).  -> a node, or null when there is nothing to say (not linked, and
+// the service has no provider).
+async function oidcSection(ctx, creds) {
+  const { i18n } = ctx;
+  const t = i18n.t;
+  const link = creds?.oidc ?? null;
+  if (!link && (await ctx.providers?.() ?? []).length === 0) return null;
+  const rows = link ? [
+    [t('account.oidc-provider'), link.provider ? render(link.provider.label) : t('account.oidc-unknown')],
+    [t('account.oidc-issuer'), h('code', null, render(link.issuer))],
+    [t('account.oidc-subject'), h('code', null, render(link.subject))],
+  ] : [];
+  return h('section', { class: 'card', 'aria-labelledby': 'acc-oidc' }, h('h2', { id: 'acc-oidc' }, t('account.oidc-title')),
+    link ? [h('p', null, t('account.oidc-linked')), h('dl', null, rows.map(([k, v]) => [h('dt', null, k), h('dd', null, v)]))] : h('p', null, t('account.oidc-none')),
+    creds?.password === false ? h('p', { class: 'notice' }, t('account.oidc-nopw')) : null);
 }
 
 function tokenState(tok, nowMs) {
@@ -244,9 +263,16 @@ export function accountView(ctx) {
       p.display_name ? [h('dt', null, t('account.display')), h('dd', null, render(p.display_name))] : null,
       p.email ? [h('dt', null, t('account.email')), h('dd', null, render(p.email))] : null));
   const totpSlot = h('div');
+  const oidcSlot = h('div');
+  const pwSlot = h('div', null, passwordSection(ctx));
   const tokens = tokensSection(ctx);
-  fill(root, head, passwordSection(ctx), totpSlot, tokens.node, languageSection(ctx), sessionSection(ctx));
-  // whether TOTP is on is in the credentials of the principal itself
-  api.get(`/principals/${p.id}`).then((r) => fill(totpSlot, totpSection(ctx, r.credentials)), (e) => fill(totpSlot, h('section', { class: 'card' }, h('h2', null, t('account.totp')), h('p', { class: 'msg error', role: 'alert' }, ...problemNodes(i18n, e)))));
+  fill(root, head, pwSlot, oidcSlot, totpSlot, tokens.node, languageSection(ctx), sessionSection(ctx));
+  // whether TOTP is on, whether there is a password and the identity the account is linked to are in the credentials of the principal itself
+  api.get(`/principals/${p.id}`).then(async (r) => {
+    if (r.credentials?.password === false) fill(pwSlot);                           // (nothing to change: the account signs in with an identity provider)
+    const oidc = await oidcSection(ctx, r.credentials);
+    if (oidc) fill(oidcSlot, oidc);
+    fill(totpSlot, totpSection(ctx, r.credentials));
+  }, (e) => fill(totpSlot, h('section', { class: 'card' }, h('h2', null, t('account.totp')), h('p', { class: 'msg error', role: 'alert' }, ...problemNodes(i18n, e)))));
   return { node: root, dispose: tokens.dispose };
 }

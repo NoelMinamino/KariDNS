@@ -34,6 +34,10 @@ export async function newSession(app, tx, principalId, { totpOk, client }) {
   return { value, csrf: token, expires };
 }
 
+// May this principal get a session at all?  A user, not disabled, whose account is not locked (the lock that failed logins make).  The password login and the OpenID Connect
+// sign-in ask this one function (plan section 10: one place for "a principal may get a session").
+export const mayHaveSession = (principal, creds, nowMs) => Boolean(principal) && !principal.disabled && principal.kind === 'user' && !(creds?.locked_until && creds.locked_until > nowMs);
+
 // does this principal have to use TOTP?  (A-10: every global master, or every user, or nobody: `require-totp`)
 export function needsTotp(settings, grants) {
   const mode = settings['require-totp'];

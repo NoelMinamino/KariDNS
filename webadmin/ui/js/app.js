@@ -83,6 +83,7 @@ export function createApp(env) {
   let notice = null;                              // a text shown above the sign-in form ("you were signed out in another tab")
   let drawnKey = null;
   let warnDialog = null;
+  let providersAsked = null;
   const politeEl = h('div', { class: 'sr-only', 'aria-live': 'polite', role: 'status' });
   const assertiveEl = h('div', { class: 'sr-only', 'aria-live': 'assertive', role: 'alert' });
   const root = doc.getElementById('app');
@@ -99,6 +100,11 @@ export function createApp(env) {
       el.textContent = msg;
     },
     copy: (s) => env.clipboard.writeText(s),
+    // the identity providers of the service (GET /auth/providers, no login needed): [{ name, label }], asked once per page; a failure is no providers
+    providers() {
+      providersAsked ??= api.get('/auth/providers', { quiet: true }).then((r) => (Array.isArray(r?.providers) ? r.providers : []), () => { providersAsked = null; return []; });
+      return providersAsked;
+    },
   };
   const router = createRouter(win, ROUTES, (r) => { route = r; render(); });
   ctx.router = router;
@@ -145,13 +151,19 @@ export function createApp(env) {
     if (v.focus) v.focus(); else main.focus();
   }
 
+  // where a sign-in with an identity provider comes back to: the place the person was at ("/zones/main/example.test"), the start page when that is where they are
+  const returnRoute = () => (route === null || route.name === 'home' || route.name === 'notfound' ? '/' : String(win.location.hash ?? '').replace(/^#/, '') || '/');
+
   function loginScreen() {
-    const form = loginForm(ctx, { onDone: async (r) => {
+    const form = loginForm(ctx, { route: returnRoute(), onDone: async (r) => {
       notice = null;
       if (!r.enrollmentRequired) await session.loadVersion().catch(noop);
       render();
     } });
-    const card = h('section', { class: 'card narrow', 'aria-labelledby': 'login-title' }, h('h1', { id: 'login-title' }, t('login.title')), notice ? h('p', { class: 'notice', role: 'status' }, notice) : null, form.node);
+    // the page the service sends the browser to when a sign-in with an identity provider did not work (/#/?oidc=failed): one text for each of three words
+    const why = route?.query?.oidc;
+    const oidcFailure = why === 'failed' || why === 'unavailable' || why === 'busy' ? h('p', { class: 'msg error', role: 'alert' }, t(`login.oidc-${why}`)) : null;
+    const card = h('section', { class: 'card narrow', 'aria-labelledby': 'login-title' }, h('h1', { id: 'login-title' }, t('login.title')), notice ? h('p', { class: 'notice', role: 'status' }, notice) : null, oidcFailure, form.node);
     mount(t('login.title'), { node: card, focus: form.focus, dispose: form.dispose });
   }
 
@@ -218,7 +230,7 @@ export function createApp(env) {
         dlg.close();
         resolve(outcome);
       };
-      form = loginForm(ctx, { onDone: (r) => finish(r.samePrincipal ? 'same' : 'other'), onCancel: () => finish('cancel') });
+      form = loginForm(ctx, { route: returnRoute(), onDone: (r) => finish(r.samePrincipal ? 'same' : 'other'), onCancel: () => finish('cancel') });
       fill(dlg, h('h2', { id: 'reauth-title' }, t('reauth.title')), h('p', null, t('reauth.text')), form.node);
       dlg.addEventListener('cancel', (ev) => { ev.preventDefault(); finish('cancel'); });
       openDialog(dlg);

@@ -5,14 +5,16 @@ import { Buckets } from './ratelimit.js';
 import { hashPassword } from './crypto.js';
 import { datasetList } from './config.js';
 import { Pool, KeyedLock } from './pool.js';
+import { Oidc } from './oidc.js';
 
 export const VERSION = '0.6.0';
 
 export class App {
   // config: { settings, datasets }; backend: db.js; log: the logger; run: runChild; key: the Buffer that wraps TOTP secrets
   // ui: the files of the GUI (static.js loadStatic) or null for none (`ui = no`)
-  constructor({ config, backend, log, run, key, now = () => Date.now(), ui = null }) {
+  constructor({ config, backend, log, run, key, now = () => Date.now(), ui = null, fetch = globalThis.fetch }) {
     this.ui = ui;
+    this.oidc = new Oidc({ fetch, now: () => this.now(), log });          // the providers of [oidc] sections: cli.js and the tests call app.oidc.configure(...)
     this.backend = backend;
     this.log = log;
     this.run = run;

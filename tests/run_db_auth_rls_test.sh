@@ -177,9 +177,9 @@ echo "-- the role scripts"
 if rs karidns_api_role.pgsql.sql $API public; then pass "db/karidns_api_role.pgsql.sql applies (the role is created)"; else fail "the API role script"; head -5 "$T/rs.err"; fi
 if rs karidns_api_role.pgsql.sql $API public; then pass "...and can be applied again"; else fail "second application of the API role script"; head -5 "$T/rs.err"; fi
 if rs karidns_signer_role.pgsql.sql $SIG public && rs karidns_signer_role.pgsql.sql $SIG public; then pass "db/karidns_signer_role.pgsql.sql applies, twice"; else fail "the signer role script"; head -5 "$T/rs.err"; fi
-oeq "the policies exist: 39 for the API on the schema's tables, 37 on karidns_auth, 1 for the trusted role on each of the 24 tables, 32 for the signer (3 + 3 permissive and restrictive on records and domainmetadata, 14 SELECT, 1 INSERT on reload requests, 1 on cryptokeys, 1 UPDATE on key requests, 3 on the signer state)" \
-    "39 37 24 32" "SELECT (SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE c.relnamespace = 'public'::regnamespace AND p.polname LIKE 'karidns\_rls\_%' AND p.polname <> 'karidns_rls_trusted' AND p.polroles = '{0}')::text || ' ' || (SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE c.relnamespace = 'karidns_auth'::regnamespace AND p.polname LIKE 'karidns\_rls\_%' AND p.polname <> 'karidns_rls_trusted' AND p.polroles = '{0}')::text || ' ' || (SELECT count(*) FROM pg_policy WHERE polname = 'karidns_rls_trusted')::text || ' ' || (SELECT count(*) FROM pg_policy WHERE polname LIKE 'karidns\_signer\_%')::text"
-oeq "RLS is on for the 14 tables of the schema and the 10 of karidns_auth, and for nothing else" "24" "SELECT count(*) FROM pg_class WHERE relrowsecurity AND relnamespace IN ('public'::regnamespace, 'karidns_auth'::regnamespace)"
+oeq "the policies exist: 39 for the API on the schema's tables, 37 on karidns_auth, 1 for the trusted role on each of the 25 tables, 32 for the signer (3 + 3 permissive and restrictive on records and domainmetadata, 14 SELECT, 1 INSERT on reload requests, 1 on cryptokeys, 1 UPDATE on key requests, 3 on the signer state)" \
+    "39 37 25 32" "SELECT (SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE c.relnamespace = 'public'::regnamespace AND p.polname LIKE 'karidns\_rls\_%' AND p.polname <> 'karidns_rls_trusted' AND p.polroles = '{0}')::text || ' ' || (SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE c.relnamespace = 'karidns_auth'::regnamespace AND p.polname LIKE 'karidns\_rls\_%' AND p.polname <> 'karidns_rls_trusted' AND p.polroles = '{0}')::text || ' ' || (SELECT count(*) FROM pg_policy WHERE polname = 'karidns_rls_trusted')::text || ' ' || (SELECT count(*) FROM pg_policy WHERE polname LIKE 'karidns\_signer\_%')::text"
+oeq "RLS is on for the 14 tables of the schema and the 11 of karidns_auth (with oidc_states), and for nothing else" "25" "SELECT count(*) FROM pg_class WHERE relrowsecurity AND relnamespace IN ('public'::regnamespace, 'karidns_auth'::regnamespace)"
 oeq "...and not forced (the owner is exempt)" "0" "SELECT count(*) FROM pg_class WHERE relforcerowsecurity"
 oeq "the audit triggers are attached to the schema (the eight PowerDNS and KariDNS data tables and the two tables of the signer)" "10" "SELECT count(DISTINCT tgrelid) FROM pg_trigger WHERE tgname = 'karidns_audit_row' AND tgrelid::regclass::text IN ('domains','records','domainmetadata','cryptokeys','karidns_record_tags','karidns_record_tinydns','karidns_zone_tagdefs','karidns_domain_views','karidns_key_requests','karidns_signer_state')"
 oeq "only the API role is in audit_restricted_roles (the signer is a trusted daemon that asks for summary mode); the API role is in api_roles (the signer is not)" "true|false|true|false" \
@@ -528,6 +528,37 @@ a_n "...cannot delete its row: no row" 0 $API $DM "DELETE FROM karidns_auth.cred
 a_ok "...a global master creates credentials" $API $GM "INSERT INTO karidns_auth.credentials (principal_id, oidc_issuer, oidc_subject) VALUES ($NOG, 'https://idp.example', 'nog')"
 a_n "...and deletes them" 1 $API $GM "DELETE FROM karidns_auth.credentials WHERE principal_id = $NOG"
 a_err "a plain text password hash is still refused" "check constraint" $API $DM "UPDATE karidns_auth.credentials SET password_hash = 'hunter2' WHERE principal_id = $DM"
+# the sign-in with an OpenID Connect provider (item F, M5): no principal exists yet when it starts, so the API role has no right on the table and calls functions
+H32="decode(repeat('ab', 32), 'hex')"
+a_err "oidc_states: the API role cannot read the table" "permission denied" $API $GM "SELECT count(*) FROM karidns_auth.oidc_states"
+a_err "...nor write it" "permission denied" $API $GM "INSERT INTO karidns_auth.oidc_states (state_hash, browser_hash, provider, nonce, verifier, expires_at) VALUES ($H32, $H32, 'p', 'n', repeat('v', 43), now())"
+a_err "...nor delete from it" "permission denied" $API $GM "DELETE FROM karidns_auth.oidc_states"
+a_eq "oidc_state_put() records a state without a principal (no one is signed in yet)" t $API NONE "SELECT karidns_auth.oidc_state_put($H32, $H32, 'idp', 'n', repeat('v', 43), '/zones', 600)"
+a_eq "oidc_state_take() returns it once, with its route" "/zones" $API NONE "SELECT return_route FROM karidns_auth.oidc_state_take($H32)"
+a_eq "...and a second time finds nothing" 0 $API NONE "SELECT count(*) FROM karidns_auth.oidc_state_take($H32)"
+oq "SELECT karidns_auth.oidc_state_put($H32, $H32, 'idp', 'n', repeat('v', 43), '/', 1)" > /dev/null
+oq "UPDATE karidns_auth.oidc_states SET created_at = now() - interval '1 minute', expires_at = now() - interval '30 seconds'" > /dev/null
+a_eq "...a state that is over is not returned" 0 $API NONE "SELECT count(*) FROM karidns_auth.oidc_state_take($H32)"
+oq "DELETE FROM karidns_auth.oidc_states" > /dev/null
+a_err "...the table refuses a state that lives more than an hour" "check constraint|violates" $API NONE "SELECT karidns_auth.oidc_state_put($H32, $H32, 'idp', 'n', repeat('v', 43), '/', 7200)"
+oq "INSERT INTO karidns_auth.oidc_states (state_hash, browser_hash, provider, nonce, verifier, expires_at) SELECT decode(lpad(to_hex(g), 64, '0'), 'hex'), $H32, 'idp', 'n', repeat('v', 43), now() + interval '5 minutes' FROM generate_series(1, 1000) g" > /dev/null
+a_eq "oidc_state_put() refuses the 1001st waiting state" f $API NONE "SELECT karidns_auth.oidc_state_put($H32, $H32, 'idp', 'n', repeat('v', 43), '/', 600)"
+oq "UPDATE karidns_auth.oidc_states SET created_at = now() - interval '2 minutes', expires_at = now() - interval '1 minute'" > /dev/null
+a_eq "...and makes room when they are over" t $API NONE "SELECT karidns_auth.oidc_state_put($H32, $H32, 'idp', 'n', repeat('v', 43), '/', 600)"
+oq "UPDATE karidns_auth.oidc_states SET created_at = now() - interval '2 minutes', expires_at = now() - interval '1 minute' WHERE state_hash = decode(repeat('ab', 32), 'hex')" > /dev/null
+oq "INSERT INTO karidns_auth.oidc_states (state_hash, browser_hash, provider, nonce, verifier, expires_at) VALUES (decode(repeat('cd', 32), 'hex'), $H32, 'idp', 'n', repeat('v', 43), now() + interval '5 minutes')" > /dev/null
+a_ok "sweep_expired() runs for the API role" $API NONE "SELECT karidns_auth.sweep_expired()"
+oeq "...it deleted the states that are over and left the one that is not" "1" "SELECT count(*) FROM karidns_auth.oidc_states"
+oq "DELETE FROM karidns_auth.oidc_states" > /dev/null
+oq "UPDATE karidns_auth.credentials SET oidc_issuer = 'https://idp.example', oidc_subject = 'dm-sub' WHERE principal_id = $DM" > /dev/null
+a_eq "oidc_lookup() finds the user an identity is linked to, without a principal" "$DM" $API NONE "SELECT karidns_auth.oidc_lookup('https://idp.example', 'dm-sub')"
+a_eq "...not by another issuer or subject" 0 $API NONE "SELECT count(karidns_auth.oidc_lookup('https://idp.example', 'DM-SUB')) + count(karidns_auth.oidc_lookup('https://other.example', 'dm-sub'))"
+oq "UPDATE karidns_auth.principals SET disabled = true WHERE id = $DM" > /dev/null
+a_eq "...not a disabled user" 0 $API NONE "SELECT count(karidns_auth.oidc_lookup('https://idp.example', 'dm-sub'))"
+oq "UPDATE karidns_auth.principals SET disabled = false WHERE id = $DM" > /dev/null
+oq "UPDATE karidns_auth.credentials SET oidc_issuer = NULL, oidc_subject = NULL WHERE principal_id = $DM" > /dev/null
+a_err "the signer role has no EXECUTE on the functions of the sign-in" "permission denied" $SIG NONE "SELECT karidns_auth.oidc_state_take($H32)"
+a_err "...nor has PUBLIC (the functions are not for anybody to call)" "permission denied" $SIG NONE "SELECT karidns_auth.oidc_lookup('https://idp.example', 'x')"
 a_eq "principal_closure is readable" t $API NONE "SELECT count(*) > 0 FROM karidns_auth.principal_closure"
 a_err "...but not writable" "permission denied" $API $GM "DELETE FROM karidns_auth.principal_closure"
 a_err "the schema_version row cannot be changed" "permission denied" $API $GM "UPDATE karidns_auth.schema_version SET version = 4"
@@ -1010,10 +1041,10 @@ else
 fi
 
 echo "-- switching RLS off and on again"
-oeq "disable_rls('public') and ('karidns_auth') turn it off on 14 + 10 tables" "14 10" "SELECT karidns_auth.disable_rls('public') || ' ' || karidns_auth.disable_rls('karidns_auth')"
+oeq "disable_rls('public') and ('karidns_auth') turn it off on 14 + 11 tables" "14 11" "SELECT karidns_auth.disable_rls('public') || ' ' || karidns_auth.disable_rls('karidns_auth')"
 oq "GRANT SELECT ON domains, records TO $BARE" > /dev/null
 a_eq "...a role that is not trusted sees the rows again" "$(sg_cnt records)" $BARE NONE "SELECT count(*) FROM records"
-oeq "enable_rls() switches it on again" "14 10" "SELECT karidns_auth.enable_rls('public') || ' ' || karidns_auth.enable_rls('karidns_auth')"
+oeq "enable_rls() switches it on again" "14 11" "SELECT karidns_auth.enable_rls('public') || ' ' || karidns_auth.enable_rls('karidns_auth')"
 a_err "...and the bare role is refused again" "permission denied for function|row-level security" $BARE NONE "SELECT count(*) FROM records"
 
 echo

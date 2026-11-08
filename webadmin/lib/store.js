@@ -81,8 +81,11 @@ export async function removeMember(tx, groupId, memberId) {
 
 // ---------------------------------------------------------------------------------------------------------------------------------- credentials
 export async function getCredentials(tx, id) {
-  const r = await tx.get(`SELECT password_hash, totp_secret, totp_enabled, failed_logins, locked_until, password_changed_at FROM ${tx.A}credentials WHERE principal_id = $1`, [id]);
-  return r && { password_hash: r.password_hash, totp_secret: r.totp_secret, totp_enabled: bool(r.totp_enabled), failed_logins: r.failed_logins, locked_until: toMs(r.locked_until), password_changed_at: toIso(r.password_changed_at) };
+  const r = await tx.get(`SELECT password_hash, totp_secret, totp_enabled, oidc_issuer, oidc_subject, failed_logins, locked_until, password_changed_at FROM ${tx.A}credentials WHERE principal_id = $1`, [id]);
+  return r && {
+    password_hash: r.password_hash, totp_secret: r.totp_secret, totp_enabled: bool(r.totp_enabled), oidc_issuer: r.oidc_issuer ?? null, oidc_subject: r.oidc_subject ?? null,
+    failed_logins: r.failed_logins, locked_until: toMs(r.locked_until), password_changed_at: toIso(r.password_changed_at),
+  };
 }
 
 // UPDATE first: an INSERT ... ON CONFLICT would need the right to insert (a global master's) even when the row is there
@@ -554,6 +557,58 @@ export async function zoneViews(tx, schema, domainId) {
 // the hourly sweep on PostgreSQL: the API role cannot see the sessions of the other principals, so a SECURITY DEFINER function deletes the expired ones
 export async function sweepExpired(tx) {
   return Number((await tx.get('SELECT karidns_auth.sweep_expired() AS n')).n);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------- OpenID Connect (M5)
+// The state of a sign-in that has started (F-18).  PostgreSQL: the API role has no right on the table, the three SECURITY DEFINER functions do it (there is no principal yet,
+// so no policy could show a row).  SQLite3: the same in plain SQL.  A state is used once; at most 1000 wait.
+const OIDC_STATES_MAX = 1000;
+export const OIDC_STATE_TTL = 600;
+
+// s: { stateHash, browserHash, provider, nonce, verifier, route, nowMs } -> false when too many sign-ins are waiting
+export async function putOidcState(tx, s) {
+  if (tx.dialect === 'pg') {
+    return (await tx.get(`SELECT ${tx.A}oidc_state_put($1, $2, $3, $4, $5, $6, $7) AS ok`, [s.stateHash, s.browserHash, s.provider, s.nonce, s.verifier, s.route, OIDC_STATE_TTL])).ok === true;
+  }
+  await tx.run(`DELETE FROM ${tx.A}oidc_states WHERE expires_at <= $1`, [tx.ts(s.nowMs)]);
+  if ((await tx.get(`SELECT count(*) AS n FROM ${tx.A}oidc_states`)).n >= OIDC_STATES_MAX) return false;
+  await tx.run(`INSERT INTO ${tx.A}oidc_states (state_hash, browser_hash, provider, nonce, verifier, return_route, created_at, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [s.stateHash, s.browserHash, s.provider, s.nonce, s.verifier, s.route, tx.ts(s.nowMs), tx.ts(s.nowMs + OIDC_STATE_TTL * 1000)]);
+  return true;
+}
+
+// -> { browser_hash, provider, nonce, verifier, return_route } of an unexpired state, which is deleted by the same call; undefined for a state that is unknown, used or over
+export async function takeOidcState(tx, stateHash, nowMs) {
+  if (tx.dialect === 'pg') return tx.get(`SELECT browser_hash, provider, nonce, verifier, return_route FROM ${tx.A}oidc_state_take($1)`, [stateHash]);
+  const r = await tx.get(`SELECT browser_hash, provider, nonce, verifier, return_route, expires_at FROM ${tx.A}oidc_states WHERE state_hash = $1`, [stateHash]);
+  if (!r) return undefined;
+  await tx.run(`DELETE FROM ${tx.A}oidc_states WHERE state_hash = $1`, [stateHash]);
+  return toMs(r.expires_at) > nowMs ? r : undefined;
+}
+
+export const deleteExpiredOidcStates = (tx, nowMs) => tx.run(`DELETE FROM ${tx.A}oidc_states WHERE expires_at <= $1`, [tx.ts(nowMs)]);
+
+// the id of the user (not disabled) an identity is linked to, or null
+export async function oidcLookup(tx, issuer, subject) {
+  const r = tx.dialect === 'pg'
+    ? await tx.get(`SELECT ${tx.A}oidc_lookup($1, $2) AS id`, [issuer, subject])
+    : await tx.get(`SELECT c.principal_id AS id FROM ${tx.A}credentials c JOIN ${tx.A}principals p ON p.id = c.principal_id AND NOT p.disabled AND p.kind = 'user' WHERE c.oidc_issuer = $1 AND c.oidc_subject = $2`, [issuer, subject]);
+  return r?.id ?? null;
+}
+
+// the user an identity is linked to, disabled or not (a global master's view: the credentials policy shows it every row)
+export async function oidcOwner(tx, issuer, subject) {
+  return (await tx.get(`SELECT principal_id AS id FROM ${tx.A}credentials WHERE oidc_issuer = $1 AND oidc_subject = $2`, [issuer, subject]))?.id ?? null;
+}
+
+// UPDATE first, like setPassword: an INSERT ... ON CONFLICT would need the right to insert even when the row is there
+export async function setOidc(tx, id, issuer, subject) {
+  const r = await tx.run(`UPDATE ${tx.A}credentials SET oidc_issuer = $2, oidc_subject = $3 WHERE principal_id = $1`, [id, issuer, subject]);
+  if (r.changes === 0) await tx.run(`INSERT INTO ${tx.A}credentials (principal_id, oidc_issuer, oidc_subject) VALUES ($1, $2, $3)`, [id, issuer, subject]);
+}
+
+export async function clearOidc(tx, id) {
+  return (await tx.run(`UPDATE ${tx.A}credentials SET oidc_issuer = NULL, oidc_subject = NULL WHERE principal_id = $1 AND oidc_issuer IS NOT NULL`, [id])).changes;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------- zone versions (M4)

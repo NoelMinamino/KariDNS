@@ -67,3 +67,18 @@ check-conninfo-file = /usr/local/etc/karidns/check.conninfo
 
 # stderr, or a syslog facility (daemon, local0 ... local7, ...).
 log = daemon
+
+# --- sign in with an identity provider (OpenID Connect) ----------------------------------------------------------------------------------
+# One section for each provider, at the END of the file (every key after a section header belongs to it).  Register the service at the provider with
+# the redirect URI <public-origin>/api/v1/auth/oidc/<name>/callback; the provider must sign ID tokens with RS256, ES256 or EdDSA.  A global master then
+# links each user to an identity in the web interface (Administration, the user).  The service makes outbound HTTPS requests to the provider.
+# issuer: exactly as in the provider's discovery document (https; http only for a provider on this machine).  client-secret-file: the service user's, mode 0600, one line.
+# label: the text of the button.  scopes: default openid.  mfa: totp (the default: require-totp applies to these sign-ins too) or idp (the provider's
+# second factor, shown by the amr claim of the ID token, replaces the TOTP step).
+# [oidc corp]
+# issuer = https://idp.example.test/realms/corp
+# client-id = karidns-webadmin
+# client-secret-file = /usr/local/etc/karidns/oidc-corp.secret
+# label = Corp ID
+# scopes = openid
+# mfa = totp

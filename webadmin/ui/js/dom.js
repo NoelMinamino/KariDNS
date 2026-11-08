@@ -80,6 +80,17 @@ export function fileLink(path, props, ...kids) {
   return el;
 }
 
+// the button that starts a sign-in with an identity provider: a link to /api/v1/auth/oidc/<name>/start, a plain navigation (the service answers with a redirect to the
+// provider).  The name is a provider's name as the configuration allows it; the route is the hash route to come back to ("/zones/main/example.test"), put into the
+// query as one encoded value.  Never a URL from data.
+export function oidcLink(name, route, props, ...kids) {
+  if (typeof name !== 'string' || !/^[a-z][a-z0-9_-]{0,31}$/.test(name)) throw new Error('dom.oidcLink: not a provider name');
+  const back = typeof route === 'string' && route.length <= 500 && route.startsWith('/') && !route.startsWith('//') && !/[\0-\x1f\x7f]/.test(route) ? route : '/';
+  const el = h('a', props, ...kids);
+  el.setAttribute('href', `/api/v1/auth/oidc/${name}/start?return=${encodeURIComponent(back)}`);
+  return el;
+}
+
 // a drawing: svg('svg', { viewBox: '0 0 10 10' }, svg('path', { d: '...' }))
 export function svg(tag, attrs, ...kids) {
   const el = doc.createElementNS(SVG_NS, tag);

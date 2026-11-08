@@ -46,9 +46,16 @@ export async function principalCreate(ctx) {
 }
 
 // what an administrator (and the user itself) may know of the credentials: no hash, no secret
-const credentialsView = (c, now) => (c
-  ? { password: Boolean(c.password_hash), totp_enabled: c.totp_enabled, failed_logins: c.failed_logins, locked: Boolean(c.locked_until && c.locked_until > now) }
-  : { password: false, totp_enabled: false, failed_logins: 0, locked: false });
+// (oidc: the identity the user is linked to, with the provider's name and label when a configured provider has that issuer: the issuer and the subject are not secrets, and the
+// person it belongs to sees them in the account, an administrator in the administration)
+const credentialsView = (c, now, app) => {
+  if (!c) return { password: false, totp_enabled: false, failed_logins: 0, locked: false, oidc: null };
+  const prov = c.oidc_issuer ? app.oidc.byIssuer(c.oidc_issuer) : undefined;
+  return {
+    password: Boolean(c.password_hash), totp_enabled: c.totp_enabled, failed_logins: c.failed_logins, locked: Boolean(c.locked_until && c.locked_until > now),
+    oidc: c.oidc_issuer ? { issuer: c.oidc_issuer, subject: c.oidc_subject, provider: prov ? { name: prov.name, label: prov.label } : null } : null,
+  };
+};
 
 export async function principalGet(ctx) {
   const id = idParam(ctx);
@@ -60,7 +67,7 @@ export async function principalGet(ctx) {
   });
   if (!r) throw notFound('no such principal');
   const out = { principal: { ...principalView(r.p), created_at: r.p.created_at, created_by: r.p.created_by }, groups: r.groups };
-  if (r.creds !== undefined) out.credentials = credentialsView(r.creds, ctx.app.now());
+  if (r.creds !== undefined) out.credentials = credentialsView(r.creds, ctx.app.now(), ctx.app);
   return out;
 }
 
@@ -89,7 +96,50 @@ export async function principalCredentials(ctx) {
   }, { write: true });
   if (!r) throw notFound('no such principal');
   ctx.app.log.info(`auth: ${clean(ctx.auth.principal.name)} did ${body.action} for ${clean(r.p.name)}`);
-  return { credentials: credentialsView(r.creds, ctx.app.now()) };
+  return { credentials: credentialsView(r.creds, ctx.app.now(), ctx.app) };
+}
+
+// G7 (F-16): a global master links a user to an identity at a provider, (issuer, subject), or removes the link.  The subject is what the provider's ID token says in `sub` (the
+// service logs it when a sign-in finds no user, so the administrator can copy it).  The issuer must be one of the configured providers'.  A user has one identity; a pair
+// belongs to one user.  A changed or removed link ends the user's sessions (not the administrator's own): whoever came in through the old identity must not stay in.
+export async function principalOidcPut(ctx) {
+  requireGlobal(ctx);
+  const id = idParam(ctx);
+  const body = shape(ctx.body, {
+    issuer: { type: 'string', required: true, min: 1, max: 255 },
+    subject: { type: 'string', required: true, min: 1, max: 255 },
+  });
+  if (!ctx.app.oidc.byIssuer(body.issuer)) throw badRequest('no configured provider has this issuer', '/issuer');
+  const r = await ctx.db(async (tx) => {
+    const p = await S.getPrincipal(tx, id);
+    if (!p) return null;
+    if (p.kind !== 'user') throw conflict('only a user signs in', 'not-a-user');
+    const owner = await S.oidcOwner(tx, body.issuer, body.subject);
+    if (owner !== null && owner !== id) throw conflict('this identity is linked to another user', 'exists');
+    const before = await S.getCredentials(tx, id);
+    await S.setOidc(tx, id, body.issuer, body.subject);
+    if (before?.oidc_issuer && (before.oidc_issuer !== body.issuer || before.oidc_subject !== body.subject)) await S.deleteSessionsOf(tx, id, ctx.auth.principal.id === id ? (ctx.auth.idHash ?? null) : null);
+    return { p, creds: await S.getCredentials(tx, id) };
+  }, { write: true });
+  if (!r) throw notFound('no such principal');
+  ctx.app.log.info(`auth: ${clean(ctx.auth.principal.name)} linked ${clean(r.p.name)} to ${clean(body.issuer)} subject ${clean(body.subject)}`);
+  return { credentials: credentialsView(r.creds, ctx.app.now(), ctx.app) };
+}
+
+export async function principalOidcDelete(ctx) {
+  requireGlobal(ctx);
+  const id = idParam(ctx);
+  const r = await ctx.db(async (tx) => {
+    const p = await S.getPrincipal(tx, id);
+    if (!p) return 'principal';
+    if (!(await S.clearOidc(tx, id))) return 'link';
+    await S.deleteSessionsOf(tx, id, ctx.auth.principal.id === id ? (ctx.auth.idHash ?? null) : null);
+    return p;
+  }, { write: true });
+  if (r === 'principal') throw notFound('no such principal');
+  if (r === 'link') throw notFound('this user is not linked to an identity');
+  ctx.app.log.info(`auth: ${clean(ctx.auth.principal.name)} removed the identity link of ${clean(r.name)}`);
+  return reply(204, null);
 }
 
 export async function principalUpdate(ctx) {
