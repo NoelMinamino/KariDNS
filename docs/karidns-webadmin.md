@@ -201,7 +201,7 @@ server {
     proxy_http_version 1.1;
     proxy_read_timeout 330s;                # an import may take 300 s
 
-    location /api/ {                        # forward /api/ only: nothing else of the host reaches the service
+    location / {                            # the API (/api/v1/) and the files of the web interface (/ and /ui/): the service decides what exists, the rest is a 404
         limit_req zone=webadmin burst=40 nodelay;
         proxy_pass http://127.0.0.1:8053;                                     # or http://unix:/var/run/karidns_webadmin/api.sock;
         proxy_set_header X-Forwarded-For $remote_addr;                       # set, not append: the client's own header is not passed on
@@ -220,7 +220,9 @@ http protocol "webadmin" {
     tls { no tlsv1.0, no tlsv1.1 }
     match request header set "X-Forwarded-For" value "$REMOTE_ADDR"          # set: a header from the client is replaced
     block                                                                     # relayd takes the last rule that matches: block everything ...
-    pass request path "/api/*"                                                # ... except /api/
+    pass request path "/api/*"                                                # ... except the API,
+    pass request path "/ui/*"                                                 # the files of the web interface
+    pass request path "/"                                                     # and its page
 }
 relay "webadmin_tls" {
     listen on 192.0.2.10 port 443 tls
@@ -229,11 +231,22 @@ relay "webadmin_tls" {
 }
 ```
 
-(Neither proxy configuration is run by KariDNS's tests; check the syntax against your version. What the service needs from the proxy is only: TLS, the `/api/` path forwarded, `X-Forwarded-For` set to the client's address, bodies up to 16 MiB, and a read timeout longer than 300 seconds for imports.)
+(Neither proxy configuration is run by KariDNS's tests; check the syntax against your version. What the service needs from the proxy is only: TLS, the paths `/api/`, `/ui/` and `/` forwarded (`/` and `/ui/` only with the web interface, unless `ui = no`), `X-Forwarded-For` set to the client's address, bodies up to 16 MiB, and a read timeout longer than 300 seconds for imports.)
 
 ### The built-in TLS
 
 For a single host without a proxy: set `tls-cert` and `tls-key` (both, PEM files; `tls-key` owned by the service user, mode 0600, which `--check` verifies) and `listen = 192.0.2.10:8443`. TLS 1.2 or newer; the key and certificate are read at the start (restart to renew). There is no HTTP to HTTPS redirect and no OCSP stapling; a proxy does those better.
+
+## THE WEB INTERFACE
+
+The service serves a browser front end of its own API under `/` (settings `ui` and `ui-dir`, [API reference](karidns-api.md), "The web interface"). It is plain JavaScript modules and one style sheet, no build step, no framework, no outside address: the page's policy (`default-src 'none'`, scripts and styles only from the origin, no inline code, Trusted Types) makes anything else fail, which is why **a proxy that injects a script or a style sheet breaks it** (the page then shows a banner that something was blocked). It needs no database and no login for its files; everything it shows comes from `/api/v1/` with the cookie session of the person (`HttpOnly`, `SameSite=Strict`, `Path=/api/`, so the files are fetched without it).
+
+This release has the foundation and the person's own pages: **sign-in** (user, password, the code when the account has TOTP; one message for every refusal; a button that waits when the service says 429), **TOTP set-up** (the QR code is drawn in the page by the interface's own encoder, the key as text only when asked for; a global master under `require-totp = global` can do nothing else until it has done this), the **account** (password, TOTP on and off where the configuration allows, API tokens shown once, language, signing out here or everywhere), the start page with the person's grants, and **About** (versions). English and Japanese, chosen by the browser and changed in the account. The pages for zones, versions, templates, administration and the audit log follow in the next milestones of item F; until then the API is the way to them.
+
+- **Sessions.** Nothing in the page asks the service on its own, so the idle time of `session-idle` means what it says: the page counts down from its last request, warns two minutes before (a minute earlier than the service ends it, which writes the time of the last request at most once a minute), and "Stay signed in" is one request made because the person asked. When the session has ended, a 401 on any page opens the sign-in over what is on the screen; the same person goes on, another person starts at the start page. A sign-out in one tab signs out the others (a `BroadcastChannel`).
+- **Browsers.** Firefox ESR, Chrome and Edge (current and previous), Safari 17 or newer. The automated tests run Firefox (`tests/run_webadmin_gui_test.sh`, headless through geckodriver; on the FreeBSD build host that needs `pkg install firefox geckodriver dejavu`: Firefox crashes at the start on a system without a font).
+- **Storage.** The page keeps the chosen language in `localStorage` and nothing else: no token, no zone data, no secret.
+- **Files.** The interface is in the package (`webadmin/ui/`); the page asks for the version of the service after the sign-in and tells the person to reload when it differs from its own (the service was upgraded while the page was open).
 
 ## RUNNING IT
 

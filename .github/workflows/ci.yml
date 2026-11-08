@@ -58,6 +58,16 @@ jobs:
             dnssec-signzone -V
             echo "::endgroup::"
 
+            echo "::group::📦 [Setup] Firefox and geckodriver for the browser tests of the web interface (0.6.0 item F, FreeBSD 15.1 only)"
+            # run_webadmin_gui_test.sh drives Firefox (headless) through geckodriver; the packages are built for 15.x.  Firefox crashes at the start without a font.
+            # The tests use no network (a profile that talks to nothing, everything on 127.0.0.1): the network is for this step only.
+            if [ "${{ matrix.release }}" = "15.1" ]; then
+              pkg install -y firefox geckodriver dejavu
+              firefox --version
+              geckodriver --version | head -1
+            fi
+            echo "::endgroup::"
+
             echo "::group::📦 [Setup] PostgreSQL server and libpq (PostgreSQL driver of karidns-dbloader, B10)"
             # The job runs inside this VM, so the PostgreSQL "service" is a server started here (a service container of the
             # runner is not reachable from the VM).  initdb's default pg_hba.conf trusts the UNIX socket and 127.0.0.1; the tests
@@ -169,7 +179,10 @@ jobs:
 
             echo "::group::🔏 [Signer, WebAdmin] karidns-signer and karidns-webadmin: unit tests, SQLite3 and PostgreSQL (root: with a server)"
             # A SKIP of a whole script must fail here (tests/run_all_suite.sh shows it as a note of a PASS): node24, bind-tools, signer/node_modules and webadmin/node_modules are installed above
-            for t in run_signer_unit_test run_signer_test run_signer_pg_test run_webadmin_unit_test run_webadmin_test run_webadmin_pg_test run_webadmin_write_test run_webadmin_write_pg_test run_webadmin_versions_test run_webadmin_versions_pg_test run_webadmin_pkg_test; do
+            # The browser test of the web interface runs on 15.1 only (Firefox is installed there); a SKIP fails the job like any other
+            GUI_TEST=""
+            if [ "${{ matrix.release }}" = "15.1" ]; then GUI_TEST="run_webadmin_gui_test"; fi
+            for t in run_signer_unit_test run_signer_test run_signer_pg_test run_webadmin_unit_test run_webadmin_test run_webadmin_pg_test run_webadmin_write_test run_webadmin_write_pg_test run_webadmin_versions_test run_webadmin_versions_pg_test run_webadmin_pkg_test $GUI_TEST; do
               out="/tmp/$t.out"
               sh "./tests/$t.sh" < /dev/null > "$out" 2>&1 || { cat "$out"; echo "::error title=Signer and WebAdmin::$t failed"; exit 1; }
               cat "$out"

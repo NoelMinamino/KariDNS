@@ -181,3 +181,20 @@ export async function cast(d) {
   const sub = await d.makeUser('sub', 'sub password 12345', { grants: [{ role: 'subdomain_master', zone: 'example.test', suffix: 'sub.example.test', policyId: web, schema: '' }] });
   return { all, web, root, dom, sub };
 }
+
+// the error codes of the table in docs/karidns-api.md (a code is a word in backticks at the start of an entry: the explanations in parentheses may name other things in
+// backticks), for docs.test.js and for the catalogs of the GUI (i18n.test.js)
+export function docApiCodes() {
+  const text = fs.readFileSync(new URL('docs/karidns-api.md', ROOT), 'utf8');
+  const table = text.slice(text.indexOf('| Status | Codes |'), text.indexOf('## ENDPOINTS'));
+  if (table.length < 100) throw new Error('the table of codes was not found');
+  const out = new Set();
+  for (const row of table.split('\n').filter((l) => /^\| \d/.test(l))) {
+    const cell = row.split('|')[2];
+    for (const entry of cell.replace(/\([^)]*\)/g, '').split(/[,;:]/)) {
+      const m = /^\s*`([a-z]+(?:-[a-z]+)*)`\s*$/.exec(entry);
+      if (m) out.add(m[1]);
+    }
+  }
+  return out;
+}

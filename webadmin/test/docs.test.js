@@ -6,7 +6,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { ROOT } from './helpers.js';
+import { ROOT, docApiCodes } from './helpers.js';
 
 const LIB = new URL('../lib/', import.meta.url);
 const sources = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? sources(new URL(`${e.name}/`, dir)) : e.name.endsWith('.js') ? [new URL(e.name, dir)] : []));
@@ -60,21 +60,7 @@ function codesInCode() {
   return codes;
 }
 
-function codesInDocs() {
-  const text = fs.readFileSync(new URL('docs/karidns-api.md', ROOT), 'utf8');
-  const table = text.slice(text.indexOf('| Status | Codes |'), text.indexOf('## ENDPOINTS'));
-  assert.ok(table.length > 100, 'the table of codes was not found');
-  // a code is a word in backticks at the start of an entry (the explanations in parentheses may name other things in backticks)
-  const out = new Set();
-  for (const row of table.split('\n').filter((l) => /^\| \d/.test(l))) {
-    const cell = row.split('|')[2];
-    for (const entry of cell.replace(/\([^)]*\)/g, '').split(/[,;:]/)) {
-      const m = /^\s*`([a-z]+(?:-[a-z]+)*)`\s*$/.exec(entry);
-      if (m) out.add(m[1]);
-    }
-  }
-  return out;
-}
+const codesInDocs = docApiCodes;
 
 test('every error code the API can answer with is in the table of docs/karidns-api.md, and every code of the table exists', () => {
   const code = codesInCode();
