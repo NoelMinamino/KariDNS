@@ -1,0 +1,12 @@
+$ORIGIN example.test.
+$TTL 300
+@ IN SOA ns1 hostmaster 10 7200 3600 1209600 300
+@ IN NS ns1
+@ IN MX 10 mail
+ns1 IN A 192.0.2.1
+mail IN A 192.0.2.40
+www IN A 192.0.2.10
+www IN A 192.0.2.11
+sub IN A 192.0.2.20
+a.sub IN TXT "hello"
+evilsub IN A 192.0.2.30

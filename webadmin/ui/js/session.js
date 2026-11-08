@@ -142,6 +142,7 @@ export function createSession({ api, timers, now, BroadcastChannel: BC }) {
       st.leaving = false;
     }
     st.previous = null;
+    emit('logout');                    // the work that was not saved goes with the session (the drafts, F-13); a session that merely ended keeps it
     setOut('out');
     channel?.postMessage({ type: 'logout' });
   }

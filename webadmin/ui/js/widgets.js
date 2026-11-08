@@ -70,7 +70,7 @@ export async function busy(button, fn) {
 export function confirmButton({ label, confirmLabel, yes, no, onConfirm, cls = 'danger' }) {
   const wrap = h('span', { class: 'confirm' });
   const first = h('button', { type: 'button', class: cls }, label);
-  const yesButton = h('button', { type: 'button', class: cls, on: { click: () => onConfirm() } }, yes);
+  const yesButton = h('button', { type: 'button', class: cls, on: { click: () => { reset(); onConfirm(); } } }, yes);
   const ask = h('span', { hidden: true }, h('span', { class: 'ask' }, confirmLabel, ' '), yesButton, ' ', h('button', { type: 'button', on: { click: () => reset() } }, no));
   function reset() { ask.hidden = true; first.hidden = false; first.focus(); }
   first.addEventListener('click', () => { first.hidden = true; ask.hidden = false; yesButton.focus(); });

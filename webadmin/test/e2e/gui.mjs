@@ -227,13 +227,13 @@ try {
     await b.exec(() => document.querySelector('header a.brand').focus());
     const order = [];
     let found = false;
-    for (let i = 0; i < 10 && !found; i++) {
+    for (let i = 0; i < 12 && !found; i++) {
       await b.keys(NAMED_KEYS.Tab);
       const t = await b.exec(() => document.activeElement.textContent.trim());
       order.push(t);
       found = t === 'Log out';
     }
-    eq(order, ['Home', 'Account', 'About', 'Log out'], 'the order of the keyboard');
+    eq(order, ['Home', 'Zones', 'Servers', 'Account', 'About', 'Log out'], 'the order of the keyboard');
     // the focus can be seen: the style sheet has an outline for what has the focus, and the element has a size (the check of :focus-visible itself is not made:
     // headless Firefox does not report it after a script moved the focus)
     const ring = await b.exec(() => [...document.styleSheets].some((s) => [...s.cssRules].some((r) => r.selectorText && r.selectorText.includes(':focus-visible') && /outline: (?!none)/.test(r.style.cssText))));

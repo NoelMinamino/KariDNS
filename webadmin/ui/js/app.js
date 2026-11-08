@@ -6,23 +6,40 @@ import { createApi } from './api.js';
 import { createSession } from './session.js';
 import { createRouter } from './router.js';
 import { createI18n } from './i18n.js';
-import { duration, render as renderText } from './format.js';
+import { duration, plain, render as renderText } from './format.js';
 import { GUI_VERSION } from './version.js';
 import { loginForm } from './views/login.js';
 import { totpView } from './views/totp.js';
 import { accountView } from './views/account.js';
 import { aboutView } from './views/about.js';
 import { homeView } from './views/home.js';
+import { zonesView } from './views/zones.js';
+import { zoneView } from './views/zone.js';
+import { zoneImportView } from './views/zoneimport.js';
+import { zoneSettingsView } from './views/zonesettings.js';
+import { dnssecView } from './views/dnssec.js';
+import { zoneCreateView } from './views/zonecreate.js';
+import { serversView } from './views/servers.js';
+import { createDrafts } from './draft.js';
 import en from '../i18n/en.js';
 import ja from '../i18n/ja.js';
 
 export const ROUTES = [
   { name: 'home', pattern: '/' },
+  { name: 'zones', pattern: '/zones' },
+  { name: 'create', pattern: '/create/:ds' },
+  { name: 'zone', pattern: '/zones/:ds/:zone' },
+  { name: 'zone-import', pattern: '/zones/:ds/:zone/import' },
+  { name: 'zone-settings', pattern: '/zones/:ds/:zone/settings' },
+  { name: 'zone-dnssec', pattern: '/zones/:ds/:zone/dnssec' },
+  { name: 'servers', pattern: '/servers' },
   { name: 'account', pattern: '/account' },
   { name: 'totp', pattern: '/account/totp' },
   { name: 'about', pattern: '/about' },
 ];
-const NAV = [['home', 'nav.home'], ['account', 'nav.account'], ['about', 'nav.about']];
+// the menu: [route, message id]; the zone pages belong to "Zones"
+const NAV = [['home', 'nav.home'], ['zones', 'nav.zones'], ['servers', 'nav.servers'], ['account', 'nav.account'], ['about', 'nav.about']];
+const IN_ZONES = new Set(['zones', 'zone', 'zone-import', 'zone-settings', 'zone-dnssec', 'create']);
 const noop = () => {};
 
 export function createApp(env) {
@@ -44,8 +61,11 @@ export function createApp(env) {
   const assertiveEl = h('div', { class: 'sr-only', 'aria-live': 'assertive', role: 'alert' });
   const root = doc.getElementById('app');
 
+  const drafts = createDrafts();                  // the change sets being put together (F-13: memory only)
+  session.guards.add(() => drafts.dirty());       // a page that is left with a draft asks first
   const ctx = {
-    api, session, i18n, now, timers,
+    api, session, i18n, now, timers, drafts,
+    flash: null,                                  // a text the next screen shows once
     router: null,
     announce(msg, level = 'polite') {
       const el = level === 'assertive' ? assertiveEl : politeEl;
@@ -78,7 +98,7 @@ export function createApp(env) {
     const head = [brand()];
     if (authed() && !forced()) {
       const cur = route?.name;
-      head.push(h('nav', { 'aria-label': t('nav.label') }, h('ul', null, NAV.map(([name, id]) => h('li', null, link(router.href(name), { 'aria-current': cur === name || (name === 'account' && cur === 'totp') ? 'page' : undefined }, t(id)))))));
+      head.push(h('nav', { 'aria-label': t('nav.label') }, h('ul', null, NAV.map(([name, id]) => h('li', null, link(router.href(name), { 'aria-current': cur === name || (name === 'account' && cur === 'totp') || (name === 'zones' && IN_ZONES.has(cur)) ? 'page' : undefined }, t(id)))))));
     }
     if (authed()) {
       const me = session.state.me.principal;
@@ -126,6 +146,13 @@ export function createApp(env) {
     if (forced()) { const v = totpView(ctx, { forced: true }); mount(t('totp.title'), v); return; }
     switch (route.name) {
       case 'home': mount(t('nav.home'), homeView(ctx)); break;
+      case 'zones': mount(t('zones.title'), zonesView(ctx, route)); break;
+      case 'create': mount(t('create.title', { ds: plain(route.params.ds) }), zoneCreateView(ctx, route)); break;
+      case 'zone': mount(plain(route.params.zone), zoneView(ctx, route)); break;
+      case 'zone-import': mount(`${t('zone.sec-import')} - ${plain(route.params.zone)}`, zoneImportView(ctx, route)); break;
+      case 'zone-settings': mount(`${t('zone.sec-settings')} - ${plain(route.params.zone)}`, zoneSettingsView(ctx, route)); break;
+      case 'zone-dnssec': mount(`${t('zone.sec-dnssec')} - ${plain(route.params.zone)}`, dnssecView(ctx, route)); break;
+      case 'servers': mount(t('servers.title'), serversView(ctx)); break;
       case 'account': mount(t('account.title'), accountView(ctx)); break;
       case 'totp': mount(t('totp.title'), totpView(ctx)); break;
       case 'about': mount(t('about.title'), aboutView(ctx)); break;
@@ -194,8 +221,9 @@ export function createApp(env) {
   session.on('warn-clear', closeWarning);
   session.on('expired', () => { closeWarning(); session.reauth(); });
   // (the same person: the screen stays as it is, with what is on it; another person: it was redrawn for them by the change of the session, and starts at home)
-  session.on('reauthenticated', (outcome) => { if (outcome === 'other') router.go('home'); });
-  session.on('other-tab-logout', () => { notice = t('login.other-tab'); closeWarning(); render(); });
+  session.on('reauthenticated', (outcome) => { if (outcome === 'other') { drafts.clear(); router.go('home'); } });
+  session.on('logout', () => drafts.clear());
+  session.on('other-tab-logout', () => { drafts.clear(); notice = t('login.other-tab'); closeWarning(); render(); });
   session.on('other-tab-login', () => render());
   i18n.onChange((lang) => { setLang(lang); render(); });
 

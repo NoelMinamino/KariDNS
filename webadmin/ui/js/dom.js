@@ -70,6 +70,16 @@ export function link(href, props, ...kids) {
   return el;
 }
 
+// a link to a file the API serves (the export of a zone): a path under /api/v1/ that the code built from encoded parts, never a URL from data.  The browser saves it
+// (the service answers with Content-Disposition: attachment); the session cookie goes with it because the address is the page's own origin.
+export function fileLink(path, props, ...kids) {
+  if (typeof path !== 'string' || !/^\/api\/v1\/[A-Za-z0-9._~%/!*'()-]+$/.test(path)) throw new Error('dom.fileLink: only API paths');
+  const el = h('a', props, ...kids);
+  el.setAttribute('href', path);
+  el.setAttribute('download', '');
+  return el;
+}
+
 // a drawing: svg('svg', { viewBox: '0 0 10 10' }, svg('path', { d: '...' }))
 export function svg(tag, attrs, ...kids) {
   const el = doc.createElementNS(SVG_NS, tag);

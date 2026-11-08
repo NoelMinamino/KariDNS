@@ -1,0 +1,12 @@
+; hostile record data for the browser tests of the web interface: nothing here may become an element, run, or reorder the page.  The bytes of U+202E are written as \226\128\174.
+$ORIGIN xss.test.
+$TTL 300
+@ IN SOA ns1 hostmaster 1 7200 3600 1209600 300
+@ IN NS ns1
+ns1 IN A 192.0.2.1
+markup IN TXT "<img src=x onerror=window.__xss=1>"
+script IN TXT "</script><script>window.__xss2=1</script>"
+bidi IN TXT "a\226\128\174b"
+ctl IN TXT "tab\009here" "nul\000x"
+*.wild IN A 192.0.2.100
+_dmarc IN TXT "v=DMARC1; p=none"

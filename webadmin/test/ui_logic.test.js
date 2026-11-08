@@ -53,6 +53,14 @@ test('link accepts hash routes only', () => {
   for (const bad of ['javascript:alert(1)', 'https://example.test/', '/x', '', null, 5]) assert.throws(() => dom.link(bad, null, 'x'), /only hash routes/);
 });
 
+test('fileLink accepts the paths of the API only, made of encoded parts, and marks the link as a download', () => {
+  const a = dom.fileLink('/api/v1/datasets/main/zones/example.test./export', { class: 'x' }, 'export');
+  assert.equal(a.getAttribute('href'), '/api/v1/datasets/main/zones/example.test./export');
+  assert.equal(a.getAttribute('download'), '');
+  assert.ok(dom.fileLink(`/api/v1/datasets/${encodeURIComponent("a b!*'()")}/zones/x/export`, null, 'x'));
+  for (const bad of ['javascript:alert(1)', 'https://example.test/api/v1/x', '/api/v1/', '/api/v1/a b', '/api/v1/a?b=c', '/api/v1/a#b', '//example.test/api/v1/x', '/x', '', null, 5]) assert.throws(() => dom.fileLink(bad, null, 'x'), /only API paths/, String(bad));
+});
+
 test('svg makes namespaced elements with a list of attributes; fill and clear replace the children; the document helpers', () => {
   const s = dom.svg('svg', { viewBox: '0 0 3 3', role: 'img', 'aria-label': 'qr' }, dom.svg('path', { d: 'M0 0h1v1h-1z' }));
   assert.equal(s.namespaceURI, 'http://www.w3.org/2000/svg');

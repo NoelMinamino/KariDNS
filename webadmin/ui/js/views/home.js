@@ -1,4 +1,4 @@
-// The start page after the sign-in: who you are and what you may do (the effective grants of GET /auth/me, planning 2).  The zone list (S3) replaces it in M3.
+// The start page after the sign-in: who you are and what you may do (the effective grants of GET /auth/me, planning 2), and the way to the zones (S3).
 
 import { h, link } from '../dom.js';
 import { render } from '../format.js';
@@ -24,7 +24,7 @@ export function homeView(ctx) {
       h('section', { class: 'card', 'aria-labelledby': 'home-title' },
         h('h1', { id: 'home-title' }, ...i18n.parts('home.title', { name: h('span', null, render(p.display_name ?? p.name)) })),
         h('p', null, t('home.intro')),
-        h('p', null, link(router.href('account'), { class: 'button' }, t('nav.account')))),
+        h('p', { class: 'actions' }, link(router.href('zones'), { class: 'button primary' }, t('nav.zones')), link(router.href('account'), { class: 'button' }, t('nav.account')))),
       h('section', { class: 'card', 'aria-labelledby': 'home-access' },
         h('h2', { id: 'home-access' }, t('home.access')),
         me.grants.length === 0 ? h('p', null, t('home.no-grants')) : h('table', null,
