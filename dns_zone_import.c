@@ -932,6 +932,38 @@ static bool zi_soa_noserial(const char *line, char *out, size_t cap) {
     return true;
 }
 
+/* the seven fields of an SOA content ("mname rname serial refresh retry expire minimum", blanks between): pointers and lengths; false if there are fewer than seven */
+static bool zi_soa_fields(const char *c, const char *f[7], size_t n[7]) {
+    const char *p = c;
+    for (int i = 0; i < 7; i++) {
+        while (*p == ' ' || *p == '\t') p++;
+        f[i] = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        n[i] = (size_t)(p - f[i]);
+        if (n[i] == 0) return false;
+    }
+    return true;
+}
+
+/* do two SOA contents differ in the serial only?  The two names are compared without regard to case and to a final dot (PowerDNS stores them without). */
+static bool zi_soa_same_but_serial(const char *a, const char *b) {
+    const char *fa[7], *fb[7];
+    size_t na[7], nb[7];
+    if (!zi_soa_fields(a, fa, na) || !zi_soa_fields(b, fb, nb)) return false;
+    for (int i = 0; i < 7; i++) {
+        if (i == 2) continue;
+        size_t la = na[i], lb = nb[i];
+        if (i < 2) {
+            if (la > 1 && fa[i][la - 1] == '.') la--;
+            if (lb > 1 && fb[i][lb - 1] == '.') lb--;
+            if (la != lb || strncasecmp(fa[i], fb[i], la) != 0) return false;
+        } else if (la != lb || strncmp(fa[i], fb[i], la) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* is the change of this SOA RRset the serial alone?  (the serial is not versioned: a rollback always raises it, CK-8) */
 static bool zi_soa_serial_only(const zi_change_t *c) {
     char a[1024], b[1024];
@@ -1158,6 +1190,17 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
         }
         nins = w;
     }
+    /* a zone text (apply --zone-file) whose apex SOA differs from the zone's in the serial only does not write the SOA: the serial is raised like any change's
+     * (a principal that may not write an SOA can import its zone file) */
+    if (ap && ap->zone_text && zf.found && zf.soa) {
+        size_t w = 0;
+        for (size_t k = 0; k < nins; k++) {
+            const db_record_row_t *r = &rows->rows[ins[k]];
+            if (!(r->type && strcasecmp(r->type, "SOA") == 0 && r->name && strcmp(r->name, rows->zone) == 0 && r->content && zi_soa_same_but_serial(r->content, zf.soa)))
+                ins[w++] = ins[k];
+        }
+        nins = w;
+    }
 
     /* the SOA serial (RFC 1982) of a zone that exists and whose SOA is written */
     if (zf.found && zf.soa) {
@@ -1219,7 +1262,8 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
         } else {
             rrv_t key = { r->owner, r->type, "", 0, 0, 0, false };
             del = zi_type_wanted(z, r->type);           /* nothing outside the types is touched */
-            if (del) del = zi_has_key(vb, nins, &key) || (ndk && zi_has_key(dk, ndk, &key));
+            if (del) del = zi_has_key(vb, nins, &key) || (ndk && zi_has_key(dk, ndk, &key)) ||
+                           (ap && ap->delete_others && !(strcmp(r->type, "SOA") == 0 && strcmp(r->owner, rows->zone) == 0));
         }
         if (!del) continue;
         va[nva] = (rrv_t){ r->owner, r->type, r->content, r->ttl, r->prio, r->id, r->disabled };
@@ -1230,6 +1274,40 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
     res->records_deleted = ndel;
     res->records_inserted = nins;
     if (!zi_diff(va, nva, vb, nins, true, &items, &nitems, res)) goto oom;
+    if (ap && nva + nins > 0) {
+        /* An apply writes the RRsets that CHANGE and no others.  The rows of an RRset of the change that equals the zone's are not deleted and written again: that would be
+         * a write the audit log records and row level security judges (the API's role may not write an apex NS or an RRset whose TTL is outside its policy, also when the
+         * write changes nothing).  va and vb are sorted now; the ids of the rows to delete and the order of the rows to insert are taken from them. */
+        bool *chg_a = calloc(nva ? nva : 1, 1), *chg_b = calloc(nins ? nins : 1, 1), *take = calloc(nins ? nins : 1, 1);
+        if (!chg_a || !chg_b || !take) {
+            free(chg_a);
+            free(chg_b);
+            free(take);
+            goto oom;
+        }
+        for (size_t i = 0; i < nitems; i++) {
+            memset(chg_a + items[i].alo, 1, items[i].ahi - items[i].alo);
+            memset(chg_b + items[i].blo, 1, items[i].bhi - items[i].blo);
+        }
+        ndel = 0;
+        nrec_del = 0;
+        for (size_t i = 0; i < nva; i++) {
+            if (!chg_a[i]) continue;
+            del_ids[ndel++] = va[i].id;
+            if (!va[i].disabled && va[i].type[0]) nrec_del++;
+        }
+        for (size_t j = 0; j < nins; j++)
+            if (chg_b[j]) take[(size_t)vb[j].id] = true;
+        size_t w = 0;
+        for (size_t k = 0; k < nins; k++)
+            if (take[k]) ins[w++] = ins[k];
+        nins = w;
+        res->records_deleted = ndel;
+        res->records_inserted = nins;
+        free(chg_a);
+        free(chg_b);
+        free(take);
+    }
 
     if (zf.found && whole && z->o.mode == ZI_REPLACE && !rows->presigned && !szone) {
         bool keys = false;
@@ -2135,6 +2213,30 @@ int zi_import_tinydns(zi_t *z, const zi_input_t *in, const char *zone, zi_result
 /* apply                                                                                                          */
 /* ------------------------------------------------------------------------------------------------------------- */
 
+/* A zone text given to apply carries plain records only: the DNSSEC data (the signer's), location and ECS tags, tinydns attributes and tag definitions are not what the
+ * API writes (use import).  false: a message was given. */
+static bool zi_text_plain(zi_t *z, const zrows_t *rows, const char *shown) {
+    if (rows->signed_zone || rows->presigned || rows->nsec3param || rows->tags || rows->td || rows->ndefs || rows->tinydns) {
+        ZI_ERR(z, DC_DB_APPLY_CHANGES, shown, "the zone text has DNSSEC records, location or ECS tags, tinydns attributes or tag definitions; apply takes plain records "
+               "only (use import for those)");
+        return false;
+    }
+    for (size_t i = 0; i < rows->n; i++) {
+        const char *ty = rows->rows[i].type;
+        char t[40];
+        size_t k = 0;
+        if (!ty) continue;
+        for (; ty[k] && k + 1 < sizeof(t); k++) t[k] = (char)toupper((unsigned char)ty[k]);
+        t[k] = '\0';
+        if (zc_type_refused(t)) {
+            ZI_ERR(z, DC_DB_APPLY_CHANGES, shown, "the zone text has a record of type %.32s (%.100s): the DNSSEC types and the meta types are not written by apply", t,
+                   rows->rows[i].name ? rows->rows[i].name : "?");
+            return false;
+        }
+    }
+    return true;
+}
+
 int zi_apply_changes(zi_t *z, const zi_apply_in_t *in, zi_result_t *res) {
     const zc_changes_t *ch = in->changes;
     const char *shown = in->shown ? in->shown : "change file";
@@ -2148,7 +2250,10 @@ int zi_apply_changes(zi_t *z, const zi_apply_in_t *in, zi_result_t *res) {
     for (size_t i = 0; i + 1 < zl; i++) dbname[i] = (char)tolower((unsigned char)in->zone[i]);
     dbname[zl - 1] = '\0';
     snprintf(res->zone, sizeof(res->zone), "%s", dbname);
-    if (in->create && ch->n_rr == 0) {
+    const bool text_mode = in->zone_text != NULL;       /* a zone text instead of a change file: no delete lines, no rr lines to render */
+    static const zc_changes_t no_changes = { NULL, 0, 0, 0, 0 };
+    if (text_mode) ch = &no_changes;
+    if (in->create && ch->n_rr == 0 && !text_mode) {
         ZI_ERR(z, DC_DB_APPLY_CHANGES, shown, "--create needs the records of the new zone (rr lines)");
         return ZI_FAIL;
     }
@@ -2197,17 +2302,20 @@ int zi_apply_changes(zi_t *z, const zi_apply_in_t *in, zi_result_t *res) {
     memset(&info, 0, sizeof(info));
     bool have_arena = false;
     int status = ZI_FAIL;
-    if (ch->n_rr) {
+    if (ch->n_rr || text_mode) {
         size_t tl = 0;
-        char *text = zc_zone_text(ch, in->zone, &tl), apex[DNS_NAME_TEXT_SIZE], err[600];
-        if (!text) {
+        char *text = text_mode ? NULL : zc_zone_text(ch, in->zone, &tl), apex[DNS_NAME_TEXT_SIZE], err[600];
+        const char *src = text_mode ? in->zone_text : text;
+        if (text_mode) tl = in->zone_text_len;
+        if (!src) {
             ZI_ERR(z, DC_INTERNAL_OOM, shown, "out of memory");
-        } else if (!zrows_load_zone_text(text, tl, NULL, in->zone, &arena, apex, sizeof(apex), &info, err, sizeof(err))) {
+        } else if (!zrows_load_zone_text(src, tl, NULL, in->zone, &arena, apex, sizeof(apex), &info, err, sizeof(err))) {
             ZI_ERR(z, DC_DB_APPLY_CHANGES, shown, "%s", err);
         } else {
             have_arena = true;
             res->dry_run = z->o.dry_run;
-            if (zi_check_zone(z, &arena, apex, shown, text, false, &info, &rows, res)) status = zi_apply(z, &rows, shown, res);
+            if (zi_check_zone(z, &arena, apex, shown, src, false, &info, &rows, res) && (!text_mode || zi_text_plain(z, &rows, shown)))
+                status = zi_apply(z, &rows, shown, res);
         }
         free(text);
     } else {

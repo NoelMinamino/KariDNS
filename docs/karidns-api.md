@@ -15,11 +15,11 @@ karidns-webadmin --version | -h | --help
 
 ## DESCRIPTION
 
-`karidns-webadmin` (0.6.0, items D and E) is a Node.js service that lets authenticated principals look at, and (in the next steps of this release) change, the zones of a PowerDNS 5.1 database that [`karidns(8)`](karidns.md) serves through [`karidns-dbloader(8)`](karidns-dbloader.md). It is the one place that knows **who may do what**: users and groups, three kinds of grant (global master, domain master, subdomain master) and the record policies they carry. A browser front end (item F) and automation (API tokens) are clients of the same API.
+`karidns-webadmin` (0.6.0, items D and E) is a Node.js service that lets authenticated principals look at, and change, the zones of a PowerDNS 5.1 database that [`karidns(8)`](karidns.md) serves through [`karidns-dbloader(8)`](karidns-dbloader.md). It is the one place that knows **who may do what**: users and groups, three kinds of grant (global master, domain master, subdomain master) and the record policies they carry. A browser front end (item F) and automation (API tokens) are clients of the same API.
 
-**What this version has.** Authentication (password, TOTP, sessions, API tokens, CSRF protection, lockout, rate limits); users, groups, nested groups, record policies and grants with the no-escalation rule; the list of datasets and zones a principal may see, zone information, the RRsets of a zone (paged), the export of a zone as a zone file, the audit log, the status of the servers, `/health` and `/version`. **What follows in this release** (the specification is in the planning notes, nothing of it is in this version): changing zone data (change sets with a dry run, zone creation and deletion, import, reload requests, DNSSEC key requests), zone versions with diff and rollback, and zone templates.
+**What this version has.** Authentication (password, TOTP, sessions, API tokens, CSRF protection, lockout, rate limits); users, groups, nested groups, record policies and grants with the no-escalation rule; the list of datasets and zones a principal may see, zone information, the RRsets of a zone (paged), the export of a zone as a zone file, the audit log, the status of the servers, `/health` and `/version`; and the **write side**: change sets (`PATCH .../rrsets`, with a dry run, preconditions and the permission check of the whole diff), zone creation, update and deletion, the import of a zone text, the reload ("update") button, the zone metadata the API may write, DNSSEC (the DS records of a signed zone, key requests for the signer) and the hourly sweep of expired sessions. **What follows in this release** (the specification is in the planning notes, nothing of it is in this version): zone versions with diff and rollback, and zone templates.
 
-Zone data is read by the service itself (SQL, one page at a time) and exported by [`karidns-zone`](karidns-zone.md); the only other programs it runs are `karidns-zone` and `karicheck` (a version check). It never talks to a DNS server.
+Zone data is read by the service itself (SQL, one page at a time) and exported and written by [`karidns-zone`](karidns-zone.md); the other programs it runs are `karicheck` (a version check) and, on SQLite3, `karictl` (the reload, with a restricted control key). It never talks to a DNS server in any other way.
 
 It is an ordinary process (no Capsicum): it runs as its own user, `karidns-webadmin`. Every request is hostile input: the validators refuse what they do not know, every SQL value is a bound parameter, a name that reaches a program's argument list was checked first, and no shell is involved.
 
@@ -71,6 +71,19 @@ SQLite3: apply `db/karidns_ext.sqlite3.sql` and `db/karidns_audit.sqlite3.sql` t
 
 The server listens on `127.0.0.1` or a UNIX socket (mode 0660). TLS is the job of a reverse proxy in front (relayd, nginx): set `trusted-proxy` to its address so that the rate limits and the log see the real client, `public-origin` to the https origin a browser uses, and let the proxy forward `/api/` only. A non-loopback `listen` needs `tls-cert` and `tls-key` (TLS 1.2 or newer); the configuration check refuses plain HTTP anywhere but on loopback.
 
+**Reloading with SQLite3.** A SQLite3 database has no reload requests, so the API asks the server over the control channel, with a key that can do **nothing but `reload-zone`** (it may reload one named zone and read the status; a full-power key must never sit in the web tier):
+
+```text
+# karidns.conf
+key "webadmin" { algorithm hmac-sha256; secret "..."; };            # a secret of your own: karictl tsig-keygen
+control-channel { socket "/var/run/karidns/control.sock"; keys { "webadmin" read-only yes allow-commands { reload-zone; }; }; ... };
+# /usr/local/etc/karidns/webadmin-karictl.conf (owner karidns-webadmin, mode 0600); karictl-config points here
+socket "/var/run/karidns/control.sock";
+key "karictl" { algorithm hmac-sha256; secret "..."; };            # the same secret
+```
+
+The control socket must be reachable by the service user, so the API runs on the host of the DNS server (it must anyway: the SQLite3 file is local). PostgreSQL needs none of this: the reload is a row in `karidns_reload_requests`.
+
 Back up the auth file (SQLite3) or the `karidns_auth` schema (PostgreSQL) with the zone data, and keep the **TOTP key file** with it: without that key the TOTP secrets in the database cannot be read and every TOTP user must enrol again.
 
 ## CONFIGURATION FILE
@@ -87,9 +100,9 @@ Lines are `key = value`; `#` starts a comment; a value may be in double quotes; 
 | `api-conninfo-file`, `check-conninfo-file` | | PostgreSQL: the connection files of the API role and of the check role (both required) |
 | `sqlite-file`, `auth-file` | | SQLite3: the zone file and the auth file (both required) |
 | `karidns-zone`, `karicheck`, `karictl` | `/usr/local/bin/...` | the programs |
-| `karictl-config` | | the restricted control key for reloads on SQLite3 (later steps) |
-| `workers` | min(4, CPUs) | the child process pool (later steps) |
-| `reload-after-change` | no | request a reload after every change set (later steps) |
+| `karictl-config` | | SQLite3: the `karictl` configuration (mode 0600, owned by the service user) of a **restricted control key**, `read-only yes` with `allow-commands { reload-zone; }` in the control channel of `karidns.conf` ([`karidns(8)`](karidns.md), "Restricted control keys"): the API reloads one named zone with it, nothing else. Without it a SQLite3 deployment cannot reload from the API |
+| `workers` | min(4, CPUs) | the pool of tool runs (`karidns-zone`, `karictl`): at most this many at a time, 64 more may wait, then 503 |
+| `reload-after-change` | no | the default of `reload` in a change set, an import and a zone deletion. SQLite3 needs `karictl-config` for it |
 | `require-totp` | `global` | who must use TOTP: `global` (every global master), `all`, `none` |
 | `session-idle`, `session-max` | `30m`, `12h` | idle time and absolute life of a session |
 | `totp-key-file` | `/var/db/karidns-webadmin/totp.key` | the AES key of the TOTP secrets (64 hex digits, mode 0600), made at the first start |
@@ -133,11 +146,13 @@ A **policy** (`rr_policy`) lists the record types allowed (never the DNSSEC type
 
 **Seeing.** A zone without a grant does not exist for a principal: 404, not 403, whether it exists or not. A domain master reads the whole zone; a subdomain master reads the names under its suffix and the apex SOA and NS.
 
+**Writing.** A change set is allowed when **one grant** allows every RRset of it: the old records and the new ones (a record whose TTL is outside the policy cannot be removed either), the type, the wildcard / delegation / DNAME / apex rules, the TTL range and `max_rr` (the records in the scope of the grant after the change). Only a global master writes an SOA record; the serial of a zone is raised by the API for everybody. Creating and deleting zones, zone attributes and metadata are for global masters; the import is for the masters of the whole zone; DNSSEC key requests for domain and global masters. The rules are applied twice: by the API on the diff `karidns-zone` found (and, before the tools run, on the request itself), and on PostgreSQL by row level security on every row written.
+
 **No escalation.** Everyone reads principals, groups, memberships and policies (their names are needed to grant); only global masters write them. A **domain master** may make and remove grants of its own zone for any principal, as domain master or subdomain master, **with a policy no wider than its own** (types a subset, no flag it has not, TTL range inside, `max_rr` not higher, no limit counts as widest); a subdomain master grants nothing; a global master anything. A grant is seen by its holder, by the members of a holding group and by the domain master of its zone. On PostgreSQL a trigger of the database checks the same rule again.
 
 ## CONVENTIONS
 
-Base path `/api/v1`; JSON (`application/json; charset=utf-8`), UTF-8, every document has `"api": 1`. Names are absolute with the final dot (`www.example.test.`), canonical (lower case); in a request the dot may be left out. Zone names are plain LDH names (letters, digits, `-`, `_`); an owner name may also hold `*` as a whole label and `/`; no backslash escapes, no non-ASCII (use the A-label). Unknown fields in a request are refused (400, with a JSON pointer), so a typo is not ignored. Request bodies are limited to 1 MiB (the login to 16 KiB); headers to 16 KiB; a request has 30 seconds. Responses carry `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'self'; frame-ancestors 'none'` and an `X-Request-Id`.
+Base path `/api/v1`; JSON (`application/json; charset=utf-8`), UTF-8, every document has `"api": 1`. Names are absolute with the final dot (`www.example.test.`), canonical (lower case); in a request the dot may be left out. Zone names are plain LDH names (letters, digits, `-`, `_`); an owner name may also hold `*` as a whole label and `/`; no backslash escapes, no non-ASCII (use the A-label). Unknown fields in a request are refused (400, with a JSON pointer), so a typo is not ignored. Request bodies are limited to 1 MiB (the login to 16 KiB; an import and the creation of a zone from a text to 16 MiB); headers to 16 KiB; the body of a request has 30 seconds to arrive (408 after that; an import 300 seconds). Responses carry `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'self'; frame-ancestors 'none'` and an `X-Request-Id`.
 
 **Lists** take `?limit=` (1 to 500, default 100) and `?cursor=` (opaque, from `next_cursor` of the previous page; `null` at the end). A page of the audit log may hold fewer rows than `limit` when the principal may not see some; follow `next_cursor`.
 
@@ -147,13 +162,14 @@ Base path `/api/v1`; JSON (`application/json; charset=utf-8`), UTF-8, every docu
 |---|---|
 | 400 | `bad-request`, `malformed-json`, `both-credentials`, `weak-password`, `no-session` |
 | 401 | `unauthenticated`, `invalid-credentials`, `totp-required` (at login: a code is needed) |
-| 403 | `forbidden` (the role may not), `escalation` (grant wider than the granter's), `csrf`, `totp-required` (session without the second step), `totp-required-by-policy`, `read-only-token`, `session-only`, `wrong-password`, `wrong-code` |
+| 403 | `forbidden` (the role may not; a change that no single grant allows), `max-rr`, `escalation` (grant wider than the granter's), `csrf`, `totp-required` (session without the second step), `totp-required-by-policy`, `read-only-token`, `session-only`, `wrong-password`, `wrong-code` |
 | 404 | `not-found` (also: no grant on the zone) |
 | 405, 413, 415 | `method-not-allowed`, `too-large`, `unsupported-media-type` |
-| 409 | `exists`, `in-use`, `refused` (a rule of the schema: a cycle of groups, ...), `self`, `not-a-group`, `not-a-user`, `no-password`, `totp-enabled`, `totp-disabled`, `no-enrolment` |
-| 422 | `constraint` |
+| 408 | `request-timeout` (the body did not arrive in time) |
+| 409 | `exists`, `in-use`, `refused` (a rule of the schema: a cycle of groups, ...), `self`, `not-a-group`, `not-a-user`, `no-password`, `totp-enabled`, `totp-disabled`, `no-enrolment`; the write side: `changed`, `precondition-failed`, `zone-not-editable`, `presigned-zone`, `tagged-rrset`, `signer-managed`, `signer-zones`, `unsupported`, `not-a-catalog`, `request-pending`, `already-signed`, `not-signed` |
+| 422 | `constraint`, `zone-checks-failed`, `refused` |
 | 429 | `rate-limited` (`Retry-After`) |
-| 503 | `busy` (`Retry-After`), `database-unavailable` |
+| 503 | `busy` (`Retry-After`), `database-unavailable`, `reload-failed` |
 | 500 | `internal` |
 
 ## ENDPOINTS
@@ -207,12 +223,59 @@ All paths are relative to `/api/v1`. "Global" means a global master.
 | `GET /datasets/{ds}/zones/{zone}/rrsets` | `?name=`, `?type=`, `?limit=`, `?cursor=`: `{rrsets:[{name, type, ttl, records:[{content, disabled, ttl}]}]}` in (name, type) byte order, **at most `limit` RRsets** a page (the records of an RRset are never split). `ttl` is the lowest of the records (RFC 2181 section 5.2). `content` is the stored content; MX and SRV carry their priority in front, as in a zone file; names inside are as stored (PowerDNS stores them without the final dot) |
 | `GET /datasets/{ds}/zones/{zone}/export` | `text/plain`: the zone as a zone file in canonical order, as `karidns-zone export` writes it (what the server serves). For the masters of the whole zone (global, domain master); 403 for a subdomain master |
 
+### Changing zones
+
+| | |
+|---|---|
+| `PATCH /datasets/{ds}/zones/{zone}/rrsets` | a **change set**: RRsets replaced or deleted, one zone, one request (below). Any principal whose grants allow every RRset of it |
+| `POST /datasets/{ds}/zones` | global. Makes a zone: `{name, type?, soa:{mname, rname, serial?, refresh?, retry?, expire?, minimum?, ttl?}, nameservers[], ns_ttl?, rrsets[]?, comment?, dry_run?, reload?}` or `{name, type?, zone_text, ...}`. 201 with the document of a change set and `Location`. The serial is the day, `YYYYMMDD00`, unless given |
+| `PATCH /datasets/{ds}/zones/{zone}` | global. `{catalog?, views?}`: the PRODUCER zone whose catalog the zone is in (`null`: none), the views of the dataset (`dataset` sections of the configuration) the zone is in |
+| `DELETE /datasets/{ds}/zones/{zone}` | global. `{confirm: "<the zone's name>", reload?}`: the zone, its records, metadata, keys, versions and the grants on it |
+| `POST /datasets/{ds}/zones/{zone}/import` | a domain master or global master. `{zone_text, mode?: replace\|merge, comment?, dry_run?, reload?}` (below) |
+| `POST /datasets/{ds}/zones/{zone}/reload` | the "update" button: any grant on the zone. PostgreSQL: a row in `karidns_reload_requests`, every server on the database reloads the zone. SQLite3: `karictl reload` with the restricted key |
+| `POST /datasets/{ds}/reload` | global, PostgreSQL: a reload request for every zone of the dataset. 409 `signer-zones` while a zone of the dataset is kept signed by the signer (a reload of every zone would publish its unsigned changes); 409 `unsupported` on SQLite3 |
+| `GET /datasets/{ds}/zones/{zone}/metadata` | `{metadata:[{kind, content[]}], writable[]}`: every kind the zone has; `writable` lists the kinds the API writes |
+| `PUT /datasets/{ds}/zones/{zone}/metadata/{kind}`, `DELETE ...` | global. `{content: [..]}` replaces the values of the kind (an empty list, or DELETE, removes it). Only `ALLOW-AXFR-FROM`, `ALLOW-DNSUPDATE-FROM`, `TSIG-ALLOW-AXFR`, `TSIG-ALLOW-DNSUPDATE`, `ALSO-NOTIFY`, `X-KARIDNS-PROFILE`, `X-KARIDNS-ECS-TRUSTED-RESOLVERS`, each value checked by the rules of the loader (an address or prefix, a key name, ...). Never `PRESIGNED`, `NSEC3PARAM`, `X-KARIDNS-SIGNER` or `X-KARIDNS-FORMAT` (the signer's and the importer's) |
+| `GET /datasets/{ds}/zones/{zone}/dnssec` | for the masters of the whole zone. `{dnssec:{signed, signer, presigned, nsec3param, signer_state, waiting_for_signer, serial, keys[], ds[], cryptokeys[], requests[]}}`. `keys` are the DNSKEY records with their key tags, `ds` the DS records to put in the parent zone (digest types 2 and 4, RFC 4034 section 5.1, RFC 4509, RFC 6605) for the keys with the SEP bit, computed from the public keys in the zone (`cryptokeys.content` is never read) |
+| `POST /datasets/{ds}/zones/{zone}/dnssec/requests` | a domain master or global master. `{kind: enable\|add, algorithm? (8, 10, 13, 14, 15, 16; default 13), bits? (RSA), key_type? (csk\|ksk\|zsk; default csk), nsec? (nsec3\|nsec; enable)}`: asks `karidns-signer` to start signing the zone, or for one more key. 201 with the request (`state: pending`; the signer answers it). One request per zone at a time |
+
 ### Audit and servers
 
 | | |
 |---|---|
 | `GET /audit` | newest first. `?zone=`, `?principal=ID`, `?change_set=`, `?table=`, `?since=`, `?until=` (ISO 8601). `{audit:[{id, at, source, principal_id, principal, db_role, change_set, schema, table, op (I U D), zone, row_id, before, after}]}`. A global master reads all; a domain master the rows of its zones (data rows and the grants made on them); others none. Secrets are `"<redacted>"` in the log itself. `source` is `audit` (PostgreSQL), or `zone` / `auth` (SQLite3: the two files) |
 | `GET /servers` | PostgreSQL: per dataset and server the generation applied, whether every zone loaded, and the zones that did not (lines filtered to the zones the principal has a grant on). SQLite3: empty, with a note (ask the server with `karictl status`) |
+
+## CHANGE SETS
+
+`PATCH /datasets/{ds}/zones/{zone}/rrsets` changes the RRsets of one zone in one request and one transaction:
+
+```json
+{ "comment": "move www", "dry_run": false, "reload": false,
+  "rrsets": [
+    { "name": "www.example.test.", "type": "A", "changetype": "REPLACE", "ttl": 300,
+      "records": [ { "content": "192.0.2.10" }, { "content": "192.0.2.11" } ],
+      "expect": [ { "ttl": 3600, "content": "192.0.2.1" } ] },
+    { "name": "old.example.test.", "type": "TXT", "changetype": "DELETE" } ] }
+```
+
+`REPLACE` puts the records in the place of the RRset (all of them, or it is new); `DELETE` removes the RRset. At most 1000 RRsets, 1000 records an RRset, an RRset once. A name is in the zone (at a label boundary); a type is one `karidns-zone --types-list` names (never the DNSSEC types: the signer's); the text of a record has no control character, no `;` or parentheses outside quotes and does not begin with `$` (the zone checks decide what it means). **`expect`** (optional) is the RRset as the client saw it, the records with their TTLs; an empty list means "must not exist". Without a match the answer is 409 `precondition-failed` with the RRset as it is (`errors[].current`) and nothing is written. The comparison is made with the canonical form `karidns-zone` writes (`GET .../rrsets` shows the content as stored, which for names and for MX / SRV can read differently: take the content from the `diff` of a dry run if in doubt).
+
+**What happens.** (1) The request is checked against the principal's grants (a refusal names the RRset: `errors[].pointer`, `/rrsets/3`); it cannot be used to find out what an RRset outside the scope holds. (2) The **check run**: `karidns-zone apply --dry-run` in a trusted session (PostgreSQL: the check role; it sees the whole zone, which a subdomain master's session does not) applies the change in a transaction, runs the zone checks of `karicheck zone` and reads the zone back through the loader's reader, and rolls back; the answer is the **diff** (each RRset that changes, with its records before and after, in canonical form) and the **generation** of the zone. (3) **One grant must allow the whole change set**: the types, TTLs, wildcard / delegation / DNAME / apex rules of its policy for every RRset of the diff, for the records removed as well as the records written (the policies of the database check each row again), and `max_rr` (the records in the scope of the grant after the change: the zone for a domain master, the names at or below its suffix for a subdomain master). Two grants that each cover half are not enough. (4) The **commit run**: `karidns-zone apply` as the API's role, against the generation of the check run, for the principal and a new change set id (a UUID), with the narrow read-back (`--readback changed`). The SOA serial is raised by one when the change set wrote no SOA of its own (RFC 1982 section 3.1). The RRsets of the change set that already equal the zone's are not written again. (5) If the zone changed in between (any writer, the signer included: the generation is a counter of the owner's triggers) the commit run writes nothing and exits with 3: the API starts again from (2), three rounds at most, with a short random pause, and then answers 409 `changed`. (6) The reload.
+
+**Answer** (200): `{change_set, committed, changed, version, generation:{before, after}, serial:{before, after}, records:{before, after}, diff:[{name, type, change: add|replace|delete, before:[{ttl, content}]|null, after:[...]|null}], messages:[{code, severity, text, pointer?}], reload}`. A change set that changes nothing is `committed: false` and writes nothing (no version, no new serial). `reload` is `not requested`, `requested`, `waiting for the signer` or `failed: ...` (the change is in the database; the server serves the old version until it is reloaded).
+
+**Dry run** (`dry_run: true`): the answer after (3): `{dry_run: true, allowed, diff, version (the number it would have), generation, serial, messages}`; when no grant allows it, `allowed: false` and `denied: {text, pointer}` instead of an error (the diff of a change that is not allowed is not shown).
+
+**Errors.** 400 for a request that is not well formed (with the JSON pointer); 403 `forbidden` (names the first RRset that no grant allows, or says that no single grant allows them all) and `max-rr`; 404 for a zone the principal has no grant on; 409 `zone-not-editable` (a SLAVE, CONSUMER or PRODUCER zone), `presigned-zone` (signed elsewhere: an edit would publish records without valid signatures; sign elsewhere and import with `karidns-zone`), `tagged-rrset` (an RRset with location / ECS tags or tinydns attributes is edited with `karidns-zone`, not here), `precondition-failed`, `changed`; 422 `zone-checks-failed` with the messages of the zone checks and their codes ([`karicheck(1)`](karicheck.md)), each pointing at the record that caused it; 503 `busy` (the zone is locked by another writer, or the pool is full). A 500 says nothing but the request id; the log says what, and names a refusal by row level security as the bug it is.
+
+**Reload.** Explicit by default: `reload: true` in the request (or `reload-after-change = yes`) asks for it, or the "update" button (`POST .../reload`). PostgreSQL: the commit run adds the row to `karidns_reload_requests` in its own transaction (every server reloads the zone). SQLite3: `karictl reload <zone>` (once per view the zone is in) with the key of `karictl-config`. **A zone the signer keeps signed (`X-KARIDNS-SIGNER`) is never reloaded by the API**: the loader reloads it when the signer has signed the change and asks (the zone info says `waiting_for_signer` until then); the button answers 409 `signer-managed`.
+
+**Import.** `POST .../import {zone_text}` takes a zone file (BIND format; the plain records only: no DNSSEC records, location / ECS tags or tinydns attributes; `$INCLUDE` and `$GENERATE` are refused) and makes the zone's RRsets the text's: with `mode: "replace"` (the default) the RRsets the text does not have are deleted (not the apex SOA, nor the DNSSEC records of a signer zone), with `merge` they stay. An apex SOA that differs from the zone's in the serial only is left alone and the serial is raised as for any change set. It is a change set like the others (check run, one grant for the whole diff, commit run, version of kind `import`), for the masters of the whole zone, not for a subdomain master; a zone that has any RRset with tags is not imported into. Creating a zone from a text works the same way (`POST .../zones {name, zone_text}`).
+
+**Deleting a zone** takes the rows with it; on SQLite3 the API deletes the child rows itself (the PowerDNS tables have no foreign keys) and the grants of the zone in the auth file; on PostgreSQL the foreign keys and a trigger do. The audit log names the principal and the change set.
+
+**Cost** (pc200, a FreeBSD jail on a shared host; the API on the same host as the database; median of 3 to 5 requests; `tests/run_webadmin_write_test.sh` and `..._write_pg_test.sh` print them): a change set of one RRset costs two runs of `karidns-zone`, each of which reads the zone. SQLite3: a zone of about 15 records, 11 to 13 ms for a dry run and 20 to 25 ms for the check and the commit together; a zone of 20,000 records, 93 to 96 ms and 123 to 125 ms (a subdomain master: the same). PostgreSQL: 30 ms and 63 ms; 20,000 records, 127 to 134 ms and 440 to 674 ms (a subdomain master: 446 ms). A page of 500 RRsets of the big zone: 20 ms (SQLite3), 240 to 283 ms (PostgreSQL, row level security). The reload and the loader's work come on top.
 
 ## SECURITY
 
@@ -221,7 +284,8 @@ All paths are relative to `/api/v1`. "Global" means a global master.
 - **Output**: JSON (and the export as `text/plain` with `nosniff` and `Content-Disposition: attachment`); a front end must escape record data in the DOM.
 - **SQLite3**: anyone who can write the auth file or run SQL on the zone file bypasses every rule here. Run the service as its own user, keep the files 0600 (auth file) and the zone file in a group the loader is in, and treat the host as the trust boundary.
 - **PostgreSQL**: `karidns.principal` is a setting any session can make; the API is trusted to set it to the logged-in user. Row level security catches mistakes in the API's statements, not a compromised API process.
-- Expired sessions: on SQLite3 the service deletes them at the start and every hour; on PostgreSQL the API role cannot see other users' rows, so a user's expired sessions are deleted at its next login, and `DELETE FROM karidns_auth.sessions WHERE expires_at < now()` as the owner (cron) cleans the rest.
+- Expired sessions: the service deletes them at the start and every hour. SQLite3: all of them. PostgreSQL: the API role sees the rows of its own principal only, so a SECURITY DEFINER function does it (`karidns_auth.sweep_expired()`, `EXECUTE` granted to the API role by `db/karidns_api_role.pgsql.sql`; it deletes the sessions whose absolute time is over, of every principal and nothing else); a user's own expired sessions are also deleted at its next login.
+- **Zone texts and change sets are hostile input.** The text of a record is checked for the characters that could end its line or hide the rest of it before it is written to the change file, and `karidns-zone` checks the same again (a mistake in the API is not a hole); a zone text goes to the parser of the server with `$INCLUDE` refused (no file is read) and `$GENERATE` refused by the API (it could make more records than a host has memory for). The tools run with a timeout, without a shell, in a pool of `workers`.
 
 ## FILES
 
@@ -244,6 +308,16 @@ curl -s -b jar -H "X-KariDNS-CSRF: $CSRF" -H 'Origin: https://dns.example.test' 
      -d '{"kind":"group","name":"customers"}' https://dns.example.test/api/v1/principals
 # automation: a token
 curl -s -H "Authorization: Bearer $TOKEN" https://dns.example.test/api/v1/datasets/main/zones
+# a change set with a token: look first (dry run), then do it and ask for the reload
+curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -X PATCH \
+     -d '{"dry_run":true,"rrsets":[{"name":"www.example.test.","type":"A","changetype":"REPLACE","ttl":300,"records":[{"content":"192.0.2.10"}]}]}' \
+     https://dns.example.test/api/v1/datasets/main/zones/example.test./rrsets
+curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -X PATCH \
+     -d '{"reload":true,"comment":"move www","rrsets":[{"name":"www.example.test.","type":"A","changetype":"REPLACE","ttl":300,"records":[{"content":"192.0.2.10"}]}]}' \
+     https://dns.example.test/api/v1/datasets/main/zones/example.test./rrsets
+# the update button, and the DS records of a signed zone
+curl -s -H "Authorization: Bearer $TOKEN" -X POST https://dns.example.test/api/v1/datasets/main/zones/example.test./reload
+curl -s -H "Authorization: Bearer $TOKEN" https://dns.example.test/api/v1/datasets/main/zones/example.test./dnssec
 ```
 
 ## SEE ALSO

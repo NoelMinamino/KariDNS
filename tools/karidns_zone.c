@@ -101,6 +101,7 @@ static void kz_usage(FILE *fp) {
         "  karidns-zone export [--signer] [options] <zone> [<file>]\n"
         "  karidns-zone export --all --dir <dir> [options]\n"
         "  karidns-zone apply [options] --changes <file|-> <zone>\n"
+        "  karidns-zone apply [options] --zone-file <file|-> [--delete-others] <zone>\n"
         "  karidns-zone --types-list [--json]\n"
         "  karidns-zone --version | -h | --help\n"
         "\n"
@@ -152,7 +153,10 @@ static void kz_usage(FILE *fp) {
         "apply options (the API of the WebAdmin and operators; docs/karidns-zone.md, \"apply\" and \"The change file\"):\n"
         "      --changes FILE      the change file (- = standard input): lines `rr <owner> <ttl> <type> <rdata>` replace the RRset (owner, type), lines\n"
         "                          `delete <owner> <type>` delete it; owners are absolute names in the zone\n"
-        "      --create            the zone must not exist and is made (--type NATIVE|MASTER); the rr lines are the whole zone\n"
+        "      --zone-file FILE    instead of --changes: a zone file (BIND format, - = standard input; no $INCLUDE; plain records only): each of its RRsets\n"
+        "                          replaces that RRset of the zone; an apex SOA that differs from the zone's in the serial only is left alone\n"
+        "      --delete-others     with --zone-file: also delete the RRsets the file does not have (not the apex SOA, not the DNSSEC records of a signer zone)\n"
+        "      --create            the zone must not exist and is made (--type NATIVE|MASTER); the rr lines (or the zone file) are the whole zone\n"
         "      --expect-generation N  fail with exit status 3 unless the zone has this generation (karidns_zone_state); the dry run prints the generation\n"
         "  -n, --dry-run           everything but the commit: the diff (the RRsets with their records before and after) and the version it would write\n"
         "      --serial grow|increment|keep  as for import, but the default is increment: a change that wrote no SOA raises the serial by one\n"
@@ -162,7 +166,7 @@ static void kz_usage(FILE *fp) {
         "      --change-set ID     the id of the change set (1 to 64 of letters, digits, '.', '_', ':' and '-') in the audit log and the version row\n"
         "      --readback zone|changed  zone (default): read the whole zone back through the loader's reader; changed: only the rows written (the commit run of\n"
         "                          the API, after a check run at the same generation)\n"
-        "      --version-kind K    edit (default), template or rollback: the kind of the version row; --rollback-of N names the version a rollback restores\n"
+        "      --version-kind K    edit (default), template, import or rollback: the kind of the version row; --rollback-of N names the version a rollback restores\n"
         "      --comment TEXT      the comment of the version row (at most 1024 octets)\n"
         "      --view, --reload, --strict, --verbose, --audit  as for import\n"
         "\n"
@@ -184,6 +188,7 @@ static void kz_usage(FILE *fp) {
         "  karidns-zone export --all --dir /var/backups/zones --sqlite3 /var/db/karidns/pdns.sqlite3\n"
         "  karidns-zone apply --dry-run --json --sqlite3 /var/db/karidns/pdns.sqlite3 --changes - example.test < changes.txt\n"
         "  karidns-zone apply -c /usr/local/etc/karidns/karidns.conf --expect-generation 17 --changes changes.txt example.test\n"
+        "  karidns-zone apply --dry-run --sqlite3 /var/db/karidns/pdns.sqlite3 --zone-file example.test.zone --delete-others example.test\n"
         "  karidns-zone --types-list\n");
 }
 
@@ -205,16 +210,16 @@ static int kz_usage_error(bool json, dns_diag_code_t code, const char *fmt, ...)
 /* ------------------------------------------------------------------------------------------------------------- */
 
 typedef struct {
-    bool json, verbose, dry_run, strict, reload, all, force, no_config, help, version, signer, create, types_list;
+    bool json, verbose, dry_run, strict, reload, all, force, no_config, help, version, signer, create, types_list, delete_others;
     const char *conf, *view, *sqlite, *conninfo, *schema, *mode, *types, *serial, *type, *format, *dir, *audit;
-    const char *changes, *expect, *principal, *pname, *change_set, *readback, *vkind, *comment, *rollback_of;      /* apply */
+    const char *changes, *expect, *principal, *pname, *change_set, *readback, *vkind, *comment, *rollback_of, *zone_file;      /* apply */
     int nargs;
     char **args;
     char perr[100];                         /* why the options could not be read */
 } kz_args_t;
 
 enum { KO_NOCONFIG = 256, KO_VIEW, KO_SQLITE, KO_CONNINFO, KO_SCHEMA, KO_ALL, KO_MODE, KO_TYPES, KO_SERIAL, KO_STRICT, KO_RELOAD, KO_TYPE, KO_FORMAT, KO_VERBOSE, KO_DIR,
-       KO_FORCE, KO_AUDIT, KO_SIGNER, KO_CHANGES, KO_CREATE, KO_EXPECT, KO_PRINCIPAL, KO_PNAME, KO_CHANGESET, KO_READBACK, KO_VKIND, KO_COMMENT, KO_ROLLBACKOF, KO_TYPESLIST };
+       KO_FORCE, KO_AUDIT, KO_SIGNER, KO_CHANGES, KO_CREATE, KO_EXPECT, KO_PRINCIPAL, KO_PNAME, KO_CHANGESET, KO_READBACK, KO_VKIND, KO_COMMENT, KO_ROLLBACKOF, KO_TYPESLIST, KO_ZONEFILE, KO_DELOTHERS };
 
 static const struct option k_long[] = {
     { "config", required_argument, NULL, 'c' }, { "no-config", no_argument, NULL, KO_NOCONFIG }, { "view", required_argument, NULL, KO_VIEW },
@@ -228,6 +233,7 @@ static const struct option k_long[] = {
     { "principal", required_argument, NULL, KO_PRINCIPAL }, { "principal-name", required_argument, NULL, KO_PNAME }, { "change-set", required_argument, NULL, KO_CHANGESET },
     { "readback", required_argument, NULL, KO_READBACK }, { "version-kind", required_argument, NULL, KO_VKIND }, { "comment", required_argument, NULL, KO_COMMENT },
     { "rollback-of", required_argument, NULL, KO_ROLLBACKOF }, { "types-list", no_argument, NULL, KO_TYPESLIST },
+    { "zone-file", required_argument, NULL, KO_ZONEFILE }, { "delete-others", no_argument, NULL, KO_DELOTHERS },
     { "help", no_argument, NULL, 'h' }, { "version", no_argument, NULL, 'v' }, { NULL, 0, NULL, 0 }
 };
 
@@ -289,6 +295,8 @@ static int kz_parse(int argc, char **argv, const char **cmd, kz_args_t *a) {
         case KO_COMMENT: a->comment = optarg; break;
         case KO_ROLLBACKOF: a->rollback_of = optarg; break;
         case KO_TYPESLIST: a->types_list = true; break;
+        case KO_ZONEFILE: a->zone_file = optarg; break;
+        case KO_DELOTHERS: a->delete_others = true; break;
         case ':': snprintf(a->perr, sizeof(a->perr), "the option %.60s needs a value", argv[optind - 1]); return 2;
         default: snprintf(a->perr, sizeof(a->perr), "unknown option %.60s", argv[optind - 1]); return 2;
         }
@@ -838,18 +846,29 @@ static int kz_cmd_apply(const kz_args_t *a, kz_ctx_t *x) {
         zone[zl++] = '.';
         zone[zl] = '\0';
     }
-    const char *shown = strcmp(a->changes, "-") == 0 ? "standard input" : a->changes;
+    const char *source = a->zone_file ? a->zone_file : a->changes;
+    const char *shown = strcmp(source, "-") == 0 ? "standard input" : source;
     size_t len = 0;
-    char *text = kz_read_all(a->changes, &len);
+    char *text = kz_read_all(source, &len);
     if (!text) return 1;
     zc_changes_t ch;
+    memset(&ch, 0, sizeof(ch));
     char err[400];
-    if (!zc_parse(text, len, zone, &ch, err, sizeof(err))) {
-        dns_diag(DIAG_ERROR, DC_DB_APPLY_CHANGES, shown, 0, "%s: %s\n", shown, err);
+    if (a->zone_file) {                                     /* the zone text itself is handed to the importer (a NUL in it would end it early) */
+        if (strlen(text) != len) {
+            dns_diag(DIAG_ERROR, DC_DB_APPLY_CHANGES, shown, 0, "%s: the zone file has a NUL byte\n", shown);
+            free(text);
+            return 1;
+        }
+    } else {
+        if (!zc_parse(text, len, zone, &ch, err, sizeof(err))) {
+            dns_diag(DIAG_ERROR, DC_DB_APPLY_CHANGES, shown, 0, "%s: %s\n", shown, err);
+            free(text);
+            return 1;
+        }
         free(text);
-        return 1;
+        text = NULL;
     }
-    free(text);
     zi_opts_t o;
     kz_fill_opts(a, x, &o);
     o.serial = a->serial && kz_ieq(a->serial, "grow") ? ZI_SERIAL_GROW : a->serial && kz_ieq(a->serial, "keep") ? ZI_SERIAL_KEEP : ZI_SERIAL_INCREMENT;
@@ -858,12 +877,16 @@ static int kz_cmd_apply(const kz_args_t *a, kz_ctx_t *x) {
     zi_t *zt = zi_open(&o);
     if (!zt) {
         zc_free(&ch);
+        free(text);
         return 1;
     }
     zi_apply_in_t in;
     memset(&in, 0, sizeof(in));
     in.zone = zone;
-    in.changes = &ch;
+    in.changes = a->zone_file ? NULL : &ch;
+    in.zone_text = a->zone_file ? text : NULL;
+    in.zone_text_len = len;
+    in.delete_others = a->delete_others;
     in.create = a->create;
     in.have_expect = a->expect != NULL;
     if (a->expect) in.expect_generation = strtoull(a->expect, NULL, 10);
@@ -890,6 +913,7 @@ static int kz_cmd_apply(const kz_args_t *a, kz_ctx_t *x) {
     zi_result_free(&res);
     zi_close(zt);
     zc_free(&ch);
+    free(text);
     return rc == ZI_OK ? 0 : rc == ZI_CHANGED ? 3 : rc == ZI_BUSY ? 4 : 1;
 }
 
@@ -1178,7 +1202,7 @@ static int kz_cmd_export(const kz_args_t *a, kz_ctx_t *x) {
 
 /* an option that only apply takes */
 static bool kz_apply_only(const kz_args_t *a) {
-    return a->changes || a->create || a->expect || a->principal || a->pname || a->change_set || a->readback || a->vkind || a->comment || a->rollback_of;
+    return a->changes || a->zone_file || a->delete_others || a->create || a->expect || a->principal || a->pname || a->change_set || a->readback || a->vkind || a->comment || a->rollback_of;
 }
 
 static bool kz_all_digits(const char *s, size_t min, size_t max) {
@@ -1199,7 +1223,9 @@ static int kz_check_apply_args(const kz_args_t *a) {
     if (a->all || a->signer || a->mode || a->types || a->dir || a->force || a->format)
         return kz_usage_error(j, DC_USAGE_OPTION, "--all, --signer, --mode, --types, --format, --dir and --force are not options of apply");
     if (a->nargs != 1) return kz_usage_error(j, DC_USAGE_ARGS, "apply takes a zone name (and --changes FILE)");
-    if (!a->changes) return kz_usage_error(j, DC_USAGE_ARGS, "apply needs --changes FILE (- = standard input)");
+    if (!a->changes && !a->zone_file) return kz_usage_error(j, DC_USAGE_ARGS, "apply needs --changes FILE or --zone-file FILE (- = standard input)");
+    if (a->changes && a->zone_file) return kz_usage_error(j, DC_USAGE_OPTION, "--changes and --zone-file exclude each other");
+    if (a->delete_others && (!a->zone_file || a->create)) return kz_usage_error(j, DC_USAGE_OPTION, "--delete-others goes with --zone-file, and not with --create (a new zone has nothing to delete)");
     if (a->serial && !kz_ieq(a->serial, "grow") && !kz_ieq(a->serial, "increment") && !kz_ieq(a->serial, "keep")) return kz_usage_error(j, DC_USAGE_OPTION, "--serial must be grow, increment or keep");
     if (a->type && !a->create) return kz_usage_error(j, DC_USAGE_OPTION, "--type is for --create (an existing zone keeps its type)");
     if (a->type && !kz_ieq(a->type, "NATIVE") && !kz_ieq(a->type, "MASTER")) return kz_usage_error(j, DC_USAGE_OPTION, "--type must be NATIVE or MASTER");
@@ -1217,8 +1243,8 @@ static int kz_check_apply_args(const kz_args_t *a) {
         if (!good) return kz_usage_error(j, DC_USAGE_OPTION, "--change-set takes 1 to 64 of letters, digits, '.', '_', ':' and '-'");
     }
     if (a->readback && !kz_ieq(a->readback, "zone") && !kz_ieq(a->readback, "changed")) return kz_usage_error(j, DC_USAGE_OPTION, "--readback must be zone or changed");
-    if (a->vkind && !kz_ieq(a->vkind, "edit") && !kz_ieq(a->vkind, "template") && !kz_ieq(a->vkind, "rollback"))
-        return kz_usage_error(j, DC_USAGE_OPTION, "--version-kind must be edit, template or rollback");
+    if (a->vkind && !kz_ieq(a->vkind, "edit") && !kz_ieq(a->vkind, "template") && !kz_ieq(a->vkind, "import") && !kz_ieq(a->vkind, "rollback"))
+        return kz_usage_error(j, DC_USAGE_OPTION, "--version-kind must be edit, template, import or rollback");
     if (a->create && a->vkind) return kz_usage_error(j, DC_USAGE_OPTION, "a zone made with --create has a version of kind create: no --version-kind");
     if ((a->vkind && kz_ieq(a->vkind, "rollback")) != (a->rollback_of != NULL)) return kz_usage_error(j, DC_USAGE_OPTION, "--rollback-of names the version of a rollback, and a rollback needs it");
     if (a->rollback_of && (!kz_all_digits(a->rollback_of, 1, 9) || strtoul(a->rollback_of, NULL, 10) < 1)) return kz_usage_error(j, DC_USAGE_OPTION, "--rollback-of takes a version number");

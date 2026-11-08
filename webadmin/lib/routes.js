@@ -4,6 +4,10 @@
 import * as auth from './handlers/auth.js';
 import * as admin from './handlers/admin.js';
 import * as zones from './handlers/zones.js';
+import * as write from './handlers/write.js';
+import { IMPORT_MS } from './http.js';
+
+const ZIP = 16 << 20;                       // a zone text travels in a JSON string: 16 MiB, received within 5 minutes (planning 8.2)
 
 export const ROUTES = [
   { method: 'GET', path: '/health', auth: 'none', handler: zones.health },
@@ -44,6 +48,19 @@ export const ROUTES = [
   { method: 'GET', path: '/datasets/:ds/zones/:zone', handler: zones.zoneGet },
   { method: 'GET', path: '/datasets/:ds/zones/:zone/rrsets', handler: zones.rrsetsList },
   { method: 'GET', path: '/datasets/:ds/zones/:zone/export', handler: zones.zoneExport },
+
+  { method: 'POST', path: '/datasets/:ds/zones', bodyLimit: ZIP, readTimeoutMs: IMPORT_MS, handler: write.zoneCreate },
+  { method: 'PATCH', path: '/datasets/:ds/zones/:zone', handler: write.zonePatch },
+  { method: 'DELETE', path: '/datasets/:ds/zones/:zone', handler: write.zoneDelete },
+  { method: 'PATCH', path: '/datasets/:ds/zones/:zone/rrsets', handler: write.rrsetsPatch },
+  { method: 'POST', path: '/datasets/:ds/zones/:zone/import', bodyLimit: ZIP, readTimeoutMs: IMPORT_MS, handler: write.importZone },
+  { method: 'POST', path: '/datasets/:ds/zones/:zone/reload', handler: write.reloadZone },
+  { method: 'POST', path: '/datasets/:ds/reload', handler: write.reloadAll },
+  { method: 'GET', path: '/datasets/:ds/zones/:zone/metadata', handler: write.metadataList },
+  { method: 'PUT', path: '/datasets/:ds/zones/:zone/metadata/:kind', handler: write.metadataPut },
+  { method: 'DELETE', path: '/datasets/:ds/zones/:zone/metadata/:kind', handler: write.metadataDelete },
+  { method: 'GET', path: '/datasets/:ds/zones/:zone/dnssec', handler: write.dnssecGet },
+  { method: 'POST', path: '/datasets/:ds/zones/:zone/dnssec/requests', handler: write.dnssecRequest },
 
   { method: 'GET', path: '/audit', handler: zones.auditList },
   { method: 'GET', path: '/servers', handler: zones.serversList },

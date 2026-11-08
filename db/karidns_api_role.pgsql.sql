@@ -25,7 +25,7 @@
 --     sequences behind the serial columns.  Nothing on karidns_changes: the change log and the prune of the reload requests are written by the
 --     triggers of the data tables, which run as the owner.  karidns_auth: SELECT, INSERT, UPDATE, DELETE on principals, memberships, rr_policies, grants and
 --     credentials (the only role that reads them); SELECT, INSERT, UPDATE, DELETE on sessions, api_tokens, templates and template_records;
---     SELECT on principal_closure, audit_log and schema_version; EXECUTE on the RLS functions, bump_serial, session_lookup and api_token_lookup.  Data schema, besides:
+--     SELECT on principal_closure, audit_log and schema_version; EXECUTE on the RLS functions, bump_serial, session_lookup, api_token_lookup and sweep_expired.  Data schema, besides:
 --     SELECT on karidns_server_status and karidns_zone_state, SELECT and INSERT on karidns_zone_versions and karidns_zone_version_rrsets (item E).
 --     Nothing else: no TRUNCATE, no write to the audit log, nothing on the key material or karidns_profiles.
 --   * the role's name is added to karidns_auth.audit_restricted_roles (it cannot turn the detail of the audit log off) and karidns_auth.api_roles (the trigger
@@ -107,6 +107,8 @@ SELECT format('GRANT EXECUTE ON FUNCTION %s(), %s(bigint, text) TO %I, karidns_r
 GRANT EXECUTE ON FUNCTION karidns_auth.bump_serial(text, integer) TO :"role";
 -- the lookups of a session by the hash of its cookie and of a token by its id and the hash of its secret (the policies show a principal its own rows only)
 GRANT EXECUTE ON FUNCTION karidns_auth.session_lookup(bytea), karidns_auth.api_token_lookup(bigint, bytea) TO :"role";
+-- the hourly sweep: deletes the expired sessions of every principal (the policy of sessions shows the role its own principal's rows only)
+GRANT EXECUTE ON FUNCTION karidns_auth.sweep_expired() TO :"role";
 
 -- the audit log cannot be switched to summary mode by the role, and the grant trigger applies to it
 INSERT INTO karidns_auth.audit_restricted_roles (role_name) VALUES (:'role') ON CONFLICT DO NOTHING;

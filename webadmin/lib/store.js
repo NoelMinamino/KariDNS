@@ -412,3 +412,128 @@ export async function schemaVersions(tx, schema) {
   const data = await tx.get(`SELECT max(version) AS v FROM ${tx.z(schema)}karidns_schema_version`);
   return { auth: auth?.v ?? null, data: data?.v ?? null };
 }
+
+// ---------------------------------------------------------------------------------------------------------------------------------- writing zones (M3)
+// What a change needs to know of the zone before it runs the tools: its id, type, and whether it is signed (by the signer, or presigned elsewhere).
+export async function zoneFacts(tx, schema, zone) {
+  const Z = tx.z(schema);
+  const r = await tx.get(`SELECT d.id, d.name, d.type, d.catalog, ${META(Z, 'PRESIGNED')} AS presigned, ${META(Z, 'X-KARIDNS-SIGNER')} AS signer
+                            FROM ${Z}domains d WHERE d.name IN ($1, $2)`, zoneNames(zone));
+  return r && { id: r.id, name: noDot(r.name).toLowerCase(), kind: r.type, catalog: r.catalog ?? null, presigned: bool(r.presigned), signer: bool(r.signer) };
+}
+
+// The RRsets (name, type) among `pairs` ([{ name, type }], canonical names, upper-case types) that carry a location / ECS tag or a tinydns attribute (A-18: the API
+// does not edit those).  pairs undefined: whether the zone has any (the answer is then at most one entry).
+export async function taggedRRsets(tx, schema, domainId, pairs) {
+  const Z = tx.z(schema);
+  const q = new Q();
+  const id = q.add(domainId);
+  const w = [`r.domain_id = ${id}`, `(EXISTS (SELECT 1 FROM ${Z}karidns_record_tags t WHERE t.record_id = r.id) OR EXISTS (SELECT 1 FROM ${Z}karidns_record_tinydns t WHERE t.record_id = r.id))`];
+  if (pairs) w.push(q.list(tx, 'r.name', [...new Set(pairs.map((p) => p.name))]));
+  const rows = await tx.all(`SELECT DISTINCT r.name, upper(r.type) AS type FROM ${Z}records r WHERE ${w.join(' AND ')} ORDER BY 1, 2 LIMIT ${pairs ? 100000 : 1}`, q.params);
+  const wanted = pairs && new Set(pairs.map((p) => `${p.name} ${p.type}`));
+  return rows.map((r) => ({ name: r.name.toLowerCase(), type: r.type })).filter((r) => !wanted || wanted.has(`${r.name} ${r.type}`));
+}
+
+// the enabled records at or below a name of the zone (max_rr counts them, A-24)
+export async function countUnder(tx, schema, domainId, name) {
+  const Z = tx.z(schema);
+  const r = await tx.get(`SELECT count(*) AS n FROM ${Z}records r WHERE r.domain_id = $1 AND r.type IS NOT NULL AND r.type <> '' AND r.disabled IS NOT TRUE
+                            AND (r.name = $2 OR substr(r.name, length(r.name) - $3) = $4)`, [domainId, name, name.length, `.${name}`]);
+  return Number(r.n);
+}
+
+// Delete a zone and everything of it.  PostgreSQL: the foreign keys cascade.  SQLite3: the PowerDNS tables have no foreign keys (the reduced schema of the tests
+// has none either), so the rows are deleted here, children first; the karidns_* tables cascade (the connection runs foreign_keys = ON); and the grants of the zone
+// in the auth file go too (a trigger cannot reach across the two files; on PostgreSQL a trigger on domains deletes them).
+export async function deleteZone(tx, schema, id, zone) {
+  const Z = tx.z(schema);
+  if (tx.dialect === 'sqlite') {
+    for (const t of ['records', 'domainmetadata', 'cryptokeys']) await tx.run(`DELETE FROM ${t} WHERE domain_id = $1`, [id]);
+    const comments = await tx.get("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'comments'");
+    if (comments) await tx.run('DELETE FROM comments WHERE domain_id = $1', [id]);
+    await tx.run('DELETE FROM domains WHERE id = $1', [id]);
+    await tx.run(`DELETE FROM ${tx.A}grants WHERE zone_name = $1`, [zone]);
+    return;
+  }
+  await tx.run(`DELETE FROM ${Z}domains WHERE id = $1`, [id]);
+}
+
+// a reload request for a zone (PostgreSQL: every loader on the database reloads it, planning 2.5); zone undefined: every zone of the schema
+export const requestReload = (tx, schema, zone) => (zone === undefined
+  ? tx.run(`INSERT INTO ${tx.z(schema)}karidns_reload_requests DEFAULT VALUES`)
+  : tx.run(`INSERT INTO ${tx.z(schema)}karidns_reload_requests (zone) VALUES ($1)`, [zone]));
+
+// the zones of the dataset that the signer keeps signed (a reload of every zone would publish their unsigned changes)
+export async function signerZoneCount(tx, schema) {
+  const Z = tx.z(schema);
+  return Number((await tx.get(`SELECT count(*) AS n FROM ${Z}domainmetadata m WHERE upper(m.kind) = 'X-KARIDNS-SIGNER' AND m.content = '1'`)).n);
+}
+
+export async function listMetadata(tx, schema, domainId) {
+  return (await tx.all(`SELECT upper(kind) AS kind, content FROM ${tx.z(schema)}domainmetadata WHERE domain_id = $1 ORDER BY upper(kind), id`, [domainId])).map((r) => ({ kind: r.kind, content: r.content }));
+}
+
+// the rows of one kind replaced by `values` (none: removed)
+export async function setMetadata(tx, schema, domainId, kind, values) {
+  const Z = tx.z(schema);
+  await tx.run(`DELETE FROM ${Z}domainmetadata WHERE domain_id = $1 AND upper(kind) = $2`, [domainId, kind]);
+  for (const v of values) await tx.run(`INSERT INTO ${Z}domainmetadata (domain_id, kind, content) VALUES ($1, $2, $3)`, [domainId, kind, v]);
+}
+
+export async function setCatalog(tx, schema, domainId, catalog) {
+  await tx.run(`UPDATE ${tx.z(schema)}domains SET catalog = $2 WHERE id = $1`, [domainId, catalog]);
+}
+
+export async function producerZone(tx, schema, name) {
+  const r = await tx.get(`SELECT d.type FROM ${tx.z(schema)}domains d WHERE d.name IN ($1, $2)`, zoneNames(name));
+  return r?.type === 'PRODUCER';
+}
+
+export async function setViews(tx, schema, domainId, views) {
+  const Z = tx.z(schema);
+  await tx.run(`DELETE FROM ${Z}karidns_domain_views WHERE domain_id = $1`, [domainId]);
+  for (const v of views) await tx.run(`INSERT INTO ${Z}karidns_domain_views (domain_id, view_name) VALUES ($1, $2)`, [domainId, v]);
+}
+
+// the DNSKEY RRset of the apex, and the key rows the API may read (never the key material)
+export async function dnskeyRecords(tx, schema, domainId, zone) {
+  return (await tx.all(`SELECT ttl, content FROM ${tx.z(schema)}records WHERE domain_id = $1 AND name = $2 AND upper(type) = 'DNSKEY' AND disabled IS NOT TRUE ORDER BY id`, [domainId, zone]))
+    .map((r) => ({ ttl: r.ttl, content: r.content }));
+}
+
+export async function cryptoKeys(tx, schema, domainId) {
+  return (await tx.all(`SELECT id, flags, active, published FROM ${tx.z(schema)}cryptokeys WHERE domain_id = $1 ORDER BY id`, [domainId]))
+    .map((r) => ({ id: r.id, flags: r.flags, active: bool(r.active), published: bool(r.published) }));
+}
+
+const keyRequest = (r) => ({
+  id: r.id, kind: r.kind, algorithm: r.algorithm, bits: r.bits ?? null, key_type: r.key_type, nsec: r.nsec ?? null, state: r.state, message: r.message ?? null,
+  requested_by: r.requested_by ?? null, created_at: toIso(r.created_at), done_at: toIso(r.done_at),
+});
+
+export async function listKeyRequests(tx, schema, domainId, limit = 20) {
+  return (await tx.all(`SELECT id, kind, algorithm, bits, key_type, nsec, state, message, requested_by, created_at, done_at FROM ${tx.z(schema)}karidns_key_requests
+                         WHERE domain_id = $1 ORDER BY id DESC LIMIT $2`, [domainId, limit])).map(keyRequest);
+}
+
+// -> the id of the request.  The columns are the ones the API's role may insert (the state and the answer keep their defaults).
+export async function insertKeyRequest(tx, schema, domainId, k, requestedBy) {
+  const r = await tx.get(`INSERT INTO ${tx.z(schema)}karidns_key_requests (domain_id, kind, algorithm, bits, key_type, nsec, requested_by) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+    [domainId, k.kind, k.algorithm, k.bits ?? null, k.key_type, k.nsec ?? null, requestedBy]);
+  return r.id;
+}
+
+export async function pendingKeyRequest(tx, schema, domainId) {
+  const r = await tx.get(`SELECT id FROM ${tx.z(schema)}karidns_key_requests WHERE domain_id = $1 AND state = 'pending'`, [domainId]);
+  return r?.id;
+}
+
+export async function zoneViews(tx, schema, domainId) {
+  return (await tx.all(`SELECT view_name FROM ${tx.z(schema)}karidns_domain_views WHERE domain_id = $1 ORDER BY view_name`, [domainId])).map((v) => v.view_name);
+}
+
+// the hourly sweep on PostgreSQL: the API role cannot see the sessions of the other principals, so a SECURITY DEFINER function deletes the expired ones
+export async function sweepExpired(tx) {
+  return Number((await tx.get('SELECT karidns_auth.sweep_expired() AS n')).n);
+}

@@ -7,6 +7,7 @@ const TITLES = {
   403: 'Forbidden',
   404: 'Not found',
   405: 'Method not allowed',
+  408: 'Request timeout',
   409: 'Conflict',
   413: 'Payload too large',
   415: 'Unsupported media type',

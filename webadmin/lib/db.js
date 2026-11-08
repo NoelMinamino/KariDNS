@@ -15,8 +15,9 @@
 
 export const iso = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
 
-// a timestamp column as unix milliseconds (pg gives a Date, SQLite3 the text we wrote)
-export const toMs = (v) => (v instanceof Date ? v.getTime() : v === null || v === undefined ? null : Date.parse(v));
+// a timestamp column as unix milliseconds (pg gives a Date, SQLite3 the text we wrote, or, in the karidns_* tables of the zone file that the signer and the loader
+// write, the number of seconds since the epoch)
+export const toMs = (v) => (v instanceof Date ? v.getTime() : v === null || v === undefined ? null : typeof v === 'number' || typeof v === 'bigint' ? Number(v) * 1000 : Date.parse(v));
 export const toIso = (v) => (v === null || v === undefined ? null : iso(toMs(v)));
 
 const sqliteSql = (sql) => sql.replace(/\$(\d+)/g, '?$1');
@@ -78,6 +79,8 @@ export class SqliteBackend {
     this.db.exec(`PRAGMA busy_timeout = ${Number(this.busyMs)}`);
     this.db.exec('PRAGMA foreign_keys = ON');
     this.db.prepare('ATTACH DATABASE ?1 AS auth').run(this.authFile);
+    // the audit triggers of the zone file (db/karidns_audit.sqlite3.sql) read who writes from a row of their own database: written with the actor row of the auth file
+    this.zoneActor = Boolean(this.db.prepare("SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = 'karidns_audit_actor'").get());
     this.tx0 = new SqliteTx(this.db);
   }
 
@@ -94,9 +97,16 @@ export class SqliteBackend {
         if (write) {
           this.db.prepare("INSERT OR REPLACE INTO auth.karidns_auth_actor (id, principal_id, principal_name, change_set, db_role) VALUES (1, ?1, ?2, ?3, 'karidns-webadmin')")
             .run(principal, name, changeSet);
+          if (this.zoneActor) {
+            this.db.prepare("INSERT OR REPLACE INTO main.karidns_audit_actor (id, principal_id, principal_name, change_set, db_role) VALUES (1, ?1, ?2, ?3, 'karidns-webadmin')")
+              .run(principal, name, changeSet);
+          }
         }
         const r = await fn(this.tx0);
-        if (write) this.db.exec('DELETE FROM auth.karidns_auth_actor WHERE id = 1');
+        if (write) {
+          this.db.exec('DELETE FROM auth.karidns_auth_actor WHERE id = 1');
+          if (this.zoneActor) this.db.exec('DELETE FROM main.karidns_audit_actor WHERE id = 1');
+        }
         this.db.exec('COMMIT');
         return r;
       } catch (e) {

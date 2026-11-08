@@ -7,7 +7,8 @@ const fail = (pointer, text) => new ApiError(400, 'bad-request', `${pointer || '
 
 const CTRL = /[\0-\x1f\x7f]/;
 
-// spec: { field: { type: 'string'|'int'|'bool'|'array'|'object', required, nullable, min, max, re, values, items (a spec of one element), noControl (default true) } }
+// spec: { field: { type: 'string'|'int'|'bool'|'array'|'object', required, nullable, min, max, re, values, items (a spec of one element), fields (the spec of an
+// object), noControl (default true) } }
 // -> a new plain object with the fields that were given (a missing optional field is left out)
 export function shape(input, spec, pointer = '') {
   if (input === null || typeof input !== 'object' || Array.isArray(input)) throw fail(pointer, 'an object is expected');
@@ -55,6 +56,8 @@ export function value(v, s, p) {
       if (v.length < (s.min ?? 0) || v.length > (s.max ?? 1000)) throw fail(p, `the array must have ${s.min ?? 0} to ${s.max ?? 1000} elements`);
       return v.map((x, i) => value(x, s.items, `${p}/${i}`));
     }
+    case 'object':
+      return shape(v, s.fields, p);
     default:
       throw new Error(`validate: unknown type ${s.type}`);
   }

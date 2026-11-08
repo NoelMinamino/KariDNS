@@ -15,8 +15,8 @@ const PROGRAM = 'karidns-webadmin';
 // the tables the API relies on: the auth tables (schema version 3, with the tables of items D and E) and the zone data tables of a dataset
 export const AUTH_TABLES = ['auth.principals', 'auth.credentials', 'auth.memberships', 'auth.principal_closure', 'auth.rr_policies', 'auth.grants', 'auth.sessions',
   'auth.api_tokens', 'auth.templates', 'auth.template_records', 'auth.schema_version'];
-export const DATA_TABLES = ['domains', 'records', 'domainmetadata', 'karidns_schema_version', 'karidns_zone_state', 'karidns_zone_versions', 'karidns_zone_version_rrsets',
-  'karidns_domain_views', 'karidns_signer_state', 'karidns_key_requests'];
+export const DATA_TABLES = ['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_schema_version', 'karidns_zone_state', 'karidns_zone_versions', 'karidns_zone_version_rrsets',
+  'karidns_domain_views', 'karidns_signer_state', 'karidns_key_requests', 'karidns_record_tags', 'karidns_record_tinydns', 'karidns_zone_tagdefs'];
 
 // -> a backend, opened.  conninfoFile overrides the file of the configuration (--create-admin uses a trusted role of its own).
 export async function openBackend(config, { conninfoFile, importPg = () => import('pg'), importSqlite = loadSqlite, readFile = fs.readFileSync, checkConninfo = checkConninfoFile, onError } = {}) {
@@ -43,7 +43,8 @@ export async function inspect(config, { backend, run, st = {}, uid = process.get
   const problems = validate(config);
   const notes = [];
   const versions = {};
-  if (problems.length) return { problems, notes, versions };
+  let types = null;                         // the record types karidns-zone's change file takes (its own list, planning 8.1)
+  if (problems.length) return { problems, notes, versions, types };
 
   const checkFile = (what, file, stat) => {
     const p = checkConninfoFile(file, stat, uid, PROGRAM);
@@ -62,6 +63,7 @@ export async function inspect(config, { backend, run, st = {}, uid = process.get
         problems.push(`${what} ${file}: ${e.code ?? e.message}`);
       }
     }
+    if (s['karictl-config']) checkFile('karictl-config', s['karictl-config'], st.karictl);       // the restricted control key: a secret like a connection file
     const p = st.auth ?? (() => { try { return fs.lstatSync(s['auth-file']); } catch { return null; } })();
     if (p && uid !== undefined && (p.mode & 0o077) !== 0) problems.push(`auth-file ${s['auth-file']} has mode ${(p.mode & 0o777).toString(8).padStart(4, '0')}: it holds the password hashes, it must be 0600`);
   }
@@ -87,7 +89,10 @@ export async function inspect(config, { backend, run, st = {}, uid = process.get
       let doc = null;
       try { doc = JSON.parse(t.stdout); } catch { /* reported below */ }
       if (doc?.['karidns-zone'] !== 1 || !Array.isArray(doc.types)) problems.push(`karidns-zone --types-list --json did not give a document of schema 1 (${clip(t.stdout || t.stderr, 120)})`);
-      else versions['karidns-zone-json'] = doc['karidns-zone'];
+      else {
+        versions['karidns-zone-json'] = doc['karidns-zone'];
+        types = doc.types.filter((x) => typeof x === 'string').map((x) => x.toUpperCase());
+      }
     }
     const k = await run(s.karicheck, ['--version'], { timeoutMs: 10000, maxOutput: 8192 });
     if (k.spawnError || k.code !== 0) problems.push(`karicheck (${s.karicheck}): ${k.spawnError ?? `exit status ${k.code}`}`);
@@ -95,13 +100,19 @@ export async function inspect(config, { backend, run, st = {}, uid = process.get
       versions.karicheck = clip(firstLine(k), 120);
       notes.push(`karicheck (${s.karicheck}): ${versions.karicheck}`);
     }
+    // SQLite3 has no reload requests: a reload runs karictl with the restricted key of karictl-config
+    if (s.database === 'sqlite3' && s['karictl-config']) {
+      const c = await run(s.karictl, ['--version'], { timeoutMs: 10000, maxOutput: 8192 });
+      if (c.spawnError || c.code !== 0) problems.push(`karictl (${s.karictl}): ${c.spawnError ?? `exit status ${c.code}`}`);
+      else notes.push(`karictl (${s.karictl}): ${clip(firstLine(c), 120)}`);
+    }
   }
 
   if (backend) {
     try {
       const datasets = config.settings.database === 'pg' ? [...(config.datasets.size ? config.datasets.values() : [{ name: 'main', schema: 'public' }])] : [{ name: 'main', schema: '' }];
       for (const d of datasets) {
-        const r = await backend.tx({}, async (tx) => ({ v: await S.schemaVersions(tx, d.schema), missing: await S.missingTables(tx, d.schema, [...AUTH_TABLES, ...DATA_TABLES]) }));
+        const r = await backend.tx({}, async (tx) => ({ v: await S.schemaVersions(tx, d.schema), missing: await S.missingTables(tx, d.schema, [...AUTH_TABLES, ...DATA_TABLES, ...(s.database === 'pg' ? ['karidns_reload_requests'] : [])]) }));
         if (r.v.auth !== 3 || r.v.data !== 3) problems.push(`dataset ${d.name}: the schema version is ${r.v.auth}/${r.v.data} (auth/data), 3 is needed: apply db/karidns_ext.*.sql and db/karidns_auth.sqlite3.sql of this release`);
         else if (r.missing.length) problems.push(`dataset ${d.name}: missing tables: ${r.missing.join(', ')}`);
         else notes.push(`dataset ${d.name}: schema version 3, all tables there`);
@@ -110,7 +121,7 @@ export async function inspect(config, { backend, run, st = {}, uid = process.get
       problems.push(`the database: ${e.message}`);
     }
   }
-  return { problems, notes, versions };
+  return { problems, notes, versions, types };
 }
 
 const FALLBACK_TYPES = ['A', 'AAAA', 'AFSDB', 'CAA', 'CNAME', 'DNAME', 'DS', 'HINFO', 'HTTPS', 'LOC', 'MX', 'NAPTR', 'NS', 'PTR', 'SOA', 'SPF', 'SRV', 'SSHFP', 'SVCB', 'TLSA', 'TXT', 'URI'];

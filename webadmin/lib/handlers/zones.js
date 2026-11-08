@@ -5,11 +5,11 @@ import { ApiError, badRequest, forbidden, notFound } from '../errors.js';
 import { query, LIMIT, CURSOR, decodeCursor, encodeCursor } from '../validate.js';
 import * as S from '../store.js';
 import { reply } from '../http.js';
-import { isGlobal, grantsOn, zoneGrant, rrVisible, auditVisible } from '../perm.js';
+import { isGlobal, zoneGrant, rrVisible, auditVisible } from '../perm.js';
 import { canonicalOwner, inZone, absolute } from '../names.js';
 import { exportArgv } from '../tools.js';
 import { VERSION } from '../app.js';
-import { dataset, zoneParam, page } from './common.js';
+import { dataset, zoneParam, zoneGrants, page } from './common.js';
 import { grantView } from './auth.js';
 
 export function datasets(ctx) {
@@ -17,13 +17,6 @@ export function datasets(ctx) {
   return {
     datasets: app.datasets.map((d) => ({ name: d.name, driver: app.backend.dialect === 'pg' ? 'postgresql' : 'sqlite3', schema: d.schema || undefined, views: d.views })),
   };
-}
-
-// the grants that apply to the zone; none: it does not exist for this principal
-function zoneGrants(ctx, ds, zone) {
-  const gs = grantsOn(ctx.auth.grants, ds.schema, zone);
-  if (gs.length === 0) throw notFound('no such zone');
-  return gs;
 }
 
 const NAME_CURSOR = (o) => typeof o?.n === 'string' && o.n.length <= 255;

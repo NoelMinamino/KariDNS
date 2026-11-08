@@ -147,6 +147,30 @@ export async function deploy({ settings, now, run = runChild, key = Buffer.alloc
   return d;
 }
 
+// ---- a scripted karidns-zone / karictl: `run` has the shape of node/lib/run.js runChild; fn(call, n) -> a result (see ok(), exit()); the calls are recorded
+export const exit = (code, over = {}) => ({ code, signal: null, stdout: '', stderr: '', truncated: false, timedOut: false, spawnError: null, ...over });
+export const ok = (doc) => exit(0, { stdout: JSON.stringify(doc) });
+export function makeRun(fn) {
+  const calls = [];
+  const run = async (file, argv, opts = {}) => {
+    const call = { file, argv: [...argv], input: opts.input, opts };
+    calls.push(call);
+    return fn(call, calls.length);
+  };
+  return { run, calls };
+}
+
+// the document of `karidns-zone --json apply` (docs/karidns-zone.md); over.apply overrides the keys of "apply"
+export const applyDoc = (over = {}) => ({
+  'karidns-zone': 1, version: '0.6.0', command: 'apply', result: 'ok', counts: { error: 0, warning: 0, checked: 1, skipped: 0, dropped: 0 }, truncated: false,
+  messages: over.messages ?? [], zones: [],
+  apply: {
+    zone: 'example.test.', dry_run: true, committed: false, changed: false, busy: false, created: false, generation: 7, generation_after: 7, serial: { before: 10, after: 11 },
+    serial_bumped: true, version: 2, delta_complete: true, records_before: 9, records_after: 9, warnings: 0, diff: [], ...over.apply,
+  },
+});
+export const entry = (owner, type, before, after) => ({ owner, type, change: before === null ? 'add' : after === null ? 'delete' : 'replace', before, after });
+
 // the standard cast: root (global master), a domain master of example.test, a subdomain master of sub.example.test
 export async function cast(d) {
   const all = await d.makePolicy({ name: 'all', allowed_types: ['A', 'AAAA', 'CNAME', 'MX', 'NS', 'SOA', 'TXT', 'SRV', 'DNAME'], allow_wildcard: true, allow_delegation: true, allow_dname: true, apex_editable: true });

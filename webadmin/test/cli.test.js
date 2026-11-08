@@ -10,7 +10,7 @@ import net from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { parseArgs, main, USAGE, VERSION, DEFAULT_CONFIG } from '../lib/cli.js';
 import { openBackend, inspect, createAdmin } from '../lib/setup.js';
-import { parseConfig, loadConfig } from '../lib/config.js';
+import { parseConfig, loadConfig, validate } from '../lib/config.js';
 import { SqliteBackend } from '../lib/db.js';
 import { runChild } from '../../node/lib/run.js';
 import { sqlite, makeFiles, confText, memLog, deploy, rmDir } from './helpers.js';
@@ -162,7 +162,7 @@ test('the server: starts, sweeps the sessions, reads the configuration on SIGHUP
   assert.equal(f.proc.listenerCount('SIGHUP'), 0);
 });
 
-test('the server: a configuration that is wrong at SIGHUP is not taken; PostgreSQL has no sweep', async () => {
+test('the server: a configuration that is wrong at SIGHUP is not taken; PostgreSQL sweeps with the SECURITY DEFINER function', async () => {
   let mode = 'good';
   const f = fakes({ loadConfig: () => (mode === 'throw' ? parseConfig('listen = nonsense') : mode === 'invalid' ? parseConfig('database = sqlite3') : goodConfig()) });
   const p = main([], { stdout: sink(), stderr: sink(), proc: f.proc, deps: f.deps });
@@ -175,13 +175,13 @@ test('the server: a configuration that is wrong at SIGHUP is not taken; PostgreS
   assert.equal(await p, 0);
   assert.equal(f.log.lines.filter((l) => /^error the configuration was not read: /.test(l)).length, 2);
   const g = fakes();
-  const pgBackend = { dialect: 'pg', tx: async () => { g.events.push(['tx']); }, close: async () => {} };
+  const pgBackend = { dialect: 'pg', tx: async (o, fn) => { g.events.push(['tx', o.write]); return fn({ get: async (sql) => { g.events.push(['sql', sql]); return { n: 3 }; } }); }, close: async () => {} };
   g.deps.openBackend = async () => pgBackend;
   const q = main([], { stdout: sink(), stderr: sink(), proc: g.proc, deps: g.deps });
   await sleep(50);
   g.proc.emit('SIGTERM');
   await q;
-  assert.equal(g.events.some((e) => e[0] === 'tx'), false);
+  assert.deepEqual(g.events.filter((e) => e[0] === 'tx' || e[0] === 'sql'), [['tx', true], ['sql', 'SELECT karidns_auth.sweep_expired() AS n']]);
 });
 
 test('the server: it does not start with a configuration, a key, a database, a schema or a port that is wrong', async () => {
@@ -299,6 +299,38 @@ test('inspect: the files, the tools, the schema', async () => {
     d.backend.db.exec('UPDATE auth.schema_version SET version = 3; DROP TABLE auth.sessions');
     const noTable = await inspect(cfg, { backend: d.backend, uid: undefined });
     assert.ok(noTable.problems.some((p) => /dataset main: missing tables: auth\.sessions/.test(p)));
+  } finally {
+    await d.close();
+  }
+});
+
+test('inspect: the types karidns-zone names, and the restricted control key of SQLite3 (the file and karictl)', async () => {
+  const d = await deploy();
+  try {
+    fs.chmodSync(path.join(d.dir, 'auth.sqlite3'), 0o600);
+    const cfg = d.config;
+    cfg.settings['karictl-config'] = path.join(d.dir, 'ctl.conf');
+    const base = okRun();
+    const run = (over = {}) => async (file, argv) => (file === cfg.settings.karictl ? { code: 0, stdout: 'karictl 0.6.0\n', stderr: '', ...over } : base(file, argv));
+    const missing = await inspect(cfg, { run: run(), uid: undefined });
+    assert.deepEqual(missing.types, ['A', 'AAAA']);
+    assert.ok(missing.problems.some((p) => /^karictl-config: cannot read .*ctl.conf/.test(p)), missing.problems.join('|'));
+    fs.writeFileSync(cfg.settings['karictl-config'], 'key', { mode: 0o600 });
+    const st = { auth: { mode: 0o100600 }, karictl: { isFile: () => true, uid: 1000, mode: 0o100600 } };
+    const fine = await inspect(cfg, { run: run(), uid: 1000, st });
+    assert.ok(fine.notes.some((n) => /^karictl-config .*: fine$/.test(n)));
+    assert.ok(fine.notes.some((n) => /^karictl \(.*\): karictl 0\.6\.0$/.test(n)), fine.notes.join('|'));
+    assert.ok(!fine.problems.some((p) => /karictl/.test(p)));
+    const broken = await inspect(cfg, { run: run({ code: 127, stdout: '' }), uid: 1000, st });
+    assert.ok(broken.problems.some((p) => /^karictl \(.*\): exit status 127/.test(p)));
+    const spawn = await inspect(cfg, { run: run({ code: null, spawnError: 'ENOENT' }), uid: 1000, st });
+    assert.ok(spawn.problems.some((p) => /^karictl \(.*\): ENOENT/.test(p)));
+    // reload-after-change needs the key on SQLite3
+    cfg.settings['karictl-config'] = undefined;
+    cfg.settings['reload-after-change'] = true;
+    assert.ok(validate(cfg).some((p) => /reload-after-change = yes needs 'karictl-config'/.test(p)));
+    cfg.settings['reload-after-change'] = false;
+    assert.deepEqual(validate(cfg), []);
   } finally {
     await d.close();
   }

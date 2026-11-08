@@ -1,7 +1,7 @@
 // What several handlers need: route-level checks, path parameters, pages.
 
 import { ApiError, badRequest, forbidden, notFound } from '../errors.js';
-import { isGlobal } from '../perm.js';
+import { isGlobal, grantsOn } from '../perm.js';
 import { canonicalZone } from '../names.js';
 import { encodeCursor, decodeCursor } from '../validate.js';
 
@@ -22,6 +22,13 @@ export function zoneParam(ctx) {
   } catch (e) {
     throw badRequest(e.message);
   }
+}
+
+// the grants that apply to the zone, strongest first; none: the zone does not exist for this principal (404, not 403, A-25)
+export function zoneGrants(ctx, ds, zone) {
+  const gs = grantsOn(ctx.auth.grants, ds.schema, zone);
+  if (gs.length === 0) throw notFound('no such zone');
+  return gs;
 }
 
 // a numeric id of the path; anything else cannot be an object of ours: 404

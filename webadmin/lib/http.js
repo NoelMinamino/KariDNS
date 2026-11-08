@@ -11,6 +11,8 @@ import { listenHost } from './config.js';
 
 export const PREFIX = '/api/v1';
 const BODY_LIMIT = 1 << 20;
+const REQUEST_MS = 30000;                   // a request body is received within this time ...
+const IMPORT_MS = 300000;                   // ... a zone import within this (planning 8.2); the server's requestTimeout is the larger
 const JSON_TYPE = /^application\/json\s*(?:;\s*charset\s*=\s*"?utf-?8"?\s*)?$/i;
 const UNSAFE = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -26,7 +28,8 @@ export class Reply {
 }
 export const reply = (status, body, extra) => new Reply(status, body, extra);
 
-// route: { method, path: '/datasets/:ds/zones/:zone', handler, auth: 'user' (default) | 'none', preTotp, sessionOnly, bodyLimit }
+// route: { method, path: '/datasets/:ds/zones/:zone', handler, auth: 'user' (default) | 'none', preTotp, sessionOnly, bodyLimit, readTimeoutMs }
+export { IMPORT_MS };
 export class Router {
   constructor(routes) {
     this.routes = routes.map((r) => {
@@ -64,17 +67,54 @@ export class Router {
   }
 }
 
-async function readBody(req, limit) {
+// What is left of a body that is too large is read and thrown away (64 MiB at most, then the connection goes): a client that is still sending when the 413 comes
+// gets the answer, not a reset (the connection is kept open for that: closing it right after the answer resets it).
+function discard(req) {
+  let n = 0;
+  req.on('data', (chunk) => {
+    n += chunk.length;
+    if (n > 64 << 20) req.destroy();
+  });
+  req.on('error', () => {});
+}
+
+// The body, at most `limit` octets, received within `timeoutMs` (30 s; a zone import has 300 s: the route says so).  The server's own requestTimeout is the longest of
+// these; this deadline is the one an ordinary request gets.
+export function readBody(req, limit, timeoutMs = REQUEST_MS) {
   const declared = req.headers['content-length'];
-  if (declared !== undefined && (!/^\d{1,12}$/.test(declared) || Number(declared) > limit)) throw new ApiError(413, 'too-large', `the body is limited to ${limit} octets`, { headers: { Connection: 'close' } });
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of req) {
-    size += chunk.length;
-    if (size > limit) throw new ApiError(413, 'too-large', `the body is limited to ${limit} octets`, { headers: { Connection: 'close' } });
-    chunks.push(chunk);
+  if (declared !== undefined && (!/^\d{1,12}$/.test(declared) || Number(declared) > limit)) {
+    discard(req);
+    return Promise.reject(new ApiError(413, 'too-large', `the body is limited to ${limit} octets`));
   }
-  return Buffer.concat(chunks);
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    const done = (fn, v) => {
+      clearTimeout(timer);
+      req.off('data', onData);
+      req.off('end', onEnd);
+      req.off('error', onError);
+      req.off('close', onClose);
+      fn(v);
+    };
+    const onData = (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        done(reject, new ApiError(413, 'too-large', `the body is limited to ${limit} octets`));
+        discard(req);
+      } else {
+        chunks.push(chunk);
+      }
+    };
+    const onEnd = () => done(resolve, Buffer.concat(chunks));
+    const onError = (e) => done(reject, e);
+    const onClose = () => { if (!req.complete) done(reject, new Error('the client closed the connection')); };
+    const timer = setTimeout(() => done(reject, new ApiError(408, 'request-timeout', `the request was not received within ${Math.round(timeoutMs / 1000)} seconds`, { headers: { Connection: 'close' } })), timeoutMs);
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
+    req.on('close', onClose);
+  });
 }
 
 // The client's address: the peer's, unless the peer is a configured trusted proxy, then the first address from the right of X-Forwarded-For that is not
@@ -145,7 +185,7 @@ export async function dispatch(app, router, req, res) {
       if (wait) throw new ApiError(429, 'rate-limited', 'too many requests', { headers: { 'Retry-After': String(wait) } });
     }
     if (UNSAFE.has(req.method)) {
-      const raw = await readBody(req, m.route.bodyLimit ?? BODY_LIMIT);
+      const raw = await readBody(req, m.route.bodyLimit ?? BODY_LIMIT, m.route.readTimeoutMs);
       if (raw.length) {
         if (!JSON_TYPE.test(req.headers['content-type'] ?? '')) throw new ApiError(415, 'unsupported-media-type', 'the body must be application/json (UTF-8)');
         try { ctx.body = JSON.parse(raw.toString('utf8')); } catch { throw new ApiError(400, 'malformed-json', 'the body is not valid JSON'); }
@@ -160,7 +200,8 @@ export async function dispatch(app, router, req, res) {
   }
 }
 
-// -> the listening server.  Limits against slow and large requests: 16 KiB of headers, 10 s for them, 30 s for a request, 5 s keep-alive, 256 sockets.
+// -> the listening server.  Limits against slow and large requests: 16 KiB of headers, 10 s for them, 30 s for the body of a request (readBody; the server's own
+// requestTimeout is 300 s because a zone import may take that), 5 s keep-alive, 256 sockets.
 export async function listen(app, router, { fsx = fs } = {}) {
   const s = app.settings;
   // dispatch answers every error itself; what it cannot (the connection is gone) must not take the process down
@@ -170,7 +211,7 @@ export async function listen(app, router, { fsx = fs } = {}) {
       res.destroy();
     });
   };
-  const opts = { maxHeaderSize: 16384, keepAliveTimeout: 5000, headersTimeout: 10000, requestTimeout: 30000 };
+  const opts = { maxHeaderSize: 16384, keepAliveTimeout: 5000, headersTimeout: 10000, requestTimeout: IMPORT_MS };
   const server = s['tls-cert']
     ? https.createServer({ ...opts, cert: fsx.readFileSync(s['tls-cert']), key: fsx.readFileSync(s['tls-key']), minVersion: 'TLSv1.2' }, handler)
     : http.createServer(opts, handler);

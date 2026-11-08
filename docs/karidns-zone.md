@@ -14,6 +14,7 @@ karidns-zone export [options] <zone> [<file>]
 karidns-zone export --signer [options] <zone> [<file>]
 karidns-zone export --all --dir <dir> [options]
 karidns-zone apply [options] --changes <file|-> <zone>
+karidns-zone apply [options] --zone-file <file|-> [--delete-others] <zone>
 karidns-zone --types-list [--json]
 karidns-zone --version | -h | --help
 ```
@@ -128,7 +129,7 @@ A signed (PRESIGNED) zone is exported as the server serves it, with the NSEC3PAR
 3. In ONE transaction (`REPEATABLE READ` on PostgreSQL): locks the zone, reads its **generation** (below) and fails with exit status **3** when `--expect-generation` names another, deletes and inserts the RRsets, **raises the SOA serial by one** when the change set changed the zone and wrote no SOA record of its own (RFC 1982 section 3.1; with `--principal` through `karidns_auth.bump_serial()`, the only way the API's role may change an SOA), reads the zone back through the loader's reader (the whole zone, or with `--readback changed` only the rows written), writes the **version** (below) and commits, or rolls back for `--dry-run`.
 4. Reports the RRsets that changed, each with its records before and after, in the text output as `db.import.change` notes and in the `--json` document as the key `apply` (below).
 
-A change set that changes nothing writes nothing: no version, no new serial. A zone that is not a primary zone (`SLAVE`, `CONSUMER`, `PRODUCER`), a zone that is not in the database (without `--create`), the deletion of the apex SOA, and a zone that already exists (with `--create`) are errors (`db.apply.zone`). `--create` makes a new zone (`--type NATIVE` or `MASTER`, `--view`): the `rr` lines are the whole zone and are checked as one (SOA, NS and glue are needed); its version 1 has the kind `create`.
+A change set that changes nothing writes nothing: no version, no new serial. The RRsets of the change that equal the zone's are not deleted and written again either: only the RRsets that change are written (a write that changes nothing is still a write for the audit log and for row level security). `--zone-file FILE` (below, "OPTIONS") takes a zone file instead of a change file. A zone that is not a primary zone (`SLAVE`, `CONSUMER`, `PRODUCER`), a zone that is not in the database (without `--create`), the deletion of the apex SOA, and a zone that already exists (with `--create`) are errors (`db.apply.zone`). `--create` makes a new zone (`--type NATIVE` or `MASTER`, `--view`): the `rr` lines are the whole zone and are checked as one (SOA, NS and glue are needed); its version 1 has the kind `create`.
 
 **The change file** (`dns_zone_changes.h`) has one operation per line, fields separated by blanks, lines ended by LF (a CR before it is dropped); empty lines and lines that begin with `#` are ignored:
 
@@ -214,10 +215,16 @@ delete <owner> <type>
 : One JSON document on standard output (below).
 
 `--changes FILE` (apply)
-: The change file; `-` is standard input. Required.
+: The change file; `-` is standard input. Required, unless `--zone-file` is given.
+
+`--zone-file FILE` (apply)
+: Instead of `--changes`: the RRsets of a **zone file** (BIND format; `-` is standard input, where `$INCLUDE` is refused; the plain records only, no DNSSEC records, location / ECS tags or tinydns attributes) replace those RRsets of the zone, as `import --mode merge` does, with the checks, the generation, the version and the read-back of `apply`. An apex SOA of the file that differs from the zone's in the serial only is left alone (the serial is raised as for any change, `--serial increment`); one that differs otherwise is written. It is what the WebAdmin API runs for an import.
+
+`--delete-others` (apply)
+: With `--zone-file`: also delete the RRsets of the zone that the file does not have, except the apex SOA and, in a zone kept signed by `karidns-signer`, the DNSSEC records. Not with `--create`.
 
 `--create` (apply)
-: The zone must not exist and is made; the `rr` lines are the whole zone (`--type NATIVE|MASTER`, `--view`).
+: The zone must not exist and is made; the `rr` lines (or the zone file) are the whole zone (`--type NATIVE|MASTER`, `--view`).
 
 `--expect-generation N` (apply)
 : Fail with exit status 3 unless the zone has this generation. Not with `--create`.
@@ -231,7 +238,7 @@ delete <owner> <type>
 `--readback zone|changed` (apply)
 : `zone` (the default) reads the whole zone back through the loader's reader; `changed` only the rows this transaction wrote (the commit run of the API).
 
-`--version-kind edit|template|rollback`, `--rollback-of N`, `--comment TEXT` (apply)
+`--version-kind edit|template|import|rollback`, `--rollback-of N`, `--comment TEXT` (apply)
 : The kind of the version row (`create` is chosen by `--create`), the version a rollback restores (needed with `rollback`, an error otherwise), and the comment (at most 1024 octets).
 
 `--types-list`

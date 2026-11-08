@@ -174,15 +174,20 @@ void zi_close(zi_t *z);
  * --------------------------------------------------------------------------------------------------------------------------------------------------- */
 typedef struct {
     const char *zone;                   /* the zone as the change file names it: lower case with the final dot (pdns_canonical_zone_name()) */
-    const zc_changes_t *changes;
-    bool create;                        /* the zone must not exist and is made (domains.type from the options): the rr lines are the whole zone (checked as a whole zone) */
+    const zc_changes_t *changes;        /* the change file; or NULL with zone_text */
+    const char *zone_text;              /* instead of a change file: the zone as BIND zone-file text (len bytes; standard-input rules: no $INCLUDE).  Its RRsets are merged like
+                                         * rr lines; plain records only (no DNSSEC data, no location / ECS tags, no tinydns attributes: refused); the apex SOA of an existing
+                                         * zone is left alone when the text's differs from it in the serial only */
+    size_t zone_text_len;
+    bool delete_others;                 /* zone_text, existing zone: also delete the RRsets the text does not have (not the apex SOA, not the DNSSEC records of a signer zone) */
+    bool create;                      /* the zone must not exist and is made (domains.type from the options): the rr lines are the whole zone (checked as a whole zone) */
     bool have_expect;
     uint64_t expect_generation;         /* the transaction fails with ZI_CHANGED unless the zone has this generation */
     bool readback_changed;              /* read back only the rows of the changed RRsets, not the whole zone (the commit run of the API: the check run, at the same generation,
                                          * has checked the whole zone; row level security shows the API's session only a part of it) */
     bool api_serial;                    /* raise the serial with karidns_auth.bump_serial() (PostgreSQL, the role of the API; needs the principal) */
     db_actor_t actor;                   /* the principal and the change set (the audit log and the version row name them) */
-    const char *kind;                   /* the kind of the version row: edit (NULL), template, rollback (create is chosen by the create flag) */
+    const char *kind;                   /* the kind of the version row: edit (NULL), template, import, rollback (create is chosen by the create flag) */
     const char *comment;                /* NULL, or at most 1024 octets */
     uint32_t rollback_of;               /* 0, or the version a rollback restores */
     const char *shown;                  /* the name of the change file in messages */

@@ -175,6 +175,7 @@ export function validate(cfg) {
     if (!s['sqlite-file']) problems.push("database = sqlite3 needs 'sqlite-file'");
     if (!s['auth-file']) problems.push("database = sqlite3 needs 'auth-file' (the file with the users and grants: db/karidns_auth.sqlite3.sql)");
     if (s['api-conninfo-file'] || s['check-conninfo-file']) problems.push("'api-conninfo-file' and 'check-conninfo-file' are for database = pg");
+    if (s['reload-after-change'] && !s['karictl-config']) problems.push("reload-after-change = yes needs 'karictl-config' on SQLite3 (a SQLite3 database has no reload requests: the API runs `karictl reload <zone>` with a restricted control key)");
     if (cfg.datasets.size) problems.push('database = sqlite3 has one dataset (main): there are no [dataset] sections');
   }
   for (const d of cfg.datasets.values()) if (!d.schema) problems.push(`[dataset ${d.name}] needs 'schema'`);

@@ -35,6 +35,16 @@ check-conninfo-file = /usr/local/etc/karidns/check.conninfo
 # --- the programs ------------------------------------------------------------------------------------------------------------------------
 # karidns-zone = /usr/local/bin/karidns-zone
 # karicheck = /usr/local/bin/karicheck
+# The pool of tool runs (karidns-zone, karictl): at most this many at a time, 64 more may wait (default: the CPUs, at most 4).
+# workers = 4
+
+# --- reloading after a change -------------------------------------------------------------------------------------------------------------
+# A change set asks for a reload when it says "reload": true; this makes that the default.  PostgreSQL: a row in karidns_reload_requests (every server
+# reloads the zone).  SQLite3: karictl with a RESTRICTED control key (read-only yes, allow-commands { reload-zone; } in the control channel of karidns.conf):
+# karictl-config is its karictl.conf (owner = the service user, mode 0600).  A zone the signer keeps signed is never reloaded by the API.
+# reload-after-change = no
+# karictl = /usr/local/bin/karictl
+# karictl-config = /usr/local/etc/karidns/webadmin-karictl.conf
 
 # --- logins ------------------------------------------------------------------------------------------------------------------------------
 # Who must use TOTP: global (every global master; the default), all, none.

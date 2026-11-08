@@ -167,3 +167,105 @@ test('the audit log on PostgreSQL: the data schema of a grant row is in the row'
   const plain = { ...row('z.test', null), data_schema: 's1', table_name: 'records' };
   assert.equal((await auditList(ctx(dom, [plain]))).audit.length, 1);
 });
+
+// ---------------------------------------------------------------------------------------------------------------------------------- M3: the write side
+test('writing zones on PostgreSQL: the statements and their parameters', async () => {
+  const tx = fakeTx([
+    [/^SELECT d\.type FROM/, [{ type: 'PRODUCER' }]],
+    [/^SELECT d\.id, d\.name/, [{ id: 8, name: 'Example.test.', type: 'NATIVE', catalog: null, presigned: true, signer: false }]],
+    [/count\(\*\) AS n FROM "s".records/, [{ n: '41' }]],
+    [/FROM "s".records r WHERE/, [{ name: 'WWW.example.test', type: 'A' }, { name: 'other.example.test', type: 'MX' }]],
+    [/count\(\*\) AS n FROM "s".domainmetadata/, [{ n: 2 }]],
+    [/FROM "s".domainmetadata WHERE domain_id = \$1 ORDER/, [{ kind: 'ALSO-NOTIFY', content: '192.0.2.1' }]],
+    [/FROM "s".karidns_key_requests WHERE domain_id = \$1 AND state/, [{ id: 4 }]],
+    [/INSERT INTO "s".karidns_key_requests/, [{ id: 5 }]],
+    [/FROM "s".karidns_key_requests/, [{ id: 5, kind: 'enable', algorithm: 13, bits: null, key_type: 'csk', nsec: null, state: 'pending', message: null, requested_by: 3, created_at: new Date(0), done_at: null }]],
+    [/FROM "s".cryptokeys/, [{ id: 1, flags: 257, active: true, published: false }]],
+    [/FROM "s".records WHERE domain_id = \$1 AND name = \$2 AND upper\(type\) = 'DNSKEY'/, [{ ttl: 300, content: '257 3 13 AAAA' }]],
+    [/karidns_domain_views/, [{ view_name: 'a' }]],
+    [/sweep_expired/, [{ n: '3' }]],
+  ]);
+  assert.deepEqual(await S.zoneFacts(tx, 's', 'example.test'), { id: 8, name: 'example.test', kind: 'NATIVE', catalog: null, presigned: true, signer: false });
+  assert.deepEqual(tx.log[0][1], ['example.test', 'example.test.']);
+  // the tagged RRsets among the ones asked about: the names go in as one array
+  const pairs = [{ name: 'www.example.test', type: 'A' }, { name: 'www.example.test', type: 'TXT' }, { name: 'other.example.test', type: 'MX' }];
+  assert.deepEqual(await S.taggedRRsets(tx, 's', 8, pairs), [{ name: 'www.example.test', type: 'A' }, { name: 'other.example.test', type: 'MX' }]);
+  assert.deepEqual(tx.log.at(-1)[1], [8, ['www.example.test', 'other.example.test']]);
+  assert.match(tx.log.at(-1)[0], /r\.name = ANY\(\$2::text\[\]\) ORDER BY 1, 2 LIMIT 100000/);
+  assert.equal((await S.taggedRRsets(tx, 's', 8)).length, 2);
+  assert.match(tx.log.at(-1)[0], /LIMIT 1$/);
+  assert.equal(await S.countUnder(tx, 's', 8, 'sub.example.test'), 41);
+  assert.deepEqual(tx.log.at(-1)[1], [8, 'sub.example.test', 16, '.sub.example.test']);
+  assert.match(tx.log.at(-1)[0], /r\.disabled IS NOT TRUE/);
+  // a zone goes by its foreign keys; the reload request is one row
+  const d = fakeTx();
+  await S.deleteZone(d, 's', 8, 'example.test');
+  assert.deepEqual(d.log, [['DELETE FROM "s".domains WHERE id = $1', [8]]]);
+  await S.requestReload(d, 's', 'example.test');
+  await S.requestReload(d, 's');
+  assert.deepEqual(d.log.slice(1), [['INSERT INTO "s".karidns_reload_requests (zone) VALUES ($1)', ['example.test']], ['INSERT INTO "s".karidns_reload_requests DEFAULT VALUES', []]]);
+  assert.equal(await S.signerZoneCount(tx, 's'), 2);
+  assert.deepEqual(await S.listMetadata(tx, 's', 8), [{ kind: 'ALSO-NOTIFY', content: '192.0.2.1' }]);
+  await S.setMetadata(d, 's', 8, 'ALSO-NOTIFY', ['192.0.2.1', '192.0.2.2']);
+  assert.deepEqual(d.log.slice(3).map((l) => l[1]), [[8, 'ALSO-NOTIFY'], [8, 'ALSO-NOTIFY', '192.0.2.1'], [8, 'ALSO-NOTIFY', '192.0.2.2']]);
+  await S.setCatalog(d, 's', 8, 'cat.test');
+  await S.setViews(d, 's', 8, ['a', 'b']);
+  assert.deepEqual(d.log.slice(6).map((l) => l[1]), [[8, 'cat.test'], [8], [8, 'a'], [8, 'b']]);
+  assert.equal(await S.producerZone(tx, 's', 'cat.test'), true);
+  assert.equal(await S.producerZone(fakeTx(), 's', 'cat.test'), false);
+  assert.deepEqual(await S.zoneViews(tx, 's', 8), ['a']);
+  assert.deepEqual(await S.dnskeyRecords(tx, 's', 8, 'example.test'), [{ ttl: 300, content: '257 3 13 AAAA' }]);
+  assert.deepEqual(await S.cryptoKeys(tx, 's', 8), [{ id: 1, flags: 257, active: true, published: false }]);
+  assert.equal(await S.pendingKeyRequest(tx, 's', 8), 4);
+  assert.equal(await S.insertKeyRequest(tx, 's', 8, { kind: 'enable', algorithm: 13, key_type: 'csk' }, 3), 5);
+  assert.deepEqual(tx.log.at(-1)[1], [8, 'enable', 13, null, 'csk', null, 3]);
+  assert.deepEqual((await S.listKeyRequests(tx, 's', 8))[0], { id: 5, kind: 'enable', algorithm: 13, bits: null, key_type: 'csk', nsec: null, state: 'pending', message: null, requested_by: 3, created_at: '1970-01-01T00:00:00Z', done_at: null });
+  assert.equal(await S.sweepExpired(tx), 3);
+});
+
+// a context for the handlers of the write side on PostgreSQL: the transaction answers from a script, the tools are scripted
+function writeCtx(grants, script, over = {}) {
+  const config = parseConfig('listen = 127.0.0.1:1\npublic-origin = http://127.0.0.1:1\ndatabase = pg\napi-conninfo-file = /a\ncheck-conninfo-file = /b\nkarictl = /opt/karictl\n');
+  const tx = fakeTx(script);
+  const calls = [];
+  const app = new App({ config, backend: { dialect: 'pg' }, log: { error: () => {}, warn: () => {} }, run: async (file, argv) => { calls.push([file, argv]); return { code: 0, stdout: '', stderr: '' }; }, key: Buffer.alloc(32) });
+  const ctx = { app, auth: { grants, principal: { id: 4, name: 'p' } }, db: (fn, o) => { calls.push(['tx', o]); return fn(tx); }, params: { ds: 'main', zone: 'example.test', ...over.params }, body: over.body, id: 'rid' };
+  return { ctx, tx, calls, app };
+}
+const ZONE_FACTS = [/FROM "public".domains d WHERE d.name IN/, [{ id: 8, name: 'example.test', type: 'NATIVE', catalog: null, presigned: false, signer: false }]];
+
+test('the update button on PostgreSQL is a row in karidns_reload_requests; every zone only when the signer keeps none', async () => {
+  const { reloadZone, reloadAll } = await import('../lib/handlers/write.js');
+  const global = [grant('global_master', null, null)];
+  const a = writeCtx(global, [ZONE_FACTS]);
+  assert.deepEqual((await reloadZone(a.ctx)).reload, 'requested');
+  assert.ok(a.tx.log.some((l) => /INSERT INTO "public".karidns_reload_requests \(zone\) VALUES \(\$1\)/.test(l[0]) && l[1][0] === 'example.test'));
+  assert.deepEqual(a.calls.filter((c) => c[0] === 'tx').map((c) => c[1]).at(-1).write, true);
+  assert.ok(!a.calls.some((c) => c[0] === '/opt/karictl'), 'no karictl on PostgreSQL');
+  // every zone of the dataset
+  const b = writeCtx(global, [[/count\(\*\) AS n FROM "public".domainmetadata/, [{ n: 0 }]]]);
+  assert.equal((await reloadAll(b.ctx)).reload, 'requested');
+  assert.ok(b.tx.log.some((l) => /INSERT INTO "public".karidns_reload_requests DEFAULT VALUES/.test(l[0])));
+  const c = writeCtx(global, [[/count\(\*\) AS n FROM "public".domainmetadata/, [{ n: 1 }]]]);
+  await assert.rejects(reloadAll(c.ctx), (e) => e.status === 409 && e.code === 'signer-zones');
+  assert.ok(!c.tx.log.some((l) => /INSERT/.test(l[0])));
+});
+
+test('a change set on PostgreSQL asks the commit run for the reload request, and the check run is the check role', async () => {
+  const { rrsetsPatch } = await import('../lib/handlers/write.js');
+  const grants = [{ role: 'domain_master', data_schema: 'public', zone_name: 'example.test', name_suffix: null, policy: { allowed_types: ['A'], allow_wildcard: false, allow_delegation: false, allow_dname: false, apex_editable: false, ttl_min: 0, ttl_max: 9999, max_rr: null } }];
+  const doc = (dry) => JSON.stringify({ 'karidns-zone': 1, messages: [], apply: { dry_run: dry, generation: 3, generation_after: 4, serial: { before: 1, after: 2 }, version: 2, records_before: 5, records_after: 5, diff: [{ owner: 'www.example.test.', type: 'A', change: 'replace', before: ['300 A 192.0.2.1'], after: ['300 A 192.0.2.2'] }] } });
+  const w = writeCtx(grants, [ZONE_FACTS], { body: { reload: true, rrsets: [{ name: 'www.example.test', type: 'A', changetype: 'REPLACE', ttl: 300, records: [{ content: '192.0.2.2' }] }] } });
+  w.app.run = async (file, argv) => { w.calls.push([file, argv]); return { code: 0, stdout: doc(argv.includes('--dry-run')), stderr: '' }; };
+  const r = await rrsetsPatch(w.ctx);
+  assert.equal(r.reload, 'requested');
+  const [check, commit] = w.calls.filter((c) => c[0] !== 'tx').map((c) => c[1]);
+  assert.deepEqual(check.slice(3, 8), ['--no-config', '--conninfo-file', '/b', '--schema', 'public']);
+  assert.deepEqual(commit.slice(2, 7), ['--no-config', '--conninfo-file', '/a', '--schema', 'public']);
+  assert.ok(commit.includes('--reload') && !check.includes('--reload'));
+  // a signer zone: no --reload, the signer asks
+  const s = writeCtx(grants, [[ZONE_FACTS[0], [{ id: 8, name: 'example.test', type: 'NATIVE', catalog: null, presigned: true, signer: true }]]].map(([re, rows]) => [re, rows]), { body: w.ctx.body });
+  s.app.run = async (file, argv) => { s.calls.push([file, argv]); return { code: 0, stdout: doc(argv.includes('--dry-run')), stderr: '' }; };
+  assert.equal((await rrsetsPatch(s.ctx)).reload, 'waiting for the signer');
+  assert.ok(!s.calls.filter((c) => c[0] !== 'tx').some((c) => c[1].includes('--reload')));
+});

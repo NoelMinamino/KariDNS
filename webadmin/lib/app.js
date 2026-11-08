@@ -4,6 +4,7 @@
 import { Buckets } from './ratelimit.js';
 import { hashPassword } from './crypto.js';
 import { datasetList } from './config.js';
+import { Pool, KeyedLock } from './pool.js';
 
 export const VERSION = '0.6.0';
 
@@ -19,7 +20,17 @@ export class App {
     this.dummy = null;
     this.pending = new Set();              // background work in flight (a touch of a session), so shutdown can wait for it
     this.healthTimeoutMs = 3000;           // how long /health waits for the database
+    this.types = null;                     // the record types karidns-zone's change file takes (a Set; null: not known, karidns-zone decides)
     this.setConfig(config);
+    this.pool = new Pool({ limit: config.settings.workers });        // the tools run here: at most `workers` at a time, 64 more may wait
+    this.locks = new KeyedLock();                                     // one change set at a time per zone
+    this.sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });       // (the tests replace it)
+    this.random = Math.random;
+  }
+
+  // Run a tool in the pool: -> runChild's result.  Never throws (a refusal of the pool is the ApiError 503).
+  runTool(file, argv, opts) {
+    return this.pool.run(() => this.run(file, argv, opts));
   }
 
   // (also called on SIGHUP: the settings that are read per request change; the database, the datasets and the listen address do not)

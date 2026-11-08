@@ -93,6 +93,10 @@ run "--all on apply" 2 apply --no-config --sqlite3 "$DB" --changes "$CH" --all e
 run "--signer on apply" 2 apply --no-config --sqlite3 "$DB" --changes "$CH" --signer example.test
 run "--serial bogus" 2 apply --no-config --sqlite3 "$DB" --changes "$CH" --serial bogus example.test
 run "--comment over 1024 octets" 2 apply --no-config --sqlite3 "$DB" --changes "$CH" --comment "$(head -c 1100 /dev/zero | tr '\0' x)" example.test
+run "--changes and --zone-file together" 2 apply --no-config --sqlite3 "$DB" --changes "$CH" --zone-file "$CH" example.test
+run "--delete-others without --zone-file" 2 apply --no-config --sqlite3 "$DB" --changes "$CH" --delete-others example.test
+run "--delete-others with --create" 2 apply --no-config --sqlite3 "$DB" --zone-file "$CH" --create --delete-others example.test
+run "--zone-file on import" 2 import --no-config --sqlite3 "$DB" --zone-file "$CH" example.test /dev/null
 run "--changes on import" 2 import --no-config --sqlite3 "$DB" --changes "$CH" example.test /dev/null
 run "--principal on export" 2 export --no-config --sqlite3 "$DB" --principal 7 example.test
 run "--types-list with a command" 2 --types-list apply
@@ -105,7 +109,7 @@ mkzone "$T/h.zone" example.test. 10; kz import example.test "$T/h.zone"
 "$ZONE" --help | grep '^  karidns-zone \(apply -\|--types-list$\)' > "$T/examples.txt"
 [ "$(wc -l < "$T/examples.txt" | tr -d ' ')" -ge 3 ] && ok "--help has the examples of apply and --types-list" || bad "no examples in --help" "$(cat "$T/examples.txt")"
 while IFS= read -r line; do
-    cmd=$(printf '%s' "$line" | sed -e "s#^  karidns-zone#$ZONE#" -e "s#/var/db/karidns/pdns.sqlite3#$DB#" -e "s#/usr/local/etc/karidns/karidns.conf#$T/k.conf#" -e "s#< changes.txt#< $T/changes.txt#" -e "s# changes.txt# $T/changes.txt#")
+    cmd=$(printf '%s' "$line" | sed -e "s#^  karidns-zone#$ZONE#" -e "s#/var/db/karidns/pdns.sqlite3#$DB#" -e "s#/usr/local/etc/karidns/karidns.conf#$T/k.conf#" -e "s#< changes.txt#< $T/changes.txt#" -e "s# changes.txt# $T/changes.txt#" -e "s# example.test.zone# $T/h.zone#")
     sh -c "$cmd" > "$OUT" 2> "$ERR"; st=$?
     if [ "$st" = 0 ] || [ "$st" = 3 ]; then ok "the example runs ($st): $(printf '%s' "$line" | cut -c3-70)"; else bad "the example fails ($st): $line" "$(cat "$ERR")"; fi
 done < "$T/examples.txt"
@@ -255,6 +259,40 @@ errhas "...the checks of a whole zone" "SOA"
 same "...the zone was not made" "$(q "SELECT count(*) FROM domains WHERE name = 'made2.test'")" 0
 printf 'delete www.made.test. A\n' > "$CH"
 aexp "--create with a delete line" 1 --create --changes "$CH" made3.test
+
+echo "-- a zone text instead of a change file (--zone-file, --delete-others)"
+newdb "$DB"
+mkzone "$T/zt.zone" example.test. 10 'www IN A 192.0.2.2
+mail IN MX 10 www
+old IN TXT "old"'
+kz import example.test "$T/zt.zone"
+mkzone "$T/zt2.zone" example.test. 777 'www IN A 192.0.2.3
+new IN TXT "new"'
+aexp "--zone-file --dry-run (merge)" 0 --dry-run --json --zone-file "$T/zt2.zone" example.test
+jvalid "--zone-file --dry-run"
+same "...merge changes www and adds new" "$(perl -MJSON::PP -e 'my $d = decode_json(join "", <STDIN>); print join ",", map { "$_->{owner}$_->{type}$_->{change}" } @{$d->{apply}{diff}}' < "$OUT")" "new.example.test.TXTadd,www.example.test.Areplace"
+jget "...the serial is raised, not the file's" apply.serial.after 11
+same "...nothing was written" "$(q "SELECT count(*) FROM records WHERE name = 'new.example.test'")$(serial example.test)" 010
+aexp "--zone-file (merge)" 0 --principal 7 --principal-name zed --change-set cs-z --version-kind import --comment "from a file" --zone-file "$T/zt2.zone" example.test
+same "...www replaced, new added, mail and old stay, the SOA is the database's + 1" "$(q "SELECT group_concat(content, ',') FROM records WHERE name = 'www.example.test'")|$(q "SELECT count(*) FROM records WHERE type IN ('MX', 'TXT')")|$(serial example.test)" "192.0.2.3|3|11"
+same "...the version row is of kind import and names who" "$(q "SELECT kind || '|' || principal_name || '|' || change_set || '|' || comment FROM karidns_zone_versions WHERE version = 2")" "import|zed|cs-z|from a file"
+IN="$T/zt2.zone"; aexp "--zone-file - --delete-others (standard input)" 0 --delete-others --json --zone-file - example.test; IN=/dev/null
+same "...what the text does not have is gone (mail, old); the apex SOA and NS stay" "$(q "SELECT group_concat(name || ' ' || type, ',') FROM (SELECT name, type FROM records ORDER BY name, type)")" "example.test NS,example.test SOA,new.example.test TXT,ns1.example.test A,www.example.test A"
+mkzone "$T/zt3.zone" example.test. 1 'www IN A 192.0.2.3
+new IN TXT "new"'
+sed -i.bak 's/ 7200 3600 1209600 300/ 7200 3600 1209600 600/' "$T/zt3.zone"
+aexp "--zone-file with an SOA of other values" 0 --json --zone-file "$T/zt3.zone" example.test
+jget "...the SOA is written (the serial is the database's + 1)" apply.serial.after 13
+printf '$ORIGIN example.test.\n$TTL 60\nx IN A 192.0.2.1\nx IN RRSIG A 8 3 60 20350101000000 20250101000000 1 example.test. AAAA\n' > "$T/zt-sig.zone"
+aexp "a zone text with DNSSEC records is refused" 1 --zone-file "$T/zt-sig.zone" example.test
+errhas "...and says so" "plain records only"
+printf '$ORIGIN example.test.\n$TTL 60\n$INCLUDE /etc/passwd\n' > "$T/zt-inc.zone"
+IN="$T/zt-inc.zone"; aexp "\$INCLUDE in a zone text is refused" 1 --zone-file - example.test; IN=/dev/null
+grep -q root "$OUT" "$ERR" && bad "...a file was read" || ok "...nothing was read"
+printf '$ORIGIN made.test.\n$TTL 3600\n@ IN SOA ns1 h 4 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.4\n' > "$T/made.zone"
+aexp "--create --zone-file" 0 --create --type MASTER --principal 5 --zone-file "$T/made.zone" made.test
+same "...the zone, its serial and its version 1 (kind create)" "$(q "SELECT type FROM domains WHERE name = 'made.test'")$(serial made.test)|$(q "SELECT kind FROM karidns_zone_versions v JOIN domains d ON d.id = v.domain_id WHERE d.name = 'made.test'")" "MASTER4|create"
+aexp "--create --zone-file of a zone that is there" 1 --create --zone-file "$T/made.zone" made.test
 
 echo "-- the retention of the versions"
 q "DROP TRIGGER karidns_zone_versions_prune; CREATE TRIGGER karidns_zone_versions_prune AFTER INSERT ON karidns_zone_versions BEGIN DELETE FROM karidns_zone_version_rrsets WHERE version_id IN (SELECT id FROM karidns_zone_versions WHERE domain_id = NEW.domain_id AND version <= NEW.version - 3); DELETE FROM karidns_zone_versions WHERE domain_id = NEW.domain_id AND version <= NEW.version - 3; END" >/dev/null
@@ -479,6 +517,9 @@ same "...a disabled principal's session is not found" "$(PGCONNECT_TIMEOUT=5 psq
 pq "UPDATE karidns_auth.principals SET disabled = false WHERE id = 2" > /dev/null
 aq 2 "UPDATE karidns_auth.sessions SET last_seen = now()" > /dev/null
 same "the audit has the session without the hashes, and not a change of last_seen alone" "$(pq "SELECT count(*) FROM karidns_auth.audit_log WHERE table_name = 'sessions'")$(pq "SELECT count(*) FROM karidns_auth.audit_log WHERE table_name = 'sessions' AND after::text LIKE '%<redacted>%'")" 11
+pq "INSERT INTO karidns_auth.sessions (id_hash, principal_id, csrf_hash, expires_at) VALUES (decode('$(printf '%064d' 7)', 'hex'), 3, $H2, now() - interval '1 hour'), (decode('$(printf '%064d' 8)', 'hex'), 2, $H2, now() - interval '1 minute')" > /dev/null
+same "sweep_expired: a principal deletes the expired sessions of every principal (the policy shows it its own)" "$(aq 2 "SELECT karidns_auth.sweep_expired()")|$(pq "SELECT count(*) FROM karidns_auth.sessions WHERE expires_at <= now()")|$(pq "SELECT count(*) FROM karidns_auth.sessions")" "2|0|1"
+PGCONNECT_TIMEOUT=5 psql -X -q -At "$AQ" -c "SELECT karidns_auth.sweep_expired()" > /dev/null 2>&1 && ok "...the function needs no principal" || bad "sweep_expired without a principal"
 aq 1 "INSERT INTO karidns_auth.api_tokens (principal_id, name, secret_hash, expires_at) VALUES (3, 'svc', $H3, now() + interval '30 days')" | grep -q . && bad "a service token" || ok "a global master makes a token for another principal"
 aq 2 "INSERT INTO karidns_auth.api_tokens (principal_id, name, secret_hash, expires_at) VALUES (3, 'steal', $H3, now() + interval '30 days')" | grep -q "row-level security" && ok "...bob cannot" || bad "a token for another principal"
 aq 2 "INSERT INTO karidns_auth.api_tokens (principal_id, name, secret_hash, expires_at) VALUES (2, 'forever', $H3, now() + interval '400 days')" | grep -q "api_tokens_max_life" && ok "a token cannot live more than a year" || bad "a long token"

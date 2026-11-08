@@ -2777,6 +2777,119 @@ static void t_apply(void) {
     }
 }
 
+/* apply with a zone text (karidns-zone apply --zone-file): the text instead of a change file */
+static int apptext(const zi_opts_t *o, const char *zone, const char *text, const zi_apply_in_t *tmpl, zi_result_t *r) {
+    zi_t *z = zi_open(o);
+    if (!z) return -1;
+    zi_apply_in_t in;
+    memset(&in, 0, sizeof(in));
+    if (tmpl) in = *tmpl;
+    in.zone = zone;
+    in.zone_text = text;
+    in.zone_text_len = strlen(text);
+    in.shown = "zone text";
+    int st = zi_apply_changes(z, &in, r);
+    zi_close(z);
+    return st;
+}
+
+static void t_apply_text(void) {
+    printf("  apply with a zone text\n");
+    be_fresh(true);
+    zi_opts_t o = base_opts();
+    o.serial = ZI_SERIAL_INCREMENT;
+    o.snapshot = true;
+    CHECK(imp_zone(&o, "example.test", 10, K_BODY, NULL) == ZI_OK);
+    const char *Z = "example.test.";
+    zi_result_t r;
+
+    /* merge: the RRsets of the text replace those of the zone, the rest stays; an apex SOA that differs in the serial only is not written, the serial is raised as for any change */
+    char *t = zone_text("example.test", 777, "www IN A 192.0.2.81\nnew IN TXT \"x\"\n");
+    long ns_id = qn("SELECT id FROM records WHERE name = 'ns1.example.test' AND type = 'A'"), apex_id = qn("SELECT id FROM records WHERE name = 'example.test' AND type = 'NS'");
+    long www_id = qn("SELECT min(id) FROM records WHERE name = 'www.example.test'");
+    CHECK(apptext(&o, Z, t, NULL, &r) == ZI_OK);
+    /* the RRsets of the text that equal the zone's are not written again (a write that changes nothing is still a write: the audit log, row level security) */
+    CHECK(qn("SELECT id FROM records WHERE name = 'ns1.example.test' AND type = 'A'") == ns_id && qn("SELECT id FROM records WHERE name = 'example.test' AND type = 'NS'") == apex_id);
+    CHECK(qn("SELECT min(id) FROM records WHERE name = 'www.example.test'") != www_id && r.records_inserted == 2 && r.records_deleted == 1);
+    CHECK(r.n_items == 2 && item_of(&r, "www.example.test", "A") && item_of(&r, "new.example.test", "TXT") && !r.wrote_soa && r.serial_bumped && serial_of("example.test") == 11);
+    CHECK(qn("SELECT count(*) FROM records WHERE type = 'MX'") == 1 && qn("SELECT count(*) FROM records WHERE type = 'SOA'") == 1);
+    zi_result_free(&r);
+    free(t);
+
+    /* replace (delete_others): what the text does not have goes, except the apex SOA; the text's www is the zone's already */
+    t = zone_text("example.test", 11, "www IN A 192.0.2.81\n");
+    zi_apply_in_t rep;
+    memset(&rep, 0, sizeof(rep));
+    rep.delete_others = true;
+    rep.kind = "import";
+    CHECK(apptext(&o, Z, t, &rep, &r) == ZI_OK);
+    CHECK(r.n_items == 3 && item_of(&r, "new.example.test", "TXT") && item_of(&r, "mail.example.test", "MX") && item_of(&r, "mx.example.test", "A") && r.rrsets_deleted == 3);
+    CHECK(serial_of("example.test") == 12 && qn("SELECT count(*) FROM records WHERE type IN ('SOA', 'NS')") == 2 && qn("SELECT count(*) FROM karidns_zone_versions WHERE kind = 'import' AND version = 3") == 1);
+    zi_result_free(&r);
+    /* ... a text without an SOA keeps the SOA (the text is not a zone then: the checks of a part) */
+    CHECK(apptext(&o, Z, "$ORIGIN example.test.\n$TTL 3600\n@ IN NS ns1.example.test.\nns1 IN A 192.0.2.1\nonly IN A 192.0.2.9\n", &rep, &r) == ZI_OK);
+    CHECK(r.n_items == 2 && item_of(&r, "only.example.test", "A") && item_of(&r, "www.example.test", "A") && !r.wrote_soa);
+    CHECK(qn("SELECT count(*) FROM records WHERE type = 'SOA'") == 1 && serial_of("example.test") == 13);
+    zi_result_free(&r);
+    free(t);
+
+    /* an SOA that differs in more than the serial is written (and the serial is the database's + 1); names with and without the final dot are the same name */
+    CHECK(apptext(&o, Z, "$ORIGIN example.test.\n$TTL 60\n@ IN SOA ns1.example.test. hostmaster.example.test. 1 7200 3600 1209600 600\n", NULL, &r) == ZI_OK);
+    CHECK(r.wrote_soa && !r.serial_bumped && serial_of("example.test") == 14 && item_of(&r, "example.test", "SOA"));
+    zi_result_free(&r);
+    be_exec("UPDATE records SET content = 'NS1.example.test. hostmaster.example.test. 14 7200 3600 1209600 600' WHERE type = 'SOA'");
+    CHECK(apptext(&o, Z, "$ORIGIN example.test.\n$TTL 60\n@ IN SOA ns1.example.test. hostmaster.example.test. 99 7200 3600 1209600 600\n", NULL, &r) == ZI_OK);
+    CHECK(r.n_items == 0 && !r.wrote_soa && serial_of("example.test") == 14);
+    zi_result_free(&r);
+    be_exec("UPDATE records SET content = 'ns1.example.test hostmaster.example.test 14 7200 3600 1209600 600' WHERE type = 'SOA'");
+
+    /* what a zone text may not carry: the signer's data, tags, attributes; and what is not a zone text */
+    const char *refused[] = {
+        "$ORIGIN example.test.\n$TTL 60\nx IN A 192.0.2.1\nx IN RRSIG A 8 3 60 20350101000000 20250101000000 1 example.test. AAAA\n",
+        "$ORIGIN example.test.\n$TTL 60\n@ IN DNSKEY 257 3 8 AwEAAcvPyrbeMXE2CxVFJhnpJAWoJJJMiqpbRVvIgN0o\n",
+        "$ORIGIN example.test.\n$TTL 60\n$LOCATION-TAG office 10.0.0.0/8\nx IN A 192.0.2.1\n",
+        "$ORIGIN example.test.\n$TTL 60\n@ IN CDS 1 8 2 49FD46E6C4B45C55D4AC49FD46E6C4B45C55D4AC49FD46E6C4B45C55D4AC49FD\n",
+    };
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        log_reset();
+        CHECK(apptext(&o, Z, refused[i], NULL, &r) == ZI_FAIL);
+        zi_result_free(&r);
+    }
+    LOG_HAS("db.apply.changes");
+    log_reset();
+    CHECK(apptext(&o, Z, "$ORIGIN example.test.\nthis is not a zone\n", NULL, &r) == ZI_FAIL);
+    LOG_HAS("db.apply.changes");
+    zi_result_free(&r);
+    CHECK(apptext(&o, Z, "", NULL, &r) == ZI_FAIL);
+    zi_result_free(&r);
+    CHECK(serial_of("example.test") == 14 && qn("SELECT count(*) FROM records WHERE type IN ('RRSIG', 'DNSKEY', 'CDS')") == 0);
+
+    /* a signer zone: its DNSSEC records stay when the text replaces the rest */
+    be_exec("INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'X-KARIDNS-SIGNER', '1' FROM domains WHERE name = 'example.test'");
+    be_exec("INSERT INTO records (domain_id, name, type, content, ttl) SELECT id, 'example.test', 'DNSKEY', '257 3 8 AwEAAcvPyrbeMXE2CxVFJhnpJAWoJJJMiqpbRVvIgN0o', 60 FROM domains WHERE name = 'example.test'");
+    CHECK(apptext(&o, Z, "$ORIGIN example.test.\n$TTL 60\n@ IN NS ns1.example.test.\nns1 IN A 192.0.2.1\n", &rep, &r) == ZI_OK);
+    CHECK(qn("SELECT count(*) FROM records WHERE type = 'DNSKEY'") == 1 && qn("SELECT count(*) FROM records WHERE type = 'SOA'") == 1);
+    zi_result_free(&r);
+
+    /* a new zone from a text: the text is the whole zone, version 1 has the kind create; a zone that is there is refused */
+    zi_apply_in_t cr;
+    memset(&cr, 0, sizeof(cr));
+    cr.create = true;
+    t = zone_text("textzone.test", 5, "www IN A 192.0.2.7\n");
+    CHECK(apptext(&o, "textzone.test.", t, &cr, &r) == ZI_OK);
+    CHECK(r.created && r.committed && r.version == 1 && serial_of("textzone.test") == 5 && qn("SELECT count(*) FROM karidns_zone_versions v JOIN domains d ON d.id = v.domain_id "
+                                                                                          "WHERE d.name = 'textzone.test' AND v.kind = 'create'") == 1);
+    zi_result_free(&r);
+    log_reset();
+    CHECK(apptext(&o, "textzone.test.", t, &cr, &r) == ZI_FAIL);
+    LOG_HAS("db.apply.zone");
+    zi_result_free(&r);
+    free(t);
+    log_reset();
+    CHECK(apptext(&o, "empty.test.", "$ORIGIN empty.test.\n", &cr, &r) == ZI_FAIL);
+    zi_result_free(&r);
+}
+
 /* the driver functions of items D and E: the generation, the version rows and their numbers, the retention, the actor, the SOA serial */
 static void t_apply_driver(void) {
     printf("  generation, versions, retention\n");
@@ -2896,6 +3009,7 @@ static void run_scenarios(void) {
     t_signer_zone_import();
     t_signer_driver();
     t_apply();
+    t_apply_text();
     t_apply_driver();
 #ifdef KARIDNS_DB_POSTGRESQL
     if (g_be == BE_PG) {

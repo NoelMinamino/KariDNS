@@ -33,27 +33,27 @@ export function rrOk(grants, { schema, zone, name, type, ttl }) {
   const n = name.toLowerCase();
   if (!underName(n, z)) return null;
   const t = canonType(type) || null;
-  for (const g of grants) {
-    const inScope = g.role === 'global_master'
-      || (g.data_schema === schema && g.zone_name === z
-          && (g.role === 'domain_master' || n === g.name_suffix || n.endsWith(`.${g.name_suffix}`)));
-    if (!inScope) continue;
-    const p = g.policy;
-    if (WILDCARD.test(n) && !p.allow_wildcard) continue;
-    if (t === null) {
-      if (n !== z) return g;
-      continue;
-    }
-    if (!p.allowed_types.includes(t) || DNSSEC.has(t)) continue;
-    const ttlv = ttl ?? 0;
-    if (ttlv < p.ttl_min || ttlv > p.ttl_max) continue;
-    if (t === 'NS' && n !== z && !p.allow_delegation) continue;
-    if (t === 'DNAME' && !p.allow_dname) continue;
-    if (n === z && !(p.apex_editable && g.role !== 'subdomain_master')) continue;
-    if (t === 'SOA' && !(n === z && g.role === 'global_master' && p.apex_editable)) continue;
-    return g;
-  }
+  for (const g of grants) if (grantAllows(g, schema, z, n, t, ttl)) return g;
   return null;
+}
+
+// The rule of rr_ok for ONE grant (z, n lower case and n inside z; t canonical or null for a bare name): may a holder of g write this record?
+export function grantAllows(g, schema, z, n, t, ttl) {
+  const inScope = g.role === 'global_master'
+    || (g.data_schema === schema && g.zone_name === z
+        && (g.role === 'domain_master' || n === g.name_suffix || n.endsWith(`.${g.name_suffix}`)));
+  if (!inScope) return false;
+  const p = g.policy;
+  if (WILDCARD.test(n) && !p.allow_wildcard) return false;
+  if (t === null) return n !== z;
+  if (!p.allowed_types.includes(t) || DNSSEC.has(t)) return false;
+  const ttlv = ttl ?? 0;
+  if (ttlv < p.ttl_min || ttlv > p.ttl_max) return false;
+  if (t === 'NS' && n !== z && !p.allow_delegation) return false;
+  if (t === 'DNAME' && !p.allow_dname) return false;
+  if (n === z && !(p.apex_editable && g.role !== 'subdomain_master')) return false;
+  if (t === 'SOA' && !(n === z && g.role === 'global_master' && p.apex_editable)) return false;
+  return true;
 }
 
 // May the principal READ this record?  The name must be inside the zone for every grant; then a global master sees every such row, a domain master the rows
@@ -114,3 +114,41 @@ export const maySetGrant = (grants, grant) => isGlobal(grants) || mayGrant(grant
 // Which audit_log rows does the principal see?  A global master all, a domain master of the row's zone those of the zone (audit_visible).  `schema` is the
 // data schema of the row; for a row about a grant (table karidns_auth.grants) it is the schema the grant names.
 export const auditVisible = (grants, { schema, zone }) => isGlobal(grants) || (zone !== null && zone !== undefined && zoneGrant(grants, schema, zone) === 'domain_master');
+
+// ---------------------------------------------------------------------------------------------------------------------------------- change sets
+// Rule 1 of planning 4.10 (3.3 step 4): ONE grant must allow the whole change set, every RRset of it, the records it removes and the records it writes (row level
+// security checks each row of both kinds again, so a record that is out of the policy's TTL range cannot be touched either).  An item is
+//   { name, type, ttls }   name canonical, type any spelling, ttls the TTLs of the records involved; no ttls (a DELETE of the request: nothing is known of the
+//                          records yet) means "any record the grant allows", tested with its lowest TTL.
+const itemAllowedBy = (g, schema, zone, it) => {
+  if (!underName(it.name, zone)) return false;
+  const t = canonType(it.type) || null;
+  const ttls = it.ttls && it.ttls.length ? it.ttls : [g.policy.ttl_min];
+  return ttls.every((ttl) => grantAllows(g, schema, zone, it.name, t, ttl));
+};
+
+// -> { grant } (the first of the principal's grants on the zone, strongest first, that allows every item and, when scopeAfter(g) gives a number of records,
+// keeps max_rr), or { denied: { reason, index?, limit?, count? } }: 'max-rr' (the items are allowed but the scope would hold more records than max_rr, A-24),
+// 'rrset' (the first item no grant allows by itself) or 'no-single-grant' (every item is allowed by some grant but none allows all: index is the first item
+// the strongest grant refuses)
+export function chooseGrant(grants, { schema, zone, items, scopeAfter }) {
+  const z = zone.toLowerCase();
+  const cands = grantsOn(grants, schema, z);
+  let maxrr = null;
+  for (const g of cands) {
+    if (!items.every((it) => itemAllowedBy(g, schema, z, it))) continue;
+    if (g.policy.max_rr !== null && scopeAfter) {
+      const count = scopeAfter(g);
+      if (count !== null && count > g.policy.max_rr) {
+        maxrr ??= { reason: 'max-rr', limit: g.policy.max_rr, count };
+        continue;
+      }
+    }
+    return { grant: g };
+  }
+  if (maxrr) return { denied: maxrr };
+  const alone = items.findIndex((it) => !cands.some((g) => itemAllowedBy(g, schema, z, it)));
+  if (alone >= 0) return { denied: { reason: 'rrset', index: alone } };
+  const first = cands.length ? items.findIndex((it) => !itemAllowedBy(cands[0], schema, z, it)) : 0;
+  return { denied: { reason: 'no-single-grant', index: first < 0 ? 0 : first } };
+}

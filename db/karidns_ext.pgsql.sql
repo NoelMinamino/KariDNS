@@ -866,6 +866,15 @@ CREATE OR REPLACE FUNCTION karidns_auth.api_token_lookup(tid bigint, h bytea) RE
     FROM karidns_auth.api_tokens t JOIN karidns_auth.principals p ON p.id = t.principal_id AND NOT p.disabled
    WHERE t.id = tid AND t.secret_hash = h AND t.revoked_at IS NULL AND t.expires_at > now()
 $$;
+-- The hourly sweep of the API: the sessions whose absolute time is over, of every principal (the policy of sessions shows the API role its own principal's rows
+-- only, so it could not delete the rest).  Returns the number of rows deleted.  Nothing else is deleted here.
+CREATE OR REPLACE FUNCTION karidns_auth.sweep_expired() RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+DECLARE n bigint;
+BEGIN
+  DELETE FROM karidns_auth.sessions WHERE expires_at <= now();
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END $$;
 
 -- ---------------------------------------------------------------------------------------------------------------------------------
 -- The audit log (4.5).  Only the owner may write it; the trigger functions are SECURITY DEFINER, so the roles that change the data
@@ -1988,7 +1997,7 @@ REVOKE EXECUTE ON FUNCTION karidns_auth.current_principal(), karidns_auth.my_gro
   karidns_auth.may_grant(text, text, text, bigint), karidns_auth.grants_escalation_fn(), karidns_auth.signer_soa_fn(), karidns_auth.assert_service_role(text, text),
   karidns_auth.set_policy(regclass, text, text, text, text, text, boolean), karidns_auth.create_policies(text),
   karidns_auth.create_signer_policies(text, text), karidns_auth.enable_rls(text), karidns_auth.disable_rls(text), karidns_auth.session_lookup(bytea),
-  karidns_auth.api_token_lookup(bigint, bytea), karidns_auth.enable_never_commit(text), karidns_auth.disable_never_commit(text),
+  karidns_auth.api_token_lookup(bigint, bytea), karidns_auth.sweep_expired(), karidns_auth.enable_never_commit(text), karidns_auth.disable_never_commit(text),
   karidns_auth.assert_check_role(text, text) FROM PUBLIC;
 -- (canon_type, is_dnssec_type and setting_principal stay with PUBLIC: the policies and the trigger conditions of the signer call them as the signer.)
 -- The role scripts grant EXECUTE on current_principal, my_groups, zone_grant, is_global, rr_ok, rr_visible and audit_visible (and bump_serial to the API

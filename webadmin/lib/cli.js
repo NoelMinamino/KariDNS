@@ -143,6 +143,7 @@ export async function main(argv, io = {}) {
   }
   const app = new App({ config, backend, log, run: d.run, key });
   app.versions = checked.versions;
+  app.types = checked.types ? new Set(checked.types) : null;
   let server;
   try {
     server = await d.listen(app, new Router(ROUTES));
@@ -152,10 +153,11 @@ export async function main(argv, io = {}) {
     log.close();
     return 1;
   }
-  // expired sessions and tokens: on SQLite3 there is no row level security, so the API deletes them all at the start and every hour; on PostgreSQL a principal
-  // deletes its own at its login (the API role cannot see the rows of the others)
+  // expired sessions: on SQLite3 there is no row level security, so the API deletes them all at the start and every hour; on PostgreSQL the API role sees the rows of its
+  // own principal only, so a SECURITY DEFINER function does it (karidns_auth.sweep_expired()), and a principal also deletes its own at its login
   const sweep = () => {
     if (backend.dialect === 'sqlite') app.background(() => backend.tx({ write: true }, (tx) => S.deleteExpiredSessions(tx, app.now())));
+    else app.background(() => backend.tx({ write: true }, (tx) => S.sweepExpired(tx)));
   };
   sweep();
   const timer = setInterval(sweep, 3600000);
