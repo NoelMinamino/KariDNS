@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 
 const clean = (s) => String(s).replace(/[\0-\x1f\x7f]+/g, ' ');
 
-export function createLogger({ target = 'stderr', name = 'karidns-signer', stream = process.stderr, spawnFn = spawn, loggerPath = '/usr/bin/logger' } = {}) {
+export function createLogger({ target = 'stderr', name = 'karidns', stream = process.stderr, spawnFn = spawn, loggerPath = '/usr/bin/logger' } = {}) {
   let sink = null;                       // the stdin of logger(1)
   if (target !== 'stderr') {
     try {

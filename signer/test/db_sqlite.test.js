@@ -4,7 +4,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { SqliteDb, loadSqlite, acquireFileLock } from '../lib/db_sqlite.js';
+import { SqliteDb, acquireFileLock } from '../lib/db_sqlite.js';
+import { loadSqlite } from '../../node/lib/sqlite.js';
 
 const sqlite = await loadSqlite();
 const SCHEMA = [new URL('../../tests/db/pdns_schema.sqlite3.sql', import.meta.url), new URL('../../db/karidns_ext.sqlite3.sql', import.meta.url)];
@@ -23,32 +24,6 @@ function fresh() {
 // Windows keeps SQLite files open a little longer; a left-over temporary directory is not a failure of the test
 const rmDir = (d) => { try { fs.rmSync(d, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); } catch (e) { if (process.platform !== "win32") throw e; } };
 const id = (raw, n) => raw.prepare('SELECT id FROM domains WHERE name = ?').get(n).id;
-
-test('loadSqlite: no ExperimentalWarning line, the original emitWarning is back, a missing module is explained', async () => {
-  const before = process.emitWarning;
-  const seen = [];
-  process.on('warning', (w) => seen.push(w));
-  await loadSqlite();
-  assert.equal(process.emitWarning, before);
-  await assert.rejects(loadSqlite(() => Promise.reject(new Error('no such module'))), /needs node:sqlite \(Node 22\.13 or newer\): no such module/);
-  assert.equal(process.emitWarning, before);
-  // the filter passes other warnings through, and an object-form ExperimentalWarning about something else
-  const emit = process.emitWarning;
-  let passed = 0;
-  process.emitWarning = () => { passed++; };
-  try {
-    await loadSqlite(async () => {
-      process.emitWarning('SQLite is an experimental feature', 'ExperimentalWarning');
-      process.emitWarning('SQLite is an experimental feature', { type: 'ExperimentalWarning' });
-      process.emitWarning('something else', 'ExperimentalWarning');
-      process.emitWarning('SQLite deprecated', 'DeprecationWarning');
-      return sqlite;
-    });
-  } finally {
-    process.emitWarning = emit;
-  }
-  assert.equal(passed, 2);
-});
 
 test('one signer per database file; the lock of a dead process is taken over', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-lock-'));

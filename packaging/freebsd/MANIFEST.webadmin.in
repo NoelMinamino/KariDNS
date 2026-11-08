@@ -1,0 +1,38 @@
+name: "karidns-webadmin"
+version: "__VERSION__"
+origin: "dns/karidns-webadmin"
+comment: "HTTP API for the zones, users and grants of a KariDNS database"
+arch: "__ARCH__"
+www: "https://github.com/NoelMinamino/KariDNS"
+maintainer: "noel@karidns.org"
+prefix: "/usr/local"
+licenselogic: "single"
+licenses: [
+    "MIT"
+]
+desc: <<EOD
+karidns-webadmin is the HTTP API of a KariDNS database (PostgreSQL or SQLite3): logins with TOTP, users, groups and grants (global, domain and
+subdomain masters), the zones and their records, change sets, zone versions and rollback, and templates. It runs karidns-zone and karicheck (from
+karidns-sqlite3, karidns-postgresql or karidns-db, and from karidns, which must be installed first).
+EOD
+categories: [
+    "dns",
+    "net",
+    "sysutils"
+]
+scripts: {
+    pre-install: <<EOD
+if [ ! -x /usr/local/bin/karidns-zone ] || [ ! -x /usr/local/bin/karicheck ]; then
+    echo "karidns-webadmin needs karidns-zone and karicheck: install karidns-sqlite3, karidns-postgresql or karidns-db first" >&2
+    exit 1
+fi
+pw groupshow karidns-webadmin >/dev/null 2>&1 || pw groupadd karidns-webadmin
+pw usershow karidns-webadmin >/dev/null 2>&1 || pw useradd karidns-webadmin -g karidns-webadmin -h - -d /var/db/karidns-webadmin -s /usr/sbin/nologin -c "KariDNS WebAdmin"
+EOD
+}
+deps: {
+__DEPS__
+}
+files: {
+__FILES__
+}

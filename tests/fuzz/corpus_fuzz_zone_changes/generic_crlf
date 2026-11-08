@@ -1,0 +1,3 @@
+rr www.fuzz.test. 300 TYPE65400 \# 3 010203
+delete  	fuzz.test.   NS   
+rr   a.fuzz.test.	60	AAAA	2001:db8::1

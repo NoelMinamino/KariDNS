@@ -19,17 +19,22 @@ export function childEnv(home = process.env.HOME, profile = process.env.LLVM_PRO
 }
 
 // -> Promise<{ code, signal, stdout, stderr, truncated, timedOut, spawnError }>; never rejects.  The output is kept up to maxOutput octets per stream;
-// a child that writes more is killed (truncated: true).  After timeoutMs the child gets SIGKILL (timedOut: true).
-export function runChild(file, argv, { cwd, timeoutMs = 60000, maxOutput = 1 << 20, spawnFn = spawn, env = childEnv() } = {}) {
+// a child that writes more is killed (truncated: true).  After timeoutMs the child gets SIGKILL (timedOut: true).  input (a string or a Buffer) is written to the
+// child's standard input, which is then closed; without it the child has no standard input.
+export function runChild(file, argv, { cwd, timeoutMs = 60000, maxOutput = 1 << 20, spawnFn = spawn, env = childEnv(), input } = {}) {
   return new Promise((resolve) => {
     const res = { code: null, signal: null, stdout: '', stderr: '', truncated: false, timedOut: false, spawnError: null };
     let child;
     try {
-      child = spawnFn(file, argv, { cwd, env, shell: false, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+      child = spawnFn(file, argv, { cwd, env, shell: false, stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'], windowsHide: true });
     } catch (e) {
       res.spawnError = e.message;
       resolve(res);
       return;
+    }
+    if (input !== undefined) {
+      child.stdin.on('error', () => {});                  // the child may exit without reading it all (EPIPE): its status says what happened
+      child.stdin.end(input);
     }
     const out = [[], []];
     const size = [0, 0];

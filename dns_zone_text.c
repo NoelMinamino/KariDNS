@@ -939,3 +939,97 @@ static int file_sink(void *ud, const char *data, size_t len) { return fwrite(dat
 bool dns_zone_text_write_file(const zone_arena_t *arena, const char *apex, const dzt_opts_t *opts, FILE *fp, char *err, size_t errlen) {
     return dns_zone_text_write(arena, apex, opts, file_sink, fp, err, errlen);
 }
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* one RRset as lines (karidns-zone apply: the delta of a change set, the rows of karidns_zone_version_rrsets)       */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+static int rrset_key_cmp(const void *pa, const void *pb) {
+    const dzt_key_t *a = pa, *b = pb;
+    size_t n = a->rdlen < b->rdlen ? a->rdlen : b->rdlen;                       /* RFC 4034 section 6.3: RDATA as left-justified octets */
+    int c = n ? memcmp(a->rd, b->rd, n) : 0;
+    if (c) return c;
+    if (a->rdlen != b->rdlen) return a->rdlen < b->rdlen ? -1 : 1;
+    return a->r->ttl_value < b->r->ttl_value ? -1 : a->r->ttl_value > b->r->ttl_value;
+}
+
+char *dns_zone_text_rrset_lines(const dns_record_t *const *recs, size_t n, char *err, size_t errlen) {
+    dzt_t z;
+    memset(&z, 0, sizeof(z));
+    z.err = err;
+    z.errlen = errlen;
+    snprintf(z.apex, sizeof(z.apex), ".");                 /* no zone to be relative to: every name is written absolute */
+    z.apex_len = 1;
+    z.apex_root = true;
+    dzt_key_t *keys = calloc(n ? n : 1, sizeof(*keys));
+    uint8_t *tmp = malloc(65535), *pool = NULL;
+    size_t plen = 0, pcap = 0;
+    char *result = NULL;
+    if (!keys || !tmp) {
+        fail_msg(err, errlen, "out of memory");
+        goto done;
+    }
+    for (size_t i = 0; i < n; i++) {
+        const dns_record_t *r = recs[i];
+        dzt_key_t *k = &keys[i];
+        k->r = r;
+        k->idx = i;
+        if (!r->name) {
+            fail_msg(err, errlen, "record %zu: no owner name", i + 1);
+            goto done;
+        }
+        for (int j = 0; j < r->rdata_count; j++)
+            if (!r->rdata || !r->rdata[j]) {
+                fail_rec(err, errlen, k, "a missing RDATA field");
+                goto done;
+            }
+        long rl = dns_record_canonical_rdata(r, tmp, 65535);
+        if (rl < 0) {
+            fail_rec(err, errlen, k, "the RDATA cannot be encoded");
+            goto done;
+        }
+        if (plen + (size_t)rl > pcap) {
+            size_t nc = pcap ? pcap : 4096;
+            while (nc < plen + (size_t)rl) nc *= 2;
+            uint8_t *np = realloc(pool, nc);
+            if (!np) {
+                fail_msg(err, errlen, "out of memory");
+                goto done;
+            }
+            pool = np;
+            pcap = nc;
+        }
+        if (rl) memcpy(pool + plen, tmp, (size_t)rl);
+        k->off = plen;
+        k->rdlen = (uint16_t)rl;
+        plen += (size_t)rl;
+    }
+    for (size_t i = 0; i < n; i++) keys[i].rd = pool ? pool + keys[i].off : NULL;
+    qsort(keys, n, sizeof(*keys), rrset_key_cmp);
+    for (size_t i = 0; i < n; i++) {
+        const dns_record_t *r = keys[i].r;
+        char tb[32];
+        const char *why;
+        if (i) out_addc(&z.out, '\n');
+        out_addf(&z.out, "%u ", (unsigned)r->ttl_value);
+        out_adds(&z.out, type_token(r->type_code, tb, sizeof(tb)));
+        out_addc(&z.out, ' ');
+        if ((why = put_rdata(&z, r)) != NULL) {
+            fail_rec(err, errlen, &keys[i], why);
+            goto done;
+        }
+    }
+    if (z.out.oom) {
+        fail_msg(err, errlen, "out of memory");
+        goto done;
+    }
+    result = z.out.p ? z.out.p : strdup("");
+    z.out.p = NULL;
+    if (!result) fail_msg(err, errlen, "out of memory");
+done:
+    free(z.out.p);
+    free(keys);
+    free(tmp);
+    free(pool);
+    return result;
+}

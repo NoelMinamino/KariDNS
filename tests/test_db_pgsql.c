@@ -1163,7 +1163,7 @@ static void test_notify(void) {
         CHECK(D->poll_version(c3, &p2, &r3) == 0 && p2 != p0);              /* a commit */
         CHECK(D->poll_version(c3, &p1, &r3) == 0 && p1 == p2);
         CHECK(qx(w2, "BEGIN") && qx(w2, "INSERT INTO records (domain_id, name, type, content, ttl) VALUES (2, 'n4.b.test', 'A', '192.0.2.14', 60)"));
-        Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (2, 'n5.b.test', 'A', '192.0.2.15', 60)");   /* higher seq, commits first */
+        Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (3, 'n5.c.test', 'A', '192.0.2.15', 60)");   /* higher seq, commits first (another zone: two open transactions of one zone queue on its generation row) */
         CHECK(D->poll_version(c3, &p3, &r3) == 0 && p3 != p2);
         CHECK(qx(w2, "COMMIT"));                                            /* the lower seq becomes visible last */
         CHECK(D->poll_version(c3, &p2, &r3) == 0 && p2 != p3);

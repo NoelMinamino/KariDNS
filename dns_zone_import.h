@@ -56,6 +56,7 @@
 #include <stdint.h>
 #include <time.h>
 #include "dns_db_driver.h"
+#include "dns_zone_changes.h"
 #include "dns_zone_lint.h"
 #include "dns_zone_msg.h"
 
@@ -92,6 +93,7 @@ typedef struct {
     int n_loc_tags;
     zone_limits_t limits;               /* max-records, max-records-per-type, max-types-per-name, max-zone-ttl; 0 = no limit */
     pdns_opts_t reader;                 /* default-ttl, max-zone-records and max-zone-bytes of options { database { } } for the read-back; zero = the loader's defaults */
+    bool snapshot;                      /* every write transaction is REPEATABLE READ (PostgreSQL): a row that another session changed after the tool read the zone is a conflict (apply, signer) */
     bool audit_summary;                 /* the audit log (schema version 3): PostgreSQL logs one row per statement and table instead of one per row */
     const char *audit_actor;            /* SQLite3: the db_role of the row of karidns_audit_actor each write transaction carries (NULL: no row); must outlive the import */
     zi_report_fn report;                /* NULL: no report */
@@ -107,6 +109,14 @@ typedef struct {
     size_t len;
     time_t mtime;                       /* tinydns: the SOA serial of a . line (0: now); a file's own mtime is used */
 } zi_input_t;
+
+/* One RRset that an import or an apply changes (zi_result_t.items): what '+' (new) '~' (replaced with other data) '-' (deleted); owner lower case without the final dot;
+ * type upper case; before / after: the RRset as canonical lines "<ttl> <TYPE> <rdata>" joined by LF (dns_zone_text_rrset_lines()), NULL = it was not there / is not there
+ * any more.  Only an apply makes them; an import makes them for the zone versions when the database has the tables and the change is not too big. */
+typedef struct {
+    char what;
+    char *owner, *type, *before, *after;
+} zi_change_t;
 
 typedef struct {
     char zone[DNS_NAME_TEXT_SIZE];      /* domains.name: lowercase, no final dot */
@@ -126,7 +136,21 @@ typedef struct {
     time_t min_expire;                  /* the earliest RRSIG expiration of the zone after the write (RFC 4034 3.1.5: 32 bit serial number arithmetic, put near now) */
     bool has_write_id;
     db_write_id_t write_id;             /* dns_db_driver.h w_write_id() */
+    /* karidns-zone apply, and the versions an import writes (items D and E) */
+    bool has_generation;
+    uint64_t generation;                /* the zone's generation when the transaction began (0: a new zone) */
+    uint64_t generation_after;          /* ... and before the commit (what the version row has) */
+    bool serial_bumped;                 /* the SOA serial was raised by 1 because the change set changed the zone and wrote no SOA */
+    bool has_version;
+    uint32_t version;                   /* the version row written (also by a dry run, which rolls it back) */
+    bool delta_complete;                /* the RRset rows of the version were written (false: more than 10000 RRsets, or no version tables) */
+    zi_change_t *items;                 /* the RRsets changed, in owner, type order; free with zi_result_free() */
+    size_t n_items;
+    uint64_t records_before, records_after;     /* enabled records of the zone the session could see, before and after (empty non-terminals not counted) */
 } zi_result_t;
+
+void zi_result_free(zi_result_t *res);        /* the items of an apply; harmless on any other result */
+
 
 typedef enum { ZI_OK = 0, ZI_FAIL = 1, ZI_BUSY = 2, ZI_CHANGED = 3 } zi_status_t;      /* ZI_BUSY: another importer holds the zone; try again.  ZI_CHANGED: signer mode, the zone's data differs from the file's: nothing was written */
 
@@ -136,6 +160,41 @@ typedef struct zi_s zi_t;
  * zone_type, file_zones, src) must stay valid until zi_close(). */
 zi_t *zi_open(const zi_opts_t *o);
 void zi_close(zi_t *z);
+
+/* ---------------------------------------------------------------------------------------------------------------------------------------------------
+ * karidns-zone apply (0.6.0 items D and E; docs/karidns-zone.md "apply"): a change file (dns_zone_changes.h) instead of a zone file.
+ *
+ * The RRsets that have rr lines REPLACE those of the zone, the RRsets of the delete lines are deleted (the RRset merge of --mode merge, with deletes); nothing else
+ * of the zone is touched.  The rr lines go through the zone checks of `karicheck zone` exactly as `import --mode merge` does (a part of a zone is not judged by the
+ * SOA, NS and glue it lacks), the transaction writes the change, raises the SOA serial by one when the change set changed the zone and wrote no SOA of its own
+ * (serial ZI_SERIAL_INCREMENT; the API's role does it through karidns_auth.bump_serial()), reads the zone back through the loader's reader, writes the version row
+ * and its RRset rows (item E), and commits - or rolls back for a dry run.  The result has the generation of the zone (karidns_zone_state) and the RRsets changed
+ * with their records before and after.  ZI_CHANGED: the zone is not at expect_generation, or a concurrent writer changed a row the transaction wrote (PostgreSQL:
+ * REPEATABLE READ, SQLSTATE 40001).  ZI_BUSY: another importer holds the zone.
+ * --------------------------------------------------------------------------------------------------------------------------------------------------- */
+typedef struct {
+    const char *zone;                   /* the zone as the change file names it: lower case with the final dot (pdns_canonical_zone_name()) */
+    const zc_changes_t *changes;        /* the change file; or NULL with zone_text */
+    const char *zone_text;              /* instead of a change file: the zone as BIND zone-file text (len bytes; standard-input rules: no $INCLUDE).  Its RRsets are merged like
+                                         * rr lines; plain records only (no DNSSEC data, no location / ECS tags, no tinydns attributes: refused); the apex SOA of an existing
+                                         * zone is left alone when the text's differs from it in the serial only */
+    size_t zone_text_len;
+    bool delete_others;                 /* zone_text, existing zone: also delete the RRsets the text does not have (not the apex SOA, not the DNSSEC records of a signer zone) */
+    bool create;                      /* the zone must not exist and is made (domains.type from the options): the rr lines are the whole zone (checked as a whole zone) */
+    bool have_expect;
+    uint64_t expect_generation;         /* the transaction fails with ZI_CHANGED unless the zone has this generation */
+    bool readback_changed;              /* read back only the rows of the changed RRsets, not the whole zone (the commit run of the API: the check run, at the same generation,
+                                         * has checked the whole zone; row level security shows the API's session only a part of it) */
+    bool api_serial;                    /* raise the serial with karidns_auth.bump_serial() (PostgreSQL, the role of the API; needs the principal) */
+    db_actor_t actor;                   /* the principal and the change set (the audit log and the version row name them) */
+    const char *kind;                   /* the kind of the version row: edit (NULL), template, import, rollback (create is chosen by the create flag) */
+    const char *comment;                /* NULL, or at most 1024 octets */
+    uint32_t rollback_of;               /* 0, or the version a rollback restores */
+    const char *shown;                  /* the name of the change file in messages */
+} zi_apply_in_t;
+
+/* Apply the change set.  res (not NULL) has the generation, the version and the items; free it with zi_result_free().  ZI_OK, ZI_FAIL, ZI_BUSY, ZI_CHANGED. */
+int zi_apply_changes(zi_t *z, const zi_apply_in_t *in, zi_result_t *res);
 
 /* One zone from a BIND zone file.  zone: its name (NULL: the owner of the first SOA).  res may be NULL.  ZI_OK, ZI_FAIL, ZI_BUSY, ZI_CHANGED. */
 int zi_import_zone(zi_t *z, const zi_input_t *in, const char *zone, zi_result_t *res);

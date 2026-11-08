@@ -11,7 +11,7 @@ command -v "$NODE" >/dev/null 2>&1 || { echo "SKIP: node is not installed"; exit
 
 OUT=$(mktemp "${TMPDIR:-/tmp}/karidns_signer_unit.XXXXXX") || exit 1
 trap 'rm -f "$OUT"' EXIT
-"$NODE" --test --experimental-test-coverage "test/*.test.js" > "$OUT" 2>&1
+"$NODE" --test --experimental-test-coverage "test/*.test.js" "../node/test/*.test.js" > "$OUT" 2>&1
 RC=$?
 grep -E '^(not ok|# (tests|pass|fail))|^ℹ (tests|pass|fail)|✖' "$OUT" | head -40
 sed -n '/start of coverage report/,/end of coverage report/p' "$OUT"

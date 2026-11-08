@@ -1,0 +1,113 @@
+#!/bin/sh
+#
+# PROVIDE: karidns_webadmin
+# REQUIRE: DAEMON NETWORKING
+# BEFORE: LOGIN
+# KEYWORD: shutdown
+#
+# karidns-webadmin (docs/karidns-webadmin.md, docs/karidns-api.md) is the HTTP API of a KariDNS database.  It runs as its own user and listens on 127.0.0.1 or a
+# UNIX socket (a reverse proxy in front does the TLS), or does TLS itself.
+# Add the following lines to /etc/rc.conf to enable it:
+#
+# karidns_webadmin_enable="YES"
+# karidns_webadmin_config="/usr/local/etc/karidns/karidns-webadmin.conf"   # the configuration file
+# karidns_webadmin_user="karidns-webadmin"                                 # the user the daemon runs as (created by the package)
+# karidns_webadmin_flags=""                                                # more options of karidns-webadmin
+#
+# service karidns_webadmin reload      reads the configuration file again (SIGHUP: rates, session times, public-origin, trusted-proxy; not the database or the address)
+# service karidns_webadmin configtest  karidns-webadmin --check, as the user the daemon runs as
+#
+# If the database is on this host, start it first: add its service name to REQUIRE above, or to the rcorder of your site (for example "postgresql").
+#
+
+. /etc/rc.subr
+
+name="karidns_webadmin"
+rcvar="karidns_webadmin_enable"
+
+load_rc_config "${name}"
+
+: ${karidns_webadmin_enable:="NO"}
+: ${karidns_webadmin_config:="/usr/local/etc/karidns/karidns-webadmin.conf"}
+: ${karidns_webadmin_user:="karidns-webadmin"}
+: ${karidns_webadmin_flags:=""}
+
+webadmin_program="${karidns_webadmin_wrapper:-/usr/local/sbin/karidns-webadmin}"      # (karidns_webadmin_wrapper is for tests with another build; not karidns_webadmin_program, which rc.subr takes for `command`)
+rundir="/var/run/${name}"                          # daemon(8) writes both pid files as the service user (rc.subr runs the command as ${name}_user with su(1)): a directory of that user
+pidfile="${rundir}/supervisor.pid"                  # daemon(8)'s supervisor: stop sends SIGTERM to it, it passes the signal on
+childpidfile="${rundir}/child.pid"                  # the daemon itself: reload sends SIGHUP to it
+# -r: start it again if it dies (after 10 seconds); -f: standard input, output and error to /dev/null (the daemon logs to syslog, see `log` in the configuration file)
+command="/usr/sbin/daemon"
+command_args="-r -R 10 -f -P ${pidfile} -p ${childpidfile} -t karidns-webadmin -- ${webadmin_program} -c ${karidns_webadmin_config} ${karidns_webadmin_flags}"
+
+required_files="${karidns_webadmin_config}"
+extra_commands="reload configtest"
+reload_cmd="karidns_webadmin_reload"
+configtest_cmd="karidns_webadmin_configtest"
+start_precmd="karidns_webadmin_prestart"
+stop_postcmd="karidns_webadmin_poststop"
+
+# the directory of the TOTP key file of the configuration file (the global value, before the first [dataset ...] section), else the default of karidns-webadmin
+karidns_webadmin_keydir()
+{
+    _key=$(awk '
+        /^[ \t]*\[/ { exit }
+        /^[ \t]*totp-key-file[ \t]*=/ {
+            v = $0; sub(/^[^=]*=[ \t]*/, "", v)
+            if (v ~ /^"/) { sub(/^"/, "", v); sub(/".*$/, "", v) } else { sub(/[ \t]+#.*$/, "", v); sub(/[ \t]+$/, "", v) }
+            print v; exit
+        }' "${karidns_webadmin_config}")
+    dirname "${_key:-/var/db/karidns-webadmin/totp.key}"
+}
+
+# the directories of the service: the one the TOTP key is made in (the user's, closed to others; only made when it is not there: never the mode of an existing directory
+# such as /etc) and the one of the pid files
+karidns_webadmin_dirs()
+{
+    if ! id -u "${karidns_webadmin_user}" >/dev/null 2>&1; then
+        warn "the user ${karidns_webadmin_user} does not exist"
+        return 1
+    fi
+    _group=$(id -gn "${karidns_webadmin_user}")
+    _keydir=$(karidns_webadmin_keydir)
+    if [ ! -d "${_keydir}" ]; then
+        install -d -o "${karidns_webadmin_user}" -g "${_group}" -m 0700 "${_keydir}" || return 1
+    fi
+    install -d -o "${karidns_webadmin_user}" -g "${_group}" -m 0755 "${rundir}" || return 1
+}
+
+karidns_webadmin_prestart()
+{
+    # no core dump: the process memory holds the password hashes of the logins in flight and the key of the TOTP secrets
+    ulimit -c 0
+    karidns_webadmin_dirs || return 1
+    # an old pidfile of a daemon that died must not stop a start (rc.subr checks the supervisor's)
+    rm -f "${childpidfile}"
+}
+
+karidns_webadmin_poststop()
+{
+    rm -f "${childpidfile}"
+    return 0
+}
+
+karidns_webadmin_reload()
+{
+    _pid=$(cat "${childpidfile}" 2>/dev/null)
+    if [ -z "${_pid}" ] || ! kill -0 "${_pid}" 2>/dev/null; then
+        echo "${name} is not running."
+        return 1
+    fi
+    echo "Reloading ${name} (SIGHUP)."
+    kill -HUP "${_pid}"
+}
+
+karidns_webadmin_configtest()
+{
+    echo "Checking configuration: ${karidns_webadmin_config}"
+    karidns_webadmin_dirs || return 1
+    # as the user the daemon runs as: the checks of the files and their modes are about that user
+    su -m "${karidns_webadmin_user}" -c "${webadmin_program} --check -c ${karidns_webadmin_config}"
+}
+
+run_rc_command "$1"

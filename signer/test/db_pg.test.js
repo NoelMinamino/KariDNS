@@ -2,29 +2,7 @@
 // is tests/run_signer_pg_test.sh.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { PgDb, parseConninfo } from '../lib/db_pg.js';
-
-test('conninfo: the keywords we honour', () => {
-  assert.deepEqual(parseConninfo('host=/var/run/postgresql dbname=karidns user=karidns_signer\n'), { host: '/var/run/postgresql', database: 'karidns', user: 'karidns_signer' });
-  assert.deepEqual(parseConninfo("host = 127.0.0.1 port=5433 dbname='my db' user=u password='p w\\'x\\\\y' application_name=ks connect_timeout=7 sslmode=disable"),
-    { host: '127.0.0.1', port: 5433, database: 'my db', user: 'u', password: "p w'x\\y", application_name: 'ks', connectionTimeoutMillis: 7000 });
-  assert.deepEqual(parseConninfo('sslmode=require'), { ssl: { rejectUnauthorized: false } });
-  assert.deepEqual(parseConninfo('sslmode=verify-full'), { ssl: { rejectUnauthorized: true } });
-  assert.deepEqual(parseConninfo('sslmode=verify-ca'), { ssl: { rejectUnauthorized: true } });
-  assert.deepEqual(parseConninfo('sslmode=prefer sslmode=allow'), {});
-  assert.deepEqual(parseConninfo('password=a\\ b'), { password: 'a b' });
-  assert.deepEqual(parseConninfo(''), {});
-});
-
-test('conninfo: anything we cannot honour is an error, not silently ignored', () => {
-  assert.throws(() => parseConninfo('service=prod'), /'service' is not supported/);
-  assert.throws(() => parseConninfo('options=-csearch_path=x'), /'options' is not supported/);
-  assert.throws(() => parseConninfo('port=abc'), /port is not a number/);
-  assert.throws(() => parseConninfo('sslmode=maybe'), /sslmode maybe/);
-  assert.throws(() => parseConninfo('host'), /'=' is expected/);
-  assert.throws(() => parseConninfo('=x'), /keyword is expected/);
-  assert.throws(() => parseConninfo("password='abc"), /unterminated/);
-});
+import { PgDb } from '../lib/db_pg.js';
 
 class FakeClient {
   static all = [];

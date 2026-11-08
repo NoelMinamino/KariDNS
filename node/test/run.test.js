@@ -80,3 +80,15 @@ test('clip: control characters out, 1 KB at most', () => {
   assert.equal(clip('  hi  '), 'hi');
   assert.equal(clip(null), 'null');
 });
+
+test('input goes to the standard input of the child, which is closed after it', async () => {
+  const r = await runChild(NODE, ['-e', 'let s = ""; process.stdin.setEncoding("utf8"); process.stdin.on("data", (d) => { s += d; }); process.stdin.on("end", () => console.log(s.length + ":" + s.slice(0, 5)))'], { input: 'héllo world\n' });
+  assert.equal(r.stdout.trim(), '12:héllo');
+  const big = await runChild(NODE, ['-e', 'let n = 0; process.stdin.on("data", (d) => { n += d.length; }); process.stdin.on("end", () => console.log(n))'], { input: Buffer.alloc(3 << 20, 120) });
+  assert.equal(big.stdout.trim(), String(3 << 20));
+});
+
+test('a child that does not read its input is not a problem', async () => {
+  const r = await runChild(NODE, ['-e', 'process.exit(5)'], { input: Buffer.alloc(8 << 20, 120) });
+  assert.equal(r.code, 5);
+});

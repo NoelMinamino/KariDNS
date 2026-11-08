@@ -5,67 +5,6 @@
 // One connection does all the queries, one runs LISTEN karidns_changes.  Queries are serialised (a promise chain), so nothing interleaves; every
 // statement is a single statement (no transaction spans two awaits).
 
-// The libpq connection string of a conninfo file (key = value pairs, values may be 'single quoted' with \' and \\) -> the options of pg's Client.
-// Only the keywords we can honour are accepted; any other is an error, so that nothing in the file is silently ignored.
-export function parseConninfo(text) {
-  const out = {};
-  let i = 0;
-  const s = text.trim();
-  while (i < s.length) {
-    while (i < s.length && /\s/.test(s[i])) i++;
-    if (i >= s.length) break;
-    const k = /^[A-Za-z_][A-Za-z0-9_]*/.exec(s.slice(i));
-    if (!k) throw new Error(`conninfo: a keyword is expected at offset ${i}`);
-    const key = k[0];
-    i += key.length;
-    while (i < s.length && /\s/.test(s[i])) i++;
-    if (s[i] !== '=') throw new Error(`conninfo: '=' is expected after ${key}`);
-    i++;
-    while (i < s.length && /\s/.test(s[i])) i++;
-    let val = '';
-    if (s[i] === "'") {
-      i++;
-      for (;;) {
-        if (i >= s.length) throw new Error('conninfo: an unterminated quoted value');
-        const c = s[i++];
-        if (c === "'") break;
-        if (c === '\\' && i < s.length) val += s[i++];
-        else val += c;
-      }
-    } else {
-      while (i < s.length && !/\s/.test(s[i])) {
-        if (s[i] === '\\' && i + 1 < s.length) i++;
-        val += s[i++];
-      }
-    }
-    out[key] = val;
-  }
-  const cfg = {};
-  for (const [k, v] of Object.entries(out)) {
-    switch (k) {
-      case 'host': cfg.host = v; break;
-      case 'port': {
-        if (!/^\d{1,5}$/.test(v)) throw new Error('conninfo: port is not a number');
-        cfg.port = Number(v);
-        break;
-      }
-      case 'dbname': cfg.database = v; break;
-      case 'user': cfg.user = v; break;
-      case 'password': cfg.password = v; break;
-      case 'application_name': cfg.application_name = v; break;
-      case 'connect_timeout': cfg.connectionTimeoutMillis = Number(v) * 1000; break;
-      case 'sslmode':
-        if (v === 'require') cfg.ssl = { rejectUnauthorized: false };
-        else if (v === 'verify-ca' || v === 'verify-full') cfg.ssl = { rejectUnauthorized: true };
-        else if (v !== 'disable' && v !== 'allow' && v !== 'prefer') throw new Error(`conninfo: sslmode ${v} is not known`);
-        break;
-      default:
-        throw new Error(`conninfo: the keyword '${k}' is not supported by karidns-signer (host, port, dbname, user, password, sslmode, connect_timeout, application_name are)`);
-    }
-  }
-  return cfg;
-}
-
 const CHUNK = 5000;
 
 export class PgDb {

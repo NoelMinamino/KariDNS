@@ -8,7 +8,7 @@
 // Key tag: RFC 4034 appendix B.  Algorithms 5 and 7 (RSA/SHA-1) are refused: RFC 8624 section 3.1 says MUST NOT sign with them.
 
 import crypto from 'node:crypto';
-import { canonicalZone } from './names.js';
+import { canonicalZone } from '../../node/lib/names.js';
 
 export const ALGORITHMS = new Map([
   [8, { name: 'RSASHA256', kind: 'rsa' }],

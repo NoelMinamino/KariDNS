@@ -1,0 +1,5 @@
+#!/bin/sh
+# karidns-webadmin: starts the WebAdmin API (docs/karidns-webadmin.md) with the Node.js of the package.  Installed as /usr/local/sbin/karidns-webadmin.
+# The path of the Node.js binary and of the program are fixed: nothing is looked up in PATH.
+ulimit -c 0                                     # no core dump: the process memory holds password hashes and the key of the TOTP secrets
+exec /usr/local/bin/node /usr/local/libexec/karidns-webadmin/webadmin/bin/karidns-webadmin.js "$@"

@@ -53,6 +53,7 @@ jobs:
             # npm dependency (pg, exact version in package-lock.json), installed without install scripts.  The signer tests SKIP without these.
             pkg install -y node24 npm-node24 bind-tools
             (cd signer && npm ci --ignore-scripts)
+            (cd webadmin && npm ci --ignore-scripts)
             node --version
             dnssec-signzone -V
             echo "::endgroup::"
@@ -166,13 +167,13 @@ jobs:
             sh ./tests/run_zone_type_secondary_test.sh
             echo "::endgroup::"
 
-            echo "::group::🔏 [Signer] karidns-signer: unit tests, SQLite3 and PostgreSQL (root: with a server)"
-            # A SKIP of a whole script must fail here (tests/run_all_suite.sh shows it as a note of a PASS): node24, bind-tools and signer/node_modules are installed above
-            for t in run_signer_unit_test run_signer_test run_signer_pg_test; do
+            echo "::group::🔏 [Signer, WebAdmin] karidns-signer and karidns-webadmin: unit tests, SQLite3 and PostgreSQL (root: with a server)"
+            # A SKIP of a whole script must fail here (tests/run_all_suite.sh shows it as a note of a PASS): node24, bind-tools, signer/node_modules and webadmin/node_modules are installed above
+            for t in run_signer_unit_test run_signer_test run_signer_pg_test run_webadmin_unit_test run_webadmin_test run_webadmin_pg_test run_webadmin_write_test run_webadmin_write_pg_test run_webadmin_versions_test run_webadmin_versions_pg_test run_webadmin_pkg_test; do
               out="/tmp/$t.out"
-              sh "./tests/$t.sh" < /dev/null > "$out" 2>&1 || { cat "$out"; echo "::error title=karidns-signer::$t failed"; exit 1; }
+              sh "./tests/$t.sh" < /dev/null > "$out" 2>&1 || { cat "$out"; echo "::error title=Signer and WebAdmin::$t failed"; exit 1; }
               cat "$out"
-              if grep -Eq '^[[:space:]]*SKIP' "$out"; then echo "::error title=karidns-signer::$t skipped a part (see SKIP above)"; exit 1; fi
+              if grep -Eq '^[[:space:]]*SKIP' "$out"; then echo "::error title=Signer and WebAdmin::$t skipped a part (see SKIP above)"; exit 1; fi
             done
             echo "::endgroup::"
 
@@ -262,9 +263,9 @@ jobs:
           [ "$EVENT" = "pull_request" ] && base="$PR_BASE"
           [ "$EVENT" = "push" ] && base="$PUSH_BEFORE"
           if [ -n "$base" ] && ! printf '%s' "$base" | grep -Eq '^0+$' && git cat-file -e "$base^{commit}" 2>/dev/null; then
-            if ! git diff --name-only "$base" HEAD | grep -Eq '^(signer/|tests/run_signer_unit_test\.sh$|\.github/workflows/ci\.yml$)'; then
+            if ! git diff --name-only "$base" HEAD | grep -Eq '^(signer/|node/|tests/run_signer_unit_test\.sh$|\.github/workflows/ci\.yml$)'; then
               run=false
-              echo "signer/ and its unit test are unchanged: the job has nothing to do"
+              echo "signer/, node/ and the unit test are unchanged: the job has nothing to do"
             fi
           fi
           echo "run=$run" >> "$GITHUB_OUTPUT"
@@ -295,6 +296,74 @@ jobs:
           # a SKIP (no Node 22.13, say) is a failure here: the gate did not run
           if grep -Eq '^[[:space:]]*SKIP' /tmp/signer_unit.out; then echo "::error title=signer (Node)::the unit tests were skipped"; exit 1; fi
           grep -q 'all unit tests passed' /tmp/signer_unit.out
+
+  # ---------------------------------------------------------------------------
+  # karidns-webadmin (webadmin/, 0.6.0 items D and E): the HTTP API.  Like the
+  # signer job: the pinned dependency (npm audit) and the unit tests with
+  # coverage (functions 100%, lines 90%, the gate of
+  # tests/run_webadmin_unit_test.sh).  The unit tests need no database server:
+  # the HTTP server runs on SQLite3 files made from db/*.sql, the PostgreSQL
+  # side against a fake pool.  The integration tests (tests/run_webadmin_test.sh,
+  # tests/run_webadmin_pg_test.sh) need the FreeBSD build and run in the FreeBSD
+  # jobs.  It runs when webadmin/, node/ (shared with the signer), the SQL files, the two manuals (a test compares their tables with the code)
+  # or this workflow change (and always on a schedule or by hand).
+  # ---------------------------------------------------------------------------
+  webadmin-node:
+    name: webadmin (Node)
+    if: github.event_name != 'schedule' && github.event.action != 'labeled'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Does the change touch the WebAdmin?
+        id: paths
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          run=true
+          base=""
+          [ "$EVENT" = "pull_request" ] && base="$PR_BASE"
+          [ "$EVENT" = "push" ] && base="$PUSH_BEFORE"
+          if [ -n "$base" ] && ! printf '%s' "$base" | grep -Eq '^0+$' && git cat-file -e "$base^{commit}" 2>/dev/null; then
+            if ! git diff --name-only "$base" HEAD | grep -Eq '^(webadmin/|node/|db/|tests/auth_vectors\.json$|tests/db/pdns_schema\.sqlite3\.sql$|tests/run_webadmin_unit_test\.sh$|karidns-webadmin\.conf\.sample$|docs/karidns-(api|webadmin)\.md$|packaging/freebsd/rc\.d/karidns_webadmin$|\.github/workflows/ci\.yml$)'; then
+              run=false
+              echo "webadmin/, node/, db/, the manuals and the unit test are unchanged: the job has nothing to do"
+            fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js 24
+        if: steps.paths.outputs.run == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: webadmin/package-lock.json
+
+      - name: Install the dependency (pinned, no install scripts)
+        if: steps.paths.outputs.run == 'true'
+        working-directory: webadmin
+        run: npm ci --ignore-scripts
+
+      - name: npm audit (high and critical fail the job)
+        if: steps.paths.outputs.run == 'true'
+        working-directory: webadmin
+        run: npm audit --audit-level=high
+
+      - name: Unit tests with the coverage gate (functions 100%, lines 90%)
+        if: steps.paths.outputs.run == 'true'
+        run: |
+          node --version
+          sh tests/run_webadmin_unit_test.sh < /dev/null | tee /tmp/webadmin_unit.out
+          # a SKIP (no Node 22.13, say) is a failure here: the gate did not run
+          if grep -Eq '^[[:space:]]*SKIP' /tmp/webadmin_unit.out; then echo "::error title=webadmin (Node)::the unit tests were skipped"; exit 1; fi
+          grep -q 'all unit tests passed' /tmp/webadmin_unit.out
 
   build-dag-unix:
     name: Build & Smoke Test dag on ${{ matrix.name }}
@@ -411,9 +480,10 @@ jobs:
             # provides llvm-covNN / llvm-profdataNN, which the Makefile picks up.
             V=$(cc --version | sed -n 's/.*clang version \([0-9][0-9]*\).*/\1/p' | head -n 1)
             pkg install -y perl5 sqlite3 "llvm${V}-lite"
-            # the suite runs the karidns-signer tests (tests/run_signer_*.sh): Node.js, BIND tools and signer/node_modules, or they SKIP (shown as a note in the suite output)
+            # the suite runs the karidns-signer tests (tests/run_signer_*.sh): Node.js, BIND tools, signer/node_modules and webadmin/node_modules (run_webadmin_*.sh), or they SKIP (shown as a note in the suite output)
             pkg install -y node24 npm-node24 bind-tools
             (cd signer && npm ci --ignore-scripts)
+            (cd webadmin && npm ci --ignore-scripts)
             echo "::endgroup::"
 
             echo "::group::📦 [Setup] PostgreSQL for the PostgreSQL driver tier (test_db_pgsql)"

@@ -23,7 +23,9 @@
 --   The change log: the triggers of db/karidns_ext.pgsql.sql run with the rights of the role that writes, so the importer needs INSERT on
 --   karidns_changes (and SELECT and DELETE: the prune trigger deletes the oldest rows) and INSERT on karidns_reload_requests (`import --reload`;
 --   the same prune trigger needs SELECT and DELETE there).
---   USAGE on the sequences of the tables above (domains.id, records.id, karidns_zone_tagdefs.id, karidns_changes.seq are serial columns).
+--   INSERT on karidns_zone_versions and karidns_zone_version_rrsets (the history of a zone: `import` and `apply` write a version row in the transaction of the
+--   change; nothing but the prune trigger of the owner deletes them).
+--   USAGE on the sequences of the tables above (domains.id, records.id, karidns_zone_tagdefs.id, karidns_changes.seq, karidns_zone_versions.id are serial columns).
 --   cryptokeys: everything is revoked first, then only the COLUMN privilege SELECT (domain_id): the importer asks whether a zone has keys (to warn
 --   that data without DNSSEC records makes the loader refuse a zone with keys).  It can never read `content`, the private keys.
 --   Nothing on karidns_profiles (beyond SELECT), karidns_server_status, supermasters, comments, tsigkeys, ...
@@ -58,6 +60,12 @@ SELECT format('GRANT INSERT, UPDATE, DELETE ON %I.%I TO %I', :'schema', c.relnam
    AND c.relname IN ('karidns_domain_views', 'karidns_record_tags', 'karidns_record_tinydns', 'karidns_zone_tagdefs')
 \gexec
 
+-- the zone versions (item E): `import` and `apply` write one row per change; the prune trigger of the table deletes the old ones as the owner
+SELECT format('GRANT INSERT ON %I.%I TO %I', :'schema', c.relname, :'role')
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = :'schema' AND c.relkind IN ('r', 'p') AND c.relname IN ('karidns_zone_versions', 'karidns_zone_version_rrsets')
+\gexec
+
 -- the change log and the reload requests: written by the triggers (and by `import --reload`); pruned by their prune triggers
 SELECT format('GRANT INSERT, DELETE ON %I.%I TO %I', :'schema', c.relname, :'role')
   FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -71,7 +79,7 @@ SELECT format('GRANT USAGE ON SEQUENCE %I.%I TO %I', n.nspname, s.relname, :'rol
   JOIN pg_depend d ON d.objid = s.oid AND d.deptype IN ('a', 'i')
   JOIN pg_class t ON t.oid = d.refobjid AND t.relnamespace = n.oid
  WHERE s.relkind = 'S' AND n.nspname = :'schema'
-   AND t.relname IN ('domains', 'records', 'domainmetadata', 'karidns_zone_tagdefs', 'karidns_changes')
+   AND t.relname IN ('domains', 'records', 'domainmetadata', 'karidns_zone_tagdefs', 'karidns_changes', 'karidns_zone_versions')
 \gexec
 
 -- Row level security (0.6.0 item B): once db/karidns_api_role.pgsql.sql or db/karidns_signer_role.pgsql.sql has switched RLS on for the tables of the

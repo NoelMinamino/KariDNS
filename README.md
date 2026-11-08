@@ -143,6 +143,14 @@ karidns-signer --check -c /usr/local/etc/karidns/karidns-signer.conf
 service karidns_signer start
 ```
 
+### 3d. `karidns-webadmin` (database packages)
+A Node.js service, the HTTP API of a KariDNS database (PostgreSQL or SQLite3) under `/api/v1/`: password and TOTP logins, sessions and API tokens, users, groups and grants (global, domain and subdomain masters, with record policies and no escalation), the zones a principal may see, their RRsets (paged), the export of a zone, the audit log, change sets (with a dry run, preconditions and one grant for the whole diff), the history of a zone (versions, diffs, rollback to a version) and zone templates. On PostgreSQL every statement runs as the role `karidns_api` with row level security as the second check; on SQLite3 the API's checks are the only ones. The shared Node code is in `node/lib/` (with the signer). See the **[service manual](docs/karidns-webadmin.md)** (packages, database roles, the first administrator, TLS and the reverse proxy, backups, upgrades) and the **[karidns-webadmin(8) / API reference](docs/karidns-api.md)** (every endpoint, error code and setting). On FreeBSD it is the package `karidns-webadmin` (`service karidns_webadmin start`).
+
+```sh
+karidns-webadmin --create-admin admin --bootstrap-conninfo-file /usr/local/etc/karidns/owner.conninfo   # PostgreSQL; SQLite3 needs no option
+karidns-webadmin --check -c /usr/local/etc/karidns/karidns-webadmin.conf
+```
+
 ### 4. `dag` (DNS Anomaly Generator)
 A test client, protocol debugger, and packet fuzzer for DNS servers. For full option specifications and fuzzing modes, see the **[dag(1) Manual](docs/dag.md)**.
 
@@ -327,7 +335,7 @@ The database tools (`karidns-dbloader`, the loader the server starts, and `karid
 make karidns-dbloader karidns-zone DB_DRIVERS="sqlite3 postgresql"
 ```
 
-`karidns-signer` (the signer daemon, [manual](docs/karidns-signer.md)) is Node.js and is not built: `cd signer && npm ci --ignore-scripts`, then `node signer/bin/karidns-signer.js --check -c <config>`; it needs Node 22.13 or newer and BIND 9.20's `dnssec-keygen` and `dnssec-signzone`.
+`karidns-signer` (the signer daemon, [manual](docs/karidns-signer.md)) is Node.js and is not built: `cd signer && npm ci --ignore-scripts`, then `node signer/bin/karidns-signer.js --check -c <config>`; it needs Node 22.13 or newer and BIND 9.20's `dnssec-keygen` and `dnssec-signzone`. `karidns-webadmin` (the API, [manual](docs/karidns-api.md)) is the same: `cd webadmin && npm ci --ignore-scripts`, then `node webadmin/bin/karidns-webadmin.js --check -c <config>`; Node 22.13 or newer, `karidns-zone` and `karicheck`.
 
 To compile only the `dag` client (on Linux, macOS, Windows MSYS2, or FreeBSD):
 ```sh

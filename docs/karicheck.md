@@ -576,7 +576,9 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `db.import.done` | info | a zone was imported, with the number of RRsets added, replaced and deleted |
 | `db.import.summary` | info | the end of an import of several zones: how many were imported and how many failed |
 | `db.import.change` | note | an RRset the import adds, replaces or deletes (listed for --dry-run and --verbose) |
-| `db.import.changed` | error | import --signer: the zone in the database is not the zone the signed file was made from; nothing was written (exit status 3) |
+| `db.import.changed` | error | the zone changed under the tool (import --signer: it is not the zone the file was made from; apply: not at --expect-generation); nothing was written (exit 3) |
+| `db.apply.changes` | error | apply: the change file is not valid: a line, an owner, a type, a TTL or an RDATA a change file does not take |
+| `db.apply.zone` | error | apply: the zone is not there (or is there, with --create), is not a primary zone, or the change would take its SOA away |
 | `db.import.signer` | error | import --signer cannot take this file or zone: the file is not a signed zone, or the zone is not a primary zone of the database; nothing was written |
 | `db.import.signer-zone` | info | the zone is signed by karidns-signer: the import kept its DNSSEC records and signer metadata, and the zone is served again after the next signing |
 | `db.export.open` | error | the database could not be opened |

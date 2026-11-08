@@ -62,6 +62,8 @@ typedef struct {
     bool has_ext;                   /* karidns_record_tags, karidns_record_tinydns and karidns_zone_tagdefs exist (B8, design 3.7) */
     bool has_reload_requests;       /* PostgreSQL: karidns_reload_requests exists (B11, release plan 4.8) */
     bool has_server_status;         /* PostgreSQL: karidns_server_status exists (B11) */
+    bool has_zone_state;            /* karidns_zone_state exists (items D and E: the zone generation) */
+    bool has_versions;              /* karidns_zone_versions and karidns_zone_version_rrsets exist (item E) */
 } db_schema_info_t;
 
 /* PostgreSQL only: written to karidns_server_status (B11).  SQLite3 ignores it.  server_id: 1..64 bytes; failed_zones: the
@@ -81,6 +83,29 @@ typedef struct {
 } db_reload_row_t;
 
 typedef struct db_conn db_conn_t;   /* opaque, one per source (view file / schema) */
+
+/* Items D and E: who a write transaction is for.  PostgreSQL: every w_begin() then sets karidns.principal and karidns.change_set (SET LOCAL), which the audit
+ * triggers log and the row level security of the API role reads.  SQLite3: the same two values (and the name) go into the row of karidns_audit_actor the
+ * transaction writes (together with the db_role of w_set_audit()). */
+typedef struct {
+    bool has_principal;
+    int64_t principal_id;               /* karidns_auth.principals.id; 1 to 18 digits */
+    const char *principal_name;         /* NULL = none (SQLite3 only: PostgreSQL looks the name up) */
+    const char *change_set;             /* NULL = none; 1 to 64 characters */
+} db_actor_t;
+
+/* Item E: one row of karidns_zone_versions (version numbers are made by w_insert_version: the zone's highest + 1) */
+typedef struct {
+    const char *kind;                   /* create edit template import rollback */
+    const char *change_set, *principal_name, *db_role, *comment;    /* NULL = none (db_role NULL: the session user on PostgreSQL) */
+    bool has_principal;
+    int64_t principal_id;
+    bool has_serial_before, has_serial_after;
+    uint32_t serial_before, serial_after;
+    uint64_t generation_before, generation_after;
+    uint32_t rollback_of;               /* 0 = none */
+    bool delta_complete;
+} db_version_t;
 
 /* B12 (karidns-dbloader --check, `karicheck db`, beta design 7.2): what schema_findings() needs to know about the configuration. */
 typedef struct {
@@ -327,6 +352,23 @@ typedef struct db_driver {
     int (*w_update_orders)(db_conn_t *c, int64_t domain_id, const db_order_t *v, size_t n);
     int (*w_insert_dnssec)(db_conn_t *c, int64_t domain_id, const db_ins_t *v, size_t n);
     int (*w_set_snapshot)(db_conn_t *c, bool on);
+
+    /* ----------------------------------------------------------------------------------------------------------------------------
+     * 0.6.0 items D and E: karidns-zone apply.  Inside a w_begin() transaction on an open_write() connection (w_set_actor outside one).
+     * ---------------------------------------------------------------------------------------------------------------------------- */
+    /* The actor of the next transactions (see db_actor_t); NULL clears it.  The strings are copied.  -1 on a connection that is read only or inside a transaction. */
+    int (*w_set_actor)(db_conn_t *c, const db_actor_t *a);
+    /* The generation of the zone (karidns_zone_state; 0 when the zone has no row).  DB_ERR_UNAVAILABLE without the table. */
+    int (*w_zone_generation)(db_conn_t *c, int64_t domain_id, uint64_t *generation);
+    /* Raise the serial of the zone's SOA record.  new_content is the content of the SOA row soa_id with the serial raised (the caller made it by RFC 1982 section 3.1);
+     * the row is updated with it.  via_api (PostgreSQL only; SQLite3 ignores it): do it with karidns_auth.bump_serial(), the only way the API role may change an SOA
+     * (the function raises the serial itself and new_content is not used); the principal must be set (w_set_actor).  *serial: on entry the serial new_content carries, on
+     * return the serial the row has (via_api: the one the function made, which must be the same for the caller to go on). */
+    int (*w_bump_serial)(db_conn_t *c, int64_t domain_id, int64_t soa_id, const char *new_content, bool via_api, uint32_t *serial);
+    /* Add a row to karidns_zone_versions for the zone; *number is its version (the zone's highest + 1), *id the key for w_insert_version_rrset().  DB_ERR_UNAVAILABLE
+     * without the tables.  The RRset rows are lines "<ttl> <TYPE> <rdata>" joined by LF; before / after NULL = the RRset was not there / is not there any more. */
+    int (*w_insert_version)(db_conn_t *c, int64_t domain_id, const db_version_t *v, uint32_t *number, int64_t *id);
+    int (*w_insert_version_rrset)(db_conn_t *c, int64_t version_id, const char *owner, const char *type, const char *before, const char *after);
 } db_driver_t;
 
 #define DB_IN_MAX 128u        /* the most zones of one scan_*_in call */

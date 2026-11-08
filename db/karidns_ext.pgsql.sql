@@ -13,6 +13,10 @@
 -- Schema version 3 (0.6.0 item B) adds the schema karidns_auth: the users, groups, grants and the audit log of the WebAdmin.  The loader and
 -- karicheck db read versions 1 to 3 and use nothing of it; the end of this file says what it holds.  Item C (the signer) adds the tables
 -- karidns_key_requests and karidns_signer_state (before the karidns_auth part) to version 3: apply this file again to a version 3 database that lacks them.
+-- Items D and E (the API, templates, zone versions) add, in the same way, the tables karidns_zone_state (the zone generation, grown by karidns_log_domains()),
+-- karidns_zone_versions and karidns_zone_version_rrsets (data schema) and the tables sessions, api_tokens, templates and template_records and the functions
+-- of the check role (karidns_auth); a version 3 database made before them gets them when this file is applied again (then run the role scripts again).
+-- The loader and `karicheck db` use none of these tables.
 --
 -- What it gives karidns-dbloader:
 --   karidns_changes   a log of "domain D changed" (seq, domain_id, changed_at).  Statement-level AFTER INSERT / UPDATE /
@@ -58,6 +62,20 @@ CREATE TABLE IF NOT EXISTS karidns_changes (
   xid        xid8 NOT NULL DEFAULT pg_current_xact_id()   -- schema version 2: the transaction that wrote the row
 );
 CREATE INDEX IF NOT EXISTS karidns_changes_xid_idx ON karidns_changes (xid);
+
+-- The zone generation (0.6.0 items D and E, schema version 3): one row per zone with a number that grows whenever a transaction changes the zone's rows
+-- (records, domainmetadata, the karidns_* zone tables: the set that writes karidns_changes, because karidns_log_domains() below writes it).  The API
+-- (karidns-zone apply --expect-generation) validates a change against the generation it read and commits only when nobody changed the zone in between:
+-- the writer's own change UPDATEs the row, so under REPEATABLE READ a concurrent writer that committed after the snapshot makes it fail with a
+-- serialization failure ("changed").  It grows ONCE per transaction and zone (the first change of the transaction; the row's xmin tells), not once per
+-- statement: a row-by-row import would otherwise pile up a hundred thousand versions of one row.  Every writer bumps it (the signer too; see
+-- docs/karidns-dbloader.md for why DNSSEC rows are not left out).  A zone with no row has generation 0.  Nothing but the owner's triggers writes it.
+CREATE TABLE IF NOT EXISTS karidns_zone_state (
+  domain_id  INTEGER PRIMARY KEY REFERENCES domains(id) ON UPDATE CASCADE ON DELETE CASCADE,
+  generation BIGINT NOT NULL DEFAULT 0 CHECK (generation >= 0),
+  changed_at BIGINT NOT NULL DEFAULT 0
+);
+INSERT INTO karidns_zone_state (domain_id) SELECT id FROM domains ON CONFLICT DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS karidns_domain_views (
   domain_id INTEGER NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
@@ -113,11 +131,17 @@ DROP TRIGGER IF EXISTS karidns_changes_prune ON karidns_changes;
 CREATE TRIGGER karidns_changes_prune AFTER INSERT ON karidns_changes
   REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION karidns_changes_prune_fn();
 
--- the one place that writes the log: the distinct domain ids of a statement, then NOTIFY
+-- the one place that writes the log: the distinct domain ids of a statement, then NOTIFY.  It also grows the generation of each zone that still exists
+-- (a deleted zone's row goes with the zone) the first time the transaction changes it: the UPDATE skips a row this transaction wrote already
+-- (xmin is the transaction's own id), which keeps a row-by-row import linear.
 CREATE OR REPLACE FUNCTION karidns_log_domains(ids INTEGER[]) RETURNS void LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
   INSERT INTO karidns_changes (domain_id, changed_at)
     SELECT DISTINCT d, extract(epoch FROM now())::bigint FROM unnest(ids) AS d WHERE d IS NOT NULL;
+  INSERT INTO karidns_zone_state AS s (domain_id, generation, changed_at)
+    SELECT d, 1, extract(epoch FROM now())::bigint FROM (SELECT DISTINCT x AS d FROM unnest(ids) AS x WHERE x IS NOT NULL) y
+     WHERE EXISTS (SELECT 1 FROM domains WHERE id = d)
+    ON CONFLICT (domain_id) DO UPDATE SET generation = s.generation + 1, changed_at = EXCLUDED.changed_at WHERE s.xmin <> pg_current_xact_id()::xid;
   PERFORM pg_notify('karidns_changes', '');
 END $$;
 
@@ -407,6 +431,58 @@ CREATE TABLE IF NOT EXISTS karidns_signer_state (
 CREATE INDEX IF NOT EXISTS karidns_signer_state_due_idx ON karidns_signer_state (next_due);
 
 -- ---------------------------------------------------------------------------------------------------------------------------------
+-- Zone versions (0.6.0 item E, docs/karidns-zone.md "Versions"; schema version 3): one row per committed change set of one zone, written by
+-- `karidns-zone apply` (and `import`) in the transaction of the change itself, so the history is atomic with the data.  Version numbers are per zone, from 1.
+--   karidns_zone_versions         who (principal_id / principal_name when the API acts, always db_role), when, what kind ('create' 'edit' 'template' 'import'
+--                                 'rollback'), the change set id (the audit_log.change_set of the same change), the comment, the SOA serial and the zone generation
+--                                 before and after, the version a rollback restores (rollback_of), and delta_complete (false: the change was too big to store,
+--                                 no rollback crosses the version).
+--   karidns_zone_version_rrsets   the delta: for each RRset the version changed, the RRset before and after as canonical lines "<ttl> <TYPE> <rdata>" joined
+--                                 by LF (names absolute), NULL = absent.  DNSSEC types and a change of the SOA serial alone are not versioned.
+-- The newest 100 versions of a zone are kept: the number in karidns_zone_versions_prune_fn below (tests/run_db_ddl_test.sh replaces it).  The audit log
+-- stays the complete record.  The API role reads the rows of the zones it has a grant on (db/karidns_ext.pgsql.sql, create_policies) and inserts, never
+-- updates or deletes.
+CREATE TABLE IF NOT EXISTS karidns_zone_versions (
+  id                BIGSERIAL PRIMARY KEY,
+  domain_id         INTEGER NOT NULL REFERENCES domains(id) ON UPDATE CASCADE ON DELETE CASCADE,
+  version           INTEGER NOT NULL CHECK (version >= 1),
+  kind              VARCHAR(8) NOT NULL CHECK (kind IN ('create', 'edit', 'template', 'import', 'rollback')),
+  change_set        TEXT NULL CHECK (change_set IS NULL OR length(change_set) <= 64),
+  principal_id      BIGINT NULL,
+  principal_name    TEXT NULL CHECK (principal_name IS NULL OR length(principal_name) <= 255),
+  db_role           TEXT NOT NULL DEFAULT session_user,
+  at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+  comment           TEXT NULL CHECK (comment IS NULL OR octet_length(comment) <= 1024),
+  serial_before     BIGINT NULL CHECK (serial_before IS NULL OR serial_before BETWEEN 0 AND 4294967295),
+  serial_after      BIGINT NULL CHECK (serial_after IS NULL OR serial_after BETWEEN 0 AND 4294967295),
+  generation_before BIGINT NOT NULL,
+  generation_after  BIGINT NOT NULL,
+  rollback_of       INTEGER NULL CHECK (rollback_of IS NULL OR rollback_of >= 1),
+  delta_complete    BOOLEAN NOT NULL DEFAULT true,
+  UNIQUE (domain_id, version),
+  CONSTRAINT karidns_zone_versions_rollback_chk CHECK ((kind = 'rollback') = (rollback_of IS NOT NULL))
+);
+CREATE TABLE IF NOT EXISTS karidns_zone_version_rrsets (
+  version_id BIGINT NOT NULL REFERENCES karidns_zone_versions(id) ON DELETE CASCADE,
+  owner      TEXT NOT NULL CHECK (octet_length(owner) BETWEEN 1 AND 253),       -- lower case, no final dot (the form of records.name)
+  type       VARCHAR(32) NOT NULL,
+  before     TEXT NULL,
+  after      TEXT NULL,
+  PRIMARY KEY (version_id, owner, type),
+  CHECK (before IS NOT NULL OR after IS NOT NULL)
+);
+
+-- prune: keep the newest 100 versions of the zone (the rows of their RRsets go with them: ON DELETE CASCADE)
+CREATE OR REPLACE FUNCTION karidns_zone_versions_prune_fn() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  DELETE FROM karidns_zone_versions WHERE domain_id = NEW.domain_id AND version <= NEW.version - 100;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS karidns_zone_versions_prune ON karidns_zone_versions;
+CREATE TRIGGER karidns_zone_versions_prune AFTER INSERT ON karidns_zone_versions
+  FOR EACH ROW EXECUTE FUNCTION karidns_zone_versions_prune_fn();
+
+-- ---------------------------------------------------------------------------------------------------------------------------------
 -- == karidns_auth (schema version 3) ==    0.6.0 item B, milestone M1.  Everything above is version 2.
 --
 -- The schema karidns_auth holds the users, groups, grants and the audit log of the WebAdmin / API (docs/karidns-auth.md); it is shared
@@ -686,6 +762,121 @@ CREATE TRIGGER karidns_trg_domains_grants AFTER DELETE OR UPDATE OF name ON doma
   FOR EACH ROW EXECUTE FUNCTION karidns_auth.domains_grants_fn();
 
 -- ---------------------------------------------------------------------------------------------------------------------------------
+-- The API's own tables (0.6.0 items D and E, schema version 3; docs/karidns-dbloader.md "The WebAdmin tables").  Like the tables above they live in
+-- karidns_auth and serve every data schema.
+--   sessions      a browser session: the SHA-256 of the 256-bit cookie value is the key (the cookie itself is never stored), the SHA-256 of the CSRF token,
+--                 when it was made, last seen, expires (idle and absolute timeouts are the API's), whether the TOTP step was done, and the client (address,
+--                 user agent; capped).  Deleted with the principal.  The audit does not log a change of last_seen alone.
+--   api_tokens    an API token of a principal ("kdt_<id>_<secret>": the SHA-256 of the secret is stored): its name, read only or not, when it expires
+--                 (at most a year after it was made), when it was last used and when it was revoked.
+--   templates, template_records   zone data templates (E): a named set of records with owners relative to the zone ('@' is the apex; no final dot), copied
+--                 into a zone when the zone is made or when the template is applied.  The SOA fields are defaults for a zone made from the template.
+--                 revision grows with every change of the template or of its records.  Written by a global master, read by every principal.
+CREATE TABLE IF NOT EXISTS karidns_auth.sessions (
+  id_hash      BYTEA PRIMARY KEY CHECK (octet_length(id_hash) = 32),
+  principal_id BIGINT NOT NULL REFERENCES karidns_auth.principals (id) ON DELETE CASCADE,
+  csrf_hash    BYTEA NOT NULL CHECK (octet_length(csrf_hash) = 32),
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_seen    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at   TIMESTAMPTZ NOT NULL,
+  totp_ok      BOOLEAN NOT NULL DEFAULT false,
+  client       TEXT NULL CHECK (client IS NULL OR length(client) <= 255)
+);
+CREATE INDEX IF NOT EXISTS sessions_principal_idx ON karidns_auth.sessions (principal_id);
+CREATE INDEX IF NOT EXISTS sessions_expires_idx ON karidns_auth.sessions (expires_at);
+
+CREATE TABLE IF NOT EXISTS karidns_auth.api_tokens (
+  id           BIGSERIAL PRIMARY KEY,
+  principal_id BIGINT NOT NULL REFERENCES karidns_auth.principals (id) ON DELETE CASCADE,
+  name         VARCHAR(255) NOT NULL,
+  secret_hash  BYTEA NOT NULL CHECK (octet_length(secret_hash) = 32),
+  read_only    BOOLEAN NOT NULL DEFAULT false,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at   TIMESTAMPTZ NOT NULL,
+  last_used_at TIMESTAMPTZ NULL,
+  revoked_at   TIMESTAMPTZ NULL,
+  CONSTRAINT api_tokens_max_life CHECK (expires_at <= created_at + interval '366 days')
+);
+CREATE INDEX IF NOT EXISTS api_tokens_principal_idx ON karidns_auth.api_tokens (principal_id);
+
+CREATE TABLE IF NOT EXISTS karidns_auth.templates (
+  id          BIGSERIAL PRIMARY KEY,
+  name        VARCHAR(255) NOT NULL UNIQUE,
+  description TEXT NULL,
+  revision    INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+  soa_mname   VARCHAR(255) NULL CHECK (soa_mname IS NULL OR (soa_mname <> '' AND soa_mname !~ '[\x01-\x20\x7f]')),
+  soa_rname   VARCHAR(255) NULL CHECK (soa_rname IS NULL OR (soa_rname <> '' AND soa_rname !~ '[\x01-\x20\x7f]')),
+  soa_refresh INTEGER NULL CHECK (soa_refresh IS NULL OR soa_refresh >= 0),
+  soa_retry   INTEGER NULL CHECK (soa_retry IS NULL OR soa_retry >= 0),
+  soa_expire  INTEGER NULL CHECK (soa_expire IS NULL OR soa_expire >= 0),
+  soa_minimum INTEGER NULL CHECK (soa_minimum IS NULL OR soa_minimum >= 0),
+  created_by  BIGINT NULL,                      -- a principal id; NULL = a database role
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS karidns_auth.template_records (
+  template_id BIGINT NOT NULL REFERENCES karidns_auth.templates (id) ON DELETE CASCADE,
+  ordinal     INTEGER NOT NULL CHECK (ordinal >= 0),
+  owner       VARCHAR(253) NOT NULL CHECK (owner = lower(owner) AND owner !~ '[\x01-\x20\x7f]' AND (owner = '@' OR owner !~ '(^[.]|[.][.]|[.]$)')),
+  type        VARCHAR(32) NOT NULL CHECK (type ~ '^[A-Z][A-Z0-9-]*$' AND type !~ '^(RRSIG|NSEC|NSEC3|NSEC3PARAM|DNSKEY|CDS|CDNSKEY|TYPE0*(46|47|48|50|51|59|60))$'),
+  ttl         INTEGER NULL CHECK (ttl IS NULL OR ttl >= 0),
+  content     TEXT NOT NULL CHECK (content <> '' AND content !~ '[\x01-\x08\x0a-\x1f\x7f]'),
+  PRIMARY KEY (template_id, ordinal)
+);
+
+-- revision: grows by one with every change of a template and of its records.  A statement that sets revision itself (the records trigger below) is
+-- not counted twice.
+CREATE OR REPLACE FUNCTION karidns_auth.templates_revision_fn() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+BEGIN
+  IF NEW.revision = OLD.revision THEN NEW.revision := OLD.revision + 1; END IF;
+  NEW.updated_at := now();
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS karidns_templates_revision ON karidns_auth.templates;
+CREATE TRIGGER karidns_templates_revision BEFORE UPDATE ON karidns_auth.templates
+  FOR EACH ROW EXECUTE FUNCTION karidns_auth.templates_revision_fn();
+CREATE OR REPLACE FUNCTION karidns_auth.template_records_revision_fn() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+BEGIN
+  IF TG_OP <> 'INSERT' THEN
+    UPDATE karidns_auth.templates SET revision = revision + 1 WHERE id = OLD.template_id;
+  END IF;
+  IF TG_OP <> 'DELETE' AND (TG_OP = 'INSERT' OR NEW.template_id IS DISTINCT FROM OLD.template_id) THEN
+    UPDATE karidns_auth.templates SET revision = revision + 1 WHERE id = NEW.template_id;
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS karidns_template_records_revision ON karidns_auth.template_records;
+CREATE TRIGGER karidns_template_records_revision AFTER INSERT OR UPDATE OR DELETE ON karidns_auth.template_records
+  FOR EACH ROW EXECUTE FUNCTION karidns_auth.template_records_revision_fn();
+
+-- The lookups of the API before it knows who it serves: a session by the hash of its cookie, a token by its id and the hash of its secret.  The
+-- policies of sessions and api_tokens show a principal its own rows, so a request that carries nothing but the cookie or the token could not find its
+-- own row; these two functions (SECURITY DEFINER, EXECUTE granted to the API role by its script) return the row of an unexpired, unrevoked credential
+-- of a principal that is not disabled, and nothing else.
+CREATE OR REPLACE FUNCTION karidns_auth.session_lookup(h bytea) RETURNS TABLE (principal_id bigint, csrf_hash bytea, created_at timestamptz, last_seen timestamptz,
+                                                                           expires_at timestamptz, totp_ok boolean)
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+  SELECT s.principal_id, s.csrf_hash, s.created_at, s.last_seen, s.expires_at, s.totp_ok
+    FROM karidns_auth.sessions s JOIN karidns_auth.principals p ON p.id = s.principal_id AND NOT p.disabled
+   WHERE s.id_hash = h AND s.expires_at > now()
+$$;
+CREATE OR REPLACE FUNCTION karidns_auth.api_token_lookup(tid bigint, h bytea) RETURNS TABLE (principal_id bigint, read_only boolean, expires_at timestamptz)
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+  SELECT t.principal_id, t.read_only, t.expires_at
+    FROM karidns_auth.api_tokens t JOIN karidns_auth.principals p ON p.id = t.principal_id AND NOT p.disabled
+   WHERE t.id = tid AND t.secret_hash = h AND t.revoked_at IS NULL AND t.expires_at > now()
+$$;
+-- The hourly sweep of the API: the sessions whose absolute time is over, of every principal (the policy of sessions shows the API role its own principal's rows
+-- only, so it could not delete the rest).  Returns the number of rows deleted.  Nothing else is deleted here.
+CREATE OR REPLACE FUNCTION karidns_auth.sweep_expired() RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+DECLARE n bigint;
+BEGIN
+  DELETE FROM karidns_auth.sessions WHERE expires_at <= now();
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END $$;
+
+-- ---------------------------------------------------------------------------------------------------------------------------------
 -- The audit log (4.5).  Only the owner may write it; the trigger functions are SECURITY DEFINER, so the roles that change the data
 -- need no right on it.  Nothing is granted here: no role (the WebAdmin's included) can UPDATE or DELETE a row.  Pruning is the
 -- owner's job:  DELETE FROM karidns_auth.audit_log WHERE at < now() - interval '1 year';
@@ -773,6 +964,15 @@ BEGIN
       jn := karidns_auth.audit_redact(jn, ARRAY['password_hash', 'totp_secret']);
     END IF;
     IF tbl = 'grants' THEN zone := jr ->> 'zone_name'; END IF;
+    IF tbl = 'sessions' THEN
+      IF TG_OP = 'UPDATE' AND (jn - 'last_seen') = (jo - 'last_seen') THEN RETURN NULL; END IF;       -- the API touches last_seen on requests: not a change worth a row
+      jo := karidns_auth.audit_redact(jo, ARRAY['id_hash', 'csrf_hash']);
+      jn := karidns_auth.audit_redact(jn, ARRAY['id_hash', 'csrf_hash']);
+    END IF;
+    IF tbl = 'api_tokens' THEN
+      jo := karidns_auth.audit_redact(jo, ARRAY['secret_hash']);
+      jn := karidns_auth.audit_redact(jn, ARRAY['secret_hash']);
+    END IF;
   ELSE
     IF tbl = 'cryptokeys' THEN
       jo := karidns_auth.audit_redact(jo, ARRAY['content']);
@@ -904,7 +1104,7 @@ DECLARE
   t   text;
   cnt integer := 0;
 BEGIN
-  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants']
+  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'sessions', 'api_tokens', 'templates', 'template_records']
                            ELSE ARRAY['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_record_tags', 'karidns_record_tinydns',
                                       'karidns_zone_tagdefs', 'karidns_domain_views', 'karidns_key_requests', 'karidns_signer_state'] END) LOOP
     IF to_regclass(format('%I.%I', sch, t)) IS NULL THEN CONTINUE; END IF;
@@ -933,7 +1133,7 @@ DECLARE
   tg  text;
   cnt integer := 0;
 BEGIN
-  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants']
+  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'sessions', 'api_tokens', 'templates', 'template_records']
                            ELSE ARRAY['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_record_tags', 'karidns_record_tinydns',
                                       'karidns_zone_tagdefs', 'karidns_domain_views', 'karidns_key_requests', 'karidns_signer_state'] END) LOOP
     IF to_regclass(format('%I.%I', sch, t)) IS NULL THEN CONTINUE; END IF;
@@ -1354,6 +1554,89 @@ BEGIN
   END IF;
 END $$;
 
+-- ---- the CHECK role (0.6.0 items D and E, db/karidns_check_role.pgsql.sql): the role the API runs `karidns-zone apply --dry-run` as.  A change set from a
+-- subdomain master has to be checked against the whole zone (CNAME beside other data, the size limits, the reader), and RLS shows that session only its
+-- part of the zone, so the check run is a trusted session (a member of karidns_rls_trusted) that writes the change, reads the zone back and rolls back.  It
+-- must never be able to commit: every table the dry run writes has a DEFERRED constraint trigger that raises at COMMIT for a session whose login role is a
+-- member of the group role karidns_never_commit.  The test is two cheap built-in calls in the WHEN condition (evaluated when the row event is queued, so
+-- other roles pay almost nothing); a superuser is never counted (it could disable the trigger anyway: the script refuses a superuser).  SET ROLE does not
+-- help the session, session_user stays.  A PREPARE TRANSACTION fires deferred triggers too.
+CREATE OR REPLACE FUNCTION karidns_auth.never_commit_fn() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+  RAISE EXCEPTION 'karidns_auth: the check role never commits (% of %.%): the transaction is rolled back', TG_OP, TG_TABLE_SCHEMA, TG_TABLE_NAME
+    USING ERRCODE = 'insufficient_privilege';
+  RETURN NULL;
+END $$;
+
+-- the trigger on every table the dry run of `karidns-zone apply` writes in the schema (the data tables, the change log and the generation the triggers of
+-- the owner write for it, the zone versions) and on the audit log; idempotent.  Returns the number of tables.
+CREATE OR REPLACE FUNCTION karidns_auth.enable_never_commit(sch text) RETURNS integer LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+  t   text;
+  cnt integer := 0;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['domains', 'records', 'domainmetadata', 'karidns_record_tags', 'karidns_record_tinydns', 'karidns_zone_tagdefs', 'karidns_domain_views',
+                           'karidns_reload_requests', 'karidns_zone_versions', 'karidns_zone_version_rrsets', 'karidns_changes', 'karidns_zone_state',
+                           'karidns_key_requests'] LOOP
+    IF to_regclass(format('%I.%I', sch, t)) IS NULL THEN CONTINUE; END IF;
+    EXECUTE format('DROP TRIGGER IF EXISTS karidns_never_commit ON %I.%I', sch, t);
+    EXECUTE format('CREATE CONSTRAINT TRIGGER karidns_never_commit AFTER INSERT OR UPDATE OR DELETE ON %I.%I DEFERRABLE INITIALLY DEFERRED FOR EACH ROW '
+                   'WHEN (current_setting(''is_superuser'') = ''off'' AND pg_has_role(session_user, to_regrole(''karidns_never_commit''), ''MEMBER'')) '
+                   'EXECUTE FUNCTION karidns_auth.never_commit_fn()', sch, t);
+    cnt := cnt + 1;
+  END LOOP;
+  EXECUTE 'DROP TRIGGER IF EXISTS karidns_never_commit ON karidns_auth.audit_log';
+  EXECUTE 'CREATE CONSTRAINT TRIGGER karidns_never_commit AFTER INSERT OR UPDATE OR DELETE ON karidns_auth.audit_log DEFERRABLE INITIALLY DEFERRED FOR EACH ROW '
+          'WHEN (current_setting(''is_superuser'') = ''off'' AND pg_has_role(session_user, to_regrole(''karidns_never_commit''), ''MEMBER'')) '
+          'EXECUTE FUNCTION karidns_auth.never_commit_fn()';
+  RETURN cnt + 1;
+END $$;
+
+CREATE OR REPLACE FUNCTION karidns_auth.disable_never_commit(sch text) RETURNS integer LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+  t   text;
+  cnt integer := 0;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['domains', 'records', 'domainmetadata', 'karidns_record_tags', 'karidns_record_tinydns', 'karidns_zone_tagdefs', 'karidns_domain_views',
+                           'karidns_reload_requests', 'karidns_zone_versions', 'karidns_zone_version_rrsets', 'karidns_changes', 'karidns_zone_state',
+                           'karidns_key_requests'] LOOP
+    IF to_regclass(format('%I.%I', sch, t)) IS NULL THEN CONTINUE; END IF;
+    EXECUTE format('DROP TRIGGER IF EXISTS karidns_never_commit ON %I.%I', sch, t);
+    cnt := cnt + 1;
+  END LOOP;
+  RETURN cnt;
+END $$;
+
+-- the check role script calls this first: the role must be one that can be held to the never-commit rule.  It is refused when it is a superuser, or is (or is a
+-- member of) the owner of the tables (the owner can drop the triggers), or when it is a member of karidns_auth's API roles.
+CREATE OR REPLACE FUNCTION karidns_auth.assert_check_role(sch text, rol text) RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+  r   pg_roles%ROWTYPE;
+  own oid;
+BEGIN
+  SELECT * INTO r FROM pg_roles WHERE rolname = rol;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'karidns_auth.assert_check_role: role % does not exist', rol;
+  END IF;
+  IF r.rolsuper THEN
+    RAISE EXCEPTION 'karidns_auth.assert_check_role: role % is a superuser: it could switch the never-commit triggers off', rol USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  SELECT c.relowner INTO own FROM pg_class c WHERE c.oid = to_regclass(format('%I.records', sch));
+  IF own IS NULL THEN
+    RAISE EXCEPTION 'karidns_auth.assert_check_role: schema % has no records table', sch;
+  END IF;
+  IF EXISTS (WITH RECURSIVE m(roleid) AS (SELECT r.oid UNION SELECT am.roleid FROM pg_auth_members am JOIN m ON am.member = m.roleid)
+             SELECT 1 FROM m WHERE m.roleid = own) THEN
+    RAISE EXCEPTION 'karidns_auth.assert_check_role: role % is, or is a member of, the owner of the tables of schema %: the owner could drop the never-commit triggers', rol, sch
+      USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  IF EXISTS (WITH RECURSIVE m(roleid) AS (SELECT r.oid UNION SELECT am.roleid FROM pg_auth_members am JOIN m ON am.member = m.roleid)
+             SELECT 1 FROM m JOIN pg_roles t ON t.oid = m.roleid JOIN karidns_auth.api_roles x ON x.role_name = t.rolname) THEN
+    RAISE EXCEPTION 'karidns_auth.assert_check_role: role % is, or is a member of, an API role: the check role and the API role are different roles', rol
+      USING ERRCODE = 'insufficient_privilege';
+  END IF;
+END $$;
+
 -- ---- policies.  set_policy replaces one policy; create_policies(schema) creates the policies of a data schema (the schema is a literal in them, so no
 -- search_path matters when they run) or, for 'karidns_auth', those of the auth tables.  Both are idempotent.
 DROP FUNCTION IF EXISTS karidns_auth.set_policy(regclass, text, text, text, text, text);
@@ -1405,7 +1688,27 @@ BEGIN
     PERFORM karidns_auth.set_policy('karidns_auth.credentials', 'karidns_rls_insert', 'INSERT', NULL, 'karidns_auth.is_global()');
     PERFORM karidns_auth.set_policy('karidns_auth.credentials', 'karidns_rls_update', 'UPDATE', w, w);
     PERFORM karidns_auth.set_policy('karidns_auth.credentials', 'karidns_rls_delete', 'DELETE', 'karidns_auth.is_global()', NULL);
-    RETURN 6;
+    -- sessions and api_tokens: the principal's own rows, a global master all of them (a service account's token is made by a global master).  The API finds a
+    -- session or a token by its hash before it has a principal: session_lookup() / api_token_lookup().
+    w := 'sessions.principal_id = karidns_auth.current_principal() OR karidns_auth.is_global()';
+    PERFORM karidns_auth.set_policy('karidns_auth.sessions', 'karidns_rls_select', 'SELECT', w, NULL);
+    PERFORM karidns_auth.set_policy('karidns_auth.sessions', 'karidns_rls_insert', 'INSERT', NULL, w);
+    PERFORM karidns_auth.set_policy('karidns_auth.sessions', 'karidns_rls_update', 'UPDATE', w, w);
+    PERFORM karidns_auth.set_policy('karidns_auth.sessions', 'karidns_rls_delete', 'DELETE', w, NULL);
+    w := 'api_tokens.principal_id = karidns_auth.current_principal() OR karidns_auth.is_global()';
+    PERFORM karidns_auth.set_policy('karidns_auth.api_tokens', 'karidns_rls_select', 'SELECT', w, NULL);
+    PERFORM karidns_auth.set_policy('karidns_auth.api_tokens', 'karidns_rls_insert', 'INSERT', NULL, w);
+    PERFORM karidns_auth.set_policy('karidns_auth.api_tokens', 'karidns_rls_update', 'UPDATE', w, w);
+    PERFORM karidns_auth.set_policy('karidns_auth.api_tokens', 'karidns_rls_delete', 'DELETE', w, NULL);
+    -- templates and their records: every row is readable, only a global master changes them
+    FOREACH nm IN ARRAY ARRAY['templates', 'template_records'] LOOP
+      rel := format('karidns_auth.%I', nm)::regclass;
+      PERFORM karidns_auth.set_policy(rel, 'karidns_rls_select', 'SELECT', 'true', NULL);
+      PERFORM karidns_auth.set_policy(rel, 'karidns_rls_insert', 'INSERT', NULL, 'karidns_auth.is_global()');
+      PERFORM karidns_auth.set_policy(rel, 'karidns_rls_update', 'UPDATE', 'karidns_auth.is_global()', 'karidns_auth.is_global()');
+      PERFORM karidns_auth.set_policy(rel, 'karidns_rls_delete', 'DELETE', 'karidns_auth.is_global()', NULL);
+    END LOOP;
+    RETURN 12;
   END IF;
 
   -- ---- a data schema
@@ -1526,6 +1829,30 @@ BEGIN
     PERFORM karidns_auth.set_policy(rel, 'karidns_rls_select', 'SELECT', format('karidns_auth.zone_grant(%s, %s) IS NOT NULL', lit, format(zr, 'karidns_signer_state')), NULL);
     cnt := cnt + 1;
   END IF;
+  -- karidns_zone_state: the generation of the zones the principal has a grant on; written by the triggers of the owner only
+  IF to_regclass(format('%I.karidns_zone_state', sch)) IS NOT NULL THEN
+    rel := format('%I.karidns_zone_state', sch)::regclass;
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_select', 'SELECT', format('karidns_auth.zone_grant(%s, %s) IS NOT NULL', lit, format(zr, 'karidns_zone_state')), NULL);
+    cnt := cnt + 1;
+  END IF;
+  -- karidns_zone_versions: read with a grant on the zone; a version is inserted by the principal itself (karidns-zone apply sets karidns.principal), for a zone it
+  -- has a grant on.  No UPDATE and no DELETE: the history is append only (the prune trigger is SECURITY DEFINER).
+  IF to_regclass(format('%I.karidns_zone_versions', sch)) IS NOT NULL THEN
+    rel := format('%I.karidns_zone_versions', sch)::regclass;
+    w := format('karidns_auth.zone_grant(%s, %s) IS NOT NULL', lit, format(zr, 'karidns_zone_versions'));
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_select', 'SELECT', w, NULL);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_insert', 'INSERT', NULL, w || ' AND karidns_zone_versions.principal_id = karidns_auth.current_principal()');
+    cnt := cnt + 1;
+  END IF;
+  -- karidns_zone_version_rrsets: the RRsets a principal may read or write, by the rule of rr_visible (a subdomain master reads the history of its names only)
+  IF to_regclass(format('%I.karidns_zone_version_rrsets', sch)) IS NOT NULL AND to_regclass(format('%I.karidns_zone_versions', sch)) IS NOT NULL THEN
+    rel := format('%I.karidns_zone_version_rrsets', sch)::regclass;
+    w := format('EXISTS (SELECT 1 FROM %1$I.karidns_zone_versions v JOIN %1$I.domains d ON d.id = v.domain_id WHERE v.id = karidns_zone_version_rrsets.version_id '
+                'AND karidns_auth.rr_visible(%2$s, %3$s, karidns_zone_version_rrsets.owner, karidns_zone_version_rrsets.type))', sch, lit, format(zn, 'd.name'));
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_select', 'SELECT', w, NULL);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_insert', 'INSERT', NULL, w);
+    cnt := cnt + 1;
+  END IF;
   -- cryptokeys: the rows of the zones the principal has a grant on; the role has the column privilege SELECT (id, domain_id, flags, active, published) only
   IF to_regclass(format('%I.cryptokeys', sch)) IS NOT NULL THEN
     rel := format('%I.cryptokeys', sch)::regclass;
@@ -1551,7 +1878,7 @@ DECLARE
   pm  text;
 BEGIN
   FOREACH nm IN ARRAY ARRAY['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_record_tags', 'karidns_record_tinydns', 'karidns_zone_tagdefs',
-                            'karidns_domain_views', 'karidns_reload_requests', 'karidns_key_requests', 'karidns_signer_state'] LOOP
+                            'karidns_domain_views', 'karidns_reload_requests', 'karidns_key_requests', 'karidns_signer_state', 'karidns_zone_state', 'karidns_zone_versions', 'karidns_zone_version_rrsets'] LOOP
     IF to_regclass(format('%I.%I', sch, nm)) IS NULL THEN CONTINUE; END IF;
     rel := format('%I.%I', sch, nm)::regclass;
     PERFORM karidns_auth.set_policy(rel, 'karidns_signer_select_' || sfx, 'SELECT', 'true', NULL, rol);
@@ -1607,9 +1934,9 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'karidns_rls_trusted') THEN
     RAISE EXCEPTION 'karidns_auth.enable_rls: the role karidns_rls_trusted does not exist (the role scripts create it)';
   END IF;
-  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'audit_log']
+  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'audit_log', 'sessions', 'api_tokens', 'templates', 'template_records']
                            ELSE ARRAY['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_record_tags', 'karidns_record_tinydns',
-                                      'karidns_zone_tagdefs', 'karidns_domain_views', 'karidns_reload_requests', 'karidns_key_requests', 'karidns_signer_state'] END) LOOP
+                                      'karidns_zone_tagdefs', 'karidns_domain_views', 'karidns_reload_requests', 'karidns_key_requests', 'karidns_signer_state', 'karidns_zone_state', 'karidns_zone_versions', 'karidns_zone_version_rrsets'] END) LOOP
     IF to_regclass(format('%I.%I', sch, t)) IS NULL THEN CONTINUE; END IF;
     EXECUTE format('ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY', sch, t);
     EXECUTE format('DROP POLICY IF EXISTS karidns_rls_trusted ON %I.%I', sch, t);
@@ -1624,9 +1951,9 @@ DECLARE
   t   text;
   cnt integer := 0;
 BEGIN
-  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'audit_log']
+  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'audit_log', 'sessions', 'api_tokens', 'templates', 'template_records']
                            ELSE ARRAY['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_record_tags', 'karidns_record_tinydns',
-                                      'karidns_zone_tagdefs', 'karidns_domain_views', 'karidns_reload_requests', 'karidns_key_requests', 'karidns_signer_state'] END) LOOP
+                                      'karidns_zone_tagdefs', 'karidns_domain_views', 'karidns_reload_requests', 'karidns_key_requests', 'karidns_signer_state', 'karidns_zone_state', 'karidns_zone_versions', 'karidns_zone_version_rrsets'] END) LOOP
     IF to_regclass(format('%I.%I', sch, t)) IS NULL THEN CONTINUE; END IF;
     EXECUTE format('ALTER TABLE %I.%I DISABLE ROW LEVEL SECURITY', sch, t);
     cnt := cnt + 1;
@@ -1648,7 +1975,7 @@ BEGIN
   FOR f IN SELECT p.oid::regprocedure FROM pg_proc p
             WHERE p.pronamespace = current_schema()::regnamespace AND p.prokind = 'f'
               AND (p.proname LIKE 'karidns\_trg\_%\_fn' OR p.proname IN ('karidns_log_domains', 'karidns_changes_prune_fn', 'karidns_reload_requests_lock_fn',
-                                                                         'karidns_reload_requests_notify_fn', 'karidns_reload_requests_prune_fn'))
+                                                                         'karidns_reload_requests_notify_fn', 'karidns_reload_requests_prune_fn', 'karidns_zone_versions_prune_fn'))
   LOOP
     EXECUTE format('ALTER FUNCTION %s SECURITY DEFINER SET search_path = pg_catalog, %I, pg_temp', f, current_schema());
     EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', f);
@@ -1662,13 +1989,16 @@ END $$;
 REVOKE EXECUTE ON FUNCTION karidns_auth.credentials_user_only_fn(), karidns_auth.principals_kind_fn(), karidns_auth.principals_self_fn(),
   karidns_auth.principals_delete_fn(), karidns_auth.memberships_check_fn(), karidns_auth.memberships_closure_fn(), karidns_auth.domains_grants_fn(),
   karidns_auth.audit_row(), karidns_auth.audit_stmt(), karidns_auth.audit_summary_fin(), karidns_auth.audit_zone_fn(), karidns_auth.audit_summary(),
-  karidns_auth.enable_audit(text), karidns_auth.disable_audit(text) FROM PUBLIC;
+  karidns_auth.enable_audit(text), karidns_auth.disable_audit(text), karidns_auth.templates_revision_fn(), karidns_auth.template_records_revision_fn(),
+  karidns_auth.never_commit_fn() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION karidns_auth.current_principal(), karidns_auth.my_groups(), karidns_auth.zone_grant(text, text), karidns_auth.is_global(),
   karidns_auth.rr_ok(text, text, text, text, integer), karidns_auth.rr_visible(text, text, text, text), karidns_auth.audit_visible(text, text, text, jsonb, jsonb),
   karidns_auth.bump_serial(text, integer), karidns_auth.is_api_caller(), karidns_auth.is_signer_caller(), karidns_auth.policy_subset(bigint, bigint),
   karidns_auth.may_grant(text, text, text, bigint), karidns_auth.grants_escalation_fn(), karidns_auth.signer_soa_fn(), karidns_auth.assert_service_role(text, text),
   karidns_auth.set_policy(regclass, text, text, text, text, text, boolean), karidns_auth.create_policies(text),
-  karidns_auth.create_signer_policies(text, text), karidns_auth.enable_rls(text), karidns_auth.disable_rls(text) FROM PUBLIC;
+  karidns_auth.create_signer_policies(text, text), karidns_auth.enable_rls(text), karidns_auth.disable_rls(text), karidns_auth.session_lookup(bytea),
+  karidns_auth.api_token_lookup(bigint, bytea), karidns_auth.sweep_expired(), karidns_auth.enable_never_commit(text), karidns_auth.disable_never_commit(text),
+  karidns_auth.assert_check_role(text, text) FROM PUBLIC;
 -- (canon_type, is_dnssec_type and setting_principal stay with PUBLIC: the policies and the trigger conditions of the signer call them as the signer.)
 -- The role scripts grant EXECUTE on current_principal, my_groups, zone_grant, is_global, rr_ok, rr_visible and audit_visible (and bump_serial to the API
 -- role) to their role and to karidns_rls_trusted: the policies call them as the role that runs the statement.  The generated functions of the fast path

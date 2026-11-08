@@ -50,10 +50,11 @@ sub check_schema {
     my @top = ($tool, qw(version command result counts truncated messages zones));
     for my $k (@top) { fail("missing key $k") unless exists $doc->{$k}; }
     my $has_signer = $tool eq "karidns-zone" && exists $doc->{signer};          # import --signer: the result of the write, after zones
-    fail("unexpected keys: " . join(',', grep { my $x = $_; !grep { $_ eq $x } (@top, $has_signer ? ("signer") : ()) } sort keys %$doc)) if keys %$doc != @top + ($has_signer ? 1 : 0);
+    my @extra = grep { $tool eq "karidns-zone" && exists $doc->{$_} } qw(apply types);     # apply: the result of the change set; --types-list: the record types
+    fail("unexpected keys: " . join(',', grep { my $x = $_; !grep { $_ eq $x } (@top, $has_signer ? ("signer") : (), @extra) } sort keys %$doc)) if keys %$doc != @top + ($has_signer ? 1 : 0) + @extra;
     fail("$tool is not 1") unless is_int($doc->{$tool}) && $doc->{$tool} == 1;
     fail("version is not a string") unless is_str($doc->{version}) && length $doc->{version};
-    my $cmds = $tool eq "karidns-zone" ? "import|export" : "conf|zones|zone|db";
+    my $cmds = $tool eq "karidns-zone" ? "import|export|apply|types" : "conf|zones|zone|db";
     fail("command is not $cmds or null") unless !defined $doc->{command} || $doc->{command} =~ /^($cmds)$/;
     fail("result is not ok/fail/usage") unless is_str($doc->{result}) && $doc->{result} =~ /^(ok|fail|usage)$/;
     fail("truncated is not a boolean") unless ref $doc->{truncated} eq 'JSON::PP::Boolean';
@@ -113,6 +114,29 @@ sub check_schema {
             fail("signer.write_id.xid") unless !defined $w->{xid} || ($w->{xid} =~ /^[0-9]+$/);
             for my $k (qw(seq_first seq_last)) { fail("signer.write_id.$k") unless !defined $w->{$k} || is_int($w->{$k}); }
         }
+    }
+    if (exists $doc->{apply}) {                                                  # apply: docs/karidns-zone.md
+        my $a = $doc->{apply};
+        fail("apply is not an object") unless ref $a eq 'HASH';
+        for my $k (qw(zone dry_run committed changed busy created)) { fail("apply has no $k") unless exists $a->{$k}; }
+        fail("apply.zone is not an absolute name") unless is_str($a->{zone}) && $a->{zone} =~ /\.$/;
+        for my $k (qw(dry_run committed changed busy created)) { fail("apply.$k is not a boolean") unless ref $a->{$k} eq 'JSON::PP::Boolean'; }
+        if (!$a->{changed} && !$a->{busy} && $doc->{result} eq 'ok') {
+            for my $k (qw(generation generation_after serial serial_bumped version delta_complete records_before records_after warnings diff)) { fail("apply has no $k") unless exists $a->{$k}; }
+            for my $k (qw(generation generation_after version)) { fail("apply.$k is neither an integer nor null") unless !defined $a->{$k} || is_int($a->{$k}); }
+            fail("apply.serial") unless ref $a->{serial} eq 'HASH' && exists $a->{serial}{before} && exists $a->{serial}{after};
+            fail("apply.diff is not an array") unless ref $a->{diff} eq 'ARRAY';
+            my $j = 0;
+            for my $d (@{ $a->{diff} }) {
+                fail("apply.diff[$j]") unless ref $d eq 'HASH' && keys %$d == 5 && is_str($d->{owner}) && $d->{owner} =~ /\.$/ && is_str($d->{type}) && is_str($d->{change}) && $d->{change} =~ /^(add|replace|delete)$/;
+                for my $k (qw(before after)) { fail("apply.diff[$j].$k") unless !defined $d->{$k} || (ref $d->{$k} eq 'ARRAY' && @{ $d->{$k} } > 0); }
+                fail("apply.diff[$j]: an added RRset has no before, a deleted one no after") if ($d->{change} eq 'add' && defined $d->{before}) || ($d->{change} eq 'delete' && defined $d->{after});
+                $j++;
+            }
+        }
+    }
+    if (exists $doc->{types}) {                                                  # --types-list
+        fail("types is not an array of strings") unless ref $doc->{types} eq 'ARRAY' && @{ $doc->{types} } > 10 && !grep { !is_str($_) } @{ $doc->{types} };
     }
     $i = 0;
     for my $z (@{ $doc->{zones} }) {

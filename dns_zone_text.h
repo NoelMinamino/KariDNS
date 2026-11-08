@@ -62,4 +62,9 @@ bool dns_zone_text_write_file(const zone_arena_t *arena, const char *apex, const
  * tag definitions and the tinydns locations in order.  false: why names the first difference. */
 bool dns_zone_text_same_zone(const zone_arena_t *a, const zone_arena_t *b, char *why, size_t whylen);
 
+/* One RRset (the records recs[0..n), one owner and type) as canonical lines for the delta of a change set (karidns-zone apply, karidns_zone_version_rrsets):
+ * "<ttl> <TYPE> <rdata>" per record in the canonical RDATA order (RFC 4034 section 6.3), joined by LF, every name absolute (nothing is relative to a zone),
+ * strings quoted as the zone-file writer does.  malloc'd; NULL with err (a record that cannot be written, out of memory). */
+char *dns_zone_text_rrset_lines(const dns_record_t *const *recs, size_t n, char *err, size_t errlen);
+
 #endif

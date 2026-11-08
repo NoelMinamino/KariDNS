@@ -1,0 +1,313 @@
+// /principals, /rr-policies, /grants: users, groups, memberships, record policies and grants (planning 3.3, 4).  Everyone who is logged in may read; changing is for
+// global masters, except grants, which a domain master may make inside its zone with a policy no wider than its own (no escalation, rule 2 of the plan).
+
+import { ApiError, badRequest, forbidden, notFound, conflict } from '../errors.js';
+import { shape, query, LIMIT, CURSOR } from '../validate.js';
+import * as S from '../store.js';
+import { hashPassword } from '../crypto.js';
+import { reply } from '../http.js';
+import { isGlobal, zoneGrant, maySetGrant } from '../perm.js';
+import { canonicalZone, canonicalOwner, inZone, absolute } from '../names.js';
+import { requireGlobal, idParam, idCursor, page } from './common.js';
+import { checkPassword, principalView, policyView } from './auth.js';
+
+const PASSWORD = { type: 'string', min: 12, max: 1024, noControl: false };
+const ID = { type: 'int', min: 1, max: 999999999999999 };
+
+// ---------------------------------------------------------------------------------------------------------------------------------- principals
+export async function principalsList(ctx) {
+  const q = query(ctx.query, { limit: LIMIT, cursor: CURSOR, kind: { type: 'string', values: ['user', 'group'] }, prefix: { type: 'string', min: 1, max: 64 } });
+  const limit = q.limit ?? 100;
+  const rows = await ctx.db((tx) => S.listPrincipals(tx, { kind: q.kind, prefix: q.prefix, after: idCursor(q.cursor), limit }));
+  const p = page(rows, limit, (r) => ({ i: r.id }));
+  return { principals: p.items.map(principalView), next_cursor: p.next_cursor };
+}
+
+export async function principalCreate(ctx) {
+  const { app, auth } = ctx;
+  requireGlobal(ctx);
+  const body = shape(ctx.body, {
+    kind: { type: 'string', required: true, values: ['user', 'group'] },
+    name: { type: 'string', required: true, min: 1, max: 255, re: /^[A-Za-z0-9][A-Za-z0-9._@+:-]*$/, reText: 'letters, digits and . _ @ + : - (not first)' },
+    display_name: { type: 'string', max: 255, nullable: true },
+    email: { type: 'string', max: 255, nullable: true, re: /^[^\s@]+@[^\s@]+$/, reText: 'an e-mail address' },
+    password: PASSWORD,
+    disabled: { type: 'bool' },
+  });
+  if (body.password !== undefined && body.kind !== 'user') throw badRequest('only a user has a password', '/password');
+  if (body.password !== undefined) checkPassword(body.password, body.name);
+  const hash = body.password === undefined ? null : await hashPassword(body.password, { ln: app.settings['scrypt-ln'] });
+  const id = await ctx.db(async (tx) => {
+    const pid = await S.createPrincipal(tx, { ...body, createdBy: auth.principal.id });
+    if (hash) await S.setPassword(tx, pid, hash, app.now());
+    return pid;
+  }, { write: true });
+  return reply(201, { principal: principalView(await ctx.db((tx) => S.getPrincipal(tx, id))) });
+}
+
+export async function principalGet(ctx) {
+  const id = idParam(ctx);
+  const self = id === ctx.auth.principal.id;
+  const r = await ctx.db(async (tx) => {
+    const p = await S.getPrincipal(tx, id);
+    if (!p) return null;
+    return { p, groups: await S.groupsOf(tx, id), creds: isGlobal(ctx.auth.grants) || self ? ((await S.getCredentials(tx, id)) ?? null) : undefined };
+  });
+  if (!r) throw notFound('no such principal');
+  const out = { principal: { ...principalView(r.p), created_at: r.p.created_at, created_by: r.p.created_by }, groups: r.groups };
+  if (r.creds !== undefined) out.credentials = r.creds ? { password: Boolean(r.creds.password_hash), totp_enabled: r.creds.totp_enabled, failed_logins: r.creds.failed_logins, locked: Boolean(r.creds.locked_until && r.creds.locked_until > ctx.app.now()) } : { password: false, totp_enabled: false, failed_logins: 0, locked: false };
+  return out;
+}
+
+export async function principalUpdate(ctx) {
+  const id = idParam(ctx);
+  requireGlobal(ctx);
+  const body = shape(ctx.body, {
+    name: { type: 'string', min: 1, max: 255, re: /^[A-Za-z0-9][A-Za-z0-9._@+:-]*$/, reText: 'letters, digits and . _ @ + : - (not first)' },
+    display_name: { type: 'string', max: 255, nullable: true },
+    email: { type: 'string', max: 255, nullable: true, re: /^[^\s@]+@[^\s@]+$/, reText: 'an e-mail address' },
+    disabled: { type: 'bool' },
+  });
+  if (id === ctx.auth.principal.id && body.disabled === true) throw conflict('you cannot disable yourself', 'self');
+  const changed = await ctx.db(async (tx) => {
+    const n = await S.updatePrincipal(tx, id, body);
+    if (n && body.disabled === true) {
+      await S.deleteSessionsOf(tx, id);
+      await S.revokeTokensOf(tx, id, ctx.app.now());
+    }
+    return n;
+  }, { write: true });
+  if (!changed && Object.keys(body).length) throw notFound('no such principal');
+  const p = await ctx.db((tx) => S.getPrincipal(tx, id));
+  if (!p) throw notFound('no such principal');
+  return { principal: principalView(p) };
+}
+
+export async function principalDelete(ctx) {
+  const id = idParam(ctx);
+  requireGlobal(ctx);
+  if (id === ctx.auth.principal.id) throw conflict('you cannot delete yourself', 'self');
+  const n = await ctx.db((tx) => S.deletePrincipal(tx, id), { write: true });
+  if (!n) throw notFound('no such principal');
+  return reply(204, null);
+}
+
+// an administrator sets the password of a user (the user's sessions end)
+export async function principalPassword(ctx) {
+  const id = idParam(ctx);
+  requireGlobal(ctx);
+  const body = shape(ctx.body, { password: { ...PASSWORD, required: true } });
+  const p = await ctx.db((tx) => S.getPrincipal(tx, id));
+  if (!p) throw notFound('no such principal');
+  if (p.kind !== 'user') throw conflict('only a user has a password', 'not-a-user');
+  checkPassword(body.password, p.name);
+  const hash = await hashPassword(body.password, { ln: ctx.app.settings['scrypt-ln'] });
+  await ctx.db(async (tx) => {
+    await S.setPassword(tx, id, hash, ctx.app.now());
+    await S.deleteSessionsOf(tx, id);
+  }, { write: true });
+  return { password: 'changed' };
+}
+
+async function groupOf(ctx, tx) {
+  const g = await S.getPrincipal(tx, idParam(ctx));
+  if (!g) throw notFound('no such principal');
+  if (g.kind !== 'group') throw conflict('this is not a group: only a group has members', 'not-a-group');
+  return g;
+}
+
+export async function membersList(ctx) {
+  const r = await ctx.db(async (tx) => {
+    const g = await groupOf(ctx, tx);
+    return { group: g, members: await S.membersOf(tx, g.id) };
+  });
+  return { group: principalView(r.group), members: r.members.map(principalView) };
+}
+
+export async function memberAdd(ctx) {
+  requireGlobal(ctx);
+  const body = shape(ctx.body, { member: { ...ID, required: true } });
+  await ctx.db(async (tx) => {
+    const g = await groupOf(ctx, tx);
+    if (!(await S.getPrincipal(tx, body.member))) throw notFound('no such principal');
+    await S.addMember(tx, g.id, body.member);
+  }, { write: true });
+  return reply(201, { member: body.member });
+}
+
+export async function memberRemove(ctx) {
+  requireGlobal(ctx);
+  const mid = idParam(ctx, 'mid');
+  const n = await ctx.db(async (tx) => S.removeMember(tx, (await groupOf(ctx, tx)).id, mid), { write: true });
+  if (!n) throw notFound('this principal is not a member');
+  return reply(204, null);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------- policies
+const META_TYPES = new Set(['RRSIG', 'NSEC', 'NSEC3', 'NSEC3PARAM', 'DNSKEY', 'CDS', 'CDNSKEY', 'ANY', 'AXFR', 'IXFR', 'OPT', 'TSIG', 'TKEY', 'MAILA', 'MAILB']);
+const TTL = { type: 'int', min: 0, max: 2147483647 };
+const POLICY = {
+  name: { type: 'string', min: 1, max: 255 },
+  allowed_types: { type: 'array', max: 200, items: { type: 'string', min: 1, max: 32, re: /^[A-Za-z][A-Za-z0-9]*$/ } },
+  allow_wildcard: { type: 'bool' },
+  allow_delegation: { type: 'bool' },
+  allow_dname: { type: 'bool' },
+  apex_editable: { type: 'bool' },
+  ttl_min: TTL,
+  ttl_max: TTL,
+  max_rr: { type: 'int', min: 0, max: 1000000000, nullable: true },
+};
+
+// the types of a policy: upper case, once each, none of the DNSSEC types (the signer owns them) and none of the meta types, also not as TYPEnnn (the database checks again)
+function policyTypes(list) {
+  const out = [...new Set(list.map((t) => t.toUpperCase()))].sort();
+  out.forEach((t, i) => {
+    if (META_TYPES.has(t) || /^TYPE0*(2|6|39|46|47|48|50|51|59|60)$/.test(t)) {
+      throw new ApiError(400, 'bad-request', `${t} cannot be in a policy: the DNSSEC types belong to the signer and the meta types are no data`, { errors: [{ code: 'bad-request', severity: 'error', text: `${t} cannot be in a policy`, pointer: `/allowed_types/${i}` }] });
+    }
+  });
+  return out;
+}
+
+export async function policiesList(ctx) {
+  const q = query(ctx.query, { limit: LIMIT, cursor: CURSOR });
+  const limit = q.limit ?? 100;
+  const rows = await ctx.db((tx) => S.listPolicies(tx, { after: idCursor(q.cursor), limit: limit + 1 }));
+  const p = page(rows, limit, (r) => ({ i: r.id }));
+  return { policies: p.items.map(policyView), next_cursor: p.next_cursor };
+}
+
+export async function policyGet(ctx) {
+  const p = await ctx.db((tx) => S.getPolicy(tx, idParam(ctx)));
+  if (!p) throw notFound('no such policy');
+  return { policy: policyView(p) };
+}
+
+export async function policyCreate(ctx) {
+  requireGlobal(ctx);
+  const body = shape(ctx.body, { ...POLICY, name: { ...POLICY.name, required: true }, allowed_types: { ...POLICY.allowed_types, required: true } });
+  const p = {
+    allow_wildcard: false, allow_delegation: false, allow_dname: false, apex_editable: false, ttl_min: 0, ttl_max: 2147483647, max_rr: null, ...body, allowed_types: policyTypes(body.allowed_types),
+  };
+  if (p.ttl_min > p.ttl_max) throw badRequest('ttl_min is higher than ttl_max', '/ttl_min');
+  const id = await ctx.db((tx) => S.createPolicy(tx, p, ctx.auth.principal.id), { write: true });
+  return reply(201, { policy: policyView(await ctx.db((tx) => S.getPolicy(tx, id))) });
+}
+
+export async function policyUpdate(ctx) {
+  requireGlobal(ctx);
+  const id = idParam(ctx);
+  const body = shape(ctx.body, POLICY);
+  if (body.allowed_types) body.allowed_types = policyTypes(body.allowed_types);
+  const p = await ctx.db(async (tx) => {
+    const old = await S.getPolicy(tx, id);
+    if (!old) return null;
+    if ((body.ttl_min ?? old.ttl_min) > (body.ttl_max ?? old.ttl_max)) throw badRequest('ttl_min is higher than ttl_max', '/ttl_min');
+    await S.updatePolicy(tx, id, body);
+    return S.getPolicy(tx, id);
+  }, { write: true });
+  if (!p) throw notFound('no such policy');
+  return { policy: policyView(p) };
+}
+
+export async function policyDelete(ctx) {
+  requireGlobal(ctx);
+  const n = await ctx.db((tx) => S.deletePolicy(tx, idParam(ctx)), { write: true });
+  if (!n) throw notFound('no such policy');
+  return reply(204, null);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------- grants
+const gview = (app, g) => ({
+  id: g.id, principal_id: g.principal_id, principal: g.principal, role: g.role,
+  dataset: g.data_schema === null ? (g.zone_name ? 'main' : null) : (app.datasetOfSchema(g.data_schema)?.name ?? g.data_schema),
+  zone: g.zone_name ? absolute(g.zone_name) : null, suffix: g.name_suffix ? absolute(g.name_suffix) : null, policy_id: g.rr_policy_id, policy: g.rr_policy,
+  granted_by: g.granted_by, granted_at: g.granted_at,
+});
+
+// a grant's data_schema as perm.js compares it ('' on SQLite3)
+const schemaOf = (ctx, g) => (ctx.app.backend.dialect === 'sqlite' ? '' : g.data_schema);
+
+// Which grants does the principal see?  A global master all of them; otherwise its own, those of the groups it is in, and those on the zones it is domain
+// master of (karidns_auth's policy on grants says the same).  -> { visible: the part for the SQL (null = all), canSee(grant): the exact test }
+async function grantFilter(ctx, tx) {
+  const { auth } = ctx;
+  if (isGlobal(auth.grants)) return { visible: undefined, canSee: () => true };
+  const mine = new Set([auth.principal.id, ...(await S.groupsOf(tx, auth.principal.id)).map((g) => g.id)]);
+  const zones = [...new Set(auth.grants.filter((g) => g.role === 'domain_master').map((g) => g.zone_name))];
+  return {
+    visible: { principals: [...mine], zones },
+    canSee: (g) => mine.has(g.principal_id) || Boolean(g.zone_name && zoneGrant(auth.grants, schemaOf(ctx, g), g.zone_name) === 'domain_master'),
+  };
+}
+
+export async function grantsList(ctx) {
+  const { app, auth } = ctx;
+  const q = query(ctx.query, { limit: LIMIT, cursor: CURSOR, principal: ID, zone: { type: 'string', min: 1, max: 255 } });
+  const limit = q.limit ?? 100;
+  let zone;
+  if (q.zone !== undefined) {
+    try { zone = canonicalZone(q.zone); } catch (e) { throw badRequest(e.message, '?zone'); }
+  }
+  const { rows, canSee } = await ctx.db(async (tx) => {
+    const f = await grantFilter(ctx, tx);
+    return { canSee: f.canSee, rows: await S.listGrants(tx, { principalId: q.principal, zone, visible: f.visible, after: idCursor(q.cursor), limit: limit + 1 }) };
+  });
+  const p = page(rows, limit, (r) => ({ i: r.id }));
+  const items = p.items.filter(canSee);
+  return { grants: items.map((g) => gview(app, g)), next_cursor: p.next_cursor };
+}
+
+export async function grantCreate(ctx) {
+  const { app, auth } = ctx;
+  const body = shape(ctx.body, {
+    principal: { ...ID, required: true },
+    role: { type: 'string', required: true, values: ['global_master', 'domain_master', 'subdomain_master'] },
+    dataset: { type: 'string', max: 32 },
+    zone: { type: 'string', min: 1, max: 255 },
+    suffix: { type: 'string', min: 1, max: 255 },
+    policy: { ...ID, required: true },
+  });
+  let ds = null;
+  let zone = null;
+  let suffix = null;
+  if (body.role === 'global_master') {
+    for (const f of ['dataset', 'zone', 'suffix']) if (body[f] !== undefined) throw badRequest('a global master grant has no dataset, zone or suffix', `/${f}`);
+  } else {
+    if (body.zone === undefined) throw badRequest('this role needs a zone', '/zone');
+    if (body.role === 'subdomain_master' && body.suffix === undefined) throw badRequest('a subdomain master needs a suffix', '/suffix');
+    if (body.role === 'domain_master' && body.suffix !== undefined) throw badRequest('a domain master has no suffix', '/suffix');
+    ds = body.dataset === undefined && app.datasets.length === 1 ? app.datasets[0] : app.dataset(body.dataset);
+    if (!ds) throw badRequest(body.dataset === undefined ? 'the dataset is required' : 'no such dataset', '/dataset');
+    try { zone = canonicalZone(body.zone); } catch (e) { throw badRequest(e.message, '/zone'); }
+    if (body.suffix !== undefined) {
+      try { suffix = canonicalOwner(body.suffix); } catch (e) { throw badRequest(e.message, '/suffix'); }
+      if (!inZone(suffix, zone)) throw badRequest('the suffix is not the zone or a name below it', '/suffix');
+    }
+  }
+  const id = await ctx.db(async (tx) => {
+    const target = await S.getPrincipal(tx, body.principal);
+    if (!target) throw notFound('no such principal');
+    const pol = await S.getPolicy(tx, body.policy);
+    if (!pol) throw notFound('no such policy');
+    if (!maySetGrant(auth.grants, { role: body.role, schema: ds ? ds.schema : null, zone, policy: pol })) {
+      throw forbidden('you may only grant on a zone you are domain master of, with a policy no wider than your own (a global master may grant anything)', 'escalation');
+    }
+    return S.createGrant(tx, { principalId: body.principal, role: body.role, schema: ds ? ds.schema : null, zone, suffix, policyId: body.policy, grantedBy: auth.principal.id });
+  }, { write: true });
+  return reply(201, { grant: gview(app, await ctx.db((tx) => S.getGrant(tx, id))) });
+}
+
+export async function grantDelete(ctx) {
+  const { auth } = ctx;
+  const id = idParam(ctx);
+  await ctx.db(async (tx) => {
+    const g = await S.getGrant(tx, id);
+    if (!g || !(await grantFilter(ctx, tx)).canSee(g)) throw notFound('no such grant');
+    const pol = await S.getPolicy(tx, g.rr_policy_id);
+    if (!maySetGrant(auth.grants, { role: g.role, schema: schemaOf(ctx, g), zone: g.zone_name, policy: pol })) throw forbidden('you may not remove this grant', 'escalation');
+    await S.deleteGrant(tx, id);
+  }, { write: true });
+  return reply(204, null);
+}
+

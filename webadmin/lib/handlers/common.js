@@ -1,0 +1,59 @@
+// What several handlers need: route-level checks, path parameters, pages.
+
+import { ApiError, badRequest, forbidden, notFound } from '../errors.js';
+import { isGlobal, grantsOn } from '../perm.js';
+import { canonicalZone } from '../names.js';
+import { encodeCursor, decodeCursor } from '../validate.js';
+
+export function requireGlobal(ctx) {
+  if (!isGlobal(ctx.auth.grants)) throw forbidden('only a global master may do this');
+}
+
+export function dataset(ctx) {
+  const d = ctx.app.dataset(ctx.params.ds);
+  if (!d) throw notFound('no such dataset');
+  return d;
+}
+
+// the zone of the path, canonical (no final dot); a name that is no plain LDH name is a 400
+export function zoneParam(ctx) {
+  try {
+    return canonicalZone(ctx.params.zone);
+  } catch (e) {
+    throw badRequest(e.message);
+  }
+}
+
+// the grants that apply to the zone, strongest first; none: the zone does not exist for this principal (404, not 403, A-25)
+export function zoneGrants(ctx, ds, zone) {
+  const gs = grantsOn(ctx.auth.grants, ds.schema, zone);
+  if (gs.length === 0) throw notFound('no such zone');
+  return gs;
+}
+
+// a numeric id of the path; anything else cannot be an object of ours: 404
+export function idParam(ctx, name = 'id') {
+  const v = ctx.params[name];
+  if (!/^\d{1,15}$/.test(v)) throw notFound('no such object');
+  return Number(v);
+}
+
+// a version number of the path: karidns_zone_versions.version is a 32 bit integer, so a longer number is no version (PostgreSQL would answer it with an error: a 500)
+export function versionParam(ctx, name = 'n') {
+  const v = ctx.params[name];
+  if (!/^\d{1,9}$/.test(v)) throw notFound('no such version');
+  return Number(v);
+}
+
+export const idCursor =(text) => (text === undefined ? 0 : decodeCursor(text, (o) => Number.isSafeInteger(o?.i) && o.i >= 0).i);
+
+// rows fetched with limit + 1 -> { items, next_cursor }
+export function page(rows, limit, key) {
+  const more = rows.length > limit;
+  const items = rows.slice(0, limit);
+  return { items, next_cursor: more ? encodeCursor(key(items[items.length - 1])) : null };
+}
+
+export const clean = (s) => String(s).replace(/[\0-\x1f\x7f]+/g, ' ').slice(0, 80);
+
+export { ApiError };

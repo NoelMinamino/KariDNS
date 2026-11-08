@@ -13,14 +13,18 @@ karidns-zone import --signer [options] <zone> <signed-zone-file|->
 karidns-zone export [options] <zone> [<file>]
 karidns-zone export --signer [options] <zone> [<file>]
 karidns-zone export --all --dir <dir> [options]
+karidns-zone apply [options] --changes <file|-> <zone>
+karidns-zone apply [options] --zone-file <file|-> [--delete-others] <zone>
+karidns-zone --types-list [--json]
 karidns-zone --version | -h | --help
 ```
 
 ## DESCRIPTION
 
-`karidns-zone` is the command line of the 0.6.0 ZoneImporter and ZoneExporter. It reads the settings of the database the way [`karidns-dbloader(8)`](karidns-dbloader.md) and `karicheck db` do (the `database { }` block and the views of `karidns.conf`), or takes them from the command line. It is an ordinary program: it runs as an ordinary user and never needs root. The server and the loader do not use it; it is how zone files get into the database and out of it again (backups, the DB-outage fallback below, a signer that writes its records through `--types`).
+`karidns-zone` is the command line of the 0.6.0 ZoneImporter and ZoneExporter. It reads the settings of the database the way [`karidns-dbloader(8)`](karidns-dbloader.md) and `karicheck db` do (the `database { }` block and the views of `karidns.conf`), or takes them from the command line. It is an ordinary program: it runs as an ordinary user and never needs root. The server and the loader do not use it; it is how zone files get into the database and out of it again (backups, the DB-outage fallback below, a signer that writes its records through `--types`), and, with `apply`, how the WebAdmin API changes the RRsets of a zone (below).
 
 - **import** reads a zone file (BIND format, with `$INCLUDE`, `$GENERATE`, `$LOCATION` and `$ECS-SUBNET` tags; or a tinydns data file) with the parser of the server and writes the zone as rows of the PowerDNS schema, in ONE transaction per zone: owners in lower case without the final dot, MX and SRV priorities in `prio`, a signed zone in the layout PowerDNS stores for a zone with `PRESIGNED=1` (see [`karidns(8)`](karidns.md), "Database zones"), tags and tinydns attributes in the `karidns_*` tables. It does not run SQL text: every value is a bound parameter.
+- **apply** changes RRsets of a zone from a change file, with the zone's generation checked, the serial raised, the version of the change written and a JSON diff of the RRsets (below, "apply and the change file").
 - **export** writes a zone of the database as a zone file. The zone is read the way the loader reads it (every row checked, a presigned zone with the NSEC3PARAM / NSEC3 / NSEC records the server rebuilds), so what is exported is what the server serves. The text is in **canonical order** (RFC 4034 section 6.1, owner names first, then type, then RDATA), so two exports of the same zone are the same file and `diff` shows the real change. The text is parsed again before a byte is written and must give the same records.
 
 ### What an import does
@@ -116,6 +120,49 @@ Without a configuration the checks have their default severities and there are n
 
 A signed (PRESIGNED) zone is exported as the server serves it, with the NSEC3PARAM / NSEC3 / NSEC records the server rebuilds from the rows, so **the file alone can serve the zone** (below).
 
+### apply and the change file (0.6.0 items D and E)
+
+`karidns-zone apply --changes <file|-> <zone>` changes RRsets of a zone that is in the database: the **RRset merge** of `import --mode merge`, with deletes, from a small change file instead of a zone file. It is what the WebAdmin API runs for every change of a zone (the API renders the file from a request; an operator may write one by hand), and it does the work in one transaction:
+
+1. Reads the change file (a file, `-` for standard input, at most 64 MiB) with the parser of `dns_zone_changes.c` (below). A line it refuses fails the whole file, names the line and writes nothing.
+2. Turns the `rr` lines into zone text under `$ORIGIN <zone>.` and runs the checks of `karicheck zone` on it exactly as `import --mode merge` does (a part of a zone is not judged by the SOA, NS and glue it lacks). An error fails the change.
+3. In ONE transaction (`REPEATABLE READ` on PostgreSQL): locks the zone, reads its **generation** (below) and fails with exit status **3** when `--expect-generation` names another, deletes and inserts the RRsets, **raises the SOA serial by one** when the change set changed the zone and wrote no SOA record of its own (RFC 1982 section 3.1; with `--principal` through `karidns_auth.bump_serial()`, the only way the API's role may change an SOA), reads the zone back through the loader's reader (the whole zone, or with `--readback changed` only the rows written), writes the **version** (below) and commits, or rolls back for `--dry-run`.
+4. Reports the RRsets that changed, each with its records before and after, in the text output as `db.import.change` notes and in the `--json` document as the key `apply` (below).
+
+A change set that changes nothing writes nothing: no version, no new serial. The RRsets of the change that equal the zone's are not deleted and written again either: only the RRsets that change are written (a write that changes nothing is still a write for the audit log and for row level security). `--zone-file FILE` (below, "OPTIONS") takes a zone file instead of a change file. A zone that is not a primary zone (`SLAVE`, `CONSUMER`, `PRODUCER`), a zone that is not in the database (without `--create`), the deletion of the apex SOA, and a zone that already exists (with `--create`) are errors (`db.apply.zone`). `--create` makes a new zone (`--type NATIVE` or `MASTER`, `--view`): the `rr` lines are the whole zone and are checked as one (SOA, NS and glue are needed); its version 1 has the kind `create`.
+
+**The change file** (`dns_zone_changes.h`) has one operation per line, fields separated by blanks, lines ended by LF (a CR before it is dropped); empty lines and lines that begin with `#` are ignored:
+
+```text
+rr <owner> <ttl> <type> <rdata>
+delete <owner> <type>
+```
+
+- `rr` puts a record into the new RRset (owner, type): **every RRset that has `rr` lines is replaced** by its `rr` lines, in one step, whatever it had before. `delete` deletes the RRset. The same RRset in a `delete` line and in an `rr` line is an error; two `delete` lines of one RRset are one.
+- `owner` is an absolute name with the final dot, made of letters, digits, `_`, `*`, `-`, `/` and `.` (labels of 1 to 63 octets, 253 octets in all; case does not matter, it is stored in lower case), and it is the zone or a name below it at a label boundary: `www.example.test.` is in `example.test.`, `wwwexample.test.` is not. A name outside the zone is an error (it is not dropped as a zone file's would be).
+- `ttl` is decimal, 0 to 2147483647 (RFC 2181 section 8). `type` is a record type name or `TYPEnnn`, any case, letters, digits and `-`. The types the signer owns (`RRSIG NSEC NSEC3 NSEC3PARAM DNSKEY CDS CDNSKEY`) and the meta types (`ANY AXFR IXFR OPT TSIG TKEY MAILA MAILB`) are refused, also in their `TYPEnnn` spelling. `karidns-zone --types-list` prints the names a change file may use.
+- `rdata` is the rest of the line in the presentation format of the zone parser (names in it that are not absolute are relative to the zone), not empty, at most 65535 octets. It must be safe in a zone file by the rules of the loader's reader (`dns_pdns_reader.h`, RFC 1035 section 5.1): no control character but TAB, no `;` outside quotes, no leading `$`, no open quote or group, no trailing backslash, no bare `@`. A field can therefore never end its line, start a directive or hide the rest of its line, whatever a renderer put into it. The parser is fuzzed (`tests/fuzz/fuzz_zone_changes.c`).
+
+**The generation.** `karidns_zone_state` has a number per zone that grows whenever a transaction changes a row of the zone (records, metadata, the `karidns_*` zone tables), written by triggers of the owner: nothing else writes it. `apply --dry-run` prints it; `--expect-generation N` makes the transaction fail with exit status 3 (`db.import.changed`, nothing written) unless the zone has that generation, and on PostgreSQL a writer that committed after the transaction's snapshot makes its own write fail with a serialization failure, which is the same exit status 3. So the API validates a change set against the zone it read, and commits only when nobody changed the zone in between (it repeats the check when it is told "changed"). Every writer grows the number, the signer included: the SOA serial a re-sign raises is a change of the zone, so a signed zone can make the commit run of the API exit with 3 now and then, and the API repeats the two steps. PostgreSQL grows it once per transaction and zone, SQLite3 once per changed row; only equality means anything.
+
+**Versions.** `karidns_zone_versions` and `karidns_zone_version_rrsets` (db/karidns_ext.*.sql) hold one row per committed change set of a zone: its number (per zone, from 1), the kind (`create`, `edit`, `template`, `import`, `rollback`; `--version-kind`), the principal (`--principal`, `--principal-name`) and the database role, the change set (`--change-set`), the comment (`--comment`), the SOA serial and the generation before and after, the version a rollback restores (`--rollback-of`), and for each RRset the change made, the RRset before and after as canonical lines `<ttl> <TYPE> <rdata>` (names absolute, in the order of the exporter), NULL for absent. The rows are written in the transaction of the change itself, from the RRsets it replaced and wrote; the audit log stays the complete record. The newest 100 versions of a zone are kept (the number in the trigger; `tests/run_karidns_zone_apply_test.sh` replaces it by 3). The DNSSEC types, tags and tinydns attributes, and a change of the SOA serial alone, are not versioned. A change of more than 10000 RRsets is listed without its RRsets (`delta_complete` false). `import` writes a version too (kind `import`, no principal) when the tables exist, so the history has no silent gaps; a signer import (`--signer`) writes none. A database without the tables works as before.
+
+**Roles.** An operator runs `apply` with the writer role. The WebAdmin API runs it twice per change set: the **check run** (`apply --dry-run`, then nothing stays) as the **check role** of `db/karidns_check_role.pgsql.sql`, a trusted session that sees the whole zone and so can judge a change of a subdomain master against it, and the **commit run** as the API's role (`--readback changed --expect-generation G --principal P --change-set C`), where row level security checks every row again. The check role cannot commit: a transaction of its login role that wrote a row of any table the dry run writes is refused at COMMIT ("the check role never commits"; a deferred constraint trigger, `karidns_auth.enable_never_commit()`). `--readback changed` reads back only the rows this transaction wrote and runs them through the loader's reader; the checks of the whole zone were made by the check run at the same generation (row level security shows the API's session only the part of the zone its principal has a grant on, so a read-back of the whole zone would judge a part), and the tool checks that every row written is read back.
+
+**The `apply` document.** With `--json` the document has the key `"command": "apply"` and, after `zones`, the key `apply`:
+
+```json
+"apply": { "zone": "example.test.", "dry_run": true, "committed": false, "changed": false, "busy": false, "created": false,
+           "generation": 17, "generation_after": 21, "serial": { "before": 41, "after": 42 }, "serial_bumped": true,
+           "version": 5, "delta_complete": true, "records_before": 1200, "records_after": 1201, "warnings": 0,
+           "diff": [ { "owner": "www.example.test.", "type": "A", "change": "replace",
+                       "before": [ "300 A 192.0.2.1" ], "after": [ "300 A 192.0.2.10", "300 A 192.0.2.11" ] } ] }
+```
+
+`diff` has one entry per RRset changed, in owner, type order (the SOA RRset too, when the file wrote it); `change` is `add`, `replace` or `delete`; `before` / `after` are arrays of the canonical lines, null when the RRset was not / is not there. `version` is the number the version row has (a dry run writes it and rolls it back); `records_before` / `records_after` count the records the session could see. When the zone changed (exit status 3) or is busy (4) the document has `changed` or `busy` true and no other key but `zone`, `dry_run`, `committed` and `created`. The messages (the zone checks) are in `messages[]` as always, with the codes of `karicheck(1)`.
+
+**`--types-list`** prints the record types a change file may name, one per line (with `--json`: the key `types`, `"command": "types"`).
+
 ## OPTIONS
 
 `-c`, `--config FILE`
@@ -167,6 +214,36 @@ A signed (PRESIGNED) zone is exported as the server serves it, with the NSEC3PAR
 `--json`
 : One JSON document on standard output (below).
 
+`--changes FILE` (apply)
+: The change file; `-` is standard input. Required, unless `--zone-file` is given.
+
+`--zone-file FILE` (apply)
+: Instead of `--changes`: the RRsets of a **zone file** (BIND format; `-` is standard input, where `$INCLUDE` is refused; the plain records only, no DNSSEC records, location / ECS tags or tinydns attributes) replace those RRsets of the zone, as `import --mode merge` does, with the checks, the generation, the version and the read-back of `apply`. An apex SOA of the file that differs from the zone's in the serial only is left alone (the serial is raised as for any change, `--serial increment`); one that differs otherwise is written. It is what the WebAdmin API runs for an import.
+
+`--delete-others` (apply)
+: With `--zone-file`: also delete the RRsets of the zone that the file does not have, except the apex SOA and, in a zone kept signed by `karidns-signer`, the DNSSEC records. Not with `--create`.
+
+`--create` (apply)
+: The zone must not exist and is made; the `rr` lines (or the zone file) are the whole zone (`--type NATIVE|MASTER`, `--view`).
+
+`--expect-generation N` (apply)
+: Fail with exit status 3 unless the zone has this generation. Not with `--create`.
+
+`--serial grow|increment|keep` (apply)
+: As for import, but the default is `increment`: a change that wrote no SOA of its own raises the serial by one; an SOA in the change file gets the database serial + 1.
+
+`--principal ID`, `--principal-name NAME`, `--change-set ID` (apply)
+: Who acts and for which change set. PostgreSQL: `SET LOCAL karidns.principal` and `karidns.change_set` for the transaction (the audit log and the policies of the API's role read them), and the serial is raised with `karidns_auth.bump_serial()`. SQLite3: the values go into the row of `karidns_audit_actor` and the version row. The id is 1 to 18 digits, the change set 1 to 64 of letters, digits, `.`, `_`, `:` and `-`.
+
+`--readback zone|changed` (apply)
+: `zone` (the default) reads the whole zone back through the loader's reader; `changed` only the rows this transaction wrote (the commit run of the API).
+
+`--version-kind edit|template|import|rollback`, `--rollback-of N`, `--comment TEXT` (apply)
+: The kind of the version row (`create` is chosen by `--create`), the version a rollback restores (needed with `rollback`, an error otherwise), and the comment (at most 1024 octets).
+
+`--types-list`
+: Print the record types a change file may name and exit.
+
 `-h`, `--help`
 : Print the usage and exit with 0.
 
@@ -189,13 +266,13 @@ The BIND text is `$ORIGIN`, `$TTL` (the TTL most records have), the tag definiti
 
 ## JSON OUTPUT
 
-`karidns-zone --json <command> ...` writes the document of [`karicheck --json`](karicheck.md#json-output) with the first key `"karidns-zone": 1` and `"command": "import"` or `"export"`; `import --signer` adds the key `signer` after `zones` (above); `messages[]`, `counts` and `zones[]` are as there (`zones[]` has one entry per zone imported or exported; `format` is `bind`, `tinydns`, or `database` for a zone that failed before its format was known; `file` is the input or output file). Standard output carries only the document, standard error nothing; the exit status is the one of the text mode. The codes are those of [`karicheck(1)`](karicheck.md) (`usage.*`, `io.*`, `conf.*`, `zone.*`, `db.import.*`, `db.export.*`, `db.zone.*`; the list is in the manual of `karicheck`).
+`karidns-zone --json <command> ...` writes the document of [`karicheck --json`](karicheck.md#json-output) with the first key `"karidns-zone": 1` and `"command": "import"`, `"export"`, `"apply"` or `"types"`; `import --signer` adds the key `signer` after `zones` (above), `apply` the key `apply` (above), `--types-list` the key `types`; `messages[]`, `counts` and `zones[]` are as there (`zones[]` has one entry per zone imported or exported; `format` is `bind`, `tinydns`, or `database` for a zone that failed before its format was known; `file` is the input or output file). Standard output carries only the document, standard error nothing; the exit status is the one of the text mode. The codes are those of [`karicheck(1)`](karicheck.md) (`usage.*`, `io.*`, `conf.*`, `zone.*`, `db.import.*`, `db.export.*`, `db.zone.*`; the list is in the manual of `karicheck`).
 
 ## AUDIT
 
 A database of schema version 3 (`db/karidns_ext.*.sql`) has an audit log: `karidns_auth.audit_log` on PostgreSQL, `karidns_audit_log` on SQLite3. It is empty and stays empty until the audit triggers are attached (PostgreSQL: `SELECT karidns_auth.enable_audit('public')`, which the role scripts of the WebAdmin do; SQLite3: apply `db/karidns_audit.sqlite3.sql`). With the triggers on, every row `karidns-zone import` changes is logged: the table, the operation (`I`, `U`, `D`), the zone, the row before and after as JSON, and who did it.
 
-**Who.** PostgreSQL: the database role of the connection (`db_role`), and no principal. SQLite3: triggers can only read their own database, so the importer writes one row to the table `karidns_audit_actor` first in its transaction and deletes it before the commit; the row says `karidns-zone:<OS user>`. A database without that table (schema version 2) gets no row and the import is as before. The importer does not set `karidns.principal`: a session that does (the WebAdmin) is logged under that principal.
+**Who.** PostgreSQL: the database role of the connection (`db_role`), and no principal. SQLite3: triggers can only read their own database, so the importer writes one row to the table `karidns_audit_actor` first in its transaction and deletes it before the commit; the row says `karidns-zone:<OS user>`. A database without that table (schema version 2) gets no row and the import is as before. `import` does not set `karidns.principal`: a session that does (the WebAdmin) is logged under that principal; `apply --principal P --change-set C` sets it (and, on SQLite3, writes it into the actor row) and the audit rows of the change carry both.
 
 `--audit rows` (the default)
 : One audit row per changed record, tag, tag definition and metadata row. A replace-import of a zone of a million records writes two million rows.
@@ -221,10 +298,10 @@ A database of schema version 3 (`db/karidns_ext.*.sql`) has an audit log: `karid
 : Usage error (an unknown option or command, a missing value, an option of the other command, a wrong number of arguments, `--json` with an export to standard output, `--signer` with `--mode`, `--types`, `--serial`, `--view`, `--type` or `--all`). The usage goes to standard error (the message only, in the document, with `--json`); nothing was done.
 
 `3`
-: `import --signer` only: the zone in the database is no longer the zone the signed file was made from (a record or the SOA differs, or the serial does not grow, or another session changed the zone while the tool wrote it). Nothing was written (`db.import.changed`). Sign the zone again.
+: `import --signer`: the zone in the database is no longer the zone the signed file was made from (a record or the SOA differs, or the serial does not grow, or another session changed the zone while the tool wrote it). Nothing was written (`db.import.changed`). Sign the zone again. `apply`: the zone is not at the generation `--expect-generation` named, or a session that committed after the snapshot of the transaction changed a row it wrote. Nothing was written; check the change again.
 
 `4`
-: `import --signer` only: the zone is locked by another import, or the database is busy for longer than the tool waits. Nothing was written (`db.import.busy`). Try again.
+: `import --signer`, `apply`: the zone is locked by another import, or the database is busy for longer than the tool waits. Nothing was written (`db.import.busy`). Try again.
 
 ## THE WRITER ROLE (PostgreSQL)
 
@@ -318,6 +395,9 @@ then `karictl reconfig`. A signed zone is exported with its signatures and the N
 
 ## FILES
 
+`/usr/local/share/karidns/db/karidns_check_role.pgsql.sql`
+: The privileges of the check role of the API (the writer role's, membership of `karidns_rls_trusted` and `karidns_never_commit`, the never-commit triggers; database packages).
+
 `/usr/local/etc/karidns/karidns.conf`
 : The configuration read when `-c` is not given.
 
@@ -333,6 +413,7 @@ then `karictl reconfig`. A signed zone is exported with its signatures and the N
 - [`karidns-signer(8)`](karidns-signer.md) — the daemon that runs `export --signer` and `import --signer` and keeps the zones signed
 - [`karicheck(1)`](karicheck.md) — the zone checks (`karicheck zone`), `karicheck db`, the JSON document and the message codes
 - [`karictl(8)`](karictl.md) — `reload`, `dbstatus`, `rollback`
+- the database chapter of [`karidns-dbloader(8)`](karidns-dbloader.md) — the generation, version, session, token and template tables, the check role, the migration of a database made before them
 - [`karidns(8)`](karidns.md) — the `database` block, views, database zones, `check-*` options and limits
 - [Distribution Guide](distribution.md) — the FreeBSD packages
 

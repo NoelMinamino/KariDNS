@@ -177,9 +177,9 @@ echo "-- the role scripts"
 if rs karidns_api_role.pgsql.sql $API public; then pass "db/karidns_api_role.pgsql.sql applies (the role is created)"; else fail "the API role script"; head -5 "$T/rs.err"; fi
 if rs karidns_api_role.pgsql.sql $API public; then pass "...and can be applied again"; else fail "second application of the API role script"; head -5 "$T/rs.err"; fi
 if rs karidns_signer_role.pgsql.sql $SIG public && rs karidns_signer_role.pgsql.sql $SIG public; then pass "db/karidns_signer_role.pgsql.sql applies, twice"; else fail "the signer role script"; head -5 "$T/rs.err"; fi
-oeq "the policies exist: 34 for the API on the schema's tables, 21 on karidns_auth, 1 for the trusted role on each of the 17 tables, 29 for the signer (3 + 3 permissive and restrictive on records and domainmetadata, 11 SELECT, 1 INSERT on reload requests, 1 on cryptokeys, 1 UPDATE on key requests, 3 on the signer state)" \
-    "34 21 17 29" "SELECT (SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE c.relnamespace = 'public'::regnamespace AND p.polname LIKE 'karidns\_rls\_%' AND p.polname <> 'karidns_rls_trusted' AND p.polroles = '{0}')::text || ' ' || (SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE c.relnamespace = 'karidns_auth'::regnamespace AND p.polname LIKE 'karidns\_rls\_%' AND p.polname <> 'karidns_rls_trusted' AND p.polroles = '{0}')::text || ' ' || (SELECT count(*) FROM pg_policy WHERE polname = 'karidns_rls_trusted')::text || ' ' || (SELECT count(*) FROM pg_policy WHERE polname LIKE 'karidns\_signer\_%')::text"
-oeq "RLS is on for the 11 tables of the schema and the 6 of karidns_auth, and for nothing else" "17" "SELECT count(*) FROM pg_class WHERE relrowsecurity AND relnamespace IN ('public'::regnamespace, 'karidns_auth'::regnamespace)"
+oeq "the policies exist: 39 for the API on the schema's tables, 37 on karidns_auth, 1 for the trusted role on each of the 24 tables, 32 for the signer (3 + 3 permissive and restrictive on records and domainmetadata, 14 SELECT, 1 INSERT on reload requests, 1 on cryptokeys, 1 UPDATE on key requests, 3 on the signer state)" \
+    "39 37 24 32" "SELECT (SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE c.relnamespace = 'public'::regnamespace AND p.polname LIKE 'karidns\_rls\_%' AND p.polname <> 'karidns_rls_trusted' AND p.polroles = '{0}')::text || ' ' || (SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE c.relnamespace = 'karidns_auth'::regnamespace AND p.polname LIKE 'karidns\_rls\_%' AND p.polname <> 'karidns_rls_trusted' AND p.polroles = '{0}')::text || ' ' || (SELECT count(*) FROM pg_policy WHERE polname = 'karidns_rls_trusted')::text || ' ' || (SELECT count(*) FROM pg_policy WHERE polname LIKE 'karidns\_signer\_%')::text"
+oeq "RLS is on for the 14 tables of the schema and the 10 of karidns_auth, and for nothing else" "24" "SELECT count(*) FROM pg_class WHERE relrowsecurity AND relnamespace IN ('public'::regnamespace, 'karidns_auth'::regnamespace)"
 oeq "...and not forced (the owner is exempt)" "0" "SELECT count(*) FROM pg_class WHERE relforcerowsecurity"
 oeq "the audit triggers are attached to the schema (the eight PowerDNS and KariDNS data tables and the two tables of the signer)" "10" "SELECT count(DISTINCT tgrelid) FROM pg_trigger WHERE tgname = 'karidns_audit_row' AND tgrelid::regclass::text IN ('domains','records','domainmetadata','cryptokeys','karidns_record_tags','karidns_record_tinydns','karidns_zone_tagdefs','karidns_domain_views','karidns_key_requests','karidns_signer_state')"
 oeq "only the API role is in audit_restricted_roles (the signer is a trusted daemon that asks for summary mode); the API role is in api_roles (the signer is not)" "true|false|true|false" \
@@ -1010,10 +1010,10 @@ else
 fi
 
 echo "-- switching RLS off and on again"
-oeq "disable_rls('public') and ('karidns_auth') turn it off on 11 + 6 tables" "11 6" "SELECT karidns_auth.disable_rls('public') || ' ' || karidns_auth.disable_rls('karidns_auth')"
+oeq "disable_rls('public') and ('karidns_auth') turn it off on 14 + 10 tables" "14 10" "SELECT karidns_auth.disable_rls('public') || ' ' || karidns_auth.disable_rls('karidns_auth')"
 oq "GRANT SELECT ON domains, records TO $BARE" > /dev/null
 a_eq "...a role that is not trusted sees the rows again" "$(sg_cnt records)" $BARE NONE "SELECT count(*) FROM records"
-oeq "enable_rls() switches it on again" "11 6" "SELECT karidns_auth.enable_rls('public') || ' ' || karidns_auth.enable_rls('karidns_auth')"
+oeq "enable_rls() switches it on again" "14 10" "SELECT karidns_auth.enable_rls('public') || ' ' || karidns_auth.enable_rls('karidns_auth')"
 a_err "...and the bare role is refused again" "permission denied for function|row-level security" $BARE NONE "SELECT count(*) FROM records"
 
 echo
