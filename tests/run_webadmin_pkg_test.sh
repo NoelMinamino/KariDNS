@@ -172,7 +172,8 @@ same "the pid directory is the service user's" "$(stat -f %Su /var/run/karidns_w
 same "the daemon runs as the service user" "$(ps -o user= -p "$CHILD" 2> /dev/null | tr -d ' ')" nobody
 $RC onestatus > /dev/null 2>&1 && ok "status finds it" || bad "status"
 # reload = SIGHUP: public-origin is read again (a login that names the new origin is refused before, accepted after)
-login() { $NODE -e "fetch('http://127.0.0.1:$PORT/api/v1/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: '$1' }, body: JSON.stringify({ user: 'admin', password: process.argv[1] }) }).then((r) => console.log(r.status))" "$PW"; }
+# the password goes in the environment: as an argument one that starts with '-' (it is random base64url) is read by node as an option
+login() { KW_PW="$PW" $NODE -e "fetch('http://127.0.0.1:$PORT/api/v1/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: '$1' }, body: JSON.stringify({ user: 'admin', password: process.env.KW_PW }) }).then((r) => console.log(r.status))"; }
 same "a login with the origin of the new configuration is refused at first" "$(login http://127.0.0.1:$((PORT + 1)))" 403
 sed -i '' "s|^public-origin = .*|public-origin = http://127.0.0.1:$((PORT + 1))|" "$CONF"
 $RC onereload > "$T/rc_reload.out" 2>&1 && ok "reload" || bad "reload" "$(cat "$T/rc_reload.out")"
