@@ -4,13 +4,15 @@ import fs from 'node:fs';
 import { setTimeout as sleepMs } from 'node:timers/promises';
 import { loadConfig, validate, checkConninfoFile } from './config.js';
 import { tools } from './argv.js';
-import { runChild, clip } from './run.js';
-import { createLogger } from './log.js';
+import { runChild, clip } from '../../node/lib/run.js';
+import { createLogger } from '../../node/lib/log.js';
 import { checkWorkDir, wipeStale } from './workdir.js';
 import { Daemon } from './daemon.js';
 import { signZone } from './pipeline.js';
-import { SqliteDb, loadSqlite } from './db_sqlite.js';
-import { PgDb, parseConninfo } from './db_pg.js';
+import { SqliteDb } from './db_sqlite.js';
+import { loadSqlite } from '../../node/lib/sqlite.js';
+import { PgDb } from './db_pg.js';
+import { parseConninfo } from '../../node/lib/conf.js';
 
 export const VERSION = '0.6.0';
 export const DEFAULT_CONFIG = '/usr/local/etc/karidns/karidns-signer.conf';
@@ -104,7 +106,7 @@ export async function openDb(config, { onFatal, importPg, importSqlite = loadSql
     if (problem) throw new Error(problem);
     const pg = await (importPg ? importPg() : import('pg'));
     const Client = pg.Client ?? pg.default.Client;
-    db = new PgDb({ Client, conn: parseConninfo(readFile(s['conninfo-file'], 'utf8')), schema: s.schema, onFatal });
+    db = new PgDb({ Client, conn: parseConninfo(readFile(s['conninfo-file'], 'utf8'), 'karidns-signer'), schema: s.schema, onFatal });
     await db.open();
   }
   return db;
@@ -146,7 +148,7 @@ export async function main(argv, io = {}) {
     for (const p of problems) stderr.write(`karidns-signer: ${p}\n`);
     return 1;
   }
-  const log = (deps.createLogger ?? createLogger)({ target: s.log });
+  const log = (deps.createLogger ?? createLogger)({ target: s.log, name: 'karidns-signer' });
   let resolveDone;
   const done = new Promise((resolve) => { resolveDone = resolve; });
   let daemon = null;

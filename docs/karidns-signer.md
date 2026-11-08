@@ -302,10 +302,10 @@ Two workers give 1.8 times the throughput of one on 4 CPUs. At 14 zones a second
 : The configuration file (`karidns-signer.conf.sample`).
 
 `/usr/local/sbin/karidns-signer`
-: The wrapper (`ulimit -c 0`, then `/usr/local/bin/node /usr/local/libexec/karidns-signer/bin/karidns-signer.js`).
+: The wrapper (`ulimit -c 0`, then `/usr/local/bin/node /usr/local/libexec/karidns-signer/signer/bin/karidns-signer.js`).
 
 `/usr/local/libexec/karidns-signer/`
-: The program (`bin/`, `lib/`) and its `node_modules` (`pg`). `root:wheel`, not writable.
+: The program (`signer/bin/`, `signer/lib/`), the Node code it shares with `karidns-webadmin` (`node/lib/`, imported as `../../node/lib`) and its `node_modules` (`pg`). `root:wheel`, not writable.
 
 `/usr/local/etc/rc.d/karidns_signer`
 : The rc script (`karidns_signer_enable`, `_config`, `_user`, `_tmpfs`, `_tmpfs_size`, `_cpuset`, `_flags`; commands `start`, `stop`, `restart`, `status`, `reload`, `configtest`).

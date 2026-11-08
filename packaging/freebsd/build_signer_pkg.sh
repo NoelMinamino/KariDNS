@@ -33,12 +33,15 @@ done
 
 SIGNER_DIR="usr/local/libexec/karidns-signer"
 (cd signer && npm ci --omit=dev --ignore-scripts) || { echo "ERROR: npm ci in signer/ failed (pkg install npm-node24)" >&2; exit 1; }
-mkdir -p "${STAGE_DIR}/${SIGNER_DIR}" "${STAGE_DIR}/usr/local/sbin" "${STAGE_DIR}/usr/local/etc/rc.d" "${STAGE_DIR}/usr/local/etc/karidns" "${STAGE_DIR}/usr/local/share/doc/karidns" "${OUT_DIR}"
-cp -R signer/bin signer/lib signer/package.json signer/package-lock.json signer/node_modules "${STAGE_DIR}/${SIGNER_DIR}/"
+mkdir -p "${STAGE_DIR}/${SIGNER_DIR}/signer" "${STAGE_DIR}/${SIGNER_DIR}/node" "${STAGE_DIR}/usr/local/sbin" "${STAGE_DIR}/usr/local/etc/rc.d" "${STAGE_DIR}/usr/local/etc/karidns" "${STAGE_DIR}/usr/local/share/doc/karidns" "${OUT_DIR}"
+cp -R signer/bin signer/lib signer/package.json signer/package-lock.json "${STAGE_DIR}/${SIGNER_DIR}/signer/"
+# the code signer/ shares with karidns-webadmin (node/lib: signer/lib imports ../../node/lib), and the one dependency, next to both
+cp -R node/lib node/package.json "${STAGE_DIR}/${SIGNER_DIR}/node/"
+cp -R signer/node_modules "${STAGE_DIR}/${SIGNER_DIR}/"
 rm -rf "${STAGE_DIR}/${SIGNER_DIR}/node_modules/.bin"
 find "${STAGE_DIR}/${SIGNER_DIR}" -type d -exec chmod 0755 {} +
 find "${STAGE_DIR}/${SIGNER_DIR}" -type f -exec chmod 0444 {} +
-chmod 0555 "${STAGE_DIR}/${SIGNER_DIR}/bin/karidns-signer.js"
+chmod 0555 "${STAGE_DIR}/${SIGNER_DIR}/signer/bin/karidns-signer.js"
 if [ -n "$(find "${STAGE_DIR}/${SIGNER_DIR}" ! -type f ! -type d)" ]; then
     echo "ERROR: the signer tree holds something that is neither a file nor a directory" >&2
     exit 1
@@ -57,7 +60,7 @@ for f in $(cd "${STAGE_DIR}" && find "${SIGNER_DIR}" -type f | sort); do
         *[!A-Za-z0-9_./+@-]*) echo "ERROR: unexpected file name in the signer tree: $f" >&2; exit 1 ;;
     esac
     perm=0444
-    [ "$f" = "${SIGNER_DIR}/bin/karidns-signer.js" ] && perm=0555
+    [ "$f" = "${SIGNER_DIR}/signer/bin/karidns-signer.js" ] && perm=0555
     FILES="${FILES},
     \"/${f}\": { uname: \"root\", gname: \"wheel\", perm: \"${perm}\" }"
 done

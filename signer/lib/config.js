@@ -4,59 +4,10 @@
 
 import fs from 'node:fs';
 import os from 'node:os';
-import path from 'node:path';
-import { canonicalZone } from './names.js';
+import { canonicalZone } from '../../node/lib/names.js';
+import { parseBool, parseDuration, parseInt1, parseEnum, parseAbsPath, parseSchema, parseLog, checkConninfoFile as checkConninfo } from '../../node/lib/conf.js';
 
 const DAY = 86400;
-
-const parseBool = (v) => {
-  const s = v.toLowerCase();
-  if (s === 'yes' || s === 'true' || s === 'on' || s === '1') return true;
-  if (s === 'no' || s === 'false' || s === 'off' || s === '0') return false;
-  throw new Error(`expected yes or no, got ${JSON.stringify(v)}`);
-};
-
-// A duration in seconds: digits and an optional unit s, m, h, d, w (a bare number is seconds).
-export function parseDuration(v) {
-  const m = /^(\d{1,9})([smhdw]?)$/.exec(v);
-  if (!m) throw new Error(`expected a duration like 90, 30m, 14d, got ${JSON.stringify(v)}`);
-  const unit = { '': 1, s: 1, m: 60, h: 3600, d: DAY, w: 7 * DAY }[m[2]];
-  return Number(m[1]) * unit;
-}
-
-const parseInt1 = (v) => {
-  if (!/^\d{1,4}$/.test(v)) throw new Error(`expected a number, got ${JSON.stringify(v)}`);
-  return Number(v);
-};
-
-const parseEnum = (...values) => (v) => {
-  const s = v.toLowerCase();
-  if (!values.includes(s)) throw new Error(`expected one of ${values.join(', ')}, got ${JSON.stringify(v)}`);
-  return s;
-};
-
-const parseText = (v) => {
-  if (v.length === 0 || v.length > 1024 || /[\0-\x1f\x7f]/.test(v)) throw new Error('expected a non-empty string without control characters');
-  return v;
-};
-
-const parseAbsPath = (v) => {
-  parseText(v);
-  if (!path.isAbsolute(v)) throw new Error(`expected an absolute path, got ${JSON.stringify(v)}`);
-  return v;
-};
-
-const parseSchema = (v) => {
-  if (!/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(v)) throw new Error(`expected a schema name (letters, digits, underscore), got ${JSON.stringify(v)}`);
-  return v;
-};
-
-const parseLog = (v) => {
-  const s = v.toLowerCase();
-  if (s === 'stderr') return 'stderr';
-  if (/^(kern|user|mail|daemon|auth|syslog|lpr|news|uucp|cron|authpriv|ftp|local[0-7])$/.test(s)) return s;
-  throw new Error(`expected stderr or a syslog facility (daemon, local0 ... local7, ...), got ${JSON.stringify(v)}`);
-};
 
 // the keys that can also be set per zone
 const ZONE_KEYS = {
@@ -203,15 +154,5 @@ export function loadConfig(path) {
   return parseConfig(text);
 }
 
-// The check karidns-zone and the loader apply to a conninfo file: a regular file (no symbolic link) owned by the user running us, mode 0600 or 0400.
-// Returns null when fine, else the reason.
-export function checkConninfoFile(path, st, uid = process.getuid?.()) {
-  if (!st) {
-    try { st = fs.lstatSync(path); } catch (e) { return `cannot read ${path}: ${e.code ?? e.message}`; }
-  }
-  if (!st.isFile()) return `${path} is not a regular file`;
-  if (uid !== undefined && st.uid !== uid) return `${path} is not owned by the user running karidns-signer`;
-  const mode = st.mode & 0o777;
-  if (mode !== 0o600 && mode !== 0o400) return `${path} has mode ${mode.toString(8).padStart(4, '0')}, it must be 0600 or 0400`;
-  return null;
-}
+// The check karidns-zone and the loader apply to a conninfo file (node/lib/conf.js).  Returns null when fine, else the reason.
+export const checkConninfoFile = (file, st, uid = process.getuid?.()) => checkConninfo(file, st, uid, 'karidns-signer');

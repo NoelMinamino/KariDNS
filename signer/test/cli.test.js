@@ -6,7 +6,7 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { parseConfig } from '../lib/config.js';
 import { parseArgs, checkSetup, openDb, main, USAGE, VERSION, DEFAULT_CONFIG } from '../lib/cli.js';
-import { loadSqlite } from '../lib/db_sqlite.js';
+import { loadSqlite } from '../../node/lib/sqlite.js';
 
 const out = () => { const w = []; return { w, write: (s) => { w.push(s); }, text: () => w.join('') }; };
 

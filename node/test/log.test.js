@@ -6,12 +6,12 @@ const sink = () => { const lines = []; return { lines, write: (s) => { lines.pus
 
 test('stderr: time, name, pid, level; no control characters', () => {
   const s = sink();
-  const log = createLogger({ stream: s });
+  const log = createLogger({ stream: s, name: 'karidns-x' });
   log.info('signed example.test');
   log.warn('slow');
   log.error('line one\nline two\u0000\u001b[31m');
-  assert.match(s.lines[0], /^\d{4}-\d\d-\d\dT[\d:.]+Z karidns-signer\[\d+\]: signed example\.test\n$/);
-  assert.match(s.lines[1], / karidns-signer\[\d+\]: warning: slow\n$/);
+  assert.match(s.lines[0], /^\d{4}-\d\d-\d\dT[\d:.]+Z karidns-x\[\d+\]: signed example\.test\n$/);
+  assert.match(s.lines[1], / karidns-x\[\d+\]: warning: slow\n$/);
   assert.match(s.lines[2], /: error: line one line two \[31m\n$/);
   assert.equal(s.lines.join('').split('\n').length, 4);
   log.close();
@@ -31,7 +31,7 @@ test('syslog: one logger(1) child with the facility, no shell', () => {
   const f = fakeLogger();
   const s = sink();
   const log = createLogger({ target: 'daemon', stream: s, spawnFn: f.spawnFn });
-  assert.deepEqual(f.calls[0].slice(0, 2), ['/usr/bin/logger', ['-t', 'karidns-signer', '-p', 'daemon.notice']]);
+  assert.deepEqual(f.calls[0].slice(0, 2), ['/usr/bin/logger', ['-t', 'karidns', '-p', 'daemon.notice']]);
   assert.equal(f.calls[0][2].shell, false);
   log.info('hello');
   log.error('bad');

@@ -137,7 +137,7 @@ jobs:
             pkg add dist-db/karidns-signer-[0-9]*.pkg
             pkg info -d karidns-signer
             test -x /usr/local/sbin/karidns-signer
-            test -x /usr/local/libexec/karidns-signer/bin/karidns-signer.js
+            test -x /usr/local/libexec/karidns-signer/signer/bin/karidns-signer.js
             test -d /usr/local/libexec/karidns-signer/node_modules/pg
             test -x /usr/local/etc/rc.d/karidns_signer
             pw usershow karidns-signer > /dev/null

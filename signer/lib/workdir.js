@@ -3,7 +3,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { canonicalZone } from './names.js';
+import { canonicalZone } from '../../node/lib/names.js';
 
 // null when <work> is a directory of ours with no access for group and other, else the reason
 export function checkWorkDir(dir, st, uid = process.getuid?.()) {

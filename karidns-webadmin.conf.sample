@@ -1,0 +1,54 @@
+# karidns-webadmin.conf: the configuration of karidns-webadmin (docs/karidns-api.md).
+# Lines are `key = value`; `#` starts a comment; a value may be in double quotes.  Durations are a number with an optional unit
+# s, m, h, d or w (a bare number is seconds).  Copy this file to /usr/local/etc/karidns/karidns-webadmin.conf and edit it.
+# Check it with:  karidns-webadmin --check -c /usr/local/etc/karidns/karidns-webadmin.conf
+
+# --- where it listens ------------------------------------------------------------------------------------------------------------------
+# 127.0.0.1:port, [::1]:port or the absolute path of a UNIX socket (mode 0660).  Plain HTTP only on loopback or a socket: TLS is the job of a
+# reverse proxy in front (relayd, nginx); or set tls-cert and tls-key and listen on another address.
+listen = 127.0.0.1:8053
+# tls-cert = /usr/local/etc/karidns/webadmin.crt
+# tls-key = /usr/local/etc/karidns/webadmin.key
+# The origin a browser sees.  An unsafe request that carries a cookie must send exactly this Origin.
+public-origin = https://dns.example.test
+# The addresses of the reverse proxies; only from them is X-Forwarded-For believed (the rate limits and the log use the client's address).
+# trusted-proxy = 127.0.0.1, ::1
+
+# --- the database (one of the two) -----------------------------------------------------------------------------------------------------
+database = pg
+# PostgreSQL: connection files (regular files owned by the user the service runs as, mode 0600 or 0400).  Example content:
+#   host=db.example.test port=5432 dbname=karidns user=karidns_api password=... sslmode=verify-full
+# api-conninfo-file: the role karidns_api (db/karidns_api_role.pgsql.sql: row level security on).
+# check-conninfo-file: the check role (db/karidns_check_role.pgsql.sql); it reads a whole zone for the export.
+api-conninfo-file = /usr/local/etc/karidns/api.conninfo
+check-conninfo-file = /usr/local/etc/karidns/check.conninfo
+# A dataset is a schema with the zone tables; without a section there is one dataset, main, in the schema public.
+# [dataset main]
+# schema = public
+# views = internal, external
+
+# SQLite3 instead (database = sqlite3): the zone file and the auth file (db/karidns_auth.sqlite3.sql, owner = the service user, mode 0600).
+# database = sqlite3
+# sqlite-file = /var/db/karidns/zones.sqlite3
+# auth-file = /var/db/karidns/auth.sqlite3
+
+# --- the programs ------------------------------------------------------------------------------------------------------------------------
+# karidns-zone = /usr/local/bin/karidns-zone
+# karicheck = /usr/local/bin/karicheck
+
+# --- logins ------------------------------------------------------------------------------------------------------------------------------
+# Who must use TOTP: global (every global master; the default), all, none.
+# require-totp = global
+# session-idle = 30m
+# session-max = 12h
+# The AES key that wraps the TOTP secrets in the database (64 hex digits, mode 0600); made at the first start.  Keep it with the backups.
+# totp-key-file = /var/db/karidns-webadmin/totp.key
+# Login attempts a minute (per address and per user name); requests a second and writes a second (per principal).
+# rate-login = 5
+# rate-api = 20
+# rate-write = 2
+# The cost of a new password hash, 2^n (14 to 20, default 17: about 128 MiB each, two at a time).
+# scrypt-ln = 17
+
+# stderr, or a syslog facility (daemon, local0 ... local7, ...).
+log = daemon

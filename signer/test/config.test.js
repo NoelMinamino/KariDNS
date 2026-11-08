@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseConfig, parseDuration, zoneSettings, validate, defaults, loadConfig, checkConninfoFile } from '../lib/config.js';
+import { parseDuration } from '../../node/lib/conf.js';
+import { parseConfig, zoneSettings, validate, defaults, loadConfig, checkConninfoFile } from '../lib/config.js';
 
 const PG = `
 # the signer

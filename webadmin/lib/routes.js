@@ -1,0 +1,50 @@
+// The route table of /api/v1 (planning 4).  Paths are relative to /api/v1.  auth: 'none' needs no credential; the rest needs a session or a token.  preTotp: a
+// session that has not done its TOTP step yet may call it.  sessionOnly: a token may not (it would make tokens that make tokens).
+
+import * as auth from './handlers/auth.js';
+import * as admin from './handlers/admin.js';
+import * as zones from './handlers/zones.js';
+
+export const ROUTES = [
+  { method: 'GET', path: '/health', auth: 'none', handler: zones.health },
+  { method: 'GET', path: '/version', handler: zones.version },
+
+  { method: 'POST', path: '/auth/login', auth: 'none', bodyLimit: 16384, handler: auth.login },
+  { method: 'POST', path: '/auth/logout', preTotp: true, sessionOnly: true, handler: auth.logout },
+  { method: 'GET', path: '/auth/me', preTotp: true, handler: auth.me },
+  { method: 'POST', path: '/auth/totp', preTotp: true, sessionOnly: true, handler: auth.totp },
+  { method: 'POST', path: '/auth/password', sessionOnly: true, handler: auth.password },
+
+  { method: 'GET', path: '/tokens', handler: auth.tokensList },
+  { method: 'POST', path: '/tokens', sessionOnly: true, handler: auth.tokenCreate },
+  { method: 'DELETE', path: '/tokens/:id', handler: auth.tokenRevoke },
+
+  { method: 'GET', path: '/principals', handler: admin.principalsList },
+  { method: 'POST', path: '/principals', handler: admin.principalCreate },
+  { method: 'GET', path: '/principals/:id', handler: admin.principalGet },
+  { method: 'PATCH', path: '/principals/:id', handler: admin.principalUpdate },
+  { method: 'DELETE', path: '/principals/:id', handler: admin.principalDelete },
+  { method: 'PUT', path: '/principals/:id/password', handler: admin.principalPassword },
+  { method: 'GET', path: '/principals/:id/members', handler: admin.membersList },
+  { method: 'POST', path: '/principals/:id/members', handler: admin.memberAdd },
+  { method: 'DELETE', path: '/principals/:id/members/:mid', handler: admin.memberRemove },
+
+  { method: 'GET', path: '/rr-policies', handler: admin.policiesList },
+  { method: 'POST', path: '/rr-policies', handler: admin.policyCreate },
+  { method: 'GET', path: '/rr-policies/:id', handler: admin.policyGet },
+  { method: 'PATCH', path: '/rr-policies/:id', handler: admin.policyUpdate },
+  { method: 'DELETE', path: '/rr-policies/:id', handler: admin.policyDelete },
+
+  { method: 'GET', path: '/grants', handler: admin.grantsList },
+  { method: 'POST', path: '/grants', handler: admin.grantCreate },
+  { method: 'DELETE', path: '/grants/:id', handler: admin.grantDelete },
+
+  { method: 'GET', path: '/datasets', handler: zones.datasets },
+  { method: 'GET', path: '/datasets/:ds/zones', handler: zones.zonesList },
+  { method: 'GET', path: '/datasets/:ds/zones/:zone', handler: zones.zoneGet },
+  { method: 'GET', path: '/datasets/:ds/zones/:zone/rrsets', handler: zones.rrsetsList },
+  { method: 'GET', path: '/datasets/:ds/zones/:zone/export', handler: zones.zoneExport },
+
+  { method: 'GET', path: '/audit', handler: zones.auditList },
+  { method: 'GET', path: '/servers', handler: zones.serversList },
+];

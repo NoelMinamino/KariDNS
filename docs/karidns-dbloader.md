@@ -347,7 +347,7 @@ Run it in batches on a big log (`WHERE id IN (SELECT id ... LIMIT 100000)`) and 
 
 ### The API tables, the zone generation and versions, and the check role (0.6.0 items D and E)
 
-The API with permission checks, the zone templates and the zone versions add these objects to schema version 3 (the version row stays 3: 0.6.0 is not released). **The server, `karidns-dbloader` and `karicheck db` use none of them**: they do not read the tables, and a database that has them passes `karicheck db` and the loader's schema check as it did without them. The commands that use them are `karidns-zone apply` and `import` (generation, versions) and the WebAdmin API.
+The API with permission checks, the zone templates and the zone versions add these objects to schema version 3 (the version row stays 3: 0.6.0 is not released). **The server, `karidns-dbloader` and `karicheck db` use none of them**: they do not read the tables, and a database that has them passes `karicheck db` and the loader's schema check as it did without them. The commands that use them are `karidns-zone apply` and `import` (generation, versions) and the WebAdmin API ([`karidns-webadmin`](karidns-api.md): `GET /auth/me`, the sessions, tokens, principals, policies, grants and the audit log are these tables).
 
 | Table | Where | What it holds |
 |---|---|---|

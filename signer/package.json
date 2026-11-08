@@ -12,8 +12,8 @@
     "karidns-signer": "bin/karidns-signer.js"
   },
   "scripts": {
-    "test": "node --test \"test/*.test.js\"",
-    "coverage": "node --test --experimental-test-coverage \"test/*.test.js\""
+    "test": "node --test \"test/*.test.js\" \"../node/test/*.test.js\"",
+    "coverage": "node --test --experimental-test-coverage \"test/*.test.js\" \"../node/test/*.test.js\""
   },
   "dependencies": {
     "pg": "8.23.1"

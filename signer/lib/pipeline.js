@@ -18,11 +18,11 @@ import readline from 'node:readline';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { setTimeout as sleepMs } from 'node:timers/promises';
-import { canonicalZone } from './names.js';
+import { canonicalZone } from '../../node/lib/names.js';
 import { zoneSettings } from './config.js';
 import { loadKey, parseKeyStem } from './keys.js';
 import { makeZoneDir, wipeDir, wipeFile, writeSecret } from './workdir.js';
-import { clip } from './run.js';
+import { clip } from '../../node/lib/run.js';
 import { checkArgv, exportArgv, importArgv, keygenArgv, parseNsec3param, reloadArgv, signzoneArgv } from './argv.js';
 
 export class PipelineError extends Error {

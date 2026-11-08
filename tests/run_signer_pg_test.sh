@@ -66,8 +66,8 @@ if psql -X -q -At -v ON_ERROR_STOP=1 -v role=$ROLE -v schema=public -f db/karidn
 
 # the programs the signer runs, and the signer itself, where the user it runs as can read them (as root that is the PostgreSQL user)
 cp ./karidns-zone ./karicheck "$T/" && chmod 755 "$T/karidns-zone" "$T/karicheck"
-mkdir "$T/app" && cp -R signer/bin signer/lib signer/package.json signer/node_modules "$T/app/" && chmod -R a+rX "$T/app"
-SG_APP="$T/app"; SG_ZONE_BIN="$T/karidns-zone"; SG_KARICHECK="$T/karicheck"; SG_KARICTL="$T/karicheck"
+mkdir -p "$T/app/signer" "$T/app/node" && cp -R signer/bin signer/lib signer/package.json signer/node_modules "$T/app/signer/" && cp -R node/lib node/package.json "$T/app/node/" && chmod -R a+rX "$T/app"     # (signer/lib imports ../../node/lib)
+SG_APP="$T/app/signer"; SG_ZONE_BIN="$T/karidns-zone"; SG_KARICHECK="$T/karicheck"; SG_KARICTL="$T/karicheck"
 mkdir "$T/work"; chmod 700 "$T/work"; chmod 777 "$T/out"             # (out: written by the signer, too: the exports, the signals of the slow dnssec-signzone)
 [ -n "$PG_AS" ] && chown "$PG_AS" "$T/work"
 printf '%s\n' "$RCS" > "$T/ci_sg"; [ -n "$PG_AS" ] && chown "$PG_AS" "$T/ci_sg"; chmod 600 "$T/ci_sg"

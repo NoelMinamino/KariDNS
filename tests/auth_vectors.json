@@ -1,0 +1,244 @@
+{
+  "_doc": "Test vectors of the permission rules: one rule set, two implementations. webadmin/lib/perm.js (the API; the only one on SQLite3) and the SQL functions karidns_auth.rr_ok / rr_visible / zone_grant / is_global / policy_subset / may_grant (db/karidns_ext.pgsql.sql). webadmin/test/perm.test.js runs every check against perm.js, tests/run_webadmin_pg_test.sh against the SQL functions in a private transaction that is rolled back. A case makes the user 'u', groups (members: the names of users or groups), grants (to: a name) and says what each check must answer. Names are canonical (lower case, no final dot). A change of a rule is a change here too.",
+  "policies": {
+    "all":     { "allowed_types": ["A", "AAAA", "CNAME", "DNAME", "MX", "NS", "SOA", "SRV", "TXT"], "allow_wildcard": true,  "allow_delegation": true,  "allow_dname": true,  "apex_editable": true,  "ttl_min": 0,  "ttl_max": 2147483647, "max_rr": null },
+    "web":     { "allowed_types": ["A", "AAAA", "CNAME", "TXT"],                                    "allow_wildcard": false, "allow_delegation": false, "allow_dname": false, "apex_editable": false, "ttl_min": 60, "ttl_max": 86400,      "max_rr": 100 },
+    "web50":   { "allowed_types": ["A", "AAAA", "CNAME", "TXT"],                                    "allow_wildcard": false, "allow_delegation": false, "allow_dname": false, "apex_editable": false, "ttl_min": 60, "ttl_max": 86400,      "max_rr": 50 },
+    "wide":    { "allowed_types": ["A", "AAAA", "CNAME", "TXT"],                                    "allow_wildcard": false, "allow_delegation": false, "allow_dname": false, "apex_editable": false, "ttl_min": 0,  "ttl_max": 86400,      "max_rr": 100 },
+    "nsok":    { "allowed_types": ["A", "NS"],                                                      "allow_wildcard": false, "allow_delegation": true,  "allow_dname": false, "apex_editable": false, "ttl_min": 0,  "ttl_max": 2147483647, "max_rr": null },
+    "apexpol": { "allowed_types": ["A", "NS", "SOA"],                                               "allow_wildcard": false, "allow_delegation": false, "allow_dname": false, "apex_editable": true,  "ttl_min": 0,  "ttl_max": 2147483647, "max_rr": null },
+    "dn":      { "allowed_types": ["DNAME", "A"],                                                   "allow_wildcard": false, "allow_delegation": false, "allow_dname": true,  "apex_editable": false, "ttl_min": 0,  "ttl_max": 2147483647, "max_rr": null },
+    "none":    { "allowed_types": [],                                                               "allow_wildcard": false, "allow_delegation": false, "allow_dname": false, "apex_editable": false, "ttl_min": 60, "ttl_max": 86400,      "max_rr": 10 }
+  },
+  "cases": [
+    {
+      "name": "a domain master with the web policy",
+      "grants": [ { "to": "u", "role": "domain_master", "schema": "s1", "zone": "example.test", "suffix": null, "policy": "web" } ],
+      "checks": [
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "A", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "WWW.Example.TEST", "type": "a", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "Example.Test", "name": "deep.er.www.example.test", "type": "TXT", "ttl": 60, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "A", "ttl": 86400, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "example.test", "type": "A", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "A", "ttl": 59, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "A", "ttl": 86401, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "A", "ttl": null, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "MX", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "NS", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "RRSIG", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "TYPE46", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "NSEC3", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "evilexample.test", "type": "A", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "www.example.test.evil.test", "type": "A", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "*.example.test", "type": "A", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "a.*.example.test", "type": "A", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "b*.example.test", "type": "A", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "empty.example.test", "type": null, "ttl": null, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "example.test", "type": null, "ttl": null, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "*.example.test", "type": null, "ttl": null, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "other.test", "name": "www.other.test", "type": "A", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s2", "zone": "example.test", "name": "www.example.test", "type": "A", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "", "name": "www.example.test", "type": "A", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "", "type": "A", "ttl": 300, "expect": false },
+        { "fn": "rr_visible", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "A", "expect": true },
+        { "fn": "rr_visible", "schema": "s1", "zone": "example.test", "name": "example.test", "type": "MX", "expect": true },
+        { "fn": "rr_visible", "schema": "s1", "zone": "example.test", "name": "example.test", "type": "SOA", "expect": true },
+        { "fn": "rr_visible", "schema": "s1", "zone": "example.test", "name": "evilexample.test", "type": "A", "expect": false },
+        { "fn": "rr_visible", "schema": "s1", "zone": "example.test", "name": "www.other.test", "type": "A", "expect": false },
+        { "fn": "rr_visible", "schema": "s2", "zone": "example.test", "name": "www.example.test", "type": "A", "expect": false },
+        { "fn": "rr_visible", "schema": "s1", "zone": "", "name": "www.example.test", "type": "A", "expect": false },
+        { "fn": "zone_grant", "schema": "s1", "zone": "example.test", "expect": "domain_master" },
+        { "fn": "zone_grant", "schema": "s1", "zone": "EXAMPLE.test", "expect": "domain_master" },
+        { "fn": "zone_grant", "schema": "s1", "zone": "other.test", "expect": null },
+        { "fn": "zone_grant", "schema": "s2", "zone": "example.test", "expect": null },
+        { "fn": "is_global", "expect": false }
+      ]
+    },
+    {
+      "name": "a subdomain master: the label boundary, and what it may read",
+      "grants": [ { "to": "u", "role": "subdomain_master", "schema": "s1", "zone": "example.test", "suffix": "sub.example.test", "policy": "web" } ],
+      "checks": [
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "sub.example.test", "type": "A", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "a.sub.example.test", "type": "A", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "b.a.sub.example.test", "type": "TXT", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "evilsub.example.test", "type": "A", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "xsub.example.test", "type": "A", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "sub.example.test.x.example.test", "type": "A", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "example.test", "type": "A", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "A", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "a.sub.example.test", "type": "MX", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "*.sub.example.test", "type": "A", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "empty.sub.example.test", "type": null, "ttl": null, "expect": true },
+        { "fn": "rr_visible", "schema": "s1", "zone": "example.test", "name": "sub.example.test", "type": "A", "expect": true },
+        { "fn": "rr_visible", "schema": "s1", "zone": "example.test", "name": "a.sub.example.test", "type": "TXT", "expect": true },
+        { "fn": "rr_visible", "schema": "s1", "zone": "example.test", "name": "evilsub.example.test", "type": "A", "expect": false },
+        { "fn": "rr_visible", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "A", "expect": false },
+        { "fn": "rr_visible", "schema": "s1", "zone": "example.test", "name": "example.test", "type": "SOA", "expect": true },
+        { "fn": "rr_visible", "schema": "s1", "zone": "example.test", "name": "example.test", "type": "NS", "expect": true },
+        { "fn": "rr_visible", "schema": "s1", "zone": "example.test", "name": "example.test", "type": "TYPE2", "expect": true },
+        { "fn": "rr_visible", "schema": "s1", "zone": "example.test", "name": "example.test", "type": "MX", "expect": false },
+        { "fn": "rr_visible", "schema": "s1", "zone": "example.test", "name": "example.test", "type": "A", "expect": false },
+        { "fn": "zone_grant", "schema": "s1", "zone": "example.test", "expect": "subdomain_master" },
+        { "fn": "is_global", "expect": false }
+      ]
+    },
+    {
+      "name": "a global master with the all policy",
+      "grants": [ { "to": "u", "role": "global_master", "schema": null, "zone": null, "suffix": null, "policy": "all" } ],
+      "checks": [
+        { "fn": "rr_ok", "schema": "zzz", "zone": "other.test", "name": "www.other.test", "type": "A", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "example.test", "type": "SOA", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "example.test", "type": "TYPE6", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "SOA", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "example.test", "type": "NS", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "sub.example.test", "type": "NS", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "sub.example.test", "type": "TYPE2", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "sub.example.test", "type": "DNAME", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "*.example.test", "type": "A", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "example.test", "type": "DNSKEY", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "example.test", "type": "TYPE48", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "CDS", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "PTR", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "evilexample.test", "type": "A", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "empty.example.test", "type": "", "ttl": null, "expect": true },
+        { "fn": "rr_visible", "schema": "zzz", "zone": "other.test", "name": "www.other.test", "type": "A", "expect": true },
+        { "fn": "rr_visible", "schema": "zzz", "zone": "other.test", "name": "www.example.test", "type": "A", "expect": false },
+        { "fn": "rr_visible", "schema": "zzz", "zone": "", "name": "www.other.test", "type": "A", "expect": false },
+        { "fn": "zone_grant", "schema": "anything", "zone": "any.test", "expect": "global_master" },
+        { "fn": "is_global", "expect": true }
+      ]
+    },
+    {
+      "name": "a global master with the web policy: the policy still applies to records",
+      "grants": [ { "to": "u", "role": "global_master", "schema": null, "zone": null, "suffix": null, "policy": "web" } ],
+      "checks": [
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "A", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "example.test", "type": "SOA", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "example.test", "type": "A", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "MX", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "A", "ttl": 1, "expect": false }
+      ]
+    },
+    {
+      "name": "the flags of a policy: delegation, DNAME, apex",
+      "grants": [
+        { "to": "u", "role": "domain_master", "schema": "s1", "zone": "example.test", "suffix": null, "policy": "nsok" },
+        { "to": "u", "role": "domain_master", "schema": "s1", "zone": "dn.test", "suffix": null, "policy": "dn" },
+        { "to": "u", "role": "domain_master", "schema": "s1", "zone": "apex.test", "suffix": null, "policy": "apexpol" }
+      ],
+      "checks": [
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "child.example.test", "type": "NS", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "example.test", "type": "NS", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "child.example.test", "type": "A", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "child.example.test", "type": "DNAME", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "dn.test", "name": "x.dn.test", "type": "DNAME", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "dn.test", "name": "x.dn.test", "type": "NS", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "apex.test", "name": "apex.test", "type": "NS", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "apex.test", "name": "apex.test", "type": "A", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "apex.test", "name": "apex.test", "type": "SOA", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "apex.test", "name": "x.apex.test", "type": "NS", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "apex.test", "name": "apex.test", "type": null, "ttl": null, "expect": false }
+      ]
+    },
+    {
+      "name": "groups: a grant of a group, of a nested group, of a disabled group",
+      "groups": [
+        { "name": "g_on",   "disabled": false, "members": ["u"] },
+        { "name": "g_off",  "disabled": true,  "members": ["u"] },
+        { "name": "g_mid",  "disabled": true,  "members": ["u"] },
+        { "name": "g_top",  "disabled": false, "members": ["g_mid"] },
+        { "name": "g_none", "disabled": false, "members": [] }
+      ],
+      "grants": [
+        { "to": "g_on",   "role": "domain_master", "schema": "s1", "zone": "on.test", "suffix": null, "policy": "web" },
+        { "to": "g_off",  "role": "domain_master", "schema": "s1", "zone": "off.test", "suffix": null, "policy": "web" },
+        { "to": "g_top",  "role": "domain_master", "schema": "s1", "zone": "top.test", "suffix": null, "policy": "web" },
+        { "to": "g_none", "role": "domain_master", "schema": "s1", "zone": "none.test", "suffix": null, "policy": "web" },
+        { "to": "u",      "role": "subdomain_master", "schema": "s1", "zone": "on.test", "suffix": "x.on.test", "policy": "web" }
+      ],
+      "checks": [
+        { "fn": "rr_ok", "schema": "s1", "zone": "on.test", "name": "www.on.test", "type": "A", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "off.test", "name": "www.off.test", "type": "A", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "top.test", "name": "www.top.test", "type": "A", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "none.test", "name": "www.none.test", "type": "A", "ttl": 300, "expect": false },
+        { "fn": "rr_visible", "schema": "s1", "zone": "off.test", "name": "www.off.test", "type": "A", "expect": false },
+        { "fn": "rr_visible", "schema": "s1", "zone": "top.test", "name": "www.top.test", "type": "A", "expect": true },
+        { "fn": "zone_grant", "schema": "s1", "zone": "on.test", "expect": "domain_master" },
+        { "fn": "zone_grant", "schema": "s1", "zone": "off.test", "expect": null },
+        { "fn": "zone_grant", "schema": "s1", "zone": "top.test", "expect": "domain_master" },
+        { "fn": "zone_grant", "schema": "s1", "zone": "none.test", "expect": null }
+      ]
+    },
+    {
+      "name": "a disabled user has nothing",
+      "user_disabled": true,
+      "grants": [ { "to": "u", "role": "global_master", "schema": null, "zone": null, "suffix": null, "policy": "all" } ],
+      "checks": [
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "A", "ttl": 300, "expect": false },
+        { "fn": "rr_visible", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "A", "expect": false },
+        { "fn": "zone_grant", "schema": "s1", "zone": "example.test", "expect": null },
+        { "fn": "is_global", "expect": false }
+      ]
+    },
+    {
+      "name": "one grant must cover the record: two grants, each a part",
+      "grants": [
+        { "to": "u", "role": "domain_master", "schema": "s1", "zone": "example.test", "suffix": null, "policy": "nsok" },
+        { "to": "u", "role": "subdomain_master", "schema": "s1", "zone": "example.test", "suffix": "sub.example.test", "policy": "web" }
+      ],
+      "checks": [
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "sub.example.test", "type": "NS", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "sub.example.test", "type": "TXT", "ttl": 300, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "www.example.test", "type": "TXT", "ttl": 300, "expect": false },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "sub.example.test", "type": "A", "ttl": 30, "expect": true },
+        { "fn": "rr_ok", "schema": "s1", "zone": "example.test", "name": "sub.example.test", "type": "MX", "ttl": 300, "expect": false },
+        { "fn": "zone_grant", "schema": "s1", "zone": "example.test", "expect": "domain_master" }
+      ]
+    },
+    {
+      "name": "policy_subset: no wider than",
+      "grants": [],
+      "checks": [
+        { "fn": "policy_subset", "sub": "web", "sup": "all", "expect": true },
+        { "fn": "policy_subset", "sub": "all", "sup": "web", "expect": false },
+        { "fn": "policy_subset", "sub": "web", "sup": "web", "expect": true },
+        { "fn": "policy_subset", "sub": "none", "sup": "web", "expect": true },
+        { "fn": "policy_subset", "sub": "web", "sup": "none", "expect": false },
+        { "fn": "policy_subset", "sub": "web", "sup": "web50", "expect": false },
+        { "fn": "policy_subset", "sub": "web50", "sup": "web", "expect": true },
+        { "fn": "policy_subset", "sub": "wide", "sup": "web", "expect": false },
+        { "fn": "policy_subset", "sub": "web", "sup": "wide", "expect": true },
+        { "fn": "policy_subset", "sub": "nsok", "sup": "web", "expect": false },
+        { "fn": "policy_subset", "sub": "nsok", "sup": "all", "expect": true },
+        { "fn": "policy_subset", "sub": "all", "sup": "all", "expect": true },
+        { "fn": "policy_subset", "sub": "dn", "sup": "web", "expect": false },
+        { "fn": "policy_subset", "sub": "apexpol", "sup": "all", "expect": true },
+        { "fn": "policy_subset", "sub": "all", "sup": "apexpol", "expect": false }
+      ]
+    },
+    {
+      "name": "may_grant: a domain master grants inside its zone, with a policy no wider than its own",
+      "grants": [
+        { "to": "u", "role": "domain_master", "schema": "s1", "zone": "example.test", "suffix": null, "policy": "web" },
+        { "to": "u", "role": "domain_master", "schema": "s1", "zone": "wide.test", "suffix": null, "policy": "all" },
+        { "to": "u", "role": "subdomain_master", "schema": "s1", "zone": "sub.test", "suffix": "x.sub.test", "policy": "all" }
+      ],
+      "checks": [
+        { "fn": "may_grant", "role": "domain_master", "schema": "s1", "zone": "example.test", "policy": "web", "expect": true },
+        { "fn": "may_grant", "role": "subdomain_master", "schema": "s1", "zone": "example.test", "policy": "web", "expect": true },
+        { "fn": "may_grant", "role": "subdomain_master", "schema": "s1", "zone": "example.test", "policy": "none", "expect": true },
+        { "fn": "may_grant", "role": "subdomain_master", "schema": "s1", "zone": "example.test", "policy": "web50", "expect": true },
+        { "fn": "may_grant", "role": "subdomain_master", "schema": "s1", "zone": "example.test", "policy": "all", "expect": false },
+        { "fn": "may_grant", "role": "subdomain_master", "schema": "s1", "zone": "example.test", "policy": "wide", "expect": false },
+        { "fn": "may_grant", "role": "global_master", "schema": null, "zone": null, "policy": "web", "expect": false },
+        { "fn": "may_grant", "role": "domain_master", "schema": "s1", "zone": "other.test", "policy": "web", "expect": false },
+        { "fn": "may_grant", "role": "domain_master", "schema": "s2", "zone": "example.test", "policy": "web", "expect": false },
+        { "fn": "may_grant", "role": "domain_master", "schema": "s1", "zone": "wide.test", "policy": "all", "expect": true },
+        { "fn": "may_grant", "role": "domain_master", "schema": "s1", "zone": "wide.test", "policy": "nsok", "expect": true },
+        { "fn": "may_grant", "role": "domain_master", "schema": "s1", "zone": "sub.test", "policy": "web", "expect": false },
+        { "fn": "may_grant", "role": "domain_master", "schema": null, "zone": "example.test", "policy": "web", "expect": false },
+        { "fn": "may_grant", "role": "domain_master", "schema": "s1", "zone": null, "policy": "web", "expect": false }
+      ]
+    }
+  ]
+}

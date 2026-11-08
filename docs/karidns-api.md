@@ -1,0 +1,251 @@
+# KARIDNS-WEBADMIN(8) — KariDNS WebAdmin API
+
+## NAME
+
+**karidns-webadmin** — the HTTP API of a KariDNS database (PostgreSQL or SQLite3): logins, users, groups and grants, and the zones the database holds, under `/api/v1/`
+
+## SYNOPSIS
+
+```text
+karidns-webadmin [-c <config>]
+karidns-webadmin [-c <config>] --check
+karidns-webadmin [-c <config>] --create-admin <name> [--bootstrap-conninfo-file <file>]
+karidns-webadmin --version | -h | --help
+```
+
+## DESCRIPTION
+
+`karidns-webadmin` (0.6.0, items D and E) is a Node.js service that lets authenticated principals look at, and (in the next steps of this release) change, the zones of a PowerDNS 5.1 database that [`karidns(8)`](karidns.md) serves through [`karidns-dbloader(8)`](karidns-dbloader.md). It is the one place that knows **who may do what**: users and groups, three kinds of grant (global master, domain master, subdomain master) and the record policies they carry. A browser front end (item F) and automation (API tokens) are clients of the same API.
+
+**What this version has.** Authentication (password, TOTP, sessions, API tokens, CSRF protection, lockout, rate limits); users, groups, nested groups, record policies and grants with the no-escalation rule; the list of datasets and zones a principal may see, zone information, the RRsets of a zone (paged), the export of a zone as a zone file, the audit log, the status of the servers, `/health` and `/version`. **What follows in this release** (the specification is in the planning notes, nothing of it is in this version): changing zone data (change sets with a dry run, zone creation and deletion, import, reload requests, DNSSEC key requests), zone versions with diff and rollback, and zone templates.
+
+Zone data is read by the service itself (SQL, one page at a time) and exported by [`karidns-zone`](karidns-zone.md); the only other programs it runs are `karidns-zone` and `karicheck` (a version check). It never talks to a DNS server.
+
+It is an ordinary process (no Capsicum): it runs as its own user, `karidns-webadmin`. Every request is hostile input: the validators refuse what they do not know, every SQL value is a bound parameter, a name that reaches a program's argument list was checked first, and no shell is involved.
+
+### Two databases, two models
+
+| | PostgreSQL | SQLite3 |
+|---|---|---|
+| connection | the role `karidns_api` ([`db/karidns_api_role.pgsql.sql`](karidns-dbloader.md)), through a pool | the zone file with the auth file attached as `auth` (one connection) |
+| who checks | the API, **and** row level security: every statement runs with `karidns.principal` set, and the policies check each row again | **the API only**. SQLite3 has no roles: whoever can write the files can do anything. This is the weaker model of the release plan (4.17); the files are the credential (below) |
+| the first administrator | `--create-admin` needs the connection of the table owner (`--bootstrap-conninfo-file`): the API role cannot make the first user | `--create-admin` writes the auth file |
+| zone export | as the check role (it reads a whole zone) | the same file |
+
+If row level security refuses a statement that the API had allowed, that is a bug in the API: the answer is 500, the log says `row level security refused what the API allowed (a bug)` with the request id. The tests look for that line.
+
+## OPTIONS
+
+`-c`, `--config FILE`
+: The configuration file (default `/usr/local/etc/karidns/karidns-webadmin.conf`).
+
+`--check`
+: Reads the configuration, checks the files and their modes, the versions and JSON schema numbers of `karidns-zone` and `karicheck`, and the database (schema version 3, every table the API uses), then exits: 0 = fine, 1 = a problem (one line each on standard error).
+
+`--create-admin NAME`
+: Makes a user NAME with a `global_master` grant and the record policy `all-types` (every record type `karidns-zone` accepts in a change file; the DNSSEC types are never in a policy), with a random password that is printed **once**. No default account exists. Run it once, as the service user. If `require-totp` is `global` or `all`, the first login has to enrol a TOTP device (below).
+
+`--bootstrap-conninfo-file FILE`
+: PostgreSQL only, with `--create-admin`: the connection of a role that row level security does not bind (the owner of the tables). The file has the rules of every connection file (below).
+
+`-v`, `--version`, `-h`, `--help`
+: Print the version, or the usage.
+
+Signals: `SIGTERM` and `SIGINT` finish the requests that are running and stop. `SIGHUP` reads the configuration again: the rates, the session times, `require-totp`, `public-origin`, `trusted-proxy` and `scrypt-ln` change; the database, the datasets and the listen address do not (restart for those).
+
+## SETUP
+
+PostgreSQL (the owner of the tables does all of this once):
+
+```text
+psql -f db/karidns_ext.pgsql.sql karidns                                     # schema version 3 (the auth schema too)
+psql -v role=karidns_api -v schema=public -f db/karidns_api_role.pgsql.sql karidns
+psql -v role=karidns_check -v schema=public -f db/karidns_check_role.pgsql.sql karidns
+printf 'host=/var/run/postgresql dbname=karidns user=karidns_api\n' > /usr/local/etc/karidns/api.conninfo       # 0600, owner karidns-webadmin
+printf 'host=/var/run/postgresql dbname=karidns user=karidns_check\n' > /usr/local/etc/karidns/check.conninfo   # likewise
+karidns-webadmin --create-admin admin --bootstrap-conninfo-file /usr/local/etc/karidns/owner.conninfo
+karidns-webadmin --check
+```
+
+SQLite3: apply `db/karidns_ext.sqlite3.sql` and `db/karidns_audit.sqlite3.sql` to the zone file, create the auth file (`sqlite3 /var/db/karidns/auth.sqlite3 < db/karidns_auth.sqlite3.sql`, owned by `karidns-webadmin`, **mode 0600**: it holds the password hashes, and `--check` refuses a wider mode), then `--create-admin` and `--check`. The loader must not be able to read the auth file. The zone file needs to be readable and writable by the API user (SQLite3 opens it read-write even to read: WAL mode).
+
+The server listens on `127.0.0.1` or a UNIX socket (mode 0660). TLS is the job of a reverse proxy in front (relayd, nginx): set `trusted-proxy` to its address so that the rate limits and the log see the real client, `public-origin` to the https origin a browser uses, and let the proxy forward `/api/` only. A non-loopback `listen` needs `tls-cert` and `tls-key` (TLS 1.2 or newer); the configuration check refuses plain HTTP anywhere but on loopback.
+
+Back up the auth file (SQLite3) or the `karidns_auth` schema (PostgreSQL) with the zone data, and keep the **TOTP key file** with it: without that key the TOTP secrets in the database cannot be read and every TOTP user must enrol again.
+
+## CONFIGURATION FILE
+
+Lines are `key = value`; `#` starts a comment; a value may be in double quotes; sections `[dataset <name>]` come last. Durations are a number with an optional unit `s m h d w` (a bare number is seconds). An unknown key, a key set twice or a value that does not fit is an error that names the line. A sample is in `karidns-webadmin.conf.sample`.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `listen` | (required) | `host:port`, `[ipv6]:port` or the absolute path of a UNIX socket. Plain HTTP only on loopback or a socket |
+| `tls-cert`, `tls-key` | | built-in TLS (both or neither) |
+| `public-origin` | (required) | the origin a browser sees, `https://dns.example.test` (`http://` only for localhost). Unsafe requests with a cookie must carry exactly this `Origin` |
+| `trusted-proxy` | | comma separated addresses of proxies; only from them is `X-Forwarded-For` believed |
+| `database` | (required) | `pg` or `sqlite3` |
+| `api-conninfo-file`, `check-conninfo-file` | | PostgreSQL: the connection files of the API role and of the check role (both required) |
+| `sqlite-file`, `auth-file` | | SQLite3: the zone file and the auth file (both required) |
+| `karidns-zone`, `karicheck`, `karictl` | `/usr/local/bin/...` | the programs |
+| `karictl-config` | | the restricted control key for reloads on SQLite3 (later steps) |
+| `workers` | min(4, CPUs) | the child process pool (later steps) |
+| `reload-after-change` | no | request a reload after every change set (later steps) |
+| `require-totp` | `global` | who must use TOTP: `global` (every global master), `all`, `none` |
+| `session-idle`, `session-max` | `30m`, `12h` | idle time and absolute life of a session |
+| `totp-key-file` | `/var/db/karidns-webadmin/totp.key` | the AES key of the TOTP secrets (64 hex digits, mode 0600), made at the first start |
+| `rate-login` | 5 | login attempts a minute, per address and per user name |
+| `rate-api`, `rate-write` | 20, 2 | requests a second (burst twice that) per principal, and writes a second |
+| `scrypt-ln` | 17 | the cost of a new password hash (2^n; 14 to 20; about 128 MiB at 17) |
+| `log` | `stderr` | `stderr` or a syslog facility (through `logger(1)`) |
+| `[dataset NAME]` `schema`, `views` | | PostgreSQL: a dataset is a schema of zone tables (default one dataset `main` in `public`); SQLite3 has the one dataset `main` |
+
+Connection files (`api-conninfo-file`, `check-conninfo-file`, `--bootstrap-conninfo-file`) must be regular files owned by the user the service runs as, mode 0600 or 0400; the keywords `host`, `port`, `dbname`, `user`, `password`, `sslmode`, `connect_timeout` and `application_name` are understood, any other is an error.
+
+## AUTHENTICATION
+
+A request carries **either** a session cookie (a browser) **or** `Authorization: Bearer kdt_<id>_<secret>` (automation), never both (400). Without one: 401, except `/health` and `/auth/login`.
+
+**Passwords** are scrypt hashes (`$scrypt$ln=17,r=8,p=1$...`, `node:crypto`; no package); `$argon2id$` hashes made elsewhere are verified where Node has argon2 (24.7 or newer). A password has at least 12 characters and does not contain the user name. Hashing runs two at a time (about 128 MiB each); more than 64 waiting is a 503.
+
+**Login** (`POST /auth/login {user, password, totp}`) answers the same 401 `invalid-credentials` for an unknown user, a wrong password, a disabled user, a group, a locked account and a wrong code, and does the same amount of work for each. Ten failures in a row lock the account for 15 minutes, twice as long for every further failure, a day at most; a success resets the count. The session cookie is `karidns_session` (256 random bits; the database holds only their SHA-256), `HttpOnly; SameSite=Strict; Path=/api/` and `Secure` when `public-origin` is https. The answer carries the CSRF token.
+
+**Sessions** end after `session-idle` without a request, after `session-max`, on logout (`POST /auth/logout`, `{"all": true}` ends the other sessions too), when the user is disabled or deleted, and when the password is reset by an administrator. A session is replaced by a new one (new id) at the login and when TOTP is confirmed.
+
+**CSRF.** An unsafe request (POST, PUT, PATCH, DELETE) with a cookie needs the header `X-KariDNS-CSRF: <token>` (from the login answer or `GET /auth/me`) **and** `Origin: <public-origin>`; otherwise 403 `csrf`. The body must be `application/json`. Bearer tokens are not ambient and need neither.
+
+**TOTP** (RFC 6238, SHA-1, 6 digits, 30 s, one step either way). `POST /auth/totp {"action":"enroll"}` returns the secret (base32) and an `otpauth://` URI; `{"action":"confirm","code":"123456"}` switches it on and replaces the session; `{"action":"disable","password":...,"code":...}` switches it off where `require-totp` allows. With `require-totp = global` (the default) a global master's first login gets a session that can only call `/auth/*` until it has enrolled (`totp.enrollment_required` in the login answer; other routes answer 403 `totp-required`). Afterwards a login needs `totp`. A code is accepted once: the step is remembered. The secret is stored encrypted (AES-256-GCM under the key file, bound to the user).
+
+**API tokens.** `POST /tokens {name, read_only, days (1 to 365, default 90), principal}` returns `token` **once**; the database holds the SHA-256 of the secret. A token acts as its principal with that principal's grants; a read-only token can only GET. Tokens cannot make tokens, change passwords or TOTP (a login session is needed). A global master may make a token for another principal (a service account is a user without a password). Disabling a user revokes its tokens.
+
+**Rate limits** (token buckets in memory, one process): logins per address and per user name (`rate-login` a minute), requests with bad credentials per address (the same bucket), requests per principal (`rate-api`) and writes (`rate-write`). Over the limit: 429 with `Retry-After`. Behind a proxy without `trusted-proxy` every client has the address of the proxy.
+
+## PERMISSIONS
+
+A **principal** is a user or a group; groups nest (at most 8 deep, no cycle); a **tenant** is a group that is in no group. A **grant** gives a principal (a user or a group, whose members inherit it) a role and a **record policy**:
+
+| Role | Scope |
+|---|---|
+| `global_master` | every zone of every dataset |
+| `domain_master` | one zone (dataset + zone name) |
+| `subdomain_master` | the names at or below a suffix of one zone (label boundary: `sub.example.test` covers `a.sub.example.test`, not `evilsub.example.test`) |
+
+A **policy** (`rr_policy`) lists the record types allowed (never the DNSSEC types, which belong to the signer), whether wildcard names, delegations (NS below the apex) and DNAME are allowed, whether the zone apex may be edited, the TTL range, and `max_rr`. An SOA record is only writable by a global master whose policy allows SOA and the apex. A disabled user or group has no rights. These are the rules of `karidns_auth.rr_ok` / `rr_visible` in the database, written a second time in `webadmin/lib/perm.js`; `tests/auth_vectors.json` holds cases that both must answer alike, and both are tested against it.
+
+**Seeing.** A zone without a grant does not exist for a principal: 404, not 403, whether it exists or not. A domain master reads the whole zone; a subdomain master reads the names under its suffix and the apex SOA and NS.
+
+**No escalation.** Everyone reads principals, groups, memberships and policies (their names are needed to grant); only global masters write them. A **domain master** may make and remove grants of its own zone for any principal, as domain master or subdomain master, **with a policy no wider than its own** (types a subset, no flag it has not, TTL range inside, `max_rr` not higher, no limit counts as widest); a subdomain master grants nothing; a global master anything. A grant is seen by its holder, by the members of a holding group and by the domain master of its zone. On PostgreSQL a trigger of the database checks the same rule again.
+
+## CONVENTIONS
+
+Base path `/api/v1`; JSON (`application/json; charset=utf-8`), UTF-8, every document has `"api": 1`. Names are absolute with the final dot (`www.example.test.`), canonical (lower case); in a request the dot may be left out. Zone names are plain LDH names (letters, digits, `-`, `_`); an owner name may also hold `*` as a whole label and `/`; no backslash escapes, no non-ASCII (use the A-label). Unknown fields in a request are refused (400, with a JSON pointer), so a typo is not ignored. Request bodies are limited to 1 MiB (the login to 16 KiB); headers to 16 KiB; a request has 30 seconds. Responses carry `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'self'; frame-ancestors 'none'` and an `X-Request-Id`.
+
+**Lists** take `?limit=` (1 to 500, default 100) and `?cursor=` (opaque, from `next_cursor` of the previous page; `null` at the end). A page of the audit log may hold fewer rows than `limit` when the principal may not see some; follow `next_cursor`.
+
+**Errors** are RFC 9457 problem documents (`application/problem+json`): `type` (`urn:karidns:api:<code>`), `title`, `status`, `detail`, `request_id` and, for a mistake in a request, `errors[]` with `{code, severity, text, pointer}`. A 500 carries the request id and nothing else; the log has the rest.
+
+| Status | Codes |
+|---|---|
+| 400 | `bad-request`, `malformed-json`, `both-credentials`, `weak-password`, `no-session` |
+| 401 | `unauthenticated`, `invalid-credentials`, `totp-required` (at login: a code is needed) |
+| 403 | `forbidden` (the role may not), `escalation` (grant wider than the granter's), `csrf`, `totp-required` (session without the second step), `totp-required-by-policy`, `read-only-token`, `session-only`, `wrong-password`, `wrong-code` |
+| 404 | `not-found` (also: no grant on the zone) |
+| 405, 413, 415 | `method-not-allowed`, `too-large`, `unsupported-media-type` |
+| 409 | `exists`, `in-use`, `refused` (a rule of the schema: a cycle of groups, ...), `self`, `not-a-group`, `not-a-user`, `no-password`, `totp-enabled`, `totp-disabled`, `no-enrolment` |
+| 422 | `constraint` |
+| 429 | `rate-limited` (`Retry-After`) |
+| 503 | `busy` (`Retry-After`), `database-unavailable` |
+| 500 | `internal` |
+
+## ENDPOINTS
+
+All paths are relative to `/api/v1`. "Global" means a global master.
+
+### Service
+
+| | |
+|---|---|
+| `GET /health` | no login. `{"status":"ok","database":"ok"}`, or 503 when the database does not answer within 3 seconds |
+| `GET /version` | the version, the versions of `karidns-zone` and `karicheck`, the datasets |
+
+### Login and self
+
+| | |
+|---|---|
+| `POST /auth/login` | `{user, password, totp?}` -> `{principal, csrf, expires_at, totp:{enabled, enrollment_required}}` and the cookie |
+| `POST /auth/logout` | `{all?}` -> 204 |
+| `GET /auth/me` | the principal, its groups and tenants, its effective grants with their policies, `capabilities` (`global`, `manage_principals`, `manage_policies`, `create_zones`, `grant_on`: the zones it may grant on), and the session (`csrf`, `totp_ok`, `expires_at`, `idle_timeout`) or the token (`read_only`) |
+| `POST /auth/totp` | `{action: enroll\|confirm\|disable, code?, password?}` |
+| `POST /auth/password` | `{current, new, all?}`; `all` ends the other sessions |
+| `GET /tokens` | own tokens (no secrets); `?principal=ID` or `?all=true`: global |
+| `POST /tokens` | `{name, read_only?, days?, principal?}` -> 201, `{token, info}` |
+| `DELETE /tokens/{id}` | revoke (own, or global) |
+
+### Principals, policies, grants
+
+| | |
+|---|---|
+| `GET /principals` | `?kind=user\|group`, `?prefix=` |
+| `POST /principals` | global. `{kind, name, display_name?, email?, password? (users), disabled?}`. Names: letters, digits, `. _ @ + : -`; unique whatever the case |
+| `GET /principals/{id}` | the principal, its groups; `credentials` (password set, TOTP on, failed logins, locked) for global and for oneself |
+| `PATCH /principals/{id}` | global. `{name?, display_name?, email?, disabled?}`. Disabling ends the sessions and revokes the tokens; one cannot disable oneself |
+| `DELETE /principals/{id}` | global; not oneself |
+| `PUT /principals/{id}/password` | global. `{password}`: the user's sessions end |
+| `GET /principals/{id}/members`, `POST` `{member}`, `DELETE /principals/{id}/members/{mid}` | members of a group (POST and DELETE: global) |
+| `GET /rr-policies`, `GET /rr-policies/{id}` | |
+| `POST /rr-policies`, `PATCH`, `DELETE` | global. `{name, allowed_types[], allow_wildcard, allow_delegation, allow_dname, apex_editable, ttl_min, ttl_max, max_rr}`. Types are upper-cased; DNSSEC and meta types are refused with a pointer; a policy in use is not deleted (409) |
+| `GET /grants` | `?principal=ID`, `?zone=` (what the principal may see, above) |
+| `POST /grants` | `{principal, role, dataset?, zone?, suffix?, policy}`: `global_master` has none of `dataset`, `zone`, `suffix`; `domain_master` needs `zone`; `subdomain_master` needs `zone` and `suffix` (at or below the zone). Escalation: 403 |
+| `DELETE /grants/{id}` | global, or the domain master of the zone for a grant it could make; a grant one cannot see is 404 |
+
+### Zones
+
+| | |
+|---|---|
+| `GET /datasets` | `[{name, driver, schema?, views}]` |
+| `GET /datasets/{ds}/zones` | the zones the principal has a grant on: `{name, kind, serial, presigned, signer, catalog, role}`. `?prefix=`, `?kind=NATIVE\|MASTER\|SLAVE\|PRODUCER\|CONSUMER`, `?signed=true\|false`; ordered by name |
+| `GET /datasets/{ds}/zones/{zone}` | kind, serial, catalog, masters, `generation` (grows with every change of the zone's rows, by any writer), `changed_at`, views, `presigned`, `signer` (signed by `karidns-signer`), `nsec3param`, `signer_state`, `waiting_for_signer` (the signer has not signed the current serial yet), the last reload request (PostgreSQL), the principal's role and grants on it |
+| `GET /datasets/{ds}/zones/{zone}/rrsets` | `?name=`, `?type=`, `?limit=`, `?cursor=`: `{rrsets:[{name, type, ttl, records:[{content, disabled, ttl}]}]}` in (name, type) byte order, **at most `limit` RRsets** a page (the records of an RRset are never split). `ttl` is the lowest of the records (RFC 2181 section 5.2). `content` is the stored content; MX and SRV carry their priority in front, as in a zone file; names inside are as stored (PowerDNS stores them without the final dot) |
+| `GET /datasets/{ds}/zones/{zone}/export` | `text/plain`: the zone as a zone file in canonical order, as `karidns-zone export` writes it (what the server serves). For the masters of the whole zone (global, domain master); 403 for a subdomain master |
+
+### Audit and servers
+
+| | |
+|---|---|
+| `GET /audit` | newest first. `?zone=`, `?principal=ID`, `?change_set=`, `?table=`, `?since=`, `?until=` (ISO 8601). `{audit:[{id, at, source, principal_id, principal, db_role, change_set, schema, table, op (I U D), zone, row_id, before, after}]}`. A global master reads all; a domain master the rows of its zones (data rows and the grants made on them); others none. Secrets are `"<redacted>"` in the log itself. `source` is `audit` (PostgreSQL), or `zone` / `auth` (SQLite3: the two files) |
+| `GET /servers` | PostgreSQL: per dataset and server the generation applied, whether every zone loaded, and the zones that did not (lines filtered to the zones the principal has a grant on). SQLite3: empty, with a note (ask the server with `karictl status`) |
+
+## SECURITY
+
+- **Secrets on disk**: the connection files and the TOTP key file (mode 0600, owner checked at start), the auth file (0600). The API never reads `cryptokeys.content` (the role has no right to) and never logs passwords, tokens, cookies, TOTP codes, request bodies or query strings; the access log has the client address, the request id, the user, the method, the route template, the status and the time.
+- **Input**: see CONVENTIONS. Paths and queries are validated before they reach SQL or a program's arguments; the programs get a fixed environment and no shell.
+- **Output**: JSON (and the export as `text/plain` with `nosniff` and `Content-Disposition: attachment`); a front end must escape record data in the DOM.
+- **SQLite3**: anyone who can write the auth file or run SQL on the zone file bypasses every rule here. Run the service as its own user, keep the files 0600 (auth file) and the zone file in a group the loader is in, and treat the host as the trust boundary.
+- **PostgreSQL**: `karidns.principal` is a setting any session can make; the API is trusted to set it to the logged-in user. Row level security catches mistakes in the API's statements, not a compromised API process.
+- Expired sessions: on SQLite3 the service deletes them at the start and every hour; on PostgreSQL the API role cannot see other users' rows, so a user's expired sessions are deleted at its next login, and `DELETE FROM karidns_auth.sessions WHERE expires_at < now()` as the owner (cron) cleans the rest.
+
+## FILES
+
+`/usr/local/etc/karidns/karidns-webadmin.conf` (settings, no secrets), the connection files, `totp.key`, the SQLite3 zone file and auth file. The shared Node code is in `node/lib/` (also used by `karidns-signer`); the service is `webadmin/` (`npm ci --ignore-scripts` installs its one dependency, `pg`).
+
+## EXIT STATUS
+
+0: fine, or stopped by a signal. 1: a problem (the configuration, a file, the database, a tool; `--create-admin` failed). 2: a usage error.
+
+## EXAMPLES
+
+```sh
+karidns-webadmin --check -c /usr/local/etc/karidns/karidns-webadmin.conf
+curl -s -c jar -H 'Content-Type: application/json' -d '{"user":"admin","password":"..."}' http://127.0.0.1:8053/api/v1/auth/login
+curl -s -b jar http://127.0.0.1:8053/api/v1/datasets/main/zones
+curl -s -b jar 'http://127.0.0.1:8053/api/v1/datasets/main/zones/example.test./rrsets?type=A&limit=50'
+curl -s -b jar http://127.0.0.1:8053/api/v1/datasets/main/zones/example.test./export > example.test.zone
+# an unsafe request with a cookie: the CSRF token and the Origin
+curl -s -b jar -H "X-KariDNS-CSRF: $CSRF" -H 'Origin: https://dns.example.test' -H 'Content-Type: application/json' \
+     -d '{"kind":"group","name":"customers"}' https://dns.example.test/api/v1/principals
+# automation: a token
+curl -s -H "Authorization: Bearer $TOKEN" https://dns.example.test/api/v1/datasets/main/zones
+```
+
+## SEE ALSO
+
+[`karidns-zone(1)`](karidns-zone.md), [`karidns-dbloader(8)`](karidns-dbloader.md) ("Roles and row level security", the WebAdmin tables), [`karidns-signer(8)`](karidns-signer.md), [`karicheck(1)`](karicheck.md), RFC 9457 (problem details), RFC 6238 (TOTP).

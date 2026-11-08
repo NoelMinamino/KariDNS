@@ -2,7 +2,7 @@
 // text that was not validated (zone names: names.js; numbers: formatted here), and no word is passed through a shell.
 
 import path from 'node:path';
-import { canonicalZone } from './names.js';
+import { canonicalZone } from '../../node/lib/names.js';
 import { algorithmName } from './keys.js';
 
 export function tools(cfg) {
