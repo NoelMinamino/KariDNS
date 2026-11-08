@@ -78,7 +78,7 @@ function denial(d, entries, pointers) {
 // The permission check on the request itself (before any tool runs): the names, types and TTLs it sets, and the types it deletes.  Without it a principal could
 // learn what an RRset outside its scope holds by sending the same RRset back and seeing whether the change shows in the diff.
 function precheck(ctx, spec) {
-  const items = spec.rrsets.map((r) => ({ name: r.name, type: r.type, ttls: r.op === 'delete' ? null : [r.ttl] }));
+  const items = spec.rrsets.map((r) => ({ name: r.name, type: r.type, ttls: r.op === 'delete' ? null : (r.ttls ?? [r.ttl]) }));
   const r = chooseGrant(ctx.auth.grants, { schema: spec.ds.schema, zone: spec.zone, items });
   if (r.denied) return denial(r.denied, items, spec.rrsets.map((_, i) => spec.label(i).path));
   return null;
@@ -132,6 +132,11 @@ export async function reloadState(ctx, { ds, zone, facts, want, views = [], dele
 //   rrsets, label, maps         the parsed RRsets of the request and where they come from; maps = renderChangeFile(): the change file (text)
 //   zoneText, deleteOthers      instead of rrsets: a zone text (import)
 //   expectations                renderExpectations(rrsets) or null
+//   conflict                    { code, detail, error(entry, rrset) }: what an expectation that does not hold is called (default: precondition-failed, A-5); a dry run
+//                               then reports them in `conflicts` and goes on instead of failing (a rollback, planning 6.4)
+//   rollbackOf                  the version a rollback restores (kind rollback)
+//   build                       instead of rrsets / label / maps / expectations: async () => { rrsets, label, maps, expectations } | { none: true }, called with
+//                               the zone locked at the start of each round (a rollback reads the history there, so a change set of this process cannot slip in between)
 //   comment, dryRun, want       a comment for the version; a dry run; whether to reload afterwards
 //   timeoutMs                   for the tool runs
 export async function runChange(ctx, spec) {
@@ -139,12 +144,10 @@ export async function runChange(ctx, spec) {
   const s = app.settings;
   const changeSet = crypto.randomUUID();
   ctx.changeSet = changeSet;
-  const input = spec.zoneText ?? spec.maps.text;
   const isText = spec.zoneText !== undefined;
-  const maps = isText ? null : spec.maps;
   const argSpec = { zone: spec.zone, text: isText, deleteOthers: spec.deleteOthers, create: spec.create, zoneType: spec.zoneType };
 
-  if (!isText) {
+  if (!isText && !spec.build) {
     const bad = precheck(ctx, spec);
     if (bad) {
       if (!spec.dryRun) throw bad;
@@ -154,20 +157,29 @@ export async function runChange(ctx, spec) {
 
   // A-18: an RRset with location / ECS tags or tinydns attributes is not edited here (the change file cannot carry them, and a replacement would drop them); a zone
   // text may touch any RRset, so a zone that has any is not imported into
-  if (!spec.create) {
-    const pairs = isText ? undefined : spec.rrsets.map((r) => ({ name: r.name, type: r.type }));
+  const tagged = async (rrsets) => {
+    if (spec.create) return;
+    const pairs = isText ? undefined : rrsets.map((r) => ({ name: r.name, type: r.type }));
     const hits = await ctx.db((tx) => S.taggedRRsets(tx, spec.ds.schema, spec.facts.id, pairs));
     if (hits.length) {
       throw conflict(isText ? 'the zone has RRsets with location / ECS tags or tinydns attributes, which the API does not edit: use karidns-zone to import into it'
         : `${hits[0].type} ${absolute(hits[0].name)} carries location / ECS tags or tinydns attributes, which the API does not edit: use karidns-zone`, 'tagged-rrset');
     }
-  }
+  };
+  if (!spec.build) await tagged(spec.rrsets);
 
   const release = await app.locks.acquire(`${spec.ds.name}/${spec.zone}`);
   try {
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       if (attempt > 1) await app.sleep(Math.floor(40 + app.random() * 120 * attempt));
-      const r = await once(ctx, spec, { changeSet, input, isText, maps, argSpec, s, auth });
+      let cur = spec;
+      if (spec.build) {
+        const b = await spec.build();
+        if (b.none) return { committed: false, changed: false, change_set: changeSet, diff: [], messages: [], reload: 'not requested', ...(spec.dryRun ? { dry_run: true, allowed: true } : {}) };
+        await tagged(b.rrsets);
+        cur = { ...spec, ...b };
+      }
+      const r = await once(ctx, cur, { changeSet, input: cur.zoneText ?? cur.maps.text, isText, maps: isText ? null : cur.maps, argSpec, s, auth });
       if (!r.retry) return r.value;
     }
   } finally {
@@ -180,6 +192,7 @@ async function once(ctx, spec, c) {
   const { app } = ctx;
   const { s } = c;
   let expectGeneration = null;
+  let conflicts = null;
   // 1. the preconditions
   if (spec.expectations) {
     const er = await runApply(ctx, checkArgv(s, spec.ds, { zone: spec.zone, text: false }), spec.expectations.text, spec.timeoutMs);
@@ -188,11 +201,13 @@ async function once(ctx, spec, c) {
     expectGeneration = er.doc.apply.generation;
     const failed = er.doc.apply.diff.map((e) => ({ e, i: spec.expectations.index.find((k) => k === entryIndex(spec.rrsets, e)) })).filter((x) => x.i !== undefined);
     if (failed.length) {
-      const errors = failed.map(({ e, i }) => ({
+      const cf = spec.conflict;
+      const errors = failed.map(({ e, i }) => (cf ? cf.error(e, spec.rrsets[i]) : {
         code: 'precondition-failed', severity: 'error', text: `${e.type} ${e.owner} is not as expected`, pointer: `${spec.label(i).path}/expect`,
         current: e.before === null ? null : e.before.map(parseLine),
       }));
-      throw new ApiError(409, 'precondition-failed', 'an RRset is not as the request expected; nothing was written', { errors });
+      if (!cf || !spec.dryRun) throw new ApiError(409, cf?.code ?? 'precondition-failed', cf?.detail ?? 'an RRset is not as the request expected; nothing was written', { errors });
+      conflicts = errors;
     }
   }
   // 2. the check run
@@ -212,8 +227,9 @@ async function once(ctx, spec, c) {
     verdict = denial(picked.denied, entries, ptrs);
   }
   if (spec.dryRun) {
-    if (verdict) return { value: { dry_run: true, allowed: false, denied: verdict.errors[0], messages } };
-    return { value: { dry_run: true, allowed: true, ...summary(ap), diff: showDiff(ap.diff), messages } };
+    const extra = conflicts ? { conflicts } : {};
+    if (verdict) return { value: { dry_run: true, allowed: false, denied: verdict.errors[0], ...extra, messages } };
+    return { value: { dry_run: true, allowed: true, ...summary(ap), diff: showDiff(ap.diff), ...extra, messages } };
   }
   if (verdict) throw verdict;
   if (!spec.create && ap.diff.length === 0) {
@@ -223,7 +239,7 @@ async function once(ctx, spec, c) {
   const reload = spec.want && !(spec.facts?.signer);
   const cm = await runApply(ctx, commitArgv(s, spec.ds, {
     zone: spec.zone, text: c.isText, deleteOthers: spec.deleteOthers, create: spec.create, zoneType: spec.zoneType, generation: ap.generation, principal: ctx.auth.principal,
-    changeSet: c.changeSet, kind: spec.kind, comment: spec.comment, reload,
+    changeSet: c.changeSet, kind: spec.kind, rollbackOf: spec.rollbackOf, comment: spec.comment, reload,
   }), c.input, spec.timeoutMs);
   if (cm.code === 3) return { retry: true };
   if (cm.code !== 0 || !cm.doc?.apply) throw failure(ctx, cm, c.maps);
@@ -234,3 +250,11 @@ async function once(ctx, spec, c) {
 }
 
 const summary = (ap) => ({ version: ap.version, generation: { before: ap.generation, after: ap.generation_after }, serial: ap.serial, records: { before: ap.records_before, after: ap.records_after } });
+
+// The diff a change file would make to the zone as it is now: a check run (the check role, a dry run) and nothing else - no grants are looked at, nothing is written.
+// For the views of the history (`GET .../versions/{n}/diff?to=current`).  A change file whose result the zone checks refuse is a 422 like any other.
+export async function checkDiff(ctx, { ds, zone, maps, timeoutMs }) {
+  const r = await runApply(ctx, checkArgv(ctx.app.settings, ds, { zone, text: false }), maps.text, timeoutMs);
+  if (r.code !== 0 || !r.doc?.apply) throw failure(ctx, r, maps);
+  return r.doc.apply.diff;
+}

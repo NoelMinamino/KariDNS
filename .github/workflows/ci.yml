@@ -169,7 +169,7 @@ jobs:
 
             echo "::group::🔏 [Signer, WebAdmin] karidns-signer and karidns-webadmin: unit tests, SQLite3 and PostgreSQL (root: with a server)"
             # A SKIP of a whole script must fail here (tests/run_all_suite.sh shows it as a note of a PASS): node24, bind-tools, signer/node_modules and webadmin/node_modules are installed above
-            for t in run_signer_unit_test run_signer_test run_signer_pg_test run_webadmin_unit_test run_webadmin_test run_webadmin_pg_test run_webadmin_write_test run_webadmin_write_pg_test; do
+            for t in run_signer_unit_test run_signer_test run_signer_pg_test run_webadmin_unit_test run_webadmin_test run_webadmin_pg_test run_webadmin_write_test run_webadmin_write_pg_test run_webadmin_versions_test run_webadmin_versions_pg_test; do
               out="/tmp/$t.out"
               sh "./tests/$t.sh" < /dev/null > "$out" 2>&1 || { cat "$out"; echo "::error title=karidns-signer::$t failed"; exit 1; }
               cat "$out"

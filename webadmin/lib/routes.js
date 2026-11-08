@@ -5,6 +5,8 @@ import * as auth from './handlers/auth.js';
 import * as admin from './handlers/admin.js';
 import * as zones from './handlers/zones.js';
 import * as write from './handlers/write.js';
+import * as versions from './handlers/versions.js';
+import * as templates from './handlers/templates.js';
 import { IMPORT_MS } from './http.js';
 
 const ZIP = 16 << 20;                       // a zone text travels in a JSON string: 16 MiB, received within 5 minutes (planning 8.2)
@@ -61,6 +63,19 @@ export const ROUTES = [
   { method: 'DELETE', path: '/datasets/:ds/zones/:zone/metadata/:kind', handler: write.metadataDelete },
   { method: 'GET', path: '/datasets/:ds/zones/:zone/dnssec', handler: write.dnssecGet },
   { method: 'POST', path: '/datasets/:ds/zones/:zone/dnssec/requests', handler: write.dnssecRequest },
+
+  { method: 'GET', path: '/datasets/:ds/zones/:zone/versions', handler: versions.list },
+  { method: 'GET', path: '/datasets/:ds/zones/:zone/versions/:n', handler: versions.get },
+  { method: 'GET', path: '/datasets/:ds/zones/:zone/versions/:n/diff', handler: versions.diff },
+  { method: 'POST', path: '/datasets/:ds/zones/:zone/versions/:n/rollback', handler: versions.rollback },
+  { method: 'POST', path: '/datasets/:ds/zones/:zone/apply-template', handler: templates.applyTemplate },
+
+  { method: 'GET', path: '/templates', handler: templates.list },
+  { method: 'POST', path: '/templates', handler: templates.create },
+  { method: 'GET', path: '/templates/:id', handler: templates.get },
+  { method: 'PATCH', path: '/templates/:id', handler: templates.update },
+  { method: 'DELETE', path: '/templates/:id', handler: templates.remove },
+  { method: 'POST', path: '/templates/:id/validate', handler: templates.validate },
 
   { method: 'GET', path: '/audit', handler: zones.auditList },
   { method: 'GET', path: '/servers', handler: zones.serversList },

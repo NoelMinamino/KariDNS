@@ -537,3 +537,189 @@ export async function zoneViews(tx, schema, domainId) {
 export async function sweepExpired(tx) {
   return Number((await tx.get('SELECT karidns_auth.sweep_expired() AS n')).n);
 }
+
+// ---------------------------------------------------------------------------------------------------------------------------------- zone versions (M4)
+// The history of a zone (planning 6): karidns_zone_versions and karidns_zone_version_rrsets, written by karidns-zone in the transaction of a change.  The API only
+// reads them.  `visibility` is that of listRRsets: null = every row; else { zone, suffixes } = the names under these suffixes and the apex SOA / NS (a subdomain
+// master).  On PostgreSQL row level security shows the same rows; on SQLite3 this condition is the only filter.
+const sfxCond = (q, col, s) => `(${col} = ${q.add(s)} OR substr(${col}, length(${col}) - ${s.length}) = ${q.add(`.${s}`)})`;
+function visCond(q, ownerCol, typeCol, visibility) {
+  if (!visibility) return '1 = 1';
+  const alts = visibility.suffixes.map((s) => sfxCond(q, ownerCol, s));
+  alts.push(`(${ownerCol} = ${q.add(visibility.zone)} AND upper(${typeCol}) IN ('SOA', 'NS'))`);
+  return `(${alts.join(' OR ')})`;
+}
+
+const versionHeader = (r) => ({
+  version: r.version, kind: r.kind, at: toIso(r.at), principal_id: r.principal_id ?? null, principal: r.principal_name ?? null, db_role: r.db_role ?? null,
+  change_set: r.change_set ?? null, comment: r.comment ?? null, serial_before: r.serial_before ?? null, serial_after: r.serial_after ?? null,
+  generation_before: Number(r.generation_before), generation_after: Number(r.generation_after), rollback_of: r.rollback_of ?? null, delta_complete: bool(r.delta_complete),
+  id: r.id, ...(r.n === undefined ? {} : { rrsets: Number(r.n) }),
+});
+const VSEL = 'v.id, v.version, v.kind, v.at, v.principal_id, v.principal_name, v.db_role, v.change_set, v.comment, v.serial_before, v.serial_after, v.generation_before, v.generation_after, v.rollback_of, v.delta_complete';
+
+// The newest `limit` + 1 versions older than `before` (a version number), newest first, each with the number of RRsets of its delta that the principal sees.  The
+// extra one is the next page's first, and the predecessor of the last one shown.
+export async function listVersions(tx, schema, domainId, { before, limit, zone, visibility }) {
+  const Z = tx.z(schema);
+  const q = new Q();
+  const id = q.add(domainId);
+  const upto = q.add(before ?? 2147483647);
+  const cnt = `SELECT count(*) FROM ${Z}karidns_zone_version_rrsets r WHERE r.version_id = v.id AND ${visCond(q, 'r.owner', 'r.type', visibility && { ...visibility, zone })}`;
+  const rows = await tx.all(`SELECT ${VSEL}, (${cnt}) AS n FROM ${Z}karidns_zone_versions v WHERE v.domain_id = ${id} AND v.version < ${upto} ORDER BY v.version DESC LIMIT ${q.add(limit + 1)}`, q.params);
+  return rows.map(versionHeader);
+}
+
+export async function getVersion(tx, schema, domainId, version, { zone, visibility } = {}) {
+  const Z = tx.z(schema);
+  const q = new Q();
+  const cnt = `SELECT count(*) FROM ${Z}karidns_zone_version_rrsets r WHERE r.version_id = v.id AND ${visCond(q, 'r.owner', 'r.type', visibility && { ...visibility, zone })}`;
+  const r = await tx.get(`SELECT ${VSEL}, (${cnt}) AS n FROM ${Z}karidns_zone_versions v WHERE v.domain_id = ${q.add(domainId)} AND v.version = ${q.add(version)}`, q.params);
+  return r && versionHeader(r);
+}
+
+// the delta of one version, `limit` + 1 RRsets after the cursor { name, type }, in (owner, type) order: [{ owner, type, before, after }] (the lines are LF separated text)
+export async function versionRRsets(tx, schema, versionId, { zone, visibility, after, limit }) {
+  const Z = tx.z(schema);
+  const q = new Q();
+  const w = [`r.version_id = ${q.add(versionId)}`, visCond(q, 'r.owner', 'r.type', visibility && { ...visibility, zone })];
+  if (after) w.push(`(r.owner > ${q.add(after.name)} OR (r.owner = ${q.add(after.name)} AND r.type > ${q.add(after.type)}))`);
+  return tx.all(`SELECT r.owner, r.type, r.before, r.after FROM ${Z}karidns_zone_version_rrsets r WHERE ${w.join(' AND ')} ORDER BY r.owner, r.type LIMIT ${q.add(limit + 1)}`, q.params);
+}
+
+// How many RRset rows the versions in (from, to] hold that the principal sees (to undefined: up to the newest): the size of a fold, checked before it is read
+export async function versionRowCount(tx, schema, domainId, from, to, { zone, visibility }) {
+  const Z = tx.z(schema);
+  const q = new Q();
+  const w = [`v.domain_id = ${q.add(domainId)}`, `v.version > ${q.add(from)}`];
+  if (to !== undefined) w.push(`v.version <= ${q.add(to)}`);
+  const r = await tx.get(`SELECT count(*) AS n FROM ${Z}karidns_zone_version_rrsets r JOIN ${Z}karidns_zone_versions v ON v.id = r.version_id
+                           WHERE ${w.join(' AND ')} AND ${visCond(q, 'r.owner', 'r.type', visibility && { ...visibility, zone })}`, q.params);
+  return Number(r.n);
+}
+
+// The versions in (from, to] with their RRset rows, in the order the history happened: -> { headers: [{ version, delta_complete }], rows: [{ version, owner, type,
+// before, after }] }.  Headers of versions without a visible RRset are there too (a version that did not touch the principal's names is still a version).
+export async function versionsBetween(tx, schema, domainId, from, to, { zone, visibility }) {
+  const Z = tx.z(schema);
+  const q = new Q();
+  const w = [`v.domain_id = ${q.add(domainId)}`, `v.version > ${q.add(from)}`];
+  if (to !== undefined) w.push(`v.version <= ${q.add(to)}`);
+  const headers = (await tx.all(`SELECT v.version, v.delta_complete FROM ${Z}karidns_zone_versions v WHERE ${w.join(' AND ')} ORDER BY v.version`, q.params))
+    .map((r) => ({ version: r.version, delta_complete: bool(r.delta_complete) }));
+  const q2 = new Q();
+  const w2 = [`v.domain_id = ${q2.add(domainId)}`, `v.version > ${q2.add(from)}`];
+  if (to !== undefined) w2.push(`v.version <= ${q2.add(to)}`);
+  const rows = await tx.all(`SELECT v.version, r.owner, r.type, r.before, r.after FROM ${Z}karidns_zone_version_rrsets r JOIN ${Z}karidns_zone_versions v ON v.id = r.version_id
+                              WHERE ${w2.join(' AND ')} AND ${visCond(q2, 'r.owner', 'r.type', visibility && { ...visibility, zone })} ORDER BY v.version, r.owner, r.type`, q2.params);
+  return { headers, rows };
+}
+
+export async function zoneGeneration(tx, schema, domainId) {
+  const r = await tx.get(`SELECT generation FROM ${tx.z(schema)}karidns_zone_state WHERE domain_id = $1`, [domainId]);
+  return r ? Number(r.generation) : 0;
+}
+
+// the change sets of the versions of a zone (their audit rows are no outside changes)
+export async function versionChangeSets(tx, schema, domainId) {
+  return (await tx.all(`SELECT change_set FROM ${tx.z(schema)}karidns_zone_versions WHERE domain_id = $1 AND change_set IS NOT NULL`, [domainId])).map((r) => r.change_set);
+}
+
+const DNSSEC_LIST = "'RRSIG', 'NSEC', 'NSEC3', 'NSEC3PARAM', 'DNSKEY', 'CDS', 'CDNSKEY'";
+const json = (v) => (typeof v === 'string' ? JSON.parse(v) : v ?? null);
+
+// Rows of the audit log that changed a record of the zone between two versions.  `since` and `until` are version ids (`until` undefined: up to now): the window is between
+// their times, the end of a version that was made by the API (`sinceIncl` / `untilIncl`: it has a change set) included, so that a change by somebody else in the same second
+// (SQLite3's audit log has no finer time) is looked at too: the rows of the API's own transaction carry its change set and are left out by that.  The end of a version
+// without a change set (an operator's) is excluded: its rows cannot be told from others'.  Left out too: the rows of every change set in `exclude` (the versions'), the DNSSEC
+// types (the signer's), an update that changed nothing but ordername / auth (the signer's), and the summary rows (no detail to judge).  -> { any, rows }: `any` is whether the
+// audit log has any row of this zone in the window (when none, the log cannot tell what happened), `rows` are { op, before, after } for the JavaScript to judge the rest (an
+// SOA update that changed the serial alone).
+export async function auditRecordChanges(tx, schema, zone, { since, sinceIncl = false, until, untilIncl = false, exclude }) {
+  const sqlite = tx.dialect === 'sqlite';
+  if (sqlite && !(await tx.get("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'karidns_audit_log'"))) return { any: false, rows: [] };
+  const Z = tx.z(schema);
+  const q = new Q();
+  const w = [`a.zone_name IN (${q.add(zone)}, ${q.add(`${zone}.`)})`, `a.at ${sinceIncl ? '>=' : '>'} (SELECT v.at FROM ${Z}karidns_zone_versions v WHERE v.id = ${q.add(since)})`];
+  if (!sqlite) w.push(`a.data_schema = ${q.add(schema)}`);
+  if (until !== undefined) w.push(`a.at ${untilIncl ? '<=' : '<'} (SELECT v.at FROM ${Z}karidns_zone_versions v WHERE v.id = ${q.add(until)})`);
+  w.push(sqlite ? `(a.change_set IS NULL OR a.change_set NOT IN (SELECT value FROM json_each(${q.add(JSON.stringify(exclude))})))`
+    : `(a.change_set IS NULL OR NOT (a.change_set = ANY(${q.add(exclude)}::text[])))`);
+  const table = sqlite ? 'karidns_audit_log' : 'karidns_auth.audit_log';
+  const any = await tx.get(`SELECT 1 AS ok FROM ${table} a WHERE ${w.join(' AND ')} LIMIT 1`, q.params);
+  const body = sqlite
+    ? `a.table_name = 'records' AND json_extract(coalesce(a.after, a.before), '$.summary') IS NULL
+       AND upper(json_extract(coalesce(a.after, a.before), '$.type')) NOT IN (${DNSSEC_LIST})
+       AND (a.op <> 'U' OR json_extract(a.before, '$.name') IS NOT json_extract(a.after, '$.name') OR json_extract(a.before, '$.type') IS NOT json_extract(a.after, '$.type')
+            OR json_extract(a.before, '$.content') IS NOT json_extract(a.after, '$.content') OR json_extract(a.before, '$.ttl') IS NOT json_extract(a.after, '$.ttl')
+            OR json_extract(a.before, '$.prio') IS NOT json_extract(a.after, '$.prio') OR json_extract(a.before, '$.disabled') IS NOT json_extract(a.after, '$.disabled'))`
+    : `a.table_name = 'records' AND (coalesce(a.after, a.before) ->> 'summary') IS NULL
+       AND upper(coalesce(a.after, a.before) ->> 'type') NOT IN (${DNSSEC_LIST})
+       AND (a.op <> 'U' OR (a.before - 'ordername' - 'auth') IS DISTINCT FROM (a.after - 'ordername' - 'auth'))`;
+  const rows = await tx.all(`SELECT a.op, a.before, a.after FROM ${table} a WHERE ${w.join(' AND ')} AND ${body} ORDER BY a.id LIMIT 2000`, q.params);
+  return { any: Boolean(any), rows: rows.map((r) => ({ op: r.op, before: json(r.before), after: json(r.after) })) };
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------- zone templates (M4)
+// karidns_auth.templates / template_records (planning 5.2): readable by every principal, written by global masters (row level security on PostgreSQL).
+const SOA_COLS = ['soa_mname', 'soa_rname', 'soa_refresh', 'soa_retry', 'soa_expire', 'soa_minimum'];
+const template = (r) => ({
+  id: r.id, name: r.name, description: r.description ?? null, revision: r.revision,
+  soa: SOA_COLS.every((c) => r[c] === null || r[c] === undefined) ? null : { mname: r.soa_mname ?? null, rname: r.soa_rname ?? null, refresh: r.soa_refresh ?? null, retry: r.soa_retry ?? null, expire: r.soa_expire ?? null, minimum: r.soa_minimum ?? null },
+  created_by: r.created_by ?? null, updated_at: toIso(r.updated_at), ...(r.n === undefined ? {} : { record_count: Number(r.n) }),
+});
+const TCOLS = (A) => `t.id, t.name, t.description, t.revision, ${SOA_COLS.map((c) => `t.${c}`).join(', ')}, t.created_by, t.updated_at`;
+
+export async function listTemplates(tx, { prefix, after = 0, limit }) {
+  const q = new Q();
+  const w = [`t.id > ${q.add(after)}`];
+  if (prefix) w.push(`substr(lower(t.name), 1, ${prefix.length}) = ${q.add(prefix.toLowerCase())}`);
+  return (await tx.all(`SELECT ${TCOLS()}, (SELECT count(*) FROM ${tx.A}template_records x WHERE x.template_id = t.id) AS n FROM ${tx.A}templates t WHERE ${w.join(' AND ')} ORDER BY t.id LIMIT ${q.add(limit + 1)}`, q.params)).map(template);
+}
+
+async function withRecords(tx, t) {
+  if (!t) return undefined;
+  const recs = await tx.all(`SELECT ordinal, owner, type, ttl, content FROM ${tx.A}template_records WHERE template_id = $1 ORDER BY ordinal`, [t.id]);
+  return { ...template(t), records: recs.map((r) => ({ owner: r.owner, type: r.type, ttl: r.ttl ?? null, content: r.content })) };
+}
+
+export async function getTemplate(tx, id) {
+  return withRecords(tx, await tx.get(`SELECT ${TCOLS()} FROM ${tx.A}templates t WHERE t.id = $1`, [id]));
+}
+
+export async function getTemplateByName(tx, name) {
+  return withRecords(tx, await tx.get(`SELECT ${TCOLS()} FROM ${tx.A}templates t WHERE t.name = $1`, [name]));
+}
+
+const soaValues = (soa) => [soa?.mname ?? null, soa?.rname ?? null, soa?.refresh ?? null, soa?.retry ?? null, soa?.expire ?? null, soa?.minimum ?? null];
+
+async function putRecords(tx, id, records) {
+  await tx.run(`DELETE FROM ${tx.A}template_records WHERE template_id = $1`, [id]);
+  let i = 0;
+  for (const r of records) await tx.run(`INSERT INTO ${tx.A}template_records (template_id, ordinal, owner, type, ttl, content) VALUES ($1, $2, $3, $4, $5, $6)`, [id, i++, r.owner, r.type, r.ttl ?? null, r.content]);
+}
+
+// t: { name, description, soa: { mname, rname, refresh, retry, expire, minimum } | null, records: [{ owner, type, ttl, content }] } -> the id
+export async function createTemplate(tx, t, createdBy) {
+  const id = (await tx.get(`INSERT INTO ${tx.A}templates (name, description, ${SOA_COLS.join(', ')}, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+    [t.name, t.description ?? null, ...soaValues(t.soa), createdBy])).id;
+  await putRecords(tx, id, t.records);
+  return id;
+}
+
+// patch: any of name, description, soa (null clears), records (the whole list); -> the number of templates changed (0: there is none)
+export async function updateTemplate(tx, id, patch) {
+  const q = new Q();
+  const set = [];
+  if (patch.name !== undefined) set.push(`name = ${q.add(patch.name)}`);
+  if (patch.description !== undefined) set.push(`description = ${q.add(patch.description)}`);
+  if (patch.soa !== undefined) SOA_COLS.forEach((c, i) => set.push(`${c} = ${q.add(soaValues(patch.soa)[i])}`));
+  if (set.length === 0) set.push('name = name');
+  const n = (await tx.run(`UPDATE ${tx.A}templates SET ${set.join(', ')} WHERE id = ${q.add(id)}`, q.params)).changes;
+  if (n && patch.records !== undefined) await putRecords(tx, id, patch.records);
+  return n;
+}
+
+export async function deleteTemplate(tx, id) {
+  return (await tx.run(`DELETE FROM ${tx.A}templates WHERE id = $1`, [id])).changes;
+}

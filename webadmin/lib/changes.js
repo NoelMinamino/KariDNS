@@ -4,7 +4,7 @@
 // Names reach the change file as absolute names made by names.js; a record's text is checked here for the characters that could end its line or hide the rest
 // of it (the parser of the change file checks them again: a mistake here is not a hole), but what the record MEANS is karidns-zone's to judge.
 
-import { badRequest } from './errors.js';
+import { badRequest, conflict } from './errors.js';
 import { shape } from './validate.js';
 import { canonicalOwner, inZone, absolute } from './names.js';
 
@@ -51,7 +51,7 @@ export function contentProblem(text) {
 }
 
 // a record type as the API takes it: upper case; a name karidns-zone knows (types: its --types-list, when we have it) or TYPEnnn
-function recordType(t, types, pointer) {
+export function recordType(t, types, pointer) {
   const u = t.toUpperCase();
   if (types && !types.has(u) && !/^TYPE\d{1,5}$/.test(u)) throw badRequest(`${u} is not a record type that can be written (karidns-zone --types-list names them)`, pointer);
   return u;
@@ -112,7 +112,7 @@ export function renderChangeFile(rrsets, label = rrsetLabel) {
       ops.push({ ...l });
     } else {
       r.records.forEach((content, j) => {
-        lines.push(`rr ${absolute(r.name)} ${r.ttl} ${r.type} ${content}`);
+        lines.push(`rr ${absolute(r.name)} ${r.ttls?.[j] ?? r.ttl} ${r.type} ${content}`);
         ops.push({ ...l, record: j });
         rr.push({ ...l, record: j });
       });
@@ -172,7 +172,7 @@ export function mapMessages(messages, maps) {
     const at = /(?:standard input|[^\s:]+):(\d+): /.exec(e.text);
     if (maps) {
       const hit = ops ? maps.ops[Number(ops[1]) - 1] : at ? maps.rr[Number(at[1]) - 2] : undefined;
-      if (hit) e.pointer = pointerOf(hit);
+      if (hit && pointerOf(hit)) e.pointer = pointerOf(hit);
     } else if (at) {
       e.pointer = '/zone_text';
       e.line = Number(at[1]);
@@ -197,7 +197,7 @@ export function entryPointer(rrsets, entry, label = rrsetLabel) {
 const ymd = (d) => `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
 
 const HOST = /^[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?(?:\.[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?)*\.?$/;
-const hostName = (v, pointer) => {
+export const hostName = (v, pointer) => {
   if (!HOST.test(v) || v.length > 254) throw badRequest('a host name (letters, digits, - and _, labels separated by dots) is expected', pointer);
   return v.toLowerCase().replace(/\.$/, '');
 };
@@ -208,8 +208,8 @@ export const CREATE_SPEC = {
   soa: {
     type: 'object',
     fields: {
-      mname: { type: 'string', required: true, min: 1, max: 255 },
-      rname: { type: 'string', required: true, min: 1, max: 255 },
+      mname: { type: 'string', min: 1, max: 255 },
+      rname: { type: 'string', min: 1, max: 255 },
       serial: { type: 'int', min: 1, max: 4294967295 },
       refresh: { type: 'int', min: 1, max: 2147483647 },
       retry: { type: 'int', min: 1, max: 2147483647 },
@@ -222,52 +222,114 @@ export const CREATE_SPEC = {
   ns_ttl: { type: 'int', min: 0, max: 2147483647 },
   rrsets: { type: 'array', max: MAX_RRSETS, items: { type: 'object', fields: RRSET_FIELDS } },
   zone_text: { type: 'string', min: 1, max: 16 << 20, noControl: false },
+  template: { type: 'string', min: 1, max: 255 },
+  template_id: { type: 'int', min: 1, max: 999999999999999 },
+  default_ttl: { type: 'int', min: 0, max: 2147483647 },
   comment: COMMENT,
   dry_run: { type: 'bool' },
   reload: { type: 'bool' },
 };
 
 // POST .../zones -> { name, kind, text | rrsets, soa..., comment, dryRun, reload }.  Either a zone text (karidns-zone's parser reads it), or the SOA and the name
-// servers (and more RRsets) of the request, which become the rr lines of the whole new zone.  The serial of a new zone is the day, YYYYMMDD00 (A-17), unless given.
+// servers (and more RRsets) of the request, which become the rr lines of the whole new zone.  With a template (by name or id: the handler loads it) the SOA values
+// and the name servers may come from the template instead.  The serial of a new zone is the day, YYYYMMDD00 (A-17), unless given.
 export function parseCreate(body, { types, now = new Date() } = {}) {
   const b = shape(body, CREATE_SPEC);
   const kind = b.type ?? 'NATIVE';
   const common = { kind, comment: b.comment, dryRun: b.dry_run === true, reload: b.reload };
+  const usesTemplate = b.template !== undefined || b.template_id !== undefined;
+  if (b.template !== undefined && b.template_id !== undefined) throw badRequest('give the template by name or by id, not both', '/template_id');
   if (b.zone_text !== undefined) {
-    for (const k of ['soa', 'nameservers', 'rrsets', 'ns_ttl']) if (b[k] !== undefined) throw badRequest('a zone text brings its own SOA, name servers and records', `/${k}`);
+    for (const k of ['soa', 'nameservers', 'rrsets', 'ns_ttl', 'template', 'template_id', 'default_ttl']) if (b[k] !== undefined) throw badRequest('a zone text brings its own SOA, name servers and records', `/${k}`);
     return { ...common, name: b.name, zoneText: b.zone_text };
   }
-  if (b.soa === undefined) throw badRequest('the SOA values (mname, rname) are needed, or a zone_text', '/soa');
-  if (b.nameservers === undefined) throw badRequest('at least one name server is needed, or a zone_text', '/nameservers');
-  return { ...common, name: b.name, soa: b.soa, nameservers: b.nameservers, nsTtl: b.ns_ttl, rrsets: b.rrsets, types, today: ymd(now) };
+  if (!usesTemplate) {
+    if (b.soa === undefined) throw badRequest('the SOA values (mname, rname) are needed, or a zone_text', '/soa');
+    for (const k of ['mname', 'rname']) if (b.soa[k] === undefined) throw badRequest(`the SOA ${k} is needed (or a template that has one)`, `/soa/${k}`);
+    if (b.nameservers === undefined) throw badRequest('at least one name server is needed, or a zone_text', '/nameservers');
+  }
+  return {
+    ...common, name: b.name, soa: b.soa, nameservers: b.nameservers, nsTtl: b.ns_ttl, rrsets: b.rrsets, types, today: ymd(now),
+    template: b.template, templateId: b.template_id, defaultTtl: b.default_ttl,
+  };
 }
 
-// the RRsets of the new zone `zone` (canonical) -> { rrsets (as parseChangeSet makes them), soaSerial }
-export function createRRsets(c, zone) {
-  const s = c.soa;
-  const ttl = s.ttl ?? 3600;
-  const soa = [hostName(s.mname, '/soa/mname'), hostName(s.rname, '/soa/rname')].map(absolute).join(' ');
+// why a record of a template (owner relative to the zone, RDATA) cannot be written to a change file, or null
+function templateRecordProblem(r) {
+  if (r.owner !== '@') {
+    if (r.owner.endsWith('.')) return 'the owner has a final dot';
+    try { canonicalOwner(r.owner); } catch (e) { return e.message; }
+  }
+  return contentProblem(r.content);
+}
+
+// The RRsets of a template for the zone `zone` (canonical): one RRset per (owner, type), the owner '@' being the apex, the others relative to the zone; a record
+// without a TTL gets `defaultTtl`.  RDATA keeps its names as they are: a relative name resolves against the zone when karidns-zone reads it, as in a zone file.
+// -> parseChangeSet-shaped RRsets with `first`, the index of the first record of the template in each
+export function templateRRsets(tpl, zone, defaultTtl) {
+  const groups = new Map();
+  tpl.records.forEach((r, i) => {
+    // (the template was checked when it was saved, but the database can be written to by others: what is copied into a change file is checked as a request's text)
+    const problem = templateRecordProblem(r);
+    if (problem) throw conflict(`record ${i} of the template is not fit to be copied (${problem}): validate the template`, 'template-invalid');
+    const name = r.owner === '@' ? zone : `${r.owner}.${zone}`;
+    const key = `${name} ${r.type}`;
+    let g = groups.get(key);
+    if (!g) {
+      g = { name, type: r.type, op: 'replace', ttl: 0, ttls: [], records: [], expect: null, first: i };
+      groups.set(key, g);
+    }
+    g.records.push(r.content);
+    g.ttls.push(r.ttl ?? defaultTtl);
+  });
+  return [...groups.values()].map((g) => ({ name: g.name, type: g.type, op: 'replace', ttl: Math.min(...g.ttls), records: g.records, expect: null, first: g.first }));
+}
+
+// where the RRsets of a template come from: the template, whose record number is `first`
+export const templateLabel = (rrsets) => (i) => ({ path: `/template/records/${rrsets[i].first}` });
+
+// the RRsets of the new zone `zone` (canonical) -> { rrsets (as parseChangeSet makes them), serial, label }.  tpl: the template (S.getTemplate), when the request names one: its
+// SOA values are the defaults of the request's, its records are in the zone unless the request has an RRset of the same name and type (or name servers: the apex NS)
+export function createRRsets(c, zone, tpl) {
+  const s = c.soa ?? {};
+  const t = tpl?.soa ?? {};
+  const mname = s.mname ?? t.mname;
+  const rname = s.rname ?? t.rname;
+  if (mname === undefined || mname === null) throw badRequest('the SOA mname is needed: in the request or in the template', '/soa/mname');
+  if (rname === undefined || rname === null) throw badRequest('the SOA rname is needed: in the request or in the template', '/soa/rname');
+  const defaultTtl = c.defaultTtl ?? 3600;
+  const ttl = s.ttl ?? defaultTtl;
+  const soa = [hostName(mname, '/soa/mname'), hostName(rname, '/soa/rname')].map(absolute).join(' ');
   const serial = s.serial ?? Number(`${c.today}00`);
   const rrsets = [{
     name: zone, type: 'SOA', op: 'replace', ttl, expect: null,
-    records: [`${soa} ${serial} ${s.refresh ?? 7200} ${s.retry ?? 3600} ${s.expire ?? 1209600} ${s.minimum ?? 300}`],
+    records: [`${soa} ${serial} ${s.refresh ?? t.refresh ?? 7200} ${s.retry ?? t.retry ?? 3600} ${s.expire ?? t.expire ?? 1209600} ${s.minimum ?? t.minimum ?? 300}`],
   }];
-  rrsets.push({
-    name: zone, type: 'NS', op: 'replace', ttl: c.nsTtl ?? ttl, expect: null,
-    records: c.nameservers.map((n, i) => absolute(hostName(n, `/nameservers/${i}`))),
-  });
+  const labels = [{ path: '/soa' }];
+  if (c.nameservers !== undefined) {
+    rrsets.push({
+      name: zone, type: 'NS', op: 'replace', ttl: c.nsTtl ?? ttl, expect: null,
+      records: c.nameservers.map((n, i) => absolute(hostName(n, `/nameservers/${i}`))),
+    });
+    labels.push({ path: '/nameservers', records: '' });
+  }
   const more = (c.rrsets ?? []).map((r, i) => {
     if (r.changetype !== 'REPLACE') throw badRequest('a new zone has nothing to delete', `/rrsets/${i}/changetype`);
     return rrsetOf(r, i, zone, c.types);
   });
-  const seen = new Set(['SOA', 'NS'].map((t) => `${zone} ${t}`));
+  const seen = new Set(rrsets.map((x) => `${x.name} ${x.type}`));
   more.forEach((x, i) => {
     const key = `${x.name} ${x.type}`;
     if (seen.has(key)) throw badRequest('this RRset is made from the SOA and nameservers of the request, or named twice', `/rrsets/${i}`);
     seen.add(key);
   });
-  return { rrsets: [...rrsets, ...more], serial };
+  const own = new Set(seen);
+  const fromTemplate = tpl ? templateRRsets(tpl, zone, defaultTtl).filter((x) => !own.has(`${x.name} ${x.type}`)) : [];
+  const label = templateLabel(fromTemplate);
+  fromTemplate.forEach((_, i) => labels.push(label(i)));
+  more.forEach((_, i) => labels.push({ path: `/rrsets/${i}`, records: 'records' }));
+  return { rrsets: [...rrsets, ...fromTemplate, ...more], serial, label: (i) => labels[i] };
 }
 
-// where the RRsets of createRRsets come from in the request: the SOA and the name servers have their own fields, the others are rrsets[i - 2]
+// where the RRsets of createRRsets come from in the request (without a template): the SOA and the name servers have their own fields, the others are rrsets[i - 2]
 export const createLabel = (i) => (i === 0 ? { path: '/soa' } : i === 1 ? { path: '/nameservers', records: '' } : { path: `/rrsets/${i - 2}`, records: 'records' });

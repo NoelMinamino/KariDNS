@@ -17,7 +17,7 @@ karidns-webadmin --version | -h | --help
 
 `karidns-webadmin` (0.6.0, items D and E) is a Node.js service that lets authenticated principals look at, and change, the zones of a PowerDNS 5.1 database that [`karidns(8)`](karidns.md) serves through [`karidns-dbloader(8)`](karidns-dbloader.md). It is the one place that knows **who may do what**: users and groups, three kinds of grant (global master, domain master, subdomain master) and the record policies they carry. A browser front end (item F) and automation (API tokens) are clients of the same API.
 
-**What this version has.** Authentication (password, TOTP, sessions, API tokens, CSRF protection, lockout, rate limits); users, groups, nested groups, record policies and grants with the no-escalation rule; the list of datasets and zones a principal may see, zone information, the RRsets of a zone (paged), the export of a zone as a zone file, the audit log, the status of the servers, `/health` and `/version`; and the **write side**: change sets (`PATCH .../rrsets`, with a dry run, preconditions and the permission check of the whole diff), zone creation, update and deletion, the import of a zone text, the reload ("update") button, the zone metadata the API may write, DNSSEC (the DS records of a signed zone, key requests for the signer) and the hourly sweep of expired sessions. **What follows in this release** (the specification is in the planning notes, nothing of it is in this version): zone versions with diff and rollback, and zone templates.
+**What this version has.** Authentication (password, TOTP, sessions, API tokens, CSRF protection, lockout, rate limits); users, groups, nested groups, record policies and grants with the no-escalation rule; the list of datasets and zones a principal may see, zone information, the RRsets of a zone (paged), the export of a zone as a zone file, the audit log, the status of the servers, `/health` and `/version`; and the **write side**: change sets (`PATCH .../rrsets`, with a dry run, preconditions and the permission check of the whole diff), zone creation, update and deletion, the import of a zone text, the reload ("update") button, the zone metadata the API may write, DNSSEC (the DS records of a signed zone, key requests for the signer) and the hourly sweep of expired sessions; and the **history of a zone** (item E): the versions every change set leaves, the diff of two versions or of a version and the zone, the rollback to a version (a change set of its own), the marker for changes made outside the versions, and **zone templates** (global masters write them, everyone reads them; a zone is made from one, or one is applied to a zone).
 
 Zone data is read by the service itself (SQL, one page at a time) and exported and written by [`karidns-zone`](karidns-zone.md); the other programs it runs are `karicheck` (a version check) and, on SQLite3, `karictl` (the reload, with a restricted control key). It never talks to a DNS server in any other way.
 
@@ -166,8 +166,8 @@ Base path `/api/v1`; JSON (`application/json; charset=utf-8`), UTF-8, every docu
 | 404 | `not-found` (also: no grant on the zone) |
 | 405, 413, 415 | `method-not-allowed`, `too-large`, `unsupported-media-type` |
 | 408 | `request-timeout` (the body did not arrive in time) |
-| 409 | `exists`, `in-use`, `refused` (a rule of the schema: a cycle of groups, ...), `self`, `not-a-group`, `not-a-user`, `no-password`, `totp-enabled`, `totp-disabled`, `no-enrolment`; the write side: `changed`, `precondition-failed`, `zone-not-editable`, `presigned-zone`, `tagged-rrset`, `signer-managed`, `signer-zones`, `unsupported`, `not-a-catalog`, `request-pending`, `already-signed`, `not-signed` |
-| 422 | `constraint`, `zone-checks-failed`, `refused` |
+| 409 | `exists`, `in-use`, `refused` (a rule of the schema: a cycle of groups, ...), `self`, `not-a-group`, `not-a-user`, `no-password`, `totp-enabled`, `totp-disabled`, `no-enrolment`; the write side: `changed`, `precondition-failed`, `zone-not-editable`, `presigned-zone`, `tagged-rrset`, `signer-managed`, `signer-zones`, `unsupported`, `not-a-catalog`, `request-pending`, `already-signed`, `not-signed`; versions and templates: `version-conflict` (a rollback finds RRsets changed after the versions it undoes), `delta-incomplete` (a version in the range was too big to keep its RRsets), `too-large` (the range holds more RRsets than a fold reads), `cannot-restore` (the history holds something that cannot be written back), `template-invalid` (a record of a stored template is not fit to be copied) |
+| 422 | `constraint`, `zone-checks-failed`, `refused`, `template-checks-failed` (karicheck refuses a template) |
 | 429 | `rate-limited` (`Retry-After`) |
 | 503 | `busy` (`Retry-After`), `database-unavailable`, `reload-failed` |
 | 500 | `internal` |
@@ -228,7 +228,7 @@ All paths are relative to `/api/v1`. "Global" means a global master.
 | | |
 |---|---|
 | `PATCH /datasets/{ds}/zones/{zone}/rrsets` | a **change set**: RRsets replaced or deleted, one zone, one request (below). Any principal whose grants allow every RRset of it |
-| `POST /datasets/{ds}/zones` | global. Makes a zone: `{name, type?, soa:{mname, rname, serial?, refresh?, retry?, expire?, minimum?, ttl?}, nameservers[], ns_ttl?, rrsets[]?, comment?, dry_run?, reload?}` or `{name, type?, zone_text, ...}`. 201 with the document of a change set and `Location`. The serial is the day, `YYYYMMDD00`, unless given |
+| `POST /datasets/{ds}/zones` | global. Makes a zone: `{name, type?, soa:{mname, rname, serial?, refresh?, retry?, expire?, minimum?, ttl?}, nameservers[], ns_ttl?, rrsets[]?, comment?, dry_run?, reload?}` or `{name, type?, zone_text, ...}`, or from a template (`template` by name or `template_id`, below: then `soa` and `nameservers` are optional). 201 with the document of a change set and `Location`. The serial is the day, `YYYYMMDD00`, unless given |
 | `PATCH /datasets/{ds}/zones/{zone}` | global. `{catalog?, views?}`: the PRODUCER zone whose catalog the zone is in (`null`: none), the views of the dataset (`dataset` sections of the configuration) the zone is in |
 | `DELETE /datasets/{ds}/zones/{zone}` | global. `{confirm: "<the zone's name>", reload?}`: the zone, its records, metadata, keys, versions and the grants on it |
 | `POST /datasets/{ds}/zones/{zone}/import` | a domain master or global master. `{zone_text, mode?: replace\|merge, comment?, dry_run?, reload?}` (below) |
@@ -238,6 +238,29 @@ All paths are relative to `/api/v1`. "Global" means a global master.
 | `PUT /datasets/{ds}/zones/{zone}/metadata/{kind}`, `DELETE ...` | global. `{content: [..]}` replaces the values of the kind (an empty list, or DELETE, removes it). Only `ALLOW-AXFR-FROM`, `ALLOW-DNSUPDATE-FROM`, `TSIG-ALLOW-AXFR`, `TSIG-ALLOW-DNSUPDATE`, `ALSO-NOTIFY`, `X-KARIDNS-PROFILE`, `X-KARIDNS-ECS-TRUSTED-RESOLVERS`, each value checked by the rules of the loader (an address or prefix, a key name, ...). Never `PRESIGNED`, `NSEC3PARAM`, `X-KARIDNS-SIGNER` or `X-KARIDNS-FORMAT` (the signer's and the importer's) |
 | `GET /datasets/{ds}/zones/{zone}/dnssec` | for the masters of the whole zone. `{dnssec:{signed, signer, presigned, nsec3param, signer_state, waiting_for_signer, serial, keys[], ds[], cryptokeys[], requests[]}}`. `keys` are the DNSKEY records with their key tags, `ds` the DS records to put in the parent zone (digest types 2 and 4, RFC 4034 section 5.1, RFC 4509, RFC 6605) for the keys with the SEP bit, computed from the public keys in the zone (`cryptokeys.content` is never read) |
 | `POST /datasets/{ds}/zones/{zone}/dnssec/requests` | a domain master or global master. `{kind: enable\|add, algorithm? (8, 10, 13, 14, 15, 16; default 13), bits? (RSA), key_type? (csk\|ksk\|zsk; default csk), nsec? (nsec3\|nsec; enable)}`: asks `karidns-signer` to start signing the zone, or for one more key. 201 with the request (`state: pending`; the signer answers it). One request per zone at a time |
+
+### Versions
+
+Paths are `/datasets/{ds}/zones/{zone}/...`. Any principal with a grant on the zone reads them (a subdomain master sees the part of each delta under its suffix, and the apex SOA and NS). Details below, "Versions and rollback".
+
+| | |
+|---|---|
+| `GET .../versions` | `?limit=`, `?cursor=`. Newest first: `{versions:[{version, kind (create edit template import rollback), at, principal:{id, name}\|null, db_role, change_set, comment, serial:{before, after}, generation:{before, after}, rollback_of, delta_complete, rrsets, changed_outside_before}], changed_outside_since, next_cursor}`. `rrsets` is the number of RRsets the version changed (as far as the principal sees them). The two `changed_outside_*` fields are for the masters of the whole zone only (below) |
+| `GET .../versions/{n}` | `?limit=`, `?cursor=`. `{version, rrsets:[{name, type, change: add\|replace\|delete, before:[{ttl, content}]\|null, after:[...]\|null}], next_cursor}`: the delta of version n |
+| `GET .../versions/{a}/diff` | `?to={b}` (a later version) or `?to=current` (the default), `?limit=`, `?cursor=`. `{from, to, rrsets:[...], next_cursor}`: for every RRset the versions after a touched, its records at a (`before`) and at b or now (`after`); the same at both ends: not listed |
+| `POST .../versions/{n}/rollback` | `{comment?, dry_run?, force?, reload?}`: a change set that restores the zone's RRsets to their state at version n. Any principal whose grants allow the whole change set |
+
+### Templates
+
+| | |
+|---|---|
+| `GET /templates` | `?prefix=`, `?limit=`, `?cursor=`. Everybody: `{templates:[{id, name, description, revision, soa, created_by, updated_at, record_count}]}` |
+| `GET /templates/{id}` | everybody: the same with `records:[{owner, type, ttl, content}]` |
+| `POST /templates` | global. `{name, description?, soa?:{mname, rname, refresh, retry, expire, minimum}, records?:[{owner, type, ttl?, content}], dry_run?}` -> 201. The records are checked by `karicheck` first |
+| `PATCH /templates/{id}` | global. Any of `name`, `description`, `soa` (`null` clears it), `records` (the whole list), `dry_run`. The revision grows |
+| `DELETE /templates/{id}` | global -> 204 |
+| `POST /templates/{id}/validate` | everybody: the stored template through `karicheck` again: `{template:{id, name, revision}, valid, messages:[{code, severity, text, pointer?}]}` |
+| `POST /datasets/{ds}/zones/{zone}/apply-template` | `{template \| template_id, default_ttl?, comment?, dry_run?, reload?}`: a change set of REPLACE operations. Any principal whose grants allow the whole change set (below) |
 
 ### Audit and servers
 
@@ -277,6 +300,57 @@ All paths are relative to `/api/v1`. "Global" means a global master.
 
 **Cost** (pc200, a FreeBSD jail on a shared host; the API on the same host as the database; median of 3 to 5 requests; `tests/run_webadmin_write_test.sh` and `..._write_pg_test.sh` print them): a change set of one RRset costs two runs of `karidns-zone`, each of which reads the zone. SQLite3: a zone of about 15 records, 11 to 13 ms for a dry run and 20 to 25 ms for the check and the commit together; a zone of 20,000 records, 93 to 96 ms and 123 to 125 ms (a subdomain master: the same). PostgreSQL: 30 ms and 63 ms; 20,000 records, 127 to 134 ms and 440 to 674 ms (a subdomain master: 446 ms). A page of 500 RRsets of the big zone: 20 ms (SQLite3), 240 to 283 ms (PostgreSQL, row level security). The reload and the loader's work come on top.
 
+## VERSIONS AND ROLLBACK
+
+**What a version is.** Every change set that is committed (a `PATCH .../rrsets`, an import, the creation of a zone, a template applied, a rollback) is one **version** of its zone, written by `karidns-zone` in the transaction of the change itself, so the history is exactly as reliable as the data. Numbers are per zone, from 1. A version records who (the principal, and the database role), when, the change set (the id of the audit log's rows of the same change), the comment, the kind (`create`, `edit`, `template`, `import`, `rollback`; for a rollback `rollback_of` is the version it restores), the SOA serial and the zone generation before and after, and the **delta**: every RRset the change touched, as it was and as it is, in the canonical lines `karidns-zone` writes (`<ttl> <TYPE> <rdata>`). `karidns-zone import` and `apply` run by an operator write versions too (no principal), so the history has no silent gaps. Not versioned: the DNSSEC types (the signer's output), and a change of the SOA serial alone (every change raises it). A change of more than 10,000 RRsets is listed without its RRsets (`delta_complete: false`); no diff or rollback crosses such a version (409 `delta-incomplete`). A zone keeps its **newest 100 versions** (the audit log stays the complete record); a version that is gone is 404.
+
+**Changes outside the versions.** A write that does not go through `karidns-zone` (`psql`, a PowerDNS tool) leaves no version. The generation of the zone grows with every writer, the signer included, so a version whose `generation.before` is higher than the `generation.after` of the one before it has something in between, and the list says what:
+
+```json
+"changed_outside_before": { "basis": "audit", "count": 2, "rrsets": [ {"name": "www.example.test.", "type": "A"} ] }
+```
+
+`basis: "audit"`: the audit log has changes of the zone's records in that time that no version explains; `rrsets` names the first ten. They are **not** counted: the DNSSEC types, an update of nothing but `ordername` / `auth`, a change of the SOA serial alone (what the signer does when it re-signs, so a signed zone is not noisy), the summary rows of an import by the signer, and the rows of the change sets of the versions themselves. Only records count: metadata, keys and views are not RRsets. `basis: "generation"`: the audit log has no row of the zone at all in that time, so only the generation says that something happened (the audit triggers are not on). `changed_outside_since` is the same for the time after the newest version (first page of the list). The fields are for the masters of the whole zone (a subdomain master cannot read the audit log, and sees part of each delta only: the fields are not in its answers). "In that time" means between the times of the two versions. The rows of a version made by the API are told by their change set, so the window includes the second (SQLite3's audit log has no finer time) of such a version; the rows of an operator's version (an import) carry no change set and cannot be told from others', so the second of such a version is not looked at: a change made in that very second is not seen.
+
+**Diff.** `GET .../versions/{a}/diff?to={b}` lists, for every RRset the versions a+1 to b touched, its records at the end of a (the `before` of the first version that touched it) and at the end of b (the `after` of the last one); an RRset that is the same at both ends (changed and changed back) is left out, an SOA that differs in its serial only too. `?to=current` compares version a with **the zone as it is**: the state at a of those RRsets is written as a change and `karidns-zone` (a check run) says what that would change, so a change made outside the versions to an RRset a version touched shows. (An RRset no version touched has no known state at a: it is not in any diff.) A state that the zone checks refuse in the zone as it is (a CNAME beside data that came later) is a 422 with the messages, as for any change.
+
+**Rollback.** `POST .../versions/{n}/rollback {comment?, dry_run?, force?, reload?}` is a **new change set** that undoes the versions after n:
+
+1. Every RRset that the versions after n touched is restored to its state before the first of them (that is the state at n; a change made outside the versions between n and that version is part of it); an RRset that did not exist then is deleted. The apex SOA is not restored (its serial only grows, and its other fields are the zone's parameters: change them with a change set); the answer's `skipped` names it.
+2. **Conflict check.** Each of these RRsets must now be as the newest version that touched it left it; otherwise something else changed it, and restoring it would undo that too: 409 `version-conflict`, `errors[]` has `{name, type, expected, current}` for each. `force: true` restores them anyway. A `dry_run` does not fail on a conflict: it lists them in `conflicts` and shows the diff that a forced rollback would make.
+3. The result goes through the pipeline of every change set (above): the zone checks, **one grant must allow every RRset restored** (old and new records; so a domain master cannot undo an apex change if its policy has no apex), the serial raised by one, a version of kind `rollback` with `rollback_of`, the reload on request. The answer is that of a change set plus `rollback_of`, `restored` (the RRsets in the plan), `versions_undone` and `skipped`. A rollback to the newest version, or to a state the zone is in already, changes nothing (`committed: false`).
+4. Rolling back a rollback is an ordinary rollback to an earlier version: roll back to the version before the rollback.
+
+A subdomain master sees, and so restores, only the RRsets under its suffix (and the apex NS, which every grant on the zone sees): "roll back to n" for it means "put my names back as they were". It cannot undo what lies outside its suffix; if the versions after n changed the apex NS the plan has it, no grant of a subdomain master allows the apex, and the rollback is refused (403).
+
+**Signed zones.** The rollback is unsigned data, like every change set: the signer signs it and asks for the reload (S-5), the API files no reload (`reload: "waiting for the signer"`). The signer's records are not in the history and a rollback does not touch them; the signer removes the signatures of an RRset that is gone and signs the one that came back. This is the durable way to undo a change in a signed zone: `karictl rollback` refuses a signed zone.
+
+| | `karictl rollback <zone>` | the API's rollback |
+|---|---|---|
+| acts on | the memory of one server: the previous published image, within `rollback-window` | the database |
+| servers | the one server | every server reading the database, after a reload |
+| signed zones | refused | yes, re-signed |
+| speed | instant | the pipeline, the reload (and the signer) |
+| who | an operator, or a restricted key with `rollback` | any principal whose grants allow the restored RRsets |
+
+The API does **not** call `karictl rollback`: it is an operator's emergency tool. Use it first when a bad change must go at once, then roll back in the database to make it durable (after that the next reload installs the same content with a higher serial).
+
+## TEMPLATES
+
+A **template** is a named set of records whose owners are relative to the zone: `@` is the apex, `www` is `www.<zone>.`. It is **copied** into a zone, when the zone is made or when the template is applied; afterwards nothing links the zone to the template except the version (kind `create` or `template`, whose comment names the template, its id and its revision). A later change of the template changes no zone. Everybody reads templates, global masters write them.
+
+```json
+{ "name": "basic", "description": "mail and web",
+  "soa": { "mname": "ns1.nsprovider.test", "rname": "hostmaster.nsprovider.test", "refresh": 1800, "minimum": 120 },
+  "records": [ { "owner": "@", "type": "NS", "content": "ns1.nsprovider.test." }, { "owner": "@", "type": "MX", "content": "10 mail" },
+               { "owner": "www", "type": "A", "ttl": 600, "content": "192.0.2.41" } ] }
+```
+
+- **Records.** `owner` is `@` or a name without the final dot (labels as in a change set; `*` and `_` allowed); `type` a record type `karidns-zone --types-list` names, not `SOA` (the `soa` fields are for that) and not a DNSSEC type; `content` the RDATA in zone file format, by the rules of a change set's records; a name in it that is not absolute is relative to the zone it is copied into (`10 mail` is `mail.<zone>.`). `ttl` is optional; the records of one RRset have one TTL (RFC 2181 section 5.2): all given and equal, or none given. A record without a TTL gets `default_ttl` of the request (3600 if none). At most 1000 records.
+- **Validation on save** (and `POST .../validate`). The records are put in a zone text under `template.invalid.` (RFC 6761: never a real zone) with an SOA, and an NS outside the zone when the template has no NS at its apex, and `karicheck --json zone template.invalid -` reads it: a CNAME beside data, bad RDATA, a missing glue and so on. Errors are a 422 `template-checks-failed` with the messages, each pointing at the record (`/records/3`) and nothing is stored; warnings come back in `messages`. `dry_run: true` only checks. The `soa` fields are defaults: `mname` and `rname` (host names; always absolute) and the four timers.
+- **A zone from a template.** `POST /datasets/{ds}/zones {name, template: "basic", ...}` (or `template_id`). The SOA is made of the request's `soa` fields, then the template's, then `refresh 7200, retry 3600, expire 1209600, minimum 300`; the serial is the day, `YYYYMMDD00`, unless the request gives one; the zone's records are the template's, and the request's own `rrsets` and `nameservers` **replace** the template's RRset of the same name and type (the request's `nameservers` replace the template's apex NS). The `soa` of the request may be left out when the template has the names. Global masters only, as for any new zone; the whole new zone is checked as one (`dry_run` shows it). The version 1 (kind `create`) has the comment `<comment> [template "basic" (id 3, revision 7)]`.
+- **A template applied to a zone** (`POST .../apply-template {template | template_id, default_ttl?, comment?, dry_run?, reload?}`): every RRset of the template **replaces** the zone's RRset of the same name and type (an RRset merge: the zone's other RRsets stay; the template's SOA fields are not used). It is a change set like any other: the caller needs one grant that allows every RRset (a domain master whose policy has no apex cannot apply a template that has apex records: 403, `errors[].pointer` is `/template/records/<i>` of the record), the `dry_run` shows what would be overwritten, the version has the kind `template`. To undo it, roll back to the version before.
+
 ## SECURITY
 
 - **Secrets on disk**: the connection files and the TOTP key file (mode 0600, owner checked at start), the auth file (0600). The API never reads `cryptokeys.content` (the role has no right to) and never logs passwords, tokens, cookies, TOTP codes, request bodies or query strings; the access log has the client address, the request id, the user, the method, the route template, the status and the time.
@@ -315,6 +389,16 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -X
 curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -X PATCH \
      -d '{"reload":true,"comment":"move www","rrsets":[{"name":"www.example.test.","type":"A","changetype":"REPLACE","ttl":300,"records":[{"content":"192.0.2.10"}]}]}' \
      https://dns.example.test/api/v1/datasets/main/zones/example.test./rrsets
+# the history: the versions, what version 3 changed, version 1 against now, and a rollback to version 1 (look first, then do it; "force":true restores RRsets that were changed outside the versions)
+curl -s -H "Authorization: Bearer $TOKEN" https://dns.example.test/api/v1/datasets/main/zones/example.test./versions
+curl -s -H "Authorization: Bearer $TOKEN" https://dns.example.test/api/v1/datasets/main/zones/example.test./versions/3
+curl -s -H "Authorization: Bearer $TOKEN" 'https://dns.example.test/api/v1/datasets/main/zones/example.test./versions/1/diff?to=current'
+curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -X POST -d '{"dry_run":true}' https://dns.example.test/api/v1/datasets/main/zones/example.test./versions/1/rollback
+curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -X POST -d '{"comment":"undo the move","reload":true}' https://dns.example.test/api/v1/datasets/main/zones/example.test./versions/1/rollback
+# a template, a zone made from it, the template applied to another zone
+curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -X POST -d '{"name":"basic","soa":{"mname":"ns1.nsprovider.test","rname":"hostmaster.nsprovider.test"},"records":[{"owner":"@","type":"NS","content":"ns1.nsprovider.test."},{"owner":"www","type":"A","content":"192.0.2.41"}]}' https://dns.example.test/api/v1/templates
+curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -X POST -d '{"name":"customer.test","template":"basic","reload":true}' https://dns.example.test/api/v1/datasets/main/zones
+curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -X POST -d '{"template":"basic","dry_run":true}' https://dns.example.test/api/v1/datasets/main/zones/example.test./apply-template
 # the update button, and the DS records of a signed zone
 curl -s -H "Authorization: Bearer $TOKEN" -X POST https://dns.example.test/api/v1/datasets/main/zones/example.test./reload
 curl -s -H "Authorization: Bearer $TOKEN" https://dns.example.test/api/v1/datasets/main/zones/example.test./dnssec

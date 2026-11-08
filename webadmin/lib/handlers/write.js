@@ -7,9 +7,10 @@ import { ApiError, badRequest, conflict, forbidden, notFound } from '../errors.j
 import { shape } from '../validate.js';
 import * as S from '../store.js';
 import { reply } from '../http.js';
-import { parseChangeSet, parseCreate, createRRsets, renderChangeFile, renderExpectations, rrsetLabel, createLabel } from '../changes.js';
+import { parseChangeSet, parseCreate, createRRsets, renderChangeFile, renderExpectations, rrsetLabel } from '../changes.js';
 import { runChange, reloadState } from '../pipeline.js';
 import { canonicalZone, absolute } from '../names.js';
+import { templateComment } from '../templates.js';
 import { dnskeyView } from '../dnssec.js';
 import { KINDS, metaKind, metaProblem, MAX_ROWS } from '../meta.js';
 import { dataset, zoneParam, zoneGrants, requireGlobal } from './common.js';
@@ -17,14 +18,14 @@ import { dataset, zoneParam, zoneGrants, requireGlobal } from './common.js';
 const EDIT_MS = 120000;            // the tools may take this long for one change set (a large zone is read twice)
 const IMPORT_RUN_MS = 300000;      // ... and this long for an import
 
-async function loadFacts(ctx, ds, zone) {
+export async function loadFacts(ctx, ds, zone) {
   const facts = await ctx.db((tx) => S.zoneFacts(tx, ds.schema, zone));
   if (!facts) throw notFound('no such zone');
   return facts;
 }
 
 // A zone whose records the API edits: a primary zone, not signed elsewhere (A-26).  A zone the signer keeps signed is fine: its data are edited, the signer signs.
-function editable(facts) {
+export function editable(facts) {
   if (!['NATIVE', 'MASTER'].includes(String(facts.kind).toUpperCase())) throw conflict(`the zone is a ${facts.kind} zone: its records are not edited here`, 'zone-not-editable');
   if (facts.presigned && !facts.signer) {
     throw conflict('the zone is signed elsewhere (PRESIGNED, not kept by karidns-signer): a change would publish records without valid signatures; sign it elsewhere and import it with karidns-zone', 'presigned-zone');
@@ -33,7 +34,7 @@ function editable(facts) {
 
 // Reload after the change?  `requested` is the request's own wish; else the configuration's (reload-after-change).  A SQLite3 deployment reloads with karictl, which
 // needs its restricted key: a request for a reload that cannot be done is refused before anything is written.
-function wantReload(app, requested) {
+export function wantReload(app, requested) {
   const s = app.settings;
   const want = requested ?? s['reload-after-change'];
   if (want && s.database === 'sqlite3' && !s['karictl-config']) {
@@ -43,7 +44,7 @@ function wantReload(app, requested) {
   return Boolean(want);
 }
 
-const noChangeSet = (ctx) => {
+export const noChangeSet = (ctx) => {
   ctx.changeSet = crypto.randomUUID();
   return ctx.changeSet;
 };
@@ -112,8 +113,14 @@ export async function zoneCreate(ctx) {
   if (c.zoneText !== undefined) {
     spec = { ...base, zoneText: NO_NUL(c.zoneText, '/zone_text'), timeoutMs: IMPORT_RUN_MS };
   } else {
-    const made = createRRsets(c, zone);
-    spec = { ...base, rrsets: made.rrsets, label: createLabel, maps: renderChangeFile(made.rrsets, createLabel) };
+    // a template: copied into the zone (planning 5.4); the version keeps its name, id and revision in the comment
+    let tpl;
+    if (c.templateId !== undefined || c.template !== undefined) {
+      tpl = await ctx.db((tx) => (c.templateId !== undefined ? S.getTemplate(tx, c.templateId) : S.getTemplateByName(tx, c.template)));
+      if (!tpl) throw notFound('no such template');
+    }
+    const made = createRRsets(c, zone, tpl);
+    spec = { ...base, rrsets: made.rrsets, label: made.label, maps: renderChangeFile(made.rrsets, made.label), ...(tpl ? { comment: templateComment(tpl, c.comment) } : {}) };
   }
   const r = await runChange(ctx, spec);
   if (!r.committed) return r;
