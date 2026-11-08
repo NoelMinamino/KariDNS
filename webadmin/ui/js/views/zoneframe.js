@@ -8,9 +8,12 @@ import { zonePath } from '../zonelib.js';
 
 const SECTIONS = [
   ['zone', 'zone.sec-records', () => true],
+  ['zone-versions', 'zone.sec-versions', () => true],
   ['zone-import', 'zone.sec-import', (role) => role !== 'subdomain_master'],
+  ['zone-template', 'zone.sec-template', (role) => role !== 'subdomain_master'],
   ['zone-settings', 'zone.sec-settings', () => true],
   ['zone-dnssec', 'zone.sec-dnssec', (role) => role !== 'subdomain_master'],
+  ['zone-grants', 'zone.sec-grants', (role) => role !== 'subdomain_master'],
 ];
 
 // the policy of a grant in one line: the types, the TTL range, the flags that are set, max_rr

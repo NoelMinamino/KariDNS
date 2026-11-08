@@ -142,6 +142,15 @@ code.pre { display: block; white-space: pre-wrap; overflow-wrap: anywhere; }
 .danger-zone { border-color: var(--danger); }
 textarea { font-family: var(--mono); }
 
+/* history, templates, administration, audit (M4) */
+tr.hit { outline: 3px solid var(--accent); outline-offset: -3px; }
+tr.outside-row td { padding: 0 .6rem; border-bottom: 1px solid var(--notice-line); background: var(--notice-bg); }
+p.outside { margin: .4rem 0; }
+pre.json { margin: .25rem 0 .75rem; padding: .5rem; background: var(--bg); border: 1px solid var(--line); border-radius: 5px; overflow-x: auto; font-family: var(--mono); font-size: .85rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+pre.json div { margin: 0; }
+details > summary { cursor: pointer; }
+table.versions td:nth-child(5), table.audit td:nth-child(5) { max-width: 20rem; }
+
 /* dialogs */
 dialog.modal.wide { max-width: 40rem; }
 dialog.modal { max-width: 28rem; width: calc(100% - 2rem); padding: 1.25rem; border: 2px solid var(--accent); border-radius: 8px; background: var(--panel); color: var(--text); }

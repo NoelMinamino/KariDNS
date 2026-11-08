@@ -5,62 +5,12 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { deploy, cast, ORIGIN, makeRun, ok, applyDoc, entry } from './helpers.js';
+import { deploy, cast, makeRun, ok, applyDoc, entry } from './helpers.js';
 import { loadStatic, defaultUiDir } from '../lib/static.js';
-import { createApp } from '../ui/js/app.js';
-import { makeEnv, makeClock, makeBroadcast, FakeStorage, flush, findAll, byText } from './fakedom.js';
+import { page } from './ui_page.js';
+import { findAll, byText } from './fakedom.js';
 
 const KZ = '/opt/karidns-zone';
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// a browser's fetch: the cookie jar, Origin on what is not a read
-function browserFetch(d) {
-  const jar = { cookie: null };
-  let inflight = 0;
-  const f = async (url, init = {}) => {
-    const headers = { ...(init.headers ?? {}) };
-    if (jar.cookie) headers.Cookie = jar.cookie;
-    if ((init.method ?? 'GET') !== 'GET') headers.Origin = ORIGIN;
-    inflight++;
-    try {
-      const res = await fetch(d.origin + url, { ...init, headers, signal: undefined });
-      for (const c of res.headers.getSetCookie()) {
-        const m = /^karidns_session=([^;]*)/.exec(c);
-        if (m) jar.cookie = m[1] ? `karidns_session=${m[1]}` : null;
-      }
-      return res;
-    } finally {
-      inflight--;
-    }
-  };
-  return { fetch: f, idle: async () => { await flush(); while (inflight > 0) { await sleep(5); await flush(); } await flush(); } };
-}
-
-async function page(d, hash) {
-  const bf = browserFetch(d);
-  const env = makeEnv({ handler: () => { throw new Error('unused'); }, clock: makeClock(), storage: new FakeStorage(), BroadcastChannel: makeBroadcast() });
-  env.fetch = bf.fetch;
-  env.window.location.hash = hash;
-  const app = createApp(env);
-  await app.start();
-  await bf.idle();
-  const root = env.document.getElementById('app');
-  const ui = {
-    env, app, root,
-    q: (sel) => root.querySelector(sel),
-    qa: (sel) => root.querySelectorAll(sel),
-    input: (name, scope = root) => findAll(scope, (e) => ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.tagName) && e.getAttribute('name') === name)[0],
-    button: (re, scope = env.document.body) => byText(scope, 'button', re),
-    type(el, v) { el.value = v; },
-    async click(el) { el.click(); await bf.idle(); },
-    async submit(form) { form.submit(); await bf.idle(); },
-    async go(h) { env.window.location.hash = h; await bf.idle(); },
-    text: () => root.textContent,
-    dialogs: () => env.document.body.querySelectorAll('dialog').filter((x) => x.open),
-    errors: () => findAll(root, (e) => e.className === 'msg error' && !e.hidden).map((e) => e.textContent),
-  };
-  return ui;
-}
 
 // the usual tools: render gives "<type>:<prio>:<content>", apply answers a check run with `diff` and a commit run as committed
 const DIFF = [entry('www.example.test.', 'A', ['300 A 192.0.2.10', '300 A 192.0.2.11'], ['60 A 192.0.2.99'])];

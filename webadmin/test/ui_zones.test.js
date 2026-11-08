@@ -153,7 +153,7 @@ test('S4: the zone page: header, record sets with names relative to the zone, th
   noForeign(ui);
   // the sections of the zone and the export link
   const nav = sectionsNav(ui);
-  assert.deepEqual(findAll(nav, (e) => e.tagName === 'A').map((a) => a.textContent), ['Records', 'Import', 'Settings', 'DNSSEC', 'Export (zone file)']);
+  assert.deepEqual(findAll(nav, (e) => e.tagName === 'A').map((a) => a.textContent), ['Records', 'Versions', 'Import', 'Template', 'Settings', 'DNSSEC', 'Grants', 'Export (zone file)']);
   const exp = findAll(nav, (e) => e.tagName === 'A').pop();
   assert.equal(exp.getAttribute('href'), '/api/v1/datasets/main/zones/example.test./export');
   assert.equal(exp.getAttribute('download'), '');
@@ -214,7 +214,7 @@ test('S4: read-only zones: a secondary zone, a zone signed elsewhere, a zone the
       { name: 'evilsub.example.test.', type: 'A', ttl: 300, tagged: false, records: [rec('192.0.2.6')] }] }),
     hash: ZONE, me: { global: false, grants },
   });
-  assert.deepEqual(findAll(sectionsNav(sub), (e) => e.tagName === 'A').map((a) => a.textContent), ['Records', 'Settings']);
+  assert.deepEqual(findAll(sectionsNav(sub), (e) => e.tagName === 'A').map((a) => a.textContent), ['Records', 'Versions', 'Settings']);
   assert.match(sub.q('dl').textContent, /Subdomain master.*sub\.example\.test\./);
   assert.match(rowOf(sub, '@', 'NS').childNodes[4].textContent, /outside your part of the zone/);
   assert.equal(buttonIn(rowOf(sub, '@', 'SOA'), /Edit/), null, 'not a global master: no SOA form');

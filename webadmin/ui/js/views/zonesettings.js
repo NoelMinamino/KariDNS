@@ -3,7 +3,7 @@
 
 import { h, fill } from '../dom.js';
 import { render } from '../format.js';
-import { field, select, checkbox, message, problemNodes, confirmButton } from '../widgets.js';
+import { field, select, checkbox, message, problemNodes, confirmButton, isGlobal } from '../widgets.js';
 import { zonePath, datasetPath, recordLines } from '../zonelib.js';
 import { placeOnFields } from '../pointer.js';
 import { zoneFrame } from './zoneframe.js';
@@ -14,7 +14,7 @@ export function zoneSettingsView(ctx, { params }) {
   const t = i18n.t;
   const ds = params.ds;
   return zoneFrame(ctx, { ds, zone: params.zone, active: 'zone-settings' }, (info, frame) => {
-    const global = ctx.session.state.me.capabilities?.global === true;
+    const global = isGlobal(ctx);
     const path = zonePath(ds, info.name);
     const box = h('div', { class: 'stack' });
     let alive = true;

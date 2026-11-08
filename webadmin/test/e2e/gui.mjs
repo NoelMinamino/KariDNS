@@ -233,7 +233,7 @@ try {
       order.push(t);
       found = t === 'Log out';
     }
-    eq(order, ['Home', 'Zones', 'Servers', 'Account', 'About', 'Log out'], 'the order of the keyboard');
+    eq(order, ['Home', 'Zones', 'Templates', 'Servers', 'Account', 'About', 'Log out'], 'the order of the keyboard');
     // the focus can be seen: the style sheet has an outline for what has the focus, and the element has a size (the check of :focus-visible itself is not made:
     // headless Firefox does not report it after a script moved the focus)
     const ring = await b.exec(() => [...document.styleSheets].some((s) => [...s.cssRules].some((r) => r.selectorText && r.selectorText.includes(':focus-visible') && /outline: (?!none)/.test(r.style.cssText))));

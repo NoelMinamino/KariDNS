@@ -6,7 +6,8 @@
 //   GUI_BASE=http://127.0.0.1:PORT GUI_ADMIN_PASSWORD=... GUI_DIR=work GUI_GECKODRIVER=... GUI_FIREFOX=... GUI_DRIVER_PORT=4444 GUI_DNS_PORT=... GUI_DAG=./dag
 //   GUI_DB=sqlite|pg GUI_SQL=script node webadmin/test/e2e/gui_zones.mjs
 //
-// GUI_SQL "statement" runs a statement on the zone database.  The zones: example.test
+// GUI_SQL "statement" runs a statement on the zone database (milestone M4 makes a change behind the API's back with it, for the history screens).  Milestone M4 adds the
+// scenarios of the history, the templates, the administration and the audit log (S9 to S12) at the end of this file, in the same browser.  The zones: example.test
 // (served; a domain master `dom` with the record policy `web`, a subdomain master `sub` on sub.example.test), dskey.example.com (kept by the signer: DNSKEY and signer state
 // made by SQL), xss.test (hostile record data), and zones the scenarios make and delete.  The service runs with require-totp = none.
 
@@ -15,6 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { startBrowser, NAMED_KEYS } from './wd.mjs';
 import { dsDigest, keyTag, parseDnskey } from '../../lib/dnssec.js';
+import { hotp, totpStep, base32Decode } from '../../lib/crypto.js';
 import ja from '../../ui/i18n/ja.js';
 import en from '../../ui/i18n/en.js';
 
@@ -179,6 +181,7 @@ await (async () => {
   admin = await loginApi('admin', E.GUI_ADMIN_PASSWORD);
   const mk = async (p, body) => { const r = await admin('POST', p, body); must(r.status === 201 || r.status === 200, `${p}: ${r.status} ${r.text}`); return r.body; };
   const web = (await mk('/rr-policies', { name: 'web', allowed_types: ['A', 'AAAA', 'CNAME', 'TXT'], ttl_min: 60, ttl_max: 86400 })).policy.id;
+  IDS.web = web;
   IDS.dom = (await mk('/principals', { kind: 'user', name: 'dom', display_name: 'Dora Domain', password: 'dora quartz lantern 12' })).principal.id;
   IDS.sub = (await mk('/principals', { kind: 'user', name: 'sub', display_name: 'Sam Sub', password: 'sam granite pine 1234' })).principal.id;
   IDS.evil = (await mk('/principals', { kind: 'user', name: 'evil', display_name: '<img src=x onerror="window.__xss=1">‮revo', password: 'delta echo foxtrot 34' })).principal.id;
@@ -419,7 +422,7 @@ try {
     eq(names, ['a.sub TXT', '@ NS', '@ SOA', 'sub A'], 'the record sets it sees');
     must(!names.some((n) => n.startsWith('evilsub')), 'evilsub is listed');
     must((await rowText('@', 'NS'))?.[4].includes('Read only'), 'the apex NS is read only');
-    eq(await b.exec(() => [...document.querySelectorAll('nav[aria-label="Sections of this zone"] a')].map((a) => a.innerText.trim())), ['Records', 'Settings'], 'the sections');
+    eq(await b.exec(() => [...document.querySelectorAll('nav[aria-label="Sections of this zone"] a')].map((a) => a.innerText.trim())), ['Records', 'Versions', 'Settings'], 'the sections');
     await (await rowButton('a.sub', 'TXT', 'Edit')).click();
     await b.waitCss('dialog[open]');
     await fill('records', '"hello again"', 'dialog[open]');
@@ -684,6 +687,357 @@ try {
     await click('Discard all changes', 'section.draft');
   });
 
+  // ------------------------------------------------------------------------------------------------------------------------------------------ milestone M4
+  // The history, the templates, the administration and the audit log (S9 to S12).  hist.test is a zone made for this part, with a history written through the API; the
+  // part ends signed in as the administrator, as it began.
+  const m4start = Date.now();
+  console.log('-- versions and rollback (S9)');
+  let tplId = null;
+  await scenario('the versions of a zone, one version, a difference; the comment of a version is text', async () => {
+    const made = await admin('POST', '/datasets/main/zones', { name: 'hist.test', soa: { mname: 'ns1.nsprovider.test', rname: 'hostmaster.nsprovider.test' }, nameservers: ['ns1.nsprovider.test.'], comment: 'the first' });
+    must(made.status === 201, `create hist.test: ${made.status} ${made.text}`);
+    const patch = async (rrsets, comment) => {
+      const r = await admin('PATCH', '/datasets/main/zones/hist.test/rrsets', { rrsets, comment });
+      must(r.status === 200, `patch hist.test: ${r.status} ${r.text}`);
+    };
+    const rs = (name, ip) => ({ name: `${name}.hist.test.`, type: 'A', changetype: 'REPLACE', ttl: 300, records: [{ content: ip }] });
+    await patch([rs('www', '192.0.2.1')], 'add www <b>x</b>');
+    await patch([rs('www', '192.0.2.2'), rs('api', '192.0.2.3')], 'move www, add api');
+    await open('#/zones/main/hist.test./versions', /^hist\.test\./);
+    await b.waitCss('table.versions');
+    const rows = await b.exec(() => [...document.querySelectorAll('table.versions tbody tr')].filter((r) => r.querySelector('th')).map((r) => [...r.children].map((c) => c.innerText.trim())));
+    eq(rows.map((r) => [r[0], r[1], r[3]]), [['3', 'edit', 'admin'], ['2', 'edit', 'admin'], ['1', 'created', 'admin']], 'the versions, newest first');
+    must(rows[1][4] === 'add www <b>x</b>', `the comment is text: ${rows[1][4]}`);
+    must(!(await b.exists('table.versions img, table.versions b')), 'a comment made an element');
+    must(!(await b.exists('table.versions .outside')), 'nothing happened outside the versions yet');
+    await labelsOk('the versions');
+    // one version
+    await open('#/zones/main/hist.test./versions/3', /^hist\.test\./);
+    await b.waitText('main', /1 added, 1 changed, 0 deleted/);
+    const names = await b.exec(() => [...document.querySelectorAll('table.diff-table tbody th')].map((e) => e.innerText.trim()));
+    eq(names, ['api', 'www'], 'the record sets of the version');
+    await labelsOk('a version');
+    // version 1 against the zone as it is: the compare form
+    await open('#/zones/main/hist.test./versions', /^hist\.test\./);
+    await b.waitCss('table.versions');
+    await fill('from', '1');
+    await click('Compare', 'form.search');
+    await b.waitText('main', /Version 1 against the zone as it is now/);
+    await b.waitText('main', /2 added, 0 changed, 0 deleted/);
+    await labelsOk('a difference');
+    // two versions
+    await open('#/zones/main/hist.test./versions/2/diff?to=3', /^hist\.test\./);
+    await b.waitText('main', /Version 2 against version 3/);
+    await b.waitText('main', /1 added, 1 changed, 0 deleted/);
+  });
+
+  await scenario('a change made outside the versions is marked; the rollback lists it as a conflict and waits for the question about force', async () => {
+    sql("UPDATE records SET content = '192.0.2.99' WHERE name = 'api.hist.test' AND type = 'A'");
+    await open('#/zones/main/hist.test./versions', /^hist\.test\./);
+    await b.waitText('main', /Since the newest version:/);
+    await open('#/zones/main/hist.test./versions/2', /^hist\.test\./);
+    await b.waitCss('#rb-title');
+    await labelsOk('the rollback');
+    await fill('comment', 'back to 2', 'section[aria-labelledby=rb-title]');
+    await click('Preview the rollback', 'section[aria-labelledby=rb-title]');
+    await b.waitCss('section.conflict');
+    must(await b.exec(() => [...document.querySelectorAll('section[aria-labelledby=rb-title] button')].find((x) => x.textContent.trim() === 'Roll back').disabled), 'a plain commit is possible with a conflict');
+    eq(await b.exec(() => [...document.querySelectorAll('section.conflict tbody tr')].map((r) => [...r.children].map((c) => c.innerText.trim()))), [['api', 'A', '300 192.0.2.3', '300 192.0.2.99']], 'the conflict');
+    await click('Roll back anyway and overwrite these', 'section.conflict');
+    must(/Overwrite these 1 record sets\?/.test(await b.exec(() => document.querySelector('section.conflict').innerText)), 'the question');
+    await click('No', 'section.conflict');
+    must(!(await bodyText()).includes('The change was saved.'), 'saved without the answer yes');
+    await click('Roll back anyway and overwrite these', 'section.conflict');
+    await click('Yes', 'section.conflict');
+    await b.waitText('main', /The change was saved\./);
+    await zonePage('hist.test.');
+    await rowIs('www', 'A', '192.0.2.1', 'www as it was at version 2');
+    eq(await rowText('api', 'A'), null, 'api is gone');
+    await open('#/zones/main/hist.test./versions', /^hist\.test\./);
+    await b.waitText('main', /restores version 2/);
+    eq(await b.exec(() => [...document.querySelectorAll('table.versions tbody tr')].filter((r) => r.querySelector('th'))[0].children[1].innerText.trim()), 'rollback', 'the new version is a rollback');
+  });
+
+  console.log('-- templates (S10)');
+  await scenario('a template is checked by the zone checks (a bad address is refused at its line), saved, applied to a zone with a preview, and deleted', async () => {
+    await open('#/templates', /^Templates$/);
+    await b.waitCss('table tbody tr');
+    must((await bodyText()).includes('basic'), 'the template of the fixtures');
+    await labelsOk('templates');
+    await click('New template', 'main');
+    await waitH1(/^New template$/);
+    await labelsOk('a new template');
+    await fill('name', 'e2e');
+    await fill('description', 'for the browser test');
+    await fill('records', 'tplhost 600 A 192.0.2.88\nbad CNAME other.example.test.\nbad A 192.0.2.5\nbadip A 999.1.1.1');
+    await click('Check', 'main');
+    await b.waitText('main', /The zone checks refuse some records/);
+    must(/Line 4: /.test(await bodyText()), 'a message does not name the line of its record');
+    await fill('records', 'tplhost 600 A 192.0.2.88\n@ TXT "e2e"');
+    await click('Check', 'main');
+    await b.waitText('main', /The zone checks accept this template\./);
+    await click('Create template', 'main');
+    await waitH1(/^e2e$/);
+    tplId = (await b.exec(() => window.location.hash)).replace(/^#\/templates\//, '');
+    must(/^\d+$/.test(tplId), `the address of the template: ${tplId}`);
+    must((await bodyText()).includes('The template was saved.'), 'saved');
+    eq(await b.exec(() => [...document.querySelectorAll('main table tbody tr')].map((r) => [...r.children].map((c) => c.innerText.trim()))), [['tplhost', 'A', '600', '192.0.2.88'], ['@', 'TXT', '-', '"e2e"']], 'the records');
+    await labelsOk('a template');
+    await click('Check again', 'main');
+    await b.waitText('main', /The zone checks accept this template\./);
+    // applied to a zone
+    await open('#/zones/main/hist.test./template', /^hist\.test\./);
+    await b.waitCss('select[name=template]');
+    await setSelect('template', tplId);
+    await fill('default_ttl', '120');
+    await labelsOk('apply a template');
+    await click('Preview', 'main');
+    await b.waitText('main', /This is what the change would do/);
+    await click('Apply the template', 'main');
+    await b.waitText('main', /The change was saved\./);
+    await zonePage('hist.test.');
+    await rowIs('tplhost', 'A', '192.0.2.88', 'the template was applied');
+    await rowIs('@', 'TXT', '"e2e"', 'the record without a TTL');
+    await open('#/zones/main/hist.test./versions', /^hist\.test\./);
+    await b.waitText('main', /template applied/);
+    // deleted after a question
+    await open(`#/templates/${tplId}`, /^e2e$/);
+    await click('Delete the template', 'main');
+    await click('Yes', 'section.danger-zone');
+    await waitH1(/^Templates$/);
+    await b.waitText('main', /The template e2e was deleted\./);
+  });
+
+  console.log('-- administration (S11)');
+  let groupHash = null;
+  await scenario('users: a new user, a group with a member and a grant; the user signs in with the grant of the group', async () => {
+    await open('#/admin/users', /^Administration$/);
+    await b.waitCss('table tbody tr');
+    const names = await b.exec(() => [...document.querySelectorAll('tbody tr th')].map((e) => e.innerText.trim()));
+    for (const n of ['admin', 'dom', 'sub', 'evil']) must(names.includes(n), `${n} is not listed: ${names}`);
+    await labelsOk('users');
+    await fill('prefix', 'su', 'form.search');
+    await click('Find', 'form.search');
+    await b.waitFor(async () => JSON.stringify(await b.exec(() => [...document.querySelectorAll('tbody tr th')].map((e) => e.innerText.trim()))) === '["sub"]', { message: 'the search to narrow the list' });
+    await open('#/admin/users', /^Administration$/);
+    await b.waitCss('form[novalidate] input[name=password]');
+    await fill('name', 'newbie', 'form:has(input[name=password])');
+    await fill('display_name', 'New <b>Bie</b>', 'form:has(input[name=password])');
+    await fill('password', 'a new person 12345', 'form:has(input[name=password])');
+    await click('Create user', 'main');
+    await b.waitText('main', /User: newbie/);
+    must((await bodyText()).includes('newbie was created.'), 'created');
+    must(!(await b.exists('main b')), 'a display name made an element');
+    await labelsOk('a user');
+    // a group, a member by name, a grant on a zone
+    await open('#/admin/groups', /^Administration$/);
+    await b.waitCss('form[novalidate]');
+    await fill('name', 'e2e-ops', 'form:has(button.primary)');
+    await click('Create group', 'main');
+    await b.waitText('main', /Group: e2e-ops/);
+    groupHash = await b.exec(() => window.location.hash);
+    await labelsOk('a group');
+    await fill('member', 'NEWBIE');
+    await click('Add', 'main');
+    await b.waitText('main', /newbie was added\./);
+    await setSelect('policy', String(IDS.web), 'form:has(select[name=role])');
+    await fill('zone', 'hist.test', 'form:has(select[name=role])');
+    await click('Give the grant', 'main');
+    await b.waitText('main', /The grant was given\./);
+    eq(await b.exec(() => [...document.querySelectorAll('table.grants tbody tr')].map((r) => [...r.children].slice(0, 3).map((c) => c.innerText.trim()))), [['Domain master', 'main / hist.test.', 'web']], 'the grant');
+    // the user has the grant of the group
+    await logout();
+    await signIn('newbie', 'a new person 12345');
+    await click('Zones', 'nav');
+    await waitH1(/^Zones$/);
+    await b.waitCss('table tbody tr');
+    eq(await b.exec(() => [...document.querySelectorAll('tbody tr')].map((r) => [r.children[0].innerText.trim(), r.children[1].innerText.trim()])), [['hist.test.', 'Domain master']], 'the zones of the member of the group');
+    await logout();
+    await signIn('admin', E.GUI_ADMIN_PASSWORD);
+  });
+
+  await scenario('a lost device and a locked account: the TOTP is reset and the account unlocked by an administrator; a user cannot reset its own', async () => {
+    const pw = 'a new person 12345';
+    const me = await loginApi('newbie', pw);
+    const enrol = await me('POST', '/auth/totp', { action: 'enroll' });
+    must(enrol.status === 200, `enrol: ${enrol.status} ${enrol.text}`);
+    const conf = await me('POST', '/auth/totp', { action: 'confirm', code: hotp(base32Decode(enrol.body.secret), totpStep(Date.now() / 1000)) });
+    must(conf.status === 200, `confirm: ${conf.status} ${conf.text}`);
+    for (let i = 0; i < 3; i++) must((await call('POST', '/auth/login', { body: { user: 'newbie', password: 'wrong password 1234' } })).status === 401, 'a wrong password was accepted');
+    await open('#/admin/users', /^Administration$/);
+    await b.waitCss('table tbody tr');
+    await click('newbie', 'table');
+    await b.waitText('main', /User: newbie/);
+    await b.waitText('main', /Failed sign-in attempts\s*3/);
+    must(/Two-step verification\s*on/.test(await bodyText()), 'the TOTP is not shown as on');
+    await click('Unlock the account', 'main');
+    await click('Yes', 'main');
+    await b.waitText('main', /The account was unlocked\./);
+    await b.waitText('main', /Failed sign-in attempts\s*0/);
+    await click('Reset two-step verification', 'main');
+    await click('Yes', 'main');
+    await b.waitText('main', /Two-step verification was reset/);
+    must(/Two-step verification\s*off/.test(await bodyText()), 'the TOTP is still on');
+    const after = await call('POST', '/auth/login', { body: { user: 'newbie', password: pw } });
+    must(after.status === 200, `the user cannot sign in with the password alone: ${after.status} ${after.text}`);
+    // one's own account: no way to disable, delete or reset oneself
+    await open('#/admin/users', /^Administration$/);
+    await b.waitCss('table tbody tr');
+    await click('admin', 'table');
+    await b.waitText('main', /User: admin/);
+    must(await b.exec(() => ![...document.querySelectorAll('main button')].some((x) => /^(Delete|Reset two-step verification)$/.test(x.textContent.trim())) && !document.querySelector('main input[name=disabled]')), 'oneself can be disabled, deleted or reset');
+  });
+
+  await scenario('record policies: a new one, edited, deleted; one that is in use is refused; grants by user and zone, one removed after a question', async () => {
+    await open('#/admin/policies', /^Administration$/);
+    await b.waitCss('table tbody tr');
+    await labelsOk('policies');
+    await fill('name', 'e2e-pol', 'form:has(input[name=allow_wildcard])');
+    await fill('types', 'a txt', 'form:has(input[name=allow_wildcard])');
+    await fill('ttl_min', '60', 'form:has(input[name=allow_wildcard])');
+    await fill('ttl_max', '600', 'form:has(input[name=allow_wildcard])');
+    await click('Create the policy', 'main');
+    await b.waitText('main', /The policy e2e-pol was created\./);
+    const inRow = async (th, label) => {
+      const r = await b.exec((n, l) => {
+        const row = [...document.querySelectorAll('table tbody tr')].find((tr) => tr.querySelector('th').textContent.trim() === n);
+        return row ? ([...row.querySelectorAll('button')].find((x) => x.textContent.trim() === l && x.offsetParent !== null) ?? null) : null;
+      }, th, label);
+      must(r, `no button ${label} in the row ${th}`);
+      return b.wrap(r);
+    };
+    eq(await b.exec(() => [...document.querySelectorAll('table tbody tr')].find((tr) => tr.querySelector('th').textContent.trim() === 'e2e-pol').children[1].innerText.trim()), 'A TXT', 'the types of the policy');
+    await (await inRow('e2e-pol', 'Edit')).click();
+    await b.waitText('main', /Edit the policy e2e-pol/);
+    await fill('max_rr', '5', 'form:has(input[name=allow_wildcard])');
+    await click('Save the policy', 'main');
+    await b.waitText('main', /The policy e2e-pol was saved\./);
+    await (await inRow('e2e-pol', 'Delete')).click();
+    await (await inRow('e2e-pol', 'Yes')).click();
+    await b.waitText('main', /The policy e2e-pol was deleted\./);
+    await (await inRow('web', 'Delete')).click();
+    await (await inRow('web', 'Yes')).click();
+    await waitErr(/still in use/);
+    // grants of the group, found by name
+    await open('#/admin/grants?who=e2e-ops', /^Administration$/);
+    await b.waitCss('table.grants');
+    await labelsOk('grants');
+    eq(await b.exec(() => [...document.querySelectorAll('table.grants tbody tr')].map((r) => [...r.children].slice(0, 4).map((c) => c.innerText.trim()))), [['e2e-ops', 'Domain master', 'main / hist.test.', 'web']], 'the grants of the group');
+    await click('Remove', 'table.grants');
+    await click('Yes', 'table.grants');
+    await b.waitText('main', /There is no grant\./);
+    // the group and the user are deleted (a question first)
+    await open(groupHash, /^Administration$/);
+    await b.waitText('main', /Group: e2e-ops/);
+    await click('Delete', 'section.danger-zone');
+    await click('Yes', 'section.danger-zone');
+    await b.waitText('main', /e2e-ops was deleted\./);
+    await open('#/admin/users?prefix=newbie', /^Administration$/);
+    await b.waitCss('table tbody tr');
+    await click('newbie', 'table');
+    await b.waitText('main', /User: newbie/);
+    await click('Delete', 'section.danger-zone');
+    await click('Yes', 'section.danger-zone');
+    await b.waitText('main', /newbie was deleted\./);
+  });
+
+  console.log('-- a domain master and a subdomain master (S9, S11, S12)');
+  await scenario('a domain master: no administration, the audit log of its zone only, the grants of its zone with the policies no wider than its own', async () => {
+    await logout();
+    await signIn('dom', 'dora quartz lantern 12');
+    eq(await b.exec(() => [...document.querySelectorAll('header.top nav a')].map((a) => a.textContent.trim())), ['Home', 'Zones', 'Templates', 'Servers', 'Audit log', 'Account', 'About'], 'the menu of a domain master');
+    await open('#/admin/users', /^Administration$/);
+    await b.waitText('main', /Only global masters administer users/);
+    await open('#/audit', /^Audit log$/);
+    await b.waitCss('table.audit tbody tr');
+    const zones = await b.exec(() => [...new Set([...document.querySelectorAll('table.audit tbody tr')].map((r) => r.children[3].innerText.trim()))]);
+    eq(zones, ['example.test.'], 'the zones of the rows a domain master reads');
+    await labelsOk('the audit log');
+    await open('#/zones/main/example.test./grants', /^example\.test\./);
+    await b.waitCss('select[name=policy]');
+    await labelsOk('the grants of a zone');
+    eq(await b.exec(() => [...document.querySelectorAll('select[name=policy] option')].map((o) => o.textContent.trim())), ['web'], 'the policies a domain master may give');
+    eq(await b.exec(() => [...document.querySelectorAll('select[name=role] option')].map((o) => o.textContent.trim())), ['Domain master', 'Subdomain master'], 'the roles');
+    await fill('principal', 'evil', 'form:has(select[name=role])');
+    await fill('suffix', 'zz.example.test', 'form:has(select[name=role])');
+    await click('Give the grant', 'main');
+    await b.waitText('main', /The grant was given\./);
+    const rows = await b.exec(() => [...document.querySelectorAll('table.grants tbody tr')].map((r) => [...r.children].slice(0, 3).map((c) => c.innerText.trim())));
+    must(rows.some((r) => r[0] === 'evil' && r[1] === 'Subdomain master' && r[2].includes('zz.example.test.')), `the grant is not listed: ${JSON.stringify(rows)}`);
+    // a grant the service refuses: no more than the policy the person holds is a rule of the service; a zone that is not its own is not found
+    await b.exec(() => { [...document.querySelectorAll('table.grants tbody tr')].find((r) => r.children[0].innerText.trim() === 'evil').querySelector('button').click(); });
+    await click('Yes', 'table.grants');
+    await b.waitText('main', /The grant was removed\./);
+    // the versions of its zone, with the marker for what was done outside them
+    await open('#/zones/main/example.test./versions', /^example\.test\./);
+    await b.waitCss('table.versions');
+    must((await b.exec(() => document.querySelectorAll('table.versions tbody tr').length)) >= 4, 'few versions');
+    must((await bodyText()).includes('Roll back...'), 'no way to the rollback');
+  });
+
+  await scenario('a subdomain master: the versions are its part of each change, not the names of others', async () => {
+    await logout();
+    await signIn('sub', 'sam granite pine 1234');
+    await open('#/zones/main/example.test./versions', /^example\.test\./);
+    await b.waitCss('table.versions');
+    await b.waitText('main', /part of each change that lies under your suffix/);
+    must(!(await b.exists('table.versions .outside')), 'a subdomain master reads no marker (it cannot read the audit log)');
+    const last = Number(await b.exec(() => [...document.querySelectorAll('table.versions tbody tr')].filter((r) => r.querySelector('th'))[0].querySelector('th').innerText.trim()));
+    must(last >= 4, `few versions: ${last}`);
+    eq(await b.exec(() => [...document.querySelectorAll('header.top nav a')].map((a) => a.textContent.trim())), ['Home', 'Zones', 'Templates', 'Servers', 'Account', 'About'], 'the menu');
+    eq(await b.exec(() => [...document.querySelectorAll('nav[aria-label="Sections of this zone"] a')].map((a) => a.textContent.trim())), ['Records', 'Versions', 'Settings'], 'the sections');
+    await open(`#/zones/main/example.test./versions/1/diff?to=${last}`, /^example\.test\./);
+    await b.waitText('main', new RegExp(`Version 1 against version ${last}`));
+    await b.waitFor(async () => (await b.exists('table.diff-table')) || /No difference\./.test(await bodyText()), { message: 'the difference' });
+    const shown = await b.exec(() => [...document.querySelectorAll('table.diff-table tbody th')].map((e) => e.innerText.trim()));
+    must(shown.length >= 1, 'a subdomain master sees nothing of its own part');
+    for (const n of shown) must(/^(@|sub|.+\.sub)$/.test(n), `a name outside the suffix: ${n}`);
+    must(!shown.includes('www') && !shown.includes('evilsub'), 'names of others');
+    await open('#/zones/main/example.test./grants', /^example\.test\./);
+    await b.waitText('main', /managed by the masters of the whole zone/);
+    await logout();
+    await signIn('admin', E.GUI_ADMIN_PASSWORD);
+  });
+
+  console.log('-- the audit log (S12)');
+  await scenario('filters, a change set to its version, the rows of hostile data are text', async () => {
+    await open('#/audit?zone=hist.test.&table=records', /^Audit log$/);
+    await b.waitCss('table.audit tbody tr');
+    eq(await b.exec(() => [...new Set([...document.querySelectorAll('table.audit tbody tr')].map((r) => r.children[3].innerText.trim()))]), ['hist.test.'], 'the zone of the rows');
+    await labelsOk('the audit log');
+    // the change set of a row leads to its version
+    const link = await control('version', 'table.audit');
+    await link.click();
+    await b.waitCss('table.versions');
+    must((await b.exec(() => window.location.hash)).includes('/versions?cs='), 'the address of the version');
+    await b.waitCss('table.versions tr[aria-current=true]');
+    must((await bodyText()).includes('the change you came from'), 'the version is not marked');
+    // the form
+    await open('#/audit', /^Audit log$/);
+    await b.waitCss('table.audit tbody tr');
+    await fill('who', 'admin', 'form.search');
+    await fill('table', 'records', 'form.search');
+    await fill('zone', 'hist.test.', 'form.search');
+    await click('Show', 'form.search');
+    await b.waitFor(async () => (await b.exec(() => window.location.hash)).includes('who=admin'), { message: 'the filter to be in the address' });
+    await b.waitCss('table.audit tbody tr');
+    must((await b.exec(() => [...document.querySelectorAll('table.audit tbody tr')].every((r) => r.children[1].innerText.trim() === 'admin'))), 'rows of another person');
+    // a name nobody has, a field that is wrong
+    await open('#/audit?who=nobody-here', /^Audit log$/);
+    await b.waitText('main', /No user or group has this name\./);
+    await open('#/audit?since=soon', /^Audit log$/);
+    await b.waitText('main', /This is not a time\./);
+    // before and after are text
+    await open('#/audit?zone=xss.test.&table=records', /^Audit log$/);
+    await b.waitCss('table.audit tbody tr');
+    const json = await b.exec(() => [...document.querySelectorAll('table.audit pre')].map((p) => p.textContent).join('\n'));
+    must(json.includes('onerror'), `the hostile record is not in the details: ${json.slice(0, 300)}`);
+    must(!(await b.exists('table.audit img, table.audit script')), 'an element came from the audit log');
+    await noTrouble();
+    must((await b.exec(() => document.querySelector('table.audit pre').parentNode.querySelectorAll('div').length)) >= 1, 'no lines');
+  });
+
+  console.log(`  [TIME] the scenarios of milestone M4 (S9 to S12) took ${Math.round((Date.now() - m4start) / 1000)} s`);
   console.log('-- the policy of the page');
   await scenario('every resource came from the origin and the page never reported a violation', async () => {
     const urls = await b.exec(() => performance.getEntriesByType('resource').map((e) => e.name));

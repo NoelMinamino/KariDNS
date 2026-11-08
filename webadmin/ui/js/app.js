@@ -20,6 +20,13 @@ import { zoneSettingsView } from './views/zonesettings.js';
 import { dnssecView } from './views/dnssec.js';
 import { zoneCreateView } from './views/zonecreate.js';
 import { serversView } from './views/servers.js';
+import { versionsView, versionView, versionDiffView } from './views/versions.js';
+import { templatesView, templateView, templateNewView } from './views/templates.js';
+import { zoneTemplateView } from './views/zonetemplate.js';
+import { principalsView, policiesView, grantsView } from './views/admin.js';
+import { principalView } from './views/adminprincipal.js';
+import { zoneGrantsView } from './views/zonegrants.js';
+import { auditView } from './views/audit.js';
 import { createDrafts } from './draft.js';
 import en from '../i18n/en.js';
 import ja from '../i18n/ja.js';
@@ -32,14 +39,33 @@ export const ROUTES = [
   { name: 'zone-import', pattern: '/zones/:ds/:zone/import' },
   { name: 'zone-settings', pattern: '/zones/:ds/:zone/settings' },
   { name: 'zone-dnssec', pattern: '/zones/:ds/:zone/dnssec' },
+  { name: 'zone-versions', pattern: '/zones/:ds/:zone/versions' },
+  { name: 'zone-version', pattern: '/zones/:ds/:zone/versions/:n' },
+  { name: 'zone-diff', pattern: '/zones/:ds/:zone/versions/:n/diff' },
+  { name: 'zone-template', pattern: '/zones/:ds/:zone/template' },
+  { name: 'zone-grants', pattern: '/zones/:ds/:zone/grants' },
+  { name: 'templates', pattern: '/templates' },
+  { name: 'template-new', pattern: '/templates/new' },
+  { name: 'template', pattern: '/templates/:id' },
+  { name: 'admin-users', pattern: '/admin/users' },
+  { name: 'admin-groups', pattern: '/admin/groups' },
+  { name: 'admin-policies', pattern: '/admin/policies' },
+  { name: 'admin-grants', pattern: '/admin/grants' },
+  { name: 'admin-principal', pattern: '/admin/principals/:id' },
+  { name: 'audit', pattern: '/audit' },
   { name: 'servers', pattern: '/servers' },
   { name: 'account', pattern: '/account' },
   { name: 'totp', pattern: '/account/totp' },
   { name: 'about', pattern: '/about' },
 ];
 // the menu: [route, message id]; the zone pages belong to "Zones"
-const NAV = [['home', 'nav.home'], ['zones', 'nav.zones'], ['servers', 'nav.servers'], ['account', 'nav.account'], ['about', 'nav.about']];
-const IN_ZONES = new Set(['zones', 'zone', 'zone-import', 'zone-settings', 'zone-dnssec', 'create']);
+// (the third is who sees the entry: everybody, global masters only, or the people who may read the audit log: global masters and domain masters)
+const NAV = [['home', 'nav.home'], ['zones', 'nav.zones'], ['templates', 'nav.templates'], ['servers', 'nav.servers'], ['admin-users', 'nav.admin', 'global'], ['audit', 'nav.audit', 'audit'],
+  ['account', 'nav.account'], ['about', 'nav.about']];
+const IN_ZONES = new Set(['zones', 'zone', 'zone-import', 'zone-settings', 'zone-dnssec', 'zone-versions', 'zone-version', 'zone-diff', 'zone-template', 'zone-grants', 'create']);
+// the entry of the menu a route belongs to
+const sectionOf = (r) => (IN_ZONES.has(r) ? 'zones' : r === 'totp' ? 'account' : r.startsWith('admin-') ? 'admin-users' : r.startsWith('template') ? 'templates' : r);
+const mayShow = (who, caps) => who === undefined || (who === 'global' ? caps?.global === true : caps?.global === true || (caps?.grant_on ?? []).length > 0);
 const noop = () => {};
 
 export function createApp(env) {
@@ -98,7 +124,8 @@ export function createApp(env) {
     const head = [brand()];
     if (authed() && !forced()) {
       const cur = route?.name;
-      head.push(h('nav', { 'aria-label': t('nav.label') }, h('ul', null, NAV.map(([name, id]) => h('li', null, link(router.href(name), { 'aria-current': cur === name || (name === 'account' && cur === 'totp') || (name === 'zones' && IN_ZONES.has(cur)) ? 'page' : undefined }, t(id)))))));
+      const caps = session.state.me.capabilities;
+      head.push(h('nav', { 'aria-label': t('nav.label') }, h('ul', null, NAV.filter(([, , who]) => mayShow(who, caps)).map(([name, id]) => h('li', null, link(router.href(name), { 'aria-current': cur !== undefined && sectionOf(cur) === name ? 'page' : undefined }, t(id)))))));
     }
     if (authed()) {
       const me = session.state.me.principal;
@@ -152,6 +179,20 @@ export function createApp(env) {
       case 'zone-import': mount(`${t('zone.sec-import')} - ${plain(route.params.zone)}`, zoneImportView(ctx, route)); break;
       case 'zone-settings': mount(`${t('zone.sec-settings')} - ${plain(route.params.zone)}`, zoneSettingsView(ctx, route)); break;
       case 'zone-dnssec': mount(`${t('zone.sec-dnssec')} - ${plain(route.params.zone)}`, dnssecView(ctx, route)); break;
+      case 'zone-versions': mount(`${t('zone.sec-versions')} - ${plain(route.params.zone)}`, versionsView(ctx, route)); break;
+      case 'zone-version': mount(`${t('versions.one-title', { n: plain(route.params.n) })} - ${plain(route.params.zone)}`, versionView(ctx, route)); break;
+      case 'zone-diff': mount(`${t('zone.sec-versions')} - ${plain(route.params.zone)}`, versionDiffView(ctx, route)); break;
+      case 'zone-template': mount(`${t('zone.sec-template')} - ${plain(route.params.zone)}`, zoneTemplateView(ctx, route)); break;
+      case 'zone-grants': mount(`${t('zone.sec-grants')} - ${plain(route.params.zone)}`, zoneGrantsView(ctx, route)); break;
+      case 'templates': mount(t('tpl.title'), templatesView(ctx, route)); break;
+      case 'template-new': mount(t('tpl.new'), templateNewView(ctx)); break;
+      case 'template': mount(t('tpl.one'), templateView(ctx, route)); break;
+      case 'admin-users': mount(t('admin.users'), principalsView(ctx, route, 'user')); break;
+      case 'admin-groups': mount(t('admin.groups'), principalsView(ctx, route, 'group')); break;
+      case 'admin-policies': mount(t('admin.policies'), policiesView(ctx)); break;
+      case 'admin-grants': mount(t('admin.grants'), grantsView(ctx, route)); break;
+      case 'admin-principal': mount(t('admin.principal'), principalView(ctx, route)); break;
+      case 'audit': mount(t('audit.title'), auditView(ctx, route)); break;
       case 'servers': mount(t('servers.title'), serversView(ctx)); break;
       case 'account': mount(t('account.title'), accountView(ctx)); break;
       case 'totp': mount(t('totp.title'), totpView(ctx)); break;

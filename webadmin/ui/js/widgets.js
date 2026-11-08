@@ -4,6 +4,9 @@
 import { h, fill } from './dom.js';
 import { plain, render } from './format.js';
 
+// is the person a global master (the capabilities of GET /auth/me)?  A hint for what to offer; the service decides
+export const isGlobal = (ctx) => ctx.session.state.me.capabilities?.global === true;
+
 let seq = 0;
 export const uid = (prefix = 'f') => `${prefix}${++seq}`;
 

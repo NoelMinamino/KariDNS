@@ -3,7 +3,7 @@
 
 import { h, link, fill } from '../dom.js';
 import { render } from '../format.js';
-import { field, select, message, problemNodes, confirmButton } from '../widgets.js';
+import { field, select, message, problemNodes, confirmButton, isGlobal } from '../widgets.js';
 import { datasetPath } from '../zonelib.js';
 import { reloadText } from './change.js';
 
@@ -11,11 +11,11 @@ const KINDS = ['NATIVE', 'MASTER', 'SLAVE', 'PRODUCER', 'CONSUMER'];
 const SEARCH = /^[A-Za-z0-9_.-]+$/;
 
 export function zonesView(ctx, { query }) {
-  const { api, i18n, router, session } = ctx;
+  const { api, i18n, router } = ctx;
   const t = i18n.t;
   const body = h('div', { class: 'stack' }, h('p', { role: 'status' }, t('common.loading')));
   const root = h('section', { class: 'card', 'aria-labelledby': 'zones-title' }, h('h1', { id: 'zones-title' }, t('zones.title')), body);
-  const global = session.state.me.capabilities?.global === true;
+  const global = isGlobal(ctx);
   const flash = ctx.flash ?? null;                     // what the screen before left to say ("the zone was deleted")
   ctx.flash = null;
   let alive = true;

@@ -16,7 +16,9 @@
 # an edit with the preview and the commit, the update button (the servers know nothing before it), conflicts made behind the page (both ways out, in English and Japanese),
 # refusals told at the record set, a draft that survives the end of the session, a subdomain master, a new zone from a template / a form / a zone file, import (merge, replace,
 # a file that is not UTF-8) and export (the downloaded file), settings and metadata, a zone deleted after its name is typed again, DNSSEC (keys, DS, the countdown, key
-# requests), zones that are read only, hostile zone data (nothing runs), the keyboard alone.  Without root that part prints SKIP.  The same part runs on PostgreSQL in
+# requests), zones that are read only, hostile zone data (nothing runs), the keyboard alone.  Milestone M4 adds to the same driver the versions of a zone with a rollback
+# (a change made behind the API's back with sqlite3 is marked and is a conflict that needs the question about force), templates (the real karicheck), the administration
+# (users, a group, grants, the TOTP reset and the unlock, policies), what a domain master and a subdomain master see, and the audit log.  Without root that part prints SKIP.  The same part runs on PostgreSQL in
 # run_webadmin_gui_pg_test.sh.  Environment: KARIDNS (./karidns), LOADER (./karidns-dbloader), DAG (./dag).
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -278,7 +280,7 @@ EOF
     ZWEB=""
     grep -q "(a bug)" "$Z/server.log" && bad "row level security refused what the API had allowed" "$(grep '(a bug)' "$Z/server.log" | head -3)" || ok "the service never logged a disagreement with the database"
     grep -Eq '^[^ ]+ error ' "$Z/server.log" && bad "the service logged an error" "$(grep ' error ' "$Z/server.log" | head -3)" || ok "the service logged no error"
-    if grep -Eq 'karidns_session=|\$scrypt\$|kdt_|dora quartz lantern|sam granite pine|delta echo foxtrot|hello from the web interface' "$Z/server.log" || grep -Fq "$ZADMIN_PW" "$Z/server.log"; then bad "the log holds a password, cookie, hash, token or record data"; else ok "the log holds no password, cookie, hash, token or record data"; fi
+    if grep -Eq 'karidns_session=|\$scrypt\$|kdt_|dora quartz lantern|sam granite pine|delta echo foxtrot|a new person 12345|wrong password 1234|hello from the web interface' "$Z/server.log" || grep -Fq "$ZADMIN_PW" "$Z/server.log"; then bad "the log holds a password, cookie, hash, token or record data"; else ok "the log holds no password, cookie, hash, token or record data"; fi
     kari_kill_tree "$ZSRV"; ZSRV=""
     grep -q "ERROR\|assertion\|Assertion" "$Z/karidns.log" && bad "karidns logged an error" "$(grep 'ERROR\|ssertion' "$Z/karidns.log" | head -3)" || ok "karidns logged no error"
     if pgrep -f "$T" > /dev/null 2>&1; then bad "a process of the test is still running" "$(pgrep -fl "$T")"; else ok "no process of the test is left"; fi

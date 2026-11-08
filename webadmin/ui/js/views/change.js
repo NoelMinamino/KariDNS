@@ -81,8 +81,10 @@ export function summaryList(ctx, r, committed) {
 //   place(errors)      puts the errors that belong to a field or an entry there; -> the errors left over (default: all)
 //   onProblem(e, phase) -> true when the screen handled the refusal itself (the conflicts of a draft)
 //   onPreview(r), onCommitted(r)
+//   blockCommit(r)     true = the preview shows something that keeps the commit button off (a rollback with conflicts: the screen offers its own way on)
 //   previewLabel, commitLabel, previewOnly: no commit button
-// -> { node, invalidate(), reset() }.  invalidate(): the thing that was previewed has changed, so the commit waits for a new preview.
+// -> { node, invalidate(), reset(), commit() }.  invalidate(): the thing that was previewed has changed, so the commit waits for a new preview.  commit(): a commit
+// without the button (the screen's own way on, after its own question).
 export function changeFlow(ctx, o) {
   const { i18n, timers } = ctx;
   const t = i18n.t;
@@ -171,7 +173,7 @@ export function changeFlow(ctx, o) {
         err.setNodes(t('flow.denied'), ' ', plain(r.denied?.text ?? ''));
         previewed = false;
       } else if (dry) {
-        previewed = true;
+        previewed = o.blockCommit?.(r) !== true;
         showResult(r, false);
         o.onPreview?.(r);
       } else {
@@ -193,5 +195,5 @@ export function changeFlow(ctx, o) {
     comment.node, reload?.node, err.node,
     h('div', { class: 'actions' }, previewBtn, commitBtn),
     out);
-  return { node, invalidate, reset, dispose() { if (waiter !== null) timers.clearInterval(waiter); waiter = null; } };
+  return { node, invalidate, reset, commit: () => go(false), dispose() { if (waiter !== null) timers.clearInterval(waiter); waiter = null; } };
 }

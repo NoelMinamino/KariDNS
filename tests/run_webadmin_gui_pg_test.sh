@@ -7,6 +7,8 @@
 # karidns_reload_requests, the loader reloads, `dag` sees the change; the page counts the servers that have applied it), conflicts made behind the page, refusals told at the
 # record set, a draft that survives the end of the session, a subdomain master, new zones (template, form, zone file), import and export, settings and metadata, a zone
 # deleted after its name is typed again, DNSSEC (keys, DS, the countdown, key requests), zones that are read only, the servers, hostile zone data, the keyboard alone.
+# Milestone M4 adds the versions with a rollback (a change made with psql as the owner is marked and is a conflict), templates, the administration, what a domain master and
+# a subdomain master see under row level security, and the audit log.
 # Environment: ZONE, KARICHECK, KARIDNS, LOADER, DAG, NODE, FIREFOX and GECKODRIVER (default: from PATH), GUI_MAX_RSS_MIB (the resident size, in MiB, at which the browser is
 # killed; default 4096), KEEP=1 to keep the work directory.  Needs root and an unprivileged PostgreSQL user (KARIDNS_TEST_PG_USER); SKIP (exit 0, with the reason) when
 # PostgreSQL is not reachable (tests/db/pg_lib.sh), the role may not create roles, the password login over 127.0.0.1 is not accepted, node 22.13 or newer,
@@ -157,7 +159,9 @@ WEB=$(cat "$T/web/server.pid" 2>/dev/null)
 if grep -q "karidns-webadmin 0.6.0 started" "$T/server.log"; then ok "the API started (pid $WEB)"; else bad "the API did not start" "$(cat "$T/server.log")"; exit 1; fi
 
 echo "-- the browser (webadmin/test/e2e/gui_zones.mjs)"
-gui_run_driver "zone screens, PostgreSQL" "$T/browser" webadmin/test/e2e/gui_zones.mjs GUI_BASE="http://127.0.0.1:$WPORT" GUI_ADMIN_PASSWORD="$ADMIN_PW" GUI_DNS_PORT="$PORT" GUI_DAG="$DAG" GUI_DB=pg
+# (a change made behind the API's back, as the owner: the history screens mark it)
+printf '#!/bin/sh\nexec psql -X -q -At -v ON_ERROR_STOP=1 "%s" -c "$1"\n' "$PGC" > "$T/sql.sh"; chmod 755 "$T/sql.sh"
+gui_run_driver "zone screens, PostgreSQL" "$T/browser" webadmin/test/e2e/gui_zones.mjs GUI_BASE="http://127.0.0.1:$WPORT" GUI_ADMIN_PASSWORD="$ADMIN_PW" GUI_DNS_PORT="$PORT" GUI_DAG="$DAG" GUI_DB=pg GUI_SQL="$T/sql.sh"
 [ "$GUI_RC" = 3 ] && exit 0
 
 echo "-- PostgreSQL: what the API left in the database"
@@ -179,7 +183,7 @@ kari_kill_tree "$SRV"; SRV=""
 if pgrep -f "$T" > /dev/null 2>&1; then bad "a process of the test is still running" "$(pgrep -fl "$T")"; else ok "no process of the test is left"; fi
 grep -q "(a bug)" "$T/server.log" && bad "row level security refused what the API had allowed" "$(grep '(a bug)' "$T/server.log" | head -3)" || ok "row level security never disagreed with the API"
 grep -Eq '^[^ ]+ error ' "$T/server.log" && bad "the API logged an error" "$(grep ' error ' "$T/server.log" | head -3)" || ok "the API logged no error"
-if grep -Eq 'karidns_session=|\$scrypt\$|kdt_|dora quartz lantern|sam granite pine|delta echo foxtrot|hello from the web interface' "$T/server.log" || grep -Fq "$PW" "$T/server.log" || grep -Fq "$ADMIN_PW" "$T/server.log"; then bad "the log holds a password, cookie, hash, token or record data"; else ok "the log holds no password, cookie, hash, token or record data"; fi
+if grep -Eq 'karidns_session=|\$scrypt\$|kdt_|dora quartz lantern|sam granite pine|delta echo foxtrot|a new person 12345|wrong password 1234|hello from the web interface' "$T/server.log" || grep -Fq "$PW" "$T/server.log" || grep -Fq "$ADMIN_PW" "$T/server.log"; then bad "the log holds a password, cookie, hash, token or record data"; else ok "the log holds no password, cookie, hash, token or record data"; fi
 [ -d "$T/browser" ] && ok "the profile, the downloads and the log of the browser are in the work directory" || bad "no work directory of the browser"
 
 echo

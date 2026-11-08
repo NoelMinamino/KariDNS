@@ -94,7 +94,8 @@ test('every error code of docs/karidns-api.md has a message in both languages (F
 
 // the ids that views build with a template string
 const DYNAMIC = [/^role\./, /^home\.h-/, /^account\.tok-(h-|ro$|rw$|active$|revoked$|expired$)/, /^warn\./, /^api\./,
-  /^diff\.(add|replace|delete|h-)/, /^reason\./, /^rr\.h-/, /^zones\.h-/, /^servers\.h-/, /^settings\.m-h-/, /^dnssec\.(h-|in$|ago$)/, /^create\.(refresh|retry|expire|minimum|ttl)$/];
+  /^diff\.(add|replace|delete|h-)/, /^reason\./, /^rr\.h-/, /^zones\.h-/, /^servers\.h-/, /^settings\.m-h-/, /^dnssec\.(h-|in$|ago$)/, /^create\.(refresh|retry|expire|minimum|ttl)$/,
+  /^vkind\./, /^versions\.h-/, /^rollback\.h-/, /^tpl\.(h-|r-|soa-)/, /^admin\.(h-|m-)/, /^pol\.(h-|bad-)/, /^grants\.h-/, /^audit\.(h-|op-|bad-)/];
 
 test('every message id a view asks for exists, and every message is used', () => {
   const source = js.map(read).join('\n');
