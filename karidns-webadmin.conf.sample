@@ -8,10 +8,10 @@
 # reverse proxy in front (relayd, nginx); or set tls-cert and tls-key and listen on another address.
 listen = 127.0.0.1:8053
 # tls-cert = /usr/local/etc/karidns/webadmin.crt
-# tls-key = /usr/local/etc/karidns/webadmin.key
+# tls-key = /usr/local/etc/karidns/webadmin.key      # the service user's, mode 0600 (--check refuses any other)
 # The origin a browser sees.  An unsafe request that carries a cookie must send exactly this Origin.
 public-origin = https://dns.example.test
-# The addresses of the reverse proxies; only from them is X-Forwarded-For believed (the rate limits and the log use the client's address).
+# The addresses of the reverse proxies (`local` for a proxy on the UNIX socket of `listen`); only from them is X-Forwarded-For believed (the rate limits and the log use the client's address).
 # trusted-proxy = 127.0.0.1, ::1
 
 # --- the database (one of the two) -----------------------------------------------------------------------------------------------------

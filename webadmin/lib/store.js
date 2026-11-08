@@ -343,11 +343,19 @@ export async function listRRsets(tx, schema, domainId, { zone, name, type, visib
     w.push(`(${alts.join(' OR ')})`);
   }
   if (after) w.push(`(k.name > ${q.add(after.name)} OR (k.name = ${q.add(after.name)} AND upper(k.type) > ${q.add(after.type)}))`);
+  // Two statements, not one with the keys as a subquery of a join: PostgreSQL without statistics (a table just filled, before the analyze of autovacuum) planned that join
+  // as a nested loop that scanned the whole zone for each of the 501 keys, and row level security tested every row of every scan: 500,000 tests, 2.9 seconds, for a
+  // zone of 1000 records (measured, M5).  Here the keys come first, then the records of those names (one pass over the zone at the worst), and the types that were not
+  // asked for are left out in JavaScript.  The reads of a PostgreSQL transaction share one snapshot (db.js), so the two statements see the same zone.
+  const keys = await tx.all(`SELECT k.name, upper(k.type) AS type FROM ${Z}records k WHERE ${w.join(' AND ')} GROUP BY k.name, upper(k.type) ORDER BY k.name, upper(k.type) LIMIT ${q.add(limit + 1)}`, q.params);
+  if (keys.length === 0) return [];
+  const q2 = new Q();
   const rows = await tx.all(`SELECT r.id, r.name, upper(r.type) AS type, r.ttl, r.content, r.prio, r.disabled FROM ${Z}records r
-                              WHERE r.domain_id = ${id} AND (r.name, upper(r.type)) IN
-                                    (SELECT k.name, upper(k.type) FROM ${Z}records k WHERE ${w.join(' AND ')} GROUP BY k.name, upper(k.type) ORDER BY k.name, upper(k.type) LIMIT ${q.add(limit + 1)})
-                              ORDER BY r.name, upper(r.type), r.id`, q.params);
-  return rows.map((r) => ({ id: r.id, name: r.name.toLowerCase(), type: r.type, ttl: r.ttl, content: r.content, prio: r.prio, disabled: bool(r.disabled) }));
+                              WHERE r.domain_id = ${q2.add(domainId)} AND ${q2.list(tx, 'r.name', [...new Set(keys.map((r) => r.name))])}
+                              ORDER BY r.name, upper(r.type), r.id`, q2.params);
+  const wanted = new Set(keys.map((r) => `${r.name}\n${r.type}`));
+  return rows.filter((r) => wanted.has(`${r.name}\n${r.type}`))
+    .map((r) => ({ id: r.id, name: r.name.toLowerCase(), type: r.type, ttl: r.ttl, content: r.content, prio: r.prio, disabled: bool(r.disabled) }));
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------- audit, servers

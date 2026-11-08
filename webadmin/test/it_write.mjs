@@ -270,6 +270,33 @@ if (BIG > 0) {
   check('a change set of the big zone takes under 60 seconds', median(bigSet) < 60000 && median(bigSub) < 60000, () => `${median(bigSet)} / ${median(bigSub)} ms`);
   const rd = (await time(() => admin('GET', `${BP}?limit=500`)));
   console.log(`  [COST] ${PG ? 'PostgreSQL' : 'SQLite3'}, GET rrsets of the big zone, one page of 500 RRsets as a global master: ${rd.ms.toFixed(0)} ms`);
+  // paging as a domain master and as a subdomain master (planning A-23: on PostgreSQL row level security tests every row of the page again): the first 20 pages of 500
+  // RRsets of the zone, the median of a page and the time of all 20, against the same as a global master
+  const domBig = await mk('/principals', { kind: 'user', name: 'bigdom', password: 'Granite-Pine-2468' });
+  await mk('/grants', { principal: domBig.principal.id, role: 'domain_master', zone: 'big.test', policy: web });
+  const BD = await login('bigdom', 'Granite-Pine-2468');
+  const walk = async (who, path, pages) => {
+    const ms = [];
+    let cursor = '';
+    let rrsets = 0;
+    for (let i = 0; i < pages; i++) {
+      const t = await time(() => who('GET', `${path}?limit=500${cursor}`));
+      if (t.r.status !== 200) { bad('paging the big zone', t.r.text); break; }
+      ms.push(t.ms);
+      rrsets += t.r.body.rrsets.length;
+      if (!t.r.body.next_cursor) break;
+      cursor = `&cursor=${t.r.body.next_cursor}`;
+    }
+    return { ms, rrsets, total: ms.reduce((a, b) => a + b, 0) };
+  };
+  const label = PG ? 'PostgreSQL' : 'SQLite3';
+  const pagesOf = Math.min(20, Math.ceil(BIG / 500));
+  const gm = await walk(admin, BP, pagesOf);
+  const dm = await walk(BD, BP, pagesOf);
+  const sm = await walk(BS, BP, pagesOf);
+  console.log(`  [COST] ${label}, ${gm.ms.length} pages of 500 RRsets of the big zone (${gm.rrsets} RRsets): global master median ${median(gm.ms).toFixed(0)} ms a page (${gm.total.toFixed(0)} ms in all), domain master median ${median(dm.ms).toFixed(0)} ms a page (${dm.total.toFixed(0)} ms in all, ${(dm.total / gm.total).toFixed(1)} times)`);
+  console.log(`  [COST] ${label}, a subdomain master (the names under sub1.big.test, half of the zone): ${sm.ms.length} pages, ${sm.rrsets} RRsets, median ${median(sm.ms).toFixed(0)} ms a page (${sm.total.toFixed(0)} ms in all)`);
+  check('the domain master reads as many RRsets as the global master', dm.rrsets === gm.rrsets, () => `${dm.rrsets} / ${gm.rrsets}`);
 }
 
 console.log(`\n${pass} passed, ${fails} failed`);

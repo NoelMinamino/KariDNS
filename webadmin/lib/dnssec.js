@@ -24,11 +24,12 @@ export function keyTag(rdata) {
 
 // "256 3 13 <base64>" (the presentation form; the base64 may hold blanks) -> { flags, protocol, algorithm, rdata } or null
 export function parseDnskey(content) {
-  const m = /^\s*(\d{1,5})\s+(\d{1,3})\s+(\d{1,3})\s+([A-Za-z0-9+/=\s]+?)\s*$/.exec(content ?? '');
-  if (!m) return null;
-  const [flags, protocol, algorithm] = [Number(m[1]), Number(m[2]), Number(m[3])];
-  const b64 = m[4].replace(/\s+/g, '');
-  if (flags > 65535 || protocol > 255 || algorithm > 255 || b64.length === 0 || b64.length % 4 === 1) return null;
+  // (split on blanks, no regular expression over the whole text: two runs of `\s` next to each other take time quadratic in the length of a long run of blanks)
+  const words = String(content ?? '').trim().split(/\s+/);
+  if (words.length < 4 || !/^\d{1,5}$/.test(words[0]) || !/^\d{1,3}$/.test(words[1]) || !/^\d{1,3}$/.test(words[2])) return null;
+  const [flags, protocol, algorithm] = [Number(words[0]), Number(words[1]), Number(words[2])];
+  const b64 = words.slice(3).join('');
+  if (!/^[A-Za-z0-9+/=]+$/.test(b64) || flags > 65535 || protocol > 255 || algorithm > 255 || b64.length % 4 === 1) return null;
   const key = Buffer.from(b64, 'base64');
   if (key.length === 0) return null;
   const head = Buffer.alloc(4);

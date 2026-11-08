@@ -57,6 +57,7 @@ test('configuration: PostgreSQL with datasets, quotes, comments', () => {
   assert.equal(c.settings['rate-login'], 3);
   assert.equal(c.settings.log, 'daemon');
   assert.deepEqual(c.settings['trusted-proxy'], ['127.0.0.1', '::1']);
+  assert.deepEqual(parseConfig(`${SQLITE}\ntrusted-proxy = local, 192.0.2.7`).settings['trusted-proxy'], ['local', '192.0.2.7']);
   assert.deepEqual(datasetList(c), [{ name: 'main', schema: 'public', views: ['a', 'b'] }, { name: 'second', schema: 'second_schema', views: [] }]);
   const q = parseConfig(`${SQLITE.replace('listen = 127.0.0.1:8053', 'listen = "[::1]:8053"')}\nkarictl-config = "/x/y z"\n`);
   assert.equal(q.settings.listen, '[::1]:8053');

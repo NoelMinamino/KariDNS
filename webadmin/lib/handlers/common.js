@@ -38,7 +38,14 @@ export function idParam(ctx, name = 'id') {
   return Number(v);
 }
 
-export const idCursor = (text) => (text === undefined ? 0 : decodeCursor(text, (o) => Number.isSafeInteger(o?.i) && o.i >= 0).i);
+// a version number of the path: karidns_zone_versions.version is a 32 bit integer, so a longer number is no version (PostgreSQL would answer it with an error: a 500)
+export function versionParam(ctx, name = 'n') {
+  const v = ctx.params[name];
+  if (!/^\d{1,9}$/.test(v)) throw notFound('no such version');
+  return Number(v);
+}
+
+export const idCursor =(text) => (text === undefined ? 0 : decodeCursor(text, (o) => Number.isSafeInteger(o?.i) && o.i >= 0).i);
 
 // rows fetched with limit + 1 -> { items, next_cursor }
 export function page(rows, limit, key) {

@@ -30,22 +30,24 @@ export const CHANGE_SPEC = {
 };
 
 // Why the text of a record cannot be written to a change file, or null.  The characters the zone-file syntax gives a meaning outside quotes: ';' (a comment), '(' and
-// ')' (a group), '$' first (a directive); an open quote swallows the rest.  Control characters (CR, LF, NUL, TAB too) never.
+// ')' (a group), '$' first (a directive); an open quote swallows the rest.  Control characters (CR, LF, NUL, TAB too) never.  A backslash takes the next character
+// literally, inside quotes or not (the tokenizer of pdns_text_check() in dns_pdns_reader.c, which judges the same text again in karidns-zone: the two must agree, so that
+// `\"` does not open a quote here and close nothing there).
 export function contentProblem(text) {
   if (/[\0-\x1f\x7f]/.test(text)) return 'control characters are not allowed';
   if (text.startsWith('$')) return "the text must not start with '$' (a directive)";
   let quoted = false;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
-    if (quoted) {
-      if (c === '\\') i++;
-      else if (c === '"') quoted = false;
-      continue;
+    if (c === '\\') {
+      if (i === text.length - 1) return 'the text ends with a backslash';
+      i++;
+    } else if (c === '"') {
+      quoted = !quoted;
+    } else if (!quoted) {
+      if (c === ';') return "a ';' outside quotes starts a comment";
+      if (c === '(' || c === ')') return 'parentheses outside quotes are not allowed';
     }
-    if (c === '"') quoted = true;
-    else if (c === ';') return "a ';' outside quotes starts a comment";
-    else if (c === '(' || c === ')') return 'parentheses outside quotes are not allowed';
-    else if (c === '\\' && i === text.length - 1) return 'the text ends with a backslash';
   }
   return quoted ? 'a quote is not closed' : null;
 }

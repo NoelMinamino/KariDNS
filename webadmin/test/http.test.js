@@ -58,6 +58,10 @@ test('the client address: the peer, or what a trusted proxy says', () => {
   assert.equal(clientAddress(req('10.0.0.1', '10.0.0.2'), ['10.0.0.1', '10.0.0.2']), '10.0.0.1');
   assert.equal(clientAddress(req('10.0.0.1'), ['10.0.0.1']), '10.0.0.1');
   assert.equal(clientAddress(req('10.0.0.1', '::ffff:198.51.100.9'), ['10.0.0.1']), '198.51.100.9');
+  // a proxy on the UNIX socket has no address: `local` names it (and nothing that connects over TCP is ever `local`)
+  assert.equal(clientAddress(req(undefined, '198.51.100.9'), ['local']), '198.51.100.9');
+  assert.equal(clientAddress(req(undefined, '198.51.100.9'), ['127.0.0.1']), 'local', 'the socket peer is not trusted unless local is named');
+  assert.equal(clientAddress(req('192.0.2.1', '198.51.100.9'), ['local']), '192.0.2.1');
 });
 
 test('what is not the API, and the wrong method', withDeploy({}, async (d) => {

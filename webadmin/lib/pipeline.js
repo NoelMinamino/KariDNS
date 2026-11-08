@@ -12,7 +12,7 @@
 import crypto from 'node:crypto';
 import { ApiError, conflict, notFound } from './errors.js';
 import { checkArgv, commitArgv, reloadArgv } from './tools.js';
-import { chooseGrant } from './perm.js';
+import { chooseGrant, isGlobal } from './perm.js';
 import { showDiff, diffItems, mapMessages, entryPointer, entryIndex, parseLine } from './changes.js';
 import { absolute, inZone } from './names.js';
 import { clip } from '../../node/lib/run.js';
@@ -119,7 +119,9 @@ export async function reloadState(ctx, { ds, zone, facts, want, views = [], dele
     if (r.spawnError || r.timedOut || r.code !== 0) {
       const why = clip(r.spawnError ?? (r.timedOut ? 'timed out' : (r.stderr || r.stdout || `exit status ${r.code}`)), 200).replace(/\s+/g, ' ');
       app.log.warn(`${ctx.id}: karictl reload ${zone} failed: ${why}`);
-      return `failed: ${why} (the change is in the database; the server serves the old version until it is reloaded)`;
+      // what karictl says can hold paths of the host (the control socket, the program): a global master is told, everybody else is pointed at the log
+      const shown = isGlobal(ctx.auth.grants) ? why : `karictl could not reload the zone (the log of the service has the reason, request ${ctx.id})`;
+      return `failed: ${shown} (the change is in the database; the server serves the old version until it is reloaded)`;
     }
   }
   return 'requested';

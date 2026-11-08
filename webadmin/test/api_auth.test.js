@@ -56,7 +56,9 @@ test('the login: a cookie, the CSRF token, the same answer for every kind of ref
   const withOrigin = await d.request('POST', '/auth/login', { body: { user: 'root', password: 'correct horse battery' }, origin: ORIGIN });
   assert.equal(withOrigin.status, 200);
   assert.ok(d.log.lines.some((l) => /auth: root logged in from 127\.0\.0\.1/.test(l)));
-  assert.ok(d.log.lines.some((l) => /auth: login refused for nobody/.test(l)));
+  assert.ok(d.log.lines.some((l) => /auth: login refused for nopw from 127\.0\.0\.1/.test(l)), 'a known name without a password is named');
+  assert.ok(d.log.lines.some((l) => /auth: login refused for an unknown or disabled user from 127\.0\.0\.1/.test(l)));
+  assert.ok(!d.log.lines.some((l) => /nobody|\boff\b.*refused|refused for off/.test(l)), 'a name that is not one of ours (maybe a password) is not logged');
   assert.ok(!d.log.lines.some((l) => /correct horse|wrong password/.test(l)), 'no password in the log');
 }));
 

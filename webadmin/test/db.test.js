@@ -217,7 +217,7 @@ test('PostgreSQL: a transaction sets the principal and the change set; a read is
   assert.deepEqual(pool.released, [false]);
   pool.log.length = 0;
   await b.tx({}, async () => {});
-  assert.equal(pool.log[0][0], 'BEGIN READ ONLY');
+  assert.equal(pool.log[0][0], 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
   assert.deepEqual(pool.log[1][1], ['', '']);
 });
 

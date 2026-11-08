@@ -115,7 +115,8 @@ export async function zoneExport(ctx) {
   const zone = zoneParam(ctx);
   const gs = zoneGrants(ctx, ds, zone);
   if (gs[0].role === 'subdomain_master') throw forbidden('a subdomain master sees part of the zone only; the export is for the masters of the whole zone');
-  const r = await app.run(app.settings['karidns-zone'], exportArgv(app.settings, ds, zone), { timeoutMs: 120000, maxOutput: 256 << 20 });
+  // (in the pool like every other run of a tool: at most `workers` exports at a time, up to 256 MiB each in memory, the rest wait or get a 503)
+  const r = await app.runTool(app.settings['karidns-zone'], exportArgv(app.settings, ds, zone), { timeoutMs: 120000, maxOutput: 256 << 20 });
   if (r.spawnError || r.timedOut || r.truncated) throw new ApiError(500, 'internal', 'the export failed');
   if (r.code !== 0) {
     if (/no such zone|not found|does not exist|not in the database/i.test(r.stderr)) throw notFound('no such zone');
@@ -205,16 +206,23 @@ export async function serversList(ctx) {
   return { servers, note };
 }
 
+// No login is needed, so a caller must not cost a database connection each: the callers that arrive while a check is running wait for that one.
 export async function health(ctx) {
-  let ok = true;
-  try {
-    await Promise.race([
-      ctx.app.backend.tx({}, (tx) => tx.get('SELECT 1 AS ok')),
-      new Promise((_, reject) => { setTimeout(() => reject(new Error('timeout')), ctx.app.healthTimeoutMs).unref(); }),
-    ]);
-  } catch {
-    ok = false;
-  }
+  const { app } = ctx;
+  app.healthCheck ??= (async () => {
+    try {
+      await Promise.race([
+        app.backend.tx({}, (tx) => tx.get('SELECT 1 AS ok')),
+        new Promise((_, reject) => { setTimeout(() => reject(new Error('timeout')), app.healthTimeoutMs).unref(); }),
+      ]);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      app.healthCheck = null;
+    }
+  })();
+  const ok = await app.healthCheck;
   return reply(ok ? 200 : 503, { status: ok ? 'ok' : 'unavailable', database: ok ? 'ok' : 'error' });
 }
 

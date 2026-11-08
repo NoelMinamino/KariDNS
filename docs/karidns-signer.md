@@ -314,7 +314,7 @@ Two workers give 1.8 times the throughput of one on 4 CPUs. At 14 zones a second
 : The default work directory (tmpfs, `0700`, owned by `karidns-signer`).
 
 `/var/run/karidns_signer/`
-: The pid files of `daemon(8)` (`supervisor.pid` for `service karidns_signer stop`, `child.pid` for `reload`); the directory belongs to the signer's user because `daemon -u` writes them after it has dropped privileges.
+: The pid files of `daemon(8)` (`supervisor.pid` for `service karidns_signer stop`, `child.pid` for `reload`); the directory belongs to the signer's user because the rc script runs `daemon` as that user (rc.subr does it with `su -m`, for `karidns_signer_user`), so `daemon` writes them as that user.
 
 `<sqlite-file>.signer.lock`
 : The lock file of a SQLite3 database (the pid of the signer).

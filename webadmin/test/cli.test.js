@@ -275,6 +275,18 @@ test('inspect: the files, the tools, the schema', async () => {
     cfg.settings['sqlite-file'] = path.join(d.dir, 'zones.sqlite3');
     const wide = await inspect(cfg, { uid: 1000, st: { auth: { mode: 0o100644 } } });
     assert.ok(wide.problems.some((p) => /auth-file .* has mode 0644: it holds the password hashes/.test(p)));
+    // the private key of the built-in TLS is checked like a connection file
+    cfg.settings['tls-cert'] = '/etc/tls.crt';
+    cfg.settings['tls-key'] = '/etc/tls.key';
+    const file = (mode, uid = 1000) => ({ isFile: () => true, mode, uid });
+    const tlsBad = await inspect(cfg, { uid: 1000, st: { auth: { mode: 0o100600 }, tls: file(0o100640) } });
+    assert.ok(tlsBad.problems.some((p) => /^tls-key: \/etc\/tls\.key has mode 0640, it must be 0600 or 0400/.test(p)));
+    const tlsOther = await inspect(cfg, { uid: 1000, st: { auth: { mode: 0o100600 }, tls: file(0o100600, 0) } });
+    assert.ok(tlsOther.problems.some((p) => /^tls-key: .* is not owned by the user running karidns-webadmin/.test(p)));
+    const tlsOk = await inspect(cfg, { uid: 1000, st: { auth: { mode: 0o100600 }, tls: file(0o100600) } });
+    assert.ok(tlsOk.notes.some((n) => /^tls-key \/etc\/tls\.key: fine$/.test(n)));
+    cfg.settings['tls-cert'] = undefined;
+    cfg.settings['tls-key'] = undefined;
     // the key file
     fs.writeFileSync(cfg.settings['totp-key-file'], 'x', { mode: 0o644 });
     fs.chmodSync(cfg.settings['totp-key-file'], 0o644);

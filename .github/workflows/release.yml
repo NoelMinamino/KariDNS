@@ -96,7 +96,7 @@ jobs:
             # sqlite3: libsqlite3 for the SQLite3 driver; postgresql17-client: libpq for the PostgreSQL driver
             # (the same version as the coverage job of ci.yml; build_pkg.sh takes the dependency from the libpq it linked)
             pkg install -y pkgconf libidn2 sqlite3 postgresql17-client node24 npm-node24 bind-tools
-            # (node24, npm-node24 and bind-tools: for the package karidns-signer, built below)
+            # (node24, npm-node24 and bind-tools: for the packages karidns-signer and karidns-webadmin, built below; the latter needs no bind-tools)
             # the binaries must link the base system OpenSSL (see the step above)
             if pkg info -e openssl; then pkg delete -fy openssl; fi
             mkdir -p dist-db
@@ -106,6 +106,7 @@ jobs:
             ./packaging/freebsd/build_pkg.sh --db postgresql "$TAG_VER" ./dist-db
             ./packaging/freebsd/build_pkg.sh --db both "$TAG_VER" ./dist-db
             sh packaging/freebsd/build_signer_pkg.sh "$TAG_VER" ./dist-db
+            sh packaging/freebsd/build_webadmin_pkg.sh "$TAG_VER" ./dist-db
             ls -l dist-db
 
             echo "::group::🧪 [Verification] Test installing the database packages on ${{ matrix.release }}"
@@ -143,6 +144,21 @@ jobs:
             pw usershow karidns-signer > /dev/null
             /usr/local/sbin/karidns-signer --version
             pkg delete -y karidns-signer karidns-sqlite3
+            # karidns-webadmin: needs karidns-zone and karicheck from a database package; the wrapper, the program with its dependency and the code it shares with the
+            # signer, the rc script, the sample configuration and the manuals, and the user
+            pkg add dist-db/karidns-sqlite3-[0-9]*.pkg
+            pkg add dist-db/karidns-webadmin-[0-9]*.pkg
+            pkg info -d karidns-webadmin
+            test -x /usr/local/sbin/karidns-webadmin
+            test -x /usr/local/libexec/karidns-webadmin/webadmin/bin/karidns-webadmin.js
+            test -f /usr/local/libexec/karidns-webadmin/node/lib/run.js
+            test -d /usr/local/libexec/karidns-webadmin/node_modules/pg
+            test -x /usr/local/etc/rc.d/karidns_webadmin
+            test -f /usr/local/etc/karidns/karidns-webadmin.conf.sample
+            test -f /usr/local/share/doc/karidns/karidns-webadmin.md
+            pw usershow karidns-webadmin > /dev/null
+            /usr/local/sbin/karidns-webadmin --version
+            pkg delete -y karidns-webadmin karidns-sqlite3
             echo "::endgroup::"
 
       - name: Upload FreeBSD ${{ matrix.release }} Database Package Artifacts

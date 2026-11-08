@@ -67,6 +67,8 @@ export async function inspect(config, { backend, run, st = {}, uid = process.get
     const p = st.auth ?? (() => { try { return fs.lstatSync(s['auth-file']); } catch { return null; } })();
     if (p && uid !== undefined && (p.mode & 0o077) !== 0) problems.push(`auth-file ${s['auth-file']} has mode ${(p.mode & 0o777).toString(8).padStart(4, '0')}: it holds the password hashes, it must be 0600`);
   }
+  // the private key of the built-in TLS: a secret like a connection file (planning 8.4: the service user's, mode 0600)
+  if (s['tls-key']) checkFile('tls-key', s['tls-key'], st.tls);
   try {
     const st2 = fs.lstatSync(s['totp-key-file']);
     if (uid !== undefined && (st2.mode & 0o077) !== 0) problems.push(`totp-key-file ${s['totp-key-file']} has mode ${(st2.mode & 0o777).toString(8).padStart(4, '0')}: it must be 0600`);

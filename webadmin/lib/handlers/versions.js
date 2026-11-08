@@ -9,11 +9,11 @@ import { rrVisible } from '../perm.js';
 import { renderChangeFile, renderExpectations, parseLine } from '../changes.js';
 import { runChange, checkDiff } from '../pipeline.js';
 import { fold, diffEntries, showEntry, rollbackRRsets, outsideChanges, MAX_FOLD_ROWS } from '../versions.js';
-import { dataset, zoneParam, zoneGrants, idParam, page } from './common.js';
+import { dataset, zoneParam, zoneGrants, versionParam, page } from './common.js';
 import { loadFacts, editable, wantReload } from './write.js';
 
 const EDIT_MS = 120000;
-const VERSION_CURSOR = (o) => Number.isSafeInteger(o?.v) && o.v >= 1;
+const VERSION_CURSOR = (o) => Number.isSafeInteger(o?.v) && o.v >= 1 && o.v <= 2147483647;
 const RR_CURSOR = (o) => typeof o?.n === 'string' && typeof o?.t === 'string' && o.n.length <= 255 && o.t.length <= 32;
 
 // what the principal sees of the history: everything of the zone for the masters of the whole zone; for a subdomain master the names under its suffixes (and the apex
@@ -75,7 +75,7 @@ export async function get(ctx) {
   const ds = dataset(ctx);
   const zone = zoneParam(ctx);
   const gs = zoneGrants(ctx, ds, zone);
-  const n = idParam(ctx, 'n');
+  const n = versionParam(ctx);
   const q = query(ctx.query, { limit: LIMIT, cursor: CURSOR });
   const limit = q.limit ?? 100;
   const cur = q.cursor === undefined ? undefined : decodeCursor(q.cursor, RR_CURSOR);
@@ -120,7 +120,7 @@ export async function diff(ctx) {
   const ds = dataset(ctx);
   const zone = zoneParam(ctx);
   const gs = zoneGrants(ctx, ds, zone);
-  const a = idParam(ctx, 'n');
+  const a = versionParam(ctx);
   const q = query(ctx.query, { to: { type: 'string', min: 1, max: 9, re: /^(?:[0-9]{1,9}|current)$/, reText: 'a version number or current' }, limit: LIMIT, cursor: CURSOR });
   const limit = q.limit ?? 100;
   const to = q.to === undefined || q.to === 'current' ? 'current' : Number(q.to);
@@ -169,7 +169,7 @@ export async function rollback(ctx) {
   const ds = dataset(ctx);
   const zone = zoneParam(ctx);
   const gs = zoneGrants(ctx, ds, zone);
-  const n = idParam(ctx, 'n');
+  const n = versionParam(ctx);
   const body = shape(ctx.body, { comment: { type: 'string', max: 900 }, dry_run: { type: 'bool' }, force: { type: 'bool' }, reload: { type: 'bool' } });
   const facts = await loadFacts(ctx, ds, zone);
   editable(facts);

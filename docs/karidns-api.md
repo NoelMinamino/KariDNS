@@ -55,6 +55,9 @@ Signals: `SIGTERM` and `SIGINT` finish the requests that are running and stop. `
 
 ## SETUP
 
+The packages, the roles, the first administrator, TLS and the day-to-day operation are described step by step in the **[service manual](karidns-webadmin.md)**; this is the short form.
+
+
 PostgreSQL (the owner of the tables does all of this once):
 
 ```text
@@ -69,7 +72,7 @@ karidns-webadmin --check
 
 SQLite3: apply `db/karidns_ext.sqlite3.sql` and `db/karidns_audit.sqlite3.sql` to the zone file, create the auth file (`sqlite3 /var/db/karidns/auth.sqlite3 < db/karidns_auth.sqlite3.sql`, owned by `karidns-webadmin`, **mode 0600**: it holds the password hashes, and `--check` refuses a wider mode), then `--create-admin` and `--check`. The loader must not be able to read the auth file. The zone file needs to be readable and writable by the API user (SQLite3 opens it read-write even to read: WAL mode).
 
-The server listens on `127.0.0.1` or a UNIX socket (mode 0660). TLS is the job of a reverse proxy in front (relayd, nginx): set `trusted-proxy` to its address so that the rate limits and the log see the real client, `public-origin` to the https origin a browser uses, and let the proxy forward `/api/` only. A non-loopback `listen` needs `tls-cert` and `tls-key` (TLS 1.2 or newer); the configuration check refuses plain HTTP anywhere but on loopback.
+The server listens on `127.0.0.1` or a UNIX socket (mode 0660). TLS is the job of a reverse proxy in front (relayd, nginx): set `trusted-proxy` to its address (`local` for a UNIX socket) so that the rate limits and the log see the real client, `public-origin` to the https origin a browser uses, and let the proxy forward `/api/` only. A non-loopback `listen` needs `tls-cert` and `tls-key` (TLS 1.2 or newer); the configuration check refuses plain HTTP anywhere but on loopback.
 
 **Reloading with SQLite3.** A SQLite3 database has no reload requests, so the API asks the server over the control channel, with a key that can do **nothing but `reload-zone`** (it may reload one named zone and read the status; a full-power key must never sit in the web tier):
 
@@ -93,9 +96,9 @@ Lines are `key = value`; `#` starts a comment; a value may be in double quotes; 
 | Key | Default | Meaning |
 |---|---|---|
 | `listen` | (required) | `host:port`, `[ipv6]:port` or the absolute path of a UNIX socket. Plain HTTP only on loopback or a socket |
-| `tls-cert`, `tls-key` | | built-in TLS (both or neither) |
+| `tls-cert`, `tls-key` | | built-in TLS (both or neither; TLS 1.2 or newer). `tls-key` is checked like a connection file: the service user's, mode 0600 or 0400 |
 | `public-origin` | (required) | the origin a browser sees, `https://dns.example.test` (`http://` only for localhost). Unsafe requests with a cookie must carry exactly this `Origin` |
-| `trusted-proxy` | | comma separated addresses of proxies; only from them is `X-Forwarded-For` believed |
+| `trusted-proxy` | | comma separated addresses of proxies; only from them is `X-Forwarded-For` believed (the first address from the right that is not a proxy is the client). `local` names the peer of a UNIX socket, which has no address |
 | `database` | (required) | `pg` or `sqlite3` |
 | `api-conninfo-file`, `check-conninfo-file` | | PostgreSQL: the connection files of the API role and of the check role (both required) |
 | `sqlite-file`, `auth-file` | | SQLite3: the zone file and the auth file (both required) |
@@ -298,7 +301,7 @@ Paths are `/datasets/{ds}/zones/{zone}/...`. Any principal with a grant on the z
 
 **Deleting a zone** takes the rows with it; on SQLite3 the API deletes the child rows itself (the PowerDNS tables have no foreign keys) and the grants of the zone in the auth file; on PostgreSQL the foreign keys and a trigger do. The audit log names the principal and the change set.
 
-**Cost** (pc200, a FreeBSD jail on a shared host; the API on the same host as the database; median of 3 to 5 requests; `tests/run_webadmin_write_test.sh` and `..._write_pg_test.sh` print them): a change set of one RRset costs two runs of `karidns-zone`, each of which reads the zone. SQLite3: a zone of about 15 records, 11 to 13 ms for a dry run and 20 to 25 ms for the check and the commit together; a zone of 20,000 records, 93 to 96 ms and 123 to 125 ms (a subdomain master: the same). PostgreSQL: 30 ms and 63 ms; 20,000 records, 127 to 134 ms and 440 to 674 ms (a subdomain master: 446 ms). A page of 500 RRsets of the big zone: 20 ms (SQLite3), 240 to 283 ms (PostgreSQL, row level security). The reload and the loader's work come on top.
+**Cost** (pc200, a FreeBSD jail on a shared host; the API on the same host as the database; median of 3 to 5 requests; `tests/run_webadmin_write_test.sh` and `..._write_pg_test.sh` print them): a change set of one RRset costs two runs of `karidns-zone`, each of which reads the zone. SQLite3: a zone of about 15 records, 11 to 13 ms for a dry run and 20 to 25 ms for the check and the commit together; a zone of 20,000 records, 93 to 96 ms and 123 to 125 ms (a subdomain master: the same). PostgreSQL: 30 ms and 63 ms; 20,000 records, 127 to 134 ms and 440 to 674 ms (a subdomain master: 446 ms). A page of 500 RRsets of that zone: 20 ms (SQLite3), 240 to 283 ms (PostgreSQL, row level security; with the earlier one-statement page query, which could take seconds on a table without statistics). A zone of 100,000 records: 0.6 s (SQLite3) and 1.9 s (PostgreSQL) a change set, 40 ms and 0.16 to 0.7 s a page; memory and the other sizes are in the **MEASUREMENTS** of the [service manual](karidns-webadmin.md). The reload and the loader's work come on top.
 
 ## VERSIONS AND ROLLBACK
 
@@ -359,7 +362,13 @@ A **template** is a named set of records whose owners are relative to the zone: 
 - **SQLite3**: anyone who can write the auth file or run SQL on the zone file bypasses every rule here. Run the service as its own user, keep the files 0600 (auth file) and the zone file in a group the loader is in, and treat the host as the trust boundary.
 - **PostgreSQL**: `karidns.principal` is a setting any session can make; the API is trusted to set it to the logged-in user. Row level security catches mistakes in the API's statements, not a compromised API process.
 - Expired sessions: the service deletes them at the start and every hour. SQLite3: all of them. PostgreSQL: the API role sees the rows of its own principal only, so a SECURITY DEFINER function does it (`karidns_auth.sweep_expired()`, `EXECUTE` granted to the API role by `db/karidns_api_role.pgsql.sql`; it deletes the sessions whose absolute time is over, of every principal and nothing else); a user's own expired sessions are also deleted at its next login.
-- **Zone texts and change sets are hostile input.** The text of a record is checked for the characters that could end its line or hide the rest of it before it is written to the change file, and `karidns-zone` checks the same again (a mistake in the API is not a hole); a zone text goes to the parser of the server with `$INCLUDE` refused (no file is read) and `$GENERATE` refused by the API (it could make more records than a host has memory for). The tools run with a timeout, without a shell, in a pool of `workers`.
+- **Zone texts and change sets are hostile input.** The text of a record is checked for the characters that could end its line or hide the rest of it before it is written to the change file, and `karidns-zone` checks the same again (a mistake in the API is not a hole); a zone text goes to the parser of the server with `$INCLUDE` refused (no file is read) and `$GENERATE` refused by the API (it could make more records than a host has memory for). The tools run with a timeout, without a shell, in a pool of `workers` (the export too: at most `workers` of them at a time, each up to 256 MiB of output in memory; more wait, 64 at most, then 503).
+- **Limits** (all fixed in the code): headers 16 KiB; body 1 MiB, a zone text 16 MiB; 30 seconds to receive a body (300 for an import); 256 connections; 5 seconds of keep-alive; a change set of 1000 RRsets with 1000 records each; one change set per zone at a time (about 16 may wait, then 503). Rate limits per address and per principal as described under AUTHENTICATION.
+- **The password asked for again** (`POST /auth/password`, switching TOTP off) has the limits of a login: five tries a minute per principal, and every wrong password or wrong code counts towards the lock of the account. Otherwise the holder of a stolen session could guess the password at the speed of the API.
+- **The log does not keep what was typed in the name field of a failed login**: a login for a name that does not exist (or is disabled) is logged as `an unknown or disabled user`, because a password typed in the wrong field would otherwise be in the log.
+- **Errors that leak nothing**: a 500 carries the request id and no text; a failed reload shows karictl's words (which can hold paths of the host) to a global master only, others are pointed at the log; a database error is mapped to a status and a code, never passed on.
+- **Reading is one snapshot**: a PostgreSQL read runs in one `REPEATABLE READ READ ONLY` transaction, and a page of RRsets is read in two statements (the keys, then the records of those names) — one statement with a join planned as a nested loop that tested row level security 500,000 times on a table that has no statistics yet (a zone just imported, before autovacuum's analyze; 2.9 seconds for a zone of 1000 records).
+- **The unauthenticated routes** are `/health` (one database check at a time, however many callers) and `/auth/login` (rate limited before the database is asked). A request with bad credentials is limited per address but costs a database lookup before that; put a rate limit in the proxy.
 
 ## FILES
 
@@ -406,4 +415,4 @@ curl -s -H "Authorization: Bearer $TOKEN" https://dns.example.test/api/v1/datase
 
 ## SEE ALSO
 
-[`karidns-zone(1)`](karidns-zone.md), [`karidns-dbloader(8)`](karidns-dbloader.md) ("Roles and row level security", the WebAdmin tables), [`karidns-signer(8)`](karidns-signer.md), [`karicheck(1)`](karicheck.md), RFC 9457 (problem details), RFC 6238 (TOTP).
+[Service manual](karidns-webadmin.md) (install, roles, TLS, backups, measurements), [`karidns-zone(1)`](karidns-zone.md), [`karidns-dbloader(8)`](karidns-dbloader.md) ("Roles and row level security", the WebAdmin tables), [`karidns-signer(8)`](karidns-signer.md), [`karicheck(1)`](karicheck.md), RFC 9457 (problem details), RFC 6238 (TOTP).

@@ -269,3 +269,27 @@ test('a change set on PostgreSQL asks the commit run for the reload request, and
   assert.equal((await rrsetsPatch(s.ctx)).reload, 'waiting for the signer');
   assert.ok(!s.calls.filter((c) => c[0] !== 'tx').some((c) => c[1].includes('--reload')));
 });
+
+test('a page of RRsets is two statements: the keys, then the records of those names (no self join that row level security would test row by row)', async () => {
+  const tx = fakeTx([
+    [/GROUP BY k\.name/, [{ name: 'a.example.test', type: 'A' }, { name: 'a.example.test', type: 'TXT' }, { name: 'b.example.test', type: 'A' }]],
+    [/FROM "public"\.records r/, [
+      { id: 1, name: 'a.example.test', type: 'A', ttl: 300, content: '192.0.2.1', prio: 0, disabled: false },
+      { id: 2, name: 'a.example.test', type: 'MX', ttl: 300, content: 'mail', prio: 10, disabled: false },
+      { id: 3, name: 'a.example.test', type: 'TXT', ttl: 300, content: '"x"', prio: 0, disabled: false },
+      { id: 4, name: 'b.example.test', type: 'A', ttl: 60, content: '192.0.2.2', prio: 0, disabled: true },
+    ]],
+  ]);
+  const rows = await S.listRRsets(tx, 'public', 7, { zone: 'example.test', visibility: null, limit: 2 });
+  assert.equal(tx.log.length, 2);
+  assert.match(tx.log[0][0], /^SELECT k\.name, upper\(k\.type\) AS type FROM "public"\.records k WHERE k\.domain_id = \$1 .* GROUP BY k\.name, upper\(k\.type\) ORDER BY k\.name, upper\(k\.type\) LIMIT \$\d+$/);
+  assert.equal(tx.log[0][1].at(-1), 3, 'one more than the page');
+  assert.match(tx.log[1][0], /^SELECT r\.id, r\.name, upper\(r\.type\) AS type, .* FROM "public"\.records r WHERE r\.domain_id = \$1 AND r\.name = ANY\(\$2::text\[\]\) ORDER BY r\.name, upper\(r\.type\), r\.id$/);
+  assert.deepEqual(tx.log[1][1], [7, ['a.example.test', 'b.example.test']]);
+  assert.deepEqual(rows.map((r) => `${r.id} ${r.name} ${r.type}`), ['1 a.example.test A', '3 a.example.test TXT', '4 b.example.test A'], 'the MX of the same name was not asked for');
+  assert.equal(rows[2].disabled, true);
+  // nothing found: one statement
+  const none = fakeTx([[/GROUP BY k\.name/, []]]);
+  assert.deepEqual(await S.listRRsets(none, 'public', 7, { zone: 'example.test', visibility: null, limit: 5 }), []);
+  assert.equal(none.log.length, 1);
+});

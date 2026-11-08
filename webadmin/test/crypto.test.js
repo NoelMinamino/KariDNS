@@ -69,6 +69,10 @@ test('passwords: a hash we cannot read or whose cost is out of bounds is "no"', 
     '', '$scrypt$', 'plain', '$unknown$x$y$z', with_(2, 'ln=9,r=8,p=1'), with_(2, 'ln=21,r=8,p=1'), with_(2, 'ln=10,r=17,p=1'), with_(2, 'ln=10,r=8,p=5'), with_(2, 'ln=10,r=0,p=1'),
     with_(2, 'N=10'), with_(4, 'AAAA'), with_(4, ''), `${h}$extra`,
   ]) assert.equal(await verifyPassword(bad, 'pw-1234567890'), false, bad);
+  // a hash that is right but costs more than the API ever makes (r above 8: at ln 20 and r 16 that is 2 GiB of memory) is refused unread
+  const costly = await hashPassword('pw-1234567890', { ln: 10, r: 9 });
+  assert.equal(await verifyPassword(costly, 'pw-1234567890'), false);
+  assert.equal(await verifyPassword(await hashPassword('pw-1234567890', { ln: 10, r: 8 }), 'pw-1234567890'), true);
 });
 
 test('passwords: argon2id strings are verified when node:crypto has argon2', { skip: typeof crypto.argon2 !== 'function' }, async () => {

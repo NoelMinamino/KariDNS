@@ -77,7 +77,8 @@ export async function login(ctx) {
   const good = await verifyPassword(usable ? found.creds.password_hash : await app.dummyHash(), body.password);
   if (!usable || !good) {
     if (usable) await loginFailed(app, found.p, found.creds);
-    else app.log.warn(`auth: login refused for ${clean(body.user)} from ${ctx.ip}`);
+    // (the name is logged when it is one of ours: what else was typed in the field may be a password)
+    else app.log.warn(`auth: login refused for ${found ? clean(found.p.name) : 'an unknown or disabled user'} from ${ctx.ip}`);
     throw invalid();
   }
   const { p, creds, grants } = found;
@@ -131,10 +132,17 @@ export async function me(ctx) {
   };
 }
 
-// a password check for the actions that ask for it again (disable TOTP, change the password)
+// A password check for the actions that ask for it again (disable TOTP, change the password).  It is a way to guess the password for whoever holds the session, so it
+// has the limits of a login: the bucket of logins (5 a minute, a key of its own per principal) and the count of failures that locks the account.
 async function reauth(ctx, password) {
-  const creds = await ctx.db((tx) => S.getCredentials(tx, ctx.auth.principal.id));
-  if (!creds?.password_hash || !(await verifyPassword(creds.password_hash, password))) throw forbidden('the password is wrong', 'wrong-password');
+  const { app, auth } = ctx;
+  const wait = app.buckets.loginUser.take(`reauth:${auth.principal.id}`);
+  if (wait) throw new ApiError(429, 'rate-limited', 'too many password checks', { headers: { 'Retry-After': String(wait) } });
+  const creds = await ctx.db((tx) => S.getCredentials(tx, auth.principal.id));
+  if (!creds?.password_hash || !(await verifyPassword(creds.password_hash, password))) {
+    if (creds?.password_hash) await loginFailed(app, auth.principal, creds);
+    throw forbidden('the password is wrong', 'wrong-password');
+  }
   return creds;
 }
 
@@ -178,9 +186,12 @@ export async function totp(ctx) {
   if (!creds.totp_enabled) throw conflict('TOTP is not on', 'totp-disabled');
   if (needsTotp(app.settings, auth.grants)) throw forbidden('TOTP is required for this user by the configuration (require-totp)', 'totp-required-by-policy');
   if (!body.password || !body.code) throw new ApiError(400, 'bad-request', 'password and code are required');
-  await reauth(ctx, body.password);
+  const again = await reauth(ctx, body.password);
   const sec = JSON.parse(unwrapSecret(app.key, id, creds.totp_secret) ?? 'null');
-  if (!sec || totpVerify(Buffer.from(sec.s, 'hex'), body.code, app.now() / 1000, { lastStep: sec.u }) === null) throw forbidden('the code is wrong', 'wrong-code');
+  if (!sec || totpVerify(Buffer.from(sec.s, 'hex'), body.code, app.now() / 1000, { lastStep: sec.u }) === null) {
+    await loginFailed(app, auth.principal, again);
+    throw forbidden('the code is wrong', 'wrong-code');
+  }
   await ctx.db(async (tx) => {
     await S.setTotp(tx, id, null, false);
     await S.deleteSessionsOf(tx, id, auth.idHash);

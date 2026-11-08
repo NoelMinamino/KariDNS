@@ -35,7 +35,7 @@ load_rc_config "${name}"
 : ${karidns_signer_flags:=""}
 
 signer_program="${karidns_signer_wrapper:-/usr/local/sbin/karidns-signer}"      # (karidns_signer_wrapper is for tests with another build; not karidns_signer_program, which rc.subr takes for `command`)
-rundir="/var/run/${name}"                          # daemon(8) writes both pid files after it has dropped privileges (-u): a directory of the signer's user
+rundir="/var/run/${name}"                          # daemon(8) writes both pid files as the signer's user (rc.subr runs the command as ${name}_user with su(1)): a directory of that user
 pidfile="${rundir}/supervisor.pid"                  # daemon(8)'s supervisor: stop sends SIGTERM to it, it passes the signal on
 childpidfile="${rundir}/child.pid"                  # the daemon itself: reload sends SIGHUP to it
 # -r: start it again if it dies (after 10 seconds); -f: standard input, output and error to /dev/null (the daemon logs to syslog, see `log` in the configuration file)
@@ -43,7 +43,7 @@ command="/usr/sbin/daemon"
 : ${karidns_signer_cpuset:=""}
 signer_command="${signer_program}"
 [ -n "${karidns_signer_cpuset}" ] && signer_command="/usr/bin/cpuset -l ${karidns_signer_cpuset} ${signer_program}"      # cpuset(1) execs the program: the pid is the same
-command_args="-r -R 10 -f -P ${pidfile} -p ${childpidfile} -u ${karidns_signer_user} -t karidns-signer -- ${signer_command} -c ${karidns_signer_config} ${karidns_signer_flags}"
+command_args="-r -R 10 -f -P ${pidfile} -p ${childpidfile} -t karidns-signer -- ${signer_command} -c ${karidns_signer_config} ${karidns_signer_flags}"
 
 required_files="${karidns_signer_config}"
 extra_commands="reload configtest"

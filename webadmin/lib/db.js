@@ -178,7 +178,8 @@ export class PgBackend {
     const c = await this.pool.connect();
     let broken = false;
     try {
-      await c.query(write ? 'BEGIN' : 'BEGIN READ ONLY');
+      // a read is one snapshot for all its statements (a page of RRsets is two statements; a read-only transaction at this level cannot fail with a serialization error)
+      await c.query(write ? 'BEGIN' : 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
       await c.query("SELECT set_config('karidns.principal', $1, true), set_config('karidns.change_set', $2, true), set_config('statement_timeout', '30000', true)",
         [principal === null ? '' : String(principal), changeSet ?? '']);
       const r = await fn(new PgTx(c));

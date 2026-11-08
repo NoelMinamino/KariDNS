@@ -20,9 +20,10 @@ const parseOrigin = (v) => {
   return v;
 };
 
+// IP addresses, and `local`: the peer of a UNIX socket (it has no address; a proxy that connects to `listen = /path/to/socket` is trusted by naming it)
 const parseAddresses = (v) => {
   const out = v.split(',').map((s) => s.trim()).filter(Boolean);
-  for (const a of out) if (!/^[0-9a-fA-F:.]+$/.test(a)) throw new Error(`expected a list of IP addresses, got ${JSON.stringify(a)}`);
+  for (const a of out) if (a !== 'local' && !/^[0-9a-fA-F:.]+$/.test(a)) throw new Error(`expected a list of IP addresses (or local, for a UNIX socket), got ${JSON.stringify(a)}`);
   return out;
 };
 

@@ -46,7 +46,8 @@ export class Semaphore {
 
 const hashing = new Semaphore(2, 64);
 
-const SCRYPT_BOUNDS = { ln: [10, 20], r: [1, 16], p: [1, 4] };
+// (128 * 2^ln * r octets of memory: at most 1 GiB, the cost the configuration allows at its highest, scrypt-ln = 20 with r = 8; r = 16 would be 2 GiB)
+const SCRYPT_BOUNDS = { ln: [10, 20], r: [1, 8], p: [1, 4] };
 const b64 = (buf) => buf.toString('base64').replace(/=+$/, '');
 const unb64 = (s) => Buffer.from(s, 'base64');
 

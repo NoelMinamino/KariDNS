@@ -76,7 +76,12 @@ test('the text of a record: nothing that could end its line or hide the rest of 
     ['$INCLUDE /etc/passwd', /directive/], ['$ORIGIN x.', /directive/],
     ['1.2.3.4 ; comment', /comment/], ['(1.2.3.4', /parentheses/], ['1.2.3.4)', /parentheses/],
     ['"open quote', /not closed/], ['"a" "b', /not closed/], ['trailing\\', /backslash/], ['"x\\"', /not closed/],
-  ]) assert.match(contentProblem(text), re, JSON.stringify(text));
+    // a backslash takes the next character literally outside quotes too, as pdns_text_check() reads it in karidns-zone: `\"` opens no quote, so the `;` is a comment
+    ['a\\" ; b', /comment/], ['a\\"', null], ['a\\(b', null], ['a\\;b', null], ['x\\\\" ; y', /not closed/],
+  ]) {
+    if (re === null) assert.equal(contentProblem(text), null, JSON.stringify(text));
+    else assert.match(contentProblem(text), re, JSON.stringify(text));
+  }
   // and through a request: the pointer names the record
   bad(() => parseChangeSet({ rrsets: [rr('a.example.test', 'TXT', 1, '"ok"', '"x" ; y')] }, 'example.test'), '/rrsets/0/records/1/content');
   bad(() => parseChangeSet({ rrsets: [rr('a.example.test', 'TXT', 1, 'a\nrr evil.example.test. 1 A 1.2.3.4')] }, 'example.test'), '/rrsets/0/records/0/content');
@@ -249,6 +254,11 @@ test('DNSKEY: the key tag and the DS digest (RFC 4034 section 5.4 and appendix B
   // the base64 may be split by blanks (a zone file's way)
   assert.deepEqual(parseDnskey(content.replace('AQOeiiR0GOMYkDshWoSKz9Xz', 'AQOeiiR0GOMYkDshWoSKz9Xz ')).rdata, k.rdata);
   for (const badKey of ['', 'x', '256 3 5', '256 3 5 !!!', '99999 3 5 AAAA', '256 300 5 AAAA', '256 3 300 AAAA', '256 3 5 A', null]) assert.equal(parseDnskey(badKey), null, String(badKey));
+  // a long run of blanks is read in linear time (a regular expression with two runs of \s next to each other takes seconds on this)
+  const t0 = Date.now();
+  assert.equal(parseDnskey(`256 3 5 ${' '.repeat(60000)}!`), null);
+  assert.equal(parseDnskey(`${' '.repeat(60000)}x 3 5 AAAA`), null);
+  assert.ok(Date.now() - t0 < 1000, 'took long');
   // the view: a key with the SEP bit gets DS records (SHA-256 and SHA-384), the others do not; a record that is no key is left out
   const v = dnskeyView('dskey.example.com', [{ ttl: 300, content: '257 3 5 ' + content.split(' ')[3] }, { ttl: 300, content }, { ttl: 1, content: 'garbage' }, { ttl: 300, content: '257 3 1 AQOeiiR0GOMYkDshWoSKz9Xz' }]);
   assert.equal(v.keys.length, 3);

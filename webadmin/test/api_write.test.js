@@ -338,13 +338,20 @@ test('a signer zone: the change is made, the reload waits for the signer; SQLite
 
 test('karictl that fails: the change is in the database, the answer says the reload did not happen', async () => {
   for (const [result, re] of [[exit(1, { stderr: 'ERROR command not allowed\n' }), /ERROR command not allowed/], [exit(null, { spawnError: 'ENOENT' }), /ENOENT/], [exit(null, { timedOut: true }), /timed out/], [exit(1), /exit status 1/]]) {
-    await withTools((c) => (c.file === KCTL ? result : standard()(c)), async (d, { dom }) => {
-      const r = await dom('PATCH', PATCH, { body: www({ reload: true }) });
-      is(r, 200);
-      assert.match(r.body.reload, re);
-      assert.match(r.body.reload, /^failed: .*the change is in the database/);
-      assert.ok(d.log.lines.some((l) => /^warn .* karictl reload example\.test failed/.test(l)));
-    }, { 'karictl-config': CTL_CONF })();
+    // a global master is told why; anybody else is pointed at the log (karictl's words can hold paths of the host)
+    for (const who of ['root', 'dom']) {
+      await withTools((c) => (c.file === KCTL ? result : standard()(c)), async (d, cast) => {
+        const r = await cast[who]('PATCH', PATCH, { body: www({ reload: true }) });
+        is(r, 200);
+        if (who === 'root') assert.match(r.body.reload, re);
+        else {
+          assert.doesNotMatch(r.body.reload, re);
+          assert.match(r.body.reload, /^failed: karictl could not reload the zone \(the log of the service has the reason, request [0-9a-f]{16}\)/);
+        }
+        assert.match(r.body.reload, /^failed: .*the change is in the database/);
+        assert.ok(d.log.lines.some((l) => /^warn .* karictl reload example\.test failed/.test(l)));
+      }, { 'karictl-config': CTL_CONF })();
+    }
   }
   // no restricted key configured: a request for a reload is refused before anything is written
   await withTools(standard(), async (d, { dom }, t) => {
@@ -551,9 +558,12 @@ test('the update button: a zone, or every zone', withTools(standard(), async (d,
   is(await root('POST', '/datasets/main/zones/ghost.test/reload'), 404, 'not-found');
   // karictl fails: an error, with the reason
   d.app.run = makeRun(() => exit(1, { stderr: 'ERROR no such zone\n' })).run;
-  const failed = await dom('POST', url);
+  const failed = await root('POST', url);
   is(failed, 503, 'reload-failed');
   assert.match(failed.body.detail, /^failed: ERROR no such zone/);
+  const hidden = await dom('POST', url);
+  is(hidden, 503, 'reload-failed');
+  assert.doesNotMatch(hidden.body.detail, /no such zone/);
   // SQLite3 reloads one named zone, never all
   is(await root('POST', '/datasets/main/reload'), 409, 'unsupported');
   is(await dom('POST', '/datasets/main/reload'), 403, 'forbidden');
