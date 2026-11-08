@@ -1279,7 +1279,7 @@ static bool build_masters(pdns_zone_t *z, sbuf_t *sb) {
 static bool build_settings(pdns_zone_t *z) {
     strlist_t axfr_from = {0}, axfr_keys = {0}, notify = {0}, upd_from = {0}, upd_keys = {0}, trusted = {0};
     bool have_axfr = false, have_upd = false, have_notify = false, have_nsec3param = false, have_presigned = false,
-         have_format = false, have_profile = false, have_tsig = false;
+         have_format = false, have_profile = false, have_tsig = false, upd_from_rows = false, upd_keys_rows = false;
     char tsig_key[256] = "";
     char opt_val[N_OPTIONS][34];
     bool opt_set[N_OPTIONS];
@@ -1329,7 +1329,7 @@ static bool build_settings(pdns_zone_t *z) {
             else zwarn(z, false, 0, "X-KARIDNS-PROFILE value is not a valid profile name, ignored");
         } else if (strcasecmp(kind, "ALLOW-AXFR-FROM") == 0 || strcasecmp(kind, "ALLOW-DNSUPDATE-FROM") == 0) {
             bool upd = strcasecmp(kind, "ALLOW-DNSUPDATE-FROM") == 0;
-            if (upd) have_upd = true;
+            if (upd) have_upd = upd_from_rows = true;
             else have_axfr = true;
             strlist_t *l = upd ? &upd_from : &axfr_from;
             if (!acl_addr_ok(content)) {
@@ -1342,7 +1342,7 @@ static bool build_settings(pdns_zone_t *z) {
             }
         } else if (strcasecmp(kind, "TSIG-ALLOW-AXFR") == 0 || strcasecmp(kind, "TSIG-ALLOW-DNSUPDATE") == 0) {
             bool upd = strcasecmp(kind, "TSIG-ALLOW-DNSUPDATE") == 0;
-            if (upd) have_upd = true;
+            if (upd) have_upd = upd_keys_rows = true;
             else have_axfr = true;
             strlist_t *l = upd ? &upd_keys : &axfr_keys;
             if (!key_name_ok(content)) {
@@ -1444,8 +1444,15 @@ static bool build_settings(pdns_zone_t *z) {
             sb_add(&sb, " }; ");
         }
         if (have_upd) {
+            /* review pdns_reader [1]: a kind that has rows but no usable entry (each was warned about above) allows
+             * nobody: dropping it would leave the other kind alone, which allows more than was written (any address
+             * with the key, or any key from the address) */
+            bool upd_none = (upd_from_rows && !upd_from.n) || (upd_keys_rows && !upd_keys.n);
+            if (upd_none && (upd_from.n || upd_keys.n))
+                zwarn(z, false, 0, "%s has no valid entry: dynamic updates are refused",
+                      upd_from_rows && !upd_from.n ? "ALLOW-DNSUPDATE-FROM" : "TSIG-ALLOW-DNSUPDATE");
             sb_add(&sb, "allow-update {");
-            if (!upd_from.n && !upd_keys.n) {
+            if (upd_none || (!upd_from.n && !upd_keys.n)) {
                 sb_add(&sb, " none;");
             } else {
                 for (size_t i = 0; i < upd_from.n; i++) { sb_add(&sb, " "); sb_add(&sb, upd_from.v[i]); sb_add(&sb, ";"); }
@@ -1453,7 +1460,7 @@ static bool build_settings(pdns_zone_t *z) {
             }
             sb_add(&sb, " }; ");
             /* D14 (B7a): PowerDNS needs the address AND the TSIG key for an update; allow-update alone would take either */
-            if (upd_from.n && upd_keys.n) sb_add(&sb, "update-acl-match all; ");
+            if (!upd_none && upd_from.n && upd_keys.n) sb_add(&sb, "update-acl-match all; ");
         }
         if (trusted.n) {
             sb_add(&sb, "ecs-trusted-resolvers {");

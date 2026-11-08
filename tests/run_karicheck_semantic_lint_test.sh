@@ -71,6 +71,19 @@ else
     FAILED=1
 fi
 
+# Test 3b: two NS records of one delegation and two records below it: one warning per (NS record, record), in the order
+# NS record, then record (the lookups through the hash index sort what they find, lint_occ_cmp)
+echo "[+] Test 3b: Delegation occlusion, several NS records and records..."
+OUT3B=$(./karicheck zone example.test. tests/zones/test_lint_occlusion_multi.zone 2>&1 || true)
+GOT3B=$(echo "$OUT3B" | sed -n "s/.*Record '\([^']*\)' is occluded by delegation at 'sub.example.test.'.*/\1/p" | tr '\n' '|')
+if [ "$GOT3B" = "deep.sub.example.test. TXT|a.sub.example.test. A|deep.sub.example.test. TXT|a.sub.example.test. A|" ]; then
+    echo "  PASS: four occlusion warnings in NS / record order."
+else
+    echo "  FAIL: occlusion warnings '$GOT3B':"
+    echo "$OUT3B"
+    FAILED=1
+fi
+
 # Test 3: Delegation Occlusion
 echo "[+] Test 3: Delegation occlusion check..."
 OUT3=$(./karicheck zone example.com. tests/zones/test_lint_occlusion.zone 2>&1 || true)

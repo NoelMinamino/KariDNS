@@ -3282,8 +3282,74 @@ static void test_xfr_request_shape(void) {
     CHECK_STR(xfr_shape_text((xfr_shape_t)99), "malformed request");
 }
 
+/* serialize one record (owner "example.", class IN, TTL 60); the RDATA from fields; returns rc; rdata and rdlen point into buf */
+static int ser_rdata(uint16_t type, const char *const *fields, int n, uint8_t *buf, size_t cap, const uint8_t **rdata,
+                     size_t *rdlen) {
+    dns_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    DNS_RECORD_BIND_RDATA(rec);
+    rec.name = (char *)"example.";
+    rec.type_code = type;
+    rec.class_val = 1;
+    rec.ttl_value = 60;
+    for (int i = 0; i < n; i++) rec.rdata[i] = (char *)fields[i];
+    rec.rdata_count = n;
+    uint16_t off = 0;
+    int rc = serialize_dns_record(buf, cap, &off, &rec, NULL, NULL, 0xFFFFFFFFu);
+    if (rc == 0) {
+        *rdata = buf + 9 + 10;   /* "example." is 9 octets, then type class TTL RDLENGTH */
+        *rdlen = (size_t)buf[17] << 8 | buf[18];
+    }
+    return rc;
+}
+
+/* review utils [3]: the hex of DS / SSHFP / TLSA (decode_concat_hex_rdata) is an even number of hex digits, else the
+ * record is refused (it used to skip other characters and drop an odd digit).  Review wire [7]: RRSIG times are
+ * YYYYMMDDHHmmSS or seconds since the epoch (RFC 4034 3.2); anything else is refused (it used to become 0). */
+static void test_strict_hex_and_rrsig_times(void) {
+    printf("[TEST] Wire: strict hex of DS / SSHFP / TLSA, RRSIG times in both forms (RFC 4034 3.2)...\n");
+    uint8_t buf[512];
+    const uint8_t *rd;
+    size_t rl;
+    const char *ds_ok[] = { "12345", "13", "2", "0123456789ABCDEF", "abcd" };
+    CHECK(ser_rdata(43, ds_ok, 5, buf, sizeof(buf), &rd, &rl) == 0 && rl == 4 + 10 && rd[4] == 0x01 && rd[13] == 0xCD);
+    const char *ds_odd[] = { "12345", "13", "2", "0123456789ABCDE" };
+    CHECK(ser_rdata(43, ds_odd, 4, buf, sizeof(buf), &rd, &rl) != 0);
+    const char *ds_bad[] = { "12345", "13", "2", "0123456789ABCDEG" };
+    CHECK(ser_rdata(43, ds_bad, 4, buf, sizeof(buf), &rd, &rl) != 0);
+    const char *ds_odd_split[] = { "12345", "13", "2", "012", "3" };   /* even in all: fine */
+    CHECK(ser_rdata(43, ds_odd_split, 5, buf, sizeof(buf), &rd, &rl) == 0 && rl == 4 + 2);
+    const char *sshfp_bad[] = { "1", "1", "12:34" };
+    CHECK(ser_rdata(44, sshfp_bad, 3, buf, sizeof(buf), &rd, &rl) != 0);
+    const char *tlsa_ok[] = { "3", "1", "1", "00ff" };
+    CHECK(ser_rdata(52, tlsa_ok, 4, buf, sizeof(buf), &rd, &rl) == 0 && rl == 5 && rd[4] == 0xFF);
+    const char *tlsa_bad[] = { "3", "1", "1", "00f" };
+    CHECK(ser_rdata(52, tlsa_bad, 4, buf, sizeof(buf), &rd, &rl) != 0);
+
+    /* RRSIG: expiration 2030-01-01 00:00:00 = 1893456000, inception 2020-01-01 00:00:00 = 1577836800 */
+    const char *sig_date[] = { "A", "13", "2", "300", "20300101000000", "20200101000000", "12345", "example.", "AAAA" };
+    const char *sig_secs[] = { "A", "13", "2", "300", "1893456000", "1577836800", "12345", "example.", "AAAA" };
+    uint8_t b1[512], b2[512];
+    const uint8_t *r1, *r2;
+    size_t l1, l2;
+    CHECK(ser_rdata(46, sig_date, 9, b1, sizeof(b1), &r1, &l1) == 0);
+    CHECK(ser_rdata(46, sig_secs, 9, b2, sizeof(b2), &r2, &l2) == 0);
+    CHECK(l1 == l2 && memcmp(r1, r2, l1) == 0);
+    CHECK(r1[8] == 0x70 && r1[9] == 0xDB && r1[10] == 0xD8 && r1[11] == 0x80);   /* 1893456000 = 0x70DBD880 */
+    const char *bad_times[] = { "2030010100000", "203001010000000", "20301301000000", "20300230000000", "20300101240000",
+                                "4294967296", "-1", "1e9", "" };
+    for (size_t i = 0; i < sizeof(bad_times) / sizeof(bad_times[0]); i++) {
+        const char *f[] = { "A", "13", "2", "300", bad_times[i], "20200101000000", "12345", "example.", "AAAA" };
+        if (ser_rdata(46, f, 9, b1, sizeof(b1), &r1, &l1) == 0) printf("  accepted bad time '%s'\n", bad_times[i]);
+        CHECK(ser_rdata(46, f, 9, b1, sizeof(b1), &r1, &l1) != 0);
+    }
+    const char *leap[] = { "A", "13", "2", "300", "20280229000000", "4294967295", "12345", "example.", "AAAA" };
+    CHECK(ser_rdata(46, leap, 9, b1, sizeof(b1), &r1, &l1) == 0 && r1[12] == 0xFF && r1[15] == 0xFF);
+}
+
 int main(void) {
     printf("=== Starting Wire / Utility Helper Tests ===\n");
+    test_strict_hex_and_rrsig_times();
     test_xfr_request_shape();
     test_wire_compression_and_rdata_boundaries();
     test_deep_pointer_chains_and_cycles();
