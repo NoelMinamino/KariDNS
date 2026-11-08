@@ -40,10 +40,10 @@ export function checkbox({ label, checked = false, name }) {
   return { node: h('div', { class: 'check' }, input, h('label', { for: id }, label)), input };
 }
 
-// options: [{ value, label }]
+// options: [{ value, label, lang }]  (lang: the language of the label when it is not the page's, WCAG 3.1.2: the name of a language in that language)
 export function select({ label, options, value, name }) {
   const id = uid('sel');
-  const input = h('select', { id, name }, options.map((o) => h('option', { value: o.value, selected: o.value === value }, o.label)));
+  const input = h('select', { id, name }, options.map((o) => h('option', { value: o.value, selected: o.value === value, lang: o.lang }, o.label)));
   input.value = value;
   return { node: h('div', { class: 'field' }, h('label', { for: id }, label), input), input };
 }

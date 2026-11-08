@@ -15,6 +15,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { startBrowser, NAMED_KEYS } from './wd.mjs';
+import { pageProblems, overflowProblems } from './a11y.mjs';
 import { dsDigest, keyTag, parseDnskey } from '../../lib/dnssec.js';
 import { hotp, totpStep, base32Decode } from '../../lib/crypto.js';
 import ja from '../../ui/i18n/ja.js';
@@ -141,23 +142,7 @@ const waitErr = (re) => b.waitFor(async () => { const t = (await visibleErrors()
 const draftText = () => b.exec(() => (document.querySelector('section.draft') || { innerText: '' }).innerText);
 const waitDraft = (re) => b.waitFor(async () => { const t = await draftText(); return re.test(t) ? t : null; }, { message: `the draft panel to match ${re}` });
 
-const a11y = () => b.exec(() => {
-  const bad = [];
-  for (const el of document.querySelectorAll('input, select, textarea')) {
-    if (!(el.labels && el.labels.length) && !el.getAttribute('aria-label') && !el.getAttribute('aria-labelledby')) bad.push(`input ${el.name || el.id} has no label`);
-  }
-  for (const el of document.querySelectorAll('button, a[href]')) {
-    if (!(el.textContent || '').trim() && !el.getAttribute('aria-label')) bad.push('a button or link without a name');
-  }
-  if (document.querySelectorAll('h1').length !== 1) bad.push(`${document.querySelectorAll('h1').length} h1`);
-  if (!document.documentElement.lang) bad.push('no lang');
-  if (!document.querySelector('main')) bad.push('no main');
-  for (const t of document.querySelectorAll('table')) if (!t.querySelector('th')) bad.push('a table without header cells');
-  const ids = [...document.querySelectorAll('[id]')].map((e) => e.id);
-  for (const id of new Set(ids.filter((x, i) => ids.indexOf(x) !== i))) bad.push(`duplicate id ${id}`);
-  for (const el of document.querySelectorAll('[aria-describedby]')) for (const id of el.getAttribute('aria-describedby').split(' ')) if (!document.getElementById(id)) bad.push(`aria-describedby ${id} does not exist`);
-  return bad;
-});
+const a11y = () => b.exec(pageProblems);                 // (a11y.mjs, shared with gui.mjs)
 const labelsOk = async (screen) => eq(await a11y(), [], `${screen}: names and landmarks`);
 const noTrouble = async () => {
   must(!(await b.exists('.csp-violation')), 'the policy of the page was violated');
@@ -1035,6 +1020,82 @@ try {
     must(!(await b.exists('table.audit img, table.audit script')), 'an element came from the audit log');
     await noTrouble();
     must((await b.exec(() => document.querySelector('table.audit pre').parentNode.querySelectorAll('div').length)) >= 1, 'no lines');
+  });
+
+  // ---- milestone M6: what M4 left to the fake DOM, in a real browser
+  console.log('-- a conflict found at the commit, and a page of a list (M6)');
+  await scenario('a rollback is previewed with no conflict, a change is made behind the page, and the commit is a 409 version-conflict: the conflict is listed, force is asked first', async () => {
+    const made = await admin('POST', '/datasets/main/zones', { name: 'race.test', soa: { mname: 'ns1.nsprovider.test', rname: 'hostmaster.nsprovider.test' }, nameservers: ['ns1.nsprovider.test.'], comment: 'the first' });
+    must(made.status === 201, `create race.test: ${made.status} ${made.text}`);
+    for (const [ip, comment] of [['192.0.2.1', 'one'], ['192.0.2.2', 'two']]) {
+      const r = await admin('PATCH', '/datasets/main/zones/race.test/rrsets', { rrsets: [{ name: 'www.race.test.', type: 'A', changetype: 'REPLACE', ttl: 300, records: [{ content: ip }] }], comment });
+      must(r.status === 200, `patch race.test: ${r.status} ${r.text}`);
+    }
+    await open('#/zones/main/race.test./versions/2', /^race\.test\./);
+    await b.waitCss('#rb-title');
+    const panel = 'section[aria-labelledby=rb-title]';
+    await click('Preview the rollback', panel);
+    await b.waitFor(async () => b.exec(() => { const x = [...document.querySelectorAll('section[aria-labelledby=rb-title] button')].find((e) => e.textContent.trim() === 'Roll back'); return x && !x.disabled; }), { message: 'a commit without a conflict' });
+    must(!(await b.exists('section.conflict')), 'a conflict before anything was changed behind the page');
+    // the change made behind the back of the page and of the versions
+    sql("UPDATE records SET content = '192.0.2.77' WHERE name = 'www.race.test' AND type = 'A'");
+    await click('Roll back', panel);
+    await b.waitCss('section.conflict');
+    eq(await b.exec(() => [...document.querySelectorAll('section.conflict tbody tr')].map((r) => [...r.children].map((c) => c.innerText.trim()))), [['www', 'A', '300 192.0.2.2', '300 192.0.2.77']], 'the conflict found at the commit');
+    must(!(await bodyText()).includes('The change was saved.'), 'saved although the commit was refused');
+    must(await b.exec(() => [...document.querySelectorAll('section[aria-labelledby=rb-title] button')].find((x) => x.textContent.trim() === 'Roll back').disabled), 'a plain commit is possible with a conflict');
+    await labelsOk('the rollback with a conflict');
+    await click('Roll back anyway and overwrite these', 'section.conflict');
+    must(/Overwrite these 1 record sets\?/.test(await b.exec(() => document.querySelector('section.conflict').innerText)), 'the question');
+    await click('Yes', 'section.conflict');
+    await b.waitText('main', /The change was saved\./);
+    await zonePage('race.test.');
+    await rowIs('www', 'A', '192.0.2.1', 'www as it was at version 2');
+    await noTrouble();
+  });
+
+  await scenario('a list has a next page: the link carries the cursor in the address, the second page has the rest, "First page" comes back', async () => {
+    const lines = ['$ORIGIN page.test.', '$TTL 300', '@ IN SOA ns1 hostmaster 1 7200 3600 1209600 300', '@ IN NS ns1', 'ns1 IN A 192.0.2.1'];
+    for (let i = 1; i <= 60; i++) lines.push(`h${String(i).padStart(2, '0')} IN A 192.0.2.${(i % 200) + 10}`);
+    const made = await admin('POST', '/datasets/main/zones', { name: 'page.test', zone_text: `${lines.join('\n')}\n`, comment: 'sixty hosts' });
+    must(made.status === 201, `create page.test: ${made.status} ${made.text}`);
+    await open('#/zones/main/page.test.?n=25', /^page\.test\./);
+    const names = () => b.exec(() => [...document.querySelectorAll('table.rrsets tbody tr')].map((r) => (r.querySelector('th') || r.children[0]).innerText.trim()));
+    await b.waitFor(async () => (await names()).length === 25, { message: 'the first page of 25' });
+    const first = await names();
+    eq(first[0], 'h01', 'the first page starts at the first name');
+    must(!(await b.exec(() => [...document.querySelectorAll('main a')].some((a) => a.textContent.trim() === 'First page'))), 'a link back to the first page on the first page');
+    await click('Next page');
+    await b.waitFor(async () => (await b.exec(() => window.location.hash)).includes('cursor='), { message: 'the cursor to be in the address' });
+    await b.waitFor(async () => { const n = await names(); return n.length > 0 && n[0] !== first[0]; }, { message: 'the second page' });
+    const second = await names();
+    eq(second.length, 25, 'the second page has 25 rows');
+    must(second.every((n) => !first.includes(n)), 'a row of the first page is on the second');
+    eq(second[0], 'h26', 'the second page continues where the first stopped');
+    await labelsOk('the second page');
+    // the last page has no next link; 63 sets in all: 25 + 25 + 13
+    await click('Next page');
+    await b.waitFor(async () => (await names()).length === 13, { message: 'the last page' });
+    must(!(await b.exec(() => [...document.querySelectorAll('main a')].some((a) => a.textContent.trim() === 'Next page'))), 'a next link on the last page');
+    await click('First page');
+    await b.waitFor(async () => { const n = await names(); return n.length === 25 && n[0] === first[0]; }, { message: 'the first page again' });
+    must(!(await b.exec(() => window.location.hash)).includes('cursor='), 'the cursor stays in the address after "First page"');
+    await noTrouble();
+  });
+
+  await scenario('in 320 CSS pixels nothing but a table or a block of code reaches past the right edge: the zone list, a zone, the versions, the users, the audit log', async () => {
+    await b.cmd('POST', '/window/rect', { width: 320, height: 800 });
+    try {
+      for (const [hash, h1] of [['#/zones', /^Zones$/], ['#/zones/main/hist.test.', /^hist\.test\./], ['#/zones/main/hist.test./versions', /^hist\.test\./], ['#/admin/users', /^Administration$/], ['#/audit', /^Audit log$/]]) {
+        await open(hash, h1);
+        await b.waitFor(async () => b.exec(() => !/Loading/.test(document.querySelector('main').innerText)), { message: `${hash} to be loaded`, timeout: 15000 });
+        const r = await b.exec(overflowProblems);
+        eq(r.bad, [], `${hash} at ${r.width} px`);
+        must(r.window <= 640, `the window is wider than 40rem (${r.window} px)`);
+      }
+    } finally {
+      await b.cmd('POST', '/window/rect', { width: 1280, height: 900 });
+    }
   });
 
   console.log(`  [TIME] the scenarios of milestone M4 (S9 to S12) took ${Math.round((Date.now() - m4start) / 1000)} s`);

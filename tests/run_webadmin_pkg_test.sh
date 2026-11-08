@@ -55,7 +55,7 @@ mkdir -p "$T/src/webadmin" "$T/src/node" "$T/src/packaging" "$T/src/docs" "$T/ou
 cp -R webadmin/bin webadmin/lib webadmin/ui webadmin/package.json webadmin/package-lock.json "$T/src/webadmin/"
 cp -R node/lib node/package.json "$T/src/node/"
 cp -R packaging/freebsd "$T/src/packaging/"
-cp docs/karidns-webadmin.md docs/karidns-api.md "$T/src/docs/"
+cp docs/karidns-webadmin.md docs/karidns-api.md docs/karidns-webadmin-gui.md docs/karidns-webadmin-gui-checklist.md "$T/src/docs/"
 cp karidns-webadmin.conf.sample "$T/src/"
 export npm_config_prefer_offline=true
 if (cd "$T/src" && sh packaging/freebsd/build_webadmin_pkg.sh 9.9.9 "$T/out") > "$T/build.out" 2>&1; then ok "build_webadmin_pkg.sh builds the package"; else bad "build_webadmin_pkg.sh failed" "$(tail -15 "$T/build.out")"; done_; fi
@@ -68,13 +68,13 @@ pkg info -d -F "$PKG" 2> /dev/null | grep -q 'node24-' && ok "it depends on node
 pkg info -d -F "$PKG" 2> /dev/null | grep -q 'bind-tools' && bad "it depends on bind-tools (only the signer needs them)" || ok "...and on nothing else it does not use"
 pkg info -l -F "$PKG" 2> /dev/null | tail -n +2 | sed 's/^[[:space:]]*//' > "$T/files.txt"
 for f in /usr/local/sbin/karidns-webadmin /usr/local/etc/rc.d/karidns_webadmin /usr/local/etc/karidns/karidns-webadmin.conf.sample /usr/local/share/doc/karidns/karidns-webadmin.md \
-         /usr/local/share/doc/karidns/karidns-api.md /usr/local/libexec/karidns-webadmin/webadmin/bin/karidns-webadmin.js /usr/local/libexec/karidns-webadmin/webadmin/lib/cli.js /usr/local/libexec/karidns-webadmin/webadmin/ui/index.html \
+         /usr/local/share/doc/karidns/karidns-api.md /usr/local/share/doc/karidns/karidns-webadmin-gui.md /usr/local/share/doc/karidns/karidns-webadmin-gui-checklist.md /usr/local/libexec/karidns-webadmin/webadmin/bin/karidns-webadmin.js /usr/local/libexec/karidns-webadmin/webadmin/lib/cli.js /usr/local/libexec/karidns-webadmin/webadmin/ui/index.html \
          /usr/local/libexec/karidns-webadmin/node/lib/run.js /usr/local/libexec/karidns-webadmin/node/package.json /usr/local/libexec/karidns-webadmin/node_modules/pg/package.json; do
     grep -qx "$f" "$T/files.txt" && ok "the package holds $f" || bad "the package does not hold $f"
 done
 grep -Eq '^/usr/local/libexec/karidns-webadmin/(webadmin|node)/test/' "$T/files.txt" && bad "the package holds the test files of the program" || ok "no test file of the program in the package"
 grep -q 'node_modules/\.bin' "$T/files.txt" && bad "the package holds node_modules/.bin" || ok "no node_modules/.bin (no link into the tree)"
-grep -v '^/usr/local/\(sbin/karidns-webadmin\|etc/rc.d/karidns_webadmin\|etc/karidns/karidns-webadmin.conf.sample\|share/doc/karidns/karidns-\(webadmin\|api\).md\|libexec/karidns-webadmin/\)' "$T/files.txt" > "$T/other.txt"
+grep -v '^/usr/local/\(sbin/karidns-webadmin\|etc/rc.d/karidns_webadmin\|etc/karidns/karidns-webadmin.conf.sample\|share/doc/karidns/karidns-\(webadmin\|webadmin-gui\|webadmin-gui-checklist\|api\).md\|libexec/karidns-webadmin/\)' "$T/files.txt" > "$T/other.txt"
 [ ! -s "$T/other.txt" ] && ok "nothing outside the paths of the package" || bad "files outside the paths of the package" "$(head -5 "$T/other.txt")"
 # the scripts and the user
 mkdir "$T/root" && tar -xf "$PKG" -C "$T/root" 2> /dev/null
@@ -87,6 +87,15 @@ same "the program is mode 0555" "$(stat -f %Lp "$L/webadmin/bin/karidns-webadmin
 same "the libraries are mode 0444" "$(stat -f %Lp "$L/webadmin/lib/cli.js")" 444
 same "the sample configuration is mode 0644" "$(stat -f %Lp "$T/root/usr/local/etc/karidns/karidns-webadmin.conf.sample")" 644
 cmp -s karidns-webadmin.conf.sample "$T/root/usr/local/etc/karidns/karidns-webadmin.conf.sample" && ok "the sample is the one of the repository" || bad "the sample differs"
+# the web interface (item F, F-12): all of webadmin/ui/, nothing else, the files of the repository, the modes of the rest of the program (0444 files in 0755 directories)
+(cd webadmin/ui && find . -type f | sort) > "$T/ui_src.txt"
+(cd "$L/webadmin/ui" && find . -type f | sort) > "$T/ui_pkg.txt"
+[ -s "$T/ui_src.txt" ] && cmp -s "$T/ui_src.txt" "$T/ui_pkg.txt" && ok "the package holds every file of webadmin/ui/ and nothing more ($(wc -l < "$T/ui_src.txt" | tr -d ' ') files)" || bad "the files of webadmin/ui/ in the package differ from the repository" "$(diff "$T/ui_src.txt" "$T/ui_pkg.txt" | head -6)"
+diff -r webadmin/ui "$L/webadmin/ui" > /dev/null 2>&1 && ok "...with the contents of the repository" || bad "the contents of webadmin/ui/ in the package differ"
+same "...all of mode 0444" "$(find "$L/webadmin/ui" -type f ! -perm 0444 | wc -l | tr -d ' ')" 0
+same "...in directories of mode 0755" "$(find "$L/webadmin/ui" -type d ! -perm 0755 | wc -l | tr -d ' ')" 0
+grep -q 'web interface' "$T/root/+MANIFEST" && ok "the description of the package names the web interface" || bad "the description does not name the web interface"
+cmp -s docs/karidns-webadmin-gui.md "$T/root/usr/local/share/doc/karidns/karidns-webadmin-gui.md" && cmp -s docs/karidns-webadmin-gui-checklist.md "$T/root/usr/local/share/doc/karidns/karidns-webadmin-gui-checklist.md" && ok "the user manual of the web interface and its checklist are the repository's" || bad "the manuals of the web interface differ"
 
 echo "-- the program in the installed layout"
 [ "$($NODE "$L/webadmin/bin/karidns-webadmin.js" --version 2>&1)" = "karidns-webadmin 0.6.0" ] && ok "--version" || bad "--version" "$($NODE "$L/webadmin/bin/karidns-webadmin.js" --version 2>&1)"
@@ -119,6 +128,7 @@ EOF
 mkdir -p "$T/key"
 APP="$NODE $L/webadmin/bin/karidns-webadmin.js -c $CONF"
 $APP --check > "$T/check.out" 2> "$T/check.err" && ok "--check is fine" || bad "--check" "$(cat "$T/check.err" "$T/check.out")"
+grep -q "^ok: ui $L/webadmin/ui/" "$T/check.out" && ok "...and it reports the files of the web interface of the installed layout" || bad "--check does not report the files of the web interface" "$(grep -i '^.*ui' "$T/check.out" | head -3)"
 $APP --create-admin admin > "$T/admin.out" 2> "$T/admin.err" && ok "--create-admin" || bad "--create-admin" "$(cat "$T/admin.err")"
 PW=$(sed -n 's/^password (shown once): //p' "$T/admin.out")
 $APP > "$T/server.log" 2>&1 &
@@ -133,6 +143,52 @@ const me = await fetch(`${base}/auth/me`, { headers: { Cookie: /karidns_session=
 console.log(h.status, r.status, me.status, (await me.json()).capabilities?.global);
 EOF
 same "/health, the login and /auth/me through the installed program" "$($NODE "$T/probe.mjs" "http://127.0.0.1:$PORT/api/v1" admin "$PW" 2>&1)" "200 200 200 true"
+# the web interface from the unpacked package: the page and its policy, every file as the package holds it, the answers for what is not a file, nothing outside the map
+cat > "$T/gui_probe.mjs" <<'EOF'
+import fs from 'node:fs';
+import http from 'node:http';
+import path from 'node:path';
+const [base, dir] = process.argv.slice(2);
+const bad = [];
+const raw = (method, p) => new Promise((resolve) => {
+  const u = new URL(base);
+  const req = http.request({ host: u.hostname, port: u.port, method, path: p }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
+  req.on('error', () => resolve(0));
+  req.end();
+});
+const walk = (d, rel = '') => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(d, e.name), `${rel}/${e.name}`) : [`${rel}/${e.name}`]));
+const files = walk(dir);
+let served = 0;
+for (const rel of files) {
+  const r = await fetch(`${base}${rel === '/index.html' ? '/' : `/ui${rel}`}`);
+  const body = Buffer.from(await r.arrayBuffer());
+  if (r.status !== 200 || !body.equals(fs.readFileSync(path.join(dir, rel)))) bad.push(`${rel}: ${r.status}`);
+  else served++;
+}
+const page = await fetch(`${base}/`);
+const csp = page.headers.get('content-security-policy') ?? '';
+if (!csp.startsWith("default-src 'none'; script-src 'self'; style-src 'self'") || !csp.includes("require-trusted-types-for 'script'") || !csp.includes("frame-ancestors 'none'")) bad.push(`the policy of the page: ${csp}`);
+if (page.headers.get('cache-control') !== 'no-store') bad.push('the page is kept');
+if (page.headers.get('x-content-type-options') !== 'nosniff') bad.push('no nosniff');
+if (page.headers.get('cross-origin-opener-policy') !== 'same-origin') bad.push('no COOP');
+const js = await fetch(`${base}/ui/js/app.js`);
+if (!/^text\/javascript/.test(js.headers.get('content-type') ?? '')) bad.push(`app.js is ${js.headers.get('content-type')}`);
+const again = await fetch(`${base}/ui/js/app.js`, { headers: { 'If-None-Match': js.headers.get('etag') ?? '' } });
+if (again.status !== 304) bad.push(`the entity tag gives ${again.status}, not 304`);
+const head = await fetch(`${base}/`, { method: 'HEAD' });
+if (head.status !== 200 || (await head.text()) !== '') bad.push('HEAD /');
+const post = await fetch(`${base}/`, { method: 'POST', body: '{}', headers: { 'Content-Type': 'application/json' } });
+if (post.status !== 405 || !/GET/.test(post.headers.get('allow') ?? '')) bad.push(`POST / is ${post.status}`);
+for (const p of ['/ui/nothing.js', '/nothing', '/etc/passwd', '/ui/', '/ui', '/ui/js/', '/ui/%2e%2e/%2e%2e/etc/passwd', '/ui/js/app.js%00', '/ui/..%2f..%2fetc%2fpasswd']) {
+  const s = await raw('GET', p);
+  if (s !== 404 && s !== 400) bad.push(`GET ${p} is ${s}`);
+}
+const rawTraversal = await raw('GET', '/ui/../../../../etc/passwd');
+if (rawTraversal !== 404) bad.push(`a path with .. is ${rawTraversal}`);
+console.log(bad.length === 0 ? `ok ${served}` : bad.join('; '));
+EOF
+GUI_OUT=$($NODE "$T/gui_probe.mjs" "http://127.0.0.1:$PORT" "$L/webadmin/ui" 2>&1)
+case "$GUI_OUT" in ok\ *) ok "the unpacked service answers GET / with the page and the policy of the GUI, serves all ${GUI_OUT#ok } files of webadmin/ui byte for byte, 304 for the entity tag, 405/404 for the rest" ;; *) bad "the web interface of the unpacked package" "$GUI_OUT" ;; esac
 kill -TERM "$SRV" 2> /dev/null
 i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2> /dev/null; do sleep 0.1; i=$((i + 1)); done
 kill -0 "$SRV" 2> /dev/null && { bad "the server did not stop after SIGTERM"; kill -KILL "$SRV"; } || { wait "$SRV" 2> /dev/null; same "SIGTERM stops it with status 0" "$?" 0; }

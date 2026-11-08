@@ -135,6 +135,8 @@ const SECURITY = {
   'Content-Security-Policy': "default-src 'self'; frame-ancestors 'none'",
   'Referrer-Policy': 'no-referrer',
   'X-Frame-Options': 'DENY',
+  // (M6 review: another site may not load an answer of the API as a resource, with or without a cookie; the files of the GUI have it from static.js as well)
+  'Cross-Origin-Resource-Policy': 'same-origin',
 };
 
 function send(ctx, status, headers, payload) {

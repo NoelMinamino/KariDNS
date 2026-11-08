@@ -124,7 +124,8 @@ test('configuration: what the whole must satisfy', () => {
 });
 
 test('the sample configuration is a good configuration, also with the SQLite3 lines for the PostgreSQL ones', () => {
-  const sample = fs.readFileSync(new URL('../../karidns-webadmin.conf.sample', import.meta.url), 'utf8');
+  // (a checkout with CRLF line ends, as on Windows with core.autocrlf, must not change what the patterns below see)
+  const sample = fs.readFileSync(new URL('../../karidns-webadmin.conf.sample', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
   const c = parseConfig(sample);
   assert.deepEqual(validate(c), []);
   assert.equal(c.settings.database, 'pg');

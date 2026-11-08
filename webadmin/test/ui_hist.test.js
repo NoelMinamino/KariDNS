@@ -72,8 +72,8 @@ test('S9: the versions of a zone: kinds, who, when, the comment as text, notes, 
   assert.equal(main[2].childNodes[5].textContent, '- → 10');
   assert.equal(findAll(main[0], (e) => e.tagName === 'B').length, 0, 'a comment is text');
   const links = findAll(main[0], (e) => e.tagName === 'A').map((a) => [a.textContent, a.getAttribute('href'), a.getAttribute('aria-label')]);
-  assert.deepEqual(links.slice(1), [['Against the zone now', '#/zones/main/example.test./versions/3/diff?to=current', 'Compare version 3 with the zone as it is now'],
-    ['Roll back...', '#/zones/main/example.test./versions/3', 'Roll the zone back to version 3']]);
+  assert.deepEqual(links.slice(1), [['Against the zone now', '#/zones/main/example.test./versions/3/diff?to=current', 'Against the zone now, from version 3'],
+    ['Roll back...', '#/zones/main/example.test./versions/3', 'Roll back the zone to version 3']]);
   // the markers: one before the first row (since the newest), one after the rows that have them
   const text = ui.q('table.versions').parentNode.textContent;
   assert.match(text, /Since the newest version: the zone was changed outside the versions \(1 changes of records that no version explains\)\. new CNAME/);

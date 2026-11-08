@@ -33,7 +33,9 @@ export function createI18n({ catalogs, fallback = 'en', storage, languages = [] 
     let last = 0;
     for (const m of msg.matchAll(PLACEHOLDER)) {
       if (m.index > last) out.push(msg.slice(last, m.index));
-      out.push(m[1] in params ? params[m[1]] : m[0]);
+      // (a string is text that came from somewhere: a name, a comment, a part of the address.  Its control, bidi and zero-width characters are made visible here, once, for
+      // every message, flash, announcement and aria-label alike (planning 5.2 rule 3).  plain() of plain() is the same text.  A node is the caller's own.)
+      out.push(Object.hasOwn(params, m[1]) ? (typeof params[m[1]] === 'string' ? plain(params[m[1]]) : params[m[1]]) : m[0]);
       last = m.index + m[0].length;
     }
     if (last < msg.length) out.push(msg.slice(last));

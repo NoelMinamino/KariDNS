@@ -13,6 +13,9 @@ export function parse(hash, table) {
   for (const s of segs) {
     try { decoded.push(decodeURIComponent(s)); } catch { return { name: 'notfound', params: {}, query: {} }; }
   }
+  // a part that is "." or ".." would be taken out of the path of a request by the browser (RFC 3986 section 5.2.4; the URL standard does so for %2e too), so that
+  // /datasets/main/zones/.. + /reload would reach /datasets/main/reload: there is no such zone name, and no such route
+  if (decoded.some((d) => d === '.' || d === '..')) return { name: 'notfound', params: {}, query: {} };
   for (const r of table) {
     const pat = r.pattern === '/' ? [] : r.pattern.slice(1).split('/');
     if (pat.length !== decoded.length) continue;

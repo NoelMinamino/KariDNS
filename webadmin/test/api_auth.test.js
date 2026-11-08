@@ -37,6 +37,7 @@ test('the login: a cookie, the CSRF token, the same answer for every kind of ref
   assert.equal(ok.headers.get('cache-control'), 'no-store');
   assert.equal(ok.headers.get('x-content-type-options'), 'nosniff');
   assert.match(ok.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+  assert.equal(ok.headers.get('cross-origin-resource-policy'), 'same-origin');
   assert.equal(ok.headers.get('strict-transport-security'), null);
   const refusals = [
     ['root', 'wrong password 1234'], ['nobody', 'correct horse battery'], ['nopw', 'whatever 123456'], ['off', 'off password 12345'], ['grp', 'x'],

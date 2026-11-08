@@ -278,7 +278,14 @@ export function createApp(env) {
   session.on('logout', () => drafts.clear());
   session.on('other-tab-logout', () => { drafts.clear(); notice = t('login.other-tab'); closeWarning(); render(); });
   session.on('other-tab-login', () => render());
-  i18n.onChange((lang) => { setLang(lang); render(); });
+  // (the screen is drawn again in the new language.  A control the person was using keeps the focus: the language is chosen with the arrow keys of a select, and a focus
+  // that jumps to the top of the page after the first key is a keyboard trap in effect, WCAG 2.4.3 / 3.2.2)
+  i18n.onChange((lang) => {
+    setLang(lang);
+    const name = doc.activeElement?.getAttribute?.('name');
+    render();
+    if (typeof name === 'string' && /^[a-z_]+$/.test(name)) doc.querySelector(`[name=${name}]`)?.focus();
+  });
 
   win.addEventListener('beforeunload', (ev) => {
     if (session.dirty()) { ev.preventDefault(); ev.returnValue = ''; }

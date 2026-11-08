@@ -51,12 +51,16 @@ install -m 0555 packaging/freebsd/rc.d/karidns_webadmin "${STAGE_DIR}/usr/local/
 install -m 0644 karidns-webadmin.conf.sample "${STAGE_DIR}/usr/local/etc/karidns/karidns-webadmin.conf.sample"
 install -m 0644 docs/karidns-webadmin.md "${STAGE_DIR}/usr/local/share/doc/karidns/karidns-webadmin.md"
 install -m 0644 docs/karidns-api.md "${STAGE_DIR}/usr/local/share/doc/karidns/karidns-api.md"
+install -m 0644 docs/karidns-webadmin-gui.md "${STAGE_DIR}/usr/local/share/doc/karidns/karidns-webadmin-gui.md"
+install -m 0644 docs/karidns-webadmin-gui-checklist.md "${STAGE_DIR}/usr/local/share/doc/karidns/karidns-webadmin-gui-checklist.md"
 
 FILES="    /usr/local/sbin/karidns-webadmin: { uname: \"root\", gname: \"wheel\", perm: \"0555\" },
     /usr/local/etc/rc.d/karidns_webadmin: { uname: \"root\", gname: \"wheel\", perm: \"0555\" },
     /usr/local/etc/karidns/karidns-webadmin.conf.sample: { uname: \"root\", gname: \"wheel\", perm: \"0644\" },
     /usr/local/share/doc/karidns/karidns-webadmin.md: { uname: \"root\", gname: \"wheel\", perm: \"0644\" },
-    /usr/local/share/doc/karidns/karidns-api.md: { uname: \"root\", gname: \"wheel\", perm: \"0644\" }"
+    /usr/local/share/doc/karidns/karidns-api.md: { uname: \"root\", gname: \"wheel\", perm: \"0644\" },
+    /usr/local/share/doc/karidns/karidns-webadmin-gui.md: { uname: \"root\", gname: \"wheel\", perm: \"0644\" },
+    /usr/local/share/doc/karidns/karidns-webadmin-gui-checklist.md: { uname: \"root\", gname: \"wheel\", perm: \"0644\" }"
 for f in $(cd "${STAGE_DIR}" && find "${WEBADMIN_DIR}" -type f | sort); do
     case "$f" in
         *[!A-Za-z0-9_./+@-]*) echo "ERROR: unexpected file name in the webadmin tree: $f" >&2; exit 1 ;;

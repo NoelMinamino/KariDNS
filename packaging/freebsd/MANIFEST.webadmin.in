@@ -1,7 +1,7 @@
 name: "karidns-webadmin"
 version: "__VERSION__"
 origin: "dns/karidns-webadmin"
-comment: "HTTP API for the zones, users and grants of a KariDNS database"
+comment: "HTTP API and web interface for the zones, users and grants of a KariDNS database"
 arch: "__ARCH__"
 www: "https://github.com/NoelMinamino/KariDNS"
 maintainer: "noel@karidns.org"
@@ -11,7 +11,7 @@ licenses: [
     "MIT"
 ]
 desc: <<EOD
-karidns-webadmin is the HTTP API of a KariDNS database (PostgreSQL or SQLite3): logins with TOTP, users, groups and grants (global, domain and
+karidns-webadmin is the HTTP API of a KariDNS database (PostgreSQL or SQLite3), with a web interface for it (English and Japanese; plain JavaScript served by the service itself): logins with TOTP or an OpenID Connect provider, users, groups and grants (global, domain and
 subdomain masters), the zones and their records, change sets, zone versions and rollback, and templates. It runs karidns-zone and karicheck (from
 karidns-sqlite3, karidns-postgresql or karidns-db, and from karidns, which must be installed first).
 EOD

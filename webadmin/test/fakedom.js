@@ -154,6 +154,7 @@ export class FakeDocument {
   createElementNS(ns, tag) { return new FakeElement(this, tag, ns); }
   createTextNode(s) { return new FakeText(String(s)); }
   getElementById(id) { return this.body.querySelectorAll(`#${id}`)[0] ?? null; }
+  querySelector(sel) { return this.body.querySelector(sel); }
   addEventListener(type, fn) { (this.listeners.get(type) ?? this.listeners.set(type, []).get(type)).push(fn); }
   dispatchEvent(ev) { for (const fn of this.listeners.get(ev.type) ?? []) fn(ev); }
 }

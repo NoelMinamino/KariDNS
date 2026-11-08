@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { hotp, totpStep, base32Decode } from '../../lib/crypto.js';
 import { startBrowser, NAMED_KEYS } from './wd.mjs';
+import { pageProblems, overflowProblems } from './a11y.mjs';
 
 const BASE = process.env.GUI_BASE;
 const DIR = process.env.GUI_DIR;
@@ -64,24 +65,8 @@ const logout = async () => {
   await b.exec(() => { window.location.hash = '#/'; });
 };
 
-// the checks of 7.1 on whatever is on the screen: names for inputs, buttons, links and images, one h1, the language, the landmark, no duplicate id, descriptions that exist
-const a11y = () => b.exec(() => {
-  const bad = [];
-  for (const el of document.querySelectorAll('input, select, textarea')) {
-    if (!(el.labels && el.labels.length) && !el.getAttribute('aria-label') && !el.getAttribute('aria-labelledby')) bad.push(`input ${el.name || el.id} has no label`);
-  }
-  for (const el of document.querySelectorAll('button, a[href]')) {
-    if (!(el.textContent || '').trim() && !el.getAttribute('aria-label')) bad.push('a button or link without a name');
-  }
-  for (const el of document.querySelectorAll('svg[role=img], img')) if (!el.getAttribute('aria-label') && !el.getAttribute('alt')) bad.push('an image without a name');
-  if (document.querySelectorAll('h1').length !== 1) bad.push(`${document.querySelectorAll('h1').length} h1`);
-  if (!document.documentElement.lang) bad.push('no lang');
-  if (!document.querySelector('main')) bad.push('no main');
-  const ids = [...document.querySelectorAll('[id]')].map((e) => e.id);
-  for (const id of new Set(ids.filter((x, i) => ids.indexOf(x) !== i))) bad.push(`duplicate id ${id}`);
-  for (const el of document.querySelectorAll('[aria-describedby]')) for (const id of el.getAttribute('aria-describedby').split(' ')) if (!document.getElementById(id)) bad.push(`aria-describedby ${id} does not exist`);
-  return bad;
-});
+// the checks of 7.1 / F-22 on whatever is on the screen (a11y.mjs, shared with gui_zones.mjs)
+const a11y = () => b.exec(pageProblems);
 const labelsOk = async (screen) => eq(await a11y(), [], `${screen}: names and landmarks`);
 
 const apiCalls = () => b.exec(() => performance.getEntriesByType('resource').filter((e) => e.name.includes('/api/v1/')).length);
@@ -390,6 +375,31 @@ try {
     await b.waitFor(async () => (await (await b.$('form button[type=submit]')).text()).trim() === 'Sign in', { timeout: 15000, message: 'the button to be back' });
     await click('Sign in');
     await waitH1(/^Welcome, /);
+  });
+
+  // ------------------------------------------------------------------------------------------------------------------------------------------ reflow
+  console.log('-- a narrow window (WCAG 1.4.10)');
+  await scenario('in 320 CSS pixels (the narrowest window, the page given that width) nothing but a table or a block of code reaches past the right edge: start page, account, sign-in', async () => {
+    await b.cmd('POST', '/window/rect', { width: 320, height: 800 });
+    try {
+      const seen = [];
+      for (const [hash, h1] of [['#/', /^Welcome, /], ['#/account', /^Your account$/]]) {
+        await b.exec((x) => { window.location.hash = x; }, hash);
+        await waitH1(h1);
+        const r = await b.exec(overflowProblems);
+        seen.push(r.window);
+        eq(r.bad, [], `${hash} at ${r.width} px`);
+        eq(await a11y(), [], `${hash} at ${r.width} px: names and landmarks`);
+      }
+      await logout();
+      const r = await b.exec(overflowProblems);
+      seen.push(r.window);
+      eq(r.bad, [], `the sign-in at ${r.width} px`);
+      console.log(`  [NOTE] the window was ${seen.join(', ')} px wide, the page was laid out in 320`);
+      must(Math.max(...seen) <= 640, `the window is wider than 40rem (${seen.join(', ')} px): the media query of narrow screens does not apply`);
+    } finally {
+      await b.cmd('POST', '/window/rect', { width: 1280, height: 900 });
+    }
   });
 
   // ------------------------------------------------------------------------------------------------------------------------------------------ the policy

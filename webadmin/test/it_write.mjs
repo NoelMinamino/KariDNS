@@ -312,7 +312,7 @@ const s3 = /karidns_session=([^;]+)/.exec(l3.headers.get('set-cookie') ?? '')?.[
 const G3 = (method, p, o = {}) => call(method, p, { cookie: s3, csrf: l3.body?.csrf, origin: ORIGIN, ...o });
 eq('...and a login with the code works', [l3.status, (await G3('GET', '/auth/me')).status], [200, 200]);
 const reset = await admin('POST', `/principals/${gu}/credentials`, { body: { action: 'reset-totp' } });
-eq('an administrator resets it', [reset.status, reset.body.credentials], [200, { password: true, totp_enabled: false, failed_logins: 0, locked: false }]);
+eq('an administrator resets it', [reset.status, reset.body.credentials], [200, { password: true, totp_enabled: false, failed_logins: 0, locked: false, oidc: null }]);
 eq('...the user\'s session ended', (await G3('GET', '/auth/me')).status, 401);
 const relog = await call('POST', '/auth/login', { body: { user: 'guiuser', password: 'Quartz-Lantern-9081' } });
 eq('...and the login needs no code', [relog.status, relog.body.totp], [200, { enabled: false, enrollment_required: false }]);

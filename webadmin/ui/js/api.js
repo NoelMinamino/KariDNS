@@ -4,6 +4,7 @@
 
 export const UNSAFE = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 export const enc = encodeURIComponent;
+const DOT_PART = /(?:^|\/)(?:\.|%2e){1,2}(?=\/|$)/i;
 
 export class ApiProblem extends Error {
   // status 0: no answer (network, timeout)
@@ -38,6 +39,9 @@ export function createApi(opts) {
   let csrf = null;
 
   async function once(method, path, { body, query }) {
+    // a "." or ".." part is removed from an address by the browser (also in its %2e spellings), which would send the request to another resource than the one the caller built
+    // from a name: no request is made (the router makes such a name "not found" long before; this is the one place every request passes)
+    if (DOT_PART.test(path)) throw new ApiProblem({ status: 400, code: 'bad-request', detail: 'the address has a "." or ".." part' });
     const params = new URLSearchParams();
     for (const [k, v] of Object.entries(query ?? {})) if (v !== undefined && v !== null && v !== '') params.set(k, String(v));
     const qs = params.toString();

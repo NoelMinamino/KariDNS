@@ -157,6 +157,7 @@ jobs:
             test -x /usr/local/etc/rc.d/karidns_webadmin
             test -f /usr/local/etc/karidns/karidns-webadmin.conf.sample
             test -f /usr/local/share/doc/karidns/karidns-webadmin.md
+            test -f /usr/local/share/doc/karidns/karidns-webadmin-gui.md
             pw usershow karidns-webadmin > /dev/null
             /usr/local/sbin/karidns-webadmin --version
             pkg delete -y karidns-webadmin karidns-sqlite3

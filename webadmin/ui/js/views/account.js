@@ -222,9 +222,10 @@ function languageSection(ctx) {
   const { i18n } = ctx;
   const t = i18n.t;
   const labels = { en: 'English', ja: '日本語' };
-  const sel = select({ label: t('account.language'), options: i18n.languages.map((l) => ({ value: l, label: labels[l] ?? l })), value: i18n.lang, name: 'language' });
+  // (the name of a language is written in that language: WCAG 3.1.2; the choice is applied at once, which the hint says first: 3.2.2)
+  const sel = select({ label: t('account.language'), options: i18n.languages.map((l) => ({ value: l, label: labels[l] ?? l, lang: l })), value: i18n.lang, name: 'language' });
   sel.input.addEventListener('change', () => i18n.setLang(sel.input.value));
-  return h('section', { class: 'card', 'aria-labelledby': 'acc-lang' }, h('h2', { id: 'acc-lang' }, t('account.language-title')), sel.node);
+  return h('section', { class: 'card', 'aria-labelledby': 'acc-lang' }, h('h2', { id: 'acc-lang' }, t('account.language-title')), sel.node, h('p', { class: 'hint' }, t('account.language-hint')));
 }
 
 function sessionSection(ctx) {

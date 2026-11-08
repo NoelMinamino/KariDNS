@@ -458,6 +458,9 @@ test('S15: the language is chosen here, kept, and the whole page follows at once
   const ui = await boot({ hash: '#/account', storage });
   const sel = ui.q('select');
   assert.deepEqual(sel.children.map((o) => o.textContent), ['English', '日本語']);
+  assert.deepEqual(sel.children.map((o) => o.getAttribute('lang')), ['en', 'ja']);                   // (WCAG 3.1.2: a language name is in its language)
+  assert.ok(ui.text().includes(en['account.language-hint']));
+  sel.focus();
   sel.value = 'ja';
   sel.dispatchEvent(new FakeEvent('change'));
   await flush();
@@ -466,6 +469,7 @@ test('S15: the language is chosen here, kept, and the whole page follows at once
   assert.equal(ui.q('h1').textContent, ja['account.title']);
   assert.equal(ui.env.document.title, `${ja['account.title']} - KariDNS WebAdmin`);
   assert.equal(ui.q('select').value, 'ja');
+  assert.ok(ui.env.document.activeElement === ui.q('select'), 'the select keeps the focus when the page is drawn again');
 
   // sign out everywhere: the request carries all: true, the page shows the sign-in
   const all = ui.button(new RegExp(ja['account.logout-all']));
