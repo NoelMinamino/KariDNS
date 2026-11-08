@@ -126,6 +126,18 @@ static const char *col_text(db_conn_t *c, sqlite3_stmt *st, int i, const char *t
     return (const char *)t;
 }
 
+/* An integer column.  SQLite is dynamically typed: a TEXT or REAL cell in an INTEGER column reads as 0 or as a cut number through
+ * sqlite3_column_int64(), which would turn a damaged row into a valid-looking one (a TEXT 'false' in disabled is 0 = enabled here, but the
+ * joins' `disabled = 0` do not match it).  A cell that is not SQLITE_INTEGER sets *bad; c->err names the table, the row id and the column. */
+static int64_t col_int(db_conn_t *c, sqlite3_stmt *st, int i, const char *table, int64_t id, const char *name, bool *bad) {
+    if (sqlite3_column_type(st, i) != SQLITE_INTEGER) {
+        set_err(c, "table %s id %lld: column %s is not an integer", table, (long long)id, name);
+        *bad = true;
+        return 0;
+    }
+    return sqlite3_column_int64(st, i);
+}
+
 /* ------------------------------------------------------------------------------------------------------------- */
 /* open / close                                                                                                   */
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -166,6 +178,20 @@ static int sq_open_mode(db_conn_t **out, const db_source_t *src, char *err, size
 #ifdef SQLITE_DBCONFIG_DEFENSIVE
     sqlite3_db_config(c->db, SQLITE_DBCONFIG_DEFENSIVE, 1, (int *)NULL);
 #endif
+#ifdef SQLITE_DBCONFIG_TRUSTED_SCHEMA
+    /* The loader reads a file other users may write: a view or trigger planted in its schema must not run functions of ours or of
+     * SQLite that are not marked innocuous (the SQLite advice for a database that an untrusted party can change).  The importer's
+     * connection (write) owns the file and its audit triggers, and keeps the default. */
+    if (!write) {
+        rc = sqlite3_db_config(c->db, SQLITE_DBCONFIG_TRUSTED_SCHEMA, 0, (int *)NULL);
+        if (rc != SQLITE_OK) {
+            snprintf(err, errlen, "sqlite3: cannot turn off trusted_schema: %s", sqlite3_errmsg(c->db));
+            sqlite3_close(c->db);
+            free(c);
+            return -1;
+        }
+    }
+#endif
     c->writable = write;
     int ret = write ? 0 : exec(c, "PRAGMA query_only=1");
     if (ret == 0) {
@@ -180,6 +206,9 @@ static int sq_open_mode(db_conn_t **out, const db_source_t *src, char *err, size
                         m ? m : "?");
                 ret = -1;
             }
+        } else if (rc == SQLITE_DONE) {      /* (sql_fail() would say "not an error": the step succeeded but gave no row) */
+            set_err(c, "sqlite3: PRAGMA journal_mode returned no row");
+            ret = -1;
         } else {
             ret = sql_fail(c, rc, "PRAGMA journal_mode");
         }
@@ -538,7 +567,8 @@ static int sq_zone_loop(db_conn_t *c, sqlite3_stmt *st, db_zone_cb cb, void *ud)
         z.type = col_text(c, st, 2, "domains", id, "type", &bad);
         z.master = col_text(c, st, 3, "domains", id, "master", &bad);
         z.catalog = col_text(c, st, 4, "domains", id, "catalog", &bad);
-        z.soa_content = col_text(c, st, 5, "records", id, "content", &bad);
+        /* (column 6: the id of the SOA row, which is the row the error is about; NULL when the zone has no enabled apex SOA) */
+        z.soa_content = col_text(c, st, 5, "records", sqlite3_column_int64(st, 6), "content", &bad);
         if (bad) {
             ret = -1;
             break;
@@ -554,7 +584,7 @@ static int sq_zone_loop(db_conn_t *c, sqlite3_stmt *st, db_zone_cb cb, void *ud)
 
 static int sq_list_zones(db_conn_t *c, db_zone_cb cb, void *ud) {
     int ret = prep(c, &c->st_zones,
-                   "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content FROM domains d "
+                   "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content, r.id FROM domains d "
                    "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND r.name = d.name AND r.disabled = 0 "
                    "ORDER BY d.id, r.id");
     if (ret != 0) return ret;
@@ -580,7 +610,7 @@ static int sq_find_zone(db_conn_t *c, const char *name, db_zone_cb cb, void *ud)
     a[n] = '\0';
     a[n + 1] = '\0';
     int ret = prep(c, &c->st_zone_one,
-                   "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content FROM domains d "
+                   "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content, r.id FROM domains d "
                    "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND r.name = d.name AND r.disabled = 0 "
                    "WHERE d.name COLLATE NOCASE IN (?1, ?2) ORDER BY d.id, r.id");
     if (ret != 0) {
@@ -616,18 +646,19 @@ static int rec_loop(db_conn_t *c, sqlite3_stmt *st, db_record_cb cb, void *ud) {
             break;
         }
         bool bad = false;
-        int64_t did = sqlite3_column_int64(st, 0);
         db_record_row_t r;
         memset(&r, 0, sizeof(r));
         r.id = sqlite3_column_int64(st, 1);
+        int64_t did = col_int(c, st, 0, "records", r.id, "domain_id", &bad);
         r.name = col_text(c, st, 2, "records", r.id, "name", &bad);
         r.type = col_text(c, st, 3, "records", r.id, "type", &bad);
         r.content = col_text(c, st, 4, "records", r.id, "content", &bad);
         r.ttl_null = sqlite3_column_type(st, 5) == SQLITE_NULL;
-        r.ttl = r.ttl_null ? 0 : sqlite3_column_int64(st, 5);
+        r.ttl = r.ttl_null ? 0 : col_int(c, st, 5, "records", r.id, "ttl", &bad);
         r.prio_null = sqlite3_column_type(st, 6) == SQLITE_NULL;
-        r.prio = r.prio_null ? 0 : sqlite3_column_int64(st, 6);
-        r.disabled = sqlite3_column_type(st, 7) == SQLITE_NULL || sqlite3_column_int64(st, 7) != 0;
+        r.prio = r.prio_null ? 0 : col_int(c, st, 6, "records", r.id, "prio", &bad);
+        /* NULL is disabled (the SQL joins' `disabled = 0` does not match it); anything but an integer is a bad cell, not "enabled" */
+        r.disabled = sqlite3_column_type(st, 7) == SQLITE_NULL || col_int(c, st, 7, "records", r.id, "disabled", &bad) != 0;
         r.ordername = col_text(c, st, 8, "records", r.id, "ordername", &bad);
         if (bad) {
             ret = -1;
@@ -688,14 +719,14 @@ static int sq_scan_apex(db_conn_t *c, const int64_t *domain_id, db_apex_cb cb, v
         }
         bool bad = false;
         db_apex_row_t r;
-        r.domain_id = sqlite3_column_int64(st, 0);
+        r.domain_id = col_int(c, st, 0, "records", sqlite3_column_int64(st, 4), "domain_id", &bad);
         const char *type = col_text(c, st, 1, "records", sqlite3_column_int64(st, 4), "type", &bad);
         r.is_soa = type && strcasecmp(type, "SOA") == 0;
         r.addr_type = type && strcasecmp(type, "A") == 0 ? 1 : type && strcasecmp(type, "AAAA") == 0 ? 28 : 0;
         r.name = col_text(c, st, 5, "records", sqlite3_column_int64(st, 4), "name", &bad);
         r.content = col_text(c, st, 2, "records", sqlite3_column_int64(st, 4), "content", &bad);
         r.ttl_null = sqlite3_column_type(st, 3) == SQLITE_NULL;
-        r.ttl = r.ttl_null ? 0 : sqlite3_column_int64(st, 3);
+        r.ttl = r.ttl_null ? 0 : col_int(c, st, 3, "records", sqlite3_column_int64(st, 4), "ttl", &bad);
         if (bad) {
             ret = -1;
             break;

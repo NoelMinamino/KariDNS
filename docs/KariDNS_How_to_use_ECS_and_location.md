@@ -59,7 +59,7 @@ In a tinydns data file (`file-format tinydns;`), location prefixes are defined w
   - `<prefix>`: Decimal IPv4 prefix with 1 to 4 octets separated by dots, as in djbdns. The prefix length is the number of octets times 8 (e.g. `192.168.` = `/16`, `10.` = `/8`, `127.0.0.1` = `/32`).
   - KariDNS extension: a `/n` suffix (`/0` to `/32`) sets the prefix length in bits, e.g. `10.0.0.0/8`, `10.16.0.0/12` or `192.168/24` (missing octets are zero). Bits beyond the prefix are cleared (`10.16.3.4/12` is `10.16.0.0/12`). Any other text after `/` or a length above 32 is a parse error. djbdns `tinydns-data` does not understand `/n`, so such a file is KariDNS-specific.
   - Empty prefix `%<loc>:` (or `%df:`): Catch-all location when no other prefix matches.
-  - At most 4096 `%` lines are loaded per zone; further lines are ignored with a warning.
+  - At most 4096 `%` lines are loaded per zone; the 4097th is a parse error and the data file is not loaded (a dropped line would change who gets which answer).
 - **Record Assignment**:
   - The 6th field of standard tinydns record lines (`+`, `=`, `@`, `^`, `C`, etc.) specifies the location code.
   - If the location field is omitted, the record is **unrestricted** and is served to all clients.

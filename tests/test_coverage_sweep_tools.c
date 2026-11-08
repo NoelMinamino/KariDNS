@@ -217,11 +217,16 @@ static void test_karicheck(void) {
 }
 
 /* ---------------------------------------------------------------- karictl */
+/* karictl.conf readers of tools/karictl.c (the sweep compiles karictl.c as another unit) */
+char *extract_secret_from_config(const char *path);
+char *extract_socket_from_config(const char *path);
+char *extract_algorithm_from_config(const char *path);
 static char g_sock[200];
 static volatile int g_ctl_mode;
 static const char *CTL_SECRET_B64 = "c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0";
 static const char *CTL_SECRET_RAW = "secretsecretsecretsecret";     /* CTL_SECRET_B64 decoded */
 static volatile int g_ctl_auth_ok;                                  /* mode 9: result of the HMAC check */
+static const char *g_ctl_raw;                                         /* mode 9: the secret the check uses instead of CTL_SECRET_RAW, when set */
 
 static void *ctl_server(void *arg) {
     int ls = *(int *)arg;
@@ -241,7 +246,7 @@ static void *ctl_server(void *arg) {
         if (mode == 9) {                                  /* verify an HMAC-SHA512 challenge response */
             b[r] = 0;
             unsigned char md[EVP_MAX_MD_SIZE]; unsigned int md_len = 0;
-            HMAC(EVP_sha512(), CTL_SECRET_RAW, strlen(CTL_SECRET_RAW), (const unsigned char *)chal, 64, md, &md_len);
+            HMAC(EVP_sha512(), g_ctl_raw ? g_ctl_raw : CTL_SECRET_RAW, strlen(g_ctl_raw ? g_ctl_raw : CTL_SECRET_RAW), (const unsigned char *)chal, 64, md, &md_len);
             char want[2 * EVP_MAX_MD_SIZE + 8] = "AUTH ";
             for (unsigned int k = 0; k < md_len; k++) snprintf(want + 5 + 2 * k, 3, "%02x", md[k]);
             strcat(want, "\n");
@@ -329,6 +334,50 @@ static void test_karictl(void) {
         assert(g_ctl_auth_ok == 0);
         assert(run_tool(karictl_main, "karictl", "-c", pbad, "reconfig", NULL) == 2);   /* unsupported: no connect */
         g_ctl_mode = 0;
+    }
+    /* L1: karictl.conf in the shape of the shipped sample.  The comments carry `secret "..."` / `socket "..."` text before the real
+     * statements (the sample's own comment has `{ secret "..."; }`): only the statements outside comments and strings count. */
+    {
+        char csample[900], cws[900];
+        snprintf(csample, sizeof(csample),
+                 "// control-channel { secret \"%s\"; } is what the server writes\n# secret \"AAAA\"\n/* socket \"/tmp/not-this.sock\"; algorithm \"hmac-sha1\"; */\n"
+                 "// socket \"/tmp/not-this-either.sock\";\nsocket \"%s\";\n"
+                 "key \"karictl\" {\n    algorithm \"hmac-sha512\";\n    // secret \"BBBB\";\n    secret \"%s\";\n};\n",
+                 "UkVQTEFDRS1NRTpvcGVuc3NsLXJhbmQtYmFzZTY0LTMy", g_sock, CTL_SECRET_B64);
+        /* R5: 25 bytes encode to 4n chars ending in "=="; a trailing space must not change how many bytes the secret has */
+        snprintf(cws, sizeof(cws), "socket \"%s\";\nkey \"k\" { algorithm hmac-sha512; secret \"c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0WA== \"; };\n", g_sock);
+        const char *psample = wfile("karictl_sample.conf", csample);
+        const char *pws = wfile("karictl_ws.conf", cws);
+        g_ctl_mode = 9;
+        g_ctl_auth_ok = 0;
+        assert(run_tool(karictl_main, "karictl", "-c", psample, "reconfig", NULL) == 0);
+        assert(g_ctl_auth_ok == 1);
+        g_ctl_raw = "secretsecretsecretsecretX";
+        g_ctl_auth_ok = 0;
+        assert(run_tool(karictl_main, "karictl", "-c", pws, "reconfig", NULL) == 0);
+        assert(g_ctl_auth_ok == 1);
+        g_ctl_raw = NULL;
+        g_ctl_mode = 0;
+        char *s1 = extract_secret_from_config(psample);
+        assert(s1 && strcmp(s1, CTL_SECRET_B64) == 0);
+        free(s1);
+        char *a1 = extract_algorithm_from_config(psample);
+        assert(a1 && strcmp(a1, "hmac-sha512") == 0);
+        free(a1);
+        char *k1 = extract_socket_from_config(psample);
+        assert(k1 && strcmp(k1, g_sock) == 0);
+        free(k1);
+        /* the sample itself (the tests run from the top of the source tree): its comment line holds `{ secret "..."; }` before the key */
+        FILE *sf = fopen("karictl.conf.sample", "r");
+        if (sf) {
+            fclose(sf);
+            char *ss = extract_secret_from_config("karictl.conf.sample");
+            assert(ss && strcmp(ss, "UkVQTEFDRS1NRTpvcGVuc3NsLXJhbmQtYmFzZTY0LTMy") == 0);
+            free(ss);
+            char *sk = extract_socket_from_config("karictl.conf.sample");
+            assert(sk == NULL);   /* the sample's socket line is a comment */
+            free(sk);
+        }
     }
     run_tool(karictl_main, "karictl", "tsig-keygen", NULL);
     run_tool(karictl_main, "karictl", "tsig-keygen", "mykey", NULL);
@@ -495,7 +544,7 @@ static void test_lint_messages(void) {
     lint_expect("sshfp empty", &o, "(line 9): SSHFP invalid fingerprint hex string ''");
     lint_zone(&o, "", "_k.a.test.:0:300:0123\n", fix_tinydns);
     lint_expect("sshfp fp_type range", &o, "SSHFP fp_type '300' out of range (0-255)");
-    lint_expect("sshfp algorithm 0", &o, "SSHFP algorithm '0' is outside standard RFC assignments (1-4)");
+    lint_expect("sshfp algorithm 0", &o, "SSHFP algorithm '0' is outside standard RFC assignments (1-4, 6)");
 
     /* the apex SOA that no client sees */
     lint_zone(&o, "", "", fix_soa_restricted);

@@ -13,6 +13,8 @@
 #include <poll.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include "dns_wire.h"
@@ -1863,6 +1865,13 @@ static void test_dns_cookie_engine_rfc9018(void) {
     n = gr_build_cookie_query(req, "host1.example.", 1, opt, 24);
     gr_query_raw(req, n, "host1.example.", 1, ip, false, &r);
     assert(r.rcode == 0);
+    // ...and answered with a new cookie from the current (first) secret, not the old one echoed (RFC 9018 section 5; low batch L3):
+    // it still verifies once the old secret is gone
+    ck = gr_find_cookie(&r, &clen, &opt_ttl);
+    assert(ck && clen == 24 && memcmp(ck, cc, 8) == 0 && memcmp(ck + 8, sc, 16) != 0);
+    server_config_t cur_only = g_gr.cfg;
+    cur_only.cookie_secret_count = 1;
+    assert(verify_server_cookie(&cur_only, ip, cc, ck + 8, 16, (uint32_t)time(NULL)) == SERVER_COOKIE_VALID);
     // ...and rejected once it is removed (stage 3)
     g_gr.cfg.cookie_secret_count = 1;
     gr_query_raw(req, n, "host1.example.", 1, ip, false, &r);
@@ -1879,6 +1888,47 @@ static void test_dns_cookie_engine_rfc9018(void) {
     memset(&g_gr.cfg, 0, sizeof(g_gr.cfg));
     zone_arena_destroy(&g_gr.arena);
     printf("  -> RFC 9018 DNS Cookie engine handling passed.\n");
+    fflush(stdout);
+}
+
+// low batch L3, dns_query_engine.c [12]: a CH question that is not one of the built-in names is not answered from the IN zone that holds the
+// name (it used to be NOERROR / NXDOMAIN with AA=1).  BIND has no CHAOS view with such a zone, so it is REFUSED, AA=0, as for any name this
+// server is not authoritative for.  The built-in names and the IN questions are unchanged.
+static void test_chaos_class_not_builtin_refused(void) {
+    printf("[TEST] Query Engine: a CH question outside the built-in zones is REFUSED...\n");
+    fflush(stdout);
+    gr_setup("example.",
+        "$ORIGIN example.\n$TTL 3600\n"
+        "@ IN SOA ns.example.com. hostmaster.example.com. 1 7200 3600 1209600 3600\n"
+        "@ IN NS ns.example.com.\n"
+        "host1 IN A 192.0.2.1\n"
+        "*.wild IN A 192.0.2.2\n");
+    static const char *const names[] = { "host1.example.", "example.", "nosuch.example.", "x.wild.example." };
+    static const uint16_t types[] = { 16, 1, 16, 1 };
+    uint8_t req[512];
+    gr_resp_t r;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        size_t n = 0;
+        build_dns_query(req, &n, 0x4592, names[i], types[i], false);
+        gr_query_raw(req, n, names[i], types[i], "192.0.2.100", false, &r);
+        assert(r.aa && (r.rcode == 0 || r.rcode == 3));  // class IN: answered from the zone as before
+        req[n - 2] = 0; req[n - 1] = 3;                  // QCLASS = CH
+        gr_query_raw(req, n, names[i], types[i], "192.0.2.100", false, &r);
+        assert(r.rcode == 5 && !r.aa && r.counts[0] == 0 && r.counts[1] == 0);
+        gr_query_raw(req, n, names[i], types[i], "192.0.2.100", true, &r);      // TCP: the same
+        assert(r.rcode == 5 && !r.aa);
+    }
+    // the built-in names are answered in class CH
+    {
+        size_t n = 0;
+        build_dns_query(req, &n, 0x4592, "version.bind.", 16, false);
+        req[n - 2] = 0; req[n - 1] = 3;
+        gr_query_raw(req, n, "version.bind.", 16, "192.0.2.100", false, &r);
+        assert(r.rcode == 0 && r.aa);
+    }
+    memset(&g_gr.cfg, 0, sizeof(g_gr.cfg));
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> CH question outside the built-in zones passed.\n");
     fflush(stdout);
 }
 
@@ -2098,6 +2148,33 @@ static void test_program_plugins_and_forward_zone_helpers(void) {
     null_prog_cfg.domain = "null.prog.";
     program_plugin_t null_out;
     assert(spawn_one_program_plugin(&null_prog_cfg, "", &null_out) == false);
+
+    // 9b. low batch L3, dns_query_engine.c [15]: when the second pipe() fails, the first pair is closed again.  RLIMIT_NOFILE leaves room
+    // for exactly one pipe; the lowest free descriptor must be the same after the call.
+    {
+        int fa = open("/dev/null", O_RDONLY), fb = open("/dev/null", O_RDONLY);
+        assert(fa >= 0 && fb >= 0);
+        close(fa);
+        close(fb);
+        if (fb == fa + 1) {
+            zone_config_t pipe_cfg;
+            memset(&pipe_cfg, 0, sizeof(pipe_cfg));
+            pipe_cfg.domain = "pipe.prog.";
+            tzx(&pipe_cfg)->program_path = (char *)"/usr/bin/true";
+            program_plugin_t pipe_out;
+            struct rlimit old_lim, lim;
+            assert(getrlimit(RLIMIT_NOFILE, &old_lim) == 0);
+            lim = old_lim;
+            lim.rlim_cur = (rlim_t)fa + 2;
+            assert(setrlimit(RLIMIT_NOFILE, &lim) == 0);
+            bool spawned = spawn_one_program_plugin(&pipe_cfg, "", &pipe_out);
+            assert(setrlimit(RLIMIT_NOFILE, &old_lim) == 0);
+            assert(!spawned);
+            int again = open("/dev/null", O_RDONLY);
+            assert(again == fa);                  // nothing leaked
+            close(again);
+        }
+    }
 
     // 10. nsec_covers_name & find_covering_nsec
     zone_arena_t nsec_arena;
@@ -10054,12 +10131,23 @@ static void test_b9a_alias_response_parser(void) {
     b9_pk_rr(&p, "end.other.test.", 1, 3, 77, a2, 4);             /* CLASS CH: ignored */
     b9_pk_rr(&p, "unrelated.test.", 1, 1, 77, a2, 4);             /* not in the chain: ignored */
     alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o);
-    assert(o.rc == 0 && o.n == 1 && o.ttl == 77 && memcmp(o.rd, a1, 4) == 0);
+    assert(o.rc == 0 && o.n == 1 && o.ttl == 20 && memcmp(o.rd, a1, 4) == 0);    /* the smallest TTL of the CNAMEs followed (RFC 2181 s5.2) */
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 3, "t.target.test.", 1);
+    l = b9_pk_name(cn, "mid.other.test.");
+    b9_pk_rr(&p, NULL, 5, 1, 500, cn, l);
+    l2 = b9_pk_name(cn2, "end.other.test.");
+    b9_pk_rr(&p, "mid.other.test.", 5, 1, 90, cn2, l2);
+    b9_pk_rr(&p, "end.other.test.", 1, 1, 77, a1, 4);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o);
+    assert(o.rc == 0 && o.n == 1 && o.ttl == 77);                                /* the final RRset is the smallest */
     /* a chain that ends without addresses is NODATA */
     b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1);
     l = b9_pk_name(cn, "gone.other.test.");
     b9_pk_rr(&p, NULL, 5, 1, 500, cn, l);
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == 0 && o.n == 0);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == 0 && o.n == 0 && o.ttl == ALIAS_NEG_TTL);
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1);                      /* ... and does not outlive a shorter CNAME */
+    b9_pk_rr(&p, NULL, 5, 1, 1, cn, l);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == 0 && o.n == 0 && o.ttl == 1 && ALIAS_NEG_TTL > 1);
     /* a loop, and a chain longer than ALIAS_MAX_CNAME, are refused */
     b9_pk_hdr(&p, 0x1234, 0x80, 0, 2, "t.target.test.", 1);
     l = b9_pk_name(cn, "b.test.");   b9_pk_rr(&p, NULL, 5, 1, 60, cn, l);
@@ -10713,6 +10801,7 @@ int main(void) {
     test_image_glue_order_and_caps();
     test_rfc4592_wildcard_golden();
     test_dns_cookie_engine_rfc9018();
+    test_chaos_class_not_builtin_refused();
     test_delegation_referral_and_ds_handling();
     test_program_plugins_and_forward_zone_helpers();
     test_query_engine_helpers_and_edge_cases();

@@ -163,9 +163,9 @@ kdc1    IN A  192.0.2.26
 ; PX (X.400 Mail Information, RFC 2163, Type 26)
 x400-gw IN PX 10 prmd-a.example.com. admd-b.example.com.
 
+; the public key is one token (RFC 8005 section 5, as BIND reads it): what follows it are rendezvous servers
 host-hip IN HIP ( 2 1B16A611E21577146EB10AC91B5EE027
-    z+dS47XItL/GDrIZ736/ChYfkg3EvMkSaD2D0Rbot3lBwte5Ek2Rq3Q2Cxa3FEUU
-    m8Cr6cDPCLrW49OEu6ObcQ== )
+    z+dS47XItL/GDrIZ736/ChYfkg3EvMkSaD2D0Rbot3lBwte5Ek2Rq3Q2Cxa3FEUUm8Cr6cDPCLrW49OEu6ObcQ== )
 
 ; ----------------------------------------------------------------------------
 ; WKS (Well-Known Services, RFC 1035, Type 11)

@@ -936,6 +936,83 @@ static void test_snapshot_rebuild_case_32(void) {
     release_zone_snapshot(s5);
 }
 
+/* L2, RFC 9432 s4.1 / s5.1: a catalog zone has exactly one version TXT RR.  With two ("2" and "1") the catalog is broken and none of its
+ * members is created, even though one of the RRs says "2"; with one it works. */
+static void catv_write(int serial, const char *version_rrs) {
+    char text[512];
+    snprintf(text, sizeof(text),
+             "$ORIGIN catv.example.\n$TTL 60\n@ IN SOA ns h %d 2 3 4 5\n@ IN NS invalid.\n%sabc.zones IN PTR mv.example.\n",
+             serial, version_rrs);
+    wfile("catv.zone", text);
+}
+
+static void test_snapshot_low_l2_catalog_version(void) {
+    printf("[TEST] Snapshot Rebuild: L2 catalog with two version TXT records is broken (RFC 9432 s5.1)...\n");
+    catv_write(1, "version IN TXT \"2\"\nversion IN TXT \"1\"\n");
+    server_config_t *cfg = load_conf(
+        "options { directory \"%s\"; };\n"
+        "zone \"catv.example\" { type master; file \"%s/catv.zone\"; catalog-zone yes; };\n", g_dir, g_dir);
+    zone_db_snapshot_t *s1 = build(cfg, false);
+    zone_db_entry_t *cat = snapshot_get_zone_in_view(s1, "__default__", "catv.example.");
+    assert(cat);
+    assert(snapshot_get_zone_in_view(s1, "__default__", "mv.example.") == NULL);
+    assert(cat->catalog_member_count == 0);
+
+    /* one version RR: the same catalog works */
+    catv_write(2, "version IN TXT \"2\"\n");
+    zone_config_t *zcfg = find_zone_config_in_view(cfg, "__default__", "catv.example.");
+    assert(zcfg && zcfg->is_catalog);
+    assert(reload_master_zone(cat, zcfg) == RELOAD_OK);
+    catalog_process_membership(cat, zcfg, "__default__");
+    zone_db_snapshot_t *s2 = acquire_retained_zone_snapshot();
+    assert(snapshot_get_zone_in_view(s2, "__default__", "mv.example.") != NULL);
+    assert(cat->catalog_member_count == 1);
+
+    /* a second version RR later: the update is refused and the members stay as they were */
+    catv_write(3, "version IN TXT \"1\"\nversion IN TXT \"2\"\n");
+    assert(reload_master_zone(cat, zcfg) == RELOAD_OK);
+    catalog_process_membership(cat, zcfg, "__default__");
+    assert(cat->catalog_member_count == 1);
+    release_zone_snapshot(s1);
+    release_zone_snapshot(s2);
+}
+
+/* L2: a $INCLUDE of something that is not a regular file (a FIFO without a writer would block the reload for good while it holds
+ * writer_lock) fails the reload; skip_unchanged compares with the mtime and size of the file that was read (fstat of the same fd). */
+static void test_snapshot_low_l2_reload_file(void) {
+    printf("[TEST] Snapshot Rebuild: L2 $INCLUDE of a FIFO fails the reload, the mtime recorded is the one of the file read...\n");
+    wfile("inc_l2.inc", "www IN A 192.0.2.80\n");
+    wfile("incl2.zone", "$ORIGIN incl2.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nns IN A 192.0.2.1\n$INCLUDE inc_l2.inc\n");
+    server_config_t *cfg = load_conf(
+        "options { directory \"%s\"; };\n"
+        "zone \"incl2.example\" { type master; file \"%s/incl2.zone\"; };\n", g_dir, g_dir);
+    zone_db_snapshot_t *s1 = build(cfg, false);
+    zone_db_entry_t *z = snapshot_get_zone_in_view(s1, "__default__", "incl2.example.");
+    assert(z);
+    zone_config_t *zcfg = find_zone_config_in_view(cfg, "__default__", "incl2.example.");
+    assert(zcfg);
+    zone_version_t *v = atomic_load_explicit(&z->rcu.active, memory_order_acquire);
+    assert(v && v->image && zone_image_find_name(v->image, "www.incl2.example.") != ZONE_IMAGE_NONE);
+    char zpath[300];
+    struct stat st;
+    snprintf(zpath, sizeof(zpath), "%s/incl2.zone", g_dir);
+    assert(stat(zpath, &st) == 0);
+    assert(z->last_loaded_mtime == st.st_mtime && z->last_loaded_size == st.st_size);
+
+    char ipath[300];
+    snprintf(ipath, sizeof(ipath), "%s/inc_l2.inc", g_dir);
+    assert(unlink(ipath) == 0);
+    assert(mkfifo(ipath, 0600) == 0);
+    alarm(30);                                      /* without O_NONBLOCK the open waits for a writer for ever */
+    int rc = reload_master_zone(z, zcfg);
+    alarm(0);
+    assert(rc != RELOAD_OK);
+    v = atomic_load_explicit(&z->rcu.active, memory_order_acquire);
+    assert(v && v->image && zone_image_find_name(v->image, "www.incl2.example.") != ZONE_IMAGE_NONE);   /* the old version serves */
+    unlink(ipath);
+    release_zone_snapshot(s1);
+}
+
 static void test_snapshot_rebuild_case_33(void) {
     printf("[TEST] Snapshot Rebuild: ECS trusted resolvers array validation...\n");
     cidr_entry_t cidr;
@@ -1751,6 +1828,8 @@ int main(void) {
     test_snapshot_view_match_key();
     test_snapshot_rebuild_type_change();
     test_snapshot_rebuild_case_32();
+    test_snapshot_low_l2_catalog_version();
+    test_snapshot_low_l2_reload_file();
     test_snapshot_rebuild_case_33();
     test_snapshot_rebuild_case_35();
     test_retire_object_and_entry_config();

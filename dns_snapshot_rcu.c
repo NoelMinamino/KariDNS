@@ -980,20 +980,21 @@ static char *server_load_file_cb(parse_context_t *ctx, const char *rel_path, dev
 #ifndef O_NOFOLLOW
 #define O_NOFOLLOW 0
 #endif
-    int fd = open_via_dir_cache(rel_path, O_RDONLY | O_NOFOLLOW, 0, false);
+    /* O_NONBLOCK: opening a FIFO for reading would wait for a writer (here with writer_lock held); the fstat() below refuses
+     * anything but a regular file */
+    int fd = open_via_dir_cache(rel_path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK, 0, false);
     if (fd < 0) {
         return NULL;
     }
-    
-    if (out_dev || out_ino) {
+
+    {
         struct stat st;
-        if (fstat(fd, &st) == 0) {
-            if (out_dev) *out_dev = st.st_dev;
-            if (out_ino) *out_ino = st.st_ino;
-        } else {
+        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
             close(fd);
-            return NULL; // fstat failed, fail-closed
+            return NULL; // fstat failed or not a regular file, fail-closed
         }
+        if (out_dev) *out_dev = st.st_dev;
+        if (out_ino) *out_ino = st.st_ino;
     }
 
     FILE *f = fdopen(fd, "rb");
@@ -1014,8 +1015,12 @@ static char *server_load_file_cb(parse_context_t *ctx, const char *rel_path, dev
         return NULL;
     }
     size_t read_len = fread(buf, 1, len, f);
-    buf[read_len] = '\0';
     fclose(f);
+    if (read_len != (size_t)len) {      /* a short read: a truncated $INCLUDE must not be parsed and published */
+        free(buf);
+        return NULL;
+    }
+    buf[read_len] = '\0';
     return buf;
 }
 
@@ -1837,13 +1842,12 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
 
   compute_ixfr_diff(entry, z_active, z_next);
   zone_publish_ex(entry, z_next, keep_prev);
-  struct stat st_loaded;
-  if (stat_via_dir_cache(file, &st_loaded) == 0) {
-    entry->last_loaded_mtime = st_loaded.st_mtime;
-    entry->last_loaded_size = st_loaded.st_size;
-    if (entry->is_secondary) {
-      atomic_store_explicit(&entry->last_successful_transfer, (time_t)st_loaded.st_mtime, memory_order_release);
-    }
+  /* what skip_unchanged compares with is the mtime and size of the file that was read (root_st, the fstat() of that fd): a stat() of the
+   * path now could see a file changed after the read and the change would never be reloaded.  (0 = fstat failed: never skipped.) */
+  entry->last_loaded_mtime = root_st.st_mtime;
+  entry->last_loaded_size = root_st.st_size;
+  if (entry->is_secondary && root_st.st_mtime != 0) {
+    atomic_store_explicit(&entry->last_successful_transfer, (time_t)root_st.st_mtime, memory_order_release);
   }
   pthread_mutex_unlock(&entry->writer_lock);
   syslog(LOG_NOTICE, "[Zone] Reload successful for '%s'", entry->domain);
@@ -4649,11 +4653,14 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
     zone_db_snapshot_t *old_snap = atomic_load_explicit(&g_zone_db_active, memory_order_acquire);
     zone_db_snapshot_t *new_snap = calloc(1, sizeof(zone_db_snapshot_t));
+    /* A catalog delta takes over new_desired_members: the entry keeps them on success, and every failure below frees them (the
+     * caller has nothing to free after a NULL return; a full reload passes none) */
     if (!new_snap) {
+        free_catalog_member_ids(new_desired_members, new_desired_count);
         abort_rebuild_snapshot(NULL, "new_snap");
         return NULL;
     }
-    
+
     bool reused = false;
     burst_yield_t by = BURST_YIELD_INIT;
     if (active_config && snapshot_views_reusable(old_snap, active_config)) {
@@ -4895,6 +4902,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
     } else {
         // MODE: Catalog Delta Update
         if (!catalog_entry_to_update) {
+            free_catalog_member_ids(new_desired_members, new_desired_count);
             abort_rebuild_snapshot(new_snap, "null catalog_entry_to_update");
             return NULL;
         }
@@ -4907,6 +4915,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         cat_ops_t cops;
         memset(&cops, 0, sizeof(cops));
         if (!coo_new) {
+            free_catalog_member_ids(new_desired_members, new_desired_count);
             abort_rebuild_snapshot(new_snap, "catalog CoO intentions");
             return NULL;
         }
@@ -4929,6 +4938,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             if (removed_members) free(removed_members);
             if (coo_evicted_members) free(coo_evicted_members);
             free(coo_new);
+            free_catalog_member_ids(new_desired_members, new_desired_count);
             abort_rebuild_snapshot(new_snap, "catalog member allocations");
             return NULL;
         }
@@ -5059,6 +5069,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             free(added_members); free(removed_members); free(coo_evicted_members);
             free(coo_new);
             cat_ops_free(&cops);
+            free_catalog_member_ids(new_desired_members, new_desired_count);   /* (the members the filter dropped were freed there; the count is the kept ones) */
             abort_rebuild_snapshot(new_snap, "catalog changes");
             return NULL;
         }
@@ -5087,6 +5098,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             free(added_members); free(removed_members); free(coo_evicted_members);
             free(coo_new);
             cat_ops_free(&cops);
+            free_catalog_member_ids(new_desired_members, new_desired_count);
             abort_rebuild_snapshot(new_snap, "catalog new_entries");
             return NULL;
         }
@@ -5117,9 +5129,12 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             if (added_members[i].group_count > 0) {
                 entry->groups = calloc(added_members[i].group_count, sizeof(char*));
                 if (entry->groups) {
-                    entry->group_count = added_members[i].group_count;
+                    /* group_count counts the strings that were copied (catalog_entry_set_groups() does the same): a strdup() failure
+                     * leaves no NULL inside the counted part */
                     for (int g = 0; g < added_members[i].group_count; g++) {
                         entry->groups[g] = strdup(added_members[i].groups[g]);
+                        if (!entry->groups[g]) break;
+                        entry->group_count = g + 1;
                     }
                 }
             }
@@ -5212,6 +5227,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
             free(coo_new);
             cat_ops_free(&cops);
+            free_catalog_member_ids(new_desired_members, new_desired_count);
             abort_rebuild_snapshot(new_snap, "catalog plan");
             return NULL;
         }

@@ -53,6 +53,17 @@ static bool path_has_dotdot_component(const char *p) {
 #define O_RESOLVE_BENEATH 0
 #endif
 
+/* The cache key of a directory path: trailing slashes cut ("/var/dns/" and "/var/dns" are one directory, and a root registered as
+ * "/var/dns/" must match the "/var/dns/zones" that open_dir_below_root_locked() looks for), the root "/" kept.  false = too long. */
+static bool dir_key(const char *in, char *out, size_t cap) {
+  size_t n = strlen(in);
+  while (n > 1 && in[n - 1] == '/') n--;
+  if (n >= cap) return false;
+  memcpy(out, in, n);
+  out[n] = '\0';
+  return true;
+}
+
 /* Capability mode, directory not cached: open it through the fd of a root registered with dir_fd_cache_add_root() that contains it
  * (the longest such root), as a read-only directory below it.  Only a plain relative remainder is accepted ("a/b", no "..", no leading
  * '/'), and O_RESOLVE_BENEATH keeps symbolic links from leading out.  The new fd is cached like any other.  g_dir_fd_lock is held. */
@@ -62,11 +73,13 @@ static int open_dir_below_root_locked(const char *dirpath) {
   for (dir_fd_entry_t *e = g_dir_fd_table; e; e = e->next) {
     if (!e->is_root) continue;
     size_t n = strlen(e->dirpath);
-    if (n == 0 || n >= strlen(dirpath) || strncmp(dirpath, e->dirpath, n) != 0 || dirpath[n] != '/') continue;
+    /* the root "/" ends in the separator itself; any other key has none (dir_key()) */
+    size_t sep = (n == 1 && e->dirpath[0] == '/') ? 0 : n;
+    if (n == 0 || n >= strlen(dirpath) || strncmp(dirpath, e->dirpath, n) != 0 || dirpath[sep] != '/') continue;
     if (n > best_len) { best = e; best_len = n; }
   }
   if (!best) return -1;
-  const char *rem = dirpath + best_len + 1;
+  const char *rem = dirpath + best_len + (best_len == 1 && best->dirpath[0] == '/' ? 0 : 1);
   while (*rem == '/') rem++;
   if (!*rem || path_has_dotdot_component(rem)) return -1;
   int fd = openat(best->fd, rem, O_DIRECTORY | O_CLOEXEC | O_RDONLY | O_RESOLVE_BENEATH);
@@ -86,7 +99,12 @@ static int open_dir_below_root_locked(const char *dirpath) {
   return fd;
 }
 
-static int get_or_open_dir_fd(const char *dirpath, bool writable) {
+static int get_or_open_dir_fd(const char *dirpath_in, bool writable) {
+  char dirpath[PATH_MAX];
+  if (!dir_key(dirpath_in, dirpath, sizeof(dirpath))) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
   pthread_mutex_lock(&g_dir_fd_lock);
   for (dir_fd_entry_t *e = g_dir_fd_table; e; e = e->next) {
     if (strcmp(e->dirpath, dirpath) == 0) {
@@ -182,31 +200,48 @@ bool dir_fd_cache_add_root(const char *dirpath) {
     errno = EINVAL;
     return false;
   }
-  int fd = get_or_open_dir_fd(dirpath, false);
+  char key[PATH_MAX];
+  if (!dir_key(dirpath, key, sizeof(key))) {
+    errno = ENAMETOOLONG;
+    return false;
+  }
+  int fd = get_or_open_dir_fd(key, false);
   if (fd < 0) return false;
   pthread_mutex_lock(&g_dir_fd_lock);
   for (dir_fd_entry_t *e = g_dir_fd_table; e; e = e->next)
-    if (strcmp(e->dirpath, dirpath) == 0) e->is_root = true;
+    if (strcmp(e->dirpath, key) == 0) e->is_root = true;
   pthread_mutex_unlock(&g_dir_fd_lock);
   return true;
 }
 
+/* cap_rights_limit() with the failure logged.  ENOSYS (a kernel without CAPABILITY_MODE) is not a failure: there are no rights to keep.
+ * On false errno is the cause. */
+static bool limit_fd_rights(int fd, const cap_rights_t *rights, const char *what) {
+  if (cap_rights_limit(fd, rights) == 0 || errno == ENOSYS) return true;
+  int e = errno;
+  syslog(LOG_ERR, "[Sandbox] cap_rights_limit(%s, fd %d) failed: %s; the descriptor keeps its wider rights", what, fd, strerror(e));
+  errno = e;
+  return false;
+}
+
 /* Takes CAP_FCHOWN off fd (a file opened through a writable directory fd inherits it). */
-void fd_drop_fchown(int fd) {
+bool fd_drop_fchown(int fd) {
   cap_rights_t rights;
-  if (fd < 0 || cap_rights_get(fd, &rights) != 0 || !cap_rights_is_set(&rights, CAP_FCHOWN)) return;
+  if (fd < 0 || cap_rights_get(fd, &rights) != 0 || !cap_rights_is_set(&rights, CAP_FCHOWN)) return true;
   cap_rights_clear(&rights, CAP_FCHOWN);
-  cap_rights_limit(fd, &rights);
+  return limit_fd_rights(fd, &rights, "drop CAP_FCHOWN");
 }
 
 /* After the startup hand-off of the logs: the writable directory fds lose CAP_FCHOWN, and ones opened later do not get
  * it.  The processes forked after this (Backend, routers, broker) run as the run user anyway. */
-void dir_fd_cache_drop_fchown(void) {
+bool dir_fd_cache_drop_fchown(void) {
+  bool ok = true;
   pthread_mutex_lock(&g_dir_fd_lock);
   g_dir_fd_fchown_dropped = true;
   for (dir_fd_entry_t *e = g_dir_fd_table; e; e = e->next)
-    if (e->is_writable) fd_drop_fchown(e->fd);
+    if (e->is_writable && !fd_drop_fchown(e->fd)) ok = false;
   pthread_mutex_unlock(&g_dir_fd_lock);
+  return ok;
 }
 
 int stat_via_dir_cache(const char *path, struct stat *sb) {
@@ -225,11 +260,12 @@ int stat_via_dir_cache(const char *path, struct stat *sb) {
 int renameat_via_dir_cache(const char *old_path, const char *new_path) {
   char odir[PATH_MAX], obase[PATH_MAX], ndir[PATH_MAX], nbase[PATH_MAX];
   if (!split_path_for_openat(old_path, odir, sizeof(odir), obase,
-                             sizeof(obase)))
+                             sizeof(obase)) ||
+      !split_path_for_openat(new_path, ndir, sizeof(ndir), nbase,
+                             sizeof(nbase))) {
+    errno = EINVAL;
     return -1;
-  if (!split_path_for_openat(new_path, ndir, sizeof(ndir), nbase,
-                             sizeof(nbase)))
-    return -1;
+  }
   int ofd = get_or_open_dir_fd(odir, true);
   int nfd = get_or_open_dir_fd(ndir, true);
   if (ofd < 0 || nfd < 0)
@@ -276,7 +312,7 @@ int unlink_via_dir_cache(const char *path) {
   return unlinkat(dfd, basebuf, 0);
 }
 
-void limit_server_socket_rights(int fd, bool is_listening_tcp) {
+bool limit_server_socket_rights(int fd, bool is_listening_tcp) {
   cap_rights_t rights;
   if (is_listening_tcp)
     cap_rights_init(&rights, CAP_ACCEPT, CAP_RECV, CAP_SEND, CAP_FCNTL,
@@ -286,24 +322,29 @@ void limit_server_socket_rights(int fd, bool is_listening_tcp) {
     cap_rights_init(&rights, CAP_RECV, CAP_SEND, CAP_CONNECT, CAP_EVENT,
                     CAP_GETSOCKOPT, CAP_SETSOCKOPT, CAP_SHUTDOWN,
                     CAP_GETSOCKNAME, CAP_GETPEERNAME);
-  cap_rights_limit(fd, &rights);
+  return limit_fd_rights(fd, &rights, is_listening_tcp ? "listening socket" : "server socket");
 }
 
-void limit_client_socket_rights(int fd) {
+bool limit_client_socket_rights(int fd) {
   cap_rights_t rights;
   cap_rights_init(&rights, CAP_RECV, CAP_SEND, CAP_FCNTL, CAP_EVENT,
                   CAP_GETSOCKOPT, CAP_SETSOCKOPT, CAP_SHUTDOWN, CAP_GETSOCKNAME,
                   CAP_GETPEERNAME);
-  cap_rights_limit(fd, &rights);
+  return limit_fd_rights(fd, &rights, "client socket");
 }
 
 void enter_capsicum_sandbox(void) {
 #ifndef SANITIZER_BUILD
-  if (g_dnstap_sock >= 0) {
+  /* the sender thread may reconnect meanwhile (it limits its own socket): read the descriptor once */
+  int dtap = atomic_load_explicit(&g_dnstap_sock, memory_order_acquire);
+  if (dtap >= 0) {
     cap_rights_t rights;
     /* CAP_READ / CAP_RECV: 終了時に Frame Streams の FINISH を受け取る (O-03) */
     cap_rights_init(&rights, CAP_READ, CAP_RECV, CAP_WRITE, CAP_SEND, CAP_EVENT, CAP_GETSOCKOPT, CAP_SETSOCKOPT, CAP_FCNTL, CAP_SHUTDOWN);
-    cap_rights_limit(g_dnstap_sock, &rights);
+    if (!limit_fd_rights(dtap, &rights, "dnstap socket")) {
+      fprintf(stderr, "[ERROR] [Backend] cannot limit the rights of the dnstap socket; aborting startup\n");
+      backend_exit(EXIT_FAILURE);
+    }
   }
   /* strerror() and syslog's %m look up libc's message catalog on first use
    * (/usr/share/nls/<locale>/libc.cat). In capability mode that lookup is a

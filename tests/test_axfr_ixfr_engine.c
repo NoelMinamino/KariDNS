@@ -1821,6 +1821,7 @@ static void test_extended_axfr_and_intermediate_tsig_cases(void) {
     zone_arena_init(&active);
     axfr_session_t session;
     memset(&session, 0, sizeof(session));
+    session.is_extended_mode = true;    /* the transfer is extended: the primary answered the option (the packet has no OPT, so it is set here; L2) */
 
     // Construct packet with Extended AXFR tags (LOC_STATE, ECS_STATE, LOC_TAGDEF, ECS_TAGDEF, ECS_TRUSTED, TINYDNS_LOCDEF, TINYDNS_WRAP)
     uint8_t pkt[2048] = {0};
@@ -6676,8 +6677,8 @@ static void test_p10_xfr_check_response_header(void) {
     n = p10_resp(p, sizeof(p), 0x4242, 0x80, 4, 1, "z.example.", 251, 1);
     assert(xfr_check_response_header(p, n, &s, "z.example.") == 1 && s.rcode == 4);
     P10_SESSION(251);
-    n = p10_resp(p, sizeof(p), 0x4242, 0x80, 1, 0, NULL, 0, 0);         /* error without question */
-    assert(xfr_check_response_header(p, n, &s, "z.example.") == -1);
+    n = p10_resp(p, sizeof(p), 0x4242, 0x80, 1, 0, NULL, 0, 0);         /* error without question: still the answer to the request (L2) */
+    assert(xfr_check_response_header(p, n, &s, "z.example.") == 1 && s.rcode == 1);
 #undef P10_SESSION
 
     /* handle_axfr_event(): a REFUSED answer ends at once with session.rcode set */
@@ -7226,6 +7227,7 @@ static void test_b8t2_receiver_soa_set(void) {
         if (k == 2) b8_rr(&p, z, 65408, 65302, (const uint8_t *)"zone-udp-bufsize 512;", 21);
         int rc = b8_feed(&s, &a, &p, z);
         if (k == 3) assert(rc != 0);
+        else if (k == 1) assert(rc != 0 && !s.has_settings);      /* L2: a record of class 65302 in a stream that was not negotiated refuses the transfer (it was ignored) */
         else assert(rc == 0 && s.has_settings == (k == 2) && (k != 2 || strcmp(s.settings_text, txt) == 0));
         zone_arena_destroy(&a);
     }
@@ -7786,6 +7788,7 @@ static void test_sr_i3_tagdef_limits(void) {
         axfr_session_t s;
         memset(&s, 0, sizeof(s));
         s.db_stream = mode >= 2;
+        s.is_extended_mode = !s.db_stream;      /* (the network transfer negotiated the extension; L2) */
         int rc = 0, n = 0;
         while (rc == 0 && n < 4200) {
             size_t off = sr_hdr(pkt, 1, 0, 100);
@@ -7805,6 +7808,7 @@ static void test_sr_i3_tagdef_limits(void) {
         zone_arena_init(&standby);
         axfr_session_t s;
         memset(&s, 0, sizeof(s));
+        s.is_extended_mode = true;
         size_t off = sr_hdr(pkt, 1, 0, 9);
         for (int k = 0; k < 9; k++) off = sr_tagdef(pkt, sizeof(pkt), off, false, k, 1);
         assert(parse_xfr_packet(pkt, off, &standby, NULL, &s, "example.com.") == 0);
@@ -7817,6 +7821,7 @@ static void test_sr_i3_tagdef_limits(void) {
         axfr_session_t s;
         memset(&s, 0, sizeof(s));
         s.db_stream = mode == 1;
+        s.is_extended_mode = !s.db_stream;
         int rc = 0, n = 0;
         while (rc == 0 && n < 30) {
             size_t off = sr_hdr(pkt, 1, 0, 1);
@@ -8194,6 +8199,214 @@ static void test_batch4_soa_probe(void) {
     printf("  -> batch 4 SOA probe passed.\n");
 }
 
+/* ---- low batch L2: AXFR-in / IXFR-in fixes ---- */
+static size_t l2_soa(uint8_t *p, size_t cap, size_t off, const char *owner, const char *dom, uint32_t serial) {
+    uint8_t rd[300];
+    size_t sl = 0;
+    char nm[300];
+    snprintf(nm, sizeof(nm), "ns1.%s", dom);
+    sl += (size_t)write_uncompressed_name(rd, sl, sizeof(rd), nm);
+    snprintf(nm, sizeof(nm), "admin.%s", dom);
+    sl += (size_t)write_uncompressed_name(rd, sl, sizeof(rd), nm);
+    rd[sl++] = serial >> 24; rd[sl++] = (serial >> 16) & 0xFF; rd[sl++] = (serial >> 8) & 0xFF; rd[sl++] = serial & 0xFF;
+    for (int k = 0; k < 4; k++) { rd[sl++] = 0; rd[sl++] = 0; rd[sl++] = 0; rd[sl++] = 10; }
+    return xfr_put_rr(p, cap, off, owner, 6, rd, (uint16_t)sl);
+}
+
+/* a response header (ID 0x1123, QR AA) with a question for dom/qtype and an answer count */
+static size_t l2_hdr(uint8_t *p, size_t cap, const char *dom, uint16_t qtype, int an) {
+    memset(p, 0, 12);
+    p[0] = 0x11; p[1] = 0x23; p[2] = 0x84; p[5] = 1; p[7] = (uint8_t)an;
+    size_t off = 12;
+    off += (size_t)write_uncompressed_name(p, off, cap, dom);
+    p[off++] = qtype >> 8; p[off++] = qtype & 0xFF; p[off++] = 0; p[off++] = 1;
+    return off;
+}
+
+static void test_low_l2_trailing_rrs(void) {
+    printf("[TEST] AXFR/IXFR: L2 an RR after the final SOA in the same message rejects the transfer (RFC 5936 s2.2, RFC 1995 s4)...\n");
+    static const uint8_t a1[4] = { 192, 0, 2, 1 }, a2[4] = { 192, 0, 2, 2 };
+    uint8_t p[1500];
+    size_t off;
+    zone_arena_t standby;
+    axfr_session_t s;
+
+    /* the final SOA is the last RR: fine */
+    zone_arena_init(&standby);
+    memset(&s, 0, sizeof(s));
+    off = l2_hdr(p, sizeof(p), "example.com.", 252, 3);
+    off = l2_soa(p, sizeof(p), off, "example.com.", "example.com.", 200);
+    off = xfr_put_rr(p, sizeof(p), off, "www.example.com.", 1, a1, 4);
+    off = l2_soa(p, sizeof(p), off, "example.com.", "example.com.", 200);
+    assert(parse_xfr_packet(p, off, &standby, NULL, &s, "example.com.") == 0);
+    assert(s.is_finished && !s.trailing_rrs && standby.count == 2);
+    zone_arena_destroy(&standby);
+
+    /* ... and with one more RR after it: rejected for every caller, the flag says why (the database loader's stream names the reason) */
+    zone_arena_init(&standby);
+    memset(&s, 0, sizeof(s));
+    off = l2_hdr(p, sizeof(p), "example.com.", 252, 4);
+    off = l2_soa(p, sizeof(p), off, "example.com.", "example.com.", 200);
+    off = xfr_put_rr(p, sizeof(p), off, "www.example.com.", 1, a1, 4);
+    off = l2_soa(p, sizeof(p), off, "example.com.", "example.com.", 200);
+    off = xfr_put_rr(p, sizeof(p), off, "evil.example.com.", 1, a2, 4);
+    assert(parse_xfr_packet(p, off, &standby, NULL, &s, "example.com.") == -1);
+    assert(s.is_finished && s.trailing_rrs);
+    zone_arena_destroy(&standby);
+
+    /* the same for the database loader's stream (db_stream) */
+    zone_arena_init(&standby);
+    memset(&s, 0, sizeof(s));
+    s.db_stream = true;
+    assert(parse_xfr_packet(p, off, &standby, NULL, &s, "example.com.") == -1 && s.trailing_rrs);
+    zone_arena_destroy(&standby);
+
+    /* an IXFR: new SOA, old SOA (our version), [deletions], new SOA, [additions], new SOA -- and one RR after the last */
+    zone_arena_t active;
+    zone_arena_init(&active);
+    init_axfr_zone(&active, "example.com.", "100");
+    zone_arena_init(&standby);
+    memset(&s, 0, sizeof(s));
+    s.is_ixfr = true;
+    s.client_serial = 100;
+    off = l2_hdr(p, sizeof(p), "example.com.", 251, 6);
+    off = l2_soa(p, sizeof(p), off, "example.com.", "example.com.", 200);
+    off = l2_soa(p, sizeof(p), off, "example.com.", "example.com.", 100);
+    off = l2_soa(p, sizeof(p), off, "example.com.", "example.com.", 200);
+    off = xfr_put_rr(p, sizeof(p), off, "www.example.com.", 1, a1, 4);
+    off = l2_soa(p, sizeof(p), off, "example.com.", "example.com.", 200);
+    const size_t ok_end = off;
+    off = xfr_put_rr(p, sizeof(p), off, "evil.example.com.", 1, a2, 4);
+    assert(parse_xfr_packet(p, off, &standby, &active.ver, &s, "example.com.") == -1);
+    assert(s.is_finished && s.trailing_rrs);
+    zone_arena_destroy(&standby);
+    /* without the extra RR the same IXFR is accepted */
+    zone_arena_init(&standby);
+    memset(&s, 0, sizeof(s));
+    s.is_ixfr = true;
+    s.client_serial = 100;
+    p[7] = 5;
+    assert(parse_xfr_packet(p, ok_end, &standby, &active.ver, &s, "example.com.") == 0);
+    assert(s.is_finished && !s.trailing_rrs);
+    zone_arena_destroy(&standby);
+    zone_arena_destroy(&active);
+    printf("  -> L2 trailing RRs passed.\n");
+}
+
+static void test_low_l2_ext_class_needs_negotiation(void) {
+    printf("[TEST] AXFR/IXFR: L2 class 65302 records are taken only in extended mode (or from the database loader)...\n");
+    uint8_t p[1500];
+    size_t off;
+    zone_arena_t standby;
+    axfr_session_t s;
+    static const uint8_t tag[3] = { 't', 'a', 'g' };
+    for (int mode = 0; mode < 3; mode++) {
+        zone_arena_init(&standby);
+        memset(&s, 0, sizeof(s));
+        s.is_extended_mode = mode == 1;
+        s.db_stream = mode == 2;
+        off = l2_hdr(p, sizeof(p), "example.com.", 252, 3);
+        off = l2_soa(p, sizeof(p), off, "example.com.", "example.com.", 200);
+        off += (size_t)write_uncompressed_name(p, off, sizeof(p), "example.com.");
+        p[off++] = DNS_TYPE_KARIDNS_LOC_STATE >> 8; p[off++] = DNS_TYPE_KARIDNS_LOC_STATE & 0xFF;
+        p[off++] = DNS_CLASS_KARIDNS_EXT >> 8; p[off++] = DNS_CLASS_KARIDNS_EXT & 0xFF;
+        p[off++] = 0; p[off++] = 0; p[off++] = 0; p[off++] = 0;
+        p[off++] = 0; p[off++] = 3; memcpy(p + off, tag, 3); off += 3;
+        off = l2_soa(p, sizeof(p), off, "example.com.", "example.com.", 200);
+        int rc = parse_xfr_packet(p, off, &standby, NULL, &s, "example.com.");
+        if (mode == 0) {
+            assert(rc == -1);                   /* nobody asked for the extension: a primary that sends its class is refused */
+            assert(s.ext_records == 0);
+        } else {
+            assert(rc == 0 && s.ext_records == 1 && s.is_finished);
+        }
+        zone_arena_destroy(&standby);
+    }
+    printf("  -> L2 extension class passed.\n");
+}
+
+static void test_low_l2_error_without_question(void) {
+    printf("[TEST] AXFR/IXFR: L2 an error response without a question still records the RCODE (IXFR falls back to AXFR on FORMERR / NOTIMP)...\n");
+    uint8_t p[256];
+    size_t n;
+    axfr_session_t s;
+    for (int rc = 1; rc <= 5; rc++) {
+        memset(&s, 0, sizeof(s));
+        s.query_id = 0x4242; s.query_type = 251;
+        n = p10_resp(p, sizeof(p), 0x4242, 0x80, (uint8_t)rc, 0, NULL, 0, 0);
+        assert(xfr_check_response_header(p, n, &s, "z.example.") == 1 && s.rcode == rc);
+    }
+    /* a later message of a transfer in progress (a question was seen) is the same */
+    memset(&s, 0, sizeof(s));
+    s.query_id = 0x4242; s.query_type = 252;
+    n = p10_resp(p, sizeof(p), 0x4242, 0x84, 0, 1, "z.example.", 252, 1);
+    assert(xfr_check_response_header(p, n, &s, "z.example.") == 0);
+    n = p10_resp(p, sizeof(p), 0x4242, 0x80, 2, 0, NULL, 0, 0);
+    assert(xfr_check_response_header(p, n, &s, "z.example.") == 1 && s.rcode == 2);
+    /* NOERROR without a question is still wrong in the first message, and two questions are wrong with any RCODE */
+    memset(&s, 0, sizeof(s));
+    s.query_id = 0x4242; s.query_type = 252;
+    n = p10_resp(p, sizeof(p), 0x4242, 0x84, 0, 0, NULL, 0, 0);
+    assert(xfr_check_response_header(p, n, &s, "z.example.") == -1 && s.rcode == 0);
+    memset(&s, 0, sizeof(s));
+    s.query_id = 0x4242; s.query_type = 252;
+    n = p10_resp(p, sizeof(p), 0x4242, 0x80, 1, 0, NULL, 0, 0);
+    p[5] = 2;
+    assert(xfr_check_response_header(p, n, &s, "z.example.") == -1);
+    printf("  -> L2 error response without question passed.\n");
+}
+
+static void test_low_l2_no_apex_soa(void) {
+    printf("[TEST] AXFR/IXFR: L2 a transfer whose SOA is not at the apex is refused and the zone stays as it was...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "drop.example.", sizeof(entry.domain));
+    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    pthread_mutex_init(&entry.writer_lock, NULL);
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+    init_axfr_zone(test_zone_slot(&entry, 0), "drop.example.", "100");
+    atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
+    atomic_store_explicit(&entry.serial, 100, memory_order_release);
+
+    static const uint8_t a_rd[4] = { 192, 0, 2, 1 };
+    uint8_t p1[1024];
+    size_t off = l2_hdr(p1, sizeof(p1), "drop.example.", 252, 3);
+    off = l2_soa(p1, sizeof(p1), off, "sub.drop.example.", "drop.example.", 200);     /* the SOA RR is below the apex */
+    off = xfr_put_rr(p1, sizeof(p1), off, "www.drop.example.", 1, a_rd, 4);
+    off = l2_soa(p1, sizeof(p1), off, "sub.drop.example.", "drop.example.", 200);
+
+    tcp_stream_ctx_t stream_ctx;
+    memset(&stream_ctx, 0, sizeof(stream_ctx));
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+    reset_mock_tcp_stream();
+    push_mock_tcp_msg(p1, (uint16_t)off);
+    session.query_id = 0x1123; session.query_type = 252;
+    assert(handle_axfr_event(-1, &entry, &stream_ctx, &session, NULL, NULL, 0) == -1);
+    assert(entry.serial == 100);
+    zone_version_t *cur = atomic_load_explicit(&entry.rcu.active, memory_order_acquire);
+    assert(cur == &test_zone_slot(&entry, 0)->ver);           /* nothing was published */
+
+    /* the same transfer with the SOA at the apex is installed (the test is about the owner of the SOA) */
+    off = l2_hdr(p1, sizeof(p1), "drop.example.", 252, 3);
+    off = l2_soa(p1, sizeof(p1), off, "drop.example.", "drop.example.", 200);
+    off = xfr_put_rr(p1, sizeof(p1), off, "www.drop.example.", 1, a_rd, 4);
+    off = l2_soa(p1, sizeof(p1), off, "drop.example.", "drop.example.", 200);
+    memset(&stream_ctx, 0, sizeof(stream_ctx));
+    memset(&session, 0, sizeof(session));
+    reset_mock_tcp_stream();
+    push_mock_tcp_msg(p1, (uint16_t)off);
+    session.query_id = 0x1123; session.query_type = 252;
+    assert(handle_axfr_event(-1, &entry, &stream_ctx, &session, NULL, NULL, 0) == 1);
+    assert(entry.serial == 200);
+
+    zone_arena_destroy(test_zone_slot(&entry, 0));
+    zone_arena_destroy(test_zone_slot(&entry, 1));
+    pthread_mutex_destroy(&entry.writer_lock);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+    printf("  -> L2 no apex SOA passed.\n");
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     test_batch4_soa_probe();
@@ -8444,6 +8657,10 @@ int main(void) {
     test_sr_i4_long_escaped_apex();
     test_sr_s_i1_record_class();
     test_sr_i5_txt_many_strings();
+    test_low_l2_trailing_rrs();
+    test_low_l2_ext_class_needs_negotiation();
+    test_low_l2_error_without_question();
+    test_low_l2_no_apex_soa();
     printf("=== All AXFR/IXFR Engine Unit Tests PASSED ===\n");
     return 0;
 }

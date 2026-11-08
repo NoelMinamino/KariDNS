@@ -293,6 +293,7 @@ void alias_parse_response(const uint8_t *pkt, size_t len, uint16_t id, const uin
     uint8_t cur[256];
     int curlen = (int)nlen;
     memcpy(cur, name, nlen);
+    uint32_t cname_ttl = 0xFFFFFFFFu;               /* minimum over the CNAMEs followed (RFC 2181 section 5.2: the answer must not outlive them) */
     for (int hop = 0;; hop++) {
         bool moved = false;
         off = an_start;
@@ -305,6 +306,7 @@ void alias_parse_response(const uint8_t *pkt, size_t len, uint16_t id, const uin
             int tl = pkt_name(pkt, len, r.rd_off, tgt, &tn);
             if (tl < 0 || tn != r.rd_off + r.rdlen) return;
             if (hop >= ALIAS_MAX_CNAME) return;
+            if (r.ttl < cname_ttl) cname_ttl = r.ttl;
             memcpy(cur, tgt, (size_t)tl);
             curlen = tl;
             moved = true;
@@ -313,7 +315,7 @@ void alias_parse_response(const uint8_t *pkt, size_t len, uint16_t id, const uin
         if (!moved) break;
     }
     uint8_t want = qtype == 1 ? 4 : 16;
-    uint32_t ttl = 0xFFFFFFFFu;
+    uint32_t ttl = cname_ttl;
     off = an_start;
     for (unsigned i = 0; i < an; i++) {
         rr_t r;
@@ -328,7 +330,7 @@ void alias_parse_response(const uint8_t *pkt, size_t len, uint16_t id, const uin
         out->n++;
     }
     out->rdlen = want;
-    if (out->n == 0) ttl = ALIAS_NEG_TTL;         /* NODATA (or a chain that ends without addresses) */
+    if (out->n == 0) ttl = ALIAS_NEG_TTL < cname_ttl ? ALIAS_NEG_TTL : cname_ttl;  /* NODATA (or a chain that ends without addresses) */
     if (ttl > 0x7FFFFFFF) ttl = 0x7FFFFFFF;       /* RFC 2181 section 8, RFC 8767 section 4 */
     out->ttl = ttl > ALIAS_MAX_TTL ? ALIAS_MAX_TTL : ttl;
     out->rc = 0;

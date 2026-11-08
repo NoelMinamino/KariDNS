@@ -717,7 +717,7 @@ static void test_sweep_query_engine(void) {
  * Fake upstream forwarder (UDP + TCP on 127.0.0.1) driven by a scenario id.
  * ======================================================================== */
 enum { FW_OK, FW_SILENT, FW_BADID, FW_NOQR, FW_BADQ, FW_TC_TCPOK, FW_TC_TCPFAIL,
-       FW_TC_TCPBADID, FW_HUGE, FW_SHORT, FW_TC_TCPZERO, FW_TC_TCPCLOSE, FW_TC_TCPBIG };
+       FW_TC_TCPBADID, FW_HUGE, FW_SHORT, FW_TC_TCPZERO, FW_TC_TCPCLOSE, FW_TC_TCPBIG, FW_TC_TCPSLOW };
 static volatile int g_fw_scn;
 static volatile int g_fw_stop;
 static int g_fw_udp = -1, g_fw_tcp = -1, g_fw_port;
@@ -778,7 +778,9 @@ static void *fw_thread(void *arg) {
             if (scn == FW_TC_TCPZERO) olen = 0;
             uint8_t hl[2] = { (uint8_t)(olen >> 8), (uint8_t)olen };
             if (scn != FW_TC_TCPFAIL) {
+                if (scn == FW_TC_TCPSLOW) usleep(300000);        /* the length after 300 ms, the body 300 ms later */
                 write_all_timeout(c, hl, 2, 1000);
+                if (scn == FW_TC_TCPSLOW) usleep(300000);
                 if (olen) write_all_timeout(c, out, olen, 1000);
             }
             close(c);
@@ -861,6 +863,18 @@ static void test_forward_zone_scenarios(void) {
     g_fw_scn = FW_TC_TCPOK;
     assert(forward_via_tcp(&ss, sl, req, len, res, 20, 500) == -1);     /* response larger than cap */
     assert(forward_via_tcp(&ss, sl, req, len, res, sizeof(res), 500) > 12);
+    /* low batch L3, dns_query_engine.c [6]: one deadline for write, length and body.  The upstream answers in two pieces, 300 ms and
+     * 600 ms after the request; with 500 ms each read used to get 500 ms of its own and the 600 ms answer was taken */
+    g_fw_scn = FW_TC_TCPSLOW;
+    {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        assert(forward_via_tcp(&ss, sl, req, len, res, sizeof(res), 500) == -1);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long ms = (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000);
+        assert(ms >= 450 && ms < 580);
+        assert(forward_via_tcp(&ss, sl, req, len, res, sizeof(res), 1500) > 12);      /* a deadline that is long enough still gets it */
+    }
     /* question_section_matches edge cases */
     uint8_t a[64], b[64];
     size_t al = sw_build(a, 1, 0, 0, "Www.Fwd.Test.", 1, 1, 0);

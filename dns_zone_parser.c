@@ -3,31 +3,43 @@
 #include "dns_utils.h"
 #include <ctype.h>
 
-static void unescape_string_in_place(char *str) {
-    if (!str) return;
+/* Unescape a master-file string in place.  NULL = done, else why it cannot be kept: RFC 1035 5.1 \DDD is a decimal number 000-255, so
+ * \300 is no octet (it used to lose its backslash and keep "300"; BIND reports a bad escape), and \000 would end a NUL-terminated string at
+ * that octet (review low L4 dns_zone_parser.c [4]).  allow_nul: the caller keeps the length (*outlen, the octets before the final NUL) and
+ * handles the NUL octets, as the character-strings of a TXT record do (RFC 1035 3.3.14: any octet); otherwise \000 is the error. */
+static const char *unescape_string_in_place(char *str, bool allow_nul, size_t *outlen) {
+    if (outlen) *outlen = 0;
+    if (!str) return NULL;
     char *read = str;
     char *write = str;
+    const char *why = NULL;
     while (*read) {
         if (*read == '\\' && *(read + 1)) {
             read++;
             // RFC 1035 §5.1: \DDD は 000 から 255 までの 10 進数 3 桁
-            if (isdigit((unsigned char)*read) && 
-                isdigit((unsigned char)*(read+1)) && 
+            if (isdigit((unsigned char)*read) &&
+                isdigit((unsigned char)*(read+1)) &&
                 isdigit((unsigned char)*(read+2))) {
-                
+
                 int val = (*read - '0') * 100 + (*(read+1) - '0') * 10 + (*(read+2) - '0');
-                if (val <= 255) {
+                read += 3;
+                if (val > 255) {
+                    if (!why) why = "bad escape: \\DDD is a decimal number from 000 to 255";
+                } else if (val == 0 && !allow_nul) {
+                    if (!why) why = "\\000 (a NUL octet) cannot be held in this field";
+                } else {
                     *write++ = (char)val;
-                    read += 3;
-                    continue;
                 }
+                continue;
             }
             *write++ = *read++;
         } else {
             *write++ = *read++;
         }
     }
+    if (outlen) *outlen = (size_t)(write - str);
     *write = '\0';
+    return why;
 }
 
 #include <stdio.h>
@@ -502,7 +514,8 @@ static int zone_pdns_type_rewrite(dns_record_t *rec, bool is_alias, const char *
       rd[n++] = (uint8_t)(qt >> 8);
       rd[n++] = (uint8_t)qt;
       for (int j = 1; j < rec->rdata_count && !why; j++) {
-        unescape_string_in_place(rec->rdata[j]);
+        why = unescape_string_in_place(rec->rdata[j], false, NULL);
+        if (why) break;
         size_t len = strlen(rec->rdata[j]);
         size_t off = 0;
         do {                      /* a string longer than 255 octets is cut into <character-string>s, as PowerDNS does */
@@ -753,6 +766,53 @@ static void note_long_txt(parse_context_t *ctx, const char *owner) {
         ctx->first_long_txt_line = ctx->cur_line;
     }
     ctx->long_txt_count++;
+}
+
+/* The character-strings s[0..n) (lengths len[]: a string may hold NUL octets, \000) of a TXT-like record as the RDATA octets (RFC 3597 s5
+ * form, set as rec->generic_data): each string is cut into 255-octet <character-string>s, as serialize_dns_record() does for the text fields.
+ * 0, or -1 with the error set (the whole RDATA must fit a 16-bit RDLENGTH). */
+static int zone_txt_blob(parse_context_t *ctx, zone_arena_t *arena, dns_record_t *rec, const char *buf,
+                         char *const *s, const size_t *len, int n) {
+    uint8_t *blob = (uint8_t *)malloc(65535);
+    size_t glen = 0;
+    bool long_noted = false;
+    if (!blob) {
+        zone_generic_rdata_error(ctx, rec->type, buf, "Out of memory");
+        return -1;
+    }
+    for (int j = 0; j < n; j++) {
+        size_t left = len[j];
+        const char *p = s[j];
+        if (left > 255 && !long_noted) {
+            note_long_txt(ctx, rec->name);
+            long_noted = true;
+        }
+        do {
+            size_t piece = left > 255 ? 255 : left;
+            if (glen + 1 + piece > 65535) {
+                free(blob);
+                zone_generic_rdata_error(ctx, rec->type, buf, "TXT RDATA longer than 65535 octets");
+                return -1;
+            }
+            blob[glen++] = (uint8_t)piece;
+            memcpy(blob + glen, p, piece);
+            glen += piece;
+            p += piece;
+            left -= piece;
+        } while (left > 0);
+    }
+    uint8_t *keep = (uint8_t *)arena_alloc(arena, glen);
+    if (!keep) {
+        free(blob);
+        zone_generic_rdata_error(ctx, rec->type, buf, "Out of memory");
+        return -1;
+    }
+    memcpy(keep, blob, glen);
+    free(blob);
+    rec->generic_data = keep;
+    rec->generic_len = (uint16_t)glen;
+    rec->rdata_count = 0;
+    return 0;
 }
 
 #define MAX_GENERATE_COUNT 100000
@@ -1100,6 +1160,29 @@ static int join_trailing_fields(char **fields, int from, int count) {
   return from + 1;
 }
 
+/* Is field j of the RDATA of a record of this type a domain name (by position, as the text forms put the names)?  One table for the pass that
+ * unescapes the fields (a name keeps its escapes) and for the name length check; the expansion of relative names below follows the same
+ * positions.  review low L4 dns_zone_parser.c [6]: IPSECKEY / AMTRELAY gateway (RFC 4025 s2.1, RFC 8777 s4.2.3), SVCB / HTTPS TargetName
+ * (RFC 9460 s2.2) and the HIP Rendezvous Servers (RFC 8005 s5) were unescaped first, so "a\.b" became the two labels a and b. */
+static bool zone_rdata_name_field(uint16_t type, int j) {
+  switch (type) {
+    case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 23: case 39:   /* NS MD MF CNAME MB MG MR PTR NSAP-PTR DNAME */
+    case 30:                                                                              /* NXT (RFC 2535): Next Domain Name */
+      return j == 0;
+    case 15: case 18: case 21: case 36: case 107:                                         /* MX AFSDB RT KX LP */
+    case 64: case 65:                                                                     /* SVCB HTTPS: TargetName */
+      return j == 1;
+    case 6: case 14: case 17: case 58:                                                    /* SOA MINFO RP TALINK */
+      return j == 0 || j == 1;
+    case 26: return j == 1 || j == 2;                                                     /* PX */
+    case 33: case 45: case 260: return j == 3;                                            /* SRV; IPSECKEY, AMTRELAY gateway */
+    case 35: return j == 5;                                                               /* NAPTR */
+    case 38: return j == 2;                                                               /* A6 (RFC 2874): prefix name */
+    case 55: return j >= 3;                                                               /* HIP: Rendezvous Servers */
+    default: return false;
+  }
+}
+
 /* finalize: 最上位のファイルの読み込みの最後に、全レコードの前処理キャッシュを作る。
  * $INCLUDE と $GENERATE の行は最上位がまとめて処理するので false で呼ぶ。 */
 static int parse_zone_buffer(char *buf, size_t size, zone_arena_t *arena, parse_context_t *ctx,
@@ -1116,6 +1199,7 @@ static int parse_zone_buffer(char *buf, size_t size, zone_arena_t *arena, parse_
   int in_parens = 0, in_quotes = 0, field_idx = 0;
   bool is_tag_def_line = false;
   char *fields[MAX_FIELDS], *token_start = NULL;
+  bool field_quoted[MAX_FIELDS];   /* the token was written "like this" (fields[] has the quotes cut off) */
   size_t line_no = 1, rec_line = 1;   /* line of p, and the line the record being read starts on (only '\n' counts: the buffer is cut in place) */
 
 STATE_START_LINE:
@@ -1140,8 +1224,19 @@ STATE_START_LINE:
       p = scan;
       goto STATE_FIND_TOKEN;
     }
-    if (*prev_owner_io)
+    if (*prev_owner_io) {
+      field_quoted[field_idx] = false;
       fields[field_idx++] = *prev_owner_io;
+    } else {
+      /* review low L4 dns_zone_parser.c [3]: a record that starts with a blank takes the owner of the one before it (RFC 1035 5.1);
+       * with none, the TTL / type token would have been read as the owner name.  BIND: "no current owner name" */
+      if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = "no current owner name (a line that starts with a blank needs a record before it)";
+        ctx->err_out->error_offset = (size_t)(scan - buf);
+        ctx->err_out->token_length = 0;
+      }
+      return -1;
+    }
     goto SKIP_WHITESPACE;
   }
 STATE_FIND_TOKEN:
@@ -1246,6 +1341,7 @@ STATE_FIND_TOKEN:
   }
 
           if (field_idx < MAX_FIELDS) {
+            field_quoted[field_idx] = false;
             fields[field_idx++] = token_start;
           } else {
             if (ctx && ctx->err_out) {
@@ -1268,6 +1364,7 @@ STATE_FIND_TOKEN:
             }
             if (field_idx > 0) {
                 if (fields[field_idx - 1][0] == '"') {
+                    field_quoted[field_idx - 1] = true;
                     fields[field_idx - 1]++;
                     size_t t_len = strlen(fields[field_idx - 1]);
                     if (t_len > 0 && fields[field_idx - 1][t_len - 1] == '"')
@@ -1281,6 +1378,7 @@ STATE_FIND_TOKEN:
   *p++ = '\0';
   if (field_idx > 0) {
       if (fields[field_idx - 1][0] == '"') {
+          field_quoted[field_idx - 1] = true;
           fields[field_idx - 1]++;
           size_t t_len = strlen(fields[field_idx - 1]);
           if (t_len > 0 && fields[field_idx - 1][t_len - 1] == '"')
@@ -1343,7 +1441,16 @@ PROCESS_RECORD:
   }
   if (ctx && !ctx->in_generate) ctx->cur_line = rec_line;
   if (fields[0][0] == '$' && strcasecmp(fields[0], "$ORIGIN") == 0) {
-    if (field_idx > 1) {
+    if (field_idx < 2) {
+      /* review low L4 dns_zone_parser.c [13]: BIND (master.c) refuses "$ORIGIN" without a name */
+      if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = "$ORIGIN requires a domain name";
+        ctx->err_out->error_offset = (size_t)(fields[0] - buf);
+        ctx->err_out->token_length = strlen(fields[0]);
+      }
+      return -1;
+    }
+    {
       /* RFC 1035 §5.1: 相対名の $ORIGIN は現在の origin を補って絶対名にする (R-22 d) */
       char *new_origin = expand_domain_name(fields[1], *origin_io, arena);
       if (!validate_domain_name_length(new_origin, ctx ? ctx->err_out : NULL, fields[1], buf)) {
@@ -1485,8 +1592,18 @@ PROCESS_RECORD:
     }
     for (int c = 0; c < cidr_count; c++) {
       cidrs[c].cidr = cidrs_found[c];
-      if (cidrs[c].cidr) {
-        cidr_entry_parse(&cidrs[c].parsed, cidrs[c].cidr);
+      /* review low L4 dns_zone_parser.c [8]: an entry that is not an address or CIDR never matches; say so now */
+      if (!cidr_entry_parse(&cidrs[c].parsed, cidrs[c].cidr)) {
+        if (ctx && ctx->err_out) {
+          snprintf(ctx->err_out->detail, sizeof(ctx->err_out->detail), "%s: '%.100s' is not an address or CIDR",
+                   is_loc ? "$LOCATION-TAG" : "$ECS-SUBNET-TAG", cidrs[c].cidr);
+          ctx->err_out->error_message = ctx->err_out->detail;
+          ctx->err_out->error_offset = (size_t)(fields[0] - buf);
+          ctx->err_out->token_length = strlen(fields[0]);
+        }
+        for (int d = 0; d < cidr_count; d++) free(cidrs_found[d]);
+        free(cidrs);
+        return -1;
       }
     }
     (*target_tags)[*target_count].tag = strdup(clean_tag);
@@ -1497,6 +1614,17 @@ PROCESS_RECORD:
     if (p < end)
       goto STATE_START_LINE;
     goto DONE;
+  }
+  if (fields[0][0] == '$') {
+    /* review low L4 dns_zone_parser.c [13]: BIND (master.c, "unknown $ directive") refuses a $WORD that is none of its directives; it
+     * used to become the owner name of a record ("$foo.") */
+    if (ctx && ctx->err_out) {
+      snprintf(ctx->err_out->detail, sizeof(ctx->err_out->detail), "unknown directive '%.100s'", fields[0]);
+      ctx->err_out->error_message = ctx->err_out->detail;
+      ctx->err_out->error_offset = (size_t)(fields[0] - buf);
+      ctx->err_out->token_length = strlen(fields[0]);
+    }
+    return -1;
   }
     dns_record_t *rec = arena_alloc_record(arena, ctx, p, buf);
     if (!rec) return -1;
@@ -1572,12 +1700,16 @@ PROCESS_RECORD:
    * 書ける (RFC 4034 §2.2/§3.2 等)。ML-DSA-44 (algorithm 18) の RRSIG 署名は base64 で 3228 文字あり、
    * dnssec-signzone などの出力では MAX_RDATA を超える数の断片に分かれるので、超えるときは末尾の断片を
    * 1 フィールドに連結する (エンコーダは断片を連結して復号するので、結果のワイヤ形式は変わらない)。 */
+  /* review low L4 dns_zone_parser.c [5]: RFC 3597 s5 "\# <length> <hex>" is the unquoted token \# right after the type.  It is read from the
+   * token as written: once the fields are unescaped, a quoted "\#" or "#" (TXT "#" "1" "ab") looks just like it.  raw_generic stays
+   * true for the records this function rewrites into that form (ALIAS, LUA, EID, NIMLOC); their rdata[0] is the literal \# */
+  bool raw_generic = i < field_idx && !field_quoted[i] && strcmp(fields[i], "\\#") == 0;
   int txt_wire_from = -1, txt_wire_to = -1;   /* I5: a TXT-like RR with more character-strings than MAX_RDATA */
   if (field_idx - i > MAX_RDATA && rec->type) {
     uint16_t tc = get_type_code(rec->type);
     int lead = trailing_blob_lead_fields(tc);
     /* "\# <len> <hex>" (RFC 3597 §5) of a whole-RDATA blob type: its tokens are the length and the hex, not one value to join */
-    bool generic_tok = strcmp(fields[i], "\\#") == 0 || strcmp(fields[i], "#") == 0;
+    bool generic_tok = raw_generic;
     if (generic_tok) {
       /* RFC 3597 section 5: "\# <length> <hex>", the hex digits in any number of tokens, for every type: they are the RDATA octets, whatever
        * the type's own text form is, so the tokens after the length are joined into one (dns_generic_rdata_parse() reads them as one) */
@@ -1631,6 +1763,7 @@ PROCESS_RECORD:
   if (strcasecmp(rec->type, "ALIAS") == 0 || strcasecmp(rec->type, "LUA") == 0) {
     if (zone_pdns_type_rewrite(rec, toupper((unsigned char)rec->type[0]) == 'A', *origin_io, arena, ctx, buf) != 0)
       return -1;
+    raw_generic = true;   /* (rdata[] is now "\# <len> <hex>") */
   }
   rec->type_code = get_type_code(rec->type);
   if (rec->type_code == 0) {
@@ -1735,53 +1868,32 @@ PROCESS_RECORD:
   // A-1: Unescape fields appropriately
   // Owner name, type, class, ttl are handled without unescaping.
   // RDATA fields are unescaped UNLESS they are domain name fields.
-  for (int j = 0; j < rec->rdata_count; j++) {
-      bool is_domain_name = false;
-      switch (rec->type_code) {
-          case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 23: case 39: // NS, MD, MF, CNAME, MB, MG, MR, PTR, NSAP-PTR, DNAME
-              if (j == 0) is_domain_name = true;
-              break;
-          case 15: // MX
-              if (j == 1) is_domain_name = true;
-              break;
-          case 6: // SOA
-              if (j == 0 || j == 1) is_domain_name = true;
-              break;
-          case 33: // SRV
-              if (j == 3) is_domain_name = true;
-              break;
-          case 35: // NAPTR
-              if (j == 5) is_domain_name = true;
-              break;
-          case 14: case 17: // MINFO, RP
-              if (j == 0 || j == 1) is_domain_name = true;
-              break;
-          case 18: case 36: case 21: case 107: // AFSDB, KX, RT, LP
-              if (j == 1) is_domain_name = true;
-              break;
-          case 26: // PX
-              if (j == 1 || j == 2) is_domain_name = true;
-              break;
-          case 30: // NXT (RFC 2535): rdata[0] = Next Domain Name
-              if (j == 0) is_domain_name = true;
-              break;
-          case 38: // A6 (RFC 2874): rdata[2] = prefix name domain (prefix_len > 0 のときのみ)
-              if (j == 2) is_domain_name = true;
-              break;
-          case 58: // TALINK: rdata[0]=prev, rdata[1]=next (両方ドメイン名)
-              if (j == 0 || j == 1) is_domain_name = true;
-              break;
-          default:
-              break;
-      }
+  // The tokens of "\# <len> <hex>" are not text (RFC 3597 s5): a backslash in them is no escape, the hex test refuses it.
+  const bool txt_like = zone_txt_like(rec->type_code);
+  size_t txt_len[MAX_RDATA];   /* TXT-like: the octets of each string after unescaping (a \000 stays in) */
+  bool txt_nul = false;
+  for (int j = 0; j < rec->rdata_count && !raw_generic; j++) {
+      /* a domain name keeps its escapes: expand_domain_name() and the name writer read them ("a\.b" is one label) */
+      bool is_domain_name = zone_rdata_name_field(rec->type_code, j);
       if (!is_domain_name) {
-          unescape_string_in_place(rec->rdata[j]);
+          const char *bad = unescape_string_in_place(rec->rdata[j], txt_like, &txt_len[j]);
+          if (bad) {
+              if (ctx && ctx->err_out) {
+                  ctx->err_out->error_message = bad;
+                  ctx->err_out->error_offset = (size_t)(rec->rdata[j] - buf);
+                  ctx->err_out->token_length = strlen(rec->rdata[j]);
+              }
+              return -1;
+          }
+          if (txt_like && txt_len[j] != strlen(rec->rdata[j])) txt_nul = true;
+      } else {
+          txt_len[j] = 0;
       }
   }
 
-  if (zone_txt_like(rec->type_code) && !(rec->rdata_count >= 1 && (strcmp(rec->rdata[0], "\\#") == 0 || strcmp(rec->rdata[0], "#") == 0))) {
+  if (txt_like && !raw_generic) {
     for (int j = 0; j < rec->rdata_count; j++) {
-      if (strlen(rec->rdata[j]) > 255) {
+      if (txt_len[j] > 255) {
         note_long_txt(ctx, rec->name);
         break;
       }
@@ -1793,52 +1905,25 @@ PROCESS_RECORD:
   if (txt_wire_from >= 0) {
     /* I5: the character-strings of a long TXT, each unescaped and cut into 255-octet pieces as serialize_dns_record()
      * does for the text fields, kept as the RDATA octets (RFC 3597 §5 form; the whole RDATA fits a 16-bit RDLENGTH) */
-    uint8_t *blob = (uint8_t *)malloc(65535);
-    size_t glen = 0;
-    bool long_noted = false;
-    if (!blob) {
-      zone_generic_rdata_error(ctx, rec->type, buf, "Out of memory");
-      return -1;
-    }
+    size_t lens[MAX_FIELDS];
     for (int j = txt_wire_from; j < txt_wire_to; j++) {
-      unescape_string_in_place(fields[j]);
-      size_t len = strlen(fields[j]);
-      if (len > 255 && !long_noted) {
-        note_long_txt(ctx, rec->name);
-        long_noted = true;
+      const char *bad = unescape_string_in_place(fields[j], true, &lens[j]);
+      if (bad) {
+        zone_generic_rdata_error(ctx, rec->type, buf, bad);
+        return -1;
       }
-      const char *s = fields[j];
-      do {
-        size_t piece = len > 255 ? 255 : len;
-        if (glen + 1 + piece > 65535) {
-          free(blob);
-          zone_generic_rdata_error(ctx, rec->type, buf, "TXT RDATA longer than 65535 octets");
-          return -1;
-        }
-        blob[glen++] = (uint8_t)piece;
-        memcpy(blob + glen, s, piece);
-        glen += piece;
-        s += piece;
-        len -= piece;
-      } while (len > 0);
     }
-    uint8_t *keep = (uint8_t *)arena_alloc(arena, glen);
-    if (!keep) {
-      free(blob);
-      zone_generic_rdata_error(ctx, rec->type, buf, "Out of memory");
-      return -1;
-    }
-    memcpy(keep, blob, glen);
-    free(blob);
-    rec->generic_data = keep;
-    rec->generic_len = (uint16_t)glen;
-    rec->rdata_count = 0;
+    if (zone_txt_blob(ctx, arena, rec, buf, fields + txt_wire_from, lens + txt_wire_from, txt_wire_to - txt_wire_from) != 0) return -1;
+  } else if (txt_nul) {
+    /* review low L4 dns_zone_parser.c [4]: a string with a \000 octet is no NUL-terminated C string; the RDATA is kept as the octets, like
+     * a long TXT (RFC 1035 3.3.14: a <character-string> holds any octet; BIND takes \000) */
+    if (zone_txt_blob(ctx, arena, rec, buf, rec->rdata, txt_len, rec->rdata_count) != 0) return -1;
   }
   /* Types BIND takes only in the RFC 3597 "\# <len> <hex>" form.  NULL (10): null_10.c fromtext_null() always returns
    * DNS_R_SYNTAX.  UINFO/UID/GID/UNSPEC (100-103): BIND 9.18/9.20 gen.c registers only the names (no rdata module), so
    * dns_rdata_fromtext() gives DNS_R_UNKNOWN for anything but "\#".  Text fields could not be encoded for them (the lint
    * pass would only report "cannot be serialized"), so the line is refused here, as BIND refuses the zone. */
-  bool generic_form = rec->rdata_count >= 1 && (strcmp(rec->rdata[0], "\\#") == 0 || strcmp(rec->rdata[0], "#") == 0);
+  bool generic_form = raw_generic && rec->rdata_count >= 1;
   if (!generic_form && (rec->type_code == 10 || (rec->type_code >= 100 && rec->type_code <= 103))) {
     zone_generic_rdata_error(ctx, rec->type, buf, "This record type has no text form; write the RDATA in the RFC 3597 \\# form");
     return -1;
@@ -1883,8 +1968,9 @@ PROCESS_RECORD:
     rec->rdata[1] = lenstr;
     rec->rdata[2] = joined;
     rec->rdata_count = 3;
+    raw_generic = true;
   }
-  if (rec->rdata_count >= 2 && (strcmp(rec->rdata[0], "\\#") == 0 || strcmp(rec->rdata[0], "#") == 0)) {
+  if (raw_generic && rec->rdata_count >= 2) {
     /* RFC 3597 section 5: "\# <length> <hex rdata>". The declared length is a decimal number, the rdata is an
      * even number of hex digits (possibly split into several tokens) and its size MUST equal <length>. Anything
      * else used to be "repaired" silently (non-hex skipped, short data padded, long data cut off), which let a
@@ -1965,23 +2051,10 @@ PROCESS_RECORD:
         rec->rdata[3] = expand_domain_name(rec->rdata[3], *origin_io, arena);
       }
     } else if (rec->type_code == 55) { // HIP
-      // Base64トークンをドメイン名展開から除外し、Rendezvous Serverのみ展開する
-      bool in_pubkey = true;
-      for (int i = 2; i < rec->rdata_count; i++) {
-        // ドットを含む場合はドメイン名 (Rendezvous Server) と判定
-        if (strchr(rec->rdata[i], '.') != NULL) {
-          in_pubkey = false;
-        }
-        if (!in_pubkey) {
-          rec->rdata[i] = expand_domain_name(rec->rdata[i], *origin_io, arena);
-        } else {
-          // Base64の末尾パディング '=' に達した後のトークンはRendezvous Server
-          size_t tlen = strlen(rec->rdata[i]);
-          if (tlen > 0 && rec->rdata[i][tlen - 1] == '=') {
-            in_pubkey = false;
-          }
-        }
-      }
+      /* RFC 8005 s5: rdata[2] is the public key (one base64 token); the tokens after it are the Rendezvous Servers, dotted or not
+       * (D17: the old test "contains a dot" left a relative name such as "rvs" unexpanded) */
+      for (int i = 3; i < rec->rdata_count; i++)
+        rec->rdata[i] = expand_domain_name(rec->rdata[i], *origin_io, arena);
     } else if (rec->type_code == 64 || rec->type_code == 65) { // SVCB / HTTPS
       if (rec->rdata_count > 1) {
         if (strcmp(rec->rdata[1], ".") != 0) {
@@ -1997,44 +2070,8 @@ PROCESS_RECORD:
 
     // Validate domain name length in RDATA
     for (int j = 0; j < rec->rdata_count; j++) {
-      bool is_domain_field = false;
-      switch (rec->type_code) {
-        case 2: case 5: case 12: case 39: case 23: case 3: case 4: case 7: case 8: case 9:
-          if (j == 0) is_domain_field = true;
-          break;
-        case 15: case 18: case 36: case 21: case 107:
-          if (j == 1) is_domain_field = true;
-          break;
-        case 6: case 14: case 17:
-          if (j == 0 || j == 1) is_domain_field = true;
-          break;
-        case 33:
-          if (j == 3) is_domain_field = true;
-          break;
-        case 35:
-          if (j == 5) is_domain_field = true;
-          break;
-        case 26:
-          if (j == 1 || j == 2) is_domain_field = true;
-          break;
-        case 45: case 260:
-          if (j == 3) is_domain_field = true;
-          break;
-        case 30: // NXT (RFC 2535): rdata[0] = Next Domain Name
-          if (j == 0) is_domain_field = true;
-          break;
-        case 38: // A6 (RFC 2874): rdata[2] = prefix name (prefix_len > 0)
-          if (j == 2) is_domain_field = true;
-          break;
-        case 58: // TALINK
-          if (j == 0 || j == 1) is_domain_field = true;
-          break;
-        default:
-          if ((rec->type_code == 64 || rec->type_code == 65) && j == 1 && strcmp(rec->rdata[1], ".") != 0) {
-            is_domain_field = true;
-          }
-          break;
-      }
+      bool is_domain_field = zone_rdata_name_field(rec->type_code, j) &&
+                             !((rec->type_code == 64 || rec->type_code == 65) && strcmp(rec->rdata[1], ".") == 0);   /* (SVCB / HTTPS ".": no target) */
       if (is_domain_field && rec->rdata[j]) {
         if (!validate_domain_name_length(rec->rdata[j], ctx ? ctx->err_out : NULL, rec->rdata[j], buf)) {
           return -1;
@@ -2784,32 +2821,45 @@ static bool pdns_lua_rdata_ok(const uint8_t *rd, size_t len) {
  * and dns_rdataslab_merge() with DNS_R_SINGLETON "multiple RRs of singleton type" after duplicates were dropped, so a zone file, a transfer
  * and an UPDATE that would give a name two different ones are all refused; lib/ns/update.c replaces_p() names only CNAME, DNAME, SOA, NSEC,
  * RRSIG, WKS and NSEC3PARAM as replaced, so an UPDATE adding a second one fails instead of replacing).  RESINFO (RFC 9606 section 3) is the
- * one this server knows that BIND marks so (resinfo_261.c RRTYPE_RESINFO_ATTRIBUTES); CNAME, DNAME and SOA have their own rules.  Two RRs
- * with the same RDATA are one RR.  The index must exist (build_zone_index()).  0 = ok, -1 with `detail` filled. */
+ * one this server knows that BIND marks so (resinfo_261.c RRTYPE_RESINFO_ATTRIBUTES), and CNAME (RFC 1034 section 3.6.2) and DNAME (RFC 6672
+ * section 2.4) are singletons too (review low L4 dns_zone_lint.c [B5]; BIND cname_5.c, dname_39.c): a zone file, a transfer or a database
+ * that gives one name two different CNAMEs is refused.  A dynamic UPDATE is not affected: it replaces the CNAME or DNAME (RFC 2136
+ * section 3.4.2.2, update_replaces()) before the zone is built.  SOA has its own rules.  Two RRs with the same RDATA are one RR, and so
+ * are two that tinydns locations, $LOCATION-TAG / $ECS-SUBNET-TAG tags or a tinydns timestamp keep apart (a query gets the one that fits
+ * the client).  The index must exist (build_zone_index()).  0 = ok, -1 with `detail` filled. */
+static bool str_eq_or_null(const char *a, const char *b) {
+  return a == b || (a && b && strcmp(a, b) == 0);
+}
+
 static int validate_zone_singletons(const zone_arena_t *arena, char *detail, size_t detail_cap) {
   if (!arena->hash_table) return 0;
   uint8_t *ba = NULL, *bb = NULL;
   int rc = 0;
   for (size_t i = 0; i < arena->count && rc == 0; i++) {
     const dns_record_t *a = &arena->records[i];
-    if (a->type_code != 261 || !a->name) continue;
+    if ((a->type_code != 261 && a->type_code != 5 && a->type_code != 39) || !a->name) continue;
     size_t idx = calc_fnv1a_str(a->name) & (arena->hash_size - 1);
     for (int j = arena->hash_table[idx]; j != -1; j = arena->records[j].next_record) {
       const dns_record_t *b = &arena->records[j];
-      if ((size_t)j <= i || b->type_code != 261 || !b->name || b->class_val != a->class_val || !domain_names_match_ci(a->name, b->name))
+      if ((size_t)j <= i || b->type_code != a->type_code || !b->name || b->class_val != a->class_val || !domain_names_match_ci(a->name, b->name))
+        continue;
+      if (a->tinydns_loc[0] != b->tinydns_loc[0] || a->tinydns_loc[1] != b->tinydns_loc[1] || a->tinydns_ttd != b->tinydns_ttd ||
+          !str_eq_or_null(a->bind_location_tag, b->bind_location_tag) || !str_eq_or_null(a->ecs_subnet_tag, b->ecs_subnet_tag))
         continue;
       if (!ba) {
         ba = (uint8_t *)malloc(65535);
         bb = (uint8_t *)malloc(65535);
         if (!ba || !bb) {
-          snprintf(detail, detail_cap, "out of memory checking the RESINFO records");
+          snprintf(detail, detail_cap, "out of memory checking the singleton records");
           rc = -1;
           break;
         }
       }
       long la = dns_record_canonical_rdata(a, ba, 65535), lb = dns_record_canonical_rdata(b, bb, 65535);
       if (la >= 0 && lb >= 0 && la == lb && memcmp(ba, bb, (size_t)la) == 0) continue;   /* the same RR twice */
-      snprintf(detail, detail_cap, "multiple RRs of singleton type: '%.200s' has more than one RESINFO record (RFC 9606 section 3)", a->name);
+      snprintf(detail, detail_cap, "multiple RRs of singleton type: '%.200s' has more than one %s record (%s)", a->name,
+               a->type_code == 5 ? "CNAME" : a->type_code == 39 ? "DNAME" : "RESINFO",
+               a->type_code == 5 ? "RFC 1034 section 3.6.2" : a->type_code == 39 ? "RFC 6672 section 2.4" : "RFC 9606 section 3");
       rc = -1;
       break;
     }
@@ -2825,6 +2875,27 @@ int validate_zone_pdns_types(const zone_arena_t *arena, parse_error_t *err, char
   bool dnssec = false;
   const char *dnssec_owner = NULL;
   if (validate_zone_singletons(arena, detail, detail_cap) != 0) goto fail;   /* every publish path calls this function (freeze, database reader, karicheck) */
+  /* NSEC3 iterations above ZONE_MAX_NSEC3_ITERATIONS (RFC 9276 s3.2): refused for every source of a zone, so a query never hashes more than
+   * that many times (D10-D12).  BIND 9.20 (named-checkzone) only warns "excessive NSEC3PARAM iterations N > 50" and loads the zone. */
+  for (size_t i = 0; i < arena->count; i++) {
+    const dns_record_t *r = &arena->records[i];
+    if (r->type_code != 50 && r->type_code != 51) continue;
+    uint8_t n3alg;
+    uint16_t n3it;
+    const char *n3salt;
+    bool have = false;
+    if (r->generic_data && r->generic_len >= 4) {
+      n3it = (uint16_t)((r->generic_data[2] << 8) | r->generic_data[3]);
+      have = true;
+    } else {
+      have = nsec3_rdata_params(r, &n3alg, &n3it, &n3salt);
+    }
+    if (have && n3it > ZONE_MAX_NSEC3_ITERATIONS) {
+      snprintf(detail, detail_cap, "%s at '%.200s' has %u NSEC3 iterations; more than %u is refused (RFC 9276 section 3.2)",
+               r->type_code == 50 ? "NSEC3" : "NSEC3PARAM", r->name ? r->name : "", (unsigned)n3it, ZONE_MAX_NSEC3_ITERATIONS);
+      goto fail;
+    }
+  }
   for (size_t i = 0; i < arena->count; i++) {
     const dns_record_t *r = &arena->records[i];
     if (r->class_val != 1 && r->class_val != 0) continue;
@@ -2907,44 +2978,7 @@ int validate_zone_name_lengths(zone_arena_t *arena, parse_error_t *err) {
     
     // Check RDATA domain names based on type
     for (int j = 0; j < rec->rdata_count; j++) {
-        bool is_domain_name = false;
-        switch (rec->type_code) {
-            case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 23: case 39: // NS, MD, MF, CNAME, MB, MG, MR, PTR, NSAP-PTR, DNAME
-                if (j == 0) is_domain_name = true;
-                break;
-            case 15: // MX
-                if (j == 1) is_domain_name = true;
-                break;
-            case 6: // SOA
-                if (j == 0 || j == 1) is_domain_name = true;
-                break;
-            case 33: // SRV
-                if (j == 3) is_domain_name = true;
-                break;
-            case 35: // NAPTR
-                if (j == 5) is_domain_name = true;
-                break;
-            case 14: case 17: // MINFO, RP
-                if (j == 0 || j == 1) is_domain_name = true;
-                break;
-            case 18: case 36: case 21: case 107: // AFSDB, KX, RT, LP
-                if (j == 1) is_domain_name = true;
-                break;
-            case 26: // PX
-                if (j == 1 || j == 2) is_domain_name = true;
-                break;
-            case 30: // NXT (RFC 2535): rdata[0] = Next Domain Name
-                if (j == 0) is_domain_name = true;
-                break;
-            case 38: // A6 (RFC 2874): rdata[2] = prefix name
-                if (j == 2) is_domain_name = true;
-                break;
-            case 58: // TALINK: rdata[0]=prev, rdata[1]=next
-                if (j == 0 || j == 1) is_domain_name = true;
-                break;
-            default:
-                break;
-        }
+        bool is_domain_name = zone_rdata_name_field(rec->type_code, j);
         if (is_domain_name && rec->rdata[j] && strlen(rec->rdata[j]) > 1024) {
             if (err) {
                 err->error_message = "RDATA domain name exceeds maximum supported length (1024 bytes)";

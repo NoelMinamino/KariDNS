@@ -139,7 +139,7 @@ control-channel {
     // socket "/var/run/karidns/control.sock";
     algorithm "hmac-sha256";
     // karictl.conf側の key "karictl" に設定した secret と一致させてください
-    // 下の値はプレースホルダです (このままだと起動時に警告が出ます)。
+    // 下の値はプレースホルダです (このままだと起動エラーになります)。
     // 必ず `openssl rand -base64 32` の出力に置き換えてください
     secret "UkVQTEFDRS1NRTpvcGVuc3NsLXJhbmQtYmFzZTY0LTMy";
 };
@@ -166,6 +166,7 @@ control-channel {
 key "tsig-key-example" {
     algorithm "hmac-sha256";
     // プレースホルダです。`openssl rand -base64 32` の出力に置き換えてください
+    // (この鍵を ACL や update-policy で使うと、プレースホルダのままでは起動エラーになります。誰も使わない鍵は警告だけです)
     secret "UkVQTEFDRS1NRTpvcGVuc3NsLXJhbmQtYmFzZTY0LTMy";
 };
 

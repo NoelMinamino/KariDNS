@@ -503,7 +503,10 @@ int xfr_check_response_header(const uint8_t *msg, size_t msg_len, axfr_session_t
   /* RFC 5936 §2.2.1, §2.2.2: 最初のメッセージとエラー応答は QDCOUNT=1 で要求の質問を写す。
    * 後続のメッセージは 0 か 1。 */
   unsigned rcode = msg[3] & 0x0F;
-  if (qdcount > 1 || (qdcount == 0 && (first || rcode != 0))) {
+  /* An error response with no question section (a primary that did not parse the request: FORMERR / NOTIMP) is still the answer to the
+   * request, so the rcode is recorded and the caller can fall back from IXFR to AXFR on it (BIND xfrin_recv_done() looks at the rcode
+   * before it checks the question section). */
+  if (qdcount > 1 || (qdcount == 0 && first && rcode == 0)) {
     syslog(LOG_WARNING, "[AXFR] zone '%s': rejecting %s response: QDCOUNT %u", domain, qt, qdcount);
     return -1;
   }
@@ -585,6 +588,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
     }
   }
 
+  bool trailing = false;      /* the final SOA was not the last RR of the message */
   for (int i = 0; i < ancount; i++) {
     if (standby->count >= standby->records_cap) {
       size_t new_cap =
@@ -614,6 +618,10 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
 
     // KariDNS Extended AXFR record interception:
     bool wrapped_soa = false; /* a 65406 wrapper around an apex SOA RR: a body RR of a version 3 stream, never the frame */
+    /* Class 65302 is the extension's own class: a primary that did not answer our Extended AXFR option (EDNS option 65153, checked above
+     * on the first message) must not send it, whatever it claims; the database loader's stream needs no option (ZONE_BEGIN announces it). */
+    if (rec->class_val == DNS_CLASS_KARIDNS_EXT && !session->is_extended_mode && !session->db_stream)
+      return xfr_ext_reject(domain, "an Extended AXFR record (class 65302) in a transfer that was not negotiated as extended");
     if (rec->class_val == DNS_CLASS_KARIDNS_EXT) {
       if (type == DNS_TYPE_KARIDNS_LOC_STATE) {
         standby->count--;
@@ -927,6 +935,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
         if (current_serial == session->initial_soa_serial && session->ixfr_expected_serial == session->initial_soa_serial) {
           session->is_finished = true;
           standby->count--;
+          if (i != ancount - 1) trailing = true;          /* RFC 1995 §4: the last SOA ends the response; nothing follows it (see the AXFR case below) */
         } else if (current_serial != session->ixfr_expected_serial) {
           /* I1, RFC 1995 §4: "the differential sequences are the history of changes ... ordered oldest first newest last":
            * a deletion sequence must start where the previous one ended */
@@ -945,7 +954,9 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
             return xfr_ext_reject(domain, "the transfer ends before all the apex SOA RRs SOA_SET announced");
           session->is_finished = true;
           standby->count--;
-          if (i != ancount - 1) session->trailing_rrs = true; /* RFC 5936 §2.2: the final SOA is the last RR (the database loader checks it) */
+          /* RFC 5936 §2.2: the final SOA is the last RR of the transfer; a primary that goes on in the same message is not sending
+           * the zone it announced (BIND xfrin.c: DNS_R_EXTRADATA).  The database loader's stream is held to it too: it reports the reason */
+          if (i != ancount - 1) trailing = true;
         }
       }
     } else {
@@ -961,6 +972,11 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
         }
       }
     }
+  }
+  /* judged after the loop: a message whose later RRs are malformed (ANCOUNT too large) is a malformed message, not one with records after the SOA */
+  if (trailing) {
+    session->trailing_rrs = true;
+    return xfr_ext_reject(domain, "records after the final SOA");
   }
   return 0;
 }
@@ -1116,6 +1132,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
   uint64_t total_bytes = 0;      /* I2: octets of the messages read so far (session->max_bytes) */
 
   uint32_t cur_rcvtimeo = 0;  /* max-transfer-time-in / max-transfer-idle-in: the SO_RCVTIMEO now set (0 = none set by this loop) */
+  stream_ctx->read_deadline = session->deadline;   /* read_dns_tcp_message() checks it between the recv() calls of one message too */
   while (1) {
     if (session->deadline || session->idle_secs) {
       bool expired = false;
@@ -1134,7 +1151,9 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
     }
     int ret = read_dns_tcp_message(tcp_fd, stream_ctx, &msg, &msg_len);
     if (ret < 0 || ret == 0) {
-      if (session->idle_secs && ret == 0) /* the read timed out (SO_RCVTIMEO): read_dns_tcp_message() reports EAGAIN as 0 */
+      if (session->deadline && time(NULL) >= session->deadline)   /* gave up inside a message: the primary was still sending */
+        syslog(LOG_ERR, "[AXFR] zone '%s': giving up the transfer: it took longer than max-transfer-time-in", entry->domain);
+      else if (session->idle_secs && ret == 0) /* the read timed out (SO_RCVTIMEO): read_dns_tcp_message() reports EAGAIN as 0 */
         syslog(LOG_ERR, "[AXFR] zone '%s': giving up the transfer: no data for %u seconds (max-transfer-idle-in / max-transfer-time-in)",
                entry->domain, cur_rcvtimeo);
       if (unsigned_msgs) free(unsigned_msgs);
@@ -1285,6 +1304,15 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
             has_soa = true;
             break;
           }
+        }
+        /* RFC 5936 §2.2: the transfer opens and closes with the SOA of the zone, so the zone has its SOA at the apex.  A transfer that
+         * ends without one (the SOA RR is below the apex) is not a zone: the serial and the timers would stay stale (BIND does
+         * not load a transferred zone that has no SOA at its origin) */
+        if (!has_soa) {
+          syslog(LOG_ERR, "[AXFR] zone '%s': rejecting transfer: no SOA at the apex of the zone", entry->domain);
+          if (unsigned_msgs) free(unsigned_msgs);
+          zone_arena_destroy(&tmp_arena);
+          return -1;
         }
 
         /* batch 7: a zone over max-records & co. is refused here, before the serial and the timers of the zone are replaced (zone_limits_gate()) */
@@ -1492,7 +1520,10 @@ static int xfr_connect(axfr_bg_ctx_t *ctx, const xfr_primary_t *p, struct sockad
            p->has_src ? " (from the configured transfer source address)" : "");
     return -1;
   }
-  limit_client_socket_rights(tcp_fd);
+  if (!limit_client_socket_rights(tcp_fd)) {      /* logged: a socket with wide rights is not used */
+    close(tcp_fd);
+    return -1;
+  }
   struct timeval tv;
   tv.tv_sec = 30;
   tv.tv_usec = 0;

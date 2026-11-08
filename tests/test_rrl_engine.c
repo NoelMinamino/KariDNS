@@ -162,13 +162,23 @@ static void test_rrl_rate_limiting_and_slip(void) {
     cfg.exempt_clients_count = 0;
     cfg.log_only = true;
     cfg.responses_per_second = 1;
+    uint64_t dropped_before = atomic_load(&g_rrl_dropped_total), slipped_before = atomic_load(&g_rrl_slip_total);
+    cfg.slip = 2;
     rrl_check(&cli1, RRL_RESP_NOERROR, &cfg, &slip);
     // In log_only mode, rate exceeded should still return true!
-    allow = rrl_check(&cli1, RRL_RESP_NOERROR, &cfg, &slip);
-    assert(allow == true);
+    for (int i = 0; i < 6; i++) {
+        allow = rrl_check(&cli1, RRL_RESP_NOERROR, &cfg, &slip);
+        assert(allow == true && slip == false);
+    }
+    // ... and nothing was dropped or slipped, so nothing is counted (low batch L3, dns_rrl.c [9])
+    assert(atomic_load(&g_rrl_dropped_total) == dropped_before && atomic_load(&g_rrl_slip_total) == slipped_before);
+
+    // without log-only the same exhausted key is counted: a drop, or a slip
+    cfg.log_only = false;
+    for (int i = 0; i < 6; i++) rrl_check(&cli1, RRL_RESP_NOERROR, &cfg, &slip);
+    assert(atomic_load(&g_rrl_dropped_total) + atomic_load(&g_rrl_slip_total) >= dropped_before + slipped_before + 4);
 
     // Test NODATA and ERROR rate classes
-    cfg.log_only = false;
     cfg.nodata_per_second = 1;
     cfg.errors_per_second = 1;
     cfg.window_seconds = 5000; // Trigger > 3600 clamp

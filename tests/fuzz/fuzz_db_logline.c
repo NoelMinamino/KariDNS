@@ -19,7 +19,7 @@
 /* what dns_priv_sandbox.c and dns_utils.c take from the server: not used here (as in tests/test_db_supervisor.c) */
 char g_startup_cwd[PATH_MAX];
 int g_cwd_fd = -1;
-int g_dnstap_sock = -1;
+_Atomic int g_dnstap_sock = -1;
 void gc_snapshot_wait_idle(void) {}
 long write_uncompressed_name_ext(uint8_t *buf, size_t offset, size_t max_len, const char *name, bool downcase) {
     (void)buf; (void)offset; (void)max_len; (void)name; (void)downcase;

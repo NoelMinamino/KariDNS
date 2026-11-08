@@ -93,6 +93,7 @@ server_cookie_status_t verify_server_cookie(const server_config_t *cfg, const ch
 
     /* Reserved (bytes 1..3) is deliberately NOT required to be zero; it is hashed as received. */
     bool match = false;
+    bool old_secret = false;
     if (cfg && cfg->cookie_secret_count > 0) {
         for (int i = 0; i < cfg->cookie_secret_count && !match; i++) {
             uint8_t expected[8];
@@ -100,6 +101,7 @@ server_cookie_status_t verify_server_cookie(const server_config_t *cfg, const ch
                                             server_cookie, expected))
                 return SERVER_COOKIE_INVALID;
             match = (const_time_memcmp(server_cookie + 8, expected, 8) == 0);
+            old_secret = match && i > 0;
         }
     } else {
         uint8_t expected[8];
@@ -109,7 +111,9 @@ server_cookie_status_t verify_server_cookie(const server_config_t *cfg, const ch
         match = (const_time_memcmp(server_cookie + 8, expected, 8) == 0);
     }
     if (!match) return SERVER_COOKIE_INVALID;
-    return (age > SERVER_COOKIE_REFRESH_SECS) ? SERVER_COOKIE_VALID_REFRESH : SERVER_COOKIE_VALID;
+    /* The query engine echoes a valid cookie back unless a new one is due.  One made with an older secret is accepted (rollover, RFC 9018
+     * section 5) but answered with a new cookie from the current secret, so that the client moves over before that secret is removed. */
+    return (age > SERVER_COOKIE_REFRESH_SECS || old_secret) ? SERVER_COOKIE_VALID_REFRESH : SERVER_COOKIE_VALID;
 }
 
 void add_ede(edns_info_t *edns, bool enabled, uint16_t code, const char *text) {

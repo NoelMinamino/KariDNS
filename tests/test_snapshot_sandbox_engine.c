@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/capsicum.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 
@@ -101,20 +102,30 @@ static void test_priv_sandbox_directory_caching(void) {
     assert(memcmp(buf, "test", 4) == 0);
     close(r_fd);
 
-    // 3. Socket rights limitation (should not crash or error)
+    // 3. Socket rights limitation: the result is reported (low batch L3, dns_priv_sandbox.c [8])
     int sock_tcp = socket(AF_INET, SOCK_STREAM, 0);
     if (sock_tcp >= 0) {
-        limit_server_socket_rights(sock_tcp, true);  // listening
-        limit_server_socket_rights(sock_tcp, false); // connected
+        assert(limit_server_socket_rights(sock_tcp, true));   // listening
+        errno = 0;
+        assert(!limit_server_socket_rights(sock_tcp, false)); // wider than the listening rights: refused, not silently ignored
+        assert(errno == ENOTCAPABLE);
         close(sock_tcp);
     }
 
     int sock_udp = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock_udp >= 0) {
-        limit_server_socket_rights(sock_udp, false);
-        limit_client_socket_rights(sock_udp);
+        assert(limit_server_socket_rights(sock_udp, false));
         close(sock_udp);
     }
+    int sock_cl = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock_cl >= 0) {
+        assert(limit_client_socket_rights(sock_cl));
+        close(sock_cl);
+    }
+    errno = 0;
+    assert(!limit_client_socket_rights(-1) && errno == EBADF);
+    assert(!limit_server_socket_rights(-1, true) && errno == EBADF);
+    assert(fd_drop_fchown(-1));                               // nothing to drop
 
     // 4. renameat via dir cache
     char tmp_file2[] = "/tmp/karidns_sandbox_test2_XXXXXX";
@@ -294,8 +305,8 @@ static void test_priv_sandbox_path_errors(void) {
         errno = 0; assert(stat_via_dir_cache(bad[i], &sb) == -1 && errno == EINVAL);
         errno = 0; assert(unlink_via_dir_cache(bad[i]) == -1 && errno == EINVAL);
         errno = 0; assert(list_dir_via_dir_cache(bad[i], dc_name, NULL) == -1 && errno == EINVAL);
-        assert(renameat_via_dir_cache(bad[i], "/tmp/karidns_dc_never") == -1);
-        assert(renameat_via_dir_cache("/tmp/karidns_dc_never", bad[i]) == -1);
+        errno = 0; assert(renameat_via_dir_cache(bad[i], "/tmp/karidns_dc_never") == -1 && errno == EINVAL);
+        errno = 0; assert(renameat_via_dir_cache("/tmp/karidns_dc_never", bad[i]) == -1 && errno == EINVAL);
     }
     char dir[] = "/tmp/karidns_dc_XXXXXX";
     assert(mkdtemp(dir) != NULL);
@@ -320,6 +331,12 @@ static void test_priv_sandbox_path_errors(void) {
     snprintf(q, sizeof(q), "%s/b.txt", dir);
     fd = open_via_dir_cache(q, O_CREAT | O_WRONLY, 0600, true);                        /* ... and opened again for writing */
     assert(fd >= 0);
+    {                                                                                  /* CAP_FCHOWN comes off, and the result says so */
+        cap_rights_t cr;
+        assert(fd_drop_fchown(fd));
+        assert(cap_rights_get(fd, &cr) == 0 && !cap_rights_is_set(&cr, CAP_FCHOWN));
+        assert(fd_drop_fchown(fd));                                                    /* again: nothing left to drop */
+    }
     close(fd);
     assert(stat_via_dir_cache(q, &sb) == 0);
 
@@ -396,9 +413,41 @@ static void test_priv_sandbox_root_below(void) {
     printf("  -> roots passed.\n");
 }
 
+/* low batch L3, dns_priv_sandbox.c [4]: a root registered as "dir/" (options { directory "/var/dns/"; }) matches the directories below it,
+ * the same as "dir"; the cache key of a directory has no trailing slash, and the root "/" stays "/" */
+static void test_priv_sandbox_root_trailing_slash(void) {
+    printf("[TEST] Priv Sandbox: a root registered with a trailing slash...\n");
+    char root[] = "/tmp/karidns_sbslash_XXXXXX";
+    assert(mkdtemp(root));
+    char p[PATH_MAX], f[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/sub", root);               assert(mkdir(p, 0755) == 0);
+    snprintf(f, sizeof(f), "%s/sub/f.txt", root);
+    int fd = open(f, O_CREAT | O_WRONLY, 0600);          assert(fd >= 0);
+    close(fd);
+
+    char reg[PATH_MAX];
+    snprintf(reg, sizeof(reg), "%s//", root);             /* two trailing slashes */
+    assert(dir_fd_cache_add_root(reg));
+
+    atomic_store_explicit(&g_capsicum_enabled, true, memory_order_release);
+    fd = open_via_dir_cache(f, O_RDONLY, 0, false);       /* "root/sub" was never opened: reached through the root */
+    assert(fd >= 0);
+    close(fd);
+    snprintf(f, sizeof(f), "%s//sub/f.txt", root);        /* a path of the same directory with a doubled slash: the same cache entry */
+    fd = open_via_dir_cache(f, O_RDONLY, 0, false);
+    assert(fd >= 0);
+    close(fd);
+    atomic_store_explicit(&g_capsicum_enabled, false, memory_order_release);
+
+    snprintf(p, sizeof(p), "rm -rf %s", root);
+    assert(system(p) == 0);
+    printf("  -> trailing slash passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Sandbox & Snapshot RCU Engine Unit Tests ===\n");
     test_priv_sandbox_root_below();
+    test_priv_sandbox_root_trailing_slash();
     test_priv_sandbox_directory_caching();
     test_priv_sandbox_path_errors();
     test_snapshot_rcu_lifecycle_and_suffix_lookup();

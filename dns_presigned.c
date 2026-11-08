@@ -123,7 +123,7 @@ bool presigned_parse_n3param(const char *s, presigned_n3param_t *p, const char *
         return false;
     }
     if (iter > PRESIGNED_MAX_ITERATIONS) {
-        *why = "NSEC3PARAM iterations exceed 2500 (RFC 5155 s10.3, RFC 9276 s3)";
+        *why = "NSEC3PARAM iterations exceed 150 (RFC 9276 s3.2)";
         return false;
     }
     p->alg = (uint8_t)alg;
@@ -387,7 +387,7 @@ static bool nsec_ordername(const char *name, const char *apex, char *out, size_t
     size_t nl = dns_name_len_no_root(name, strlen(name)), al = dns_name_len_no_root(apex, strlen(apex));
     if (nl < al) return false;
     if (nl == al) return true;
-    size_t rl = nl - al - 1;                        /* the part before ".apex" */
+    size_t rl = nl - al - (al ? 1 : 0);             /* the part before ".apex" (the root apex "." has no label, so no dot to skip) */
     if (rl + 1 > cap) return false;
     size_t o = 0;
     size_t end = rl;
@@ -658,9 +658,13 @@ static int rebuild_nsec3(ps_ctx_t *c, const presigned_n3param_t *np, const char 
                 }
             }
         }
-        if (!have_param_ttl && soa_minimum(c, &ttl_param) != 0) {
-            snprintf(err, errlen, "no SOA record at the zone apex");
-            goto out;
+        if (!have_param_ttl) {
+            /* no RRSIG(NSEC3PARAM) to take the Original TTL from: SOA MINIMUM stands in (kept on purpose; the caller warns) */
+            if (soa_minimum(c, &ttl_param) != 0) {
+                snprintf(err, errlen, "no SOA record at the zone apex");
+                goto out;
+            }
+            out->param_ttl_from_soa = true;
         }
         salt_text(np, salt);
         out->anchor = malloc((n_chain + 1) * sizeof(size_t));

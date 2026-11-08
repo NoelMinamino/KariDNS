@@ -73,7 +73,7 @@ typedef struct {
 struct worker_ctx;
 typedef struct worker_ctx worker_ctx_t;
 
-extern int g_dnstap_sock;
+extern _Atomic int g_dnstap_sock; /* written by the sender thread (reconnect, close) and read by enter_capsicum_sandbox */
 extern _Atomic bool g_dnstap_connected;
 extern _Atomic uint64_t g_dnstap_truncated_total;
 
@@ -100,6 +100,10 @@ bool dnstap_shutdown(int timeout_ms);
  * 実体は dns_query_engine.c の dnstap_fill_query_zone() (ゾーン DB を引く)。 */
 void dnstap_set_zone_filler(void (*fn)(dnstap_event_meta_t *meta, const uint8_t *wire, size_t wire_len));
 void dnstap_fill_query_zone(dnstap_event_meta_t *meta, const uint8_t *wire, size_t wire_len);
+
+/* worst case of one frame: a 64 KB wire + the addresses and the zone name (Message), the identity and the version (top level); with room to spare */
+#define DNSTAP_MSG_BUF_SIZE   (65535 + 1024)
+#define DNSTAP_FRAME_BUF_SIZE (65535 + 2048)
 
 size_t dnstap_build_message(const dnstap_event_meta_t *meta,
                             const uint8_t *wire, size_t wire_len,

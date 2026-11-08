@@ -373,6 +373,25 @@ static dns_record_t *tinydns_new_record(zone_arena_t *arena, parse_context_t *ct
     return rec;
 }
 
+/* D13 (review low L4 dns_tinydns_parser.c [1]): a TTL (or SOA time) field is decimal digits and nothing else.  strtoul() read "abc" as 0 and a
+ * signed "-1" as a huge value; an empty field keeps the default of the line (the callers test the length first).  Larger numbers saturate
+ * and are cut to 2147483647 by tinydns_new_record() (RFC 8767 s4). */
+static bool tinydns_ttl_field(parse_context_t *ctx, const char *line_start, const char *buf, const char *field, size_t len, unsigned long *out) {
+    bool ok = len > 0;
+    for (size_t i = 0; i < len && ok; i++)
+        if (!isdigit((unsigned char)field[i])) ok = false;
+    if (!ok) {
+        if (ctx && ctx->err_out) {
+            ctx->err_out->error_message = "Invalid TTL in tinydns record (expected decimal digits only)";
+            ctx->err_out->error_offset = (size_t)(line_start - buf);
+            ctx->err_out->token_length = len;
+        }
+        return false;
+    }
+    *out = strtoul(field, NULL, 10);
+    return true;
+}
+
 /* ============================================================================
  * 1行処理関数
  * ============================================================================ */
@@ -406,17 +425,26 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             }
 
             unsigned long ttl = TTL_NS;
-            if (flen[3] > 0) ttl = strtoul(f[3], NULL, 10);
+            if (flen[3] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[3], flen[3], &ttl)) return false;
 
             if (typech == '.') {
                 // SOA レコード
                 if (tinydns_owned(ctx, fqdn, true)) {
-                    // SOA自身のTTL: f[3]が明示的に "0" の場合のみ 0、それ以外(省略含む)は 2560
+                    // SOA自身のTTL: f[3]が明示的に 0 (数値として。"00" も) の場合のみ 0、それ以外(省略含む)は 2560
                     unsigned long soa_ttl = TTL_NEGATIVE;
-                    if (flen[3] > 0 && flen[3] == 1 && f[3][0] == '0') soa_ttl = 0;
+                    if (flen[3] > 0 && ttl == 0) soa_ttl = 0;
 
                     // rname は "\12hostmaster" + fqdn
                     char *rname = tinydns_join_names(arena, "hostmaster.", fqdn);
+                    if (!rname) {
+                        /* the name does not fit 255 octets: it used to become "hostmaster." (a wrong SOA RNAME) */
+                        if (ctx && ctx->err_out) {
+                            ctx->err_out->error_message = "Name too long: hostmaster.<zone> in tinydns '.' record does not fit 255 octets";
+                            ctx->err_out->error_offset = (size_t)(line_start - buf);
+                            ctx->err_out->token_length = flen[0];
+                        }
+                        return false;
+                    }
 
                     dns_record_t *soa_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "SOA", 6, soa_ttl, f[4], flen[4], f[5], flen[5]);
                     if (!soa_rec) return false;
@@ -430,7 +458,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
 
                     if (!arena_record_alloc_rdata(arena, soa_rec, 7)) return false;
                     soa_rec->rdata[0] = x;
-                    soa_rec->rdata[1] = rname ? rname : arena_strdup(arena, "hostmaster.");
+                    soa_rec->rdata[1] = rname;
                     soa_rec->rdata[2] = arena_strdup(arena, s_ser);
                     soa_rec->rdata[3] = arena_strdup(arena, s_ref);
                     soa_rec->rdata[4] = arena_strdup(arena, s_ret);
@@ -440,8 +468,8 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                 }
             }
 
-            // NS レコード
-            if (tinydns_owned(ctx, fqdn, true)) {
+            // NS レコード。'.' 行は SOA で数え済み: 同じ行をゾーン外として二度数えない (review low L4 [10])
+            if (tinydns_owned(ctx, fqdn, typech == '&')) {
                 dns_record_t *ns_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "NS", 2, ttl, f[4], flen[4], f[5], flen[5]);
                 if (!ns_rec) return false;
                 if (!arena_record_alloc_rdata(arena, ns_rec, 1)) return false;
@@ -478,7 +506,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             }
 
             unsigned long ttl = TTL_POSITIVE;
-            if (flen[2] > 0) ttl = strtoul(f[2], NULL, 10);
+            if (flen[2] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[2], flen[2], &ttl)) return false;
 
             uint8_t ip[4];
             if (flen[1] > 0 && tinydns_ip4_scan(f[1], flen[1], ip)) {
@@ -536,7 +564,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             if (flen[3] > 0) dist = strtoul(f[3], NULL, 10);
 
             unsigned long ttl = TTL_POSITIVE;
-            if (flen[4] > 0) ttl = strtoul(f[4], NULL, 10);
+            if (flen[4] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[4], flen[4], &ttl)) return false;
 
             if (tinydns_owned(ctx, fqdn, true)) {
                 dns_record_t *mx_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "MX", 15, ttl, f[5], flen[5], f[6], flen[6]);
@@ -577,7 +605,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             }
 
             unsigned long ttl = TTL_POSITIVE;
-            if (flen[2] > 0) ttl = strtoul(f[2], NULL, 10);
+            if (flen[2] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[2], flen[2], &ttl)) return false;
 
             if (tinydns_owned(ctx, fqdn, true)) {
                 size_t raw_len = 0;
@@ -612,6 +640,23 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                     if (!arena_record_alloc_rdata(arena, txt_rec, 1)) return false;
                     txt_rec->rdata[0] = arena_strdup(arena, "");
                     txt_rec->rdata_count = 1;
+                } else if (memchr(raw_bytes, 0, raw_len)) {
+                    /* review low L4 dns_tinydns_parser.c [3]: a NUL octet (\000) ends a chunk that is a C string, and tinydns keeps it.
+                     * The RDATA goes in as the octets of the RFC 3597 form instead (the same as a long TXT of a zone file), cut into the
+                     * same 127-octet <character-string>s: at most 6096 octets of data, so the whole fits RDLENGTH */
+                    size_t nchunks = (raw_len + 126) / 127;
+                    uint8_t *blob = (uint8_t *)arena_alloc(arena, raw_len + nchunks);
+                    if (!blob) return false;
+                    size_t w = 0;
+                    for (size_t offset = 0; offset < raw_len; offset += 127) {
+                        size_t clen = raw_len - offset > 127 ? 127 : raw_len - offset;
+                        blob[w++] = (uint8_t)clen;
+                        memcpy(blob + w, raw_bytes + offset, clen);
+                        w += clen;
+                    }
+                    txt_rec->generic_data = blob;
+                    txt_rec->generic_len = (uint16_t)w;
+                    txt_rec->rdata_count = 0;
                 } else {
                     size_t offset = 0;
                     int chunk_idx = 0;
@@ -657,7 +702,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             }
 
             unsigned long ttl = TTL_POSITIVE;
-            if (flen[2] > 0) ttl = strtoul(f[2], NULL, 10);
+            if (flen[2] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[2], flen[2], &ttl)) return false;
 
             if (tinydns_owned(ctx, fqdn, true)) {
                 const char *tname = (typech == 'C') ? "CNAME" : "PTR";
@@ -720,15 +765,15 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                 ser = sv;
             }
             unsigned long ref = DEFAULT_SOA_REFRESH;
-            if (flen[4] > 0) ref = strtoul(f[4], NULL, 10);
+            if (flen[4] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[4], flen[4], &ref)) return false;
             unsigned long ret = DEFAULT_SOA_RETRY;
-            if (flen[5] > 0) ret = strtoul(f[5], NULL, 10);
+            if (flen[5] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[5], flen[5], &ret)) return false;
             unsigned long exp = DEFAULT_SOA_EXPIRE;
-            if (flen[6] > 0) exp = strtoul(f[6], NULL, 10);
+            if (flen[6] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[6], flen[6], &exp)) return false;
             unsigned long min = DEFAULT_SOA_MINIMUM;
-            if (flen[7] > 0) min = strtoul(f[7], NULL, 10);
+            if (flen[7] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[7], flen[7], &min)) return false;
             unsigned long ttl = TTL_NEGATIVE;
-            if (flen[8] > 0) ttl = strtoul(f[8], NULL, 10);
+            if (flen[8] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[8], flen[8], &ttl)) return false;
 
             if (tinydns_owned(ctx, fqdn, true)) {
                 dns_record_t *soa_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "SOA", 6, ttl, f[9], flen[9], f[10], flen[10]);
@@ -790,7 +835,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             }
 
             unsigned long ttl = TTL_POSITIVE;
-            if (flen[3] > 0) ttl = strtoul(f[3], NULL, 10);
+            if (flen[3] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[3], flen[3], &ttl)) return false;
 
             if (tinydns_owned(ctx, fqdn, true)) {
                 size_t raw_len = 0;
@@ -841,7 +886,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             }
 
             unsigned long ttl = TTL_POSITIVE;
-            if (flen[2] > 0) ttl = strtoul(f[2], NULL, 10);
+            if (flen[2] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[2], flen[2], &ttl)) return false;
 
             uint8_t ip6[16];
             if (tinydns_decode_ipv6_hex32(f[1], flen[1], ip6)) {
@@ -902,7 +947,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             if (flen[3] > 0) port = strtoul(f[3], NULL, 10);
             if (flen[4] > 0) weight = strtoul(f[4], NULL, 10);
             if (flen[5] > 0) priority = strtoul(f[5], NULL, 10);
-            if (flen[6] > 0) ttl = strtoul(f[6], NULL, 10);
+            if (flen[6] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[6], flen[6], &ttl)) return false;
 
             char *target = tinydns_decode_fqdn(arena, f[2], flen[2]);
             if (!target) {
@@ -961,7 +1006,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             unsigned long order = 0, pref = 0, ttl = TTL_POSITIVE;
             if (flen[1] > 0) order = strtoul(f[1], NULL, 10);
             if (flen[2] > 0) pref = strtoul(f[2], NULL, 10);
-            if (flen[7] > 0) ttl = strtoul(f[7], NULL, 10);
+            if (flen[7] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[7], flen[7], &ttl)) return false;
 
             if (tinydns_owned(ctx, owner, true)) {
                 size_t flags_len = 0, service_len = 0, regexp_len = 0;
@@ -1016,7 +1061,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             unsigned long alg = 0, fptype = 0, ttl = TTL_POSITIVE;
             if (flen[1] > 0) alg = strtoul(f[1], NULL, 10);
             if (flen[2] > 0) fptype = strtoul(f[2], NULL, 10);
-            if (flen[4] > 0) ttl = strtoul(f[4], NULL, 10);
+            if (flen[4] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[4], flen[4], &ttl)) return false;
 
             if (tinydns_owned(ctx, owner, true)) {
                 char *fp_hex = (char *)arena_alloc(arena, flen[3] + 1);
@@ -1051,9 +1096,15 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
 
         case '%': { // location
             if (arena->location_count >= 4096) {
-                syslog(LOG_WARNING, "[tinydns] location定義が上限(4096)に達したため、"
-                       "これ以上の%%行は無視します (line %lu)", linenum);
-                return true;
+                /* D14 (review low L4 dns_tinydns_parser.c [15]): fail closed.  A location line that is dropped changes who gets which
+                 * answer, and the load used to succeed with a partial map */
+                syslog(LOG_ERR, "[tinydns] more than 4096 location (%%) lines (line %lu): the data file is refused", linenum);
+                if (ctx && ctx->err_out) {
+                    ctx->err_out->error_message = "Too many location lines (more than 4096 '%' lines)";
+                    ctx->err_out->error_offset = (size_t)(line_start - buf);
+                    ctx->err_out->token_length = flen[0];
+                }
+                return false;
             }
             tinydns_location_entry_t loc;
             memset(&loc, 0, sizeof(loc));

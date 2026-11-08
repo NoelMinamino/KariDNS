@@ -275,7 +275,10 @@ int rrl_debit(uint64_t hash, uint32_t rate, uint32_t window_sec, uint32_t slip,
     for (int probe = 0; probe < RRL_PROBE_WAYS; probe++) {
       rrl_bucket_t *b = &g_rrl_table[(base_idx + (size_t)probe) & (RRL_TABLE_SIZE - 1)];
       rrl_lock(b);
-      if (atomic_load_explicit(&b->key_hash, memory_order_relaxed) == 0 ||
+      /* a thread that missed in the 1st pass can find the key here: another thread made its bucket in between; taking a second
+       * (empty) bucket for the same key would give the client a second budget */
+      if (atomic_load_explicit(&b->key_hash, memory_order_relaxed) == hash ||
+          atomic_load_explicit(&b->key_hash, memory_order_relaxed) == 0 ||
           now_ms - b->last_used_ms > (int64_t)window_sec * 1000) {
         selected = b;
         break;
@@ -365,12 +368,6 @@ bool rrl_check_key(const void *client_addr_ptr, const rrl_key_t *key, const rate
     }
   }
 
-  if (!allow && !*out_slip) {
-    atomic_fetch_add_explicit(&g_rrl_dropped_total, 1, memory_order_relaxed);
-  } else if (!allow && *out_slip) {
-    atomic_fetch_add_explicit(&g_rrl_slip_total, 1, memory_order_relaxed);
-  }
-
   if (cfg->log_only && !allow) {
     char ip_str[INET6_ADDRSTRLEN] = {0};
     if (client_addr->sa_family == AF_INET) {
@@ -380,7 +377,13 @@ bool rrl_check_key(const void *client_addr_ptr, const rrl_key_t *key, const rate
     }
     syslog(LOG_INFO, "[RRL] would rate-limit %s (log-only)", ip_str);
     *out_slip = false;
-    return true; // allow anyway
+    return true; // allow anyway; nothing was dropped or slipped, so nothing is counted
+  }
+
+  if (!allow && !*out_slip) {
+    atomic_fetch_add_explicit(&g_rrl_dropped_total, 1, memory_order_relaxed);
+  } else if (!allow && *out_slip) {
+    atomic_fetch_add_explicit(&g_rrl_slip_total, 1, memory_order_relaxed);
   }
 
   return allow;

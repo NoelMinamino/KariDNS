@@ -156,7 +156,7 @@ zone_case csync_type  0 "CSYNC record contains unknown type 'BOGUS'" '@ CSYNC 66
 zone_case n3p_optout  1 "MUST be ignored (RFC 5155 section 4.1.2), so the server ignores it" '@ NSEC3PARAM 1 1 0 -'
 zone_case n3p_flags   1 "has Flags 2; the Flags field must be 0" '@ NSEC3PARAM 1 2 0 -'
 zone_case n3p_unusable 1 "None of the 1 NSEC3PARAM RRs of zone 'z.example.' is usable" '@ NSEC3PARAM 1 1 0 -'
-zone_case n3p_high    1 "iterations value is excessively high" '@ NSEC3PARAM 1 0 5000 -'
+zone_case n3p_high    1 "iterations value is excessively high" '@ NSEC3PARAM 1 0 150 -'   # (above 150 the zone is refused: run_karicheck_low_l4_test.sh)
 
 # ---- NSEC3 chains (K-05): checked once per chain, against the NSEC3PARAM the server uses ------------------
 N3A='0p9mhaveqvm6t7vbl5lop2u3t2rp3tom'
@@ -234,7 +234,7 @@ esac
 td_case hex3       1 "type '3' requires a 32-character hexadecimal IPv6 address" '3www.example.com:20010db8:300'
 td_case hex6_info  0 "type '6' generates deprecated PTR" '6www.example.com:20010db8000000000000000000000001:300'
 td_case srv_range  1 "out of range (0-65535)" 'Sexample.com:5.srv.example.com:5060:70000:20:300'
-td_case naptr_pref 1 "NAPTR preference '70000' out of range" 'Nexample.com:1:70000:u:E2U+sip:!^.*$!sip:a@b!:.:300'
+td_case naptr_pref 1 "NAPTR preference '70000' out of range" 'Nexample.com:1:70000:u:E2U+sip:!^.*$!sip\072a@b!:.:300'
 td_case sshfp_gen  1 "SSHFP record requires 3 fields" ':sshfp.example.com:44:\001\001\252\273:300'
 td_case loc_dup    0 "Duplicate location code 'lo'" '%lo:10.0
 %lo:10.1'
@@ -276,10 +276,28 @@ conf_case zones_nofile  zones 1 "Could not open file" 'zone "m.example" { type m
 zone "s.example" { type slave; file "s"; masters { 192.0.2.1; }; };'
 out=$("$KC" conf /nonexistent/x.conf 2>&1); rc=$?
 check "conf:missing" 1 "Could not open file" "$out" "$rc"
-# the shipped sample must stay loadable; its placeholder secrets are flagged but are not errors
+# the shipped sample is not usable as it is: the control-channel secret is still the placeholder, which is an error (a key nobody uses only warns)
 out=$("$KC" conf karidns.conf.sample 2>&1); rc=$?
+check "conf:sample-placeholder" 1 "control-channel: secret is still the sample placeholder" "$out" "$rc"
+# with a real secret in the control-channel (the 2nd and 3rd secrets of the sample are keys: one unused, which only warns) it loads
+perl -pe 'if (!$d && s/UkVQTEFDRS1NRTpvcGVuc3NsLXJhbmQtYmFzZTY0LTMy/c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0/) { $d = 1 }' karidns.conf.sample > "$TMP/sample_real.conf"
+out=$("$KC" conf "$TMP/sample_real.conf" 2>&1); rc=$?
 check "conf:sample" 0 "is valid" "$out" "$rc"
-check "conf:sample-placeholder" 0 "secret is still the sample placeholder" "$out" "$rc"
+check "conf:sample-unused-key-warning" 0 "key 'tsig-key-example': secret is still the sample placeholder" "$out" "$rc"
+# a key that an ACL uses with the placeholder is an error
+printf 'key "k" { algorithm hmac-sha256; secret "UkVQTEFDRS1NRTpvcGVuc3NsLXJhbmQtYmFzZTY0LTMy"; };\nzone "z.example" { type master; file "z"; allow-transfer { key k; }; };\n' > "$TMP/used_key.conf"
+out=$("$KC" conf "$TMP/used_key.conf" 2>&1); rc=$?
+check "conf:placeholder-key-used" 1 "key 'k' is used here but its secret is still the sample placeholder" "$out" "$rc"
+# S6 / F4 / D1 / S10 of the review fixes
+printf 'options { port 5300; };\n/* never closed\n' > "$TMP/open_comment.conf"
+out=$("$KC" conf "$TMP/open_comment.conf" 2>&1); rc=$?
+check "conf:unterminated-comment" 1 "unterminated /* comment" "$out" "$rc"
+printf 'options { port 5300; };\nzonee "a.example" { type master; file "x"; };\n' > "$TMP/typo.conf"
+out=$("$KC" conf "$TMP/typo.conf" 2>&1); rc=$?
+check "conf:unknown-statement" 0 "unknown statement 'zonee' is skipped" "$out" "$rc"
+printf 'options { allow-query { 10.0.0.1/8; }; };\n' > "$TMP/hostbits.conf"
+out=$("$KC" conf "$TMP/hostbits.conf" 2>&1); rc=$?
+check "conf:host-bits" 0 "'10.0.0.1/8' has host bits set" "$out" "$rc"
 conf_case tcp_opts      conf 0 "is valid" 'options { tcp-mss 1220; tcp-window 256K; udp-bufsize 1232; };
 zone "t.example" { type master; file "t.zone"; zone-tcp-mss 1200; zone-tcp-window 128K; zone-tcp-sndbuf 2M; zone-udp-bufsize 1400; };'
 conf_case tcp_opts_bad  conf 1 "invalid zone-tcp-sndbuf value" 'zone "t.example" { type master; file "t.zone"; zone-tcp-sndbuf 2MB; };'

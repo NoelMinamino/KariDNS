@@ -547,10 +547,23 @@ size_t aml_get_interfaces(const aml_iface_t **v) {
     return s->n;
 }
 
+/* The table grows until getifaddrs() fits (a jail or a router can have many more than 256 addresses, and an address that is missing
+ * makes localhost / localnets deny a client that is on the host).  An allocation failure or the 1 Mi entries stop it; the entries
+ * collected so far are used then. */
+#define AML_IFACE_MAX_ENTRIES (1u << 20)
 void aml_init_interfaces(void) {
-    aml_iface_t tmp[256];
-    size_t n = aml_collect_interfaces(tmp, sizeof(tmp) / sizeof(tmp[0]));
-    aml_set_interfaces(tmp, n);
+    size_t cap = 256, n = 0;
+    aml_iface_t *tmp = NULL;
+    for (;;) {
+        aml_iface_t *grown = realloc(tmp, cap * sizeof(*tmp));
+        if (!grown) break;
+        tmp = grown;
+        n = aml_collect_interfaces(tmp, cap);
+        if (n < cap || cap >= AML_IFACE_MAX_ENTRIES) break;      /* everything fitted */
+        cap *= 2;
+    }
+    if (tmp) aml_set_interfaces(tmp, n);
+    free(tmp);
 }
 
 static bool aml_iface_match(const aml_subject_t *s, bool nets) {

@@ -8,15 +8,16 @@
 extern bool g_bypass_cap_enter;
 
 void enter_capsicum_sandbox(void);
-void limit_server_socket_rights(int fd, bool is_listening_tcp);
-void limit_client_socket_rights(int fd);
+/* false (logged, errno set) = cap_rights_limit() failed and the descriptor keeps its wider rights; ENOSYS (no CAPABILITY_MODE in the kernel) is true */
+bool limit_server_socket_rights(int fd, bool is_listening_tcp);
+bool limit_client_socket_rights(int fd);
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable);
 int stat_via_dir_cache(const char *path, struct stat *sb);
 int renameat_via_dir_cache(const char *old_path, const char *new_path);
 int list_dir_via_dir_cache(const char *file_path, void (*cb)(const char *name, void *ud), void *ud);
 int unlink_via_dir_cache(const char *path);
-void fd_drop_fchown(int fd);
-void dir_fd_cache_drop_fchown(void);
+bool fd_drop_fchown(int fd);
+bool dir_fd_cache_drop_fchown(void);
 /* Opens dirpath (before the sandbox) for reading and marks it as a root of a directory tree: afterwards a directory below it that nobody
  * has opened yet can still be opened in capability mode, with openat() on this fd (O_RESOLVE_BENEATH, no ".."), instead of failing with
  * ENOTCAPABLE.  The server registers options { directory } and the directory of each zone file this way.  false (errno set) = not openable. */

@@ -174,7 +174,7 @@ static void test_rfc9018_appendix_a(void) {
     set_secrets(&cfg, 2, s_a4);
     const char *v6 = "2001:db8:220:1:59de:d0f4:8769:82b8";
     assert(verify_hex(&cfg, v6, "22681ab97d52c298", "010000005cf7c57926556bd0934c72f8",
-                      1559741961u) == SERVER_COOKIE_VALID);      // made with the OLD secret (2nd entry)
+                      1559741961u) == SERVER_COOKIE_VALID_REFRESH);   // made with the OLD secret (2nd entry): accepted, and the reply carries a new cookie (A.4)
     expect_cookie(&cfg, v6, "22681ab97d52c298", 1559741961u,
                   "010000005cf7c609a6bb79d16625507a");            // generated with the NEW secret
     assert(verify_hex(&cfg, v6, "22681ab97d52c298", "010000005cf7c609a6bb79d16625507a",
@@ -188,7 +188,7 @@ static void test_rfc9018_appendix_a(void) {
     const char *s_stage1[] = { RFC9018_SECRET_A4_OLD, RFC9018_SECRET_A4_NEW };
     set_secrets(&cfg, 2, s_stage1);
     assert(verify_hex(&cfg, v6, "22681ab97d52c298", "010000005cf7c609a6bb79d16625507a",
-                      1559741961u) == SERVER_COOKIE_VALID);
+                      1559741961u) == SERVER_COOKIE_VALID_REFRESH);   // the 2nd entry again: the first generates
     uint8_t cc[8], sc[16], want[16];
     hex2bin("22681ab97d52c298", cc, 8);
     hex2bin("010000005cf7c57926556bd0934c72f8", want, 16);

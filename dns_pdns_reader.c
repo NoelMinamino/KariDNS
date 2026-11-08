@@ -525,7 +525,8 @@ int pdns_zone_add_record(pdns_zone_t *z, const db_record_row_t *row) {
         pdns_ent_t *e = &z->ents[z->n_ents];
         e->row_id = id;
         e->name = strdup(owner);
-        e->ordername = row->ordername ? strdup(row->ordername) : NULL;
+        /* the same bound as store_ordername(): a longer value (a damaged cell) is not kept whole, only marked */
+        e->ordername = row->ordername ? strdup(strlen(row->ordername) > 255 ? "\x01too-long" : row->ordername) : NULL;
         if (!e->name || (row->ordername && !e->ordername)) {
             free(e->name);
             free(e->ordername);
@@ -1595,6 +1596,8 @@ static int apply_presigned(pdns_zone_t *z) {
         goto done;
     }
     z->presigned_mode = out.mode;
+    if (out.param_ttl_from_soa)
+        zwarn(z, false, 0, "presigned zone: no RRSIG(NSEC3PARAM) at the apex; the NSEC3PARAM TTL is the SOA MINIMUM (the TTL the signer used is unknown)");
     if (out.mode == PS_NSEC3 && z->nsec3param) {      /* open item 3: the cap stays 2500 (RFC 5155 s10.3); RFC 9276 s3.1 says 0 */
         presigned_n3param_t np;
         const char *why = NULL;
@@ -2011,6 +2014,12 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
     if (rc == 0 && !norows && (z->flags & PDNS_F_TINYDNS)) {
         static const uint8_t ftag[] = "KDB1-TINYDNS";
         if (EVP_DigestUpdate(dd.md, ftag, sizeof(ftag)) != 1) rc = -1;
+    }
+    /* the PRESIGNED flag is sent in ZONE_BEGIN and decides how the Backend serves the zone (the signatures it has, no ALIAS): toggling it
+     * leaves the bodies alone when the zone has nothing the presigned checks change (PS_NONE), and the diff must still see it */
+    if (rc == 0 && !norows && (z->flags & PDNS_F_PRESIGNED)) {
+        static const uint8_t ptag[] = "KDB1-PRESIGNED";
+        if (EVP_DigestUpdate(dd.md, ptag, sizeof(ptag)) != 1) rc = -1;
     }
     /* B7a: a metadata-only edit (the settings text, the profile that is named, the text of that profile) must change the
      * digest, or the diff would find the zone up to date.  Zones without settings and profile keep the digest of the data

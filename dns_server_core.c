@@ -351,7 +351,11 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
         _exit(1);
       }
     }
-    logging_drop_fchown();
+    if (!logging_drop_fchown()) {
+      syslog(LOG_ERR, "[Broker] Cannot take the fchown right off the log descriptors; refusing to run");
+      close(sv[1]);
+      _exit(1);
+    }
     /* AF_UNIX で connect してよいのは起動時に設定された dnstap ソケットだけ (再接続用)。
      * それ以外のローカルソケットへ実行ユーザーとして接続させる口にはしない。 */
     char allowed_unix_path[sizeof(((struct sockaddr_un *)0)->sun_path)] = "";
@@ -446,7 +450,7 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
   g_broker_sock = sv[0];
   g_broker_pid = pid;
   cap_rights_t broker_rights;
-  cap_rights_init(&broker_rights, CAP_SEND, CAP_RECV, CAP_EVENT, CAP_FCNTL);
+  cap_rights_init(&broker_rights, CAP_SEND, CAP_RECV, CAP_EVENT, CAP_FCNTL, CAP_SHUTDOWN);   /* CAP_SHUTDOWN: broker_connect_opts() ends a conversation that lost a message */
   cap_rights_limit(g_broker_sock, &broker_rights);
 }
 
@@ -498,7 +502,15 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr,
    * 応答するので、保持するのは2回のシステムコールの間だけ (O-04)。 */
   static pthread_mutex_t broker_lock = PTHREAD_MUTEX_INITIALIZER;
   pthread_mutex_lock(&broker_lock);
-  if (send(g_broker_sock, &req, sizeof(req), 0) != sizeof(req)) {
+  /* One request, one reply, in order: if a request or its reply is lost half way, the next caller would get the reply of this one
+   * (a socket to another peer).  An interrupted call is repeated; any other failure ends the conversation for good (shutdown() makes
+   * every later send / recvmsg fail), because nothing says whether the broker has answered. */
+  ssize_t sr;
+  do {
+    sr = send(g_broker_sock, &req, sizeof(req), 0);
+  } while (sr < 0 && errno == EINTR);
+  if (sr != (ssize_t)sizeof(req)) {
+    shutdown(g_broker_sock, SHUT_RDWR);
     pthread_mutex_unlock(&broker_lock);
     return -1;
   }
@@ -512,7 +524,12 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr,
   msg.msg_iovlen = 1;
   msg.msg_control = buf;
   msg.msg_controllen = sizeof(buf);
-  if (recvmsg(g_broker_sock, &msg, 0) < 0 || data[0] != 0) {
+  ssize_t rr;
+  do {
+    rr = recvmsg(g_broker_sock, &msg, 0);
+  } while (rr < 0 && errno == EINTR);
+  if (rr <= 0) {                                /* error, or the broker is gone: the reply is not known */
+    shutdown(g_broker_sock, SHUT_RDWR);
     pthread_mutex_unlock(&broker_lock);
     return -1;
   }
@@ -521,6 +538,10 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr,
   if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS)
     fd = *(int *)CMSG_DATA(cmsg);
   pthread_mutex_unlock(&broker_lock);
+  if (data[0] != 0) {                           /* the broker refused: close a descriptor that came with the answer anyway */
+    if (fd >= 0) close(fd);
+    return -1;
+  }
   if (fd >= 0 && !broker_finish_connect(fd, type, tcp_opts)) {
     close(fd);
     return -1;
@@ -556,6 +577,7 @@ size_t resolve_ip_port_to_sockaddr(const char *ip, int port,
 int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out,
                          uint16_t *len_out) {
   while (1) {
+    if (ctx->read_deadline && time(NULL) >= ctx->read_deadline) return -1;   /* max-transfer-time-in, also inside one message */
     if (ctx->state == TCP_STATE_READ_LEN) {
       ssize_t n =
           recv(fd, &ctx->buf[ctx->accumulated], 2 - ctx->accumulated, 0);
@@ -779,7 +801,7 @@ int log_open_channels(log_channel_t *list, bool hand_off) {
 /* The files of the runtime installed at start-up (log_runtime_install()) are handed to the run user (root start-up with `user`); the
  * directory and the files were opened before, by log_open_channels(hand_off = false), so that the pid file / control socket checks
  * (ensure_priv_dir_safe) see the directories as root owned. */
-void hand_off_logging_channels(void) {
+bool hand_off_logging_channels(void) {
   uid_t target_uid;
   gid_t target_gid;
   resolve_log_owner(&target_uid, &target_gid);
@@ -793,15 +815,17 @@ void hand_off_logging_channels(void) {
         syslog(LOG_WARNING, "[Logging] Could not hand log file '%s' to the run user: %s", ch->file_path, strerror(errno));
     }
   }
-  logging_drop_fchown();
+  return logging_drop_fchown();
 }
 
 /* The log files and the writable directory fds keep CAP_FCHOWN only until the hand-off above (also called by a child
- * forked before it). */
-void logging_drop_fchown(void) {
+ * forked before it).  false = a descriptor kept the right (logged by cap_rights_limit's wrapper): the caller stops. */
+bool logging_drop_fchown(void) {
+  bool ok = true;
   for (log_channel_t *ch = log_runtime_current_channels(); ch; ch = ch->next)
-    fd_drop_fchown(ch->fd);
-  dir_fd_cache_drop_fchown();
+    if (!fd_drop_fchown(ch->fd)) ok = false;
+  if (!dir_fd_cache_drop_fchown()) ok = false;
+  return ok;
 }
 
 void submit_response_log(log_action_t action, const char *client_ip, int client_port, const char *qname, 
@@ -2515,7 +2539,14 @@ void *worker_thread_func(void *arg) {
     struct sockaddr_storage addr;
     socklen_t addr_len = listen_addr_sockaddr(la, &addr);
     int tcp_fd = socket(la->family, SOCK_STREAM, 0);
-    if (tcp_fd < 0) continue;
+    if (tcp_fd < 0) {
+      /* like a bind() failure: the server must not start without the TCP listener of an address it serves on UDP */
+      int sock_errno = errno;
+      syslog(LOG_CRIT, "[Backend] Failed to create TCP%s socket for %s:%d: %s", la->family == AF_INET ? "v4" : "v6", la->text, (int)la->port,
+             strerror(sock_errno));
+      atomic_fetch_add(&g_tcp_bind_failures, 1);
+      continue;
+    }
     int flags = fcntl(tcp_fd, F_GETFL, 0);
     fcntl(tcp_fd, F_SETFL, flags | O_NONBLOCK);
     setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -2527,11 +2558,20 @@ void *worker_thread_func(void *arg) {
 #endif
     apply_tcp_listen_opts(tcp_fd, active_cfg, ctx->thread_id == 0);
     if (bind(tcp_fd, (struct sockaddr *)&addr, addr_len) == 0) {
-      listen(tcp_fd, 1024);
-      limit_server_socket_rights(tcp_fd, true);
-      struct kevent ev;
-      EV_SET(&ev, tcp_fd, EVFILT_READ, EV_ADD, 0, 0, (void *)2);
-      kevent(kq, &ev, 1, NULL, 0, NULL);
+      if (listen(tcp_fd, 1024) != 0) {
+        int listen_errno = errno;
+        syslog(LOG_CRIT, "[Backend] Failed to listen on TCP%s socket %s:%d: %s", la->family == AF_INET ? "v4" : "v6", la->text, (int)la->port,
+               strerror(listen_errno));
+        atomic_fetch_add(&g_tcp_bind_failures, 1);
+        close(tcp_fd);
+      } else if (!limit_server_socket_rights(tcp_fd, true)) {     /* logged; a listener with wide rights is not served */
+        atomic_fetch_add(&g_tcp_bind_failures, 1);
+        close(tcp_fd);
+      } else {
+        struct kevent ev;
+        EV_SET(&ev, tcp_fd, EVFILT_READ, EV_ADD, 0, 0, (void *)2);
+        kevent(kq, &ev, 1, NULL, 0, NULL);
+      }
     } else {
       int bind_errno = errno;
       syslog(LOG_CRIT, "[Backend] Failed to bind TCP%s socket to %s:%d: %s%s", la->family == AF_INET ? "v4" : "v6", la->text, (int)la->port,
@@ -2738,6 +2778,11 @@ worker_startup_success:;
             close(client_fd);
             continue;
           }
+          /* a descriptor that keeps the wide rights it was accepted with is not served (logged) */
+          if (!limit_client_socket_rights(client_fd)) {
+            close(client_fd);
+            continue;
+          }
           /* D-04: コンテキストは起動時に確保したプールから取る */
           tcp_stream_ctx_t *ctx_tcp = tcp_ctx_alloc();
           if (!ctx_tcp) {
@@ -2746,7 +2791,6 @@ worker_startup_success:;
           }
           inc_tcp_clients();
 
-          limit_client_socket_rights(client_fd);
           int cflags = fcntl(client_fd, F_GETFL, 0);
           fcntl(client_fd, F_SETFL, cflags | O_NONBLOCK);
           clock_gettime(CLOCK_MONOTONIC, &ctx_tcp->connect_time);
@@ -4204,7 +4248,8 @@ void *control_thread_func(void *arg) {
         c->last_active = time(NULL);
         c->buf_len += r;
         c->buf[c->buf_len] = '\0';
-        
+
+      ctrl_next_line:;   /* H4: a second line that came in the same recv() is handled here too: the events are EV_CLEAR, so no new event announces it */
         char *nl = strchr(c->buf, '\n');
         if (nl) {
           *nl = '\0';
@@ -4654,6 +4699,8 @@ void *control_thread_func(void *arg) {
           size_t rem = c->buf_len - (nl + 1 - c->buf);
           memmove(c->buf, nl + 1, rem);
           c->buf_len = rem;
+          c->buf[c->buf_len] = '\0';
+          if (strchr(c->buf, '\n')) goto ctrl_next_line;
         } else if (c->buf_len >= sizeof(c->buf) - 1) {
           /* X-47: 1 行がバッファ (1023 バイト + NUL) に収まらない。理由を返してから切断する */
           (void)ctl_send_all(cfd, "ERROR buffer overflow\n", 22);
@@ -6488,7 +6535,13 @@ int main(int argc, char **argv) {
   // pid file / 制御ソケットのディレクトリを ensure_priv_dir_safe() で検証し終えた
   // 後で、ログのディレクトリとファイルを実行ユーザーへ引き渡す。先に chown すると、
   // ログと同じディレクトリに置いた pid file 等の検証が「root所有でない」として失敗する。
-  hand_off_logging_channels();
+  if (!hand_off_logging_channels()) {
+    syslog(LOG_CRIT, "[Startup] Cannot take the fchown right off the log descriptors; aborting startup");
+    fprintf(stderr, "[ERROR] Cannot take the fchown right off the log descriptors; aborting startup\n");
+    if (g_broker_pid > 0) kill(g_broker_pid, SIGTERM);
+    cleanup_pid_file();
+    exit(1);
+  }
 
   // beta design 1.2 step 2: the loader sockets exist before the Backend is forked
   {
@@ -6853,15 +6906,19 @@ int main(int argc, char **argv) {
       backend_exit(EXIT_FAILURE);
   }
 
-  uint32_t dnstap_aux_buf_size = (cfg->dnstap.queue_size >= 64) ? cfg->dnstap.queue_size : 4096;
-  if ((dnstap_aux_buf_size & (dnstap_aux_buf_size - 1)) != 0) {
-    uint32_t p = 1;
-    while (p < dnstap_aux_buf_size) p <<= 1;
-    dnstap_aux_buf_size = p;
+  /* The ring of the threads that are not workers (AXFR, async I/O) has slots of 64 KB: about 270 MB of address space at the default queue size.
+   * dnstap is switched on at start-up only, so it is allocated only then; without it write_dnstap_event() finds no ring and returns. */
+  if (cfg->dnstap.enabled && cfg->dnstap.socket_path) {
+    uint32_t dnstap_aux_buf_size = (cfg->dnstap.queue_size >= 64) ? cfg->dnstap.queue_size : 4096;
+    if ((dnstap_aux_buf_size & (dnstap_aux_buf_size - 1)) != 0) {
+      uint32_t p = 1;
+      while (p < dnstap_aux_buf_size) p <<= 1;
+      dnstap_aux_buf_size = p;
+    }
+    g_aux_dnstap_ring.size = dnstap_aux_buf_size;
+    g_aux_dnstap_ring.mask = dnstap_aux_buf_size - 1;
+    g_aux_dnstap_ring.events = calloc(dnstap_aux_buf_size, sizeof(dnstap_aux_event_t));
   }
-  g_aux_dnstap_ring.size = dnstap_aux_buf_size;
-  g_aux_dnstap_ring.mask = dnstap_aux_buf_size - 1;
-  g_aux_dnstap_ring.events = calloc(dnstap_aux_buf_size, sizeof(dnstap_aux_event_t));
   atomic_init(&g_aux_dnstap_ring.head, 0);
   atomic_init(&g_aux_dnstap_ring.tail, 0);
   atomic_init(&g_aux_dnstap_ring.dropped, 0);

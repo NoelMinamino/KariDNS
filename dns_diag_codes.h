@@ -51,6 +51,7 @@ X (CONF_TSIG_ALGORITHM, "conf.tsig.algorithm", 'E', "a TSIG algorithm that KariD
 X (CONF_TSIG_SECRET_LENGTH, "conf.tsig.secret-length", 'E', "a TSIG secret is too long for its algorithm")
 X (CONF_TSIG_SECRET_BASE64, "conf.tsig.secret-base64", 'E', "a TSIG secret is not valid base64")
 X (CONF_TSIG_SECRET_PLACEHOLDER, "conf.tsig.secret-placeholder", 'W', "a secret is still the placeholder of the sample configuration")
+X (CONF_TSIG_SECRET_PLACEHOLDER_USED, "conf.tsig.secret-placeholder-used", 'E', "the secret of the control channel, or of a key that an ACL or an update-policy rule uses, is the placeholder of the sample configuration")
 X (CONF_ZONE_NAME, "conf.zone.name", 'E', "a zone name is not valid (bad escape, empty label, or too long)")
 X (CONF_ZONE_DUPLICATE, "conf.zone.duplicate", 'E', "a zone is defined twice")
 X (CONF_ZONE_TYPE_RESOLVER, "conf.zone.type-resolver", 'W', "a BIND zone type for resolvers is not loaded")
@@ -154,7 +155,7 @@ X (ZONE_TINYDNS_OUT_OF_ZONE, "zone.tinydns.out-of-zone", 'W', "tinydns records t
 X (ZONE_TTL_MISSING, "zone.ttl.missing", 'W', "records have no TTL and no $TTL")
 X (ZONE_STRING_LONG, "zone.string.long", 'W', "a character-string of more than 255 octets")
 X (ZONE_LIMITS, "zone.limits", 'E', "the zone breaks a size limit of the configuration")
-X (ZONE_PDNS_TYPES, "zone.pdns-types", 'E', "ALIAS or LUA records that the server does not accept")
+X (ZONE_PDNS_TYPES, "zone.pdns-types", 'E', "records the server does not accept: bad ALIAS or LUA, a second CNAME / DNAME / RESINFO at a name, NSEC3 iterations above 150")
 X (ZONE_PROGRAM_SKIPPED, "zone.program-skipped", 'I', "a program zone has no zone file to validate")
 
 /* ---- zone: dns_zone_lint.c ---- */
@@ -165,6 +166,7 @@ X (ZONE_DNSSEC_MLDSA_LENGTH, "zone.dnssec.mldsa-length", 'W', "an ML-DSA key or 
 X (ZONE_DS_DIGEST_NULL, "zone.ds.digest-null", 'W', "DS digest type 0 outside of the CDS delete signal")
 X (ZONE_DS_DIGEST_DEPRECATED, "zone.ds.digest-deprecated", 'W', "a DS digest type that is deprecated")
 X (ZONE_DS_DIGEST_UNKNOWN, "zone.ds.digest-unknown", 'W', "an unknown DS digest type")
+X (ZONE_DS_DIGEST_LENGTH, "zone.ds.digest-length", 'E', "a DS or CDS digest whose length does not fit its digest type")
 X (ZONE_ZONEMD_SCHEME_INVALID, "zone.zonemd.scheme-invalid", 'W', "the ZONEMD scheme is not a number from 0 to 255")
 X (ZONE_ZONEMD_HASH_INVALID, "zone.zonemd.hash-invalid", 'W', "the ZONEMD hash algorithm is not a number from 0 to 255")
 X (ZONE_ZONEMD_CANONICAL, "zone.zonemd.canonical", 'E', "a record cannot be put in canonical form, so the ZONEMD digest is not computed")
@@ -251,6 +253,7 @@ X (ZONE_SSHFP_ALGORITHM_UNASSIGNED, "zone.sshfp.algorithm-unassigned", 'W', "an 
 X (ZONE_SSHFP_FPTYPE_RANGE, "zone.sshfp.fptype-range", 'E', "the fingerprint type of an SSHFP record is out of range")
 X (ZONE_SSHFP_FPTYPE_UNASSIGNED, "zone.sshfp.fptype-unassigned", 'W', "an SSHFP fingerprint type that is not assigned")
 X (ZONE_SSHFP_FINGERPRINT_HEX, "zone.sshfp.fingerprint-hex", 'E', "the fingerprint of an SSHFP record is not hexadecimal")
+X (ZONE_SSHFP_FINGERPRINT_LENGTH, "zone.sshfp.fingerprint-length", 'E', "the fingerprint of an SSHFP record does not have the length of its fingerprint type")
 X (ZONE_SOA_MNAME_CNAME, "zone.soa.mname-cname", 'W', "the SOA MNAME points to a CNAME")
 X (ZONE_META_TYPE, "zone.meta-type", 'E', "a meta-type appears as a standalone RRset")
 X (ZONE_DSYNC_TYPE_UNKNOWN, "zone.dsync.type-unknown", 'W', "a DSYNC record names an unknown RR type")

@@ -351,6 +351,58 @@ static void test_read_dns_tcp_message_and_send(void) {
     printf("  -> read_dns_tcp_message & send_tcp_robust passed.\n");
 }
 
+/* L2: max-transfer-time-in of an inbound transfer (ctx->read_deadline) holds inside one message.  SO_RCVTIMEO restarts on every recv(), so
+ * a primary that sends one octet every 200 ms never trips it; the deadline stops the read after the second the transfer may take. */
+static void *l2_drip_thread(void *arg) {
+    int fd = *(int *)arg;
+    uint8_t msg[2 + 8];
+    msg[0] = 0; msg[1] = 8;
+    for (int i = 0; i < 8; i++) msg[2 + i] = (uint8_t)i;
+    for (size_t i = 0; i < sizeof(msg); i++) {
+        if (send(fd, &msg[i], 1, MSG_NOSIGNAL) != 1) break;
+        usleep(200 * 1000);
+    }
+    return NULL;
+}
+
+static void test_read_dns_tcp_message_deadline(void) {
+    printf("[TEST] Server Core: read_dns_tcp_message gives up at ctx->read_deadline inside one message (max-transfer-time-in)...\n");
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);      /* blocking, as the inbound transfer's socket is */
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    assert(setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0);
+
+    tcp_stream_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    assert(ctx);
+    ctx->state = TCP_STATE_READ_LEN;
+    ctx->read_deadline = time(NULL) + 1;
+    pthread_t th;
+    assert(pthread_create(&th, NULL, l2_drip_thread, &sv[1]) == 0);
+    uint8_t *msg_out = NULL;
+    uint16_t len_out = 0;
+    time_t t0 = time(NULL);
+    int ret = read_dns_tcp_message(sv[0], ctx, &msg_out, &len_out);
+    assert(ret == -1);                                          /* the whole message would take 2 s */
+    assert(time(NULL) - t0 <= 3);
+    close(sv[0]);                                               /* the dripping thread's send() fails and it ends */
+    pthread_join(th, NULL);
+    close(sv[1]);
+
+    /* no deadline: the same slow message is read to its end */
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    assert(setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0);
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->state = TCP_STATE_READ_LEN;
+    assert(pthread_create(&th, NULL, l2_drip_thread, &sv[1]) == 0);
+    ret = read_dns_tcp_message(sv[0], ctx, &msg_out, &len_out);
+    assert(ret == 1 && len_out == 8 && msg_out[7] == 7);
+    pthread_join(th, NULL);
+    close(sv[0]);
+    close(sv[1]);
+    free(ctx);
+    printf("  -> read_dns_tcp_message deadline passed.\n");
+}
+
 // ----------------------------------------------------------------------------
 // 6. Query Log Max QPS & Circuit Breaker Test
 // ----------------------------------------------------------------------------
@@ -1438,6 +1490,46 @@ static int run_ctrl_cmd(const struct sockaddr_un *sun, const char *secret, const
     return run_ctrl_cmd_md(sun, EVP_sha256(), secret, cmd, out_buf, out_buf_sz);
 }
 
+/* low batch L3, dns_server_core.c [H4]: the AUTH line and the commands are written in ONE send(), so the server reads several lines with one
+ * recv() and no later event announces the rest (EV_CLEAR).  `cmds` is every command line, '\n' included.  The whole answer (the "OK\n" of the
+ * AUTH first) is read until the server closes the connection; -1 when the challenge cannot be read. */
+static int run_ctrl_pipelined(const struct sockaddr_un *sun, const char *secret, const char *cmds, char *out_buf, size_t out_buf_sz) {
+    int cfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (cfd < 0) return -1;
+    if (connect(cfd, (struct sockaddr *)sun, sizeof(*sun)) != 0) {
+        close(cfd);
+        return -1;
+    }
+    char rbuf[1024];
+    ssize_t n = recv(cfd, rbuf, sizeof(rbuf) - 1, 0);
+    if (n <= 10 || strncmp(rbuf, "CHALLENGE ", 10) != 0) {
+        close(cfd);
+        return -1;
+    }
+    char challenge[65];
+    memcpy(challenge, rbuf + 10, 64);
+    challenge[64] = '\0';
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int md_len = 0;
+    HMAC(EVP_sha256(), secret, strlen(secret), (unsigned char *)challenge, 64, md, &md_len);
+    char msg[2 * EVP_MAX_MD_SIZE + 16 + 512];
+    int ml = snprintf(msg, sizeof(msg), "AUTH ");
+    for (unsigned int k = 0; k < md_len; k++) ml += snprintf(msg + ml, 3, "%02x", md[k]);
+    ml += snprintf(msg + ml, sizeof(msg) - (size_t)ml, "\n%s", cmds);
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };       /* a hung server fails the test instead of blocking it */
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    assert(send(cfd, msg, (size_t)ml, 0) == ml);
+    ssize_t total = 0;
+    while (total < (ssize_t)out_buf_sz - 1) {
+        ssize_t r = recv(cfd, out_buf + total, out_buf_sz - 1 - total, 0);
+        if (r <= 0) break;
+        total += r;
+    }
+    out_buf[total] = '\0';
+    close(cfd);
+    return (int)total;
+}
+
 // Blocking recv() in a unit test turns any server-side regression into a hung CI job.
 // Give every test client socket a receive timeout so failures are fast assertion failures.
 static void test_set_io_timeout(int fd, int seconds) {
@@ -1567,6 +1659,12 @@ static void test_control_socket_thread_and_commands(void) {
     len = run_ctrl_cmd(&sun, secret_key, "zonestatus example.com.\n", out, sizeof(out));
     assert(len > 0);
     assert(strncmp(out, "OK serial=", 10) == 0);
+
+    /* [H4] AUTH and the command in one write: the command is answered (it used to wait for an event that never came) */
+    len = run_ctrl_pipelined(&sun, secret_key, "zonestatus example.com.\n", out, sizeof(out));
+    assert(len > 3 && strncmp(out, "OK\nOK serial=", 13) == 0);
+    len = run_ctrl_pipelined(&sun, secret_key, "invalid_command_foo\n", out, sizeof(out));
+    assert(strcmp(out, "OK\nERROR unknown command\n") == 0);
 
     len = run_ctrl_cmd(&sun, secret_key, "zonestatus unknown.example.\n", out, sizeof(out));
     assert(len > 0);
@@ -3554,6 +3652,120 @@ static void test_active_broker_connect_loop(void) {
         }
     }
     printf("  -> active start_connect_broker passed.\n");
+}
+
+/* low batch L3, dns_server_core.c [M9]: broker_connect_opts() keeps request and reply in step.  The test plays the broker on a socketpair.
+ *  - a reply with status 1 that carries a descriptor anyway: -1 and the descriptor is closed (no leak);
+ *  - a recvmsg() interrupted by a signal is repeated: the reply that comes later is read by THIS call, not left for the next one;
+ *  - a broker that goes away after the request ends the conversation: -1 and every later call fails at once. */
+typedef struct { int fd; int mode; } mock_broker_t;
+static void mock_broker_reply(int fd, int status, int pass_fd) {
+    struct msghdr msg = {0};
+    char buf[CMSG_SPACE(sizeof(int))];
+    memset(buf, 0, sizeof(buf));
+    char data[1] = { (char)status };
+    struct iovec io = { .iov_base = data, .iov_len = 1 };
+    msg.msg_iov = &io;
+    msg.msg_iovlen = 1;
+    if (pass_fd >= 0) {
+        msg.msg_control = buf;
+        msg.msg_controllen = sizeof(buf);
+        struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+        c->cmsg_level = SOL_SOCKET;
+        c->cmsg_type = SCM_RIGHTS;
+        c->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(c), &pass_fd, sizeof(int));
+    }
+    assert(sendmsg(fd, &msg, 0) == 1);
+}
+static void *mock_broker_thread(void *arg) {
+    mock_broker_t *m = arg;
+    broker_req_t req;
+    int spare[2];
+    assert(recv(m->fd, &req, sizeof(req), MSG_WAITALL) == (ssize_t)sizeof(req));
+    if (m->mode == 0) {                          /* refuse, with a descriptor attached */
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, spare) == 0);
+        mock_broker_reply(m->fd, 1, spare[0]);
+        close(spare[0]);
+        close(spare[1]);
+    } else if (m->mode == 1) {                   /* a slow answer: the caller's recvmsg() is interrupted meanwhile */
+        usleep(150000);
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, spare) == 0);
+        mock_broker_reply(m->fd, 0, spare[0]);
+        close(spare[0]);
+        close(spare[1]);
+    } else {                                     /* mode 2: read the request, say nothing, go away */
+        close(m->fd);
+    }
+    return NULL;
+}
+static void test_alarm_noop(int sig) { (void)sig; }
+static void test_broker_connect_reply_handling(void) {
+    printf("[TEST] Server Core: broker_connect_opts keeps request and reply in step...\n");
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(53);
+    sin.sin_addr.s_addr = htonl(0x7F000001);
+    int saved = g_broker_sock;
+    for (int mode = 0; mode < 3; mode++) {
+        int sp[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+        g_broker_sock = sp[0];
+        mock_broker_t m = { sp[1], mode };
+        pthread_t th;
+        struct sigaction sa, old_sa;
+        if (mode == 1) {
+            memset(&sa, 0, sizeof(sa));
+            sa.sa_handler = test_alarm_noop;      /* no SA_RESTART: recvmsg() returns EINTR */
+            sigemptyset(&sa.sa_mask);
+            assert(sigaction(SIGALRM, &sa, &old_sa) == 0);
+            struct itimerval it = { .it_interval = { 0, 20000 }, .it_value = { 0, 20000 } };
+            assert(setitimer(ITIMER_REAL, &it, NULL) == 0);
+        }
+        assert(pthread_create(&th, NULL, mock_broker_thread, &m) == 0);
+        int fd = broker_connect(AF_INET, SOCK_DGRAM, (struct sockaddr *)&sin, sizeof(sin));
+        if (mode == 1) {
+            struct itimerval off = { {0, 0}, {0, 0} };
+            setitimer(ITIMER_REAL, &off, NULL);
+            sigaction(SIGALRM, &old_sa, NULL);
+        }
+        pthread_join(th, NULL);
+        if (mode == 1) {
+            assert(fd >= 0);                      /* the interrupted call waited for its own reply */
+            close(fd);
+        } else {
+            assert(fd == -1);
+        }
+        if (mode == 2) {
+            /* the conversation is over: the next call fails without blocking */
+            assert(broker_connect(AF_INET, SOCK_DGRAM, (struct sockaddr *)&sin, sizeof(sin)) == -1);
+        }
+        close(sp[0]);
+        if (mode != 2) close(sp[1]);
+        g_broker_sock = -1;
+    }
+    /* the leak check, stated plainly: the descriptor numbers are the same before and after a refused request */
+    {
+        int sp[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+        g_broker_sock = sp[0];
+        mock_broker_t m = { sp[1], 0 };
+        pthread_t th;
+        int before = open("/dev/null", O_RDONLY);
+        close(before);
+        assert(pthread_create(&th, NULL, mock_broker_thread, &m) == 0);
+        assert(broker_connect(AF_INET, SOCK_DGRAM, (struct sockaddr *)&sin, sizeof(sin)) == -1);
+        pthread_join(th, NULL);
+        int after = open("/dev/null", O_RDONLY);
+        close(after);
+        assert(after == before);
+        close(sp[0]);
+        close(sp[1]);
+        g_broker_sock = -1;
+    }
+    g_broker_sock = saved;
+    printf("  -> broker_connect_opts request/reply handling passed.\n");
 }
 
 /* The primary a catalog member is transferred from when its catalog zone is not found in the snapshot (the copy kept in the entry): the key is ranked
@@ -6415,7 +6627,7 @@ static void test_server_core_feature_case_207(void) {
     uint32_t now = (uint32_t)time(NULL);
     assert(generate_server_cookie(&cfg_prev_only, "192.0.2.1", c_cookie, s_cookie, now));
     server_cookie_status_t st = verify_server_cookie(&cfg, "192.0.2.1", c_cookie, s_cookie, sizeof(s_cookie), now);
-    assert(st == SERVER_COOKIE_VALID);
+    assert(st == SERVER_COOKIE_VALID_REFRESH);   /* accepted, and answered with a cookie from the current secret (low batch L3) */
 }
 
 static void test_server_core_feature_case_209(void) {
@@ -6648,6 +6860,7 @@ int main(void) {
     test_resolve_ip_port_to_sockaddr();
     test_tcp_client_tracking();
     test_read_dns_tcp_message_and_send();
+    test_read_dns_tcp_message_deadline();
     test_query_log_max_qps_and_circuit_breaker();
     test_submit_response_log();
     test_log_write_rotated();
@@ -6675,6 +6888,7 @@ int main(void) {
     test_setup_ipc_tables_and_reload_error_paths();
     test_perform_config_reload_valid_and_diff();
     test_active_broker_connect_loop();
+    test_broker_connect_reply_handling();
     test_broker_connect_opts_and_xfr_tcp_sockopts();
     test_catalog_member_primary_key_precedence_and_port();
     test_server_core_process_lifecycle_and_signals();

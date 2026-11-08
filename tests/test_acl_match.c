@@ -202,6 +202,18 @@ static void test_localhost_localnets(void) {
         CHECK(aml_match(config_acl_for(&cfg, NULL, NULL, AML_ACL_QUERY_ON), &s) == 1);
         free_server_config_fields(&cfg);
     }
+    /* low batch L3, dns_tsig_acl.c [4]: aml_init_interfaces() keeps every address getifaddrs() reports (its buffer held 256 and stopped there;
+     * a host with more addresses than that cannot be built here, so this compares the table with an unbounded collection) */
+    {
+        size_t cap = 65536;
+        aml_iface_t *all = malloc(cap * sizeof(*all));
+        CHECK(all != NULL);
+        size_t total = aml_collect_interfaces(all, cap);
+        aml_init_interfaces();
+        const aml_iface_t *got;
+        CHECK(aml_get_interfaces(&got) == total);
+        free(all);
+    }
     aml_set_interfaces(NULL, 0);
 }
 

@@ -314,7 +314,7 @@ static void test_nsec3(const char *z, const char *label, bool optout) {
     size_t synth = expect_same_as_file("rebuild", &f, pz, PS_NSEC3);
     CHECK_MSG((int)synth == nrs + 1, "%zu rebuilt RRs, %d chain owners + NSEC3PARAM", synth, nrs);
     (void)check_upper_hash_owners(label, &pz->arena);
-    {   /* open item 3: the loader warns about NSEC3PARAM metadata with iterations > 0 (RFC 9276 s3.1); the cap stays 2500 */
+    {   /* open item 3: the loader warns about NSEC3PARAM metadata with iterations > 0 (RFC 9276 s3.1); the cap is 150 (ZONE_MAX_NSEC3_ITERATIONS) */
         unsigned alg = 0, fl = 0, iters = 0;
         CHECK(sscanf(f.z.nsec3param, "%u %u %u", &alg, &fl, &iters) == 3);
         bool warned = false;
@@ -426,7 +426,7 @@ static void test_nsec3(const char *z, const char *label, bool optout) {
             { "1 0 3 aa bb", "more than four" },
             { "2 0 3 aa", "not 1" },
             { "1 2 3 aa", "flags must be 0 or 1" },
-            { "1 0 2501 aa", "exceed 2500" },
+            { "1 0 151 aa", "exceed 150" },
             { "1 0 x aa", "decimal" },
             { "1 0 3 abc", "even number of hex digits" },
             { "1 0 3 zz", "not hexadecimal" },
@@ -523,6 +523,46 @@ static void test_nsec3(const char *z, const char *label, bool optout) {
             rs_add(&m, &r);
             expect_fail("data at a hashed owner", rs_build_default(&f, &m), "holds RRSIG(NSEC3) and other data");
         }
+        free(m.r);
+    }
+    /* 12b. low batch L3, dns_presigned.c [1] (D8): without an RRSIG(NSEC3PARAM) at the apex the NSEC3PARAM is still rebuilt (its TTL is
+     * the SOA MINIMUM) and the reader says so in a warning */
+    {
+        rs_t m = rs_copy(&f);
+        int hidden = 0;
+        for (size_t i = 0; i < m.n; i++)
+            if (m.r[i].type && strcmp(m.r[i].type, "RRSIG") == 0 && m.r[i].content && strncmp(m.r[i].content, "NSEC3PARAM ", 11) == 0) {
+                m.r[i].disabled = true;
+                hidden++;
+            }
+        CHECK_MSG(hidden == 1, "%d RRSIG(NSEC3PARAM) rows", hidden);
+        pdns_zone_t *x = rs_build_default(&f, &m);
+        CHECK_MSG(!x->failed, "no RRSIG(NSEC3PARAM): %s", x->failed ? x->error : "");
+        if (!x->failed) {
+            bool warned = false, param = false;
+            for (size_t i = 0; i < x->n_warnings; i++)
+                if (strstr(x->warnings[i], "no RRSIG(NSEC3PARAM)") && strstr(x->warnings[i], "SOA MINIMUM")) warned = true;
+            for (size_t i = 0; i < x->arena.count; i++)
+                if (x->arena.records[i].type_code == 51 && x->arena.records[i].ttl_value == 300) param = true;
+            CHECK(warned);
+            CHECK(param);
+        }
+        pdns_zone_free(x);
+        free(m.r);
+    }
+    /* 12c. D9: only an NS cut occludes (as PowerDNS does); a name below a DNAME is an ordinary name and needs its own NSEC3 owner */
+    {
+        rs_t m = rs_copy(&f);
+        char nm[300];
+        snprintf(nm, sizeof(nm), "x.dn.%s", f.z.zone);
+        db_record_row_t r;
+        memset(&r, 0, sizeof(r));
+        r.name = nm;
+        r.type = "A";
+        r.content = "192.0.2.77";
+        r.ttl = 300;
+        rs_add(&m, &r);
+        expect_fail("a name below a DNAME has no NSEC3 owner", rs_build_default(&f, &m), "no RRSIG(NSEC3) owner for 'x.dn.");
         free(m.r);
     }
     /* 13. without PRESIGNED metadata nothing is rebuilt: the rows are served as they are */
@@ -755,9 +795,51 @@ static void test_module(void) {
     CHECK(strcmp(h, "b4um86eghhds6nea196smvmlo4ors995") == 0);
 }
 
+/* low batch L3, dns_presigned.c [3]: an NSEC zone whose apex is the root has the ordername "a" for "a." (the labels relative to the apex,
+ * as PowerDNS writes them); the last character used to be dropped ("" for "a.") because the dot before the apex was skipped for "." too.
+ * The rows are made by hand: only a (fake) RRSIG(NSEC) at each name, the reader does no cryptographic check. */
+static void test_root_nsec_ordername(void) {
+    printf("NSEC zone with the root as its apex\n");
+    /* the DB reader refuses the root zone, so the rebuild is called with the arena of the rows directly */
+    static const char text[] =
+        "$ORIGIN .\n$TTL 300\n"
+        ". IN SOA ns. hm. 1 3600 600 86400 300\n"
+        ". IN NS ns.\n"
+        ". IN RRSIG NSEC 13 0 300 20300101000000 20200101000000 12345 . AAAAAAAA\n"
+        "a. IN A 192.0.2.1\n"
+        "a. IN RRSIG NSEC 13 1 300 20300101000000 20200101000000 12345 . AAAAAAAA\n";
+    for (int variant = 0; variant < 2; variant++) {
+        zone_arena_t arena;
+        zone_arena_init(&arena);
+        parse_error_t perr = {0};
+        parse_context_t ctx = { .base_dir = ".", .default_origin = ".", .is_standalone_mode = true, .err_out = &perr };
+        char *buf = arena_strdup(&arena, text);
+        CHECK(buf != NULL && parse_zone_fast(buf, strlen(buf), &arena, &ctx) >= 0);
+        const char *ord[16] = { NULL };
+        CHECK(arena.count == 5);
+        for (size_t i = 0; i < arena.count && i < 16; i++) {
+            if (strcmp(arena.records[i].name, ".") == 0) ord[i] = "";
+            else if (strcmp(arena.records[i].name, "a.") == 0) ord[i] = variant == 0 ? "a" : "b";   /* variant 1: a wrong ordername is found */
+        }
+        presigned_out_t out;
+        char err[400];
+        int rc = presigned_rebuild(&arena, ".", NULL, ord, NULL, 0, &out, err, sizeof(err));
+        if (variant == 0) {
+            CHECK_MSG(rc == 0, "root NSEC zone: %s", err);
+            CHECK(out.mode == PS_NSEC && out.n_records == 2);
+        } else {
+            CHECK(rc != 0);
+            CHECK_HAS(err, "ordername");
+        }
+        if (rc == 0) presigned_out_free(&out);
+        zone_arena_destroy(&arena);
+    }
+}
+
 int main(void) {
     printf("=== presigned zones (dns_presigned.c) ===\n");
     test_module();
+    test_root_nsec_ordername();
     if (!tool("dnssec-signzone") || !tool("dnssec-keygen")) {
         printf("[SKIP] dnssec-signzone / dnssec-keygen are not installed: the rebuild tests need signed zones\n");
         printf("\n%d checks, %d failed\n", g_checks, g_failed);
