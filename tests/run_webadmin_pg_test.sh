@@ -146,9 +146,9 @@ echo "-- the server"
 rm -f "$T/server.pid"
 asu sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$T/server.pid" $APP >> "$T/server.log" 2>&1 &
 i=0
-while [ $i -lt 100 ] && ! grep -q "karidns-webadmin 0.6.0 started" "$T/server.log" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
+while [ $i -lt 100 ] && ! grep -q "karidns-webadmin [^ ]* started" "$T/server.log" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
 SRV=$(cat "$T/server.pid" 2>/dev/null)
-if grep -q "karidns-webadmin 0.6.0 started" "$T/server.log"; then ok "the server started (pid $SRV)"; else bad "the server did not start" "$(cat "$T/server.log")"; exit 1; fi
+if grep -q "karidns-webadmin [^ ]* started" "$T/server.log"; then ok "the server started (pid $SRV)"; else bad "the server did not start" "$(cat "$T/server.log")"; exit 1; fi
 
 IT_BASE="http://127.0.0.1:$PORT/api/v1" IT_ORIGIN="http://127.0.0.1:$PORT" IT_ADMIN_PASSWORD="$ADMIN_PW" IT_SESSION_IDLE=8 "$NODE" webadmin/test/it.mjs > "$T/it.out" 2>&1
 IT_RC=$?

@@ -8,7 +8,7 @@
 #include <stdio.h>
 
 #ifndef KARIDNS_VERSION
-#define KARIDNS_VERSION "0.5.0"
+#define KARIDNS_VERSION "dev"     /* the Makefile passes the number of the file VERSION (docs/RELEASING.md) */
 #endif
 
 #include <limits.h>

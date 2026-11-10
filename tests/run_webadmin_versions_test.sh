@@ -145,8 +145,8 @@ ADMIN_PW=$(sed -n 's/^password (shown once): //p' "$T/admin.out")
 $APP >> "$T/server.log" 2>&1 &
 WEB=$!
 i=0
-while [ $i -lt 100 ] && ! grep -q "karidns-webadmin 0.6.0 started" "$T/server.log" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
-if grep -q "karidns-webadmin 0.6.0 started" "$T/server.log"; then ok "the API started (pid $WEB)"; else bad "the API did not start" "$(cat "$T/server.log")"; exit 1; fi
+while [ $i -lt 100 ] && ! grep -q "karidns-webadmin [^ ]* started" "$T/server.log" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
+if grep -q "karidns-webadmin [^ ]* started" "$T/server.log"; then ok "the API started (pid $WEB)"; else bad "the API did not start" "$(cat "$T/server.log")"; exit 1; fi
 
 # the real karidns-signer (BIND's dnssec tools): it signs real.test when the API files the key request, and asks karidns to reload with the restricted key
 SG_ENV=""
@@ -173,8 +173,8 @@ EOF
     $NODE "$ROOT/signer/bin/karidns-signer.js" -c "$T/signer.conf" >> "$T/signer.log" 2>&1 &
     SG=$!
     i=0
-    while [ $i -lt 100 ] && ! grep -q "karidns-signer 0.6.0 started" "$T/signer.log" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
-    if grep -q "karidns-signer 0.6.0 started" "$T/signer.log"; then ok "karidns-signer started (pid $SG)"; SG_ENV=1; else bad "karidns-signer did not start" "$(cat "$T/signer.log")"; fi
+    while [ $i -lt 100 ] && ! grep -q "karidns-signer [^ ]* started" "$T/signer.log" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
+    if grep -q "karidns-signer [^ ]* started" "$T/signer.log"; then ok "karidns-signer started (pid $SG)"; SG_ENV=1; else bad "karidns-signer did not start" "$(cat "$T/signer.log")"; fi
 else
     echo "  (no real signer: BIND's dnssec-keygen, dnssec-signzone and dnssec-verify and signer/ are needed; the signer's writes are only simulated with SQL)"
 fi

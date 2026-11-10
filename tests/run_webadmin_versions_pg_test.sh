@@ -158,9 +158,9 @@ ADMIN_PW=$(sed -n 's/^password (shown once): //p' "$T/admin.out")
 rm -f "$T/web/server.pid"
 as_pg sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$T/web/server.pid" $APP >> "$T/server.log" 2>&1 &
 i=0
-while [ $i -lt 100 ] && ! grep -q "karidns-webadmin 0.6.0 started" "$T/server.log" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
+while [ $i -lt 100 ] && ! grep -q "karidns-webadmin [^ ]* started" "$T/server.log" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
 WEB=$(cat "$T/web/server.pid" 2>/dev/null)
-if grep -q "karidns-webadmin 0.6.0 started" "$T/server.log"; then ok "the API started (pid $WEB)"; else bad "the API did not start" "$(cat "$T/server.log")"; exit 1; fi
+if grep -q "karidns-webadmin [^ ]* started" "$T/server.log"; then ok "the API started (pid $WEB)"; else bad "the API did not start" "$(cat "$T/server.log")"; exit 1; fi
 
 # SQL behind the API's back (as the owner of the tables, which row level security does not bind): what the signer, a script or an operator with psql does
 export PGC

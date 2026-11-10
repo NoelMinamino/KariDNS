@@ -4,6 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { deploy, cast, sqlite } from './helpers.js';
+import { VERSION } from '../lib/app.js';
 
 const withCast = (fn, opts) => async () => {
   const d = await deploy(opts);
@@ -289,7 +290,7 @@ test('health needs no login and says when the database is gone; /version needs o
   const v = await sub('GET', '/version');
   // (G5: the record types karidns-zone's change file takes, when the service has asked it, and the settings and limits a client follows)
   assert.deepEqual(v.body, {
-    api: 1, version: '0.6.0', tools: { karicheck: 'karicheck 0.6.0' }, datasets: ['main'], types: null,
+    api: 1, version: VERSION, tools: { karicheck: 'karicheck 0.6.0' }, datasets: ['main'], types: null,
     ui: { reload_after_change: false, require_totp: 'none', max_rrsets: 1000, max_records: 1000, zone_text_limit: 16777216 },
   });
   d.app.types = new Set(['TXT', 'A', 'MX']);

@@ -20,15 +20,19 @@ WIN_LDFLAGS != case "`uname -s 2>/dev/null`" in MINGW*|MSYS*|CYGWIN*) echo "-sta
 BREW_CFLAGS  = -I/opt/homebrew/opt/openssl@3/include -I/usr/local/opt/openssl@3/include -I/opt/homebrew/include -I/usr/local/include
 BREW_LDFLAGS = -L/opt/homebrew/opt/openssl@3/lib -L/usr/local/opt/openssl@3/lib -L/opt/homebrew/lib -L/usr/local/lib
 
-# Version definition
-VERSION ?= 0.5.0
+# Version definition: the file VERSION is the one source of the release number (docs/RELEASING.md).  `make VERSION=x.y.z` still
+# overrides it for one build; `make set-version V=x.y.z` changes it and the files that cannot read it (package.json, the GUI).
+VERSION_FILE != { tr -d ' \r\n' < VERSION; } 2>/dev/null || echo dev
+VERSION ?= $(VERSION_FILE)
+# every compile line passes it (the release flags, the unit tests, ASan, TSan, fuzzing, coverage): a build without it says "dev"
+VERSION_DEF = -DKARIDNS_VERSION=\"$(VERSION)\"
 
 CC ?= cc
 # CPU tuning. -march=native suits binaries built and run on the same machine;
 # distributable packages must be built with MARCH_FLAGS= (baseline ISA), or they
 # die with SIGILL on CPUs lacking the build host's extensions (e.g. AVX-512).
 MARCH_FLAGS ?= -march=native
-CFLAGS += -O3 -flto $(MARCH_FLAGS) -Wall -Wextra -std=c11 -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE -DKARIDNS_VERSION=\"$(VERSION)\" $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
+CFLAGS += -O3 -flto $(MARCH_FLAGS) -Wall -Wextra -std=c11 -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE $(VERSION_DEF) $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
 LDFLAGS = -flto -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS) $(HARDEN_LDFLAGS)
 
 
@@ -140,7 +144,7 @@ FUZZ_DAG_REPLAY_DIFF_SRCS = tests/fuzz/fuzz_dag_replay_diff.c tools/dag_replay.c
 FUZZ_DAG_TCP_REASSEMBLY_TARGET = tests/fuzz/fuzz_dag_tcp_reassembly
 FUZZ_DAG_TCP_REASSEMBLY_SRCS = tests/fuzz/fuzz_dag_tcp_reassembly.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_replay.c tools/dag_http.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
-.PHONY: karicheck-codelog test_coverage_sweep_tools-codelog all clean run fuzz zone2kdb karidns-dbloader karidns-dbloader-tsan karidns-dbloader-asan karidns-zone karidns-zone-asan dbloader-check-drivers db_sqlite3_test db_pgsql_test fuzz_core fuzz_query_engine fuzz_zone_image fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_pdns_content fuzz_pdns_metadata fuzz_db_checkline fuzz_json_escape fuzz_zone_text fuzz_zone_changes fuzz_db_logline fuzz_nsec3_rebuild fuzz_alias_response clean-fuzz asan tsan fuzz_tsig fuzz_dag fuzz_tsig_verify dag tools response_cache_test \
+.PHONY: set-version karicheck-codelog test_coverage_sweep_tools-codelog all clean run fuzz zone2kdb karidns-dbloader karidns-dbloader-tsan karidns-dbloader-asan karidns-zone karidns-zone-asan dbloader-check-drivers db_sqlite3_test db_pgsql_test fuzz_core fuzz_query_engine fuzz_zone_image fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_pdns_content fuzz_pdns_metadata fuzz_db_checkline fuzz_json_escape fuzz_zone_text fuzz_zone_changes fuzz_db_logline fuzz_nsec3_rebuild fuzz_alias_response clean-fuzz asan tsan fuzz_tsig fuzz_dag fuzz_tsig_verify dag tools response_cache_test \
 	fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file \
 	fuzz_dag_replay_pcap_reader fuzz_dag_replay_diff fuzz_dag_tcp_reassembly \
 	fuzz_dag_all fuzz_dag_test fuzz_karidns fuzz_karidns_test fuzz_all fuzz_test \
@@ -159,7 +163,7 @@ $(KARICTL_TARGET): $(KARICTL_OBJS)
 $(DAG_TARGET): $(DAG_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS) $(WIN_LDFLAGS)
 
-karicheck: tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_tinydns_parser.o dns_wire.o dns_utils.o dns_cidr.o dns_tsig_acl.o dns_zone_lint.o dns_db_checkproto.o dns_diag.o
+karicheck: VERSION tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_tinydns_parser.o dns_wire.o dns_utils.o dns_cidr.o dns_tsig_acl.o dns_zone_lint.o dns_db_checkproto.o dns_diag.o
 	$(CC) $(CFLAGS) tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_tinydns_parser.o dns_wire.o dns_utils.o dns_cidr.o dns_tsig_acl.o dns_zone_lint.o dns_db_checkproto.o dns_diag.o -o karicheck $(LDFLAGS) -lcrypto
 
 # The test build of karicheck that logs the code of every message (KARICHECK_CODE_LOG, tests/run_karicheck_codes_test.sh).  The shipped
@@ -172,7 +176,8 @@ karicheck-codelog: $(KARICHECK_CODELOG_SRCS)
 # what uses it (the list named 8 headers, and a stale object with an old struct layout links without a word).
 HDRS != ls *.h tools/*.h tests/*.h 2>/dev/null
 ALL_C != ls *.c tools/*.c tests/*.c tests/fuzz/*.c 2>/dev/null
-$(ALL_C:.c=.o) $(ALL_C:.c=.uta.o) $(ALL_C:.c=.utn.o) $(ALL_C:.c=.fz.o) $(ALL_C:.c=.asan.o) $(ALL_C:.c=.tsan.o) $(ALL_C:.c=.ev.o): $(HDRS)
+# VERSION too: -DKARIDNS_VERSION comes from it, and a new number must not leave objects that print the old one.
+$(ALL_C:.c=.o) $(ALL_C:.c=.uta.o) $(ALL_C:.c=.utn.o) $(ALL_C:.c=.fz.o) $(ALL_C:.c=.asan.o) $(ALL_C:.c=.tsan.o) $(ALL_C:.c=.ev.o): $(HDRS) VERSION
 
 .SUFFIXES: .c .o
 
@@ -879,7 +884,7 @@ UT_ASAN_LEAKS ?= 0
 # each binary of unit-tests-asan gets at most UT_TIMEOUT seconds; a hung one prints its thread backtraces and fails
 # (tests/run_unit_with_watchdog.sh) instead of blocking CI until the job timeout
 UT_TIMEOUT ?= 300
-UT_ASAN_CFLAGS = -O1 -g -Wall -Wextra -std=c11 -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -DSANITIZER_BUILD -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -fPIE -DKARIDNS_VERSION=\"$(VERSION)\" $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
+UT_ASAN_CFLAGS = -O1 -g -Wall -Wextra -std=c11 -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -DSANITIZER_BUILD -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -fPIE $(VERSION_DEF) $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
 UT_ASAN_LDFLAGS = -fsanitize=address,undefined -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS)
 
 # Every source is compiled once per variant and the objects are shared by all
@@ -1123,7 +1128,9 @@ COV_PROFILE_PAT_0 = karidns_%p_%m.profraw
 # loader runs as other users than root, which cannot write a file another user created.
 COV_DBL_PAT_1 = cov_dbloader_%p%c.profraw
 COV_DBL_PAT_0 = karidns_dbloader_%p_%m.profraw
-COV_CFLAGS  = $(COV_CONT_CFLAGS_$(COV_CONTINUOUS)) -Wno-unused-command-line-argument -fprofile-instr-generate -fcoverage-mapping -DKARIDNS_COVERAGE_LINKAGE -DKARIDNS_TEST_EVICT -O0 -g -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -Wall -Wextra -std=c11 -fPIE $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
+# COV_CFLAGS reaches the inner make inside double quotes (CFLAGS="$(COV_CFLAGS)" below), which eat one level of backslashes
+COV_VERSION_DEF = -DKARIDNS_VERSION=\\\"$(VERSION)\\\"
+COV_CFLAGS  = $(COV_CONT_CFLAGS_$(COV_CONTINUOUS)) -Wno-unused-command-line-argument -fprofile-instr-generate -fcoverage-mapping -DKARIDNS_COVERAGE_LINKAGE -DKARIDNS_TEST_EVICT -O0 -g -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -Wall -Wextra -std=c11 -fPIE $(COV_VERSION_DEF) $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
 COV_LDFLAGS = -fprofile-instr-generate -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS) $(HARDEN_LDFLAGS)
 COV_DIR     = coverage_raw
 # Parallel jobs for the coverage build and for the test suite (tests/run_all_suite.sh -j:
@@ -1138,7 +1145,7 @@ COV_HTML_DIR = coverage_html
 COV_DATA    = coverage.profdata
 
 COV_FUZZ_DIR = coverage_fuzz
-COV_FUZZ_CFLAGS = -fsanitize=fuzzer,address,undefined -fprofile-instr-generate -fcoverage-mapping -DKARIDNS_COVERAGE_LINKAGE -O0 -g -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -Wall -Wextra -std=c11 -fPIE $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
+COV_FUZZ_CFLAGS = -fsanitize=fuzzer,address,undefined -fprofile-instr-generate -fcoverage-mapping -DKARIDNS_COVERAGE_LINKAGE -O0 -g -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -Wall -Wextra -std=c11 -fPIE $(VERSION_DEF) $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
 COV_FUZZ_LDFLAGS = -fsanitize=fuzzer,address,undefined -fprofile-instr-generate $(LDFLAGS)
 
 COV_FUZZ_BINS  = $(COV_FUZZ_DIR)/fuzz_dns_wire $(COV_FUZZ_DIR)/fuzz_dns_server_core
@@ -1382,6 +1389,10 @@ bench_serialize: tests/bench_serialize.c dns_wire.o dns_utils.o dns_zone_parser.
 bench_rrl: tests/bench_rrl.c dns_rrl.o dns_config_parser.o dns_diag.o dns_zone_parser.o dns_tinydns_parser.o dns_wire.o dns_utils.o dns_cidr.o dns_tsig_acl.o
 	$(CC) $(CFLAGS) tests/bench_rrl.c dns_rrl.o dns_config_parser.o dns_diag.o dns_zone_parser.o dns_tinydns_parser.o dns_wire.o dns_utils.o dns_cidr.o dns_tsig_acl.o -o bench_rrl $(LDFLAGS) -lssl -lcrypto -lz
 
+# make set-version V=x.y.z: the release number in VERSION and in the files that cannot read it (tools/set_version.sh, docs/RELEASING.md)
+set-version:
+	sh tools/set_version.sh $(V)
+
 clean: clean-fuzz coverage-clean
 	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck bench_serialize bench_rrl $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
 	@# karicheck's objects outside $(OBJS): an uninstrumented copy left here would be linked into the coverage build
@@ -1396,7 +1407,7 @@ run: $(TARGET)
 
 # Fuzz sources are compiled once (fuzzer-no-link instrumentation) and the objects
 # shared by every fuzzer; only the link step adds libFuzzer (-fsanitize=fuzzer).
-FUZZ_OBJ_CFLAGS = -O1 -g -fsanitize=fuzzer-no-link,address,undefined -fPIE
+FUZZ_OBJ_CFLAGS = -O1 -g -fsanitize=fuzzer-no-link,address,undefined -fPIE $(VERSION_DEF)
 .SUFFIXES: .fz.o .c
 .c.fz.o:
 	$(CC) $(FUZZ_OBJ_CFLAGS) -c $< -o $@
@@ -1517,7 +1528,7 @@ clean-fuzz:
 	rm -f $(FUZZ_DAG_REPLAY_PCAP_READER_TARGET) $(FUZZ_DAG_REPLAY_DIFF_TARGET) $(FUZZ_DAG_TCP_REASSEMBLY_TARGET) $(FUZZ_DAG_ITER_TARGET)
 
 ASAN_TARGET = karidns-asan
-ASAN_CFLAGS = -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSANITIZER_BUILD -g -fsanitize=address,undefined -fno-omit-frame-pointer -fPIE
+ASAN_CFLAGS = -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSANITIZER_BUILD -g -fsanitize=address,undefined -fno-omit-frame-pointer -fPIE $(VERSION_DEF)
 ASAN_OBJS = $(SRCS:.c=.asan.o)
 
 asan: $(ASAN_TARGET)
@@ -1530,7 +1541,7 @@ $(ASAN_TARGET): $(ASAN_OBJS)
 	$(CC) $(ASAN_CFLAGS) -c $< -o $@
 
 TSAN_TARGET = karidns-tsan
-TSAN_CFLAGS = -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSANITIZER_BUILD -g -fsanitize=thread -fPIE
+TSAN_CFLAGS = -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSANITIZER_BUILD -g -fsanitize=thread -fPIE $(VERSION_DEF)
 TSAN_LDFLAGS = -fsanitize=thread -pie
 TSAN_OBJS = $(SRCS:.c=.tsan.o)
 

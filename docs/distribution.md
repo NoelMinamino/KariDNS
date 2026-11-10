@@ -16,7 +16,7 @@ In the commands below, replace `?.?.?` with the release version (for example `0.
 | **Linux (Generic)** x86_64 | `dag-?.?.?-linux-x86_64.tar.gz` | `dag` (standalone binary) | Extract & copy to `/usr/local/bin` |
 | **macOS** Apple Silicon (arm64) | `dag-?.?.?-macos-arm64.dmg`, `dag-?.?.?-macos-arm64.tar.gz` | `dag` (arm64 binary) | Mount DMG / extract tarball |
 | **Homebrew** (macOS, Linux) | Formula `dag.rb` in `NoelMinamino/homebrew-tap` | `dag` (built from the source tarball) | `brew install NoelMinamino/tap/dag` |
-| **Windows** x86_64 | `dag-v?.?.?-windows-x86_64.zip` | `dag.exe` and the MinGW runtime DLLs it needs | Extract & copy to a directory in `%PATH%` |
+| **Windows** x86_64 | `dag-?.?.?-windows-x86_64.zip` | `dag.exe` and the MinGW runtime DLLs it needs | Extract & copy to a directory in `%PATH%` |
 
 Each release also contains `SHA256SUMS.txt` (see [§7](#7-verifying-downloads)).
 
@@ -100,11 +100,11 @@ Zones can be served from a PowerDNS 5.1 SQLite3 or PostgreSQL database ([`karidn
 | `karidns-db` | `both` | both drivers | both |
 
 
-The release workflow builds and publishes all four packages for each FreeBSD version (the database packages with `build_pkg.sh --db sqlite3`, `--db postgresql` and `--db both` in a VM that has `sqlite3` and `postgresql17-client` installed, so the PostgreSQL packages depend on `postgresql17-client`), and checks that the loader of each reports exactly the drivers of its package. To build one yourself, use a FreeBSD host that has the library, as a normal user, from the top of the source tree (each run starts with `make clean`; the version is the first argument and is only used for the file name and the package metadata):
+The release workflow builds and publishes all four packages for each FreeBSD version (the database packages with `build_pkg.sh --db sqlite3`, `--db postgresql` and `--db both` in a VM that has `sqlite3` and `postgresql17-client` installed, so the PostgreSQL packages depend on `postgresql17-client`), and checks that the loader of each reports exactly the drivers of its package. To build one yourself, use a FreeBSD host that has the library, as a normal user, from the top of the source tree (each run starts with `make clean`; the version is the first argument and defaults to the file `VERSION` of the source tree, see [RELEASING.md](RELEASING.md); another number than the file's is a test build and the script warns):
 
 ```sh
-sh packaging/freebsd/build_pkg.sh --db sqlite3 0.5.0 ./dist
-pkg add ./dist/karidns-sqlite3-0.5.0-FreeBSD-15-amd64.pkg
+sh packaging/freebsd/build_pkg.sh --db sqlite3 "" ./dist          # the number of the file VERSION
+pkg add ./dist/karidns-sqlite3-0.6.0-FreeBSD-15-amd64.pkg
 ```
 
 `pkg add` of a downloaded file does not fetch dependencies: install `libidn2` and `sqlite3` (or `postgresqlNN-client`) first, as in §2.1. The packages with a loader also install the SQL files that create the KariDNS tables and triggers (`/usr/local/share/karidns/db/`, for example `sqlite3 /var/db/karidns/zones.sqlite3 < /usr/local/share/karidns/db/karidns_ext.sqlite3.sql`) and the manual. `karidns` refuses a `database { driver x; }` that the installed loader does not have, and `karicheck db` in the plain package says `DB support is not installed`. To go from one package to another, remove the installed one first (`pkg delete karidns`) and install the other; the configuration files you created are not touched.
@@ -174,8 +174,8 @@ brew install NoelMinamino/tap/dag
 
 ## 5. Windows Installation (`dag.exe`)
 
-1. Download `dag-v?.?.?-windows-x86_64.zip` from [GitHub Releases](https://github.com/NoelMinamino/KariDNS/releases).
-2. Extract the archive. The `dag-v?.?.?-windows-x86_64` folder contains `dag.exe`, the MinGW runtime DLLs it needs, `README.md`, `LICENSE` and `docs/`. Keep the DLLs next to `dag.exe` and add that folder to your `%PATH%` (or copy all of them into a directory in `%PATH%`).
+1. Download `dag-?.?.?-windows-x86_64.zip` from [GitHub Releases](https://github.com/NoelMinamino/KariDNS/releases).
+2. Extract the archive. The `dag-?.?.?-windows-x86_64` folder contains `dag.exe`, the MinGW runtime DLLs it needs, `README.md`, `LICENSE` and `docs/`. Keep the DLLs next to `dag.exe` and add that folder to your `%PATH%` (or copy all of them into a directory in `%PATH%`).
 3. Test query in Command Prompt or PowerShell:
    ```cmd
    dag.exe example.com A @192.0.2.53

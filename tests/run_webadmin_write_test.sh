@@ -162,8 +162,8 @@ ADMIN_PW=$(sed -n 's/^password (shown once): //p' "$T/admin.out")
 $APP >> "$T/server.log" 2>&1 &
 WEB=$!
 i=0
-while [ $i -lt 100 ] && ! grep -q "karidns-webadmin 0.6.0 started" "$T/server.log" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
-if grep -q "karidns-webadmin 0.6.0 started" "$T/server.log"; then ok "the API started (pid $WEB)"; else bad "the API did not start" "$(cat "$T/server.log")"; exit 1; fi
+while [ $i -lt 100 ] && ! grep -q "karidns-webadmin [^ ]* started" "$T/server.log" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
+if grep -q "karidns-webadmin [^ ]* started" "$T/server.log"; then ok "the API started (pid $WEB)"; else bad "the API did not start" "$(cat "$T/server.log")"; exit 1; fi
 
 # a big zone, imported by the operator after the server started (it is never loaded: the cost measurement only needs the database)
 if [ "$BIG" -gt 0 ]; then

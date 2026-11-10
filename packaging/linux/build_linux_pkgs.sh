@@ -4,8 +4,7 @@ set -e
 # build_linux_pkgs.sh - Build Linux packages (RPM, DEB, tar.gz) for dag
 # Usage: ./packaging/linux/build_linux_pkgs.sh [version] [output_dir]
 
-VERSION="${1:-1.0.0}"
-VERSION="${VERSION#v}" # Strip leading 'v'
+VERSION_ARG="${1:-}"; . packaging/version.sh   # the file VERSION when no number is given
 OUT_DIR="${2:-./dist}"
 ARCH="$(uname -m)"
 
