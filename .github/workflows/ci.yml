@@ -52,7 +52,8 @@ jobs:
             echo "::group::📦 [Setup] Node.js, BIND tools and the npm dependency of karidns-signer (0.6.0 item C)"
             # karidns-signer is Node.js orchestration around BIND's dnssec-keygen / dnssec-signzone / dnssec-verify (bind-tools); signer/ has one
             # npm dependency (pg, exact version in package-lock.json), installed without install scripts.  The signer tests SKIP without these.
-            pkg install -y node24 npm-node24 bind-tools
+            # curl: tests/run_release_roundtrip_test.sh talks to the karidns-webadmin API with it
+            pkg install -y node24 npm-node24 bind-tools curl
             (cd signer && npm ci --ignore-scripts)
             (cd webadmin && npm ci --ignore-scripts)
             node --version
@@ -498,7 +499,8 @@ jobs:
             V=$(cc --version | sed -n 's/.*clang version \([0-9][0-9]*\).*/\1/p' | head -n 1)
             pkg install -y perl5 sqlite3 "llvm${V}-lite"
             # the suite runs the karidns-signer tests (tests/run_signer_*.sh): Node.js, BIND tools, signer/node_modules and webadmin/node_modules (run_webadmin_*.sh), or they SKIP (shown as a note in the suite output)
-            pkg install -y node24 npm-node24 bind-tools
+            # curl: tests/run_release_roundtrip_test.sh talks to the karidns-webadmin API with it
+            pkg install -y node24 npm-node24 bind-tools curl
             (cd signer && npm ci --ignore-scripts)
             (cd webadmin && npm ci --ignore-scripts)
             echo "::endgroup::"
