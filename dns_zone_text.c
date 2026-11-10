@@ -296,22 +296,6 @@ static bool put_name(dzt_t *z, const char *name) {
     return true;
 }
 
-/* a name the parser unescapes before it expands it (ZF_EXPAND only): the relative form as an ordinary token */
-static void put_expand_name(dzt_t *z, const char *name) {
-    size_t relen = 0;
-    char tmp[DNS_NAME_TEXT_SIZE];
-    int k = name_rel(z, name, &relen);
-    if (k == 1) {
-        out_addc(&z->out, '@');
-    } else if (k == 2 && relen < sizeof(tmp)) {
-        memcpy(tmp, name, relen);
-        tmp[relen] = '\0';
-        put_token(&z->out, tmp);
-    } else {
-        put_token(&z->out, name);
-    }
-}
-
 /* a name the parser keeps as typed (ZF_ABS): the absolute form, so that another server does not append the $ORIGIN to it */
 static void put_abs_name(dzt_t *z, const char *name) {
     size_t n = strlen(name);
@@ -429,8 +413,6 @@ static const char *put_rdata(dzt_t *z, const dns_record_t *r) {
         unsigned ff = zrows_field_flags(r, j);
         if (ff & ZF_NAME) {
             if (!put_name(z, r->rdata[j])) return "a name in the RDATA is not in the canonical text form";
-        } else if (ff & ZF_EXPAND) {
-            put_expand_name(z, r->rdata[j]);
         } else if (ff & ZF_ABS) {
             put_abs_name(z, r->rdata[j]);
         } else if (ff & ZF_STRING) {

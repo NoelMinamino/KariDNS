@@ -106,8 +106,8 @@ void zrows_free(zrows_t *r);
  * What an RDATA field is: ONE table for the row content (dns_zone_rows.c) and the zone-file writer (dns_zone_text.c).  rdata[j] of a
  * parsed record (dns_record_t) is a text field; the zone parser keeps some of them as names, some as the bytes of a character-string.
  *   ZF_NAME    a domain name the parser keeps in the canonical text form (dns_wire.h) with its escapes and expands to an absolute name
- *   ZF_EXPAND  a name the parser expands against $ORIGIN (all ZF_NAME fields, and the gateway / target names of IPSECKEY, AMTRELAY, SVCB,
- *              HTTPS, which the parser unescapes first): a name inside the zone may be written relative
+ *   ZF_EXPAND  a name the parser expands against $ORIGIN (every ZF_NAME field; the IPSECKEY / AMTRELAY gateway and the SVCB / HTTPS
+ *              target are names only for gateway type 3 and a target other than "."): a name inside the zone may be written relative
  *   ZF_NODOT   PowerDNS stores the name without the trailing dot (checked with pdnsutil load-zone on 5.1.4): NS CNAME PTR DNAME, the
  *              MX and AFSDB target, the SRV target, both SOA names, both RP names and the RRSIG signer.  It keeps the dot (as the zone
  *              file has the absolute name) in NAPTR, SVCB / HTTPS, NSEC (next name), KX, LP and MINFO.
