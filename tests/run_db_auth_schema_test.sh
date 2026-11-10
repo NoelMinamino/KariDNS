@@ -637,7 +637,7 @@ else
     echo "-- the zone file"
     ZDB=$T/zone.db
     # the test schema has no foreign keys on records, domainmetadata and cryptokeys (PowerDNS's own has ON DELETE CASCADE): add them
-    sed 's/^  domain_id             INTEGER DEFAULT NULL,/  domain_id             INTEGER DEFAULT NULL REFERENCES domains(id) ON DELETE CASCADE,/; s/^  domain_id             INT NOT NULL,/  domain_id             INT NOT NULL REFERENCES domains(id) ON DELETE CASCADE,/' "$SCHEMA" > "$T/schema_fk.sql"
+    sed -E 's/^( +domain_id (integer DEFAULT NULL|int NOT NULL)),$/\1 REFERENCES domains (id) ON DELETE CASCADE,/' "$SCHEMA" > "$T/schema_fk.sql"
     [ "$(grep -c 'ON DELETE CASCADE' "$T/schema_fk.sql")" = "3" ] || fail "the foreign keys were not added to the test schema"
     sqlite3 "$ZDB" < "$T/schema_fk.sql" > /dev/null
     sqlite3 "$ZDB" < db/karidns_ext.sqlite3.sql && pass "the ext file (version 3) applies" || fail "the ext file"
