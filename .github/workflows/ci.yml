@@ -62,7 +62,10 @@ jobs:
             echo "::group::📦 [Setup] Firefox and geckodriver for the browser tests of the web interface (0.6.0 item F, FreeBSD 15.1 only)"
             # run_webadmin_gui_test.sh drives Firefox (headless) through geckodriver; the packages are built for 15.x.  Firefox crashes at the start without a font.
             # The tests use no network (a profile that talks to nothing, everything on 127.0.0.1): the network is for this step only.
+            # The packages preinstalled in the VM image can be older than the repository: pkg keeps an installed library whose soname
+            # is unchanged (libffi.so.8 lacked the LIBFFI_CALL_PLAN_8.4 symbol version libxul.so needs), so bring them up to date first.
             if [ "${{ matrix.release }}" = "15.1" ]; then
+              pkg upgrade -y
               pkg install -y firefox geckodriver dejavu
               firefox --version
               geckodriver --version | head -1
