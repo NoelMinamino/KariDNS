@@ -41,8 +41,7 @@ case "$DB" in
     *) echo "build_pkg.sh: --db must be none, sqlite3, postgresql or both" >&2; exit 2 ;;
 esac
 
-VERSION="${1:-1.0.0}"
-VERSION="${VERSION#v}" # Strip leading 'v' if present
+VERSION_ARG="${1:-}"; . packaging/version.sh   # the file VERSION when no number is given
 OUT_DIR="${2:-./dist}"
 
 ARCH=$(pkg config ABI 2>/dev/null || echo "FreeBSD:$(uname -r | cut -d. -f1):$(uname -m)")

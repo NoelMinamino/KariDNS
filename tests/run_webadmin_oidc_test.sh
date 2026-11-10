@@ -64,8 +64,8 @@ start_idp() {
 stop_idp() { [ -n "$IDP" ] && { kill -TERM "$IDP" 2>/dev/null; wait "$IDP" 2>/dev/null; IDP=""; }; }
 # wait_started LOG: the service says it has started
 wait_started() {
-    i=0; while [ $i -lt 100 ] && ! grep -q "karidns-webadmin 0.6.0 started" "$1" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
-    grep -q "karidns-webadmin 0.6.0 started" "$1"
+    i=0; while [ $i -lt 100 ] && ! grep -q "karidns-webadmin [^ ]* started" "$1" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
+    grep -q "karidns-webadmin [^ ]* started" "$1"
 }
 stop_server() {
     kill -TERM "$SRV" 2>/dev/null
@@ -226,9 +226,9 @@ EOF
     as_pg $APP --check > "$P/check.out" 2> "$P/check.err" && ok "--check is fine (PostgreSQL: karidns_auth.oidc_states is a table the service needs)" || bad "--check" "$(cat "$P/check.err" "$P/check.out")"
     rm -f "$P/server.pid"
     as_pg sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$P/server.pid" $APP >> "$P/server.log" 2>&1 &
-    i=0; while [ $i -lt 100 ] && ! grep -q "karidns-webadmin 0.6.0 started" "$P/server.log" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
+    i=0; while [ $i -lt 100 ] && ! grep -q "karidns-webadmin [^ ]* started" "$P/server.log" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
     SRV=$(cat "$P/server.pid" 2>/dev/null)
-    if grep -q "karidns-webadmin 0.6.0 started" "$P/server.log"; then ok "the server started (pid $SRV)"; else bad "the server did not start" "$(cat "$P/server.log")"; exit 1; fi
+    if grep -q "karidns-webadmin [^ ]* started" "$P/server.log"; then ok "the server started (pid $SRV)"; else bad "the server did not start" "$(cat "$P/server.log")"; exit 1; fi
     printf '#!/bin/sh\nexec psql -X -q -At "%s" -c "SELECT count(*) FROM karidns_auth.oidc_states"\n' "$PGC" > "$P/states.sh"; chmod 755 "$P/states.sh"
     IT_BASE="http://127.0.0.1:$PORT/api/v1" IT_ORIGIN="http://127.0.0.1:$PORT" IT_IDP="$IDP_URL" IT_ADMIN_PASSWORD="$ADMIN_PW" IT_STATES_SQL="$P/states.sh" "$NODE" webadmin/test/it_oidc.mjs > "$P/it.out" 2>&1
     IT_RC=$?

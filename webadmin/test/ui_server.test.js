@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import { deploy, cast, ORIGIN } from './helpers.js';
 import { loadStatic, defaultUiDir } from '../lib/static.js';
 import { createApp } from '../ui/js/app.js';
+import { GUI_VERSION } from '../ui/js/version.js';
 import { base32Decode, hotp, totpStep } from '../lib/crypto.js';
 import { makeEnv, makeClock, makeBroadcast, FakeStorage, flush, findAll, byText } from './fakedom.js';
 
@@ -168,7 +169,7 @@ test('the GUI against the API: forced TOTP enrolment of a global master, the cod
     ui.type(ui.input('totp'), code(stepNow + 1));
     await ui.submit(ui.q('form'));
     assert.equal(ui.q('h1').textContent, 'Your account', 'back on the page the sign-in screen was opened on');
-    assert.equal(ui.q('footer').textContent, 'KariDNS WebAdmin 0.6.0');
+    assert.equal(ui.q('footer').textContent, `KariDNS WebAdmin ${GUI_VERSION}`);
 
     // a user without TOTP: another tab ends the session behind the page's back, the next request is a 401 and the sign-in opens over the screen
     const bf2 = browserFetch(d);

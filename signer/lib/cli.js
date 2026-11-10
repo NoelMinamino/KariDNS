@@ -13,8 +13,9 @@ import { SqliteDb } from './db_sqlite.js';
 import { loadSqlite } from '../../node/lib/sqlite.js';
 import { PgDb } from './db_pg.js';
 import { parseConninfo } from '../../node/lib/conf.js';
+import { packageVersion } from '../../node/lib/version.js';
 
-export const VERSION = '0.6.0';
+export const VERSION = packageVersion(new URL('../package.json', import.meta.url));
 export const DEFAULT_CONFIG = '/usr/local/etc/karidns/karidns-signer.conf';
 
 export const USAGE = `Usage: karidns-signer [-c config] [--check]

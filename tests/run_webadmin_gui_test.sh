@@ -111,8 +111,8 @@ ADMIN_PW=$(sed -n 's/^password (shown once): //p' "$T/admin.out")
 $APP >> "$T/server.log" 2>&1 &
 SRV=$!
 i=0
-while [ $i -lt 100 ] && ! grep -q "karidns-webadmin 0.6.0 started" "$T/server.log" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
-if grep -q "karidns-webadmin 0.6.0 started" "$T/server.log"; then ok "the server started (pid $SRV)"; else bad "the server did not start" "$(cat "$T/server.log")"; exit 1; fi
+while [ $i -lt 100 ] && ! grep -q "karidns-webadmin [^ ]* started" "$T/server.log" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
+if grep -q "karidns-webadmin [^ ]* started" "$T/server.log"; then ok "the server started (pid $SRV)"; else bad "the server did not start" "$(cat "$T/server.log")"; exit 1; fi
 
 # the page, with a plain HTTP client first: the headers of the GUI
 if command -v curl > /dev/null 2>&1; then
@@ -266,8 +266,8 @@ EOF
     $ZAPP >> "$Z/server.log" 2>&1 &
     ZWEB=$!
     i=0
-    while [ $i -lt 100 ] && ! grep -q "karidns-webadmin 0.6.0 started" "$Z/server.log" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
-    if grep -q "karidns-webadmin 0.6.0 started" "$Z/server.log"; then ok "the service started (pid $ZWEB)"; else bad "the service did not start" "$(cat "$Z/server.log")"; fi
+    while [ $i -lt 100 ] && ! grep -q "karidns-webadmin [^ ]* started" "$Z/server.log" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
+    if grep -q "karidns-webadmin [^ ]* started" "$Z/server.log"; then ok "the service started (pid $ZWEB)"; else bad "the service did not start" "$(cat "$Z/server.log")"; fi
     printf '#!/bin/sh\nexec sqlite3 "%s" "$1"\n' "$ZDB" > "$Z/sql.sh"; chmod 755 "$Z/sql.sh"
 
     gui_run_driver "zone screens, SQLite3" "$Z/browser" webadmin/test/e2e/gui_zones.mjs GUI_BASE="http://127.0.0.1:$ZWPORT" GUI_ADMIN_PASSWORD="$ZADMIN_PW" GUI_DNS_PORT="$ZPORT" \

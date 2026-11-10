@@ -54,7 +54,7 @@ echo "-- the package"
 mkdir -p "$T/src/webadmin" "$T/src/node" "$T/src/packaging" "$T/src/docs" "$T/out"
 cp -R webadmin/bin webadmin/lib webadmin/ui webadmin/package.json webadmin/package-lock.json "$T/src/webadmin/"
 cp -R node/lib node/package.json "$T/src/node/"
-cp -R packaging/freebsd "$T/src/packaging/"
+cp -R packaging/freebsd packaging/version.sh "$T/src/packaging/" && cp VERSION "$T/src/"      # (version.sh: the number of the package, docs/RELEASING.md)
 cp docs/karidns-webadmin.md docs/karidns-api.md docs/karidns-webadmin-gui.md docs/karidns-webadmin-gui-checklist.md "$T/src/docs/"
 cp karidns-webadmin.conf.sample "$T/src/"
 export npm_config_prefer_offline=true
@@ -98,7 +98,7 @@ grep -q 'web interface' "$T/root/+MANIFEST" && ok "the description of the packag
 cmp -s docs/karidns-webadmin-gui.md "$T/root/usr/local/share/doc/karidns/karidns-webadmin-gui.md" && cmp -s docs/karidns-webadmin-gui-checklist.md "$T/root/usr/local/share/doc/karidns/karidns-webadmin-gui-checklist.md" && ok "the user manual of the web interface and its checklist are the repository's" || bad "the manuals of the web interface differ"
 
 echo "-- the program in the installed layout"
-[ "$($NODE "$L/webadmin/bin/karidns-webadmin.js" --version 2>&1)" = "karidns-webadmin 0.6.0" ] && ok "--version" || bad "--version" "$($NODE "$L/webadmin/bin/karidns-webadmin.js" --version 2>&1)"
+[ "$($NODE "$L/webadmin/bin/karidns-webadmin.js" --version 2>&1)" = "karidns-webadmin $(cat "$ROOT/VERSION")" ] && ok "--version" || bad "--version" "$($NODE "$L/webadmin/bin/karidns-webadmin.js" --version 2>&1)"
 (cd "$L/webadmin" && $NODE -e 'import("pg").then((m) => process.exit(typeof (m.default ?? m).Pool === "function" ? 0 : 1), () => process.exit(1))') && ok "the pg module is found from the installed program (node_modules next to webadmin/ and node/)" || bad "pg is not found in the installed layout"
 command -v sqlite3 > /dev/null 2>&1 || { echo "SKIP: the sqlite3 command line tool is not installed: the installed program on a database"; done_; }
 [ -x "$ZONE" ] && [ -x "$KARICHECK" ] || { echo "SKIP: $ZONE or $KARICHECK is not built: the installed program on a database"; done_; }
@@ -134,7 +134,7 @@ PW=$(sed -n 's/^password (shown once): //p' "$T/admin.out")
 $APP > "$T/server.log" 2>&1 &
 SRV=$!
 i=0; while [ $i -lt 100 ] && ! grep -q "started" "$T/server.log" 2> /dev/null; do sleep 0.2; i=$((i + 1)); done
-grep -q "karidns-webadmin 0.6.0 started" "$T/server.log" && ok "the server starts" || { bad "the server did not start" "$(cat "$T/server.log")"; done_; }
+grep -q "karidns-webadmin [^ ]* started" "$T/server.log" && ok "the server starts" || { bad "the server did not start" "$(cat "$T/server.log")"; done_; }
 cat > "$T/probe.mjs" <<'EOF'
 const base = process.argv[2];
 const h = await fetch(`${base}/health`);

@@ -532,7 +532,7 @@ $ karidns-dbloader --drivers
 sqlite3
 postgresql
 $ karidns-dbloader --version
-karidns-dbloader 0.5.0
+karidns-dbloader 0.6.0
 ```
 
 **Write the stream the Backend would get.** The bytes do not depend on the number of loader threads, and `--zone` reads one zone with a query of its own:

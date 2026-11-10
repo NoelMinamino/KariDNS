@@ -305,7 +305,7 @@ sudo cp dag-?.?.?/dag /usr/local/bin/
 
 ### 4. Windows Installation (`dag.exe` only)
 
-Download `dag-v?.?.?-windows-x86_64.zip` from [GitHub Releases](https://github.com/NoelMinamino/KariDNS/releases).
+Download `dag-?.?.?-windows-x86_64.zip` from [GitHub Releases](https://github.com/NoelMinamino/KariDNS/releases).
 
 1. Extract the ZIP archive.
 2. Keep `dag.exe` together with the DLLs next to it, and add that folder to your `%PATH%` (or copy them all into a directory that is already in `%PATH%`).

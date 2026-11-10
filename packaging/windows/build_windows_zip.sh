@@ -2,7 +2,7 @@
 # build_windows_zip.sh - Build and package dag for Windows (x86_64) into ZIP
 set -e
 
-VERSION="${1:-0.0.0}"
+VERSION_ARG="${1:-}"; . packaging/version.sh   # the file VERSION when no number is given
 OUT_DIR="${2:-./dist}"
 
 mkdir -p "${OUT_DIR}"

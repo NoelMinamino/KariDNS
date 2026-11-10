@@ -6,8 +6,9 @@ import { hashPassword } from './crypto.js';
 import { datasetList } from './config.js';
 import { Pool, KeyedLock } from './pool.js';
 import { Oidc } from './oidc.js';
+import { packageVersion } from '../../node/lib/version.js';
 
-export const VERSION = '0.6.0';
+export const VERSION = packageVersion(new URL('../package.json', import.meta.url));
 
 export class App {
   // config: { settings, datasets }; backend: db.js; log: the logger; run: runChild; key: the Buffer that wraps TOTP secrets

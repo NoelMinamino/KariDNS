@@ -15,8 +15,30 @@ env:
   RELEASE_VER: ${{ inputs.version || github.ref_name || '0.0.1' }}
 
 jobs:
+  # The tag must name the number of the file VERSION (docs/RELEASING.md: `make set-version V=x.y.z`, commit, then the tag vx.y.z), and every file
+  # that keeps a copy of it must agree (tests/run_version_test.sh).  A manual run (workflow_dispatch) is a test build: a different number only warns.
+  version-check:
+    name: Check the tag against the file VERSION
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Compare the tag, VERSION and its copies
+        run: |
+          sh tests/run_version_test.sh
+          TAG_VER="${{ env.RELEASE_VER }}"; TAG_VER="${TAG_VER#v}"
+          FILE_VER=$(tr -d ' \r\n' < VERSION)
+          if [ "$TAG_VER" = "$FILE_VER" ]; then echo "version $FILE_VER"; exit 0; fi
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "::error::the tag says $TAG_VER, the file VERSION says $FILE_VER (make set-version V=$TAG_VER, commit, and tag that commit)"
+            exit 1
+          fi
+          echo "::warning::test build $TAG_VER; the file VERSION says $FILE_VER"
+
   build-and-test-freebsd:
     name: Build & Test FreeBSD ${{ matrix.release }} Package (.pkg)
+    needs: version-check
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -40,7 +62,7 @@ jobs:
             # in case the VM image ships it preinstalled
             if pkg info -e openssl; then pkg delete -fy openssl; fi
             mkdir -p dist
-            TAG_VER="${{ env.RELEASE_VER }}"
+            TAG_VER="${{ env.RELEASE_VER }}"; TAG_VER="${TAG_VER#v}"   # a tag v0.6.0 is the number 0.6.0
             chmod +x packaging/freebsd/build_pkg.sh
             ./packaging/freebsd/build_pkg.sh "$TAG_VER" ./dist
 
@@ -100,7 +122,7 @@ jobs:
             # the binaries must link the base system OpenSSL (see the step above)
             if pkg info -e openssl; then pkg delete -fy openssl; fi
             mkdir -p dist-db
-            TAG_VER="${{ env.RELEASE_VER }}"
+            TAG_VER="${{ env.RELEASE_VER }}"; TAG_VER="${TAG_VER#v}"   # a tag v0.6.0 is the number 0.6.0
             chmod +x packaging/freebsd/build_pkg.sh
             ./packaging/freebsd/build_pkg.sh --db sqlite3 "$TAG_VER" ./dist-db
             ./packaging/freebsd/build_pkg.sh --db postgresql "$TAG_VER" ./dist-db
@@ -171,6 +193,7 @@ jobs:
 
   build-and-test-linux:
     name: Build & Test Linux Packages (RPM, DEB, tar.gz)
+    needs: version-check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -184,7 +207,7 @@ jobs:
       - name: Build binary and RPM in Rocky Linux 9 container (glibc 2.34 compatibility)
         run: |
           mkdir -p dist
-          TAG_VER="${{ env.RELEASE_VER }}"
+          TAG_VER="${{ env.RELEASE_VER }}"; TAG_VER="${TAG_VER#v}"   # a tag v0.6.0 is the number 0.6.0
           chmod +x packaging/linux/build_linux_pkgs.sh
           docker run --rm -v "${GITHUB_WORKSPACE}:/src" -w /src rockylinux:9 sh -c "
             set -e
@@ -199,7 +222,7 @@ jobs:
       - name: Build DEB and Tarball packages on host
         run: |
           sudo chown -R $USER:$USER "${GITHUB_WORKSPACE}"
-          TAG_VER="${{ env.RELEASE_VER }}"
+          TAG_VER="${{ env.RELEASE_VER }}"; TAG_VER="${TAG_VER#v}"   # a tag v0.6.0 is the number 0.6.0
           chmod +x packaging/linux/build_linux_pkgs.sh
           ./packaging/linux/build_linux_pkgs.sh "$TAG_VER" ./dist
 
@@ -237,6 +260,7 @@ jobs:
 
   build-and-test-macos:
     name: Build & Test macOS (${{ matrix.os }}) Package (DMG, tar.gz)
+    needs: version-check
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -252,7 +276,7 @@ jobs:
 
       - name: Build macOS Package
         run: |
-          TAG_VER="${{ env.RELEASE_VER }}"
+          TAG_VER="${{ env.RELEASE_VER }}"; TAG_VER="${TAG_VER#v}"   # a tag v0.6.0 is the number 0.6.0
           chmod +x packaging/macos/build_dmg.sh
           ./packaging/macos/build_dmg.sh "$TAG_VER" ./dist
 
@@ -289,6 +313,7 @@ jobs:
 
   build-and-test-windows:
     name: Build & Test dag (Windows x86_64)
+    needs: version-check
     runs-on: windows-latest
     steps:
       - name: Checkout code
@@ -310,7 +335,7 @@ jobs:
       - name: Build dag.exe and ZIP package in MSYS2
         shell: msys2 {0}
         run: |
-          TAG_VER="${{ env.RELEASE_VER }}"
+          TAG_VER="${{ env.RELEASE_VER }}"; TAG_VER="${TAG_VER#v}"   # a tag v0.6.0 is the number 0.6.0
           mkdir -p dist
           make clean
           make VERSION="$TAG_VER" MARCH_FLAGS= dag
@@ -354,7 +379,7 @@ jobs:
           mkdir -p release-assets
           cp all-dist/* release-assets/ 2>/dev/null || true
           
-          TAG_VER="${{ env.RELEASE_VER }}"
+          TAG_VER="${{ env.RELEASE_VER }}"   # the tag itself (v0.6.0): the formula downloads the archive of the tag
           
           # Generate SHA256SUMS.txt
           cd release-assets

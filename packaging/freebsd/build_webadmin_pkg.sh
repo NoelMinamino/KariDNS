@@ -10,8 +10,7 @@ set -e
 # conflict with each other, so the package cannot depend on one of them by name: its pre-install script refuses to install without /usr/local/bin/karidns-zone
 # and /usr/local/bin/karicheck.  The build host needs node24 and npm-node24.
 
-VERSION="${1:-1.0.0}"
-VERSION="${VERSION#v}"
+VERSION_ARG="${1:-}"; . packaging/version.sh   # the file VERSION when no number is given
 OUT_DIR="${2:-./dist}"
 case "$VERSION" in -*) echo "build_webadmin_pkg.sh: usage: build_webadmin_pkg.sh [version] [output_dir]" >&2; exit 2 ;; esac
 

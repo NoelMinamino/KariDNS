@@ -80,8 +80,8 @@ ADMIN_PW=$(sed -n 's/^password (shown once): //p' "$T/admin.out")
 $APP >> "$T/server.log" 2>&1 &
 SRV=$!
 i=0
-while [ $i -lt 100 ] && ! grep -q "karidns-webadmin 0.6.0 started" "$T/server.log" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
-grep -q "karidns-webadmin 0.6.0 started" "$T/server.log" && ok "the server started (pid $SRV)" || { bad "the server did not start" "$(cat "$T/server.log")"; exit 1; }
+while [ $i -lt 100 ] && ! grep -q "karidns-webadmin [^ ]* started" "$T/server.log" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
+grep -q "karidns-webadmin [^ ]* started" "$T/server.log" && ok "the server started (pid $SRV)" || { bad "the server did not start" "$(cat "$T/server.log")"; exit 1; }
 echo "-- $("$NODE" --version), $("$FIREFOX" --version 2>/dev/null | head -1), $(uname -sr)"
 
 echo "-- the browser (webadmin/test/e2e/gui_measure.mjs), BIG=$BIG"

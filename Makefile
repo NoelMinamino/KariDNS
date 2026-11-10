@@ -20,8 +20,10 @@ WIN_LDFLAGS != case "`uname -s 2>/dev/null`" in MINGW*|MSYS*|CYGWIN*) echo "-sta
 BREW_CFLAGS  = -I/opt/homebrew/opt/openssl@3/include -I/usr/local/opt/openssl@3/include -I/opt/homebrew/include -I/usr/local/include
 BREW_LDFLAGS = -L/opt/homebrew/opt/openssl@3/lib -L/usr/local/opt/openssl@3/lib -L/opt/homebrew/lib -L/usr/local/lib
 
-# Version definition
-VERSION ?= 0.5.0
+# Version definition: the file VERSION is the one source of the release number (docs/RELEASING.md).  `make VERSION=x.y.z` still
+# overrides it for one build; `make set-version V=x.y.z` changes it and the files that cannot read it (package.json, the GUI).
+VERSION_FILE != { tr -d ' \r\n' < VERSION; } 2>/dev/null || echo dev
+VERSION ?= $(VERSION_FILE)
 
 CC ?= cc
 # CPU tuning. -march=native suits binaries built and run on the same machine;
@@ -140,7 +142,7 @@ FUZZ_DAG_REPLAY_DIFF_SRCS = tests/fuzz/fuzz_dag_replay_diff.c tools/dag_replay.c
 FUZZ_DAG_TCP_REASSEMBLY_TARGET = tests/fuzz/fuzz_dag_tcp_reassembly
 FUZZ_DAG_TCP_REASSEMBLY_SRCS = tests/fuzz/fuzz_dag_tcp_reassembly.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_replay.c tools/dag_http.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
-.PHONY: karicheck-codelog test_coverage_sweep_tools-codelog all clean run fuzz zone2kdb karidns-dbloader karidns-dbloader-tsan karidns-dbloader-asan karidns-zone karidns-zone-asan dbloader-check-drivers db_sqlite3_test db_pgsql_test fuzz_core fuzz_query_engine fuzz_zone_image fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_pdns_content fuzz_pdns_metadata fuzz_db_checkline fuzz_json_escape fuzz_zone_text fuzz_zone_changes fuzz_db_logline fuzz_nsec3_rebuild fuzz_alias_response clean-fuzz asan tsan fuzz_tsig fuzz_dag fuzz_tsig_verify dag tools response_cache_test \
+.PHONY: set-version karicheck-codelog test_coverage_sweep_tools-codelog all clean run fuzz zone2kdb karidns-dbloader karidns-dbloader-tsan karidns-dbloader-asan karidns-zone karidns-zone-asan dbloader-check-drivers db_sqlite3_test db_pgsql_test fuzz_core fuzz_query_engine fuzz_zone_image fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_pdns_content fuzz_pdns_metadata fuzz_db_checkline fuzz_json_escape fuzz_zone_text fuzz_zone_changes fuzz_db_logline fuzz_nsec3_rebuild fuzz_alias_response clean-fuzz asan tsan fuzz_tsig fuzz_dag fuzz_tsig_verify dag tools response_cache_test \
 	fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file \
 	fuzz_dag_replay_pcap_reader fuzz_dag_replay_diff fuzz_dag_tcp_reassembly \
 	fuzz_dag_all fuzz_dag_test fuzz_karidns fuzz_karidns_test fuzz_all fuzz_test \
@@ -159,7 +161,7 @@ $(KARICTL_TARGET): $(KARICTL_OBJS)
 $(DAG_TARGET): $(DAG_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS) $(WIN_LDFLAGS)
 
-karicheck: tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_tinydns_parser.o dns_wire.o dns_utils.o dns_cidr.o dns_tsig_acl.o dns_zone_lint.o dns_db_checkproto.o dns_diag.o
+karicheck: VERSION tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_tinydns_parser.o dns_wire.o dns_utils.o dns_cidr.o dns_tsig_acl.o dns_zone_lint.o dns_db_checkproto.o dns_diag.o
 	$(CC) $(CFLAGS) tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_tinydns_parser.o dns_wire.o dns_utils.o dns_cidr.o dns_tsig_acl.o dns_zone_lint.o dns_db_checkproto.o dns_diag.o -o karicheck $(LDFLAGS) -lcrypto
 
 # The test build of karicheck that logs the code of every message (KARICHECK_CODE_LOG, tests/run_karicheck_codes_test.sh).  The shipped
@@ -172,7 +174,8 @@ karicheck-codelog: $(KARICHECK_CODELOG_SRCS)
 # what uses it (the list named 8 headers, and a stale object with an old struct layout links without a word).
 HDRS != ls *.h tools/*.h tests/*.h 2>/dev/null
 ALL_C != ls *.c tools/*.c tests/*.c tests/fuzz/*.c 2>/dev/null
-$(ALL_C:.c=.o) $(ALL_C:.c=.uta.o) $(ALL_C:.c=.utn.o) $(ALL_C:.c=.fz.o) $(ALL_C:.c=.asan.o) $(ALL_C:.c=.tsan.o) $(ALL_C:.c=.ev.o): $(HDRS)
+# VERSION too: -DKARIDNS_VERSION comes from it, and a new number must not leave objects that print the old one.
+$(ALL_C:.c=.o) $(ALL_C:.c=.uta.o) $(ALL_C:.c=.utn.o) $(ALL_C:.c=.fz.o) $(ALL_C:.c=.asan.o) $(ALL_C:.c=.tsan.o) $(ALL_C:.c=.ev.o): $(HDRS) VERSION
 
 .SUFFIXES: .c .o
 
@@ -1381,6 +1384,10 @@ bench_serialize: tests/bench_serialize.c dns_wire.o dns_utils.o dns_zone_parser.
 
 bench_rrl: tests/bench_rrl.c dns_rrl.o dns_config_parser.o dns_diag.o dns_zone_parser.o dns_tinydns_parser.o dns_wire.o dns_utils.o dns_cidr.o dns_tsig_acl.o
 	$(CC) $(CFLAGS) tests/bench_rrl.c dns_rrl.o dns_config_parser.o dns_diag.o dns_zone_parser.o dns_tinydns_parser.o dns_wire.o dns_utils.o dns_cidr.o dns_tsig_acl.o -o bench_rrl $(LDFLAGS) -lssl -lcrypto -lz
+
+# make set-version V=x.y.z: the release number in VERSION and in the files that cannot read it (tools/set_version.sh, docs/RELEASING.md)
+set-version:
+	sh tools/set_version.sh $(V)
 
 clean: clean-fuzz coverage-clean
 	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck bench_serialize bench_rrl $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
