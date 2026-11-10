@@ -404,6 +404,20 @@ static void test_apex(void) {
         CHECK_HAS(w, "\na\\.example.test. A 192.0.2.2\n");      /* "a.example" is a label of test., not of example.test. */
     }
     free(w);
+    /* the names the parser keeps escaped since review fix L4 (IPSECKEY / AMTRELAY gateway of type 3, SVCB / HTTPS target, HIP Rendezvous
+     * Servers), outside the apex with an escape from the $ORIGIN (\199) and with an escaped dot: written as names, read back the same
+     * (fuzz_zone_text found the IPSECKEY one written as a quoted token, which read back as another name) */
+    w = roundtrip("escaped names in the RDATA",
+                  "$ORIGIN example.test.\n$TTL 300\n@ SOA ns1 h 1 2 3 4 5\n@ NS ns1\n$ORIGIN tes\\199t.\n"
+                  "t1 IPSECKEY 10 3 2 gw " B64 "\nt2 AMTRELAY 10 0 3 re\\.lay\nt3 SVCB 1 s\\.vc\nt4 HTTPS 1 svc\n"
+                  "t5 HIP 2 200100107B1A74DF365639CC39F1D578 " B64 " rv\\.s rvs2\n",
+                  "example.test.", DZT_BIND);
+    if (w) {
+        CHECK_HAS(w, "IPSECKEY 10 3 2 gw.tes\\199t. ");
+        CHECK_HAS(w, "AMTRELAY 10 0 3 re\\.lay.tes\\199t.\n");
+        CHECK_HAS(w, "SVCB 1 s\\.vc.tes\\199t.\n");
+    }
+    free(w);
     /* an empty zone */
     zone_arena_t a;
     char err[300];
@@ -1300,17 +1314,17 @@ static void test_field_table(void) {
     CHECK(zrows_field_flags(&r, 2) == 0);
     r.type_code = 45;
     rd[1] = "3";
-    CHECK(zrows_field_flags(&r, 3) == ZF_EXPAND);
+    CHECK(zrows_field_flags(&r, 3) == (ZF_NAME | ZF_EXPAND));
     rd[1] = "1";
     CHECK(zrows_field_flags(&r, 3) == 0);
     r.type_code = 260;
     rd[2] = "3";
-    CHECK(zrows_field_flags(&r, 3) == ZF_EXPAND);
+    CHECK(zrows_field_flags(&r, 3) == (ZF_NAME | ZF_EXPAND));
     rd[2] = "x";
     CHECK(zrows_field_flags(&r, 3) == 0);
     r.type_code = 65;
     rd[1] = "svc.example.";
-    CHECK(zrows_field_flags(&r, 1) == ZF_EXPAND);
+    CHECK(zrows_field_flags(&r, 1) == (ZF_NAME | ZF_EXPAND));
     rd[1] = ".";
     CHECK(zrows_field_flags(&r, 1) == 0);
     CHECK(zrows_blob_lead(46) == 8 && zrows_blob_lead(48) == 3 && zrows_blob_lead(49) == 0 && zrows_blob_lead(1) == -1);

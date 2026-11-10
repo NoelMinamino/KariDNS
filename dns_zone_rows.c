@@ -386,8 +386,10 @@ static void ds_add_name(dstr_t *d, const char *n) {
  * DNAME, the MX and AFSDB target, the SRV target, both SOA names, both RP names and (B5: seen in a presigned zone
  * AXFRed into the database) the RRSIG signer.  It keeps the dot (as the zone file has the absolute name) in NAPTR,
  * SVCB / HTTPS, NSEC (next name), KX, LP and MINFO, so the same rule is applied here; the reader takes both.
- * The ZF_NAME rows are the zone parser's list of names it keeps escaped (dns_zone_parser.c, "A-1: Unescape fields"), the ZF_EXPAND-only
- * rows the names it unescapes first and then expands (IPSECKEY and AMTRELAY gateway / relay of type 3, SVCB / HTTPS target). */
+ * The ZF_NAME rows are the zone parser's list of names it keeps escaped (dns_zone_parser.c zone_rdata_name_field(), "A-1: Unescape fields"):
+ * since the review fix L4 that list has the IPSECKEY and AMTRELAY gateway / relay of type 3, the SVCB / HTTPS target and the HIP
+ * Rendezvous Servers too, so they are ZF_NAME here as well (the writer had kept writing them as unescaped tokens, and a name with an
+ * escape came back as another name). */
 #define ZF_REST 255
 typedef struct { uint16_t type; uint8_t first, last; unsigned flags; } zrows_field_t;
 static const zrows_field_t zrows_field_table[] = {
@@ -413,16 +415,17 @@ static const zrows_field_t zrows_field_table[] = {
     { 36, 1, 1, ZF_NAME | ZF_EXPAND },                  /* KX */
     { 38, 2, 2, ZF_NAME | ZF_EXPAND },                  /* A6: prefix name (only with a prefix length above 0) */
     { 39, 0, 0, ZF_NAME | ZF_EXPAND | ZF_NODOT },       /* DNAME */
-    { 45, 3, 3, ZF_EXPAND },                            /* IPSECKEY: gateway (only of gateway type 3) */
+    { 45, 3, 3, ZF_NAME | ZF_EXPAND },           /* IPSECKEY: gateway (only of gateway type 3; RFC 4025 section 2.5) */
     { 24, 7, 7, ZF_ABS },                               /* SIG: signer (the parser expands no name here: a BIND file needs it absolute) */
     { 46, 7, 7, ZF_NODOT | ZF_ABS },                    /* RRSIG: signer (stored without the dot by AXFR-in, checked on 5.1.4, B5) */
     { 47, 0, 0, ZF_ABS },                               /* NSEC: next name */
     { 58, 0, 1, ZF_NAME | ZF_EXPAND },                  /* TALINK */
-    { 64, 1, 1, ZF_EXPAND },                            /* SVCB: target (not "." ) */
-    { 65, 1, 1, ZF_EXPAND },                            /* HTTPS: target (not "." ) */
+    { 64, 1, 1, ZF_NAME | ZF_EXPAND },           /* SVCB: TargetName (RFC 9460 section 2.2; not "." ) */
+    { 65, 1, 1, ZF_NAME | ZF_EXPAND },           /* HTTPS: TargetName (not "." ) */
     { 66, 3, 3, ZF_ABS },                               /* DSYNC: target */
     { 107, 1, 1, ZF_NAME | ZF_EXPAND },                 /* LP */
-    { 260, 3, 3, ZF_EXPAND },                           /* AMTRELAY: relay (only of relay type 3) */
+    { 260, 3, 3, ZF_NAME | ZF_EXPAND },          /* AMTRELAY: relay (only of relay type 3; RFC 8777 section 4.2.3) */
+    { 55, 3, ZF_REST, ZF_NAME | ZF_EXPAND },     /* HIP: Rendezvous Servers (RFC 8005 section 5) */
     /* character-strings */
     { 13, 0, ZF_REST, ZF_STRING },                      /* HINFO */
     { 16, 0, ZF_REST, ZF_STRING },                      /* TXT */
@@ -457,13 +460,13 @@ unsigned zrows_field_flags(const dns_record_t *r, int j) {
             if ((uint8_t)atoi(r->rdata[0]) == 0) f &= ~(ZF_NAME | ZF_EXPAND);
             break;
         case 45:
-            if (!zrows_type_is_3(r->rdata[1])) f &= ~ZF_EXPAND;
+            if (!zrows_type_is_3(r->rdata[1])) f &= ~(ZF_NAME | ZF_EXPAND);
             break;
         case 260:
-            if (!zrows_type_is_3(r->rdata[2])) f &= ~ZF_EXPAND;
+            if (!zrows_type_is_3(r->rdata[2])) f &= ~(ZF_NAME | ZF_EXPAND);
             break;
         case 64: case 65:                           /* "." is the AliasMode root, not a name to expand */
-            if (strcmp(r->rdata[1], ".") == 0) f &= ~ZF_EXPAND;
+            if (strcmp(r->rdata[1], ".") == 0) f &= ~(ZF_NAME | ZF_EXPAND);
             break;
         default:
             break;
