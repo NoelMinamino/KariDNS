@@ -24,13 +24,15 @@ BREW_LDFLAGS = -L/opt/homebrew/opt/openssl@3/lib -L/usr/local/opt/openssl@3/lib 
 # overrides it for one build; `make set-version V=x.y.z` changes it and the files that cannot read it (package.json, the GUI).
 VERSION_FILE != { tr -d ' \r\n' < VERSION; } 2>/dev/null || echo dev
 VERSION ?= $(VERSION_FILE)
+# every compile line passes it (the release flags, the unit tests, ASan, TSan, fuzzing, coverage): a build without it says "dev"
+VERSION_DEF = -DKARIDNS_VERSION=\"$(VERSION)\"
 
 CC ?= cc
 # CPU tuning. -march=native suits binaries built and run on the same machine;
 # distributable packages must be built with MARCH_FLAGS= (baseline ISA), or they
 # die with SIGILL on CPUs lacking the build host's extensions (e.g. AVX-512).
 MARCH_FLAGS ?= -march=native
-CFLAGS += -O3 -flto $(MARCH_FLAGS) -Wall -Wextra -std=c11 -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE -DKARIDNS_VERSION=\"$(VERSION)\" $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
+CFLAGS += -O3 -flto $(MARCH_FLAGS) -Wall -Wextra -std=c11 -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE $(VERSION_DEF) $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
 LDFLAGS = -flto -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS) $(HARDEN_LDFLAGS)
 
 
@@ -882,7 +884,7 @@ UT_ASAN_LEAKS ?= 0
 # each binary of unit-tests-asan gets at most UT_TIMEOUT seconds; a hung one prints its thread backtraces and fails
 # (tests/run_unit_with_watchdog.sh) instead of blocking CI until the job timeout
 UT_TIMEOUT ?= 300
-UT_ASAN_CFLAGS = -O1 -g -Wall -Wextra -std=c11 -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -DSANITIZER_BUILD -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -fPIE -DKARIDNS_VERSION=\"$(VERSION)\" $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
+UT_ASAN_CFLAGS = -O1 -g -Wall -Wextra -std=c11 -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -DSANITIZER_BUILD -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -fPIE $(VERSION_DEF) $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
 UT_ASAN_LDFLAGS = -fsanitize=address,undefined -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS)
 
 # Every source is compiled once per variant and the objects are shared by all
@@ -1126,7 +1128,9 @@ COV_PROFILE_PAT_0 = karidns_%p_%m.profraw
 # loader runs as other users than root, which cannot write a file another user created.
 COV_DBL_PAT_1 = cov_dbloader_%p%c.profraw
 COV_DBL_PAT_0 = karidns_dbloader_%p_%m.profraw
-COV_CFLAGS  = $(COV_CONT_CFLAGS_$(COV_CONTINUOUS)) -Wno-unused-command-line-argument -fprofile-instr-generate -fcoverage-mapping -DKARIDNS_COVERAGE_LINKAGE -DKARIDNS_TEST_EVICT -O0 -g -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -Wall -Wextra -std=c11 -fPIE $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
+# COV_CFLAGS reaches the inner make inside double quotes (CFLAGS="$(COV_CFLAGS)" below), which eat one level of backslashes
+COV_VERSION_DEF = -DKARIDNS_VERSION=\\\"$(VERSION)\\\"
+COV_CFLAGS  = $(COV_CONT_CFLAGS_$(COV_CONTINUOUS)) -Wno-unused-command-line-argument -fprofile-instr-generate -fcoverage-mapping -DKARIDNS_COVERAGE_LINKAGE -DKARIDNS_TEST_EVICT -O0 -g -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -Wall -Wextra -std=c11 -fPIE $(COV_VERSION_DEF) $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
 COV_LDFLAGS = -fprofile-instr-generate -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS) $(HARDEN_LDFLAGS)
 COV_DIR     = coverage_raw
 # Parallel jobs for the coverage build and for the test suite (tests/run_all_suite.sh -j:
@@ -1141,7 +1145,7 @@ COV_HTML_DIR = coverage_html
 COV_DATA    = coverage.profdata
 
 COV_FUZZ_DIR = coverage_fuzz
-COV_FUZZ_CFLAGS = -fsanitize=fuzzer,address,undefined -fprofile-instr-generate -fcoverage-mapping -DKARIDNS_COVERAGE_LINKAGE -O0 -g -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -Wall -Wextra -std=c11 -fPIE $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
+COV_FUZZ_CFLAGS = -fsanitize=fuzzer,address,undefined -fprofile-instr-generate -fcoverage-mapping -DKARIDNS_COVERAGE_LINKAGE -O0 -g -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -Wall -Wextra -std=c11 -fPIE $(VERSION_DEF) $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
 COV_FUZZ_LDFLAGS = -fsanitize=fuzzer,address,undefined -fprofile-instr-generate $(LDFLAGS)
 
 COV_FUZZ_BINS  = $(COV_FUZZ_DIR)/fuzz_dns_wire $(COV_FUZZ_DIR)/fuzz_dns_server_core
@@ -1403,7 +1407,7 @@ run: $(TARGET)
 
 # Fuzz sources are compiled once (fuzzer-no-link instrumentation) and the objects
 # shared by every fuzzer; only the link step adds libFuzzer (-fsanitize=fuzzer).
-FUZZ_OBJ_CFLAGS = -O1 -g -fsanitize=fuzzer-no-link,address,undefined -fPIE
+FUZZ_OBJ_CFLAGS = -O1 -g -fsanitize=fuzzer-no-link,address,undefined -fPIE $(VERSION_DEF)
 .SUFFIXES: .fz.o .c
 .c.fz.o:
 	$(CC) $(FUZZ_OBJ_CFLAGS) -c $< -o $@
@@ -1524,7 +1528,7 @@ clean-fuzz:
 	rm -f $(FUZZ_DAG_REPLAY_PCAP_READER_TARGET) $(FUZZ_DAG_REPLAY_DIFF_TARGET) $(FUZZ_DAG_TCP_REASSEMBLY_TARGET) $(FUZZ_DAG_ITER_TARGET)
 
 ASAN_TARGET = karidns-asan
-ASAN_CFLAGS = -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSANITIZER_BUILD -g -fsanitize=address,undefined -fno-omit-frame-pointer -fPIE
+ASAN_CFLAGS = -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSANITIZER_BUILD -g -fsanitize=address,undefined -fno-omit-frame-pointer -fPIE $(VERSION_DEF)
 ASAN_OBJS = $(SRCS:.c=.asan.o)
 
 asan: $(ASAN_TARGET)
@@ -1537,7 +1541,7 @@ $(ASAN_TARGET): $(ASAN_OBJS)
 	$(CC) $(ASAN_CFLAGS) -c $< -o $@
 
 TSAN_TARGET = karidns-tsan
-TSAN_CFLAGS = -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSANITIZER_BUILD -g -fsanitize=thread -fPIE
+TSAN_CFLAGS = -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSANITIZER_BUILD -g -fsanitize=thread -fPIE $(VERSION_DEF)
 TSAN_LDFLAGS = -fsanitize=thread -pie
 TSAN_OBJS = $(SRCS:.c=.tsan.o)
 

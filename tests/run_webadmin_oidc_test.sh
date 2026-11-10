@@ -137,6 +137,8 @@ EOF
     $APP >> "$S/server.log" 2>&1 &
     SRV=$!
     if wait_started "$S/server.log"; then ok "the server started (pid $SRV)"; else bad "the server did not start" "$(cat "$S/server.log")"; exit 1; fi
+    # the fetch runs after the "started" line (a slow host, the coverage build): wait for its line
+    i=0; while [ $i -lt 100 ] && ! grep -q "oidc: provider idp .* is reachable" "$S/server.log"; do sleep 0.1; i=$((i + 1)); done
     grep -q "oidc: provider idp .* is reachable" "$S/server.log" && ok "the documents of the provider were fetched at the start" || bad "no sign of the fetch at the start" "$(cat "$S/server.log")"
     printf '#!/bin/sh\nexec sqlite3 "%s" "SELECT count(*) FROM oidc_states"\n' "$AUTH" > "$S/states.sh"; chmod 755 "$S/states.sh"
     IT_BASE="http://127.0.0.1:$PORT/api/v1" IT_ORIGIN="http://127.0.0.1:$PORT" IT_IDP="$IDP_URL" IT_ADMIN_PASSWORD="$ADMIN_PW" IT_STATES_SQL="$S/states.sh" "$NODE" webadmin/test/it_oidc.mjs > "$S/it.out" 2>&1
