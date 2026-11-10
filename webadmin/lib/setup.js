@@ -2,7 +2,7 @@
 
 import fs from 'node:fs';
 import { validate } from './config.js';
-import { checkConninfoFile, parseConninfo } from '../../node/lib/conf.js';
+import { checkConninfoFile, parseConninfo, plaintextWarning } from '../../node/lib/conf.js';
 import { loadSqlite } from '../../node/lib/sqlite.js';
 import { clip } from '../../node/lib/run.js';
 import { SqliteBackend, PgBackend } from './db.js';
@@ -20,7 +20,7 @@ export const DATA_TABLES = ['domains', 'records', 'domainmetadata', 'cryptokeys'
   'karidns_domain_views', 'karidns_signer_state', 'karidns_key_requests', 'karidns_record_tags', 'karidns_record_tinydns', 'karidns_zone_tagdefs'];
 
 // -> a backend, opened.  conninfoFile overrides the file of the configuration (--create-admin uses a trusted role of its own).
-export async function openBackend(config, { conninfoFile, importPg = () => import('pg'), importSqlite = loadSqlite, readFile = fs.readFileSync, checkConninfo = checkConninfoFile, onError } = {}) {
+export async function openBackend(config, { conninfoFile, importPg = () => import('pg'), importSqlite = loadSqlite, readFile = fs.readFileSync, checkConninfo = checkConninfoFile, onError, warn } = {}) {
   const s = config.settings;
   if (s.database === 'sqlite3') {
     const b = new SqliteBackend({ sqlite: await importSqlite(), file: s['sqlite-file'], authFile: s['auth-file'] });
@@ -31,22 +31,26 @@ export async function openBackend(config, { conninfoFile, importPg = () => impor
   const problem = checkConninfo(file, undefined, undefined, PROGRAM);
   if (problem) throw new Error(problem);
   const mod = await importPg();
-  const b = new PgBackend({ pg: mod.Pool ? mod : mod.default, conn: parseConninfo(readFile(file, 'utf8'), PROGRAM), poolMax: Math.max(4, config.settings.workers * 2), onError });
+  const conn = parseConninfo(readFile(file, 'utf8'), PROGRAM);
+  const w = plaintextWarning(conn);
+  if (w) warn?.(w);
+  const b = new PgBackend({ pg: mod.Pool ? mod : mod.default, conn, poolMax: Math.max(4, config.settings.workers * 2), onError });
   await b.open();
   return b;
 }
 
 const firstLine = (r) => (r.stdout || r.stderr).trim().split(/\r?\n/)[0] ?? '';
 
-// What the start and --check look at.  -> { problems, notes, versions }.  backend: an opened backend (its schema is checked) or undefined.
-export async function inspect(config, { backend, run, st = {}, uid = process.getuid?.() } = {}) {
+// What the start and --check look at.  -> { problems, notes, warnings, versions }.  backend: an opened backend (its schema is checked) or undefined.
+export async function inspect(config, { backend, run, st = {}, uid = process.getuid?.(), readFile = fs.readFileSync } = {}) {
   const s = config.settings;
   const problems = validate(config);
   const notes = [];
+  const warnings = [];
   const versions = {};
   let types = null;                         // the record types karidns-zone's change file takes (its own list, planning 8.1)
   let ui = null;                            // the files of the GUI (static.js), read here once and kept by the service
-  if (problems.length) return { problems, notes, versions, types, ui };
+  if (problems.length) return { problems, notes, warnings, versions, types, ui };
 
   const checkFile = (what, file, stat) => {
     const p = checkConninfoFile(file, stat, uid, PROGRAM);
@@ -55,6 +59,10 @@ export async function inspect(config, { backend, run, st = {}, uid = process.get
   };
   if (s.database === 'pg') {
     checkFile('api-conninfo-file', s['api-conninfo-file'], st.api);
+    try {
+      const w = plaintextWarning(parseConninfo(readFile(s['api-conninfo-file'], 'utf8'), PROGRAM));
+      if (w) warnings.push(w);
+    } catch { /* (a file that cannot be read or parsed is a problem the check above or the opening tells) */ }
     checkFile('check-conninfo-file', s['check-conninfo-file'], st.check);
   } else {
     for (const [what, file] of [['sqlite-file', s['sqlite-file']], ['auth-file', s['auth-file']]]) {
@@ -147,7 +155,7 @@ export async function inspect(config, { backend, run, st = {}, uid = process.get
       problems.push(`the database: ${e.message}`);
     }
   }
-  return { problems, notes, versions, types, ui, oidc: providers.list };
+  return { problems, notes, warnings, versions, types, ui, oidc: providers.list };
 }
 
 // The [oidc] sections as the service uses them: the client secret is read from its file (a secret like a connection file: the service user's, mode 0600 or 0400).

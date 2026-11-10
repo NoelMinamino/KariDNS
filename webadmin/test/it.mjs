@@ -127,7 +127,19 @@ const exp = await admin.do('GET', '/datasets/main/zones/example.test/export');
 check('the export (karidns-zone, canonical order)', exp.status === 200 && /^\$ORIGIN example\.test\./m.test(exp.text) && /www/.test(exp.text) && /text\/plain/.test(exp.headers.get('content-type')), () => `${exp.status} ${exp.text.slice(0, 200)}`);
 eq('...a domain master may export, a subdomain master may not, a stranger finds no zone', [(await D.do('GET', '/datasets/main/zones/example.test/export')).status, (await U.do('GET', '/datasets/main/zones/example.test/export')).status, (await N.do('GET', '/datasets/main/zones/example.test/export')).status], [200, 403, 404]);
 
+eq('principals: a global master lists all of them', (await admin.do('GET', '/principals?limit=500')).body.principals.map((p) => p.name).filter((n) => n !== 'admin'), ['dom', 'sub', 'nobody', 'team', 'victim']);
+eq('...a domain master itself and the holders of a grant on its zone, a member only itself and its group (paged by one)', [(await D.do('GET', '/principals')).body.principals.map((p) => p.name), (await N.do('GET', '/principals?limit=1')).body.principals.map((p) => p.name), (await N.do('GET', `/principals?limit=1&cursor=${(await N.do('GET', '/principals?limit=1')).body.next_cursor}`)).body.principals.map((p) => p.name)], [['dom', 'sub'], ['nobody'], ['team']]);
+eq('...anybody else is 404, as is a principal that does not exist', [(await D.do('GET', `/principals/${sub}`)).status, (await N.do('GET', `/principals/${victim}`)).status, (await N.do('GET', '/principals/999999')).status, (await N.do('GET', `/principals/${team}`)).status], [200, 404, 404, 200]);
+eq('...the members of a group: of its own groups only', [(await N.do('GET', `/principals/${team}/members`)).body.members.map((m) => m.name), (await U.do('GET', `/principals/${team}/members`)).status], [['nobody'], 404]);
+eq('policies: all for a global master, those of the own grants for the others', [(await admin.do('GET', '/rr-policies?limit=500')).body.policies.length, (await D.do('GET', '/rr-policies')).body.policies.map((p) => p.name), (await N.do('GET', '/rr-policies')).body.policies.map((p) => p.name)], [4, ['web', 'narrow'], ['web', 'narrow']]);
+eq('...another policy is 404', [(await D.do('GET', `/rr-policies/${wide}`)).status, (await D.do('GET', `/rr-policies/${web}`)).status], [404, 200]);
+
 // ---------------------------------------------------------------------------------------------------------------------------------- escalation
+const dgrp = (await mk('/principals', { kind: 'group', name: 'dgrp' })).principal.id;
+for (const m of [dom, victim]) await admin.do('POST', `/principals/${dgrp}/members`, { body: { member: m } });
+eq('a domain master sees its group, the members of it and the holders on its zone (short form), no stranger', [(await D.do('GET', '/principals')).body.principals.map((p) => p.name), Object.keys((await D.do('GET', `/principals/${victim}`)).body.principal).sort(), (await D.do('GET', `/principals/${nobody}`)).status, (await D.do('GET', `/principals/${dgrp}/members`)).body.members.map((m) => m.name), (await D.do('GET', `/principals/${team}/members`)).status], [['dom', 'sub', 'victim', 'dgrp'], ['display_name', 'id', 'kind', 'name'], 404, ['dom', 'victim'], 404]);
+eq('...and grants to those it sees only', [(await D.do('POST', '/grants', { body: { principal: nobody, role: 'subdomain_master', zone: 'example.test', suffix: 'zz.example.test', policy: narrow } })).status, (await D.do('POST', '/grants', { body: { principal: 999999, role: 'subdomain_master', zone: 'example.test', suffix: 'zz.example.test', policy: narrow } })).status], [404, 404]);
+
 console.log('-- grants: no escalation');
 const g1 = await D.do('POST', '/grants', { body: { principal: victim, role: 'subdomain_master', zone: 'example.test', suffix: 'cust.example.test', policy: narrow } });
 eq('a domain master grants inside its zone with a narrower policy', g1.status, 201);

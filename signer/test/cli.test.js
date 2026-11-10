@@ -116,6 +116,53 @@ test('--check for PostgreSQL: the conninfo file, no karictl', async () => {
   assert.match(bad.problems[0], /mode 0644/);
 });
 
+test('--check and the start: a plain text connection to another host is a warning', async () => {
+  const f = fakeRun({ '/kz': { code: 0, stdout: 'karidns-zone 0.6.0 (drivers: postgresql)\n', stderr: '', spawnError: null } });
+  const pg = parseConfig('database = pg\nconninfo-file = /ci\nwork-dir = /w\nbind-tools = /bt\nkaridns-zone = /kz\nkaricheck = /kc');
+  const st = { isFile: () => true, uid: process.getuid?.() ?? 0, mode: 0o100600 };
+  const warnings = async (text) => (await checkSetup(pg, { run: f.run, st: { work: goodStat, conninfo: st }, readFile: () => text })).warnings;
+  assert.deepEqual(await warnings('host=/tmp dbname=k'), []);
+  assert.deepEqual(await warnings('host=db.example.test sslmode=verify-full'), []);
+  assert.deepEqual(await warnings('host=db.example.test sslmode=allow'), ['the connection to the database at db.example.test is not encrypted (sslmode=allow); use sslmode=require or verify-full']);
+  assert.deepEqual(await warnings('host=db.example.test'), ['the connection to the database at db.example.test is not encrypted (no sslmode); use sslmode=require or verify-full']);
+  assert.deepEqual(await warnings('host=db.example.test nonsense'), []);
+  const o = out();
+  const e = out();
+  const r = await main(['--check'], { stdout: o, stderr: e, deps: { loadConfig: () => pg, checkSetup: async () => ({ problems: [], notes: [], warnings: ['w1'] }) } });
+  assert.equal(r, 0);
+  assert.equal(e.text(), 'warning: w1\n');
+  const warned = [];
+  class FakeClient {
+    on() {}
+
+    async connect() {}
+
+    async end() {}
+
+    async query() { return { rows: [{ ok: true }] }; }
+  }
+  const open = (text, warn) => openDb(pg, { checkConninfo: () => null, importPg: async () => ({ Client: FakeClient }), readFile: () => text, onFatal: () => {}, warn });
+  await (await open('host=192.0.2.5 sslmode=disable', (m) => warned.push(m))).close();
+  await (await open('host=127.0.0.2', (m) => warned.push(m))).close();
+  await (await open('host=192.0.2.5')).close();
+  assert.equal(warned.length, 1);
+  assert.match(warned[0], /at 192\.0\.2\.5 is not encrypted \(sslmode=disable\)/);
+  const log = [];
+  const proc = new EventEmitter();
+  const deps = {
+    loadConfig: () => parseConfig('database = sqlite3\nsqlite-file = /d\nkarictl-config = /k'),
+    createLogger: () => ({ info: (m) => log.push(`info ${m}`), warn: (m) => log.push(`warn ${m}`), error: (m) => log.push(`error ${m}`), close: () => {} }),
+    openDb: async (c, o) => { o.warn('plain'); return fakeDb(log); },
+    checkWorkDir: () => null,
+    wipeStale: () => [],
+  };
+  const p = main([], { proc, deps });
+  while (!log.some((l) => /started/.test(l))) await new Promise((r2) => setTimeout(r2, 5));
+  proc.emit('SIGTERM');
+  assert.equal(await p, 0);
+  assert.ok(log.includes('warn plain'));
+});
+
 test('--check through main: exit status and the output', async () => {
   const o = out();
   const e = out();

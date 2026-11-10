@@ -110,6 +110,7 @@ export async function main(argv, io = {}) {
       await backend?.close();
     }
     for (const n of r.notes) stdout.write(`ok: ${n}\n`);
+    for (const w of r.warnings ?? []) stderr.write(`warning: ${w}\n`);
     for (const p of [...bad.filter((b) => !r.problems.includes(b)), ...r.problems]) stderr.write(`problem: ${p}\n`);
     const fine = r.problems.length === 0 && bad.length === 0;
     stdout.write(fine ? 'karidns-webadmin: the configuration is fine\n' : 'karidns-webadmin: the configuration has problems\n');
@@ -128,7 +129,7 @@ export async function main(argv, io = {}) {
   let key;
   try {
     key = d.loadKeyFile(s['totp-key-file']);
-    backend = await d.openBackend(config, { onError: (e) => log.error(`database connection: ${e.message}`) });
+    backend = await d.openBackend(config, { onError: (e) => log.error(`database connection: ${e.message}`), warn: (m) => log.warn(m) });
   } catch (e) {
     log.error(`cannot start: ${e.message}`);
     log.close();

@@ -943,14 +943,14 @@ try {
     await labelsOk('the grants of a zone');
     eq(await b.exec(() => [...document.querySelectorAll('select[name=policy] option')].map((o) => o.textContent.trim())), ['web'], 'the policies a domain master may give');
     eq(await b.exec(() => [...document.querySelectorAll('select[name=role] option')].map((o) => o.textContent.trim())), ['Domain master', 'Subdomain master'], 'the roles');
-    await fill('principal', 'evil', 'form:has(select[name=role])');
+    await fill('principal', 'sub', 'form:has(select[name=role])');
     await fill('suffix', 'zz.example.test', 'form:has(select[name=role])');
     await click('Give the grant', 'main');
     await b.waitText('main', /The grant was given\./);
     const rows = await b.exec(() => [...document.querySelectorAll('table.grants tbody tr')].map((r) => [...r.children].slice(0, 3).map((c) => c.innerText.trim())));
-    must(rows.some((r) => r[0] === 'evil' && r[1] === 'Subdomain master' && r[2].includes('zz.example.test.')), `the grant is not listed: ${JSON.stringify(rows)}`);
+    must(rows.some((r) => r[0] === 'sub' && r[1] === 'Subdomain master' && r[2].includes('zz.example.test.')), `the grant is not listed: ${JSON.stringify(rows)}`);
     // a grant the service refuses: no more than the policy the person holds is a rule of the service; a zone that is not its own is not found
-    await b.exec(() => { [...document.querySelectorAll('table.grants tbody tr')].find((r) => r.children[0].innerText.trim() === 'evil').querySelector('button').click(); });
+    await b.exec(() => { [...document.querySelectorAll('table.grants tbody tr')].find((r) => r.children[0].innerText.trim() === 'sub' && r.children[2].innerText.includes('zz.example.test')).querySelector('button').click(); });
     await click('Yes', 'table.grants');
     await b.waitText('main', /The grant was removed\./);
     // the versions of its zone, with the marker for what was done outside them

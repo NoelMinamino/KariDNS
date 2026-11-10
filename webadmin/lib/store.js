@@ -37,9 +37,23 @@ export async function getPrincipal(tx, id) {
   return r && principal(r);
 }
 
-export async function listPrincipals(tx, { kind, prefix, after = 0, limit }) {
+// "a grant g on one of these zones" ({ schema, zone } pairs; on SQLite3 the grants have no schema)
+const onZones = (q, tx, zones) => (tx.dialect === 'sqlite'
+  ? q.list(tx, 'g.zone_name', [...new Set(zones.map((z) => z.zone))])
+  : `(${zones.map((z) => `(g.zone_name = ${q.add(z.zone)} AND g.data_schema = ${q.add(z.schema)})`).join(' OR ')})`);
+
+// scope: undefined = all; else { ids, groups, zones }: the principals with these ids, the members of these groups (directly or through groups), and the holders of a
+// grant on one of these zones ({ schema, zone }); see perm.js principalsScope.  id: only this one (to ask whether it is in the scope).
+export async function listPrincipals(tx, { kind, prefix, scope, id, after = 0, limit }) {
   const q = new Q();
   const w = [`p.id > ${q.add(after)}`];
+  if (id !== undefined) w.push(`p.id = ${q.add(id)}`);
+  if (scope) {
+    const any = [q.list(tx, 'p.id', scope.ids, 'bigint')];
+    if (scope.groups?.length) any.push(`p.id IN (SELECT c.member_id FROM ${tx.A}principal_closure c WHERE ${q.list(tx, 'c.group_id', scope.groups, 'bigint')})`);
+    if (scope.zones?.length) any.push(`EXISTS (SELECT 1 FROM ${tx.A}grants g WHERE g.principal_id = p.id AND ${onZones(q, tx, scope.zones)})`);
+    w.push(`(${any.join(' OR ')})`);
+  }
   if (kind) w.push(`p.kind = ${q.add(kind)}`);
   if (prefix) w.push(`substr(lower(p.name), 1, ${prefix.length}) = ${q.add(prefix.toLowerCase())}`);
   return (await tx.all(`SELECT ${PCOLS} FROM ${tx.A}principals p WHERE ${w.join(' AND ')} ORDER BY p.id LIMIT ${q.add(limit + 1)}`, q.params)).map(principal);
@@ -189,6 +203,12 @@ export async function listPolicies(tx, { ids, after = 0, limit = 100000 } = {}) 
     }
   }
   return rows.map((r) => policy(r, types.get(r.id) ?? []));
+}
+
+// the ids of the policies used by the grants on these zones ({ schema, zone } pairs)
+export async function policyIdsOnZones(tx, zones) {
+  const q = new Q();
+  return (await tx.all(`SELECT DISTINCT g.rr_policy_id AS id FROM ${tx.A}grants g WHERE ${onZones(q, tx, zones)}`, q.params)).map((r) => r.id);
 }
 
 export async function getPolicy(tx, id) {

@@ -55,7 +55,7 @@ Lines of `key = value`; `#` starts a comment (in a value, after white space); a 
 | Key | Default | Meaning |
 |---|---|---|
 | `database` | (required) | `pg` or `sqlite3`. |
-| `conninfo-file` | | `pg`: the file with the connection string of the signer's role. A regular file (no link) owned by the user the signer runs as, mode `0600` or `0400` (checked like the loader checks its own). Keywords: `host`, `port`, `dbname`, `user`, `password`, `sslmode`, `connect_timeout`, `application_name`; another keyword is refused. |
+| `conninfo-file` | | `pg`: the file with the connection string of the signer's role. A regular file (no link) owned by the user the signer runs as, mode `0600` or `0400` (checked like the loader checks its own). Keywords: `host`, `port`, `dbname`, `user`, `password`, `sslmode`, `connect_timeout`, `application_name`; another keyword is refused. The Node driver has no opportunistic TLS: `sslmode=disable`, `allow`, `prefer` and no `sslmode` all mean plain text. For a host that is not local (a Unix socket directory, `localhost`, `127.0.0.0/8` and `::1` are local) without `require`, `verify-ca` or `verify-full`, `--check` prints `warning: the connection to the database at HOST is not encrypted (sslmode=X); use sslmode=require or verify-full` and the start logs it; it is a warning, not a refusal. |
 | `schema` | the role's `search_path` | `pg`: the schema of the PowerDNS and `karidns_*` tables. |
 | `sqlite-file` | | `sqlite3`: the database file. The user needs write access to the file **and its directory** (`<file>.signer.lock` is created there, WAL files too). |
 | `karictl-config` | | `sqlite3`: the `karictl` configuration of the restricted key that asks the server to reload a zone (below). Required for `sqlite3`. |
