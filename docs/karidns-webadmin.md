@@ -85,7 +85,7 @@ host=db.example.test port=5432 dbname=karidns user=karidns_web password=... sslm
 # /usr/local/etc/karidns/check.conninfo (the same, user=karidns_webck)
 ```
 
-Use a UNIX socket (`host=/tmp`) or `sslmode=verify-full` for a remote database. The keywords understood are `host`, `port`, `dbname`, `user`, `password`, `sslmode`, `connect_timeout` and `application_name`; any other is an error. **`sslmode=prefer` and `allow` do not try TLS** (the Node driver has no opportunistic mode): they mean plain text. Use `require` (encrypted, the certificate not checked), `verify-ca` or `verify-full`.
+Use a UNIX socket (`host=/tmp`) or `sslmode=verify-full` for a remote database. The keywords understood are `host`, `port`, `dbname`, `user`, `password`, `sslmode`, `connect_timeout` and `application_name`; any other is an error. **`sslmode=prefer` and `allow` do not try TLS** (the Node driver has no opportunistic mode): they mean plain text (so does no `sslmode` at all). Use `require` (encrypted, the certificate not checked), `verify-ca` or `verify-full`. When `api-conninfo-file` names a host that is not local (a Unix socket directory, `localhost`, `127.0.0.0/8` and `::1` are local) and the `sslmode` is not `require`, `verify-ca` or `verify-full`, `--check` prints `warning: the connection to the database at HOST is not encrypted (sslmode=X); use sslmode=require or verify-full` and the start writes the same warning to the log. It is a warning, not a refusal.
 
 Several data schemas (views with their own zone data): run the role scripts once per schema and list the schemas in `[dataset NAME]` sections of the configuration ([API reference](karidns-api.md), "Configuration file").
 
@@ -174,6 +174,8 @@ curl -s -b jar -c jar -H 'Content-Type: application/json' -H "Origin: $O" -H 'X-
 #  -> a new session (the jar is updated) and a new csrf token: from now on the login needs "totp"
 ```
 
+**Keep the clock of the server right (`ntpd`).** A TOTP code is accepted for the 30-second step it belongs to and one step before or after, so a server clock more than about 30 seconds off refuses every correct code, at the login and at the confirm step above (a trial with a server clock 118 s fast: every code failed). The same holds for sign-in with an identity provider (below).
+
 An unsafe request (POST, PUT, PATCH, DELETE) with a session cookie needs the `X-KariDNS-CSRF` header **and** an `Origin` equal to `public-origin`, and `Content-Type: application/json`. Automation should not use the cookie: make an **API token** (`POST /api/v1/tokens`, a login session is needed to make it) and send `Authorization: Bearer kdt_...`; a token needs no CSRF header, can be read-only, and expires (90 days by default, 365 at most).
 
 Then make the real users and grants ([API reference](karidns-api.md), "Permissions"): groups for the tenants, users in them, record policies (`POST /api/v1/rr-policies`), grants (`POST /api/v1/grants`: `domain_master` on a zone, `subdomain_master` on a name below it). A domain master can grant on its own zone, with a policy no wider than its own, without a global master.
@@ -232,7 +234,7 @@ relay "webadmin_tls" {
 }
 ```
 
-(Neither proxy configuration is run by KariDNS's tests; check the syntax against your version. What the service needs from the proxy is only: TLS, the paths `/api/`, `/ui/` and `/` forwarded (`/` and `/ui/` only with the web interface, unless `ui = no`), `X-Forwarded-For` set to the client's address, bodies up to 16 MiB, and a read timeout longer than 300 seconds for imports.)
+(Neither proxy configuration is run by KariDNS's tests; check the syntax against your version. The relayd example could not be run when this was written: the package `relayd` of FreeBSD 15.1 does not start on a 15.0 userland, so it is untested even for syntax. `relayd -n -f /usr/local/etc/relayd.conf` checks it; the TLS relay also needs its certificate and key (see `tls keypair` in relayd.conf(5) for where it looks for them). What the service needs from the proxy is only: TLS, the paths `/api/`, `/ui/` and `/` forwarded (`/` and `/ui/` only with the web interface, unless `ui = no`), `X-Forwarded-For` set to the client's address, bodies up to 16 MiB, and a read timeout longer than 300 seconds for imports.)
 
 ### The built-in TLS
 
@@ -464,6 +466,7 @@ Zone of 1,000 records, one page of 500: 5 to 7 ms (SQLite3), 8 to 17 ms (Postgre
 | login: 403 `csrf` | the `Origin` header is not exactly `public-origin` (scheme, host, port) | fix `public-origin` or the proxy's host name |
 | login: 429 | five logins a minute per address or per name; behind a proxy without `trusted-proxy` every client is one address | set `trusted-proxy` |
 | a write: 403 `csrf` | the cookie request lacks `X-KariDNS-CSRF` or `Origin` | send both (the token is in the login answer and in `GET /auth/me`), or use a token |
+| every TOTP code is refused (login 401, or the confirm step of the enrolment) although the app shows the right one | the clock of the server is more than about 30 s off: a code is accepted for its own 30 s step and one step either side (RFC 6238, section 5.2) | set the clock right (`ntpd`, `ntpdate -b`), then try again; the clock of the phone matters less than the server's |
 | a write: 403 `totp-required` | a global master's session before its TOTP step | enrol and confirm ([The first login](#totp-the-first-login)) |
 | 500 `internal` | a bug or a broken installation; the body has only the request id | find the id in the log |
 | 503 `busy` | the pool of tool runs is full (`workers` + 64), or the database is busy (SQLite3 `busy_timeout` 5 s) | retry; raise `workers` |

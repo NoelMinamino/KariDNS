@@ -127,6 +127,8 @@ Section *DNSSEC* (domain and global masters) shows how the zone is signed: kept 
 - **Signing in** (on the page of a user): whether a password is set, whether two-step verification is on, the failed attempts and the lock. **Unlock the account** clears the attempts and the lock; **Reset two-step verification** is for a user who lost the device: it is switched off and the user's sessions end (where the configuration requires it, the user enrols again at the next sign-in). You cannot reset your own: switch it off from your account, or ask another global master. *New password* sets a password and ends the user's sessions. Each of these asks first.
 - **Identity at a provider**: *Link the identity* ties the user to an issuer and a **subject** (the `sub` of the ID token). Nobody is made by a sign-in, and an unlinked identity is refused. When a sign-in is refused because nobody is linked, the subject is in the service's log. Linking another identity, or removing the link, signs the user out.
 - **Member of / Members**: a user is in groups; a group has members, added by exact name (groups nest) and removed after a question. Members have the grants of the group.
+
+On the grants page of a zone, a domain master finds the user or group to give a grant to by its exact name, but only among the principals it can see: itself, its groups and their members, and those who already hold a grant on this zone (a holder of another of its zones is not enough). For anybody else the page says "No user or group has this name"; a global master adds the new person to one of the domain master's groups or gives it a grant first.
 - **Record policies**: which types, whether wildcards, delegations, DNAME and the apex are allowed, the TTL range and the most records. A policy that is in use cannot be deleted.
 - **Grants**: a grant gives a user or group a role (domain master or subdomain master on a zone, with a suffix for the latter; global master) with a record policy. The page lists all grants with a filter by user and by zone; removing a grant asks first.
 
@@ -158,7 +160,7 @@ The messages of the service are in the language of the page. The text is the pag
 
 | Message | What it means, and what to do |
 |---|---|
-| `The user name, the password or the code is wrong.` | One message for every refusal. Check the name, the password and the code (a code is good once; wait for the next one). A disabled or locked account looks the same: ask a global master. |
+| `The user name, the password or the code is wrong.` | One message for every refusal. Check the name, the password and the code (a code is good once; wait for the next one). A disabled or locked account looks the same: ask a global master. Every code refused although the app shows the right one: the clock of the server is more than about 30 seconds off (a code is accepted one 30-second step either side); the page cannot tell this from a wrong code, so tell the operator (the server clock must be right, `ntpd`). |
 | `Too many requests. Wait a moment and try again.` | A rate limit. The button counts down. If it keeps happening, something else is also using your account. |
 | `You are not signed in.` | The session ended. The sign-in opens over the page; sign in and go on. |
 | `The request was refused as unsafe. Reload the page and try again.` | The page and the session did not match (a session replaced in another tab). Reload. |

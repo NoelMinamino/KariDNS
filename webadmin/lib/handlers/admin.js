@@ -1,12 +1,19 @@
-// /principals, /rr-policies, /grants: users, groups, memberships, record policies and grants (planning 3.3, 4).  Everyone who is logged in may read; changing is for
-// global masters, except grants, which a domain master may make inside its zone with a policy no wider than its own (no escalation, rule 2 of the plan).
+// /principals, /rr-policies, /grants: users, groups, memberships, record policies and grants (planning 3.3, 4).  Changing is for global masters, except grants, which a
+// domain master may make inside its zone with a policy no wider than its own (no escalation, rule 2 of the plan).  Reading (0.6.0):
+//   a global master reads everything;
+//   a domain master (a domain_master grant on some zone, Z = those zones) sees itself and its groups (directly or through groups) in full, and in the short form (id, kind,
+//     name, display_name) the members of those groups and every principal holding a grant on a zone of Z; and the policies of its own grants, of the grants on Z and those it
+//     could use for a new grant (no wider than its own: mayGrant); it grants only to the principals it sees (any other is 404, as if it did not exist);
+//   everyone else sees itself and the groups it is in, and the policies of its own grants;
+//   anything outside that is a 404, so that nothing is told about whether it exists (perm.js principalsScope / policiesScope decide which rule applies).
+// The filter is part of the SQL (store.js), so that a page is never short or empty because rows were dropped after the paging.
 
 import { ApiError, badRequest, forbidden, notFound, conflict } from '../errors.js';
 import { shape, query, LIMIT, CURSOR } from '../validate.js';
 import * as S from '../store.js';
 import { hashPassword } from '../crypto.js';
 import { reply } from '../http.js';
-import { isGlobal, zoneGrant, maySetGrant } from '../perm.js';
+import { isGlobal, zoneGrant, maySetGrant, mayGrant, principalsScope, policiesScope, domainZones } from '../perm.js';
 import { canonicalZone, canonicalOwner, inZone, absolute } from '../names.js';
 import { requireGlobal, idParam, idCursor, page, clean } from './common.js';
 import { checkPassword, principalView, policyView } from './auth.js';
@@ -15,12 +22,36 @@ const PASSWORD = { type: 'string', min: 12, max: 1024, noControl: false };
 const ID = { type: 'int', min: 1, max: 999999999999999 };
 
 // ---------------------------------------------------------------------------------------------------------------------------------- principals
+// what a principal sees of a member of one of its groups that is neither itself nor one of its groups (principalsScope decides who sees more)
+const reducedView = (p) => ({ id: p.id, kind: p.kind, name: p.name, display_name: p.display_name });
+
+// -> { global, own, scope }.  own = the ids of the principal itself and of the groups it is in (directly or through groups), whom it sees in full; scope = the part for
+// the SQL of S.listPrincipals (principalsScope in perm.js decides), undefined for a global master (everything)
+async function reach(ctx, tx) {
+  const kind = principalsScope(ctx.auth.grants);
+  if (kind === 'all') return { global: true, own: null, scope: undefined };
+  const self = ctx.auth.principal.id;
+  const groups = (await S.groupsOf(tx, self)).map((g) => g.id);
+  const own = new Set([self, ...groups]);
+  return { global: false, own, scope: { ids: [...own], groups: kind === 'domain' ? groups : [], zones: kind === 'domain' ? domainZones(ctx.auth.grants) : [] } };
+}
+
+// may the principal see this one at all?  (the same condition as the list)
+async function canSeePrincipal(tx, reached, id) {
+  if (reached.global || reached.own.has(id)) return true;
+  return (await S.listPrincipals(tx, { id, scope: reached.scope, after: 0, limit: 1 })).length > 0;
+}
+const viewIn = (r, p) => (r.global || r.own.has(p.id) ? principalView(p) : reducedView(p));
+
 export async function principalsList(ctx) {
   const q = query(ctx.query, { limit: LIMIT, cursor: CURSOR, kind: { type: 'string', values: ['user', 'group'] }, prefix: { type: 'string', min: 1, max: 64 } });
   const limit = q.limit ?? 100;
-  const rows = await ctx.db((tx) => S.listPrincipals(tx, { kind: q.kind, prefix: q.prefix, after: idCursor(q.cursor), limit }));
-  const p = page(rows, limit, (r) => ({ i: r.id }));
-  return { principals: p.items.map(principalView), next_cursor: p.next_cursor };
+  const { r, rows } = await ctx.db(async (tx) => {
+    const reached = await reach(ctx, tx);
+    return { r: reached, rows: await S.listPrincipals(tx, { kind: q.kind, prefix: q.prefix, scope: reached.scope, after: idCursor(q.cursor), limit }) };
+  });
+  const p = page(rows, limit, (x) => ({ i: x.id }));
+  return { principals: p.items.map((x) => viewIn(r, x)), next_cursor: p.next_cursor };
 }
 
 export async function principalCreate(ctx) {
@@ -61,11 +92,14 @@ export async function principalGet(ctx) {
   const id = idParam(ctx);
   const self = id === ctx.auth.principal.id;
   const r = await ctx.db(async (tx) => {
+    const reached = await reach(ctx, tx);
     const p = await S.getPrincipal(tx, id);
-    if (!p) return null;
-    return { p, groups: await S.groupsOf(tx, id), creds: isGlobal(ctx.auth.grants) || self ? ((await S.getCredentials(tx, id)) ?? null) : undefined };
+    if (!p || !(await canSeePrincipal(tx, reached, id))) return null;
+    if (!reached.global && !reached.own.has(id)) return { p, reduced: true };
+    return { p, groups: await S.groupsOf(tx, id), creds: reached.global || self ? ((await S.getCredentials(tx, id)) ?? null) : undefined };
   });
   if (!r) throw notFound('no such principal');
+  if (r.reduced) return { principal: reducedView(r.p) };
   const out = { principal: { ...principalView(r.p), created_at: r.p.created_at, created_by: r.p.created_by }, groups: r.groups };
   if (r.creds !== undefined) out.credentials = credentialsView(r.creds, ctx.app.now(), ctx.app);
   return out;
@@ -201,10 +235,12 @@ async function groupOf(ctx, tx) {
 
 export async function membersList(ctx) {
   const r = await ctx.db(async (tx) => {
+    const reached = await reach(ctx, tx);
+    if (!(await canSeePrincipal(tx, reached, idParam(ctx)))) throw notFound('no such principal');       // (a group it does not see: it is not told whether it exists)
     const g = await groupOf(ctx, tx);
-    return { group: g, members: await S.membersOf(tx, g.id) };
+    return { reached, group: g, members: await S.membersOf(tx, g.id) };
   });
-  return { group: principalView(r.group), members: r.members.map(principalView) };
+  return { group: viewIn(r.reached, r.group), members: r.members.map((m) => viewIn(r.reached, m)) };
 }
 
 export async function memberAdd(ctx) {
@@ -255,13 +291,31 @@ function policyTypes(list) {
 export async function policiesList(ctx) {
   const q = query(ctx.query, { limit: LIMIT, cursor: CURSOR });
   const limit = q.limit ?? 100;
-  const rows = await ctx.db((tx) => S.listPolicies(tx, { after: idCursor(q.cursor), limit: limit + 1 }));
+  const rows = await ctx.db(async (tx) => S.listPolicies(tx, { ids: await visiblePolicies(ctx, tx), after: idCursor(q.cursor), limit: limit + 1 }));
   const p = page(rows, limit, (r) => ({ i: r.id }));
   return { policies: p.items.map(policyView), next_cursor: p.next_cursor };
 }
 
+// undefined = all policies (policiesScope); else the ids of the policies of the principal's own grants and, for a domain master, of the grants on its zones and of the
+// policies it could use for a new grant in them (what the grant form offers: mayGrant, the same test the creation applies)
+async function visiblePolicies(ctx, tx) {
+  const grants = ctx.auth.grants;
+  const kind = policiesScope(grants);
+  if (kind === 'all') return undefined;
+  const ids = new Set(grants.map((g) => g.policy?.id).filter((i) => i !== undefined));
+  if (kind === 'domain') {
+    for (const i of await S.policyIdsOnZones(tx, domainZones(grants))) ids.add(i);
+    for (const p of await S.listPolicies(tx)) if (!ids.has(p.id) && grants.some((g) => g.role === 'domain_master' && mayGrant(grants, { role: 'subdomain_master', schema: g.data_schema, zone: g.zone_name, policy: p }))) ids.add(p.id);
+  }
+  return [...ids];
+}
+
 export async function policyGet(ctx) {
-  const p = await ctx.db((tx) => S.getPolicy(tx, idParam(ctx)));
+  const id = idParam(ctx);
+  const p = await ctx.db(async (tx) => {
+    const ids = await visiblePolicies(ctx, tx);
+    return ids && !ids.includes(id) ? undefined : S.getPolicy(tx, id);
+  });
   if (!p) throw notFound('no such policy');
   return { policy: policyView(p) };
 }
@@ -376,6 +430,11 @@ export async function grantCreate(ctx) {
     if (!maySetGrant(auth.grants, { role: body.role, schema: ds ? ds.schema : null, zone, policy: pol })) {
       throw forbidden('you may only grant on a zone you are domain master of, with a policy no wider than your own (a global master may grant anything)', 'escalation');
     }
+    // A domain master grants only to the principals it sees FOR THIS ZONE: itself, its groups and their members, and the holders of a grant on this zone (not
+    // those of its other zones: a master of several zones keeps them apart; decided 2026-11-10).  maySetGrant above made sure it is domain master of this zone.
+    const reached = await reach(ctx, tx);
+    if (!reached.global) reached.scope = { ...reached.scope, zones: [{ schema: ds.schema, zone }] };
+    if (!(await canSeePrincipal(tx, reached, body.principal))) throw notFound('no such principal');
     return S.createGrant(tx, { principalId: body.principal, role: body.role, schema: ds ? ds.schema : null, zone, suffix, policyId: body.policy, grantedBy: auth.principal.id });
   }, { write: true });
   return reply(201, { grant: gview(app, await ctx.db((tx) => S.getGrant(tx, id))) });

@@ -63,6 +63,16 @@ test('the sign-in with a provider on PostgreSQL goes through the functions of th
   assert.match(tx.log.at(-1)[0], /^UPDATE karidns_auth\.credentials SET oidc_issuer = \$2, oidc_subject = \$3 WHERE principal_id = \$1$/);
 });
 
+test('principals and policies in the reach of a domain master: the zones are (schema, zone) pairs', async () => {
+  const zones = [{ schema: 'karidns_a', zone: 'example.test' }, { schema: 'karidns_b', zone: 'other.test' }];
+  const tx = fakeTx([[/FROM karidns_auth.principals p/, [{ id: 5, kind: 'user', name: 'u', disabled: false }]], [/SELECT DISTINCT g.rr_policy_id/, [{ id: 8 }]]]);
+  assert.equal((await S.listPrincipals(tx, { scope: { ids: [1], groups: [2], zones }, limit: 10 })).length, 1);
+  assert.match(tx.log[0][0], /\(p\.id = ANY\(\$2::bigint\[\]\) OR p\.id IN \(SELECT c\.member_id FROM karidns_auth\.principal_closure c WHERE c\.group_id = ANY\(\$3::bigint\[\]\)\) OR EXISTS \(SELECT 1 FROM karidns_auth\.grants g WHERE g\.principal_id = p\.id AND \(\(g\.zone_name = \$4 AND g\.data_schema = \$5\) OR \(g\.zone_name = \$6 AND g\.data_schema = \$7\)\)\)\)/);
+  assert.deepEqual(tx.log[0][1], [0, [1], [2], 'example.test', 'karidns_a', 'other.test', 'karidns_b', 11]);
+  assert.deepEqual(await S.policyIdsOnZones(tx, zones), [8]);
+  assert.match(tx.log[1][0], /^SELECT DISTINCT g\.rr_policy_id AS id FROM karidns_auth\.grants g WHERE \(\(g\.zone_name = \$1 AND g\.data_schema = \$2\) OR /);
+});
+
 test('policies: the types are an array column', async () => {
   const tx = fakeTx([[/FROM karidns_auth.rr_policies/, [{ id: 3, name: 'web', allow_wildcard: false, allow_delegation: false, allow_dname: false, apex_editable: false, ttl_min: 60, ttl_max: 86400, max_rr: null, allowed_types: ['A', 'TXT'] }]]]);
   const p = (await S.listPolicies(tx, { ids: [3] }))[0];

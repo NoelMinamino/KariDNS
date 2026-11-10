@@ -133,7 +133,7 @@ function fakes(over = {}) {
     loadConfig: () => goodConfig(),
     createLogger: () => log,
     loadKeyFile: () => Buffer.alloc(32, 1),
-    openBackend: async (c, o) => { captured.onError = o?.onError; return backend; },
+    openBackend: async (c, o) => { captured.onError = o?.onError; captured.warn = o?.warn; return backend; },
     inspect: async () => ({ problems: [], notes: [], versions: { karicheck: 'karicheck 0.6.0' } }),
     listen: async (app) => { events.push(['listen', app.versions.karicheck]); return server; },
     ...over,
@@ -150,9 +150,11 @@ test('the server: starts, sweeps the sessions, reads the configuration on SIGHUP
   assert.equal(f.proc.listenerCount('SIGHUP'), 1);
   f.proc.emit('SIGHUP');
   f.captured.onError(new Error('connection lost'));
+  f.captured.warn('the connection to the database at db.example.test is not encrypted');
   f.proc.emit('SIGINT');
   assert.equal(await p, 0);
   assert.ok(f.log.lines.includes('error database connection: connection lost'));
+  assert.ok(f.log.lines.includes('warn the connection to the database at db.example.test is not encrypted'));
   assert.deepEqual(f.events.filter((e) => e[0] !== 'tx'), [['listen', 'karicheck 0.6.0'], ['server closed'], ['backend closed']]);
   assert.ok(f.events.some((e) => e[0] === 'tx' && e[1] === true), 'the expired sessions of the SQLite3 file are deleted at the start');
   assert.ok(f.log.lines.some((l) => /karidns-webadmin 0\.6\.0 started \(sqlite3, listening on 127\.0\.0\.1:8053\)/.test(l)));
@@ -257,6 +259,35 @@ test('openBackend: SQLite3 opens the files, PostgreSQL checks the connection fil
   await b.close();
   await openBackend(cfg, { conninfoFile: '/owner.ci', checkConninfo: () => null, importPg: async () => ({ Pool, types: { getTypeParser: () => null } }), readFile: (f) => { seen.file = f; return 'user=owner'; } });
   assert.equal(seen.file, '/owner.ci');
+});
+
+test('a plain text connection to another host: a warning at the opening and in inspect', async () => {
+  const cfg = parseConfig('listen = 127.0.0.1:8053\npublic-origin = http://127.0.0.1:8053\ndatabase = pg\napi-conninfo-file = /api.ci\ncheck-conninfo-file = /chk.ci\n');
+  class Pool {
+    on() {}
+
+    async query() { return { rows: [] }; }
+
+    async end() {}
+  }
+  const importPg = async () => ({ Pool, types: { getTypeParser: () => null } });
+  const warned = [];
+  for (const [text, want] of [['host=/tmp', 0], ['host=localhost', 0], ['host=db.example.test sslmode=verify-full', 0], ['host=db.example.test', 1], ['host=192.0.2.5 sslmode=prefer', 1]]) {
+    warned.length = 0;
+    await (await openBackend(cfg, { checkConninfo: () => null, importPg, readFile: () => text, warn: (m) => warned.push(m) })).close();
+    assert.equal(warned.length, want, text);
+  }
+  assert.match(warned[0], /^the connection to the database at 192\.0\.2\.5 is not encrypted \(sslmode=prefer\); use sslmode=require or verify-full$/);
+  await (await openBackend(cfg, { checkConninfo: () => null, importPg, readFile: () => 'host=db.example.test' })).close();     // (no warn callback: fine)
+  const file = { isFile: () => true, uid: 1000, mode: 0o100600 };
+  const seen = async (text) => (await inspect(cfg, { run: okRun(), uid: undefined, st: { api: file, check: file }, readFile: () => text })).warnings;
+  assert.deepEqual(await seen('host=/tmp'), []);
+  assert.deepEqual(await seen('host=db.example.test sslmode=disable'), ['the connection to the database at db.example.test is not encrypted (sslmode=disable); use sslmode=require or verify-full']);
+  assert.deepEqual(await seen('host=db.example.test password'), [], 'a file that does not parse: no warning, the opening tells');
+  assert.deepEqual((await inspect(cfg, { run: okRun(), uid: undefined, st: { api: file, check: file }, readFile: () => { throw new Error('ENOENT'); } })).warnings, []);
+  const r = await run(['--check'], { loadConfig: () => goodConfig(), openBackend: async () => ({ close: async () => {} }), inspect: async () => ({ problems: [], notes: [], warnings: ['w1'], versions: {} }) });
+  assert.equal(r.status, 0);
+  assert.match(r.err, /^warning: w1\n/);
 });
 
 const okRun = (over = {}) => async (file, argv) => {

@@ -84,6 +84,23 @@ export function zoneGrant(grants, schema, zone) {
 
 export const isGlobal = (grants) => grants.some((g) => g.role === 'global_master');
 
+// Which principals and which policies may the principal read (GET /principals, /principals/:id, its members, GET /rr-policies, /rr-policies/:id), and whom may it
+// grant to?  'all' (a global master), 'domain' (it holds a domain_master grant, Z = the zones of those grants), or 'own':
+//   principals  own: itself and the groups it is in (directly or through groups).  domain: those, the members of those groups, and every principal holding a grant on a
+//               zone of Z (any role, any suffix); the others in the reduced view (id, kind, name, display_name).
+//   policies    own: those of its own grants.  domain: those, those of the grants on the zones of Z, and those it could use for a new grant (policySubset of the policy of one
+//               of its domain_master grants: mayGrant).
+// This is the one place that decides which scope applies.
+export const principalsScope = (grants) => (isGlobal(grants) ? 'all' : grants.some((g) => g.role === 'domain_master') ? 'domain' : 'own');
+export const policiesScope = principalsScope;
+
+// the zones ({ schema, zone }) the principal is domain master of
+export function domainZones(grants) {
+  const seen = new Map();
+  for (const g of grants) if (g.role === 'domain_master') seen.set(`${g.data_schema}\0${g.zone_name}`, { schema: g.data_schema, zone: g.zone_name });
+  return [...seen.values()];
+}
+
 // The grants that apply to one zone (a global master's included), strongest first
 export function grantsOn(grants, schema, zone) {
   const z = zone.toLowerCase();

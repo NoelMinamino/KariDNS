@@ -12,7 +12,7 @@ import { signZone } from './pipeline.js';
 import { SqliteDb } from './db_sqlite.js';
 import { loadSqlite } from '../../node/lib/sqlite.js';
 import { PgDb } from './db_pg.js';
-import { parseConninfo } from '../../node/lib/conf.js';
+import { parseConninfo, plaintextWarning } from '../../node/lib/conf.js';
 import { packageVersion } from '../../node/lib/version.js';
 
 export const VERSION = packageVersion(new URL('../package.json', import.meta.url));
@@ -53,12 +53,13 @@ export function parseArgs(argv) {
   return o;
 }
 
-// --check: the permissions of the files and the tools' versions.  Returns { problems, notes }.
-export async function checkSetup(config, { run = runChild, st = {}, nodeVersion = process.versions.node } = {}) {
+// --check: the permissions of the files and the tools' versions.  Returns { problems, notes, warnings }.
+export async function checkSetup(config, { run = runChild, st = {}, nodeVersion = process.versions.node, readFile = fs.readFileSync } = {}) {
   const s = config.settings;
   const problems = validate(config);
   const notes = [];
-  if (problems.length) return { problems, notes };
+  const warnings = [];
+  if (problems.length) return { problems, notes, warnings };
   const t = tools(s);
   const wd = checkWorkDir(s['work-dir'], st.work);
   if (wd) problems.push(wd);
@@ -66,7 +67,13 @@ export async function checkSetup(config, { run = runChild, st = {}, nodeVersion 
   if (s.database === 'pg') {
     const c = checkConninfoFile(s['conninfo-file'], st.conninfo);
     if (c) problems.push(c);
-    else notes.push(`conninfo-file ${s['conninfo-file']}: fine`);
+    else {
+      notes.push(`conninfo-file ${s['conninfo-file']}: fine`);
+      try {
+        const w = plaintextWarning(parseConninfo(readFile(s['conninfo-file'], 'utf8'), 'karidns-signer'));
+        if (w) warnings.push(w);
+      } catch { /* (a file that cannot be read or parsed is the start's problem to tell) */ }
+    }
   } else {
     if ((nodeVersion.split('.').map(Number)[0] ?? 0) < 22) problems.push(`database = sqlite3 needs Node 22.13 or newer (this is ${nodeVersion})`);
     try {
@@ -93,10 +100,10 @@ export async function checkSetup(config, { run = runChild, st = {}, nodeVersion 
       if (!out.includes(want)) problems.push(`karidns-zone has no ${want} driver (${clip(out, 120)})`);
     }
   }
-  return { problems, notes };
+  return { problems, notes, warnings };
 }
 
-export async function openDb(config, { onFatal, importPg, importSqlite = loadSqlite, readFile = fs.readFileSync, checkConninfo = checkConninfoFile } = {}) {
+export async function openDb(config, { onFatal, warn, importPg, importSqlite = loadSqlite, readFile = fs.readFileSync, checkConninfo = checkConninfoFile } = {}) {
   const s = config.settings;
   let db;
   if (s.database === 'sqlite3') {
@@ -107,7 +114,10 @@ export async function openDb(config, { onFatal, importPg, importSqlite = loadSql
     if (problem) throw new Error(problem);
     const pg = await (importPg ? importPg() : import('pg'));
     const Client = pg.Client ?? pg.default.Client;
-    db = new PgDb({ Client, conn: parseConninfo(readFile(s['conninfo-file'], 'utf8'), 'karidns-signer'), schema: s.schema, onFatal });
+    const conn = parseConninfo(readFile(s['conninfo-file'], 'utf8'), 'karidns-signer');
+    const w = plaintextWarning(conn);
+    if (w) warn?.(w);
+    db = new PgDb({ Client, conn, schema: s.schema, onFatal });
     await db.open();
   }
   return db;
@@ -133,8 +143,9 @@ export async function main(argv, io = {}) {
     return 1;
   }
   if (opts.check) {
-    const { problems, notes } = await (deps.checkSetup ?? checkSetup)(config);
+    const { problems, notes, warnings = [] } = await (deps.checkSetup ?? checkSetup)(config);
     for (const n of notes) stdout.write(`ok: ${n}\n`);
+    for (const w of warnings) stderr.write(`warning: ${w}\n`);
     for (const p of problems) stderr.write(`problem: ${p}\n`);
     stdout.write(problems.length ? 'karidns-signer: the configuration has problems\n' : 'karidns-signer: the configuration is fine\n');
     return problems.length ? 1 : 0;
@@ -159,7 +170,7 @@ export async function main(argv, io = {}) {
   };
   let db;
   try {
-    db = await (deps.openDb ?? openDb)(config, { onFatal: fatal });
+    db = await (deps.openDb ?? openDb)(config, { onFatal: fatal, warn: (m) => log.warn(m) });
   } catch (e) {
     log.error(`cannot open the database: ${e.message}`);
     log.close();

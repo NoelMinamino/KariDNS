@@ -245,7 +245,7 @@ test('history, templates, administration and audit against the API: every reques
     await dom.go('#/zones/main/example.test./grants');
     assert.deepEqual(dom.errors(), []);
     assert.deepEqual(dom.input('policy').children.map((o) => o.textContent), ['web'], 'only the policy no wider than its own');
-    dom.type(dom.input('principal'), 'sub');
+    dom.type(dom.input('principal'), 'sub');
     dom.type(dom.input('suffix'), 'x.example.test');
     await dom.submit(dom.q('form.stack'));
     assert.deepEqual(dom.errors(), []);

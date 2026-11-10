@@ -114,7 +114,18 @@ export function parseConninfo(text, program = 'karidns') {
         throw new Error(`conninfo: the keyword '${k}' is not supported by ${program} (host, port, dbname, user, password, sslmode, connect_timeout, application_name are)`);
     }
   }
+  Object.defineProperty(cfg, 'sslmode', { value: out.sslmode ?? '', enumerable: false });   // (for plaintextWarning; not an option of pg)
   return cfg;
+}
+
+// pg has no fallback negotiation: sslmode disable, allow, prefer and none all mean no TLS at all.  -> a warning when that is a connection to another host, else null.
+// Local: no host, a Unix socket directory, localhost, 127.0.0.0/8, ::1.
+export function plaintextWarning(conn) {
+  if (conn.ssl) return null;
+  const host = conn.host ?? '';
+  if (host === '' || host.startsWith('/') || host.toLowerCase() === 'localhost' || /^127(\.\d{1,3}){3}$/.test(host) || host === '::1' || host === '[::1]') return null;
+  const mode = conn.sslmode;
+  return `the connection to the database at ${host} is not encrypted (${mode ? `sslmode=${mode}` : 'no sslmode'}); use sslmode=require or verify-full`;
 }
 
 // The check karidns-zone and the loader apply to a conninfo file: a regular file (no symbolic link) owned by the user running us, mode 0600 or 0400.

@@ -90,7 +90,8 @@ karidns_signer_prestart()
     ulimit -c 0
     karidns_signer_dirs || return 1
     if checkyesno karidns_signer_tmpfs && ! karidns_signer_mounted "${_wd}"; then
-        mount -t tmpfs -o "size=${karidns_signer_tmpfs_size},mode=0700,uid=${karidns_signer_user},gid=${_group}" tmpfs "${_wd}" || return 1
+        # (numeric ids: the options go to the kernel as they are, mount_tmpfs(8) lists uid and gid as numbers)
+        mount -t tmpfs -o "size=${karidns_signer_tmpfs_size},mode=0700,uid=$(id -u "${karidns_signer_user}"),gid=$(id -g "${karidns_signer_user}")" tmpfs "${_wd}" || return 1
     fi
     # an old pidfile of a daemon that died must not stop a start (rc.subr checks the supervisor's)
     rm -f "${childpidfile}"

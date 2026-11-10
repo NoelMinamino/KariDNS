@@ -44,7 +44,7 @@ export function policyWithin(sub, sup) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------- principals
-// the user or group with exactly this name (names are unique whatever the case), or null.  GET /principals is readable by everybody; its prefix is at most 64 characters.
+// the user or group with exactly this name (names are unique whatever the case), or null.  GET /principals lists, for anybody but a global master, only the principals it may see (itself, its groups, and for a domain master the members of its groups and the holders of grants on its zones); its prefix is at most 64 characters.
 export async function lookupPrincipal(api, name, kind) {
   const n = String(name ?? '').trim();
   if (n === '') return null;
