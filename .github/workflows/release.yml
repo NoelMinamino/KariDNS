@@ -132,6 +132,8 @@ jobs:
             ls -l dist-db
 
             echo "::group::🧪 [Verification] Test installing the database packages on ${{ matrix.release }}"
+            # the plain package of the step above is still installed (the same VM): it conflicts with these
+            if pkg info -e karidns; then pkg delete -y karidns; fi
             # one at a time: the four packages install the same files
             for spec in "karidns-sqlite3:sqlite3" "karidns-postgresql:postgresql" "karidns-db:sqlite3 postgresql"; do
               name="${spec%%:*}"; want="${spec#*:}"
