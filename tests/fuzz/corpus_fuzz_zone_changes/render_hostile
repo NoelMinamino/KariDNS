@@ -1,0 +1,9 @@
+a.fuzz.test	A	-	bad
+b.fuzz.test	MX	7	10 mail
+c.fuzz.test	TXT	-	a;b
+d.fuzz.test	TXT	-	"open
+e.fuzz.test	TXT	-	$INCLUDE x
+f.other.test	A	-	192.0.2.1
+g.fuzz.test	TYPE65400	-	\# 4 deadbeef
+h.fuzz.test	NAPTR	-	100 10 "u" "E2U+sip" "!^.*$!x!" .
+bad line

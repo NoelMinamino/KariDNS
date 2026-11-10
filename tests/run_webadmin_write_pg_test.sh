@@ -8,7 +8,7 @@
 # preconditions, a signer zone that no request reloads, the import, a zone made and deleted (the trigger takes its grants), metadata, key requests, the audit log
 # (under the principal and the API role), and the cost of a change set of a small and of a zone of 20,000 records (the lines "[COST]").  Then: the reload requests
 # the API filed, that the API role never saw a policy refuse what the API had allowed, and the expired sessions swept by karidns_auth.sweep_expired().
-# Environment: ZONE, KARICHECK, KARIDNS, LOADER, NODE, BIG (default 20000).  Needs root and an unprivileged PostgreSQL user (KARIDNS_TEST_PG_USER); SKIP (exit 0,
+# Environment: ZONE, KARICHECK, KARIDNS, LOADER, NODE, BIG (default 20000), ZONES (more, empty zones for the cost of the search in the zone list, default 0).  Needs root and an unprivileged PostgreSQL user (KARIDNS_TEST_PG_USER); SKIP (exit 0,
 # with the reason) when PostgreSQL is not reachable (tests/db/pg_lib.sh), the role may not create roles, the password login over 127.0.0.1 is not accepted,
 # node 22.13 or newer, webadmin/node_modules/pg (npm ci --ignore-scripts in webadmin/) or a binary is missing.  About 2 minutes.
 set -u
@@ -22,6 +22,7 @@ KARICHECK=${KARICHECK:-$ROOT/karicheck}
 KARIDNS=${KARIDNS:-$ROOT/karidns}
 LOADER=${LOADER:-$ROOT/karidns-dbloader}
 BIG=${BIG:-20000}
+ZONES=${ZONES:-0}
 for v in ZONE KARICHECK KARIDNS LOADER; do eval "p=\$$v"; case $p in /*) ;; *) eval "$v=$ROOT/\${p#./}" ;; esac; done
 [ "$(id -u)" = "0" ] || { echo "SKIP: needs root (the server drops to nobody; the loader must be root-owned)"; exit 0; }
 command -v "$NODE" >/dev/null 2>&1 || { echo "SKIP: node is not installed"; exit 0; }
@@ -81,7 +82,7 @@ rolescript db/karidns_check_role.pgsql.sql $RK "the check role script"
 mkdir -p "$T/app/webadmin" "$T/app/node" "$T/ctl"
 chmod 777 "$T/ctl"
 cp "$ZONE" "$T/karidns-zone-real"; cp "$KARICHECK" "$T/karicheck"; cp ./karictl "$T/karictl"; chmod 755 "$T/karidns-zone-real" "$T/karicheck" "$T/karictl"
-cp -R webadmin/bin webadmin/lib webadmin/package.json webadmin/node_modules "$T/app/webadmin/" && cp -R node/lib "$T/app/node/" && chmod -R a+rX "$T/app"
+cp -R webadmin/bin webadmin/lib webadmin/ui webadmin/package.json webadmin/node_modules "$T/app/webadmin/" && cp -R node/lib "$T/app/node/" && chmod -R a+rX "$T/app"
 mkci() { printf '%s\n' "$2" > "$1"; chown "$PG_AS" "$1"; chmod 600 "$1"; }
 mkci "$T/ci_owner" "host=$PGSOCK port=$PORT_PG user=$OWNER dbname=$PGDB"
 mkci "$T/ci_api" "$(rc_of $RA)"
@@ -117,6 +118,8 @@ for z in example other signed; do
     as_pg "$T/karidns-zone-real" import --no-config --conninfo-file "$T/ci_owner" "$z.test" "$T/$z.test.zone" > "$T/import.out" 2>&1 && ok "$z.test is imported (as the owner)" || bad "import of $z" "$(cat "$T/import.out")"
 done
 pq "INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'X-KARIDNS-SIGNER', '1' FROM domains WHERE name = 'signed.test'" > /dev/null
+# the zone of the round trip (the text form of the records, item F): every kind of RDATA whose text is not its stored form
+as_pg "$T/karidns-zone-real" import --no-config --conninfo-file "$T/ci_owner" rt.test "$ROOT/webadmin/test/rt.test.zone" > "$T/import.out" 2>&1 && ok "rt.test (the round trip zone) is imported" || bad "import of rt.test" "$(cat "$T/import.out")"
 
 # ---------------------------------------------------------------- karidns and its loader (the loader reads as the owner: row level security does not bind it)
 PORT=$(kari_port 0 $((20000 + $$ % 20000)))
@@ -195,9 +198,14 @@ if [ "$BIG" -gt 0 ]; then
     as_pg "$T/karidns-zone-real" import --no-config --conninfo-file "$T/ci_owner" big.test "$T/big.zone" > "$T/import.out" 2>&1 && ok "big.test is imported (about $BIG records, $(( $(date +%s) - s )) s)" || bad "import of big.test" "$(tail -3 "$T/import.out")"
 fi
 
+# many zones, for the cost of the search in the zone list (zones with no records: the server was told nothing about them); ZONES=10000 for the measurement
+if [ "$ZONES" -gt 0 ]; then
+    pq "INSERT INTO domains (name, type) SELECT format('z%s.bulk.test', lpad(i::text, 4, '0')), 'NATIVE' FROM generate_series(0, $ZONES - 1) i" > /dev/null && ok "$ZONES empty zones are in the database" || bad "the empty zones"
+fi
+
 echo "-- the scenarios (webadmin/test/it_write.mjs)"
 IT_BASE="http://127.0.0.1:$WPORT/api/v1" IT_ORIGIN="http://127.0.0.1:$WPORT" IT_ADMIN_PASSWORD="$ADMIN_PW" IT_DNS_PORT=$PORT IT_DAG="$ROOT/dag" IT_DIR="$T/ctl" \
-    IT_KARICTL="$ROOT/karictl" IT_KARICTL_CONF="$T/main-karictl.conf" IT_KARICTL_SOCK="$T/ctl.sock" IT_DB=pg IT_API_ROLE="$RA" IT_BIG="$BIG" "$NODE" webadmin/test/it_write.mjs > "$T/it.out" 2>&1
+    IT_KARICTL="$ROOT/karictl" IT_KARICTL_CONF="$T/main-karictl.conf" IT_KARICTL_SOCK="$T/ctl.sock" IT_DB=pg IT_API_ROLE="$RA" IT_BIG="$BIG" IT_ZONES="$ZONES" "$NODE" webadmin/test/it_write.mjs > "$T/it.out" 2>&1
 IT_RC=$?
 cat "$T/it.out"
 [ $IT_RC = 0 ] && ok "the integration scenarios (webadmin/test/it_write.mjs)" || bad "the integration scenarios failed"

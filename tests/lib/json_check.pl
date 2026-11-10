@@ -50,11 +50,11 @@ sub check_schema {
     my @top = ($tool, qw(version command result counts truncated messages zones));
     for my $k (@top) { fail("missing key $k") unless exists $doc->{$k}; }
     my $has_signer = $tool eq "karidns-zone" && exists $doc->{signer};          # import --signer: the result of the write, after zones
-    my @extra = grep { $tool eq "karidns-zone" && exists $doc->{$_} } qw(apply types);     # apply: the result of the change set; --types-list: the record types
+    my @extra = grep { $tool eq "karidns-zone" && exists $doc->{$_} } qw(apply types render);     # apply: the result of the change set; --types-list: the record types; render: the text form of records
     fail("unexpected keys: " . join(',', grep { my $x = $_; !grep { $_ eq $x } (@top, $has_signer ? ("signer") : (), @extra) } sort keys %$doc)) if keys %$doc != @top + ($has_signer ? 1 : 0) + @extra;
     fail("$tool is not 1") unless is_int($doc->{$tool}) && $doc->{$tool} == 1;
     fail("version is not a string") unless is_str($doc->{version}) && length $doc->{version};
-    my $cmds = $tool eq "karidns-zone" ? "import|export|apply|types" : "conf|zones|zone|db";
+    my $cmds = $tool eq "karidns-zone" ? "import|export|apply|render|types" : "conf|zones|zone|db";
     fail("command is not $cmds or null") unless !defined $doc->{command} || $doc->{command} =~ /^($cmds)$/;
     fail("result is not ok/fail/usage") unless is_str($doc->{result}) && $doc->{result} =~ /^(ok|fail|usage)$/;
     fail("truncated is not a boolean") unless ref $doc->{truncated} eq 'JSON::PP::Boolean';
@@ -134,6 +134,14 @@ sub check_schema {
                 $j++;
             }
         }
+    }
+    if (exists $doc->{render}) {                                                 # render: one entry in rdata for each input line, an error for each null
+        my $r = $doc->{render};
+        fail("render is not an object with rdata and errors") unless ref $r eq 'HASH' && keys %$r == 2 && ref $r->{rdata} eq 'ARRAY' && ref $r->{errors} eq 'ARRAY';
+        my @nulls = grep { !defined $r->{rdata}[$_] } 0 .. $#{ $r->{rdata} };
+        fail("render.rdata has an entry that is neither a string nor null") if grep { defined $_ && ref $_ } @{ $r->{rdata} };
+        fail("render.errors is not one {index, text} for each null of rdata") unless @{ $r->{errors} } == @nulls
+            && !grep { my $e = $r->{errors}[$_]; ref $e ne 'HASH' || keys %$e != 2 || !is_int($e->{index}) || $e->{index} != $nulls[$_] || !is_str($e->{text}) || !length $e->{text} } 0 .. $#nulls;
     }
     if (exists $doc->{types}) {                                                  # --types-list
         fail("types is not an array of strings") unless ref $doc->{types} eq 'ARRAY' && @{ $doc->{types} } > 10 && !grep { !is_str($_) } @{ $doc->{types} };

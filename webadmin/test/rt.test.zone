@@ -1,0 +1,48 @@
+; rt.test.zone - the records of the round trip test of the WebAdmin API (tests/run_webadmin_write_test.sh, webadmin/test/it_write.mjs): every kind of RDATA
+; whose text form is not its stored form -- names (relative, absolute, the root), the priority of MX and SRV, strings with quotes, a backslash, a semicolon, a TAB and a
+; high byte, addresses, generic and structured types.  GET .../rrsets?rdata=1 of this zone, sent back as a change set with its own records as `expect`, must show no
+; difference.
+$ORIGIN rt.test.
+$TTL 300
+@ IN SOA ns1 hostmaster 1 7200 3600 1209600 300
+@ IN NS ns1
+@ IN NS ns2.other.test.
+@ IN MX 10 mail
+@ IN MX 20 mail2.rt.test.
+@ IN TXT "v=spf1 mx -all"
+@ IN CAA 0 issue "ca.example.test"
+@ IN CAA 0 issuewild ";"
+ns1 IN A 192.0.2.1
+ns1 IN AAAA 2001:db8::1
+mail IN A 192.0.2.25
+mail2 IN A 192.0.2.26
+nomail IN MX 0 .
+www IN CNAME web
+web IN A 192.0.2.80
+web IN A 192.0.2.81
+web IN AAAA 2001:DB8:0:0::80
+_sip._tcp IN SRV 10 60 5060 sip
+_sip._tcp IN SRV 20 0 5060 sip2.rt.test.
+_no._tcp IN SRV 0 0 0 .
+sip IN A 192.0.2.60
+sip2 IN A 192.0.2.61
+_dmarc IN TXT "v=DMARC1; p=none; rua=mailto:dmarc@example.test"
+txt IN TXT "hello world" "second" "with \"quotes\" and \\ backslash"
+long IN TXT "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "tail"
+semi IN TXT "a;b" "(paren)"
+odd IN TXT "tab\009here" "nul\000x" "high\200byte"
+sp IN SPF "v=spf1 -all"
+naptr IN NAPTR 100 10 "u" "E2U+sip" "!^.*$!sip:info@example.test!" .
+naptr2 IN NAPTR 100 10 "s" "SIP+D2U" "" _sip._udp
+ptr IN PTR target
+host IN HINFO "PC" "Linux"
+ssh IN SSHFP 4 2 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+tlsa IN TLSA 3 1 1 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+uri IN URI 10 1 "https://example.test/path"
+loc IN LOC 52 22 23.000 N 4 53 32.000 E -2.00m 0.00m 10000m 10m
+del IN NS ns1.del
+del IN DS 12345 13 2 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+ns1.del IN A 192.0.2.99
+alias IN DNAME other.example.test.
+*.wild IN A 192.0.2.100
+MiXed IN A 192.0.2.101

@@ -1,0 +1,7 @@
+www.fuzz.test	A	-	192.0.2.1
+fuzz.test	MX	10	mail.fuzz.test
+_sip._tcp.fuzz.test	SRV	1	2 5060 sip.fuzz.test
+t.fuzz.test	TXT	-	"hello" "wor ld" "q\"x"
+fuzz.test	SOA	0	ns1.fuzz.test hostmaster.fuzz.test 1 2 3 4 5
+n.fuzz.test	MX	-	0 .
+c.fuzz.test	CNAME	-	target

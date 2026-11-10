@@ -13,7 +13,7 @@
 -- keeps its record types in rr_policy_types instead of an array, grants.data_schema is NULL (one zone file per API instance), and a grant
 -- cannot follow the zone it names (the zones are in another file): the API removes the grants of a zone it deletes or renames.
 --
---   principals, credentials, memberships, principal_closure, rr_policies, rr_policy_types, grants, sessions, api_tokens, templates, template_records, schema_version (3)
+--   principals, credentials, memberships, principal_closure, rr_policies, rr_policy_types, grants, sessions, api_tokens, templates, template_records, oidc_states, schema_version (3)
 --   karidns_auth_audit   who changed what in this file, before / after as JSON; password_hash and totp_secret are written as "<redacted>"
 --   karidns_auth_actor   at most one row (id 1): who is writing; the API writes it first in its transaction and deletes it last
 --
@@ -154,6 +154,22 @@ CREATE TABLE IF NOT EXISTS api_tokens (
   CONSTRAINT api_tokens_max_life CHECK (expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ', created_at, '+366 days'))
 );
 CREATE INDEX IF NOT EXISTS api_tokens_principal_idx ON api_tokens (principal_id);
+
+-- oidc_states (item F, milestone M5; the same as in db/karidns_ext.pgsql.sql): the state of an OpenID Connect sign-in that has started and not come back.  The SHA-256 of the
+-- `state` parameter is the key, then the SHA-256 of the value of the short cookie that ties the flow to the browser that began it, the provider, the nonce, the PKCE code
+-- verifier, the route to return to and when it ends (ten minutes).  A row is used once: the API deletes it as it reads it.  Not audited.
+CREATE TABLE IF NOT EXISTS oidc_states (
+  state_hash   BLOB PRIMARY KEY CHECK (typeof(state_hash) = 'blob' AND length(state_hash) = 32),
+  browser_hash BLOB NOT NULL CHECK (typeof(browser_hash) = 'blob' AND length(browser_hash) = 32),
+  provider     TEXT NOT NULL CHECK (length(provider) BETWEEN 1 AND 32),
+  nonce        TEXT NOT NULL CHECK (length(nonce) BETWEEN 1 AND 128),
+  verifier     TEXT NOT NULL CHECK (length(verifier) BETWEEN 43 AND 128),
+  return_route TEXT NOT NULL DEFAULT '/' CHECK (length(return_route) <= 512),
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+  expires_at   TEXT NOT NULL,
+  CONSTRAINT oidc_states_life CHECK (expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ', created_at, '+1 hour'))
+);
+CREATE INDEX IF NOT EXISTS oidc_states_expires_idx ON oidc_states (expires_at);
 
 CREATE TABLE IF NOT EXISTS templates (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,

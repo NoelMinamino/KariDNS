@@ -7,7 +7,7 @@ import { createLogger } from '../../node/lib/log.js';
 import { App, VERSION } from './app.js';
 import { Router, listen, closeServer } from './http.js';
 import { ROUTES } from './routes.js';
-import { openBackend, inspect, createAdmin } from './setup.js';
+import { openBackend, inspect, createAdmin, readOidcProviders } from './setup.js';
 import { loadKeyFile } from './crypto.js';
 import * as S from './store.js';
 
@@ -60,7 +60,7 @@ export function parseArgs(argv) {
 // The server.  io: { stdout, stderr, proc (signals), deps }.  Resolves with the exit status after SIGTERM / SIGINT.
 export async function main(argv, io = {}) {
   const { stdout = process.stdout, stderr = process.stderr, proc = process, deps = {} } = io;
-  const d = { loadConfig, openBackend, inspect, createAdmin, createLogger, loadKeyFile: (f) => loadKeyFile(f, fs), listen, run: runChild, ...deps };
+  const d = { loadConfig, openBackend, inspect, createAdmin, readOidc: readOidcProviders, createLogger, loadKeyFile: (f) => loadKeyFile(f, fs), listen, run: runChild, ...deps };
   let opts;
   try {
     opts = parseArgs(argv);
@@ -141,9 +141,11 @@ export async function main(argv, io = {}) {
     log.close();
     return 1;
   }
-  const app = new App({ config, backend, log, run: d.run, key });
+  const app = new App({ config, backend, log, run: d.run, key, ui: checked.ui });
   app.versions = checked.versions;
   app.types = checked.types ? new Set(checked.types) : null;
+  app.oidc.configure(checked.oidc ?? []);
+  if (checked.oidc?.length) app.background(() => app.oidc.prefetch());              // (the providers' documents, now: a problem is in the log at the start)
   let server;
   try {
     server = await d.listen(app, new Router(ROUTES));
@@ -156,7 +158,12 @@ export async function main(argv, io = {}) {
   // expired sessions: on SQLite3 there is no row level security, so the API deletes them all at the start and every hour; on PostgreSQL the API role sees the rows of its
   // own principal only, so a SECURITY DEFINER function does it (karidns_auth.sweep_expired()), and a principal also deletes its own at its login
   const sweep = () => {
-    if (backend.dialect === 'sqlite') app.background(() => backend.tx({ write: true }, (tx) => S.deleteExpiredSessions(tx, app.now())));
+    if (backend.dialect === 'sqlite') {
+      app.background(() => backend.tx({ write: true }, async (tx) => {
+        await S.deleteExpiredSessions(tx, app.now());
+        await S.deleteExpiredOidcStates(tx, app.now());
+      }));
+    }
     else app.background(() => backend.tx({ write: true }, (tx) => S.sweepExpired(tx)));
   };
   sweep();
@@ -168,7 +175,11 @@ export async function main(argv, io = {}) {
       const next = d.loadConfig(opts.config);
       const problems = validate(next);
       if (problems.length) throw new Error(problems.join('; '));
+      const providers = d.readOidc(next);
+      if (providers.problems.length) throw new Error(providers.problems.join('; '));
       app.setConfig(next);
+      app.oidc.configure(providers.list);
+      if (providers.list.length) app.background(() => app.oidc.prefetch());
       log.info('the configuration was read again');
     } catch (e) {
       log.error(`the configuration was not read: ${e.message}`);

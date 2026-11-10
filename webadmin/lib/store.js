@@ -20,6 +20,9 @@ class Q {
 // "name = x OR name = x." : PowerDNS stores a zone name without the final dot, but a database may hold it with
 const zoneNames = (zone) => [zone, `${zone}.`];
 
+// "the column contains the text, whatever the case": LIKE with its own characters escaped (the callers only pass names, but the escape is cheap and complete)
+const containsText = (q, col, text) => `lower(${col}) LIKE ${q.add(`%${text.toLowerCase().replace(/[\\%_]/g, '\\$&')}%`)} ESCAPE '\\'`;
+
 const principal = (r) => ({ id: r.id, kind: r.kind, name: r.name, display_name: r.display_name, email: r.email, disabled: bool(r.disabled), created_at: toIso(r.created_at), created_by: r.created_by });
 const PCOLS = 'p.id, p.kind, p.name, p.display_name, p.email, p.disabled, p.created_at, p.created_by';
 
@@ -78,8 +81,11 @@ export async function removeMember(tx, groupId, memberId) {
 
 // ---------------------------------------------------------------------------------------------------------------------------------- credentials
 export async function getCredentials(tx, id) {
-  const r = await tx.get(`SELECT password_hash, totp_secret, totp_enabled, failed_logins, locked_until, password_changed_at FROM ${tx.A}credentials WHERE principal_id = $1`, [id]);
-  return r && { password_hash: r.password_hash, totp_secret: r.totp_secret, totp_enabled: bool(r.totp_enabled), failed_logins: r.failed_logins, locked_until: toMs(r.locked_until), password_changed_at: toIso(r.password_changed_at) };
+  const r = await tx.get(`SELECT password_hash, totp_secret, totp_enabled, oidc_issuer, oidc_subject, failed_logins, locked_until, password_changed_at FROM ${tx.A}credentials WHERE principal_id = $1`, [id]);
+  return r && {
+    password_hash: r.password_hash, totp_secret: r.totp_secret, totp_enabled: bool(r.totp_enabled), oidc_issuer: r.oidc_issuer ?? null, oidc_subject: r.oidc_subject ?? null,
+    failed_logins: r.failed_logins, locked_until: toMs(r.locked_until), password_changed_at: toIso(r.password_changed_at),
+  };
 }
 
 // UPDATE first: an INSERT ... ON CONFLICT would need the right to insert (a global master's) even when the row is there
@@ -87,6 +93,9 @@ export async function setPassword(tx, id, hash, nowMs) {
   const r = await tx.run(`UPDATE ${tx.A}credentials SET password_hash = $2, password_changed_at = $3, failed_logins = 0, locked_until = NULL WHERE principal_id = $1`, [id, hash, tx.ts(nowMs)]);
   if (r.changes === 0) await tx.run(`INSERT INTO ${tx.A}credentials (principal_id, password_hash, password_changed_at) VALUES ($1, $2, $3)`, [id, hash, tx.ts(nowMs)]);
 }
+
+// an administrator ends the lock of an account (and the count of failures that led to it) without a new password
+export const clearLock = (tx, id) => tx.run(`UPDATE ${tx.A}credentials SET failed_logins = 0, locked_until = NULL WHERE principal_id = $1`, [id]);
 
 export const setTotp = (tx, id, wrapped, enabled) => tx.run(`UPDATE ${tx.A}credentials SET totp_secret = $2, totp_enabled = $3 WHERE principal_id = $1`, [id, wrapped, enabled]);
 
@@ -283,13 +292,14 @@ const zoneRow = (r) => ({
 });
 
 // names: the zones to list (a principal that is not a global master sees the zones it has a grant on), or null for all
-export async function listZones(tx, schema, { names, prefix, kind, signed, after, limit }) {
+export async function listZones(tx, schema, { names, prefix, contains, kind, signed, after, limit }) {
   const Z = tx.z(schema);
   const q = new Q();
   const w = ['1 = 1'];
   if (names) w.push(q.list(tx, 'd.name', names.flatMap(zoneNames)));
   if (after !== undefined) w.push(`d.name > ${q.add(after)}`);
   if (prefix) w.push(`substr(lower(d.name), 1, ${prefix.length}) = ${q.add(prefix.toLowerCase())}`);
+  if (contains) w.push(containsText(q, 'd.name', contains));          // (a scan of the zones the principal sees)
   if (kind) w.push(`d.type = ${q.add(kind)}`);
   if (signed === true) w.push(`(${META(Z, 'PRESIGNED')} OR ${META(Z, 'X-KARIDNS-SIGNER')})`);
   if (signed === false) w.push(`NOT (${META(Z, 'PRESIGNED')} OR ${META(Z, 'X-KARIDNS-SIGNER')})`);
@@ -328,7 +338,8 @@ export async function getZone(tx, schema, zone) {
 
 // How RRsets are read (planning 2.2, A-23): by domain_id, the RRsets in (name, type) order after the cursor, `limit` of them plus one to know whether there is more.
 // visibility: null = every row of the zone; else { zone, suffixes: [...] } = the names under these suffixes and the apex SOA / NS (a subdomain master).
-export async function listRRsets(tx, schema, domainId, { zone, name, type, visibility, after, limit }) {
+// from: the first owner to list (names >= from, the order of the cursor: an index range, cheap); contains: the owner has this text in it (a scan of the zone, G3)
+export async function listRRsets(tx, schema, domainId, { zone, name, type, visibility, after, limit, from, contains }) {
   const Z = tx.z(schema);
   const q = new Q();
   const id = q.add(domainId);
@@ -336,6 +347,8 @@ export async function listRRsets(tx, schema, domainId, { zone, name, type, visib
   const sfx = (col, s) => `(${col} = ${q.add(s)} OR substr(${col}, length(${col}) - ${s.length}) = ${q.add(`.${s}`)})`;
   w.push(sfx('k.name', zone));
   if (name) w.push(`k.name = ${q.add(name)}`);
+  if (from) w.push(`k.name >= ${q.add(from)}`);
+  if (contains) w.push(containsText(q, 'k.name', contains));
   if (type) w.push(`upper(k.type) = ${q.add(type)}`);
   if (visibility) {
     const alts = visibility.suffixes.map((s) => sfx('k.name', s));
@@ -544,6 +557,58 @@ export async function zoneViews(tx, schema, domainId) {
 // the hourly sweep on PostgreSQL: the API role cannot see the sessions of the other principals, so a SECURITY DEFINER function deletes the expired ones
 export async function sweepExpired(tx) {
   return Number((await tx.get('SELECT karidns_auth.sweep_expired() AS n')).n);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------- OpenID Connect (M5)
+// The state of a sign-in that has started (F-18).  PostgreSQL: the API role has no right on the table, the three SECURITY DEFINER functions do it (there is no principal yet,
+// so no policy could show a row).  SQLite3: the same in plain SQL.  A state is used once; at most 1000 wait.
+const OIDC_STATES_MAX = 1000;
+export const OIDC_STATE_TTL = 600;
+
+// s: { stateHash, browserHash, provider, nonce, verifier, route, nowMs } -> false when too many sign-ins are waiting
+export async function putOidcState(tx, s) {
+  if (tx.dialect === 'pg') {
+    return (await tx.get(`SELECT ${tx.A}oidc_state_put($1, $2, $3, $4, $5, $6, $7) AS ok`, [s.stateHash, s.browserHash, s.provider, s.nonce, s.verifier, s.route, OIDC_STATE_TTL])).ok === true;
+  }
+  await tx.run(`DELETE FROM ${tx.A}oidc_states WHERE expires_at <= $1`, [tx.ts(s.nowMs)]);
+  if ((await tx.get(`SELECT count(*) AS n FROM ${tx.A}oidc_states`)).n >= OIDC_STATES_MAX) return false;
+  await tx.run(`INSERT INTO ${tx.A}oidc_states (state_hash, browser_hash, provider, nonce, verifier, return_route, created_at, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [s.stateHash, s.browserHash, s.provider, s.nonce, s.verifier, s.route, tx.ts(s.nowMs), tx.ts(s.nowMs + OIDC_STATE_TTL * 1000)]);
+  return true;
+}
+
+// -> { browser_hash, provider, nonce, verifier, return_route } of an unexpired state, which is deleted by the same call; undefined for a state that is unknown, used or over
+export async function takeOidcState(tx, stateHash, nowMs) {
+  if (tx.dialect === 'pg') return tx.get(`SELECT browser_hash, provider, nonce, verifier, return_route FROM ${tx.A}oidc_state_take($1)`, [stateHash]);
+  const r = await tx.get(`SELECT browser_hash, provider, nonce, verifier, return_route, expires_at FROM ${tx.A}oidc_states WHERE state_hash = $1`, [stateHash]);
+  if (!r) return undefined;
+  await tx.run(`DELETE FROM ${tx.A}oidc_states WHERE state_hash = $1`, [stateHash]);
+  return toMs(r.expires_at) > nowMs ? r : undefined;
+}
+
+export const deleteExpiredOidcStates = (tx, nowMs) => tx.run(`DELETE FROM ${tx.A}oidc_states WHERE expires_at <= $1`, [tx.ts(nowMs)]);
+
+// the id of the user (not disabled) an identity is linked to, or null
+export async function oidcLookup(tx, issuer, subject) {
+  const r = tx.dialect === 'pg'
+    ? await tx.get(`SELECT ${tx.A}oidc_lookup($1, $2) AS id`, [issuer, subject])
+    : await tx.get(`SELECT c.principal_id AS id FROM ${tx.A}credentials c JOIN ${tx.A}principals p ON p.id = c.principal_id AND NOT p.disabled AND p.kind = 'user' WHERE c.oidc_issuer = $1 AND c.oidc_subject = $2`, [issuer, subject]);
+  return r?.id ?? null;
+}
+
+// the user an identity is linked to, disabled or not (a global master's view: the credentials policy shows it every row)
+export async function oidcOwner(tx, issuer, subject) {
+  return (await tx.get(`SELECT principal_id AS id FROM ${tx.A}credentials WHERE oidc_issuer = $1 AND oidc_subject = $2`, [issuer, subject]))?.id ?? null;
+}
+
+// UPDATE first, like setPassword: an INSERT ... ON CONFLICT would need the right to insert even when the row is there
+export async function setOidc(tx, id, issuer, subject) {
+  const r = await tx.run(`UPDATE ${tx.A}credentials SET oidc_issuer = $2, oidc_subject = $3 WHERE principal_id = $1`, [id, issuer, subject]);
+  if (r.changes === 0) await tx.run(`INSERT INTO ${tx.A}credentials (principal_id, oidc_issuer, oidc_subject) VALUES ($1, $2, $3)`, [id, issuer, subject]);
+}
+
+export async function clearOidc(tx, id) {
+  return (await tx.run(`UPDATE ${tx.A}credentials SET oidc_issuer = NULL, oidc_subject = NULL WHERE principal_id = $1 AND oidc_issuer IS NOT NULL`, [id])).changes;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------- zone versions (M4)

@@ -5,7 +5,7 @@ import { ApiError, forbidden, notFound, conflict } from '../errors.js';
 import { shape, query, LIMIT, CURSOR } from '../validate.js';
 import * as S from '../store.js';
 import { hashPassword, verifyPassword, totpVerify, wrapSecret, unwrapSecret, base32, otpauthUri, randomToken, tokenText, tokenHash } from '../crypto.js';
-import { newSession, cookieHeader, needsTotp } from '../session.js';
+import { newSession, cookieHeader, needsTotp, mayHaveSession } from '../session.js';
 import { reply } from '../http.js';
 import { isGlobal } from '../perm.js';
 import { absolute } from '../names.js';
@@ -72,7 +72,7 @@ export async function login(ctx) {
     return { p, creds: await S.getCredentials(tx, p.id), grants: await S.effectiveGrants(tx, p.id) };
   });
   const now = app.now();
-  const usable = found?.creds?.password_hash && !(found.creds.locked_until && found.creds.locked_until > now);
+  const usable = found?.creds?.password_hash && mayHaveSession(found.p, found.creds, now);
   // a name that does not exist, a disabled user, a locked one: the same work is done against the dummy hash
   const good = await verifyPassword(usable ? found.creds.password_hash : await app.dummyHash(), body.password);
   if (!usable || !good) {
@@ -119,6 +119,8 @@ export async function me(ctx) {
   const { app, auth } = ctx;
   const groups = await ctx.db((tx) => S.groupsOf(tx, auth.principal.id));
   const global = isGlobal(auth.grants);
+  // a session that has not done the TOTP step: is the person to enrol (no TOTP yet) or to give the code (a sign-in with a provider, TOTP on)?
+  const step = auth.kind === 'session' && !auth.totpOk ? ((await ctx.db((tx) => S.getCredentials(tx, auth.principal.id)))?.totp_enabled ? 'verify' : 'enrol') : null;
   const grantable = auth.grants.filter((g) => g.role === 'domain_master').map((g) => ({ dataset: app.datasetOfSchema(g.data_schema)?.name ?? g.data_schema, zone: absolute(g.zone_name) }));
   return {
     principal: principalView(auth.principal),
@@ -127,7 +129,7 @@ export async function me(ctx) {
     grants: auth.grants.map((g) => grantView(app, g)),
     capabilities: { global, manage_principals: global, manage_policies: global, create_zones: global, grant_on: grantable },
     session: auth.kind === 'session'
-      ? { csrf: auth.csrf, totp_ok: auth.totpOk, expires_at: new Date(auth.sessionExpires).toISOString(), idle_timeout: app.settings['session-idle'] }
+      ? { csrf: auth.csrf, totp_ok: auth.totpOk, ...(step ? { totp_step: step } : {}), expires_at: new Date(auth.sessionExpires).toISOString(), idle_timeout: app.settings['session-idle'] }
       : { token: true, read_only: auth.readOnly },
   };
 }
@@ -149,13 +151,14 @@ async function reauth(ctx, password) {
 export async function totp(ctx) {
   const { app, auth } = ctx;
   const body = shape(ctx.body, {
-    action: { type: 'string', required: true, values: ['enroll', 'confirm', 'disable'] },
+    action: { type: 'string', required: true, values: ['enroll', 'confirm', 'verify', 'disable'] },
     code: { type: 'string', min: 6, max: 6, re: /^\d{6}$/ },
     password: { type: 'string', min: 1, max: 1024, noControl: false },
   });
   const id = auth.principal.id;
   const creds = await ctx.db((tx) => S.getCredentials(tx, id));
-  if (!creds?.password_hash) throw conflict('this user has no password: TOTP is a second step for a login with a password', 'no-password');
+  // TOTP is a second step for a login with a password, or with a linked identity (F-17: the sign-in with a provider asks for it too)
+  if (!creds?.password_hash && !creds?.oidc_issuer) throw conflict('this user has no password and no linked identity: TOTP is a second step for those', 'no-password');
 
   if (body.action === 'enroll') {
     if (creds.totp_enabled) throw conflict('TOTP is on already: disable it first', 'totp-enabled');
@@ -182,11 +185,40 @@ export async function totp(ctx) {
       { headers: { 'Set-Cookie': cookieHeader(sess.value, app.settings['session-max'], secure(app)) } });
   }
 
-  // disable: the password and a current code, and only where no rule makes it mandatory
+  // verify: the code of a user whose TOTP is on, for a session that has not done the step (a sign-in with a provider cannot ask for the code on the way: the answer of the
+  // provider is a redirect).  The session is replaced by one that has done it, like a confirmation does.
+  if (body.action === 'verify') {
+    if (!creds.totp_enabled) throw conflict('TOTP is not on', 'totp-disabled');
+    if (auth.totpOk) return { csrf: auth.csrf, expires_at: new Date(auth.sessionExpires).toISOString(), totp: { enabled: true, enrollment_required: false } };
+    if (!body.code) throw new ApiError(400, 'bad-request', 'code is required', { errors: [{ code: 'bad-request', severity: 'error', text: 'this field is required', pointer: '/code' }] });
+    const wait = app.buckets.loginUser.take(`reauth:${id}`);
+    if (wait) throw new ApiError(429, 'rate-limited', 'too many code checks', { headers: { 'Retry-After': String(wait) } });
+    const sec = JSON.parse(unwrapSecret(app.key, id, creds.totp_secret) ?? 'null');
+    const step = sec && totpVerify(Buffer.from(sec.s, 'hex'), body.code, app.now() / 1000, { lastStep: sec.u });
+    if (step === null || step === undefined) {
+      await loginFailed(app, auth.principal, creds);
+      throw forbidden('the code is wrong', 'wrong-code');
+    }
+    const sess = await ctx.db(async (tx) => {
+      await S.recordLoginSuccess(tx, id, wrapSecret(app.key, id, JSON.stringify({ s: sec.s, u: step })));
+      await S.deleteSession(tx, auth.idHash);
+      return newSession(app, tx, id, { totpOk: true, client: clientText(ctx) });
+    }, { write: true });
+    return reply(200, { csrf: sess.csrf, expires_at: new Date(sess.expires).toISOString(), totp: { enabled: true, enrollment_required: false } },
+      { headers: { 'Set-Cookie': cookieHeader(sess.value, app.settings['session-max'], secure(app)) } });
+  }
+
+  // disable: the password (where there is one) and a current code, and only where no rule makes it mandatory
   if (!creds.totp_enabled) throw conflict('TOTP is not on', 'totp-disabled');
   if (needsTotp(app.settings, auth.grants)) throw forbidden('TOTP is required for this user by the configuration (require-totp)', 'totp-required-by-policy');
-  if (!body.password || !body.code) throw new ApiError(400, 'bad-request', 'password and code are required');
-  const again = await reauth(ctx, body.password);
+  if (!body.code || (creds.password_hash && !body.password)) throw new ApiError(400, 'bad-request', creds.password_hash ? 'password and code are required' : 'code is required');
+  let again = creds;
+  if (creds.password_hash) {
+    again = await reauth(ctx, body.password);
+  } else {
+    const wait = app.buckets.loginUser.take(`reauth:${id}`);
+    if (wait) throw new ApiError(429, 'rate-limited', 'too many code checks', { headers: { 'Retry-After': String(wait) } });
+  }
   const sec = JSON.parse(unwrapSecret(app.key, id, creds.totp_secret) ?? 'null');
   if (!sec || totpVerify(Buffer.from(sec.s, 'hex'), body.code, app.now() / 1000, { lastStep: sec.u }) === null) {
     await loginFailed(app, auth.principal, again);

@@ -15,6 +15,9 @@ export const exportArgv = (settings, dataset, zone) => ['export', ...dbArgs(sett
 
 export const typesArgv = () => ['--types-list', '--json'];
 
+// stored records on standard input -> the text a change set takes (G2); no database, no configuration
+export const renderArgv = (zone) => ['render', '--json', canonicalZone(zone)];
+
 // The source of a run: the change file or a zone text, both on standard input (docs/karidns-zone.md "apply").  create: a new zone of this type.
 function sourceArgs({ text, deleteOthers, create, zoneType }) {
   const a = text ? ['--zone-file', '-'] : ['--changes', '-'];

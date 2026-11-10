@@ -799,6 +799,24 @@ CREATE TABLE IF NOT EXISTS karidns_auth.api_tokens (
 );
 CREATE INDEX IF NOT EXISTS api_tokens_principal_idx ON karidns_auth.api_tokens (principal_id);
 
+-- oidc_states (0.6.0 item F, milestone M5; decision F-18): the state of an OpenID Connect sign-in that has started and not come back.  The browser leaves for the identity
+-- provider with the session cookie out of reach (SameSite=Strict), so the state lives here, not in a cookie: the SHA-256 of the `state` parameter is the key, the SHA-256 of
+-- the value of the short cookie that ties the flow to the browser that began it, the provider's name, the nonce and the PKCE code verifier, the route to return to, and
+-- when it ends (ten minutes).  A row is used once: oidc_state_take() deletes it as it returns it.  Nothing here is audited, and the API role has no right on the table at
+-- all: it calls the three SECURITY DEFINER functions below (the sign-in has no principal yet, so no policy could show it a row).
+CREATE TABLE IF NOT EXISTS karidns_auth.oidc_states (
+  state_hash   BYTEA PRIMARY KEY CHECK (octet_length(state_hash) = 32),
+  browser_hash BYTEA NOT NULL CHECK (octet_length(browser_hash) = 32),
+  provider     VARCHAR(32) NOT NULL,
+  nonce        VARCHAR(128) NOT NULL,
+  verifier     VARCHAR(128) NOT NULL CHECK (length(verifier) >= 43),
+  return_route VARCHAR(512) NOT NULL DEFAULT '/',
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at   TIMESTAMPTZ NOT NULL,
+  CONSTRAINT oidc_states_life CHECK (expires_at <= created_at + interval '1 hour')
+);
+CREATE INDEX IF NOT EXISTS oidc_states_expires_idx ON karidns_auth.oidc_states (expires_at);
+
 CREATE TABLE IF NOT EXISTS karidns_auth.templates (
   id          BIGSERIAL PRIMARY KEY,
   name        VARCHAR(255) NOT NULL UNIQUE,
@@ -866,13 +884,35 @@ CREATE OR REPLACE FUNCTION karidns_auth.api_token_lookup(tid bigint, h bytea) RE
     FROM karidns_auth.api_tokens t JOIN karidns_auth.principals p ON p.id = t.principal_id AND NOT p.disabled
    WHERE t.id = tid AND t.secret_hash = h AND t.revoked_at IS NULL AND t.expires_at > now()
 $$;
+-- The OpenID Connect sign-in before there is a principal (oidc_states above).  oidc_state_put() records a started sign-in and returns false when 1000 are waiting
+-- already (an unauthenticated request makes a row: the number is bounded); oidc_state_take() returns the row of a state and deletes it, once, if it has not ended;
+-- oidc_lookup() finds the user an (issuer, subject) pair is linked to, if that user is not disabled (the policy of credentials shows a principal its own row only).
+CREATE OR REPLACE FUNCTION karidns_auth.oidc_state_put(h bytea, b bytea, prov text, nonce text, verifier text, ret text, ttl integer) RETURNS boolean
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+BEGIN
+  DELETE FROM karidns_auth.oidc_states WHERE expires_at <= now();
+  IF (SELECT count(*) FROM karidns_auth.oidc_states) >= 1000 THEN RETURN false; END IF;
+  INSERT INTO karidns_auth.oidc_states (state_hash, browser_hash, provider, nonce, verifier, return_route, expires_at)
+    VALUES (h, b, prov, nonce, verifier, ret, now() + make_interval(secs => ttl));
+  RETURN true;
+END $$;
+CREATE OR REPLACE FUNCTION karidns_auth.oidc_state_take(h bytea) RETURNS TABLE (browser_hash bytea, provider text, nonce text, verifier text, return_route text)
+  LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+  WITH d AS (DELETE FROM karidns_auth.oidc_states s WHERE s.state_hash = h RETURNING s.browser_hash, s.provider, s.nonce, s.verifier, s.return_route, s.expires_at)
+  SELECT d.browser_hash, d.provider::text, d.nonce::text, d.verifier::text, d.return_route::text FROM d WHERE d.expires_at > now()
+$$;
+CREATE OR REPLACE FUNCTION karidns_auth.oidc_lookup(iss text, sub text) RETURNS bigint LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+  SELECT c.principal_id FROM karidns_auth.credentials c JOIN karidns_auth.principals p ON p.id = c.principal_id AND NOT p.disabled AND p.kind = 'user'
+   WHERE c.oidc_issuer = iss AND c.oidc_subject = sub
+$$;
 -- The hourly sweep of the API: the sessions whose absolute time is over, of every principal (the policy of sessions shows the API role its own principal's rows
--- only, so it could not delete the rest).  Returns the number of rows deleted.  Nothing else is deleted here.
+-- only, so it could not delete the rest), and the sign-ins that never came back.  Returns the number of rows deleted.  Nothing else is deleted here.
 CREATE OR REPLACE FUNCTION karidns_auth.sweep_expired() RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
 DECLARE n bigint;
 BEGIN
   DELETE FROM karidns_auth.sessions WHERE expires_at <= now();
   GET DIAGNOSTICS n = ROW_COUNT;
+  DELETE FROM karidns_auth.oidc_states WHERE expires_at <= now();
   RETURN n;
 END $$;
 
@@ -1934,7 +1974,7 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'karidns_rls_trusted') THEN
     RAISE EXCEPTION 'karidns_auth.enable_rls: the role karidns_rls_trusted does not exist (the role scripts create it)';
   END IF;
-  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'audit_log', 'sessions', 'api_tokens', 'templates', 'template_records']
+  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'audit_log', 'sessions', 'api_tokens', 'oidc_states', 'templates', 'template_records']
                            ELSE ARRAY['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_record_tags', 'karidns_record_tinydns',
                                       'karidns_zone_tagdefs', 'karidns_domain_views', 'karidns_reload_requests', 'karidns_key_requests', 'karidns_signer_state', 'karidns_zone_state', 'karidns_zone_versions', 'karidns_zone_version_rrsets'] END) LOOP
     IF to_regclass(format('%I.%I', sch, t)) IS NULL THEN CONTINUE; END IF;
@@ -1951,7 +1991,7 @@ DECLARE
   t   text;
   cnt integer := 0;
 BEGIN
-  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'audit_log', 'sessions', 'api_tokens', 'templates', 'template_records']
+  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'audit_log', 'sessions', 'api_tokens', 'oidc_states', 'templates', 'template_records']
                            ELSE ARRAY['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_record_tags', 'karidns_record_tinydns',
                                       'karidns_zone_tagdefs', 'karidns_domain_views', 'karidns_reload_requests', 'karidns_key_requests', 'karidns_signer_state', 'karidns_zone_state', 'karidns_zone_versions', 'karidns_zone_version_rrsets'] END) LOOP
     IF to_regclass(format('%I.%I', sch, t)) IS NULL THEN CONTINUE; END IF;
@@ -1997,7 +2037,8 @@ REVOKE EXECUTE ON FUNCTION karidns_auth.current_principal(), karidns_auth.my_gro
   karidns_auth.may_grant(text, text, text, bigint), karidns_auth.grants_escalation_fn(), karidns_auth.signer_soa_fn(), karidns_auth.assert_service_role(text, text),
   karidns_auth.set_policy(regclass, text, text, text, text, text, boolean), karidns_auth.create_policies(text),
   karidns_auth.create_signer_policies(text, text), karidns_auth.enable_rls(text), karidns_auth.disable_rls(text), karidns_auth.session_lookup(bytea),
-  karidns_auth.api_token_lookup(bigint, bytea), karidns_auth.sweep_expired(), karidns_auth.enable_never_commit(text), karidns_auth.disable_never_commit(text),
+  karidns_auth.api_token_lookup(bigint, bytea), karidns_auth.sweep_expired(), karidns_auth.oidc_state_put(bytea, bytea, text, text, text, text, integer),
+  karidns_auth.oidc_state_take(bytea), karidns_auth.oidc_lookup(text, text), karidns_auth.enable_never_commit(text), karidns_auth.disable_never_commit(text),
   karidns_auth.assert_check_role(text, text) FROM PUBLIC;
 -- (canon_type, is_dnssec_type and setting_principal stay with PUBLIC: the policies and the trigger conditions of the signer call them as the signer.)
 -- The role scripts grant EXECUTE on current_principal, my_groups, zone_grant, is_global, rr_ok, rr_visible and audit_visible (and bump_serial to the API

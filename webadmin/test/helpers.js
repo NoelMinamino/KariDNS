@@ -85,7 +85,7 @@ export function makeFiles(dir) {
 }
 
 // A running deployment: { app, backend, server, base, dir, request(), login(), close() }.  settings: more (or other) lines of the configuration; now: a clock.
-export async function deploy({ settings, now, run = runChild, key = Buffer.alloc(32, 7) } = {}) {
+export async function deploy({ settings, now, run = runChild, key = Buffer.alloc(32, 7), ui = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kw-'));
   makeFiles(dir);
   const config = parseConfig(confText(dir, settings));
@@ -94,10 +94,11 @@ export async function deploy({ settings, now, run = runChild, key = Buffer.alloc
   const backend = new SqliteBackend({ sqlite, file: config.settings['sqlite-file'], authFile: config.settings['auth-file'] });
   backend.open();
   const log = memLog();
-  const app = new App({ config, backend, log, run, key, now });
+  const app = new App({ config, backend, log, run, key, now, ui });
   const server = await listen(app, new Router(ROUTES));
-  const base = `http://127.0.0.1:${server.address().port}/api/v1`;
-  const d = { app, backend, server, base, dir, log, config };
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const base = `${origin}/api/v1`;
+  const d = { app, backend, server, base, origin, dir, log, config };
 
   // fetch with JSON in and out: -> { status, headers, body (parsed JSON, or text for text/plain), text }
   d.request = async (method, p, { body, cookie, token, csrf, origin, headers = {}, raw } = {}) => {
@@ -179,4 +180,21 @@ export async function cast(d) {
   const dom = await d.makeUser('dom', 'dom password 12345', { grants: [{ role: 'domain_master', zone: 'example.test', policyId: web, schema: '' }] });
   const sub = await d.makeUser('sub', 'sub password 12345', { grants: [{ role: 'subdomain_master', zone: 'example.test', suffix: 'sub.example.test', policyId: web, schema: '' }] });
   return { all, web, root, dom, sub };
+}
+
+// the error codes of the table in docs/karidns-api.md (a code is a word in backticks at the start of an entry: the explanations in parentheses may name other things in
+// backticks), for docs.test.js and for the catalogs of the GUI (i18n.test.js)
+export function docApiCodes() {
+  const text = fs.readFileSync(new URL('docs/karidns-api.md', ROOT), 'utf8');
+  const table = text.slice(text.indexOf('| Status | Codes |'), text.indexOf('## ENDPOINTS'));
+  if (table.length < 100) throw new Error('the table of codes was not found');
+  const out = new Set();
+  for (const row of table.split('\n').filter((l) => /^\| \d/.test(l))) {
+    const cell = row.split('|')[2];
+    for (const entry of cell.replace(/\([^)]*\)/g, '').split(/[,;:]/)) {
+      const m = /^\s*`([a-z]+(?:-[a-z]+)*)`\s*$/.exec(entry);
+      if (m) out.add(m[1]);
+    }
+  }
+  return out;
 }

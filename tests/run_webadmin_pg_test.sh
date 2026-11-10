@@ -73,7 +73,7 @@ rolescript db/karidns_check_role.pgsql.sql $RK "the check role script"
 # the programs and the server, where the user they run as can read them (as root that is the PostgreSQL user)
 cp "$ZONE" "$T/karidns-zone" && chmod 755 "$T/karidns-zone"
 mkdir -p "$T/app/webadmin" "$T/app/node" "$T/app/tests"
-cp -R webadmin/bin webadmin/lib webadmin/test webadmin/package.json webadmin/node_modules "$T/app/webadmin/" && cp -R node/lib "$T/app/node/" && cp tests/auth_vectors.json "$T/app/tests/" && chmod -R a+rX "$T/app"
+cp -R webadmin/bin webadmin/lib webadmin/ui webadmin/test webadmin/package.json webadmin/node_modules "$T/app/webadmin/" && cp -R node/lib "$T/app/node/" && cp tests/auth_vectors.json "$T/app/tests/" && chmod -R a+rX "$T/app"
 mkci() { printf '%s\n' "$2" > "$1"; [ -n "$PG_AS" ] && chown "$PG_AS" "$1"; chmod 600 "$1"; }
 mkci "$T/ci_owner" "host=$PGSOCK port=$PORT_PG user=$OWNER dbname=$PGDB"
 mkci "$T/ci_api" "$(rc_of $RA)"

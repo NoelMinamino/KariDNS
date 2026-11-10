@@ -8,6 +8,7 @@
  *   karidns-zone export --all --dir <dir> [options]
  *   karidns-zone apply [options] --changes <file|-> <zone>
  *   karidns-zone --types-list
+ *   karidns-zone render --json <zone>
  *
  * A thin shell over dns_zone_import.c (zone file -> PowerDNS rows, one transaction per zone, the checks of karicheck, the read-back through the
  * loader's reader) and dns_zone_export.c (rows -> zone file text, canonical order, verified).  This file reads the database settings the way
@@ -42,6 +43,7 @@
 #include "dns_zone_changes.h"
 #include "dns_zone_export.h"
 #include "dns_zone_import.h"
+#include "dns_zone_render.h"
 #include "dns_zone_text.h"
 
 #ifndef KARIDNS_VERSION
@@ -103,6 +105,7 @@ static void kz_usage(FILE *fp) {
         "  karidns-zone apply [options] --changes <file|-> <zone>\n"
         "  karidns-zone apply [options] --zone-file <file|-> [--delete-others] <zone>\n"
         "  karidns-zone --types-list [--json]\n"
+        "  karidns-zone render --json <zone>\n"
         "  karidns-zone --version | -h | --help\n"
         "\n"
         "import reads a zone file (BIND format, or a tinydns data file) and writes the zone to the PowerDNS database in one transaction; export\n"
@@ -172,6 +175,10 @@ static void kz_usage(FILE *fp) {
         "\n"
         "      --types-list        print the record types a change file may name (one per line, or in the JSON document) and exit\n"
         "\n"
+        "render (the WebAdmin GUI; docs/karidns-zone.md, \"render\"): reads no database and no configuration.  Standard input holds stored records, one a line,\n"
+        "`owner TAB type TAB prio TAB content` (records.name, type, prio or -, content), for the zone named; the document has \"render\": { \"rdata\": [...], \"errors\": [...] }:\n"
+        "for each line the record's text as a change file takes it (every name absolute, MX and SRV with the priority in front), or null and an error.\n"
+        "\n"
         "Output:\n"
         "      --json              one JSON document on standard output (docs/karicheck.md, JSON OUTPUT; first key \"karidns-zone\");\n"
         "                          export of a single zone then needs a <file>\n"
@@ -189,7 +196,8 @@ static void kz_usage(FILE *fp) {
         "  karidns-zone apply --dry-run --json --sqlite3 /var/db/karidns/pdns.sqlite3 --changes - example.test < changes.txt\n"
         "  karidns-zone apply -c /usr/local/etc/karidns/karidns.conf --expect-generation 17 --changes changes.txt example.test\n"
         "  karidns-zone apply --dry-run --sqlite3 /var/db/karidns/pdns.sqlite3 --zone-file example.test.zone --delete-others example.test\n"
-        "  karidns-zone --types-list\n");
+        "  karidns-zone --types-list\n"
+        "  printf 'mail.example.test\\tMX\\t10\\tmail2.example.test\\n' | karidns-zone render --json example.test\n");
 }
 
 /* A usage error: one message and the usage text on stderr; with --json only the message goes into the document.  Exit status 2. */
@@ -675,7 +683,7 @@ static char *kz_read_all(const char *path, size_t *len) {
     while (buf) {
         if (n == cap) {
             if (cap >= ((size_t)64 << 20)) {
-                dns_diag(DIAG_ERROR, DC_IO_STDIN_TOO_LARGE, path, 0, "The change file is larger than %zu bytes\n", cap);
+                dns_diag(DIAG_ERROR, DC_IO_STDIN_TOO_LARGE, path, 0, "The input is larger than %zu bytes\n", cap);
                 free(buf);
                 buf = NULL;
                 break;
@@ -768,6 +776,25 @@ static void kz_jb_str(kz_jb_t *b, const char *s, size_t n) {
     }
     kz_jb_add(b, "\"");
     free(tmp);
+}
+
+/* s[0..n) as it is (already JSON) */
+static void kz_jb_raw(kz_jb_t *b, const char *s, size_t n) {
+    if (b->oom) return;
+    if (b->len + n + 1 > b->cap) {
+        size_t nc = b->cap ? b->cap * 2 : 4096;
+        while (nc < b->len + n + 1) nc *= 2;
+        char *np = realloc(b->p, nc);
+        if (!np) {
+            b->oom = true;
+            return;
+        }
+        b->p = np;
+        b->cap = nc;
+    }
+    memcpy(b->p + b->len, s, n);
+    b->len += n;
+    b->p[b->len] = '\0';
 }
 
 /* the lines of an RRset text ("<ttl> <TYPE> <rdata>" joined by LF) as a JSON array, or null */
@@ -937,6 +964,64 @@ static int kz_types_list(bool json) {
     if (json && !b.oom) dns_diag_json_extra("types", b.p);
     free(b.p);
     return 0;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* render (item F: the WebAdmin GUI)                                                                              */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* render --json <zone>: the stored records on standard input as the text a change file takes (dns_zone_render.h).  The document has the key "render":
+ * { "rdata": [ "<text>" | null, ... ], "errors": [ { "index": N, "text": "..." } ] }, one entry in "rdata" for each input line, in order. */
+static int kz_cmd_render(const kz_args_t *a) {
+    char canon[DNS_NAME_TEXT_SIZE];
+    if (!pdns_canonical_zone_name(a->args[0], canon)) {
+        dns_diag(DIAG_ERROR, DC_DB_IMPORT_ZONE_NAME, NULL, 0, "'%.100s' is not a valid zone name\n", a->args[0]);
+        return 1;
+    }
+    size_t len = 0;
+    char *text = kz_read_all("-", &len);
+    if (!text) return 1;
+    zr_result_t *res = NULL;
+    size_t n = 0;
+    char err[300];
+    int rc = zr_render(canon, text, len, &res, &n, err, sizeof(err));
+    free(text);
+    if (rc != 0) {
+        dns_diag(DIAG_ERROR, DC_DB_RENDER_INPUT, "standard input", 0, "%s\n", err);
+        return 1;
+    }
+    kz_jb_t b = { NULL, 0, 0, false };
+    kz_jb_t eb = { NULL, 0, 0, false };
+    kz_jb_add(&b, "{ \"rdata\": [");
+    kz_jb_add(&eb, "[");
+    size_t nerr = 0;
+    for (size_t i = 0; i < n; i++) {
+        kz_jb_add(&b, "%s", i ? ", " : "");
+        if (res[i].rdata) {
+            kz_jb_str(&b, res[i].rdata, strlen(res[i].rdata));
+        } else {
+            kz_jb_add(&b, "null");
+            kz_jb_add(&eb, "%s{ \"index\": %zu, \"text\": ", nerr++ ? ", " : "", i);
+            kz_jb_str(&eb, res[i].err, strlen(res[i].err));
+            kz_jb_add(&eb, " }");
+        }
+    }
+    kz_jb_add(&eb, "]");
+    kz_jb_add(&b, "], \"errors\": ");
+    kz_jb_raw(&b, eb.p ? eb.p : "[]", eb.p ? eb.len : 2);
+    kz_jb_add(&b, " }");
+    int ret = 0;
+    if (b.oom || eb.oom) {
+        dns_diag(DIAG_ERROR, DC_INTERNAL_OOM, NULL, 0, "out of memory\n");
+        ret = 1;
+    } else {
+        dns_diag_json_extra("render", b.p);
+    }
+    dns_diag_counts(1, 0);
+    free(b.p);
+    free(eb.p);
+    zr_free(res, n);
+    return ret;
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -1252,6 +1337,17 @@ static int kz_check_apply_args(const kz_args_t *a) {
     return 0;
 }
 
+/* render takes --json and a zone name and nothing else: 0, or 2 (usage error) */
+static int kz_check_render_args(const kz_args_t *a) {
+    const bool j = a->json;
+    if (a->conf || a->no_config || a->view || a->sqlite || a->conninfo || a->schema || a->all || a->mode || a->types || a->dry_run || a->serial || a->strict || a->reload ||
+        a->type || a->format || a->verbose || a->dir || a->force || a->audit || a->signer || kz_apply_only(a))
+        return kz_usage_error(j, DC_USAGE_OPTION, "render takes --json and a zone name, no other option (it reads no database and no configuration)");
+    if (!j) return kz_usage_error(false, DC_USAGE_OPTION, "render needs --json: its answer is a JSON document");
+    if (a->nargs != 1) return kz_usage_error(j, DC_USAGE_ARGS, "render takes a zone name; the records come on standard input");
+    return 0;
+}
+
 /* the values of the options, before anything is opened: 0, or 2 (usage error) */
 static int kz_check_args(const kz_args_t *a, bool import) {
     const bool j = a->json;
@@ -1294,7 +1390,7 @@ static int kz_run(int argc, char **argv, bool *json_out) {
     const char *cmd;
     int perr = kz_parse(argc, argv, &cmd, &a);
     *json_out = a.json;
-    const char *known = cmd && (strcmp(cmd, "import") == 0 || strcmp(cmd, "export") == 0 || strcmp(cmd, "apply") == 0) ? cmd : NULL;
+    const char *known = cmd && (strcmp(cmd, "import") == 0 || strcmp(cmd, "export") == 0 || strcmp(cmd, "apply") == 0 || strcmp(cmd, "render") == 0) ? cmd : NULL;
     if (a.types_list && !known) known = "types";
     if (a.json) {
         dns_diag_json_start(known, KARIDNS_VERSION);
@@ -1316,8 +1412,12 @@ static int kz_run(int argc, char **argv, bool *json_out) {
         if (cmd || a.nargs) return kz_usage_error(a.json, DC_USAGE_OPTION, "--types-list takes no command and no argument");
         return kz_types_list(a.json);
     }
-    if (!cmd) return kz_usage_error(a.json, DC_USAGE_COMMAND_MISSING, "no command given (import, export or apply)");
-    if (!known) return kz_usage_error(a.json, DC_USAGE_COMMAND_UNKNOWN, "unknown command '%.64s' (import, export or apply)", cmd);
+    if (!cmd) return kz_usage_error(a.json, DC_USAGE_COMMAND_MISSING, "no command given (import, export, apply or render)");
+    if (!known) return kz_usage_error(a.json, DC_USAGE_COMMAND_UNKNOWN, "unknown command '%.64s' (import, export, apply or render)", cmd);
+    if (strcmp(cmd, "render") == 0) {                       /* no database and no configuration: a filter */
+        int rr = kz_check_render_args(&a);
+        return rr != 0 ? rr : kz_cmd_render(&a);
+    }
     const bool import = strcmp(cmd, "import") == 0;
     const bool apply = strcmp(cmd, "apply") == 0;
     int rc = apply ? kz_check_apply_args(&a) : kz_check_args(&a, import);

@@ -123,6 +123,71 @@ run "--types-list --json" 0 --types-list --json
 jvalid "--types-list --json"
 jget "...the command" command types
 
+echo "-- render (item F, the WebAdmin GUI: stored records as the text a change set takes)"
+printf 'mail.example.test\tMX\t10\tmail2.example.test\nwww.example.test\tTXT\t-\t"hello" "wor ld"\nexample.test\tSOA\t0\tns1.example.test hostmaster.example.test 10 7200 3600 1209600 300\nx.example.test\tA\t-\tbad\nx.example.test\tMX\t5\t10 mail\nn.example.test\tMX\t-\t0 .\n_sip._tcp.example.test\tSRV\t3\t5 5060 sip.example.test\nfoo.other.test\tA\t-\t192.0.2.1\nt.example.test\tTXT\t-\ta;b' > "$T/render.in"
+IN="$T/render.in"
+run "render --json" 0 render --json example.test
+jvalid "render --json"
+jget "...the command" command render
+jget "...an MX: the priority in front, every name absolute" render.rdata.0 "10 mail2.example.test."
+jget "...a TXT" render.rdata.1 '"hello" "wor ld"'
+jget "...the SOA at the apex" render.rdata.2 "ns1.example.test. hostmaster.example.test. 10 7200 3600 1209600 300"
+jget "...a bad address is null" render.rdata.3 null
+jget "...a priority twice is null" render.rdata.4 null
+jget "...the null MX has the root name (not @, which would be the origin of the zone)" render.rdata.5 "0 ."
+jget "...an SRV" render.rdata.6 "3 5 5060 sip.example.test."
+jget "...a name outside the zone is null" render.rdata.7 null
+jget "...a comment in a string is null" render.rdata.8 null
+jget "...one entry for each line, an error for each null" render.errors.0.index 3
+jget "...(the reason has neither the zone nor the row)" render.errors.0.text "invalid IPv4 address literal in A record"
+jget "...a priority twice" render.errors.1.text "MX content already has a preference and prio is 5: ambiguous"
+jget "...the last one" "render.errors.3.index" 8
+same "...and there are four" "$($JC "$OUT" count render.errors)" 4
+IN=/dev/null
+printf '' > "$T/empty.in"; IN="$T/empty.in"
+run "render of nothing" 0 render --json example.test
+jvalid "render of nothing"
+jget "...no records" render.rdata "[]"
+printf 'only-an-owner\n' > "$T/render.in"; IN="$T/render.in"
+run "render of a line that is not four fields" 1 render --json example.test
+jvalid "...a document with the failure"
+jget "...db.render.input" messages.0.code db.render.input
+jget "...names the line" messages.0.text "line 1: the line has fewer than four fields (owner, type, prio, content)"
+printf 'a.example.test\tA\t1x\t192.0.2.1\n' > "$T/render.in"
+run "render: a prio that is not a number" 1 render --json example.test
+printf 'a.example.test\tTXT\t-\t"x"\nb\n' > "$T/render.in"
+run "render: the second line is the wrong one" 1 render --json example.test
+jget "...names the line" messages.0.text "line 2: the line has fewer than four fields (owner, type, prio, content)"
+IN=/dev/null
+run "render without --json" 2 render example.test
+errhas "...says why" "render needs --json"
+run "render without a zone" 2 render --json
+run "render with two zones" 2 render --json a.test b.test
+run "render with a database option" 2 render --json --sqlite3 "$DB" example.test
+run "render with --no-config" 2 render --json --no-config example.test
+run "render with -c" 2 render --json -c /nonexistent example.test
+run "render with --mode" 2 render --json --mode merge example.test
+run "render with --changes" 2 render --json --changes "$CH" example.test
+run "render of a zone that is not a name" 1 render --json 'a..b'
+run "--types-list with render" 2 --types-list render
+printf 'a.example.test\tA\t-\t192.0.2.1\n' > "$T/render.in"; IN="$T/render.in"
+run "render: the zone with its final dot, any case" 0 render --json EXAMPLE.test.
+jget "...renders" render.rdata.0 192.0.2.1
+IN=/dev/null
+"$ZONE" --help | grep -c 'karidns-zone render --json example.test$' | grep -q '^1$' && ok "--help has the example of render" || bad "no example of render in --help"
+"$ZONE" --help | grep '^  printf .*karidns-zone render --json example.test$' | sed "s#karidns-zone render#$ZONE render#" > "$T/render_example.sh"
+sh "$T/render_example.sh" > "$OUT" 2> "$ERR"; st=$?
+if [ "$st" = 0 ]; then ok "the example of --help runs"; else bad "the example of --help fails ($st)" "$(cat "$ERR")"; fi
+jget "...it gives the MX as a change set takes it" render.rdata.0 "10 mail2.example.test."
+# the root name in a diff (apply): "0 ." and not "0 @", which a change file would read as the zone's own name
+newdb "$DB"; mkzone "$T/nm.zone" example.test. 10; kz import example.test "$T/nm.zone"
+printf 'rr n.example.test. 300 MX 0 .\nrr s.example.test. 300 SRV 0 0 0 .\nrr naptr.example.test. 300 NAPTR 100 10 "" "" "" .\n' > "$T/nm.changes"
+ka --dry-run --json --changes "$T/nm.changes" example.test
+jget "apply: the root name in the diff of a null MX is a dot" apply.diff.0.after.0 "300 MX 0 ."
+jget "...of an SRV with no target" apply.diff.2.after.0 "300 SRV 0 0 0 ."
+jget "...of a NAPTR replacement" apply.diff.1.after.0 '300 NAPTR 100 10 "" "" "" .'
+newdb "$DB"
+
 echo "-- the generation and the versions of an operator's import"
 mkzone "$T/ex.zone" example.test. 10 'www IN A 192.0.2.2
 mail IN MX 10 www

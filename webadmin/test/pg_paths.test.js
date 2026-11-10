@@ -43,6 +43,26 @@ test('sessions and tokens are looked up by the functions of the schema', async (
   assert.equal(await S.lookupToken(fakeTx(), 1, h, 1), undefined);
 });
 
+test('the sign-in with a provider on PostgreSQL goes through the functions of the schema, never the table', async () => {
+  const h = Buffer.alloc(32, 1);
+  const tx = fakeTx([
+    [/oidc_state_put/, [{ ok: true }]],
+    [/oidc_state_take/, [{ browser_hash: h, provider: 'idp', nonce: 'n', verifier: 'v', return_route: '/' }]],
+    [/oidc_lookup/, [{ id: 7 }]],
+  ]);
+  assert.equal(await S.putOidcState(tx, { stateHash: h, browserHash: h, provider: 'idp', nonce: 'n', verifier: 'v', route: '/zones', nowMs: 1 }), true);
+  assert.deepEqual(tx.log[0], ['SELECT karidns_auth.oidc_state_put($1, $2, $3, $4, $5, $6, $7) AS ok', [h, h, 'idp', 'n', 'v', '/zones', 600]]);
+  assert.deepEqual(await S.takeOidcState(tx, h, 1), { browser_hash: h, provider: 'idp', nonce: 'n', verifier: 'v', return_route: '/' });
+  assert.deepEqual(tx.log[1], ['SELECT browser_hash, provider, nonce, verifier, return_route FROM karidns_auth.oidc_state_take($1)', [h]]);
+  assert.equal(await S.oidcLookup(tx, 'https://idp.example.test', 'sub'), 7);
+  assert.deepEqual(tx.log[2], ['SELECT karidns_auth.oidc_lookup($1, $2) AS id', ['https://idp.example.test', 'sub']]);
+  assert.equal(await S.oidcLookup(fakeTx(), 'i', 's'), null);
+  assert.equal(await S.putOidcState(fakeTx([[/oidc_state_put/, [{ ok: false }]]]), { stateHash: h, browserHash: h, provider: 'idp', nonce: 'n', verifier: 'v', route: '/', nowMs: 1 }), false);
+  // the link is plain SQL on credentials (a global master's policy allows it)
+  await S.setOidc(tx, 7, 'i', 's');
+  assert.match(tx.log.at(-1)[0], /^UPDATE karidns_auth\.credentials SET oidc_issuer = \$2, oidc_subject = \$3 WHERE principal_id = \$1$/);
+});
+
 test('policies: the types are an array column', async () => {
   const tx = fakeTx([[/FROM karidns_auth.rr_policies/, [{ id: 3, name: 'web', allow_wildcard: false, allow_delegation: false, allow_dname: false, apex_editable: false, ttl_min: 60, ttl_max: 86400, max_rr: null, allowed_types: ['A', 'TXT'] }]]]);
   const p = (await S.listPolicies(tx, { ids: [3] }))[0];

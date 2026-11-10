@@ -10,6 +10,7 @@ import { canonicalOwner, inZone, absolute } from './names.js';
 
 export const MAX_RRSETS = 1000;
 export const MAX_RECORDS = 1000;
+export const ZONE_TEXT_LIMIT = 16 << 20;           // a zone text travels in a JSON string: the body of an import and of a zone made from a text (routes.js)
 
 const CONTENT = { type: 'string', required: true, min: 1, max: 65535, noControl: true };
 const TYPE = { type: 'string', required: true, min: 1, max: 32, re: /^[A-Za-z][A-Za-z0-9-]*$/, reText: 'a record type name' };

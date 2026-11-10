@@ -79,7 +79,7 @@ rolescript db/karidns_check_role.pgsql.sql $RK "the check role script"
 
 mkdir -p "$T/app/webadmin" "$T/app/node"
 cp "$ZONE" "$T/karidns-zone-real"; cp "$KARICHECK" "$T/karicheck"; cp ./karictl "$T/karictl"; chmod 755 "$T/karidns-zone-real" "$T/karicheck" "$T/karictl"
-cp -R webadmin/bin webadmin/lib webadmin/package.json webadmin/node_modules "$T/app/webadmin/" && cp -R node/lib "$T/app/node/" && chmod -R a+rX "$T/app"
+cp -R webadmin/bin webadmin/lib webadmin/ui webadmin/package.json webadmin/node_modules "$T/app/webadmin/" && cp -R node/lib "$T/app/node/" && chmod -R a+rX "$T/app"
 mkci() { printf '%s\n' "$2" > "$1"; chown "$PG_AS" "$1"; chmod 600 "$1"; }
 mkci "$T/ci_owner" "host=$PGSOCK port=$PORT_PG user=$OWNER dbname=$PGDB"
 mkci "$T/ci_api" "$(rc_of $RA)"

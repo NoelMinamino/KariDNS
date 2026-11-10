@@ -8,13 +8,14 @@ import { clip } from '../../node/lib/run.js';
 import { SqliteBackend, PgBackend } from './db.js';
 import * as S from './store.js';
 import { hashPassword, randomToken } from './crypto.js';
-import { typesArgv } from './tools.js';
+import { typesArgv, renderArgv } from './tools.js';
+import { loadStatic, defaultUiDir } from './static.js';
 
 const PROGRAM = 'karidns-webadmin';
 
 // the tables the API relies on: the auth tables (schema version 3, with the tables of items D and E) and the zone data tables of a dataset
 export const AUTH_TABLES = ['auth.principals', 'auth.credentials', 'auth.memberships', 'auth.principal_closure', 'auth.rr_policies', 'auth.grants', 'auth.sessions',
-  'auth.api_tokens', 'auth.templates', 'auth.template_records', 'auth.schema_version'];
+  'auth.api_tokens', 'auth.templates', 'auth.template_records', 'auth.oidc_states', 'auth.schema_version'];
 export const DATA_TABLES = ['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_schema_version', 'karidns_zone_state', 'karidns_zone_versions', 'karidns_zone_version_rrsets',
   'karidns_domain_views', 'karidns_signer_state', 'karidns_key_requests', 'karidns_record_tags', 'karidns_record_tinydns', 'karidns_zone_tagdefs'];
 
@@ -44,7 +45,8 @@ export async function inspect(config, { backend, run, st = {}, uid = process.get
   const notes = [];
   const versions = {};
   let types = null;                         // the record types karidns-zone's change file takes (its own list, planning 8.1)
-  if (problems.length) return { problems, notes, versions, types };
+  let ui = null;                            // the files of the GUI (static.js), read here once and kept by the service
+  if (problems.length) return { problems, notes, versions, types, ui };
 
   const checkFile = (what, file, stat) => {
     const p = checkConninfoFile(file, stat, uid, PROGRAM);
@@ -78,6 +80,23 @@ export async function inspect(config, { backend, run, st = {}, uid = process.get
     else problems.push(`totp-key-file ${s['totp-key-file']}: ${e.code ?? e.message}`);
   }
 
+  // the providers: the secret files are read here (the service starts with what this found); the providers themselves are not asked
+  const providers = readOidcProviders(config, { stat: st.oidc, uid });
+  problems.push(...providers.problems);
+  for (const p of providers.list) notes.push(`oidc ${p.name} (${p.issuer}): client id and secret read, mfa = ${p.mfa}, redirect URI ${s['public-origin']}/api/v1/auth/oidc/${p.name}/callback`);
+
+  if (s.ui) {
+    const dir = s['ui-dir'] ?? defaultUiDir();
+    try {
+      ui = loadStatic(dir);
+      notes.push(`ui ${dir}: ${ui.size} files, ${[...ui.values()].reduce((n, f) => n + f.body.length, 0)} bytes`);
+    } catch (e) {
+      problems.push(`ui ${dir}: ${e.message} (ui = no switches the GUI off)`);
+    }
+  } else {
+    notes.push('ui: off (ui = no)');
+  }
+
   if (run) {
     const want = s.database === 'pg' ? 'postgresql' : 'sqlite3';
     const z = await run(s['karidns-zone'], ['--version'], { timeoutMs: 10000, maxOutput: 8192 });
@@ -95,6 +114,11 @@ export async function inspect(config, { backend, run, st = {}, uid = process.get
         versions['karidns-zone-json'] = doc['karidns-zone'];
         types = doc.types.filter((x) => typeof x === 'string').map((x) => x.toUpperCase());
       }
+      // `render` (G2, the GUI): a karidns-zone of an older release does not have it, and GET .../rrsets?rdata=1 would fail on every call
+      const r = await run(s['karidns-zone'], renderArgv('example.test'), { timeoutMs: 10000, maxOutput: 1 << 16, input: '' });
+      let rdoc = null;
+      try { rdoc = JSON.parse(r.stdout); } catch { /* reported below */ }
+      if (rdoc?.['karidns-zone'] !== 1 || !Array.isArray(rdoc.render?.rdata)) problems.push(`karidns-zone render --json did not give a document of schema 1 (${clip(r.stdout || r.stderr, 120)}): is karidns-zone of this release?`);
     }
     const k = await run(s.karicheck, ['--version'], { timeoutMs: 10000, maxOutput: 8192 });
     if (k.spawnError || k.code !== 0) problems.push(`karicheck (${s.karicheck}): ${k.spawnError ?? `exit status ${k.code}`}`);
@@ -123,10 +147,26 @@ export async function inspect(config, { backend, run, st = {}, uid = process.get
       problems.push(`the database: ${e.message}`);
     }
   }
-  return { problems, notes, versions, types };
+  return { problems, notes, versions, types, ui, oidc: providers.list };
 }
 
-const FALLBACK_TYPES = ['A', 'AAAA', 'AFSDB', 'CAA', 'CNAME', 'DNAME', 'DS', 'HINFO', 'HTTPS', 'LOC', 'MX', 'NAPTR', 'NS', 'PTR', 'SOA', 'SPF', 'SRV', 'SSHFP', 'SVCB', 'TLSA', 'TXT', 'URI'];
+// The [oidc] sections as the service uses them: the client secret is read from its file (a secret like a connection file: the service user's, mode 0600 or 0400).
+// -> { list: [{ name, issuer, clientId, clientSecret, scopes, label, mfa }], problems }.  Nothing is fetched here: --check does not touch the providers.
+export function readOidcProviders(config, { readFile = fs.readFileSync, stat, uid = process.getuid?.() } = {}) {
+  const list = [];
+  const problems = [];
+  for (const o of config.oidc?.values() ?? []) {
+    const bad = checkConninfoFile(o['client-secret-file'], stat?.[o.name], uid, PROGRAM);
+    if (bad) { problems.push(`oidc ${o.name}: client-secret-file: ${bad}`); continue; }
+    let secret;
+    try { secret = readFile(o['client-secret-file'], 'utf8').replace(/\r?\n$/, ''); } catch (e) { problems.push(`oidc ${o.name}: client-secret-file ${o['client-secret-file']}: ${e.code ?? e.message}`); continue; }
+    if (secret.length === 0 || secret.length > 1024 || /[\0-\x1f\x7f]/.test(secret)) { problems.push(`oidc ${o.name}: client-secret-file ${o['client-secret-file']} must hold the secret on one line (1 to 1024 characters)`); continue; }
+    list.push({ name: o.name, issuer: o.issuer, clientId: o['client-id'], clientSecret: secret, scopes: o.scopes.includes('openid') ? o.scopes : ['openid', ...o.scopes], label: o.label, mfa: o.mfa });
+  }
+  return { list, problems };
+}
+
+const FALLBACK_TYPES =['A', 'AAAA', 'AFSDB', 'CAA', 'CNAME', 'DNAME', 'DS', 'HINFO', 'HTTPS', 'LOC', 'MX', 'NAPTR', 'NS', 'PTR', 'SOA', 'SPF', 'SRV', 'SSHFP', 'SVCB', 'TLSA', 'TXT', 'URI'];
 
 // karidns-webadmin --create-admin NAME: a user with a global_master grant and the policy "all-types" (every type karidns-zone's change file takes), a
 // password made here and printed once.  -> { name, password, created: { principal, policy } }

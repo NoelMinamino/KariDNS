@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <syslog.h>
 
+#include "../dns_zone_render.h"
 #include "../dns_zone_text.h"
 #include "../dns_zone_rows.h"
 #include "../dns_pdns_reader.h"
@@ -1121,6 +1122,154 @@ static void test_same_zone(void) {
     zone_arena_destroy(&a);
 }
 
+/* ---- 8. dns_zone_render.c: stored records as the text a change set takes (karidns-zone render; 0.6.0 item F) ---- */
+
+/* the text of line i of the input, or NULL */
+static char *render_one(const char *zone, const char *line, char *err, size_t errlen) {
+    zr_result_t *r = NULL;
+    size_t n = 0;
+    char *out = NULL;
+    if (zr_render(zone, line, strlen(line), &r, &n, err, errlen) != 0 || n != 1) return NULL;
+    if (r[0].rdata) out = strdup(r[0].rdata);
+    else snprintf(err, errlen, "%s", r[0].err);
+    zr_free(r, n);
+    return out;
+}
+
+#define RENDERS(line, want) do { char e_[300] = ""; char *t_ = render_one("example.test", line, e_, sizeof(e_)); \
+    CHECK_MSG(t_ != NULL && strcmp(t_, want) == 0, "%s: got \"%s\" (%s)", line, t_ ? t_ : "(none)", e_); free(t_); } while (0)
+#define REFUSES(line, needle) do { char e_[300] = ""; char *t_ = render_one("example.test", line, e_, sizeof(e_)); \
+    CHECK_MSG(t_ == NULL && strstr(e_, needle) != NULL, "%s: got \"%s\" / \"%s\"", line, t_ ? t_ : "(none)", e_); free(t_); } while (0)
+
+static void test_render(void) {
+    /* names absolute, the priority of MX and SRV in front (as the exporter and the diff of `apply` write them) */
+    RENDERS("example.test\tMX\t10\tmail.example.test", "10 mail.example.test.");
+    RENDERS("example.test\tMX\t-\tmail", "0 mail.");                               /* NULL prio is 0; a name without a dot is relative to the root, as PowerDNS means it */
+    RENDERS("example.test\tMX\t0\t10 mail.example.test", "10 mail.example.test.");  /* the preference is in the content and the column says 0: the content stands */
+    RENDERS("_sip._tcp.example.test\tSRV\t20\t5 5060 sip.example.test", "20 5 5060 sip.example.test.");
+    RENDERS("_sip._tcp.example.test\tsrv\t-\t0 5 5060 sip.example.test", "0 5 5060 sip.example.test.");
+    RENDERS("www.example.test\tA\t-\t192.0.2.1", "192.0.2.1");
+    RENDERS("www.example.test\tAAAA\t0\t2001:DB8:0:0::1", "2001:DB8:0:0::1");        /* the text as it was parsed: the zone-file writer does not rewrite an address */
+    RENDERS("www.example.test\tCNAME\t-\tTarget.Example.TEST", "Target.Example.TEST.");
+    RENDERS("example.test\tNS\t0\tns1.example.test.", "ns1.example.test.");
+    RENDERS("example.test\tSOA\t0\tns1.example.test hostmaster.example.test 10 7200 3600 1209600 300", "ns1.example.test. hostmaster.example.test. 10 7200 3600 1209600 300");
+    /* strings: quoted, escaped as the zone-file writer does; a TAB is part of the content */
+    RENDERS("t.example.test\tTXT\t-\t\"hello\" \"wor ld\"", "\"hello\" \"wor ld\"");
+    RENDERS("t.example.test\tTXT\t-\thello", "\"hello\"");
+    RENDERS("t.example.test\tTXT\t-\t\"a;b\" \"c\\\"d\"", "\"a;b\" \"c\\\"d\"");
+    RENDERS("t.example.test\tTXT\t-\t\"a\tb\"", "\"a\\009b\"");
+    RENDERS("example.test\tCAA\t-\t0 issue \"ca.example.test\"", "0 issue \"ca.example.test\"");
+    RENDERS("t.example.test\tTYPE65400\t-\t\\# 4 deadbeef", "\\# 4 deadbeef");
+    /* the root name is "." (a null MX, RFC 7505; no service, RFC 2782): "@" would be the origin of the zone the line is read for */
+    RENDERS("n.example.test\tMX\t-\t0 .", "0 .");
+    RENDERS("n.example.test\tSRV\t-\t0 0 0 .", "0 0 0 .");
+    RENDERS("n.example.test\tMX\t0\t.", "0 .");
+    {
+        char e[300] = "";
+        char *t = render_one("example.test", "n.example.test\tNAPTR\t-\t100 10 \"\" \"\" \"\" .", e, sizeof(e));
+        CHECK_MSG(t != NULL && t[strlen(t) - 1] == '.' && strchr(t, '@') == NULL, "NAPTR: %s", t ? t : e);
+        free(t);
+    }
+    /* the others are refused one by one and say why; the reader's own row id and zone name are not in the message */
+    REFUSES("www.example.test\tA\t-\tnot-an-address", "IPv4");
+    REFUSES("www.example.test\tALIAS\t-\ttarget.example.test", "shown as stored");
+    REFUSES("www.example.test\tlua\t-\tA \"return 1\"", "shown as stored");
+    REFUSES("www.example.test\tMX\t7\t10 mail", "ambiguous");
+    REFUSES("www.example.test\tMX\t70000\tmail", "outside 0..65535");
+    REFUSES("www.example.test\tTXT\t-\ta;b", "comment");
+    REFUSES("www.example.test\tTXT\t-\t\"open", "quote");
+    REFUSES("www.example.test\tTXT\t-\t$INCLUDE x", "directive");
+    REFUSES("www.example.test\tTXT\t-\t(a", "parenthesis");
+    REFUSES("www.example.test\tTXT\t-\ta\rb", "line break");
+    REFUSES("www.example.test\tTXT\t-\t \t", "empty");
+    REFUSES("www.example.test\tTXT\t-\t", "empty");
+    REFUSES("www.other.test\tA\t-\t192.0.2.1", "outside the zone");
+    REFUSES("www.example.test\tSOA\t-\tns1 h 1 2 3 4 5", "not at the zone apex");
+    REFUSES("www.example.test\tbad_type\t-\tx", "type");
+    REFUSES("a b.example.test\tA\t-\t192.0.2.1", "owner");
+    { char e[300] = ""; char *t = render_one("example.test", "www.example.test\tA\t-\tx", e, sizeof(e)); CHECK(t == NULL); CHECK(strstr(e, "records.id") == NULL && strstr(e, "zone '") == NULL); free(t); }
+
+    /* the whole input: results in the order of the lines, one bad record does not touch the others, the last line needs no LF, nothing is an empty list */
+    {
+        const char in[] = "a.example.test\tA\t-\t192.0.2.1\nb.example.test\tA\t-\tbad\nc.example.test\tA\t-\t192.0.2.3";
+        zr_result_t *r = NULL;
+        size_t n = 0;
+        char err[200];
+        CHECK(zr_render("example.test.", in, sizeof(in) - 1, &r, &n, err, sizeof(err)) == 0 && n == 3);          /* the zone with its final dot */
+        CHECK(n == 3 && r[0].rdata && !r[1].rdata && r[2].rdata);
+        CHECK(n == 3 && r[1].err[0] != '\0');
+        CHECK_STR(n == 3 ? r[2].rdata : NULL, "192.0.2.3");
+        zr_free(r, n);
+        CHECK(zr_render("example.test", "", 0, &r, &n, err, sizeof(err)) == 0 && n == 0);
+        zr_free(r, n);
+        zr_free(NULL, 0);
+    }
+    /* a NUL inside a field: the record is refused (a C string would end there), the input is not */
+    {
+        const char in[] = "a.example.test\tTXT\t-\tab\0cd\n";
+        zr_result_t *r = NULL;
+        size_t n = 0;
+        char err[200];
+        CHECK(zr_render("example.test", in, sizeof(in) - 1, &r, &n, err, sizeof(err)) == 0 && n == 1 && !r[0].rdata);
+        CHECK(n == 1 && strstr(r[0].err, "NUL") != NULL);
+        zr_free(r, n);
+    }
+    /* an input that is not in the form is refused as a whole, with the line */
+    {
+        const char *bad[] = { "only-owner\n", "a\tb\tc\n", "\tA\t-\t1.2.3.4\n", "a.example.test\t\t-\t1\n", "a.example.test\tA\t1x\t1.2.3.4\n", "a.example.test\tA\t\t1.2.3.4\n",
+                              "a.example.test\tA\t-\t1.2.3.4\n\n", "a.example.test\tA\t1234567890123456789\t1.2.3.4\n", "a.example.test\tA\t-\t1.2.3.4\nzzz\n" };
+        for (size_t i = 0; i < sizeof(bad) / sizeof(*bad); i++) {
+            zr_result_t *r = (zr_result_t *)1;
+            size_t n = 7;
+            char err[200] = "";
+            CHECK_MSG(zr_render("example.test", bad[i], strlen(bad[i]), &r, &n, err, sizeof(err)) == -1 && r == NULL && n == 0 && strstr(err, "line ") != NULL, "bad input %zu: \"%s\"", i, err);
+        }
+        char err[200] = "";
+        zr_result_t *r = NULL;
+        size_t n = 0;
+        CHECK(zr_render("example.test", "a.example.test\tA\t-\t1.2.3.4\nzzz\n", 32, &r, &n, err, sizeof(err)) == -1 && strstr(err, "line 2") != NULL);
+        char *many = malloc(ZR_MAX_RECORDS + 2);
+        CHECK(many != NULL);
+        if (many) {
+            memset(many, '\n', ZR_MAX_RECORDS + 1);
+            CHECK(zr_render("example.test", many, ZR_MAX_RECORDS + 1, &r, &n, err, sizeof(err)) == -1 && strstr(err, "more than") != NULL);
+            free(many);
+        }
+    }
+    /* a zone that is not a zone: every record is refused with the reader's reason */
+    {
+        zr_result_t *r = NULL;
+        size_t n = 0;
+        char err[200];
+        CHECK(zr_render("a..b", "a.b\tA\t-\t192.0.2.1\n", 18, &r, &n, err, sizeof(err)) == 0 && n == 1 && !r[0].rdata && r[0].err[0]);
+        zr_free(r, n);
+    }
+    /* what is rendered is a fixed point: the text as the content (the priority is in it now, the column is NULL) renders to itself (the round trip of the GUI) */
+    {
+        const char *samples[] = {
+            "example.test\tMX\t10\tmail.example.test", "_sip._tcp.example.test\tSRV\t1\t2 3 sip.example.test", "t.example.test\tTXT\t-\t\"a\" \"b c\" \"\\\"q\\\"\" \"\\092\"",
+            "example.test\tSOA\t-\tns1.example.test hostmaster.example.test 1 2 3 4 5", "example.test\tCAA\t-\t128 issuewild \"x;y\"", "w.example.test\tAAAA\t-\t::ffff:192.0.2.1",
+            "w.example.test\tCNAME\t-\ta.b", "w.example.test\tNAPTR\t-\t100 10 \"u\" \"E2U+sip\" \"!^.*$!sip:x@example.test!\" .", "w.example.test\tHINFO\t-\t\"PC\" \"Linux\"",
+            "w.example.test\tSSHFP\t-\t4 2 ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789", "w.example.test\tTYPE65401\t-\t\\# 3 016100",
+            "n.example.test\tMX\t-\t0 .", "n.example.test\tSRV\t-\t0 0 0 .", "n.example.test\tNAPTR\t-\t100 10 \"u\" \"E2U+sip\" \"\" .",
+            "example.test\tDNAME\t-\ttarget.example.test", "w.example.test\tTLSA\t-\t3 1 1 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",
+        };
+        for (size_t i = 0; i < sizeof(samples) / sizeof(*samples); i++) {
+            char e1[300] = "", e2[300] = "", line[2048];
+            char *t1 = render_one("example.test", samples[i], e1, sizeof(e1));
+            CHECK_MSG(t1 != NULL, "%s: %s", samples[i], e1);
+            if (!t1) continue;
+            const char *tab1 = strchr(samples[i], '\t');
+            const char *tab2 = tab1 ? strchr(tab1 + 1, '\t') : NULL;
+            snprintf(line, sizeof(line), "%.*s\t-\t%s", (int)(tab2 - samples[i]), samples[i], t1);
+            char *t2 = render_one("example.test", line, e2, sizeof(e2));
+            CHECK_MSG(t2 != NULL && strcmp(t1, t2) == 0, "%s: \"%s\" renders to \"%s\" (%s)", samples[i], t1, t2 ? t2 : "(none)", e2);
+            free(t1);
+            free(t2);
+        }
+    }
+}
+
 static void test_field_table(void) {
     printf("field table\n");
     dns_record_t r;
@@ -1242,6 +1391,7 @@ int main(int argc, char **argv) {
     test_hostile();
     test_tinydns();
     test_same_zone();
+    test_render();
     test_field_table();
     const char *tmp = getenv("TMPDIR");
     snprintf(g_dir, sizeof(g_dir), "%s/test_zone_text.XXXXXX", tmp && *tmp ? tmp : "/tmp");

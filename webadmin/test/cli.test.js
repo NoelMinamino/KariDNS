@@ -184,6 +184,28 @@ test('the server: a configuration that is wrong at SIGHUP is not taken; PostgreS
   assert.deepEqual(g.events.filter((e) => e[0] === 'tx' || e[0] === 'sql'), [['tx', true], ['sql', 'SELECT karidns_auth.sweep_expired() AS n']]);
 });
 
+test('the server: the providers of the [oidc] sections are set up at the start (their documents asked for at once) and again at SIGHUP, which a bad secret file does not change', async () => {
+  const prov = (secret) => [{ name: 'gone', issuer: 'http://127.0.0.1:1', clientId: 'c', clientSecret: secret, scopes: ['openid'], label: 'Gone', mfa: 'totp' }];
+  let reads = 0;
+  const f = fakes({ inspect: async () => ({ problems: [], notes: [], versions: {}, oidc: prov('s1') }), readOidc: () => { reads++; return reads === 1 ? { list: prov('s2'), problems: [] } : { list: [], problems: ['oidc gone: client-secret-file: has mode 0644'] }; } });
+  let app;
+  f.deps.listen = async (a) => { app = a; return { close: (cb) => cb(), closeIdleConnections: () => {} }; };
+  const p = main([], { stdout: sink(), stderr: sink(), proc: f.proc, deps: f.deps });
+  await sleep(300);
+  assert.deepEqual(app.oidc.list(), [{ name: 'gone', label: 'Gone', issuer: 'http://127.0.0.1:1' }]);
+  assert.equal(app.oidc.get('gone').clientSecret, 's1');
+  assert.ok(f.log.lines.some((l) => /oidc: provider gone .* cannot be used yet/.test(l)));
+  f.proc.emit('SIGHUP');
+  await sleep(300);
+  assert.equal(app.oidc.get('gone').clientSecret, 's2');
+  f.proc.emit('SIGHUP');
+  await sleep(50);
+  assert.equal(app.oidc.get('gone').clientSecret, 's2');
+  assert.ok(f.log.lines.some((l) => /the configuration was not read: oidc gone: client-secret-file: has mode 0644/.test(l)));
+  f.proc.emit('SIGTERM');
+  assert.equal(await p, 0);
+});
+
 test('the server: it does not start with a configuration, a key, a database, a schema or a port that is wrong', async () => {
   let f = fakes({ loadConfig: () => parseConfig('') });
   let r = await run([], f.deps);
@@ -241,6 +263,7 @@ const okRun = (over = {}) => async (file, argv) => {
   const text = argv.join(' ');
   if (text === '--version') return { code: 0, stdout: file.endsWith('karicheck') ? 'karicheck 0.6.0\n' : 'karidns-zone 0.6.0 (sqlite3 postgresql)\n', stderr: '', ...over.version };
   if (text === '--types-list --json') return { code: 0, stdout: '{"karidns-zone": 1, "command": "types", "types": ["A", "AAAA"]}\n', stderr: '', ...over.types };
+  if (text === 'render --json example.test') return { code: 0, stdout: '{"karidns-zone": 1, "command": "render", "render": {"rdata": [], "errors": []}}\n', stderr: '', ...over.render };
   return { code: 1, stdout: '', stderr: 'unexpected', spawnError: null };
 };
 
@@ -268,6 +291,23 @@ test('inspect: the files, the tools, the schema', async () => {
     assert.ok(otherSchema.problems.some((p) => /did not give a document of schema 1/.test(p)));
     const notJson = await inspect(cfg, { run: okRun({ types: { stdout: 'not json', stderr: 'x' } }), uid: undefined });
     assert.ok(notJson.problems.some((p) => /did not give a document of schema 1/.test(p)));
+    // karidns-zone render (G2): a karidns-zone of an older release has none
+    const noRender = await inspect(cfg, { run: okRun({ render: { code: 2, stdout: '', stderr: 'unknown command' } }), uid: undefined });
+    assert.ok(noRender.problems.some((p) => /^karidns-zone render --json did not give a document of schema 1 \(unknown command\): is karidns-zone of this release\?$/.test(p)), noRender.problems.join('|'));
+    const badRender = await inspect(cfg, { run: okRun({ render: { stdout: '{"karidns-zone": 1, "render": {}}' } }), uid: undefined });
+    assert.ok(badRender.problems.some((p) => /render --json did not give a document/.test(p)));
+    // the files of the GUI: read here, once (static.js)
+    assert.ok(good.ui instanceof Map && good.ui.has('/index.html'));
+    assert.ok(good.notes.some((n) => /^ui .*: \d+ files, \d+ bytes$/.test(n)), good.notes.join('|'));
+    cfg.settings['ui-dir'] = path.join(d.dir, 'no-ui');
+    const noUi = await inspect(cfg, { run: okRun(), uid: undefined });
+    assert.ok(noUi.problems.some((p) => /^ui .*no-ui: ENOENT.*\(ui = no switches the GUI off\)$/.test(p)), noUi.problems.join('|'));
+    assert.equal(noUi.ui, null);
+    cfg.settings['ui-dir'] = undefined;
+    cfg.settings.ui = false;
+    const off = await inspect(cfg, { run: okRun(), uid: undefined });
+    assert.ok(off.notes.includes('ui: off (ui = no)') && off.ui === null && off.problems.length === 0);
+    cfg.settings.ui = true;
     // the files
     cfg.settings['sqlite-file'] = path.join(d.dir, 'missing.sqlite3');
     const missing = await inspect(cfg, { uid: undefined });
@@ -413,6 +453,13 @@ test('the real server on real files: it listens, answers, makes its key file, st
       health = await fetch(`http://127.0.0.1:${port}/api/v1/health`).then((r) => r.json(), () => undefined);
     }
     assert.deepEqual(health, { api: 1, status: 'ok', database: 'ok' });
+    // the GUI (here the placeholder page of webadmin/ui/), read when the service started
+    const page = await fetch(`http://127.0.0.1:${port}/`);
+    assert.equal(page.status, 200);
+    assert.equal(page.headers.get('content-type'), 'text/html; charset=utf-8');
+    assert.match(page.headers.get('content-security-policy'), /^default-src 'none'; script-src 'self'/);
+    assert.match(await page.text(), /<title>KariDNS WebAdmin<\/title>/);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/ui/app.css`)).status, 200);
     assert.match(fs.readFileSync(path.join(dir, 'totp.key'), 'utf8'), /^[0-9a-f]{64}\n$/);
     proc.emit('SIGTERM');
     assert.equal(await p, 0);
