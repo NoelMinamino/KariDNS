@@ -8,6 +8,7 @@
 #include <strings.h>
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -483,6 +484,10 @@ int pdns_zone_add_record(pdns_zone_t *z, const db_record_row_t *row) {
         zfail(z, false, 0, "internal error: record added after pdns_zone_finish()");
         return -1;
     }
+    if (z->zkind != KDB_ZK_PRIMARY) {                              /* B7b: a SLAVE / CONSUMER zone has no rows to convert; the loader does not feed them (PowerDNS keeps its transfer copy in records) */
+        zfail(z, false, 0, "internal error: record added to a secondary zone");
+        return -1;
+    }
     if (row->disabled) return 0;                                   /* rule 1 */
     int64_t id = row->id;
     if (++z->n_seen > z->opts.max_records) {
@@ -821,23 +826,35 @@ static void defs_free(ecs_tag_def_t *d, int n) {
 
 /* a $LOCATION-TAG / $ECS-SUBNET-TAG line of a zone file is one definition (one tag, several CIDRs, first match wins); the
  * database has one CIDR per row, so the consecutive rows of one tag are one definition.  -1: out of memory */
-static int defs_add(ecs_tag_def_t **defs, int *n, const char *tag, const char *cidr) {
+static int defs_add(ecs_tag_def_t **defs, int *n, pdns_defs_cap_t *cap, const char *tag, const char *cidr) {
     if (*n > 0 && strcmp((*defs)[*n - 1].tag, tag) == 0) {
         ecs_tag_def_t *d = &(*defs)[*n - 1];
-        ecs_cidr_entry_t *nc = realloc(d->cidrs, (size_t)(d->cidr_count + 1) * sizeof(*nc));
-        if (!nc) return -1;
-        d->cidrs = nc;
+        if (d->cidr_count >= cap->last_cap) {        /* (a tag may have tens of thousands of prefixes: the list of the last definition grows by doubling) */
+            int ncap = cap->last_cap > INT_MAX / 2 ? INT_MAX : cap->last_cap * 2;
+            if (ncap <= d->cidr_count) return -1;
+            ecs_cidr_entry_t *nc = realloc(d->cidrs, (size_t)ncap * sizeof(*nc));
+            if (!nc) return -1;
+            d->cidrs = nc;
+            cap->last_cap = ncap;
+        }
         char *c = strdup(cidr);
         if (!c) return -1;
-        memset(&nc[d->cidr_count], 0, sizeof(*nc));
-        nc[d->cidr_count].cidr = c;
-        cidr_entry_parse(&nc[d->cidr_count].parsed, c);
+        ecs_cidr_entry_t *e = &d->cidrs[d->cidr_count];
+        memset(e, 0, sizeof(*e));
+        e->cidr = c;
+        cidr_entry_parse(&e->parsed, c);
         d->cidr_count++;
         return 0;
     }
-    ecs_tag_def_t *nd = realloc(*defs, (size_t)(*n + 1) * sizeof(*nd));
-    if (!nd) return -1;
-    *defs = nd;
+    if ((size_t)*n >= cap->defs_cap) {
+        size_t ncap = cap->defs_cap ? cap->defs_cap * 2 : 8;
+        ecs_tag_def_t *grown = realloc(*defs, ncap * sizeof(**defs));
+        if (!grown) return -1;
+        *defs = grown;
+        cap->defs_cap = ncap;
+    }
+    ecs_tag_def_t *nd = *defs;
+    cap->last_cap = 1;
     ecs_tag_def_t *d = &nd[*n];
     memset(d, 0, sizeof(*d));
     d->tag = strdup(tag);
@@ -909,7 +926,7 @@ int pdns_zone_add_tagdef(pdns_zone_t *z, const db_tagdef_row_t *row) {
         zfail(z, false, 0, "karidns_zone_tagdefs (%.20s): '%.70s' is not a tag name (1-63 printable characters without blanks; none and default are reserved)", kind, tag);
         return -1;
     }
-    if (k == 0 ? defs_add(&z->loc_defs, &z->n_loc_defs, tag, cidr) : defs_add(&z->ecs_defs, &z->n_ecs_defs, tag, cidr)) {
+    if (k == 0 ? defs_add(&z->loc_defs, &z->n_loc_defs, &z->loc_cap, tag, cidr) : defs_add(&z->ecs_defs, &z->n_ecs_defs, &z->ecs_cap, tag, cidr)) {
         zfail(z, false, 0, "out of memory");
         return -1;
     }

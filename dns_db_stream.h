@@ -107,6 +107,8 @@
  *                         4 serial u32 R | 5 digest bytes (exactly 32; required unless the zone is not resident) |
  *                         6 resident u8 O (D1a: 0/1, absent = 1; 0 = the Backend has only the directory entry of the zone, no data and
  *                         no digest)
+ *                     An inventory may span several INVENTORY messages (the Backend sends a few hundred entries at a time);
+ *                     INVENTORY_END ends it and its n_zones is the total of the entries of all of them.
  *   INVENTORY_END (0x8004) 1 last_change_seq u64 R | 2 n_zones u64 R
  *   ZONE_RESULT (0x8005) 1 view view R | 2 zone name R | 3 status u8 R (0 applied,1 unchanged,2 rejected,
  *                     3 shadowed,4 deleted) | 4 reason str<=255 O

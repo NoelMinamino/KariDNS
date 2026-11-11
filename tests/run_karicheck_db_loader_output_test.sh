@@ -68,8 +68,12 @@ case_run "a last line without its line feed is still read" 0 \
     "0 zone(s) read, 0 error(s), 0 warning(s)"
 
 case_run "a line longer than the protocol allows is skipped and reported" 1 \
-    "printf 'E\t\t0\t'; head -c 300000 /dev/zero | tr '\\000' x; printf '\n'; printf 'R\t0\t0\t0\n'" \
-    "wrote a line longer than 262144 bytes; it was skipped"
+    "printf 'E\t\t0\t'; head -c 1100000 /dev/zero | tr '\\000' x; printf '\n'; printf 'R\t0\t0\t0\n'" \
+    "wrote a line longer than 1048576 bytes; it was skipped"
+
+case_run "a byte from 0x7F in a line is not a protocol line" 0 \
+    "printf 'E\t\t0\tcaf\303\251\n'; printf 'R\t0\t0\t0\n'" \
+    "line(s) that are not part of its protocol"
 
 case_run "text that is not part of the protocol is one warning naming the first line" 0 \
     "echo 'hello from the loader'; echo 'second'; printf 'R\t0\t0\t0\n'" \

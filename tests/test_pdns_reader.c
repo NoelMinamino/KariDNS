@@ -1379,6 +1379,14 @@ static void sec_digest(const pdns_zone_t *z, uint8_t out[KDB_DIGEST_LEN], uint32
 
 static void test_secondary(void) {
     printf("SLAVE / CONSUMER zones (B7b): domains.master, settings, KDB1 without data, digest\n");
+    {   /* a secondary zone takes no rows (the loader does not feed them): the caller's error fails the zone */
+        pdns_zone_t *z = pdns_zone_new("s.test", NULL);
+        db_record_row_t row = { 1, 3600, 0, false, true, false, "s.test", "A", "192.0.2.1", NULL };
+        CHECK(z != NULL && pdns_zone_set_secondary(z, KDB_ZK_SECONDARY, "192.0.2.1") == 0);
+        CHECK(pdns_zone_add_record(z, &row) == -1 && z->failed);
+        CHECK(strstr(z->error, "secondary zone") != NULL);
+        pdns_zone_free(z);
+    }
     struct { const char *master, *want; } ok[] = {
         { "192.0.2.1", "masters { 192.0.2.1 port 53; };" },
         { "192.0.2.1:5353", "masters { 192.0.2.1 port 5353; };" },
@@ -2054,6 +2062,24 @@ static void test_limits(void) {
         }
         CHECK(rc == -1);
         CHECK_HAS(z->error, "more than 4096 tinydns location definitions");
+        pdns_zone_free(z);
+        /* many prefixes of a few tags: the definition lists grow by doubling and come out in order (the rows of one tag are one definition) */
+        z = pdns_zone_new("z.test", NULL);
+        pdns_zone_add_record(z, &soa);
+        for (int t = 0; t < 20; t++) {
+            char tag[16];
+            snprintf(tag, sizeof(tag), "t%d", t);
+            for (int i = 0; i < 700; i++) {
+                char cidr[40];
+                snprintf(cidr, sizeof(cidr), "10.%d.%d.0/24", (t * 700 + i) / 256, (t * 700 + i) % 256);
+                db_tagdef_row_t l = { t % 2 ? "ecs" : "location", tag, cidr };
+                CHECK(pdns_zone_add_tagdef(z, &l) == 0);
+            }
+        }
+        CHECK(pdns_zone_finish(z) == 0);
+        CHECK(z->arena.bind_location_tag_count == 10 && z->arena.bind_ecs_tag_count == 10);
+        CHECK(z->arena.bind_location_tags[0].cidr_count == 700 && z->arena.bind_location_tags[9].cidr_count == 700);
+        CHECK(strcmp(z->arena.bind_location_tags[9].tag, "t18") == 0 && strcmp(z->arena.bind_location_tags[9].cidrs[699].cidr, "10.0.0.0/24") != 0);
         pdns_zone_free(z);
         /* two rows of karidns_record_tinydns for one record */
         db_tinydns_row_t two[] = { { 3, false, 10, "l2", false }, { 3, false, 20, "l2", false } };

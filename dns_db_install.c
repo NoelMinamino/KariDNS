@@ -87,6 +87,23 @@ static const dns_record_t *find_apex_soa(const zone_arena_t *a, const char *zone
   return NULL;
 }
 
+/* B8t-2: the rules for a SOA set: the zone check of the SOA RRs, and the frame is the reference SOA.  Run before the unencodable RRs are
+ * dropped and again after (a SOA of the set may be one that cannot be written).  0, or -1 with the reason in why */
+static int check_soa_set_rules(const db_zone_build_t *b, char *why, size_t whylen) {
+  char serr[320];
+  if (zone_arena_check_soa_set(&b->arena, b->zone, serr, sizeof(serr)) < 0) {
+    set_why(why, whylen, serr);
+    return -1;
+  }
+  const dns_record_t *ref = zone_arena_reference_soa(&b->arena, b->zone);
+  if (!ref || ref->rdata_count < 7 || parse_ttl_value(ref->rdata[3]) != b->sess.frame_refresh ||
+      parse_ttl_value(ref->rdata[4]) != b->sess.frame_retry || parse_ttl_value(ref->rdata[5]) != b->sess.frame_expire) {
+    set_why(why, whylen, "the opening SOA is not the reference SOA of the zone");
+    return -1;
+  }
+  return 0;
+}
+
 int db_zone_build_install(db_zone_build_t *b, zone_db_entry_t *entry, bool *notified, char *why, size_t whylen) {
   zone_arena_t *a = &b->arena;
   if (notified) *notified = false;
@@ -99,8 +116,9 @@ int db_zone_build_install(db_zone_build_t *b, zone_db_entry_t *entry, bool *noti
   const bool soa_set = b->sess.soa_set;
   uint64_t got = (uint64_t)a->count + 1 + b->sess.ext_records + (soa_set ? 1 : 0);
   if (got != b->rr_count) {
-    snprintf(why, whylen, "RR count mismatch: %llu received, %llu declared", (unsigned long long)got,
-             (unsigned long long)b->rr_count);
+    char msg[96];
+    snprintf(msg, sizeof(msg), "RR count mismatch: %llu received, %llu declared", (unsigned long long)got, (unsigned long long)b->rr_count);
+    set_why(why, whylen, msg);
     return -1;
   }
   if (!domain_names_match_ci(b->sess.initial_soa_name, b->zone) ||
@@ -129,11 +147,6 @@ int db_zone_build_install(db_zone_build_t *b, zone_db_entry_t *entry, bool *noti
       set_why(why, whylen, "the SOA records of the zone are not the ones SOA_SET announced");
       return -1;
     }
-    char serr[320];
-    if (zone_arena_check_soa_set(a, b->zone, serr, sizeof(serr)) < 0) {
-      snprintf(why, whylen, "%.200s", serr);
-      return -1;
-    }
     for (size_t i = 0; i < a->count; i++) {
       if (a->records[i].type_code != 6) continue;
       for (size_t j = i + 1; j < a->count; j++)
@@ -142,17 +155,13 @@ int db_zone_build_install(db_zone_build_t *b, zone_db_entry_t *entry, bool *noti
           return -1;
         }
     }
-    const dns_record_t *ref = zone_arena_reference_soa(a, b->zone);
-    if (!ref || ref->rdata_count < 7 || parse_ttl_value(ref->rdata[3]) != b->sess.frame_refresh ||
-        parse_ttl_value(ref->rdata[4]) != b->sess.frame_retry || parse_ttl_value(ref->rdata[5]) != b->sess.frame_expire) {
-      set_why(why, whylen, "the opening SOA is not the reference SOA of the zone");
-      return -1;
-    }
+    if (check_soa_set_rules(b, why, whylen) != 0) return -1;
   }
 
   /* an RR that cannot be written in wire format is dropped with a warning and the rest is published (as for a zone
    * file and AXFR-in); the SOA is read after that */
-  zone_drop_unencodable_logged(a, b->zone, "the database loader");
+  if (zone_drop_unencodable_logged(a, b->zone, "the database loader") > 0 && soa_set && check_soa_set_rules(b, why, whylen) != 0)
+    return -1;           /* (the checks above ran before the drop: the RR that went may have been a SOA of the set) */
   const dns_record_t *soa = find_apex_soa(a, b->zone);
   if (!soa) {
     set_why(why, whylen, "the apex SOA cannot be encoded");

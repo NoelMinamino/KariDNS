@@ -27,6 +27,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 #include <strings.h>
 #include <stdarg.h>
@@ -46,7 +47,7 @@ struct db_conn {
     char err[DB_ERRLEN];
     bool in_snapshot;
     bool has_changes;
-    sqlite3_stmt *st_apex_all, *st_apex_one, *st_zones, *st_zone_one, *st_rec_all, *st_rec_one, *st_rec_rng, *st_meta_all, *st_meta_one, *st_keys, *st_changes;
+    sqlite3_stmt *st_apex_all, *st_apex_one, *st_zones, *st_zone_one, *st_rec_all, *st_rec_one, *st_rec_rng, *st_meta_all, *st_meta_one, *st_keys, *st_changes, *st_cmax;
     sqlite3_stmt *st_dv_all, *st_dv_one;
     bool has_domain_views;
     sqlite3_stmt *st_prof;
@@ -178,7 +179,7 @@ static int sq_open_mode(db_conn_t **out, const db_source_t *src, char *err, size
         return ret;
     }
     unsigned ms = src->busy_timeout_ms ? src->busy_timeout_ms : 5000;
-    sqlite3_busy_timeout(c->db, (int)ms);
+    sqlite3_busy_timeout(c->db, ms > (unsigned)INT_MAX ? INT_MAX : (int)ms);
 #ifdef SQLITE_DBCONFIG_DEFENSIVE
     sqlite3_db_config(c->db, SQLITE_DBCONFIG_DEFENSIVE, 1, (int *)NULL);
 #endif
@@ -195,6 +196,11 @@ static int sq_open_mode(db_conn_t **out, const db_source_t *src, char *err, size
             return -1;
         }
     }
+#endif
+#ifdef SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE
+    /* The loader only reads: the last connection of a WAL database must not try to checkpoint (and remove the WAL) when it closes, as
+     * the user of the loader may not be allowed to write the file. */
+    if (!write) sqlite3_db_config(c->db, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, 1, (int *)NULL);
 #endif
     c->writable = write;
     int ret = write ? 0 : exec(c, "PRAGMA query_only=1");
@@ -225,8 +231,14 @@ static int sq_open_mode(db_conn_t **out, const db_source_t *src, char *err, size
         return ret;
     }
     c->path = strdup(path);
+    if (!c->path) {                      /* (without it poll_version would report "replaced" at every poll) */
+        snprintf(err, errlen, "sqlite3: out of memory");
+        sqlite3_close(c->db);
+        free(c);
+        return -1;
+    }
     struct stat sb;
-    if (c->path && stat(path, &sb) == 0) {
+    if (stat(path, &sb) == 0) {
         c->dev = sb.st_dev;
         c->ino = sb.st_ino;
         c->have_id = true;
@@ -268,6 +280,7 @@ static void sq_close(db_conn_t *c) {
     sqlite3_finalize(c->st_meta_one);
     sqlite3_finalize(c->st_keys);
     sqlite3_finalize(c->st_changes);
+    sqlite3_finalize(c->st_cmax);
     sqlite3_close(c->db);
     free(c);
 }
@@ -543,7 +556,7 @@ static int sq_begin_snapshot(db_conn_t *c) {
 /* every read statement back to the start, so that no cursor keeps the transaction (or the WAL read mark) busy */
 static void rearm_all(db_conn_t *c) {
     sqlite3_stmt *all[] = { c->st_apex_all, c->st_apex_one, c->st_zones, c->st_zone_one, c->st_rec_all, c->st_rec_one, c->st_rec_rng, c->st_meta_all, c->st_meta_one,
-                            c->st_keys, c->st_changes, c->st_dv_all, c->st_dv_one, c->st_prof };
+                            c->st_keys, c->st_changes, c->st_cmax, c->st_dv_all, c->st_dv_one, c->st_prof };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
         if (all[i]) rearm(all[i]);
     for (int i = 0; i < 2; i++) {
@@ -557,7 +570,9 @@ static int sq_end_snapshot(db_conn_t *c) {
     if (!c->in_snapshot) return 0;
     rearm_all(c);
     c->in_snapshot = false;
-    return exec(c, "COMMIT");
+    int rc = exec(c, "COMMIT");
+    if (rc != 0) sqlite3_exec(c->db, "ROLLBACK", NULL, NULL, NULL);    /* (a failed COMMIT may leave the transaction open: the snapshot must not live on) */
+    return rc;
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -620,38 +635,20 @@ static int sq_list_zones(db_conn_t *c, db_zone_cb cb, void *ud) {
 static int sq_find_zone(db_conn_t *c, const char *name, db_zone_cb cb, void *ud) {
     size_t n = strlen(name);
     if (n > 1 && name[n - 1] == '.') n--;
-    char *a = malloc(n + 2);
-    if (!a) {
-        set_err(c, "out of memory");
-        return -1;
-    }
+    char a[1100];                 /* the name without the dot, then the dot for the second spelling (SQLite copies the text: SQLITE_TRANSIENT) */
+    if (n > sizeof(a) - 2) return 0;       /* longer than any domain name (255 bytes, escapes included): no zone of that name */
     memcpy(a, name, n);
-    a[n] = '\0';
-    a[n + 1] = '\0';
+    a[n] = '.';
     int ret = prep(c, &c->st_zone_one,
                    "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content, r.id FROM domains d "
                    "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND r.name = d.name AND r.disabled = 0 "
                    "WHERE d.name COLLATE NOCASE IN (?1, ?2) ORDER BY d.id, r.id");
-    if (ret != 0) {
-        free(a);
-        return ret;
-    }
+    if (ret != 0) return ret;
     sqlite3_stmt *st = c->st_zone_one;
     rearm(st);
     sqlite3_bind_text(st, 1, a, (int)n, SQLITE_TRANSIENT);
-    char *b = malloc(n + 2);
-    if (!b) {
-        free(a);
-        set_err(c, "out of memory");
-        return -1;
-    }
-    memcpy(b, a, n);
-    b[n] = '.';
-    sqlite3_bind_text(st, 2, b, (int)n + 1, SQLITE_TRANSIENT);
-    ret = sq_zone_loop(c, st, cb, ud);
-    free(a);
-    free(b);
-    return ret;
+    sqlite3_bind_text(st, 2, a, (int)n + 1, SQLITE_TRANSIENT);
+    return sq_zone_loop(c, st, cb, ud);
 }
 
 /* the rows of a prepared records statement (already bound) to the callback */
@@ -776,7 +773,7 @@ static int sq_scan_domain_views(db_conn_t *c, const int64_t *domain_id, db_domai
         return DB_ERR_UNAVAILABLE;
     }
     sqlite3_stmt **slot = domain_id ? &c->st_dv_one : &c->st_dv_all;
-    int ret = prep(c, slot, domain_id ? "SELECT domain_id, view_name FROM karidns_domain_views WHERE domain_id = ?1"
+    int ret = prep(c, slot, domain_id ? "SELECT domain_id, view_name FROM karidns_domain_views WHERE domain_id = ?1 ORDER BY view_name"
                                       : "SELECT domain_id, view_name FROM karidns_domain_views ORDER BY domain_id");
     if (ret != 0) return ret;
     sqlite3_stmt *st = *slot;
@@ -938,17 +935,17 @@ static int sq_changes_max(db_conn_t *c, uint64_t *seq) {
         set_err(c, "karidns_changes does not exist in this database");
         return DB_ERR_UNAVAILABLE;
     }
-    sqlite3_stmt *st = NULL;
-    int rc = sqlite3_prepare_v2(c->db, "SELECT max(seq) FROM karidns_changes", -1, &st, NULL);
-    if (rc != SQLITE_OK) return sql_fail(c, rc, "prepare");
-    int ret = 0;
-    rc = sqlite3_step(st);
+    int ret = prep(c, &c->st_cmax, "SELECT max(seq) FROM karidns_changes");
+    if (ret != 0) return ret;
+    sqlite3_stmt *st = c->st_cmax;
+    rearm(st);
+    int rc = sqlite3_step(st);
     if (rc == SQLITE_ROW) {
         *seq = sqlite3_column_type(st, 0) == SQLITE_NULL ? 0 : (uint64_t)sqlite3_column_int64(st, 0);
     } else {
         ret = sql_fail(c, rc, "changes_max");
     }
-    sqlite3_finalize(st);
+    rearm(st);                       /* (the statement is kept: no cursor may hold the read transaction) */
     return ret;
 }
 
@@ -1631,24 +1628,34 @@ static int sq_w_insert_version_rrset(db_conn_t *c, int64_t version_id, const cha
 }
 
 const db_driver_t db_driver_sqlite3 = {
-    "sqlite3",       sq_open,         sq_close,           sq_errmsg,           sq_check_schema,
-    sq_begin_snapshot, sq_end_snapshot, sq_list_zones,    sq_scan_records,     sq_scan_metadata,
-    sq_zones_with_keys, sq_changes_since, sq_wait_fd,     sq_drain_notifications, sq_report_status,
-    sq_changes_max,   sq_scan_records_range, sq_scan_domain_views, sq_scan_profiles, sq_scan_ext, sq_poll_version,
-    false,          /* changes_unsettled: the cursor is the highest seq */
-    NULL, NULL, NULL,   /* B11 reload requests: PostgreSQL only (watch_requests, requests_max, reload_requests) */
-    sq_schema_findings, /* B12 */
-    sq_find_zone,       /* B13 */
-    NULL, NULL, NULL,   /* B13b scan_records_in, scan_metadata_in, scan_ext_in: PostgreSQL only (a statement costs no round trip here) */
-    sq_scan_apex,       /* D1a step 6 */
+    .name = "sqlite3",
+    .open = sq_open, .close = sq_close, .errmsg = sq_errmsg, .check_schema = sq_check_schema,
+    .begin_snapshot = sq_begin_snapshot, .end_snapshot = sq_end_snapshot, .list_zones = sq_list_zones,
+    .scan_records = sq_scan_records, .scan_metadata = sq_scan_metadata, .zones_with_keys = sq_zones_with_keys,
+    .changes_since = sq_changes_since, .wait_fd = sq_wait_fd, .drain_notifications = sq_drain_notifications,
+    .report_status = sq_report_status, .changes_max = sq_changes_max, .scan_records_range = sq_scan_records_range,
+    .scan_domain_views = sq_scan_domain_views, .scan_profiles = sq_scan_profiles, .scan_ext = sq_scan_ext,
+    .poll_version = sq_poll_version,
+    .changes_unsettled = false,          /* the cursor is the highest seq */
+    /* B11 reload requests: PostgreSQL only (watch_requests, requests_max, reload_requests are NULL) */
+    .schema_findings = sq_schema_findings,      /* B12 */
+    .find_zone = sq_find_zone,                  /* B13 */
+    /* B13b scan_records_in, scan_metadata_in, scan_ext_in: PostgreSQL only (a statement costs no round trip here) */
+    .scan_apex = sq_scan_apex,                  /* D1a step 6 */
     /* M2, the ZoneImporter: write access (open_write connections only) */
-    sq_open_write, sq_w_begin, sq_w_commit, sq_w_rollback, sq_w_create_zone, sq_w_delete_records, sq_w_insert_record, sq_w_insert_tags,
-    sq_w_insert_tinydns, sq_w_delete_tagdefs, sq_w_insert_tagdef, sq_w_delete_meta, sq_w_insert_meta, sq_w_set_view, sq_w_request_reload,
-    sq_w_zone_has_keys,
-    sq_w_set_audit,     /* schema version 3 */
-    sq_w_scan_auth, sq_w_update_record, sq_w_mark, sq_w_write_id, sq_w_delete_dnssec,       /* item C, the signer */
-    sq_w_update_orders, sq_w_insert_dnssec, sq_w_set_snapshot,
-    sq_w_set_actor, sq_w_zone_generation, sq_w_bump_serial, sq_w_insert_version, sq_w_insert_version_rrset,        /* items D and E */
+    .open_write = sq_open_write, .w_begin = sq_w_begin, .w_commit = sq_w_commit, .w_rollback = sq_w_rollback,
+    .w_create_zone = sq_w_create_zone, .w_delete_records = sq_w_delete_records, .w_insert_record = sq_w_insert_record,
+    .w_insert_tags = sq_w_insert_tags, .w_insert_tinydns = sq_w_insert_tinydns, .w_delete_tagdefs = sq_w_delete_tagdefs,
+    .w_insert_tagdef = sq_w_insert_tagdef, .w_delete_meta = sq_w_delete_meta, .w_insert_meta = sq_w_insert_meta,
+    .w_set_view = sq_w_set_view, .w_request_reload = sq_w_request_reload, .w_zone_has_keys = sq_w_zone_has_keys,
+    .w_set_audit = sq_w_set_audit,              /* schema version 3 */
+    /* item C, the signer */
+    .w_scan_auth = sq_w_scan_auth, .w_update_record = sq_w_update_record, .w_mark = sq_w_mark, .w_write_id = sq_w_write_id,
+    .w_delete_dnssec = sq_w_delete_dnssec, .w_update_orders = sq_w_update_orders, .w_insert_dnssec = sq_w_insert_dnssec,
+    .w_set_snapshot = sq_w_set_snapshot,
+    /* items D and E */
+    .w_set_actor = sq_w_set_actor, .w_zone_generation = sq_w_zone_generation, .w_bump_serial = sq_w_bump_serial,
+    .w_insert_version = sq_w_insert_version, .w_insert_version_rrset = sq_w_insert_version_rrset,
 };
 
 #endif /* KARIDNS_DB_SQLITE3 */

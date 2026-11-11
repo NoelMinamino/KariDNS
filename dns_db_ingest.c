@@ -489,18 +489,24 @@ static int64_t now_ms(void) {
 /* ------------------------------------------------------------------------------------------------------------- */
 
 /* Design 1.3: the stream may be read, written and watched, nothing else (no fcntl, no shutdown, no sockopt). */
-static void limit_stream_rights(int fd) {
+static bool limit_stream_rights(int fd) {
   cap_rights_t r;
   cap_rights_init(&r, CAP_READ, CAP_WRITE, CAP_EVENT);
-  if (cap_rights_limit(fd, &r) != 0 && errno != ENOSYS)
-    syslog(LOG_ERR, "[DB] cannot limit the rights of the loader stream: %s", strerror(errno));
+  if (cap_rights_limit(fd, &r) != 0 && errno != ENOSYS) {
+    syslog(LOG_ERR, "[DB] cannot limit the rights of the loader stream: %s; the stream is not used", strerror(errno));
+    return false;                 /* (a descriptor with all the rights of the sender's end is not kept) */
+  }
+  return true;
 }
 
-static void limit_ctrl_rights(int fd) {
+static bool limit_ctrl_rights(int fd) {
   cap_rights_t r;
   cap_rights_init(&r, CAP_RECV, CAP_EVENT);
-  if (cap_rights_limit(fd, &r) != 0 && errno != ENOSYS)
+  if (cap_rights_limit(fd, &r) != 0 && errno != ENOSYS) {
     syslog(LOG_ERR, "[DB] cannot limit the rights of the loader control socket: %s", strerror(errno));
+    return false;
+  }
+  return true;
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -584,13 +590,17 @@ static bool build_config(ing_t *g, ing_cfg_t *snap) {
     kdb_enc_str(&g->enc, 2, db->driver);
     if (db->server_id) enc_sane_str(&g->enc, 3, db->server_id);
     uint32_t idx = 0, listed = 0;
+    bool too_many = false;
     for (const view_config_t *v = cfg->views; v; v = v->next, idx++) {
       if (g->view_names && idx < g->nview_names) snprintf(g->view_names[idx], sizeof(g->view_names[idx]), "%s", v->name ? v->name : "");
       if (v->database_none) continue;
+      if (listed >= KDB_MAX_CONFIG_VIEWS) {         /* (the configuration check refuses this; here a view without a source is not sent as if it had one) */
+        too_many = true;
+        break;
+      }
       if (g->view_db && idx < g->nview_names) g->view_db[idx] = 1;
       const char *src = sqlite ? (v->database_file ? v->database_file : db->database_file)
                                : (v->database_schema ? v->database_schema : db->schema);
-      if (listed >= KDB_MAX_CONFIG_VIEWS) break;
       listed++;
       kdb_enc_nest_begin(&g->enc, 4);
       kdb_enc_u16(&g->enc, 1, (uint16_t)idx);
@@ -611,7 +621,7 @@ static bool build_config(ing_t *g, ing_cfg_t *snap) {
     kdb_enc_u32(&g->enc, 7, db->loader_threads);
     if (db->memory_limit) kdb_enc_u8(&g->enc, 8, 1);       /* D1a milestone 4: the directory only for the zones that are not in memory (design 3.3) */
     kdb_enc_u8(&g->enc, 9, db->signer_wait ? 1 : 0);        /* 0.6.0 item C: a changed zone of the signer waits for the signer */
-    ok =kdb_enc_end(&g->enc) == 0 && idx <= 0xFFFF && (snap->nviews == 0 || (g->view_names && g->view_db));
+    ok = kdb_enc_end(&g->enc) == 0 && !too_many && idx <= 0xFFFF &&(snap->nviews == 0 || (g->view_names && g->view_db));
   }
   rcu_aux_read_unlock();
   return ok;
@@ -1169,11 +1179,16 @@ static void *builder_thread(void *arg) {
   rcu_aux_thread_pin();
   struct kevent ev;
   burst_yield_t by = BURST_YIELD_INIT;
+  bool poll_warned = false;
   for (;;) {
     if (kevent(b->kq, NULL, 0, &ev, 1, NULL) < 0) {
       if (errno == EINTR) continue;
-      syslog(LOG_ERR, "[DB] a builder thread stops: kevent: %s", strerror(errno));
-      return NULL;
+      /* The wait is broken.  Returning would leave the job in the slot (and its flight entry) for ever, and the stream thread waiting
+       * for it; so the thread looks at its slot every few ms instead. */
+      if (!poll_warned) syslog(LOG_ERR, "[DB] a builder thread cannot wait for work (kevent: %s); it polls", strerror(errno));
+      poll_warned = true;
+      struct timespec nap = { 0, 5000000L };
+      nanosleep(&nap, NULL);
     }
     ing_job_t *j = atomic_exchange_explicit(&b->slot, NULL, memory_order_acquire);
     if (!j) continue;
@@ -1372,6 +1387,21 @@ static void sync_all(ing_t *g) {
   retire_if_due(g, true);
 }
 
+/* a zone of this name (in this view) is with a builder, or its result has not been taken yet */
+static bool name_in_flight_by_name(const ing_t *g, const char *view_name, const char *zone) {
+  for (uint32_t i = 0; i < g->nbuilders; i++) {
+    const ing_job_t *j = g->flight[i];
+    if (j && strcmp(j->view_name, view_name) == 0 && domain_names_match_ci(j->zone, zone)) return true;
+  }
+  return false;
+}
+
+/* the zones of this name that are in flight are finished (the others keep running): a ZONE_FAILED or ZONE_DELETE of it must not race on its record */
+static void drain_name(ing_t *g, const char *view_name, const char *zone) {
+  drain_results(g);
+  while (name_in_flight_by_name(g, view_name, zone)) wait_for_result(g);
+}
+
 static bool name_in_flight(ing_t *g, const ing_job_t *me) {
   /* in-flight zones of the same name must finish first: two builders would race on one registry record */
   for (uint32_t i = 0; i < g->nbuilders; i++) {
@@ -1384,6 +1414,7 @@ static bool name_in_flight(ing_t *g, const ing_job_t *me) {
 /* hand a complete zone over (or build it here) */
 static void job_submit(ing_t *g, ing_job_t *j) {
   if (g->nbuilders == 0 || j->skip) {
+    while (name_in_flight(g, j)) wait_for_result(g);      /* (a skip job runs here: a zone of the same name may still be in a builder) */
     job_execute(j);
     job_finish(g, j);
     retire_if_due(g, false);
@@ -1583,6 +1614,9 @@ typedef struct {
   ing_t *g;
   uint32_t n;
   bool bad;
+  const char *last_view;          /* the view of the last zone, and what the lookup of its index said */
+  uint16_t last_idx;
+  bool last_found;
 } inv_ctx_t;
 
 static bool inv_cb(void *ud, const char *view, const dbreg_zone_t *z) {
@@ -1593,16 +1627,19 @@ static bool inv_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   /* B6a: a zone whose last version was refused (or could not be read) is offered again by a loader that starts now: it
    * must not find the old version "up to date" and leave the error standing when the data are fixed */
   if (z->last_result == DBREG_REJECTED) return true;
-  uint16_t idx = 0;
-  bool found = false;
-  for (uint32_t i = 0; i < g->nview_names; i++) {
-    if (strcasecmp(g->view_names[i], view) == 0) {
-      idx = (uint16_t)i;
-      found = true;
-      break;
+  if (!c->last_view || (c->last_view != view && strcmp(c->last_view, view) != 0)) {      /* (the walk goes view by view: the lookup is cached) */
+    c->last_found = false;
+    for (uint32_t i = 0; i < g->nview_names; i++) {
+      if (strcasecmp(g->view_names[i], view) == 0) {
+        c->last_idx = (uint16_t)i;
+        c->last_found = true;
+        break;
+      }
     }
+    c->last_view = view;
   }
-  if (!found) return true;                               /* a view that left the configuration */
+  if (!c->last_found) return true;                       /* a view that left the configuration */
+  const uint16_t idx = c->last_idx;
   if (c->n >= ING_INV_CHUNK) return false;
   if (kdb_enc_nest_begin(&g->enc, 1) != 0 || kdb_enc_u16(&g->enc, 1, idx) != 0 || kdb_enc_name(&g->enc, 2, z->name) != 0 ||
       kdb_enc_i64(&g->enc, 3, z->source_id) != 0 || kdb_enc_u32(&g->enc, 4, zdir_serial(z)) != 0 ||
@@ -1619,7 +1656,7 @@ static void pump_inventory(ing_t *g) {
   burst_yield_t by = BURST_YIELD_INIT;
   while (g->inv_active && g->stream_fd >= 0 && g->out_len - g->out_off < ING_INV_QUEUE_LOW) {
     burst_yield_check(&by);                /* a million zones are read in chunks; the pinned worker on this CPU gets its turns */
-    inv_ctx_t c = { g, 0, false };
+    inv_ctx_t c = { .g = g };
     kdb_enc_reset(&g->enc);
     if (kdb_enc_begin(&g->enc, KDB_T_INVENTORY) != 0) {
       send_enc(g);
@@ -1941,7 +1978,7 @@ static void on_zone_failed(ing_t *g, const kdb_msg_t *m) {
   const char *vname = view_name_at(g, zf->view, true);
   if (vname[0]) {
     /* a zone of the same name in flight must be finished first (it would race on the record) */
-    drain_all(g);
+    drain_name(g, vname, zf->name);
     (void)dbreg_reject(vname, zf->name, zf->source_id, reason);
   }
   if (g->cur_req >= 0 && g->reqs[g->cur_req].view == zf->view && domain_names_match_ci(g->reqs[g->cur_req].zone, zf->name)) {
@@ -1955,7 +1992,7 @@ static void on_zone_delete(ing_t *g, const kdb_msg_t *m) {
   uint8_t st = KDB_ST_UNCHANGED;
   const char *vname = view_name_at(g, zd->view, true);
   if (vname[0]) {
-    drain_all(g);                                        /* a zone of the same name may be in flight */
+    drain_name(g, vname, zd->name);                      /* a zone of the same name may be in flight */
     int r = dbreg_delete(vname, zd->name, zd->source_id);
     if (r > 0) {
       st = KDB_ST_DELETED;
@@ -2178,7 +2215,10 @@ static void on_stream_readable(ing_t *g) {
 /* ------------------------------------------------------------------------------------------------------------- */
 
 static void adopt_stream(ing_t *g, int fd) {
-  limit_stream_rights(fd); /* at once: a received descriptor has all the rights of the sender's end */
+  if (!limit_stream_rights(fd)) {   /* at once: a received descriptor has all the rights of the sender's end */
+    close(fd);
+    return;
+  }
   if (g->stream_fd >= 0) {
     syslog(LOG_NOTICE, "[DB] a new loader stream replaces the old one");
     drop_stream(g);
@@ -2232,6 +2272,9 @@ static void on_ctrl_readable(ing_t *g) {
       if (errno == EINTR) continue;
       if (errno == EAGAIN || errno == EWOULDBLOCK) return;
       syslog(LOG_ERR, "[DB] recvmsg on the loader control socket: %s", strerror(errno));
+      if (errno == EMFILE || errno == ENFILE || errno == ENOMEM || errno == ENOBUFS) return;      /* (it may pass: the message is tried again) */
+      close(g->ctrl_fd);              /* a permanent error would be reported again at every wake-up: stop watching, as for the end of the stream */
+      g->ctrl_fd = -1;
       return;
     }
     if (n == 0) { /* the supervisor is gone: the server is going down; stop watching so the thread does not spin */
@@ -2353,20 +2396,23 @@ static void apex_walk_step(ing_t *g) {
 static void reeval_settings(ing_t *g) {
   (void)g;
   reeval_ctx_t c = { NULL, 0, 0, 0, 0, 0 };
-  rcu_aux_read_lock();
-  c.cfg = acquire_config_snapshot();
   dbreg_cursor_t cur;
   memset(&cur, 0, sizeof(cur));
   /* in chunks: a hold of the rebuild lock over a million zones (50 ms) would stall a reload or a delta that needs it, and
-   * the ingest thread shares its CPU with a pinned worker (burst_yield()) */
-  while (!dbreg_walk(&cur, reeval_cb, &c)) {
+   * the ingest thread shares its CPU with a pinned worker (burst_yield()).  The read section of the RCU is held for one chunk
+   * only (not across the sleeps: a writer's grace period would wait for it); every chunk takes the configuration anew. */
+  for (;;) {
+    rcu_aux_read_lock();
+    c.cfg = acquire_config_snapshot();
+    bool done = dbreg_walk(&cur, reeval_cb, &c);
+    if (done && c.with_acl > 0 && !db_acl_ceiling_configured(c.cfg))
+      syslog(LOG_WARNING, "[DB] %u zone(s) have ACLs in their database settings, but options { database { acl-ceiling } } is not "
+                          "configured: they refuse every client", c.with_acl);
+    rcu_aux_read_unlock();
+    if (done) break;
     struct timespec ts = { 0, BURST_YIELD_NS };
     nanosleep(&ts, NULL);
   }
-  if (c.with_acl > 0 && !db_acl_ceiling_configured(c.cfg))
-    syslog(LOG_WARNING, "[DB] %u zone(s) have ACLs in their database settings, but options { database { acl-ceiling } } is not "
-                        "configured: they refuse every client", c.with_acl);
-  rcu_aux_read_unlock();
   atomic_store_explicit(&g_settings_missing_keys, c.missing, memory_order_relaxed);
   if (c.zones > 0)
     syslog(LOG_INFO, "[DB] configuration reloaded: settings of %u database zone(s) checked against it (%u with ACLs, %u naming a "
@@ -2464,7 +2510,7 @@ static void process_requests(ing_t *g) {
     switch (it.type) {
     case RQ_ALL:
       if (ready) {
-        send_reload_req(g, it.id, true, 0, NULL, false);
+        send_reload_req(g, it.id, true, 0, NULL, it.force);
         syslog(LOG_NOTICE, "[DB] reload requested (request %llu): the loader compares every source with the zones served",
                (unsigned long long)it.id);
       } else {
@@ -3236,7 +3282,10 @@ bool db_ingest_hold_queries(void) {
 }
 
 static void fetch_adopt(ing_t *g, int fd) {
-  limit_stream_rights(fd);
+  if (!limit_stream_rights(fd)) {
+    close(fd);
+    return;
+  }
   if (g->fetch_fd >= 0) fetch_drop(g);
   g->fetch_fd = fd;
   struct kevent ev[2];
@@ -3433,7 +3482,7 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
     syslog(LOG_ERR, "[DB] cannot start the ingest thread: %s", g->kq < 0 ? strerror(errno) : "no control socket or memory");
     return false;
   }
-  limit_ctrl_rights(ctrl_fd);
+  if (!limit_ctrl_rights(ctrl_fd)) return false;
   struct kevent ev[6];
   EV_SET(&ev[0], ctrl_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
   EV_SET(&ev[1], ING_EVT_CONFIG, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
