@@ -126,6 +126,13 @@ A zone file syntax and configuration validation utility. It performs pre-flight 
 ./karicheck zone example.com /path/to/example.com.zone
 ```
 
+### 3a. `karidns-tapstat`
+Query analytics outside the server: it receives the dnstap stream of `karidns` on a UNIX socket (or reads a Frame Streams file) and every few seconds writes a summary per zone, query name, query type, response code and client prefix (text, JSON or a Prometheus textfile), in fixed-size tables. Files and standard output only. See the **[karidns-tapstat(8) Manual](docs/karidns-tapstat.md)**.
+
+```sh
+./karidns-tapstat -s /var/run/karidns/tapstat.sock -z example.com -i 60 -f prom -o /var/tmp/karidns_tapstat.prom
+```
+
 ### 3b. `karidns-zone` (database packages)
 The importer and exporter for zones in a PowerDNS 5.1 database (SQLite3 or PostgreSQL): `import` writes a zone file or a tinydns data file into the database in one transaction (with the checks of `karicheck`, the `check-*` options and size limits of the configuration, and a read-back through the loader's reader before the commit), `export` writes a zone, or every zone (`--all --dir`, a backup), as a zone file in canonical order. It runs as an ordinary user. See the **[karidns-zone(1) Manual](docs/karidns-zone.md)**.
 
@@ -247,7 +254,7 @@ pkg add karidns-?.?.?-FreeBSD-14-amd64.pkg
 ```sh
 # Copy sample configuration
 cp /usr/local/etc/karidns/karidns.conf.sample /usr/local/etc/karidns/karidns.conf
-cp /usr/local/etc/karidns/zones/example.local.zone.sample /usr/local/etc/karidns/zones/example.local.zone
+cp /usr/local/etc/karidns/zones/example.test.zone.sample /usr/local/etc/karidns/zones/example.test.zone
 
 # Enable and start daemon
 sysrc karidns_enable="YES"

@@ -5,6 +5,8 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
+/* Tests only: true makes enter_capsicum_sandbox() skip cap_enter().  A plain global, not a setter or a test macro: the unit tests are built
+ * without a common test define, and the server never writes it. */
 extern bool g_bypass_cap_enter;
 
 void enter_capsicum_sandbox(void);
@@ -42,8 +44,6 @@ bool resolve_run_identity(const char *user, const char *group, run_identity_t *i
                           char *err, size_t errlen);
 /* resolve_run_identity() の結果に従い、root 起動なら権限を降格する。
  * 非 root 起動で検証に通った場合は何もしない。 */
-bool apply_run_identity(const char *user, const char *group, char *err, size_t errlen);
-/* 解決済みの id で降格する (apply_run_identity() の後半)。 */
 bool apply_run_identity_id(const run_identity_t *id, char *err, size_t errlen);
 
 /* 起動時に main() が1回だけ解決した実行ユーザー (O-18)。fork した子プロセス
@@ -51,7 +51,8 @@ bool apply_run_identity_id(const run_identity_t *id, char *err, size_t errlen);
  * 実行中に名前を引き直さない。 */
 extern run_identity_t g_run_identity;
 
-/* getpwnam_r() / getgrnam_r() による名前解決 (スレッド安全)。見つからなければ false。 */
+/* getpwnam_r() / getgrnam_r() による名前解決 (スレッド安全)。見つからなければ false。
+ * false のとき errno は 0 (名前が無い) か、引き当て自体の失敗 (ENOMEM、ERANGE ...)。数字の uid / gid は受け付けない (名前だけ)。 */
 bool lookup_user_ids(const char *user, uid_t *uid, gid_t *gid);
 bool lookup_group_id(const char *group, gid_t *gid);
 
@@ -60,6 +61,7 @@ bool lookup_group_id(const char *group, gid_t *gid);
 __attribute__((noreturn)) void backend_exit(int code);
 
 /* カバレッジ計測ビルドでプロファイルを書き出す (通常ビルドと capability mode の中では何もしない)。
+ * LLVM のプロファイル用ランタイムは weak シンボルで参照するので、ランタイムが無い通常のビルドでは何もしない関数になる。
  * シグナルハンドラからも呼べる。 */
 void backend_profile_flush(void);
 

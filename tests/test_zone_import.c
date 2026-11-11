@@ -1841,6 +1841,17 @@ static char *do_export_ex(const char *zone, unsigned plain) {
 
 /* export --signer (ZX_PLAIN_CHAIN, 0.6.0 item C): the input of dnssec-signzone.  A signed zone that someone changed has no complete chain (the new name has no RRSIG(NSEC)),
  * so the reader and the plain export refuse it; without the chain the zone can be read, and the other signatures stay. */
+/* the NSEC, NSEC3 and NSEC3PARAM records of an export (a token of that name that does not follow the word RRSIG: the RRSIG over them are meant to stay) */
+static int chain_rrs(const char *t) {
+    int n = 0;
+    for (const char *p = t; (p = strstr(p, "NSEC")) != NULL; p += 4) {
+        if (p > t && p[-1] != ' ' && p[-1] != '\t') continue;
+        if (p - t >= 6 && (p[-1] == ' ' || p[-1] == '\t') && strncmp(p - 6, "RRSIG", 5) == 0) continue;
+        n++;
+    }
+    return n;
+}
+
 static void t_export_signer(void) {
     printf("  export --signer (ZX_PLAIN_CHAIN)\n");
     if (!signer_base()) return;
@@ -1854,8 +1865,8 @@ static void t_export_signer(void) {
     char *chainless = do_export_ex("example.test", ZX_PLAIN_CHAIN);
     CHECK(chainless != NULL);
     if (chainless) {
-        CHECK(strstr(chainless, " NSEC ") == NULL && strstr(chainless, "NSEC3") == NULL);              /* no chain, ... */
-        CHECK(strstr(chainless, " RRSIG NSEC") == NULL && strstr(chainless, "RRSIG\tNSEC") == NULL);   /* ... no signature over it ... */
+        CHECK(chain_rrs(chainless) == 0);              /* no chain, ... */
+        CHECK(strstr(chainless, "RRSIG NSEC") != NULL || strstr(chainless, "RRSIG\tNSEC") != NULL);   /* ... but the signature over it stays (0.6.1: dnssec-signzone -u keeps what verifies) ... */
         CHECK_HAS(chainless, "192.0.2.80");
         CHECK(strstr(chainless, "RRSIG") != NULL && strstr(chainless, "DNSKEY") != NULL);              /* ... the other signatures and the key stay */
         free(chainless);
@@ -1869,9 +1880,32 @@ static void t_export_signer(void) {
     CHECK(chainless != NULL);
     if (chainless) {
         CHECK_HAS(chainless, "192.0.2.99");
-        CHECK(strstr(chainless, " NSEC ") == NULL && strstr(chainless, "RRSIG") != NULL);
+        CHECK(chain_rrs(chainless) == 0 && strstr(chainless, "RRSIG") != NULL);
         free(chainless);
     }
+    /* the signature over the chain record of a name that is gone does not go to the signer (the reader would refuse the zone after the signing): NSEC, and NSEC3 whose
+     * hash is no row's ordername; the signature of a name that is there stays */
+    be_exec("INSERT INTO records (domain_id, name, type, content, ttl) SELECT id, 'gone.example.test', 'RRSIG', 'NSEC 8 3 3600 20300601000000 20200101000000 1 example.test. AAAA', 3600 FROM domains WHERE name = 'example.test'");
+    be_exec("INSERT INTO records (domain_id, name, type, content, ttl) SELECT id, 'fphivg4u4kqm6nlhk25bhvuatq4bngu1.example.test', 'RRSIG', 'NSEC3 8 3 3600 20300601000000 20200101000000 1 example.test. AAAA', 3600 FROM domains WHERE name = 'example.test'");
+    chainless = do_export_ex("example.test", ZX_PLAIN_CHAIN);
+    CHECK(chainless != NULL);
+    if (chainless) {
+        CHECK(strstr(chainless, "gone") == NULL && strstr(chainless, "fphivg4u4kqm6nlhk25bhvuatq4bngu1") == NULL && strstr(chainless, "FPHIVG4U4KQM6NLHK25BHVUATQ4BNGU1") == NULL);
+        CHECK(chain_rrs(chainless) == 0 && strstr(chainless, "RRSIG") != NULL);
+        free(chainless);
+    }
+    be_exec("DELETE FROM records WHERE name IN ('gone.example.test', 'fphivg4u4kqm6nlhk25bhvuatq4bngu1.example.test')");
+    /* a kept signature line is written only for an owner the master-file reader takes as a name: not one that starts with '$' (a directive), not one with a
+     * control octet (an RRSIG over NSEC3PARAM is kept whatever its owner, so these reach the line writer) */
+    be_exec("INSERT INTO records (domain_id, name, type, content, ttl) SELECT id, '$x.example.test', 'RRSIG', 'NSEC3PARAM 8 2 3600 20300601000000 20200101000000 1 example.test. AAAA', 3600 FROM domains WHERE name = 'example.test'");
+    be_exec("INSERT INTO records (domain_id, name, type, content, ttl) SELECT id, 'c\001.example.test', 'RRSIG', 'NSEC3PARAM 8 2 3600 20300601000000 20200101000000 1 example.test. AAAA', 3600 FROM domains WHERE name = 'example.test'");
+    chainless = do_export_ex("example.test", ZX_PLAIN_CHAIN);
+    CHECK(chainless != NULL);
+    if (chainless) {
+        CHECK(strstr(chainless, "$x.example.test") == NULL && strstr(chainless, "c\001.example.test") == NULL);
+        free(chainless);
+    }
+    be_exec("DELETE FROM records WHERE name = '$x.example.test' OR name LIKE 'c_.example.test'");
     /* a zone with keys and no PRESIGNED is refused by the plain export, not by the signer's */
     be_exec("DELETE FROM domainmetadata WHERE kind IN ('PRESIGNED', 'NSEC3PARAM', 'X-KARIDNS-SIGNER')");
     be_exec("INSERT INTO cryptokeys (domain_id, flags, active, content) SELECT id, 257, true, 'k' FROM domains WHERE name = 'example.test'");
@@ -1885,8 +1919,58 @@ static void t_export_signer(void) {
     be_exec("INSERT INTO records (domain_id, name, type, content, ttl) SELECT id, 'x.example.test', 'RRSIG', 'TYPE50 8 3 3600 20300601000000 20200101000000 1 example.test. AAAA', 3600 FROM domains WHERE name = 'example.test'");
     be_exec("INSERT INTO records (domain_id, name, type, content, ttl) SELECT id, 'y.example.test', 'RRSIG', NULL, 3600 FROM domains WHERE name = 'example.test'");
     chainless = do_export_ex("example.test", ZX_PLAIN_CHAIN);
-    CHECK(chainless == NULL || strstr(chainless, "TYPE50") == NULL);
+    CHECK(chainless == NULL || strstr(chainless, "x.example.test") != NULL);      /* (0.6.1: an RRSIG over the chain stays; this odd one may be refused by the reader) */
     free(chainless);
+}
+
+/* import --signer writes only the DNSSEC rows that differ (0.6.1): a second signing whose rows are the same leaves them, with their ids, and the change log lists only
+ * what changed (the SOA row); a changed signature is one DELETE and one INSERT */
+static void t_signer_diff(void) {
+    printf("  import --signer: only the rows that differ are written\n");
+    if (!signer_base()) return;
+    zi_opts_t o = signer_opts();
+    zi_result_t r;
+    char *s = signed_text(11, "20300101000000", "20300601000000", K_SOA_TAIL);
+    CHECK(imp_signed(&o, s, &r) == ZI_OK);
+    free(s);
+    CHECK_MSG(r.records_inserted == 16 && r.records_deleted == 0, "%zu inserted, %zu deleted", r.records_inserted, r.records_deleted);
+    long ids = qn("SELECT sum(id) FROM records WHERE type IN ('RRSIG', 'DNSKEY')");
+    long seq0 = qn("SELECT coalesce(max(seq), 0) FROM karidns_changes");
+    s = signed_text(12, "20300101000000", "20300601000000", K_SOA_TAIL);       /* a serial that grew, every signature the same */
+    log_reset();
+    CHECK(imp_signed(&o, s, &r) == ZI_OK);
+    free(s);
+    CHECK_MSG(r.committed && r.records_inserted == 0 && r.records_deleted == 0, "%zu inserted, %zu deleted", r.records_inserted, r.records_deleted);
+    CHECK(serial_of("example.test") == 12);
+    CHECK(qn("SELECT sum(id) FROM records WHERE type IN ('RRSIG', 'DNSKEY')") == ids && qn("SELECT count(*) FROM records WHERE type = 'RRSIG'") == 15);
+    CHECK(meta_n("example.test", "PRESIGNED") == 1 && meta_n("example.test", "X-KARIDNS-SIGNER") == 1);
+    CHECK(r.has_write_id);
+    if (g_be == BE_SQLITE) {
+        /* the change log of the write is the SOA row: not one row per DNSSEC row */
+        long n = qn("SELECT count(*) FROM karidns_changes WHERE seq > %ld", seq0);
+        CHECK_MSG(n >= 1 && n <= 2, "%ld log rows", n);
+        CHECK(r.write_id.seq_first > (unsigned long long)seq0 && r.write_id.seq_last >= r.write_id.seq_first);
+    }
+    s = signed_text(13, "20300101000000", "20310101000000", K_SOA_TAIL);       /* the signatures but the SOA's are new */
+    CHECK(imp_signed(&o, s, &r) == ZI_OK);
+    free(s);
+    CHECK_MSG(r.records_inserted == 14 && r.records_deleted == 14, "%zu inserted, %zu deleted", r.records_inserted, r.records_deleted);
+    CHECK(qn("SELECT count(*) FROM records WHERE type = 'RRSIG'") == 15 && qn("SELECT count(*) FROM records WHERE type = 'RRSIG' AND content LIKE '%%20310101000000%%'") == 14);
+    s = signed_text(14, "20300201000000", "20310101000000", K_SOA_TAIL);       /* only the SOA's signature */
+    CHECK(imp_signed(&o, s, &r) == ZI_OK);
+    free(s);
+    CHECK_MSG(r.records_inserted == 1 && r.records_deleted == 1, "%zu inserted, %zu deleted", r.records_inserted, r.records_deleted);
+    CHECK(r.has_expire && r.min_expire > 0);
+    /* a disabled DNSSEC row in the database is never the same as a row of the file: it goes, and the file's row is inserted */
+    be_exec("UPDATE records SET disabled = true WHERE type = 'DNSKEY'");
+    s = signed_text(15, "20300201000000", "20310101000000", K_SOA_TAIL);
+    CHECK(imp_signed(&o, s, &r) == ZI_OK);
+    free(s);
+    CHECK_MSG(r.records_inserted == 1 && r.records_deleted == 1, "%zu inserted, %zu deleted", r.records_inserted, r.records_deleted);
+    CHECK(qn("SELECT count(*) FROM records WHERE type = 'DNSKEY' AND NOT disabled") == 1 && qn("SELECT count(*) FROM records WHERE type = 'DNSKEY'") == 1);
+    char *x = do_export("example.test", NULL, NULL);                          /* the zone the reader serves is the file's */
+    CHECK(x != NULL);
+    free(x);
 }
 
 static void t_signer(void) {
@@ -1979,7 +2063,7 @@ static void t_signer(void) {
     CHECK(imp_signed(&o, s12, &r) == ZI_OK);
     o.report = NULL;
     CHECK(r.committed && r.old_serial == 11 && r.new_serial == 12 && serial_of("example.test") == 12);
-    CHECK_MSG(r.records_deleted == 17 && r.records_inserted == 16, "%zu deleted, %zu inserted", r.records_deleted, r.records_inserted);      /* the disabled RRSIG goes too */
+    CHECK_MSG(r.records_deleted == 2 && r.records_inserted == 1, "%zu deleted, %zu inserted", r.records_deleted, r.records_inserted);      /* the SOA's changed signature and the disabled RRSIG; the other rows stay */
     CHECK_MSG(r.rows_updated == 2, "%zu rows updated", r.rows_updated);                                       /* the SOA, and the empty non-terminal (ordername NULL for NSEC) */
     CHECK(qn("SELECT count(*) FROM records WHERE name = 'b.example.test' AND type IS NULL AND ordername IS NULL") == 1);
     CHECK(qn("SELECT count(*) FROM records WHERE name = 'off.example.test'") == 1);                          /* a disabled row stays */
@@ -2182,6 +2266,7 @@ static void t_signer(void) {
         zi_opts_t f = signer_opts();
         f.drv = &g_sdrv;
         if (op == SF_DELREC || op == SF_CONFLICT_DEL) be_exec("INSERT INTO records (domain_id, name, type, content, ttl, disabled, auth) SELECT id, 'old.example.test', 'RRSIG', 'A 8 3 3600 20300101000000 20200101000000 1 example.test. x', 300, false, true FROM domains WHERE name = 'example.test'");
+        if (op == SF_DELMETA) be_exec("INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'PRESIGNED', '0' FROM domains WHERE name = 'example.test'");      /* (a value to replace: metadata that is right is not written again) */
         state_of(before, sizeof(before));
         g_sfail = op;
         log_reset();
@@ -3004,6 +3089,7 @@ static void run_scenarios(void) {
     t_export();
     t_driver();
     t_signer();
+    t_signer_diff();
     t_export_signer();
     t_signer_canonical();
     t_signer_zone_import();

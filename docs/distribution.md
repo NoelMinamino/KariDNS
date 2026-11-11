@@ -50,15 +50,16 @@ Use `pkg add -f` to replace an already installed version in place.
   - `/usr/local/sbin/karidns` (Authoritative DNS daemon)
   - `/usr/local/bin/karictl` (Control channel client)
   - `/usr/local/bin/karicheck` (Configuration & zone syntax checker)
+  - `/usr/local/bin/karidns-tapstat` (dnstap query statistics, see `karidns-tapstat.md`)
   - `/usr/local/bin/dag` (DNS query client & fuzzer)
 - **Configuration & Zones:**
   - `/usr/local/etc/karidns/karidns.conf.sample`
   - `/usr/local/etc/karidns/karictl.conf.sample`
-  - `/usr/local/etc/karidns/zones/example.local.zone.sample`
+  - `/usr/local/etc/karidns/zones/example.test.zone.sample`
 - **Service Management:**
   - `/usr/local/etc/rc.d/karidns`
 - **Manuals:**
-  - `/usr/local/share/doc/karidns/` (`karidns.md`, `karictl.md`, `karicheck.md`, `dag.md`, `dag_replay.md`)
+  - `/usr/local/share/doc/karidns/` (`karidns.md`, `karictl.md`, `karicheck.md`, `karidns-tapstat.md`, `dag.md`, `dag_replay.md`)
 - **Database packages only** (§2.5):
   - `/usr/local/libexec/karidns-dbloader` (the database loader, root:wheel, 0555)
   - `/usr/local/bin/karidns-zone` (the zone importer and exporter, with the same drivers, root:wheel, 0555)
@@ -70,7 +71,7 @@ Use `pkg add -f` to replace an already installed version in place.
 1. Copy the configuration and sample zone, then edit them (`user`, `group`, secrets, zones):
    ```sh
    cp /usr/local/etc/karidns/karidns.conf.sample /usr/local/etc/karidns/karidns.conf
-   cp /usr/local/etc/karidns/zones/example.local.zone.sample /usr/local/etc/karidns/zones/example.local.zone
+   cp /usr/local/etc/karidns/zones/example.test.zone.sample /usr/local/etc/karidns/zones/example.test.zone
    ```
 2. Enable and start:
    ```sh
@@ -189,16 +190,16 @@ brew install NoelMinamino/tap/dag
 
 ```sh
 # Standard UDP Query
-dag example.local A @127.0.0.1
+dag example.test A @127.0.0.1
 
 # TCP Query with DNSSEC & EDNS
-dag example.local A @127.0.0.1 +tcp +dnssec +edns
+dag example.test A @127.0.0.1 +tcp +dnssec +edns
 
 # Query several servers and compare the answers
-dag example.local A @192.0.2.1,198.51.100.1,203.0.113.1
+dag example.test A @192.0.2.1,198.51.100.1,203.0.113.1
 
 # Anomaly testing / packet fuzzing (local test servers only)
-dag example.local A @127.0.0.1 --break qdcount=2
+dag example.test A @127.0.0.1 --break qdcount=2
 ```
 
 ---

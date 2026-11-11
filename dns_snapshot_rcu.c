@@ -28,6 +28,10 @@
 #include <sys/types.h>
 #include <time.h>
 
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW 0
+#endif
+
 pthread_mutex_t g_zone_db_rebuild_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // Protected by g_zone_db_rebuild_lock
@@ -158,7 +162,7 @@ static void zdir_ref(zdir_t *d) {
 /* give back one reference of an entry that the directory kept; the last one frees the entry */
 static void zdir_entry_unref(zone_db_entry_t *en) {
   if (atomic_fetch_sub_explicit(&en->snapshot_refs, 1, memory_order_acq_rel) == 1) {
-    syslog(LOG_INFO, "[GC] Freeing deleted zone '%s'", en->domain);
+    syslog(LOG_DEBUG, "[GC] Freeing deleted zone '%s'", en->domain);   /* one line per zone: a bulk replace of 100k zones is not an INFO event */
     free_zone_db_entry(en);
   }
 }
@@ -977,9 +981,6 @@ void *gc_snapshot_thread(void *arg) {
 
 static char *server_load_file_cb(parse_context_t *ctx, const char *rel_path, dev_t *out_dev, ino_t *out_ino) {
     (void)ctx;
-#ifndef O_NOFOLLOW
-#define O_NOFOLLOW 0
-#endif
     /* O_NONBLOCK: opening a FIFO for reading would wait for a writer (here with writer_lock held); the fstat() below refuses
      * anything but a regular file */
     int fd = open_via_dir_cache(rel_path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK, 0, false);
@@ -1734,6 +1735,11 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
              "in view '%s' (first: '%s') in '%s'", entry->domain, ctx.out_of_zone_count, entry->view_name,
              ctx.first_out_of_zone ? ctx.first_out_of_zone : "", file);
   }
+  if (ctx.skipped_data_count > 0) {   /* as karicheck reports it (DC_ZONE_TINYDNS_SKIPPED) */
+      syslog(LOG_WARNING, "[Zone] zone '%s': %zu tinydns line(s) have data that cannot be kept (an SSHFP fingerprint that is not hexadecimal) "
+             "and are left out (first: '%s') in '%s'", entry->domain, ctx.skipped_data_count,
+             ctx.first_skipped_data ? ctx.first_skipped_data : "", file);
+  }
   /* X-32: 書けないレコードはその 1 件だけ警告して除く (応答や AXFR で他のレコードを巻き込まない) */
   {
       char from[PATH_MAX + 8];
@@ -2291,8 +2297,10 @@ static void dbreg_unlink(dbreg_view_t *rv, dbreg_zone_t *z) {
     atomic_fetch_add_explicit(&g_walk_unlink_gen, 1, memory_order_relaxed);
     dbreg_zone_t **pp = &rv->tab[z->hash & (rv->nb - 1)];
     while (*pp && *pp != z) pp = &(*pp)->next;
-    if (*pp) *pp = z->next;
-    rv->count--;
+    if (*pp) {
+        *pp = z->next;
+        rv->count--;   /* only what was in the chain */
+    }
 }
 
 static bool dbreg_queue_reserve(zdir_elem_t ***arr, size_t n, size_t *cap) {

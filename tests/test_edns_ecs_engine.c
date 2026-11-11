@@ -180,6 +180,29 @@ static void test_tag_def_pack_unpack(void) {
     assert(unpack_tag_def_rdata(NULL, 0, &unpacked_defs, &unpacked_count, NULL) == false);
     assert(unpack_tag_def_rdata(buf, 2, &unpacked_defs, &unpacked_count, NULL) == false);
 
+    {   // a count of CIDRs that the data cannot hold is refused before anything is allocated for it
+        uint8_t big[] = { 't', 0, 0xFF, 0xFF, '1', 0 };
+        unpacked_defs = NULL;
+        unpacked_count = 0;
+        assert(unpack_tag_def_rdata(big, sizeof(big), &unpacked_defs, &unpacked_count, NULL) == false);
+        assert(unpacked_defs == NULL && unpacked_count == 0);
+        // the data ends inside the CIDR list: false, and nothing is left behind
+        uint8_t cut[] = { 't', 0, 0, 2, '1', '.', '2', '.', '3', '.', '4', 0 };
+        assert(unpack_tag_def_rdata(cut, sizeof(cut), &unpacked_defs, &unpacked_count, NULL) == false);
+        assert(unpacked_defs == NULL && unpacked_count == 0);
+        // a capacity the caller kept for an array that is gone does not make the store go to NULL
+        uint8_t one[] = { 't', 0, 0, 1, '1', '.', '2', '.', '3', '.', '4', 0 };
+        int stale_cap = 8;
+        assert(unpack_tag_def_rdata(one, sizeof(one), &unpacked_defs, &unpacked_count, &stale_cap) == true);
+        assert(unpacked_count == 1 && unpacked_defs != NULL && stale_cap >= 1);
+        free(unpacked_defs[0].tag);
+        free(unpacked_defs[0].cidrs[0].cidr);
+        free(unpacked_defs[0].cidrs);
+        free(unpacked_defs);
+        unpacked_defs = NULL;
+        unpacked_count = 0;
+    }
+
     printf("  -> Tag def pack/unpack passed.\n");
 }
 

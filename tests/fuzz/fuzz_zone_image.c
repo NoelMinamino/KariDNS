@@ -106,7 +106,16 @@ static void exercise_accessors(const zone_image_t *img) {
 
 static void check_image(zone_arena_t *a, const char *apex) {
     zone_image_t *img = zone_image_freeze(a, apex);
-    if (!img) fail(); /* every record serializes (drop_unencodable ran) and the builder is indexed */
+    if (!img) {
+        /* every record serializes (drop_unencodable ran) and the builder is indexed, so the one reason left is a zone that
+         * validate_zone_pdns_types() refuses on purpose (two CNAMEs on a name: BIND refuses them too, DNS_R_SINGLETON; ALIAS / LUA
+         * rules; NSEC3 iterations).  Such a zone is not published and that is correct; anything else is a bug. */
+        parse_error_t pe;
+        char why[400];
+        memset(&pe, 0, sizeof(pe));
+        if (validate_zone_pdns_types(a, &pe, why, sizeof(why)) == 0) fail();
+        return;
+    }
     if (img->n_rrs > 0) {
         /* builder record -> image RR: RRs of one owner are contiguous in file order */
         uint32_t *used = calloc(img->n_names ? img->n_names : 1, sizeof(uint32_t));

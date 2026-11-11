@@ -5,19 +5,22 @@
 #include <time.h>
 #include <unistd.h>
 #include <inttypes.h>
+#include <pthread.h>
 
-_Atomic uint64_t g_global_epoch = ATOMIC_VAR_INIT(0);
-rcu_reader_slot_t g_resp_logger_rcu_ctx = { .rcu_observed_epoch = ATOMIC_VAR_INIT(RCU_EPOCH_IDLE) };
-rcu_reader_slot_t g_query_logger_rcu_ctx = { .rcu_observed_epoch = ATOMIC_VAR_INIT(RCU_EPOCH_IDLE) };
+/* (the [0 ... N - 1] range designators below are a GNU extension that both compilers of the project, clang and gcc, accept; C has no plain way to
+ * initialise an array of RCU_EPOCH_IDLE = UINT64_MAX slots statically) */
+_Atomic uint64_t g_global_epoch = 0;
+rcu_reader_slot_t g_resp_logger_rcu_ctx = { .rcu_observed_epoch = RCU_EPOCH_IDLE };
+rcu_reader_slot_t g_query_logger_rcu_ctx = { .rcu_observed_epoch = RCU_EPOCH_IDLE };
 
 rcu_reader_slot_t g_async_io_rcu_ctxs[MAX_ASYNC_IO_RCU_WORKERS] = {
-    [0 ... MAX_ASYNC_IO_RCU_WORKERS - 1] = { .rcu_observed_epoch = ATOMIC_VAR_INIT(RCU_EPOCH_IDLE) }
+    [0 ... MAX_ASYNC_IO_RCU_WORKERS - 1] = { .rcu_observed_epoch = RCU_EPOCH_IDLE }
 };
 int g_async_io_rcu_worker_count = MAX_ASYNC_IO_RCU_WORKERS;
 
 rcu_aux_slot_t g_aux_rcu_slots[MAX_AUX_RCU_READERS] = {
-    [0 ... MAX_AUX_RCU_READERS - 1] = { .observed_epoch = ATOMIC_VAR_INIT(RCU_EPOCH_IDLE),
-                                        .in_use = ATOMIC_VAR_INIT(false) }
+    [0 ... MAX_AUX_RCU_READERS - 1] = { .observed_epoch = RCU_EPOCH_IDLE,
+                                        .in_use = false }
 };
 
 _Thread_local _Atomic uint64_t *t_rcu_own_observed = NULL;
@@ -56,6 +59,9 @@ bool rcu_writer_wait_until_safe(uint64_t retire_epoch, int timeout_ms) {
   return wait_until_safe_impl(retire_epoch, timeout_ms, NULL);
 }
 
+/* Precondition: the calling thread is in a worker / slot read section (rcu_reader_enter(), rcu_slot_reader_enter(); t_rcu_own_observed is its slot) and holds
+ * no rcu_aux_read_lock() section: only the slot of t_rcu_own_observed is skipped, an auxiliary section of this same thread would be waited for.
+ * The one caller, the UPDATE handler of a worker, takes none. */
 bool rcu_writer_wait_until_safe_in_reader(uint64_t retire_epoch, int timeout_ms) {
   return wait_until_safe_impl(retire_epoch, timeout_ms, t_rcu_own_observed);
 }
@@ -148,28 +154,51 @@ static bool wait_until_safe_impl(uint64_t retire_epoch, int timeout_ms, _Atomic 
   }
 }
 
+/* A thread that ends while it still holds an auxiliary slot (pinned and never unpinned, or ended inside a section) gives the slot back here:
+ * otherwise the slot would stay in use for good and, with an epoch in it, hold up every writer.  The key holds the slot of the thread. */
+static pthread_key_t g_aux_slot_key;
+static pthread_once_t g_aux_slot_key_once = PTHREAD_ONCE_INIT;
+
+static void aux_slot_thread_exit(void *p) {
+  rcu_aux_slot_t *slot = (rcu_aux_slot_t *)p;
+  if (!slot) return;
+  atomic_store_explicit(&slot->observed_epoch, RCU_EPOCH_IDLE, memory_order_release);
+  atomic_store_explicit(&slot->in_use, false, memory_order_release);
+}
+
+static void aux_slot_key_create(void) {
+  (void)pthread_key_create(&g_aux_slot_key, aux_slot_thread_exit);
+}
+
 static rcu_aux_slot_t *aux_slot_claim(void) {
   int retries = 0;
   useconds_t sleep_time = 1;
-  bool warned = false;
+  struct timespec t0, tn;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  int64_t next_warn_s = 0;   /* seconds after t0 of the next warning: at once, then every 10 s while the wait goes on */
   for (;;) {
     for (int i = 0; i < MAX_AUX_RCU_READERS; i++) {
       bool expected = false;
       if (!atomic_load_explicit(&g_aux_rcu_slots[i].in_use, memory_order_relaxed) &&
           atomic_compare_exchange_strong_explicit(&g_aux_rcu_slots[i].in_use, &expected, true,
                                                   memory_order_acquire, memory_order_relaxed)) {
+        pthread_once(&g_aux_slot_key_once, aux_slot_key_create);
+        (void)pthread_setspecific(g_aux_slot_key, &g_aux_rcu_slots[i]);
         return &g_aux_rcu_slots[i];
       }
     }
-    if (!warned) {
-      syslog(LOG_WARNING, "[EpochRCU] all %d auxiliary reader slots are in use; waiting", MAX_AUX_RCU_READERS);
-      warned = true;
+    clock_gettime(CLOCK_MONOTONIC, &tn);
+    int64_t waited_s = (int64_t)(tn.tv_sec - t0.tv_sec);
+    if (waited_s >= next_warn_s) {
+      syslog(LOG_WARNING, "[EpochRCU] all %d auxiliary reader slots are in use; waiting (%" PRId64 " s so far)", MAX_AUX_RCU_READERS, waited_s);
+      next_warn_s = waited_s + 10;
     }
     rcu_exponential_backoff(&retries, &sleep_time);
   }
 }
 
 static void aux_slot_release(rcu_aux_slot_t *slot) {
+  (void)pthread_setspecific(g_aux_slot_key, NULL);   /* released on purpose: the exit handler has nothing left to do */
   atomic_store_explicit(&slot->in_use, false, memory_order_release);
 }
 
@@ -195,7 +224,7 @@ void rcu_aux_read_lock(void) {
 }
 
 void rcu_aux_read_unlock(void) {
-  if (t_aux_depth <= 0) return;
+  if (t_aux_depth <= 0) return;   /* an unlock without a lock is ignored (the unit test checks it); a debug build is not made to abort on it */
   if (--t_aux_depth > 0) return;
   rcu_epoch_exit(&t_aux_slot->observed_epoch);
   if (!t_aux_pinned) {

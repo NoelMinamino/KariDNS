@@ -131,6 +131,36 @@ static void test_aux_slots(void) {
   printf("  [PASS] nesting keeps the outer epoch; slots are released on exit / unpin\n");
 }
 
+/* A thread that ends while it holds an auxiliary slot (pinned and never unpinned, or ended inside a section) gives the slot back, with the
+ * epoch it had observed: otherwise it would keep the slot, and hold up the writers, for good. */
+static void *exit_pinned_thread(void *arg) {
+  (void)arg;
+  rcu_aux_thread_pin();
+  return NULL;
+}
+
+static void *exit_in_section_thread(void *arg) {
+  (void)arg;
+  rcu_aux_read_lock();
+  return NULL;
+}
+
+static void test_aux_slot_released_at_thread_exit(void) {
+  printf("[TEST] auxiliary slot of a thread that ends is released...\n");
+  int base = count_aux_slots_in_use();
+  pthread_t th;
+  assert(pthread_create(&th, NULL, exit_pinned_thread, NULL) == 0);
+  assert(pthread_join(th, NULL) == 0);
+  assert(count_aux_slots_in_use() == base);
+  uint64_t e = atomic_load_explicit(&g_global_epoch, memory_order_acquire);
+  assert(pthread_create(&th, NULL, exit_in_section_thread, NULL) == 0);
+  assert(pthread_join(th, NULL) == 0);
+  assert(count_aux_slots_in_use() == base);
+  rcu_writer_advance_epoch();
+  assert(rcu_writer_wait_until_safe(e, 50) == true);      /* the section it ended in does not hold the writers up */
+  printf("  [PASS] pinned and in-section threads give the slot back when they end\n");
+}
+
 /* --- concurrent stress: double buffer reused after the grace period --------- */
 
 #define BUF_WORDS 64
@@ -301,6 +331,7 @@ int main(void) {
   printf("=== Epoch RCU tests (R-25) ===\n");
   test_publish_order();
   test_aux_slots();
+  test_aux_slot_released_at_thread_exit();
   test_wait_granularity();
   test_wait_in_reader();
   test_concurrent_reuse();

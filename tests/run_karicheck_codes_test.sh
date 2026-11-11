@@ -79,6 +79,9 @@ cfix conf.cookie.algorithm 'options { cookie-algorithm aes; };'
 cfix conf.query-log.max-qps 'options { query-log-max-qps abc; };'
 cfix conf.query-log.buffer-size 'options { query-log-buffer-size 1000; };'
 cfix conf.minimal-any-ttl 'options { minimal-any-ttl abc; };'
+cfix conf.alerts.option 'options { alerts { qps-over 5; }; };'
+cfix conf.alerts.range 'options { alerts { interval 5; }; };'
+cfix conf.alerts.empty 'options { alerts { }; };'
 cfix conf.wire-cache.max-records 'options { wire-cache-max-records abc; };'
 cfix conf.acl.transfer-order "key \"k\" { algorithm hmac-sha256; secret \"$SEC\"; }; zone \"a.test\" { type master; file \"/x\"; allow-transfer { 192.0.2.1; key \"k\"; }; };"
 cfix conf.acl.update-order "key \"k\" { algorithm hmac-sha256; secret \"$SEC\"; }; zone \"a.test\" { type master; file \"/x\"; allow-update { !192.0.2.9; key \"k\"; }; };"
@@ -121,6 +124,8 @@ while [ $i -le 130 ]; do
     i=$((i + 1))
 done
 fx conf.xfr-source.limit conf "$T/xfr.conf"
+# the list of source addresses (karidns.conf.sample used to print it with its notify-source; the sample no longer sets one, review karidns.conf.sample [6])
+cfix conf.xfr-source.list 'options { notify-source 192.0.2.1; transfer-source 192.0.2.2; };'
 
 # the database block of the configuration
 ME=$(id -un)
@@ -160,6 +165,19 @@ fx zone.names.target zone ck.test "$T/ck.test.conf"
 printf '=host.other.test:192.0.2.9:300\n' > "$T/tiny.data"
 printf 'zone "tiny.test" { type master; file "%s/tiny.data"; file-format tinydns; };\n' "$T" > "$T/tiny.conf"
 fx zone.tinydns.out-of-zone zones "$T/tiny.conf"
+# a tinydns SSHFP line whose fingerprint is no hexadecimal: the parser leaves it out, karicheck says so (review dns_tinydns_parser.c [8])
+printf 'Ztiny2.test:ns.tiny2.test:h.tiny2.test:1:3600:600:86400:300:300\n&tiny2.test::ns.tiny2.test:300\n_host.tiny2.test:1:1:zz:300\n' > "$T/tiny2.data"
+printf 'zone "tiny2.test" { type master; file "%s/tiny2.data"; file-format tinydns; };\n' "$T" > "$T/tiny2.conf"
+fx zone.tinydns.skipped zones "$T/tiny2.conf"
+# CDS / CDNSKEY delete signals, a DNSKEY with protocol 2, data at a cut, a catalog zone that is broken (RFC 8078 4, RFC 4034 2.1.2, RFC 9432 5.1)
+zfix zone.dnskey.protocol dkp.test '' '@ DNSKEY 257 2 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ=='
+zfix zone.cds.delete-content cdsd.test '' '@ CDS 0 0 0 01'
+zfix zone.cut.data cut.test '' 'sub NS ns1
+sub TXT "x"'
+printf '$ORIGIN cmp.test.\n$TTL 300\n@ IN SOA ns1 h 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\nversion IN TXT "2"\nm1.zones IN PTR a.test.\nm1.zones IN PTR b.test.\nm2.zones IN PTR c.test.\nm3.zones IN PTR c.test.\n' > "$T/cmp.zone"
+printf 'zone "cmp.test" { type master; file "%s/cmp.zone"; catalog-zone yes; };\n' "$T" > "$T/cmp.conf"
+fx zone.catalog.member-ptrs zone cmp.test "$T/cmp.conf"
+fx zone.catalog.member-duplicate zone cmp.test "$T/cmp.conf"
 # zone text from standard input: a zone with $INCLUDE, and one too big
 printf '$ORIGIN inc.test.\n$TTL 300\n@ IN SOA ns1 h 1 7200 3600 1209600 300\n$INCLUDE other.zone\n' | "$KC" zone inc.test - > /dev/null 2>&1
 yes ';cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' | head -c 67108865 | "$KC" zone x.test - > /dev/null 2>&1
@@ -254,7 +272,6 @@ zone.a.fields
 zone.aaaa.address
 zone.aaaa.fields
 zone.catalog.orphan-group
-zone.dnssec.algorithm-unknown
 zone.dnssec.key-base64
 zone.dnssec.mldsa-length
 zone.ds.digest-null

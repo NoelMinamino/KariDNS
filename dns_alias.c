@@ -60,6 +60,9 @@ static int64_t alias_now(void) {
     return (int64_t)ts.tv_sec;
 }
 
+/* How long a result of this TTL is kept as fresh data: the TTL, at least the refresh interval (a refresh is not tried sooner) */
+static inline int64_t alias_validity(uint32_t ttl) { return ttl > ALIAS_MIN_REFRESH ? (int64_t)ttl : ALIAS_MIN_REFRESH; }
+
 /* ------------------------------------------------------------------------------------------------------------- */
 /* configuration: which resolvers apply to a zone                                                                 */
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -103,13 +106,35 @@ static uint64_t fnv64(uint64_t h, const void *p, size_t n) {
     return h;
 }
 
+/* The key of a resolver set: the same members give the same key whatever their order or spelling ("::1" and "0::1"), so one set
+ * does not make two jobs per target.  Each member is hashed on its binary address and port (the text when it is not an IP literal),
+ * the hashes are sorted and folded. */
 static uint64_t rs_key(const rs_ent_t *e, int n) {
     if (n == 0) return 0;
-    uint64_t h = 1469598103934665603ULL;
+    uint64_t eh[ALIAS_MAX_RESOLVERS];
     for (int i = 0; i < n; i++) {
-        h = fnv64(h, e[i].ip, strlen(e[i].ip) + 1);
-        h = fnv64(h, &e[i].port, sizeof(e[i].port));
+        uint8_t a[16];
+        uint16_t port = (uint16_t)(e[i].port > 0 && e[i].port <= 65535 ? e[i].port : 53);   /* as alias_resolvers_fill() */
+        uint64_t h = 1469598103934665603ULL;
+        if (inet_pton(AF_INET, e[i].ip, a) == 1) {
+            h = fnv64(h, "4", 1);
+            h = fnv64(h, a, 4);
+        } else if (inet_pton(AF_INET6, e[i].ip, a) == 1) {
+            h = fnv64(h, "6", 1);
+            h = fnv64(h, a, 16);
+        } else {
+            h = fnv64(h, e[i].ip, strlen(e[i].ip) + 1);
+        }
+        eh[i] = fnv64(h, &port, sizeof(port));
     }
+    for (int i = 1; i < n; i++) {                 /* insertion sort: n <= ALIAS_MAX_RESOLVERS */
+        uint64_t v = eh[i];
+        int k = i;
+        for (; k > 0 && eh[k - 1] > v; k--) eh[k] = eh[k - 1];
+        eh[k] = v;
+    }
+    uint64_t h = 1469598103934665603ULL;
+    for (int i = 0; i < n; i++) h = fnv64(h, &eh[i], sizeof(eh[i]));
     return h ? h : 1;
 }
 
@@ -322,7 +347,7 @@ void alias_parse_response(const uint8_t *pkt, size_t len, uint16_t id, const uin
         if (!next_rr(pkt, len, &off, &r)) return;
         if (r.cls != 1 || r.type != qtype || r.olen != curlen || memcmp(r.owner, cur, (size_t)curlen) != 0 || r.rdlen != want) continue;
         bool dup = false;
-        for (unsigned k = 0; k < out->n; k++)
+        for (unsigned k = 0; k < out->n && !dup; k++)
             if (memcmp(out->rd + (size_t)k * want, pkt + r.rd_off, want) == 0) dup = true;
         if (r.ttl < ttl) ttl = r.ttl;
         if (dup || out->n >= ALIAS_MAX_RR) continue;
@@ -372,6 +397,9 @@ static int net_resolve(const alias_rset_t *rs, const uint8_t *name, size_t nlen,
     bool any_answer = false;
     memset(out, 0, sizeof(*out));
     out->rc = -1;
+    uint8_t q[600];                               /* built once; only the ID differs per resolver */
+    size_t ql = alias_build_query(q, sizeof(q), 0, name, nlen, qtype);
+    if (ql == 0) return 1;
     for (int i = 0; i < rs->n; i++) {
         uint32_t rem = remaining_ms(deadline);
         if (rem == 0) break;
@@ -379,9 +407,8 @@ static int net_resolve(const alias_rset_t *rs, const uint8_t *name, size_t nlen,
         if (share == 0) share = 1;
         const struct sockaddr_storage *sa = &rs->sa[i];
         uint16_t id = (uint16_t)(arc4random() & 0xFFFF);
-        uint8_t q[600];
-        size_t ql = alias_build_query(q, sizeof(q), id, name, nlen, qtype);
-        if (ql == 0) return 1;
+        q[0] = (uint8_t)(id >> 8);
+        q[1] = (uint8_t)id;
         int fd = broker_connect(sa->ss_family, SOCK_DGRAM, (struct sockaddr *)(void *)sa, rs->sl[i]);
         if (fd < 0) continue;
         int64_t fwd_deadline = monotonic_ms() + share;
@@ -409,7 +436,9 @@ static int net_resolve(const alias_rset_t *rs, const uint8_t *name, size_t nlen,
         if (got < 0) continue;
         any_answer = true;
         if (p.truncated) {
-            ssize_t tg = tcp_query(sa, rs->sl[i], q, ql, remaining_ms(deadline), g_rbuf, sizeof(g_rbuf));
+            /* TCP gets this resolver's share of what is left, not all of it: the resolvers after this one still need time */
+            uint32_t tcp_ms = remaining_ms(deadline) / (uint32_t)(rs->n - i);
+            ssize_t tg = tcp_query(sa, rs->sl[i], q, ql, tcp_ms, g_rbuf, sizeof(g_rbuf));
             if (tg < 0) continue;
             alias_parse_response(g_rbuf, (size_t)tg, id, name, nlen, qtype, &p);
         }
@@ -463,12 +492,16 @@ bool alias_lookup(uint64_t key, const uint8_t *name, size_t nlen, uint16_t qtype
         if (e->key != key || e->qtype != qtype || e->nlen != nlen || memcmp((const uint8_t *)(e + 1), name, nlen) != 0) continue;
         int64_t age = alias_now() - e->fetched;
         if (age < 0) age = 0;
-        int64_t validity = e->ttl > ALIAS_MIN_REFRESH ? (int64_t)e->ttl : ALIAS_MIN_REFRESH;
+        int64_t validity = alias_validity(e->ttl);
         if (age < validity) {
+            /* current data: the rest of the TTL, 0 while a TTL below ALIAS_MIN_REFRESH waits for its refresh (an upstream
+             * TTL of 0 stays 0: the upstream asks not to cache it, and the refresh is due) */
             out->ttl = age < (int64_t)e->ttl ? (uint32_t)((int64_t)e->ttl - age) : 0;
             out->stale = false;
         } else if (age < validity + ALIAS_STALE_MAX) {
-            out->ttl = ALIAS_STALE_TTL;           /* RFC 8767 section 5: a short TTL for the data served past its time */
+            /* the refreshes failed past the validity: stale data, served with a TTL greater than 0, RECOMMENDED 30 s
+             * (RFC 8767 section 4) */
+            out->ttl = ALIAS_STALE_TTL;
             out->stale = true;
         } else {
             return false;
@@ -513,12 +546,28 @@ static size_t g_rot;                               /* rotating start of a pass (
 static bool g_changed;
 
 static int rset_get(const alias_rset_t *rs) {
-    for (int i = 0; i < g_n_rsets; i++)
+    int slot = -1;
+    for (int i = 0; i < g_n_rsets; i++) {
         if (g_rsets[i].key == rs->key) return i;
-    if (g_n_rsets >= MAX_RSETS) return -1;
-    g_rsets[g_n_rsets] = *rs;
-    g_rset_dead[g_n_rsets] = 0;
-    return g_n_rsets++;
+        if (g_rsets[i].key == 0 && slot < 0) slot = i;   /* released by reclaim_rsets() */
+    }
+    if (slot < 0) {
+        if (g_n_rsets >= MAX_RSETS) return -1;
+        slot = g_n_rsets++;
+    }
+    g_rsets[slot] = *rs;
+    g_rset_dead[slot] = 0;
+    return slot;
+}
+
+/* Releases the slots no job refers to any more (a resolver list that left the configuration), so that changing lists over the life of the
+ * process does not use up MAX_RSETS.  A released slot has key 0; real keys are never 0. */
+static void reclaim_rsets(void) {
+    bool used[MAX_RSETS] = { false };
+    for (size_t i = 0; i < g_njobs; i++) used[g_jobs[i]->rset] = true;
+    for (int i = 0; i < g_n_rsets; i++)
+        if (!used[i]) g_rsets[i].key = 0;
+    while (g_n_rsets > 0 && g_rsets[g_n_rsets - 1].key == 0) g_n_rsets--;
 }
 
 static bool jidx_rebuild(void) {
@@ -627,7 +676,7 @@ static void name_text(const uint8_t *w, size_t n, char *out, size_t cap) {
 }
 
 static void log_job(const job_t *j, const char *what) {
-    char t[300];
+    char t[1100];                                  /* 255 wire octets, each at worst as "\DDD" */
     name_text(j->name, j->nlen, t, sizeof(t));
     syslog(LOG_WARNING, "[Alias] %s: ALIAS target '%s' (%s)", what, t, j->qtype == 1 ? "A" : "AAAA");
 }
@@ -646,8 +695,7 @@ static alias_tab_t *tab_build(void) {
     for (size_t i = 0; i < g_njobs; i++) {
         const job_t *j = g_jobs[i];
         if (!j->have) continue;
-        int64_t validity = j->ttl > ALIAS_MIN_REFRESH ? (int64_t)j->ttl : ALIAS_MIN_REFRESH;
-        if (now - j->fetched >= validity + ALIAS_STALE_MAX) continue;
+        if (now - j->fetched >= alias_validity(j->ttl) + ALIAS_STALE_MAX) continue;
         usable++;
         bytes += ent_size(j->nlen, j->n, j->rdlen);
     }
@@ -663,8 +711,7 @@ static alias_tab_t *tab_build(void) {
     for (size_t i = 0; i < g_njobs; i++) {
         const job_t *j = g_jobs[i];
         if (!j->have) continue;
-        int64_t validity = j->ttl > ALIAS_MIN_REFRESH ? (int64_t)j->ttl : ALIAS_MIN_REFRESH;
-        if (now - j->fetched >= validity + ALIAS_STALE_MAX) continue;
+        if (now - j->fetched >= alias_validity(j->ttl) + ALIAS_STALE_MAX) continue;
         alias_ent_t *e = (alias_ent_t *)(void *)(mem + o);
         e->key = j->key;
         e->fetched = j->fetched;
@@ -695,13 +742,13 @@ static void reap_old(bool wait) {
 }
 
 static void publish(void) {
+    reap_old(true);
+    if (g_old_tab) return;                         /* readers still hold the one before: build and publish at the next pass (g_changed stays set) */
     alias_tab_t *t = tab_build();
     if (!t) {
         syslog(LOG_ERR, "[Alias] out of memory building the result table; the previous one stays in service");
         return;
     }
-    reap_old(true);
-    if (g_old_tab) { free(t); return; }            /* readers still hold the one before: publish at the next pass */
     alias_tab_t *prev = atomic_load_explicit(&g_tab, memory_order_relaxed);
     g_old_epoch = rcu_writer_publish(&g_tab, t);
     g_old_tab = prev;
@@ -727,7 +774,8 @@ static void run_pass(void) {
         job_t *j = g_jobs[(g_rot + k) % n];
         if (j->next_try > now) continue;
         if (g_rset_dead[j->rset] > now) {          /* the whole resolver set did not answer a moment ago */
-            j->next_try = g_rset_dead[j->rset];
+            /* a little jitter, so the jobs of a set that comes back do not all fire in the same tick */
+            j->next_try = g_rset_dead[j->rset] + (int64_t)arc4random_uniform(ALIAS_DEAD_SECS / 2);
             continue;
         }
         budget--;
@@ -761,12 +809,24 @@ static void run_pass(void) {
         }
     }
     if (n) g_rot = (g_rot + 1) % n;
+    if (budget == 0) {                              /* the per-tick limit was reached: say so when jobs are still due (at most every 5 minutes) */
+        static int64_t last_note;
+        if (last_note == 0 || now - last_note >= 300) {
+            size_t due = 0;
+            for (size_t i = 0; i < g_njobs; i++)
+                if (g_jobs[i]->next_try <= now && g_rset_dead[g_jobs[i]->rset] <= now) due++;
+            if (due) {
+                last_note = now ? now : 1;
+                syslog(LOG_WARNING, "[Alias] %zu ALIAS jobs are due but at most %d upstream queries per %d ms are sent; they are refreshed late",
+                       due, ALIAS_QUERIES_PER_TICK, ALIAS_TICK_MS);
+            }
+        }
+    }
     /* a result that ran out of its stale time leaves the table */
     for (size_t i = 0; i < g_njobs; i++) {
         job_t *j = g_jobs[i];
         if (!j->have) continue;
-        int64_t validity = j->ttl > ALIAS_MIN_REFRESH ? (int64_t)j->ttl : ALIAS_MIN_REFRESH;
-        if (now - j->fetched >= validity + ALIAS_STALE_MAX) {
+        if (now - j->fetched >= alias_validity(j->ttl) + ALIAS_STALE_MAX) {
             j->have = false;
             g_changed = true;
         }
@@ -778,7 +838,17 @@ static void run_pass(void) {
 /* finding the targets                                                                                            */
 /* ------------------------------------------------------------------------------------------------------------- */
 
+/* what scan_zones() has to tell the log: syslog() can block, so it is called after rcu_aux_read_unlock() and not inside the section
+ * (which would hold up writers' grace periods).  The calloc()s of want() stay inside: they are small and at most ALIAS_MAX_JOBS. */
+#define SCAN_NOTES_MAX 8
+typedef struct {
+    bool rsets;                                    /* true: too many resolver lists; false: too many targets */
+    char zone[256];
+} scan_note_t;
+
 static void scan_zones(void) {
+    scan_note_t notes[SCAN_NOTES_MAX];
+    int n_notes = 0, n_lost = 0;
     for (size_t i = 0; i < g_njobs; i++) g_jobs[i]->wanted = false;
     rcu_aux_read_lock();
     server_config_t *cfg = acquire_config_snapshot();
@@ -799,7 +869,12 @@ static void scan_zones(void) {
                 if (alias_resolvers_fill(cfg, zc, e->source == ZONE_SRC_DB, &rs) == 0) continue;
                 int ri = rset_get(&rs);
                 if (ri < 0) {
-                    syslog(LOG_WARNING, "[Alias] more than %d different alias-resolver lists; zone '%s' is not expanded", MAX_RSETS, e->domain);
+                    if (n_notes < SCAN_NOTES_MAX) {
+                        notes[n_notes].rsets = true;
+                        strlcpy(notes[n_notes++].zone, e->domain, sizeof(notes[0].zone));
+                    } else {
+                        n_lost++;
+                    }
                     continue;
                 }
                 const zone_image_name_t *names = zone_image_names(img);
@@ -821,14 +896,29 @@ static void scan_zones(void) {
                         }
                     }
                 }
-                if (capped) syslog(LOG_WARNING, "[Alias] zone '%s': more than %d ALIAS targets (or %d jobs in all); the rest answer SERVFAIL", e->domain,
-                                   ALIAS_MAX_TARGETS_PER_ZONE, ALIAS_MAX_JOBS);
+                if (capped) {
+                    if (n_notes < SCAN_NOTES_MAX) {
+                        notes[n_notes].rsets = false;
+                        strlcpy(notes[n_notes++].zone, e->domain, sizeof(notes[0].zone));
+                    } else {
+                        n_lost++;
+                    }
+                }
             }
         }
     }
     if (cfg) release_config_snapshot(cfg);
     rcu_aux_read_unlock();
     sweep_unwanted();
+    reclaim_rsets();
+    for (int i = 0; i < n_notes; i++) {
+        if (notes[i].rsets)
+            syslog(LOG_WARNING, "[Alias] more than %d different alias-resolver lists; zone '%s' is not expanded", MAX_RSETS, notes[i].zone);
+        else
+            syslog(LOG_WARNING, "[Alias] zone '%s': more than %d ALIAS targets (or %d jobs in all); the rest answer SERVFAIL", notes[i].zone,
+                   ALIAS_MAX_TARGETS_PER_ZONE, ALIAS_MAX_JOBS);
+    }
+    if (n_lost) syslog(LOG_WARNING, "[Alias] %d more zones hit the ALIAS limits (not listed)", n_lost);
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */

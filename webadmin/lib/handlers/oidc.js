@@ -44,6 +44,7 @@ export async function start(ctx) {
   const route = cleanRoute(ctx.query.get('return') ?? '/');
   try {
     if (app.buckets.loginIp.take(`oidc:${ctx.ip}`)) return failure(app, 'busy');
+    if (app.oidcStarts.take(ctx.ip)) return failure(app, 'busy');          // (no log line: a flood would be a flood of lines)
     const state = newSecret();
     const verifier = newSecret();
     const nonce = newSecret();

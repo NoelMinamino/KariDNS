@@ -42,10 +42,6 @@ void rrl_init(void) {
 void rrl_shutdown(void) {
 }
 
-uint64_t siphash24(const uint8_t *in, size_t inlen, const uint64_t k[2]) {
-    return dns_siphash24(in, inlen, k);   /* shared header-only implementation */
-}
-
 rrl_response_class_t get_rrl_class(const uint8_t *res_buf, size_t res_len) {
   if (res_len < DNS_HEADER_SIZE) return RRL_RESP_ERROR;
   uint8_t rcode = res_buf[3] & 0x0F;
@@ -130,7 +126,7 @@ static uint32_t rrl_rate(const rate_limit_config_t *cfg, rrl_response_class_t cl
 static bool rrl_is_exempt(const struct sockaddr *client_addr, const rate_limit_config_t *cfg) {
   if (cfg->exempt_clients_count > 0 && cfg->exempt_clients_parsed) {
     for (int i = 0; i < cfg->exempt_clients_count; i++) {
-      if (cidr_entry_match_sockaddr(&cfg->exempt_clients_parsed[i], client_addr)) return true;
+      if (cidr_entry_match_sockaddr(&cfg->exempt_clients_parsed[i], (const struct sockaddr_storage *)(const void *)client_addr)) return true;
     }
   } else if (cfg->exempt_clients_count > 0 && cfg->exempt_clients) {
     char ip_str[INET6_ADDRSTRLEN] = {0};
@@ -196,7 +192,7 @@ static uint64_t rrl_key_hash(const struct sockaddr *client_addr, const rrl_key_t
       buf[n++] = (uint8_t)((c >= 'A' && c <= 'Z') ? (c | 0x20) : c);
     }
   }
-  uint64_t h = siphash24(buf, n, g_rrl_hash_key);
+  uint64_t h = dns_siphash24(buf, n, g_rrl_hash_key);
   return h ? h : 1;
 }
 
@@ -206,6 +202,8 @@ static void rrl_lock(rrl_bucket_t *b) {
   while (atomic_flag_test_and_set_explicit(&b->lock, memory_order_acquire)) {
 #if defined(__x86_64__) || defined(__i386__)
     __asm__ volatile("pause" ::: "memory");
+#elif defined(__aarch64__)
+    __asm__ volatile("yield" ::: "memory");
 #else
     sched_yield();
 #endif
@@ -375,7 +373,19 @@ bool rrl_check_key(const void *client_addr_ptr, const rrl_key_t *key, const rate
     } else {
       inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, ip_str, INET6_ADDRSTRLEN);
     }
-    syslog(LOG_INFO, "[RRL] would rate-limit %s (log-only)", ip_str);
+    /* BIND logs once per limit episode, not once per response: at most one line a second here
+     * (log-only mode only; the line carries the number of lines left out) */
+    static _Atomic int64_t last_log_ms = INT64_MIN / 2;
+    static _Atomic uint64_t suppressed = 0;
+    int64_t last = atomic_load_explicit(&last_log_ms, memory_order_relaxed);
+    if (now_ms - last >= 1000 &&
+        atomic_compare_exchange_strong_explicit(&last_log_ms, &last, now_ms, memory_order_relaxed, memory_order_relaxed)) {
+      uint64_t skipped = atomic_exchange_explicit(&suppressed, 0, memory_order_relaxed);
+      syslog(LOG_INFO, "[RRL] would rate-limit %s (log-only, %llu more since the last line)", ip_str,
+             (unsigned long long)skipped);
+    } else {
+      atomic_fetch_add_explicit(&suppressed, 1, memory_order_relaxed);
+    }
     *out_slip = false;
     return true; // allow anyway; nothing was dropped or slipped, so nothing is counted
   }

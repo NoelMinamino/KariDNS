@@ -354,7 +354,7 @@ static bool update_generic_rdata(dns_record_t *rec, uint8_t **blob, const char *
         return false;
     }
     size_t n = 0;
-    const char *why = dns_generic_rdata_parse(rec->type_code, rec->rdata, rec->rdata_count, buf, &n);
+    const char *why = dns_generic_rdata_parse(rec->type_code, rec->rdata, rec->rdata_count, buf, 65535, &n);
     if (why) {
         fprintf(stderr, "Failed to serialize %s record: %s: %s\n", what, why, raw);
         free(buf);

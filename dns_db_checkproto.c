@@ -8,7 +8,10 @@ size_t chk_escape(const char *in, size_t n, char *out, size_t cap, bool *trunc) 
     size_t o = 0;
     size_t i = 0;
     if (trunc) *trunc = false;
-    if (cap == 0) return 0;
+    if (cap == 0) {                 /* not even the NUL fits: nothing was written */
+        if (trunc) *trunc = n > 0;
+        return 0;
+    }
     for (; i < n; i++) {
         unsigned char ch = (unsigned char)in[i];
         if (ch >= 0x20 && ch < 0x7F && ch != '\\') {
@@ -37,7 +40,7 @@ size_t chk_unescape(const char *in, size_t n, char *out, size_t cap) {
             unsigned char d0 = (unsigned char)in[i + 1], d1 = (unsigned char)in[i + 2], d2 = (unsigned char)in[i + 3];
             if (d0 < '0' || d0 > '9' || d1 < '0' || d1 > '9' || d2 < '0' || d2 > '9') return (size_t)-1;
             unsigned v = (unsigned)(d0 - '0') * 100 + (unsigned)(d1 - '0') * 10 + (unsigned)(d2 - '0');
-            if (v > 255) return (size_t)-1;
+            if (v == 0 || v > 255) return (size_t)-1;           /* (\000: the texts are used as C strings, a NUL would cut them) */
             if (o + 1 >= cap) return (size_t)-1;
             out[o++] = (char)v;
             i += 3;
@@ -59,7 +62,7 @@ int chk_split(char *line, char **fields, int max) {
         if (n >= max) return -1;
         fields[n++] = p;
         for (; *p && *p != '\t'; p++)
-            if ((unsigned char)*p < 0x20) return -1;
+            if ((unsigned char)*p < 0x20 || (unsigned char)*p >= 0x7F) return -1;
         if (!*p) return n;
         *p++ = '\0';
     }

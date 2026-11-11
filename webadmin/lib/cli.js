@@ -5,7 +5,7 @@ import { loadConfig, validate } from './config.js';
 import { runChild } from '../../node/lib/run.js';
 import { createLogger } from '../../node/lib/log.js';
 import { App, VERSION } from './app.js';
-import { Router, listen, closeServer } from './http.js';
+import { Router, listen, closeServer, reloadTls } from './http.js';
 import { ROUTES } from './routes.js';
 import { openBackend, inspect, createAdmin, readOidcProviders } from './setup.js';
 import { loadKeyFile } from './crypto.js';
@@ -166,6 +166,19 @@ export async function main(argv, io = {}) {
       }));
     }
     else app.background(() => backend.tx({ write: true }, (tx) => S.sweepExpired(tx)));
+    // the audit log: rows older than audit-retention days (read again at every sweep: SIGHUP changes it), a batch per transaction so no write lock is held for long
+    const days = app.settings['audit-retention'];
+    if (days > 0) {
+      app.background(async () => {
+        let total = 0;
+        for (let i = 0; i < 1000; i++) {                       // (10 million rows an hour at the most; the rest is for the next sweep)
+          const n = await backend.tx({ write: true }, (tx) => S.pruneAudit(tx, days, app.now()));
+          total += n;
+          if (n < S.AUDIT_PRUNE_BATCH) break;
+        }
+        if (total > 0) log.info(`audit: deleted ${total} log rows older than ${days} days`);
+      });
+    }
   };
   sweep();
   const timer = setInterval(sweep, 3600000);
@@ -178,10 +191,11 @@ export async function main(argv, io = {}) {
       if (problems.length) throw new Error(problems.join('; '));
       const providers = d.readOidc(next);
       if (providers.problems.length) throw new Error(providers.problems.join('; '));
+      const tls = reloadTls(server, next.settings);            // (before the settings change: a certificate that cannot be read keeps everything as it was)
       app.setConfig(next);
       app.oidc.configure(providers.list);
       if (providers.list.length) app.background(() => app.oidc.prefetch());
-      log.info('the configuration was read again');
+      log.info(`the configuration was read again${tls ? ' (the TLS certificate and key too)' : ''}`);
     } catch (e) {
       log.error(`the configuration was not read: ${e.message}`);
     }

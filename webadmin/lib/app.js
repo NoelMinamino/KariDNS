@@ -1,7 +1,7 @@
 // The state the handlers share: the configuration (read again on SIGHUP), the datasets, the database, the logger, the rate limiters, the tools and the
 // key of the TOTP secrets.  One App per process.
 
-import { Buckets } from './ratelimit.js';
+import { Buckets, Window } from './ratelimit.js';
 import { hashPassword } from './crypto.js';
 import { datasetList } from './config.js';
 import { Pool, KeyedLock } from './pool.js';
@@ -21,7 +21,10 @@ export class App {
     this.run = run;
     this.key = key;
     this.now = now;
-    this.versions = {};                    // filled by the startup checks: the tools' versions, for /version
+    // sign-ins one client address may have waiting at a provider (a state lives 10 minutes, store.js OIDC_STATE_TTL; 1000 wait at the most in all): the rate-login
+    // bucket paces the starts, this bounds how many of the 1000 one address can hold (IPv6: per address, not per prefix)
+    this.oidcStarts = new Window({ limit: config.settings['rate-oidc-start'], windowMs: 600000, now: () => this.now() });
+    this.versions = {};                   // filled by the startup checks: the tools' versions, for /version
     this.dummy = null;
     this.pending = new Set();              // background work in flight (a touch of a session), so shutdown can wait for it
     this.healthTimeoutMs = 3000;           // how long /health waits for the database
@@ -44,6 +47,7 @@ export class App {
     this.settings = config.settings;
     this.datasets = datasetList(config);
     this.dsByName = new Map(this.datasets.map((d) => [d.name, d]));
+    this.oidcStarts.limit = config.settings['rate-oidc-start'];          // (SIGHUP)
     const s = this.settings;
     const old = this.buckets;
     // the counters survive a reload when the rates did not change

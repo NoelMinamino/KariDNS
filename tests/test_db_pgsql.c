@@ -961,6 +961,22 @@ static uint64_t snap_since(db_conn_t *c, uint64_t after, cacc_t *a, bool *gap) {
     return last;
 }
 
+/* The cursor is pg_snapshot_xmin(): the oldest transaction that is still open ANYWHERE in the PostgreSQL cluster, not only in this test's database.
+ * Next to other tests that use the same server (tests/run_all_suite.sh -j runs the PostgreSQL tests together, each in a database of its own) an open
+ * transaction of theirs holds the cursor below the rows this test has just written, and the xid counter moves with their transactions.  What the
+ * checks below are about (a cursor that passes a finished transaction, and nothing listed twice below it) is only observable when nothing older is
+ * open: wait until no transaction is open in the cluster (xmin == xmax of the snapshot), up to 30 s.  A transaction that starts afterwards has a
+ * higher xid than everything this test wrote so far, so it cannot hold a later cursor below it. */
+static void wait_cluster_quiet(void) {
+    char v[8] = "";
+    for (int i = 0; i < 3000; i++) {
+        qv(g_admin, "SELECT pg_snapshot_xmin(pg_current_snapshot()) = pg_snapshot_xmax(pg_current_snapshot())", v, sizeof(v));
+        if (!strcmp(v, "t")) return;
+        usleep(10000);
+    }
+    printf("  note: other transactions stayed open in the cluster for 30 s\n");
+}
+
 static void test_changes(void) {
     printf("change log\n");
     PGconn *t1 = connect_db(g_db), *t2 = connect_db(g_db), *t3 = connect_db(g_db);
@@ -972,14 +988,16 @@ static void test_changes(void) {
     bool gap = false;
 
     /* a plain edit: seen once, the cursor moves on, nothing is listed again below it */
+    wait_cluster_quiet();
     uint64_t cur0 = snap_max(c);
     Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (1, 'plain.a.test', 'A', '192.0.2.77', 60)");
+    wait_cluster_quiet();
     uint64_t cur1 = snap_since(c, cur0, &a, &gap);
     CHECK_MSG(a.n == 1 && a.v[0] == 1 && !gap, "plain edit: %d rows", a.n);
     CHECK(cur1 > cur0);
     CHECK_MSG(a.pos[0] >= cur0 && a.pos[0] < cur1, "pos (the xid8 of the writing transaction) %llu is in [%llu, %llu)", (unsigned long long)a.pos[0], (unsigned long long)cur0, (unsigned long long)cur1);     /* the edit is in every snapshot whose cursor is cur1 (item C: a one-zone reload covers it) */
     uint64_t cur1b = snap_since(c, cur1, &a, &gap);
-    CHECK_MSG(a.n == 0 && cur1b == cur1, "nothing new: %d rows", a.n);
+    CHECK_MSG(a.n == 0 && cur1b >= cur1, "nothing new: %d rows (cursor %llu, was %llu)", a.n, (unsigned long long)cur1b, (unsigned long long)cur1);   /* (>=: the transactions of other databases move the xid counter) */
 
     /* A: T1 takes the lower seq and stays open, T2 takes the higher seq and commits */
     CHECK(qx(t1, "BEGIN"));
@@ -995,6 +1013,7 @@ static void test_changes(void) {
     }
     CHECK_MSG(cur2 >= cur1 && cur2 <= strtoull(xs, NULL, 10), "the cursor does not pass the open transaction (%llu, xid %s)", (unsigned long long)cur2, xs);
     CHECK(qx(t1, "COMMIT"));
+    wait_cluster_quiet();
     uint64_t cur3 = snap_since(c, cur2, &a, &gap);
     CHECK_MSG(has_dom(&a, 1), "the transaction that committed late is listed (%d rows)", a.n);
     CHECK(cur3 > cur2);
@@ -1025,6 +1044,7 @@ static void test_changes(void) {
     snap_since(c, cur6, &a, &gap);
     CHECK_MSG(has_dom(&a, 3), "the commit behind the idle transaction is listed although the cursor did not grow");
     CHECK(qx(t3, "COMMIT"));
+    wait_cluster_quiet();
     uint64_t cur8 = snap_max(c);
     CHECK(cur8 > cur7);
 
@@ -1037,6 +1057,7 @@ static void test_changes(void) {
     CHECK_MSG(a.n == 1 && !gap, "a rolled back transaction is no gap (%d rows, gap %d)", a.n, gap);
 
     /* pruning: rows below the cursor are gone, the first seq is not 1 -> gap; with rows left below the cursor -> no gap */
+    wait_cluster_quiet();
     uint64_t cur9 = snap_max(c);
     char sqlb[160];
     Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (1, 'p1.a.test', 'A', '192.0.2.8', 60)");

@@ -14,7 +14,7 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { startBrowser, NAMED_KEYS } from './wd.mjs';
+import { startBrowser, NAMED_KEYS, retryStale } from './wd.mjs';
 import { pageProblems, overflowProblems } from './a11y.mjs';
 import { dsDigest, keyTag, parseDnskey } from '../../lib/dnssec.js';
 import { hotp, totpStep, base32Decode } from '../../lib/crypto.js';
@@ -86,19 +86,19 @@ fs.mkdirSync(files, { recursive: true });
 const h1 = async () => (await (await b.$('h1')).text()).trim();
 const waitH1 = (re, o) => b.waitText('h1', re, o);
 const bodyText = () => b.exec(() => document.body.innerText);
-const fill = async (name, value, scope = '') => { const e = await b.$(`${scope} [name=${name}]`); await e.clear(); await e.type(value); };
+const fill = async (name, value, scope = '') => retryStale(async () => { const e = await b.$(`${scope} [name=${name}]`); await e.clear(); await e.type(value); });
 const control = async (text, scope = 'body') => {
   const r = await b.exec((t, s) => [...document.querySelector(s).querySelectorAll('button, a[href]')].find((e) => e.textContent.trim() === t && e.offsetParent !== null) ?? null, text, scope);
   must(r, `no visible control "${text}" in ${scope}`);
   return b.wrap(r);
 };
-const click = async (text, scope) => (await control(text, scope)).click();
+const click = (text, scope) => retryStale(async () => (await control(text, scope)).click());
 // a button only ("Import" is also the name of a section of the zone)
-const clickButton = async (text, scope = 'body') => {
+const clickButton = (text, scope = 'body') => retryStale(async () => {
   const r = await b.exec((t, s) => [...document.querySelector(s).querySelectorAll('button')].find((e) => e.textContent.trim() === t && e.offsetParent !== null) ?? null, text, scope);
   must(r, `no visible button "${text}" in ${scope}`);
   await b.wrap(r).click();
-};
+});
 // the button of a record set row
 const rowButton = async (name, type, label) => {
   const r = await b.exec((n, t, l) => {

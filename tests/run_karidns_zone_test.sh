@@ -1002,13 +1002,13 @@ if command -v dnssec-keygen >/dev/null 2>&1 && command -v dnssec-signzone >/dev/
         grep -q "no RRSIG(NSEC3) owner" "$ERR" && ok "...because the new name has no NSEC3" || bad "...the reason" "$(cat "$ERR")"
         kz export --signer xs.test "$T/xs3.sg"
         if [ "$st" = 0 ]; then ok "xs3: export --signer works"; else bad "xs3: export --signer" "$(cat "$ERR")"; fi
-        [ "$(grep -c ' NSEC3 \|NSEC3PARAM\| NSEC ' "$T/xs3.sg")" = 0 ] && ok "xs3: no NSEC3, NSEC3PARAM or NSEC record" || bad "xs3: chain records in the text" "$(grep ' NSEC' "$T/xs3.sg" | head -3)"
-        [ "$(grep -c ' RRSIG NSEC' "$T/xs3.sg")" = 0 ] && ok "xs3: no signature over the chain" || bad "xs3: RRSIG(NSEC3) in the text"
+        [ "$(awk '{ t = $2; if (t ~ /^[0-9]+$/) t = $3; if (t ~ /^NSEC/) n++ } END { print n + 0 }' "$T/xs3.sg")" = 0 ] && ok "xs3: no NSEC3, NSEC3PARAM or NSEC record" || bad "xs3: chain records in the text" "$(grep ' NSEC' "$T/xs3.sg" | head -3)"
+        [ "$(grep -c ' RRSIG NSEC' "$T/xs3.sg")" -gt 0 ] && ok "xs3: the signatures over the chain stay (0.6.1: dnssec-signzone -u keeps those that verify)" || bad "xs3: no RRSIG(NSEC3) in the text"
         [ "$(grep -c ' RRSIG A \| RRSIG SOA \| RRSIG DNSKEY \| RRSIG MX ' "$T/xs3.sg")" -gt 3 ] && ok "xs3: the other signatures stay" || bad "xs3: the other signatures are gone"
         [ "$(grep -c ' DNSKEY ' "$T/xs3.sg")" -ge 2 ] && ok "xs3: and the DNSKEY records" || bad "xs3: no DNSKEY"
         grep -q '^newname A ' "$T/xs3.sg" && ! grep -q '^mail MX ' "$T/xs3.sg" && ok "xs3: the data is the data of the database (new name there, the deleted record gone)" || bad "xs3: data" "$(grep -E '^(newname|mail)' "$T/xs3.sg")"
         # the text signed again by BIND's tool, with the signatures that are still good kept (-i), is taken back
-        (cd "$T" && dnssec-signzone -q -o xs.test -f xs3b.out -O full -K keys3 -e now+14d -i 259200 -N increment -3 - -H 0 -x xs3.sg "$(cat keys3/ksk.name)" "$(cat keys3/zsk.name)" > /dev/null 2>&1)
+        (cd "$T" && dnssec-signzone -q -o xs.test -f xs3b.out -O full -K keys3 -e now+14d -i 259200 -N increment -u -3 - -H 0 -x xs3.sg "$(cat keys3/ksk.name)" "$(cat keys3/zsk.name)" > /dev/null 2>&1)
         if grep -qE '[[:space:]]MX[[:space:]]' "$T/xs3b.out"; then bad "xs3: dnssec-signzone kept the deleted MX RRset or its signature"; else ok "xs3: dnssec-signzone dropped the signature of the deleted RRset (it was in the text)"; fi
         expect "xs3: the zone signed again from export --signer is written back" 0 import --signer --json xs.test "$T/xs3b.out"
         jget "xs3: the serial grew by one" "signer.serial" 3

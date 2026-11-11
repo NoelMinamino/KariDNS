@@ -304,6 +304,28 @@ CREATE TABLE IF NOT EXISTS karidns_signer_state (
 );
 CREATE INDEX IF NOT EXISTS karidns_signer_state_due_idx ON karidns_signer_state (next_due);
 
+-- The monitoring view of the signer (0.6.1, docs/karidns-signer.md "Monitoring"): one row per zone the signer keeps (X-KARIDNS-SIGNER = 1), with its state row (unix
+-- seconds like the table; NULL columns for a zone without a state row) and a `status`: the first that applies of
+--   expired   the earliest RRSIG expiration (min_expire) has passed: validating resolvers refuse the zone now
+--   failing   the last run failed (last_error)
+--   overdue   the signer wanted to look at the zone more than an hour ago (next_due) and has not: it is stuck or not running
+--   expiring  the signatures end within two days (the signer re-signs well before that: a zone that is `expiring` and not `overdue` is a signer that fails to sign)
+--   unsigned  no state row yet (never signed, or the signer is not running)
+--   ok
+-- `seconds_to_expiry` is min_expire - now (negative when expired).  Alert on every status but `ok`; the thresholds (1 hour, 2 days) are the ones of the manual's SQL.
+DROP VIEW IF EXISTS karidns_signer_monitor;
+CREATE VIEW karidns_signer_monitor AS
+SELECT d.id AS domain_id, d.name AS zone, s.signed_at, s.signed_serial, s.min_expire, s.next_due, s.attempts, s.last_error, s.last_duration_ms,
+       CASE WHEN s.domain_id IS NULL THEN 'unsigned'
+            WHEN s.min_expire IS NOT NULL AND s.min_expire < CAST(strftime('%s', 'now') AS INTEGER) THEN 'expired'
+            WHEN s.last_error IS NOT NULL THEN 'failing'
+            WHEN s.next_due < CAST(strftime('%s', 'now') AS INTEGER) - 3600 THEN 'overdue'
+            WHEN s.min_expire IS NOT NULL AND s.min_expire < CAST(strftime('%s', 'now') AS INTEGER) + 172800 THEN 'expiring'
+            ELSE 'ok' END AS status,
+       s.min_expire - CAST(strftime('%s', 'now') AS INTEGER) AS seconds_to_expiry
+  FROM domains d LEFT JOIN karidns_signer_state s ON s.domain_id = d.id
+ WHERE EXISTS (SELECT 1 FROM domainmetadata m WHERE m.domain_id = d.id AND m.kind = 'X-KARIDNS-SIGNER' AND m.content = '1');
+
 -- ---------------------------------------------------------------------------------------------------------------------------------
 -- Zone versions (0.6.0 item E, docs/karidns-zone.md "Versions"; schema version 3): one row per committed change set of one zone, written by
 -- `karidns-zone apply` (and `import`) in the transaction of the change itself.  Version numbers are per zone, from 1.  The same tables as on PostgreSQL

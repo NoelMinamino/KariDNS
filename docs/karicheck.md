@@ -406,6 +406,9 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `conf.database.server-id-sqlite` | warning | server-id is ignored with sqlite3 |
 | `conf.database.server-id-chars` | warning | server-id has characters other than letters, digits and . - _ : |
 | `conf.database.server-id-host` | warning | server-id is not set and the host name does not fit |
+| `conf.alerts.option` | error | an unknown statement in alerts { }, or interval / reload-failures-above in the alerts { } of a zone |
+| `conf.alerts.range` | error | an alerts { } value is not a number, is negative, is above 100 for servfail-ratio-above, or is outside 10..3600 for interval |
+| `conf.alerts.empty` | warning | an alerts { } block sets no limit, so nothing is checked |
 | `conf.database.alias-resolver` | warning | an alias-resolver with server-id: servers sharing a database can answer ALIAS names differently |
 | `zone.not-found` | error | the zone is not in the configuration |
 | `zone.skipped` | info | a zone without a zone file is not checked |
@@ -415,6 +418,7 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `zone.empty` | error | the zone has no records |
 | `zone.out-of-zone` | warning | a record outside the zone is ignored |
 | `zone.tinydns.out-of-zone` | warning | tinydns records that belong to no zone of the view are ignored |
+| `zone.tinydns.skipped` | warning | tinydns lines with data that cannot be kept are left out |
 | `zone.ttl.missing` | warning | records have no TTL and no $TTL |
 | `zone.string.long` | warning | a character-string of more than 255 octets |
 | `zone.limits` | error | the zone breaks a size limit of the configuration |
@@ -428,6 +432,8 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `zone.ds.digest-deprecated` | warning | a DS digest type that is deprecated |
 | `zone.ds.digest-unknown` | warning | an unknown DS digest type |
 | `zone.ds.digest-length` | error | a DS or CDS digest whose length does not fit its digest type |
+| `zone.cds.delete-content` | warning | a CDS or CDNSKEY delete signal whose content is not the one RFC 8078 section 4 gives |
+| `zone.dnskey.protocol` | warning | a DNSKEY or CDNSKEY whose protocol field is not 3 |
 | `zone.zonemd.scheme-invalid` | warning | the ZONEMD scheme is not a number from 0 to 255 |
 | `zone.zonemd.hash-invalid` | warning | the ZONEMD hash algorithm is not a number from 0 to 255 |
 | `zone.zonemd.canonical` | error | a record cannot be put in canonical form, so the ZONEMD digest is not computed |
@@ -444,6 +450,7 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `zone.cname.coexists` | error | a CNAME shares its name with other record types |
 | `zone.cname.coexists-other` | warning | a CNAME co-exists with other records (RFC 1912) |
 | `zone.record.occluded` | warning | a record is hidden by a delegation above it |
+| `zone.cut.data` | warning | a record other than NS, DS, DNSSEC or address data at a delegation point |
 | `zone.cname.target` | error | an NS or MX record points to a CNAME |
 | `zone.srv.cname` | warning | an SRV record points to a CNAME |
 | `zone.cname.loop` | error | a CNAME points to itself |
@@ -488,7 +495,7 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `zone.hip.key-base64` | error | the public key of a HIP record is not valid base64 |
 | `zone.wks.protocol` | warning | the protocol of a WKS record is neither a number nor TCP or UDP |
 | `zone.wks.port` | warning | a port of a WKS record is neither a number nor a known service |
-| `zone.gpos.fields` | warning | a GPOS record has fewer than three fields |
+| `zone.gpos.fields` | warning | a GPOS record does not have exactly three fields |
 | `zone.x25.fields` | warning | an X25 record has no field |
 | `zone.isdn.fields` | warning | an ISDN record does not have one or two fields |
 | `zone.eui48` | warning | an EUI48 record is not six octets |
@@ -528,6 +535,8 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `zone.catalog.version` | error | a catalog zone lacks its version TXT record |
 | `zone.catalog.name-too-long` | error | a name in a catalog zone is too long to check |
 | `zone.catalog.orphan-group` | warning | a group TXT record of a catalog zone has no member PTR record |
+| `zone.catalog.member-ptrs` | error | a member node of a catalog zone has more than one PTR record |
+| `zone.catalog.member-duplicate` | error | two member nodes of a catalog zone name the same zone |
 | `db.finding` | error | a finding of karidns-dbloader --check that carries no code of its own (the severity is the message's) |
 | `db.checking` | info | the database that is being checked |
 | `db.summary` | info | the number of databases and zones checked |

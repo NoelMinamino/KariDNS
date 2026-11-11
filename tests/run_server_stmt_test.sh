@@ -102,6 +102,11 @@ wait_grep() { # PATTERN FILE [SECONDS]
     while [ $_i -lt "${3:-10}" ]; do grep -q -- "$1" "$2" 2>/dev/null && return 0; sleep 1; _i=$((_i + 1)); done
     return 1
 }
+wait_listen() { # PORT [SECONDS]: something listens on the port (a perl mock needs a moment to start when the host is loaded)
+    _i=0
+    while [ $_i -lt $((${2:-20} * 5)) ]; do sockstat -4 -l -p "$1" 2>/dev/null | grep -q ":$1 " && return 0; sleep 0.2; _i=$((_i + 1)); done
+    return 1
+}
 dag_soa() { "$DAG" @127.0.0.1 -p "$1" "$2" SOA +short +nohexdump +time=1 +tries=1 2>/dev/null; }
 serial_of() { dag_soa "$1" "$2" | awk '{print $3}'; }
 wait_serial() { # PORT ZONE SERIAL [SECONDS]
@@ -642,11 +647,14 @@ else
         echo "zone \"e2.test\" { type master; file \"$W/e2.zone\"; also-notify source 127.0.0.4 { 127.0.0.5 port $(cp_of 42); }; };"
         echo "zone \"e3.test\" { type master; file \"$W/e3.zone\"; also-notify { 127.0.0.4 port $(cp_of 43); }; };"
     } > "$W/pc3.conf"
-    sleep 1
+    for p in 41 42 43; do wait_listen "$(cp_of $p)" || echo "NOTE: the mock receiver does not listen on $(cp_of $p)"; done
     start pc3
     kari_wait_answer "$DAG" "$(cp_of 32)" e1.test. || true
     for z in e1 e2 e3; do ctl pc3 notify $z.test > /dev/null; done
-    sleep 3
+    # the NOTIFYs are sent by threads of the server, each over a new TCP connection: wait for them (up to 20 s each) instead of a fixed pause
+    wait_grep "NOTIFY port=$(cp_of 41) src=127.0.0.2 .* tsig=xk:ok via=tcp" "$W/sinke.log" 20
+    wait_grep "NOTIFY port=$(cp_of 42) src=127.0.0.4 .* via=tcp" "$W/sinke.log" 20
+    wait_grep "NOTIFY port=$(cp_of 43) src=127.0.0.3 .* via=tcp" "$W/sinke.log" 20
     grep -q "NOTIFY port=$(cp_of 41) src=127.0.0.2 .* tsig=xk:ok via=tcp" "$W/sinke.log" \
         && pass "C11: the server statement's notify-source (127.0.0.2) is the local address of the TCP connection (above the list's 127.0.0.4)" \
         || { fail "C11: e1.test: expected a TCP NOTIFY from 127.0.0.2"; cat "$W/sinke.log"; }

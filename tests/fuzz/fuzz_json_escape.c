@@ -7,7 +7,9 @@
  * a line number and a detail line.  The document must be well formed: strings end where they should, escapes are the legal ones, no raw
  * control character, nothing but valid UTF-8.
  */
-#define _GNU_SOURCE
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   /* the fuzz object flags define it too */
+#endif
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>

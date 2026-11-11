@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 #include <arpa/inet.h>
 #include "dns_log.h"
 #include <fcntl.h>
@@ -75,22 +76,23 @@ void *safe_calloc_or_die_test_wrapper(size_t nmemb, size_t size) {
   return safe_calloc_or_die(nmemb, size);
 }
 
-#define APPEND_STR(arr, cnt, val) \
-    do { \
-        char *_val_dup = (val); \
-        if (!_val_dup) { \
-            if (ctx) ctx->error_occurred = true; \
-            return -1; \
-        } \
-        char **_new_arr = safe_realloc_or_die((arr), sizeof(char *) * ((cnt) + 1)); \
-        if (!_new_arr) { \
-            free(_val_dup); \
-            if (ctx) ctx->error_occurred = true; \
-            return -1; \
-        } \
-        (arr) = _new_arr; \
-        (arr)[(cnt)++] = _val_dup; \
-    } while (0)
+/* Appends val (owned: freed when it cannot be added; a NULL val is an allocation failure of the caller) to the array *arr of *cnt strings.
+ * 0, or -1 with the error flag set: the caller returns -1 after releasing what it holds. */
+static int append_str(token_ctx_t *ctx, char ***arr, int *cnt, char *val) {
+    if (!val) {
+        if (ctx) ctx->error_occurred = true;
+        return -1;
+    }
+    char **new_arr = safe_realloc_or_die(*arr, sizeof(char *) * ((size_t)*cnt + 1));
+    if (!new_arr) {
+        free(val);
+        if (ctx) ctx->error_occurred = true;
+        return -1;
+    }
+    *arr = new_arr;
+    (*arr)[(*cnt)++] = val;
+    return 0;
+}
 
 #define LEX_TOKEN_MAX 4096   /* the longest token (bytes); a longer one is a syntax error, not truncated */
 enum { LEXERR_NONE = 0, LEXERR_COMMENT, LEXERR_STRING, LEXERR_TOKEN };
@@ -402,6 +404,8 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
       ctx->stack[ctx->depth].dev = inc_dev;
       ctx->stack[ctx->depth].ino = inc_ino;
       ctx->stack[ctx->depth].via_rel = was_rel;
+      ctx->stack[ctx->depth].loc_pos = 0;          /* a frame is reused: the line cache of the file before is not this file's */
+      ctx->stack[ctx->depth].loc_line = 0;
 
       continue;
     }
@@ -723,12 +727,19 @@ static void free_view_db_fields(view_config_t *view) {
   view->database_none = false;
 }
 
+/* the Base64 text of a secret is wiped before it is freed, like the decoded copy */
+static void free_secret_str(char *s) {
+  if (!s) return;
+  OPENSSL_cleanse(s, strlen(s));
+  free(s);
+}
+
 static void tsig_keys_free(tsig_key_t *k) {
   while (k) {
     tsig_key_t *next_k = k->next;
     free(k->name);
     free(k->algorithm);
-    free(k->secret);
+    free_secret_str(k->secret);
     OPENSSL_cleanse(k->secret_decoded, sizeof(k->secret_decoded));
     free(k);
     k = next_k;
@@ -885,9 +896,9 @@ static int acl_expand_into(token_ctx_t *ctx, const server_config_t *cfg, const c
       if (use == ACL_USE_ADDRESS) return acl_reject(ctx, where, kname, "is a key; only addresses can be used here");
       if (key_placeholder_used(ctx, cfg, where, kname)) return -1;
       if (use == ACL_USE_TRANSFER) {
-        APPEND_STR(*keys_out, *keys_count, strdup(kname));
+        if (append_str(ctx, keys_out, keys_count, strdup(kname)) != 0) return -1;
       } else {
-        APPEND_STR(*out, *out_count, strdup(kname));
+        if (append_str(ctx, out, out_count, strdup(kname)) != 0) return -1;
       }
       continue;
     }
@@ -897,7 +908,7 @@ static int acl_expand_into(token_ctx_t *ctx, const server_config_t *cfg, const c
       char *v = malloc(tlen + 2);
       if (!v) { if (ctx) ctx->error_occurred = true; return -1; }
       snprintf(v, tlen + 2, "%s%s", neg ? "!" : "", t);
-      APPEND_STR(*out, *out_count, v);
+      if (append_str(ctx, out, out_count, v) != 0) return -1;
       continue;
     }
     if (strcasecmp(t, "localhost") == 0 || strcasecmp(t, "localnets") == 0) {
@@ -921,7 +932,7 @@ static int acl_expand_into(token_ctx_t *ctx, const server_config_t *cfg, const c
         }
         char ent[INET6_ADDRSTRLEN + 8];
         snprintf(ent, sizeof(ent), "%s%s/%d", neg ? "!" : "", ip, prefix);
-        APPEND_STR(*out, *out_count, strdup(ent));
+        if (append_str(ctx, out, out_count, strdup(ent)) != 0) return -1;
       }
       continue;
     }
@@ -940,7 +951,7 @@ static int acl_expand_into(token_ctx_t *ctx, const server_config_t *cfg, const c
     /* allow-update は従来どおり鍵名だけの要素も受け付ける (key "name" と同じ意味) */
     if (use == ACL_USE_UPDATE && !neg && key_is_defined(ctx, cfg, t)) {
       if (key_placeholder_used(ctx, cfg, where, t)) return -1;
-      APPEND_STR(*out, *out_count, strdup(t));
+      if (append_str(ctx, out, out_count, strdup(t)) != 0) return -1;
       continue;
     }
     return acl_reject(ctx, where, e, use == ACL_USE_UPDATE
@@ -1323,7 +1334,7 @@ void free_server_config_fields(server_config_t *cfg) {
 
   if (cfg->control.socket_path) { free(cfg->control.socket_path); cfg->control.socket_path = NULL; }
   if (cfg->control.algorithm) { free(cfg->control.algorithm); cfg->control.algorithm = NULL; }
-  if (cfg->control.secret) { free(cfg->control.secret); cfg->control.secret = NULL; }
+  if (cfg->control.secret) { free_secret_str(cfg->control.secret); cfg->control.secret = NULL; }
   free(cfg->control.allow_group);
   for (int i = 0; i < cfg->control.nkeys; i++) {
     free(cfg->control.keys[i].name);
@@ -1340,6 +1351,7 @@ void free_server_config_fields(server_config_t *cfg) {
   free_database_config(&cfg->database);
   free_rate_limit_config(&cfg->rrl);
   memset(&cfg->rrl, 0, sizeof(rate_limit_config_t));
+  memset(&cfg->alerts, 0, sizeof(cfg->alerts));
 
   logging_config_free(&cfg->logging);
   for (int j = 0; j < cfg->controls_count; j++) {
@@ -1406,10 +1418,18 @@ char *read_entire_file(const char *path, dev_t *out_dev, ino_t *out_ino) {
  * サンドボックスの中なので、mtime もパスではなくこの fd から取る (X-13)。 */
 char *read_entire_file_stat(const char *path, struct stat *out_st) {
   memset(out_st, 0, sizeof(*out_st));
-  int fd = open_via_dir_cache(path, O_RDONLY, 0, false);
+  /* O_NONBLOCK: opening a FIFO for reading would wait for a writer; it only matters here, the file is read with fread() from a regular file */
+  int fd = open_via_dir_cache(path, O_RDONLY | O_NONBLOCK, 0, false);
   if (fd < 0)
     return NULL;
-  if (fstat(fd, out_st) != 0) memset(out_st, 0, sizeof(*out_st));
+  if (fstat(fd, out_st) != 0) {
+    memset(out_st, 0, sizeof(*out_st));
+  } else if (!S_ISREG(out_st->st_mode)) {   /* a FIFO, a device or a directory is not a configuration or zone file */
+    syslog(LOG_ERR, "[Config] '%s' is not a regular file", path);
+    memset(out_st, 0, sizeof(*out_st));
+    close(fd);
+    return NULL;
+  }
 
   FILE *f = fdopen(fd, "rb");
   if (!f) {
@@ -1435,6 +1455,12 @@ char *read_entire_file_stat(const char *path, struct stat *out_st) {
   }
   str[fsize] = '\0';
   fclose(f);
+  /* the lexers stop at a NUL, so the rest of the file would be silently ignored: refuse the file */
+  if (fsize > 0 && memchr(str, '\0', (size_t)fsize) != NULL) {
+    syslog(LOG_ERR, "[Config] '%s' contains a NUL byte", path);
+    free(str);
+    return NULL;
+  }
   return str;
 }
 
@@ -1443,6 +1469,11 @@ static void skip_unknown_block(token_ctx_t *ctx) {
   while (1) {
     conf_token_t tok = get_next_token(ctx);
     if (tok.type == TOKEN_EOF) {
+      if (!ctx->error_occurred) {   /* a lexer or include error has been reported already */
+        char loc[256];
+        ctx_location(ctx, loc, sizeof(loc));
+        syslog(LOG_WARNING, "[Config] %s: end of file inside an unknown statement or block (a missing '}' or ';'?)", loc);
+      }
       free_token(&tok);
       break;
     }
@@ -1509,9 +1540,16 @@ static void report_bad_bool(token_ctx_t *ctx, const char *zone, const char *name
 }
 
 /* "<name> <bool>;" の値とセミコロンを読む。不正な値や構文は -1。 */
+static const char *tok_desc(const conf_token_t *t, char *buf, size_t n);
+static void conf_error(token_ctx_t *ctx, const char *what, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 static int parse_bool_statement(token_ctx_t *ctx, const char *zone, const char *name, bool *out) {
+  char db[80];
   conf_token_t tok = get_next_token(ctx);
-  if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
+  if (tok.type != TOKEN_STRING) {
+    conf_error(ctx, name, "expected yes or no but found %s", tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    return -1;
+  }
   if (!parse_config_bool(tok.value, out)) {
     report_bad_bool(ctx, zone, name, tok.value);
     free_token(&tok);
@@ -1519,7 +1557,11 @@ static int parse_bool_statement(token_ctx_t *ctx, const char *zone, const char *
   }
   free_token(&tok);
   tok = get_next_token(ctx);
-  if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+  if (tok.type != TOKEN_SEMICOLON) {
+    conf_error(ctx, name, "expected ';' after the value but found %s", tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    return -1;
+  }
   free_token(&tok);
   return 0;
 }
@@ -1537,8 +1579,10 @@ bool match_cidr(const char *client_ip_str, const char *cidr_str) {
   if (slash) {
     *slash = '\0';
     char *endptr = NULL;
-    long val = strtol(slash + 1, &endptr, 10);
-    if (endptr == slash + 1 || *endptr != '\0' || val < 0 || val > 128) {
+    long val = 0;
+    /* digits only, as cidr_entry_parse(): strtol would also take leading space, '+' and '-' */
+    if (slash[1] >= '0' && slash[1] <= '9') val = strtol(slash + 1, &endptr, 10);
+    if (!endptr || *endptr != '\0' || val > 128) {
         syslog(LOG_WARNING, "[Config] Invalid CIDR prefix in ACL entry: '%s' (rejecting, no match)", cidr_str);
         return false;
     }
@@ -1594,7 +1638,7 @@ static int parse_string_list_inner(token_ctx_t *ctx, char ***list, int *count) {
     char *val = tok.value;
     tok.value = NULL;
     free_token(&tok);
-    APPEND_STR(*list, *count, val);
+    if (append_str(ctx, list, count, val) != 0) return -1;
     tok = get_next_token(ctx);
     if (tok.type != TOKEN_SEMICOLON) {
       free_token(&tok);
@@ -1660,7 +1704,7 @@ static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
             tok.value = NULL;
             free_token(&tok);
             if (key_mode == ACL_KEY_AS_TSIG_FIELD && tsig_keys_out && tsig_keys_count_out) {
-                APPEND_STR(*tsig_keys_out, *tsig_keys_count_out, val);
+                if (append_str(ctx, tsig_keys_out, tsig_keys_count_out, val) != 0) return -1;
             } else if (key_mode == ACL_KEY_MARKED) {
                 /* 名前付き ACL の key 要素。参照先の文で意味が決まるので印を付けて残す */
                 size_t vlen = strlen(val);
@@ -1673,9 +1717,9 @@ static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
                 marked[0] = ACL_KEY_MARK;
                 memcpy(marked + 1, val, vlen + 1);
                 free(val);
-                APPEND_STR(*list, *count, marked);
+                if (append_str(ctx, list, count, marked) != 0) return -1;
             } else {
-                APPEND_STR(*list, *count, val);
+                if (append_str(ctx, list, count, val) != 0) return -1;
             }
         } else if (strcmp(tok.value, "!") == 0) {
             free_token(&tok);
@@ -1689,7 +1733,7 @@ static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
                     char *val = tok.value;
                     tok.value = NULL;
                     free_token(&tok);
-                    APPEND_STR(*list, *count, val);
+                    if (append_str(ctx, list, count, val) != 0) return -1;
                 } else {
                     free_token(&tok);
                 }
@@ -1702,7 +1746,7 @@ static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
                     if (ctx) ctx->error_occurred = true;
                     return -1;
                 }
-                APPEND_STR(*list, *count, dup_val);
+                if (append_str(ctx, list, count, dup_val) != 0) return -1;
             }
         } else {
             char *val = tok.value;
@@ -1731,9 +1775,9 @@ static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
                 }
                 snprintf(negated, buflen, "!%s", val);
                 free(val);
-                APPEND_STR(*list, *count, negated);
+                if (append_str(ctx, list, count, negated) != 0) return -1;
             } else {
-                APPEND_STR(*list, *count, val);
+                if (append_str(ctx, list, count, val) != 0) return -1;
             }
         }
         tok = get_next_token(ctx);
@@ -1752,12 +1796,20 @@ static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
  * (the innermost file of the include stack), so it is the line of the token that was read last. */
 static void ctx_location(const token_ctx_t *ctx, char *buf, size_t n) {
   int depth = ctx->depth >= 0 && ctx->depth < MAX_INCLUDE_DEPTH ? ctx->depth : 0;
-  const config_file_frame_t *f = &ctx->stack[depth];
+  /* the line cache of the frame is the one thing written (the callers hold const pointers to token_ctx_t objects that are not const themselves) */
+  config_file_frame_t *f = (config_file_frame_t *)(uintptr_t)&ctx->stack[depth];
   int line = 1;
   if (f->src) {
     size_t end = f->pos < f->len ? f->pos : f->len;
-    for (size_t i = 0; i < end; i++)
+    size_t i = 0;
+    if (f->loc_line > 0 && f->loc_pos <= end) {   /* the lexer only moves forward: go on from the last message, not from the file start */
+      i = f->loc_pos;
+      line = f->loc_line;
+    }
+    for (; i < end; i++)
       if (f->src[i] == '\n') line++;
+    f->loc_pos = end;
+    f->loc_line = line;
   }
   if (f->file_path)
     snprintf(buf, n, "%.200s:%d", f->file_path, line);
@@ -2206,7 +2258,9 @@ static int chaos_finish(token_ctx_t *ctx, server_config_t *cfg) {
                  c->r_id, cfg->nsid_string);
       return -1;
     }
-    if (!cfg->nsid_string && (cfg->nsid_string = strdup(c->r_id)) == NULL) return -1;
+    if (!cfg->nsid_string && strlen(c->r_id) > KARIDNS_NSID_MAX)   /* as for `nsid`: too long to be sent, so it is not the NSID (id.server still answers) */
+      syslog(LOG_WARNING, "[Config] server-id is longer than %d octets: it is not used as the NSID of the responses", KARIDNS_NSID_MAX);
+    else if (!cfg->nsid_string && (cfg->nsid_string = strdup(c->r_id)) == NULL) return -1;
   }
   if (cfg->dnstap.enabled && cfg->dnstap.bind_form && !cfg->dnstap.socket_path) {   /* BIND check_dnstap(): 'dnstap-output' must be set if 'dnstap' is set */
     conf_error(ctx, "dnstap", "'dnstap-output' must be set if 'dnstap' is set (dnstap-output unix \"/path/to/socket\";)");
@@ -2493,7 +2547,7 @@ static int aml_flatten(token_ctx_t *ctx, const aml_t *l, bool negate, acl_key_mo
         continue;
       }
       if (km == ACL_KEY_AS_TSIG_FIELD && keys_out && keys_count) {
-        APPEND_STR(*keys_out, *keys_count, strdup(e->text));
+        if (append_str(ctx, keys_out, keys_count, strdup(e->text)) != 0) return -1;
       } else if (km == ACL_KEY_MARKED) {
         size_t n = strlen(e->text);
         char *m = malloc(n + 2);
@@ -2503,9 +2557,9 @@ static int aml_flatten(token_ctx_t *ctx, const aml_t *l, bool negate, acl_key_mo
         }
         m[0] = ACL_KEY_MARK;
         memcpy(m + 1, e->text, n + 1);
-        APPEND_STR(*list, *count, m);
+        if (append_str(ctx, list, count, m) != 0) return -1;
       } else {
-        APPEND_STR(*list, *count, strdup(e->text));
+        if (append_str(ctx, list, count, strdup(e->text)) != 0) return -1;
       }
       continue;
     }
@@ -2520,7 +2574,7 @@ static int aml_flatten(token_ctx_t *ctx, const aml_t *l, bool negate, acl_key_mo
       return -1;
     }
     snprintf(v, n + 2, "%s%s", neg ? "!" : "", e->text);
-    APPEND_STR(*list, *count, v);
+    if (append_str(ctx, list, count, v) != 0) return -1;
   }
   return 0;
 }
@@ -3116,6 +3170,158 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
     }
   }
 
+  return 0;
+}
+
+/* ---- alerts { } (KariDNS, 0.6.1): options { alerts { } } and zone { alerts { } } ----
+ *   alerts {
+ *       interval 60;                        // seconds between checks (options only), 10..3600
+ *       qps-above 200000;                   // queries per second over the interval
+ *       servfail-ratio-above 5;             // percent of the responses of the interval, 0..100
+ *       rrl-drops-above 1000;               // responses dropped by rate-limit in the interval
+ *       transfer-failures-above 0;          // refreshes that failed at every primary in the interval
+ *       reload-failures-above 0;            // failed configuration reloads in the interval (options only)
+ *   };
+ * A limit is a number >= 0 (an alert is raised when the value is above it).  A second alerts block of the same place replaces the first. */
+static const struct { const char *name; bool in_zone; } k_alert_names[ALERT_KIND_COUNT] = {
+  { "qps-above", true }, { "servfail-ratio-above", true }, { "rrl-drops-above", true },
+  { "transfer-failures-above", true }, { "reload-failures-above", false },
+};
+
+const char *alert_kind_name(alert_kind_t k) { return (unsigned)k < ALERT_KIND_COUNT ? k_alert_names[k].name : "?"; }
+bool alert_kind_in_zone(alert_kind_t k) { return (unsigned)k < ALERT_KIND_COUNT && k_alert_names[k].in_zone; }
+
+void alert_limits_for_server(const alerts_config_t *opts, alert_limits_t *out) {
+  memset(out, 0, sizeof(*out));
+  if (!opts) return;
+  for (int k = 0; k < ALERT_KIND_COUNT; k++) {
+    out->set[k] = opts->set[k];
+    out->limit[k] = opts->limit[k];
+  }
+}
+
+void alert_limits_for_zone(const alerts_config_t *opts, const alerts_config_t *zone, alert_limits_t *out) {
+  memset(out, 0, sizeof(*out));
+  for (int k = 0; k < ALERT_KIND_COUNT; k++) {
+    if (!alert_kind_in_zone((alert_kind_t)k)) continue;
+    if (zone && zone->set[k]) {
+      out->set[k] = true;
+      out->limit[k] = zone->limit[k];
+    } else if (opts && opts->set[k]) {
+      out->set[k] = true;
+      out->limit[k] = opts->limit[k];
+    }
+  }
+}
+
+static int alerts_error(token_ctx_t *ctx, dns_diag_code_t code, const char *what, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+static int alerts_error(token_ctx_t *ctx, dns_diag_code_t code, const char *what, const char *fmt, ...) {
+  char msg[300], loc[300];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, ap);
+  va_end(ap);
+  ctx_location(ctx, loc, sizeof(loc));
+  syslog(LOG_ERR, "[Config] %s: %s: %s", loc, what, msg);
+  dns_diag_at(DIAG_ERROR, code, loc, "%s: %s: %s\n", loc, what, msg);
+  if (ctx) ctx->error_occurred = true;
+  return -1;
+}
+
+static int parse_alerts_block(token_ctx_t *ctx, alerts_config_t *a, bool in_zone) {
+  const char *what = in_zone ? "zone alerts" : "options alerts";
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_LBRACE) {
+    conf_error(ctx, what, "expected '{'");
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  memset(a, 0, sizeof(*a));
+  a->configured = true;
+  for (;;) {
+    tok = get_next_token(ctx);
+    if (tok.type == TOKEN_RBRACE) {
+      free_token(&tok);
+      break;
+    }
+    if (tok.type != TOKEN_STRING || !tok.value) {
+      conf_error(ctx, what, "expected a statement name or '}'");
+      free_token(&tok);
+      return -1;
+    }
+    char *key = tok.value;
+    tok.value = NULL;
+    free_token(&tok);
+    int kind = -1;
+    for (int k = 0; k < ALERT_KIND_COUNT; k++)
+      if (strcmp(key, k_alert_names[k].name) == 0) kind = k;
+    bool is_interval = strcmp(key, "interval") == 0;
+    if (!is_interval && kind < 0) {
+      int rc = alerts_error(ctx, DC_CONF_ALERTS_OPTION, what, "unknown statement '%.64s' (interval, qps-above, servfail-ratio-above, rrl-drops-above, transfer-failures-above, reload-failures-above)", key);
+      free(key);
+      return rc;
+    }
+    if (in_zone && (is_interval || !k_alert_names[kind].in_zone)) {
+      int rc = alerts_error(ctx, DC_CONF_ALERTS_OPTION, what, "'%s' can be written in options { alerts { } } only (a zone block has qps-above, servfail-ratio-above, rrl-drops-above and transfer-failures-above)", key);
+      free(key);
+      return rc;
+    }
+    tok = get_next_token(ctx);
+    if (tok.type != TOKEN_STRING || !tok.value) {
+      conf_error(ctx, what, "'%s' needs a number", key);
+      free(key);
+      free_token(&tok);
+      return -1;
+    }
+    char *val = tok.value;
+    tok.value = NULL;
+    free_token(&tok);
+    tok = get_next_token(ctx);
+    if (tok.type != TOKEN_SEMICOLON) {
+      conf_error(ctx, what, "missing ';' after '%s'", key);
+      free(key);
+      free(val);
+      free_token(&tok);
+      return -1;
+    }
+    free_token(&tok);
+    char *end = NULL;
+    double d = strtod(val, &end);
+    bool numeric = val[0] != '\0' && end && *end == '\0' && isfinite(d) && !isspace((unsigned char)val[0]);
+    int rc = 0;
+    if (!numeric) {
+      rc = alerts_error(ctx, DC_CONF_ALERTS_RANGE, what, "%s: '%.64s' is not a number", key, val);
+    } else if (is_interval) {
+      if (d != (double)(uint32_t)d || d < ALERT_INTERVAL_MIN || d > ALERT_INTERVAL_MAX)
+        rc = alerts_error(ctx, DC_CONF_ALERTS_RANGE, what, "interval %s is outside %d..%d seconds", val, ALERT_INTERVAL_MIN, ALERT_INTERVAL_MAX);
+      else
+        a->interval = (uint32_t)d;
+    } else if (d < 0 || (kind == ALERT_SERVFAIL_RATIO_ABOVE && d > 100)) {
+      rc = alerts_error(ctx, DC_CONF_ALERTS_RANGE, what, "%s %s is outside %s", key, val, kind == ALERT_SERVFAIL_RATIO_ABOVE ? "0..100 (percent)" : "0 and above");
+    } else {
+      a->set[kind] = true;
+      a->limit[kind] = d;
+    }
+    free(key);
+    free(val);
+    if (rc != 0) return rc;
+  }
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) {
+    conf_error(ctx, what, "missing ';' after '}'");
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  bool any = a->interval != 0;
+  for (int k = 0; k < ALERT_KIND_COUNT; k++) any = any || a->set[k];
+  if (!any) {
+    char loc[300];
+    ctx_location(ctx, loc, sizeof(loc));
+    syslog(LOG_WARNING, "[Config] %s: %s: the block sets no limit, so nothing is checked", loc, what);
+    dns_diag_at(DIAG_WARNING, DC_CONF_ALERTS_EMPTY, loc, "%s: %s: the block sets no limit, so nothing is checked\n", loc, what);
+  }
   return 0;
 }
 
@@ -4178,6 +4384,9 @@ uint32_t xfr_cfg_limit(const server_config_t *cfg, int which) {
 uint32_t xfr_rate_clamp(uint32_t v) { return v == 0 ? 1 : v; }
 
 uint32_t xfr_minutes_to_secs(uint32_t minutes) {
+  /* KARIDNS_XFER_MINUTE_SECS (1..60: seconds per "minute") lets the integration tests run the transfer timeouts in seconds, so it stays in the
+   * production binary (the shell tests start it); it is read on each call because test_xfr_opts changes it inside one process.  The caller
+   * is the configuration load, not the query path. */
   uint32_t unit = 60;
   const char *e = getenv("KARIDNS_XFER_MINUTE_SECS");
   if (e && *e) {
@@ -4937,7 +5146,7 @@ static tsig_key_t *parse_key_block(token_ctx_t *ctx) {
           cfg_diag(ctx, DIAG_ERROR, DC_CONF_TSIG_ALGORITHM, "Unsupported TSIG algorithm: %s\n", val);
           goto fail;
         }
-        if (strstr(val, "md5") || strstr(val, "sha1")) {
+        if (strcasestr(val, "md5") || strcasestr(val, "sha1")) {
           syslog(LOG_WARNING, "[Config] Warning: TSIG algorithm '%s' is deprecated and insecure (RFC 8945)", val);
         }
         tsig->algorithm = val;
@@ -5524,6 +5733,12 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       free_token(&tok);
     } else if (strcmp(key, "rate-limit") == 0) {
       if (parse_rate_limit_config(ctx, &x->rrl) != 0) {
+        free(key);
+        free_zone_config(zone);
+        return -1;
+      }
+    } else if (strcmp(key, "alerts") == 0) {
+      if (parse_alerts_block(ctx, &x->alerts, true) != 0) {
         free(key);
         free_zone_config(zone);
         return -1;
@@ -7866,7 +8081,8 @@ uint32_t control_perm_from_name(const char *name) {
 uint32_t control_command_perm(const char *cmd, bool has_arg) {
   if (!cmd) return CTLP_OTHER;
   if (strcmp(cmd, "reload") == 0) return has_arg ? CTLP_RELOAD_ZONE : CTLP_RELOAD;
-  if (strcmp(cmd, "status") == 0 || strcmp(cmd, "zonestatus") == 0 || strcmp(cmd, "observatory") == 0 || strcmp(cmd, "dbstatus") == 0)
+  if (strcmp(cmd, "status") == 0 || strcmp(cmd, "zonestatus") == 0 || strcmp(cmd, "observatory") == 0 || strcmp(cmd, "dbstatus") == 0 ||
+      strcmp(cmd, "stats") == 0 || strcmp(cmd, "obspage") == 0)
     return CTLP_READ;
   uint32_t p = control_perm_from_name(cmd);
   return p ? p : CTLP_OTHER;
@@ -8203,7 +8419,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
               return -1;
             }
             free_token(&tok);
-            APPEND_STR(config->bind_addresses, config->bind_address_count, dup_addr);
+            if (append_str(ctx, &config->bind_addresses, &config->bind_address_count, dup_addr) != 0) return -1;
             if (bind_address_check(ctx, config, bind_first_new) != 0) {
               free(key);
               return -1;
@@ -8228,6 +8444,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           config->blackhole = bh;
         } else if (strcmp(key, "rate-limit") == 0) {
           if (parse_rate_limit_config(ctx, &config->rrl) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "alerts") == 0) {
+          if (parse_alerts_block(ctx, &config->alerts, false) != 0) {
             free(key);
             return -1;
           }
@@ -8367,6 +8588,12 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
         } else if (strcmp(key, "nsid") == 0) {
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) { free(key); free_token(&tok); return -1; }
+          if (tok.value && strlen(tok.value) > KARIDNS_NSID_MAX) {   /* RFC 5001: a response must stay within the UDP size; a longer one would never be sent */
+            conf_error(ctx, "nsid", "the identifier is longer than %d octets", KARIDNS_NSID_MAX);
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
           if (config->nsid_string) free(config->nsid_string);
           config->nsid_string = tok.value;
           tok.value = NULL;
@@ -9164,13 +9391,13 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
               free(val);
               return -1;
             }
-            if (strstr(val, "md5") || strstr(val, "sha1")) {
+            if (strcasestr(val, "md5") || strcasestr(val, "sha1")) {
               syslog(LOG_WARNING, "[Config] Warning: TSIG algorithm '%s' is deprecated and insecure (RFC 8945)", val);
             }
             if (config->control.algorithm) free(config->control.algorithm);
             config->control.algorithm = val;
           } else {
-            if (config->control.secret) free(config->control.secret);
+            if (config->control.secret) free_secret_str(config->control.secret);
             config->control.secret = val;
             size_t slen = strlen(config->control.secret);
             size_t decoded_upper_bound = ((slen + 3) / 4) * 3;
@@ -9178,7 +9405,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
               syslog(LOG_ERR, "[Config] secret too long for algorithm (decodes to %zu bytes, max %zu)", decoded_upper_bound, sizeof(config->control.secret_decoded));
               cfg_diag(ctx, DIAG_ERROR, DC_CONF_TSIG_SECRET_LENGTH, "secret too long for algorithm\n");
               free(key_prop);
-              free(config->control.secret);
+              free_secret_str(config->control.secret);
               config->control.secret = NULL;
               return -1;
             }
@@ -9189,7 +9416,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
               syslog(LOG_ERR, "[Config] control-channel: secret is not valid base64");
               cfg_diag(ctx, DIAG_ERROR, DC_CONF_TSIG_SECRET_BASE64, "control-channel: secret is not valid base64\n");
               free(key_prop);
-              free(config->control.secret);
+              free_secret_str(config->control.secret);
               config->control.secret = NULL;
               return -1;
             }
@@ -9203,7 +9430,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
                       "replace it with the output of 'openssl rand -base64 32'\n");
               if (ctx) ctx->error_occurred = true;
               free(key_prop);
-              free(config->control.secret);
+              free_secret_str(config->control.secret);
               config->control.secret = NULL;
               return -1;
             }

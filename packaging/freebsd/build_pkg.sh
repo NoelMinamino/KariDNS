@@ -75,7 +75,7 @@ fi
 # dependency, so a package linked against it fails to install on hosts without
 # it ("Missing shlib libcrypto.so.12"). Set ALLOW_PORTS_OPENSSL=1 to override.
 if [ "${ALLOW_PORTS_OPENSSL:-0}" != "1" ]; then
-    for b in karidns karictl karicheck dag $( [ -n "$DRIVERS" ] && echo karidns-dbloader karidns-zone ); do
+    for b in karidns karictl karicheck karidns-tapstat dag $( [ -n "$DRIVERS" ] && echo karidns-dbloader karidns-zone ); do
         if ldd "$b" 2>/dev/null | grep -E 'lib(crypto|ssl)\.so' | grep -q '/usr/local/'; then
             echo "ERROR: $b links the ports OpenSSL:" >&2
             ldd "$b" | grep -E 'lib(crypto|ssl)\.so' >&2
@@ -136,6 +136,7 @@ mkdir -p "${OUT_DIR}"
 install -m 0755 karidns "${STAGE_DIR}/usr/local/sbin/karidns"
 install -m 0755 karictl "${STAGE_DIR}/usr/local/bin/karictl"
 install -m 0755 karicheck "${STAGE_DIR}/usr/local/bin/karicheck"
+install -m 0755 karidns-tapstat "${STAGE_DIR}/usr/local/bin/karidns-tapstat"
 install -m 0755 dag "${STAGE_DIR}/usr/local/bin/dag"
 
 # Install rc.d script
@@ -144,10 +145,10 @@ install -m 0555 packaging/freebsd/rc.d/karidns "${STAGE_DIR}/usr/local/etc/rc.d/
 # Install sample configuration & sample zone
 install -m 0644 karidns.conf.sample "${STAGE_DIR}/usr/local/etc/karidns/karidns.conf.sample"
 install -m 0644 karictl.conf.sample "${STAGE_DIR}/usr/local/etc/karidns/karictl.conf.sample"
-install -m 0644 packaging/freebsd/zones/example.local.zone.sample "${STAGE_DIR}/usr/local/etc/karidns/zones/example.local.zone.sample"
+install -m 0644 packaging/freebsd/zones/example.test.zone.sample "${STAGE_DIR}/usr/local/etc/karidns/zones/example.test.zone.sample"
 
 # Install the manuals
-for m in karidns karictl karicheck dag dag_replay; do
+for m in karidns karictl karicheck karidns-tapstat dag dag_replay; do
     install -m 0644 "docs/${m}.md" "${STAGE_DIR}/usr/local/share/doc/karidns/${m}.md"
 done
 

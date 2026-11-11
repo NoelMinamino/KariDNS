@@ -205,6 +205,77 @@ int main(void) {
     TEST_ASSERT(find_tsig_key_by_name(&cfg, NULL) == NULL, "find NULL key");
     TEST_ASSERT(find_tsig_key_by_name(&cfg, "") == NULL, "find empty key");
 
+    /* 9. the prefix length is digits only (strtol alone would take leading space, '+' and '-'), in both parsers */
+    {
+        cidr_entry_t pe;
+        TEST_ASSERT(cidr_entry_parse(&pe, "192.0.2.0/24") && pe.prefix == 24, "prefix 24");
+        TEST_ASSERT(cidr_entry_parse(&pe, "192.0.2.0/024") && pe.prefix == 24, "leading zeros are digits");
+        TEST_ASSERT(!cidr_entry_parse(&pe, "192.0.2.0/ 24"), "prefix with a leading space is refused");
+        TEST_ASSERT(!cidr_entry_parse(&pe, "192.0.2.0/+24"), "prefix with a plus sign is refused");
+        TEST_ASSERT(!cidr_entry_parse(&pe, "192.0.2.0/-1"), "negative prefix is refused");
+        TEST_ASSERT(!cidr_entry_parse(&pe, "192.0.2.0/"), "empty prefix is refused");
+        TEST_ASSERT(!cidr_entry_parse(&pe, "192.0.2.0/33"), "IPv4 prefix above 32 is refused");
+        TEST_ASSERT(cidr_entry_parse(&pe, "2001:db8::/128") && pe.prefix == 128, "IPv6 /128");
+        TEST_ASSERT(!cidr_entry_parse(&pe, "2001:db8::/129"), "IPv6 prefix above 128 is refused");
+        TEST_ASSERT(!match_cidr("192.0.2.1", "192.0.2.0/ 24"), "match_cidr: prefix with a leading space matches nothing");
+        TEST_ASSERT(!match_cidr("192.0.2.1", "192.0.2.0/+24"), "match_cidr: prefix with a plus sign matches nothing");
+        TEST_ASSERT(match_cidr("192.0.2.1", "192.0.2.0/24"), "match_cidr: plain prefix still matches");
+    }
+
+    /* 10. a BADKEY / BADSIG answer reserves room for the TSIG RR it carries (the key name and algorithm of the request), though no key was found */
+    {
+        tsig_request_t tr;
+        memset(&tr, 0, sizeof(tr));
+        tr.status = TSIG_REQ_ERROR;
+        tr.error = 17;
+        snprintf(tr.key_name, sizeof(tr.key_name), "nokey.example.");
+        snprintf(tr.alg_name, sizeof(tr.alg_name), "hmac-sha256.");
+        size_t want = tsig_rr_wire_size("nokey.example.", "hmac-sha256.", 17);
+        TEST_ASSERT(want > 0 && tsig_response_reserve(&tr) == want, "BADKEY without a key reserves the TSIG RR");
+        tr.error = 16;
+        want = tsig_rr_wire_size("nokey.example.", "hmac-sha256.", 16);
+        TEST_ASSERT(tsig_response_reserve(&tr) == want, "BADSIG reserves from the request's names");
+        tr.status = TSIG_REQ_NONE;
+        TEST_ASSERT(tsig_response_reserve(&tr) == 0, "no TSIG: nothing reserved");
+        tr.status = TSIG_REQ_VALID;
+        TEST_ASSERT(tsig_response_reserve(&tr) == 0, "valid but no key object: nothing reserved");
+    }
+
+    /* 11. RFC 8945 section 5.3: a response whose TSIG does not fit becomes question + TSIG, TC=1, RCODE 0 -- also an error response (BADTIME, RCODE 9) */
+    {
+        static tsig_key_t tk;
+        memset(&tk, 0, sizeof(tk));
+        tk.name = "k.test.";
+        tk.algorithm = "hmac-sha256";
+        memset(tk.secret_decoded, 0x42, 32);
+        tk.secret_decoded_len = 32;
+        tsig_request_t tr;
+        memset(&tr, 0, sizeof(tr));
+        tr.status = TSIG_REQ_ERROR;
+        tr.error = 18;                       /* BADTIME: signed with the request's key */
+        tr.key = &tk;
+        tr.time_signed = 1700000000;
+        tr.fudge = 300;
+        memset(tr.mac, 0x11, 32);   /* the verified MAC of the request (BADTIME keeps it) */
+        tr.mac_len = 32;
+        snprintf(tr.key_name, sizeof(tr.key_name), "k.test.");
+        snprintf(tr.alg_name, sizeof(tr.alg_name), "hmac-sha256.");
+        uint8_t res[512];
+        memset(res, 0xAB, sizeof(res));
+        memset(res, 0, 12);
+        res[3] = 0x09;                       /* NOTAUTH */
+        res[5] = 1;                          /* one question: a.test. A IN */
+        res[7] = 1;                          /* and an answer that is long enough to push the TSIG out */
+        static const uint8_t q[] = { 1, 'a', 4, 't', 'e', 's', 't', 0, 0, 1, 0, 1 };
+        memcpy(res + 12, q, sizeof(q));
+        size_t q_end = 12 + sizeof(q);
+        int n = tsig_finish_response(res, 300, 200, &tr);
+        TEST_ASSERT(n > (int)q_end && n <= 200, "TSIG that does not fit: a response is still made (n=%d)", n);
+        TEST_ASSERT(n > 0 && (res[2] & 0x02) != 0, "TC=1");
+        TEST_ASSERT(n > 0 && (res[3] & 0x0F) == 0, "RCODE 0 (NOERROR) in the TC response (RFC 8945 5.3)");
+        TEST_ASSERT(n > 0 && res[6] == 0 && res[7] == 0 && res[9] == 0 && res[11] == 1, "no answer, the TSIG RR in the additional section");
+    }
+
     printf("[*] Results: %d / %d tests passed.\n", g_tests_passed, g_tests_run);
     if (g_tests_passed == g_tests_run) {
         printf("[OK] All CIDR tests passed successfully!\n");

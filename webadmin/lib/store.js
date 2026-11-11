@@ -375,7 +375,12 @@ export async function listRRsets(tx, schema, domainId, { zone, name, type, visib
     alts.push(`(k.name = ${q.add(zone)} AND upper(k.type) IN ('SOA', 'NS'))`);
     w.push(`(${alts.join(' OR ')})`);
   }
-  if (after) w.push(`(k.name > ${q.add(after.name)} OR (k.name = ${q.add(after.name)} AND upper(k.type) > ${q.add(after.type)}))`);
+  if (after) {
+    // `k.name >= after` is redundant, and it is what lets PostgreSQL start at the cursor: with only the OR the planner reads the index of names from the first name of the
+    // table and filters, so a page deep in a zone of 100,000 records cost more than a hundred times the first (measured, 0.6.1)
+    const an = q.add(after.name);
+    w.push(`k.name >= ${an}`, `(k.name > ${an} OR (k.name = ${an} AND upper(k.type) > ${q.add(after.type)}))`);
+  }
   // Two statements, not one with the keys as a subquery of a join: PostgreSQL without statistics (a table just filled, before the analyze of autovacuum) planned that join
   // as a nested loop that scanned the whole zone for each of the 501 keys, and row level security tested every row of every scan: 500,000 tests, 2.9 seconds, for a
   // zone of 1000 records (measured, M5).  Here the keys come first, then the records of those names (one pass over the zone at the worst), and the types that were not
@@ -426,6 +431,22 @@ export async function listAudit(tx, f, after, limit) {
   }
   if (tx.dialect !== 'pg') out.sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : a.rank - b.rank || b.id - a.id));
   return out;
+}
+
+// The pruning of the audit log (option audit-retention): the rows older than `days` days, the oldest AUDIT_PRUNE_BATCH of each log at a call.  -> the most rows deleted
+// from one log (a call that returns AUDIT_PRUNE_BATCH may have left more: the caller calls again).  PostgreSQL: the SECURITY DEFINER function (no role may delete
+// from audit_log); SQLite3: the log of the zone file, if it has one, and the log of the auth file.
+export const AUDIT_PRUNE_BATCH = 10000;
+export async function pruneAudit(tx, days, nowMs) {
+  if (tx.dialect === 'pg') return Number((await tx.get('SELECT karidns_auth.prune_audit($1::integer) AS n', [days])).n);
+  const cut = tx.ts(nowMs - days * 86400000);
+  let most = 0;
+  for (const table of ['karidns_audit_log', `${tx.A}karidns_auth_audit`]) {
+    if (table === 'karidns_audit_log' && !(await tx.get("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'karidns_audit_log'"))) continue;
+    const n = (await tx.run(`DELETE FROM ${table} WHERE id IN (SELECT id FROM ${table} WHERE at < $1 ORDER BY id LIMIT ${AUDIT_PRUNE_BATCH})`, [cut])).changes;
+    most = Math.max(most, n);
+  }
+  return most;
 }
 
 export async function serverStatus(tx, schema) {
@@ -676,7 +697,10 @@ export async function versionRRsets(tx, schema, versionId, { zone, visibility, a
   const Z = tx.z(schema);
   const q = new Q();
   const w = [`r.version_id = ${q.add(versionId)}`, visCond(q, 'r.owner', 'r.type', visibility && { ...visibility, zone })];
-  if (after) w.push(`(r.owner > ${q.add(after.name)} OR (r.owner = ${q.add(after.name)} AND r.type > ${q.add(after.type)}))`);
+  if (after) {
+    const an = q.add(after.name);              // (`owner >= after` is redundant and lets the primary key (version_id, owner, type) start at the cursor, as in listRRsets)
+    w.push(`r.owner >= ${an}`, `(r.owner > ${an} OR (r.owner = ${an} AND r.type > ${q.add(after.type)}))`);
+  }
   return tx.all(`SELECT r.owner, r.type, r.before, r.after FROM ${Z}karidns_zone_version_rrsets r WHERE ${w.join(' AND ')} ORDER BY r.owner, r.type LIMIT ${q.add(limit + 1)}`, q.params);
 }
 

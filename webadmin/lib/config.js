@@ -33,9 +33,23 @@ const parseNames = (v) => {
   return out;
 };
 
+// sign-ins one address may start in 10 minutes (the states it can hold waiting at a provider): 1 to 1000, there is no "off" (the table of waiting states is shared by everybody)
+const parseOidcStart = (v) => {
+  const n = parseInt1(v);
+  if (n < 1 || n > 1000) throw new Error('expected 1 to 1000 (sign-ins an address may start in 10 minutes)');
+  return n;
+};
+
 const parseScryptLn = (v) => {
   const n = parseInt1(v);
   if (n < 14 || n > 20) throw new Error('expected 14 to 20 (the cost of a password hash is 2^n; 17 is the default)');
+  return n;
+};
+
+// days the audit log is kept: 0 = for ever (the default); else 7 to 36500 (the database function refuses fewer than 7: a stolen API role cannot wipe what it just did)
+const parseRetention = (v) => {
+  const n = Number(v);
+  if (!/^\d{1,5}$/.test(v) || (n !== 0 && (n < 7 || n > 36500))) throw new Error('expected 0 (keep the audit log for ever) or a number of days, 7 to 36500');
   return n;
 };
 
@@ -63,7 +77,9 @@ const GLOBAL_KEYS = {
   'rate-login': parseInt1,
   'rate-api': parseInt1,
   'rate-write': parseInt1,
+  'rate-oidc-start': parseOidcStart,
   'scrypt-ln': parseScryptLn,
+  'audit-retention': parseRetention,
   ui: parseBool,
   'ui-dir': parseAbsPath,
   log: parseLog,
@@ -121,7 +137,9 @@ export function defaults() {
     'rate-login': 5,
     'rate-api': 20,
     'rate-write': 2,
+    'rate-oidc-start': 20,
     'scrypt-ln': 17,
+    'audit-retention': 0,
     ui: true,
     'ui-dir': undefined,
     log: 'stderr',

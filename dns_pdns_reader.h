@@ -127,6 +127,8 @@ typedef struct {
     char *content;
 } pdns_meta_t;
 
+typedef struct { size_t defs_cap; int last_cap; } pdns_defs_cap_t;
+
 typedef struct pdns_zone_s {
     /* ---- input state (private) */
     char name[DNS_NAME_TEXT_SIZE];  /* canonical absolute zone name */
@@ -157,6 +159,7 @@ typedef struct pdns_zone_s {
     size_t n_tdns, tdns_cap;
     ecs_tag_def_t *loc_defs, *ecs_defs;       /* $LOCATION-TAG / $ECS-SUBNET-TAG; at finish they move into arena.bind_*_tags */
     int n_loc_defs, n_ecs_defs;
+    pdns_defs_cap_t loc_cap, ecs_cap;         /* the room in those arrays and in the CIDR list of the last definition (growth by doubling) */
     tinydns_location_entry_t *locs;           /* the %% lines; at finish they move into arena.locations */
     int n_locs;
     size_t n_def_rows;
@@ -221,8 +224,15 @@ int pdns_zone_set_secondary(pdns_zone_t *z, uint8_t kind, const char *master);
  * zone's SOA as the loader read them from the zone list. */
 void pdns_zone_set_summary(pdns_zone_t *z, uint32_t serial, bool has_timers, uint32_t refresh, uint32_t retry, uint32_t expire);
 
-/* One row of `records` (the driver passes them in records.id order).  0 = accepted or skipped; -1 = the zone has
- * failed (z->error says why; later calls return -1 at once, so a driver callback can stop its scan). */
+/* The order of the rows is part of the contract with the drivers (their ORDER BY clauses; dns_db_sqlite3.c, dns_db_pgsql.c):
+ *   records            records.id (a bulk scan: domain_id, id); the generated lines and the digest follow it
+ *   domainmetadata     id (rows of one kind are used in this order)
+ *   karidns_zone_tagdefs   table order (rowid / id): the first tag that matches wins, and the consecutive rows of one tag are one definition
+ *                      (pdns_zone_add_tagdef() starts a new definition when the tag changes; rows of one tag that are not adjacent become two)
+ *   karidns_record_tags / _tinydns, karidns_domain_views   any order
+ * One row of `records` (the driver passes them in records.id order).  0 = accepted or skipped; -1 = the zone has
+ * failed (z->error says why, also for an out of memory; later calls return -1 at once, so a driver callback can stop its scan).
+ * A zone made secondary (pdns_zone_set_secondary()) takes no rows: that is a failure of the caller. */
 int pdns_zone_add_record(pdns_zone_t *z, const db_record_row_t *row);
 /* One row of `domainmetadata` (domain_id is ignored).  Rows of one kind are used in the order given. */
 int pdns_zone_add_meta(pdns_zone_t *z, const db_meta_row_t *row);
@@ -238,7 +248,8 @@ int pdns_zone_finish(pdns_zone_t *z);
 
 /* ------------------------------------------------------------------ helpers */
 /* Third field of an SOA content: strict decimal digits only, <= 2^32 - 1.  Fields are separated by blanks; the
- * content may have leading / trailing blanks.  false if there are fewer than 3 fields or the serial is not valid. */
+ * content may have leading / trailing blanks.  false if there are fewer than 3 fields or the serial is not valid.  Only the one-line
+ * form is read (PowerDNS stores it so); a parenthesised multi-line SOA text of a zone file is not accepted. */
 bool pdns_soa_serial(const char *content, uint32_t *serial);
 /* The refresh, retry and expire (fields 4..6) of an SOA content, with the same rules.  false if a field is missing or not a number. */
 bool pdns_soa_timers(const char *content, uint32_t *refresh, uint32_t *retry, uint32_t *expire);

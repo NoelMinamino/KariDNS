@@ -388,3 +388,29 @@ test('a token made straight in the database, and one with a bad secret', withDep
   assert.equal((await d.request('GET', '/auth/me', { token: tokenText(id, secret) })).status, 200);
   problem(await d.request('GET', '/auth/me', { token: tokenText(id, randomToken(32)) }), 401, 'unauthenticated');
 }));
+
+test('pruneAudit (SQLite3, 0.6.1): rows older than the days go from the zone file log and the auth file log, the newer stay, a missing zone log is no error', withDeploy({}, async (d) => {
+  await cast(d);
+  const day = 86400000;
+  const count = (t) => d.backend.tx({}, async (tx) => Number((await tx.get(`SELECT count(*) AS n FROM ${t}`)).n));
+  await d.backend.tx({ write: true }, async (tx) => {
+    for (const t of ['karidns_audit_log', 'auth.karidns_auth_audit']) {
+      await tx.run(`INSERT INTO ${t} (at, table_name, op) VALUES ($1, 'records', 'I'), ($2, 'records', 'I'), ($3, 'records', 'I')`, [tx.ts(Date.now() - 40 * day), tx.ts(Date.now() - 31 * day), tx.ts(Date.now() - 10 * day)]);
+    }
+  });
+  const before = [await count('karidns_audit_log'), await count('auth.karidns_auth_audit')];
+  assert.equal(await d.backend.tx({ write: true }, (tx) => S.pruneAudit(tx, 30, Date.now())), 2);
+  assert.deepEqual([await count('karidns_audit_log'), await count('auth.karidns_auth_audit')], [before[0] - 2, before[1] - 2]);
+  assert.equal(await d.backend.tx({ write: true }, (tx) => S.pruneAudit(tx, 30, Date.now())), 0);
+  await d.backend.tx({ write: true }, (tx) => tx.run('DROP TABLE karidns_audit_log'));
+  assert.equal(await d.backend.tx({ write: true }, (tx) => S.pruneAudit(tx, 5, Date.now())), 1);          // (the auth file's log only: its row of 10 days ago)
+}));
+
+test('a token cannot be made for a group (0.6.1)', withDeploy({}, async (d) => {
+  await cast(d);
+  const gid = await d.makeUser('grp', null, { kind: 'group' });
+  const root = d.as(await d.login('root', 'correct horse battery'));
+  problem(await root('POST', '/tokens', { body: { name: 'g', principal: gid } }), 409, 'not-a-user');
+  assert.equal((await root('GET', '/tokens?all=true')).body.tokens.length, 0);
+  assert.equal((await root('POST', '/tokens', { body: { name: 'u', principal: 2 } })).status, 201);
+}));

@@ -1,7 +1,7 @@
-$ORIGIN example.local.
+$ORIGIN example.test.
 $TTL 3600
 
-@   IN  SOA ns1.example.local. admin.example.local. (
+@   IN  SOA ns1.example.test. admin.example.test. (
             2026082301 ; Serial (YYYYMMDDNN)
             3600       ; Refresh (1 hour)
             1800       ; Retry (30 mins)
@@ -9,9 +9,9 @@ $TTL 3600
             86400      ; Minimum TTL (1 day)
 )
 
-    IN  NS  ns1.example.local.
-    IN  NS  ns2.example.local.
-    IN  MX  10 mail.example.local.
+    IN  NS  ns1.example.test.
+    IN  NS  ns2.example.test.
+    IN  MX  10 mail.example.test.
     IN  TXT "v=spf1 ip4:192.168.1.0/24 -all"
 
 ; Name servers
@@ -21,11 +21,11 @@ ns2     IN  A       192.168.1.11
 ; Network devices & infrastructure
 router  IN  A       192.168.1.1
 server  IN  A       192.168.1.50
-gateway IN  CNAME   router.example.local.
+gateway IN  CNAME   router.example.test.
 
 ; Hostnames & Services
 www     IN  A       192.168.1.100
 www     IN  AAAA    2001:db8:1::100
 mail    IN  A       192.168.1.200
-ftp     IN  CNAME   www.example.local.
-status  IN  CNAME   server.example.local.
+ftp     IN  CNAME   www.example.test.
+status  IN  CNAME   server.example.test.

@@ -233,6 +233,7 @@ typedef struct {
 static bool eset_grow(void **v, size_t *cap, size_t n, size_t esz) {
     if (n < *cap) return true;
     size_t nc = *cap ? *cap * 2 : 64;
+    if (nc > SIZE_MAX / esz) return false;
     void *nv = realloc(*v, nc * esz);
     if (!nv) return false;
     *v = nv;
@@ -326,8 +327,8 @@ static int eset_load(const db_driver_t *drv, db_conn_t *conn, const int64_t *id,
     return drv->scan_ext(conn, id, &sink);
 }
 
-/* first row of the vector with domain_id >= id */
-#define ESET_LOWER(NAME, TYPE, FIELD)                                                                  \
+/* first row of the vector with domain_id >= id (the three row types all start with domain_id) */
+#define ESET_LOWER(NAME, TYPE)                                                                         \
     static size_t NAME(const TYPE *v, size_t n, int64_t id) {                                          \
         size_t lo = 0, hi = n;                                                                         \
         while (lo < hi) {                                                                              \
@@ -337,9 +338,9 @@ static int eset_load(const db_driver_t *drv, db_conn_t *conn, const int64_t *id,
         }                                                                                              \
         return lo;                                                                                     \
     }
-ESET_LOWER(eset_lower_tags, xtag_t, tags)
-ESET_LOWER(eset_lower_td, xtd_t, td)
-ESET_LOWER(eset_lower_defs, xdef_t, defs)
+ESET_LOWER(eset_lower_tags, xtag_t)
+ESET_LOWER(eset_lower_td, xtd_t)
+ESET_LOWER(eset_lower_defs, xdef_t)
 
 /* the rows of zone `id` into the reader; the reader checks them (a bad row fails the zone at pdns_zone_finish()) */
 static void eset_feed(const eset_t *e, int64_t id, pdns_zone_t *z) {
@@ -472,7 +473,7 @@ typedef struct {
     struct lprof { char *name; char *text; const char *bad; } *profs;
     size_t nprofs, cprofs;
     bool prof_oom;
-    struct psent { char name[256]; uint64_t hash; size_t len; } *psent;
+    struct psent { char name[256]; char *text; size_t len; } *psent;      /* text: a copy of what was sent (slots from npsent on keep their old copy for reuse) */
     size_t npsent, cpsent;
     /* B12, --check (read only, nothing is sent): the zone checks of `karicheck db`; all zero in the other modes */
     bool check;
@@ -964,22 +965,12 @@ static int zone_cb(void *ud, const db_zone_row_t *r) {
     z->name = r->name ? strdup(r->name) : NULL;
     z->type = r->type ? strdup(r->type) : NULL;
     z->master = r->master ? strdup(r->master) : NULL;
-    if ((r->name && !z->name) || (r->type && !z->type) || (r->master && !z->master)) {
-        free(z->name);
-        free(z->type);
-        free(z->master);
-        return x->oom = true;
-    }
+    if ((r->name && !z->name) || (r->type && !z->type) || (r->master && !z->master)) goto oom;
     if (x->io) {                                     /* stream mode: the diff needs the canonical name and the serial */
         char canon[DNS_NAME_TEXT_SIZE];
         if (pdns_canonical_zone_name(z->name, canon)) {
             z->canon = strdup(canon);
-            if (!z->canon) {
-                free(z->name);
-                free(z->type);
-                free(z->master);
-                return x->oom = true;
-            }
+            if (!z->canon) goto oom;
         }
         z->has_serial = r->soa_content && pdns_soa_serial(r->soa_content, &z->serial);
         z->has_timers = r->soa_content && pdns_soa_timers(r->soa_content, &z->t_refresh, &z->t_retry, &z->t_expire);
@@ -988,16 +979,22 @@ static int zone_cb(void *ud, const db_zone_row_t *r) {
         if (x->chk_ncat >= x->chk_ccat) {
             size_t nc = x->chk_ccat ? x->chk_ccat * 2 : 256;
             char **ncat = realloc(x->chk_cat, nc * sizeof(*ncat));
-            if (!ncat) return x->oom = true;
+            if (!ncat) goto oom;
             x->chk_cat = ncat;
             x->chk_ccat = nc;
         }
         x->chk_cat[x->chk_ncat] = r->catalog ? strdup(r->catalog) : NULL;
-        if (r->catalog && !x->chk_cat[x->chk_ncat]) return x->oom = true;
+        if (r->catalog && !x->chk_cat[x->chk_ncat]) goto oom;
         x->chk_ncat++;
     }
     x->nz++;
     return x->only_name ? 1 : 0;                    /* one zone wanted: stop after it (names are unique) */
+oom:                                                 /* the strings of this zone (not counted in nz yet; canon is NULL unless it was made) */
+    free(z->name);
+    free(z->type);
+    free(z->master);
+    free(z->canon);
+    return x->oom = true;
 }
 
 /* 0.6.0 item C: the zones a one-zone reload has read up to a change log position (vstate_t.cov).  A row is covered when it is in what the reload read: SQLite3 the
@@ -1324,6 +1321,7 @@ typedef struct wk {
     bool cur_open;
     zres_t res;                       /* scratch for the zone being converted */
     bool oom, stop;
+    bool scan_done;                   /* the bulk scan of the records was ended by rec_cb(): the rows left are those of zones after the task */
     int (*deliver)(struct wk *w, size_t pos, zres_t *r);   /* nonzero: stop */
     void *dud;
     char errtext[240];
@@ -1392,15 +1390,6 @@ static const struct lprof *lprof_find(const ctx_t *x, const char *name) {
     return NULL;
 }
 
-static uint64_t text_hash(const char *s, size_t n) {
-    uint64_t h = 1469598103934665603ULL;
-    for (size_t i = 0; i < n; i++) {
-        h ^= (uint8_t)s[i];
-        h *= 1099511628211ULL;
-    }
-    return h;
-}
-
 /* the PROFILE message of a zone about to be sent, unless the batch carried this name with this text already.  The Backend
  * keeps the latest text of a name, so two views that read different databases and use the same profile name each get
  * their own text in front of their zones.  0, or -1 (output error, memory). */
@@ -1408,29 +1397,35 @@ static int send_profile_for(ctx_t *x, const char *name) {
     const struct lprof *pf = lprof_find(x, name);
     if (!pf) return 0;
     size_t len = strlen(pf->text);
-    uint64_t h = text_hash(pf->text, len);
-    for (size_t i = 0; i < x->npsent; i++)
-        if (strcmp(x->psent[i].name, name) == 0) {
-            if (x->psent[i].hash == h && x->psent[i].len == len) return 0;
-            x->psent[i].hash = h;
-            x->psent[i].len = len;
-            goto send;
+    struct psent *ps = NULL;
+    for (size_t i = 0; i < x->npsent && !ps; i++)
+        if (strcmp(x->psent[i].name, name) == 0) ps = &x->psent[i];
+    if (ps && ps->len == len && memcmp(ps->text, pf->text, len) == 0) return 0;      /* (the text itself is compared: no hash that could collide) */
+    if (!ps) {
+        if (x->npsent >= x->cpsent) {
+            size_t nc = x->cpsent ? x->cpsent * 2 : 16;
+            struct psent *np = realloc(x->psent, nc * sizeof(*np));
+            if (!np) {
+                x->oom = true;
+                return -1;
+            }
+            memset(np + x->cpsent, 0, (nc - x->cpsent) * sizeof(*np));
+            x->psent = np;
+            x->cpsent = nc;
         }
-    if (x->npsent >= x->cpsent) {
-        size_t nc = x->cpsent ? x->cpsent * 2 : 16;
-        struct psent *np = realloc(x->psent, nc * sizeof(*np));
-        if (!np) {
-            x->oom = true;
-            return -1;
-        }
-        x->psent = np;
-        x->cpsent = nc;
+        ps = &x->psent[x->npsent];                   /* (a slot past npsent may still own the text of an earlier batch: it is reused below) */
+        snprintf(ps->name, sizeof(ps->name), "%s", name);
     }
-    snprintf(x->psent[x->npsent].name, sizeof(x->psent[0].name), "%s", name);
-    x->psent[x->npsent].hash = h;
-    x->psent[x->npsent].len = len;
-    x->npsent++;
-send:
+    char *copy = malloc(len + 1);
+    if (!copy) {
+        x->oom = true;
+        return -1;
+    }
+    memcpy(copy, pf->text, len + 1);
+    free(ps->text);
+    ps->text = copy;
+    ps->len = len;
+    if (ps == &x->psent[x->npsent]) x->npsent++;
     if (kdb_enc_begin(&x->enc, KDB_T_PROFILE) != 0 || kdb_enc_str(&x->enc, 1, name) != 0 ||
         kdb_enc_str(&x->enc, 2, pf->text) != 0 || kdb_enc_end(&x->enc) != 0)
         return -1;
@@ -1719,7 +1714,12 @@ static int rec_cb(void *ud, int64_t did, const db_record_row_t *row) {
     while (w->wi < w->wend && WZ(w, w->wi)->id < did) {
         if (finish_pos(w) != 0) return 1;
     }
-    if (w->wi >= w->wend || WZ(w, w->wi)->id != did) return 0;      /* a row of a domain that is not wanted: ignored */
+    if (w->wi >= w->wend) {            /* every zone of the task is done, and the rows come in domain_id order: nothing wanted follows */
+        if (w->grouped) return 0;
+        w->scan_done = true;
+        return 1;
+    }
+    if (WZ(w, w->wi)->id != did) return 0;                          /* a row of a domain that is not wanted: ignored */
     open_current(w, WZ(w, w->wi));
     if (w->oom) {
         w->stop = true;
@@ -1788,12 +1788,14 @@ static int run_task(wk_t *w, size_t a, size_t b, bool bulk, bool all) {
     int rc;
     w->wi = a;
     w->wend = b;
+    w->scan_done = false;
     if (bulk) {
         bool rows = false;                                  /* D1a milestone 4: a task of summaries only reads no records (the metadata are in x->meta) */
         for (size_t pos = a; pos < b && !rows; pos++) rows = !zinfo_no_rows(WZ(w, pos));
         if (!rows) rc = 0;
         else if (all) rc = drv->scan_records(w->conn, NULL, rec_cb, w);
         else rc = drv->scan_records_range(w->conn, WZ(w, a)->id, WZ(w, b - 1)->id, rec_cb, w);
+        if (rc == DB_STOPPED && w->scan_done) rc = 0;       /* the scan was ended on purpose (rec_cb(): the window is full) */
         if (rc != 0 && rc != DB_STOPPED) return db_err_c(drv, w->conn, w->errtext, sizeof(w->errtext), rc, "reading records");
         if (rc == DB_STOPPED) {
             if (!w->stop) {
@@ -3195,6 +3197,11 @@ static const char *chk_me(char *buf, size_t cap) {
     return buf;
 }
 
+/* access() with the effective user, the one the messages name (chk_me()) and the one that opens the files */
+static int eacc(const char *path, int mode) {
+    return faccessat(AT_FDCWD, path, mode, AT_EACCESS);
+}
+
 /* Can this user use `path`?  If not, say which file or directory lacks which permission.  rw: the file is opened for writing too
  * (SQLite opens a WAL database read-write because even a reader writes the -shm file). */
 static bool chk_path_access(const char *what, const char *path, bool rw) {
@@ -3210,7 +3217,7 @@ static bool chk_path_access(const char *what, const char *path, bool rw) {
                 if (prefix[i] != '/') continue;
                 prefix[i] = '\0';
                 struct stat ds;
-                if (stat(prefix, &ds) != 0 || access(prefix, X_OK) != 0) {
+                if (stat(prefix, &ds) != 0 || eacc(prefix, X_OK) != 0) {
                     if (stat(prefix, &ds) == 0)
                         chk_linef('E', "cannot reach %s '%s': the user %s has no search (x) permission on the directory '%s' (mode %04o, owner uid %u, group gid %u)",
                                   what, path, chk_me(me, sizeof(me)), prefix, (unsigned)(ds.st_mode & 07777), (unsigned)ds.st_uid, (unsigned)ds.st_gid);
@@ -3230,7 +3237,7 @@ static bool chk_path_access(const char *what, const char *path, bool rw) {
         chk_linef('E', "%s '%s' is not a regular file", what, path);
         return false;
     }
-    if (access(path, R_OK) != 0) {
+    if (eacc(path, R_OK) != 0) {
         chk_linef('E', "%s '%s' is not readable by the user %s: it needs read permission (mode %04o, owner uid %u, group gid %u)", what, path,
                   chk_me(me, sizeof(me)), (unsigned)(st.st_mode & 07777), (unsigned)st.st_uid, (unsigned)st.st_gid);
         return false;
@@ -3246,7 +3253,7 @@ static bool chk_path_access(const char *what, const char *path, bool rw) {
             return false;
         }
     }
-    if (rw && access(path, W_OK) != 0) {
+    if (rw && eacc(path, W_OK) != 0) {
         chk_linef('E', "%s '%s' is not writable by the user %s: SQLite needs write permission on the database file even for a reader in WAL mode "
                        "(mode %04o, owner uid %u, group gid %u)", what, path, chk_me(me, sizeof(me)), (unsigned)(st.st_mode & 07777),
                   (unsigned)st.st_uid, (unsigned)st.st_gid);
@@ -3260,7 +3267,7 @@ static bool chk_path_access(const char *what, const char *path, bool rw) {
         else snprintf(dir, sizeof(dir), ".");
         snprintf(shm, sizeof(shm), "%s-shm", path);
         snprintf(wal, sizeof(wal), "%s-wal", path);
-        if (access(dir, W_OK) != 0 && (access(shm, W_OK) != 0 || access(wal, W_OK) != 0)) {
+        if (eacc(dir, W_OK) != 0 && (eacc(shm, W_OK) != 0 || eacc(wal, W_OK) != 0)) {
             chk_linef('E', "the directory '%s' of the database file is not writable by the user %s, and '%s' / '%s' do not both exist and are writable: a reader "
                            "in WAL mode needs the -shm and -wal files (the directory needs write permission, or both files must exist and be writable)", dir,
                       chk_me(me, sizeof(me)), shm, wal);
@@ -3379,7 +3386,7 @@ static void chk_state_file(const char *path) {
         chk_linef('E', "state file '%s': '%s' is not a directory", path, dir);
         return;
     }
-    if (access(dir, W_OK | X_OK) != 0)
+    if (eacc(dir, W_OK | X_OK) != 0)
         chk_linef('E', "state file '%s': the user %s cannot write in the directory '%s' (mode %04o, owner uid %u): the loader writes '%s.tmp' there and renames it",
                   path, chk_me(me, sizeof(me)), dir, (unsigned)(st.st_mode & 07777), (unsigned)st.st_uid, path);
     else if ((st.st_mode & S_IWOTH) && !(st.st_mode & S_ISVTX))
@@ -3520,7 +3527,7 @@ static char *dup_kstr(kdb_str_t s) {
 static int cfg_from_msg(const kdb_msg_t *m, lcfg_t *c) {
     memset(c, 0, sizeof(*c));
     c->generation = m->u.config.generation;
-    snprintf(c->driver, sizeof(c->driver), "%.*s", (int)m->u.config.driver.len, m->u.config.driver.p);
+    snprintf(c->driver, sizeof(c->driver), "%.*s", (int)m->u.config.driver.len, m->u.config.driver.p ? m->u.config.driver.p : "");
     if (m->u.config.server_id.p)
         snprintf(c->server_id, sizeof(c->server_id), "%.*s", (int)m->u.config.server_id.len, m->u.config.server_id.p);
     c->default_ttl = m->u.config.default_ttl;
@@ -5541,13 +5548,20 @@ static void usage(FILE *fp) {
         KARIDNS_VERSION, drv);
 }
 
-static bool parse_uint(const char *s, unsigned long min, unsigned long max, unsigned long *out) {
+static bool parse_u64(const char *s, uint64_t min, uint64_t max, uint64_t *out) {
     char *end;
     if (!*s || *s == '-' || *s == '+') return false;
     errno = 0;
-    unsigned long v = strtoul(s, &end, 10);
+    unsigned long long v = strtoull(s, &end, 10);
     if (errno || *end || v < min || v > max) return false;
     *out = v;
+    return true;
+}
+
+static bool parse_uint(const char *s, unsigned long min, unsigned long max, unsigned long *out) {
+    uint64_t v;
+    if (!parse_u64(s, min, max, &v)) return false;
+    *out = (unsigned long)v;
     return true;
 }
 
@@ -5572,7 +5586,8 @@ int main(int argc, char **argv) {
     const char *dump = NULL, *driver = NULL, *dbfile = NULL, *conninfo = NULL, *schema = NULL, *zone = NULL, *map_view = NULL;
     const char *stream_fd = NULL, *fetch_fd_arg = NULL;
     const char *state_file_arg = NULL;
-    unsigned long view = 0, ttl = 0, threads = 1, v, max_records = 0, max_bytes = 0;
+    unsigned long view = 0, ttl = 0, threads = 1, v, max_records = 0;
+    uint64_t max_bytes = 0;
     bool check = false, chk_auto = false;                 // B12
     const char *chk_server_id = NULL, *chk_zone_checks = NULL;
     const char *chk_ecs[256], *chk_loc[256];
@@ -5629,7 +5644,7 @@ int main(int argc, char **argv) {
             }
             break;
         case 1007:
-            if (!parse_uint(optarg, 65535, 1ul << 36, &max_bytes)) {
+            if (!parse_u64(optarg, 65535, 1ull << 36, &max_bytes)) {
                 fprintf(stderr, "karidns-dbloader: --max-zone-bytes must be 65535..68719476736\n");
                 return EXIT_USAGE;
             }
@@ -5769,7 +5784,25 @@ int main(int argc, char **argv) {
         return cst;
     }
     bool to_stdout = strcmp(dump, "-") == 0;
-    x.out = to_stdout ? stdout : fopen(dump, "wb");
+    /* A file that is replaced (or does not exist yet) is written under a temporary name and renamed when the dump is complete: a dump that
+     * fails leaves the earlier file as it was.  Anything else (a device, a FIFO) is opened as it is. */
+    char tmp[PATH_MAX] = "";
+    bool use_tmp = false;
+    if (!to_stdout) {
+        struct stat ds;
+        bool plain = lstat(dump, &ds) == 0 ? S_ISREG(ds.st_mode) : errno == ENOENT;
+        if (plain && snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", dump, (long)getpid()) < (int)sizeof(tmp)) use_tmp = true;
+    }
+    if (use_tmp) {
+        int dfd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+        x.out = dfd >= 0 ? fdopen(dfd, "wb") : NULL;
+        if (dfd >= 0 && !x.out) {
+            close(dfd);
+            unlink(tmp);
+        }
+    } else {
+        x.out = to_stdout ? stdout : fopen(dump, "wb");
+    }
     if (!x.out) {
         fprintf(stderr, "karidns-dbloader: cannot create %s: %s\n", dump, strerror(errno));
         return EXIT_ERROR;
@@ -5784,7 +5817,15 @@ int main(int argc, char **argv) {
         fprintf(stderr, "karidns-dbloader: cannot write the output: %s\n", strerror(errno));
         status = EXIT_ERROR;
     }
-    if (status >= EXIT_ERROR && !to_stdout) unlink(dump);
+    if (use_tmp) {
+        if (status < EXIT_ERROR && rename(tmp, dump) != 0) {
+            fprintf(stderr, "karidns-dbloader: cannot create %s: %s\n", dump, strerror(errno));
+            status = EXIT_ERROR;
+        }
+        if (status >= EXIT_ERROR) unlink(tmp);
+    } else if (status >= EXIT_ERROR && !to_stdout) {
+        unlink(dump);
+    }
     ctx_view_reset(&x);
     kdb_enc_free(&x.enc);
     return status;

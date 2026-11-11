@@ -59,6 +59,7 @@ my %tier_c_files = map { $_ => 1 } (
     "tools/dag_iter.c", "tools/dag_roothints.c", "tools/dag_tsig_client.c",
     "tools/dag_edns_client.c", "tools/dag_transport.c", "tools/dag_replay.c",
     "tools/dag_pcap_l4.c", "tools/dag_tcp_reassembly.c", "tools/dag_http.c",
+    "tools/dnstap_decode.c", "tools/tapstat_core.c",   # 0.6.1 M3: the dnstap decoder shared by dag --replay and karidns-tapstat; the Frame Streams reader and the aggregator
     "tools/karicheck.c", "tools/karictl.c", "tools/karidns_zone.c",
     "dns_zone_lint.c",   # the zone checks of karicheck (moved out of tools/karicheck.c in B12; karidns-dbloader --check runs them too)
     "dns_diag.c",        # the diagnostic sink: the text path of the parser and the checks, the JSON document of karicheck --json

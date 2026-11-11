@@ -100,7 +100,6 @@ static void test_siphash_reference_vectors(void) {
     dns_siphash_key_from_bytes(key, k);
     for (size_t i = 0; i < sizeof(v) / sizeof(v[0]); i++) {
         assert(dns_siphash24(msg, v[i].len, k) == v[i].expect);
-        assert(siphash24(msg, v[i].len, k) == v[i].expect);     // RRL's exported wrapper: same implementation
     }
     // Unaligned input must give the same result (no host-endian / alignment assumptions)
     uint8_t shifted[65];

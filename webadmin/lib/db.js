@@ -179,8 +179,10 @@ export class PgBackend {
     let broken = false;
     try {
       // a read is one snapshot for all its statements (a page of RRsets is two statements; a read-only transaction at this level cannot fail with a serialization error)
+      // jit off (0.6.1): the row level security functions make the planner's cost estimate of a page of RRsets huge (millions), above jit_above_cost, so PostgreSQL compiled
+      // the query for 140 ms every time to run it for 4 ms (a page of 500 RRsets of a zone of 100,000 records: 843 ms median as a global master before, see docs/karidns-api.md)
       await c.query(write ? 'BEGIN' : 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
-      await c.query("SELECT set_config('karidns.principal', $1, true), set_config('karidns.change_set', $2, true), set_config('statement_timeout', '30000', true)",
+      await c.query("SELECT set_config('karidns.principal', $1, true), set_config('karidns.change_set', $2, true), set_config('statement_timeout', '30000', true), set_config('jit', 'off', true)",
         [principal === null ? '' : String(principal), changeSet ?? '']);
       const r = await fn(new PgTx(c));
       await c.query('COMMIT');

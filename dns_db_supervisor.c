@@ -1,7 +1,9 @@
 /*
  * dns_db_supervisor.c - starting, restarting and stopping karidns-dbloader (see dns_db_supervisor.h).
  *
- * Runs in the supervisor, a single-threaded process, so fork() followed by ordinary libc calls in the child is fine.
+ * Runs in the supervisor.  It has no thread of its own, but the zone-version garbage collector (dns_snapshot_rcu.c) starts detached
+ * threads; db_sup_spawn() therefore waits for them (gc_snapshot_wait_idle()) before fork(), so that the child is a copy of a
+ * single-threaded process and ordinary libc calls between fork() and exec are fine.
  */
 #include "dns_db_supervisor.h"
 #include "dns_snapshot_rcu.h"
@@ -205,8 +207,12 @@ bool db_sup_init(db_sup_t *s, const server_config_t *cfg, char *err, size_t errl
     snprintf(err, errlen, "database loader: %s", tmp);
     return false;
   }
-  snprintf(s->path, sizeof(s->path), "%s", db_loader_path(cfg));
-  snprintf(s->state_file, sizeof(s->state_file), "%s", cfg->database.loader_state_file ? cfg->database.loader_state_file : "");
+  const char *state = cfg->database.loader_state_file ? cfg->database.loader_state_file : "";
+  if (snprintf(s->path, sizeof(s->path), "%s", db_loader_path(cfg)) >= (int)sizeof(s->path) ||
+      snprintf(s->state_file, sizeof(s->state_file), "%s", state) >= (int)sizeof(s->state_file)) {
+    snprintf(err, errlen, "database loader: loader-path or loader-state-file is longer than %d bytes", (int)sizeof(s->path) - 1);
+    return false;
+  }
   if (!check_loader_path(s->path, err, errlen)) return false;
   s->enabled = true;
   return true;
@@ -329,8 +335,9 @@ static void child_exec(const db_sup_t *s, int stream_fd, int fetch_fd, int log_w
   sigprocmask(SIG_SETMASK, &empty, NULL);
 
   const char *tz = getenv("TZ");
-  char tzbuf[128] = "";
-  if (tz) snprintf(tzbuf, sizeof(tzbuf), "%s", tz);
+  char tzbuf[PATH_MAX] = "";                           /* (a TZ that does not fit is not handed on: a cut zone name would be a different zone) */
+  if (tz && strlen(tz) < sizeof(tzbuf)) snprintf(tzbuf, sizeof(tzbuf), "%s", tz);
+  else tz = NULL;
 
   /* stream on fd 3, the fetch stream (D1a) on fd 4, stdin / stdout on /dev/null, stderr the pipe to the supervisor (batch 14; no pipe: the
    * manager's own stderr, kept), everything else closed.  Each descriptor that is moved is first copied above 10, so that none of the
@@ -399,7 +406,7 @@ static void schedule_restart(db_sup_t *s, int64_t now) {
 }
 
 bool db_sup_spawn(db_sup_t *s) {
-  if (!s->enabled) return false;
+  if (!s->enabled || s->pid > 0) return false;      /* (one loader at a time: its exit has not been seen yet) */
   int64_t now = mono_ms();
   s->restart_pending = false;
   char err[300];
@@ -503,8 +510,10 @@ bool db_sup_spawn(db_sup_t *s) {
      * not listening any more; it is going down, and the loader will find its ends closed.  The fetch stream, when there is one,
      * is the second descriptor of the same message. */
     int fds[2] = { backend_fd, backend_fetch_fd };
-    if (!send_fds(s->ctrl_fd, fds, backend_fetch_fd >= 0 ? 2 : 1))
-      syslog(LOG_ERR, "[Manager] Cannot pass the loader stream to the Backend: %m");
+    if (!send_fds(s->ctrl_fd, fds, backend_fetch_fd >= 0 ? 2 : 1)) {
+      syslog(LOG_ERR, "[Manager] Cannot pass the loader stream to the Backend: %m; the loader is stopped (its streams lead nowhere)");
+      kill(pid, SIGKILL);        /* (it is reaped as any exit of the loader: db_sup_child_exited() schedules the next try) */
+    }
     close(backend_fd);
     if (backend_fetch_fd >= 0) close(backend_fetch_fd);
   }

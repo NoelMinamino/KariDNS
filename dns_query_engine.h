@@ -15,7 +15,8 @@
 #include "dns_tsig_acl.h"
 
 /* D-05: 直前の process_dns_query*() が応答を作ったゾーンと、答えがワイルドカードから作られたか
- * (RRL のキー)。同じスレッドで、同じスナップショットを持っている間だけ有効。 */
+ * (RRL のキー)。同じスレッドで、同じスナップショットを持っている間だけ有効。
+ * zone は応答を作ったゾーンのエントリの名前 (domain) を指す借り物のポインタで、所有しない。呼び出し側は同じ読み取り区間の中で rrl_make_key() に渡して使い切る。 */
 typedef struct {
   const char *zone;
   bool wildcard;
@@ -231,7 +232,6 @@ int dispatch_forward_zone(const zone_config_t *zcfg, const uint8_t *req, size_t 
                           uint8_t *res, size_t max_res_len);
 bool nsec_covers_name(const zone_image_t *img, uint32_t rr, const char *name);
 uint32_t find_covering_nsec(const zone_image_t *img, const char *name);
-bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, program_plugin_t *out);
 void record_observatory_response(zone_db_entry_t *entry, uint8_t rcode, uint16_t ancount);
 #endif
 

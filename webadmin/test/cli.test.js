@@ -186,6 +186,23 @@ test('the server: a configuration that is wrong at SIGHUP is not taken; PostgreS
   assert.deepEqual(g.events.filter((e) => e[0] === 'tx' || e[0] === 'sql'), [['tx', true], ['sql', 'SELECT karidns_auth.sweep_expired() AS n']]);
 });
 
+test('the server: audit-retention prunes the audit log in batches at the sweep, and says how many rows went', async () => {
+  const f = fakes({ loadConfig: () => parseConfig(`${confText('/var/db/x')}\naudit-retention = 30\n`) });
+  const answers = [10000, 10000, 5];
+  const calls = [];
+  f.deps.openBackend = async () => ({
+    dialect: 'pg',
+    tx: async (o, fn) => fn({ dialect: 'pg', get: async (sql, params) => { calls.push([sql, params]); return { n: sql.includes('prune_audit') ? answers.shift() : 0 }; } }),
+    close: async () => {},
+  });
+  const p = main([], { stdout: sink(), stderr: sink(), proc: f.proc, deps: f.deps });
+  await sleep(100);
+  f.proc.emit('SIGTERM');
+  assert.equal(await p, 0);
+  assert.deepEqual(calls.filter(([s]) => s.includes('prune_audit')).map(([, a]) => a), [[30], [30], [30]]);
+  assert.ok(f.log.lines.includes('info audit: deleted 20005 log rows older than 30 days'), f.log.lines.join('|'));
+});
+
 test('the server: the providers of the [oidc] sections are set up at the start (their documents asked for at once) and again at SIGHUP, which a bad secret file does not change', async () => {
   const prov = (secret) => [{ name: 'gone', issuer: 'http://127.0.0.1:1', clientId: 'c', clientSecret: secret, scopes: ['openid'], label: 'Gone', mfa: 'totp' }];
   let reads = 0;
