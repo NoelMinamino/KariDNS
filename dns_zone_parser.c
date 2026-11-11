@@ -45,7 +45,6 @@ static const char *unescape_string_in_place(char *str, bool allow_nul, size_t *o
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
 #include <assert.h>
 #include <errno.h>
 #ifdef _WIN32
@@ -68,7 +67,6 @@ static const char *unescape_string_in_place(char *str, bool allow_nul, size_t *o
 #include "dns_log.h"
 #include <strings.h>
 #endif
-#include "dns_utils.h"
 
 #define IS_SPACE(c) ((c) == ' ' || (c) == '\t')
 #define IS_NEWLINE(c) ((c) == '\n' || (c) == '\r')
@@ -170,11 +168,23 @@ bool compare_records(const dns_record_t *a, const dns_record_t *b, bool ignore_t
    * 大文字小文字を区別しない)。テキスト (ゾーンファイル) とワイヤ (転送、UPDATE) の表現の違い、数値の書き方、
    * 名前の大文字小文字に依らないよう、RFC 4034 §6.2 の正規形の RDATA で比べる (BIND の dns_rdata_compare()
    * と同じく、一覧に無い型の名前は区別する)。 */
-  uint8_t wa[65535], wb[65535];
-  long la = dns_record_canonical_rdata(a, wa, sizeof(wa));
-  if (la < 0) return false;
-  long lb = dns_record_canonical_rdata(b, wb, sizeof(wb));
-  return lb == la && memcmp(wa, wb, (size_t)la) == 0;
+  /* review dns_zone_parser.c [16]: small buffers first (nearly every RDATA fits); only a record that does not fit them is
+   * compared in 2 x 64 KiB taken from the heap (not the stack: this runs inside long loops of the transfer and UPDATE code) */
+  uint8_t sa[512], sb[512];
+  long la = dns_record_canonical_rdata(a, sa, sizeof(sa));
+  long lb = la >= 0 ? dns_record_canonical_rdata(b, sb, sizeof(sb)) : -1;
+  if (la >= 0 && lb >= 0) return lb == la && memcmp(sa, sb, (size_t)la) == 0;
+  uint8_t *wa = malloc(2 * 65535);
+  if (!wa) return false;
+  uint8_t *wb = wa + 65535;
+  bool eq = false;
+  la = dns_record_canonical_rdata(a, wa, 65535);
+  if (la >= 0) {
+    lb = dns_record_canonical_rdata(b, wb, 65535);
+    eq = lb == la && memcmp(wa, wb, (size_t)la) == 0;
+  }
+  free(wa);
+  return eq;
 }
 
 bool record_exists_in_arena(zone_arena_t *arena, const dns_record_t *target) {
@@ -1564,7 +1574,13 @@ PROCESS_RECORD:
         clean_cidr[--clen] = '\0';
       }
       if (clen == 0) continue;
-      cidrs_found[cidr_count++] = strdup(clean_cidr);
+      cidrs_found[cidr_count] = strdup(clean_cidr);
+      if (!cidrs_found[cidr_count]) { /* review dns_zone_parser.c [7] */
+        for (int c = 0; c < cidr_count; c++) free(cidrs_found[c]);
+        if (ctx && ctx->err_out) ctx->err_out->error_message = "Out of memory";
+        return -1;
+      }
+      cidr_count++;
     }
     if (cidr_count == 0) {
       if (ctx && ctx->err_out) {
@@ -1606,7 +1622,14 @@ PROCESS_RECORD:
         return -1;
       }
     }
-    (*target_tags)[*target_count].tag = strdup(clean_tag);
+    char *tag_copy = strdup(clean_tag);
+    if (!tag_copy) { /* review dns_zone_parser.c [7] */
+      for (int d = 0; d < cidr_count; d++) free(cidrs_found[d]);
+      free(cidrs);
+      if (ctx && ctx->err_out) ctx->err_out->error_message = "Out of memory";
+      return -1;
+    }
+    (*target_tags)[*target_count].tag = tag_copy;
     (*target_tags)[*target_count].cidrs = cidrs;
     (*target_tags)[*target_count].cidr_count = cidr_count;
     (*target_count)++;
@@ -1983,7 +2006,7 @@ PROCESS_RECORD:
       return -1;
     }
     size_t glen = 0;
-    const char *gwhy = dns_generic_rdata_parse(rec->type_code, rec->rdata, rec->rdata_count, tmp, &glen);
+    const char *gwhy = dns_generic_rdata_parse(rec->type_code, rec->rdata, rec->rdata_count, tmp, 65535, &glen);
     if (gwhy) {
       free(tmp);
       zone_generic_rdata_error(ctx, rec->type, buf, gwhy);
@@ -1992,7 +2015,12 @@ PROCESS_RECORD:
     rec->generic_len = (uint16_t)glen;
     if (glen > 0) {
       uint8_t *blob = (uint8_t *)arena_alloc(arena, glen);
-      if (blob) memcpy(blob, tmp, glen);
+      if (!blob) { /* review dns_zone_parser.c [7]: not a record with a length and no data */
+        free(tmp);
+        zone_generic_rdata_error(ctx, rec->type, buf, "Out of memory");
+        return -1;
+      }
+      memcpy(blob, tmp, glen);
       rec->generic_data = blob;
     } else {
       rec->generic_data = (uint8_t *)"";
@@ -2009,8 +2037,8 @@ PROCESS_RECORD:
     } else if (rec->type_code == 38) { // A6 (RFC 2874): prefix name は rdata[2]
       // prefix_len (rdata[0]) > 0 のときのみ rdata[2] にプレフィックス名が存在する
       if (rec->rdata_count >= 3) {
-        uint8_t a6_plen = (uint8_t)atoi(rec->rdata[0]);
-        if (a6_plen > 0)
+        uint8_t a6_plen = 0;
+        if (parse_u8(rec->rdata[0], &a6_plen) && a6_plen > 0) /* strict: atoi() took "12x" and wrapped 300 to 44 */
           rec->rdata[2] = expand_domain_name(rec->rdata[2], *origin_io, arena);
       }
     } else if (rec->type_code == 6) {
@@ -2069,6 +2097,18 @@ PROCESS_RECORD:
     }
 
     // Validate domain name length in RDATA
+    /* review dns_zone_parser.c [7]: expand_domain_name() gives NULL when the arena is full; a record with a NULL field fails the load here
+     * instead of reaching the code below (and the serializer) */
+    for (int j = 0; j < rec->rdata_count; j++) {
+      if (!rec->rdata[j]) {
+        if (ctx && ctx->err_out) {
+          ctx->err_out->error_message = "Out of memory expanding a domain name";
+          ctx->err_out->error_offset = rec->type ? (size_t)(rec->type - buf) : 0;
+          ctx->err_out->token_length = rec->type ? strlen(rec->type) : 0;
+        }
+        return -1;
+      }
+    }
     for (int j = 0; j < rec->rdata_count; j++) {
       bool is_domain_field = zone_rdata_name_field(rec->type_code, j) &&
                              !((rec->type_code == 64 || rec->type_code == 65) && strcmp(rec->rdata[1], ".") == 0);   /* (SVCB / HTTPS ".": no target) */
@@ -2237,20 +2277,25 @@ ecs_tag_def_t *clone_ecs_tags_array(const ecs_tag_def_t *src, int count) {
   if (!src || count <= 0) return NULL;
   ecs_tag_def_t *dst = calloc(count, sizeof(ecs_tag_def_t));
   if (!dst) return NULL;
+  /* review dns_zone_parser.c [7]: an allocation that fails gives NULL (and frees the part made), not a copy with holes */
   for (int i = 0; i < count; i++) {
     dst[i].tag = src[i].tag ? strdup(src[i].tag) : NULL;
-    dst[i].cidr_count = src[i].cidr_count;
+    if (src[i].tag && !dst[i].tag) goto fail;
     if (src[i].cidr_count > 0 && src[i].cidrs) {
       dst[i].cidrs = calloc(src[i].cidr_count, sizeof(ecs_cidr_entry_t));
-      if (dst[i].cidrs) {
-        for (int j = 0; j < src[i].cidr_count; j++) {
-          dst[i].cidrs[j].cidr = src[i].cidrs[j].cidr ? strdup(src[i].cidrs[j].cidr) : NULL;
-          dst[i].cidrs[j].parsed = src[i].cidrs[j].parsed;
-        }
+      if (!dst[i].cidrs) goto fail;
+      dst[i].cidr_count = src[i].cidr_count;
+      for (int j = 0; j < src[i].cidr_count; j++) {
+        dst[i].cidrs[j].cidr = src[i].cidrs[j].cidr ? strdup(src[i].cidrs[j].cidr) : NULL;
+        if (src[i].cidrs[j].cidr && !dst[i].cidrs[j].cidr) goto fail;
+        dst[i].cidrs[j].parsed = src[i].cidrs[j].parsed;
       }
     }
   }
   return dst;
+fail:
+  free_ecs_tags_array(dst, count);
+  return NULL;
 }
 
 void zone_arena_free_builder(zone_arena_t *arena) {
@@ -2646,6 +2691,7 @@ static void harmonize_rrset_ttls(zone_arena_t *arena) {
     if (!rec->name) continue;
     char buf[16];
     snprintf(buf, sizeof(buf), "%u", rec->ttl_value);
+    if (rec->ttl && strcmp(rec->ttl, buf) == 0) continue; /* unchanged: no new copy in the arena */
     char *new_ttl = arena_strdup(arena, buf);
     if (new_ttl) rec->ttl = new_ttl;
   }
@@ -2664,7 +2710,8 @@ void zone_arena_shrink_records(zone_arena_t *arena) {
 }
 
 int build_zone_index(zone_arena_t *arena, bool harmonize_ttls) {
-  assert(calc_fnv1a_str("*.") == FNV1A_WILDCARD_PREFIX_HASH);
+  /* checked in every build (an assert() vanishes under NDEBUG): the wildcard lookup of the query engine relies on this constant */
+  if (calc_fnv1a_str("*.") != FNV1A_WILDCARD_PREFIX_HASH) return -1;
   if (arena->hash_table) {
     free(arena->hash_table);
     arena->hash_table = NULL;

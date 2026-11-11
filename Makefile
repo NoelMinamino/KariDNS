@@ -1,7 +1,5 @@
 # Makefile for karidns & dag (FreeBSD, Linux, macOS)
 
-UNAME_S != uname -s 2>/dev/null || echo Unknown
-
 # OS-specific flags
 DARWIN_CFLAGS  != [ "`uname -s 2>/dev/null`" = "Darwin" ] && echo "-I`brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null || echo /usr/local/opt/openssl`/include" || echo "-I/usr/local/include"
 DARWIN_LDFLAGS != [ "`uname -s 2>/dev/null`" = "Darwin" ] && echo "-L`brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null || echo /usr/local/opt/openssl`/lib" || echo "-L/usr/local/lib"
@@ -11,14 +9,14 @@ HARDEN_LDFLAGS != case "`uname -s 2>/dev/null`" in Darwin) echo "-pie" ;; MINGW*
 
 # libidn2 detection (portable for BSD make & GNU make)
 IDN_CFLAGS != (pkg-config --exists libidn2 2>/dev/null && echo "-DHAVE_LIBIDN2 `pkg-config --cflags libidn2 2>/dev/null`") || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-DHAVE_LIBIDN2") || ([ -f /usr/include/idn2.h ] || [ -f /usr/local/include/idn2.h ] && echo "-DHAVE_LIBIDN2") || true
-IDN_LDFLAGS != (pkg-config --libs libidn2 2>/dev/null || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-L/usr/local/lib -lidn2") || ([ -f /usr/lib/libidn2.so ] || [ -f /usr/local/lib/libidn2.so ] || [ -f /usr/lib64/libidn2.so ] && echo "-lidn2")) || true
+IDN_LDFLAGS != [ -z "$(IDN_CFLAGS)" ] || (pkg-config --libs libidn2 2>/dev/null || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-L/usr/local/lib -lidn2") || ([ -f /usr/lib/libidn2.so ] || [ -f /usr/local/lib/libidn2.so ] || [ -f /usr/lib64/libidn2.so ] && echo "-lidn2")) || true
 
 # Windows / MinGW detection (static single-binary build)
 WIN_LDFLAGS != case "`uname -s 2>/dev/null`" in MINGW*|MSYS*|CYGWIN*) echo "-static -lws2_32 -liphlpapi -lcrypt32" ;; *) echo "" ;; esac
 
 # Homebrew & standard paths for macOS (Apple Silicon /opt/homebrew & Intel /usr/local) and BSD
-BREW_CFLAGS  = -I/opt/homebrew/opt/openssl@3/include -I/usr/local/opt/openssl@3/include -I/opt/homebrew/include -I/usr/local/include
-BREW_LDFLAGS = -L/opt/homebrew/opt/openssl@3/lib -L/usr/local/opt/openssl@3/lib -L/opt/homebrew/lib -L/usr/local/lib
+BREW_CFLAGS  != [ "`uname -s 2>/dev/null`" = "Darwin" ] && echo "-I/opt/homebrew/opt/openssl@3/include -I/usr/local/opt/openssl@3/include -I/opt/homebrew/include -I/usr/local/include" || echo "-I/usr/local/include"
+BREW_LDFLAGS != [ "`uname -s 2>/dev/null`" = "Darwin" ] && echo "-L/opt/homebrew/opt/openssl@3/lib -L/usr/local/opt/openssl@3/lib -L/opt/homebrew/lib -L/usr/local/lib" || echo "-L/usr/local/lib"
 
 # Version definition: the file VERSION is the one source of the release number (docs/RELEASING.md).  `make VERSION=x.y.z` still
 # overrides it for one build; `make set-version V=x.y.z` changes it and the files that cannot read it (package.json, the GUI).
@@ -32,8 +30,8 @@ CC ?= cc
 # distributable packages must be built with MARCH_FLAGS= (baseline ISA), or they
 # die with SIGILL on CPUs lacking the build host's extensions (e.g. AVX-512).
 MARCH_FLAGS ?= -march=native
-CFLAGS += -O3 -flto $(MARCH_FLAGS) -Wall -Wextra -std=c11 -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE $(VERSION_DEF) $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
-LDFLAGS = -flto -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS) $(HARDEN_LDFLAGS)
+CFLAGS += -O3 -flto $(MARCH_FLAGS) -Wall -Wextra -std=c11 -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 -fPIE $(VERSION_DEF) $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
+LDFLAGS += -flto -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS) $(HARDEN_LDFLAGS)
 
 
 TARGET = karidns
@@ -871,7 +869,7 @@ unit-test-bins: $(UT_BINS)
 # `make sweep-tests` runs them on their own. They are not part of unit-tests.
 sweep-tests: coverage_sweep_test coverage_sweep_dag_test coverage_sweep_net_test coverage_sweep_tools_test
 
-unit-tests: dns_diag_test cidr_test tinydns_test asan_test include_test config_directives_test xfr_opts_test server_stmt_test wire_helpers_test zone_image_test zone_parser_paths_test tinydns_paths_test sig0_sign_test snapshot_rebuild_test dnssec_proofs_test qe_protocol_test dag_format_test dag_iter_test dag_reassembly_test hash_test epoch_rcu_test dnstap_test edns_ecs_test rfc_vectors_test dynamic_update_test axfr_ixfr_test rrl_test query_expanded_test response_cache_test vulnerability_test catalog_zone_test snapshot_sandbox_test dag_tools_test server_core_test fi_parsers_test fi_wire_test fi_snapshot_test fi_xfr_test fi_misc_test fi_dag_test db_stream_test pdns_reader_test presigned_test zone_text_test zone_import_test db_supervisor_test db_sqlite3_test db_registry_test zone_dir_test park_test db_fetch_test park_worker_test db_pgsql_test
+unit-tests: dns_diag_test cidr_test tinydns_test asan_test include_test config_directives_test acl_match_test listen_on_test xfr_opts_test server_stmt_test wire_helpers_test zone_image_test zone_parser_paths_test tinydns_paths_test sig0_sign_test snapshot_rebuild_test dnssec_proofs_test qe_protocol_test dag_format_test dag_iter_test dag_reassembly_test hash_test epoch_rcu_test dnstap_test edns_ecs_test rfc_vectors_test dynamic_update_test axfr_ixfr_test rrl_test query_expanded_test response_cache_test vulnerability_test catalog_zone_test snapshot_sandbox_test dag_tools_test server_core_test fi_parsers_test fi_wire_test fi_snapshot_test fi_xfr_test fi_misc_test fi_dag_test db_stream_test pdns_reader_test presigned_test zone_text_test zone_import_test db_supervisor_test db_sqlite3_test db_registry_test zone_dir_test park_test db_fetch_test park_worker_test db_pgsql_test
 
 # --- Unit tests under ASan + UBSan --------------------------------------------
 # The plain test_* targets above are built with the production CFLAGS (-O3 -flto),
@@ -1381,7 +1379,13 @@ coverage-suite-check:
 	else echo "Error: the test suite has failing tests: $$(head -n 1 coverage_suite.status)"; \
 	     sed -n 's/^failed_tests=//p' coverage_suite.status | tr ' ' '\n' | sed 's/^/  FAILED: /'; exit 1; fi
 
-coverage: coverage-clean coverage-build coverage-run coverage-report coverage-suite-check
+# review Makefile [4]: one step after the other also under make -j (prerequisites would be free to run in parallel)
+coverage:
+	$(MAKE) coverage-clean
+	$(MAKE) coverage-build
+	$(MAKE) coverage-run
+	$(MAKE) coverage-report
+	$(MAKE) coverage-suite-check
 
 bench_serialize: tests/bench_serialize.c dns_wire.o dns_utils.o dns_zone_parser.o dns_tinydns_parser.o dns_config_parser.o dns_diag.o dns_cidr.o dns_tsig_acl.o
 	$(CC) $(CFLAGS) tests/bench_serialize.c dns_wire.o dns_utils.o dns_zone_parser.o dns_tinydns_parser.o dns_config_parser.o dns_diag.o dns_cidr.o dns_tsig_acl.o -o bench_serialize $(LDFLAGS) -lssl -lcrypto -lz
@@ -1407,7 +1411,7 @@ run: $(TARGET)
 
 # Fuzz sources are compiled once (fuzzer-no-link instrumentation) and the objects
 # shared by every fuzzer; only the link step adds libFuzzer (-fsanitize=fuzzer).
-FUZZ_OBJ_CFLAGS = -O1 -g -fsanitize=fuzzer-no-link,address,undefined -fPIE $(VERSION_DEF)
+FUZZ_OBJ_CFLAGS = -O1 -g -fsanitize=fuzzer-no-link,address,undefined -fPIE -std=c11 -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED $(VERSION_DEF)
 .SUFFIXES: .fz.o .c
 .c.fz.o:
 	$(CC) $(FUZZ_OBJ_CFLAGS) -c $< -o $@
@@ -1528,7 +1532,7 @@ clean-fuzz:
 	rm -f $(FUZZ_DAG_REPLAY_PCAP_READER_TARGET) $(FUZZ_DAG_REPLAY_DIFF_TARGET) $(FUZZ_DAG_TCP_REASSEMBLY_TARGET) $(FUZZ_DAG_ITER_TARGET)
 
 ASAN_TARGET = karidns-asan
-ASAN_CFLAGS = -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSANITIZER_BUILD -g -fsanitize=address,undefined -fno-omit-frame-pointer -fPIE $(VERSION_DEF)
+ASAN_CFLAGS = -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -DSANITIZER_BUILD -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -fPIE $(VERSION_DEF)
 ASAN_OBJS = $(SRCS:.c=.asan.o)
 
 asan: $(ASAN_TARGET)
@@ -1541,7 +1545,7 @@ $(ASAN_TARGET): $(ASAN_OBJS)
 	$(CC) $(ASAN_CFLAGS) -c $< -o $@
 
 TSAN_TARGET = karidns-tsan
-TSAN_CFLAGS = -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSANITIZER_BUILD -g -fsanitize=thread -fPIE $(VERSION_DEF)
+TSAN_CFLAGS = -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -DSANITIZER_BUILD -g -fsanitize=thread -fPIE $(VERSION_DEF)
 TSAN_LDFLAGS = -fsanitize=thread -pie
 TSAN_OBJS = $(SRCS:.c=.tsan.o)
 
@@ -1589,7 +1593,12 @@ dag-asan: $(DAG_ASAN_SRCS)
 
 KARICTL_ASAN_SRCS = tools/karictl.c
 karictl-asan: $(KARICTL_ASAN_SRCS)
-	$(CC) $(ASAN_CFLAGS) $(KARICTL_ASAN_SRCS) -o $@ -lcrypto -fsanitize=address,undefined
+	$(CC) $(ASAN_CFLAGS) $(KARICTL_ASAN_SRCS) -o $@ $(LDFLAGS) -lcrypto -fsanitize=address,undefined
 
 .PHONY: tools-asan
 tools-asan: karicheck-asan dag-asan karictl-asan
+
+# review Makefile [19]: targets that are no files (aliases, test runners, coverage steps)
+.PHONY: acl_match_test asan_test axfr_ixfr_test bind_ecs_subnet_test catalog_zone_test cidr_test config_directives_test coverage coverage-build coverage-clean coverage-fuzz coverage-fuzz-build coverage-fuzz-run coverage-report coverage-run coverage-suite-check coverage_sweep_dag_test coverage_sweep_net_test coverage_sweep_test coverage_sweep_tools_test dag_format_test dag_iter_test dag_reassembly_test dag_tools_test db_fetch_test db_registry_test db_stream_test db_supervisor_test dns_diag_test dnssec_proofs_test dnstap_test dynamic_update_test edns_ecs_test epoch_rcu_test evict extended_axfr_test fi_dag_test fi_misc_test fi_parsers_test fi_snapshot_test fi_wire_test fi_xfr_test fuzz_all fuzz_conf fuzz_dag_all fuzz_dag_axfr_stream fuzz_dag_batch_file fuzz_dag_chunked_http fuzz_dag_cli_args fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_rdata_yaml fuzz_dag_replay_diff fuzz_dag_replay_pcap_reader fuzz_dag_tcp_reassembly fuzz_dag_test fuzz_karidns fuzz_karidns_test fuzz_test fuzz_zone hash_test include_test karicheck_matrix_test listen_on_test park_test park_worker_test pdns_reader_test presigned_test qe_protocol_test query_expanded_test rfc_vectors_test rrl_test server_core_test server_stmt_test sig0_sign_test snapshot_rebuild_test snapshot_sandbox_test sweep-tests test test-all tinydns_location_test tinydns_paths_test tinydns_test tinydns_timestamp_test unit-test-bins unit-tests unit-tests-asan unit-tests-portable unit-tests-portable-asan vulnerability_test wire_helpers_test xfr_opts_test zone_dir_test zone_image_test zone_import_test zone_parser_paths_test zone_text_test
+# review Makefile [2]: the test objects of the DB / ACL tests were missing, so they survived a header edit
+$(TEST_PRESIGNED_SRCS:.c=.uta.o) $(TEST_PDNS_READER_SRCS:.c=.uta.o) $(TEST_DB_SUPERVISOR_SRCS:.c=.uta.o) $(TEST_DB_SQLITE3_SRCS:.c=.uta.o) $(TEST_DB_REGISTRY_SRCS:.c=.uta.o) $(TEST_ACLM_SRCS:.c=.utn.o) $(TEST_LISTEN_SRCS:.c=.utn.o) : $(PROJECT_HDRS)

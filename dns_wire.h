@@ -21,7 +21,7 @@
 // 数値フィールド安全パースヘルパー (0-255, 0-65535 範囲検証付き)
 // ============================================================================
 static inline bool parse_u8(const char *s, uint8_t *out) {
-    if (!s || !*s) return false;
+    if (!s || *s < '0' || *s > '9') return false; /* a digit first: strtol alone takes " 5" and "+5" */
     char *endptr;
     long val = strtol(s, &endptr, 10);
     if (*endptr != '\0' || val < 0 || val > 255) return false;
@@ -30,7 +30,7 @@ static inline bool parse_u8(const char *s, uint8_t *out) {
 }
 
 static inline bool parse_u16(const char *s, uint16_t *out) {
-    if (!s || !*s) return false;
+    if (!s || *s < '0' || *s > '9') return false; /* a digit first: strtol alone takes " 5" and "+5" */
     char *endptr;
     long val = strtol(s, &endptr, 10);
     if (*endptr != '\0' || val < 0 || val > 65535) return false;
@@ -104,6 +104,9 @@ typedef struct {
 // ============================================================================
 // 定数 (dns_server_core.c から移動)
 // ============================================================================
+/* The number of text fields of a record (dns_record_t.rdata[]).  A TXT-like RR with more character-strings, or one with a NUL in a string, is kept as its
+ * RDATA octets (generic_data, review dns_wire.h [12]); the zone file parser cuts a string of more than 255 octets into 255-octet strings (RFC 1035 3.3.14),
+ * a transfer carries the strings as they are. */
 #define MAX_RDATA 48
 #define COMPRESS_HASH_SIZE 4096
 #define COMPRESS_HASH_MASK (COMPRESS_HASH_SIZE - 1)
@@ -153,6 +156,7 @@ void *arena_alloc(zone_arena_t *arena, size_t size);
  * version falls back to a standard AXFR. */
 #define KARIDNS_EXT_VERSION             3
 #define KARIDNS_EXT_VERSION_MIN         2
+/* v is evaluated twice: pass a plain variable, not an expression with side effects */
 #define KARIDNS_EXT_VERSION_OK(v)       ((v) >= KARIDNS_EXT_VERSION_MIN && (v) <= KARIDNS_EXT_VERSION)
 
 // ECS / Location サブネットタグ構造体
@@ -260,6 +264,8 @@ typedef struct {
 /* S5: rdata は rdata_count 個ぶんの配列を指すだけなので、スタックなどに作るレコード (dns_record_t r; ...)
  * に r.rdata[i] = ... と書く前には配列を結び付ける。r は memset 等で 0 にした「後」に使う
  * (memset すると rdata が NULL に戻る)。MAX_RDATA 個まで書ける。 */
+/* Macro rule (review dns_wire.h [11]): a statement macro that declares a variable named <r>_rdbuf_ in the block it is written in, so it can be used once per
+ * record name and not as the only statement of an if / else; `r` is a plain variable name, evaluated twice. */
 #define DNS_RECORD_BIND_RDATA(r) \
     char *r##_rdbuf_[MAX_RDATA]; \
     memset(r##_rdbuf_, 0, sizeof(r##_rdbuf_)); \
@@ -395,7 +401,8 @@ int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offs
  * 直後。Answer は読み飛ばす。最初の Authority RR が SOA で SERIAL まで読めれば true。TCP と UDP の IXFR で共有する。*/
 bool ixfr_request_client_serial(const uint8_t *req, size_t req_len, size_t q_end, uint32_t *serial);
 /* RFC 4648 §7 base32hex (upper case, no padding; RFC 5155 §3.3). */
-void dns_base32hex_encode(const uint8_t *data, size_t len, char *out, size_t out_cap);
+/* Returns the number of characters the whole text needs (without the NUL); the text was cut off when that is >= out_cap. */
+size_t dns_base32hex_encode(const uint8_t *data, size_t len, char *out, size_t out_cap);
 int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, zone_arena_t *arena, char **name_out);
 
 // レコード型変換・解析
@@ -407,7 +414,7 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
 const char *dns_generic_rdata_check(uint16_t type, const uint8_t *rd, size_t len);
 /* RFC 3597 5: decode "\# <length> <hex>..." (tok[0] = "\#" or "#") into out (>= 65535 octets); *outlen = the octets.
  * NULL on success, else a static message.  Used by the zone parser and by dag's UPDATE operands. */
-const char *dns_generic_rdata_parse(uint16_t type, char *const *tok, int ntok, uint8_t *out, size_t *outlen);
+const char *dns_generic_rdata_parse(uint16_t type, char *const *tok, int ntok, uint8_t *out, size_t out_cap, size_t *outlen);
 
 // TSIG
 bool tsig_algorithm_is_supported(const char *alg);

@@ -390,7 +390,7 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
 }
 
 const char *get_type_str(uint16_t type, zone_arena_t *arena) {
-    assert(arena != NULL && "arena must be provided. malloc fallback is removed.");
+    if (!arena) return NULL; /* review dns_wire.c [26]: not an assert (a NULL dereference under NDEBUG); callers already handle NULL (arena full) */
     char tmp[16];
     const char *n = format_type_name(type, tmp, sizeof(tmp));
     if (n != tmp) return n;
@@ -400,8 +400,9 @@ const char *get_type_str(uint16_t type, zone_arena_t *arena) {
 }
 
 /* RFC 4648 §7 base32hex, upper case, without padding (RFC 5155 §3.3). */
-void dns_base32hex_encode(const uint8_t *data, size_t len, char *out, size_t out_cap) {
-    if (!out || out_cap == 0) return;
+size_t dns_base32hex_encode(const uint8_t *data, size_t len, char *out, size_t out_cap) {
+    size_t needed = (len * 8 + 4) / 5; /* characters without the NUL: the caller sees a cut-off when needed >= out_cap */
+    if (!out || out_cap == 0) return needed;
     static const char alphabet[] = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
     size_t out_len = 0;
     uint32_t buffer = 0;
@@ -410,7 +411,7 @@ void dns_base32hex_encode(const uint8_t *data, size_t len, char *out, size_t out
         buffer = (buffer << 8) | data[i];
         bits_left += 8;
         while (bits_left >= 5) {
-            if (out_len + 1 >= out_cap) { out[out_len] = '\0'; return; }
+            if (out_len + 1 >= out_cap) { out[out_len] = '\0'; return needed; }
             out[out_len++] = alphabet[(buffer >> (bits_left - 5)) & 0x1F];
             bits_left -= 5;
         }
@@ -419,6 +420,7 @@ void dns_base32hex_encode(const uint8_t *data, size_t len, char *out, size_t out
         out[out_len++] = alphabet[(buffer << (5 - bits_left)) & 0x1F];
     }
     out[out_len] = '\0';
+    return needed;
 }
 
 /* ---------------------------------------------------------------------------
@@ -629,7 +631,7 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
     if (*offset + rdlen > packet_len) { syslog(LOG_ERR, "RR from wire: rdlen %u goes out of bounds (len=%zu)", rdlen, packet_len); return -1; }
 
     *type_out = type; rec->type_code = type;
-    rec->class_str = (class_val == 1) ? "IN" : ((class_val == DNS_CLASS_KARIDNS_EXT) ? "KARIDNS" : "CH");
+    rec->class_str = (class_val == DNS_CLASS_KARIDNS_EXT) ? "KARIDNS" : (char *)dns_class_literal(class_val);
     rec->type = (char *)get_type_str(type, arena);
     if (ttl > 0x7FFFFFFF) ttl = 0x7FFFFFFF; // RFC 8767 §4: 送るときと同じ値で持つ (O-14)
     rec->ttl_value = ttl;
@@ -659,6 +661,7 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
             uint32_t val = ((uint32_t)packet[rdata_p] << 24) | ((uint32_t)packet[rdata_p+1] << 16) | ((uint32_t)packet[rdata_p+2] << 8) | packet[rdata_p+3];
             char *val_buf = arena_alloc(arena, 16); if (!val_buf) return -1; snprintf(val_buf, 16, "%u", val); rec->rdata[rec->rdata_count++] = val_buf; rdata_p += 4;
         }
+        if (rdata_p != *offset + rdlen) { syslog(LOG_ERR, "RR from wire: SOA has data after the numbers"); return -1; }
     } else if (type == 1) {
         if (rdlen != 4) { syslog(LOG_ERR, "RR from wire: A record rdlen != 4"); return -1; }
         char *ip_buf = arena_alloc(arena, 16); if (!ip_buf) return -1;
@@ -669,7 +672,7 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
         // NS, MD, MF, CNAME, MB, MG, MR, PTR, NSAP-PTR, DNAME
         size_t rdata_p = *offset; char *target;
         if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &target) != 0) { syslog(LOG_ERR, "RR from wire: NAME expand failed"); return -1; }
-        if (rdata_p > *offset + rdlen) { syslog(LOG_ERR, "RR from wire: NAME exceeds rdlen"); return -1; }
+        if (rdata_p != *offset + rdlen) { syslog(LOG_ERR, "RR from wire: NAME does not fill the rdlen"); return -1; }
         rec->rdata[0] = target; rec->rdata_count = 1;
     } else if (type == 14 || type == 17) {
         // MINFO, RP: 2 domain names
@@ -677,7 +680,7 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
         if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &name1) != 0) return -1;
         if (rdata_p > *offset + rdlen) return -1;
         if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &name2) != 0) return -1;
-        if (rdata_p > *offset + rdlen) return -1;
+        if (rdata_p != *offset + rdlen) return -1;
         rec->rdata[0] = name1; rec->rdata[1] = name2; rec->rdata_count = 2;
     } else if (type == 18 || type == 21 || type == 36 || type == 107) {
         // AFSDB, RT, KX, LP: uint16 pref + domain name
@@ -686,7 +689,7 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
         uint16_t pref = (packet[rdata_p] << 8) | packet[rdata_p+1];
         rdata_p += 2;
         if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &target) != 0) return -1;
-        if (rdata_p > *offset + rdlen) return -1;
+        if (rdata_p != *offset + rdlen) return -1;
         char *pref_buf = arena_alloc(arena, 16); if (!pref_buf) return -1;
         snprintf(pref_buf, 16, "%u", pref);
         rec->rdata[0] = pref_buf; rec->rdata[1] = target; rec->rdata_count = 2;
@@ -699,7 +702,7 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
         if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &map822) != 0) return -1;
         if (rdata_p > *offset + rdlen) return -1;
         if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &mapx400) != 0) return -1;
-        if (rdata_p > *offset + rdlen) return -1;
+        if (rdata_p != *offset + rdlen) return -1;
         char *pref_buf = arena_alloc(arena, 16); if (!pref_buf) return -1;
         snprintf(pref_buf, 16, "%u", pref);
         rec->rdata[0] = pref_buf; rec->rdata[1] = map822; rec->rdata[2] = mapx400; rec->rdata_count = 3;
@@ -712,7 +715,7 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
         uint16_t port = (packet[rdata_p+4] << 8) | packet[rdata_p+5];
         rdata_p += 6;
         if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &target) != 0) return -1;
-        if (rdata_p > *offset + rdlen) return -1;
+        if (rdata_p != *offset + rdlen) return -1;
         char *prio_buf = arena_alloc(arena, 16);
         char *weight_buf = arena_alloc(arena, 16);
         char *port_buf = arena_alloc(arena, 16);
@@ -743,7 +746,7 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
         size_t repl_start = rdata_p;
         char *replacement;
         if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &replacement) != 0) return -1;
-        if (rdata_p > *offset + rdlen) return -1;
+        if (rdata_p != *offset + rdlen) return -1;
         char *order_buf = arena_alloc(arena, 16);
         char *pref_buf = arena_alloc(arena, 16);
         if (!order_buf || !pref_buf) return -1;
@@ -779,7 +782,7 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
         uint16_t pref = (packet[rdata_p] << 8) | packet[rdata_p+1];
         rdata_p += 2;
         if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &target) != 0) return -1;
-        if (rdata_p > *offset + rdlen) return -1;
+        if (rdata_p != *offset + rdlen) return -1;
         char *pref_buf = arena_alloc(arena, 16); if (!pref_buf) return -1;
         snprintf(pref_buf, 16, "%u", pref);
         rec->rdata[0] = pref_buf; rec->rdata[1] = target; rec->rdata_count = 2;
@@ -913,7 +916,7 @@ const char *dns_generic_rdata_check(uint16_t type, const uint8_t *rd, size_t len
     size_t off = 0;
     uint16_t t;
     if (parse_resource_record(pkt, 11 + len, &off, &a, &rec, &t) != 0 || off != 11 + len) {
-        why = "RDATA is not valid for this record type (RFC 3597 5)";
+        why = "RDATA is not valid for this record type: it is malformed or has trailing octets (RFC 3597 5)";
     } else if (rec.generic_data == NULL) {      /* decoded into text fields: write it back */
         long n = dns_record_canonical_rdata(&rec, back, 65535);
         if (len) memcpy(want, rd, len);
@@ -940,7 +943,7 @@ static int generic_hex_val(char c) {
  * the hex digits, split into any number of tokens.  One implementation for the zone parser and for dag's UPDATE
  * operands.  The length must equal the number of octets; a fixed-size type must have its size; RDATA the type
  * does not accept is refused (dns_generic_rdata_check()). */
-const char *dns_generic_rdata_parse(uint16_t type, char *const *tok, int ntok, uint8_t *out, size_t *outlen) {
+const char *dns_generic_rdata_parse(uint16_t type, char *const *tok, int ntok, uint8_t *out, size_t out_cap, size_t *outlen) {
     if (ntok < 2 || !tok[0] || !tok[1] || (strcmp(tok[0], "\\#") != 0 && strcmp(tok[0], "#") != 0))
         return "Generic RDATA (\\#) is malformed";
     size_t len_tok_len = strlen(tok[1]);
@@ -948,6 +951,7 @@ const char *dns_generic_rdata_parse(uint16_t type, char *const *tok, int ntok, u
         return "Generic RDATA length (\\#) is not a decimal number";
     long declared = atol(tok[1]);
     if (declared < 0 || declared > 65535) return "Generic RDATA length (\\#) out of range (0-65535)";
+    if ((size_t)declared > out_cap) return "Generic RDATA (\\#) is longer than the buffer for it";
     size_t nibbles = 0;
     for (int j = 2; j < ntok; j++) {
         for (const char *h = tok[j]; *h; h++) {
@@ -1007,10 +1011,7 @@ int dns_record_dup_rdata(zone_arena_t *arena, dns_record_t *rec) {
 #define TSIG_PRE_MAC_STACK 68000
 
 int const_time_memcmp(const void *a, const void *b, size_t len) {
-    const unsigned char *p1 = a; const unsigned char *p2 = b;
-    unsigned char res = 0;
-    for (size_t i = 0; i < len; i++) res |= p1[i] ^ p2[i];
-    return res == 0 ? 0 : 1;
+    return CRYPTO_memcmp(a, b, len) == 0 ? 0 : 1; /* review dns_wire.h [9]: OpenSSL's compare instead of a hand-written one */
 }
 
 static int parse_label(const char *name, uint8_t *label_out, const char **next_p) {
@@ -1052,6 +1053,7 @@ long write_uncompressed_name_ext(uint8_t *buf, size_t offset, size_t max_len, co
         const char *next_p = NULL;
         int len = parse_label(p, label, &next_p);
         if (len < 0) return -1;
+        if (len == 0 && next_p && !(p == name && !*next_p)) return -1;   /* an empty label ("a..b", ".a") is no name; only "." is the root */
         if (len > 0) {
             if (offset + w_len + len + 1 > max_len) return -1;
             buf[offset + w_len++] = (uint8_t)len;
@@ -1397,6 +1399,7 @@ static size_t wire_name_length(const char *name) {
         const char *next_p = NULL;
         int len = parse_label(p, label, &next_p);
         if (len < 0) return (size_t)-1;
+        if (len == 0 && next_p && !(p == name && !*next_p)) return (size_t)-1;
         if (len > 0) {
             w_len += len + 1;
         }
@@ -1597,7 +1600,11 @@ int tsig_sign_packet_ex(uint8_t *packet, size_t *packet_len, size_t max_len, tsi
             if (use_malloc) free(pre_mac);
             return -1;
         }
-        HMAC(evp_md, key->secret_decoded, key->secret_decoded_len, pre_mac, offset, mac, &mac_len);
+        /* review dns_wire.c [6]: a failed HMAC must not leave an answer that looks signed but carries an empty MAC */
+        if (!HMAC(evp_md, key->secret_decoded, key->secret_decoded_len, pre_mac, offset, mac, &mac_len) || mac_len == 0) {
+            if (use_malloc) free(pre_mac);
+            return -1;
+        }
     }
     if (use_malloc) free(pre_mac);
 
@@ -2139,6 +2146,7 @@ int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, 
         const char *next_p = NULL;
         int len = parse_label(p, label, &next_p);
         if (len < 0) return -1;
+        if (len == 0 && next_p && !(p == name && !*next_p)) return -1;
         if (len > 0) {
             if (w_len + len + 1 > 255) return -1;
             wire[w_len++] = (uint8_t)len;
@@ -4503,14 +4511,10 @@ static bool update_replaces(const dns_record_t *zrr, const dns_record_t *rr) {
 
 /* 追加する RR をワイヤー形式に書けるか。書けない RR はゾーンファイルと同じく落として警告し、変更として
  * 数えない (そうしないと、それだけの UPDATE でシリアルが上がり公開される: RFC 2136 §3.6)。UPDATE は
- * クエリの経路ではないので作業領域はヒープに取る。確保できなければ書けるものとして扱う (公開前の
- * zone_drop_unencodable_logged() が落とす) */
+ * クエリの経路ではないので作業領域はスタックに取る */
 static bool update_rr_encodable(const dns_record_t *rr) {
-    uint8_t *buf = malloc(65535);
-    if (!buf) return true;
-    bool ok = dns_record_canonical_rdata(rr, buf, 65535) >= 0;
-    free(buf);
-    return ok;
+    uint8_t buf[65535]; /* review dns_wire.c [23]: stack, so there is no allocation failure to guess an answer for */
+    return dns_record_canonical_rdata(rr, buf, sizeof(buf)) >= 0;
 }
 
 static int update_append_record(zone_arena_t *standby, const dns_record_t *rec) {
@@ -5456,17 +5460,22 @@ int xext_emit_trusted(xext_t *x, char *const *list, int count) {
     uint8_t *buf = xext_buf(x);
     if (!buf) return -1;
     if (count > 255) count = 255;
-    size_t off = 0;
-    buf[off++] = (uint8_t)count;
+    /* review dns_wire.c [4]: the count byte is written last and counts the entries that were emitted; an entry that does not fit fails the
+     * transfer (like xext_emit_tagdef) rather than serving a shorter trusted list */
+    size_t off = 1;
+    unsigned emitted = 0;
     for (int i = 0; i < count; i++) {
         if (!list[i]) continue;
         size_t slen = strlen(list[i]);
         if (slen > 255) slen = 255;
-        if (off + 1 + slen > XEXT_SCRATCH) break;
+        if (off + 1 + slen > XEXT_SCRATCH) return -1;
         buf[off++] = (uint8_t)slen;
         memcpy(&buf[off], list[i], slen);
         off += slen;
+        emitted++;
     }
+    if (emitted == 0) return 0;
+    buf[0] = (uint8_t)emitted;
     return xext_emit_blob(x, DNS_TYPE_KARIDNS_ECS_TRUSTED, buf, off);
 }
 
@@ -5544,6 +5553,8 @@ bool wrap_tinydns_wire(const uint8_t *tmp_wire, uint16_t tmp_off, const char loc
 
 bool wrap_tinydns_record(const dns_record_t *rec, dns_record_t *out_wrap, uint8_t *wrap_buf, size_t wrap_buf_cap) {
   if (!rec || !out_wrap || !wrap_buf) return false;
+  /* review dns_wire.c [5]: the limit is 4096 octets of plain RDATA, the size of the wrap buffers of every caller (AXFR out, the PowerDNS
+   * reader); a record that is larger (a huge TXT) is refused (false) and shows as a failed wrap, never as a cut-off record */
   uint8_t tmp_wire[4096];
   uint16_t tmp_off = 0;
   compress_ctx_t dummy_comp;
