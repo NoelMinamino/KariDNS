@@ -1895,6 +1895,17 @@ static void t_export_signer(void) {
         free(chainless);
     }
     be_exec("DELETE FROM records WHERE name IN ('gone.example.test', 'fphivg4u4kqm6nlhk25bhvuatq4bngu1.example.test')");
+    /* a kept signature line is written only for an owner the master-file reader takes as a name: not one that starts with '$' (a directive), not one with a
+     * control octet (an RRSIG over NSEC3PARAM is kept whatever its owner, so these reach the line writer) */
+    be_exec("INSERT INTO records (domain_id, name, type, content, ttl) SELECT id, '$x.example.test', 'RRSIG', 'NSEC3PARAM 8 2 3600 20300601000000 20200101000000 1 example.test. AAAA', 3600 FROM domains WHERE name = 'example.test'");
+    be_exec("INSERT INTO records (domain_id, name, type, content, ttl) SELECT id, 'c\001.example.test', 'RRSIG', 'NSEC3PARAM 8 2 3600 20300601000000 20200101000000 1 example.test. AAAA', 3600 FROM domains WHERE name = 'example.test'");
+    chainless = do_export_ex("example.test", ZX_PLAIN_CHAIN);
+    CHECK(chainless != NULL);
+    if (chainless) {
+        CHECK(strstr(chainless, "$x.example.test") == NULL && strstr(chainless, "c\001.example.test") == NULL);
+        free(chainless);
+    }
+    be_exec("DELETE FROM records WHERE name = '$x.example.test' OR name LIKE 'c_.example.test'");
     /* a zone with keys and no PRESIGNED is refused by the plain export, not by the signer's */
     be_exec("DELETE FROM domainmetadata WHERE kind IN ('PRESIGNED', 'NSEC3PARAM', 'X-KARIDNS-SIGNER')");
     be_exec("INSERT INTO cryptokeys (domain_id, flags, active, content) SELECT id, 257, true, 'k' FROM domains WHERE name = 'example.test'");

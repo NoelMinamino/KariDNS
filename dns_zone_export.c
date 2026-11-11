@@ -292,6 +292,12 @@ static void zx_add_sig_line(zx_text_t *b, const db_record_row_t *r) {
         nw++;
     }
     if (nw < 9 || strpbrk(c, "\r\n\t\"\\;()") != NULL || !r->name || strpbrk(r->name, " \r\n\t\"\\;()") != NULL) return;
+    /* only printable ASCII, and no owner that the master-file reader would take for a directive ($ORIGIN, $INCLUDE, ...) */
+    if (r->name[0] == '$' || r->name[0] == '\0') return;
+    for (const unsigned char *q = (const unsigned char *)r->name; *q; q++)
+        if (*q < 0x21 || *q > 0x7e) return;
+    for (const unsigned char *q = (const unsigned char *)c; *q; q++)
+        if (*q < 0x20 || *q > 0x7e) return;
     char head[512];
     size_t nm = strlen(r->name);
     if (nm > 1 && r->name[nm - 1] == '.') nm--;
