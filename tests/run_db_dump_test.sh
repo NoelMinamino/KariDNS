@@ -181,6 +181,13 @@ expect 3 "a name starting with file: is refused" "$LOADER" --dump "$T/x.kdb" --d
 grep -q "file:" "$T/e.out" && ok "the message names file:" || bad "no message about file:"
 expect 3 "unknown zone" "$LOADER" --dump "$T/x.kdb" --driver sqlite3 --database-file "$T/z.db" --zone nothere.test
 [ ! -e "$T/x.kdb" ] && ok "no output file after an error" || bad "x.kdb left behind"
+printf 'earlier dump' > "$T/keep.kdb"
+expect 3 "unknown zone, with an earlier dump file in place" "$LOADER" --dump "$T/keep.kdb" --driver sqlite3 --database-file "$T/z.db" --zone nothere.test
+[ "$(cat "$T/keep.kdb")" = "earlier dump" ] && ok "a failed dump leaves the earlier file as it was" || bad "the earlier dump file was changed or removed"
+ls "$T"/keep.kdb.tmp.* > /dev/null 2>&1 && bad "a temporary dump file was left behind" || ok "no temporary dump file is left behind"
+expect 0 "a dump over an earlier file" "$LOADER" --dump "$T/keep.kdb" --driver sqlite3 --database-file "$T/z.db"
+[ "$(head -c 4 "$T/keep.kdb")" = "KDB1" ] && ok "the earlier file was replaced by the dump" || bad "the earlier file was not replaced"
+rm -f "$T/keep.kdb"
 expect 3 "output in a directory that does not exist" "$LOADER" --dump "$T/no/such/dir/x.kdb" --driver sqlite3 --database-file "$T/z.db"
 # not in WAL mode
 sqlite3 "$T/nowal.db" "CREATE TABLE t (a)" > /dev/null

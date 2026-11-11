@@ -44,7 +44,10 @@ typedef struct { uint8_t type; uint8_t flags; uint32_t max; const kdb_tdef_t *su
 struct kdb_tdef { const char *name; uint8_t n; const kdb_tspec_t *spec; };
 
 #define S(t, f, m) { (t), (f), (m), NULL }
-#define TDEF(var, nm, arr) static const kdb_tdef_t var = { nm, (uint8_t)(sizeof(arr) / sizeof((arr)[0])), arr }
+/* (tlv_parse() keeps the values of a nested entry in a kdb_val_t[KDB_MAX_TAGS]: no definition may have more tags than that) */
+#define TDEF(var, nm, arr) \
+    _Static_assert(sizeof(arr) / sizeof((arr)[0]) <= KDB_MAX_TAGS, "kdb_val_t arrays are KDB_MAX_TAGS long: " nm); \
+    static const kdb_tdef_t var = { nm, (uint8_t)(sizeof(arr) / sizeof((arr)[0])), arr }
 
 static const kdb_tspec_t sp_hello[] = { S(KT_U16, KS_REQ, 0), S(KT_STR, KS_REQ, 64), S(KT_STR, KS_REQ, 32), S(KT_U32, KS_REQ, 0) };
 static const kdb_tspec_t sp_batch_begin[] = { S(KT_U64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 4), S(KT_U64, KS_REQ, 0), S(KT_U64, 0, 0), S(KT_U64, 0, 0) };
@@ -122,8 +125,6 @@ TDEF(td_warm_list, "WARM_LIST", sp_hot_list);
 static const kdb_tspec_t sp_hot_ack[] = { S(KT_U64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, KDB_HA_N - 1), S(KT_U32, KS_REQ, 0), S(KT_STR, 0, 255) };
 TDEF(td_hot_ack, "HOT_ACK", sp_hot_ack);
 
-_Static_assert(sizeof(sp_zone_begin) / sizeof(sp_zone_begin[0]) <= KDB_MAX_TAGS, "kdb_val_t arrays are KDB_MAX_TAGS long");
-_Static_assert(sizeof(sp_cfg_view) / sizeof(sp_cfg_view[0]) <= KDB_MAX_TAGS, "kdb_val_t arrays are KDB_MAX_TAGS long");
 
 /* INVENTORY_REQ has no tags: any tag is unknown */
 static const kdb_tdef_t td_empty = { "INVENTORY_REQ", 0, NULL };
@@ -268,7 +269,8 @@ static bool str_ok(const uint8_t *p, size_t n, bool text) {
 }
 
 /* Parse the TLV list b[0..n) against d.  vals[0..d->n) receive the values.  *nrep (may be NULL) the number of
- * entries of the repeatable nested tag; nested entries are validated and not kept. */
+ * entries of the repeatable nested tag; nested entries are validated and not kept.  One counter serves all KT_NEST tags of d, so a
+ * definition has at most one of them (every table above does: AUTO_STATUS, CONFIG, INVENTORY, HOT_LIST / WARM_LIST). */
 static kdb_rc_t tlv_parse(const kdb_tdef_t *d, const uint8_t *b, size_t n, uint32_t vc, kdb_val_t *vals,
                           uint32_t *nrep, char *why, size_t wl) {
     memset(vals, 0, sizeof(*vals) * d->n);
@@ -800,7 +802,7 @@ int kdb_enc_begin(kdb_enc_t *e, uint16_t type) {
 }
 
 static int enc_tlv(kdb_enc_t *e, uint16_t tag, const void *p, size_t n) {
-    if (e->err || !e->open || n > 65535) { e->err = true; return -1; }
+    if (e->err || !e->open || n > 65535 || tag == 0) { e->err = true; return -1; }       /* (tags are dense from 1; the decoder refuses 0) */
     if (enc_room(e, 4 + n) != 0) return -1;
     put16(e->buf + e->len, tag);
     put16(e->buf + e->len + 2, (uint16_t)n);
@@ -847,6 +849,8 @@ int kdb_enc_end(kdb_enc_t *e) {
 
 int kdb_enc_raw_msg(kdb_enc_t *e, uint16_t type, const void *body, size_t n) {
     if (e->err || e->open || n > UINT32_MAX || n > SIZE_MAX - KDB_HEADER_LEN) { e->err = true; return -1; }
+    const kdb_mdef_t *md = mdef_find(type);
+    if (!md || n > md->maxlen) { e->err = true; return -1; }       /* (as kdb_enc_end(): the limit of the type) */
     if (enc_room(e, KDB_HEADER_LEN + n) != 0) return -1;
     memcpy(e->buf + e->len, KDB_MAGIC, 4);
     put16(e->buf + e->len + 4, type);

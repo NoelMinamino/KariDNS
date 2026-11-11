@@ -529,10 +529,23 @@ static void test_tlv_rejects(void) {
     kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "x"); kdb_enc_str(&e, 3, "y"); kdb_enc_u32(&e, 4, 1); kdb_enc_u8(&e, 5, 0);
     kdb_enc_end(&e);
     CHECK_RC("unknown tag 5", send_enc(KDB_S_AWAIT_HELLO, &e), KDB_E_TLV_UNKNOWN);
-    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_HELLO);
-    kdb_enc_u8(&e, 0, 1);
-    kdb_enc_end(&e);
-    CHECK_RC("tag 0", send_enc(KDB_S_AWAIT_HELLO, &e), KDB_E_TLV_UNKNOWN);
+    {   /* (the encoder refuses tag 0 itself; the body is made by hand) */
+        const uint8_t tag0[] = { 0, 0, 0, 1, 1 };
+        kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_HELLO);
+        CHECK(kdb_enc_u8(&e, 0, 1) != 0 && e.err);
+        kdb_enc_reset(&e); kdb_enc_raw_msg(&e, KDB_T_HELLO, tag0, sizeof(tag0));
+        CHECK_RC("tag 0", send_enc(KDB_S_AWAIT_HELLO, &e), KDB_E_TLV_UNKNOWN);
+    }
+    {   /* the encoder refuses a raw message of an unknown type or above the limit of its type */
+        uint8_t big[70000] = { 0 };
+        kdb_enc_reset(&e);
+        CHECK(kdb_enc_raw_msg(&e, 0x7777, big, 4) != 0 && e.err);
+        kdb_enc_reset(&e);
+        CHECK(kdb_enc_raw_msg(&e, KDB_T_ZONE_DATA, big, KDB_MAX_ZONE_DATA + 1) != 0 && e.err);
+        kdb_enc_reset(&e);
+        CHECK(kdb_enc_raw_msg(&e, KDB_T_ZONE_DATA, big, KDB_MAX_ZONE_DATA) == 0 && !e.err);
+        kdb_enc_reset(&e);
+    }
     kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_INVENTORY_REQ); kdb_enc_u8(&e, 1, 1); kdb_enc_end(&e);
     CHECK_RC("tag in empty message", send_enc(KDB_S_READY, &e), KDB_E_TLV_UNKNOWN);
 
@@ -1523,8 +1536,8 @@ static void test_checkproto(void) {
     size_t n = chk_escape("a b\tc\n\\d\x7f\xc3\xa9", 11, out, sizeof(out), &trunc);
     CHECK_STR(out, "a b\\009c\\010\\092d\\127\\195\\169");
     CHECK(n == strlen(out) && !trunc);
-    /* round trip, byte for byte, with a NUL in the middle */
-    const char raw[] = { 'x', 0, 'y', '\r', '"', '\'', (char)0xff, '\\', '1', '2', '3' };
+    /* round trip, byte for byte (a NUL does not come back: chk_unescape() refuses \000, see below) */
+    const char raw[] = { 'x', 1, 'y', '\r', '"', '\'', (char)0xff, '\\', '1', '2', '3' };
     n = chk_escape(raw, sizeof(raw), out, sizeof(out), &trunc);
     CHECK(!trunc);
     size_t m = chk_unescape(out, n, back, sizeof(back));
@@ -1534,7 +1547,10 @@ static void test_checkproto(void) {
     CHECK(trunc && n == 8 && strcmp(out, "\\001\\002") == 0);
     n = chk_escape("abcdef", 6, out, 4, &trunc);
     CHECK(trunc && n == 3 && strcmp(out, "abc") == 0);
-    CHECK(chk_escape("abc", 3, out, 0, &trunc) == 0 && !trunc);
+    CHECK(chk_escape("abc", 3, out, 0, &trunc) == 0 && trunc);                /* nothing fits, and it is said */
+    CHECK(chk_escape("", 0, out, 0, &trunc) == 0 && !trunc);
+    CHECK(chk_escape("abc", 3, out, 0, NULL) == 0);
+    CHECK(chk_unescape("a\\000b", 6, back, sizeof(back)) == (size_t)-1);      /* \000: a NUL would cut the C string */
     /* unescape: every malformed input is refused */
     CHECK(chk_unescape("a\\", 2, back, sizeof(back)) == (size_t)-1);          /* a backslash at the end */
     CHECK(chk_unescape("\\12", 3, back, sizeof(back)) == (size_t)-1);         /* two digits */
@@ -1556,6 +1572,8 @@ static void test_checkproto(void) {
     CHECK(chk_split(l2b, f, 4) == 4);
     char l3[] = "Z\tbad\001ctl";
     CHECK(chk_split(l3, f, 8) == -1);                                          /* a control character other than TAB */
+    char l3b[] = "Z\tcaf\xc3\xa9", l3c[] = "Z\tdel\x7f";
+    CHECK(chk_split(l3b, f, 8) == -1 && chk_split(l3c, f, 8) == -1);           /* DEL and bytes from 0x80: not plain ASCII */
     char l4[] = "";
     CHECK(chk_split(l4, f, 8) == 1 && f[0][0] == '\0');
     char l5[] = "a\t";

@@ -239,6 +239,10 @@ static int read_conninfo(const char *path, char *buf, size_t cap, char *err, siz
         n += (size_t)k;
     }
     close(fd);
+    if (n < (size_t)sb.st_size) {            /* a read error or a file that got shorter: half a connection string is not used */
+        snprintf(err, errlen, "postgresql: cannot read conninfo-file completely");
+        return -1;
+    }
     buf[n] = '\0';
     if (strlen(buf) != n) {
         snprintf(err, errlen, "postgresql: conninfo-file contains a NUL byte");
@@ -424,9 +428,13 @@ static int schema_scan(db_conn_t *c, bool exists[N_TABLES], unsigned found[N_TAB
     char sql[1400];
     size_t o = (size_t)snprintf(sql, sizeof(sql), "SELECT c.relname, a.attname FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid "
                                                   "AND a.attnum > 0 AND NOT a.attisdropped WHERE c.oid = ANY (ARRAY[");
-    for (size_t t = 0; t < N_TABLES; t++)
+    for (size_t t = 0; t < N_TABLES && o < sizeof(sql); t++)
         o += (size_t)snprintf(sql + o, sizeof(sql) - o, "%sto_regclass('%s')::oid", t ? "," : "", k_tables[t].table);
-    snprintf(sql + o, sizeof(sql) - o, "])");
+    if (o < sizeof(sql)) o += (size_t)snprintf(sql + o, sizeof(sql) - o, "])");
+    if (o >= sizeof(sql)) {                  /* (the table list is static and fits; this is the guard for the day it grows) */
+        set_err(c, "postgresql: the schema query is too long");
+        return -1;
+    }
     ret = exec_rows(c, sql, 0, NULL, &r, "schema");
     if (ret != 0) return ret;
     for (int i = 0; i < PQntuples(r); i++) {
@@ -859,13 +867,8 @@ static int pg_list_zones(db_conn_t *c, db_zone_cb cb, void *ud) {
 static int pg_find_zone(db_conn_t *c, const char *name, db_zone_cb cb, void *ud) {
     size_t n = strlen(name);
     if (n > 1 && name[n - 1] == '.') n--;
-    char *a = malloc(n + 1), *b = malloc(n + 2);
-    if (!a || !b) {
-        free(a);
-        free(b);
-        set_err(c, "out of memory");
-        return -1;
-    }
+    char a[1100], b[1100];        /* the two spellings (PQexecParams takes C strings) */
+    if (n > sizeof(a) - 2) return 0;       /* longer than any domain name (255 bytes, escapes included): no zone of that name */
     memcpy(a, name, n);
     a[n] = '\0';
     memcpy(b, a, n);
@@ -881,8 +884,6 @@ static int pg_find_zone(db_conn_t *c, const char *name, db_zone_cb cb, void *ud)
         snprintf(q, sizeof(q), "%sWHERE lower(d.name) IN (lower($1), lower($2)) ORDER BY d.id, r.id", sel);
         ret = pg_scan(c, "find_zone", q, 2, pv, zl_row, &z);
     }
-    free(a);
-    free(b);
     return ret;
 }
 
@@ -1041,7 +1042,7 @@ static int pg_scan_domain_views(db_conn_t *c, const int64_t *domain_id, db_domai
         char p[32];
         snprintf(p, sizeof(p), "%lld", (long long)*domain_id);
         const char *pv[1] = { p };
-        return pg_scan(c, "scan_domain_views", "SELECT domain_id, view_name FROM karidns_domain_views WHERE domain_id = $1::bigint", 1, pv, dl_row, &l);
+        return pg_scan(c, "scan_domain_views", "SELECT domain_id, view_name FROM karidns_domain_views WHERE domain_id = $1::bigint ORDER BY view_name", 1, pv, dl_row, &l);
     }
     return pg_scan(c, "scan_domain_views", "SELECT domain_id, view_name FROM karidns_domain_views ORDER BY domain_id", 0, NULL, dl_row, &l);
 }
@@ -1255,7 +1256,9 @@ static int pg_changes_since(db_conn_t *c, uint64_t after, db_change_cb cb, void 
     bool g = false;
     if (after > 0) {
         /* pruned rows: the log has rows, the first seq is not 1, and nothing is left below the cursor (the rows the
-         * loader has seen are gone, so some of the ones after them may be too) */
+         * loader has seen are gone, so some of the ones after them may be too).  This is a heuristic: it can say "gap" when there is
+         * none (a needless full reload), and it can miss a gap behind a very long transaction (rows of a transaction that commits late
+         * are older than the cursor and the check looks at min(seq) only); a full reload (karictl reload) repairs that. */
         PGresult *r = NULL;
         ret = exec_rows(c, "SELECT (SELECT min(seq) FROM karidns_changes), EXISTS (SELECT 1 FROM karidns_changes WHERE xid < $1::xid8)", 1, pv, &r,
                         "changes_since");
@@ -2109,24 +2112,34 @@ static int pg_w_insert_version_rrset(db_conn_t *c, int64_t version_id, const cha
 }
 
 const db_driver_t db_driver_postgresql = {
-    "postgresql",    pg_open,         pg_close,           pg_errmsg,           pg_check_schema,
-    pg_begin_snapshot, pg_end_snapshot, pg_list_zones,    pg_scan_records,     pg_scan_metadata,
-    pg_zones_with_keys, pg_changes_since, pg_wait_fd,     pg_drain_notifications, pg_report_status,
-    pg_changes_max,  pg_scan_records_range, pg_scan_domain_views, pg_scan_profiles, pg_scan_ext, pg_poll_version,
-    true,
-    pg_watch_requests, pg_requests_max, pg_reload_requests,
-    pg_schema_findings, /* B12 */
-    pg_find_zone,       /* B13 */
-    pg_scan_records_in, pg_scan_metadata_in, pg_scan_ext_in,      /* B13b */
-    pg_scan_apex,       /* D1a step 6 */
+    .name = "postgresql",
+    .open = pg_open, .close = pg_close, .errmsg = pg_errmsg, .check_schema = pg_check_schema,
+    .begin_snapshot = pg_begin_snapshot, .end_snapshot = pg_end_snapshot, .list_zones = pg_list_zones,
+    .scan_records = pg_scan_records, .scan_metadata = pg_scan_metadata, .zones_with_keys = pg_zones_with_keys,
+    .changes_since = pg_changes_since, .wait_fd = pg_wait_fd, .drain_notifications = pg_drain_notifications,
+    .report_status = pg_report_status, .changes_max = pg_changes_max, .scan_records_range = pg_scan_records_range,
+    .scan_domain_views = pg_scan_domain_views, .scan_profiles = pg_scan_profiles, .scan_ext = pg_scan_ext,
+    .poll_version = pg_poll_version,
+    .changes_unsettled = true,
+    .watch_requests = pg_watch_requests, .requests_max = pg_requests_max, .reload_requests = pg_reload_requests,
+    .schema_findings = pg_schema_findings,      /* B12 */
+    .find_zone = pg_find_zone,                  /* B13 */
+    .scan_records_in = pg_scan_records_in, .scan_metadata_in = pg_scan_metadata_in, .scan_ext_in = pg_scan_ext_in,      /* B13b */
+    .scan_apex = pg_scan_apex,                  /* D1a step 6 */
     /* M2, the ZoneImporter: write access (open_write connections only) */
-    pg_open_write, pg_w_begin, pg_w_commit, pg_w_rollback, pg_w_create_zone, pg_w_delete_records, pg_w_insert_record, pg_w_insert_tags,
-    pg_w_insert_tinydns, pg_w_delete_tagdefs, pg_w_insert_tagdef, pg_w_delete_meta, pg_w_insert_meta, pg_w_set_view, pg_w_request_reload,
-    pg_w_zone_has_keys,
-    pg_w_set_audit,       /* schema version 3 */
-    pg_w_scan_auth, pg_w_update_record, pg_w_mark, pg_w_write_id, pg_w_delete_dnssec,       /* item C, the signer */
-    pg_w_update_orders, pg_w_insert_dnssec, pg_w_set_snapshot,
-    pg_w_set_actor, pg_w_zone_generation, pg_w_bump_serial, pg_w_insert_version, pg_w_insert_version_rrset,        /* items D and E */
+    .open_write = pg_open_write, .w_begin = pg_w_begin, .w_commit = pg_w_commit, .w_rollback = pg_w_rollback,
+    .w_create_zone = pg_w_create_zone, .w_delete_records = pg_w_delete_records, .w_insert_record = pg_w_insert_record,
+    .w_insert_tags = pg_w_insert_tags, .w_insert_tinydns = pg_w_insert_tinydns, .w_delete_tagdefs = pg_w_delete_tagdefs,
+    .w_insert_tagdef = pg_w_insert_tagdef, .w_delete_meta = pg_w_delete_meta, .w_insert_meta = pg_w_insert_meta,
+    .w_set_view = pg_w_set_view, .w_request_reload = pg_w_request_reload, .w_zone_has_keys = pg_w_zone_has_keys,
+    .w_set_audit = pg_w_set_audit,              /* schema version 3 */
+    /* item C, the signer */
+    .w_scan_auth = pg_w_scan_auth, .w_update_record = pg_w_update_record, .w_mark = pg_w_mark, .w_write_id = pg_w_write_id,
+    .w_delete_dnssec = pg_w_delete_dnssec, .w_update_orders = pg_w_update_orders, .w_insert_dnssec = pg_w_insert_dnssec,
+    .w_set_snapshot = pg_w_set_snapshot,
+    /* items D and E */
+    .w_set_actor = pg_w_set_actor, .w_zone_generation = pg_w_zone_generation, .w_bump_serial = pg_w_bump_serial,
+    .w_insert_version = pg_w_insert_version, .w_insert_version_rrset = pg_w_insert_version_rrset,
 };
 
 #endif /* KARIDNS_DB_POSTGRESQL */

@@ -662,6 +662,16 @@ static void test_zone_soa_rows(void) {
         CHECK_MSG(l.n == 1 && str_eq(l.soa[0], want[askid[k] - 1]), "find_zone %s: SOA '%s'", ask[k], l.n && l.soa[0] ? l.soa[0] : "(none)");
         zl_free(&l);
     }
+    {   /* a name longer than any domain name: no zone, no error (the two spellings are made in a buffer of 1100 bytes) */
+        char longname[2100];
+        memset(longname, 'a', sizeof(longname) - 1);
+        longname[sizeof(longname) - 1] = '\0';
+        CHECK(db_driver_sqlite3.find_zone(c, longname, zl_collect, &l) == 0 && l.n == 0);
+        zl_free(&l);
+        longname[1090] = '\0';                                                      /* the longest that fits: asked, nothing found */
+        CHECK(db_driver_sqlite3.find_zone(c, longname, zl_collect, &l) == 0 && l.n == 0);
+        zl_free(&l);
+    }
     db_driver_sqlite3.close(c);
 }
 
@@ -3124,6 +3134,7 @@ static void test_signer_cover(void) {
     uint64_t last = 0, mx = 0;
     bool gap = false;
     CHECK(db_driver_sqlite3.begin_snapshot(c) == 0 && db_driver_sqlite3.changes_max(c, &mx) == 0 && mx == 4);
+    CHECK(db_driver_sqlite3.changes_max(c, &mx) == 0 && mx == 4);                          /* the statement is kept between calls */
     CHECK(cov_set(&io->vst[0], 1, mx) == 0);                                               /* a reload of zone 1 read the log up to seq 4 */
     CHECK(db_driver_sqlite3.changes_since(c, 0, chg_cb, &x, &last, &gap) == 0);
     CHECK_MSG(x.nchg == 2 && x.chg[0] == 2 && x.chg[1] == 3, "%zu rows", x.nchg);        /* zone 2 and zone 3 changed; the rows of zone 1 are in what was read */

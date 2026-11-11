@@ -27,19 +27,21 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#define CHK_LINE_MAX 262144         /* the longest line karicheck accepts (a settings text of 64 KiB escapes to about 4 times that) */
+#define CHK_LINE_MAX 1048576        /* the longest line karicheck accepts (an S line holds two texts of 64 KiB, which escape to 4 times that) */
 #define CHK_MAX_FIELDS 64           /* fields of a line (Z lines list the views of a zone) */
 #define CHK_TEXT_MAX 1000           /* the loader cuts a finding at this many source bytes */
 
 /* in[0..n) into out (NUL terminated, at most cap - 1 bytes, an escape is never cut).  Returns the length; *trunc is set when the
- * input did not fit. */
+ * input did not fit.  trunc may be NULL.  cap == 0 is allowed: nothing is written (not even the NUL), 0 is returned and *trunc is set
+ * when n > 0. */
 size_t chk_escape(const char *in, size_t n, char *out, size_t cap, bool *trunc);
 /* The inverse: in[0..n) of escaped text into out (NUL terminated).  Returns the length, or (size_t)-1 for a malformed escape (a
- * backslash not followed by three digits, a value above 255) or when the result does not fit cap - 1 bytes.  A byte outside
- * 0x20..0x7E in the input is malformed too. */
+ * backslash not followed by three digits, a value above 255, \000: the result is a C string) or when the result does not fit
+ * cap - 1 bytes.  A byte outside 0x20..0x7E in the input is malformed too.  After an error the contents of out are unspecified
+ * (callers use the return value). */
 size_t chk_unescape(const char *in, size_t n, char *out, size_t cap);
 /* Split line (without its LF; modified: TABs become NULs) into at most max fields.  Returns the number of fields, or -1 when there
- * are more than max or the line has a byte below 0x20 other than TAB. */
+ * are more than max or the line has a byte below 0x20 other than TAB, or a byte from 0x7F (the fields are escaped text: plain ASCII). */
 int chk_split(char *line, char **fields, int max);
 /* Make s printable in place: a byte outside 0x20..0x7E becomes '?' */
 void chk_printable(char *s);

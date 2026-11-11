@@ -774,6 +774,8 @@ static void test_module(void) {
     CHECK(p.alg == 1 && p.flags == 0 && p.iterations == 3 && p.salt_len == 4 && p.salt[0] == 0xAA && p.salt[3] == 0xDD);
     CHECK(presigned_parse_n3param("  1\t1  0 -  ", &p, &why));
     CHECK(p.flags == 1 && p.salt_len == 0);
+    CHECK(presigned_parse_n3param("1 0 3 AABBCCDD\r\n", &p, &why));       /* a line end after the last field is blank space */
+    CHECK(p.iterations == 3 && p.salt_len == 4);
     CHECK(!presigned_parse_n3param("", &p, &why));
     CHECK(!presigned_parse_n3param(NULL, &p, &why));
     /* RFC 5155 Appendix A: H(example) with salt aabbccdd, 12 iterations = 0p9mhaveqvm6t7vbl5lop2u3t2rp3tom */

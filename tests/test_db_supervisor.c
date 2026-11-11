@@ -133,6 +133,17 @@ static void test_init(void) {
     CHECK_MSG(db_sup_init(&s, &cfg, err, sizeof(err)), "%s", err);
     CHECK(s.enabled && strcmp(s.path, path) == 0 && s.backoff_s == 1 && s.starts == 0 && !s.restart_pending);
 
+    {
+        char longpath[PATH_MAX + 100];                                       /* a state file that does not fit is refused, not cut */
+        memset(longpath, 'a', sizeof(longpath) - 1);
+        longpath[0] = '/';
+        longpath[sizeof(longpath) - 1] = '\0';
+        cfg.database.loader_state_file = longpath;
+        CHECK(!db_sup_init(&s, &cfg, err, sizeof(err)));
+        CHECK_HAS(err, "is longer than");
+        cfg.database.loader_state_file = NULL;
+    }
+
     if (geteuid() == 0) {
         chown(path, 12345, 12345);                                           /* a loader that somebody else owns */
         CHECK(!db_sup_init(&s, &cfg, err, sizeof(err)));
@@ -279,14 +290,20 @@ static void test_spawn_and_restart(void) {
     CHECK(!db_sup_spawn(&s));
     CHECK(s.restart_pending);
 
-    /* the Backend cannot take the stream (pair C is closed): the loader is started, the failure is logged */
+    /* the Backend cannot take the stream (pair C is closed): the failure is logged and the loader, whose streams lead nowhere, is killed (or
+     * has ended by itself already); it is reaped as any exit */
     write_loader(path, 0755);
     close(g_db_ctrl_fd);
     g_db_ctrl_fd = -1;
     s.restart_pending = false;
     CHECK(db_sup_spawn(&s));
     CHECK(s.pid > 0);
-    CHECK(WIFEXITED(reap(s.pid)));
+    {
+        int rst = reap(s.pid);
+        CHECK(WIFEXITED(rst) || (WIFSIGNALED(rst) && WTERMSIG(rst) == SIGKILL));
+    }
+    /* one loader at a time: db_sup_spawn() does not start another while the exit of the first has not been seen */
+    CHECK(!db_sup_spawn(&s));
     s.pid = 0;
     unsetenv("KARIDNS_TEST_LEAK");
 

@@ -4,6 +4,7 @@
  */
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -29,6 +30,10 @@ typedef struct { char *p; size_t len, cap; bool oom; } ps_sb_t;
 
 static void sb_put(ps_sb_t *b, const char *s, size_t n) {
     if (b->oom) return;
+    if (n >= SIZE_MAX / 4 - b->len) {            /* (not reachable with 64-bit sizes; the doubling below must not wrap) */
+        b->oom = true;
+        return;
+    }
     if (b->len + n + 1 > b->cap) {
         size_t nc = b->cap ? b->cap : 4096;
         while (nc < b->len + n + 1) nc *= 2;
@@ -97,7 +102,8 @@ bool presigned_parse_n3param(const char *s, presigned_n3param_t *p, const char *
     snprintf(buf, sizeof(buf), "%s", s);
     char *tok[6];
     int nt = 0;
-    for (char *q = strtok(buf, " \t"); q; q = strtok(NULL, " \t")) {
+    char *save = NULL;
+    for (char *q = strtok_r(buf, " \t\r\n", &save); q; q = strtok_r(NULL, " \t\r\n", &save)) {
         if (nt == 5) break;
         tok[nt++] = q;
     }
@@ -168,7 +174,8 @@ static bool nsec3_hash_ctx(EVP_MD_CTX *md, const char *name, const presigned_n3p
         (p->salt_len && EVP_DigestUpdate(md, p->salt, p->salt_len) != 1) || EVP_DigestFinal_ex(md, dg, &dl) != 1 || dl != 20)
         return false;
     for (unsigned i = 0; i < p->iterations; i++) {
-        if (EVP_DigestInit_ex(md, EVP_sha1(), NULL) != 1 || EVP_DigestUpdate(md, dg, 20) != 1 ||
+        /* (type NULL: the context starts again with the digest it has; OpenSSL 3 does not look the algorithm up at every iteration) */
+        if (EVP_DigestInit_ex(md, NULL, NULL) != 1 || EVP_DigestUpdate(md, dg, 20) != 1 ||
             (p->salt_len && EVP_DigestUpdate(md, p->salt, p->salt_len) != 1) || EVP_DigestFinal_ex(md, dg, &dl) != 1 || dl != 20)
             return false;
     }
@@ -213,7 +220,7 @@ typedef struct {
     const char *name;
     size_t first, count;        /* records of the name: order[first .. first+count) */
     uint32_t sig_ttl;           /* Original TTL of the RRSIG(NSEC3 / NSEC) at the name */
-    bool have_ttl, chain, has_ns, has_ds, occluded, is_apex, required;
+    bool chain, has_ns, has_ds, occluded, is_apex, required;
     char hash[33];              /* NSEC3: hash of the name (chain: the owner's label) */
     bool hashed;
 } ps_node_t;
@@ -273,14 +280,11 @@ static void rrsig_fields(const dns_record_t *r, uint16_t *covered, uint32_t *ori
 static int build_nodes(ps_ctx_t *c, char *err, size_t errlen) {
     const zone_arena_t *a = c->arena;
     c->order = malloc((a->count ? a->count : 1) * sizeof(ps_rec_t));
-    c->cov = calloc(a->count ? a->count : 1, sizeof(uint16_t));
-    c->orig = calloc(a->count ? a->count : 1, sizeof(uint32_t));
-    c->nodes = calloc(a->count ? a->count : 1, sizeof(ps_node_t));
-    if (!c->order || !c->cov || !c->orig || !c->nodes) goto oom;
+    c->nodes = calloc(a->count ? a->count : 1, sizeof(ps_node_t));       /* (c->cov / c->orig: rebuild_impl() has read the RRSIG rows already) */
+    if (!c->order || !c->nodes) goto oom;
     for (size_t i = 0; i < a->count; i++) {
         c->order[i].name = a->records[i].name;
         c->order[i].idx = i;
-        if (a->records[i].type_code == T_RRSIG) rrsig_fields(&a->records[i], &c->cov[i], &c->orig[i]);
     }
     qsort(c->order, a->count, sizeof(ps_rec_t), rec_cmp);
     for (size_t i = 0; i < a->count;) {
@@ -302,17 +306,17 @@ static int build_nodes(ps_ctx_t *c, char *err, size_t errlen) {
         }
         i = j;
     }
-    /* occluded: strictly below a delegation point (a non-apex name with NS), RFC 1034 s4.2.1; glue lives there */
+    /* occluded: strictly below a delegation point (a non-apex name with NS), RFC 1034 s4.2.1; glue lives there.  The nodes are in canonical
+     * order (RFC 4034 s6.1), where everything below a name follows it without a gap, so one pass with the delegation point in force is
+     * enough (a delegation point inside an occluded subtree changes nothing: its names are occluded already). */
+    const char *deleg = NULL;
     for (size_t i = 0; i < c->n_nodes; i++) {
         ps_node_t *n = &c->nodes[i];
-        if (n->is_apex) continue;
-        for (const char *p = parent_of(n->name); p && !is_apex_name(c, p); p = parent_of(p)) {
-            const ps_node_t *anc = find_node(c, p);
-            if (anc && anc->has_ns) {
-                n->occluded = true;
-                break;
-            }
+        if (deleg && domain_name_is_at_or_below(n->name, deleg)) {
+            n->occluded = true;
+            continue;
         }
+        deleg = !n->is_apex && n->has_ns ? n->name : NULL;
     }
     return 0;
 oom:
@@ -346,7 +350,9 @@ static int cmp_u16(const void *a, const void *b) {
  * the apex, the NSEC of an NSEC chain); add_rrsig_always adds RRSIG; NSEC3 is never listed (s7.1). */
 static void put_types(ps_sb_t *sb, const ps_ctx_t *c, const ps_node_t *n, bool delegation, uint16_t add1, uint16_t add2,
                       bool add_rrsig_always, bool node_has_types) {
-    uint16_t *t = malloc((n ? n->count + 3 : 3) * sizeof(uint16_t));
+    uint16_t small[64];                    /* (a name rarely has more than a few dozen records: no malloc for each chain entry) */
+    size_t want = n ? n->count + 3 : 3;
+    uint16_t *t = want <= sizeof(small) / sizeof(small[0]) ? small : malloc(want * sizeof(uint16_t));
     size_t nt = 0;
     if (!t) {
         sb->oom = true;
@@ -372,7 +378,7 @@ static void put_types(ps_sb_t *sb, const ps_ctx_t *c, const ps_node_t *n, bool d
         prev = t[i];
         first = false;
     }
-    free(t);
+    if (t != small) free(t);
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -407,13 +413,12 @@ static bool nsec_ordername(const char *name, const char *apex, char *out, size_t
 /* the two rebuilds                                                                                               */
 /* ------------------------------------------------------------------------------------------------------------- */
 
+/* 0; -1 no SOA at the apex; -2 its MINIMUM is not a TTL (parse_ttl_value() would make 3600 of it) */
 static int soa_minimum(const ps_ctx_t *c, uint32_t *v) {
     for (size_t i = 0; i < c->arena->count; i++) {
         const dns_record_t *r = &c->arena->records[i];
-        if (r->type_code == T_SOA && !r->generic_data && r->rdata_count >= 7 && is_apex_name(c, r->name)) {
-            *v = parse_ttl_value(r->rdata[6]);
-            return 0;
-        }
+        if (r->type_code == T_SOA && !r->generic_data && r->rdata_count >= 7 && is_apex_name(c, r->name))
+            return parse_ttl_strict(r->rdata[6], 2147483647u, v) ? 0 : -2;
     }
     return -1;
 }
@@ -479,7 +484,6 @@ static int rebuild_nsec3(ps_ctx_t *c, const presigned_n3param_t *np, const char 
                 if (!n->chain) {
                     n->chain = true;
                     n->sig_ttl = c->orig[ri];
-                    n->have_ttl = true;
                 } else if (n->sig_ttl != c->orig[ri]) {
                     snprintf(err, errlen, "RRSIG(NSEC3) rows at '%.200s' have different Original TTLs", n->name);
                     goto out;
@@ -574,7 +578,10 @@ static int rebuild_nsec3(ps_ctx_t *c, const presigned_n3param_t *np, const char 
     for (size_t i = 0; i < n_ents_in; i++) {
         char h[33];
         if (!ents_in[i].ordername) continue;
-        if (!nsec3_hash_ctx(c->md, ents_in[i].name, np, h)) continue;
+        if (!nsec3_hash_ctx(c->md, ents_in[i].name, np, h)) {
+            snprintf(err, errlen, "cannot hash the empty non-terminal '%.200s'", ents_in[i].name);
+            goto out;
+        }
         if (strcasecmp(ents_in[i].ordername, h) != 0) {
             snprintf(err, errlen, "ordername '%.64s' of the empty non-terminal '%.200s' is not its NSEC3 hash %s",
                      ents_in[i].ordername, ents_in[i].name, h);
@@ -660,8 +667,9 @@ static int rebuild_nsec3(ps_ctx_t *c, const presigned_n3param_t *np, const char 
         }
         if (!have_param_ttl) {
             /* no RRSIG(NSEC3PARAM) to take the Original TTL from: SOA MINIMUM stands in (kept on purpose; the caller warns) */
-            if (soa_minimum(c, &ttl_param) != 0) {
-                snprintf(err, errlen, "no SOA record at the zone apex");
+            int sm = soa_minimum(c, &ttl_param);
+            if (sm != 0) {
+                snprintf(err, errlen, sm == -2 ? "the SOA MINIMUM at the zone apex is not a TTL" : "no SOA record at the zone apex");
                 goto out;
             }
             out->param_ttl_from_soa = true;
@@ -807,11 +815,10 @@ out:
     return rc;
 }
 
-int presigned_rebuild(const zone_arena_t *arena, const char *apex, const char *nsec3param,
-                      const char *const *ordernames, const presigned_ent_t *ents, size_t n_ents,
-                      presigned_out_t *out, char *err, size_t errlen) {
-    memset(out, 0, sizeof(*out));
-    err[0] = '\0';
+/* cov / orig: the covered type and Original TTL of every RRSIG row (zero for the others), read here once and used by build_nodes() */
+static int rebuild_impl(const zone_arena_t *arena, const char *apex, const char *nsec3param,
+                        const char *const *ordernames, const presigned_ent_t *ents, size_t n_ents,
+                        presigned_out_t *out, char *err, size_t errlen, uint16_t *cov, uint32_t *orig) {
     size_t n_nsec = 0, n_nsec3 = 0, n_param = 0, n_rs_nsec = 0, n_rs_nsec3 = 0;
     for (size_t i = 0; i < arena->count; i++) {
         const dns_record_t *r = &arena->records[i];
@@ -820,11 +827,9 @@ int presigned_rebuild(const zone_arena_t *arena, const char *apex, const char *n
         case T_NSEC3: n_nsec3++; break;
         case T_NSEC3PARAM: n_param++; break;
         case T_RRSIG: {
-            uint16_t cv;
-            uint32_t og;
-            rrsig_fields(r, &cv, &og);
-            if (cv == T_NSEC) n_rs_nsec++;
-            else if (cv == T_NSEC3) n_rs_nsec3++;
+            rrsig_fields(r, &cov[i], &orig[i]);
+            if (cov[i] == T_NSEC) n_rs_nsec++;
+            else if (cov[i] == T_NSEC3) n_rs_nsec3++;
             break;
         }
         default: break;
@@ -860,6 +865,8 @@ int presigned_rebuild(const zone_arena_t *arena, const char *apex, const char *n
     memset(&c, 0, sizeof(c));
     c.arena = arena;
     c.apex = apex;
+    c.cov = cov;
+    c.orig = orig;
     c.md = EVP_MD_CTX_new();
     int rc = -1;
     if (!c.md) {
@@ -871,11 +878,25 @@ int presigned_rebuild(const zone_arena_t *arena, const char *apex, const char *n
     }
     EVP_MD_CTX_free(c.md);
     free(c.order);
-    free(c.cov);
-    free(c.orig);
     free(c.nodes);
     free(c.ents);
     if (rc != 0) presigned_out_free(out);
+    return rc;
+}
+
+int presigned_rebuild(const zone_arena_t *arena, const char *apex, const char *nsec3param,
+                      const char *const *ordernames, const presigned_ent_t *ents, size_t n_ents,
+                      presigned_out_t *out, char *err, size_t errlen) {
+    memset(out, 0, sizeof(*out));
+    err[0] = '\0';
+    size_t n = arena->count ? arena->count : 1;
+    uint16_t *cov = calloc(n, sizeof(uint16_t));
+    uint32_t *orig = calloc(n, sizeof(uint32_t));
+    int rc = -1;
+    if (!cov || !orig) snprintf(err, errlen, "out of memory");
+    else rc = rebuild_impl(arena, apex, nsec3param, ordernames, ents, n_ents, out, err, errlen, cov, orig);
+    free(cov);
+    free(orig);
     return rc;
 }
 
