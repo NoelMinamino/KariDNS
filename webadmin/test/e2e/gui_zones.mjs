@@ -829,6 +829,8 @@ try {
     await fill('zone', 'hist.test', 'form:has(select[name=role])');
     await click('Give the grant', 'main');
     await b.waitText('main', /The grant was given\./);
+    // the list of grants is fetched again after the message: wait for its rows before reading them
+    await b.waitFor(async () => (await b.exec(() => document.querySelectorAll('table.grants tbody tr').length)) > 0, { message: 'the grants of the group to be listed' });
     eq(await b.exec(() => [...document.querySelectorAll('table.grants tbody tr')].map((r) => [...r.children].slice(0, 3).map((c) => c.innerText.trim()))), [['Domain master', 'main / hist.test.', 'web']], 'the grant');
     // the user has the grant of the group
     await logout();
@@ -906,6 +908,7 @@ try {
     // grants of the group, found by name
     await open('#/admin/grants?who=e2e-ops', /^Administration$/);
     await b.waitCss('table.grants');
+    await b.waitFor(async () => (await b.exec(() => document.querySelectorAll('table.grants tbody tr').length)) > 0, { message: 'the grants of e2e-ops to be listed' });
     await labelsOk('grants');
     eq(await b.exec(() => [...document.querySelectorAll('table.grants tbody tr')].map((r) => [...r.children].slice(0, 4).map((c) => c.innerText.trim()))), [['e2e-ops', 'Domain master', 'main / hist.test.', 'web']], 'the grants of the group');
     await click('Remove', 'table.grants');
@@ -947,6 +950,8 @@ try {
     await fill('suffix', 'zz.example.test', 'form:has(select[name=role])');
     await click('Give the grant', 'main');
     await b.waitText('main', /The grant was given\./);
+    // (the list is fetched again after the message, as above)
+    await b.waitFor(async () => (await b.exec(() => [...document.querySelectorAll('table.grants tbody tr')].some((r) => r.children[0] && r.children[0].innerText.trim() === 'sub'))), { message: 'the new grant of sub to be listed' }).catch(() => {});
     const rows = await b.exec(() => [...document.querySelectorAll('table.grants tbody tr')].map((r) => [...r.children].slice(0, 3).map((c) => c.innerText.trim())));
     must(rows.some((r) => r[0] === 'sub' && r[1] === 'Subdomain master' && r[2].includes('zz.example.test.')), `the grant is not listed: ${JSON.stringify(rows)}`);
     // a grant the service refuses: no more than the policy the person holds is a rule of the service; a zone that is not its own is not found
