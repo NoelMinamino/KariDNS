@@ -11,6 +11,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 
 const META_KINDS = ['PRESIGNED', 'NSEC3PARAM', 'X-KARIDNS-SIGNER'];
 const CHUNK = 500;
+const CHANGES_BATCH = 20000;            // rows of the change log read at a time
 
 // One signer per database file: a lock file next to it holding our pid.  A file of a process that is gone is taken over.  Returns a function that
 // releases the lock.
@@ -43,6 +44,7 @@ export class SqliteDb {
     this.sleep = sleepFn;
     this.db = null;
     this.releaseLock = null;
+    this.changesBatch = CHANGES_BATCH;           // (the tests make it small)
   }
 
   open() {
@@ -185,12 +187,12 @@ export class SqliteDb {
     return this.db.prepare('SELECT coalesce(max(seq), 0) AS m FROM karidns_changes').get().m;
   }
 
-  // the rows after the cursor (a seq); gap: the log was pruned beyond our position
+  // the rows after the cursor (a seq), CHANGES_BATCH at the most; gap: the log was pruned beyond our position; more: the batch is full, so the caller reads again at once
   async changesSince(cursor) {
-    const rows = this.db.prepare('SELECT seq, domain_id AS domainId FROM karidns_changes WHERE seq > ? ORDER BY seq LIMIT 20000').all(cursor);
+    const rows = this.db.prepare('SELECT seq, domain_id AS domainId FROM karidns_changes WHERE seq > ? ORDER BY seq LIMIT ?').all(cursor, this.changesBatch);
     const min = this.db.prepare('SELECT min(seq) AS m FROM karidns_changes').get().m;
     const gap = cursor > 0 && min != null && min > cursor + 1;
-    return { rows: rows.map((r) => ({ domainId: r.domainId, seq: r.seq, xid: null })), cursor: rows.length ? rows[rows.length - 1].seq : cursor, gap };
+    return { rows: rows.map((r) => ({ domainId: r.domainId, seq: r.seq, xid: null })), cursor: rows.length ? rows[rows.length - 1].seq : cursor, gap, more: rows.length >= this.changesBatch };
   }
 
   // SQLite3 has no notification: poll

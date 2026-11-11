@@ -109,6 +109,8 @@ GRANT EXECUTE ON FUNCTION karidns_auth.bump_serial(text, integer) TO :"role";
 GRANT EXECUTE ON FUNCTION karidns_auth.session_lookup(bytea), karidns_auth.api_token_lookup(bigint, bytea) TO :"role";
 -- the hourly sweep: deletes the expired sessions of every principal (the policy of sessions shows the role its own principal's rows only)
 GRANT EXECUTE ON FUNCTION karidns_auth.sweep_expired() TO :"role";
+-- the pruning of the audit log (option audit-retention of the service, 0.6.1): deletes rows older than the given days, at least 7; no role has a right on audit_log itself
+GRANT EXECUTE ON FUNCTION karidns_auth.prune_audit(integer) TO :"role";
 -- the sign-in with an OpenID Connect provider (item F, milestone M5): the table oidc_states has no privilege at all, the role calls these
 GRANT EXECUTE ON FUNCTION karidns_auth.oidc_state_put(bytea, bytea, text, text, text, text, integer), karidns_auth.oidc_state_take(bytea), karidns_auth.oidc_lookup(text, text) TO :"role";
 

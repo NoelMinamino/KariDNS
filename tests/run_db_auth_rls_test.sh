@@ -550,6 +550,23 @@ oq "INSERT INTO karidns_auth.oidc_states (state_hash, browser_hash, provider, no
 a_ok "sweep_expired() runs for the API role" $API NONE "SELECT karidns_auth.sweep_expired()"
 oeq "...it deleted the states that are over and left the one that is not" "1" "SELECT count(*) FROM karidns_auth.oidc_states"
 oq "DELETE FROM karidns_auth.oidc_states" > /dev/null
+# 0.6.1: prune_audit(days), the audit-retention option of the WebAdmin (no role may delete from audit_log; the function does, for rows older than the days, at least 7)
+a_err "the API role cannot delete from the audit log itself" "permission denied" $API $GM "DELETE FROM karidns_auth.audit_log"
+a_err "prune_audit() refuses fewer than 7 days" "at least 7 days" $API NONE "SELECT karidns_auth.prune_audit(6)"
+a_err "...and NULL" "at least 7 days" $API NONE "SELECT karidns_auth.prune_audit(NULL)"
+a_err "the signer role has no EXECUTE on prune_audit()" "permission denied" $SIG NONE "SELECT karidns_auth.prune_audit(30)"
+# (the function takes the ids to grow with the time, as they do: it looks at the oldest id first.  The rows of this test are older than the ones the log has, so the log is put
+# aside while they are checked.)
+oq "CREATE TABLE karidns_auth.zz_audit_save AS SELECT * FROM karidns_auth.audit_log; DELETE FROM karidns_auth.audit_log" > /dev/null
+oq "INSERT INTO karidns_auth.audit_log (at, data_schema, table_name, op) SELECT now() - interval '100 days', 'public', 'prune_t', 'I' FROM generate_series(1, 10001)" > /dev/null
+a_eq "a call deletes at most 10000 rows" 10000 $API NONE "SELECT karidns_auth.prune_audit(90)"
+a_eq "...the caller repeats until fewer come back" 1 $API NONE "SELECT karidns_auth.prune_audit(90)"
+a_eq "...and then there is nothing to do" 0 $API NONE "SELECT karidns_auth.prune_audit(90)"
+oq "INSERT INTO karidns_auth.audit_log (at, data_schema, table_name, op) SELECT now() - make_interval(days => d), 'public', 'prune_t', 'I' FROM unnest(ARRAY[400, 40, 31, 10, 1]) d" > /dev/null
+a_eq "prune_audit(30) deletes the rows older than 30 days" 3 $API NONE "SELECT karidns_auth.prune_audit(30)"
+oeq "...the newer ones stay" "2" "SELECT count(*) FROM karidns_auth.audit_log WHERE table_name = 'prune_t'"
+a_eq "...a second call finds nothing to do" 0 $API NONE "SELECT karidns_auth.prune_audit(30)"
+oq "DELETE FROM karidns_auth.audit_log; INSERT INTO karidns_auth.audit_log SELECT * FROM karidns_auth.zz_audit_save; DROP TABLE karidns_auth.zz_audit_save" > /dev/null
 oq "UPDATE karidns_auth.credentials SET oidc_issuer = 'https://idp.example', oidc_subject = 'dm-sub' WHERE principal_id = $DM" > /dev/null
 a_eq "oidc_lookup() finds the user an identity is linked to, without a principal" "$DM" $API NONE "SELECT karidns_auth.oidc_lookup('https://idp.example', 'dm-sub')"
 a_eq "...not by another issuer or subject" 0 $API NONE "SELECT count(karidns_auth.oidc_lookup('https://idp.example', 'DM-SUB')) + count(karidns_auth.oidc_lookup('https://other.example', 'dm-sub'))"

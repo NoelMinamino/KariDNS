@@ -382,6 +382,23 @@ test('the change loop survives a failing database', async () => {
   await m.d.stop();
 });
 
+test('the change loop reads again at once after a full batch, and waits after the last one (0.6.1)', async () => {
+  const m = make();
+  const more = [true, true, false];
+  let waits = 0;
+  m.db.waitForChange = async () => { waits++; await new Promise((r) => setTimeout(r, 2)); };
+  m.db.changesSince = async (cursor) => { m.calls.push(['changesSince', cursor]); return { rows: [], cursor: 'c1', gap: false, more: more.length ? more.shift() : false }; };
+  m.d.cursor = 'c0';
+  m.d.loops.push(m.d.changeLoop());
+  await new Promise((r) => setTimeout(r, 30));
+  await m.d.stop();
+  assert.ok(find(m.calls, 'changesSince').length >= 3);
+  assert.equal(more.length, 0);
+  // a wait before every read but the two that follow a full batch (a stop may come between a wait and its read)
+  const reads = find(m.calls, 'changesSince').length;
+  assert.ok(waits >= reads - 2 && waits <= reads - 1, `${waits} waits for ${reads} reads`);
+});
+
 test('the main loop survives a failing scheduler pass', async () => {
   const m = make();
   m.db.dueZones = async () => { throw new Error('select failed'); };

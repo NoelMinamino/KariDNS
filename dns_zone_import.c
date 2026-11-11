@@ -1742,6 +1742,55 @@ static int zi_cmp_auth_id(const void *k, const void *e) {
 
 static bool zi_same_text(const char *a, const char *b) { return (a == NULL && b == NULL) || (a && b && strcmp(a, b) == 0); }
 
+/* 0.6.1, the signer import writes only the DNSSEC rows that differ.  A row as the comparison sees it: what a row of the database holds (owner, type, text of the
+ * RDATA, TTL, priority, ordername, auth, disabled) against what the importer would write for the file's row.  Two rows are the same when every field is: then the row
+ * stays as it is (no DELETE, no INSERT, no trigger, no row in the change log, no audit row).  A difference in how the text is spelled only makes a row "different",
+ * which is the old behaviour (replaced), never a wrong one. */
+typedef struct { const char *owner, *type, *content, *ordername; int64_t ttl, prio; int64_t id; size_t idx; bool auth, dis; } dkey_t;
+
+/* names: case does not matter, one final dot does not either (the database side is kept without it) */
+static int zi_name_cmp(const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b);
+    if (la && a[la - 1] == '.' && la > 1) la--;
+    if (lb && b[lb - 1] == '.' && lb > 1) lb--;
+    size_t m = la < lb ? la : lb;
+    for (size_t i = 0; i < m; i++) {
+        int ca = tolower((unsigned char)a[i]), cb = tolower((unsigned char)b[i]);
+        if (ca != cb) return ca < cb ? -1 : 1;
+    }
+    return la == lb ? 0 : la < lb ? -1 : 1;
+}
+
+static int zi_cmp_dkey(const void *x, const void *y) {
+    const dkey_t *a = x, *b = y;
+    int c;
+    if ((c = zi_name_cmp(a->owner, b->owner)) != 0) return c;
+    if ((c = strcasecmp(a->type, b->type)) != 0) return c < 0 ? -1 : 1;
+    if ((c = strcmp(a->content, b->content)) != 0) return c < 0 ? -1 : 1;
+    if (a->ttl != b->ttl) return a->ttl < b->ttl ? -1 : 1;
+    if (a->prio != b->prio) return a->prio < b->prio ? -1 : 1;
+    if (a->ordername != b->ordername) {
+        if (!a->ordername || !b->ordername) return a->ordername ? 1 : -1;
+        if ((c = strcmp(a->ordername, b->ordername)) != 0) return c < 0 ? -1 : 1;
+    }
+    if (a->auth != b->auth) return a->auth ? 1 : -1;
+    if (a->dis != b->dis) return a->dis ? 1 : -1;
+    return 0;
+}
+
+/* the metadata kinds the signer owns, as the zone has them: how many rows of each kind and whether its value is the wanted one */
+typedef struct { int n[3]; bool same[3]; const char *const *want; } zi_meta_have_t;
+static int zi_cb_meta_have(void *ud, const db_meta_row_t *m) {
+    zi_meta_have_t *h = ud;
+    static const char *const kinds[3] = { "PRESIGNED", "NSEC3PARAM", "X-KARIDNS-SIGNER" };
+    for (int k = 0; k < 3; k++)
+        if (m->kind && strcasecmp(m->kind, kinds[k]) == 0) {
+            h->n[k]++;
+            h->same[k] = m->content && h->want[k] && strcmp(m->content, h->want[k]) == 0;
+        }
+    return 0;
+}
+
 /* the status of a failed step of the signer's transaction: a concurrent change is "the zone changed" (the signer signs again), the rest a failure */
 static int zi_sfail(zi_t *z, const char *what, int rc, const char *shown, const char *zone) {
     if (rc == DB_ERR_CONFLICT) {
@@ -1788,6 +1837,8 @@ static int zi_apply_signer(zi_t *z, zrows_t *rows, zone_arena_t *farena, const c
     db_order_t *ords = NULL;
     size_t nords = 0;
     db_ins_t *ins = NULL;
+    dkey_t *da = NULL, *fa = NULL;                      /* the DNSSEC rows of the database / of the file, for the comparison */
+    size_t nda = 0, nins = 0;
     char why[400];
     char zone[DNS_NAME_TEXT_SIZE];
     int rc;
@@ -1881,10 +1932,13 @@ static int zi_apply_signer(zi_t *z, zrows_t *rows, zone_arena_t *farena, const c
     del_ids = malloc((db.n ? db.n : 1) * sizeof(*del_ids));
     va = malloc((db.n ? db.n : 1) * sizeof(*va));
     ords = malloc((db.n ? db.n : 1) * sizeof(*ords));
-    if (!del_ids || !va || !ords) goto oom;
+    da = malloc((db.n ? db.n : 1) * sizeof(*da));
+    if (!del_ids || !va || !ords || !da) goto oom;
     for (size_t i = 0; i < db.n; i++) {
         const dbrec_t *r = &db.v[i];
         if (zi_managed_type(r->type)) {
+            const dbauth_t *ca = bsearch(&r->id, au.v, au.n, sizeof(*au.v), zi_cmp_auth_id);
+            da[nda++] = (dkey_t){ r->owner, r->type, r->content, r->ordername, r->ttl, r->prio, r->id, 0, ca ? ca->auth : true, r->disabled };
             del_ids[ndel++] = r->id;
             if (!r->disabled) va[nva++] = (rrv_t){ r->owner, r->type, r->content, r->ttl < 0 ? 0 : r->ttl, r->prio < 0 ? 0 : r->prio, 0, false };
         } else if (!r->disabled && strcmp(r->type, "SOA") == 0 && strcmp(r->owner, rows->zone) == 0) {
@@ -1969,14 +2023,36 @@ static int zi_apply_signer(zi_t *z, zrows_t *rows, zone_arena_t *farena, const c
     vb = malloc((nfdn ? nfdn : 1) * sizeof(*vb));
     ins = malloc((nfdn ? nfdn : 1) * sizeof(*ins));
     if (!vb || !ins) goto oom;
+    fa = malloc((nfdn ? nfdn : 1) * sizeof(*fa));
+    if (!fa) goto oom;
     for (size_t k = 0; k < nfdn; k++) {
         const db_record_row_t *r = &rows->rows[fdn[k]];
+        const bool fauth = !rows->auth || rows->auth[fdn[k]] != 0;
         vb[k] = (rrv_t){ r->name, r->type, r->content ? r->content : "", r->ttl_null ? -1 : r->ttl, r->prio_null ? 0 : r->prio, 0, false };
-        ins[k] = (db_ins_t){ r, !rows->auth || rows->auth[fdn[k]] != 0 };
+        fa[k] = (dkey_t){ r->name, r->type, r->content ? r->content : "", r->ordername, r->ttl_null ? -1 : r->ttl, r->prio_null ? -1 : r->prio, 0, fdn[k], fauth, false };
     }
     if (!zi_diff(va, nva, vb, nfdn, z->o.report != NULL, &items, &nitems, res)) goto oom;
+    /* Only the rows that differ are written: both sides sorted by every field, then one walk; a row on both sides stays, a row only in the database goes (a disabled
+     * one too: it never equals a row of the file), a row only in the file is inserted.  The result is the rows of the file, as before. */
+    qsort(da, nda, sizeof(*da), zi_cmp_dkey);
+    qsort(fa, nfdn, sizeof(*fa), zi_cmp_dkey);
+    ndel = 0;
+    for (size_t i = 0, j = 0; i < nda || j < nfdn;) {
+        const int c = i >= nda ? 1 : j >= nfdn ? -1 : zi_cmp_dkey(&da[i], &fa[j]);
+        if (c == 0) {
+            i++;
+            j++;
+        } else if (c < 0) {
+            del_ids[ndel++] = da[i++].id;
+        } else {
+            ins[nins++] = (db_ins_t){ &rows->rows[fa[j].idx], fa[j].auth };
+            j++;
+        }
+    }
+    free(da); da = NULL;
+    free(fa); fa = NULL;
     res->records_deleted = ndel;
-    res->records_inserted = nfdn;
+    res->records_inserted = nins;
     res->has_expire = true;
     res->min_expire = zi_time_near(exp_best, z->o.now ? z->o.now : time(NULL));
 
@@ -1988,7 +2064,7 @@ static int zi_apply_signer(zi_t *z, zrows_t *rows, zone_arena_t *farena, const c
 
     /* ---- writes ---- */
     if (ndel && (rc = d->w_delete_dnssec(c, zf.id, del_ids, ndel)) != 0) ZI_SFAIL("deleting the DNSSEC records", rc);
-    if (nfdn && (rc = d->w_insert_dnssec(c, zf.id, ins, nfdn)) != 0) ZI_SFAIL("inserting the DNSSEC records", rc);
+    if (nins && (rc = d->w_insert_dnssec(c, zf.id, ins, nins)) != 0) ZI_SFAIL("inserting the DNSSEC records", rc);
     /* the apex SOA with its new serial, and the ordername and auth of the records that stay, as a presigned zone has them */
     if ((rc = d->w_update_record(c, zf.id, soa_d->id, soa_new, rows->rows[isoa_f].ordername, !rows->auth || rows->auth[isoa_f] != 0)) != 0) ZI_SFAIL("updating the SOA record", rc);
     res->rows_updated++;
@@ -2010,15 +2086,27 @@ static int zi_apply_signer(zi_t *z, zrows_t *rows, zone_arena_t *farena, const c
     if (nords && (rc = d->w_update_orders(c, zf.id, ords, nords)) != 0) ZI_SFAIL("updating ordername and auth", rc);
     res->rows_updated += nords;
 
-    /* the metadata the signer owns */
-    if (d->w_delete_meta(c, zf.id, "PRESIGNED") != 0 || d->w_delete_meta(c, zf.id, "NSEC3PARAM") != 0 || d->w_delete_meta(c, zf.id, "X-KARIDNS-SIGNER") != 0) {
-        zi_dbfail(z, "deleting metadata");
-        goto out;
-    }
-    if (d->w_insert_meta(c, zf.id, "PRESIGNED", "1") != 0 || (rows->nsec3param && d->w_insert_meta(c, zf.id, "NSEC3PARAM", rows->nsec3param) != 0) ||
-        d->w_insert_meta(c, zf.id, "X-KARIDNS-SIGNER", "1") != 0) {
-        zi_dbfail(z, "inserting metadata");
-        goto out;
+    /* the metadata the signer owns: a kind that is there once with the value the file asks for is left alone (0.6.1: no change-log row for nothing) */
+    {
+        static const char *const kinds[3] = { "PRESIGNED", "NSEC3PARAM", "X-KARIDNS-SIGNER" };
+        const char *want[3] = { "1", rows->nsec3param, "1" };
+        zi_meta_have_t have = { { 0, 0, 0 }, { false, false, false }, want };
+        if (d->scan_metadata(c, &zf.id, zi_cb_meta_have, &have) != 0) {
+            zi_dbfail(z, "reading metadata");
+            goto out;
+        }
+        for (int k = 0; k < 3; k++) {
+            if (have.n[k] == 1 && have.same[k] && want[k]) continue;
+            if (have.n[k] == 0 && !want[k]) continue;
+            if (have.n[k] && d->w_delete_meta(c, zf.id, kinds[k]) != 0) {
+                zi_dbfail(z, "deleting metadata");
+                goto out;
+            }
+            if (want[k] && d->w_insert_meta(c, zf.id, kinds[k], want[k]) != 0) {
+                zi_dbfail(z, "inserting metadata");
+                goto out;
+            }
+        }
     }
     if (z->o.reload) {
         if (z->si.has_reload_requests) {
@@ -2081,6 +2169,8 @@ out:
     zi_crrs_free(&dbr);
     zi_crrs_free(&fir);
     free(ins);
+    free(da);
+    free(fa);
     free(ords);
     free(soa_new);
     free(items);

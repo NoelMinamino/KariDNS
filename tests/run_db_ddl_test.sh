@@ -208,6 +208,30 @@ else
     # the log of a database that is pruned: the next seq goes on from the last one (AUTOINCREMENT), never reuses a number
     sq "INSERT INTO domains (id, name, type) VALUES (13, 'p13.test', 'NATIVE')"
     [ "$(sq 'SELECT max(seq) FROM karidns_changes')" = "13" ] && pass "seq 13 follows 12" || fail "seq after prune"
+
+    # 0.6.1: the monitoring view of the signer (karidns_signer_monitor): the zones of the signer, one row each, with the status of the first rule that applies
+    DB=$T/mon.db
+    sq < "$SCHEMA" > /dev/null
+    sq < "$EXT" && sq < "$EXT" && pass "the view is made again when the file is applied again" || fail "the ext file does not apply twice (the view)"
+    sq "INSERT INTO domains (id, name, type) VALUES (1, 'ok.test', 'NATIVE'), (2, 'expired.test', 'NATIVE'), (3, 'failing.test', 'NATIVE'), (4, 'overdue.test', 'NATIVE'), (5, 'soon.test', 'NATIVE'),
+            (6, 'new.test', 'NATIVE'), (7, 'plain.test', 'NATIVE'), (8, 'off.test', 'NATIVE'), (9, 'both.test', 'NATIVE');
+        INSERT INTO domainmetadata (domain_id, kind, content) VALUES (1, 'X-KARIDNS-SIGNER', '1'), (2, 'X-KARIDNS-SIGNER', '1'), (3, 'X-KARIDNS-SIGNER', '1'), (4, 'X-KARIDNS-SIGNER', '1'),
+            (5, 'X-KARIDNS-SIGNER', '1'), (6, 'X-KARIDNS-SIGNER', '1'), (8, 'X-KARIDNS-SIGNER', '0'), (9, 'X-KARIDNS-SIGNER', '1'), (9, 'X-KARIDNS-SIGNER', '1');
+        INSERT INTO karidns_signer_state (domain_id, signed_at, signed_serial, min_expire, next_due, attempts, last_error) VALUES
+            (1, strftime('%s','now'), 5, strftime('%s','now') + 864000, strftime('%s','now') + 86400, 0, NULL),
+            (2, strftime('%s','now') - 90000, 5, strftime('%s','now') - 100, strftime('%s','now') - 50000, 0, NULL),
+            (3, strftime('%s','now'), 5, strftime('%s','now') + 864000, strftime('%s','now') + 60, 3, 'dnssec-signzone failed'),
+            (4, strftime('%s','now'), 5, strftime('%s','now') + 864000, strftime('%s','now') - 7200, 0, NULL),
+            (5, strftime('%s','now'), 5, strftime('%s','now') + 3600, strftime('%s','now') + 60, 0, NULL),
+            (9, strftime('%s','now'), 5, strftime('%s','now') - 5, strftime('%s','now') - 7200, 2, 'x')"
+    want="ok.test=ok expired.test=expired failing.test=failing overdue.test=overdue soon.test=expiring new.test=unsigned both.test=expired"
+    got=$(sq "SELECT group_concat(zone || '=' || status, ' ') FROM (SELECT * FROM karidns_signer_monitor ORDER BY domain_id)")
+    [ "$got" = "$want" ] && pass "the monitoring view: one row per signer zone (not plain.test, not off.test, not twice); ok, expired, failing, overdue, expiring, unsigned; expired first" ||
+        fail "the monitoring view: got '$got'"
+    [ "$(sq "SELECT seconds_to_expiry BETWEEN 863990 AND 864000 FROM karidns_signer_monitor WHERE zone = 'ok.test'")" = "1" ] &&
+        [ "$(sq "SELECT seconds_to_expiry < 0 FROM karidns_signer_monitor WHERE zone = 'expired.test'")" = "1" ] &&
+        [ "$(sq "SELECT seconds_to_expiry IS NULL FROM karidns_signer_monitor WHERE zone = 'new.test'")" = "1" ] &&
+        pass "...seconds_to_expiry is min_expire - now (negative when expired, NULL without a state row)" || fail "seconds_to_expiry"
 fi
 
 # ================================================================ PostgreSQL
@@ -411,6 +435,28 @@ else
             fail "log rows: home $(pq "SELECT count(*) FROM karidns_ddl_home.karidns_changes"), decoy $(pq "SELECT count(*) FROM karidns_ddl_decoy.karidns_changes")"
         [ "$(pq "SELECT count(*) FROM pg_proc WHERE proname LIKE 'karidns\_%' AND pronamespace = 'karidns_ddl_home'::regnamespace AND proconfig IS NULL")" = "0" ] && pass "every karidns_* function pins its search_path" || fail "unpinned functions"
         pq "DROP SCHEMA karidns_ddl_home CASCADE; DROP SCHEMA karidns_ddl_decoy CASCADE" >/dev/null
+
+        # 0.6.1: the monitoring view of the signer (karidns_signer_monitor), as in the SQLite3 part
+        pq "INSERT INTO domains (id, name, type) VALUES (901, 'ok.test', 'NATIVE'), (902, 'expired.test', 'NATIVE'), (903, 'failing.test', 'NATIVE'), (904, 'overdue.test', 'NATIVE'), (905, 'soon.test', 'NATIVE'),
+                (906, 'new.test', 'NATIVE'), (907, 'plain.test', 'NATIVE'), (908, 'off.test', 'NATIVE'), (909, 'both.test', 'NATIVE');
+            INSERT INTO domainmetadata (domain_id, kind, content) VALUES (901, 'X-KARIDNS-SIGNER', '1'), (902, 'X-KARIDNS-SIGNER', '1'), (903, 'X-KARIDNS-SIGNER', '1'), (904, 'X-KARIDNS-SIGNER', '1'),
+                (905, 'X-KARIDNS-SIGNER', '1'), (906, 'X-KARIDNS-SIGNER', '1'), (908, 'X-KARIDNS-SIGNER', '0'), (909, 'X-KARIDNS-SIGNER', '1'), (909, 'X-KARIDNS-SIGNER', '1');
+            INSERT INTO karidns_signer_state (domain_id, signed_at, signed_serial, min_expire, next_due, attempts, last_error) VALUES
+                (901, now(), 5, now() + interval '10 days', now() + interval '1 day', 0, NULL),
+                (902, now() - interval '25 hours', 5, now() - interval '100 seconds', now() - interval '14 hours', 0, NULL),
+                (903, now(), 5, now() + interval '10 days', now() + interval '1 minute', 3, 'dnssec-signzone failed'),
+                (904, now(), 5, now() + interval '10 days', now() - interval '2 hours', 0, NULL),
+                (905, now(), 5, now() + interval '1 hour', now() + interval '1 minute', 0, NULL),
+                (909, now(), 5, now() - interval '5 seconds', now() - interval '2 hours', 2, 'x')" > /dev/null
+        want="ok.test=ok expired.test=expired failing.test=failing overdue.test=overdue soon.test=expiring new.test=unsigned both.test=expired"
+        got=$(pq "SELECT string_agg(zone || '=' || status, ' ' ORDER BY domain_id) FROM karidns_signer_monitor")
+        [ "$got" = "$want" ] && pass "the monitoring view: one row per signer zone (not plain.test, not off.test, not twice); ok, expired, failing, overdue, expiring, unsigned; expired first" ||
+            fail "the monitoring view: got '$got'"
+        [ "$(pq "SELECT seconds_to_expiry BETWEEN 863990 AND 864000 FROM karidns_signer_monitor WHERE zone = 'ok.test'")" = "t" ] &&
+            [ "$(pq "SELECT seconds_to_expiry < 0 FROM karidns_signer_monitor WHERE zone = 'expired.test'")" = "t" ] &&
+            [ "$(pq "SELECT seconds_to_expiry IS NULL FROM karidns_signer_monitor WHERE zone = 'new.test'")" = "t" ] &&
+            pass "...seconds_to_expiry is min_expire - now (negative when expired, NULL without a state row)" || fail "seconds_to_expiry"
+        pq "DELETE FROM domains WHERE id >= 901" > /dev/null
 
         # the real PowerDNS schema, if it can be found
         PDNS_PG=${PDNS_SCHEMA_PGSQL:-/usr/local/share/doc/pdns/schema.pgsql.sql}

@@ -269,7 +269,11 @@ export async function tokenCreate(ctx) {
   const secret = randomToken(32);
   const now = app.now();
   const id = await ctx.db(async (tx) => {
-    if (principalId !== auth.principal.id && !(await S.getPrincipal(tx, principalId))) throw notFound('no such principal');
+    if (principalId !== auth.principal.id) {
+      const p = await S.getPrincipal(tx, principalId);
+      if (!p) throw notFound('no such principal');
+      if (p.kind !== 'user') throw conflict('only a user signs in, so only a user has tokens', 'not-a-user');       // (a token of a group would be a login nobody can account for)
+    }
     return S.createToken(tx, { principalId, name: body.name, secretHash: tokenHash(secret), readOnly: body.read_only ?? false, createdMs: now, expiresMs: now + (body.days ?? 90) * 86400000 });
   }, { write: true });
   const t = await ctx.db((tx) => S.getToken(tx, id));

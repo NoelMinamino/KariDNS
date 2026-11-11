@@ -63,13 +63,15 @@ export function parseNsec3param(text) {
   return m ? { iterations: Number(m[1]), salt: m[2] } : null;
 }
 
-// dnssec-signzone.  mode: 'csk' (-z: the KSK-flag keys sign everything) or 'split' (-x: only the KSKs sign the DNSKEY RRset);
+// dnssec-signzone.  -u (0.6.1): the input carries the signatures over the NSEC / NSEC3 chain (karidns-zone export --signer keeps them), and -u builds the chain again from
+// the parameters given here (so a new salt, opt-out or NSEC <-> NSEC3 takes effect; without -u dnssec-signzone refuses a chain with a different salt) while keeping every
+// signature that still verifies; the rows that come out equal are then not written again by import --signer.  mode: 'csk' (-z: the KSK-flag keys sign everything) or 'split' (-x: only the KSKs sign the DNSKEY RRset);
 // nsec3: null (NSEC) or { salt, iterations, optOut }.  -i is refresh + jitter, so that the run which the scheduler places up to `jitter` before the
 // refresh point re-signs the signatures that are due (scheduler.js); -R drops the signatures of keys that are gone from the zone (a retired key, still published, keeps the signatures it made until they expire; -Q would drop them but also those of keys whose files carry no timing metadata, and signs everything again every run).
 export function signzoneArgv({ zone, dir, inFile, outFile, validity, refresh, jitter, verify, mode, nsec3, keyStems }) {
   for (const n of [validity, refresh, jitter]) if (!Number.isInteger(n) || n < 0) throw new Error('bad signature timing');
   const a = ['-q', '-o', canonicalZone(zone), '-f', outFile, '-O', 'full', '-K', dir, '-d', dir,
-    '-e', `now+${validity}`, '-i', String(refresh + jitter), '-j', String(jitter), '-N', 'increment', '-R'];
+    '-e', `now+${validity}`, '-i', String(refresh + jitter), '-j', String(jitter), '-N', 'increment', '-R', '-u'];
   if (nsec3) {
     if (!/^(-|([0-9a-fA-F]{2}){1,255})$/.test(nsec3.salt) || !Number.isInteger(nsec3.iterations) || nsec3.iterations < 0 || nsec3.iterations > 65535) throw new Error('bad NSEC3 parameters');
     a.push('-3', nsec3.salt, '-H', String(nsec3.iterations));

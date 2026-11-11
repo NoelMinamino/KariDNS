@@ -245,6 +245,24 @@ test('the change log: position, new rows only, a pruned log is a gap', async () 
   } finally { t.done(); }
 });
 
+test('the change log is read in batches: `more` says the batch was full (0.6.1)', async () => {
+  const t = fresh();
+  try {
+    t.raw.exec('DELETE FROM karidns_changes');
+    t.raw.exec('DELETE FROM sqlite_sequence');
+    t.raw.exec('INSERT INTO karidns_changes (domain_id, changed_at) VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)');
+    assert.equal(t.db.changesBatch, 20000);
+    t.db.changesBatch = 2;
+    const a = await t.db.changesSince(0);
+    assert.deepEqual([a.rows.map((x) => x.seq), a.cursor, a.more], [[1, 2], 2, true]);
+    const b = await t.db.changesSince(a.cursor);
+    assert.deepEqual([b.rows.map((x) => x.seq), b.cursor, b.more], [[3, 4], 4, true]);
+    const c = await t.db.changesSince(b.cursor);
+    assert.deepEqual([c.rows.map((x) => x.seq), c.cursor, c.more], [[5], 5, false]);
+    assert.equal((await t.db.changesSince(5)).more, false);
+  } finally { t.done(); }
+});
+
 test('locks are the lock file, waiting is a sleep', async () => {
   const t = fresh();
   try {
