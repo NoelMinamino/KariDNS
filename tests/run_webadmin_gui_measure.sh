@@ -92,6 +92,7 @@ kill -TERM "$SRV" 2>/dev/null
 i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
 kill -0 "$SRV" 2>/dev/null && { bad "the server did not stop after SIGTERM"; kill -KILL "$SRV" 2>/dev/null; } || { wait "$SRV" 2>/dev/null; ok "the server stops on SIGTERM"; }
 SRV=""
+_w=0; while [ $_w -lt 50 ] && pgrep -f "$T" > /dev/null 2>&1; do sleep 0.1; _w=$((_w + 1)); done   # a process that was just killed may take a moment to go
 if pgrep -f "$T" > /dev/null 2>&1; then bad "a process of the test is still running" "$(pgrep -fl "$T")"; else ok "no process of the browser is left"; fi
 echo
 echo "=== run_webadmin_gui_measure: $FAILS failed, $PASS passed ==="

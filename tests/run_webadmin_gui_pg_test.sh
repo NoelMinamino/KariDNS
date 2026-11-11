@@ -180,6 +180,7 @@ if kill -0 "$WEB" 2>/dev/null; then bad "the API did not stop after SIGTERM"; ki
 WEB=""
 grep -q "ERROR\|assertion\|Assertion" "$T/karidns.log" && bad "karidns logged an error" "$(grep 'ERROR\|ssertion' "$T/karidns.log" | head -3)" || ok "karidns logged no error"
 kari_kill_tree "$SRV"; SRV=""
+_w=0; while [ $_w -lt 50 ] && pgrep -f "$T" > /dev/null 2>&1; do sleep 0.1; _w=$((_w + 1)); done   # a process that was just killed may take a moment to go
 if pgrep -f "$T" > /dev/null 2>&1; then bad "a process of the test is still running" "$(pgrep -fl "$T")"; else ok "no process of the test is left"; fi
 grep -q "(a bug)" "$T/server.log" && bad "row level security refused what the API had allowed" "$(grep '(a bug)' "$T/server.log" | head -3)" || ok "row level security never disagreed with the API"
 grep -Eq '^[^ ]+ error ' "$T/server.log" && bad "the API logged an error" "$(grep ' error ' "$T/server.log" | head -3)" || ok "the API logged no error"

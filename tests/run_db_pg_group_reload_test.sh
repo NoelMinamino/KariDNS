@@ -107,13 +107,16 @@ pq "BEGIN;
 CHG=$(pq "SELECT count(DISTINCT domain_id) FROM karidns_changes WHERE seq > $BASE")
 [ "$CHG" = "$CH" ] && pass "the change log lists $CH zones" || fail "the change log lists '$CHG' zones, want $CH"
 
+# the batch that answers the reload, not an earlier batch of the change log: its line ends in "(answers a request)".  Waiting for
+# any "(diff) sent" line took an earlier batch, and the answer of this reload then came after the count of the second reload below.
+RQ="\[DB\] batch [0-9]* (diff) sent.*(answers a request)"
+before=$(grep -c "$RQ" "$LOG")
 $KCTL reload > "$T/reload.out" 2>&1
-i=0; while [ $i -lt 600 ]; do grep -Eq "\[DB\] batch [0-9]+ \(diff\) sent" "$LOG" && break; sleep 0.1; i=$((i + 1)); done
-sleep 1
-grep "\[DB\] batch [0-9]* (diff) sent" "$LOG" | tail -1 | sed 's/^/         /'
+i=0; while [ $i -lt 600 ]; do [ "$(grep -c "$RQ" "$LOG")" -gt "$before" ] && break; sleep 0.1; i=$((i + 1)); done
+grep "$RQ" "$LOG" | tail -1 | sed 's/^/         /'
 # the zone of id 150 (SLAVE) is read (its metadata) but sends nothing as a primary; id 200 is a ZONE_DELETE
-if grep "\[DB\] batch [0-9]* (diff) sent" "$LOG" | tail -1 | grep -Eq "(159|160|161) zone\(s\) read"; then pass "the batch read the $CH changed zones, not $N"; else fail "the batch did not read about $CH zones"; fi
-grep "\[DB\] batch [0-9]* (diff) sent" "$LOG" | tail -1 | grep -q " 1 deleted" && pass "the deleted zone went as ZONE_DELETE" || fail "no ZONE_DELETE in the batch"
+if grep "$RQ" "$LOG" | tail -1 | grep -Eq "(159|160|161) zone\(s\) read"; then pass "the batch read the $CH changed zones, not $N"; else fail "the batch did not read about $CH zones"; fi
+grep "$RQ" "$LOG" | tail -1 | grep -q " 1 deleted" && pass "the deleted zone went as ZONE_DELETE" || fail "no ZONE_DELETE in the batch"
 
 for i in 99 100 101 127 128 129 130 140 149 151 227 228 229 230 258 259 260 261; do
     if [ "$i" -ge 100 ] && [ "$i" -le 259 ]; then want=192.0.2.201; else want=192.0.2.$((i % 200 + 1)); fi
@@ -132,11 +135,10 @@ SERIAL=$(./dag @127.0.0.1 -p $PORT g106.test SOA +short +nohexdump 2>/dev/null |
 [ "$SERIAL" = "1" ] && pass "g106 (www changed, serial kept) serves SOA serial 1" || fail "g106 serves SOA serial '$SERIAL'"
 
 # nothing changed: nothing is read, nothing is sent
-before=$(grep -c "\[DB\] batch [0-9]* (diff) sent" "$LOG")
+before=$(grep -c "$RQ" "$LOG")
 $KCTL reload > "$T/reload2.out" 2>&1
-i=0; while [ $i -lt 300 ]; do [ "$(grep -c "\[DB\] batch [0-9]* (diff) sent" "$LOG")" -gt "$before" ] && break; sleep 0.1; i=$((i + 1)); done
-sleep 0.5
-if grep "\[DB\] batch [0-9]* (diff) sent" "$LOG" | tail -1 | grep -q " 0 zone(s) read, 0 sent"; then pass "a second reload reads and sends nothing"; else fail "the second reload read zones"; grep "\[DB\] batch [0-9]* (diff) sent" "$LOG" | tail -1 | sed 's/^/         /'; fi
+i=0; while [ $i -lt 300 ]; do [ "$(grep -c "$RQ" "$LOG")" -gt "$before" ] && break; sleep 0.1; i=$((i + 1)); done
+if grep "$RQ" "$LOG" | tail -1 | grep -q " 0 zone(s) read, 0 sent"; then pass "a second reload reads and sends nothing"; else fail "the second reload read zones"; grep "$RQ" "$LOG" | tail -1 | sed 's/^/         /'; fi
 
 echo "=== run_db_pg_group_reload_test: $PASS passed, $FAILS failed ==="
 [ "$FAILS" -eq 0 ]
