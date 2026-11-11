@@ -949,13 +949,6 @@ static void fz_report(const fz_t *f, const uint16_t *views, size_t nv, char *out
 
 static bool names_equal(const char *a, const char *b);
 
-static void zinfo_free_strings(zinfo_t *z) {
-    free(z->name);
-    free(z->type);
-    free(z->master);
-    free(z->canon);
-}
-
 static int zone_cb(void *ud, const db_zone_row_t *r) {
     ctx_t *x = ud;
     if (x->only_name && !(r->name && names_equal(r->name, x->only_name))) return 0;
@@ -972,22 +965,12 @@ static int zone_cb(void *ud, const db_zone_row_t *r) {
     z->name = r->name ? strdup(r->name) : NULL;
     z->type = r->type ? strdup(r->type) : NULL;
     z->master = r->master ? strdup(r->master) : NULL;
-    if ((r->name && !z->name) || (r->type && !z->type) || (r->master && !z->master)) {
-        free(z->name);
-        free(z->type);
-        free(z->master);
-        return x->oom = true;
-    }
+    if ((r->name && !z->name) || (r->type && !z->type) || (r->master && !z->master)) goto oom;
     if (x->io) {                                     /* stream mode: the diff needs the canonical name and the serial */
         char canon[DNS_NAME_TEXT_SIZE];
         if (pdns_canonical_zone_name(z->name, canon)) {
             z->canon = strdup(canon);
-            if (!z->canon) {
-                free(z->name);
-                free(z->type);
-                free(z->master);
-                return x->oom = true;
-            }
+            if (!z->canon) goto oom;
         }
         z->has_serial = r->soa_content && pdns_soa_serial(r->soa_content, &z->serial);
         z->has_timers = r->soa_content && pdns_soa_timers(r->soa_content, &z->t_refresh, &z->t_retry, &z->t_expire);
@@ -996,22 +979,22 @@ static int zone_cb(void *ud, const db_zone_row_t *r) {
         if (x->chk_ncat >= x->chk_ccat) {
             size_t nc = x->chk_ccat ? x->chk_ccat * 2 : 256;
             char **ncat = realloc(x->chk_cat, nc * sizeof(*ncat));
-            if (!ncat) {
-                zinfo_free_strings(z);
-                return x->oom = true;
-            }
+            if (!ncat) goto oom;
             x->chk_cat = ncat;
             x->chk_ccat = nc;
         }
         x->chk_cat[x->chk_ncat] = r->catalog ? strdup(r->catalog) : NULL;
-        if (r->catalog && !x->chk_cat[x->chk_ncat]) {
-            zinfo_free_strings(z);
-            return x->oom = true;
-        }
+        if (r->catalog && !x->chk_cat[x->chk_ncat]) goto oom;
         x->chk_ncat++;
     }
     x->nz++;
     return x->only_name ? 1 : 0;                    /* one zone wanted: stop after it (names are unique) */
+oom:                                                 /* the strings of this zone (not counted in nz yet; canon is NULL unless it was made) */
+    free(z->name);
+    free(z->type);
+    free(z->master);
+    free(z->canon);
+    return x->oom = true;
 }
 
 /* 0.6.0 item C: the zones a one-zone reload has read up to a change log position (vstate_t.cov).  A row is covered when it is in what the reload read: SQLite3 the
