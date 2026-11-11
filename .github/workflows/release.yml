@@ -72,7 +72,7 @@ jobs:
             pkg delete -y pkgconf
             pkg add dist/karidns-*.pkg
             pkg info -d karidns
-            for b in /usr/local/sbin/karidns /usr/local/bin/karictl /usr/local/bin/karicheck /usr/local/bin/dag; do
+            for b in /usr/local/sbin/karidns /usr/local/bin/karictl /usr/local/bin/karicheck /usr/local/bin/karidns-tapstat /usr/local/bin/dag; do
               echo "== ldd $b"; ldd "$b"
               if ldd "$b" | grep -E 'lib(crypto|ssl)[.]so' | grep -q '/usr/local/'; then
                 echo "::error::$b links the ports OpenSSL"; exit 1
@@ -88,6 +88,7 @@ jobs:
             test -x /usr/local/sbin/karidns
             test -x /usr/local/bin/karictl
             test -x /usr/local/bin/karicheck
+            test -x /usr/local/bin/karidns-tapstat
             test -x /usr/local/bin/dag
             test -f /usr/local/etc/karidns/karidns.conf.sample
             test -f /usr/local/etc/karidns/zones/example.local.zone.sample

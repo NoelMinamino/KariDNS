@@ -353,6 +353,7 @@ register_test "unit" "bin" "test_zone_import" "ZoneImporter and ZoneExporter of 
 register_test "unit" "bin" "test_db_supervisor" "Database loader supervisor: loader-path checks (missing, not a regular file, writable, not executable, foreign owner), loader-user / loader-group rules, fd 3 stream and SCM_RIGHTS hand-over on restart, cleared environment, restart backoff 1 .. 60 s and its reset after ten minutes, exits and signals, a loader that lost its mode"
 register_test "unit" "bin" "test_dag_iter" "dag +trace2 response classification, bailiwick filtering of glue, truncated-packet sweep, named.root and CLI option parsing"
 register_test "unit" "bin" "test_dnstap_engine" "DNSTAP Protobuf encoder, frame sender & ring buffers"
+register_test "unit" "bin" "test_tapstat" "karidns-tapstat core: Frame Streams reader (handshake, every protocol error, split reads), dnstap decoder, aggregator tables, text/json/prom output"
 register_test "unit" "bin" "test_edns_ecs_engine" "EDNS Cookies, EDE error codes & ECS subnet LPM resolution"
 register_test "unit" "bin" "test_rfc_vectors" "RFC 9018 Server Cookie vectors, SipHash-2-4, RFC 4034 key tag & cookie-secret config"
 register_test "unit" "bin" "test_dynamic_update_engine" "RFC 2136 SOA serial bump & NOTIFY deduplication"
@@ -436,6 +437,7 @@ register_test "catalog" "sh" "tests/run_cve_coo_test.sh" "RFC 9432 CoO tracking 
 
 # 8. DNSTAP Telemetry Logging
 register_test "dnstap" "sh" "tests/run_dnstap_capture_test.sh" "DNSTAP frame streams capture verification"
+register_test "dnstap" "sh" "tests/run_tapstat_test.sh" "karidns-tapstat: file and socket mode, hostile senders, a real karidns dnstap stream aggregated per zone/qname/qtype/rcode/client prefix"
 register_test "core" "sh" "tests/run_server_core_matrix_test.sh" "Server runtime matrix: dual-stack wildcard, IPv6 NOTIFY, TCP misuse, RRL/TC, log rotation, control errors, daemon/CLI, primary+secondary" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
 register_test "core" "sh" "tests/run_server_core_fi_test.sh" "Server fault injection: startup/runtime syscall failures via LD_PRELOAD shim (no crash allowed)" "serial"   # stress, perf, sanitizer, fuzz or its own parallelism
 
@@ -823,7 +825,7 @@ START_TIME=$(date +%s 2>/dev/null || perl -e 'print time')
 # Ensure unit test binaries are built if category 'unit' is active
 if is_category_selected "unit"; then
     echo "${C_CYAN}==> Ensuring unit test binaries are built...${C_RESET}"
-    for _b in test_dns_diag test_vulnerability_fixes test_response_cache test_asan_overflow test_tinydns_parser test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_server_stmt test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_epoch_rcu test_cidr test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_db_pgsql test_db_sqlite3 test_db_stream test_db_registry test_zone_dir test_park test_db_fetch test_park_worker test_pdns_reader test_presigned test_zone_text test_zone_import test_db_supervisor test_dag_iter; do
+    for _b in test_dns_diag test_vulnerability_fixes test_response_cache test_asan_overflow test_tinydns_parser test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_server_stmt test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_epoch_rcu test_cidr test_dnstap_engine test_tapstat test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_db_pgsql test_db_sqlite3 test_db_stream test_db_registry test_zone_dir test_park test_db_fetch test_park_worker test_pdns_reader test_presigned test_zone_text test_zone_import test_db_supervisor test_dag_iter; do
         if [ ! -x "./${_b}" ]; then
             as_user "make ${_b}" >/dev/null 2>&1 || true
         fi
