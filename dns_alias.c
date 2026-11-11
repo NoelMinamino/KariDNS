@@ -492,12 +492,16 @@ bool alias_lookup(uint64_t key, const uint8_t *name, size_t nlen, uint16_t qtype
         if (e->key != key || e->qtype != qtype || e->nlen != nlen || memcmp((const uint8_t *)(e + 1), name, nlen) != 0) continue;
         int64_t age = alias_now() - e->fetched;
         if (age < 0) age = 0;
-        if (age < (int64_t)e->ttl) {
-            out->ttl = (uint32_t)((int64_t)e->ttl - age);
+        int64_t validity = alias_validity(e->ttl);
+        if (age < validity) {
+            /* current data: the rest of the TTL, 0 while a TTL below ALIAS_MIN_REFRESH waits for its refresh (an upstream
+             * TTL of 0 stays 0: the upstream asks not to cache it, and the refresh is due) */
+            out->ttl = age < (int64_t)e->ttl ? (uint32_t)((int64_t)e->ttl - age) : 0;
             out->stale = false;
-        } else if (age < alias_validity(e->ttl) + ALIAS_STALE_MAX) {
-            /* the TTL ran out (also while a TTL below ALIAS_MIN_REFRESH waits for its refresh): stale data, not TTL 0 */
-            out->ttl = e->ttl < ALIAS_STALE_TTL ? e->ttl : ALIAS_STALE_TTL;   /* RFC 8767 section 5: a short TTL for the data served past its time, never above the original TTL (0 stays 0) */
+        } else if (age < validity + ALIAS_STALE_MAX) {
+            /* the refreshes failed past the validity: stale data, served with a TTL greater than 0, RECOMMENDED 30 s
+             * (RFC 8767 section 4) */
+            out->ttl = ALIAS_STALE_TTL;
             out->stale = true;
         } else {
             return false;

@@ -10032,7 +10032,7 @@ static void test_b9a_alias_lua_queries(void) {
     g_b9_now += 400;                                                                                                /* the back-off is over */
     alias_test_pass();
     b9_ask(&z, &cfg, "a.al.test.", 1, &r);          assert(r.rcode == 0 && r.an == 2 && r.ttl[0] == 60);            /* recovered */
-    /* an answer with TTL 0 is never served with a longer TTL when it is served stale (RFC 8767 section 5: the stale TTL is a cap, not a floor) */
+    /* a current upstream answer with TTL 0 is served with TTL 0 (not the stale TTL: it is not stale, its refresh is due) */
     g_b9_ttl0 = 1;
     g_b9_now += 100;
     alias_test_pass();
