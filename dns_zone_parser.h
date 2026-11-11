@@ -13,7 +13,7 @@ typedef struct {
     const char *error_message;
     size_t error_offset;
     size_t token_length;
-    const char *file_path; // 霑ｽ蜉: 縺薙・繧ｨ繝ｩ繝ｼ縺後←縺ｮ繝輔ぃ繧､繝ｫ縺ｧ逋ｺ逕溘＠縺溘°
+    const char *file_path; // the file the error is in (for an $INCLUDE file); NULL = the file the caller parsed
     char detail[512];      // text of error_message when it has to carry a path ($INCLUDE outside the opened directories)
 } parse_error_t;
 
@@ -29,13 +29,12 @@ typedef struct parse_context_s {
     char* (*load_file_cb)(struct parse_context_s *ctx, const char *rel_path, dev_t *out_dev, ino_t *out_ino);
     void *user_data;
 
-    // --- $INCLUDE 逕ｨ縺ｫ霑ｽ蜉 ---
-    char **shared_ttl_io;   // 笘・怙驥崎ｦ・ $TTL縺ｮ譖ｸ縺肴綾縺怜・縲ゅヨ繝・・繝ｬ繝吶Ν蜻ｼ縺ｳ蜃ｺ縺怜・縺・
-                            //   閾ｪ蛻・・繧ｹ繧ｿ繝・け螟画焚縺ｮ繧｢繝峨Ξ繧ｹ繧偵そ繝・ヨ縺励∽ｻ･髯阪・蜀榊ｸｰ
-                            //   蜻ｼ縺ｳ蜃ｺ縺怜・縺ｦ縺ｧ縲悟酔縺倥・繧､繝ｳ繧ｿ縲阪ｒ菴ｿ縺・屓縺吶％縺ｨ縲・
-    char **shared_ecs_tag_io; // $ECS-SUBNET縺ｮ譖ｸ縺肴綾縺怜・ ($TTL縺ｮshared_ttl_io縺ｨ蜷後§謖吝虚)
-    char **shared_loc_tag_io; // $LOCATION縺ｮ譖ｸ縺肴綾縺怜・ ($ECS-SUBNET縺ｮshared_ecs_tag_io縺ｨ蜷後§謖吝虚)
-    char **visited_paths;   // 逾門・繧ｹ繧ｿ繝・け(迴ｾ蝨ｨ縺ｮ蜻ｼ縺ｳ蜃ｺ縺励メ繧ｧ繝ｼ繝ｳ縺ｮ縺ｿ縲∬ｨｪ蝠乗ｸ医∩髮・粋縺ｧ縺ｯ縺ｪ縺・
+    // --- for $INCLUDE ---
+    char **shared_ttl_io;   // important: write-back place of $TTL. The top-level caller sets the address of its own stack variable;
+                            //   every nested (recursive) call must reuse the same pointer.
+    char **shared_ecs_tag_io; // write-back place of $ECS-SUBNET (works like shared_ttl_io)
+    char **shared_loc_tag_io; // write-back place of $LOCATION (works like shared_ecs_tag_io)
+    char **visited_paths;   // stack of ancestors (the current chain of $INCLUDE calls only, not the set of every file visited)
     dev_t *visited_devs;
     ino_t *visited_inos;
     int visited_count;      // スタックの現在の深さ
@@ -52,6 +51,10 @@ typedef struct parse_context_s {
      * その最初のオーナー名 (arena 内の文字列)。all_zone_names が無ければ数えない。 */
     size_t out_of_zone_count;
     const char *first_out_of_zone;
+    /* tinydns: lines whose data cannot be kept and that the parser leaves out on purpose (an SSHFP fingerprint that is not hexadecimal): the
+     * count and the owner of the first (arena string), so that karicheck can warn (review dns_tinydns_parser.c [8]). */
+    size_t skipped_data_count;
+    const char *first_skipped_data;
     /* tinydns: SOA serial に使うデータファイルの mtime (0 = 不明、読み込み時刻を使う)。
      * パーサ自身はファイルを stat しない (X-13: サンドボックス内の再読み込みではパスを使えない)。 */
     time_t source_mtime;
@@ -196,8 +199,8 @@ typedef struct zone_arena_s {
 /* file を arena に登録する ($INCLUDE を含め最大 ZONE_ARENA_MAX_FILES)。失敗は -1 (呼び出し側が buf 等を解放) */
 int zone_arena_add_file(zone_arena_t *arena, char *buf, char *display, char *path);
 /* グルーを含めたゾーンのデータの版 (応答キャッシュの鍵) */
-static inline uint64_t zone_arena_data_generation(const zone_version_t *arena) {
-  return atomic_load_explicit((_Atomic uint64_t *)&arena->generation, memory_order_acquire);
+static inline uint64_t zone_arena_data_generation(const zone_version_t *version) {
+  return atomic_load_explicit((_Atomic uint64_t *)&version->generation, memory_order_acquire);
 }
 
 int parse_zone_fast(char *buf, size_t len, zone_arena_t *arena, parse_context_t *ctx);

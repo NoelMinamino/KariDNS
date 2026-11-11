@@ -254,7 +254,7 @@ pkg add karidns-?.?.?-FreeBSD-14-amd64.pkg
 ```sh
 # Copy sample configuration
 cp /usr/local/etc/karidns/karidns.conf.sample /usr/local/etc/karidns/karidns.conf
-cp /usr/local/etc/karidns/zones/example.local.zone.sample /usr/local/etc/karidns/zones/example.local.zone
+cp /usr/local/etc/karidns/zones/example.test.zone.sample /usr/local/etc/karidns/zones/example.test.zone
 
 # Enable and start daemon
 sysrc karidns_enable="YES"

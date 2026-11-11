@@ -8,6 +8,7 @@
 #include <strings.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#include <time.h>
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -360,12 +361,41 @@ void tsig_check_request_nolog(const server_config_t *cfg, const char *view_name,
     }
 }
 
+/* An unauthenticated client can send bad TSIGs as fast as it likes: the log line of one (client, key, error) is written once a second at most
+ * (a small table of the last time each hash was logged; a collision only costs a line that would have been written), and the lines left out are
+ * counted into the next one. */
+#define TSIG_LOG_SLOTS 64
+typedef struct {
+    _Atomic uint64_t key;
+    _Atomic int64_t sec;
+} tsig_log_slot_t;
+static tsig_log_slot_t g_tsig_log_slots[TSIG_LOG_SLOTS];
+static _Atomic uint64_t g_tsig_log_suppressed;
+
 void tsig_log_request_error(const tsig_request_t *t, const char *client_ip) {
     if (t->status != TSIG_REQ_ERROR && t->status != TSIG_REQ_FORMERR) return;
+    const char *kname = t->status == TSIG_REQ_FORMERR ? "?" : t->key_name;
+    unsigned err = t->status == TSIG_REQ_FORMERR ? 0 : t->error;
+    uint64_t h = 14695981039346656037ULL;
+    for (const char *p = client_ip ? client_ip : "?"; *p; p++) { h ^= (uint8_t)*p; h *= 1099511628211ULL; }
+    h ^= 0xFF; h *= 1099511628211ULL;
+    for (const char *p = kname; *p; p++) { h ^= (uint8_t)*p; h *= 1099511628211ULL; }
+    h ^= err; h *= 1099511628211ULL;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec;
+    tsig_log_slot_t *slot = &g_tsig_log_slots[h % TSIG_LOG_SLOTS];
+    if (atomic_load_explicit(&slot->key, memory_order_relaxed) == h && atomic_load_explicit(&slot->sec, memory_order_relaxed) == now) {
+        atomic_fetch_add_explicit(&g_tsig_log_suppressed, 1, memory_order_relaxed);
+        return;
+    }
+    atomic_store_explicit(&slot->key, h, memory_order_relaxed);
+    atomic_store_explicit(&slot->sec, now, memory_order_relaxed);
+    uint64_t left_out = atomic_exchange_explicit(&g_tsig_log_suppressed, 0, memory_order_relaxed);
     /* RFC 8945 §5.2.1-§5.2.4: the server SHOULD log the error */
     syslog(LOG_INFO, "[TSIG] request from %s with key '%s': %s",
-           client_ip ? client_ip : "?", t->status == TSIG_REQ_FORMERR ? "?" : t->key_name,
-           tsig_error_name(t->status == TSIG_REQ_FORMERR ? 0 : t->error));
+           client_ip ? client_ip : "?", kname, tsig_error_name(err));
+    if (left_out) syslog(LOG_INFO, "[TSIG] %llu similar request error line(s) were left out (at most one per client, key and error a second)", (unsigned long long)left_out);
 }
 
 void tsig_check_request(const server_config_t *cfg, const char *view_name, const uint8_t *req, size_t req_len, const char *client_ip,
@@ -375,7 +405,11 @@ void tsig_check_request(const server_config_t *cfg, const char *view_name, const
 }
 
 size_t tsig_response_reserve(const tsig_request_t *t) {
-    if (!t || !t->key || (t->status != TSIG_REQ_VALID && t->status != TSIG_REQ_ERROR)) return 0;
+    if (!t || (t->status != TSIG_REQ_VALID && t->status != TSIG_REQ_ERROR)) return 0;
+    /* BADKEY / BADSIG answers carry the key name and the algorithm of the request, not of a key the server has (tsig_finish_response() echoes them) */
+    if (t->status == TSIG_REQ_ERROR && (t->error == 16 || t->error == 17))
+        return tsig_rr_wire_size(t->key_name, t->alg_name, t->error);
+    if (!t->key) return 0;
     return tsig_rr_wire_size(t->key->name, t->key->algorithm ? t->key->algorithm : "hmac-sha256",
                              t->status == TSIG_REQ_VALID ? 0 : t->error);
 }
@@ -406,7 +440,8 @@ int tsig_finish_response(uint8_t *res, size_t res_len, size_t max_len, const tsi
         if (tsig_sign_packet_ex(res, &len, max_len, key, error, mac, &mac_len, NULL, 0, false, tp) == 0)
             return (int)len;
         if (attempt == 1) break;
-        /* RFC 8945 §5.3: TSIG が入らなければ、質問と TSIG だけ、TC=1、NOERROR の応答にする */
+        /* RFC 8945 §5.3: TSIG が入らなければ、質問と TSIG だけ、TC=1、RCODE 0 (NOERROR) の応答にする。エラー応答 (BADTIME など、RCODE 9 NOTAUTH)
+         * の TSIG が入らない場合も同じ: §5.3 の文言は区別しておらず、RCODE 0 のまま TSIG の Error フィールドで誤りを伝える (§5.2.3) */
         uint16_t qdcount = (res[4] << 8) | res[5];
         size_t q_end = DNS_HEADER_SIZE;
         for (uint16_t i = 0; i < qdcount; i++) {

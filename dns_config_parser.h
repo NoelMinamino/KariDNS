@@ -12,7 +12,8 @@
 #define KARIDNS_TCP_MSS_MAX      65495               /* 65535 - IPv4/TCP ヘッダ 40 */
 #define KARIDNS_TCP_BUF_MIN      4096
 #define KARIDNS_TCP_BUF_MAX      (64 * 1024 * 1024)
-#define KARIDNS_UDP_BUFSIZE_MIN  512                 /* RFC 6891 §6.2.3 */
+#define KARIDNS_NSID_MAX         128                 /* options { nsid }: octets (RFC 5001 §2.3 puts no limit; a long one would not fit a 512-octet response) */
+#define KARIDNS_UDP_BUFSIZE_MIN  512                /* RFC 6891 §6.2.3 */
 #define KARIDNS_UDP_BUFSIZE_MAX  4096
 #define KARIDNS_UDP_BUFSIZE_DEFAULT 1232             /* DNS Flag Day 2020 */
 
@@ -96,6 +97,36 @@ typedef struct {
   int exempt_clients_count;
   cidr_entry_t *exempt_clients_parsed;
 } rate_limit_config_t;
+
+/* KariDNS alerts { } (options and zone): thresholds the control thread compares with the counters (0.6.1).  The statement names are
+ * the alert names of the log messages.  `interval` and `reload-failures-above` exist in options { } only. */
+typedef enum {
+  ALERT_QPS_ABOVE = 0,                /* queries per second over the interval */
+  ALERT_SERVFAIL_RATIO_ABOVE,         /* SERVFAIL responses as a percentage of the responses of the interval */
+  ALERT_RRL_DROPS_ABOVE,              /* responses dropped by rate-limit in the interval */
+  ALERT_TRANSFER_FAILURES_ABOVE,      /* inbound zone refreshes that failed at every primary in the interval */
+  ALERT_RELOAD_FAILURES_ABOVE,        /* configuration reloads that failed (or left zones unloaded) in the interval; server-wide only */
+  ALERT_KIND_COUNT
+} alert_kind_t;
+#define ALERT_INTERVAL_DEFAULT 60
+#define ALERT_INTERVAL_MIN 10
+#define ALERT_INTERVAL_MAX 3600
+typedef struct {
+  bool configured;                    /* an alerts { } block was written */
+  uint32_t interval;                  /* seconds between two checks (options only); 0 = ALERT_INTERVAL_DEFAULT */
+  bool set[ALERT_KIND_COUNT];
+  double limit[ALERT_KIND_COUNT];
+} alerts_config_t;
+const char *alert_kind_name(alert_kind_t k);
+bool alert_kind_in_zone(alert_kind_t k);   /* may a zone { alerts { } } block name it */
+/* The limits one check compares with.  A zone's: its own alerts { } statement of the name, else the options one (reload-failures-above is
+ * server-wide only).  The server's: the options block. */
+typedef struct {
+  bool set[ALERT_KIND_COUNT];
+  double limit[ALERT_KIND_COUNT];
+} alert_limits_t;
+void alert_limits_for_zone(const alerts_config_t *opts, const alerts_config_t *zone, alert_limits_t *out);
+void alert_limits_for_server(const alerts_config_t *opts, alert_limits_t *out);
 
 typedef enum {
   ADDITIONAL_AUTH_YES = 0,       /* 原則 (デフォルト): Primary/Slaveゾーン全体からsibling domainも含めて返す */
@@ -351,6 +382,7 @@ typedef struct zone_ext {
   int allow_update_count;
   acl_entry_t *allow_update_parsed;
   rate_limit_config_t rrl;
+  alerts_config_t alerts;       /* zone { alerts { } }: overrides the options limits of the same name for this zone */
   /* BIND address match lists of this zone.  transfer / update, when written in a configuration file, are also kept as the flat lists above
    * (what the settings text sent to secondaries, and zone { } blocks built by hand, use); the zone's tsig-key is not in them. */
   acl_set_t acl;
@@ -556,7 +588,7 @@ typedef struct {
 } controls_inet_t;
 
 /* The commands of the control channel as permission bits (a key's permission is a mask of these).  `reload` is the full reload and
- * `reload-zone` is `reload <zone> [view] [force]`; CTLP_READ covers status, zonestatus, observatory and dbstatus (BIND's read-only set);
+ * `reload-zone` is `reload <zone> [view] [force]`; CTLP_READ covers status, zonestatus, observatory, dbstatus, stats and obspage (BIND's read-only set);
  * CTLP_OTHER is every other word (test-only commands, unknown commands): only a key with full power reaches them. */
 #define CTLP_RELOAD      (1u << 0)
 #define CTLP_RELOAD_ZONE (1u << 1)
@@ -828,6 +860,7 @@ typedef struct server_config_s {
   dnstap_config_t dnstap;
   database_config_t database;  /* options { database { } }; .enabled == false when absent */
   rate_limit_config_t rrl;
+  alerts_config_t alerts;        /* options { alerts { } } */
   bool serve_stale;
   bool send_extended_errors;
   uint8_t minimal_responses;     /* MINIMAL_* */
@@ -957,6 +990,8 @@ typedef struct {
   ino_t ino;            // 循環検出用
   bool via_rel;         // this file was reached by an include with a relative name (options { directory } check)
   int lex_err;          // an error the lexer cannot go on from (LEXERR_*); get_next_token() reports it
+  size_t loc_pos;       // ctx_location(): the offset up to which the lines were counted last time (loc_line > 0)
+  int loc_line;         // ctx_location(): the line at loc_pos; 0 = not counted yet (a later message continues from here, not from the file start)
 } config_file_frame_t;
 
 typedef struct {

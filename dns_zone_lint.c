@@ -26,7 +26,8 @@
 static void kc_vreport(kc_tally_t *t, int *counter, char level, int dsev, dns_diag_code_t code, const char *fmt, va_list ap) {
     if (t && t->sink) {
         char buf[2048];
-        vsnprintf(buf, sizeof(buf), fmt, ap);
+        int need = vsnprintf(buf, sizeof(buf), fmt, ap);
+        if (need >= (int)sizeof(buf)) memcpy(buf + sizeof(buf) - 4, "...", 4); /* review lint.h [2.3]: mark the cut-off */
         size_t n = strlen(buf);
         while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = '\0';
         dns_diag_code_note(code);
@@ -249,6 +250,9 @@ static void check_ds_digest_type(kc_tally_t *t, int digest_type, int algorithm, 
     // RFC 8078 §4: CDS delete signal (digest_type=0, algorithm=0, key_tag=0)
     if (strcmp(rec_type, "CDS") == 0 && digest_type == 0 &&
         algorithm == 0 && key_tag == 0) {
+        /* RFC 8078 section 4: the delete signal is "0 0 0 00" */
+        if (digest_count != 1 || strcmp(digest_fields[0], "00") != 0)
+            kc_warning(t, DC_ZONE_CDS_DELETE_CONTENT, "CDS '%s': the delete signal (key tag 0, algorithm 0, digest type 0) must be \"0 0 0 00\" (RFC 8078 section 4)\n", rec_name);
         return; // RFC 8078 delete signal: 正当、警告不要
     }
     if (digest_type == 0) {
@@ -363,7 +367,7 @@ static bool kc_zone_digest(const kc_canon_rr_t *rrs, size_t n, uint8_t halg, uin
 /* RFC 8976 §4: apex の ZONEMD を全て検証する。対応している scheme と hash algorithm の ZONEMD は全て一致しなければ
  * エラーとする (§4 の注記は「どれか 1 つが一致すれば十分」だが、karicheck は公開する側の検査なので、受け手が
  * 扱えるどの ZONEMD も正しいことを求める)。 */
-static bool verify_zonemd(const char *domain, zone_arena_t *arena, kc_tally_t *t) {
+static bool verify_zonemd(const char *domain, const zone_arena_t *arena, kc_tally_t *t) {
     const dns_record_t *soa = NULL;
     size_t zm_count = 0;
     for (size_t i = 0; i < arena->count; i++) {
@@ -494,12 +498,12 @@ static bool verify_zonemd(const char *domain, zone_arena_t *arena, kc_tally_t *t
     return all_valid;
 }
 
-static bool is_cname(zone_arena_t *arena, const char *name) {
+static bool is_cname(const zone_arena_t *arena, const char *name) {
     if (!arena->hash_table || arena->hash_size == 0) return false;
     uint32_t hash = calc_fnv1a_str(name);
     size_t idx = hash & (arena->hash_size - 1);
     for (int j = arena->hash_table[idx]; j != -1; j = arena->records[j].next_record) {
-        if (arena->records[j].type_code == 5 && strcasecmp(arena->records[j].name, name) == 0) {
+        if (arena->records[j].type_code == 5 && domain_names_match_ci(arena->records[j].name, name)) {
             return true;
         }
     }
@@ -576,13 +580,24 @@ static bool lint_ns_to(const dns_record_t *r, const void *ctx) {
     return r->type_code == 2 && r->rdata_count >= 1 && domain_names_match_ci((const char *)ctx, r->rdata[0]);
 }
 
-static void lint_glue_consistency(const zone_lint_in_t *in, const char *domain, zone_arena_t *arena, kc_tally_t *t) {
+static void lint_glue_consistency(const zone_lint_in_t *in, const char *domain, const zone_arena_t *arena, kc_tally_t *t) {
     if (lint_sev(in, ZC_INTEGRITY) == CHK_IGNORE) return;   /* check-integrity no: neither the NS glue nor the MX / SRV addresses are looked for */
-    char checked_targets[2][64][256];
-    int checked_count[2] = {0, 0};
+    /* review dns_zone_lint.c [B9]: the targets that were checked, per kind (NS, MX / SRV), in an open-addressing table of the name pointers
+     * (the old list held 64 names of 256 bytes on the stack, and after the 64th the same error was repeated) */
+    size_t set_cap = 16;
+    while (set_cap < arena->count * 2) set_cap <<= 1;
+    const char **checked[2];
+    checked[0] = calloc(set_cap, sizeof(char *));
+    checked[1] = calloc(set_cap, sizeof(char *));
+    if (!checked[0] || !checked[1]) {
+        free(checked[0]);
+        free(checked[1]);
+        kc_error(t, DC_INTERNAL_OOM, "out of memory while checking the glue of zone '%s'\n", domain);
+        return;
+    }
 
     for (size_t i = 0; i < arena->count; i++) {
-        dns_record_t *rec = &arena->records[i];
+        const dns_record_t *rec = &arena->records[i];
         const char *target = NULL;
         const char *type_str = NULL;
         if (rec->type_code == 2 && rec->rdata_count >= 1) {
@@ -599,16 +614,15 @@ static void lint_glue_consistency(const zone_lint_in_t *in, const char *domain, 
         int kind = rec->type_code == 2 ? 0 : 1;
 
         bool already_checked = false;
-        for (int c = 0; c < checked_count[kind]; c++) {
-            if (domain_names_match_ci(checked_targets[kind][c], target)) {
+        size_t hs = dns_name_hash_ci(target) & (set_cap - 1);
+        for (; checked[kind][hs]; hs = (hs + 1) & (set_cap - 1)) {
+            if (domain_names_match_ci(checked[kind][hs], target)) {
                 already_checked = true;
                 break;
             }
         }
         if (already_checked) continue;
-        if (checked_count[kind] < 64) {
-            snprintf(checked_targets[kind][checked_count[kind]++], sizeof(checked_targets[kind][0]), "%s", target);
-        }
+        checked[kind][hs] = target;
 
         // If target points to a CNAME, it will be flagged as ERROR by lint_cname_targets (RFC 2181 §10.3).
         if (lint_first_at(arena, target, SIZE_MAX, lint_is_cname, NULL) >= 0) continue;
@@ -619,14 +633,16 @@ static void lint_glue_consistency(const zone_lint_in_t *in, const char *domain, 
             kc_warning(t, DC_ZONE_TARGET_NO_ADDRESS, "In-bailiwick %s target '%s' has no A/AAAA record in zone '%s'\n", type_str, target, domain);
         }
     }
+    free(checked[0]);
+    free(checked[1]);
     /* グルーのアドレスの書式はゾーンパーサが検査済み。ゾーン外のアドレス (ゾーン外のターゲットのグルー) は
      * check_zone() の zone_arena_drop_out_of_zone() で報告して除いてある (R-27)。 */
 }
 
-static void lint_cname_coexistence(const char *domain, zone_arena_t *arena, kc_tally_t *t) {
+static void lint_cname_coexistence(const char *domain, const zone_arena_t *arena, kc_tally_t *t) {
     (void)domain;
     for (size_t i = 0; i < arena->count; i++) {
-        dns_record_t *r1 = &arena->records[i];
+        const dns_record_t *r1 = &arena->records[i];
         if (r1->type_code != 5) continue; // CNAME
         // Exceptions: RRSIG (46), NSEC (47), NSEC3 (50), SIG (24), KEY (25)
         long j = lint_first_at(arena, r1->name, i, lint_not_beside_cname, NULL);
@@ -655,7 +671,7 @@ static int lint_name_cmp(const void *pa, const void *pb) {
  * address record whose name is the target of an NS record of that delegation (RFC 1034 4.2.1) or of another delegation of the
  * zone (sibling glue, RFC 9471 s2.1; BIND's named-checkzone does not call it occluded either).  Each record looks for
  * the delegations above it (its ancestors in the hash index) instead of each NS record scanning the zone. */
-static void lint_delegation_occlusion(const char *domain, zone_arena_t *arena, kc_tally_t *t) {
+static void lint_delegation_occlusion(const char *domain, const zone_arena_t *arena, kc_tally_t *t) {
     lint_occ_t *occ = NULL;
     size_t n_occ = 0, cap_occ = 0;
     bool oom = false;
@@ -689,9 +705,9 @@ static void lint_delegation_occlusion(const char *domain, zone_arena_t *arena, k
                 is_glue = n_targets > 0 && bsearch(&r->name, ns_targets, n_targets, sizeof(*ns_targets), lint_name_cmp) != NULL;
             }
             if (is_glue) continue;
-            /* every NS record at del_name (each one gave its own warning in the old scan) */
-            for (long i = lint_at_from(arena, del_name, 0, SIZE_MAX, lint_is_ns, NULL); i >= 0;
-                 i = lint_at_from(arena, del_name, (size_t)i + 1, SIZE_MAX, lint_is_ns, NULL)) {
+            /* review dns_zone_lint.c [B6]: one warning per occluded record (it used to be one per NS record of the cut, which inflated the
+             * count); the first NS record of the cut names the delegation */
+            for (long i = lint_at_from(arena, del_name, 0, SIZE_MAX, lint_is_ns, NULL); i >= 0; i = -1) {
                 if (n_occ == cap_occ) {
                     size_t nc = cap_occ ? cap_occ * 2 : 64;
                     lint_occ_t *p = realloc(occ, nc * sizeof(*occ));
@@ -716,11 +732,30 @@ static void lint_delegation_occlusion(const char *domain, zone_arena_t *arena, k
     free(ns_targets);
 }
 
-static void lint_cname_targets(const zone_lint_in_t *in, const char *domain, zone_arena_t *arena, kc_tally_t *t) {
+/* review dns_zone_lint.c [B7]: data that the zone cannot serve.  At a delegation point below the apex only NS, DS and the DNSSEC records
+ * belong (RFC 4035 section 2.2; A / AAAA are left alone because the glue of an NS record that names the cut itself sits there; a CNAME is
+ * reported by lint_cname_coexistence()).  A name below a DNAME is refused by validate_zone_dname() for every source, so it never gets here.  One warning per record. */
+static void lint_cut_data(const char *domain, const zone_arena_t *arena, kc_tally_t *t) {
+    for (size_t j = 0; j < arena->count; j++) {
+        const dns_record_t *r = &arena->records[j];
+        if (!r->name) continue;
+        if (is_strict_subdomain_of(r->name, domain)) {
+            switch (r->type_code) {
+            case 1: case 2: case 5: case 28: case 43: case 46: case 47: case 50: break;
+            default:
+                if (lint_first_at(arena, r->name, SIZE_MAX, lint_is_ns, NULL) >= 0)
+                    kc_warning(t, DC_ZONE_CUT_DATA, "Record '%s %s' is at a delegation point, where only NS, DS and DNSSEC records belong (RFC 4035 section 2.2)\n",
+                               r->name, r->type ? r->type : "<type>");
+            }
+        }
+    }
+}
+
+static void lint_cname_targets(const zone_lint_in_t *in, const char *domain, const zone_arena_t *arena, kc_tally_t *t) {
     (void)domain;
     // 1. RFC 2181 section 10.3: NS and MX targets must not point to CNAME (ERROR)
     for (size_t i = 0; i < arena->count; i++) {
-        dns_record_t *rec = &arena->records[i];
+        const dns_record_t *rec = &arena->records[i];
         const char *target = NULL;
         const char *type_name = NULL;
         if (rec->type_code == 2 && rec->rdata_count >= 1) {
@@ -742,7 +777,7 @@ static void lint_cname_targets(const zone_lint_in_t *in, const char *domain, zon
     /* X-39: RFC 2782 "Target": the name "MUST NOT be an alias". BIND の check-srv-cname の既定 (warn) に合わせて
      * 警告にする。"." はサービスが無いことを表す (同じ節) ので調べない。 */
     for (size_t i = 0; i < arena->count; i++) {
-        dns_record_t *rec = &arena->records[i];
+        const dns_record_t *rec = &arena->records[i];
         if (rec->type_code != 33 || rec->rdata_count < 4 || !rec->rdata[3] || strcmp(rec->rdata[3], ".") == 0) continue;
         if (lint_first_at(arena, rec->rdata[3], SIZE_MAX, lint_is_cname, NULL) >= 0)
             kc_finding(t, lint_sev(in, ZC_SRV_CNAME), 'W', DC_ZONE_SRV_CNAME, "SRV record '%s' points to CNAME target '%s' (RFC 2782)\n", rec->name, rec->rdata[3]);
@@ -750,7 +785,7 @@ static void lint_cname_targets(const zone_lint_in_t *in, const char *domain, zon
 
     // 2. CNAME loops (ERROR) and CNAME chains (WARNING)
     for (size_t i = 0; i < arena->count; i++) {
-        dns_record_t *cname = &arena->records[i];
+        const dns_record_t *cname = &arena->records[i];
         if (cname->type_code != 5) continue;
         if (cname->rdata_count < 1 || !cname->rdata[0]) continue;
         const char *target = cname->rdata[0];
@@ -760,6 +795,23 @@ static void lint_cname_targets(const zone_lint_in_t *in, const char *domain, zon
             continue;
         }
 
+        /* review dns_zone_lint.c [B4]: follow the chain (at most 16 hops); a CNAME that leads back to itself is a loop, not two chain warnings.
+         * BIND's named-checkzone does not look for loops, and a zone with one has always imported (tests/matrix/zones/cname_chain.zone), so
+         * it stays a warning (the self-loop of one name stays an error). */
+        {
+            const char *cur = target;
+            bool loop = false;
+            for (int hop = 0; hop < 16 && !loop; hop++) {
+                long k = lint_first_at(arena, cur, SIZE_MAX, lint_is_cname, NULL);
+                if (k < 0 || arena->records[k].rdata_count < 1 || !arena->records[k].rdata[0]) break;
+                cur = arena->records[k].rdata[0];
+                loop = domain_names_match_ci(cur, cname->name);
+            }
+            if (loop) {
+                kc_warning(t, DC_ZONE_CNAME_CHAIN, "CNAME loop detected: '%s' leads back to itself (via '%s'); a lookup of it fails\n", cname->name, target);
+                continue;
+            }
+        }
         if (lint_first_at(arena, target, i, lint_is_cname, NULL) >= 0)
             kc_warning(t, DC_ZONE_CNAME_CHAIN, "CNAME chain detected: '%s' points to CNAME '%s'\n",
                     cname->name, target);
@@ -783,7 +835,7 @@ static bool lint_internal_wildcard(const char *name) {
     return false;
 }
 
-static void lint_wildcard(const zone_lint_in_t *in, zone_arena_t *arena, kc_tally_t *t) {
+static void lint_wildcard(const zone_lint_in_t *in, const zone_arena_t *arena, kc_tally_t *t) {
     uint8_t sev = lint_sev(in, ZC_WILDCARD);
     if (sev == CHK_DEFAULT || sev == CHK_IGNORE) return;
     for (size_t i = 0; i < arena->count; i++) {
@@ -795,7 +847,7 @@ static void lint_wildcard(const zone_lint_in_t *in, zone_arena_t *arena, kc_tall
 }
 
 /* the same RR twice in one RRset (BIND check-dup-records: "<name>: <type>/<class> has duplicate rdata" at load) */
-static void lint_dup_records(const zone_lint_in_t *in, zone_arena_t *arena, kc_tally_t *t) {
+static void lint_dup_records(const zone_lint_in_t *in, const zone_arena_t *arena, kc_tally_t *t) {
     uint8_t sev = lint_sev(in, ZC_DUP_RECORDS);
     if (sev == CHK_DEFAULT || sev == CHK_IGNORE || !arena->hash_table || arena->hash_size == 0) return;
     for (size_t i = 0; i < arena->count; i++) {
@@ -813,7 +865,7 @@ static void lint_dup_records(const zone_lint_in_t *in, zone_arena_t *arena, kc_t
 }
 
 /* an MX whose target is an IP address: the target must be a host name (RFC 1035 §3.3.9, RFC 5321 §5.1; BIND check-mx: "MX is an address") */
-static void lint_mx_address(const zone_lint_in_t *in, zone_arena_t *arena, kc_tally_t *t) {
+static void lint_mx_address(const zone_lint_in_t *in, const zone_arena_t *arena, kc_tally_t *t) {
     uint8_t sev = lint_sev(in, ZC_MX);
     if (sev == CHK_DEFAULT || sev == CHK_IGNORE) return;
     for (size_t i = 0; i < arena->count; i++) {
@@ -851,7 +903,7 @@ static bool lint_is_hostname(const char *name, bool wildcard_ok) {
     return true;
 }
 
-static void lint_check_names(const zone_lint_in_t *in, zone_arena_t *arena, kc_tally_t *t) {
+static void lint_check_names(const zone_lint_in_t *in, const zone_arena_t *arena, kc_tally_t *t) {
     uint8_t sev = (in && in->chk) ? in->chk_names : (uint8_t)CHK_DEFAULT;   /* a caller without a policy (chk == NULL) leaves chk_names at 0, which is fail */
     if (sev == CHK_DEFAULT || sev == CHK_IGNORE) return;
     for (size_t i = 0; i < arena->count; i++) {
@@ -882,7 +934,7 @@ static bool kc_has_salt(const char *salt) {
 /* K-05: NSEC3PARAM (RFC 5155 §4、RFC 9276 §3.1) と NSEC3 チェーン。チェーンはサーバーと同じ build_zone_index() の
  * 索引 (arena->nsec3_chains) と、サーバーが選んだ NSEC3PARAM (arena->nsec3_active、R-31) を使う。NSEC3 の警告は
  * RR ごとではなくチェーンごとに 1 回出す (署名済みゾーンの全 NSEC3 RR で同じ警告を繰り返さない)。 */
-static void lint_nsec3(const char *domain, zone_arena_t *arena, kc_tally_t *t) {
+static void lint_nsec3(const char *domain, const zone_arena_t *arena, kc_tally_t *t) {
     size_t params = 0, usable = 0;
     for (size_t i = 0; i < arena->count; i++) {
         const dns_record_t *r = &arena->records[i];
@@ -893,17 +945,17 @@ static void lint_nsec3(const char *domain, zone_arena_t *arena, kc_tally_t *t) {
             continue;
         }
         params++;
-        int algo = (int)strtol(r->rdata[0], NULL, 10);
-        int flags = (int)strtol(r->rdata[1], NULL, 10);
+        long algo = strtol(r->rdata[0], NULL, 10);
+        long flags = strtol(r->rdata[1], NULL, 10);
         long iterations = strtol(r->rdata[2], NULL, 10);
         uint8_t salt_buf[255];
         bool salt_ok = hex_to_bytes(r->rdata[3], salt_buf, sizeof(salt_buf)) != (size_t)-1;
         if (algo != 1) {
-            kc_warning(t, DC_ZONE_NSEC3PARAM_HASH_ALGORITHM, "NSEC3PARAM for '%s' uses hash algorithm %d; only 1 (SHA-1) is defined "
+            kc_warning(t, DC_ZONE_NSEC3PARAM_HASH_ALGORITHM, "NSEC3PARAM for '%s' uses hash algorithm %ld; only 1 (SHA-1) is defined "
                           "(RFC 5155 section 4.1.1), so the server ignores this NSEC3PARAM\n", r->name, algo);
         }
         if (flags != 0) {
-            kc_error(t, DC_ZONE_NSEC3PARAM_FLAGS, "NSEC3PARAM for '%s' has Flags %d; the Flags field must be 0 (the opt-out flag is only "
+            kc_error(t, DC_ZONE_NSEC3PARAM_FLAGS, "NSEC3PARAM for '%s' has Flags %ld; the Flags field must be 0 (the opt-out flag is only "
                         "meaningful in NSEC3 records) and an NSEC3PARAM with other Flags MUST be ignored "
                         "(RFC 5155 section 4.1.2), so the server ignores it\n", r->name, flags);
         }
@@ -935,7 +987,7 @@ static void lint_nsec3(const char *domain, zone_arena_t *arena, kc_tally_t *t) {
         const nsec3_chain_t *ch = &arena->nsec3_chains[c];
         size_t optout = 0, reserved = 0;
         for (size_t k = 0; k < ch->count; k++) {
-            int flags = (int)strtol(ch->entries[k].rec->rdata[1], NULL, 10);
+            long flags = strtol(ch->entries[k].rec->rdata[1], NULL, 10);
             if (flags & 0x01) optout++;
             if (flags & ~0x01) reserved++;
         }
@@ -1000,7 +1052,7 @@ void zone_lint_ttl(const zone_arena_t *arena_in, const char *what, kc_tally_t *t
             for (size_t k = 0; k < arena->count;) {
                 size_t e = k + 1;
                 while (e < arena->count && sorted[e]->name && sorted[k]->name && sorted[e]->type_code == sorted[k]->type_code &&
-                       strcasecmp(sorted[e]->name, sorted[k]->name) == 0)
+                       domain_names_match_ci(sorted[e]->name, sorted[k]->name))
                     e++;
                 if (!sorted[k]->name || sorted[k]->type_code == 46 || e - k < 2) {
                     k = e;
@@ -1055,7 +1107,56 @@ void zone_lint_pdns_types(const zone_arena_t *arena, const char *domain, kc_tall
                    domain, n_lua);
 }
 
-void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t *t) {
+/* RFC 9432 section 4.1: a member node is one label directly below "zones.<catalog>" */
+static bool lint_catalog_member(const dns_record_t *r, const char *suffix, size_t suffix_len) {
+    if (r->type_code != 12 || !r->name || r->rdata_count < 1 || !r->rdata[0]) return false;
+    size_t nl = strlen(r->name);
+    if (nl <= suffix_len || strcasecmp(r->name + nl - suffix_len, suffix) != 0) return false;
+    for (size_t i = 0; i < nl - suffix_len; i++) {
+        if (r->name[i] == '\\') { i++; continue; }
+        if (r->name[i] == '.') return false;
+    }
+    return true;
+}
+
+/* RFC 9432 section 5.1: a catalog zone is broken when one member node has several PTR records, or when two member nodes name the same
+ * zone; karidns refuses to process such a catalog zone (dns_catalog_zone.c), so karicheck says so too. */
+static void lint_catalog_members(const char *domain, const zone_arena_t *arena, kc_tally_t *t) {
+    char suffix[DNS_NAME_TEXT_SIZE + 16];
+    snprintf(suffix, sizeof(suffix), ".zones.%s", domain);
+    size_t sl = strlen(suffix), m = 0;
+    for (size_t i = 0; i < arena->count; i++)
+        if (lint_catalog_member(&arena->records[i], suffix, sl)) m++;
+    if (m == 0) return;
+    size_t cap = 16;
+    while (cap < m * 2) cap <<= 1;
+    long *tab = malloc(cap * sizeof(*tab));
+    if (!tab) return;
+    for (size_t s = 0; s < cap; s++) tab[s] = -1;
+    for (size_t i = 0; i < arena->count; i++) {
+        const dns_record_t *r = &arena->records[i];
+        if (!lint_catalog_member(r, suffix, sl)) continue;
+        if ((size_t)lint_at_from(arena, r->name, 0, SIZE_MAX, lint_is_ptr, NULL) == i &&
+            lint_at_from(arena, r->name, i + 1, SIZE_MAX, lint_is_ptr, NULL) >= 0)
+            kc_error(t, DC_ZONE_CATALOG_MEMBER_PTRS, "Catalog zone '%s': member node '%s' has more than one PTR record (RFC 9432 section 5.1); the catalog zone is broken and karidns will not process it\n",
+                     domain, r->name);
+        size_t s = dns_name_hash_ci(r->rdata[0]) & (cap - 1);
+        bool dup = false;
+        for (; tab[s] >= 0; s = (s + 1) & (cap - 1)) {
+            const dns_record_t *o = &arena->records[tab[s]];
+            if (domain_names_match_ci(o->rdata[0], r->rdata[0]) && !domain_names_match_ci(o->name, r->name)) {
+                kc_error(t, DC_ZONE_CATALOG_MEMBER_DUPLICATE, "Catalog zone '%s': the member nodes '%s' and '%s' name the same zone '%s' (RFC 9432 section 5.1); the catalog zone is broken and karidns will not process it\n",
+                         domain, o->name, r->name, r->rdata[0]);
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) tab[s] = (long)i;
+    }
+    free(tab);
+}
+
+void zone_lint_records(const zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t *t) {
     const char *domain = in->domain;
     const char *raw = in->raw_text;
     bool has_soa = false;
@@ -1145,7 +1246,7 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                         if (flen[3] > 0) {
                             char *endp;
                             unsigned long p = strtoul(fld[3], &endp, 10);
-                            if (*endp != '\0' || p > 65535) {
+                            if ((*endp != '\0' || !isdigit((unsigned char)fld[3][0])) || p > 65535) {
                                 kc_error(t, DC_ZONE_SRV_PORT_RANGE, "Zone '%s' (line %lu): SRV port '%s' out of range (0-65535)\n",
                                         domain, linenum, fld[3]);
                             }
@@ -1153,7 +1254,7 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                         if (flen[4] > 0) {
                             char *endp;
                             unsigned long w = strtoul(fld[4], &endp, 10);
-                            if (*endp != '\0' || w > 65535) {
+                            if ((*endp != '\0' || !isdigit((unsigned char)fld[4][0])) || w > 65535) {
                                 kc_error(t, DC_ZONE_SRV_WEIGHT_RANGE, "Zone '%s' (line %lu): SRV weight '%s' out of range (0-65535)\n",
                                         domain, linenum, fld[4]);
                             }
@@ -1161,7 +1262,7 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                         if (flen[5] > 0) {
                             char *endp;
                             unsigned long prio = strtoul(fld[5], &endp, 10);
-                            if (*endp != '\0' || prio > 65535) {
+                            if ((*endp != '\0' || !isdigit((unsigned char)fld[5][0])) || prio > 65535) {
                                 kc_error(t, DC_ZONE_SRV_PRIORITY_RANGE, "Zone '%s' (line %lu): SRV priority '%s' out of range (0-65535)\n",
                                         domain, linenum, fld[5]);
                             }
@@ -1171,7 +1272,7 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                         if (flen[1] > 0) {
                             char *endp;
                             unsigned long ord = strtoul(fld[1], &endp, 10);
-                            if (*endp != '\0' || ord > 65535) {
+                            if ((*endp != '\0' || !isdigit((unsigned char)fld[1][0])) || ord > 65535) {
                                 kc_error(t, DC_ZONE_NAPTR_ORDER_RANGE, "Zone '%s' (line %lu): NAPTR order '%s' out of range (0-65535)\n",
                                         domain, linenum, fld[1]);
                             }
@@ -1179,7 +1280,7 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                         if (flen[2] > 0) {
                             char *endp;
                             unsigned long pref = strtoul(fld[2], &endp, 10);
-                            if (*endp != '\0' || pref > 65535) {
+                            if ((*endp != '\0' || !isdigit((unsigned char)fld[2][0])) || pref > 65535) {
                                 kc_error(t, DC_ZONE_NAPTR_PREFERENCE_RANGE, "Zone '%s' (line %lu): NAPTR preference '%s' out of range (0-65535)\n",
                                         domain, linenum, fld[2]);
                             }
@@ -1189,7 +1290,7 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                         if (flen[1] > 0) {
                             char *endp;
                             unsigned long alg = strtoul(fld[1], &endp, 10);
-                            if (*endp != '\0' || alg > 255) {
+                            if ((*endp != '\0' || !isdigit((unsigned char)fld[1][0])) || alg > 255) {
                                 kc_error(t, DC_ZONE_SSHFP_ALGORITHM_RANGE, "Zone '%s' (line %lu): SSHFP algorithm '%s' out of range (0-255)\n",
                                         domain, linenum, fld[1]);
                             } else if (alg == 0 || alg == 5 || alg > 6) {   /* 6 = Ed448, RFC 8709 */
@@ -1200,7 +1301,7 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                         if (flen[2] > 0) {
                             char *endp;
                             unsigned long fpt = strtoul(fld[2], &endp, 10);
-                            if (*endp != '\0' || fpt > 255) {
+                            if ((*endp != '\0' || !isdigit((unsigned char)fld[2][0])) || fpt > 255) {
                                 kc_error(t, DC_ZONE_SSHFP_FPTYPE_RANGE, "Zone '%s' (line %lu): SSHFP fp_type '%s' out of range (0-255)\n",
                                         domain, linenum, fld[2]);
                             } else if (fpt == 0 || fpt > 2) {
@@ -1217,7 +1318,7 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                             /* RFC 4255 3.1.2 (SHA-1: 20 octets), RFC 6594 5 (SHA-256: 32) */
                             char *endp;
                             unsigned long fpt = strtoul(fld[2], &endp, 10);
-                            if (*endp == '\0' && (fpt == 1 || fpt == 2) && fplen != (fpt == 1 ? 20 : 32))
+                            if (*endp == '\0' && isdigit((unsigned char)fld[2][0]) && (fpt == 1 || fpt == 2) && fplen != (fpt == 1 ? 20 : 32))
                                 kc_error(t, DC_ZONE_SSHFP_FINGERPRINT_LENGTH, "Zone '%s' (line %lu): SSHFP fingerprint is %ld octets, a %s fingerprint is %d (RFC 4255 3.1.2, RFC 6594 5)\n",
                                         domain, linenum, fplen, fpt == 1 ? "SHA-1" : "SHA-256", fpt == 1 ? 20 : 32);
                         }
@@ -1290,13 +1391,13 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
             }
         }
 
-        if (tcode == 6 && strcasecmp(arena->records[i].name, domain) == 0) {
+        if (tcode == 6 && domain_names_match_ci(arena->records[i].name, domain)) {
             has_soa = true;
             /* [T3] SOA重複検出: apexに2度以上の SOAは破損ゾーンファイル */
             soa_count++;
             if (!dns_record_is_restricted(&arena->records[i])) soa_plain_count++;
         }
-        if (tcode == 2 && strcasecmp(arena->records[i].name, domain) == 0) {
+        if (tcode == 2 && domain_names_match_ci(arena->records[i].name, domain)) {
             has_apex_ns = true;
         }
         if (tcode == 62) { // CSYNC
@@ -1320,7 +1421,7 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
         
         // --- Add specific field validations ---
         if (tcode == 63) { // ZONEMD
-            if (strcasecmp(arena->records[i].name, domain) != 0) {
+            if (!domain_names_match_ci(arena->records[i].name, domain)) {
                 kc_warning(t, DC_ZONE_ZONEMD_NOT_APEX, "ZONEMD record '%s' is not at the zone apex '%s' (RFC 8976 section 2.1)\n",
                         arena->records[i].name, domain);
             }
@@ -1337,6 +1438,15 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                 int protocol = (int)strtol(rdata[1], NULL, 10);
                 int alg = (int)strtol(rdata[2], NULL, 10);
                 check_dnssec_algorithm(t, alg, arena->records[i].name, tcode == 48 ? "DNSKEY" : "CDNSKEY", flags, protocol);
+                /* RFC 4034 section 2.1.2: the Protocol Field MUST have value 3 (a validator treats the key as invalid otherwise) */
+                if (protocol != 3)
+                    kc_warning(t, DC_ZONE_DNSKEY_PROTOCOL, "%s '%s': protocol field is %d; it must be 3 (RFC 4034 section 2.1.2)\n",
+                               tcode == 48 ? "DNSKEY" : "CDNSKEY", arena->records[i].name, protocol);
+                /* RFC 8078 section 4: the CDNSKEY delete signal is "0 3 0 AA==" (the key field is one zero octet; the RFC text also writes 0) */
+                if (tcode == 60 && flags == 0 && protocol == 3 && alg == 0 &&
+                    (rcount != 4 || (strcmp(rdata[3], "AA==") != 0 && strcmp(rdata[3], "0") != 0)))
+                    kc_warning(t, DC_ZONE_CDS_DELETE_CONTENT, "CDNSKEY '%s': the delete signal (algorithm 0) must be \"0 3 0 AA==\" (RFC 8078 section 4)\n",
+                               arena->records[i].name);
                 if (rcount >= 4)
                     check_dnssec_blob_length(t, alg, arena->records[i].name, tcode == 48 ? "DNSKEY" : "CDNSKEY",
                                              false, &rdata[3], rcount - 3);
@@ -1377,12 +1487,14 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
         if (tcode == 11) { // WKS
             /* K-03: プロトコルはサーバーのシリアライザと同じ規則で読む (番号 0-255、または TCP/UDP) */
             uint8_t proto = 0;
+            bool proto_ok = true; /* review dns_zone_lint.c [B16]: with a bad protocol every port would be warned about again */
             if (rcount >= 2 && !dns_wks_protocol_from_text(rdata[1], &proto)) {
                 kc_warning(t, DC_ZONE_WKS_PROTOCOL, "WKS record protocol '%s' is neither a number (0-255) nor TCP/UDP for name '%s'\n",
                            rdata[1], arena->records[i].name);
+                proto_ok = false;
             }
             /* X-38: ポート名はサーバーと同じ固定表で引く。読めないポートがあるとレコードは書けない (下の試し書き) */
-            for (int j = 2; j < rcount; j++) {
+            for (int j = 2; proto_ok && j < rcount; j++) {
                 uint16_t port;
                 if (!dns_wks_port_from_text(rdata[j], proto, &port)) {
                     kc_warning(t, DC_ZONE_WKS_PORT, "WKS record port '%s' for name '%s' is neither a number (0-65535) nor a known "
@@ -1390,7 +1502,7 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                 }
             }
         }
-        if (tcode == 27 && rcount < 3) { // GPOS
+        if (tcode == 27 && rcount != 3) { // GPOS
             kc_warning(t, DC_ZONE_GPOS_FIELDS, "GPOS record requires exactly 3 fields (Longitude, Latitude, Altitude) for name '%s'\n", arena->records[i].name);
         }
         if (tcode == 19 && rcount < 1) { // X25
@@ -1451,12 +1563,12 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                             "[A-Za-z0-9] characters (RFC 3403 §4.1)\n",
                             naptr_flags, arena->records[i].name, domain);
                 }
-                /* [T5] RFC 2915 §2: regexp と replacement は同時に非空であってはならない */
+                /* [T5] RFC 3403 §4.1: regexp と replacement は同時に非空であってはならない */
                 bool naptr_has_regexp = (strlen(rdata[4]) > 0);
                 bool naptr_has_replacement = (strlen(rdata[5]) > 0 && strcmp(rdata[5], ".") != 0);
                 if (naptr_has_regexp && naptr_has_replacement) {
                     kc_error(t, DC_ZONE_NAPTR_REGEXP_REPLACEMENT, "NAPTR record for '%s' in zone '%s' sets both a regexp and a "
-                            "non-root replacement field; RFC 2915 requires exactly one of them to be empty\n",
+                            "non-root replacement field; RFC 3403 section 4.1 requires exactly one of them to be empty\n",
                             arena->records[i].name, domain);
                 }
             }
@@ -1560,7 +1672,7 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                 uint32_t hash = calc_fnv1a_str(arena->records[i].name);
                 size_t idx = hash & (arena->hash_size - 1);
                 for (int j = arena->hash_table[idx]; j != -1; j = arena->records[j].next_record) {
-                    if (i != (size_t)j && strcasecmp(arena->records[j].name, arena->records[i].name) == 0) {
+                    if (i != (size_t)j && domain_names_match_ci(arena->records[j].name, arena->records[i].name)) {
                         uint16_t other = arena->records[j].type_code;
                         // Ignore DNSSEC records
                         if (other != 5 && other != 46 && other != 47 && other != 50) {
@@ -1624,7 +1736,7 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
                 "Record '%s %s' at index %zu cannot be serialized to wire format "
                 "(the server leaves this record out with a warning when it loads the zone). "
                 "Check field count and value ranges for this record type.\n",
-                arena->records[i].name, arena->records[i].type, i);
+                arena->records[i].name, arena->records[i].type ? arena->records[i].type : "?", i);
         }
     }
 
@@ -1649,7 +1761,7 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
         time_t soa_now = time(NULL);
         for (size_t i = 0; i < arena->count; i++) {
             const dns_record_t *sr = &arena->records[i];
-            if (sr->type_code != 6 || !sr->name || strcasecmp(sr->name, domain) != 0 || !dns_record_is_restricted(sr)) continue;
+            if (sr->type_code != 6 || !sr->name || !domain_names_match_ci(sr->name, domain) || !dns_record_is_restricted(sr)) continue;
             bool defined = true;
             if (sr->tinydns_loc[0] || sr->tinydns_loc[1]) {
                 defined = false;
@@ -1670,11 +1782,11 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
     }
 
     if (in->is_catalog) {
-        char version_txt[256];
+        char version_txt[DNS_NAME_TEXT_SIZE + 16];
         snprintf(version_txt, sizeof(version_txt), "version.%s", domain);
         bool found_version = false;
         for (size_t i = 0; i < arena->count; i++) {
-            if (arena->records[i].type_code == 16 && strcasecmp(arena->records[i].name, version_txt) == 0) {
+            if (arena->records[i].type_code == 16 && domain_names_match_ci(arena->records[i].name, version_txt)) {
                 if (arena->records[i].rdata_count > 0 && strcmp(arena->records[i].rdata[0], "2") == 0) {
                     found_version = true;
                     break;
@@ -1685,9 +1797,11 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
             kc_error(t, DC_ZONE_CATALOG_VERSION, "Catalog zone '%s' is missing '%s TXT \"2\"'\n", domain, version_txt);
         }
 
+        lint_catalog_members(domain, arena, t);
+
         // Check for orphaned group TXT records
-        char group_prefix[10] = "group.";
-        char zones_suffix[256];
+        static const char group_prefix[] = "group.";
+        char zones_suffix[DNS_NAME_TEXT_SIZE + 16];
         snprintf(zones_suffix, sizeof(zones_suffix), ".zones.%s", domain);
         size_t zones_suffix_len = strlen(zones_suffix);
         for (size_t i = 0; i < arena->count; i++) {
@@ -1720,6 +1834,7 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
     lint_glue_consistency(in, domain, arena, t);
     lint_cname_coexistence(domain, arena, t);
     lint_delegation_occlusion(domain, arena, t);
+    lint_cut_data(domain, arena, t);
     lint_cname_targets(in, domain, arena, t);
     lint_wildcard(in, arena, t);
     lint_dup_records(in, arena, t);

@@ -49,8 +49,10 @@ bool cidr_entry_parse(cidr_entry_t *entry, const char *cidr_str) {
     if (slash) {
         *slash = '\0';
         char *endptr = NULL;
-        long val = strtol(slash + 1, &endptr, 10);
-        if (endptr == slash + 1 || *endptr != '\0' || val < 0 || val > 128) {
+        long val = 0;
+        /* digits only: strtol would also take leading space, '+' and '-' */
+        if (slash[1] >= '0' && slash[1] <= '9') val = strtol(slash + 1, &endptr, 10);
+        if (!endptr || *endptr != '\0' || val > 128) {
             syslog(LOG_WARNING, "[Config] Invalid CIDR prefix in ACL entry: '%s' (rejecting, no match)", cidr_str);
             return false;
         }
@@ -61,7 +63,7 @@ bool cidr_entry_parse(cidr_entry_t *entry, const char *cidr_str) {
     struct in6_addr addr6;
     if (inet_pton(AF_INET, cidr_copy, &addr4) == 1) {
         if (prefix == -1) prefix = 32;
-        if (prefix < 0 || prefix > 32) return false;
+        if (prefix > 32) return false;
 
         entry->valid = true;
         entry->is_any = false;
@@ -72,7 +74,6 @@ bool cidr_entry_parse(cidr_entry_t *entry, const char *cidr_str) {
         return true;
     } else if (inet_pton(AF_INET6, cidr_copy, &addr6) == 1) {
         if (prefix == -1) prefix = 128;
-        if (prefix < 0 || prefix > 128) return false;
 
         entry->valid = true;
         entry->is_any = false;
@@ -108,7 +109,7 @@ bool cidr_entry_match(const cidr_entry_t *net, int family, const uint8_t *addr_b
     return false;
 }
 
-bool cidr_entry_match_sockaddr(const cidr_entry_t *net, const void *sa_ptr) {
+bool cidr_entry_match_sockaddr(const cidr_entry_t *net, const struct sockaddr_storage *sa_ptr) {
     if (!net || !net->valid || !sa_ptr) return false;
     if (net->is_any) return true;
 

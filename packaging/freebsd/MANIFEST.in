@@ -33,7 +33,7 @@ files: {
     /usr/local/etc/rc.d/karidns: { "perm": "0555" },
     /usr/local/etc/karidns/karidns.conf.sample: "",
     /usr/local/etc/karidns/karictl.conf.sample: "",
-    /usr/local/etc/karidns/zones/example.local.zone.sample: "",
+    /usr/local/etc/karidns/zones/example.test.zone.sample: "",
 __DB_FILES__
     /usr/local/share/doc/karidns/karidns.md: "",
     /usr/local/share/doc/karidns/karictl.md: "",

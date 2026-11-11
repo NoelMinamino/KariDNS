@@ -38,8 +38,6 @@ bool split_path_for_openat(const char *path, char *dir_out,
   }
   if (strcmp(base_out, "..") == 0 || strcmp(base_out, ".") == 0)
     return false;
-  if (strstr(base_out, "/") != NULL)
-    return false;
 #ifdef _WIN32
   if (strstr(base_out, "\\") != NULL)
     return false;
@@ -277,7 +275,8 @@ static uint16_t type_code_upper(const char *type_str) {
     if (strncmp(type_str, "TYPE", 4) == 0) {
       char *endptr;
       long tval = strtol(type_str + 4, &endptr, 10);
-      if (*endptr == '\0' && tval > 0 && tval <= 65535) {
+      /* the first character must be a digit: strtol alone also takes "TYPE+1" and "TYPE 1" */
+      if (isdigit((unsigned char)type_str[4]) && *endptr == '\0' && tval > 0 && tval <= 65535) {
         return (uint16_t)tval;
       }
       return 0;
@@ -328,6 +327,7 @@ uint16_t get_type_code(const char *type_str) {
 }
 
 char *get_base_dir(const char *path) {
+    if (!path) return NULL;
     const char *slash = strrchr(path, '/');
     if (!slash) return strdup(".");
     size_t len = slash - path;
@@ -473,6 +473,16 @@ const char *dns_class_text(uint16_t qclass, char *buf, size_t buf_size) {
             snprintf(buf, buf_size, "CLASS%u", (unsigned)qclass);   /* RFC 3597 5 */
             return buf;
     }
+}
+
+const char *dns_class_literal(uint16_t qclass) {
+  switch (qclass) {
+    case 1:   return "IN";
+    case 4:   return "HS";
+    case 254: return "NONE";
+    case 255: return "ANY";
+    default:  return "CH";
+  }
 }
 
 const char *dns_rcode_name(unsigned rcode) {
@@ -714,7 +724,7 @@ int exec_file_open_checked(const char *path, uid_t self, const char *what, const
   }
   /* both findings are reported when both apply (karicheck shows them to the operator in one go) */
   size_t n = 0;
-  err[0] = '\0';
+  if (errlen > 0) err[0] = '\0'; /* a zero-size buffer is never written */
   if (st.st_uid != 0 && st.st_uid != self)
     n += (size_t)snprintf(err, errlen, "%s '%s' is owned by uid %u; it must belong to root%s", what, path, (unsigned)st.st_uid,
                           self == 0 ? "" : " or to the user running karidns");
@@ -756,14 +766,34 @@ int exec_file_exec_fd(int fd, const char *path, char *const argv[], char *const 
 }
 
 bool identity_names_root(const char *user, const char *group, char *err, size_t errlen) {
-  char buf[16384];
+  /* review dns_utils.c [1]: the buffer of getpwnam_r / getgrnam_r grows on ERANGE (entry did not fit) up to 1 MiB; an entry that
+   * does not fit even then is an error, not "no such user" (that would let root through unnoticed) */
+  size_t blen = 16384;
+  char *buf = malloc(blen);
+  if (!buf) {
+    snprintf(err, errlen, "out of memory looking up the user and the group");
+    return true;
+  }
   gid_t gid = (gid_t)-1;
   bool have_gid = false, gid_from_group = false;
   if (user) {
     struct passwd pw, *res = NULL;
-    if (getpwnam_r(user, &pw, buf, sizeof(buf), &res) == 0 && res) {
+    int rc;
+    while ((rc = getpwnam_r(user, &pw, buf, blen, &res)) == ERANGE && blen < (1u << 20)) {
+      char *nb = realloc(buf, blen * 2);
+      if (!nb) break;
+      buf = nb;
+      blen *= 2;
+    }
+    if (rc == ERANGE) {
+      snprintf(err, errlen, "the account entry of user '%s' is too large to read", user);
+      free(buf);
+      return true;
+    }
+    if (rc == 0 && res) {
       if (pw.pw_uid == 0) {
         snprintf(err, errlen, "user '%s' is uid 0: root is not accepted as the user to run as", user);
+        free(buf);
         return true;
       }
       gid = pw.pw_gid;
@@ -772,11 +802,24 @@ bool identity_names_root(const char *user, const char *group, char *err, size_t 
   }
   if (group) {
     struct group gr, *res = NULL;
-    if (getgrnam_r(group, &gr, buf, sizeof(buf), &res) == 0 && res) {
+    int rc;
+    while ((rc = getgrnam_r(group, &gr, buf, blen, &res)) == ERANGE && blen < (1u << 20)) {
+      char *nb = realloc(buf, blen * 2);
+      if (!nb) break;
+      buf = nb;
+      blen *= 2;
+    }
+    if (rc == ERANGE) {
+      snprintf(err, errlen, "the entry of group '%s' is too large to read", group);
+      free(buf);
+      return true;
+    }
+    if (rc == 0 && res) {
       gid = gr.gr_gid;   /* the group named overrides the user's primary group */
       have_gid = gid_from_group = true;
     }
   }
+  free(buf);
   if (have_gid && gid == 0) {
     if (gid_from_group)
       snprintf(err, errlen, "group '%s' is gid 0: the root group is not accepted as the group to run as", group);

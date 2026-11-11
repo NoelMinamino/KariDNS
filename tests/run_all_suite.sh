@@ -504,6 +504,7 @@ register_test "core" "sh" "tests/run_multi_instance_test.sh" "Multi-instance iso
 register_test "core" "sh" "tests/run_forward_zone_test.sh" "RFC 5452 Forward zone upstream resolution & failover"
 register_test "core" "sh" "tests/run_program_zone_test.sh" "Dynamic backend records via program zone plugin"
 register_test "core" "sh" "tests/run_karictl_observatory_test.sh" "karictl observatory IPC metrics query"
+register_test "core" "sh" "tests/run_karictl_stats_test.sh" "karictl stats (Prometheus text, JSON, paging) and options/zone alerts { } (0.6.1)"
 register_test "core" "sh" "tests/run_karictl_reload_reconfig_test.sh" "karictl reload & dynamic reconfig IPC"
 register_test "core" "sh" "tests/run_karictl_reload_failure_test.sh" "karictl reload/reconfig report failures (exit 3), restart-only settings, status values and time format (D-13, O-05, O-09, D-12, T-11)"
 register_test "core" "sh" "tests/run_signal_all_processes_test.sh" "SIGHUP/SIGUSR1/SIGUSR2/SIGPIPE to every karidns process: nothing dies, the server reloads and keeps answering"

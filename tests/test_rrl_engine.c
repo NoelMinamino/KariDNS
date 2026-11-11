@@ -11,6 +11,7 @@
 
 #include "dns_wire.h"
 #include "dns_rrl.h"
+#include "dns_siphash.h"
 #include "dns_cidr.h"
 #include "dns_config_parser.h"
 
@@ -34,11 +35,11 @@ static void test_siphash_and_init(void) {
     uint64_t key[2] = { 0x0706050403020100ULL, 0x0f0e0d0c0b0a0908ULL };
     uint8_t in[15] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
 
-    uint64_t h1 = siphash24(in, sizeof(in), key);
-    uint64_t h2 = siphash24(in, sizeof(in), key);
+    uint64_t h1 = dns_siphash24(in, sizeof(in), key);
+    uint64_t h2 = dns_siphash24(in, sizeof(in), key);
     assert(h1 == h2); // deterministic
 
-    uint64_t h3 = siphash24(in, sizeof(in) - 1, key);
+    uint64_t h3 = dns_siphash24(in, sizeof(in) - 1, key);
     assert(h1 != h3);
 
     printf("  -> siphash24 passed.\n");

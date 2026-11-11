@@ -264,10 +264,70 @@ static void test_name_register_stops_at_pointer(void) {
     CHECK(ctx != NULL);
     if (ctx) {
         compress_ctx_init(ctx);
-        register_wire_name_for_compression(copy, DNS_HEADER_SIZE, ctx);
+        register_wire_name_for_compression(copy, sizeof(pkt), DNS_HEADER_SIZE, ctx);
         free(ctx);
     }
     free(copy);
+}
+
+/* fuzz_dns_wire found an RRSIG in the KariDNS extension class (65302): it has the text fields of an RRSIG and is written from its generic data, so
+ * writing the "text" record with that class gave an empty RDATA and the check of the harness failed.  The text form is stable as an IN record. */
+static void test_rrsig_ext_class_text_roundtrip(void) {
+    printf("[TEST] RRSIG of the extension class: text fields round-trip as an IN record...\n");
+    static const uint8_t msg[] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x02,0x77,0x6e,0x04,0x74,0x65,0x63,0x74,0x00,0x00,0x2e,0xff,0x16,0x00,0x00,0x01,0x2c,0x00,0x30,0x00,0x2d,0x06,0x0d,0x02,0x00,0x7f,0x60,0xff,0xff,0xff,0x7f,0x43,0x53,0x59,0x4e,0x43,0x23,0x00,0x00,0xbc,0xcf,0x00,0x00,0x00,0x00,0x00,0x04,0xff,0xff,0xff,0xf6,0xff,0xff,0xff,0x55,0x81,0x9a,0x01,0x30,0x67,0xed,0x38,0x3a,0x45,0x55,0x29,0xf2,0xae, };
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+    size_t off = 12;
+    dns_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    uint16_t type = 0;
+    CHECK(parse_resource_record(msg, sizeof(msg), &off, &arena, &rec, &type) == 0);
+    CHECK(rec.type_code == 46 && rec.class_val == DNS_CLASS_KARIDNS_EXT && rec.rdata_count >= 9);
+    dns_record_t text = rec;
+    text.generic_data = NULL;
+    text.generic_len = 0;
+    text.is_cached = false;
+    uint8_t wire[4096];
+    uint16_t woff = 0;
+    CHECK(serialize_dns_record(wire, sizeof(wire), &woff, &text, NULL, "fuzz.test.", 0xFFFFFFFF) == 0);
+    CHECK(woff == 11 + 10);                                   /* extension class: nothing but the header (generic data is NULL) */
+    text.class_val = 1;
+    woff = 0;
+    CHECK(serialize_dns_record(wire, sizeof(wire), &woff, &text, NULL, "fuzz.test.", 0xFFFFFFFF) == 0);
+    dns_record_t again;
+    memset(&again, 0, sizeof(again));
+    size_t pos = 0;
+    CHECK(parse_resource_record(wire, woff, &pos, &arena, &again, &type) == 0);
+    CHECK(again.rdata_count == rec.rdata_count);
+    for (int i = 0; i < rec.rdata_count && i < again.rdata_count; i++) CHECK(strcasecmp(again.rdata[i], rec.rdata[i]) == 0);
+    zone_arena_destroy(&arena);
+}
+
+/* buf_len bounds what register_wire_name_for_compression() reads: a name whose root octet (or a label) lies outside it is not registered */
+static void test_name_register_bounded(void) {
+    printf("[TEST] register_wire_name_for_compression: a name that does not end inside buf_len is not registered...\n");
+    static const uint8_t www[] = { 3, 'w', 'w', 'w', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
+    uint8_t pkt[64];
+    compress_ctx_t ctx;
+    uint16_t off;
+    memset(pkt, 0, sizeof(pkt));
+    memcpy(pkt + 12, www, sizeof(www));
+    compress_ctx_init(&ctx);
+    register_wire_name_for_compression(pkt, 12 + sizeof(www) - 1, 12, &ctx);       /* the root octet is outside */
+    off = 40;
+    CHECK(compress_name(pkt, &off, www, &ctx, sizeof(pkt)) == 0);
+    CHECK(off == 40 + sizeof(www));                                                 /* written in full: nothing was registered */
+    compress_ctx_init(&ctx);
+    register_wire_name_for_compression(pkt, 14, 12, &ctx);                          /* the first label itself is cut */
+    off = 40;
+    CHECK(compress_name(pkt, &off, www, &ctx, sizeof(pkt)) == 0);
+    CHECK(off == 40 + sizeof(www));
+    compress_ctx_init(&ctx);
+    register_wire_name_for_compression(pkt, 12 + sizeof(www), 12, &ctx);            /* the whole name is inside */
+    off = 40;
+    CHECK(compress_name(pkt, &off, www, &ctx, sizeof(pkt)) == 0);
+    CHECK(off == 42 && pkt[40] == 0xC0 && pkt[41] == 12);                           /* a pointer to it */
 }
 
 static void test_name_canonical_order(void) {
@@ -435,6 +495,19 @@ static void test_domain_names_match_ci(void) {
     CHECK(!domain_names_match_ci("a.example.com.", "example.com."));
     CHECK(!domain_names_match_ci(NULL, "example.com"));
     CHECK(!domain_names_match_ci("example.com", NULL));
+    /* review dns_utils.h [7]/[8]: one pass; only ONE trailing dot is ignored and an escaped one is part of the label */
+    CHECK(domain_names_match_ci("", "."));
+    CHECK(domain_names_match_ci(".", ""));
+    CHECK(!domain_names_match_ci("x..", "x."));
+    CHECK(!domain_names_match_ci("x.", "x.."));
+    CHECK(domain_names_match_ci("x..", "x.."));
+    CHECK(!domain_names_match_ci("a\\.", "a"));
+    CHECK(domain_names_match_ci("a\\\\.", "a\\\\"));   /* the backslash is escaped, so the final dot is a real one */
+    CHECK(dns_name_hash_ci("Example.COM.") == dns_name_hash_ci("example.com"));
+    CHECK(dns_name_hash_ci("a\\.") != dns_name_hash_ci("a"));
+    CHECK(dns_name_hash_ci("a\\\\.") == dns_name_hash_ci("a\\\\"));
+    CHECK(dns_name_hash_ci("x..") != dns_name_hash_ci("x") && dns_name_hash_ci("X..") == dns_name_hash_ci("x.."));   /* one dot only */
+    CHECK(dns_name_hash_ci(".") == dns_name_hash_ci(""));
 }
 
 /* ------------------------------------------------------------------------ dns_wire */
@@ -802,14 +875,14 @@ static void test_name_compression(void) {
     memset(pkt, 0, sizeof(pkt));
     compress_ctx_init(&ctx);
     memcpy(pkt + 12, WWW_EXAMPLE_COM, sizeof(WWW_EXAMPLE_COM));         /* www.example.com at 12 */
-    register_wire_name_for_compression(pkt, 12, &ctx);
+    register_wire_name_for_compression(pkt, sizeof(pkt), 12, &ctx);
     static const uint8_t mail_example_com[] = { 4, 'm', 'a', 'i', 'l', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
     off = 40;
     CHECK(compress_name(pkt, &off, mail_example_com, &ctx, sizeof(pkt)) == 0);
     /* 04 mail + pointer to "example.com" which begins at 12 + 4 = 16 => 0xC010 */
     CHECK(off == 47 && pkt[45] == 0xC0 && pkt[46] == 0x10);
-    register_wire_name_for_compression(NULL, 12, &ctx);
-    register_wire_name_for_compression(pkt, 12, NULL);
+    register_wire_name_for_compression(NULL, 0, 12, &ctx);
+    register_wire_name_for_compression(pkt, sizeof(pkt), 12, NULL);
     compress_ctx_init(NULL);
     compress_ctx_init_packet(NULL);
 }
@@ -870,6 +943,33 @@ static void test_wire_name_length_and_write_uncompressed(void) {
 
     w = write_uncompressed_name(out, 0, sizeof(out), "example.com.");
     CHECK(w == 13);
+
+    /* review dns_wire.c [17]: an empty label is no name ("a..b", ".a", ".."); only "." is the root, a trailing dot and no dot are fine */
+    CHECK(write_uncompressed_name(out, 0, sizeof(out), "a..b.") < 0);
+    CHECK(write_uncompressed_name(out, 0, sizeof(out), ".a.") < 0);
+    CHECK(write_uncompressed_name(out, 0, sizeof(out), "..") < 0);
+    CHECK(write_uncompressed_name(out, 0, sizeof(out), "a.b") == 5 && write_uncompressed_name(out, 0, sizeof(out), "a.b.") == 5);
+    CHECK(calc_fnv1a_str("*.") == FNV1A_WILDCARD_PREFIX_HASH);   /* review dns_zone_parser.h [5]: the constant of the wildcard lookup */
+
+    {   /* review dns_wire.c [15] (BIND: DNS_R_EXTRADATA): RDATA that goes on after the fields of its type is refused; exact RDATA is read */
+        zone_arena_t ar;
+        zone_arena_init(&ar);
+        static const uint8_t exact[] = { 0, 0, 2, 0, 1, 0, 0, 0, 0, 0, 3, 1, 'a', 0 };           /* NS "a." */
+        static const uint8_t extra[] = { 0, 0, 2, 0, 1, 0, 0, 0, 0, 0, 4, 1, 'a', 0, 9 };        /* the same and one octet more */
+        static const uint8_t mx_extra[] = { 0, 0, 15, 0, 1, 0, 0, 0, 0, 0, 6, 0, 10, 1, 'a', 0, 9 };
+        dns_record_t rec;
+        uint16_t ty = 0;
+        size_t off = 0;
+        memset(&rec, 0, sizeof(rec));
+        CHECK(parse_resource_record(exact, sizeof(exact), &off, &ar, &rec, &ty) == 0 && rec.rdata_count == 1 && strcmp(rec.rdata[0], "a.") == 0);
+        off = 0;
+        memset(&rec, 0, sizeof(rec));
+        CHECK(parse_resource_record(extra, sizeof(extra), &off, &ar, &rec, &ty) == -1);
+        off = 0;
+        memset(&rec, 0, sizeof(rec));
+        CHECK(parse_resource_record(mx_extra, sizeof(mx_extra), &off, &ar, &rec, &ty) == -1);
+        zone_arena_destroy(&ar);
+    }
 
     w = write_uncompressed_name(out, 0, sizeof(out), "API.Example.Com.");
     CHECK(w == 17);
@@ -955,6 +1055,22 @@ static void test_parse_u8_and_u16_validation(void) {
     CHECK(!parse_u8("abc", &u8_val));
     CHECK(!parse_u8("123abc", &u8_val));
     CHECK(!parse_u8("", &u8_val));
+    CHECK(!parse_u8("+5", &u8_val));   /* review dns_wire.h [5]: a digit first (strtol alone takes a sign and blanks) */
+    CHECK(!parse_u8(" 5", &u8_val));
+    CHECK(!parse_u16("+5", NULL));
+    CHECK(!parse_u16(" 5", NULL));
+    CHECK(get_type_code("TYPE5") == 5 && get_type_code("TYPE65535") == 65535);
+    CHECK(get_type_code("TYPE+5") == 0 && get_type_code("TYPE 5") == 0);   /* review dns_utils.c [4] */
+    CHECK(strcmp(dns_class_literal(1), "IN") == 0 && strcmp(dns_class_literal(4), "HS") == 0 &&
+          strcmp(dns_class_literal(254), "NONE") == 0 && strcmp(dns_class_literal(255), "ANY") == 0 &&
+          strcmp(dns_class_literal(3), "CH") == 0);
+    {   /* review dns_wire.h [20]: base32hex reports the length the whole text needs */
+        uint8_t h20[20] = {0};
+        char b32[8];
+        CHECK(dns_base32hex_encode(h20, 20, b32, sizeof(b32)) == 32 && strlen(b32) == 7);   /* cut off, and the caller can tell */
+        char b32full[40];
+        CHECK(dns_base32hex_encode(h20, 20, b32full, sizeof(b32full)) == 32 && strlen(b32full) == 32);
+    }
     CHECK(!parse_u8(NULL, &u8_val));
 
     uint16_t u16_val = 0;
@@ -1524,7 +1640,7 @@ static void test_wire_compression_pointer_table_full(void) {
     // Register names in wire format
     uint8_t wire_name[] = { 4, 'h', 'o', 's', 't', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
     memcpy(pkt + 12, wire_name, sizeof(wire_name));
-    register_wire_name_for_compression(pkt, 12, &ctx);
+    register_wire_name_for_compression(pkt, sizeof(pkt), 12, &ctx);
     CHECK(ctx.current_generation == 1);
 }
 
@@ -1536,7 +1652,7 @@ static void test_wire_compression_pointer_to_pointer_chain(void) {
     memset(pkt, 0, sizeof(pkt));
     uint8_t sub_name[] = { 3, 's', 'u', 'b', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
     memcpy(pkt + 12, sub_name, sizeof(sub_name));
-    register_wire_name_for_compression(pkt, 12, &ctx);
+    register_wire_name_for_compression(pkt, sizeof(pkt), 12, &ctx);
     
     uint8_t host_name[] = { 4, 'h', 'o', 's', 't', 3, 's', 'u', 'b', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
     uint16_t cur_off = 50;
@@ -3131,12 +3247,13 @@ static void test_char_string_nul(void) {
     char *tok[] = { (char *)"\\#", (char *)"4", (char *)"0361", (char *)"0062" };
     uint8_t blob[65535];
     size_t blen = 0;
-    CHECK(dns_generic_rdata_parse(16, tok, 4, blob, &blen) == NULL && blen == 4 && memcmp(blob, g, 4) == 0);
+    CHECK(dns_generic_rdata_parse(16, tok, 4, blob, sizeof(blob), &blen) == NULL && blen == 4 && memcmp(blob, g, 4) == 0);
     char *t0[] = { (char *)"\\#", (char *)"0" };
-    CHECK(dns_generic_rdata_parse(65534, t0, 2, blob, &blen) == NULL && blen == 0);
-    CHECK(dns_generic_rdata_parse(12, t0, 2, blob, &blen) != NULL);      /* PTR \# 0 is not valid RDATA */
+    CHECK(dns_generic_rdata_parse(16, tok, 4, blob, 3, &blen) != NULL);   /* review dns_wire.c [18]: 4 octets do not fit a 3-octet buffer */
+    CHECK(dns_generic_rdata_parse(65534, t0, 2, blob, sizeof(blob), &blen) == NULL && blen == 0);
+    CHECK(dns_generic_rdata_parse(12, t0, 2, blob, sizeof(blob), &blen) != NULL);      /* PTR \# 0 is not valid RDATA */
     char *tb[] = { (char *)"\\#", (char *)"3", (char *)"0102" };
-    CHECK(dns_generic_rdata_parse(65534, tb, 3, blob, &blen) != NULL);   /* length mismatch */
+    CHECK(dns_generic_rdata_parse(65534, tb, 3, blob, sizeof(blob), &blen) != NULL);   /* length mismatch */
     zone_arena_destroy(&a);
 }
 
@@ -3576,6 +3693,8 @@ int main(void) {
     test_name_wire_decoders();
     test_name_canonical_order();
     test_name_register_stops_at_pointer();
+    test_name_register_bounded();
+    test_rrsig_ext_class_text_roundtrip();
     test_name_zone_parser_normalizes();
     test_name_tinydns_normalizes();
     test_serialize_exact_fit_base64();

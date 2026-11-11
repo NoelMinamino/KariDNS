@@ -37,6 +37,8 @@ typedef struct dir_fd_entry {
 } dir_fd_entry_t;
 
 static dir_fd_entry_t *g_dir_fd_table = NULL;
+/* The one pthread mutex outside the RCU rule of CLAUDE.md: it guards the directory fd table, is held across the open of a directory, and is
+ * taken only at startup, at reload (zone files, logs) and in the control paths; the query path never touches it. */
 static pthread_mutex_t g_dir_fd_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_dir_fd_fchown_dropped = false;
 bool g_bypass_cap_enter = false;
@@ -52,6 +54,16 @@ static bool path_has_dotdot_component(const char *p) {
 #ifndef O_RESOLVE_BENEATH
 #define O_RESOLVE_BENEATH 0
 #endif
+#ifndef AT_RESOLVE_BENEATH
+#define AT_RESOLVE_BENEATH 0
+#endif
+
+/* Beside the rights, the fcntl() commands a descriptor allows are cut to the ones the server uses (cap_fcntls_limit(2); CAP_FCNTL alone
+ * allows all of them).  A file opened through a directory fd inherits the list.  ENOSYS (no CAPABILITY_MODE in the kernel) is not a failure. */
+static void limit_fd_fcntls(int fd, uint32_t fcntls, const char *what) {
+  if (cap_fcntls_limit(fd, fcntls) == 0 || errno == ENOSYS) return;
+  syslog(LOG_ERR, "[Sandbox] cap_fcntls_limit(%s, fd %d) failed: %s; the descriptor allows all fcntl commands", what, fd, strerror(errno));
+}
 
 /* The cache key of a directory path: trailing slashes cut ("/var/dns/" and "/var/dns" are one directory, and a root registered as
  * "/var/dns/" must match the "/var/dns/zones" that open_dir_below_root_locked() looks for), the root "/" kept.  false = too long. */
@@ -93,6 +105,7 @@ static int open_dir_below_root_locked(const char *dirpath) {
     close(fd);
     return -1;
   }
+  limit_fd_fcntls(fd, CAP_FCNTL_GETFL, "directory");   /* fdopen() of a file opened through it asks F_GETFL */
   ne->fd = fd;
   ne->next = g_dir_fd_table;
   g_dir_fd_table = ne;
@@ -106,14 +119,20 @@ static int get_or_open_dir_fd(const char *dirpath_in, bool writable) {
     return -1;
   }
   pthread_mutex_lock(&g_dir_fd_lock);
+  int writable_hit = -1;
   for (dir_fd_entry_t *e = g_dir_fd_table; e; e = e->next) {
     if (strcmp(e->dirpath, dirpath) == 0) {
-      if (!writable || e->is_writable) {
+      if (writable ? e->is_writable : !e->is_writable) {
         int fd = e->fd;
         pthread_mutex_unlock(&g_dir_fd_lock);
         return fd;
       }
+      if (!writable) writable_hit = e->fd;   /* a read-only request gets a read-only entry when there is one, else this */
     }
+  }
+  if (writable_hit >= 0) {
+    pthread_mutex_unlock(&g_dir_fd_lock);
+    return writable_hit;
   }
   if (atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire)) {
     int bfd = writable ? -1 : open_dir_below_root_locked(dirpath);
@@ -156,6 +175,7 @@ static int get_or_open_dir_fd(const char *dirpath_in, bool writable) {
     pthread_mutex_unlock(&g_dir_fd_lock);
     return -1;
   }
+  limit_fd_fcntls(fd, CAP_FCNTL_GETFL, "directory");   /* fdopen() of a file opened through it asks F_GETFL */
   dir_fd_entry_t *e = calloc(1, sizeof(*e));
   if (!e) {
     close(fd);
@@ -177,10 +197,6 @@ static int get_or_open_dir_fd(const char *dirpath_in, bool writable) {
   return fd;
 }
 
-#ifndef O_RESOLVE_BENEATH
-#define O_RESOLVE_BENEATH 0
-#endif
-
 int open_via_dir_cache(const char *path, int flags, mode_t mode,
                        bool writable) {
   char dirbuf[PATH_MAX], basebuf[PATH_MAX];
@@ -192,7 +208,7 @@ int open_via_dir_cache(const char *path, int flags, mode_t mode,
   int dfd = get_or_open_dir_fd(dirbuf, writable);
   if (dfd < 0)
     return -1;
-  return openat(dfd, basebuf, flags | O_RESOLVE_BENEATH, mode);
+  return openat(dfd, basebuf, flags | O_CLOEXEC | O_RESOLVE_BENEATH, mode);   /* never into a program-zone plugin or the loader */
 }
 
 bool dir_fd_cache_add_root(const char *dirpath) {
@@ -254,7 +270,7 @@ int stat_via_dir_cache(const char *path, struct stat *sb) {
   int dfd = get_or_open_dir_fd(dirbuf, false);
   if (dfd < 0)
     return -1;
-  return fstatat(dfd, basebuf, sb, 0);
+  return fstatat(dfd, basebuf, sb, AT_RESOLVE_BENEATH);   /* as the open does: a symbolic link does not lead out of the directory */
 }
 
 int renameat_via_dir_cache(const char *old_path, const char *new_path) {
@@ -294,9 +310,17 @@ int list_dir_via_dir_cache(const char *file_path, void (*cb)(const char *name, v
     return -1;
   }
   struct dirent *de;
-  while ((de = readdir(d)) != NULL)
-    cb(de->d_name, ud);
+  errno = 0;
+  while ((de = readdir(d)) != NULL) {
+    if (strcmp(de->d_name, ".") != 0 && strcmp(de->d_name, "..") != 0) cb(de->d_name, ud);
+    errno = 0;
+  }
+  int rd_errno = errno;   /* readdir() returns NULL for the end and for an error; only errno tells them apart */
   closedir(d);
+  if (rd_errno != 0) {
+    errno = rd_errno;
+    return -1;
+  }
   return 0;
 }
 
@@ -322,7 +346,9 @@ bool limit_server_socket_rights(int fd, bool is_listening_tcp) {
     cap_rights_init(&rights, CAP_RECV, CAP_SEND, CAP_CONNECT, CAP_EVENT,
                     CAP_GETSOCKOPT, CAP_SETSOCKOPT, CAP_SHUTDOWN,
                     CAP_GETSOCKNAME, CAP_GETPEERNAME);
-  return limit_fd_rights(fd, &rights, is_listening_tcp ? "listening socket" : "server socket");
+  bool ok = limit_fd_rights(fd, &rights, is_listening_tcp ? "listening socket" : "server socket");
+  if (ok) limit_fd_fcntls(fd, CAP_FCNTL_GETFL | CAP_FCNTL_SETFL, "server socket");   /* O_NONBLOCK is all the server sets */
+  return ok;
 }
 
 bool limit_client_socket_rights(int fd) {
@@ -330,7 +356,9 @@ bool limit_client_socket_rights(int fd) {
   cap_rights_init(&rights, CAP_RECV, CAP_SEND, CAP_FCNTL, CAP_EVENT,
                   CAP_GETSOCKOPT, CAP_SETSOCKOPT, CAP_SHUTDOWN, CAP_GETSOCKNAME,
                   CAP_GETPEERNAME);
-  return limit_fd_rights(fd, &rights, "client socket");
+  bool ok = limit_fd_rights(fd, &rights, "client socket");
+  if (ok) limit_fd_fcntls(fd, CAP_FCNTL_GETFL | CAP_FCNTL_SETFL, "client socket");
+  return ok;
 }
 
 void enter_capsicum_sandbox(void) {
@@ -394,14 +422,16 @@ bool lookup_user_ids(const char *user, uid_t *uid, gid_t *gid) {
     if (buf != stackbuf) free(buf);
     len *= 2;
     buf = malloc(len);
-    if (!buf) return false;
+    if (!buf) { errno = ENOMEM; return false; }
   }
   bool ok = (rc == 0 && res != NULL);
+  int lookup_errno = rc;   /* 0 = the name is not there; else the error of the lookup */
   if (ok) {
     *uid = pw.pw_uid;
     *gid = pw.pw_gid;
   }
   if (buf != stackbuf) free(buf);
+  errno = lookup_errno;
   return ok;
 }
 
@@ -415,11 +445,12 @@ bool lookup_group_id(const char *group, gid_t *gid) {
     if (buf != stackbuf) free(buf);
     len *= 2;
     buf = malloc(len);
-    if (!buf) return false;
+    if (!buf) { errno = ENOMEM; return false; }
   }
   bool ok = (rc == 0 && res != NULL);
   if (ok) *gid = gr.gr_gid;
   if (buf != stackbuf) free(buf);
+  errno = rc;   /* 0 = the name is not there; else the error of the lookup */
   return ok;
 }
 
@@ -436,14 +467,18 @@ bool resolve_run_identity(const char *user, const char *group, run_identity_t *i
   if (identity_names_root(user, group, err, errlen)) return false;
   if (user) {
     if (!lookup_user_ids(user, &id->uid, &id->gid)) {
-      snprintf(err, errlen, "user '%s' not found", user);
+      int e = errno;   /* 0: not in the user database; else the lookup itself failed */
+      if (e) snprintf(err, errlen, "user '%s' could not be looked up: %s", user, strerror(e));
+      else snprintf(err, errlen, "user '%s' not found", user);
       return false;
     }
     id->has_user = true;
   }
   if (group) {
     if (!lookup_group_id(group, &id->gid)) {
-      snprintf(err, errlen, "group '%s' not found", group);
+      int e = errno;
+      if (e) snprintf(err, errlen, "group '%s' could not be looked up: %s", group, strerror(e));
+      else snprintf(err, errlen, "group '%s' not found", group);
       return false;
     }
     id->has_group = true;
@@ -520,13 +555,6 @@ bool apply_run_identity_id(const run_identity_t *id, char *err, size_t errlen) {
   return true;
 }
 
-bool apply_run_identity(const char *user, const char *group, char *err, size_t errlen) {
-  run_identity_t id;
-  if (!resolve_run_identity(user, group, &id, err, errlen))
-    return false;
-  return apply_run_identity_id(&id, err, errlen);
-}
-
 // ============================================================================
 // Backend の終了 (O-15)
 // ============================================================================
@@ -555,6 +583,7 @@ void backend_profile_flush(void) {
  * 解放済みのロックやテーブルを他スレッドが使う窓ができる。_exit() はそれを実行しない。
  * カバレッジ計測ビルドではプロファイルだけ先に書き出す。 */
 __attribute__((noreturn)) void backend_exit(int code) {
+  fflush(stdout);   /* _exit() does not: a message printed with printf() before a failed start would be lost when stdout is a pipe or a file */
   backend_profile_flush();
   _exit(code);
 }

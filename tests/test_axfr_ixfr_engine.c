@@ -408,6 +408,33 @@ static void test_compute_ixfr_diff_generic_and_edge_cases(void) {
     assert(entry.ixfr_history.entries[0]->old_serial == 4294967295U);
     assert(entry.ixfr_history.entries[0]->new_serial == 1U);
 
+    // 2b. serial 0 is a serial like any other (RFC 1982): 0 -> 1 has a history entry; only a missing SOA means "no serial"
+    {
+        zone_arena_t a_zero, a_one;
+        zone_arena_init(&a_zero);
+        zone_arena_init(&a_one);
+        a_zero.records = calloc(4, sizeof(dns_record_t)); a_zero.records_cap = 4;
+        a_one.records = calloc(4, sizeof(dns_record_t)); a_one.records_cap = 4;
+        dns_record_t z0 = soa1;
+        dns_record_dup_rdata(&a_zero, &z0);
+        z0.name = arena_strdup(&a_zero, "example.org.");
+        z0.rdata[2] = arena_strdup(&a_zero, "0");
+        a_zero.records[0] = z0;
+        a_zero.count = 1;
+        build_zone_index(&a_zero, true);
+        dns_record_t z1 = soa1;
+        dns_record_dup_rdata(&a_one, &z1);
+        z1.name = arena_strdup(&a_one, "example.org.");
+        z1.rdata[2] = arena_strdup(&a_one, "1");
+        a_one.records[0] = z1;
+        a_one.count = 1;
+        build_zone_index(&a_one, true);
+        int before = entry.ixfr_history.count;
+        compute_ixfr_diff(&entry, &a_zero, &a_one);
+        assert(entry.ixfr_history.count == before + 1);
+        assert(entry.ixfr_history.entries[before]->old_serial == 0U && entry.ixfr_history.entries[before]->new_serial == 1U);
+    }
+
     // 3. Ring buffer full rollover test (B-3: the depth is configurable, default 4; use the maximum here)
     ixfr_history_set_depth(&entry, MAX_IXFR_HISTORY);
     for (int k = 0; k < MAX_IXFR_HISTORY + 5; k++) {

@@ -55,7 +55,7 @@ Use `pkg add -f` to replace an already installed version in place.
 - **Configuration & Zones:**
   - `/usr/local/etc/karidns/karidns.conf.sample`
   - `/usr/local/etc/karidns/karictl.conf.sample`
-  - `/usr/local/etc/karidns/zones/example.local.zone.sample`
+  - `/usr/local/etc/karidns/zones/example.test.zone.sample`
 - **Service Management:**
   - `/usr/local/etc/rc.d/karidns`
 - **Manuals:**
@@ -71,7 +71,7 @@ Use `pkg add -f` to replace an already installed version in place.
 1. Copy the configuration and sample zone, then edit them (`user`, `group`, secrets, zones):
    ```sh
    cp /usr/local/etc/karidns/karidns.conf.sample /usr/local/etc/karidns/karidns.conf
-   cp /usr/local/etc/karidns/zones/example.local.zone.sample /usr/local/etc/karidns/zones/example.local.zone
+   cp /usr/local/etc/karidns/zones/example.test.zone.sample /usr/local/etc/karidns/zones/example.test.zone
    ```
 2. Enable and start:
    ```sh
@@ -190,16 +190,16 @@ brew install NoelMinamino/tap/dag
 
 ```sh
 # Standard UDP Query
-dag example.local A @127.0.0.1
+dag example.test A @127.0.0.1
 
 # TCP Query with DNSSEC & EDNS
-dag example.local A @127.0.0.1 +tcp +dnssec +edns
+dag example.test A @127.0.0.1 +tcp +dnssec +edns
 
 # Query several servers and compare the answers
-dag example.local A @192.0.2.1,198.51.100.1,203.0.113.1
+dag example.test A @192.0.2.1,198.51.100.1,203.0.113.1
 
 # Anomaly testing / packet fuzzing (local test servers only)
-dag example.local A @127.0.0.1 --break qdcount=2
+dag example.test A @127.0.0.1 --break qdcount=2
 ```
 
 ---

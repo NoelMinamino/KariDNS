@@ -26,7 +26,13 @@ static inline void dns_siphash_key_from_bytes(const uint8_t key16[16], uint64_t 
     k[1] = dns_siphash_load_le64(key16 + 8);
 }
 
-#define DNS_SIPHASH_ROTL(x, b) (uint64_t)(((x) << (b)) | ((x) >> (64 - (b))))
+/* clang -Wimplicit-fallthrough does not read the comment form */
+#if defined(__GNUC__) || defined(__clang__)
+#define DNS_SIPHASH_FALLTHROUGH __attribute__((fallthrough))
+#else
+#define DNS_SIPHASH_FALLTHROUGH ((void)0)
+#endif
+#define DNS_SIPHASH_ROTL(x, b)(uint64_t)(((x) << (b)) | ((x) >> (64 - (b))))
 #define DNS_SIPROUND do { \
     v0 += v1; v1 = DNS_SIPHASH_ROTL(v1, 13); v1 ^= v0; v0 = DNS_SIPHASH_ROTL(v0, 32); \
     v2 += v3; v3 = DNS_SIPHASH_ROTL(v3, 16); v3 ^= v2; \
@@ -47,13 +53,13 @@ static inline uint64_t dns_siphash24(const uint8_t *in, size_t inlen, const uint
     }
     uint64_t t = 0;
     switch (inlen & 7) {
-        case 7: t |= ((uint64_t)in[6]) << 48; /* fallthrough */
-        case 6: t |= ((uint64_t)in[5]) << 40; /* fallthrough */
-        case 5: t |= ((uint64_t)in[4]) << 32; /* fallthrough */
-        case 4: t |= ((uint64_t)in[3]) << 24; /* fallthrough */
-        case 3: t |= ((uint64_t)in[2]) << 16; /* fallthrough */
-        case 2: t |= ((uint64_t)in[1]) << 8;  /* fallthrough */
-        case 1: t |= ((uint64_t)in[0]);       /* fallthrough */
+        case 7: t |= ((uint64_t)in[6]) << 48; DNS_SIPHASH_FALLTHROUGH;
+        case 6: t |= ((uint64_t)in[5]) << 40; DNS_SIPHASH_FALLTHROUGH;
+        case 5: t |= ((uint64_t)in[4]) << 32; DNS_SIPHASH_FALLTHROUGH;
+        case 4: t |= ((uint64_t)in[3]) << 24; DNS_SIPHASH_FALLTHROUGH;
+        case 3: t |= ((uint64_t)in[2]) << 16; DNS_SIPHASH_FALLTHROUGH;
+        case 2: t |= ((uint64_t)in[1]) << 8;  DNS_SIPHASH_FALLTHROUGH;
+        case 1: t |= ((uint64_t)in[0]);       DNS_SIPHASH_FALLTHROUGH;
         default: break;
     }
     b |= t;
@@ -63,6 +69,7 @@ static inline uint64_t dns_siphash24(const uint8_t *in, size_t inlen, const uint
 }
 
 #undef DNS_SIPROUND
+#undef DNS_SIPHASH_FALLTHROUGH
 #undef DNS_SIPHASH_ROTL
 
 #endif /* DNS_SIPHASH_H */

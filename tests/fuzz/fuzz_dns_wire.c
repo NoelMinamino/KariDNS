@@ -24,6 +24,9 @@ static void check_dnssec_text_fields(const dns_record_t *rec, zone_arena_t *aren
     text.generic_data = NULL;
     text.generic_len = 0;
     text.is_cached = false;
+    /* a record of the KariDNS extension class is written from generic_data, never from the text fields (serialize_dns_record()): the text form is
+     * checked as the ordinary IN record it would be */
+    text.class_val = 1;
     uint8_t wire[65535];
     uint16_t off = 0;
     if (serialize_dns_record(wire, sizeof(wire), &off, &text, NULL, "fuzz.test.", 0xFFFFFFFF) != 0) return;

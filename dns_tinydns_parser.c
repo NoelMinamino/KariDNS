@@ -1074,6 +1074,10 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                 size_t fp_len = hex_decode(fp_hex, dummy_fp, sizeof(dummy_fp));
                 if (flen[3] > 0 && (fp_len == 0 || fp_len == (size_t)-1)) {
                     // デコード不能な不正な16進数の場合はレコード生成をスキップ (緩いパース哲学)
+                    // review dns_tinydns_parser.c [8]: counted in the context so that karicheck can warn once per file
+                    if (ctx) {
+                        if (ctx->skipped_data_count++ == 0) ctx->first_skipped_data = owner;
+                    }
                     return true;
                 }
 

@@ -28,6 +28,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <syslog.h>
 #include <grp.h>
 #include <stdatomic.h>
@@ -889,6 +890,93 @@ static void test_zone_program_and_forward(void) {
     expect_reject("forward-timeout ';' missing", "zone \"f.test\" { type forward; forward-timeout 5 };");
 }
 
+/* 0.6.1: alerts { } in options and in a zone */
+static void test_alerts_block(void) {
+    printf("[TEST] alerts block (options and zone)...\n");
+    server_config_t cfg;
+    if (parse_ok("options { alerts { interval 30; qps-above 200000; servfail-ratio-above 2.5; rrl-drops-above 1000; "
+                 "transfer-failures-above 0; reload-failures-above 0; }; }; "
+                 "zone \"a.test\" { type master; file \"a\"; alerts { qps-above 5; transfer-failures-above 3; }; }; "
+                 "zone \"b.test\" { type master; file \"b\"; };", &cfg)) {
+        CHECK(cfg.alerts.configured && cfg.alerts.interval == 30);
+        CHECK(cfg.alerts.set[ALERT_QPS_ABOVE] && cfg.alerts.limit[ALERT_QPS_ABOVE] == 200000.0);
+        CHECK(cfg.alerts.set[ALERT_SERVFAIL_RATIO_ABOVE] && cfg.alerts.limit[ALERT_SERVFAIL_RATIO_ABOVE] == 2.5);
+        CHECK(cfg.alerts.set[ALERT_RRL_DROPS_ABOVE] && cfg.alerts.limit[ALERT_RRL_DROPS_ABOVE] == 1000.0);
+        CHECK(cfg.alerts.set[ALERT_TRANSFER_FAILURES_ABOVE] && cfg.alerts.limit[ALERT_TRANSFER_FAILURES_ABOVE] == 0.0);
+        CHECK(cfg.alerts.set[ALERT_RELOAD_FAILURES_ABOVE]);
+        const zone_config_t *za = cfg.views ? cfg.views->zones : NULL;
+        const zone_config_t *zb = za ? za->next : NULL;
+        if (za && zb) {   /* (the list order is not the file order: find them by name) */
+            if (strncmp(za->domain, "a.test", 6) != 0) { const zone_config_t *t = za; za = zb; zb = t; }
+            CHECK(strncmp(za->domain, "a.test", 6) == 0);   /* (names are kept with the root label) */
+            CHECK(zext(za)->alerts.configured && zext(za)->alerts.set[ALERT_QPS_ABOVE] && zext(za)->alerts.limit[ALERT_QPS_ABOVE] == 5.0);
+            CHECK(!zext(za)->alerts.set[ALERT_SERVFAIL_RATIO_ABOVE]);
+            CHECK(!zext(zb)->alerts.configured);
+        } else {
+            CHECK(false);
+        }
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { alerts { qps-above 1; }; alerts { rrl-drops-above 2; }; };", &cfg)) {   /* a second block replaces the first */
+        CHECK(!cfg.alerts.set[ALERT_QPS_ABOVE] && cfg.alerts.set[ALERT_RRL_DROPS_ABOVE] && cfg.alerts.interval == 0);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { alerts { }; };", &cfg)) {   /* an empty block is a warning, not an error */
+        CHECK(cfg.alerts.configured);
+        free_server_config_fields(&cfg);
+    }
+    /* limits, as the effective set of a zone: the zone's name wins, the options value fills the rest, reload-failures stays server-only */
+    {
+        alerts_config_t o, z;
+        memset(&o, 0, sizeof(o));
+        memset(&z, 0, sizeof(z));
+        o.configured = true;
+        o.set[ALERT_QPS_ABOVE] = true; o.limit[ALERT_QPS_ABOVE] = 100;
+        o.set[ALERT_RELOAD_FAILURES_ABOVE] = true; o.limit[ALERT_RELOAD_FAILURES_ABOVE] = 0;
+        o.set[ALERT_RRL_DROPS_ABOVE] = true; o.limit[ALERT_RRL_DROPS_ABOVE] = 9;
+        z.configured = true;
+        z.set[ALERT_QPS_ABOVE] = true; z.limit[ALERT_QPS_ABOVE] = 7;
+        alert_limits_t l;
+        alert_limits_for_zone(&o, &z, &l);
+        CHECK(l.set[ALERT_QPS_ABOVE] && l.limit[ALERT_QPS_ABOVE] == 7);
+        CHECK(l.set[ALERT_RRL_DROPS_ABOVE] && l.limit[ALERT_RRL_DROPS_ABOVE] == 9);
+        CHECK(!l.set[ALERT_RELOAD_FAILURES_ABOVE] && !l.set[ALERT_SERVFAIL_RATIO_ABOVE]);
+        alert_limits_for_server(&o, &l);
+        CHECK(l.set[ALERT_QPS_ABOVE] && l.limit[ALERT_QPS_ABOVE] == 100 && l.set[ALERT_RELOAD_FAILURES_ABOVE]);
+        alert_limits_for_zone(NULL, NULL, &l);
+        CHECK(!l.set[ALERT_QPS_ABOVE]);
+        alert_limits_for_server(NULL, &l);
+        CHECK(!l.set[ALERT_QPS_ABOVE]);
+        CHECK_STR(alert_kind_name(ALERT_SERVFAIL_RATIO_ABOVE), "servfail-ratio-above");
+        CHECK_STR(alert_kind_name((alert_kind_t)99), "?");
+        CHECK(alert_kind_in_zone(ALERT_QPS_ABOVE) && !alert_kind_in_zone(ALERT_RELOAD_FAILURES_ABOVE) && !alert_kind_in_zone((alert_kind_t)99));
+    }
+    expect_an_error("an unknown statement", "options { alerts { qps-over 5; }; };", "unknown statement 'qps-over'");
+    expect_an_error("interval too small", "options { alerts { interval 9; }; };", "interval 9 is outside 10..3600");
+    expect_an_error("interval too large", "options { alerts { interval 3601; }; };", "interval 3601 is outside 10..3600");
+    expect_an_error("interval not whole", "options { alerts { interval 10.5; }; };", "interval 10.5 is outside");
+    expect_an_error("ratio above 100", "options { alerts { servfail-ratio-above 101; }; };", "outside 0..100");
+    expect_an_error("negative limit", "options { alerts { qps-above -1; }; };", "outside 0 and above");
+    expect_an_error("not a number", "options { alerts { rrl-drops-above lots; }; };", "'lots' is not a number");
+    expect_an_error("not finite", "options { alerts { qps-above nan; }; };", "is not a number");
+    expect_an_error("missing semicolon", "options { alerts { qps-above 5 }; };", "missing ';' after 'qps-above'");
+    expect_an_error("value missing", "options { alerts { qps-above }; };", "needs a number");
+    expect_an_error("no brace", "options { alerts qps-above 5; };", "expected '{'");
+    expect_an_error("block not closed with ;", "options { alerts { qps-above 5; } };", "missing ';' after '}'");
+    expect_an_error("statement name expected", "options { alerts { ; }; };", "expected a statement name or '}'");
+    expect_an_error("interval in a zone", "zone \"a.test\" { type master; file \"a\"; alerts { interval 20; }; };", "options { alerts { } } only");
+    expect_an_error("reload-failures in a zone", "zone \"a.test\" { type master; file \"a\"; alerts { reload-failures-above 1; }; };", "options { alerts { } } only");
+    expect_an_error("a zone block with an unknown statement", "zone \"a.test\" { type master; file \"a\"; alerts { frob 1; }; };", "unknown statement 'frob'");
+    /* a database zone's settings text is hostile input: alerts is not one of its statements */
+    {
+        char err[256] = "";
+        zone_ext_shared_t *s = db_settings_parse("alerts { qps-above 1; };", strlen("alerts { qps-above 1; };"), err, sizeof(err));
+        CHECK(s == NULL);
+        CHECK(strstr(err, "not allowed in the settings of a database zone") != NULL);
+        if (s) zone_ext_shared_unref(s);
+    }
+}
+
 static void test_zone_rate_limit(void) {
     printf("[TEST] rate-limit block (per zone)...\n");
     server_config_t cfg;
@@ -1236,6 +1324,7 @@ static void test_control_keys(void) {
     CHECK(control_command_perm("rollback", true) == CTLP_ROLLBACK);
     CHECK(control_command_perm("status", false) == CTLP_READ && control_command_perm("zonestatus", true) == CTLP_READ);
     CHECK(control_command_perm("observatory", false) == CTLP_READ && control_command_perm("dbstatus", false) == CTLP_READ);
+    CHECK(control_command_perm("stats", false) == CTLP_READ && control_command_perm("obspage", true) == CTLP_READ);   /* karictl stats (0.6.1) */
     CHECK(control_command_perm("evict", true) == CTLP_OTHER && control_command_perm("xfr-fail", true) == CTLP_OTHER);
     CHECK(control_command_perm("", false) == CTLP_OTHER && control_command_perm("bogus", true) == CTLP_OTHER && control_command_perm(NULL, false) == CTLP_OTHER);
     CHECK(control_command_perm("RELOAD", false) == CTLP_OTHER);          /* the server compares the command case-sensitively: so does the permission */
@@ -4999,8 +5088,54 @@ static void test_low_l1_config_body(void) {
     }
 }
 
+/* review lows of the server group: an nsid that cannot be sent is refused, a file that is not a regular file or holds a NUL is not read, a bool
+ * statement with the wrong token is an error with a place */
+static void test_review_lows_g4(void) {
+    printf("[TEST] review lows (nsid cap, files that are not read, bool statement errors)...\n");
+    char nsid_ok[256], nsid_long[256];
+    char val[KARIDNS_NSID_MAX + 2];
+    memset(val, 'n', sizeof(val));
+    val[KARIDNS_NSID_MAX] = '\0';
+    snprintf(nsid_ok, sizeof(nsid_ok), "options { nsid \"%s\"; };", val);
+    val[KARIDNS_NSID_MAX] = 'n';
+    val[KARIDNS_NSID_MAX + 1] = '\0';
+    snprintf(nsid_long, sizeof(nsid_long), "options { nsid \"%s\"; };", val);
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    if (parse_ok(nsid_ok, &cfg)) free_server_config_fields(&cfg);
+    expect_reject("nsid longer than KARIDNS_NSID_MAX", nsid_long);
+    expect_reject("bool statement with a block", "options { querylog { }; };");
+    expect_reject("bool statement without ';'", "options { querylog yes }; ");
+    expect_reject("bool statement with a bad value", "options { querylog maybe; };");
+
+    char root[] = "/tmp/kdns_g4_XXXXXX";
+    if (!mkdtemp(root)) { printf("  [FAIL] mkdtemp\n"); g_failed++; return; }
+    char path[PATH_MAX];
+    struct stat st;
+    snprintf(path, sizeof(path), "%s/fifo", root);
+    CHECK(mkfifo(path, 0600) == 0);
+    CHECK(read_entire_file_stat(path, &st) == NULL);                   /* a FIFO: not opened for a writer, not read */
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/nul.conf", root);
+    FILE *f = fopen(path, "wb");
+    CHECK(f != NULL);
+    if (f) { fwrite("options { };\0 zone", 1, 19, f); fclose(f); }
+    CHECK(read_entire_file_stat(path, &st) == NULL);                   /* the rest after a NUL would be ignored: refused */
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/ok.conf", root);
+    f = fopen(path, "wb");
+    CHECK(f != NULL);
+    if (f) { fputs("options { };\n", f); fclose(f); }
+    char *txt = read_entire_file_stat(path, &st);
+    CHECK(txt != NULL && strcmp(txt, "options { };\n") == 0 && S_ISREG(st.st_mode));
+    free(txt);
+    unlink(path);
+    rmdir(root);
+}
+
 int main(void) {
     printf("=== Starting Config Directive Tests ===\n");
+    test_review_lows_g4();
     test_in_view();
     test_bind_option_values_update_policy();
     test_bind_option_values_catalog_zones();
@@ -5028,6 +5163,7 @@ int main(void) {
     test_zone_types_and_files();
     test_zone_program_and_forward();
     test_zone_rate_limit();
+    test_alerts_block();
     test_acl_lists();
     test_tsig_key_blocks();
     test_control_channel();

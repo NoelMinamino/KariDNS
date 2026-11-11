@@ -21,6 +21,7 @@ typedef enum {
  * クライアントは ipv4-prefix-length / ipv6-prefix-length でまとめる。 */
 typedef struct {
   rrl_response_class_t cls;
+  /* 指す先は呼び出し側のもの。rrl_check_key() / rrl_key_exhausted() が返るまで有効ならよい (キーは保持しない) */
   const char *name;  /* NOERROR / NODATA: QNAME、NXDOMAIN: ゾーン名、referral: 委任点、エラー: NULL */
   bool wildcard;     /* name はゾーン名で、"*.<ゾーン>" のバケットに数える */
   uint16_t qtype;    /* NOERROR だけがキーに含める */
@@ -32,7 +33,6 @@ extern _Atomic uint64_t g_rrl_slip_total;
 
 void rrl_init(void);
 void rrl_shutdown(void);
-uint64_t siphash24(const uint8_t *in, size_t inlen, const uint64_t k[2]);
 rrl_response_class_t get_rrl_class(const uint8_t *res_buf, size_t res_len);
 /* 応答からキーを作る。zone は応答を作ったゾーンの名前 (無ければ NULL)、wildcard は答えが
  * ワイルドカードから作られたか。namebuf (DNS_NAME_TEXT_SIZE) は委任点の名前の置き場。 */
