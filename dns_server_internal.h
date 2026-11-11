@@ -306,7 +306,6 @@ typedef struct {
 
 struct worker_ctx {
   int thread_id;
-  int core_id;
   zone_rcu_t *rcu_db;
   qlog_ring_t qlog_ring;
   dnstap_ring_t dnstap_ring;
@@ -1488,7 +1487,6 @@ bool control_socket_in_use(const char *path);
 void daemonize(void);
 void setup_ipc_tables(int num_workers);
 void run_frontend_router(pid_t backend_pid, int router_id);
-int allowed_cpu(int index);
 void *worker_thread_func(void *arg);
 #endif
 

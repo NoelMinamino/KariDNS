@@ -13,7 +13,7 @@
 # karidns_signer_user="karidns-signer"                                 # the user the daemon runs as (created by the package)
 # karidns_signer_tmpfs="YES"                                           # mount a tmpfs on the work-dir of the configuration file
 # karidns_signer_tmpfs_size="256m"                                     # its size
-# karidns_signer_cpuset=""                                             # cpuset(1) CPU list (for example "2-3"): keeps the signer off the CPUs of the server
+# karidns_signer_cpuset=""                                             # cpuset(1) CPU list (for example "3"): the CPUs the signer may use (karidns is not pinned)
 # karidns_signer_flags=""                                              # more options of karidns-signer
 #
 # service karidns_signer reload      reads the configuration file again (SIGHUP)
