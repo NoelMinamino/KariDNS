@@ -264,7 +264,7 @@ Algorithm rollovers (RFC 6781) follow the same steps with the two algorithms' ke
 
 The signer never competes with the server for CPU if you do not let it. Signing is CPU heavy for a short time (a big zone, many zones due together), `dnssec-signzone` is single threaded, and `workers` multiplies it.
 
-* **Same host:** `karidns_signer_cpuset="2-3"` in `rc.conf` (`cpuset -l 2-3`), or `cpuset -l 2-3 -p <pid>`, and `workers` no larger than the CPUs you give it. `rtprio` / `nice` do not matter for a CPU set of its own.
+* **Same host:** give the signer CPUs of its own and keep `workers` no larger than their number, for example `karidns_signer_cpuset="3"` in `rc.conf` (`cpuset -l 3`) or `cpuset -l 3 -p <pid>`. `karidns` does not pin its threads (since 0.6.1), so it uses whatever CPUs are free; on a host with few CPUs, leave most of them to the server (on 4 CPUs at most one or two for the signer). `rtprio` / `nice` do not matter for a CPU set of its own.
 * **Other host:** the signer needs only the database (and, with SQLite3, the file and the server's control socket, which is why PostgreSQL is the choice for this), `karidns-zone`, `karicheck`, `bind-tools` and Node. Install the same package on a host that runs no server, enable only `karidns_signer`, and use a conninfo file that names the database host (`sslmode=verify-full`). The signed data reaches the servers through the database; their loaders reload on the reload requests.
 * **Several instances** on one PostgreSQL database share the zones (advisory locks). They need the same configuration.
 

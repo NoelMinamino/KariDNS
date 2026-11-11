@@ -32,10 +32,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/capsicum.h> // Capsicum capability mode / rights
-#include <sys/cpuset.h>   // cpuset
 #include <sys/file.h>     // flock
 #include <sys/event.h>    // kqueue
-#include <sys/param.h>    // cpuset
+#include <sys/param.h>
 #include <sys/procctl.h>  // PROC_TRAPCAP
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -153,20 +152,6 @@ STATIC_TEST void capture_host_status_info(void) {
   g_host_status_info.ncpus = n > 0 ? (int)n : 1;
 }
 
-/* M3: the CPU for router or worker `index`: the index-th (modulo their count) of the CPUs in the cpuset of this process, which in a jail or under
- * cpuset(1) need not be 0..N-1.  -1 when the set cannot be read or is empty (the caller then runs unpinned). */
-STATIC_TEST int allowed_cpu(int index) {
-  cpuset_t set;
-  CPU_ZERO(&set);
-  if (index < 0 || cpuset_getaffinity(CPU_LEVEL_CPUSET, CPU_WHICH_PID, -1, sizeof(set), &set) != 0) return -1;
-  int count = CPU_COUNT(&set);
-  if (count <= 0) return -1;
-  int want = index % count;
-  for (int c = 0; c < CPU_SETSIZE; c++) {
-    if (CPU_ISSET(c, &set) && want-- == 0) return c;
-  }
-  return -1;
-}
 _Atomic int g_xfers_running = ATOMIC_VAR_INIT(0);
 _Atomic int g_tcp_clients = ATOMIC_VAR_INIT(0);
 _Atomic int g_tcp_high_water = ATOMIC_VAR_INIT(0);
@@ -2507,19 +2492,9 @@ void *worker_thread_func(void *arg) {
   memset(&park, 0, sizeof(park));
   bool park_on = false;
   uint32_t park_timeout_ms = PARK_DEFAULT_TIMEOUT_MS;
-#ifndef CPU_SETSIZE
-#define CPU_SETSIZE 256
-#endif
-  /* M3: the core of the worker is taken from the CPUs the process may use (a jail's cpuset need not be 0..N-1); a worker that cannot be pinned runs
-   * unpinned, as a router does, instead of stopping the start */
-  int cpu = allowed_cpu(ctx->core_id);
-  if (cpu >= 0) {
-    cpuset_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(cpu, &cpuset);
-    if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, sizeof(cpuset_t), &cpuset) != 0)
-      syslog(LOG_WARNING, "[Worker %d] Failed to set CPU affinity to CPU %d: %m; running unpinned", ctx->thread_id, cpu);
-  }
+  /* The workers and the routers are not pinned to CPUs (0.6.1): a pinned worker that the scheduler puts behind another busy thread on its CPU
+   * (a client or the signer on the same host) cannot move to an idle CPU, and the queries already in its socket wait for it, 0.5 to 2 s on a
+   * 4 CPU host under load.  Measured without pinning: the same throughput, no such waits. */
 
   /* D-04: TCP 応答の組み立て用バッファはワーカーごとに起動時に1つ確保する
    * (以前はクエリごとに malloc(65535))。 */
@@ -5513,16 +5488,7 @@ int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], b
 }
 
 STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
-  (void)backend_pid;
-  int cpu = allowed_cpu(router_id);
-  if (cpu >= 0) {
-    cpuset_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(cpu, &cpuset);
-    if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(cpuset), &cpuset) < 0) {
-      syslog(LOG_WARNING, "[Frontend %d] Failed to set CPU affinity: %m", router_id);
-    }
-  }
+  (void)backend_pid;   /* (not pinned to a CPU, as the workers: see worker_thread_func()) */
 
   if (g_control_sock >= 0) {
     close(g_control_sock);
@@ -7364,7 +7330,6 @@ int main(int argc, char **argv) {
     backend_exit(1);
   for (int i = 0; i < num_workers; i++) {
     ctxs[i].thread_id = i;
-    ctxs[i].core_id = (g_num_frontend_routers + i) % total_cores;
     ctxs[i].qlog_ring.size = qlog_buf_size;
     ctxs[i].qlog_ring.mask = qlog_buf_size - 1;
     ctxs[i].qlog_ring.events = calloc(qlog_buf_size, sizeof(qlog_event_t));
@@ -7431,7 +7396,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[ERROR] [Backend] Failed to bind TCP listening socket(s); aborting startup\n");
     backend_exit(EXIT_FAILURE);
   }
-  // X-33: 起動できなかったワーカー (cpuset / kqueue / バッファの確保の失敗) があれば中止する。
+  // X-33: 起動できなかったワーカー (kqueue / バッファの確保の失敗) があれば中止する。
   // 以前はそのワーカーが受け持つ IPC を誰も読まないまま稼働していた。
   int failed_workers = atomic_load(&g_worker_start_failures);
   if (failed_workers > 0) {

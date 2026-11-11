@@ -6,7 +6,8 @@
 # during start-up, and must not wait forever for a child.  Driven with the
 # fault-injection shim (tests/fi/kari_fi_preload.c).
 #  1. The Backend fails (its first pthread_create) while the Frontend routers are still
-#     starting (cpuset_setaffinity() delayed 3 s in every router).  The manager's SIGTERM
+#     starting (the first bind() of every router, its UDP socket, delayed 3 s; the Backend
+#     binds only in its worker threads, which it never starts here).  The manager's SIGTERM
 #     used to reach a router that still ran the manager's flag-only handler and
 #     was lost; the router then waited for a Backend that was already gone.
 #     Expected: the manager ends by itself, exit status 1, no pid file left.
@@ -106,14 +107,14 @@ wait_exit() { # $1 = limit in tenths of a second; sets RC and ELAPSED (tenths); 
 }
 
 # 1. the Backend dies while the routers start
-start_server "pthread_create@1:child,cpuset_setaffinity@1:delay=3000:child"
+start_server "pthread_create@1:child,bind@1:delay=3000:child"
 if wait_exit 300; then
     pass "start-up failure: the manager ended by itself after $((ELAPSED / 10)) s"
 else
     fail "start-up failure: the manager is still running after 30 s (hang)"
 fi
 grep -q "pthread_create@1" "$TMP_DIR/fired.log" 2>/dev/null || fail "start-up failure: the Backend was not faulted"
-grep -q "cpuset_setaffinity@1" "$TMP_DIR/fired.log" 2>/dev/null || fail "start-up failure: the router start-up was not delayed"
+grep -q "bind@1" "$TMP_DIR/fired.log" 2>/dev/null || fail "start-up failure: the router start-up was not delayed"
 [ "$RC" = 1 ] && pass "start-up failure: exit status 1" || fail "start-up failure: exit status $RC (expected 1)"
 [ ! -e "$TMP_DIR/karidns.pid" ] && pass "start-up failure: pid file removed" || fail "start-up failure: pid file left behind"
 
