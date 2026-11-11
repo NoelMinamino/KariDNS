@@ -8,7 +8,7 @@ import path from 'node:path';
 import http from 'node:http';
 import https from 'node:https';
 import { spawnSync } from 'node:child_process';
-import { Router, reply, Reply, clientAddress, listen, closeServer, dispatch } from '../lib/http.js';
+import { Router, reply, Reply, clientAddress, listen, closeServer, dispatch, reloadTls } from '../lib/http.js';
 import { ApiError } from '../lib/errors.js';
 import { deploy, cast } from './helpers.js';
 
@@ -284,6 +284,55 @@ test('built-in TLS: tls-cert and tls-key, TLS 1.2 or newer', { skip: OPENSSL.sta
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+}));
+
+test('built-in TLS: SIGHUP reads the certificate and key again (reloadTls); a file that cannot be read changes nothing; a plain server is left alone', { skip: OPENSSL.status !== 0 && 'openssl is not installed' }, withDeploy({}, async (d) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kw-tls2-'));
+  try {
+    const make = (name) => {
+      const key = path.join(dir, `${name}.key`);
+      const crt = path.join(dir, `${name}.crt`);
+      const made = spawnSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes', '-keyout', key, '-out', crt, '-days', '2', '-subj', '/CN=localhost',
+        '-addext', 'subjectAltName=IP:127.0.0.1,DNS:localhost']);
+      assert.equal(made.status, 0, String(made.stderr));
+      return { key, crt };
+    };
+    const a = make('a');
+    const b = make('b');
+    d.app.settings['tls-cert'] = path.join(dir, 'live.crt');
+    d.app.settings['tls-key'] = path.join(dir, 'live.key');
+    d.app.settings['public-origin'] = 'https://localhost';
+    fs.copyFileSync(a.crt, d.app.settings['tls-cert']);
+    fs.copyFileSync(a.key, d.app.settings['tls-key']);
+    const server = await listen(d.app, new Router([{ method: 'GET', path: '/health', auth: 'none', handler: () => ({ tls: true }) }]));
+    try {
+      const fingerprint = () => new Promise((resolve, reject) => {
+        const req = https.get({ host: '127.0.0.1', port: server.address().port, path: '/api/v1/health', rejectUnauthorized: false, agent: false }, (r) => {
+          const fp = r.socket.getPeerCertificate().fingerprint256;
+          r.resume();
+          r.on('end', () => resolve(fp));
+        });
+        req.on('error', reject);
+      });
+      const first = await fingerprint();
+      assert.match(first, /^[0-9A-F:]{95}$/);
+      fs.copyFileSync(b.crt, d.app.settings['tls-cert']);
+      fs.copyFileSync(b.key, d.app.settings['tls-key']);
+      assert.equal(await fingerprint(), first, 'nothing changes until the files are read again');
+      assert.equal(reloadTls(server, d.app.settings), true);
+      const second = await fingerprint();
+      assert.notEqual(second, first);
+      fs.rmSync(d.app.settings['tls-cert']);
+      assert.throws(() => reloadTls(server, d.app.settings), /ENOENT/);
+      assert.equal(await fingerprint(), second, 'the certificate in use stays');
+      assert.equal(reloadTls(server, { ...d.app.settings, 'tls-cert': undefined }), false);
+    } finally {
+      await closeServer(server, 200);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  assert.equal(reloadTls({}, { 'tls-cert': '/x', 'tls-key': '/y' }), false);        // (a server without TLS)
 }));
 
 test('closing the server: idle connections at once, the others after the grace time', async () => {

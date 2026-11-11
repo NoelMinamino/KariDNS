@@ -102,8 +102,9 @@ export class Daemon {
     return p;
   }
 
+  // -> true when the database says there is more to read (a full batch: SQLite3 hands out 20,000 rows of its change log at a time)
   async ingest1() {
-    const { rows, cursor, gap } = await this.db.changesSince(this.cursor);
+    const { rows, cursor, gap, more } = await this.db.changesSince(this.cursor);
     this.cursor = cursor;
     const now = this.clock();
     for (const r of rows) this.debounce.add(r.domainId, { seq: r.seq, xid: r.xid }, now);
@@ -111,6 +112,7 @@ export class Daemon {
       this.log.warn('the change log was pruned beyond our position: scanning all zones');
       await this.catchUp();
     }
+    return more === true;
   }
 
   async flushChanges() {
@@ -121,13 +123,17 @@ export class Daemon {
   }
 
   // reads the change log whenever the database says something changed (PostgreSQL: NOTIFY; SQLite3: a poll)
+  // A full batch is followed by the next read at once, not after the wait (the 100,000 rows of the signer's own write take several batches to skip, and a foreign change
+  // behind them would be seen a poll late for each batch).
   async changeLoop() {
+    let more = false;
     while (!this.stopping) {
       try {
-        await this.db.waitForChange(this.changePollMs);
+        if (!more) await this.db.waitForChange(this.changePollMs);
         if (this.stopping) break;
-        await this.ingest();
+        more = await this.ingest();
       } catch (e) {
+        more = false;
         this.log.error(`reading the change log failed: ${e.message}`);
         await this.sleep(5000);
       }

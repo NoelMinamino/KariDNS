@@ -57,8 +57,13 @@ check-conninfo-file = /usr/local/etc/karidns/check.conninfo
 # rate-login = 5
 # rate-api = 20
 # rate-write = 2
+# Sign-ins one client address may start with an OpenID Connect provider in 10 minutes (1 to 1000; at most 1000 wait in all).
+# rate-oidc-start = 20
 # The cost of a new password hash, 2^n (14 to 20, default 17: about 128 MiB each, two at a time).
 # scrypt-ln = 17
+# Days the audit log is kept (7 to 36500); the service deletes older rows every hour.  0 (the default) keeps it for ever.  PostgreSQL: needs the 0.6.1
+# karidns_ext.pgsql.sql applied again and karidns_api_role.pgsql.sql run again (the function karidns_auth.prune_audit).
+# audit-retention = 0
 
 # --- the web interface -------------------------------------------------------------------------------------------------------------------
 # The files of the web interface are read once at the start and served under / and /ui/ (no login is needed for them).  `no` serves only /api/v1/.

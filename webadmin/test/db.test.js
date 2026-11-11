@@ -208,7 +208,7 @@ test('PostgreSQL: a transaction sets the principal and the change set; a read is
   });
   assert.equal(r, 'done');
   assert.deepEqual(pool.log.map((l) => l[0]), [
-    'BEGIN', "SELECT set_config('karidns.principal', $1, true), set_config('karidns.change_set', $2, true), set_config('statement_timeout', '30000', true)",
+    'BEGIN', "SELECT set_config('karidns.principal', $1, true), set_config('karidns.change_set', $2, true), set_config('statement_timeout', '30000', true), set_config('jit', 'off', true)",
     'SELECT a', 'SELECT a', 'UPDATE x', "SELECT set_config('karidns.principal', $1, true)", 'COMMIT',
   ]);
   assert.deepEqual(pool.log[1][1], ['42', 'cs-9']);

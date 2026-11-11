@@ -61,7 +61,7 @@ const SIGN = { zone: 'example.test', dir: '/w/z', inFile: '/w/z/in.zone', outFil
 test('dnssec-signzone: NSEC, one CSK, with the settings of the planning', () => {
   assert.deepEqual(signzoneArgv(SIGN), [
     '-q', '-o', 'example.test', '-f', '/w/z/out.zone', '-O', 'full', '-K', '/w/z', '-d', '/w/z',
-    '-e', 'now+1209600', '-i', '388800', '-j', '86400', '-N', 'increment', '-R', '-z',
+    '-e', 'now+1209600', '-i', '388800', '-j', '86400', '-N', 'increment', '-R', '-u', '-z',
     '/w/z/in.zone', 'Kexample.test.+013+08808']);
 });
 

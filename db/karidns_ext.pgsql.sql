@@ -430,6 +430,29 @@ CREATE TABLE IF NOT EXISTS karidns_signer_state (
 );
 CREATE INDEX IF NOT EXISTS karidns_signer_state_due_idx ON karidns_signer_state (next_due);
 
+-- The monitoring view of the signer (0.6.1, docs/karidns-signer.md "Monitoring"): one row per zone the signer keeps (X-KARIDNS-SIGNER = 1), with its state row (NULL
+-- columns for a zone without one) and a `status`: the first that applies of
+--   expired   the earliest RRSIG expiration (min_expire) has passed: validating resolvers refuse the zone now
+--   failing   the last run failed (last_error)
+--   overdue   the signer wanted to look at the zone more than an hour ago (next_due) and has not: it is stuck or not running
+--   expiring  the signatures end within two days (the signer re-signs well before that: a zone that is `expiring` and not `overdue` is a signer that fails to sign)
+--   unsigned  no state row yet (never signed, or the signer is not running)
+--   ok
+-- `seconds_to_expiry` is min_expire - now (negative when expired).  Alert on every status but `ok`; the thresholds (1 hour, 2 days) are the ones of the manual's SQL.
+-- Like every table of this file it is the owner's: grant SELECT on the view (and on nothing else) to the role of a monitoring system; the view does not run row level
+-- security of the reader, so such a role sees every signer zone, and nothing of cryptokeys.
+CREATE OR REPLACE VIEW karidns_signer_monitor AS
+SELECT d.id AS domain_id, d.name AS zone, s.signed_at, s.signed_serial, s.min_expire, s.next_due, s.attempts, s.last_error, s.last_duration_ms,
+       CASE WHEN s.domain_id IS NULL THEN 'unsigned'
+            WHEN s.min_expire IS NOT NULL AND s.min_expire < now() THEN 'expired'
+            WHEN s.last_error IS NOT NULL THEN 'failing'
+            WHEN s.next_due < now() - interval '1 hour' THEN 'overdue'
+            WHEN s.min_expire IS NOT NULL AND s.min_expire < now() + interval '2 days' THEN 'expiring'
+            ELSE 'ok' END AS status,
+       (EXTRACT(EPOCH FROM s.min_expire - now()))::bigint AS seconds_to_expiry
+  FROM domains d LEFT JOIN karidns_signer_state s ON s.domain_id = d.id
+ WHERE EXISTS (SELECT 1 FROM domainmetadata m WHERE m.domain_id = d.id AND m.kind = 'X-KARIDNS-SIGNER' AND m.content = '1');
+
 -- ---------------------------------------------------------------------------------------------------------------------------------
 -- Zone versions (0.6.0 item E, docs/karidns-zone.md "Versions"; schema version 3): one row per committed change set of one zone, written by
 -- `karidns-zone apply` (and `import`) in the transaction of the change itself, so the history is atomic with the data.  Version numbers are per zone, from 1.
@@ -916,10 +939,30 @@ BEGIN
   RETURN n;
 END $$;
 
+-- The audit log pruning of the API (0.6.1, option audit-retention of karidns-webadmin; default off).  No role can DELETE from audit_log (see below), so this
+-- SECURITY DEFINER function does it for the API role: the rows older than `days` days, the oldest 10,000 at a call (the caller repeats while it gets 10,000
+-- back).  Fewer than 7 days is refused, so a stolen API role cannot wipe the log of what it did a moment ago.  Returns the number of rows deleted.
+CREATE OR REPLACE FUNCTION karidns_auth.prune_audit(days integer) RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+DECLARE
+  cutoff timestamptz;
+  n bigint;
+BEGIN
+  IF days IS NULL OR days < 7 THEN
+    RAISE EXCEPTION 'karidns_auth.prune_audit: the audit log is kept for at least 7 days' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  cutoff := now() - make_interval(days => days);
+  -- the ids grow with the time: when the oldest row is not old, nothing is (and the table is not read)
+  IF NOT EXISTS (SELECT 1 FROM (SELECT a.at FROM karidns_auth.audit_log a ORDER BY a.id LIMIT 1) o WHERE o.at < cutoff) THEN RETURN 0; END IF;
+  DELETE FROM karidns_auth.audit_log WHERE id IN (SELECT a.id FROM karidns_auth.audit_log a WHERE a.at < cutoff ORDER BY a.id LIMIT 10000);
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END $$;
+
 -- ---------------------------------------------------------------------------------------------------------------------------------
 -- The audit log (4.5).  Only the owner may write it; the trigger functions are SECURITY DEFINER, so the roles that change the data
 -- need no right on it.  Nothing is granted here: no role (the WebAdmin's included) can UPDATE or DELETE a row.  Pruning is the
 -- owner's job:  DELETE FROM karidns_auth.audit_log WHERE at < now() - interval '1 year';
+-- (or the WebAdmin's option audit-retention, which calls prune_audit(days) above: the one thing it can delete, and not within the last 7 days)
 -- TRUNCATE of an audited table is not logged (use DELETE; the roles of the WebAdmin are given no TRUNCATE right).
 CREATE TABLE IF NOT EXISTS karidns_auth.audit_log (
   id             BIGSERIAL PRIMARY KEY,
@@ -2037,7 +2080,7 @@ REVOKE EXECUTE ON FUNCTION karidns_auth.current_principal(), karidns_auth.my_gro
   karidns_auth.may_grant(text, text, text, bigint), karidns_auth.grants_escalation_fn(), karidns_auth.signer_soa_fn(), karidns_auth.assert_service_role(text, text),
   karidns_auth.set_policy(regclass, text, text, text, text, text, boolean), karidns_auth.create_policies(text),
   karidns_auth.create_signer_policies(text, text), karidns_auth.enable_rls(text), karidns_auth.disable_rls(text), karidns_auth.session_lookup(bytea),
-  karidns_auth.api_token_lookup(bigint, bytea), karidns_auth.sweep_expired(), karidns_auth.oidc_state_put(bytea, bytea, text, text, text, text, integer),
+  karidns_auth.api_token_lookup(bigint, bytea), karidns_auth.sweep_expired(), karidns_auth.prune_audit(integer), karidns_auth.oidc_state_put(bytea, bytea, text, text, text, text, integer),
   karidns_auth.oidc_state_take(bytea), karidns_auth.oidc_lookup(text, text), karidns_auth.enable_never_commit(text), karidns_auth.disable_never_commit(text),
   karidns_auth.assert_check_role(text, text) FROM PUBLIC;
 -- (canon_type, is_dnssec_type and setting_principal stay with PUBLIC: the policies and the trigger conditions of the signer call them as the signer.)

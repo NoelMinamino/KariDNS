@@ -52,8 +52,8 @@ test('versions: the list, one version, the delta, the sizes; a subdomain master\
   // its delta, after a cursor
   const d = fakeTx();
   await S.versionRRsets(d, 's', 7, { zone: 'example.test', visibility: null, after: { name: 'b.example.test', type: 'A' }, limit: 100 });
-  assert.match(d.log[0][0], /FROM "s"\.karidns_zone_version_rrsets r WHERE r\.version_id = \$1 AND 1 = 1 AND \(r\.owner > \$2 OR \(r\.owner = \$3 AND r\.type > \$4\)\) ORDER BY r\.owner, r\.type LIMIT \$5/);
-  assert.deepEqual(d.log[0][1], [7, 'b.example.test', 'b.example.test', 'A', 101]);
+  assert.match(d.log[0][0], /FROM "s"\.karidns_zone_version_rrsets r WHERE r\.version_id = \$1 AND 1 = 1 AND r\.owner >= \$2 AND \(r\.owner > \$2 OR \(r\.owner = \$2 AND r\.type > \$3\)\) ORDER BY r\.owner, r\.type LIMIT \$4/);
+  assert.deepEqual(d.log[0][1], [7, 'b.example.test', 'A', 101]);
   await S.versionRRsets(d, 's', 7, { zone: 'example.test', visibility: null, limit: 5 });
   assert.deepEqual(d.log[1][1], [7, 6]);
   // a range

@@ -9,7 +9,7 @@ import { parseConfig, validate, defaults, datasetList, listenHost, loadConfig } 
 import { shape, value, query, encodeCursor, decodeCursor, LIMIT, CURSOR } from '../lib/validate.js';
 import { canonicalOwner, canonicalZone, inZone, absolute, dbName } from '../lib/names.js';
 import { ApiError, badRequest, forbidden, notFound, conflict, problem, mapDbError } from '../lib/errors.js';
-import { Buckets } from '../lib/ratelimit.js';
+import { Buckets, Window } from '../lib/ratelimit.js';
 
 const SQLITE = `
 listen = 127.0.0.1:8053
@@ -44,6 +44,9 @@ test('configuration: SQLite3', () => {
   assert.equal(c.settings['session-idle'], 1800);
   assert.equal(c.settings['require-totp'], 'global');
   assert.equal(c.settings['scrypt-ln'], 17);
+  assert.equal(c.settings['audit-retention'], 0);
+  assert.equal(c.settings['rate-oidc-start'], 20);
+  assert.equal(parseConfig(`${SQLITE}\naudit-retention = 7`).settings['audit-retention'], 7);
   assert.equal(c.settings['karidns-zone'], '/usr/local/bin/karidns-zone');
   assert.deepEqual(datasetList(c), [{ name: 'main', schema: '', views: [] }]);
   assert.equal(defaults().workers >= 1, true);
@@ -81,6 +84,11 @@ test('configuration: mistakes are reported with the line', () => {
     ['public-origin = not a url', /public-origin: expected an origin/],
     ['database = mysql', /database: expected one of pg, sqlite3/],
     ['scrypt-ln = 13', /scrypt-ln: expected 14 to 20/],
+    ['rate-oidc-start = 0', /rate-oidc-start: expected 1 to 1000/],
+    ['rate-oidc-start = 1001', /rate-oidc-start: expected 1 to 1000/],
+    ['audit-retention = 6', /audit-retention: expected 0 \(keep the audit log for ever\) or a number of days, 7 to 36500/],
+    ['audit-retention = 36501', /audit-retention: expected 0/],
+    ['audit-retention = 30d', /audit-retention: expected 0/],
     ['trusted-proxy = host.example', /expected a list of IP addresses/],
     ['workers = x', /workers: expected a number/],
     ['listen = 127.0.0.1:1\nlisten = 127.0.0.1:2', /line 2: 'listen' is set twice/],
@@ -284,6 +292,27 @@ test('token buckets use the clock of the process unless they are given one', () 
   const b = new Buckets({ rate: 1000, burst: 1 });
   assert.equal(b.take('k'), 0);
   assert.equal(b.take('k') >= 0, true);
+});
+
+test('sliding window: at most `limit` per key within the window, a refused event is not recorded, the table does not grow', () => {
+  let t = 1000;
+  const w = new Window({ limit: 2, windowMs: 100, max: 3, now: () => t });
+  assert.deepEqual([w.take('a'), w.take('a'), w.take('a')], [false, false, true]);
+  assert.equal(w.take('b'), false);                    // another key has its own count
+  t += 99;
+  assert.equal(w.take('a'), true);                     // (the refused one at +0 was not recorded: the oldest event leaves at +100)
+  t += 1;
+  assert.deepEqual([w.take('a'), w.take('a'), w.take('a')], [false, false, true]);
+  // the sweep drops the keys whose events are over; if every key is busy they are all forgotten
+  w.take('c');
+  assert.equal(w.map.size, 3);
+  t += 1000;
+  w.take('d');
+  assert.equal(w.map.size, 1);
+  const busy = new Window({ limit: 1, windowMs: 100000, max: 2, now: () => t });
+  busy.take('1'); busy.take('2'); busy.take('3');
+  assert.equal(busy.map.size, 1);
+  assert.equal(new Window({ limit: 1, windowMs: 10 }).take('x'), false);        // the clock of the process
 });
 
 test('token buckets: a burst, a refill, the wait, and the table does not grow', () => {

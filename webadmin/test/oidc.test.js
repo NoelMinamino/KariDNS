@@ -530,6 +530,33 @@ test('start and callback are rate limited like logins', async () => {
   } finally { await w.close(); }
 });
 
+test('start: one client address starts at most 20 sign-ins in 10 minutes (0.6.1, the default of rate-oidc-start), the others are not affected', async () => {
+  let t = Date.now();
+  const w = await world({ now: () => t }, { settings: { 'rate-login': 1000 } });
+  try {
+    const go = async () => (await fetch(`${w.d.base}/auth/oidc/idp/start`, { redirect: 'manual' })).headers.get('location');
+    for (let i = 0; i < 20; i++) assert.match(await go(), /\/authorize/);
+    assert.equal(await go(), `${ORIGIN}/#/?oidc=busy`);
+    assert.equal(await states(w.d), 20);                       // the refused start made no state
+    assert.ok(w.d.app.oidcStarts.take('192.0.2.77') === false);          // (another address has its own count)
+    t += 601 * 1000;                                            // the first ones are over (and their states with them)
+    assert.match(await go(), /\/authorize/);
+  } finally { await w.close(); }
+});
+
+test('start: rate-oidc-start is the limit, and a new value (SIGHUP, app.setConfig) is taken at once', async () => {
+  const w = await world({}, { settings: { 'rate-login': 1000, 'rate-oidc-start': 2 } });
+  try {
+    const go = async () => (await fetch(`${w.d.base}/auth/oidc/idp/start`, { redirect: 'manual' })).headers.get('location');
+    assert.match(await go(), /\/authorize/);
+    assert.match(await go(), /\/authorize/);
+    assert.equal(await go(), `${ORIGIN}/#/?oidc=busy`);
+    w.d.app.setConfig({ ...w.d.app.config, settings: { ...w.d.app.settings, 'rate-oidc-start': 3 } });
+    assert.match(await go(), /\/authorize/);
+    assert.equal(await go(), `${ORIGIN}/#/?oidc=busy`);
+  } finally { await w.close(); }
+});
+
 // ------------------------------------------------------------------------------------------------------------------------------- the TOTP step (F-17)
 const code = (secret, now = Date.now()) => hotp(base32Decode(secret), totpStep(now / 1000));
 

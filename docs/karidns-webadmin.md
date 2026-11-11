@@ -238,7 +238,7 @@ relay "webadmin_tls" {
 
 ### The built-in TLS
 
-For a single host without a proxy: set `tls-cert` and `tls-key` (both, PEM files; `tls-key` owned by the service user, mode 0600, which `--check` verifies) and `listen = 192.0.2.10:8443`. TLS 1.2 or newer; the key and certificate are read at the start (restart to renew). There is no HTTP to HTTPS redirect and no OCSP stapling; a proxy does those better.
+For a single host without a proxy: set `tls-cert` and `tls-key` (both, PEM files; `tls-key` owned by the service user, mode 0600, which `--check` verifies) and `listen = 192.0.2.10:8443`. TLS 1.2 or newer; the key and certificate are read at the start and again at SIGHUP (`service karidns_webadmin reload`): a renewed certificate needs no restart, new connections use it, open ones keep the old. There is no HTTP to HTTPS redirect and no OCSP stapling; a proxy does those better.
 
 ## THE WEB INTERFACE
 
@@ -342,7 +342,7 @@ service karidns_webadmin reload          # SIGHUP: reads the configuration again
 
 `rc.conf` variables: `karidns_webadmin_enable`, `karidns_webadmin_config` (default `/usr/local/etc/karidns/karidns-webadmin.conf`), `karidns_webadmin_user` (default `karidns-webadmin`; rc.subr runs `daemon(8)` as this user with `su -m`), `karidns_webadmin_flags`. The script makes the directory of the TOTP key and `/var/run/karidns_webadmin` for the service user, sets `ulimit -c 0`, and starts the program under `daemon -r`, which starts it again 10 seconds after it dies (for example because the database was down at boot). **Standard error goes to /dev/null under the rc script: set `log = daemon` (or another syslog facility) in the configuration file.** If the database is on this host, start it first (add its service name to `REQUIRE` in the rc script or to the `rcorder` of your site).
 
-SIGHUP changes the rate limits, the session times, `require-totp`, `public-origin`, `trusted-proxy` and `scrypt-ln`; the database, the datasets, `workers`, the paths of the tools, the listen address and the TLS files need a restart. A configuration with a mistake is refused and the old settings stay (the log says why).
+SIGHUP changes the rate limits, the session times, `require-totp`, `public-origin`, `trusted-proxy`, `scrypt-ln` and `audit-retention`, and reads the TLS certificate and key again (the built-in TLS only); the database, the datasets, `workers`, the paths of the tools, the listen address and switching TLS on or off need a restart. A configuration with a mistake is refused and the old settings stay (the log says why).
 
 ### The log
 
@@ -424,22 +424,22 @@ A subdomain master pays about the same (SQLite3: 581 ms at 100,000 records) or l
 
 | Reader | SQLite3 | PostgreSQL (row level security) |
 |---|---|---|
-| global master | 40 ms | 683 ms |
-| domain master | 39 ms | 161 ms |
-| subdomain master (half of the zone) | 38 ms | 103 to 237 ms |
+| global master | 40 ms | 22 ms (0.6.0: 683 to 843 ms) |
+| domain master | 39 ms | 10 ms (161 to 381 ms) |
+| subdomain master (half of the zone) | 38 ms | 11 ms (103 to 333 ms) |
 
-Zone of 1,000 records, one page of 500: 5 to 7 ms (SQLite3), 8 to 17 ms (PostgreSQL). A page costs a pass over the zone's rows after the cursor (the keys are sorted, the first 501 kept), so every page of a big zone costs about the same, not more the deeper it is. On PostgreSQL the policy of a global master tests every row with the function `name_in_zone` (the exact name test of A-23: a row of the zone's `domain_id` whose name is outside the zone stays invisible), which is why a global master reads *slower* than a domain master, whose rows are covered by a grant on the zone with no function call per row; both are a few times what SQLite3 costs without any policy.
+Zone of 1,000 records, one page of 500: 5 to 7 ms (SQLite3), 8 to 17 ms (PostgreSQL). A page reads the keys of the 501 RRsets after the cursor (sorted by the index of names, the first 501 kept), so every page of a big zone costs about the same, not more the deeper it is. That held only since 0.6.1; two things made 0.6.0 slower: PostgreSQL compiled every page for about 140 ms (the planner's cost estimate for the policy functions is in the millions, above `jit_above_cost`, so JIT switched itself on for a query that runs in 4 ms; the service now sets `jit = off` in every transaction), and the cursor was tested as `name > X OR (name = X AND type > Y)`, which the planner could not use as an index range, so it read the index from the first name of the table and filtered (a page at the end of the zone cost 600 ms, a page at the start 4 ms; the query now adds the redundant `name >= X`). In 0.6.1 the 20 pages walked 478 ms in all as a global master (17,600 ms in 0.6.0, the same walk on the same host). On PostgreSQL the policy of a global master tests every row with the function `name_in_zone` (the exact name test of A-23: a row of the zone's `domain_id` whose name is outside the zone stays invisible), which is why a global master still reads slower than a domain master (22 against 10 ms a page), whose rows are covered by a grant on the zone with no function call per row; both are a few times what SQLite3 costs without any policy.
 
-**Reading for the web interface** (item F; the same host and method, measured on 2026-11-09 by `tests/run_webadmin_write_test.sh` and `..._write_pg_test.sh` with `BIG=100000 ZONES=10000`: a zone of 100,000 records and 10,000 more zones with no records; a global master unless said; the median of 3):
+**Reading for the web interface** (item F; the same host and method, measured on 2026-11-09 by `tests/run_webadmin_write_test.sh` and `..._write_pg_test.sh` with `BIG=100000 ZONES=10000`: a zone of 100,000 records and 10,000 more zones with no records; a global master unless said; the median of 3; the PostgreSQL column of the RRset rows was measured again on 2026-11-11 with 0.6.1, the 0.6.0 figure in brackets; the list of zones was not measured again):
 
 | Request | SQLite3 | PostgreSQL |
 |---|---|---|
-| `GET .../rrsets?limit=500` (the comparison) | 39 ms | 191 ms |
-| ... with `rdata=1` (one run of `karidns-zone render` for the 500 RRsets) | 56 ms | 202 ms |
-| ... with `from=` the middle of the zone | 43 ms | 187 ms |
-| ... with `contains=` a text no owner has (the whole zone scanned) | 33 ms | 742 ms |
-| ... with `contains=` a text half of the zone has, the first page | 49 ms | 501 ms |
-| ... `contains=` a text no owner has, as a domain master / a subdomain master | 30 / 31 ms | 174 / 207 ms |
+| `GET .../rrsets?limit=500` (the comparison) | 39 ms | 19 ms (0.6.0: 191 ms) |
+| ... with `rdata=1` (one run of `karidns-zone render` for the 500 RRsets) | 56 ms | 38 ms (202 ms) |
+| ... with `from=` the middle of the zone | 43 ms | 20 ms (187 ms) |
+| ... with `contains=` a text no owner has (the whole zone scanned) | 33 ms | 694 ms (742 ms) |
+| ... with `contains=` a text half of the zone has, the first page | 49 ms | 376 ms (501 ms) |
+| ... `contains=` a text no owner has, as a domain master / a subdomain master | 30 / 31 ms | 71 / 98 ms (174 / 207 ms) |
 | `GET .../zones?limit=100` of 10,002 zones | 16 ms | 1113 ms |
 | ... with `contains=` a text one zone has | 3 ms | 362 ms |
 | ... with `prefix=` (the comparison) | 3 ms | 357 ms |

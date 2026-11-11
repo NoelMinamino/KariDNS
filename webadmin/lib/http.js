@@ -211,6 +211,17 @@ export async function dispatch(app, router, req, res) {
   }
 }
 
+const tlsMaterial = (s, fsx) => ({ cert: fsx.readFileSync(s['tls-cert']), key: fsx.readFileSync(s['tls-key']), minVersion: 'TLSv1.2' });
+
+// SIGHUP (0.6.1): the next connections use the certificate and key now in the files (tls.Server.setSecureContext; the connections that are open keep theirs), so a
+// renewed certificate needs no restart.  Throws when a file cannot be read: the caller keeps the old settings and the old certificate.  Does nothing for a server that
+// listens without TLS (switching TLS on or off, like the listen address, needs a restart).  -> true when the files were read.
+export function reloadTls(server, settings, { fsx = fs } = {}) {
+  if (typeof server.setSecureContext !== 'function' || !settings['tls-cert']) return false;
+  server.setSecureContext(tlsMaterial(settings, fsx));
+  return true;
+}
+
 // -> the listening server.  Limits against slow and large requests: 16 KiB of headers, 10 s for them, 30 s for the body of a request (readBody; the server's own
 // requestTimeout is 300 s because a zone import may take that), 5 s keep-alive, 256 sockets.
 export async function listen(app, router, { fsx = fs } = {}) {
@@ -224,7 +235,7 @@ export async function listen(app, router, { fsx = fs } = {}) {
   };
   const opts = { maxHeaderSize: 16384, keepAliveTimeout: 5000, headersTimeout: 10000, requestTimeout: IMPORT_MS };
   const server = s['tls-cert']
-    ? https.createServer({ ...opts, cert: fsx.readFileSync(s['tls-cert']), key: fsx.readFileSync(s['tls-key']), minVersion: 'TLSv1.2' }, handler)
+    ? https.createServer({ ...opts, ...tlsMaterial(s, fsx) }, handler)
     : http.createServer(opts, handler);
   server.maxConnections = 256;
   const host = listenHost(s.listen);
