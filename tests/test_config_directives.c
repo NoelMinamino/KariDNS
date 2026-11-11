@@ -28,6 +28,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <syslog.h>
 #include <grp.h>
 #include <stdatomic.h>
@@ -5087,8 +5088,54 @@ static void test_low_l1_config_body(void) {
     }
 }
 
+/* review lows of the server group: an nsid that cannot be sent is refused, a file that is not a regular file or holds a NUL is not read, a bool
+ * statement with the wrong token is an error with a place */
+static void test_review_lows_g4(void) {
+    printf("[TEST] review lows (nsid cap, files that are not read, bool statement errors)...\n");
+    char nsid_ok[256], nsid_long[256];
+    char val[KARIDNS_NSID_MAX + 2];
+    memset(val, 'n', sizeof(val));
+    val[KARIDNS_NSID_MAX] = '\0';
+    snprintf(nsid_ok, sizeof(nsid_ok), "options { nsid \"%s\"; };", val);
+    val[KARIDNS_NSID_MAX] = 'n';
+    val[KARIDNS_NSID_MAX + 1] = '\0';
+    snprintf(nsid_long, sizeof(nsid_long), "options { nsid \"%s\"; };", val);
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    if (parse_ok(nsid_ok, &cfg)) free_server_config_fields(&cfg);
+    expect_reject("nsid longer than KARIDNS_NSID_MAX", nsid_long);
+    expect_reject("bool statement with a block", "options { querylog { }; };");
+    expect_reject("bool statement without ';'", "options { querylog yes }; ");
+    expect_reject("bool statement with a bad value", "options { querylog maybe; };");
+
+    char root[] = "/tmp/kdns_g4_XXXXXX";
+    if (!mkdtemp(root)) { printf("  [FAIL] mkdtemp\n"); g_failed++; return; }
+    char path[PATH_MAX];
+    struct stat st;
+    snprintf(path, sizeof(path), "%s/fifo", root);
+    CHECK(mkfifo(path, 0600) == 0);
+    CHECK(read_entire_file_stat(path, &st) == NULL);                   /* a FIFO: not opened for a writer, not read */
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/nul.conf", root);
+    FILE *f = fopen(path, "wb");
+    CHECK(f != NULL);
+    if (f) { fwrite("options { };\0 zone", 1, 19, f); fclose(f); }
+    CHECK(read_entire_file_stat(path, &st) == NULL);                   /* the rest after a NUL would be ignored: refused */
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/ok.conf", root);
+    f = fopen(path, "wb");
+    CHECK(f != NULL);
+    if (f) { fputs("options { };\n", f); fclose(f); }
+    char *txt = read_entire_file_stat(path, &st);
+    CHECK(txt != NULL && strcmp(txt, "options { };\n") == 0 && S_ISREG(st.st_mode));
+    free(txt);
+    unlink(path);
+    rmdir(root);
+}
+
 int main(void) {
     printf("=== Starting Config Directive Tests ===\n");
+    test_review_lows_g4();
     test_in_view();
     test_bind_option_values_update_policy();
     test_bind_option_values_catalog_zones();

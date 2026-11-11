@@ -2735,6 +2735,13 @@ static void test_server_core_process_lifecycle_and_signals(void) {
 // ----------------------------------------------------------------------------
 // Non-root startup: run identity / preflight checks
 // ----------------------------------------------------------------------------
+/* resolve_run_identity() + apply_run_identity_id() by name (the server resolves once at start and applies the id) */
+static bool apply_run_identity(const char *user, const char *group, char *err, size_t errlen) {
+    run_identity_t id;
+    if (!resolve_run_identity(user, group, &id, err, errlen)) return false;
+    return apply_run_identity_id(&id, err, errlen);
+}
+
 /* 非rootとしての検証本体。root で実行されている場合は fork した子で nobody へ
  * 降格してから呼ぶ。失敗時は assert で abort する。 */
 static void nonroot_startup_checks(void) {

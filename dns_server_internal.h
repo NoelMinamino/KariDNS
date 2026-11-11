@@ -71,10 +71,15 @@ extern char g_startup_cwd[PATH_MAX];
 #define BUFFER_SIZE 4096
 #define MAX_BIND_ADDRS 64
 
+/* kevent idents / udata values of the control thread and the workers (the files that set and read them share the numbers) */
+#define CTL_NOTIFY_EVENT 2                  /* control thread, EVFILT_USER: a zone wants a NOTIFY round (notify_request_send()) */
+#define TCP_LISTEN_RESUME 1002              /* worker, EVFILT_TIMER udata: the pause of the TCP listener after EMFILE / ENFILE is over */
+
 /* IXFR history (RFC 1995 §4): the most diffs one zone keeps. The configured depth (ixfr-history, 0..MAX_IXFR_HISTORY, default
  * IXFR_HISTORY_DEFAULT; dns_config_parser.h) is the number of versions a secondary may lag behind and still get an
  * incremental transfer. */
 #define MAX_IXFR_HISTORY IXFR_HISTORY_MAX
+_Static_assert(IXFR_HISTORY_MAX <= UINT8_MAX, "ixfr_history and the history ring counters are uint8_t");
 #define MAX_TCP_CLIENTS 1000
 
 // Frontend/Backendプロセス間のUDPパケット受け渡し用コンパクトソケットアドレス (IPv4: 16B, IPv6: 28B, 8B aligned)
@@ -102,6 +107,10 @@ typedef struct {
   alignas(8) ipc_sockaddr_t client_addr;
   alignas(8) ipc_sockaddr_t source_addr;
 } udp_ipc_t;
+
+/* the layout is the format between the Frontend and the Backend (one binary, two processes): a change has to be deliberate */
+_Static_assert(sizeof(ipc_sockaddr_t) == 32, "ipc_sockaddr_t: 28 octets of sockaddr_in6, 8-aligned");
+_Static_assert(sizeof(udp_ipc_t) == 80, "udp_ipc_t: 16 octets of header and two ipc_sockaddr_t");
 
 #define UDP_BATCH_SIZE 16
 #define UDP_IPC_PAYLOAD_MAX 65535
@@ -539,7 +548,8 @@ static inline uint32_t zone_expire_option_value(zone_db_entry_t *e, time_t now) 
   if (deadline == 0) return expire;
   if (deadline <= now) return 0;
   time_t left = deadline - now;
-  return (left > (time_t)expire && expire > 0) ? expire : (uint32_t)left;
+  if (left > (time_t)expire && expire > 0) return expire;
+  return left > (time_t)UINT32_MAX ? UINT32_MAX : (uint32_t)left;   /* the option is 32 bits (RFC 7314 §3) */
 }
 
 /* ---- The zone directory (D1a, design 3.1, 3.2) ----
@@ -1483,9 +1493,7 @@ void *worker_thread_func(void *arg);
 #endif
 
 
-extern config_rcu_t g_config_db;
 extern int g_control_sock;
-extern _Atomic int g_control_kq;
 extern time_t g_boot_time;
 extern time_t g_last_configured_time;
 extern _Atomic int g_tcp_clients;

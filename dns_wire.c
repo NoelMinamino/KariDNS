@@ -189,20 +189,23 @@ int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, co
     return 0;
 }
 
-void register_wire_name_for_compression(const uint8_t *packet_buf, uint16_t start_offset, compress_ctx_t *ctx) {
+void register_wire_name_for_compression(const uint8_t *packet_buf, size_t buf_len, uint16_t start_offset, compress_ctx_t *ctx) {
     if (!packet_buf || !ctx) return;
     // 1. ラベルの開始オフセットを列挙する (compress_name()のlabels[]収集ループと同じ考え方だが、
     //    ソースは独立したnameバッファではなく packet_buf 内の既存バイト列)
     uint16_t label_offsets[128];
     int label_count = 0;
-    uint16_t p = start_offset;
-    while (packet_buf[p] != 0) {
+    size_t p = start_offset;
+    for (;;) {
+        if (p >= buf_len) return;       // 名前が buf_len の中で終わらない (読み進めるとバッファの外)。登録しないで戻る
+        if (packet_buf[p] == 0) break;
         if (label_count >= 127) return; // 異常に長い名前は無視 (安全側)
         if (p >= 0x4000) return;        // 圧縮ポインタで表現できない範囲は登録不要
         // 圧縮ポインタ / 拡張ラベル (上位 2 ビットが 0 でない) は長さではない (RFC 1035 §4.1.4)。
         // 長さとして読み進めると、コピーした質問の外 (バッファの外) を読む。登録しないで戻る。
         if ((packet_buf[p] & 0xC0) != 0) return;
-        label_offsets[label_count++] = p;
+        if (p + 1 + packet_buf[p] >= buf_len) return;   // ラベルとその次の長さオクテットが buf_len の中にある
+        label_offsets[label_count++] = (uint16_t)p;
         p += 1 + packet_buf[p];
     }
 

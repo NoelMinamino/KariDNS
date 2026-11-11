@@ -3,6 +3,7 @@
 #include "dns_zone_parser.h"
 #include "dns_config_parser.h"
 #include "dns_utils.h"
+#include "dns_siphash.h"
 #include <arpa/inet.h>
 #include <assert.h>
 #include <ctype.h>
@@ -365,11 +366,16 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
     broker_req_t req;
     while (recv(sv[1], &req, sizeof(req), MSG_WAITALL) == sizeof(req)) {
       size_t addr_len = 0;
-      if (req.family == AF_INET)
-        addr_len = sizeof(struct sockaddr_in);
-      else if (req.family == AF_INET6)
-        addr_len = sizeof(struct sockaddr_in6);
-      else if (req.family == AF_UNIX && req.type == SOCK_STREAM && allowed_unix_path[0] != '\0') {
+      /* defence in depth against a compromised Backend: the address has to be of the family asked for, have a port, and not be a multicast
+       * address (a TCP / UDP peer is never one); the sockets themselves are socket() + connect() of this unprivileged process only */
+      const struct sockaddr *req_sa = (const struct sockaddr *)&req.addr;
+      if (req.family == AF_INET && req_sa->sa_family == AF_INET) {
+        const struct sockaddr_in *r4 = (const struct sockaddr_in *)&req.addr;
+        if (r4->sin_port != 0 && !IN_MULTICAST(ntohl(r4->sin_addr.s_addr))) addr_len = sizeof(struct sockaddr_in);
+      } else if (req.family == AF_INET6 && req_sa->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *r6 = (const struct sockaddr_in6 *)&req.addr;
+        if (r6->sin6_port != 0 && !IN6_IS_ADDR_MULTICAST(&r6->sin6_addr)) addr_len = sizeof(struct sockaddr_in6);
+      } else if (req.family == AF_UNIX && req.type == SOCK_STREAM && allowed_unix_path[0] != '\0') {
         struct sockaddr_un *sun = (struct sockaddr_un *)&req.addr;
         sun->sun_path[sizeof(sun->sun_path) - 1] = '\0';
         if (sun->sun_family == AF_UNIX && strcmp(sun->sun_path, allowed_unix_path) == 0)
@@ -1525,7 +1531,10 @@ ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len) {
     if (n < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
         struct pollfd pfd = {.fd = fd, .events = POLLOUT};
-        if (poll(&pfd, 1, 30000) <= 0)
+        int pr = poll(&pfd, 1, 30000);
+        if (pr < 0 && errno == EINTR)
+          continue;
+        if (pr <= 0)
           return -1;
         continue;
       }
@@ -1561,7 +1570,10 @@ ssize_t send_tcp_dns_message(int fd, const uint8_t *msg, size_t len) {
         if (g_tcp_send_idle_secs)
           return -1;
         struct pollfd pfd = {.fd = fd, .events = POLLOUT};
-        if (poll(&pfd, 1, 30000) <= 0)
+        int pr = poll(&pfd, 1, 30000);
+        if (pr < 0 && errno == EINTR)
+          continue;
+        if (pr <= 0)
           return -1;
         continue;
       }
@@ -2683,6 +2695,10 @@ worker_startup_success:;
     for (int i = 0; i < n_events; i++) {
       if (ev_list[i].udata == (void *)(uintptr_t)1001) {
         backend_shutdown(0); /* Supervisor が終了した (O-15: exit() は使わない) */
+      } else if (ev_list[i].filter == EVFILT_TIMER && ev_list[i].udata == (void *)(uintptr_t)TCP_LISTEN_RESUME) {
+        struct kevent resume_ev;   /* the pause after EMFILE / ENFILE is over: the ident is the listening socket */
+        EV_SET(&resume_ev, ev_list[i].ident, EVFILT_READ, EV_ENABLE, 0, 0, (void *)2);
+        kevent(kq, &resume_ev, 1, NULL, 0, NULL);
       } else if (ev_list[i].filter == EVFILT_TIMER) {
         int client_fd = ev_list[i].ident;
         tcp_stream_ctx_t *ctx_tcp = (tcp_stream_ctx_t *)ev_list[i].udata;
@@ -2760,8 +2776,17 @@ worker_startup_success:;
                                  &client_len);
           if (client_fd < 0) {
             if (errno == EMFILE || errno == ENFILE) {
-              // FD exhaustion: backoff to prevent accept storm
-              usleep(10000); // 10ms
+              /* FD exhaustion: stop reading the listening socket for 10 ms (no accept storm) without sleeping: this worker goes on with
+               * UDP, the IPC and the open connections, which are what free descriptors.  The timer event (udata TCP_LISTEN_RESUME) turns the
+               * listener on again. */
+              struct kevent pause_ev[2];
+              EV_SET(&pause_ev[0], active_tcp_fd, EVFILT_READ, EV_DISABLE, 0, 0, (void *)2);
+              EV_SET(&pause_ev[1], active_tcp_fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0, 10, (void *)(uintptr_t)TCP_LISTEN_RESUME);
+              if (kevent(kq, pause_ev, 2, NULL, 0, NULL) < 0) {
+                EV_SET(&pause_ev[0], active_tcp_fd, EVFILT_READ, EV_ENABLE, 0, 0, (void *)2);   /* never leave the listener off */
+                kevent(kq, pause_ev, 1, NULL, 0, NULL);
+                usleep(10000);
+              }
             }
             break;
           }
@@ -2881,7 +2906,9 @@ process_tcp_client: ;
 
           // [RFC 1035 §4.1.1 / RFC 5452] QR=1 (レスポンスパケット) の破棄
           if (msg_len >= DNS_HEADER_SIZE && (msg[2] & 0x80) != 0) {
+            rcu_reader_enter(ctx);      /* submit_response_log() reads the configuration: inside a read section, like every other caller */
             submit_response_log(LOG_ACT_DROP_MALFORMED, ctx_tcp->client_ip, 0, "<response-on-query-port>", 0, 0, 0, false, false);
+            rcu_reader_exit(ctx);
             tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
             client_closed = true;
             break;
@@ -2891,10 +2918,10 @@ process_tcp_client: ;
           /* メッセージを1つ受け取り終えたので、次のメッセージの期限を tcp-idle-timeout で決め直す
            * (RFC 7766 §6.2.3) */
           ctx_tcp->idle_deadline_ms = (int64_t)now_mono.tv_sec * 1000 + now_mono.tv_nsec / 1000000 + tcp_idle_ms;
-          struct kevent ev_del;
-          EV_SET(&ev_del, client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
-          kevent(kq, &ev_del, 1, NULL, 0, NULL);
-
+          /* The idle timer is not deleted here and added again below: the EV_ADD at the end of the event replaces it (one kevent() per message,
+           * not two).  This worker is the only thread that handles the event, so the timer cannot fire in between; a timer event that is already
+           * in ev_list is judged against idle_deadline_ms like any early one (above).  The paths that leave without that EV_ADD close the
+           * connection (tcp_client_close() deletes the timer), hand it to a thread (which deletes it first) or park it (the timer handler skips it). */
           char qname[DNS_NAME_TEXT_SIZE] = "";
           uint16_t qtype = 0;
           uint16_t qclass = 1;
@@ -2903,9 +2930,8 @@ process_tcp_client: ;
             parse_query_question_fast(msg, msg_len, qname, sizeof(qname),
                                       &qtype, &qclass, &question_end);
           }
-          struct sockaddr_storage client_addr;
-          socklen_t c_len = sizeof(client_addr);
-          getpeername(client_fd, (struct sockaddr *)&client_addr, &c_len);
+          /* the peer address was stored in the context when the connection was accepted: no getpeername() per query */
+          const struct sockaddr_storage client_addr = ctx_tcp->client_addr;
           int client_port = 0;
           if (client_addr.ss_family == AF_INET)
             client_port = ntohs(((struct sockaddr_in *)&client_addr)->sin_port);
@@ -4452,7 +4478,7 @@ void *control_thread_func(void *arg) {
   struct kevent ev_set[6];
   EV_SET(&ev_set[0], SIGHUP, EVFILT_SIGNAL, EV_ADD | EV_CLEAR, 0, 0, NULL);
   EV_SET(&ev_set[1], 1, EVFILT_TIMER, EV_ADD | EV_CLEAR, 0, 1000, NULL);
-  EV_SET(&ev_set[2], 2, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+  EV_SET(&ev_set[2], CTL_NOTIFY_EVENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
   /* SIGTERM / SIGINT: シグナルハンドラは起動後は何もせずに戻り、ここで受けた制御スレッドが
    * backend_shutdown() する (EVFILT_SIGNAL はハンドラがあっても配送を記録する) */
   EV_SET(&ev_set[3], SIGTERM, EVFILT_SIGNAL, EV_ADD | EV_CLEAR, 0, 0, NULL);
@@ -6161,8 +6187,23 @@ STATIC_TEST void daemonize(void) {
     cap_rights_limit(stdio_fd, &io_rights);
 }
 
+/* SO_RCVBUF / SO_SNDBUF of an IPC socket.  A refusal or a smaller buffer than asked for (the kernel clamps to kern.ipc.maxsockbuf and
+ * net.local.dgram.*) is counted; setup_ipc_tables() logs one warning for all of them. */
+static int g_ipc_buf_short;
+static int g_ipc_buf_asked, g_ipc_buf_got;
+static void ipc_set_buf(int fd, int opt, int size) {
+  int got = 0;
+  socklen_t gl = sizeof(got);
+  if (setsockopt(fd, SOL_SOCKET, opt, &size, sizeof(size)) != 0 || getsockopt(fd, SOL_SOCKET, opt, &got, &gl) != 0 || got < size) {
+    g_ipc_buf_short++;
+    g_ipc_buf_asked = size;
+    g_ipc_buf_got = got;
+  }
+}
+
 STATIC_TEST void setup_ipc_tables(int num_workers) {
   g_num_workers = num_workers;
+  g_ipc_buf_short = 0;
   server_config_t *cfg = &g_config_db.config_a;
   int rcvbuf_size = (cfg && cfg->udp_recvbuf_size > 0) ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;
   int sndbuf_size = (cfg && cfg->udp_sndbuf_size > 0) ? cfg->udp_sndbuf_size : 4 * 1024 * 1024;
@@ -6177,10 +6218,10 @@ STATIC_TEST void setup_ipc_tables(int num_workers) {
             fcntl(g_ipc_fds[f][w][0], F_GETFL, 0) | O_NONBLOCK);
       fcntl(g_ipc_fds[f][w][1], F_SETFL,
             fcntl(g_ipc_fds[f][w][1], F_GETFL, 0) | O_NONBLOCK);
-      setsockopt(g_ipc_fds[f][w][0], SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size));
-      setsockopt(g_ipc_fds[f][w][0], SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(sndbuf_size));
-      setsockopt(g_ipc_fds[f][w][1], SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size));
-      setsockopt(g_ipc_fds[f][w][1], SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(sndbuf_size));
+      ipc_set_buf(g_ipc_fds[f][w][0], SO_RCVBUF, rcvbuf_size);
+      ipc_set_buf(g_ipc_fds[f][w][0], SO_SNDBUF, sndbuf_size);
+      ipc_set_buf(g_ipc_fds[f][w][1], SO_RCVBUF, rcvbuf_size);
+      ipc_set_buf(g_ipc_fds[f][w][1], SO_SNDBUF, sndbuf_size);
     }
   }
 
@@ -6193,10 +6234,13 @@ STATIC_TEST void setup_ipc_tables(int num_workers) {
   fcntl(g_notify_ipc[1], F_SETFL,
         fcntl(g_notify_ipc[1], F_GETFL, 0) | O_NONBLOCK);
   int nbufsize = 1024 * 1024; // 1MB
-  setsockopt(g_notify_ipc[0], SOL_SOCKET, SO_RCVBUF, &nbufsize, sizeof(nbufsize));
-  setsockopt(g_notify_ipc[0], SOL_SOCKET, SO_SNDBUF, &nbufsize, sizeof(nbufsize));
-  setsockopt(g_notify_ipc[1], SOL_SOCKET, SO_RCVBUF, &nbufsize, sizeof(nbufsize));
-  setsockopt(g_notify_ipc[1], SOL_SOCKET, SO_SNDBUF, &nbufsize, sizeof(nbufsize));
+  ipc_set_buf(g_notify_ipc[0], SO_RCVBUF, nbufsize);
+  ipc_set_buf(g_notify_ipc[0], SO_SNDBUF, nbufsize);
+  ipc_set_buf(g_notify_ipc[1], SO_RCVBUF, nbufsize);
+  ipc_set_buf(g_notify_ipc[1], SO_SNDBUF, nbufsize);
+  if (g_ipc_buf_short > 0)
+    syslog(LOG_WARNING, "[IPC] %d socket buffer setting(s) did not get the size asked for (last: asked %d bytes, got %d); queries may be dropped "
+                        "under load - raise kern.ipc.maxsockbuf and net.local.dgram.recvspace / maxdgram", g_ipc_buf_short, g_ipc_buf_asked, g_ipc_buf_got);
   cap_rights_t n_rights_0, n_rights_1;
   cap_rights_init(&n_rights_0, CAP_RECV, CAP_EVENT);
   cap_rights_limit(g_notify_ipc[0], &n_rights_0);
@@ -6402,6 +6446,21 @@ STATIC_TEST bool preflight_xfr_sources(server_config_t *cfg) {
   return true;
 }
 
+/* The check on the descriptor itself: a directory opened with O_NOFOLLOW is root-owned and not writable by group / other.  The fd that passes is
+ * the one the caller then creates files through (openat / bindat), so a path component swapped after the check cannot redirect them. */
+static bool priv_dir_fd_safe(int dfd, const char *dir_buf) {
+  struct stat st;
+  bool ok = (fstat(dfd, &st) == 0) && S_ISDIR(st.st_mode) &&
+            st.st_uid == 0 && !(st.st_mode & (S_IWGRP | S_IWOTH));
+  if (!ok) {
+    syslog(LOG_ERR, "[Startup] Refusing to use directory '%s': not root-owned and non-writable by "
+                     "group/other (possible pre-planted directory attack)", dir_buf);
+    fprintf(stderr, "[ERROR] Refusing to use directory '%s': not root-owned and non-writable by "
+                     "group/other (possible pre-planted directory attack)\n", dir_buf);
+  }
+  return ok;
+}
+
 /* [SEC] pidfile / control-socket 用ディレクトリの安全性検証。
  *
  * mkdir(dir_buf, 0755) 自体はシンボリックリンクを追跡しないため作成時の
@@ -6434,16 +6493,8 @@ bool ensure_priv_dir_safe(const char *dir_buf) {
     fprintf(stderr, "[ERROR] Failed to verify directory '%s': %s\n", dir_buf, strerror(errno));
     return false;
   }
-  struct stat st;
-  bool ok = (fstat(dfd, &st) == 0) && S_ISDIR(st.st_mode) &&
-            st.st_uid == 0 && !(st.st_mode & (S_IWGRP | S_IWOTH));
+  bool ok = priv_dir_fd_safe(dfd, dir_buf);
   close(dfd);
-  if (!ok) {
-    syslog(LOG_ERR, "[Startup] Refusing to use directory '%s': not root-owned and non-writable by "
-                     "group/other (possible pre-planted directory attack)", dir_buf);
-    fprintf(stderr, "[ERROR] Refusing to use directory '%s': not root-owned and non-writable by "
-                     "group/other (possible pre-planted directory attack)\n", dir_buf);
-  }
   return ok;
 }
 
@@ -6458,7 +6509,7 @@ int main(int argc, char **argv) {
     static const uint64_t tv_key[2] = {0x0706050403020100ULL, 0x0f0e0d0c0b0a0908ULL};
     uint8_t tv_msg[15];
     for (int i = 0; i < 15; i++) tv_msg[i] = (uint8_t)i;
-    uint64_t tv_result = siphash24(tv_msg, sizeof(tv_msg), tv_key);
+    uint64_t tv_result = dns_siphash24(tv_msg, sizeof(tv_msg), tv_key);
     if (tv_result != 0xa129ca6149be45e5ULL) {
       /* LCOV_EXCL_START */
       syslog(LOG_CRIT, "FATAL: SipHash-2-4 self-test failed (got %016llx, expected a129ca6149be45e5)",
@@ -6752,9 +6803,19 @@ int main(int argc, char **argv) {
     strncpy(dir_buf, effective_pid_file, sizeof(dir_buf) - 1);
     dir_buf[sizeof(dir_buf) - 1] = '\0';
     char *slash = strrchr(dir_buf, '/');
+    int pid_dir_fd = -1;                       /* the checked directory: the PID file is created through this descriptor, not by path */
+    const char *pid_leaf = effective_pid_file;
     if (slash && slash != dir_buf) {
       *slash = '\0';
       if (!ensure_priv_dir_safe(dir_buf)) {
+        cleanup_pid_file();
+        free_server_config_fields(&g_config_db.config_a);
+        return 1;
+      }
+      pid_leaf = effective_pid_file + (slash - dir_buf) + 1;
+      pid_dir_fd = open(dir_buf, O_RDONLY | O_DIRECTORY | O_CLOEXEC | (geteuid() == 0 ? O_NOFOLLOW : 0));
+      if (pid_dir_fd >= 0 && geteuid() == 0 && !priv_dir_fd_safe(pid_dir_fd, dir_buf)) {
+        close(pid_dir_fd);
         cleanup_pid_file();
         free_server_config_fields(&g_config_db.config_a);
         return 1;
@@ -6768,7 +6829,9 @@ int main(int argc, char **argv) {
      * しまい、root権限による任意ファイル破壊/上書きプリミティブとなる。
      * O_NOFOLLOWを付与し、シンボリックリンクなら即座にELOOPで失敗させる
      * (fail-closed)。 */
-    g_pid_fd = open(effective_pid_file, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
+    g_pid_fd = pid_dir_fd >= 0 ? openat(pid_dir_fd, pid_leaf, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644)
+                               : open(effective_pid_file, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
+    if (pid_dir_fd >= 0) close(pid_dir_fd);
     if (g_pid_fd < 0) {
       if (errno == ELOOP) {
         syslog(LOG_ERR, "Refusing to open pidfile %s: path is a symlink (possible attack)", effective_pid_file);
@@ -6828,10 +6891,7 @@ int main(int argc, char **argv) {
   if (total_cores <= 3) {
     g_num_frontend_routers = 1;
     num_workers = (total_cores >= 3) ? 2 : 1;
-  } else if (total_cores <= 6) {
-    g_num_frontend_routers = 2;
-    num_workers = total_cores - 2;
-  } else {
+  } else {   // 4 cores or more: two routers, the rest are workers
     g_num_frontend_routers = 2;
     num_workers = total_cores - 2;
   }
@@ -6870,7 +6930,13 @@ int main(int argc, char **argv) {
         free_server_config_fields(&g_config_db.config_a);
         return 1;
       }
-      dir_fd = open(dir_buf, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      dir_fd = open(dir_buf, O_RDONLY | O_DIRECTORY | O_CLOEXEC | (geteuid() == 0 ? O_NOFOLLOW : 0));
+      if (dir_fd >= 0 && geteuid() == 0 && !priv_dir_fd_safe(dir_fd, dir_buf)) {   /* the descriptor used below is the one that is checked */
+        close(dir_fd);
+        cleanup_pid_file();
+        free_server_config_fields(&g_config_db.config_a);
+        return 1;
+      }
     } else if (slash == dir_buf) {
       leaf_name = sock_path + 1;
       dir_fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -6878,11 +6944,19 @@ int main(int argc, char **argv) {
       dir_fd = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     }
     strncpy(un.sun_path, sock_path, sizeof(un.sun_path) - 1);
-    unlink(un.sun_path);
+    /* with the directory open, the old socket is removed and the new one is made by name relative to that descriptor (unlinkat / bindat), so
+     * the path above it is not looked up again; without it (the directory is not openable) the path is used as before */
+    struct sockaddr_un rel_un;
+    memset(&rel_un, 0, sizeof(rel_un));
+    rel_un.sun_family = AF_UNIX;
+    strlcpy(rel_un.sun_path, leaf_name, sizeof(rel_un.sun_path));
+    if (dir_fd >= 0) unlinkat(dir_fd, leaf_name, 0);
+    else unlink(un.sun_path);
     g_control_sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (g_control_sock >= 0) {
       mode_t old_mask = umask(0177);
-      if (bind(g_control_sock, (struct sockaddr *)&un, sizeof(un)) == 0) {
+      if ((dir_fd >= 0 ? bindat(dir_fd, g_control_sock, (struct sockaddr *)&rel_un, sizeof(rel_un))
+                       : bind(g_control_sock, (struct sockaddr *)&un, sizeof(un))) == 0) {
         fcntl(g_control_sock, F_SETFL, fcntl(g_control_sock, F_GETFL, 0) | O_NONBLOCK);
         listen(g_control_sock, 128);
         const bool want_grp = g_config_db.config_a.control.has_allow_gid;
@@ -7282,7 +7356,10 @@ int main(int argc, char **argv) {
   }
 
   pthread_t *threads = calloc(num_workers, sizeof(pthread_t));
-  worker_ctx_t *ctxs = calloc(num_workers, sizeof(worker_ctx_t));
+  /* worker_ctx_t has alignas(64) members (false-sharing padding): calloc() only promises alignof(max_align_t), so the array is aligned_alloc()ed */
+  size_t ctxs_bytes = ((size_t)num_workers * sizeof(worker_ctx_t) + 63) & ~(size_t)63;
+  worker_ctx_t *ctxs = aligned_alloc(64, ctxs_bytes);
+  if (ctxs) memset(ctxs, 0, ctxs_bytes);
   if (!threads || !ctxs)
     backend_exit(1);
   for (int i = 0; i < num_workers; i++) {

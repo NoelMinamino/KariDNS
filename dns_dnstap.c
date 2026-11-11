@@ -7,10 +7,10 @@
 #endif
 
 _Atomic int g_dnstap_sock = -1;
-_Atomic bool g_dnstap_connected = ATOMIC_VAR_INIT(false);
-_Atomic uint64_t g_dnstap_truncated_total = ATOMIC_VAR_INIT(0);
+_Atomic bool g_dnstap_connected = false;
+_Atomic uint64_t g_dnstap_truncated_total = 0;
 _Atomic uint32_t g_dnstap_message_mask =
-    ATOMIC_VAR_INIT((1u << DNSTAP_MSG_AUTH_QUERY) | (1u << DNSTAP_MSG_AUTH_RESPONSE));
+    (1u << DNSTAP_MSG_AUTH_QUERY) | (1u << DNSTAP_MSG_AUTH_RESPONSE);
 
 void dnstap_set_message_types(bool log_auth_query, bool log_auth_response) {
     uint32_t mask = 0;
@@ -24,6 +24,48 @@ static const char DNSTAP_CONTENT_TYPE[] = "protobuf:dnstap.Dnstap";
 static char g_dnstap_identity[256];
 static char g_dnstap_version[256];
 static bool dnstap_handshake(int sock);
+
+/* All of iov (cnt entries) to fd: a short write goes on, EINTR is retried.  false = an error (errno set) */
+static bool dnstap_writev_all(int fd, struct iovec *iov, int cnt) {
+    size_t total = 0;
+    for (int i = 0; i < cnt; i++) total += iov[i].iov_len;
+    while (total > 0) {
+        ssize_t w = writev(fd, iov, cnt);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (w == 0) {
+            errno = EIO;
+            return false;
+        }
+        total -= (size_t)w;
+        size_t adv = (size_t)w;
+        for (int i = 0; i < cnt && adv > 0; i++) {
+            if (adv >= iov[i].iov_len) {
+                adv -= iov[i].iov_len;
+                iov[i].iov_len = 0;
+            } else {
+                iov[i].iov_base = (uint8_t *)iov[i].iov_base + adv;
+                iov[i].iov_len -= adv;
+                adv = 0;
+            }
+        }
+    }
+    return true;
+}
+
+/* Exactly n octets from fd (recv() with EINTR retried; the socket has SO_RCVTIMEO).  false = error, timeout or end of stream */
+static bool dnstap_recv_all(int fd, void *buf, size_t n) {
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = recv(fd, (uint8_t *)buf + got, n - got, 0);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return false;
+        got += (size_t)r;
+    }
+    return true;
+}
 
 int dnstap_connect_and_handshake(const char *socket_path, const char *identity, const char *version) {
     if (!socket_path || !*socket_path) return -1;
@@ -64,7 +106,7 @@ static bool dnstap_handshake(int sock) {
     uint32_t ct_len = (uint32_t)(sizeof(DNSTAP_CONTENT_TYPE) - 1);
     uint32_t payload_len = 4 + 4 + 4 + ct_len;
     uint32_t ready_hdr[5];
-    ready_hdr[0] = htonl(FSTRM_CONTROL_ESCAPE);
+    ready_hdr[0] = htonl(FSTRM_ESCAPE_ZERO);
     ready_hdr[1] = htonl(payload_len);
     ready_hdr[2] = htonl(FSTRM_CONTROL_READY);
     ready_hdr[3] = htonl(FSTRM_CONTROL_FIELD_CONTENT_TYPE);
@@ -76,18 +118,18 @@ static bool dnstap_handshake(int sock) {
     r_iov[1].iov_base = (void *)DNSTAP_CONTENT_TYPE;
     r_iov[1].iov_len = ct_len;
 
-    if (writev(sock, r_iov, 2) < 0) {
+    if (!dnstap_writev_all(sock, r_iov, 2)) {
         close(sock);
         return false;
     }
 
     // Receive ACCEPT frame
     uint32_t esc = 0, acc_len_be = 0;
-    if (recv(sock, &esc, 4, MSG_WAITALL) != 4 || ntohl(esc) != FSTRM_CONTROL_ESCAPE) {
+    if (!dnstap_recv_all(sock, &esc, 4) || ntohl(esc) != FSTRM_ESCAPE_ZERO) {
         close(sock);
         return false;
     }
-    if (recv(sock, &acc_len_be, 4, MSG_WAITALL) != 4) {
+    if (!dnstap_recv_all(sock, &acc_len_be, 4)) {
         close(sock);
         return false;
     }
@@ -97,7 +139,7 @@ static bool dnstap_handshake(int sock) {
         return false;
     }
     uint8_t acc_buf[1024];
-    if (recv(sock, acc_buf, acc_len, MSG_WAITALL) != (ssize_t)acc_len) {
+    if (!dnstap_recv_all(sock, acc_buf, acc_len)) {
         close(sock);
         return false;
     }
@@ -107,10 +149,28 @@ static bool dnstap_handshake(int sock) {
         close(sock);
         return false;
     }
+    /* The ACCEPT lists the content types the collector reads (fstrm control frame fields: type, length, value).  When it lists any, ours has
+     * to be one of them; a frame without the field puts no constraint on the content type. */
+    bool has_ct = false, ct_ok = false;
+    for (uint32_t o = 4; o + 8 <= acc_len;) {
+        uint32_t ftype = ((uint32_t)acc_buf[o] << 24) | ((uint32_t)acc_buf[o + 1] << 16) | ((uint32_t)acc_buf[o + 2] << 8) | acc_buf[o + 3];
+        uint32_t flen = ((uint32_t)acc_buf[o + 4] << 24) | ((uint32_t)acc_buf[o + 5] << 16) | ((uint32_t)acc_buf[o + 6] << 8) | acc_buf[o + 7];
+        if (flen > acc_len - o - 8) break;   /* malformed tail: what was read so far decides */
+        if (ftype == FSTRM_CONTROL_FIELD_CONTENT_TYPE) {
+            has_ct = true;
+            if (flen == ct_len && memcmp(acc_buf + o + 8, DNSTAP_CONTENT_TYPE, ct_len) == 0) ct_ok = true;
+        }
+        o += 8 + flen;
+    }
+    if (has_ct && !ct_ok) {
+        syslog(LOG_WARNING, "[dnstap] the collector does not accept the content type %s", DNSTAP_CONTENT_TYPE);
+        close(sock);
+        return false;
+    }
 
     // Send START frame: escape(4B, 0) + len(4B, 34) + type(4B, 2) + field(4B, 1) + ct_len(4B, 22) + "protobuf:dnstap.Dnstap" (22B)
     uint32_t start_hdr[5];
-    start_hdr[0] = htonl(FSTRM_CONTROL_ESCAPE);
+    start_hdr[0] = htonl(FSTRM_ESCAPE_ZERO);
     start_hdr[1] = htonl(payload_len);
     start_hdr[2] = htonl(FSTRM_CONTROL_START);
     start_hdr[3] = htonl(FSTRM_CONTROL_FIELD_CONTENT_TYPE);
@@ -122,7 +182,7 @@ static bool dnstap_handshake(int sock) {
     s_iov[1].iov_base = (void *)DNSTAP_CONTENT_TYPE;
     s_iov[1].iov_len = ct_len;
 
-    if (writev(sock, s_iov, 2) < 0) {
+    if (!dnstap_writev_all(sock, s_iov, 2)) {
         close(sock);
         return false;
     }
@@ -142,9 +202,11 @@ size_t dnstap_build_message(const dnstap_event_meta_t *meta,
     // Message.type (field 1, required, varint): 1 = AUTH_QUERY, 2 = AUTH_RESPONSE
     PB_ADD(msg_offset, pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 1, meta->message_type));
 
-    // Message.socket_family (field 2, varint): 1 = INET, 2 = INET6
-    uint32_t fam = (meta->client_addr.ss_family == AF_INET6) ? 2 : 1;
-    PB_ADD(msg_offset, pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 2, fam));
+    // Message.socket_family (field 2, varint): 1 = INET, 2 = INET6; left out when the client address is neither (unset)
+    if (meta->client_addr.ss_family == AF_INET || meta->client_addr.ss_family == AF_INET6) {
+        uint32_t fam = (meta->client_addr.ss_family == AF_INET6) ? 2 : 1;
+        PB_ADD(msg_offset, pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 2, fam));
+    }
 
     // Message.socket_protocol (field 3, varint): 1 = UDP, 2 = TCP
     uint32_t proto = (meta->protocol == IPPROTO_TCP) ? 2 : 1;
@@ -186,7 +248,7 @@ size_t dnstap_build_message(const dnstap_event_meta_t *meta,
         }
     }
 
-    if (meta->message_type == 1 /* AUTH_QUERY */) {
+    if (meta->message_type == DNSTAP_MSG_AUTH_QUERY) {
         PB_ADD(msg_offset, pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 8, (uint64_t)meta->ts.tv_sec));
         PB_ADD(msg_offset, pb_encode_fixed32_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 9, (uint32_t)meta->ts.tv_nsec));
         PB_ADD(msg_offset, pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 10, wire, wire_len));
@@ -232,25 +294,7 @@ bool dnstap_send_frame(const dnstap_event_meta_t *meta,
     iov[1].iov_base = scratch_buf;
     iov[1].iov_len = plen;
 
-    size_t total_written = 0;
-    size_t total_to_write = 4 + plen;
-    while (total_written < total_to_write) {
-        ssize_t w = writev(g_dnstap_sock, iov, 2);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        total_written += w;
-        if (total_written < 4) {
-            iov[0].iov_base = (uint8_t *)&be_len + total_written;
-            iov[0].iov_len = 4 - total_written;
-        } else {
-            iov[0].iov_len = 0;
-            iov[1].iov_base = scratch_buf + (total_written - 4);
-            iov[1].iov_len = plen - (total_written - 4);
-        }
-    }
-    return true;
+    return dnstap_writev_all(g_dnstap_sock, iov, 2);
 }
 
 void fill_dnstap_event(dnstap_event_meta_t *meta,
@@ -271,7 +315,7 @@ void fill_dnstap_event(dnstap_event_meta_t *meta,
         if (copy_len < sizeof(meta->client_addr)) {
             memset((uint8_t *)&meta->client_addr + copy_len, 0, sizeof(meta->client_addr) - copy_len);
         }
-        meta->client_addr_len = client_addr_len;
+        meta->client_addr_len = (socklen_t)copy_len;   /* what was copied, not what the caller claimed */
     } else {
         memset(&meta->client_addr, 0, sizeof(meta->client_addr));
         meta->client_addr_len = 0;
@@ -395,9 +439,11 @@ static void dnstap_drop_connection(void) {
         close(g_dnstap_sock);
         g_dnstap_sock = -1;
     }
+    /* the socket has SO_SNDTIMEO (2 s): EAGAIN here means the collector did not read for that long, not a failing socket */
+    const char *why = (err == EAGAIN || err == EWOULDBLOCK) ? "collector too slow (no room in the socket for 2 s)" : strerror(err);
     syslog(LOG_WARNING, "[dnstap] write failed, %s: %s",
-           g_dnstap_reconnect_path[0] ? "reconnecting" : "dnstap disabled until restart", strerror(err));
-    fprintf(stderr, "[dnstap] write failed: %s\n", strerror(err));
+           g_dnstap_reconnect_path[0] ? "reconnecting" : "dnstap disabled until restart", why);
+    fprintf(stderr, "[dnstap] write failed: %s\n", why);
 }
 
 /* 全リングの溜まっているイベントを送る。送れなくなったら false (接続は閉じてある)。 */
@@ -420,6 +466,8 @@ static bool dnstap_drain_rings(uint8_t *scratch, size_t scratch_cap, bool *any_w
                     break;
                 }
                 t++;
+                /* give the slots back to the worker as they are sent, not only when the whole ring is drained (a worker sees "full" later) */
+                if ((t & 63) == 0) atomic_store_explicit(&ring->tail, t, memory_order_release);
             }
             atomic_store_explicit(&ring->tail, t, memory_order_release);
             if (!ok) {
@@ -435,7 +483,7 @@ static bool dnstap_drain_rings(uint8_t *scratch, size_t scratch_cap, bool *any_w
         while (t != h) {
             dnstap_aux_event_t *ev = &g_aux_dnstap_ring.events[t & g_aux_dnstap_ring.mask];
             if (!atomic_load_explicit(&ev->ready, memory_order_acquire)) {
-                break;
+                break;   /* a slot reserved but not filled yet holds up the ready ones behind it: they go out when the writer is done (head-of-line, short) */
             }
             *any_work = true;
             dnstap_fill_zone(&ev->meta, ev->wire, ev->wire_len);
@@ -484,11 +532,11 @@ static void dnstap_discard_rings(void) {
 /* Frame Streams の双方向プロトコルの終わり: STOP を送り、受信側の FINISH を待つ
  * (SO_RCVTIMEO はハンドシェイクで 2 秒に設定済み)。 */
 static void dnstap_send_stop(int sock) {
-    uint32_t stop_frame[3] = { htonl(FSTRM_CONTROL_ESCAPE), htonl(4), htonl(FSTRM_CONTROL_STOP) };
+    uint32_t stop_frame[3] = { htonl(FSTRM_ESCAPE_ZERO), htonl(4), htonl(FSTRM_CONTROL_STOP) };
     if (send(sock, stop_frame, sizeof(stop_frame), 0) != (ssize_t)sizeof(stop_frame)) return;
     uint32_t fin[3];
-    if (recv(sock, fin, sizeof(fin), MSG_WAITALL) == (ssize_t)sizeof(fin) &&
-        ntohl(fin[0]) == FSTRM_CONTROL_ESCAPE && ntohl(fin[1]) == 4 && ntohl(fin[2]) == FSTRM_CONTROL_FINISH) {
+    if (dnstap_recv_all(sock, fin, sizeof(fin)) &&
+        ntohl(fin[0]) == FSTRM_ESCAPE_ZERO && ntohl(fin[1]) == 4 && ntohl(fin[2]) == FSTRM_CONTROL_FINISH) {
         syslog(LOG_NOTICE, "[dnstap] stream closed (STOP/FINISH)");
     } else {
         syslog(LOG_WARNING, "[dnstap] no FINISH from the collector after STOP");
@@ -505,13 +553,18 @@ static int dnstap_reconnect(void) {
     tcp_sockopts_t copts = { .connect_timeout_ms = 2000 };
     int sock = broker_connect_opts(AF_UNIX, SOCK_STREAM, (struct sockaddr *)&sun, sizeof(sun), &copts);
     if (sock < 0) return -1;
-    if (!dnstap_handshake(sock)) return -1;
 #ifdef __FreeBSD__
+    /* the rights are cut before the handshake (it needs only these); a socket that keeps its wider rights is not used */
     cap_rights_t rights;
     cap_rights_init(&rights, CAP_READ, CAP_RECV, CAP_WRITE, CAP_SEND, CAP_EVENT, CAP_GETSOCKOPT,
                     CAP_SETSOCKOPT, CAP_FCNTL, CAP_SHUTDOWN);
-    cap_rights_limit(sock, &rights);
+    if (cap_rights_limit(sock, &rights) != 0 && errno != ENOSYS) {
+        syslog(LOG_ERR, "[dnstap] cap_rights_limit on the reconnected socket failed: %s", strerror(errno));
+        close(sock);
+        return -1;
+    }
 #endif
+    if (!dnstap_handshake(sock)) return -1;
     return sock;
 }
 

@@ -38,11 +38,12 @@ typedef struct {
 /* Parse a CIDR string (e.g., "192.0.2.0/24", "2001:db8::/32", "any", "1.2.3.4") into cidr_entry_t */
 bool cidr_entry_parse(cidr_entry_t *entry, const char *cidr_str);
 
-/* Match raw network bytes against parsed CIDR (family: AF_INET or AF_INET6) */
+/* Match raw network bytes against parsed CIDR (family: AF_INET or AF_INET6);
+ * addr_bytes must hold 4 bytes for AF_INET and 16 for AF_INET6 (the length follows from family) */
 bool cidr_entry_match(const cidr_entry_t *net, int family, const uint8_t *addr_bytes);
 
 /* Match sockaddr / sockaddr_storage / ipc_sockaddr against parsed CIDR */
-bool cidr_entry_match_sockaddr(const cidr_entry_t *net, const void *sa);
+bool cidr_entry_match_sockaddr(const cidr_entry_t *net, const struct sockaddr_storage *sa);
 
 /* Match client IP string (e.g. "192.0.2.1", "2001:db8::1") against parsed CIDR */
 bool cidr_entry_match_str(const cidr_entry_t *net, const char *addr_str);

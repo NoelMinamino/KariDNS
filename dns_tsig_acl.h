@@ -19,8 +19,9 @@ tsig_key_t *find_tsig_key_in_view(const server_config_t *cfg, const char *view_n
  * a negated match denies, and a list in which nothing matches denies ("If there is no match, access is denied").  An element is
  * an address or prefix, any, none, localhost, localnets, `key <name>` (the request is signed with a TSIG key of that name,
  * RFC 8945), the name of an acl { } block, or a nested { } list; each can be negated with "!".  A nested list matches only when
- * its own first match is a non-negated one (a negative match inside it counts as "no match", so `!{ !a; any; }` is the usual way
- * to say "only a"; BIND's lib/dns/acl.c does the same).  Lists are immutable once the configuration is published and are
+ * its own first match is a non-negated one (a negative match inside it counts as "no match", so `!{ !a; any; }; any;` is the usual way
+ * to say "only a": the first element denies everyone but a, and a falls through to `any`; the first element alone denies everyone, as
+ * "no match" is a denial.  BIND's lib/dns/acl.c does the same).  Lists are immutable once the configuration is published and are
  * shared by reference counting (the settings of a zone, a view and options all point to the lists they were written with). */
 enum { AML_E_ANY = 0, AML_E_NONE, AML_E_NET, AML_E_KEY, AML_E_LIST, AML_E_LOCALHOST, AML_E_LOCALNETS, AML_E_NAME };
 typedef struct {

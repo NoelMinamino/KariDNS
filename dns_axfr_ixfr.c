@@ -27,6 +27,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <openssl/crypto.h>
 #include "dns_log.h"
 #include <time.h>
 #include <unistd.h>
@@ -49,6 +50,14 @@ bool xfr_counter_acquire(_Atomic int *c, uint32_t limit) {
 }
 
 void xfr_counter_release(_Atomic int *c) { atomic_fetch_sub_explicit(c, 1, memory_order_acq_rel); }
+
+/* Gives back the slot the scheduler took before it started a thread, but never takes the count below 0: a thread started without a slot
+ * (a unit test) leaves it alone.  A compare-and-swap, so a concurrent acquire is not overwritten (a store of 0 after a fetch_sub could). */
+static void xfr_slot_give_back(_Atomic int *c) {
+  int cur = atomic_load_explicit(c, memory_order_acquire);
+  while (cur > 0 && !atomic_compare_exchange_weak_explicit(c, &cur, cur - 1, memory_order_acq_rel, memory_order_acquire)) {
+  }
+}
 
 /* One slot per remote address that a transfer has been started from (the table never frees a slot: at most XFR_NS_SLOTS different
  * primaries; beyond that the limit is not enforced for a new address, which is logged once).  The address is folded into 64 bits; two
@@ -130,6 +139,8 @@ uint32_t xfr_read_budget(time_t now, time_t deadline, uint32_t idle_secs, bool *
   return b;
 }
 
+/* Is the primary's serial behind ours?  RFC 1982 §3.2 leaves the comparison undefined when the distance is exactly 2^31; that case is
+ * treated as "behind" here (serial_is_newer() is false for it both ways), so a zone is not replaced by a serial that cannot be ordered. */
 bool xfr_serial_behind(uint32_t ours, uint32_t theirs) { return ours != theirs && !serial_is_newer(theirs, ours); }
 
 void xfr_run_primaries(int n, xfr_try_fn fn, void *arg, xfr_run_t *out) {
@@ -328,6 +339,9 @@ void ixfr_history_clear(ixfr_history_t *h) {
 /* Compare the published image of old_ver with the new one and keep the difference in the IXFR history of `entry`
  * (RFC 1995 §4: deletions and additions per version). Does nothing when the zone keeps no history (ixfr-history 0), a
  * serial is missing or not newer, or when the difference is larger than IXFR_MAX_DELTA RRs. */
+/* Design note (review dns_axfr_ixfr.c [16]): the two images are compared in full, with the zone's writer_lock held by the caller, once per
+ * published version.  The cost is bounded: the comparison stops when the difference passes IXFR_MAX_DELTA RRs (then there is no history entry and
+ * a secondary gets an AXFR), and it is paid by the writer (UPDATE, reload, transfer), never by the query path. */
 void compute_ixfr_diff(zone_db_entry_t *entry, const zone_version_t *old_ver, const zone_version_t *new_ver) {
   const zone_image_t *oi = old_ver ? old_ver->image : NULL, *ni = new_ver ? new_ver->image : NULL;
   if (!oi || !ni) return;
@@ -336,9 +350,8 @@ void compute_ixfr_diff(zone_db_entry_t *entry, const zone_version_t *old_ver, co
   pthread_mutex_unlock(&entry->ixfr_history.lock);
   if (depth == 0) return;
   uint32_t old_serial = 0, new_serial = 0;
-  (void)ixfr_apex_serial(oi, &old_serial);
-  (void)ixfr_apex_serial(ni, &new_serial);
-  if (old_serial == 0 || new_serial == 0) return;
+  /* a missing SOA is told by the return value: serial 0 is a legal serial (RFC 1982 §3.1 has no special value), so a zone that goes 0 -> 1 has a history */
+  if (!ixfr_apex_serial(oi, &old_serial) || !ixfr_apex_serial(ni, &new_serial)) return;
   if ((int32_t)(new_serial - old_serial) <= 0) return;
 
   uint32_t *del_rr = malloc((IXFR_MAX_DELTA + 1) * sizeof(uint32_t));
@@ -806,7 +819,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
               rec->class_val = orig_class;
               rec->ttl_value = orig_ttl > 0x7FFFFFFFu ? 0x7FFFFFFFu : orig_ttl; // RFC 8767 §4 (O-14)
               rec->type = (char *)get_type_str(orig_type, standby);
-              rec->class_str = (orig_class == 1) ? "IN" : "CH";
+              rec->class_str = (char *)dns_class_literal(orig_class);
               char *ttl_buf = arena_alloc(standby, 16);
               if (ttl_buf) {
                 snprintf(ttl_buf, 16, "%u", rec->ttl_value);
@@ -1533,11 +1546,17 @@ static int xfr_connect(axfr_bg_ctx_t *ctx, const xfr_primary_t *p, struct sockad
 }
 
 /* The serial of the one apex SOA in the answer section of a SOA response (RFC 1035 §4.1.3).  false = not a usable SOA answer. */
-static bool xfr_soa_answer_serial(const uint8_t *m, size_t len, uint16_t id, uint32_t *serial) {
+static bool xfr_soa_answer_serial(const uint8_t *m, size_t len, uint16_t id, const char *zone, uint32_t *serial) {
   if (len < DNS_HEADER_SIZE || (((uint16_t)m[0] << 8) | m[1]) != id || (m[2] & 0x80) == 0 || ((m[2] >> 3) & 0x0F) != 0 || (m[3] & 0x0F) != 0)
     return false;
   uint16_t qd = (uint16_t)((m[4] << 8) | m[5]), an = (uint16_t)((m[6] << 8) | m[7]);
   size_t off = DNS_HEADER_SIZE;
+  /* the answer is to our question: one question, the zone, type SOA, class IN (RFC 1035 §4.1.2, the same check as for any response) */
+  char qname[DNS_NAME_TEXT_SIZE];
+  size_t qnext;
+  if (qd != 1 || expand_wire_name_to_buffer(m, len, off, &qnext, qname, sizeof(qname)) <= 0 || qnext + 4 > len ||
+      !domain_names_match_ci(qname, zone) || (((uint16_t)m[qnext] << 8) | m[qnext + 1]) != 6 || (((uint16_t)m[qnext + 2] << 8) | m[qnext + 3]) != 1)
+    return false;
   for (uint16_t i = 0; i < qd; i++) {
     size_t next;
     if (skip_wire_name(m, len, off, &next) != 0 || next + 4 > len) return false;
@@ -1555,6 +1574,10 @@ static bool xfr_soa_answer_serial(const uint8_t *m, size_t len, uint16_t id, uin
     if (rd + rdlen > len) return false;
     if (type == 6 && cls == 1) {
       size_t o1, o2;
+      char owner[DNS_NAME_TEXT_SIZE];
+      size_t onext;
+      /* the SOA is the zone's own (not that of another name the primary happened to put in the answer) */
+      if (expand_wire_name_to_buffer(m, len, off, &onext, owner, sizeof(owner)) <= 0 || !domain_names_match_ci(owner, zone)) return false;
       if (found || skip_wire_name(m, len, rd, &o1) != 0 || skip_wire_name(m, len, o1, &o2) != 0 || o2 + 4 > rd + rdlen) return false;
       s = ((uint32_t)m[o2] << 24) | ((uint32_t)m[o2 + 1] << 16) | ((uint32_t)m[o2 + 2] << 8) | m[o2 + 3];
       found = true;
@@ -1591,7 +1614,7 @@ static int xfr_soa_probe(axfr_bg_ctx_t *ctx, const xfr_primary_t *p, struct sock
       signed_ok = tsig_verify_packet(msg, msg_len, tsig_key, req_mac_len > 0 ? req_mac : NULL, req_mac_len, NULL, 0, false, mac, &mac_len) == 0;
       if (!signed_ok) syslog(LOG_ERR, "[AXFR] zone %s: the SOA answer of %s is not signed correctly with key '%s'", ctx->domain, p->ip, tsig_key->name);
     }
-    if (signed_ok && !xfr_soa_answer_serial(msg, msg_len, id, &theirs)) {
+    if (signed_ok && !xfr_soa_answer_serial(msg, msg_len, id, ctx->domain, &theirs)) {
       syslog(LOG_ERR, "[AXFR] zone %s: %s did not answer the SOA query with a SOA record", ctx->domain, p->ip);
     } else if (signed_ok) {
       if (msg_len >= DNS_HEADER_SIZE && ((msg[10] << 8) | msg[11]) > 0) {
@@ -1677,22 +1700,21 @@ uint8_t xfr_ext_learn(bool answered_extended, uint8_t answered_version) {
 }
 
 /* The refresh of one primary: everything the thread did for the single primary before batch 4.  Returns an XFR_R_* code. */
-static int xfr_try_primary(void *arg, int idx) {
+static int xfr_try_primary_with(void *arg, int idx, tsig_key_t *kst) {
   axfr_bg_ctx_t *ctx = (axfr_bg_ctx_t *)arg;
   const xfr_primary_t *p = &ctx->prim[idx];
   /* [H-4] p->has_tsig が真の場合は、p 内に値コピーされた TSIG 情報から
-   * スタック上の tsig_key_t を組み立てて使用する (config ポインタを参照しない)。*/
-  tsig_key_t local_tsig_key;
+   * kst (呼び出し側のスタック上の tsig_key_t) を組み立てて使用する (config ポインタを参照しない)。*/
   tsig_key_t *tsig_key_ptr = NULL;
   if (p->has_tsig) {
-    memset(&local_tsig_key, 0, sizeof(local_tsig_key));
-    local_tsig_key.name = (char *)p->tsig_name;
-    local_tsig_key.algorithm = (char *)p->tsig_algorithm;
-    local_tsig_key.secret = NULL; /* 使用しないので NULL 可 */
-    memcpy(local_tsig_key.secret_decoded, p->tsig_secret_decoded, p->tsig_secret_decoded_len);
-    local_tsig_key.secret_decoded_len = p->tsig_secret_decoded_len;
-    local_tsig_key.next = NULL;
-    tsig_key_ptr = &local_tsig_key;
+    memset(kst, 0, sizeof(*kst));
+    kst->name = (char *)p->tsig_name;
+    kst->algorithm = (char *)p->tsig_algorithm;
+    kst->secret = NULL; /* 使用しないので NULL 可 */
+    memcpy(kst->secret_decoded, p->tsig_secret_decoded, p->tsig_secret_decoded_len);
+    kst->secret_decoded_len = p->tsig_secret_decoded_len;
+    kst->next = NULL;
+    tsig_key_ptr = kst;
   }
   struct sockaddr_storage master_addr;
   memset(&master_addr, 0, sizeof(master_addr));
@@ -1799,6 +1821,14 @@ static int xfr_try_primary(void *arg, int idx) {
   return XFR_R_FAILED;
 }
 
+/* The copy of the TSIG secret on this thread's stack is wiped on every way out of the refresh */
+static int xfr_try_primary(void *arg, int idx) {
+  tsig_key_t key;
+  int r = xfr_try_primary_with(arg, idx, &key);
+  OPENSSL_cleanse(&key, sizeof(key));
+  return r;
+}
+
 void *axfr_bg_thread_func(void *arg) {
   atomic_fetch_add_explicit(&g_xfers_running, 1, memory_order_relaxed);
   axfr_bg_ctx_t *ctx = (axfr_bg_ctx_t *)arg;
@@ -1819,11 +1849,13 @@ void *axfr_bg_thread_func(void *arg) {
     }
     atomic_store_explicit(&ctx->entry->is_transferring, false, memory_order_release);
   }
+  for (int i = 0; i < ctx->nprim; i++)             /* the decoded TSIG secrets copied into the primaries */
+    OPENSSL_cleanse(ctx->prim[i].tsig_secret_decoded, sizeof(ctx->prim[i].tsig_secret_decoded));
   free(ctx);
   if (bg_snap)
     release_zone_snapshot(bg_snap);
   /* the scheduler (the control thread) took the slot before it started this thread; a caller that did not (a unit test) must not drive the count negative */
-  if (atomic_fetch_sub_explicit(&g_xfr_in_active, 1, memory_order_acq_rel) <= 0) atomic_store_explicit(&g_xfr_in_active, 0, memory_order_release);
+  xfr_slot_give_back(&g_xfr_in_active);
   atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);
   pthread_exit(NULL);
 }
@@ -1916,15 +1948,16 @@ static int axfr_emit_item(axfr_emit_ctx_t *ec, const dns_record_t *rec, const zo
     /* 次のパケットの準備（QDCOUNT=1 と質問セクションを必ず引き継ぐ） */
     ec->offset = ec->q_offset;
     ec->answers = 0;
-    memset(ec->res, 0, 65535);
+    /* the header and the question are rewritten below; what follows q_offset is written by the next RRs and only ec->offset octets are sent,
+     * so the rest of the 64 KiB buffer is not cleared again for every message */
     memcpy(ec->res, ec->req, ec->q_offset); /* クエリのヘッダと質問セクションをそのままコピー */
     dns_init_response_header(ec->res, ec->req, 0, true); /* QR=1 AA=1、RA/Z/AD/TC は写さない (R-05) */
-    ec->res[8] = 0; ec->res[9] = 0; ec->res[10] = 0; ec->res[11] = 0;
+    ec->res[6] = 0; ec->res[7] = 0; ec->res[8] = 0; ec->res[9] = 0; ec->res[10] = 0; ec->res[11] = 0;
 
     memset(&ec->comp_ctx, 0, sizeof(ec->comp_ctx));
     compress_ctx_init_packet(&ec->comp_ctx);
     /* パケットバッファを破壊せず質問セクションの名前を圧縮テーブルに登録 */
-    register_wire_name_for_compression(ec->res, DNS_HEADER_SIZE, &ec->comp_ctx);
+    register_wire_name_for_compression(ec->res, ec->q_offset, DNS_HEADER_SIZE, &ec->comp_ctx);
 
     if (axfr_write_item(ec, rec, img, rr) < 0) {
       kdns_logc(LOGC_XFER_OUT, LOG_ERR, "[AXFR] Record too large to fit in any TCP message (name=%s type=%u), aborting transfer",
@@ -2148,6 +2181,7 @@ static void axfr_ec_start(axfr_emit_ctx_t *ec, uint8_t *res, const uint8_t *req,
   ec->opt_sent = false;
   ec->is_subsequent = false;
   ec->tsig_key = tsig_key;
+  if (req_mac_len > sizeof(ec->tsig_mac)) req_mac_len = sizeof(ec->tsig_mac);   /* callers pass at most 64 (EVP_MAX_MD_SIZE) */
   if (req_mac_len > 0) {
     memcpy(ec->tsig_mac, req_mac, req_mac_len);
     ec->tsig_mac_len = req_mac_len;
@@ -2166,7 +2200,7 @@ static void axfr_ec_start(axfr_emit_ctx_t *ec, uint8_t *res, const uint8_t *req,
   res[10] = 0;
   res[11] = 0;
   compress_ctx_init_packet(&ec->comp_ctx);
-  register_wire_name_for_compression(res, DNS_HEADER_SIZE, &ec->comp_ctx);
+  register_wire_name_for_compression(res, q_offset, DNS_HEADER_SIZE, &ec->comp_ctx);
 }
 
 /* The last message of the transfer (the RRs not sent yet), with the OPT of the first message when none went out, signed and sent.  0, or -1: a failure. */
@@ -2745,13 +2779,15 @@ void *axfr_worker_thread(void *arg) {
   close(args->client_fd);
   dec_tcp_clients();
   zone_db_snapshot_t *worker_snap = args->snap;
+  OPENSSL_cleanse(args->tsig_secret_decoded, sizeof(args->tsig_secret_decoded));
+  if (args->has_tsig) OPENSSL_cleanse(&key_val, sizeof(key_val));
   free(args);
   if (entry)
     atomic_fetch_sub(&entry->active_axfr, 1);
   rcu_aux_read_unlock();
   release_zone_snapshot(worker_snap);
   /* the slot taken when the thread was started (transfers-out); a caller that did not take one (a unit test) must not drive the count negative */
-  if (atomic_fetch_sub_explicit(&g_xfr_out_active, 1, memory_order_acq_rel) <= 0) atomic_store_explicit(&g_xfr_out_active, 0, memory_order_release);
+  xfr_slot_give_back(&g_xfr_out_active);
   atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);
   pthread_exit(NULL);
 }

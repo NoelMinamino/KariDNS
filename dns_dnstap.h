@@ -11,7 +11,8 @@
 
 #include "dns_wire.h"
 
-#define FSTRM_CONTROL_ESCAPE               0x00000000U
+/* the zero escape word that opens a Frame Streams control frame (a data frame has a non-zero length there) */
+#define FSTRM_ESCAPE_ZERO                  0x00000000U
 #define FSTRM_CONTROL_ACCEPT               0x00000001U
 #define FSTRM_CONTROL_START                0x00000002U
 #define FSTRM_CONTROL_STOP                 0x00000003U
@@ -37,6 +38,8 @@ typedef struct {
 } dnstap_event_meta_t;
 
 // dnstap用イベント: UDPワーカーのSPSCリング専用。
+// wire is cut at the slot size (counted in g_dnstap_truncated_total); the cut message is sent as it is, without a mark, so a consumer sees a DNS
+// message that ends early.  The slot holds a full UDP response (4096 at least), so it happens for oversized responses only.
 typedef struct {
     dnstap_event_meta_t meta;
     size_t wire_len;

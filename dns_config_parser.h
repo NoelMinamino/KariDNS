@@ -12,7 +12,8 @@
 #define KARIDNS_TCP_MSS_MAX      65495               /* 65535 - IPv4/TCP ヘッダ 40 */
 #define KARIDNS_TCP_BUF_MIN      4096
 #define KARIDNS_TCP_BUF_MAX      (64 * 1024 * 1024)
-#define KARIDNS_UDP_BUFSIZE_MIN  512                 /* RFC 6891 §6.2.3 */
+#define KARIDNS_NSID_MAX         128                 /* options { nsid }: octets (RFC 5001 §2.3 puts no limit; a long one would not fit a 512-octet response) */
+#define KARIDNS_UDP_BUFSIZE_MIN  512                /* RFC 6891 §6.2.3 */
 #define KARIDNS_UDP_BUFSIZE_MAX  4096
 #define KARIDNS_UDP_BUFSIZE_DEFAULT 1232             /* DNS Flag Day 2020 */
 
@@ -989,6 +990,8 @@ typedef struct {
   ino_t ino;            // 循環検出用
   bool via_rel;         // this file was reached by an include with a relative name (options { directory } check)
   int lex_err;          // an error the lexer cannot go on from (LEXERR_*); get_next_token() reports it
+  size_t loc_pos;       // ctx_location(): the offset up to which the lines were counted last time (loc_line > 0)
+  int loc_line;         // ctx_location(): the line at loc_pos; 0 = not counted yet (a later message continues from here, not from the file start)
 } config_file_frame_t;
 
 typedef struct {

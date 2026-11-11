@@ -20,6 +20,8 @@
 #include <sys/procdesc.h>
 #endif
 
+/* STATIC_TEST marks the functions the unit tests call directly: they have external linkage in every build (dns_server_core.c defines it
+ * the same way) */
 #define STATIC_TEST
 
 /* 名前解決が CNAME/DNAME で別のゾーンに移ったか (共有の応答キャッシュの鍵は最初のゾーンの版だけ
@@ -1020,6 +1022,44 @@ static void wc_proof_add(wc_proofs_t *p, const char *qname, const char *apex, zo
   p->n++;
 }
 
+/* The names a CNAME / DNAME chain has visited (loop detection).  64-bit hashes of the names (case-insensitive, one trailing dot ignored, as
+ * domain_names_match_ci()) instead of 16 copies of a name: no stack buffer of 16 names, and nothing at all is done for a query without a
+ * CNAME (the first name is entered at the first hop). */
+typedef struct {
+  uint64_t h[16];
+  int n;
+} qn_visited_t;
+
+static uint64_t qn_hash64(const char *name) {
+  uint64_t h = 14695981039346656037ULL;
+  bool esc = false, pending_dot = false;
+  for (const char *p = name; *p; p++) {
+    uint8_t c = (uint8_t)*p;
+    if (!esc && c == '.') {
+      if (pending_dot) { h ^= (uint8_t)'.'; h *= 1099511628211ULL; }
+      pending_dot = true;
+      continue;
+    }
+    if (pending_dot) { h ^= (uint8_t)'.'; h *= 1099511628211ULL; pending_dot = false; }
+    esc = !esc && c == '\\';
+    if (c >= 'A' && c <= 'Z') c |= 0x20;
+    h ^= c;
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+/* true: `target` was visited already (a loop).  Otherwise it is entered (up to 16 names, as before) and false is returned.  `current` is the
+ * name being followed; it is the first one entered. */
+static bool qn_visit(qn_visited_t *v, const char *current, const char *target) {
+  if (v->n == 0) v->h[v->n++] = qn_hash64(current);
+  uint64_t th = qn_hash64(target);
+  for (int i = 0; i < v->n; i++)
+    if (v->h[i] == th) return true;
+  if (v->n < 16) v->h[v->n++] = th;
+  return false;
+}
+
 static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16_t *qtypes, int num_qtypes,
                          zone_db_entry_t **db_entry_ptr,
                          zone_version_t **current_zone_ptr, uint8_t *res,
@@ -1040,9 +1080,8 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
   char current_qname[DNS_NAME_TEXT_SIZE];
   strlcpy(current_qname, qname, sizeof(current_qname));
   size_t current_qname_len = strlen(current_qname);
-  char visited_qnames[16][DNS_NAME_TEXT_SIZE];
-  int visited_count = 0;
-  strlcpy(visited_qnames[visited_count++], current_qname, sizeof(visited_qnames[0]));
+  qn_visited_t visited;
+  visited.n = 0;
   glue_list_t glue;
   const glue_sibling_ctx_t sib_ctx = { view, cfg, client_ip };
   glue.count = 0;
@@ -1192,19 +1231,10 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
         }
         char target[DNS_NAME_TEXT_SIZE];
         if (rr_target_text(img, k, target, sizeof(target))) {
-          bool loop_detected = false;
-          for (int v = 0; v < visited_count; v++) {
-            if (domain_names_match_ci(target, visited_qnames[v])) {
-              loop_detected = true;
-              break;
-            }
-          }
+          bool loop_detected = qn_visit(&visited, current_qname, target);
           if (loop_detected) {
             res[3] &= 0xF0;
             return;
-          }
-          if (visited_count < 16) {
-            strlcpy(visited_qnames[visited_count++], target, sizeof(visited_qnames[0]));
           }
           strlcpy(current_qname, target, sizeof(current_qname));
           current_qname_len = strlen(current_qname);
@@ -1325,19 +1355,10 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
               }
               (*ancount)++;
               const char *target = synth_name;
-              bool loop_detected = false;
-              for (int v = 0; v < visited_count; v++) {
-                if (domain_names_match_ci(target, visited_qnames[v])) {
-                  loop_detected = true;
-                  break;
-                }
-              }
+              bool loop_detected = qn_visit(&visited, current_qname, target);
               if (loop_detected) {
                 res[3] &= 0xF0;
                 return;
-              }
-              if (visited_count < 16) {
-                strlcpy(visited_qnames[visited_count++], target, sizeof(visited_qnames[0]));
               }
               strlcpy(current_qname, synth_name, sizeof(current_qname));
               current_qname_len = prefix_len + (size_t)written;
@@ -1402,19 +1423,10 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
                 }
                 char target[DNS_NAME_TEXT_SIZE];
                 if (rr_target_text(img, k, target, sizeof(target))) {
-                  bool loop_detected = false;
-                  for (int v = 0; v < visited_count; v++) {
-                    if (domain_names_match_ci(target, visited_qnames[v])) {
-                      loop_detected = true;
-                      break;
-                    }
-                  }
+                  bool loop_detected = qn_visit(&visited, current_qname, target);
                   if (loop_detected) {
                     res[3] &= 0xF0;
                     return;
-                  }
-                  if (visited_count < 16) {
-                    strlcpy(visited_qnames[visited_count++], target, sizeof(visited_qnames[0]));
                   }
                   strlcpy(current_qname, target, sizeof(current_qname));
                   current_qname_len = strlen(current_qname);
@@ -1921,7 +1933,8 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
   if (out_ecs_scope_prefix) *out_ecs_scope_prefix = positive ? answer_scope : 0;
 }
 
-size_t get_question_end_offset(const uint8_t *pkt, size_t len, uint16_t qdcount) {
+/* The end of the question section of a packet of len octets, in *end.  false: the section is malformed or runs past len (*end is not set). */
+static bool question_end_strict(const uint8_t *pkt, size_t len, uint16_t qdcount, size_t *end) {
     size_t offset = DNS_HEADER_SIZE;
     for (int k = 0; k < qdcount; k++) {
         while (offset < len) {
@@ -1929,18 +1942,26 @@ size_t get_question_end_offset(const uint8_t *pkt, size_t len, uint16_t qdcount)
             if (l == 0) { offset++; break; }
             /* [C-1] 圧縮ポインタの境界チェック */
             if ((l & 0xC0) == 0xC0) {
-                if (offset + 2 > len) return len;
+                if (offset + 2 > len) return false;
                 offset += 2; break;
             }
             /* [C-1] ラベル読み越し防止: offset + l + 1 が len を超えないことを確認 */
-            if (offset + 1 + l + 1 > len) return len;
+            if (offset + 1 + l + 1 > len) return false;
             offset += l + 1;
         }
         /* [C-1] QTYPE/QCLASS (4バイト) の境界チェック */
-        if (offset + 4 > len) return len;
+        if (offset + 4 > len) return false;
         offset += 4; // QTYPE, QCLASS
     }
-    return (offset <= len) ? offset : len;
+    if (offset > len) return false;
+    *end = offset;
+    return true;
+}
+
+/* As question_end_strict(), but a malformed section gives len (the callers cut at the end of what they have). */
+size_t get_question_end_offset(const uint8_t *pkt, size_t len, uint16_t qdcount) {
+    size_t end;
+    return question_end_strict(pkt, len, qdcount, &end) ? end : len;
 }
 
 program_plugin_t *find_program_plugin(const char *view_name, const char *domain) {
@@ -1969,17 +1990,30 @@ STATIC_TEST uint32_t remaining_ms(int64_t deadline) {
   return (uint32_t)rem;
 }
 
+/* FNV-1a over one field of the fingerprint; the 0xFF after it keeps "ab","c" apart from "a","bc" (0xFF is not in a path or an argument). */
+static uint64_t fp_mix(uint64_t h, const void *p, size_t n) {
+  const uint8_t *b = (const uint8_t *)p;
+  for (size_t i = 0; i < n; i++) {
+    h ^= b[i];
+    h *= 1099511628211ULL;
+  }
+  h ^= 0xFF;
+  return h * 1099511628211ULL;
+}
+
+/* A fingerprint of everything that decides how the plugin is started (path, user, timeout, max failures, auto-TC flag, ALL arguments), as 16 hex
+ * digits: a change in a late argument of a long list is noticed at reload (the text it used to be kept was cut at the size of the buffer). */
 void compute_program_zone_fingerprint(const zone_config_t *z, char *out, size_t out_cap) {
   const zone_ext_t *x = zext(z);
-  size_t pos = 0;
-  pos += (size_t)snprintf(out + pos, out_cap - pos, "path=%s|user=%s|timeout=%u|maxfail=%u|disable_tc=%d|args=",
-                          x->program_path ? x->program_path : "",
-                          x->program_user ? x->program_user : "",
-                          x->program_timeout_ms, x->program_max_failures,
-                          x->disable_auto_tc_flag ? 1 : 0);
-  for (int i = 0; i < x->program_args_count && pos < out_cap; i++) {
-    pos += (size_t)snprintf(out + pos, out_cap - pos, "%s;", x->program_args[i]);
-  }
+  const char *path = x->program_path ? x->program_path : "", *user = x->program_user ? x->program_user : "";
+  uint64_t h = 14695981039346656037ULL;
+  h = fp_mix(h, path, strlen(path));
+  h = fp_mix(h, user, strlen(user));
+  uint32_t nums[3] = { x->program_timeout_ms, x->program_max_failures, x->disable_auto_tc_flag ? 1u : 0u };
+  h = fp_mix(h, nums, sizeof(nums));
+  for (int i = 0; i < x->program_args_count; i++)
+    h = fp_mix(h, x->program_args[i], strlen(x->program_args[i]));
+  snprintf(out, out_cap, "%016llx", (unsigned long long)h);
 }
 
 /* type "program"/"forward" ゾーンで、実際の応答を得られなかった場合に
@@ -1991,13 +2025,14 @@ STATIC_TEST int build_synthetic_servfail(const uint8_t *req, size_t req_len,
                                        uint8_t *res, size_t max_res_len) {
   if (req_len < DNS_HEADER_SIZE || max_res_len < DNS_HEADER_SIZE) return 0; // 応答しようがない
   uint16_t qdcount = (req[4] << 8) | req[5];
-  size_t q_end = (size_t)get_question_end_offset(req, req_len, qdcount);
-  /* [M-4] 質問セクションが入らないときは QDCOUNT=0 でヘッダだけにする
+  size_t q_end;
+  /* [M-4] 質問セクションが入らないときと、読み取れないとき (壊れた要求で、全体を写すことになる) は QDCOUNT=0 でヘッダだけにする
    * (途中までの質問を返すと QDCOUNT と内容が食い違う)。*/
-  size_t copy_len = q_end > max_res_len ? DNS_HEADER_SIZE : q_end;
+  bool no_question = !question_end_strict(req, req_len, qdcount, &q_end) || q_end > max_res_len;
+  size_t copy_len = no_question ? DNS_HEADER_SIZE : q_end;
   memcpy(res, req, copy_len);
   dns_init_response_header(res, req, 2, false); // SERVFAIL、AA/TC/RA/Z/AD=0 (R-05)
-  if (q_end > max_res_len) {
+  if (no_question) {
     res[4] = 0; res[5] = 0; // QDCOUNT=0 (切り詰め時)
   }
   res[6] = 0; res[7] = 0;   // ANCOUNT=0
@@ -2019,6 +2054,7 @@ STATIC_TEST ssize_t write_all_timeout(int fd, const uint8_t *buf, size_t len, ui
 
     struct pollfd pfd = { .fd = fd, .events = POLLOUT, .revents = 0 };
     int ret = poll(&pfd, 1, rem_ms);
+    if (ret < 0 && errno == EINTR) continue;   /* the loop recomputes what is left of the time */
     if (ret <= 0) return -1;
 
     if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
@@ -2047,6 +2083,7 @@ STATIC_TEST ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t 
 
     struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
     int ret = poll(&pfd, 1, rem_ms);
+    if (ret < 0 && errno == EINTR) continue;
     if (ret <= 0) return -1;
 
     if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
@@ -2064,6 +2101,10 @@ STATIC_TEST ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t 
   return (ssize_t)nread;
 }
 
+/* Design note (review dns_query_engine.c [7]): a program zone's plugin and a forward zone's forwarders are called from the worker that has the query,
+ * which waits for the answer.  The wait is bounded by one absolute deadline per query (program-timeout / the forwarders' budget), a program plugin
+ * serves one query at a time (its lock), and a plugin that fails repeatedly is marked dead and answered with SERVFAIL without I/O.  Dedicated threads for
+ * these zones would take the wait off the workers, at the price of a hand-off per query; program and forward zones are for low query rates. */
 #define PLUGIN_STALE_FRAMES 4 /* late replies dropped before the reply to this query */
 STATIC_TEST bool question_section_matches(const uint8_t *resp, size_t resp_len, const uint8_t *req, size_t req_len);
 
@@ -3211,7 +3252,7 @@ static bool wire_names_equal_ci(const uint8_t *a, const uint8_t *b) {
 static size_t edns_udp_limit(edns_info_t *edns, bool is_tcp, const server_config_t *cfg, const view_snapshot_t *view, const char *client_ip, size_t max_res_len,
                              size_t res_cap) {
   if (!edns->present) return max_res_len;
-  if (edns->udp_payload_size < 512) edns->udp_payload_size = 512;
+  /* (udp_payload_size is 512 at least: process_query_body() raised it when it parsed the OPT, RFC 6891 §6.2.3) */
   if (is_tcp) return max_res_len;
   uint16_t server_udp_size = edns->server_udp_size ? edns->server_udp_size : KARIDNS_UDP_BUFSIZE_DEFAULT;
   /* the server statement of the client can set the limit (batch 5; BIND ns client.c: max-udp-size of the peer replaces the view's
@@ -3293,7 +3334,7 @@ static int build_apex_soa_answer(const uint8_t *req, size_t req_len, uint8_t *re
   if (q_offset > body_max || body_max > UINT16_MAX) return -1;
   memcpy(res, req, q_offset);
   compress_ctx_init_packet(comp_ctx);
-  register_wire_name_for_compression(res, DNS_HEADER_SIZE, comp_ctx);
+  register_wire_name_for_compression(res, q_offset, DNS_HEADER_SIZE, comp_ctx);
   dns_init_response_header(res, req, 0, true);
   if (ixfr_serial) {
     /* UDP IXFR (RFC 1995 4, as the zone in memory answers it below): the one SOA of the current version; TC when the client is behind, so that it asks again over
@@ -3886,7 +3927,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       int kq = atomic_load_explicit(&g_control_kq, memory_order_acquire);
       if (kq != -1) {
         struct kevent ev;
-        EV_SET(&ev, 2, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+        EV_SET(&ev, CTL_NOTIFY_EVENT, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
         kevent(kq, &ev, 1, NULL, 0, NULL);
       }
     } else {
@@ -4079,7 +4120,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     }
   q_offset += 4;
   memcpy(res, req, q_offset);
-  register_wire_name_for_compression(res, DNS_HEADER_SIZE, comp_ctx);
+  register_wire_name_for_compression(res, q_offset, DNS_HEADER_SIZE, comp_ctx);
   /* R-05: RA/Z/AD/TC は問い合わせから写さない。AA=1 は権威データの応答の既定で、委任・REFUSED・
    * SERVFAIL・BADCOOKIE ではそれぞれの経路で落とす。 */
   dns_init_response_header(res, req, 0, true);

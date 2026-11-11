@@ -425,7 +425,7 @@ static void *mock_framestream_server(void *arg) {
     uint32_t ct_len = (uint32_t)(sizeof(ct_str) - 1);
     uint32_t payload_len = 4 + 4 + 4 + ct_len;
     uint32_t acc_hdr[5];
-    acc_hdr[0] = htonl(FSTRM_CONTROL_ESCAPE);
+    acc_hdr[0] = htonl(FSTRM_ESCAPE_ZERO);
     acc_hdr[1] = htonl(payload_len);
     acc_hdr[2] = htonl(FSTRM_CONTROL_ACCEPT);
     acc_hdr[3] = htonl(FSTRM_CONTROL_FIELD_CONTENT_TYPE);
@@ -478,6 +478,63 @@ static void test_dnstap_handshake(void) {
     unlink(sock_path);
 
     printf("  -> dnstap handshake passed.\n");
+}
+
+/* A collector whose ACCEPT lists the content type `ct` (NULL: no content type field at all) and which then reads START, if there is one */
+typedef struct { int srv_fd; const char *ct; bool got_start; } accept_mock_t;
+
+static void *mock_accept_with_type(void *arg) {
+    accept_mock_t *m = (accept_mock_t *)arg;
+    int cli_fd = accept(m->srv_fd, NULL, NULL);
+    if (cli_fd < 0) return NULL;
+    uint8_t buf[64];
+    uint32_t ready_hdr[5];
+    if (recv(cli_fd, ready_hdr, sizeof(ready_hdr), MSG_WAITALL) == (ssize_t)sizeof(ready_hdr)) {
+        uint32_t n = ntohl(ready_hdr[4]);
+        if (n < sizeof(buf)) recv(cli_fd, buf, n, MSG_WAITALL);
+    }
+    uint32_t ct_len = m->ct ? (uint32_t)strlen(m->ct) : 0;
+    uint32_t hdr[5] = { htonl(FSTRM_ESCAPE_ZERO), htonl(m->ct ? 4 + 4 + 4 + ct_len : 4), htonl(FSTRM_CONTROL_ACCEPT),
+                        htonl(FSTRM_CONTROL_FIELD_CONTENT_TYPE), htonl(ct_len) };
+    send(cli_fd, hdr, m->ct ? sizeof(hdr) : 12, 0);
+    if (m->ct) send(cli_fd, m->ct, ct_len, 0);
+    uint32_t start_hdr[5];
+    m->got_start = recv(cli_fd, start_hdr, sizeof(start_hdr), MSG_WAITALL) == (ssize_t)sizeof(start_hdr);
+    close(cli_fd);
+    return NULL;
+}
+
+static void test_dnstap_handshake_content_type(void) {
+    printf("[TEST] DNSTAP: the collector's ACCEPT has to list our content type...\n");
+    struct { const char *ct; bool ok; } cases[] = {
+        { "protobuf:dnstap.Dnstap", true },       // ours
+        { "protobuf:other.Type", false },         // another one
+        { NULL, true },                           // none listed: no constraint
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char sock_path[128];
+        snprintf(sock_path, sizeof(sock_path), "/tmp/test_dnstap_ct_%d_%zu.sock", (int)getpid(), i);
+        unlink(sock_path);
+        int srv_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        assert(srv_fd >= 0);
+        struct sockaddr_un sun;
+        memset(&sun, 0, sizeof(sun));
+        sun.sun_family = AF_UNIX;
+        strncpy(sun.sun_path, sock_path, sizeof(sun.sun_path) - 1);
+        assert(bind(srv_fd, (struct sockaddr *)&sun, sizeof(sun)) == 0);
+        assert(listen(srv_fd, 1) == 0);
+        accept_mock_t m = { srv_fd, cases[i].ct, false };
+        pthread_t th;
+        pthread_create(&th, NULL, mock_accept_with_type, &m);
+        int sock = dnstap_connect_and_handshake(sock_path, "id", "v");
+        pthread_join(th, NULL);
+        assert((sock >= 0) == cases[i].ok);
+        assert(m.got_start == cases[i].ok);          // START follows only when the type was accepted
+        if (sock >= 0) close(sock);
+        close(srv_fd);
+        unlink(sock_path);
+    }
+    printf("  -> dnstap content type check passed.\n");
 }
 
 static void test_dnstap_sender_thread(void) {
@@ -582,7 +639,7 @@ static bool collector_handshake(int fd) {
     uint32_t ct_len = ntohl(hdr[4]);
     if (ct_len >= sizeof(ct) || recv(fd, ct, ct_len, MSG_WAITALL) != (ssize_t)ct_len) return false;
     const char ct_str[] = "protobuf:dnstap.Dnstap";
-    uint32_t acc[5] = { htonl(FSTRM_CONTROL_ESCAPE), htonl(4 + 4 + 4 + 22), htonl(FSTRM_CONTROL_ACCEPT),
+    uint32_t acc[5] = { htonl(FSTRM_ESCAPE_ZERO), htonl(4 + 4 + 4 + 22), htonl(FSTRM_CONTROL_ACCEPT),
                         htonl(FSTRM_CONTROL_FIELD_CONTENT_TYPE), htonl(22) };
     send(fd, acc, sizeof(acc), 0);
     send(fd, ct_str, 22, 0);
@@ -608,7 +665,7 @@ static void *fstrm_collector(void *arg) {
                 if (recv(fd, &clen_be, 4, MSG_WAITALL) != 4 || recv(fd, &ctype_be, 4, MSG_WAITALL) != 4) break;
                 if (ntohl(ctype_be) == FSTRM_CONTROL_STOP) {
                     atomic_store(&c->got_stop, true);
-                    uint32_t fin[3] = { htonl(FSTRM_CONTROL_ESCAPE), htonl(4), htonl(FSTRM_CONTROL_FINISH) };
+                    uint32_t fin[3] = { htonl(FSTRM_ESCAPE_ZERO), htonl(4), htonl(FSTRM_CONTROL_FINISH) };
                     send(fd, fin, sizeof(fin), 0);
                 }
                 break;
@@ -708,6 +765,7 @@ int main(void) {
     test_dnstap_send_frame_socketpair();
     test_dnstap_rings_and_queuing();
     test_dnstap_handshake();
+    test_dnstap_handshake_content_type();
     test_dnstap_sender_thread();
     test_dnstap_stop_finish_reconnect();   /* last: dnstap_shutdown() ends the sender for good */
     printf("=== All DNSTAP Engine Unit Tests PASSED ===\n");

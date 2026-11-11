@@ -10,6 +10,7 @@
 #include "dns_tsig_acl.h"
 #include "dns_config_parser.h"
 #include "dns_priv_sandbox.h"
+#include <openssl/crypto.h>
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -144,6 +145,10 @@ static void update_log_failure(const zone_db_entry_t *entry, const char *client_
   logev_post(LOGC_UPDATE, LOG_LVL_INFO, client_ip, query_client_port(), "updating zone '%s/IN': update failed: %s (%s)%s", zn, why, dns_rcode_name((unsigned)rcode), what);
 }
 
+/* Design note (review dns_dynamic_update.c [11]): an UPDATE builds the whole next version of the zone (thaw, apply, index, freeze) and holds the zone's
+ * writer_lock for that time, and for up to 5 s while it waits for a running AXFR to finish (wait_for_active_axfr()).  That is the cost of the
+ * immutable image design (readers never see a half-built zone, no lock on the query path); an incremental image update would be a change of that
+ * design, not of this function.  Dynamic Update is transient in KariDNS (lost on reload), meant for small, infrequent changes. */
 int handle_dynamic_update(const uint8_t *req, size_t req_len,
                           zone_db_entry_t *entry,
                           const char *client_ip,
@@ -288,13 +293,16 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
   return 0; // NOERROR
 }
 
+/* NOTIFY is not sent per UPDATE: the zone is marked (zone_notify_request()) and the control thread, woken here, sends one NOTIFY round for all
+ * the marks at its next tick (one-second tick), so several UPDATEs inside a tick give one NOTIFY (BIND waits a little before it notifies, too). */
 void notify_request_send(zone_db_entry_t *entry) {
   zone_notify_request(entry);
   int kq = atomic_load_explicit(&g_control_kq, memory_order_acquire);
   if (kq != -1) {
     struct kevent ev;
-    EV_SET(&ev, 2, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
-    kevent(kq, &ev, 1, NULL, 0, NULL);
+    EV_SET(&ev, CTL_NOTIFY_EVENT, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+    /* the wake-up is only a hint: the mark is picked up at the next one-second tick anyway */
+    if (kevent(kq, &ev, 1, NULL, 0, NULL) < 0) syslog(LOG_WARNING, "[Notify] cannot wake the control thread: %m (the NOTIFY follows at the next tick)");
   }
 }
 
@@ -378,6 +386,11 @@ static void send_single_notify(const uint8_t *req, size_t req_len,
   if (send(g_notify_ipc[1], buf, sizeof(msg) + req_len, 0) < 0) {
     if (errno != EAGAIN && errno != EWOULDBLOCK) {
       syslog(LOG_WARNING, "[Notify] send to notify IPC failed: %m");
+    } else {
+      /* the IPC socket is full: dropped by design (a NOTIFY from a primary is repeated); counted, and logged for the first and every 1000th */
+      static _Atomic uint64_t dropped;
+      uint64_t n = atomic_fetch_add_explicit(&dropped, 1, memory_order_relaxed) + 1;
+      if (n == 1 || n % 1000 == 0) syslog(LOG_WARNING, "[Notify] the notify IPC socket is full: %llu incoming NOTIFY message(s) dropped so far", (unsigned long long)n);
     }
   }
 }
@@ -390,7 +403,8 @@ static bool sockaddr_equal(const struct sockaddr_storage *a, const struct sockad
   }
   if (b->sa_family == AF_INET6) {
     const struct sockaddr_in6 *x = (const struct sockaddr_in6 *)a, *y = (const struct sockaddr_in6 *)b;
-    return x->sin6_port == y->sin6_port && memcmp(&x->sin6_addr, &y->sin6_addr, sizeof(struct in6_addr)) == 0;
+    return x->sin6_port == y->sin6_port && memcmp(&x->sin6_addr, &y->sin6_addr, sizeof(struct in6_addr)) == 0 &&
+           (!IN6_IS_ADDR_LINKLOCAL(&x->sin6_addr) || x->sin6_scope_id == y->sin6_scope_id);   /* fe80::/10 means a different host on each link */
   }
   return false;
 }
@@ -408,6 +422,12 @@ static void sockaddr_to_text(const struct sockaddr_storage *ss, char *buf, size_
   snprintf(buf, len, "%s port %u", ip, port);
 }
 
+/* A slot that is free again does not keep the TSIG secret */
+static void notify_slot_release(notify_pending_t *p) {
+  p->used = false;
+  OPENSSL_cleanse(p->key_secret, sizeof(p->key_secret));
+}
+
 static void notify_pending_tsig_key(const notify_pending_t *p, tsig_key_t *k) {
   memset(k, 0, sizeof(*k));
   k->name = (char *)p->key_name;
@@ -422,6 +442,7 @@ static bool notify_sign(notify_pending_t *p) {
   tsig_key_t key;
   notify_pending_tsig_key(p, &key);
   size_t len = p->unsigned_len;
+  bool ok = true;
   p->pkt[10] = 0;
   p->pkt[11] = 0;
   memcpy(p->prev_mac, p->req_mac, p->req_mac_len);
@@ -429,11 +450,13 @@ static bool notify_sign(notify_pending_t *p) {
   size_t mac_len = 0;
   if (tsig_sign_packet(p->pkt, &len, NOTIFY_PKT_MAX, &key, 0, p->req_mac, &mac_len, NULL, 0, false) != 0) {
     syslog(LOG_ERR, "[Notify] zone '%s': failed to TSIG-sign NOTIFY with key '%s'", p->domain, p->key_name);
-    return false;
+    ok = false;
+  } else {
+    p->req_mac_len = mac_len;
+    p->pkt_len = len;
   }
-  p->req_mac_len = mac_len;
-  p->pkt_len = len;
-  return true;
+  OPENSSL_cleanse(key.secret_decoded, sizeof(key.secret_decoded));   /* the copy on this stack */
+  return ok;
 }
 
 /* The header and the question of an answer to a NOTIFY (RFC 1996 §3.6): QR set, opcode NOTIFY, a question.  The caller compares the ID
@@ -443,6 +466,8 @@ static bool notify_parse_answer(const uint8_t *msg, size_t len, uint16_t *id, ch
   uint16_t qdcount = (uint16_t)((msg[4] << 8) | msg[5]);
   size_t q_end;
   if (qdcount < 1 || expand_wire_name_to_buffer(msg, len, DNS_HEADER_SIZE, &q_end, qname, qsz) < 0) return false;
+  /* the question is the one sent: type SOA, class IN (RFC 1996 §3.6 repeats the NOTIFY's question) */
+  if (q_end + 4 > len || (((uint16_t)msg[q_end] << 8) | msg[q_end + 1]) != 6 || (((uint16_t)msg[q_end + 2] << 8) | msg[q_end + 3]) != 1) return false;
   *id = (uint16_t)((msg[0] << 8) | msg[1]);
   *rcode = msg[3] & 0x0F;
   return true;
@@ -461,6 +486,7 @@ static int notify_answer_tsig(const notify_pending_t *p, const uint8_t *msg, siz
     int tv_prev = tsig_verify_packet(msg, len, &key, p->prev_mac, p->prev_mac_len, NULL, 0, false, mac, &mac_len);
     if (tv_prev == 0) tv = 0;
   }
+  OPENSSL_cleanse(key.secret_decoded, sizeof(key.secret_decoded));
   return tv;
 }
 
@@ -680,7 +706,7 @@ static void notify_xmit(notify_pending_t *p, time_t now) {
     p->next_time = now + 1;
     return;
   }
-  p->used = false;
+  notify_slot_release(p);
 }
 
 /* The UDP attempts did not get the NOTIFY answered (or the answer was no good): the message is made over TCP once (BIND notify_done()) */
@@ -698,7 +724,7 @@ static void notify_to_tcp(notify_pending_t *p, time_t now, bool bad_answer) {
 /* 1つの宛先へ NOTIFY を組み立てて送り、応答待ちに登録する。宛先ごとに ID を変え (RFC 1996 §3.6 の
  * 照合は ID、QNAME、送信元アドレスとポート)、鍵があれば署名する (RFC 8945 §5.1)。
  * 同じゾーンの同じ宛先への古い NOTIFY が待っていれば置き換える (新しい版の通知で足りる)。 */
-static void notify_send_to(const char *domain, const char *view_name, const struct sockaddr_storage *dest,
+static bool notify_send_to(const char *domain, const char *view_name, const struct sockaddr_storage *dest,
                            bool has_src, const uint8_t *src, const tsig_key_t *key, const notify_retry_config_t *nr, uint32_t rate,
                            bool tcp_only) {
   socklen_t dlen = dest->ss_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
@@ -725,26 +751,36 @@ static void notify_send_to(const char *domain, const char *view_name, const stru
   req[5] = 1;
   size_t offset = DNS_HEADER_SIZE;
   long w = write_uncompressed_name(req, offset, NOTIFY_PKT_MAX, domain);
-  if (w <= 0) return;
+  if (w <= 0) return false;
   offset += (size_t)w;
   req[offset++] = 0;
   req[offset++] = 6;
   req[offset++] = 0;
   req[offset++] = 1;
   slot->pkt_len = slot->unsigned_len = offset;
-  strlcpy(slot->domain, domain, sizeof(slot->domain));
+  if (strlcpy(slot->domain, domain, sizeof(slot->domain)) >= sizeof(slot->domain)) return false;
   if (key) {
-    if (key->secret_decoded_len > sizeof(slot->key_secret) || !key->name || !key->algorithm) return;
+    if (key->secret_decoded_len > sizeof(slot->key_secret) || !key->name || !key->algorithm) return false;
     slot->is_signed = true;
-    strlcpy(slot->key_name, key->name, sizeof(slot->key_name));
-    strlcpy(slot->key_alg, key->algorithm, sizeof(slot->key_alg));
+    /* a name that does not fit would sign with another key (or fail at the receiver): no NOTIFY rather than a wrong one */
+    if (strlcpy(slot->key_name, key->name, sizeof(slot->key_name)) >= sizeof(slot->key_name) ||
+        strlcpy(slot->key_alg, key->algorithm, sizeof(slot->key_alg)) >= sizeof(slot->key_alg)) {
+      syslog(LOG_ERR, "[Notify] zone '%s': the TSIG key name or algorithm is too long; no NOTIFY is sent with it", domain);
+      return false;
+    }
     memcpy(slot->key_secret, key->secret_decoded, key->secret_decoded_len);
     slot->key_secret_len = key->secret_decoded_len;
-    if (!notify_sign(slot)) return;
+    if (!notify_sign(slot)) {
+      OPENSSL_cleanse(slot->key_secret, sizeof(slot->key_secret));   /* also when slot is the stack copy of an untracked NOTIFY */
+      return false;
+    }
   }
   slot->dest = *dest;
   slot->dest_len = dlen;
-  strlcpy(slot->view, view_name ? view_name : "", sizeof(slot->view));
+  if (strlcpy(slot->view, view_name ? view_name : "", sizeof(slot->view)) >= sizeof(slot->view)) {
+    OPENSSL_cleanse(slot->key_secret, sizeof(slot->key_secret));
+    return false;
+  }
   slot->has_src = has_src;
   if (has_src && src) memcpy(slot->src, src, sizeof(slot->src));
   slot->max_sends = 1 + nr->retries;
@@ -763,7 +799,8 @@ static void notify_send_to(const char *domain, const char *view_name, const stru
     char a[INET6_ADDRSTRLEN + 16];
     sockaddr_to_text(dest, a, sizeof(a));
     syslog(LOG_WARNING, "[Notify] zone '%s': too many NOTIFYs awaiting an answer; NOTIFY to %s over TCP is not sent", domain, a);
-    return;
+    OPENSSL_cleanse(slot->key_secret, sizeof(slot->key_secret));
+    return false;
   }
   slot->used = tracked;
   if (!tracked || (room && xfr_rl_take(&g_notify_rl, rate, now))) {
@@ -779,7 +816,9 @@ static void notify_send_to(const char *domain, const char *view_name, const stru
     sockaddr_to_text(dest, a, sizeof(a));
     syslog(LOG_WARNING, "[Notify] zone '%s': too many NOTIFYs awaiting an answer; NOTIFY to %s is not retransmitted",
            domain, a);
+    OPENSSL_cleanse(slot->key_secret, sizeof(slot->key_secret));   /* slot is the stack copy: nothing keeps it */
   }
+  return true;
 }
 
 void notify_retransmit_due(time_t now) {
@@ -798,7 +837,7 @@ void notify_retransmit_due(time_t now) {
         continue;
       }
       if (!p->tcp_stage && p->is_signed && !notify_sign(p)) {
-        p->used = false;
+        notify_slot_release(p);
         continue;
       }
       p->sends = 1;
@@ -808,7 +847,7 @@ void notify_retransmit_due(time_t now) {
     }
     /* 同じ ID で送り直す (RFC 1996 §3.6 の照合は ID で行う)。署名は今の時刻で付け直す */
     if (p->is_signed && !notify_sign(p)) {
-      p->used = false;
+      notify_slot_release(p);
       continue;
     }
     send_single_notify(p->pkt, p->pkt_len, (const struct sockaddr *)&p->dest, p->dest_len, p->has_src, p->src);
@@ -845,7 +884,7 @@ void notify_handle_response(const uint8_t *msg, size_t len, const struct sockadd
       }
     }
     notify_log_answer(p, a, rcode, "");
-    p->used = false;
+    notify_slot_release(p);
     return;
   }
 }
@@ -862,7 +901,22 @@ typedef struct {
  * of notify_add_target()) clears it before it builds the list and logs it after */
 static bool g_notify_dropped;
 
-/* 宛先の一覧に重複なく加える */
+/* 宛先 d を一覧に重複なく加える */
+static void notify_add_dest(notify_dest_t *targets, int *count, int max, const struct sockaddr_storage *d,
+                            const tsig_key_t *tkey, const notify_target_t *tpl) {
+  for (int i = 0; i < *count; i++) {
+    if (sockaddr_equal(&targets[i].addr, (const struct sockaddr *)d)) return;
+  }
+  if (*count < max) {
+    targets[*count].key = tkey;
+    targets[*count].tpl = tpl;
+    targets[(*count)++].addr = *d;
+  } else {
+    g_notify_dropped = true;
+  }
+}
+
+/* 宛先の一覧に重複なく加える (アドレスはテキスト) */
 static void notify_add_target(notify_dest_t *targets, int *count, int max, int family, const char *ip, uint16_t port,
                               const tsig_key_t *tkey, const notify_target_t *tpl) {
   struct sockaddr_storage d;
@@ -876,16 +930,7 @@ static void notify_add_target(notify_dest_t *targets, int *count, int max, int f
   } else {
     return;
   }
-  for (int i = 0; i < *count; i++) {
-    if (sockaddr_equal(&targets[i].addr, (const struct sockaddr *)&d)) return;
-  }
-  if (*count < max) {
-    targets[*count].key = tkey;
-    targets[*count].tpl = tpl;
-    targets[(*count)++].addr = d;
-  } else {
-    g_notify_dropped = true;
-  }
+  notify_add_dest(targets, count, max, &d, tkey, tpl);
 }
 
 /* arena の中の name のアドレス (A/AAAA) を宛先に加える。見つかれば true */
@@ -897,10 +942,19 @@ static bool notify_add_glue(const zone_image_t *img, const char *name, notify_de
   for (uint32_t k = zone_image_name_first_rr(img, id); k < end; k++) {
     uint16_t t = zone_image_rr_type(img, k);
     uint16_t len = zone_image_rr_rdlen(img, k);
-    char ip[INET6_ADDRSTRLEN];
     if ((t != 1 || len != 4) && (t != 28 || len != 16)) continue;
-    if (!inet_ntop(t == 1 ? AF_INET : AF_INET6, zone_image_rr_rdata(img, k), ip, sizeof(ip))) continue;
-    notify_add_target(targets, count, max, t == 1 ? AF_INET : AF_INET6, ip, port, tkey, NULL);
+    struct sockaddr_storage d;   /* the binary address of the RR, no text round trip */
+    memset(&d, 0, sizeof(d));
+    if (t == 1) {
+      d.ss_family = AF_INET;
+      memcpy(&((struct sockaddr_in *)&d)->sin_addr, zone_image_rr_rdata(img, k), 4);
+      ((struct sockaddr_in *)&d)->sin_port = htons(port);
+    } else {
+      d.ss_family = AF_INET6;
+      memcpy(&((struct sockaddr_in6 *)&d)->sin6_addr, zone_image_rr_rdata(img, k), 16);
+      ((struct sockaddr_in6 *)&d)->sin6_port = htons(port);
+    }
+    notify_add_dest(targets, count, max, &d, tkey, NULL);
     found = true;
   }
   return found;
@@ -1098,6 +1152,7 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
     syslog(LOG_WARNING, "[Notify] zone '%s': more than %d NOTIFY destinations (also-notify and the NS hosts); the others get no NOTIFY and find the "
                         "change at their next refresh", domain, (int)(sizeof(targets) / sizeof(targets[0])));
 
+  int nsent = 0;
   for (int i = 0; i < ntargets; i++) {
     /* the local address of this NOTIFY: the `source` of the also-notify list the address is written in, else notify-source(-v6).  Only an
      * address that was in the configuration at start-up has a pre-bound socket (config_xfr_source_allowed()); another one is ignored with a
@@ -1129,11 +1184,11 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
     }
     /* tcp-only yes in that server statement: the NOTIFY goes over TCP (BIND notify_send_toaddr(): dns_peer_getforcetcp()) */
     bool tcp_only = srv && (srv->set & SV_B_TCP_ONLY) && (srv->bools & SV_B_TCP_ONLY);
-    notify_send_to(domain, view_name, &targets[i].addr, has_src, src, tkey, &nr, g_notify_rate, tcp_only);
+    if (notify_send_to(domain, view_name, &targets[i].addr, has_src, src, tkey, &nr, g_notify_rate, tcp_only)) nsent++;
   }
 
-  if (entry && ntargets > 0) {
-    atomic_fetch_add_explicit(&entry->observatory.notify_sent, ntargets, memory_order_relaxed);
+  if (entry && nsent > 0) {   /* the NOTIFYs sent or queued (a rate-held one goes at a later tick); not the ones that could not be built */
+    atomic_fetch_add_explicit(&entry->observatory.notify_sent, nsent, memory_order_relaxed);
     atomic_store_explicit(&entry->observatory.last_notify_time, (uint64_t)time(NULL), memory_order_relaxed);
   }
   if (!entry) syslog(LOG_INFO, "[Notify] zone '%s' (data out of memory): NOTIFY to %d address(es)", domain, ntargets);

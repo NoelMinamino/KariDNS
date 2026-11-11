@@ -264,10 +264,70 @@ static void test_name_register_stops_at_pointer(void) {
     CHECK(ctx != NULL);
     if (ctx) {
         compress_ctx_init(ctx);
-        register_wire_name_for_compression(copy, DNS_HEADER_SIZE, ctx);
+        register_wire_name_for_compression(copy, sizeof(pkt), DNS_HEADER_SIZE, ctx);
         free(ctx);
     }
     free(copy);
+}
+
+/* fuzz_dns_wire found an RRSIG in the KariDNS extension class (65302): it has the text fields of an RRSIG and is written from its generic data, so
+ * writing the "text" record with that class gave an empty RDATA and the check of the harness failed.  The text form is stable as an IN record. */
+static void test_rrsig_ext_class_text_roundtrip(void) {
+    printf("[TEST] RRSIG of the extension class: text fields round-trip as an IN record...\n");
+    static const uint8_t msg[] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x02,0x77,0x6e,0x04,0x74,0x65,0x63,0x74,0x00,0x00,0x2e,0xff,0x16,0x00,0x00,0x01,0x2c,0x00,0x30,0x00,0x2d,0x06,0x0d,0x02,0x00,0x7f,0x60,0xff,0xff,0xff,0x7f,0x43,0x53,0x59,0x4e,0x43,0x23,0x00,0x00,0xbc,0xcf,0x00,0x00,0x00,0x00,0x00,0x04,0xff,0xff,0xff,0xf6,0xff,0xff,0xff,0x55,0x81,0x9a,0x01,0x30,0x67,0xed,0x38,0x3a,0x45,0x55,0x29,0xf2,0xae, };
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+    size_t off = 12;
+    dns_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    uint16_t type = 0;
+    CHECK(parse_resource_record(msg, sizeof(msg), &off, &arena, &rec, &type) == 0);
+    CHECK(rec.type_code == 46 && rec.class_val == DNS_CLASS_KARIDNS_EXT && rec.rdata_count >= 9);
+    dns_record_t text = rec;
+    text.generic_data = NULL;
+    text.generic_len = 0;
+    text.is_cached = false;
+    uint8_t wire[4096];
+    uint16_t woff = 0;
+    CHECK(serialize_dns_record(wire, sizeof(wire), &woff, &text, NULL, "fuzz.test.", 0xFFFFFFFF) == 0);
+    CHECK(woff == 11 + 10);                                   /* extension class: nothing but the header (generic data is NULL) */
+    text.class_val = 1;
+    woff = 0;
+    CHECK(serialize_dns_record(wire, sizeof(wire), &woff, &text, NULL, "fuzz.test.", 0xFFFFFFFF) == 0);
+    dns_record_t again;
+    memset(&again, 0, sizeof(again));
+    size_t pos = 0;
+    CHECK(parse_resource_record(wire, woff, &pos, &arena, &again, &type) == 0);
+    CHECK(again.rdata_count == rec.rdata_count);
+    for (int i = 0; i < rec.rdata_count && i < again.rdata_count; i++) CHECK(strcasecmp(again.rdata[i], rec.rdata[i]) == 0);
+    zone_arena_destroy(&arena);
+}
+
+/* buf_len bounds what register_wire_name_for_compression() reads: a name whose root octet (or a label) lies outside it is not registered */
+static void test_name_register_bounded(void) {
+    printf("[TEST] register_wire_name_for_compression: a name that does not end inside buf_len is not registered...\n");
+    static const uint8_t www[] = { 3, 'w', 'w', 'w', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
+    uint8_t pkt[64];
+    compress_ctx_t ctx;
+    uint16_t off;
+    memset(pkt, 0, sizeof(pkt));
+    memcpy(pkt + 12, www, sizeof(www));
+    compress_ctx_init(&ctx);
+    register_wire_name_for_compression(pkt, 12 + sizeof(www) - 1, 12, &ctx);       /* the root octet is outside */
+    off = 40;
+    CHECK(compress_name(pkt, &off, www, &ctx, sizeof(pkt)) == 0);
+    CHECK(off == 40 + sizeof(www));                                                 /* written in full: nothing was registered */
+    compress_ctx_init(&ctx);
+    register_wire_name_for_compression(pkt, 14, 12, &ctx);                          /* the first label itself is cut */
+    off = 40;
+    CHECK(compress_name(pkt, &off, www, &ctx, sizeof(pkt)) == 0);
+    CHECK(off == 40 + sizeof(www));
+    compress_ctx_init(&ctx);
+    register_wire_name_for_compression(pkt, 12 + sizeof(www), 12, &ctx);            /* the whole name is inside */
+    off = 40;
+    CHECK(compress_name(pkt, &off, www, &ctx, sizeof(pkt)) == 0);
+    CHECK(off == 42 && pkt[40] == 0xC0 && pkt[41] == 12);                           /* a pointer to it */
 }
 
 static void test_name_canonical_order(void) {
@@ -815,14 +875,14 @@ static void test_name_compression(void) {
     memset(pkt, 0, sizeof(pkt));
     compress_ctx_init(&ctx);
     memcpy(pkt + 12, WWW_EXAMPLE_COM, sizeof(WWW_EXAMPLE_COM));         /* www.example.com at 12 */
-    register_wire_name_for_compression(pkt, 12, &ctx);
+    register_wire_name_for_compression(pkt, sizeof(pkt), 12, &ctx);
     static const uint8_t mail_example_com[] = { 4, 'm', 'a', 'i', 'l', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
     off = 40;
     CHECK(compress_name(pkt, &off, mail_example_com, &ctx, sizeof(pkt)) == 0);
     /* 04 mail + pointer to "example.com" which begins at 12 + 4 = 16 => 0xC010 */
     CHECK(off == 47 && pkt[45] == 0xC0 && pkt[46] == 0x10);
-    register_wire_name_for_compression(NULL, 12, &ctx);
-    register_wire_name_for_compression(pkt, 12, NULL);
+    register_wire_name_for_compression(NULL, 0, 12, &ctx);
+    register_wire_name_for_compression(pkt, sizeof(pkt), 12, NULL);
     compress_ctx_init(NULL);
     compress_ctx_init_packet(NULL);
 }
@@ -1580,7 +1640,7 @@ static void test_wire_compression_pointer_table_full(void) {
     // Register names in wire format
     uint8_t wire_name[] = { 4, 'h', 'o', 's', 't', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
     memcpy(pkt + 12, wire_name, sizeof(wire_name));
-    register_wire_name_for_compression(pkt, 12, &ctx);
+    register_wire_name_for_compression(pkt, sizeof(pkt), 12, &ctx);
     CHECK(ctx.current_generation == 1);
 }
 
@@ -1592,7 +1652,7 @@ static void test_wire_compression_pointer_to_pointer_chain(void) {
     memset(pkt, 0, sizeof(pkt));
     uint8_t sub_name[] = { 3, 's', 'u', 'b', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
     memcpy(pkt + 12, sub_name, sizeof(sub_name));
-    register_wire_name_for_compression(pkt, 12, &ctx);
+    register_wire_name_for_compression(pkt, sizeof(pkt), 12, &ctx);
     
     uint8_t host_name[] = { 4, 'h', 'o', 's', 't', 3, 's', 'u', 'b', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
     uint16_t cur_off = 50;
@@ -3633,6 +3693,8 @@ int main(void) {
     test_name_wire_decoders();
     test_name_canonical_order();
     test_name_register_stops_at_pointer();
+    test_name_register_bounded();
+    test_rrsig_ext_class_text_roundtrip();
     test_name_zone_parser_normalizes();
     test_name_tinydns_normalizes();
     test_serialize_exact_fit_base64();

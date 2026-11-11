@@ -2066,10 +2066,32 @@ static void test_program_plugins_and_forward_zone_helpers(void) {
 
     char fp[256];
     compute_program_zone_fingerprint(&zcfg, fp, sizeof(fp));
-    assert(strstr(fp, "path=/usr/local/bin/test_plugin") != NULL);
-    assert(strstr(fp, "user=bind") != NULL);
-    assert(strstr(fp, "timeout=1500") != NULL);
-    assert(strstr(fp, "--zone=dynamic.prog;") != NULL);
+    /* the fingerprint is a hash of everything that decides how the plugin is started: 16 hex digits */
+    assert(strlen(fp) == 16 && strspn(fp, "0123456789abcdef") == 16);
+    char fp2[256];
+    compute_program_zone_fingerprint(&zcfg, fp2, sizeof(fp2));
+    assert(strcmp(fp, fp2) == 0);                                   // stable
+    tzx(&zcfg)->program_timeout_ms = 1501;
+    compute_program_zone_fingerprint(&zcfg, fp2, sizeof(fp2));
+    assert(strcmp(fp, fp2) != 0);                                   // a number changed
+    tzx(&zcfg)->program_timeout_ms = 1500;
+    {   // a change in the LAST argument of a long list is noticed (the old text form was cut at 512 octets)
+        enum { NLONG = 60 };
+        char *long_args[NLONG];
+        for (int i = 0; i < NLONG; i++) {
+            long_args[i] = malloc(32);
+            snprintf(long_args[i], 32, "--option-number-%02d=value", i);
+        }
+        tzx(&zcfg)->program_args = long_args;
+        tzx(&zcfg)->program_args_count = NLONG;
+        compute_program_zone_fingerprint(&zcfg, fp, sizeof(fp));
+        long_args[NLONG - 1][strlen(long_args[NLONG - 1]) - 1] = 'X';
+        compute_program_zone_fingerprint(&zcfg, fp2, sizeof(fp2));
+        assert(strcmp(fp, fp2) != 0);
+        for (int i = 0; i < NLONG; i++) free(long_args[i]);
+        tzx(&zcfg)->program_args = (char **)args;
+        tzx(&zcfg)->program_args_count = 2;
+    }
 
     // 2. build_synthetic_servfail
     uint8_t qpkt[512];
@@ -7328,6 +7350,16 @@ static void test_query_engine_feature_case_183(void) {
     // Degenerate/short input returns 0 (cannot respond)
     assert(build_synthetic_servfail(req, 8, res, sizeof(res)) == 0);
     assert(build_synthetic_servfail(req, req_len, res, 10) == 0);
+
+    // A question that cannot be read (a label that runs past the end) is not copied back: the answer is the header only, QDCOUNT 0
+    uint8_t bad[64];
+    memset(bad, 0, sizeof(bad));
+    bad[0] = 0x56; bad[1] = 0x78; bad[5] = 1;                      // QDCOUNT = 1
+    bad[12] = 40; memset(bad + 13, 'a', 20);                       // a label of 40 octets, 20 present
+    len = build_synthetic_servfail(bad, 33, res, sizeof(res));
+    assert(len == (int)DNS_HEADER_SIZE);
+    assert(res[0] == 0x56 && res[1] == 0x78 && (res[3] & 0x0F) == 2);
+    assert(res[4] == 0 && res[5] == 0);
 }
 
 static void test_query_engine_feature_case_184(void) {
@@ -9884,6 +9916,7 @@ static int g_b9_fail;
 static int g_b9_calls;
 static int64_t g_b9_now = 1000;
 static int64_t b9_now(void) { return g_b9_now; }
+static int g_b9_ttl0;   /* 1: the A answer has TTL 0 */
 static int b9_resolve(const alias_rset_t *rs, const uint8_t *name, size_t nlen, uint16_t qtype, alias_parsed_t *out) {
     static const uint8_t t_name[] = { 1, 't', 6, 't', 'a', 'r', 'g', 'e', 't', 4, 't', 'e', 's', 't', 0 };
     (void)rs;
@@ -9893,7 +9926,7 @@ static int b9_resolve(const alias_rset_t *rs, const uint8_t *name, size_t nlen, 
     if (nlen != sizeof(t_name) || memcmp(name, t_name, nlen) != 0) return 1;
     out->rc = 0;
     if (qtype == 1) {
-        out->n = 2; out->rdlen = 4; out->ttl = 60;
+        out->n = 2; out->rdlen = 4; out->ttl = g_b9_ttl0 ? 0 : 60;
         memcpy(out->rd, "\xC0\x00\x02\x0A\xC0\x00\x02\x0B", 8);
     } else {
         out->n = 1; out->rdlen = 16; out->ttl = 90;
@@ -9999,6 +10032,15 @@ static void test_b9a_alias_lua_queries(void) {
     g_b9_now += 400;                                                                                                /* the back-off is over */
     alias_test_pass();
     b9_ask(&z, &cfg, "a.al.test.", 1, &r);          assert(r.rcode == 0 && r.an == 2 && r.ttl[0] == 60);            /* recovered */
+    /* an answer with TTL 0 is never served with a longer TTL when it is served stale (RFC 8767 section 5: the stale TTL is a cap, not a floor) */
+    g_b9_ttl0 = 1;
+    g_b9_now += 100;
+    alias_test_pass();
+    b9_ask(&z, &cfg, "a.al.test.", 1, &r);          assert(r.rcode == 0 && r.an == 2 && r.ttl[0] == 0);
+    g_b9_ttl0 = 0;
+    g_b9_now += 10;
+    alias_test_pass();
+    b9_ask(&z, &cfg, "a.al.test.", 1, &r);          assert(r.an == 2 && r.ttl[0] == 60);
 
     /* a result is keyed by the resolver set: another list does not see it */
     server_config_t cfg2;
@@ -10025,6 +10067,30 @@ static void test_b9a_alias_lua_queries(void) {
         free(x->alias_resolvers[0].ip);
         free(x->alias_resolvers);
         free(zc.ext);
+        /* the key of a resolver set does not depend on the order of its members or on how an IPv6 address is spelled: one set, one job per target */
+        {
+            zone_config_t za, zb;
+            memset(&za, 0, sizeof(za));
+            memset(&zb, 0, sizeof(zb));
+            zone_ext_t *xa = zone_ext_mut(&za), *xb = zone_ext_mut(&zb);
+            xa->alias_resolvers = calloc(2, sizeof(ip_port_t));
+            xb->alias_resolvers = calloc(2, sizeof(ip_port_t));
+            xa->alias_resolvers[0].ip = strdup("192.0.2.1");  xa->alias_resolvers[0].port = 53;
+            xa->alias_resolvers[1].ip = strdup("2001:db8::1"); xa->alias_resolvers[1].port = 0;       /* 0: port 53, as alias_resolvers_fill() */
+            xb->alias_resolvers[0].ip = strdup("2001:0db8:0:0:0:0:0:1"); xb->alias_resolvers[0].port = 53;
+            xb->alias_resolvers[1].ip = strdup("192.0.2.1");  xb->alias_resolvers[1].port = 53;
+            xa->alias_resolvers_count = xb->alias_resolvers_count = 2;
+            assert(alias_resolvers_key(&cfg, &za, false) != 0);
+            assert(alias_resolvers_key(&cfg, &za, false) == alias_resolvers_key(&cfg, &zb, false));
+            free(xb->alias_resolvers[1].ip);
+            xb->alias_resolvers[1].ip = strdup("192.0.2.2");                                      /* another member: another set */
+            assert(alias_resolvers_key(&cfg, &za, false) != alias_resolvers_key(&cfg, &zb, false));
+            for (int i = 0; i < 2; i++) { free(xa->alias_resolvers[i].ip); free(xb->alias_resolvers[i].ip); }
+            free(xa->alias_resolvers);
+            free(xb->alias_resolvers);
+            free(za.ext);
+            free(zb.ext);
+        }
         server_config_t dbc;
         memset(&dbc, 0, sizeof(dbc));
         dbc.database.enabled = true;

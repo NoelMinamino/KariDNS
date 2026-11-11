@@ -8,9 +8,6 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
-#include <openssl/sha.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,33 +24,45 @@ void init_server_cookie_secret(void) {
   arc4random_buf(g_server_cookie_secret, sizeof(g_server_cookie_secret));
 }
 
-bool compute_server_cookie_hash(const uint8_t secret[SERVER_COOKIE_SECRET_LEN], const char *client_ip,
-                                const uint8_t client_cookie[8], const uint8_t ver_rsvd_ts[8],
-                                uint8_t hash_out[8]) {
-    /* RFC 9018 §4.4 input order: Client Cookie | Version | Reserved | Timestamp | Client-IP */
-    uint8_t data[8 + 8 + 16];
-    size_t data_len = 0;
-    memcpy(data, client_cookie, 8);
-    memcpy(data + 8, ver_rsvd_ts, 8);
-    data_len = 16;
-
+/* The client address as the octets RFC 9018 §4.4 hashes (4 or 16); 0 = not an IP literal (logged).  Parsed once per cookie operation, not once per
+ * secret that is tried. */
+static size_t cookie_client_addr(const char *client_ip, uint8_t out[16]) {
     struct in_addr a4;
     struct in6_addr a6;
     if (client_ip && inet_pton(AF_INET, client_ip, &a4) == 1) {
-        memcpy(data + data_len, &a4, 4);
-        data_len += 4;
-    } else if (client_ip && inet_pton(AF_INET6, client_ip, &a6) == 1) {
-        memcpy(data + data_len, &a6, 16);
-        data_len += 16;
-    } else {
-        syslog(LOG_WARNING, "[Cookie] client_ip could not be parsed as IPv4/IPv6; refusing to bind cookie to address");
-        return false;
+        memcpy(out, &a4, 4);
+        return 4;
     }
+    if (client_ip && inet_pton(AF_INET6, client_ip, &a6) == 1) {
+        memcpy(out, &a6, 16);
+        return 16;
+    }
+    syslog(LOG_WARNING, "[Cookie] client_ip could not be parsed as IPv4/IPv6; refusing to bind cookie to address");
+    return 0;
+}
+
+static void cookie_hash_addr(const uint8_t secret[SERVER_COOKIE_SECRET_LEN], const uint8_t *addr, size_t addr_len,
+                             const uint8_t client_cookie[8], const uint8_t ver_rsvd_ts[8], uint8_t hash_out[8]) {
+    /* RFC 9018 §4.4 input order: Client Cookie | Version | Reserved | Timestamp | Client-IP */
+    uint8_t data[8 + 8 + 16];
+    memcpy(data, client_cookie, 8);
+    memcpy(data + 8, ver_rsvd_ts, 8);
+    memcpy(data + 16, addr, addr_len);
+    size_t data_len = 16 + addr_len;
 
     uint64_t key[2];
     dns_siphash_key_from_bytes(secret, key);
     uint64_t h = dns_siphash24(data, data_len, key);
     for (int i = 0; i < 8; i++) hash_out[i] = (uint8_t)(h >> (8 * i));   /* little-endian */
+}
+
+bool compute_server_cookie_hash(const uint8_t secret[SERVER_COOKIE_SECRET_LEN], const char *client_ip,
+                                const uint8_t client_cookie[8], const uint8_t ver_rsvd_ts[8],
+                                uint8_t hash_out[8]) {
+    uint8_t addr[16];
+    size_t addr_len = cookie_client_addr(client_ip, addr);
+    if (addr_len == 0) return false;
+    cookie_hash_addr(secret, addr, addr_len, client_cookie, ver_rsvd_ts, hash_out);
     return true;
 }
 
@@ -73,7 +82,7 @@ bool generate_server_cookie(const server_config_t *cfg, const char *client_ip,
     server_cookie[6] = (uint8_t)((timestamp >> 8) & 0xFF);
     server_cookie[7] = (uint8_t)(timestamp & 0xFF);
     return compute_server_cookie_hash(cookie_active_secret(cfg), client_ip, client_cookie,
-                                      server_cookie, server_cookie + 8);
+                                      server_cookie, server_cookie + 8);   /* one parse of the address */
 }
 
 server_cookie_status_t verify_server_cookie(const server_config_t *cfg, const char *client_ip,
@@ -94,20 +103,19 @@ server_cookie_status_t verify_server_cookie(const server_config_t *cfg, const ch
     /* Reserved (bytes 1..3) is deliberately NOT required to be zero; it is hashed as received. */
     bool match = false;
     bool old_secret = false;
+    uint8_t addr[16];
+    size_t addr_len = cookie_client_addr(client_ip, addr);   /* parsed once for all the secrets */
+    if (addr_len == 0) return SERVER_COOKIE_INVALID;
     if (cfg && cfg->cookie_secret_count > 0) {
         for (int i = 0; i < cfg->cookie_secret_count && !match; i++) {
             uint8_t expected[8];
-            if (!compute_server_cookie_hash(cfg->cookie_secrets[i], client_ip, client_cookie,
-                                            server_cookie, expected))
-                return SERVER_COOKIE_INVALID;
+            cookie_hash_addr(cfg->cookie_secrets[i], addr, addr_len, client_cookie, server_cookie, expected);
             match = (const_time_memcmp(server_cookie + 8, expected, 8) == 0);
             old_secret = match && i > 0;
         }
     } else {
         uint8_t expected[8];
-        if (!compute_server_cookie_hash(g_server_cookie_secret, client_ip, client_cookie,
-                                        server_cookie, expected))
-            return SERVER_COOKIE_INVALID;
+        cookie_hash_addr(g_server_cookie_secret, addr, addr_len, client_cookie, server_cookie, expected);
         match = (const_time_memcmp(server_cookie + 8, expected, 8) == 0);
     }
     if (!match) return SERVER_COOKIE_INVALID;
@@ -122,8 +130,7 @@ void add_ede(edns_info_t *edns, bool enabled, uint16_t code, const char *text) {
 
     edns->ede_list[edns->ede_count].code = code;
     if (text) {
-        strncpy(edns->ede_list[edns->ede_count].text, text, sizeof(edns->ede_list[0].text) - 1);
-        edns->ede_list[edns->ede_count].text[sizeof(edns->ede_list[0].text) - 1] = '\0';
+        strlcpy(edns->ede_list[edns->ede_count].text, text, sizeof(edns->ede_list[0].text));
     } else {
         edns->ede_list[edns->ede_count].text[0] = '\0';
     }
@@ -151,37 +158,20 @@ bool unpack_tag_def_rdata(const uint8_t *data, size_t len, ecs_tag_def_t **defs_
 
   ecs_tag_def_t def;
   memset(&def, 0, sizeof(def));
+  /* every CIDR text takes at least its NUL: a count the data cannot hold is refused before anything is allocated for it (65535 entries of 80 octets) */
+  if (cidr_count > len - off) return false;
   def.tag = strdup(tag);
   if (!def.tag) return false;
   def.cidrs = (cidr_count > 0) ? calloc(cidr_count, sizeof(ecs_cidr_entry_t)) : NULL;
-  if (cidr_count > 0 && !def.cidrs) {
-    free(def.tag);
-    return false;
-  }
+  if (cidr_count > 0 && !def.cidrs) goto fail;
   def.cidr_count = cidr_count;
 
   for (int j = 0; j < cidr_count; j++) {
-    if (off >= len) {
-      for (int k = 0; k < j; k++) free(def.cidrs[k].cidr);
-      free(def.cidrs);
-      free(def.tag);
-      return false;
-    }
     const char *cidr_str = (const char *)&data[off];
-    size_t clen = strnlen(cidr_str, len - off);
-    if (off + clen + 1 > len) {
-      for (int k = 0; k < j; k++) free(def.cidrs[k].cidr);
-      free(def.cidrs);
-      free(def.tag);
-      return false;
-    }
+    size_t clen = off < len ? strnlen(cidr_str, len - off) : len;
+    if (off >= len || off + clen + 1 > len) goto fail;
     def.cidrs[j].cidr = strdup(cidr_str);
-    if (!def.cidrs[j].cidr) {
-      for (int k = 0; k < j; k++) free(def.cidrs[k].cidr);
-      free(def.cidrs);
-      free(def.tag);
-      return false;
-    }
+    if (!def.cidrs[j].cidr) goto fail;
     cidr_entry_parse(&def.cidrs[j].parsed, def.cidrs[j].cidr);
     off += clen + 1;
   }
@@ -189,18 +179,15 @@ bool unpack_tag_def_rdata(const uint8_t *data, size_t len, ecs_tag_def_t **defs_
   /* I3: the array grows geometrically (doubling, at least 8), not by one definition per record.  *cap_inout is the number of
    * entries the array holds; NULL, or a value below the count (an array that was not grown here, e.g. one thaw_zone_arena()
    * made), means "exactly the count". */
-  int cur_count = *count_out;
-  int cap = cap_inout && *cap_inout >= cur_count ? *cap_inout : cur_count;
+  /* (an array that is not there holds nothing, whatever the count and the capacity the caller kept say: the fuzzer found a transfer session whose
+   * capacity outlived the array, and the store below went to NULL + 0) */
+  int cur_count = *defs_out ? *count_out : 0;
+  int cap = (*defs_out && cap_inout && *cap_inout >= cur_count) ? *cap_inout : cur_count;
   ecs_tag_def_t *new_defs = *defs_out;
   if (cur_count >= cap) {
     int ncap = cur_count < 4 ? 8 : cur_count * 2;
     new_defs = realloc(*defs_out, (size_t)ncap * sizeof(ecs_tag_def_t));
-    if (!new_defs) {
-      for (int k = 0; k < cidr_count; k++) free(def.cidrs[k].cidr);
-      free(def.cidrs);
-      free(def.tag);
-      return false;
-    }
+    if (!new_defs) goto fail;
     cap = ncap;
   }
   new_defs[cur_count] = def;
@@ -208,6 +195,13 @@ bool unpack_tag_def_rdata(const uint8_t *data, size_t len, ecs_tag_def_t **defs_
   *count_out = cur_count + 1;
   if (cap_inout) *cap_inout = cap;
   return true;
+
+fail:   /* the entries made so far (calloc: the ones not reached are NULL, free(NULL) is fine) */
+  if (def.cidrs)
+    for (int k = 0; k < cidr_count; k++) free(def.cidrs[k].cidr);
+  free(def.cidrs);
+  free(def.tag);
+  return false;
 }
 
 bool unpack_trusted_resolvers_rdata(const uint8_t *data, size_t len, char ***resolvers_out, int *count_out) {
@@ -221,7 +215,8 @@ bool unpack_trusted_resolvers_rdata(const uint8_t *data, size_t len, char ***res
   if (!new_res) return false;
   *resolvers_out = new_res;
 
-  for (int i = 0; i < count && off < len; i++) {
+  for (int i = 0; i < count; i++) {
+    if (off >= len) return false;   /* the count says more entries than the data holds */
     size_t slen = data[off++];
     if (off + slen > len) return false;
     char *s = malloc(slen + 1);
@@ -273,7 +268,12 @@ bool wrap_tinydns_image_rr(const zone_image_t *img, uint32_t rr, dns_record_t *o
   memset(&dummy_comp, 0, sizeof(dummy_comp));
   compress_ctx_init_packet(&dummy_comp);
   uint32_t ttl = zone_image_rr_ttl(img, rr);
-  if (image_serialize_rr(img, rr, tmp_wire, sizeof(tmp_wire), &tmp_off, &dummy_comp, NULL, ttl) < 0) return false;
+  if (image_serialize_rr(img, rr, tmp_wire, sizeof(tmp_wire), &tmp_off, &dummy_comp, NULL, ttl) < 0) {
+    /* a tinydns RR is small; one that does not fit 4096 octets cannot be wrapped for Extended AXFR, and the transfer fails: say which */
+    syslog(LOG_WARNING, "[AXFR] cannot wrap RR %u of type %u (%s) for Extended AXFR: more than %zu octets of wire format", (unsigned)rr,
+           (unsigned)zone_image_rr_type(img, rr), zone_image_name_text(img, zone_image_rr_name(img, rr)), sizeof(tmp_wire));
+    return false;
+  }
   const zone_image_ext_t *ext = zone_image_rr_ext(img, rr);
   static const char no_loc[2] = { 0, 0 };
   const char *name = zone_image_str(img, ext && ext->alt_text_off ? ext->alt_text_off
@@ -331,6 +331,18 @@ static bool ecs_cidr_step(const char *cidr_text, const cidr_entry_t *parsed, int
     return false;
 }
 
+/* The tag definitions that apply: the zone statement's, else the server's (ECS tags or BIND location tags) */
+static void tag_defs_pick(const server_config_t *cfg, const zone_config_t *zcfg, bool ecs, const ecs_tag_def_t **tags, int *count) {
+    const ecs_tag_def_t *zt = zcfg ? (ecs ? zext(zcfg)->ecs_tags : zext(zcfg)->location_tags) : NULL;
+    if (zt) {
+        *tags = zt;
+        *count = ecs ? zext(zcfg)->ecs_tag_count : zext(zcfg)->location_tag_count;
+    } else {
+        *tags = cfg ? (ecs ? cfg->ecs_tags : cfg->location_tags) : NULL;
+        *count = cfg ? (ecs ? cfg->ecs_tag_count : cfg->location_tag_count) : 0;
+    }
+}
+
 const char *resolve_ecs_subnet_tag(const zone_image_t *zone, const server_config_t *cfg, const zone_config_t *zcfg,
                                    const uint8_t *addr, uint16_t family, uint8_t *out_scope_prefix) {
     if (out_scope_prefix) *out_scope_prefix = 0;
@@ -340,8 +352,7 @@ const char *resolve_ecs_subnet_tag(const zone_image_t *zone, const server_config
     const ecs_tag_def_t *tags = NULL;
     int tag_count = 0;
     if (zit.left == 0) {
-        tags = (zcfg && zext(zcfg)->ecs_tags) ? zext(zcfg)->ecs_tags : (cfg ? cfg->ecs_tags : NULL);
-        tag_count = (zcfg && zext(zcfg)->ecs_tags) ? zext(zcfg)->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0);
+        tag_defs_pick(cfg, zcfg, true, &tags, &tag_count);
         if (!tags || tag_count == 0) return NULL;
     }
     if (!addr) return NULL;
@@ -389,8 +400,7 @@ const char *resolve_bind_location_tag(const zone_image_t *zone, const server_con
     const ecs_tag_def_t *tags = NULL;
     int tag_count = 0;
     if (zit.left == 0) {
-        tags = (zcfg && zext(zcfg)->location_tags) ? zext(zcfg)->location_tags : (cfg ? cfg->location_tags : NULL);
-        tag_count = (zcfg && zext(zcfg)->location_tags) ? zext(zcfg)->location_tag_count : (cfg ? cfg->location_tag_count : 0);
+        tag_defs_pick(cfg, zcfg, false, &tags, &tag_count);
         if (!tags || tag_count == 0) return NULL;
     }
 

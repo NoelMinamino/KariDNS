@@ -1025,7 +1025,7 @@ static void test_engine_helper_edges(void) {
     assert(name_to_canonical_wire("abc.def.", wire, 4) == 0);
     assert(name_to_canonical_wire("abc", wire, 4) == 0);
     assert(name_to_canonical_wire("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.b.", wire, sizeof(wire)) == 0);
-    assert(name_to_canonical_wire("A..b", wire, sizeof(wire)) > 0);
+    assert(name_to_canonical_wire("A..b", wire, sizeof(wire)) == 0);   /* an empty label is no name (write_uncompressed_name_ext() refuses it since the wire lows) */
     assert(compute_nsec3_hash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.", 1, 0, salt, 1, out, sizeof(out)) == false);
     assert(compute_nsec3_hash("a.", 1, 0, salt, 1, out, 0) == true);
     assert(compute_nsec3_hash("a.", 1, 0, salt, 1, out, 3) == true);
@@ -1394,8 +1394,8 @@ static void test_wire_name_edges(void) {
         char nm2[64]; snprintf(nm2, sizeof(nm2), "h%d.z%d.example.", i, i % 7);
         if (write_dns_name_str(big, &bo, nm2, &cc, sizeof(big)) != 0) break;
     }
-    register_wire_name_for_compression(big, 12, &cc);
-    register_wire_name_for_compression(big, 0x3FFF, &cc);
+    register_wire_name_for_compression(big, bo, 12, &cc);
+    register_wire_name_for_compression(big, sizeof(big), 0x3FFF, &cc);
     zone_arena_destroy(&a);
     printf("  -> wire name corner cases passed.\n");
 }
