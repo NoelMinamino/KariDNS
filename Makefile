@@ -14,9 +14,10 @@ IDN_LDFLAGS != [ -z "$(IDN_CFLAGS)" ] || (pkg-config --libs libidn2 2>/dev/null 
 # Windows / MinGW detection (static single-binary build)
 WIN_LDFLAGS != case "`uname -s 2>/dev/null`" in MINGW*|MSYS*|CYGWIN*) echo "-static -lws2_32 -liphlpapi -lcrypt32" ;; *) echo "" ;; esac
 
-# Homebrew & standard paths for macOS (Apple Silicon /opt/homebrew & Intel /usr/local) and BSD
-BREW_CFLAGS  != [ "`uname -s 2>/dev/null`" = "Darwin" ] && echo "-I/opt/homebrew/opt/openssl@3/include -I/usr/local/opt/openssl@3/include -I/opt/homebrew/include -I/usr/local/include" || echo "-I/usr/local/include"
-BREW_LDFLAGS != [ "`uname -s 2>/dev/null`" = "Darwin" ] && echo "-L/opt/homebrew/opt/openssl@3/lib -L/usr/local/opt/openssl@3/lib -L/opt/homebrew/lib -L/usr/local/lib" || echo "-L/usr/local/lib"
+# Homebrew & standard paths for macOS (Apple Silicon /opt/homebrew & Intel /usr/local) and BSD; a plain assignment on purpose:
+# macOS make is GNU make 3.81, which has no `!=` (the paths that do not exist elsewhere are harmless)
+BREW_CFLAGS  = -I/opt/homebrew/opt/openssl@3/include -I/usr/local/opt/openssl@3/include -I/opt/homebrew/include -I/usr/local/include
+BREW_LDFLAGS = -L/opt/homebrew/opt/openssl@3/lib -L/usr/local/opt/openssl@3/lib -L/opt/homebrew/lib -L/usr/local/lib
 
 # Version definition: the file VERSION is the one source of the release number (docs/RELEASING.md).  `make VERSION=x.y.z` still
 # overrides it for one build; `make set-version V=x.y.z` changes it and the files that cannot read it (package.json, the GUI).
