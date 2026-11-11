@@ -26,6 +26,7 @@
 #   -t, --tests <list>      Run exactly the listed tests (comma-separated; unknown name = error).
 #   --fail-on-skip          A test that exits 0 but prints a SKIP line counts as failed.
 #   --full-log              Print the whole log of a failed test.
+#   --test-timeout SECONDS  A test still running after SECONDS is stopped (its process group) and fails with "*** TIMEOUT" in its log.
 #   --asan                  Run the unit test binaries as their -asan builds (like make unit-tests-asan).
 #   --serial-as-par         Run the tests registered "serial" next to the others (a list of tests that own their ports, directories and databases).
 #                           A test that sources tests/db/pg_lib.sh joins the group "pg" instead (one PostgreSQL test at a time).
@@ -111,6 +112,7 @@ SKIP_DAG=0
 JOBS=""
 TEST_LIST=""
 FAIL_ON_SKIP=0
+TEST_TIMEOUT=0
 FULL_LOG=0
 ASAN_UNITS=0
 SERIAL_AS_PAR=0
@@ -198,6 +200,11 @@ while [ $# -gt 0 ]; do
         --full-log)
             FULL_LOG=1
             ;;
+        --test-timeout)
+            shift
+            case "${1:-}" in ''|*[!0-9]*) echo "--test-timeout needs a number of seconds" >&2; exit 1 ;; esac
+            TEST_TIMEOUT=$1
+            ;;
         --asan)
             ASAN_UNITS=1
             ;;
@@ -227,6 +234,7 @@ while [ $# -gt 0 ]; do
             echo "                          script or binary, with or without tests/ and .sh; an unknown name is an error"
             echo "  --fail-on-skip          A test that exits 0 but prints a SKIP line counts as failed"
             echo "  --full-log              Print the whole log (up to 2000 lines) of a failed test, not the failed checks and the tail"
+            echo "  --test-timeout SECONDS  Stop a test still running after SECONDS (its process group); it fails with *** TIMEOUT in its log"
             echo "  --asan                  Run the unit test binaries as their -asan builds (make unit-test-bins-asan) under"
             echo "                          tests/run_unit_with_watchdog.sh (UT_TIMEOUT, default 300 s; UT_ASAN_LEAKS=1 adds leak"
             echo "                          checks) like make unit-tests-asan; only the unit tests are run"
@@ -1020,9 +1028,20 @@ EOF
         if [ "${VERBOSE}" -eq 1 ]; then
             "$@" 2>&1 | tee "${_log}"
             _exit_code=$?
-        elif [ "${JOBS}" -gt 1 ]; then
-            # own session: the cleanup below reaches only what this test started
-            perl -MPOSIX -e 'POSIX::setsid(); $SIG{INT} = $SIG{QUIT} = "DEFAULT"; exec @ARGV or exit 127' "$@" </dev/null > "${_log}" 2>&1 &
+        elif [ "${JOBS}" -gt 1 ] || [ "${TEST_TIMEOUT}" -gt 0 ]; then
+            # own session: the cleanup below reaches only what this test started.  --test-timeout: the session leader waits for the test and, after
+            # TEST_TIMEOUT seconds, notes it in the log, sends SIGTERM to the whole group (not to itself), SIGKILL to the test 10 s later, and exits 124
+            # (kill_group below takes what is left); a hung test then fails with its log instead of holding the job until the CI timeout
+            if [ "${TEST_TIMEOUT}" -gt 0 ]; then
+                perl -MPOSIX -e 'my $t = shift; POSIX::setsid(); $SIG{INT} = $SIG{QUIT} = "DEFAULT"; $| = 1;
+                    my $pid = fork(); exit 127 unless defined $pid;
+                    if (!$pid) { exec @ARGV or exit 127 }
+                    $SIG{ALRM} = sub { print "\n*** TIMEOUT: still running after $t s; its process group is stopped\n"; $SIG{TERM} = "IGNORE";
+                                       kill "TERM", -$$; sleep 10; kill "KILL", $pid; waitpid($pid, 0); exit 124 };
+                    alarm $t; waitpid($pid, 0); exit(($? & 127) ? 128 + ($? & 127) : $? >> 8)' "${TEST_TIMEOUT}" "$@" </dev/null > "${_log}" 2>&1 &
+            else
+                perl -MPOSIX -e 'POSIX::setsid(); $SIG{INT} = $SIG{QUIT} = "DEFAULT"; exec @ARGV or exit 127' "$@" </dev/null > "${_log}" 2>&1 &
+            fi
             _tpid=$!
             echo "${_tpid}" > "${RES_DIR}/${_ji}.pgid"
             wait "${_tpid}"
