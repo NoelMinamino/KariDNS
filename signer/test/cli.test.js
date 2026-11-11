@@ -248,7 +248,7 @@ test('the daemon: starts, reads the configuration again on SIGHUP, stops on SIGT
     proc.emit('SIGHUP');                           // this one parses but is no configuration (no sqlite-file): refused as well
     proc.emit(sig);
     assert.equal(await p, 0);
-    assert.ok(log.some((l) => /karidns-signer 0\.6\.0 started \(sqlite3, 1 worker\(s\)\)/.test(l)));
+    assert.ok(log.some((l) => l.includes(`karidns-signer ${VERSION} started (sqlite3, 1 worker(s))`)));
     assert.ok(log.some((l) => /wiped 1 work directory/.test(l)));
     assert.ok(log.some((l) => /configuration read again/.test(l)));
     assert.ok(log.some((l) => /error the configuration was not read: syntax error in line 2/.test(l)));

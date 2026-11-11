@@ -101,7 +101,7 @@ sg_start() {
     SG_SHELL=$!
     sg_quiet_wait 10 '[ -s "$SG_PIDFILE" ]'
     SG_PID=$(cat "$SG_PIDFILE" 2>/dev/null)
-    if sg_quiet_wait 20 'grep -q "karidns-signer 0.6.0 started" "$SG_LOG"'; then pass "the signer started (pid $SG_PID)"; else fail "the signer did not start"; sg_logtail; fi
+    if sg_quiet_wait 20 'grep -q "karidns-signer $(cat "$ROOT/VERSION") started" "$SG_LOG"'; then pass "the signer started (pid $SG_PID)"; else fail "the signer did not start"; sg_logtail; fi
 }
 # stop with SIGTERM and wait for the exit (a signer that is signing finishes the zone first)
 sg_stop() {
