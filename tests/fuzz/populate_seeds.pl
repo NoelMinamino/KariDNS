@@ -30,6 +30,7 @@ for my $c (qw(
     corpus_fuzz_dag_cli_args
     corpus_fuzz_dag_batch_file
     corpus_fuzz_dag_replay_pcap_reader
+    corpus_fuzz_tapstat
     corpus_fuzz_dag_replay_diff
     corpus_fuzz_dag_tcp_reassembly
 )) {
@@ -124,6 +125,48 @@ my $batch_corpus = "$fuzz_dir/corpus_fuzz_dag_batch_file";
     print $fh "example.org MX\n";
     print $fh "sub.example.net TXT +yaml\n";
     close $fh;
+}
+
+# 7. karidns-tapstat: Frame Streams sessions (the first byte is the chunk size of the harness) with dnstap frames
+{
+    my $dir = "$fuzz_dir/corpus_fuzz_tapstat";
+    my $varint = sub { my $v = shift; my $o = ''; while ($v >= 0x80) { $o .= chr(($v & 0x7f) | 0x80); $v >>= 7; } return $o . chr($v); };
+    my $fvar   = sub { my ($f, $v) = @_; return $varint->(($f << 3) | 0) . $varint->($v); };
+    my $fbytes = sub { my ($f, $b) = @_; return $varint->(($f << 3) | 2) . $varint->(length $b) . $b; };
+    my $dns = sub {
+        my ($resp, $rcode, $name, $qtype) = @_;
+        my $w = join('', map { chr(length $_) . $_ } split(/\./, $name)) . "\0";
+        return pack('nnnnnn', 0x1234, ($resp ? 0x8400 : 0) | $rcode, 1, 0, 0, 0) . $w . pack('nn', $qtype, 1);
+    };
+    my $frame = sub {
+        my ($type, $addr, $wire, $zone) = @_;
+        my $m = $fvar->(1, $type) . $fvar->(2, length($addr) == 16 ? 2 : 1) . $fvar->(3, 1) . $fbytes->(4, $addr) . $fvar->(6, 5353)
+              . $fbytes->($type == 1 ? 10 : 14, $wire) . (defined $zone ? $fbytes->(11, $zone) : '');
+        return $fbytes->(1, 'id') . $fvar->(15, 1) . $fbytes->(14, $m);
+    };
+    my $ct = 'protobuf:dnstap.Dnstap';
+    my $ctl = sub { my ($type, $withct) = @_; my $p = pack('N', $type) . ($withct ? pack('NN', 1, length $ct) . $ct : ''); return pack('NN', 0, length $p) . $p; };
+    my $data = sub { my $f = shift; return pack('N', length $f) . $f; };
+    my $a4 = pack('C4', 192, 0, 2, 77);
+    my $a6 = pack('C16', 0x20, 0x01, 0x0d, 0xb8, 0, 0x12, 0x34, 0x56, 1 .. 8);
+    my @frames = (
+        $frame->(2, $a4, $dns->(1, 0, 'www.example.test', 1), "\7example\4test\0"),
+        $frame->(1, $a4, $dns->(0, 0, 'www.example.test', 1)),
+        $frame->(2, $a6, $dns->(1, 3, 'nx.sub.example.test', 28)),
+        $frame->(2, $a4, $dns->(1, 5, 'example.org', 255)),
+    );
+    my %seeds = (
+        seed_session => chr(7) . $ctl->(4, 1) . $ctl->(2, 1) . join('', map { $data->($_) } @frames) . $ctl->(3, 0),
+        seed_file    => chr(255) . $ctl->(2, 1) . join('', map { $data->($_) } @frames),
+        seed_frame   => chr(0) . $frames[2],
+        seed_nocontenttype => chr(1) . $ctl->(4, 0) . $ctl->(2, 0) . $data->($frames[0]),
+        seed_oversize => chr(3) . $ctl->(2, 1) . pack('N', 0x7fffffff),
+    );
+    for my $n (sort keys %seeds) {
+        open my $fh, '>:raw', "$dir/$n" or die $!;
+        print $fh $seeds{$n};
+        close $fh;
+    }
 }
 
 print "[+] Seed corpuses populated successfully.\n";

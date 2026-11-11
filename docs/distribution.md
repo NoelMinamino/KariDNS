@@ -50,6 +50,7 @@ Use `pkg add -f` to replace an already installed version in place.
   - `/usr/local/sbin/karidns` (Authoritative DNS daemon)
   - `/usr/local/bin/karictl` (Control channel client)
   - `/usr/local/bin/karicheck` (Configuration & zone syntax checker)
+  - `/usr/local/bin/karidns-tapstat` (dnstap query statistics, see `karidns-tapstat.md`)
   - `/usr/local/bin/dag` (DNS query client & fuzzer)
 - **Configuration & Zones:**
   - `/usr/local/etc/karidns/karidns.conf.sample`
@@ -58,7 +59,7 @@ Use `pkg add -f` to replace an already installed version in place.
 - **Service Management:**
   - `/usr/local/etc/rc.d/karidns`
 - **Manuals:**
-  - `/usr/local/share/doc/karidns/` (`karidns.md`, `karictl.md`, `karicheck.md`, `dag.md`, `dag_replay.md`)
+  - `/usr/local/share/doc/karidns/` (`karidns.md`, `karictl.md`, `karicheck.md`, `karidns-tapstat.md`, `dag.md`, `dag_replay.md`)
 - **Database packages only** (§2.5):
   - `/usr/local/libexec/karidns-dbloader` (the database loader, root:wheel, 0555)
   - `/usr/local/bin/karidns-zone` (the zone importer and exporter, with the same drivers, root:wheel, 0555)
