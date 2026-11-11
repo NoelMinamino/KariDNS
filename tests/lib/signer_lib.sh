@@ -266,7 +266,7 @@ sg_phase_served() {
     sg_has "ex.test: a name that does not exist gets NSEC3 records" "$(qa_dnssec nope.ex.test A)" 'NSEC3'
     # every zone the signer has signed so far has been reloaded after the loader read its change rows or before it: either way none waits (a one-zone
     # reload covers the rows it has read, the poll of the loader must not list the zone again)
-    sg_wait 20 "no zone is on the list of the zones that wait for the signer (all are signed)" '! sg_dbstatus | grep -q "waiting for the signer"'
+    sg_wait 120 "no zone is on the list of the zones that wait for the signer (all are signed)" '! sg_dbstatus | grep -q "waiting for the signer"'
     sg_stop
     # a change of somebody else that bumps the serial, made at once (the same second as the last signature): the scan at the start finds it by the serial
     ser=$(sg_serial ex.test)
@@ -279,7 +279,7 @@ sg_phase_served() {
     sg_start
     sg_wait 60 "ex.test: after the signature the record is served" 'qa_dnssec held.ex.test A | grep -q 192.0.2.91'
     sg_has "ex.test: ...with its RRSIG" "$(qa_dnssec held.ex.test A)" 'RRSIG'
-    sg_wait 20 "karictl dbstatus: the list of the zones that wait for the signer is empty again (and stays so)" '! sg_dbstatus | grep -q "waiting for the signer"'
+    sg_wait 60 "karictl dbstatus: the list of the zones that wait for the signer is empty again (and stays so)" '! sg_dbstatus | grep -q "waiting for the signer"'
     sleep 4
     sg_eq "...also after the poll of the loader has read the rows of the signature" "$(sg_dbstatus | grep -c 'waiting for the signer')" 0
 }

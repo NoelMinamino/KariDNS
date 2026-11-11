@@ -3,7 +3,7 @@
 # (s = 1: the zone of rank r is asked for 1/r as often as the first), each answer checked against what the database holds.
 #
 #   cache_stress.pl HOST PORT NZONES NHOSTS COUNT SEED       random queries
-#   cache_stress.pl HOST PORT NZONES NHOSTS sweep            one query for every zone, in order; a SERVFAIL is asked again (10 times, 100 ms apart)
+#   cache_stress.pl HOST PORT NZONES NHOSTS sweep            one query for every zone, in order; a SERVFAIL is asked again (for up to 30 s, 100 ms apart; CACHE_STRESS_SWEEP_WAIT_S)
 #
 # Zone z (0-based) is "zNNNN.test." (4 digits); its host hK (K 0-based) has the address 10.(z % 200 + 1).(K / 200).(K % 200 + 1), the same
 # arithmetic as in the SQL that fills the database.  The answer is: ok (NOERROR, one A record with that address), wrong (anything else
@@ -15,7 +15,7 @@ use IO::Socket::INET;
 use IO::Select;
 use Time::HiRes qw(time usleep);
 my $delay_us = ($ENV{CACHE_STRESS_DELAY_MS} || 0) * 1000;           # a pause between two queries of this client
-my $sweep_retries = 10;                                               # sweep: a SERVFAIL (shed, not ready) is asked again this often, 100 ms apart
+my $sweep_wait = $ENV{CACHE_STRESS_SWEEP_WAIT_S} || 30;                    # sweep: a SERVFAIL (shed, not ready) is asked again, 100 ms apart, for at most this many seconds per zone
 
 my ($host, $port, $nz, $nh, $count_or_sweep, $seed) = @ARGV;
 die "usage\n" unless defined $nh;
@@ -56,8 +56,9 @@ for my $i (0 .. $count - 1) {
     my $want = sprintf('10.%d.%d.%d', $z % 200 + 1, int($k / 200), $k % 200 + 1);
     usleep($delay_us) if $delay_us;
     my ($got, $rcode, $an);
-    for my $again (0 .. ($sweep ? $sweep_retries : 0)) {
-        if ($again) { $n{retried}++; usleep(100_000); }
+    my $until = time() + $sweep_wait;
+    for (my $again = 0; ; $again++) {
+        if ($again) { last if time() > $until; $n{retried}++; usleep(100_000); }
         my $id = int(rand(65536));
         my $q = query($id, $name);
         $got = undef;
@@ -78,7 +79,7 @@ for my $i (0 .. $count - 1) {
         my $fl;
         ($fl, undef, $an) = unpack('x2nnn', $got);
         $rcode = $fl & 0xF;
-        last if $rcode != 2;
+        last if $rcode != 2 || !$sweep;
     }
     if (!defined $got) { $n{timeout}++; next; }
     if ($rcode == 2) { $n{notready}++; next; }

@@ -10,7 +10,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { startBrowser } from './wd.mjs';
+import { startBrowser, retryStale } from './wd.mjs';
 
 const BASE = process.env.GUI_BASE;
 const IDP = process.env.GUI_IDP;
@@ -46,13 +46,13 @@ const started = await startBrowser({ driver: process.env.GUI_GECKODRIVER, firefo
 const b = started.browser;
 fs.mkdirSync(path.join(DIR, 'shots'), { recursive: true });
 const h1 = async () => (await (await b.$('h1')).text()).trim();
-const fill = async (name, value, scope = '') => { const e = await b.$(`${scope} input[name=${name}]`); await e.clear(); await e.type(value); };
+const fill = async (name, value, scope = '') => retryStale(async () => { const e = await b.$(`${scope} input[name=${name}]`); await e.clear(); await e.type(value); });
 const control = async (text, scope = 'body') => {
   const r = await b.exec((t, s) => [...document.querySelector(s).querySelectorAll('button, a[href]')].find((e) => e.textContent.trim() === t && e.offsetParent !== null) ?? null, text, scope);
   must(r, `no visible control "${text}"`);
   return b.wrap(r);
 };
-const click = async (text, scope) => (await control(text, scope)).click();
+const click = (text, scope) => retryStale(async () => (await control(text, scope)).click());
 const who = () => b.waitFor(async () => { const e = await b.$('.who span'); return (await e.text()).trim(); }, { message: 'the name of the person who is signed in' });
 const waitSignedOut = () => b.waitText('h1', /^Sign in$/);
 const me = () => b.execAsync(async () => { const r = await fetch('/api/v1/auth/me', { credentials: 'same-origin' }); return { status: r.status, name: r.ok ? (await r.json()).principal.name : null }; });

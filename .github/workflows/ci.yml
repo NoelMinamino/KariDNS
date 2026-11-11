@@ -89,27 +89,28 @@ jobs:
 
             echo "::group::📦 [Build] Parallel Build KariDNS, Sanitizers, Tests & Fuzzers"
             NCPU=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
-            make -j"$NCPU" DB_DRIVERS="sqlite3 postgresql" all karicheck-codelog test_coverage_sweep_tools-codelog karidns-dbloader karidns-zone karidns-zone-asan zone2sql zone2kdb asan tsan tools-asan fuzz_all asan_test tinydns_test hash_test include_test response_cache_test vulnerability_test bench_serialize
+            make -j"$NCPU" DB_DRIVERS="sqlite3 postgresql" all karicheck-codelog test_coverage_sweep_tools-codelog karidns-dbloader karidns-zone karidns-zone-asan zone2sql zone2kdb asan tsan tools-asan fuzz_all asan_test tinydns_test hash_test include_test response_cache_test vulnerability_test bench_serialize fetch_backend karidns-evict
             echo "::endgroup::"
 
-            echo "::group::🧪 [Unit Tests] All C unit tests (incl. RFC published-vector tests)"
-            # Previously only 6 of the C unit tests ran in CI (asan, tinydns, hash, include,
-            # response_cache, vulnerability). `unit-tests` builds and runs every binary, sequentially.
-            # build every test binary in parallel first; the tests then run one by one
-            # (stdin from /dev/null: no test may block reading the VM session's stdin)
+            echo "::group::🧪 [Unit Tests] All C unit tests (incl. RFC published-vector tests), 4 at a time"
+            # Same tests as `make unit-tests` (plus test_acl_match and test_listen_on), run by tests/run_all_suite.sh: 4 at a time,
+            # tests that share a resource (the PostgreSQL server) one after the other, each test with its own log, which is printed
+            # in full when the test fails.  The coverage sweeps are not part of unit-tests (the coverage job runs them).
+            # Build every test binary in parallel first (stdin from /dev/null: no test may block reading the VM session's stdin).
             make -j"$NCPU" unit-test-bins
-            make unit-tests < /dev/null
+            sh tests/run_all_suite.sh -j 4 --full-log -c unit -e coverage_sweep < /dev/null
             echo "::endgroup::"
 
-            echo "::group::🛡️ [Sanitizers] Unit tests under ASan + UBSan"
+            echo "::group::🛡️ [Sanitizers] Unit tests under ASan + UBSan, 4 at a time"
             # The plain test_* binaries use production CFLAGS, so they are NOT sanitizer-checked
             # (test_asan_overflow included). This rebuilds every unit test with
             # -fsanitize=address,undefined (UBSan findings are fatal); leak checks are off by default
             # (UT_ASAN_LEAKS=1 enables them once the tests' teardown is complete).
-            # Blocking: any ASan/UBSan unit-test failure fails the job.
-            # -j: the ASan binaries (each compiles ~18 sources) build in parallel; the
-            # recipe still runs the tests sequentially
-            make -j"$NCPU" unit-tests-asan < /dev/null
+            # Blocking: any ASan/UBSan unit-test failure fails the job (a missing -asan binary too).
+            # -j: the ASan binaries (each links ~18 objects) build in parallel; --asan then runs the same binaries as
+            # make unit-tests-asan does (tests/run_unit_with_watchdog.sh, UT_TIMEOUT 300 s each), 4 at a time; like it, not the test_fi_* fault-injection tests (no -asan build)
+            make -j"$NCPU" unit-test-bins-asan < /dev/null
+            sh tests/run_all_suite.sh -j 4 --full-log --asan -e coverage_sweep,test_fi_ < /dev/null
             echo "::endgroup::"
 
             echo "::group::🔍 [Smoke Test] Test dag client against a local mock server"
@@ -117,82 +118,41 @@ jobs:
             sh ./tests/run_ci_dag_smoke.sh
             echo "::endgroup::"
 
-            echo "::group::🛡️ [Functional & Protocol Tests]"
-            sh ./tests/run_paren_check_test.sh
-            sh ./tests/run_ttl_suffix_test.sh
-            sh ./tests/run_zonemd_val_test.sh
-            sh ./tests/run_glue_truncation_test.sh
-            sh ./tests/run_mqtype_qdcount0_test.sh
-            sh ./tests/run_ixfr_roundtrip_test.sh
-            sh ./tests/run_catalog_zone_test.sh
-            sh ./tests/run_capsicum_axfr_test.sh
-            sh ./tests/run_dynamic_update_test.sh
-            sh ./tests/run_roundtrip_test.sh
-            sh ./tests/run_karicheck_glue_test.sh
-            sh ./tests/run_dag_ci_test.sh
-            sh ./tests/run_phase2_core_audit_test.sh
-            sh ./tests/run_phase2_audit_part2_test.sh
-            sh ./tests/run_tinydns_location_test.sh
-            sh ./tests/run_bind_ecs_subnet_test.sh
-            sh ./tests/run_response_section_order_test.sh
-            sh ./tests/run_sibling_additional_test.sh
-            sh ./tests/run_multi_instance_test.sh
-            sh ./tests/run_extended_axfr_test.sh
-            sh ./tests/run_dnstap_capture_test.sh
-            sh ./tests/run_karicheck_semantic_lint_test.sh
-            sh ./tests/run_db_dump_test.sh
-            sh ./tests/run_db_sqlite_basic_test.sh
-            sh ./tests/run_db_file_diff_test.sh
-            sh ./tests/run_db_hostile_loader_test.sh
-            sh ./tests/run_db_ddl_test.sh
-            sh ./tests/run_db_schema_migrate_test.sh
-            sh ./tests/run_db_pg_sqlite_diff_test.sh
-            sh ./tests/run_db_pg_autoreload_test.sh
-            sh ./tests/run_db_pg_role_test.sh
-            sh ./tests/run_db_auth_schema_test.sh
-            sh ./tests/run_db_auth_rls_test.sh
-            sh ./tests/run_karicheck_database_conf_test.sh
-            sh ./tests/run_karicheck_json_test.sh
-            sh ./tests/run_karicheck_codes_test.sh
-            sh ./tests/run_dag_update_generic_rdata_test.sh
-            sh ./tests/run_karictl_observatory_test.sh
-            sh ./tests/run_axfr_multikey_tsig_test.sh
-            sh ./tests/run_config_duplicate_rejection_test.sh
-            sh ./tests/run_cve_coo_test.sh
-            sh ./tests/run_dag_batch_advanced_opts_test.sh
-            sh ./tests/run_dag_fuzzer_test.sh
-            sh ./tests/run_dnssec_negative_soa_rrsig_test.sh
-            sh ./tests/run_domain_length_rfc1035_test.sh
-            sh ./tests/run_ds_delegation_test.sh
-            sh ./tests/run_karictl_reload_reconfig_test.sh
-            sh ./tests/run_logging_channel_validation_test.sh
-            sh ./tests/run_mx_srv_glue_test.sh
-            sh ./tests/run_notify_source_test.sh
-            sh ./tests/run_privilege_drop_root_test.sh
-            sh ./tests/run_nonroot_startup_test.sh
-            sh ./tests/run_query_log_rate_limit_test.sh
-            sh ./tests/run_response_cache_test.sh
-            sh ./tests/run_rrl_window_test.sh
-            sh ./tests/run_tinydns_timestamp_test.sh
-            sh ./tests/run_ttl_harmonization_test.sh
-            sh ./tests/run_ttl_harmonization_update_test.sh
-            sh ./tests/run_ttl_rfc2181_clamp_test.sh
-            sh ./tests/run_update_secondary_refused_test.sh
-            sh ./tests/run_zone_oom_partial_load_test.sh
-            sh ./tests/run_zone_type_secondary_test.sh
+            echo "::group::🛡️ [Functional & Protocol Tests] 4 at a time"
+            # The tests of this list, run by tests/run_all_suite.sh: 4 at a time, each in its own port window and temporary directory (KARI_PORT_BASE,
+            # KARI_TMP); the ones that share a resource (loopback aliases, one server's files, fixed ports) are registered as group or serial there
+            # and run one at a time.  A failed test prints its whole log.  --tests refuses a name that is not registered.
+            FUNC_TESTS="\
+              run_paren_check_test,run_ttl_suffix_test,run_zonemd_val_test,run_glue_truncation_test,run_mqtype_qdcount0_test,\
+              run_ixfr_roundtrip_test,run_catalog_zone_test,run_capsicum_axfr_test,run_dynamic_update_test,run_roundtrip_test,\
+              run_karicheck_glue_test,run_dag_ci_test,run_phase2_core_audit_test,run_phase2_audit_part2_test,run_tinydns_location_test,\
+              run_bind_ecs_subnet_test,run_response_section_order_test,run_sibling_additional_test,run_multi_instance_test,\
+              run_extended_axfr_test,run_dnstap_capture_test,run_karicheck_semantic_lint_test,run_db_dump_test,run_db_sqlite_basic_test,\
+              run_db_file_diff_test,run_db_hostile_loader_test,run_db_ddl_test,run_db_schema_migrate_test,run_db_pg_sqlite_diff_test,\
+              run_db_pg_autoreload_test,run_db_pg_role_test,run_db_auth_schema_test,run_db_auth_rls_test,\
+              run_karicheck_database_conf_test,run_karicheck_json_test,run_karicheck_codes_test,run_dag_update_generic_rdata_test,\
+              run_karictl_observatory_test,run_axfr_multikey_tsig_test,run_config_duplicate_rejection_test,run_cve_coo_test,\
+              run_dag_batch_advanced_opts_test,run_dag_fuzzer_test,run_dnssec_negative_soa_rrsig_test,run_domain_length_rfc1035_test,\
+              run_ds_delegation_test,run_karictl_reload_reconfig_test,run_logging_channel_validation_test,run_mx_srv_glue_test,\
+              run_notify_source_test,run_privilege_drop_root_test,run_nonroot_startup_test,run_query_log_rate_limit_test,\
+              run_response_cache_test,run_rrl_window_test,run_tinydns_timestamp_test,run_ttl_harmonization_test,\
+              run_ttl_harmonization_update_test,run_ttl_rfc2181_clamp_test,run_update_secondary_refused_test,\
+              run_zone_oom_partial_load_test,run_zone_type_secondary_test"
+            sh ./tests/run_all_suite.sh -j 4 --full-log --tests "$FUNC_TESTS" < /dev/null
             echo "::endgroup::"
 
             echo "::group::🔏 [Signer, WebAdmin] karidns-signer and karidns-webadmin: unit tests, SQLite3 and PostgreSQL (root: with a server)"
             # A SKIP of a whole script must fail here (tests/run_all_suite.sh shows it as a note of a PASS): node24, bind-tools, signer/node_modules and webadmin/node_modules are installed above
             # The browser tests of the web interface (the sign-in with a provider among them: its browser part) run on 15.1 only (Firefox is installed there); a SKIP fails the job like any other
             GUI_TEST=""
-            if [ "${{ matrix.release }}" = "15.1" ]; then GUI_TEST="run_webadmin_gui_test run_webadmin_gui_pg_test run_webadmin_oidc_test"; fi
-            for t in run_signer_unit_test run_signer_test run_signer_pg_test run_webadmin_unit_test run_webadmin_test run_webadmin_pg_test run_webadmin_write_test run_webadmin_write_pg_test run_webadmin_versions_test run_webadmin_versions_pg_test run_webadmin_pkg_test run_signer_pkg_test run_release_roundtrip_test $GUI_TEST; do
-              out="/tmp/$t.out"
-              sh "./tests/$t.sh" < /dev/null > "$out" 2>&1 || { cat "$out"; echo "::error title=Signer and WebAdmin::$t failed"; exit 1; }
-              cat "$out"
-              if grep -Eq '^[[:space:]]*SKIP' "$out"; then echo "::error title=Signer and WebAdmin::$t skipped a part (see SKIP above)"; exit 1; fi
-            done
+            if [ "${{ matrix.release }}" = "15.1" ]; then GUI_TEST="run_webadmin_gui_test,run_webadmin_gui_pg_test,run_webadmin_oidc_test"; fi
+            NODE_TESTS="run_signer_unit_test,run_signer_test,run_signer_pg_test,run_webadmin_unit_test,run_webadmin_test,run_webadmin_pg_test,run_webadmin_write_test,run_webadmin_write_pg_test,run_webadmin_versions_test,run_webadmin_versions_pg_test,run_webadmin_pkg_test,run_signer_pkg_test,run_release_roundtrip_test"
+            # 4 at a time through tests/run_all_suite.sh.  --serial-as-par: these tests are registered "serial" there (the coverage job runs them one by one), but every one of them
+            # takes its ports (kari_port), its directory (mktemp) and its PostgreSQL roles and databases ($$) of its own.  --fail-on-skip: a test that exits 0 but prints a SKIP line
+            # fails the job, as the loop did before
+            sh ./tests/run_all_suite.sh -j 4 --serial-as-par --full-log --fail-on-skip --tests "$NODE_TESTS" < /dev/null
+            # the browser tests one after the other (a Firefox each; the memory of the VM)
+            if [ -n "$GUI_TEST" ]; then sh ./tests/run_all_suite.sh -j 1 --full-log --fail-on-skip --tests "$GUI_TEST" < /dev/null; fi
             echo "::endgroup::"
 
             echo "::group::🛡️ [Sanitizer & Fuzzing] Run Comprehensive Smoke Tests"

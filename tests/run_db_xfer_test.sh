@@ -296,8 +296,8 @@ SLACK=$((LIMIT / 100 * 15 + 256 * 1024))
 # the retired bytes are the evictions the retire stack has not freed yet (a reader, a transfer of the zone, the grace period): a backlog that
 # grows with the pace of evictions and the speed of the host (about 0.9 MB on the build host, more in a slow CI VM), not a limit; they must all go
 RET=""; t=0
-while [ $t -lt 50 ]; do RET=$(stat retired); [ "$RET" = "0" ] && break; sleep 0.2; t=$((t + 1)); done
-[ "$RET" = "0" ] && pass "the retired bytes were all freed after the load (largest backlog $MAXRET)" || fail "retired=${RET:-?} 10 s after the load (largest $MAXRET)"
+while [ $t -lt 150 ]; do RET=$(stat retired); [ "$RET" = "0" ] && break; sleep 0.2; t=$((t + 1)); done
+[ "$RET" = "0" ] && pass "the retired bytes were all freed after the load (largest backlog $MAXRET)" || fail "retired=${RET:-?} 30 s after the load (largest $MAXRET)"
 [ "$(xstat loaded)" -gt 5 ] && [ "$(stat evictions)" -gt 5 ] && pass "zones were read for transfers and taken out of memory ($(stat evictions) evictions)" || fail "loaded $(xstat loaded), evictions $(stat evictions)"
 kill -0 "$SRV" 2>/dev/null && pass "the server is running" || fail "the server is gone"
 grep -q "AddressSanitizer\|runtime error:\|ThreadSanitizer" "$T/srv.log" 2>/dev/null && fail "sanitizer report in the server log" || pass "no sanitizer report in the server log"

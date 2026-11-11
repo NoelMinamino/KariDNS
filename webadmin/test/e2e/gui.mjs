@@ -9,7 +9,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { hotp, totpStep, base32Decode } from '../../lib/crypto.js';
-import { startBrowser, NAMED_KEYS } from './wd.mjs';
+import { startBrowser, NAMED_KEYS, retryStale } from './wd.mjs';
 import { pageProblems, overflowProblems } from './a11y.mjs';
 
 const BASE = process.env.GUI_BASE;
@@ -43,14 +43,14 @@ fs.mkdirSync(path.join(DIR, 'shots'), { recursive: true });
 const home = () => b.get(`${BASE}/`);
 const h1 = async () => (await (await b.$('h1')).text()).trim();
 const waitH1 = (re, o) => b.waitText('h1', re, o);
-const fill = async (name, value, scope = '') => { const e = await b.$(`${scope} input[name=${name}]`); await e.clear(); await e.type(value); };
+const fill = async (name, value, scope = '') => retryStale(async () => { const e = await b.$(`${scope} input[name=${name}]`); await e.clear(); await e.type(value); });
 // a button or a link that looks like one, by its text
 const control = async (text, scope = 'body') => {
   const r = await b.exec((t, s) => [...document.querySelector(s).querySelectorAll('button, a[href]')].find((e) => e.textContent.trim() === t && e.offsetParent !== null) ?? null, text, scope);
   must(r, `no visible control "${text}"`);
   return b.wrap(r);
 };
-const click = async (text, scope) => (await control(text, scope)).click();
+const click = (text, scope) => retryStale(async () => (await control(text, scope)).click());
 const signIn = async (user, password, totp) => {
   await fill('user', user);
   await fill('password', password);

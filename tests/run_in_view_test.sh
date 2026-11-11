@@ -293,9 +293,10 @@ upd_ok $PV 127.0.0.4 shr.test v4 && fail "V11b: an UPDATE from 127.0.0.4 was acc
 upd_ok $PV 127.0.0.3 shr.test v2 && fail "V12: an UPDATE from 127.0.0.3 was accepted (the owner zone lists it, the in-view zone's own list overrides)" \
     || pass "V12: an UPDATE from 127.0.0.3 is refused: the in-view zone's own allow-update overrides the owner zone's"
 upd_ok $PV 127.0.0.2 shr.test v3 && pass "V13: through the owner view the owner zone's allow-update applies" || fail "V13: UPDATE from 127.0.0.2"
-sleep 2
-[ "$(q $PV 127.0.0.3 v1.shr.test)" = 192.0.2.99 ] && [ "$(q $PV 127.0.0.2 v1.shr.test)" = 192.0.2.99 ] && [ "$(q $PV 127.0.0.2 v3.shr.test)" = 192.0.2.99 ] && [ -z "$(q $PV 127.0.0.3 v2.shr.test)" ] && [ -z "$(q $PV 127.0.0.2 v4.shr.test)" ] \
-    && pass "V14: the accepted UPDATEs are in both views, the refused ones nowhere" || fail "V14: data after the UPDATEs"
+# an accepted UPDATE reaches the answers of both views a moment later (the zone is published after the UPDATE is applied): wait for it, up to 20 s, then check once more
+v14_ok() { [ "$(q $PV 127.0.0.3 v1.shr.test)" = 192.0.2.99 ] && [ "$(q $PV 127.0.0.2 v1.shr.test)" = 192.0.2.99 ] && [ "$(q $PV 127.0.0.2 v3.shr.test)" = 192.0.2.99 ] && [ -z "$(q $PV 127.0.0.3 v2.shr.test)" ] && [ -z "$(q $PV 127.0.0.2 v4.shr.test)" ]; }
+i=0; while [ $i -lt 100 ] && ! v14_ok; do sleep 0.2; i=$((i + 1)); done
+v14_ok && pass "V14: the accepted UPDATEs are in both views, the refused ones nowhere" || fail "V14: data after the UPDATEs"
 
 out=$(ctl pv observatory shr.test)
 echo "$out" | grep -q "^Zone: shr.test. (view: va, shared to views: vb)$" && pass "V15: karictl observatory in view mode: the zone once, shared to vb" || fail "V15: $out"

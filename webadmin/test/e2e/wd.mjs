@@ -46,6 +46,17 @@ export class WebDriverError extends Error {
   }
 }
 
+// The page re-renders under a test (a list that arrives after its form, a view that is redrawn after a save): an element found a moment ago can be gone when it is used
+// ("stale element reference").  Run fn again (it finds its elements anew) until it does not hit that, up to 5 s.  Any other error is thrown at once.
+export const retryStale = async (fn, tries = 50) => {
+  for (let i = 1; ; i++) {
+    try { return await fn(); } catch (e) {
+      if (e?.error !== 'stale element reference' || i >= tries) throw e;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
+};
+
 export class Element {
   constructor(b, id) { this.b = b; this.id = id; }
   cmd(method, p, body) { return this.b.cmd(method, `/element/${this.id}${p}`, body); }

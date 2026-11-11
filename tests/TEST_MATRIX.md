@@ -551,6 +551,13 @@ sh tests/run_all_suite.sh -j 1       # one test at a time, registration order
 
 # 8. List all registered tests
 sh tests/run_all_suite.sh --list
+
+# 9. The runs of the CI jobs (.github/workflows/ci.yml, FreeBSD): a list of tests by name (an unknown name is an error), 4 at a time,
+#    the whole log of a failed test, a SKIP line of a test that exits 0 counts as a failure
+sh tests/run_all_suite.sh -j 4 --full-log --tests run_signer_unit_test,run_webadmin_test --fail-on-skip
+sh tests/run_all_suite.sh -j 4 --full-log -c unit -e coverage_sweep      # the unit tests of `make unit-tests`, 4 at a time
+sh tests/run_all_suite.sh -j 4 --full-log --asan -e coverage_sweep,test_fi_   # the -asan builds (make unit-test-bins-asan) like `make unit-tests-asan`
+sh tests/run_all_suite.sh -j 4 --serial-as-par --tests ...   # tests registered "serial" next to the others (PostgreSQL ones in group pg)
 ```
 
 Integration tests that need loopback aliases (127.0.0.2 and up) add them when run as root and report SKIP otherwise.
