@@ -423,6 +423,11 @@ KARIDNS_TOOL_FN int check_zone_run(const char *domain_raw, const char *file_arg,
                         "view and are ignored (first: '%s')\n",
                 domain, ctx.out_of_zone_count, ctx.first_out_of_zone ? ctx.first_out_of_zone : "");
     }
+    if (ctx.skipped_data_count > 0) {
+        kc_warning(&tally, DC_ZONE_TINYDNS_SKIPPED, "Zone '%s': %zu tinydns line(s) have data that cannot be kept (an SSHFP fingerprint that is not hexadecimal) "
+                        "and are left out (first: '%s')\n",
+                domain, ctx.skipped_data_count, ctx.first_skipped_data ? ctx.first_skipped_data : "");
+    }
 
     if (arena.count == 0) {
         kc_error(&tally, DC_ZONE_EMPTY, "No records found in zone '%s' (%s)\n", domain, file_path);

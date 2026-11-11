@@ -1530,8 +1530,34 @@ static void run_b9a_alias(void) {
     }
 }
 
+/* Regression (fuzz_zone_image found it): a zone that parses but has two different CNAMEs on one name is refused at freeze (BIND:
+ * DNS_R_SINGLETON), tinydns data and zone file text alike; the same RR twice is one RR and is published. */
+static void run_singleton_refused(void) {
+    g_label = "singleton";
+    zone_t z;
+    CHECK(load_zone(&z, "Calias.fuzz.local:a.example.:300\nCalias.fuzz.local:b.example.:300\n", "fuzz.local.", NULL, true));
+    if (z.ok) {
+        CHECK(zone_image_freeze(&z.a, "fuzz.local.") == NULL);
+        free_zone(&z);
+    }
+    CHECK(load_zone(&z, "$ORIGIN fuzz.local.\n$TTL 60\nalias CNAME a.example.\nalias CNAME b.example.\n", "fuzz.local.", NULL, false));
+    if (z.ok) {
+        CHECK(zone_image_freeze(&z.a, "fuzz.local.") == NULL);
+        free_zone(&z);
+    }
+    CHECK(load_zone(&z, "$ORIGIN fuzz.local.\n$TTL 60\nalias CNAME a.example.\nalias CNAME a.example.\n", "fuzz.local.", NULL, false));
+    if (z.ok) {
+        zone_image_t *img = zone_image_freeze(&z.a, "fuzz.local.");
+        CHECK(img != NULL);
+        if (img) zone_image_free(img);
+        free_zone(&z);
+    }
+}
+
 int main(void) {
     printf("=== test_zone_image ===\n");
+    printf("[TEST] two CNAMEs on one name are refused at freeze\n");
+    run_singleton_refused();
     printf("[TEST] synthetic zones: one line per RR type\n");
     run_type_lines();
     printf("[TEST] tinydns time stamps, countdown TTLs, locations\n");

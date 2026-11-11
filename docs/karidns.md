@@ -1468,7 +1468,9 @@ The default `file-format` is the master file format of RFC 1035 §5 as BIND read
   by dots, as for `ip6.arpa`; the width counts the dots), `$$` gives `$` and `\$` a literal `$`. Any RR type can be
   generated; the resulting line is read like any other record line, so `$ECS-SUBNET`/`$LOCATION` tags and the TTL
   rules apply. `<rhs>` is one field: quote RDATA that contains spaces, e.g.
-  `$GENERATE 1-10 host$ MX "10 mail$"`.
+  `$GENERATE 1-10 host$ MX "10 mail$"`. The quotes only keep the field together; the text inside is split on blanks
+  again, so one TXT character-string that contains a blank cannot be generated (BIND keeps `TXT "a b"` as one string):
+  put such records in the zone file itself.
 
 ---
 
@@ -1492,6 +1494,13 @@ multiple `zone {}` blocks simultaneously; each zone automatically keeps
 only the records belonging to it (longest-suffix match against all
 configured zone names, so parent/child zone delegation is handled
 correctly without duplicate records).
+
+> [!NOTE]
+> **Numeric fields and lines that cannot be kept:** the tinydns parser does not limit the 8-, 16- and 32-bit numeric
+> fields of the extension lines (`S`, `N`, `_`, ...). djbdns itself truncates such a value; KariDNS keeps it, and a record whose
+> value does not fit its field is left out with a warning when the zone is loaded (`karicheck` reports it as `zone.record.wire`).
+> An SSHFP line whose fingerprint is not hexadecimal is left out as well; `karicheck` reports it once per file
+> (`zone.tinydns.skipped`).
 
 > [!NOTE]
 > **tinydns Format Support Scope:**

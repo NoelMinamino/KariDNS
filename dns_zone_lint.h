@@ -70,7 +70,7 @@ typedef struct {
 
 /* Everything `karicheck zone` checks on a parsed and indexed zone after the parser and the zone-level validations (name lengths, DNAME,
  * ALIAS / LUA rules) passed: the printed "[OK] ... parsed" line and the final [RESULT] are the caller's. */
-void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t *t);
+void zone_lint_records(const zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t *t);
 
 /* Records that survive for the "LUA / ALIAS" notes of the zone (design 3.6b), printed through kc_info() / kc_warning() */
 void zone_lint_pdns_types(const zone_arena_t *arena, const char *domain, kc_tally_t *t);

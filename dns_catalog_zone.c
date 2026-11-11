@@ -1,5 +1,10 @@
 #define OPENSSL_SUPPRESS_DEPRECATED 1
+/* review catalog_zone [16]: the header declares the test hooks only under KARIDNS_UNIT_TEST, so they are static otherwise */
+#ifdef KARIDNS_UNIT_TEST
 #define STATIC_TEST
+#else
+#define STATIC_TEST static
+#endif
 #include "dns_catalog_zone.h"
 #include "dns_zone_image.h"
 #include "dns_log.h"
@@ -74,16 +79,7 @@ static bool normalize_domain_fqdn_local(const char *in, char *out, size_t out_ca
 }
 
 STATIC_TEST void free_catalog_desired_list(catalog_member_id_t *list, int count) {
-    if (!list) return;
-    for (int i = 0; i < count; i++) {
-        if (list[i].groups) {
-            for (int j = 0; j < list[i].group_count; j++) {
-                if (list[i].groups[j]) free(list[i].groups[j]);
-            }
-            free(list[i].groups);
-        }
-    }
-    free(list);
+    free_catalog_member_ids(list, count); /* review catalog_zone [15]: one implementation */
 }
 
 /* RFC 9432 §4.1: a member node is exactly one label (<unique-N>) directly below
@@ -94,6 +90,11 @@ static int catalog_member_cmp(const void *a, const void *b) {
     const catalog_member_id_t *x = *(const catalog_member_id_t *const *)a;
     const catalog_member_id_t *y = *(const catalog_member_id_t *const *)b;
     return strcasecmp(x->domain, y->domain);
+}
+
+/* qsort() of the group strings (char *) */
+static int catalog_group_cmp(const void *a, const void *b) {
+    return strcmp(*(char *const *)a, *(char *const *)b);
 }
 
 static bool catalog_prefix_is_single_label(const char *name, size_t prefix_len) {
@@ -144,7 +145,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, const zone_confi
     }
 
     // Verify version.<catalog_zone>. TXT "2"
-    char version_txt[256];
+    char version_txt[DNS_NAME_TEXT_SIZE + 16]; /* review catalog_zone [4]: room for "version." + the longest zone name text */
     snprintf(version_txt, sizeof(version_txt), "version.%s", catalog_entry->domain);
     bool found_version = false;
     {
@@ -168,18 +169,28 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, const zone_confi
     }
 
     // Build desired members list
-    int max_possible = (int)img->n_rrs;
-    catalog_member_id_t *new_desired = calloc(max_possible, sizeof(catalog_member_id_t));
+    char suffix[DNS_NAME_TEXT_SIZE + 16];
+    snprintf(suffix, sizeof(suffix), ".zones.%s", catalog_entry->domain);
+    size_t suffix_len = strlen(suffix);
+
+    /* review catalog_zone [11]: size the list to the member PTRs (one cheap pass) instead of one slot of about 784 bytes per RR of the zone */
+    uint32_t n_member_ptr = 0;
+    for (uint32_t seq = 0; seq < img->n_rrs; seq++) {
+        uint32_t rr = zone_image_seq_rr(img, seq);
+        if (zone_image_rr_type(img, rr) != 12) continue;
+        const char *rr_name = zone_image_name_text(img, zone_image_rr_name(img, rr));
+        size_t name_len = strlen(rr_name);
+        if (name_len > suffix_len && strcasecmp(rr_name + name_len - suffix_len, suffix) == 0 &&
+            catalog_prefix_is_single_label(rr_name, name_len - suffix_len))
+            n_member_ptr++;
+    }
+    catalog_member_id_t *new_desired = calloc(n_member_ptr ? n_member_ptr : 1, sizeof(catalog_member_id_t));
     if (!new_desired) {
         syslog(LOG_ERR, "[Catalog] Zone '%s': out of memory building member list", catalog_entry->domain);
         rcu_aux_read_unlock();
         return;
     }
     int new_desired_count = 0;
-
-    char suffix[256];
-    snprintf(suffix, sizeof(suffix), ".zones.%s", catalog_entry->domain);
-    size_t suffix_len = strlen(suffix);
 
     server_config_t *cfg = acquire_config_snapshot();
     for (uint32_t seq = 0; seq < img->n_rrs; seq++) {
@@ -231,6 +242,9 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, const zone_confi
             strcasecmp(rr_name + name_len - suffix_len, suffix) != 0 ||
             !catalog_prefix_is_single_label(rr_name, name_len - suffix_len))
             continue;
+        /* review catalog_zone [13]: count a name once, at its first PTR (k PTRs on one name were counted k times) */
+        uint32_t nid = zone_image_rr_name(img, rr);
+        if (zone_image_rrset_next(img, nid, 12, zone_image_name_first_rr(img, nid)) != rr) continue;
         int count_for_this_name = catalog_count(img, rr_name, 12, NULL);
         if (count_for_this_name > 1) {
             syslog(LOG_ERR, "[Catalog] Zone '%s': member node '%s' has %d PTR records (RFC 9432 requires exactly 1); catalog zone is broken and will NOT be processed",
@@ -301,20 +315,14 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, const zone_confi
                     }
                 }
             }
-            for (int i = 0; i < new_desired[d].group_count - 1; i++) {
-                for (int j = i + 1; j < new_desired[d].group_count; j++) {
-                    if (strcmp(new_desired[d].groups[i], new_desired[d].groups[j]) > 0) {
-                        char *tmp = new_desired[d].groups[i];
-                        new_desired[d].groups[i] = new_desired[d].groups[j];
-                        new_desired[d].groups[j] = tmp;
-                    }
-                }
-            }
+            /* review catalog_zone [14]: qsort instead of the O(g^2) exchange sort (same order: byte-wise strcmp) */
+            if (new_desired[d].group_count > 1)
+                qsort(new_desired[d].groups, (size_t)new_desired[d].group_count, sizeof(char *), catalog_group_cmp);
         }
         char coo_name[512];
         snprintf(coo_name, sizeof(coo_name), "coo.%s.zones.%s", new_desired[d].unique_id, catalog_entry->domain);
         
-        char coo_rdata[256] = {0};
+        char coo_rdata[DNS_NAME_TEXT_SIZE] = {0};
         uint32_t coo_first = ZONE_IMAGE_NONE;
         int coo_count = catalog_count(img, coo_name, 12, &coo_first);
         if (coo_count > 0) {
@@ -326,7 +334,9 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, const zone_confi
         }
         
         if (coo_count == 1) {
-            normalize_domain_fqdn_local(coo_rdata, new_desired[d].coo_target, sizeof(new_desired[d].coo_target));
+            /* review catalog_zone [6]: a target that does not fit coo_target is dropped (empty), not silently cut */
+            if (!normalize_domain_fqdn_local(coo_rdata, new_desired[d].coo_target, sizeof(new_desired[d].coo_target)))
+                syslog(LOG_WARNING, "[Catalog] Zone '%s': coo target of member '%s' is too long. Ignoring it.", catalog_entry->domain, new_desired[d].domain);
         } else if (coo_count > 1) {
             syslog(LOG_ERR, "[Catalog] Multiple coo PTR records found for member '%s' in catalog '%s'; catalog zone is broken and will NOT be processed", new_desired[d].domain, catalog_entry->domain);
             free_catalog_desired_list(new_desired, new_desired_count);

@@ -38,10 +38,10 @@
 #define ZONE_IMAGE_F_WILDCARD 0x4u /* some owner is a wildcard (first label "*"): lets the engine skip the wildcard search of a zone without one */
 #define ZONE_IMAGE_F_DNAME    0x8u /* some owner has a DNAME RRset: lets the engine skip the DNAME search of a zone without one */
 #define ZONE_IMAGE_F_PERM     0x10u /* the file (builder) order of the RRs differs from the image order: perm[] lists the RR indexes in that order (AXFR out and thaw use it) */
-#define ZONE_IMAGE_F_VIEW     0x40u /* B8t-1: some RR is seen only by some clients or at some times (tinydns location / time stamp / countdown, $LOCATION / $ECS-SUBNET tag); an ext[] entry that only keeps an owner spelling (alt text) does not count */
 #define ZONE_IMAGE_F_SOA_ATTR 0x20u /* B8t-1: some apex SOA RR is restricted (tinydns location / time stamp, $LOCATION / $ECS-SUBNET tag): a client may see no SOA of the zone, and the SOA it sees is the first visible one */
-#define ZONE_IMAGE_F_CUT 0x100u /* E3: some owner other than the apex has an NS RR (a zone cut, ZONE_IMAGE_NAME_CUT): lets find_delegation() skip the walk up the name of a zone without one */
+#define ZONE_IMAGE_F_VIEW     0x40u /* B8t-1: some RR is seen only by some clients or at some times (tinydns location / time stamp / countdown, $LOCATION / $ECS-SUBNET tag); an ext[] entry that only keeps an owner spelling (alt text) does not count */
 #define ZONE_IMAGE_F_ALIAS 0x80u /* B9a: some owner has an ALIAS RRset (TYPE 65401 of CLASS IN): lets the alias module and the engine skip a zone without one */
+#define ZONE_IMAGE_F_CUT 0x100u /* E3: some owner other than the apex has an NS RR (a zone cut, ZONE_IMAGE_NAME_CUT): lets find_delegation() skip the walk up the name of a zone without one */
 
 /* zone_image_name_t.rr_count_flags: low 24 bits RR count, high 8 bits flags */
 #define ZONE_IMAGE_NAME_COUNT_MASK 0x00FFFFFFu
@@ -141,6 +141,7 @@ static inline const uint8_t *zone_image_base(const zone_image_t *img) { return (
 static inline const char *zone_image_str(const zone_image_t *img, uint32_t off) {
     return off ? (const char *)zone_image_base(img) + img->off_strings + off : NULL;
 }
+/* offset 0 is "none" and gives NULL: a caller that copies (memcpy) must not pass NULL even for length 0, so it checks the length first */
 static inline const uint8_t *zone_image_bytes(const zone_image_t *img, uint32_t off) {
     return off ? zone_image_base(img) + img->off_strings + off : NULL;
 }

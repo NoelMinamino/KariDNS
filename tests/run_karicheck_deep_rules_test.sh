@@ -188,6 +188,18 @@ loop    IN CNAME loop.example.com.
 EOF
 run_check_zone_fail "Reject self-looping CNAME" "example.com" "$TMP_DIR/cname_loop.zone" "CNAME loop detected"
 
+# 8b. CNAME loop through another CNAME (review dns_zone_lint.c [B4]): one warning that names the loop, not two chain warnings
+cat <<'EOF' > "$TMP_DIR/cname_loop2.zone"
+$ORIGIN example.com.
+$TTL 3600
+@       IN SOA   ns1.example.com. hostmaster.example.com. 2026092401 7200 3600 1209600 3600
+@       IN NS    ns1.example.com.
+ns1     IN A     192.0.2.1
+a       IN CNAME b.example.com.
+b       IN CNAME a.example.com.
+EOF
+run_check_zone_warn "Warn on a CNAME loop through two names" "example.com" "$TMP_DIR/cname_loop2.zone" "leads back to itself"
+
 # 9. CNAME chain (WARNING)
 cat <<'EOF' > "$TMP_DIR/cname_chain.zone"
 $ORIGIN example.com.

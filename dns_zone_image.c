@@ -210,6 +210,9 @@ static void build_zattr(sbuf_t *sb, const zone_arena_t *a) {
         if (!parsed) parsed = own = acl_list_parse(a->bind_ecs_trusted_resolvers, ntr);
         if (!parsed) sb->oom = true; /* freeze fails: a zone must not lose its own trusted resolvers (it would fall back to the server's) */
     }
+    /* review [4]: the parsed entries are copied into the image byte for byte, so the type must stay plain data (no pointer): a change of its
+     * size has to be looked at here */
+    _Static_assert(sizeof(acl_entry_t) == 48, "acl_entry_t is copied by value into the zone image: keep it free of pointers");
     sb_u32(sb, parsed ? (uint32_t)ntr : 0);
     if (parsed) {
         static const uint8_t zeros[8] = { 0 };
@@ -378,7 +381,8 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
 
         /* RDATA: what serialize_dns_record() writes with no compression context */
         uint16_t len = 0;
-        if (r->class_val == DNS_CLASS_KARIDNS_EXT && !r->generic_data) memset(cap, 0, 65535);
+        /* review [efficiency 2]: only what the serializer can write (owner "." + 10 + RDATA of generic_len octets) has to be zero, not all 64 KiB */
+        if (r->class_val == DNS_CLASS_KARIDNS_EXT && !r->generic_data) memset(cap, 0, 11u + r->generic_len + 16u < 65535u ? 11u + r->generic_len + 16u : 65535u);
         if (serialize_dns_record(cap, 65535, &len, r, NULL, ".", 0xFFFFFFFFu) != 0 || len < 11 || cap[0] != 0) {
             syslog(LOG_ERR, "[Image] freeze: '%s' type %u cannot be written in wire format", r->name, r->type_code);
             IMG_FAIL();
@@ -478,6 +482,12 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
         syslog(LOG_ERR, "[Image] freeze: the builder's canonical index is empty");
         IMG_FAIL();
     }
+    /* review dns_zone_image.c [8]: every name of the image has exactly one place in the canonical order (a missing name fails above, a
+     * name listed twice would overwrite its rank) */
+    if (a->sorted_unique_count != n_names) {
+        syslog(LOG_ERR, "[Image] freeze: %zu canonical names for %u owner names", a->sorted_unique_count, n_names);
+        IMG_FAIL();
+    }
 
     /* 7. NSEC index */
     if (a->nsec_count > 0) {
@@ -551,11 +561,14 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
         else if (r->type_code == 33 && r->rdata_count >= 4) tgt = r->rdata[3];
         if (!tgt || *tgt == '\0') continue;
         bool in_prelink = false, dup = false;
-        for (int k = 0; k < n_prelink; k++)
-            if (domain_names_match_ci(prelink_targets[k], tgt)) { dup = true; break; }
-        if (!dup && n_prelink < IMG_MAX_PRELINK_TARGETS) {
-            prelink_targets[n_prelink++] = tgt;
-            in_prelink = true;
+        /* review [efficiency 1]: once the list is full nothing more is added, so the duplicate scan is not needed */
+        if (n_prelink < IMG_MAX_PRELINK_TARGETS) {
+            for (int k = 0; k < n_prelink; k++)
+                if (domain_names_match_ci(prelink_targets[k], tgt)) { dup = true; break; }
+            if (!dup) {
+                prelink_targets[n_prelink++] = tgt;
+                in_prelink = true;
+            }
         }
         uint32_t id = tmp_find(&ix, tgt, dns_name_hash_ci(tgt));
         if (id == ZONE_IMAGE_NONE) continue;
@@ -1008,7 +1021,7 @@ static int thaw_zattr(const zone_image_t *img, zone_arena_t *a) {
     cursor_t c = { (const uint8_t *)img + img->off_zattr, img->zattr_len, 0, false };
     uint32_t nloc = get_u32(&c);
     if (!c.bad && nloc) {
-        if ((size_t)nloc > c.len / sizeof(tinydns_location_entry_t)) return -1;
+        if ((size_t)nloc > (c.len - c.pos) / sizeof(tinydns_location_entry_t)) return -1; /* review [2]: what is left, not the whole length */
         a->locations = calloc(nloc, sizeof(tinydns_location_entry_t));
         if (!a->locations) return -1;
         for (uint32_t i = 0; i < nloc; i++) {
@@ -1279,7 +1292,7 @@ static int thaw_one(const zone_image_t *img, uint32_t k, zone_arena_t *a, uint8_
         rec.ttl = arena_strdup(a, ttlbuf);
         rec.ttl_value = rr->ttl;
         rec.class_val = rr->class_val;
-        rec.class_str = rr->class_val == 1 ? "IN" : (rr->class_val == DNS_CLASS_KARIDNS_EXT ? "KARIDNS" : "CH");
+        rec.class_str = rr->class_val == DNS_CLASS_KARIDNS_EXT ? "KARIDNS" : (char *)dns_class_literal(rr->class_val);
         rec.type = (char *)get_type_str(rr->type, a);
         rec.type_code = rr->type;
         rec.next_record = -1;
@@ -1349,15 +1362,15 @@ int zone_image_rr_to_record(const zone_image_t *img, uint32_t rr, zone_arena_t *
 }
 
 int zone_image_thaw(const zone_image_t *img, zone_arena_t *a) {
-    if (!img || !a || img->magic != ZONE_IMAGE_MAGIC || a->count != 0) return -1;
+    if (!img || !a || img->magic != ZONE_IMAGE_MAGIC || img->version != ZONE_IMAGE_VERSION || a->count != 0) return -1; /* review [9] */
     const uint32_t n = img->n_rrs;
     size_t hint = (size_t)img->total_size * 2 + 4096;
     a->first_pool_cap = hint > (16u << 20) ? (16u << 20) : hint;
     /* an arena that was used and emptied (count 0) may still own a record array: replace it */
     free(a->records);
     a->records = calloc(n ? n : 1, sizeof(dns_record_t));
+    if (!a->records) { a->records_cap = 0; return -1; } /* review dns_zone_image.c [1]: the capacity only with the array */
     a->records_cap = n ? n : 1;
-    if (!a->records) return -1;
     uint8_t *pkt = malloc(255 + 10 + 65535);
     uint8_t *chk = malloc(65535);
     if (!pkt || !chk) { free(pkt); free(chk); return -1; }

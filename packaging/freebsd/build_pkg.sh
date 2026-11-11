@@ -144,7 +144,7 @@ install -m 0555 packaging/freebsd/rc.d/karidns "${STAGE_DIR}/usr/local/etc/rc.d/
 # Install sample configuration & sample zone
 install -m 0644 karidns.conf.sample "${STAGE_DIR}/usr/local/etc/karidns/karidns.conf.sample"
 install -m 0644 karictl.conf.sample "${STAGE_DIR}/usr/local/etc/karidns/karictl.conf.sample"
-install -m 0644 packaging/freebsd/zones/example.local.zone.sample "${STAGE_DIR}/usr/local/etc/karidns/zones/example.local.zone.sample"
+install -m 0644 packaging/freebsd/zones/example.test.zone.sample "${STAGE_DIR}/usr/local/etc/karidns/zones/example.test.zone.sample"
 
 # Install the manuals
 for m in karidns karictl karicheck dag dag_replay; do

@@ -90,7 +90,7 @@ jobs:
             test -x /usr/local/bin/karicheck
             test -x /usr/local/bin/dag
             test -f /usr/local/etc/karidns/karidns.conf.sample
-            test -f /usr/local/etc/karidns/zones/example.local.zone.sample
+            test -f /usr/local/etc/karidns/zones/example.test.zone.sample
             test -x /usr/local/etc/rc.d/karidns
             
             # Smoke test dag query

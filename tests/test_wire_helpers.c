@@ -435,6 +435,19 @@ static void test_domain_names_match_ci(void) {
     CHECK(!domain_names_match_ci("a.example.com.", "example.com."));
     CHECK(!domain_names_match_ci(NULL, "example.com"));
     CHECK(!domain_names_match_ci("example.com", NULL));
+    /* review dns_utils.h [7]/[8]: one pass; only ONE trailing dot is ignored and an escaped one is part of the label */
+    CHECK(domain_names_match_ci("", "."));
+    CHECK(domain_names_match_ci(".", ""));
+    CHECK(!domain_names_match_ci("x..", "x."));
+    CHECK(!domain_names_match_ci("x.", "x.."));
+    CHECK(domain_names_match_ci("x..", "x.."));
+    CHECK(!domain_names_match_ci("a\\.", "a"));
+    CHECK(domain_names_match_ci("a\\\\.", "a\\\\"));   /* the backslash is escaped, so the final dot is a real one */
+    CHECK(dns_name_hash_ci("Example.COM.") == dns_name_hash_ci("example.com"));
+    CHECK(dns_name_hash_ci("a\\.") != dns_name_hash_ci("a"));
+    CHECK(dns_name_hash_ci("a\\\\.") == dns_name_hash_ci("a\\\\"));
+    CHECK(dns_name_hash_ci("x..") != dns_name_hash_ci("x") && dns_name_hash_ci("X..") == dns_name_hash_ci("x.."));   /* one dot only */
+    CHECK(dns_name_hash_ci(".") == dns_name_hash_ci(""));
 }
 
 /* ------------------------------------------------------------------------ dns_wire */
@@ -871,6 +884,33 @@ static void test_wire_name_length_and_write_uncompressed(void) {
     w = write_uncompressed_name(out, 0, sizeof(out), "example.com.");
     CHECK(w == 13);
 
+    /* review dns_wire.c [17]: an empty label is no name ("a..b", ".a", ".."); only "." is the root, a trailing dot and no dot are fine */
+    CHECK(write_uncompressed_name(out, 0, sizeof(out), "a..b.") < 0);
+    CHECK(write_uncompressed_name(out, 0, sizeof(out), ".a.") < 0);
+    CHECK(write_uncompressed_name(out, 0, sizeof(out), "..") < 0);
+    CHECK(write_uncompressed_name(out, 0, sizeof(out), "a.b") == 5 && write_uncompressed_name(out, 0, sizeof(out), "a.b.") == 5);
+    CHECK(calc_fnv1a_str("*.") == FNV1A_WILDCARD_PREFIX_HASH);   /* review dns_zone_parser.h [5]: the constant of the wildcard lookup */
+
+    {   /* review dns_wire.c [15] (BIND: DNS_R_EXTRADATA): RDATA that goes on after the fields of its type is refused; exact RDATA is read */
+        zone_arena_t ar;
+        zone_arena_init(&ar);
+        static const uint8_t exact[] = { 0, 0, 2, 0, 1, 0, 0, 0, 0, 0, 3, 1, 'a', 0 };           /* NS "a." */
+        static const uint8_t extra[] = { 0, 0, 2, 0, 1, 0, 0, 0, 0, 0, 4, 1, 'a', 0, 9 };        /* the same and one octet more */
+        static const uint8_t mx_extra[] = { 0, 0, 15, 0, 1, 0, 0, 0, 0, 0, 6, 0, 10, 1, 'a', 0, 9 };
+        dns_record_t rec;
+        uint16_t ty = 0;
+        size_t off = 0;
+        memset(&rec, 0, sizeof(rec));
+        CHECK(parse_resource_record(exact, sizeof(exact), &off, &ar, &rec, &ty) == 0 && rec.rdata_count == 1 && strcmp(rec.rdata[0], "a.") == 0);
+        off = 0;
+        memset(&rec, 0, sizeof(rec));
+        CHECK(parse_resource_record(extra, sizeof(extra), &off, &ar, &rec, &ty) == -1);
+        off = 0;
+        memset(&rec, 0, sizeof(rec));
+        CHECK(parse_resource_record(mx_extra, sizeof(mx_extra), &off, &ar, &rec, &ty) == -1);
+        zone_arena_destroy(&ar);
+    }
+
     w = write_uncompressed_name(out, 0, sizeof(out), "API.Example.Com.");
     CHECK(w == 17);
     CHECK(out[0] == 3 && out[1] == 'a' && out[2] == 'p' && out[3] == 'i'); // Lowercased canonical
@@ -955,6 +995,22 @@ static void test_parse_u8_and_u16_validation(void) {
     CHECK(!parse_u8("abc", &u8_val));
     CHECK(!parse_u8("123abc", &u8_val));
     CHECK(!parse_u8("", &u8_val));
+    CHECK(!parse_u8("+5", &u8_val));   /* review dns_wire.h [5]: a digit first (strtol alone takes a sign and blanks) */
+    CHECK(!parse_u8(" 5", &u8_val));
+    CHECK(!parse_u16("+5", NULL));
+    CHECK(!parse_u16(" 5", NULL));
+    CHECK(get_type_code("TYPE5") == 5 && get_type_code("TYPE65535") == 65535);
+    CHECK(get_type_code("TYPE+5") == 0 && get_type_code("TYPE 5") == 0);   /* review dns_utils.c [4] */
+    CHECK(strcmp(dns_class_literal(1), "IN") == 0 && strcmp(dns_class_literal(4), "HS") == 0 &&
+          strcmp(dns_class_literal(254), "NONE") == 0 && strcmp(dns_class_literal(255), "ANY") == 0 &&
+          strcmp(dns_class_literal(3), "CH") == 0);
+    {   /* review dns_wire.h [20]: base32hex reports the length the whole text needs */
+        uint8_t h20[20] = {0};
+        char b32[8];
+        CHECK(dns_base32hex_encode(h20, 20, b32, sizeof(b32)) == 32 && strlen(b32) == 7);   /* cut off, and the caller can tell */
+        char b32full[40];
+        CHECK(dns_base32hex_encode(h20, 20, b32full, sizeof(b32full)) == 32 && strlen(b32full) == 32);
+    }
     CHECK(!parse_u8(NULL, &u8_val));
 
     uint16_t u16_val = 0;
@@ -3131,12 +3187,13 @@ static void test_char_string_nul(void) {
     char *tok[] = { (char *)"\\#", (char *)"4", (char *)"0361", (char *)"0062" };
     uint8_t blob[65535];
     size_t blen = 0;
-    CHECK(dns_generic_rdata_parse(16, tok, 4, blob, &blen) == NULL && blen == 4 && memcmp(blob, g, 4) == 0);
+    CHECK(dns_generic_rdata_parse(16, tok, 4, blob, sizeof(blob), &blen) == NULL && blen == 4 && memcmp(blob, g, 4) == 0);
     char *t0[] = { (char *)"\\#", (char *)"0" };
-    CHECK(dns_generic_rdata_parse(65534, t0, 2, blob, &blen) == NULL && blen == 0);
-    CHECK(dns_generic_rdata_parse(12, t0, 2, blob, &blen) != NULL);      /* PTR \# 0 is not valid RDATA */
+    CHECK(dns_generic_rdata_parse(16, tok, 4, blob, 3, &blen) != NULL);   /* review dns_wire.c [18]: 4 octets do not fit a 3-octet buffer */
+    CHECK(dns_generic_rdata_parse(65534, t0, 2, blob, sizeof(blob), &blen) == NULL && blen == 0);
+    CHECK(dns_generic_rdata_parse(12, t0, 2, blob, sizeof(blob), &blen) != NULL);      /* PTR \# 0 is not valid RDATA */
     char *tb[] = { (char *)"\\#", (char *)"3", (char *)"0102" };
-    CHECK(dns_generic_rdata_parse(65534, tb, 3, blob, &blen) != NULL);   /* length mismatch */
+    CHECK(dns_generic_rdata_parse(65534, tb, 3, blob, sizeof(blob), &blen) != NULL);   /* length mismatch */
     zone_arena_destroy(&a);
 }
 

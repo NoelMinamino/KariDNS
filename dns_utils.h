@@ -40,11 +40,18 @@ bool identity_names_root(const char *user, const char *group, char *err, size_t 
 #endif
 
 uint16_t get_type_code(const char *type_str);
+/* The directory part of path ("." without a slash, "/" for a file in the root); malloc()ed, the caller free()s it.  NULL for a NULL path
+ * or on out of memory. */
 char *get_base_dir(const char *path);
 const char *format_type_name(uint16_t type, char *buf, size_t buf_size);
+/* The mnemonic of a type; "TYPEnnn" (RFC 3597 5) for the rest, written into a _Thread_local buffer that the next call of the same
+ * thread overwrites: use the result before calling again (two calls in one printf() argument list show the same text twice). */
 const char *dns_type_to_string(uint16_t type_code);
 /* The mnemonic of a CLASS as BIND prints it in its logs (IN, CH, HS, NONE, ANY); CLASSnnn (RFC 3597 5) for the rest, written into buf (>= 12 bytes) */
 const char *dns_class_text(uint16_t qclass, char *buf, size_t buf_size);
+/* The same mnemonics as string literals (no buffer) for the classes a zone can hold: IN, CH, HS, NONE, ANY; "CH" for anything else
+ * (what dns_record_t.class_str used to say for every non-IN class; class_val is the value that counts). */
+const char *dns_class_literal(uint16_t qclass);
 /* The mnemonic of an RCODE 0..10 (RFC 1035 4.1.1, RFC 2136 2.2, RFC 6895); "RCODE" for the rest */
 const char *dns_rcode_name(unsigned rcode);
 
@@ -91,20 +98,40 @@ static inline size_t dns_name_len_no_root(const char *name, size_t len) {
  * RFC 4343 §2 の比較と一致する。 */
 static inline bool domain_names_match_ci(const char *a, const char *b) {
     if (!a || !b) return false;
-    if (strcasecmp(a, b) == 0) return true;
-    size_t la = dns_name_len_no_root(a, strlen(a));
-    size_t lb = dns_name_len_no_root(b, strlen(b));
-    return la == lb && strncasecmp(a, b, la) == 0;
+    /* one pass (review dns_utils.h [7]): equal up to the end of the shorter name, then either both end, or the longer one is left with
+     * exactly one unescaped '.' and the shorter one does not itself end in an unescaped '.' (only one trailing dot is ignored) */
+    size_t i = 0;
+    for (; a[i] && b[i]; i++) {
+        unsigned char ca = (unsigned char)a[i], cb = (unsigned char)b[i];
+        if (ca != cb) {
+            if (ca >= 'A' && ca <= 'Z') ca |= 0x20;
+            if (cb >= 'A' && cb <= 'Z') cb |= 0x20;
+            if (ca != cb) return false;
+        }
+    }
+    if (!a[i] && !b[i]) return true;
+    const char *longer = a[i] ? a : b, *shorter = a[i] ? b : a;
+    if (longer[i] != '.' || longer[i + 1] != '\0' || dns_char_is_escaped(longer, i)) return false;
+    return i == 0 || shorter[i - 1] != '.' || dns_char_is_escaped(shorter, i - 1);
 }
 
 /* domain_names_match_ci() で一致する名前が必ず同じ値になるハッシュ (FNV-1a)。
  * 末尾のエスケープされない '.' を 1 つ除き、ASCII 英字の大文字小文字を区別しない。
  * 一致の判定は domain_names_match_ci() で行い、これは候補を絞るだけ。 */
 static inline uint32_t dns_name_hash_ci(const char *name) {
-    size_t len = dns_name_len_no_root(name, strlen(name));
+    /* one pass (review dns_utils.h [8]): an unescaped '.' is held back and hashed only when a character follows, so a trailing one
+     * is left out like dns_name_len_no_root() does; the escape state is the parity of the backslash run before a character */
     uint32_t h = 2166136261u;
-    for (size_t i = 0; i < len; i++) {
-        uint8_t c = (uint8_t)name[i];
+    bool esc = false, pending_dot = false;
+    for (const char *p = name; *p; p++) {
+        uint8_t c = (uint8_t)*p;
+        if (!esc && c == '.') {
+            if (pending_dot) { h ^= (uint8_t)'.'; h *= 16777619u; }
+            pending_dot = true;
+            continue;
+        }
+        if (pending_dot) { h ^= (uint8_t)'.'; h *= 16777619u; pending_dot = false; }
+        esc = !esc && c == '\\';
         if (c >= 'A' && c <= 'Z') c |= 0x20;
         h ^= c;
         h *= 16777619u;
