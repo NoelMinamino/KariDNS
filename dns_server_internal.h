@@ -390,6 +390,7 @@ typedef struct {
   _Atomic uint64_t notify_ack;
   _Atomic uint64_t axfr_success;
   _Atomic uint64_t ixfr_success;
+  _Atomic uint64_t xfer_failed;        /* 0.6.1: a refresh that failed at every primary asked (axfr_bg_thread_func()) */
   _Atomic uint64_t wirecache_hits;
   _Atomic uint64_t wirecache_misses;
   _Atomic time_t   last_transfer_time;
@@ -865,6 +866,13 @@ typedef struct {
 } resp_log_entry_t;
 
 extern _Atomic int g_xfers_running;
+/* 0.6.1 karictl stats / alerts: the server-wide response counters: every response by RCODE, those of queries no zone answered (REFUSED for a name
+ * outside every zone, FORMERR, NOTIMP, ...), and the number sent over TCP.  One relaxed add in the calling thread's own cache line per response
+ * (dns_query_engine.c); the zone counters stay where they were.  server_responses_get() sums the threads' slots (the control thread).
+ * g_xfer_failed_total: refreshes that failed at every primary, all zones (the alerts' server counter). */
+void server_response_count(unsigned rcode, bool is_tcp, bool zoned);
+void server_responses_get(uint64_t resp[16], uint64_t unzoned[16], uint64_t *tcp);
+extern _Atomic uint64_t g_xfer_failed_total;
 
 server_config_t *acquire_config_snapshot(void);
 /* 退いた設定 (standby) を、読み手が全員抜けていれば解放する。wait なら最大 10 秒待つ。
@@ -1289,6 +1297,38 @@ void fast_ipv4_to_str(uint32_t ip_be, char *dst);
 uint32_t get_effective_query_log_max_qps(const server_config_t *cfg);
 void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct tm *tm_info);
 void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, zone_observatory_snapshot_t *out);
+
+/* ---- 0.6.1: karictl stats and threshold alerts (dns_server_core.c, control thread) ---- */
+/* Sums the counters of every zone of the snapshot (a shared zone once) and adds the counters that belong to no zone. */
+void stats_collect_totals(zone_db_snapshot_t *snap, karidns_stats_total_t *t);
+/* One page of zones from the cursor (NULL = the start) that match the glob `pattern` (NULL = all), in directory order (see obspage_select() in
+ * dns_server_core.c): at most `limit` entries of `snap` (valid while snap is held) in *out (free() it), their number in *n, and in cursor_out the
+ * cursor of the next page ("" = the end).  Cost O(page + OBSPAGE_SCAN_MAX at the most).  OBSPAGE_STALE: the cursor does not fit the directories now. */
+enum { OBSPAGE_OOM = -1, OBSPAGE_STALE = -2 };
+int obspage_select(zone_db_snapshot_t *snap, const char *pattern, const char *cursor, size_t limit, const zone_db_entry_t ***out, size_t *n,
+                   char *cursor_out, size_t cursor_cap);
+/* The counters an alert is computed from (cumulative since the start; a counter that went back, because the zone was replaced, counts as new) */
+typedef struct {
+  uint64_t queries, responses, servfail, rrl_dropped, xfer_failed, reload_failed;
+} alert_counters_t;
+typedef struct {
+  bool have_prev;
+  time_t prev_time;
+  alert_counters_t prev;
+  bool active[ALERT_KIND_COUNT];
+} alert_state_t;
+enum { ALERT_EV_RAISED = 1, ALERT_EV_CLEARED, ALERT_EV_REMOVED };
+typedef void (*alert_emit_fn)(void *ctx, int event, alert_kind_t kind, double value, double limit);
+/* ratio alerts need this many responses in the interval to be computed (a SERVFAIL out of 3 answers is not an alert) */
+#define ALERT_RATIO_MIN_RESPONSES 100
+/* One check with the counters read at time t.  The first call only takes the baseline.  Raises an alert once when the value goes above its limit,
+ * clears it once when the value is not above, and clears (EV_REMOVED) an alert whose limit left the configuration.  Returns the number raised now. */
+int alert_check(alert_state_t *st, const alert_limits_t *lim, const alert_counters_t *now, time_t t, alert_emit_fn fn, void *ctx);
+/* The control thread's timer: runs a check of the server and of the zones that have an alerts { } block when the interval is over. */
+void alerts_tick(time_t now);
+extern _Atomic uint64_t g_reload_failures_total;
+extern uint64_t g_alerts_active;   /* alerts raised at the last check */
+extern uint64_t g_alerts_zones, g_alerts_check_us, g_alerts_build_us;   /* zones looked at, time of the last check and of the last list build (microseconds) */
 bool ensure_priv_dir_safe(const char *dir_buf);
 /* dns_server_core.c: open the files of the channels in `list` (the other kinds of channel need nothing).  0 = all open; 1 = nothing wrong but a
  * file in a directory the sandbox cannot reach any more (a reload that names a new directory: it takes effect after a restart); -1 = a

@@ -265,6 +265,28 @@ static void *ctl_server(void *arg) {
             snprintf(st.config_file, sizeof(st.config_file), "/etc/karidns.conf");
             char out[3 + sizeof(st)]; memcpy(out, "OK ", 3); memcpy(out + 3, &st, sizeof(st));
             send(c, out, mode == 7 ? 5 : sizeof(out), 0);
+        } else if (!strncmp(b, "stats", 5)) {                 /* karictl stats: the totals */
+            karidns_stats_total_t tt; memset(&tt, 0, sizeof(tt));
+            tt.zones = 3; tt.queries_total = 10; tt.tcp_queries = 4; tt.responses_noerror = 6; tt.responses_nodata = 1;
+            tt.unzoned_responses[5] = 2; tt.unzoned_responses[1] = 1; tt.unzoned_responses[9] = 1; tt.alerts_active = 1;
+            char out[3 + sizeof(tt)]; memcpy(out, "OK ", 3); memcpy(out + 3, &tt, sizeof(tt));
+            if (mode == 8) send(c, "ERROR command not allowed\n", 26, 0);
+            else send(c, out, mode == 7 ? 5 : sizeof(out), 0);
+        } else if (!strncmp(b, "obspage", 7)) {                /* karictl stats: a page of zones (the first page says there are more) */
+            zone_observatory_snapshot_t z[2]; memset(z, 0, sizeof(z));
+            snprintf(z[0].domain, sizeof(z[0].domain), "a\"b\\c.test."); snprintf(z[0].view_name, sizeof(z[0].view_name), "v1");
+            snprintf(z[1].domain, sizeof(z[1].domain), "d.test."); z[1].is_secondary = true; z[1].last_transfer_time = 1700000000;
+            z[0].queries_total = 5; z[0].tcp_queries = 2; z[1].queries_total = 7;
+            bool first = strstr(b, " -\n") != NULL;   /* (no cursor) */
+            if (strstr(b, " stale")) {
+                static const char stale[] = "ERROR cursor is stale: the zones were reloaded, start the listing again\n";
+                send(c, stale, sizeof(stale) - 1, 0);
+                close(c);
+                continue;
+            }
+            const char *hdr = first ? "OK 2 0.2.abc\n" : "OK 1 -\n";
+            send(c, hdr, strlen(hdr), 0);
+            send(c, z, first ? 2 * sizeof(z[0]) : sizeof(z[0]), 0);
         } else if (mode == 8) {
             send(c, "ERR unknown zone\n", 17, 0);
         } else {
@@ -303,7 +325,24 @@ static void test_karictl(void) {
             run_tool(karictl_main, "karictl", "-c", cp, cmds[c][0], cmds[c][1], cmds[c][2], NULL);
         }
     }
+    /* karictl stats (0.6.1): every fake-server mode, both formats, the paging, the filters and the usage errors */
+    for (int mode = 0; mode <= 8; mode++) {
+        g_ctl_mode = mode;
+        run_tool(karictl_main, "karictl", "-c", cp, "stats", NULL);
+    }
     g_ctl_mode = 0;
+    run_tool(karictl_main, "karictl", "-c", cp, "stats", "-f", "json", NULL);
+    run_tool(karictl_main, "karictl", "-c", cp, "stats", "--format=prometheus", "--limit", "2", NULL);
+    run_tool(karictl_main, "karictl", "-c", cp, "stats", "--format", "json", "--limit", "1", NULL);
+    run_tool(karictl_main, "karictl", "-c", cp, "stats", "--zones", "*.test", "--after", "0.2.abc", NULL);
+    run_tool(karictl_main, "karictl", "-c", cp, "stats", "--limit", "3", "--after", "stale", NULL);
+    run_tool(karictl_main, "karictl", "-c", cp, "stats", "a.test", NULL);
+    run_tool(karictl_main, "karictl", "-c", cp, "stats", "a.test", "v1", "-f", "json", NULL);
+    const char *bad_stats[][4] = { { "-f", "xml", NULL, NULL }, { "--limit", "0", NULL, NULL }, { "--limit", "x", NULL, NULL }, { "--limit", "-3", NULL, NULL },
+                                   { "--zones", NULL, NULL, NULL }, { "--zones", "a b", NULL, NULL }, { "--bogus", NULL, NULL, NULL },
+                                   { "a", "b", "c", NULL }, { "a.test", "--zones", "x", NULL }, { "--after-view", "v", NULL, NULL }, { "--after", "", NULL, NULL } };
+    for (size_t bi = 0; bi < N(bad_stats); bi++)
+        assert(run_tool(karictl_main, "karictl", "-c", cp, "stats", bad_stats[bi][0], bad_stats[bi][1], bad_stats[bi][2], NULL) == 2);
     run_tool(karictl_main, "karictl", "-f", cp_nosock, "-s", g_sock, "status", NULL);
     run_tool(karictl_main, "karictl", "-c", cp_nosecret, "status", NULL);
     run_tool(karictl_main, "karictl", "-c", cp_long, "status", NULL);

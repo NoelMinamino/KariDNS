@@ -141,6 +141,9 @@ X (CONF_DATABASE_CONNINFO_TLS, "conf.database.conninfo-tls", 'W', "the connectio
 X (CONF_DATABASE_SERVER_ID_SQLITE, "conf.database.server-id-sqlite", 'W', "server-id is ignored with sqlite3")
 X (CONF_DATABASE_SERVER_ID_CHARS, "conf.database.server-id-chars", 'W', "server-id has characters other than letters, digits and . - _ :")
 X (CONF_DATABASE_SERVER_ID_HOST, "conf.database.server-id-host", 'W', "server-id is not set and the host name does not fit")
+X (CONF_ALERTS_OPTION, "conf.alerts.option", 'E', "an unknown statement in alerts { }, or interval / reload-failures-above in the alerts { } of a zone")
+X (CONF_ALERTS_RANGE, "conf.alerts.range", 'E', "an alerts { } value is not a number, is negative, is above 100 for servfail-ratio-above, or is outside 10..3600 for interval")
+X (CONF_ALERTS_EMPTY, "conf.alerts.empty", 'W', "an alerts { } block sets no limit, so nothing is checked")
 X (CONF_DATABASE_ALIAS_RESOLVER, "conf.database.alias-resolver", 'W', "an alias-resolver with server-id: servers sharing a database can answer ALIAS names differently")
 
 /* ---- zone: the zone file (tools/karicheck.c) ---- */

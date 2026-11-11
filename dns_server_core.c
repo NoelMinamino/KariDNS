@@ -8,6 +8,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <fnmatch.h>
 #include <grp.h>
 #include <limits.h> // PATH_MAX, NAME_MAX
 #include <netinet/in.h>
@@ -1499,6 +1500,7 @@ void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, z
     out->notify_ack = atomic_load_explicit(&e->observatory.notify_ack, memory_order_relaxed);
     out->axfr_success = atomic_load_explicit(&e->observatory.axfr_success, memory_order_relaxed);
     out->ixfr_success = atomic_load_explicit(&e->observatory.ixfr_success, memory_order_relaxed);
+    out->xfer_failed = atomic_load_explicit(&e->observatory.xfer_failed, memory_order_relaxed);
 
     out->wirecache_hits = atomic_load_explicit(&e->observatory.wirecache_hits, memory_order_relaxed);
     out->wirecache_misses = atomic_load_explicit(&e->observatory.wirecache_misses, memory_order_relaxed);
@@ -3730,9 +3732,14 @@ STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged
 static bool g_reload_pending = false;
 static bool g_reload_pending_full = false; /* 延期したものに全ゾーンの再読み込みが含まれる */
 
+_Atomic uint64_t g_reload_failures_total = 0;   /* karictl stats, alerts reload-failures-above: reloads that failed or left zones unloaded (the control thread writes it) */
+
 static config_reload_result_t run_config_reload(bool skip_unchanged) {
   bool full = !skip_unchanged || g_reload_pending_full;
   config_reload_result_t r = perform_config_reload_ext(!full);
+  if (r.status == CONFIG_RELOAD_READ_ERROR || r.status == CONFIG_RELOAD_PARSE_ERROR || r.status == CONFIG_RELOAD_REJECTED ||
+      r.status == CONFIG_RELOAD_ZONE_ERRORS)
+    atomic_fetch_add_explicit(&g_reload_failures_total, 1, memory_order_relaxed);
   if (r.status == CONFIG_RELOAD_POSTPONED) {
     g_reload_pending = true;
     g_reload_pending_full = full;
@@ -4087,6 +4094,349 @@ static bool sighup_from_manager(long delivered) {
                      "the manager forwards SIGHUP (send it to the manager or use karictl reload)",
          (int)other);
   return false;
+}
+
+/* ============================================================================
+ * 0.6.1: karictl stats (totals, pages of zones) and threshold alerts.  Control thread only; nothing here runs on the query path: the
+ * counters are the ones the query path keeps already (zone observatory, g_unzoned_responses, g_rrl_dropped_total).
+ * ============================================================================ */
+
+STATIC_TEST void stats_collect_totals(zone_db_snapshot_t *snap, karidns_stats_total_t *t) {
+  memset(t, 0, sizeof(*t));
+  if (snap) {
+    for (size_t v = 0; v < snap->view_count; v++) {
+      zdir_iter_t it;
+      zdir_iter_init(&it, &snap->views[v]);
+      for (zdir_elem_t *el; (el = zdir_iter_next(&it));) {
+        zone_db_entry_t *e = zdir_entry(el);
+        if (!e || !view_owns_elem(el)) continue;   /* a shared zone is counted in its owner view */
+        const zone_observatory_t *o = &e->observatory;
+#define ST_ADD(f) t->f += atomic_load_explicit(&o->f, memory_order_relaxed)
+        t->zones++;
+        ST_ADD(queries_total); ST_ADD(tcp_queries);
+        ST_ADD(responses_noerror); ST_ADD(responses_nodata); ST_ADD(responses_nxdomain); ST_ADD(responses_servfail); ST_ADD(responses_refused);
+        ST_ADD(edns_queries); ST_ADD(dnssec_do_queries); ST_ADD(ecs_queries);
+        ST_ADD(rrl_dropped); ST_ADD(rrl_slipped);
+        ST_ADD(notify_sent); ST_ADD(notify_ack); ST_ADD(axfr_success); ST_ADD(ixfr_success); ST_ADD(xfer_failed);
+        ST_ADD(wirecache_hits); ST_ADD(wirecache_misses);
+#undef ST_ADD
+      }
+    }
+  }
+  {
+    uint64_t resp[KARIDNS_STATS_RCODES], tcp;
+    server_responses_get(resp, t->unzoned_responses, &tcp);
+  }
+  t->reload_failures = atomic_load_explicit(&g_reload_failures_total, memory_order_relaxed);
+  t->alerts_active = g_alerts_active;
+  t->alerts_zones = g_alerts_zones;
+  t->alerts_check_us = g_alerts_check_us;
+  t->alerts_build_us = g_alerts_build_us;
+}
+
+/* obspage: one page of zones, found in O(page) from a cursor.  The order is the order of the zone directories: the views in the order of the
+ * snapshot, and in a view the slots of its open-addressing table (zdir_iter_at()), which is the order of the names' hashes, not alphabetical.
+ * The cursor is "<view>.<slot>.<table id>"; the table id is made from the address and the size of the table the cursor points into, so a
+ * cursor from before a reload that built new directories (or a table that grew) is refused: OBSPAGE_STALE.  A zone added or removed in
+ * place between two pages may or may not be seen (the walk is not a point-in-time copy).  One call looks at no more than OBSPAGE_SCAN_MAX
+ * slots (a glob that matches little returns a short page with a cursor), so the control thread is never held for a whole directory. */
+#define OBSPAGE_SCAN_MAX 65536
+
+static uint64_t obs_tab_id(const zdir_tab_t *t) {
+  return t ? ((uint64_t)(uintptr_t)t * 0x9e3779b97f4a7c15ull) ^ (uint64_t)t->cap : 0;
+}
+
+STATIC_TEST int obspage_select(zone_db_snapshot_t *snap, const char *pattern, const char *cursor, size_t limit, const zone_db_entry_t ***out,
+                               size_t *n_out, char *cursor_out, size_t cursor_cap) {
+  *out = NULL;
+  *n_out = 0;
+  if (cursor_cap) cursor_out[0] = '\0';
+  size_t v = 0, slot = 0;
+  if (cursor) {
+    unsigned long long cv, cs, ct;
+    char tail;
+    if (sscanf(cursor, "%llu.%llu.%llx%c", &cv, &cs, &ct, &tail) != 3) return OBSPAGE_STALE;
+    if (!snap || cv >= snap->view_count) return OBSPAGE_STALE;
+    zdir_iter_t it;
+    zdir_iter_init(&it, &snap->views[cv]);
+    if (obs_tab_id(it.tab) != (uint64_t)ct || (it.tab && cs > it.tab->cap)) return OBSPAGE_STALE;
+    v = (size_t)cv;
+    slot = (size_t)cs;
+  }
+  if (limit == 0) return 0;
+  const zone_db_entry_t **page = malloc(limit * sizeof(*page));
+  if (!page) return OBSPAGE_OOM;
+  size_t n = 0, scanned = 0;
+  bool done = false;
+  while (snap && v < snap->view_count && n < limit && scanned < OBSPAGE_SCAN_MAX) {
+    zdir_iter_t it;
+    zdir_iter_init(&it, &snap->views[v]);
+    size_t cap = zdir_iter_slots(&it);
+    for (; slot < cap && n < limit && scanned < OBSPAGE_SCAN_MAX; slot++, scanned++) {
+      zdir_elem_t *el = zdir_iter_at(&it, slot);
+      if (!el) continue;
+      const zone_db_entry_t *e = zdir_entry(el);
+      if (!e || !view_owns_elem(el)) continue;
+      if (pattern) {
+        /* the name as stored and without the root label: `example.*` and `example.test.` both match example.test. */
+        char bare[256];
+        strlcpy(bare, e->domain, sizeof(bare));
+        size_t bl = strlen(bare);
+        if (bl > 1 && bare[bl - 1] == '.') bare[bl - 1] = '\0';
+        if (fnmatch(pattern, e->domain, FNM_CASEFOLD) != 0 && fnmatch(pattern, bare, FNM_CASEFOLD) != 0) continue;
+      }
+      page[n++] = e;
+    }
+    if (slot >= cap) {   /* the view is done */
+      v++;
+      slot = 0;
+    }
+  }
+  if (!snap || v >= snap->view_count) done = true;
+  if (!done && cursor_cap) {
+    zdir_iter_t it;
+    zdir_iter_init(&it, &snap->views[v]);
+    snprintf(cursor_out, cursor_cap, "%zu.%zu.%llx", v, slot, (unsigned long long)obs_tab_id(it.tab));
+  }
+  *out = page;
+  *n_out = n;
+  return 0;
+}
+
+/* ---- alerts ---- */
+
+static uint64_t alert_delta(uint64_t now, uint64_t prev) { return now >= prev ? now - prev : now; }   /* a counter that restarted (replaced zone) */
+
+STATIC_TEST int alert_check(alert_state_t *st, const alert_limits_t *lim, const alert_counters_t *now, time_t t, alert_emit_fn fn, void *ctx) {
+  int raised = 0;
+  bool any_limit = false;
+  for (int k = 0; k < ALERT_KIND_COUNT; k++) {
+    if (lim->set[k]) {
+      any_limit = true;
+    } else if (st->active[k]) {   /* the limit left the configuration while the alert was raised */
+      st->active[k] = false;
+      fn(ctx, ALERT_EV_REMOVED, (alert_kind_t)k, 0, 0);
+    }
+  }
+  if (!any_limit) {
+    st->have_prev = false;
+    return 0;
+  }
+  if (!st->have_prev || t <= st->prev_time) {
+    if (!st->have_prev || t < st->prev_time) {   /* the baseline (or a clock that went back: start again) */
+      st->have_prev = true;
+      st->prev = *now;
+      st->prev_time = t;
+    }
+    for (int k = 0; k < ALERT_KIND_COUNT; k++) raised += st->active[k];
+    return raised;
+  }
+  double secs = (double)(t - st->prev_time);
+  uint64_t dresp = alert_delta(now->responses, st->prev.responses);
+  double value[ALERT_KIND_COUNT];
+  value[ALERT_QPS_ABOVE] = (double)alert_delta(now->queries, st->prev.queries) / secs;
+  value[ALERT_SERVFAIL_RATIO_ABOVE] = dresp >= ALERT_RATIO_MIN_RESPONSES ? 100.0 * (double)alert_delta(now->servfail, st->prev.servfail) / (double)dresp : 0.0;
+  value[ALERT_RRL_DROPS_ABOVE] = (double)alert_delta(now->rrl_dropped, st->prev.rrl_dropped);
+  value[ALERT_TRANSFER_FAILURES_ABOVE] = (double)alert_delta(now->xfer_failed, st->prev.xfer_failed);
+  value[ALERT_RELOAD_FAILURES_ABOVE] = (double)alert_delta(now->reload_failed, st->prev.reload_failed);
+  for (int k = 0; k < ALERT_KIND_COUNT; k++) {
+    if (!lim->set[k]) continue;
+    if (value[k] > lim->limit[k]) {
+      if (!st->active[k]) {
+        st->active[k] = true;
+        fn(ctx, ALERT_EV_RAISED, (alert_kind_t)k, value[k], lim->limit[k]);
+      }
+    } else if (st->active[k]) {
+      st->active[k] = false;
+      fn(ctx, ALERT_EV_CLEARED, (alert_kind_t)k, value[k], lim->limit[k]);
+    }
+    raised += st->active[k];
+  }
+  st->prev = *now;
+  st->prev_time = t;
+  return raised;
+}
+
+/* where an alert is reported (the log line says server, or the zone and its view) */
+typedef struct {
+  char scope[KARIDNS_VIEW_NAME_MAX + 280];
+  uint32_t interval;
+} alert_log_ctx_t;
+
+static void alert_log(void *vctx, int event, alert_kind_t kind, double value, double limit) {
+  const alert_log_ctx_t *c = vctx;
+  char val[48];
+  if (kind == ALERT_QPS_ABOVE) snprintf(val, sizeof(val), "%.1f queries/s", value);
+  else if (kind == ALERT_SERVFAIL_RATIO_ABOVE) snprintf(val, sizeof(val), "%.2f%%", value);
+  else snprintf(val, sizeof(val), "%.0f in %us", value, (unsigned)c->interval);
+  if (event == ALERT_EV_RAISED)
+    syslog(LOG_WARNING, "[Control] alert: %s on %s: %s above %g", alert_kind_name(kind), c->scope, val, limit);
+  else if (event == ALERT_EV_CLEARED)
+    syslog(LOG_NOTICE, "[Control] alert cleared: %s on %s: %s, limit %g", alert_kind_name(kind), c->scope, val, limit);
+  else
+    syslog(LOG_NOTICE, "[Control] alert cleared: %s on %s: no longer checked (the limit or the zone left the configuration)",alert_kind_name(kind), c->scope);
+}
+
+/* The zones that have an effective alerts { } block, with their limits and state, built from the configuration when it changes (a new generation:
+ * karidns.conf is read again) and kept between two checks.  A check looks at these zones only, each by one hash lookup in its view; the server's
+ * own check reads the server-wide counters and walks nothing.  Bounded: ALERT_ZONES_MAX zones. */
+#define ALERT_ZONES_MAX 4096
+typedef struct {
+  char view[KARIDNS_VIEW_NAME_MAX];
+  char zone[256];
+  bool carried;
+  alert_limits_t lim;
+  alert_state_t st;
+} alert_zone_t;
+static struct {
+  alert_state_t server;
+  alert_zone_t *zones;
+  size_t nzones;
+  time_t next_run;
+  uint64_t cfg_generation;
+  bool built;
+  bool cap_warned;
+} g_alerts;
+uint64_t g_alerts_active;
+uint64_t g_alerts_zones, g_alerts_check_us, g_alerts_build_us;
+
+static uint64_t alerts_clock_us(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+static void alert_scope_zone(alert_log_ctx_t *c, const char *zone, const char *view) {
+  snprintf(c->scope, sizeof(c->scope), "zone %.255s (view %.63s)", zone, view);
+}
+
+/* the list of zones with a block, from `cfg` (a walk of the configured zones, once per configuration); the state of a zone that was in the old list
+ * is kept (a zone that is gone while an alert of it is raised gets its "cleared" line) */
+static void alerts_build_zone_list(const server_config_t *cfg, alert_log_ctx_t *lc) {
+  alert_zone_t *nz = NULL;
+  size_t nn = 0, ncap = 0;
+  for (view_config_t *v = cfg->views; v; v = v->next) {
+    if (!v->name) continue;
+    for (zone_config_t *z = v->zones; z; z = z->next) {
+      const zone_ext_t *x = zext(z);
+      if (!x->alerts.configured || x->iv || !z->domain) continue;
+      alert_limits_t zlim;
+      alert_limits_for_zone(&cfg->alerts, &x->alerts, &zlim);
+      bool any = false;
+      for (int k = 0; k < ALERT_KIND_COUNT; k++) any = any || zlim.set[k];
+      if (!any) continue;
+      if (nn == ALERT_ZONES_MAX) {
+        if (!g_alerts.cap_warned) {
+          g_alerts.cap_warned = true;
+          syslog(LOG_WARNING, "[Control] alerts: more than %d zones have an alerts { } block; the others are not checked", ALERT_ZONES_MAX);
+        }
+        continue;
+      }
+      if (nn == ncap) {
+        size_t cap2 = ncap ? ncap * 2 : 16;
+        alert_zone_t *t2 = realloc(nz, cap2 * sizeof(*t2));
+        if (!t2) continue;
+        nz = t2;
+        ncap = cap2;
+      }
+      alert_zone_t *az = &nz[nn++];
+      memset(az, 0, sizeof(*az));
+      strlcpy(az->view, v->name, sizeof(az->view));
+      strlcpy(az->zone, z->domain, sizeof(az->zone));
+      az->lim = zlim;
+      for (size_t i = 0; i < g_alerts.nzones; i++) {
+        alert_zone_t *old = &g_alerts.zones[i];
+        if (!old->carried && strcmp(old->view, az->view) == 0 && strcmp(old->zone, az->zone) == 0) {
+          az->st = old->st;
+          az->st.have_prev = false;   /* the limits may differ: take the baseline again */
+          old->carried = true;
+          break;
+        }
+      }
+    }
+  }
+  for (size_t i = 0; i < g_alerts.nzones; i++) {
+    const alert_zone_t *old = &g_alerts.zones[i];
+    if (old->carried) continue;
+    alert_scope_zone(lc, old->zone, old->view);
+    for (int k = 0; k < ALERT_KIND_COUNT; k++)
+      if (old->st.active[k]) alert_log(lc, ALERT_EV_REMOVED, (alert_kind_t)k, 0, 0);
+  }
+  free(g_alerts.zones);
+  g_alerts.zones = nz;
+  g_alerts.nzones = nn;
+}
+
+STATIC_TEST void alerts_tick(time_t now) {
+  if (now < g_alerts.next_run) return;
+  server_config_t *cfg = acquire_config_snapshot();
+  if (!cfg) return;
+  const uint64_t t_start = alerts_clock_us();
+  const uint32_t interval = cfg->alerts.interval ? cfg->alerts.interval : ALERT_INTERVAL_DEFAULT;
+  alert_log_ctx_t lc;
+  lc.interval = interval;
+  if (!g_alerts.built || cfg->generation != g_alerts.cfg_generation) {   /* a new configuration: the limits may differ */
+    g_alerts.built = true;
+    g_alerts.cfg_generation = cfg->generation;
+    g_alerts.server.have_prev = false;
+    const uint64_t t_build = alerts_clock_us();
+    alerts_build_zone_list(cfg, &lc);
+    g_alerts_build_us = alerts_clock_us() - t_build;
+  }
+  uint64_t active = 0;
+
+  /* the server: the options { alerts { } } limits against the server-wide counters (nothing is walked) */
+  alert_limits_t slim;
+  alert_limits_for_server(&cfg->alerts, &slim);
+  alert_counters_t sc;
+  memset(&sc, 0, sizeof(sc));
+  uint64_t resp[KARIDNS_STATS_RCODES], unz[KARIDNS_STATS_RCODES], tcp;
+  server_responses_get(resp, unz, &tcp);
+  for (int r = 0; r < KARIDNS_STATS_RCODES; r++) sc.responses += resp[r];
+  sc.queries = sc.responses;   /* (every query that reaches the query engine is answered; a rate-limited answer is counted before it is dropped) */
+  sc.servfail = resp[2];
+  sc.rrl_dropped = atomic_load_explicit(&g_rrl_dropped_total, memory_order_relaxed);
+  sc.xfer_failed = atomic_load_explicit(&g_xfer_failed_total, memory_order_relaxed);
+  sc.reload_failed = atomic_load_explicit(&g_reload_failures_total, memory_order_relaxed);
+  snprintf(lc.scope, sizeof(lc.scope), "server");
+  active += (uint64_t)alert_check(&g_alerts.server, &slim, &sc, now, alert_log, &lc);
+
+  /* the zones with a block: one lookup each */
+  if (g_alerts.nzones) {
+    zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
+    for (size_t i = 0; i < g_alerts.nzones; i++) {
+      alert_zone_t *az = &g_alerts.zones[i];
+      const zone_db_entry_t *e = snap ? snapshot_get_zone_in_view(snap, az->view, az->zone) : NULL;
+      if (!e) {   /* not loaded (yet): no counters; a raised alert of it is cleared */
+        alert_limits_t none;
+        memset(&none, 0, sizeof(none));
+        alert_scope_zone(&lc, az->zone, az->view);
+        alert_counters_t zero;
+        memset(&zero, 0, sizeof(zero));
+        (void)alert_check(&az->st, &none, &zero, now, alert_log, &lc);
+        az->st.have_prev = false;
+        continue;
+      }
+      const zone_observatory_t *o = &e->observatory;
+      alert_counters_t zc;
+      memset(&zc, 0, sizeof(zc));
+      zc.queries = atomic_load_explicit(&o->queries_total, memory_order_relaxed);
+      zc.servfail = atomic_load_explicit(&o->responses_servfail, memory_order_relaxed);
+      zc.responses = atomic_load_explicit(&o->responses_noerror, memory_order_relaxed) + atomic_load_explicit(&o->responses_nodata, memory_order_relaxed) +
+                     atomic_load_explicit(&o->responses_nxdomain, memory_order_relaxed) + zc.servfail +
+                     atomic_load_explicit(&o->responses_refused, memory_order_relaxed);
+      zc.rrl_dropped = atomic_load_explicit(&o->rrl_dropped, memory_order_relaxed);
+      zc.xfer_failed = atomic_load_explicit(&o->xfer_failed, memory_order_relaxed);
+      alert_scope_zone(&lc, az->zone, az->view);
+      active += (uint64_t)alert_check(&az->st, &az->lim, &zc, now, alert_log, &lc);
+    }
+    if (snap) release_zone_snapshot(snap);
+  }
+  g_alerts_active = active;
+  g_alerts_zones = g_alerts.nzones;
+  g_alerts_check_us = alerts_clock_us() - t_start;
+  g_alerts.next_run = now + (time_t)interval;
+  release_config_snapshot(cfg);
 }
 
 void *control_thread_func(void *arg) {
@@ -4578,6 +4928,76 @@ void *control_thread_func(void *arg) {
               free(obs);
               if (active_cfg) release_config_snapshot(active_cfg);
               if (snap) release_zone_snapshot(snap);
+            } else if (strcmp(cmd, "stats") == 0) {
+              /* karictl stats: the sums over every zone and the counters of no zone (one walk of the zone directories) */
+              zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
+              karidns_stats_total_t tot;
+              stats_collect_totals(snap, &tot);
+              if (snap) release_zone_snapshot(snap);
+              uint8_t reply[3 + sizeof(tot)];
+              memcpy(reply, "OK ", 3);
+              memcpy(reply + 3, &tot, sizeof(tot));
+              (void)ctl_send_all(cfd, reply, sizeof(reply));
+            } else if (strcmp(cmd, "obspage") == 0 && arg) {
+              /* obspage <limit> <pattern|-> <cursor|->: one page of the per-zone statistics, found from the cursor in O(page) (obspage_select()),
+               * so that no reply holds all zones and no page walks the directory.  Reply "OK <n> <cursor|->\n" and n snapshots; cursor "-" = the end */
+              char *pat = NULL, *cursor = NULL;
+              char *save = view_arg;
+              char *tokv[2] = {NULL, NULL};
+              for (int ti = 0; ti < 2 && save; ti++) {
+                tokv[ti] = save;
+                char *sp = strchr(save, ' ');
+                if (sp) {
+                  *sp = '\0';
+                  save = sp + 1;
+                  while (*save == ' ') save++;
+                } else {
+                  save = NULL;
+                }
+              }
+              if (tokv[0] && strcmp(tokv[0], "-") != 0) pat = tokv[0];
+              if (tokv[1] && strcmp(tokv[1], "-") != 0) cursor = tokv[1];
+              char *lend = NULL;
+              unsigned long lim = strtoul(arg, &lend, 10);
+              /* a glob with many '*' takes exponential time to refuse a name (fnmatch() backtracks) */
+              size_t stars = 0;
+              for (const char *pp = pat; pp && *pp; pp++) stars += (*pp == '*');
+              if (stars > 4) {
+                static const char many[] = "ERROR pattern has more than 4 '*'\n";
+                (void)ctl_send_all(cfd, many, sizeof(many) - 1);
+              } else if (!tokv[1] || !*arg || *lend != '\0' || lim == 0 || lim > KARIDNS_OBSPAGE_MAX) {
+                static const char usage[] = "ERROR usage: obspage <limit 1-5000> <pattern|-> <cursor|->\n";
+                (void)ctl_send_all(cfd, usage, sizeof(usage) - 1);
+              } else {
+                zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
+                server_config_t *active_cfg = acquire_config_snapshot();
+                const zone_db_entry_t **page = NULL;
+                size_t pn = 0;
+                char next[KARIDNS_OBSPAGE_CURSOR_MAX];
+                int prc = obspage_select(snap, pat, cursor, lim, &page, &pn, next, sizeof(next));
+                if (prc == OBSPAGE_OOM) {
+                  (void)ctl_send_all(cfd, "ERROR out of memory\n", 20);
+                } else if (prc == OBSPAGE_STALE) {
+                  static const char stale[] = "ERROR cursor is stale: the zones were reloaded, start the listing again\n";
+                  (void)ctl_send_all(cfd, stale, sizeof(stale) - 1);
+                } else {
+                  char resp_hdr[96];
+                  int hlen = snprintf(resp_hdr, sizeof(resp_hdr), "OK %zu %s\n", pn, next[0] ? next : "-");
+                  const int64_t pdeadline = park_now_ms() + CTL_REPLY_MS;
+                  bool pok = ctl_send_until(cfd, resp_hdr, (size_t)hlen, pdeadline);
+                  for (size_t k = 0; pok && k < pn; k++) {
+                    zone_observatory_snapshot_t snap_item;
+                    memset(&snap_item, 0, sizeof(snap_item));
+                    rcu_aux_read_lock();
+                    fill_observatory_snapshot(page[k], active_cfg, &snap_item);
+                    rcu_aux_read_unlock();
+                    pok = ctl_send_until(cfd, &snap_item, sizeof(snap_item), pdeadline);
+                  }
+                }
+                free(page);
+                if (active_cfg) release_config_snapshot(active_cfg);
+                if (snap) release_zone_snapshot(snap);
+              }
             } else if (strcmp(cmd, "notify") == 0 && arg) {
               char canon_buf[256];
               const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
@@ -4762,6 +5182,7 @@ void *control_thread_func(void *arg) {
         control_park_timeouts(now);
         control_zone_notify_queue(); /* D1a step 7: NOTIFY of zones whose data is out of memory */
         notify_retransmit_due(now); /* RFC 1996 §3.6: 応答の無い NOTIFY の再送 */
+        alerts_tick(now);           /* 0.6.1: options / zone alerts { } (does its work once an interval) */
 
         if (gc_has_unstarted()) gc_start_pending();       /* a snapshot cleanup thread that could not be started is tried again */
         server_config_t *active = acquire_config_snapshot();

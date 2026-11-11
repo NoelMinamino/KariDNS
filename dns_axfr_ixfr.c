@@ -1808,6 +1808,11 @@ void *axfr_bg_thread_func(void *arg) {
   xfr_run_t run;
   xfr_run_primaries(ctx->nprim, xfr_try_primary, ctx, &run);
   if (ctx->entry) {
+    /* karictl stats / alerts transfer-failures-above: the refresh failed at every primary that was asked (an up-to-date or "behind" answer is not a failure) */
+    if (run.tried > 0 && run.failed == run.tried) {
+      atomic_fetch_add_explicit(&ctx->entry->observatory.xfer_failed, 1, memory_order_relaxed);
+      atomic_fetch_add_explicit(&g_xfer_failed_total, 1, memory_order_relaxed);
+    }
     if (run.tried == 0 && run.deferred > 0) {
       /* every primary was at its transfers-per-ns quota: look again at the next tick instead of waiting for the retry time */
       atomic_store_explicit(&ctx->entry->next_check, time(NULL) + 1, memory_order_release);

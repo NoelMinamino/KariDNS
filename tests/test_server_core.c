@@ -1674,6 +1674,57 @@ static void test_control_socket_thread_and_commands(void) {
     assert(len > 0);
     assert(strncmp(out, "OK 2\n", 5) == 0);
 
+    /* 0.6.1 karictl stats: the totals, and pages of zones from a cursor (directory order: the test does not depend on it) */
+    {
+        static char big[8192];
+        len = run_ctrl_cmd(&sun, secret_key, "stats\n", big, sizeof(big));
+        assert(len == (int)(3 + sizeof(karidns_stats_total_t)) && strncmp(big, "OK ", 3) == 0);
+        karidns_stats_total_t tot;
+        memcpy(&tot, big + 3, sizeof(tot));
+        assert(tot.zones == 2);
+        zone_observatory_snapshot_t s1, s2;
+        char c1[64];
+        /* a page of one: the header is "OK 1 <cursor>\n", then one snapshot; the next page brings the other zone and the end ("-") */
+        len = run_ctrl_cmd(&sun, secret_key, "obspage 1 - -\n", big, sizeof(big));
+        assert(strncmp(big, "OK 1 ", 5) == 0);
+        char *nl = strchr(big, '\n');
+        assert(nl && len == (int)(nl - big) + 1 + (int)sizeof(s1));
+        *nl = '\0';
+        snprintf(c1, sizeof(c1), "%s", big + 5);
+        assert(strcmp(c1, "-") != 0);
+        memcpy(&s1, nl + 1, sizeof(s1));
+        char cmdline[160];
+        snprintf(cmdline, sizeof(cmdline), "obspage 1 - %s\n", c1);
+        len = run_ctrl_cmd(&sun, secret_key, cmdline, big, sizeof(big));
+        nl = strchr(big, '\n');
+        assert(strncmp(big, "OK 1 ", 5) == 0 && nl && len == (int)(nl - big) + 1 + (int)sizeof(s2));
+        memcpy(&s2, nl + 1, sizeof(s2));
+        assert(strcmp(s1.domain, s2.domain) != 0);
+        assert((strcmp(s1.domain, "example.com.") == 0) != (strcmp(s2.domain, "example.com.") == 0));
+        /* both in one page: the end */
+        len = run_ctrl_cmd(&sun, secret_key, "obspage 5 - -\n", big, sizeof(big));
+        assert(strncmp(big, "OK 2 -\n", 7) == 0 && len == 7 + 2 * (int)sizeof(s1));
+        len = run_ctrl_cmd(&sun, secret_key, "obspage 5 SLAVE.* -\n", big, sizeof(big));   /* a glob, any case, with or without the root label */
+        assert(strncmp(big, "OK 1 -\n", 7) == 0 && len == 7 + (int)sizeof(s1));
+        len = run_ctrl_cmd(&sun, secret_key, "obspage 5 nomatch* -\n", big, sizeof(big));
+        assert(len == 7 && strncmp(big, "OK 0 -\n", 7) == 0);
+        len = run_ctrl_cmd(&sun, secret_key, "obspage 5 a*b*c*d*e*f -\n", big, sizeof(big));   /* (fnmatch() backtracks: at most 4 stars) */
+        assert(len > 0 && strncmp(big, "ERROR pattern has more than 4", 29) == 0);
+        len = run_ctrl_cmd(&sun, secret_key, "obspage 5 *e*x*a*m -\n", big, sizeof(big));   /* four stars are fine: matches example.com. */
+        assert(strncmp(big, "OK 1 -\n", 7) == 0 && len == 7 + (int)sizeof(s1));
+        /* a cursor that does not fit the directories is refused, never skipped: garbage, a view that is not there, a table of another size */
+        const char *stale[] = { "obspage 5 - nonsense\n", "obspage 5 - 7.0.0\n", "obspage 5 - 0.0.1234\n", "obspage 5 - 0.9999999.1\n" };
+        for (size_t bi = 0; bi < sizeof(stale) / sizeof(stale[0]); bi++) {
+            len = run_ctrl_cmd(&sun, secret_key, stale[bi], big, sizeof(big));
+            assert(len > 0 && strncmp(big, "ERROR cursor is stale", 21) == 0);
+        }
+        const char *bad_pages[] = { "obspage 0 - -\n", "obspage x - -\n", "obspage 5001 - -\n", "obspage 5\n", "obspage 5 -\n" };
+        for (size_t bi = 0; bi < sizeof(bad_pages) / sizeof(bad_pages[0]); bi++) {
+            len = run_ctrl_cmd(&sun, secret_key, bad_pages[bi], big, sizeof(big));
+            assert(len > 0 && strncmp(big, "ERROR usage: obspage", 20) == 0);
+        }
+    }
+
     /* karictl rollback <zone> [view] [local]: the refusals (a zone with nothing kept, a secondary, a catalog zone, a program zone), the words of the
      * usage errors, and what zonestatus says about a rolled-back zone */
     len = run_ctrl_cmd(&sun, secret_key, "rollback example.com.\n", out, sizeof(out));
@@ -6805,6 +6856,209 @@ static void test_server_core_notify_tsig_key_matching_and_transfer_bg_ctx(void) 
     printf("  -> NOTIFY TSIG matching & AXFR bg context passed.\n");
 }
 
+/* 0.6.1: alert_check() -- the baseline, raise once, clear once, no repeat, counter resets, the ratio floor, a limit that leaves */
+typedef struct {
+    int raised[ALERT_KIND_COUNT], cleared[ALERT_KIND_COUNT], removed[ALERT_KIND_COUNT];
+    double last_value[ALERT_KIND_COUNT];
+} alert_rec_t;
+static void alert_rec_fn(void *ctx, int event, alert_kind_t kind, double value, double limit) {
+    alert_rec_t *r = ctx;
+    (void)limit;
+    if (event == ALERT_EV_RAISED) r->raised[kind]++;
+    else if (event == ALERT_EV_CLEARED) r->cleared[kind]++;
+    else r->removed[kind]++;
+    r->last_value[kind] = value;
+}
+static void test_alert_check(void) {
+    printf("[TEST] Server Core: alert_check (baseline, raise once, clear once, resets, floor, removal)...\n");
+    alert_state_t st;
+    alert_rec_t rec;
+    alert_limits_t lim;
+    alert_counters_t c;
+    memset(&st, 0, sizeof(st));
+    memset(&rec, 0, sizeof(rec));
+    memset(&lim, 0, sizeof(lim));
+    memset(&c, 0, sizeof(c));
+    lim.set[ALERT_QPS_ABOVE] = true;            lim.limit[ALERT_QPS_ABOVE] = 100;
+    lim.set[ALERT_SERVFAIL_RATIO_ABOVE] = true; lim.limit[ALERT_SERVFAIL_RATIO_ABOVE] = 5;
+    lim.set[ALERT_RRL_DROPS_ABOVE] = true;      lim.limit[ALERT_RRL_DROPS_ABOVE] = 10;
+    lim.set[ALERT_TRANSFER_FAILURES_ABOVE] = true; lim.limit[ALERT_TRANSFER_FAILURES_ABOVE] = 0;
+    lim.set[ALERT_RELOAD_FAILURES_ABOVE] = true;   lim.limit[ALERT_RELOAD_FAILURES_ABOVE] = 0;
+
+    /* the first call only takes the starting values, whatever the counters are */
+    c.queries = 1000000; c.responses = 1000000; c.servfail = 900000; c.rrl_dropped = 777; c.xfer_failed = 5; c.reload_failed = 5;
+    assert(alert_check(&st, &lim, &c, 1000, alert_rec_fn, &rec) == 0 && st.have_prev);
+    for (int k = 0; k < ALERT_KIND_COUNT; k++) assert(!rec.raised[k]);
+    /* 60 s later: 3000 queries (50/s), 300 responses of which 6 SERVFAIL (2 %), 10 drops (not above 10), no failures: nothing */
+    c.queries += 3000; c.responses += 300; c.servfail += 6; c.rrl_dropped += 10;
+    assert(alert_check(&st, &lim, &c, 1060, alert_rec_fn, &rec) == 0);
+    for (int k = 0; k < ALERT_KIND_COUNT; k++) assert(!rec.raised[k] && !rec.cleared[k]);
+    /* 60 s: 12000 queries = 200/s, 5 % is not above 5, 11 drops, a failed refresh, a failed reload: four alerts */
+    c.queries += 12000; c.responses += 200; c.servfail += 10; c.rrl_dropped += 11; c.xfer_failed += 1; c.reload_failed += 2;
+    assert(alert_check(&st, &lim, &c, 1120, alert_rec_fn, &rec) == 4);
+    assert(rec.raised[ALERT_QPS_ABOVE] == 1 && rec.last_value[ALERT_QPS_ABOVE] == 200.0);
+    assert(rec.raised[ALERT_RRL_DROPS_ABOVE] == 1 && rec.last_value[ALERT_RRL_DROPS_ABOVE] == 11.0);
+    assert(rec.raised[ALERT_TRANSFER_FAILURES_ABOVE] == 1 && rec.raised[ALERT_RELOAD_FAILURES_ABOVE] == 1 && rec.last_value[ALERT_RELOAD_FAILURES_ABOVE] == 2.0);
+    assert(rec.raised[ALERT_SERVFAIL_RATIO_ABOVE] == 0);
+    /* still above: no second line, the count stays */
+    c.queries += 12000; c.responses += 200; c.servfail += 40; c.rrl_dropped += 50; c.xfer_failed += 3; c.reload_failed += 1;
+    assert(alert_check(&st, &lim, &c, 1180, alert_rec_fn, &rec) == 5);   /* the SERVFAIL ratio (20 %) joins; the others are not raised again */
+    assert(rec.raised[ALERT_QPS_ABOVE] == 1 && rec.raised[ALERT_RRL_DROPS_ABOVE] == 1 && rec.raised[ALERT_SERVFAIL_RATIO_ABOVE] == 1);
+    assert(rec.last_value[ALERT_SERVFAIL_RATIO_ABOVE] == 20.0);
+    /* quiet: everything is cleared, once; a counter that went back (a replaced zone) counts as the new value, not a huge number */
+    c.queries = 50; c.responses = 40; c.servfail = 0; c.rrl_dropped = 0; c.xfer_failed = 0; c.reload_failed = 0;
+    assert(alert_check(&st, &lim, &c, 1240, alert_rec_fn, &rec) == 0);
+    for (int k = 0; k < ALERT_KIND_COUNT; k++) assert(rec.cleared[k] == 1);
+    assert(alert_check(&st, &lim, &c, 1300, alert_rec_fn, &rec) == 0);
+    for (int k = 0; k < ALERT_KIND_COUNT; k++) assert(rec.cleared[k] == 1 && rec.raised[k] <= 1);
+    /* the ratio needs ALERT_RATIO_MIN_RESPONSES responses in the interval: 5 responses, all SERVFAIL, is not an alert */
+    c.queries += 5; c.responses += 5; c.servfail += 5;
+    assert(alert_check(&st, &lim, &c, 1360, alert_rec_fn, &rec) == 0);
+    assert(rec.raised[ALERT_SERVFAIL_RATIO_ABOVE] == 1);
+    /* an alert that is raised when its limit leaves the configuration is cleared with its own event; a block without limits forgets the baseline */
+    c.queries += 12000;
+    assert(alert_check(&st, &lim, &c, 1420, alert_rec_fn, &rec) == 1);
+    alert_limits_t none;
+    memset(&none, 0, sizeof(none));
+    assert(alert_check(&st, &none, &c, 1480, alert_rec_fn, &rec) == 0);
+    assert(rec.removed[ALERT_QPS_ABOVE] == 1 && !st.have_prev && !st.active[ALERT_QPS_ABOVE]);
+    assert(alert_check(&st, &lim, &c, 1540, alert_rec_fn, &rec) == 0 && st.have_prev);   /* a new baseline: no verdict yet */
+    /* the same second twice, and a clock that went back: no division by zero, a new baseline */
+    assert(alert_check(&st, &lim, &c, 1540, alert_rec_fn, &rec) == 0);
+    assert(alert_check(&st, &lim, &c, 100, alert_rec_fn, &rec) == 0 && st.prev_time == 100);
+}
+
+static void *srv_count_thread(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 1000; i++) server_response_count(2, i % 2, i % 5 != 0);
+    return NULL;
+}
+
+/* 0.6.1: obspage_select() (cursor, glob, limit, stale cursors) and stats_collect_totals() on a snapshot of two views */
+static void test_obspage_select_and_totals(void) {
+    printf("[TEST] Server Core: obspage_select (cursor paging in directory order, glob, stale cursor), stats_collect_totals, server counters...\n");
+    enum { N = 23 };
+    static zone_db_entry_t zs[N];
+    zone_db_entry_t *va[N], *vb[N];
+    size_t na = 0, nb = 0;
+    memset(zs, 0, sizeof(zs));
+    for (int i = 0; i < N; i++) {
+        int k = (i * 7) % N;   /* scrambled: 7 and 23 are coprime */
+        snprintf(zs[i].domain, sizeof(zs[i].domain), "z%02d.%s.", k, (k % 5 == 0) ? "five" : "other");
+        snprintf(zs[i].view_name, sizeof(zs[i].view_name), "%s", (k % 4 == 0) ? "zeta" : "alpha");
+        atomic_init(&zs[i].observatory.queries_total, (uint64_t)(k + 1));
+        atomic_init(&zs[i].observatory.tcp_queries, (uint64_t)(k % 3));
+        atomic_init(&zs[i].observatory.responses_servfail, 1);
+        atomic_init(&zs[i].observatory.xfer_failed, 2);
+        if (k % 4 == 0) vb[nb++] = &zs[i]; else va[na++] = &zs[i];
+    }
+    view_snapshot_t views[2];
+    memset(views, 0, sizeof(views));
+    views[0].name = "zeta";
+    views[1].name = "alpha";
+    assert(view_set_entries(&views[0], vb, nb) && view_set_entries(&views[1], va, na));
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = views;
+    snap.view_count = 2;
+    atomic_init(&snap.reader_count, 1);
+
+    /* every page of 4 from the start: every zone exactly once, the last page says "end" */
+    const zone_db_entry_t **page = NULL;
+    size_t n = 0, seen = 0;
+    char cur[KARIDNS_OBSPAGE_CURSOR_MAX] = "", next[KARIDNS_OBSPAGE_CURSOR_MAX];
+    bool hit[N];
+    memset(hit, 0, sizeof(hit));
+    int pages = 0;
+    do {
+        assert(obspage_select(&snap, NULL, cur[0] ? cur : NULL, 4, &page, &n, next, sizeof(next)) == 0);
+        assert(n <= 4);
+        for (size_t i = 0; i < n; i++) {
+            int idx = (int)(page[i] - zs);
+            assert(idx >= 0 && idx < N && !hit[idx]);
+            hit[idx] = true;
+            seen++;
+        }
+        free(page);
+        snprintf(cur, sizeof(cur), "%s", next);
+        pages++;
+    } while (cur[0] && pages < 100);
+    assert(seen == N && !cur[0]);
+    /* the same listing in one page, and a page that is longer than the zones */
+    assert(obspage_select(&snap, NULL, NULL, 100, &page, &n, next, sizeof(next)) == 0 && n == N && !next[0]);
+    free(page);
+    /* a glob (any case, with and without the root label), more than one page of matches, no match */
+    assert(obspage_select(&snap, "Z00.FIVE", NULL, 10, &page, &n, next, sizeof(next)) == 0 && n == 1 && !next[0] && strcmp(page[0]->domain, "z00.five.") == 0);
+    free(page);
+    assert(obspage_select(&snap, "z*.five.", NULL, 2, &page, &n, next, sizeof(next)) == 0 && n == 2 && next[0]);   /* z00 z05 z10 z15 z20 */
+    free(page);
+    size_t five = 0;
+    snprintf(cur, sizeof(cur), "%s", "");
+    do {
+        assert(obspage_select(&snap, "z*.five.", cur[0] ? cur : NULL, 2, &page, &n, next, sizeof(next)) == 0);
+        five += n;
+        free(page);
+        snprintf(cur, sizeof(cur), "%s", next);
+    } while (cur[0]);
+    assert(five == 5);
+    assert(obspage_select(&snap, "nothing*", NULL, 2, &page, &n, next, sizeof(next)) == 0 && n == 0 && !next[0]);
+    free(page);
+    assert(obspage_select(&snap, NULL, NULL, 0, &page, &n, next, sizeof(next)) == 0 && n == 0 && !next[0] && page == NULL);
+    assert(obspage_select(NULL, NULL, NULL, 3, &page, &n, next, sizeof(next)) == 0 && n == 0 && !next[0]);
+    free(page);
+    /* cursors that do not fit the directories are refused, not skipped over */
+    assert(obspage_select(&snap, NULL, "bogus", 3, &page, &n, next, sizeof(next)) == OBSPAGE_STALE);
+    assert(obspage_select(&snap, NULL, "5.0.0", 3, &page, &n, next, sizeof(next)) == OBSPAGE_STALE);          /* no such view */
+    assert(obspage_select(&snap, NULL, "0.0.1", 3, &page, &n, next, sizeof(next)) == OBSPAGE_STALE);          /* another table */
+    assert(obspage_select(NULL, NULL, "0.0.0", 3, &page, &n, next, sizeof(next)) == OBSPAGE_STALE);
+    assert(obspage_select(&snap, NULL, NULL, 1, &page, &n, next, sizeof(next)) == 0 && next[0]);
+    free(page);
+    {   /* a cursor of a table that was replaced by a bigger one (a reload that built new directories) */
+        char old[KARIDNS_OBSPAGE_CURSOR_MAX];
+        snprintf(old, sizeof(old), "%s", next);
+        view_clear_dir(&views[0]);
+        view_clear_dir(&views[1]);
+        zone_db_entry_t *vb2[N];
+        for (size_t i = 0; i < nb; i++) vb2[i] = vb[i];
+        assert(view_set_entries(&views[0], vb2, nb) && view_set_entries(&views[1], va, na));
+        assert(obspage_select(&snap, NULL, old, 3, &page, &n, next, sizeof(next)) == OBSPAGE_STALE || n > 0);   /* (a table may be rebuilt at the same address) */
+        if (n) free(page);
+    }
+
+    /* the totals: sums of the zones, plus the server-wide counters */
+    uint64_t resp0[16], unz0[16], tcp0;
+    server_responses_get(resp0, unz0, &tcp0);
+    {   /* more threads than slots: nothing is lost */
+        pthread_t th[20];
+        for (int i = 0; i < 20; i++) assert(pthread_create(&th[i], NULL, srv_count_thread, NULL) == 0);
+        for (int i = 0; i < 20; i++) pthread_join(th[i], NULL);
+        uint64_t r1[16], u1[16], t1;
+        server_responses_get(r1, u1, &t1);
+        assert(r1[2] == resp0[2] + 20 * 1000 && u1[2] == unz0[2] + 20 * 200 && t1 == tcp0 + 20 * 500);
+        server_responses_get(resp0, unz0, &tcp0);
+    }
+    for (int i = 0; i < 7; i++) server_response_count(5, false, false);
+    server_response_count(1, false, false);
+    server_response_count(1 + 16, true, true);   /* (an RCODE is 4 bits: 17 counts as 1) */
+    uint64_t rf0 = atomic_load(&g_reload_failures_total);
+    atomic_fetch_add(&g_reload_failures_total, 3);
+    karidns_stats_total_t t;
+    stats_collect_totals(&snap, &t);
+    uint64_t want_q = 0, want_tcp = 0;
+    for (int i = 0; i < N; i++) {
+        int k = (i * 7) % N;
+        want_q += (uint64_t)(k + 1);
+        want_tcp += (uint64_t)(k % 3);
+    }
+    assert(t.zones == N && t.queries_total == want_q && t.tcp_queries == want_tcp && t.responses_servfail == N && t.xfer_failed == 2 * N);
+    assert(t.unzoned_responses[5] == unz0[5] + 7 && t.unzoned_responses[1] == unz0[1] + 1 && t.unzoned_responses[0] == unz0[0] && t.reload_failures == rf0 + 3);
+    stats_collect_totals(NULL, &t);   /* no snapshot: only the server-wide counters */
+    assert(t.zones == 0 && t.queries_total == 0 && t.unzoned_responses[5] == unz0[5] + 7);
+    atomic_store(&g_reload_failures_total, rf0);
+    view_clear_dir(&views[0]);
+    view_clear_dir(&views[1]);
+}
+
 static void test_server_core_rrl_slip_truncation_and_metrics(void) {
     printf("[TEST] Server Core: RRL SLIP truncation and observatory metrics...\n");
 
@@ -6867,6 +7121,8 @@ int main(void) {
     test_log_write_rotated_timestamp_versions();
     test_tcp_pool_and_single_write();
     test_fill_observatory_snapshot();
+    test_alert_check();
+    test_obspage_select_and_totals();
     test_find_configured_domain();
     test_ensure_priv_dir_safe();
     test_server_core_program_zone_reload_fingerprint_and_added();

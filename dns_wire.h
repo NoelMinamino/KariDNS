@@ -698,7 +698,32 @@ typedef struct {
     uint64_t wirecache_entries;
     uint64_t wirecache_bytes;
     char shared_views[128];   /* zone { in-view }: the views that share this zone with its owner view, "a, b" (""  = none) */
+    uint64_t xfer_failed;     /* 0.6.1: refreshes of this secondary that failed at every primary asked (karictl stats, alerts) */
 } zone_observatory_snapshot_t;
+
+/* ---- karictl stats (0.6.1) ----
+ * `stats` returns "OK " and one karidns_stats_total_t: the sums of the counters of every zone the server holds (one walk of the zone
+ * directories, in the control thread) and the server-wide counters (responses of no zone, failed reloads).  `obspage <limit> <pattern|-> <cursor|->`
+ * returns "OK <n> <cursor|->\n" and n zone_observatory_snapshot_t, the zones from the cursor on in the order of the zone tables (a cursor
+ * is "<view>.<slot>.<table id>", found again in O(page); "-" = the end; "ERROR cursor is stale ..." when the tables were rebuilt). */
+#define KARIDNS_STATS_RCODES 16
+#define KARIDNS_OBSPAGE_MAX 5000      /* zones in one page */
+#define KARIDNS_OBSPAGE_CURSOR_MAX 64 /* longest cursor text */
+typedef struct {
+    uint64_t zones;                              /* zones walked (each shared zone once) */
+    uint64_t queries_total, tcp_queries;
+    uint64_t responses_noerror, responses_nodata, responses_nxdomain, responses_servfail, responses_refused;   /* of the zones */
+    uint64_t edns_queries, dnssec_do_queries, ecs_queries;
+    uint64_t rrl_dropped, rrl_slipped;           /* of the zones (status has the server's) */
+    uint64_t notify_sent, notify_ack, axfr_success, ixfr_success, xfer_failed;
+    uint64_t wirecache_hits, wirecache_misses;
+    uint64_t unzoned_responses[KARIDNS_STATS_RCODES];   /* responses to queries no zone answered (REFUSED, FORMERR, NOTIMP, ...), by RCODE */
+    uint64_t reload_failures;                    /* configuration reloads that failed, or left zones unloaded, since the start */
+    uint64_t alerts_active;                      /* alerts (server and zones) that are raised now */
+    uint64_t alerts_zones;                       /* zones with an alerts block that the last check looked at */
+    uint64_t alerts_check_us;                    /* how long the last check took (microseconds) */
+    uint64_t alerts_build_us;                    /* how long the last build of the list of those zones took (when the configuration was read) */
+} karidns_stats_total_t;
 
 /* ---- Extended AXFR records (KariDNS extension): the one encoder, shared by Extended AXFR out (dns_axfr_ixfr.c, from the
  * zone image or the IXFR history) and karidns-dbloader (dns_pdns_reader.c, from the parsed zone).

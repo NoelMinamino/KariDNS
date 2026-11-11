@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 #include <arpa/inet.h>
 #include "dns_log.h"
 #include <fcntl.h>
@@ -1340,6 +1341,7 @@ void free_server_config_fields(server_config_t *cfg) {
   free_database_config(&cfg->database);
   free_rate_limit_config(&cfg->rrl);
   memset(&cfg->rrl, 0, sizeof(rate_limit_config_t));
+  memset(&cfg->alerts, 0, sizeof(cfg->alerts));
 
   logging_config_free(&cfg->logging);
   for (int j = 0; j < cfg->controls_count; j++) {
@@ -3116,6 +3118,158 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
     }
   }
 
+  return 0;
+}
+
+/* ---- alerts { } (KariDNS, 0.6.1): options { alerts { } } and zone { alerts { } } ----
+ *   alerts {
+ *       interval 60;                        // seconds between checks (options only), 10..3600
+ *       qps-above 200000;                   // queries per second over the interval
+ *       servfail-ratio-above 5;             // percent of the responses of the interval, 0..100
+ *       rrl-drops-above 1000;               // responses dropped by rate-limit in the interval
+ *       transfer-failures-above 0;          // refreshes that failed at every primary in the interval
+ *       reload-failures-above 0;            // failed configuration reloads in the interval (options only)
+ *   };
+ * A limit is a number >= 0 (an alert is raised when the value is above it).  A second alerts block of the same place replaces the first. */
+static const struct { const char *name; bool in_zone; } k_alert_names[ALERT_KIND_COUNT] = {
+  { "qps-above", true }, { "servfail-ratio-above", true }, { "rrl-drops-above", true },
+  { "transfer-failures-above", true }, { "reload-failures-above", false },
+};
+
+const char *alert_kind_name(alert_kind_t k) { return (unsigned)k < ALERT_KIND_COUNT ? k_alert_names[k].name : "?"; }
+bool alert_kind_in_zone(alert_kind_t k) { return (unsigned)k < ALERT_KIND_COUNT && k_alert_names[k].in_zone; }
+
+void alert_limits_for_server(const alerts_config_t *opts, alert_limits_t *out) {
+  memset(out, 0, sizeof(*out));
+  if (!opts) return;
+  for (int k = 0; k < ALERT_KIND_COUNT; k++) {
+    out->set[k] = opts->set[k];
+    out->limit[k] = opts->limit[k];
+  }
+}
+
+void alert_limits_for_zone(const alerts_config_t *opts, const alerts_config_t *zone, alert_limits_t *out) {
+  memset(out, 0, sizeof(*out));
+  for (int k = 0; k < ALERT_KIND_COUNT; k++) {
+    if (!alert_kind_in_zone((alert_kind_t)k)) continue;
+    if (zone && zone->set[k]) {
+      out->set[k] = true;
+      out->limit[k] = zone->limit[k];
+    } else if (opts && opts->set[k]) {
+      out->set[k] = true;
+      out->limit[k] = opts->limit[k];
+    }
+  }
+}
+
+static int alerts_error(token_ctx_t *ctx, dns_diag_code_t code, const char *what, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+static int alerts_error(token_ctx_t *ctx, dns_diag_code_t code, const char *what, const char *fmt, ...) {
+  char msg[300], loc[300];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, ap);
+  va_end(ap);
+  ctx_location(ctx, loc, sizeof(loc));
+  syslog(LOG_ERR, "[Config] %s: %s: %s", loc, what, msg);
+  dns_diag_at(DIAG_ERROR, code, loc, "%s: %s: %s\n", loc, what, msg);
+  if (ctx) ctx->error_occurred = true;
+  return -1;
+}
+
+static int parse_alerts_block(token_ctx_t *ctx, alerts_config_t *a, bool in_zone) {
+  const char *what = in_zone ? "zone alerts" : "options alerts";
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_LBRACE) {
+    conf_error(ctx, what, "expected '{'");
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  memset(a, 0, sizeof(*a));
+  a->configured = true;
+  for (;;) {
+    tok = get_next_token(ctx);
+    if (tok.type == TOKEN_RBRACE) {
+      free_token(&tok);
+      break;
+    }
+    if (tok.type != TOKEN_STRING || !tok.value) {
+      conf_error(ctx, what, "expected a statement name or '}'");
+      free_token(&tok);
+      return -1;
+    }
+    char *key = tok.value;
+    tok.value = NULL;
+    free_token(&tok);
+    int kind = -1;
+    for (int k = 0; k < ALERT_KIND_COUNT; k++)
+      if (strcmp(key, k_alert_names[k].name) == 0) kind = k;
+    bool is_interval = strcmp(key, "interval") == 0;
+    if (!is_interval && kind < 0) {
+      int rc = alerts_error(ctx, DC_CONF_ALERTS_OPTION, what, "unknown statement '%.64s' (interval, qps-above, servfail-ratio-above, rrl-drops-above, transfer-failures-above, reload-failures-above)", key);
+      free(key);
+      return rc;
+    }
+    if (in_zone && (is_interval || !k_alert_names[kind].in_zone)) {
+      int rc = alerts_error(ctx, DC_CONF_ALERTS_OPTION, what, "'%s' can be written in options { alerts { } } only (a zone block has qps-above, servfail-ratio-above, rrl-drops-above and transfer-failures-above)", key);
+      free(key);
+      return rc;
+    }
+    tok = get_next_token(ctx);
+    if (tok.type != TOKEN_STRING || !tok.value) {
+      conf_error(ctx, what, "'%s' needs a number", key);
+      free(key);
+      free_token(&tok);
+      return -1;
+    }
+    char *val = tok.value;
+    tok.value = NULL;
+    free_token(&tok);
+    tok = get_next_token(ctx);
+    if (tok.type != TOKEN_SEMICOLON) {
+      conf_error(ctx, what, "missing ';' after '%s'", key);
+      free(key);
+      free(val);
+      free_token(&tok);
+      return -1;
+    }
+    free_token(&tok);
+    char *end = NULL;
+    double d = strtod(val, &end);
+    bool numeric = val[0] != '\0' && end && *end == '\0' && isfinite(d) && !isspace((unsigned char)val[0]);
+    int rc = 0;
+    if (!numeric) {
+      rc = alerts_error(ctx, DC_CONF_ALERTS_RANGE, what, "%s: '%.64s' is not a number", key, val);
+    } else if (is_interval) {
+      if (d != (double)(uint32_t)d || d < ALERT_INTERVAL_MIN || d > ALERT_INTERVAL_MAX)
+        rc = alerts_error(ctx, DC_CONF_ALERTS_RANGE, what, "interval %s is outside %d..%d seconds", val, ALERT_INTERVAL_MIN, ALERT_INTERVAL_MAX);
+      else
+        a->interval = (uint32_t)d;
+    } else if (d < 0 || (kind == ALERT_SERVFAIL_RATIO_ABOVE && d > 100)) {
+      rc = alerts_error(ctx, DC_CONF_ALERTS_RANGE, what, "%s %s is outside %s", key, val, kind == ALERT_SERVFAIL_RATIO_ABOVE ? "0..100 (percent)" : "0 and above");
+    } else {
+      a->set[kind] = true;
+      a->limit[kind] = d;
+    }
+    free(key);
+    free(val);
+    if (rc != 0) return rc;
+  }
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) {
+    conf_error(ctx, what, "missing ';' after '}'");
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  bool any = a->interval != 0;
+  for (int k = 0; k < ALERT_KIND_COUNT; k++) any = any || a->set[k];
+  if (!any) {
+    char loc[300];
+    ctx_location(ctx, loc, sizeof(loc));
+    syslog(LOG_WARNING, "[Config] %s: %s: the block sets no limit, so nothing is checked", loc, what);
+    dns_diag_at(DIAG_WARNING, DC_CONF_ALERTS_EMPTY, loc, "%s: %s: the block sets no limit, so nothing is checked\n", loc, what);
+  }
   return 0;
 }
 
@@ -5528,6 +5682,12 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
         free_zone_config(zone);
         return -1;
       }
+    } else if (strcmp(key, "alerts") == 0) {
+      if (parse_alerts_block(ctx, &x->alerts, true) != 0) {
+        free(key);
+        free_zone_config(zone);
+        return -1;
+      }
     } else if (strcmp(key, "ecs-tags") == 0) {
       if (parse_ecs_tags_block(ctx, "ecs-tags", &x->ecs_tags, &x->ecs_tag_count) != 0) {
         free(key);
@@ -7866,7 +8026,8 @@ uint32_t control_perm_from_name(const char *name) {
 uint32_t control_command_perm(const char *cmd, bool has_arg) {
   if (!cmd) return CTLP_OTHER;
   if (strcmp(cmd, "reload") == 0) return has_arg ? CTLP_RELOAD_ZONE : CTLP_RELOAD;
-  if (strcmp(cmd, "status") == 0 || strcmp(cmd, "zonestatus") == 0 || strcmp(cmd, "observatory") == 0 || strcmp(cmd, "dbstatus") == 0)
+  if (strcmp(cmd, "status") == 0 || strcmp(cmd, "zonestatus") == 0 || strcmp(cmd, "observatory") == 0 || strcmp(cmd, "dbstatus") == 0 ||
+      strcmp(cmd, "stats") == 0 || strcmp(cmd, "obspage") == 0)
     return CTLP_READ;
   uint32_t p = control_perm_from_name(cmd);
   return p ? p : CTLP_OTHER;
@@ -8228,6 +8389,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           config->blackhole = bh;
         } else if (strcmp(key, "rate-limit") == 0) {
           if (parse_rate_limit_config(ctx, &config->rrl) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "alerts") == 0) {
+          if (parse_alerts_block(ctx, &config->alerts, false) != 0) {
             free(key);
             return -1;
           }

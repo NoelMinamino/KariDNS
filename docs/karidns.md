@@ -278,6 +278,7 @@ Duplicate zones (in the same view or at top level), duplicate views, duplicate k
 | `query-log-max-qps <n>;` | `5000` | Maximum number of query log lines per second, shared by all worker threads (`0` means 5000). Queries over the limit are not logged. |
 | `query-log-buffer-size <n>;` | `32768` | Entries in each worker's query log ring buffer; a power of two between 1024 and 1048576. When a ring is 80 % full, query logging is suspended to protect query processing. |
 | `rate-limit { ... };` | not set (no RRL) | Response Rate Limiting (below). |
+| `alerts { ... };` | not set | Threshold alerts written to syslog (below; KariDNS only). |
 | `dnstap { ... };` | not set | dnstap output (below). |
 
 ### BIND option values (milestone: option value compatibility)
@@ -369,6 +370,52 @@ Differences from BIND: the table has a fixed size of 131072 entries (`min-table-
 | `exempt-clients { <addr/cidr>; ... };` | none | Clients that are never limited. |
 
 Negative or non-numeric values are ignored with a warning; unknown keys are ignored with a warning.
+
+### `alerts { ... }` (in `options` or `zone`; KariDNS only, 0.6.1)
+
+Threshold alerts. The control thread reads the counters every `interval` seconds, works out what happened since the last check, and writes **one** line to syslog (category `general`, `[Control]`) when a value goes above its limit and **one** line when it is back at or below it. While a value stays above the limit nothing more is written. The alerts read counters only: the server-wide ones (one add per response in the thread's own cache line, summed by the control thread) and the zone counters of the zones that have an `alerts` block. No alerts are checked unless an `alerts { }` block with at least one limit is written. A check walks no zone table: the server's own check reads the server-wide counters, and each zone that has an `alerts` block (kept in a list that is built when the configuration is read) costs one lookup.
+
+```
+options {
+    alerts {
+        interval 60;                  // seconds between checks, 10..3600 (options only)
+        qps-above 200000;             // queries per second over the interval
+        servfail-ratio-above 5;       // percent of the responses of the interval, 0..100
+        rrl-drops-above 1000;         // responses dropped by rate-limit in the interval
+        transfer-failures-above 0;    // secondary refreshes that failed at every primary, in the interval
+        reload-failures-above 0;      // reloads that failed or left zones unloaded, in the interval (options only)
+    };
+};
+zone "example.test" {
+    type primary;
+    file "example.test.zone";
+    alerts {                          // this zone alone; a name written here replaces the options value for the zone
+        qps-above 5000;
+        servfail-ratio-above 1;
+    };
+};
+```
+
+| Statement | Compared with | Notes |
+|---|---|---|
+| `interval <seconds>;` | | Default 60. `options` only. A change takes effect with the next configuration; each reload starts the comparison again (the first check after a start or a reload only takes the starting values). |
+| `qps-above <n>;` | queries / seconds of the interval | Server: all queries (answered for a zone or not). Zone: the queries counted for that zone. |
+| `servfail-ratio-above <percent>;` | SERVFAIL responses / all responses of the interval, in percent | Fractions are allowed (`0.5`). Checked only when at least 100 responses were sent in the interval; with fewer the ratio is taken as 0. |
+| `rrl-drops-above <n>;` | responses dropped by `rate-limit` in the interval | Server: the server's total (includes drops for queries no zone answered). Zone: the zone's count. |
+| `transfer-failures-above <n>;` | secondary refreshes in the interval that failed at every primary asked | An answer "up to date" or "primary is behind" is not a failure. Server: all zones. |
+| `reload-failures-above <n>;` | reloads (`SIGHUP`, `karictl reload`, `reconfig`) that failed or loaded with zone errors | `options` only. Not counted: a reload postponed because readers of the old configuration remained. |
+
+An alert is raised when the value is **above** the limit (`transfer-failures-above 0` raises at the first failure). In the `options` block the limits are the server's. In a `zone` block they apply to that zone; a name not written there falls back to the `options` value of the same name, so `options { alerts { qps-above 100000; } }` with `zone { alerts { servfail-ratio-above 1; } }` checks the zone for both. Only zones with an `alerts` block (and a limit after the fallback) are checked individually, up to 4096 of them; a database zone cannot carry an `alerts` block (its settings text does not accept the statement). A counter that goes back (a zone that was replaced by a reload starts at 0 again) counts as new, so an interval right after a reload under-counts rather than being negative.
+
+Log lines (the limit is shown as written):
+
+```
+[Control] alert: qps-above on server: 250031.4 queries/s above 200000
+[Control] alert: servfail-ratio-above on zone example.test (view default): 7.20% above 1
+[Control] alert cleared: qps-above on server: 1211.0 queries/s, limit 200000
+```
+
+If the limit is removed from the configuration, or the zone leaves it, while an alert is raised, one `alert cleared: ... no longer checked ...` line is written. `karictl stats` shows how many alerts are raised (`karidns_alerts_active`). `karicheck conf` reports an unknown statement (`conf.alerts.option`), a bad value or an `interval` outside 10..3600 (`conf.alerts.range`) and a block with no limit (`conf.alerts.empty`).
 
 ### `dnstap { ... }` (top level or in `options`)
 
@@ -609,7 +656,7 @@ control-channel {
 };
 ```
 
-- A key without `read-only` (or with `read-only no`) has full power. `read-only yes` has BIND's meaning (`controls { ... read-only yes; }`): only `status`, `zonestatus`, `observatory` and `dbstatus`. `allow-commands { ... }` is a KariDNS extension that adds commands to a read-only key; without `read-only yes` it is an error, because a key that is not read-only can run everything already. The clauses may be written in either order.
+- A key without `read-only` (or with `read-only no`) has full power. `read-only yes` has BIND's meaning (`controls { ... read-only yes; }`): only `status`, `zonestatus`, `observatory`, `dbstatus` and `stats`. `allow-commands { ... }` is a KariDNS extension that adds commands to a read-only key; without `read-only yes` it is an error, because a key that is not read-only can run everything already. The clauses may be written in either order.
 - The names that `allow-commands` takes (nothing else is accepted, the test-only commands included):
 
   | Name | Allows |
@@ -1083,6 +1130,7 @@ An element is an IPv4/IPv6 address, a prefix, `any`, `none`, `localhost`, `local
 | `allow-update { <acl>; key "<name>"; ... };` | master | Enables Dynamic Update (RFC 2136) for matching clients or TSIG keys; replaces the `view` and `options` statements. The list is evaluated in BIND's order (first match decides) unless `update-acl-match` is written. Updates are kept in memory only. An update sent to a secondary zone is answered with REFUSED (EDE 18) whether or not the client matches `allow-update`: KariDNS does not forward updates to the primary (RFC 2136 §6); a warning is printed at load time. Processing follows RFC 2136 §3: an update whose zone section does not name a zone of the client's view gets NOTAUTH; update RRs that §3.4.2 says to ignore (a CNAME next to other data or other data next to a CNAME, an SOA whose serial is not newer, deletion of the apex SOA, of the apex NS RRset or of the last apex NS) are ignored and the rest of the update is applied; an error anywhere leaves the zone unchanged. An update that replaces the SOA with a newer serial keeps that serial; any other change increments the serial by one. An update that changes nothing (only prerequisites, or only ignored or already present records) answers NOERROR without changing the serial or sending NOTIFY. |
 | `catalog-zone yes;` | master, slave | Marks the zone as a catalog zone (RFC 9432, schema version 2: exactly one `version.<zone> TXT "2"` is required; a second version TXT record makes the catalog zone broken and it is not processed, RFC 9432 §4.1, §5.1). Member zones listed under `zones.<zone>` are served as secondary zones that transfer from the catalog zone's first `masters` entry. |
 | `rate-limit { ... };` | all | Per-zone RRL block (replaces the server-wide one). |
+| `alerts { ... };` | all (not database zones) | Per-zone threshold alerts: `qps-above`, `servfail-ratio-above`, `rrl-drops-above`, `transfer-failures-above`; a name written here replaces the `options` value for the zone (see `alerts`). |
 | `ecs-tags { ... };`, `location-tags { ... };` | master, slave | Per-zone tag definitions. |
 | `ecs-trusted-resolvers { ... };` | master, slave | Per-zone trusted ECS resolvers. |
 | `primary-settings yes\|no;` | slave | `yes` (default): use the settings the primary sends with the zone (Extended AXFR version 3: `allow-transfer`, `transfer-acl-match`, `ecs-trusted-resolvers`, `additional-from-auth`, `zone-udp-bufsize`); a statement written in this `zone {}` still wins. `no`: ignore them. See "Secondary zones: Extended AXFR version 3 and the settings of the primary". |

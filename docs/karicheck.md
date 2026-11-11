@@ -406,6 +406,9 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `conf.database.server-id-sqlite` | warning | server-id is ignored with sqlite3 |
 | `conf.database.server-id-chars` | warning | server-id has characters other than letters, digits and . - _ : |
 | `conf.database.server-id-host` | warning | server-id is not set and the host name does not fit |
+| `conf.alerts.option` | error | an unknown statement in alerts { }, or interval / reload-failures-above in the alerts { } of a zone |
+| `conf.alerts.range` | error | an alerts { } value is not a number, is negative, is above 100 for servfail-ratio-above, or is outside 10..3600 for interval |
+| `conf.alerts.empty` | warning | an alerts { } block sets no limit, so nothing is checked |
 | `conf.database.alias-resolver` | warning | an alias-resolver with server-id: servers sharing a database can answer ALIAS names differently |
 | `zone.not-found` | error | the zone is not in the configuration |
 | `zone.skipped` | info | a zone without a zone file is not checked |

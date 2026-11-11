@@ -2333,6 +2333,40 @@ STATIC_TEST ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss
 }
 
 _Thread_local query_rrl_info_t t_query_rrl_info;
+/* Server-wide response counters (karictl stats, alerts): every response by RCODE, those of queries no zone answered, and the TCP ones.  The zone
+ * observatory counters would need a walk of all zones to be summed.  Each thread adds to its own slot (64-byte aligned, 320 bytes long: no two
+ * threads share a cache line unless there are more than SRV_SLOTS of them) and the control thread sums them. */
+#define SRV_SLOTS 16
+typedef struct {
+  _Atomic uint64_t resp[16];
+  _Atomic uint64_t unzoned[16];
+  _Atomic uint64_t tcp;
+  uint64_t pad[7];
+} srv_slot_t;
+static srv_slot_t g_srv_slots[SRV_SLOTS] __attribute__((aligned(64)));
+static _Atomic unsigned g_srv_next;
+static _Thread_local unsigned t_srv_slot = UINT_MAX;
+_Atomic uint64_t g_xfer_failed_total;
+
+void server_response_count(unsigned rcode, bool is_tcp, bool zoned) {
+  if (t_srv_slot == UINT_MAX) t_srv_slot = atomic_fetch_add_explicit(&g_srv_next, 1, memory_order_relaxed) % SRV_SLOTS;
+  srv_slot_t *s = &g_srv_slots[t_srv_slot];
+  atomic_fetch_add_explicit(&s->resp[rcode & 15], 1, memory_order_relaxed);
+  if (!zoned) atomic_fetch_add_explicit(&s->unzoned[rcode & 15], 1, memory_order_relaxed);
+  if (is_tcp) atomic_fetch_add_explicit(&s->tcp, 1, memory_order_relaxed);
+}
+
+void server_responses_get(uint64_t resp[16], uint64_t unzoned[16], uint64_t *tcp) {
+  for (int r = 0; r < 16; r++) resp[r] = unzoned[r] = 0;
+  *tcp = 0;
+  for (int s = 0; s < SRV_SLOTS; s++) {
+    for (int r = 0; r < 16; r++) {
+      resp[r] += atomic_load_explicit(&g_srv_slots[s].resp[r], memory_order_relaxed);
+      unzoned[r] += atomic_load_explicit(&g_srv_slots[s].unzoned[r], memory_order_relaxed);
+    }
+    *tcp += atomic_load_explicit(&g_srv_slots[s].tcp, memory_order_relaxed);
+  }
+}
 /* D1a: process_dns_not_ready_routed() is asked whether the query may be parked (see there) */
 static _Thread_local bool t_nr_probe;
 /* X-20: 直前の要求の TSIG の状態 (鍵は設定スナップショット内)。RRL の slip 応答の署名に使う */
@@ -4530,10 +4564,14 @@ int process_dns_query_cap_routed(const uint8_t *req, size_t req_len, uint8_t *re
                                               client_ip, comp_ctx, is_tcp, out_rrl_cfg, snap, cfg, &matched_entry,
                                               route, NULL);
   release_config_snapshot(cfg);
-  if (ret >= DNS_HEADER_SIZE && matched_entry) {
-    uint8_t rcode = res[3] & 0x0F;
-    uint16_t ancount = ((uint16_t)res[6] << 8) | (uint16_t)res[7];
-    record_observatory_response(matched_entry, rcode, ancount);
+  if (ret >= DNS_HEADER_SIZE) {
+    if (matched_entry) {
+      uint8_t rcode = res[3] & 0x0F;
+      uint16_t ancount = ((uint16_t)res[6] << 8) | (uint16_t)res[7];
+      record_observatory_response(matched_entry, rcode, ancount);
+    }
+    /* the server-wide counters (karictl stats, the alerts of options { }): one add in this thread's own cache line */
+    server_response_count(res[3] & 0x0F, is_tcp, matched_entry != NULL);
   }
   return ret;
 }

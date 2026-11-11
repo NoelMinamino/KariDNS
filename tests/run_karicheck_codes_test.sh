@@ -79,6 +79,9 @@ cfix conf.cookie.algorithm 'options { cookie-algorithm aes; };'
 cfix conf.query-log.max-qps 'options { query-log-max-qps abc; };'
 cfix conf.query-log.buffer-size 'options { query-log-buffer-size 1000; };'
 cfix conf.minimal-any-ttl 'options { minimal-any-ttl abc; };'
+cfix conf.alerts.option 'options { alerts { qps-over 5; }; };'
+cfix conf.alerts.range 'options { alerts { interval 5; }; };'
+cfix conf.alerts.empty 'options { alerts { }; };'
 cfix conf.wire-cache.max-records 'options { wire-cache-max-records abc; };'
 cfix conf.acl.transfer-order "key \"k\" { algorithm hmac-sha256; secret \"$SEC\"; }; zone \"a.test\" { type master; file \"/x\"; allow-transfer { 192.0.2.1; key \"k\"; }; };"
 cfix conf.acl.update-order "key \"k\" { algorithm hmac-sha256; secret \"$SEC\"; }; zone \"a.test\" { type master; file \"/x\"; allow-update { !192.0.2.9; key \"k\"; }; };"

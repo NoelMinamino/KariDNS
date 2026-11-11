@@ -99,6 +99,20 @@ options {
         // log-only yes; // 有効にすると制限はせずログ出力のみ行います
         exempt-clients { 127.0.0.1/32; 192.168.0.0/16; ::1/128; };
     };
+
+    // しきい値アラート (KariDNS 独自、既定は無効)。制御スレッドが interval 秒ごとに
+    // カウンタの増分を調べ、しきい値を超えた時に "alert: ..." を一度だけ、下回った時に
+    // "alert cleared: ..." を一度だけ syslog (category general) に出す。繰り返しは出さない。
+    // zone { alerts { } } で同じ名前をゾーンごとに指定でき、そのゾーンでは options の値より優先される
+    // (interval と reload-failures-above は options のみ)。値は karictl stats で確認できる
+    // alerts {
+    //     interval 60;                      // 検査の間隔 (秒、10..3600)
+    //     qps-above 200000;                 // 間隔の平均 QPS
+    //     servfail-ratio-above 5;           // 間隔の応答のうち SERVFAIL の割合 (%、100 応答以上のとき)
+    //     rrl-drops-above 1000;             // 間隔に rate-limit で破棄した応答数
+    //     transfer-failures-above 0;        // 間隔に全プライマリで失敗したセカンダリの更新回数
+    //     reload-failures-above 0;          // 間隔に失敗したリロード (ゾーンの読み込み失敗を含む) の回数
+    // };
 };
 
 logging {
@@ -209,6 +223,13 @@ zone "example.com" {
         responses-per-second 100;
         slip 0; // slipを0にするとTC応答せず即座に破棄します
     };
+
+    // このゾーンだけのアラート (options { alerts { } } で interval が決まる。同じ名前は
+    // このゾーンの値が優先され、書かない名前は options の値を使う)
+    // alerts {
+    //     qps-above 5000;
+    //     servfail-ratio-above 1;
+    // };
 };
 
 // スレーブゾーンの定義
