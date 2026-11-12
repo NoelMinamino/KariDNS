@@ -68,15 +68,15 @@ test('asking for the password again (change it, switch TOTP off) is a way to gue
   type(await dom('POST', '/auth/password', { body: { current: 'dom password 12345', new: 'a brand new password 1' } }), 429, 'rate-limited');
 }));
 
-test('wrong passwords at the password form count towards the lock of the account, as at the login', withDeploy({}, async (d) => {
+test('wrong passwords at the password form count towards the lock of the account from that network, as at the login', withDeploy({}, async (d) => {
   const dom = d.as(await d.login('dom', 'dom password 12345'));
   for (let i = 0; i < 10; i++) type(await dom('POST', '/auth/password', { body: { current: `not the password ${i}`, new: 'a brand new password 1' } }), 403, 'wrong-password');
-  // the account is locked: a login with the right password is refused like any other
+  // the account is locked from this network: a login with the right password is refused like any other
   type(await d.request('POST', '/auth/login', { body: { user: 'dom', password: 'dom password 12345' } }), 401, 'invalid-credentials');
   const creds = await d.as(await d.login('root', 'correct horse battery'))('GET', '/principals/2');
   assert.equal(creds.body.credentials.locked, true);
   assert.equal(creds.body.credentials.failed_logins, 10);
-  assert.ok(d.log.lines.some((l) => /^warn auth: dom is locked after 10 failed logins/.test(l)));
+  assert.ok(d.log.lines.some((l) => /^warn auth: dom is locked from 127\.0\.0\.0\/24 after 10 failed logins/.test(l)));
 }));
 
 test('a wrong TOTP code when switching TOTP off counts as a failed login too', withDeploy({}, async (d) => {

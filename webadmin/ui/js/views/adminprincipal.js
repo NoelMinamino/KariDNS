@@ -86,6 +86,8 @@ export function principalView(ctx, { params }) {
       [t('admin.c-totp'), t(creds.totp_enabled ? 'admin.c-totp-on' : 'admin.c-totp-off')],
       [t('admin.c-failed'), String(creds.failed_logins)],
       [t('admin.c-locked'), t(creds.locked ? 'common.yes' : 'common.no')],
+      // 0.6.2: the lock is per network; the networks that are locked out of the account now
+      ...(creds.locked_networks?.length ? [[t('admin.c-locked-nets'), creds.locked_networks.map((n) => n.network).join(', ')]] : []),
     ] : [];
     const pw = field({ label: t('admin.f-newpw'), type: 'password', name: 'new_password', autocomplete: 'new-password', maxlength: 1024, hint: t('admin.f-newpw-hint', { min: PASSWORD_MIN }) });
     const pwForm = h('form', { class: 'stack', novalidate: true }, pw.node, h('div', { class: 'actions' }, h('button', { type: 'submit' }, t('admin.set-password'))));

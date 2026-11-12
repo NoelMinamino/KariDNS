@@ -10,10 +10,7 @@ import { reply } from '../http.js';
 import { isGlobal } from '../perm.js';
 import { absolute } from '../names.js';
 import { requireGlobal, idParam, idCursor, page, clean } from './common.js';
-
-const LOCK_AFTER = 10;
-const LOCK_MS = 15 * 60 * 1000;
-const LOCK_MAX_MS = 24 * 3600 * 1000;
+import { lockNetwork } from '../ratelimit.js';
 
 const PASSWORD = { type: 'string', min: 12, max: 1024, noControl: false };
 
@@ -41,13 +38,12 @@ export const policyView = (p) => ({
 const secure = (app) => app.settings['public-origin'].startsWith('https:');
 const clientText = (ctx) => `${ctx.ip} ${clean(ctx.req.headers['user-agent'] ?? '')}`.slice(0, 255);
 
-// the failure of one login: counted, and the account locked for a while once ten in a row have happened (15 minutes, twice as long for every further failure, a day
-// at most).  A locked account is told apart from a wrong password by nobody: both give the same answer.
-async function loginFailed(app, p, creds) {
-  const failed = creds.failed_logins + 1;
-  const lock = failed >= LOCK_AFTER ? app.now() + Math.min(LOCK_MS * 2 ** (failed - LOCK_AFTER), LOCK_MAX_MS) : null;
-  await app.backend.tx({ principal: p.id, name: p.name, write: true }, (tx) => S.recordLoginFailure(tx, p.id, failed, lock));
-  if (lock) app.log.warn(`auth: ${clean(p.name)} is locked after ${failed} failed logins`);
+// the failure of one login: counted per account and client network, and that network locked out of the account for a while once ten in a row have happened (15
+// minutes, twice as long for every further failure, a day at most; ratelimit.js Lockouts).  The owner still gets in from another network (audit, 0.6.2: the lock
+// used to be the account's, for everybody).  A locked network is told apart from a wrong password by nobody: both give the same answer.
+function loginFailed(app, p, ip) {
+  const { failed, until } = app.lockouts.fail(p.id, ip);
+  if (until) app.log.warn(`auth: ${clean(p.name)} is locked from ${lockNetwork(ip)} after ${failed} failed logins`);
 }
 
 const invalid = () => new ApiError(401, 'invalid-credentials', 'the user name, the password or the code is wrong');
@@ -72,11 +68,11 @@ export async function login(ctx) {
     return { p, creds: await S.getCredentials(tx, p.id), grants: await S.effectiveGrants(tx, p.id) };
   });
   const now = app.now();
-  const usable = found?.creds?.password_hash && mayHaveSession(found.p, found.creds, now);
-  // a name that does not exist, a disabled user, a locked one: the same work is done against the dummy hash
+  const usable = found?.creds?.password_hash && mayHaveSession(found.p, found.creds, now) && !app.lockouts.locked(found.p.id, ctx.ip);
+  // a name that does not exist, a disabled user, a locked one (from this network): the same work is done against the dummy hash
   const good = await verifyPassword(usable ? found.creds.password_hash : await app.dummyHash(), body.password);
   if (!usable || !good) {
-    if (usable) await loginFailed(app, found.p, found.creds);
+    if (usable) loginFailed(app, found.p, ctx.ip);
     // (the name is logged when it is one of ours: what else was typed in the field may be a password)
     else app.log.warn(`auth: login refused for ${found ? clean(found.p.name) : 'an unknown or disabled user'} from ${ctx.ip}`);
     throw invalid();
@@ -89,12 +85,13 @@ export async function login(ctx) {
     const sec = JSON.parse(unwrapSecret(app.key, p.id, creds.totp_secret) ?? 'null');
     const step = sec && totpVerify(Buffer.from(sec.s, 'hex'), body.totp, now / 1000, { lastStep: sec.u });
     if (step === null || step === undefined) {
-      await loginFailed(app, p, creds);
+      loginFailed(app, p, ctx.ip);
       throw invalid();
     }
     wrapped = wrapSecret(app.key, p.id, JSON.stringify({ s: sec.s, u: step }));
   }
   const enrolRequired = needsTotp(s, grants) && !creds.totp_enabled;
+  app.lockouts.succeed(p.id, ctx.ip);
   const sess = await app.backend.tx({ principal: p.id, name: p.name, write: true }, async (tx) => {
     await S.recordLoginSuccess(tx, p.id, wrapped);
     await S.deleteExpiredSessions(tx, now, p.id);
@@ -135,14 +132,14 @@ export async function me(ctx) {
 }
 
 // A password check for the actions that ask for it again (disable TOTP, change the password).  It is a way to guess the password for whoever holds the session, so it
-// has the limits of a login: the bucket of logins (5 a minute, a key of its own per principal) and the count of failures that locks the account.
+// has the limits of a login: the bucket of logins (5 a minute, a key of its own per principal) and the count of failures that locks the account from this network.
 async function reauth(ctx, password) {
   const { app, auth } = ctx;
   const wait = app.buckets.loginUser.take(`reauth:${auth.principal.id}`);
   if (wait) throw new ApiError(429, 'rate-limited', 'too many password checks', { headers: { 'Retry-After': String(wait) } });
   const creds = await ctx.db((tx) => S.getCredentials(tx, auth.principal.id));
   if (!creds?.password_hash || !(await verifyPassword(creds.password_hash, password))) {
-    if (creds?.password_hash) await loginFailed(app, auth.principal, creds);
+    if (creds?.password_hash) loginFailed(app, auth.principal, ctx.ip);
     throw forbidden('the password is wrong', 'wrong-password');
   }
   return creds;
@@ -196,9 +193,10 @@ export async function totp(ctx) {
     const sec = JSON.parse(unwrapSecret(app.key, id, creds.totp_secret) ?? 'null');
     const step = sec && totpVerify(Buffer.from(sec.s, 'hex'), body.code, app.now() / 1000, { lastStep: sec.u });
     if (step === null || step === undefined) {
-      await loginFailed(app, auth.principal, creds);
+      loginFailed(app, auth.principal, ctx.ip);
       throw forbidden('the code is wrong', 'wrong-code');
     }
+    app.lockouts.succeed(id, ctx.ip);
     const sess = await ctx.db(async (tx) => {
       await S.recordLoginSuccess(tx, id, wrapSecret(app.key, id, JSON.stringify({ s: sec.s, u: step })));
       await S.deleteSession(tx, auth.idHash);
@@ -212,16 +210,15 @@ export async function totp(ctx) {
   if (!creds.totp_enabled) throw conflict('TOTP is not on', 'totp-disabled');
   if (needsTotp(app.settings, auth.grants)) throw forbidden('TOTP is required for this user by the configuration (require-totp)', 'totp-required-by-policy');
   if (!body.code || (creds.password_hash && !body.password)) throw new ApiError(400, 'bad-request', creds.password_hash ? 'password and code are required' : 'code is required');
-  let again = creds;
   if (creds.password_hash) {
-    again = await reauth(ctx, body.password);
+    await reauth(ctx, body.password);
   } else {
     const wait = app.buckets.loginUser.take(`reauth:${id}`);
     if (wait) throw new ApiError(429, 'rate-limited', 'too many code checks', { headers: { 'Retry-After': String(wait) } });
   }
   const sec = JSON.parse(unwrapSecret(app.key, id, creds.totp_secret) ?? 'null');
   if (!sec || totpVerify(Buffer.from(sec.s, 'hex'), body.code, app.now() / 1000, { lastStep: sec.u }) === null) {
-    await loginFailed(app, auth.principal, again);
+    loginFailed(app, auth.principal, ctx.ip);
     throw forbidden('the code is wrong', 'wrong-code');
   }
   await ctx.db(async (tx) => {

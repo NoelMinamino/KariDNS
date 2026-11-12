@@ -707,6 +707,7 @@ export default {
   'admin.c-totp-off': 'off',
   'admin.c-failed': 'Failed sign-in attempts',
   'admin.c-locked': 'Locked',
+  'admin.c-locked-nets': 'Locked from',
   'admin.unlock': 'Unlock the account',
   'admin.unlock-ask': 'Clear the failed attempts and the lock?',
   'admin.unlocked': 'The account was unlocked.',

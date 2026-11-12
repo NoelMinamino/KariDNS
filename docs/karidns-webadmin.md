@@ -352,7 +352,7 @@ One line per request, to syslog (`logger(1)`, tag `karidns-webadmin`, `notice`):
 |---|---|
 | `auth: <user> logged in from <address>` | a login |
 | `auth: login refused for <user> from <address>` | a wrong password, a locked account, a user without a password; for a name that does not exist: `an unknown or disabled user` |
-| `auth: <user> is locked after N failed logins` | ten failures in a row (also from the password form and the TOTP form of a logged-in session): 15 minutes, doubling for every further failure, a day at most; a new password from an administrator ends the lock |
+| `auth: <user> is locked from <network> after N failed logins` | ten failures in a row from one network, the client network (an IPv4 /24, an IPv6 /64) (also from the password form and the TOTP form of a logged-in session): that network is locked out of the account for 15 minutes, doubling for every further failure, a day at most; the user still signs in from another network. A new password from an administrator, or unlock, ends the locks. The locks are kept in the memory of the service: a restart forgets them |
 | `<id>: row level security refused what the API allowed (a bug)` | PostgreSQL: the database refused a statement the service had allowed; the answer was 500. Report it with the id |
 | `<id>: karidns-zone apply failed (exit status N): ...` | a tool broke or is not the version the service expects |
 | `<id>: karictl reload <zone> failed: ...` | SQLite3: the reload did not happen; the change is in the database |
@@ -382,7 +382,7 @@ One line per request, to syslog (`logger(1)`, tag `karidns-webadmin`, `notice`):
 |---|---|
 | a user forgot the password | an administrator: `PUT /api/v1/principals/{id}/password` (this also ends the lock and the user's sessions, and revokes its API tokens) |
 | a user lost the TOTP device | an administrator: `POST /api/v1/principals/{id}/credentials {"action":"reset-totp"}` (TOTP is off, the secret is gone, the user's sessions end; a global master enrols again at the next login). Not for oneself: ask another global master. Without an administrator who can log in, as the database owner: `UPDATE karidns_auth.credentials SET totp_enabled = false, totp_secret = NULL WHERE principal_id = <id>;` |
-| an account is locked (ten failed logins) | an administrator: `POST /api/v1/principals/{id}/credentials {"action":"unlock"}` (the count and the lock go, the password stays); or wait out the lock (15 minutes, twice as long for every further failure, a day at most) |
+| an account is locked from a network (ten failed logins from it) | sign in from another network; or an administrator: `POST /api/v1/principals/{id}/credentials {"action":"unlock"}` (the counts and the locks of every network go, the password stays; the user's page lists the locked networks); or wait out the lock (15 minutes, twice as long for every further failure, a day at most) |
 | every administrator is locked out | `karidns-webadmin --create-admin another-name` (PostgreSQL: with `--bootstrap-conninfo-file`) as above |
 | a token leaked | `DELETE /api/v1/tokens/{id}` (the owner or an administrator); disabling a user revokes its tokens and ends its sessions |
 
@@ -462,7 +462,7 @@ Zone of 1,000 records, one page of 500: 5 to 7 ms (SQLite3), 8 to 17 ms (Postgre
 | `--check`: `the schema version is 2/3 (auth/data), 3 is needed` | the SQL files of this release are not applied | apply them (above) |
 | `--check`: `listen ... is not a loopback address: plain HTTP is only allowed on ...` | a public address without TLS | `127.0.0.1`, a UNIX socket, or `tls-cert` and `tls-key` |
 | the service restarts every 10 seconds | it cannot start (the database is down, a file has the wrong mode); standard error is /dev/null | `service karidns_webadmin configtest`; look in the syslog |
-| login: 401 `invalid-credentials` for a right password | the account is locked (ten failures), disabled, or has no password | wait, or an administrator sets a password |
+| login: 401 `invalid-credentials` for a right password | the account is locked from this network (ten failures), disabled, or has no password | another network, wait, or an administrator unlocks it or sets a password |
 | login: 403 `csrf` | the `Origin` header is not exactly `public-origin` (scheme, host, port) | fix `public-origin` or the proxy's host name |
 | login: 429 | five logins a minute per address or per name; behind a proxy without `trusted-proxy` every client is one address | set `trusted-proxy` |
 | a write: 403 `csrf` | the cookie request lacks `X-KariDNS-CSRF` or `Origin` | send both (the token is in the login answer and in `GET /auth/me`), or use a token |

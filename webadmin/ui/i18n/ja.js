@@ -707,6 +707,7 @@ export default {
   'admin.c-totp-off': 'オフ',
   'admin.c-failed': 'サインインの失敗回数',
   'admin.c-locked': 'ロック',
+  'admin.c-locked-nets': 'ロック中のネットワーク',
   'admin.unlock': 'アカウントのロックを解除',
   'admin.unlock-ask': '失敗回数とロックを消去しますか?',
   'admin.unlocked': 'アカウントのロックを解除しました。',

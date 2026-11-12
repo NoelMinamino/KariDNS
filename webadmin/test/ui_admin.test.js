@@ -167,7 +167,7 @@ test('S11: groups: a new group has no password; the list is of groups; empty and
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------------- one user
-const CREDS = { password: true, totp_enabled: true, failed_logins: 3, locked: true };
+const CREDS = { password: true, totp_enabled: true, failed_logins: 3, locked: true, locked_networks: [{ network: '203.0.113.0/24', until: '2026-11-12T10:00:00Z' }, { network: '2001:db8:1:2::/64', until: '2026-11-12T10:30:00Z' }] };
 function userRoutes(st = {}, over = {}) {
   return base({
     'GET /principals/2': () => reply(200, { principal: { ...U(2, 'bob', { display_name: 'Bob <i>B</i>', email: 'bob@example.test', ...(st.p ?? {}) }), created_at: '2026-11-01T00:00:00Z', created_by: 1 }, groups: [G(5, 'ops')], credentials: st.creds ?? CREDS }),
@@ -181,7 +181,7 @@ test('S11: one user: details, the state of its sign-in, unlock and the TOTP rese
   const sent = [];
   const st = {};
   const ui = await bootApp({ routes: userRoutes(st, {
-    'POST /principals/2/credentials': (b) => { sent.push(b); st.creds = { ...CREDS, ...(b.action === 'unlock' ? { failed_logins: 0, locked: false } : { totp_enabled: false }) }; return reply(200, { credentials: st.creds }); },
+    'POST /principals/2/credentials': (b) => { sent.push(b); st.creds = { ...CREDS, ...(b.action === 'unlock' ? { failed_logins: 0, locked: false, locked_networks: [] } : { totp_enabled: false }) }; return reply(200, { credentials: st.creds }); },
     'PUT /principals/2/password': (b) => { sent.push(['password', b]); return reply(200, { password: 'changed' }); },
   }), hash: '#/admin/principals/2' });
   assert.equal(ui.q('h2').textContent, 'User: bob');
@@ -193,6 +193,7 @@ test('S11: one user: details, the state of its sign-in, unlock and the TOTP rese
   assert.match(dls[1], /Two-step verificationon/);
   assert.match(dls[1], /Failed sign-in attempts3/);
   assert.match(dls[1], /LockedYes/);
+  assert.match(dls[1], /Locked from203\.0\.113\.0\/24, 2001:db8:1:2::\/64/);   // the networks of the lock (0.6.2)
   assert.equal(ui.input('display_name').value, 'Bob <i>B</i>', 'a display name is a value, not markup');
   assert.equal(findAll(ui.root, (e) => e.tagName === 'I').length, 0);
   assert.equal(ui.link(/^ops$/).getAttribute('href'), '#/admin/principals/5');

@@ -79,11 +79,16 @@ export async function principalCreate(ctx) {
 // what an administrator (and the user itself) may know of the credentials: no hash, no secret
 // (oidc: the identity the user is linked to, with the provider's name and label when a configured provider has that issuer: the issuer and the subject are not secrets, and the
 // person it belongs to sees them in the account, an administrator in the administration)
-const credentialsView = (c, now, app) => {
-  if (!c) return { password: false, totp_enabled: false, failed_logins: 0, locked: false, oidc: null };
+// failed_logins and locked add the per-network counts of app.lockouts (0.6.2) to what the database still has from an older version; locked_networks lists the networks
+// that are locked out of the account now.
+const credentialsView = (c, now, app, id) => {
+  if (!c) return { password: false, totp_enabled: false, failed_logins: 0, locked: false, locked_networks: [], oidc: null };
   const prov = c.oidc_issuer ? app.oidc.byIssuer(c.oidc_issuer) : undefined;
+  const nets = app.lockouts.of(id);
+  const lockedNets = nets.filter((n) => n.locked_until).map((n) => ({ network: n.network, until: new Date(n.locked_until).toISOString() }));
   return {
-    password: Boolean(c.password_hash), totp_enabled: c.totp_enabled, failed_logins: c.failed_logins, locked: Boolean(c.locked_until && c.locked_until > now),
+    password: Boolean(c.password_hash), totp_enabled: c.totp_enabled, failed_logins: c.failed_logins + nets.reduce((s, n) => s + n.failed, 0),
+    locked: Boolean(c.locked_until && c.locked_until > now) || lockedNets.length > 0, locked_networks: lockedNets,
     oidc: c.oidc_issuer ? { issuer: c.oidc_issuer, subject: c.oidc_subject, provider: prov ? { name: prov.name, label: prov.label } : null } : null,
   };
 };
@@ -101,7 +106,7 @@ export async function principalGet(ctx) {
   if (!r) throw notFound('no such principal');
   if (r.reduced) return { principal: reducedView(r.p) };
   const out = { principal: { ...principalView(r.p), created_at: r.p.created_at, created_by: r.p.created_by }, groups: r.groups };
-  if (r.creds !== undefined) out.credentials = credentialsView(r.creds, ctx.app.now(), ctx.app);
+  if (r.creds !== undefined) out.credentials = credentialsView(r.creds, ctx.app.now(), ctx.app, id);
   return out;
 }
 
@@ -121,6 +126,7 @@ export async function principalCredentials(ctx) {
     if (!c) throw conflict('this user has no password, so no credentials to change', 'no-password');
     if (body.action === 'unlock') {
       await S.clearLock(tx, id);
+      ctx.app.lockouts.clear(id);              // every network's count and lock
     } else {
       if (!c.totp_enabled && !c.totp_secret) throw conflict('TOTP is not on for this user', 'totp-disabled');
       await S.setTotp(tx, id, null, false);
@@ -130,7 +136,7 @@ export async function principalCredentials(ctx) {
   }, { write: true });
   if (!r) throw notFound('no such principal');
   ctx.app.log.info(`auth: ${clean(ctx.auth.principal.name)} did ${body.action} for ${clean(r.p.name)}`);
-  return { credentials: credentialsView(r.creds, ctx.app.now(), ctx.app) };
+  return { credentials: credentialsView(r.creds, ctx.app.now(), ctx.app, id) };
 }
 
 // G7 (F-16): a global master links a user to an identity at a provider, (issuer, subject), or removes the link.  The subject is what the provider's ID token says in `sub` (the
@@ -157,7 +163,7 @@ export async function principalOidcPut(ctx) {
   }, { write: true });
   if (!r) throw notFound('no such principal');
   ctx.app.log.info(`auth: ${clean(ctx.auth.principal.name)} linked ${clean(r.p.name)} to ${clean(body.issuer)} subject ${clean(body.subject)}`);
-  return { credentials: credentialsView(r.creds, ctx.app.now(), ctx.app) };
+  return { credentials: credentialsView(r.creds, ctx.app.now(), ctx.app, id) };
 }
 
 export async function principalOidcDelete(ctx) {
@@ -225,6 +231,7 @@ export async function principalPassword(ctx) {
     await S.deleteSessionsOf(tx, id);
     await S.revokeTokensOf(tx, id, ctx.app.now());
   }, { write: true });
+  ctx.app.lockouts.clear(id);                  // a new password ends the locks, as it ends the one of the database (setPassword)
   return { password: 'changed' };
 }
 

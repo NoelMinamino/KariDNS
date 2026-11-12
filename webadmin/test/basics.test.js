@@ -9,7 +9,7 @@ import { parseConfig, validate, defaults, datasetList, listenHost, loadConfig } 
 import { shape, value, query, encodeCursor, decodeCursor, LIMIT, CURSOR } from '../lib/validate.js';
 import { canonicalOwner, canonicalZone, inZone, absolute, dbName } from '../lib/names.js';
 import { ApiError, badRequest, forbidden, notFound, conflict, problem, mapDbError } from '../lib/errors.js';
-import { Buckets, Window } from '../lib/ratelimit.js';
+import { Buckets, Window, Lockouts, lockNetwork } from '../lib/ratelimit.js';
 
 const SQLITE = `
 listen = 127.0.0.1:8053
@@ -342,4 +342,53 @@ test('token buckets: a burst, a refill, the wait, and the table does not grow', 
   busy.take('1'); busy.take('2'); busy.take('1');
   busy.take('3');
   assert.equal(busy.map.size, 1);
+});
+
+test('the network of a login lock: IPv4 /24, IPv6 /64, other text as it is', () => {
+  assert.equal(lockNetwork('192.0.2.77'), '192.0.2.0/24');
+  assert.equal(lockNetwork('::ffff:198.51.100.9'), '198.51.100.0/24');
+  assert.equal(lockNetwork('2001:db8:1:2::5'), '2001:db8:1:2::/64');
+  assert.equal(lockNetwork('2001:DB8:0001:0002:ffff:0:0:1'), '2001:db8:1:2::/64');
+  assert.equal(lockNetwork('2001:db8::1'), '2001:db8:0:0::/64');
+  assert.equal(lockNetwork('::1'), '0:0:0:0::/64');
+  assert.equal(lockNetwork('fe80::1%em0'), 'fe80:0:0:0::/64');
+  for (const odd of ['local', '', '1:2:3', '1::2::3', '::ffff:1.2.3.4.5', '2001:db8::zz', '1:2:3:4:5:6:7:8:9']) assert.equal(lockNetwork(odd), odd);
+  assert.equal(lockNetwork(undefined), '');
+});
+
+test('login locks per account and network: ten failures, doubling, a day at most; success, clear, the table does not grow', () => {
+  let t = 0;
+  const l = new Lockouts({ after: 3, firstMs: 1000, maxMs: 4000, max: 3, now: () => t });
+  assert.deepEqual([l.fail(1, '192.0.2.1'), l.fail(1, '192.0.2.2')], [{ failed: 1, until: null }, { failed: 2, until: null }]);
+  assert.deepEqual(l.fail(1, '192.0.2.3'), { failed: 3, until: 1000 });          // the same /24: locked
+  assert.equal(l.locked(1, '192.0.2.200'), true);
+  assert.equal(l.locked(1, '192.0.3.1'), false);                                // another network
+  assert.equal(l.locked(2, '192.0.2.1'), false);                                // another account
+  assert.deepEqual([l.fail(1, '192.0.2.1').until, l.fail(1, '192.0.2.1').until, l.fail(1, '192.0.2.1').until], [2000, 4000, 4000]);
+  assert.deepEqual(l.of(1), [{ network: '192.0.2.0/24', failed: 6, locked_until: 4000 }]);
+  t = 4000;
+  assert.equal(l.locked(1, '192.0.2.1'), false);                                // the lock ends
+  assert.deepEqual(l.of(1), [{ network: '192.0.2.0/24', failed: 6, locked_until: null }]);
+  l.succeed(1, '192.0.2.9');
+  assert.deepEqual(l.of(1), []);
+  l.fail(1, '2001:db8::1');
+  l.fail(2, '2001:db8::1');
+  l.clear(1);
+  assert.deepEqual([l.of(1), l.of(2).length], [[], 1]);
+  // the sweep: quiet entries go first, then those that are not locked, then everything
+  t = 10000;
+  l.fail(3, '198.51.100.1');
+  l.fail(4, '198.51.100.1');
+  t = 20000;
+  l.fail(5, '198.51.100.1');                                                    // full: the entries quiet for maxMs are dropped
+  assert.equal(l.map.size, 1);
+  for (const p of [6, 7]) for (let i = 0; i < 3; i++) l.fail(p, '203.0.113.1');
+  l.fail(8, '203.0.113.1');                                                     // full again: the one that is not locked goes
+  assert.deepEqual([...l.map.keys()].sort(), ['6 203.0.113.0/24', '7 203.0.113.0/24', '8 203.0.113.0/24']);
+  for (let i = 0; i < 3; i++) l.fail(8, '203.0.113.1');
+  l.fail(9, '203.0.113.1');                                                     // every entry is locked: all are forgotten
+  assert.deepEqual([...l.map.keys()], ['9 203.0.113.0/24']);
+  const real = new Lockouts();                                                  // the defaults and the clock of the process
+  assert.deepEqual(real.fail(1, '192.0.2.1'), { failed: 1, until: null });
+  assert.equal(real.locked(1, '192.0.2.1'), false);
 });
