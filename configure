@@ -23,7 +23,11 @@ Options:
   --prefix=DIR            the installation prefix, recorded as PREFIX in config.mk for the packaging scripts; the Makefile has no
                           install target (default: /usr/local)
   --sysconfdir=DIR        the directory the tools look in for their configuration (DIR/karidns/karidns.conf, DIR/karidns/karictl.conf):
-                          compiled into karictl, karicheck and karidns-zone as -DKARIDNS_SYSCONFDIR (default: PREFIX/etc)
+                          compiled into karictl, karicheck and karidns-zone as -DKARIDNS_SYSCONFDIR; dag also looks for its CA
+                          bundle at DIR/ssl/cert.pem (default: PREFIX/etc)
+  --libexecdir=DIR        where karidns finds karidns-dbloader when `loader-path` is not set: DIR/karidns-dbloader, compiled in as
+                          -DKARIDNS_LIBEXECDIR (default: PREFIX/libexec).  A prefix other than /usr/local is compiled in as
+                          -DKARIDNS_PREFIX for the second CA bundle of dag, PREFIX/share/certs/ca-root-nss.crt
   --with-db-drivers=LIST  the drivers of karidns-dbloader and karidns-zone: auto, none, or sqlite3, postgresql or both, separated by a
                           space or a comma (default: auto, the drivers whose library is found).  A driver that is named and not
                           found is an error
@@ -44,6 +48,7 @@ Examples:
   ./configure
   ./configure --march=none --with-db-drivers=none
   ./configure --sysconfdir=/etc --with-db-drivers="sqlite3 postgresql"
+  ./configure --prefix=/usr --sysconfdir=/etc --libexecdir=/usr/libexec
   ./configure --with-openssl=/usr/local/opt/openssl@3 CFLAGS="-g -O1"
 EOF
 }
@@ -66,6 +71,7 @@ cd "$SRCDIR" || { echo "configure: cannot enter $SRCDIR" >&2; exit 1; }
 
 prefix=/usr/local
 sysconfdir=
+libexecdir=
 db_drivers=auto
 idn2=auto
 openssl_dir=
@@ -89,7 +95,7 @@ while [ $# -gt 0 ]; do
         --with-idn2)
             if [ $hasval = no ]; then val=yes; fi
             idn2=$val ;;
-        --prefix|--sysconfdir|--with-db-drivers|--with-openssl|--march)
+        --prefix|--sysconfdir|--libexecdir|--with-db-drivers|--with-openssl|--march)
             if [ $hasval = no ]; then
                 [ $# -gt 0 ] || usage_error "$opt needs a value"
                 val=$1
@@ -98,6 +104,7 @@ while [ $# -gt 0 ]; do
             case $opt in
                 --prefix) prefix=$val ;;
                 --sysconfdir) sysconfdir=$val ;;
+                --libexecdir) libexecdir=$val ;;
                 --with-db-drivers) db_drivers=$val ;;
                 --with-openssl) openssl_dir=$val ;;
                 --march) march=$val ;;
@@ -136,6 +143,10 @@ prefix=`stripslash "$prefix"`
 checkdir --sysconfdir "$sysconfdir"
 sysconfdir=`stripslash "$sysconfdir"`
 [ -n "$sysconfdir" ] || usage_error "--sysconfdir may not be /"
+[ -n "$libexecdir" ] || libexecdir=$prefix/libexec
+checkdir --libexecdir "$libexecdir"
+libexecdir=`stripslash "$libexecdir"`
+[ -n "$libexecdir" ] || usage_error "--libexecdir may not be /"
 if [ -n "$openssl_dir" ]; then
     checkdir --with-openssl "$openssl_dir"
     openssl_dir=`stripslash "$openssl_dir"`
@@ -361,6 +372,12 @@ SYSCONF_DEF=
 if [ "$sysconfdir" != /usr/local/etc ]; then
     SYSCONF_DEF="-DKARIDNS_SYSCONFDIR=\\\"$sysconfdir\\\""
 fi
+if [ "$prefix" != /usr/local ]; then
+    SYSCONF_DEF="${SYSCONF_DEF:+$SYSCONF_DEF }-DKARIDNS_PREFIX=\\\"$prefix\\\""
+fi
+if [ "$libexecdir" != /usr/local/libexec ]; then
+    SYSCONF_DEF="${SYSCONF_DEF:+$SYSCONF_DEF }-DKARIDNS_LIBEXECDIR=\\\"$libexecdir\\\""
+fi
 
 # --- config.mk --------------------------------------------------------------------------------------------------------------------------------
 # a value for make: $ doubled, # escaped; no trailing white space
@@ -377,6 +394,7 @@ w() {   # name value
 } >> config.mk.tmp$$
 w PREFIX "$prefix"
 w SYSCONFDIR "$sysconfdir"
+w LIBEXECDIR "$libexecdir"
 w CC "$CC"
 [ -z "$user_cflags" ] || w CFLAGS "$user_cflags"
 # += : BSD make has a CFLAGS of its own (-O2 -pipe) that an assignment would drop; the compile lines differ by the -D only
@@ -405,6 +423,7 @@ mv config.mk.tmp$$ config.mk || die "cannot write config.mk"
     echo "  -march        ${MARCH_FLAGS:-(baseline)}$MARCH_NOTE"
     echo "  prefix        $prefix"
     echo "  sysconfdir    $sysconfdir"
+    echo "  libexecdir    $libexecdir"
     echo "  OpenSSL, zlib found${openssl_dir:+ ($openssl_dir)}"
     echo "  libidn2       $have_idn2$IDN_NOTE"
     echo "  DB drivers    ${DB_DRIVERS:-(none)}${DB_NOTE:+   [${DB_NOTE#; }]}"

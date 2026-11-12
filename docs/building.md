@@ -7,7 +7,7 @@
 ## SYNOPSIS
 
 ```sh
-./configure [--prefix=DIR] [--sysconfdir=DIR] [--with-db-drivers=auto|none|sqlite3|postgresql|"sqlite3 postgresql"]
+./configure [--prefix=DIR] [--sysconfdir=DIR] [--libexecdir=DIR] [--with-db-drivers=auto|none|sqlite3|postgresql|"sqlite3 postgresql"]
             [--with-idn2=auto|yes|no] [--with-openssl=DIR] [--march=native|none|V] [CC=cc] [CFLAGS=...] [LDFLAGS=...]
 make                  # karidns, dag, karictl, karicheck, karidns-tapstat
 make karidns-dbloader karidns-zone
@@ -27,13 +27,18 @@ It finds the compiler (`CC`, else `cc`, `gcc` or `clang`), proves with a small t
 
 | Option | Meaning |
 |---|---|
-| `--prefix=DIR` | Recorded as `PREFIX` in `config.mk` for the packaging scripts. The `Makefile` has no `install` target: the packages and Homebrew stage the files themselves. Default `/usr/local`. |
-| `--sysconfdir=DIR` | The directory the tools look in for their configuration when they are not told where: `DIR/karidns/karidns.conf` (`karicheck`, `karidns-zone`), `DIR/karidns/karictl.conf` (`karictl`), the example in the help of `karidns-dbloader`. It is compiled in as `-DKARIDNS_SYSCONFDIR="DIR"` (`dns_utils.h`). Default `PREFIX/etc`; the sources default to `/usr/local/etc`, and only another directory adds a flag, so the default build is the build without `configure`. The rc scripts, the packages and the manuals keep the FreeBSD layout (`/usr/local/etc`). Only letters, digits and `_ . / + @ -` are allowed. |
+| `--prefix=DIR` | Recorded as `PREFIX` in `config.mk` for the packaging scripts, and the base of the defaults of `--sysconfdir` and `--libexecdir`. It is compiled in as `-DKARIDNS_PREFIX` (only when it is not `/usr/local`) for one name: the FreeBSD ca_root_nss bundle `PREFIX/share/certs/ca-root-nss.crt` that `dag` looks for. The `Makefile` has no `install` target: the packages and Homebrew stage the files themselves. Default `/usr/local`. |
+| `--sysconfdir=DIR` | The directory the tools look in for their configuration when they are not told where: `DIR/karidns/karidns.conf` (`karicheck`, `karidns-zone`), `DIR/karidns/karictl.conf` (`karictl`), the example in the help of `karidns-dbloader`. It is compiled in as `-DKARIDNS_SYSCONFDIR="DIR"` (`dns_utils.h`). `dag` looks for its CA bundle (`+tls-ca` without a file) at `DIR/ssl/cert.pem`, as one of its fixed places (below). Default `PREFIX/etc`; the sources default to `/usr/local/etc`, and only another directory adds a flag, so the default build is the build without `configure`. The rc scripts, the packages and the manuals keep the FreeBSD layout (`/usr/local/etc`). Only letters, digits and `_ . / + @ -` are allowed. |
+| `--libexecdir=DIR` | Where `karidns` finds the database loader when `loader-path` is not set: `DIR/karidns-dbloader` (`KARIDNS_DB_DEFAULT_LOADER_PATH` in `dns_config_parser.h`; `karicheck conf` and the server both use it). Compiled in as `-DKARIDNS_LIBEXECDIR="DIR"`. Default `PREFIX/libexec`. The FreeBSD packages install the loader in `/usr/local/libexec` and the manuals say so; a package for another layout passes `--libexecdir`. |
 | `--with-db-drivers=LIST` | The drivers of `karidns-dbloader` and `karidns-zone`: `auto` (the default: the drivers whose library is found), `none`, `sqlite3`, `postgresql`, or both (`"sqlite3 postgresql"` or `sqlite3,postgresql`). A driver that is named and not found is an error. `make DB_DRIVERS=...` on the command line still wins over `config.mk`. |
 | `--with-idn2=auto\|yes\|no` | libidn2 for `dag` (internationalized names). `yes` is an error when it is not found; `auto` (the default) says so in the summary. `--with-idn2` is `yes`, `--without-idn2` is `no`. |
 | `--with-openssl=DIR` | OpenSSL is in `DIR/include` and `DIR/lib`. The default is the system's, or the Homebrew one on macOS. The `Makefile` always searches `/usr/local` and the Homebrew directories first (`BREW_CFLAGS`, `BREW_LDFLAGS`): with a second copy of OpenSSL there, put your directory first in `CFLAGS` and `LDFLAGS`. |
 | `--march=native\|none\|V` | `native` (the default): `-march=native`, the CPU of the build host. `none`: the baseline of the architecture, for a package that runs on other machines. `V`: `-march=V`. A default `native` that the compiler refuses becomes `none` with a line in the summary; a value that was asked for and is refused is an error. |
 | `CC`, `CFLAGS`, `LDFLAGS` | From the environment or as arguments. They are saved in `config.mk`; the flags of the `Makefile` are added to them. |
+
+### The CA bundle of dag
+
+`dag +tls-ca` without a file loads the default store of OpenSSL (it honours `SSL_CERT_FILE`), then the first readable file of a fixed list: `/etc/ssl/cert.pem`, `SYSCONFDIR/ssl/cert.pem`, `PREFIX/share/certs/ca-root-nss.crt`, `/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/ca-bundle.pem`. `+tls-ca=FILE` names one file. Only the two names under `/usr/local` follow the options (FreeBSD ports: `/usr/local/etc/ssl/cert.pem` is the link of the ca_root_nss package); the others are the places of Linux distributions and stay. There is no `--with-ca-bundle`: the list is searched when `dag` runs, so a build needs no file name, and `SSL_CERT_FILE` or `+tls-ca=FILE` covers any other place. Windows and macOS have no entries of their own; they use the OpenSSL store.
 
 ### Libraries
 
@@ -48,7 +53,7 @@ It finds the compiler (`CC`, else `cc`, `gcc` or `clang`), proves with a small t
 
 Without `config.mk` the `Makefile` finds the same things itself with shell commands at the top of the file (`NAME_PROBE != command`, then `NAME ?= $(NAME_PROBE)`), as it always did: on FreeBSD and Linux, with BSD make or GNU make 4, `make` alone behaves as before. `config.mk` sets the same names first, so the result of a probe is not used. GNU make 3.81, the `make` of macOS, has no `!=`: it needs `./configure` (its `config.mk` is how it gets the version, the Homebrew paths and the libpq flags).
 
-The compile and link commands are the same with and without `config.mk` for the same options. `tests/run_configure_test.sh` checks that with `make -n` for `karidns dag karicheck karictl karidns-dbloader karidns-zone` (and that a `--sysconfdir` adds only its `-D`), together with the options, the errors for a missing library, `--help` and `make distclean`.
+The compile and link commands are the same with and without `config.mk` for the same options. `tests/run_configure_test.sh` checks that with `make -n` for `karidns dag karicheck karictl karidns-dbloader karidns-zone` (and that `--prefix`, `--sysconfdir` and `--libexecdir` add only their `-D`, and what the headers give with them), together with the options, the errors for a missing library, `--help` and `make distclean`.
 
 A few things are not in `config.mk` on purpose:
 
@@ -62,6 +67,7 @@ A few things are not in `config.mk` on purpose:
 ./configure
 ./configure --march=none --with-db-drivers=none
 ./configure --sysconfdir=/etc --with-db-drivers="sqlite3 postgresql"
+./configure --prefix=/usr --sysconfdir=/etc --libexecdir=/usr/libexec
 ./configure --with-openssl=/usr/local/opt/openssl@3 CFLAGS="-g -O1"
 ```
 

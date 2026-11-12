@@ -92,7 +92,7 @@ done < "$T/examples"
 # --- 2. usage errors ------------------------------------------------------------------------------------------------------------------------
 echo "--- usage errors"
 for a in --nosuch --prefix=relative '--prefix=/a b' '--sysconfdir=/a"b' '--sysconfdir=/a%b' '--sysconfdir=/a$b' --with-db-drivers=oracle --with-db-drivers= \
-         --with-idn2=maybe --march= '--march=a b' --prefix --with-openssl=rel; do
+         --with-idn2=maybe --march= '--march=a b' --prefix --with-openssl=rel --libexecdir=rel '--libexecdir=/a b' --libexecdir; do
     cfg "$a"; rc=$?
     if [ $rc -eq 2 ] && [ ! -e config.mk ]; then ok "'$a' is a usage error"; else bad "'$a': exit $rc, config.mk: $(ls config.mk 2>&1)"; fi
 done
@@ -104,8 +104,10 @@ grep -q '^CFLAGS' config.mk && bad "the default sysconfdir puts a flag into CFLA
 [ -z "$(mkval DB_DRIVERS)" ] && grep -q '^DB_DRIVERS =' config.mk && ok "--with-db-drivers=none: DB_DRIVERS is defined and empty" || bad "none: DB_DRIVERS='$(mkval DB_DRIVERS)'"
 [ "$(mkval VERSION_FILE)" = "$(tr -d ' \r\n' < VERSION)" ] && ok "VERSION_FILE is the file VERSION" || bad "VERSION_FILE '$(mkval VERSION_FILE)'"
 [ "$(mkval MARCH_FLAGS)" = -march=native ] && ok "default -march=native" || { grep -q 'does not accept -march=native' "$T/out" && ok "-march=native is not accepted here: baseline, said in the summary" || bad "MARCH_FLAGS '$(mkval MARCH_FLAGS)'"; }
-cfg --with-db-drivers=none --prefix=/opt/kd/ ; [ "$(mkval PREFIX)" = /opt/kd ] && [ "$(mkval SYSCONFDIR)" = /opt/kd/etc ] && ok "--prefix=/opt/kd/: PREFIX /opt/kd, SYSCONFDIR /opt/kd/etc" || bad "prefix: $(mkval PREFIX) $(mkval SYSCONFDIR)"
-grep -q '^CFLAGS += -DKARIDNS_SYSCONFDIR=\\"/opt/kd/etc\\"$' config.mk && ok "a sysconfdir that is not the default is a CFLAGS += -DKARIDNS_SYSCONFDIR=\\\"...\\\"" || bad "CFLAGS: $(grep '^CFLAGS' config.mk)"
+cfg --with-db-drivers=none --prefix=/opt/kd/ ; [ "$(mkval PREFIX)" = /opt/kd ] && [ "$(mkval SYSCONFDIR)" = /opt/kd/etc ] && [ "$(mkval LIBEXECDIR)" = /opt/kd/libexec ] && ok "--prefix=/opt/kd/: PREFIX /opt/kd, SYSCONFDIR /opt/kd/etc, LIBEXECDIR /opt/kd/libexec" || bad "prefix: $(mkval PREFIX) $(mkval SYSCONFDIR) $(mkval LIBEXECDIR)"
+grep -q '^CFLAGS += -DKARIDNS_SYSCONFDIR=\\"/opt/kd/etc\\" -DKARIDNS_PREFIX=\\"/opt/kd\\" -DKARIDNS_LIBEXECDIR=\\"/opt/kd/libexec\\"$' config.mk && ok "a prefix that is not the default is a CFLAGS += with -DKARIDNS_PREFIX, -DKARIDNS_SYSCONFDIR and -DKARIDNS_LIBEXECDIR" || bad "CFLAGS: $(grep '^CFLAGS' config.mk)"
+cfg --with-db-drivers=none --libexecdir=/usr/libexec/ ; [ "$(mkval LIBEXECDIR)" = /usr/libexec ] && grep -q '^CFLAGS += -DKARIDNS_LIBEXECDIR=\\"/usr/libexec\\"$' config.mk && ok "--libexecdir=/usr/libexec/: only -DKARIDNS_LIBEXECDIR" || bad "libexecdir: $(mkval LIBEXECDIR) $(grep '^CFLAGS' config.mk)"
+cfg --with-db-drivers=none --libexecdir /usr/local/libexec; ! grep -q '^CFLAGS' config.mk && ok "the default libexecdir adds no -D" || bad "default libexecdir: $(grep '^CFLAGS' config.mk)"
 cfg --with-db-drivers=none --sysconfdir /etc/ ; [ "$(mkval SYSCONFDIR)" = /etc ] && grep -q '^CFLAGS += -DKARIDNS_SYSCONFDIR=\\"/etc\\"$' config.mk && ok "--sysconfdir /etc/ (two words, a trailing slash): /etc" || bad "sysconfdir: $(mkval SYSCONFDIR) $(grep '^CFLAGS' config.mk)"
 cfg --with-db-drivers=none --march=none; grep -q '^MARCH_FLAGS = *$' config.mk && ok "--march=none: MARCH_FLAGS is defined and empty" || bad "march none: $(grep MARCH config.mk)"
 cfg --with-db-drivers=none --march=x86-64; [ $? -eq 0 ] && [ "$(mkval MARCH_FLAGS)" = -march=x86-64 ] && ok "--march=x86-64: -march=x86-64" || {
@@ -204,18 +206,21 @@ for MK in make gmake; do
     CFLAGS='-g -DFOO=1' LDFLAGS='-L/nonexistent_dir' sh ./configure --with-db-drivers=$DOPT > "$T/out" 2>&1
     $MK -n $TARGETS > "$T/n.conf" 2>&1
     cmp -s "$T/n.plain" "$T/n.conf" && ok "$MK, CFLAGS and LDFLAGS of the environment: the same" || { bad "$MK, CFLAGS and LDFLAGS of the environment differ"; diff "$T/n.plain" "$T/n.conf" | head -4; }
-    # another sysconfdir: only its -D is new (and it is on every compile line of the objects)
+    # other directories: only their -D are new (and it is on every compile line of the objects)
     rm -f config.mk; $MK -n DB_DRIVERS="$D" $TARGETS > "$T/n.plain" 2>&1
-    sh ./configure --with-db-drivers=$DOPT --sysconfdir=/etc/kdtest > "$T/out" 2>&1
+    sh ./configure --with-db-drivers=$DOPT --prefix=/opt/kd --sysconfdir=/etc/kdtest --libexecdir=/opt/kd/lx > "$T/out" 2>&1
     $MK -n $TARGETS > "$T/n.conf" 2>&1
     DEF='-DKARIDNS_SYSCONFDIR=\"/etc/kdtest\"'
-    sed "s|-DKARIDNS_SYSCONFDIR=[^ ]* ||" "$T/n.conf" > "$T/n.conf.nodef"
+    sed -e "s|-DKARIDNS_SYSCONFDIR=[^ ]* ||" -e "s|-DKARIDNS_PREFIX=[^ ]* ||" -e "s|-DKARIDNS_LIBEXECDIR=[^ ]* ||" "$T/n.conf" > "$T/n.conf.nodef"
     if cmp -s "$T/n.plain" "$T/n.conf.nodef" && grep -qF -- "$DEF" "$T/n.conf"; then
-        ok "$MK, --sysconfdir=/etc/kdtest: $(grep -cF -- "$DEF" "$T/n.conf") commands carry -DKARIDNS_SYSCONFDIR, nothing else changes"
+        ok "$MK, --prefix, --sysconfdir, --libexecdir: $(grep -cF -- "$DEF" "$T/n.conf") commands carry the -D, nothing else changes"
     else
         bad "$MK, --sysconfdir: the commands differ by more than the -D"; diff "$T/n.plain" "$T/n.conf.nodef" | head -4
     fi
     grep -F -- "karictl.c" "$T/n.conf" | grep -qF -- "$DEF" && ok "$MK: the karictl compile line has the sysconfdir" || bad "$MK: karictl.c is compiled without the sysconfdir"
+    for d in 'KARIDNS_PREFIX=\"/opt/kd\"' 'KARIDNS_LIBEXECDIR=\"/opt/kd/lx\"'; do
+        grep -F -- "dns_server_core.c" "$T/n.conf" | grep -qF -- "-D$d" && ok "$MK: the karidns compile line has -D$d" || bad "$MK: dns_server_core.c is compiled without -D$d"
+    done
 done
 [ $n_made -gt 0 ] || note "no make that can run without configure: the equivalence was not checked"
 
@@ -259,6 +264,38 @@ else
             bad "make karictl failed with --sysconfdir=$dir: $(tail -5 "$T/build.log")"
         fi
     done
+fi
+
+# --- 9. the directories that are compiled in: the loader of karidns, the CA bundles of dag -------------------------------------------------
+echo "--- compiled-in directories"
+cat > probe.c <<'PROBE'
+#include <stdio.h>
+#include "dns_config_parser.h"
+int main(void) {
+    printf("%s\n%s\n%s\n", KARIDNS_DB_DEFAULT_LOADER_PATH, KARIDNS_SYSCONFDIR "/ssl/cert.pem", KARIDNS_PREFIX "/share/certs/ca-root-nss.crt");
+    return 0;
+}
+PROBE
+probe() {   # configure arguments: the three strings the headers give with the flags configure wrote
+    cfg --with-db-drivers=none --march=none "$@" || return 1
+    _fl=$(sed -n 's/^CFLAGS += //p' config.mk)
+    eval "$REALCC $_fl -I. probe.c -o probe.out" 2> "$T/probe.err" && ./probe.out | tr '\n' ' '
+}
+P=$(probe); R="/usr/local/libexec/karidns-dbloader /usr/local/etc/ssl/cert.pem /usr/local/share/certs/ca-root-nss.crt "
+[ "$P" = "$R" ] && ok "without options: loader-path default and the two CA bundles are the FreeBSD ones" || bad "defaults: '$P' $(head -3 "$T/probe.err")"
+P=$(probe --prefix=/opt/kd --sysconfdir=/etc/kdt --libexecdir=/opt/lx); R="/opt/lx/karidns-dbloader /etc/kdt/ssl/cert.pem /opt/kd/share/certs/ca-root-nss.crt "
+[ "$P" = "$R" ] && ok "--prefix, --sysconfdir, --libexecdir reach KARIDNS_DB_DEFAULT_LOADER_PATH and the CA bundle names" || bad "options: '$P' $(head -3 "$T/probe.err")"
+P=$(probe --prefix=/opt/kd); R="/opt/kd/libexec/karidns-dbloader /opt/kd/etc/ssl/cert.pem /opt/kd/share/certs/ca-root-nss.crt "
+[ "$P" = "$R" ] && ok "--prefix alone moves libexecdir and sysconfdir with it" || bad "prefix: '$P' $(head -3 "$T/probe.err")"
+if grep -q 'KARIDNS_SYSCONFDIR "/ssl/cert.pem"' tools/dag_transport.c && grep -q 'KARIDNS_PREFIX "/share/certs/ca-root-nss.crt"' tools/dag_transport.c; then
+    ok "dag_transport.c builds its two /usr/local CA bundle names from these macros"
+else
+    bad "dag_transport.c has a fixed /usr/local CA bundle name"
+fi
+if grep -n '"/usr/local/' tools/dag_transport.c tools/dag_http.c dns_config_parser.h > "$T/fixed" 2>&1; then
+    bad "a fixed /usr/local path in dag's TLS code or in the loader default: $(cat "$T/fixed")"
+else
+    ok "no fixed /usr/local path in dag's TLS code or in the loader default"
 fi
 
 if [ $FAIL -ne 0 ]; then echo "=== run_configure_test: FAILED"; exit 1; fi
