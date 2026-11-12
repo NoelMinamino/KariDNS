@@ -121,6 +121,22 @@ void plug_backend_wait_startup(int ms);
 /* A reload published cfg: new zones get a plugin, a changed fingerprint a new one (the old one goes when the new one is up), removed zones'
  * plugins are stopped, the others are left as they are and get the RELOAD line when they have program-reload-line yes */
 void plug_backend_reconfigure(const server_config_t *cfg);
+/* What `karictl reload <zone>` did to the plugin of one program zone */
+typedef enum {
+  PLUG_ZR_NOT_PROGRAM = 0,  /* cfg has no program zone of that name in that view: nothing was done */
+  PLUG_ZR_DISABLED,         /* it has one, but allow-program-zones is not yes or the zone has no program: no plugin is run */
+  PLUG_ZR_NOMEM,            /* no memory or no slot: the plugin was left as it was */
+  PLUG_ZR_RELOAD_LINE,      /* the settings are unchanged and the zone has program-reload-line yes: the RELOAD line was written (or is owed) */
+  PLUG_ZR_REPLACING,        /* the settings changed: a new plugin was asked for; the running one answers until it is up */
+  PLUG_ZR_RESTARTING,       /* the settings are the same, there is no program-reload-line: a new plugin with them was asked for, as for a replacement */
+  PLUG_ZR_STARTING,         /* a plugin that never came up (or has no running one) was asked for again */
+  PLUG_ZR_PENDING           /* a replacement with these settings is already on its way */
+} plug_zone_result_t;
+/* plug_backend_reconfigure() for the one program zone (view, zone) of cfg, with the same rules except that a plugin with the same settings
+ * and no program-reload-line is replaced by a new one (the operator named the zone: it must read its data again); every other plugin is
+ * left as it is.
+ * The control thread only (as plug_backend_reconfigure()) */
+plug_zone_result_t plug_backend_reconfigure_zone(const server_config_t *cfg, const char *view, const char *zone);
 /* The pair is readable (the control thread's kqueue): handle what the manager sent */
 void plug_backend_handle_ctrl(void);
 /* Free the objects no reader can hold any more (the control thread's timer) */

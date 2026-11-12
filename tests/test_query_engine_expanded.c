@@ -10876,6 +10876,18 @@ static program_plugin_t *pt_find(const char *zone) {
     return find_program_plugin("v", zone);
 }
 
+/* plug_backend_reconfigure_zone() that starts a new plugin for zone: the START, the UP of the new one, the STOP of the old one */
+static void pt_zone_swap(const server_config_t *cfg, const char *zone, plug_zone_result_t want, plug_msg_t *start_out) {
+    assert(plug_backend_reconfigure_zone(cfg, "v", zone) == want);
+    plug_msg_t s, m;
+    assert(pt_recv(&s) && s.type == PLUG_MSG_START && strcmp(s.zone, zone) == 0);
+    int in, out;
+    pt_up(s.slot, s.gen, 1, &in, &out, NULL);
+    plug_backend_reap();
+    assert(pt_recv(&m) && m.type == PLUG_MSG_STOP);
+    *start_out = s;
+}
+
 static void test_plugin_backend_table(void) {
     printf("[TEST] Plugins 0.6.2: the Backend's table (START, UP, DOWN, reload: same / changed / added / removed, RELOAD line, bad records)...\n");
     int sv[2];
@@ -10971,6 +10983,44 @@ static void test_plugin_backend_table(void) {
     assert(poll(&rp, 1, 1000) == 1 && read(a_in, line, sizeof(line)) == 7 && memcmp(line, "RELOAD\n", 7) == 0);
     struct pollfd bp = { .fd = b_in, .events = POLLIN };
     assert(poll(&bp, 1, 0) == 0);
+
+    /* 4b. karictl reload <zone> (plug_backend_reconfigure_zone()): the RELOAD line to a zone with program-reload-line yes, no other zone
+     * touched; not a program zone of that view, or not enabled: nothing done */
+    assert(plug_backend_reconfigure_zone(&cfg, "v", "a.test.") == PLUG_ZR_RELOAD_LINE);
+    assert(pt_nothing() && pt_find("a.test.") == pa && pt_find("b.test.") == pb);
+    assert(poll(&rp, 1, 1000) == 1 && read(a_in, line, sizeof(line)) == 7 && memcmp(line, "RELOAD\n", 7) == 0);
+    assert(poll(&bp, 1, 0) == 0);
+    assert(plug_backend_reconfigure_zone(&cfg, "v", "nosuch.test.") == PLUG_ZR_NOT_PROGRAM);
+    assert(plug_backend_reconfigure_zone(&cfg, "w", "b.test.") == PLUG_ZR_NOT_PROGRAM);
+    assert(plug_backend_reconfigure_zone(NULL, "v", "b.test.") == PLUG_ZR_NOT_PROGRAM);
+    cfg.allow_program_zones = false;
+    assert(plug_backend_reconfigure_zone(&cfg, "v", "b.test.") == PLUG_ZR_DISABLED);
+    cfg.allow_program_zones = true;
+    assert(pt_nothing() && pt_find("a.test.") == pa && pt_find("b.test.") == pb);
+    /* b.test. has the same settings and no program-reload-line: a START in a new slot with the same fingerprint (asked again while it
+     * has no answer), the old plugin answers until the new one is up, then its STOP; the other zone is not touched */
+    assert(plug_backend_reconfigure_zone(&cfg, "v", "b.test.") == PLUG_ZR_RESTARTING);
+    plug_msg_t mr;
+    assert(pt_recv(&mr) && mr.type == PLUG_MSG_START && mr.slot != mb.slot && strcmp(mr.fingerprint, fp) == 0);
+    assert(pt_find("b.test.") == pb && pt_find("a.test.") == pa);
+    assert(plug_backend_reconfigure_zone(&cfg, "v", "b.test.") == PLUG_ZR_STARTING);
+    assert(pt_recv(&m) && m.type == PLUG_MSG_START && m.slot == mr.slot && m.gen == mr.gen);
+    int r4_in, r4_out;
+    pt_up(mr.slot, mr.gen, 1, &r4_in, &r4_out, NULL);
+    assert(pt_find("b.test.") != pb && pt_find("b.test.")->slot == mr.slot && pt_find("a.test.") == pa);
+    assert(pt_nothing());
+    plug_backend_reap();
+    assert(pt_recv(&m) && m.type == PLUG_MSG_STOP && m.slot == mb.slot && m.gen == mb.gen);
+    pb = pt_find("b.test.");
+    /* changed settings: a new plugin, and back */
+    tzx(&zb)->program_args = args2;
+    pt_zone_swap(&cfg, "b.test.", PLUG_ZR_REPLACING, &mr);
+    tzx(&zb)->program_args = args1;
+    pt_zone_swap(&cfg, "b.test.", PLUG_ZR_REPLACING, &mr);
+    pb = pt_find("b.test.");
+    mb.slot = mr.slot;
+    mb.gen = mr.gen;
+    assert(pt_nothing() && pt_find("a.test.") == pa);
 
     /* 5. reload, b.test.'s arguments changed: a START for a new slot; the old plugin answers until the new one is up, then STOP */
     tzx(&zb)->program_args = args2;
