@@ -51,6 +51,7 @@ Unlike traditional CGI-like designs, KariDNS **does not fork or execute a new pr
      - the plugin of a zone that the reload removes is stopped;
      - a plugin whose settings did not change is left as it is (with `program-reload-line yes;` it gets the `RELOAD` line, see the protocol section).
      The manager reads `karidns.conf` again for a zone, or settings, that it has not seen yet, and starts only what that file says: the path, the arguments and the user never come from the sandboxed backend. It reads the file at most once a second. A start the manager refuses (a file that changed again between the reload and that read, a half-written file, a `program-user` it cannot look up, no memory) is asked for again after 1, 2, 4, ... 60 seconds, and at once by the next reload; meanwhile a new zone answers `SERVFAIL`, and a zone whose replacement is refused keeps its running plugin. The old plugin of a changed or removed zone is stopped once no query in progress can still use it.
+   - **`karictl reload <zone>` (0.6.2)** is for one program zone (with its view name when the zone is in several views); the plugins of the other zones are not touched. An operator who names the zone asks for its data to be read again, so, unlike the full reload, it never leaves the plugin alone: (1) when the zone's settings in the active configuration are not those of its running plugin, a new plugin is started and the old one is stopped once the new one is up; (2) when the settings are the same and the zone has `program-reload-line yes;`, the plugin gets the `RELOAD` line; (3) when the settings are the same and there is no `program-reload-line` (or `no`), a new plugin with the same settings is started and replaces the old one the same way (queries are answered throughout), because a plugin without the `RELOAD` line can read its data again only by starting again. It does not read `karidns.conf` again: `karictl reconfig` (or a full `reload`) applies an edit first and already replaces a changed plugin. The reply says which of the three happened.
    - At most 256 zones of type `program` can be configured; more is a configuration error.
 
 2. **Asynchronous I/O Pool with Serialized Plugin Access**
@@ -97,7 +98,7 @@ For each query, KariDNS writes three elements sequentially to the plugin's stand
 
 #### The `RELOAD` line (0.6.2, only with `program-reload-line yes;`)
 
-When the zone has `program-reload-line yes;`, a configuration reload (`karictl reload`, `karictl reconfig`, `SIGHUP` to the server) also writes one line to the plugin:
+When the zone has `program-reload-line yes;`, a configuration reload (`karictl reload`, `karictl reload <zone>` for that zone only (below), `karictl reconfig`, `SIGHUP` to the server) also writes one line to the plugin:
 
 ```text
 RELOAD\n

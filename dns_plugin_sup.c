@@ -948,29 +948,46 @@ static void bk_start_again_now(int i) {
   bk_start(i);
 }
 
-void plug_backend_reconfigure(const server_config_t *cfg) {
+/* only_zone NULL: every program zone of cfg (a reload).  Else only the zone (only_view, only_zone), which is a program zone of cfg with a
+ * plugin to run (the caller checked): every other plugin is left as it is, in the table and in the manager (karictl reload <zone>).
+ * Returns what was done to that zone (PLUG_ZR_NOT_PROGRAM for a reload of all) */
+static plug_zone_result_t plug_reconfigure(const server_config_t *cfg, const char *only_view, const char *only_zone) {
+  plug_zone_result_t res = PLUG_ZR_NOT_PROGRAM;
   plug_backend_reap();
   /* 1. the table is allocated before anything is changed: a failure leaves everything as it was */
   program_plugin_table_t *t = table_alloc();
   if (!t) {
     syslog(LOG_ERR, "[Plugin] no memory for the table of the plugins; the program zones are left as they were");
-    return;
+    return PLUG_ZR_NOMEM;
   }
   static struct {
     const zone_config_t *z;
     const char *vn;
     char fp[PLUG_FP_MAX];
     int a;
+    bool same;   /* the settings are those of the running plugin a (a restart asked for by name) */
   } want[PLUG_MAX_ZONES];
   int nwant = 0, skipped = 0, nzones = 0;
   int again[PLUG_MAX_ZONES], nagain = 0, reload[PLUG_MAX_ZONES], nreload = 0;
   bool keep[PLUG_SLOTS];
   memset(keep, 0, sizeof(keep));
+  if (only_zone) {
+    /* the plugins of every other zone, running or on their way, stay as they are */
+    for (int i = 0; i < PLUG_SLOTS; i++) {
+      const bslot_t *b = &s_bs[i];
+      if (!b->gen || b->retiring || !b->obj) continue;
+      if (strcasecmp(b->obj->domain, only_zone) == 0 && strcasecmp(b->obj->view_name, only_view) == 0) continue;
+      keep[i] = true;
+      if (!b->pending && t->count < PLUG_MAX_ZONES) t->p[t->count++] = b->obj;
+    }
+  }
   /* 2. what stays, and what needs a new plugin; no message yet */
   for (const view_config_t *v = cfg ? cfg->views : NULL; v; v = v->next) {
     const char *vn = v->name ? v->name : "";
+    if (only_zone && strcasecmp(vn, only_view) != 0) continue;
     for (const zone_config_t *z = v->zones; z; z = z->next) {
       if (!z->type || strcasecmp(z->type, "program") != 0 || !z->domain) continue;
+      if (only_zone && strcasecmp(z->domain, only_zone) != 0) continue;
       if (!cfg->allow_program_zones) {
         skipped++;
         continue;
@@ -988,18 +1005,31 @@ void plug_backend_reconfigure(const server_config_t *cfg) {
       compute_program_zone_fingerprint(z, fp, sizeof(fp));
       int a = find_slot(vn, z->domain, false), p = find_slot(vn, z->domain, true);
       if ((a >= 0 && keep[a]) || (p >= 0 && keep[p])) continue;   /* the same zone twice in one view (the parser refuses it) */
-      if (a >= 0 && strcmp(s_bs[a].obj->config_fingerprint, fp) == 0) {
+      const bool same_a = a >= 0 && strcmp(s_bs[a].obj->config_fingerprint, fp) == 0;
+      /* A zone named by `karictl reload <zone>` whose plugin has the same settings and no RELOAD line can be made to read its data again
+       * only by starting it again: a new plugin with these settings goes through the replacement path below */
+      const bool restart = only_zone && same_a && s_bs[a].obj->seq != 0 && !s_bs[a].obj->reload_line;
+      if (same_a && !restart) {
         /* Decision 4: unchanged settings leave the plugin alone; program-reload-line yes gets the RELOAD line.  One that has never been
          * up (refused, unanswered) is asked for again. */
         keep[a] = true;
         t->p[t->count++] = s_bs[a].obj;
-        if (s_bs[a].obj->seq == 0) again[nagain++] = a;
-        else reload[nreload++] = a;
+        if (s_bs[a].obj->seq == 0) {
+          again[nagain++] = a;
+          res = PLUG_ZR_STARTING;
+        } else {
+          reload[nreload++] = a;
+          res = PLUG_ZR_RELOAD_LINE;                /* (for a named zone: not `restart`, so it has program-reload-line yes) */
+        }
         continue;                                 /* (a pending replacement is not kept: cancelled below) */
       }
       if (p >= 0 && strcmp(s_bs[p].obj->config_fingerprint, fp) == 0) {
         keep[p] = true;                           /* the replacement asked for by an earlier reload is still the right one */
-        if (!s_bs[p].answered || s_bs[p].retry_at_ms) again[nagain++] = p;
+        res = PLUG_ZR_PENDING;
+        if (!s_bs[p].answered || s_bs[p].retry_at_ms) {
+          again[nagain++] = p;
+          res = PLUG_ZR_STARTING;
+        }
         if (a >= 0) {
           keep[a] = true;
           t->p[t->count++] = s_bs[a].obj;
@@ -1010,6 +1040,7 @@ void plug_backend_reconfigure(const server_config_t *cfg) {
       want[nwant].vn = vn;
       memcpy(want[nwant].fp, fp, sizeof(fp));
       want[nwant].a = a;
+      want[nwant].same = same_a;
       nwant++;
       if (a >= 0) {
         keep[a] = true;                           /* the running plugin keeps answering until the new one is up */
@@ -1034,8 +1065,10 @@ void plug_backend_reconfigure(const server_config_t *cfg) {
     if (!o) {
       syslog(LOG_ERR, "[Plugin] zone '%s' in view '%s': no slot or no memory for its plugin; the next reload tries again", want[w].z->domain,
              want[w].vn);
+      if (only_zone) res = PLUG_ZR_NOMEM;
       continue;
     }
+    if (only_zone) res = want[w].same ? PLUG_ZR_RESTARTING : want[w].a >= 0 ? PLUG_ZR_REPLACING : PLUG_ZR_STARTING;
     memset(&s_bs[ns], 0, sizeof(s_bs[ns]));
     s_bs[ns].gen = gen;
     s_bs[ns].obj = o;
@@ -1054,6 +1087,27 @@ void plug_backend_reconfigure(const server_config_t *cfg) {
   }
   for (int k = 0; k < nagain; k++) bk_start_again_now(again[k]);
   for (int k = 0; k < nreload; k++) program_plugin_request_reload(s_bs[reload[k]].obj);
+  return res;
+}
+
+void plug_backend_reconfigure(const server_config_t *cfg) {
+  (void)plug_reconfigure(cfg, NULL, NULL);
+}
+
+plug_zone_result_t plug_backend_reconfigure_zone(const server_config_t *cfg, const char *view, const char *zone) {
+  if (!cfg || !view || !zone) return PLUG_ZR_NOT_PROGRAM;
+  const zone_config_t *found = NULL;
+  for (const view_config_t *v = cfg->views; v && !found; v = v->next) {
+    if (strcasecmp(v->name ? v->name : "", view) != 0) continue;
+    for (const zone_config_t *z = v->zones; z; z = z->next)
+      if (z->type && strcasecmp(z->type, "program") == 0 && z->domain && strcasecmp(z->domain, zone) == 0) {
+        found = z;
+        break;
+      }
+  }
+  if (!found) return PLUG_ZR_NOT_PROGRAM;
+  if (!cfg->allow_program_zones || !zext(found)->program_path) return PLUG_ZR_DISABLED;
+  return plug_reconfigure(cfg, view, zone);
 }
 
 void plug_backend_start(const server_config_t *cfg) {

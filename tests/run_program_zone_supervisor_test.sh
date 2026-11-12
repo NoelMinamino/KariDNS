@@ -8,6 +8,9 @@
 #   - a plugin that exits at once is started again after 1, 2, 4 s (the backoff), not in a loop;
 #   - a plugin that reaches program-max-failures is killed and started again;
 #   - a reload: a changed program-args gets a new plugin (the old one ends), a new zone answers, a removed zone's plugin ends;
+#   - karictl reload <zone> on one program zone: settings changed -> a new plugin (a replacement the manager refused is asked for again);
+#     the same settings with program-reload-line yes -> the RELOAD line; the same settings without it -> a new plugin with them (the old
+#     one answers until it is up); an unknown zone is an error; a zone that is not a program zone and the other plugins are not touched;
 #   - the plugins end with the server.
 # ==============================================================================
 . "$(dirname "$0")/lib_proc.sh"
@@ -30,6 +33,7 @@ TMP_DIR="$(mktemp -d /tmp/karidns_program_sup.XXXXXX)"
 SERVER_PID=""
 cleanup() {
     set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
+    [ -n "$SERVER_PID" ] && kill -CONT "$SERVER_PID" 2>/dev/null   # (step 8 stops the manager for a while)
     kari_kill_tree "$SERVER_PID"
     kari_kill_conf "$TMP_DIR/karidns.conf"
     rm -rf "$TMP_DIR" 2>/dev/null || true
@@ -40,6 +44,13 @@ trap cleanup EXIT INT TERM
 chmod 755 "$TMP_DIR"
 mkdir "$TMP_DIR/ev"
 chmod 777 "$TMP_DIR/ev"
+cat << EOF > "$TMP_DIR/file.zone"
+\$TTL 60
+@ IN SOA ns.file.example. h.file.example. 1 3600 600 86400 60
+@ IN NS ns.file.example.
+ns IN A 192.0.2.1
+EOF
+chmod 644 "$TMP_DIR/file.zone"
 chmod +x "$PLUGIN" 2>/dev/null || true
 
 PORT=$(kari_port 0 $((29000 + $$ % 5000)))
@@ -128,6 +139,10 @@ zone "quick.example." {
     type program;
     program "/usr/bin/true";
     $PROG_USER_OPT
+};
+zone "file.example." {
+    type master;
+    file "$TMP_DIR/file.zone";
 };
 EOF
 }
@@ -240,9 +255,88 @@ if [ -n "$plain_pid" ] && gone "$plain_pid"; then pass "plain.example's plugin e
 if [ "$(pid 192.0.2.10)" = "$rl_pid" ] && kill -0 "$rl_pid" 2>/dev/null; then pass "rl.example's unchanged plugin kept running"; else fail "rl.example's unchanged plugin kept running"; fi
 [ "$(events 192.0.2.10 RELOAD)" -ge 3 ] && pass "rl.example got the RELOAD line of this reload too" || fail "rl.example got the RELOAD line of this reload too"
 
-echo "=== 8. The plugins end with the server ==="
+echo "=== 8. karictl reload <zone> on a program zone ==="
+# ctl_out ARGS...: run karictl; the reply is in ctl.out, the exit status in $rc
+ctl_out() { rc=0; "$KARICTL" -f "$TMP_DIR/karictl.conf" "$@" > "$TMP_DIR/ctl.out" 2>&1 || rc=$?; }
+# zones_with_chg ADDR: the configuration of step 7 with chg.example's plugin answering ADDR
+zones_with_chg() {
+    {
+        base_zones | awk '/^zone "plain.example."/{skip=1} skip&&/^};/{skip=0; next} !skip'
+        zone chg.example. "$1"
+        zone add.example. 192.0.2.40
+    } > "$TMP_DIR/zones"
+    write_conf
+}
+rl_pid=$(pid 192.0.2.10)
+rl_n=$(events 192.0.2.10 RELOAD)
+ctl_out reload rl.example.
+if [ "$rc" = "0" ] && grep -q "^OK reloaded (program zone: RELOAD line sent" "$TMP_DIR/ctl.out"; then pass "reload rl.example.: the reply says the RELOAD line was sent"; else fail "reload rl.example.: the reply says the RELOAD line was sent" "rc $rc: $(cat "$TMP_DIR/ctl.out")"; fi
+if wait_events 192.0.2.10 RELOAD $((rl_n + 1)); then pass "reload rl.example.: the plugin got the RELOAD line"; else fail "reload rl.example.: the plugin got the RELOAD line"; fi
+sleep 0.5
+if [ "$(events 192.0.2.10 RELOAD)" = "$((rl_n + 1))" ] && [ "$(pid 192.0.2.10)" = "$rl_pid" ] && kill -0 "$rl_pid" 2>/dev/null; then pass "reload rl.example.: one line, the plugin was not restarted"; else fail "reload rl.example.: one line, the plugin was not restarted"; fi
+[ "$(answer y.rl.example.)" = "192.0.2.10" ] && pass "rl.example answers after the targeted reload" || fail "rl.example answers after the targeted reload"
+
+# no program-reload-line, the same settings: a new plugin replaces the old one, which answers until the new one is up
+norl_pid=$(pid 192.0.2.11)
+ctl_out reload norl.example.
+if [ "$rc" = "0" ] && grep -q "^OK reloaded (program zone: no program-reload-line; a new plugin with the same settings was asked for" "$TMP_DIR/ctl.out"; then pass "reload norl.example.: the reply says a new plugin with the same settings was asked for"; else fail "reload norl.example.: the reply says a new plugin with the same settings was asked for" "rc $rc: $(cat "$TMP_DIR/ctl.out")"; fi
+lost=0
+k=0
+while [ "$k" -lt 20 ]; do
+    [ "$(answer q$k.norl.example.)" = "192.0.2.11" ] || lost=$((lost + 1))
+    k=$((k + 1))
+done
+[ "$lost" = "0" ] && pass "reload norl.example.: every query was answered during the switch" || fail "reload norl.example.: every query was answered during the switch" "$lost of 20 lost"
+if wait_events 192.0.2.11 START 2 && [ -n "$norl_pid" ] && gone "$norl_pid" 5; then pass "reload norl.example.: a new plugin started and the old one ended"; else fail "reload norl.example.: a new plugin started and the old one ended" "$(cat "$TMP_DIR/ev/192.0.2.11" 2>/dev/null)"; fi
+if [ "$(events 192.0.2.11 RELOAD)" = "0" ] && [ "$(events 192.0.2.11 UNKNOWN)" = "0" ] && [ "$(events 192.0.2.11 START)" = "2" ]; then pass "reload norl.example.: no RELOAD line, one new plugin"; else fail "reload norl.example.: no RELOAD line, one new plugin" "$(cat "$TMP_DIR/ev/192.0.2.11" 2>/dev/null)"; fi
+[ "$(answer z.norl.example.)" = "192.0.2.11" ] && pass "norl.example answers from the new plugin" || fail "norl.example answers from the new plugin"
+[ "$(events 192.0.2.10 RELOAD)" = "$((rl_n + 1))" ] && pass "reload norl.example.: the plugin of the other zone got no line" || fail "reload norl.example.: the plugin of the other zone got no line"
+
+ctl_out reload nosuch.example.
+if [ "$rc" = "3" ] && grep -q "ERROR zone not found" "$TMP_DIR/ctl.out"; then pass "reload of an unknown zone: ERROR zone not found, exit 3"; else fail "reload of an unknown zone: ERROR zone not found, exit 3" "rc $rc: $(cat "$TMP_DIR/ctl.out")"; fi
+# a zone that is not a program zone: as before, and no plugin is touched
+rl_n=$(events 192.0.2.10 RELOAD)
+ctl_out reload file.example.
+if [ "$rc" = "0" ] && [ "$(tail -n 1 "$TMP_DIR/ctl.out")" = "OK reloaded" ]; then pass "reload file.example. (master zone): OK reloaded, as before"; else fail "reload file.example. (master zone): OK reloaded, as before" "rc $rc: $(cat "$TMP_DIR/ctl.out")"; fi
+sleep 0.5
+if [ "$(events 192.0.2.10 RELOAD)" = "$rl_n" ] && [ "$(events 192.0.2.11 START)" = "2" ]; then pass "reload of a master zone touched no plugin"; else fail "reload of a master zone touched no plugin"; fi
+
+# an edited program-args: reconfig (the configuration only) already replaces the plugin; a reload of the zone after it (no program-reload-line,
+# the same settings) starts one more
+chg_pid=$(pid 192.0.2.31)
+zones_with_chg 192.0.2.32
+ctl_out reconfig
+if answer_is x.chg.example. 192.0.2.32 && [ -n "$chg_pid" ] && gone "$chg_pid"; then pass "reconfig replaced chg.example's plugin (program-args edited)"; else fail "reconfig replaced chg.example's plugin (program-args edited)" "rc $rc: $(cat "$TMP_DIR/ctl.out")"; fi
+chg_pid=$(pid 192.0.2.32)
+ctl_out reload chg.example.
+if [ "$rc" = "0" ] && grep -q "^OK reloaded (program zone: no program-reload-line; a new plugin with the same settings" "$TMP_DIR/ctl.out"; then pass "reload chg.example. after the reconfig: restarted with the same settings"; else fail "reload chg.example. after the reconfig: restarted with the same settings" "rc $rc: $(cat "$TMP_DIR/ctl.out")"; fi
+if wait_events 192.0.2.32 START 2 && gone "$chg_pid" 5 && answer_is y.chg.example. 192.0.2.32; then pass "reload chg.example.: the plugin was replaced by one with the same settings"; else fail "reload chg.example.: the plugin was replaced by one with the same settings" "$(cat "$TMP_DIR/ev/192.0.2.32" 2>/dev/null)"; fi
+sleep 0.5
+chg_pid=$(pid 192.0.2.32)
+
+# a replacement the manager refused: the manager is stopped while the configuration changes twice, so that it reads the second edit
+# for the START of the first ("not the ones the server loaded"); the zone keeps its running plugin; restoring the first edit and
+# reloading the zone asks for the plugin again at once
+sleep 1.2
+refused0=$(grep -c "are not the ones the server loaded" "$TMP_DIR/karidns.log" || true)
+kill -STOP "$SERVER_PID"
+zones_with_chg 192.0.2.33
+ctl_out reconfig
+[ "$rc" = "0" ] || fail "reconfig while the manager is stopped" "rc $rc: $(cat "$TMP_DIR/ctl.out")"
+zones_with_chg 192.0.2.34
+kill -CONT "$SERVER_PID"
+i=0
+while [ "$i" -lt 50 ] && [ "$(grep -c "are not the ones the server loaded" "$TMP_DIR/karidns.log" || true)" -le "$refused0" ]; do sleep 0.2; i=$((i + 1)); done
+if [ "$(grep -c "are not the ones the server loaded" "$TMP_DIR/karidns.log" || true)" -gt "$refused0" ]; then pass "the manager refused the replacement (the file changed again)"; else fail "the manager refused the replacement (the file changed again)"; fi
+zones_with_chg 192.0.2.33
+ctl_out reload chg.example.
+if [ "$rc" = "0" ] && grep -q "^OK reloaded (program zone: a plugin was asked for" "$TMP_DIR/ctl.out"; then pass "reload chg.example.: the reply says the plugin was asked for again"; else fail "reload chg.example.: the reply says the plugin was asked for again" "rc $rc: $(cat "$TMP_DIR/ctl.out")"; fi
+if answer_is x.chg.example. 192.0.2.33 15 && gone "$chg_pid" 5; then pass "reload chg.example.: the new plugin answers and the old one ended"; else fail "reload chg.example.: the new plugin answers and the old one ended" "got '$(answer x.chg.example.)'"; fi
+[ ! -e "$TMP_DIR/ev/192.0.2.34" ] && pass "the plugin of the edit the file no longer has was never started" || fail "the plugin of the edit the file no longer has was never started"
+
+echo "=== 9. The plugins end with the server ==="
 all_pids=""
-for a in 192.0.2.10 192.0.2.11 192.0.2.20 192.0.2.21 192.0.2.31 192.0.2.40; do all_pids="$all_pids $(pid $a)"; done
+for a in 192.0.2.10 192.0.2.11 192.0.2.20 192.0.2.21 192.0.2.33 192.0.2.40; do all_pids="$all_pids $(pid $a)"; done
 kill -TERM "$SERVER_PID" 2>/dev/null
 i=0
 while [ "$i" -lt 50 ] && kill -0 "$SERVER_PID" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done

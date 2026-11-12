@@ -4731,6 +4731,40 @@ void *control_thread_func(void *arg) {
                     atomic_store_explicit(&lr.entry->serial, 0, memory_order_release);
                     atomic_store_explicit(&lr.entry->refresh_now, true, memory_order_release);
                     (void)ctl_send_all(cfd, "OK reloaded (slave)\n", 20);
+                  } else if (lr.zcfg->type && strcasecmp(lr.zcfg->type, "program") == 0 && lr.view_name) {
+                    /* 0.6.2: a reload of this one zone (plug_backend_reconfigure_zone()): a new plugin when its program settings in the active
+                     * configuration are not those of the running one; else the RELOAD line with program-reload-line yes; else (unlike a full
+                     * reload, which leaves such a plugin alone) a new plugin with the same settings, because the operator who names the zone
+                     * asks for its data to be read again.  "force" has no meaning here. */
+                    const char *msg;
+                    switch (plug_backend_reconfigure_zone(active, lr.view_name, lr.zcfg->domain)) {
+                    case PLUG_ZR_RELOAD_LINE:
+                      msg = "OK reloaded (program zone: RELOAD line sent to the plugin)\n";
+                      break;
+                    case PLUG_ZR_RESTARTING:
+                      msg = "OK reloaded (program zone: no program-reload-line; a new plugin with the same settings was asked for, the old one answers until it is up)\n";
+                      break;
+                    case PLUG_ZR_REPLACING:
+                      msg = "OK reloaded (program zone: the program settings changed; a new plugin was asked for, the old one answers until it is up)\n";
+                      break;
+                    case PLUG_ZR_STARTING:
+                      msg = "OK reloaded (program zone: a plugin was asked for; the zone answers when it is up)\n";
+                      break;
+                    case PLUG_ZR_PENDING:
+                      msg = "OK reloaded (program zone: a new plugin with these settings is already on its way)\n";
+                      break;
+                    case PLUG_ZR_DISABLED:
+                      msg = "ERROR no plugin runs for this zone: allow-program-zones is not yes, or the zone has no program\n";
+                      break;
+                    case PLUG_ZR_NOMEM:
+                      msg = "ERROR no memory or no slot for the plugin; it was left as it was\n";
+                      break;
+                    default:
+                      msg = "ERROR zone not found\n";
+                      break;
+                    }
+                    syslog(LOG_NOTICE, "[Control] Targeted reload of program zone %s: %.*s", lr.zcfg->domain, (int)strcspn(msg, "\n"), msg);
+                    (void)ctl_send_all(cfd, msg, strlen(msg));
                   } else {
                     (void)ctl_send_all(cfd, "ERROR unknown zone type\n", 24);
                   }
