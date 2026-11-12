@@ -165,10 +165,11 @@ run_one() {
         "$DAG" @127.0.0.1 -p $LPORT txt.fi.test. TXT +tcp +time=1 +tries=1 >/dev/null 2>&1
         "$DAG" @127.0.0.1 -p $LPORT nx.fi.test. A +keepopen +tcp www.fi.test. A +time=1 +tries=1 >/dev/null 2>&1
         "$DAG" @127.0.0.1 -p $LPORT fi.test. AXFR +time=1 +tries=1 >/dev/null 2>&1
-        "$KARICTL" -f "$L/karictl.conf" status >/dev/null 2>&1
-        "$KARICTL" -f "$L/karictl.conf" notify fi.test >/dev/null 2>&1
-        "$KARICTL" -f "$L/karictl.conf" reload fi.test >/dev/null 2>&1
-        "$KARICTL" -f "$L/karictl.conf" reconfig >/dev/null 2>&1
+        # (karictl waits for the reply without a limit: a server faulted at its start can accept the control connection and never answer)
+        timeout 10 "$KARICTL" -f "$L/karictl.conf" status >/dev/null 2>&1
+        timeout 10 "$KARICTL" -f "$L/karictl.conf" notify fi.test >/dev/null 2>&1
+        timeout 10 "$KARICTL" -f "$L/karictl.conf" reload fi.test >/dev/null 2>&1
+        timeout 10 "$KARICTL" -f "$L/karictl.conf" reconfig >/dev/null 2>&1
         "$DAG" @127.0.0.1 -p $LPORT www.fi.test. A +time=1 +tries=1 >/dev/null 2>&1
         if [ -n "${HEAVY:-}" ]; then
             # enough logged queries to rotate the 1k query log a few times
