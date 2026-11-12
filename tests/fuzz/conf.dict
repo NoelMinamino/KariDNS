@@ -85,6 +85,7 @@
 "program-user"
 "program-timeout"
 "program-max-failures"
+"program-reload-line"
 "algorithm"
 "secret"
 "hmac-md5"

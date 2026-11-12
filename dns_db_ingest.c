@@ -2286,7 +2286,12 @@ static void on_ctrl_readable(ing_t *g) {
     int got = -1, got_fetch = -1;
     for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c)) {
       if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) continue;
+      if (c->cmsg_len < CMSG_LEN(0)) continue;
       size_t cnt = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+      /* never past the control buffer (0.6.2 review: a kernel that shortens a cut message may leave cmsg_len as it was) */
+      const unsigned char *cend = (const unsigned char *)m.msg_control + m.msg_controllen;
+      size_t room = cend > (const unsigned char *)CMSG_DATA(c) ? (size_t)(cend - (const unsigned char *)CMSG_DATA(c)) / sizeof(int) : 0;
+      if (cnt > room) cnt = room;
       for (size_t i = 0; i < cnt; i++) {
         int fd;
         memcpy(&fd, CMSG_DATA(c) + i * sizeof(int), sizeof(int));

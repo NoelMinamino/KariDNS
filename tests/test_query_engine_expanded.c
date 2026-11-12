@@ -14,11 +14,14 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #include <unistd.h>
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
+#include "dns_plugin_sup.h"
+#include "dns_epoch_rcu.h"
 #include "test_zext.h"
 #include "dns_zone_parser.h"
 #include "dns_zone_image.h"
@@ -2159,17 +2162,21 @@ static void test_program_plugins_and_forward_zone_helpers(void) {
     assert(fwd_len > 0);
     assert((prog_res[3] & 0x0F) == 2); // SERVFAIL
 
-    // 8. spawn_program_zone_plugins with no program zones
+    // 8. 0.6.2: the Backend's table with no program zone (and no manager): empty
     server_config_t no_prog_cfg;
     memset(&no_prog_cfg, 0, sizeof(no_prog_cfg));
-    spawn_program_zone_plugins(&no_prog_cfg);
+    plug_backend_start(&no_prog_cfg);
+    plug_backend_reconfigure(&no_prog_cfg);
+    assert(atomic_load(&g_program_plugin_table) == NULL);
 
-    // 9. spawn_one_program_plugin with NULL path -> false
-    zone_config_t null_prog_cfg;
-    memset(&null_prog_cfg, 0, sizeof(null_prog_cfg));
-    null_prog_cfg.domain = "null.prog.";
-    program_plugin_t null_out;
-    assert(spawn_one_program_plugin(&null_prog_cfg, "", &null_out) == false);
+    // 9. the manager's spawn (plug_spawn_process) with no path -> false
+    plug_mslot_t null_slot;
+    memset(&null_slot, 0, sizeof(null_slot));
+    snprintf(null_slot.zone, sizeof(null_slot.zone), "null.prog.");
+    plug_proc_t null_out;
+    char spawn_err[300];
+    assert(plug_spawn_process(&null_slot, &null_out, spawn_err, sizeof(spawn_err)) == false);
+    assert(null_out.pid == -1 && null_out.stdin_w == -1);
 
     // 9b. low batch L3, dns_query_engine.c [15]: when the second pipe() fails, the first pair is closed again.  RLIMIT_NOFILE leaves room
     // for exactly one pipe; the lowest free descriptor must be the same after the call.
@@ -2179,17 +2186,18 @@ static void test_program_plugins_and_forward_zone_helpers(void) {
         close(fa);
         close(fb);
         if (fb == fa + 1) {
-            zone_config_t pipe_cfg;
-            memset(&pipe_cfg, 0, sizeof(pipe_cfg));
-            pipe_cfg.domain = "pipe.prog.";
-            tzx(&pipe_cfg)->program_path = (char *)"/usr/bin/true";
-            program_plugin_t pipe_out;
+            plug_mslot_t pipe_slot;
+            memset(&pipe_slot, 0, sizeof(pipe_slot));
+            char *argv[2] = { (char *)"/usr/bin/true", NULL };
+            pipe_slot.path = argv[0];
+            pipe_slot.argv = argv;
+            plug_proc_t pipe_out;
             struct rlimit old_lim, lim;
             assert(getrlimit(RLIMIT_NOFILE, &old_lim) == 0);
             lim = old_lim;
             lim.rlim_cur = (rlim_t)fa + 2;
             assert(setrlimit(RLIMIT_NOFILE, &lim) == 0);
-            bool spawned = spawn_one_program_plugin(&pipe_cfg, "", &pipe_out);
+            bool spawned = plug_spawn_process(&pipe_slot, &pipe_out, spawn_err, sizeof(spawn_err));
             assert(setrlimit(RLIMIT_NOFILE, &old_lim) == 0);
             assert(!spawned);
             int again = open("/dev/null", O_RDONLY);
@@ -2505,16 +2513,12 @@ static void test_query_engine_helpers_and_edge_cases(void) {
         strlcpy(two[0].view_name, "internal", sizeof(two[0].view_name));
         strlcpy(two[1].domain, "prog.example.", sizeof(two[1].domain));
         strlcpy(two[1].view_name, "external", sizeof(two[1].view_name));
-        program_plugin_t *saved = g_program_plugins;
-        int saved_count = g_program_plugins_count;
-        g_program_plugins = two;
-        g_program_plugins_count = 2;
+        program_plugins_set_for_test(two, 2);
         assert(find_program_plugin("internal", "prog.example.") == &two[0]);
         assert(find_program_plugin("EXTERNAL", "PROG.example.") == &two[1]);
         assert(find_program_plugin("other", "prog.example.") == NULL);
         assert(find_program_plugin(NULL, "prog.example.") == NULL);
-        g_program_plugins = saved;
-        g_program_plugins_count = saved_count;
+        program_plugins_set_for_test(NULL, 0);
     }
 
     // 15. forward_via_tcp
@@ -9402,8 +9406,7 @@ static void test_query_engine_program_zone_plugin_pipe_timeout_and_dead_mark(voi
     atomic_init(&plugin.consecutive_failures, 0);
     atomic_init(&plugin.dead, false);
 
-    g_program_plugins = &plugin;
-    g_program_plugins_count = 1;
+    program_plugins_set_for_test(&plugin, 1);
 
     // Send query to program zone -> will timeout since nothing writes to out_p[1]
     uint8_t req[64], res[512];
@@ -9431,8 +9434,7 @@ static void test_query_engine_program_zone_plugin_pipe_timeout_and_dead_mark(voi
     pthread_mutex_destroy(&plugin.lock);
     close(in_p[0]); close(in_p[1]);
     close(out_p[0]); close(out_p[1]);
-    g_program_plugins = NULL;
-    g_program_plugins_count = 0;
+    program_plugins_set_for_test(NULL, 0);
 
     printf("  -> Program zone plugin timeout & dead mark passed.\n");
 }
@@ -9456,8 +9458,7 @@ static void test_query_engine_program_zone_reply_bounded_by_buffer(void) {
     plugin.disable_auto_tc_flag = true;
     atomic_init(&plugin.consecutive_failures, 0);
     atomic_init(&plugin.dead, false);
-    g_program_plugins = &plugin;
-    g_program_plugins_count = 1;
+    program_plugins_set_for_test(&plugin, 1);
 
     uint8_t req[64];
     size_t req_len = 0;
@@ -9491,8 +9492,7 @@ static void test_query_engine_program_zone_reply_bounded_by_buffer(void) {
     pthread_mutex_destroy(&plugin.lock);
     close(in_p[0]); close(in_p[1]);
     close(out_p[0]); close(out_p[1]);
-    g_program_plugins = NULL;
-    g_program_plugins_count = 0;
+    program_plugins_set_for_test(NULL, 0);
     printf("  -> Program zone reply bound passed.\n");
 }
 
@@ -9540,8 +9540,7 @@ static void test_query_engine_program_zone_late_reply(void) {
     plugin.max_failures = 5;
     atomic_init(&plugin.consecutive_failures, 0);
     atomic_init(&plugin.dead, false);
-    g_program_plugins = &plugin;
-    g_program_plugins_count = 1;
+    program_plugins_set_for_test(&plugin, 1);
 
     uint8_t q1[64], q2[64], q3[64], res[512], frames[512];
     size_t l1 = 0, l2 = 0, l3 = 0;
@@ -9597,8 +9596,7 @@ static void test_query_engine_program_zone_late_reply(void) {
     pthread_mutex_destroy(&plugin.lock);
     close(in_p[0]); close(in_p[1]);
     close(out_p[0]); close(out_p[1]);
-    g_program_plugins = NULL;
-    g_program_plugins_count = 0;
+    program_plugins_set_for_test(NULL, 0);
     printf("  -> Program zone late reply passed.\n");
 }
 
@@ -10842,6 +10840,568 @@ static void test_require_server_cookie_and_view_udp_size(void) {
     printf("  -> require-server-cookie and max-udp-size of a view passed.\n");
 }
 
+/* 0.6.2: the Backend's table of plugins (dns_plugin_sup.c), with the test as the manager on the other end of the pair */
+static int pt_mgr = -1;
+
+static bool pt_recv(plug_msg_t *m) {
+    unsigned char buf[sizeof(plug_msg_t) + 1];
+    struct pollfd p = { .fd = pt_mgr, .events = POLLIN };
+    if (poll(&p, 1, 1000) != 1) return false;
+    ssize_t n = recv(pt_mgr, buf, sizeof(buf), 0);
+    return n > 0 && plug_check_from_backend(buf, (size_t)n, 0, 0, m) == PLUG_OK;
+}
+
+static bool pt_nothing(void) {
+    struct pollfd p = { .fd = pt_mgr, .events = POLLIN };
+    return poll(&p, 1, 50) == 0;
+}
+
+/* An UP for (slot, gen, seq): two pipes, the plugin's ends kept in *in_r / *out_w */
+static void pt_up(uint32_t slot, uint32_t gen, uint32_t seq, int *in_r, int *out_w, int *sent) {
+    int a[2], b[2], c[2];
+    assert(pipe(a) == 0 && pipe(b) == 0 && pipe(c) == 0);
+    plug_msg_t m;
+    plug_msg_init(&m, PLUG_MSG_UP, slot, gen, seq);
+    m.pid = 999999;
+    int fds[3] = { a[1], b[0], c[0] };
+    plug_backend_apply(&m, sizeof(m), 0, fds, PLUG_UP_NFDS);
+    if (PLUG_UP_NFDS < 3) close(c[0]);
+    close(c[1]);
+    *in_r = a[0];
+    *out_w = b[1];
+    if (sent) { sent[0] = a[1]; sent[1] = b[0]; }
+}
+
+static program_plugin_t *pt_find(const char *zone) {
+    return find_program_plugin("v", zone);
+}
+
+static void test_plugin_backend_table(void) {
+    printf("[TEST] Plugins 0.6.2: the Backend's table (START, UP, DOWN, reload: same / changed / added / removed, RELOAD line, bad records)...\n");
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+    pt_mgr = sv[0];
+    int saved_fd = g_plug_ctrl_fd;
+    g_plug_ctrl_fd = sv[1];
+
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.allow_program_zones = true;
+    view_config_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "v";
+    zone_config_t za, zb;
+    memset(&za, 0, sizeof(za));
+    memset(&zb, 0, sizeof(zb));
+    za.domain = "a.test.";
+    za.type = "program";
+    tzx(&za)->program_path = (char *)"/bin/cat";
+    tzx(&za)->program_reload_line = true;
+    zb.domain = "b.test.";
+    zb.type = "program";
+    tzx(&zb)->program_path = (char *)"/bin/cat";
+    char *args1[1] = { (char *)"one" }, *args2[1] = { (char *)"two" };
+    tzx(&zb)->program_args = args1;
+    tzx(&zb)->program_args_count = 1;
+    za.next = &zb;
+    view.zones = &za;
+    cfg.views = &view;
+
+    /* 1. start: both zones in the table, dead, a START each */
+    plug_backend_reconfigure(&cfg);
+    plug_msg_t m, ma, mb;
+    assert(pt_recv(&ma) && ma.type == PLUG_MSG_START && strcmp(ma.zone, "a.test.") == 0 && strcmp(ma.view, "v") == 0);
+    assert(pt_recv(&mb) && mb.type == PLUG_MSG_START && strcmp(mb.zone, "b.test.") == 0);
+    char fp[PLUG_FP_MAX];
+    compute_program_zone_fingerprint(&zb, fp, sizeof(fp));
+    assert(strcmp(mb.fingerprint, fp) == 0);
+    program_plugin_t *pa = pt_find("a.test."), *pb = pt_find("b.test.");
+    assert(pa && pb && atomic_load(&pa->dead) && atomic_load(&pb->dead) && pa->seq == 0);
+
+    /* 2. UP: a live object with the descriptors; bad records are refused and their descriptors closed */
+    int a_in, a_out, b_in, b_out, sent[2];
+    pt_up(ma.slot, ma.gen, 1, &a_in, &a_out, sent);
+    pa = pt_find("a.test.");
+    assert(pa && !atomic_load(&pa->dead) && pa->seq == 1 && pa->stdin_fd == sent[0] && pa->stdout_fd == sent[1] && pa->reload_line);
+    int x_in, x_out, xs[2];
+    pt_up(ma.slot, ma.gen, 1, &x_in, &x_out, xs);                       /* the same start again: refused */
+    assert(fcntl(xs[0], F_GETFD) == -1 && fcntl(xs[1], F_GETFD) == -1);
+    close(x_in); close(x_out);
+    pt_up(ma.slot, ma.gen + 100, 2, &x_in, &x_out, xs);                 /* another generation */
+    assert(fcntl(xs[0], F_GETFD) == -1 && pt_find("a.test.") == pa);
+    close(x_in); close(x_out);
+    pt_up(PLUG_SLOTS - 1, 1, 1, &x_in, &x_out, xs);                     /* a slot not in use */
+    assert(fcntl(xs[0], F_GETFD) == -1);
+    close(x_in); close(x_out);
+    {
+        int p[2];
+        assert(pipe(p) == 0);
+        plug_msg_init(&m, PLUG_MSG_UP, mb.slot, mb.gen, 1);
+        m.pid = 5;
+        int one[1] = { p[0] };
+        plug_backend_apply(&m, sizeof(m), 0, one, 1);                   /* too few descriptors */
+        assert(fcntl(p[0], F_GETFD) == -1);
+        close(p[1]);
+        assert(pt_find("b.test.") == pb && atomic_load(&pb->dead));
+        plug_backend_apply(&m, sizeof(m) - 1, 0, NULL, 0);              /* not one record */
+    }
+    pt_up(mb.slot, mb.gen, 1, &b_in, &b_out, NULL);
+    pb = pt_find("b.test.");
+    assert(pb && !atomic_load(&pb->dead));
+
+    /* 3. DOWN of the current start: dead; a DOWN of another start is refused */
+    plug_msg_init(&m, PLUG_MSG_DOWN, mb.slot, mb.gen, 7);
+    plug_backend_apply(&m, sizeof(m), 0, NULL, 0);
+    assert(!atomic_load(&pb->dead));
+    plug_msg_init(&m, PLUG_MSG_DOWN, mb.slot, mb.gen, 1);
+    m.status = 9;
+    plug_backend_apply(&m, sizeof(m), 0, NULL, 0);
+    assert(atomic_load(&pb->dead));
+    pt_up(mb.slot, mb.gen, 2, &x_in, &x_out, NULL);                     /* the restart: a new object */
+    assert(pt_find("b.test.") != pb && pt_find("b.test.")->seq == 2);
+    close(b_in); close(b_out);
+    b_in = x_in; b_out = x_out;
+    pb = pt_find("b.test.");
+
+    /* 4. reload, nothing changed: no message, the same objects, the RELOAD line to a.test. only */
+    plug_backend_reconfigure(&cfg);
+    assert(pt_nothing() && pt_find("a.test.") == pa && pt_find("b.test.") == pb);
+    char line[16] = "";
+    struct pollfd rp = { .fd = a_in, .events = POLLIN };
+    assert(poll(&rp, 1, 1000) == 1 && read(a_in, line, sizeof(line)) == 7 && memcmp(line, "RELOAD\n", 7) == 0);
+    struct pollfd bp = { .fd = b_in, .events = POLLIN };
+    assert(poll(&bp, 1, 0) == 0);
+
+    /* 5. reload, b.test.'s arguments changed: a START for a new slot; the old plugin answers until the new one is up, then STOP */
+    tzx(&zb)->program_args = args2;
+    plug_backend_reconfigure(&cfg);
+    plug_msg_t mn;
+    assert(pt_recv(&mn) && mn.type == PLUG_MSG_START && strcmp(mn.zone, "b.test.") == 0 && mn.slot != mb.slot);
+    assert(pt_find("b.test.") == pb);
+    int n_in, n_out;
+    pt_up(mn.slot, mn.gen, 1, &n_in, &n_out, NULL);
+    assert(pt_find("b.test.") != pb && pt_find("b.test.")->slot == mn.slot);
+    assert(pt_nothing());                                 /* review 5: the STOP waits for the readers of the old plugin */
+    plug_backend_reap();
+    assert(pt_recv(&m) && m.type == PLUG_MSG_STOP && m.slot == mb.slot && m.gen == mb.gen);
+    pb = pt_find("b.test.");
+
+    /* 6. reload, changed again while a replacement is pending, then back: the pending one is stopped */
+    tzx(&zb)->program_args = args1;
+    plug_backend_reconfigure(&cfg);
+    plug_msg_t mp;
+    assert(pt_recv(&mp) && mp.type == PLUG_MSG_START);
+    tzx(&zb)->program_args = args2;
+    plug_backend_reconfigure(&cfg);
+    assert(pt_recv(&m) && m.type == PLUG_MSG_STOP && m.slot == mp.slot);
+    assert(pt_find("b.test.") == pb);
+    while (poll(&rp, 1, 0) == 1 && read(a_in, line, sizeof(line)) > 0) {}   /* (the RELOAD lines of these reloads) */
+
+    /* 7. review 3: a refused replacement leaves the running plugin serving; review 2: it is asked for again (the next reload: at once,
+     * the same generation), and the switch happens when it is up */
+    tzx(&zb)->program_args = args1;
+    plug_backend_reconfigure(&cfg);
+    assert(pt_recv(&mp) && mp.type == PLUG_MSG_START);
+    plug_msg_init(&m, PLUG_MSG_DOWN, mp.slot, mp.gen, 0);
+    m.flags = PLUG_DOWN_REFUSED;
+    plug_backend_apply(&m, sizeof(m), 0, NULL, 0);
+    assert(pt_nothing() && pt_find("b.test.") == pb && !atomic_load(&pb->dead));
+    while (poll(&rp, 1, 0) == 1 && read(a_in, line, sizeof(line)) > 0) {}
+    plug_backend_reconfigure(&cfg);                       /* the same configuration: the refused replacement is not "unchanged" */
+    assert(pt_recv(&m) && m.type == PLUG_MSG_START && m.slot == mp.slot && m.gen == mp.gen);
+    assert(pt_find("b.test.") == pb);
+    int r_in, r_out;
+    pt_up(mp.slot, mp.gen, 1, &r_in, &r_out, NULL);
+    assert(pt_find("b.test.") != pb && pt_find("b.test.")->slot == mp.slot);
+    plug_backend_reap();
+    assert(pt_recv(&m) && m.type == PLUG_MSG_STOP && m.slot == mn.slot);
+    pb = pt_find("b.test.");
+
+    /* 7b. review 2: a refused zone that has no plugin yet is asked for again with the backoff (1 s) and at a reload */
+    zone_config_t zc;
+    memset(&zc, 0, sizeof(zc));
+    zc.domain = "c.test.";
+    zc.type = "program";
+    tzx(&zc)->program_path = (char *)"/bin/cat";
+    zb.next = &zc;
+    plug_backend_reconfigure(&cfg);
+    plug_msg_t mc;
+    assert(pt_recv(&mc) && mc.type == PLUG_MSG_START && strcmp(mc.zone, "c.test.") == 0);
+    plug_msg_init(&m, PLUG_MSG_DOWN, mc.slot, mc.gen, 0);
+    m.flags = PLUG_DOWN_REFUSED;
+    plug_backend_apply(&m, sizeof(m), 0, NULL, 0);
+    plug_backend_timer();
+    assert(pt_nothing());                                 /* (not before the backoff) */
+    usleep(1100000);
+    plug_backend_timer();
+    assert(pt_recv(&m) && m.type == PLUG_MSG_START && m.slot == mc.slot && m.gen == mc.gen);
+    plug_msg_init(&m, PLUG_MSG_DOWN, mc.slot, mc.gen, 0);
+    m.flags = PLUG_DOWN_REFUSED;
+    plug_backend_apply(&m, sizeof(m), 0, NULL, 0);
+    while (poll(&rp, 1, 0) == 1 && read(a_in, line, sizeof(line)) > 0) {}
+    plug_backend_reconfigure(&cfg);
+    assert(pt_recv(&m) && m.type == PLUG_MSG_START && m.slot == mc.slot);   /* the reload asks at once */
+#ifdef __FreeBSD__
+    /* review 10: an UP whose descriptors are not pipes is a failed start: KILL, nothing in the table */
+    {
+        int bad[2], c2[2], p2[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, bad) == 0 && pipe(c2) == 0 && pipe(p2) == 0);
+        plug_msg_init(&m, PLUG_MSG_UP, mc.slot, mc.gen, 1);
+        m.pid = 77;
+        int fds3[3] = { bad[0], c2[0], p2[0] };
+        plug_backend_apply(&m, sizeof(m), 0, fds3, 3);
+        assert(fcntl(bad[0], F_GETFD) == -1 && fcntl(c2[0], F_GETFD) == -1);
+        assert(pt_recv(&m) && m.type == PLUG_MSG_KILL && m.slot == mc.slot && m.seq == 1);
+        assert(atomic_load(&pt_find("c.test.")->dead));
+        close(bad[1]); close(c2[1]); close(p2[1]);
+    }
+#endif
+    zb.next = NULL;
+
+    /* 8. reload, a.test. and c.test. removed: out of the table, STOP after the readers; program-max-failures sends a KILL */
+    view.zones = &zb;
+    plug_backend_reconfigure(&cfg);
+    assert(pt_find("a.test.") == NULL && pt_find("c.test.") == NULL);
+    assert(pt_nothing());
+    plug_backend_reap();
+    bool stop_a = false, stop_c = false;
+    for (int k = 0; k < 2; k++) {
+        assert(pt_recv(&m) && m.type == PLUG_MSG_STOP);
+        if (m.slot == ma.slot) stop_a = true;
+        if (m.slot == mc.slot) stop_c = true;
+    }
+    assert(stop_a && stop_c);
+    {
+        program_plugin_t fake;
+        memset(&fake, 0, sizeof(fake));
+        fake.proc_fd = -1;
+        fake.slot = 3;
+        fake.gen = 4;
+        fake.seq = 5;
+        plug_backend_kill(&fake);
+        assert(pt_recv(&m) && m.type == PLUG_MSG_KILL && m.slot == 3 && m.gen == 4 && m.seq == 5);
+        assert(!atomic_load(&fake.kill_owed));
+    }
+
+    /* 9. no program zone left (allow-program-zones no: they answer SERVFAIL): empty table, STOP after the readers; freed */
+    cfg.allow_program_zones = false;
+    plug_backend_reconfigure(&cfg);
+    assert(atomic_load(&g_program_plugin_table) == NULL);
+    plug_backend_reap();
+    assert(pt_recv(&m) && m.type == PLUG_MSG_STOP);
+    plug_backend_reap();
+
+    /* review 8: a KILL that cannot be sent stays owed and the timer sends it again */
+    {
+        program_plugin_t fake;
+        memset(&fake, 0, sizeof(fake));
+        fake.proc_fd = -1;
+        fake.slot = 6;
+        fake.gen = 7;
+        fake.seq = 8;
+        program_plugins_set_for_test(&fake, 1);
+        g_plug_ctrl_fd = -1;
+        plug_backend_kill(&fake);
+        assert(atomic_load(&fake.kill_owed));
+        g_plug_ctrl_fd = sv[1];
+        plug_backend_timer();
+        assert(pt_recv(&m) && m.type == PLUG_MSG_KILL && m.slot == 6 && m.seq == 8 && !atomic_load(&fake.kill_owed));
+        program_plugins_set_for_test(NULL, 0);
+    }
+    close(r_in); close(r_out);
+
+    /* review 4: 256 zones, every one replaced while its replacement is pending and after the switch: the slots do not run out */
+    {
+        int big = 1024 * 1024;
+        for (int e = 0; e < 2; e++) { (void)setsockopt(sv[e], SOL_SOCKET, SO_RCVBUF, &big, sizeof(big)); (void)setsockopt(sv[e], SOL_SOCKET, SO_SNDBUF, &big, sizeof(big)); }
+        static zone_config_t many[PLUG_MAX_ZONES];
+        static char names[PLUG_MAX_ZONES][24];
+        char *argv_r[4][1] = { { (char *)"r0" }, { (char *)"r1" }, { (char *)"r2" }, { (char *)"r3" } };
+        memset(many, 0, sizeof(many));
+        for (int i = 0; i < PLUG_MAX_ZONES; i++) {
+            snprintf(names[i], sizeof(names[i]), "z%d.test.", i);
+            many[i].domain = names[i];
+            many[i].type = "program";
+            tzx(&many[i])->program_path = (char *)"/bin/cat";
+            many[i].next = i + 1 < PLUG_MAX_ZONES ? &many[i + 1] : NULL;
+        }
+        view.zones = many;
+        cfg.allow_program_zones = true;
+        static plug_msg_t st[PLUG_MAX_ZONES];
+        for (int round = 0; round < 5; round++) {
+            for (int i = 0; i < PLUG_MAX_ZONES; i++) {
+                tzx(&many[i])->program_args = argv_r[round % 4];
+                tzx(&many[i])->program_args_count = round == 0 ? 0 : 1;
+            }
+            plug_backend_reconfigure(&cfg);
+            int starts = 0;
+            while (pt_recv(&m)) {
+                if (m.type == PLUG_MSG_START) st[starts++ % PLUG_MAX_ZONES] = m;
+            }
+            if (starts != PLUG_MAX_ZONES) printf("round %d: %d STARTs\n", round, starts);
+            assert(starts == PLUG_MAX_ZONES);                 /* every zone got its START: no "no slot" */
+            if (round == 0 || round == 2) {                   /* the plugins come up: the old ones retire, unreaped */
+                if (round == 2) rcu_aux_read_lock();          /* (a reader: nothing retired is freed until round 4 is done) */
+                for (int i = 0; i < PLUG_MAX_ZONES; i++) {
+                    int ui, uo;
+                    pt_up(st[i].slot, st[i].gen, 1, &ui, &uo, NULL);
+                    close(ui); close(uo);
+                }
+            }
+        }
+        rcu_aux_read_unlock();
+        cfg.allow_program_zones = false;
+        plug_backend_reconfigure(&cfg);
+        plug_backend_reap();
+        while (pt_recv(&m)) {}
+        assert(atomic_load(&g_program_plugin_table) == NULL);
+    }
+    close(a_in); close(a_out); close(b_in); close(b_out); close(n_in); close(n_out);
+    g_plug_ctrl_fd = saved_fd;
+    close(sv[0]);
+    close(sv[1]);
+    printf("  -> the Backend's plugin table passed.\n");
+}
+
+int plugin_write_reload_line(int fd, uint32_t wait_ms);
+
+/* review 6: the RELOAD line: never a wait on the control thread (owed to the next exchange when the pipe is full), a fragment is told apart */
+static void test_plugin_reload_line_write(void) {
+    printf("[TEST] Plugins 0.6.2: the RELOAD line (whole, owed when the pipe is full, a fragment)...\n");
+    int p[2];
+    assert(pipe(p) == 0);
+    char buf[16];
+    assert(plugin_write_reload_line(p[1], 0) == 1 && read(p[0], buf, sizeof(buf)) == 7 && memcmp(buf, "RELOAD\n", 7) == 0);
+    fcntl(p[1], F_SETFL, fcntl(p[1], F_GETFL) | O_NONBLOCK);
+    static char fill[4096];
+    while (write(p[1], fill, sizeof(fill)) > 0) {}
+    while (write(p[1], fill, 1) > 0) {}
+    assert(plugin_write_reload_line(p[1], 0) == 0);
+    assert(plugin_write_reload_line(p[1], 50) == 0);
+    /* the control thread does not wait: the line stays owed */
+    program_plugin_t pl;
+    memset(&pl, 0, sizeof(pl));
+    pl.stdin_fd = p[1];
+    pl.stdout_fd = -1;
+    pl.proc_fd = -1;
+    pl.timeout_ms = 2000;
+    pl.reload_line = true;
+    pthread_mutex_init(&pl.lock, NULL);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    program_plugin_request_reload(&pl);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    assert(atomic_load(&pl.reload_pending) && (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < 500);
+    pthread_mutex_destroy(&pl.lock);
+    close(p[0]);
+    close(p[1]);
+    /* a fragment: a stream socket with room for 3 bytes takes "REL" and no more */
+    int s2[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, s2) == 0);
+    fcntl(s2[1], F_SETFL, fcntl(s2[1], F_GETFL) | O_NONBLOCK);
+    int one = 1;
+    (void)setsockopt(s2[1], SOL_SOCKET, SO_SNDLOWAT, &one, sizeof(one));
+    while (write(s2[1], fill, sizeof(fill)) > 0) {}
+    while (write(s2[1], fill, 1) > 0) {}
+    size_t got = 0;
+    while (got < 3) {
+        ssize_t n = read(s2[0], buf, 3 - got);
+        assert(n > 0);
+        got += (size_t)n;
+    }
+    int r = plugin_write_reload_line(s2[1], 50);
+    printf("  (a socket with 3 bytes of room: %d)\n", r);
+#ifdef __FreeBSD__
+    assert(r == -1);                                      /* (FreeBSD 15: "REL" goes, the rest does not: a fragment) */
+#else
+    assert(r != 1);
+#endif
+    close(s2[0]);
+    close(s2[1]);
+    printf("  -> the RELOAD line passed.\n");
+}
+
+/* The Backend's end of the manager's pair: the next record, with the number of descriptors (closed) */
+static bool ps_recv(int fd, plug_msg_t *m, int *nfds, int wait_ms) {
+    struct pollfd p = { .fd = fd, .events = POLLIN };
+    if (poll(&p, 1, wait_ms) != 1) return false;
+    unsigned char buf[sizeof(plug_msg_t) + 1];
+    union { struct cmsghdr h; char c[CMSG_SPACE(sizeof(int) * 4)]; } u;
+    struct iovec iov = { buf, sizeof(buf) };
+    struct msghdr mh;
+    memset(&mh, 0, sizeof(mh));
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    mh.msg_control = u.c;
+    mh.msg_controllen = sizeof(u.c);
+    ssize_t n = recvmsg(fd, &mh, 0);
+    if (n != (ssize_t)sizeof(plug_msg_t)) return false;
+    *nfds = 0;
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c)) {
+        int k = (int)((c->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+        for (int i = 0; i < k; i++) {
+            int fd2;
+            memcpy(&fd2, (unsigned char *)CMSG_DATA(c) + (size_t)i * sizeof(int), sizeof(int));
+            close(fd2);
+        }
+        *nfds += k;
+    }
+    memcpy(m, buf, sizeof(*m));
+    return true;
+}
+
+static void test_plugin_manager(void) {
+    printf("[TEST] Plugins 0.6.2: the manager's supervisor (START from its configuration, re-read, refusals, UP, KILL, exit, backoff, STOP)...\n");
+    static plug_sup_t s;
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.allow_program_zones = true;
+    view_config_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "v";
+    zone_config_t z;
+    memset(&z, 0, sizeof(z));
+    z.domain = "m.test.";
+    z.type = "program";
+    tzx(&z)->program_path = (char *)"/bin/cat";
+    if (geteuid() == 0) tzx(&z)->program_user = (char *)"nobody";
+    view.zones = &z;
+    cfg.views = &view;
+    char fp[PLUG_FP_MAX];
+    compute_program_zone_fingerprint(&z, fp, sizeof(fp));
+    /* the configuration file the manager reads again for a zone its copy does not have */
+    char path[] = "/tmp/karidns_plugsup_XXXXXX";
+    int cf = mkstemp(path);
+    assert(cf >= 0);
+    const char *conf = geteuid() == 0
+        ? "options { allow-program-zones yes; };\nview \"v\" { zone \"f.test.\" { type program; program \"/bin/cat\"; program-user \"nobody\"; }; };\n"
+        : "options { allow-program-zones yes; };\nview \"v\" { zone \"f.test.\" { type program; program \"/bin/cat\"; }; };\n";
+    assert(write(cf, conf, strlen(conf)) == (ssize_t)strlen(conf));
+    close(cf);
+
+    int saved = g_plug_ctrl_fd;
+    char err[256];
+    plug_sup_init(&s, &cfg, path);
+    assert(plug_sup_open_pair(&s, err, sizeof(err)));
+    int bk = g_plug_ctrl_fd;
+    plug_msg_t m, r;
+    int nfds;
+
+    /* 1. START of a zone of the configuration: started on the next tick, UP with the descriptors */
+    plug_msg_init(&m, PLUG_MSG_START, 7, 70, 0);
+    strcpy(m.zone, "M.TEST.");
+    strcpy(m.view, "v");
+    strcpy(m.fingerprint, fp);
+    assert(send(bk, &m, sizeof(m), 0) == (ssize_t)sizeof(m));
+    unsigned char junk[10] = { 1 };
+    assert(send(bk, junk, sizeof(junk), 0) == (ssize_t)sizeof(junk));   /* not a record: refused */
+    plug_sup_tick(&s);
+    assert(s.s[7].state == PLUG_MS_RUN && s.s[7].seq == 1 && s.starts == 1);
+    assert(ps_recv(bk, &r, &nfds, 1000) && r.type == PLUG_MSG_UP && r.slot == 7 && r.gen == 70 && r.seq == 1 && nfds == PLUG_UP_NFDS);
+    assert(r.pid == s.s[7].pid);
+    assert(plug_sup_wait_ms(&s) == 250);                                  /* a plugin runs: its end is looked for */
+    plug_sup_handle(&s, &m);                                              /* a repeat of the START: nothing */
+    assert(s.s[7].seq == 1);
+
+    /* 2. KILL of that start: killed, collected, DOWN, started again after 1 s */
+    plug_msg_init(&m, PLUG_MSG_KILL, 7, 70, 1);
+    plug_sup_handle(&s, &m);
+    for (int i = 0; i < 100 && s.s[7].state == PLUG_MS_RUN; i++) {
+        usleep(20000);
+        plug_sup_tick(&s);
+    }
+    assert(s.s[7].state == PLUG_MS_WAIT && s.s[7].backoff_s == 2);
+    assert(ps_recv(bk, &r, &nfds, 1000) && r.type == PLUG_MSG_DOWN && r.seq == 1 && nfds == 0);   /* (killed, or ended by itself: its stdin is closed) */
+    int w = plug_sup_wait_ms(&s);
+    assert(w > 500 && w <= 1000);
+    s.s[7].start_at_ms = 0;                                               /* (its time has come) */
+    plug_sup_tick(&s);
+    assert(s.s[7].state == PLUG_MS_RUN && s.s[7].seq == 2);
+    assert(ps_recv(bk, &r, &nfds, 1000) && r.type == PLUG_MSG_UP && r.seq == 2);
+    pid_t p2 = s.s[7].pid;
+
+    /* 3. STOP: the process goes, the slot is free */
+    plug_msg_init(&m, PLUG_MSG_STOP, 7, 70, 0);
+    plug_sup_handle(&s, &m);
+    assert(s.s[7].state == PLUG_MS_FREE && s.s[7].gen == 0 && s.nstopping == 1);
+    for (int i = 0; i < 100 && s.nstopping; i++) {
+        usleep(20000);
+        plug_sup_tick(&s);
+    }
+    assert(s.nstopping == 0 && kill(p2, 0) != 0);
+
+    /* 4. refused: not a zone of the configuration (the file has none of that name either), settings that differ */
+    plug_msg_init(&m, PLUG_MSG_START, 8, 80, 0);
+    strcpy(m.zone, "none.test.");
+    strcpy(m.fingerprint, fp);
+    plug_sup_handle(&s, &m);
+    assert(s.s[8].state == PLUG_MS_REFUSED);
+    assert(ps_recv(bk, &r, &nfds, 1000) && r.type == PLUG_MSG_DOWN && r.slot == 8 && r.seq == 0 && (r.flags & PLUG_DOWN_REFUSED));
+    plug_msg_init(&m, PLUG_MSG_START, 9, 90, 0);
+    strcpy(m.zone, "f.test.");
+    strcpy(m.view, "v");
+    strcpy(m.fingerprint, "0000000000000000");
+    plug_sup_handle(&s, &m);
+    assert(s.s[9].state == PLUG_MS_REFUSED && s.own_cfg != NULL);         /* (the file was read) */
+    assert(ps_recv(bk, &r, &nfds, 1000) && r.type == PLUG_MSG_DOWN && (r.flags & PLUG_DOWN_REFUSED));
+    assert(s.rereads == 1);                                               /* review 7: at most one reading a second */
+    plug_sup_handle(&s, &m);                                              /* review 2: a refused START asked again is looked at again */
+    assert(s.s[9].state == PLUG_MS_REFUSED && s.rereads == 1);
+    assert(ps_recv(bk, &r, &nfds, 1000) && r.type == PLUG_MSG_DOWN && r.slot == 9 && (r.flags & PLUG_DOWN_REFUSED));
+    s.reread_ms -= 1000;                                                  /* (a second later) */
+    plug_sup_handle(&s, &m);
+    assert(s.rereads == 2);
+    assert(ps_recv(bk, &r, &nfds, 1000) && r.type == PLUG_MSG_DOWN && r.slot == 9);
+
+    /* 5. a zone a reload added: in the file, not in the start-up copy */
+    char ffp[PLUG_FP_MAX];
+    const zone_config_t *fz = s.own_cfg && s.own_cfg->views ? s.own_cfg->views->zones : NULL;
+    assert(fz && strcmp(fz->domain, "f.test.") == 0);
+    compute_program_zone_fingerprint(fz, ffp, sizeof(ffp));
+    plug_msg_init(&m, PLUG_MSG_START, 9, 91, 0);                          /* the slot again, with another generation */
+    strcpy(m.zone, "f.test.");
+    strcpy(m.view, "v");
+    strcpy(m.fingerprint, ffp);
+    plug_sup_handle(&s, &m);
+    assert(s.s[9].state == PLUG_MS_WAIT && s.s[9].gen == 91);
+    plug_sup_tick(&s);
+    assert(s.s[9].state == PLUG_MS_RUN);
+    assert(ps_recv(bk, &r, &nfds, 1000) && r.type == PLUG_MSG_UP && r.slot == 9 && r.gen == 91);
+    assert(!plug_sup_child_exited(&s, 1, 0));
+
+    /* 6. the start rate: without a token nothing starts, and the wait is the next token */
+    plug_msg_init(&m, PLUG_MSG_STOP, 9, 91, 0);
+    plug_sup_handle(&s, &m);
+    plug_msg_init(&m, PLUG_MSG_START, 10, 100, 0);
+    strcpy(m.zone, "f.test.");                                            /* (the manager's copy is the file's now) */
+    strcpy(m.view, "v");
+    strcpy(m.fingerprint, ffp);
+    plug_sup_handle(&s, &m);
+    unsigned tokens = s.tokens;
+    s.tokens = 0;
+    s.refill_ms = INT64_MAX / 2;                                          /* (no refill now) */
+    plug_sup_tick(&s);
+    assert(s.s[10].state == PLUG_MS_WAIT && plug_sup_wait_ms(&s) == 1000 / PLUG_START_RATE);
+    s.tokens = tokens;
+
+    /* 7. shut down: every plugin is killed */
+    plug_sup_tick(&s);
+    pid_t p3 = s.s[10].pid;
+    assert(s.s[10].state == PLUG_MS_RUN && p3 > 0);
+    plug_sup_stop_all(&s);
+    for (int i = 0; i < 100 && kill(p3, 0) == 0; i++) {
+        (void)waitpid(p3, NULL, WNOHANG);
+        usleep(20000);
+    }
+    assert(kill(p3, 0) != 0 && s.s[10].state == PLUG_MS_FREE && s.own_cfg == NULL);
+    plug_sup_close_manager_end(&s);
+    assert(s.fd < 0);
+    close(bk);
+    g_plug_ctrl_fd = saved;
+    unlink(path);
+    printf("  -> the manager's supervisor passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Expanded Query Engine Unit Tests ===\n");
     test_chaos_builtin_zones();
@@ -10851,6 +11411,9 @@ int main(void) {
     test_query_engine_program_zone_plugin_pipe_timeout_and_dead_mark();
     test_query_engine_program_zone_reply_bounded_by_buffer();
     test_query_engine_program_zone_late_reply();
+    test_plugin_backend_table();
+    test_plugin_manager();
+    test_plugin_reload_line_write();
     test_query_engine_opcode_header_validations();
     test_all_rr_types_and_resolution();
     test_dnssec_negative_and_delegation_proofs();

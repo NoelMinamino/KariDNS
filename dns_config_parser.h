@@ -395,7 +395,7 @@ typedef struct zone_ext {
   char *program_user;          /* 追加の権限降格先ユーザ(省略可) */
   uint32_t program_timeout_ms; /* 1クエリの応答待ちタイムアウト(既定 2000) */
   uint32_t program_max_failures; /* 連続失敗許容回数(既定 5) */
-  uint32_t program_restart_backoff_ms; /* 未使用: v1では自動再起動なし。将来用に予約 */
+  bool program_reload_line;    /* program-reload-line yes: a reload writes the line "RELOAD" to the plugin (0.6.2; default no) */
   /* --- ここまで追加 --- */
 
   /* --- type "forward" 用 --- */

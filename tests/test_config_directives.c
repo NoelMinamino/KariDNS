@@ -826,7 +826,7 @@ static void test_zone_program_and_forward(void) {
     if (parse_ok("options { user \"nobody\"; allow-program-zones yes; };"
                  "zone \"dyn.example\" { type program; program \"/usr/local/bin/backend\"; "
                  "program-args { \"--verbose\"; \"zone=dyn\"; }; program-user \"svc\"; "
-                 "program-timeout 750; program-max-failures 3; };"
+                 "program-timeout 750; program-max-failures 3; program-reload-line yes; };"
                  "zone \"dyn2.example\" { type program; program \"/bin/true\"; };", &cfg)) {
         CHECK(cfg.allow_program_zones == true);
         CHECK_STR(cfg.user, "nobody");
@@ -842,11 +842,13 @@ static void test_zone_program_and_forward(void) {
             CHECK_STR(zext(z1)->program_user, "svc");
             CHECK(zext(z1)->program_timeout_ms == 750);
             CHECK(zext(z1)->program_max_failures == 3);
+            CHECK(zext(z1)->program_reload_line == true);
             const zone_config_t *z2 = z1->next;
             CHECK(z2 != NULL);
             if (z2) {
                 CHECK_STR(zext(z2)->program_path, "/bin/true");
                 CHECK_STR(zext(z2)->program_user, "nobody");   /* inherited from options { user } */
+                CHECK(zext(z2)->program_reload_line == false); /* 0.6.2: the RELOAD line is opt-in */
             }
         }
         free_server_config_fields(&cfg);
@@ -866,6 +868,27 @@ static void test_zone_program_and_forward(void) {
     expect_reject("program-timeout negative", "zone \"d.test\" { type program; program-timeout -1; };");
     expect_reject("program-timeout above 2^31-1", "zone \"d.test\" { type program; program-timeout 4294968296; };");
     expect_reject("program-max-failures not a number", "zone \"d.test\" { type program; program-max-failures x; };");
+    expect_reject("program-reload-line not a boolean", "zone \"d.test\" { type program; program-reload-line maybe; };");
+    expect_reject("program-reload-line ';' missing", "zone \"d.test\" { type program; program-reload-line yes };");
+    /* 0.6.2: at most PLUG_MAX_ZONES (256) program zones */
+    {
+        size_t cap = 300 * 96;
+        char *many = malloc(cap);
+        CHECK(many != NULL);
+        if (many) {
+            for (int total = 256; total <= 257; total++) {
+                size_t len = (size_t)snprintf(many, cap, "options { allow-program-zones yes; };");
+                for (int i = 0; i < total; i++)
+                    len += (size_t)snprintf(many + len, cap - len, "zone \"p%d.test\" { type program; program \"/bin/cat\"; };", i);
+                if (total == 256) {
+                    if (parse_ok(many, &cfg)) free_server_config_fields(&cfg);
+                } else {
+                    expect_reject("257 program zones", many);
+                }
+            }
+            free(many);
+        }
+    }
     expect_reject("forward-timeout above 2^31-1", "zone \"f.test\" { type forward; forwarders { 192.0.2.53; }; forward-timeout 99999999999; };");
 
     if (parse_ok("zone \"f.example\" { type forward; forwarders { 192.0.2.53; 198.51.100.53 port 5353; }; "

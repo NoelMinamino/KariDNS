@@ -61,6 +61,7 @@
 #include "dns_query_engine.h"
 #include "dns_snapshot_rcu.h"
 #include "dns_db_supervisor.h"
+#include "dns_plugin_sup.h"
 #include "dns_db_ingest.h"
 #include "dns_db_stream.h"
 #include "dns_park.h"
@@ -527,8 +528,9 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr,
   }
   int fd = -1;
   cmsg = CMSG_FIRSTHDR(&msg);
-  if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS)
-    fd = *(int *)CMSG_DATA(cmsg);
+  if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS && cmsg->cmsg_len >= CMSG_LEN(sizeof(int)) &&
+      msg.msg_controllen >= CMSG_LEN(sizeof(int)))   /* (0.6.2 review: the descriptor is inside the control data that came) */
+    memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
   pthread_mutex_unlock(&broker_lock);
   if (data[0] != 0) {                           /* the broker refused: close a descriptor that came with the answer anyway */
     if (fd >= 0) close(fd);
@@ -3651,9 +3653,10 @@ STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged
     return res;
   }
   /* P4 is not checked here: the Backend runs in capability mode and cannot resolve names (getpwnam() would open the user
-   * database and trap).  user / group, loader-user / loader-group and the program-user of a program zone take effect only
-   * after a restart (the plugins are started at startup, the identities are resolved then); the start refuses a root one
-   * (resolve_run_identity(), validate_program_zone_users()) and karicheck conf shows it before. */
+   * database and trap).  user / group and loader-user / loader-group take effect only after a restart (the identities are
+   * resolved then); the start refuses a root one (resolve_run_identity(), validate_program_zone_users()) and karicheck conf
+   * shows it before.  The program-user of a program zone is resolved by the manager at every start of its plugin
+   * (dns_plugin_sup.c), which refuses a root one too. */
   /* The new logging runtime (channels, files, the table of categories) is built before the configuration is published, so a file that
    * cannot be opened rejects the reload.  A file in a directory that was not opened before the sandbox cannot be opened by anyone now:
    * the logging in use stays as it is and a restart brings the new one (not a failure of the reload). */
@@ -3694,31 +3697,10 @@ STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged
   } else if (res.zones_failed > 0) {
     res.status = CONFIG_RELOAD_ZONE_ERRORS;
   }
-  for (view_config_t *v = standby->views; v; v = v->next) {
-    for (zone_config_t *z = v->zones; z; z = z->next) {
-      if (z->type && strcasecmp(z->type, "program") == 0) {
-        program_plugin_t *running = find_program_plugin(v->name, z->domain);
-        if (running) {
-          /* M-4: 実行中の設定と新しい設定を比較し、変わっていれば警告 */
-          char new_fingerprint[512];
-          compute_program_zone_fingerprint(z, new_fingerprint, sizeof(new_fingerprint));
-          if (strcmp(running->config_fingerprint, new_fingerprint) != 0) {
-            syslog(LOG_WARNING, "[Plugin] zone '%s' in view '%s' (type program) configuration changed "
-                   "(program/program-args/program-user/program-timeout/program-max-failures), "
-                   "but the running plugin process cannot be restarted without a full karidns "
-                   "restart (Capsicum sandbox is already active). The OLD configuration is "
-                   "still in effect for this zone.", z->domain, v->name);
-            append_list_item(res.restart_needed, sizeof(res.restart_needed), "type program zone settings");
-          }
-        } else {
-          syslog(LOG_ERR, "[Plugin] zone '%s' in view '%s' (type program) was added via reload but "
-                 "cannot be started without a full restart (Capsicum sandbox is already active). "
-                 "This zone will return SERVFAIL until karidns is restarted.", z->domain, v->name);
-          append_list_item(res.restart_needed, sizeof(res.restart_needed), "new type program zones");
-        }
-      }
-    }
-  }
+  /* 0.6.2: the plugins follow the new configuration (the manager starts and stops them, dns_plugin_sup.c): a new program zone gets one,
+   * a changed fingerprint a new one (the old one answers until the new one is up), a removed zone's plugin is stopped, an unchanged one is
+   * left alone and gets the RELOAD line with program-reload-line yes */
+  plug_backend_reconfigure(standby);
   if (res.restart_needed[0])
     syslog(LOG_WARNING, "[Config] Reload: changed settings take effect only after a restart: %s", res.restart_needed);
   if (res.status == CONFIG_RELOAD_ZONE_ERRORS)
@@ -4476,6 +4458,12 @@ void *control_thread_func(void *arg) {
     if (kevent(kq, ev_set, 1, NULL, 0, NULL) == -1)
       syslog(LOG_ERR, "[Control] Cannot watch NOTIFY answers: %m (outbound NOTIFY is not retransmitted correctly)");
   }
+  /* 0.6.2: the manager's answers about the plugins (UP with the descriptors, DOWN), dns_plugin_sup.c */
+  if (g_plug_ctrl_fd >= 0) {
+    EV_SET(&ev_set[0], g_plug_ctrl_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+    if (kevent(kq, ev_set, 1, NULL, 0, NULL) == -1)
+      syslog(LOG_ERR, "[Control] Cannot watch the plugin control socket: %m (program zones are not restarted)");
+  }
 
   /* O-18: main() の起動処理 (権限降格・Capsicum 突入) が終わるまで、制御コマンド・SIGHUP・
    * タイマーを処理しない。reload は設定の読み込みやログの所有者の引き渡しを行うので、
@@ -4495,6 +4483,15 @@ void *control_thread_func(void *arg) {
     for (int i = 0; i < n; i++) {
       if (ev_list[i].filter == EVFILT_USER && ev_list[i].ident == DB_INGEST_CTL_EVENT) {
         control_db_results();
+        continue;
+      }
+      if (ev_list[i].filter == EVFILT_READ && g_plug_ctrl_fd >= 0 && ev_list[i].ident == (uintptr_t)g_plug_ctrl_fd) {
+        plug_backend_handle_ctrl();
+        if (ev_list[i].flags & EV_EOF) {      /* the manager is gone: do not wake up for it again */
+          struct kevent del;
+          EV_SET(&del, g_plug_ctrl_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+          (void)kevent(kq, &del, 1, NULL, 0, NULL);
+        }
         continue;
       }
       if (ev_list[i].filter == EVFILT_READ && g_notify_resp_ipc[0] >= 0 &&
@@ -5153,6 +5150,7 @@ void *control_thread_func(void *arg) {
         zone_retire_process(false);
         zone_prev_expire(now);          /* karictl rollback: the previous versions whose rollback-window is over */
         config_standby_reap(false);
+        plug_backend_timer();           /* 0.6.2: freed plugin objects (and their STOPs), STARTs to ask again, owed KILLs */
         if (g_reload_pending) {
           /* O-10: 読み手が残っていて延期したリロードを捨てずにやり直す */
           syslog(LOG_NOTICE, "[Config] Retrying the postponed reload");
@@ -6304,7 +6302,7 @@ STATIC_TEST bool validate_program_zone_users(server_config_t *cfg) {
       gid_t pgid;
       bool found = lookup_user_ids(zext(z)->program_user, &puid, &pgid);
       /* P4: a program-user that is root by another name (uid 0, or the root group as its primary group) is refused,
-       * as a start as root with no program-user is not run either (spawn_one_program_plugin()) */
+       * as a start as root with no program-user is not run either (the manager, dns_plugin_sup.c) */
       char id_err[256];
       if (identity_names_root(zext(z)->program_user, NULL, id_err, sizeof(id_err))) {
         syslog(LOG_ERR, "[Config] Refusing: zone '%s': program-user: %s", z->domain, id_err);
@@ -6473,6 +6471,9 @@ bool ensure_priv_dir_safe(const char *dir_buf) {
 }
 
 #ifndef KARIDNS_UNIT_TEST
+// 0.6.2: the supervisor of the program zone plugins (the manager uses it; the Backend and the routers only close its end)
+static plug_sup_t g_plug_sup;
+
 int main(int argc, char **argv) {
   assert(calc_fnv1a_str("*.") == FNV1A_WILDCARD_PREFIX_HASH);
   init_server_cookie_secret();
@@ -7022,6 +7023,18 @@ int main(int argc, char **argv) {
       exit(1);
     }
   }
+  // 0.6.2: the plugins of the program zones are started by the manager; the pair to the Backend exists before the Backend is forked
+  // (always: a reload may add a program zone)
+  plug_sup_init(&g_plug_sup, &g_config_db.config_a, g_config_path);
+  {
+    char plug_err[256];
+    if (!plug_sup_open_pair(&g_plug_sup, plug_err, sizeof(plug_err))) {
+      syslog(LOG_CRIT, "[Startup] %s", plug_err);
+      if (g_broker_pid > 0) kill(g_broker_pid, SIGTERM);
+      cleanup_pid_file();
+      exit(1);
+    }
+  }
 
   gc_snapshot_wait_idle(); // GC threads of the startup configuration must be gone: the Backend is forked from one thread
   pid_t backend_pid = fork();
@@ -7036,6 +7049,7 @@ int main(int argc, char **argv) {
     // === Parent Process (Process Manager / Supervisor) ===
     klog_set_role(KLOG_ROLE_AUX);   // the Backend rolls the log files; this process appends to them by name
     db_sup_after_fork_supervisor(&dbsup); // the Backend's ends of the loader sockets belong to the Backend
+    plug_sup_after_fork_manager(&g_plug_sup);
     sigset_t unblock_set;
     sigemptyset(&unblock_set);
     sigaddset(&unblock_set, SIGHUP);
@@ -7092,6 +7106,7 @@ int main(int argc, char **argv) {
           g_broker_sock = -1;
         }
         db_sup_close_supervisor_ends(&dbsup);
+        plug_sup_close_manager_end(&g_plug_sup);
         run_frontend_router(backend_pid, r);
         exit(0);
       }
@@ -7121,12 +7136,15 @@ int main(int argc, char **argv) {
 
     // beta design 1.2 step 4: the loader is started last, when the Backend and the routers exist.  Its stderr is a pipe the loop below reads
     // (batch 14): SIGIO tells that it has data, the handler does nothing (the signal is blocked in the loop and taken with sigtimedwait())
-    if (dbsup.enabled) {
+    // 0.6.2: SIGIO also tells that the Backend has written a plugin request (plug_sup_after_fork_manager() armed it)
+    {
       struct sigaction ioa;
       memset(&ioa, 0, sizeof(ioa));
       ioa.sa_handler = supervisor_sigchld_handler;
       sigemptyset(&ioa.sa_mask);
       sigaction(SIGIO, &ioa, NULL);
+    }
+    if (dbsup.enabled) {
       dbsup.want_sigio = true;
       db_sup_spawn(&dbsup);
     }
@@ -7167,6 +7185,7 @@ int main(int argc, char **argv) {
       bool child_died = false;
       while ((w = waitpid(-1, &status, WNOHANG)) > 0) {
         if (db_sup_child_exited(&dbsup, w, status)) continue;
+        if (plug_sup_child_exited(&g_plug_sup, w, status)) continue;   // (a plugin, where it is an ordinary child: without pdfork())
         dead = w;
         if (WIFEXITED(status)) {
           int code = WEXITSTATUS(status);
@@ -7189,7 +7208,10 @@ int main(int argc, char **argv) {
       db_sup_tick(&dbsup);
       bool log_more = db_sup_log_read(&dbsup);     // the loader's messages (the read is bounded: the signals above and below get their turn)
       struct timespec nap;
+      plug_sup_tick(&g_plug_sup);                 // 0.6.2: the Backend's plugin requests, plugins that ended, restarts that are due
       int nap_ms = log_more ? 0 : db_sup_wait_ms(&dbsup);
+      int plug_ms = plug_sup_wait_ms(&g_plug_sup);
+      if (plug_ms >= 0 && (nap_ms < 0 || plug_ms < nap_ms)) nap_ms = plug_ms;
       nap.tv_sec = nap_ms / 1000;
       nap.tv_nsec = (long)(nap_ms % 1000) * 1000000L;
       siginfo_t si;
@@ -7204,6 +7226,7 @@ int main(int argc, char **argv) {
     if (g_supervisor_should_exit && dead <= 0) {
       syslog(LOG_INFO, "[Manager] Received termination signal. Shutting down children.");
     }
+    plug_sup_stop_all(&g_plug_sup);              // 0.6.2: the plugins first (on FreeBSD they are no child the wait below collects)
     /* The children that have not been collected yet (the loader is tracked by dbsup).  A pid that was reaped is never
      * signalled again: it could belong to another process by now. */
     pid_t kids[MAX_FRONTEND_ROUTERS + 2];
@@ -7303,6 +7326,7 @@ int main(int argc, char **argv) {
     g_pid_fd = -1;
   }
   db_sup_close_supervisor_ends(&dbsup); // the loader sockets: the Backend keeps only its own ends
+  plug_sup_close_manager_end(&g_plug_sup);  // 0.6.2: the Backend keeps g_plug_ctrl_fd
 
   // 指示2: Backendプロセス側もFrontend用端点を直ちにclose
   for (int f = 0; f < g_num_frontend_routers; f++) {
@@ -7417,12 +7441,9 @@ int main(int argc, char **argv) {
     backend_exit(EXIT_FAILURE);
   }
 
-  // 重要: type "program" ゾーンの子プロセスへの権限降格(program-user)は
-  // fork元(karidns自身)がまだroot権限を持っている間でなければ成立しない
-  // (POSIXでは非root→別の非rootユーザへのsetuid()は許可されない)。
-  // そのため、必ずkaridns自身のsetuid/setgid(直後のブロック)より前に
-  // プラグインをspawnすること。この順序を変更してはならない。
-  spawn_program_zone_plugins(&g_config_db.config_a);
+  // 0.6.2: the plugins of the type "program" zones are started by the manager (it keeps the rights to switch to program-user, and it
+  // can start them again).  The Backend only limits the pair to the manager and asks for every program zone (START).
+  plug_backend_start(&g_config_db.config_a);
 
   {
     char id_err[512];
@@ -7488,6 +7509,10 @@ int main(int argc, char **argv) {
   }
 
   enter_capsicum_sandbox(); // サンドボックス突入
+
+  // 0.6.2: the plugins of the start-up configuration are up (or refused) before the first query, as when the Backend started them itself.
+  // The control thread waits for g_privilege_drop_complete, so this thread is the only one that touches the plugin table here.
+  plug_backend_wait_startup(5000);
 
   // 特権分離(setuid+Capsicum)が完了したため、各Workerスレッドにクエリ処理の開始を許可する
   atomic_store_explicit(&g_privilege_drop_complete, true, memory_order_release);
