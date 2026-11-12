@@ -171,6 +171,7 @@ kill -TERM "$SRV" 2>/dev/null
 i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
 if kill -0 "$SRV" 2>/dev/null; then bad "the server did not stop after SIGTERM"; kill -KILL "$SRV" 2>/dev/null; else wait "$SRV" 2>/dev/null; [ $? = 0 ] && ok "the server stops on SIGTERM with status 0" || bad "the server stopped with a status"; fi
 SRV=""
+_w=0; while [ $_w -lt 50 ] && pgrep -f "$T" > /dev/null 2>&1; do sleep 0.1; _w=$((_w + 1)); done   # a process that was just killed may take a moment to go
 if pgrep -f "$T" > /dev/null 2>&1; then bad "a process of the test is still running" "$(pgrep -fl "$T")"; else ok "no process of the browser is left"; fi
 grep -Eq '^[^ ]+ error ' "$T/server.log" && bad "the server logged an error" "$(grep ' error ' "$T/server.log" | head -3)" || ok "the server logged no error"
 if grep -Eq 'karidns_session=|\$scrypt\$|kdt_|JBSWY|alpha bravo charlie|delta echo foxtrot|a long enough new password' "$T/server.log"; then bad "the log holds a password, cookie, hash, token or secret"; else ok "the log holds no password, cookie, hash, token or secret"; fi
@@ -283,6 +284,7 @@ EOF
     if grep -Eq 'karidns_session=|\$scrypt\$|kdt_|dora quartz lantern|sam granite pine|delta echo foxtrot|a new person 12345|wrong password 1234|hello from the web interface' "$Z/server.log" || grep -Fq "$ZADMIN_PW" "$Z/server.log"; then bad "the log holds a password, cookie, hash, token or record data"; else ok "the log holds no password, cookie, hash, token or record data"; fi
     kari_kill_tree "$ZSRV"; ZSRV=""
     grep -q "ERROR\|assertion\|Assertion" "$Z/karidns.log" && bad "karidns logged an error" "$(grep 'ERROR\|ssertion' "$Z/karidns.log" | head -3)" || ok "karidns logged no error"
+    _w=0; while [ $_w -lt 50 ] && pgrep -f "$T" > /dev/null 2>&1; do sleep 0.1; _w=$((_w + 1)); done   # a process that was just killed may take a moment to go
     if pgrep -f "$T" > /dev/null 2>&1; then bad "a process of the test is still running" "$(pgrep -fl "$T")"; else ok "no process of the test is left"; fi
 fi
 

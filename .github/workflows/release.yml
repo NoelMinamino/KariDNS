@@ -204,8 +204,7 @@ jobs:
 
       - name: Install Debian packaging tools on host
         run: |
-          sudo apt-get update
-          sudo apt-get install -y dpkg-dev
+          sh .github/scripts/apt-install.sh dpkg-dev   # survives a mirror the runner cannot reach
 
       - name: Build binary and RPM in Rocky Linux 9 container (glibc 2.34 compatibility)
         run: |

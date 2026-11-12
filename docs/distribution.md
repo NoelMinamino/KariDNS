@@ -105,7 +105,7 @@ The release workflow builds and publishes all four packages for each FreeBSD ver
 
 ```sh
 sh packaging/freebsd/build_pkg.sh --db sqlite3 "" ./dist          # the number of the file VERSION
-pkg add ./dist/karidns-sqlite3-0.6.0-FreeBSD-15-amd64.pkg
+pkg add ./dist/karidns-sqlite3-0.6.1-FreeBSD-15-amd64.pkg
 ```
 
 `pkg add` of a downloaded file does not fetch dependencies: install `libidn2` and `sqlite3` (or `postgresqlNN-client`) first, as in §2.1. The packages with a loader also install the SQL files that create the KariDNS tables and triggers (`/usr/local/share/karidns/db/`, for example `sqlite3 /var/db/karidns/zones.sqlite3 < /usr/local/share/karidns/db/karidns_ext.sqlite3.sql`) and the manual. `karidns` refuses a `database { driver x; }` that the installed loader does not have, and `karicheck db` in the plain package says `DB support is not installed`. To go from one package to another, remove the installed one first (`pkg delete karidns`) and install the other; the configuration files you created are not touched.

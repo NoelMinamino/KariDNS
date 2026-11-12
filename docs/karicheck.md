@@ -235,7 +235,7 @@ $ karicheck db /usr/local/etc/karidns/karidns.conf
 ```json
 {
   "karicheck": 1,
-  "version": "0.6.0",
+  "version": "0.6.1",
   "command": "zone",
   "result": "fail",
   "counts": { "error": 1, "warning": 2, "checked": 1, "skipped": 0, "dropped": 0 },

@@ -157,7 +157,7 @@ test('the server: starts, sweeps the sessions, reads the configuration on SIGHUP
   assert.ok(f.log.lines.includes('warn the connection to the database at db.example.test is not encrypted'));
   assert.deepEqual(f.events.filter((e) => e[0] !== 'tx'), [['listen', 'karicheck 0.6.0'], ['server closed'], ['backend closed']]);
   assert.ok(f.events.some((e) => e[0] === 'tx' && e[1] === true), 'the expired sessions of the SQLite3 file are deleted at the start');
-  assert.ok(f.log.lines.some((l) => /karidns-webadmin 0\.6\.0 started \(sqlite3, listening on 127\.0\.0\.1:8053\)/.test(l)));
+  assert.ok(f.log.lines.some((l) => l.includes(`karidns-webadmin ${VERSION} started (sqlite3, listening on 127.0.0.1:8053)`)));
   assert.ok(f.log.lines.includes('info the configuration was read again'));
   assert.ok(f.log.lines.includes('info stopped'));
   assert.equal(f.proc.listenerCount('SIGTERM'), 0);
