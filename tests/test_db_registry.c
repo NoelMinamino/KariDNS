@@ -2069,6 +2069,15 @@ static void test_dir_replaced_entry_ticks(void) {
 
 /* Design 3.1: what the directory costs per zone (the entries and images are not in it).  The target is 130-160 bytes; the elements carry the
  * 32-byte digest today (it will go to the resident zones only), the index is a table of 8-byte slots at a load of at most one half. */
+/* dns_snapshot_rcu.c, KARIDNS_UNIT_TEST: the hook between two slices of the count walk, and a stand-in for a rehash */
+extern void (*g_count_walk_between)(void);
+void dbreg_test_bump_grow_gen(void);
+static int g_between_calls;
+static void bump_between(void) {
+    g_between_calls++;
+    dbreg_test_bump_grow_gen();
+}
+
 static void test_dir_bytes_per_zone(void) {
     printf("[TEST] zone directory: bytes per zone (registry element + hash table + index table)...\n");
     server_config_t *cfg = load_conf("view \"default\" { match-clients { any; }; };\n");
@@ -2089,6 +2098,23 @@ static void test_dir_bytes_per_zone(void) {
     printf("  -> %zu zones: sizeof(element) = %zu, %.1f bytes per zone requested (registry %.1f + index %.1f)\n", nel, sizeof(zdir_elem_t), per,
            (double)rb / (double)nel, (double)ib / (double)nel);
     CHECK(per >= 100.0 && per <= 190.0);
+    /* 0.6.2: the counts of karictl dbstatus are walked in slices of 4096 (the lock is let go in between): 20000 zones are several slices */
+    size_t tot = 0, rej = 0, shc = 0, shk = 0;
+    dbreg_counts2(&tot, &rej, &shc, &shk);
+    CHECK(tot == N && rej == 0 && shc == 0 && shk == 0);
+    dbreg_residency_t rs;
+    dbreg_residency(&rs);
+    CHECK(rs.total == N && rs.resident == N && rs.absent == 0);
+    CHECK(dbreg_count_updated() == 0);
+    /* a rehash between two slices starts the counts again; after three of those the rest is counted in one hold, and the counts are still whole */
+    g_between_calls = 0;
+    g_count_walk_between = bump_between;
+    dbreg_counts2(&tot, &rej, &shc, &shk);
+    CHECK(tot == N);
+    CHECK(g_between_calls == 4);
+    dbreg_residency(&rs);
+    CHECK(rs.total == N && rs.resident == N);
+    g_count_walk_between = NULL;
     gc_snapshot_wait_idle();
     dbreg_reset();
     zone_retire_process(true);
