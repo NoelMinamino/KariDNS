@@ -2114,6 +2114,11 @@ static void test_dir_bytes_per_zone(void) {
     CHECK(g_between_calls == 4);
     dbreg_residency(&rs);
     CHECK(rs.total == N && rs.resident == N);
+    /* the other walkers start again too (their reset functions): the same results as without the restarts */
+    size_t nel2, rb2, ib2;
+    dbreg_dir_bytes(&nel2, &rb2, &ib2);
+    CHECK(nel2 == nel && rb2 == rb);
+    CHECK(dbreg_count_updated() == 0);
     g_count_walk_between = NULL;
     gc_snapshot_wait_idle();
     dbreg_reset();
