@@ -511,6 +511,7 @@ register_test "core" "sh" "tests/run_sibling_additional_test.sh" "Sibling zone g
 register_test "core" "sh" "tests/run_multi_instance_test.sh" "Multi-instance isolation & SO_REUSEPORT"
 register_test "core" "sh" "tests/run_forward_zone_test.sh" "RFC 5452 Forward zone upstream resolution & failover"
 register_test "core" "sh" "tests/run_program_zone_test.sh" "Dynamic backend records via program zone plugin"
+register_test "core" "sh" "tests/run_program_zone_supervisor_test.sh" "program zones 0.6.2: the RELOAD line (program-reload-line), the plugin supervisor (restart, reload, backoff)"
 register_test "core" "sh" "tests/run_karictl_observatory_test.sh" "karictl observatory IPC metrics query"
 register_test "core" "sh" "tests/run_karictl_stats_test.sh" "karictl stats (Prometheus text, JSON, paging) and options/zone alerts { } (0.6.1)"
 register_test "core" "sh" "tests/run_karictl_timeout_test.sh" "karictl -t: a server that never answers ends the wait (0.6.2)"

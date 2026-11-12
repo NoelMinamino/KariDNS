@@ -843,6 +843,8 @@ typedef struct program_plugin {
   uint32_t timeout_ms;
   uint32_t max_failures;
   bool disable_auto_tc_flag;
+  bool reload_line;        /* program-reload-line yes: a reload writes the RELOAD line (0.6.2) */
+  _Atomic bool reload_pending; /* a RELOAD line is owed: written by whoever holds the lock next (program_plugin_request_reload()) */
   _Atomic unsigned int consecutive_failures;
   _Atomic bool dead;        /* max_failures超過、またはexec失敗でtrueになったら以後SERVFAIL固定 */
   bool resync;             /* a query failed: drop what the pipe holds before the next one (under lock) */

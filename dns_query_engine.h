@@ -125,6 +125,8 @@ view_snapshot_t *select_view_req(zone_db_snapshot_t *snap, const server_config_t
 bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, program_plugin_t *out);
 void spawn_program_zone_plugins(server_config_t *cfg);
 void compute_program_zone_fingerprint(const zone_config_t *z, char *out, size_t out_cap);
+/* 0.6.2: owe the plugin a RELOAD line (only with program-reload-line yes); written now when no exchange runs, else right after it */
+void program_plugin_request_reload(program_plugin_t *p);
 size_t get_question_end_offset(const uint8_t *pkt, size_t len, uint16_t qdcount);
 
 void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, int num_qtypes,

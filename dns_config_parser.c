@@ -5712,6 +5712,9 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       if (parse_transport_param(ctx, zone->domain, key, false, 0, INT32_MAX, &v) != 0) { free(key); free_zone_config(zone); return -1; }
       if (strcmp(key, "program-timeout") == 0) x->program_timeout_ms = (uint32_t)v;
       else x->program_max_failures = (uint32_t)v;
+    } else if (strcmp(key, "program-reload-line") == 0) {
+      /* 0.6.2: a reload writes "RELOAD\n" to the plugin.  Opt-in: a plugin written to the earlier protocol may take an unknown line as an error */
+      if (parse_bool_statement(ctx, zone->domain, key, &x->program_reload_line) != 0) { free(key); free_zone_config(zone); return -1; }
     } else if (strcmp(key, "alias-resolver") == 0) {
       if (parse_alias_resolvers(ctx, zone->domain ? zone->domain : "zone", &x->alias_resolvers, &x->alias_resolvers_count) != 0) {
         free(key); free_zone_config(zone); return -1;

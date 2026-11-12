@@ -88,6 +88,19 @@ For each query, KariDNS writes three elements sequentially to the plugin's stand
 3. **Raw DNS Query Packet**:
    - The exact binary DNS query payload as received from the client.
 
+#### The `RELOAD` line (0.6.2, only with `program-reload-line yes;`)
+
+When the zone has `program-reload-line yes;`, a configuration reload (`karictl reload`, `karictl reconfig`, `SIGHUP` to the server) also writes one line to the plugin:
+
+```text
+RELOAD\n
+```
+
+- No length and no packet follow it, and KariDNS waits for no answer: the plugin must not write anything for it. The next `QUERY` comes as usual.
+- It tells the plugin to read its own data again (a table, a file, a database).
+- It is written between two exchanges, never inside one: when a query is in progress, the line follows right after its reply.
+- Without `program-reload-line yes;` (the default) the line is never sent, so a plugin that treats an unknown line as an error (as the examples below do) keeps working.
+
 ---
 
 ### 2. Response Stream (Plugin STDOUT → KariDNS)
@@ -150,6 +163,9 @@ zone "dynamic.example.com." {
 
     # yes: send oversized UDP replies as-is instead of truncating them to TC=1 (default: no)
     disable-auto-tc-flag no;
+
+    # yes: a reload writes the line "RELOAD" to the plugin (default: no; see the protocol section)
+    program-reload-line no;
 };
 ```
 

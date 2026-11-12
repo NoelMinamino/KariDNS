@@ -3748,6 +3748,10 @@ static config_reload_result_t run_config_reload(bool skip_unchanged) {
     g_reload_pending = false;
     g_reload_pending_full = false;
   }
+  /* 0.6.2: the configuration was applied (karictl reload / reconfig, SIGHUP): every running plugin with program-reload-line yes is told to
+   * read its data again.  Nothing is awaited. */
+  if (r.status == CONFIG_RELOAD_OK || r.status == CONFIG_RELOAD_ZONE_ERRORS)
+    for (int i = 0; i < g_program_plugins_count; i++) program_plugin_request_reload(&g_program_plugins[i]);
   return r;
 }
 

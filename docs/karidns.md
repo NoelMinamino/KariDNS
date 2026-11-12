@@ -1141,7 +1141,7 @@ An element is an IPv4/IPv6 address, a prefix, `any`, `none`, `localhost`, `local
 | `alias-resolver { <addr> [port <n>]; ... };` | master, slave | The resolvers that expand the ALIAS records of this zone; replaces the `options` value. See POWERDNS ALIAS AND LUA RECORDS. |
 | `forwarders [ port <n> ] { <addr> [port <n>]; ... };` | forward | Upstream servers; see FORWARD ZONES. An address without a port takes the `port` written before the `{`, else `options { port }`, else 53 (BIND 9.20 `bin/named/server.c` `configure_forward()`); an address with its own port keeps it. |
 | `forward-timeout <ms>;` | forward | Total time budget in milliseconds (default 2000), shared by the forwarders: each one gets the remaining time divided by the number of forwarders not tried yet. |
-| `program "<path>";`, `program-args { "<arg>"; ... };`, `program-user "<user>";`, `program-timeout <ms>;`, `program-max-failures <n>;` | program | See PROGRAM ZONE PLUGINS. |
+| `program "<path>";`, `program-args { "<arg>"; ... };`, `program-user "<user>";`, `program-timeout <ms>;`, `program-max-failures <n>;`, `program-reload-line yes\|no;` | program | See PROGRAM ZONE PLUGINS. |
 
 ---
 
@@ -1343,6 +1343,7 @@ zone "anomaly.test." {
     program-max-failures 5; # consecutive failures before the circuit breaker opens (default: 5)
     program-user "nobody"; # optional privilege drop for plugin process (default: options { user })
     disable-auto-tc-flag no; # yes: send oversized UDP replies as-is (default: no)
+    program-reload-line no; # yes: a reload writes the line "RELOAD" to the plugin (default: no)
 };
 ```
 
@@ -1352,6 +1353,7 @@ zone "anomaly.test." {
 > - **UDP Truncation (`disable-auto-tc-flag`)**: With the default `no`, a plugin reply larger than the UDP limit (EDNS UDP payload size, capped by the server's UDP buffer size; 512 without EDNS) is replaced by a TC=1 reply with an empty answer. With `yes`, KariDNS sends the plugin reply as-is (up to 65,535 bytes), so the plugin itself is responsible for setting TC=1 on UDP.
 > - **TCP & AXFR Semantics**: TCP queries (including `AXFR` / `IXFR`) sent to a program zone are forwarded directly to the plugin as a single query-response transaction. Multi-envelope streaming AXFR is not supported. A transfer request that is not shaped like one (RFC 5936 §2.1, RFC 1995 §3) is answered FORMERR, and one of a class other than IN REFUSED (EDE 20), before the plugin is asked (see "The class of a transfer request"). `allow-transfer` does not apply to a program zone: whether an AXFR or IXFR is answered is the plugin's decision. It gets the client address with every query and can refuse (REFUSED) whom it does not want to serve the whole zone to.
 > - **Security & Isolation**: Plugin child processes are spawned prior to Capsicum capability mode and drop privileges (`program-user`). All internal control channels, frontend IPC, and network sockets are strictly closed via `closefrom(3)` before executing the plugin. The plugin starts with an empty environment (only `TZ` of the server is kept). A `program-user` that resolves to uid 0 or whose primary group is gid 0 is refused (by `karicheck conf` and at start; the plugins are started at startup).
+> - **The `RELOAD` line**: with `program-reload-line yes;` a reload (`karictl reload` / `reconfig`, `SIGHUP`) writes the line `RELOAD` to the zone's plugin, between two queries, and waits for no answer: the plugin reads its own data again. Without it (the default) the line is never sent, so a plugin written to the earlier protocol, which may take an unknown line as an error, keeps working.
 > - **Reload**: Plugin processes are started only at server startup. A program zone added by a reload returns SERVFAIL until the next restart, and changes to `program`, `program-args`, `program-user`, `program-timeout` or `program-max-failures` are logged but take effect only after a restart.
 >
 > For full architectural details, IPC wire specifications, and complete runnable examples in Perl, Python, C, Rust, and Go, see **[KariDNS: Complete Guide to 'type program' Zones](KariDNS_how_to_use_type_program_zone.md)**.

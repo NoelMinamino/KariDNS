@@ -2001,7 +2001,8 @@ static uint64_t fp_mix(uint64_t h, const void *p, size_t n) {
   return h * 1099511628211ULL;
 }
 
-/* A fingerprint of everything that decides how the plugin is started (path, user, timeout, max failures, auto-TC flag, ALL arguments), as 16 hex
+/* A fingerprint of everything that decides how the plugin is started and spoken to (path, user, timeout, max failures, auto-TC flag, the
+ * RELOAD line, ALL arguments), as 16 hex
  * digits: a change in a late argument of a long list is noticed at reload (the text it used to be kept was cut at the size of the buffer). */
 void compute_program_zone_fingerprint(const zone_config_t *z, char *out, size_t out_cap) {
   const zone_ext_t *x = zext(z);
@@ -2009,7 +2010,7 @@ void compute_program_zone_fingerprint(const zone_config_t *z, char *out, size_t 
   uint64_t h = 14695981039346656037ULL;
   h = fp_mix(h, path, strlen(path));
   h = fp_mix(h, user, strlen(user));
-  uint32_t nums[3] = { x->program_timeout_ms, x->program_max_failures, x->disable_auto_tc_flag ? 1u : 0u };
+  uint32_t nums[4] = { x->program_timeout_ms, x->program_max_failures, x->disable_auto_tc_flag ? 1u : 0u, x->program_reload_line ? 1u : 0u };
   h = fp_mix(h, nums, sizeof(nums));
   for (int i = 0; i < x->program_args_count; i++)
     h = fp_mix(h, x->program_args[i], strlen(x->program_args[i]));
@@ -2107,6 +2108,30 @@ STATIC_TEST ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t 
  * these zones would take the wait off the workers, at the price of a hand-off per query; program and forward zones are for low query rates. */
 #define PLUGIN_STALE_FRAMES 4 /* late replies dropped before the reply to this query */
 STATIC_TEST bool question_section_matches(const uint8_t *resp, size_t resp_len, const uint8_t *req, size_t req_len);
+
+/* 0.6.2: the RELOAD line (program-reload-line yes; docs/KariDNS_how_to_use_type_program_zone.md).  It is written between two exchanges,
+ * under the plugin's lock, so that no QUERY is cut in two; no answer is read.  The thread that asks (the control thread, after a reload)
+ * does not wait for an exchange: when the lock is taken it leaves the line owed (reload_pending), and the thread of the exchange writes it
+ * after it has let the lock go.  (The pending flag is seq_cst and the lock's own operations are full barriers, so one of the two sees the
+ * other; at worst the line goes out before the next query.)  A line that cannot be written in program-timeout is logged and dropped. */
+static void plugin_flush_reload(program_plugin_t *p) {
+  while (atomic_load_explicit(&p->reload_pending, memory_order_seq_cst)) {
+    if (pthread_mutex_trylock(&p->lock) != 0) return;   /* an exchange runs: it calls this after its unlock */
+    if (atomic_exchange_explicit(&p->reload_pending, false, memory_order_seq_cst) &&
+        !atomic_load_explicit(&p->dead, memory_order_acquire)) {
+      static const uint8_t line[] = "RELOAD\n";
+      if (write_all_timeout(p->stdin_fd, line, sizeof(line) - 1, p->timeout_ms) != (ssize_t)(sizeof(line) - 1))
+        syslog(LOG_WARNING, "[Plugin] zone '%s': the RELOAD line could not be written in %u ms", p->domain, (unsigned)p->timeout_ms);
+    }
+    pthread_mutex_unlock(&p->lock);
+  }
+}
+
+void program_plugin_request_reload(program_plugin_t *p) {
+  if (!p || !p->reload_line) return;
+  atomic_store_explicit(&p->reload_pending, true, memory_order_seq_cst);
+  plugin_flush_reload(p);
+}
 
 /* max_res_len: 応答の上限 (UDP ではクライアントの上限。超えたら TC=1 に切り詰める)。
  * res_cap: res の容量。disable-auto-tc-flag yes のときは max_res_len を超えてもそのまま返すが、
@@ -2271,6 +2296,7 @@ STATIC_TEST int dispatch_to_program_zone(const char *view_name, const char *doma
   }
 
   pthread_mutex_unlock(&plugin->lock);
+  if (plugin->reload_line) plugin_flush_reload(plugin);   /* a RELOAD line asked for during the exchange */
   return result_len;
 }
 
@@ -2725,6 +2751,8 @@ bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, progra
   out->timeout_ms = x->program_timeout_ms > 0 ? x->program_timeout_ms : 2000;
   out->max_failures = x->program_max_failures > 0 ? x->program_max_failures : 5;
   out->disable_auto_tc_flag = x->disable_auto_tc_flag;
+  out->reload_line = x->program_reload_line;
+  atomic_init(&out->reload_pending, false);
   compute_program_zone_fingerprint(zcfg, out->config_fingerprint, sizeof(out->config_fingerprint));
   atomic_init(&out->consecutive_failures, 0);
   atomic_init(&out->dead, false);
