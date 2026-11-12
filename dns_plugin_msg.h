@@ -12,7 +12,9 @@
  *   Backend -> manager   START slot gen zone view fingerprint   start a plugin for the program zone (view, zone) whose settings have that
  *                                                                fingerprint (compute_program_zone_fingerprint()); the path, the arguments
  *                                                                and the user come from the manager's own copy of the configuration
- *                        STOP  slot gen                          stop that plugin for good (its zone was removed or replaced)
+ *                                                                (sent again with the same gen after a refusal: the manager looks again)
+ *                        STOP  slot gen                          stop that plugin for good (its zone was removed or replaced; sent once no
+ *                                                                reader of the Backend can still use the old plugin)
  *                        KILL  slot gen seq                      kill start number seq (program-max-failures reached); it is restarted
  *   manager -> Backend   UP    slot gen seq pid  + 3 fds         start number seq runs: the write end of its stdin, the read end of its
  *                                                                stdout and its process descriptor (SCM_RIGHTS; 2 fds without pdfork())
@@ -32,7 +34,8 @@
 #include <stdint.h>
 
 #define PLUG_MAX_ZONES 256              /* program zones in one configuration; more is a configuration error */
-#define PLUG_SLOTS (2 * PLUG_MAX_ZONES) /* a zone whose settings changed has two for a while: the running plugin and its replacement */
+#define PLUG_SLOTS (3 * PLUG_MAX_ZONES) /* a zone has a running plugin and, while its settings change, a replacement; the third share is for
+                                          * plugins that were switched away from and are stopped once their readers are gone */
 #define PLUG_MAGIC 0x4b505331u          /* "KPS1" */
 #define PLUG_ZONE_MAX 256               /* zone name text with its NUL (program_plugin_t.domain) */
 #define PLUG_VIEW_MAX 64                /* KARIDNS_VIEW_NAME_MAX */

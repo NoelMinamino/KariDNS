@@ -853,6 +853,7 @@ typedef struct program_plugin {
   bool disable_auto_tc_flag;
   bool reload_line;        /* program-reload-line yes: a reload writes the RELOAD line (0.6.2) */
   _Atomic bool reload_pending; /* (changes) a RELOAD line is owed: written by whoever holds the lock next (program_plugin_request_reload()) */
+  _Atomic bool kill_owed;  /* (changes) the KILL record of program-max-failures could not be sent yet: the control thread's timer resends it */
   _Atomic unsigned int consecutive_failures; /* (changes) */
   _Atomic bool dead;        /* (changes) no process (seq 0), program-max-failures reached, or the manager said DOWN: SERVFAIL without
                              * I/O until the manager has started it again (that is a new object) */

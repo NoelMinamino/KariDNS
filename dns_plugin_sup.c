@@ -51,6 +51,10 @@ static int take_rights(struct msghdr *mh, int *out, int cap) {
   for (struct cmsghdr *c = CMSG_FIRSTHDR(mh); c; c = CMSG_NXTHDR(mh, c)) {
     if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS || c->cmsg_len < CMSG_LEN(0)) continue;
     size_t k = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+    /* never past the control buffer: a kernel that shortens a cut message may leave cmsg_len as it was */
+    const unsigned char *end = (const unsigned char *)mh->msg_control + mh->msg_controllen;
+    size_t room = end > CMSG_DATA(c) ? (size_t)(end - CMSG_DATA(c)) / sizeof(int) : 0;
+    if (k > room) k = room;
     for (size_t i = 0; i < k; i++) {
       int fd;
       memcpy(&fd, (const unsigned char *)CMSG_DATA(c) + i * sizeof(int), sizeof(int));
@@ -272,14 +276,20 @@ static char *dup_or_null(const char *p) {
 
 static void m_start_request(plug_sup_t *s, const plug_msg_t *m) {
   plug_mslot_t *sl = &s->s[m->slot];
-  if (sl->gen == m->gen) return;                 /* a repeat */
+  /* a repeat (the Backend got no answer) is ignored; a refused START is evaluated again when the Backend asks again (its backoff, a reload) */
+  if (sl->gen == m->gen && sl->state != PLUG_MS_REFUSED) return;
   m_release(s, sl);                               /* an earlier use of the slot (its STOP was lost, or the Backend reuses it) */
   sl->gen = m->gen;
   snprintf(sl->zone, sizeof(sl->zone), "%s", m->zone);
   snprintf(sl->view, sizeof(sl->view), "%s", m->view);
   bool differs = false;
   const zone_config_t *z = m_find_zone(s->cfg, m->view, m->zone, m->fingerprint, &differs);
-  if (!z) {
+  /* the file again, at most once a second: a Backend cannot make the manager (root) parse it for every START.  The STARTs of a reload
+   * come in one burst and are all answered from that one reading; one refused meanwhile is asked for again by the Backend's backoff. */
+  int64_t now = mono_ms();
+  if (!z && (s->rereads == 0 || now - s->reread_ms >= 1000)) {
+    s->reread_ms = now;
+    s->rereads++;
     m_reread(s);
     z = m_find_zone(s->cfg, m->view, m->zone, m->fingerprint, &differs);
   }
@@ -659,12 +669,19 @@ void plug_sup_stop_all(plug_sup_t *s) {
 
 _Atomic(program_plugin_table_t *) g_program_plugin_table;
 
+#define PLUG_START_ANSWER_MS 10000   /* a START without an answer after this is sent again */
+
 typedef struct {
   uint32_t gen;                 /* 0 = free */
-  program_plugin_t *obj;        /* the slot's newest object: published, or (pending) a placeholder no reader has seen */
+  program_plugin_t *obj;        /* the slot's newest object: published, or (pending) a placeholder no reader has seen; NULL while retiring */
   bool pending;                 /* a replacement: its UP puts it in the place of `replaces` */
   int replaces;                 /* the slot of the plugin it replaces, -1 */
-  bool answered;                /* the manager answered the START (UP or DOWN) */
+  bool answered;                /* the manager answered the START last sent (UP or DOWN) */
+  bool first_answered;          /* it has answered one START of this slot (the start-up wait) */
+  bool retiring;                /* the slot's plugin was replaced or its zone removed: its STOP goes after the readers (obj NULL) */
+  int64_t start_sent_ms;        /* when the last START went, 0 = none outstanding */
+  int64_t retry_at_ms;          /* a START to send again then (refused, or could not be sent), 0 = none */
+  unsigned backoff_s;           /* the wait before the next retry */
 } bslot_t;
 
 typedef struct retire {
@@ -672,12 +689,16 @@ typedef struct retire {
   uint64_t epoch;
   program_plugin_t *obj;
   program_plugin_table_t *tab;
+  int stop_slot;                /* the STOP to send once no reader can hold obj (the switch is made), -1 = none */
+  uint32_t stop_gen;
 } retire_t;
 
 static bslot_t s_bs[PLUG_SLOTS];
 static uint32_t s_next_gen = 1;
 static retire_t *s_retire;
 static bool s_ctrl_eof;
+
+static void bk_send_simple(uint32_t type, uint32_t slot, uint32_t gen, uint32_t seq);
 
 static void obj_free(program_plugin_t *p) {
   if (!p) return;
@@ -706,6 +727,7 @@ static program_plugin_t *obj_new(const zone_config_t *z, const char *view, uint3
   p->reload_line = x->program_reload_line;
   snprintf(p->config_fingerprint, sizeof(p->config_fingerprint), "%s", fp);
   atomic_init(&p->reload_pending, false);
+  atomic_init(&p->kill_owed, false);
   atomic_init(&p->consecutive_failures, 0);
   atomic_init(&p->dead, true);
   return p;
@@ -731,26 +753,50 @@ static program_plugin_t *obj_up(const program_plugin_t *src, uint32_t seq, pid_t
   p->disable_auto_tc_flag = src->disable_auto_tc_flag;
   p->reload_line = src->reload_line;
   atomic_init(&p->reload_pending, false);
+  atomic_init(&p->kill_owed, false);
   atomic_init(&p->consecutive_failures, 0);
   atomic_init(&p->dead, false);
   return p;
 }
 
-static void retire_add(program_plugin_t *obj, program_plugin_table_t *tab, uint64_t epoch) {
-  if (!obj && !tab) return;
+/* obj (and tab) are freed once no reader can hold them; then the STOP of (stop_slot, stop_gen) is sent, if any (stop_slot -1: none) */
+static void retire_add_stop(program_plugin_t *obj, program_plugin_table_t *tab, uint64_t epoch, int stop_slot, uint32_t stop_gen) {
+  if (!obj && !tab && stop_slot < 0) return;
   retire_t *r = malloc(sizeof(*r));
   if (!r) {
     /* no memory for the list: wait for the readers here (the control thread; a reader holds a plugin for at most program-timeout) */
     (void)rcu_writer_wait_until_safe(epoch, 0);
     obj_free(obj);
     free(tab);
+    if (stop_slot >= 0) {
+      bk_send_simple(PLUG_MSG_STOP, (uint32_t)stop_slot, stop_gen, 0);
+      if (s_bs[stop_slot].retiring && s_bs[stop_slot].gen == stop_gen) memset(&s_bs[stop_slot], 0, sizeof(s_bs[stop_slot]));
+    }
     return;
   }
   r->epoch = epoch;
   r->obj = obj;
   r->tab = tab;
+  r->stop_slot = stop_slot;
+  r->stop_gen = stop_gen;
   r->next = s_retire;
   s_retire = r;
+}
+
+static void retire_add(program_plugin_t *obj, program_plugin_table_t *tab, uint64_t epoch) {
+  retire_add_stop(obj, tab, epoch, -1, 0);
+}
+
+/* The running plugin of slot i is replaced or its zone removed: the slot keeps its number (and the manager its process) until the STOP that
+ * plug_backend_reap() sends after the readers are gone (design: "the old one is stopped after the switch") */
+static void retire_slot(int i, uint64_t epoch) {
+  program_plugin_t *o = s_bs[i].obj;
+  uint32_t gen = s_bs[i].gen;
+  memset(&s_bs[i], 0, sizeof(s_bs[i]));
+  s_bs[i].gen = gen;
+  s_bs[i].retiring = true;
+  s_bs[i].replaces = -1;
+  retire_add_stop(o, NULL, epoch, i, gen);
 }
 
 void plug_backend_reap(void) {
@@ -759,6 +805,11 @@ void plug_backend_reap(void) {
     if (rcu_writer_is_safe(r->epoch)) {
       obj_free(r->obj);
       free(r->tab);
+      if (r->stop_slot >= 0) {
+        bk_send_simple(PLUG_MSG_STOP, (uint32_t)r->stop_slot, r->stop_gen, 0);
+        bslot_t *b = &s_bs[r->stop_slot];
+        if (b->retiring && b->gen == r->stop_gen) memset(b, 0, sizeof(*b));   /* (not when the slot was taken again meanwhile) */
+      }
       *pp = r->next;
       free(r);
     } else {
@@ -767,15 +818,17 @@ void plug_backend_reap(void) {
   }
 }
 
-/* Publish the table made of the n objects of list; the one it replaces is freed after the readers.  The retire epoch, or 0 when the table
- * could not be allocated (nothing changed then). */
-static uint64_t publish(program_plugin_t *const *list, int n) {
-  program_plugin_table_t *t = NULL;
-  if (n > 0) {
-    t = malloc(sizeof(*t) + (size_t)n * sizeof(t->p[0]));
-    if (!t) return 0;
-    t->count = n;
-    memcpy(t->p, list, (size_t)n * sizeof(t->p[0]));
+static program_plugin_table_t *table_alloc(void) {
+  program_plugin_table_t *t = malloc(sizeof(*t) + (size_t)PLUG_MAX_ZONES * sizeof(t->p[0]));
+  if (t) t->count = 0;
+  return t;
+}
+
+/* Publish t (NULL or empty: no plugin); the table it replaces is freed after the readers.  Never fails: the table was allocated before. */
+static uint64_t publish_table(program_plugin_table_t *t) {
+  if (t && t->count == 0) {
+    free(t);
+    t = NULL;
   }
   program_plugin_table_t *old = atomic_load_explicit(&g_program_plugin_table, memory_order_acquire);
   uint64_t epoch = rcu_writer_publish(&g_program_plugin_table, t);
@@ -783,22 +836,26 @@ static uint64_t publish(program_plugin_t *const *list, int n) {
   return epoch ? epoch : 1;
 }
 
-/* The published objects, with from replaced by to (to == NULL: removed; from not there: to is added).  The retire epoch, 0 = no memory. */
+/* The published objects, with from replaced by to (to == NULL: removed; from not there: to is added).  The retire epoch; 0 = nothing
+ * changed (no memory, or the table would grow past PLUG_MAX_ZONES: logged) */
 static uint64_t publish_replacing(program_plugin_t *from, program_plugin_t *to) {
-  program_plugin_t *list[PLUG_MAX_ZONES + 1];
-  int n = 0;
-  bool found = false;
   program_plugin_table_t *cur = atomic_load_explicit(&g_program_plugin_table, memory_order_acquire);
-  for (int i = 0; cur && i < cur->count && n < PLUG_MAX_ZONES; i++) {
-    if (cur->p[i] == from) {
-      found = true;
-      if (to) list[n++] = to;
-    } else {
-      list[n++] = cur->p[i];
-    }
+  bool found = false;
+  for (int i = 0; cur && i < cur->count; i++)
+    if (cur->p[i] == from) found = true;
+  int n = (cur ? cur->count : 0) + (!found && to ? 1 : 0) - (found && !to ? 1 : 0);
+  if (n > PLUG_MAX_ZONES) {
+    syslog(LOG_ERR, "[Plugin] the table of the plugins would hold more than %d; zone '%s' is not added", PLUG_MAX_ZONES, to ? to->domain : "");
+    return 0;
   }
-  if (!found && to && n < PLUG_MAX_ZONES + 1) list[n++] = to;
-  return publish(list, n);
+  program_plugin_table_t *t = table_alloc();
+  if (!t) return 0;
+  for (int i = 0; cur && i < cur->count; i++) {
+    if (cur->p[i] != from) t->p[t->count++] = cur->p[i];
+    else if (to) t->p[t->count++] = to;
+  }
+  if (!found && to) t->p[t->count++] = to;
+  return publish_table(t);
 }
 
 static bool bk_send(const plug_msg_t *m, int wait_ms) {
@@ -814,8 +871,9 @@ static void bk_send_simple(uint32_t type, uint32_t slot, uint32_t gen, uint32_t 
 
 void plug_backend_expect(plug_expect_t *out, size_t n) {
   for (size_t i = 0; i < n && i < PLUG_SLOTS; i++) {
-    out[i].gen = s_bs[i].gen;
-    out[i].seq = s_bs[i].gen && s_bs[i].obj ? s_bs[i].obj->seq : 0;
+    bool live = s_bs[i].gen && s_bs[i].obj && !s_bs[i].retiring;   /* (a retiring slot takes no UP / DOWN) */
+    out[i].gen = live ? s_bs[i].gen : 0;
+    out[i].seq = live ? s_bs[i].obj->seq : 0;
   }
   for (size_t i = PLUG_SLOTS; i < n; i++) out[i].gen = out[i].seq = 0;
 }
@@ -829,9 +887,18 @@ static int find_slot(const char *view, const char *domain, bool pending) {
   return -1;
 }
 
+/* A free slot.  When every slot is in use, a retiring one is taken: its STOP goes now (the readers of its old plugin may still be there;
+ * they get SERVFAIL).  With PLUG_SLOTS = 3 x PLUG_MAX_ZONES and at most one running and one pending plugin per zone, that needs a pile of
+ * retirements from reloads within one grace period. */
 static int alloc_slot(void) {
   for (int i = 0; i < PLUG_SLOTS; i++)
     if (s_bs[i].gen == 0) return i;
+  for (int i = 0; i < PLUG_SLOTS; i++)
+    if (s_bs[i].retiring) {
+      bk_send_simple(PLUG_MSG_STOP, (uint32_t)i, s_bs[i].gen, 0);
+      memset(&s_bs[i], 0, sizeof(s_bs[i]));   /* (its retire record still frees the object; its late STOP names the old generation) */
+      return i;
+    }
   return -1;
 }
 
@@ -842,23 +909,64 @@ static void cancel_pending(int p) {
   memset(&s_bs[p], 0, sizeof(s_bs[p]));
 }
 
-static void send_start(const program_plugin_t *o) {
+static void bk_schedule_retry(int i, const char *why) {
+  bslot_t *b = &s_bs[i];
+  if (b->backoff_s == 0) b->backoff_s = 1;
+  b->start_sent_ms = 0;
+  b->retry_at_ms = mono_ms() + (int64_t)b->backoff_s * 1000;
+  syslog(LOG_NOTICE, "[Plugin] zone '%s' in view '%s': %s; asking the manager again in %u s", b->obj->domain, b->obj->view_name, why,
+         b->backoff_s);
+  if (b->backoff_s < PLUG_BACKOFF_MAX) {
+    b->backoff_s *= 2;
+    if (b->backoff_s > PLUG_BACKOFF_MAX) b->backoff_s = PLUG_BACKOFF_MAX;
+  }
+}
+
+/* Send (or send again: the manager takes the same generation again when it refused it) the START of slot i */
+static void bk_start(int i) {
+  bslot_t *b = &s_bs[i];
+  const program_plugin_t *o = b->obj;
   plug_msg_t m;
-  plug_msg_init(&m, PLUG_MSG_START, o->slot, o->gen, 0);
+  plug_msg_init(&m, PLUG_MSG_START, (uint32_t)i, b->gen, 0);
   snprintf(m.zone, sizeof(m.zone), "%s", o->domain);
   snprintf(m.view, sizeof(m.view), "%s", o->view_name);
   snprintf(m.fingerprint, sizeof(m.fingerprint), "%s", o->config_fingerprint);
-  if (!bk_send(&m, 2000))
+  b->retry_at_ms = 0;
+  b->answered = false;
+  if (bk_send(&m, 2000)) {
+    b->start_sent_ms = mono_ms();
+  } else {
     syslog(LOG_ERR, "[Plugin] zone '%s' in view '%s': cannot ask the manager to start the plugin: %m (the zone answers SERVFAIL)", o->domain,
            o->view_name);
+    bk_schedule_retry(i, "the START could not be sent");
+  }
+}
+
+/* A slot whose plugin has never been up (refused, unanswered, not sent): a reload asks again at once (it is not "unchanged") */
+static void bk_start_again_now(int i) {
+  s_bs[i].backoff_s = 1;
+  bk_start(i);
 }
 
 void plug_backend_reconfigure(const server_config_t *cfg) {
   plug_backend_reap();
+  /* 1. the table is allocated before anything is changed: a failure leaves everything as it was */
+  program_plugin_table_t *t = table_alloc();
+  if (!t) {
+    syslog(LOG_ERR, "[Plugin] no memory for the table of the plugins; the program zones are left as they were");
+    return;
+  }
+  static struct {
+    const zone_config_t *z;
+    const char *vn;
+    char fp[PLUG_FP_MAX];
+    int a;
+  } want[PLUG_MAX_ZONES];
+  int nwant = 0, skipped = 0, nzones = 0;
+  int again[PLUG_MAX_ZONES], nagain = 0, reload[PLUG_MAX_ZONES], nreload = 0;
   bool keep[PLUG_SLOTS];
   memset(keep, 0, sizeof(keep));
-  program_plugin_t *act[PLUG_MAX_ZONES];
-  int nact = 0, skipped = 0;
+  /* 2. what stays, and what needs a new plugin; no message yet */
   for (const view_config_t *v = cfg ? cfg->views : NULL; v; v = v->next) {
     const char *vn = v->name ? v->name : "";
     for (const zone_config_t *z = v->zones; z; z = z->next) {
@@ -871,73 +979,81 @@ void plug_backend_reconfigure(const server_config_t *cfg) {
         syslog(LOG_ERR, "[Plugin] zone '%s' has type program but no 'program' path set; skipping (will SERVFAIL)", z->domain);
         continue;
       }
-      if (nact >= PLUG_MAX_ZONES) {   /* (the configuration parser refuses more) */
+      if (nzones >= PLUG_MAX_ZONES) {   /* (the configuration parser refuses more; the table and want[] hold one per zone) */
         syslog(LOG_ERR, "[Plugin] more than %d program zones; zone '%s' answers SERVFAIL", PLUG_MAX_ZONES, z->domain);
         continue;
       }
+      nzones++;
       char fp[PLUG_FP_MAX];
       compute_program_zone_fingerprint(z, fp, sizeof(fp));
       int a = find_slot(vn, z->domain, false), p = find_slot(vn, z->domain, true);
       if ((a >= 0 && keep[a]) || (p >= 0 && keep[p])) continue;   /* the same zone twice in one view (the parser refuses it) */
       if (a >= 0 && strcmp(s_bs[a].obj->config_fingerprint, fp) == 0) {
-        /* Decision 4: unchanged settings leave the plugin alone; program-reload-line yes gets the RELOAD line */
+        /* Decision 4: unchanged settings leave the plugin alone; program-reload-line yes gets the RELOAD line.  One that has never been
+         * up (refused, unanswered) is asked for again. */
         keep[a] = true;
-        act[nact++] = s_bs[a].obj;
-        if (p >= 0) cancel_pending(p);
-        program_plugin_request_reload(s_bs[a].obj);
-        continue;
+        t->p[t->count++] = s_bs[a].obj;
+        if (s_bs[a].obj->seq == 0) again[nagain++] = a;
+        else reload[nreload++] = a;
+        continue;                                 /* (a pending replacement is not kept: cancelled below) */
       }
       if (p >= 0 && strcmp(s_bs[p].obj->config_fingerprint, fp) == 0) {
         keep[p] = true;                           /* the replacement asked for by an earlier reload is still the right one */
+        if (!s_bs[p].answered || s_bs[p].retry_at_ms) again[nagain++] = p;
         if (a >= 0) {
           keep[a] = true;
-          act[nact++] = s_bs[a].obj;
+          t->p[t->count++] = s_bs[a].obj;
         }
         continue;
       }
-      if (p >= 0) cancel_pending(p);
-      int ns = alloc_slot();
-      program_plugin_t *o = NULL;
-      if (ns >= 0) {
-        uint32_t gen = s_next_gen++;
-        if (s_next_gen == 0) s_next_gen = 1;
-        o = obj_new(z, vn, (uint32_t)ns, gen, fp);
-        if (o) {
-          s_bs[ns].gen = gen;
-          s_bs[ns].obj = o;
-          s_bs[ns].pending = a >= 0;   /* the running plugin keeps answering until the new one is up */
-          s_bs[ns].replaces = a;
-          s_bs[ns].answered = false;
-          keep[ns] = true;
-        }
-      }
-      if (!o) syslog(LOG_ERR, "[Plugin] zone '%s' in view '%s': no slot or no memory for its plugin", z->domain, vn);
+      want[nwant].z = z;
+      want[nwant].vn = vn;
+      memcpy(want[nwant].fp, fp, sizeof(fp));
+      want[nwant].a = a;
+      nwant++;
       if (a >= 0) {
-        keep[a] = true;
-        act[nact++] = s_bs[a].obj;
-      } else if (o) {
-        act[nact++] = o;
+        keep[a] = true;                           /* the running plugin keeps answering until the new one is up */
+        t->p[t->count++] = s_bs[a].obj;
       }
-      if (o) send_start(o);
     }
   }
   if (skipped)
     syslog(LOG_ERR, "[Plugin] %d zone(s) with type \"program\" but allow-program-zones is not yes; they answer SERVFAIL", skipped);
-  /* what is not kept goes: replacements at once, running plugins after the switch */
+  /* 3. replacements no longer wanted go at once (no reader has seen them); their slots are free before new ones are taken */
   for (int i = 0; i < PLUG_SLOTS; i++)
-    if (s_bs[i].gen && !keep[i] && s_bs[i].pending) cancel_pending(i);
-  uint64_t epoch = publish(act, nact);
-  if (epoch == 0) {
-    syslog(LOG_ERR, "[Plugin] no memory for the table of the plugins; the previous one stays");
-    return;
+    if (s_bs[i].gen && !s_bs[i].retiring && !keep[i] && s_bs[i].pending) cancel_pending(i);
+  bool gone[PLUG_SLOTS];
+  for (int i = 0; i < PLUG_SLOTS; i++) gone[i] = s_bs[i].gen && !s_bs[i].retiring && !keep[i];
+  /* 4. the new plugins (and the STARTs) */
+  for (int w = 0; w < nwant; w++) {
+    int ns = alloc_slot();
+    program_plugin_t *o = NULL;
+    uint32_t gen = s_next_gen++;
+    if (s_next_gen == 0) s_next_gen = 1;
+    if (ns >= 0) o = obj_new(want[w].z, want[w].vn, (uint32_t)ns, gen, want[w].fp);
+    if (!o) {
+      syslog(LOG_ERR, "[Plugin] zone '%s' in view '%s': no slot or no memory for its plugin; the next reload tries again", want[w].z->domain,
+             want[w].vn);
+      continue;
+    }
+    memset(&s_bs[ns], 0, sizeof(s_bs[ns]));
+    s_bs[ns].gen = gen;
+    s_bs[ns].obj = o;
+    s_bs[ns].pending = want[w].a >= 0;
+    s_bs[ns].replaces = want[w].a;
+    s_bs[ns].backoff_s = 1;
+    if (want[w].a < 0) t->p[t->count++] = o;
+    bk_start(ns);
   }
+  /* 5. the switch; the plugins of removed zones are stopped once no reader can hold them */
+  uint64_t epoch = publish_table(t);
   for (int i = 0; i < PLUG_SLOTS; i++) {
-    if (!s_bs[i].gen || keep[i]) continue;
+    if (!gone[i]) continue;
     syslog(LOG_INFO, "[Plugin] zone '%s' in view '%s' is gone: stopping its plugin", s_bs[i].obj->domain, s_bs[i].obj->view_name);
-    bk_send_simple(PLUG_MSG_STOP, (uint32_t)i, s_bs[i].gen, 0);
-    retire_add(s_bs[i].obj, NULL, epoch);
-    memset(&s_bs[i], 0, sizeof(s_bs[i]));
+    retire_slot(i, epoch);
   }
+  for (int k = 0; k < nagain; k++) bk_start_again_now(again[k]);
+  for (int k = 0; k < nreload; k++) program_plugin_request_reload(s_bs[reload[k]].obj);
 }
 
 void plug_backend_start(const server_config_t *cfg) {
@@ -986,12 +1102,7 @@ static void bk_up(const plug_msg_t *m, int *fds) {
     return;
   }
   if (b->pending) {
-    if (old) {
-      int a = b->replaces;
-      bk_send_simple(PLUG_MSG_STOP, (uint32_t)a, s_bs[a].gen, 0);   /* the switch is made: the old plugin goes */
-      retire_add(old, NULL, epoch);
-      memset(&s_bs[a], 0, sizeof(s_bs[a]));
-    }
+    if (old) retire_slot(b->replaces, epoch);     /* the switch is made: the old plugin is stopped after the readers */
     obj_free(b->obj);                             /* the placeholder, never published */
     b->pending = false;
     b->replaces = -1;
@@ -999,31 +1110,23 @@ static void bk_up(const plug_msg_t *m, int *fds) {
     retire_add(old, NULL, epoch);
   }
   b->obj = o;
-  b->answered = true;
+  b->answered = b->first_answered = true;
+  b->start_sent_ms = b->retry_at_ms = 0;
+  b->backoff_s = 1;
   syslog(LOG_INFO, "[Plugin] zone '%s' in view '%s': the plugin is up (pid %d, start %u)", o->domain, o->view_name, (int)o->pid,
          (unsigned)o->seq);
 }
 
 static void bk_down(const plug_msg_t *m) {
   bslot_t *b = &s_bs[m->slot];
-  b->answered = true;
+  b->answered = b->first_answered = true;
+  b->start_sent_ms = 0;
   if (m->flags & PLUG_DOWN_REFUSED) {
-    syslog(LOG_ERR, "[Plugin] zone '%s' in view '%s': the manager did not start the plugin (see its log); the zone answers SERVFAIL",
-           b->obj->domain, b->obj->view_name);
-    if (b->pending) {
-      /* the new settings are refused: the zone follows the configuration and answers SERVFAIL, the old plugin goes */
-      int a = b->replaces;
-      program_plugin_t *old = a >= 0 && s_bs[a].gen ? s_bs[a].obj : NULL;
-      uint64_t epoch = publish_replacing(old, b->obj);
-      if (epoch == 0) return;
-      if (old) {
-        bk_send_simple(PLUG_MSG_STOP, (uint32_t)a, s_bs[a].gen, 0);
-        retire_add(old, NULL, epoch);
-        memset(&s_bs[a], 0, sizeof(s_bs[a]));
-      }
-      b->pending = false;
-      b->replaces = -1;
-    }
+    /* the manager would not start it (the configuration file changed again, no memory, program-user unknown, ...): asked again with the
+     * backoff, and at the next reload.  A replacement that is refused leaves the running plugin serving. */
+    syslog(LOG_ERR, "[Plugin] zone '%s' in view '%s': the manager did not start the plugin (see its log); %s", b->obj->domain,
+           b->obj->view_name, b->pending ? "the running plugin keeps serving" : "the zone answers SERVFAIL");
+    bk_schedule_retry((int)m->slot, "refused");
     return;
   }
   if (!b->pending) {
@@ -1033,6 +1136,23 @@ static void bk_down(const plug_msg_t *m) {
   }
 }
 
+/* Rule 2: the descriptors of an UP are limited at once, before any other use: write + poll + fcntl for stdin, read + poll + fcntl for
+ * stdout, pdkill for the process descriptor.  The pipes must be pipes.  false: not usable (the caller closes them). */
+static bool plug_limit_up_fds(const int *fds) {
+#ifdef __FreeBSD__
+  struct stat st;
+  cap_rights_t rw, rr, rp;
+  cap_rights_init(&rw, CAP_WRITE, CAP_EVENT, CAP_FCNTL);
+  cap_rights_init(&rr, CAP_READ, CAP_EVENT, CAP_FCNTL);
+  cap_rights_init(&rp, CAP_PDKILL);
+  return fstat(fds[0], &st) == 0 && S_ISFIFO(st.st_mode) && fstat(fds[1], &st) == 0 && S_ISFIFO(st.st_mode) &&
+         cap_rights_limit(fds[0], &rw) == 0 && cap_rights_limit(fds[1], &rr) == 0 && cap_rights_limit(fds[2], &rp) == 0;
+#else
+  struct stat st;
+  return fstat(fds[0], &st) == 0 && S_ISFIFO(st.st_mode) && fstat(fds[1], &st) == 0 && S_ISFIFO(st.st_mode);
+#endif
+}
+
 void plug_backend_apply(const void *buf, size_t len, int msg_flags, int *fds, int nfds) {
   static unsigned long refused;
   plug_expect_t ex[PLUG_SLOTS];
@@ -1040,23 +1160,21 @@ void plug_backend_apply(const void *buf, size_t len, int msg_flags, int *fds, in
   plug_msg_t m;
   int nkeep = nfds < 8 ? nfds : 8;
   plug_err_t e = plug_check_from_manager(buf, len, msg_flags, nfds, ex, PLUG_SLOTS, &m);
-  if (e == PLUG_OK && m.type == PLUG_MSG_UP) {
-#ifdef __FreeBSD__
-    /* Rule 2: the descriptors are limited at once, before any other use: write + poll + fcntl for stdin, read + poll + fcntl for stdout,
-     * pdkill for the process descriptor.  The pipes must be pipes. */
-    struct stat st;
-    cap_rights_t rw, rr, rp;
-    cap_rights_init(&rw, CAP_WRITE, CAP_EVENT, CAP_FCNTL);
-    cap_rights_init(&rr, CAP_READ, CAP_EVENT, CAP_FCNTL);
-    cap_rights_init(&rp, CAP_PDKILL);
-    if (fstat(fds[0], &st) != 0 || !S_ISFIFO(st.st_mode) || fstat(fds[1], &st) != 0 || !S_ISFIFO(st.st_mode) ||
-        cap_rights_limit(fds[0], &rw) != 0 || cap_rights_limit(fds[1], &rr) != 0 || cap_rights_limit(fds[2], &rp) != 0)
-      e = PLUG_E_FDS;
-#endif
-  }
   if (e != PLUG_OK) {
     for (int i = 0; i < nkeep; i++) close(fds[i]);
     if (refused++ < 16) syslog(LOG_ERR, "[Plugin] A message from the manager was refused: %s", plug_err_text(e));
+    return;
+  }
+  if (m.type == PLUG_MSG_UP && !plug_limit_up_fds(fds)) {
+    /* a valid record with descriptors that are not what they must be: a failed start.  The manager kills it and starts it again with the
+     * backoff; the slot counts as answered (the start-up does not wait for it) */
+    for (int i = 0; i < PLUG_UP_NFDS; i++) close(fds[i]);
+    bslot_t *b = &s_bs[m.slot];
+    b->answered = b->first_answered = true;
+    b->start_sent_ms = 0;
+    syslog(LOG_ERR, "[Plugin] zone '%s': the descriptors of the started plugin are refused (not pipes, or cannot be limited); asking the manager "
+                    "to start it again", b->obj->domain);
+    bk_send_simple(PLUG_MSG_KILL, m.slot, m.gen, m.seq);
     return;
   }
   if (m.type == PLUG_MSG_UP) bk_up(&m, fds);
@@ -1100,7 +1218,7 @@ void plug_backend_wait_startup(int ms) {
   for (;;) {
     int waiting = 0;
     for (int i = 0; i < PLUG_SLOTS; i++)
-      if (s_bs[i].gen && !s_bs[i].answered) waiting++;
+      if (s_bs[i].gen && s_bs[i].obj && !s_bs[i].first_answered) waiting++;
     if (waiting == 0) return;
     int64_t left = deadline - mono_ms();
     if (left <= 0 || s_ctrl_eof) {
@@ -1110,7 +1228,16 @@ void plug_backend_wait_startup(int ms) {
     struct pollfd p = { .fd = g_plug_ctrl_fd, .events = POLLIN, .revents = 0 };
     (void)poll(&p, 1, left > 100 ? 100 : (int)left);
     plug_backend_handle_ctrl();
+    plug_backend_timer();                         /* (a START that could not be sent is tried again) */
   }
+}
+
+/* The KILL of p.  pdkill() stops the process at once where there is a process descriptor; the record tells the manager (and is the only
+ * way without pdfork()).  A record that does not go (a full socket) stays owed and plug_backend_timer() sends it again. */
+static void bk_send_kill(program_plugin_t *p) {
+  plug_msg_t m;
+  plug_msg_init(&m, PLUG_MSG_KILL, p->slot, p->gen, p->seq);
+  if (bk_send(&m, 0)) atomic_store_explicit(&p->kill_owed, false, memory_order_release);
 }
 
 void plug_backend_kill(program_plugin_t *p) {
@@ -1118,7 +1245,23 @@ void plug_backend_kill(program_plugin_t *p) {
   /* X-11: inside the sandbox kill(pid) is ECAPMODE (and a SIGTRAP with PROC_TRAPCAP); the process descriptor it came with can */
   if (p->proc_fd >= 0 && p->pid > 0) (void)pdkill(p->proc_fd, SIGKILL);
 #endif
-  if (p->seq > 0) bk_send_simple(PLUG_MSG_KILL, p->slot, p->gen, p->seq);
+  if (p->seq == 0) return;
+  atomic_store_explicit(&p->kill_owed, true, memory_order_release);
+  bk_send_kill(p);
+}
+
+void plug_backend_timer(void) {
+  plug_backend_reap();
+  int64_t now = mono_ms();
+  for (int i = 0; i < PLUG_SLOTS; i++) {
+    bslot_t *b = &s_bs[i];
+    if (!b->gen || !b->obj || b->retiring) continue;
+    if (b->retry_at_ms && b->retry_at_ms <= now) bk_start(i);                                      /* refused, or not sent */
+    else if (!b->answered && b->start_sent_ms && now - b->start_sent_ms >= PLUG_START_ANSWER_MS) bk_start(i);   /* no answer */
+  }
+  program_plugin_table_t *t = atomic_load_explicit(&g_program_plugin_table, memory_order_acquire);
+  for (int i = 0; t && i < t->count; i++)
+    if (atomic_load_explicit(&t->p[i]->kill_owed, memory_order_acquire)) bk_send_kill(t->p[i]);
 }
 
 void program_plugins_set_for_test(program_plugin_t *arr, int n) {

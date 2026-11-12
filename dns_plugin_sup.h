@@ -76,6 +76,8 @@ typedef struct {
   unsigned tokens;
   int64_t refill_ms;
   unsigned long starts;    /* forks made (tests, the log) */
+  int64_t reread_ms;       /* the last reading of the configuration file (at most one a second) */
+  unsigned long rereads;
 } plug_sup_t;
 
 /* The Backend's end of the pair (-1 when it could not be made, or in the manager after the fork) */
@@ -123,6 +125,9 @@ void plug_backend_reconfigure(const server_config_t *cfg);
 void plug_backend_handle_ctrl(void);
 /* Free the objects no reader can hold any more (the control thread's timer) */
 void plug_backend_reap(void);
+/* The control thread's timer (every second): plug_backend_reap(); a START that was refused or could not be sent is sent again when its
+ * backoff (1, 2, 4 ... 60 s) is over, one without an answer after 10 s; an owed KILL is sent again */
+void plug_backend_timer(void);
 /* program-max-failures was reached (the thread of the exchange, under the plugin's lock): kill the process; the manager restarts it */
 struct program_plugin;
 void plug_backend_kill(struct program_plugin *p);

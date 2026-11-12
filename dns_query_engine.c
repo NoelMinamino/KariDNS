@@ -2112,15 +2112,48 @@ STATIC_TEST bool question_section_matches(const uint8_t *resp, size_t resp_len, 
  * under the plugin's lock, so that no QUERY is cut in two; no answer is read.  The thread that asks (the control thread, after a reload)
  * does not wait for an exchange: when the lock is taken it leaves the line owed (reload_pending), and the thread of the exchange writes it
  * after it has let the lock go.  (The pending flag is seq_cst and the lock's own operations are full barriers, so one of the two sees the
- * other; at worst the line goes out before the next query.)  A line that cannot be written in program-timeout is logged and dropped. */
-static void plugin_flush_reload(program_plugin_t *p) {
+ * other; at worst the line goes out before the next query.)
+ * The control thread never waits for the pipe (wait_ms 0): a plugin that does not read its stdin keeps the line owed, and the next exchange
+ * writes it (with program-timeout), so a reload with hung plugins does not stop the control thread.  A line that does not go in time is
+ * logged and dropped; a line written in part (the plugin would read the next QUERY after the fragment) is a failed exchange: the plugin is
+ * marked dead and killed, and the manager starts it again. */
+STATIC_TEST int plugin_write_reload_line(int fd, uint32_t wait_ms) {
+  static const uint8_t line[] = "RELOAD\n";
+  const size_t len = sizeof(line) - 1;
+  size_t done = 0;
+  int64_t deadline = monotonic_ms() + wait_ms;
+  while (done < len) {
+    struct pollfd pfd = { .fd = fd, .events = POLLOUT, .revents = 0 };
+    int pr = poll(&pfd, 1, (int)remaining_ms(deadline));
+    if (pr < 0 && errno == EINTR) continue;
+    if (pr <= 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) break;
+    ssize_t n = write(fd, line + done, len - done);
+    if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+    if (n <= 0) break;
+    done += (size_t)n;
+  }
+  return done == len ? 1 : done == 0 ? 0 : -1;   /* 1: written, 0: nothing written, -1: a fragment */
+}
+
+static void plugin_flush_reload(program_plugin_t *p, bool wait) {
   while (atomic_load_explicit(&p->reload_pending, memory_order_seq_cst)) {
     if (pthread_mutex_trylock(&p->lock) != 0) return;   /* an exchange runs: it calls this after its unlock */
     if (atomic_exchange_explicit(&p->reload_pending, false, memory_order_seq_cst) &&
         !atomic_load_explicit(&p->dead, memory_order_acquire)) {
-      static const uint8_t line[] = "RELOAD\n";
-      if (write_all_timeout(p->stdin_fd, line, sizeof(line) - 1, p->timeout_ms) != (ssize_t)(sizeof(line) - 1))
-        syslog(LOG_WARNING, "[Plugin] zone '%s': the RELOAD line could not be written in %u ms", p->domain, (unsigned)p->timeout_ms);
+      int r = plugin_write_reload_line(p->stdin_fd, wait ? p->timeout_ms : 0);
+      if (r == 0 && !wait) {
+        atomic_store_explicit(&p->reload_pending, true, memory_order_seq_cst);   /* owed to the next exchange */
+        pthread_mutex_unlock(&p->lock);
+        return;
+      }
+      if (r == 0) {
+        syslog(LOG_WARNING, "[Plugin] zone '%s': the RELOAD line could not be written in %u ms; dropped", p->domain, (unsigned)p->timeout_ms);
+      } else if (r < 0) {
+        atomic_store_explicit(&p->dead, true, memory_order_release);
+        syslog(LOG_ERR, "[Plugin] zone '%s': the RELOAD line was written only in part; killing the plugin (the manager starts it again)",
+               p->domain);
+        plug_backend_kill(p);
+      }
     }
     pthread_mutex_unlock(&p->lock);
   }
@@ -2129,7 +2162,7 @@ static void plugin_flush_reload(program_plugin_t *p) {
 void program_plugin_request_reload(program_plugin_t *p) {
   if (!p || !p->reload_line) return;
   atomic_store_explicit(&p->reload_pending, true, memory_order_seq_cst);
-  plugin_flush_reload(p);
+  plugin_flush_reload(p, false);
 }
 
 /* max_res_len: 応答の上限 (UDP ではクライアントの上限。超えたら TC=1 に切り詰める)。
@@ -2284,7 +2317,7 @@ STATIC_TEST int dispatch_to_program_zone(const char *view_name, const char *doma
   }
 
   pthread_mutex_unlock(&plugin->lock);
-  if (plugin->reload_line) plugin_flush_reload(plugin);   /* a RELOAD line asked for during the exchange */
+  if (plugin->reload_line) plugin_flush_reload(plugin, true);   /* a RELOAD line asked for during the exchange */
   return result_len;
 }
 

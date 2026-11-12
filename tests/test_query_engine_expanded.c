@@ -21,6 +21,7 @@
 #include "dns_wire.h"
 #include "dns_config_parser.h"
 #include "dns_plugin_sup.h"
+#include "dns_epoch_rcu.h"
 #include "test_zext.h"
 #include "dns_zone_parser.h"
 #include "dns_zone_image.h"
@@ -10980,6 +10981,8 @@ static void test_plugin_backend_table(void) {
     int n_in, n_out;
     pt_up(mn.slot, mn.gen, 1, &n_in, &n_out, NULL);
     assert(pt_find("b.test.") != pb && pt_find("b.test.")->slot == mn.slot);
+    assert(pt_nothing());                                 /* review 5: the STOP waits for the readers of the old plugin */
+    plug_backend_reap();
     assert(pt_recv(&m) && m.type == PLUG_MSG_STOP && m.slot == mb.slot && m.gen == mb.gen);
     pb = pt_find("b.test.");
 
@@ -10994,21 +10997,80 @@ static void test_plugin_backend_table(void) {
     assert(pt_find("b.test.") == pb);
     while (poll(&rp, 1, 0) == 1 && read(a_in, line, sizeof(line)) > 0) {}   /* (the RELOAD lines of these reloads) */
 
-    /* 7. a refused replacement: the zone follows the configuration (SERVFAIL), the old plugin is stopped */
+    /* 7. review 3: a refused replacement leaves the running plugin serving; review 2: it is asked for again (the next reload: at once,
+     * the same generation), and the switch happens when it is up */
     tzx(&zb)->program_args = args1;
     plug_backend_reconfigure(&cfg);
     assert(pt_recv(&mp) && mp.type == PLUG_MSG_START);
     plug_msg_init(&m, PLUG_MSG_DOWN, mp.slot, mp.gen, 0);
     m.flags = PLUG_DOWN_REFUSED;
     plug_backend_apply(&m, sizeof(m), 0, NULL, 0);
+    assert(pt_nothing() && pt_find("b.test.") == pb && !atomic_load(&pb->dead));
+    while (poll(&rp, 1, 0) == 1 && read(a_in, line, sizeof(line)) > 0) {}
+    plug_backend_reconfigure(&cfg);                       /* the same configuration: the refused replacement is not "unchanged" */
+    assert(pt_recv(&m) && m.type == PLUG_MSG_START && m.slot == mp.slot && m.gen == mp.gen);
+    assert(pt_find("b.test.") == pb);
+    int r_in, r_out;
+    pt_up(mp.slot, mp.gen, 1, &r_in, &r_out, NULL);
+    assert(pt_find("b.test.") != pb && pt_find("b.test.")->slot == mp.slot);
+    plug_backend_reap();
     assert(pt_recv(&m) && m.type == PLUG_MSG_STOP && m.slot == mn.slot);
-    assert(pt_find("b.test.") && pt_find("b.test.") != pb && atomic_load(&pt_find("b.test.")->dead));
+    pb = pt_find("b.test.");
 
-    /* 8. reload, a.test. removed: STOP, out of the table; program-max-failures sends a KILL */
+    /* 7b. review 2: a refused zone that has no plugin yet is asked for again with the backoff (1 s) and at a reload */
+    zone_config_t zc;
+    memset(&zc, 0, sizeof(zc));
+    zc.domain = "c.test.";
+    zc.type = "program";
+    tzx(&zc)->program_path = (char *)"/bin/cat";
+    zb.next = &zc;
+    plug_backend_reconfigure(&cfg);
+    plug_msg_t mc;
+    assert(pt_recv(&mc) && mc.type == PLUG_MSG_START && strcmp(mc.zone, "c.test.") == 0);
+    plug_msg_init(&m, PLUG_MSG_DOWN, mc.slot, mc.gen, 0);
+    m.flags = PLUG_DOWN_REFUSED;
+    plug_backend_apply(&m, sizeof(m), 0, NULL, 0);
+    plug_backend_timer();
+    assert(pt_nothing());                                 /* (not before the backoff) */
+    usleep(1100000);
+    plug_backend_timer();
+    assert(pt_recv(&m) && m.type == PLUG_MSG_START && m.slot == mc.slot && m.gen == mc.gen);
+    plug_msg_init(&m, PLUG_MSG_DOWN, mc.slot, mc.gen, 0);
+    m.flags = PLUG_DOWN_REFUSED;
+    plug_backend_apply(&m, sizeof(m), 0, NULL, 0);
+    while (poll(&rp, 1, 0) == 1 && read(a_in, line, sizeof(line)) > 0) {}
+    plug_backend_reconfigure(&cfg);
+    assert(pt_recv(&m) && m.type == PLUG_MSG_START && m.slot == mc.slot);   /* the reload asks at once */
+#ifdef __FreeBSD__
+    /* review 10: an UP whose descriptors are not pipes is a failed start: KILL, nothing in the table */
+    {
+        int bad[2], c2[2], p2[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, bad) == 0 && pipe(c2) == 0 && pipe(p2) == 0);
+        plug_msg_init(&m, PLUG_MSG_UP, mc.slot, mc.gen, 1);
+        m.pid = 77;
+        int fds3[3] = { bad[0], c2[0], p2[0] };
+        plug_backend_apply(&m, sizeof(m), 0, fds3, 3);
+        assert(fcntl(bad[0], F_GETFD) == -1 && fcntl(c2[0], F_GETFD) == -1);
+        assert(pt_recv(&m) && m.type == PLUG_MSG_KILL && m.slot == mc.slot && m.seq == 1);
+        assert(atomic_load(&pt_find("c.test.")->dead));
+        close(bad[1]); close(c2[1]); close(p2[1]);
+    }
+#endif
+    zb.next = NULL;
+
+    /* 8. reload, a.test. and c.test. removed: out of the table, STOP after the readers; program-max-failures sends a KILL */
     view.zones = &zb;
     plug_backend_reconfigure(&cfg);
-    assert(pt_recv(&m) && m.type == PLUG_MSG_STOP && m.slot == ma.slot);
-    assert(pt_find("a.test.") == NULL);
+    assert(pt_find("a.test.") == NULL && pt_find("c.test.") == NULL);
+    assert(pt_nothing());
+    plug_backend_reap();
+    bool stop_a = false, stop_c = false;
+    for (int k = 0; k < 2; k++) {
+        assert(pt_recv(&m) && m.type == PLUG_MSG_STOP);
+        if (m.slot == ma.slot) stop_a = true;
+        if (m.slot == mc.slot) stop_c = true;
+    }
+    assert(stop_a && stop_c);
     {
         program_plugin_t fake;
         memset(&fake, 0, sizeof(fake));
@@ -11018,19 +11080,145 @@ static void test_plugin_backend_table(void) {
         fake.seq = 5;
         plug_backend_kill(&fake);
         assert(pt_recv(&m) && m.type == PLUG_MSG_KILL && m.slot == 3 && m.gen == 4 && m.seq == 5);
+        assert(!atomic_load(&fake.kill_owed));
     }
 
-    /* 9. no program zone left (allow-program-zones no: they answer SERVFAIL): empty table, STOP; the retired objects are freed */
+    /* 9. no program zone left (allow-program-zones no: they answer SERVFAIL): empty table, STOP after the readers; freed */
     cfg.allow_program_zones = false;
     plug_backend_reconfigure(&cfg);
-    assert(pt_recv(&m) && m.type == PLUG_MSG_STOP);
     assert(atomic_load(&g_program_plugin_table) == NULL);
     plug_backend_reap();
+    assert(pt_recv(&m) && m.type == PLUG_MSG_STOP);
+    plug_backend_reap();
+
+    /* review 8: a KILL that cannot be sent stays owed and the timer sends it again */
+    {
+        program_plugin_t fake;
+        memset(&fake, 0, sizeof(fake));
+        fake.proc_fd = -1;
+        fake.slot = 6;
+        fake.gen = 7;
+        fake.seq = 8;
+        program_plugins_set_for_test(&fake, 1);
+        g_plug_ctrl_fd = -1;
+        plug_backend_kill(&fake);
+        assert(atomic_load(&fake.kill_owed));
+        g_plug_ctrl_fd = sv[1];
+        plug_backend_timer();
+        assert(pt_recv(&m) && m.type == PLUG_MSG_KILL && m.slot == 6 && m.seq == 8 && !atomic_load(&fake.kill_owed));
+        program_plugins_set_for_test(NULL, 0);
+    }
+    close(r_in); close(r_out);
+
+    /* review 4: 256 zones, every one replaced while its replacement is pending and after the switch: the slots do not run out */
+    {
+        int big = 1024 * 1024;
+        for (int e = 0; e < 2; e++) { (void)setsockopt(sv[e], SOL_SOCKET, SO_RCVBUF, &big, sizeof(big)); (void)setsockopt(sv[e], SOL_SOCKET, SO_SNDBUF, &big, sizeof(big)); }
+        static zone_config_t many[PLUG_MAX_ZONES];
+        static char names[PLUG_MAX_ZONES][24];
+        char *argv_r[4][1] = { { (char *)"r0" }, { (char *)"r1" }, { (char *)"r2" }, { (char *)"r3" } };
+        memset(many, 0, sizeof(many));
+        for (int i = 0; i < PLUG_MAX_ZONES; i++) {
+            snprintf(names[i], sizeof(names[i]), "z%d.test.", i);
+            many[i].domain = names[i];
+            many[i].type = "program";
+            tzx(&many[i])->program_path = (char *)"/bin/cat";
+            many[i].next = i + 1 < PLUG_MAX_ZONES ? &many[i + 1] : NULL;
+        }
+        view.zones = many;
+        cfg.allow_program_zones = true;
+        static plug_msg_t st[PLUG_MAX_ZONES];
+        for (int round = 0; round < 5; round++) {
+            for (int i = 0; i < PLUG_MAX_ZONES; i++) {
+                tzx(&many[i])->program_args = argv_r[round % 4];
+                tzx(&many[i])->program_args_count = round == 0 ? 0 : 1;
+            }
+            plug_backend_reconfigure(&cfg);
+            int starts = 0;
+            while (pt_recv(&m)) {
+                if (m.type == PLUG_MSG_START) st[starts++ % PLUG_MAX_ZONES] = m;
+            }
+            if (starts != PLUG_MAX_ZONES) printf("round %d: %d STARTs\n", round, starts);
+            assert(starts == PLUG_MAX_ZONES);                 /* every zone got its START: no "no slot" */
+            if (round == 0 || round == 2) {                   /* the plugins come up: the old ones retire, unreaped */
+                if (round == 2) rcu_aux_read_lock();          /* (a reader: nothing retired is freed until round 4 is done) */
+                for (int i = 0; i < PLUG_MAX_ZONES; i++) {
+                    int ui, uo;
+                    pt_up(st[i].slot, st[i].gen, 1, &ui, &uo, NULL);
+                    close(ui); close(uo);
+                }
+            }
+        }
+        rcu_aux_read_unlock();
+        cfg.allow_program_zones = false;
+        plug_backend_reconfigure(&cfg);
+        plug_backend_reap();
+        while (pt_recv(&m)) {}
+        assert(atomic_load(&g_program_plugin_table) == NULL);
+    }
     close(a_in); close(a_out); close(b_in); close(b_out); close(n_in); close(n_out);
     g_plug_ctrl_fd = saved_fd;
     close(sv[0]);
     close(sv[1]);
     printf("  -> the Backend's plugin table passed.\n");
+}
+
+int plugin_write_reload_line(int fd, uint32_t wait_ms);
+
+/* review 6: the RELOAD line: never a wait on the control thread (owed to the next exchange when the pipe is full), a fragment is told apart */
+static void test_plugin_reload_line_write(void) {
+    printf("[TEST] Plugins 0.6.2: the RELOAD line (whole, owed when the pipe is full, a fragment)...\n");
+    int p[2];
+    assert(pipe(p) == 0);
+    char buf[16];
+    assert(plugin_write_reload_line(p[1], 0) == 1 && read(p[0], buf, sizeof(buf)) == 7 && memcmp(buf, "RELOAD\n", 7) == 0);
+    fcntl(p[1], F_SETFL, fcntl(p[1], F_GETFL) | O_NONBLOCK);
+    static char fill[4096];
+    while (write(p[1], fill, sizeof(fill)) > 0) {}
+    while (write(p[1], fill, 1) > 0) {}
+    assert(plugin_write_reload_line(p[1], 0) == 0);
+    assert(plugin_write_reload_line(p[1], 50) == 0);
+    /* the control thread does not wait: the line stays owed */
+    program_plugin_t pl;
+    memset(&pl, 0, sizeof(pl));
+    pl.stdin_fd = p[1];
+    pl.stdout_fd = -1;
+    pl.proc_fd = -1;
+    pl.timeout_ms = 2000;
+    pl.reload_line = true;
+    pthread_mutex_init(&pl.lock, NULL);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    program_plugin_request_reload(&pl);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    assert(atomic_load(&pl.reload_pending) && (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < 500);
+    pthread_mutex_destroy(&pl.lock);
+    close(p[0]);
+    close(p[1]);
+    /* a fragment: a stream socket with room for 3 bytes takes "REL" and no more */
+    int s2[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, s2) == 0);
+    fcntl(s2[1], F_SETFL, fcntl(s2[1], F_GETFL) | O_NONBLOCK);
+    int one = 1;
+    (void)setsockopt(s2[1], SOL_SOCKET, SO_SNDLOWAT, &one, sizeof(one));
+    while (write(s2[1], fill, sizeof(fill)) > 0) {}
+    while (write(s2[1], fill, 1) > 0) {}
+    size_t got = 0;
+    while (got < 3) {
+        ssize_t n = read(s2[0], buf, 3 - got);
+        assert(n > 0);
+        got += (size_t)n;
+    }
+    int r = plugin_write_reload_line(s2[1], 50);
+    printf("  (a socket with 3 bytes of room: %d)\n", r);
+#ifdef __FreeBSD__
+    assert(r == -1);                                      /* (FreeBSD 15: "REL" goes, the rest does not: a fragment) */
+#else
+    assert(r != 1);
+#endif
+    close(s2[0]);
+    close(s2[1]);
+    printf("  -> the RELOAD line passed.\n");
 }
 
 /* The Backend's end of the manager's pair: the next record, with the number of descriptors (closed) */
@@ -11156,6 +11344,14 @@ static void test_plugin_manager(void) {
     plug_sup_handle(&s, &m);
     assert(s.s[9].state == PLUG_MS_REFUSED && s.own_cfg != NULL);         /* (the file was read) */
     assert(ps_recv(bk, &r, &nfds, 1000) && r.type == PLUG_MSG_DOWN && (r.flags & PLUG_DOWN_REFUSED));
+    assert(s.rereads == 1);                                               /* review 7: at most one reading a second */
+    plug_sup_handle(&s, &m);                                              /* review 2: a refused START asked again is looked at again */
+    assert(s.s[9].state == PLUG_MS_REFUSED && s.rereads == 1);
+    assert(ps_recv(bk, &r, &nfds, 1000) && r.type == PLUG_MSG_DOWN && r.slot == 9 && (r.flags & PLUG_DOWN_REFUSED));
+    s.reread_ms -= 1000;                                                  /* (a second later) */
+    plug_sup_handle(&s, &m);
+    assert(s.rereads == 2);
+    assert(ps_recv(bk, &r, &nfds, 1000) && r.type == PLUG_MSG_DOWN && r.slot == 9);
 
     /* 5. a zone a reload added: in the file, not in the start-up copy */
     char ffp[PLUG_FP_MAX];
@@ -11217,6 +11413,7 @@ int main(void) {
     test_query_engine_program_zone_late_reply();
     test_plugin_backend_table();
     test_plugin_manager();
+    test_plugin_reload_line_write();
     test_query_engine_opcode_header_validations();
     test_all_rr_types_and_resolution();
     test_dnssec_negative_and_delegation_proofs();

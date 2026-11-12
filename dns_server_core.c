@@ -528,8 +528,9 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr,
   }
   int fd = -1;
   cmsg = CMSG_FIRSTHDR(&msg);
-  if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS)
-    fd = *(int *)CMSG_DATA(cmsg);
+  if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS && cmsg->cmsg_len >= CMSG_LEN(sizeof(int)) &&
+      msg.msg_controllen >= CMSG_LEN(sizeof(int)))   /* (0.6.2 review: the descriptor is inside the control data that came) */
+    memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
   pthread_mutex_unlock(&broker_lock);
   if (data[0] != 0) {                           /* the broker refused: close a descriptor that came with the answer anyway */
     if (fd >= 0) close(fd);
@@ -5149,7 +5150,7 @@ void *control_thread_func(void *arg) {
         zone_retire_process(false);
         zone_prev_expire(now);          /* karictl rollback: the previous versions whose rollback-window is over */
         config_standby_reap(false);
-        plug_backend_reap();            /* 0.6.2: the plugin objects and tables no reader holds any more */
+        plug_backend_timer();           /* 0.6.2: freed plugin objects (and their STOPs), STARTs to ask again, owed KILLs */
         if (g_reload_pending) {
           /* O-10: 読み手が残っていて延期したリロードを捨てずにやり直す */
           syslog(LOG_NOTICE, "[Config] Retrying the postponed reload");

@@ -50,7 +50,7 @@ Unlike traditional CGI-like designs, KariDNS **does not fork or execute a new pr
      - a zone whose `program`, `program-args`, `program-user`, `program-timeout`, `program-max-failures`, `disable-auto-tc-flag` or `program-reload-line` changed gets a new plugin; the old one keeps answering until the new one runs, and is then stopped;
      - the plugin of a zone that the reload removes is stopped;
      - a plugin whose settings did not change is left as it is (with `program-reload-line yes;` it gets the `RELOAD` line, see the protocol section).
-     The manager reads `karidns.conf` again for a zone, or settings, that it has not seen yet, and starts only what that file says: the path, the arguments and the user never come from the sandboxed backend. A file that changed again between the reload and that read (other settings for the zone) is refused, and the zone answers `SERVFAIL` until the next reload.
+     The manager reads `karidns.conf` again for a zone, or settings, that it has not seen yet, and starts only what that file says: the path, the arguments and the user never come from the sandboxed backend. It reads the file at most once a second. A start the manager refuses (a file that changed again between the reload and that read, a half-written file, a `program-user` it cannot look up, no memory) is asked for again after 1, 2, 4, ... 60 seconds, and at once by the next reload; meanwhile a new zone answers `SERVFAIL`, and a zone whose replacement is refused keeps its running plugin. The old plugin of a changed or removed zone is stopped once no query in progress can still use it.
    - At most 256 zones of type `program` can be configured; more is a configuration error.
 
 2. **Asynchronous I/O Pool with Serialized Plugin Access**
