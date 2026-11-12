@@ -209,7 +209,8 @@ export async function principalDelete(ctx) {
   return reply(204, null);
 }
 
-// an administrator sets the password of a user (the user's sessions end)
+// an administrator sets the password of a user (the user's sessions end and its API tokens are revoked: a token stolen with the old
+// password would stay valid until it expires otherwise; audit, 0.6.2)
 export async function principalPassword(ctx) {
   const id = idParam(ctx);
   requireGlobal(ctx);
@@ -222,6 +223,7 @@ export async function principalPassword(ctx) {
   await ctx.db(async (tx) => {
     await S.setPassword(tx, id, hash, ctx.app.now());
     await S.deleteSessionsOf(tx, id);
+    await S.revokeTokensOf(tx, id, ctx.app.now());
   }, { write: true });
   return { password: 'changed' };
 }

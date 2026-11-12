@@ -392,6 +392,26 @@ static bool tinydns_ttl_field(parse_context_t *ctx, const char *line_start, cons
     return true;
 }
 
+/* A numeric RDATA field (MX distance, SRV port / weight / priority, NAPTR order / preference, SSHFP algorithm / type, the type of a
+ * generic ':' line): decimal digits only, at most MAX.  strtoul() read garbage as 0 and wrapped a value too large for the field. */
+static bool tinydns_num_field(parse_context_t *ctx, const char *line_start, const char *buf, const char *field, size_t len,
+                              unsigned long max, const char *what, unsigned long *out) {
+    bool ok = len > 0 && len <= 10;
+    for (size_t i = 0; i < len && ok; i++)
+        if (!isdigit((unsigned char)field[i])) ok = false;
+    unsigned long v = ok ? strtoul(field, NULL, 10) : 0;
+    if (!ok || v > max) {
+        if (ctx && ctx->err_out) {
+            ctx->err_out->error_message = what;
+            ctx->err_out->error_offset = (size_t)(line_start - buf);
+            ctx->err_out->token_length = len;
+        }
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
 /* ============================================================================
  * 1行処理関数
  * ============================================================================ */
@@ -561,7 +581,8 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             }
 
             unsigned long dist = 0;
-            if (flen[3] > 0) dist = strtoul(f[3], NULL, 10);
+            if (flen[3] > 0 && !tinydns_num_field(ctx, line_start, buf, f[3], flen[3], 65535, "Invalid MX distance in tinydns record (expected 0-65535)", &dist))
+                return false;
 
             unsigned long ttl = TTL_POSITIVE;
             if (flen[4] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[4], flen[4], &ttl)) return false;
@@ -819,7 +840,9 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                 return false;
             }
 
-            unsigned long type_num = strtoul(f[1], NULL, 10);
+            unsigned long type_num = 0;
+            if (!tinydns_num_field(ctx, line_start, buf, f[1], flen[1], 65535, "Invalid type number in tinydns generic record (expected 1-65535)", &type_num))
+                return false;
             // 禁止タイプ検証 (0, NS=2, CNAME=5, SOA=6, PTR=12, MX=15) and every meta-type (OPT, TKEY, TSIG, IXFR, AXFR,
             // MAILB/MAILA, ANY, NXNAME): the same is_meta_rrtype() the master-file parser uses, so a meta-type can not be
             // smuggled into zone data through a generic record.
@@ -944,9 +967,10 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             }
 
             unsigned long port = 0, weight = 0, priority = 0, ttl = TTL_POSITIVE;
-            if (flen[3] > 0) port = strtoul(f[3], NULL, 10);
-            if (flen[4] > 0) weight = strtoul(f[4], NULL, 10);
-            if (flen[5] > 0) priority = strtoul(f[5], NULL, 10);
+            if ((flen[3] > 0 && !tinydns_num_field(ctx, line_start, buf, f[3], flen[3], 65535, "Invalid SRV port in tinydns record (expected 0-65535)", &port)) ||
+                (flen[4] > 0 && !tinydns_num_field(ctx, line_start, buf, f[4], flen[4], 65535, "Invalid SRV weight in tinydns record (expected 0-65535)", &weight)) ||
+                (flen[5] > 0 && !tinydns_num_field(ctx, line_start, buf, f[5], flen[5], 65535, "Invalid SRV priority in tinydns record (expected 0-65535)", &priority)))
+                return false;
             if (flen[6] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[6], flen[6], &ttl)) return false;
 
             char *target = tinydns_decode_fqdn(arena, f[2], flen[2]);
@@ -1004,8 +1028,9 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             }
 
             unsigned long order = 0, pref = 0, ttl = TTL_POSITIVE;
-            if (flen[1] > 0) order = strtoul(f[1], NULL, 10);
-            if (flen[2] > 0) pref = strtoul(f[2], NULL, 10);
+            if ((flen[1] > 0 && !tinydns_num_field(ctx, line_start, buf, f[1], flen[1], 65535, "Invalid NAPTR order in tinydns record (expected 0-65535)", &order)) ||
+                (flen[2] > 0 && !tinydns_num_field(ctx, line_start, buf, f[2], flen[2], 65535, "Invalid NAPTR preference in tinydns record (expected 0-65535)", &pref)))
+                return false;
             if (flen[7] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[7], flen[7], &ttl)) return false;
 
             if (tinydns_owned(ctx, owner, true)) {
@@ -1059,8 +1084,9 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             }
 
             unsigned long alg = 0, fptype = 0, ttl = TTL_POSITIVE;
-            if (flen[1] > 0) alg = strtoul(f[1], NULL, 10);
-            if (flen[2] > 0) fptype = strtoul(f[2], NULL, 10);
+            if ((flen[1] > 0 && !tinydns_num_field(ctx, line_start, buf, f[1], flen[1], 255, "Invalid SSHFP algorithm in tinydns record (expected 0-255)", &alg)) ||
+                (flen[2] > 0 && !tinydns_num_field(ctx, line_start, buf, f[2], flen[2], 255, "Invalid SSHFP fingerprint type in tinydns record (expected 0-255)", &fptype)))
+                return false;
             if (flen[4] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[4], flen[4], &ttl)) return false;
 
             if (tinydns_owned(ctx, owner, true)) {

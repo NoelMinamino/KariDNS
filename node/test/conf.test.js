@@ -64,9 +64,9 @@ test('plaintextWarning: a connection to another host without TLS', () => {
   const w = (t) => plaintextWarning(parseConninfo(t));
   for (const local of ['', 'dbname=k', 'host=/tmp', 'host=/var/run/postgresql sslmode=disable', 'host=localhost', 'host=LOCALHOST sslmode=prefer', 'host=127.0.0.1', 'host=127.1.2.3 sslmode=allow', 'host=::1', "host='[::1]'"]) assert.equal(w(local), null, local);
   for (const mode of ['disable', 'allow', 'prefer']) {
-    assert.equal(w(`host=db.example.test sslmode=${mode}`), `the connection to the database at db.example.test is not encrypted (sslmode=${mode}); use sslmode=require or verify-full`);
+    assert.equal(w(`host=db.example.test sslmode=${mode}`), `the connection to the database at db.example.test is not encrypted (sslmode=${mode}); use sslmode=verify-full (require encrypts but does not check the server)`);
   }
-  assert.equal(w('host=192.0.2.5 port=5432'), 'the connection to the database at 192.0.2.5 is not encrypted (no sslmode); use sslmode=require or verify-full');
+  assert.equal(w('host=192.0.2.5 port=5432'), 'the connection to the database at 192.0.2.5 is not encrypted (no sslmode); use sslmode=verify-full (require encrypts but does not check the server)');
   assert.match(w('host=127.0.0.1.example.test'), /not encrypted/);
   for (const mode of ['require', 'verify-ca', 'verify-full']) assert.equal(w(`host=db.example.test sslmode=${mode}`), null);
   assert.deepEqual(Object.keys(parseConninfo('host=db.example.test sslmode=prefer')), ['host'], 'sslmode is not an option for pg');

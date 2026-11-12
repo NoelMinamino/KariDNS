@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <sys/ucred.h>
 #include <sys/stat.h>
@@ -179,8 +180,22 @@ const EVP_MD *karictl_hmac_md(const char *alg) {
     return NULL;
 }
 
+/* -t: how long karictl waits for each piece of the server's reply (SO_RCVTIMEO on the control socket; rndc -t, default 60 s).  Without a
+ * limit a server that accepted the connection and never answered held karictl for ever (seen in the fault-injection sweep, PR #175). */
+static int g_reply_timeout = 60;
+static bool g_timeout_told;
+static ssize_t ctl_recv(int sock, void *buf, size_t len) {
+    ssize_t r = recv(sock, buf, len, 0);
+    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !g_timeout_told) {
+        g_timeout_told = true;
+        fprintf(stderr, "karictl: no reply from the server within %d s (-t sets the limit)\n", g_reply_timeout);
+    }
+    return r;
+}
+
 static void karictl_usage(FILE *fp, const char *argv0) {
-    fprintf(fp, "Usage: %s [-c config_path] [-f config_path] [-s socket_path] [-v] <command> [args...]\n", argv0);
+    fprintf(fp, "Usage: %s [-c config_path] [-f config_path] [-s socket_path] [-t seconds] [-v] <command> [args...]\n", argv0);
+    fprintf(fp, "  -t seconds                  how long to wait for the server's reply (1-86400, default 60)\n");
     fprintf(fp,
         "Commands:\n"
         "  status                      server status\n"
@@ -318,9 +333,16 @@ static int karictl_open_session(const char *conf_path, const char *cli_sock_path
         explicit_bzero(secret_decoded, sizeof(secret_decoded));
         *rc = 1; return -1;
     }
+    struct timeval rtv = { .tv_sec = g_reply_timeout, .tv_usec = 0 };
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv)) != 0) {
+        perror("setsockopt(SO_RCVTIMEO)");
+        close(sock);
+        explicit_bzero(secret_decoded, sizeof(secret_decoded));
+        *rc = 1; return -1;
+    }
 
     char buf[1024];
-    ssize_t r = recv(sock, buf, sizeof(buf) - 1, 0);
+    ssize_t r = ctl_recv(sock, buf, sizeof(buf) - 1);
     if (r <= 0) {
         fprintf(stderr, "Failed to receive challenge\n");
         close(sock);
@@ -369,7 +391,7 @@ static int karictl_open_session(const char *conf_path, const char *cli_sock_path
     int mlen = snprintf(auth_msg, sizeof(auth_msg), "AUTH %s\n", expected);
     send(sock, auth_msg, mlen, 0);
 
-    r = recv(sock, buf, sizeof(buf) - 1, 0);
+    r = ctl_recv(sock, buf, sizeof(buf) - 1);
     if (r <= 0) {
         fprintf(stderr, "Failed to receive auth response\n");
         close(sock);
@@ -404,7 +426,7 @@ typedef struct {
 static bool ctl_read_full(int sock, void *buf, size_t n) {
     size_t got = 0;
     while (got < n) {
-        ssize_t r = recv(sock, (char *)buf + got, n - got, 0);
+        ssize_t r = ctl_recv(sock, (char *)buf + got, n - got);
         if (r <= 0) return false;
         got += (size_t)r;
     }
@@ -415,7 +437,7 @@ static bool ctl_read_full(int sock, void *buf, size_t n) {
 static bool ctl_read_line(int sock, char *buf, size_t cap) {
     size_t n = 0;
     while (n + 1 < cap) {
-        ssize_t r = recv(sock, buf + n, 1, 0);
+        ssize_t r = ctl_recv(sock, buf + n, 1);
         if (r <= 0) return false;
         if (buf[n] == '\n') break;
         n++;
@@ -436,7 +458,7 @@ static int ctl_fetch_struct(const char *conf_path, const char *cli_sock, const c
     if (!buf) { close(sock); return 1; }
     size_t got = 0;
     while (got < 3 + len) {
-        ssize_t r = recv(sock, buf + got, 3 + len - got, 0);
+        ssize_t r = ctl_recv(sock, buf + got, 3 + len - got);
         if (r <= 0) break;
         got += (size_t)r;
         if (got >= 5 && strncmp(buf, "ERROR", 5) == 0) break;   /* a refusal is a line, shorter than the structure */
@@ -979,8 +1001,19 @@ int main(int argc, char **argv) {
     bool conf_path_explicit = false;
     const char *cli_sock_path = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "+c:f:s:v")) != -1) {   /* ('+': stop at the command; its own -f is not this one) */
+    while ((opt = getopt(argc, argv, "+c:f:s:t:v")) != -1) {   /* ('+': stop at the command; its own -f is not this one) */
         switch (opt) {
+            case 't': {
+                char *end = NULL;
+                errno = 0;
+                long t = strtol(optarg, &end, 10);
+                if (errno != 0 || end == optarg || *end != '\0' || t < 1 || t > 86400) {
+                    fprintf(stderr, "karictl: -t: '%s' is not a number of seconds from 1 to 86400\n", optarg);
+                    return 2;
+                }
+                g_reply_timeout = (int)t;
+                break;
+            }
             case 'c':
             case 'f':
                 conf_path = optarg;
@@ -1111,7 +1144,7 @@ int main(int argc, char **argv) {
         size_t expected_len = 3 + sizeof(karidns_status_t);
         size_t total = 0;
         while (total < expected_len) {
-            r = recv(sock, buf + total, sizeof(buf) - total, 0);
+            r = ctl_recv(sock, buf + total, sizeof(buf) - total);
             if (r <= 0) break;
             total += r;
         }
@@ -1183,7 +1216,7 @@ int main(int argc, char **argv) {
         char dbuf[16384];
         size_t total = 0;
         while (total < sizeof(dbuf) - 1) {
-            r = recv(sock, dbuf + total, sizeof(dbuf) - 1 - total, 0);
+            r = ctl_recv(sock, dbuf + total, sizeof(dbuf) - 1 - total);
             if (r <= 0) break;
             total += (size_t)r;
         }
@@ -1196,7 +1229,7 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[optind], "observatory") == 0) {
         size_t total = 0;
         while (total < sizeof(buf) - 1) {
-            r = recv(sock, buf + total, 1, 0);
+            r = ctl_recv(sock, buf + total, 1);
             if (r <= 0) break;
             total += r;
             if (buf[total - 1] == '\n') break;
@@ -1220,7 +1253,7 @@ int main(int argc, char **argv) {
                 zone_observatory_snapshot_t snap;
                 size_t got = 0;
                 while (got < sizeof(snap)) {
-                    ssize_t n = recv(sock, (char *)&snap + got, sizeof(snap) - got, 0);
+                    ssize_t n = ctl_recv(sock, (char *)&snap + got, sizeof(snap) - got);
                     if (n <= 0) break;
                     got += n;
                 }
@@ -1292,7 +1325,7 @@ int main(int argc, char **argv) {
             }
         }
     } else {
-        r = recv(sock, buf, sizeof(buf) - 1, 0);
+        r = ctl_recv(sock, buf, sizeof(buf) - 1);
         if (r > 0) {
             buf[r] = '\0';
             printf("%s", buf);

@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { parseConfig } from '../lib/config.js';
-import { parseArgs, checkSetup, openDb, main, USAGE, VERSION, DEFAULT_CONFIG } from '../lib/cli.js';
+import { parseArgs, checkSetup, openDb, main, USAGE, VERSION, DEFAULT_CONFIG, sqliteModeWarning } from '../lib/cli.js';
 import { loadSqlite } from '../../node/lib/sqlite.js';
 
 const out = () => { const w = []; return { w, write: (s) => { w.push(s); }, text: () => w.join('') }; };
@@ -67,15 +67,30 @@ test('--check: the tools, the files; nothing is changed', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-cli-'));
   try {
     fs.writeFileSync(path.join(dir, 'p.sqlite3'), '');
+    fs.chmodSync(path.join(dir, 'p.sqlite3'), 0o660);   // group access is the documented setup (shared with the loader)
     const f = fakeRun();
     const r = await checkSetup(parseConfig(GOOD(dir)), { run: f.run, st: { work: goodStat } });
     assert.deepEqual(r.problems, []);
+    assert.deepEqual(r.warnings, []);
     assert.ok(r.notes.some((n) => /^dnssec-signzone \(\/bt\/dnssec-signzone\): dnssec-signzone 9\.20\.29$/.test(n)));
     assert.ok(r.notes.some((n) => /^karidns-zone .*drivers: sqlite3/.test(n)));
     assert.ok(r.notes.some((n) => /^karictl /.test(n)));
     assert.ok(r.notes.some((n) => /^sqlite-file .*: fine$/.test(n)));
     assert.deepEqual(f.calls.map((c) => c[0]), ['/bt/dnssec-keygen', '/bt/dnssec-signzone', '/kz', '/kc', '/kctl']);
     assert.deepEqual(f.calls[1][1], ['-V']);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('--check: a SQLite3 file other users can read is a warning (audit M8)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-cli-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'p.sqlite3'), '');
+    const r = await checkSetup(parseConfig(GOOD(dir)), { run: fakeRun().run, st: { work: goodStat, sqlite: () => ({ mode: 0o100604 }) } });
+    assert.deepEqual(r.problems, []);
+    assert.deepEqual(r.warnings, [`sqlite-file ${path.join(dir, 'p.sqlite3')} has mode 0604: other users can read the signing keys in it; remove their access (chmod o-rwx)`]);
+    assert.ok(!r.notes.some((n) => /^sqlite-file /.test(n)));
+    // a file that cannot be examined: no warning here (the start and access() report it)
+    assert.equal(sqliteModeWarning('/nonexistent/p.sqlite3'), null);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -123,8 +138,8 @@ test('--check and the start: a plain text connection to another host is a warnin
   const warnings = async (text) => (await checkSetup(pg, { run: f.run, st: { work: goodStat, conninfo: st }, readFile: () => text })).warnings;
   assert.deepEqual(await warnings('host=/tmp dbname=k'), []);
   assert.deepEqual(await warnings('host=db.example.test sslmode=verify-full'), []);
-  assert.deepEqual(await warnings('host=db.example.test sslmode=allow'), ['the connection to the database at db.example.test is not encrypted (sslmode=allow); use sslmode=require or verify-full']);
-  assert.deepEqual(await warnings('host=db.example.test'), ['the connection to the database at db.example.test is not encrypted (no sslmode); use sslmode=require or verify-full']);
+  assert.deepEqual(await warnings('host=db.example.test sslmode=allow'), ['the connection to the database at db.example.test is not encrypted (sslmode=allow); use sslmode=verify-full (require encrypts but does not check the server)']);
+  assert.deepEqual(await warnings('host=db.example.test'), ['the connection to the database at db.example.test is not encrypted (no sslmode); use sslmode=verify-full (require encrypts but does not check the server)']);
   assert.deepEqual(await warnings('host=db.example.test nonsense'), []);
   const o = out();
   const e = out();
@@ -186,9 +201,12 @@ test('openDb: SQLite3 and PostgreSQL', async () => {
     raw.exec(fs.readFileSync(new URL('../../tests/db/pdns_schema.sqlite3.sql', import.meta.url), 'utf8'));
     raw.exec(fs.readFileSync(new URL('../../db/karidns_ext.sqlite3.sql', import.meta.url), 'utf8'));
     raw.close();
-    const db = await openDb(parseConfig(`database = sqlite3\nsqlite-file = ${file}\nkarictl-config = /k`), { importSqlite: async () => sqlite });
+    const warned = [];
+    const db = await openDb(parseConfig(`database = sqlite3\nsqlite-file = ${file}\nkarictl-config = /k`), { importSqlite: async () => sqlite, warn: (m) => warned.push(m), statSqlite: () => ({ mode: 0o100644 }) });
     assert.equal(typeof db.dueZones, 'function');
     db.close();
+    // audit M8 (0.6.2): the file holds the signing keys; access for others is warned at the start (and by --check)
+    assert.deepEqual(warned, [`sqlite-file ${file} has mode 0644: other users can read the signing keys in it; remove their access (chmod o-rwx)`]);
     // PostgreSQL: a conninfo file that is not acceptable, then one that is
     const cfg = parseConfig('database = pg\nconninfo-file = /ci\nschema = ks');
     await assert.rejects(openDb(cfg, { checkConninfo: () => '/ci has mode 0644' }), /mode 0644/);

@@ -513,6 +513,7 @@ register_test "core" "sh" "tests/run_forward_zone_test.sh" "RFC 5452 Forward zon
 register_test "core" "sh" "tests/run_program_zone_test.sh" "Dynamic backend records via program zone plugin"
 register_test "core" "sh" "tests/run_karictl_observatory_test.sh" "karictl observatory IPC metrics query"
 register_test "core" "sh" "tests/run_karictl_stats_test.sh" "karictl stats (Prometheus text, JSON, paging) and options/zone alerts { } (0.6.1)"
+register_test "core" "sh" "tests/run_karictl_timeout_test.sh" "karictl -t: a server that never answers ends the wait (0.6.2)"
 register_test "core" "sh" "tests/run_karictl_reload_reconfig_test.sh" "karictl reload & dynamic reconfig IPC"
 register_test "core" "sh" "tests/run_karictl_reload_failure_test.sh" "karictl reload/reconfig report failures (exit 3), restart-only settings, status values and time format (D-13, O-05, O-09, D-12, T-11)"
 register_test "core" "sh" "tests/run_signal_all_processes_test.sh" "SIGHUP/SIGUSR1/SIGUSR2/SIGPIPE to every karidns process: nothing dies, the server reloads and keeps answering"
@@ -533,6 +534,7 @@ register_test "core" "sh" "tests/run_xfr_request_shape_test.sh" "A malformed AXF
 register_test "core" "sh" "tests/run_formerr_bind_compat_test.sh" "Error answers as BIND 9.20: a bad question section is a FORMERR without OPT/EDE (any opcode, EDNS version, transport, the TCP transfer dispatch); NOTIMP and BADVERS echo the questions BIND does; UPDATE/NOTIFY of class ANY/NONE = FORMERR; AXFR over UDP after the zone and ACL checks; a repeated FORMERR is answered every time (no loop guard, as named 9.20)"
 register_test "core" "sh" "tests/run_xfr_dispatch_fault_test.sh" "TCP transfer dispatch fault injection (test-only karictl xfr-fail): no thread / no memory = REFUSED + EDE 0 without text, xfer-out error lines (SKIP without the test hook)"
 register_test "core" "sh" "tests/run_compressed_qname_test.sh" "Compression pointer in the question name -> FORMERR (X-15)"
+register_test "core" "sh" "tests/run_udp_oversize_test.sh" "UDP datagram above the receive buffer is dropped (audit M5)"
 register_test "core" "sh" "tests/run_rrl_slip_tsig_test.sh" "RRL slip answers to TSIG-signed queries are signed (X-20)"
 register_test "core" "sh" "tests/run_view_same_zone_test.sh" "Same zone name in two views: data, glue and program plugin per view (R-26, O-12)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
 register_test "core" "sh" "tests/run_name_escape_test.sh" "Owner names with master-file escapes: BIND/tinydns zones, AXFR, NSEC3 hashes (R-29, R-23, O-08)"

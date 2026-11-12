@@ -53,11 +53,7 @@ static char *zrows_read_file(const char *path) {
 
 static char *zrows_include_cb(parse_context_t *ctx, const char *path, dev_t *out_dev, ino_t *out_ino) {
     (void)ctx;
-    struct stat st;
-    if (stat(path, &st) != 0) return NULL;
-    if (out_dev) *out_dev = st.st_dev;
-    if (out_ino) *out_ino = st.st_ino;
-    return zrows_read_file(path);
+    return zone_read_include_file(path, ZONE_INCLUDE_MAX_BYTES, out_dev, out_ino);
 }
 
 /* The text of a file or of standard input becomes the arena's file buffer (the parser works on it in place) and its pristine copy (for messages). */

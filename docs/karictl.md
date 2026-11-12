@@ -15,7 +15,7 @@ KARICTL(8)                     KariDNS Manual                     KARICTL(8)
 ## SYNOPSIS
 
 ```sh
-karictl [-c config_path | -f config_path] [-s socket_path] <command> [arguments...]
+karictl [-c config_path | -f config_path] [-s socket_path] [-t seconds] <command> [arguments...]
 karictl -v | --version
 karictl -h | --help
 karictl tsig-keygen [keyname]
@@ -36,6 +36,9 @@ karictl tsig-keygen [keyname]
 
 `-s socket_path`
 : UNIX domain socket to connect to. Takes precedence over the `socket` setting of the configuration file (default: `/var/run/karidns/control.sock`).
+
+`-t seconds`
+: How long to wait for each part of the server's reply: the challenge, and then each read of the answer (1–86400, default 60, as `rndc -t`). When the server sends nothing for that long, `karictl` prints `no reply from the server within N s` and fails. A full `reload` of the zone files answers when the reload is done, so a server with very many zone files may need a larger value; database zones answer at once (`karictl dbstatus` shows the progress).
 
 `-v`, `--version`
 : Display version information and exit.

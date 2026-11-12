@@ -96,7 +96,7 @@ export default {
   'account.pw-new': 'New password',
   'account.pw-again': 'New password again',
   'account.pw-rules': 'At least {min} characters, and not your user name.',
-  'account.pw-others': 'Sign out my other sessions',
+  'account.pw-others': 'Sign out my other sessions and revoke my API tokens',
   'account.pw-change': 'Change password',
   'account.pw-need-current': 'Enter your current password.',
   'account.pw-has-name': 'The password must not contain your user name.',

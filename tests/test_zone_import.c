@@ -1111,6 +1111,27 @@ static void t_inputs(void) {
     zi_input_t in = { path, NULL, 0, 0 };
     CHECK(z && zi_import_zone(z, &in, NULL, &r) == ZI_OK);
     CHECK(qn("SELECT count(*) FROM records WHERE name = 'inc.inc.test'") == 1);
+    /* 0.6.2 (audit M11): an $INCLUDE that is a symbolic link, or a FIFO (the open must not wait for a writer), is refused as the server
+     * refuses it (zone_read_include_file) */
+    char lnk[600], fifo[600];
+    snprintf(lnk, sizeof(lnk), "%s/link.inc", g_dir);
+    snprintf(fifo, sizeof(fifo), "%s/fifo.inc", g_dir);
+    unlink(lnk);
+    unlink(fifo);
+    CHECK(symlink(inc, lnk) == 0);
+    CHECK(mkfifo(fifo, 0644) == 0);
+    write_file(path, "$ORIGIN inc.test.\n$TTL 300\n@ IN SOA ns1 hostmaster 2 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n$INCLUDE link.inc\n", 0644);
+    log_reset();
+    CHECK(z && zi_import_zone(z, &in, NULL, &r) == ZI_FAIL);
+    LOG_HAS("zone.syntax");
+    CHECK(strstr(g_log, "$INCLUDE file could not be read") != NULL);
+    write_file(path, "$ORIGIN inc.test.\n$TTL 300\n@ IN SOA ns1 hostmaster 2 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n$INCLUDE fifo.inc\n", 0644);
+    log_reset();
+    CHECK(z && zi_import_zone(z, &in, NULL, &r) == ZI_FAIL);
+    LOG_HAS("zone.syntax");
+    CHECK(strstr(g_log, "$INCLUDE file could not be read") != NULL);
+    unlink(lnk);
+    unlink(fifo);
     /* standard input: the text of a file on file descriptor 0; $INCLUDE is refused */
     write_file(path, "$ORIGIN stdin.test.\n$TTL 300\n@ IN SOA ns1 hostmaster 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n", 0644);
     int saved = dup(0), fd = open(path, O_RDONLY);

@@ -5693,6 +5693,10 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
           int tx_count = 0;
           for (int k = 0; k < n_recv; k++) {
             ssize_t len = (ssize_t)fctx->rx_msgs[k].msg_len;
+            // バッファ (BUFFER_SIZE) より大きいデータグラムは切り詰められて MSG_TRUNC 付きで返る。
+            // 切れたメッセージは数と中身が合わない (UPDATE、TSIG) ので、送られていないメッセージに答えず捨てる
+            if (fctx->rx_msgs[k].msg_hdr.msg_flags & MSG_TRUNC)
+              continue;
             if (len >= DNS_HEADER_SIZE) {
               udp_ipc_t *msg = (udp_ipc_t *)fctx->rx_buffers[k];
               msg->sock_fd_idx = ud;

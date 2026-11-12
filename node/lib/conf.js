@@ -125,7 +125,7 @@ export function plaintextWarning(conn) {
   const host = conn.host ?? '';
   if (host === '' || host.startsWith('/') || host.toLowerCase() === 'localhost' || /^127(\.\d{1,3}){3}$/.test(host) || host === '::1' || host === '[::1]') return null;
   const mode = conn.sslmode;
-  return `the connection to the database at ${host} is not encrypted (${mode ? `sslmode=${mode}` : 'no sslmode'}); use sslmode=require or verify-full`;
+  return `the connection to the database at ${host} is not encrypted (${mode ? `sslmode=${mode}` : 'no sslmode'}); use sslmode=verify-full (require encrypts but does not check the server)`;
 }
 
 // The check karidns-zone and the loader apply to a conninfo file: a regular file (no symbolic link) owned by the user running us, mode 0600 or 0400.

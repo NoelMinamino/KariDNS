@@ -96,7 +96,7 @@ export default {
   'account.pw-new': '新しいパスワード',
   'account.pw-again': '新しいパスワード (確認)',
   'account.pw-rules': '{min} 文字以上で、ユーザー名を含まないこと。',
-  'account.pw-others': '他のセッションをログアウトする',
+  'account.pw-others': '他のセッションをログアウトし、API トークンを無効にする',
   'account.pw-change': 'パスワードを変更',
   'account.pw-need-current': '現在のパスワードを入力してください。',
   'account.pw-has-name': 'パスワードにユーザー名を含めないでください。',

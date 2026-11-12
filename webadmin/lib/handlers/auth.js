@@ -239,7 +239,11 @@ export async function password(ctx) {
   const hash = await hashPassword(body.new, { ln: app.settings['scrypt-ln'] });
   await ctx.db(async (tx) => {
     await S.setPassword(tx, auth.principal.id, hash, app.now());
-    if (body.all) await S.deleteSessionsOf(tx, auth.principal.id, auth.idHash);
+    // all: the other sessions end and the person's API tokens are revoked (audit, 0.6.2: a token taken with the old password stayed valid)
+    if (body.all) {
+      await S.deleteSessionsOf(tx, auth.principal.id, auth.idHash);
+      await S.revokeTokensOf(tx, auth.principal.id, app.now());
+    }
   }, { write: true });
   return { password: 'changed' };
 }

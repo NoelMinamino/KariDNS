@@ -267,6 +267,11 @@ test('S8: a person who is not a global master reads the settings and cannot chan
   assert.equal(findAll(ui.root, (e) => e.tagName === 'FORM').length, 0, 'no form at all');
   assert.equal(ui.input('confirm'), undefined);
   assert.equal(ui.qa('tbody tr').length, 2);
+  // a subdomain master: no metadata section and no request for it (the service answers 403: audit, 0.6.2)
+  const sgrants = [{ id: 4, role: 'subdomain_master', dataset: 'main', zone: 'example.test.', suffix: 'www', policy: POLICY, via: null }];
+  const subUi = await bootApp({ routes: zoneRoutes({ info: { role: 'subdomain_master', grants: sgrants } }, {}), hash: `${ZONE}/settings`, me: { global: false, grants: sgrants } });
+  assert.equal(subUi.count('GET', '/datasets/main/zones/example.test./metadata'), 0);
+  assert.equal(subUi.q('section[aria-labelledby=meta-title]'), null);
   const bad = await bootApp({ routes: zoneRoutes({}, { 'GET /datasets/main/zones/example.test./metadata': () => problem(500, 'internal'), 'DELETE /datasets/main/zones/example.test.': () => problem(409, 'refused') }), hash: `${ZONE}/settings` });
   assert.ok(findAll(bad.root, (e) => e.className === 'msg error').length >= 1);
   typed(bad, bad.input('confirm'), 'example.test.');

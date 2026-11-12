@@ -223,15 +223,18 @@ static void test_numeric_directives(void) {
         expect_reject(bad_sizes[i], txt);
     }
 
-    /* max-mqtypes clamps to [0, 16]; garbage is ignored (keeps the default of 4) */
+    /* max-mqtypes: above 16 is cut to 16; a negative value or garbage is an error (0.6.2, audit: it was ignored silently) */
     static const struct { const char *in; int expect; } mq[] = {
-        { "0", 0 }, { "7", 7 }, { "16", 16 }, { "99", 16 }, { "-3", 0 }, { "abc", 4 },
+        { "0", 0 }, { "7", 7 }, { "16", 16 }, { "99", 16 }, { "4294967295", 16 },
     };
     for (size_t i = 0; i < sizeof(mq) / sizeof(mq[0]); i++) {
         char txt[128];
         snprintf(txt, sizeof(txt), "options { max-mqtypes %s; };", mq[i].in);
         if (parse_ok(txt, &cfg)) { CHECK(cfg.max_mqtypes == mq[i].expect); free_server_config_fields(&cfg); }
     }
+    expect_reject("max-mqtypes negative", "options { max-mqtypes -3; };");
+    expect_reject("max-mqtypes garbage", "options { max-mqtypes abc; };");
+    expect_reject("max-mqtypes trailing garbage", "options { max-mqtypes 4x; };");
 }
 
 static void test_numeric_directives_invalid(void) {
@@ -248,6 +251,14 @@ static void test_numeric_directives_invalid(void) {
         "options { minimal-any-ttl 1.5; };",
         "options { wire-cache-max-records -1; };",
         "options { wire-cache-max-records lots; };",
+        /* 0.6.2 (audit): values that do not fit in 32 bits were cut; a sign was read as a huge value */
+        "options { query-log-max-qps -1; };",
+        "options { query-log-max-qps 4294967296; };",
+        "options { query-log-buffer-size -1024; };",
+        "options { wire-cache-max-records 4294967296; };",
+        "options { dnstap { socket \"/var/run/dnstap.sock\"; queue-size 3000000000; }; };",
+        "options { dnstap { socket \"/var/run/dnstap.sock\"; queue-size 1048577; }; };",
+        "options { dnstap { socket \"/var/run/dnstap.sock\"; queue-size big; }; };",
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) expect_reject(cases[i], cases[i]);
 }
@@ -849,6 +860,13 @@ static void test_zone_program_and_forward(void) {
     expect_reject("program-timeout ';' missing", "zone \"d.test\" { type program; program-timeout 5 };");
     expect_reject("program-max-failures value missing", "zone \"d.test\" { type program; program-max-failures; };");
     expect_reject("program-max-failures ';' missing", "zone \"d.test\" { type program; program-max-failures 5 };");
+    /* 0.6.2 (audit): a value that is not a number, has garbage after it, or does not fit is an error (it was ignored or cut to 32 bits) */
+    expect_reject("program-timeout not a number", "zone \"d.test\" { type program; program-timeout abc; };");
+    expect_reject("program-timeout trailing garbage", "zone \"d.test\" { type program; program-timeout 750ms; };");
+    expect_reject("program-timeout negative", "zone \"d.test\" { type program; program-timeout -1; };");
+    expect_reject("program-timeout above 2^31-1", "zone \"d.test\" { type program; program-timeout 4294968296; };");
+    expect_reject("program-max-failures not a number", "zone \"d.test\" { type program; program-max-failures x; };");
+    expect_reject("forward-timeout above 2^31-1", "zone \"f.test\" { type forward; forwarders { 192.0.2.53; }; forward-timeout 99999999999; };");
 
     if (parse_ok("zone \"f.example\" { type forward; forwarders { 192.0.2.53; 198.51.100.53 port 5353; }; "
                  "forward-timeout 1500; };", &cfg)) {

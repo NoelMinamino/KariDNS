@@ -589,7 +589,8 @@ test('metadata: the kinds the API writes, global masters only, audited', withToo
   const list = await dom('GET', url);
   assert.deepEqual(list.body.metadata, [{ kind: 'ALLOW-AXFR-FROM', content: ['192.0.2.0/24', '2001:db8::/32'] }, { kind: 'ALSO-NOTIFY', content: ['192.0.2.9:5353'] }]);
   assert.ok(list.body.writable.includes('X-KARIDNS-PROFILE'));
-  assert.equal((await sub('GET', url)).status, 200, 'a grant on the zone reads');
+  // the masters of the whole zone read them; a subdomain master does not (they are about the whole zone: audit, 0.6.2)
+  is(await sub('GET', url), 403, 'forbidden');
   // replaced, not added to
   await root('PUT', `${url}/ALLOW-AXFR-FROM`, { body: { content: ['198.51.100.1'] } });
   assert.deepEqual((await sql(d, "SELECT content FROM domainmetadata WHERE kind = 'ALLOW-AXFR-FROM'")).map((r) => r.content), ['198.51.100.1']);

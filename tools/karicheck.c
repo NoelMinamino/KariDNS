@@ -131,18 +131,9 @@ KARIDNS_TOOL_FN char *kc_read_stdin(bool *out_failed) {
 
 KARIDNS_TOOL_FN char *karicheck_load_file_cb(parse_context_t *ctx, const char *rel_path, dev_t *out_dev, ino_t *out_ino) {
     (void)ctx;
-    
-    if (out_dev || out_ino) {
-        struct stat st;
-        if (stat(rel_path, &st) == 0) {
-            if (out_dev) *out_dev = st.st_dev;
-            if (out_ino) *out_ino = st.st_ino;
-        } else {
-            return NULL; // fstat failed, fail-closed
-        }
-    }
-    
-    return read_file_or_die(rel_path, NULL);
+    /* 0.6.2 (audit M11): as the server reads it (no symbolic link as the last component, no FIFO, a size limit); the parser reports the
+     * failure as "$INCLUDE file could not be read" */
+    return zone_read_include_file(rel_path, ZONE_INCLUDE_MAX_BYTES, out_dev, out_ino);
 }
 
 
