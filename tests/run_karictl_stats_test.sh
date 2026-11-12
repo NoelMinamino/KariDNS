@@ -162,6 +162,9 @@ sleep 1
 echo "== B. karictl stats"
 ctl stats > "$T/all.prom"; st=$?
 if [ "$st" = 0 ]; then ok "karictl stats exits 0 (Prometheus text is the default)"; else bad "karictl stats exit $st" "$(head -5 "$T/all.prom")"; fi
+# 0.6.2: one log line per listing (its first page), not one per page: this listing has two pages
+n=$(grep -c ': obspage ' "$LOG" 2>/dev/null)
+[ "${n:-0}" = 1 ] && ok "the two pages of the listing log one line" || bad "obspage lines in the log: ${n:-0}, want 1" "$(grep ': obspage ' "$LOG" | head -3)"
 has() { grep -q -- "$1" "$2"; }
 getv() { sed -n "s/^$1 //p" "$2" | head -1; }   # value of a sample whose name{labels} is exactly $1 (regex-free text)
 has '^karidns_build_info{version="' "$T/all.prom" && ok "karidns_build_info has the version" || bad "karidns_build_info missing"

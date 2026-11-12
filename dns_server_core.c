@@ -4664,7 +4664,11 @@ void *control_thread_func(void *arg) {
              * a refused command is answered and logged, and the connection stays open. */
             const bool allowed = (c->perm & control_command_perm(cmd, arg != NULL)) != 0;
             if (allowed) {
-              syslog(LOG_NOTICE, "[Control] key \"%s\": %s", c->key_name, logline);
+              /* obspage: one line per listing (its first page, cursor "-"), the later pages at debug level: `karictl stats` of 1M zones asks for
+               * some 200 pages and filled the log with them (0.6.2) */
+              const char *last_sp = view_arg ? strrchr(view_arg, ' ') : NULL;
+              const bool later_page = strcmp(cmd, "obspage") == 0 && last_sp && strcmp(last_sp + 1, "-") != 0;
+              syslog(later_page ? LOG_DEBUG : LOG_NOTICE, "[Control] key \"%s\": %s", c->key_name, logline);
             } else {
               char deny[192];
               int dl = snprintf(deny, sizeof(deny), "ERROR command not allowed for key \"%.100s\"\n", c->key_name);
