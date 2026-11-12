@@ -1,6 +1,7 @@
 #include "dns_config_parser.h"
 #include <openssl/crypto.h>
 #include "dns_utils.h"
+#include "dns_plugin_msg.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9528,9 +9529,18 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   if (validate_database_config(ctx, config) != 0) return -1;
 
   // Inherit options.user as default program-user if unspecified
+  int program_zones = 0;
   for (view_config_t *v = config->views; v; v = v->next) {
     for (zone_config_t *z = v->zones; z; z = z->next) {
       if (z->type && strcasecmp(z->type, "program") == 0) {
+        /* 0.6.2: the manager supervises at most PLUG_MAX_ZONES plugins (dns_plugin_msg.h) */
+        if (++program_zones > PLUG_MAX_ZONES) {
+          syslog(LOG_ERR, "[Config] more than %d zones of type program (zone '%s')", PLUG_MAX_ZONES, z->domain ? z->domain : "");
+          cfg_diag(ctx, DIAG_ERROR, DC_CONF_ZONE_PROGRAM_COUNT, "more than %d zones of type program (zone '%s'); at most %d are supported\n",
+                   PLUG_MAX_ZONES, z->domain ? z->domain : "", PLUG_MAX_ZONES);
+          if (ctx) ctx->error_occurred = true;
+          return -1;
+        }
         if (!zext(z)->program_user && config->user) {
           zone_ext_t *zx = zone_ext_mut(z);
           if (!zx) return -1;

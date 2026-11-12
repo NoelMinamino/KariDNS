@@ -13,6 +13,7 @@
 #include "dns_siphash.h"
 #include "dns_zone_image.h"
 #include "dns_alias.h"
+#include "dns_plugin_sup.h"
 
 #ifdef __FreeBSD__
 #include <sys/capsicum.h>
@@ -196,9 +197,6 @@ static bool qe_update_query_acl_denies(const server_config_t *cfg, const zone_co
   }
   return true;
 }
-
-program_plugin_t *g_program_plugins = NULL;
-int g_program_plugins_count = 0;
 
 /* S5 phase B-1: the engine reads the zone image (dns_zone_image.h), not zone_arena_t.records[]. A published version (zone_version_t) carries the image (with the zone level tables:
  * tinydns locations, tags), the response cache state and the generation. RRs are named by their index in the image. */
@@ -1964,12 +1962,13 @@ size_t get_question_end_offset(const uint8_t *pkt, size_t len, uint16_t qdcount)
     return question_end_strict(pkt, len, qdcount, &end) ? end : len;
 }
 
+/* 0.6.2: the table is published through RCU (dns_plugin_sup.c); the caller is in its read section (the pool threads are, for the whole
+ * exchange), so the object stays valid while it is used */
 program_plugin_t *find_program_plugin(const char *view_name, const char *domain) {
   if (!view_name || !domain) return NULL;
-  for (int i = 0; i < g_program_plugins_count; i++) {
-    if (strcasecmp(g_program_plugins[i].view_name, view_name) == 0 &&
-        strcasecmp(g_program_plugins[i].domain, domain) == 0)
-      return &g_program_plugins[i];
+  program_plugin_table_t *t = atomic_load_explicit(&g_program_plugin_table, memory_order_acquire);
+  for (int i = 0; t && i < t->count; i++) {
+    if (strcasecmp(t->p[i]->view_name, view_name) == 0 && strcasecmp(t->p[i]->domain, domain) == 0) return t->p[i];
   }
   return NULL;
 }
@@ -2274,21 +2273,10 @@ STATIC_TEST int dispatch_to_program_zone(const char *view_name, const char *doma
     if (f >= plugin->max_failures) {
       atomic_store_explicit(&plugin->dead, true, memory_order_release);
       syslog(LOG_CRIT, "[Plugin] zone '%s' exceeded max failures; marking dead "
-             "(will return SERVFAIL until restart)", domain);
-      if (plugin->pid > 0) {
-#ifdef __FreeBSD__
-        /* X-11: ここはサンドボックスの中。kill(pid) は ECAPMODE (PROC_TRAPCAP で SIGTRAP) になり
-         * バックエンドごと止まるので、起動時に得たプロセス記述子で止める。close() で回収される。 */
-        if (plugin->proc_fd >= 0) {
-          pdkill(plugin->proc_fd, SIGKILL);
-          close(plugin->proc_fd);
-          plugin->proc_fd = -1;
-        }
-#else
-        kill(plugin->pid, SIGKILL);
-        waitpid(plugin->pid, NULL, WNOHANG);
-#endif
-      }
+             "(SERVFAIL until the manager has started the plugin again)", domain);
+      /* 0.6.2 (decision 5): killed (pdkill() on its process descriptor: kill(pid) is ECAPMODE here, X-11) and started again by the manager
+       * with the backoff of a plugin that exited */
+      plug_backend_kill(plugin);
     }
     result_len = build_synthetic_servfail(req, req_len, res, max_res_len); // M-1
   } else {
@@ -2592,214 +2580,6 @@ STATIC_TEST int dispatch_forward_zone(const zone_config_t *zcfg, const uint8_t *
 
   syslog(LOG_ERR, "[Forward] zone '%s': all %d forwarder(s) failed or timed out", zcfg->domain, x->forwarders_count);
   return build_synthetic_servfail(req, req_len, res, max_res_len);
-}
-
-bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, program_plugin_t *out) {
-  const zone_ext_t *x = zext(zcfg);
-  if (!x->program_path) {
-    syslog(LOG_ERR, "[Plugin] zone '%s' program_path is NULL; refusing to spawn", zcfg->domain);
-    return false;
-  }
-
-  /* program-user は fork 前に解決する (O-18: fork した子で getpwnam() を呼ばない) */
-  uid_t prog_uid = (uid_t)-1;
-  gid_t prog_gid = (gid_t)-1;
-  bool prog_user_found = x->program_user && lookup_user_ids(x->program_user, &prog_uid, &prog_gid);
-  /* P4: a program-user that is root by another name (uid 0, or the root group as its primary group) is refused, like no
-   * program-user as root below (validate_program_zone_users() refuses the configuration first; this is the fail-closed spawn) */
-  if (prog_user_found && (prog_uid == 0 || prog_gid == 0)) {   /* the ids resolved above: no second name lookup here */
-    syslog(LOG_ERR, "[Plugin] zone '%s': program-user '%s' is uid %u, gid %u; refusing to run the plugin as root or in the root group",
-           zcfg->domain, x->program_user, (unsigned)prog_uid, (unsigned)prog_gid);
-    return false;
-  }
-  /* S-1: the plugin gets an empty environment (as the database loader does, dns_db_supervisor.c): nothing of the
-   * server's environment (paths, debugging variables, anything an operator exported) reaches a zone's program.  TZ is
-   * kept so that its time stamps match the server's.  Read before the fork (no getenv() in the child). */
-  const char *tz = getenv("TZ");
-  char tzenv[136] = "";
-  char *plugin_envp[2] = { NULL, NULL };
-  if (tz) {
-    snprintf(tzenv, sizeof(tzenv), "TZ=%s", tz);
-    plugin_envp[0] = tzenv;
-  }
-
-  int in_pipe[2];  // parent(karidns) write -> child(script) stdin
-  int out_pipe[2]; // child(script) stdout -> parent(karidns) read
-  if (pipe(in_pipe) != 0) {
-    syslog(LOG_ERR, "[Plugin] pipe() failed for zone '%s': %m", zcfg->domain);
-    return false;
-  }
-  if (pipe(out_pipe) != 0) {
-    syslog(LOG_ERR, "[Plugin] pipe() failed for zone '%s': %m", zcfg->domain);
-    close(in_pipe[0]); close(in_pipe[1]);          /* the first pair would leak */
-    return false;
-  }
-
-  /* The child writes its two messages with write(2) from text made here: after pdfork() the Backend's other threads exist, and stdio
-   * (its locks, malloc) is not safe in the child of a multithreaded process. */
-  char child_msg_root[256], child_msg_user[256];
-  size_t child_msg_root_len = (size_t)snprintf(child_msg_root, sizeof(child_msg_root),
-      "[FATAL] Zone '%s': 'program-user' is not set and karidns is running as root; refusing to exec plugin as root.\n", zcfg->domain);
-  size_t child_msg_user_len = (size_t)snprintf(child_msg_user, sizeof(child_msg_user),
-      "[FATAL] Zone '%s': program-user '%s' differs from the non-root user karidns runs as; refusing to exec plugin.\n",
-      zcfg->domain, x->program_user ? x->program_user : "");
-  if (child_msg_root_len >= sizeof(child_msg_root)) child_msg_root_len = sizeof(child_msg_root) - 1;
-  if (child_msg_user_len >= sizeof(child_msg_user)) child_msg_user_len = sizeof(child_msg_user) - 1;
-
-  int proc_fd = -1;
-#ifdef __FreeBSD__
-  /* X-11: 子を止めるのはサンドボックスに入った後なので、pid ではなくプロセス記述子で持つ */
-  pid_t pid = pdfork(&proc_fd, PD_CLOEXEC);
-#else
-  pid_t pid = fork();
-#endif
-  if (pid < 0) {
-    syslog(LOG_ERR, "[Plugin] fork() failed for zone '%s': %m", zcfg->domain);
-    close(in_pipe[0]); close(in_pipe[1]); close(out_pipe[0]); close(out_pipe[1]);
-    return false;
-  }
-
-  if (pid == 0) {
-    dup2(in_pipe[0], STDIN_FILENO);
-    dup2(out_pipe[1], STDOUT_FILENO);
-    close(in_pipe[0]); close(in_pipe[1]);
-    close(out_pipe[0]); close(out_pipe[1]);
-
-#ifdef __FreeBSD__
-    closefrom(STDERR_FILENO + 1); // 継承済みの全fd(制御チャネル/IPC/リスニングソケット等)を確実に閉じる
-#else
-    int maxfd = (int)sysconf(_SC_OPEN_MAX);
-    if (maxfd < 0) maxfd = 1024;
-    for (int fd = 3; fd < maxfd; fd++) {
-      close(fd);
-    }
-#endif
-
-    // H-1適用に伴う必須フェイルセーフ:
-    // program-user未設定のままrootでexecされることを、main()の
-    // 「root起動でuser/group未設定なら拒否する」既存ポリシーと同様に禁止する。
-    if (!x->program_user && geteuid() == 0) {
-      // 標準エラーはまだ生きている(closefromはSTDERR_FILENO+1から)ので出力可能
-      (void)!write(STDERR_FILENO, child_msg_root, child_msg_root_len);
-      _exit(125);
-    }
-
-    if (x->program_user) {
-      if (!prog_user_found) { _exit(126); }
-      if (geteuid() == 0) {
-        if (setgroups(0, NULL) != 0) _exit(126);
-        if (setgid(prog_gid) != 0) _exit(126);
-        if (setuid(prog_uid) != 0) _exit(126);
-      } else if (prog_uid != geteuid() || prog_uid != getuid()) {
-        // 非root起動では別ユーザーへ切り替えられない。main()の起動前検証
-        // (validate_program_zone_users) で弾かれるはずだが念のため fail-closed。
-        (void)!write(STDERR_FILENO, child_msg_user, child_msg_user_len);
-        _exit(126);
-      }
-    }
-
-    char *argv[64];
-    int ai = 0;
-    argv[ai++] = (char *)x->program_path;
-    for (int i = 0; i < x->program_args_count && ai < 63; i++)
-      argv[ai++] = x->program_args[i];
-    argv[ai] = NULL;
-
-    /* The plugin runs in "/", as it did when daemonize() changed there: it must not inherit the working directory of the server (the
-     * starting directory or options { directory }, which program-user may not even be able to read) */
-    if (chdir("/") != 0) _exit(126);
-
-    /* バックエンドが無視/ブロックしているシグナルをプラグインへ引き継がない
-     * (無視の設定とシグナルマスクは exec 後も残る) */
-    signal(SIGPIPE, SIG_DFL);
-    signal(SIGHUP, SIG_DFL);
-    signal(SIGUSR1, SIG_DFL);
-    signal(SIGUSR2, SIG_DFL);
-    sigset_t plugin_mask;
-    sigemptyset(&plugin_mask);
-    sigprocmask(SIG_SETMASK, &plugin_mask, NULL);
-
-    execve(x->program_path, argv, plugin_envp);   /* S-1: an empty environment (plugin_envp, built before the fork) */
-    _exit(127);
-  }
-
-  close(in_pipe[0]);
-  close(out_pipe[1]);
-
-  fcntl(in_pipe[1], F_SETFD, FD_CLOEXEC);
-  fcntl(out_pipe[0], F_SETFD, FD_CLOEXEC);
-#ifdef __FreeBSD__
-  cap_rights_t rights;
-  cap_rights_init(&rights, CAP_WRITE, CAP_EVENT, CAP_FCNTL);
-  cap_rights_limit(in_pipe[1], &rights);
-  cap_rights_t rights_r;
-  cap_rights_init(&rights_r, CAP_READ, CAP_EVENT, CAP_FCNTL);
-  cap_rights_limit(out_pipe[0], &rights_r);
-  cap_rights_t rights_pd;
-  cap_rights_init(&rights_pd, CAP_PDKILL);
-  cap_rights_limit(proc_fd, &rights_pd);
-#endif
-
-  strncpy(out->domain, zcfg->domain, sizeof(out->domain) - 1);
-  out->domain[sizeof(out->domain) - 1] = '\0';
-  strlcpy(out->view_name, view_name ? view_name : "", sizeof(out->view_name));
-  out->pid = pid;
-  out->proc_fd = proc_fd;
-  out->stdin_fd = in_pipe[1];
-  out->stdout_fd = out_pipe[0];
-  pthread_mutex_init(&out->lock, NULL);
-  out->timeout_ms = x->program_timeout_ms > 0 ? x->program_timeout_ms : 2000;
-  out->max_failures = x->program_max_failures > 0 ? x->program_max_failures : 5;
-  out->disable_auto_tc_flag = x->disable_auto_tc_flag;
-  out->reload_line = x->program_reload_line;
-  atomic_init(&out->reload_pending, false);
-  compute_program_zone_fingerprint(zcfg, out->config_fingerprint, sizeof(out->config_fingerprint));
-  atomic_init(&out->consecutive_failures, 0);
-  atomic_init(&out->dead, false);
-
-  syslog(LOG_INFO, "[Plugin] Spawned program zone '%s' -> pid=%d exec='%s'",
-         zcfg->domain, pid, x->program_path);
-  return true;
-}
-
-void spawn_program_zone_plugins(server_config_t *cfg) {
-  int count = 0;
-  for (view_config_t *v = cfg->views; v; v = v->next)
-    for (zone_config_t *z = v->zones; z; z = z->next)
-      if (z->type && strcasecmp(z->type, "program") == 0) count++;
-
-  if (count == 0) return;
-
-  if (!cfg->allow_program_zones) {
-    syslog(LOG_CRIT, "[Plugin] %d zone(s) with type \"program\" found but "
-           "allow-program-zones is not set to yes in options{}. Refusing to start.", count);
-    fprintf(stderr, "[FATAL] type \"program\" zones require "
-            "'allow-program-zones yes;' in options{}.\n");
-    backend_exit(EXIT_FAILURE); /* O-15: スレッド起動後に Backend から呼ばれる */
-  }
-
-  syslog(LOG_WARNING, "[Plugin] %d program zone(s) enabled. "
-         "This is a TEST-ONLY feature; do not use in production.", count);
-
-  g_program_plugins = calloc(count, sizeof(program_plugin_t));
-  if (!g_program_plugins) backend_exit(EXIT_FAILURE);
-
-  int idx = 0;
-  for (view_config_t *v = cfg->views; v; v = v->next) {
-    for (zone_config_t *z = v->zones; z; z = z->next) {
-      if (!z->type || strcasecmp(z->type, "program") != 0) continue;
-      if (!zext(z)->program_path) {
-        syslog(LOG_ERR, "[Plugin] zone '%s' has type program but no 'program' path set; skipping (will SERVFAIL)", z->domain);
-        continue;
-      }
-      if (!zext(z)->program_user && cfg->user) {
-        zone_ext_t *zx = zone_ext_mut(z);
-        if (zx) zx->program_user = strdup(cfg->user);
-      }
-      if (spawn_one_program_plugin(z, v->name, &g_program_plugins[idx])) idx++;
-    }
-  }
-  g_program_plugins_count = idx;
 }
 
 /* One view, by the address alone (the flat match-clients lists; an empty list matches every client) */

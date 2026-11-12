@@ -122,8 +122,6 @@ view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client_ip);
  * otherwise *tsig_done is false and *tsig is not meaningful.  cfg may be NULL (no key is known then); tsig and tsig_done may not be NULL. */
 view_snapshot_t *select_view_req(zone_db_snapshot_t *snap, const server_config_t *cfg, const char *client_ip, const uint8_t *req,
                                  size_t req_len, tsig_request_t *tsig, bool *tsig_done);
-bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, program_plugin_t *out);
-void spawn_program_zone_plugins(server_config_t *cfg);
 void compute_program_zone_fingerprint(const zone_config_t *z, char *out, size_t out_cap);
 /* 0.6.2: owe the plugin a RELOAD line (only with program-reload-line yes); written now when no exchange runs, else right after it */
 void program_plugin_request_reload(program_plugin_t *p);

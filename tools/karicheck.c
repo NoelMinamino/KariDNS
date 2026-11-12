@@ -1104,7 +1104,7 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
                 if (zx->program_args_count > 62) {
                     dns_diag(DIAG_ERROR, DC_CONF_ZONE_PROGRAM_ARGS, NULL, 0,
                         "Zone '%s': program-args has %d entries, but only 62 are "
-                        "supported (argv[] is fixed-size in spawn_one_program_plugin()). "
+                        "supported (the manager passes at most 62 to the plugin, dns_plugin_sup.c). "
                         "Reduce the argument count.\n",
                         z->domain, zx->program_args_count);
                     free(buf);

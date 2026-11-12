@@ -1,9 +1,14 @@
 #!/bin/sh
 # ==============================================================================
-# KariDNS type "program" zones: the RELOAD line (program-reload-line, 0.6.2)
+# KariDNS type "program" zones 0.6.2: the RELOAD line and the plugin supervisor of the manager
 #
-#   - karictl reload and SIGHUP write "RELOAD" to a plugin whose zone has program-reload-line yes;
-#   - a zone without it never gets the line (its plugin would exit on an unknown line, tests/plugins/supervised_plugin.pl).
+#   - karictl reload and SIGHUP write "RELOAD" to a plugin whose zone has program-reload-line yes, and do not restart it;
+#   - a zone without it never gets the line (its plugin would exit on an unknown line, tests/plugins/supervised_plugin.pl);
+#   - a plugin that exits after N queries is started again and answers;
+#   - a plugin that exits at once is started again after 1, 2, 4 s (the backoff), not in a loop;
+#   - a plugin that reaches program-max-failures is killed and started again;
+#   - a reload: a changed program-args gets a new plugin (the old one ends), a new zone answers, a removed zone's plugin ends;
+#   - the plugins end with the server.
 # ==============================================================================
 . "$(dirname "$0")/lib_proc.sh"
 set -e
@@ -66,15 +71,17 @@ wait_events() {
     return 1
 }
 # answer NAME: the A answer for NAME (empty when there is none)
-answer() { "$DAG" @127.0.0.1 -p "$PORT" "$1" A +short +nohexdump +time=2 +tries=1 2>/dev/null | head -1; }
+answer() { "$DAG" @127.0.0.1 -p "$PORT" "$1" A +short +nohexdump +time=2 +tries=1 2>/dev/null | grep -E '^[0-9.]+$' | head -1; }
 
-# zone NAME ADDR [extra statements]: a program zone whose plugin answers ADDR and logs to ev/ADDR
+# zone NAME ADDR [extra statements] [EXIT_AFTER]: a program zone whose plugin answers ADDR and logs to ev/ADDR
 zone() {
+    _z_more=""
+    [ -n "${4:-}" ] && _z_more=" \"$4\";"
     cat << EOF
 zone "$1" {
     type program;
     program "$PLUGIN";
-    program-args { "$2"; "$TMP_DIR/ev/$2"; };
+    program-args { "$2"; "$TMP_DIR/ev/$2";$_z_more };
     $PROG_USER_OPT
     program-timeout 1000;
     program-max-failures 2;
@@ -110,10 +117,23 @@ key "karictl" {
 };
 EOF
 
-{
+base_zones() {
     zone rl.example. 192.0.2.10 "program-reload-line yes;"
     zone norl.example. 192.0.2.11 "program-reload-line no;"
     zone plain.example. 192.0.2.12
+    zone exit.example. 192.0.2.20 "" 2
+    zone hang.example. 192.0.2.21 "" hang
+    cat << EOF
+zone "quick.example." {
+    type program;
+    program "/usr/bin/true";
+    $PROG_USER_OPT
+};
+EOF
+}
+{
+    base_zones
+    zone chg.example. 192.0.2.30
 } > "$TMP_DIR/zones"
 write_conf
 
@@ -146,6 +166,90 @@ for a in 192.0.2.11 192.0.2.12; do
 done
 [ "$(answer y.rl.example.)" = "192.0.2.10" ] && pass "rl.example answers after the RELOAD lines" || fail "rl.example answers after the RELOAD lines"
 [ "$(answer y.norl.example.)" = "192.0.2.11" ] && pass "norl.example answers after the reloads" || fail "norl.example answers after the reloads"
+
+# pid NAME: the pid of the newest start of the plugin of address NAME
+pid() { grep "^START [0-9]* $1\$" "$TMP_DIR/ev/$1" 2>/dev/null | tail -1 | awk '{print $2}'; }
+# gone PID [SECONDS]: wait until the process has ended
+gone() {
+    _g_i=0
+    while [ "$_g_i" -lt $(( ${2:-10} * 5 )) ]; do
+        kill -0 "$1" 2>/dev/null || return 0
+        sleep 0.2
+        _g_i=$((_g_i + 1))
+    done
+    return 1
+}
+# answer_is NAME ADDR [SECONDS]: wait until NAME answers ADDR
+answer_is() {
+    _a_i=0
+    while [ "$_a_i" -lt $(( ${3:-10} * 2 )) ]; do
+        [ "$(answer "$1")" = "$2" ] && return 0
+        sleep 0.5
+        _a_i=$((_a_i + 1))
+    done
+    return 1
+}
+
+echo "=== 4. A plugin that exits after two queries is started again ==="
+answer a.exit.example. >/dev/null
+answer b.exit.example. >/dev/null
+if wait_events 192.0.2.20 EXIT 1 && wait_events 192.0.2.20 START 2 5; then pass "exit.example's plugin was started again"; else fail "exit.example's plugin was started again" "$(cat "$TMP_DIR/ev/192.0.2.20" 2>/dev/null)"; fi
+if answer_is c.exit.example. 192.0.2.20 5; then pass "exit.example answers after the restart"; else fail "exit.example answers after the restart"; fi
+
+echo "=== 5. A plugin that exits at once: the backoff ==="
+# quick.example's plugin (/usr/bin/true) has been exiting since the start: the waits 1, 2, 4 s, never a loop
+sleep 4
+q_starts=$(grep -c "Spawned program zone 'quick.example.'" "$TMP_DIR/karidns.log" || true)
+waits=$(grep "zone 'quick.example.' in view '[^']*': starting the plugin again in" "$TMP_DIR/karidns.log" | sed 's/.* in \([0-9]*\) s$/\1/' | tr '\n' ' ')
+case "$waits" in
+    "1 2 4 "*) pass "the waits are 1, 2, 4 ... s ($waits)" ;;
+    *) fail "the waits are 1, 2, 4 ... s" "got '$waits'" ;;
+esac
+if [ "$q_starts" -ge 3 ] && [ "$q_starts" -le 6 ]; then pass "a few starts, no loop ($q_starts)"; else fail "a few starts, no loop" "$q_starts starts"; fi
+st=$("$DAG" @127.0.0.1 -p "$PORT" x.quick.example. A +nohexdump +time=2 +tries=1 2>/dev/null | grep -o "status: [A-Z]*")
+[ "$st" = "status: SERVFAIL" ] && pass "quick.example answers SERVFAIL meanwhile" || fail "quick.example answers SERVFAIL meanwhile" "$st"
+
+echo "=== 6. program-max-failures: the plugin is killed and started again ==="
+hang_pid=$(pid 192.0.2.21)
+answer a.hang.example. >/dev/null
+answer b.hang.example. >/dev/null
+if grep -q "zone 'hang.example.' exceeded max failures" "$TMP_DIR/karidns.log" && gone "$hang_pid" 5; then
+    pass "hang.example's plugin was killed at program-max-failures"
+else
+    fail "hang.example's plugin was killed at program-max-failures" "pid $hang_pid"
+fi
+if wait_events 192.0.2.21 START 2 5; then pass "hang.example's plugin was started again"; else fail "hang.example's plugin was started again"; fi
+
+echo "=== 7. Reload: a changed program-args, a new zone, a removed zone ==="
+rl_pid=$(pid 192.0.2.10)
+chg_pid=$(pid 192.0.2.30)
+plain_pid=$(pid 192.0.2.12)
+{
+    base_zones | awk '/^zone "plain.example."/{skip=1} skip&&/^};/{skip=0; next} !skip'
+    zone chg.example. 192.0.2.31
+    zone add.example. 192.0.2.40
+} > "$TMP_DIR/zones"
+write_conf
+"$KARICTL" -f "$TMP_DIR/karictl.conf" reload > "$TMP_DIR/ctl.out" 2>&1 || true
+grep -q "restart needed" "$TMP_DIR/ctl.out" && fail "the reload asks for no restart" "$(cat "$TMP_DIR/ctl.out")" || pass "the reload asks for no restart"
+if answer_is x.chg.example. 192.0.2.31; then pass "chg.example answers with the new program-args"; else fail "chg.example answers with the new program-args" "got '$(answer x.chg.example.)'"; fi
+if [ -n "$chg_pid" ] && gone "$chg_pid"; then pass "chg.example's old plugin ended"; else fail "chg.example's old plugin ended" "pid $chg_pid"; fi
+if answer_is x.add.example. 192.0.2.40; then pass "add.example (added by the reload) answers"; else fail "add.example (added by the reload) answers"; fi
+if [ -n "$plain_pid" ] && gone "$plain_pid"; then pass "plain.example's plugin ended with its zone"; else fail "plain.example's plugin ended with its zone" "pid $plain_pid"; fi
+[ "$(answer x.plain.example.)" = "" ] && pass "plain.example is gone" || fail "plain.example is gone"
+if [ "$(pid 192.0.2.10)" = "$rl_pid" ] && kill -0 "$rl_pid" 2>/dev/null; then pass "rl.example's unchanged plugin kept running"; else fail "rl.example's unchanged plugin kept running"; fi
+[ "$(events 192.0.2.10 RELOAD)" -ge 3 ] && pass "rl.example got the RELOAD line of this reload too" || fail "rl.example got the RELOAD line of this reload too"
+
+echo "=== 8. The plugins end with the server ==="
+all_pids=""
+for a in 192.0.2.10 192.0.2.11 192.0.2.20 192.0.2.21 192.0.2.31 192.0.2.40; do all_pids="$all_pids $(pid $a)"; done
+kill -TERM "$SERVER_PID" 2>/dev/null
+i=0
+while [ "$i" -lt 50 ] && kill -0 "$SERVER_PID" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
+left=""
+for p in $all_pids; do gone "$p" 5 || left="$left $p"; done
+[ -z "$left" ] && pass "no plugin is left after the server stopped" || fail "no plugin is left after the server stopped" "still running:$left"
+grep -q "Terminating all children" "$TMP_DIR/karidns.log" && fail "no child of the server died on its own" || pass "no child of the server died on its own"
 
 if [ "$FAILED" -gt 0 ]; then
     echo "=== Server log ==="

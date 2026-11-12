@@ -42,9 +42,16 @@ Unlike traditional CGI-like designs, KariDNS **does not fork or execute a new pr
 ### Key Architectural Characteristics
 
 1. **Persistent Process Model**
-   - KariDNS launches one plugin process per program zone during server startup (`spawn_program_zone_plugins`), before the backend enters Capsicum capability mode. The plugin inherits standard error; all other inherited descriptors are closed.
+   - One plugin process runs per program zone. Since 0.6.2 it is started by the **manager process** of KariDNS (the parent of the backend, outside the Capsicum sandbox), which hands the backend the plugin's STDIN, its STDOUT and its process descriptor. The plugin runs as `program-user`, in `/`, with an empty environment (only `TZ` is kept); it inherits standard error, all other descriptors are closed. It is never run as root: a missing `program-user` while KariDNS runs as root, or a `program-user` that is uid 0 or in group 0, is refused.
    - The plugin runs as a persistent daemon process that blocks on STDIN and loops over incoming queries, eliminating per-query process instantiation overhead.
-   - Plugins are not restarted by a reload: a program zone added by `karictl reload` / `reconfig` / `SIGHUP` returns `SERVFAIL` until KariDNS is restarted, and changes to the `program*` settings of an existing zone take effect only after a restart.
+   - **Restarts (0.6.2).** A plugin that exits, or that KariDNS kills because it reached `program-max-failures` (below), is started again after 1, 2, 4, ... 60 seconds (the wait doubles at every start and goes back to 1 second once a plugin has run for 10 minutes). The zone answers `SERVFAIL` meanwhile. The manager starts at most 4 plugins per second once a burst of 256 is used, so a plugin that exits at once cannot keep it forking.
+   - **Reload (0.6.2)**, with `karictl reload` / `reconfig` / `SIGHUP`:
+     - a program zone that the reload adds gets its plugin;
+     - a zone whose `program`, `program-args`, `program-user`, `program-timeout`, `program-max-failures`, `disable-auto-tc-flag` or `program-reload-line` changed gets a new plugin; the old one keeps answering until the new one runs, and is then stopped;
+     - the plugin of a zone that the reload removes is stopped;
+     - a plugin whose settings did not change is left as it is (with `program-reload-line yes;` it gets the `RELOAD` line, see the protocol section).
+     The manager reads `karidns.conf` again for a zone, or settings, that it has not seen yet, and starts only what that file says: the path, the arguments and the user never come from the sandboxed backend. A file that changed again between the reload and that read (other settings for the zone) is refused, and the zone answers `SERVFAIL` until the next reload.
+   - At most 256 zones of type `program` can be configured; more is a configuration error.
 
 2. **Asynchronous I/O Pool with Serialized Plugin Access**
    - The worker thread that receives a query for a `type program` (or `type forward`) zone does not wait for the plugin: it hands the query to KariDNS's asynchronous I/O pool (16 threads, queue of 4096 queries), and a pool thread writes the request to the plugin and waits for the reply. When the queue is full, the query is dropped.
@@ -52,7 +59,7 @@ Unlike traditional CGI-like designs, KariDNS **does not fork or execute a new pr
 
 3. **Fault Tolerance and Deadline Monitoring**
    - Each query is assigned a single deadline based on `program-timeout` (default: 2000 ms), shared by all reads and writes of that exchange. If the plugin does not respond within this deadline, KariDNS stops waiting and synthesizes a `SERVFAIL` response to the client.
-   - Every failed exchange (timeout, broken pipe, a declared response length above 65,535) increments a counter of consecutive failures, and a successful exchange resets it. When the counter reaches `program-max-failures` (default: 5), KariDNS kills the process (`SIGKILL`) and marks the zone dead: it answers `SERVFAIL` until KariDNS is restarted.
+   - Every failed exchange (timeout, broken pipe, a declared response length above 65,535) increments a counter of consecutive failures, and a successful exchange resets it. When the counter reaches `program-max-failures` (default: 5), KariDNS kills the process (`SIGKILL`) and marks the zone dead: it answers `SERVFAIL` until the manager has started the plugin again, with the same waits as for a plugin that exited (see Restarts above).
 
 4. **Transparent Binary Wire Passthrough & Truncation**
    - KariDNS passes the raw DNS query packet directly to the plugin and returns the plugin's response bytes directly to the client.
@@ -132,7 +139,7 @@ After generating the response, the plugin writes to standard output:
 To enable `type program` zones, configure the `options` block and define the zone in `karidns.conf`.
 
 ### Safety Requirement
-Because executing external binaries involves system-level privileges, `allow-program-zones yes;` must be explicitly declared in the global `options` block. If this option is omitted or set to `no`, KariDNS will refuse to start.
+Because executing external binaries involves system-level privileges, `allow-program-zones yes;` must be explicitly declared in the global `options` block. If this option is omitted or set to `no`, KariDNS will refuse to start (a reload that removes it stops the plugins, and the program zones answer `SERVFAIL`).
 
 ```text
 options {
@@ -574,6 +581,7 @@ func main() {
 ### 1. KariDNS Returns `SERVFAIL` / Query Timeouts
 - **Missing Output Flush**: By default, standard libraries buffer stdout when connected to a pipe. Ensure that `flush()` or equivalent unbuffered mode is enabled.
 - **External Network or Database Latency**: If your plugin performs external network requests or database queries synchronously, slow queries can exceed `program-timeout` (default: 2000 ms). Utilize in-memory caching (e.g., Redis or local shared memory) to keep response times under 10 ms.
+- **A Plugin That Keeps Exiting**: the log shows `the plugin (pid N) exited with status S` and `starting the plugin again in N s` for the zone, with growing waits. Run the plugin by hand (see below) to see why it ends; an exit status of 127 means that `program` could not be executed.
 
 ### 2. Standalone CLI Testing (Piping Without KariDNS)
 You can test your plugin independently from the command line without launching KariDNS.

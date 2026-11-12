@@ -6,6 +6,7 @@
 #include "dns_config_parser.h"
 #include "dns_wire.h"
 #include "dns_utils.h"
+#include "dns_plugin_msg.h"
 
 #include <arpa/inet.h>
 #include <assert.h>
@@ -831,28 +832,42 @@ typedef struct {
   char new_catalog[256];
 } pending_coo_t;
 
+/* One plugin process as the Backend sees it (0.6.2: started by the manager, dns_plugin_sup.h).  The object is published in
+ * g_program_plugin_table and read by the pool threads in their RCU read section; a restart of the process, or a change of the zone, makes a
+ * new object, and the old one (with its descriptors) is freed once no reader can hold it.  Only the fields marked "changes" are written
+ * after the object is published. */
 typedef struct program_plugin {
   char domain[256];      /* zone_db_entry_t->domain と同じ形式(FQDN, 末尾ドット) */
   char view_name[KARIDNS_VIEW_NAME_MAX]; /* 同じゾーン名が別の view にもあり得るので view と組で引く (O-12) */
+  uint32_t slot;          /* the manager's slot of this zone's plugin */
+  uint32_t gen;           /* the Backend's START number of the slot (the manager echoes it) */
+  uint32_t seq;           /* the manager's start number of the process below; 0 = no process (the zone answers SERVFAIL) */
   pid_t pid;
   int proc_fd;            /* FreeBSD: pdfork() のプロセス記述子 (CAP_PDKILL のみ)。-1 = なし。
                            * capability mode では kill(pid) ができないので pdkill() で止める (X-11) */
-  int stdin_fd;           /* karidns -> script への書き込み側 */
-  int stdout_fd;          /* script -> karidns への読み込み側 */
+  int stdin_fd;           /* karidns -> script への書き込み側 (CAP_WRITE|CAP_EVENT|CAP_FCNTL) */
+  int stdout_fd;          /* script -> karidns への読み込み側 (CAP_READ|CAP_EVENT|CAP_FCNTL) */
   pthread_mutex_t lock;    /* 1子プロセスを複数workerから同時に叩かないための直列化 */
   uint32_t timeout_ms;
   uint32_t max_failures;
   bool disable_auto_tc_flag;
   bool reload_line;        /* program-reload-line yes: a reload writes the RELOAD line (0.6.2) */
-  _Atomic bool reload_pending; /* a RELOAD line is owed: written by whoever holds the lock next (program_plugin_request_reload()) */
-  _Atomic unsigned int consecutive_failures;
-  _Atomic bool dead;        /* max_failures超過、またはexec失敗でtrueになったら以後SERVFAIL固定 */
-  bool resync;             /* a query failed: drop what the pipe holds before the next one (under lock) */
-  char config_fingerprint[512]; /* M-4: reload時の設定変更検知用 */
+  _Atomic bool reload_pending; /* (changes) a RELOAD line is owed: written by whoever holds the lock next (program_plugin_request_reload()) */
+  _Atomic unsigned int consecutive_failures; /* (changes) */
+  _Atomic bool dead;        /* (changes) no process (seq 0), program-max-failures reached, or the manager said DOWN: SERVFAIL without
+                             * I/O until the manager has started it again (that is a new object) */
+  bool resync;             /* (changes, under lock) a query failed: drop what the pipe holds before the next one */
+  char config_fingerprint[PLUG_FP_MAX]; /* compute_program_zone_fingerprint(): what a reload compares */
 } program_plugin_t;
 
-extern program_plugin_t *g_program_plugins;
-extern int g_program_plugins_count;
+/* The plugins, published through RCU (rcu_writer_publish(); the readers are the pool threads in their read section); written by the
+ * control thread only (before the sandbox: the main thread) */
+typedef struct program_plugin_table {
+  int count;
+  program_plugin_t *p[];
+} program_plugin_table_t;
+
+extern _Atomic(program_plugin_table_t *) g_program_plugin_table;
 
 #define RESP_LOG_RING_SIZE 8192
 

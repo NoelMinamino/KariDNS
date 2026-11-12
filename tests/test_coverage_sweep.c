@@ -14,6 +14,7 @@
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
+#include "dns_plugin_sup.h"
 #include "test_zext.h"
 #include "test_tmpdir.h"
 #include "dns_zone_parser.h"
@@ -946,8 +947,7 @@ static void pg_run(int scn, bool disable_tc, size_t max_res, int rounds, uint32_
     plug.timeout_ms = 150;
     plug.max_failures = max_fail;
     plug.disable_auto_tc_flag = disable_tc;
-    g_program_plugins = &plug;
-    g_program_plugins_count = 1;
+    program_plugins_set_for_test(&plug, 1);
     pg_ctx_t c = { in_p[0], out_p[1], scn, rounds };
     pthread_t t;
     pthread_create(&t, NULL, pg_thread, &c);
@@ -961,8 +961,7 @@ static void pg_run(int scn, bool disable_tc, size_t max_res, int rounds, uint32_
     pthread_join(t, NULL);
     close(in_p[0]); close(out_p[0]); if (c.out_wr >= 0) close(c.out_wr);
     pthread_mutex_destroy(&plug.lock);
-    g_program_plugins = NULL;
-    g_program_plugins_count = 0;
+    program_plugins_set_for_test(NULL, 0);
 }
 
 static void test_program_zone_emulated(void) {

@@ -5,7 +5,7 @@
 #   ADDR        the address of every A answer (and the name of the plugin in EVENTS)
 #   EVENTS      a file the plugin appends its events to: "START <pid> <ADDR>", "RELOAD <pid> <ADDR>", "EXIT <pid> <ADDR>",
 #               "UNKNOWN <pid> <ADDR> <line>"
-#   EXIT_AFTER  when > 0, the plugin exits after answering that many queries
+#   EXIT_AFTER  when > 0, the plugin exits after answering that many queries; "hang": it reads the queries and never answers
 # A line that is neither QUERY nor RELOAD ends the plugin (exit 2), as a plugin written to the protocol before 0.6.2 may do: the test
 # checks that a zone without program-reload-line never gets the RELOAD line.
 use strict;
@@ -16,6 +16,8 @@ $| = 1;
 my ($ADDR, $EVENTS, $EXIT_AFTER) = @ARGV;
 die "usage: supervised_plugin.pl ADDR EVENTS [EXIT_AFTER]\n" unless defined $ADDR && defined $EVENTS;
 $EXIT_AFTER //= 0;
+my $HANG = $EXIT_AFTER eq "hang";
+$EXIT_AFTER = 0 if $HANG;
 
 sub event {
     my ($what) = @_;
@@ -79,6 +81,7 @@ while (defined(my $line = read_line())) {
     last unless defined $lb;
     my $req = read_bytes(unpack("n", $lb));
     last unless defined $req;
+    next if $HANG;
     my $resp = answer($req);
     syswrite(STDOUT, pack("n", length($resp)) . $resp);
     $answered++;

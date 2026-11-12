@@ -870,6 +870,25 @@ static void test_zone_program_and_forward(void) {
     expect_reject("program-max-failures not a number", "zone \"d.test\" { type program; program-max-failures x; };");
     expect_reject("program-reload-line not a boolean", "zone \"d.test\" { type program; program-reload-line maybe; };");
     expect_reject("program-reload-line ';' missing", "zone \"d.test\" { type program; program-reload-line yes };");
+    /* 0.6.2: at most PLUG_MAX_ZONES (256) program zones */
+    {
+        size_t cap = 300 * 96;
+        char *many = malloc(cap);
+        CHECK(many != NULL);
+        if (many) {
+            for (int total = 256; total <= 257; total++) {
+                size_t len = (size_t)snprintf(many, cap, "options { allow-program-zones yes; };");
+                for (int i = 0; i < total; i++)
+                    len += (size_t)snprintf(many + len, cap - len, "zone \"p%d.test\" { type program; program \"/bin/cat\"; };", i);
+                if (total == 256) {
+                    if (parse_ok(many, &cfg)) free_server_config_fields(&cfg);
+                } else {
+                    expect_reject("257 program zones", many);
+                }
+            }
+            free(many);
+        }
+    }
     expect_reject("forward-timeout above 2^31-1", "zone \"f.test\" { type forward; forwarders { 192.0.2.53; }; forward-timeout 99999999999; };");
 
     if (parse_ok("zone \"f.example\" { type forward; forwarders { 192.0.2.53; 198.51.100.53 port 5353; }; "

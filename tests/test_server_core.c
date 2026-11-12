@@ -33,6 +33,7 @@
 #include "dns_wire.h"
 #include "dns_zone_parser.h"
 #include "dns_config_parser.h"
+#include "dns_plugin_sup.h"
 #include "test_zext.h"
 #include "dns_utils.h"
 #include "dns_query_engine.h"
@@ -6409,8 +6410,7 @@ static void test_server_core_feature_case_155(void) {
     strncpy(plugin.domain, "dynplugin.example.", sizeof(plugin.domain) - 1);
     strncpy(plugin.config_fingerprint, "initial_fp_val", sizeof(plugin.config_fingerprint) - 1);
 
-    g_program_plugins = &plugin;
-    g_program_plugins_count = 1;
+    program_plugins_set_for_test(&plugin, 1);
 
     zone_config_t z;
     memset(&z, 0, sizeof(z));
@@ -6423,8 +6423,7 @@ static void test_server_core_feature_case_155(void) {
     compute_program_zone_fingerprint(&z, new_fp, sizeof(new_fp));
     assert(strcmp(plugin.config_fingerprint, new_fp) != 0);
 
-    g_program_plugins = NULL;
-    g_program_plugins_count = 0;
+    program_plugins_set_for_test(NULL, 0);
     printf("  -> Case 155 passed.\n");
 }
 
@@ -6693,8 +6692,7 @@ static void test_server_core_program_zone_reload_fingerprint_and_added(void) {
     strncpy(mock_plugin.domain, "plugin.example.", sizeof(mock_plugin.domain) - 1);
     strncpy(mock_plugin.config_fingerprint, "old_fingerprint_hash_value", sizeof(mock_plugin.config_fingerprint) - 1);
 
-    g_program_plugins = &mock_plugin;
-    g_program_plugins_count = 1;
+    program_plugins_set_for_test(&mock_plugin, 1);
 
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -6724,13 +6722,14 @@ static void test_server_core_program_zone_reload_fingerprint_and_added(void) {
         for (zone_config_t *z = v->zones; z; z = z->next) {
             if (z->type && strcasecmp(z->type, "program") == 0) {
                 bool already_running = false;
-                for (int i = 0; i < g_program_plugins_count; i++) {
-                    if (strcasecmp(g_program_plugins[i].domain, z->domain) == 0) {
+                program_plugin_t *running_list[1] = { &mock_plugin };
+                for (int i = 0; i < 1; i++) {
+                    if (strcasecmp(running_list[i]->domain, z->domain) == 0) {
                         already_running = true;
                         /* Build the same fingerprint the server builds. */
                         char new_fingerprint[512];
                         compute_program_zone_fingerprint(z, new_fingerprint, sizeof(new_fingerprint));
-                        assert(strcmp(g_program_plugins[i].config_fingerprint, new_fingerprint) != 0);
+                        assert(strcmp(running_list[i]->config_fingerprint, new_fingerprint) != 0);
                         break;
                     }
                 }
@@ -6741,8 +6740,7 @@ static void test_server_core_program_zone_reload_fingerprint_and_added(void) {
         }
     }
 
-    g_program_plugins = NULL;
-    g_program_plugins_count = 0;
+    program_plugins_set_for_test(NULL, 0);
     printf("  -> Program zone reload fingerprint diff & added zone passed.\n");
 }
 
