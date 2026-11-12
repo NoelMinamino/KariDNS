@@ -93,10 +93,10 @@ while [ $# -gt 0 ]; do
         -h|--help) usage; exit 0 ;;
         --without-idn2) idn2=no ;;
         --with-idn2)
-            if [ $hasval = no ]; then val=yes; fi
+            if [ "$hasval" = no ]; then val=yes; fi
             idn2=$val ;;
         --prefix|--sysconfdir|--libexecdir|--with-db-drivers|--with-openssl|--march)
-            if [ $hasval = no ]; then
+            if [ "$hasval" = no ]; then
                 [ $# -gt 0 ] || usage_error "$opt needs a value"
                 val=$1
                 shift
@@ -177,7 +177,7 @@ case $db_drivers in
                 *) usage_error "unknown database driver '$d' (sqlite3 postgresql)" ;;
             esac
         done
-        [ $want_sqlite3 = yes ] || [ $want_pgsql = yes ] || usage_error "--with-db-drivers is empty: use none"
+        [ "$want_sqlite3" = yes ] || [ "$want_pgsql" = yes ] || usage_error "--with-db-drivers is empty: use none"
         ;;
 esac
 
@@ -264,7 +264,7 @@ IDN_CFLAGS=
 IDN_LDFLAGS=
 IDN_NOTE=
 have_idn2=no
-if [ $idn2 != no ]; then
+if [ "$idn2" != no ]; then
     IDN_CFLAGS=$( (pkg-config --exists libidn2 2>/dev/null && echo "-DHAVE_LIBIDN2 $(pkg-config --cflags libidn2 2>/dev/null)") || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-DHAVE_LIBIDN2") || ([ -f /usr/include/idn2.h ] || [ -f /usr/local/include/idn2.h ] && echo "-DHAVE_LIBIDN2") || true)
     if [ -n "$IDN_CFLAGS" ]; then
         IDN_LDFLAGS=$( (pkg-config --libs libidn2 2>/dev/null || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-L/usr/local/lib -lidn2") || ([ -f /usr/lib/libidn2.so ] || [ -f /usr/local/lib/libidn2.so ] || [ -f /usr/lib64/libidn2.so ] && echo "-lidn2")) || true)
@@ -279,7 +279,7 @@ EOF
     else
         IDN_CFLAGS=
         IDN_LDFLAGS=
-        if [ $idn2 = yes ]; then
+        if [ "$idn2" = yes ]; then
             die "libidn2 was not found (--with-idn2=yes; see config.log).  Install libidn2 and its development files (pkg-config libidn2 must work)"
         fi
         IDN_NOTE=" (not found: dag has no internationalized names)"
@@ -291,7 +291,7 @@ DBPG_HAVE=
 DBPG_CFLAGS=
 DBPG_LIBS=-lpq
 have_sqlite3=no
-if [ $db_drivers = auto ] || [ $want_sqlite3 = yes ]; then
+if [ "$db_drivers" = auto ] || [ "$want_sqlite3" = yes ]; then
     cat > "$CT.c" <<'EOF'
 #include <sqlite3.h>
 int main(void) { return sqlite3_libversion_number() == 0; }
@@ -324,11 +324,11 @@ case $db_drivers in
     auto)
         DB_DRIVERS=
         [ "$have_sqlite3" = yes ] && DB_DRIVERS=sqlite3
-        if [ $have_pgsql = yes ]; then
+        if [ "$have_pgsql" = yes ]; then
             DB_DRIVERS=${DB_DRIVERS:+$DB_DRIVERS }postgresql
         fi
         [ "$have_sqlite3" = yes ] || DB_NOTE="$DB_NOTE; sqlite3: not found (sqlite3.h, libsqlite3)"
-        [ $have_pgsql = yes ] || DB_NOTE="$DB_NOTE; postgresql: not found (libpq: pkg-config libpq or pg_config)"
+        [ "$have_pgsql" = yes ] || DB_NOTE="$DB_NOTE; postgresql: not found (libpq: pkg-config libpq or pg_config)"
         [ -n "$DB_DRIVERS" ] || DB_NOTE="$DB_NOTE; karidns-dbloader and karidns-zone cannot be built"
         ;;
     *)
@@ -336,7 +336,7 @@ case $db_drivers in
         for d in `printf '%s' "$db_drivers" | tr ',' ' '`; do
             case $d in
                 sqlite3) [ "$have_sqlite3" = yes ] || die "the sqlite3 driver was asked for (--with-db-drivers) and sqlite3.h or libsqlite3 was not found (see config.log)" ;;
-                postgresql) [ $have_pgsql = yes ] || die "the postgresql driver was asked for (--with-db-drivers) and libpq was not found (see config.log): install libpq (pkg-config libpq or pg_config)" ;;
+                postgresql) [ "$have_pgsql" = yes ] || die "the postgresql driver was asked for (--with-db-drivers) and libpq was not found (see config.log): install libpq (pkg-config libpq or pg_config)" ;;
             esac
             case " $DB_DRIVERS " in
                 *" $d "*) ;;

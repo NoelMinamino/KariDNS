@@ -136,6 +136,14 @@ case " $D_AUTO " in
     *" sqlite3 "*)
         cfg --with-db-drivers=sqlite3,sqlite3; [ "$(mkval DB_DRIVERS)" = sqlite3 ] && ok "a driver named twice (comma list) is kept once" || bad "dup: '$(mkval DB_DRIVERS)'" ;;
 esac
+case " $D_AUTO " in
+    *" sqlite3 "*postgresql*)
+        # a list with a space, as CI writes it: configure printed "[: sqlite3: unexpected operator" (an unquoted test) before 0.6.2's fix
+        rm -f config.mk config.log
+        sh ./configure --with-db-drivers="sqlite3 postgresql" > "$T/out" 2> "$T/err"
+        [ "$(mkval DB_DRIVERS)" = "sqlite3 postgresql" ] && [ ! -s "$T/err" ] && ok "--with-db-drivers=\"sqlite3 postgresql\": both, nothing on standard error" \
+            || bad "two drivers: '$(mkval DB_DRIVERS)', stderr: $(head -2 "$T/err")" ;;
+esac
 
 # --- 4. a library that is missing -------------------------------------------------------------------------------------------------------
 echo "--- missing libraries (a compiler that fails on the header)"
