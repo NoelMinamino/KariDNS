@@ -34,9 +34,9 @@ The service decides **who may do what** (users and groups, three kinds of grant,
 ### The packages
 
 ```
-pkg add karidns-postgresql-0.6.1-FreeBSD-15-amd64.pkg      # or karidns-sqlite3, or karidns-db: they hold karidns, karicheck, karictl, karidns-zone, the loader and db/*.sql
+pkg add karidns-postgresql-0.6.2-FreeBSD-15-amd64.pkg      # or karidns-sqlite3, or karidns-db: they hold karidns, karicheck, karictl, karidns-zone, the loader and db/*.sql
 pkg install node24                                         # pkg add does not fetch dependencies
-pkg add karidns-webadmin-0.6.1-FreeBSD-15-amd64.pkg
+pkg add karidns-webadmin-0.6.2-FreeBSD-15-amd64.pkg
 ```
 
 `karidns-webadmin` installs `/usr/local/sbin/karidns-webadmin` (a wrapper that starts the Node.js of the package with core dumps off), `/usr/local/libexec/karidns-webadmin/` (the program, its one dependency `pg`, and the code it shares with `karidns-signer`; root-owned, read-only), `/usr/local/etc/rc.d/karidns_webadmin`, `/usr/local/etc/karidns/karidns-webadmin.conf.sample`, the web interface (`webadmin/ui/` under the program directory), these manuals in `/usr/local/share/doc/karidns/` (`karidns-webadmin.md`, `karidns-api.md`, `karidns-webadmin-gui.md`, `karidns-webadmin-gui-checklist.md`), and creates the user and group `karidns-webadmin` (no login shell, no password, home `/var/db/karidns-webadmin`). The package refuses to install without `/usr/local/bin/karidns-zone` and `/usr/local/bin/karicheck` (the database packages conflict with each other, so the dependency cannot name one). The SQL files are in `/usr/local/share/karidns/db/`.

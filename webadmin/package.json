@@ -1,6 +1,6 @@
 {
   "name": "karidns-webadmin",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "KariDNS WebAdmin API: authentication, permissions and the zones of a KariDNS database (PostgreSQL or SQLite3) over HTTP",
   "license": "MIT",
   "private": true,
