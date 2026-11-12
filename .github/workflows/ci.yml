@@ -154,7 +154,7 @@ jobs:
             GUI_TEST=""
             if [ "${{ matrix.release }}" = "15.1" ]; then GUI_TEST="run_webadmin_gui_test,run_webadmin_gui_pg_test,run_webadmin_oidc_test"; fi
             NODE_TESTS="run_signer_unit_test,run_signer_test,run_signer_pg_test,run_webadmin_unit_test,run_webadmin_test,run_webadmin_pg_test,run_webadmin_write_test,run_webadmin_write_pg_test,run_webadmin_versions_test,run_webadmin_versions_pg_test,run_webadmin_pkg_test,run_signer_pkg_test,run_release_roundtrip_test"
-            # 4 at a time through tests/run_all_suite.sh.  --serial-as-par: these tests are registered "serial" there (the coverage job runs them one by one), but every one of them
+            # 4 at a time through tests/run_all_suite.sh.  --serial-as-par: the browser tests are registered "serial" there (the others run next to the other tests since 0.6.2); every one of them
             # takes its ports (kari_port), its directory (mktemp) and its PostgreSQL roles and databases ($$) of its own.  --fail-on-skip: a test that exits 0 but prints a SKIP line
             # fails the job, as the loop did before
             sh ./tests/run_all_suite.sh -j 4 --test-timeout 1200 --serial-as-par --full-log --fail-on-skip --tests "$NODE_TESTS" < /dev/null

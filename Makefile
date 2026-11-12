@@ -741,6 +741,12 @@ epoch_rcu_test: test_epoch_rcu
 test_epoch_rcu-tsan: $(TEST_EPOCH_RCU_SRCS)
 	$(CC) $(TSAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_EPOCH_RCU_SRCS) -o $@ $(TSAN_LDFLAGS) -lpthread
 
+# The unit tests that tests/run_rcu_tsan_units_test.sh runs under ThreadSanitizer, for one parallel make
+# (the test builds them with -j: one cc per binary, about 100 s one after the other on the build host)
+TSAN_TEST_BINS = test_epoch_rcu-tsan test_zone_dir-tsan test_park-tsan test_db_fetch-tsan test_park_worker-tsan test_db_stream-tsan test_pdns_reader-tsan test_db_registry-tsan test_server_core-tsan
+tsan-test-bins: $(TSAN_TEST_BINS)
+.PHONY: tsan-test-bins
+
 TEST_TAPSTAT_SRCS = tests/test_tapstat.c tools/tapstat_core.c tools/dnstap_decode.c $(TEST_SYSLOG_QUIET)
 test_tapstat: $(TEST_TAPSTAT_SRCS)
 	$(CC) $(CFLAGS) -I. $(TEST_TAPSTAT_SRCS) -o test_tapstat $(LDFLAGS)
@@ -1197,7 +1203,7 @@ COV_JOBS != (sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 2) | hea
 # Suites that only exercise ASan/TSan/libFuzzer binaries. Those binaries are not
 # coverage-instrumented, so the suites add ~5 minutes and no coverage; the
 # regular CI job still runs them.
-COV_SUITE_EXCLUDE ?= run_sanitizer_smoke_test,run_stress_test,run_rcu_tsan_test,run_fuzz_smoke_test
+COV_SUITE_EXCLUDE ?= run_sanitizer_smoke_test,run_stress_test,run_rcu_tsan_test,run_rcu_tsan_units_test,run_fuzz_smoke_test
 COV_HTML_DIR = coverage_html
 COV_DATA    = coverage.profdata
 

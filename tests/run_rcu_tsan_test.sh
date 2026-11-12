@@ -1,7 +1,7 @@
 #!/bin/sh
 # R-25 regression: epoch-RCU publish ordering under ThreadSanitizer.
 #
-# Part 1: test_epoch_rcu-tsan (publish order, grace period, reuse stress); part 1b: test_zone_dir-tsan (the zone directory, D1a); part 1c: test_park-tsan, test_db_fetch-tsan, test_park_worker-tsan, test_db_stream-tsan, test_pdns_reader-tsan, test_db_registry-tsan (parked queries, D1a milestone 2), test_server_core-tsan (the logger threads and the control thread).
+# Part 1 (the TSan unit tests) is tests/run_rcu_tsan_units_test.sh since 0.6.2: it runs next to the other tests, this one alone.
 # Part 2: karidns-tsan as a primary. Concurrently:
 #   - UDP and TCP (tcp-connection-reuse) queries from several clients,
 #   - SIGHUP reloads with a touched zone file (config swap + reload_master_zone
@@ -33,8 +33,8 @@ UPDATES=${UPDATES:-15}
 echo "=== R-25 RCU TSan test ==="
 
 # Build as the invoking user (kari_make: running make as root leaves root-owned objects).
-if ! kari_make karidns karidns-tsan dag test_epoch_rcu-tsan test_zone_dir-tsan test_park-tsan test_db_fetch-tsan test_park_worker-tsan test_db_stream-tsan test_pdns_reader-tsan test_db_registry-tsan test_server_core-tsan >/dev/null 2>&1; then
-    echo "FAIL: could not build karidns / karidns-tsan / dag / test_epoch_rcu-tsan / test_zone_dir-tsan / test_park-tsan / test_db_fetch-tsan / test_park_worker-tsan / test_db_stream-tsan / test_pdns_reader-tsan / test_db_registry-tsan / test_server_core-tsan"
+if ! kari_make karidns karidns-tsan dag >/dev/null 2>&1; then
+    echo "FAIL: could not build karidns / karidns-tsan / dag"
     exit 1
 fi
 
@@ -86,49 +86,6 @@ stop_servers() {
     kill_ours
     sleep 1
 }
-
-echo "--- part 1: test_epoch_rcu-tsan"
-if ! TSAN_OPTIONS="halt_on_error=0" ./test_epoch_rcu-tsan >"$WORK/unit.log" 2>&1; then
-    echo "FAIL: test_epoch_rcu-tsan exited with an error"
-    cat "$WORK/unit.log"
-    exit 1
-fi
-if grep -q "WARNING: ThreadSanitizer" "$WORK/unit.log"; then
-    echo "FAIL: ThreadSanitizer reports in test_epoch_rcu-tsan"
-    cat "$WORK/unit.log"
-    exit 1
-fi
-grep "reads=" "$WORK/unit.log"
-
-echo "--- part 1b: test_zone_dir-tsan (the zone directory under concurrent readers, D1a)"
-if ! TSAN_OPTIONS="halt_on_error=0" ./test_zone_dir-tsan >"$WORK/zdir.log" 2>&1; then
-    echo "FAIL: test_zone_dir-tsan exited with an error"
-    cat "$WORK/zdir.log"
-    exit 1
-fi
-if grep -q "WARNING: ThreadSanitizer" "$WORK/zdir.log"; then
-    echo "FAIL: ThreadSanitizer reports in test_zone_dir-tsan"
-    cat "$WORK/zdir.log"
-    exit 1
-fi
-grep "inconsistencies" "$WORK/zdir.log"
-
-# part 1c (D1a milestone 2): the park table, the wake and fetch rings, workers and the ingest thread; the Backend side of the fetch stream
-# with the real ingest thread; a worker parking and answering a UDP query
-for t in test_park test_db_fetch test_park_worker test_db_stream test_pdns_reader test_db_registry test_server_core; do
-    echo "--- part 1c: ${t}-tsan"
-    if ! TSAN_OPTIONS="halt_on_error=0" ./${t}-tsan >"$WORK/${t}.log" 2>&1; then
-        echo "FAIL: ${t}-tsan exited with an error"
-        cat "$WORK/${t}.log"
-        exit 1
-    fi
-    if grep -q "WARNING: ThreadSanitizer" "$WORK/${t}.log"; then
-        echo "FAIL: ThreadSanitizer reports in ${t}-tsan"
-        cat "$WORK/${t}.log"
-        exit 1
-    fi
-    grep "checks," "$WORK/${t}.log"
-done
 
 cp tests/zones/example.com.zone tests/zones/example.com.dnskey tests/zones/example.com.hosts "$WORK/"
 

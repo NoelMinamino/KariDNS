@@ -484,7 +484,7 @@ int main(int argc, char **argv) {
         /* zone-level modes: one batch, ok1.test, the bad zone, ok2.test */
         batch_begin(fd);
         good_zone(fd, "ok1.test", 1);
-        if (strcmp(mode, "slow") == 0) sleep(3);
+        if (strcmp(mode, "slow") == 0) sleep(8);   /* long enough for the checks during the batch on a loaded host (3 s was not, 0.6.2 suite at -j 4) */
         else if (strcmp(mode, "good") != 0) bad_zone(fd, mode);
         if (strcmp(mode, "again") == 0) good_zone(fd, "ok1.test", 2);
         good_zone(fd, "ok2.test", 1);
