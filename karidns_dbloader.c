@@ -443,6 +443,16 @@ typedef struct {
     /* D1a, the fetch thread (second stream): one zone for one FETCH_REQ, no batch, no inventory, no results.  Every ZONE_BEGIN and ZONE_FAILED
      * carries the request id; with fetch_summary the zone is not read, only its summary is sent. */
     bool fetch;
+    /* 0.6.2, a worker of the fetch pool: the connection kept between requests, and what it was opened on.  Opening a SQLite3 connection took
+     * about 1.9 ms of the 2.4 ms of a fetch (the first connection to a WAL file: the -shm and -wal files, the locks, the schema), which held a
+     * worker at about 400 zones/s.  Each request still has its own check_schema and snapshot.  Kept only for the same driver and source, and
+     * for SQLite3 only while the file is the one that was opened (keep_dev / keep_ino); a kept connection that fails its first statement is
+     * opened again once. */
+    db_conn_t *keep;
+    const db_driver_t *keep_drv;
+    char keep_key[1100];
+    dev_t keep_dev;
+    ino_t keep_ino;
     bool fetch_summary;
     const char *fetch_vname;          /* D1a: the view of the request being served (the fetch thread tells the inventory what it served) */
     bool dir_only;                    /* D1a milestone 4: CONFIG dir_only (memory-limit): zones the Backend has no data of are sent as summaries */
@@ -2988,16 +2998,65 @@ write_failed:
     return EXIT_ERROR;
 }
 
-static int run_view_once(ctx_t *x, const db_source_t *src, const char *only_zone, bool whole) {
-    char err[DB_ERRLEN];
-    ctx_view_reset(x);
-    x->only_name = only_zone;
+/* 0.6.2, the kept connection of a fetch worker (ctx_t keep): the identity of a source (false when it does not fit: such a source is not kept),
+ * the file a SQLite3 source names now, and the end of a kept connection */
+static bool keep_key_of(const db_source_t *src, char *out, size_t n) {
+    int l = snprintf(out, n, "%s\n%s\n%s\n%s\n%u", src->driver ? src->driver : "", src->database_file ? src->database_file : "",
+                     src->conninfo_file ? src->conninfo_file : "", src->schema ? src->schema : "", src->busy_timeout_ms);
+    return l >= 0 && (size_t)l < n;
+}
+
+static bool keep_file_id(const db_source_t *src, dev_t *dev, ino_t *ino) {
+    struct stat sb;
+    *dev = 0;
+    *ino = 0;
+    if (!src->database_file) return true;                 /* (PostgreSQL: a connection that went bad fails its first statement) */
+    if (stat(src->database_file, &sb) != 0) return false;
+    *dev = sb.st_dev;
+    *ino = sb.st_ino;
+    return true;
+}
+
+static void keep_drop(ctx_t *x) {
+    if (x->keep) x->keep_drv->close(x->keep);
+    x->keep = NULL;
+    x->keep_drv = NULL;
+}
+
+/* x->conn for one reading: the kept connection when it is for this source and file, else a new one.  0, or the exit status of a failed open. */
+static int conn_for(ctx_t *x, const db_source_t *src, bool *reused, dev_t *dev, ino_t *ino) {
+    char err[DB_ERRLEN], key[sizeof(x->keep_key)];
+    *reused = false;
+    if (x->keep) {
+        if (x->keep_drv == x->drv && keep_key_of(src, key, sizeof(key)) && strcmp(key, x->keep_key) == 0 && keep_file_id(src, dev, ino) &&
+            *dev == x->keep_dev && *ino == x->keep_ino) {
+            x->conn = x->keep;
+            x->keep = NULL;
+            x->keep_drv = NULL;
+            *reused = true;
+            return 0;
+        }
+        keep_drop(x);                                     /* another source, or the file was replaced: the new one is opened */
+    }
+    if (x->fetch) (void)keep_file_id(src, dev, ino);   /* (looked at before the open: a file replaced after it differs at the next look) */
     int rc = x->drv->open(&x->conn, src, err, sizeof(err));
     if (rc != 0) {
+        x->conn = NULL;
         lg(LOG_ERR, "%s", err);
         clean_reason(err, x->errtext, sizeof(x->errtext));
         return rc == DB_ERR_RETRY ? EXIT_RETRY : EXIT_ERROR;
     }
+    return 0;
+}
+
+static int run_view_once(ctx_t *x, const db_source_t *src, const char *only_zone, bool whole) {
+    ctx_view_reset(x);
+    x->only_name = only_zone;
+    bool reused = false;
+    dev_t fdev = 0;
+    ino_t fino = 0;
+    int rc = conn_for(x, src, &reused, &fdev, &fino);
+    if (rc != 0) return rc;
     int status = EXIT_OK;
     gone_t *gone = NULL;
     size_t ngone = 0;
@@ -3005,7 +3064,18 @@ static int run_view_once(ctx_t *x, const db_source_t *src, const char *only_zone
     uint64_t new_seq = 0;
     db_schema_info_t si;
     memset(&si, 0, sizeof(si));
-    if ((rc = x->drv->check_schema(x->conn, &si)) != 0) {
+    rc = x->drv->check_schema(x->conn, &si);
+    if (rc != 0 && reused) {                              /* a kept connection that went bad (the server restarted, ...): once more with a new one */
+        x->drv->close(x->conn);
+        x->conn = NULL;
+        if ((rc = conn_for(x, src, &reused, &fdev, &fino)) != 0) {
+            status = rc;
+            goto out;
+        }
+        memset(&si, 0, sizeof(si));
+        rc = x->drv->check_schema(x->conn, &si);
+    }
+    if (rc != 0) {
         status = db_err(x, rc, "schema");
         goto out;
     }
@@ -3151,7 +3221,16 @@ out_snap:
     x->drv->end_snapshot(x->conn);
 out:
     free(gone);
-    x->drv->close(x->conn);
+    /* a fetch worker keeps the connection for the next request (a statement that failed on it is retried with a new one, above), unless the
+     * stream or the memory is gone */
+    if (x->conn && x->fetch && !x->io_error && !x->oom && keep_key_of(src, x->keep_key, sizeof(x->keep_key))) {
+        x->keep = x->conn;
+        x->keep_drv = x->drv;
+        x->keep_dev = fdev;
+        x->keep_ino = fino;
+    } else if (x->conn) {
+        x->drv->close(x->conn);
+    }
     x->conn = NULL;
     return status;
 }
@@ -4301,6 +4380,7 @@ static void *fetch_worker(void *arg) {
     }
     cfg_free(&lc);
     ctx_view_reset(&x);
+    keep_drop(&x);
     kdb_enc_free(&x.enc);
     return NULL;
 }
