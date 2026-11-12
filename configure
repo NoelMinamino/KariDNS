@@ -185,7 +185,7 @@ esac
 echo "configure: $0 $ARGS" >> config.log
 
 CT=conftest$$
-trap 'rm -f "$CT".* config.mk.tmp$$' EXIT
+trap 'rm -rf "$CT".* config.mk.tmp$$' EXIT   # -r: clang -g on macOS leaves a directory $CT.out.dSYM
 trap 'exit 1' HUP INT TERM
 
 log() { printf '%s\n' "$*" >> config.log; }
@@ -208,7 +208,7 @@ try_cc() {
     $CC $user_cflags $1 $CT.c -o $CT.out $user_ldflags $2 >> config.log 2>&1
     rc=$?
     log "-> exit $rc"
-    rm -f "$CT.out"
+    rm -rf "$CT.out" "$CT.out.dSYM"
     return $rc
 }
 

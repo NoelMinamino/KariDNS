@@ -180,6 +180,9 @@ fa -march=native --march=native --with-db-drivers=none; rc=$?
 ls conftest* >/dev/null 2>&1 && bad "configure left test files: $(ls conftest*)" || ok "configure leaves no conftest files"
 
 # --- 5. make -n with and without config.mk -------------------------------------------------------------------------------------------------
+# sq FILE: runs of blanks as one blank, none at the end.  Only the words of a command matter: the Makefile's != keeps the blank that pkg-config
+# prints after its flags (Ubuntu), configure does not
+sq() { sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/ $//' "$1" > "$1.sq" && mv "$1.sq" "$1"; }
 echo "--- make -n with and without config.mk"
 TARGETS="karidns dag karicheck karictl karidns-dbloader karidns-zone"
 cfg; D=$(mkval DB_DRIVERS); [ -n "$D" ] && DOPT=$(printf "%s" "$D" | tr " " ",") || DOPT=none
@@ -200,6 +203,7 @@ for MK in make gmake; do
         # shellcheck disable=SC2086
         sh ./configure $_c > "$T/out" 2>&1 || { bad "$MK $_l: configure failed: $(tail -2 "$T/out")"; return; }
         $MK -n $TARGETS > "$T/n.conf" 2>&1
+        sq "$T/n.plain"; sq "$T/n.conf"
         if cmp -s "$T/n.plain" "$T/n.conf" && [ -s "$T/n.plain" ]; then
             ok "$MK, $_l: $(wc -l < "$T/n.conf" | tr -d ' ') lines, the same with and without config.mk"
         else
@@ -213,11 +217,13 @@ for MK in make gmake; do
     rm -f config.mk; CFLAGS='-g -DFOO=1' LDFLAGS='-L/nonexistent_dir' $MK -n DB_DRIVERS="$D" $TARGETS > "$T/n.plain" 2>&1
     CFLAGS='-g -DFOO=1' LDFLAGS='-L/nonexistent_dir' sh ./configure --with-db-drivers=$DOPT > "$T/out" 2>&1
     $MK -n $TARGETS > "$T/n.conf" 2>&1
+    sq "$T/n.plain"; sq "$T/n.conf"
     cmp -s "$T/n.plain" "$T/n.conf" && ok "$MK, CFLAGS and LDFLAGS of the environment: the same" || { bad "$MK, CFLAGS and LDFLAGS of the environment differ"; diff "$T/n.plain" "$T/n.conf" | head -4; }
     # other directories: only their -D are new (and it is on every compile line of the objects)
     rm -f config.mk; $MK -n DB_DRIVERS="$D" $TARGETS > "$T/n.plain" 2>&1
     sh ./configure --with-db-drivers=$DOPT --prefix=/opt/kd --sysconfdir=/etc/kdtest --libexecdir=/opt/kd/lx > "$T/out" 2>&1
     $MK -n $TARGETS > "$T/n.conf" 2>&1
+    sq "$T/n.plain"; sq "$T/n.conf"
     DEF='-DKARIDNS_SYSCONFDIR=\"/etc/kdtest\"'
     sed -e "s|-DKARIDNS_SYSCONFDIR=[^ ]* ||" -e "s|-DKARIDNS_PREFIX=[^ ]* ||" -e "s|-DKARIDNS_LIBEXECDIR=[^ ]* ||" "$T/n.conf" > "$T/n.conf.nodef"
     if cmp -s "$T/n.plain" "$T/n.conf.nodef" && grep -qF -- "$DEF" "$T/n.conf"; then

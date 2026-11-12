@@ -17,6 +17,7 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/param.h>   /* __FreeBSD_version */
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
@@ -11262,7 +11263,12 @@ static void test_plugin_reload_line_write(void) {
     int r = plugin_write_reload_line(s2[1], 50);
     printf("  (a socket with 3 bytes of room: %d)\n", r);
 #ifdef __FreeBSD__
-    assert(r == -1);                                      /* (FreeBSD 15: "REL" goes, the rest does not: a fragment) */
+    /* FreeBSD 15: "REL" goes, the rest does not: a fragment (-1).  FreeBSD 14 frees more room when 3 bytes are read and takes the whole line (1):
+     * nothing to check about fragments there, but never 0 (nothing written although there was room) */
+    assert(r == -1 || r == 1);
+#if defined(__FreeBSD_version) && __FreeBSD_version >= 1500000
+    assert(r == -1);
+#endif
 #else
     assert(r != 1);
 #endif
