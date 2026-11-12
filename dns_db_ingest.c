@@ -13,6 +13,7 @@
  * Allocation happens on the load path only (start, stream buffers, zones), never on the query path.
  */
 #include "dns_db_ingest.h"
+#include "dns_utils.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -2283,23 +2284,9 @@ static void on_ctrl_readable(ing_t *g) {
       g->ctrl_fd = -1;
       return;
     }
-    int got = -1, got_fetch = -1;
-    for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c)) {
-      if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) continue;
-      if (c->cmsg_len < CMSG_LEN(0)) continue;
-      size_t cnt = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
-      /* never past the control buffer (0.6.2 review: a kernel that shortens a cut message may leave cmsg_len as it was) */
-      const unsigned char *cend = (const unsigned char *)m.msg_control + m.msg_controllen;
-      size_t room = cend > (const unsigned char *)CMSG_DATA(c) ? (size_t)(cend - (const unsigned char *)CMSG_DATA(c)) / sizeof(int) : 0;
-      if (cnt > room) cnt = room;
-      for (size_t i = 0; i < cnt; i++) {
-        int fd;
-        memcpy(&fd, CMSG_DATA(c) + i * sizeof(int), sizeof(int));
-        if (got < 0) got = fd;                  /* the first descriptor is the stream, the second (D1a) the fetch stream */
-        else if (got_fetch < 0) got_fetch = fd;
-        else close(fd);
-      }
-    }
+    int fds[2] = { -1, -1 };
+    recv_take_rights(&m, fds, 2);              /* the first descriptor is the stream, the second (D1a) the fetch stream; any other is closed */
+    int got = fds[0], got_fetch = fds[1];
     if (m.msg_flags & MSG_CTRUNC) syslog(LOG_ERR, "[DB] the loader control message was truncated");
     if (got >= 0) {
       adopt_stream(g, got);

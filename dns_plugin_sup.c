@@ -10,6 +10,7 @@
  * threads only read the published table and call plug_backend_kill().
  */
 #include "dns_plugin_sup.h"
+#include "dns_utils.h"
 #include "dns_server_internal.h"
 #include "dns_epoch_rcu.h"
 #include "dns_snapshot_rcu.h"
@@ -43,27 +44,6 @@ static int64_t mono_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
-/* Close every descriptor that came with a message; with out != NULL keep the first cap of them there.  The count of all of them. */
-static int take_rights(struct msghdr *mh, int *out, int cap) {
-  int n = 0;
-  for (struct cmsghdr *c = CMSG_FIRSTHDR(mh); c; c = CMSG_NXTHDR(mh, c)) {
-    if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS || c->cmsg_len < CMSG_LEN(0)) continue;
-    size_t k = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
-    /* never past the control buffer: a kernel that shortens a cut message may leave cmsg_len as it was */
-    const unsigned char *end = (const unsigned char *)mh->msg_control + mh->msg_controllen;
-    size_t room = end > CMSG_DATA(c) ? (size_t)(end - CMSG_DATA(c)) / sizeof(int) : 0;
-    if (k > room) k = room;
-    for (size_t i = 0; i < k; i++) {
-      int fd;
-      memcpy(&fd, (const unsigned char *)CMSG_DATA(c) + i * sizeof(int), sizeof(int));
-      if (out && n < cap) out[n] = fd;
-      else close(fd);
-      n++;
-    }
-  }
-  return n;
 }
 
 /* One record, with nfd descriptors (SCM_RIGHTS), on the non-blocking datagram socket of the pair.  A full socket buffer is waited for at most
@@ -573,7 +553,7 @@ static void m_read(plug_sup_t *s) {
     ssize_t n = recvmsg(s->fd, &mh, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
     if (n < 0 && errno == EINTR) continue;
     if (n < 0) return;                            /* nothing more (or the Backend is gone: the manager's loop sees its exit) */
-    int nfds = take_rights(&mh, NULL, 0);         /* the Backend sends no descriptor: whatever came is closed */
+    int nfds = recv_take_rights(&mh, NULL, 0);         /* the Backend sends no descriptor: whatever came is closed */
     plug_msg_t m;
     plug_err_t e = plug_check_from_backend(buf, (size_t)n, mh.msg_flags, nfds, &m);
     if (e != PLUG_OK) {
@@ -1261,7 +1241,7 @@ void plug_backend_handle_ctrl(void) {
     }
     /* (an empty datagram is no end of the stream on this socket: it is refused below, as any record of the wrong size) */
     int fds[8];
-    int nfds = take_rights(&mh, fds, 8);
+    int nfds = recv_take_rights(&mh, fds, 8);
     plug_backend_apply(buf, (size_t)n, mh.msg_flags, fds, nfds);
   }
 }

@@ -53,6 +53,13 @@ int exec_file_exec_fd(int fd, const char *path, char *const argv[], char *const 
  * the user's primary group) being 0.  NULL names are skipped; a name that does not exist is not an error here (the callers say so).
  * Used for user / group, loader-user / loader-group and program-user, by karidns (start, reload) and karicheck. */
 bool identity_names_root(const char *user, const char *group, char *err, size_t errlen);
+/* The descriptors (SCM_RIGHTS) of a received message: the first `cap` of them go to out[] (out may be NULL with cap 0), every other one
+ * is closed, so that a peer cannot leave descriptors behind in the receiver (a CMSG_SPACE() buffer is rounded up and holds more than it
+ * was sized for).  Never reads past msg_controllen: a kernel that shortens a cut message may leave cmsg_len as it was.  Returns the count
+ * of all of them (more than cap: the extra ones were closed).  Used by the Backend (the connect broker, the loader and plugin control
+ * sockets) and by the plugin supervisor. */
+struct msghdr;
+int recv_take_rights(struct msghdr *mh, int *out, int cap);
 #endif
 
 uint16_t get_type_code(const char *type_str);

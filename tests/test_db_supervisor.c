@@ -708,6 +708,92 @@ static void test_exec_file(void) {
     unlink(path);
 }
 
+/* send_fds SOCK FDS N : one byte with N descriptors (SCM_RIGHTS) */
+static int send_fds(int sock, const int *fds, int n) {
+    char byte = 0;
+    struct iovec iov = { &byte, 1 };
+    union { struct cmsghdr h; char buf[CMSG_SPACE(sizeof(int) * 4)]; } u;
+    struct msghdr m;
+    memset(&m, 0, sizeof(m));
+    memset(&u, 0, sizeof(u));
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    m.msg_control = u.buf;
+    m.msg_controllen = CMSG_SPACE(sizeof(int) * (size_t)n);
+    struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int) * (size_t)n);
+    memcpy(CMSG_DATA(c), fds, sizeof(int) * (size_t)n);
+    return sendmsg(sock, &m, 0) == 1 ? 0 : -1;
+}
+
+/* recv_take_rights (0.6.2): the descriptors past cap are closed, also those that fit only because CMSG_SPACE() rounds the buffer up (the
+ * connect broker's answer); a message without any gives 0 */
+static void test_recv_take_rights(void) {
+    printf("recv_take_rights: the first cap descriptors are kept, the others closed\n");
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) != 0) { CHECK(0); return; }
+    int nul = open("/dev/null", O_RDONLY);
+    CHECK(nul >= 0);
+    int three[3] = { nul, nul, nul };
+    for (int round = 0; round < 3; round++) {
+        /* round 0: 3 descriptors into a room for 4, cap 1; round 1: 2 descriptors into CMSG_SPACE(sizeof(int)), cap 1 (the broker);
+         * round 2: 1 descriptor, out NULL, cap 0 (the plugin supervisor's socket of a plugin) */
+        int nsend = round == 0 ? 3 : round == 1 ? 2 : 1;
+        CHECK(send_fds(sv[0], three, nsend) == 0);
+        char byte;
+        struct iovec iov = { &byte, 1 };
+        union { struct cmsghdr h; char buf[CMSG_SPACE(sizeof(int) * 4)]; } u;
+        struct msghdr m;
+        memset(&m, 0, sizeof(m));
+        m.msg_iov = &iov;
+        m.msg_iovlen = 1;
+        m.msg_control = u.buf;
+        m.msg_controllen = round == 1 ? CMSG_SPACE(sizeof(int)) : sizeof(u.buf);
+        CHECK(recvmsg(sv[1], &m, 0) == 1);
+        /* the descriptors as they came, before the helper closes any: to see that they are closed afterwards */
+        int came[4] = { -1, -1, -1, -1 };
+        struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+        size_t ncame = 0;
+        if (c && c->cmsg_type == SCM_RIGHTS) {
+            ncame = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+            if (ncame > 4) ncame = 4;
+            memcpy(came, CMSG_DATA(c), sizeof(int) * ncame);
+        }
+        int keep = -1;
+        int n = recv_take_rights(&m, round == 2 ? NULL : &keep, round == 2 ? 0 : 1);
+        /* round 1: two come where CMSG_SPACE() rounds up to 8 octets (amd64, arm64); a kernel that cuts the message closes the second itself */
+        CHECK_MSG(n == (int)ncame && (round == 1 ? ncame >= 1 : ncame == (size_t)nsend), "round %d: %d descriptors, sent %d (came %zu)", round, n, nsend, ncame);
+        if (round == 2) {
+            CHECK(keep == -1);
+        } else {
+            CHECK(keep >= 0 && keep == came[0] && fcntl(keep, F_GETFD) >= 0);
+            if (keep >= 0) close(keep);
+        }
+        for (size_t i = (round == 2 ? 0 : 1); i < ncame; i++)
+            CHECK_MSG(fcntl(came[i], F_GETFD) < 0 && errno == EBADF, "round %d: descriptor %zu left open", round, i);
+    }
+    /* a message without control data */
+    char z = 0;
+    CHECK(send(sv[0], &z, 1, 0) == 1);
+    char byte;
+    struct iovec iov = { &byte, 1 };
+    union { struct cmsghdr h; char buf[CMSG_SPACE(sizeof(int))]; } u;
+    struct msghdr m;
+    memset(&m, 0, sizeof(m));
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    m.msg_control = u.buf;
+    m.msg_controllen = sizeof(u.buf);
+    CHECK(recvmsg(sv[1], &m, 0) == 1);
+    int keep = -1;
+    CHECK(recv_take_rights(&m, &keep, 1) == 0 && keep == -1);
+    close(nul);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_identity_names_root(void) {
     printf("identity_names_root / resolve_run_identity (P4)\n");
     char err[300];
@@ -756,6 +842,7 @@ int main(void) {
     test_log_pipe();
     test_exec_file();
     test_identity_names_root();
+    test_recv_take_rights();
     rmdir(g_dir);
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;

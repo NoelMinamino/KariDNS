@@ -508,7 +508,6 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr,
     return -1;
   }
   struct msghdr msg = {0};
-  struct cmsghdr *cmsg;
   char buf[CMSG_SPACE(sizeof(int))];
   memset(buf, 0, sizeof(buf));
   char data[1] = {1};
@@ -527,10 +526,8 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr,
     return -1;
   }
   int fd = -1;
-  cmsg = CMSG_FIRSTHDR(&msg);
-  if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS && cmsg->cmsg_len >= CMSG_LEN(sizeof(int)) &&
-      msg.msg_controllen >= CMSG_LEN(sizeof(int)))   /* (0.6.2 review: the descriptor is inside the control data that came) */
-    memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
+  /* one descriptor is kept; CMSG_SPACE() rounds the buffer up so that a second one fits, and it (any other) is closed (0.6.2) */
+  recv_take_rights(&msg, &fd, 1);
   pthread_mutex_unlock(&broker_lock);
   if (data[0] != 0) {                           /* the broker refused: close a descriptor that came with the answer anyway */
     if (fd >= 0) close(fd);
