@@ -60,6 +60,7 @@
 #include "dns_db_driver.h"
 #include "dns_db_stream.h"
 #include "dns_db_checkproto.h"
+#include "dns_utils.h"
 #include "dns_diag.h"
 #include "dns_pdns_reader.h"
 #include "dns_zone_lint.h"
@@ -5624,7 +5625,7 @@ static void usage(FILE *fp) {
         "  karidns-dbloader --dump /tmp/zones.kdb --driver sqlite3 --database-file /var/db/karidns/zones.sqlite3\n"
         "  karidns-dbloader --dump - --driver sqlite3 --database-file zones.sqlite3 --zone example.test | od -c | head\n"
         "  karidns-dbloader --dump /tmp/view1.kdb --driver sqlite3 --database-file view1.sqlite3 --view-index 1 --default-ttl 300\n"
-        "  karidns-dbloader --dump /tmp/zones.kdb --driver postgresql --conninfo-file /usr/local/etc/karidns/database.conf --schema pdns\n",
+        "  karidns-dbloader --dump /tmp/zones.kdb --driver postgresql --conninfo-file " KARIDNS_CONFDIR "/database.conf --schema pdns\n",
         KARIDNS_VERSION, drv);
 }
 

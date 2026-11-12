@@ -10,7 +10,7 @@ The file **`VERSION`** at the top of the source tree is the one source of the re
 
 | Component | How it gets the number |
 |---|---|
-| `karidns`, `dag`, `karicheck`, `karictl`, `karidns-dbloader`, `karidns-zone` (C) | The `Makefile` reads `VERSION` and compiles it in (`-DKARIDNS_VERSION`). Every object depends on `VERSION`, so a new number rebuilds them. `make VERSION=x.y.z` overrides it for one build. Built without the `Makefile`, they say `dev`. |
+| `karidns`, `dag`, `karicheck`, `karictl`, `karidns-dbloader`, `karidns-zone` (C) | The `Makefile` reads `VERSION` and compiles it in (`-DKARIDNS_VERSION`); after `./configure` it reads the copy in `config.mk` (`VERSION_FILE`), which `make set-version` keeps in step. Every object depends on `VERSION`, so a new number rebuilds them. `make VERSION=x.y.z` overrides it for one build. Built without the `Makefile`, they say `dev`. |
 | `karidns-signer`, `karidns-webadmin` (Node.js) | They read the `version` of their own `package.json` when they start (`node/lib/version.js`); the packages install it next to the program. |
 | The web interface (`webadmin/ui/`) | `GUI_VERSION` in `webadmin/ui/js/version.js`: the files are served to a browser as they are, so they cannot read anything. The page compares it with the service's number and asks for a reload when they differ. |
 | The packages (`packaging/*/build_*.sh`) | The first argument, or the file `VERSION` when it is left out or empty (`packaging/version.sh`). A different number is allowed for a test build and is warned about. |
@@ -29,6 +29,7 @@ git diff --stat                   # VERSION, signer/ and webadmin/ package.json 
 
 `set-version` takes three numbers only (no `v`, no suffix such as `-rc1`). It changes the package's own version in the lock files and leaves the versions of the dependencies alone.
 
+A `config.mk` written by `./configure` (`docs/building.md`) holds the number it read; `tools/set_version.sh` updates that line when the file exists, so the next `make` builds the new number. Run `./configure` again if `VERSION` was changed any other way.
 ## MAKING A RELEASE
 
 1. On a branch: `make set-version V=x.y.z`, update the documents that name the release, run the tests (the full suite on the FreeBSD build host), open a pull request and merge it.
@@ -39,7 +40,7 @@ git diff --stat                   # VERSION, signer/ and webadmin/ package.json 
    git push origin vx.y.z
    ```
 
-3. The release workflow (`.github/workflows/release.yml`) starts with the job "Check the tag against the file VERSION": it runs `tests/run_version_test.sh` and **refuses a tag that is not `v` + the number of `VERSION`** (the fix is `make set-version`, a new commit, and the tag on that commit). Then it builds and tests the packages of every platform with the number without its `v`, and publishes a draft release with the files and `SHA256SUMS.txt`.
+3. The release workflow (`.github/workflows/release.yml`) starts with the job "Check the tag against the file VERSION": it runs `tests/run_version_test.sh` and **refuses a tag that is not `v` + the number of `VERSION`** (the fix is `make set-version`, a new commit, and the tag on that commit). Then it builds and tests the packages of every platform with the number without its `v` (each build runs `./configure --march=none`: the baseline instruction set, not the CPU of the build host), and publishes a draft release with the files and `SHA256SUMS.txt`.
 4. Check the draft release and publish it.
 
 A manual run of the release workflow (`workflow_dispatch`, with a version typed in) is a test build: a number other than `VERSION` only gives a warning.

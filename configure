@@ -1,0 +1,435 @@
+#!/bin/sh
+# configure - find the compiler and the libraries and write config.mk for the Makefile (docs/building.md).
+#
+# A hand-written POSIX sh script: no autoconf, no m4.  It runs on FreeBSD sh, dash, bash and the /bin/sh of macOS, and in MSYS2 (MinGW is
+# used for dag only).  It builds in the source tree.  What it finds is what the Makefile finds without it (the probes at the top of the Makefile):
+# the same tools in the same order, then a test program per library that proves the compile and the link line works.  The Makefile builds
+# the same commands with config.mk and without it (tests/run_configure_test.sh checks that); config.mk lets GNU make 3.81 (macOS), which has
+# no `!=`, build at all.
+#
+# Writes: config.mk (NAME = value lines, read by every make) and config.log (the commands that were run and what they said).
+
+LC_ALL=C
+export LC_ALL
+
+usage() {
+    cat <<'EOF'
+Usage: ./configure [options] [CC=cc] [CFLAGS=flags] [LDFLAGS=flags]
+
+Finds the compiler and the libraries and writes config.mk (read by make) and config.log.  A build that does not run it works as it did
+before on FreeBSD, Linux (BSD make or GNU make 4) and in MSYS2; on macOS (GNU make 3.81) it needs config.mk.
+
+Options:
+  --prefix=DIR            the installation prefix, recorded as PREFIX in config.mk for the packaging scripts; the Makefile has no
+                          install target (default: /usr/local)
+  --sysconfdir=DIR        the directory the tools look in for their configuration (DIR/karidns/karidns.conf, DIR/karidns/karictl.conf):
+                          compiled into karictl, karicheck and karidns-zone as -DKARIDNS_SYSCONFDIR; dag also looks for its CA
+                          bundle at DIR/ssl/cert.pem (default: PREFIX/etc)
+  --libexecdir=DIR        where karidns finds karidns-dbloader when `loader-path` is not set: DIR/karidns-dbloader, compiled in as
+                          -DKARIDNS_LIBEXECDIR (default: PREFIX/libexec).  A prefix other than /usr/local is compiled in as
+                          -DKARIDNS_PREFIX for the second CA bundle of dag, PREFIX/share/certs/ca-root-nss.crt
+  --with-db-drivers=LIST  the drivers of karidns-dbloader and karidns-zone: auto, none, or sqlite3, postgresql or both, separated by a
+                          space or a comma (default: auto, the drivers whose library is found).  A driver that is named and not
+                          found is an error
+  --with-idn2=auto|yes|no libidn2 for dag (internationalized names; default: auto).  yes: an error when it is not found
+                          (--with-idn2 is yes, --without-idn2 is no)
+  --with-openssl=DIR      OpenSSL is in DIR/include and DIR/lib (default: the system's, or the Homebrew one on macOS).  The Makefile
+                          searches /usr/local and the Homebrew directories first: with two copies of OpenSSL there, set CFLAGS and LDFLAGS
+  --march=native|none|V   the CPU the code is built for: the build host (-march=native, the default), the baseline of the architecture
+                          (none: for a package that runs on other machines), or -march=V
+  -h, --help              this text
+
+Environment or arguments: CC (default: cc, gcc or clang, the first that exists), CFLAGS, LDFLAGS.
+
+OpenSSL and zlib are needed by every build and are an error when missing.  After a new run of ./configure, run `make clean`: the objects
+of the earlier build do not know the new options.
+
+Examples:
+  ./configure
+  ./configure --march=none --with-db-drivers=none
+  ./configure --sysconfdir=/etc --with-db-drivers="sqlite3 postgresql"
+  ./configure --prefix=/usr --sysconfdir=/etc --libexecdir=/usr/libexec
+  ./configure --with-openssl=/usr/local/opt/openssl@3 CFLAGS="-g -O1"
+EOF
+}
+
+die() {
+    echo "configure: error: $*" >&2
+    echo "configure: error: $*" >> config.log 2>/dev/null
+    exit 1
+}
+
+usage_error() {
+    echo "configure: $*" >&2
+    echo "Try ./configure --help" >&2
+    exit 2
+}
+
+SRCDIR=`dirname "$0"`
+cd "$SRCDIR" || { echo "configure: cannot enter $SRCDIR" >&2; exit 1; }
+[ -f Makefile ] && [ -f VERSION ] || { echo "configure: the Makefile and VERSION are not here: run it in the KariDNS source tree" >&2; exit 1; }
+
+prefix=/usr/local
+sysconfdir=
+libexecdir=
+db_drivers=auto
+idn2=auto
+openssl_dir=
+march=native
+user_cc=${CC-}
+user_cflags=${CFLAGS-}
+user_ldflags=${LDFLAGS-}
+ARGS="$*"
+
+while [ $# -gt 0 ]; do
+    opt=$1
+    shift
+    val=
+    hasval=no
+    case $opt in
+        --*=*) val=${opt#*=}; opt=${opt%%=*}; hasval=yes ;;
+    esac
+    case $opt in
+        -h|--help) usage; exit 0 ;;
+        --without-idn2) idn2=no ;;
+        --with-idn2)
+            if [ $hasval = no ]; then val=yes; fi
+            idn2=$val ;;
+        --prefix|--sysconfdir|--libexecdir|--with-db-drivers|--with-openssl|--march)
+            if [ $hasval = no ]; then
+                [ $# -gt 0 ] || usage_error "$opt needs a value"
+                val=$1
+                shift
+            fi
+            case $opt in
+                --prefix) prefix=$val ;;
+                --sysconfdir) sysconfdir=$val ;;
+                --libexecdir) libexecdir=$val ;;
+                --with-db-drivers) db_drivers=$val ;;
+                --with-openssl) openssl_dir=$val ;;
+                --march) march=$val ;;
+            esac ;;
+        CC=*) user_cc=${opt#CC=} ;;
+        CFLAGS=*) user_cflags=${opt#CFLAGS=} ;;
+        LDFLAGS=*) user_ldflags=${opt#LDFLAGS=} ;;
+        *) usage_error "unknown option: $opt" ;;
+    esac
+done
+
+# a path goes into a make variable and a -D string: letters, digits and _ . / + @ - only, absolute, no trailing slash
+checkdir() {   # name value
+    case $2 in
+        /*) ;;
+        *) usage_error "$1 must be an absolute path: '$2'" ;;
+    esac
+    case $2 in
+        *[!A-Za-z0-9_./+@-]*) usage_error "$1 may hold only letters, digits and _ . / + @ - : '$2'" ;;
+    esac
+}
+stripslash() {
+    r=$1
+    while :; do
+        case $r in
+            */) r=${r%/} ;;
+            *) break ;;
+        esac
+    done
+    printf '%s' "$r"
+}
+checkdir --prefix "$prefix"
+prefix=`stripslash "$prefix"`
+[ -n "$prefix" ] || usage_error "--prefix may not be /"
+[ -n "$sysconfdir" ] || sysconfdir=$prefix/etc
+checkdir --sysconfdir "$sysconfdir"
+sysconfdir=`stripslash "$sysconfdir"`
+[ -n "$sysconfdir" ] || usage_error "--sysconfdir may not be /"
+[ -n "$libexecdir" ] || libexecdir=$prefix/libexec
+checkdir --libexecdir "$libexecdir"
+libexecdir=`stripslash "$libexecdir"`
+[ -n "$libexecdir" ] || usage_error "--libexecdir may not be /"
+if [ -n "$openssl_dir" ]; then
+    checkdir --with-openssl "$openssl_dir"
+    openssl_dir=`stripslash "$openssl_dir"`
+fi
+case $idn2 in
+    auto|yes|no) ;;
+    *) usage_error "--with-idn2 takes auto, yes or no: '$idn2'" ;;
+esac
+case $march in
+    native|none) ;;
+    ''|*[!A-Za-z0-9_.+-]*) usage_error "--march takes native, none or a name such as x86-64-v2: '$march'" ;;
+esac
+case $user_cflags$user_ldflags$user_cc in
+    *'
+'*) usage_error "CC, CFLAGS and LDFLAGS may not hold a new line" ;;
+esac
+
+# the drivers: auto, none, or a list of sqlite3 and postgresql
+want_sqlite3=no
+want_pgsql=no
+case $db_drivers in
+    auto|none) ;;
+    *)
+        for d in `printf '%s' "$db_drivers" | tr ',' ' '`; do
+            case $d in
+                sqlite3) want_sqlite3=yes ;;
+                postgresql) want_pgsql=yes ;;
+                *) usage_error "unknown database driver '$d' (sqlite3 postgresql)" ;;
+            esac
+        done
+        [ $want_sqlite3 = yes ] || [ $want_pgsql = yes ] || usage_error "--with-db-drivers is empty: use none"
+        ;;
+esac
+
+: > config.log
+echo "configure: $0 $ARGS" >> config.log
+
+CT=conftest$$
+trap 'rm -f "$CT".* config.mk.tmp$$' EXIT
+trap 'exit 1' HUP INT TERM
+
+log() { printf '%s\n' "$*" >> config.log; }
+
+# --- the compiler ---------------------------------------------------------------------------------------------------------------------
+if [ -z "$user_cc" ]; then
+    for c in cc gcc clang; do
+        if command -v $c >/dev/null 2>&1; then user_cc=$c; break; fi
+    done
+fi
+[ -n "$user_cc" ] || die "no C compiler found (cc, gcc, clang): set CC"
+CC=$user_cc
+
+OS=`uname -s 2>/dev/null`
+log "system: $OS, compiler: $CC"
+
+# try_cc "compile flags" "link flags": the test program $CT.c as a program; the user's CFLAGS and LDFLAGS are part of every test
+try_cc() {
+    log "\$ $CC $user_cflags $1 $CT.c -o $CT.out $user_ldflags $2"
+    $CC $user_cflags $1 $CT.c -o $CT.out $user_ldflags $2 >> config.log 2>&1
+    rc=$?
+    log "-> exit $rc"
+    rm -f "$CT.out"
+    return $rc
+}
+
+# the search paths the Makefile adds to every build (BREW_CFLAGS, BREW_LDFLAGS; keep them in step: tests/run_configure_test.sh compares)
+BREW_CFLAGS='-I/opt/homebrew/opt/openssl@3/include -I/usr/local/opt/openssl@3/include -I/opt/homebrew/include -I/usr/local/include'
+BREW_LDFLAGS='-L/opt/homebrew/opt/openssl@3/lib -L/usr/local/opt/openssl@3/lib -L/opt/homebrew/lib -L/usr/local/lib'
+
+# --- the probes of the Makefile -------------------------------------------------------------------------------------------------------
+# OpenSSL (Homebrew on macOS), the same words as the Makefile's DARWIN_CFLAGS and DARWIN_LDFLAGS
+if [ -n "$openssl_dir" ]; then
+    DARWIN_CFLAGS="-I$openssl_dir/include"
+    DARWIN_LDFLAGS="-L$openssl_dir/lib"
+elif [ "$OS" = Darwin ]; then
+    p=`brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null || echo /usr/local/opt/openssl`
+    DARWIN_CFLAGS="-I$p/include"
+    DARWIN_LDFLAGS="-L$p/lib"
+else
+    DARWIN_CFLAGS="-I/usr/local/include"
+    DARWIN_LDFLAGS="-L/usr/local/lib"
+fi
+case $OS in
+    Darwin) HARDEN_LDFLAGS="-pie" ;;
+    MINGW*|MSYS*|CYGWIN*) HARDEN_LDFLAGS="" ;;
+    *) HARDEN_LDFLAGS="-pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack" ;;
+esac
+case $OS in
+    MINGW*|MSYS*|CYGWIN*) WIN_LDFLAGS="-static -lws2_32 -liphlpapi -lcrypt32" ;;
+    *) WIN_LDFLAGS="" ;;
+esac
+VERSION_FILE=`{ tr -d ' \r\n' < VERSION; } 2>/dev/null || echo dev`
+
+BASE_CFLAGS="$BREW_CFLAGS $DARWIN_CFLAGS"
+BASE_LDFLAGS="$BREW_LDFLAGS $DARWIN_LDFLAGS"
+
+# --- OpenSSL and zlib: every build needs them -----------------------------------------------------------------------------------------
+cat > "$CT.c" <<'EOF'
+#include <openssl/ssl.h>
+#include <openssl/evp.h>
+#include <zlib.h>
+int main(void) { OPENSSL_init_ssl(0, NULL); return zlibVersion() == 0 || EVP_sha256() == 0; }
+EOF
+if try_cc "-DOPENSSL_SUPPRESS_DEPRECATED $BASE_CFLAGS" "$BASE_LDFLAGS -lssl -lcrypto -lz"; then
+    :
+else
+    if [ -n "$openssl_dir" ]; then
+        die "OpenSSL and zlib do not compile and link with --with-openssl=$openssl_dir (see config.log)"
+    fi
+    die "OpenSSL (libssl, libcrypto) or zlib was not found (see config.log).  Install their development packages, or give the OpenSSL directory with --with-openssl=DIR"
+fi
+
+# --- libidn2 (dag): the Makefile's chain, then a test of the result ----------------------------------------------------------------------
+IDN_CFLAGS=
+IDN_LDFLAGS=
+IDN_NOTE=
+have_idn2=no
+if [ $idn2 != no ]; then
+    IDN_CFLAGS=$( (pkg-config --exists libidn2 2>/dev/null && echo "-DHAVE_LIBIDN2 $(pkg-config --cflags libidn2 2>/dev/null)") || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-DHAVE_LIBIDN2") || ([ -f /usr/include/idn2.h ] || [ -f /usr/local/include/idn2.h ] && echo "-DHAVE_LIBIDN2") || true)
+    if [ -n "$IDN_CFLAGS" ]; then
+        IDN_LDFLAGS=$( (pkg-config --libs libidn2 2>/dev/null || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-L/usr/local/lib -lidn2") || ([ -f /usr/lib/libidn2.so ] || [ -f /usr/local/lib/libidn2.so ] || [ -f /usr/lib64/libidn2.so ] && echo "-lidn2")) || true)
+    fi
+    log "libidn2: flags '$IDN_CFLAGS', libs '$IDN_LDFLAGS'"
+    cat > "$CT.c" <<'EOF'
+#include <idn2.h>
+int main(void) { return idn2_check_version(IDN2_VERSION) == 0; }
+EOF
+    if [ -n "$IDN_CFLAGS" ] && [ -n "$IDN_LDFLAGS" ] && try_cc "$BASE_CFLAGS $IDN_CFLAGS" "$BASE_LDFLAGS $IDN_LDFLAGS"; then
+        have_idn2=yes
+    else
+        IDN_CFLAGS=
+        IDN_LDFLAGS=
+        if [ $idn2 = yes ]; then
+            die "libidn2 was not found (--with-idn2=yes; see config.log).  Install libidn2 and its development files (pkg-config libidn2 must work)"
+        fi
+        IDN_NOTE=" (not found: dag has no internationalized names)"
+    fi
+fi
+
+# --- database drivers ---------------------------------------------------------------------------------------------------------------------
+DBPG_HAVE=
+DBPG_CFLAGS=
+DBPG_LIBS=-lpq
+have_sqlite3=no
+if [ $db_drivers = auto ] || [ $want_sqlite3 = yes ]; then
+    cat > "$CT.c" <<'EOF'
+#include <sqlite3.h>
+int main(void) { return sqlite3_libversion_number() == 0; }
+EOF
+    if try_cc "$BASE_CFLAGS" "$BASE_LDFLAGS -lsqlite3"; then have_sqlite3=yes; else have_sqlite3=no; fi
+fi
+# libpq: the Makefile's own probes (DBPG_*), then a test of the result.  They are in config.mk whether or not a driver is chosen, as the
+# Makefile's other targets (test_db_pgsql, the coverage build) look at DBPG_HAVE
+if { pkg-config --exists libpq || pg_config --version; } >/dev/null 2>&1; then
+    DBPG_HAVE=yes
+    DBPG_CFLAGS=`pkg-config --cflags libpq 2>/dev/null || { d=$(pg_config --includedir 2>/dev/null) && printf -- '-I%s' "$d"; } || true`
+    DBPG_LIBS=`pkg-config --libs libpq 2>/dev/null || { d=$(pg_config --libdir 2>/dev/null) && printf -- '-L%s -lpq' "$d"; } || printf -- '-lpq'`
+fi
+have_pgsql=no
+if [ -n "$DBPG_HAVE" ]; then
+    cat > "$CT.c" <<'EOF'
+#include <libpq-fe.h>
+int main(void) { return PQlibVersion() == 0; }
+EOF
+    if try_cc "$BASE_CFLAGS $DBPG_CFLAGS" "$BASE_LDFLAGS $DBPG_LIBS"; then
+        have_pgsql=yes
+    else
+        DBPG_HAVE=
+    fi
+fi
+
+DB_NOTE=
+case $db_drivers in
+    none) DB_DRIVERS= ;;
+    auto)
+        DB_DRIVERS=
+        [ "$have_sqlite3" = yes ] && DB_DRIVERS=sqlite3
+        if [ $have_pgsql = yes ]; then
+            DB_DRIVERS=${DB_DRIVERS:+$DB_DRIVERS }postgresql
+        fi
+        [ "$have_sqlite3" = yes ] || DB_NOTE="$DB_NOTE; sqlite3: not found (sqlite3.h, libsqlite3)"
+        [ $have_pgsql = yes ] || DB_NOTE="$DB_NOTE; postgresql: not found (libpq: pkg-config libpq or pg_config)"
+        [ -n "$DB_DRIVERS" ] || DB_NOTE="$DB_NOTE; karidns-dbloader and karidns-zone cannot be built"
+        ;;
+    *)
+        DB_DRIVERS=
+        for d in `printf '%s' "$db_drivers" | tr ',' ' '`; do
+            case $d in
+                sqlite3) [ "$have_sqlite3" = yes ] || die "the sqlite3 driver was asked for (--with-db-drivers) and sqlite3.h or libsqlite3 was not found (see config.log)" ;;
+                postgresql) [ $have_pgsql = yes ] || die "the postgresql driver was asked for (--with-db-drivers) and libpq was not found (see config.log): install libpq (pkg-config libpq or pg_config)" ;;
+            esac
+            case " $DB_DRIVERS " in
+                *" $d "*) ;;
+                *) DB_DRIVERS=${DB_DRIVERS:+$DB_DRIVERS }$d ;;
+            esac
+        done
+        ;;
+esac
+
+# --- -march ---------------------------------------------------------------------------------------------------------------------------------
+case $march in
+    none) MARCH_FLAGS= ;;
+    *) MARCH_FLAGS=-march=$march ;;
+esac
+MARCH_NOTE=
+if [ -n "$MARCH_FLAGS" ]; then
+    cat > "$CT.c" <<'EOF'
+int main(void) { return 0; }
+EOF
+    if ! try_cc "$MARCH_FLAGS" ""; then
+        case $ARGS in
+            *--march*) die "the compiler does not accept $MARCH_FLAGS (see config.log)" ;;
+        esac
+        MARCH_FLAGS=
+        MARCH_NOTE=" (the compiler does not accept -march=native: baseline)"
+    fi
+fi
+
+# --- the paths ------------------------------------------------------------------------------------------------------------------------------
+# the default of the sources is the FreeBSD ports layout: only another directory is passed, so that a build with the default is the build
+# without configure, command for command
+SYSCONF_DEF=
+if [ "$sysconfdir" != /usr/local/etc ]; then
+    SYSCONF_DEF="-DKARIDNS_SYSCONFDIR=\\\"$sysconfdir\\\""
+fi
+if [ "$prefix" != /usr/local ]; then
+    SYSCONF_DEF="${SYSCONF_DEF:+$SYSCONF_DEF }-DKARIDNS_PREFIX=\\\"$prefix\\\""
+fi
+if [ "$libexecdir" != /usr/local/libexec ]; then
+    SYSCONF_DEF="${SYSCONF_DEF:+$SYSCONF_DEF }-DKARIDNS_LIBEXECDIR=\\\"$libexecdir\\\""
+fi
+
+# --- config.mk --------------------------------------------------------------------------------------------------------------------------------
+# a value for make: $ doubled, # escaped; no trailing white space
+mkv() {
+    printf '%s' "$1" | sed -e 's/[[:space:]]*$//' -e 's/\$/$$/g' -e 's/#/\\#/g'
+}
+w() {   # name value
+    printf '%s = %s\n' "$1" "`mkv "$2"`" >> config.mk.tmp$$
+}
+: > config.mk.tmp$$
+{
+    echo "# config.mk - written by ./configure; do not edit (run ./configure again).  Read by the Makefile (docs/building.md)."
+    echo "# configure arguments: $ARGS"
+} >> config.mk.tmp$$
+w PREFIX "$prefix"
+w SYSCONFDIR "$sysconfdir"
+w LIBEXECDIR "$libexecdir"
+w CC "$CC"
+[ -z "$user_cflags" ] || w CFLAGS "$user_cflags"
+# += : BSD make has a CFLAGS of its own (-O2 -pipe) that an assignment would drop; the compile lines differ by the -D only
+[ -z "$SYSCONF_DEF" ] || printf 'CFLAGS += %s\n' "$SYSCONF_DEF" >> config.mk.tmp$$
+[ -z "$user_ldflags" ] || w LDFLAGS "$user_ldflags"
+w MARCH_FLAGS "$MARCH_FLAGS"
+w DB_DRIVERS "$DB_DRIVERS"
+w DARWIN_CFLAGS "$DARWIN_CFLAGS"
+w DARWIN_LDFLAGS "$DARWIN_LDFLAGS"
+w HARDEN_LDFLAGS "$HARDEN_LDFLAGS"
+w IDN_CFLAGS "$IDN_CFLAGS"
+w IDN_LDFLAGS "$IDN_LDFLAGS"
+w WIN_LDFLAGS "$WIN_LDFLAGS"
+w VERSION_FILE "$VERSION_FILE"
+w DBPG_HAVE "$DBPG_HAVE"
+w DBPG_CFLAGS "$DBPG_CFLAGS"
+w DBPG_LIBS "$DBPG_LIBS"
+mv config.mk.tmp$$ config.mk || die "cannot write config.mk"
+
+# --- the summary ------------------------------------------------------------------------------------------------------------------------------
+{
+    echo "KariDNS $VERSION_FILE configured:"
+    echo "  compiler      $CC"
+    echo "  CFLAGS        ${user_cflags:-(none)}"
+    echo "  LDFLAGS       ${user_ldflags:-(none)}"
+    echo "  -march        ${MARCH_FLAGS:-(baseline)}$MARCH_NOTE"
+    echo "  prefix        $prefix"
+    echo "  sysconfdir    $sysconfdir"
+    echo "  libexecdir    $libexecdir"
+    echo "  OpenSSL, zlib found${openssl_dir:+ ($openssl_dir)}"
+    echo "  libidn2       $have_idn2$IDN_NOTE"
+    echo "  DB drivers    ${DB_DRIVERS:-(none)}${DB_NOTE:+   [${DB_NOTE#; }]}"
+    echo "Written: config.mk, config.log.  Run make."
+    if ls ./*.o >/dev/null 2>&1; then
+        echo "Objects of an earlier build are here: run make clean first."
+    fi
+} | tee -a config.log
+exit 0

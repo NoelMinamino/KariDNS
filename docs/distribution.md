@@ -1,6 +1,6 @@
 # KariDNS & dag Distribution Guide
 
-This document describes how to install and use KariDNS and its accompanying toolset (`dag`, `karictl`, `karicheck`) across supported operating systems. Release packages are built by the GitHub Actions release workflow (`.github/workflows/release.yml`) with the scripts under `packaging/`, and are published on [GitHub Releases](https://github.com/NoelMinamino/KariDNS/releases). They are built for the baseline instruction set of their architecture (`MARCH_FLAGS=`), so they run on any compatible CPU.
+This document describes how to install and use KariDNS and its accompanying toolset (`dag`, `karictl`, `karicheck`) across supported operating systems. Release packages are built by the GitHub Actions release workflow (`.github/workflows/release.yml`) with the scripts under `packaging/`, and are published on [GitHub Releases](https://github.com/NoelMinamino/KariDNS/releases). They are built for the baseline instruction set of their architecture (`./configure --march=none`), so they run on any compatible CPU.
 
 In the commands below, replace `?.?.?` with the release version (for example `0.4.2`).
 

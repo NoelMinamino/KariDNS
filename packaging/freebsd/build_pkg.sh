@@ -50,13 +50,14 @@ STAGE_DIR="$(mktemp -d -t karidns-pkg-stage)"
 MANIFEST_DIR="$(mktemp -d -t karidns-pkg-manifest)"
 
 echo "==> Building KariDNS binaries for FreeBSD (${ARCH}, version ${VERSION}, package ${PKG_NAME})..."
+# --march=none: portable baseline ISA, not the build host CPU (-march=native); the drivers are the package's (docs/building.md)
+./configure --march=none --with-db-drivers="${DRIVERS:-none}"
 make clean
-# MARCH_FLAGS=: portable baseline ISA, not the build host CPU (-march=native)
-make VERSION="${VERSION}" MARCH_FLAGS= all
+make VERSION="${VERSION}" all
 if [ -n "$DRIVERS" ]; then
-    make VERSION="${VERSION}" MARCH_FLAGS= DB_DRIVERS="${DRIVERS}" karidns-dbloader
+    make VERSION="${VERSION}" karidns-dbloader
     # karidns-zone (the importer and exporter, docs/karidns-zone.md) is linked with the same drivers
-    make VERSION="${VERSION}" MARCH_FLAGS= DB_DRIVERS="${DRIVERS}" karidns-zone
+    make VERSION="${VERSION}" karidns-zone
     # the loader must report exactly the drivers of the package (the server refuses a driver the loader does not have)
     GOT=$(./karidns-dbloader --drivers | tr '\n' ' ' | sed 's/ $//')
     if [ "$GOT" != "$DRIVERS" ]; then

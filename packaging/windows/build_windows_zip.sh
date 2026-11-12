@@ -16,8 +16,9 @@ elif [ -f "dag" ]; then
     DAG_BIN="dag"
 else
     echo "==> Compiling dag..."
+    ./configure --march=none --with-db-drivers=none
     make clean
-    make VERSION="${VERSION}" MARCH_FLAGS= dag
+    make VERSION="${VERSION}" dag
     if [ -f "dag.exe" ]; then
         DAG_BIN="dag.exe"
     else

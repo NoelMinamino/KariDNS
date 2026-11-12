@@ -29,6 +29,7 @@
 #include <pthread.h>
 #include <sys/types.h>
 #include "dns_wire.h"
+#include "dns_utils.h"
 #include "dns_cidr.h"
 #include "dns_logcat.h"
 
@@ -690,7 +691,7 @@ typedef struct view_config {
 /* options { database { ... }; }  (beta design 7.1). enabled == false: the block is absent and the rest is zero.
  * Paths and schema names are UTF-8 strings kept byte for byte (dns_path_is_valid_utf8()). */
 #define KARIDNS_DB_PATH_MAX 1023            /* same limit as the CONFIG path TLV (dns_db_stream.h) */
-#define KARIDNS_DB_DEFAULT_LOADER_PATH "/usr/local/libexec/karidns-dbloader"
+#define KARIDNS_DB_DEFAULT_LOADER_PATH KARIDNS_LIBEXECDIR "/karidns-dbloader"   /* ./configure --libexecdir (dns_utils.h) */
 typedef struct {
   bool enabled;
   char *driver;                /* "sqlite3" | "postgresql" */

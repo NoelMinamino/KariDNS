@@ -333,6 +333,13 @@ For complete packaging details and checksum verification, see the **[Distributio
 - **Libraries:** OpenSSL (`libcrypto`, `libssl`), `zlib`, `libidn2` (optional, for IDN support), `pthread`
 
 ### Compilation
+`./configure` finds the compiler and the libraries and writes `config.mk`, which `make` reads (details, options and what `make` does without it: [docs/building.md](docs/building.md)):
+```sh
+./configure                                  # --prefix, --sysconfdir, --with-db-drivers, --with-idn2, --with-openssl, --march, CC, CFLAGS, LDFLAGS; --help lists them
+make all
+```
+`make` alone still works on FreeBSD and Linux (BSD make and GNU make 4), as it always did; GNU make 3.81 (macOS) needs `./configure` first.
+
 To compile all utilities on FreeBSD (`karidns`, `dag`, `karictl`, `karicheck`):
 ```sh
 make all
@@ -349,7 +356,7 @@ To compile only the `dag` client (on Linux, macOS, Windows MSYS2, or FreeBSD):
 make dag
 ```
 
-The default build uses `-march=native`; use `make MARCH_FLAGS= ...` for a binary that runs on other CPUs of the same architecture.
+The default build uses `-march=native`; use `./configure --march=none` (or `make MARCH_FLAGS= ...`) for a binary that runs on other CPUs of the same architecture.
 
 ### Tests
 ```sh

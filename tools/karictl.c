@@ -997,7 +997,7 @@ int main(int argc, char **argv) {
         karictl_usage(stdout, argv[0]);
         return 0;
     }
-    const char *conf_path = "/usr/local/etc/karidns/karictl.conf";
+    const char *conf_path = KARIDNS_CONFDIR "/karictl.conf";
     bool conf_path_explicit = false;
     const char *cli_sock_path = NULL;
     int opt;
@@ -1062,8 +1062,8 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    if (!conf_path_explicit && access(conf_path, F_OK) != 0 && access("/usr/local/etc/karictl.conf", F_OK) == 0) {
-        conf_path = "/usr/local/etc/karictl.conf";
+    if (!conf_path_explicit && access(conf_path, F_OK) != 0 && access(KARIDNS_SYSCONFDIR "/karictl.conf", F_OK) == 0) {
+        conf_path = KARIDNS_SYSCONFDIR "/karictl.conf";
     }
 
     if (strcmp(argv[optind], "stats") == 0) {

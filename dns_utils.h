@@ -11,6 +11,22 @@
 #define KARIDNS_VERSION "dev"     /* the Makefile passes the number of the file VERSION (docs/RELEASING.md) */
 #endif
 
+/* The directory of the configuration files that the programs look in when they are not told where (karictl, karicheck, karidns-zone), and the CA bundle of dag (SYSCONFDIR/ssl/cert.pem).
+ * ./configure --sysconfdir=DIR passes -DKARIDNS_SYSCONFDIR="DIR" (docs/building.md); a build without it uses the FreeBSD ports layout. */
+#ifndef KARIDNS_SYSCONFDIR
+#define KARIDNS_SYSCONFDIR "/usr/local/etc"
+#endif
+#define KARIDNS_CONFDIR KARIDNS_SYSCONFDIR "/karidns"
+
+/* The other directories ./configure sets (--prefix, --libexecdir; -DKARIDNS_PREFIX, -DKARIDNS_LIBEXECDIR when they are not these): the database
+ * loader that karidns starts when `loader-path` is not set (dns_config_parser.h), and the FreeBSD ca_root_nss bundle that dag looks for. */
+#ifndef KARIDNS_PREFIX
+#define KARIDNS_PREFIX "/usr/local"
+#endif
+#ifndef KARIDNS_LIBEXECDIR
+#define KARIDNS_LIBEXECDIR "/usr/local/libexec"
+#endif
+
 #include <limits.h>
 #include <unistd.h>
 #include <sys/stat.h>
