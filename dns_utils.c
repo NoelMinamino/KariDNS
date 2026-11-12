@@ -1078,3 +1078,29 @@ void logev_post(int cat, int level, const char *client_ip, int client_port, cons
   va_end(ap);
 }
 #endif
+
+#ifndef _WIN32
+/* ---- descriptors that come with a message (dns_utils.h) ---- */
+#include <sys/socket.h>
+#include <unistd.h>
+
+int recv_take_rights(struct msghdr *mh, int *out, int cap) {
+  int n = 0;
+  for (struct cmsghdr *c = CMSG_FIRSTHDR(mh); c; c = CMSG_NXTHDR(mh, c)) {
+    if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS || c->cmsg_len < CMSG_LEN(0)) continue;
+    size_t k = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+    const unsigned char *end = (const unsigned char *)mh->msg_control + mh->msg_controllen;
+    const unsigned char *data = (const unsigned char *)CMSG_DATA(c);
+    size_t room = end > data ? (size_t)(end - data) / sizeof(int) : 0;
+    if (k > room) k = room;
+    for (size_t i = 0; i < k; i++) {
+      int fd;
+      memcpy(&fd, data + i * sizeof(int), sizeof(int));
+      if (out && n < cap) out[n] = fd;
+      else close(fd);
+      n++;
+    }
+  }
+  return n;
+}
+#endif

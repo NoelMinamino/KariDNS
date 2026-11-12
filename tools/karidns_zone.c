@@ -114,7 +114,7 @@ static void kz_usage(FILE *fp) {
         "reader (an import is read back before it is committed; it is refused when karidns-dbloader would refuse the zone).\n"
         "\n"
         "Database (the settings of options { database { } } in the configuration, or on the command line):\n"
-        "  -c, --config FILE       karidns.conf (default: /usr/local/etc/karidns/karidns.conf when it exists); gives the database, the\n"
+        "  -c, --config FILE       karidns.conf (default: " KARIDNS_CONFDIR "/karidns.conf when it exists); gives the database, the\n"
         "                          limits and the check-* options of the view, and the file zones of the server\n"
         "      --no-config         do not read a configuration\n"
         "      --view NAME         the view: its database, its limits; import puts the zone in this view (karidns_domain_views), export\n"
@@ -187,14 +187,14 @@ static void kz_usage(FILE *fp) {
         "since the signed file was made, apply: the zone is not at --expect-generation or was changed while the tool wrote (nothing was written; sign the\n"
         "zone again / check again), 4 import --signer, apply: the zone is locked by another import or the database is busy (nothing was written; try again).\n"
         "Examples:\n"
-        "  karidns-zone import -c /usr/local/etc/karidns/karidns.conf example.test /var/zones/example.test.zone\n"
+        "  karidns-zone import -c " KARIDNS_CONFDIR "/karidns.conf example.test /var/zones/example.test.zone\n"
         "  karidns-zone import --sqlite3 /var/db/karidns/pdns.sqlite3 --dry-run --mode merge example.test -\n"
         "  karidns-zone import --all --sqlite3 /var/db/karidns/pdns.sqlite3 /var/tinydns/root/data\n"
-        "  karidns-zone import --signer --json -c /usr/local/etc/karidns/karidns.conf example.test /tmp/example.test.signed\n"
-        "  karidns-zone export -c /usr/local/etc/karidns/karidns.conf example.test > example.test.zone\n"
+        "  karidns-zone import --signer --json -c " KARIDNS_CONFDIR "/karidns.conf example.test /tmp/example.test.signed\n"
+        "  karidns-zone export -c " KARIDNS_CONFDIR "/karidns.conf example.test > example.test.zone\n"
         "  karidns-zone export --all --dir /var/backups/zones --sqlite3 /var/db/karidns/pdns.sqlite3\n"
         "  karidns-zone apply --dry-run --json --sqlite3 /var/db/karidns/pdns.sqlite3 --changes - example.test < changes.txt\n"
-        "  karidns-zone apply -c /usr/local/etc/karidns/karidns.conf --expect-generation 17 --changes changes.txt example.test\n"
+        "  karidns-zone apply -c " KARIDNS_CONFDIR "/karidns.conf --expect-generation 17 --changes changes.txt example.test\n"
         "  karidns-zone apply --dry-run --sqlite3 /var/db/karidns/pdns.sqlite3 --zone-file example.test.zone --delete-others example.test\n"
         "  karidns-zone --types-list\n"
         "  printf 'mail.example.test\\tMX\\t10\\tmail2.example.test\\n' | karidns-zone render --json example.test\n");
@@ -381,8 +381,8 @@ static int kz_load_config(const kz_args_t *a, kz_ctx_t *x) {
     const char *path = a->conf;
     if (a->no_config) return 0;
     if (!path) {
-        path = "/usr/local/etc/karidns/karidns.conf";
-        if (access(path, F_OK) != 0 && access("/usr/local/etc/karidns.conf", F_OK) == 0) path = "/usr/local/etc/karidns.conf";
+        path = KARIDNS_CONFDIR "/karidns.conf";
+        if (access(path, F_OK) != 0 && access(KARIDNS_SYSCONFDIR "/karidns.conf", F_OK) == 0) path = KARIDNS_SYSCONFDIR "/karidns.conf";
         if (access(path, F_OK) != 0) return 0;              /* no configuration, and none asked for */
     }
     char *buf = kz_read_conf(path);

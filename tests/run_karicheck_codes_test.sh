@@ -124,6 +124,13 @@ while [ $i -le 130 ]; do
     i=$((i + 1))
 done
 fx conf.xfr-source.limit conf "$T/xfr.conf"
+# more than 256 program zones (0.6.2: the plugin supervisor has room for 256)
+i=1; printf 'options { allow-program-zones yes; };\n' > "$T/prog.conf"
+while [ $i -le 257 ]; do
+    printf 'zone "p%d.test" { type program; program "/bin/sh"; };\n' $i >> "$T/prog.conf"
+    i=$((i + 1))
+done
+fx conf.zone.program-count conf "$T/prog.conf"
 # the list of source addresses (karidns.conf.sample used to print it with its notify-source; the sample no longer sets one, review karidns.conf.sample [6])
 cfix conf.xfr-source.list 'options { notify-source 192.0.2.1; transfer-source 192.0.2.2; };'
 

@@ -294,5 +294,13 @@ int validate_zone_pdns_types(const zone_arena_t *arena, parse_error_t *err, char
 #define ZONE_MAX_NSEC3_ITERATIONS 150u
 void free_ecs_tags_array(ecs_tag_def_t *tags, int count);
 ecs_tag_def_t *clone_ecs_tags_array(const ecs_tag_def_t *src, int count);
+#ifndef _WIN32
+/* The text of the file a tool's $INCLUDE names (karicheck, karidns-zone): the checks of the server's reader (server_load_file_cb in
+ * dns_snapshot_rcu.c).  A symbolic link as the last component is not followed, a FIFO does not block, only a regular file of at most max
+ * bytes is read, and a short read fails.  NULL on any failure, else malloc'ed text with a NUL after it. */
+char *zone_read_include_file(const char *path, size_t max, dev_t *out_dev, ino_t *out_ino);
+#endif
+/* the size limit of an $INCLUDE file in the tools: the server's (KARIDNS_MAX_CONFIG_FILE_SIZE in dns_config_parser.h) */
+#define ZONE_INCLUDE_MAX_BYTES ((size_t)256 * 1024 * 1024)
 
 #endif

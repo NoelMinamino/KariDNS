@@ -68,8 +68,8 @@ static const struct { const char *line; size_t n; uint16_t must_have; } VALID[] 
     { "3www.example.com:20010db8000000000000000000000001:300", 1, 28 },
     { "6www.example.com:20010db8000000000000000000000001:300", 1, 28 },
     { "Sexample.com:5.srv.example.com:5060:10:20:300", 1, 0 },
-    { "Nexample.com:ns.example.com:300", 1, 0 },
-    { "_sip._tcp.example.com:srv:5060", 1, 0 },
+    { "Nexample.com:100:10:u:E2U+sip::.:300", 1, 35 },             /* NAPTR (0.6.2: the order and the preference are numbers) */
+    { "_ssh.example.com:1:1:0123456789abcdef0123456789abcdef01234567:300", 1, 44 },   /* SSHFP (0.6.2: the algorithm and the type are numbers) */
     { "=www.example.com:192.0.2.10:300:20260101T000000:lo", 1, 1 },
     { "=www.example.com:192.0.2.10:300:4611686018427387914", 1, 1 },
     { "=www.example.com:192.0.2.10:0:4611686018427387914", 1, 1 },
@@ -194,6 +194,9 @@ static void test_generic_and_unknown(void) {
         { ":raw.example.com:notnum:data", "Prohibited or invalid RR type" },
         { ":raw.example.com:99999:data", "Prohibited or invalid RR type" },
         { "Q unknown type char", "Unknown tinydns record type character" },
+        /* 0.6.2 (audit): a numeric field that holds a name was read as 0 (these two lines were once taken as valid) */
+        { "Nexample.com:ns.example.com:300", "Invalid NAPTR order in tinydns record" },
+        { "_sip._tcp.example.com:srv:5060", "Invalid SSHFP algorithm in tinydns record" },
     };
     for (size_t i = 0; i < N(bad); i++) {
         zone_arena_t a; parse_error_t e; size_t cnt;

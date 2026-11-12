@@ -3972,20 +3972,75 @@ bool dbreg_walk(dbreg_cursor_t *cur, dbreg_walk_cb cb, void *ud) {
     return done;
 }
 
+/* 0.6.2: the counts of karictl dbstatus walk every element of the registry.  Under one hold of g_zone_db_rebuild_lock that took 23-37 ms per walk
+ * at 1M zones (four walks per dbstatus), and the ingest thread, which takes the lock for every fetch and install and is the one that answers the
+ * queries for zones out of memory, waited for all of it: queries parked for 0.1-0.9 s while a script polled dbstatus.  The walk now lets the lock
+ * go after every DBREG_COUNT_SLICE elements (whole buckets).  An element added to a bucket already passed, or taken out of one not reached yet,
+ * changes the counts as it would one moment later: a report, not an invariant.  A rehash in between moves elements to other buckets, so the
+ * counts start again (reset); after DBREG_COUNT_RESTARTS of those the rest is counted in one hold. */
+#define DBREG_COUNT_SLICE 4096
+#define DBREG_COUNT_RESTARTS 3
+typedef void (*dbreg_count_fn)(const dbreg_zone_t *z, void *ud);
+#ifdef KARIDNS_UNIT_TEST
+void (*g_count_walk_between)(void);           /* tests: called between two slices of dbreg_count_walk(), the lock let go */
+void dbreg_test_bump_grow_gen(void) { atomic_fetch_add_explicit(&g_walk_grow_gen, 1, memory_order_relaxed); }   /* tests: as a rehash does */
+#endif
+STATIC_TEST void dbreg_count_walk(dbreg_count_fn fn, void (*reset)(void *ud), void *ud) {
+    size_t v = 0, b = 0;
+    uint64_t gg = 0;
+    int restarts = 0;
+    for (bool first = true;; first = false) {
+        pthread_mutex_lock(&g_zone_db_rebuild_lock);
+        const uint64_t now_gg = atomic_load_explicit(&g_walk_grow_gen, memory_order_relaxed);
+        if (!first && now_gg != gg && restarts <= DBREG_COUNT_RESTARTS) {
+            restarts++;
+            reset(ud);
+            v = b = 0;
+        }
+        gg = now_gg;
+        const bool to_the_end = restarts > DBREG_COUNT_RESTARTS;
+        size_t seen = 0;
+        while (v < g_dbreg_nviews && (to_the_end || seen < DBREG_COUNT_SLICE)) {
+            const dbreg_view_t *rv = &g_dbreg_views[v];
+            if (b >= rv->nb) {
+                v++;
+                b = 0;
+                continue;
+            }
+            for (const dbreg_zone_t *z = rv->tab[b]; z; z = z->next, seen++) fn(z, ud);
+            b++;
+        }
+        const bool done = v >= g_dbreg_nviews;
+        pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+        if (done) return;
+#ifdef KARIDNS_UNIT_TEST
+        if (g_count_walk_between) g_count_walk_between();
+#endif
+        /* a pause, so that a thread that waits for the lock gets it: without one this thread took the lock again before the waiter (woken, not yet
+         * running) could, and the ingest thread waited through the whole walk as before (dtrace: up to 104 ms, no hold above 3 ms) */
+        const struct timespec pause = { 0, 50000 };
+        nanosleep(&pause, NULL);
+    }
+}
+
+typedef struct { size_t n, rb; } dirb_t;
+static void dirb_fn(const dbreg_zone_t *z, void *ud) {
+    dirb_t *a = ud;
+    a->n++;
+    a->rb += sizeof(*z) + strlen(z->name) + 1 + (z->error ? strlen(z->error) + 1 : 0) + (z->digest ? 32 : 0);
+}
+static void dirb_reset(void *ud) { memset(ud, 0, sizeof(dirb_t)); }
+
 /* What the directory costs (D1a, design 3.1): the registry's elements (header, name, error text) and its hash tables, and the index tables of
  * the views of the active snapshot (and their tick lists), in bytes as requested from malloc.  The entries and their images are not in it. */
 void dbreg_dir_bytes(size_t *elements, size_t *registry_bytes, size_t *index_bytes) {
-    size_t n = 0, rb = 0, ib = 0;
-    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dirb_t a = { 0, 0 };
+    dbreg_count_walk(dirb_fn, dirb_reset, &a);
+    size_t n = a.n, rb = a.rb, ib = 0;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);                 /* the tables themselves: O(views) */
     for (size_t v = 0; v < g_dbreg_nviews; v++) {
         const dbreg_view_t *rv = &g_dbreg_views[v];
         rb += rv->nb * sizeof(*rv->tab) + rv->cap_adds * sizeof(*rv->adds) + rv->cap_removes * sizeof(*rv->removes);
-        for (size_t b = 0; b < rv->nb; b++) {
-            for (const dbreg_zone_t *z = rv->tab[b]; z; z = z->next) {
-                n++;
-                rb += sizeof(*z) + strlen(z->name) + 1 + (z->error ? strlen(z->error) + 1 : 0) + (z->digest ? 32 : 0);
-            }
-        }
     }
     zone_db_snapshot_t *snap = atomic_load_explicit(&g_zone_db_active, memory_order_acquire);
     for (size_t v = 0; snap && v < snap->view_count; v++) {
@@ -4022,68 +4077,59 @@ void dbreg_counts(size_t *total, size_t *rejected, size_t *shadowed) {
 
 /* D1a milestone 4 (design 12-8): the zones that a dynamic UPDATE changed.  They are kept in memory (never taken out) until the next load from the
  * database replaces them, because the changes exist nowhere else. */
+static void upd_fn(const dbreg_zone_t *z, void *ud) {
+    const zone_db_entry_t *e = zdir_entry(z);
+    if (e && atomic_load_explicit(&e->updated, memory_order_relaxed)) (*(size_t *)ud)++;
+}
+static void size_reset(void *ud) { *(size_t *)ud = 0; }
+
 size_t dbreg_count_updated(void) {
     size_t n = 0;
-    pthread_mutex_lock(&g_zone_db_rebuild_lock);
-    for (size_t v = 0; v < g_dbreg_nviews; v++) {
-        const dbreg_view_t *rv = &g_dbreg_views[v];
-        for (size_t b = 0; b < rv->nb; b++) {
-            for (const dbreg_zone_t *z = rv->tab[b]; z; z = z->next) {
-                const zone_db_entry_t *e = zdir_entry(z);
-                if (e && atomic_load_explicit(&e->updated, memory_order_relaxed)) n++;
-            }
-        }
-    }
-    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    dbreg_count_walk(upd_fn, size_reset, &n);                     /* (in slices: dbreg_count_walk) */
     return n;
 }
 
+static void res_fn(const dbreg_zone_t *z, void *ud) {
+    dbreg_residency_t *o = ud;
+    if (!dbreg_zone_known(z) || z->shadowed || (z->flags & ZDIR_F_DELETED)) return;
+    const zone_db_entry_t *e = zdir_entry(z);
+    o->total++;
+    if (e) {
+        o->resident++;
+        if (e->source == ZONE_SRC_DB) o->queries += atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed);
+    } else {
+        o->absent++;
+    }
+}
+static void res_reset(void *ud) { memset(ud, 0, sizeof(dbreg_residency_t)); }
+
 /* D1a step 7: what the directory holds (karictl dbstatus): zones with and without data, and the queries the zones in memory have answered (plus those of the
- * entries taken out of memory since the start; an entry that a newer version replaced starts its count again) */
+ * entries taken out of memory since the start; an entry that a newer version replaced starts its count again).  In slices (dbreg_count_walk). */
 void dbreg_residency(dbreg_residency_t *o) {
     memset(o, 0, sizeof(*o));
-    pthread_mutex_lock(&g_zone_db_rebuild_lock);
-    for (size_t v = 0; v < g_dbreg_nviews; v++) {
-        const dbreg_view_t *rv = &g_dbreg_views[v];
-        for (size_t b = 0; b < rv->nb; b++) {
-            for (const dbreg_zone_t *z = rv->tab[b]; z; z = z->next) {
-                if (!dbreg_zone_known(z) || z->shadowed || (z->flags & ZDIR_F_DELETED)) continue;
-                const zone_db_entry_t *e = zdir_entry(z);
-                o->total++;
-                if (e) {
-                    o->resident++;
-                    if (e->source == ZONE_SRC_DB) o->queries += atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed);
-                } else {
-                    o->absent++;
-                }
-            }
-        }
-    }
-    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    dbreg_count_walk(res_fn, res_reset, o);
     o->queries += atomic_load_explicit(&g_gone_queries, memory_order_relaxed);
 }
 
-void dbreg_counts2(size_t *total, size_t *rejected, size_t *shadowed_config, size_t *shadowed_catalog) {
-    size_t t = 0, r = 0, sc = 0, sk = 0;
-    pthread_mutex_lock(&g_zone_db_rebuild_lock);
-    for (size_t v = 0; v < g_dbreg_nviews; v++) {
-        const dbreg_view_t *rv = &g_dbreg_views[v];
-        for (size_t b = 0; b < rv->nb; b++) {
-            for (const dbreg_zone_t *z = rv->tab[b]; z; z = z->next) {
-                if (dbreg_zone_known(z)) t++;
-                if (z->last_result == DBREG_REJECTED) r++;
-                if (dbreg_zone_known(z) && z->shadowed) {
-                    if (z->shadow_by == DBREG_SH_CATALOG) sk++;
-                    else sc++;
-                }
-            }
-        }
+typedef struct { size_t t, r, sc, sk; } cnt2_t;
+static void cnt2_fn(const dbreg_zone_t *z, void *ud) {
+    cnt2_t *c = ud;
+    if (dbreg_zone_known(z)) c->t++;
+    if (z->last_result == DBREG_REJECTED) c->r++;
+    if (dbreg_zone_known(z) && z->shadowed) {
+        if (z->shadow_by == DBREG_SH_CATALOG) c->sk++;
+        else c->sc++;
     }
-    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
-    if (total) *total = t;
-    if (rejected) *rejected = r;
-    if (shadowed_config) *shadowed_config = sc;
-    if (shadowed_catalog) *shadowed_catalog = sk;
+}
+static void cnt2_reset(void *ud) { memset(ud, 0, sizeof(cnt2_t)); }
+
+void dbreg_counts2(size_t *total, size_t *rejected, size_t *shadowed_config, size_t *shadowed_catalog) {
+    cnt2_t c = { 0, 0, 0, 0 };
+    dbreg_count_walk(cnt2_fn, cnt2_reset, &c);                    /* (in slices: dbreg_count_walk) */
+    if (total) *total = c.t;
+    if (rejected) *rejected = c.r;
+    if (shadowed_config) *shadowed_config = c.sc;
+    if (shadowed_catalog) *shadowed_catalog = c.sk;
 }
 
 int dbreg_find_info(const char *view, const char *name, dbreg_info_t *out, int max) {

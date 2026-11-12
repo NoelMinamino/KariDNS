@@ -312,7 +312,7 @@ test('S15: the account page has the sections; the password form checks what it c
   ui.type(again, 'a long enough password');
   routes['POST /auth/password'] = problem(403, 'wrong-password');
   await ui.submit(form);
-  assert.deepEqual(ui.last('POST', '/auth/password').body, { current: 'old password 1', new: 'a long enough password', all: true });
+  assert.deepEqual(ui.last('POST', '/auth/password').body, { current: 'old password 1', new: 'a long enough password', all: true, tokens: false });
   assert.equal(ui.input('current').parentNode.querySelector('p.error').textContent, en['api.wrong-password']);
   assert.equal(ui.env.document.activeElement, ui.input('current'));
   routes['POST /auth/password'] = problem(400, 'weak-password');
@@ -323,9 +323,11 @@ test('S15: the account page has the sections; the password form checks what it c
   assert.equal(form.querySelector('p.msg.error').textContent, en['api.rate-limited']);
   // the box "sign out my other sessions" is sent as it is
   ui.input('all').click();
+  ui.input('tokens').click();   // "revoke my API tokens" (off by default; audit, 0.6.2)
   routes['POST /auth/password'] = reply(200, { api: 1, password: 'changed' });
   await ui.submit(form);
   assert.equal(ui.last('POST', '/auth/password').body.all, false);
+  assert.equal(ui.last('POST', '/auth/password').body.tokens, true);
   assert.equal(form.querySelector('p[role=status]').textContent, en['account.pw-changed']);
   for (const n of ['current', 'new', 'again']) assert.equal(ui.input(n).value, '', `${n} is cleared after the change`);
   noForeignElements(ui);

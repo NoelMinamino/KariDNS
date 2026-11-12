@@ -11,6 +11,22 @@
 #define KARIDNS_VERSION "dev"     /* the Makefile passes the number of the file VERSION (docs/RELEASING.md) */
 #endif
 
+/* The directory of the configuration files that the programs look in when they are not told where (karictl, karicheck, karidns-zone), and the CA bundle of dag (SYSCONFDIR/ssl/cert.pem).
+ * ./configure --sysconfdir=DIR passes -DKARIDNS_SYSCONFDIR="DIR" (docs/building.md); a build without it uses the FreeBSD ports layout. */
+#ifndef KARIDNS_SYSCONFDIR
+#define KARIDNS_SYSCONFDIR "/usr/local/etc"
+#endif
+#define KARIDNS_CONFDIR KARIDNS_SYSCONFDIR "/karidns"
+
+/* The other directories ./configure sets (--prefix, --libexecdir; -DKARIDNS_PREFIX, -DKARIDNS_LIBEXECDIR when they are not these): the database
+ * loader that karidns starts when `loader-path` is not set (dns_config_parser.h), and the FreeBSD ca_root_nss bundle that dag looks for. */
+#ifndef KARIDNS_PREFIX
+#define KARIDNS_PREFIX "/usr/local"
+#endif
+#ifndef KARIDNS_LIBEXECDIR
+#define KARIDNS_LIBEXECDIR "/usr/local/libexec"
+#endif
+
 #include <limits.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -37,6 +53,13 @@ int exec_file_exec_fd(int fd, const char *path, char *const argv[], char *const 
  * the user's primary group) being 0.  NULL names are skipped; a name that does not exist is not an error here (the callers say so).
  * Used for user / group, loader-user / loader-group and program-user, by karidns (start, reload) and karicheck. */
 bool identity_names_root(const char *user, const char *group, char *err, size_t errlen);
+/* The descriptors (SCM_RIGHTS) of a received message: the first `cap` of them go to out[] (out may be NULL with cap 0), every other one
+ * is closed, so that a peer cannot leave descriptors behind in the receiver (a CMSG_SPACE() buffer is rounded up and holds more than it
+ * was sized for).  Never reads past msg_controllen: a kernel that shortens a cut message may leave cmsg_len as it was.  Returns the count
+ * of all of them (more than cap: the extra ones were closed).  Used by the Backend (the connect broker, the loader and plugin control
+ * sockets) and by the plugin supervisor. */
+struct msghdr;
+int recv_take_rights(struct msghdr *mh, int *out, int cap);
 #endif
 
 uint16_t get_type_code(const char *type_str);

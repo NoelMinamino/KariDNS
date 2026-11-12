@@ -1,7 +1,7 @@
 // The state the handlers share: the configuration (read again on SIGHUP), the datasets, the database, the logger, the rate limiters, the tools and the
 // key of the TOTP secrets.  One App per process.
 
-import { Buckets, Window } from './ratelimit.js';
+import { Buckets, Window, Lockouts } from './ratelimit.js';
 import { hashPassword } from './crypto.js';
 import { datasetList } from './config.js';
 import { Pool, KeyedLock } from './pool.js';
@@ -24,6 +24,7 @@ export class App {
     // sign-ins one client address may have waiting at a provider (a state lives 10 minutes, store.js OIDC_STATE_TTL; 1000 wait at the most in all): the rate-login
     // bucket paces the starts, this bounds how many of the 1000 one address can hold (IPv6: per address, not per prefix)
     this.oidcStarts = new Window({ limit: config.settings['rate-oidc-start'], windowMs: 600000, now: () => this.now() });
+    this.lockouts = new Lockouts({ now: () => this.now() });             // failed logins: the lock per account and client network (handlers/auth.js)
     this.versions = {};                   // filled by the startup checks: the tools' versions, for /version
     this.dummy = null;
     this.pending = new Set();              // background work in flight (a touch of a session), so shutdown can wait for it

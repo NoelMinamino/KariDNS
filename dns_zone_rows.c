@@ -53,11 +53,7 @@ static char *zrows_read_file(const char *path) {
 
 static char *zrows_include_cb(parse_context_t *ctx, const char *path, dev_t *out_dev, ino_t *out_ino) {
     (void)ctx;
-    struct stat st;
-    if (stat(path, &st) != 0) return NULL;
-    if (out_dev) *out_dev = st.st_dev;
-    if (out_ino) *out_ino = st.st_ino;
-    return zrows_read_file(path);
+    return zone_read_include_file(path, ZONE_INCLUDE_MAX_BYTES, out_dev, out_ino);
 }
 
 /* The text of a file or of standard input becomes the arena's file buffer (the parser works on it in place) and its pristine copy (for messages). */
@@ -574,6 +570,11 @@ static bool record_content(const dns_record_t *r, dstr_t *out, long *prio, char 
             snprintf(b, sizeof(b), " %u", parse_ttl_value(r->rdata[j]));
             ds_adds(out, b);
         }
+        return !out->oom;
+    }
+    if (r->type_code == 22 && r->rdata_count == 1) {     /* NSAP: "0x" and the digits, the form of RFC 1706 section 5 */
+        ds_adds(out, "0x");
+        ds_adds(out, r->rdata[0]);
         return !out->oom;
     }
     int lead = zrows_blob_lead(r->type_code);

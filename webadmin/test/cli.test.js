@@ -294,12 +294,12 @@ test('a plain text connection to another host: a warning at the opening and in i
     await (await openBackend(cfg, { checkConninfo: () => null, importPg, readFile: () => text, warn: (m) => warned.push(m) })).close();
     assert.equal(warned.length, want, text);
   }
-  assert.match(warned[0], /^the connection to the database at 192\.0\.2\.5 is not encrypted \(sslmode=prefer\); use sslmode=require or verify-full$/);
+  assert.match(warned[0], /^the connection to the database at 192\.0\.2\.5 is not encrypted \(sslmode=prefer\); use sslmode=verify-full \(require encrypts but does not check the server\)$/);
   await (await openBackend(cfg, { checkConninfo: () => null, importPg, readFile: () => 'host=db.example.test' })).close();     // (no warn callback: fine)
   const file = { isFile: () => true, uid: 1000, mode: 0o100600 };
   const seen = async (text) => (await inspect(cfg, { run: okRun(), uid: undefined, st: { api: file, check: file }, readFile: () => text })).warnings;
   assert.deepEqual(await seen('host=/tmp'), []);
-  assert.deepEqual(await seen('host=db.example.test sslmode=disable'), ['the connection to the database at db.example.test is not encrypted (sslmode=disable); use sslmode=require or verify-full']);
+  assert.deepEqual(await seen('host=db.example.test sslmode=disable'), ['the connection to the database at db.example.test is not encrypted (sslmode=disable); use sslmode=verify-full (require encrypts but does not check the server)']);
   assert.deepEqual(await seen('host=db.example.test password'), [], 'a file that does not parse: no warning, the opening tells');
   assert.deepEqual((await inspect(cfg, { run: okRun(), uid: undefined, st: { api: file, check: file }, readFile: () => { throw new Error('ENOENT'); } })).warnings, []);
   const r = await run(['--check'], { loadConfig: () => goodConfig(), openBackend: async () => ({ close: async () => {} }), inspect: async () => ({ problems: [], notes: [], warnings: ['w1'], versions: {} }) });

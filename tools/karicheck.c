@@ -131,18 +131,9 @@ KARIDNS_TOOL_FN char *kc_read_stdin(bool *out_failed) {
 
 KARIDNS_TOOL_FN char *karicheck_load_file_cb(parse_context_t *ctx, const char *rel_path, dev_t *out_dev, ino_t *out_ino) {
     (void)ctx;
-    
-    if (out_dev || out_ino) {
-        struct stat st;
-        if (stat(rel_path, &st) == 0) {
-            if (out_dev) *out_dev = st.st_dev;
-            if (out_ino) *out_ino = st.st_ino;
-        } else {
-            return NULL; // fstat failed, fail-closed
-        }
-    }
-    
-    return read_file_or_die(rel_path, NULL);
+    /* 0.6.2 (audit M11): as the server reads it (no symbolic link as the last component, no FIFO, a size limit); the parser reports the
+     * failure as "$INCLUDE file could not be read" */
+    return zone_read_include_file(rel_path, ZONE_INCLUDE_MAX_BYTES, out_dev, out_ino);
 }
 
 
@@ -1113,7 +1104,7 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
                 if (zx->program_args_count > 62) {
                     dns_diag(DIAG_ERROR, DC_CONF_ZONE_PROGRAM_ARGS, NULL, 0,
                         "Zone '%s': program-args has %d entries, but only 62 are "
-                        "supported (argv[] is fixed-size in spawn_one_program_plugin()). "
+                        "supported (the manager passes at most 62 to the plugin, dns_plugin_sup.c). "
                         "Reduce the argument count.\n",
                         z->domain, zx->program_args_count);
                     free(buf);
@@ -1990,7 +1981,7 @@ KARIDNS_TOOL_FN void print_usage(FILE *fp, const char *prog) {
     fprintf(fp, "error, 1: errors (or the check could not be run).  A single argument is a view unless it contains a '/' or ends in .conf.\n");
     fprintf(fp, "Examples:\n");
     fprintf(fp, "  %s db\n", prog);
-    fprintf(fp, "  %s db internal /usr/local/etc/karidns/karidns.conf\n", prog);
+    fprintf(fp, "  %s db internal " KARIDNS_CONFDIR "/karidns.conf\n", prog);
 }
 
 #if defined(KARIDNS_COVERAGE_LINKAGE) && !defined(main)
@@ -2032,9 +2023,9 @@ KARIDNS_TOOL_FN int kc_run(int argc, char **argv) {
     }
 
     const char *cmd = argv[1];
-    const char *default_config = "/usr/local/etc/karidns/karidns.conf";
-    if (access(default_config, F_OK) != 0 && access("/usr/local/etc/karidns.conf", F_OK) == 0) {
-        default_config = "/usr/local/etc/karidns.conf";
+    const char *default_config = KARIDNS_CONFDIR "/karidns.conf";
+    if (access(default_config, F_OK) != 0 && access(KARIDNS_SYSCONFDIR "/karidns.conf", F_OK) == 0) {
+        default_config = KARIDNS_SYSCONFDIR "/karidns.conf";
     }
 
     if (strcmp(cmd, "conf") == 0) {

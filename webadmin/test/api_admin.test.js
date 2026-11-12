@@ -58,13 +58,13 @@ test('principals: create, read, change, delete; only a global master writes', wi
   is(await root('POST', '/principals', { body: { kind: 'user', name: 'e', email: 'not an address' } }), 400, 'bad-request');
   // reading: credentials only for a global master and for oneself
   const asRoot = await root('GET', `/principals/${id}`);
-  assert.deepEqual(asRoot.body.credentials, { password: true, totp_enabled: false, failed_logins: 0, locked: false, oidc: null });
+  assert.deepEqual(asRoot.body.credentials, { password: true, totp_enabled: false, failed_logins: 0, locked: false, locked_networks: [], oidc: null });
   assert.equal(asRoot.body.principal.created_by, 1);
   assert.equal((await dom('GET', `/principals/${id}`)).body.credentials, undefined);
   assert.notEqual((await dom('GET', '/principals/2')).body.credentials, undefined);
-  assert.deepEqual((await root('GET', '/principals/3')).body.credentials, { password: true, totp_enabled: false, failed_logins: 0, locked: false, oidc: null });
+  assert.deepEqual((await root('GET', '/principals/3')).body.credentials, { password: true, totp_enabled: false, failed_logins: 0, locked: false, locked_networks: [], oidc: null });
   const group = (await root('POST', '/principals', { body: { kind: 'group', name: 'nocreds' } })).body.principal.id;
-  assert.deepEqual((await root('GET', `/principals/${group}`)).body.credentials, { password: false, totp_enabled: false, failed_logins: 0, locked: false, oidc: null });
+  assert.deepEqual((await root('GET', `/principals/${group}`)).body.credentials, { password: false, totp_enabled: false, failed_logins: 0, locked: false, locked_networks: [], oidc: null });
   is(await root('GET', '/principals/999'), 404, 'not-found');
   is(await root('GET', '/principals/x'), 404, 'not-found');
   // changing
@@ -77,11 +77,14 @@ test('principals: create, read, change, delete; only a global master writes', wi
   is(await root('PATCH', '/principals/1', { body: { disabled: true } }), 409, 'self');
   is(await dom('PATCH', `/principals/${id}`, { body: { name: 'x' } }), 403, 'forbidden');
   is(await root('PATCH', `/principals/${id}`, { body: { unknown: 1 } }), 400, 'bad-request');
-  // the password reset ends the user's sessions
+  // the password reset ends the user's sessions and revokes its API tokens (audit, 0.6.2)
   const s = await d.login('alice2', 'alice password 12');
+  const tok = (await d.as(s)('POST', '/tokens', { body: { name: 'ci' } })).body.token;
+  assert.equal((await d.request('GET', '/auth/me', { token: tok })).status, 200);
   is(await root('PUT', `/principals/${id}/password`, { body: { password: 'alice2 is the name' } }), 400, 'weak-password');
   is(await root('PUT', `/principals/${id}/password`, { body: { password: 'a brand new password' } }), 200);
   is(await d.as(s)('GET', '/auth/me'), 401, 'unauthenticated');
+  is(await d.request('GET', '/auth/me', { token: tok }), 401, 'unauthenticated');
   assert.equal((await d.login('alice2', 'a brand new password')).status, 200);
   is(await root('PUT', `/principals/${group}/password`, { body: { password: 'a brand new password' } }), 409, 'not-a-user');
   is(await root('PUT', '/principals/999/password', { body: { password: 'a brand new password' } }), 404, 'not-found');

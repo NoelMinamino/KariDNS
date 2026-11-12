@@ -103,6 +103,7 @@ X (CONF_ZONE_PROGRAM_EXEC, "conf.zone.program-exec", 'W', "the program of a prog
 X (CONF_ZONE_PROGRAM_USER_ROOT, "conf.zone.program-user-root", 'E', "program-user is root by another name")
 X (CONF_ZONE_PROGRAM_USER_DIFFERS, "conf.zone.program-user-differs", 'W', "program-user differs from options user")
 X (CONF_ZONE_PROGRAM_ARGS, "conf.zone.program-args", 'E', "program-args has more entries than supported")
+X (CONF_ZONE_PROGRAM_COUNT, "conf.zone.program-count", 'E', "more zones of type program than supported (256)")
 X (CONF_ZONE_PROGRAM_MISSING, "conf.zone.program-missing", 'E', "a program zone has no program path")
 X (CONF_ZONE_FORWARD, "conf.zone.forward", 'I', "type forward keeps its KariDNS meaning, which differs from BIND")
 X (CONF_ZONE_FORWARD_MISSING, "conf.zone.forward-missing", 'E', "a forward zone has no forwarders")

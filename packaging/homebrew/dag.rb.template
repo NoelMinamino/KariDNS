@@ -5,18 +5,21 @@ class Dag < Formula
   sha256 "__SHA256__"
   license "MIT"
 
+  depends_on "pkgconf" => :build
   depends_on "openssl@3"
   depends_on "zlib"
   depends_on "libidn2" => :optional
 
   def install
-    ENV.append "CFLAGS", "-I#{Formula["openssl@3"].opt_include}"
-    ENV.append "LDFLAGS", "-L#{Formula["openssl@3"].opt_lib}"
-    if build.with? "libidn2"
-      ENV.append "CFLAGS", "-I#{Formula["libidn2"].opt_include} -DHAVE_LIBIDN2"
-      ENV.append "LDFLAGS", "-L#{Formula["libidn2"].opt_lib} -lidn2"
-    end
+    # ./configure writes config.mk, which the make of macOS (GNU make 3.81) needs; it finds libidn2 with pkg-config (docs/building.md)
+    args = %W[
+      --prefix=#{prefix}
+      --with-openssl=#{Formula["openssl@3"].opt_prefix}
+      --with-db-drivers=none
+    ]
+    args << (build.with?("libidn2") ? "--with-idn2=yes" : "--with-idn2=no")
 
+    system "./configure", *args
     system "make", "dag"
     bin.install "dag"
     doc.install "README.md", "docs/dag.md" if File.exist?("docs/dag.md")

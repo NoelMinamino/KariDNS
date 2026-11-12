@@ -605,8 +605,8 @@ static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *serv
         SSL_CTX_set_default_verify_paths(g_ssl_ctx);
         static const char *const default_ca_locations[] = {
             "/etc/ssl/cert.pem",
-            "/usr/local/etc/ssl/cert.pem",
-            "/usr/local/share/certs/ca-root-nss.crt",
+            KARIDNS_SYSCONFDIR "/ssl/cert.pem",
+            KARIDNS_PREFIX "/share/certs/ca-root-nss.crt",
             "/etc/ssl/certs/ca-certificates.crt",
             "/etc/pki/tls/certs/ca-bundle.crt",
             "/etc/ssl/ca-bundle.pem",

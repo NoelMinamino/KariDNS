@@ -80,7 +80,7 @@ test('ten failures lock the account for 15 minutes, doubling; a success resets t
   assert.equal((await good()).status, 200);                       // the ninth failure did not lock; the success resets
   for (let i = 0; i < 10; i++) problem(await bad(), 401, 'invalid-credentials');
   problem(await good(), 401, 'invalid-credentials');              // locked: even the right password is refused
-  assert.ok(d.log.lines.some((l) => /warn auth: dom is locked after 10 failed logins/.test(l)));
+  assert.ok(d.log.lines.some((l) => /warn auth: dom is locked from 127\.0\.0\.0\/24 after 10 failed logins/.test(l)));
   const root = await d.login('root', 'correct horse battery');
   const info = await d.as(root)('GET', '/principals/2');
   assert.equal(info.body.credentials.locked, true);
@@ -291,15 +291,18 @@ test('the password: changing it asks for the old one', withDeploy({}, async (d) 
   problem(await change({ current: 'dom password 12345', new: 'short' }), 400, 'bad-request');
   problem(await change({ current: 'dom password 12345', new: 'my DOM password!' }), 400, 'weak-password');
   problem(await change({ current: 'dom password 12345' }), 400, 'bad-request');
+  const tok = (await d.as(a)('POST', '/tokens', { body: { name: 'ci' } })).body.token;
   assert.equal((await change({ current: 'dom password 12345', new: 'a new password 123', all: true })).status, 200);
   assert.equal((await d.as(a)('GET', '/auth/me')).status, 200);
   problem(await d.as(b)('GET', '/auth/me'), 401, 'unauthenticated');          // the other session ended
+  assert.equal((await d.request('GET', '/auth/me', { token: tok })).status, 200, 'all alone keeps the API tokens');
   problem(await d.request('POST', '/auth/login', { body: { user: 'dom', password: 'dom password 12345' } }), 401, 'invalid-credentials');
   assert.equal((await d.login('dom', 'a new password 123')).status, 200);
-  // without all the other sessions stay
+  // without all the other sessions stay; tokens revokes the API tokens (audit, 0.6.2), sessions or not
   const c = await d.login('dom', 'a new password 123');
-  assert.equal((await change({ current: 'a new password 123', new: 'yet another one 12' })).status, 200);
+  assert.equal((await change({ current: 'a new password 123', new: 'yet another one 12', tokens: true })).status, 200);
   assert.equal((await d.as(c)('GET', '/auth/me')).status, 200);
+  problem(await d.request('GET', '/auth/me', { token: tok }), 401, 'unauthenticated');
 }));
 
 test('API tokens: made once, used as bearer, read-only, revoked, expired, listed', withDeploy({}, async (d) => {
@@ -413,4 +416,34 @@ test('a token cannot be made for a group (0.6.1)', withDeploy({}, async (d) => {
   problem(await root('POST', '/tokens', { body: { name: 'g', principal: gid } }), 409, 'not-a-user');
   assert.equal((await root('GET', '/tokens?all=true')).body.tokens.length, 0);
   assert.equal((await root('POST', '/tokens', { body: { name: 'u', principal: 2 } })).status, 201);
+}));
+
+test('the lock is per network: the owner gets in from another network; /24 and /64; unlock and a new password end it (audit, 0.6.2)', withDeploy({ settings: { 'trusted-proxy': '127.0.0.1, ::1' } }, async (d) => {
+  await cast(d);
+  const from = (ip, password) => d.request('POST', '/auth/login', { body: { user: 'dom', password }, headers: { 'X-Forwarded-For': ip } });
+  for (let i = 0; i < 10; i++) problem(await from('203.0.113.5', 'not the password'), 401, 'invalid-credentials');
+  assert.ok(d.log.lines.some((l) => /warn auth: dom is locked from 203\.0\.113\.0\/24 after 10 failed logins/.test(l)));
+  problem(await from('203.0.113.200', 'dom password 12345'), 401, 'invalid-credentials');   // the same /24: locked, even with the right password
+  assert.equal((await from('198.51.100.7', 'dom password 12345')).status, 200);             // another network: the owner gets in
+  for (let i = 0; i < 10; i++) await from('2001:db8:1:2::5', 'not the password');
+  problem(await from('2001:db8:1:2:ffff::1', 'dom password 12345'), 401, 'invalid-credentials');   // the same /64
+  assert.equal((await from('2001:db8:1:3::1', 'dom password 12345')).status, 200);
+  // what an administrator sees, and the unlock
+  const root = d.as(await d.login('root', 'correct horse battery'));
+  const c = (await root('GET', '/principals/2')).body.credentials;
+  assert.equal(c.locked, true);
+  assert.equal(c.failed_logins, 20);
+  assert.deepEqual(c.locked_networks.map((n) => n.network).sort(), ['2001:db8:1:2::/64', '203.0.113.0/24']);
+  assert.match(c.locked_networks[0].until, /^\d{4}-\d\d-\d\dT/);
+  const u = await root('POST', '/principals/2/credentials', { body: { action: 'unlock' } });
+  assert.deepEqual([u.body.credentials.locked, u.body.credentials.failed_logins, u.body.credentials.locked_networks], [false, 0, []]);
+  assert.equal((await from('203.0.113.200', 'dom password 12345')).status, 200);
+  // a new password from an administrator ends the locks too
+  for (let i = 0; i < 10; i++) await from('192.0.2.9', 'not the password');
+  assert.equal((await root('PUT', '/principals/2/password', { body: { password: 'a brand new password' } })).status, 200);
+  assert.equal((await from('192.0.2.10', 'a brand new password')).status, 200);
+  // a sign-in that works ends the count of its network
+  for (let i = 0; i < 9; i++) await from('192.0.2.9', 'not the password');
+  assert.equal((await from('192.0.2.9', 'a brand new password')).status, 200);
+  assert.equal((await root('GET', '/principals/2')).body.credentials.failed_logins, 0);
 }));

@@ -3167,6 +3167,116 @@ static void test_signer_cover(void) {
     cov_clear(&vs);
 }
 
+/* ------------------------------------------------------------------ 0.6.2: the kept connection of a fetch worker */
+/* the SQLite3 driver with its opens counted, and a check_schema that fails when told to (a kept connection that went bad) */
+static db_driver_t g_kd;
+static int g_kd_opens, g_kd_fail_schema;
+static int kd_open(db_conn_t **c, const db_source_t *s, char *err, size_t errlen) {
+    g_kd_opens++;
+    return db_driver_sqlite3.open(c, s, err, errlen);
+}
+static int kd_check_schema(db_conn_t *c, db_schema_info_t *si) {
+    if (g_kd_fail_schema > 0) {
+        g_kd_fail_schema--;
+        return -1;
+    }
+    return db_driver_sqlite3.check_schema(c, si);
+}
+
+/* run_view_once() as a fetch worker runs it (fetch_one()), the zone going to a socket that is read here */
+static int keep_fetch(ctx_t *x, const db_source_t *src, const char *zone, int rd) {
+    x->n_zones = x->n_failed = 0;
+    int st = run_view_once(x, src, zone, false);
+    ctx_view_reset(x);
+    char sink[65536];
+    while (recv(rd, sink, sizeof(sink), MSG_DONTWAIT) > 0) {}
+    return st;
+}
+
+static void test_fetch_keep(void) {
+    printf("the kept connection of a fetch worker (0.6.2)\n");
+    char path[600], other[620], err[DB_ERRLEN];
+    sqlite3 *db = make_db("keep.db", path, sizeof(path));
+    add_simple_zone(db, 1, 1, "k.test");
+    add_simple_zone(db, 2, 4, "l.test");
+    sqlite3_close(db);
+    g_kd = db_driver_sqlite3;
+    g_kd.open = kd_open;
+    g_kd.check_schema = kd_check_schema;
+    db_source_t src = { "sqlite3", path, NULL, NULL, 0 };
+
+    /* the helpers: the identity of a source, the file it names, a failed open */
+    char key[sizeof(((ctx_t *)0)->keep_key)], longp[1200];
+    CHECK(keep_key_of(&src, key, sizeof(key)) && strstr(key, path) != NULL);
+    memset(longp, 'a', sizeof(longp) - 1);
+    longp[sizeof(longp) - 1] = '\0';
+    db_source_t lsrc = { "sqlite3", longp, NULL, NULL, 0 };
+    CHECK(!keep_key_of(&lsrc, key, sizeof(key)));                   /* does not fit: not kept */
+    dev_t d;
+    ino_t i;
+    db_source_t nosrc = { "sqlite3", "/nonexistent/dir/x.db", NULL, NULL, 0 };
+    CHECK(!keep_file_id(&nosrc, &d, &i) && d == 0 && i == 0);
+    db_source_t pgsrc = { "postgresql", NULL, "/ci", "s", 0 };
+    CHECK(keep_file_id(&pgsrc, &d, &i));                            /* no file to look at */
+    ctx_t f;
+    memset(&f, 0, sizeof(f));
+    f.drv = &g_kd;
+    f.fetch = true;
+    bool reused = true;
+    CHECK(conn_for(&f, &nosrc, &reused, &d, &i) == EXIT_ERROR && f.conn == NULL && !reused && f.errtext[0]);
+
+    /* the whole reading, as fetch_one() does it, over a socket pair */
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    struct lio *io = calloc(1, sizeof(*io));
+    CHECK(io != NULL);
+    if (!io) return;
+    io->fd = sv[0];
+    io->is_fetch = true;
+    pthread_mutex_init(&io->wlock, NULL);
+    ctx_t x;
+    memset(&x, 0, sizeof(x));
+    x.io = io;
+    x.fetch = true;
+    x.drv = &g_kd;
+    x.nthreads = 1;
+    x.force = true;
+    kdb_enc_init(&x.enc);
+    g_kd_opens = 0;
+    CHECK(keep_fetch(&x, &src, "k.test", sv[1]) == EXIT_OK && x.n_zones == 1);
+    CHECK(g_kd_opens == 1 && x.keep != NULL);                       /* opened once, kept */
+    db_conn_t *kept = x.keep;
+    CHECK(keep_fetch(&x, &src, "l.test", sv[1]) == EXIT_OK && x.n_zones == 1);
+    CHECK(g_kd_opens == 1 && x.keep == kept);                       /* the next request uses it */
+    g_kd_fail_schema = 1;
+    CHECK(keep_fetch(&x, &src, "k.test", sv[1]) == EXIT_OK && x.n_zones == 1);
+    CHECK(g_kd_opens == 2 && x.keep != NULL);                       /* its first statement failed: opened again, once */
+    /* the file is replaced: the next request opens the new one and reads its zones */
+    snprintf(other, sizeof(other), "%s.new", path);
+    db = make_db("keep.db.new", other, sizeof(other));
+    add_simple_zone(db, 1, 1, "m.test");
+    sqlite3_close(db);
+    CHECK(rename(other, path) == 0);
+    CHECK(keep_fetch(&x, &src, "m.test", sv[1]) == EXIT_OK && x.n_zones == 1);
+    CHECK(g_kd_opens == 3);
+    /* another source (another busy timeout of the same file): another connection */
+    db_source_t src2 = { "sqlite3", path, NULL, NULL, 7000 };
+    CHECK(keep_fetch(&x, &src2, "m.test", sv[1]) == EXIT_OK && g_kd_opens == 4);
+    /* back to the first source: a new connection (not a kept one) whose first statement fails is not opened a third time */
+    g_kd_fail_schema = 1;
+    CHECK(keep_fetch(&x, &src, "m.test", sv[1]) != EXIT_OK);        /* a new connection that fails is not retried */
+    CHECK(g_kd_opens == 5 && x.keep != NULL);
+    keep_drop(&x);
+    CHECK(x.keep == NULL && x.keep_drv == NULL);
+    keep_drop(&x);                                                   /* (nothing kept: nothing to do) */
+    kdb_enc_free(&x.enc);
+    pthread_mutex_destroy(&io->wlock);
+    free(io);
+    close(sv[0]);
+    close(sv[1]);
+    (void)err;
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/db";
     snprintf(g_schema, sizeof(g_schema), "%s/pdns_schema.sqlite3.sql", dir);
@@ -3215,6 +3325,7 @@ int main(int argc, char **argv) {
     test_profiles_and_views();
     test_pool_snapshot_moved();
     test_driver_faults();
+    test_fetch_keep();
     snprintf(g_ext_path, sizeof(g_ext_path), "%s/../../db/karidns_ext.sqlite3.sql", dir);
     snprintf(g_audit_path, sizeof(g_audit_path), "%s/../../db/karidns_audit.sqlite3.sql", dir);
     test_writes();

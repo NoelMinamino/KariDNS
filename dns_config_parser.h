@@ -29,6 +29,7 @@
 #include <pthread.h>
 #include <sys/types.h>
 #include "dns_wire.h"
+#include "dns_utils.h"
 #include "dns_cidr.h"
 #include "dns_logcat.h"
 
@@ -394,7 +395,7 @@ typedef struct zone_ext {
   char *program_user;          /* 追加の権限降格先ユーザ(省略可) */
   uint32_t program_timeout_ms; /* 1クエリの応答待ちタイムアウト(既定 2000) */
   uint32_t program_max_failures; /* 連続失敗許容回数(既定 5) */
-  uint32_t program_restart_backoff_ms; /* 未使用: v1では自動再起動なし。将来用に予約 */
+  bool program_reload_line;    /* program-reload-line yes: a reload writes the line "RELOAD" to the plugin (0.6.2; default no) */
   /* --- ここまで追加 --- */
 
   /* --- type "forward" 用 --- */
@@ -690,7 +691,7 @@ typedef struct view_config {
 /* options { database { ... }; }  (beta design 7.1). enabled == false: the block is absent and the rest is zero.
  * Paths and schema names are UTF-8 strings kept byte for byte (dns_path_is_valid_utf8()). */
 #define KARIDNS_DB_PATH_MAX 1023            /* same limit as the CONFIG path TLV (dns_db_stream.h) */
-#define KARIDNS_DB_DEFAULT_LOADER_PATH "/usr/local/libexec/karidns-dbloader"
+#define KARIDNS_DB_DEFAULT_LOADER_PATH KARIDNS_LIBEXECDIR "/karidns-dbloader"   /* ./configure --libexecdir (dns_utils.h) */
 typedef struct {
   bool enabled;
   char *driver;                /* "sqlite3" | "postgresql" */

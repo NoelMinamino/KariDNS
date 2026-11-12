@@ -23,6 +23,8 @@ done
 
 printf '%s\n' "$V" > VERSION
 export V
+# a config.mk written by ./configure holds the number it read (VERSION_FILE): keep it in step, or the next make builds the old one
+[ ! -f config.mk ] || perl -pi -e 's/^VERSION_FILE = .*/VERSION_FILE = $ENV{V}/' config.mk
 for p in signer webadmin; do
     # package.json: the first "version" (the package's own).  package-lock.json (lockfileVersion 3): the first two, the top
     # level and packages[""]; the later ones are the dependencies' and stay.

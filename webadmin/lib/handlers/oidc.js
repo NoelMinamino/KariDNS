@@ -103,7 +103,7 @@ export async function callback(ctx) {
       return { p: await S.getPrincipal(tx, pid), creds: await S.getCredentials(tx, pid), grants: await S.effectiveGrants(tx, pid) };
     });
     if (!found) return refuse(`no user is linked to the subject ${clean(id.sub)}`);
-    if (!mayHaveSession(found.p, found.creds, now)) return refuse(`${clean(found.p?.name ?? '?')} is disabled or locked`);
+    if (!mayHaveSession(found.p, found.creds, now) || app.lockouts.locked(found.p.id, ctx.ip)) return refuse(`${clean(found.p?.name ?? '?')} is disabled or locked`);
     const { p, creds, grants } = found;
 
     // F-17: the TOTP step also after a provider, unless the provider is configured to answer for it (mfa = idp) and the token says two factors were used (RFC 8176)

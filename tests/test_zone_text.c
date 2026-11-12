@@ -308,6 +308,8 @@ static void test_every_type(void) {
             snprintf(want, sizeof(want), "\nt 7200 %s ", strcmp(s->type, "ALIAS") == 0 ? "TYPE65401" : strcmp(s->type, "LUA") == 0 ? "TYPE65402" : s->type);
             if (strcasecmp(s->type, "EID") != 0 && strcasecmp(s->type, "NIMLOC") != 0) CHECK_HAS(w, want);
         }
+        /* NSAP is written with its "0x" (RFC 1706 section 5; BIND refuses the bare digits), 0.6.2 */
+        if (strcmp(s->type, "NSAP") == 0) CHECK_HAS(w, " NSAP 0x47000580005a0000000001e133ffffff00016100\n");
         free(w);
     }
     /* every type with a name is in the table (meta types cannot be zone data) */
@@ -790,6 +792,16 @@ static void test_loaders(void) {
     CHECK_STR(rows.zone, "example.test");
     zrows_free(&rows);
     zone_arena_destroy(&a);
+    /* NSAP: the row content is "0x" and the digits (RFC 1706 section 5), 0.6.2; the bare digits of older rows still read */
+    put_file("nsap.zone", "$ORIGIN example.test.\n$TTL 300\n@ SOA ns1 h 1 2 3 4 5\n@ NS ns1\nns1 A 192.0.2.1\nosi NSAP 0x47.0005.80.005a00\n", p3, sizeof(p3));
+    CHECK_MSG(zrows_load_zone_file(p3, NULL, &a, apex, sizeof(apex), err, sizeof(err)), "%s", err);
+    CHECK_MSG(zrows_from_arena(&a, apex, &rows, err, sizeof(err)), "%s", err);
+    bool nsap_seen = false;
+    for (size_t i = 0; i < rows.n; i++)
+        if (rows.rows[i].type && strcmp(rows.rows[i].type, "NSAP") == 0) { CHECK_STR(rows.rows[i].content, "0x47000580005a00"); nsap_seen = true; }
+    CHECK(nsap_seen);
+    zrows_free(&rows);
+    zone_arena_destroy(&a);
     CHECK_MSG(zrows_load_zone_file(p1, "example.test.", &a, apex, sizeof(apex), err, sizeof(err)), "%s", err);
     zone_arena_destroy(&a);
     CHECK(!zrows_load_zone_file("/nonexistent/dir/x.zone", NULL, &a, apex, sizeof(apex), err, sizeof(err)));
@@ -1163,6 +1175,9 @@ static void test_render(void) {
     RENDERS("_sip._tcp.example.test\tSRV\t20\t5 5060 sip.example.test", "20 5 5060 sip.example.test.");
     RENDERS("_sip._tcp.example.test\tsrv\t-\t0 5 5060 sip.example.test", "0 5 5060 sip.example.test.");
     RENDERS("www.example.test\tA\t-\t192.0.2.1", "192.0.2.1");
+    RENDERS("osi.example.test\tNSAP\t-\t0x47.0005.80.005a00", "0x47000580005a00");   /* 0.6.2: with its "0x" (RFC 1706 section 5) */
+    RENDERS("osi.example.test\tNSAP\t-\t47000580005a00", "0x47000580005a00");        /* the bare digits of rows written before 0.6.2 */
+    REFUSES("osi.example.test\tNSAP\t-\t0.x47000580005a00", "NSAP");
     RENDERS("www.example.test\tAAAA\t0\t2001:DB8:0:0::1", "2001:DB8:0:0::1");        /* the text as it was parsed: the zone-file writer does not rewrite an address */
     RENDERS("www.example.test\tCNAME\t-\tTarget.Example.TEST", "Target.Example.TEST.");
     RENDERS("example.test\tNS\t0\tns1.example.test.", "ns1.example.test.");

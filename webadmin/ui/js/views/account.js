@@ -21,10 +21,11 @@ function passwordSection(ctx) {
   const next = field({ label: t('account.pw-new'), type: 'password', name: 'new', autocomplete: 'new-password', required: true, maxlength: 1024, hint: t('account.pw-rules', { min: PASSWORD_MIN }) });
   const again = field({ label: t('account.pw-again'), type: 'password', name: 'again', autocomplete: 'new-password', required: true, maxlength: 1024 });
   const others = checkbox({ label: t('account.pw-others'), checked: true, name: 'all' });
+  const tokens = checkbox({ label: t('account.pw-tokens'), checked: false, name: 'tokens' });
   const msg = message('status');
   const err = message('error');
   const submit = h('button', { type: 'submit', class: 'primary' }, t('account.pw-change'));
-  const form = h('form', { class: 'stack', novalidate: true }, current.node, next.node, again.node, others.node, err.node, msg.node, h('div', { class: 'actions' }, submit));
+  const form = h('form', { class: 'stack', novalidate: true }, current.node, next.node, again.node, others.node, tokens.node, err.node, msg.node, h('div', { class: 'actions' }, submit));
   form.addEventListener('submit', (ev) => {
     ev.preventDefault();
     for (const f of [current, next, again]) f.setError(null);
@@ -38,7 +39,7 @@ function passwordSection(ctx) {
     if (n !== again.input.value) { again.setError(t('account.pw-mismatch')); again.focus(); return; }
     busy(submit, async () => {
       try {
-        await api.post('/auth/password', { current: current.input.value, new: n, all: others.input.checked });
+        await api.post('/auth/password', { current: current.input.value, new: n, all: others.input.checked, tokens: tokens.input.checked });
         current.input.value = '';
         next.input.value = '';
         again.input.value = '';

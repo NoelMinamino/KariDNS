@@ -113,6 +113,8 @@ export const clearLock = (tx, id) => tx.run(`UPDATE ${tx.A}credentials SET faile
 
 export const setTotp = (tx, id, wrapped, enabled) => tx.run(`UPDATE ${tx.A}credentials SET totp_secret = $2, totp_enabled = $3 WHERE principal_id = $1`, [id, wrapped, enabled]);
 
+// (the lock of the account that 0.6.1 and before wrote; 0.6.2 locks per network in memory, ratelimit.js Lockouts.  A lock left in the database is still honoured until it
+// ends, and unlock / a new password clear it.  The tests use this to make such a lock.)
 export const recordLoginFailure = (tx, id, failed, lockedUntilMs) => tx.run(`UPDATE ${tx.A}credentials SET failed_logins = $2, locked_until = $3 WHERE principal_id = $1`,
   [id, failed, lockedUntilMs === null ? null : tx.ts(lockedUntilMs)]);
 

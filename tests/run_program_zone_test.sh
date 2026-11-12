@@ -225,16 +225,17 @@ run_check "Large TCP query (>5000 bytes) to async program zone is not truncated"
     "$LARGE_TCP_TEST" \
     "SUCCESS: Large TCP query"
 
-# X-11: a plugin that exits must only make its own zone fail. Marking it dead stops the plugin from
-# inside the Capsicum sandbox (kill(pid) used to raise SIGTRAP and stop the whole server).
+# X-11: a plugin that exits must only make its own zone fail (kill(pid) inside the Capsicum sandbox used to raise
+# SIGTRAP and stop the whole server).  0.6.2: the manager notices the exit, the zone answers SERVFAIL, and the plugin is
+# started again with the backoff (tests/run_program_zone_supervisor_test.sh checks the restarts).
 echo ""
 echo "=== 3. Testing a program plugin that exits (X-11) ==="
 for n in 1 2 3; do
     "$DAG" @127.0.0.1 -p $PORT x.dead.example A +timeout=2 +tries=1 >/dev/null 2>&1 || true
 done
-run_check "Plugin that exits is marked dead" \
-    "grep -c \"zone 'dead.example.' exceeded max failures\" $TMP_DIR/karidns.log" \
-    "^1$"
+run_check "Plugin that exits is noticed" \
+    "grep -c \"zone 'dead.example.' in view '[^']*': the plugin (pid [0-9]*) exited\" $TMP_DIR/karidns.log" \
+    "^[1-9][0-9]*$"
 run_check "Dead program zone answers SERVFAIL" \
     "$DAG @127.0.0.1 -p $PORT x.dead.example A +timeout=2 +tries=1 +nohexdump" \
     "status: SERVFAIL"

@@ -66,6 +66,8 @@ static const char *unescape_string_in_place(char *str, bool allow_nul, size_t *o
 #include <arpa/inet.h>
 #include "dns_log.h"
 #include <strings.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #endif
 
 #define IS_SPACE(c) ((c) == ' ' || (c) == '\t')
@@ -570,6 +572,42 @@ static int zone_pdns_type_rewrite(dns_record_t *rec, bool is_alias, const char *
 
 static int parse_zone_buffer(char *buf, size_t size, zone_arena_t *arena, parse_context_t *ctx,
                              const zone_parse_state_t *st, bool finalize);
+
+#ifndef _WIN32
+/* 0.6.2 (audit M11): karidns-zone import and karicheck read an $INCLUDE with fopen(): a symbolic link was followed, a FIFO blocked the
+ * open, and the size had no limit.  The tools now read it the way the server does (server_load_file_cb).  Not called by the server (its
+ * Backend opens files only through the directories opened at startup). */
+char *zone_read_include_file(const char *path, size_t max, dev_t *out_dev, ino_t *out_ino) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 || (uint64_t)st.st_size > (uint64_t)max) {
+        close(fd);
+        return NULL;
+    }
+    size_t len = (size_t)st.st_size, got = 0;
+    char *buf = malloc(len + 1);
+    if (!buf) {
+        close(fd);
+        return NULL;
+    }
+    while (got < len) {
+        ssize_t n = read(fd, buf + got, len - got);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    close(fd);
+    if (got != len) {   /* a short read: a cut file must not be parsed */
+        free(buf);
+        return NULL;
+    }
+    buf[len] = '\0';
+    if (out_dev) *out_dev = st.st_dev;
+    if (out_ino) *out_ino = st.st_ino;
+    return buf;
+}
+#endif
 
 static int process_include(char **fields, int field_idx, zone_arena_t *arena,
                             parse_context_t *ctx, const zone_parse_state_t *st, char *cur_buf) {
@@ -2120,25 +2158,34 @@ PROCESS_RECORD:
     }
 
     if (rec->type_code == 22) { // NSAP
-      if (rec->rdata_count > 0) {
-        char *raw = rec->rdata[0];
-        // "0x" または "0X" で始まっていればスキップ
-        if (raw[0] == '0' && (raw[1] == 'x' || raw[1] == 'X')) {
-            raw += 2;
-        }
-        size_t len = strlen(raw);
-        char *clean = arena_alloc(arena, len + 1);
-        if (clean) {
-          size_t c_idx = 0;
-          for (size_t k = 0; k < len; k++) {
-            if (raw[k] != '.') { // ドットを除去
-              clean[c_idx++] = raw[k];
-            }
-          }
-          clean[c_idx] = '\0';
-          rec->rdata[0] = clean; // 正規化された純粋なHex文字列に置き換え
-        }
+      /* RFC 1706 §5: the RDATA is "0x" followed by the address in hex digits; "." may be put between digits for readability.  The
+       * text after the prefix must be hex digits and dots, an even number of digits: "0.x47..." failed the prefix check, its dots were
+       * taken out and hex_decode() skipped the 'x', which shifted the address by a nibble, and an odd last digit was dropped (found by
+       * fuzz_zone_text, 0.6.2).  The prefix itself stays optional (BIND requires it): the database rows karidns-zone wrote before 0.6.2
+       * hold the bare digits, and the writers (dns_zone_text.c, dns_zone_rows.c) put it in front now. */
+      const char *raw = rec->rdata_count == 1 ? rec->rdata[0] : NULL;
+      if (raw && raw[0] == '0' && (raw[1] == 'x' || raw[1] == 'X')) raw += 2;
+      size_t digits = 0;
+      bool ok = raw != NULL;
+      for (const char *p = ok ? raw : ""; ok && *p; p++) {
+        if (isxdigit((unsigned char)*p)) digits++;
+        else if (*p != '.') ok = false;
       }
+      if (!ok || digits == 0 || digits % 2 != 0) {
+        if (ctx && ctx->err_out) {
+          ctx->err_out->error_message = "NSAP record requires 0x and an even number of hex digits ('.' between them for readability; RFC 1706 section 5)";
+          ctx->err_out->error_offset = rec->type - buf;
+          ctx->err_out->token_length = strlen(rec->type);
+        }
+        return -1;
+      }
+      char *clean = arena_alloc(arena, digits + 1);
+      if (!clean) return -1;
+      size_t c_idx = 0;
+      for (const char *p = raw; *p; p++)
+        if (*p != '.') clean[c_idx++] = *p;   // ドットを除去
+      clean[c_idx] = '\0';
+      rec->rdata[0] = clean; // 正規化された純粋なHex文字列に置き換え
     } else if (rec->type_code == 1) { // A
         if (rec->rdata_count != 1) {
             if (ctx && ctx->err_out) {

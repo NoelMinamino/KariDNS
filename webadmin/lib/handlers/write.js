@@ -225,7 +225,9 @@ export async function reloadAll(ctx) {
 export async function metadataList(ctx) {
   const ds = dataset(ctx);
   const zone = zoneParam(ctx);
-  zoneGrants(ctx, ds, zone);
+  // the metadata are about the whole zone (ACLs of transfers, TSIG key names, ...): the masters of the whole zone, as DNSSEC (audit, 0.6.2)
+  const gs = zoneGrants(ctx, ds, zone);
+  if (gs[0].role === 'subdomain_master') throw forbidden('the zone metadata are for the masters of the whole zone');
   const facts = await loadFacts(ctx, ds, zone);
   const rows = await ctx.db((tx) => S.listMetadata(tx, ds.schema, facts.id));
   const kinds = [];

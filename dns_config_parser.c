@@ -1,6 +1,7 @@
 #include "dns_config_parser.h"
 #include <openssl/crypto.h>
 #include "dns_utils.h"
+#include "dns_plugin_msg.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1539,6 +1540,29 @@ static void report_bad_bool(token_ctx_t *ctx, const char *zone, const char *name
   report_bad_value(ctx, zone, name, val, "yes or no");
 }
 
+/* a non-negative integer of at most 10 digits that fits in 32 bits (cfg_type_uint32); nothing before or after the digits */
+static bool parse_u32_digits(const char *s, uint32_t *out) {
+  size_t n = 0;
+  while (s[n] >= '0' && s[n] <= '9') n++;
+  if (n == 0 || n > 10 || s[n] != '\0') return false;
+  unsigned long long v = strtoull(s, NULL, 10);
+  if (v > UINT32_MAX) return false;
+  *out = (uint32_t)v;
+  return true;
+}
+
+/* "<name> <n>;" whose value has already been read: parse_u32_digits() and lo..hi, or report_bad_value() and false */
+static bool cfg_u32_in(token_ctx_t *ctx, const char *zone, const char *name, const char *val, uint32_t lo, uint32_t hi,
+                       const char *expected, uint32_t *out) {
+  uint32_t v = 0;
+  if (!val || !parse_u32_digits(val, &v) || v < lo || v > hi) {
+    report_bad_value(ctx, zone, name, val, expected);
+    return false;
+  }
+  *out = v;
+  return true;
+}
+
 /* "<name> <bool>;" の値とセミコロンを読む。不正な値や構文は -1。 */
 static const char *tok_desc(const conf_token_t *t, char *buf, size_t n);
 static void conf_error(token_ctx_t *ctx, const char *what, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
@@ -3074,8 +3098,10 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
     free_token(&tok);
 
     char *endptr;
+    errno = 0;
     long num_val = strtol(val, &endptr, 10);
-    bool valid = (*endptr == '\0' && num_val >= 0);
+    /* 0.6.2 (audit): an empty value, or one above INT_MAX that the (int) below would have wrapped, is invalid too */
+    bool valid = (endptr != val && *endptr == '\0' && errno == 0 && num_val >= 0 && num_val <= INT_MAX);
 
     if (strcmp(key, "responses-per-second") == 0) {
       if (valid) rrl->responses_per_second = (int)num_val;
@@ -3705,13 +3731,7 @@ static bool zv_parse_mode(const char *s, bool allow_fail, uint8_t *out) {
 
 /* a non-negative integer of at most 10 digits that fits in 32 bits (cfg_type_uint32) */
 static bool zv_parse_u32(const char *s, uint32_t *out) {
-  size_t n = 0;
-  while (s[n] >= '0' && s[n] <= '9') n++;
-  if (n == 0 || n > 10 || s[n] != '\0') return false;
-  unsigned long long v = strtoull(s, NULL, 10);
-  if (v > UINT32_MAX) return false;
-  *out = (uint32_t)v;
-  return true;
+  return parse_u32_digits(s, out);
 }
 
 /* One statement of this family: `key` has been read and zv_option_name(key) holds.  The value and the ';' are read here.  A later statement of
@@ -5687,30 +5707,15 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
       free_token(&tok);
-    } else if (strcmp(key, "program-timeout") == 0) {
-      tok = get_next_token(ctx);
-      if (tok.type != TOKEN_STRING) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
-      char *endptr = NULL;
-      unsigned long val_num = strtoul(tok.value, &endptr, 10);
-      if (*endptr == '\0') {
-        x->program_timeout_ms = (uint32_t)val_num;
-      }
-      free_token(&tok);
-      tok = get_next_token(ctx);
-      if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
-      free_token(&tok);
-    } else if (strcmp(key, "program-max-failures") == 0) {
-      tok = get_next_token(ctx);
-      if (tok.type != TOKEN_STRING) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
-      char *endptr = NULL;
-      unsigned long val_num = strtoul(tok.value, &endptr, 10);
-      if (*endptr == '\0') {
-        x->program_max_failures = (uint32_t)val_num;
-      }
-      free_token(&tok);
-      tok = get_next_token(ctx);
-      if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
-      free_token(&tok);
+    } else if (strcmp(key, "program-timeout") == 0 || strcmp(key, "program-max-failures") == 0) {
+      /* 0.6.2 (audit): digits only and within range.  A bad value was ignored silently and a large one cut to 32 bits. */
+      int v = 0;
+      if (parse_transport_param(ctx, zone->domain, key, false, 0, INT32_MAX, &v) != 0) { free(key); free_zone_config(zone); return -1; }
+      if (strcmp(key, "program-timeout") == 0) x->program_timeout_ms = (uint32_t)v;
+      else x->program_max_failures = (uint32_t)v;
+    } else if (strcmp(key, "program-reload-line") == 0) {
+      /* 0.6.2: a reload writes "RELOAD\n" to the plugin.  Opt-in: a plugin written to the earlier protocol may take an unknown line as an error */
+      if (parse_bool_statement(ctx, zone->domain, key, &x->program_reload_line) != 0) { free(key); free_zone_config(zone); return -1; }
     } else if (strcmp(key, "alias-resolver") == 0) {
       if (parse_alias_resolvers(ctx, zone->domain ? zone->domain : "zone", &x->alias_resolvers, &x->alias_resolvers_count) != 0) {
         free(key); free_zone_config(zone); return -1;
@@ -5720,17 +5725,9 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
         free(key); free_zone_config(zone); return -1;
       }
     } else if (strcmp(key, "forward-timeout") == 0) {
-      tok = get_next_token(ctx);
-      if (tok.type != TOKEN_STRING) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
-      char *endptr = NULL;
-      unsigned long val_num = strtoul(tok.value, &endptr, 10);
-      if (*endptr == '\0') {
-        x->forward_timeout_ms = (uint32_t)val_num;
-      }
-      free_token(&tok);
-      tok = get_next_token(ctx);
-      if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
-      free_token(&tok);
+      int v = 0;   /* 0.6.2 (audit): as program-timeout above */
+      if (parse_transport_param(ctx, zone->domain, "forward-timeout", false, 0, INT32_MAX, &v) != 0) { free(key); free_zone_config(zone); return -1; }
+      x->forward_timeout_ms = (uint32_t)v;
     } else if (strcmp(key, "rate-limit") == 0) {
       if (parse_rate_limit_config(ctx, &x->rrl) != 0) {
         free(key);
@@ -6367,8 +6364,11 @@ static int parse_dnstap_block(token_ctx_t *ctx, server_config_t *config) {
       free(val);
       if (src != 0) { free(key_prop); return -1; }
     } else if (strcmp(key_prop, "queue-size") == 0 || strcmp(key_prop, "queue_size") == 0) {
-      config->dnstap.queue_size = (uint32_t)strtoul(val, NULL, 10);
+      /* 0.6.2 (audit): digits only, at most 2^20 entries.  A value above 2^31 made the rounding up to a power of two in
+       * dns_server_core.c loop for ever; garbage was read as 0 (the default). */
+      bool ok = cfg_u32_in(ctx, NULL, "dnstap queue-size", val, 0, 1048576, "an integer from 0 to 1048576", &config->dnstap.queue_size);
       free(val);
+      if (!ok) { free(key_prop); return -1; }
     } else if (strcmp(key_prop, "log-queries") == 0 || strcmp(key_prop, "auth-query") == 0 ||
                strcmp(key_prop, "log-responses") == 0 || strcmp(key_prop, "auth-response") == 0 ||
                strcmp(key_prop, "require-connect") == 0) {
@@ -8644,10 +8644,10 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free_token(&tok);
             return -1;
           }
-          char *endptr;
-          unsigned long v = strtoul(tok.value, &endptr, 10);
-          if (*endptr == '\0') {
-            config->query_log_max_qps = (uint32_t)v;
+          /* 0.6.2 (audit): digits only and 32 bits ("-1" was read as a huge value, a larger one cut) */
+          uint32_t v = 0;
+          if (tok.value && parse_u32_digits(tok.value, &v)) {
+            config->query_log_max_qps = v;
           } else {
             syslog(LOG_ERR, "[Config] Invalid query-log-max-qps value '%s'", tok.value);
             cfg_diag(ctx, DIAG_ERROR, DC_CONF_QUERY_LOG_MAX_QPS, "Invalid query-log-max-qps value '%s'\n", tok.value);
@@ -8670,10 +8670,9 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free_token(&tok);
             return -1;
           }
-          char *endptr;
-          unsigned long v = strtoul(tok.value, &endptr, 10);
-          if (*endptr == '\0' && v >= 1024 && v <= 1048576 && ((v & (v - 1)) == 0)) {
-            config->query_log_buffer_size = (uint32_t)v;
+          uint32_t v = 0;
+          if (tok.value && parse_u32_digits(tok.value, &v) && v >= 1024 && v <= 1048576 && ((v & (v - 1)) == 0)) {
+            config->query_log_buffer_size = v;
           } else {
             syslog(LOG_ERR, "[Config] Invalid query-log-buffer-size value '%s' (must be a power of 2 between 1024 and 1048576)", tok.value);
             cfg_diag(ctx, DIAG_ERROR, DC_CONF_QUERY_LOG_BUFFER_SIZE, "Invalid query-log-buffer-size value '%s' (must be a power of 2 between 1024 and 1048576)\n", tok.value);
@@ -8701,13 +8700,14 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free_token(&tok);
             return -1;
           }
-          char *endptr;
-          long mqval = strtol(tok.value, &endptr, 10);
-          if (*endptr == '\0') {
-            if (mqval < 0) mqval = 0;
-            if (mqval > 16) mqval = 16;
-            config->max_mqtypes = (int)mqval;
+          /* 0.6.2 (audit): a value that is not a number is an error (it was ignored silently); above 16 is still cut to 16 */
+          uint32_t mq = 0;
+          if (!cfg_u32_in(ctx, NULL, "max-mqtypes", tok.value, 0, UINT32_MAX, "an integer from 0 to 16", &mq)) {
+            free(key);
+            free_token(&tok);
+            return -1;
           }
+          config->max_mqtypes = mq > 16 ? 16 : (int)mq;
           free_token(&tok);
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
@@ -8749,14 +8749,13 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free_token(&tok);
             return -1;
           }
-          char *endptr;
-          unsigned long v = strtoul(tok.value, &endptr, 10);
-          if (*endptr != '\0' || tok.value[0] == '-' || isspace((unsigned char)tok.value[0])) {
+          uint32_t v = 0;   /* 0.6.2 (audit): a value above 2^32-1 was cut to 32 bits */
+          if (!tok.value || !parse_u32_digits(tok.value, &v)) {
             syslog(LOG_ERR, "[Config] Invalid wire-cache-max-records value '%s' (must be a non-negative integer)", tok.value);
             cfg_diag(ctx, DIAG_ERROR, DC_CONF_WIRE_CACHE_MAX_RECORDS, "Invalid wire-cache-max-records value '%s' (must be a non-negative integer)\n", tok.value);
             free(key); free_token(&tok); return -1;
           }
-          config->wire_cache_max_records = (uint32_t)v;
+          config->wire_cache_max_records = v;
           free_token(&tok);
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
@@ -9530,9 +9529,18 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   if (validate_database_config(ctx, config) != 0) return -1;
 
   // Inherit options.user as default program-user if unspecified
+  int program_zones = 0;
   for (view_config_t *v = config->views; v; v = v->next) {
     for (zone_config_t *z = v->zones; z; z = z->next) {
       if (z->type && strcasecmp(z->type, "program") == 0) {
+        /* 0.6.2: the manager supervises at most PLUG_MAX_ZONES plugins (dns_plugin_msg.h) */
+        if (++program_zones > PLUG_MAX_ZONES) {
+          syslog(LOG_ERR, "[Config] more than %d zones of type program (zone '%s')", PLUG_MAX_ZONES, z->domain ? z->domain : "");
+          cfg_diag(ctx, DIAG_ERROR, DC_CONF_ZONE_PROGRAM_COUNT, "more than %d zones of type program (zone '%s'); at most %d are supported\n",
+                   PLUG_MAX_ZONES, z->domain ? z->domain : "", PLUG_MAX_ZONES);
+          if (ctx) ctx->error_occurred = true;
+          return -1;
+        }
         if (!zext(z)->program_user && config->user) {
           zone_ext_t *zx = zone_ext_mut(z);
           if (!zx) return -1;

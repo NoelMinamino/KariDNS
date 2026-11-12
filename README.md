@@ -29,7 +29,7 @@ KariDNS is an authoritative DNS server designed for FreeBSD, developed in collab
 - **Authoritative Zone Roles & Formats:**
   - **Master (Primary) & Slave (Secondary):** Supports standard BIND-style zone files and djbdns/tinydns-style plain-text `data` files (`file-format tinydns;`). Supports AXFR (RFC 5936) and IXFR (RFC 1995) zone transfers, inbound and outbound NOTIFY (RFC 1996) with TSIG authentication.
   - **Forward Zones (`type forward`):** Transparent query forwarding to multiple upstream nameservers with per-zone timeouts, shared deadline budgeting, automatic failover, transaction ID randomization, and response verification.
-  - **Program Zone Plugins (`type program`):** Test-only dynamic external process-backed zones communicating over stdin/stdout pipes with strict privilege dropping and automatic circuit-breaker failure isolation. For IPC protocol specifications and multi-language implementation examples (Perl, Python, C, Rust, Go), see **[KariDNS: 'type program' Zone Guide](docs/KariDNS_how_to_use_type_program_zone.md)**.
+  - **Program Zone Plugins (`type program`):** Test-only dynamic external process-backed zones communicating over stdin/stdout pipes with strict privilege dropping, automatic circuit-breaker failure isolation, and restarts by the manager process (with backoff, and on reload when the settings change). For IPC protocol specifications and multi-language implementation examples (Perl, Python, C, Rust, Go), see **[KariDNS: 'type program' Zone Guide](docs/KariDNS_how_to_use_type_program_zone.md)**.
 - **Dynamic DNS Update:** Ephemeral DNS UPDATE handling (RFC 2136 / RFC 3007) with prerequisite evaluation and TSIG verification.
 - **DNSSEC Support (Static):** Serves pre-signed DNSSEC records (DNSKEY, RRSIG, NSEC, NSEC3, DS, CDS, CDNSKEY, CSYNC, etc.), with NSEC and NSEC3 denial-of-existence proofs. ZONEMD (RFC 8976) records are served like any other record; the server does not verify them, neither at load time nor after a zone transfer. `karicheck` verifies ZONEMD digests before a zone is published.
 - **Security & Rate Limiting:**
@@ -333,6 +333,13 @@ For complete packaging details and checksum verification, see the **[Distributio
 - **Libraries:** OpenSSL (`libcrypto`, `libssl`), `zlib`, `libidn2` (optional, for IDN support), `pthread`
 
 ### Compilation
+`./configure` finds the compiler and the libraries and writes `config.mk`, which `make` reads (details, options and what `make` does without it: [docs/building.md](docs/building.md)):
+```sh
+./configure                                  # --prefix, --sysconfdir, --with-db-drivers, --with-idn2, --with-openssl, --march, CC, CFLAGS, LDFLAGS; --help lists them
+make all
+```
+`make` alone still works on FreeBSD and Linux (BSD make and GNU make 4), as it always did; GNU make 3.81 (macOS) needs `./configure` first.
+
 To compile all utilities on FreeBSD (`karidns`, `dag`, `karictl`, `karicheck`):
 ```sh
 make all
@@ -349,7 +356,7 @@ To compile only the `dag` client (on Linux, macOS, Windows MSYS2, or FreeBSD):
 make dag
 ```
 
-The default build uses `-march=native`; use `make MARCH_FLAGS= ...` for a binary that runs on other CPUs of the same architecture.
+The default build uses `-march=native`; use `./configure --march=none` (or `make MARCH_FLAGS= ...`) for a binary that runs on other CPUs of the same architecture.
 
 ### Tests
 ```sh

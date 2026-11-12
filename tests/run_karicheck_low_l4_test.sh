@@ -12,7 +12,10 @@
 #   * two different CNAMEs / DNAMEs at one name, NSEC3 iterations above 150 (RFC 9276 3.2): the zone is refused
 #   * zone file syntax: unknown $ directive, $ORIGIN without a name, a line that starts with a blank before any record,
 #     \DDD above 255, \000 outside TXT, a bad entry in a tag definition
-#   * tinydns: a TTL that is not decimal digits, more than 4096 location lines
+#   * tinydns: a TTL that is not decimal digits, more than 4096 location lines; 0.6.2: the numeric RDATA fields (MX, SRV, NAPTR, SSHFP,
+#     the type of a generic line) are digits within the size of the field
+#   * 0.6.2: an $INCLUDE that is a symbolic link or a FIFO is refused (as the server refuses it), without waiting on the FIFO
+#   * 0.6.2: NSAP RDATA is "0x" and an even number of hex digits (RFC 1706 section 5)
 # Exit status contract as in run_karicheck_matrix_test.sh: 1 when at least one [ERROR] is reported, 0 otherwise.
 # The binary can be overridden with KARICHECK=/path/to/karicheck.
 # ==============================================================================
@@ -193,12 +196,47 @@ raw_zone tag_ok      0 "0 error(s)" "$ZHEAD
 td_case ttl_alpha   1 "Invalid TTL in tinydns record" '+www.example.com:192.0.2.10:abc'
 td_case ttl_signed  1 "Invalid TTL in tinydns record" '+www.example.com:192.0.2.10:-1'
 td_case ttl_ok      0 "0 error(s)" '+www.example.com:192.0.2.10:300'
+# 0.6.2 (audit: numeric RDATA fields): digits only and within the size of the field; strtoul read "10x" as 10 and "abc" as 0
+td_case mx_alpha    1 "Invalid MX distance in tinydns record" '@example.com:192.0.2.11:mx:10x'
+td_case mx_big      1 "Invalid MX distance in tinydns record" '@example.com:192.0.2.11:mx:65536'
+td_case mx_ok       0 "0 error(s)" '@example.com:192.0.2.11:mx:65535'
+td_case srv_port    1 "Invalid SRV port in tinydns record" 'S_sip._udp.example.com:192.0.2.12:sip.example.com:70000:1:2'
+td_case srv_weight  1 "Invalid SRV weight in tinydns record" 'S_sip._udp.example.com:192.0.2.12:sip.example.com:5060:w:2'
+td_case srv_prio    1 "Invalid SRV priority in tinydns record" 'S_sip._udp.example.com:192.0.2.12:sip.example.com:5060:1:-2'
+td_case srv_ok      0 "0 error(s)" 'S_sip._udp.example.com:192.0.2.12:sip.example.com:5060:1:2'
+td_case naptr_order 1 "Invalid NAPTR order in tinydns record" 'Nexample.com:1a:10:u:E2U+sip:!^.*$!sip\072info@example.com!:.'
+td_case naptr_pref  1 "Invalid NAPTR preference in tinydns record" 'Nexample.com:100:99999:u:E2U+sip:!^.*$!sip\072info@example.com!:.'
+td_case sshfp_alg   1 "Invalid SSHFP algorithm in tinydns record" "_host.example.com:256:1:$H20"
+td_case sshfp_type  1 "Invalid SSHFP fingerprint type in tinydns record" "_host.example.com:4:x:$H20"
+td_case gen_type    1 "Prohibited or invalid RR type in tinydns generic record" ':gen.example.com:16x:\003abc'
+td_case gen_big     1 "Prohibited or invalid RR type in tinydns generic record" ':gen.example.com:99999999999:\003abc'
+td_case gen_ok      0 "0 error(s)" ':gen.example.com:16:\003abc'
 i=0
 : > "$TMP/loc4097.txt"
 while [ $i -lt 4097 ]; do printf '%%l%d:10.%d.%d.0/24\n' "$i" $((i / 256)) $((i % 256)) >> "$TMP/loc4097.txt"; i=$((i + 1)); done
 td_case loc_4097    1 "Too many location lines" "$(cat "$TMP/loc4097.txt")"
 head -4096 "$TMP/loc4097.txt" > "$TMP/loc4096.txt"
 td_case loc_4096    0 "!Too many location lines" "$(cat "$TMP/loc4096.txt")"
+
+# ---- NSAP (0.6.2, found by fuzz_zone_text): RFC 1706 section 5, "0x" and an even number of hex digits ('.' for readability) ----------
+zone_case nsap_ok     0 "0 error(s)" 'osi NSAP 0x47.0005.80.005a00.0000.0001.e133.ffffff000161.00'
+zone_case nsap_dotx   1 "NSAP record requires 0x" 'osi NSAP 0.x47.0005.80.005a00.0000.0001.e133.ffffff000161.00'
+zone_case nsap_nox    0 "0 error(s)" 'osi NSAP 47000580005a0000000001e133ffffff00016100'   # (database rows written before 0.6.2)
+zone_case nsap_odd    1 "NSAP record requires 0x" 'osi NSAP 0x470'
+zone_case nsap_empty  1 "NSAP record requires 0x" 'osi NSAP 0x'
+zone_case nsap_bad    1 "NSAP record requires 0x" 'osi NSAP 0x47zz'
+
+# ---- $INCLUDE (0.6.2, audit M11): read as the server reads it ----------------------------------------------------------
+printf 'inc A 192.0.2.44\n' > "$TMP/real.inc"
+ln -s "$TMP/real.inc" "$TMP/link.inc"
+mkfifo "$TMP/fifo.inc"
+zone_case inc_ok      0 "0 error(s)" "\$INCLUDE real.inc"
+zone_case inc_symlink 1 "\$INCLUDE file could not be read" "\$INCLUDE link.inc"
+# a FIFO must not block the open (no writer comes): bounded with timeout(1) where there is one
+TO=""; command -v timeout >/dev/null 2>&1 && TO="timeout 20"
+f="$TMP/inc_fifo.zone"; printf '%s\n%s\n' "$ZHEAD" '$INCLUDE fifo.inc' > "$f"
+out=$($TO "$KC" zone z.example. "$f" 2>&1); rc=$?
+check "zone:inc_fifo" 1 "\$INCLUDE file could not be read" "$out" "$rc"
 
 echo "=== karicheck low batch L4: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]

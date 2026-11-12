@@ -155,8 +155,10 @@ export function zoneSettingsView(ctx, { params }) {
         try { views = (await api.get('/datasets')).datasets.find((d) => d.name === ds)?.views ?? []; } catch { /* the form is offered without views */ }
       }
       if (!alive) return;
-      fill(box, attributes(views), metaBox, global ? danger() : null);
-      loadMeta();
+      // the metadata are for the masters of the whole zone (the service answers 403 to a subdomain master)
+      const wholeZone = info.role !== 'subdomain_master';
+      fill(box, attributes(views), wholeZone ? metaBox : null, global ? danger() : null);
+      if (wholeZone) loadMeta();
     })();
     return { node: box, dispose() { alive = false; } };
   });

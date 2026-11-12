@@ -127,7 +127,8 @@ EOF
 echo "=== Starting KariDNS Server on port $PORT ==="
 "$KARIDNS" -f "$TMP_DIR/karidns.conf" > "$TMP_DIR/server.log" 2>&1 &
 SERVER_PID=$!
-sleep 1
+# wait until it answers, not a fixed second: the manager starts the plugin of the program zone first (0.6.2), slower on a loaded VM
+kari_wait_answer "$DAG" "$PORT" example.com 15 || echo "warning: the server did not answer within 15 s"
 
 # 1. Async Worker Pool Test (Task 1)
 echo "=== Task 1: Async Worker Pool Offloading ==="
