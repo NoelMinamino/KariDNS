@@ -233,17 +233,16 @@ export async function totp(ctx) {
 
 export async function password(ctx) {
   const { app, auth } = ctx;
-  const body = shape(ctx.body, { current: { type: 'string', required: true, min: 1, max: 1024, noControl: false }, new: { ...PASSWORD, required: true }, all: { type: 'bool' } });
+  const body = shape(ctx.body, { current: { type: 'string', required: true, min: 1, max: 1024, noControl: false }, new: { ...PASSWORD, required: true }, all: { type: 'bool' }, tokens: { type: 'bool' } });
   checkPassword(body.new, auth.principal.name);
   await reauth(ctx, body.current);
   const hash = await hashPassword(body.new, { ln: app.settings['scrypt-ln'] });
   await ctx.db(async (tx) => {
     await S.setPassword(tx, auth.principal.id, hash, app.now());
-    // all: the other sessions end and the person's API tokens are revoked (audit, 0.6.2: a token taken with the old password stayed valid)
-    if (body.all) {
-      await S.deleteSessionsOf(tx, auth.principal.id, auth.idHash);
-      await S.revokeTokensOf(tx, auth.principal.id, app.now());
-    }
+    if (body.all) await S.deleteSessionsOf(tx, auth.principal.id, auth.idHash);
+    // tokens: the person's API tokens are revoked as well (audit, 0.6.2: a token taken with the old password stayed valid); a choice of its
+    // own, as tokens are often used by automation that a password change need not stop
+    if (body.tokens) await S.revokeTokensOf(tx, auth.principal.id, app.now());
   }, { write: true });
   return { password: 'changed' };
 }

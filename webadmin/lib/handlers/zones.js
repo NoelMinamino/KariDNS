@@ -13,10 +13,14 @@ import { VERSION } from '../app.js';
 import { dataset, zoneParam, zoneGrants, page } from './common.js';
 import { grantView } from './auth.js';
 
+// A global master sees every dataset; anyone else the datasets it has a grant in (audit, 0.6.2: the names and the PostgreSQL schemas of the
+// other datasets were listed to everyone)
 export function datasets(ctx) {
   const { app } = ctx;
+  const gs = ctx.auth.grants;
+  const shown = isGlobal(gs) ? app.datasets : app.datasets.filter((d) => gs.some((g) => g.data_schema === d.schema));
   return {
-    datasets: app.datasets.map((d) => ({ name: d.name, driver: app.backend.dialect === 'pg' ? 'postgresql' : 'sqlite3', schema: d.schema || undefined, views: d.views })),
+    datasets: shown.map((d) => ({ name: d.name, driver: app.backend.dialect === 'pg' ? 'postgresql' : 'sqlite3', schema: d.schema || undefined, views: d.views })),
   };
 }
 

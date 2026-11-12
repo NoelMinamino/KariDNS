@@ -572,6 +572,11 @@ static bool record_content(const dns_record_t *r, dstr_t *out, long *prio, char 
         }
         return !out->oom;
     }
+    if (r->type_code == 22 && r->rdata_count == 1) {     /* NSAP: "0x" and the digits, the form of RFC 1706 section 5 */
+        ds_adds(out, "0x");
+        ds_adds(out, r->rdata[0]);
+        return !out->oom;
+    }
     int lead = zrows_blob_lead(r->type_code);
     for (int j = from; j < r->rdata_count; j++) {
         bool glue = lead >= 0 && j > lead;     /* a split blob is one token */

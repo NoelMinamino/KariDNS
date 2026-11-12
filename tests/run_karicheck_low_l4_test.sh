@@ -15,6 +15,7 @@
 #   * tinydns: a TTL that is not decimal digits, more than 4096 location lines; 0.6.2: the numeric RDATA fields (MX, SRV, NAPTR, SSHFP,
 #     the type of a generic line) are digits within the size of the field
 #   * 0.6.2: an $INCLUDE that is a symbolic link or a FIFO is refused (as the server refuses it), without waiting on the FIFO
+#   * 0.6.2: NSAP RDATA is "0x" and an even number of hex digits (RFC 1706 section 5)
 # Exit status contract as in run_karicheck_matrix_test.sh: 1 when at least one [ERROR] is reported, 0 otherwise.
 # The binary can be overridden with KARICHECK=/path/to/karicheck.
 # ==============================================================================
@@ -216,6 +217,14 @@ while [ $i -lt 4097 ]; do printf '%%l%d:10.%d.%d.0/24\n' "$i" $((i / 256)) $((i 
 td_case loc_4097    1 "Too many location lines" "$(cat "$TMP/loc4097.txt")"
 head -4096 "$TMP/loc4097.txt" > "$TMP/loc4096.txt"
 td_case loc_4096    0 "!Too many location lines" "$(cat "$TMP/loc4096.txt")"
+
+# ---- NSAP (0.6.2, found by fuzz_zone_text): RFC 1706 section 5, "0x" and an even number of hex digits ('.' for readability) ----------
+zone_case nsap_ok     0 "0 error(s)" 'osi NSAP 0x47.0005.80.005a00.0000.0001.e133.ffffff000161.00'
+zone_case nsap_dotx   1 "NSAP record requires 0x" 'osi NSAP 0.x47.0005.80.005a00.0000.0001.e133.ffffff000161.00'
+zone_case nsap_nox    0 "0 error(s)" 'osi NSAP 47000580005a0000000001e133ffffff00016100'   # (database rows written before 0.6.2)
+zone_case nsap_odd    1 "NSAP record requires 0x" 'osi NSAP 0x470'
+zone_case nsap_empty  1 "NSAP record requires 0x" 'osi NSAP 0x'
+zone_case nsap_bad    1 "NSAP record requires 0x" 'osi NSAP 0x47zz'
 
 # ---- $INCLUDE (0.6.2, audit M11): read as the server reads it ----------------------------------------------------------
 printf 'inc A 192.0.2.44\n' > "$TMP/real.inc"

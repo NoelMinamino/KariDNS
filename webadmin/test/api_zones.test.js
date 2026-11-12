@@ -24,9 +24,14 @@ const is = (r, status, type) => {
 };
 const names = (r) => r.body.rrsets.map((s) => `${s.name} ${s.type}`);
 
-test('datasets', withCast(async (d, { sub }) => {
+test('datasets', withCast(async (d, { root, sub }) => {
   const r = await sub('GET', '/datasets');
   assert.deepEqual(r.body.datasets, [{ name: 'main', driver: 'sqlite3', views: [] }]);
+  assert.deepEqual((await root('GET', '/datasets')).body.datasets.map((x) => x.name), ['main']);
+  // a principal without a grant in a dataset does not see it (audit, 0.6.2)
+  await d.makeUser('nogrant', 'nogrant password 1');
+  const none = d.as(await d.login('nogrant', 'nogrant password 1'));
+  assert.deepEqual((await none('GET', '/datasets')).body.datasets, []);
 }));
 
 test('the zone list: only the zones a principal has a grant on', withCast(async (d, { root, dom, sub }) => {

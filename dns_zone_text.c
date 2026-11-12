@@ -390,6 +390,11 @@ static const char *put_rdata(dzt_t *z, const dns_record_t *r) {
         return NULL;
     }
     if (r->rdata_count <= 0) return "no RDATA";
+    if (r->type_code == 22 && r->rdata_count == 1) {               /* NSAP: the parser keeps the bare digits; RFC 1706 section 5 writes "0x" */
+        out_adds(o, "0x");
+        out_adds(o, r->rdata[0]);
+        return NULL;
+    }
     int lead = zrows_blob_lead(r->type_code);
     for (int j = 0; j < r->rdata_count; j++) {
         if (j) out_addc(o, ' ');

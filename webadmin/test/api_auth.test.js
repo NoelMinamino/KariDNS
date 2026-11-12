@@ -295,15 +295,14 @@ test('the password: changing it asks for the old one', withDeploy({}, async (d) 
   assert.equal((await change({ current: 'dom password 12345', new: 'a new password 123', all: true })).status, 200);
   assert.equal((await d.as(a)('GET', '/auth/me')).status, 200);
   problem(await d.as(b)('GET', '/auth/me'), 401, 'unauthenticated');          // the other session ended
-  problem(await d.request('GET', '/auth/me', { token: tok }), 401, 'unauthenticated');   // and the API token was revoked (audit, 0.6.2)
+  assert.equal((await d.request('GET', '/auth/me', { token: tok })).status, 200, 'all alone keeps the API tokens');
   problem(await d.request('POST', '/auth/login', { body: { user: 'dom', password: 'dom password 12345' } }), 401, 'invalid-credentials');
   assert.equal((await d.login('dom', 'a new password 123')).status, 200);
-  // without all the other sessions and the tokens stay
+  // without all the other sessions stay; tokens revokes the API tokens (audit, 0.6.2), sessions or not
   const c = await d.login('dom', 'a new password 123');
-  const tok2 = (await d.as(a)('POST', '/tokens', { body: { name: 'ci2' } })).body.token;
-  assert.equal((await change({ current: 'a new password 123', new: 'yet another one 12' })).status, 200);
+  assert.equal((await change({ current: 'a new password 123', new: 'yet another one 12', tokens: true })).status, 200);
   assert.equal((await d.as(c)('GET', '/auth/me')).status, 200);
-  assert.equal((await d.request('GET', '/auth/me', { token: tok2 })).status, 200);
+  problem(await d.request('GET', '/auth/me', { token: tok }), 401, 'unauthenticated');
 }));
 
 test('API tokens: made once, used as bearer, read-only, revoked, expired, listed', withDeploy({}, async (d) => {

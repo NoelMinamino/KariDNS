@@ -2158,25 +2158,34 @@ PROCESS_RECORD:
     }
 
     if (rec->type_code == 22) { // NSAP
-      if (rec->rdata_count > 0) {
-        char *raw = rec->rdata[0];
-        // "0x" または "0X" で始まっていればスキップ
-        if (raw[0] == '0' && (raw[1] == 'x' || raw[1] == 'X')) {
-            raw += 2;
-        }
-        size_t len = strlen(raw);
-        char *clean = arena_alloc(arena, len + 1);
-        if (clean) {
-          size_t c_idx = 0;
-          for (size_t k = 0; k < len; k++) {
-            if (raw[k] != '.') { // ドットを除去
-              clean[c_idx++] = raw[k];
-            }
-          }
-          clean[c_idx] = '\0';
-          rec->rdata[0] = clean; // 正規化された純粋なHex文字列に置き換え
-        }
+      /* RFC 1706 §5: the RDATA is "0x" followed by the address in hex digits; "." may be put between digits for readability.  The
+       * text after the prefix must be hex digits and dots, an even number of digits: "0.x47..." failed the prefix check, its dots were
+       * taken out and hex_decode() skipped the 'x', which shifted the address by a nibble, and an odd last digit was dropped (found by
+       * fuzz_zone_text, 0.6.2).  The prefix itself stays optional (BIND requires it): the database rows karidns-zone wrote before 0.6.2
+       * hold the bare digits, and the writers (dns_zone_text.c, dns_zone_rows.c) put it in front now. */
+      const char *raw = rec->rdata_count == 1 ? rec->rdata[0] : NULL;
+      if (raw && raw[0] == '0' && (raw[1] == 'x' || raw[1] == 'X')) raw += 2;
+      size_t digits = 0;
+      bool ok = raw != NULL;
+      for (const char *p = ok ? raw : ""; ok && *p; p++) {
+        if (isxdigit((unsigned char)*p)) digits++;
+        else if (*p != '.') ok = false;
       }
+      if (!ok || digits == 0 || digits % 2 != 0) {
+        if (ctx && ctx->err_out) {
+          ctx->err_out->error_message = "NSAP record requires 0x and an even number of hex digits ('.' between them for readability; RFC 1706 section 5)";
+          ctx->err_out->error_offset = rec->type - buf;
+          ctx->err_out->token_length = strlen(rec->type);
+        }
+        return -1;
+      }
+      char *clean = arena_alloc(arena, digits + 1);
+      if (!clean) return -1;
+      size_t c_idx = 0;
+      for (const char *p = raw; *p; p++)
+        if (*p != '.') clean[c_idx++] = *p;   // ドットを除去
+      clean[c_idx] = '\0';
+      rec->rdata[0] = clean; // 正規化された純粋なHex文字列に置き換え
     } else if (rec->type_code == 1) { // A
         if (rec->rdata_count != 1) {
             if (ctx && ctx->err_out) {
