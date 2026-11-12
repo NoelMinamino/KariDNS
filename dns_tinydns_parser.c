@@ -841,7 +841,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             }
 
             unsigned long type_num = 0;
-            if (!tinydns_num_field(ctx, line_start, buf, f[1], flen[1], 65535, "Invalid type number in tinydns generic record (expected 1-65535)", &type_num))
+            if (!tinydns_num_field(ctx, line_start, buf, f[1], flen[1], 65535, "Prohibited or invalid RR type in tinydns generic record (expected a number from 1 to 65535)", &type_num))
                 return false;
             // 禁止タイプ検証 (0, NS=2, CNAME=5, SOA=6, PTR=12, MX=15) and every meta-type (OPT, TKEY, TSIG, IXFR, AXFR,
             // MAILB/MAILA, ANY, NXNAME): the same is_meta_rrtype() the master-file parser uses, so a meta-type can not be

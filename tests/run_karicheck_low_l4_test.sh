@@ -208,8 +208,8 @@ td_case naptr_order 1 "Invalid NAPTR order in tinydns record" 'Nexample.com:1a:1
 td_case naptr_pref  1 "Invalid NAPTR preference in tinydns record" 'Nexample.com:100:99999:u:E2U+sip:!^.*$!sip\072info@example.com!:.'
 td_case sshfp_alg   1 "Invalid SSHFP algorithm in tinydns record" "_host.example.com:256:1:$H20"
 td_case sshfp_type  1 "Invalid SSHFP fingerprint type in tinydns record" "_host.example.com:4:x:$H20"
-td_case gen_type    1 "Invalid type number in tinydns generic record" ':gen.example.com:16x:\003abc'
-td_case gen_big     1 "Invalid type number in tinydns generic record" ':gen.example.com:99999999999:\003abc'
+td_case gen_type    1 "Prohibited or invalid RR type in tinydns generic record" ':gen.example.com:16x:\003abc'
+td_case gen_big     1 "Prohibited or invalid RR type in tinydns generic record" ':gen.example.com:99999999999:\003abc'
 td_case gen_ok      0 "0 error(s)" ':gen.example.com:16:\003abc'
 i=0
 : > "$TMP/loc4097.txt"
