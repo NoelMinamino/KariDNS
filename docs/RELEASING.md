@@ -22,7 +22,7 @@ The file **`VERSION`** at the top of the source tree is the one source of the re
 From the top of the source tree:
 
 ```sh
-make set-version V=0.6.1          # or: sh tools/set_version.sh 0.6.1
+make set-version V=0.6.2          # or: sh tools/set_version.sh 0.6.2
 sh tests/run_version_test.sh
 git diff --stat                   # VERSION, signer/ and webadmin/ package.json and package-lock.json, webadmin/ui/js/version.js
 ```

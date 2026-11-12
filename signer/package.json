@@ -1,6 +1,6 @@
 {
   "name": "karidns-signer",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "KariDNS signer daemon: keeps the zones of a KariDNS database signed (orchestrates the BIND dnssec tools and karidns-zone)",
   "license": "MIT",
   "private": true,
