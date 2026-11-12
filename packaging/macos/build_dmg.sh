@@ -15,8 +15,9 @@ STAGE_DIR="$(mktemp -d -t dag-dmg-stage-XXXXXX)"
 
 if [ ! -f dag ]; then
     echo "==> Building dag binary for macOS (${ARCH}, version ${VERSION})..."
+    ./configure --march=none --with-db-drivers=none
     make clean || true
-    make VERSION="${VERSION}" MARCH_FLAGS= dag
+    make VERSION="${VERSION}" dag
 else
     echo "==> Using existing dag binary for macOS (${ARCH}, version ${VERSION})..."
 fi

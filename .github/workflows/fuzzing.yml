@@ -44,6 +44,7 @@ jobs:
 
             echo "::group::📦 [Build] Build all libFuzzer targets in parallel"
             NCPU=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+            ./configure
             make -j"$NCPU" fuzz_all
             echo "::endgroup::"
 

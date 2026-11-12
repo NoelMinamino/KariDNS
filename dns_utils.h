@@ -11,6 +11,13 @@
 #define KARIDNS_VERSION "dev"     /* the Makefile passes the number of the file VERSION (docs/RELEASING.md) */
 #endif
 
+/* The directory of the configuration files that the programs look in when they are not told where (karictl, karicheck, karidns-zone).
+ * ./configure --sysconfdir=DIR passes -DKARIDNS_SYSCONFDIR="DIR" (docs/building.md); a build without it uses the FreeBSD ports layout. */
+#ifndef KARIDNS_SYSCONFDIR
+#define KARIDNS_SYSCONFDIR "/usr/local/etc"
+#endif
+#define KARIDNS_CONFDIR KARIDNS_SYSCONFDIR "/karidns"
+
 #include <limits.h>
 #include <unistd.h>
 #include <sys/stat.h>

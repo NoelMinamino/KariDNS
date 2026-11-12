@@ -1981,7 +1981,7 @@ KARIDNS_TOOL_FN void print_usage(FILE *fp, const char *prog) {
     fprintf(fp, "error, 1: errors (or the check could not be run).  A single argument is a view unless it contains a '/' or ends in .conf.\n");
     fprintf(fp, "Examples:\n");
     fprintf(fp, "  %s db\n", prog);
-    fprintf(fp, "  %s db internal /usr/local/etc/karidns/karidns.conf\n", prog);
+    fprintf(fp, "  %s db internal " KARIDNS_CONFDIR "/karidns.conf\n", prog);
 }
 
 #if defined(KARIDNS_COVERAGE_LINKAGE) && !defined(main)
@@ -2023,9 +2023,9 @@ KARIDNS_TOOL_FN int kc_run(int argc, char **argv) {
     }
 
     const char *cmd = argv[1];
-    const char *default_config = "/usr/local/etc/karidns/karidns.conf";
-    if (access(default_config, F_OK) != 0 && access("/usr/local/etc/karidns.conf", F_OK) == 0) {
-        default_config = "/usr/local/etc/karidns.conf";
+    const char *default_config = KARIDNS_CONFDIR "/karidns.conf";
+    if (access(default_config, F_OK) != 0 && access(KARIDNS_SYSCONFDIR "/karidns.conf", F_OK) == 0) {
+        default_config = KARIDNS_SYSCONFDIR "/karidns.conf";
     }
 
     if (strcmp(cmd, "conf") == 0) {

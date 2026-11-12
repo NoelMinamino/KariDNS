@@ -1,18 +1,31 @@
 # Makefile for karidns & dag (FreeBSD, Linux, macOS)
 
+# ./configure writes config.mk (docs/building.md): the compiler, the flags, the libraries it found, DB_DRIVERS.  Each system probe below is a
+# NAME_PROBE != command (BSD make and GNU make 4) and NAME ?= $(NAME_PROBE), so that a build without configure behaves as it always did, and
+# with config.mk the probe results are not used: GNU make 3.81 (macOS) has no `!=` and needs config.mk.  A line of config.mk is overridden by
+# the command line (make DB_DRIVERS=...).  The DBLOADER_DRV_* and DBSQ_* lines further down are derived from DB_DRIVERS by `!=`
+# and are not in config.mk, so that a DB_DRIVERS on the command line is honoured.
+-include config.mk
+
 # OS-specific flags
-DARWIN_CFLAGS  != [ "`uname -s 2>/dev/null`" = "Darwin" ] && echo "-I`brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null || echo /usr/local/opt/openssl`/include" || echo "-I/usr/local/include"
-DARWIN_LDFLAGS != [ "`uname -s 2>/dev/null`" = "Darwin" ] && echo "-L`brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null || echo /usr/local/opt/openssl`/lib" || echo "-L/usr/local/lib"
+DARWIN_CFLAGS_PROBE != [ "`uname -s 2>/dev/null`" = "Darwin" ] && echo "-I`brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null || echo /usr/local/opt/openssl`/include" || echo "-I/usr/local/include"
+DARWIN_CFLAGS ?= $(DARWIN_CFLAGS_PROBE)
+DARWIN_LDFLAGS_PROBE != [ "`uname -s 2>/dev/null`" = "Darwin" ] && echo "-L`brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null || echo /usr/local/opt/openssl`/lib" || echo "-L/usr/local/lib"
+DARWIN_LDFLAGS ?= $(DARWIN_LDFLAGS_PROBE)
 
 # Hardening LDFLAGS (macOS & Windows ld do not support ELF -z options)
-HARDEN_LDFLAGS != case "`uname -s 2>/dev/null`" in Darwin) echo "-pie" ;; MINGW*|MSYS*|CYGWIN*) echo "" ;; *) echo "-pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack" ;; esac
+HARDEN_LDFLAGS_PROBE != case "`uname -s 2>/dev/null`" in Darwin) echo "-pie" ;; MINGW*|MSYS*|CYGWIN*) echo "" ;; *) echo "-pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack" ;; esac
+HARDEN_LDFLAGS ?= $(HARDEN_LDFLAGS_PROBE)
 
 # libidn2 detection (portable for BSD make & GNU make)
-IDN_CFLAGS != (pkg-config --exists libidn2 2>/dev/null && echo "-DHAVE_LIBIDN2 `pkg-config --cflags libidn2 2>/dev/null`") || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-DHAVE_LIBIDN2") || ([ -f /usr/include/idn2.h ] || [ -f /usr/local/include/idn2.h ] && echo "-DHAVE_LIBIDN2") || true
-IDN_LDFLAGS != [ -z "$(IDN_CFLAGS)" ] || (pkg-config --libs libidn2 2>/dev/null || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-L/usr/local/lib -lidn2") || ([ -f /usr/lib/libidn2.so ] || [ -f /usr/local/lib/libidn2.so ] || [ -f /usr/lib64/libidn2.so ] && echo "-lidn2")) || true
+IDN_CFLAGS_PROBE != (pkg-config --exists libidn2 2>/dev/null && echo "-DHAVE_LIBIDN2 `pkg-config --cflags libidn2 2>/dev/null`") || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-DHAVE_LIBIDN2") || ([ -f /usr/include/idn2.h ] || [ -f /usr/local/include/idn2.h ] && echo "-DHAVE_LIBIDN2") || true
+IDN_CFLAGS ?= $(IDN_CFLAGS_PROBE)
+IDN_LDFLAGS_PROBE != [ -z "$(IDN_CFLAGS)" ] || (pkg-config --libs libidn2 2>/dev/null || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-L/usr/local/lib -lidn2") || ([ -f /usr/lib/libidn2.so ] || [ -f /usr/local/lib/libidn2.so ] || [ -f /usr/lib64/libidn2.so ] && echo "-lidn2")) || true
+IDN_LDFLAGS ?= $(IDN_LDFLAGS_PROBE)
 
 # Windows / MinGW detection (static single-binary build)
-WIN_LDFLAGS != case "`uname -s 2>/dev/null`" in MINGW*|MSYS*|CYGWIN*) echo "-static -lws2_32 -liphlpapi -lcrypt32" ;; *) echo "" ;; esac
+WIN_LDFLAGS_PROBE != case "`uname -s 2>/dev/null`" in MINGW*|MSYS*|CYGWIN*) echo "-static -lws2_32 -liphlpapi -lcrypt32" ;; *) echo "" ;; esac
+WIN_LDFLAGS ?= $(WIN_LDFLAGS_PROBE)
 
 # Homebrew & standard paths for macOS (Apple Silicon /opt/homebrew & Intel /usr/local) and BSD; a plain assignment on purpose:
 # macOS make is GNU make 3.81, which has no `!=` (the paths that do not exist elsewhere are harmless)
@@ -21,7 +34,8 @@ BREW_LDFLAGS = -L/opt/homebrew/opt/openssl@3/lib -L/usr/local/opt/openssl@3/lib 
 
 # Version definition: the file VERSION is the one source of the release number (docs/RELEASING.md).  `make VERSION=x.y.z` still
 # overrides it for one build; `make set-version V=x.y.z` changes it and the files that cannot read it (package.json, the GUI).
-VERSION_FILE != { tr -d ' \r\n' < VERSION; } 2>/dev/null || echo dev
+VERSION_FILE_PROBE != { tr -d ' \r\n' < VERSION; } 2>/dev/null || echo dev
+VERSION_FILE ?= $(VERSION_FILE_PROBE)
 VERSION ?= $(VERSION_FILE)
 # every compile line passes it (the release flags, the unit tests, ASan, TSan, fuzzing, coverage): a build without it says "dev"
 VERSION_DEF = -DKARIDNS_VERSION=\"$(VERSION)\"
@@ -151,6 +165,7 @@ FUZZ_TAPSTAT_SRCS = tests/fuzz/fuzz_tapstat.c tools/tapstat_core.c tools/dnstap_
 FUZZ_DAG_TCP_REASSEMBLY_TARGET = tests/fuzz/fuzz_dag_tcp_reassembly
 FUZZ_DAG_TCP_REASSEMBLY_SRCS = tests/fuzz/fuzz_dag_tcp_reassembly.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_http.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
+.PHONY: distclean
 .PHONY: set-version tapstat_test karicheck-codelog test_coverage_sweep_tools-codelog all clean run fuzz zone2kdb karidns-dbloader karidns-dbloader-tsan karidns-dbloader-asan karidns-zone karidns-zone-asan dbloader-check-drivers db_sqlite3_test db_pgsql_test fuzz_core fuzz_query_engine fuzz_zone_image fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_pdns_content fuzz_pdns_metadata fuzz_db_checkline fuzz_json_escape fuzz_zone_text fuzz_zone_changes fuzz_db_logline fuzz_nsec3_rebuild fuzz_alias_response clean-fuzz asan tsan fuzz_tsig fuzz_dag fuzz_tsig_verify dag tools response_cache_test \
 	fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file \
 	fuzz_dag_replay_pcap_reader fuzz_dag_replay_diff fuzz_dag_tcp_reassembly \
@@ -501,9 +516,12 @@ zone2kdb: $(ZONE2KDB_SRCS)
 DB_DRIVERS ?= sqlite3
 # postgresql (B10): libpq, found with pkg-config, else pg_config (FreeBSD: databases/postgresqlNN-client, which installs
 # pg_config; Debian / Ubuntu: libpq-dev).  DBPG_HAVE is empty when neither finds it.
-DBPG_HAVE != { pkg-config --exists libpq || pg_config --version; } >/dev/null 2>&1 && echo yes || true
-DBPG_CFLAGS != pkg-config --cflags libpq 2>/dev/null || { d=$$(pg_config --includedir 2>/dev/null) && printf -- '-I%s' "$$d"; } || true
-DBPG_LIBS != pkg-config --libs libpq 2>/dev/null || { d=$$(pg_config --libdir 2>/dev/null) && printf -- '-L%s -lpq' "$$d"; } || printf -- '-lpq'
+DBPG_HAVE_PROBE != { pkg-config --exists libpq || pg_config --version; } >/dev/null 2>&1 && echo yes || true
+DBPG_HAVE ?= $(DBPG_HAVE_PROBE)
+DBPG_CFLAGS_PROBE != pkg-config --cflags libpq 2>/dev/null || { d=$$(pg_config --includedir 2>/dev/null) && printf -- '-I%s' "$$d"; } || true
+DBPG_CFLAGS ?= $(DBPG_CFLAGS_PROBE)
+DBPG_LIBS_PROBE != pkg-config --libs libpq 2>/dev/null || { d=$$(pg_config --libdir 2>/dev/null) && printf -- '-L%s -lpq' "$$d"; } || printf -- '-lpq'
+DBPG_LIBS ?= $(DBPG_LIBS_PROBE)
 DBLOADER_DRV_SRCS != for d in $(DB_DRIVERS); do case $$d in sqlite3) printf 'dns_db_sqlite3.c ' ;; postgresql) printf 'dns_db_pgsql.c ' ;; esac; done
 DBLOADER_DRV_CFLAGS != for d in $(DB_DRIVERS); do case $$d in sqlite3) printf -- '-DKARIDNS_DB_SQLITE3 ' ;; postgresql) printf -- '-DKARIDNS_DB_POSTGRESQL $(DBPG_CFLAGS) ' ;; esac; done
 DBLOADER_DRV_LIBS != for d in $(DB_DRIVERS); do case $$d in sqlite3) printf -- '-lsqlite3 ' ;; postgresql) printf -- '$(DBPG_LIBS) ' ;; esac; done
@@ -1430,6 +1448,10 @@ clean: clean-fuzz coverage-clean
 	rm -f $(UT_ASAN_BINS)
 	rm -f *.uta.o *.utn.o tests/*.uta.o tests/*.utn.o tools/*.uta.o tools/*.utn.o
 	rm -f tests/fi/kari_fi_preload.so
+
+# clean and the files ./configure wrote (docs/building.md)
+distclean: clean
+	rm -f config.mk config.log
 
 run: $(TARGET)
 	./$(TARGET)

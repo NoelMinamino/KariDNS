@@ -34,7 +34,7 @@ L=$(grep -n -E "VERSION = '[0-9]" signer/lib/*.js webadmin/lib/*.js node/lib/*.j
 [ -z "$L" ] && ok "signer and webadmin read their package.json" || bad "a Node module holds a number: $L"
 L=$(grep -n -E '^VERSION="\$\{1:-[0-9]' packaging/*/*.sh)
 [ -z "$L" ] && ok "the packaging scripts default to the file VERSION" || bad "a packaging script has a number of its own: $L"
-grep -Eq '^VERSION_FILE != .*< VERSION' Makefile && ok "the Makefile reads VERSION" || bad "the Makefile does not read the file VERSION"
+grep -Eq '^VERSION_FILE_PROBE != .*< VERSION' Makefile && ok "the Makefile reads VERSION" || bad "the Makefile does not read the file VERSION"
 
 # set_version.sh on a scratch copy
 T=$(mktemp -d "${TMPDIR:-/tmp}/karidns_version.XXXXXX") || exit 1
@@ -42,6 +42,7 @@ trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/tools" "$T/signer" "$T/webadmin/ui/js"
 cp tools/set_version.sh "$T/tools/"
 cp VERSION "$T/"
+printf 'CC = cc\nVERSION_FILE = 0.0.1\n' > "$T/config.mk"   # as ./configure writes it
 for p in signer webadmin; do cp "$p/package.json" "$p/package-lock.json" "$T/$p/"; done
 cp webadmin/ui/js/version.js "$T/webadmin/ui/js/"
 DEPS_BEFORE=$(versions "$T/webadmin/package-lock.json" | tail -n +3)
@@ -53,6 +54,7 @@ if sh "$T/tools/set_version.sh" 98.76.54 > "$T/out" 2>&1; then
     done
     [ "$(versions "$T/webadmin/package-lock.json" | tail -n +3)" = "$DEPS_BEFORE" ] && ok "set_version.sh leaves the dependencies' versions" || bad "set_version.sh changed a dependency's version"
     grep -q "^export const GUI_VERSION = '98.76.54';" "$T/webadmin/ui/js/version.js" && ok "set_version.sh writes version.js" || bad "set_version.sh did not write version.js: $(grep GUI_VERSION "$T/webadmin/ui/js/version.js")"
+    grep -qx "VERSION_FILE = 98.76.54" "$T/config.mk" && grep -qx "CC = cc" "$T/config.mk" && ok "set_version.sh keeps the VERSION_FILE of config.mk in step" || bad "set_version.sh did not update config.mk: $(cat "$T/config.mk")"
 else
     bad "set_version.sh 98.76.54 failed: $(cat "$T/out")"
 fi
