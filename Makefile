@@ -305,55 +305,57 @@ tools/dag_replay.o: tools/dag_replay.c tools/dag_replay.h tools/dag_pcap_l4.h to
 tools/karictl.o: tools/karictl.c
 	$(CC) $(CFLAGS) -c tools/karictl.c -o tools/karictl.o
 
-TEST_CIDR_SRCS = tests/test_cidr.c dns_cidr.c dns_tsig_acl.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c
-TEST_DBSTREAM_SRCS = tests/test_db_stream.c dns_db_stream.c dns_db_checkproto.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
-TEST_DB_REGISTRY_SRCS = tests/test_db_registry.c dns_db_install.c dns_db_stream.c $(PDNS_XFR_DEPS)
-TEST_ZONE_DIR_SRCS = tests/test_zone_dir.c $(PDNS_XFR_DEPS)
-TEST_PRESIGNED_SRCS = tests/test_presigned.c dns_zone_rows.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c $(PDNS_XFR_DEPS)
-TEST_ZONE_TEXT_SRCS = tests/test_zone_text.c dns_zone_render.c dns_zone_text.c dns_zone_rows.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c
-TEST_ZONE_IMPORT_BASE = tests/test_zone_import.c dns_zone_import.c dns_zone_changes.c dns_zone_export.c dns_zone_msg.c dns_zone_text.c dns_zone_rows.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_zone_lint.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c
-TEST_DB_SUPERVISOR_SRCS = tests/test_db_supervisor.c dns_db_supervisor.c dns_priv_sandbox.c dns_utils.c
-TEST_PDNS_READER_SRCS = tests/test_pdns_reader.c tests/db/zone2sql_lib.c dns_zone_rows.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c $(PDNS_XFR_DEPS)
-TEST_TINYDNS_SRCS = tests/test_tinydns_parser.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c
-TEST_ASAN_SRCS = tests/test_asan_overflow.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c
-TEST_CONF_SRCS = tests/test_conf_include.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c
-TEST_DNSDIAG_SRCS = tests/test_dns_diag.c
-TEST_CONFDIR_SRCS = tests/test_config_directives.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c
-TEST_ACLM_SRCS = tests/test_acl_match.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c
-TEST_LISTEN_SRCS = tests/test_listen_on.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c
-TEST_XFROPTS_SRCS = tests/test_xfr_opts.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c
-TEST_SRVSTMT_SRCS = tests/test_server_stmt.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c
-TEST_WIREHELP_SRCS = tests/test_wire_helpers.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c
-TEST_ZONEIMAGE_SRCS = tests/test_zone_image.c dns_zone_image.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c
-TEST_ZONEPATHS_SRCS = tests/test_zone_parser_paths.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c
-TEST_TINYPATHS_SRCS = tests/test_tinydns_paths.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c
-TEST_SIG0_SRCS = tests/test_sig0_sign.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c
-TEST_SNAPREBUILD_SRCS = tests/test_snapshot_rebuild.c dns_priv_sandbox.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_alias.c dns_rrl.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c
-TEST_HASH_SRCS = tests/test_hash_table.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c
-TEST_EPOCH_RCU_SRCS = tests/test_epoch_rcu.c dns_epoch_rcu.c
-TEST_DNSTAP_SRCS = tests/test_dnstap_engine.c dns_dnstap.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c
-TEST_EDNS_ECS_SRCS = tests/test_edns_ecs_engine.c dns_edns_ecs.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_zone_image.c
-TEST_RFC_VECTORS_SRCS = tests/test_rfc_vectors.c dns_edns_ecs.c dns_rrl.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_zone_image.c
-TEST_DYN_UPDATE_SRCS = tests/test_dynamic_update_engine.c dns_dynamic_update.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_axfr_ixfr.c dns_zone_image.c
-TEST_AXFR_IXFR_SRCS = tests/test_axfr_ixfr_engine.c dns_axfr_ixfr.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_zone_image.c
-TEST_RRL_SRCS = tests/test_rrl_engine.c dns_rrl.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c
-TEST_QUERY_EXP_SRCS = tests/test_query_engine_expanded.c dns_query_engine.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c
-TEST_DNSSECPROOFS_SRCS = tests/test_dnssec_proofs.c dns_query_engine.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c
-TEST_QEPROTO_SRCS = tests/test_query_engine_protocol.c dns_query_engine.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c
+TEST_CIDR_SRCS = tests/test_cidr.c dns_cidr.c dns_tsig_acl.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c $(TEST_SYSLOG_QUIET)
+TEST_DBSTREAM_SRCS = tests/test_db_stream.c dns_db_stream.c dns_db_checkproto.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c $(TEST_SYSLOG_QUIET)
+# 0.6.2: the quiet syslog() of the unit tests (tests/test_syslog_quiet.c): their error paths do not fill the system log
+TEST_SYSLOG_QUIET = tests/test_syslog_quiet.c
+TEST_DB_REGISTRY_SRCS = tests/test_db_registry.c dns_db_install.c dns_db_stream.c $(PDNS_XFR_DEPS) $(TEST_SYSLOG_QUIET)
+TEST_ZONE_DIR_SRCS = tests/test_zone_dir.c $(PDNS_XFR_DEPS) $(TEST_SYSLOG_QUIET)
+TEST_PRESIGNED_SRCS = tests/test_presigned.c dns_zone_rows.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c $(PDNS_XFR_DEPS) $(TEST_SYSLOG_QUIET)
+TEST_ZONE_TEXT_SRCS = tests/test_zone_text.c dns_zone_render.c dns_zone_text.c dns_zone_rows.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_ZONE_IMPORT_BASE = tests/test_zone_import.c dns_zone_import.c dns_zone_changes.c dns_zone_export.c dns_zone_msg.c dns_zone_text.c dns_zone_rows.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_zone_lint.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c $(TEST_SYSLOG_QUIET)
+TEST_DB_SUPERVISOR_SRCS = tests/test_db_supervisor.c dns_db_supervisor.c dns_priv_sandbox.c dns_utils.c $(TEST_SYSLOG_QUIET)
+TEST_PDNS_READER_SRCS = tests/test_pdns_reader.c tests/db/zone2sql_lib.c dns_zone_rows.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c $(PDNS_XFR_DEPS) $(TEST_SYSLOG_QUIET)
+TEST_TINYDNS_SRCS = tests/test_tinydns_parser.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_ASAN_SRCS = tests/test_asan_overflow.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_CONF_SRCS = tests/test_conf_include.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_DNSDIAG_SRCS = tests/test_dns_diag.c $(TEST_SYSLOG_QUIET)
+TEST_CONFDIR_SRCS = tests/test_config_directives.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_ACLM_SRCS = tests/test_acl_match.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_LISTEN_SRCS = tests/test_listen_on.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_XFROPTS_SRCS = tests/test_xfr_opts.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_SRVSTMT_SRCS = tests/test_server_stmt.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_WIREHELP_SRCS = tests/test_wire_helpers.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_ZONEIMAGE_SRCS = tests/test_zone_image.c dns_zone_image.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_ZONEPATHS_SRCS = tests/test_zone_parser_paths.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_TINYPATHS_SRCS = tests/test_tinydns_paths.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_SIG0_SRCS = tests/test_sig0_sign.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_SNAPREBUILD_SRCS = tests/test_snapshot_rebuild.c dns_priv_sandbox.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_alias.c dns_rrl.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_HASH_SRCS = tests/test_hash_table.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_EPOCH_RCU_SRCS = tests/test_epoch_rcu.c dns_epoch_rcu.c $(TEST_SYSLOG_QUIET)
+TEST_DNSTAP_SRCS = tests/test_dnstap_engine.c dns_dnstap.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_EDNS_ECS_SRCS = tests/test_edns_ecs_engine.c dns_edns_ecs.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_RFC_VECTORS_SRCS = tests/test_rfc_vectors.c dns_edns_ecs.c dns_rrl.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_DYN_UPDATE_SRCS = tests/test_dynamic_update_engine.c dns_dynamic_update.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_AXFR_IXFR_SRCS = tests/test_axfr_ixfr_engine.c dns_axfr_ixfr.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_RRL_SRCS = tests/test_rrl_engine.c dns_rrl.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_QUERY_EXP_SRCS = tests/test_query_engine_expanded.c dns_query_engine.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_DNSSECPROOFS_SRCS = tests/test_dnssec_proofs.c dns_query_engine.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_QEPROTO_SRCS = tests/test_query_engine_protocol.c dns_query_engine.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
 RESPONSE_CACHE_TEST_SRCS = tests/test_response_cache.c dns_query_engine.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c
 VULN_TEST_SRCS = tests/test_vulnerability_fixes.c dns_query_engine.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c
 
-TEST_CATALOG_SRCS = tests/test_catalog_zone_engine.c dns_catalog_zone.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c
-TEST_SANDBOX_SRCS = tests/test_snapshot_sandbox_engine.c dns_priv_sandbox.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_alias.c dns_rrl.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c
-TEST_DAG_ITER_SRCS = tests/test_dag_iter.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
-TEST_DAGFORMAT_SRCS = tests/test_dag_format.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_tsig_acl.c
-TEST_COV_SWEEP_SRCS = tests/test_coverage_sweep.c dns_query_engine.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c
-TEST_COV_SWEEP_NET_SRCS = tests/test_coverage_sweep_net.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_tsig_acl.c
-TEST_COV_SWEEP_TOOLS_SRCS = tests/test_coverage_sweep_tools.c tests/test_coverage_sweep_karictl_main.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_zone_lint.c dns_db_checkproto.c
-TEST_COV_SWEEP_DAG_SRCS = tests/test_coverage_sweep_dag.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_tsig_acl.c
-TEST_DAGREASM_SRCS = tests/test_dag_reassembly.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c
-TEST_DAG_TOOLS_SRCS = tests/test_dag_tools.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_tsig_client.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_transport.c tools/dag_http.c dns_zone_parser.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_wire.c dns_utils.c
-TEST_SERVER_CORE_SRCS = tests/test_server_core.c dns_server_core.c dns_log.c dns_db_stream.c dns_db_ingest.c dns_park.c dns_db_install.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c
+TEST_CATALOG_SRCS = tests/test_catalog_zone_engine.c dns_catalog_zone.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_SANDBOX_SRCS = tests/test_snapshot_sandbox_engine.c dns_priv_sandbox.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_alias.c dns_rrl.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_DAG_ITER_SRCS = tests/test_dag_iter.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c $(TEST_SYSLOG_QUIET)
+TEST_DAGFORMAT_SRCS = tests/test_dag_format.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_COV_SWEEP_SRCS = tests/test_coverage_sweep.c dns_query_engine.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_COV_SWEEP_NET_SRCS = tests/test_coverage_sweep_net.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_COV_SWEEP_TOOLS_SRCS = tests/test_coverage_sweep_tools.c tests/test_coverage_sweep_karictl_main.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_zone_lint.c dns_db_checkproto.c $(TEST_SYSLOG_QUIET)
+TEST_COV_SWEEP_DAG_SRCS = tests/test_coverage_sweep_dag.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_DAGREASM_SRCS = tests/test_dag_reassembly.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c $(TEST_SYSLOG_QUIET)
+TEST_DAG_TOOLS_SRCS = tests/test_dag_tools.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_tsig_client.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_transport.c tools/dag_http.c dns_zone_parser.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_wire.c dns_utils.c $(TEST_SYSLOG_QUIET)
+TEST_SERVER_CORE_SRCS = tests/test_server_core.c dns_server_core.c dns_log.c dns_db_stream.c dns_db_ingest.c dns_park.c dns_db_install.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
 
 FI_WRAP_LDFLAGS  = -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=strdup -Wl,--wrap=strndup -Wl,--wrap=posix_memalign
 FI_WRAP_LDFLAGS += -Wl,--wrap=open -Wl,--wrap=openat -Wl,--wrap=fopen -Wl,--wrap=read -Wl,--wrap=write -Wl,--wrap=send -Wl,--wrap=sendto -Wl,--wrap=recv -Wl,--wrap=recvfrom
@@ -366,12 +368,12 @@ FI_WRAP_SSL_LDFLAGS = -Wl,--wrap=SSL_CTX_new -Wl,--wrap=SSL_connect -Wl,--wrap=S
 
 FI_COMMON_SRCS = tests/fi/kari_fi.c
 
-TEST_FI_PARSERS_SRCS = tests/test_fi_parsers.c $(FI_COMMON_SRCS) dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c
-TEST_FI_WIRE_SRCS = tests/test_fi_wire.c $(FI_COMMON_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c
-TEST_FI_SNAPSHOT_SRCS = tests/test_fi_snapshot.c $(FI_COMMON_SRCS) dns_priv_sandbox.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_alias.c dns_rrl.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c
-TEST_FI_XFR_SRCS = tests/test_fi_xfr.c $(FI_COMMON_SRCS) dns_axfr_ixfr.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_zone_image.c
-TEST_FI_MISC_SRCS = tests/test_fi_misc.c $(FI_COMMON_SRCS) dns_dynamic_update.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_axfr_ixfr.c dns_zone_image.c
-TEST_FI_DAG_SRCS = tests/test_fi_dag.c $(FI_COMMON_SRCS) $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_tsig_acl.c
+TEST_FI_PARSERS_SRCS = tests/test_fi_parsers.c $(FI_COMMON_SRCS) dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_FI_WIRE_SRCS = tests/test_fi_wire.c $(FI_COMMON_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
+TEST_FI_SNAPSHOT_SRCS = tests/test_fi_snapshot.c $(FI_COMMON_SRCS) dns_priv_sandbox.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_alias.c dns_rrl.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_FI_XFR_SRCS = tests/test_fi_xfr.c $(FI_COMMON_SRCS) dns_axfr_ixfr.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_FI_MISC_SRCS = tests/test_fi_misc.c $(FI_COMMON_SRCS) dns_dynamic_update.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_FI_DAG_SRCS = tests/test_fi_dag.c $(FI_COMMON_SRCS) $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
 
 test_db_stream: $(TEST_DBSTREAM_SRCS)
 	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DBSTREAM_SRCS) -o test_db_stream $(LDFLAGS) -lcrypto
@@ -396,7 +398,7 @@ test_zone_dir-tsan: $(TEST_ZONE_DIR_SRCS)
 	$(CC) $(TSAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_ZONE_DIR_SRCS) -o $@ $(TSAN_LDFLAGS) -lcrypto -lpthread -lm
 
 # D1a milestone 2: the park table, the wake rings and the fetch rings (dns_park.c)
-TEST_PARK_SRCS = tests/test_park.c dns_park.c
+TEST_PARK_SRCS = tests/test_park.c dns_park.c $(TEST_SYSLOG_QUIET)
 
 test_park: $(TEST_PARK_SRCS)
 	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_PARK_SRCS) -o test_park $(LDFLAGS) -lpthread
@@ -414,7 +416,7 @@ test_park-tsan: $(TEST_PARK_SRCS)
 	$(CC) $(TSAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_PARK_SRCS) -o $@ $(TSAN_LDFLAGS) -lpthread
 
 # the Backend side of the fetch stream: the real ingest thread, the test is the loader (needs the whole server core, like test_server_core)
-TEST_DB_FETCH_SRCS = $(TEST_SERVER_CORE_SRCS:tests/test_server_core.c=tests/test_db_fetch.c)
+TEST_DB_FETCH_SRCS = $(TEST_SERVER_CORE_SRCS:tests/test_server_core.c=tests/test_db_fetch.c) $(TEST_SYSLOG_QUIET)
 
 test_db_fetch: $(TEST_DB_FETCH_SRCS)
 	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DB_FETCH_SRCS) -o test_db_fetch $(LDFLAGS) -lcrypto -lpthread -lm
@@ -440,7 +442,7 @@ test_pdns_reader-tsan: $(TEST_PDNS_READER_SRCS)
 	$(CC) $(TSAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_PDNS_READER_SRCS) -o $@ $(TSAN_LDFLAGS) -lcrypto -lpthread -lm
 
 # a worker parks a UDP query for a zone that is not in memory and answers it later (udp_one(), park_service() of dns_server_core.c)
-TEST_PARK_WORKER_SRCS = $(TEST_SERVER_CORE_SRCS:tests/test_server_core.c=tests/test_park_worker.c)
+TEST_PARK_WORKER_SRCS = $(TEST_SERVER_CORE_SRCS:tests/test_server_core.c=tests/test_park_worker.c) $(TEST_SYSLOG_QUIET)
 
 test_park_worker: $(TEST_PARK_WORKER_SRCS)
 	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_PARK_WORKER_SRCS) -o test_park_worker $(LDFLAGS) -lcrypto -lpthread -lm
@@ -546,7 +548,7 @@ karidns-zone: dbloader-check-drivers $(KARIDNS_ZONE_SRCS) $(KARIDNS_ZONE_HDRS)
 karidns-zone-asan: dbloader-check-drivers $(KARIDNS_ZONE_SRCS) $(KARIDNS_ZONE_HDRS)
 	$(CC) $(ASAN_CFLAGS) $(DBLOADER_DRV_CFLAGS) -I. $(KARIDNS_ZONE_SRCS) -o karidns-zone-asan $(LDFLAGS) -pthread -lcrypto $(DBLOADER_DRV_LIBS)
 
-TEST_DB_SQLITE3_SRCS = tests/test_db_sqlite3.c dns_db_sqlite3.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_db_checkproto.c dns_zone_lint.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c
+TEST_DB_SQLITE3_SRCS = tests/test_db_sqlite3.c dns_db_sqlite3.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_db_checkproto.c dns_zone_lint.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c $(TEST_SYSLOG_QUIET)
 
 test_db_sqlite3: $(TEST_DB_SQLITE3_SRCS) karidns_dbloader.c dns_db_driver.h
 	$(CC) $(CFLAGS) $(DBSQ_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DB_SQLITE3_SRCS) -o test_db_sqlite3 $(LDFLAGS) -lcrypto -lpthread -lm $(DBSQ_LIBS)
@@ -556,7 +558,7 @@ db_sqlite3_test: test_db_sqlite3
 
 # B10: the unit test of the PostgreSQL driver includes the driver source (it tests static helpers too).  Without libpq nothing
 # is built and the test reports SKIP; without a reachable server the binary reports SKIP (KARIDNS_TEST_PG, tests/db/pg_lib.sh).
-TEST_DB_PGSQL_SRCS = tests/test_db_pgsql.c
+TEST_DB_PGSQL_SRCS = tests/test_db_pgsql.c $(TEST_SYSLOG_QUIET)
 
 test_db_pgsql: $(TEST_DB_PGSQL_SRCS) dns_db_pgsql.c dns_db_driver.h
 	@if [ -z "$(DBPG_HAVE)" ]; then echo "SKIP: libpq is not installed (test_db_pgsql is not built)"; rm -f test_db_pgsql; exit 0; fi; \
@@ -710,7 +712,7 @@ epoch_rcu_test: test_epoch_rcu
 test_epoch_rcu-tsan: $(TEST_EPOCH_RCU_SRCS)
 	$(CC) $(TSAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_EPOCH_RCU_SRCS) -o $@ $(TSAN_LDFLAGS) -lpthread
 
-TEST_TAPSTAT_SRCS = tests/test_tapstat.c tools/tapstat_core.c tools/dnstap_decode.c
+TEST_TAPSTAT_SRCS = tests/test_tapstat.c tools/tapstat_core.c tools/dnstap_decode.c $(TEST_SYSLOG_QUIET)
 test_tapstat: $(TEST_TAPSTAT_SRCS)
 	$(CC) $(CFLAGS) -I. $(TEST_TAPSTAT_SRCS) -o test_tapstat $(LDFLAGS)
 
