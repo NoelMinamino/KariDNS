@@ -6842,18 +6842,65 @@ bool ensure_priv_dir_safe(const char *dir_buf) {
  * directory of the pid file or of the control socket (ensure_priv_dir_safe()): with both in one directory such a start worked once and the
  * next one was refused.  A root-owned directory that was there keeps working as before.  Only as root (the directories are compared by device
  * and inode; nothing is opened or changed). */
+/* 0.7: true when the directory `anc` is a strict ancestor of the directory `dir`, or, when `dir` does not exist yet, `anc` is its parent or
+ * above it (ensure_priv_dir_safe() makes `dir` in its parent; a parent that does not exist either fails there).  It walks up from the
+ * directory itself with openat(fd, "..") and compares device and inode, so symlinks and ".." in `dir` cannot hide the relation; it stops at
+ * "/" (or at the root of a jail or chroot), where ".." is the directory itself.  Only refuses a start: nothing is opened for use or changed. */
+STATIC_TEST bool dir_is_below(const char *dir, const struct stat *anc) {
+  int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  bool self = false;                              /* the directory in hand counts too (the parent of a `dir` still to be made) */
+  if (fd < 0) {
+    char parent[PATH_MAX], leaf[PATH_MAX];
+    if (errno != ENOENT || !split_path_for_openat(dir, parent, sizeof(parent), leaf, sizeof(leaf))) return false;
+    if ((fd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) < 0) return false;
+    self = true;
+  }
+  struct stat cur;
+  bool below = false;
+  if (fstat(fd, &cur) == 0) {
+    for (int depth = 0; depth < PATH_MAX / 2; depth++) {   /* (a bound: every step names at least "x/") */
+      if (self && cur.st_dev == anc->st_dev && cur.st_ino == anc->st_ino) {
+        below = true;
+        break;
+      }
+      int up = openat(fd, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      close(fd);
+      fd = up;
+      struct stat next;
+      if (fd < 0 || fstat(fd, &next) != 0 || (next.st_dev == cur.st_dev && next.st_ino == cur.st_ino)) break;
+      cur = next;
+      self = true;
+    }
+  }
+  if (fd >= 0) close(fd);
+  return below;
+}
+
 STATIC_TEST bool startup_dir_shared_with_log(const char *path, const char *what) {
   char dir[PATH_MAX], base[PATH_MAX];
   struct stat ds;
   const char *slash = path ? strrchr(path, '/') : NULL;
   /* (as in main(): a name without a directory, or in "/", gets no ensure_priv_dir_safe() check either) */
-  if (geteuid() != 0 || !slash || slash == path || !split_path_for_openat(path, dir, sizeof(dir), base, sizeof(base)) || stat(dir, &ds) != 0) return false;
+  if (geteuid() != 0 || !slash || slash == path || !split_path_for_openat(path, dir, sizeof(dir), base, sizeof(base))) return false;
+  bool have_dir = stat(dir, &ds) == 0;            /* (ensure_priv_dir_safe() makes it after this check when it is not there yet) */
   for (log_channel_t *ch = log_runtime_current_channels(); ch; ch = ch->next) {
     char ldir[PATH_MAX], lbase[PATH_MAX];
     struct stat ls;
     if (ch->dest != LOGDEST_FILE || !ch->file_path || !split_path_for_openat(ch->file_path, ldir, sizeof(ldir), lbase, sizeof(lbase)) ||
-        stat(ldir, &ls) != 0 || ls.st_dev != ds.st_dev || ls.st_ino != ds.st_ino)
+        stat(ldir, &ls) != 0)
       continue;
+    if (!have_dir || ls.st_dev != ds.st_dev || ls.st_ino != ds.st_ino) {
+      /* a log directory this start made above the pid file / control socket directory: the run user gets it at the hand-off and could rename
+       * the root-owned directory in it away and put one of its own there.  One that was there before is used as before. */
+      if (!log_dir_was_created(ldir) || !dir_is_below(dir, &ls)) continue;
+      syslog(LOG_ERR, "[Startup] Refusing to start: the directory '%s' of the log file '%s', made by this start, contains the %s directory '%s'; "
+                      "the run user writes to a log directory, and could replace the %s directory in it: put the log files in a directory of their "
+                      "own that is not above it", ldir, ch->file_path, what, dir, what);
+      fprintf(stderr, "[ERROR] Refusing to start: the directory '%s' of the log file '%s', made by this start, contains the %s directory '%s'; "
+                      "the run user writes to a log directory, and could replace the %s directory in it: put the log files in a directory of their "
+                      "own that is not above it\n", ldir, ch->file_path, what, dir, what);
+      return true;
+    }
     if (!log_dir_was_created(ldir) && ds.st_uid == 0 && !(ds.st_mode & (S_IWGRP | S_IWOTH))) continue;
     syslog(LOG_ERR, "[Startup] Refusing to start: the %s directory '%s' is also the directory of the log file '%s'; the run user writes to a "
                     "log directory, and must not be able to write to the %s directory: put the log files in a directory of their own", what, dir,

@@ -1525,6 +1525,7 @@ bool control_socket_in_use(const char *path);
 bool ctl_bound_set(int dir_fd, const char *name);
 void ctl_bound_unlink(void);
 void ctl_bound_forget(void);
+bool dir_is_below(const char *dir, const struct stat *anc);
 bool startup_dir_shared_with_log(const char *path, const char *what);
 bool daemonize(void);
 void setup_ipc_tables(int num_workers);

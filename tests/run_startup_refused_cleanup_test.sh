@@ -15,6 +15,9 @@
 #   5  a second instance against a running server is refused and the first one keeps answering on its socket
 #   6  a log directory the start would make that is also the pid file / control socket directory: refused before anything is bound, the
 #      reason on stderr, again at the next start; a root-owned directory that was there is used as before
+#   7  a log directory the start makes above the pid file / control socket directory (its parent, a grandparent, through a symlink or
+#      ".."): refused before the directory is made, the reason on stderr, the log directories the run user's; with the pid file / socket
+#      moved out the next start works; a root-owned log directory that was there above them is used as before
 # Needs root (the run user is nobody) and a C compiler for the shim.  SKIP otherwise.
 # ==============================================================================
 . "$(dirname "$0")/lib_proc.sh"
@@ -59,19 +62,22 @@ printf '$TTL 300\n@ SOA ns host 1 2 3 4 5\n@ NS ns\nns A 192.0.2.1\n' > "$T/file
 owner() { stat -f %Su "$1" 2>/dev/null; }
 
 # mkcase NAME [LOGDIR PIDDIR CTLDIR]: $T/NAME.conf; by default the log file is in a directory the start makes ($T/NAME/logs/new), the pid
-# file in $T/NAME/pid and the socket in $T/NAME/ctl (both root's, 0755, each with a file "keep" from before; not made when it is LOGDIR);
-# allow-group nobody
+# file in $T/NAME/pid and the socket in $T/NAME/ctl (both root's, 0755, each with a file "keep" from before; not made when it is LOGDIR,
+# below it or in $NOMK); allow-group nobody; $LOG2: a second log file (channel b)
 mkcase() {
     C="$T/$1"
     LOGDIR="${2:-$C/logs/new}"; PIDDIR="${3:-$C/pid}"; CTLDIR="${4:-$C/ctl}"
     mkdir -p "$C/logs"; chmod 755 "$C" "$C/logs"
     for d in "$PIDDIR" "$CTLDIR"; do
-        [ "$d" = "$LOGDIR" ] || { mkdir -p "$d"; chmod 755 "$d"; : > "$d/keep"; }
+        case " $LOGDIR ${NOMK:-} " in *" $d "*) continue ;; esac; case "$d" in "$LOGDIR"/*) continue ;; esac
+        mkdir -p "$d"; chmod 755 "$d"; : > "$d/keep"
     done
+    B_CH=""; B_USE=""
+    [ -n "${LOG2:-}" ] && { B_CH="channel b { file \"$LOG2\"; severity info; }; "; B_USE=" b;"; }
     cat > "$T/$1.conf" <<EOF
 options { user "nobody"; group "nobody"; directory "$T/dir"; pid-file "$PIDDIR/k.pid"; listen-on { 127.0.0.1; }; port $PORT; };
 control-channel { socket "$CTLDIR/ctl.sock"; algorithm hmac-sha256; secret "$SECRET"; allow-group "nobody"; };
-logging { channel a { file "$LOGDIR/a.log"; severity info; }; category default { a; }; category general { a; }; };
+logging { channel a { file "$LOGDIR/a.log"; severity info; }; ${B_CH}category default { a;${B_USE} }; category general { a; }; };
 zone "file.test" { type primary; file "$T/file.zone"; };
 EOF
     printf 'socket "%s/ctl.sock";\nkey "karictl" { algorithm hmac-sha256; secret "%s"; };\n' "$CTLDIR" "$SECRET" > "$T/$1.ctl"
@@ -198,6 +204,49 @@ next_start c6c
 next_start c6c
 [ "$(owner "$T/c6c/pre")" = root ] && pass "c6c: a root-owned directory that was there is used as before (twice), and stays root's" ||
     fail "c6c: $(ls -ld "$T/c6c/pre")"
+
+# ================================================================ 7: a log directory the start makes above the pid file / control socket directory
+echo "== 7: a log directory the start makes that contains the pid file or control socket directory"
+# refused_above NAME WHAT DIR LDIR LFILE: refused (exit 1) with the reason; DIR (the pid file / socket directory) was not made, no pid file, no
+# socket; the log directory and file the start made are the run user's
+refused_above() {
+    bounded "$T/$1.out" "$BIN/karidns" -c "$T/$1.conf" -f; rc=$RC
+    [ $rc -eq 1 ] && grep -qF "the directory '$4' of the log file '$5', made by this start, contains the $2 directory '$3'" "$T/$1.out" &&
+        pass "$1: refused (exit 1), the reason on stderr" || fail "$1: rc $rc: $(tail -3 "$T/$1.out")"
+    [ ! -e "$3" ] && [ ! -e "$PIDDIR/k.pid" ] && [ ! -e "$CTLDIR/ctl.sock" ] && pass "$1: the $2 directory was not made, no pid file, no socket" ||
+        fail "$1: $(ls -la "$3" "$PIDDIR" "$CTLDIR" 2>&1)"
+    [ "$(owner "$4")" = nobody ] && [ "$(owner "$5")" = nobody ] && [ "$(owner "$LOGDIR")" = nobody ] && [ "$(owner "$LOGDIR/a.log")" = nobody ] &&
+        pass "$1: the log directory and file the start made are the run user's" || fail "$1: $(ls -ld "$4" "$5" "$LOGDIR" "$LOGDIR/a.log" 2>&1)"
+}
+L="$T/c7a/logs/new"
+mkcase c7a "$L" "$L/run"                               # the parent of the pid file directory
+refused_above c7a "pid file" "$L/run" "$L" "$L/a.log"
+mkcase c7a "$L"                                        # corrected: the pid file in a directory of its own
+next_start c7a
+L="$T/c7b/logs/new"
+mkcase c7b "$L" "" "$L/ctl"                            # the parent of the control socket directory
+refused_above c7b "control socket" "$L/ctl" "$L" "$L/a.log"
+mkcase c7b "$L"
+next_start c7b
+L="$T/c7c/logs/new"                                    # a grandparent: logs/new (b.log) and logs/new/a (a.log) are both made by the start
+LOG2="$L/b.log"; mkcase c7c "$L/a" "$L/a/run"
+refused_above c7c "pid file" "$L/a/run" "$L" "$L/b.log"
+mkcase c7c "$L/a"; LOG2=""
+next_start c7c
+mkdir -p "$T/c7d/pre"; chmod 755 "$T/c7d" "$T/c7d/pre"  # a root-owned log directory that was there, above both: used as before
+mkcase c7d "$T/c7d/pre" "$T/c7d/pre/run" "$T/c7d/pre/ctl"
+next_start c7d
+next_start c7d
+[ "$(owner "$T/c7d/pre")" = root ] && [ "$(owner "$T/c7d/pre/run")" = root ] &&
+    pass "c7d: a root-owned log directory that was there above the pid file directory is used as before (twice), and stays root's" ||
+    fail "c7d: $(ls -ld "$T/c7d/pre" "$T/c7d/pre/run" 2>&1)"
+L="$T/c7e/logs/new"                                    # through a symlink: c7e/lnk -> logs/new (made by the start)
+NOMK="$T/c7e/lnk/run"; mkcase c7e "$L" "$T/c7e/lnk/run"; NOMK=""
+ln -s logs/new "$T/c7e/lnk"
+refused_above c7e "pid file" "$T/c7e/lnk/run" "$L" "$L/a.log"
+L="$T/c7f/logs/new"                                    # through "..": c7f/logs/../logs/new/ctl
+NOMK="$T/c7f/logs/../logs/new/ctl"; mkcase c7f "$L" "" "$T/c7f/logs/../logs/new/ctl"; NOMK=""
+refused_above c7f "control socket" "$T/c7f/logs/../logs/new/ctl" "$L" "$L/a.log"
 
 echo "== $PASSES passed, $FAILS failed"
 [ "$FAILS" -eq 0 ]

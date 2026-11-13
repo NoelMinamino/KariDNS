@@ -958,6 +958,42 @@ static void test_startup_refused_cleanup(void) {
     assert(!startup_dir_shared_with_log("ctl.sock", "control socket"));   // (no directory, or "/": not checked, as in main())
     assert(!startup_dir_shared_with_log("/ctl.sock", "control socket"));
 
+    // dir_is_below(): base/a/b/c, base/l -> a/b; compared by device and inode while walking up with ".."
+    char a[300], b[300], c[300], d[400];
+    struct stat sbase, sa, sb, sroot;
+    snprintf(a, sizeof(a), "%s/a", base);
+    snprintf(b, sizeof(b), "%s/a/b", base);
+    snprintf(c, sizeof(c), "%s/a/b/c", base);
+    assert(mkdir(a, 0755) == 0 && mkdir(b, 0755) == 0 && mkdir(c, 0755) == 0);
+    assert(symlinkat("a/b", dfd, "l") == 0);
+    assert(stat(base, &sbase) == 0 && stat(a, &sa) == 0 && stat(b, &sb) == 0 && stat("/", &sroot) == 0);
+    assert(dir_is_below(c, &sb));                     // the parent
+    assert(dir_is_below(c, &sbase));                  // a grandparent (and above)
+    assert(dir_is_below(c, &sroot));                  // up to "/"
+    assert(!dir_is_below(b, &sb));                    // not the directory itself (startup_dir_shared_with_log() compares that)
+    assert(!dir_is_below(a, &sb));                    // not below
+    assert(!dir_is_below("/", &sbase));               // "/" has nothing above it (".." is "/" again)
+    snprintf(d, sizeof(d), "%s/a/b/new", base);       // not there yet: its parent counts (ensure_priv_dir_safe() makes it there)
+    assert(dir_is_below(d, &sb) && dir_is_below(d, &sa));
+    snprintf(d, sizeof(d), "%s/a/new", base);
+    assert(!dir_is_below(d, &sb));
+    snprintf(d, sizeof(d), "%s/a/x/new", base);       // the parent is not there either
+    assert(!dir_is_below(d, &sbase));
+    snprintf(d, sizeof(d), "%s/a/b/../b/c", base);    // ".." and a symlink in the path do not hide the relation
+    assert(dir_is_below(d, &sb));
+    snprintf(d, sizeof(d), "%s/l/c", base);
+    assert(dir_is_below(d, &sb) && dir_is_below(d, &sa));
+    snprintf(d, sizeof(d), "%s/l/new", base);
+    assert(dir_is_below(d, &sb));
+    snprintf(d, sizeof(d), "%s/l", base);             // (the symlink itself: the directory it names, not below itself)
+    assert(!dir_is_below(d, &sb));
+    f = openat(dfd, "plain", O_WRONLY | O_CREAT | O_EXCL, 0600);
+    assert(f >= 0);
+    close(f);
+    snprintf(d, sizeof(d), "%s/plain", base);         // not a directory
+    assert(!dir_is_below(d, &sbase));
+    assert(unlinkat(dfd, "plain", 0) == 0 && unlinkat(dfd, "l", 0) == 0 && rmdir(c) == 0 && rmdir(b) == 0 && rmdir(a) == 0);
+
     close(dfd);
     assert(rmdir(base) == 0);
     printf("  -> ctl_bound_* and startup_dir_shared_with_log passed.\n");
