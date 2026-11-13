@@ -649,6 +649,85 @@ static void test_gc_reclaim_queue(void) {
     printf("  -> one reclaim thread: a held snapshot keeps the later ones (3 waiting), one warning, all freed after the release\n");
 }
 
+/* ---------------------------------------------------------------------------
+ * Review low (0.7): a fork while the manager's reclaim thread runs ("forking anyway", gc_snapshot_wait_idle() gave up) hands the Backend
+ * the queue as the thread left it.  gc_snapshot_detach_only() rebuilds the tail and the counts from the chain: a torn dequeue (head NULL,
+ * a stale tail) must not swallow the later snapshots, a torn append gets its tail, the snapshot being released is given up, the
+ * zone-version retire count is that of the stack.  Then real publications in the detached mode are all freed.  Runs last: the process is
+ * in the Backend's mode afterwards.
+ * ------------------------------------------------------------------------- */
+void gc_queue_set_for_test(zone_db_snapshot_t *head, zone_db_snapshot_t *tail, size_t count, zone_db_snapshot_t *releasing, size_t zone_retire_count);
+void gc_queue_get_for_test(zone_db_snapshot_t **head, zone_db_snapshot_t **tail, size_t *count, zone_db_snapshot_t **releasing, bool *joinable);
+
+static void test_gc_detach_torn_queue(void) {
+    zone_config_t zc;
+    memset(&zc, 0, sizeof(zc));
+    zc.domain = (char *)"static.test.";
+    zc.type = (char *)"master";
+    view_config_t vcfg;
+    memset(&vcfg, 0, sizeof(vcfg));
+    vcfg.name = (char *)"default";
+    vcfg.zones = &zc;
+    server_config_t config;
+    memset(&config, 0, sizeof(config));
+    config.views = &vcfg;
+    atomic_store_explicit(&g_config_db.active, &config, memory_order_release);
+    fi_reset();
+    dbreg_reset();
+    assert(rebuild_zone_db_snapshot(&config, NULL, NULL, NULL, NULL, 0));
+    gc_snapshot_wait_idle();                                  /* (no thread runs, the queue is empty) */
+    assert(zdir_gc_queued() == 0);
+    zone_retire_process(true);
+
+    zone_db_snapshot_t *h, *t, *rel;
+    size_t n;
+    bool joinable;
+    /* a torn dequeue of the only one: head moved on to NULL, the tail still names it, the count not decremented */
+    zone_db_snapshot_t *lost = calloc(1, sizeof(*lost));
+    assert(lost);
+    gc_queue_set_for_test(NULL, lost, 1, NULL, 3);           /* and a retire count that is not that of the (empty) stack */
+    gc_snapshot_detach_only();
+    gc_queue_get_for_test(&h, &t, &n, &rel, &joinable);
+    assert(h == NULL && t == NULL && n == 0 && zdir_gc_queued() == 0 && !joinable);
+    gc_reclaim_stats_t gs;
+    gc_reclaim_stats(&gs);
+    assert(gs.zone_retire_waiting == 0);
+    free(lost);                                               /* (the thread that had it is gone: the child never frees it) */
+
+    /* a torn append: s0 -> s1 linked, the tail still s0, the count 1; s0 was being released (its views given up) */
+    zone_db_snapshot_t *s0 = calloc(1, sizeof(*s0)), *s1 = calloc(1, sizeof(*s1));
+    assert(s0 && s1);
+    void *views = malloc(16);
+    assert(views);
+    s0->views = views;
+    s0->view_count = 1;
+    s0->gc_queued = s1->gc_queued = true;
+    s0->gc_next = s1;
+    s1->gc_drained = true;
+    gc_queue_set_for_test(s0, s0, 1, s0, 0);
+    gc_snapshot_detach_only();
+    gc_queue_get_for_test(&h, &t, &n, &rel, &joinable);
+    assert(h == s0 && t == s1 && n == 2 && rel == NULL);
+    assert(s0->views == NULL && s0->view_count == 0 && s0->gc_drained);
+    free(views);
+    gc_reclaim_stats(&gs);
+    assert(gs.snapshots_waiting == 2);
+
+    /* publications in the Backend's mode: they queue behind s1, the detached thread is started and frees all of them */
+    gc_commit("t1.test.", 500, 1);
+    assert(snapshot_apply_db_delta() > 0);
+    gc_commit("t2.test.", 501, 1);
+    assert(snapshot_apply_db_delta() > 0);
+    for (int i = 0; i < 500 && zdir_gc_queued() != 0; i++) usleep(10000);   /* up to 5 s */
+    gc_queue_get_for_test(&h, &t, &n, &rel, &joinable);
+    assert(zdir_gc_queued() == 0 && h == NULL && t == NULL);
+    gc_reclaim_stats(&gs);
+    assert(gs.snapshots_waiting == 0);
+    fi_reset();
+    atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
+    printf("  -> fork-torn reclaim queue: tail and counts rebuilt from the chain, later snapshots freed by the detached thread\n");
+}
+
 
 /* review low L4 dns_zone_image.c [3]: thaw_zone_arena() of an image with the zone's own ECS trusted-resolver list, with the Nth allocation failing, for
  * every N.  The thaw either fails or gives the zone its list: it must not succeed with the parsed list missing (the zone would fall back to the
@@ -707,6 +786,7 @@ int main(void) {
     test_fi_gc_thread_start();
     test_gc_reclaim_queue();
     test_fi_catalog_membership();
+    test_gc_detach_torn_queue();                 /* last: it leaves the process in the Backend's mode */
     tmpdir_remove(g_cdir);
     printf("[+] test_fi_snapshot passed successfully.\n");
     return 0;

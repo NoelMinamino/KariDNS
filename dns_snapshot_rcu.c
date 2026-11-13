@@ -893,10 +893,13 @@ static pthread_t g_gc_tid;
 static _Atomic uint64_t g_gc_warnings;
 static int64_t g_gc_next_warn_ms; /* the reclaim thread's own */
 
+static size_t zone_retire_recount(void);
+
 void gc_snapshot_detach_only(void) {
   /* (in the child of fork(): only the forking thread exists.  If gc_snapshot_wait_idle() gave up after 30 s the manager's thread may
    * have held the lock or been releasing a snapshot's views; the lock is made anew and that snapshot is given up (its views leak,
-   * nothing is freed twice).) */
+   * nothing is freed twice).  A snapshot whose views were released but that was not marked drained yet (between the two steps under
+   * the lock) has views == NULL: releasing it again does nothing.) */
   pthread_mutex_init(&g_gc_lock, NULL);
   pthread_mutex_init(&g_gc_start_lock, NULL);
   if (g_gc_cond_ready) gc_cond_init();
@@ -906,10 +909,45 @@ void gc_snapshot_detach_only(void) {
     g_gc_releasing->gc_drained = true;
     g_gc_releasing = NULL;
   }
+  /* The thread may also have been in the middle of a dequeue (g_gc_head moved on, g_gc_tail not cleared yet: head NULL and a stale tail,
+   * behind which gc_retire_locked() would append where nobody looks, and the thread would never be started) or of an append (the tail
+   * not moved to the new last one), with the count off by one.  The chain from g_gc_head is whole in each of these states; tail and
+   * count are rebuilt from it.  What the thread had already taken off the chain is lost to this process (leaked, not freed twice). */
+  zone_db_snapshot_t *last = NULL;
+  size_t n = 0;
+  for (zone_db_snapshot_t *q = g_gc_head; q; q = q->gc_next) {
+    last = q;
+    n++;
+  }
+  g_gc_tail = last;
+  atomic_store_explicit(&g_gc_count, n, memory_order_relaxed);
+  /* the count of the zone-version retire stack, likewise: zone_version_retire() counts a node before it pushes it, and
+   * zone_retire_process() takes the whole stack off before it frees (or pushes back) its nodes */
+  atomic_store_explicit(&g_zone_retire_count, zone_retire_recount(), memory_order_relaxed);
   g_gc_joinable = false;
   g_gc_have_tid = false;
   atomic_store_explicit(&g_gc_running, false, memory_order_relaxed);
 }
+
+#ifdef KARIDNS_UNIT_TEST
+/* the unit test builds the states that a fork in the middle of the manager's reclaim thread leaves, and looks at what
+ * gc_snapshot_detach_only() made of them; joinable: back to the manager's mode for the tests after it */
+void gc_queue_set_for_test(zone_db_snapshot_t *head, zone_db_snapshot_t *tail, size_t count, zone_db_snapshot_t *releasing, size_t zone_retire_count) {
+  g_gc_head = head;
+  g_gc_tail = tail;
+  atomic_store_explicit(&g_gc_count, count, memory_order_relaxed);
+  g_gc_releasing = releasing;
+  atomic_store_explicit(&g_zone_retire_count, zone_retire_count, memory_order_relaxed);
+}
+
+void gc_queue_get_for_test(zone_db_snapshot_t **head, zone_db_snapshot_t **tail, size_t *count, zone_db_snapshot_t **releasing, bool *joinable) {
+  *head = g_gc_head;
+  *tail = g_gc_tail;
+  *count = atomic_load_explicit(&g_gc_count, memory_order_relaxed);
+  *releasing = g_gc_releasing;
+  *joinable = g_gc_joinable;
+}
+#endif
 
 /* The warning of K-1: what holds the oldest snapshot, if it can be told (the kind of reader slot of the grace period, or the references
  * retained with retain_zone_snapshot()).  Called without g_gc_lock. */
@@ -1285,6 +1323,13 @@ static void zone_retire_push(zone_retire_t *r) {
 
 static void zone_entry_unref(zone_db_entry_t *e) {
   if (atomic_fetch_sub_explicit(&e->snapshot_refs, 1, memory_order_acq_rel) == 1) free_zone_db_entry(e);
+}
+
+/* the nodes on the retire stack (gc_snapshot_detach_only(), in the child of fork(): no other thread) */
+static size_t zone_retire_recount(void) {
+  size_t n = 0;
+  for (zone_retire_t *r = atomic_load_explicit(&g_zone_retire_head, memory_order_acquire); r; r = r->next) n++;
+  return n;
 }
 
 /* 解放待ちを処理する。wait なら最も新しい世代まで猶予期間を待つ (再構築の途中でまとめて解放する)。
