@@ -835,7 +835,7 @@ static bool attach_nsec3_optout_proof(const zone_image_t *img, const zone_n3_t *
                                       zone_db_entry_t *gap_entry, const char *rfc) {
   uint32_t ce_rec;
   const char *encloser = closest_provable_encloser(img, n3, name, zone_apex, client_loc, client_ecs_tag, client_loc_tag, &ce_rec);
-  char what[96];
+  char what[160];
   if (ce_rec == ZONE_IMAGE_NONE) {
     snprintf(what, sizeof(what), "NSEC3 that matches the closest provable encloser (%s)", rfc);
     note_denial_gap(gap_entry, encloser, what);
@@ -1844,18 +1844,24 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
           char q_hash[64];
           if (compute_nsec3_hash(current_qname, algo, iterations, salt, salt_len, q_hash, sizeof(q_hash))) {
             uint32_t m_rec = find_matching_nsec3(img, n3.chain, q_hash, db_entry->domain);
-            /* §7.2.3; DS has its Opt-Out proof below (§7.2.4), and a name in an Opt-Out span may lawfully have no NSEC3 */
-            if (m_rec == ZONE_IMAGE_NONE && qtypes[0] != 43 && !nsec3_opt_out_at(img, n3.chain, q_hash)) note_denial_gap(db_entry, current_qname, "NSEC3 that matches the name (RFC 5155 7.2.3)");
+            /* §7.2.3 (the NSEC3 that matches the name).  Without one:
+             *  - DS at an unsigned delegation in an Opt-Out span (§7.2.4): the closest provable encloser proof (review query_engine [9]);
+             *  - another type at a name whose hash is in an Opt-Out span: an empty non-terminal that only insecure delegations make, which
+             *    §7.1 lets have no NSEC3.  §7.2.3 cannot be met literally there; the answer carries §7.2.1's closest provable encloser
+             *    proof (the NSEC3 of the closest provable encloser, the Opt-Out NSEC3 that covers the next closer name), as BIND 9.20
+             *    does (named 9.20.30; delv 9.20.30 validates it as a negative response).  A part of it the zone lacks is a gap;
+             *  - anything else is a gap of the chain: said, the answer goes out without it. */
+            bool opt_out_ent = m_rec == ZONE_IMAGE_NONE && qtypes[0] != 43 && nsec3_opt_out_at(img, n3.chain, q_hash);
+            if (m_rec == ZONE_IMAGE_NONE && qtypes[0] != 43 && !opt_out_ent) note_denial_gap(db_entry, current_qname, "NSEC3 that matches the name (RFC 5155 7.2.3)");
             if (m_rec != ZONE_IMAGE_NONE) {
               if (!attach_nsec3_record(img, m_rec, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                 nsec_failed = true;
               }
-            } else if (qtypes[0] == 43 &&
+            } else if ((qtypes[0] == 43 || opt_out_ent) &&
                        !attach_nsec3_optout_proof(img, &n3, current_qname, db_entry->domain, client_loc, client_ecs_tag,
                                                   client_loc_tag, res, max_res_len, offset, comp_ctx, nscount,
-                                                  attached_nsec3, &attached_nsec3_cnt, db_entry, "RFC 5155 7.2.4")) {
-              /* RFC 5155 §7.2.4: DS at an unsigned delegation in an Opt-Out span has no matching NSEC3; the closest
-               * provable encloser proof instead (review query_engine [9]) */
+                                                  attached_nsec3, &attached_nsec3_cnt, db_entry,
+                                                  qtypes[0] == 43 ? "RFC 5155 7.2.4" : "RFC 5155 7.2.1, no data at an Opt-Out empty non-terminal")) {
               nsec_failed = true;
             }
           }

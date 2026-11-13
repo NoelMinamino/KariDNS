@@ -2070,10 +2070,23 @@ static void test_nsec3_optout_empty_non_terminal(void) {
     oo_expect_hashes(&r, "referral to d (7.2.7)", h_apex, oo_proof("d.oo.test."), NULL);
     CHECK(&r, !oo_gap_said());
 
-    /* no data at the ENT itself: no NSEC3 matches it, and 7.2.3 has no other proof: the answer carries none (unchanged), and nothing is
-     * said (the zone is right; see the report of this review for the options) */
+    /* no data at the ENT itself: no NSEC3 matches it (7.1), so 7.2.3 cannot be met literally; the answer carries 7.2.1's closest provable
+     * encloser proof, as BIND 9.20 does: the NSEC3 of the apex and the Opt-Out NSEC3 that covers b.oo.test.  Nothing is said. */
     oo_query("b.oo.test.", 1, &r);
-    CHECK(&r, r.rcode == 0 && r.aa && gr_count(&r, 1, -1) == 0 && gr_count(&r, 2, 6) == 1 && gr_count(&r, 2, 50) == 0);
+    CHECK(&r, r.rcode == 0 && r.aa && gr_count(&r, 1, -1) == 0 && gr_count(&r, 2, 6) == 1);
+    oo_expect_hashes(&r, "NODATA A at the Opt-Out ENT", h_apex, oo_proof("b.oo.test."), NULL);
+    CHECK(&r, !oo_gap_said());
+    oo_query("b.oo.test.", 16, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && gr_count(&r, 1, -1) == 0);
+    oo_expect_hashes(&r, "NODATA TXT at the Opt-Out ENT", h_apex, oo_proof("b.oo.test."), NULL);
+    CHECK(&r, !oo_gap_said());
+    /* without DO: no proof at all, as every negative answer */
+    gr_query("b.oo.test.", 1, false, &r);
+    CHECK(&r, r.rcode == 0 && gr_count(&r, 2, 50) == 0 && gr_count(&r, 2, 46) == 0);
+    /* an ordinary NODATA beside it keeps the NSEC3 of the name only (7.2.3) */
+    oo_query("a.oo.test.", 16, &r);
+    CHECK(&r, r.rcode == 0 && r.aa);
+    oo_expect_hashes(&r, "NODATA at a.oo.test", oo_proof("a.oo.test."), NULL, NULL);
     CHECK(&r, !oo_gap_said());
 
     /* a CNAME to a name that a wildcard makes (7.2.6 for x.w.oo.test: the cover of its next closer name) */

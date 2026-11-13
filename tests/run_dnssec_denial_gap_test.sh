@@ -12,7 +12,7 @@
 #   ok.test, ok3.test  the same zones whole (NSEC, NSEC3) with a wildcard: NXDOMAIN, NODATA, wildcard answer and wildcard NODATA log nothing.
 #   oo3.test   NSEC3 Opt-Out (dnssec-signzone -A), whole: the insecure delegations c.b.oo3.test (b.oo3.test is an empty non-terminal made
 #              only by it, without an NSEC3 of its own: RFC 5155 7.1) and d.oo3.test, a CNAME to a name a wildcard makes, a wildcard CNAME.
-#              Name error below b, DS at c.b and d, referrals to them, no data at b, the CNAMEs: nothing is logged, and the name error, the
+#              Name error below b, DS at c.b and d, referrals to them, no data at b, the CNAMEs: nothing is logged, and the name error, no data at b, the
 #              DS answers and the referrals carry the closest provable encloser proof (RFC 5155 7.2.1: the NSEC3 of the apex, the Opt-Out NSEC3
 #              that covers b.oo3.test or d.oo3.test).  With delv (BIND 9.20) the name error and the DS answer under b validate with the zone's
 #              KSK as trust anchor ("fully validated").
@@ -173,10 +173,23 @@ for q in "x.b.oo3.test A" "c.b.oo3.test DS" "www.c.b.oo3.test A" "d.oo3.test DS"
     if n3_owners $q | grep -qx "$HA"; then ok "oo3.test $q: the NSEC3 of the closest provable encloser (the apex)"
     else bad "oo3.test $q: no NSEC3 of the apex: $(n3_owners $q | tr '\n' ' ')"; fi
 done
+# no data at the Opt-Out ENT b.oo3.test (it has no NSEC3, RFC 5155 7.1, so 7.2.3 cannot be met literally): the closest provable encloser
+# proof of 7.2.1, as BIND 9.20 gives it.  The expected records are what named 9.20.30 answered for this zone (recorded 2026-11-13; the hashes
+# depend on the names only: no salt, no extra iterations): the NSEC3 of oo3.test and the Opt-Out NSEC3 of cn.oo3.test, which covers b.oo3.test.
+NAMED_ENT="SAGIQ31JGEVRPPJ0Q3QFJNN9C91DFEI2 V5C4BV0EA9GRG2F7KG0P7GHO84UCD39R"
+[ "$(h3 oo3.test) $(h3 cn.oo3.test)" = "$NAMED_ENT" ] || bad "the hashes of oo3.test / cn.oo3.test are not the recorded ones (nsec3hash)"
+for t in A TXT; do
+    got=$(n3_owners b.oo3.test $t | tr '\n' ' ' | sed 's/ $//')
+    [ "$got" = "$NAMED_ENT" ] && ok "oo3.test b.oo3.test $t (NODATA at the ENT): the NSEC3 RRs named 9.20.30 gives" ||
+        bad "oo3.test b.oo3.test $t: NSEC3 owners '$got', named 9.20.30: '$NAMED_ENT'"
+    fl=$("$DAG" b.oo3.test $t @127.0.0.1 -p $PORT +dnssec +norec +nohexdump +tries=1 +time=2 2>/dev/null |
+        awk '$4 == "NSEC3" && toupper($1) ~ /^V5C4BV0EA9GRG2F7KG0P7GHO84UCD39R\./ { print $6 }')
+    [ "$fl" = 1 ] && ok "oo3.test b.oo3.test $t: the cover has the Opt-Out flag" || bad "oo3.test b.oo3.test $t: the cover's flags are '$fl'"
+done
 if command -v delv >/dev/null 2>&1; then
     awk '$4 == "DNSKEY" && $5 == 257 { printf "trust-anchors { \"oo3.test.\" static-key %s %s %s \"", $5, $6, $7; for (i = 8; i <= NF; i++) printf "%s", $i; print "\"; };" }' \
         "$W/oo3.test.signed" > "$W/anchor.conf"
-    for q in "x.b.oo3.test A" "c.b.oo3.test DS" "d.oo3.test DS" "q.oo3.test A"; do
+    for q in "x.b.oo3.test A" "c.b.oo3.test DS" "d.oo3.test DS" "q.oo3.test A" "b.oo3.test A" "b.oo3.test TXT"; do
         # shellcheck disable=SC2086
         out=$(delv @127.0.0.1 -p $PORT -a "$W/anchor.conf" +root=oo3.test. $q 2>&1) || true
         if printf '%s\n' "$out" | grep -q "negative response, fully validated"; then ok "delv: $q: fully validated"
