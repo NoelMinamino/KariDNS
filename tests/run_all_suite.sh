@@ -268,7 +268,8 @@ done
 # KARI_PORT_BASE_MIN in the environment moves the windows (two suites on one host, e.g. two CI-like runs of agents on a shared build host)
 KARI_PORT_BASE_MIN="${KARI_PORT_BASE_MIN:-20000}"
 KARI_PORT_SLOT_SPAN=1000
-# 20000 + 29 * 1000 + 999 = 48999, below the ephemeral port range (49152 ..)
+# 20000 + 29 * 1000 + 999 = 48999: below the IANA dynamic range (49152 ..), but inside the ephemeral range of FreeBSD (net.inet.ip.portrange.first
+# is 10000 by default) and of Linux (32768 ..), so an outgoing connection of another process can hold a port of a window before a test binds it
 KARI_MAX_JOBS=29
 
 detect_ncpu() {

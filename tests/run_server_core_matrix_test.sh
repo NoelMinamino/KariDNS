@@ -21,6 +21,7 @@
 set -u
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$DIR/lib_proc.sh"   # (KARIDNS_NOSYSLOG=1: nothing to the host's system log when run on its own)
 ROOT="$DIR/.."
 KARIDNS="$ROOT/karidns"
 DAG="$ROOT/dag"
