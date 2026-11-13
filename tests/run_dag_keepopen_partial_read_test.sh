@@ -95,7 +95,7 @@ if (my $paddr = accept(my $client, $srv)) {
         
         my $resp = $qid . pack("nnnnn", 0x8180, 1, 1, 0, 0);
         $resp .= "\x07example\x03com\x00" . pack("nn", 1, 1);
-        $resp .= "\x07example\x03com\x00" . pack("nnNn", 1, 1, 300, 4) . pack("C4", 93, 184, 216, 34);
+        $resp .= "\x07example\x03com\x00" . pack("nnNn", 1, 1, 300, 4) . pack("C4", 192, 0, 2, 34);
         
         print $client pack("n", length($resp)) . $resp;
         $client->flush() if $client->can('flush');
@@ -123,7 +123,7 @@ fi
 echo "=== 2. Testing Second Query Successfully Reconnects without Stream Desync ==="
 echo -n "Test: Query 2 re-establishes clean TCP connection ... "
 OUT2=$($DAG @127.0.0.1 -p $PORT example.com A +tcp +keepopen +timeout=2 +tries=1 2>&1 || true)
-if echo "$OUT2" | grep -q "93\.184\.216\.34"; then
+if echo "$OUT2" | grep -q "192\.0\.2\.34"; then
     echo "OK"
 else
     echo "FAILED"

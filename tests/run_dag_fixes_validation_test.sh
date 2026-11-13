@@ -319,7 +319,7 @@ while (my $paddr = accept(my $client, $srv)) {
     my ($qid) = pack("n", 0x1234);
     my $dns_msg = $qid . pack("nnnnn", 0x8180, 1, 1, 0, 0);
     $dns_msg .= "\x07example\x03com\x00" . pack("nn", 1, 1);
-    $dns_msg .= "\x07example\x03com\x00" . pack("nnNn", 1, 1, 300, 4) . pack("C4", 93, 184, 216, 34);
+    $dns_msg .= "\x07example\x03com\x00" . pack("nnNn", 1, 1, 300, 4) . pack("C4", 192, 0, 2, 34);
 
     my $body_len = length($dns_msg);
     my $http_resp = "HTTP/1.1 200 OK\r\n" .
@@ -345,11 +345,11 @@ PL_EOF
     else
         run_check "DoH +http-plain returns immediately using Content-Length" \
             "$DAG @127.0.0.1 -p $PORT_DOH example.com A +http-plain +timeout=3" \
-            "(93\.184\.216\.34|NOERROR)"
+            "(192\.0\.2\.34|NOERROR)"
 
         run_check "DoH GET URI correctly uses '&dns=' when path has existing '?'" \
             "$DAG @127.0.0.1 -p $PORT_DOH example.com A +http-plain-get=/dns-query?foo=bar +timeout=3" \
-            "(93\.184\.216\.34|NOERROR)"
+            "(192\.0\.2\.34|NOERROR)"
     fi
 
     kill -9 "$DOH_PID" 2>/dev/null || true

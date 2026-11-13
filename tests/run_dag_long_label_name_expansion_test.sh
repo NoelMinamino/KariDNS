@@ -67,19 +67,19 @@ while (1) {
 
     # Construct the exact response with 63-byte label and compression pointers
     my $resp = $qid . pack("H*",
-        "81000001000000050006036d73670473697a65097463707265706c6179036e65740000010001" .
+        "81000001000000050006036d73670473697a65087463707265706c7904746573740000010001" .
         "c00c000200010000012c005d046e7330333f" .
         ("78" x 63) .
-        "036d73670473697a65097463707265706c6179036e657400" .
+        "036d73670473697a65087463707265706c79047465737400" .
         "c00c000200010000012c0007046e733034c039" .
         "c00c000200010000012c0007046e733032c039" .
         "c00c000200010000012c0007046e733031c039" .
         "c00c000200010000012c0007046e733035c039" .
-        "c0d6000100010000012c0004364d80fe" .
-        "c09d000100010000012c0004364d80fe" .
-        "c034000100010000012c0004364d80fe" .
-        "c0b0000100010000012c0004364d80fe" .
-        "c0c3000100010000012c0004364d80fe" .
+        "c0d6000100010000012c0004c00002fe" .
+        "c09d000100010000012c0004c00002fe" .
+        "c034000100010000012c0004c00002fe" .
+        "c0b0000100010000012c0004c00002fe" .
+        "c0c3000100010000012c0004c00002fe" .
         "00002904d0000000000000"
     );
     send($srv, $resp, 0, $client_addr);
@@ -92,14 +92,14 @@ sleep 0.3
 
 echo "=== 1. Testing 63-byte Long Label Name Expansion ==="
 echo -n "Test: Name with 63-byte label is parsed without (unparsable name) ... "
-OUT=$($DAG @127.0.0.1 -p $PORT msg.size.tcpreplay.net A 2>&1 || true)
+OUT=$($DAG @127.0.0.1 -p $PORT msg.size.tcpreply.test A 2>&1 || true)
 if echo "$OUT" | grep -q "unparsable" || echo "$OUT" | grep -q "unexpected end of input"; then
     echo "FAILED"
     echo "  Output: $OUT"
     FAILED=$((FAILED + 1))
 else
-    if echo "$OUT" | grep -q "ns03\.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\.msg\.size\.tcpreplay\.net\." && \
-       echo "$OUT" | grep -q "54\.77\.128\.254"; then
+    if echo "$OUT" | grep -q "ns03\.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\.msg\.size\.tcpreply\.test\." && \
+       echo "$OUT" | grep -q "192\.0\.2\.254"; then
         echo "OK"
     else
         echo "FAILED"
