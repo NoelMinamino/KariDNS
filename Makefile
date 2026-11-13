@@ -1469,7 +1469,9 @@ bench_rrl: tests/bench_rrl.c dns_rrl.o dns_config_parser.o dns_diag.o dns_zone_p
 # the command line (make install PREFIX=/opt/karidns, MANDIR=..., DESTDIR=/tmp/stage).  packaging/install.sh does the work: modes are set
 # explicitly (BINMODE for the programs and scripts, default 0555), owner root only when run as root, configuration only as *.sample (an
 # existing configuration is never overwritten), manual pages gzip'ed with MANCOMPRESS=yes (auto: yes on FreeBSD, as the ports do).  An
-# install target never builds: build first (make; make karidns-dbloader karidns-zone), as the user that owns the tree, then install.
+# install target never builds: build first (make; with DB_DRIVERS also make karidns-dbloader karidns-zone), as the user that owns the tree,
+# then install.  Each target is one run of install.sh, which checks every file it is going to install before it copies the first one: a
+# file that is not built stops it with nothing installed and the make target that builds it.
 #   make install            the server and the tools (install-server, install-dag), and, when DB_DRIVERS is not empty, install-db; the
 #                           manual pages and the manuals of the same programs (install-man, install-docs)
 #   make install-server     karidns, karictl, karicheck, karidns-tapstat, the rc script, the sample configuration and zone
@@ -1478,7 +1480,8 @@ bench_rrl: tests/bench_rrl.c dns_rrl.o dns_config_parser.o dns_diag.o dns_zone_p
 #   make install-signer     karidns-signer, install-webadmin: karidns-webadmin (Node.js; npm ci --omit=dev --ignore-scripts in signer/ or
 #                           webadmin/ first); not part of make install
 #   make install-man-X, install-docs-X   the pages and the manuals of X = server, dag, db, signer, webadmin
-#   make uninstall, uninstall-X          remove exactly what the install target puts there, and the directories of KariDNS left empty
+#   make uninstall, uninstall-X          remove what the install target puts there (a tree: the installed directory as it is), and the
+#                                        directories of KariDNS left empty (INST_OWN: never bin, share/man/man8, ...)
 PREFIX ?= /usr/local
 SYSCONFDIR ?= $(PREFIX)/etc
 LIBEXECDIR ?= $(PREFIX)/libexec
@@ -1492,6 +1495,10 @@ MANCOMPRESS ?= auto
 BINMODE ?= 0555
 KARI_INSTALL = MANCOMPRESS="$(MANCOMPRESS)" sh packaging/install.sh
 
+# the directories that are KariDNS's own: uninstall removes them (and what is below them) when they are left empty, and no other directory.
+# install.sh takes one only when its last component starts with "karidns" (DOCDIR=/usr/share/doc is not removed).
+INST_OWN = owndir:-:$(SYSCONFDIR)/karidns owndir:-:$(DATADIR) owndir:-:$(DOCDIR) owndir:-:$(LIBEXECDIR)/karidns-signer \
+	owndir:-:$(LIBEXECDIR)/karidns-webadmin
 INST_SERVER = $(BINMODE):karidns:$(SBINDIR)/karidns $(BINMODE):karictl:$(BINDIR)/karictl $(BINMODE):karicheck:$(BINDIR)/karicheck \
 	$(BINMODE):karidns-tapstat:$(BINDIR)/karidns-tapstat $(BINMODE):packaging/freebsd/rc.d/karidns:$(RCDIR)/karidns \
 	0644:karidns.conf.sample:$(SYSCONFDIR)/karidns/karidns.conf.sample 0644:karictl.conf.sample:$(SYSCONFDIR)/karidns/karictl.conf.sample \
@@ -1531,88 +1538,88 @@ INST_DOCS_SIGNER = 0444:docs/karidns-signer.md:$(DOCDIR)/karidns-signer.md
 INST_DOCS_WEBADMIN = 0444:docs/karidns-webadmin.md:$(DOCDIR)/karidns-webadmin.md 0444:docs/karidns-api.md:$(DOCDIR)/karidns-api.md \
 	0444:docs/karidns-webadmin-gui.md:$(DOCDIR)/karidns-webadmin-gui.md 0444:docs/karidns-webadmin-gui-checklist.md:$(DOCDIR)/karidns-webadmin-gui-checklist.md
 
+# Shell for the recipes that take the database parts (BSD make and GNU make have no common functions): $$a is install or uninstall, the
+# entries so far are "$$@".  KARI_DB_SQL adds the SQL files of the drivers of DB_DRIVERS (the drivers the loader was built with:
+# build_pkg.sh checks karidns-dbloader --drivers); KARI_DB adds the programs, pages and manuals too when DB_DRIVERS is not empty.
+KARI_DB_SQL = for d in $(DB_DRIVERS); do case $$d in sqlite3) set -- "$$@" $(INST_DB_SQLITE3) ;; postgresql) set -- "$$@" $(INST_DB_PGSQL) ;; \
+	*) echo "make: unknown driver '$$d' in DB_DRIVERS (sqlite3 postgresql)" >&2; exit 1 ;; esac; done
+KARI_DB = if [ -n "$(DB_DRIVERS)" ]; then set -- "$$@" $(INST_DB) $(INST_MAN_DB) $(INST_DOCS_DB); $(KARI_DB_SQL); fi
+KARI_DB_MAN = if [ -n "$(DB_DRIVERS)" ]; then set -- "$$@" $(INST_MAN_DB); fi
+KARI_DB_DOCS = if [ -n "$(DB_DRIVERS)" ]; then set -- "$$@" $(INST_DOCS_DB); fi
+KARI_RUN = $(KARI_INSTALL) $$a "$(DESTDIR)" "$$@"
+
 .PHONY: install uninstall install-server uninstall-server install-dag uninstall-dag install-db uninstall-db install-signer uninstall-signer \
 	install-webadmin uninstall-webadmin install-man uninstall-man install-docs uninstall-docs install-man-server uninstall-man-server \
 	install-man-dag uninstall-man-dag install-man-db uninstall-man-db install-man-signer uninstall-man-signer install-man-webadmin \
 	uninstall-man-webadmin install-docs-server uninstall-docs-server install-docs-dag uninstall-docs-dag install-docs-db uninstall-docs-db \
 	install-docs-signer uninstall-docs-signer install-docs-webadmin uninstall-docs-webadmin man
 
-install: install-server install-dag install-man install-docs
-	@if [ -n "$(DB_DRIVERS)" ]; then $(MAKE) install-db; fi
-uninstall: uninstall-server uninstall-dag uninstall-man uninstall-docs
-	@if [ -n "$(DB_DRIVERS)" ]; then $(MAKE) uninstall-db; fi
+install uninstall:
+	@set -e; a=$@; set -- $(INST_OWN) $(INST_SERVER) $(INST_DAG) $(INST_MAN_SERVER) $(INST_MAN_DAG) $(INST_DOCS_SERVER) $(INST_DOCS_DAG); \
+	$(KARI_DB); $(KARI_RUN)
+install-man uninstall-man:
+	@set -e; a=$@; a=$${a%-man}; set -- $(INST_OWN) $(INST_MAN_SERVER) $(INST_MAN_DAG); $(KARI_DB_MAN); $(KARI_RUN)
+install-docs uninstall-docs:
+	@set -e; a=$@; a=$${a%-docs}; set -- $(INST_OWN) $(INST_DOCS_SERVER) $(INST_DOCS_DAG); $(KARI_DB_DOCS); $(KARI_RUN)
+install-db uninstall-db:
+	@set -e; a=$@; a=$${a%-db}; if [ -z "$(DB_DRIVERS)" ]; then echo "make: DB_DRIVERS is empty: no database parts to $$a" >&2; exit 1; fi; \
+	set -- $(INST_OWN) $(INST_DB); $(KARI_DB_SQL); $(KARI_RUN)
 install-server:
-	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_SERVER)
+	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_OWN) $(INST_SERVER)
 uninstall-server:
-	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_SERVER)
+	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_OWN) $(INST_SERVER)
 install-dag:
-	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_DAG)
+	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_OWN) $(INST_DAG)
 uninstall-dag:
-	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_DAG)
-# the SQL files of the drivers of DB_DRIVERS (the drivers the loader was built with: build_pkg.sh checks karidns-dbloader --drivers)
-install-db:
-	@set -e; if [ -z "$(DB_DRIVERS)" ]; then echo "make: DB_DRIVERS is empty: no database parts to install" >&2; exit 1; fi; \
-	set -- $(INST_DB); for d in $(DB_DRIVERS); do case $$d in sqlite3) set -- "$$@" $(INST_DB_SQLITE3) ;; postgresql) set -- "$$@" $(INST_DB_PGSQL) ;; esac; done; \
-	$(KARI_INSTALL) install "$(DESTDIR)" "$$@"
-uninstall-db:
-	@set -e; set -- $(INST_DB); for d in $(DB_DRIVERS); do case $$d in sqlite3) set -- "$$@" $(INST_DB_SQLITE3) ;; postgresql) set -- "$$@" $(INST_DB_PGSQL) ;; esac; done; \
-	$(KARI_INSTALL) uninstall "$(DESTDIR)" "$$@"
+	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_OWN) $(INST_DAG)
 install-signer:
-	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_SIGNER)
+	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_OWN) $(INST_SIGNER)
 uninstall-signer:
-	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_SIGNER)
+	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_OWN) $(INST_SIGNER)
 install-webadmin:
-	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_WEBADMIN)
+	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_OWN) $(INST_WEBADMIN)
 uninstall-webadmin:
-	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_WEBADMIN)
-install-man: install-man-server install-man-dag
-	@if [ -n "$(DB_DRIVERS)" ]; then $(MAKE) install-man-db; fi
-uninstall-man: uninstall-man-server uninstall-man-dag
-	@if [ -n "$(DB_DRIVERS)" ]; then $(MAKE) uninstall-man-db; fi
-install-docs: install-docs-server install-docs-dag
-	@if [ -n "$(DB_DRIVERS)" ]; then $(MAKE) install-docs-db; fi
-uninstall-docs: uninstall-docs-server uninstall-docs-dag
-	@if [ -n "$(DB_DRIVERS)" ]; then $(MAKE) uninstall-docs-db; fi
+	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_OWN) $(INST_WEBADMIN)
 install-man-server:
-	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_MAN_SERVER)
+	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_OWN) $(INST_MAN_SERVER)
 uninstall-man-server:
-	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_MAN_SERVER)
+	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_OWN) $(INST_MAN_SERVER)
 install-man-dag:
-	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_MAN_DAG)
+	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_OWN) $(INST_MAN_DAG)
 uninstall-man-dag:
-	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_MAN_DAG)
+	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_OWN) $(INST_MAN_DAG)
 install-man-db:
-	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_MAN_DB)
+	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_OWN) $(INST_MAN_DB)
 uninstall-man-db:
-	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_MAN_DB)
+	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_OWN) $(INST_MAN_DB)
 install-man-signer:
-	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_MAN_SIGNER)
+	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_OWN) $(INST_MAN_SIGNER)
 uninstall-man-signer:
-	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_MAN_SIGNER)
+	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_OWN) $(INST_MAN_SIGNER)
 install-man-webadmin:
-	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_MAN_WEBADMIN)
+	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_OWN) $(INST_MAN_WEBADMIN)
 uninstall-man-webadmin:
-	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_MAN_WEBADMIN)
+	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_OWN) $(INST_MAN_WEBADMIN)
 install-docs-server:
-	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_DOCS_SERVER)
+	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_OWN) $(INST_DOCS_SERVER)
 uninstall-docs-server:
-	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_DOCS_SERVER)
+	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_OWN) $(INST_DOCS_SERVER)
 install-docs-dag:
-	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_DOCS_DAG)
+	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_OWN) $(INST_DOCS_DAG)
 uninstall-docs-dag:
-	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_DOCS_DAG)
+	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_OWN) $(INST_DOCS_DAG)
 install-docs-db:
-	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_DOCS_DB)
+	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_OWN) $(INST_DOCS_DB)
 uninstall-docs-db:
-	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_DOCS_DB)
+	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_OWN) $(INST_DOCS_DB)
 install-docs-signer:
-	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_DOCS_SIGNER)
+	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_OWN) $(INST_DOCS_SIGNER)
 uninstall-docs-signer:
-	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_DOCS_SIGNER)
+	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_OWN) $(INST_DOCS_SIGNER)
 install-docs-webadmin:
-	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_DOCS_WEBADMIN)
+	@$(KARI_INSTALL) install "$(DESTDIR)" $(INST_OWN) $(INST_DOCS_WEBADMIN)
 uninstall-docs-webadmin:
-	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_DOCS_WEBADMIN)
+	@$(KARI_INSTALL) uninstall "$(DESTDIR)" $(INST_OWN) $(INST_DOCS_WEBADMIN)
 
 # make man: the manual pages in man/ again from docs/*.md (man/generate.sh, perl; run it after changing a manual and commit the pages:
 # tests/run_md2man_test.sh fails when they are not fresh)

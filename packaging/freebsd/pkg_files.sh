@@ -1,6 +1,8 @@
 # pkg_files.sh - sourced by the FreeBSD package scripts (build_pkg.sh, build_signer_pkg.sh, build_webadmin_pkg.sh).
 #
-#   pkg_stage STAGE TARGET...   make TARGET... with DESTDIR=STAGE and the paths of the packages (PREFIX /usr/local; the manual pages gzip'ed)
+#   pkg_stage STAGE TARGET...   make TARGET... with DESTDIR=STAGE and the paths of the packages (PREFIX /usr/local; the manual pages gzip'ed).
+#                               Every directory, BINMODE and MANCOMPRESS is given on the command line: they are ?= in the Makefile, so a variable of
+#                               the same name in the environment of the build host would otherwise change the package (tests/run_install_test.sh)
 #   pkg_files STAGE             the `files` of +MANIFEST for everything under STAGE
 #
 # A package lists exactly what `make install` staged (the Makefile, "Installation", is the one list of what goes where): every regular file of
@@ -11,7 +13,9 @@
 pkg_stage() {
     _st=$1
     shift
-    make DESTDIR="$_st" PREFIX=/usr/local SYSCONFDIR=/usr/local/etc LIBEXECDIR=/usr/local/libexec MANCOMPRESS=yes "$@"
+    make DESTDIR="$_st" PREFIX=/usr/local SYSCONFDIR=/usr/local/etc LIBEXECDIR=/usr/local/libexec BINDIR=/usr/local/bin SBINDIR=/usr/local/sbin \
+        DATADIR=/usr/local/share/karidns DOCDIR=/usr/local/share/doc/karidns MANDIR=/usr/local/share/man RCDIR=/usr/local/etc/rc.d BINMODE=0555 \
+        MANCOMPRESS=yes "$@"
 }
 
 pkg_files() {

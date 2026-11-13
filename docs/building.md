@@ -66,11 +66,15 @@ A few things are not in `config.mk` on purpose:
 `make install` puts the programs, the sample configuration, the manual pages and the manuals where the options of `./configure` say (0.7). The `Makefile` holds the one list of what goes where (the block "Installation"); the FreeBSD packages are made from it (`make install DESTDIR=<stage>`, then the package lists exactly the staged files), and `tests/run_install_test.sh` compares a staged tree with `tests/install_manifest.txt`. An install target never builds: build first, as the user that owns the tree, then install (as root for a real installation, or into `DESTDIR` as anybody).
 
 ```sh
-./configure && make && make karidns-dbloader karidns-zone     # the last two only with database drivers
-make install                                                  # as root
-make install DESTDIR=/tmp/stage                               # staged: the files land under /tmp/stage/usr/local/...
-make uninstall                                                # removes exactly what make install put there
+./configure                         # its summary shows the DB drivers it found ("DB drivers    sqlite3")
+make                                # karidns, dag, karictl, karicheck, karidns-tapstat
+make karidns-dbloader karidns-zone  # only when ./configure found DB drivers: make install installs these too then
+make install                        # as root
+make install DESTDIR=/tmp/stage     # staged: the files land under /tmp/stage/usr/local/...
+make uninstall                      # removes what make install put there
 ```
+
+`make` (`all`) does not build the two database programs: they link a database library, and `make` without `./configure` takes `DB_DRIVERS=sqlite3`, so `all` would fail on a host without SQLite3 (the dag builds of Linux, macOS and Windows among them). `make install` installs them whenever `DB_DRIVERS` is not empty (with `./configure`: the drivers it found). Each install target checks every file it is going to install before it copies the first one: when one is not built, nothing is installed and the message names what to build (`karidns-dbloader: make karidns-dbloader karidns-zone (or leave the database parts out: DB_DRIVERS=)`, `man/dag.1: make man`, ...). To install without the database parts, `make install DB_DRIVERS=` (or `./configure --with-db-drivers=none`). `tests/run_install_test.sh` runs this sequence in a copy of the sources (with a stub compiler).
 
 | Target | Installs | Where (defaults) |
 |---|---|---|
@@ -82,7 +86,7 @@ make uninstall                                                # removes exactly 
 | `install-docs-X` | the Markdown manuals of X | `DOCDIR` (`PREFIX/share/doc/karidns`) |
 | `install` | `install-server`, `install-dag`, `install-man` and `install-docs` of both, and `install-db` with its pages and manuals when `DB_DRIVERS` is not empty | |
 
-Every target has an `uninstall-...` twin; `make uninstall` is the twin of `make install`. Uninstalling removes the files the install target puts there, then the directories of KariDNS that are left empty (a path with a component that starts with `karidns`: `etc/karidns/zones`, `share/doc/karidns`, `libexec/karidns-signer`, ...); `bin`, `share/man/man8` and the like are never removed, and neither is a file it did not install (a `karidns.conf` you made stays, and so does its directory).
+Every target has an `uninstall-...` twin; `make uninstall` is the twin of `make install`. Uninstalling removes the files the install target puts there, then the directories of KariDNS that are left empty: `SYSCONFDIR/karidns` (and `zones` in it), `DATADIR`, `DOCDIR`, `LIBEXECDIR/karidns-signer` and `LIBEXECDIR/karidns-webadmin` and what is below them (`INST_OWN` in the Makefile; one of these is taken only when its last component starts with `karidns`, so `DOCDIR=/usr/share/doc` is never removed). `PREFIX` itself, `bin`, `share/man/man8` and the like are never removed, also when their path holds `karidns` (`PREFIX=/opt/karidns-0.7`), and neither is a file it did not install (a `karidns.conf` you made stays, and so does its directory). The Node.js trees (`lib`, `ui`, `node_modules` of the signer and the WebAdmin) are removed as the installed directories are, whatever `signer/` or `webadmin/` holds now (a later `npm ci` with another lock leaves nothing stale); an installed tree that is or holds a symbolic link is refused before anything is removed.
 
 - **Directories.** `PREFIX`, `SYSCONFDIR` and `LIBEXECDIR` come from `config.mk` (the defaults of `./configure` without it); `BINDIR`, `SBINDIR`, `DATADIR`, `DOCDIR`, `MANDIR` and `RCDIR` follow `PREFIX` and can be set on the command line like any of them (`make install MANDIR=/usr/share/man`). `DESTDIR` is put before every path. The rc scripts and the wrappers of the signer and the WebAdmin name `/usr/local` paths inside: they are for the FreeBSD layout, whatever `PREFIX` is.
 - **Modes and owners.** Programs and scripts `BINMODE` (`0555`; the Debian package uses `0755`), samples `0644`, manual pages, manuals, SQL files and the files of the Node.js programs `0444` (directories `0755`). As root the files belong to root (uid and gid 0); as anybody else to that user: a package is built unprivileged and its list names root:wheel itself.
