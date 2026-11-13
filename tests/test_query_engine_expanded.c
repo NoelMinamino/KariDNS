@@ -982,6 +982,49 @@ static void test_parse_query_question_fast_cases(void) {
     printf("  -> parse_query_question_fast() tests passed.\n");
 }
 
+/* K-9: the CNAME/DNAME loop check's name hash (dns_query_engine.c) */
+uint64_t qn_hash64(const char *name);
+void query_engine_set_key_for_test(uint64_t k0, uint64_t k1);
+
+static void test_qn_hash64_properties(void) {
+    printf("[TEST] Query Engine: keyed loop-check hash (case, trailing dot, escapes, key)...\n");
+    /* case-insensitive (ASCII), one unescaped trailing dot ignored */
+    assert(qn_hash64("A.Loop.Example.") == qn_hash64("a.loop.example"));
+    assert(qn_hash64("a.loop.example.") == qn_hash64("a.loop.example"));
+    /* only one trailing dot is dropped; dots elsewhere count */
+    assert(qn_hash64("a.loop.example..") != qn_hash64("a.loop.example."));
+    assert(qn_hash64("a.loop.example") != qn_hash64("aloop.example"));
+    /* an escaped dot is a character of the label: "a\.b." is not "a.b." and its last dot is still the root */
+    assert(qn_hash64("a\\.b.example.") != qn_hash64("a.b.example."));
+    assert(qn_hash64("a\\.b.example.") == qn_hash64("A\\.B.EXAMPLE"));
+    /* "\\." ends with an escaped backslash: the dot after it is the trailing dot */
+    assert(qn_hash64("x\\\\.") == qn_hash64("x\\\\"));
+    /* "x\." ends with an escaped dot, which is not dropped */
+    assert(qn_hash64("x\\.") != qn_hash64("x\\"));
+    assert(qn_hash64("x\\.") != qn_hash64("x"));
+    /* different names, different hashes; the root and the empty name are the same */
+    assert(qn_hash64("b.loop.example.") != qn_hash64("a.loop.example."));
+    assert(qn_hash64(".") == qn_hash64(""));
+    /* a name longer than the stack buffer is hashed in chained blocks and still told apart by its tail */
+    static char longa[3000], longb[3000];
+    memset(longa, 'a', sizeof(longa) - 1);
+    memcpy(longb, longa, sizeof(longb));
+    longb[sizeof(longb) - 2] = 'b';
+    assert(qn_hash64(longa) != qn_hash64(longb));
+    assert(qn_hash64(longa) == qn_hash64(longa));
+    /* the hash depends on the key */
+    uint64_t h1, h2, h3;
+    query_engine_set_key_for_test(1, 2);
+    h1 = qn_hash64("a.loop.example.");
+    query_engine_set_key_for_test(3, 4);
+    h2 = qn_hash64("a.loop.example.");
+    query_engine_set_key_for_test(1, 2);
+    h3 = qn_hash64("A.LOOP.EXAMPLE");
+    assert(h1 != h2 && h1 == h3);
+    query_engine_set_key_for_test(0x0123456789abcdefULL, 0xfedcba9876543210ULL);
+    printf("  -> keyed loop-check hash passed.\n");
+}
+
 static void test_cname_loop_and_max_depth(void) {
     printf("[TEST] Query Engine: CNAME loop & recursion limit (depth >= 16)...\n");
 
@@ -11480,6 +11523,7 @@ int main(void) {
     test_resolve_name_servfail_rcode_clearing();
     test_response_section_order();
     test_parse_query_question_fast_cases();
+    test_qn_hash64_properties();
     test_cname_loop_and_max_depth();
     test_prelink_zone_additional_glue_policies();
     test_nsec3_hashing_and_intervals();

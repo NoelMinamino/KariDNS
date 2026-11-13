@@ -1115,23 +1115,55 @@ typedef struct {
   int n;
 } qn_visited_t;
 
-static uint64_t qn_hash64(const char *name) {
-  uint64_t h = 14695981039346656037ULL;
+/* K-9 (0.7): the hash is SipHash-2-4 under the process's random key (g_rcache_key, the response cache's key, drawn once at start-up by
+ * query_engine_key_init()), so that two names that collide cannot be built offline.  The bytes hashed are the name lower-cased (ASCII), an
+ * unescaped trailing dot dropped, exactly what the former unkeyed FNV-1a saw.  The name is normalised into a stack buffer (no allocation);
+ * a name longer than the buffer, which no caller passes, is chained: the hash of the full buffer starts the next one. */
+static uint64_t g_rcache_key[2];
+
+/* Drawn once per process before main(): every process and test harness that links the engine has the key before its first query, whether
+ * the response cache is configured or not, and it never changes while worker threads read it. */
+static void __attribute__((constructor)) query_engine_key_init(void) {
+  arc4random_buf(g_rcache_key, sizeof(g_rcache_key));
+}
+
+#ifdef KARIDNS_UNIT_TEST
+/* Tests: replace the key (the hash must change with it) */
+void query_engine_set_key_for_test(uint64_t k0, uint64_t k1) {
+  g_rcache_key[0] = k0;
+  g_rcache_key[1] = k1;
+}
+#endif
+
+static inline void qn_put(uint8_t *buf, size_t cap, size_t *n, uint8_t c) {
+  if (*n == cap) {
+    uint64_t h = dns_siphash24(buf, *n, g_rcache_key);
+    memcpy(buf, &h, sizeof(h));
+    *n = sizeof(h);
+  }
+  buf[(*n)++] = c;
+}
+
+STATIC_TEST uint64_t qn_hash64(const char *name) {
+  uint8_t buf[DNS_NAME_TEXT_SIZE];
+  size_t n = 0;
   bool esc = false, pending_dot = false;
   for (const char *p = name; *p; p++) {
     uint8_t c = (uint8_t)*p;
     if (!esc && c == '.') {
-      if (pending_dot) { h ^= (uint8_t)'.'; h *= 1099511628211ULL; }
+      if (pending_dot) qn_put(buf, sizeof(buf), &n, '.');
       pending_dot = true;
       continue;
     }
-    if (pending_dot) { h ^= (uint8_t)'.'; h *= 1099511628211ULL; pending_dot = false; }
+    if (pending_dot) {
+      qn_put(buf, sizeof(buf), &n, '.');
+      pending_dot = false;
+    }
     esc = !esc && c == '\\';
     if (c >= 'A' && c <= 'Z') c |= 0x20;
-    h ^= c;
-    h *= 1099511628211ULL;
+    qn_put(buf, sizeof(buf), &n, c);
   }
-  return h;
+  return dns_siphash24(buf, n, g_rcache_key);
 }
 
 /* true: `target` was visited already (a loop).  Otherwise it is entered (up to 16 names, as before) and false is returned.  `current` is the
@@ -2824,7 +2856,6 @@ typedef struct {
 
 static rcache_set_t *g_rcache;
 static size_t g_rcache_sets;
-static uint64_t g_rcache_key[2];
 static _Atomic uint64_t g_zone_data_generation = 1;
 
 uint64_t zone_data_generation_next(void) {
@@ -2839,7 +2870,7 @@ size_t response_cache_init(size_t bytes) {
   if (sets == 0 || sets > UINT32_MAX) return 0;
   rcache_set_t *t = calloc(sets, sizeof(rcache_set_t));
   if (!t) return 0;
-  arc4random_buf(g_rcache_key, sizeof(g_rcache_key));
+  /* the key (g_rcache_key) was drawn at start-up by query_engine_key_init(); the CNAME loop check shares it */
   g_rcache_sets = sets;
   g_rcache = t;
   return sets * sizeof(rcache_set_t);
