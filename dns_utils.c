@@ -987,6 +987,9 @@ size_t logev_format_line(char *out, size_t n, const char *client_ip, int client_
  * enough for an operator to see what is going on, and the count of the others is reported. */
 static const uint32_t k_logev_limit_default = 20;
 uint32_t logev_rate_limit(int cat) {
+  /* 0.7 M3 (D-5): while the debug level in force is above 0 every category may write LOGEV_DEBUG_RATE lines a second (dns_log.h says why that
+   * number); at level 0 the limits below are back.  The messages over it are still counted and reported. */
+  if (klog_debug_level() > 0) return LOGEV_DEBUG_RATE;
   switch (cat) {
     case LOGC_UPDATE_SECURITY: return 10;
     case LOGC_UPDATE: return 20;
@@ -1050,9 +1053,9 @@ static void logev_report(int cat, int level, uint32_t n) {
 }
 
 void logev_flush_suppressed(int64_t now) {
-  static const int cats[] = { LOGC_UPDATE_SECURITY, LOGC_UPDATE, LOGC_QUERY_ERRORS, LOGC_XFER_OUT };
-  for (size_t i = 0; i < sizeof(cats) / sizeof(cats[0]); i++) {
-    int c = cats[i];
+  /* every category (0.7 M3: the debug messages of all of them go through the rate limit; before, only these four had event messages:
+   * update-security, update, query-errors, xfer-out) */
+  for (int c = 0; c < LOGC_COUNT; c++) {
     if (atomic_load_explicit(&g_logev_rl[c].suppressed, memory_order_relaxed) == 0) continue;
     if (atomic_load_explicit(&g_logev_rl[c].sec, memory_order_relaxed) == now) continue;     /* its second is not over */
     uint32_t n = atomic_exchange_explicit(&g_logev_rl[c].suppressed, 0, memory_order_relaxed);

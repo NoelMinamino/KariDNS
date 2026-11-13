@@ -1220,6 +1220,20 @@ static void test_logev_helpers(void) {
     logev_rate_reset();
     assert(logev_rate_limit(LOGC_UPDATE_SECURITY) == 10 && logev_rate_limit(LOGC_XFER_OUT) == 50 && logev_rate_limit(LOGC_QUERY_ERRORS) == 20 &&
            logev_rate_limit(LOGC_UPDATE) == 20 && logev_rate_limit(LOGC_GENERAL) == 20);
+    /* 0.7 M3 (D-5): above debug level 0 every category has LOGEV_DEBUG_RATE (the overflow is still counted); at level 0 the limits above are back.
+     * (the level is set directly: klog_set_debug_level() would also recompute the masks this test sets by hand) */
+    atomic_store_explicit(&g_klog_debug_level, 3, memory_order_relaxed);
+    assert(logev_rate_limit(LOGC_UPDATE_SECURITY) == LOGEV_DEBUG_RATE && logev_rate_limit(LOGC_GENERAL) == 1000 && logev_rate_limit(LOGC_XFER_OUT) == 1000);
+    {
+        uint32_t r2 = 0;
+        int l2 = 0, n2 = 0;
+        for (int i = 0; i < 1005; i++) n2 += logev_admit_at(LOGC_XFER_IN, 3, 4000, &r2, &l2) ? 1 : 0;
+        assert(n2 == 1000);
+        assert(logev_admit_at(LOGC_XFER_IN, 3, 4001, &r2, &l2) && r2 == 5 && l2 == 3);
+    }
+    atomic_store_explicit(&g_klog_debug_level, 0, memory_order_relaxed);
+    assert(logev_rate_limit(LOGC_UPDATE_SECURITY) == 10 && logev_rate_limit(LOGC_GENERAL) == 20);
+    logev_rate_reset();
     uint32_t rep = 99;
     int rl = LOG_LVL_INFO;
     int passed = 0;
@@ -1249,6 +1263,15 @@ static void test_logev_helpers(void) {
     assert(g_ev_n == 11 && g_ev_last_level == LOG_LVL_ERROR && strcmp(g_ev_last, "21 message(s) suppressed by the rate limit of 10 per second") == 0);
     logev_flush_suppressed((int64_t)time(NULL) + 6);
     assert(g_ev_n == 11);                                                   /* said once */
+    /* 0.7 M3: the tick reports the suppressed lines of every category, not only of the four that had event messages before */
+    logev_rate_reset();
+    g_ev_n = 0;
+    logev_set_mask(LOGC_XFER_IN, LOGEV_BIT(1));
+    for (int i = 0; i < 25; i++) logev_post(LOGC_XFER_IN, 1, NULL, 0, "x");
+    assert(g_ev_n == 20);
+    logev_flush_suppressed((int64_t)time(NULL) + 5);
+    assert(g_ev_n == 21 && g_ev_last_level == 1 && strcmp(g_ev_last, "5 message(s) suppressed by the rate limit of 20 per second") == 0);
+    logev_set_mask(LOGC_XFER_IN, 0);
     /* a text longer than the record is cut; no hook, no routing */
     logev_rate_reset();
     g_ev_n = 0;
@@ -1377,6 +1400,18 @@ static void test_event_ring_and_logger(void) {
     logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, "192.0.2.7", 1, "kept");
     assert(atomic_load_explicit(&worker.qlog_ring.head, memory_order_relaxed) == 54);
     assert(atomic_load_explicit(&worker.qlog_ring.ev_dropped, memory_order_relaxed) == 1);
+    /* 0.7 M3 (D-5): a debug record stops at half the ring (32 of 64), under the query log's 80% */
+    const uint32_t qe_mask = atomic_load_explicit(&g_logev_mask[LOGC_QUERY_ERRORS], memory_order_relaxed);
+    logev_set_mask(LOGC_QUERY_ERRORS, LOGEV_BIT(3));
+    atomic_store_explicit(&worker.qlog_ring.head, 32, memory_order_relaxed);
+    logev_post(LOGC_QUERY_ERRORS, 3, "192.0.2.7", 1, "debug, dropped");
+    assert(atomic_load_explicit(&worker.qlog_ring.head, memory_order_relaxed) == 32);
+    assert(atomic_load_explicit(&worker.qlog_ring.ev_dropped, memory_order_relaxed) == 2);
+    atomic_store_explicit(&worker.qlog_ring.head, 31, memory_order_relaxed);
+    logev_post(LOGC_QUERY_ERRORS, 3, "192.0.2.7", 1, "debug, kept");
+    assert(atomic_load_explicit(&worker.qlog_ring.head, memory_order_relaxed) == 32);
+    assert(atomic_load_explicit(&worker.qlog_ring.ev_dropped, memory_order_relaxed) == 2);
+    logev_set_mask(LOGC_QUERY_ERRORS, qe_mask);
     /* a worker without a ring (it could not allocate one): nothing is written, nothing breaks */
     qlog_event_t *saved = worker.qlog_ring.events;
     worker.qlog_ring.events = NULL;

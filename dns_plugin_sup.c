@@ -332,6 +332,10 @@ static void m_start_request(plug_sup_t *s, const plug_msg_t *m) {
 
 /* The plugin of the slot has ended (or could not be started): try again after the backoff of the loader */
 static void m_schedule(plug_mslot_t *sl, int64_t now) {
+  /* 0.7 M3, debug 1: why the wait is as long as it is (never the plugin's arguments: they can carry secrets) */
+  logev_post(LOGC_GENERAL, 1, NULL, 0, "[Plugin] zone '%s' in view '%s': %s", sl->zone, sl->view,
+             sl->started_ms && now - sl->started_ms >= PLUG_UPTIME_RESET_MS ? "it ran long enough: the restart backoff is reset to 1 s"
+             : "it ended soon after its start (or did not start): the backoff doubles after this wait");
   if (sl->started_ms && now - sl->started_ms >= PLUG_UPTIME_RESET_MS) sl->backoff_s = 1;
   if (sl->backoff_s == 0) sl->backoff_s = 1;
   sl->state = PLUG_MS_WAIT;
@@ -627,6 +631,7 @@ bool plug_sup_child_exited(plug_sup_t *s, pid_t pid, int status) {
     }
   for (int i = 0; i < s->nstopping; i++)
     if (s->stopping[i].pid == pid) {
+      logev_post(LOGC_GENERAL, 1, NULL, 0, "[Plugin] a stopped plugin (pid %d) was reaped (status %d)", (int)pid, status);
       if (s->stopping[i].pd >= 0) close(s->stopping[i].pd);
       s->stopping[i] = s->stopping[--s->nstopping];
       return true;

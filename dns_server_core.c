@@ -1288,15 +1288,17 @@ void *response_logger_thread_func(void *arg) {
 
 /* batch 14: the sink of the event messages (dns_log.h logev_post()) of a worker thread.  The record goes into the worker's own query log ring (this
  * thread is its one producer, as for a query); the query logger thread formats it and routes it to the channels.  Fixed size, nothing allocated; the
- * texts are cut.  The events have their own limit on the ring (90%: they come after the 80% at which the query log stops itself), and what does not
- * fit is counted in ev_dropped.  Called only when a channel passes the message (logev_wanted()) and the rate limit has admitted it. */
+ * texts are cut.  The events have their own limit on the ring (90%: they come after the 80% at which the query log stops itself; a debug record 50%), and
+ * what does not fit is counted in ev_dropped.  Called only when a channel passes the message (logev_wanted()) and the rate limit has admitted it. */
 STATIC_TEST void qlog_event_sink(void *vctx, int cat, int level, const char *client_ip, int client_port, const char *msg) {
     worker_ctx_t *ctx = vctx;
     qlog_ring_t *ring = &ctx->qlog_ring;
     if (!ring->events) return;
     uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
     uint32_t t = atomic_load_explicit(&ring->tail, memory_order_acquire);
-    if (h - t >= ring->size / 10 * 9) {
+    /* 0.7 M3 (D-5): a debug record (level > 0) may fill the ring only to half, so that a debug flood can never bring it to the 80% at which the
+     * query log stops itself (write_query_log()); the other events keep their 90% */
+    if (h - t >= (level > 0 ? ring->size / 2 : ring->size / 10 * 9)) {
         atomic_fetch_add_explicit(&ring->ev_dropped, 1, memory_order_relaxed);
         return;
     }
@@ -2877,6 +2879,8 @@ worker_startup_success:;
           /* 上限は開いている TCP 接続の数で数える (AXFR スレッドや非同期 I/O スレッドへ渡した
            * 接続はプールのコンテキストを返しているが、閉じるまで g_tcp_clients に数えられる) */
           if (atomic_load_explicit(&g_tcp_clients, memory_order_acquire) >= MAX_TCP_CLIENTS) {
+            /* 0.7 M3, debug 3 (the ring of this worker, rate-limited): why a connection was closed at once */
+            logev_post(LOGC_NETWORK, 3, NULL, 0, "[Network] TCP connection closed at accept: %d connections are open, the most there may be", MAX_TCP_CLIENTS);
             close(client_fd);
             continue;
           }
@@ -2892,6 +2896,8 @@ worker_startup_success:;
             continue;
           }
           inc_tcp_clients();
+          logev_post(LOGC_NETWORK, 3, NULL, 0, "[Network] TCP connection accepted (socket %d, %d open, first message within %d ms)", client_fd,
+                     atomic_load_explicit(&g_tcp_clients, memory_order_relaxed), (int)tcp_initial_ms);
 
           int cflags = fcntl(client_fd, F_GETFL, 0);
           fcntl(client_fd, F_SETFL, cflags | O_NONBLOCK);
@@ -3737,6 +3743,8 @@ STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged
     return res;
   }
   free(config_str);
+  logev_post(LOGC_GENERAL, 2, NULL, 0, "[Config] %s: %s parsed; the readers of the configuration before have finished", skip_unchanged ? "reconfig" : "reload",
+             g_config_path ? g_config_path : "");
   if (g_cli_port_override > 0) {
     standby->port = g_cli_port_override;
   }
@@ -3786,7 +3794,16 @@ STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged
   if (standby->dnstap.enabled) {
     dnstap_set_message_types(standby->dnstap.log_auth_query, standby->dnstap.log_auth_response);
   }
+  logev_post(LOGC_GENERAL, 1, NULL, 0, "[Config] %s: configuration generation %llu published; logging %s; the zones are rebuilt now (%s)",
+             skip_unchanged ? "reconfig" : "reload", (unsigned long long)standby->generation,
+             strstr(res.restart_needed, "logging") ? "unchanged until a restart" : "taken from the new configuration",
+             skip_unchanged ? "zone files whose mtime and size are unchanged are not read" : "every zone file is read");
+  struct timespec rz0, rz1;
+  clock_gettime(CLOCK_MONOTONIC, &rz0);
   res.zones_failed = rebuild_zone_db_from_config_ext(standby, skip_unchanged, res.detail, sizeof(res.detail));
+  clock_gettime(CLOCK_MONOTONIC, &rz1);
+  logev_post(LOGC_GENERAL, 1, NULL, 0, "[Config] %s: zones rebuilt in %lld ms, %d failed to load", skip_unchanged ? "reconfig" : "reload",
+             (long long)((rz1.tv_sec - rz0.tv_sec) * 1000 + (rz1.tv_nsec - rz0.tv_nsec) / 1000000), res.zones_failed);
   /* beta design 4.5: the loader gets a CONFIG with the new generation.  After the snapshot: the ingest thread answers it
    * with a walk of the registry (reeval_settings()) under the rebuild lock, which the rebuild would otherwise wait for. */
   db_ingest_config_changed();
@@ -4793,10 +4810,14 @@ void *control_thread_func(void *arg) {
             if (cfg && strncmp(c->buf, "AUTH ", 5) == 0)
               auth_ok = ctrl_auth_match(cfg, c->challenge, c->buf + 5, c->key_name, sizeof(c->key_name), &c->perm);
             release_config_snapshot(cfg);
+            /* 0.7 M3: the result of the challenge, by the key's name only (never the secret, the challenge's HMAC or the line the client sent) */
             if (auth_ok) {
+              logev_post(LOGC_SECURITY, 3, NULL, 0, "[Control] connection %d: authenticated with key \"%s\"", cfd, c->key_name);
               (void)ctl_send_all(cfd, "OK\n", 3);
               c->state = CTRL_STATE_CMD_WAIT;
             } else {
+              logev_post(LOGC_SECURITY, 1, NULL, 0, "[Control] connection %d: authentication failed (%s); the connection is closed", cfd,
+                         strncmp(c->buf, "AUTH ", 5) != 0 ? "the first line is not AUTH" : "the answer to the challenge matches no key of the control channel");
               (void)ctl_send_all(cfd, "AUTH_FAILED\n", 12);
               free_ctrl_client(cfd);
               continue;
@@ -4843,6 +4864,10 @@ void *control_thread_func(void *arg) {
             /* The permission of the key that authenticated this connection (a copy made at login).  Every command goes through this one check;
              * a refused command is answered and logged, and the connection stays open. */
             const bool allowed = (c->perm & control_command_perm(cmd, arg != NULL)) != 0;
+            /* 0.7 M3, debug 3: how the line was taken apart and what the key's permissions said (the line itself is the NOTICE below) */
+            logev_post(LOGC_GENERAL, 3, NULL, 0, "[Control] key \"%s\": command '%.32s', argument '%.64s', view '%.64s'%s: %s by the key's permissions", c->key_name, cmd,
+                       arg ? arg : "", view_arg ? view_arg : "", want_force ? (opt_word && opt_word[0] == 'l' ? ", local" : ", force") : "",
+                       allowed ? "allowed" : "refused");
             if (allowed) {
               /* obspage: one line per listing (its first page, cursor "-"), the later pages at debug level: `karictl stats` of 1M zones asks for
                * some 200 pages and filled the log with them (0.6.2) */
@@ -5578,6 +5603,7 @@ void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
       int actual_rcv = 0;
       socklen_t optlen = sizeof(actual_rcv);
       if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual_rcv, &optlen) == 0) {
+        logev_post(LOGC_NETWORK, 2, NULL, 0, "[Network] UDP socket %d: SO_RCVBUF requested %d, the system gives %d", fd, desired_rcv, actual_rcv);
         if (actual_rcv < desired_rcv) {
           syslog(LOG_WARNING,
                  "[Network] UDP SO_RCVBUF truncated by OS: requested %d bytes, got %d bytes "
@@ -5594,6 +5620,7 @@ void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
       int actual_snd = 0;
       socklen_t optlen = sizeof(actual_snd);
       if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &actual_snd, &optlen) == 0) {
+        logev_post(LOGC_NETWORK, 2, NULL, 0, "[Network] UDP socket %d: SO_SNDBUF requested %d, the system gives %d", fd, desired_snd, actual_snd);
         if (actual_snd < desired_snd) {
           syslog(LOG_WARNING,
                  "[Network] UDP SO_SNDBUF truncated by OS: requested %d bytes, got %d bytes "
@@ -5648,6 +5675,8 @@ int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], b
 #endif
     }
     if (bind(udp_fd, (struct sockaddr *)&addr, addr_len) == 0) {
+      logev_post(LOGC_NETWORK, 1, NULL, 0, "[Network] UDP listener %s#%d (socket %d)%s", la->text, (int)la->port, udp_fd,
+                 is_wildcard ? ": a wildcard address, the reply's source is taken from the destination of the query" : "");
       out_is_wildcard[num_fds] = is_wildcard;
       out_fds[num_fds++] = udp_fd;
     } else {
@@ -7380,6 +7409,9 @@ int main(int argc, char **argv) {
       router_pids[r] = rpid;
     }
     sigprocmask(SIG_SETMASK, &fork_orig, NULL);
+    logev_post(LOGC_GENERAL, 1, NULL, 0, "[Manager] children started: Backend pid %d, %d Frontend router(s) (first pid %d), connect broker pid %d; the end of any of "
+               "them ends the server%s", (int)backend_pid, g_num_frontend_routers, g_num_frontend_routers > 0 ? (int)router_pids[0] : -1, (int)g_broker_pid,
+               dbsup.enabled ? ", the database loader is restarted" : "");
 
     // 親プロセス（Manager）はすべての不要なIPCソケット・制御ソケットを確実にクローズ (指示2)
     for (int f = 0; f < g_num_frontend_routers; f++) {

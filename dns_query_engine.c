@@ -137,6 +137,21 @@ static void qe_log_failure(const server_config_t *cfg, const uint8_t *req, size_
   logev_post(LOGC_QUERY_ERRORS, level, client_ip, qe_client_port(), "query failed (%s) for %s/%s/%s: %s", dns_rcode_name(rcode), name, cls, tstr, reason);
 }
 
+/* 0.7 M3, debug 3 in category client: the view and the zone a message was routed to and the RCODE of its answer, one line per message (through the
+ * worker's ring, logev_post()).  The caller has checked logev_wanted(LOGC_CLIENT, 3): one atomic load for the query, nothing else at level 0. */
+static void qe_log_route(const query_route_t *route, const char *qname, uint16_t qtype, const uint8_t *req, const uint8_t *res, int len, const char *client_ip,
+                         bool signed_req) {
+  char name[300], tn[32];
+  logev_name_text(qname ? qname : "", name, sizeof(name));
+  const view_snapshot_t *v = route ? route->view : NULL;
+  const zone_db_entry_t *e = route ? route->entry : NULL;
+  static const char *const ops[16] = { "query", "iquery", "status", "opcode 3", "notify", "update", "opcode 6", "opcode 7", "opcode 8", "opcode 9",
+                                       "opcode 10", "opcode 11", "opcode 12", "opcode 13", "opcode 14", "opcode 15" };
+  logev_post(LOGC_CLIENT, 3, client_ip, qe_client_port(), "%s %s/%s%s: view '%s', zone '%s': %s", ops[(req[2] >> 3) & 0x0F], name,
+             format_type_name(qtype, tn, sizeof(tn)), signed_req ? " (signed)" : "", v ? (v->name ? v->name : "") : "(none matched)", e ? e->domain : "(none)",
+             len >= DNS_HEADER_SIZE ? dns_rcode_name(res[3] & 0x0F) : "no answer now (parked until its zone is read, or dropped)");
+}
+
 /* UPDATE (RFC 2136) that never reaches the zone: the zone section is wrong (BIND lib/ns/update.c, category update, INFO: "update failed: ... (RCODE)") */
 static void qe_log_update_zone_error(const char *client_ip, int zone_rcode, const char *zname) {
   if (!logev_wanted(LOGC_UPDATE, LOG_LVL_INFO)) return;
@@ -3362,6 +3377,7 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
     int plain = process_query_body(req, req_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
                                    is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, NULL, route, not_ready_zone);
     qe_log_failure(cfg, req, req_len, res, plain, client_ip);
+    if (logev_wanted(LOGC_CLIENT, 3)) qe_log_route(route, qname, qtype, req, res, plain, client_ip, false);
     t_qacl.local_valid = t_qacl.client_valid = false;   /* the address of the next query is set by its transport */
     t_qacl.key = NULL;
     return plain;
@@ -3382,6 +3398,7 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
   int ret = process_query_body(body_req, body_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
                                is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, &tsig, route, not_ready_zone);
   qe_log_failure(cfg, req, req_len, res, ret, client_ip);
+  if (logev_wanted(LOGC_CLIENT, 3)) qe_log_route(route, qname, qtype, req, res, ret, client_ip, true);
   t_qacl.local_valid = t_qacl.client_valid = false;
   t_qacl.key = NULL;
   if (ret < DNS_HEADER_SIZE) return ret;
@@ -3749,17 +3766,25 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
      * tsig-key を設定したゾーンではその鍵で署名されたものだけ。それ以外は方針による拒否 (REFUSED)。 */
     tsig_key_t *tkey = (tsig && tsig->status == TSIG_REQ_VALID) ? tsig->key : NULL;
     bool auth = false;
+    const char *by = !db_entry || !view ? "no zone of that name in the client's view" : "not from a primary of the zone, nor allowed by allow-notify";
     if (db_entry && view) {
       const zone_config_t *zcfg = zone_cfg_any;
       const zone_ext_t *zx = zext(zcfg);
       /* from one of the primaries, signed with that primary's key (else the zone's tsig-key) when it has one */
-      if (zcfg && zx->masters_count > 0) auth = notify_from_zone_primaries(cfg, view->name, zx, client_ip, tkey);
+      if (zcfg && zx->masters_count > 0 && (auth = notify_from_zone_primaries(cfg, view->name, zx, client_ip, tkey))) by = "from a primary of the zone";
       /* a catalog member has no zone { } of its own (or none with primaries): the primaries of its catalog zone */
-      if (!auth && db_entry->is_catalog_member) auth = notify_from_member_primaries(cfg, view, db_entry, client_ip, tkey);
+      if (!auth && db_entry->is_catalog_member && (auth = notify_from_member_primaries(cfg, view, db_entry, client_ip, tkey))) by = "from a primary of its catalog zone";
       /* allow-notify (BIND 9.20 ARM): "in addition to the zone primaries"; it applies to the secondary zones, from the zone, the view
        * or options.  A `key` element is the TSIG key the NOTIFY was signed with. */
-      if (!auth && db_entry->is_secondary)
-        auth = zone_notify_acl_allows(cfg, zcfg, view->name, client_ip, tkey ? tkey->name : NULL);
+      if (!auth && db_entry->is_secondary && (auth = zone_notify_acl_allows(cfg, zcfg, view->name, client_ip, tkey ? tkey->name : NULL))) by = "allow-notify";
+      if (!auth && !db_entry->is_secondary && !db_entry->is_catalog_member && !(zcfg && zx->masters_count > 0)) by = "the zone is not a secondary";
+    }
+    /* 0.7 M3, debug 1: why a NOTIFY was taken or refused (the refresh that it starts compares the serials: xfer-in) */
+    if (logev_wanted(LOGC_NOTIFY, 1)) {
+      char zn[300];
+      logev_name_text(current_qname, zn, sizeof(zn));
+      logev_post(LOGC_NOTIFY, 1, client_ip, qe_client_port(), "received NOTIFY for zone '%s' (view '%s')%s%s: %s (%s)", zn, view && view->name ? view->name : "",
+                 tkey ? ", signed with key " : ", unsigned", tkey && tkey->name ? tkey->name : "", auth ? "accepted, refresh scheduled" : "refused", by);
     }
 
     uint8_t notify_rcode = 0;
@@ -3826,6 +3851,15 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       /* the address list, the named keys, update-acl-match and (DB zones) acl-ceiling: dns_tsig_acl.c */
       /* update-policy replaces allow-update: the UPDATE must be signed, and the rules decide each change (handle_dynamic_update()) */
       if (zcfg) auth = zext(zcfg)->upd_policy ? tkey != NULL : zone_update_acl_allows_in_view(cfg, zcfg, view->name, client_ip, tkey ? tkey->name : NULL);
+      /* 0.7 M3, debug 1: the rule that decides the UPDATE (allow-query is looked at before it, and logged in update-security when it refuses) */
+      if (logev_wanted(LOGC_UPDATE, 1)) {
+        const bool pol = zcfg && zext(zcfg)->upd_policy;
+        logev_post(LOGC_UPDATE, 1, client_ip, qe_client_port(), "UPDATE of zone '%s' (view '%s')%s%s: %s", db_entry->domain, view->name ? view->name : "",
+                   tkey ? ", signed with key " : ", unsigned", tkey && tkey->name ? tkey->name : "",
+                   !zone_is_master ? "the zone is not a primary: refused (updates are not forwarded)"
+                   : pol ? (auth ? "update-policy: the request is signed, its rules decide each change" : "update-policy: refused, the request is not signed")
+                   : auth ? "allowed by allow-update" : "refused by allow-update (no element matched the address or the key)");
+      }
     }
 
     int rcode = 5; // REFUSED

@@ -76,6 +76,22 @@ void syslog(int priority, const char *format, ...) {
     (void)priority;
     (void)format;
 }
+/* 0.7 M3: the debug lines of the engine (logev_*); included after the stub above, whose name the header's macro must not change */
+#include "dns_log.h"
+#undef syslog
+static char g_dbg_lines[16][300];
+static int g_dbg_n;
+static void dbg_hook(int cat, int level, const char *msg) {
+    if (g_dbg_n < 16) snprintf(g_dbg_lines[g_dbg_n], sizeof(g_dbg_lines[0]), "%d %d %s", cat, level, msg);
+    g_dbg_n++;
+}
+static bool dbg_has(const char *needle) {
+    for (int i = 0; i < g_dbg_n && i < 16; i++)
+        if (strstr(g_dbg_lines[i], needle)) return true;
+    fprintf(stderr, "no debug line with [%s]; the lines:\n", needle);
+    for (int i = 0; i < g_dbg_n && i < 16; i++) fprintf(stderr, "  %s\n", g_dbg_lines[i]);
+    return false;
+}
 
 server_config_t *acquire_config_snapshot(void) {
     return atomic_load_explicit(&g_config_db.active, memory_order_acquire);
@@ -514,6 +530,33 @@ static void test_notify_authorization(void) {
         req_t q2 = q;
         assert(tsig_verify_packet(q2.b, q2.n, k1, NULL, 0, NULL, 0, false, req_mac, &req_mac_len) == 0);
         assert(tsig_verify_packet(g_gr.res, r.len, k1, req_mac, req_mac_len, NULL, 0, false, resp_mac, &resp_mac_len) == 0);
+    }
+    /* 0.7 M3: with the debug levels wanted, the NOTIFY decision (notify, 1), the route of the message (client, 3) and the TSIG check (security, 3)
+     * are said; nothing at all while no channel wants them; never a secret or a MAC */
+    {
+        g_dbg_n = 0;
+        klog_set_level_hook(dbg_hook);
+        build_notify(&q, "example.", k1);
+        ask(&q, "example.", 6, MASTER, false, &r);
+        assert(g_dbg_n == 0);
+        logev_rate_reset();
+        logev_set_mask(LOGC_NOTIFY, LOGEV_BIT(1));
+        logev_set_mask(LOGC_CLIENT, LOGEV_BIT(3));
+        logev_set_mask(LOGC_SECURITY, LOGEV_BIT(3));
+        build_notify(&q, "example.", k1);
+        ask(&q, "example.", 6, MASTER, false, &r);
+        build_notify(&q, "example.", k1);
+        ask(&q, "example.", 6, STRANGER, false, &r);
+        assert(dbg_has("3 1 client 192.0.2.100: received NOTIFY for zone 'example' (view '__default__'), signed with key k1"));
+        assert(dbg_has(": accepted, refresh scheduled (from a primary of the zone)"));
+        assert(dbg_has("3 1 client 203.0.113.9: received NOTIFY") && dbg_has(": refused (not from a primary of the zone, nor allowed by allow-notify)"));
+        assert(dbg_has("21 3 client 192.0.2.100: notify example/SOA (signed): view '__default__', zone 'example"));
+        assert(dbg_has("5 3 client 192.0.2.100: [TSIG] key 'k1") && dbg_has("algorithm hmac-sha256") && dbg_has(": verified (time signed "));
+        for (int i = 0; i < g_dbg_n && i < 16; i++) assert(!strstr(g_dbg_lines[i], "secret"));
+        logev_set_mask(LOGC_NOTIFY, 0);
+        logev_set_mask(LOGC_CLIENT, 0);
+        logev_set_mask(LOGC_SECURITY, 0);
+        klog_set_level_hook(NULL);
     }
 
     /* R-30: the TSIG is checked first (RFC 8945 5.2); a policy denial after a valid or absent TSIG is REFUSED,

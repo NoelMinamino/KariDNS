@@ -1706,6 +1706,12 @@ static int commit_zone(ctx_t *x, const zinfo_t *zi, zres_t *r) {
         }
         fw_unlock(x);
         x->n_zones++;
+        if (atomic_load_explicit(&g_debug, memory_order_relaxed) >= 2) {      /* 0.7 M3: what went to the Backend */
+            char shown[210];
+            clean_reason(zi->name ? zi->name : "(NULL)", shown, sizeof(shown));
+            lgd(2, "zone '%s' (domains.id %lld): sent, serial %u, %zu octets%s%s", shown, (long long)zi->id, (unsigned)r->serial, r->len,
+                zi->summary ? ", summary" : "", x->fetch ? ", for a fetch" : "");
+        }
         if (x->fetch && x->fetch_vname && !zi->summary) fev_push(x->fetch_vname, zi->canon, zi->id, r->serial, r->digest);     /* (a fetch has no inventory of its own: the main thread keeps it; the summary of a fetch is no data in memory) */
         if (x->io && !x->fetch) {              /* sent: what the Backend will have once it says "applied" */
             inv_ent_t *ie = inv_get(&x->io->inv, x->vslot, zi->canon);
@@ -3854,7 +3860,15 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
             snprintf(f->zone, sizeof(f->zone), "%s", q->name);
             pthread_cond_broadcast(&io->fq_cond);          /* (broadcast: a worker above fq_allowed would take the wake-up) */
         }
+        const unsigned queued = (unsigned)io->nfq;
         pthread_mutex_unlock(&io->fq_lock);
+        if (atomic_load_explicit(&g_debug, memory_order_relaxed) >= 2) {      /* 0.7 M3: what the Backend asked for, and where it went */
+            char shown[210];
+            clean_reason(q->name, shown, sizeof(shown));
+            lgd(2, "fetch %llu: zone '%s' (view %u, %s): %s (%u queued)", (unsigned long long)q->request_id, shown, (unsigned)q->view,
+                q->mode == KDB_FETCH_SUMMARY ? "summary" : "whole zone", !f ? "refused, too many are waiting (the Backend's request times out)"
+                : f >= io->fq && f < io->fq + FQ_MAX ? "queued" : "answered busy", queued);
+        }
         break;
     }
     case KDB_T_HOT_LIST:

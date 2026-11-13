@@ -396,6 +396,9 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
         ctx->error_occurred = true;
         return (conf_token_t){TOKEN_EOF, NULL, false};
       }
+      /* 0.7 M3, debug 1: which file an include read (its name and size: an include can hold keys, its text is never logged) */
+      logev_post(LOGC_CONFIG, 1, NULL, 0, "[Config] include '%s' read (%zu octets, depth %d%s)", resolved, strlen(content), ctx->depth + 1,
+                 was_rel ? (ctx->directory ? ", relative to options { directory }" : ", relative to the including file") : "");
       ctx->depth++;
       ctx->stack[ctx->depth].file_path = dup_path;
       ctx->stack[ctx->depth].src = content;
@@ -7213,6 +7216,8 @@ static int config_apply_directory(token_ctx_t *ctx, server_config_t *config) {
     ok = ok && dir_prefix_path(&config->database.database_file, eff) && dir_prefix_path(&config->database.conninfo_file, eff);
     ok = ok && dir_prefix_path(&config->database.loader_state_file, eff);
     if (!ok) goto oom;
+    logev_post(LOGC_CONFIG, 2, NULL, 0, "[Config] options { directory \"%s\" }: the relative paths of the configuration are taken from it; the built-in "
+               "default_debug is %s", eff, config->logging.debug_file);
   }
   /* what is still relative (no directory, or a relative directory without a startup directory) and is opened after daemonize() */
   if (config->pid_file && strcmp(config->pid_file, "none") != 0 &&

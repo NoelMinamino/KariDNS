@@ -192,6 +192,15 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
   update_result_t result;
   int rcode = process_update_sections_policy(req, req_len, entry->domain, z_standby, &result, zcfg_now ? zext(zcfg_now)->upd_policy : NULL,
                                               matched_key_name);
+  /* 0.7 M3, debug 2: the result of the prerequisites (RFC 2136 §3.2) and of the update section, before anything is published */
+  logev_post(LOGC_UPDATE, 2, client_ip, query_client_port(), "[Update] zone '%s': %d prerequisite(s), %d update RR(s): %s (%s)", entry->domain, result.prcount,
+             result.upcount, rcode == 3 ? "prerequisite failed: a name that must be in use is not (RFC 2136 3.2.5)"
+             : rcode == 6 ? "prerequisite failed: a name that must not be in use is (RFC 2136 3.2.5)"
+             : rcode == 7 ? "prerequisite failed: an RRset that must not exist does (RFC 2136 3.2.5)"
+             : rcode == 8 ? "prerequisite failed: an RRset that must exist does not, or differs (RFC 2136 3.2.5)"
+             : rcode == 5 ? (result.why == UPD_WHY_POLICY ? "an update RR refused by update-policy" : "refused")
+             : rcode != 0 ? "the message cannot be applied"
+             : result.changed ? "prerequisites satisfied, the zone changes" : "prerequisites satisfied, nothing changes", dns_rcode_name((unsigned)rcode));
   if (rcode != 0 || !result.changed) {
     /* エラーなら何も適用しない (RFC 2136 §3.4.2.1)。何も変わらなかった UPDATE (前提条件だけ、
      * 無視された RR や既存と同じ RR だけ) はシリアルを上げず、公開も NOTIFY もしない (§3.6)。*/
@@ -282,6 +291,8 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
   zone_publish(entry, z_next);
   if (entry->source == ZONE_SRC_DB) atomic_store_explicit(&entry->updated, true, memory_order_release);      /* D1a: the cache manager does not take the zone out of memory: the UPDATE lives only there */
   pthread_mutex_unlock(&entry->writer_lock);
+  logev_post(LOGC_UPDATE, 2, client_ip, query_client_port(), "[Update] zone '%s': published serial %u (%s); NOTIFY is sent at the next tick", entry->domain,
+             new_serial, result.soa_replaced ? "the SOA of the UPDATE" : "serial-update-method");
 
   notify_request_send(entry);
 
@@ -1073,6 +1084,8 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
    * catalog member does not pass a transfer on; explicit = only the also-notify list, not the NS hosts of the zone */
   notify_mode_t mode = notify_mode_effective(active, zone, view_name);
   if (mode == NOTIFY_MODE_NO || (mode == NOTIFY_MODE_PRIMARY_ONLY && entry && zone_entry_ticks(entry))) {
+    logev_post(LOGC_NOTIFY, 1, NULL, 0, "[Notify] zone '%s' (view '%s'): no NOTIFY is sent: %s", domain, view_name ? view_name : "",
+               mode == NOTIFY_MODE_NO ? "notify no" : "notify primary-only and the zone is a secondary");
     if (snap) release_zone_snapshot(snap);
     if (active) release_config_snapshot(active);
     rcu_aux_read_unlock();
@@ -1152,6 +1165,10 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
     syslog(LOG_WARNING, "[Notify] zone '%s': more than %d NOTIFY destinations (also-notify and the NS hosts); the others get no NOTIFY and find the "
                         "change at their next refresh", domain, (int)(sizeof(targets) / sizeof(targets[0])));
 
+  logev_post(LOGC_NOTIFY, 1, NULL, 0, "[Notify] zone '%s' (view '%s'): %d destination(s): %d from also-notify%s, the others from the apex NS hosts%s; %s%s",
+             domain, view_name ? view_name : "", ntargets, an_count, mode == NOTIFY_MODE_EXPLICIT ? " (notify explicit)" : "",
+             eff.notify_to_soa ? " (notify-to-soa yes: the SOA MNAME host too)" : " (not the SOA MNAME host)",
+             key ? "the zone's tsig-key is " : "the zone has no tsig-key (a key of also-notify or of a server statement may sign)", key && key->name ? key->name : "");
   int nsent = 0;
   for (int i = 0; i < ntargets; i++) {
     /* the local address of this NOTIFY: the `source` of the also-notify list the address is written in, else notify-source(-v6).  Only an
@@ -1184,6 +1201,12 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
     }
     /* tcp-only yes in that server statement: the NOTIFY goes over TCP (BIND notify_send_toaddr(): dns_peer_getforcetcp()) */
     bool tcp_only = srv && (srv->set & SV_B_TCP_ONLY) && (srv->bools & SV_B_TCP_ONLY);
+    if (logev_wanted(LOGC_NOTIFY, 2)) {
+      char dt[INET6_ADDRSTRLEN] = "?";
+      inet_ntop(fam, dst_bytes, dt, sizeof(dt));
+      logev_post(LOGC_NOTIFY, 2, NULL, 0, "[Notify] zone '%s': NOTIFY to %s over %s, %s%s%s", domain, dt, tcp_only ? "TCP (tcp-only of the server statement)" : "UDP",
+                 has_src ? "notify-source set, " : "", tkey ? "TSIG key " : "unsigned", tkey && tkey->name ? tkey->name : "");
+    }
     if (notify_send_to(domain, view_name, &targets[i].addr, has_src, src, tkey, &nr, g_notify_rate, tcp_only)) nsent++;
   }
 

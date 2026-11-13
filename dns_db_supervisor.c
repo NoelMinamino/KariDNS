@@ -563,6 +563,10 @@ bool db_sup_child_exited(db_sup_t *s, pid_t pid, int status) {
   else if (WIFSIGNALED(status))
     syslog(LOG_ERR, "[Manager] Database loader (pid %d) killed by signal %d", (int)pid, WTERMSIG(status));
   s->pid = 0;
+  /* 0.7 M3, debug 1: why the next start waits as long as it does */
+  logev_post(LOGC_DATABASE, 1, NULL, 0, "[Manager] Database loader (pid %d) ran %lld ms: %s; the next start waits %u s", (int)pid, (long long)(now - s->started_ms),
+             now - s->started_ms >= DB_SUP_UPTIME_RESET_MS ? "long enough to reset the backoff" : "the backoff doubles after this start (up to its maximum)",
+             now - s->started_ms >= DB_SUP_UPTIME_RESET_MS ? 1u : s->backoff_s);
   if (now - s->started_ms >= DB_SUP_UPTIME_RESET_MS) s->backoff_s = 1;
   schedule_restart(s, now);
   return true;

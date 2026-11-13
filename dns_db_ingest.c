@@ -1234,6 +1234,12 @@ static void job_finish(ing_t *g, ing_job_t *j) {
     fetch_job_finish(g, j);
     return;
   }
+  /* 0.7 M3, debug 1: what became of every zone of a batch (the INFO and WARNING lines below stop after the first few) */
+  logev_post(LOGC_DATABASE, 1, NULL, 0, "[DB] zone '%s' (view '%s'), serial %u: %s%s%s", j->zone, j->view_name, j->serial,
+             j->status == KDB_ST_APPLIED ? "installed" : j->status == KDB_ST_NOT_RESIDENT ? "version taken, the data stays out of memory"
+             : j->status == KDB_ST_SHADOWED ? "loaded but hidden (a zone of karidns.conf or a catalog member has the name)"
+             : j->status == KDB_ST_UNCHANGED ? "unchanged, nothing to install" : j->status == KDB_ST_SEND_BODY ? "another version: the whole zone is asked for"
+             : "rejected", j->status == KDB_ST_REJECTED ? ": " : "", j->status == KDB_ST_REJECTED ? j->reason : "");
   switch (j->status) {
   case KDB_ST_NOT_RESIDENT:                              /* a body that was left out of memory: the directory has the version (counted as applied) */
   case KDB_ST_APPLIED:
@@ -2799,6 +2805,9 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
   }
   if (!ok)
     syslog(LOG_WARNING, "[DB] fetch of zone '%s' (view '%s') failed: %s", done.zone, done.view_name, why && why[0] ? why : "no reason given");
+  else
+    logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] fetch %llu of zone '%s' (view '%s') done in %lld ms%s", (unsigned long long)done.id, done.zone, done.view_name,
+               (long long)(now_ms() - done.sent_ms), done.dropped ? ": unchanged, the version in memory stays" : "");
   if (dbreg_pending_count() > 0) apply_delta(g);         /* a zone that was new to the index becomes visible before its queries are woken */
   if (ok && !done.quiet && done.mode == KDB_FETCH_FULL) dbreg_touch_loaded(done.view_name, done.zone);
   /* a zone that only a background fetch (a CNAME or glue that leads into it, step 8) brought is the first to go when memory-limit needs room (BGLOAD): N cold name
@@ -3017,6 +3026,8 @@ static void fetch_issue(ing_t *g) {
           break;
         }
         atomic_fetch_add_explicit(&g_fetch_shed, 1, memory_order_relaxed);
+        logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] fetch of zone '%s' (view '%s') shed by memory-limit: %s; its queries get \"not ready\"", q.zone, q.view,
+                   dbreg_cache_over_limit() ? "the database zones in memory are over the limit" : "as many fetches in flight as fetch-concurrency allows");
         park_wake_broadcast(q.view, q.zone, true);
         continue;
       }
@@ -3034,6 +3045,8 @@ static void fetch_issue(ing_t *g) {
         break;
       }
       atomic_fetch_add_explicit(&g_fetch_limited, 1, memory_order_relaxed);
+      logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] fetch of zone '%s' (view '%s') held back by fetch-rate %u/s: no token left; its queries get \"not ready\"", q.zone,
+                 q.view, frate);
       park_wake_broadcast(q.view, q.zone, true);
       continue;
     }
@@ -3080,6 +3093,9 @@ static void fetch_issue(ing_t *g) {
     snprintf(r->view_name, sizeof(r->view_name), "%s", g->view_names[vi]);
     snprintf(r->zone, sizeof(r->zone), "%s", q.zone);
     g->nfreq++;
+    logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] fetch %llu: zone '%s' (view '%s'), %s, %s%s; %u in flight", (unsigned long long)r->id, r->zone, r->view_name,
+               r->mode == KDB_FETCH_SUMMARY ? "summary (the apex)" : "whole zone", r->prio == KDB_FETCH_PRIO_WARM ? "warm-up" :
+               r->prio == KDB_FETCH_PRIO_BACKGROUND ? "background (CNAME or glue)" : "for a query", hot ? ", hot list" : "", (unsigned)g->nfreq);
     if (!fetch_send_req(g, r)) fetch_complete(g, r, false, "the loader's fetch stream is not connected");
   }
   if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);
