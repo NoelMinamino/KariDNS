@@ -1259,7 +1259,8 @@ typedef struct zone_retire_s {
   void (*free_fn)(void *);
   uint64_t epoch;
   bool from_prev;         /* ver was a zone's prev dropped under memory pressure: g_prev_inflight counts its bytes until it is freed */
-  int64_t retired_ms;     /* burst_now_ms() when it was put on the stack (a version: zone_retire_held()) */
+  int64_t retired_ms;     /* burst_now_ms() when it was put on the stack (a version: whether it is held, zone_retire_process()) */
+  bool held;              /* its version's bytes are in g_zbytes_retired_held (from the pass that found it held until it is freed) */
 } zone_retire_t;
 
 static _Atomic(zone_retire_t *) g_zone_retire_head;
@@ -1360,7 +1361,10 @@ static _Atomic int64_t g_retire_nowait_until_ms;    /* burst_now_ms() before whi
  * and that were retired more than ZONE_RETIRE_HELD_MS ago.  Taking zones out of memory or leaving a batch's zones out cannot free them (only the
  * reader's leaving does), so the cache manager does not count them (dbreg_cache_used_bytes()); a version retired a moment ago, whose grace period is
  * simply not over yet, is counted as before, and so is a previous version dropped under pressure (from_prev: g_prev_inflight already subtracts it,
- * it is not counted out twice).  Each pass of zone_retire_process() sets the figure of what it kept (0 when the stack is empty).  A version that a
+ * it is not counted out twice).  A pass marks a node held the first time it finds it so (a short wait that did not end while the node was not safe,
+ * or an age of ZONE_RETIRE_HELD_MS), and the node stays held until a pass frees it: the gauge is the sum of the held nodes, added when one is
+ * marked and taken off when it is freed, so a later pass that does not wait, a pass that finds the stack empty because another thread has taken
+ * it, and two passes at the same time all leave it right (a node is in one pass at a time: the passes take the whole stack off).  A version that a
  * stalled outbound transfer pins (xfr_refs, R11) or an inbound transfer keeps is held memory of the same kind. */
 #define ZONE_RETIRE_HELD_MS 1000
 static int64_t g_retire_held_ms = ZONE_RETIRE_HELD_MS;
@@ -1369,13 +1373,18 @@ uint64_t zone_bytes_retired_held(int cls) { return atomic_load_explicit(&g_zbyte
 #ifdef KARIDNS_UNIT_TEST
 void zone_retire_held_ms_set_for_test(int64_t ms) { g_retire_held_ms = ms; }
 #endif
+/* (the pass that owns r: a version, not a dropped previous one, counted once) */
+static void zone_retire_mark_held(zone_retire_t *r) {
+  if (!r->ver || r->from_prev || r->held) return;
+  r->held = true;
+  atomic_fetch_add_explicit(&g_zbytes_retired_held[zone_bytes_class(r->entry)], (uint64_t)r->ver->bytes, memory_order_relaxed);
+}
 /* the (kept, freed) counts of the last debug-2 line of zone_retire_process(), shared by its callers; UINT64_MAX: none since the stack was empty */
 static _Atomic uint64_t g_retire_last_counts = UINT64_MAX;
 void zone_retire_process(bool wait) {
   zone_retire_t *list = atomic_exchange_explicit(&g_zone_retire_head, NULL, memory_order_acquire);
   if (!list) {
     atomic_store_explicit(&g_retire_last_counts, UINT64_MAX, memory_order_relaxed);   /* (the next non-empty state is logged) */
-    for (int c = 0; c < ZBYTES_CLASSES; c++) atomic_store_explicit(&g_zbytes_retired_held[c], 0, memory_order_relaxed);
     return;
   }
   uint64_t max_epoch = 0;
@@ -1394,7 +1403,6 @@ void zone_retire_process(bool wait) {
   }
   unsigned n_freed = 0, n_kept = 0;          /* (the debug 2 line of the batch) */
   uint64_t freed_bytes = 0;
-  uint64_t held[ZBYTES_CLASSES] = { 0 };
   const int64_t now_ms = burst_now_ms();
   const bool reader_stays = wait && !all_safe;    /* (the short wait did not end, or a recent one did not: a reader stays in its section) */
   while (list) {
@@ -1402,7 +1410,7 @@ void zone_retire_process(bool wait) {
     list = r->next;
     zone_db_entry_t *e = r->entry;
     if (!all_safe && !rcu_writer_is_safe(r->epoch)) {
-      if (r->ver && !r->from_prev && (reader_stays || now_ms - r->retired_ms >= g_retire_held_ms)) held[zone_bytes_class(e)] += r->ver->bytes;
+      if (reader_stays || now_ms - r->retired_ms >= g_retire_held_ms) zone_retire_mark_held(r);
       zone_retire_push(r);
       n_kept++;
       continue;
@@ -1411,7 +1419,7 @@ void zone_retire_process(bool wait) {
      * 設定などは開始時の短い読み取り区間で写してあるので、その版のほかは引き止めない */
     if (atomic_load_explicit(&e->is_transferring, memory_order_acquire) ||
         (r->ver && atomic_load_explicit(&r->ver->xfr_refs, memory_order_acquire) > 0)) {
-      if (r->ver && !r->from_prev && now_ms - r->retired_ms >= g_retire_held_ms) held[zone_bytes_class(e)] += r->ver->bytes;   /* (a transfer's pin: by its age) */
+      if (now_ms - r->retired_ms >= g_retire_held_ms) zone_retire_mark_held(r);   /* (a transfer's pin: by its age) */
       zone_retire_push(r);
       n_kept++;
       continue;
@@ -1420,6 +1428,7 @@ void zone_retire_process(bool wait) {
     if (r->ver) {
       freed_bytes += r->ver->bytes;
       zone_bytes_retired_add(zone_bytes_class(e), -(int64_t)r->ver->bytes);     /* freed now: no longer retired */
+      if (r->held) atomic_fetch_sub_explicit(&g_zbytes_retired_held[zone_bytes_class(e)], (uint64_t)r->ver->bytes, memory_order_relaxed);
       if (r->from_prev) atomic_fetch_sub_explicit(&g_prev_inflight, (uint64_t)r->ver->bytes, memory_order_relaxed);
       zone_version_free(r->ver);
     } else {
@@ -1431,7 +1440,6 @@ void zone_retire_process(bool wait) {
   }
   /* debug 2, once per change: a node that a transfer keeps (R11: up to max-transfer-time-out, or an inbound transfer) would otherwise make the same
    * line at every control tick.  The last numbers are shared by the threads that call this (the control thread, a reload, the ingest thread). */
-  for (int c = 0; c < ZBYTES_CLASSES; c++) atomic_store_explicit(&g_zbytes_retired_held[c], held[c], memory_order_relaxed);
   const uint64_t counts = ((uint64_t)n_kept << 32) | n_freed;
   if (atomic_exchange_explicit(&g_retire_last_counts, counts, memory_order_relaxed) != counts)
     logev_post(LOGC_GENERAL, 2, NULL, 0, "[GC] retired zone versions: %u freed (%llu bytes), %u kept for readers or a running transfer (epoch %llu, %s)", n_freed,
@@ -3347,6 +3355,13 @@ STATIC_TEST bool cache_reader_sample(int64_t now_ms) {
     return atomic_load_explicit(&g_cache_long_reader, memory_order_relaxed);
 }
 bool dbreg_cache_long_reader(void) { return atomic_load_explicit(&g_cache_long_reader, memory_order_relaxed); }
+#ifdef KARIDNS_UNIT_TEST
+void cache_reader_sample_reset_for_test(void) {
+    g_cache_sample_ms = 0;
+    g_cache_sample_epoch = 0;
+    atomic_store_explicit(&g_cache_long_reader, false, memory_order_relaxed);
+}
+#endif
 
 /* the retired bytes the cache manager does not count (option B): those a pass of the retire stack found held (zone_bytes_retired_held(): kept after
  * a short wait that did not end, or a transfer's pin), and, while a long reader is in its section, every retired version byte except what evictions

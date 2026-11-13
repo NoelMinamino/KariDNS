@@ -8,13 +8,15 @@
 #   1. 3000 small file zones: a full `karictl reload` (every zone file read again, a grace period was waited for every 1024 zones and at the end:
 #      60 s each before) takes about as long during the hold as without it, and answers "OK reloaded"; a second reload during the hold waits
 #      for the readers of normal operation (here 1 s: no program or forward zone), then answers "ERROR reload postponed" (the configuration is
-#      double-buffered: its buffer may still be read by the reader) and the server does it by itself when the hold is over; `retired zone versions waiting` rises during the hold and goes back to 0 after it.
+#      double-buffered: its buffer may still be read by the reader), a third one is merged into it (postponed after the short try, no second
+#      wait) and the server does it by itself when the hold is over; `retired zone versions waiting` rises during the hold and goes back to 0 after it.
 #   2. (root, the loader with SQLite3, sqlite3) 1500 database zones change during the hold: the ingest batch (a grace period was waited for
 #      every 1024 zones) is applied while the reader holds, the zones are served with their new serial; the counts go back to 0 after it.
 #      A second full reload during the hold is postponed; a row changed meanwhile is served once the tick applies it (the postponed reload asks
 #      the loader as the command would have); the postponement makes at most three log lines.
 #   3. A program zone whose plugin takes 1.5 s (program-timeout 3000): with such a query in flight, `reconfig` and `reload` back to back both
-#      answer OK (the reload waits for the query, at most program-timeout + 0.5 s; it answered "postponed" after 0.1 s before).
+#      answer OK; the reload, once the query has reached the plugin, takes at least 0.8 s (it waits for the query, at most program-timeout
+#      + 0.5 s; it answered "postponed" after 0.1 s before).
 # SKIP without perl or the test hooks; part 2 prints "SKIP: part 2: ..." without its prerequisites.
 # ==============================================================================
 
@@ -105,6 +107,9 @@ set -- $(timed a reload)
 echo "   a second reload during the hold: $*"
 # (an explicit reload waits for the readers of normal operation first: here 1 s, as there is no program or forward zone; at most 5 s)
 case "$*" in *"reload postponed"*) [ "$1" -ge 900 ] && [ "$1" -lt 5500 ] && pass "a second reload during the hold answers after the 1 s wait for normal readers ($1 ms): postponed, the configuration's buffer may still be read" || fail "the postponement took $1 ms" ;; *) fail "the second reload: $*" ;; esac
+# a third one while that one is postponed is merged into it: only the short try (0.1 s), no second wait of 1 s
+set -- $(timed a reload)
+case "$*" in *"reload postponed"*) [ "$1" -lt 700 ] && pass "a reload while one is postponed is merged into it: postponed after $1 ms (no second wait)" || fail "the reload while one is postponed took $1 ms" ;; *) fail "the third reload: $*" ;; esac
 N0=$(grep -c "reloaded successfully" "$T/a.log")
 ctl a status | grep -q "^retired zone snapshots waiting: [1-9]" && pass "status: a retired snapshot waits for the reader" || fail "status: $(ctl a status | grep 'retired zone')"
 echo "   (waiting for the end of the hold)"
@@ -194,13 +199,20 @@ chmod 644 "$T/c.conf"
 PIDS="$PIDS $!"
 i=0; until ./dag @127.0.0.1 -p "$P3" normal.p.test A +short +nohexdump +time=2 +tries=1 2>/dev/null | grep -q 192.0.2.7 || [ $i -ge 75 ]; do sleep 0.2; i=$((i + 1)); done
 [ $i -lt 75 ] && pass "the program zone answers" || fail "the program zone does not answer"
+: > "$T/plugin.pl.slow"; chmod 666 "$T/plugin.pl.slow"   # (the plugin appends a line when the slow query reaches it)
 ./dag @127.0.0.1 -p "$P3" slow.p.test A +short +nohexdump +time=6 +tries=1 > "$T/slow.out" 2>&1 &
 SLOW=$!
-sleep 0.3   # (the query reaches the plugin: it holds an async I/O read section for 1.5 s from then on)
+# the query has reached the plugin: the worker holds an async I/O read section from then on, for 1.5 s
+i=0; while [ ! -s "$T/plugin.pl.slow" ] && [ $i -lt 100 ]; do sleep 0.02; i=$((i + 1)); done
+[ -s "$T/plugin.pl.slow" ] && pass "the slow query has reached the plugin" || fail "the slow query did not reach the plugin in 2 s"
 set -- $(timed c reconfig)
 case "$*" in *" OK"*) pass "reconfig with the slow query in flight: OK ($1 ms)" ;; *) fail "reconfig: $*" ;; esac
+RC=$1
 set -- $(timed c reload)
-case "$*" in *"OK reloaded"*) pass "reload right after it: OK ($1 ms; it waited for the slow query, up to program-timeout + 0.5 s)" ;; *) fail "reload after reconfig: $*" ;; esac
+# (the reload waits for the slow query, which began under the configuration before the reconfig: what is left of its 1.5 s)
+case "$*" in *"OK reloaded"*) [ "$1" -ge 800 ] && pass "reload right after it: OK after $1 ms (it waited for the slow query, up to program-timeout + 0.5 s; reconfig took $RC ms)" \
+                                  || fail "the reload answered OK after only $1 ms: it did not wait for the slow query" ;;
+    *) fail "reload after reconfig: $*" ;; esac
 wait "$SLOW"
 grep -q 192.0.2.7 "$T/slow.out" && pass "the slow query is answered" || fail "the slow query: $(cat "$T/slow.out")"
 sanitizer_clean c

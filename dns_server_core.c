@@ -3800,9 +3800,22 @@ STATIC_TEST int reload_readers_wait_ms(const server_config_t *cfg) {
   return (int)ms;
 }
 
+/* The readers an explicit reload waits for began under the configuration before the active one (the standby buffer, intact while it is not reaped):
+ * the wait is sized from the larger of the two (a reload that removed a slow program zone still waits for its queries) */
+STATIC_TEST int reload_previous_readers_wait_ms(void) {
+  const server_config_t *active = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+  int ms = reload_readers_wait_ms(active);
+  if (g_config_db.standby_pending) {
+    const server_config_t *standby = (active == &g_config_db.config_a) ? &g_config_db.config_b : &g_config_db.config_a;
+    const int s = reload_readers_wait_ms(standby);
+    if (s > ms) ms = s;
+  }
+  return ms;
+}
+
 static config_reload_result_t perform_config_reload_wait(bool skip_unchanged, int readers_wait_ms);
 STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged) {
-  return perform_config_reload_wait(skip_unchanged, reload_readers_wait_ms(atomic_load_explicit(&g_config_db.active, memory_order_acquire)));
+  return perform_config_reload_wait(skip_unchanged, reload_previous_readers_wait_ms());
 }
 
 static config_reload_result_t perform_config_reload_wait(bool skip_unchanged, int readers_wait_ms) {
@@ -3943,7 +3956,8 @@ static time_t g_reload_pending_logged;     /* when the postponement or its last 
 
 /* A reload, and what follows it when it is applied.  ask_db (a full control-channel `reload`): the database loader is asked to compare its sources
  * with the zones served (B6a, design 5.2); *db_rid (may be NULL) gets the request id, 0 = none.  retry: the control tick's retry of a postponed
- * reload (a short try for the readers); otherwise an explicit one (the readers of normal operation are waited for).  A postponed reload is
+ * reload (a short try for the readers); otherwise an explicit one (the readers of normal operation are waited for; only the short try when a reload
+ * is already postponed: the new one is merged into it).  A postponed reload is
  * remembered with what it was to do (full, the database request) and applied by the tick; the postponement is logged once, a reminder at
  * most once a minute, the outcome once. */
 static config_reload_result_t run_config_reload(bool skip_unchanged, bool ask_db, bool retry, uint64_t *db_rid) {
@@ -3951,8 +3965,9 @@ static config_reload_result_t run_config_reload(bool skip_unchanged, bool ask_db
   bool full = !skip_unchanged || g_reload_pending_full;
   ask_db = ask_db || g_reload_pending_db;
   const bool was_pending = g_reload_pending;
-  config_reload_result_t r = perform_config_reload_wait(!full, retry ? RELOAD_RETRY_TRY_MS
-                                                                     : reload_readers_wait_ms(atomic_load_explicit(&g_config_db.active, memory_order_acquire)));
+  /* a reload while one is postponed is merged into it (full, the database request): only the short try, so that n commands do not stack n waits
+   * on the control thread; the answer is "postponed" again unless the readers have left */
+  config_reload_result_t r = perform_config_reload_wait(!full, retry || was_pending ? RELOAD_RETRY_TRY_MS : reload_previous_readers_wait_ms());
   if (r.status == CONFIG_RELOAD_READ_ERROR || r.status == CONFIG_RELOAD_PARSE_ERROR || r.status == CONFIG_RELOAD_REJECTED ||
       r.status == CONFIG_RELOAD_ZONE_ERRORS)
     atomic_fetch_add_explicit(&g_reload_failures_total, 1, memory_order_relaxed);

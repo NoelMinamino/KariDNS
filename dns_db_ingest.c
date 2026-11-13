@@ -3393,7 +3393,7 @@ static void hot_tick(const ing_cfg_t *c) {
   }
 }
 
-/* The cache manager (D1a step 5, design 8.2): every 100 ms it reads memory-limit (a reload changes it at once) and, with a limit, runs a round: the
+/* The cache manager (D1a step 5, design 8.2): with a limit, every 50 ms it reads memory-limit (a reload changes it at once) and runs a round: the
  * zones with the lowest frequency per byte are taken out of memory when the database zones are above the high mark.  Without a limit it only
  * looks at the configuration once a second. */
 static void *cache_thread(void *arg) {

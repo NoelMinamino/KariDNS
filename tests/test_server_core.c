@@ -4597,6 +4597,32 @@ static void test_reload_readers_wait_ms(void) {
         assert(ms == c[i].ms);
         free_server_config_fields(&cfg);
     }
+    /* the readers waited for began under the configuration before (the standby buffer, while it is not reaped): the larger of the two */
+    {
+        server_config_t save_a, save_b;
+        memcpy(&save_a, &g_config_db.config_a, sizeof(save_a));
+        memcpy(&save_b, &g_config_db.config_b, sizeof(save_b));
+        server_config_t *save_active = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+        const bool save_pending = g_config_db.standby_pending;
+        memset(&g_config_db.config_a, 0, sizeof(g_config_db.config_a));
+        memset(&g_config_db.config_b, 0, sizeof(g_config_db.config_b));
+        assert(parse_named_conf("options { allow-program-zones yes; };\nzone \"p.test\" { type program; program \"/bin/cat\"; program-timeout 3000; };\n",
+                                &g_config_db.config_a) == 0);              /* the one before: a slow program zone */
+        assert(parse_named_conf("zone \"p.test\" { type master; file \"p.zone\"; };\n", &g_config_db.config_b) == 0);   /* the active one: none */
+        atomic_store_explicit(&g_config_db.active, &g_config_db.config_b, memory_order_release);
+        g_config_db.standby_pending = true;
+        assert(reload_previous_readers_wait_ms() == 3500);
+        g_config_db.standby_pending = false;                                   /* (reaped: nobody can read it any more) */
+        assert(reload_previous_readers_wait_ms() == 1000);
+        atomic_store_explicit(&g_config_db.active, &g_config_db.config_a, memory_order_release);
+        assert(reload_previous_readers_wait_ms() == 3500);
+        free_server_config_fields(&g_config_db.config_a);
+        free_server_config_fields(&g_config_db.config_b);
+        memcpy(&g_config_db.config_a, &save_a, sizeof(save_a));
+        memcpy(&g_config_db.config_b, &save_b, sizeof(save_b));
+        atomic_store_explicit(&g_config_db.active, save_active, memory_order_release);
+        g_config_db.standby_pending = save_pending;
+    }
     printf("  -> reload_readers_wait_ms passed.\n");
 }
 

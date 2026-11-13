@@ -1065,8 +1065,10 @@ static void test_cache_used_bytes_and_held(void) {
     assert(zone_bytes_retired_held(ZBYTES_DB) == 0);              /* retired a moment ago: counted as before (its grace period is just not over) */
     zone_retire_process(true);                                    /* the short wait does not end: a reader stays, the version is held at once */
     assert(zone_bytes_retired_held(ZBYTES_DB) == 4096);
-    zone_retire_process(false);                                   /* (in the back-off a pass that was asked to wait treats it the same; one that was not goes by the age) */
-    assert(zone_bytes_retired_held(ZBYTES_DB) == 0);
+    zone_retire_process(false);                                   /* a later pass that does not wait (the control tick): it stays held, whatever its age */
+    assert(zone_bytes_retired_held(ZBYTES_DB) == 4096);
+    zone_retire_process(true);                                    /* (one in the back-off: the same) */
+    assert(zone_bytes_retired_held(ZBYTES_DB) == 4096);
     zone_retire_held_ms_set_for_test(0);
     zone_retire_process(false);
     assert(zone_bytes_retired_held(ZBYTES_DB) == 4096);           /* kept for the reader past the short grace period: held, not counted */
@@ -1089,6 +1091,15 @@ static void test_cache_used_bytes_and_held(void) {
     assert(dbreg_cache_long_reader());
     rcu_aux_read_unlock();
     assert(!cache_reader_sample(t + 3000));                       /* it has left */
+    /* the sampler's state is given back: a later sample at the real clock is taken again (it was left at t, and no time after it came) */
+    cache_reader_sample_reset_for_test();
+    (void)cache_reader_sample(1000);
+    rcu_aux_read_lock();
+    assert(!cache_reader_sample(2000));
+    assert(cache_reader_sample(3000));
+    rcu_aux_read_unlock();
+    assert(!cache_reader_sample(4000));
+    cache_reader_sample_reset_for_test();
     assert(atomic_load(&e->snapshot_refs) == 1);
     free_zone_db_entry(e);                                        /* (frees v2, the active version) */
     zone_arena_destroy(&b1); zone_arena_destroy(&b2);

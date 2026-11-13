@@ -88,7 +88,7 @@ sqlite3 "$T/db/z.db" "UPDATE records SET content = REPLACE(content, ' 1 3600 600
 i=0; while [ "$(serial_of d0279.test)" != "2" ] && [ $i -lt 150 ]; do sleep 0.1; i=$((i + 1)); done
 [ "$(serial_of d0279.test)" = "2" ] && pass "the batch replacing 140 of the zones in memory is applied during the hold" || fail "d0279.test: '$(serial_of d0279.test)'"
 i=0; while [ "$(stat held)" -lt 500000 ] 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
-sleep 3   # (the cache manager runs every 100 ms: give it 30 rounds to act on the retired bytes)
+sleep 3   # (with a limit the cache manager runs a round every 50 ms: give it 60 rounds to act on the retired bytes)
 echo "   during the hold: $(ctl dbstatus | grep '^cache:')"
 HE=$(stat held); RE=$(stat retired)
 [ "${HE:-0}" -gt 500000 ] && [ "${RE:-0}" -ge "${HE:-0}" ] && pass "held=$HE of retired=$RE: the replaced versions the reader holds" || fail "held '$HE', retired '$RE'"

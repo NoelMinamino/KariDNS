@@ -1012,13 +1012,14 @@ typedef struct {
   uint64_t previous;   /* the versions that zones keep for `karictl rollback` (entry->prev): nobody reads them, a rollback or the rollback-window ends them */
 } zone_bytes_t;
 void zone_bytes_get(int cls, zone_bytes_t *out);
-/* 0.7 (memory-limit, option B): the retired bytes of class cls that a reader or a transfer has held for more than a short grace period
- * (dns_snapshot_rcu.c, zone_retire_process()); the cache manager does not count them.  dbreg_cache_used_bytes(): what it counts. */
+/* 0.7 (memory-limit, option B): the retired bytes of class cls that a reader or a transfer holds (the versions a pass of zone_retire_process()
+ * found held, until they are freed: dns_snapshot_rcu.c); the cache manager does not count them.  dbreg_cache_used_bytes(): what it counts. */
 uint64_t zone_bytes_retired_held(int cls);
 uint64_t dbreg_cache_used_bytes(const zone_bytes_t *zb, uint64_t held);
 bool dbreg_cache_long_reader(void);              /* a thread of the server is in a read section for a second or more (sampled by the cache manager) */
 #ifdef KARIDNS_UNIT_TEST
 bool cache_reader_sample(int64_t now_ms);        /* (the cache manager's sampler: unit tests) */
+void cache_reader_sample_reset_for_test(void);     /* (back to "never sampled") */
 #endif
 #ifdef KARIDNS_UNIT_TEST
 void zone_retire_held_ms_set_for_test(int64_t ms);
@@ -1531,6 +1532,7 @@ config_reload_result_t reload_all_zones(void);
 config_reload_result_t perform_config_reload(void);
 config_reload_result_t perform_config_reload_ext(bool skip_unchanged);
 int reload_readers_wait_ms(const server_config_t *cfg);   /* 0.7: how long an explicit reload waits for the readers of the configuration before */
+int reload_previous_readers_wait_ms(void);              /* (the larger of the active and the standby configuration's, while the standby is not reaped) */
 void escape_qname_for_log(const char *src, char *dst, size_t dst_size);
 void write_query_log(worker_ctx_t *ctx, const void *client_addr, socklen_t addr_len,
                      const char *qname, uint16_t qclass, uint16_t qtype,
