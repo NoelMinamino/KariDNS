@@ -8110,7 +8110,7 @@ static bool control_resolve_group(const char *name, uint32_t *gid, char *err, si
  * Each name refers to a top-level `key` statement (the secret and the algorithm are taken from it).  A key without read-only has full power.
  * read-only yes: status, zonestatus, observatory and dbstatus only (BIND's meaning); allow-commands (KariDNS) adds commands to it.
  * `reload` is the full reload, `reload-zone` is `reload <zone> [view] [force]`, `trace` is `trace [<level>]` and `notrace` (0.7).  The test-only
- * commands (evict, xfr-delay, xfr-fail) have no name. */
+ * commands (evict, xfr-delay, xfr-fail, rcu-hold) have no name. */
 uint32_t control_perm_from_name(const char *name) {
   static const struct { const char *name; uint32_t bit; } t[] = {
     { "reload", CTLP_RELOAD }, { "reload-zone", CTLP_RELOAD_ZONE }, { "reconfig", CTLP_RECONFIG }, { "stop", CTLP_STOP },

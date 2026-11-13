@@ -3232,6 +3232,7 @@ process_tcp_client: ;
               xfr_eff_t out_eff;
               /* the settings of the view that owns the zone, not of the view the client came through (a zone shared with in-view is one object) */
               xfr_opts_effective(cfg, zcfg, entry ? entry->view_name : zdir_holder_view(xfr_view, xfr_el), &out_eff);
+              const bool out_send_ede = cfg ? cfg->send_extended_errors : false;   /* (read before the release, like the other values) */
               release_config_snapshot(cfg);
               if (!xfr_counter_acquire(&g_xfr_out_active, out_limit)) {
                 allowed = false; /* "Zone transfer requests in excess of the limit are refused" (ARM transfers-out) */
@@ -3261,7 +3262,7 @@ process_tcp_client: ;
                   args->qtype = qtype;
                   args->has_edns = has_edns;
                   args->dnssec_ok = dnssec_ok;
-                  args->send_ede = cfg ? cfg->send_extended_errors : false;
+                  args->send_ede = out_send_ede;
                   args->req_len = msg_len > sizeof(args->req) ? sizeof(args->req) : msg_len;
                   memcpy(args->req, msg, args->req_len);
                   if (matched_key) {

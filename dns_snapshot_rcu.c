@@ -1388,8 +1388,13 @@ void zone_retire_process(bool wait) {
     free(r);
     atomic_fetch_sub_explicit(&g_zone_retire_count, 1, memory_order_relaxed);
   }
-  logev_post(LOGC_GENERAL, 2, NULL, 0, "[GC] retired zone versions: %u freed (%llu bytes), %u kept for readers or a running transfer (epoch %llu, %s)", n_freed,
-             (unsigned long long)freed_bytes, n_kept, (unsigned long long)max_epoch, wait ? "waited for the grace period" : "no wait");
+  /* debug 2, once per change: a node that a transfer keeps (R11: up to max-transfer-time-out, or an inbound transfer) would otherwise make the same
+   * line at every control tick.  The last numbers are shared by the threads that call this (the control thread, a reload, the ingest thread). */
+  static _Atomic uint64_t last_counts = UINT64_MAX;
+  const uint64_t counts = ((uint64_t)n_kept << 32) | n_freed;
+  if (atomic_exchange_explicit(&last_counts, counts, memory_order_relaxed) != counts)
+    logev_post(LOGC_GENERAL, 2, NULL, 0, "[GC] retired zone versions: %u freed (%llu bytes), %u kept for readers or a running transfer (epoch %llu, %s)", n_freed,
+               (unsigned long long)freed_bytes, n_kept, (unsigned long long)max_epoch, wait ? "waited for the grace period" : "no wait");
 }
 
 /* entry に属する物 obj を、世代 epoch の猶予期間が過ぎ、かつ entry が転送の受信中でなくなってから free_fn(obj) で解放する

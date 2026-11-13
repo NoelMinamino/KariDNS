@@ -2,11 +2,12 @@
 # lib_stall_xfr_client.pl - a zone transfer client that stops reading until it is told to go on (tests/run_axfr_stall_reload_test.sh, R11).
 #
 #   lib_stall_xfr_client.pl --port N --zone ZONE [--type AXFR|IXFR] [--ixfr-serial N] [--key NAME:BASE64] [--go FILE] [--body FILE]
-#                           [--rcvbuf N] [--count N] [--ready FILE]
+#                           [--rcvbuf N] [--count N] [--ready FILE] [--edns]
 #
 # Connects to 127.0.0.1:PORT with a small receive buffer (--rcvbuf, default 2048), sends one AXFR (or IXFR with the client's SOA, RFC 1995 3)
 # request, TSIG-signed with hmac-sha256 when --key is given (RFC 8945 4.3), writes "sent" to --ready, and reads nothing until the file --go
-# exists (it looks every 50 ms; no --go: it reads at once).  Then it reads the stream until the server closes the connection (or 10 s pass
+# exists (it looks every 50 ms; no --go: it reads at once).  With --go, "started" goes to --ready only once the first octets of the answer have
+# arrived (unread), so the caller knows that the transfer has taken its version.  Then it reads the stream until the server closes the connection (or 10 s pass
 # without data), and checks every message:
 #   - the TSIG of every signed message (RFC 8945 5.3.1: the first one over the request MAC, the message and all TSIG variables; each later one
 #     over the previous MAC, the messages since the previous signed one and the timers only).  A stream with a key must end with a signed message.
@@ -14,7 +15,7 @@
 # --body FILE gets the messages without their TSIG RR (ARCOUNT less one, the original ID), each with its two-octet length: two transfers of the same
 # version compare equal there although their TSIG time stamps differ.
 # --count N opens N such connections and holds them all (no checks, prints "HELD n" once all requests are sent), for the test of many transfers.
-# Prints one line: "MSGS=<n> BYTES=<n> FIRST=<serial|-> LAST=<serial|-> TSIG=<none|ok|bad|unsigned-end> RCODE=<rcode of the first message>".
+# Prints one line: "MSGS=<n> BYTES=<n> FIRST=<serial|-> LAST=<serial|-> TSIG=<none|ok|bad|unsigned-end> RCODE=<rcode of the first message> EDE=<INFO-CODE of its EDE|->".
 use strict;
 use warnings;
 use Socket;
@@ -24,8 +25,9 @@ use Digest::SHA qw(hmac_sha256);
 use MIME::Base64 qw(decode_base64);
 
 my ($port, $zone, $type, $ixfr_serial, $key, $go, $body, $rcvbuf, $count, $ready) = (53, undef, 'AXFR', undef, undef, undef, undef, 2048, 1, undef);
+my $edns = 0;
 GetOptions('port=i' => \$port, 'zone=s' => \$zone, 'type=s' => \$type, 'ixfr-serial=i' => \$ixfr_serial, 'key=s' => \$key,
-           'go=s' => \$go, 'body=s' => \$body, 'rcvbuf=i' => \$rcvbuf, 'count=i' => \$count, 'ready=s' => \$ready) or die "bad options\n";
+           'go=s' => \$go, 'body=s' => \$body, 'rcvbuf=i' => \$rcvbuf, 'count=i' => \$count, 'ready=s' => \$ready, 'edns' => \$edns) or die "bad options\n";
 die "--zone is required\n" unless defined $zone;
 my $qtype = uc($type) eq 'IXFR' ? 251 : 252;
 
@@ -51,14 +53,15 @@ sub request {
         $ns = wire_name($zone) . pack('nnNn', 6, 1, 0, length $rd) . $rd;
         $nscount = 1;
     }
-    my $msg = pack('nnnnnn', $id, 0, 1, 0, $nscount, 0) . $q . $ns;
+    my $opt = $edns ? "\0" . pack('nnNn', 41, 1232, 0, 0) : '';     # --edns: an OPT RR (RFC 6891), so that the answer can carry an EDE
+    my $msg = pack('nnnnnn', $id, 0, 1, 0, $nscount, $edns ? 1 : 0) . $q . $ns . $opt;
     return ($msg, '') unless defined $key_name;
     my $now = int(time());
     my $time48 = pack('nN', 0, $now);
     my $vars = wire_name($key_name) . pack('nN', 255, 0) . $alg . $time48 . pack('nnn', 300, 0, 0);
     my $mac = hmac_sha256($msg . $vars, $secret);
     my $rd = $alg . $time48 . pack('nn', 300, length $mac) . $mac . pack('nnn', $id, 0, 0);
-    substr($msg, 10, 2) = pack('n', 1);
+    substr($msg, 10, 2) = pack('n', ($edns ? 1 : 0) + 1);
     return ($msg . wire_name($key_name) . pack('nnNn', 250, 255, 0, length $rd) . $rd, $mac);
 }
 
@@ -83,7 +86,14 @@ if ($count > 1) {
 }
 
 my ($s, $req_mac) = connect_one();
-if (defined $ready) { open(my $f, '>', $ready) or die; print $f "sent\n"; close $f; }
+# with --go: "started" once the first octets of the answer have arrived (unread): the transfer has taken its version; "sent" when nothing came in 30 s
+my $state = 'sent';
+if (defined $go) {
+    my $rin = '';
+    vec($rin, fileno($s), 1) = 1;
+    $state = 'started' if select($rin, undef, undef, 30);
+}
+if (defined $ready) { open(my $f, '>', $ready) or die; print $f "$state\n"; close $f; }
 sleep 0.05 while defined $go && !-e $go;
 
 my $buf = '';
@@ -106,7 +116,7 @@ sub skip_name {
     return length $m;
 }
 
-my ($msgs, $first, $last, $tsig, $rcode0) = (0, '-', '-', defined $key_name ? 'ok' : 'none', '-');
+my ($msgs, $first, $last, $tsig, $rcode0, $ede) = (0, '-', '-', defined $key_name ? 'ok' : 'none', '-', '-');
 my ($prev_mac, $pending, $signed_last) = ($req_mac, '', 0);
 my $bodies = '';
 my $o = 0;
@@ -149,6 +159,12 @@ while ($o + 2 <= length $buf) {
             $mac = substr($m, $a + 10, $mac_len);
             ($orig_id, $err, $other_len) = unpack('nnn', substr($m, $a + 10 + $mac_len, 6));
             $other = substr($m, $a + 16 + $mac_len, $other_len);
+        } elsif ($t == 41 && $msgs == 1) {    # the options of the OPT (RFC 6891 6.1.2): EDE is code 15 (RFC 8914 2)
+            for (my $q = $rd; $q + 4 <= $rd + $rdlen; ) {
+                my ($code, $olen) = unpack('nn', substr($m, $q, 4));
+                $ede = unpack('n', substr($m, $q + 4, 2)) if $code == 15 && $olen >= 2 && $ede eq '-';
+                $q += 4 + $olen;
+            }
         }
         $p = $rd + $rdlen;
     }
@@ -173,4 +189,4 @@ while ($o + 2 <= length $buf) {
 }
 $tsig = 'unsigned-end' if defined $key_name && $tsig eq 'ok' && !$signed_last;
 if (defined $body) { open(my $f, '>:raw', $body) or die "$body: $!"; print $f $bodies; close $f; }
-printf("MSGS=%d BYTES=%d FIRST=%s LAST=%s TSIG=%s RCODE=%s\n", $msgs, length $buf, $first, $last, $tsig, $rcode0);
+printf("MSGS=%d BYTES=%d FIRST=%s LAST=%s TSIG=%s RCODE=%s EDE=%s\n", $msgs, length $buf, $first, $last, $tsig, $rcode0, $ede);

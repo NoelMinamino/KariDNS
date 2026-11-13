@@ -15,12 +15,17 @@
 #      (the inbound swap is not refused or postponed), and the stalled downstream transfer delivers the old version.
 #   D. 140 transfers stalled at once (transfers-out 200; more than the 128 auxiliary reader slots): karictl status answers within 3 s and
 #      counts them, a reload answers OK.
-#   E. (root, the server with the test hooks: ./karidns-evict, SQLite3) a database zone: its transfer stalled, `karictl evict` (TEST ONLY) is
+#   E. (root, a server with the test hooks: ./karidns of `make coverage` or ./karidns-evict, the loader with SQLite3, sqlite3) a database zone: its transfer stalled, `karictl evict` (TEST ONLY) is
 #      refused while the transfer runs; the loader replaces the zone (a new serial in the database, `karictl reload`); the transfer delivers
 #      the old version; after it the zone can be taken out of memory.
+#   F. (as E; KARIDNS_XFER_MINUTE_SECS=1, max-transfer-time-out 1 = one second) max-transfer-time-out starts when the zone is there: a database zone
+#      that the loader (stopped) brings 2.5 s after the request is transferred in full; one it never brings within transfer-fetch-timeout (6 s) gets
+#      the one error answer, SERVFAIL with EDE 14 Not Ready (RFC 5936 2.2, 4.1.2).
+# Each client reports ready only once the first octets of its answer have arrived: the transfer has taken its version before the zone changes.
 # The server is ./karidns-asan when it is built (a sanitizer report fails the test), else ./karidns.  KARIDNS=... picks another (STALL_TEST_TIME_MULT=n
 # multiplies the time bounds, for a TSan server).  Waits are on conditions, never fixed
-# sleeps.  Loopback only.  SKIP when perl, dag or karictl is missing; part E is skipped (said in the output) without its prerequisites.
+# sleeps.  Loopback only.  SKIP when perl, dag or karictl is missing; parts E and F print "SKIP: part E/F: <reason>" without their prerequisites
+# (tests/run_all_suite.sh shows it as the note of the PASS; --fail-on-skip fails on it).
 # ==============================================================================
 
 set -u
@@ -76,7 +81,7 @@ big_zone() {
 }
 # start NAME CONF PORT: start a server, wait for its first answer
 start() {
-    "$KARIDNS" -f "$2" > "$T/$1.log" 2>&1 &
+    env ${START_ENV:-} "$KARIDNS" -f "$2" > "$T/$1.log" 2>&1 &
     PIDS="$PIDS $!"
     eval "PID_$1=$!"
     kari_wait_answer ./dag "$3" "${4:-example.test}" 20 || { fail "$1 did not start"; cat "$T/$1.log"; exit 1; }
@@ -85,15 +90,15 @@ ctl() { ./karictl -s "$T/$1.sock" -f "$T/ctl.conf" "$2" ${3:-} ${4:-} 2>&1; }
 status_num() { ctl "$1" status | sed -n "s/^$2: \([0-9][0-9]*\).*/\1/p" | head -1; }
 serial_of() { ./dag @127.0.0.1 -p "$1" "$2" SOA +short +nohexdump +time=2 +tries=2 2>/dev/null | awk '{print $3}' | head -1; }
 # stalled NAME ARGS...: a client in the background that reads when $T/go.NAME exists; its result line goes to $T/NAME.res, its messages to
-# $T/NAME.body; returns when its request is sent
+# $T/NAME.body; returns when the first octets of the answer have reached it (the transfer has taken its version: a change after this is not in it)
 stalled() {
     n=$1; shift
     rm -f "$T/$n.ready" "$T/go.$n"
     $CLIENT "$@" --go "$T/go.$n" --ready "$T/$n.ready" --body "$T/$n.body" > "$T/$n.res" 2> "$T/$n.err" &
     CPIDS="$CPIDS $!"
     eval "CPID_$n=$!"
-    i=0; while [ ! -s "$T/$n.ready" ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i + 1)); done
-    [ -s "$T/$n.ready" ] || fail "client $n did not send its request: $(cat "$T/$n.err")"
+    i=0; while [ ! -s "$T/$n.ready" ] && [ $i -lt 700 ]; do sleep 0.05; i=$((i + 1)); done
+    [ "$(cat "$T/$n.ready" 2>/dev/null)" = "started" ] || fail "client $n: the transfer did not start: '$(cat "$T/$n.ready" 2>/dev/null)' $(cat "$T/$n.err")"
 }
 # release NAME: the client reads; wait for it (not in a subshell: $(...) cannot wait for a child of this shell); its line is in $T/NAME.res
 release() {
@@ -291,27 +296,45 @@ i=0; while [ "$(status_num d "xfers running")" != "0" ] && [ $i -lt 200 ]; do sl
 [ "$(status_num d "xfers running")" = "0" ] && pass "the clients gone, the transfers end" || fail "xfers running: $(status_num d "xfers running")"
 sanitizer_clean d
 
-# ---------------------------------------------------------------------------------------------------------------- E
-echo "== E. a database zone: eviction deferred and the loader's replacement during a stalled transfer"
-E_SKIP=""
-[ "$(id -u)" = "0" ] || E_SKIP="needs root (the loader runs as another user)"
-[ -z "$E_SKIP" ] && { [ -x ./karidns-evict ] && grep -q 'no such zone in memory' ./karidns-evict 2>/dev/null || E_SKIP="./karidns-evict is not built (make evict)"; }
-[ -z "$E_SKIP" ] && { [ -x ./karidns-dbloader ] && ./karidns-dbloader --drivers | grep -qx sqlite3 || E_SKIP="./karidns-dbloader with SQLite3 is not built"; }
-[ -z "$E_SKIP" ] && { [ -x ./tests/db/zone2sql ] || E_SKIP="tests/db/zone2sql is not built"; }
-[ -z "$E_SKIP" ] && { command -v sqlite3 >/dev/null 2>&1 || E_SKIP="the sqlite3 command line tool is not installed"; }
-[ -z "$E_SKIP" ] && { id nobody >/dev/null 2>&1 || E_SKIP="no user nobody"; }
-if [ -n "$E_SKIP" ]; then
-    echo "  SKIP (part E): $E_SKIP"
-else
-    PE=$(kari_port 6 $((PA + 6)))
+# ---------------------------------------------------------------------------------------------------------------- E, F
+# (database zones: root, a server with the test hooks -- ./karidns of `make coverage` or ./karidns-evict --, the loader with SQLite3, sqlite3.  A part
+# that cannot run prints "SKIP: part ...", which tests/run_all_suite.sh shows as the note of the PASS and --fail-on-skip counts as a failure.)
+has_hook() { [ -x "$1" ] && grep -q 'no such zone in memory' "$1" 2>/dev/null; }
+HOOKED=""
+if has_hook ./karidns; then HOOKED=./karidns; elif has_hook ./karidns-evict; then HOOKED=./karidns-evict; fi
+DB_SKIP=""
+[ "$(id -u)" = "0" ] || DB_SKIP="needs root (the loader runs as another user)"
+[ -z "$DB_SKIP" ] && [ -z "$HOOKED" ] && DB_SKIP="no server with the test hooks (make evict, or the build of make coverage)"
+[ -z "$DB_SKIP" ] && { [ -x ./karidns-dbloader ] && ./karidns-dbloader --drivers | grep -qx sqlite3 || DB_SKIP="./karidns-dbloader with SQLite3 is not built"; }
+[ -z "$DB_SKIP" ] && { command -v sqlite3 >/dev/null 2>&1 || DB_SKIP="the sqlite3 command line tool is not installed"; }
+[ -z "$DB_SKIP" ] && { id nobody >/dev/null 2>&1 || DB_SKIP="no user nobody"; }
+# db_zone NAME SERIAL NTXT: the SQL of a zone (PowerDNS schema): SOA, NS, glue, NTXT TXT RRs of 200 octets, transfers allowed to 127.0.0.1
+db_zone() {
+    perl -e '
+        my ($z, $s, $n) = @ARGV;
+        print "INSERT INTO domains (name, type) VALUES (\x27$z\x27, \x27NATIVE\x27);\n";
+        my $id = "(SELECT id FROM domains WHERE name = \x27$z\x27)";
+        my @rr = (["$z", "SOA", "ns1.$z hostmaster.$z $s 3600 600 86400 60"], ["$z", "NS", "ns1.$z"], ["ns1.$z", "A", "192.0.2.1"]);
+        push @rr, [sprintf("r%05d.%s", $_, $z), "TXT", "\"" . ("x" x 200) . "\""] for 1 .. $n;
+        print "BEGIN;\n";
+        printf("INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) VALUES (%s, \x27%s\x27, \x27%s\x27, \x27%s\x27, 300, 0, 0);\n", $id, @$_) for @rr;
+        print "INSERT INTO domainmetadata (domain_id, kind, content) VALUES ($id, \x27ALLOW-AXFR-FROM\x27, \x27127.0.0.1\x27);\nCOMMIT;\n";' "$@"
+}
+loader_of() { pgrep -P "$1" -f 'karidns-dbloader -s 3' | head -1; }
+if [ -z "$DB_SKIP" ]; then
     mkdir "$T/db"
     chown nobody "$T/db"; chmod 777 "$T/db"
     sqlite3 "$T/db/z.db" < tests/db/pdns_schema.sqlite3.sql > /dev/null
-    big_zone dbz.test 20 | sed 's/( 20 3600 600 86400 60 )/20 3600 600 86400 60/' > "$T/dbz.test.zone"
-    ./tests/db/zone2sql --dialect sqlite3 "$T/dbz.test.zone" 2>/dev/null | sqlite3 "$T/db/z.db"
-    sqlite3 "$T/db/z.db" "INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'ALLOW-AXFR-FROM', '127.0.0.1' FROM domains WHERE name = 'dbz.test';"
+    { db_zone dbz.test 20 5000; db_zone late.test 30 5; } | sqlite3 "$T/db/z.db"
     chmod 666 "$T/db/z.db"*
     install -o root -m 755 ./karidns-dbloader "$T/karidns-dbloader" 2>/dev/null || { cp ./karidns-dbloader "$T/karidns-dbloader"; chown 0 "$T/karidns-dbloader"; chmod 755 "$T/karidns-dbloader"; }
+fi
+
+echo "== E. a database zone: eviction deferred and the loader's replacement during a stalled transfer"
+if [ -n "$DB_SKIP" ]; then
+    echo "  SKIP: part E: $DB_SKIP"
+else
+    PE=$(kari_port 6 $((PA + 6)))
     cat > "$T/e.conf" <<EOF
 options {
     user "nobody"; pid-file "none"; port $PE; bind-address { 127.0.0.1; };
@@ -320,7 +343,7 @@ options {
 control-channel { socket "$T/e.sock"; algorithm hmac-sha256; secret "$SECRET"; };
 EOF
     chmod 644 "$T/e.conf"
-    KARIDNS_SAVE=$KARIDNS; KARIDNS=./karidns-evict
+    KARIDNS_SAVE=$KARIDNS; KARIDNS=$HOOKED
     start e "$T/e.conf" "$PE" dbz.test
     KARIDNS=$KARIDNS_SAVE
     i=0; while [ "$(serial_of "$PE" dbz.test)" != "20" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
@@ -328,7 +351,6 @@ EOF
     $CLIENT --port "$PE" --zone dbz.test --body "$T/eref.body" --rcvbuf 262144 > "$T/eref.res"
     case "$(cat "$T/eref.res")" in *"FIRST=20 LAST=20"*) pass "the reference transfer of the database zone" ;; *) fail "the reference: $(cat "$T/eref.res")" ;; esac
     stalled e1 --port "$PE" --zone dbz.test
-    wait_xfers e 1 && pass "the transfer of the database zone is stalled" || fail "xfers running: $(status_num e "xfers running")"
     ctl e evict dbz.test | grep -q '^ERROR' && pass "karictl evict (TEST ONLY) is refused while the transfer runs (the zone stays in memory)" || fail "the zone was evicted during its transfer"
     sqlite3 "$T/db/z.db" "UPDATE records SET content = REPLACE(content, ' 20 3600 ', ' 21 3600 ') WHERE type = 'SOA' AND domain_id = (SELECT id FROM domains WHERE name = 'dbz.test');"
     ctl e reload > /dev/null
@@ -340,6 +362,46 @@ EOF
     i=0; until ctl e evict dbz.test | grep -q '^OK' || [ $i -ge 50 ]; do sleep 0.1; i=$((i + 1)); done
     [ $i -lt 50 ] && pass "after the transfer the zone can be taken out of memory" || fail "karictl evict after the transfer: $(ctl e evict dbz.test)"
     sanitizer_clean e
+fi
+
+echo "== F. max-transfer-time-out starts when the zone is there: a database zone read late is transferred, one never read gets SERVFAIL + EDE 14"
+if [ -n "$DB_SKIP" ]; then
+    echo "  SKIP: part F: $DB_SKIP"
+else
+    PF=$(kari_port 7 $((PA + 7)))
+    # KARIDNS_XFER_MINUTE_SECS=1: max-transfer-time-out 1 is one second; the wait for the zone (transfer-fetch-timeout 6000 ms) is longer
+    cat > "$T/f.conf" <<EOF
+options {
+    user "nobody"; pid-file "none"; port $PF; bind-address { 127.0.0.1; }; max-transfer-time-out 1;
+    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; db-reload-timeout 1; acl-ceiling { 127.0.0.1; };
+               transfer-fetch-timeout 6000; };
+};
+control-channel { socket "$T/f.sock"; algorithm hmac-sha256; secret "$SECRET"; };
+EOF
+    chmod 644 "$T/f.conf"
+    KARIDNS_SAVE=$KARIDNS; KARIDNS=$HOOKED
+    START_ENV=KARIDNS_XFER_MINUTE_SECS=1; start f "$T/f.conf" "$PF" late.test; START_ENV=""
+    KARIDNS=$KARIDNS_SAVE
+    LP=$(loader_of "$PID_f")
+    # (1) the zone is out of memory and the loader stopped; the transfer waits 2.5 s for it (more than the 1 s time-out), then the loader goes on
+    ctl f evict late.test | grep -q '^OK' && pass "late.test taken out of memory (TEST ONLY evict)" || fail "evict late.test: $(ctl f evict late.test)"
+    [ -n "$LP" ] && kill -STOP "$LP" || fail "no loader process"
+    t0=$(now_ms)
+    $CLIENT --port "$PF" --zone late.test --edns > "$T/f1.res" 2> "$T/f1.err" &
+    F1=$!
+    CPIDS="$CPIDS $F1"
+    until [ $(( $(now_ms) - t0 )) -ge 2500 ]; do sleep 0.1; done
+    kill -CONT "$LP"
+    wait "$F1"
+    R=$(cat "$T/f1.res")
+    case "$R" in *"FIRST=30 LAST=30"*"RCODE=0"*) pass "a zone read 2.5 s after the request is transferred in full ($R)" ;; *) fail "the late zone: '$R' $(cat "$T/f1.err")" ;; esac
+    # (2) the zone does not come within transfer-fetch-timeout: the one error answer, sent although the 1 s time-out is long over (RFC 5936 4.1.2)
+    i=0; until ctl f evict late.test | grep -q '^OK' || [ $i -ge 50 ]; do sleep 0.1; i=$((i + 1)); done
+    kill -STOP "$LP"
+    R=$($CLIENT --port "$PF" --zone late.test --edns)
+    kill -CONT "$LP"
+    case "$R" in *"RCODE=2 EDE=14"*) pass "a zone not read in time: SERVFAIL with EDE 14 Not Ready, after the 6 s wait ($R)" ;; *) fail "the zone never read: '$R'" ;; esac
+    sanitizer_clean f
 fi
 
 if [ "$FAILED" -eq 0 ]; then

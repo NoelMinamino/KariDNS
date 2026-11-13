@@ -1736,6 +1736,75 @@ static void test_r11_apex_answer_copies_before_send(void) {
     printf("  -> apex answer passed.\n");
 }
 
+/* R11 review: when the SOA of the apex cannot be written (here an MNAME of 128 labels, which compress_name() refuses), the answer is not made from
+ * the apex and the thread waits for the zone instead: with the snapshot still retained, because the wait reads the element (db_ingest_xfr_await()) */
+static zone_db_snapshot_t *g_r11_snap;
+static int g_r11_refs_at_await = -1;
+static zone_db_entry_t *r11_await_records_snapshot(zdir_elem_t *el, const char *view) {
+    (void)view;
+    g_r11_refs_at_await = atomic_load(&g_r11_snap->reader_count);
+    (void)atomic_load(&el->state);                     /* (what the real wait reads: ASan would see a freed element) */
+    return NULL;                                       /* the zone does not come: SERVFAIL, EDE 14 */
+}
+
+static void test_r11_apex_write_failure_keeps_the_snapshot(void) {
+    printf("[TEST] R11: an apex whose SOA cannot be written falls back to the wait for the zone, with the snapshot retained...\n");
+    uint8_t names[300];
+    size_t ml = 0;
+    for (int i = 0; i < 128; i++) { names[ml++] = 1; names[ml++] = 'a'; }
+    names[ml++] = 0;
+    static const uint8_t rn[] = "\5admin\7example\3com";
+    const size_t rl = sizeof(rn);
+    memcpy(names + ml, rn, rl);
+    zdir_apex_t *apex = calloc(1, sizeof(*apex) + ml + rl);
+    apex->serial = 4242; apex->soa_ttl = 3600; apex->refresh = 7200; apex->retry = 3600; apex->expire = 1209600; apex->minimum = 300;
+    apex->mname_len = (uint16_t)ml; apex->rname_len = (uint16_t)rl;
+    memcpy(apex->data, names, ml + rl);
+    zdir_elem_t *el = nr_elem("nr.example.com.", 4242, apex);
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 1);
+    g_r11_snap = &snap;
+    uint8_t req[1024];
+    size_t n = nr_request(req, sizeof(req), "nr.example.com.", 251, 4242, true, false);
+    int sp[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+    axfr_worker_args_t *args = calloc(1, sizeof(axfr_worker_args_t));
+    args->client_fd = sp[0];
+    args->send_ede = true;
+    strlcpy(args->client_ip, "127.0.0.1", sizeof(args->client_ip));
+    strlcpy(args->qname, "nr.example.com.", sizeof(args->qname));
+    args->qclass = 1;
+    args->qtype = 251;
+    memcpy(args->req, req, n);
+    args->req_len = (uint16_t)n;
+    args->elem = el;
+    args->snap = &snap;
+    args->await = r11_await_records_snapshot;
+    strlcpy(args->view_name, "default", sizeof(args->view_name));
+    pthread_t th;
+    assert(pthread_create(&th, NULL, axfr_worker_thread, args) == 0);
+    uint8_t out[4096];
+    size_t got = r11_drain(sp[1], 0, out, sizeof(out));
+    pthread_join(th, NULL);
+    close(sp[1]);
+    assert(g_r11_refs_at_await == 1);                   /* the wait ran with the snapshot retained */
+    assert(atomic_load(&snap.reader_count) == 0);       /* and the thread released it once */
+    nr_reply_t rep;
+    memset(&rep, 0, sizeof(rep));
+    assert(got > 2 + 12);
+    rep.len = ((size_t)out[0] << 8) | out[1];
+    memcpy(rep.msg, out + 2, rep.len);
+    uint32_t serial;
+    int64_t expire;
+    int ede;
+    nr_parse(&rep, &serial, &expire, &ede);
+    assert((rep.msg[3] & 0x0F) == 2 && ede == 14);       /* SERVFAIL, Not Ready */
+    free(apex);
+    free(el);
+    printf("  -> apex write failure passed.\n");
+}
+
 static void test_axfr_bg_thread_and_free_ixfr_txn(void) {
     printf("[TEST] AXFR/IXFR: axfr_bg_thread_func & free_ixfr_txn...\n");
 
@@ -8650,6 +8719,7 @@ int main(void) {
     test_axfr_worker_zone_out_of_memory();
     test_r11_stalled_transfer_holds_nothing_but_its_version();
     test_r11_apex_answer_copies_before_send();
+    test_r11_apex_write_failure_keeps_the_snapshot();
     test_axfr_bg_thread_and_free_ixfr_txn();
     test_ixfr_delta_empty_records();
     test_ixfr_history_ring_buffer_wrap();

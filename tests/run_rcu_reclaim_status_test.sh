@@ -147,7 +147,7 @@ i=0; while [ "$(status_num "xfers running")" != "0" ] && [ $i -lt 100 ]; do slee
 
 echo "== 2. a reader that holds a read section (the test hook)"
 if ! has_hook "$KARIDNS"; then
-    echo "  SKIP (part 2): $KARIDNS has no test hook (make evict, or the build of make coverage)"
+    echo "  SKIP: part 2: $KARIDNS has no test hook (make evict, or the build of make coverage)"
 else
     H=$(ctl rcu-hold 70000)
     [ "$H" = "OK" ] && pass "karictl rcu-hold 70000 (TEST ONLY)" || fail "rcu-hold: '$H'"

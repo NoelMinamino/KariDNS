@@ -2797,8 +2797,10 @@ axfr_done:
  * (RFC 8945 §5.3).  A request without the client's SOA is a FORMERR (RFC 1995 §3), as for a zone in memory.  false: the answer needs the zone (not an IXFR,
  * no apex for the version the directory has, the client is behind): the caller waits for the zone.
  * The element and its apex are valid while a->snap is retained: an apex that is replaced goes to the garbage of a snapshot that is retired at or after
- * a->snap, and the reclaim thread frees garbage only once that snapshot and every older one are drained (gc_reclaim_thread()).  R11: the SOA of the apex
- * and the zone's name are copied, and the snapshot is released before the answer is sent, so a client that does not read holds no snapshot. */
+ * a->snap, and the reclaim thread frees garbage only once that snapshot and every older one are drained (gc_reclaim_thread()).  R11: the answer (and
+ * the zone's name) is made while the snapshot is retained, and the snapshot is released before it is sent, so a client that does not read holds no
+ * snapshot.  The rule: true once the snapshot is released (answered, or the send failed); false only with the snapshot still retained. */
+static void xfr_arm_out_limits(const axfr_worker_args_t *a);
 static bool axfr_send_up_to_date_from_apex(axfr_worker_args_t *a, tsig_key_t *tsig_key) {
   if (a->qtype != 251 || !a->elem) return false;
   const zdir_apex_t *ap = atomic_load_explicit(&a->elem->apex, memory_order_acquire);
@@ -2815,26 +2817,14 @@ static bool axfr_send_up_to_date_from_apex(axfr_worker_args_t *a, tsig_key_t *ts
     release_zone_snapshot(a->snap);
     a->snap = NULL;
     xfr_log_denied(cip, cport, zname, 1, 251, XD_BAD_REQUEST, (uint32_t)shape);
+    xfr_arm_out_limits(a);
     axfr_send_error(a->client_fd, a->req, a->req_len, 1, false, a->send_ede, 0xFFFF, NULL, tsig_key, a->tsig_mac, a->tsig_mac_len, &a->client_addr, a->client_len,
                     &a->server_addr, a->has_server_addr);
     return true;
   }
   if (!(client_serial == ap->serial || serial_is_newer(client_serial, ap->serial))) return false;
-  /* the SOA of the apex (its numbers and the two names of the RDATA, the head of ap->data: apex_write_soa_rr() reads no more) */
-  const size_t names = (size_t)ap->mname_len + ap->rname_len;
-  zdir_apex_t *soa = malloc(sizeof(*soa) + names);
   uint8_t *res = malloc(65535);
-  if (!soa || !res) {
-    free(soa);
-    free(res);
-    return false;
-  }
-  memcpy(soa, ap, sizeof(*soa));
-  memcpy(soa->data, ap->data, names);
-  soa->ns_len = soa->glue_len = soa->naddr_len = 0;
-  soa->n_ns = 0;
-  release_zone_snapshot(a->snap);          /* nothing below reads the element or the apex */
-  a->snap = NULL;
+  if (!res) return false;
   edns_info_t req_edns = {0};
   edns_info_t resp_edns = {0};
   bool ext = false;
@@ -2851,26 +2841,45 @@ static bool axfr_send_up_to_date_from_apex(axfr_worker_args_t *a, tsig_key_t *ts
     if (req_edns.has_expire_query) {
       resp_edns.present = true;
       resp_edns.send_expire = true;
-      resp_edns.send_expire_value = soa->expire;     /* a primary zone: the SOA's EXPIRE (RFC 7314 §3) */
+      resp_edns.send_expire_value = ap->expire;      /* a primary zone: the SOA's EXPIRE (RFC 7314 §3) */
     }
   }
   axfr_emit_ctx_t ec;
   axfr_ec_start(&ec, res, a->req, q_offset, a->client_fd, ext, tsig_key, a->tsig_mac, a->tsig_mac_len, &resp_edns, &a->client_addr, a->client_len,
                 a->has_server_addr ? &a->server_addr : NULL, a->has_server_addr, zname);
   uint16_t off = ec.offset;
-  bool done = apex_write_soa_rr(res, &off, KARIDNS_AXFR_MSG_LIMIT, zname, soa, &ec.comp_ctx) == 0;
-  if (done) {
-    ec.offset = off;
-    ec.answers = 1;
-    if (axfr_ec_finish(&ec) == 0)    /* (a failed send: the client is gone, the connection is closed below) */
-      xfr_log_udp_ixfr(cip, cport, zname, client_serial, soa->serial, true, true);
-    else
-      xfr_log_aborted(cip, cport, zname, "IXFR", &ec);
-    dbreg_xfr_note(DBREG_XFR_SUMMARY);
+  /* the SOA RR is written from the apex while the snapshot is retained; if it cannot be (false: the caller waits for the zone, with the snapshot still
+   * retained, as db_ingest_xfr_await() requires) nothing is sent */
+  if (apex_write_soa_rr(res, &off, KARIDNS_AXFR_MSG_LIMIT, zname, ap, &ec.comp_ctx) != 0) {
+    free(res);
+    return false;
   }
-  free(soa);
+  const uint32_t serial = ap->serial;
+  release_zone_snapshot(a->snap);          /* R11: nothing below reads the element or the apex; the send may wait for the client */
+  a->snap = NULL;
+  ec.offset = off;
+  ec.answers = 1;
+  xfr_arm_out_limits(a);
+  if (axfr_ec_finish(&ec) == 0)    /* (a failed send: the client is gone, the connection is closed below) */
+    xfr_log_udp_ixfr(cip, cport, zname, client_serial, serial, true, true);
+  else
+    xfr_log_aborted(cip, cport, zname, "IXFR", &ec);
+  dbreg_xfr_note(DBREG_XFR_SUMMARY);
   free(res);
-  return done;
+  return true;
+}
+
+/* max-transfer-time-out / max-transfer-idle-out (BIND 9.20; 0 = no limit): send_tcp_dns_message() gives the transfer up after the deadline, and after a
+ * send that waited the idle time for the client (the socket is blocking, so SO_SNDTIMEO makes the wait end).  Armed when the first message of the answer
+ * is about to go out: the wait for a database zone before it is bounded by transfer-fetch-timeout only (a zone that comes late is still transferred, an
+ * answer that it did not come is still sent: RFC 5936 4.1.2). */
+static void xfr_arm_out_limits(const axfr_worker_args_t *a) {
+  g_tcp_send_idle_secs = a->idle_out_secs;
+  g_tcp_send_deadline_secs = a->time_out_secs ? time(NULL) + (time_t)a->time_out_secs : 0;
+  if (a->idle_out_secs) {
+    struct timeval stv = { .tv_sec = (time_t)a->idle_out_secs, .tv_usec = 0 };
+    setsockopt(a->client_fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&stv, sizeof stv);
+  }
 }
 
 void *axfr_worker_thread(void *arg) {
@@ -2889,14 +2898,6 @@ void *axfr_worker_thread(void *arg) {
     memcpy(key_val.secret_decoded, args->tsig_secret_decoded, args->tsig_secret_decoded_len);
     pkey = &key_val;
   }
-  /* max-transfer-time-out / max-transfer-idle-out (BIND 9.20; 0 = no limit): send_tcp_dns_message() gives the transfer up after the deadline,
-   * and after a send that waited the idle time for the client (the socket is blocking, so SO_SNDTIMEO makes the wait end) */
-  g_tcp_send_idle_secs = args->idle_out_secs;
-  g_tcp_send_deadline_secs = args->time_out_secs ? time(NULL) + (time_t)args->time_out_secs : 0;
-  if (args->idle_out_secs) {
-    struct timeval stv = { .tv_sec = (time_t)args->idle_out_secs, .tv_usec = 0 };
-    setsockopt(args->client_fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&stv, sizeof stv);
-  }
   /* D1a step 7: the zone is not in memory.  An IXFR from a client that is up to date is answered from the summary; for anything else the thread waits
    * (not a worker, holding no read section) until the zone is read; it then holds the entry as the dispatch does (db_ingest_xfr_await(), xfr_entry_hold()).
    * No zone in time: the one error message of RFC 5936 2.2 (SERVFAIL, EDE 14 Not Ready, RFC 8914 4.15; the connection is not just dropped, 4.1.2). */
@@ -2910,6 +2911,7 @@ void *axfr_worker_thread(void *arg) {
               "%s request failed: the zone data could not be read in time (SERVFAIL, Not Ready)", args->qtype == 251 ? "IXFR" : "AXFR");
       release_zone_snapshot(args->snap);
       args->snap = NULL;
+      xfr_arm_out_limits(args);
       axfr_send_error(args->client_fd, args->req, args->req_len, 2, false, args->send_ede, 14, "Not Ready", pkey, args->tsig_mac, args->tsig_mac_len, &args->client_addr,
                       args->client_len, &args->server_addr, args->has_server_addr);
       answered = true;
@@ -2921,11 +2923,13 @@ void *axfr_worker_thread(void *arg) {
    * every snapshot retired after it) */
   release_zone_snapshot(args->snap);
   args->snap = NULL;
-  if (!answered)
+  if (!answered) {
+    xfr_arm_out_limits(args);
     send_axfr_response(args->client_fd, args->qname, args->req, args->req_len,
                        pkey, entry, args->tsig_mac, args->tsig_mac_len,
                        &args->client_addr, args->client_len,
                        args->has_server_addr ? &args->server_addr : NULL, args->has_server_addr);
+  }
   g_tcp_send_idle_secs = 0;
   g_tcp_send_deadline_secs = 0;
 
