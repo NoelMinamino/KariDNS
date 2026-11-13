@@ -121,21 +121,22 @@ static void blockers_add(char *buf, size_t len, size_t *off, int n, int first, c
 }
 
 /* R1 (0.7): which reader slots hold back the grace period of retire_epoch, by kind, as text for a warning ("1 worker slot(s) (the first: 3),
- * 1 auxiliary slot(s)").  -> the number of such slots (0: the grace period is over; buf is then ""). */
-int rcu_describe_blockers(uint64_t retire_epoch, char *buf, size_t len) {
+ * 1 auxiliary slot(s)").  -> the number of such slots (0: the grace period is over; buf is then "").  skip: a slot that is not counted (the waiting
+ * worker's own, rcu_writer_wait_until_safe_in_reader(): it is never waited for), as readers_safe() skips it. */
+static int describe_blockers(uint64_t retire_epoch, _Atomic uint64_t *skip, char *buf, size_t len) {
   int nw = 0, fw = -1, nlog = 0, nio = 0, fio = -1, naux = 0, faux = -1;
   atomic_thread_fence(memory_order_seq_cst);
   int num_workers = atomic_load_explicit(&g_worker_count, memory_order_acquire);
   worker_ctx_t *workers = atomic_load_explicit(&g_worker_ctxs, memory_order_acquire);
   if (workers)
     for (int i = 0; i < num_workers; i++)
-      if (epoch_blocks(&workers[i].rcu_observed_epoch, retire_epoch, NULL) && nw++ == 0) fw = i;
-  if (epoch_blocks(&g_query_logger_rcu_ctx.rcu_observed_epoch, retire_epoch, NULL)) nlog++;
-  if (epoch_blocks(&g_resp_logger_rcu_ctx.rcu_observed_epoch, retire_epoch, NULL)) nlog++;
+      if (epoch_blocks(&workers[i].rcu_observed_epoch, retire_epoch, skip) && nw++ == 0) fw = i;
+  if (epoch_blocks(&g_query_logger_rcu_ctx.rcu_observed_epoch, retire_epoch, skip)) nlog++;
+  if (epoch_blocks(&g_resp_logger_rcu_ctx.rcu_observed_epoch, retire_epoch, skip)) nlog++;
   for (int i = 0; i < g_async_io_rcu_worker_count; i++)
-    if (epoch_blocks(&g_async_io_rcu_ctxs[i].rcu_observed_epoch, retire_epoch, NULL) && nio++ == 0) fio = i;
+    if (epoch_blocks(&g_async_io_rcu_ctxs[i].rcu_observed_epoch, retire_epoch, skip) && nio++ == 0) fio = i;
   for (int i = 0; i < MAX_AUX_RCU_READERS; i++)
-    if (epoch_blocks(&g_aux_rcu_slots[i].observed_epoch, retire_epoch, NULL) && naux++ == 0) faux = i;
+    if (epoch_blocks(&g_aux_rcu_slots[i].observed_epoch, retire_epoch, skip) && naux++ == 0) faux = i;
   size_t off = 0;
   if (len) buf[0] = '\0';
   blockers_add(buf, len, &off, nw, fw, "worker");
@@ -143,6 +144,10 @@ int rcu_describe_blockers(uint64_t retire_epoch, char *buf, size_t len) {
   blockers_add(buf, len, &off, nio, fio, "async I/O");
   blockers_add(buf, len, &off, naux, faux, "auxiliary (control, transfer or other thread)");
   return nw + nlog + nio + naux;
+}
+
+int rcu_describe_blockers(uint64_t retire_epoch, char *buf, size_t len) {
+  return describe_blockers(retire_epoch, NULL, buf, len);
 }
 
 /* 猶予期間の待ちの 1 回の眠りの上限。読み手の区間は短い (問い合わせ 1 件、制御スレッドの tick 1 回) ので、
@@ -176,7 +181,7 @@ static bool wait_until_safe_impl(uint64_t retire_epoch, int timeout_ms, _Atomic 
       if (elapsed_ms >= next_stall_log_ms) {
         next_stall_log_ms = elapsed_ms + 60000;
         char who[192];
-        if (rcu_describe_blockers(retire_epoch, who, sizeof(who)) == 0) snprintf(who, sizeof(who), "no reader now");
+        if (describe_blockers(retire_epoch, skip, who, sizeof(who)) == 0) snprintf(who, sizeof(who), "no reader now");
         syslog(LOG_WARNING, "[EpochRCU] wait_until_safe stalled for %" PRId64 " ms (retire_epoch=%" PRIu64 "; held by %s)",
                elapsed_ms, retire_epoch, who);
       }

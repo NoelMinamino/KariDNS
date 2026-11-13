@@ -323,6 +323,13 @@ static void test_wait_in_reader(void) {
 
   assert(rcu_writer_wait_until_safe(retire, 20) == false);             /* both sections are older than the publish */
   assert(rcu_writer_wait_until_safe_in_reader(retire, 20) == false);   /* the other one still blocks: timeout */
+  /* the stall line of the wait names what it waits for: the other worker's slot, not the caller's own (review low, 0.7) */
+  g_stall_log[0] = '\0';
+  assert(rcu_writer_wait_until_safe_in_reader(retire, 1300) == false);
+  assert(strstr(g_stall_log, "held by 1 worker slot(s) (the first: 1))") != NULL);
+  g_stall_log[0] = '\0';
+  assert(rcu_writer_wait_until_safe(retire, 1300) == false);            /* the plain wait counts both */
+  assert(strstr(g_stall_log, "held by 2 worker slot(s) (the first: 0))") != NULL);
   rcu_reader_exit(other);
   assert(rcu_writer_wait_until_safe_in_reader(retire, 50) == true);    /* only its own section is left */
   assert(rcu_writer_wait_until_safe(retire, 20) == false);             /* the plain wait does not skip it */
