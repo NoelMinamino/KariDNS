@@ -45,7 +45,7 @@ dag [global-queryopt...] [query...]
 4. **Transports & Protocol Extensions**:
    Support for **DNS over TLS (DoT)**, **DNS over HTTPS (DoH)**, **Plain HTTP DNS**, **HAProxy PROXYv2**, **EDNS Client Subnet (ECS)**, **DNS Cookies**, **Extended DNS Errors (EDE)**, **Multiple QTYPE (RFC 10029)**, **Dynamic Updates (RFC 2136)**, and **Transaction Security (TSIG / SIG(0))**.
 5. **Traffic Replay & Differential Engine (`--replay`)**:
-   Asynchronously replays recorded DNS queries from PCAP traces, dnstap Frame Streams, or text query lists against target nameservers, providing order-independent semantic differential testing across dual servers and automatic protocol preservation (TCP/UDP). See [`dag_replay(1)`](dag_replay.md) for full reference.
+   Asynchronously replays recorded DNS queries from PCAP traces, dnstap Frame Streams, or text query lists against target nameservers, providing order-independent semantic differential testing across dual servers and automatic protocol preservation (TCP/UDP). See [`dag-replay(1)`](dag_replay.md) for full reference.
 6. **Memory Arenas**:
    Uses bump-allocated memory arenas (`zone_arena_t`) for scratch allocations during query processing.
 
@@ -807,7 +807,7 @@ dag example.com A @127.0.0.1 --test-all
 - [`karidns(8)`](karidns.md) — KariDNS authoritative DNS server daemon
 - [`karictl(8)`](karictl.md) — KariDNS server management and control utility
 - [`karicheck(8)`](karicheck.md) — Configuration and zone file validation utility
-- [`dag_replay(1)`](dag_replay.md) — Traffic replay and differential testing (`dag --replay`)
+- [`dag-replay(1)`](dag_replay.md) — Traffic replay and differential testing (`dag --replay`)
 - [`dag.c`](../tools/dag.c) — Source implementation of the DNS Anomaly Generator
 - [`KariDNS RFC Guideline`](../KariDNS_RFC_GUIDELINE.md) — Detailed RFC compliance and design boundary document
 

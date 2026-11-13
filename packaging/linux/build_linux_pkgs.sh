@@ -36,6 +36,7 @@ cp LICENSE "${TAR_DIR}/dag-${VERSION}/" 2>/dev/null || true
 cp README.md "${TAR_DIR}/dag-${VERSION}/" 2>/dev/null || true
 cp docs/dag.md "${TAR_DIR}/dag-${VERSION}/" 2>/dev/null || true
 cp docs/dag_replay.md "${TAR_DIR}/dag-${VERSION}/" 2>/dev/null || true
+cp man/dag-replay.1 "${TAR_DIR}/dag-${VERSION}/"               # dag --replay (from docs/dag_replay.md)
 cp man/dag.1 "${TAR_DIR}/dag-${VERSION}/"                      # the manual page (generated from docs/dag.md: make man)
 tar -czf "${OUT_DIR}/dag-${VERSION}-linux-${RPM_ARCH}.tar.gz" -C "${TAR_DIR}" "dag-${VERSION}"
 rm -rf "${TAR_DIR}"

@@ -36,6 +36,7 @@ make install-dag install-man-dag DESTDIR=%{buildroot} PREFIX=%{_prefix} BINDIR=%
 %license LICENSE
 %doc README.md docs/dag.md
 %{_bindir}/dag
+%{_mandir}/man1/dag-replay.1*
 %{_mandir}/man1/dag.1*
 
 %changelog

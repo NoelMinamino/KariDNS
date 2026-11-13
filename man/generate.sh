@@ -38,6 +38,7 @@ page karidns.md 5 karidns.conf --only "$CONF" --name-desc 'the configuration fil
 page karictl.md 8 karictl
 page karicheck.md 8 karicheck
 page dag.md 1 dag
+page dag_replay.md 1 dag-replay
 page karidns-tapstat.md 1 karidns-tapstat
 page karidns-dbloader.md 8 karidns-dbloader
 page karidns-zone.md 8 karidns-zone

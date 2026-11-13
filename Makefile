@@ -1526,7 +1526,7 @@ INST_WEBADMIN = $(BINMODE):packaging/freebsd/karidns-webadmin:$(SBINDIR)/karidns
 	0444:node/package.json:$(LIBEXECDIR)/karidns-webadmin/node/package.json tree:webadmin/node_modules:$(LIBEXECDIR)/karidns-webadmin/node_modules
 INST_MAN_SERVER = man:man/karidns.8:$(MANDIR)/man8/karidns.8 man:man/karidns.conf.5:$(MANDIR)/man5/karidns.conf.5 man:man/karictl.8:$(MANDIR)/man8/karictl.8 \
 	man:man/karicheck.8:$(MANDIR)/man8/karicheck.8 man:man/karidns-tapstat.1:$(MANDIR)/man1/karidns-tapstat.1
-INST_MAN_DAG = man:man/dag.1:$(MANDIR)/man1/dag.1
+INST_MAN_DAG = man:man/dag.1:$(MANDIR)/man1/dag.1 man:man/dag-replay.1:$(MANDIR)/man1/dag-replay.1
 INST_MAN_DB = man:man/karidns-dbloader.8:$(MANDIR)/man8/karidns-dbloader.8 man:man/karidns-zone.8:$(MANDIR)/man8/karidns-zone.8
 INST_MAN_SIGNER = man:man/karidns-signer.8:$(MANDIR)/man8/karidns-signer.8
 INST_MAN_WEBADMIN = man:man/karidns-webadmin.8:$(MANDIR)/man8/karidns-webadmin.8

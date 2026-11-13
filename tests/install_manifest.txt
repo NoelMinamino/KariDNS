@@ -53,6 +53,7 @@ man-server 0444 ${PREFIX}/share/man/man5/karidns.conf.5
 man-server 0444 ${PREFIX}/share/man/man8/karictl.8
 man-server 0444 ${PREFIX}/share/man/man8/karicheck.8
 man-server 0444 ${PREFIX}/share/man/man1/karidns-tapstat.1
+man-dag 0444 ${PREFIX}/share/man/man1/dag-replay.1
 man-dag 0444 ${PREFIX}/share/man/man1/dag.1
 man-db 0444 ${PREFIX}/share/man/man8/karidns-dbloader.8
 man-db 0444 ${PREFIX}/share/man/man8/karidns-zone.8

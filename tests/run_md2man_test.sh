@@ -26,7 +26,7 @@ command -v perl > /dev/null 2>&1 || { skip "perl is not installed"; exit 0; }
 T=$(mktemp -d "${TMPDIR:-/tmp}/karidns_md2man.XXXXXX") || exit 1
 trap 'rm -rf "$T"' EXIT
 trap 'exit 130' INT TERM
-PAGES="karidns.8 karidns.conf.5 karictl.8 karicheck.8 dag.1 karidns-tapstat.1 karidns-dbloader.8 karidns-zone.8 karidns-signer.8 karidns-webadmin.8"
+PAGES="karidns.8 karidns.conf.5 karictl.8 karicheck.8 dag.1 dag-replay.1 karidns-tapstat.1 karidns-dbloader.8 karidns-zone.8 karidns-signer.8 karidns-webadmin.8"
 # the committed pages and fixtures without CRs (above): what is compared, checked and linted
 mkdir "$T/man" "$T/fix"
 for p in $PAGES; do [ -f "man/$p" ] && tr -d '\r' < "man/$p" > "$T/man/$p"; done

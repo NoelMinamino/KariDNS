@@ -82,7 +82,7 @@ make uninstall                      # removes what make install put there
 | `install-dag` | `dag` (what the dag packages of Linux, macOS and Homebrew ship) | `BINDIR` |
 | `install-db` | `karidns-dbloader`; `karidns-zone`; the SQL files of the drivers in `DB_DRIVERS` | `LIBEXECDIR`; `BINDIR`; `DATADIR/db` (`PREFIX/share/karidns/db`) |
 | `install-signer`, `install-webadmin` | the Node.js programs with `node_modules` (run `npm ci --omit=dev --ignore-scripts` in `signer/` or `webadmin/` first), the wrapper, the rc script, the sample configuration | `LIBEXECDIR/karidns-signer/`, `LIBEXECDIR/karidns-webadmin/`; `SBINDIR`; `RCDIR`; `SYSCONFDIR/karidns` |
-| `install-man-X` | the manual pages of X (`server`: karidns(8), karidns.conf(5), karictl(8), karicheck(8), karidns-tapstat(1); `dag`: dag(1); `db`: karidns-dbloader(8), karidns-zone(8); `signer`, `webadmin`) | `MANDIR/manN` (`PREFIX/share/man`) |
+| `install-man-X` | the manual pages of X (`server`: karidns(8), karidns.conf(5), karictl(8), karicheck(8), karidns-tapstat(1); `dag`: dag(1), dag-replay(1); `db`: karidns-dbloader(8), karidns-zone(8); `signer`, `webadmin`) | `MANDIR/manN` (`PREFIX/share/man`) |
 | `install-docs-X` | the Markdown manuals of X | `DOCDIR` (`PREFIX/share/doc/karidns`) |
 | `install` | `install-server`, `install-dag`, `install-man` and `install-docs` of both, and `install-db` with its pages and manuals when `DB_DRIVERS` is not empty | |
 
