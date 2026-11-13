@@ -99,6 +99,18 @@ jobs:
             sh tests/run_configure_test.sh < /dev/null
             echo "::endgroup::"
 
+            echo "::group::📖 [Manual pages] man/ is what make man makes of docs/*.md; mandoc -T lint"
+            # tests/run_md2man_test.sh: the converter's fixtures, the committed pages against a fresh man/generate.sh, no mandoc message at WARNING
+            # or worse (perl5 is installed above, mandoc is in the base system).  A stale page fails here: run make man and commit the pages
+            sh tests/run_md2man_test.sh < /dev/null
+            echo "::endgroup::"
+
+            echo "::group::📦 [Install] make install against tests/install_manifest.txt; the packages list what make install stages"
+            # tests/run_install_test.sh in a copy with the binaries built above: make install / uninstall (BSD make), other directories, and
+            # build_pkg.sh --no-build for karidns and karidns-db plus the signer and WebAdmin packages (npm ci): their file lists, modes and metadata
+            sh tests/run_install_test.sh < /dev/null
+            echo "::endgroup::"
+
             echo "::group::🧪 [Unit Tests] All C unit tests (incl. RFC published-vector tests), 4 at a time"
             # Same tests as `make unit-tests` (plus test_acl_match and test_listen_on), run by tests/run_all_suite.sh: 4 at a time,
             # tests that share a resource (the PostgreSQL server) one after the other, each test with its own log, which is printed
@@ -399,6 +411,13 @@ jobs:
           # X-09: queries a local mock server (no real domains or public resolvers)
           sh ./tests/run_ci_dag_smoke.sh
           echo "::endgroup::"
+
+      # make install-dag, install-man-dag, install-docs-dag with GNU make (tests/run_install_test.sh: only dag is built here; the server, the
+      # database parts and the packages are checked by the FreeBSD job)
+      - name: make install of dag (GNU make)
+        if: runner.os == 'Linux'
+        run: |
+          sh tests/run_install_test.sh
 
   build-dag-windows:
     name: Build & Smoke Test dag on Windows (MinGW-w64)

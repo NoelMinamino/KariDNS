@@ -218,12 +218,12 @@ mkdir -p "$P/out"
 cp -Rp "$S/." "$P/src"
 cd "$P/src" || exit 1
 rm -rf signer/node_modules webadmin/node_modules
-if (sh packaging/freebsd/build_pkg.sh --no-build 9.9.9 "$P/out") > "$T/b.out" 2>&1; then ok "build_pkg.sh --no-build builds karidns"; else bad "build_pkg.sh --no-build failed" "$(tail -10 "$T/b.out")"; done_; fi
+if (ALLOW_PORTS_OPENSSL=1 sh packaging/freebsd/build_pkg.sh --no-build 9.9.9 "$P/out") > "$T/b.out" 2>&1; then ok "build_pkg.sh --no-build builds karidns"; else bad "build_pkg.sh --no-build failed" "$(tail -10 "$T/b.out")"; done_; fi
 make install-server install-dag install-man-server install-man-dag install-docs-server install-docs-dag DESTDIR="$P/s1" PREFIX=/usr/local MANCOMPRESS=yes > /dev/null 2>&1
 pkgcheck karidns "$(ls "$P"/out/karidns-9.9.9-*.pkg)" "$P/s1"
 mkdir -p "$P/m1" && tar -xf "$P"/out/karidns-9.9.9-*.pkg -C "$P/m1" +MANIFEST
 M=$P/m1/+MANIFEST
-grep -q 'pw groupadd karidns$' "$M" && grep -q 'pw useradd karidns -g karidns -h - -d /nonexistent -s /usr/sbin/nologin' "$M" && ok "pre-install creates the group and the user karidns (no login, no home)" || bad "pre-install: no user karidns"
+grep -q 'pw groupshow karidns >/dev/null 2>&1 || pw groupadd karidns' "$M" && grep -q 'pw useradd karidns -g karidns -h - -d /nonexistent -s /usr/sbin/nologin' "$M" && ok "pre-install creates the group and the user karidns (no login, no home)" || bad "pre-install: no user karidns"
 grep -q 'install -d -o root -g wheel -m 0755 /var/run/karidns' "$M" && grep -q '\[ -d /var/log/named \] || install -d -o karidns -g karidns -m 0755 /var/log/named' "$M" && ok "post-install makes /var/run/karidns and a missing /var/log/named" || bad "post-install: no directories"
 pkg info -R -F "$P"/out/karidns-9.9.9-*.pkg > "$T/raw" 2> /dev/null
 for c in karidns-sqlite3 karidns-postgresql karidns-db; do grep -q "\"$c\"" "$T/raw" || bad "karidns does not conflict with $c"; done
@@ -238,7 +238,7 @@ case $("$ROOT/karidns-dbloader" --drivers 2> /dev/null | tr '\n' ' ') in
 esac
 if [ $HAVE_DB = yes ] && [ -n "$V" ]; then
     DRVS=$("$ROOT/karidns-dbloader" --drivers | tr '\n' ' ' | sed 's/ $//')
-    if (sh packaging/freebsd/build_pkg.sh --db $V --no-build 9.9.9 "$P/out") > "$T/b.out" 2>&1; then ok "build_pkg.sh --db $V --no-build builds $N"; else bad "build_pkg.sh --db $V failed" "$(tail -10 "$T/b.out")"; fi
+    if (ALLOW_PORTS_OPENSSL=1 sh packaging/freebsd/build_pkg.sh --db $V --no-build 9.9.9 "$P/out") > "$T/b.out" 2>&1; then ok "build_pkg.sh --db $V --no-build builds $N"; else bad "build_pkg.sh --db $V failed" "$(tail -10 "$T/b.out")"; fi
     make install-server install-dag install-man-server install-man-dag install-docs-server install-docs-dag install-db install-man-db install-docs-db \
         DB_DRIVERS="$DRVS" DESTDIR="$P/s2" PREFIX=/usr/local MANCOMPRESS=yes > /dev/null 2>&1
     pkgcheck "$N" "$(ls "$P"/out/$N-9.9.9-*.pkg)" "$P/s2"
