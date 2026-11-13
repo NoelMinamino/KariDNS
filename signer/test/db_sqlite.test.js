@@ -194,6 +194,7 @@ test('the lock path swapped between the check and SQLite\'s open: refused, the o
     const notdbGone = { DatabaseSync: class { constructor(f) { fs.unlinkSync(f); throw Object.assign(new Error('file is not a database'), { errcode: 26 }); } } };
     fs.writeFileSync(p('e.lock'), '123\n');
     assert.throws(() => acquireFileLock(p('e.lock'), { sqlite: notdbGone }), /e\.lock: ENOENT/);
+    fs.writeFileSync(p('plain.txt'), '');                                     // a path through a file: lstat fails with ENOTDIR
     assert.throws(() => acquireFileLock(path.join(p('plain.txt'), 'x.lock'), { sqlite }), /cannot take the lock file .*x.lock: ENOTDIR/);
   } finally { rmDir(dir); }
 });
