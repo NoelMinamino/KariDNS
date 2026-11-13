@@ -7,8 +7,8 @@ $ORIGIN harmonize.test.
 ns1 3600 IN A 127.0.0.1
 
 ; Case 1: mixed A records with inconsistent TTLs -> normalized to 300
-mixed 300  IN A 1.2.3.4
-mixed 900  IN A 1.2.3.5
+mixed 300  IN A 192.0.2.4
+mixed 900  IN A 192.0.2.5
 
 ; Case 2: RRSIG(A) TTL 3600 -> adjusted to 300 (covered A normalized TTL)
 mixed 3600 IN RRSIG A 13 2 300 20271231235959 20261231235959 12345 harmonize.test. YWJjZGVmZ2g=

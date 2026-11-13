@@ -1078,7 +1078,7 @@ static void test_same_zone(void) {
     const char *d1 = "$ORIGIN example.test.\n$TTL 300\n$LOCATION-TAG lan 10.0.0.0/8\n@ SOA ns1 h 1 2 3 4 5\n";
     const char *d2 = "$ORIGIN example.test.\n$TTL 300\n$LOCATION-TAG lan 10.0.0.0/9\n@ SOA ns1 h 1 2 3 4 5\n";
     const char *d3 = "$ORIGIN example.test.\n$TTL 300\n$LOCATION-TAG wan 10.0.0.0/8\n@ SOA ns1 h 1 2 3 4 5\n";
-    const char *d4 = "$ORIGIN example.test.\n$TTL 300\n$LOCATION-TAG lan 10.0.0.0/8 11.0.0.0/8\n@ SOA ns1 h 1 2 3 4 5\n";
+    const char *d4 = "$ORIGIN example.test.\n$TTL 300\n$LOCATION-TAG lan 10.0.0.0/8 198.51.100.0/24\n@ SOA ns1 h 1 2 3 4 5\n";
     zone_arena_t c;
     CHECK(parse_bind(d1, &c, err, sizeof(err)));
     const char *others[] = { d2, d3, d4 };

@@ -174,7 +174,7 @@ void *arena_alloc(zone_arena_t *arena, size_t size);
 
 // ECS / Location サブネットタグ構造体
 typedef struct {
-  char *cidr;       /* "8.8.8.0/24" のような文字列のまま保持 */
+  char *cidr;       /* "192.0.2.0/24" のような文字列のまま保持 */
   cidr_entry_t parsed;
 } ecs_cidr_entry_t;
 

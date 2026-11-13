@@ -287,7 +287,7 @@ www.example.com. IN NSEC mail.example.com. A AAAA RRSIG NSEC
 @ IN NSEC3PARAM 1 0 10 AABBCCDD
 
 ; ZONEMD: ゾーン全体の内容から計算するダイジェスト
-@       IN ZONEMD 2026071001 1 1 b9692ed4a24c596846a766b6c040e38fd81e916dcc73d79a7ab1b66c0affc045f2c5c0431d84b58685b95e7818603286
+@       IN ZONEMD 2026071001 1 1 a89448daa3525cf7a5192db756f8366fe5bcfb1e5d49ee7f088f530ed78f074df1e05dc56dd8fac9ac6736ba568a7021
 
 ; CDS / CDNSKEY: 子ゾーンが親ゾーンにDS/DNSKEY更新を通知
 @       IN CDS     23534 13 2 fcdb742c06b9a17cd02ccd070f9b8f4a9376e1f1a34b960bfab565fbea4e01d8
@@ -399,8 +399,8 @@ generic-rr  IN TYPE65280 \# 4 c0000201
 $GENERATE 1-50 host$ IN A 192.0.2.${100}
 
 ; wifi-0.example.com. 〜 wifi-9.example.com. を
-; 192.0.3.0 〜 192.0.3.9 に割り当てる例
-$GENERATE 0-9 wifi-$ IN A 192.0.3.$
+; 192.0.2.0 〜 192.0.2.9 に割り当てる例
+$GENERATE 0-9 wifi-$ IN A 192.0.2.$
 
 ; 参考: 逆引きゾーン(2.0.192.in-addr.arpa.)で使う場合の典型例
 ; (このファイル=正引きゾーンには含めていません)

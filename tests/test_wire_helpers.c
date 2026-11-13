@@ -1858,7 +1858,7 @@ static void test_zone_parser_invalid_ttl_value_rejection(void) {
     parse_context_t ctx;
     memset(&ctx, 0, sizeof(ctx));
 
-    const char *zstr = "$TTL 9999999999999999999999999\n@ IN A 1.2.3.4\n";
+    const char *zstr = "$TTL 9999999999999999999999999\n@ IN A 192.0.2.4\n";
     char *b = arena_strdup(&arena, zstr);
     parse_zone_fast(b, strlen(b), &arena, &ctx);
     zone_arena_destroy(&arena);
@@ -1934,7 +1934,7 @@ static void test_tinydns_parser_prefix_ampersand_and_dot(void) {
     zone_arena_init(&arena);
     parse_context_t ctx;
     memset(&ctx, 0, sizeof(ctx));
-    char data[] = "&example.com:1.2.3.4:ns1.example.com:300\n.example.com:1.2.3.4:ns1.example.com:300\n";
+    char data[] = "&example.com:192.0.2.4:ns1.example.com:300\n.example.com:192.0.2.4:ns1.example.com:300\n";
     int count = parse_tinydns_data(data, strlen(data), &arena, &ctx);
     CHECK(count > 0);
     zone_arena_destroy(&arena);
@@ -2296,7 +2296,7 @@ static void test_wire_cidr_ipv4_slash_zero_any(void) {
     printf("[TEST] CIDR: IPv4 0.0.0.0/0 matching any IPv4 address...\n");
     cidr_entry_t entry;
     CHECK(cidr_entry_parse(&entry, "0.0.0.0/0") == true);
-    CHECK(cidr_entry_match_str(&entry, "1.2.3.4") == true);
+    CHECK(cidr_entry_match_str(&entry, "192.0.2.4") == true);
     CHECK(cidr_entry_match_str(&entry, "255.255.255.255") == true);
 }
 

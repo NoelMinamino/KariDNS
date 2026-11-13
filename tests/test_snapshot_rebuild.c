@@ -558,7 +558,7 @@ static void test_snapshot_rebuild_case_7(void) {
     printf("[TEST] Snapshot Rebuild: Forward zone configuration snapshot...\n");
     server_config_t *cfg = load_conf(
         "options { directory \"%s\"; };\n"
-        "view \"default\" { zone \"fwd.example\" { type forward; forwarders { 8.8.8.8; }; }; };\n",
+        "view \"default\" { zone \"fwd.example\" { type forward; forwarders { 192.0.2.53; }; }; };\n",
         g_dir);
     zone_db_snapshot_t *snap = build(cfg, false);
     assert(snap != NULL);
@@ -725,7 +725,7 @@ static void test_snapshot_rebuild_case_24(void) {
     zone_arena_init(&arena);
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "coll.example.", .is_standalone_mode = true, .err_out = &err };
-    char ztext[] = "$ORIGIN coll.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nrec1 IN A 1.1.1.1\nrec2 IN A 2.2.2.2\n";
+    char ztext[] = "$ORIGIN coll.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nrec1 IN A 192.0.2.1\nrec2 IN A 192.0.2.2\n";
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
     assert(test_build_index(&arena, true) == 0);
     zone_arena_destroy(&arena);

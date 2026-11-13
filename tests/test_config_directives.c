@@ -1082,7 +1082,7 @@ static void test_zone_rate_limit(void) {
     expect_reject("rate-limit ';' missing after value", "options { rate-limit { window 5 }; };");
     expect_reject("rate-limit ';' missing after block", "options { rate-limit { window 5; } };");
     expect_reject("rate-limit non-string key", "options { rate-limit { { }; }; };");
-    expect_reject("exempt-clients without braces", "options { rate-limit { exempt-clients 1.2.3.4; }; };");
+    expect_reject("exempt-clients without braces", "options { rate-limit { exempt-clients 192.0.2.4; }; };");
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1147,7 +1147,7 @@ static void test_acl_lists(void) {
     }
 
     expect_reject("allow-transfer without braces", "zone \"a.test\" { type master; allow-transfer any; };");
-    expect_reject("allow-transfer unterminated", "zone \"a.test\" { type master; allow-transfer { 1.2.3.4; ");
+    expect_reject("allow-transfer unterminated", "zone \"a.test\" { type master; allow-transfer { 192.0.2.4; ");
     expect_reject("key without name", "zone \"a.test\" { type master; allow-transfer { key ; }; };");
     expect_reject("negated block without ';'", "zone \"a.test\" { type master; allow-transfer { ! { 10.0.0.0/8; } }; };");
     expect_reject("'!' at end of list", "zone \"a.test\" { type master; allow-transfer { ! }; };");
@@ -1755,8 +1755,8 @@ static void test_config_negative_patterns(void) {
         free_server_config_fields(&cfg);
     }
     /* Program & forward zone with superfluous file and masters */
-    if (parse_ok("zone \"p.test\" { type program; program \"/bin/echo\"; file \"z\"; masters { 1.2.3.4; }; }; "
-                 "zone \"f.test\" { type forward; forwarders { 1.2.3.4; }; file \"z\"; masters { 1.2.3.4; }; };", &cfg)) {
+    if (parse_ok("zone \"p.test\" { type program; program \"/bin/echo\"; file \"z\"; masters { 192.0.2.4; }; }; "
+                 "zone \"f.test\" { type forward; forwarders { 192.0.2.4; }; file \"z\"; masters { 192.0.2.4; }; };", &cfg)) {
         free_server_config_fields(&cfg);
     }
 

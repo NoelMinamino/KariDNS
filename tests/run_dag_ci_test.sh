@@ -447,8 +447,8 @@ run_check "+multi flag accepted" "$DAG @127.0.0.1 -p $PORT example.com A +multi 
 run_check "+nomulti flag accepted" "$DAG @127.0.0.1 -p $PORT example.com A +nomulti +timeout=1" "(opcode: QUERY|status:|timed out|no usable response|no servers could be reached)"
 run_check "+noednsopt flag accepted" "$DAG @127.0.0.1 -p $PORT example.com A +ednsopt=65001:0102 +noednsopt +qr +timeout=1" "(opcode: QUERY|status:|timed out|no usable response|no servers could be reached)"
 if [ "$DAG" != "dig" ]; then
-    run_check "--prereq-nxrrset separate args" "$DAG @127.0.0.1 -p $PORT example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-nxrrset test.example.com A +qr +timeout=1" "Query \([0-9]+ bytes\)"
-    run_check "--prereq-yxrrset separate args with rdata" "$DAG @127.0.0.1 -p $PORT example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-yxrrset test.example.com A 1.2.3.4 +qr +timeout=1" "Query \([0-9]+ bytes\)"
+    run_check "--prereq-nxrrset separate args" "$DAG @127.0.0.1 -p $PORT example.com SOA --update-add 'test.example.com 300 IN A 192.0.2.4' --prereq-nxrrset test.example.com A +qr +timeout=1" "Query \([0-9]+ bytes\)"
+    run_check "--prereq-yxrrset separate args with rdata" "$DAG @127.0.0.1 -p $PORT example.com SOA --update-add 'test.example.com 300 IN A 192.0.2.4' --prereq-yxrrset test.example.com A 192.0.2.4 +qr +timeout=1" "Query \([0-9]+ bytes\)"
     run_check "Multiple structural breaks warning" "$DAG @127.0.0.1 -p $PORT example.com A --break compression-loop --break oversized-qname +timeout=1" "warning: --break 'oversized-qname' ignored; structural break kind is already set"
 fi
 

@@ -123,15 +123,15 @@ if [ "$DAG" = "dig" ]; then
     run_skip "--prereq colon-delimited with rdata"
 else
     # Test --prereq-nxrrset with separate arguments (name type)
-    run_check "--prereq-nxrrset separate arguments" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-nxrrset test.example.com A +qr +timeout=1" "Query \([0-9]+ bytes\)"
+    run_check "--prereq-nxrrset separate arguments" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 192.0.2.4' --prereq-nxrrset test.example.com A +qr +timeout=1" "Query \([0-9]+ bytes\)"
     # Test --prereq-yxrrset with separate arguments (name type)
-    run_check "--prereq-yxrrset separate arguments without rdata" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-yxrrset test.example.com A +qr +timeout=1" "Query \([0-9]+ bytes\)"
+    run_check "--prereq-yxrrset separate arguments without rdata" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 192.0.2.4' --prereq-yxrrset test.example.com A +qr +timeout=1" "Query \([0-9]+ bytes\)"
     # Test --prereq-yxrrset with separate arguments including rdata (name type rdata)
-    run_check "--prereq-yxrrset separate arguments with rdata" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-yxrrset test.example.com A 1.2.3.4 +qr +timeout=1" "Query \([0-9]+ bytes\)"
+    run_check "--prereq-yxrrset separate arguments with rdata" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 192.0.2.4' --prereq-yxrrset test.example.com A 192.0.2.4 +qr +timeout=1" "Query \([0-9]+ bytes\)"
     # Test --prereq-yxrrset with quoted single argument
-    run_check "--prereq-yxrrset quoted argument with rdata" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-yxrrset 'test.example.com A 1.2.3.4' +qr +timeout=1" "Query \([0-9]+ bytes\)"
+    run_check "--prereq-yxrrset quoted argument with rdata" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 192.0.2.4' --prereq-yxrrset 'test.example.com A 192.0.2.4' +qr +timeout=1" "Query \([0-9]+ bytes\)"
     # Test --prereq=yxrrset:name:type:rdata colon-delimited format
-    run_check "--prereq colon-delimited with rdata" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq='yxrrset:test.example.com:A:1.2.3.4' +qr +timeout=1" "Query \([0-9]+ bytes\)"
+    run_check "--prereq colon-delimited with rdata" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 192.0.2.4' --prereq='yxrrset:test.example.com:A:192.0.2.4' +qr +timeout=1" "Query \([0-9]+ bytes\)"
     # Test --prereq= with colons inside RDATA (e.g. IPv6 address or TXT)
     run_check "--prereq colon-delimited with IPv6 RDATA" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN AAAA 2001:db8::1' --prereq='yxrrset:test.example.com:AAAA:2001:db8::1' +qr +timeout=1" "Query \([0-9]+ bytes\)"
 fi
@@ -158,8 +158,8 @@ run_check "+bufsize=1232" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +bufsiz
 run_check "+ndots=2 +tries=2 +retry=2" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +ndots=2 +tries=2 +retry=2 +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 run_check "+yaml output formatting" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +yaml +timeout=1" "(---|\"status\"|timed out|no servers could be reached|no usable response)"
 run_check "+short +multiline" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +short +multiline +timeout=1" "(timed out|no servers could be reached|no usable response|^$|[0-9a-fA-F])"
-run_check "--prereq-nxdomain" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-nxdomain nx.example.com +qr +timeout=1" "Query \([0-9]+ bytes\)"
-run_check "--prereq-yxdomain" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-yxdomain yx.example.com +qr +timeout=1" "Query \([0-9]+ bytes\)"
+run_check "--prereq-nxdomain" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 192.0.2.4' --prereq-nxdomain nx.example.com +qr +timeout=1" "Query \([0-9]+ bytes\)"
+run_check "--prereq-yxdomain" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 192.0.2.4' --prereq-yxdomain yx.example.com +qr +timeout=1" "Query \([0-9]+ bytes\)"
 
 echo "=== 7. Testing Conflicting Options, Invalid Ports, and Invalid Server IPs ==="
 # Conflicting transport flags: +tcp then +udp (udp wins)

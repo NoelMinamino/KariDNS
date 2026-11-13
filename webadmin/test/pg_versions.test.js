@@ -58,7 +58,7 @@ test('versions: the list, one version, the delta, the sizes; a subdomain master\
   assert.deepEqual(d.log[1][1], [7, 6]);
   // a range
   const c = fakeTx([[/count\(\*\) AS n/, [{ n: 12 }]], [/SELECT v\.version, v\.delta_complete/, [{ version: 2, delta_complete: true }, { version: 3, delta_complete: false }]],
-    [/SELECT v\.version, r\.owner/, [{ version: 2, owner: 'a.t', type: 'A', before: null, after: '300 A 1.1.1.1' }]]]);
+    [/SELECT v\.version, r\.owner/, [{ version: 2, owner: 'a.t', type: 'A', before: null, after: '300 A 192.0.2.1' }]]]);
   assert.equal(await S.versionRowCount(c, 's', 8, 1, undefined, { zone: 'example.test', visibility: null }), 12);
   assert.equal(await S.versionRowCount(c, 's', 8, 1, 3, { zone: 'example.test', visibility: null }), 12);
   assert.match(c.log[0][0], /JOIN "s"\.karidns_zone_versions v ON v\.id = r\.version_id WHERE v\.domain_id = \$1 AND v\.version > \$2 AND 1 = 1$/);

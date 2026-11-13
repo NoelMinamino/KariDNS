@@ -89,14 +89,14 @@ if ! grep -q "initial" out.txt; then
 fi
 
 echo "[*] 1. Unauthorized UPDATE (No TSIG): REFUSED, no TSIG (RFC 2136 §3.3)..."
-$DAG dynupdate.test a @127.0.0.1 -p $PORT --update-add 'new1.dynupdate.test 300 A 1.2.3.4' +nohexdump > out.txt 2>&1 || true
+$DAG dynupdate.test a @127.0.0.1 -p $PORT --update-add 'new1.dynupdate.test 300 A 192.0.2.4' +nohexdump > out.txt 2>&1 || true
 if ! grep -q "status: REFUSED" out.txt || grep -q "ANY[[:space:]]*TSIG" out.txt; then
     echo "[FAIL] Unsigned UPDATE: expected REFUSED without TSIG."
     cat out.txt
     exit 1
 fi
 $DAG new1.dynupdate.test. A @127.0.0.1 -p $PORT +short > res.txt
-if grep -q "1.2.3.4" res.txt; then
+if grep -q "192.0.2.4" res.txt; then
     echo "[FAIL] Unauthorized UPDATE succeeded!"
     exit 1
 fi
@@ -107,20 +107,20 @@ tsig_line() {
 }
 
 echo "[*] 2. UPDATE signed with a defined key that allow-update does not list: REFUSED, signed with that key (RFC 8945 §5.3)..."
-$DAG dynupdate.test a @127.0.0.1 -p $PORT --update-add 'new1.dynupdate.test 300 A 1.2.3.5' +nohexdump -y hmac-sha256:wrong-key:D+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
+$DAG dynupdate.test a @127.0.0.1 -p $PORT --update-add 'new1.dynupdate.test 300 A 192.0.2.5' +nohexdump -y hmac-sha256:wrong-key:D+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
 if ! grep -q "status: REFUSED" out.txt || ! tsig_line wrong-key NOERROR > /dev/null || grep -q "Couldn't verify" out.txt; then
     echo "[FAIL] Valid but not allowed key: expected REFUSED signed with wrong-key."
     cat out.txt
     exit 1
 fi
 $DAG new1.dynupdate.test. A @127.0.0.1 -p $PORT +short > res.txt
-if grep -q "1.2.3.5" res.txt; then
+if grep -q "192.0.2.5" res.txt; then
     echo "[FAIL] Wrong TSIG UPDATE succeeded!"
     exit 1
 fi
 
 echo "[*] 2b. UPDATE signed with an unknown key: NOTAUTH, BADKEY, unsigned, key name echoed (RFC 8945 §5.2.1)..."
-$DAG dynupdate.test a @127.0.0.1 -p $PORT --update-add 'new1.dynupdate.test 300 A 1.2.3.5' +nohexdump -y hmac-sha256:no-such-key:D+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
+$DAG dynupdate.test a @127.0.0.1 -p $PORT --update-add 'new1.dynupdate.test 300 A 192.0.2.5' +nohexdump -y hmac-sha256:no-such-key:D+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
 if ! grep -q "status: NOTAUTH" out.txt || ! tsig_line no-such-key BADKEY | grep -qE "[[:space:]]0[[:space:]]+[0-9]+[[:space:]]+BADKEY"; then
     echo "[FAIL] Unknown key: expected NOTAUTH with TSIG error BADKEY and MAC size 0."
     cat out.txt
@@ -128,31 +128,31 @@ if ! grep -q "status: NOTAUTH" out.txt || ! tsig_line no-such-key BADKEY | grep 
 fi
 
 echo "[*] 2c. UPDATE signed with the allowed key name but a wrong secret: NOTAUTH, BADSIG, unsigned (RFC 8945 §5.2.2)..."
-$DAG dynupdate.test a @127.0.0.1 -p $PORT --update-add 'new1.dynupdate.test 300 A 1.2.3.5' +nohexdump -y hmac-sha256:test-key:D+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
+$DAG dynupdate.test a @127.0.0.1 -p $PORT --update-add 'new1.dynupdate.test 300 A 192.0.2.5' +nohexdump -y hmac-sha256:test-key:D+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
 if ! grep -q "status: NOTAUTH" out.txt || ! tsig_line test-key "BADSIG" | grep -qE "[[:space:]]0[[:space:]]+[0-9]+[[:space:]]+BADSIG"; then
     echo "[FAIL] Wrong secret: expected NOTAUTH with TSIG error BADSIG and MAC size 0."
     cat out.txt
     exit 1
 fi
 $DAG new1.dynupdate.test. A @127.0.0.1 -p $PORT +short > res.txt
-if grep -q "1.2.3.5" res.txt; then
+if grep -q "192.0.2.5" res.txt; then
     echo "[FAIL] Wrong TSIG UPDATE succeeded!"
     exit 1
 fi
 
 echo "[*] 3. Authorized UPDATE (Add Record with prereq)..."
-$DAG dynupdate.test a @127.0.0.1 -p $PORT --prereq-nxdomain "new-host.dynupdate.test" --update-add 'new.dynupdate.test 300 A 1.2.3.7' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
+$DAG dynupdate.test a @127.0.0.1 -p $PORT --prereq-nxdomain "new-host.dynupdate.test" --update-add 'new.dynupdate.test 300 A 192.0.2.7' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
 $DAG new.dynupdate.test. A @127.0.0.1 -p $PORT +short > res.txt
-if ! grep -q "1.2.3.7" res.txt; then
+if ! grep -q "192.0.2.7" res.txt; then
     echo "[FAIL] Authorized UPDATE failed to add record."
     exit 1
 fi
 check_asan_log
 
 echo "[*] 3.5. Authorized UPDATE Double (Slot Reuse Cache Validation)..."
-$DAG dynupdate.test a @127.0.0.1 -p $PORT --update-add 'new.dynupdate.test 300 A 1.2.3.8' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
+$DAG dynupdate.test a @127.0.0.1 -p $PORT --update-add 'new.dynupdate.test 300 A 192.0.2.8' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
 $DAG new.dynupdate.test. A @127.0.0.1 -p $PORT +short > res.txt
-if ! grep -q "1.2.3.8" res.txt; then
+if ! grep -q "192.0.2.8" res.txt; then
     echo "[FAIL] Authorized UPDATE (Double) failed to update record or cache corrupted."
     exit 1
 fi
@@ -164,26 +164,26 @@ fi
 check_asan_log
 
 echo "[*] 4. Prerequisite Failure (NXDOMAIN)..."
-$DAG dynupdate.test a @127.0.0.1 -p $PORT --prereq-nxdomain "test.dynupdate.test" --update-add 'new2.dynupdate.test 300 A 2.3.4.5' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
+$DAG dynupdate.test a @127.0.0.1 -p $PORT --prereq-nxdomain "test.dynupdate.test" --update-add 'new2.dynupdate.test 300 A 198.51.100.5' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
 if ! grep -q "YXDOMAIN" out.txt; then
     echo "[!] Note: dag output: $(cat out.txt)"
 fi
 $DAG new2.dynupdate.test. A @127.0.0.1 -p $PORT +short > res.txt
-if grep -q "2.3.4.5" res.txt; then
+if grep -q "198.51.100.5" res.txt; then
     echo "[FAIL] Prerequisite was ignored!"
     exit 1
 fi
 check_asan_log
 
 echo "[*] 4.5. Prerequisite Failure (RFC 2136 NOTZONE - Out of Zone Prerequisite)..."
-$DAG dynupdate.test a @127.0.0.1 -p $PORT --prereq-nxdomain "out-of-zone.example.com" --update-add 'new-invalid.dynupdate.test 300 A 2.3.4.6' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
+$DAG dynupdate.test a @127.0.0.1 -p $PORT --prereq-nxdomain "out-of-zone.example.com" --update-add 'new-invalid.dynupdate.test 300 A 198.51.100.6' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
 if ! grep -q "NOTZONE" out.txt; then
     echo "[FAIL] Expected NOTZONE for out-of-zone prerequisite, output:"
     cat out.txt
     exit 1
 fi
 $DAG new-invalid.dynupdate.test. A @127.0.0.1 -p $PORT +short > res.txt
-if grep -q "2.3.4.6" res.txt; then
+if grep -q "198.51.100.6" res.txt; then
     echo "[FAIL] Out-of-zone prerequisite UPDATE added record!"
     exit 1
 fi
@@ -193,14 +193,14 @@ check_asan_log
 echo "[*] 5. Authorized UPDATE (Delete Record)..."
 $DAG dynupdate.test a @127.0.0.1 -p $PORT --prereq-nxdomain "new-host.dynupdate.test" --update-del 'new.dynupdate.test A' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
 $DAG new.dynupdate.test. A @127.0.0.1 -p $PORT +short > res.txt
-if grep -q "1.2.3.7" res.txt; then
+if grep -q "192.0.2.7" res.txt; then
     echo "[FAIL] Authorized UPDATE failed to delete record."
     exit 1
 fi
 check_asan_log
 
 echo "[*] 6. Authorized UPDATE (Add Record for ephemeral test)..."
-$DAG dynupdate.test a @127.0.0.1 -p $PORT --update-add 'new1.dynupdate.test 300 A 1.2.3.4' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
+$DAG dynupdate.test a @127.0.0.1 -p $PORT --update-add 'new1.dynupdate.test 300 A 192.0.2.4' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
 
 echo "[*] 6.5. In-flight ADD and Tombstone Logic test (3RR)..."
 # 3RR test: Delete ALL -> Add -> Delete EXACT
@@ -300,7 +300,7 @@ sleep 1
 
 echo "[*] Checking if added record is gone..."
 $DAG new1.dynupdate.test. A @127.0.0.1 -p $PORT +short > res.txt
-if grep -q "1.2.3.4" res.txt; then
+if grep -q "192.0.2.4" res.txt; then
     echo "[FAIL] Record persisted after reload! It should be ephemeral."
     exit 1
 fi

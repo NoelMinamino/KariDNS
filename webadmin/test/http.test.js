@@ -54,7 +54,7 @@ test('the client address: the peer, or what a trusted proxy says', () => {
   assert.equal(clientAddress(req(undefined), []), 'local');
   assert.equal(clientAddress(req('192.0.2.1', '198.51.100.9'), []), '192.0.2.1', 'an untrusted peer cannot say who it is');
   assert.equal(clientAddress(req('10.0.0.1', '198.51.100.9'), ['10.0.0.1']), '198.51.100.9');
-  assert.equal(clientAddress(req('10.0.0.1', '1.1.1.1, 198.51.100.9, 10.0.0.2'), ['10.0.0.1', '10.0.0.2']), '198.51.100.9', 'the first from the right that is not a proxy');
+  assert.equal(clientAddress(req('10.0.0.1', '203.0.113.1, 198.51.100.9, 10.0.0.2'), ['10.0.0.1', '10.0.0.2']), '198.51.100.9', 'the first from the right that is not a proxy');
   assert.equal(clientAddress(req('10.0.0.1', '10.0.0.2'), ['10.0.0.1', '10.0.0.2']), '10.0.0.1');
   assert.equal(clientAddress(req('10.0.0.1'), ['10.0.0.1']), '10.0.0.1');
   assert.equal(clientAddress(req('10.0.0.1', '::ffff:198.51.100.9'), ['10.0.0.1']), '198.51.100.9');

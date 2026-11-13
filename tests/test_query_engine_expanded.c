@@ -4709,6 +4709,7 @@ static void test_edns_client_subnet_ipv4_prefix_clamping(void) {
     assert(ecs_scope_query("geo.ecs.example.", 1, 1, "203.0.113.9", 32, true, &rcode, &an) == 5);
     assert(rcode == 0 && an == 1);
     /* SOURCE /16 cannot tell: SCOPE longer than SOURCE, not clamped (RFC 7871 §7.2.1) */
+    /* not a documentation range on purpose: a /16 SOURCE that contains 198.51.100.0/24 */
     assert(ecs_scope_query("geo.ecs.example.", 1, 1, "198.51.0.0", 16, true, &rcode, &an) == 18);
     assert(rcode == 0 && an == 1);
     /* CNAME to a name with tagged variants */
@@ -7674,6 +7675,7 @@ static void test_query_engine_feature_case_198(void) {
     memset(&sin, 0, sizeof(sin));
     sin.sin_family = AF_INET;
     sin.sin_port = htons(5353);
+    /* not a documentation range on purpose: the RRL table is shared by the tests and these need /24 buckets of their own */
     inet_pton(AF_INET, "198.51.198.1", &sin.sin_addr);
 
     bool slip = false;
@@ -8107,6 +8109,7 @@ static void test_query_engine_feature_case_209(void) {
     memset(&sin, 0, sizeof(sin));
     sin.sin_family = AF_INET;
     sin.sin_port = htons(1053);
+    /* not a documentation range on purpose: the RRL table is shared by the tests and these need /24 buckets of their own */
     inet_pton(AF_INET, "203.0.209.10", &sin.sin_addr);
 
     bool slip = false;
@@ -8131,6 +8134,7 @@ static void test_query_engine_feature_case_210(void) {
     memset(&sin, 0, sizeof(sin));
     sin.sin_family = AF_INET;
     sin.sin_port = htons(1053);
+    /* not a documentation range on purpose: the RRL table is shared by the tests and these need /24 buckets of their own */
     inet_pton(AF_INET, "203.0.210.20", &sin.sin_addr);
 
     bool slip = false;

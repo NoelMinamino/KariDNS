@@ -273,7 +273,7 @@ static const char *OPTS[] = {
 };
 
 static const char *VALS[] = { "", "0", "1", "3", "10", "512", "4096", "65535", "65536", "-1", "abc", "1.5",
-    "10:0102", "10", "0x10", "192.0.2.0/24", "2001:db8::/48", "0/0", "1.2.3.4/33", "hmac-sha256:k:c2VjcmV0",
+    "10:0102", "10", "0x10", "192.0.2.0/24", "2001:db8::/48", "0/0", "192.0.2.4/33", "hmac-sha256:k:c2VjcmV0",
     "k:c2VjcmV0", "c2VjcmV0", "0011223344556677", "00112233445566778899aabbccddeeff00112233",
     "A", "AAAA,TXT", "TYPE99", "https://x/dns-query", "/dns-query", "notify", "update", "15", "SIG", "ECDSAP256SHA256" };
 

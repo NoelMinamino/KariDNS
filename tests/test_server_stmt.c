@@ -245,7 +245,7 @@ static void test_prefix_matching(void) {
     CHECK(find4(&c, "v2", "192.0.2.77")->transfers == 32);      /* /32 */
     CHECK(find4(&c, "v2", "192.0.2.200")->transfers == 25);     /* /25 beats /24 */
     CHECK(find4(&c, "v2", "192.0.2.5")->transfers == 24);       /* /24 beats /16 */
-    CHECK(find4(&c, "v2", "192.0.99.5")->transfers == 16);      /* /16 beats /0 */
+    CHECK(find4(&c, "v2", "192.0.99.5")->transfers == 16);      /* /16 beats /0 (not a documentation range on purpose: 192.0.0.0/16 holds 192.0.2.0/24) */
     CHECK(find4(&c, "v2", "203.0.113.9")->transfers == 0 && (find4(&c, "v2", "203.0.113.9")->set & SV_TRANSFERS));   /* 0.0.0.0/0 covers all */
     CHECK(find6(&c, "v2", "2001:db8:1::9")->transfers == 48);   /* /48 beats /32 */
     CHECK(find6(&c, "v2", "2001:db8:2::9")->transfers == 64);
