@@ -41,6 +41,7 @@
 #include "dns_edns_ecs.h"
 #include "dns_priv_sandbox.h"
 #include "dns_log.h"
+#include "dns_log_state.h"
 #include <stdarg.h>
 #include <pwd.h>
 #include <grp.h>
@@ -3362,6 +3363,15 @@ static void test_klog_routing(void) {
     assert(klog_lines(p_aux) == 1);
     klog_set_role(KLOG_ROLE_AUX);
     assert(rename(p_aux, p_aux_old) == 0);
+    /* 0.7 M2: between the rename and the new file of the Backend's roll (log_write_rotated() makes it at once) the line is lost: this process
+     * never creates a log file (the manager is root; the file must stay the run user's) */
+    kdns_syslog(LOG_ERR, "[Config] in the gap of the roll");
+    assert(access(p_aux, F_OK) != 0);
+    {
+        int nfd = open(p_aux, O_WRONLY | O_CREAT | O_EXCL, 0644);   /* the Backend's new file */
+        assert(nfd >= 0);
+        close(nfd);
+    }
     kdns_syslog(LOG_ERR, "[Config] after the roll");
     klog_set_role(KLOG_ROLE_BACKEND);
     klog_expect(p_aux, "[Config] after the roll\n");
@@ -3379,6 +3389,213 @@ static void test_klog_routing(void) {
 }
 
 int ctrl_trace_command(const char *cmd, const char *arg, const char *extra, char *reply, size_t n);
+#define AUXLOG_TEST_ROUTER0 0x4u   /* AUXLOG_ROUTER(0) of dns_server_core.c */
+extern bool g_auxlog_ready;
+extern uint32_t g_auxlog_owed;
+extern int g_num_frontend_routers;
+void auxlog_changed(void);
+void auxlog_push(void);
+bool auxlog_send_router(int r, const uint8_t *rec, size_t n);
+
+/* 0.7 M2: the KLS1 record of the level and the runtime, as the Backend builds and sends it, and as the manager, a router or the broker takes it:
+ * the level follows, the channels are the Backend's, and a file is only appended to (never created), only in a directory of the start-up's logs,
+ * only a plain file with one link of this user or the run user (klog_aux_append()); a forged record cannot point a process anywhere else. */
+static void test_klog_aux_state(void) {
+    printf("[TEST] Logging: the level and the runtime in the other processes (KLS1, klog_aux_append)...\n");
+    klog_set_debug_level(0);
+    logev_rate_reset();
+    char dir[] = "/tmp/karidns_kaux_XXXXXX", out[] = "/tmp/karidns_kaux_out_XXXXXX";
+    assert(mkdtemp(dir) && mkdtemp(out));
+    char conf[2048], p_dyn[300], p_new[300], p_link[300], p_fifo[300], p_out[300], p_target[300];
+    snprintf(p_dyn, sizeof(p_dyn), "%s/dyn.log", dir);
+    snprintf(p_new, sizeof(p_new), "%s/new.log", dir);
+    snprintf(p_link, sizeof(p_link), "%s/link.log", dir);
+    snprintf(p_fifo, sizeof(p_fifo), "%s/fifo.log", dir);
+    snprintf(p_target, sizeof(p_target), "%s/target", dir);
+    snprintf(p_out, sizeof(p_out), "%s/elsewhere.log", out);
+    snprintf(conf, sizeof(conf),
+             "logging { channel dyn { file \"%s\"; severity dynamic; print-severity yes; print-category yes; }; channel sys { syslog local3; severity info; };\n"
+             " category general { dyn; sys; }; category database { dyn; }; };", p_dyn);
+    klog_install_conf(conf);
+    klog_set_debug_level(2);
+    static uint8_t rec[KLS_MAX];
+    bool dropped = true;
+    size_t n = klog_state_encode(rec, sizeof(rec), &dropped);
+    assert(n > KLS_HEADER_LEN && !dropped);
+    kls_state_t s;
+    assert(kls_parse(rec, n, &s) == NULL && s.debug_level == 2 && s.has_spec);
+    /* dyn, sys, and the built-in default_syslog / default_debug of the other categories */
+    assert(s.nch == 4 && s.nroute[LOGC_GENERAL] == 2 && s.nroute[LOGC_DATABASE] == 1 && s.nroute[LOGC_ZONELOAD] == 2);
+    /* (the table is read from category 0, `default`, which has no statement: default_syslog, then the null default_debug; then general) */
+    assert(s.ch[0].dest == LOGDEST_SYSLOG && s.ch[0].facility == LOG_DAEMON && s.ch[1].dest == LOGDEST_NULL && (s.ch[1].flags & KLS_CF_DEBUG_ONLY));
+    assert(s.ch[2].dest == LOGDEST_FILE && s.ch[2].level == LOG_LVL_DYNAMIC && s.ch[2].flags == (KLS_CF_CATEGORY | KLS_CF_SEVERITY));
+    assert(s.ch[2].path_len == strlen(p_dyn) && memcmp(s.ch[2].path, p_dyn, s.ch[2].path_len) == 0);
+    assert(s.ch[3].dest == LOGDEST_SYSLOG && s.ch[3].facility == LOG_LOCAL3 && s.ch[3].level == LOG_LVL_INFO);
+    /* too little room: the level alone, and *spec_dropped says so; less than a header: nothing */
+    assert(klog_state_encode(rec, 20, &dropped) == KLS_HEADER_LEN && dropped);
+    assert(klog_state_encode(rec, 5, NULL) == 0);
+    n = klog_state_encode(rec, sizeof(rec), NULL);
+
+    /* a process that only appends takes it: another runtime first (the start-up one, say), then the record */
+    klog_set_role(KLOG_ROLE_AUX);
+    snprintf(conf, sizeof(conf), "logging { category default { null; }; };");
+    klog_install_conf(conf);
+    klog_set_debug_level(0);
+    assert(klog_state_apply(rec, n, "Manager"));
+    assert(klog_debug_level() == 2 && logev_wanted(LOGC_DATABASE, 2) && !logev_wanted(LOGC_DATABASE, 3));
+    kdns_syslog(LOG_DEBUG, "[Manager] a debug line of the manager");
+    kdns_logc(LOGC_DATABASE, LOG_ERR, "[DB] an error of the loader");
+    {
+        char *t = klog_slurp(p_dyn);
+        assert(strstr(t, "general: debug 1: [Logging] Manager: debug level 2, logging configuration of the Backend taken (4 channel(s))\n"));
+        assert(strstr(t, "general: debug 1: [Manager] a debug line of the manager\n") && strstr(t, "database: error: [DB] an error of the loader\n"));
+        free(t);
+    }
+    /* a record that is not one: refused, nothing changes */
+    rec[4] = 9;
+    assert(!klog_state_apply(rec, n, "Frontend 0") && klog_debug_level() == 2);
+    rec[4] = KLS_VERSION;
+    /* the level alone: the channels stay */
+    {
+        kls_state_t lv;
+        memset(&lv, 0, sizeof(lv));
+        lv.debug_level = 0;
+        uint8_t small[KLS_HEADER_LEN];
+        assert(kls_encode(&lv, small, sizeof(small)) == KLS_HEADER_LEN && klog_state_apply(small, sizeof(small), "Broker"));
+        assert(klog_debug_level() == 0 && !logev_wanted(LOGC_DATABASE, 1) && logev_wanted(LOGC_DATABASE, LOG_LVL_ERROR));
+    }
+
+    /* a forged record: channels at files that must not be written.  Each is a dynamic channel of `general` */
+    int fd = open(p_target, O_WRONLY | O_CREAT, 0644);
+    assert(fd >= 0);
+    close(fd);
+    assert(link(p_target, p_link) == 0);                                   /* a hard link (the file has two names) */
+    assert(mkfifo(p_fifo, 0644) == 0);                                     /* a FIFO nobody reads: open() must not wait */
+    fd = open(p_out, O_WRONLY | O_CREAT, 0644);                            /* a directory the start-up did not open for the logs */
+    assert(fd >= 0);
+    close(fd);
+    {
+        const char *paths[4] = { p_new, p_link, p_fifo, p_out };
+        kls_state_t f;
+        memset(&f, 0, sizeof(f));
+        f.debug_level = 1;
+        f.has_spec = true;
+        f.nch = 4;
+        for (int i = 0; i < 4; i++) {
+            f.ch[i] = (kls_channel_t){ 0, 0, 0, 0, 0, (uint16_t)strlen(paths[i]), paths[i] };
+            f.route[LOGC_GENERAL][i] = (uint16_t)i;
+        }
+        f.nroute[LOGC_GENERAL] = 4;
+        size_t fn = kls_encode(&f, rec, sizeof(rec));
+        assert(fn > 0 && klog_state_apply(rec, fn, "Manager"));
+        kdns_syslog(LOG_ERR, "[Manager] to nowhere");
+        struct stat st;
+        assert(access(p_new, F_OK) != 0);                                   /* never created */
+        assert(stat(p_target, &st) == 0 && st.st_size == 0);                /* not through the hard link */
+        assert(stat(p_out, &st) == 0 && st.st_size == 0);                   /* not outside the log directories */
+        assert(open_via_dir_cache_existing(p_out, O_WRONLY) < 0 && errno == EACCES);
+        fd = open_via_dir_cache_existing(p_dyn, O_WRONLY | O_CREAT | O_APPEND);
+        assert(fd >= 0);
+        close(fd);
+        assert(open_via_dir_cache_existing("", O_WRONLY) < 0);
+        /* the run user's file is taken when this process is someone else (the manager is root, the files are the run user's) */
+        klog_set_aux_owner(getuid());
+        kdns_syslog(LOG_ERR, "[Manager] still to nowhere");
+        klog_set_aux_owner((uid_t)-1);
+    }
+    klog_set_role(KLOG_ROLE_BACKEND);
+    klog_set_debug_level(0);
+
+    /* the Backend side: the record goes to the manager (a datagram), each router (udp_ipc_t + record on worker 0's pair) and the broker
+     * (request + record, one byte back) when the level or the runtime changes; nothing before the processes exist (g_auxlog_ready) */
+    snprintf(conf, sizeof(conf), "logging { channel dyn { file \"%s\"; severity dynamic; }; category general { dyn; }; };", p_dyn);
+    klog_install_conf(conf);
+    int mgr[2], rtr[2], brk[2];
+    assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, mgr) == 0 && socketpair(AF_UNIX, SOCK_DGRAM, 0, rtr) == 0 &&
+           socketpair(AF_UNIX, SOCK_STREAM, 0, brk) == 0);
+    int saved_plug = g_plug_ctrl_fd, saved_broker = g_broker_sock, saved_routers = g_num_frontend_routers, saved_workers = g_num_workers;
+    int saved_ipc = g_ipc_fds[0][0][1];
+    g_plug_ctrl_fd = mgr[0];
+    g_ipc_fds[0][0][1] = rtr[0];
+    g_broker_sock = brk[0];
+    g_num_frontend_routers = 1;
+    g_num_workers = 1;
+    g_auxlog_ready = false;
+    auxlog_changed();                                                        /* not ready: nothing is sent */
+    uint8_t got[KLS_MAX + 200];
+    assert(recv(mgr[1], got, sizeof(got), MSG_DONTWAIT) < 0);
+    g_auxlog_ready = true;
+    klog_set_debug_level(4);
+    assert(send(brk[1], "\0", 1, 0) == 1);                                   /* the broker's answer, ahead of time */
+    auxlog_changed();
+    assert(g_auxlog_owed == 0);
+    size_t want = klog_state_encode(rec, sizeof(rec), NULL);
+    ssize_t k = recv(mgr[1], got, sizeof(got), MSG_DONTWAIT);
+    assert(k == (ssize_t)want && memcmp(got, rec, want) == 0);
+    k = recv(rtr[1], got, sizeof(got), MSG_DONTWAIT);
+    assert(k == (ssize_t)(sizeof(udp_ipc_t) + want));
+    {
+        udp_ipc_t h;
+        memcpy(&h, got, sizeof(h));
+        assert(h.sock_fd_idx == UDP_IPC_LOGSTATE && h.payload_len == want && memcmp(got + sizeof(h), rec, want) == 0);
+    }
+    size_t bl = 0;
+    while (bl < sizeof(broker_req_t) + want) {
+        k = recv(brk[1], got + bl, sizeof(got) - bl, 0);
+        assert(k > 0);
+        bl += (size_t)k;
+    }
+    {
+        broker_req_t br;
+        memcpy(&br, got, sizeof(br));
+        assert(br.family == BROKER_REQ_LOGSTATE && br.type == (int)want && memcmp(got + sizeof(br), rec, want) == 0);
+    }
+    /* a broker that refuses is logged; a router that cannot take it stays owed until the timer sends it */
+    assert(send(brk[1], "\1", 1, 0) == 1);
+    close(rtr[1]);
+    auxlog_changed();
+    assert(g_auxlog_owed == AUXLOG_TEST_ROUTER0);
+    (void)recv(mgr[1], got, sizeof(got), MSG_DONTWAIT);
+    bl = 0;
+    while (bl < sizeof(broker_req_t) + want) {
+        k = recv(brk[1], got + bl, sizeof(got) - bl, 0);
+        assert(k > 0);
+        bl += (size_t)k;
+    }
+    assert(!auxlog_send_router(0, rec, want));
+    assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, rtr) == 0);
+    g_ipc_fds[0][0][1] = rtr[0];
+    auxlog_push();                                                           /* the timer */
+    assert(g_auxlog_owed == 0 && recv(rtr[1], got, sizeof(got), MSG_DONTWAIT) == (ssize_t)(sizeof(udp_ipc_t) + want));
+    /* the broker is gone: broker_send_logstate() says so and the stream is shut */
+    close(brk[1]);
+    assert(!broker_send_logstate(rec, want));
+    assert(!broker_send_logstate(rec, 0) && !broker_send_logstate(rec, KLS_MAX + 1));
+    close(brk[0]);
+    g_broker_sock = -1;
+    assert(!broker_send_logstate(rec, want));
+    auxlog_push();                                                           /* nothing owed */
+    close(mgr[0]);
+    close(mgr[1]);
+    close(rtr[0]);
+    close(rtr[1]);
+    g_plug_ctrl_fd = saved_plug;
+    g_broker_sock = saved_broker;
+    g_ipc_fds[0][0][1] = saved_ipc;
+    g_num_frontend_routers = saved_routers;
+    g_num_workers = saved_workers;
+    g_auxlog_ready = false;
+    klog_set_debug_level(0);
+    test_retire_runtime(NULL);
+    unlink(p_dyn);
+    unlink(p_link);
+    unlink(p_target);
+    unlink(p_fifo);
+    unlink(p_out);
+    rmdir(dir);
+    rmdir(out);
+    printf("  -> the level and the runtime in the other processes passed.\n");
+}
 
 /* 0.7 M1: the debug level in force.  The masks of the event messages follow it; `severity dynamic` follows it, `debug n` does not; the built-in
  * default_debug is karidns.run in options { directory }, written only above level 0, created only when a category writes to it, and never
@@ -7290,6 +7507,7 @@ int main(void) {
         test_klog_format();
         test_klog_routing();
         test_klog_debug_level();
+        test_klog_aux_state();
         test_klog_destinations_and_batches();
         test_klog_rolling();
         test_klog_replacement_under_load();
@@ -7374,6 +7592,7 @@ int main(void) {
     test_klog_format();
     test_klog_routing();
     test_klog_debug_level();
+    test_klog_aux_state();
     test_klog_destinations_and_batches();
     test_klog_rolling();
     test_klog_replacement_under_load();

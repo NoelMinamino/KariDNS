@@ -14,6 +14,9 @@ void enter_capsicum_sandbox(void);
 bool limit_server_socket_rights(int fd, bool is_listening_tcp);
 bool limit_client_socket_rights(int fd);
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable);
+/* 0.7 M2: an existing file in a directory that is in the cache as writable already (the log directories of the start-up); no directory is
+ * opened, nothing is created (O_CREAT is taken out of flags).  -1 with errno EACCES when the directory is not in the cache. */
+int open_via_dir_cache_existing(const char *path, int flags);
 int stat_via_dir_cache(const char *path, struct stat *sb);
 int renameat_via_dir_cache(const char *old_path, const char *new_path);
 int list_dir_via_dir_cache(const char *file_path, void (*cb)(const char *name, void *ud), void *ud);

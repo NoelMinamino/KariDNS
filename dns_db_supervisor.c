@@ -45,23 +45,40 @@ void db_logrd_init(db_logrd_t *rd) {
 static void logrd_report(db_logrd_t *rd, db_logrd_sink_t sink, void *ud) {
   char msg[96];
   snprintf(msg, sizeof(msg), "[DB] %lu line(s) of the loader's output were not logged (more than %d per second)", rd->suppressed, DB_LOG_RATE_LINES);
-  sink(LOG_WARNING, msg, ud);
+  sink(LOG_WARNING, 0, msg, ud);
   rd->suppressed = 0;
 }
 
-/* One complete line: "<N>text" (N = 0..7, the syslog priority; without it LOG_NOTICE), subject to the rate limit */
+/* The priority of a line: "<N>" (N = 0..7, the syslog priority), or (0.7 M2) "<7:L>" (L = 1..99 without a leading 0: a message at debug level
+ * L).  Returns the length of the prefix, 0 when the line has none (then LOG_NOTICE, level 0; the text is the whole line). */
+size_t db_logrd_prefix(const char *text, int *prio, int *level) {
+  *prio = LOG_NOTICE;
+  *level = 0;
+  if (text[0] != '<' || text[1] < '0' || text[1] > '7') return 0;
+  if (text[2] == '>') {
+    *prio = text[1] - '0';
+    return 3;
+  }
+  if (text[1] != '7' || text[2] != ':' || text[3] < '1' || text[3] > '9') return 0;
+  int l = text[3] - '0';
+  size_t i = 4;
+  if (text[i] >= '0' && text[i] <= '9') l = l * 10 + (text[i++] - '0');
+  if (text[i] != '>') return 0;
+  *prio = LOG_DEBUG;
+  *level = l;
+  return i + 1;
+}
+
+/* One complete line: a priority (db_logrd_prefix()) and the text, subject to the rate limit */
 static void logrd_line(db_logrd_t *rd, int64_t now_ms, db_logrd_sink_t sink, void *ud) {
   if (rd->over) {
     memcpy(rd->buf + rd->len, "...", 3);
     rd->len += 3;
   }
   rd->buf[rd->len] = '\0';
-  int prio = LOG_NOTICE;
+  int prio, level;
   const char *text = rd->buf;
-  if (rd->len >= 3 && text[0] == '<' && text[1] >= '0' && text[1] <= '7' && text[2] == '>') {
-    prio = text[1] - '0';
-    text += 3;
-  }
+  text += db_logrd_prefix(text, &prio, &level);
   while (*text == ' ') text++;
   if (*text) {
     if (now_ms - rd->window_ms >= 1000 || now_ms < rd->window_ms) {     /* a new second (or the clock went back): report what the last one dropped */
@@ -71,7 +88,7 @@ static void logrd_line(db_logrd_t *rd, int64_t now_ms, db_logrd_sink_t sink, voi
     }
     if (rd->window_lines < DB_LOG_RATE_LINES) {
       rd->window_lines++;
-      sink(prio, text, ud);
+      sink(prio, level, text, ud);
     } else {
       rd->suppressed++;
     }
@@ -130,9 +147,11 @@ void db_logrd_tick(db_logrd_t *rd, int64_t now_ms, db_logrd_sink_t sink, void *u
   if (rd->suppressed && (now_ms - rd->window_ms >= 1000 || now_ms < rd->window_ms)) logrd_report(rd, sink, ud);
 }
 
-void db_log_sink(int prio, const char *text, void *ud) {
+void db_log_sink(int prio, int level, const char *text, void *ud) {
   (void)ud;
-  kdns_logc(LOGC_DATABASE, prio, text[0] == '[' ? "%s" : "[DB] %s", text);
+  /* a debug line goes at its own level (the manager's channels and level decide, dns_log.h logev_post(): one atomic load when nobody wants it) */
+  if (level > 0) logev_post(LOGC_DATABASE, level, NULL, 0, text[0] == '[' ? "%s" : "[DB] %s", text);
+  else kdns_logc(LOGC_DATABASE, prio, text[0] == '[' ? "%s" : "[DB] %s", text);
 }
 
 static void log_close(db_sup_t *s) {
@@ -376,8 +395,14 @@ static void child_exec(const db_sup_t *s, int stream_fd, int fetch_fd, int log_w
   if (chdir("/") != 0) _exit(127);
   clearenv();
   if (tz) setenv("TZ", tzbuf, 1);
-  char *argv[9] = { (char *)"karidns-dbloader", (char *)"-s", (char *)"3", NULL };
+  char *argv[11] = { (char *)"karidns-dbloader", (char *)"-s", (char *)"3", NULL };
   int ac = 3;
+  char dbg[8];                                         /* 0.7 M2: the debug level in force, which the manager keeps for the loaders it starts */
+  if (klog_debug_level() > 0) {
+    snprintf(dbg, sizeof(dbg), "%d", klog_debug_level());
+    argv[ac++] = (char *)"--debug";
+    argv[ac++] = dbg;
+  }
   if (hf >= 0) {
     argv[ac++] = (char *)"--fetch-fd";
     argv[ac++] = (char *)"4";
@@ -522,6 +547,9 @@ bool db_sup_spawn(db_sup_t *s) {
   s->starts++;
   syslog(LOG_INFO, "[Manager] Database loader %s started (pid %d%s)", s->path, (int)pid,
          s->starts > 1 ? ", restart" : "");
+  logev_post(LOGC_GENERAL, 1, NULL, 0, "[Manager] Database loader (pid %d, start %lu): debug level %d, state file %s, messages %s; "
+             "a restart would wait %u s", (int)pid, (unsigned long)s->starts, klog_debug_level(), s->state_file[0] ? s->state_file : "none",
+             s->log_fd >= 0 ? "through the pipe" : "to syslog", s->backoff_s);
   return true;
 }
 

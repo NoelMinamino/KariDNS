@@ -124,6 +124,8 @@ TDEF(td_hot_list, "HOT_LIST", sp_hot_list);
 TDEF(td_warm_list, "WARM_LIST", sp_hot_list);
 static const kdb_tspec_t sp_hot_ack[] = { S(KT_U64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, KDB_HA_N - 1), S(KT_U32, KS_REQ, 0), S(KT_STR, 0, 255) };
 TDEF(td_hot_ack, "HOT_ACK", sp_hot_ack);
+static const kdb_tspec_t sp_debug[] = { S(KT_U8, KS_REQ | KS_MAXV, 99) };
+TDEF(td_debug, "DEBUG", sp_debug);
 
 
 /* INVENTORY_REQ has no tags: any tag is unknown */
@@ -156,6 +158,7 @@ static const kdb_mdef_t mdefs[] = {
     { KDB_T_BATCH_RESULT, "BATCH_RESULT", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_batch_result },
     { KDB_T_FETCH_REQ, "FETCH_REQ", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_fetch_req },
     { KDB_T_HOT_LIST, "HOT_LIST", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_hot_list },
+    { KDB_T_DEBUG, "DEBUG", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_debug },
 };
 #define NMDEFS (sizeof(mdefs) / sizeof(mdefs[0]))
 
@@ -520,6 +523,9 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         h->body_len = fr->len;
         break;
     }
+    case KDB_T_DEBUG:
+        m->u.debug.level = (uint8_t)V(1).u;
+        break;
     case KDB_T_HOT_ACK:
         m->u.hot_ack.list_id = V(1).u;
         m->u.hot_ack.status = (uint8_t)V(2).u;

@@ -783,6 +783,30 @@ static void test_backend_direction_rejects(void) {
         kdb_enc_end(&e);
         CHECK_RC("signer_wait", decode_backend(&e, 2), sw < 2 ? KDB_OK : KDB_E_RANGE);
     }
+    /* 0.7 M2: DEBUG carries one level, 0..99, and nothing else */
+    for (unsigned lv = 0; lv <= 99; lv += 33) {
+        kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_DEBUG); kdb_enc_u8(&e, 1, (uint8_t)lv); kdb_enc_end(&e);
+        CHECK_RC("debug level", decode_backend(&e, 2), KDB_OK);
+    }
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_DEBUG); kdb_enc_u8(&e, 1, 99); kdb_enc_end(&e);
+    {
+        kdb_framer_t f;
+        kdb_framer_init(&f, KDB_FROM_BACKEND, g_rbuf, sizeof(g_rbuf));
+        kdb_frame_t fr;
+        kdb_msg_t m;
+        char why[KDB_REASON_LEN];
+        CHECK(kdb_framer_feed(&f, e.buf, e.len) == KDB_OK && kdb_framer_next(&f, &fr) == KDB_OK);
+        CHECK(kdb_decode(&fr, 2, &m, why, sizeof(why)) == KDB_OK && m.type == KDB_T_DEBUG && m.u.debug.level == 99);
+    }
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_DEBUG); kdb_enc_u8(&e, 1, 100); kdb_enc_end(&e);
+    CHECK_RC("debug 100", decode_backend(&e, 2), KDB_E_RANGE);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_DEBUG); kdb_enc_end(&e);
+    CHECK_RC("debug without a level", decode_backend(&e, 2), KDB_E_TLV_MISSING);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_DEBUG); kdb_enc_u16(&e, 1, 1); kdb_enc_end(&e);
+    CHECK_RC("debug level of two bytes", decode_backend(&e, 2), KDB_E_TLV_LEN);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_DEBUG); kdb_enc_u8(&e, 1, 1); kdb_enc_u8(&e, 2, 1); kdb_enc_end(&e);
+    CHECK_RC("debug with a second tag", decode_backend(&e, 2), KDB_E_TLV_UNKNOWN);
+    CHECK_STR(kdb_type_name(KDB_T_DEBUG), "DEBUG");
     /* RELOAD_REQ scope / target consistency */
     kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_RELOAD_REQ);
     kdb_enc_u64(&e, 1, 1); kdb_enc_u8(&e, 2, 1); kdb_enc_u8(&e, 5, 0); kdb_enc_end(&e);

@@ -54,6 +54,7 @@ _Static_assert(ZDIR_APEX_GLUE_PER_NS == KDB_NOTIFY_ADDR_PER_NS && ZDIR_APEX_NADD
 #define ING_EVT_CONFIG 1          /* EVFILT_USER idents of the main kqueue */
 #define ING_EVT_RESULT 2
 #define ING_EVT_REQ 3             /* karictl reload requests from the control thread (SPSC ring g_rq) */
+#define ING_EVT_DEBUG 7           /* 0.7 M2: the debug level changed (control thread): DEBUG to the loader */
 #define ING_REQ_MAX 32            /* reload requests waiting for the loader's answer (the control thread parks as many clients) */
 #define RQ_RING 64                /* both rings: more than ING_REQ_MAX, so a ring never fills while the bound holds */
 #define ING_RETIRE_EVERY 1024     /* design 4.3: a blocking grace period every this many published zones */
@@ -172,6 +173,7 @@ typedef struct {
   uint8_t *out;                /* answers queued for the loader */
   size_t out_len, out_off, out_cap;
   bool hello_done, need_cleanup;
+  int debug_sent;              /* 0.7 M2: the level the loader was last told (DEBUG), -1 = none on this stream */
   /* view index -> name, as of the CONFIG last sent */
   char (*view_names)[KARIDNS_VIEW_NAME_MAX];
   uint8_t *view_db;            /* [index]: the view takes zones from the database (not "database none;") */
@@ -1582,6 +1584,17 @@ static bool driver_listed(const char *list, size_t len, const char *name) {
   return false;
 }
 
+/* 0.7 M2: DEBUG, the level in force, when the loader has not been told it yet (after the handshake's CONFIG, and at every karictl trace /
+ * notrace: db_ingest_debug_changed()).  Only between messages of this thread, the one writer of the stream. */
+static void send_debug(ing_t *g) {
+  int lvl = klog_debug_level();
+  if (g->stream_fd < 0 || !g->hello_done || g->debug_sent == lvl) return;
+  kdb_enc_reset(&g->enc);
+  if (kdb_enc_begin(&g->enc, KDB_T_DEBUG) != 0 || kdb_enc_u8(&g->enc, 1, (uint8_t)lvl) != 0 || kdb_enc_end(&g->enc) != 0) g->enc.err = true;
+  send_enc(g);
+  g->debug_sent = lvl;
+}
+
 static void on_hello(ing_t *g, const kdb_msg_t *m) {
   const kdb_hello_t *h = &m->u.hello;
   ing_cfg_t snap;
@@ -1607,6 +1620,8 @@ static void on_hello(ing_t *g, const kdb_msg_t *m) {
   as_reset();
   g->hello_done = true;
   send_config(g, "handshake");
+  g->debug_sent = -1;                                  /* 0.7 M2: a new loader learns the level in force after its CONFIG */
+  send_debug(g);
 }
 
 /* ---- INVENTORY: the registry, a few hundred entries at a time so the output queue never holds all of it ---- */
@@ -3427,6 +3442,8 @@ static void *ingest_thread(void *arg) {
         drain_results(g);
       } else if (e->filter == EVFILT_USER && e->ident == ING_EVT_REQ) {
         process_requests(g);
+      } else if (e->filter == EVFILT_USER && e->ident == ING_EVT_DEBUG) {
+        send_debug(g);
       } else if (e->filter == EVFILT_USER && e->ident == ING_EVT_HOT) {
         hot_send(g);                                     /* D1a step 7: the cache thread made a hot list */
       } else if (e->filter == EVFILT_USER && e->ident == PARK_FETCH_IDENT) {
@@ -3475,14 +3492,15 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
     return false;
   }
   if (!limit_ctrl_rights(ctrl_fd)) return false;
-  struct kevent ev[6];
+  struct kevent ev[7];
   EV_SET(&ev[0], ctrl_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
   EV_SET(&ev[1], ING_EVT_CONFIG, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
   EV_SET(&ev[2], ING_EVT_RESULT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
   EV_SET(&ev[3], ING_EVT_REQ, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
   EV_SET(&ev[4], PARK_FETCH_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);      /* D1a: a worker asks for a zone */
   EV_SET(&ev[5], ING_EVT_HOT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);      /* D1a step 7: a hot list to send */
-  if (kevent(g->kq, ev, 6, NULL, 0, NULL) != 0) {
+  EV_SET(&ev[6], ING_EVT_DEBUG, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);    /* 0.7 M2: karictl trace / notrace */
+  if (kevent(g->kq, ev, 7, NULL, 0, NULL) != 0) {
     syslog(LOG_ERR, "[DB] cannot watch the loader control socket: %s", strerror(errno));
     return false;
   }
@@ -3658,6 +3676,14 @@ bool db_ingest_pick_view(const char *view_arg, char *out, size_t cap, char *err,
   }
   rcu_aux_read_unlock();
   return ok;
+}
+
+void db_ingest_debug_changed(void) {
+  int kq = atomic_load_explicit(&g_ing_kq, memory_order_acquire);
+  if (kq < 0) return;
+  struct kevent ev;
+  EV_SET(&ev, ING_EVT_DEBUG, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+  (void)kevent(kq, &ev, 1, NULL, 0, NULL);
 }
 
 void db_ingest_config_changed(void) {

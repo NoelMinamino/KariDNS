@@ -26,7 +26,8 @@
 #endif
 
 /* The messages of the loader (batch 14).  The loader's stderr is a pipe made for every start (the loader gets --log-stderr and writes
- * "<N>[DB] text" lines, N = the syslog priority).  The supervisor reads it without blocking, line by line, and logs every line in the
+ * "<N>[DB] text" lines, N = the syslog priority; 0.7 M2: "<7:L>[DB] text" is a message at debug level L, 1..99, which a reader that knows only
+ * "<N>" logs as text at LOG_NOTICE).  The supervisor reads it without blocking, line by line, and logs every line in the
  * `database` category (kdns_logc(LOGC_DATABASE, ...)), so that `logging { category database { ...; }; }` decides where it goes.  The bytes are
  * untrusted: db_logrd_t cuts a line at DB_LOG_TEXT_MAX, escapes everything but printable ASCII, accepts any end of line / end of stream, and
  * forwards at most DB_LOG_RATE_LINES lines per second (the rest are counted and reported once).  A read takes at most DB_LOG_READ_BUDGET
@@ -35,7 +36,8 @@
 #define DB_LOG_RATE_LINES 50       /* lines forwarded per second */
 #define DB_LOG_READ_BUDGET 65536   /* bytes taken from the pipe by one db_sup_log_read() */
 
-typedef void (*db_logrd_sink_t)(int prio, const char *text, void *ud);
+/* prio: the syslog priority; level: 0, or the debug level of a "<7:L>" line (0.7 M2) */
+typedef void (*db_logrd_sink_t)(int prio, int level, const char *text, void *ud);
 typedef struct {
   char buf[DB_LOG_TEXT_MAX + 1];
   size_t len;
@@ -53,8 +55,10 @@ void db_logrd_feed(db_logrd_t *rd, const char *data, size_t n, int64_t now_ms, d
 void db_logrd_tick(db_logrd_t *rd, int64_t now_ms, db_logrd_sink_t sink, void *ud);
 /* The end of the stream: a line without its newline is forwarded, and a pending report of suppressed lines is made. */
 void db_logrd_flush(db_logrd_t *rd, int64_t now_ms, db_logrd_sink_t sink, void *ud);
-/* The sink of the supervisor: kdns_logc(LOGC_DATABASE, prio, ...), with "[DB] " in front of a text that does not start with a "[Prefix]". */
-void db_log_sink(int prio, const char *text, void *ud);
+/* The sink of the supervisor: kdns_logc(LOGC_DATABASE, prio, ...) (a debug line: logev_post() at its level), with "[DB] " in front of a text that does not start with a "[Prefix]". */
+void db_log_sink(int prio, int level, const char *text, void *ud);
+/* The "<N>" or "<7:L>" in front of a line (see the top): its length, 0 = none (then *prio LOG_NOTICE, *level 0).  text is NUL-terminated. */
+size_t db_logrd_prefix(const char *text, int *prio, int *level);
 
 typedef struct {
   bool enabled;

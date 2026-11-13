@@ -319,13 +319,15 @@ static void test_spawn_and_restart(void) {
 typedef struct {
     int n;
     int prio[400];
+    int level[400];
     char text[400][DB_LOG_TEXT_MAX + 8];
 } lines_t;
 
-static void collect(int prio, const char *text, void *ud) {
+static void collect(int prio, int level, const char *text, void *ud) {
     lines_t *l = ud;
     if (l->n < 400) {
         l->prio[l->n] = prio;
+        l->level[l->n] = level;
         snprintf(l->text[l->n], sizeof(l->text[0]), "%s", text);
     }
     l->n++;
@@ -408,6 +410,27 @@ static void test_log_reader(void) {
     feed_str(&rd, "\n\n<6>\n<6>   \n<9>x\n", 18, 1000, &l);
     CHECK(l.n == 1 && l.prio[0] == 5 && strcmp(l.text[0], "<9>x") == 0);
 
+    /* 0.7 M2: "<7:L>" is a message at debug level L (1..99, no leading 0); any other text of that shape is text at LOG_NOTICE, and an old
+     * "<N>" line keeps its priority and level 0 */
+    {
+        const char *in = "<7:1>[DB] a\n<7:42>b\n<7:99>c\n<7:0>d\n<7:100>e\n<6:3>f\n<7:05>g\n<7:3x\n<7:>h\n<3>old\n<7>dbg\n";
+        memset(&l, 0, sizeof(l));
+        db_logrd_init(&rd);
+        feed_str(&rd, in, strlen(in), 1000, &l);
+        CHECK(l.n == 11);
+        CHECK(l.prio[0] == 7 && l.level[0] == 1 && strcmp(l.text[0], "[DB] a") == 0);
+        CHECK(l.prio[1] == 7 && l.level[1] == 42 && strcmp(l.text[1], "b") == 0);
+        CHECK(l.prio[2] == 7 && l.level[2] == 99 && strcmp(l.text[2], "c") == 0);
+        static const char *const as_text[] = { "<7:0>d", "<7:100>e", "<6:3>f", "<7:05>g", "<7:3x", "<7:>h" };
+        for (int i = 0; i < 6; i++) CHECK_MSG(l.prio[3 + i] == 5 && l.level[3 + i] == 0 && strcmp(l.text[3 + i], as_text[i]) == 0, "line %d: %s", 3 + i, l.text[3 + i]);
+        CHECK(l.prio[9] == 3 && l.level[9] == 0 && strcmp(l.text[9], "old") == 0);
+        CHECK(l.prio[10] == 7 && l.level[10] == 0 && strcmp(l.text[10], "dbg") == 0);
+        int p, lv;
+        CHECK(db_logrd_prefix("", &p, &lv) == 0 && p == 5 && lv == 0);
+        CHECK(db_logrd_prefix("<7:9>", &p, &lv) == 5 && p == 7 && lv == 9);
+        db_log_sink(7, 2, "[DB] a debug line nobody wants", NULL);          /* (no channel: dropped by logev_post()) */
+    }
+
     /* a line longer than the limit is cut and marked; so is a line of bytes that grow when escaped; the next line is fine */
     {
         static char big[20000];
@@ -482,7 +505,7 @@ static void test_hook(int cat, int prio, const char *fmt, va_list ap, int saved_
     char msg[KLOG_MSG_MAX];
     klog_vformat(msg, sizeof(msg), fmt, ap, saved_errno);
     if (cat != LOGC_DATABASE) return;
-    collect(prio, msg, &g_logged);
+    collect(prio, 0, msg, &g_logged);
 }
 
 static int count_open_fds(void) {

@@ -18,10 +18,12 @@
  * The files are opened by log_open_channels() (dns_server_core.c) at start-up, before the sandbox, and again at a reload through the directory
  * descriptors the Backend already holds; nothing here opens a file for the first time inside capability mode.  Processes other than the
  * Backend (the supervisor, the routers, the broker) append to a file channel by opening the path for each line, so that they follow the
- * Backend's rotation; they never rotate. */
+ * Backend's rotation; they never rotate, and (0.7 M2) never create one.  They were forked with the start-up runtime and level; after a karictl
+ * trace / notrace or a reload the Backend sends them the level and its runtime (dns_log_state.h, klog_state_encode() / klog_state_apply()). */
 #include "dns_server_internal.h"
 #include "dns_priv_sandbox.h"
 #include "dns_log.h"
+#include "dns_log_state.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -29,6 +31,12 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/stat.h>
+
+_Static_assert(KLS_ROUTE_MAX == LOG_ROUTE_MAX, "the KLS1 table has the runtime's width");
+_Static_assert(LOGDEST_FILE == 0 && LOGDEST_SYSLOG == 1 && LOGDEST_STDERR == 2 && LOGDEST_NULL == 3, "KLS1 destination numbers");
+_Static_assert(LOGTIME_NONE == 0 && LOGTIME_ISO8601_UTC == 3, "KLS1 print-time numbers");
+_Static_assert(KLS_CHANNELS_MAX >= LOGC_COUNT * LOG_ROUTE_MAX, "every channel of a table fits a KLS1 record");
 
 #undef syslog   /* the real syslog() below; dns_log.h only matters to the callers */
 
@@ -206,16 +214,30 @@ void klog_set_role(klog_role_t role) {
   atomic_store_explicit(&g_klog_role, (int)role, memory_order_relaxed);
 }
 
+/* the owner of the log files besides this process's own user: the run user they were handed to (klog_set_aux_owner(), set before the forks) */
+static uid_t g_klog_aux_owner = (uid_t)-1;
+
+void klog_set_aux_owner(uid_t uid) {
+  g_klog_aux_owner = uid;
+}
+
 /* A supervisor, router or broker process: the file may have been rolled by the Backend since the descriptor was inherited, so open it by name
- * for this line and never roll it here. */
+ * for this line and never roll it here.  0.7 M2: only appended to, never created.  The Backend created every file of its runtime (at the
+ * start, or at a reload as the run user) and owns the rotation; the manager is root and must not recreate a file that has gone (a root-owned
+ * file the run-user Backend could neither append to nor roll), and since the channels can come from the Backend (dns_log_state.h) a file is
+ * taken only in a directory opened for the logs at start-up (open_via_dir_cache_existing()), only when it is a plain file with one link owned
+ * by this process's user or the run user: a FIFO, a hard link or a root file that a taken-over Backend put there is never written to.
+ * O_NONBLOCK: a FIFO without a reader must not hold the process in open(). */
 static void klog_aux_append(const log_channel_t *ch, const char *line, size_t len) {
   if (!ch->file_path) return;
-  /* default_debug: only appended to.  The Backend created karidns.run at the start and the start-up gave it to the run user; this process
-   * (the manager is root) must not create one of its own when it has gone */
-  int fd = open_via_dir_cache(ch->file_path, O_WRONLY | O_APPEND | (ch->debug_only ? 0 : O_CREAT), 0644, true);
+  int fd = open_via_dir_cache_existing(ch->file_path, O_WRONLY | O_APPEND | O_NONBLOCK);
   if (fd < 0) return;
-  ssize_t w = write(fd, line, len);
-  (void)w;
+  struct stat st;
+  if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_nlink == 1 &&
+      (st.st_uid == geteuid() || (g_klog_aux_owner != (uid_t)-1 && st.st_uid == g_klog_aux_owner))) {
+    ssize_t w = write(fd, line, len);
+    (void)w;
+  }
   close(fd);
 }
 
@@ -544,6 +566,116 @@ log_channel_t *log_runtime_current_channels(void) {
 log_channel_t *const *log_runtime_route(const log_runtime_t *rt, int cat, int *n) {
   *n = rt->nroute[cat];
   return rt->route[cat];
+}
+
+/* ---- 0.7 M2: the level and the runtime in the other processes (dns_log_state.h) ---- */
+
+/* The KLS1 record of the level in force and the installed runtime (the channels some category writes to, in the order the table first names
+ * them).  A runtime whose record would not fit (or has a path the record cannot carry) goes as the level alone, and *spec_dropped says so: the
+ * other processes then keep the channels they have.  Returns the length (0: nothing could be encoded). */
+size_t klog_state_encode(uint8_t *buf, size_t cap, bool *spec_dropped) {
+  kls_state_t s;
+  memset(&s, 0, sizeof(s));
+  s.debug_level = klog_debug_level();
+  if (spec_dropped) *spec_dropped = false;
+  log_runtime_t *rt = log_runtime_acquire();
+  if (rt) {
+    const log_channel_t *seen[KLS_CHANNELS_MAX];
+    s.has_spec = true;
+    for (int cat = 0; cat < LOGC_COUNT; cat++) {
+      for (int i = 0; i < rt->nroute[cat]; i++) {
+        const log_channel_t *ch = rt->route[cat][i];
+        uint16_t k = 0;
+        while (k < s.nch && seen[k] != ch) k++;
+        if (k == s.nch) {
+          kls_channel_t *c = &s.ch[s.nch];
+          seen[s.nch++] = ch;
+          c->dest = (uint8_t)ch->dest;
+          c->time_fmt = (uint8_t)ch->time_fmt;
+          c->flags = (ch->print_category ? KLS_CF_CATEGORY : 0) | (ch->print_severity ? KLS_CF_SEVERITY : 0) | (ch->debug_only ? KLS_CF_DEBUG_ONLY : 0);
+          c->level = (int8_t)ch->level;
+          c->facility = (uint16_t)ch->syslog_facility;
+          if (ch->dest == LOGDEST_FILE) {
+            size_t pl = ch->file_path ? strlen(ch->file_path) : 0;
+            c->path = ch->file_path;
+            c->path_len = (uint16_t)(pl > KLS_PATH_MAX ? KLS_PATH_MAX + 1 : pl);   /* (too long: kls_encode() refuses it) */
+          }
+        }
+        s.route[cat][s.nroute[cat]++] = k;
+      }
+    }
+  }
+  size_t n = kls_encode(&s, buf, cap);
+  if (n == 0 && s.has_spec) {
+    s.has_spec = false;
+    s.nch = 0;
+    memset(s.nroute, 0, sizeof(s.nroute));
+    n = kls_encode(&s, buf, cap);
+    if (spec_dropped) *spec_dropped = true;
+  }
+  log_runtime_release(rt);
+  return n;
+}
+
+/* The runtime of a record, for a process that only appends (KLOG_ROLE_AUX): no descriptor is opened, a file is opened by name for each line
+ * (klog_aux_append()).  NULL: out of memory. */
+static log_runtime_t *klog_runtime_from_state(const kls_state_t *s) {
+  log_runtime_t *rt = calloc(1, sizeof(*rt));
+  if (!rt) return NULL;
+  log_channel_t *chs[KLS_CHANNELS_MAX];
+  log_channel_t **tail = &rt->channels;
+  for (uint16_t i = 0; i < s->nch; i++) {
+    const kls_channel_t *c = &s->ch[i];
+    log_channel_t *ch = rt_new_channel("(from the Backend)", (log_dest_t)c->dest, c->level, (log_time_t)c->time_fmt);
+    if (!ch) goto fail;
+    *tail = ch;
+    tail = &ch->next;
+    chs[i] = ch;
+    ch->syslog_facility = c->facility;
+    ch->print_category = (c->flags & KLS_CF_CATEGORY) != 0;
+    ch->print_severity = (c->flags & KLS_CF_SEVERITY) != 0;
+    ch->debug_only = (c->flags & KLS_CF_DEBUG_ONLY) != 0;
+    if (c->path_len && !(ch->file_path = strndup(c->path, c->path_len))) goto fail;
+  }
+  for (int cat = 0; cat < LOGC_COUNT; cat++) {
+    for (int k = 0; k < s->nroute[cat]; k++) rt->route[cat][k] = chs[s->route[cat][k]];
+    rt->nroute[cat] = s->nroute[cat];
+  }
+  return rt;
+fail:
+  log_runtime_free(rt);
+  return NULL;
+}
+
+/* A record from the Backend in a process that only appends (the manager, a router, the broker): the level, and the channels when the record
+ * has them.  `who` names this process in the messages ("Manager", "Frontend 0", "Broker").  The record is hostile input (kls_parse()); what
+ * it names can only make klog_aux_append() write to a file the Backend could write itself.  false: refused (logged, at most 16 times). */
+bool klog_state_apply(const uint8_t *buf, size_t len, const char *who) {
+  static unsigned long refused;
+  kls_state_t s;
+  const char *why = kls_parse(buf, len, &s);
+  if (why) {
+    if (refused++ < 16) syslog(LOG_ERR, "[Logging] %s: a logging state from the Backend was refused: %s", who, why);
+    return false;
+  }
+  bool taken = false;
+  if (s.has_spec) {
+    log_runtime_t *rt = klog_runtime_from_state(&s);
+    if (rt && log_runtime_install(rt)) {
+      taken = true;
+    } else {
+      if (rt) log_runtime_free(rt);
+      syslog(LOG_ERR, "[Logging] %s: cannot take the logging configuration of the Backend (out of memory, or the one before is still in use); "
+                      "keeping the one in use", who);
+    }
+  }
+  klog_set_debug_level(s.debug_level);
+  if (taken)
+    logev_post(LOGC_GENERAL, 1, NULL, 0, "[Logging] %s: debug level %d, logging configuration of the Backend taken (%u channel(s))", who,
+               s.debug_level, (unsigned)s.nch);
+  else
+    logev_post(LOGC_GENERAL, 1, NULL, 0, "[Logging] %s: debug level %d", who, s.debug_level);
+  return true;
 }
 
 /* One record to the channels of its category. */

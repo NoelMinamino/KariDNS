@@ -51,6 +51,7 @@
 
 #include "dns_wire.h" // 分離したワイヤーフォーマット操作用ヘッダ
 #include "dns_server_internal.h"
+#include "dns_log_state.h"
 #include "dns_catalog_zone.h"
 #include "dns_edns_ecs.h"
 #include "dns_rrl.h"
@@ -289,6 +290,8 @@ STATIC_TEST _Atomic int g_tcp_bind_failures = 0;
 // 起動に失敗したワーカースレッドの数 (X-33)。1 本でもあれば起動を中止する。
 STATIC_TEST _Atomic int g_worker_start_failures = 0;
 
+STATIC_TEST void auxlog_changed(void);   /* 0.7 M2 (below, with the control commands) */
+
 // Broker
 STATIC_TEST int g_broker_sock = -1;
 STATIC_TEST pid_t g_broker_pid = -1;
@@ -351,6 +354,18 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
       strlcpy(allowed_unix_path, g_config_db.config_a.dnstap.socket_path, sizeof(allowed_unix_path));
     broker_req_t req;
     while (recv(sv[1], &req, sizeof(req), MSG_WAITALL) == sizeof(req)) {
+      if (req.family == BROKER_REQ_LOGSTATE) {
+        /* 0.7 M2: the debug level and the logging runtime of the Backend (dns_log_state.h; checked there as hostile input).  A length that
+         * is not one of a record leaves the stream without a known boundary: the broker ends, as when a request is cut */
+        static uint8_t rec[KLS_MAX];
+        if (req.type < KLS_HEADER_LEN || req.type > KLS_MAX || recv(sv[1], rec, (size_t)req.type, MSG_WAITALL) != req.type) {
+          syslog(LOG_ERR, "[Broker] A logging state from the Backend has a length that is not one of a record; the broker stops");
+          break;
+        }
+        char ok = klog_state_apply(rec, (size_t)req.type, "Broker") ? 0 : 1;
+        if (send(sv[1], &ok, 1, MSG_NOSIGNAL) != 1) break;
+        continue;
+      }
       size_t addr_len = 0;
       /* defence in depth against a compromised Backend: the address has to be of the family asked for, have a port, and not be a multicast
        * address (a TCP / UDP peer is never one); the sockets themselves are socket() + connect() of this unprivileged process only */
@@ -367,6 +382,9 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
         if (sun->sun_family == AF_UNIX && strcmp(sun->sun_path, allowed_unix_path) == 0)
           addr_len = sizeof(struct sockaddr_un);
       }
+      if (addr_len == 0)
+        logev_post(LOGC_GENERAL, 1, NULL, 0, "[Broker] A connect request of the Backend is refused: family %d, type %d is no address the broker "
+                                             "connects to", req.family, req.type);
       int sock = addr_len > 0 ? socket(req.family, req.type, 0) : -1;
       int ret = -1;
       if (sock >= 0) {
@@ -479,6 +497,41 @@ static bool broker_finish_connect(int fd, int type, const tcp_sockopts_t *tcp_op
   return true;
 }
 
+/* 要求と応答の対応を保つためだけの排他。ブローカーは connect() の完了を待たずに
+ * 応答するので、保持するのは2回のシステムコールの間だけ (O-04)。 */
+static pthread_mutex_t broker_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* 0.7 M2: a KLS1 record for the broker (BROKER_REQ_LOGSTATE): the request, the record, the one-byte answer, under the lock of the connect
+ * requests so that the stream keeps its order.  The broker answers at once (it does nothing else meanwhile); a failure ends the conversation
+ * for good, as in broker_connect_opts().  true: the broker took it. */
+bool broker_send_logstate(const uint8_t *rec, size_t n) {
+  if (g_broker_sock < 0 || n == 0 || n > KLS_MAX) return false;
+  broker_req_t req;
+  memset(&req, 0, sizeof(req));
+  req.family = BROKER_REQ_LOGSTATE;
+  req.type = (int)n;
+  struct iovec iov[2] = { { &req, sizeof(req) }, { (void *)(uintptr_t)rec, n } };
+  struct msghdr mh;
+  memset(&mh, 0, sizeof(mh));
+  mh.msg_iov = iov;
+  mh.msg_iovlen = 2;
+  pthread_mutex_lock(&broker_lock);
+  ssize_t sr;
+  do {
+    sr = sendmsg(g_broker_sock, &mh, MSG_NOSIGNAL);
+  } while (sr < 0 && errno == EINTR);
+  char ans = 1;
+  ssize_t rr = -1;
+  if (sr == (ssize_t)(sizeof(req) + n)) {
+    do {
+      rr = recv(g_broker_sock, &ans, 1, 0);
+    } while (rr < 0 && errno == EINTR);
+  }
+  if (rr != 1) shutdown(g_broker_sock, SHUT_RDWR);
+  pthread_mutex_unlock(&broker_lock);
+  return rr == 1 && ans == 0;
+}
+
 int broker_connect_opts(int family, int type, struct sockaddr *addr,
                         size_t addr_len, const tcp_sockopts_t *tcp_opts) {
   if (g_broker_sock < 0)
@@ -491,9 +544,6 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr,
   req.type = type;
   memcpy(&req.addr, addr, addr_len);
   if (tcp_opts) req.tcp_opts = *tcp_opts;
-  /* 要求と応答の対応を保つためだけの排他。ブローカーは connect() の完了を待たずに
-   * 応答するので、保持するのは2回のシステムコールの間だけ (O-04)。 */
-  static pthread_mutex_t broker_lock = PTHREAD_MUTEX_INITIALIZER;
   pthread_mutex_lock(&broker_lock);
   /* One request, one reply, in order: if a request or its reply is lost half way, the next caller would get the reply of this one
    * (a socket to another peer).  An interrupted call is repeated; any other failure ends the conversation for good (shutdown() makes
@@ -739,6 +789,25 @@ static void log_debug_file_unusable(log_channel_t *ch, const char *why) {
   ch->dest = LOGDEST_NULL;
 }
 
+/* 0.7 M2: the files (and directories) of `list` that this process made at the start, handed to the run user through their descriptors (and the
+ * directory descriptors prepare_log_dir() opens with O_NOFOLLOW): what hand_off_logging_channels() would have done, for a start that is
+ * refused before it.  A file that was there before keeps its owner, as on any refused start; nothing is unlinked, nothing is changed by path.
+ * Only as root with a run user (otherwise every file is already the user's own). */
+static void log_hand_off_created(log_channel_t *list) {
+  if (geteuid() != 0) return;
+  uid_t uid;
+  gid_t gid;
+  resolve_log_owner(&uid, &gid);
+  if (uid == (uid_t)-1) return;
+  for (log_channel_t *ch = list; ch; ch = ch->next) {
+    if (ch->dest != LOGDEST_FILE || !ch->file_path) continue;
+    prepare_log_dir(ch->file_path, uid, gid);           /* (a directory this process made, also for a file that could not be opened) */
+    if (ch->fd < 0 || !ch->created) continue;
+    if (log_file_accept(ch->fd, ch->file_path, uid) >= 0 && fchown(ch->fd, uid, gid) != 0)
+      syslog(LOG_WARNING, "[Logging] Could not hand log file '%s' to the run user: %s", ch->file_path, strerror(errno));
+  }
+}
+
 int log_open_channels(log_channel_t *list, bool hand_off) {
   bool hard = false, restart = false;
   uid_t target_uid = (uid_t)-1;
@@ -755,7 +824,15 @@ int log_open_channels(log_channel_t *list, bool hand_off) {
       continue;
     prepare_log_dir(ch->file_path, target_uid, target_gid);
 
-    ch->fd = open_via_dir_cache(ch->file_path, O_WRONLY | O_CREAT | O_APPEND, 0644, true);
+    /* 0.7 M2: an existing file is opened as it is; only a missing one is created (O_EXCL), and the channel remembers that this process made
+     * it (log_hand_off_created(): a refused start hands it to the run user instead of leaving it root-owned) */
+    ch->created = false;
+    ch->fd = open_via_dir_cache(ch->file_path, O_WRONLY | O_APPEND, 0644, true);
+    if (ch->fd < 0 && errno == ENOENT) {
+      ch->fd = open_via_dir_cache(ch->file_path, O_WRONLY | O_CREAT | O_EXCL | O_APPEND, 0644, true);
+      if (ch->fd >= 0) ch->created = true;
+      else if (errno == EEXIST) ch->fd = open_via_dir_cache(ch->file_path, O_WRONLY | O_APPEND, 0644, true);   /* (made by someone meanwhile) */
+    }
     if (ch->fd >= 0) {
       off_t size = log_file_accept(ch->fd, ch->file_path, run_uid);
       if (size < 0) {
@@ -802,7 +879,15 @@ int log_open_channels(log_channel_t *list, bool hand_off) {
     ch->current_date = (tm_info.tm_year + 1900) * 10000 +
                        (tm_info.tm_mon + 1) * 100 + tm_info.tm_mday;
   }
+  if (hard && !hand_off) log_hand_off_created(list);   /* 0.7 M2: the start stops here; the files it made so far are the run user's */
   return hard ? -1 : restart ? 1 : 0;
+}
+
+/* 0.7 M2: a start refused after the log files were opened and before hand_off_logging_channels() (a port that cannot be bound, a pid file or
+ * control socket directory that is not safe, another instance, ...): the files and directories it made go to the run user, as they would have
+ * at the hand-off, so that the next start (and its run-user Backend, which rolls them) finds them usable. */
+void log_startup_refused(void) {
+  log_hand_off_created(log_runtime_current_channels());
 }
 
 /* The files of the runtime installed at start-up (log_runtime_install()) are handed to the run user (root start-up with `user`); the
@@ -3689,6 +3774,8 @@ STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged
   if (!new_rt || !log_runtime_install(new_rt)) {
     if (new_rt) log_runtime_free(new_rt);
     append_list_item(res.restart_needed, sizeof(res.restart_needed), "logging (a log file in a directory not opened at start-up)");
+  } else {
+    auxlog_changed();   /* 0.7 M2: the manager, the routers and the broker take the new channels */
   }
   /* 応答キャッシュの鍵に入る: 設定が変われば以前の応答 (minimal-responses 等に依存) は引かれない */
   standby->generation = (active ? active->generation : 0) + 1;
@@ -3747,6 +3834,66 @@ static config_reload_result_t run_config_reload(bool skip_unchanged) {
 }
 
 #define CTRL_RELOAD_REPLY_SIZE 768
+
+/* ---- 0.7 M2: the debug level and the logging runtime in the other processes of the server ----
+ * The Backend owns both (karictl trace / notrace / reload are commands of its control channel).  After a change the control thread sends the
+ * KLS1 record (dns_log_state.h) to the manager (the plugin control pair), to every Frontend router (the IPC pair of worker 0) and to the
+ * connect broker (its request stream): descriptors each of them has had since the start; nothing is opened (Rule 2).  A datagram that does not
+ * go at once (a full queue) stays owed and the control thread's one-second timer sends it again (auxlog_push()): a router that is slow to read
+ * never holds the control thread.  The manager keeps the level for the processes it starts later (karidns-dbloader --debug): it is the
+ * authoritative copy for them because it outlives them.  The Backend, the routers and the broker are never started again on their own (when
+ * one ends, the manager ends the server), so they need no copy elsewhere; the loader gets the level from the Backend as well (KDB1 DEBUG,
+ * dns_db_ingest.c), so that a loader started just before a change does not miss it. */
+#define AUXLOG_MANAGER 0x1u
+#define AUXLOG_BROKER 0x2u
+#define AUXLOG_ROUTER(r) (0x4u << (r))
+STATIC_TEST bool g_auxlog_ready;          /* set in the Backend after the fork (the unit tests set it themselves) */
+STATIC_TEST uint32_t g_auxlog_owed;       /* control thread only */
+static bool g_auxlog_spec_warned;
+
+STATIC_TEST bool auxlog_send_router(int r, const uint8_t *rec, size_t n) {
+  udp_ipc_t hdr;
+  memset(&hdr, 0, sizeof(hdr));
+  hdr.sock_fd_idx = UDP_IPC_LOGSTATE;
+  hdr.payload_len = (uint16_t)n;
+  struct iovec iov[2] = { { &hdr, sizeof(hdr) }, { (void *)(uintptr_t)rec, n } };
+  struct msghdr mh;
+  memset(&mh, 0, sizeof(mh));
+  mh.msg_iov = iov;
+  mh.msg_iovlen = 2;
+  return sendmsg(g_ipc_fds[r][0][1], &mh, MSG_DONTWAIT | MSG_NOSIGNAL) == (ssize_t)(sizeof(hdr) + n);
+}
+
+STATIC_TEST void auxlog_push(void) {
+  if (!g_auxlog_ready || g_auxlog_owed == 0) return;
+  static uint8_t rec[KLS_MAX];
+  bool dropped = false;
+  size_t n = klog_state_encode(rec, sizeof(rec), &dropped);
+  if (n == 0) return;
+  if (dropped && !g_auxlog_spec_warned) {
+    g_auxlog_spec_warned = true;
+    syslog(LOG_WARNING, "[Logging] The logging configuration does not fit the record for the manager, the routers and the broker (more than %d "
+                        "bytes, or a file path longer than %d bytes); they follow the debug level but keep the channels of the start-up",
+           KLS_MAX, KLS_PATH_MAX);
+  }
+  if (g_auxlog_owed & AUXLOG_MANAGER) {
+    if (g_plug_ctrl_fd < 0 || send(g_plug_ctrl_fd, rec, n, MSG_DONTWAIT | MSG_NOSIGNAL) == (ssize_t)n) g_auxlog_owed &= ~AUXLOG_MANAGER;
+  }
+  for (int r = 0; r < g_num_frontend_routers && r < MAX_FRONTEND_ROUTERS; r++)
+    if ((g_auxlog_owed & AUXLOG_ROUTER(r)) && (g_num_workers <= 0 || auxlog_send_router(r, rec, n))) g_auxlog_owed &= ~AUXLOG_ROUTER(r);
+  if (g_auxlog_owed & AUXLOG_BROKER) {
+    if (!broker_send_logstate(rec, n) && g_broker_sock >= 0)
+      syslog(LOG_WARNING, "[Logging] The connect broker did not take the debug level and the logging configuration");
+    g_auxlog_owed &= ~AUXLOG_BROKER;      /* (a stream: it went, or the conversation with the broker is over) */
+  }
+}
+
+/* the level or the runtime changed: every other process is owed the record */
+STATIC_TEST void auxlog_changed(void) {
+  g_auxlog_owed = AUXLOG_MANAGER | AUXLOG_BROKER;
+  for (int r = 0; r < g_num_frontend_routers && r < MAX_FRONTEND_ROUTERS; r++) g_auxlog_owed |= AUXLOG_ROUTER(r);
+  auxlog_push();
+}
 
 /* karictl trace [<level>] / notrace (rndc trace / notrace; BIND 9.20.4 bin/named/server.c named_server_setdebuglevel(): no level = one more, up to
  * 99; a level that is not a number from 0 to 99 is refused; then "debug level is now %u" in category general).  `extra` is a word after the level.
@@ -5176,6 +5323,10 @@ void *control_thread_func(void *arg) {
             } else if (strcmp(cmd, "trace") == 0 || strcmp(cmd, "notrace") == 0) {
               char treply[128];
               int tl = ctrl_trace_command(cmd, arg, view_arg, treply, sizeof(treply));
+              if (strncmp(treply, "OK", 2) == 0) {
+                auxlog_changed();                /* 0.7 M2: the manager, the routers and the broker follow; the loader too */
+                db_ingest_debug_changed();
+              }
               (void)ctl_send_all(cfd, treply, (size_t)tl);
             } else if (strcmp(cmd, "dbstatus") == 0) {
               /* beta design 5.2: the loader, the batches and the DB zones of the registry */
@@ -5226,6 +5377,7 @@ void *control_thread_func(void *arg) {
         zone_prev_expire(now);          /* karictl rollback: the previous versions whose rollback-window is over */
         config_standby_reap(false);
         plug_backend_timer();           /* 0.6.2: freed plugin objects (and their STOPs), STARTs to ask again, owed KILLs */
+        auxlog_push();                  /* 0.7 M2: a logging state a full queue did not take */
         if (g_reload_pending) {
           /* O-10: 読み手が残っていて延期したリロードを捨てずにやり直す */
           syslog(LOG_NOTICE, "[Config] Retrying the postponed reload");
@@ -5720,6 +5872,10 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
   int rr = 0; // ラウンドロビン分配用
   struct kevent ev_list[128];
   syslog(LOG_NOTICE, "[Frontend %d] UDP Router process started.", router_id);
+  char router_who[24];
+  snprintf(router_who, sizeof(router_who), "Frontend %d", router_id);
+  logev_post(LOGC_GENERAL, 1, NULL, 0, "[Frontend %d] %d UDP socket(s), replies from %d worker(s)%s, debug level %d", router_id, local_num_udp_fds,
+             g_num_workers, router_id == 0 ? ", the NOTIFY sender" : "", klog_debug_level());
 
   while (1) {
     int n = kevent(kq, NULL, 0, ev_list, 128, NULL);
@@ -6027,6 +6183,11 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
             ssize_t max_valid_payload = len - (ssize_t)sizeof(udp_ipc_t);
             if (msg->payload_len > max_valid_payload) {
               syslog(LOG_WARNING, "[Frontend %d] Dropping backend reply with inconsistent payload_len", router_id);
+              continue;
+            }
+            if (msg->sock_fd_idx == UDP_IPC_LOGSTATE) {
+              /* 0.7 M2: the debug level and the logging runtime of the Backend (hostile input: dns_log_state.h).  Not a reply: nothing is sent */
+              (void)klog_state_apply(fctx->ipc_rx_buffers[k] + sizeof(udp_ipc_t), msg->payload_len, router_who);
               continue;
             }
             if (msg->sock_fd_idx < 0 || msg->sock_fd_idx >= local_num_udp_fds) {
@@ -6835,12 +6996,14 @@ int main(int argc, char **argv) {
   // 待受ポートを実際に bind できるか確認する (実際の bind は子プロセスで行う)。
   if (!preflight_listen_ports(&g_config_db.config_a)) {
     free_server_config_fields(&g_config_db.config_a);
+    log_startup_refused();   // 0.7 M2: a refused start leaves no root-owned log file (or directory) it made
     return 1;
   }
   // notify-source / transfer-source / primaries の source: ここで bind できなければ起動しない (file:line 付き)。
   // 起動時の集合は子プロセス (Router、connect broker、Backend) が fork で引き継ぐ。リロードで増えた送信元は再起動まで使えない。
   if (!preflight_xfr_sources(&g_config_db.config_a)) {
     free_server_config_fields(&g_config_db.config_a);
+    log_startup_refused();
     return 1;
   }
   config_set_startup_xfr_sources(&g_config_db.config_a);
@@ -6855,6 +7018,7 @@ int main(int argc, char **argv) {
       syslog(LOG_ERR, "Another KariDNS instance is already running (control socket %s answers)", sock_path);
       fprintf(stderr, "Another KariDNS instance is already running (control socket %s answers).\n", sock_path);
       free_server_config_fields(&g_config_db.config_a);
+      log_startup_refused();
       return 1;
     }
   }
@@ -6870,6 +7034,7 @@ int main(int argc, char **argv) {
       if (!ensure_priv_dir_safe(dir_buf)) {
         cleanup_pid_file();
         free_server_config_fields(&g_config_db.config_a);
+        log_startup_refused();
         return 1;
       }
       pid_leaf = effective_pid_file + (slash - dir_buf) + 1;
@@ -6878,6 +7043,7 @@ int main(int argc, char **argv) {
         close(pid_dir_fd);
         cleanup_pid_file();
         free_server_config_fields(&g_config_db.config_a);
+        log_startup_refused();
         return 1;
       }
     }
@@ -6901,6 +7067,7 @@ int main(int argc, char **argv) {
       fprintf(stderr, "Failed to open pidfile %s: %s\n", effective_pid_file, strerror(errno));
       cleanup_pid_file();
       free_server_config_fields(&g_config_db.config_a);
+      log_startup_refused();
       return 1;
     }
     if (flock(g_pid_fd, LOCK_EX | LOCK_NB) < 0) {
@@ -6909,6 +7076,7 @@ int main(int argc, char **argv) {
       close(g_pid_fd);                  /* the file is the running instance's: not unlinked (g_supervisor_pid is not set yet) */
       g_pid_fd = -1;
       free_server_config_fields(&g_config_db.config_a);
+      log_startup_refused();
       return 1;
     }
   }
@@ -6974,6 +7142,7 @@ int main(int argc, char **argv) {
       fprintf(stderr, "Control socket path too long (max %zu bytes): %s\n", sizeof(un.sun_path) - 1, sock_path);
       cleanup_pid_file();
       free_server_config_fields(&g_config_db.config_a);
+      log_startup_refused();
       return 1;
     }
     char dir_buf[1024];
@@ -6988,6 +7157,7 @@ int main(int argc, char **argv) {
       if (!ensure_priv_dir_safe(dir_buf)) {
         cleanup_pid_file();
         free_server_config_fields(&g_config_db.config_a);
+        log_startup_refused();
         return 1;
       }
       dir_fd = open(dir_buf, O_RDONLY | O_DIRECTORY | O_CLOEXEC | (geteuid() == 0 ? O_NOFOLLOW : 0));
@@ -6995,6 +7165,7 @@ int main(int argc, char **argv) {
         close(dir_fd);
         cleanup_pid_file();
         free_server_config_fields(&g_config_db.config_a);
+        log_startup_refused();
         return 1;
       }
     } else if (slash == dir_buf) {
@@ -7042,6 +7213,7 @@ int main(int argc, char **argv) {
             if (dir_fd >= 0) close(dir_fd);
             cleanup_pid_file();
             free_server_config_fields(&g_config_db.config_a);
+            log_startup_refused();
             return 1;
           }
         }
@@ -7072,6 +7244,7 @@ int main(int argc, char **argv) {
           close(dir_fd);
         cleanup_pid_file();
         free_server_config_fields(&g_config_db.config_a);
+        log_startup_refused();
         return 1;
       }
       umask(old_mask);
@@ -7083,6 +7256,7 @@ int main(int argc, char **argv) {
         close(dir_fd);
       cleanup_pid_file();
       free_server_config_fields(&g_config_db.config_a);
+      log_startup_refused();
       return 1;
     }
   }
@@ -7096,6 +7270,13 @@ int main(int argc, char **argv) {
     if (g_broker_pid > 0) kill(g_broker_pid, SIGTERM);
     cleanup_pid_file();
     exit(1);
+  }
+  {
+    /* 0.7 M2: the files the manager and the routers append to belong to the run user now (klog_aux_append() takes no other) */
+    uid_t log_uid;
+    gid_t log_gid;
+    resolve_log_owner(&log_uid, &log_gid);
+    klog_set_aux_owner(log_uid);
   }
 
   // beta design 1.2 step 2: the loader sockets exist before the Backend is forked
@@ -7135,6 +7316,7 @@ int main(int argc, char **argv) {
     klog_set_role(KLOG_ROLE_AUX);   // the Backend rolls the log files; this process appends to them by name
     db_sup_after_fork_supervisor(&dbsup); // the Backend's ends of the loader sockets belong to the Backend
     plug_sup_after_fork_manager(&g_plug_sup);
+    g_plug_sup.logstate = klog_state_apply;   // 0.7 M2: the Backend's debug level and logging runtime come on the plugin pair
     sigset_t unblock_set;
     sigemptyset(&unblock_set);
     sigaddset(&unblock_set, SIGHUP);
@@ -7291,9 +7473,12 @@ int main(int argc, char **argv) {
         break;
       }
       db_sup_tick(&dbsup);
+      /* 0.6.2: the Backend's plugin requests, plugins that ended, restarts that are due.  Before the loader's messages (0.7 M2): a new debug
+       * level reaches this process on the plugin pair before the Backend tells the loader, so a debug line of the loader is never judged by
+       * the level before it */
+      plug_sup_tick(&g_plug_sup);
       bool log_more = db_sup_log_read(&dbsup);     // the loader's messages (the read is bounded: the signals above and below get their turn)
       struct timespec nap;
-      plug_sup_tick(&g_plug_sup);                 // 0.6.2: the Backend's plugin requests, plugins that ended, restarts that are due
       int nap_ms = log_more ? 0 : db_sup_wait_ms(&dbsup);
       int plug_ms = plug_sup_wait_ms(&g_plug_sup);
       if (plug_ms >= 0 && (nap_ms < 0 || plug_ms < nap_ms)) nap_ms = plug_ms;
@@ -7404,6 +7589,7 @@ int main(int argc, char **argv) {
   sigemptyset(&hup_sa.sa_mask);
   sigaction(SIGHUP, &hup_sa, NULL);
   g_manager_pid = getppid();
+  g_auxlog_ready = true;   // 0.7 M2: the manager, the routers and the broker exist: a change of the level or of the logging goes to them
 
   g_pid_file_path[0] = '\0';
   if (g_pid_fd >= 0) {

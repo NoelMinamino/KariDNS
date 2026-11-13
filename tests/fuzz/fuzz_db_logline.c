@@ -28,9 +28,10 @@ long write_uncompressed_name_ext(uint8_t *buf, size_t offset, size_t max_len, co
 
 static unsigned long g_calls;
 
-static void sink(int prio, const char *text, void *ud) {
+static void sink(int prio, int level, const char *text, void *ud) {
     (void)ud;
     if (prio < 0 || prio > 7) abort();
+    if (level < 0 || level > 99 || (level > 0 && prio != 7)) abort();
     size_t n = strlen(text);
     if (n > DB_LOG_TEXT_MAX) abort();
     for (size_t i = 0; i < n; i++)

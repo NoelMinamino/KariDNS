@@ -6,6 +6,8 @@
  * flags, the number of descriptors, a few slots with expectations, and the record length; the rest is the record.  Every record a check
  * accepts must satisfy the rules the receivers rely on (slot in range and in use, the slot's generation, the start number rules, the
  * descriptor count of its type, NUL-terminated printable texts of the right length, a 16 hex digit fingerprint).
+ * 0.7 M2: the whole input is also read as a KLS1 record (dns_log_state.h), which the Backend sends on the same pair (and to the routers and
+ * the broker): what kls_parse() accepts keeps the rules the receivers rely on and encodes back to the same bytes.
  */
 #include <stdint.h>
 #include <stddef.h>
@@ -14,6 +16,7 @@
 #include <sys/socket.h>
 
 #include "../../dns_plugin_msg.h"
+#include "../../dns_log_state.h"
 
 static void must(int c) {
     if (!c) abort();
@@ -35,7 +38,30 @@ static int all_zero(const char *f, size_t cap) {
     return 1;
 }
 
+static kls_state_t g_ks;
+static uint8_t g_rec[KLS_MAX];
+
+/* 0.7 M2: the KLS1 record that comes on the same pair (and to the routers and the broker): whatever kls_parse() accepts is within the rules the
+ * receivers rely on, and encodes back to exactly the bytes it came from (no field is read loosely) */
+static void fuzz_log_state(const uint8_t *data, size_t size) {
+    if (kls_parse(data, size, &g_ks) != NULL) return;
+    must(g_ks.debug_level >= 0 && g_ks.debug_level <= 99 && g_ks.nch <= KLS_CHANNELS_MAX && (g_ks.has_spec || g_ks.nch == 0));
+    for (int i = 0; i < g_ks.nch; i++) {
+        const kls_channel_t *c = &g_ks.ch[i];
+        must(c->dest <= 3 && c->time_fmt <= 3 && c->level >= -5 && c->level <= 99 && c->facility % 8 == 0 && c->facility / 8 < 24);
+        must(c->dest == 0 ? c->path_len >= 1 && c->path_len <= KLS_PATH_MAX : c->path_len == 0);
+        for (int k = 0; k < c->path_len; k++) must((unsigned char)c->path[k] >= 0x20 && (unsigned char)c->path[k] != 0x7f);
+    }
+    for (int cat = 0; cat < LOGC_COUNT; cat++) {
+        must(g_ks.nroute[cat] <= KLS_ROUTE_MAX);
+        for (int k = 0; k < g_ks.nroute[cat]; k++) must(g_ks.route[cat][k] < g_ks.nch);
+    }
+    size_t n = kls_encode(&g_ks, g_rec, sizeof(g_rec));
+    must(n == size && memcmp(g_rec, data, size) == 0);
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    fuzz_log_state(data, size);
     if (size < 8) return 0;
     int flags = (data[0] & 1 ? MSG_TRUNC : 0) | (data[0] & 2 ? MSG_CTRUNC : 0);
     int nfds = data[1] % 6;

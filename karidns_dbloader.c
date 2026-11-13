@@ -120,13 +120,14 @@ static void chk_linef(char level, const char *fmt, ...) {
     chk_line(level, msg);
 }
 
-static void lg(int prio, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
-static void lg(int prio, const char *fmt, ...) {
+/* 0.7 M2: the debug level in force: --debug at the start, then DEBUG from the Backend (KDB1).  Messages of lgd() up to it are written. */
+static _Atomic int g_debug;
+
+/* level 0: a message at prio; level 1..99: a debug message (prio LOG_DEBUG), "<7:L>" on the pipe */
+static void vlg(int prio, int level, const char *fmt, va_list ap) __attribute__((format(printf, 3, 0)));
+static void vlg(int prio, int level, const char *fmt, va_list ap) {
     char msg[1024];
-    va_list ap;
-    va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
-    va_end(ap);
     if (g_chk_out) {
         chk_line(prio <= LOG_ERR ? 'E' : prio == LOG_WARNING ? 'W' : 'I', msg);
     } else if (g_stream_mode) {
@@ -135,7 +136,8 @@ static void lg(int prio, const char *fmt, ...) {
             if ((unsigned char)*p < 0x20 || *p == 0x7f) *p = '?';
         if (g_log_stderr) {
             char line[LG_LINE_MAX + 1];
-            int n = snprintf(line, sizeof(line) - 1, "<%d>[DB] %s", prio & LOG_PRIMASK, msg);
+            int n = level > 0 ? snprintf(line, sizeof(line) - 1, "<7:%d>[DB] %s", level, msg)
+                              : snprintf(line, sizeof(line) - 1, "<%d>[DB] %s", prio & LOG_PRIMASK, msg);
             if (n < 0) n = 0;
             if ((size_t)n > sizeof(line) - 2) {                      /* cut, and say so */
                 n = (int)sizeof(line) - 2;
@@ -154,8 +156,28 @@ static void lg(int prio, const char *fmt, ...) {
     }
 }
 
+static void lg(int prio, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void lg(int prio, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vlg(prio, 0, fmt, ap);
+    va_end(ap);
+}
+
+/* A message at debug level `level` (1..99, BIND's convention: 1 a decision, 2 the steps of a longer operation; docs/karidns.md), written only
+ * while the level in force is at least that (never in check mode: its output is the check protocol).  Never a credential: no conninfo, no
+ * password, no driver error text (a libpq message can repeat parts of the connection string). */
+static void lgd(int level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void lgd(int level, const char *fmt, ...) {
+    if (g_chk_out || level > atomic_load_explicit(&g_debug, memory_order_relaxed)) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vlg(LOG_DEBUG, level, fmt, ap);
+    va_end(ap);
+}
+
 /* ------------------------------------------------------------------------------------------------------------- */
-/* drivers compiled in                                                                                            */
+/* drivers compiled in                                                                                          */
 /* ------------------------------------------------------------------------------------------------------------- */
 
 static const db_driver_t *const k_drivers[] = {
@@ -1668,6 +1690,11 @@ static int commit_zone(ctx_t *x, const zinfo_t *zi, zres_t *r) {
     switch (r->kind) {
     case ZR_UNCHANGED:
         x->n_unchanged++;
+        if (atomic_load_explicit(&g_debug, memory_order_relaxed) >= 2) {
+            char shown[210];
+            clean_reason(zi->name ? zi->name : "(NULL)", shown, sizeof(shown));
+            lgd(2, "zone '%s' (domains.id %lld): not sent, the Backend has this version (same digest)", shown, (long long)zi->id);
+        }
         return 0;
     case ZR_FAILED:
         return send_failed(x, zi, r->reason);
@@ -3035,6 +3062,7 @@ static int conn_for(ctx_t *x, const db_source_t *src, bool *reused, dev_t *dev, 
             x->keep = NULL;
             x->keep_drv = NULL;
             *reused = true;
+            lgd(2, "%s: the connection of the last reading is used again", src->database_file ? "database file" : "database");
             return 0;
         }
         keep_drop(x);                                     /* another source, or the file was replaced: the new one is opened */
@@ -3047,6 +3075,10 @@ static int conn_for(ctx_t *x, const db_source_t *src, bool *reused, dev_t *dev, 
         clean_reason(err, x->errtext, sizeof(x->errtext));
         return rc == DB_ERR_RETRY ? EXIT_RETRY : EXIT_ERROR;
     }
+    /* (the file names only: never the content of the conninfo file) */
+    lgd(1, "connected: driver %s, %s %s%s%s", x->drv->name, src->database_file ? "database file" : "conninfo file",
+        src->database_file ? src->database_file : src->conninfo_file ? src->conninfo_file : "(libpq defaults)", src->schema ? ", schema " : "",
+        src->schema ? src->schema : "");
     return 0;
 }
 
@@ -3828,6 +3860,11 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
     case KDB_T_HOT_LIST:
         hot_part(io, &m);
         break;
+    case KDB_T_DEBUG: {                                        /* 0.7 M2: karictl trace / notrace (checked by kdb_decode(): 0..99) */
+        int old = atomic_exchange_explicit(&g_debug, (int)m.u.debug.level, memory_order_relaxed);
+        if (old != (int)m.u.debug.level) lgd(1, "debug level %d (was %d)", (int)m.u.debug.level, old);
+        break;
+    }
     case KDB_T_CONFIG: {
         lcfg_t nc;
         if (cfg_from_msg(&m, &nc) != 0) {
@@ -4165,6 +4202,8 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
     io->first_reject[0] = '\0';
     int errs = 0;
     bool seen_view = false;
+    lgd(1, "batch %llu (%s): reading %s%s%s%s%s", (unsigned long long)x->batch_id, batch_kind_name(kind), only_view >= 0 ? "one view" : "every view",
+        only_zone ? ", zone " : "", only_zone ? only_zone : "", force ? ", forced" : "", req_id ? ", answers a request" : "");
     for (size_t i = 0; i < c->nviews; i++) {
         const lview_t *v = &c->views[i];
         if (only_view >= 0 && v->index != only_view) continue;
@@ -4220,6 +4259,8 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
            (unsigned long long)x->batch_id, batch_kind_name(kind), x->n_read, x->n_zones, x->n_failed, x->n_deleted,
            x->n_unchanged, req_id ? " (answers a request)" : "", vtxt);
         if (io_wait_results(io) != 0) return -1;
+        lgd(2, "batch %llu: the Backend answered %llu zone(s), %llu rejected, %llu hidden by karidns.conf", (unsigned long long)x->batch_id,
+            (unsigned long long)io->n_results, (unsigned long long)io->n_rejected, (unsigned long long)io->n_shadowed);
     }
     return errs ? 1 : 0;
 }
@@ -5523,6 +5564,8 @@ static int stream_main(int fd) {
     }
     g_stream_mode = true;
     openlog("karidns-dbloader", LOG_PID | LOG_NDELAY | (g_log_stderr ? 0 : LOG_PERROR), LOG_DAEMON);   /* (with --log-stderr syslog is only the fallback: no copy on stderr) */
+    lgd(1, "stream mode: stream on descriptor %d, fetch stream %s, state file %s, messages %s, debug level %d", fd, g_fetch_fd >= 0 ? "yes" : "no",
+        g_state_file ? g_state_file : "none", g_log_stderr ? "to stderr" : "to syslog", atomic_load_explicit(&g_debug, memory_order_relaxed));
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_term;
@@ -5608,7 +5651,9 @@ static void usage(FILE *fp) {
         "  --max-zone-records N, --max-zone-bytes N   with --check: the limits of the database block\n"
         "  --state-file PATH   with -s: the file the hot list is kept in (D1a: database { loader-state-file }); with --check: check that the loader can use it\n"
         "  --log-stderr        with -s: write the messages to stderr as \"<N>[DB] text\" lines (N = syslog priority; karidns reads them and logs them in the\n"
-        "                      `database` category) instead of syslog\n"
+        "                      `database` category) instead of syslog; a debug message is \"<7:L>[DB] text\" (L = its debug level)\n"
+        "  --debug N           the debug level, 0..99 (default 0): debug messages up to it are written.  karidns passes the level in force\n"
+        "                      (karidns -d, karictl trace); in stream mode the Backend changes it later.  Never a password, never conninfo\n"
         "  --zone-checks LIST  with --check: the check-* severities, name=fail|warn|ignore,... (names, dup-records, integrity, mx, mx-cname, sibling,\n"
         "                      spf, srv-cname, svcb, wildcard)\n"
         "  --version           print the version\n"
@@ -5662,6 +5707,7 @@ int main(int argc, char **argv) {
         { "fetch-fd", required_argument, NULL, 1009 },
         { "state-file", required_argument, NULL, 1010 },
         { "log-stderr", no_argument, NULL, 1011 },
+        { "debug", required_argument, NULL, 1012 },
         { "help", no_argument, NULL, 'h' },                { NULL, 0, NULL, 0 }
     };
     const char *dump = NULL, *driver = NULL, *dbfile = NULL, *conninfo = NULL, *schema = NULL, *zone = NULL, *map_view = NULL;
@@ -5718,6 +5764,13 @@ int main(int argc, char **argv) {
         case 1009: fetch_fd_arg = optarg; break;
         case 1010: state_file_arg = optarg; break;
         case 1011: g_log_stderr = true; break;
+        case 1012:
+            if (!parse_uint(optarg, 0, 99, &v)) {
+                fprintf(stderr, "karidns-dbloader: --debug must be a debug level from 0 to 99\n");
+                return EXIT_USAGE;
+            }
+            atomic_store_explicit(&g_debug, (int)v, memory_order_relaxed);
+            break;
         case 1006:
             if (!parse_uint(optarg, 2, 4294967295ul, &max_records)) {
                 fprintf(stderr, "karidns-dbloader: --max-zone-records must be 2..4294967295\n");

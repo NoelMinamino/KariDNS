@@ -557,6 +557,7 @@ typedef struct log_channel {
   time_t size_recheck;        /* when the file was last looked at while it was full */
   bool debug_only;            /* the built-in default_debug (BIND ISC_LOG_DEBUGONLY): written only while the debug level is above 0; its file is
                                * optional (a file that cannot be opened makes it a null channel, with a warning).  Never set by the parser */
+  bool created;               /* 0.7 M2: log_open_channels() made the file (it was not there): a start that is refused hands it to the run user */
   pthread_mutex_t lock;
   struct log_channel *next;
 } log_channel_t;

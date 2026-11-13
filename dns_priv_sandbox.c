@@ -211,6 +211,24 @@ int open_via_dir_cache(const char *path, int flags, mode_t mode,
   return openat(dfd, basebuf, flags | O_CLOEXEC | O_RESOLVE_BENEATH, mode);   /* never into a program-zone plugin or the loader */
 }
 
+int open_via_dir_cache_existing(const char *path, int flags) {
+  char dirbuf[PATH_MAX], basebuf[PATH_MAX], key[PATH_MAX];
+  if (!split_path_for_openat(path, dirbuf, sizeof(dirbuf), basebuf, sizeof(basebuf)) || !dir_key(dirbuf, key, sizeof(key))) {
+    errno = EINVAL;
+    return -1;
+  }
+  int dfd = -1;
+  pthread_mutex_lock(&g_dir_fd_lock);
+  for (dir_fd_entry_t *e = g_dir_fd_table; e && dfd < 0; e = e->next)
+    if (e->is_writable && strcmp(e->dirpath, key) == 0) dfd = e->fd;
+  pthread_mutex_unlock(&g_dir_fd_lock);
+  if (dfd < 0) {
+    errno = EACCES;
+    return -1;
+  }
+  return openat(dfd, basebuf, (flags & ~O_CREAT) | O_CLOEXEC | O_RESOLVE_BENEATH);
+}
+
 bool dir_fd_cache_add_root(const char *dirpath) {
   if (!dirpath || !*dirpath) {
     errno = EINVAL;
