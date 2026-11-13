@@ -1353,9 +1353,10 @@ void zone_retire_process(bool wait) {
       n_kept++;
       continue;
     }
-    /* 送信中の AXFR と受信中の転送は、開始時の版を読み取り区間の外で使い続ける */
-    if (atomic_load_explicit(&e->active_axfr, memory_order_acquire) > 0 ||
-        atomic_load_explicit(&e->is_transferring, memory_order_acquire)) {
+    /* 受信中の転送は entry の物を読み取り区間の外で使い続ける。送信中の転送 (R11) は自分の版だけを xfr_refs で押さえ、
+     * 設定などは開始時の短い読み取り区間で写してあるので、その版のほかは引き止めない */
+    if (atomic_load_explicit(&e->is_transferring, memory_order_acquire) ||
+        (r->ver && atomic_load_explicit(&r->ver->xfr_refs, memory_order_acquire) > 0)) {
       zone_retire_push(r);
       n_kept++;
       continue;
@@ -1377,8 +1378,8 @@ void zone_retire_process(bool wait) {
              (unsigned long long)freed_bytes, n_kept, (unsigned long long)max_epoch, wait ? "waited for the grace period" : "no wait");
 }
 
-/* entry に属する物 obj を、世代 epoch の猶予期間が過ぎ、かつ entry が AXFR の送信中でも転送の受信中でもなくなってから
- * free_fn(obj) で解放する (退いた版と同じ解放待ちの積み方、同じ条件)。epoch は obj を読み手から外した公開 (rcu_writer_publish()) が
+/* entry に属する物 obj を、世代 epoch の猶予期間が過ぎ、かつ entry が転送の受信中でなくなってから free_fn(obj) で解放する
+ * (退いた版と同じ解放待ちの積み方。送信中の転送は設定を開始時の読み取り区間で写すので、obj を引き止めない: R11)。epoch は obj を読み手から外した公開 (rcu_writer_publish()) が
  * 返した世代。積むのは複数のスレッドから呼べる。成功すると entry の参照を 1 つ持ち、解放のときに手放す。
  * 戻り値 true なら以後の解放は zone_retire_process() が行う。false は積めなかった (メモリ不足) ことを示し、
  * obj は呼び出し側に残る (解放も参照も行っていない)。 */
@@ -1412,9 +1413,9 @@ static void zone_version_retire(zone_db_entry_t *entry, zone_version_t *old, uin
     if (from_prev) atomic_fetch_add_explicit(&g_prev_inflight, (uint64_t)old->bytes, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_zone_retire_count, 1, memory_order_relaxed);
     zone_retire_push(r);
-  } else if (!atomic_load_explicit(&entry->active_axfr, memory_order_acquire) &&
-             !atomic_load_explicit(&entry->is_transferring, memory_order_acquire) &&
-             rcu_writer_wait_until_safe_in_reader(epoch, 60000)) {
+  } else if (rcu_writer_wait_until_safe_in_reader(epoch, 60000) &&       /* (first the grace period: after it no transfer can pin `old` any more) */
+             !atomic_load_explicit(&old->xfr_refs, memory_order_acquire) &&
+             !atomic_load_explicit(&entry->is_transferring, memory_order_acquire)) {
     zone_version_free(old); /* 積めないときは、ここで猶予期間を待って解放する */
   } else {
     zone_bytes_retired_add(zb, (int64_t)old->bytes);   /* leaked: it stays counted */

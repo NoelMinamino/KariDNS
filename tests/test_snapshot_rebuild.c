@@ -1050,16 +1050,19 @@ static void test_retire_object_and_entry_config(void) {
     free(spare);
     assert(atomic_load(&e->snapshot_refs) == 1);
 
-    /* pinned by an outgoing AXFR: not freed even after a blocking grace period */
+    /* R11: an outgoing AXFR does not hold the entry's objects (it copied what it reads of the settings when it started): freed after the grace period */
     g_retired_obj_freed = 0;
     atomic_store(&e->active_axfr, 1);
     uint64_t ep = rcu_writer_advance_epoch();
     assert(zone_retire_object(e, malloc(8), retired_obj_free, ep));
     assert(atomic_load(&e->snapshot_refs) == 2);
     zone_retire_process(true);
-    assert(g_retired_obj_freed == 0 && atomic_load(&e->snapshot_refs) == 2);
-    /* pinned by an inbound transfer */
+    assert(g_retired_obj_freed == 1 && atomic_load(&e->snapshot_refs) == 1);
     atomic_store(&e->active_axfr, 0);
+    g_retired_obj_freed = 0;
+    /* pinned by an inbound transfer */
+    ep = rcu_writer_advance_epoch();
+    assert(zone_retire_object(e, malloc(8), retired_obj_free, ep));
     atomic_store(&e->is_transferring, true);
     zone_retire_process(true);
     assert(g_retired_obj_freed == 0 && atomic_load(&e->snapshot_refs) == 2);
@@ -1079,16 +1082,46 @@ static void test_retire_object_and_entry_config(void) {
     zone_retire_process(false);
     assert(g_retired_obj_freed == 2 && atomic_load(&e->snapshot_refs) == 1);
 
-    /* several objects on the stack, all pinned together */
-    atomic_store(&e->active_axfr, 1);
+    /* several objects on the stack, all pinned together (an inbound transfer) */
+    atomic_store(&e->is_transferring, true);
     ep = rcu_writer_advance_epoch();
     assert(zone_retire_object(e, malloc(8), retired_obj_free, ep));
     assert(zone_retire_object(e, malloc(8), retired_obj_free, ep));
     zone_retire_process(true);
     assert(g_retired_obj_freed == 2);
-    atomic_store(&e->active_axfr, 0);
+    atomic_store(&e->is_transferring, false);
     zone_retire_process(true);
     assert(g_retired_obj_freed == 4 && atomic_load(&e->snapshot_refs) == 1);
+
+    /* R11: a retired version is kept while a transfer holds it (its own xfr_refs), and only that one: the version retired after it, which no
+     * transfer holds, is freed at once; active_axfr (a transfer runs) holds nothing on the retire stack */
+    {
+        gc_reclaim_stats_t gs;
+        zone_retire_process(true);
+        gc_reclaim_stats(&gs);
+        const uint64_t base = gs.zone_retire_waiting;   /* (what earlier cases left) */
+        pthread_mutex_lock(&e->writer_lock);
+        zone_arena_t b1, b2, b3;
+        zone_arena_init(&b1); zone_arena_init(&b2); zone_arena_init(&b3);
+        zone_version_t *v1 = zone_version_new(&b1), *v2 = zone_version_new(&b2), *v3 = zone_version_new(&b3);
+        assert(v1 && v2 && v3);
+        zone_publish(e, v1);
+        atomic_fetch_add(&v1->xfr_refs, 1);              /* a transfer sends v1 */
+        atomic_store(&e->active_axfr, 1);
+        zone_publish(e, v2);                             /* v1 retired */
+        zone_publish(e, v3);                             /* v2 retired, nobody holds it */
+        pthread_mutex_unlock(&e->writer_lock);
+        zone_retire_process(true);
+        gc_reclaim_stats(&gs);
+        assert(gs.zone_retire_waiting == base + 1 && atomic_load(&e->snapshot_refs) == 2);   /* v1 waits (with its reference of the entry), v2 is gone */
+        assert(v1->image == NULL && atomic_load(&v1->xfr_refs) == 1);                 /* (still readable: ASan would report a use after free) */
+        atomic_fetch_sub(&v1->xfr_refs, 1);              /* the stream is over */
+        atomic_store(&e->active_axfr, 0);
+        zone_retire_process(true);
+        gc_reclaim_stats(&gs);
+        assert(gs.zone_retire_waiting == base && atomic_load(&e->snapshot_refs) == 1);
+        zone_arena_destroy(&b1); zone_arena_destroy(&b2); zone_arena_destroy(&b3);
+    }
 
     /* zone_entry_config(): the DB zone's own settings; the others go through the config index */
     zone_config_t dbc;
