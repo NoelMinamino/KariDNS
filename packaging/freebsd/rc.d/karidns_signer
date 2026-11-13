@@ -70,7 +70,37 @@ karidns_signer_mounted()
     mount -p | awk -v d="$1" '$2 == d && $3 == "tmpfs" { found = 1 } END { exit !found }'
 }
 
-# the work directory and its parent: the user's, closed to others (also for configtest, which checks them)
+# karidns_signer_path_ok PATH: an absolute path with no "." or ".." component and no symbolic link among the components that exist
+karidns_signer_path_ok()
+{
+    case "$1" in
+        /*) ;;
+        *) warn "work-dir ${1} is not an absolute path"; return 1 ;;
+    esac
+    case "$1/" in
+        */./*|*/../*) warn "work-dir ${1} has a . or .. component: write the path itself"; return 1 ;;
+    esac
+    _p=""
+    _ifs=$IFS; IFS=/; set -f
+    for _c in ${1#/}; do
+        [ -n "${_c}" ] || continue
+        _p="${_p}/${_c}"
+        if [ -L "${_p}" ]; then
+            IFS=$_ifs; set +f
+            warn "work-dir ${1}: ${_p} is a symbolic link: write the path it points to"
+            return 1
+        fi
+        [ -e "${_p}" ] || break
+    done
+    IFS=$_ifs; set +f
+    return 0
+}
+
+# karidns_signer_dirs check|make: the work directory and the pid directory (docs/karidns-signer.md "The rc script").  An existing work directory is
+# never changed: it must be a directory of the signer's user with no access for group and others, as karidns-signer --check wants it (workdir.js
+# checkWorkDir), else the start is refused.  A missing one is made (the user's, 0700) only in an existing parent, or in /var/db/karidns-signer
+# (the home of the package's user, the parent of the default work-dir), which is made too when /var/db exists; any other missing parent is
+# refused, and so is a relative path, a . or .. component or a symbolic link in the path.  "check" (configtest) makes nothing.
 karidns_signer_dirs()
 {
     if ! id -u "${karidns_signer_user}" >/dev/null 2>&1; then
@@ -79,16 +109,45 @@ karidns_signer_dirs()
     fi
     _wd=$(karidns_signer_workdir)
     _group=$(id -gn "${karidns_signer_user}")
-    install -d -o "${karidns_signer_user}" -g "${_group}" -m 0700 "$(dirname "${_wd}")" || return 1
-    install -d -o "${karidns_signer_user}" -g "${_group}" -m 0700 "${_wd}" || return 1
-    install -d -o "${karidns_signer_user}" -g "${_group}" -m 0755 "${rundir}" || return 1
+    karidns_signer_path_ok "${_wd}" || return 1
+    if [ -d "${_wd}" ]; then
+        _st=$(stat -f '%u %Lp' "${_wd}") || return 1
+        if [ "${_st% *}" != "$(id -u "${karidns_signer_user}")" ] || [ $(( 0${_st#* } & 077 )) -ne 0 ]; then
+            warn "work-dir ${_wd} (uid ${_st% *}, mode ${_st#* }) is not a directory of ${karidns_signer_user} with mode 0700: it is left as it is; give it to that user (chown, chmod 0700) or choose another work-dir"
+            return 1
+        fi
+    elif [ -e "${_wd}" ]; then
+        warn "work-dir ${_wd} exists and is not a directory"
+        return 1
+    else
+        _parent=$(dirname "${_wd}")
+        _mkparent=no
+        if [ ! -d "${_parent}" ]; then
+            if [ "${_parent}" = /var/db/karidns-signer ] && [ -d /var/db ]; then
+                _mkparent=yes
+            else
+                warn "the parent ${_parent} of work-dir ${_wd} does not exist: create it (the rc script makes only the work directory, and /var/db/karidns-signer)"
+                return 1
+            fi
+        fi
+        if [ "$1" = check ]; then
+            echo "${name}: work-dir ${_wd} does not exist yet: start makes it (${karidns_signer_user}, 0700)"
+        else
+            if [ ${_mkparent} = yes ]; then
+                install -d -o "${karidns_signer_user}" -g "${_group}" -m 0700 "${_parent}" || return 1
+            fi
+            install -d -o "${karidns_signer_user}" -g "${_group}" -m 0700 "${_wd}" || return 1
+        fi
+    fi
+    # the pid directory: a fixed directory of this service, which daemon(8) writes as the service user
+    [ "$1" = check ] || install -d -o "${karidns_signer_user}" -g "${_group}" -m 0755 "${rundir}" || return 1
 }
 
 karidns_signer_prestart()
 {
     # no core dump: the process memory holds private keys while a zone is signed
     ulimit -c 0
-    karidns_signer_dirs || return 1
+    karidns_signer_dirs make || return 1
     if checkyesno karidns_signer_tmpfs && ! karidns_signer_mounted "${_wd}"; then
         # (numeric ids: the options go to the kernel as they are, mount_tmpfs(8) lists uid and gid as numbers)
         mount -t tmpfs -o "size=${karidns_signer_tmpfs_size},mode=0700,uid=$(id -u "${karidns_signer_user}"),gid=$(id -g "${karidns_signer_user}")" tmpfs "${_wd}" || return 1
@@ -124,7 +183,7 @@ karidns_signer_reload()
 karidns_signer_configtest()
 {
     echo "Checking configuration: ${karidns_signer_config}"
-    karidns_signer_dirs || return 1
+    karidns_signer_dirs check || return 1
     # as the user the daemon runs as: the checks of the files are about that user
     su -m "${karidns_signer_user}" -c "${signer_program} --check -c ${karidns_signer_config}"
 }

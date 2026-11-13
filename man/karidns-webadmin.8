@@ -124,7 +124,10 @@ start, served under \fB/\fR and \fB/ui/\fR
 \fIOwner, mode:\fR karidns-webadmin, \fB0600\fR
 .br
 \fIHolds:\fR the AES-256 key that wraps the TOTP secrets in the database; made
-at the first start; the directory is made by the rc script (0700)
+at the first start; the directory is made by the rc script at the start (0700)
+when it is missing and its parent exists; an existing directory is never
+changed, and a \fB.\fR or \fB..\fR component or a symbolic link in its path is
+refused
 .TP 8
 the auth file, \fBauth.sqlite3\fR (SQLite3)
 \fIOwner, mode:\fR karidns-webadmin, \fB0600\fR

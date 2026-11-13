@@ -50,7 +50,7 @@ From a source tree (no package): `cd webadmin && npm ci --ignore-scripts`, then 
 | `/usr/local/etc/karidns/karidns-webadmin.conf` | root:karidns-webadmin, 0640 | the settings (no secret) |
 | `api.conninfo`, `check.conninfo` (PostgreSQL) | karidns-webadmin, **0600** | the connection of the roles `karidns_api` and the check role, with passwords if the database needs them; `--check` and the start refuse any other owner or mode |
 | `/usr/local/libexec/karidns-webadmin/webadmin/ui/` | root, 0444 files in 0755 directories | the files of the web interface (`ui-dir`); read once at the start, served under `/` and `/ui/` |
-| `/var/db/karidns-webadmin/totp.key` | karidns-webadmin, **0600** | the AES-256 key that wraps the TOTP secrets in the database; made at the first start; the directory is made by the rc script (0700) |
+| `/var/db/karidns-webadmin/totp.key` | karidns-webadmin, **0600** | the AES-256 key that wraps the TOTP secrets in the database; made at the first start; the directory is made by the rc script at the start (0700) when it is missing and its parent exists; an existing directory is never changed, and a `.` or `..` component or a symbolic link in its path is refused |
 | the auth file, `auth.sqlite3` (SQLite3) | karidns-webadmin, **0600** | users, password hashes, grants, sessions, tokens, templates; `--check` refuses a wider mode |
 | the zone file, `zones.sqlite3` (SQLite3) | karidns-webadmin, group of the loader, 0660, directory writable by that group | the zones; SQLite3 opens it read-write even to read (WAL mode) |
 | `tls.key` (only for the built-in TLS) | karidns-webadmin, **0600** | the certificate key; `--check` refuses any other owner or mode |

@@ -217,9 +217,10 @@ RC="env karidns_webadmin_user=nobody karidns_webadmin_config=$CONF karidns_webad
 mkdir -p "$T/rcdir" && chown nobody "$T/rcdir"
 $RC oneconfigtest > "$T/rc_cfg.out" 2>&1 && ok "configtest runs --check as the service user" || bad "configtest" "$(cat "$T/rc_cfg.out")"
 grep -q "the configuration is fine" "$T/rc_cfg.out" && ok "...and the configuration is fine" || bad "configtest output" "$(cat "$T/rc_cfg.out")"
-[ -d "$KEYDIR" ] && same "the directory of the TOTP key is made, mode 0700" "$(stat -f %Lp "$KEYDIR")" 700 || bad "the directory of the TOTP key was not made"
-same "...owned by the service user" "$(stat -f %Su "$KEYDIR")" nobody
+[ ! -e "$KEYDIR" ] && ok "...and makes nothing (the start makes the directory of the TOTP key)" || bad "configtest made the directory of the TOTP key"
 $RC onestart > "$T/rc_start.out" 2>&1 && ok "onestart" || bad "onestart" "$(cat "$T/rc_start.out")"
+[ -d "$KEYDIR" ] && same "the start made the directory of the TOTP key, mode 0700" "$(stat -f %Lp "$KEYDIR")" 700 || bad "the directory of the TOTP key was not made"
+same "...owned by the service user" "$(stat -f %Su "$KEYDIR")" nobody
 i=0; while [ $i -lt 100 ] && ! $NODE -e "fetch('http://127.0.0.1:$PORT/api/v1/health').then((r) => process.exit(r.status === 200 ? 0 : 1), () => process.exit(1))"; do sleep 0.2; i=$((i + 1)); done
 $NODE -e "fetch('http://127.0.0.1:$PORT/api/v1/health').then((r) => process.exit(r.status === 200 ? 0 : 1), () => process.exit(1))" && ok "the daemon answers /health" || bad "the daemon does not answer" "$(cat "$T/rc_start.out")"
 SUP=$(cat /var/run/karidns_webadmin/supervisor.pid 2> /dev/null); CHILD=$(cat /var/run/karidns_webadmin/child.pid 2> /dev/null)

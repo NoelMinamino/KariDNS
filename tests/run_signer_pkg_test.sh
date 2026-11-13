@@ -171,11 +171,10 @@ TMPFS=NO
 mkdir "$T/mnt_probe"
 if mount -t tmpfs tmpfs "$T/mnt_probe" 2> "$T/mnt.err"; then umount "$T/mnt_probe"; TMPFS=YES; else echo "SKIP: the system refuses a tmpfs mount ($(head -1 "$T/mnt.err")): the tmpfs on the work directory (the rc script runs with karidns_signer_tmpfs=NO)"; fi
 RC="env karidns_signer_user=nobody karidns_signer_config=$CONF karidns_signer_wrapper=$T/wrapper.sh karidns_signer_tmpfs=$TMPFS sh $ROOT/packaging/freebsd/rc.d/karidns_signer"
-$RC oneconfigtest > "$T/rc_cfg.out" 2>&1 && ok "configtest runs --check as the service user" || bad "configtest" "$(cat "$T/rc_cfg.out")"
-grep -q "the configuration is fine" "$T/rc_cfg.out" && ok "...and the configuration is fine" || bad "configtest output" "$(cat "$T/rc_cfg.out")"
-[ -d "$RCDIR/work" ] && same "the work directory is made, mode 0700" "$(stat -f %Lp "$RCDIR/work")" 700 || bad "the work directory was not made"
-same "...owned by the service user" "$(stat -f %Su "$RCDIR/work")" nobody
-same "...and its parent is mode 0700" "$(stat -f %Lp "$RCDIR")" 700
+# configtest makes nothing (the work directory is made by the start; tests/run_rc_service_dirs_test.sh has the cases of the rule)
+RCMODE=$(stat -f %Lp "$RCDIR")
+$RC oneconfigtest > "$T/rc_cfg.out" 2>&1
+grep -q "does not exist yet: start makes it" "$T/rc_cfg.out" && [ ! -e "$RCDIR/work" ] && ok "configtest before the first start: says the start makes the work directory, makes nothing" || bad "configtest before the start" "$(cat "$T/rc_cfg.out")"
 # syslog: does a line of logger(1) reach /var/log/messages here?
 SYSLOG=NO
 logger -p daemon.notice -t karidns-signer-probe "probe $$" 2> /dev/null
@@ -189,6 +188,11 @@ i=0; while [ $i -lt 100 ] && [ -z "$CHILD" ]; do CHILD=$(cat /var/run/karidns_si
 same "the pid directory is the service user's" "$(stat -f %Su /var/run/karidns_signer)" nobody
 same "the daemon runs as the service user" "$(ps -o user= -p "$CHILD" 2> /dev/null | tr -d ' ')" nobody
 $RC onestatus > /dev/null 2>&1 && ok "status finds it" || bad "status"
+[ -d "$RCDIR/work" ] && same "the start made the work directory, mode 0700" "$(stat -f %Lp "$RCDIR/work")" 700 || bad "the work directory was not made"
+same "...owned by the service user" "$(stat -f %Su "$RCDIR/work")" nobody
+same "...and left its parent as it was" "$(stat -f %Lp "$RCDIR")" "$RCMODE"
+$RC oneconfigtest > "$T/rc_cfg.out" 2>&1 && ok "configtest runs --check as the service user" || bad "configtest" "$(cat "$T/rc_cfg.out")"
+grep -q "the configuration is fine" "$T/rc_cfg.out" && ok "...and the configuration is fine" || bad "configtest output" "$(cat "$T/rc_cfg.out")"
 if [ $SYSLOG = YES ]; then
     i=0; while [ $i -lt 100 ] && ! grep -q "karidns-signer.*karidns-signer [^ ]* started (sqlite3" /var/log/messages 2> /dev/null; do sleep 0.2; i=$((i + 1)); done
     grep "karidns-signer" /var/log/messages | tail -20 | grep -q "started (sqlite3, 1 worker(s))" && ok "the daemon logs to syslog (it started)" || bad "no 'started' line in /var/log/messages" "$(tail -3 /var/log/messages)"

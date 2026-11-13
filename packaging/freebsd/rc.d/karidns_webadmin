@@ -60,8 +60,36 @@ karidns_webadmin_keydir()
     dirname "${_key:-/var/db/karidns-webadmin/totp.key}"
 }
 
-# the directories of the service: the one the TOTP key is made in (the user's, closed to others; only made when it is not there: never the mode of an existing directory
-# such as /etc) and the one of the pid files
+# karidns_webadmin_path_ok PATH: an absolute path with no "." or ".." component and no symbolic link among the components that exist
+karidns_webadmin_path_ok()
+{
+    case "$1" in
+        /*) ;;
+        *) warn "the directory ${1} of totp-key-file is not an absolute path"; return 1 ;;
+    esac
+    case "$1/" in
+        */./*|*/../*) warn "the directory ${1} of totp-key-file has a . or .. component: write the path itself"; return 1 ;;
+    esac
+    _p=""
+    _ifs=$IFS; IFS=/; set -f
+    for _c in ${1#/}; do
+        [ -n "${_c}" ] || continue
+        _p="${_p}/${_c}"
+        if [ -L "${_p}" ]; then
+            IFS=$_ifs; set +f
+            warn "the directory ${1} of totp-key-file: ${_p} is a symbolic link: write the path it points to"
+            return 1
+        fi
+        [ -e "${_p}" ] || break
+    done
+    IFS=$_ifs; set +f
+    return 0
+}
+
+# karidns_webadmin_dirs check|make: the directory the TOTP key is made in and the pid directory (the same rule as karidns_signer_dirs).  An existing
+# directory of the key is never changed (karidns-webadmin --check checks the key file itself).  A missing one is made (the user's, 0700) only in an
+# existing parent (the default, /var/db/karidns-webadmin, the home of the package's user, is in /var/db);
+# any other missing parent is refused, and so is a . or .. component or a symbolic link in the path.  "check" (configtest) makes nothing.
 karidns_webadmin_dirs()
 {
     if ! id -u "${karidns_webadmin_user}" >/dev/null 2>&1; then
@@ -70,17 +98,31 @@ karidns_webadmin_dirs()
     fi
     _group=$(id -gn "${karidns_webadmin_user}")
     _keydir=$(karidns_webadmin_keydir)
-    if [ ! -d "${_keydir}" ]; then
-        install -d -o "${karidns_webadmin_user}" -g "${_group}" -m 0700 "${_keydir}" || return 1
+    karidns_webadmin_path_ok "${_keydir}" || return 1
+    if [ -e "${_keydir}" ] && [ ! -d "${_keydir}" ]; then
+        warn "the directory ${_keydir} of totp-key-file exists and is not a directory"
+        return 1
+    elif [ ! -d "${_keydir}" ]; then
+        _parent=$(dirname "${_keydir}")
+        if [ ! -d "${_parent}" ]; then
+            warn "the parent ${_parent} of the directory ${_keydir} of totp-key-file does not exist: create it (the rc script makes only that directory)"
+            return 1
+        fi
+        if [ "$1" = check ]; then
+            echo "${name}: the directory ${_keydir} of totp-key-file does not exist yet: start makes it (${karidns_webadmin_user}, 0700)"
+        else
+            install -d -o "${karidns_webadmin_user}" -g "${_group}" -m 0700 "${_keydir}" || return 1
+        fi
     fi
-    install -d -o "${karidns_webadmin_user}" -g "${_group}" -m 0755 "${rundir}" || return 1
+    # the pid directory: a fixed directory of this service, which daemon(8) writes as the service user
+    [ "$1" = check ] || install -d -o "${karidns_webadmin_user}" -g "${_group}" -m 0755 "${rundir}" || return 1
 }
 
 karidns_webadmin_prestart()
 {
     # no core dump: the process memory holds the password hashes of the logins in flight and the key of the TOTP secrets
     ulimit -c 0
-    karidns_webadmin_dirs || return 1
+    karidns_webadmin_dirs make || return 1
     # an old pidfile of a daemon that died must not stop a start (rc.subr checks the supervisor's)
     rm -f "${childpidfile}"
 }
@@ -105,7 +147,7 @@ karidns_webadmin_reload()
 karidns_webadmin_configtest()
 {
     echo "Checking configuration: ${karidns_webadmin_config}"
-    karidns_webadmin_dirs || return 1
+    karidns_webadmin_dirs check || return 1
     # as the user the daemon runs as: the checks of the files and their modes are about that user
     su -m "${karidns_webadmin_user}" -c "${webadmin_program} --check -c ${karidns_webadmin_config}"
 }

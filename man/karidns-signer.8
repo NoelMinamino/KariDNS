@@ -280,19 +280,30 @@ owner.
 \fBThe configuration file\fR and, for PostgreSQL, the conninfo file (\fBchown
 karidns\-signer\fR, \fBchmod 0600\fR). Check it as the signer's user: \fBservice
 karidns_signer configtest\fR, or \fBsu \-m karidns\-signer \-c 'karidns\-signer
-\-\-check \-c /usr/local/etc/karidns/karidns\-signer.conf'\fR.
+\-\-check \-c /usr/local/etc/karidns/karidns\-signer.conf'\fR. Before the first
+start the work directory does not exist yet: configtest says so
+(\fBwork\-dir ... does not exist yet: start makes it\fR) and \fB\-\-check\fR
+reports it; configtest makes nothing.
 .IP 4. 4
 \fBThe server.\fR \fBdatabase { signer\-wait yes; }\fR is the default; see "The
 server waits for the signer". With SQLite3 add the restricted control key of the
 signer to the server (below).
 .IP 5. 4
 \fBStart:\fR \fBsysrc karidns_signer_enable=YES; service karidns_signer
-start\fR. The rc script mounts a tmpfs (\fBkaridns_signer_tmpfs_size\fR, default
-256m, mode \fB0700\fR) on the \fBwork\-dir\fR of the configuration file, starts
-the daemon with \fBdaemon(8)\fR (restart after 10 s if it dies, for instance
-because the database was down at boot), sets \fBulimit \-c 0\fR, and unmounts
-the tmpfs on stop. Under the rc script standard error goes to /dev/null, so set
-\fBlog = daemon\fR (or another facility) in the configuration file. \fBservice
+start\fR. \fBThe work directory.\fR An existing \fBwork\-dir\fR is never
+changed: it must be a directory of the signer's user with mode \fB0700\fR (what
+\fB\-\-check\fR wants), else the start is refused. A missing one is made (the
+user's, \fB0700\fR) only in an existing parent, or in
+\fB/var/db/karidns\-signer\fR (the home of the package's user, the parent of the
+default), which is made too; any other missing parent, a relative path, a
+\fB.\fR or \fB..\fR component and a symbolic link in the path are refused (no
+chain of directories is made as root). The rc script mounts a tmpfs
+(\fBkaridns_signer_tmpfs_size\fR, default 256m, mode \fB0700\fR) on the
+\fBwork\-dir\fR of the configuration file, starts the daemon with
+\fBdaemon(8)\fR (restart after 10 s if it dies, for instance because the
+database was down at boot), sets \fBulimit \-c 0\fR, and unmounts the tmpfs on
+stop. Under the rc script standard error goes to /dev/null, so set \fBlog =
+daemon\fR (or another facility) in the configuration file. \fBservice
 karidns_signer reload\fR sends \fBSIGHUP\fR. \fBkaridns_signer_cpuset="2\-3"\fR
 starts it under \fBcpuset \-l\fR.
 .IP 6. 4
