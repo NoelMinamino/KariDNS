@@ -262,6 +262,8 @@ static void *ctl_server(void *arg) {
             karidns_status_t st; memset(&st, 0, sizeof(st));
             st.boot_time = time(NULL) - 100000; st.last_configured_time = time(NULL) - 50; st.num_zones = 3;
             st.worker_threads = 4; st.frontend_alive = mode != 6; st.query_logging = true; st.rrl_dropped = 5;
+            st.dnstap_dropped_queue_full = 7; st.dnstap_dropped_not_connected = 2; st.dnstap_reconnects = 1;   /* 0.7 */
+            st.dnstap_link = mode == 6 ? KARIDNS_DNSTAP_LINK_DOWN : KARIDNS_DNSTAP_LINK_UP;
             snprintf(st.config_file, sizeof(st.config_file), "/etc/karidns.conf");
             char out[3 + sizeof(st)]; memcpy(out, "OK ", 3); memcpy(out + 3, &st, sizeof(st));
             send(c, out, mode == 7 ? 5 : sizeof(out), 0);

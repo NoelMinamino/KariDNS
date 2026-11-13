@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <stdarg.h>
 #include <time.h>
 #include <signal.h>
 #include <unistd.h>
@@ -31,9 +32,34 @@ char g_startup_cwd[PATH_MAX] = "";
 
 #include <fcntl.h>
 
+/* The lines the code logs, kept for the checks of the loss messages (0.7); the sender thread writes them while the test reads */
+static pthread_mutex_t g_log_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_log_lines[256][256];
+static int g_log_count;
+
 void syslog(int priority, const char *format, ...) {
     (void)priority;
-    (void)format;
+    char line[256];
+    va_list ap;
+    va_start(ap, format);
+    vsnprintf(line, sizeof(line), format, ap);
+    va_end(ap);
+    pthread_mutex_lock(&g_log_mu);
+    if (g_log_count < 256) snprintf(g_log_lines[g_log_count++], sizeof(g_log_lines[0]), "%s", line);
+    pthread_mutex_unlock(&g_log_mu);
+}
+
+/* the number of logged lines that contain `s`; with `out`, the last of them is copied there */
+static int log_lines_with(const char *s, char *out, size_t out_cap) {
+    int n = 0;
+    pthread_mutex_lock(&g_log_mu);
+    for (int i = 0; i < g_log_count; i++)
+        if (strstr(g_log_lines[i], s)) {
+            n++;
+            if (out) snprintf(out, out_cap, "%s", g_log_lines[i]);
+        }
+    pthread_mutex_unlock(&g_log_mu);
+    return n;
 }
 
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) {
@@ -608,6 +634,87 @@ static void test_dnstap_sender_thread(void) {
     printf("  -> dnstap sender thread passed.\n");
 }
 
+/* 0.7: the messages that are recorded but not delivered.  A worker ring filled past its size (queue full), messages that find no collector
+ * (not queued) and the ones the sender discards from the rings while disconnected, as dnstap_get_counters() sums them; the sender's line
+ * about the queue-full losses and its limit of one line per DNSTAP_LOSS_LOG_INTERVAL_MS. */
+static void test_dnstap_loss_counters(void) {
+    printf("[TEST] DNSTAP: loss counters, link state and the queue-full log line (0.7)...\n");
+    worker_ctx_t worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.dnstap_ring.size = 4;
+    worker.dnstap_ring.mask = 3;
+    worker.dnstap_ring.events = calloc(4, sizeof(dnstap_event_t));
+    assert(worker.dnstap_ring.events);
+    memset(&g_aux_dnstap_ring, 0, sizeof(g_aux_dnstap_ring));
+    g_aux_dnstap_ring.size = 4;
+    g_aux_dnstap_ring.mask = 3;
+    g_aux_dnstap_ring.events = calloc(4, sizeof(dnstap_aux_event_t));
+    assert(g_aux_dnstap_ring.events);
+    atomic_store(&g_worker_ctxs, &worker);
+    atomic_store(&g_worker_count, 1);
+    atomic_store(&g_dnstap_connected, false);
+
+    dnstap_counters_t c0, c;
+    dnstap_get_counters(&c0);
+    assert(c0.link == KARIDNS_DNSTAP_LINK_OFF);
+    uint8_t dummy[10] = {0};
+    write_dnstap_event(&worker, 1, dummy, sizeof(dummy), NULL, 0, NULL, false, IPPROTO_UDP);   /* no dnstap block: not a loss */
+    dnstap_get_counters(&c);
+    assert(c.not_connected == c0.not_connected);
+
+    /* dnstap set up (the path is never reached: the sender's retries fail), first connected: 6 into a ring of 4 (2 dropped), 5 into the aux
+     * ring of 4 (1 dropped) */
+    dnstap_enable_reconnect("/nonexistent/karidns_test_dnstap_loss.sock");
+    atomic_store(&g_dnstap_connected, true);
+    dnstap_get_counters(&c);
+    assert(c.link == KARIDNS_DNSTAP_LINK_UP);
+    for (int i = 0; i < 6; i++) write_dnstap_event(&worker, 1, dummy, sizeof(dummy), NULL, 0, NULL, false, IPPROTO_UDP);
+    for (int i = 0; i < 5; i++) write_dnstap_event(NULL, 2, dummy, sizeof(dummy), NULL, 0, NULL, false, IPPROTO_TCP);
+    dnstap_get_counters(&c);
+    assert(c.queue_full == c0.queue_full + 3);
+    assert(c.not_connected == c0.not_connected);
+
+    /* the collector is gone: 3 more are not queued (one is a type that is not selected, not counted), and the sender discards the 8 queued */
+    atomic_store(&g_dnstap_connected, false);
+    dnstap_set_message_types(true, false);
+    write_dnstap_event(&worker, DNSTAP_MSG_AUTH_QUERY, dummy, sizeof(dummy), NULL, 0, NULL, false, IPPROTO_UDP);
+    write_dnstap_event(&worker, DNSTAP_MSG_AUTH_RESPONSE, dummy, sizeof(dummy), NULL, 0, NULL, false, IPPROTO_UDP);
+    write_dnstap_event(NULL, DNSTAP_MSG_AUTH_QUERY, dummy, sizeof(dummy), NULL, 0, NULL, false, IPPROTO_TCP);
+    dnstap_set_message_types(true, true);
+    dnstap_get_counters(&c);
+    assert(c.link == KARIDNS_DNSTAP_LINK_DOWN);
+    assert(c.not_connected == c0.not_connected + 2);
+
+    int lines0 = log_lines_with("messages dropped, the queue was full", NULL, 0);
+    pthread_t th;
+    assert(pthread_create(&th, NULL, dnstap_sender_thread_func, NULL) == 0);
+    for (int i = 0; i < 300; i++) {   /* up to 3 s: the first check is at once */
+        dnstap_get_counters(&c);
+        if (c.not_connected == c0.not_connected + 2 + 8 && log_lines_with("messages dropped, the queue was full", NULL, 0) > lines0) break;
+        usleep(10000);
+    }
+    assert(c.not_connected == c0.not_connected + 2 + 8);
+    char line[256] = "";
+    assert(log_lines_with("messages dropped, the queue was full", line, sizeof(line)) == lines0 + 1);
+    assert(strstr(line, "[dnstap] ") == line && strstr(line, "queue-size is too small"));
+
+    /* more losses at once: no second line within the interval (the counter has them) */
+    atomic_fetch_add(&worker.dnstap_ring.dropped, 5);
+    usleep(1500000);   /* longer than the 1 s check, shorter than the 10 s limit */
+    assert(log_lines_with("messages dropped, the queue was full", NULL, 0) == lines0 + 1);
+    dnstap_get_counters(&c);
+    assert(c.queue_full == c0.queue_full + 3 + 5);
+
+    pthread_cancel(th);
+    pthread_join(th, NULL);
+    atomic_store(&g_worker_ctxs, NULL);
+    atomic_store(&g_worker_count, 0);
+    free(worker.dnstap_ring.events);
+    free(g_aux_dnstap_ring.events);
+    memset(&g_aux_dnstap_ring, 0, sizeof(g_aux_dnstap_ring));
+    printf("  -> loss counters passed.\n");
+}
+
 /* ---------------------------------------------------------------------------
  * O-03: STOP/FINISH at shutdown, reconnect after a write failure, query_zone.
  * A Frame Streams collector that serves two connections in a row: the first one
@@ -737,6 +844,12 @@ static void test_dnstap_stop_finish_reconnect(void) {
     assert(atomic_load(&col.connections) == 2);   /* reconnected through the broker */
     assert(atomic_load(&col.data_frames) >= 2);
     assert(atomic_load(&col.zone_seen));          /* Message.query_zone (field 11) */
+    {   /* 0.7: the reconnect is counted and its line says what the gap cost */
+        dnstap_counters_t c;
+        dnstap_get_counters(&c);
+        assert(c.reconnects >= 1 && c.link == KARIDNS_DNSTAP_LINK_UP);
+        assert(log_lines_with("messages were lost while not connected", NULL, 0) >= 1);
+    }
 
     assert(dnstap_shutdown(DNSTAP_SHUTDOWN_WAIT_MS));
     pthread_join(sth, NULL);                      /* the sender thread returns after FINISH */
@@ -767,6 +880,7 @@ int main(void) {
     test_dnstap_handshake();
     test_dnstap_handshake_content_type();
     test_dnstap_sender_thread();
+    test_dnstap_loss_counters();
     test_dnstap_stop_finish_reconnect();   /* last: dnstap_shutdown() ends the sender for good */
     printf("=== All DNSTAP Engine Unit Tests PASSED ===\n");
     return 0;

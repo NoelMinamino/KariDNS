@@ -20,6 +20,13 @@ void dnstap_set_message_types(bool log_auth_query, bool log_auth_response) {
 }
 dnstap_aux_ring_t g_aux_dnstap_ring;
 
+/* 0.7: dnstap is set up (dnstap_enable_reconnect(), at start-up): only then is a message that finds no collector counted as lost */
+static _Atomic bool g_dnstap_configured = false;
+/* written by the sender thread only, read by the control thread (dnstap_get_counters()) */
+static _Atomic uint64_t g_dnstap_discarded = 0;     /* taken out of the rings while disconnected */
+static _Atomic uint64_t g_dnstap_unencodable = 0;   /* dnstap_build_message() gave 0 */
+static _Atomic uint64_t g_dnstap_reconnects = 0;
+
 static const char DNSTAP_CONTENT_TYPE[] = "protobuf:dnstap.Dnstap";
 static char g_dnstap_identity[256];
 static char g_dnstap_version[256];
@@ -285,7 +292,10 @@ bool dnstap_send_frame(const dnstap_event_meta_t *meta,
                        uint8_t *scratch_buf, size_t scratch_cap) {
     if (g_dnstap_sock < 0) return false;
     size_t plen = dnstap_build_message(meta, wire, wire_len, scratch_buf, scratch_cap);
-    if (plen == 0) return true;
+    if (plen == 0) {   /* the frame is skipped, the stream goes on; counted with the queue-full losses */
+        atomic_fetch_add_explicit(&g_dnstap_unencodable, 1, memory_order_relaxed);
+        return true;
+    }
 
     uint32_t be_len = htonl((uint32_t)plen);
     struct iovec iov[2];
@@ -345,13 +355,29 @@ void fill_dnstap_event(dnstap_event_meta_t *meta,
     *out_wire_len = copy_len;
 }
 
+/* A message that dnstap would record but no collector is connected: counted on the ring of the thread (a worker's counter is its own; the aux
+ * ring's writers are the few non-worker threads).  Not when dnstap is not set up, and not for a type that is not selected. */
+static void dnstap_count_not_connected(worker_ctx_t *ctx, uint8_t message_type) {
+    if (!atomic_load_explicit(&g_dnstap_configured, memory_order_relaxed)) return;
+    if (message_type >= 32 ||
+        !(atomic_load_explicit(&g_dnstap_message_mask, memory_order_relaxed) & (1u << message_type))) return;
+    if (ctx) {
+        if (ctx->dnstap_ring.events) atomic_fetch_add_explicit(&ctx->dnstap_ring.not_connected, 1, memory_order_relaxed);
+    } else if (g_aux_dnstap_ring.events) {
+        atomic_fetch_add_explicit(&g_aux_dnstap_ring.not_connected, 1, memory_order_relaxed);
+    }
+}
+
 void write_dnstap_event(worker_ctx_t *ctx, uint8_t message_type,
                         const uint8_t *wire, size_t wire_len,
                         const void *client_addr,
                         socklen_t client_addr_len,
                         const void *server_addr,
                         bool has_server_addr, uint8_t protocol) {
-    if (!atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed)) return;
+    if (!atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed)) {
+        dnstap_count_not_connected(ctx, message_type);
+        return;
+    }
     if (message_type >= 32 ||
         !(atomic_load_explicit(&g_dnstap_message_mask, memory_order_relaxed) & (1u << message_type))) return;
 
@@ -408,6 +434,7 @@ static _Atomic int g_dnstap_stop_state = 0; /* 0 = 稼働, 1 = 終了要求, 2 =
 void dnstap_enable_reconnect(const char *socket_path) {
     if (!socket_path) return;
     strlcpy(g_dnstap_reconnect_path, socket_path, sizeof(g_dnstap_reconnect_path));
+    atomic_store_explicit(&g_dnstap_configured, true, memory_order_relaxed);
 }
 
 bool dnstap_shutdown(int timeout_ms) {
@@ -511,13 +538,16 @@ static void dnstap_discard_rings(void) {
         for (int w = 0; w < num_workers; w++) {
             dnstap_ring_t *ring = &workers[w].dnstap_ring;
             if (!ring->events) continue;
+            uint32_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);   /* (only this thread writes tail) */
             uint32_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
+            if (h != t) atomic_fetch_add_explicit(&g_dnstap_discarded, (uint32_t)(h - t), memory_order_relaxed);
             atomic_store_explicit(&ring->tail, h, memory_order_release);
         }
     }
     if (g_aux_dnstap_ring.events) {
         uint32_t t = atomic_load_explicit(&g_aux_dnstap_ring.tail, memory_order_relaxed);
         uint32_t h = atomic_load_explicit(&g_aux_dnstap_ring.head, memory_order_acquire);
+        uint32_t t0 = t;
         /* 書き込み途中のスロットは書き手が後で ready を立てるので、立っているものだけ下ろす */
         while (t != h) {
             dnstap_aux_event_t *ev = &g_aux_dnstap_ring.events[t & g_aux_dnstap_ring.mask];
@@ -525,8 +555,38 @@ static void dnstap_discard_rings(void) {
             atomic_store_explicit(&ev->ready, false, memory_order_release);
             t++;
         }
+        if (t != t0) atomic_fetch_add_explicit(&g_dnstap_discarded, (uint32_t)(t - t0), memory_order_relaxed);
         atomic_store_explicit(&g_aux_dnstap_ring.tail, t, memory_order_release);
     }
+}
+
+/* The ring-full losses (and the unencodable frames) since the start: the sum of the rings' counters */
+static uint64_t dnstap_queue_full_total(void) {
+    uint64_t n = atomic_load_explicit(&g_dnstap_unencodable, memory_order_relaxed) +
+                 atomic_load_explicit(&g_aux_dnstap_ring.dropped, memory_order_relaxed);
+    int num_workers = atomic_load_explicit(&g_worker_count, memory_order_acquire);
+    worker_ctx_t *workers = atomic_load_explicit(&g_worker_ctxs, memory_order_acquire);
+    for (int w = 0; workers && w < num_workers; w++) n += atomic_load_explicit(&workers[w].dnstap_ring.dropped, memory_order_relaxed);
+    return n;
+}
+
+/* The not-connected losses since the start: not queued (the rings' counters) and discarded from the rings */
+static uint64_t dnstap_not_connected_total(void) {
+    uint64_t n = atomic_load_explicit(&g_dnstap_discarded, memory_order_relaxed) +
+                 atomic_load_explicit(&g_aux_dnstap_ring.not_connected, memory_order_relaxed);
+    int num_workers = atomic_load_explicit(&g_worker_count, memory_order_acquire);
+    worker_ctx_t *workers = atomic_load_explicit(&g_worker_ctxs, memory_order_acquire);
+    for (int w = 0; workers && w < num_workers; w++)
+        n += atomic_load_explicit(&workers[w].dnstap_ring.not_connected, memory_order_relaxed);
+    return n;
+}
+
+void dnstap_get_counters(dnstap_counters_t *c) {
+    c->queue_full = dnstap_queue_full_total();
+    c->not_connected = dnstap_not_connected_total();
+    c->reconnects = atomic_load_explicit(&g_dnstap_reconnects, memory_order_relaxed);
+    if (!atomic_load_explicit(&g_dnstap_configured, memory_order_relaxed)) c->link = KARIDNS_DNSTAP_LINK_OFF;
+    else c->link = atomic_load_explicit(&g_dnstap_connected, memory_order_acquire) ? KARIDNS_DNSTAP_LINK_UP : KARIDNS_DNSTAP_LINK_DOWN;
 }
 
 /* Frame Streams の双方向プロトコルの終わり: STOP を送り、受信側の FINISH を待つ
@@ -579,8 +639,23 @@ void *dnstap_sender_thread_func(void *arg) {
     static uint8_t g_dnstap_scratch_buf[DNSTAP_FRAME_BUF_SIZE]; // 送信スレッドは1本のみなので競合しない
     int64_t next_retry_ms = 0;
     int backoff_ms = 1000;
+    /* 0.7: the ring-full losses are looked at once a second and logged at most once per DNSTAP_LOSS_LOG_INTERVAL_MS (the workers cannot
+     * log; this thread can); the not-connected losses go into the line of the reconnect */
+    int64_t next_loss_check_ms = 0, loss_logged_ms = INT64_MIN / 2;
+    uint64_t loss_reported = 0, not_connected_at_drop = dnstap_not_connected_total();
     while (1) {
         bool any_work = false;
+        int64_t now_ms = dnstap_now_ms();
+        if (now_ms >= next_loss_check_ms) {
+            next_loss_check_ms = now_ms + 1000;
+            uint64_t full = dnstap_queue_full_total();
+            if (full != loss_reported && now_ms - loss_logged_ms >= DNSTAP_LOSS_LOG_INTERVAL_MS) {
+                syslog(LOG_WARNING, "[dnstap] %llu messages dropped, the queue was full (the collector reads too slowly, or queue-size "
+                       "is too small); %llu since the start", (unsigned long long)(full - loss_reported), (unsigned long long)full);
+                loss_reported = full;
+                loss_logged_ms = now_ms;
+            }
+        }
         bool connected = atomic_load_explicit(&g_dnstap_connected, memory_order_acquire);
         if (atomic_load_explicit(&g_dnstap_stop_state, memory_order_acquire) == 1) {
             /* O-03: 終了要求。溜まっているイベントを送り切ってから STOP / FINISH */
@@ -597,6 +672,7 @@ void *dnstap_sender_thread_func(void *arg) {
             if (!dnstap_drain_rings(g_dnstap_scratch_buf, sizeof(g_dnstap_scratch_buf), &any_work)) {
                 backoff_ms = 1000;
                 next_retry_ms = dnstap_now_ms() + backoff_ms;
+                not_connected_at_drop = dnstap_not_connected_total();
             }
         } else {
             dnstap_discard_rings();
@@ -606,7 +682,11 @@ void *dnstap_sender_thread_func(void *arg) {
                 if (sock >= 0) {
                     g_dnstap_sock = sock;
                     atomic_store_explicit(&g_dnstap_connected, true, memory_order_release);
-                    syslog(LOG_NOTICE, "[dnstap] reconnected to %s", g_dnstap_reconnect_path);
+                    atomic_fetch_add_explicit(&g_dnstap_reconnects, 1, memory_order_relaxed);
+                    uint64_t nc = dnstap_not_connected_total();
+                    syslog(LOG_NOTICE, "[dnstap] reconnected to %s; %llu messages were lost while not connected", g_dnstap_reconnect_path,
+                           (unsigned long long)(nc - not_connected_at_drop));
+                    not_connected_at_drop = nc;
                     backoff_ms = 1000;
                 } else {
                     next_retry_ms = dnstap_now_ms() + backoff_ms;

@@ -52,7 +52,8 @@ typedef struct {
     uint32_t mask;
     alignas(64) _Atomic uint32_t head;
     alignas(64) _Atomic uint32_t tail;
-    alignas(64) _Atomic uint64_t dropped;
+    alignas(64) _Atomic uint64_t dropped;  /* ring full (written by the worker only) */
+    _Atomic uint64_t not_connected;           /* not queued: no collector connected (the same cache line: the worker only) */
 } dnstap_ring_t;
 
 // dnstap用イベント: AXFR/非同期I/Oスレッド用のMPSC aux リング専用。
@@ -70,6 +71,7 @@ typedef struct {
     alignas(64) _Atomic uint32_t head;
     alignas(64) _Atomic uint32_t tail;
     alignas(64) _Atomic uint64_t dropped;
+    _Atomic uint64_t not_connected;
 } dnstap_aux_ring_t;
 
 // Forward declaration of worker_ctx_t
@@ -133,5 +135,21 @@ void write_dnstap_event(worker_ctx_t *ctx, uint8_t message_type,
                         bool has_server_addr, uint8_t protocol);
 
 void *dnstap_sender_thread_func(void *arg);
+
+/* 0.7: the dnstap messages that were recorded (write_dnstap_event() took them: dnstap set up, the type selected) but never handed to the
+ * collector, and the state of the link, for `karictl status` / `stats`.  Summed over the rings on the caller's thread when asked (the
+ * workers only bump their own ring's counter; nothing they share).  Not counted: frames already written into the socket when the
+ * collector went away (the kernel's buffer; nobody can tell which of them it read), and what is still queued when the server exits. */
+typedef struct {
+    uint64_t queue_full;      /* a worker's or the aux ring was full (the collector reads too slowly, or queue-size is too small);
+                               * also a frame that could not be encoded (cannot happen with the buffer sizes above) */
+    uint64_t not_connected;   /* no collector connected: not queued, or discarded from the rings while disconnected */
+    uint64_t reconnects;      /* connections made by the background retry (after a drop, or after a failed first connect) */
+    int link;                 /* KARIDNS_DNSTAP_LINK_* (dns_wire.h) */
+} dnstap_counters_t;
+void dnstap_get_counters(dnstap_counters_t *c);
+
+/* the sender thread writes at most one "messages dropped" line (queue full) per this interval while the loss goes on */
+#define DNSTAP_LOSS_LOG_INTERVAL_MS 10000
 
 #endif /* DNS_DNSTAP_H */

@@ -581,6 +581,13 @@ static void prom_server(const karidns_status_t *st, const karidns_stats_total_t 
     printf("karidns_extended_errors_total{kind=\"other\"} %llu\n", ULL(st->ede_oth));
     prom_family("karidns_dnstap_truncated_total", "counter", "dnstap messages cut because they did not fit.");
     printf("karidns_dnstap_truncated_total %llu\n", ULL(st->dnstap_truncated));
+    prom_family("karidns_dnstap_dropped_total", "counter", "dnstap messages recorded but not delivered to the collector (queue_full: a ring was full; not_connected: no collector connected).");
+    printf("karidns_dnstap_dropped_total{reason=\"queue_full\"} %llu\n", ULL(st->dnstap_dropped_queue_full));
+    printf("karidns_dnstap_dropped_total{reason=\"not_connected\"} %llu\n", ULL(st->dnstap_dropped_not_connected));
+    prom_family("karidns_dnstap_connected", "gauge", "1 when a dnstap collector is connected, 0 when not or when dnstap is not configured.");
+    printf("karidns_dnstap_connected %d\n", st->dnstap_link == KARIDNS_DNSTAP_LINK_UP);
+    prom_family("karidns_dnstap_reconnects_total", "counter", "Connections to the dnstap collector made by the background retry.");
+    printf("karidns_dnstap_reconnects_total %llu\n", ULL(st->dnstap_reconnects));
     prom_family("karidns_notify_total", "counter", "NOTIFY messages sent and acknowledged.");
     printf("karidns_notify_total{event=\"sent\"} %llu\n", ULL(t->notify_sent));
     printf("karidns_notify_total{event=\"acknowledged\"} %llu\n", ULL(t->notify_ack));
@@ -630,7 +637,10 @@ static void json_server(const karidns_status_t *st, const karidns_stats_total_t 
     printf(",\"rrl\":{\"dropped\":%llu,\"slipped\":%llu}", ULL(st->rrl_dropped), ULL(st->rrl_slipped));
     printf(",\"extended_errors\":{\"prohibited\":%llu,\"not_authoritative\":%llu,\"not_supported\":%llu,\"other\":%llu}",
            ULL(st->ede_proh), ULL(st->ede_na), ULL(st->ede_ns), ULL(st->ede_oth));
-    printf(",\"dnstap_truncated\":%llu,\"notify\":{\"sent\":%llu,\"acknowledged\":%llu}", ULL(st->dnstap_truncated), ULL(t->notify_sent), ULL(t->notify_ack));
+    printf(",\"dnstap_truncated\":%llu,\"dnstap_dropped\":{\"queue_full\":%llu,\"not_connected\":%llu},\"dnstap_connected\":%s,\"dnstap_reconnects\":%llu",
+           ULL(st->dnstap_truncated), ULL(st->dnstap_dropped_queue_full), ULL(st->dnstap_dropped_not_connected),
+           st->dnstap_link == KARIDNS_DNSTAP_LINK_UP ? "true" : "false", ULL(st->dnstap_reconnects));
+    printf(",\"notify\":{\"sent\":%llu,\"acknowledged\":%llu}", ULL(t->notify_sent), ULL(t->notify_ack));
     printf(",\"transfers_in\":{\"axfr\":%llu,\"ixfr\":%llu,\"failures\":%llu}", ULL(t->axfr_success), ULL(t->ixfr_success), ULL(t->xfer_failed));
     printf(",\"wirecache\":{\"hit\":%llu,\"miss\":%llu},\"reload_failures\":%llu,\"alerts_active\":%llu,\"alerts_zones\":%llu,"
            "\"alerts_check_us\":%llu,\"alerts_build_us\":%llu}",
@@ -1206,6 +1216,12 @@ int main(int argc, char **argv) {
             printf("EDE NotSupported (21): %lu\n", st.ede_ns);
             printf("EDE Other: %lu\n", st.ede_oth);
             printf("dnstap truncated: %lu\n", (unsigned long)st.dnstap_truncated);
+            /* 0.7: recorded but not delivered to the collector; the link */
+            printf("dnstap dropped (queue full): %llu\n", (unsigned long long)st.dnstap_dropped_queue_full);
+            printf("dnstap dropped (not connected): %llu\n", (unsigned long long)st.dnstap_dropped_not_connected);
+            printf("dnstap connected: %s\n", st.dnstap_link == KARIDNS_DNSTAP_LINK_UP ? "yes"
+                                             : st.dnstap_link == KARIDNS_DNSTAP_LINK_DOWN ? "no" : "no (not configured)");
+            printf("dnstap reconnects: %llu\n", (unsigned long long)st.dnstap_reconnects);
             printf("-----------------------------------\n");
         } else {
             /* D-13: ERROR 応答や長さの合わない応答は失敗 (終了コード 3) */

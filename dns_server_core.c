@@ -5092,6 +5092,14 @@ void *control_thread_func(void *arg) {
               st.ede_ns = atomic_load_explicit(&g_ede_not_supported_total, memory_order_relaxed);
               st.ede_oth = atomic_load_explicit(&g_ede_other_total, memory_order_relaxed);
               st.dnstap_truncated = atomic_load_explicit(&g_dnstap_truncated_total, memory_order_relaxed);
+              {
+                dnstap_counters_t dc;
+                dnstap_get_counters(&dc);   /* sums the rings here, on the control thread */
+                st.dnstap_dropped_queue_full = dc.queue_full;
+                st.dnstap_dropped_not_connected = dc.not_connected;
+                st.dnstap_reconnects = dc.reconnects;
+                st.dnstap_link = dc.link;
+              }
               snprintf(st.version, sizeof(st.version), "%s", KARIDNS_VERSION);
               snprintf(st.hostname, sizeof(st.hostname), "%s", g_host_status_info.un.nodename);
               snprintf(st.os_name, sizeof(st.os_name), "%s", g_host_status_info.un.sysname);
@@ -7891,6 +7899,7 @@ int main(int argc, char **argv) {
     atomic_init(&ctxs[i].dnstap_ring.head, 0);
     atomic_init(&ctxs[i].dnstap_ring.tail, 0);
     atomic_init(&ctxs[i].dnstap_ring.dropped, 0);
+    atomic_init(&ctxs[i].dnstap_ring.not_connected, 0);
 
     atomic_init(&ctxs[i].query_count, 0);
     atomic_init(&ctxs[i].rcu_observed_epoch, RCU_EPOCH_IDLE);
