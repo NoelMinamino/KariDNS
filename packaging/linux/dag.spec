@@ -38,5 +38,5 @@ install -m 0755 dag %{buildroot}%{_bindir}/dag
 %{_bindir}/dag
 
 %changelog
-* Sun Aug 23 2026 Noel Minamino <noel@karidns.org> - 1.0.0-1
+* Sun Aug 23 2026 Noel Minamino <NoelMinamino@users.noreply.github.com> - 1.0.0-1
 - Initial packaging for dag

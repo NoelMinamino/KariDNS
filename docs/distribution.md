@@ -4,6 +4,8 @@ This document describes how to install and use KariDNS and its accompanying tool
 
 In the commands below, replace `?.?.?` with the release version (for example `0.4.2`).
 
+Report problems with a package as an issue at <https://github.com/NoelMinamino/KariDNS/issues>. The maintainer address in the package metadata is a no-reply address; mail sent to it is not read.
+
 ---
 
 ## 1. Distribution Matrix
