@@ -13,11 +13,14 @@
  *
  * karidns-dbloader gets the level only (KDB1 DEBUG, and --debug at its start): its lines are logged by the manager (dns_db_supervisor.c).
  *
- * Every receiver treats the record as hostile: a Backend that has been taken over must not gain anything through it.  Hence the record has
- * only what a line needs (destination, severity, the print-* flags, the syslog facility, a file path, and which channels each category
- * writes to), and a receiver appends only to a file that exists, in a directory it opened for the logs at start-up (the Backend can write
- * there itself), that is a plain file with one link owned by the run user (dns_log.c klog_aux_append()).  Nothing is created, rolled or
- * handed over by a receiver.
+ * Every receiver treats the record as hostile: a Backend that has been taken over must not gain anything through it (the manager is root).
+ * Hence the record has only what a line needs (destination, severity, the print-* flags, the syslog facility, a file path, and which channels
+ * each category writes to), and a receiver holds it to what the start-up configuration allowed (dns_log.c klog_aux_init(), kept before the
+ * forks): it appends only to a file that exists, in a directory of the start-up's file channels (which the Backend holds writable itself), that
+ * is a plain file (no symbolic link) with one link owned by the run user, never one of root's; karidns.run (options { directory }) only through
+ * the descriptor the start opened (klog_aux_append()); a syslog facility only one the start-up channels used (else daemon); and its warnings
+ * and errors always reach the start-up channels of their category as well (klog_record()), so a record cannot silence them.  Nothing is
+ * created, rolled or handed over by a receiver.
  *
  * Wire format (one host, but byte by byte so that it does not depend on the layout of a structure), big-endian:
  *   u32 magic "KLS1" | u8 version (1) | u8 flags (bit 0: the channels and the table follow) | u8 debug level (0..99) | u8 0 | u16 nch

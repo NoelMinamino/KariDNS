@@ -3618,10 +3618,6 @@ static void test_klog_aux_state(void) {
         assert(fd >= 0);
         close(fd);
         assert(open_via_dir_cache_existing("", O_WRONLY) < 0);
-        /* the run user's file is taken when this process is someone else (the manager is root, the files are the run user's) */
-        klog_set_aux_owner(getuid());
-        kdns_syslog(LOG_ERR, "[Manager] still to nowhere");
-        klog_set_aux_owner((uid_t)-1);
     }
     klog_set_role(KLOG_ROLE_BACKEND);
     klog_set_debug_level(0);
@@ -3715,6 +3711,236 @@ static void test_klog_aux_state(void) {
     rmdir(dir);
     rmdir(out);
     printf("  -> the level and the runtime in the other processes passed.\n");
+}
+
+/* a record of file channels (severity dynamic) for the categories general and database, at debug level dl; a path "*name" is a default_debug
+ * channel (KLS_CF_DEBUG_ONLY), "=name" a syslog channel of facility local5 */
+static size_t klog_forge(uint8_t *rec, size_t cap, const char *const *paths, int n, int dl) {
+    static kls_state_t f;
+    memset(&f, 0, sizeof(f));
+    f.debug_level = dl;
+    f.has_spec = true;
+    f.nch = (uint16_t)n;
+    for (int i = 0; i < n; i++) {
+        const char *p = paths[i];
+        if (p[0] == '=')
+            f.ch[i] = (kls_channel_t){ LOGDEST_SYSLOG, 0, 0, LOG_LVL_INFO, LOG_LOCAL5, 0, NULL };
+        else if (p[0] == '*')
+            f.ch[i] = (kls_channel_t){ LOGDEST_FILE, 0, KLS_CF_DEBUG_ONLY, 0, 0, (uint16_t)strlen(p + 1), p + 1 };
+        else
+            f.ch[i] = (kls_channel_t){ LOGDEST_FILE, 0, 0, 0, 0, (uint16_t)strlen(p), p };
+        f.route[LOGC_GENERAL][i] = f.route[LOGC_DATABASE][i] = (uint16_t)i;
+    }
+    f.nroute[LOGC_GENERAL] = f.nroute[LOGC_DATABASE] = (uint8_t)n;
+    size_t len = kls_encode(&f, rec, cap);
+    assert(len > 0);
+    return len;
+}
+
+static int klog_count(const char *path, const char *needle) {
+    char *s = klog_slurp(path);
+    int n = 0;
+    for (const char *p = s; (p = strstr(p, needle)) != NULL; p += strlen(needle)) n++;
+    free(s);
+    return n;
+}
+
+static off_t klog_size(const char *path) {
+    struct stat st;
+    return lstat(path, &st) == 0 ? st.st_size : -1;
+}
+
+/* 0.7: what a record from a taken-over Backend can do in the manager (root), a router or the broker is held to the start (klog_aux_init()):
+ * a file only in a directory of the start's file channels, a plain file of the run user (never the manager's own user, root), karidns.run of
+ * options { directory } only through the start's descriptor, no other file of that directory; a syslog facility only one the start used; the
+ * warnings and errors always reach the start's channels too.  And the Backend holds no writable descriptor of options { directory }: the start
+ * opens karidns.run without caching one, a reload in the sandbox takes the descriptor over. */
+static void test_klog_aux_limits(void) {
+    printf("[TEST] Logging: a record of the Backend is held to the start (owner, directories, karidns.run, floor, facility)...\n");
+    klog_set_debug_level(0);
+    logev_rate_reset();
+    char ld[] = "/tmp/karidns_kal_log_XXXXXX", od[] = "/tmp/karidns_kal_opt_XXXXXX", xd[] = "/tmp/karidns_kal_x_XXXXXX";
+    assert(mkdtemp(ld) && mkdtemp(od) && mkdtemp(xd));
+    char p_start[300], p_mine[300], p_x[300], p_sym[300], p_tgt[300], p_hard[300], p_tgt2[300], p_fifo[300], p_new[300], p_conf[300], p_run[300];
+    snprintf(p_start, sizeof(p_start), "%s/start.log", ld);
+    snprintf(p_mine, sizeof(p_mine), "%s/root.log", ld);
+    snprintf(p_x, sizeof(p_x), "%s/x.log", xd);
+    snprintf(p_sym, sizeof(p_sym), "%s/sym.log", ld);
+    snprintf(p_tgt, sizeof(p_tgt), "%s/target.log", ld);
+    snprintf(p_hard, sizeof(p_hard), "%s/hard.log", ld);
+    snprintf(p_tgt2, sizeof(p_tgt2), "%s/target2", ld);
+    snprintf(p_fifo, sizeof(p_fifo), "%s/fifo.log", ld);
+    snprintf(p_new, sizeof(p_new), "%s/new.log", ld);
+    snprintf(p_conf, sizeof(p_conf), "%s/karidns.conf", od);
+    snprintf(p_run, sizeof(p_run), "%s/karidns.run", od);
+    const char *plain[] = { p_mine, p_x, p_tgt, p_tgt2, p_conf };
+    for (size_t i = 0; i < sizeof(plain) / sizeof(plain[0]); i++) {
+        int fd = open(plain[i], O_WRONLY | O_CREAT, 0644);
+        assert(fd >= 0);
+        close(fd);
+    }
+    assert(symlink(p_tgt, p_sym) == 0 && link(p_tgt2, p_hard) == 0 && mkfifo(p_fifo, 0644) == 0);
+    char conf[2048];
+    snprintf(conf, sizeof(conf),
+             "options { directory \"%s\"; }; logging { channel lf { file \"%s\"; severity info; }; channel sys { syslog local3; severity info; };\n"
+             " category general { lf; sys; default_debug; }; category database { lf; }; };", od, p_start);
+    klog_install_conf(conf);
+    /* the start: karidns.run is open, its directory is not in the cache for writing (finding 2); the log directory is */
+    assert(access(p_run, F_OK) == 0);
+    errno = 0;
+    assert(open_via_dir_cache_existing(p_run, O_WRONLY) < 0 && errno == EACCES);
+    int fd = open_via_dir_cache_existing(p_start, O_WRONLY | O_APPEND);
+    assert(fd >= 0);
+    close(fd);
+    static uint8_t rec[KLS_MAX];
+
+    /* (a), (b): files of this process's own user while the run user is someone else (the manager is root, the files are the run user's) */
+    const uid_t other = geteuid() + 1;
+    klog_aux_init(other);
+    klog_set_role(KLOG_ROLE_AUX);
+    {
+        const char *paths[] = { p_mine, p_conf, p_start };
+        size_t n = klog_forge(rec, sizeof(rec), paths, 3, 0);
+        assert(klog_state_apply(rec, n, "Manager"));
+        kdns_syslog(LOG_ERR, "[Manager] into a file that is not the run user's");
+        assert(klog_size(p_mine) == 0 && klog_size(p_conf) == 0 && klog_size(p_start) == 0);
+    }
+    klog_set_role(KLOG_ROLE_BACKEND);
+
+    /* the run user is this process's user from here on: (c) .. (f) and the other files of options { directory } are still refused */
+    klog_install_conf(conf);
+    klog_aux_init(geteuid());
+    klog_set_role(KLOG_ROLE_AUX);
+    {
+        char run_dbg[310];
+        snprintf(run_dbg, sizeof(run_dbg), "*%s", p_run);
+        const char *paths[] = { p_start, p_x, p_sym, p_hard, p_fifo, p_conf, run_dbg, p_new };
+        size_t n = klog_forge(rec, sizeof(rec), paths, 8, 1);
+        assert(klog_state_apply(rec, n, "Manager"));
+        kdns_syslog(LOG_INFO, "[Manager] where the record says");
+        assert(klog_count(p_start, "[Manager] where the record says\n") == 1);   /* the positive case: a run-user file of a start-up log directory */
+        assert(klog_count(p_run, "[Manager] where the record says\n") == 1);     /* ... and karidns.run through the start's descriptor */
+        assert(klog_size(p_x) == 0);                                               /* (c) not a start-up log directory */
+        assert(klog_size(p_tgt) == 0);                                             /* (d) not through a symbolic link */
+        assert(klog_size(p_tgt2) == 0);                                            /* (e) not through a hard link */
+        assert(klog_size(p_conf) == 0);                                            /* options { directory }: karidns.run only */
+        assert(access(p_new, F_OK) != 0);                                          /* never created */
+        /* (f): the FIFO has no reader, and the line above did not wait for one (we are here) */
+        /* karidns.run is reached by the start's descriptor, not by its name: a file put there later is not written */
+        assert(unlink(p_run) == 0);
+        fd = open(p_run, O_WRONLY | O_CREAT, 0644);
+        assert(fd >= 0);
+        close(fd);
+        kdns_syslog(LOG_INFO, "[Manager] after karidns.run was replaced");
+        assert(klog_size(p_run) == 0);
+    }
+
+    /* floor (finding 3): a record that silences everything; the warnings and errors still reach the start's channels, nothing below does */
+    {
+        size_t n = klog_forge(rec, sizeof(rec), NULL, 0, 0);
+        assert(klog_state_apply(rec, n, "Manager"));
+        assert(logev_wanted(LOGC_GENERAL, LOG_LVL_WARNING) && logev_wanted(LOGC_DATABASE, LOG_LVL_ERROR) && !logev_wanted(LOGC_GENERAL, LOG_LVL_INFO));
+        kdns_syslog(LOG_WARNING, "[Manager] a warning under a silencing record");
+        kdns_logc(LOGC_DATABASE, LOG_ERR, "[DB] an error under a silencing record");
+        logev_post(LOGC_GENERAL, LOG_LVL_ERROR, NULL, 0, "[Manager] an event error under a silencing record");
+        kdns_syslog(LOG_INFO, "[Manager] an info line under a silencing record");
+        assert(klog_count(p_start, "[Manager] a warning under a silencing record\n") == 1);
+        assert(klog_count(p_start, "[DB] an error under a silencing record\n") == 1);
+        assert(klog_count(p_start, "[Manager] an event error under a silencing record\n") == 1);
+        assert(klog_count(p_start, "an info line under a silencing record") == 0);
+        /* a record that writes to the start's file already: the line is there once */
+        const char *paths[] = { p_start };
+        n = klog_forge(rec, sizeof(rec), paths, 1, 0);
+        assert(klog_state_apply(rec, n, "Manager"));
+        kdns_syslog(LOG_ERR, "[Manager] an error written once");
+        assert(klog_count(p_start, "[Manager] an error written once\n") == 1);
+        /* the facility: local3 is the start's, local5 is not and becomes daemon */
+        const char *sys[] = { "=", "=" };
+        n = klog_forge(rec, sizeof(rec), sys, 2, 0);
+        rec[KLS_HEADER_LEN + 4]                                            /* (the facility of the first channel) */ = (uint8_t)(LOG_LOCAL3 >> 8);
+        rec[KLS_HEADER_LEN + 5] = (uint8_t)LOG_LOCAL3;
+        assert(klog_state_apply(rec, n, "Manager"));
+        log_runtime_t *rt = log_runtime_acquire();
+        int nr = 0;
+        log_channel_t *const *r = log_runtime_route(rt, LOGC_GENERAL, &nr);
+        assert(nr == 2 && r[0]->syslog_facility == LOG_LOCAL3 && r[1]->syslog_facility == LOG_DAEMON);
+        log_runtime_release(rt);
+        /* (the start's local3 channel took the warnings of the floor, and the record's local3 channel is the same place: no second line) */
+        kdns_syslog(LOG_WARNING, "[Manager] a warning to local3");
+    }
+    klog_set_role(KLOG_ROLE_BACKEND);
+
+    /* finding 2: a reload in the sandbox keeps karidns.run (the start's descriptor), with no directory descriptor of options { directory } */
+    {
+        snprintf(conf, sizeof(conf), "options { directory \"%s\"; };", od);
+        unlink(p_run);
+        klog_install_conf(conf);
+        klog_set_debug_level(1);
+        kdns_syslog(LOG_INFO, "[Zone] before the reload");
+        server_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        assert(parse_named_conf(conf, &cfg) == 0);
+        logrt_status_t st;
+        atomic_store(&g_capsicum_enabled, true);                      /* what the Backend is at a reload */
+        log_runtime_t *nrt = log_runtime_build(&cfg.logging, true, &st);
+        atomic_store(&g_capsicum_enabled, false);
+        assert(nrt && st == LOGRT_OK && log_runtime_install(nrt));
+        free_server_config_fields(&cfg);
+        kdns_syslog(LOG_INFO, "[Zone] after the reload");
+        klog_set_debug_level(0);
+        assert(klog_count(p_run, " [Zone] before the reload\n") == 1 && klog_count(p_run, " [Zone] after the reload\n") == 1);
+        errno = 0;
+        assert(open_via_dir_cache_existing(p_run, O_WRONLY) < 0 && errno == EACCES);
+        /* a reload in between that does not write to default_debug keeps the descriptor for the next one that does */
+        for (int i = 0; i < 2; i++) {
+            if (i == 0) snprintf(conf, sizeof(conf), "options { directory \"%s\"; }; logging { category default { default_syslog; }; };", od);
+            else snprintf(conf, sizeof(conf), "options { directory \"%s\"; };", od);
+            memset(&cfg, 0, sizeof(cfg));
+            assert(parse_named_conf(conf, &cfg) == 0);
+            atomic_store(&g_capsicum_enabled, true);
+            nrt = log_runtime_build(&cfg.logging, true, &st);
+            atomic_store(&g_capsicum_enabled, false);
+            assert(nrt && st == LOGRT_OK && log_runtime_install(nrt));
+            free_server_config_fields(&cfg);
+        }
+        klog_set_debug_level(1);
+        kdns_syslog(LOG_INFO, "[Zone] after two more reloads");
+        klog_set_debug_level(0);
+        assert(klog_count(p_run, " [Zone] after two more reloads\n") == 1);
+        /* ... and one that needs it when the start did not open it: default_debug is null (a warning), nothing is created */
+        char od2[] = "/tmp/karidns_kal_opt2_XXXXXX", p_run2[300];
+        assert(mkdtemp(od2));
+        snprintf(p_run2, sizeof(p_run2), "%s/karidns.run", od2);
+        snprintf(conf, sizeof(conf), "options { directory \"%s\"; }; logging { category default { default_syslog; }; };", od2);
+        klog_install_conf(conf);
+        assert(access(p_run2, F_OK) != 0);
+        snprintf(conf, sizeof(conf), "options { directory \"%s\"; };", od2);
+        memset(&cfg, 0, sizeof(cfg));
+        assert(parse_named_conf(conf, &cfg) == 0);
+        atomic_store(&g_capsicum_enabled, true);
+        nrt = log_runtime_build(&cfg.logging, true, &st);
+        atomic_store(&g_capsicum_enabled, false);
+        assert(nrt && st == LOGRT_OK && log_runtime_install(nrt));
+        free_server_config_fields(&cfg);
+        klog_set_debug_level(1);
+        assert(!logev_wanted(LOGC_ZONELOAD, 1));
+        klog_set_debug_level(0);
+        assert(access(p_run2, F_OK) != 0);
+        rmdir(od2);
+    }
+
+    /* a refused start without a run user hands nothing over (the root case: tests/run_log_refused_start_test.sh) */
+    log_startup_refused();
+    /* what the later tests expect: no run user, the floor of a runtime without files, no karidns.run descriptor */
+    test_retire_runtime(NULL);
+    klog_aux_init((uid_t)-1);
+    test_retire_runtime(NULL);
+    const char *all[] = { p_start, p_mine, p_x, p_sym, p_tgt, p_hard, p_tgt2, p_fifo, p_conf, p_run };
+    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) unlink(all[i]);
+    rmdir(ld);
+    rmdir(od);
+    rmdir(xd);
+    printf("  -> a record of the Backend held to the start passed.\n");
 }
 
 /* 0.7 M1: the debug level in force.  The masks of the event messages follow it; `severity dynamic` follows it, `debug n` does not; the built-in
@@ -7661,6 +7887,7 @@ int main(void) {
         test_klog_routing();
         test_klog_debug_level();
         test_klog_aux_state();
+        test_klog_aux_limits();
         test_klog_destinations_and_batches();
         test_klog_rolling();
         test_klog_replacement_under_load();
@@ -7747,6 +7974,7 @@ int main(void) {
     test_klog_routing();
     test_klog_debug_level();
     test_klog_aux_state();
+    test_klog_aux_limits();
     test_klog_destinations_and_batches();
     test_klog_rolling();
     test_klog_replacement_under_load();

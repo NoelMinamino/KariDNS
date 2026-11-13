@@ -1406,7 +1406,10 @@ void klog_set_debug_level(int level);                                    /* the 
  * *spec_dropped: the runtime did not fit, the record carries the level alone), and what such a process does with one it receives */
 size_t klog_state_encode(uint8_t *buf, size_t cap, bool *spec_dropped);
 bool klog_state_apply(const uint8_t *buf, size_t len, const char *who);
-void klog_set_aux_owner(uid_t uid);                                      /* the run user, who owns the files klog_aux_append() writes to */
+/* the manager, before the forks: what the processes that only append keep of the start (the run user, -1 for none; the floor; karidns.run) */
+void klog_aux_init(uid_t run_user);
+/* a duplicate of the installed runtime's descriptor of the built-in default_debug when it is the file `path` (-1: none) */
+int log_runtime_dup_debug_fd(const char *path);
 size_t klog_build_line(const log_channel_t *ch, int cat, int level, const struct timespec *ts, const char *msg, char *out, size_t n);
 void klog_channel_emit(log_channel_t *ch, int cat, int level, const struct timespec *ts, const char *msg);
 void klog_record(log_runtime_t *rt, int cat, int level, const struct timespec *ts, const char *msg);

@@ -16,10 +16,12 @@
  * which most threads that log are not in.  The runtime does not live in server_config_t for this reason.
  *
  * The files are opened by log_open_channels() (dns_server_core.c) at start-up, before the sandbox, and again at a reload through the directory
- * descriptors the Backend already holds; nothing here opens a file for the first time inside capability mode.  Processes other than the
- * Backend (the supervisor, the routers, the broker) append to a file channel by opening the path for each line, so that they follow the
+ * descriptors the Backend already holds; nothing here opens a file for the first time inside capability mode (the built-in default_debug,
+ * karidns.run, is opened at the start only, with no directory descriptor kept, and a reload takes its descriptor over).  Processes other than
+ * the Backend (the supervisor, the routers, the broker) append to a file channel by opening the path for each line, so that they follow the
  * Backend's rotation; they never rotate, and (0.7 M2) never create one.  They were forked with the start-up runtime and level; after a karictl
- * trace / notrace or a reload the Backend sends them the level and its runtime (dns_log_state.h, klog_state_encode() / klog_state_apply()). */
+ * trace / notrace or a reload the Backend sends them the level and its runtime (dns_log_state.h, klog_state_encode() / klog_state_apply()),
+ * which they take within the limits of klog_aux_init(). */
 #include "dns_server_internal.h"
 #include "dns_priv_sandbox.h"
 #include "dns_log.h"
@@ -31,6 +33,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/capsicum.h>
 #include <sys/stat.h>
 
 _Static_assert(KLS_ROUTE_MAX == LOG_ROUTE_MAX, "the KLS1 table has the runtime's width");
@@ -214,27 +217,48 @@ void klog_set_role(klog_role_t role) {
   atomic_store_explicit(&g_klog_role, (int)role, memory_order_relaxed);
 }
 
-/* the owner of the log files besides this process's own user: the run user they were handed to (klog_set_aux_owner(), set before the forks) */
+/* ---- the processes that only append (KLOG_ROLE_AUX): what they keep of the start (klog_aux_init(), before the forks) ----
+ * The Backend sends them its channels (klog_state_apply()), and a Backend that has been taken over can send anything.  So what such a process
+ * does with a record is held to what the start-up configuration (never the Backend) allowed:
+ *   g_klog_aux_owner      the run user: the one owner of a file it appends to (klog_aux_append())
+ *   g_klog_aux_dbg_*      the start's descriptor of the built-in default_debug (karidns.run) and its path: the one way to that file
+ *   g_klog_floor          the start-up routing (no descriptor): the floor of the warnings and errors (klog_record())
+ *   g_klog_aux_facilities the syslog facilities the start-up channels used (bit facility >> 3); ~0: no limit (klog_aux_init() not called) */
 static uid_t g_klog_aux_owner = (uid_t)-1;
-
-void klog_set_aux_owner(uid_t uid) {
-  g_klog_aux_owner = uid;
-}
+static int g_klog_aux_dbg_fd = -1;
+static char *g_klog_aux_dbg_path;
+static log_runtime_t *g_klog_floor;
+static uint32_t g_klog_aux_facilities = ~0u;
 
 /* A supervisor, router or broker process: the file may have been rolled by the Backend since the descriptor was inherited, so open it by name
  * for this line and never roll it here.  0.7 M2: only appended to, never created.  The Backend created every file of its runtime (at the
  * start, or at a reload as the run user) and owns the rotation; the manager is root and must not recreate a file that has gone (a root-owned
- * file the run-user Backend could neither append to nor roll), and since the channels can come from the Backend (dns_log_state.h) a file is
- * taken only in a directory opened for the logs at start-up (open_via_dir_cache_existing()), only when it is a plain file with one link owned
- * by this process's user or the run user: a FIFO, a hard link or a root file that a taken-over Backend put there is never written to.
- * O_NONBLOCK: a FIFO without a reader must not hold the process in open(). */
+ * file the run-user Backend could neither append to nor roll).  Since the channels can come from a taken-over Backend (dns_log_state.h), a
+ * line goes only where the Backend could write itself:
+ *   - karidns.run (the start's path of the built-in default_debug, in options { directory }) through the descriptor the start opened: that
+ *     directory is never opened here, it holds the configuration, the zone files and the loader's state;
+ *   - any other file only in a directory that is in this process's cache as writable (open_via_dir_cache_existing()).  Those entries are the
+ *     directories of the start-up's file channels (log_open_channels() before the forks; nothing in this role adds one), which the Backend
+ *     holds writable as well; a reload that names a new directory is "restart needed" in the Backend, so no record can name one legitimately;
+ *   - only a plain file, not a symbolic link (O_NOFOLLOW), with one link, owned by the run user.  The manager is root, so a file of its own
+ *     user (a root-owned karidns.conf, a zone file, /var/log/auth.log) is never written; a FIFO (O_NONBLOCK: open() does not wait for a reader)
+ *     or a hard link the Backend put there neither.  Without a run user the whole server runs as one user (a start as root needs `user`):
+ *     there is no boundary to keep, the owner is this process's own user.
+ * Nothing the record names is created. */
 static void klog_aux_append(const log_channel_t *ch, const char *line, size_t len) {
   if (!ch->file_path) return;
-  int fd = open_via_dir_cache_existing(ch->file_path, O_WRONLY | O_APPEND | O_NONBLOCK);
+  if (g_klog_aux_dbg_path && strcmp(ch->file_path, g_klog_aux_dbg_path) == 0) {
+    if (g_klog_aux_dbg_fd >= 0) {
+      ssize_t w = write(g_klog_aux_dbg_fd, line, len);
+      (void)w;
+    }
+    return;
+  }
+  int fd = open_via_dir_cache_existing(ch->file_path, O_WRONLY | O_APPEND | O_NONBLOCK | O_NOFOLLOW);
   if (fd < 0) return;
+  const uid_t owner = g_klog_aux_owner != (uid_t)-1 ? g_klog_aux_owner : geteuid();
   struct stat st;
-  if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_nlink == 1 &&
-      (st.st_uid == geteuid() || (g_klog_aux_owner != (uid_t)-1 && st.st_uid == g_klog_aux_owner))) {
+  if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_nlink == 1 && st.st_uid == owner) {
     ssize_t w = write(fd, line, len);
     (void)w;
   }
@@ -439,8 +463,14 @@ log_runtime_t *log_runtime_build(const logging_config_t *lc, bool hand_off, logr
     for (int i = 0; i < rt->nroute[cat]; i++) dbg_used |= rt->route[cat][i] == builtin_dbg;
   }
   /* karidns.run is created only when some category writes to the built-in default_debug (BIND opens named.run when it first writes to it;
-   * the Backend cannot create a file after the start, so it is opened here, before the sandbox, and at a reload through the directory fd) */
-  if (!dbg_used) builtin_dbg->dest = LOGDEST_NULL;
+   * the Backend cannot create a file after the start, so it is opened here, before the sandbox; a reload in the sandbox takes the descriptor
+   * of the runtime in use: log_open_channels(), dns_server_core.c log_open_debug_file()) */
+  if (!dbg_used) {
+    builtin_dbg->dest = LOGDEST_NULL;
+    /* in the sandbox the descriptor is still kept (nothing is written to it), so that a later reload that writes to default_debug again has it */
+    if (builtin_dbg->file_path && atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire))
+      builtin_dbg->fd = log_runtime_dup_debug_fd(builtin_dbg->file_path);
+  }
   int rc = log_open_channels(rt->channels, hand_off);
   if (rc != 0) {
     *status = rc > 0 ? LOGRT_RESTART : LOGRT_ERROR;
@@ -500,6 +530,7 @@ void klog_guard_leave(bool prev) {
 
 static uint32_t rt_level_mask(const log_runtime_t *rt, int cat, int debug_level);
 static void klog_emit_level(int cat, int level, const char *msg);
+static bool klog_aux_floor_active(const log_runtime_t *rt);
 
 /* bumped by every install, after the new runtime is current (klog_refresh_masks()) */
 static _Atomic uint32_t g_rt_gen;
@@ -515,7 +546,10 @@ static void klog_refresh_masks(void) {
     int dl = klog_debug_level();
     log_runtime_t *rt = log_runtime_acquire();
     if (!rt) return;
-    for (int c = 0; c < LOGC_COUNT; c++) logev_set_mask(c, rt_level_mask(rt, c, dl));   /* (the event messages of dns_log.h look at it before they build anything) */
+    /* (the event messages of dns_log.h look at it before they build anything; the warnings and worse of the floor are wanted as well) */
+    const bool floor = klog_aux_floor_active(rt);
+    for (int c = 0; c < LOGC_COUNT; c++)
+      logev_set_mask(c, rt_level_mask(rt, c, dl) | (floor ? rt_level_mask(g_klog_floor, c, dl) & (LOGEV_BIT(LOG_LVL_WARNING + 1) - 1u) : 0u));
     log_runtime_release(rt);
     if (atomic_load(&g_rt_gen) == gen && klog_debug_level() == dl) return;
   }
@@ -561,6 +595,23 @@ log_channel_t *log_runtime_current_channels(void) {
   int s = atomic_load(&g_rt_cur);
   log_runtime_t *rt = s < 0 ? NULL : atomic_load(&g_rt_slot[s]);
   return rt ? rt->channels : NULL;
+}
+
+/* the built-in default_debug of rt when it has its file open (karidns.run; also a null one that keeps the descriptor: log_runtime_build()),
+ * else NULL */
+static log_channel_t *rt_open_builtin_debug(log_runtime_t *rt) {
+  for (log_channel_t *c = rt ? rt->channels : NULL; c; c = c->next)
+    if (c->debug_only && c->fd >= 0 && c->file_path) return c;
+  return NULL;
+}
+
+int log_runtime_dup_debug_fd(const char *path) {
+  int fd = -1;
+  log_runtime_t *rt = log_runtime_acquire();
+  log_channel_t *c = rt_open_builtin_debug(rt);
+  if (c && path && strcmp(c->file_path, path) == 0) fd = fcntl(c->fd, F_DUPFD_CLOEXEC, 0);
+  log_runtime_release(rt);
+  return fd;
 }
 
 log_channel_t *const *log_runtime_route(const log_runtime_t *rt, int cat, int *n) {
@@ -631,7 +682,8 @@ static log_runtime_t *klog_runtime_from_state(const kls_state_t *s) {
     *tail = ch;
     tail = &ch->next;
     chs[i] = ch;
-    ch->syslog_facility = c->facility;
+    /* a facility the start-up channels did not use is the default one: a record cannot put these lines into, say, the auth log */
+    ch->syslog_facility = (g_klog_aux_facilities >> (c->facility >> 3)) & 1u ? c->facility : LOG_DAEMON;
     ch->print_category = (c->flags & KLS_CF_CATEGORY) != 0;
     ch->print_severity = (c->flags & KLS_CF_SEVERITY) != 0;
     ch->debug_only = (c->flags & KLS_CF_DEBUG_ONLY) != 0;
@@ -647,6 +699,54 @@ fail:
   return NULL;
 }
 
+/* 0.7: in the manager after the start-up runtime is installed, before the broker, the Backend and the routers are forked (they inherit what is
+ * kept here): the run user (-1: none, the server runs as one user), the start-up routing as the floor, its syslog facilities, and a duplicate of
+ * the start's karidns.run descriptor (write only).  The floor is what the start-up configuration routes, through a record of it (no descriptor;
+ * a configuration that does not fit one: default_syslog for every category).  Called again, it replaces what it kept (the unit tests). */
+void klog_aux_init(uid_t run_user) {
+  static uint8_t rec[KLS_MAX];
+  static kls_state_t s;
+  g_klog_aux_owner = run_user;
+  bool dropped = false;
+  size_t n = klog_state_encode(rec, sizeof(rec), &dropped);
+  if (n == 0 || dropped || kls_parse(rec, n, &s) != NULL || !s.has_spec) {
+    memset(&s, 0, sizeof(s));
+    s.has_spec = true;
+    s.nch = 1;
+    s.ch[0] = (kls_channel_t){ LOGDEST_SYSLOG, LOGTIME_NONE, 0, LOG_LVL_INFO, LOG_DAEMON, 0, NULL };
+    for (int cat = 0; cat < LOGC_COUNT; cat++) {
+      s.nroute[cat] = 1;
+      s.route[cat][0] = 0;
+    }
+  }
+  uint32_t fac = 0;
+  for (uint16_t i = 0; i < s.nch; i++)
+    if (s.ch[i].dest == LOGDEST_SYSLOG) fac |= 1u << (s.ch[i].facility >> 3);
+  g_klog_aux_facilities = ~0u;   /* the floor keeps the facilities of the start */
+  log_runtime_t *floor_rt = klog_runtime_from_state(&s);
+  g_klog_aux_facilities = fac;
+  if (floor_rt) {
+    log_runtime_free(g_klog_floor);
+    g_klog_floor = floor_rt;
+  }
+  if (g_klog_aux_dbg_fd >= 0) close(g_klog_aux_dbg_fd);
+  free(g_klog_aux_dbg_path);
+  g_klog_aux_dbg_fd = -1;
+  g_klog_aux_dbg_path = NULL;
+  log_runtime_t *rt = log_runtime_acquire();
+  log_channel_t *dbg = rt_open_builtin_debug(rt);
+  if (dbg && (g_klog_aux_dbg_path = strdup(dbg->file_path)) != NULL) {
+    g_klog_aux_dbg_fd = fcntl(dbg->fd, F_DUPFD_CLOEXEC, 0);
+    cap_rights_t rights;
+    cap_rights_init(&rights, CAP_WRITE, CAP_SEEK, CAP_FSTAT);
+    if (g_klog_aux_dbg_fd >= 0 && cap_rights_limit(g_klog_aux_dbg_fd, &rights) != 0 && errno != ENOSYS) {
+      close(g_klog_aux_dbg_fd);
+      g_klog_aux_dbg_fd = -1;
+    }
+  }
+  log_runtime_release(rt);
+}
+
 /* syslog(3) itself (through klog_syslog_text(): KARIDNS_NOSYSLOG), not the routing: the messages of klog_state_apply() */
 static void klog_syslogf(int prio, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void klog_syslogf(int prio, const char *fmt, ...) {
@@ -659,8 +759,10 @@ static void klog_syslogf(int prio, const char *fmt, ...) {
 }
 
 /* A record from the Backend in a process that only appends (the manager, a router, the broker): the level, and the channels when the record
- * has them.  `who` names this process in the messages ("Manager", "Frontend 0", "Broker").  The record is hostile input (kls_parse()); what
- * it names can only make klog_aux_append() write to a file the Backend could write itself.  false: refused (logged, at most 16 times). */
+ * has them.  `who` names this process in the messages ("Manager", "Frontend 0", "Broker").  The record is hostile input (kls_parse()), and
+ * what it names is held to the start-up configuration (klog_aux_init()): a file only as klog_aux_append() takes one (a run-user file the Backend
+ * could write itself), a syslog facility only one the start used, and the warnings and errors still reach the start's channels (klog_record()).
+ * false: refused (logged, at most 16 times). */
 bool klog_state_apply(const uint8_t *buf, size_t len, const char *who) {
   static unsigned long refused;
   kls_state_t s;
@@ -689,12 +791,40 @@ bool klog_state_apply(const uint8_t *buf, size_t len, const char *who) {
   return true;
 }
 
-/* One record to the channels of its category. */
+/* two channels that write to the same place: the same syslog facility, the same file, standard error */
+static bool klog_same_destination(const log_channel_t *a, const log_channel_t *b) {
+  if (a->dest != b->dest) return false;
+  if (a->dest == LOGDEST_SYSLOG) return a->syslog_facility == b->syslog_facility;
+  if (a->dest == LOGDEST_FILE) return a->file_path && b->file_path && strcmp(a->file_path, b->file_path) == 0;
+  return a->dest == LOGDEST_STDERR;
+}
+
+static bool klog_aux_floor_active(const log_runtime_t *rt) {
+  return g_klog_floor && rt != g_klog_floor && atomic_load_explicit(&g_klog_role, memory_order_relaxed) == KLOG_ROLE_AUX;
+}
+
+/* One record to the channels of its category.  The floor (a process that only appends, after klog_aux_init()): a warning, an error or worse
+ * also goes to each start-up channel of the category that takes it, unless a channel of the runtime in use has just written it to the same
+ * place.  A record from the Backend can add channels and move the other lines, but cannot silence these: they are the ones that would show
+ * a taken-over Backend (a refused plugin request, a loader that fails). */
 void klog_record(log_runtime_t *rt, int cat, int level, const struct timespec *ts, const char *msg) {
   const int dl = klog_debug_level();
+  const log_channel_t *done[LOG_ROUTE_MAX];
+  int ndone = 0;
   for (int i = 0; i < rt->nroute[cat]; i++) {
     log_channel_t *ch = rt->route[cat][i];
-    if (klog_channel_passes_at(ch, level, dl)) klog_channel_emit(ch, cat, level, ts, msg);
+    if (klog_channel_passes_at(ch, level, dl)) {
+      klog_channel_emit(ch, cat, level, ts, msg);
+      if (ndone < LOG_ROUTE_MAX) done[ndone++] = ch;
+    }
+  }
+  if (level > LOG_LVL_WARNING || !klog_aux_floor_active(rt)) return;
+  for (int i = 0; i < g_klog_floor->nroute[cat]; i++) {
+    log_channel_t *f = g_klog_floor->route[cat][i];
+    if (f->dest == LOGDEST_NULL || !klog_channel_passes_at(f, level, dl)) continue;
+    bool written = false;
+    for (int k = 0; k < ndone && !written; k++) written = klog_same_destination(done[k], f);
+    if (!written) klog_channel_emit(f, cat, level, ts, msg);
   }
 }
 

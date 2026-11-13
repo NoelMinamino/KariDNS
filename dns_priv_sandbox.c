@@ -112,6 +112,22 @@ static int open_dir_below_root_locked(const char *dirpath) {
   return fd;
 }
 
+/* A directory by its path (outside capability mode): absolute as it is, relative through g_cwd_fd, or from the start-up directory when it has
+ * a ".." (D-24 below).  Plain O_RDONLY descriptor, no rights limited, not cached. */
+static int open_dir_by_path(const char *dirpath) {
+  char abs_dir[PATH_MAX];
+  if (dirpath[0] == '/')
+    return open(dirpath, O_DIRECTORY | O_CLOEXEC | O_RDONLY);
+  if (path_has_dotdot_component(dirpath) && g_startup_cwd[0] != '\0' &&
+      snprintf(abs_dir, sizeof(abs_dir), "%s/%s", g_startup_cwd, dirpath) < (int)sizeof(abs_dir))
+    /* D-24: 権利を絞った g_cwd_fd からは ".." を辿れない (FreeBSD の strict relative lookup)。
+     * サンドボックスに入る前なら起動時ディレクトリからの絶対パスで開く。絶対パスは元から
+     * 開けるので、これで新たに開ける範囲が広がるわけではない。キャッシュの鍵は dirpath のまま */
+    return open(abs_dir, O_DIRECTORY | O_CLOEXEC | O_RDONLY);
+  return (g_cwd_fd >= 0) ? openat(g_cwd_fd, dirpath, O_DIRECTORY | O_CLOEXEC | O_RDONLY)
+                         : open(dirpath, O_DIRECTORY | O_CLOEXEC | O_RDONLY);
+}
+
 static int get_or_open_dir_fd(const char *dirpath_in, bool writable) {
   char dirpath[PATH_MAX];
   if (!dir_key(dirpath_in, dirpath, sizeof(dirpath))) {
@@ -140,20 +156,7 @@ static int get_or_open_dir_fd(const char *dirpath_in, bool writable) {
     if (bfd < 0) errno = ENOTCAPABLE;
     return bfd;
   }
-  int fd;
-  char abs_dir[PATH_MAX];
-  if (dirpath[0] == '/')
-    fd = open(dirpath, O_DIRECTORY | O_CLOEXEC | O_RDONLY);
-  else if (path_has_dotdot_component(dirpath) && g_startup_cwd[0] != '\0' &&
-           snprintf(abs_dir, sizeof(abs_dir), "%s/%s", g_startup_cwd, dirpath) < (int)sizeof(abs_dir))
-    /* D-24: 権利を絞った g_cwd_fd からは ".." を辿れない (FreeBSD の strict relative lookup)。
-     * サンドボックスに入る前なら起動時ディレクトリからの絶対パスで開く。絶対パスは元から
-     * 開けるので、これで新たに開ける範囲が広がるわけではない。キャッシュの鍵は dirpath のまま */
-    fd = open(abs_dir, O_DIRECTORY | O_CLOEXEC | O_RDONLY);
-  else
-    fd = (g_cwd_fd >= 0)
-             ? openat(g_cwd_fd, dirpath, O_DIRECTORY | O_CLOEXEC | O_RDONLY)
-             : open(dirpath, O_DIRECTORY | O_CLOEXEC | O_RDONLY);
+  int fd = open_dir_by_path(dirpath);
   if (fd < 0) {
     pthread_mutex_unlock(&g_dir_fd_lock);
     return -1;
@@ -227,6 +230,25 @@ int open_via_dir_cache_existing(const char *path, int flags) {
     return -1;
   }
   return openat(dfd, basebuf, (flags & ~O_CREAT) | O_CLOEXEC | O_RESOLVE_BENEATH);
+}
+
+int open_without_dir_cache(const char *path, int flags, mode_t mode) {
+  char dirbuf[PATH_MAX], basebuf[PATH_MAX];
+  if (atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire)) {
+    errno = ENOTCAPABLE;
+    return -1;
+  }
+  if (!split_path_for_openat(path, dirbuf, sizeof(dirbuf), basebuf, sizeof(basebuf))) {
+    errno = EINVAL;
+    return -1;
+  }
+  int dfd = open_dir_by_path(dirbuf);
+  if (dfd < 0) return -1;
+  int fd = openat(dfd, basebuf, flags | O_CLOEXEC | O_NOFOLLOW | O_RESOLVE_BENEATH, mode);
+  int e = errno;
+  close(dfd);
+  errno = e;
+  return fd;
 }
 
 bool dir_fd_cache_add_root(const char *dirpath) {

@@ -789,6 +789,52 @@ static void log_debug_file_unusable(log_channel_t *ch, const char *why) {
   ch->dest = LOGDEST_NULL;
 }
 
+/* 0.7: the built-in default_debug (karidns.run in options { directory }).  That directory holds the configuration, the zone files, the loader's
+ * state and an SQLite file, so no descriptor of it is cached for writing (the Backend would carry it into the sandbox): the start opens the file
+ * by its path (open_without_dir_cache()), with the rights a line needs.  It is never rolled; a reload in the sandbox takes the descriptor of the
+ * runtime in use (the same path; the path changes only with options { directory }, which needs a restart).  A reload that needs it when the
+ * start did not open it (no category wrote to it then) leaves it null with a warning: a restart opens it.  Outside capability mode (the start,
+ * the unit tests) it is opened by its path every time. */
+static void log_open_debug_file(log_channel_t *ch, uid_t run_uid, uid_t target_uid, gid_t target_gid) {
+  if (atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire)) {
+    ch->fd = log_runtime_dup_debug_fd(ch->file_path);
+    if (ch->fd < 0) {
+      log_debug_file_unusable(ch, "it was not open before (a reload in the sandbox cannot open it); it is used after a restart");
+      return;
+    }
+  } else {
+    const int fl = O_WRONLY | O_APPEND | O_NONBLOCK;   /* (a FIFO there must not hold the start in open()) */
+    ch->fd = open_without_dir_cache(ch->file_path, fl, 0644);
+    if (ch->fd < 0 && errno == ENOENT) {
+      ch->fd = open_without_dir_cache(ch->file_path, fl | O_CREAT | O_EXCL, 0644);
+      if (ch->fd >= 0) ch->created = true;
+      else if (errno == EEXIST) ch->fd = open_without_dir_cache(ch->file_path, fl, 0644);
+    }
+    if (ch->fd < 0) {
+      log_debug_file_unusable(ch, strerror(errno));
+      return;
+    }
+    cap_rights_t rights;
+    cap_rights_init(&rights, CAP_WRITE, CAP_SEEK, CAP_FSTAT, CAP_FCHOWN);   /* (CAP_FCHOWN until the hand-off: logging_drop_fchown()) */
+    if (cap_rights_limit(ch->fd, &rights) != 0 && errno != ENOSYS) {
+      int e = errno;
+      close(ch->fd);
+      ch->fd = -1;
+      log_debug_file_unusable(ch, strerror(e));
+      return;
+    }
+  }
+  off_t size = log_file_accept(ch->fd, ch->file_path, run_uid);
+  if (size < 0) {
+    close(ch->fd);
+    ch->fd = -1;
+    log_debug_file_unusable(ch, "it was refused (see the message before)");
+    return;
+  }
+  if (geteuid() == 0 && target_uid != (uid_t)-1) fchown(ch->fd, target_uid, target_gid);
+  ch->current_size = size;
+}
+
 /* 0.7 M2: the files (and directories) of `list` that this process made at the start, handed to the run user through their descriptors (and the
  * directory descriptors prepare_log_dir() opens with O_NOFOLLOW): what hand_off_logging_channels() would have done, for a start that is
  * refused before it.  A file that was there before keeps its owner, as on any refused start; nothing is unlinked, nothing is changed by path.
@@ -827,6 +873,10 @@ int log_open_channels(log_channel_t *list, bool hand_off) {
     /* 0.7 M2: an existing file is opened as it is; only a missing one is created (O_EXCL), and the channel remembers that this process made
      * it (log_hand_off_created(): a refused start hands it to the run user instead of leaving it root-owned) */
     ch->created = false;
+    if (ch->debug_only) {
+      log_open_debug_file(ch, run_uid, target_uid, target_gid);
+      continue;
+    }
     ch->fd = open_via_dir_cache(ch->file_path, O_WRONLY | O_APPEND, 0644, true);
     if (ch->fd < 0 && errno == ENOENT) {
       ch->fd = open_via_dir_cache(ch->file_path, O_WRONLY | O_CREAT | O_EXCL | O_APPEND, 0644, true);
@@ -838,10 +888,6 @@ int log_open_channels(log_channel_t *list, bool hand_off) {
       if (size < 0) {
         close(ch->fd);
         ch->fd = -1;
-        if (ch->debug_only) {
-          log_debug_file_unusable(ch, "it was refused (see the message before)");
-          continue;
-        }
         hard = true;
       } else {
         if (geteuid() == 0 && target_uid != (uid_t)-1) {
@@ -851,10 +897,6 @@ int log_open_channels(log_channel_t *list, bool hand_off) {
       }
     } else {
       int open_errno = errno;
-      if (ch->debug_only) {
-        log_debug_file_unusable(ch, strerror(open_errno));
-        continue;
-      }
 #ifdef ENOTCAPABLE
       /* a reload names a directory that was not opened before the sandbox: nothing can open it now, a restart can */
       if (open_errno == ENOTCAPABLE && atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire)) {
@@ -7112,6 +7154,13 @@ int main(int argc, char **argv) {
       free_server_config_fields(&g_config_db.config_a);
       return 1;
     }
+    /* 0.7: what the manager, the broker and the routers keep of this start (klog_aux_init()): the run user, who owns every file they append to
+     * once the hand-off below is done (they write only in role KLOG_ROLE_AUX, set after their fork), the start-up routing as the floor of
+     * the warnings and errors, and karidns.run's descriptor.  Before start_connect_broker(): the broker inherits it. */
+    uid_t log_uid;
+    gid_t log_gid;
+    resolve_log_owner(&log_uid, &log_gid);
+    klog_aux_init(log_uid);
   }
 
   // 待受ポートを実際に bind できるか確認する (実際の bind は子プロセスで行う)。
@@ -7417,14 +7466,6 @@ int main(int argc, char **argv) {
     cleanup_pid_file();
     exit(1);
   }
-  {
-    /* 0.7 M2: the files the manager and the routers append to belong to the run user now (klog_aux_append() takes no other) */
-    uid_t log_uid;
-    gid_t log_gid;
-    resolve_log_owner(&log_uid, &log_gid);
-    klog_set_aux_owner(log_uid);
-  }
-
   // beta design 1.2 step 2: the loader sockets exist before the Backend is forked
   {
     char db_err[512];
