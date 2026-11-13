@@ -64,6 +64,8 @@
 #include "dns_diag.h"
 #include "dns_pdns_reader.h"
 #include "dns_zone_lint.h"
+#include "dns_log.h"
+#undef syslog   /* this file's own syslog() calls are the real one (vlg()'s fallback); only the hook below is wanted from dns_log.h */
 
 #ifndef KARIDNS_VERSION
 #define KARIDNS_VERSION "dev"
@@ -162,6 +164,16 @@ static void lg(int prio, const char *fmt, ...) {
     va_start(ap, fmt);
     vlg(prio, 0, fmt, ap);
     va_end(ap);
+}
+
+/* 0.7 M4: with --log-stderr the messages of the shared code (dns_presigned.c, the zone parser: syslog() through dns_log.h kdns_syslog()) take
+ * the pipe as lg()'s do, so that the supervisor logs them in the `database` category; they used to go to the system log, past the logging
+ * statement.  Installed in stream mode with --log-stderr only: dump and check mode keep their output as it is. */
+static void loader_klog_hook(int cat, int prio, const char *fmt, va_list ap, int saved_errno) {
+    (void)cat;
+    char msg[1024];
+    klog_vformat(msg, sizeof(msg), fmt, ap, saved_errno);
+    lg(prio, "%s", msg);
 }
 
 /* A message at debug level `level` (1..99, BIND's convention: 1 a decision, 2 the steps of a longer operation; docs/karidns.md), written only
@@ -5578,6 +5590,7 @@ static int stream_main(int fd) {
     }
     g_stream_mode = true;
     openlog("karidns-dbloader", LOG_PID | LOG_NDELAY | (g_log_stderr ? 0 : LOG_PERROR), LOG_DAEMON);   /* (with --log-stderr syslog is only the fallback: no copy on stderr) */
+    if (g_log_stderr) klog_set_hook(loader_klog_hook);
     lgd(1, "stream mode: stream on descriptor %d, fetch stream %s, state file %s, messages %s, debug level %d", fd, g_fetch_fd >= 0 ? "yes" : "no",
         g_state_file ? g_state_file : "none", g_log_stderr ? "to stderr" : "to syslog", atomic_load_explicit(&g_debug, memory_order_relaxed));
     struct sigaction sa;

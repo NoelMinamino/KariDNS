@@ -505,10 +505,10 @@ wait_up $P2 20 || fail "S: s1 did not start"
 wait_up $P3 20 || fail "S: s2 did not start"
 M1="nosyslog-on-$$.pri.test" M2="nosyslog-off-$$.pri.test"
 query $P2 "$M1"; query $P3 "$M2"
-wait_grep "query: $M1 IN A" "$W/s1.log" 10
-grep -Eq "^KariDNS [0-9]+ - - client 127.0.0.1#[0-9]+ \($M1\.\): query: $M1 IN A" "$W/s1.log" &&
+wait_grep "query: $M1. IN A" "$W/s1.log" 10
+grep -Eq "^KariDNS [0-9]+ - - client 127\.0\.0\.1#[0-9]+ \($M1\.\): query: $M1\. IN A" "$W/s1.log" &&
     pass "S: KARIDNS_NOSYSLOG=1: the syslog line is on stderr as LOG_PERROR prints it (KariDNS <pid> - - <text>)" || { fail "S: s1.log"; tail -5 "$W/s1.log"; }
-wait_grep "query: $M2 IN A" "$W/s2.log" 10 && pass "S: without it the stderr copy is there too" || fail "S: s2.log"
+wait_grep "query: $M2. IN A" "$W/s2.log" 10 && pass "S: without it the stderr copy is there too" || fail "S: s2.log"
 if [ -z "$SYSLOGS" ]; then
     echo "SKIP: S: no system log file to read"
 else
