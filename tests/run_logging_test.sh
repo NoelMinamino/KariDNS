@@ -14,7 +14,8 @@
 #   X  controls { inet ...; } and statistics-channels in a running server: accepted with a warning, karictl works, a controls error rejects a reload
 #   D  the debug level in force (0.7): karicheck conf creates no karidns.run; with options { directory } and no logging statement karidns.run is
 #      created empty at the start (and handed to the run user), written only above level 0; karictl trace / trace <n> / notrace and their
-#      errors, karictl status "debug level: N", the permission `trace` of a restricted key (and its refusal for a read-only key); karidns -d N
+#      errors, karictl status "debug level: N", the permission `trace` of a restricted key (and its refusal for a read-only key); a reload
+#      keeps writing to karidns.run (the start's descriptor) and does not make a removed one again; karidns -d N
 #      (and its errors) with a `severity dynamic` channel that starts and stops writing the debug 3 lines of query-errors with the level
 #   S  KARIDNS_NOSYSLOG=1 (exported by lib_proc.sh): the syslog lines on stderr only, as LOG_PERROR prints them; without it they reach the
 #      system log (read where the host keeps daemon.info lines; SKIP otherwise)
@@ -438,16 +439,18 @@ out=$(ctlk ro d1 notrace); rc=$?
 [ $rc -eq 3 ] && pass "D: ... nor notrace" || fail "D: ro notrace: rc $rc: $out"
 ctl d1 status | grep -q '^debug level: 0$' && pass "D: the refused trace did not change the level" || fail "D: level after the ro refusal"
 wait_grep 'key "ro": refused: trace' "$W/d1.log" 5 && pass "D: the refusal is logged with the key name" || fail "D: no refusal line in d1.log"
-# a reload opens karidns.run again.  Removed meanwhile: an ordinary user's server makes it again; as root the sandboxed process runs as nobody
-# and cannot create it in root's directory: a warning, and the reload is not refused for it
+# 0.7: a reload keeps the descriptor of karidns.run that the start opened (the sandboxed process holds no writable descriptor of options
+# { directory }, so it never opens the file by name): the lines after a reload still reach it, without a warning
+out=$(ctl d1 reload); rc=$?
+ctl d1 trace 2 > /dev/null
+wait_grep '\[Control\] debug level is now 2$' "$RUN" 10
+[ $rc -eq 0 ] && [ "$(grep -c 'debug level is now 2$' "$RUN")" -ge 2 ] && ! grep -q 'default_debug) is not used' "$W/d1.log" &&
+    pass "D: after a reload karidns.run still receives the lines ($out)" || { fail "D: karidns.run after a reload: rc $rc: $out"; tail -5 "$RUN"; }
+# removed meanwhile: a reload does not make it again (nothing opens it by name after the start); a restart does
 rm -f "$RUN"
 out=$(ctl d1 reload); rc=$?
-if [ -n "$USER_OPT" ]; then
-    [ $rc -eq 0 ] && wait_grep "The debug file '$RUN' (built-in channel default_debug) is not used: Permission denied" "$W/d1.log" 5 && [ ! -e "$RUN" ] &&
-        pass "D: a karidns.run that the run user cannot create does not stop a reload ($out); a warning says so" || { fail "D: reload without karidns.run: rc $rc: $out"; ls -l "$DD"; }
-else
-    [ $rc -eq 0 ] && [ -f "$RUN" ] && pass "D: a reload opens karidns.run again ($out)" || { fail "D: reload without karidns.run: rc $rc: $out"; ls -l "$DD"; }
-fi
+[ $rc -eq 0 ] && [ ! -e "$RUN" ] && pass "D: a removed karidns.run does not stop a reload and is not made again by it ($out)" ||
+    { fail "D: reload without karidns.run: rc $rc: $out"; ls -l "$DD"; }
 stop $D1PID
 
 # karidns -d: the level from the start; a bad level is a usage error (exit 2, nothing started)
