@@ -797,10 +797,23 @@ static void run_pass(void) {
                 log_job(j, "resolved again");
                 j->logged_fail = false;
             }
+            if (logev_wanted(LOGC_GENERAL, 2)) {      /* 0.7 M3, debug 2: when the next refresh is and why */
+                char t[1100];
+                name_text(j->name, j->nlen, t, sizeof(t));
+                logev_post(LOGC_GENERAL, 2, NULL, 0, "[Alias] ALIAS target '%.200s' (%s): %d record(s), TTL %u; next refresh in %lld s (two thirds of the TTL, at least %d)", t,
+                           j->qtype == 1 ? "A" : "AAAA", (int)p.n, (unsigned)p.ttl, (long long)(j->next_try - now), ALIAS_MIN_REFRESH);
+            }
             g_changed = true;
         } else {
             j->fails++;
             j->next_try = now + retry_delay(j->fails);
+            if (logev_wanted(LOGC_GENERAL, 1)) {      /* 0.7 M3, debug 1: every failure, with the retry (the WARNING is said once per episode) */
+                char t[1100];
+                name_text(j->name, j->nlen, t, sizeof(t));
+                logev_post(LOGC_GENERAL, 1, NULL, 0, "[Alias] ALIAS target '%.200s' (%s): %s (failure %u); next try in %lld s%s", t, j->qtype == 1 ? "A" : "AAAA",
+                           rc == 2 ? "no resolver of the set answered" : rc != 0 ? "the query failed" : "the answer is an error", (unsigned)j->fails,
+                           (long long)(j->next_try - now), rc == 2 ? ", the whole resolver set waits" : "");
+            }
             if (rc == 2) g_rset_dead[j->rset] = now + ALIAS_DEAD_SECS;
             if (!j->logged_fail) {
                 log_job(j, j->have ? "cannot refresh, the last result is served for a while" : "cannot resolve, the name answers SERVFAIL");

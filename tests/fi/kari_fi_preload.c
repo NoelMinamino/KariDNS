@@ -430,6 +430,21 @@ pid_t setsid(void) {
     return real_fn ? real_fn() : -1;
 }
 
+/* the control socket's owner and allow-group mode (tests/run_startup_refused_cleanup_test.sh) */
+int fchownat(int fd, const char *path, uid_t owner, gid_t group, int flag) {
+    int err = 0, noop = 0;
+    if (check_and_trigger_fi("fchownat", &err, &noop)) { errno = err; return -1; }
+    FI_REAL(int, fchownat, (int, const char *, uid_t, gid_t, int));
+    return real_fn ? real_fn(fd, path, owner, group, flag) : -1;
+}
+
+int fchmodat(int fd, const char *path, mode_t mode, int flag) {
+    int err = 0, noop = 0;
+    if (check_and_trigger_fi("fchmodat", &err, &noop)) { errno = err; return -1; }
+    FI_REAL(int, fchmodat, (int, const char *, mode_t, int));
+    return real_fn ? real_fn(fd, path, mode, flag) : -1;
+}
+
 ssize_t sendmsg(int s, const struct msghdr *msg, int flags) {
     int err = 0, noop = 0;
     if (check_and_trigger_fi("sendmsg", &err, &noop)) { errno = err; return -1; }

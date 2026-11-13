@@ -864,6 +864,16 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
       }
       continue;
     }
+    {
+      /* debug 10: one line per record of the zone (the stream of the database loader goes to its own category) */
+      const int rcat = session->db_stream ? LOGC_DATABASE : LOGC_XFER_IN;
+      if (logev_wanted(rcat, 10)) {
+        char rn[DNS_NAME_TEXT_SIZE];
+        logev_name_text(rec->name ? rec->name : "", rn, sizeof(rn));
+        logev_post(rcat, 10, NULL, 0, "[AXFR] zone '%s': record %s type %u ttl %u (%s)", domain, rn, (unsigned)type, rec->ttl_value,
+                   session->is_ixfr && session->is_deleting ? "IXFR deletion" : session->is_ixfr && session->soa_count >= 2 ? "IXFR addition" : "taken");
+      }
+    }
     if (session->has_current_loc_tag && session->current_loc_tag[0] != '\0') {
       rec->bind_location_tag = arena_strdup(standby, session->current_loc_tag);
     }
@@ -1143,6 +1153,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
   size_t unsigned_msgs_cap = 0;
   unsigned unsigned_run = 0;     /* I2: unsigned messages since the last signed one (RFC 8945 §5.3.1: at most 99) */
   uint64_t total_bytes = 0;      /* I2: octets of the messages read so far (session->max_bytes) */
+  unsigned nmsgs = 0;            /* messages taken (the debug 3 line of each) */
 
   uint32_t cur_rcvtimeo = 0;  /* max-transfer-time-in / max-transfer-idle-in: the SO_RCVTIMEO now set (0 = none set by this loop) */
   stream_ctx->read_deadline = session->deadline;   /* read_dns_tcp_message() checks it between the recv() calls of one message too */
@@ -1265,6 +1276,12 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
       zone_arena_destroy(&tmp_arena);
       return -1;
     }
+    nmsgs++;
+    if (logev_wanted(LOGC_XFER_IN, 3))
+      logev_post(LOGC_XFER_IN, 3, NULL, 0, "[AXFR] zone '%s': message %u: %u octets, %u answer RR(s), %s, %zu record(s) held%s", entry->domain, nmsgs,
+               (unsigned)msg_len, msg_len >= DNS_HEADER_SIZE ? (unsigned)((msg[6] << 8) | msg[7]) : 0u,
+               !tsig_key ? "no TSIG" : packet_has_tsig(msg, msg_len) ? "TSIG verified" : "unsigned (TSIG on a later message)", tmp_arena.count,
+               session->is_finished ? ", final SOA seen" : "");
     if (session->max_records && (uint64_t)tmp_arena.count > session->max_records) {
       /* I2: the zone being built (after an IXFR's deletions were applied) has more RRs than the zone may have */
       syslog(LOG_ERR, "[AXFR] zone '%s': rejecting transfer: more than %llu records (max-zone-records)", entry->domain,
@@ -1328,6 +1345,8 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
           return -1;
         }
 
+        logev_post(LOGC_XFER_IN, 2, NULL, 0, "[AXFR] zone '%s': %s complete: %u message(s), %llu octets, %zu record(s), serial %u; installing", entry->domain,
+                   session->is_ixfr ? "IXFR" : "AXFR", nmsgs, (unsigned long long)total_bytes, tmp_arena.count, serial);
         /* batch 7: a zone over max-records & co. is refused here, before the serial and the timers of the zone are replaced (zone_limits_gate()) */
         if (zone_limits_gate(entry, &tmp_arena, "XFR") != 0) {
           if (unsigned_msgs) free(unsigned_msgs);
@@ -1748,6 +1767,9 @@ static int xfr_try_primary_with(void *arg, int idx, tsig_key_t *kst) {
   if (!ctx_request_ixfr(ctx, p) && active_serial != 0) {
     /* request-ixfr no: SOA first, and the AXFR only when the primary is ahead */
     int pr = xfr_soa_probe(ctx, p, &master_addr, domain_family, tsig_key_ptr, active_serial, &session);
+    logev_post(LOGC_XFER_IN, 1, NULL, 0, "[AXFR] zone %s: request-ixfr no: SOA query to primary %s: %s (theirs %u, ours %u)", ctx->domain, p->ip,
+               pr == XFR_R_UPTODATE ? "up to date" : pr == XFR_R_BEHIND ? "the primary is behind" : pr == XFR_R_FAILED ? "failed" : "newer, transferring the whole zone",
+               session.initial_soa_serial, active_serial);
     if (pr == XFR_R_UPTODATE) {
       pthread_mutex_lock(&ctx->entry->writer_lock);
       xfr_note_uptodate(ctx->entry, &session);
@@ -1775,6 +1797,11 @@ static int xfr_try_primary_with(void *arg, int idx, tsig_key_t *kst) {
   uint8_t ext_state = ctx->entry ? xfr_ext_effective(ctx->entry->xfr_ext_state, ctx->entry->xfr_ext_set, ext_now) : XFR_EXT_UNKNOWN;
   uint8_t ext_ver = p->no_edns ? 0 : xfr_ext_request_version(ext_state);   /* edns no: no OPT, so no Extended AXFR either */
   uint32_t ixfr_serial = probed_newer ? 0 : active_serial;   /* the SOA said the primary is ahead: the whole zone (request-ixfr no) */
+  /* (the key's name only, never its secret) */
+  logev_post(LOGC_XFER_IN, 1, NULL, 0, "[AXFR] zone %s: asking primary %s#%d (%d of %d) for %s (our serial %u%s), %s%s, Extended AXFR version %u",
+             ctx->domain, p->ip, p->port > 0 ? p->port : 53, idx + 1, ctx->nprim, ixfr_serial ? "IXFR" : "AXFR", active_serial,
+             ixfr_serial ? "" : active_serial ? ", request-ixfr no" : ", no version yet", p->has_tsig ? "TSIG key " : "no TSIG",
+             p->has_tsig ? p->tsig_name : "", (unsigned)ext_ver);
   axfr_res = xfr_attempt(ctx, p, &master_addr, domain_family, ext_ver, ext_ver && xfr_ext_probe(ext_state), tsig_key_ptr, ixfr_serial, &session);
   if (axfr_res < 0 && session.no_ext_answer) {
     syslog(LOG_NOTICE, "[AXFR] zone %s: %s answered a version 3 request with a standard transfer; asking with version 2", ctx->domain, p->ip);
@@ -1807,7 +1834,8 @@ static int xfr_try_primary_with(void *arg, int idx, tsig_key_t *kst) {
     return XFR_R_TRANSFERRED;
   }
   if (axfr_res == 2) {
-    // Zone is up to date. Do not log to avoid spam on short refresh intervals.
+    // Zone is up to date. Do not log to avoid spam on short refresh intervals.  (debug 1: say it)
+    logev_post(LOGC_XFER_IN, 1, NULL, 0, "[AXFR] zone %s: primary %s has our serial %u: up to date", ctx->domain, p->ip, active_serial);
     return XFR_R_UPTODATE;
   }
   if (session.serial_behind) {
@@ -1837,6 +1865,8 @@ void *axfr_bg_thread_func(void *arg) {
    * a transfer ends the refresh) */
   xfr_run_t run;
   xfr_run_primaries(ctx->nprim, xfr_try_primary, ctx, &run);
+  logev_post(LOGC_XFER_IN, 1, NULL, 0, "[AXFR] zone %s: refresh done: %d of %d primary(ies) asked, transferred from #%d (0: none), up to date %d, behind %d, failed %d, deferred by quota %d",
+             ctx->domain, run.tried, ctx->nprim, run.transferred_idx + 1, run.uptodate, run.behind, run.failed, run.deferred);
   if (ctx->entry) {
     /* karictl stats / alerts transfer-failures-above: the refresh failed at every primary that was asked (an up-to-date or "behind" answer is not a failure) */
     if (run.tried > 0 && run.failed == run.tried) {
@@ -1899,6 +1929,9 @@ static void axfr_count_sent(axfr_emit_ctx_t *ec, uint16_t answers, size_t len) {
   ec->nmsgs++;
   ec->nrecs += answers;
   ec->nbytes += len;
+  /* 0.7 M3, debug 3: one line per message sent */
+  logev_post(LOGC_XFER_OUT, 3, NULL, 0, "[AXFR] zone '%s': message %u sent: %u RR(s), %zu octets%s", ec->domain ? ec->domain : "", (unsigned)ec->nmsgs, (unsigned)answers, len,
+             ec->tsig_key ? ", TSIG in use" : "");
 }
 
 /* One RR to send: a builder record (IXFR history, KariDNS markers) or RR `rr` of a zone image (S5 B-2: the zone itself) */
@@ -2530,6 +2563,11 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
   const char *const mn = incremental ? "IXFR" : is_extended_axfr ? "Extended AXFR" : ixfr_asked ? "AXFR-style IXFR" : "AXFR";
   struct timespec t0;
   clock_gettime(CLOCK_MONOTONIC, &t0);
+  /* 0.7 M3, debug 1: what the answer will be, and from what (the history of differences kept for the zone, ixfr-history) */
+  xfr_log(1, cip, cport, entry->domain, "%s asked (client serial %u, ours %u): answering with %s, %d difference(s) of the history; %s%s%s", ixfr_asked ? "IXFR" : "AXFR",
+          (unsigned)client_serial, (unsigned)current_serial, ixfr_asked && client_up_to_date ? "the SOA alone (up to date)" : mn, txn_count,
+          is_extended_axfr ? "Extended AXFR version " : "standard format", is_extended_axfr ? (ext_ver >= 3 ? "3" : "2") : "",
+          one_answer ? ", one RR per message (transfer-format one-answer)" : "");
   if (ixfr_asked && client_up_to_date)
     xfr_log(1, cip, cport, entry->domain, "IXFR poll up to date (serial %u)%s%s", (unsigned)current_serial, tsig_key && tsig_key->name ? ": TSIG " : "",
             tsig_key && tsig_key->name ? tsig_key->name : "");

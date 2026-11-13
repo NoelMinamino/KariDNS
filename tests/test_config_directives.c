@@ -1310,6 +1310,13 @@ static void test_control_keys(void) {
         CHECK_STR(cfg.control.keys[0].algorithm, "hmac-sha512");
         free_server_config_fields(&cfg);
     }
+    /* 0.7: allow-commands { trace; } (trace and notrace); a key without allow-commands: a full key has it, a read-only key does not */
+    snprintf(txt, sizeof(txt), CK_KEYS "control-channel { keys { \"web\" read-only yes allow-commands { trace; }; \"admin\"; }; };");
+    if (parse_ok(txt, &cfg)) {
+        CHECK(cfg.control.nkeys == 2 && cfg.control.keys[0].perm == (CTLP_READ | CTLP_TRACE));
+        CHECK((cfg.control.keys[1].perm & CTLP_TRACE) != 0);
+        free_server_config_fields(&cfg);
+    }
     snprintf(txt, sizeof(txt), CK_KEYS "control-channel { keys { }; };");
     if (parse_ok(txt, &cfg)) { CHECK(cfg.control.enabled && cfg.control.nkeys == 0 && cfg.control.keys == NULL); free_server_config_fields(&cfg); }
     snprintf(txt, sizeof(txt), CK_KEYS "control-channel { keys { \"admin\"; }; keys { \"web\" read-only yes; }; };");
@@ -1334,7 +1341,9 @@ static void test_control_keys(void) {
     expect_an_error("allow-commands with read-only no", CK_KEYS "control-channel { keys { \"web\" read-only no allow-commands { stop; }; }; };",
                     "allow-commands needs 'read-only yes'");
     expect_an_error("unknown command", CK_KEYS "control-channel { keys { \"web\" read-only yes allow-commands { restart; }; }; };",
-                    "allow-commands: 'restart' is not a command that can be allowed");
+                    "allow-commands: 'restart' is not a command that can be allowed|retransfer, rollback, trace;");
+    expect_an_error("notrace is not a name (trace allows both)", CK_KEYS "control-channel { keys { \"web\" read-only yes allow-commands { notrace; }; }; };",
+                    "'notrace' is not a command that can be allowed");
     expect_an_error("test-only command", CK_KEYS "control-channel { keys { \"web\" read-only yes allow-commands { evict; }; }; };",
                     "'evict' is not a command that can be allowed");
     expect_an_error("read-only command in allow-commands", CK_KEYS "control-channel { keys { \"web\" read-only yes allow-commands { status; }; }; };",
@@ -1369,8 +1378,11 @@ static void test_control_keys(void) {
     CHECK(control_command_perm("evict", true) == CTLP_OTHER && control_command_perm("xfr-fail", true) == CTLP_OTHER);
     CHECK(control_command_perm("", false) == CTLP_OTHER && control_command_perm("bogus", true) == CTLP_OTHER && control_command_perm(NULL, false) == CTLP_OTHER);
     CHECK(control_command_perm("RELOAD", false) == CTLP_OTHER);          /* the server compares the command case-sensitively: so does the permission */
+    CHECK(control_command_perm("trace", false) == CTLP_TRACE && control_command_perm("trace", true) == CTLP_TRACE);   /* 0.7 */
+    CHECK(control_command_perm("notrace", false) == CTLP_TRACE && control_command_perm("TRACE", true) == CTLP_OTHER);
+    CHECK((CTLP_FULL & CTLP_TRACE) != 0 && (CTLP_FULL & CTLP_OTHER) != 0 && (CTLP_READ & CTLP_TRACE) == 0);
     /* a full key reaches every class, a read-only key only the read-only commands and what allow-commands added */
-    const char *cmds[] = { "reload", "reconfig", "stop", "notify", "retransfer", "rollback", "status", "zonestatus", "evict", "bogus" };
+    const char *cmds[] = { "reload", "reconfig", "stop", "notify", "retransfer", "rollback", "status", "zonestatus", "evict", "bogus", "trace", "notrace" };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
         CHECK((CTLP_FULL & control_command_perm(cmds[i], true)) != 0);
         CHECK((CTLP_FULL & control_command_perm(cmds[i], false)) != 0);
@@ -1380,7 +1392,7 @@ static void test_control_keys(void) {
     CHECK(control_perm_from_name("reload") == CTLP_RELOAD && control_perm_from_name("reload-zone") == CTLP_RELOAD_ZONE);
     CHECK(control_perm_from_name("reconfig") == CTLP_RECONFIG && control_perm_from_name("stop") == CTLP_STOP);
     CHECK(control_perm_from_name("notify") == CTLP_NOTIFY && control_perm_from_name("retransfer") == CTLP_RETRANSFER);
-    CHECK(control_perm_from_name("rollback") == CTLP_ROLLBACK);
+    CHECK(control_perm_from_name("rollback") == CTLP_ROLLBACK && control_perm_from_name("trace") == CTLP_TRACE && control_perm_from_name("notrace") == 0);
     CHECK(control_perm_from_name("status") == 0 && control_perm_from_name("evict") == 0 && control_perm_from_name("") == 0 && control_perm_from_name(NULL) == 0);
 }
 
@@ -3379,6 +3391,7 @@ static void test_bind_compat_paths(void) {
         const log_channel_t *ac = find_channel(&cfg, "a");
         CHECK(ac && ac->file_path && strcmp(ac->file_path, "/abs/a.log") == 0);
         CHECK_STR(cfg.control.socket_path, "ctl.sock");   /* sockets are not prefixed: sun_path is short; the server chdir()s to directory */
+        CHECK_STR(cfg.logging.debug_file, "/var/named/karidns.run");   /* 0.7: the file of the built-in default_debug */
         free_server_config_fields(&cfg);
     }
     /* "none" for pid-file is not a path */
@@ -3390,6 +3403,7 @@ static void test_bind_compat_paths(void) {
     if (parse_ok("options { pid-file \"run/k.pid\"; };\nzone \"example\" { type primary; file \"db.example\"; };", &cfg)) {
         CHECK(cfg.directory == NULL);
         CHECK_STR(cfg.pid_file, "run/k.pid");
+        CHECK(cfg.logging.debug_file == NULL);              /* no directory: no karidns.run */
         const zone_config_t *z = first_zone(&cfg);
         if (z) CHECK_STR(z->file, "db.example");
         free_server_config_fields(&cfg);
@@ -3397,6 +3411,7 @@ static void test_bind_compat_paths(void) {
     /* a relative directory is kept as written (relative to the startup directory) */
     if (parse_ok("options { directory \"named\"; };\nzone \"example\" { type primary; file \"db.example\"; };", &cfg)) {
         CHECK_STR(cfg.directory, "named");
+        CHECK_STR(cfg.logging.debug_file, "named/karidns.run");
         const zone_config_t *z = first_zone(&cfg);
         if (z) CHECK_STR(z->file, "named/db.example");
         free_server_config_fields(&cfg);

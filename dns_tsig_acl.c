@@ -402,6 +402,17 @@ void tsig_check_request(const server_config_t *cfg, const char *view_name, const
                         tsig_request_t *t) {
     tsig_check_request_nolog(cfg, view_name, req, req_len, t);
     tsig_log_request_error(t, client_ip);
+    /* 0.7 M3, debug 3 (one line per signed message): the key name, the algorithm and the time values of the check, never the secret or a MAC.
+     * An unsigned message (TSIG_REQ_NONE) costs nothing here, not even the atomic load. */
+    if (t->status != TSIG_REQ_NONE && logev_wanted(LOGC_SECURITY, 3)) {
+        char kn[300], an[64];
+        logev_name_text(t->status == TSIG_REQ_FORMERR ? "?" : t->key_name, kn, sizeof(kn));
+        logev_name_text(t->status == TSIG_REQ_FORMERR ? "?" : t->alg_name, an, sizeof(an));
+        long long skew = t->status == TSIG_REQ_FORMERR ? 0 : (long long)time(NULL) - (long long)t->time_signed;
+        logev_post(LOGC_SECURITY, 3, client_ip, 0, "[TSIG] key '%s' algorithm %s view '%s': %s (time signed %llu, fudge %u, our clock %+lld s)", kn, an,
+                   view_name ? view_name : "", t->status == TSIG_REQ_VALID ? "verified" : t->status == TSIG_REQ_FORMERR ? "TSIG record cannot be parsed (FORMERR)" :
+                   tsig_error_name(t->error), t->status == TSIG_REQ_FORMERR ? 0ULL : (unsigned long long)t->time_signed, t->status == TSIG_REQ_FORMERR ? 0u : (unsigned)t->fudge, skew);
+    }
 }
 
 size_t tsig_response_reserve(const tsig_request_t *t) {
@@ -795,17 +806,21 @@ bool zone_notify_acl_allows(const server_config_t *cfg, const zone_config_t *zon
     return aml_allows(l, &s);
 }
 
-bool zone_transfer_acl_allows_in_view(const server_config_t *cfg, const zone_config_t *zcfg, const char *view_name,
-                                      const char *client_ip, const char *key_name) {
-    if (!zcfg || !client_ip) return false;
+/* (0.7 M3) what decided, for the debug 1 line of zone_transfer_acl_allows_in_view() */
+static bool transfer_acl_decide(const server_config_t *cfg, const zone_config_t *zcfg, const char *view_name, const char *client_ip,
+                                const char *key_name, const char **why) {
     const zone_ext_t *x = zext(zcfg);
     /* the flat lists of a database zone, of settings received from a primary and of a zone built by hand are evaluated as before */
     /* (a list of the in-view zone itself, in-view-settings view, decides before any of them) */
     bool flat_own = (x->allow_transfer_count > 0 || x->tsig_keys_count > 0) && !x->acl.transfer;
-    if (!acl_in_view_own(cfg, zcfg, view_name, AML_ACL_TRANSFER) && (x->db_acl_ceiling || flat_own)) return zone_transfer_acl_allows(cfg, zcfg, client_ip, key_name);
+    if (!acl_in_view_own(cfg, zcfg, view_name, AML_ACL_TRANSFER) && (x->db_acl_ceiling || flat_own)) {
+        *why = x->db_acl_ceiling ? "the zone's database ACL and the acl-ceiling" : "the zone's own address and key lists";
+        return zone_transfer_acl_allows(cfg, zcfg, client_ip, key_name);
+    }
     const aml_t *l = config_acl_for(cfg, zcfg, view_name, AML_ACL_TRANSFER);
     aml_subject_t s;
     uint8_t b[16];
+    *why = "a client address that cannot be parsed";
     if (!aml_subject_from_ip(&s, b, client_ip, key_name)) return false;
     /* the zone's tsig-key has always been a key that may transfer (a file zone), and with addresses in the list a request had to carry
      * one of the keys as well (address AND key).  That is not something BIND's lists say, so it is left as it was: the order of the
@@ -815,18 +830,37 @@ bool zone_transfer_acl_allows_in_view(const server_config_t *cfg, const zone_con
     bool zk_signed = zk && key_name && tsig_key_names_equal(key_name, zk);
     if (x->transfer_acl_match == ACL_MATCH_DEFAULT) {
         int m = l ? aml_match(l, &s) : 0;
+        *why = !l ? "no allow-transfer list" : m > 0 ? "a positive element of allow-transfer" : m < 0 ? "a negated element of allow-transfer"
+                                                                                                    : "no element of allow-transfer matched";
         if (!zk) return m > 0;
-        if (l && l->has_addr) return m > 0 && (zk_signed || aml_key_listed(l, key_name));
+        if (l && l->has_addr) {
+            if (m > 0 && !(zk_signed || aml_key_listed(l, key_name))) *why = "allow-transfer with addresses and the zone's tsig-key: the request is not signed with one of the keys";
+            return m > 0 && (zk_signed || aml_key_listed(l, key_name));
+        }
+        if (m <= 0 && zk_signed) *why = "the zone's tsig-key";
         return m > 0 || zk_signed;
     }
     bool has_acl = l && l->has_addr;
     bool has_keys = (l && l->has_key) || zk;
     bool acl_ok = has_acl && aml_allows_addr(l, &s);
     bool key_ok = zk_signed || (l && aml_key_listed(l, key_name));
+    *why = x->transfer_acl_match == ACL_MATCH_ANY ? "transfer-acl-match any (address or key)" : "transfer-acl-match all (address and key)";
     if (has_acl && has_keys) return x->transfer_acl_match == ACL_MATCH_ANY ? (acl_ok || key_ok) : (acl_ok && key_ok);
     if (has_acl) return acl_ok;
     if (has_keys) return key_ok;
+    *why = "transfer-acl-match with neither addresses nor keys";
     return false;
+}
+
+bool zone_transfer_acl_allows_in_view(const server_config_t *cfg, const zone_config_t *zcfg, const char *view_name,
+                                      const char *client_ip, const char *key_name) {
+    if (!zcfg || !client_ip) return false;
+    const char *why = "";
+    bool ok = transfer_acl_decide(cfg, zcfg, view_name, client_ip, key_name, &why);
+    /* (a worker thread posts it into its ring; the key is a configured one, by name) */
+    logev_post(LOGC_XFER_OUT, 1, client_ip, 0, "transfer of '%s' (view '%s'): %s by %s%s%s", zcfg->domain ? zcfg->domain : "", view_name ? view_name : "",
+               ok ? "allowed" : "refused", why, key_name ? ", request signed with key " : ", unsigned request", key_name ? key_name : "");
+    return ok;
 }
 
 bool zone_update_acl_allows_in_view(const server_config_t *cfg, const zone_config_t *zcfg, const char *view_name,

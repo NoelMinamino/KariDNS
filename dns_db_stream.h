@@ -122,6 +122,8 @@
  *                     one list_id; a part that does not follow the one before (or a new list_id) starts the list again.  The loader merges the list
  *                     with what it has (the zones of the old list that nobody asked for since stay after the new ones), writes the state file when
  *                     the last part has come, and answers with HOT_ACK.  The entries are untrusted input of the loader: counts, names and views are checked.
+ *   DEBUG (0x8009)    0.7 M2, first stream only: 1 level u8 R (<= 99): the debug level in force (karictl trace / notrace), sent after the CONFIG of
+ *                     every handshake and at every change; the loader logs its messages up to that level (karidns-dbloader --debug at its start)
  *
  * The fetch stream (D1a, design 6.1) is a second KDB1 stream, made by the supervisor with the first.  It carries only what a
  * parked query waits for: FETCH_REQ from the Backend; from the loader, ZONE_BEGIN .. ZONE_DATA .. ZONE_END / ZONE_ABORT (PROFILE
@@ -163,7 +165,8 @@ enum {
     KDB_T_CONFIG = 0x8001, KDB_T_RELOAD_REQ = 0x8002, KDB_T_INVENTORY = 0x8003, KDB_T_INVENTORY_END = 0x8004,
     KDB_T_ZONE_RESULT = 0x8005, KDB_T_BATCH_RESULT = 0x8006,
     KDB_T_FETCH_REQ = 0x8007,           /* D1a: fetch stream */
-    KDB_T_HOT_LIST = 0x8008             /* D1a step 7: the zones most asked for (first stream) */
+    KDB_T_HOT_LIST = 0x8008,            /* D1a step 7: the zones most asked for (first stream) */
+    KDB_T_DEBUG = 0x8009                /* 0.7 M2: the debug level in force (first stream) */
 };
 
 enum { KDB_FETCH_PRIO_QUERY = 0, KDB_FETCH_PRIO_WARM, KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_PRIO_N };
@@ -317,6 +320,7 @@ typedef struct {
     const uint8_t *body; uint32_t body_len;       /* for kdb_hot_entries() */
 } kdb_hot_list_t;
 typedef struct { uint64_t list_id; uint8_t status; uint32_t zones; kdb_str_t error; } kdb_hot_ack_t;
+typedef struct { uint8_t level; } kdb_debug_t;
 typedef struct {
     uint64_t request_id; uint16_t view; char name[DNS_NAME_TEXT_SIZE]; uint8_t priority, mode;
     bool has_range; char range_lo[DNS_NAME_TEXT_SIZE], range_hi[DNS_NAME_TEXT_SIZE];
@@ -331,7 +335,7 @@ typedef struct {
         kdb_zone_delete_t zone_delete; kdb_profile_t profile; kdb_batch_end_t batch_end; kdb_auto_status_t auto_status;
         kdb_config_t config; kdb_reload_req_t reload_req; kdb_inventory_t inventory;
         kdb_inventory_end_t inventory_end; kdb_zone_result_t zone_result; kdb_batch_result_t batch_result;
-        kdb_fetch_req_t fetch_req; kdb_hot_list_t hot_list; kdb_hot_ack_t hot_ack;
+        kdb_fetch_req_t fetch_req; kdb_hot_list_t hot_list; kdb_hot_ack_t hot_ack; kdb_debug_t debug;
     } u;
 } kdb_msg_t;
 

@@ -91,6 +91,9 @@ N=$(grep -c "the SOA serial is 0" "$DBLOG")
 grep -q "the SOA serial is 0" "$T/a.log" && fail "the message is also on the server's own stderr / syslog copy" || pass "no second copy through syslog"
 grep -q "karidns-dbloader\[" "$T/a.log" && fail "the loader wrote to syslog itself" || pass "the loader did not use syslog"
 grep -q "database: info: \[DB\] loader connected" "$DBLOG" && pass "the Backend's own [DB] messages go to the same category" || fail "no Backend [DB] line in the file"
+# 0.7 M4: a message of the code the loader shares with the server (the NSEC3PARAM of example.com, dns_presigned.c) takes the pipe too, not syslog
+kari_wait_log "$DBLOG" "database: notice: \[DB\] \[Zone\] example.com.: using NSEC3PARAM" 10 &&
+    pass "a message of the shared zone code is in the database category ([DB] [Zone] ...)" || { fail "no [Zone] line of the loader in $DBLOG"; grep -i nsec3param "$DBLOG"; }
 file_answers && pass "the file zone answers" || fail "the file zone does not answer"
 stop_srv
 

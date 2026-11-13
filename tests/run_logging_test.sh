@@ -12,6 +12,13 @@
 #   Q  querylog yes / no, the queries category, queries to syslog when no channel is named, karictl status; rolling inside the sandbox
 #      (size 3k versions 2), size without versions (the file stops), versions unlimited
 #   X  controls { inet ...; } and statistics-channels in a running server: accepted with a warning, karictl works, a controls error rejects a reload
+#   D  the debug level in force (0.7): karicheck conf creates no karidns.run; with options { directory } and no logging statement karidns.run is
+#      created empty at the start (and handed to the run user), written only above level 0; karictl trace / trace <n> / notrace and their
+#      errors, karictl status "debug level: N", the permission `trace` of a restricted key (and its refusal for a read-only key); a reload
+#      keeps writing to karidns.run (the start's descriptor) and does not make a removed one again; karidns -d N
+#      (and its errors) with a `severity dynamic` channel that starts and stops writing the debug 3 lines of query-errors with the level
+#   S  KARIDNS_NOSYSLOG=1 (exported by lib_proc.sh): the syslog lines on stderr only, as LOG_PERROR prints them; without it they reach the
+#      system log (read where the host keeps daemon.info lines; SKIP otherwise)
 # Runs as root or as an ordinary user (the log directory is world-writable for the run user "nobody").
 # ==============================================================================
 set -u
@@ -50,9 +57,9 @@ fail() { echo "FAIL: $*"; FAILS=$((FAILS + 1)); }
 cleanup() {
     set +e
     kari_kill_tree $PIDS
-    for n in c1 q1 q2 q3 q4 x1; do kari_kill_conf "$W/$n.conf"; done
+    for n in c1 q1 q2 q3 q4 x1 d1 d2 s1 s2; do kari_kill_conf "$W/$n.conf"; done
     if [ "$FAILS" -ne 0 ]; then
-        for f in c1 q1 q2 q3 q4 x1; do echo "--- $f.log (tail)"; tail -25 "$W/$f.log" 2>/dev/null; done
+        for f in c1 q1 q2 q3 q4 x1 d1 d2 s1 s2; do echo "--- $f.log (tail)"; tail -25 "$W/$f.log" 2>/dev/null; done
     fi
     if [ -n "${KARI_KEEP_TMP:-}" ]; then echo "kept: $W"; else rm -rf "$W"; fi
 }
@@ -80,8 +87,9 @@ wait_up() { # PORT [SECONDS] : the server answers
     done
     return 1
 }
-start() { # start NAME : karidns in the foreground on $W/NAME.conf, its stdout / stderr in $W/NAME.log
-    "$KARIDNS" -f "$W/$1.conf" > "$W/$1.log" 2>&1 &
+start() { # start NAME [karidns options] : karidns in the foreground on $W/NAME.conf, its stdout / stderr in $W/NAME.log
+    _n=$1; shift
+    "$KARIDNS" "$@" -f "$W/$_n.conf" > "$W/$_n.log" 2>&1 &
     PIDS="$PIDS $!"
     LAST_PID=$!
 }
@@ -352,6 +360,171 @@ ctl x1 reload > "$W/xreload.out"
 if grep -q "ERROR" "$W/xreload.out"; then pass "X: a controls statement with an unknown key rejects the reload"; else fail "X: reload accepted an unknown controls key"; cat "$W/xreload.out"; fi
 query $P3 www.pri.test && pass "X: the server keeps answering with the old configuration" || fail "X: the server is not answering"
 stop $X1PID
+
+# ------------------------------------------------------------------------------------------------ D: the debug level in force (0.7)
+DD="$W/dir"           # options { directory }: karidns.run is made here (by the start, as root before the privileges are dropped)
+mkdir "$DD"
+chmod 755 "$DD"
+RUN="$DD/karidns.run"
+TRSECRET="dHJhY2Uta2V5LWZvci10aGUtbG9nZ2luZy10ZXN0LTE="
+ROSECRET="cm8ta2V5LWZvci10aGUtbG9nZ2luZy10ZXN0LTAwMDI="
+echo "key \"tracer\" { algorithm hmac-sha256; secret \"$TRSECRET\"; };" > "$W/tr.conf"
+echo "key \"ro\" { algorithm hmac-sha256; secret \"$ROSECRET\"; };" > "$W/ro.conf"
+chmod 600 "$W/tr.conf" "$W/ro.conf"
+ctlk() { _k=$1; _n=$2; shift 2; "$KARICTL" -s "$W/$_n.sock" -f "$W/$_k.conf" "$@" 2>&1; }
+refused() { # NAME PORT : a query that no zone answers (REFUSED: a query-errors line at debug 3)
+    "$DAG" @127.0.0.1 -p "$2" "$1" A +short +nohexdump +time=1 +tries=1 >/dev/null 2>&1
+}
+cat > "$W/d1.conf" <<EOF
+options { port $P1; bind-address { 127.0.0.1; }; pid-file "none"; directory "$DD"; $USER_OPT };
+key "tracer" { algorithm hmac-sha256; secret "$TRSECRET"; };
+key "ro" { algorithm hmac-sha256; secret "$ROSECRET"; };
+control-channel { socket "$W/d1.sock"; algorithm hmac-sha256; secret "$SECRET";
+    keys { "tracer" read-only yes allow-commands { trace; }; "ro" read-only yes; }; };
+zone "pri.test" { type primary; file "$W/pri.zone"; };
+EOF
+"$KARICHECK" conf "$W/d1.conf" > "$W/d1.check" 2>&1 && pass "D: karicheck conf accepts allow-commands { trace; }" || { fail "D: karicheck conf d1"; cat "$W/d1.check"; }
+[ ! -e "$RUN" ] && pass "D: karicheck conf does not create karidns.run" || fail "D: karicheck created $RUN"
+start d1
+D1PID=$LAST_PID
+wait_up $P1 20 || fail "D: d1 did not start"
+ctl_wait d1
+if [ -f "$RUN" ] && [ "$(size_of "$RUN")" = 0 ]; then pass "D: no logging statement: karidns.run is created empty in the directory at the start"; else fail "D: karidns.run: $(ls -l "$RUN" 2>&1)"; fi
+if [ -n "$USER_OPT" ]; then
+    [ "$(stat -f %Su "$RUN" 2>/dev/null)" = nobody ] && pass "D: karidns.run belongs to the run user" || fail "D: owner of karidns.run: $(stat -f %Su "$RUN" 2>&1)"
+fi
+ctl d1 status | grep -q '^debug level: 0$' && pass "D: karictl status: debug level: 0" || { fail "D: status of d1"; ctl d1 status | head -12; }
+refused www.other.test $P1
+out=$(ctl d1 trace); rc=$?
+[ $rc -eq 0 ] && [ "$out" = "OK debug level is now 1" ] && pass "D: trace raises the level by one: $out" || fail "D: trace: rc $rc: $out"
+wait_grep '\[Control\] debug level is now 1$' "$RUN" 10 && pass "D: the change is logged (general, notice) and reaches karidns.run above level 0" || { fail "D: no level line in karidns.run"; cat "$RUN"; }
+grep -q 'query failed' "$RUN" && fail "D: a query error of level 0 was written" || pass "D: nothing was written at level 0 (the query error before trace)"
+ctl d1 status | grep -q '^debug level: 1$' && pass "D: status follows: debug level: 1" || fail "D: status after trace"
+out=$(ctl d1 trace 3); rc=$?
+[ $rc -eq 0 ] && [ "$out" = "OK debug level is now 3" ] && pass "D: trace 3 sets the level" || fail "D: trace 3: rc $rc: $out"
+refused www.level3.other.test $P1
+if wait_grep 'query failed (REFUSED) for www.level3.other.test/IN/A' "$RUN" 10 &&
+   grep -E -q '^[0-9][0-9]-[A-Z][a-z][a-z]-20[0-9][0-9] [0-9:]{8}\.[0-9]{3} client 127.0.0.1#[0-9]+: query failed \(REFUSED\) for www.level3' "$RUN"; then
+    pass "D: at level 3 karidns.run receives the debug 3 lines of query-errors, with the time"
+else fail "D: no query-errors line at level 3"; tail -5 "$RUN"; fi
+for bad in "100" "abc" "-1" "1 2"; do
+    # shellcheck disable=SC2086
+    out=$(ctl d1 trace $bad); rc=$?
+    [ $rc -eq 3 ] && case "$out" in ERROR*) true ;; *) false ;; esac && pass "D: trace $bad is refused (exit 3): $out" || fail "D: trace $bad: rc $rc: $out"
+done
+out=$(ctl d1 notrace now); rc=$?
+[ $rc -eq 3 ] && [ "$out" = "ERROR notrace takes no argument" ] && pass "D: notrace with an argument is refused" || fail "D: notrace now: rc $rc: $out"
+ctl d1 status | grep -q '^debug level: 3$' && pass "D: the refused commands left the level at 3" || fail "D: level after the refusals"
+ctl d1 trace 99 > /dev/null
+out=$(ctl d1 trace)
+[ "$out" = "OK debug level is now 99" ] && pass "D: trace at 99 stays at 99" || fail "D: trace at 99: $out"
+out=$(ctl d1 notrace); rc=$?
+[ $rc -eq 0 ] && [ "$out" = "OK debug level is now 0" ] && pass "D: notrace sets 0" || fail "D: notrace: rc $rc: $out"
+nq=$(grep -c 'query failed' "$RUN")
+refused www.after-notrace.other.test $P1
+ctl d1 trace 1 > /dev/null
+wait_grep '\[Control\] debug level is now 1$' "$RUN" 10
+[ "$(grep -c 'debug level is now 1$' "$RUN")" -ge 2 ] && ! grep -q 'after-notrace' "$RUN" && [ "$(grep -c 'query failed' "$RUN")" = "$nq" ] &&
+    pass "D: after notrace karidns.run gets nothing (the query between notrace and trace 1 is not there)" || { fail "D: karidns.run after notrace"; tail -5 "$RUN"; }
+# the permission: a read-only key with allow-commands { trace; } may trace (and read), nothing else; a read-only key may not
+out=$(ctlk tr d1 trace 2); rc=$?
+[ $rc -eq 0 ] && [ "$out" = "OK debug level is now 2" ] && pass "D: a key with allow-commands { trace; } may trace" || fail "D: tracer trace: rc $rc: $out"
+ctlk tr d1 notrace | grep -q '^OK debug level is now 0$' && pass "D: ... and notrace" || fail "D: tracer notrace"
+ctlk tr d1 status | grep -q '^debug level: 0$' && pass "D: ... and status (read-only)" || fail "D: tracer status"
+out=$(ctlk tr d1 reload); rc=$?
+[ $rc -eq 3 ] && [ "$out" = 'ERROR command not allowed for key "tracer"' ] && pass "D: ... but not reload" || fail "D: tracer reload: rc $rc: $out"
+out=$(ctlk ro d1 trace); rc=$?
+[ $rc -eq 3 ] && [ "$out" = 'ERROR command not allowed for key "ro"' ] && pass "D: a read-only key may not trace" || fail "D: ro trace: rc $rc: $out"
+out=$(ctlk ro d1 notrace); rc=$?
+[ $rc -eq 3 ] && pass "D: ... nor notrace" || fail "D: ro notrace: rc $rc: $out"
+ctl d1 status | grep -q '^debug level: 0$' && pass "D: the refused trace did not change the level" || fail "D: level after the ro refusal"
+wait_grep 'key "ro": refused: trace' "$W/d1.log" 5 && pass "D: the refusal is logged with the key name" || fail "D: no refusal line in d1.log"
+# 0.7: a reload keeps the descriptor of karidns.run that the start opened (the sandboxed process holds no writable descriptor of options
+# { directory }, so it never opens the file by name): the lines after a reload still reach it, without a warning
+out=$(ctl d1 reload); rc=$?
+ctl d1 trace 2 > /dev/null
+wait_grep '\[Control\] debug level is now 2$' "$RUN" 10
+[ $rc -eq 0 ] && [ "$(grep -c 'debug level is now 2$' "$RUN")" -ge 2 ] && ! grep -q 'default_debug) is not used' "$W/d1.log" &&
+    pass "D: after a reload karidns.run still receives the lines ($out)" || { fail "D: karidns.run after a reload: rc $rc: $out"; tail -5 "$RUN"; }
+# removed meanwhile: a reload does not make it again (nothing opens it by name after the start); a restart does
+rm -f "$RUN"
+out=$(ctl d1 reload); rc=$?
+[ $rc -eq 0 ] && [ ! -e "$RUN" ] && pass "D: a removed karidns.run does not stop a reload and is not made again by it ($out)" ||
+    { fail "D: reload without karidns.run: rc $rc: $out"; ls -l "$DD"; }
+stop $D1PID
+
+# karidns -d: the level from the start; a bad level is a usage error (exit 2, nothing started)
+for bad in 100 x -1 ""; do
+    "$KARIDNS" -d "$bad" -f "$W/d1.conf" > "$W/dbad.out" 2>&1; rc=$?
+    [ $rc -eq 2 ] && grep -q "Invalid debug level '$bad' for -d (expected a number from 0 to 99)" "$W/dbad.out" && pass "D: karidns -d '$bad' is refused (exit 2)" || { fail "D: -d '$bad': rc $rc"; cat "$W/dbad.out"; }
+done
+"$KARIDNS" -f "$W/d1.conf" -d > "$W/dbad.out" 2>&1; rc=$?
+[ $rc -eq 2 ] && grep -q "Invalid debug level '' for -d" "$W/dbad.out" && pass "D: karidns -d without a level is refused (exit 2)" || { fail "D: -d at the end: rc $rc"; cat "$W/dbad.out"; }
+run_before=no
+[ -e "$PWD/karidns.run" ] && run_before=yes
+cat > "$W/d2.conf" <<EOF
+options { port $P2; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT };
+$(ctlblock d2)
+logging { channel dyn { file "$LG/dyn.log"; severity dynamic; print-category yes; print-severity yes; }; category query-errors { dyn; }; };
+zone "pri.test" { type primary; file "$W/pri.zone"; };
+EOF
+start d2 -d 3
+D2PID=$LAST_PID
+wait_up $P2 20 || fail "D: d2 did not start"
+ctl_wait d2
+ctl d2 status | grep -q '^debug level: 3$' && pass "D: karidns -d 3: status says debug level: 3" || fail "D: status of d2"
+refused www.start.other.test $P2
+wait_grep 'query-errors: debug 3: client 127.0.0.1#[0-9]*: query failed (REFUSED) for www.start.other.test/IN/A' "$LG/dyn.log" 10 &&
+    pass "D: -d 3: the severity dynamic channel writes the debug 3 lines" || { fail "D: dyn.log at -d 3"; cat "$LG/dyn.log"; }
+ctl d2 notrace > /dev/null
+refused www.zero.other.test $P2
+ctl d2 trace 3 > /dev/null
+refused www.again.other.test $P2
+wait_grep 'www.again.other.test' "$LG/dyn.log" 10
+grep -q 'www.again.other.test' "$LG/dyn.log" && ! grep -q 'www.zero.other.test' "$LG/dyn.log" &&
+    pass "D: the dynamic channel stops at notrace and writes again after trace 3" || { fail "D: dyn.log after notrace / trace"; cat "$LG/dyn.log"; }
+ctl d2 trace 2 > /dev/null
+refused www.two.other.test $P2
+ctl d2 trace 3 > /dev/null
+refused www.three.other.test $P2
+wait_grep 'www.three.other.test' "$LG/dyn.log" 10      # (the line of the query before it would have come first)
+grep -q 'www.three.other.test' "$LG/dyn.log" && ! grep -q 'www.two.other.test' "$LG/dyn.log" && pass "D: at level 2 the debug 3 lines are not written" || fail "D: a debug 3 line at level 2"
+[ $run_before = yes ] || [ ! -e "$PWD/karidns.run" ] && pass "D: without a directory no karidns.run is made (in the directory the server was started in)" || fail "D: a karidns.run without a directory"
+stop $D2PID
+
+# ------------------------------------------------------------------------------------------------ S: KARIDNS_NOSYSLOG
+# lib_proc.sh exports KARIDNS_NOSYSLOG=1: what the server gives syslog(3) goes to its stderr only, in the form of LOG_PERROR's copy.  s1 runs
+# with it, s2 without; each logs a query name of its own to the default category (default_syslog).  The system log files are read where the
+# host has them: s2's line must reach one of them (else the host keeps no daemon.info line where this test can read it: SKIP), s1's none.
+SYSLOGS=""
+for f in /var/log/messages /var/log/daemon.log /var/log/debug.log /var/log/all.log; do [ -r "$f" ] && SYSLOGS="$SYSLOGS $f"; done
+mkq s1 $P2 "querylog yes;" ""
+mkq s2 $P3 "querylog yes;" ""
+KARIDNS_NOSYSLOG=1 "$KARIDNS" -f "$W/s1.conf" > "$W/s1.log" 2>&1 &
+S1PID=$!; PIDS="$PIDS $S1PID"
+env -u KARIDNS_NOSYSLOG "$KARIDNS" -f "$W/s2.conf" > "$W/s2.log" 2>&1 &
+S2PID=$!; PIDS="$PIDS $S2PID"
+wait_up $P2 20 || fail "S: s1 did not start"
+wait_up $P3 20 || fail "S: s2 did not start"
+M1="nosyslog-on-$$.pri.test" M2="nosyslog-off-$$.pri.test"
+query $P2 "$M1"; query $P3 "$M2"
+wait_grep "query: $M1. IN A" "$W/s1.log" 10
+grep -Eq "^KariDNS [0-9]+ - - client 127\.0\.0\.1#[0-9]+ \($M1\.\): query: $M1\. IN A" "$W/s1.log" &&
+    pass "S: KARIDNS_NOSYSLOG=1: the syslog line is on stderr as LOG_PERROR prints it (KariDNS <pid> - - <text>)" || { fail "S: s1.log"; tail -5 "$W/s1.log"; }
+wait_grep "query: $M2. IN A" "$W/s2.log" 10 && pass "S: without it the stderr copy is there too" || fail "S: s2.log"
+if [ -z "$SYSLOGS" ]; then
+    echo "SKIP: S: no system log file to read"
+else
+    _i=0; while [ $_i -lt 10 ] && ! grep -q "$M2" $SYSLOGS 2>/dev/null; do sleep 1; _i=$((_i + 1)); done
+    if grep -q "$M2" $SYSLOGS 2>/dev/null; then
+        pass "S: without KARIDNS_NOSYSLOG the line reaches the system log"
+        grep -q "$M1" $SYSLOGS 2>/dev/null && fail "S: with KARIDNS_NOSYSLOG=1 the line reached the system log" || pass "S: with KARIDNS_NOSYSLOG=1 nothing reached the system log"
+    else
+        echo "SKIP: S: the host's syslog keeps no daemon.info line in a file this test can read ($SYSLOGS)"
+    fi
+fi
+stop $S1PID
+stop $S2PID
 
 echo "== $PASSES passed, $FAILS failed"
 [ "$FAILS" -eq 0 ]

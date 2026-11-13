@@ -89,20 +89,30 @@ server_cookie_status_t verify_server_cookie(const server_config_t *cfg, const ch
                                             const uint8_t client_cookie[8],
                                             const uint8_t *server_cookie, size_t server_cookie_len,
                                             uint32_t now) {
+    /* 0.7 M3: the debug 3 lines (security) say why a server cookie was taken or not: lengths, the age and the number of the secret that matched,
+     * never a cookie or a secret (logev_post(): one atomic load when no channel wants them) */
     if (!server_cookie || server_cookie_len != SERVER_COOKIE_LEN ||
-        server_cookie[0] != SERVER_COOKIE_VERSION)
+        server_cookie[0] != SERVER_COOKIE_VERSION) {
+        logev_post(LOGC_SECURITY, 3, client_ip, 0, "[Cookie] server cookie not valid: %zu octets%s (RFC 9018: 16 octets, version 1)", server_cookie ? server_cookie_len : 0,
+                   server_cookie && server_cookie_len == SERVER_COOKIE_LEN ? ", another version" : "");
         return SERVER_COOKIE_INVALID;
+    }
 
     /* RFC 9018 §4.3: all timestamp comparisons use RFC 1982 serial arithmetic (wrap-safe). */
     uint32_t ts = ((uint32_t)server_cookie[4] << 24) | ((uint32_t)server_cookie[5] << 16) |
                   ((uint32_t)server_cookie[6] << 8)  |  (uint32_t)server_cookie[7];
     int32_t age = (int32_t)(now - ts);          /* >0: cookie is `age` seconds old; <0: from the future */
-    if (age > SERVER_COOKIE_VALID_PAST_SECS || age < -SERVER_COOKIE_VALID_FUTURE_SECS)
+    if (age > SERVER_COOKIE_VALID_PAST_SECS || age < -SERVER_COOKIE_VALID_FUTURE_SECS) {
+        logev_post(LOGC_SECURITY, 3, client_ip, 0, "[Cookie] server cookie not valid: its time stamp is %u s %s (RFC 9018 4.3)",
+                   age < 0 ? 0u - (uint32_t)age : (uint32_t)age,      /* (unsigned: -INT32_MIN has no int32_t) */
+                   age < 0 ? "in the future" : "old");
         return SERVER_COOKIE_INVALID;
+    }
 
     /* Reserved (bytes 1..3) is deliberately NOT required to be zero; it is hashed as received. */
     bool match = false;
     bool old_secret = false;
+    int which = 0;
     uint8_t addr[16];
     size_t addr_len = cookie_client_addr(client_ip, addr);   /* parsed once for all the secrets */
     if (addr_len == 0) return SERVER_COOKIE_INVALID;
@@ -112,13 +122,19 @@ server_cookie_status_t verify_server_cookie(const server_config_t *cfg, const ch
             cookie_hash_addr(cfg->cookie_secrets[i], addr, addr_len, client_cookie, server_cookie, expected);
             match = (const_time_memcmp(server_cookie + 8, expected, 8) == 0);
             old_secret = match && i > 0;
+            which = i;
         }
     } else {
         uint8_t expected[8];
         cookie_hash_addr(g_server_cookie_secret, addr, addr_len, client_cookie, server_cookie, expected);
         match = (const_time_memcmp(server_cookie + 8, expected, 8) == 0);
     }
-    if (!match) return SERVER_COOKIE_INVALID;
+    if (!match) {
+        logev_post(LOGC_SECURITY, 3, client_ip, 0, "[Cookie] server cookie not valid: no cookie-secret (of %d) made it for this client", cfg && cfg->cookie_secret_count > 0 ? cfg->cookie_secret_count : 1);
+        return SERVER_COOKIE_INVALID;
+    }
+    logev_post(LOGC_SECURITY, 3, client_ip, 0, "[Cookie] server cookie valid: made %d s ago with cookie-secret #%d%s", age, which + 1,
+               age > SERVER_COOKIE_REFRESH_SECS || old_secret ? ", a new one is sent" : "");
     /* The query engine echoes a valid cookie back unless a new one is due.  One made with an older secret is accepted (rollover, RFC 9018
      * section 5) but answered with a new cookie from the current secret, so that the client moves over before that secret is removed. */
     return (age > SERVER_COOKIE_REFRESH_SECS || old_secret) ? SERVER_COOKIE_VALID_REFRESH : SERVER_COOKIE_VALID;

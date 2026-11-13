@@ -400,6 +400,15 @@ int main(void) {
     kdb_enc_end(&e);
     ch_send(a[0], &e);
     CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG && m.u.config.n_views == 1);
+    /* 0.7 M2: then the debug level in force, after every handshake */
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_DEBUG && m.u.debug.level == 0);
+    /* ... and every change of it (karictl trace / notrace: the control thread calls db_ingest_debug_changed()) */
+    klog_set_debug_level(3);
+    db_ingest_debug_changed();
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_DEBUG && m.u.debug.level == 3);
+    klog_set_debug_level(0);
+    db_ingest_debug_changed();
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_DEBUG && m.u.debug.level == 0);
 
     /* a zone in memory, installed from a batch of the first stream (r.test.), and a second one (s.test.) */
     kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);

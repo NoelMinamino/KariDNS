@@ -1022,6 +1022,7 @@ static char *server_load_file_cb(parse_context_t *ctx, const char *rel_path, dev
         return NULL;
     }
     buf[read_len] = '\0';
+    logev_post(LOGC_ZONELOAD, 2, NULL, 0, "[Zone] zone '%s': $INCLUDE '%s' read (%zu octets)", ctx && ctx->default_origin ? ctx->default_origin : "", rel_path, read_len);
     return buf;
 }
 
@@ -1195,21 +1196,27 @@ void zone_retire_process(bool wait) {
     if (r->epoch > max_epoch) max_epoch = r->epoch;
   }
   bool all_safe = wait ? rcu_writer_wait_until_safe(max_epoch, 60000) : rcu_writer_is_safe(max_epoch);
+  unsigned n_freed = 0, n_kept = 0;          /* (the debug 2 line of the batch) */
+  uint64_t freed_bytes = 0;
   while (list) {
     zone_retire_t *r = list;
     list = r->next;
     zone_db_entry_t *e = r->entry;
     if (!all_safe && !rcu_writer_is_safe(r->epoch)) {
       zone_retire_push(r);
+      n_kept++;
       continue;
     }
     /* 送信中の AXFR と受信中の転送は、開始時の版を読み取り区間の外で使い続ける */
     if (atomic_load_explicit(&e->active_axfr, memory_order_acquire) > 0 ||
         atomic_load_explicit(&e->is_transferring, memory_order_acquire)) {
       zone_retire_push(r);
+      n_kept++;
       continue;
     }
+    n_freed++;
     if (r->ver) {
+      freed_bytes += r->ver->bytes;
       zone_bytes_retired_add(zone_bytes_class(e), -(int64_t)r->ver->bytes);     /* freed now: no longer retired */
       if (r->from_prev) atomic_fetch_sub_explicit(&g_prev_inflight, (uint64_t)r->ver->bytes, memory_order_relaxed);
       zone_version_free(r->ver);
@@ -1219,6 +1226,8 @@ void zone_retire_process(bool wait) {
     zone_entry_unref(e);
     free(r);
   }
+  logev_post(LOGC_GENERAL, 2, NULL, 0, "[GC] retired zone versions: %u freed (%llu bytes), %u kept for readers or a running transfer (epoch %llu, %s)", n_freed,
+             (unsigned long long)freed_bytes, n_kept, (unsigned long long)max_epoch, wait ? "waited for the grace period" : "no wait");
 }
 
 /* entry に属する物 obj を、世代 epoch の猶予期間が過ぎ、かつ entry が AXFR の送信中でも転送の受信中でもなくなってから
@@ -1580,6 +1589,8 @@ static bool view_has_zone(const void *ud, const char *name) {
 reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) {
   if (!entry || !zcfg || !zcfg->file) return RELOAD_ERR_FILE_READ;
   const char *file = zcfg->file;
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
   struct stat root_st;
   char *buf = read_entire_file_stat(file, &root_st);
   dev_t root_dev = root_st.st_dev;
@@ -1857,6 +1868,16 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   }
   pthread_mutex_unlock(&entry->writer_lock);
   syslog(LOG_NOTICE, "[Zone] Reload successful for '%s'", entry->domain);
+  {
+    /* 0.7 M3, debug 1: what was read, how long it took, and whether the secondaries are told (RFC 1996 §4.5) */
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    logev_post(LOGC_ZONELOAD, 1, NULL, 0, "[Zone] zone '%s' (view '%s') loaded from '%s' (%s format): %d record(s), serial %u (before: %u), %lld ms; %s", entry->domain,
+               entry->view_name, file, zext(zcfg)->file_format ? zext(zcfg)->file_format : "zone file", count, entry->serial,
+               old_serial, (long long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000),
+               !was_loaded ? "first load, no NOTIFY" : entry->is_secondary ? "a secondary's file, no NOTIFY"
+               : entry->serial != old_serial ? "the serial changed: NOTIFY" : "same serial: no NOTIFY");
+  }
   // RFC 1996 §4.5: プライマリのゾーンが変わったらセカンダリへ通知する
   if (was_loaded && !entry->is_secondary && entry->serial != old_serial) notify_request_send(entry);
   return RELOAD_OK;
@@ -3037,6 +3058,9 @@ static uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
     atomic_fetch_add_explicit(&g_dbreg_pending, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_evictions, 1, memory_order_relaxed);
     pthread_mutex_unlock(&e->writer_lock);
+    /* 0.7 M3, debug 2: memory-limit took this zone out of memory */
+    logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] zone '%s' (view '%s') taken out of memory by memory-limit: %llu bytes, %llu queries since it came in", z->name,
+               rv->name, (unsigned long long)bytes, (unsigned long long)atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed));
     void (*notify)(void) = atomic_load_explicit(&g_pending_notify, memory_order_acquire);
     if (notify) notify();                              /* the ingest thread publishes the delta (and so retires the entry) */
     return bytes ? bytes : 1;
@@ -4740,6 +4764,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         dbreg_pending_drop_gone_locked(active_config);
         reused = true;
         g_rebuild_sets_changed = false;
+        logev_post(LOGC_GENERAL, 1, NULL, 0, "[Core] zone snapshot: no view's set of zones changed, the %d view(s) are copied (no zone entry is made or dropped)", view_count);
     } else if (active_config) {
         // MODE: Full Config Reload
         g_rebuild_sets_changed = true;
@@ -4884,6 +4909,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             }
 
             int64_t order = 0;
+            unsigned n_kept = 0, n_new = 0;        /* (the debug 1 summary of the view below) */
             for (zone_config_t *z = v->zones; z; z = z->next) {
                 zone_db_entry_t *entry = NULL;
                 zdir_elem_t *old_el = (old_view && z->domain) ? zdir_find_exact(old_view, z->domain) : NULL;
@@ -4896,6 +4922,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                      * 削除されたゾーンと同じく旧スナップショットとともに解放される)。*/
                     if (old->kind == zone_kind_from_type(z->type) && !old->is_catalog_member && old->source != ZONE_SRC_DB) {
                         entry = old;
+                        n_kept++;
                         atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
                         /* B-3: ixfr-history may have changed; a lower depth drops the oldest diffs now */
                         ixfr_history_set_depth(entry, ixfr_history_effective(active_config, z));
@@ -4905,6 +4932,9 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     }
                 }
                 if (!entry) {
+                    n_new++;
+                    logev_post(LOGC_GENERAL, 1, NULL, 0, "[Core] zone '%s' in view '%s': %s, a new zone entry%s", z->domain ? z->domain : "", v->name ? v->name : "",
+                               old ? "its type changed or it replaces a catalog member" : "not in the zones before", z->file ? " (its file is read now)" : "");
                     entry = create_new_zone_entry(z->domain, v->name);
                     if (entry) {
                         ixfr_history_set_depth(entry, ixfr_history_effective(active_config, z));
@@ -4950,6 +4980,8 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             }
             rcu_aux_read_unlock();
             free(db_list);
+            logev_post(LOGC_GENERAL, 1, NULL, 0, "[Core] zone snapshot, view '%s': %u zone(s) of the configuration kept (their data stays until the file check), %u new, "
+                       "%zu catalog member(s) carried over, %zu database zone(s)", v->name ? v->name : "", n_kept, n_new, dynamic_count, db_n);
         }
         { free(valid_members); free(vm_ht); free(vm_chain); }
 
@@ -5146,6 +5178,12 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         }
         if (des_hash_table) free(des_hash_table);
         if (des_chain_next) free(des_chain_next);
+        /* 0.7 M3, debug 1: the members that leave (the new ones have their INFO line below) */
+        for (int i = 0; i < removed_count; i++)
+            logev_post(LOGC_GENERAL, 1, NULL, 0, "[Catalog] catalog '%s': member '%s' (unique-id %s) is no longer listed; it is removed", catalog_entry_to_update->domain,
+                       removed_members[i].domain, removed_members[i].unique_id);
+        logev_post(LOGC_GENERAL, 1, NULL, 0, "[Catalog] catalog '%s' (view '%s'): %d member(s) listed, %d new, %d removed, %d reset by a change of ownership",
+                   catalog_entry_to_update->domain, catalog_view_name ? catalog_view_name : "", new_desired_count, added_count, removed_count, coo_evicted_count);
 
         zone_db_entry_t **new_entries = calloc(added_count > 0 ? added_count : 1, sizeof(zone_db_entry_t*));
         if (!new_entries) {
@@ -5345,6 +5383,8 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
      * dbreg_pending_drop_gone_locked() dropped the queues of the views that left the configuration) */
     if (active_config && !reused) dbreg_pending_drop_locked();
     uint64_t retire_epoch = rcu_writer_publish(&g_zone_db_active, new_snap);
+    logev_post(LOGC_GENERAL, 2, NULL, 0, "[Core] zone snapshot published (%s, %zu view(s), epoch %llu)%s", !active_config ? "catalog change" : reused ? "views copied" : "views rebuilt",
+               new_snap->view_count, (unsigned long long)retire_epoch, old_snap ? "; the one before goes to the garbage collector after a grace period" : "");
     if (old_snap) {
         old_snap->retire_epoch = retire_epoch;
         gc_retire_locked(old_snap);
@@ -5354,6 +5394,14 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
     if (old_snap) gc_start_pending();
 
     return new_snap;
+}
+
+/* 0.7 M3, debug 1: why a primary zone's file is read again by a reload (the reasons for leaving it alone are INFO lines of the caller) */
+static reload_result_t reload_zone_said(zone_db_entry_t *entry, zone_config_t *z, bool skip_unchanged) {
+    logev_post(LOGC_ZONELOAD, 1, NULL, 0, "[Zone] zone '%s' (view '%s'): reading '%s' again: %s", entry->domain, entry->view_name, z->file,
+               !skip_unchanged ? "a full reload reads every zone file" : entry->last_loaded_mtime == 0 ? "it was not loaded from a file before"
+               : "the file's mtime or size changed (or stat() failed)");
+    return reload_master_zone(entry, z);
 }
 
 int rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
@@ -5391,7 +5439,7 @@ int rebuild_zone_db_from_config_ext(server_config_t *config, bool skip_unchanged
                     } else if (zone_rollback_keeps_file(entry, z->file)) {
                         /* karictl rollback: the file is the one whose data was rolled back; reading it again would bring that data back (reload <zone> force does) */
                         syslog(LOG_INFO, "[Config] zone '%s' was rolled back and its file is unchanged since, keeping the rolled-back version", z->domain);
-                    } else if (reload_master_zone(entry, z) != RELOAD_OK) {
+                    } else if (reload_zone_said(entry, z, skip_unchanged) != RELOAD_OK) {
                         nfailed++;
                         if (failed && failed_sz > 0) {
                             size_t used = strlen(failed);

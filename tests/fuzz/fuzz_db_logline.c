@@ -4,7 +4,8 @@
  * The loader runs with the rights of loader-user and reads names out of a database; the supervisor (root, until it drops) reads its stderr
  * pipe, so every byte is hostile.  The input is cut into pieces (the first bytes say how long they are and how fast they come), fed to the
  * line reader, and the end of the stream is flushed.  Every line the sink gets must be printable ASCII, no longer than DB_LOG_TEXT_MAX, with a
- * priority 0..7; the sink is not called for more than DB_LOG_RATE_LINES lines in a window plus the reports; the reader's buffer never grows.
+ * priority 0..7; the sink is not called for more than 2 * DB_LOG_RATE_LINES lines in a window (two budgets: warning and worse, the others)
+ * plus the reports; the reader's buffer never grows.
  */
 #include <stdint.h>
 #include <stddef.h>
@@ -28,9 +29,10 @@ long write_uncompressed_name_ext(uint8_t *buf, size_t offset, size_t max_len, co
 
 static unsigned long g_calls;
 
-static void sink(int prio, const char *text, void *ud) {
+static void sink(int prio, int level, const char *text, void *ud) {
     (void)ud;
     if (prio < 0 || prio > 7) abort();
+    if (level < 0 || level > 99 || (level > 0 && prio != 7)) abort();
     size_t n = strlen(text);
     if (n > DB_LOG_TEXT_MAX) abort();
     for (size_t i = 0; i < n; i++)
@@ -58,8 +60,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
     db_logrd_flush(&rd, now, sink, NULL);
     if (rd.len != 0 && rd.len > DB_LOG_TEXT_MAX) abort();
-    /* the rate limit: at most DB_LOG_RATE_LINES lines plus one report per window; a window is at least 1000 ms, a piece can end the window */
+    /* the rate limit: at most DB_LOG_RATE_LINES lines of warning and worse, as many others, plus one report per window; a window is at least
+     * 1000 ms, a piece can end the window */
     unsigned long windows = (unsigned long)((step * (int64_t)pieces) / 1000) + 1;
-    if (g_calls > windows * (DB_LOG_RATE_LINES + 1) + 1) abort();
+    if (g_calls > windows * (2 * DB_LOG_RATE_LINES + 1) + 1) abort();
     return 0;
 }

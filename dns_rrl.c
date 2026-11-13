@@ -395,6 +395,14 @@ bool rrl_check_key(const void *client_addr_ptr, const rrl_key_t *key, const rate
   } else if (!allow && *out_slip) {
     atomic_fetch_add_explicit(&g_rrl_slip_total, 1, memory_order_relaxed);
   }
+  /* 0.7 M3, debug 3: one line per limited response (the worker's ring and the category's rate limit carry it; nothing for a response that passes) */
+  if (!allow && logev_wanted(LOGC_RATE_LIMIT, 3)) {
+    char ip_str[INET6_ADDRSTRLEN] = "?";
+    inet_ntop(client_addr->sa_family, client_addr->sa_family == AF_INET ? (const void *)&((const struct sockaddr_in *)client_addr)->sin_addr
+                                                                         : (const void *)&((const struct sockaddr_in6 *)client_addr)->sin6_addr, ip_str, sizeof(ip_str));
+    logev_post(LOGC_RATE_LIMIT, 3, ip_str, 0, "[RRL] response class %d: %s (%s, window %u s)", (int)key->cls, *out_slip ? "slipped (TC=1)" : "dropped",
+               rate > 0 && cfg->all_per_second > 0 ? "responses-per-second or all-per-second" : rate > 0 ? "the rate of its class" : "all-per-second", window_sec);
+  }
 
   return allow;
 }

@@ -78,6 +78,9 @@ typedef struct {
   unsigned long starts;    /* forks made (tests, the log) */
   int64_t reread_ms;       /* the last reading of the configuration file (at most one a second) */
   unsigned long rereads;
+  /* 0.7 M2: what the manager does with a KLS1 record (the Backend's debug level and logging runtime, dns_log_state.h) that comes on the pair;
+   * dns_log.c klog_state_apply() in the server, NULL (the record is refused) where dns_log.c is not linked */
+  bool (*logstate)(const uint8_t *rec, size_t len, const char *who);
 } plug_sup_t;
 
 /* The Backend's end of the pair (-1 when it could not be made, or in the manager after the fork) */

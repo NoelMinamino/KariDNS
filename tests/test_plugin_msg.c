@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 
 #include "../dns_plugin_msg.h"
+#include "../dns_log_state.h"
 
 static int g_fail, g_checks;
 #define CHECK(c)                                                                \
@@ -240,10 +241,127 @@ static void test_texts(void) {
     CHECK(m.magic == PLUG_MAGIC && m.type == PLUG_MSG_STOP && m.slot == 1 && m.gen == 2 && m.seq == 3 && m.pid == 0 && m.zone[100] == 0);
 }
 
+/* ---- 0.7 M2: the KLS1 record (dns_log_state.c) that the Backend sends the manager on the same pair (and the routers and the broker) ---- */
+
+static kls_state_t ks, kout;
+static uint8_t krec[KLS_MAX + 16];
+
+static void kls_sample(void) {
+    memset(&ks, 0, sizeof(ks));
+    ks.debug_level = 3;
+    ks.has_spec = true;
+    ks.nch = 3;
+    ks.ch[0] = (kls_channel_t){ 0, 1, KLS_CF_CATEGORY | KLS_CF_SEVERITY, 0, 3 << 3, 15, "/var/log/a.test" };
+    ks.ch[1] = (kls_channel_t){ 1, 0, 0, -2, 16 << 3, 0, NULL };
+    ks.ch[2] = (kls_channel_t){ 0, 3, KLS_CF_DEBUG_ONLY, 5, 0, 11, "karidns.run" };
+    ks.nroute[1] = 2;
+    ks.route[1][0] = 0;
+    ks.route[1][1] = 2;
+    ks.nroute[4] = 1;
+    ks.route[4][0] = 1;
+}
+
+/* the record with one byte changed at off parses or not, as expected */
+static void kls_poke(size_t len, size_t off, uint8_t v, int ok) {
+    uint8_t save = krec[off];
+    krec[off] = v;
+    CHECK((kls_parse(krec, len, &kout) == NULL) == ok);
+    krec[off] = save;
+}
+
+static void test_log_state(void) {
+    printf("[TEST] the KLS1 record of the debug level and the logging runtime...\n");
+    kls_sample();
+    size_t n = kls_encode(&ks, krec, sizeof(krec));
+    CHECK(n == KLS_HEADER_LEN + 3 * 8 + 15 + 11 + LOGC_COUNT + 2 * 3);
+    CHECK(kls_parse(krec, n, &kout) == NULL);
+    CHECK(kout.debug_level == 3 && kout.has_spec && kout.nch == 3);
+    CHECK(kout.ch[0].dest == 0 && kout.ch[0].time_fmt == 1 && kout.ch[0].flags == (KLS_CF_CATEGORY | KLS_CF_SEVERITY) && kout.ch[0].level == 0);
+    CHECK(kout.ch[0].facility == 3 << 3 && kout.ch[0].path_len == 15 && memcmp(kout.ch[0].path, "/var/log/a.test", 15) == 0);
+    CHECK(kout.ch[1].dest == 1 && kout.ch[1].level == -2 && kout.ch[1].facility == 16 << 3 && kout.ch[1].path == NULL);
+    CHECK(kout.ch[2].flags == KLS_CF_DEBUG_ONLY && kout.ch[2].level == 5 && kout.ch[2].time_fmt == 3);
+    CHECK(kout.nroute[1] == 2 && kout.route[1][1] == 2 && kout.nroute[4] == 1 && kout.route[4][0] == 1 && kout.nroute[0] == 0);
+    /* every cut is refused, and so is a byte more */
+    for (size_t k = 0; k < n; k++) CHECK(kls_parse(krec, k, &kout) != NULL);
+    CHECK(kls_parse(krec, n + 1, &kout) != NULL);
+    CHECK(kls_parse(NULL, n, &kout) != NULL && kls_parse(krec, n, NULL) != NULL);
+    CHECK(kls_parse(krec, KLS_MAX + 1, &kout) != NULL);
+    /* the header */
+    kls_poke(n, 0, 'k', 0);                         /* magic */
+    kls_poke(n, 4, 2, 0);                           /* version */
+    kls_poke(n, 5, 3, 0);                           /* unknown flag */
+    kls_poke(n, 6, 99, 1);
+    kls_poke(n, 6, 100, 0);                         /* level */
+    kls_poke(n, 7, 1, 0);                           /* reserved */
+    kls_poke(n, 9, 2, 0);                           /* nch: the record no longer adds up */
+    /* the first channel: destination, print-time, flags, severity, facility, the path */
+    size_t c0 = KLS_HEADER_LEN;
+    kls_poke(n, c0, 4, 0);
+    kls_poke(n, c0, 2, 0);                          /* stderr with a path */
+    kls_poke(n, c0 + 1, 4, 0);
+    kls_poke(n, c0 + 2, 8, 0);
+    kls_poke(n, c0 + 3, (uint8_t)-5, 1);
+    kls_poke(n, c0 + 3, (uint8_t)-6, 0);
+    kls_poke(n, c0 + 3, 100, 0);
+    kls_poke(n, c0 + 5, 3 << 3 | 1, 0);             /* not a multiple of 8 */
+    kls_poke(n, c0 + 4, 1, 0);                      /* 3 << 3 | 256: beyond LOG_LOCAL7 */
+    kls_poke(n, c0 + 8, '\n', 0);                   /* a control character in the path */
+    kls_poke(n, c0 + 8, 0x7f, 0);
+    kls_poke(n, c0 + 8, 0x00, 0);
+    kls_poke(n, c0 + 8, 0xc3, 1);                   /* (a byte of UTF-8 is fine) */
+    kls_poke(n, c0 + 7, 0, 0);                      /* a file without a path */
+    /* the table: a count above KLS_ROUTE_MAX, an index beyond the channels */
+    size_t t0 = KLS_HEADER_LEN + 3 * 8 + 15 + 11;
+    kls_poke(n, t0, KLS_ROUTE_MAX + 1, 0);
+    kls_poke(n, t0 + 1 + 1 + 1, 3, 0);              /* category 1, first index (low byte) = 3 */
+    /* the level alone */
+    kls_state_t lv;
+    memset(&lv, 0, sizeof(lv));
+    lv.debug_level = 7;
+    n = kls_encode(&lv, krec, sizeof(krec));
+    CHECK(n == KLS_HEADER_LEN && kls_parse(krec, n, &kout) == NULL && kout.debug_level == 7 && !kout.has_spec);
+    kls_poke(n, 9, 1, 0);                           /* channels without the flag */
+    /* what the encoder refuses: the same rules, and too little room */
+    kls_sample();
+    CHECK(kls_encode(&ks, krec, 20) == 0 && kls_encode(&ks, krec, KLS_HEADER_LEN - 1) == 0 && kls_encode(NULL, krec, sizeof(krec)) == 0);
+    size_t full = kls_encode(&ks, krec, sizeof(krec));
+    CHECK(full > 0 && kls_encode(&ks, krec, full - 1) == 0);
+    ks.debug_level = 100;
+    CHECK(kls_encode(&ks, krec, sizeof(krec)) == 0);
+    kls_sample();
+    ks.ch[1].path_len = 3;                          /* a path for a syslog channel */
+    CHECK(kls_encode(&ks, krec, sizeof(krec)) == 0);
+    kls_sample();
+    ks.route[4][0] = 3;
+    CHECK(kls_encode(&ks, krec, sizeof(krec)) == 0);
+    kls_sample();
+    ks.nroute[4] = KLS_ROUTE_MAX + 1;
+    CHECK(kls_encode(&ks, krec, sizeof(krec)) == 0);
+    kls_sample();
+    ks.nch = KLS_CHANNELS_MAX + 1;
+    CHECK(kls_encode(&ks, krec, sizeof(krec)) == 0);
+    lv.nch = 1;
+    CHECK(kls_encode(&lv, krec, sizeof(krec)) == 0);  /* channels without the flag */
+    /* the largest table: 256 channels of long paths do not fit KLS_MAX */
+    {
+        static char longp[KLS_PATH_MAX];
+        memset(longp, 'p', sizeof(longp));
+        memset(&ks, 0, sizeof(ks));
+        ks.has_spec = true;
+        ks.nch = KLS_CHANNELS_MAX;
+        for (int i = 0; i < KLS_CHANNELS_MAX; i++) ks.ch[i] = (kls_channel_t){ 0, 0, 0, 0, 0, KLS_PATH_MAX, longp };
+        CHECK(kls_encode(&ks, krec, sizeof(krec)) == 0);
+        ks.ch[0].path_len = KLS_PATH_MAX + 1;
+        ks.nch = 1;
+        CHECK(kls_encode(&ks, krec, sizeof(krec)) == 0);
+    }
+}
+
 int main(void) {
     test_from_manager();
     test_from_backend();
     test_texts();
+    test_log_state();
     printf("[*] %d checks, %d failed\n", g_checks, g_fail);
     if (g_fail) return 1;
     printf("=== All plugin message tests PASSED ===\n");

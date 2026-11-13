@@ -232,6 +232,9 @@ static void karictl_usage(FILE *fp, const char *argv0) {
         "                              go on with (--after).  -f here is the format; before the command it is the\n"
         "                              configuration file\n"
         "  dbstatus [zone [view]]      the database loader, the last batch, the zones of the database\n"
+        "  trace [level]               raise the debug level by one (up to 99), or set it (0-99): the channels with\n"
+        "                              severity dynamic, and karidns.run in options { directory }, follow it\n"
+        "  notrace                     set the debug level to 0\n"
         "  tsig-keygen [keyname]       print a TSIG key\n"
         "Examples:\n"
         "  karictl reload example.test\n"
@@ -241,6 +244,7 @@ static void karictl_usage(FILE *fp, const char *argv0) {
         "  karictl stats > /var/tmp/node_exporter/karidns.prom.$$ && mv /var/tmp/node_exporter/karidns.prom.$$ /var/tmp/node_exporter/karidns.prom\n"
         "  karictl stats -f json example.test\n"
         "  karictl stats --zones '*.example.test' --limit 100\n"
+        "  karictl trace 3\n"
         "A zone name that exists in several views needs the view name after it: reload <zone> <view> [force]\n");
 }
 
@@ -1179,6 +1183,7 @@ int main(int argc, char **argv) {
             printf("CPUs found: %d\n", st.ncpus);
             printf("worker threads: %d\n", st.worker_threads);
             printf("number of zones: %d (0 automatic)\n", st.num_zones);
+            printf("debug level: %d\n", st.debug_level);   /* (where rndc status prints it) */
             printf("xfers running: %d\n", st.xfers_running);
             printf("query logging is %s\n", st.query_logging ? "ON" : "OFF");
             printf("response logging is %s\n", st.response_logging ? "ON" : "OFF");

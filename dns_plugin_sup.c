@@ -17,6 +17,7 @@
 #include "dns_priv_sandbox.h"
 #include "dns_query_engine.h"
 #include "dns_log.h"
+#include "dns_log_state.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -331,6 +332,10 @@ static void m_start_request(plug_sup_t *s, const plug_msg_t *m) {
 
 /* The plugin of the slot has ended (or could not be started): try again after the backoff of the loader */
 static void m_schedule(plug_mslot_t *sl, int64_t now) {
+  /* 0.7 M3, debug 1: why the wait is as long as it is (never the plugin's arguments: they can carry secrets) */
+  logev_post(LOGC_GENERAL, 1, NULL, 0, "[Plugin] zone '%s' in view '%s': %s", sl->zone, sl->view,
+             sl->started_ms && now - sl->started_ms >= PLUG_UPTIME_RESET_MS ? "it ran long enough: the restart backoff is reset to 1 s"
+             : "it ended soon after its start (or did not start): the backoff doubles after this wait");
   if (sl->started_ms && now - sl->started_ms >= PLUG_UPTIME_RESET_MS) sl->backoff_s = 1;
   if (sl->backoff_s == 0) sl->backoff_s = 1;
   sl->state = PLUG_MS_WAIT;
@@ -483,6 +488,9 @@ static void m_try_start(plug_sup_t *s, uint32_t slot, int64_t now) {
   close(pr.stdout_r);
   syslog(LOG_INFO, "[Plugin] Spawned program zone '%s' (view '%s') -> pid=%d exec='%s' (start %u)", sl->zone, sl->view, (int)pr.pid,
          sl->path, sl->seq);
+  logev_post(LOGC_GENERAL, 1, NULL, 0, "[Plugin] zone '%s' in view '%s': start %u (slot %u, generation %u) %s the Backend; %u start token(s) "
+             "left, a restart would wait %u s", sl->zone, sl->view, sl->seq, (unsigned)slot, sl->gen, sent ? "handed to" : "could not be sent to",
+             s->tokens, sl->backoff_s ? sl->backoff_s : 1);
   if (!sent) {
     m_stop_proc(s, sl->pid, sl->pd);
     sl->pid = 0;
@@ -537,8 +545,9 @@ void plug_sup_handle(plug_sup_t *s, const plug_msg_t *m) {
 
 static void m_read(plug_sup_t *s) {
   static unsigned long refused;
+  /* a plugin record, or (0.7 M2) a KLS1 record: the room for the larger one and a byte more, so that a longer datagram shows as MSG_TRUNC */
+  static unsigned char buf[(sizeof(plug_msg_t) > KLS_MAX ? sizeof(plug_msg_t) : KLS_MAX) + 1];
   for (int k = 0; k < 4 * PLUG_SLOTS; k++) {
-    unsigned char buf[sizeof(plug_msg_t) + 1];
     union {
       struct cmsghdr h;
       char c[CMSG_SPACE(sizeof(int) * 4)];
@@ -554,6 +563,13 @@ static void m_read(plug_sup_t *s) {
     if (n < 0 && errno == EINTR) continue;
     if (n < 0) return;                            /* nothing more (or the Backend is gone: the manager's loop sees its exit) */
     int nfds = recv_take_rights(&mh, NULL, 0);         /* the Backend sends no descriptor: whatever came is closed */
+    if (n >= 4 && memcmp(buf, "KLS1", 4) == 0) {
+      /* the Backend's debug level and logging runtime (dns_log_state.h): checked there as hostile input; cut or with descriptors: refused */
+      if (!s->logstate || (mh.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) || nfds != 0 || !s->logstate(buf, (size_t)n, "Manager")) {
+        if (refused++ < 16) syslog(LOG_ERR, "[Manager] A logging state from the Backend was refused");
+      }
+      continue;
+    }
     plug_msg_t m;
     plug_err_t e = plug_check_from_backend(buf, (size_t)n, mh.msg_flags, nfds, &m);
     if (e != PLUG_OK) {
@@ -615,6 +631,7 @@ bool plug_sup_child_exited(plug_sup_t *s, pid_t pid, int status) {
     }
   for (int i = 0; i < s->nstopping; i++)
     if (s->stopping[i].pid == pid) {
+      logev_post(LOGC_GENERAL, 1, NULL, 0, "[Plugin] a stopped plugin (pid %d) was reaped (status %d)", (int)pid, status);
       if (s->stopping[i].pd >= 0) close(s->stopping[i].pd);
       s->stopping[i] = s->stopping[--s->nstopping];
       return true;

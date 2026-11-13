@@ -33,6 +33,8 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd);
 /* A new configuration was published: tell the loader (CONFIG with the new generation).  No-op while the thread is
  * not running.  Called by the control thread; never blocks. */
 void db_ingest_config_changed(void);
+/* 0.7 M2: the debug level changed (karictl trace / notrace): tell the loader (DEBUG).  No-op while the thread is not running; never blocks. */
+void db_ingest_debug_changed(void);
 
 /* D1a step 7 (database { warm-before-serve }): should the workers still wait before they read their sockets?  True from the start until the loader's hot
  * list has been read, or the configured time is up, whichever comes first (always false without the option).  The query sockets stay unread meanwhile, so the

@@ -396,6 +396,9 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
         ctx->error_occurred = true;
         return (conf_token_t){TOKEN_EOF, NULL, false};
       }
+      /* 0.7 M3, debug 1: which file an include read (its name and size: an include can hold keys, its text is never logged) */
+      logev_post(LOGC_CONFIG, 1, NULL, 0, "[Config] include '%s' read (%zu octets, depth %d%s)", resolved, strlen(content), ctx->depth + 1,
+                 was_rel ? (ctx->directory ? ", relative to options { directory }" : ", relative to the including file") : "");
       ctx->depth++;
       ctx->stack[ctx->depth].file_path = dup_path;
       ctx->stack[ctx->depth].src = content;
@@ -1223,6 +1226,7 @@ static void logging_config_free(logging_config_t *lc) {
   }
   for (int c = 0; c < LOGC_COUNT; c++)
     for (int i = 0; i < lc->cat[c].n; i++) free(lc->cat[c].name[i]);
+  free(lc->debug_file);
   memset(lc, 0, sizeof(*lc));
 }
 
@@ -7202,11 +7206,18 @@ static int config_apply_directory(token_ctx_t *ctx, server_config_t *config) {
     }
     for (log_channel_t *c = config->logging.channels; ok && c; c = c->next)
       ok = dir_prefix_path(&c->file_path, eff);
+    /* the built-in default_debug: BIND writes named.run in its working directory (bin/named/log.c named_log_setdefaultchannels()); without a
+     * directory KariDNS writes none (a server started from "/" would otherwise create /karidns.run) */
+    free(config->logging.debug_file);
+    config->logging.debug_file = ok ? strdup(KLOG_DEBUG_FILE_NAME) : NULL;
+    ok = ok && config->logging.debug_file && dir_prefix_path(&config->logging.debug_file, eff);
     /* the control-channel and dnstap sockets are NOT prefixed: a UNIX socket path holds 103 bytes (sun_path), a deep directory would overflow
      * it, and the server chdir()s to the directory at start-up (and daemonize() no longer leaves it), so the relative name resolves there */
     ok = ok && dir_prefix_path(&config->database.database_file, eff) && dir_prefix_path(&config->database.conninfo_file, eff);
     ok = ok && dir_prefix_path(&config->database.loader_state_file, eff);
     if (!ok) goto oom;
+    logev_post(LOGC_CONFIG, 2, NULL, 0, "[Config] options { directory \"%s\" }: the relative paths of the configuration are taken from it; the built-in "
+               "default_debug is %s", eff, config->logging.debug_file);
   }
   /* what is still relative (no directory, or a relative directory without a startup directory) and is opened after daemonize() */
   if (config->pid_file && strcmp(config->pid_file, "none") != 0 &&
@@ -8066,11 +8077,12 @@ static bool control_resolve_group(const char *name, uint32_t *gid, char *err, si
  *   keys { "<key>" [ read-only <boolean> ] [ allow-commands { <command>; ... } ]; ... };
  * Each name refers to a top-level `key` statement (the secret and the algorithm are taken from it).  A key without read-only has full power.
  * read-only yes: status, zonestatus, observatory and dbstatus only (BIND's meaning); allow-commands (KariDNS) adds commands to it.
- * `reload` is the full reload, `reload-zone` is `reload <zone> [view] [force]`.  The test-only commands (evict, xfr-delay, xfr-fail) have no name. */
+ * `reload` is the full reload, `reload-zone` is `reload <zone> [view] [force]`, `trace` is `trace [<level>]` and `notrace` (0.7).  The test-only
+ * commands (evict, xfr-delay, xfr-fail) have no name. */
 uint32_t control_perm_from_name(const char *name) {
   static const struct { const char *name; uint32_t bit; } t[] = {
     { "reload", CTLP_RELOAD }, { "reload-zone", CTLP_RELOAD_ZONE }, { "reconfig", CTLP_RECONFIG }, { "stop", CTLP_STOP },
-    { "notify", CTLP_NOTIFY }, { "retransfer", CTLP_RETRANSFER }, { "rollback", CTLP_ROLLBACK },
+    { "notify", CTLP_NOTIFY }, { "retransfer", CTLP_RETRANSFER }, { "rollback", CTLP_ROLLBACK }, { "trace", CTLP_TRACE },
   };
   if (!name) return 0;
   for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++)
@@ -8084,6 +8096,7 @@ uint32_t control_command_perm(const char *cmd, bool has_arg) {
   if (strcmp(cmd, "status") == 0 || strcmp(cmd, "zonestatus") == 0 || strcmp(cmd, "observatory") == 0 || strcmp(cmd, "dbstatus") == 0 ||
       strcmp(cmd, "stats") == 0 || strcmp(cmd, "obspage") == 0)
     return CTLP_READ;
+  if (strcmp(cmd, "notrace") == 0) return CTLP_TRACE;   /* (the name `trace` allows both, as rndc's trace / notrace are one switch) */
   uint32_t p = control_perm_from_name(cmd);
   return p ? p : CTLP_OTHER;
 }
@@ -8172,7 +8185,7 @@ static int parse_control_keys(token_ctx_t *ctx, server_config_t *config) {
         uint32_t bit = control_perm_from_name(t.value);
         if (!bit) {
           conf_error(ctx, what, "key '%.64s': allow-commands: '%.64s' is not a command that can be allowed (reload, reload-zone, reconfig, "
-                     "stop, notify, retransfer, rollback; status, zonestatus, observatory and dbstatus are always allowed for a read-only key)",
+                     "stop, notify, retransfer, rollback, trace; status, zonestatus, observatory and dbstatus are always allowed for a read-only key)",
                      name, t.value);
           free_token(&t);
           free(name);

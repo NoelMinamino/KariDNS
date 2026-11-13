@@ -113,6 +113,10 @@ typedef struct {
 _Static_assert(sizeof(ipc_sockaddr_t) == 32, "ipc_sockaddr_t: 28 octets of sockaddr_in6, 8-aligned");
 _Static_assert(sizeof(udp_ipc_t) == 80, "udp_ipc_t: 16 octets of header and two ipc_sockaddr_t");
 
+/* sock_fd_idx values that are no socket: -2 on the notify pair is the Backend's stop command; UDP_IPC_LOGSTATE on a worker's pair (the Backend
+ * to a router) carries a KLS1 record as the payload: the debug level and the logging runtime (dns_log_state.h, 0.7 M2) */
+#define UDP_IPC_LOGSTATE (-3)
+
 #define UDP_BATCH_SIZE 16
 #define UDP_IPC_PAYLOAD_MAX 65535
 #define UDP_IPC_BUFFER_SIZE ((sizeof(udp_ipc_t) + UDP_IPC_PAYLOAD_MAX + 7) & ~7)
@@ -1311,6 +1315,9 @@ typedef struct {
   struct sockaddr_storage addr;
   tcp_sockopts_t tcp_opts;
 } broker_req_t;
+/* family of a request that is no connect (0.7 M2): `type` bytes of a KLS1 record follow (dns_log_state.h), the broker answers one byte (0 taken) */
+#define BROKER_REQ_LOGSTATE (-1)
+bool broker_send_logstate(const uint8_t *rec, size_t n);
 
 /* family は AF_INET / AF_INET6、または AF_UNIX (起動時に設定された dnstap ソケットだけ。
  * dnstap の再接続用)。戻り値は接続済みでブロッキングモードの fd、失敗時 -1。 */
@@ -1364,6 +1371,8 @@ bool ensure_priv_dir_safe(const char *dir_buf);
 int log_open_channels(log_channel_t *list, bool hand_off);
 /* the files of the installed runtime: give them to the run user (root start-up with `user`), and take away the fchown right */
 bool hand_off_logging_channels(void);
+/* 0.7 M2: a start refused before that hand-off: the log files and directories it made go to the run user (the files that were there keep theirs) */
+void log_startup_refused(void);
 bool logging_drop_fchown(void);
 
 /* dns_log.c: the operational log (see the top of that file) */
@@ -1389,7 +1398,18 @@ bool klog_guard_enter(void);
 void klog_guard_leave(bool prev);
 int klog_category_for_message(const char *fmt);
 int klog_level_from_priority(int prio);
-bool klog_level_passes(int channel_level, int level);
+bool klog_level_passes(int channel_level, int level, int debug_level);   /* a channel severity, a message level, the debug level in force */
+bool klog_channel_passes(const log_channel_t *ch, int level);            /* ... of a channel, at the level in force (and default_debug's rule) */
+bool klog_parse_debug_level(const char *s, int *out);                    /* "0" .. "99" */
+void klog_set_debug_level(int level);                                    /* the level in force, and g_logev_mask[] with it */
+/* 0.7 M2 (dns_log_state.h): the KLS1 record of the level and the installed runtime, as the Backend sends it to the other processes (0: none;
+ * *spec_dropped: the runtime did not fit, the record carries the level alone), and what such a process does with one it receives */
+size_t klog_state_encode(uint8_t *buf, size_t cap, bool *spec_dropped);
+bool klog_state_apply(const uint8_t *buf, size_t len, const char *who);
+/* the manager, before the forks: what the processes that only append keep of the start (the run user, -1 for none; the floor; karidns.run) */
+void klog_aux_init(uid_t run_user);
+/* a duplicate of the installed runtime's descriptor of the built-in default_debug when it is the file `path` (-1: none) */
+int log_runtime_dup_debug_fd(const char *path);
 size_t klog_build_line(const log_channel_t *ch, int cat, int level, const struct timespec *ts, const char *msg, char *out, size_t n);
 void klog_channel_emit(log_channel_t *ch, int cat, int level, const struct timespec *ts, const char *msg);
 void klog_record(log_runtime_t *rt, int cat, int level, const struct timespec *ts, const char *msg);
@@ -1502,7 +1522,12 @@ void backend_sig_handler(int sig);
 void supervisor_sig_handler(int sig);
 void cleanup_pid_file(void);
 bool control_socket_in_use(const char *path);
-void daemonize(void);
+bool ctl_bound_set(int dir_fd, const char *name);
+void ctl_bound_unlink(void);
+void ctl_bound_forget(void);
+bool dir_is_below(const char *dir, const struct stat *anc);
+bool startup_dir_shared_with_log(const char *path, const char *what);
+bool daemonize(void);
 void setup_ipc_tables(int num_workers);
 void run_frontend_router(pid_t backend_pid, int router_id);
 void *worker_thread_func(void *arg);

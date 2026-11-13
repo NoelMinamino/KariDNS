@@ -54,6 +54,7 @@ _Static_assert(ZDIR_APEX_GLUE_PER_NS == KDB_NOTIFY_ADDR_PER_NS && ZDIR_APEX_NADD
 #define ING_EVT_CONFIG 1          /* EVFILT_USER idents of the main kqueue */
 #define ING_EVT_RESULT 2
 #define ING_EVT_REQ 3             /* karictl reload requests from the control thread (SPSC ring g_rq) */
+#define ING_EVT_DEBUG 7           /* 0.7 M2: the debug level changed (control thread): DEBUG to the loader */
 #define ING_REQ_MAX 32            /* reload requests waiting for the loader's answer (the control thread parks as many clients) */
 #define RQ_RING 64                /* both rings: more than ING_REQ_MAX, so a ring never fills while the bound holds */
 #define ING_RETIRE_EVERY 1024     /* design 4.3: a blocking grace period every this many published zones */
@@ -172,6 +173,7 @@ typedef struct {
   uint8_t *out;                /* answers queued for the loader */
   size_t out_len, out_off, out_cap;
   bool hello_done, need_cleanup;
+  int debug_sent;              /* 0.7 M2: the level the loader was last told (DEBUG), -1 = none on this stream */
   /* view index -> name, as of the CONFIG last sent */
   char (*view_names)[KARIDNS_VIEW_NAME_MAX];
   uint8_t *view_db;            /* [index]: the view takes zones from the database (not "database none;") */
@@ -1232,6 +1234,12 @@ static void job_finish(ing_t *g, ing_job_t *j) {
     fetch_job_finish(g, j);
     return;
   }
+  /* 0.7 M3, debug 1: what became of every zone of a batch (the INFO and WARNING lines below stop after the first few) */
+  logev_post(LOGC_DATABASE, 1, NULL, 0, "[DB] zone '%s' (view '%s'), serial %u: %s%s%s", j->zone, j->view_name, j->serial,
+             j->status == KDB_ST_APPLIED ? "installed" : j->status == KDB_ST_NOT_RESIDENT ? "version taken, the data stays out of memory"
+             : j->status == KDB_ST_SHADOWED ? "loaded but hidden (a zone of karidns.conf or a catalog member has the name)"
+             : j->status == KDB_ST_UNCHANGED ? "unchanged, nothing to install" : j->status == KDB_ST_SEND_BODY ? "another version: the whole zone is asked for"
+             : "rejected", j->status == KDB_ST_REJECTED ? ": " : "", j->status == KDB_ST_REJECTED ? j->reason : "");
   switch (j->status) {
   case KDB_ST_NOT_RESIDENT:                              /* a body that was left out of memory: the directory has the version (counted as applied) */
   case KDB_ST_APPLIED:
@@ -1582,6 +1590,17 @@ static bool driver_listed(const char *list, size_t len, const char *name) {
   return false;
 }
 
+/* 0.7 M2: DEBUG, the level in force, when the loader has not been told it yet (after the handshake's CONFIG, and at every karictl trace /
+ * notrace: db_ingest_debug_changed()).  Only between messages of this thread, the one writer of the stream. */
+static void send_debug(ing_t *g) {
+  int lvl = klog_debug_level();
+  if (g->stream_fd < 0 || !g->hello_done || g->debug_sent == lvl) return;
+  kdb_enc_reset(&g->enc);
+  if (kdb_enc_begin(&g->enc, KDB_T_DEBUG) != 0 || kdb_enc_u8(&g->enc, 1, (uint8_t)lvl) != 0 || kdb_enc_end(&g->enc) != 0) g->enc.err = true;
+  send_enc(g);
+  g->debug_sent = lvl;
+}
+
 static void on_hello(ing_t *g, const kdb_msg_t *m) {
   const kdb_hello_t *h = &m->u.hello;
   ing_cfg_t snap;
@@ -1607,6 +1626,8 @@ static void on_hello(ing_t *g, const kdb_msg_t *m) {
   as_reset();
   g->hello_done = true;
   send_config(g, "handshake");
+  g->debug_sent = -1;                                  /* 0.7 M2: a new loader learns the level in force after its CONFIG */
+  send_debug(g);
 }
 
 /* ---- INVENTORY: the registry, a few hundred entries at a time so the output queue never holds all of it ---- */
@@ -2784,6 +2805,9 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
   }
   if (!ok)
     syslog(LOG_WARNING, "[DB] fetch of zone '%s' (view '%s') failed: %s", done.zone, done.view_name, why && why[0] ? why : "no reason given");
+  else
+    logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] fetch %llu of zone '%s' (view '%s') done in %lld ms%s", (unsigned long long)done.id, done.zone, done.view_name,
+               (long long)(now_ms() - done.sent_ms), done.dropped ? ": unchanged, the version in memory stays" : "");
   if (dbreg_pending_count() > 0) apply_delta(g);         /* a zone that was new to the index becomes visible before its queries are woken */
   if (ok && !done.quiet && done.mode == KDB_FETCH_FULL) dbreg_touch_loaded(done.view_name, done.zone);
   /* a zone that only a background fetch (a CNAME or glue that leads into it, step 8) brought is the first to go when memory-limit needs room (BGLOAD): N cold name
@@ -3002,6 +3026,8 @@ static void fetch_issue(ing_t *g) {
           break;
         }
         atomic_fetch_add_explicit(&g_fetch_shed, 1, memory_order_relaxed);
+        logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] fetch of zone '%s' (view '%s') shed by memory-limit: %s; its queries get \"not ready\"", q.zone, q.view,
+                   dbreg_cache_over_limit() ? "the database zones in memory are over the limit" : "as many fetches in flight as fetch-concurrency allows");
         park_wake_broadcast(q.view, q.zone, true);
         continue;
       }
@@ -3019,6 +3045,8 @@ static void fetch_issue(ing_t *g) {
         break;
       }
       atomic_fetch_add_explicit(&g_fetch_limited, 1, memory_order_relaxed);
+      logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] fetch of zone '%s' (view '%s') held back by fetch-rate %u/s: no token left; its queries get \"not ready\"", q.zone,
+                 q.view, frate);
       park_wake_broadcast(q.view, q.zone, true);
       continue;
     }
@@ -3065,6 +3093,9 @@ static void fetch_issue(ing_t *g) {
     snprintf(r->view_name, sizeof(r->view_name), "%s", g->view_names[vi]);
     snprintf(r->zone, sizeof(r->zone), "%s", q.zone);
     g->nfreq++;
+    logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] fetch %llu: zone '%s' (view '%s'), %s, %s%s; %u in flight", (unsigned long long)r->id, r->zone, r->view_name,
+               r->mode == KDB_FETCH_SUMMARY ? "summary (the apex)" : "whole zone", r->prio == KDB_FETCH_PRIO_WARM ? "warm-up" :
+               r->prio == KDB_FETCH_PRIO_BACKGROUND ? "background (CNAME or glue)" : "for a query", hot ? ", hot list" : "", (unsigned)g->nfreq);
     if (!fetch_send_req(g, r)) fetch_complete(g, r, false, "the loader's fetch stream is not connected");
   }
   if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);
@@ -3427,6 +3458,8 @@ static void *ingest_thread(void *arg) {
         drain_results(g);
       } else if (e->filter == EVFILT_USER && e->ident == ING_EVT_REQ) {
         process_requests(g);
+      } else if (e->filter == EVFILT_USER && e->ident == ING_EVT_DEBUG) {
+        send_debug(g);
       } else if (e->filter == EVFILT_USER && e->ident == ING_EVT_HOT) {
         hot_send(g);                                     /* D1a step 7: the cache thread made a hot list */
       } else if (e->filter == EVFILT_USER && e->ident == PARK_FETCH_IDENT) {
@@ -3475,14 +3508,15 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
     return false;
   }
   if (!limit_ctrl_rights(ctrl_fd)) return false;
-  struct kevent ev[6];
+  struct kevent ev[7];
   EV_SET(&ev[0], ctrl_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
   EV_SET(&ev[1], ING_EVT_CONFIG, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
   EV_SET(&ev[2], ING_EVT_RESULT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
   EV_SET(&ev[3], ING_EVT_REQ, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
   EV_SET(&ev[4], PARK_FETCH_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);      /* D1a: a worker asks for a zone */
   EV_SET(&ev[5], ING_EVT_HOT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);      /* D1a step 7: a hot list to send */
-  if (kevent(g->kq, ev, 6, NULL, 0, NULL) != 0) {
+  EV_SET(&ev[6], ING_EVT_DEBUG, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);    /* 0.7 M2: karictl trace / notrace */
+  if (kevent(g->kq, ev, 7, NULL, 0, NULL) != 0) {
     syslog(LOG_ERR, "[DB] cannot watch the loader control socket: %s", strerror(errno));
     return false;
   }
@@ -3658,6 +3692,14 @@ bool db_ingest_pick_view(const char *view_arg, char *out, size_t cap, char *err,
   }
   rcu_aux_read_unlock();
   return ok;
+}
+
+void db_ingest_debug_changed(void) {
+  int kq = atomic_load_explicit(&g_ing_kq, memory_order_acquire);
+  if (kq < 0) return;
+  struct kevent ev;
+  EV_SET(&ev, ING_EVT_DEBUG, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+  (void)kevent(kq, &ev, 1, NULL, 0, NULL);
 }
 
 void db_ingest_config_changed(void) {
