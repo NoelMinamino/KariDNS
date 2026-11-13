@@ -15,7 +15,7 @@ KARIDNS(8)                     KariDNS Manual                     KARIDNS(8)
 ## SYNOPSIS
 
 ```sh
-karidns [-v | --version | -V] [-f] [-p port | -p pid_file] [-P pid_file] [-c config_file | config_file]
+karidns [-v | --version | -V] [-f] [-d debug_level] [-p port | -p pid_file] [-P pid_file] [-c config_file | config_file]
 ```
 
 ---
@@ -55,6 +55,9 @@ karidns [-v | --version | -V] [-f] [-p port | -p pid_file] [-P pid_file] [-c con
 
 `-f`
 : Run in the foreground instead of daemonizing into the background. In foreground mode, no PID file is created unless one is set explicitly (`-P`, `-p <path>` or `pid-file`).
+
+`-d debug_level`
+: The debug level in force from the start, 0–99 (BIND's `named -d`; default 0). A value that is not a number from 0 to 99, or `-d` without a value, is a usage error (exit status 2). The level decides what the channels with `severity dynamic` and the built-in `default_debug` (the file `karidns.run`) write; `karictl trace` and `notrace` change it while the server runs and `karictl status` shows it. See **Severities and the debug level** under `logging { ... }`.
 
 `-p port`, `-p pid_file`
 : The meaning depends on the value. If the whole value is a decimal number, it is the **listen port** (1–65535; other numbers are an error) and overrides `options { port ...; }` (also on reload); for example `-p 10053`. Any other value is taken as the path of the PID lock file, like `-P`, with a warning that recommends `-P`.
@@ -473,9 +476,16 @@ logging {
 
 Every channel has exactly one destination (`file`, `syslog`, `stderr` or `null`); `file` takes its options in any order, each once. `severity` defaults to `info`. A line is `<time> <category>: <severity>: <text>`, each part when the channel asks for it (`print-time` `yes` or `local`: `28-Oct-2026 12:34:56.789`; `iso8601`: `2026-10-28T12:34:56.789` in local time without a zone, as BIND writes it; `iso8601-utc`: `2026-10-28T03:34:56.789Z`). Control characters in a message (text that came from the network, such as a key name) are written as `?`, so a message cannot start a line of its own. A statement that is not `channel` or `category`, an option a channel does not have, a value that is not valid, a channel with no or two destinations, a category name that BIND 9.20 does not have and a channel name that is not defined (or built in) are configuration errors with the file and line, in `karidns` (start and reload) and in `karicheck conf`.
 
-**Built-in channels** (usable in a `category` without being defined, as in BIND): `default_syslog` (syslog, facility `daemon`, `info`), `default_stderr` (standard error, `info`, with the time), `default_debug` (BIND writes `named.run` with the debug level in force; KariDNS has no debug level, so nothing is written) and `null`. A channel of the file with the name of a built-in channel replaces it (a warning says so). A channel defined twice: the later definition is used (a warning).
+**Built-in channels** (usable in a `category` without being defined, as in BIND): `default_syslog` (syslog, facility `daemon`, `info`), `default_stderr` (standard error, `info`, with the time), `default_debug` and `null`. A channel of the file with the name of a built-in channel replaces it (a warning says so). A channel defined twice: the later definition is used (a warning).
 
-**Categories.** The names are those of BIND 9.20.4 (`default`, `general`, `config`, `xfer-in`, `xfer-out`, `notify`, `update`, `update-security`, `security`, `network`, `queries`, `responses`, `query-errors`, `client`, `dispatch`, `dnssec`, `lame-servers`, `rate-limit`, `zoneload`, `database`, `dnstap`, `nsid`, `rpz`, `rpz-passthru`, `cname`, `spill`, `serve-stale`, `edns-disabled`, `resolver`, `trust-anchor-telemetry`, `sslkeylog`, `unmatched`). A category with no `category` statement (or only an empty list) writes to the channels of `category default`; with no `default` category either, to `default_syslog`: that is what a configuration without `logging` does, and it is what KariDNS always did (syslog, facility `daemon`). Several statements for one category add their channels (BIND appends), a category may list up to 8 channels, and a line goes to every channel whose severity admits it.
+**`default_debug` and `karidns.run`.** As BIND's (`file "named.run"; severity dynamic;` with the time, in the working directory), `default_debug` is the file **`karidns.run` in `options { directory }`**, `severity dynamic` with the time (`print-time yes`, no category, no severity), and it writes **only while the debug level is above 0** (BIND's `ISC_LOG_DEBUGONLY`): nothing at level 0, not even an error, and from level 1 on every message up to the level (errors, warnings, notices, info and the debug lines). Differences from BIND:
+- BIND creates `named.run` when it first writes to it. The sandboxed process cannot create a file after the start, so KariDNS opens `karidns.run` (creating it empty, appending when it is there) **at every start**, before the sandbox, like the other log files, and hands it to `user` / `group`; `karictl trace` then works without a `logging` statement. A reload opens it again through the directory descriptor the server holds. It is opened only when some category writes to `default_debug`: a category without channels while there is no `category default` (so with no `logging` statement at all), or a category that names it; when every category has channels without it (a `category default` that does not name it, say), or a channel of the file is named `default_debug`, `karidns.run` is left alone. It is never rolled (no `versions` / `size`).
+- Without `options { directory }`, `default_debug` writes nothing and no `karidns.run` is made (a server started from `/` by rc(8) would otherwise write `/karidns.run`). Define a channel with `severity dynamic` to see debug output there.
+- A `karidns.run` that cannot be opened (the run user cannot create it in the directory at a reload, a directory of that name, or a file refused for the reasons under **Directories and files**) is not an error, as in BIND: `[Logging] The debug file '...' (built-in channel default_debug) is not used: <reason>; the debug output goes only to the channels of the logging statement` (warning), `default_debug` writes nothing until a later reload or restart can open it, and the start or the reload goes on.
+- `karicheck conf` reads the configuration and creates nothing.
+- The supervisor, the routers and the connect broker append to `karidns.run` by name like to every file channel, but never create it: when it was removed, only the sandboxed process makes it again (at the next reload). For now these processes keep the debug level they were started with (`-d`); `karictl trace` and `notrace` change the level of the sandboxed process (the one with the control channel, where nearly every message comes from).
+
+**Categories.** The names are those of BIND 9.20.4 (`default`, `general`, `config`, `xfer-in`, `xfer-out`, `notify`, `update`, `update-security`, `security`, `network`, `queries`, `responses`, `query-errors`, `client`, `dispatch`, `dnssec`, `lame-servers`, `rate-limit`, `zoneload`, `database`, `dnstap`, `nsid`, `rpz`, `rpz-passthru`, `cname`, `spill`, `serve-stale`, `edns-disabled`, `resolver`, `trust-anchor-telemetry`, `sslkeylog`, `unmatched`). A category with no `category` statement (or only an empty list) writes to the channels of `category default`; with no `default` category either, to `default_syslog` and `default_debug` (BIND ARM: `category default { default_syslog; default_debug; };`): that is what a configuration without `logging` does. At debug level 0 this is what KariDNS always did (syslog, facility `daemon`); since 0.7 `default_debug` adds `karidns.run` above level 0. Several statements for one category add their channels (BIND appends), a category may list up to 8 channels, and a line goes to every channel whose severity admits it.
 
 The messages of the server carry a `[Prefix]` (the part of the program they come from); the prefix selects the category:
 
@@ -498,12 +508,17 @@ The messages of the server carry a `[Prefix]` (the part of the program they come
 | `responses` | The response log (KariDNS; BIND 9.20 has a category of that name too). |
 | `general` | Everything else: start-up and shut-down, the processes (`[Manager]`, `[Backend]`, `[Frontend]`, `[Broker]`, `[IPC]`), `karictl` commands (`[Control]`), catalog zones, ALIAS, forwarding, program zones, an expired zone, the log files themselves (`[Logging]`). |
 
-Severities are those of BIND: critical, error, warning, notice, info, and `debug <n>`. KariDNS has no debug level in force (BIND's `-d`), so a message at a debug level is written only to a channel whose own `severity debug <n>` asks for it (the event messages below use `debug 1` .. `debug 4` where BIND does); `severity dynamic` passes everything from critical to info. The two messages that were `debug` in earlier versions (a NOTIFY that was answered, a zone file left alone by `reconfig` because its mtime is unchanged) are `info` now, which is what `default_syslog` passes.
+**Severities and the debug level.** Severities are those of BIND: critical, error, warning, notice, info, `dynamic` and `debug [<n>]`. The **debug level in force** (0–99, 0 at the start) is set by `karidns -d <level>` and changed with `karictl trace` (one more, up to 99), `karictl trace <level>` and `karictl notrace` (0), as `named -d` and `rndc trace` / `notrace`; each change is logged as `[Control] debug level is now N` (category `general`, notice) and `karictl status` shows `debug level: N`. The channels follow BIND's `isc_log_doit()`:
+- `severity dynamic` passes the messages up to the level in force: critical to info at level 0, plus `debug 1` .. `debug N` at level N.
+- `severity debug <n>` is a fixed level: it passes up to `debug n` whatever the level in force (at level 0 too, as in BIND: a channel of the file has no "debug only" flag), and `severity info` (the default) never passes a debug message.
+- `default_debug` (`karidns.run`, above) is `dynamic` and writes nothing at level 0.
+
+Changing the level opens no file (a channel must exist at the start, or come with a reload under the rules of **Files**) and costs nothing on the query path: the event messages below test one atomic value, recomputed when the level changes, before they build any text, and a debug message that no channel passes is not formatted. The event messages use `debug 1` .. `debug 4` where BIND does. The two messages that were `debug` in earlier versions (a NOTIFY that was answered, a zone file left alone by `reconfig` because its mtime is unchanged) are `info` now, which is what `default_syslog` passes. Few messages are logged at a debug level yet (the event messages, a later page of `karictl stats`).
 
 The other categories are accepted (a configuration written for BIND works) but this authoritative server has nothing to write to them: `client`, `dispatch`, `dnssec`, `lame-servers`, `nsid`, `rpz`, `rpz-passthru`, `cname`, `spill`, `serve-stale`, `edns-disabled`, `resolver`, `trust-anchor-telemetry`, `sslkeylog`, `unmatched`. 
 
 **Event messages (`update-security`, `update`, `xfer-out`, `query-errors`).** These categories carry messages about what clients ask of the server, in the form BIND writes them (`lib/ns/update.c`, `xfrout.c`, `query.c`): "client <address>#<port>: <text>". They arise on the query path, so they do not write anything there: a worker thread of the Backend puts a fixed-size record into its own ring (the ring of the query log, which carries the records of `category queries` as well), and the query logger thread formats it and writes it to the channels of the category; a message from any other thread (a transfer thread, the asynchronous resolver threads) is formatted and written at once. Consequences:
-- A category costs nothing while no channel passes the message: whether some non-null channel of the category (or of `default`, or `default_syslog` when there is none) admits the level is decided when the configuration is applied, and the sites test it with one atomic load before they build a text. With no `logging` statement the messages go to `default_syslog` at `info`, as BIND's do; a message at a debug level (BIND logs the reasons of `query-errors` at `debug 1` and `debug 3`) is written only to a channel with `severity debug <n>` where n is at least the level of the message (KariDNS has no running debug level, so `severity dynamic` does not pass it).
+- A category costs nothing while no channel passes the message: whether some non-null channel of the category (or of `default`, or `default_syslog` and `default_debug` when there is none) admits the level is decided when the configuration is applied and when the debug level changes, and the sites test it with one atomic load before they build a text. With no `logging` statement the messages go to `default_syslog` at `info`, as BIND's do (and to `karidns.run` above level 0); a message at a debug level (BIND logs the reasons of `query-errors` at `debug 1` and `debug 3`) is written to a channel with `severity debug <n>` where n is at least the level of the message, to a `severity dynamic` channel while the debug level in force is at least the level of the message, and (with `options { directory }`) to `karidns.run` likewise.
 - Every message can be caused by a client, so each category has a rate limit: `update-security` 10 per second, `update` 20, `query-errors` 20, `xfer-out` 50, `security` (the refused transfers) 20. The messages over the limit are not written; when the second is over one line reports them, `<N> message(s) suppressed by the rate limit of <L> per second`, at the level of the last one dropped. (BIND logs every one of them.)
 - The ring takes at most 90% of its slots for these records; one that finds it fuller is dropped and counted, and the query logger thread reports the count (`[QueryLog] Dropped N event log messages ...`, category `general`) every five seconds, like the dropped queries.
 - Names that came from the network are written in their presentation form: a byte outside `0x21..0x7e` as `\DDD`, a control character that is left becomes `?`; a line is at most 255 bytes of text.
@@ -558,7 +573,7 @@ logging {
 - A file never exceeds `size` (BIND lets the last line pass it).
 - Messages written before the channels exist (the first lines of a start: the version, the warnings and errors found while the configuration is read) go to syslog, like BIND's messages before its `logging` statement is applied; a reload reports what it finds in the configuration through the channels in use.
 - The supervisor, the UDP routers and the connect broker are separate processes: they open the file by name for each line and never roll it, so their lines follow a roll done by the sandboxed process.
-- **Reload.** A reload builds the channels again. A file in a directory that was already open when the server started can be opened; a file in a directory the sandbox cannot reach (a new directory) cannot, and `karictl reload` / `SIGHUP` then keeps the logging in use and reports `restart needed for: logging (a log file in a directory not opened at start-up)`; everything else of the reload is applied. A file that cannot be opened for another reason rejects the reload (the running configuration is kept).
+- **Reload.** A reload builds the channels again. A file in a directory that was already open when the server started can be opened; a file in a directory the sandbox cannot reach (a new directory) cannot, and `karictl reload` / `SIGHUP` then keeps the logging in use and reports `restart needed for: logging (a log file in a directory not opened at start-up)`; everything else of the reload is applied. A file that cannot be opened for another reason rejects the reload (the running configuration is kept); the built-in `karidns.run` never does (a warning, see `default_debug` above).
 - Not honoured, accepted with a warning: `buffered yes` (every line is written at once); a `syslog` facility name that does not exist (BIND silently uses `daemon`; so does KariDNS).
 
 **Directories and files (root start).** karidns creates the directory of a log file when it is missing and hands over only a directory it created itself to `user`/`group`; an existing directory keeps its owner and mode (as BIND does): prepare it so that the run user can write to it (and, for a rotation, create files in it). A log file is accepted only when it is a regular file with one link whose owner is root, the user karidns runs as, or the run user; a hard link, another type of file or a file of a third user makes the start (or the reload) fail with `Refusing to use log file`, so that a planted link cannot make karidns append to, or hand over, another file.
@@ -646,6 +661,7 @@ Any other key is a configuration error that names the key (`control-channel: unk
 ```
 key "admin" { algorithm hmac-sha256; secret "<base64>"; };
 key "web"   { algorithm hmac-sha256; secret "<base64>"; };
+key "debug" { algorithm hmac-sha256; secret "<base64>"; };
 
 control-channel {
     socket "/var/run/karidns/control.sock";
@@ -653,6 +669,7 @@ control-channel {
     keys {
         "admin";                            // full power
         "web" read-only yes allow-commands { reload-zone; rollback; };
+        "debug" read-only yes allow-commands { trace; };   // status and the debug level, nothing else
     };
 };
 ```
@@ -669,6 +686,7 @@ control-channel {
   | `notify` | `karictl notify <zone>` |
   | `retransfer` | `karictl retransfer <zone>` |
   | `rollback` | `karictl rollback <zone>`: accepted in the configuration now; until the command exists the server answers it with the unknown-command error |
+  | `trace` | `karictl trace [<level>]` and `karictl notrace` (0.7): the debug level. A name of its own, not part of `read-only`, because the debug output can show more than the read-only commands do; a key without `read-only` has it, as every other command |
 
 - The unnamed `secret` (and `algorithm`) of the block keep working as they always did: a full-power key that is logged as `(main)`. A configuration with only `keys { }` and no `secret` is valid.
 - **Nothing changes for `karictl` or the protocol.** The client's `karictl.conf` holds the `secret` and the `algorithm` of the key it uses (the name of the key is not sent). The server computes the HMAC of the challenge for the unnamed secret and for every listed key, each with its own algorithm, compares all of them in constant time and takes the key that matches. Two keys (the unnamed secret included) must therefore not have the same secret: that is a configuration error.
@@ -1655,6 +1673,9 @@ For complete configuration syntax, query evaluation flows, and Extended AXFR det
 
 `/var/run/karidns/karidns.pid`
 : Default process ID file when daemonized.
+
+`<directory>/karidns.run`
+: The built-in `default_debug` channel (BIND's `named.run`), in `options { directory }`: created at the start, written while the debug level (`-d`, `karictl trace`) is above 0. Not made without a directory. See `logging { ... }`.
 
 `/usr/local/libexec/karidns-dbloader`
 : The database loader (the packages `karidns-sqlite3`, `karidns-postgresql` and `karidns-db`; the default `loader-path`).

@@ -58,7 +58,7 @@ Commands that take a zone name accept an optional view name as the next argument
   - Server boot time, time of the last successful (re)configuration (both to the second) and the configuration file path
 
   `karictl` and `karidns` must be the same version: the reply is a binary structure, and a reply of another size is shown as is and exits with status 3.
-  - Number of zones and number of running AXFR/IXFR transfers
+  - Number of zones, `debug level: N` (the debug level in force: `karidns -d`, `trace`, `notrace`; where `rndc status` prints it) and number of running AXFR/IXFR transfers
   - Whether query and response logging are enabled
   - Current and high-water TCP connection counts
   - Size of the zone versions and IXFR deltas (D1a): the bytes of the published versions of the zones (the version, its image and its glue block) and of the IXFR deltas the zones keep (the data of the difference only), for the zones that come from the database and for the others, as `resident` (what the zones serve now) and `retired` (versions that a newer one replaced and that are not freed yet, because a reader or a transfer may still hold them). It is not the whole memory of a zone: the zone entry itself, its per-zone counters and the response cache are not in it. An IXFR delta that left the history stays counted as resident until the last transfer that reads it has released it. Read only: nothing limits them yet
@@ -148,6 +148,18 @@ Commands that take a zone name accept an optional view name as the next argument
   karictl dbstatus example.test
   ```
 
+`trace [level]`
+: Change the debug level in force of the server (0.7; `rndc trace`): without an argument one more (at most 99), with one that level, a number from 0 to 99. The reply is `OK debug level is now N`; a level that is not a number from 0 to 99 is answered `ERROR trace: the debug level must be a number from 0 to 99`, a second argument `ERROR trace takes one argument at most: ...` (exit status 3, the level is not changed). The server logs each change as `[Control] debug level is now N` (category `general`, notice). The channels with `severity dynamic` write the messages up to the level, and the built-in `default_debug` (the file `karidns.run` in `options { directory }`) writes everything up to it while it is above 0; see karidns(8), `logging`. The level is not kept across a restart (`karidns -d` sets it at the start). For now it changes the level of the sandboxed process only, where the control channel and nearly every message are; the supervisor, the routers and the connect broker keep the level they were started with.
+  ```sh
+  karictl trace 3      # the debug 3 lines of query-errors (why a query was REFUSED) appear in the dynamic channels
+  karictl notrace
+  ```
+
+`notrace`
+: Set the debug level to 0 (`rndc notrace`); the reply is `OK debug level is now 0`. An argument is refused (`ERROR notrace takes no argument`).
+
+  `trace` and `notrace` need the permission `trace` of a restricted control key (`allow-commands { trace; }`); a `read-only yes` key alone does not have it.
+
 `tsig-keygen [keyname]`
 : Generate a 256-bit random TSIG secret with OpenSSL `RAND_bytes(3)` and print a `key` block (`algorithm hmac-sha256`) ready for `karidns.conf`. The default key name is `transfer-key`. This command does not contact the server and does not read the configuration file.
   ```sh
@@ -191,7 +203,7 @@ The file is not parsed as a full configuration file: `karictl` takes the quoted 
 : Usage error (no command, an unknown option, `notify` / `retransfer` / `zonestatus` / `rollback` without a zone name; the usage text goes to standard error and nothing is sent to the server), or the secret could not be read or decoded from the configuration file, the challenge was invalid, or authentication failed. A command the server does not know is not a usage error for `karictl`: the server answers `ERROR unknown command` and the exit status is 3. `-h` and `--help` print the usage text to standard output and exit with 0.
 
 `3`
-: The server returned an error (`ERROR ...`, including a failed `reload` or `reconfig`, a command that the key is not allowed to run, a database zone that was rejected or could not be read, and a reload that timed out) or an invalid `status` or `observatory` response (also `dbstatus` without a database block).
+: The server returned an error (`ERROR ...`, including a failed `reload` or `reconfig`, a `trace` level that is not a number from 0 to 99, a command that the key is not allowed to run, a database zone that was rejected or could not be read, and a reload that timed out) or an invalid `status` or `observatory` response (also `dbstatus` without a database block).
 
 ---
 
