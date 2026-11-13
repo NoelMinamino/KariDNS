@@ -14,6 +14,8 @@ desc: <<EOD
 karidns-webadmin is the HTTP API of a KariDNS database (PostgreSQL or SQLite3), with a web interface for it (English and Japanese; plain JavaScript served by the service itself): logins with TOTP or an OpenID Connect provider, users, groups and grants (global, domain and
 subdomain masters), the zones and their records, change sets, zone versions and rollback, and templates. It runs karidns-zone and karicheck (from
 karidns-sqlite3, karidns-postgresql or karidns-db, and from karidns, which must be installed first).
+Upgrading from 0.6.x with pkg add: add the 0.7 database package first (a 0.6.x one provides neither karidns-zone nor karicheck,
+and pkg add refuses this package with "Missing provide"); pkg upgrade from a repository upgrades both together.
 EOD
 categories: [
     "dns",

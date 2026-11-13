@@ -13,6 +13,8 @@ licenses: [
 desc: <<EOD
 karidns-signer keeps the zones of a KariDNS database (PostgreSQL or SQLite3) signed: it runs BIND's dnssec-keygen and
 dnssec-signzone and karidns-zone (from karidns-sqlite3, karidns-postgresql or karidns-db, which must be installed first).
+Upgrading from 0.6.x with pkg add: add the 0.7 database package first (a 0.6.x one provides no karidns-zone, and pkg add
+refuses this package with "Missing provide karidns-zone"); pkg upgrade from a repository upgrades both together.
 EOD
 categories: [
     "dns",

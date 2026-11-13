@@ -16,8 +16,8 @@ set -e
 # The files are staged with `make install-... DESTDIR=<stage>` (the Makefile is the one list of what goes where) and the package lists what
 # was staged, with its modes and the owner root:wheel (packaging/freebsd/pkg_files.sh).  The four packages hold the same files and conflict
 # with each other: `pkg add` refuses the second one because of the overlap of the files (pkg 2.8 does not act on the `conflicts` the manifest lists); the database packages provide karidns-zone, which karidns-signer
-# and karidns-webadmin require.  The packages create the user and group karidns (pre-install, no login, no home) and the directories
-# /var/run/karidns (root:wheel 0755) and /var/log/named (karidns, when it is missing); the user is left when the package is removed
+# and karidns-webadmin require.  The packages create the user and group karidns (pre-install, no login, no home) and the directory
+# /var/run/karidns (root:wheel 0755; /var/log/named is made by the rc script for the user of the configuration); the user is left when the package is removed
 # (docs/distribution.md "The user karidns").  NN of postgresqlNN-client is the version of the package that provides the libpq the loader
 # was linked against (found with ldd and pkg which); the build host decides, nothing is hard-coded.  Run once per package (each run rebuilds
 # everything: `make clean`).  --no-build packages the binaries that are already built in the tree (tests/run_install_test.sh).

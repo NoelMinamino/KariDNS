@@ -9,7 +9,8 @@
 # karidns_enable="YES"
 # karidns_flags=""
 # karidns_config="/usr/local/etc/karidns/karidns.conf"
-# karidns_log_owner=""     the owner of /var/log/named (default: the `user` of the configuration file; see karidns_run_user below)
+# karidns_log_dir="/var/log/named"   the log directory that is created at start when it is missing (an existing one is never changed)
+# karidns_log_owner=""               its owner then, "user" or "user:group" (default: options { user; group; } of the configuration)
 #
 
 . /etc/rc.subr
@@ -25,6 +26,7 @@ load_rc_config "${name}"
 : ${karidns_enable:="NO"}
 : ${karidns_config:="/usr/local/etc/karidns/karidns.conf"}
 : ${karidns_flags:="${karidns_config}"}
+: ${karidns_log_dir:="/var/log/named"}
 : ${karidns_log_owner:=""}
 
 required_files="${karidns_config}"
@@ -33,28 +35,110 @@ reload_cmd="karidns_reload"
 checkconf_cmd="karidns_checkconf"
 start_precmd="karidns_prestart"
 
-# karidns_run_user: the user the server runs as, which owns /var/log/named (docs/distribution.md "The user karidns").  The server takes it
-# from options { user "..."; } of its configuration; so does this: karidns_log_owner when rc.conf sets it, else that `user` statement when
-# the user exists, else bind, named or karidns, the first that exists (bind and named as before 0.7).  The package creates karidns and its
-# sample configuration names it; a configuration of an earlier version that names bind or named keeps that user and its directories.
-karidns_run_user()
+# karidns_conf_identity FILE: "user:group" of options { user "..."; group "..."; } as karidns reads them (either may be empty), or a failure
+# when this cannot tell.  The tokens are those of the server's lexer (dns_config_parser.c): # and // comments to the end of the line, /* */
+# comments, "quoted strings" without escapes, { } ; and words that end at a space, { } ; # // or /*  (so `user"karidns";` is the one word
+# user"karidns", which karidns refuses, not a user).  The last user / group of options wins, as in the server.  `include "file";` is
+# followed one level deep (relative to options { directory } when it came before, else to the directory of FILE); an include inside an
+# included file, a relative directory, a file that cannot be read, an unclosed comment or string and unbalanced braces are a failure.
+karidns_conf_identity()
 {
+    awk -v main="$1" '
+    function lex(f, A,    s, l, r, n, i, j, c, len, w) {
+        s = ""
+        while ((r = (getline l < f)) > 0) s = s l "\n"
+        close(f)
+        if (r < 0) return -1
+        n = 0; i = 1; len = length(s)
+        while (i <= len) {
+            c = substr(s, i, 1)
+            if (c == " " || c == "\t" || c == "\n" || c == "\r") { i++; continue }
+            if (c == "#" || substr(s, i, 2) == "//") { j = index(substr(s, i), "\n"); i = j ? i + j : len + 1; continue }
+            if (substr(s, i, 2) == "/*") { j = index(substr(s, i + 2), "*/"); if (!j) return -1; i += j + 3; continue }
+            if (c == "{" || c == "}" || c == ";") { A[++n] = c; i++; continue }
+            if (c == "\"") { j = index(substr(s, i + 1), "\""); if (!j) return -1; A[++n] = "Q" substr(s, i + 1, j - 1); i += j + 1; continue }
+            w = ""
+            while (i <= len) {
+                c = substr(s, i, 1)
+                if (c == " " || c == "\t" || c == "\n" || c == "\r" || c == "{" || c == "}" || c == ";" || c == "#") break
+                if (c == "/" && (substr(s, i + 1, 1) == "/" || substr(s, i + 1, 1) == "*")) break
+                w = w c; i++
+            }
+            A[++n] = "W" w
+        }
+        return n
+    }
+    # walk the tokens A[1..n] of a file at include level lvl; depth, cnt[], first[], val, inopt, user, group, dir: the parse so far
+    function walk(A, n, lvl, base,    k, t, p, B, m) {
+        for (k = 1; k <= n; k++) {
+            t = A[k]
+            if (t == "Winclude") {
+                if (lvl > 0 || k + 2 > n || A[k + 1] !~ /^[QW]/ || A[k + 2] != ";") return 0
+                p = substr(A[k + 1], 2); k += 2
+                if (p !~ /^\//) { if (dir != "" && dir !~ /^\//) return 0; p = (dir != "" ? dir : base) "/" p }
+                split("", B)
+                if ((m = lex(p, B)) < 0) return 0
+                if (!walk(B, m, lvl + 1, base)) return 0
+                continue
+            }
+            if (t == "{") {
+                if (depth == 0) inopt = (cnt[0] == 1 && first[0] == "options")
+                cnt[depth]++; depth++; cnt[depth] = 0
+                continue
+            }
+            if (t == "}") { if (--depth < 0) return 0; continue }
+            if (t == ";") {
+                if (depth == 1 && inopt && cnt[1] == 2) {
+                    if (first[1] == "user") user = val
+                    else if (first[1] == "group") group = val
+                    else if (first[1] == "directory") dir = val
+                }
+                cnt[depth] = 0
+                if (depth == 0) inopt = 0
+                continue
+            }
+            if (++cnt[depth] == 1) first[depth] = substr(t, 2)
+            else if (cnt[depth] == 2) val = substr(t, 2)
+        }
+        return 1
+    }
+    BEGIN {
+        base = main; if (base !~ /\//) base = "."; else { sub(/\/[^\/]*$/, "", base); if (base == "") base = "/" }
+        depth = 0; cnt[0] = 0
+        if ((n = lex(main, T)) < 0 || !walk(T, n, 0, base) || depth != 0) exit 1
+        print user ":" group
+    }'
+}
+
+# karidns_log_dir_make: the log directory, when it is missing, for the user the server runs as (docs/distribution.md "The user karidns").  An
+# existing directory is left as it is (its owner and mode are the operator's: an installation of an earlier version keeps the directory of
+# its user).  The owner: karidns_log_owner ("user" or "user:group"), else options { user } of the configuration with options { group } or
+# else that user's primary group; when neither tells, the start is refused (there is no guess: FreeBSD always has the user bind).
+karidns_log_dir_make()
+{
+    [ -d "${karidns_log_dir}" ] && return 0
     if [ -n "${karidns_log_owner}" ]; then
-        echo "${karidns_log_owner}"
-        return 0
+        _user=${karidns_log_owner%%:*}
+        _group=""
+        case "${karidns_log_owner}" in *:*) _group=${karidns_log_owner#*:} ;; esac
+        _from="karidns_log_owner"
+    elif _id=$(karidns_conf_identity "${karidns_config}") && [ -n "${_id%%:*}" ]; then
+        _user=${_id%%:*}
+        _group=${_id#*:}
+        _from="options { user } of ${karidns_config}"
+    else
+        echo "${name}: ${karidns_log_dir} is missing, and the user karidns runs as cannot be told from ${karidns_config}" \
+            "(no options { user }, or an include in an included file): set karidns_log_owner=\"user[:group]\" in rc.conf or create the directory" >&2
+        return 1
     fi
-    _u=$(sed -e 's,//.*,,' -e 's,#.*,,' "${karidns_config}" 2>/dev/null | awk '$1 == "user" { v = $2; gsub(/[";]/, "", v); if (v != "") { print v; exit } }')
-    if [ -n "${_u}" ] && id -u "${_u}" >/dev/null 2>&1; then
-        echo "${_u}"
-        return 0
+    if [ -z "${_user}" ] || ! id -u "${_user}" >/dev/null 2>&1; then
+        echo "${name}: the user '${_user}' of ${_from} does not exist: ${karidns_log_dir} is not created" >&2
+        return 1
     fi
-    for _u in bind named karidns; do
-        if id -u "${_u}" >/dev/null 2>&1; then
-            echo "${_u}"
-            return 0
-        fi
-    done
-    return 1
+    if [ -z "${_group}" ]; then
+        _group=$(id -gn "${_user}") || return 1
+    fi
+    install -d -o "${_user}" -g "${_group}" -m 0755 "${karidns_log_dir}"
 }
 
 karidns_prestart()
@@ -63,14 +147,9 @@ karidns_prestart()
     if [ -x /usr/local/bin/karicheck ]; then
         /usr/local/bin/karicheck conf "${karidns_config}" || return 1
     fi
-    # the owner of the log directory: the user the server runs as
-    _owner=$(karidns_run_user) || { echo "${name}: none of the users of the configuration, bind, named or karidns exists" >&2; return 1; }
-    _group=$(id -gn "${_owner}")
-
-    # Ensure run / log directory exists
     # /var/run/karidns must be root:wheel (0755) to satisfy ensure_priv_dir_safe()
     install -d -o root -g wheel -m 0755 /var/run/karidns
-    install -d -o "${_owner}" -g "${_group}" -m 0755 /var/log/named
+    karidns_log_dir_make
 }
 
 karidns_reload()

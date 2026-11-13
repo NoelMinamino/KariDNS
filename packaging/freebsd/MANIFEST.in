@@ -30,7 +30,6 @@ pw usershow karidns >/dev/null 2>&1 || pw useradd karidns -g karidns -h - -d /no
 EOD
     post-install: <<EOD
 install -d -o root -g wheel -m 0755 /var/run/karidns
-[ -d /var/log/named ] || install -d -o karidns -g karidns -m 0755 /var/log/named
 EOD
 }
 messages: [
@@ -39,14 +38,16 @@ messages: [
         message: <<EOD
 karidns runs as the user karidns, which this package created: copy /usr/local/etc/karidns/karidns.conf.sample to
 /usr/local/etc/karidns/karidns.conf (its user and group are karidns) and edit it. A configuration of an earlier version that names the
-user bind or named keeps running as that user; the rc script gives /var/log/named to the user the configuration names
-(docs/distribution.md "The user karidns").
+user bind or named keeps running as that user. An existing /var/log/named is left as it is; when it is missing, the rc script creates
+it for the user and group of the configuration (or karidns_log_owner of rc.conf) and refuses to start when it cannot tell them
+(docs/distribution.md "The user karidns"). karidns-signer and karidns-webadmin 0.7 require karidns-zone and karicheck, which the
+server packages provide since 0.7: with pkg add, upgrade this package before them (docs/distribution.md 2.6).
 EOD
     },
     {
         type: "remove",
         message: <<EOD
-The user and group karidns, /var/run/karidns and /var/log/named are left in place (a configuration and the logs may still use them).
+The user and group karidns, /var/run/karidns and /var/log/named (made by the rc script) are left in place (a configuration and the logs may still use them).
 To remove them when nothing else uses them: pw userdel karidns (it removes the group karidns too), rm -r /var/run/karidns /var/log/named.
 EOD
     }
