@@ -1,4 +1,4 @@
-.TH KARICHECK 8 "2026-11-13" "KariDNS" "KariDNS Manual"
+.TH KARICHECK 8 "2026-11-14" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karicheck.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karicheck \- Configuration and Zone File Validation Utility for KariDNS
@@ -1004,6 +1004,12 @@ valid, or cannot be used with another option
 .br
 \fIMeaning:\fR the zone text on standard input is larger than 64 MiB
 .TP 8
+\fBio.file.too\-large\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a configuration or zone file is larger than the server reads (256
+MiB)
+.TP 8
 \fBio.pipe\fR
 \fISeverity:\fR error
 .br
@@ -1096,6 +1102,12 @@ the statement
 \fISeverity:\fR error
 .br
 \fIMeaning:\fR a TSIG algorithm that KariDNS does not support
+.TP 8
+\fBconf.tsig.algorithm\-deprecated\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a TSIG algorithm that is deprecated and insecure (HMAC-MD5,
+HMAC-SHA1; RFC 8945)
 .TP 8
 \fBconf.tsig.secret\-length\fR
 \fISeverity:\fR error
@@ -1303,6 +1315,12 @@ zone
 \fISeverity:\fR warning
 .br
 \fIMeaning:\fR min-retry-time is larger than max-retry-time
+.TP 8
+\fBconf.zone.primary\-settings\-unsigned\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a secondary takes the settings of its primary over a transfer
+without TSIG
 .TP 8
 \fBconf.control\-key.tsig\fR
 \fISeverity:\fR warning

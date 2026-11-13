@@ -1,4 +1,4 @@
-.TH KARICTL 8 "2026-11-13" "KariDNS" "KariDNS Manual"
+.TH KARICTL 8 "2026-11-14" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karictl.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karictl \- Remote Control and Management Utility for KariDNS
@@ -95,6 +95,14 @@ Frontend process health status
 Security counters: RRL dropped/slipped responses, Extended DNS Error counters
 (18 Prohibited, 20 Not Authoritative, 21 Not Supported, other) and truncated
 dnstap messages
+.IP \(bu 2
+dnstap (0.7): \fBdnstap dropped (queue full): N\fR (messages lost because a ring
+was full: the collector reads too slowly, or \fBqueue\-size\fR is too small),
+\fBdnstap dropped (not connected): N\fR (messages lost while no collector was
+connected), \fBdnstap connected: yes|no|no (not configured)\fR and \fBdnstap
+reconnects: N\fR (connections made by the background retry); see karidns(8)
+\fBdnstap\fR "Loss". Without a \fBdnstap\fR block the counters are 0, as
+\fBdnstap truncated\fR is
 .RE
 .TP 8
 \fBreload [zone [view] [force]]\fR
@@ -364,16 +372,21 @@ file.) The exit status is 0 only when the whole output was written, so
 file. The output has a \fBserver\fR part (version, boot time, zone count,
 workers, TCP clients, zone memory, query, response, EDNS, NOTIFY, transfer,
 response-cache, rate-limit and Extended DNS Error counters, failed transfers,
-failed reloads, raised alerts), then \fBviews\fR (zones, queries and responses
-summed per view; only when every zone is listed), then one set of series \fBper
-zone\fR (queries by transport, responses by RCODE, EDNS / DO / ECS queries,
-rate-limit drops and slips, NOTIFY, transfers in and their failures, response
-cache hits and misses, SOA serial, role, time of the last transfer). The
-counters are cumulative since the server started (Prometheus \fBcounter\fRs); a
-zone that a reload replaces starts again at 0, which \fBrate()\fR handles as a
-counter reset. Queries that no zone answered (REFUSED for a name outside every
-zone, FORMERR, NOTIMP, ...) belong to no zone: they are in
-\fBkaridns_unzoned_responses_total{rcode}\fR, and
+failed reloads, raised alerts, and dnstap: \fBkaridns_dnstap_truncated_total\fR,
+\fBkaridns_dnstap_dropped_total{reason="queue_full"|"not_connected"}\fR, the
+gauge \fBkaridns_dnstap_connected\fR (1 or 0; 0 also without a \fBdnstap\fR
+block) and \fBkaridns_dnstap_reconnects_total\fR; in JSON
+\fBdnstap_truncated\fR, \fBdnstap_dropped\fR \fB{queue_full, not_connected}\fR,
+\fBdnstap_connected\fR (true / false) and \fBdnstap_reconnects\fR), then
+\fBviews\fR (zones, queries and responses summed per view; only when every zone
+is listed), then one set of series \fBper zone\fR (queries by transport,
+responses by RCODE, EDNS / DO / ECS queries, rate-limit drops and slips, NOTIFY,
+transfers in and their failures, response cache hits and misses, SOA serial,
+role, time of the last transfer). The counters are cumulative since the server
+started (Prometheus \fBcounter\fRs); a zone that a reload replaces starts again
+at 0, which \fBrate()\fR handles as a counter reset. Queries that no zone
+answered (REFUSED for a name outside every zone, FORMERR, NOTIMP, ...) belong to
+no zone: they are in \fBkaridns_unzoned_responses_total{rcode}\fR, and
 \fBkaridns_responses_total{rcode}\fR is the zones' responses plus
 those. \fBkaridns_queries_total{proto}\fR counts the queries answered for a
 zone. \fBstats <zone> [view]\fR prints one zone (the same as \fBobservatory

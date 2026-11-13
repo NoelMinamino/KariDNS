@@ -1,4 +1,4 @@
-.TH KARIDNS.CONF 5 "2026-11-13" "KariDNS" "KariDNS Manual"
+.TH KARIDNS.CONF 5 "2026-11-14" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns.conf \- the configuration file of karidns(8)
@@ -1311,9 +1311,9 @@ to the socket.
 \fBqueue\-size <n>;\fR (alias \fBqueue_size\fR)
 \fIDefault:\fR \fB4096\fR
 .br
-\fIDescription:\fR Entries in each worker's dnstap ring buffer
-(0\[u2013]1048576; values below 64 use the default; rounded up to a power of
-two).
+\fIDescription:\fR Entries in each worker's dnstap ring buffer, and in the one
+ring of the other threads (0\[u2013]1048576; values below 64 use the default;
+rounded up to a power of two). See "Loss" below.
 .TP 8
 \fBrequire\-connect yes|no;\fR
 \fIDefault:\fR \fBno\fR
@@ -1341,7 +1341,98 @@ zone that contains the QNAME in the client's view, looked up when the message is
 sent). At shutdown the queued messages are sent and the Frame Streams session is
 ended with STOP / FINISH.
 .PP
-\fBkarictl status\fR reports the number of truncated dnstap messages.
+\fBTransport.\fR Frame Streams <https://farsightsec.github.io/fstrm/> over a
+UNIX stream socket, bidirectional: the consumer listens on \fBsocket\fR,
+\fBkaridns\fR connects and sends READY with the content type
+\fBprotobuf:dnstap.Dnstap\fR; an ACCEPT that lists content types must list this
+one (otherwise \fBkaridns\fR logs it and does not use the connection), then
+START and the data frames; at shutdown STOP, and \fBkaridns\fR waits up to 2 s
+for FINISH. The run \fBuser\fR must be allowed to connect (write permission on
+the socket file): a consumer that creates its socket again at every start needs
+the mode set again after each start. Without the collector at start-up,
+\fBkaridns\fR starts anyway and retries (1 s, doubling up to 60 s; the retries
+go through the connect broker, which connects to this path only);
+\fBrequire\-connect yes\fR makes start-up fail instead. The path is fixed when
+the server starts.
+.PP
+\fBWhat a frame contains.\fR One \fBDnstap\fR message (type \fBMESSAGE\fR) per
+DNS message; \fBkaridns\fR sends \fBAUTH_QUERY\fR and \fBAUTH_RESPONSE\fR only
+(\fBlog\-queries\fR, \fBlog\-responses\fR). Top level: \fBidentity\fR and
+\fBversion\fR when configured (absent otherwise). \fBMessage\fR: \fBtype\fR;
+\fBsocket_family\fR (INET / INET6); \fBsocket_protocol\fR (UDP or TCP);
+\fBquery_address\fR and \fBquery_port\fR (the client); \fBresponse_address\fR
+(the server's address the query came to, when known) and \fBresponse_port\fR
+(when not 0); \fBquery_zone\fR (the wire-format name of the zone that contains
+the QNAME, chosen in the client's view by the sender thread when the frame is
+sent, so a reload in between gives the new configuration; absent when no zone
+contains the name, e.g. REFUSED, or the message has no question); for
+\fBAUTH_QUERY\fR \fBquery_time_sec\fR / \fBquery_time_nsec\fR and
+\fBquery_message\fR, for \fBAUTH_RESPONSE\fR \fBresponse_time_sec\fR /
+\fBresponse_time_nsec\fR and \fBresponse_message\fR. An \fBAUTH_RESPONSE\fR
+carries the response only (no \fBquery_message\fR, no query time): pair it with
+its query by client address, port and DNS ID, or read the question in the
+response. The times are the wall clock (\fBCLOCK_REALTIME\fR) when the message
+was recorded: the query when it was parsed, the response when it was built. Not
+filled: \fBpolicy\fR, \fBhttp_protocol\fR, \fBextra\fR. A zone transfer (AXFR,
+IXFR) is one \fBAUTH_RESPONSE\fR per DNS message of the transfer. A message
+recorded by a worker thread (UDP and TCP queries and responses) is cut at 4096
+octets, without a mark (the DNS message ends early); \fBdnstap truncated\fR in
+\fBkarictl status\fR (\fBkaridns_dnstap_truncated_total\fR) counts them. The
+other threads (transfers, the responses of the asynchronous I/O threads) send up
+to 65535 octets.
+.PP
+\fBLoss.\fR Each worker thread queues its messages in its own ring of
+\fBqueue\-size\fR slots, the other threads in one shared ring of the same size;
+one sender thread writes them to the socket. Messages are lost, and counted,
+when:
+.IP \(bu 2
+a ring is full: the consumer reads more slowly than the server answers, or a
+burst is longer than the ring (\fBdnstap dropped (queue full)\fR,
+\fBkaridns_dnstap_dropped_total{reason="queue_full"}\fR). The sender writes
+\fB[dnstap] N messages dropped, the queue was full (the collector reads too
+slowly, or queue\-size is too small); M since the start\fR (category
+\fBdnstap\fR, warning), at most once every 10 s while it goes on;
+.IP \(bu 2
+no consumer is connected: a socket that has not taken data for 2 s (\fB[dnstap]
+write failed, reconnecting: collector too slow (no room in the socket for 2
+s)\fR) or that failed is closed, the queued messages are discarded, and nothing
+is queued until the next connection (\fBdnstap dropped (not connected)\fR,
+\fBreason="not_connected"\fR). The reconnect line says how many: \fB[dnstap]
+reconnected to <path>; N messages were lost while not connected\fR.
+.PP
+Not counted: the frames already written into the socket when the consumer went
+away (the kernel buffer; which of them it read is not known), and what is still
+queued when the server stops without the consumer answering. \fBdnstap
+connected\fR (\fBkaridns_dnstap_connected\fR) is the link state, \fBdnstap
+reconnects\fR (\fBkaridns_dnstap_reconnects_total\fR) the connections made by
+the retry. A worker slot takes 4656 bytes and a slot of the shared ring 66104
+bytes (\fBsizeof\fR, FreeBSD 15.1 amd64): with the default 4096 slots, 19 MB per
+worker and 271 MB for the shared ring, reserved at start-up and resident as the
+slots are used (the worker rings are reserved also without \fBdnstap\fR). A ring
+rides out a pause of the consumer of \fBqueue\-size\fR / (messages per second of
+one worker): at 50,000 queries a second, both types logged and 8 workers (about
+12,500 messages a second per worker), 4096 slots last about 0.3 s. Raise
+\fBqueue\-size\fR for longer pauses; a consumer that is slower on average loses
+messages whatever the size.
+.PP
+\fBCounting.\fR With \fBlog\-queries\fR and \fBlog\-responses\fR both on (the
+default) every query is two frames. A consumer that counts frames for rates or
+top lists counts each query twice: count one message type, or send responses
+only (\fBlog\-queries no;\fR, which also halves the frames). A query that is not
+answered (a rate-limit drop) has an \fBAUTH_QUERY\fR and no \fBAUTH_RESPONSE\fR.
+.PP
+\fBPrivacy.\fR Frames carry the full client address and port and the whole DNS
+message (the query name). Nothing is truncated or anonymised by \fBkaridns\fR:
+that is the consumer's job (the client prefixes of \fBkaridns\-tapstat \-4\fR /
+\fB\-6\fR are an example).
+.PP
+\fBConsumers.\fR \fBkaridns\-tapstat\fR(8) aggregates the stream by zone, name,
+type, rcode and client prefix. Any Frame Streams receiver that reads
+\fBprotobuf:dnstap.Dnstap\fR over a UNIX socket works; observed on 2026-11-13:
+DNS-collector 3.3.7 on FreeBSD 15.1 took the stream without changes and fed
+Prometheus and Grafana; its Prometheus output had no per-zone metric (it decodes
+\fBquery_zone\fR but does not export it) and counted queries and responses
+together.
 .PP
 The block is also read in BIND's grammar, \fBdnstap { auth; };\fR (with
 \fBdnstap\-output unix "<socket>";\fR in \fBoptions\fR); see "BIND option
@@ -1489,65 +1580,97 @@ severity admits it.
 .PP
 The messages of the server carry a \fB[Prefix]\fR (the part of the program they
 come from); the prefix selects the category:
-.PP
-.TS
-lb lbw(56)
-l lw(56).
-\&Category	\&Messages
-_
-\&\fBconfig\fR	\&Reading and reloading the configuration (\fB[Config]\fR).
-\&\fBxfer\-in\fR	T{
+.TP 8
+\fBconfig\fR
+Reading and reloading the configuration (\fB[Config]\fR).
+.TP 8
+\fBxfer\-in\fR
 Inbound AXFR / IXFR and the SOA checks of a secondary zone (\fB[AXFR]\fR,
 \fB[IXFR]\fR, \fB[XFR]\fR).
-T}
-\&\fBxfer\-out\fR	T{
+.TP 8
+\fBxfer\-out\fR
 Outbound transfers: start and end with the statistics, falls back from IXFR to
 AXFR, the IXFR over UDP, refused and bad requests, quota, aborted transfers, and
 the older messages (a record that does not fit a message, settings that cannot
 be sent, Extended AXFR that is refused); see Event messages below.
-T}
-\&\fBquery\-errors\fR	T{
+.TP 8
+\fBquery\-errors\fR
 Why a query was answered with SERVFAIL, FORMERR, REFUSED, NOTIMP or NOTAUTH (see
 Event messages below).
-T}
-\&\fBnotify\fR	\&NOTIFY sent, answered, retried, failed (\fB[Notify]\fR).
-\&\fBupdate\fR	T{
+.TP 8
+\fBnotify\fR
+NOTIFY sent, answered, retried, failed (\fB[Notify]\fR).
+.TP 8
+\fBupdate\fR
 Dynamic updates applied or aborted (\fB[Update]\fR), and why an UPDATE for a
 zone of the server was not applied (\fBupdating zone 'z/IN': update
 failed: ... (RCODE)\fR, see Event messages below).
-T}
-\&\fBupdate\-security\fR	T{
+.TP 8
+\fBupdate\-security\fR
 Who may update: \fBsigner "k" approved|denied\fR, \fBupdate 'z/IN' denied\fR,
 \fBupdate forwarding 'z/IN' denied\fR (see Event messages below).
-T}
-\&\fBsecurity\fR	\&TSIG errors (\fB[TSIG]\fR), DNS cookie problems (\fB[Cookie]\fR).
-\&\fBnetwork\fR	\&Socket options and buffer sizes (\fB[Network]\fR).
-\&\fBzoneload\fR	T{
+.TP 8
+\fBsecurity\fR
+TSIG errors (\fB[TSIG]\fR), DNS cookie problems (\fB[Cookie]\fR).
+.TP 8
+\fBdnssec\fR
+A signed zone that cannot give the NSEC or NSEC3 proof a negative, wildcard or
+referral answer needs (RFC 4035 3.1.3, 3.1.4; RFC 5155 7.2): \fB[DNSSEC]
+zone 'example.test': no NSEC3 that matches the closest encloser (RFC 5155 7.2.2)
+for '...': the answer goes out without that proof ...\fR, at warning, at most
+once a minute per zone (0.7). The answer itself is unchanged. Reported: with
+NSEC, the NSEC that covers the name and the one that covers the wildcard (name
+error), the NSEC of the name or the one that covers an empty non-terminal (no
+data), the NSEC that proves no closer match of a wildcard answer and of every
+wildcard CNAME on the way, the NSEC of the wildcard owner (wildcard no data),
+the NSEC of an insecure delegation (referral); with NSEC3, the NSEC3 that
+matches the closest provable encloser, the one that covers the next closer name
+and the one that covers the wildcard (name error), the NSEC3 of the name (no
+data; at an empty non-terminal that only insecure delegations in an Opt-Out span
+make, which has no NSEC3 (RFC 5155 7.1), RFC 5155 7.2.3 cannot be met literally
+and the answer carries the closest provable encloser proof of 7.2.1 instead, as
+BIND 9.20 does: its NSEC3 and the Opt-Out cover of the next closer name are
+reported when missing), the closest provable encloser proof of a DS query at,
+and a referral to, an insecure delegation that has no NSEC3 of its own (also
+when the cover of the next closer name lacks the Opt-Out flag), the NSEC3 that
+covers the next closer name of a wildcard answer and of every wildcard CNAME,
+and the closest encloser proof and the NSEC3 of the wildcard (wildcard no
+data). Not reported: a wildcard that exists at the closest provable encloser of
+a name error (it cannot be covered).
+.TP 8
+\fBnetwork\fR
+Socket options and buffer sizes (\fB[Network]\fR).
+.TP 8
+\fBzoneload\fR
 Loading zone files and building zone images (\fB[Zone]\fR, \fB[ZoneLoader]\fR,
 \fB[Image]\fR, \fB[tinydns]\fR).
-T}
-\&\fBdatabase\fR	T{
+.TP 8
+\fBdatabase\fR
 The database zones (\fB[DB]\fR), and the messages of \fBkaridns\-dbloader\fR
 (read from its standard error by the supervisor, see karidns-dbloader(8)
 MESSAGES).
-T}
-\&\fBrate\-limit\fR	\&Response rate limiting (\fB[RRL]\fR).
-\&\fBdnstap\fR	\&The dnstap output (\fB[dnstap]\fR).
-\&\fBqueries\fR	\&The query log, one line per query.
-\&\fBresponses\fR	T{
+.TP 8
+\fBrate\-limit\fR
+Response rate limiting (\fB[RRL]\fR).
+.TP 8
+\fBdnstap\fR
+The dnstap output (\fB[dnstap]\fR).
+.TP 8
+\fBqueries\fR
+The query log, one line per query.
+.TP 8
+\fBresponses\fR
 The response log (KariDNS; BIND 9.20 has a category of that name too).
-T}
-\&\fBgeneral\fR	T{
+.TP 8
+\fBgeneral\fR
 Everything else: start-up and shut-down, the processes (\fB[Manager]\fR,
 \fB[Backend]\fR, \fB[Frontend]\fR, \fB[Broker]\fR, \fB[IPC]\fR), \fBkarictl\fR
 commands (\fB[Control]\fR), catalog zones, ALIAS, forwarding, program zones, an
 expired zone, the log files themselves (\fB[Logging]\fR).
-T}
-\&\fBclient\fR	T{
+.TP 8
+\fBclient\fR
 The debug 3 line of each query, NOTIFY and UPDATE (0.7, see \fBDebug
 messages\fR).
-T}
-.TE
 .PP
 \fBSeverities and the debug level.\fR Severities are those of BIND: critical,
 error, warning, notice, info, \fBdynamic\fR and \fBdebug [<n>]\fR. The \fBdebug
@@ -1710,10 +1833,9 @@ query, which the debug budget of the category holds to 1000 lines a second.
 .PP
 The other categories are accepted (a configuration written for BIND works) but
 this authoritative server has nothing to write to them: \fBdispatch\fR,
-\fBdnssec\fR, \fBlame\-servers\fR, \fBnsid\fR, \fBrpz\fR, \fBrpz\-passthru\fR,
-\fBcname\fR, \fBspill\fR, \fBserve\-stale\fR, \fBedns\-disabled\fR,
-\fBresolver\fR, \fBtrust\-anchor\-telemetry\fR, \fBsslkeylog\fR,
-\fBunmatched\fR.
+\fBlame\-servers\fR, \fBnsid\fR, \fBrpz\fR, \fBrpz\-passthru\fR, \fBcname\fR,
+\fBspill\fR, \fBserve\-stale\fR, \fBedns\-disabled\fR, \fBresolver\fR,
+\fBtrust\-anchor\-telemetry\fR, \fBsslkeylog\fR, \fBunmatched\fR.
 .PP
 \fBEvent messages (\fBupdate\-security\fB, \fBupdate\fB, \fBxfer\-out\fB,
 \fBquery\-errors\fB).\fR These categories carry messages about what clients ask
@@ -5539,7 +5661,17 @@ answer instead of the primary) can change the ACLs of the secondary: widen
 key (\fBtsig\-key\fR in the secondary's zone, \fBallow\-transfer { key ...; }\fR
 on the primary) whenever the settings are accepted, or write the statements that
 matter in the secondary's own \fBzone {}\fR (they win) or set
-\fBprimary\-settings no;\fR.
+\fBprimary\-settings no;\fR. Since 0.7 a secondary \fBzone {}\fR with
+\fBprimary\-settings yes\fR (the default) and a primary whose transfer is not
+signed is reported by \fBkaricheck conf\fR
+(\fBconf.zone.primary\-settings\-unsigned\fR, with the place of the
+\fBprimaries\fR statement) and logged at warning (\fBconfig\fR) when the server
+reads the configuration. The key is the one the transfer uses: the \fBkey\fR of
+the \fBprimaries\fR entry (or of its list), else the \fBkeys\fR of the
+\fBserver\fR statement that covers the primary's address (the view's own
+\fBserver\fR statements when it has any, else the top-level ones), else the
+zone's \fBtsig\-key\fR; a primary for which none of them names a key is
+reported.
 .RE
 .SS Forward and program zones: not applied upstream
 The TCP connection a \fBtype forward;\fR zone opens to its forwarder (the

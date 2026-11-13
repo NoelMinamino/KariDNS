@@ -1,4 +1,4 @@
-.TH KARIDNS\-ZONE 8 "2026-11-13" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-ZONE 8 "2026-11-14" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-zone.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-zone \- writes a zone file into a PowerDNS 5.1 database (\fBimport\fR)
@@ -52,8 +52,10 @@ same file and \fBdiff\fR shows the real change. The text is parsed again before
 a byte is written and must give the same records.
 .SS What an import does
 .IP 1. 4
-Reads the text (a file, \fB\-\fR for standard input, at most 64 MiB there) and
-parses it. A syntax error names the file and the line.
+Reads the text (a file, at most 256 MiB as the server reads a zone file, or
+\fB\-\fR for standard input, at most 64 MiB there; a larger input is refused,
+\fBio.file.too\-large\fR or \fBio.stdin.too\-large\fR, not cut) and parses it. A
+syntax error names the file and the line.
 .IP 2. 4
 Runs the checks of \fBkaricheck zone\fR on it (with the \fBcheck\-*\fR options
 of the configuration, below). An \fBerror\fR fails the import and nothing is
@@ -995,8 +997,10 @@ the NSEC3 records, so the file serves it as the database did. Remove the
 \-\-serial increment\fR first if the file was changed).
 .SH LIMITS
 .IP \(bu 2
-\fBimport\fR reads up to 64 MiB from standard input. A zone file read from
-standard input cannot use \fB$INCLUDE\fR (there is no directory to read from;
+\fBimport\fR reads up to 64 MiB from standard input and a zone file of up to 256
+MiB (the server's limit for a zone file and an \fB$INCLUDE\fR; since 0.7, a
+larger file used to be read whole). A zone file read from standard input cannot
+use \fB$INCLUDE\fR (there is no directory to read from;
 \fBzone.include\-stdin\fR).
 .IP \(bu 2
 One zone per \fBimport <zone> <file>\fR: a BIND-format file with several zones

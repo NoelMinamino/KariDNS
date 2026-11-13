@@ -1,4 +1,4 @@
-.TH KARIDNS\-DBLOADER 8 "2026-11-13" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-DBLOADER 8 "2026-11-14" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-dbloader.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-dbloader \- reads the PowerDNS 5.1 tables of a SQLite3 or PostgreSQL
@@ -177,6 +177,17 @@ example.com.: using NSEC3PARAM ...\fR), which went to syslog before: the line is
 (identity \fBkaridns\-dbloader\fR, \fB[DB]\fR in front of the text). If standard
 error cannot be written (the pipe is closed), the message goes to syslog. It is
 an error without \fB\-s\fR.
+.TP 8
+\fBKARIDNS_NOSYSLOG=1\fR (environment)
+The test hook of \fBkaridns(8)\fR (ENVIRONMENT, 0.7): every line the loader
+would give syslog(3) goes to standard error only, as \fBkaridns\-dbloader <pid>
+\- \- <text>\fR (the copy \fBLOG_PERROR\fR prints in stream mode anyway), and
+the system log gets nothing: in stream mode without \fB\-\-log\-stderr\fR, when
+the pipe of \fB\-\-log\-stderr\fR is closed, and for the messages of the shared
+code in \fB\-\-dump\fR and \fB\-\-check\fR mode (which have no \fBopenlog()\fR
+and went to the system log). Only the value \fB1\fR counts; the integration
+tests export it (\fBtests/lib_proc.sh\fR). A loader that \fBkaridns\fR starts
+has a cleared environment and \fB\-\-log\-stderr\fR, so it is not affected.
 .TP 8
 \fB\-\-debug N\fR
 The debug level, 0 .. 99 (default 0): the debug messages up to it are written
