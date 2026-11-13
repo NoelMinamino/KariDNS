@@ -29,11 +29,15 @@ const section = (md, name) => {
 const rows = (block) => block.split('\n').filter((l) => /^\|.*\|$/.test(l)).slice(2).map((l) => l.slice(1, -1).split(/(?<!\\)\|/).map((c) => c.trim()));
 
 test('both files exist, are linked from the README and the service manual, and are in the package', () => {
+  // 0.7: the Makefile is the one list of what is installed (INST_DOCS_WEBADMIN, continued with "\"); the package script stages that target
+  const mk = read('Makefile').replace(/\\\n/g, ' ');
+  const instDocs = (/^INST_DOCS_WEBADMIN = (.*)$/m.exec(mk) || [])[1] || '';
+  assert.match(read('packaging/freebsd/build_webadmin_pkg.sh'), /^pkg_stage .*\binstall-docs-webadmin\b/m, 'the package script stages install-docs-webadmin');
   for (const f of ['docs/karidns-webadmin-gui.md', 'docs/karidns-webadmin-gui-checklist.md']) {
     assert.ok(fs.existsSync(new URL(f, ROOT)), f);
     const base = f.slice('docs/'.length);
     assert.ok(read('docs/karidns-webadmin.md').includes(`(${base})`), `docs/karidns-webadmin.md links ${base}`);
-    assert.ok(read('packaging/freebsd/build_webadmin_pkg.sh').includes(`docs/${base}`), `the package script installs ${base}`);
+    assert.ok(instDocs.includes(`:docs/${base}:`), `make install-docs-webadmin installs ${base}`);
   }
   assert.ok(read('README.md').includes('(docs/karidns-webadmin-gui.md)'), 'README links the manual');
   assert.ok(read('README.md').includes('(docs/karidns-webadmin-gui-checklist.md)'), 'README links the checklist');
