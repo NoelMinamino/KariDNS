@@ -7831,6 +7831,7 @@ int main(int argc, char **argv) {
 
   // === Backend Process (backend_pid == 0) ===
   gc_snapshot_detach_only();
+  query_engine_key_redraw();   /* K-9: a key of its own (not the manager's), before its first thread and its first query */
   struct sigaction b_sa;
   memset(&b_sa, 0, sizeof(b_sa));
   b_sa.sa_handler = backend_sig_handler;

@@ -1115,23 +1115,36 @@ typedef struct {
   int n;
 } qn_visited_t;
 
-/* K-9 (0.7): the hash is SipHash-2-4 under the process's random key (g_rcache_key, the response cache's key, drawn once at start-up by
- * query_engine_key_init()), so that two names that collide cannot be built offline.  The bytes hashed are the name lower-cased (ASCII), an
- * unescaped trailing dot dropped, exactly what the former unkeyed FNV-1a saw.  The name is normalised into a stack buffer (no allocation);
- * a name longer than the buffer, which no caller passes, is chained: the hash of the full buffer starts the next one. */
+/* K-9 (0.7): the hash is SipHash-2-4 under the process's random key (g_rcache_key, the response cache's key), so that two names that
+ * collide cannot be built offline.  The bytes hashed are the name lower-cased (ASCII), an unescaped trailing dot dropped, exactly what the
+ * former unkeyed FNV-1a saw.  The name is normalised into a stack buffer (no allocation); a name longer than the buffer, which no caller
+ * passes, is chained: the hash of the full buffer starts the next one. */
 static uint64_t g_rcache_key[2];
 
-/* Drawn once per process before main(): every process and test harness that links the engine has the key before its first query, whether
- * the response cache is configured or not, and it never changes while worker threads read it. */
+/* Drawn before main() in every process that links the engine (the server's manager, the tools, the unit tests, the fuzz harnesses): each has
+ * a key before its first query, whether the response cache is configured or not.  The server's Backend draws its own right after its fork
+ * (query_engine_key_redraw()): this one is the manager's, and the processes forked from the manager hold copies of it. */
 static void __attribute__((constructor)) query_engine_key_init(void) {
   arc4random_buf(g_rcache_key, sizeof(g_rcache_key));
 }
 
+/* The Backend, right after its fork and before its first thread (dns_server_core.c): a key that no other process has (0.6 drew it in
+ * response_cache_init(), in the manager before the fork).  Nothing hashed under the old key survives: the response cache that the manager
+ * allocated is empty (only the Backend's workers store into it, and none runs yet), and the loop-check hashes live for one query. */
+void query_engine_key_redraw(void) {
+  arc4random_buf(g_rcache_key, sizeof(g_rcache_key));
+}
+
 #ifdef KARIDNS_UNIT_TEST
-/* Tests: replace the key (the hash must change with it) */
+/* Tests: replace or read the key (the hashes must change with it) */
 void query_engine_set_key_for_test(uint64_t k0, uint64_t k1) {
   g_rcache_key[0] = k0;
   g_rcache_key[1] = k1;
+}
+
+void query_engine_get_key_for_test(uint64_t *k0, uint64_t *k1) {
+  *k0 = g_rcache_key[0];
+  *k1 = g_rcache_key[1];
 }
 #endif
 
@@ -2870,13 +2883,13 @@ size_t response_cache_init(size_t bytes) {
   if (sets == 0 || sets > UINT32_MAX) return 0;
   rcache_set_t *t = calloc(sets, sizeof(rcache_set_t));
   if (!t) return 0;
-  /* the key (g_rcache_key) was drawn at start-up by query_engine_key_init(); the CNAME loop check shares it */
+  /* the key (g_rcache_key) is query_engine_key_init()'s, drawn again in the Backend (query_engine_key_redraw()); the CNAME loop check shares it */
   g_rcache_sets = sets;
   g_rcache = t;
   return sets * sizeof(rcache_set_t);
 }
 
-static uint64_t rcache_tag(const char *qname_lc, uint16_t qtype, uint16_t qclass, uint64_t gen, uint64_t cfg_gen) {
+STATIC_TEST uint64_t rcache_tag(const char *qname_lc, uint16_t qtype, uint16_t qclass, uint64_t gen, uint64_t cfg_gen) {
   uint8_t buf[DNS_NAME_TEXT_SIZE + 24];
   size_t n = strnlen(qname_lc, DNS_NAME_TEXT_SIZE);
   memcpy(buf, qname_lc, n);
