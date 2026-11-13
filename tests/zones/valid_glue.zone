@@ -8,7 +8,7 @@ $TTL 3600
     3600       ; minimum
 )
 @ IN NS ns1.valid.example.
-@ IN NS ns2.external.com.
+@ IN NS ns2.external.test.
 ns1 IN A 192.0.2.1
 ns1 IN AAAA 2001:db8::1
 www IN A 192.0.2.10

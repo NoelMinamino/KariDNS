@@ -49,8 +49,8 @@ trap cleanup EXIT INT TERM
 # Create a mock DNS server handling trace steps:
 # 1. Root query (". NS") -> returns NS "a.root-servers.net" with glue "127.0.0.1"
 #    (default +noglue ignores that glue and asks "a.root-servers.net A" -> "127.0.0.1")
-# 2. Query "example.com A" -> returns referral to "ns1.external.org" WITHOUT glue
-# 3. Query "ns1.external.org A" (glue resolution fallback) -> returns "127.0.0.1"
+# 2. Query "example.com A" -> returns referral to "ns1.external.test" WITHOUT glue
+# 3. Query "ns1.external.test A" (glue resolution fallback) -> returns "127.0.0.1"
 # 4. Query "example.com A" to authoritative -> returns "example.com CNAME cdn.example.net"
 # 5. Query "cdn.example.net A" (CNAME re-trace) -> returns "192.0.2.100"
 cat << 'PL_EOF' > "$TMP_DIR/mock_trace_server.pl"
@@ -157,18 +157,18 @@ while (1) {
         $resp = $qid . pack("nnnnn", 0x8180, 1, 1, 0, 0) .
                 $nw . pack("nn", 1, 1) .
                 $nw . pack("nnNn", 1, 1, 300, 4) . inet_aton("127.0.0.1");
-    } elsif ($qname =~ /^ns1\.external\.org\./i) {
+    } elsif ($qname =~ /^ns1\.external\.test\./i) {
         # Glue resolution query: return 127.0.0.1
         $resp = $qid . pack("nnnnn", 0x8180, 1, 1, 0, 0) .
-                "\x03ns1\x08external\x03org\x00" . pack("nn", 1, 1) .
-                "\x03ns1\x08external\x03org\x00" . pack("nnNn", 1, 1, 300, 4) . inet_aton("127.0.0.1");
+                "\x03ns1\x08external\x04test\x00" . pack("nn", 1, 1) .
+                "\x03ns1\x08external\x04test\x00" . pack("nnNn", 1, 1, 300, 4) . inet_aton("127.0.0.1");
     } elsif ($qname =~ /^example\.com\./i) {
         $example_count++;
         if ($example_count == 1) {
             # Referral without glue (Authority section only)
             $resp = $qid . pack("nnnnn", 0x8000, 1, 0, 1, 0) .
                     "\x07example\x03com\x00" . pack("nn", 1, 1) .
-                    "\x07example\x03com\x00" . pack("nnNn", 2, 1, 300, 18) . "\x03ns1\x08external\x03org\x00";
+                    "\x07example\x03com\x00" . pack("nnNn", 2, 1, 300, 19) . "\x03ns1\x08external\x04test\x00";
         } else {
             # Authoritative response: CNAME cdn.example.net
             $resp = $qid . pack("nnnnn", 0x8400, 1, 1, 0, 0) .
@@ -204,7 +204,7 @@ echo -n "Test: Trace succeeds through glue resolution and stops at the CNAME lik
 : > "$QUERY_LOG"
 OUT=$("$DAG" @127.0.0.1 -p $PORT example.com A +trace +timeout=2 2>&1 || true)
 # BIND dig +trace (9.20) ends at the authoritative CNAME answer and does not restart for the target (T-14)
-if echo "$OUT" | grep -q "ns1\.external\.org" && echo "$OUT" | grep -qE "^example\.com\.[[:space:]].*CNAME[[:space:]]+cdn\.example\.net\." \
+if echo "$OUT" | grep -q "ns1\.external\.test" && echo "$OUT" | grep -qE "^example\.com\.[[:space:]].*CNAME[[:space:]]+cdn\.example\.net\." \
    && ! echo "$OUT" | grep -q "192\.0\.2\.100" && ! grep -qi "^cdn\.example\.net\." "$QUERY_LOG"; then
     echo "OK"
 else
@@ -220,7 +220,7 @@ echo -n "Test: Received lines name the server like dig (T-05) ... "
 # first hop: the @server text; later hops: the NS name the address belongs to
 if echo "$OUT" | grep -qE "^;; Received [0-9]+ bytes from 127\.0\.0\.1#$PORT\(127\.0\.0\.1\) in [0-9]+ ms" \
    && echo "$OUT" | grep -qE "^;; Received [0-9]+ bytes from 127\.0\.0\.1#$PORT\(a\.root-servers\.net\) in [0-9]+ ms" \
-   && echo "$OUT" | grep -qE "^;; Received [0-9]+ bytes from 127\.0\.0\.1#$PORT\(ns1\.external\.org\) in [0-9]+ ms"; then
+   && echo "$OUT" | grep -qE "^;; Received [0-9]+ bytes from 127\.0\.0\.1#$PORT\(ns1\.external\.test\) in [0-9]+ ms"; then
     echo "OK"
 else
     echo "FAILED"
@@ -256,7 +256,7 @@ echo "=== 3. Testing +trace +glue uses ADDITIONAL section glue (legacy behavior)
 echo -n "Test: Root server glue is used without resolver lookup ... "
 : > "$QUERY_LOG"
 OUT=$("$DAG" @127.0.0.1 -p $PORT example.com A +trace +glue +timeout=2 2>&1 || true)
-if ! grep -q "^a\.root-servers\.net\." "$QUERY_LOG" && echo "$OUT" | grep -q "ns1\.external\.org" && echo "$OUT" | grep -q "cdn\.example\.net"; then
+if ! grep -q "^a\.root-servers\.net\." "$QUERY_LOG" && echo "$OUT" | grep -q "ns1\.external\.test" && echo "$OUT" | grep -q "cdn\.example\.net"; then
     echo "OK"
 else
     echo "FAILED"
@@ -355,7 +355,7 @@ fi
 echo -n "Test: +noall +answer +trace still shows the referral (dig: +trace sets +authority) ... "
 OUT=$("$DAG" @127.0.0.1 -p $PORT example.com A +noall +answer +trace +timeout=2 +nohexdump 2>&1 || true)
 OUT2=$("$DAG" @127.0.0.1 -p $PORT example.com A +trace +noall +answer +timeout=2 +nohexdump 2>&1 || true)
-if printf '%s\n' "$OUT" | grep -qE "^example\.com\.[[:space:]].*NS[[:space:]]+ns1\.external\.org\." \
+if printf '%s\n' "$OUT" | grep -qE "^example\.com\.[[:space:]].*NS[[:space:]]+ns1\.external\.test\." \
    && ! printf '%s\n' "$OUT2" | grep -qE "^example\.com\.[[:space:]].*NS[[:space:]]"; then
     echo "OK"
 else

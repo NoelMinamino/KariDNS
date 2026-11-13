@@ -1870,7 +1870,7 @@ static void test_zone_parser_origin_substitution_at_symbol(void) {
     zone_arena_init(&arena);
     parse_context_t ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.default_origin = "myorigin.com.";
+    ctx.default_origin = "myorigin.test.";
 
     const char *zstr = "@ IN A 192.0.2.1\n";
     char *b = arena_strdup(&arena, zstr);
@@ -1885,10 +1885,10 @@ static void test_zone_parser_multiline_parentheses_continuation(void) {
     zone_arena_init(&arena);
     parse_context_t ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.default_origin = "multi.com.";
+    ctx.default_origin = "multi.test.";
 
     const char *zstr = 
-        "@ IN SOA ns1.multi.com. hostmaster.multi.com. (\n"
+        "@ IN SOA ns1.multi.test. hostmaster.multi.test. (\n"
         "    2026092401 ; serial\n"
         "    7200       ; refresh\n"
         "    3600       ; retry\n"
@@ -1907,9 +1907,9 @@ static void test_zone_parser_soa_negative_ttl_parsing(void) {
     zone_arena_init(&arena);
     parse_context_t ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.default_origin = "soa.com.";
+    ctx.default_origin = "soa.test.";
 
-    const char *zstr = "@ IN SOA ns.soa.com. admin.soa.com. 1 3600 1800 604800 86400\n";
+    const char *zstr = "@ IN SOA ns.soa.test. admin.soa.test. 1 3600 1800 604800 86400\n";
     char *b = arena_strdup(&arena, zstr);
     bool ok = (parse_zone_fast(b, strlen(b), &arena, &ctx) > 0);
     CHECK(ok == true);

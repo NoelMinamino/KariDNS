@@ -83,28 +83,28 @@ sub build_response {
     }
     my ($qtype, $qclass) = unpack("nn", substr($query, $off, 4));
 
-    if ($qtype == 2) { # NS query for test.internal.zone.
+    if ($qtype == 2) { # NS query for test.internal.test.
         # Return NS record in ANSWER and in-bailiwick Glue A record in ADDITIONAL
         return $qid . pack("nnnnn", 0x8180, 1, 1, 0, 1) .
-               "\x04test\x08internal\x04zone\x00" . pack("nn", 2, 1) .
-               # Answer: test.internal.zone NS ns1.test.internal.zone (rdlength = 24)
-               "\x04test\x08internal\x04zone\x00" . pack("nnNn", 2, 1, 300, 24) . "\x03ns1\x04test\x08internal\x04zone\x00" .
-               # Additional: ns1.test.internal.zone A 127.0.0.1 (GLUE) (rdlength = 4)
-               "\x03ns1\x04test\x08internal\x04zone\x00" . pack("nnNn", 1, 1, 300, 4) . inet_aton("127.0.0.1");
+               "\x04test\x08internal\x04test\x00" . pack("nn", 2, 1) .
+               # Answer: test.internal.test NS ns1.test.internal.test (rdlength = 24)
+               "\x04test\x08internal\x04test\x00" . pack("nnNn", 2, 1, 300, 24) . "\x03ns1\x04test\x08internal\x04test\x00" .
+               # Additional: ns1.test.internal.test A 127.0.0.1 (GLUE) (rdlength = 4)
+               "\x03ns1\x04test\x08internal\x04test\x00" . pack("nnNn", 1, 1, 300, 4) . inet_aton("127.0.0.1");
     } elsif ($qtype == 6) { # SOA query (from nssearch)
-        # mname: \x03ns1\x04test\x08internal\x04zone\x00 (24 bytes)
-        # rname: \x04host\x04test\x08internal\x04zone\x00 (25 bytes)
+        # mname: \x03ns1\x04test\x08internal\x04test\x00 (24 bytes)
+        # rname: \x04host\x04test\x08internal\x04test\x00 (25 bytes)
         # numbers: 5 * 4 = 20 bytes -> total rdlength = 69 bytes
         return $qid . pack("nnnnn", 0x8580, 1, 1, 0, 0) .
-               "\x04test\x08internal\x04zone\x00" . pack("nn", 6, 1) .
-               "\x04test\x08internal\x04zone\x00" . pack("nnNn", 6, 1, 300, 69) .
-               "\x03ns1\x04test\x08internal\x04zone\x00\x04host\x04test\x08internal\x04zone\x00" .
+               "\x04test\x08internal\x04test\x00" . pack("nn", 6, 1) .
+               "\x04test\x08internal\x04test\x00" . pack("nnNn", 6, 1, 300, 69) .
+               "\x03ns1\x04test\x08internal\x04test\x00\x04host\x04test\x08internal\x04test\x00" .
                pack("NNNNN", 2026090101, 3600, 600, 86400, 300);
     } else {
         # Normal A query
         return $qid . pack("nnnnn", 0x8180, 1, 1, 0, 0) .
                substr($query, 12, $off + 4 - 12) .
-               "\x04test\x08internal\x04zone\x00" . pack("nnNn", 1, 1, 300, 4) . inet_aton("127.0.0.1");
+               "\x04test\x08internal\x04test\x00" . pack("nnNn", 1, 1, 300, 4) . inet_aton("127.0.0.1");
     }
 }
 
@@ -145,8 +145,8 @@ sleep 0.5
 
 echo "=== 1. Testing +nssearch In-Bailiwick Glue Utilization ==="
 echo -n "Test: +nssearch +glue resolves SOA using in-bailiwick Glue without system resolver ... "
-OUT=$("$DAG" @127.0.0.1 -p $PORT test.internal.zone +nssearch +glue +timeout=2 2>&1 || true)
-if echo "$OUT" | grep -q "SOA ns1\.test\.internal\.zone\." && echo "$OUT" | grep -q "2026090101"; then
+OUT=$("$DAG" @127.0.0.1 -p $PORT test.internal.test +nssearch +glue +timeout=2 2>&1 || true)
+if echo "$OUT" | grep -q "SOA ns1\.test\.internal\.test\." && echo "$OUT" | grep -q "2026090101"; then
     echo "OK"
 else
     echo "FAILED"
@@ -157,14 +157,14 @@ fi
 
 echo "=== 2. Testing Batch Mode (-f) with Advanced Per-Line Options ==="
 cat << EOF > "$TMP_DIR/batch.txt"
-test.internal.zone A +tcp +nohexdump
-test.internal.zone A +yaml +nohexdump
-test.internal.zone +nssearch +glue +nohexdump
+test.internal.test A +tcp +nohexdump
+test.internal.test A +yaml +nohexdump
+test.internal.test +nssearch +glue +nohexdump
 EOF
 
 echo -n "Test: Batch mode executes per-line +tcp, +yaml, and +nssearch +glue without warnings ... "
 OUT=$("$DAG" @127.0.0.1 -p $PORT -f "$TMP_DIR/batch.txt" 2>&1 || true)
-if echo "$OUT" | grep -q "type: MESSAGE" && echo "$OUT" | grep -q "SOA ns1\.test\.internal\.zone\." && ! echo "$OUT" | grep -qi "unexpected extra token"; then
+if echo "$OUT" | grep -q "type: MESSAGE" && echo "$OUT" | grep -q "SOA ns1\.test\.internal\.test\." && ! echo "$OUT" | grep -qi "unexpected extra token"; then
     echo "OK"
 else
     echo "FAILED"
@@ -175,15 +175,15 @@ fi
 
 echo "=== 3. Testing Batch Mode Resilience Against Per-Line Errors ==="
 cat << EOF > "$TMP_DIR/batch_resilience.txt"
-test.internal.zone A +tcp +nohexdump
-test.internal.zone -t INVALIDQTYPE
+test.internal.test A +tcp +nohexdump
+test.internal.test -t INVALIDQTYPE
 -h
-test.internal.zone TXT +nohexdump
+test.internal.test TXT +nohexdump
 EOF
 
 echo -n "Test: Batch mode continues execution when lines contain invalid qtype or CLI-only opts ... "
 OUT=$("$DAG" @127.0.0.1 -p $PORT -f "$TMP_DIR/batch_resilience.txt" 2>&1 || true)
-if echo "$OUT" | grep -q ";test\.internal\.zone\..*IN.*A" && echo "$OUT" | grep -q ";test\.internal\.zone\..*IN.*TXT" && echo "$OUT" | grep -qi "unknown query type 'INVALIDQTYPE'" && echo "$OUT" | grep -qi "ignores CLI-only option '-h'"; then
+if echo "$OUT" | grep -q ";test\.internal\.test\..*IN.*A" && echo "$OUT" | grep -q ";test\.internal\.test\..*IN.*TXT" && echo "$OUT" | grep -qi "unknown query type 'INVALIDQTYPE'" && echo "$OUT" | grep -qi "ignores CLI-only option '-h'"; then
     echo "OK"
 else
     echo "FAILED"

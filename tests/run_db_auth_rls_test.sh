@@ -100,7 +100,7 @@ SELECT d.id, v.name, v.type, v.content, v.ttl, v.prio, false
    ('example.com', 'a.sub.example.com',    'A',      '192.0.2.3', 300, NULL),
    ('example.com', 'sub.example.com',      'TXT',    'sub', 300, NULL),
    ('example.com', 'evilsub.example.com',  'A',      '192.0.2.4', 300, NULL),
-   ('example.com', 'junk.evil.org',        'A',      '192.0.2.98', 300, NULL),
+   ('example.com', 'junk.evil.test',        'A',      '192.0.2.98', 300, NULL),
    ('dot.test.',   'dot.test',             'SOA',    'ns1.dot.test hostmaster.dot.test 1 7200 3600 1209600 300', 3600, NULL),
    ('dot.test.',   'www.dot.test',         'A',      '192.0.2.97', 300, NULL),
    ('other.test',  'other.test',           'SOA',    'ns1.other.test hostmaster.other.test 1 7200 3600 1209600 300', 3600, NULL),
@@ -250,10 +250,10 @@ a_err "no principal: an INSERT of a zone is refused" "$RLSERR" $API NONE "INSERT
 
 echo "-- what each principal sees"
 a_eq "a global master sees every record but the 2 whose name is missing or outside the zone" "$((RTOTAL - 2))" $API $GM "SELECT count(*) FROM records"
-a_eq "...not the row without a name, not the one outside its zone (junk.evil.org): the owner repairs them" 0 $API $GM "SELECT count(*) FROM records WHERE name IS NULL OR name = 'junk.evil.org'"
+a_eq "...not the row without a name, not the one outside its zone (junk.evil.test): the owner repairs them" 0 $API $GM "SELECT count(*) FROM records WHERE name IS NULL OR name = 'junk.evil.test'"
 a_eq "...every zone" 5 $API $GM "SELECT count(*) FROM domains"
 a_eq "a domain master sees the records of its zone, not a row without a name or one outside the zone" 10 $API $DM "SELECT count(*) FROM records"
-a_eq "...not junk.evil.org (in its domain, outside its zone)" 0 $API $DM "SELECT count(*) FROM records WHERE name = 'junk.evil.org' OR name IS NULL"
+a_eq "...not junk.evil.test (in its domain, outside its zone)" 0 $API $DM "SELECT count(*) FROM records WHERE name = 'junk.evil.test' OR name IS NULL"
 a_eq "...its zone only" "example.com" $API $DM "SELECT string_agg(name, ',') FROM domains"
 a_eq "a subdomain master sees the suffix and the apex SOA and NS" "A,NS,SOA,TXT" $API $SM "SELECT string_agg(type, ',' ORDER BY type) FROM records"
 a_eq "...and sees the zone row (it holds a grant on the zone)" "example.com" $API $SM "SELECT string_agg(name, ',') FROM domains"
@@ -308,7 +308,7 @@ for ty in RRSIG NSEC NSEC3 NSEC3PARAM DNSKEY CDS CDNSKEY TYPE46 TYPE0048; do
     a_err "the DNSSEC-managed type $ty" "$RLSERR" $API $DM "$(ri $EX sig.example.com $ty x 300)"
 done
 a_err "SOA at the apex" "$RLSERR" $API $DM "$(ri $EX example.com SOA 'ns1.example.com hm.example.com 1 2 3 4 5' 300)"
-a_err "a name outside the zone (evil.org)" "$RLSERR" $API $DM "$(ri $EX evil.org A 192.0.2.15 300)"
+a_err "a name outside the zone (evil.test)" "$RLSERR" $API $DM "$(ri $EX evil.test A 192.0.2.15 300)"
 a_err "a name that only ends like the zone (notexample.com)" "$RLSERR" $API $DM "$(ri $EX notexample.com A 192.0.2.15 300)"
 a_err "a name with a trailing dot" "$RLSERR" $API $DM "$(ri $EX 'trail.example.com.' A 192.0.2.15 300)"
 a_err "a record of another zone (domain_id of other.test)" "$RLSERR" $API $DM "$(ri $OTHER www2.other.test A 192.0.2.16 300)"
@@ -335,7 +335,7 @@ a_n "DELETE of the SOA: no row" 0 $API $DM "DELETE FROM records WHERE type = 'SO
 a_n "DELETE of the RRSIG: no row" 0 $API $DM "DELETE FROM records WHERE type = 'RRSIG'"
 a_n "DELETE of a record of another zone: no row" 0 $API $DM "DELETE FROM records WHERE name = 'www.other.test'"
 a_n "DELETE of every row the principal may delete (5 of the fixture, 7 of its own, 1 of sm's); the rest stays" 13 $API $DM "DELETE FROM records WHERE true"
-oeq "...the zone keeps its apex SOA, NS, A, the DNSKEY, the RRSIG, the row without a name and junk.evil.org" "7" "SELECT count(*) FROM records WHERE domain_id = $EX"
+oeq "...the zone keeps its apex SOA, NS, A, the DNSKEY, the RRSIG, the row without a name and junk.evil.test" "7" "SELECT count(*) FROM records WHERE domain_id = $EX"
 # restore the fixture rows the cases deleted
 oq "$(ri $EX www.example.com A 192.0.2.2 300); INSERT INTO records (domain_id, name, type, content, ttl, prio) VALUES ($EX, 'mail.example.com', 'MX', 'mail.example.com', 300, 10); $(ri $EX a.sub.example.com A 192.0.2.3 300); $(ri $EX sub.example.com TXT sub 300); $(ri $EX evilsub.example.com A 192.0.2.4 300)" > /dev/null
 oq "INSERT INTO karidns_record_tags (record_id, location_tag) SELECT id, 'tokyo' FROM records WHERE name = 'www.example.com'; INSERT INTO karidns_record_tinydns (record_id, ttd) SELECT id, 1 FROM records WHERE name = 'a.sub.example.com'" > /dev/null

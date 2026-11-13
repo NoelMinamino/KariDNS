@@ -158,7 +158,7 @@ static void test_all_rr_types_and_resolution(void) {
         "zonemd  IN ZONEMD 2026091401 1 1 aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899\n"
         "cname1  IN CNAME ns1.example.com.\n"
         "*.wild  IN A     192.0.2.77\n"
-        "subdname IN DNAME dname-target.org.\n";
+        "subdname IN DNAME dname-target.test.\n";
 
     int parsed = parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx);
     assert(parsed >= 0);
@@ -235,7 +235,7 @@ static void test_all_rr_types_and_resolution(void) {
         // NXDOMAIN
         { "nonexistent.example.com.", 1 /* A */, 0, 3 },
         // Non-existent zone -> REFUSED
-        { "otherdomain.org.", 1 /* A */, 0, 5 }
+        { "otherdomain.test.", 1 /* A */, 0, 5 }
     };
 
     uint8_t req[512], res[4096];
@@ -1309,7 +1309,7 @@ static void test_nsec3_hashing_and_intervals(void) {
 
     // Negative find_next_closer_name
     assert(find_next_closer_name("example.com.", "example.com.", closer, sizeof(closer)) == false);
-    assert(find_next_closer_name("other.org.", "example.com.", closer, sizeof(closer)) == false);
+    assert(find_next_closer_name("other.test.", "example.com.", closer, sizeof(closer)) == false);
 
     // 5. NSEC3 matching & covering in zone arena
     zone_arena_t arena;
@@ -2405,7 +2405,7 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     uint16_t dummy_off = 0, dummy_ar = 0;
     compress_ctx_t comp;
     compress_ctx_init(&comp);
-    assert(append_glue_records(NULL, "target.com.", "apex.com.", dummy_res, sizeof(dummy_res), &dummy_off, &comp, &dummy_ar, "\0\0", NULL, ADDITIONAL_AUTH_NO, NULL, false) == true);
+    assert(append_glue_records(NULL, "target.test.", "apex.test.", dummy_res, sizeof(dummy_res), &dummy_off, &comp, &dummy_ar, "\0\0", NULL, ADDITIONAL_AUTH_NO, NULL, false) == true);
 
     // 5. record_observatory_response
     zone_db_entry_t obs_entry;
@@ -3104,7 +3104,7 @@ static void test_nsec3_wildcard_nodata_and_optout(void) {
         "nsec3opt.example. 3600 IN NS ns1.nsec3opt.example.\n"
         "nsec3opt.example. 3600 IN NSEC3PARAM 1 0 10 AABBCCDD\n"
         "00000000000000000000000000000000.nsec3opt.example. 3600 IN NSEC3 1 1 10 AABBCCDD HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH SOA NS NSEC3PARAM RRSIG\n"
-        "unsecure.nsec3opt.example. 3600 IN NS ns1.other.net.\n";
+        "unsecure.nsec3opt.example. 3600 IN NS ns1.other.test.\n";
 
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "nsec3opt.example.", .is_standalone_mode = true, .err_out = &err };
@@ -4456,7 +4456,7 @@ static void test_dname_synthesis_multi_label_subdomain(void) {
         "$ORIGIN dname2.example.\n"
         "@ IN SOA ns1.dname2.example. hostmaster.dname2.example. 1 7200 3600 1209600 300\n"
         "@ IN NS ns1.dname2.example.\n"
-        "sub IN DNAME target.net.\n";
+        "sub IN DNAME target.test.\n";
     char *b = arena_strdup(&arena, zstr);
     parse_zone_fast(b, strlen(b), &arena, &ctx);
     assert(test_build_index(&arena, true) == 0);
@@ -4828,7 +4828,7 @@ static void test_query_engine_out_of_zone_query_refused(void) {
     printf("[TEST] Query Engine: Query for non-authoritative domain REFUSED...\n");
     uint8_t qpkt[256];
     size_t qlen = 0;
-    build_dns_query(qpkt, &qlen, 0x4444, "notmyzone.org.", 1, false);
+    build_dns_query(qpkt, &qlen, 0x4444, "notmyzone.test.", 1, false);
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
     const rate_limit_config_t *rrl = NULL;
@@ -4836,7 +4836,7 @@ static void test_query_engine_out_of_zone_query_refused(void) {
     memset(&empty_snap, 0, sizeof(empty_snap));
     atomic_init(&empty_snap.reader_count, 10);
     uint8_t rpkt[512];
-    int rlen = process_dns_query(qpkt, qlen, rpkt, sizeof(rpkt), "notmyzone.org.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &empty_snap);
+    int rlen = process_dns_query(qpkt, qlen, rpkt, sizeof(rpkt), "notmyzone.test.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &empty_snap);
     assert(rlen >= 12);
     assert((rpkt[3] & 0x0F) == 5); // REFUSED
     printf("  -> out-of-zone REFUSED passed.\n");
@@ -7897,7 +7897,7 @@ static void test_query_engine_feature_case_204(void) {
         "@ IN SOA ns1 hostmaster 1 7200 3600 1209600 3600\n"
         "@ IN NS ns1\n"
         "ns1 IN A 192.0.2.1\n"
-        "sub IN DNAME target.org.\n";
+        "sub IN DNAME target.test.\n";
 
     assert(parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx) >= 0);
     assert(test_build_index(&arena, true) == 0);
@@ -8658,9 +8658,9 @@ static void test_query_engine_feature_case_226(void) {
 
     uint8_t req[512], res[512];
     size_t req_len = 0;
-    build_dns_query(req, &req_len, 226, "completely.unrelated.org.", 1, false);
+    build_dns_query(req, &req_len, 226, "completely.unrelated.test.", 1, false);
     compress_ctx_init_packet(&comp_ctx);
-    int res_len = process_dns_query(req, req_len, res, sizeof(res), "completely.unrelated.org.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "completely.unrelated.test.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(res_len >= 12);
     assert((res[3] & 0x0F) == 5); // REFUSED
 
@@ -9690,8 +9690,8 @@ static void test_query_engine_dname_cname_wildcard_truncation(void) {
         "@       IN NS    ns2.matrix.example.\n"
         "ns1     IN A     192.0.2.1\n"
         "ns2     IN AAAA  2001:db8::2\n"
-        "dname-node IN DNAME dname-target.org.\n"
-        "long-dname-node IN DNAME sub1.sub2.sub3.sub4.sub5.sub6.sub7.sub8.sub9.sub10.sub11.sub12.sub13.sub14.sub15.sub16.sub17.sub18.sub19.sub20.sub21.sub22.sub23.sub24.target.org.\n"
+        "dname-node IN DNAME dname-target.test.\n"
+        "long-dname-node IN DNAME sub1.sub2.sub3.sub4.sub5.sub6.sub7.sub8.sub9.sub10.sub11.sub12.sub13.sub14.sub15.sub16.sub17.sub18.sub19.sub20.sub21.sub22.sub23.sub24.dname.test.\n"
         "cname-nx IN CNAME non-existent.matrix.example.\n"
         "cname-self IN CNAME cname-self.matrix.example.\n"
         "cname-loop1 IN CNAME cname-loop2.matrix.example.\n"

@@ -78,10 +78,10 @@ literal\.dot IN A 192.0.2.200
 EOF
 
 # Create secondary zone file with SOA EXPIRE = 10s (for mtime expire test)
-cat << 'EOF' > "$TMP_DIR/secondary.com.zone"
+cat << 'EOF' > "$TMP_DIR/secondary.test.zone"
 $TTL 300
-@ IN SOA ns1.secondary.com. hostmaster.secondary.com. ( 2026090201 3600 900 10 300 )
-@ IN NS ns1.secondary.com.
+@ IN SOA ns1.secondary.test. hostmaster.secondary.test. ( 2026090201 3600 900 10 300 )
+@ IN NS ns1.secondary.test.
 ns1 IN A 192.0.2.1
 app IN A 192.0.2.50
 EOF
@@ -110,9 +110,9 @@ zone "example.com" {
     file "$TMP_DIR/example.com.zone";
 };
 
-zone "secondary.com" {
+zone "secondary.test" {
     type secondary;
-    file "$TMP_DIR/secondary.com.zone";
+    file "$TMP_DIR/secondary.test.zone";
     masters { 192.0.2.254 port 53; };
 };
 
@@ -148,7 +148,7 @@ run_check "Query name with escaped literal dot resolves accurately" \
 echo "=== Task 4: Secondary Zone Expire Initialization ==="
 # Initially fresh secondary zone resolves
 run_check "Secondary zone initially answers Authoritative" \
-    "$DAG @127.0.0.1 -p $PORT app.secondary.com A +udp" \
+    "$DAG @127.0.0.1 -p $PORT app.secondary.test A +udp" \
     "192.0.2.50"
 
 # 4. RRL Probing & Safe Bypass (Task 5)

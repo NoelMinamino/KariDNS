@@ -699,9 +699,9 @@ int main() {
 
         // 1. Forward Reference Pointers
         uint8_t pkt1[] = {
-            3, 'w', 'w', 'w', 0xC0, 0x08, // offset 0: "www.google.com", ptr to 8
+            3, 'w', 'w', 'w', 0xC0, 0x08, // offset 0: "www.example.com", ptr to 8
             0, 0, // offset 6-7
-            6, 'g', 'o', 'o', 'g', 'l', 'e', 3, 'c', 'o', 'm', 0 // offset 8
+            7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 // offset 8
         };
         zone_arena_t arena = {0};
         zone_arena_init(&arena);
@@ -711,7 +711,7 @@ int main() {
         if (r == -1) {
             printf("FAIL: Forward reference pointer rejected\n");
             return 1;
-        } else if (strcmp(name, "www.google.com.") != 0) {
+        } else if (strcmp(name, "www.example.com.") != 0) {
             printf("FAIL: Forward reference parsed incorrectly: %s\n", name);
             return 1;
         }
@@ -934,14 +934,14 @@ int main() {
         parse_error_t err = {0};
         parse_context_t ctx = {
             .base_dir = ".",
-            .default_origin = "dynupdate.com.",
+            .default_origin = "dynupdate.test.",
             .is_standalone_mode = true,
             .err_out = &err,
         };
-        char zone_text[] = "dynupdate.com. 3600 IN SOA ns1.dynupdate.com. admin.dynupdate.com. 1 3600 1800 604800 86400\n"
-                           "dynupdate.com. 3600 IN NS ns1.dynupdate.com.\n"
-                           "ns1.dynupdate.com. 3600 IN A 127.0.0.1\n"
-                           "test.dynupdate.com. 3600 IN TXT \"initial\"\n";
+        char zone_text[] = "dynupdate.test. 3600 IN SOA ns1.dynupdate.test. admin.dynupdate.test. 1 3600 1800 604800 86400\n"
+                           "dynupdate.test. 3600 IN NS ns1.dynupdate.test.\n"
+                           "ns1.dynupdate.test. 3600 IN A 127.0.0.1\n"
+                           "test.dynupdate.test. 3600 IN TXT \"initial\"\n";
         int prc_res = parse_zone_fast(zone_text, strlen(zone_text), &arena, &ctx);
         if (prc_res < 0) {
             printf("FAIL: Test 11 parse_zone_fast failed: %s\n", err.error_message);
@@ -958,17 +958,17 @@ int main() {
         pkt[10] = 0x00; pkt[11] = 0x00; // ARCOUNT = 0
 
         size_t off = 12;
-        // Zone: dynupdate.com., TYPE=SOA(6), CLASS=IN(1)
-        const char *zname = "\x09" "dynupdate" "\x03" "com" "\x00";
-        memcpy(&pkt[off], zname, 15);
-        off += 15;
+        // Zone: dynupdate.test., TYPE=SOA(6), CLASS=IN(1)
+        const char *zname = "\x09" "dynupdate" "\x04" "test" "\x00";
+        memcpy(&pkt[off], zname, 16);
+        off += 16;
         pkt[off++] = 0x00; pkt[off++] = 0x06; // SOA
         pkt[off++] = 0x00; pkt[off++] = 0x01; // IN (zone_class = 1)
 
-        // Prereq: test.dynupdate.com., TYPE=TXT(16), CLASS=CH(3) [INVALID], TTL=0, RDLEN=8, RDATA="\x07initial"
-        const char *pname = "\x04" "test" "\x09" "dynupdate" "\x03" "com" "\x00";
-        memcpy(&pkt[off], pname, 20);
-        off += 20;
+        // Prereq: test.dynupdate.test., TYPE=TXT(16), CLASS=CH(3) [INVALID], TTL=0, RDLEN=8, RDATA="\x07initial"
+        const char *pname = "\x04" "test" "\x09" "dynupdate" "\x04" "test" "\x00";
+        memcpy(&pkt[off], pname, 21);
+        off += 21;
         pkt[off++] = 0x00; pkt[off++] = 0x10; // TXT
         size_t class_offset = off;
         pkt[off++] = 0x00; pkt[off++] = 0x03; // CLASS = 3 (CH - Invalid)
@@ -979,7 +979,7 @@ int main() {
         off += 8;
 
         update_result_t ur;
-        int res = process_update_sections(pkt, off, "dynupdate.com.", &arena, &ur);
+        int res = process_update_sections(pkt, off, "dynupdate.test.", &arena, &ur);
         if (res != 1) { // Expected FORMERR (1)
             printf("FAIL: process_update_sections returned %d instead of 1 (FORMERR) for invalid Prereq CLASS\n", res);
             return 1;
@@ -987,7 +987,7 @@ int main() {
 
         // 2. Prereq with valid Zone CLASS (IN = 1) matching existing record -> MUST succeed (0)
         pkt[class_offset] = 0x00; pkt[class_offset + 1] = 0x01; // CLASS = 1 (IN)
-        res = process_update_sections(pkt, off, "dynupdate.com.", &arena, &ur);
+        res = process_update_sections(pkt, off, "dynupdate.test.", &arena, &ur);
         if (res != 0) {
             printf("FAIL: process_update_sections returned %d instead of 0 for valid Prereq CLASS IN\n", res);
             return 1;
@@ -995,7 +995,7 @@ int main() {
 
         // 3. Prereq with valid Zone CLASS (IN = 1) but non-matching RDATA -> MUST return NXRRSET (8)
         memcpy(&pkt[rdata_offset], "\x07wrongval", 8);
-        res = process_update_sections(pkt, off, "dynupdate.com.", &arena, &ur);
+        res = process_update_sections(pkt, off, "dynupdate.test.", &arena, &ur);
         if (res != 8) {
             printf("FAIL: process_update_sections returned %d instead of 8 (NXRRSET) for non-matching RDATA\n", res);
             return 1;
@@ -1061,7 +1061,7 @@ int main() {
     // --- Test 13: Mix of view and top-level zone error cleanup (no leak) ---
     {
         const char *mixed_cfg = "view \"external\" { match-clients { any; }; zone \"example.com\" { type master; file \"example.com.zone\"; }; };\n"
-                                "zone \"toplevel.com\" { type master; file \"toplevel.com.zone\"; };\n";
+                                "zone \"toplevel.test\" { type master; file \"toplevel.test.zone\"; };\n";
         server_config_t cfg;
         memset(&cfg, 0, sizeof(cfg));
         int res = parse_named_conf(mixed_cfg, &cfg);
@@ -1695,8 +1695,8 @@ int main() {
         const char *bad_view_zone =
             "view \"internal\" {\n"
             "    match-clients { any; };\n"
-            "    zone \"valid.com\" { type master; file \"valid.com.zone\"; };\n"
-            "    zone \"broken.com\" { type master; file; };\n"
+            "    zone \"valid.test\" { type master; file \"valid.test.zone\"; };\n"
+            "    zone \"broken.test\" { type master; file; };\n"
             "};\n";
         server_config_t cfg2;
         memset(&cfg2, 0, sizeof(cfg2));
@@ -2554,7 +2554,7 @@ int main() {
             "mail IN AAAA 2001:db8::10\n"
             "_sip._tcp IN SRV 10 60 5060 sip.example.com.\n"
             "sip IN A 192.0.2.20\n"
-            "external IN MX 10 mail.otherdomain.net.\n";
+            "external IN MX 10 mail.otherdomain.test.\n";
 
         zone_arena_t arena;
         zone_arena_init(&arena);
@@ -2925,8 +2925,8 @@ int main() {
         // 1. 豁｣蟶ｸ邉ｻ: 逡ｰ縺ｪ繧九ラ繝｡繧､繝ｳ蜷阪ｒ謖√▽隍・焚繝医ャ繝励Ξ繝吶Ν繧ｾ繝ｼ繝ｳ
         const char *valid_zones_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
-            "zone \"example1.com\" { type master; file \"/tmp/z1.zone\"; };\n"
-            "zone \"example2.com\" { type master; file \"/tmp/z2.zone\"; };\n";
+            "zone \"example1.test\" { type master; file \"/tmp/z1.zone\"; };\n"
+            "zone \"example2.test\" { type master; file \"/tmp/z2.zone\"; };\n";
         server_config_t cfg_vz;
         memset(&cfg_vz, 0, sizeof(cfg_vz));
         if (parse_named_conf_ext(valid_zones_conf, NULL, &cfg_vz) != 0) {
@@ -2943,8 +2943,8 @@ int main() {
         // 2. 豁｣蟶ｸ邉ｻ: 逡ｰ縺ｪ繧九ン繝･繝ｼ蜷阪ｒ謖√▽隍・焚繝薙Η繝ｼ
         const char *valid_views_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
-            "view \"internal\" { zone \"example1.com\" { type master; file \"/tmp/z1.zone\"; }; };\n"
-            "view \"external\" { zone \"example2.com\" { type master; file \"/tmp/z2.zone\"; }; };\n";
+            "view \"internal\" { zone \"example1.test\" { type master; file \"/tmp/z1.zone\"; }; };\n"
+            "view \"external\" { zone \"example2.test\" { type master; file \"/tmp/z2.zone\"; }; };\n";
         server_config_t cfg_vv;
         memset(&cfg_vv, 0, sizeof(cfg_vv));
         if (parse_named_conf_ext(valid_views_conf, NULL, &cfg_vv) != 0) {
@@ -2962,8 +2962,8 @@ int main() {
         const char *valid_view_zones_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "view \"internal\" {\n"
-            "  zone \"example1.com\" { type master; file \"/tmp/z1.zone\"; };\n"
-            "  zone \"example2.com\" { type master; file \"/tmp/z2.zone\"; };\n"
+            "  zone \"example1.test\" { type master; file \"/tmp/z1.zone\"; };\n"
+            "  zone \"example2.test\" { type master; file \"/tmp/z2.zone\"; };\n"
             "};\n";
         server_config_t cfg_vvz;
         memset(&cfg_vvz, 0, sizeof(cfg_vvz));
@@ -3023,8 +3023,8 @@ int main() {
         // 7. 逡ｰ蟶ｸ邉ｻ: 驥崎､・ン繝･繝ｼ
         const char *dup_view_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
-            "view \"internal\" { zone \"example1.com\" { type master; file \"/tmp/z1.zone\"; }; };\n"
-            "view \"internal\" { zone \"example2.com\" { type master; file \"/tmp/z2.zone\"; }; };\n";
+            "view \"internal\" { zone \"example1.test\" { type master; file \"/tmp/z1.zone\"; }; };\n"
+            "view \"internal\" { zone \"example2.test\" { type master; file \"/tmp/z2.zone\"; }; };\n";
         server_config_t cfg3;
         memset(&cfg3, 0, sizeof(cfg3));
         if (parse_named_conf_ext(dup_view_conf, NULL, &cfg3) == 0) {
@@ -3056,7 +3056,7 @@ int main() {
         // 1. 豁｣蟶ｸ邉ｻ: primary -> master 豁｣隕丞喧
         const char *primary_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
-            "zone \"example1.com\" { type primary; file \"/tmp/z1.zone\"; };\n";
+            "zone \"example1.test\" { type primary; file \"/tmp/z1.zone\"; };\n";
         server_config_t cfg1;
         memset(&cfg1, 0, sizeof(cfg1));
         if (parse_named_conf_ext(primary_conf, NULL, &cfg1) != 0) {
@@ -3074,7 +3074,7 @@ int main() {
         // 2. 豁｣蟶ｸ邉ｻ: secondary -> slave 豁｣隕丞喧
         const char *secondary_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
-            "zone \"example2.com\" { type secondary; masters { 192.0.2.1; }; };\n";
+            "zone \"example2.test\" { type secondary; masters { 192.0.2.1; }; };\n";
         server_config_t cfg2;
         memset(&cfg2, 0, sizeof(cfg2));
         if (parse_named_conf_ext(secondary_conf, NULL, &cfg2) != 0) {
@@ -3092,7 +3092,7 @@ int main() {
         // 3. 豁｣蟶ｸ邉ｻ: master 縺昴・縺ｾ縺ｾ
         const char *master_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
-            "zone \"example3.com\" { type master; file \"/tmp/z3.zone\"; };\n";
+            "zone \"example3.test\" { type master; file \"/tmp/z3.zone\"; };\n";
         server_config_t cfg_m;
         memset(&cfg_m, 0, sizeof(cfg_m));
         if (parse_named_conf_ext(master_conf, NULL, &cfg_m) != 0) {
@@ -3110,7 +3110,7 @@ int main() {
         // 4. 豁｣蟶ｸ邉ｻ: slave 縺昴・縺ｾ縺ｾ
         const char *slave_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
-            "zone \"example4.com\" { type slave; masters { 192.0.2.1; }; };\n";
+            "zone \"example4.test\" { type slave; masters { 192.0.2.1; }; };\n";
         server_config_t cfg_s;
         memset(&cfg_s, 0, sizeof(cfg_s));
         if (parse_named_conf_ext(slave_conf, NULL, &cfg_s) != 0) {
@@ -3128,7 +3128,7 @@ int main() {
         // 5. 逡ｰ蟶ｸ邉ｻ: 譛ｪ遏･縺ｮ繧ｾ繝ｼ繝ｳ遞ｮ蛻･繧呈拠邨ｶ
         const char *invalid_type_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
-            "zone \"example5.com\" { type unknown_type; file \"/tmp/z5.zone\"; };\n";
+            "zone \"example5.test\" { type unknown_type; file \"/tmp/z5.zone\"; };\n";
         server_config_t cfg3;
         memset(&cfg3, 0, sizeof(cfg3));
         if (parse_named_conf_ext(invalid_type_conf, NULL, &cfg3) == 0) {
@@ -3168,7 +3168,7 @@ int main() {
         // 2. 豁｣蟶ｸ邉ｻ: zone without explicit type defaults to master
         const char *no_type_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
-            "zone \"default-type.com\" { file \"/tmp/z.zone\"; };\n";
+            "zone \"default-type.test\" { file \"/tmp/z.zone\"; };\n";
         server_config_t cfg2;
         memset(&cfg2, 0, sizeof(cfg2));
         if (parse_named_conf_ext(no_type_conf, NULL, &cfg2) != 0) {

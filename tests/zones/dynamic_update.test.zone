@@ -1,12 +1,12 @@
-$ORIGIN dynamic_update.com.
+$ORIGIN dynamic_update.test.
 $TTL 3600
-@ IN SOA ns1.dynamic_update.com. admin.dynamic_update.com. (
+@ IN SOA ns1.dynamic_update.test. admin.dynamic_update.test. (
     2026071801 ; serial
     3600       ; refresh
     1800       ; retry
     604800     ; expire
     86400      ; minimum
 )
-@ IN NS ns1.dynamic_update.com.
+@ IN NS ns1.dynamic_update.test.
 ns1 IN A 127.0.0.1
 test IN TXT "initial"

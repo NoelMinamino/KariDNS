@@ -1680,7 +1680,7 @@ static void test_config_negative_patterns(void) {
     /* 2. Missing required parameters and semicolons */
     expect_reject("options missing value for port", "options { port; };");
     expect_reject("options missing semicolon after port", "options { port 53 };");
-    expect_reject("view missing name", "view { zone \"a.com\" { type master; file \"z\"; }; };");
+    expect_reject("view missing name", "view { zone \"a.test\" { type master; file \"z\"; }; };");
 
     /* 3. Zone type, file-format, and auto-tc-flag errors */
     expect_reject("unknown zone type", "zone \"example.com\" { type bogus_type; file \"z\"; };");
@@ -1730,8 +1730,8 @@ static void test_config_negative_patterns(void) {
                   "zone \"example.com\" { type master; file \"z1\"; }; "
                   "zone \"example.com\" { type master; file \"z2\"; }; };");
     expect_reject("duplicate view name",
-                  "view \"v1\" { zone \"a.com\" { type master; file \"z1\"; }; }; "
-                  "view \"v1\" { zone \"b.com\" { type master; file \"z2\"; }; };");
+                  "view \"v1\" { zone \"a.test\" { type master; file \"z1\"; }; }; "
+                  "view \"v1\" { zone \"b.test\" { type master; file \"z2\"; }; };");
     expect_reject("duplicate key name",
                   "key \"k1\" { algorithm hmac-sha256; secret \"" SECRET_OK "\"; }; "
                   "key \"k1\" { algorithm hmac-sha256; secret \"" SECRET_OK "\"; };");
@@ -1744,8 +1744,8 @@ static void test_config_negative_patterns(void) {
 
     /* 10. Mixing flat zones and views */
     expect_reject("mixing flat zone and view blocks",
-                  "zone \"flat.com\" { type master; file \"z\"; }; "
-                  "view \"v1\" { zone \"v.com\" { type master; file \"z\"; }; };");
+                  "zone \"flat.test\" { type master; file \"z\"; }; "
+                  "view \"v1\" { zone \"v.test\" { type master; file \"z\"; }; };");
 
     /* 11. Valid warning path configurations (should parse successfully and hit warning branches) */
     server_config_t cfg;
@@ -1755,8 +1755,8 @@ static void test_config_negative_patterns(void) {
         free_server_config_fields(&cfg);
     }
     /* Program & forward zone with superfluous file and masters */
-    if (parse_ok("zone \"p.com\" { type program; program \"/bin/echo\"; file \"z\"; masters { 1.2.3.4; }; }; "
-                 "zone \"f.com\" { type forward; forwarders { 1.2.3.4; }; file \"z\"; masters { 1.2.3.4; }; };", &cfg)) {
+    if (parse_ok("zone \"p.test\" { type program; program \"/bin/echo\"; file \"z\"; masters { 1.2.3.4; }; }; "
+                 "zone \"f.test\" { type forward; forwarders { 1.2.3.4; }; file \"z\"; masters { 1.2.3.4; }; };", &cfg)) {
         free_server_config_fields(&cfg);
     }
 

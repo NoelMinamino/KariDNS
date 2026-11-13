@@ -30,7 +30,7 @@ mail        IN A     192.0.2.10
 mail        IN AAAA  2001:db8::10
 _sip._tcp   IN SRV   10 60 5060 sip.example.com.
 sip         IN A     192.0.2.20
-external    IN MX    10 mail.otherdomain.net.
+external    IN MX    10 mail.otherdomain.test.
 EOF
 
 cat << EOF > "$CONF"
@@ -85,12 +85,12 @@ if ! echo "$SRV_OUT" | grep -q "sip.example.com.*192.0.2.20"; then
     exit 1
 fi
 
-# 3. Test Out-of-bailiwick MX Query (Additional section should NOT contain otherdomain.net)
+# 3. Test Out-of-bailiwick MX Query (Additional section should NOT contain otherdomain.test)
 echo "[*] Querying MX external.example.com (out-of-bailiwick)..."
 EXT_OUT=$($DAG MX external.example.com @127.0.0.1 -p ${PORT})
 echo "$EXT_OUT"
 
-if echo "$EXT_OUT" | grep -i "otherdomain.net.*IN.*A"; then
+if echo "$EXT_OUT" | grep -i "otherdomain.test.*IN.*A"; then
     echo "[FAIL] Out-of-bailiwick target was incorrectly added to Additional section!"
     exit 1
 fi

@@ -176,7 +176,7 @@ static void test_rebuild_two_views(void) {
     assert(find_zone_in_view(vi, "www.b.example.") != NULL);
     assert(find_zone_in_view(vi, "deep.host.a.example.") != NULL);
     assert(find_zone_in_view(ve, "www.b.example.") == NULL);          /* b.example only lives in the internal view */
-    assert(find_zone_in_view(vi, "unrelated.org.") == NULL);
+    assert(find_zone_in_view(vi, "unrelated.invalid.") == NULL);
     assert(find_zone_config_in_view(cfg, "internal", "a.example.") != NULL);
     assert(find_zone_config_in_view(cfg, "external", "b.example.") == NULL);
 

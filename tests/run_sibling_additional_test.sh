@@ -126,27 +126,27 @@ zone "example.net" {
 };
 EOF
 
-ZONE_PARENT="$TMP_DIR/example-parent.jp.zone"
-ZONE_SIBLING="$TMP_DIR/example-sibling.jp.zone"
+ZONE_PARENT="$TMP_DIR/example-parent.test.zone"
+ZONE_SIBLING="$TMP_DIR/example-sibling.test.zone"
 CONF_SIBLING="$TMP_DIR/sibling_dynamic.conf"
 
 cat << 'EOF' > "$ZONE_PARENT"
-$ORIGIN example-parent.jp.
+$ORIGIN example-parent.test.
 $TTL 1800
-@           IN SOA   ns1.city.example-parent.jp. hostmaster.example-parent.jp. 2026090501 7200 3600 1209600 1800
+@           IN SOA   ns1.city.example-parent.test. hostmaster.example-parent.test. 2026090501 7200 3600 1209600 1800
 @           IN NS    ns-ext.example.org.
-@           IN NS    ns1.city.example-parent.jp.
-@           IN NS    ns-sibling.v6.example-sibling.jp.
+@           IN NS    ns1.city.example-parent.test.
+@           IN NS    ns-sibling.v6.example-sibling.test.
 ns-ext.example.org. IN A 192.0.2.88
 ns-ext.example.org. IN AAAA 2001:db8:1::88
 ns1.city    IN A     192.0.2.61
 EOF
 
 cat << 'EOF' > "$ZONE_SIBLING"
-$ORIGIN example-sibling.jp.
+$ORIGIN example-sibling.test.
 $TTL 1800
-@           IN SOA   ns1.example-sibling.jp. hostmaster.example-sibling.jp. 2026090501 7200 3600 1209600 1800
-@           IN NS    ns1.example-sibling.jp.
+@           IN SOA   ns1.example-sibling.test. hostmaster.example-sibling.test. 2026090501 7200 3600 1209600 1800
+@           IN NS    ns1.example-sibling.test.
 ns-sibling.v6    IN A     198.51.100.226
 ns-sibling.v6    IN AAAA  2001:db8:2::226
 EOF
@@ -159,44 +159,44 @@ options {
     user "nobody";
     group "nobody";
 };
-zone "example-parent.jp" {
+zone "example-parent.test" {
     type master;
     file "$ZONE_PARENT";
 };
-zone "example-sibling.jp" {
+zone "example-sibling.test" {
     type master;
     file "$ZONE_SIBLING";
 };
 EOF
 
-ZONE_OVR_INDOMAIN="$TMP_DIR/ovr-indomain.jp.zone"
-ZONE_OVR_NO="$TMP_DIR/ovr-no.jp.zone"
-ZONE_OVR_YES="$TMP_DIR/ovr-yes.jp.zone"
+ZONE_OVR_INDOMAIN="$TMP_DIR/ovr-indomain.test.zone"
+ZONE_OVR_NO="$TMP_DIR/ovr-no.test.zone"
+ZONE_OVR_YES="$TMP_DIR/ovr-yes.test.zone"
 
 cat << 'EOF' > "$ZONE_OVR_INDOMAIN"
-$ORIGIN ovr-indomain.jp.
+$ORIGIN ovr-indomain.test.
 $TTL 86400
-@           IN SOA   ns1.ovr-indomain.jp. hostmaster.ovr-indomain.jp. 2026090401 7200 3600 1209600 86400
+@           IN SOA   ns1.ovr-indomain.test. hostmaster.ovr-indomain.test. 2026090401 7200 3600 1209600 86400
 @           IN NS    ns1.v6.example.com.
-@           IN NS    ns1.city.ovr-indomain.jp.
+@           IN NS    ns1.city.ovr-indomain.test.
 ns1.city    IN A     192.0.2.15
 EOF
 
 cat << 'EOF' > "$ZONE_OVR_NO"
-$ORIGIN ovr-no.jp.
+$ORIGIN ovr-no.test.
 $TTL 86400
-@           IN SOA   ns1.ovr-no.jp. hostmaster.ovr-no.jp. 2026090401 7200 3600 1209600 86400
+@           IN SOA   ns1.ovr-no.test. hostmaster.ovr-no.test. 2026090401 7200 3600 1209600 86400
 @           IN NS    ns1.v6.example.com.
-@           IN NS    ns1.city.ovr-no.jp.
+@           IN NS    ns1.city.ovr-no.test.
 ns1.city    IN A     192.0.2.15
 EOF
 
 cat << 'EOF' > "$ZONE_OVR_YES"
-$ORIGIN ovr-yes.jp.
+$ORIGIN ovr-yes.test.
 $TTL 86400
-@           IN SOA   ns1.ovr-yes.jp. hostmaster.ovr-yes.jp. 2026090401 7200 3600 1209600 86400
+@           IN SOA   ns1.ovr-yes.test. hostmaster.ovr-yes.test. 2026090401 7200 3600 1209600 86400
 @           IN NS    ns1.v6.example.com.
-@           IN NS    ns1.city.ovr-yes.jp.
+@           IN NS    ns1.city.ovr-yes.test.
 ns1.city    IN A     192.0.2.15
 EOF
 
@@ -213,17 +213,17 @@ zone "example.com" {
     type master;
     file "$ZONE_COM";
 };
-zone "ovr-indomain.jp" {
+zone "ovr-indomain.test" {
     type master;
     file "$ZONE_OVR_INDOMAIN";
     additional-from-auth in-domain;
 };
-zone "ovr-no.jp" {
+zone "ovr-no.test" {
     type master;
     file "$ZONE_OVR_NO";
     additional-from-auth no;
 };
-zone "ovr-yes.jp" {
+zone "ovr-yes.test" {
     type master;
     file "$ZONE_OVR_YES";
 };
@@ -377,7 +377,7 @@ sleep 1
 # -------------------------------------------------------------
 # Test 4: Sibling domain dynamic resolution with example domains
 # -------------------------------------------------------------
-echo "[*] Starting KariDNS for example-parent.jp & example-sibling.jp on port ${PORT_D}..."
+echo "[*] Starting KariDNS for example-parent.test & example-sibling.test on port ${PORT_D}..."
 $BIN -f -c "$CONF_SIBLING" > "$DIR/server_sibling_dyn.log" 2>&1 &
 SERVER_PID_SIBLING=$!
 sleep 2
@@ -388,16 +388,16 @@ if ! kill -0 "$SERVER_PID_SIBLING" 2>/dev/null; then
     exit 1
 fi
 
-echo "[*] Querying NS example-parent.jp on port ${PORT_D}..."
-OUT_SIBLING=$($DAG NS example-parent.jp @127.0.0.1 -p ${PORT_D})
+echo "[*] Querying NS example-parent.test on port ${PORT_D}..."
+OUT_SIBLING=$($DAG NS example-parent.test @127.0.0.1 -p ${PORT_D})
 echo "$OUT_SIBLING"
 
 # Verify all Additional records
 if ! echo "$OUT_SIBLING" | grep -q "status: NOERROR"; then
-    echo "[FAIL] NS example-parent.jp did not return NOERROR!"
+    echo "[FAIL] NS example-parent.test did not return NOERROR!"
     exit 1
 fi
-# ns-ext.example.org. A/AAAA in the example-parent.jp zone file are out-of-zone data (RFC 1034 §4.2):
+# ns-ext.example.org. A/AAAA in the example-parent.test zone file are out-of-zone data (RFC 1034 §4.2):
 # the loader ignores them with a warning (R-27, as BIND does), so they are not served as glue.
 if echo "$OUT_SIBLING" | grep -q "ns-ext.example.org.*192.0.2.88\|ns-ext.example.org.*2001:db8:1::88"; then
     echo "[FAIL] Out-of-zone address records for ns-ext.example.org were served in Additional!"
@@ -407,20 +407,20 @@ if ! grep -q "ignoring out-of-zone data 'ns-ext.example.org.' A" "$DIR/server_si
     echo "[FAIL] The server did not log the ignored out-of-zone record ns-ext.example.org!"
     exit 1
 fi
-if ! echo "$OUT_SIBLING" | grep -q "ns1.city.example-parent.jp.*192.0.2.61"; then
-    echo "[FAIL] A record for ns1.city.example-parent.jp missing in Additional!"
+if ! echo "$OUT_SIBLING" | grep -q "ns1.city.example-parent.test.*192.0.2.61"; then
+    echo "[FAIL] A record for ns1.city.example-parent.test missing in Additional!"
     exit 1
 fi
-if ! echo "$OUT_SIBLING" | grep -q "ns-sibling.v6.example-sibling.jp.*198.51.100.226"; then
-    echo "[FAIL] Sibling A record for ns-sibling.v6.example-sibling.jp missing in Additional!"
+if ! echo "$OUT_SIBLING" | grep -q "ns-sibling.v6.example-sibling.test.*198.51.100.226"; then
+    echo "[FAIL] Sibling A record for ns-sibling.v6.example-sibling.test missing in Additional!"
     exit 1
 fi
-if ! echo "$OUT_SIBLING" | grep -q "ns-sibling.v6.example-sibling.jp.*2001:db8:2::226"; then
-    echo "[FAIL] Sibling AAAA record for ns-sibling.v6.example-sibling.jp missing in Additional!"
+if ! echo "$OUT_SIBLING" | grep -q "ns-sibling.v6.example-sibling.test.*2001:db8:2::226"; then
+    echo "[FAIL] Sibling AAAA record for ns-sibling.v6.example-sibling.test missing in Additional!"
     exit 1
 fi
 
-echo "[PASS] Test 4: Sibling domain (ns-sibling.v6.example-sibling.jp A/AAAA) successfully resolved in Additional!"
+echo "[PASS] Test 4: Sibling domain (ns-sibling.v6.example-sibling.test A/AAAA) successfully resolved in Additional!"
 
 kari_kill_tree "$SERVER_PID_SIBLING"
 SERVER_PID_SIBLING=""
@@ -440,35 +440,35 @@ if ! kill -0 "$SERVER_PID_OVERRIDE" 2>/dev/null; then
     exit 1
 fi
 
-echo "[*] Querying NS ovr-indomain.jp on port ${PORT_E}..."
-OUT_OVR_IN=$($DAG NS ovr-indomain.jp @127.0.0.1 -p ${PORT_E})
+echo "[*] Querying NS ovr-indomain.test on port ${PORT_E}..."
+OUT_OVR_IN=$($DAG NS ovr-indomain.test @127.0.0.1 -p ${PORT_E})
 echo "$OUT_OVR_IN"
-if ! echo "$OUT_OVR_IN" | grep -q "ns1.city.ovr-indomain.jp.*192.0.2.15"; then
-    echo "[FAIL] In-domain glue missing for ovr-indomain.jp!"
+if ! echo "$OUT_OVR_IN" | grep -q "ns1.city.ovr-indomain.test.*192.0.2.15"; then
+    echo "[FAIL] In-domain glue missing for ovr-indomain.test!"
     exit 1
 fi
 if echo "$OUT_OVR_IN" | grep -q "192.0.2.86"; then
-    echo "[FAIL] Sibling glue present for ovr-indomain.jp with additional-from-auth in-domain!"
+    echo "[FAIL] Sibling glue present for ovr-indomain.test with additional-from-auth in-domain!"
     exit 1
 fi
 
-echo "[*] Querying NS ovr-no.jp on port ${PORT_E}..."
-OUT_OVR_NO=$($DAG NS ovr-no.jp @127.0.0.1 -p ${PORT_E})
+echo "[*] Querying NS ovr-no.test on port ${PORT_E}..."
+OUT_OVR_NO=$($DAG NS ovr-no.test @127.0.0.1 -p ${PORT_E})
 echo "$OUT_OVR_NO"
 if echo "$OUT_OVR_NO" | grep -E "192.0.2.15|192.0.2.86"; then
-    echo "[FAIL] Address records returned for ovr-no.jp with additional-from-auth no!"
+    echo "[FAIL] Address records returned for ovr-no.test with additional-from-auth no!"
     exit 1
 fi
 
-echo "[*] Querying NS ovr-yes.jp on port ${PORT_E}..."
-OUT_OVR_YES=$($DAG NS ovr-yes.jp @127.0.0.1 -p ${PORT_E})
+echo "[*] Querying NS ovr-yes.test on port ${PORT_E}..."
+OUT_OVR_YES=$($DAG NS ovr-yes.test @127.0.0.1 -p ${PORT_E})
 echo "$OUT_OVR_YES"
-if ! echo "$OUT_OVR_YES" | grep -q "ns1.city.ovr-yes.jp.*192.0.2.15"; then
-    echo "[FAIL] In-domain glue missing for ovr-yes.jp!"
+if ! echo "$OUT_OVR_YES" | grep -q "ns1.city.ovr-yes.test.*192.0.2.15"; then
+    echo "[FAIL] In-domain glue missing for ovr-yes.test!"
     exit 1
 fi
 if ! echo "$OUT_OVR_YES" | grep -q "ns1.v6.example.com.*192.0.2.86"; then
-    echo "[FAIL] Sibling glue missing for ovr-yes.jp (inherited yes)!"
+    echo "[FAIL] Sibling glue missing for ovr-yes.test (inherited yes)!"
     exit 1
 fi
 

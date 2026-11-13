@@ -115,8 +115,8 @@ grep "status: SERVFAIL" dag_output.txt || { echo "Failed: example.net did not re
 echo "[+] Checking dag resolution for example.org (should be SERVFAIL)"
 "$BIN_DIR/dag" -p ${PORT} @127.0.0.1 example.org. SOA | grep "status: SERVFAIL" || { echo "Failed: example.org did not return SERVFAIL"; kill $SERVER_PID; exit 1; }
 
-echo "[+] Checking dag resolution for example.edu (should be REFUSED because it's not a member yet)"
-"$BIN_DIR/dag" -p ${PORT} @127.0.0.1 example.edu. SOA | grep "status: REFUSED" || { echo "Failed: example.edu did not return REFUSED"; kill $SERVER_PID; exit 1; }
+echo "[+] Checking dag resolution for edu.example (should be REFUSED because it's not a member yet)"
+"$BIN_DIR/dag" -p ${PORT} @127.0.0.1 edu.example. SOA | grep "status: REFUSED" || { echo "Failed: edu.example did not return REFUSED"; kill $SERVER_PID; exit 1; }
 
 # Now let's update the catalog zone (add zone3, remove zone1)
 cat << 'EOF' > catalog.zone
@@ -126,7 +126,7 @@ $TTL 3600
 @ IN NS ns1.example.com.
 version IN TXT "2"
 zone2.zones IN PTR example.org.
-zone3.zones IN PTR example.edu.
+zone3.zones IN PTR edu.example.
 EOF
 
 "$BIN_DIR/karictl" -f karictl.conf reload
@@ -139,8 +139,8 @@ OUT=$("$BIN_DIR/dag" -p ${PORT} @127.0.0.1 example.net. SOA)
 echo "$OUT" | grep "status: REFUSED" || { echo "Failed: example.net should be REFUSED now"; echo "$OUT"; cat karidns.log; kill $SERVER_PID; exit 1; }
 OUT=$("$BIN_DIR/dag" -p ${PORT} @127.0.0.1 example.org. SOA)
 echo "$OUT" | grep "status: SERVFAIL" || { echo "Failed: example.org should still be SERVFAIL"; echo "$OUT"; kill $SERVER_PID; exit 1; }
-OUT=$("$BIN_DIR/dag" -p ${PORT} @127.0.0.1 example.edu. SOA)
-echo "$OUT" | grep "status: SERVFAIL" || { echo "Failed: example.edu should be SERVFAIL now"; echo "$OUT"; kill $SERVER_PID; exit 1; }
+OUT=$("$BIN_DIR/dag" -p ${PORT} @127.0.0.1 edu.example. SOA)
+echo "$OUT" | grep "status: SERVFAIL" || { echo "Failed: edu.example should be SERVFAIL now"; echo "$OUT"; kill $SERVER_PID; exit 1; }
 
 # Run concurrent reload + something else to test race conditions
 echo "[+] Testing race condition (concurrent full reload vs catalog delta update)"
@@ -153,7 +153,7 @@ wait $PIDS
 sleep 1
 
 # Check resolution still intact after race condition test
-"$BIN_DIR/dag" -p ${PORT} @127.0.0.1 example.edu. SOA | grep "status: SERVFAIL" || { echo "Failed: example.edu broken after race test"; kill $SERVER_PID; exit 1; }
+"$BIN_DIR/dag" -p ${PORT} @127.0.0.1 edu.example. SOA | grep "status: SERVFAIL" || { echo "Failed: edu.example broken after race test"; kill $SERVER_PID; exit 1; }
 
 
 echo "[+] Phase 0 Unique-ID Test: Changing unique-id of example.org..."
@@ -207,7 +207,7 @@ cat << EOF > catalog1.zone
 @ IN SOA ns1.example.com. admin.example.com. 1 3600 1800 604800 86400
 @ IN NS ns1.example.com.
 version IN TXT "2"
-abc.zones IN PTR coo-test.com.
+abc.zones IN PTR coo-test.test.
 EOF
 
 cat << EOF > catalog2.zone
@@ -220,17 +220,17 @@ EOF
 "$BIN_DIR/karictl" -f karictl.conf reconfig
 sleep 1
 
-# Verify coo-test.com is loaded (returns SERVFAIL instead of REFUSED because it has no records)
-"$BIN_DIR/dag" -p ${PORT} @127.0.0.1 coo-test.com. SOA > dag_out.txt || true
-grep "status: SERVFAIL" dag_out.txt || { echo "Failed: coo-test.com not loaded by catalog1"; cat dag_out.txt; kill $SERVER_PID; exit 1; }
+# Verify coo-test.test is loaded (returns SERVFAIL instead of REFUSED because it has no records)
+"$BIN_DIR/dag" -p ${PORT} @127.0.0.1 coo-test.test. SOA > dag_out.txt || true
+grep "status: SERVFAIL" dag_out.txt || { echo "Failed: coo-test.test not loaded by catalog1"; cat dag_out.txt; kill $SERVER_PID; exit 1; }
 
-echo "[+] CoO Test: catalog2 tries to steal coo-test.com (collision expected)..."
+echo "[+] CoO Test: catalog2 tries to steal coo-test.test (collision expected)..."
 cat << EOF > catalog2.zone
 \$ORIGIN catalog2.example.com.
 @ IN SOA ns1.example.com. admin.example.com. 2 3600 1800 604800 86400
 @ IN NS ns1.example.com.
 version IN TXT "2"
-xyz.zones IN PTR coo-test.com.
+xyz.zones IN PTR coo-test.test.
 EOF
 
 "$BIN_DIR/karictl" -f karictl.conf reload catalog2.example.com
@@ -238,12 +238,12 @@ sleep 1
 
 # RFC 9432 §5.3.1: without a coo property in catalog1 pointing to catalog2, the claim is
 # ignored and the member stays with catalog1 (same unique-id, still served)
-grep "Name collision for 'coo-test.com.' between 'catalog1.example.com.' and 'catalog2.example.com.'. Ignoring." karidns.log || { echo "Failed: collision without coo not reported"; cat karidns.log; kill $SERVER_PID; exit 1; }
-if grep -q "CoO transfer: .*'coo-test.com.'" karidns.log; then
+grep "Name collision for 'coo-test.test.' between 'catalog1.example.com.' and 'catalog2.example.com.'. Ignoring." karidns.log || { echo "Failed: collision without coo not reported"; cat karidns.log; kill $SERVER_PID; exit 1; }
+if grep -q "CoO transfer: .*'coo-test.test.'" karidns.log; then
     echo "Failed: member migrated to catalog2 without a coo property"; cat karidns.log; kill $SERVER_PID; exit 1
 fi
-"$BIN_DIR/dag" -p ${PORT} @127.0.0.1 coo-test.com. SOA > dag_out.txt || true
-grep "status: SERVFAIL" dag_out.txt || { echo "Failed: coo-test.com no longer loaded after the ignored claim"; cat dag_out.txt; kill $SERVER_PID; exit 1; }
+"$BIN_DIR/dag" -p ${PORT} @127.0.0.1 coo-test.test. SOA > dag_out.txt || true
+grep "status: SERVFAIL" dag_out.txt || { echo "Failed: coo-test.test no longer loaded after the ignored claim"; cat dag_out.txt; kill $SERVER_PID; exit 1; }
 echo "[+] CoO Test: claim without coo ignored"
 
 echo "[+] CoO Test: Initiating valid transfer (adding coo PTR to catalog1)..."
@@ -252,7 +252,7 @@ cat << EOF > catalog1.zone
 @ IN SOA ns1.example.com. admin.example.com. 2 3600 1800 604800 86400
 @ IN NS ns1.example.com.
 version IN TXT "2"
-abc.zones IN PTR coo-test.com.
+abc.zones IN PTR coo-test.test.
 coo.abc.zones IN PTR catalog2.example.com.
 EOF
 
@@ -265,7 +265,7 @@ cat << EOF > catalog2.zone
 @ IN SOA ns1.example.com. admin.example.com. 3 3600 1800 604800 86400
 @ IN NS ns1.example.com.
 version IN TXT "2"
-xyz.zones IN PTR coo-test.com.
+xyz.zones IN PTR coo-test.test.
 EOF
 
 "$BIN_DIR/karictl" -f karictl.conf reload catalog2.example.com
@@ -283,11 +283,11 @@ EOF
 sleep 1
 
 # If the zone was correctly transferred to catalog2, removing it from catalog1 shouldn't kill it.
-"$BIN_DIR/dag" -p ${PORT} @127.0.0.1 coo-test.com. SOA > dag_out.txt || true
-grep "status: SERVFAIL" dag_out.txt || { echo "Failed: coo-test.com was deleted even though catalog2 should own it"; cat dag_out.txt; kill $SERVER_PID; exit 1; }
+"$BIN_DIR/dag" -p ${PORT} @127.0.0.1 coo-test.test. SOA > dag_out.txt || true
+grep "status: SERVFAIL" dag_out.txt || { echo "Failed: coo-test.test was deleted even though catalog2 should own it"; cat dag_out.txt; kill $SERVER_PID; exit 1; }
 
 # Verify that State Reset was properly executed (unique-ids changed)
-grep "evicted old state for 'coo-test.com.' (old unique-id: abc, new unique-id: xyz)" karidns.log || { echo "Failed: State reset eviction log missing"; cat karidns.log; kill $SERVER_PID; exit 1; }
+grep "evicted old state for 'coo-test.test.' (old unique-id: abc, new unique-id: xyz)" karidns.log || { echo "Failed: State reset eviction log missing"; cat karidns.log; kill $SERVER_PID; exit 1; }
 echo "[+] CoO transfer (State Reset) successfully verified!"
 
 echo "[+] Phase 3 CoO State Retention Test: Transferring with identical unique-id..."
@@ -296,7 +296,7 @@ cat << EOF > catalog1.zone
 @ IN SOA ns1.example.com. admin.example.com. 4 3600 1800 604800 86400
 @ IN NS ns1.example.com.
 version IN TXT "2"
-retain.zones IN PTR state-retain.com.
+retain.zones IN PTR state-retain.test.
 coo.retain.zones IN PTR catalog2.example.com.
 EOF
 
@@ -309,15 +309,15 @@ cat << EOF > catalog2.zone
 @ IN SOA ns1.example.com. admin.example.com. 4 3600 1800 604800 86400
 @ IN NS ns1.example.com.
 version IN TXT "2"
-xyz.zones IN PTR coo-test.com.
-retain.zones IN PTR state-retain.com.
+xyz.zones IN PTR coo-test.test.
+retain.zones IN PTR state-retain.test.
 EOF
 
 "$BIN_DIR/karictl" -f karictl.conf reload catalog2.example.com
 sleep 1
 
 # Verify retention log
-grep "retained state for 'state-retain.com.' (unique-id: retain), owner catalog1.example.com. -> catalog2.example.com." karidns.log || { echo "Failed: State retention log missing"; cat karidns.log; kill $SERVER_PID; exit 1; }
+grep "retained state for 'state-retain.test.' (unique-id: retain), owner catalog1.example.com. -> catalog2.example.com." karidns.log || { echo "Failed: State retention log missing"; cat karidns.log; kill $SERVER_PID; exit 1; }
 
 # Remove from catalog1 to confirm it doesn't drop
 cat << EOF > catalog1.zone
@@ -330,8 +330,8 @@ EOF
 "$BIN_DIR/karictl" -f karictl.conf reload catalog1.example.com
 sleep 1
 
-"$BIN_DIR/dag" -p ${PORT} @127.0.0.1 state-retain.com. SOA > dag_out.txt || true
-grep "status: SERVFAIL" dag_out.txt || { echo "Failed: state-retain.com dropped after retention transfer"; cat dag_out.txt; kill $SERVER_PID; exit 1; }
+"$BIN_DIR/dag" -p ${PORT} @127.0.0.1 state-retain.test. SOA > dag_out.txt || true
+grep "status: SERVFAIL" dag_out.txt || { echo "Failed: state-retain.test dropped after retention transfer"; cat dag_out.txt; kill $SERVER_PID; exit 1; }
 
 echo "[+] CoO transfer (State Retention) successfully verified!"
 

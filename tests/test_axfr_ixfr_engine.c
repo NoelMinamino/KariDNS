@@ -568,10 +568,10 @@ static void test_parse_xfr_packet(void) {
     bad_pkt[6] = 0; bad_pkt[7] = 1; // ANCOUNT=1
     bad_pkt[4] = 0; bad_pkt[5] = 0; // QDCOUNT=0
     size_t bad_off = 12;
-    // Owner name: bad.other.org.
+    // Owner name: bad.other.test.
     bad_pkt[bad_off++] = 3; memcpy(&bad_pkt[bad_off], "bad", 3); bad_off += 3;
     bad_pkt[bad_off++] = 5; memcpy(&bad_pkt[bad_off], "other", 5); bad_off += 5;
-    bad_pkt[bad_off++] = 3; memcpy(&bad_pkt[bad_off], "org", 3); bad_off += 3;
+    bad_pkt[bad_off++] = 4; memcpy(&bad_pkt[bad_off], "test", 4); bad_off += 4;
     bad_pkt[bad_off++] = 0;
     bad_pkt[bad_off++] = 0; bad_pkt[bad_off++] = 1; // A
     bad_pkt[bad_off++] = 0; bad_pkt[bad_off++] = 1; // IN
@@ -1606,7 +1606,7 @@ static void test_parse_xfr_packet_error_and_out_of_zone_rejections(void) {
     out_pkt[0] = 0x12; out_pkt[1] = 0x34;
     out_pkt[6] = 0; out_pkt[7] = 1; // ANCOUNT = 1
     size_t off = 12;
-    off += write_uncompressed_name(out_pkt, off, sizeof(out_pkt), "outofzone.org.");
+    off += write_uncompressed_name(out_pkt, off, sizeof(out_pkt), "outofzone.test.");
     out_pkt[off++] = 0; out_pkt[off++] = 1; // A
     out_pkt[off++] = 0; out_pkt[off++] = 1; // IN
     out_pkt[off++] = 0; out_pkt[off++] = 0; out_pkt[off++] = 1; out_pkt[off++] = 0x2C;
@@ -3144,7 +3144,7 @@ static void test_handle_axfr_event_out_of_zone_bailiwick_record(void) {
     strlcpy(session.initial_soa_name, "zone.example.", sizeof(session.initial_soa_name));
 
     assert(domain_names_match_ci("zone.example.", "zone.example.") == true);
-    assert(domain_names_match_ci("rogue.attacker.com.", "zone.example.") == false);
+    assert(domain_names_match_ci("rogue.attacker.test.", "zone.example.") == false);
     printf("  -> out-of-bailiwick record filtering passed.\n");
 }
 
@@ -3207,7 +3207,7 @@ static void test_axfr_ixfr_soa_serial_equal_up_to_date(void) {
     printf("[TEST] AXFR/IXFR: SOA serial equal up-to-date immediate response...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "uptodate.org.", sizeof(entry.domain));
+    strlcpy(entry.domain, "uptodate.test.", sizeof(entry.domain));
     atomic_init(&entry.serial, 2026092401);
     assert(atomic_load(&entry.serial) == 2026092401);
     printf("  -> serial equal up-to-date passed.\n");
