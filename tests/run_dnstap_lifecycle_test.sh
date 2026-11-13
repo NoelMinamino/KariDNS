@@ -178,6 +178,10 @@ wait_status() { # $1 = status line, $2 = seconds; floods meanwhile so that frame
 }
 start_receiver "$TMP_DIR/cap5.log" --connections 2 --stall-after 4 --stall 2.5 --timeout 60
 start_server || fail "server did not answer (loss test)"
+# the Backend connects to the collector after its workers start, so an answered query does not mean connected yet: wait for the state
+# (no flood meanwhile: the collector stalls after its first frames, and the loss below is counted from here)
+i=0
+while [ $i -lt 40 ] && ! ctl status | grep -qx "dnstap connected: yes"; do sleep 0.25; i=$((i + 1)); done
 ctl status | grep -qx "dnstap connected: yes" && pass "status: dnstap connected: yes" || fail "status: $(ctl status | grep '^dnstap')"
 i=0; full=0
 while [ $i -lt 40 ]; do
