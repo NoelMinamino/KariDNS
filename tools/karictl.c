@@ -546,6 +546,14 @@ static void prom_server(const karidns_status_t *st, const karidns_stats_total_t 
     printf("karidns_zone_bytes{source=\"other\",state=\"resident\"} %llu\n", ULL(st->other_bytes_resident));
     printf("karidns_zone_bytes{source=\"other\",state=\"retired\"} %llu\n", ULL(st->other_bytes_retired));
     printf("karidns_zone_bytes{source=\"other\",state=\"previous\"} %llu\n", ULL(st->other_bytes_previous));
+    prom_family("karidns_reclaim_snapshots_waiting", "gauge", "Retired zone snapshots not freed yet (a reader still holds the oldest, or it is being freed).");
+    printf("karidns_reclaim_snapshots_waiting %llu\n", ULL(st->reclaim_snapshots_waiting));
+    prom_family("karidns_reclaim_oldest_snapshot_age_seconds", "gauge", "How long the oldest retired zone snapshot has waited to be freed (0 when none waits).");
+    printf("karidns_reclaim_oldest_snapshot_age_seconds %.3f\n", (double)st->reclaim_oldest_age_ms / 1000.0);
+    prom_family("karidns_reclaim_zone_versions_waiting", "gauge", "Retired zone versions and objects on the retire stack, not freed yet.");
+    printf("karidns_reclaim_zone_versions_waiting %llu\n", ULL(st->reclaim_zone_versions_waiting));
+    prom_family("karidns_reclaim_warnings_total", "counter", "Warnings written because a retired zone snapshot waited longer than 60 s.");
+    printf("karidns_reclaim_warnings_total %llu\n", ULL(st->reclaim_warnings));
     prom_family("karidns_queries_total", "counter", "Queries answered for a zone, by transport (queries no zone answered are in karidns_unzoned_responses_total).");
     printf("karidns_queries_total{proto=\"udp\"} %llu\n", ULL(t->queries_total - t->tcp_queries));
     printf("karidns_queries_total{proto=\"tcp\"} %llu\n", ULL(t->tcp_queries));
@@ -620,6 +628,8 @@ static void json_server(const karidns_status_t *st, const karidns_stats_total_t 
     printf(",\"zone_bytes\":{\"database\":{\"resident\":%llu,\"retired\":%llu,\"previous\":%llu},\"other\":{\"resident\":%llu,\"retired\":%llu,\"previous\":%llu}}",
            ULL(st->db_bytes_resident), ULL(st->db_bytes_retired), ULL(st->db_bytes_previous), ULL(st->other_bytes_resident),
            ULL(st->other_bytes_retired), ULL(st->other_bytes_previous));
+    printf(",\"reclaim\":{\"snapshots_waiting\":%llu,\"oldest_snapshot_age_ms\":%llu,\"zone_versions_waiting\":%llu,\"warnings\":%llu}",
+           ULL(st->reclaim_snapshots_waiting), ULL(st->reclaim_oldest_age_ms), ULL(st->reclaim_zone_versions_waiting), ULL(st->reclaim_warnings));
     printf(",\"queries\":{\"udp\":%llu,\"tcp\":%llu}", ULL(t->queries_total - t->tcp_queries), ULL(t->tcp_queries));
     printf(",\"responses\":{\"NOERROR\":%llu,\"FORMERR\":%llu,\"SERVFAIL\":%llu,\"NXDOMAIN\":%llu,\"NOTIMP\":%llu,\"REFUSED\":%llu",
            ULL(t->responses_noerror + t->responses_nodata + t->unzoned_responses[0]), ULL(t->unzoned_responses[1]),
@@ -1206,6 +1216,11 @@ int main(int argc, char **argv) {
             /* the versions zones keep for 'karictl rollback' (rollback-window): not served, freed when the window is over or the memory-limit needs the room */
             printf("zone versions kept for rollback: database zones %llu bytes, other zones %llu bytes\n",
                    (unsigned long long)st.db_bytes_previous, (unsigned long long)st.other_bytes_previous);
+            /* 0.7 (R1): what waits to be freed because a reader still holds it */
+            printf("retired zone snapshots waiting: %llu (oldest %llu ms)\n", (unsigned long long)st.reclaim_snapshots_waiting,
+                   (unsigned long long)st.reclaim_oldest_age_ms);
+            printf("retired zone versions waiting: %llu\n", (unsigned long long)st.reclaim_zone_versions_waiting);
+            printf("reclaim warnings (snapshot held over 60 s): %llu\n", (unsigned long long)st.reclaim_warnings);
             printf("server is up and running%s\n", st.frontend_alive ? "" : " (Frontend is down)");
             
             printf("\n--- Security & Rate Limit Stats ---\n");

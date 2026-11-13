@@ -778,8 +778,8 @@ typedef struct zone_db_snapshot {
   zdir_garbage_t garb;
   struct zone_db_snapshot *gc_next;   /* the retired snapshots that are not drained yet, oldest first (g_gc_lock) */
   bool gc_queued;
-  bool gc_started;                    /* its cleanup thread was started (or is being started); false = a start failed and is tried again (g_gc_lock) */
-  bool gc_drained;
+  bool gc_drained;                    /* its views are released: freed with its garbage once every older one is drained (g_gc_lock) */
+  int64_t gc_retired_ms;              /* when it was retired (CLOCK_MONOTONIC, ms): the age of the oldest in karictl status */
 } zone_db_snapshot_t;
 
 /* A long walk over every zone (a rebuild at a million zones, the glue refresh, the registry walks of the ingest thread)

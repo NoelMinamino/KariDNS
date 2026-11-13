@@ -14,6 +14,7 @@
  *     version), still waits for every other one, and times out with false.
  */
 #include <assert.h>
+#include <stdarg.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
@@ -25,9 +26,15 @@
 
 /* dns_epoch_rcu.c logs through kdns_syslog() (dns_log.h, defined in dns_utils.c, which this test does not link): the messages are not
  * what is tested here. */
+static char g_stall_log[512];   /* the last stall line (R1: it names the slots; written by the test's own thread only) */
 void kdns_syslog(int prio, const char *fmt, ...) {
     (void)prio;
-    (void)fmt;
+    va_list ap;
+    va_start(ap, fmt);
+    char m[512];
+    vsnprintf(m, sizeof(m), fmt, ap);
+    if (strstr(m, "stalled")) snprintf(g_stall_log, sizeof(g_stall_log), "%s", m);
+    va_end(ap);
 }
 
 _Atomic(worker_ctx_t *) g_worker_ctxs = ATOMIC_VAR_INIT(NULL);
@@ -327,8 +334,45 @@ static void test_wait_in_reader(void) {
   printf("  [PASS] only the caller's own slot is skipped; the timeout result is false\n");
 }
 
+/* R1 (0.7): rcu_describe_blockers() names the kinds of slot that hold a grace period, and the stall line of a long wait carries it */
+static void test_describe_blockers(void) {
+  printf("[TEST] the slots that hold a grace period, by kind...\n");
+  char buf[256];
+  (void)rcu_writer_advance_epoch();               /* (so that e - 1 below is an epoch) */
+  register_workers(3);
+  rcu_aux_read_lock();                          /* observes the epoch that advance_epoch() returns: it blocks it */
+  uint64_t e = rcu_writer_advance_epoch();
+  assert(rcu_describe_blockers(e - 1, buf, sizeof(buf)) == 0 && buf[0] == '\0');   /* an older epoch: nobody holds it */
+  assert(rcu_describe_blockers(e, buf, sizeof(buf)) == 1);
+  assert(strstr(buf, "1 auxiliary (control, transfer or other thread) slot(s) (the first: ") == buf);
+  atomic_store_explicit(&g_test_workers[1].rcu_observed_epoch, e, memory_order_release);
+  atomic_store_explicit(&g_test_workers[2].rcu_observed_epoch, e - 1, memory_order_release);
+  atomic_store_explicit(&g_query_logger_rcu_ctx.rcu_observed_epoch, e, memory_order_release);
+  atomic_store_explicit(&g_async_io_rcu_ctxs[3].rcu_observed_epoch, e, memory_order_release);
+  assert(rcu_describe_blockers(e, buf, sizeof(buf)) == 5);
+  assert(strstr(buf, "2 worker slot(s) (the first: 1), 1 logger slot(s), 1 async I/O slot(s) (the first: 3), 1 auxiliary") == buf);
+  /* a small buffer is cut, never overrun */
+  char small[12];
+  memset(small, 'x', sizeof(small));
+  assert(rcu_describe_blockers(e, small, sizeof(small)) == 5 && strlen(small) < sizeof(small));
+  assert(rcu_describe_blockers(e, small, 0) == 5);
+  /* the stall line of a wait that goes on names them (the first after 1 s) */
+  g_stall_log[0] = '\0';
+  assert(rcu_writer_wait_until_safe(e, 1300) == false);
+  assert(strstr(g_stall_log, "held by 2 worker slot(s) (the first: 1), 1 logger slot(s)") != NULL);
+  atomic_store_explicit(&g_test_workers[1].rcu_observed_epoch, RCU_EPOCH_IDLE, memory_order_release);
+  atomic_store_explicit(&g_test_workers[2].rcu_observed_epoch, RCU_EPOCH_IDLE, memory_order_release);
+  atomic_store_explicit(&g_query_logger_rcu_ctx.rcu_observed_epoch, RCU_EPOCH_IDLE, memory_order_release);
+  atomic_store_explicit(&g_async_io_rcu_ctxs[3].rcu_observed_epoch, RCU_EPOCH_IDLE, memory_order_release);
+  rcu_aux_read_unlock();
+  assert(rcu_describe_blockers(e, buf, sizeof(buf)) == 0);
+  unregister_workers();
+  printf("  [PASS] workers, loggers, async I/O and auxiliary slots are told apart; the text is cut to the buffer\n");
+}
+
 int main(void) {
   printf("=== Epoch RCU tests (R-25) ===\n");
+  test_describe_blockers();
   test_publish_order();
   test_aux_slots();
   test_aux_slot_released_at_thread_exit();

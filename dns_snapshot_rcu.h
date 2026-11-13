@@ -35,15 +35,22 @@ zone_db_entry_t *find_zone_exact_in_view(view_snapshot_t *view, const char *doma
 zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname);
 zone_db_entry_t *find_zone_for_query(view_snapshot_t *view, const char *qname, uint16_t qtype);
 void free_zone_db_entry(zone_db_entry_t *entry);
-void *gc_snapshot_thread(void *arg);
-/* Start the cleanup thread of every retired snapshot that has none (a start that failed is tried again by every publication, every ended
- * cleanup thread and the control thread's tick); gc_has_unstarted() says whether there is one.  zdir_gc_queued(): the retired snapshots
- * that are not drained yet (unit tests). */
+/* R1 (0.7): one reclaim thread per process frees the retired snapshots in order.  gc_start_pending() starts it when snapshots are queued and
+ * it does not run (every publication; the control thread's tick tries again after a failed start, gc_has_unstarted()).  zdir_gc_queued():
+ * the retired snapshots that are not freed yet. */
 void gc_start_pending(void);
 bool gc_has_unstarted(void);
 size_t zdir_gc_queued(void);
-void gc_snapshot_detach_only(void); /* the Backend, right after fork: its cleanup threads are detached from now on */
-void gc_snapshot_wait_idle(void); /* the process manager calls it before every fork(): no helper thread may be running */
+void gc_snapshot_detach_only(void); /* the Backend, right after fork: its reclaim thread is detached and lives as long as the process */
+void gc_snapshot_wait_idle(void); /* the process manager calls it before every fork(): the reclaim thread has drained the queue and is joined */
+/* What waits to be freed, for karictl status / stats (read on the control thread) */
+typedef struct {
+  uint64_t snapshots_waiting;     /* retired zone-db snapshots not freed yet */
+  uint64_t oldest_age_ms;         /* how long the oldest of them has waited (0 when none) */
+  uint64_t zone_retire_waiting;   /* retired zone versions and objects on the retire stack (zone_retire_process()) */
+  uint64_t warnings;              /* warnings written about a snapshot that waited longer than 60 s */
+} gc_reclaim_stats_t;
+void gc_reclaim_stats(gc_reclaim_stats_t *out);
 zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name);
 
 reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg);

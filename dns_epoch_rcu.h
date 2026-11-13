@@ -65,6 +65,9 @@ uint64_t rcu_writer_advance_epoch(void);
 bool rcu_writer_wait_until_safe(uint64_t retire_epoch, int timeout_ms);
 // 待たずに 1 回だけ調べる (retire_epoch 以前を読んでいるスレッドがいなければ true)
 bool rcu_writer_is_safe(uint64_t retire_epoch);
+// R1 (0.7): the reader slots that hold back retire_epoch, by kind, as text for a warning; returns their number (0 = none)
+#include <stddef.h>
+int rcu_describe_blockers(uint64_t retire_epoch, char *buf, size_t len);
 
 // ワーカーが自分の読み取り区間の中で writer になるとき (UPDATE) に使う。自分の区間は待たない
 // (待つと自分自身を待ってタイムアウトまで止まる)。呼び出し側は、待つ前に読んだ arena の

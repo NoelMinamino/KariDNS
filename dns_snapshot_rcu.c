@@ -255,50 +255,49 @@ static void garb_free(zdir_garbage_t *g) {
 
 /* ---- the snapshots that were retired and are not drained yet, oldest first.  What a snapshot keeps in its garbage list is freed
  * when it and every older snapshot have been drained: a reader that holds an older snapshot (a transfer, a control command) can
- * have got a pointer to it from the shared directory. ---- */
+ * have got a pointer to it from the shared directory.
+ * R1 (0.7, K-1): ONE reclaim thread per process owns the queue (gc_reclaim_thread()).  It releases the views of each queued snapshot
+ * as soon as nobody reads it any more, and frees the drained snapshots at the head, in order, with their garbage.  Nothing caps the
+ * queue and no reader is cut off: a snapshot that waits longer than GC_WARN_MS is reported, at most once a minute (gc_warn_stuck()),
+ * and karictl status / stats show the queue (gc_reclaim_stats()). ---- */
 static pthread_mutex_t g_gc_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_gc_cond;                 /* the reclaim thread waits on it (CLOCK_MONOTONIC); signalled when a snapshot is queued */
+static pthread_once_t g_gc_cond_once = PTHREAD_ONCE_INIT;
 static zone_db_snapshot_t *g_gc_head, *g_gc_tail;
-static _Atomic unsigned g_gc_unstarted;       /* queued snapshots that have no cleanup thread yet (a thread could not be started) */
+static _Atomic size_t g_gc_count;                /* snapshots in the queue (written under g_gc_lock) */
+static _Atomic bool g_gc_running;                /* the reclaim thread runs or has been claimed to start (written under g_gc_lock) */
+static zone_db_snapshot_t *g_gc_releasing;       /* the snapshot whose views the thread is releasing outside the lock (g_gc_lock) */
+static _Atomic size_t g_zone_retire_count;            /* nodes on the zone-version retire stack (g_zone_retire_head), allocated and not freed yet */
+static bool g_gc_cond_ready;
 
-/* old is replaced by the snapshot that was just published (the rebuild lock is held): it takes the garbage so far and joins the queue */
+static void gc_cond_init(void) {
+  g_gc_cond_ready = true;
+  pthread_condattr_t a;
+  pthread_condattr_init(&a);
+  pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
+  pthread_cond_init(&g_gc_cond, &a);
+  pthread_condattr_destroy(&a);
+}
+
+/* old is replaced by the snapshot that was just published (the rebuild lock is held): it takes the garbage so far and joins the queue.
+ * The caller starts the reclaim thread afterwards if it does not run (gc_start_pending(), outside the rebuild lock). */
 static void gc_retire_locked(zone_db_snapshot_t *old) {
   old->garb = g_garb;
   memset(&g_garb, 0, sizeof(g_garb));
   g_garb_n = 0;
   atomic_store_explicit(&g_garb_force, false, memory_order_release);
   old->gc_next = NULL;
+  old->gc_drained = false;
+  old->gc_retired_ms = burst_now_ms();
+  pthread_once(&g_gc_cond_once, gc_cond_init);
   pthread_mutex_lock(&g_gc_lock);
   old->gc_queued = true;
-  old->gc_started = false;
-  atomic_fetch_add_explicit(&g_gc_unstarted, 1, memory_order_relaxed);
   if (g_gc_tail) g_gc_tail->gc_next = old;
   else g_gc_head = old;
   g_gc_tail = old;
+  atomic_store_explicit(&g_gc_count, atomic_load_explicit(&g_gc_count, memory_order_relaxed) + 1, memory_order_relaxed);
+  pthread_cond_signal(&g_gc_cond);
   pthread_mutex_unlock(&g_gc_lock);
-}
-
-/* the views of a snapshot that nobody reads any more are released; then, in the order of retirement, the snapshots that are
- * drained are freed with their garbage.  snap may be freed here. */
-static void gc_drained(zone_db_snapshot_t *snap) {
-  zone_db_snapshot_t *done = NULL, **tail = &done;
-  pthread_mutex_lock(&g_gc_lock);
-  snap->gc_drained = true;
-  while (g_gc_head && g_gc_head->gc_drained) {
-    zone_db_snapshot_t *s = g_gc_head;
-    g_gc_head = s->gc_next;
-    if (!g_gc_head) g_gc_tail = NULL;
-    s->gc_next = NULL;
-    *tail = s;
-    tail = &s->gc_next;
-  }
-  pthread_mutex_unlock(&g_gc_lock);
-  while (done) {
-    zone_db_snapshot_t *s = done;
-    done = s->gc_next;
-    garb_free(&s->garb);
-    free(s);
-  }
-  if (gc_has_unstarted()) gc_start_pending();      /* a thread that could not be started earlier: try again now that one has ended */
 }
 
 /* ---- writers: change the index of a directory in place (g_zone_db_rebuild_lock held) ---- */
@@ -835,148 +834,250 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
   free(entry);
 }
 
-/* The views of a snapshot are released; the directories go with the last snapshot that lists them.  A snapshot that was retired
- * (gc_retire_locked()) is not freed here: it is marked drained, and freed with its garbage when the older snapshots are drained
- * too (gc_drained()).  One that was never published (an aborted rebuild, a unit test's) is freed at once. */
+/* The views of a snapshot are released; the directories go with the last snapshot that lists them. */
+static void snapshot_release_views(zone_db_snapshot_t *snap) {
+  if (!snap->views) return;
+  for (size_t v = 0; v < snap->view_count; v++) {
+    view_snapshot_t *vs = &snap->views[v];
+    free(vs->name);
+    vs->name = NULL;
+    if (vs->match_clients) {
+      for (int i = 0; i < vs->match_clients_count; i++) {
+        if (vs->match_clients[i]) free(vs->match_clients[i]);
+      }
+      free(vs->match_clients);
+      vs->match_clients = NULL;
+    }
+    free(vs->match_clients_parsed);
+    vs->match_clients_parsed = NULL;
+    aml_unref(vs->match_aml);   /* NULL is fine */
+    vs->match_aml = NULL;
+    zdir_unref(vs->dir);
+    vs->dir = NULL;
+    view_ivdb_free(vs);
+  }
+  free(snap->views);
+  snap->views = NULL;
+}
+
+/* A snapshot that was never published (an aborted rebuild, a unit test's) is freed at once with its views.  A retired one
+ * (gc_retire_locked()) belongs to the reclaim thread, which frees it in order; it is not freed here. */
 void free_zone_db_snapshot(zone_db_snapshot_t *snap) {
   if (!snap) return;
-  if (snap->views) {
-    for (size_t v = 0; v < snap->view_count; v++) {
-      view_snapshot_t *vs = &snap->views[v];
-      free(vs->name);
-      vs->name = NULL;
-      if (vs->match_clients) {
-        for (int i = 0; i < vs->match_clients_count; i++) {
-          if (vs->match_clients[i]) free(vs->match_clients[i]);
-        }
-        free(vs->match_clients);
-        vs->match_clients = NULL;
-      }
-      free(vs->match_clients_parsed);
-      vs->match_clients_parsed = NULL;
-      aml_unref(vs->match_aml);   /* NULL is fine */
-      vs->match_aml = NULL;
-      zdir_unref(vs->dir);
-      vs->dir = NULL;
-      view_ivdb_free(vs);
-    }
-    free(snap->views);
-    snap->views = NULL;
-  }
   if (snap->gc_queued) {
-    gc_drained(snap);
+    syslog(LOG_ERR, "[GC] a retired zone snapshot was handed to free_zone_db_snapshot(); left to the reclaim thread (a bug)");
     return;
   }
+  snapshot_release_views(snap);
   garb_free(&snap->garb);
   free(snap);
 }
 
-/* GC threads that were started and have not finished.  The process manager forks the Backend, the routers and the
- * database loader; a fork while one of these threads still runs leaves a multi-threaded parent behind, and the child
- * (which only copies the forking thread) must not start threads of its own then (ThreadSanitizer refuses: "starting new
- * threads after multi-threaded fork").  gc_snapshot_wait_idle() lets the manager fork from a single thread. */
-static _Atomic unsigned g_gc_live;
-/* A thread that has counted itself out is still on its way out of the C library (and of ThreadSanitizer's bookkeeping),
- * and a fork in that window is a fork from a multi-threaded process.  So in the manager, before the Backend exists, the
- * cleanup threads are joinable and gc_snapshot_wait_idle() joins them.  The Backend turns this off (gc_snapshot_detach_only):
- * it creates a thread per retired snapshot for the life of the process and never joins. */
-#define GC_TRACK_MAX 64
-static bool g_gc_track = true;
-static pthread_t g_gc_tids[GC_TRACK_MAX];
-static unsigned g_gc_ntids;
+/* ---- the reclaim thread (R1, 0.7).  The process manager forks the Backend, the routers, the database loader and the plugins; a
+ * fork while a helper thread runs leaves a multi-threaded parent behind, and the child (which only copies the forking thread) must not
+ * start threads of its own then (ThreadSanitizer refuses: "starting new threads after multi-threaded fork").  So in the manager (and
+ * in the unit tests) the thread is joinable, ends when the queue is empty, and gc_snapshot_wait_idle() joins it before a fork.  The
+ * Backend, which never forks, turns this off right after its fork (gc_snapshot_detach_only()): its thread is started once, detached,
+ * and sleeps on g_gc_cond while the queue is empty, for the life of the process. ---- */
+#define GC_WARN_MS 60000          /* K-1: a snapshot that waits longer than this is reported */
+#define GC_WARN_EVERY_MS 60000    /* and the report is repeated at most this often */
+static int64_t g_gc_warn_ms = GC_WARN_MS;
+#ifdef KARIDNS_UNIT_TEST
+void gc_set_warn_ms_for_test(int64_t ms) { g_gc_warn_ms = ms; }   /* (set while no reclaim thread runs) */
+#endif
+
+static bool g_gc_joinable = true;
+static pthread_mutex_t g_gc_start_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool g_gc_have_tid;        /* g_gc_tid is a joinable thread that was not joined yet (g_gc_start_lock) */
+static pthread_t g_gc_tid;
+static _Atomic uint64_t g_gc_warnings;
+static int64_t g_gc_next_warn_ms; /* the reclaim thread's own */
 
 void gc_snapshot_detach_only(void) {
-  g_gc_track = false;
-  g_gc_ntids = 0;                 /* the ids belong to the manager's threads, which the Backend does not have */
+  /* (in the child of fork(): only the forking thread exists.  If gc_snapshot_wait_idle() gave up after 30 s the manager's thread may
+   * have held the lock or been releasing a snapshot's views; the lock is made anew and that snapshot is given up (its views leak,
+   * nothing is freed twice).) */
+  pthread_mutex_init(&g_gc_lock, NULL);
+  pthread_mutex_init(&g_gc_start_lock, NULL);
+  if (g_gc_cond_ready) gc_cond_init();
+  if (g_gc_releasing) {
+    g_gc_releasing->views = NULL;
+    g_gc_releasing->view_count = 0;
+    g_gc_releasing->gc_drained = true;
+    g_gc_releasing = NULL;
+  }
+  g_gc_joinable = false;
+  g_gc_have_tid = false;
+  atomic_store_explicit(&g_gc_running, false, memory_order_relaxed);
 }
 
+/* The warning of K-1: what holds the oldest snapshot, if it can be told (the kind of reader slot of the grace period, or the references
+ * retained with retain_zone_snapshot()).  Called without g_gc_lock. */
+static void gc_warn_stuck(uint64_t retire_epoch, int refs, int64_t age_ms, size_t waiting) {
+  char who[192];
+  if (rcu_describe_blockers(retire_epoch, who, sizeof(who)) == 0) {
+    if (refs > 0)
+      snprintf(who, sizeof(who), "%d retained reference(s) (reader_count: a zone transfer, a dynamic update or a control command that holds it)", refs);
+    else
+      snprintf(who, sizeof(who), "nothing any more (it is freed now)");
+  }
+  syslog(LOG_WARNING, "[GC] the oldest retired zone snapshot has waited %lld s for its readers (%zu snapshot(s) and %zu retired zone version(s) "
+         "waiting to be freed, nothing is freed after it until it goes): held by %s", (long long)(age_ms / 1000), waiting,
+         (size_t)atomic_load_explicit(&g_zone_retire_count, memory_order_relaxed), who);
+  atomic_fetch_add_explicit(&g_gc_warnings, 1, memory_order_release);   /* (after the line: a test that sees the count reads the line) */
+}
+
+static void *gc_reclaim_thread(void *arg) {
+  (void)arg;
+  pthread_mutex_lock(&g_gc_lock);
+  for (;;) {
+    /* a queued snapshot that nobody reads any more: first the grace period of its epoch (after it no reader can take a new reference), then
+     * its references.  The epochs grow along the queue, so the first one whose grace period is not over ends the search. */
+    zone_db_snapshot_t *s = NULL;
+    for (zone_db_snapshot_t *q = g_gc_head; q && !s; q = q->gc_next) {
+      if (q->gc_drained) continue;
+      if (!rcu_writer_is_safe(q->retire_epoch)) break;
+      if (atomic_load_explicit(&q->reader_count, memory_order_acquire) == 0) s = q;
+    }
+    if (s) {
+      g_gc_releasing = s;
+      pthread_mutex_unlock(&g_gc_lock);
+      snapshot_release_views(s);
+      pthread_mutex_lock(&g_gc_lock);
+      g_gc_releasing = NULL;
+      s->gc_drained = true;
+      continue;
+    }
+    /* the drained snapshots at the head are freed with their garbage, in order */
+    zone_db_snapshot_t *done = NULL, **tail = &done;
+    while (g_gc_head && g_gc_head->gc_drained) {
+      zone_db_snapshot_t *d = g_gc_head;
+      g_gc_head = d->gc_next;
+      if (!g_gc_head) g_gc_tail = NULL;
+      d->gc_next = NULL;
+      *tail = d;
+      tail = &d->gc_next;
+      atomic_store_explicit(&g_gc_count, atomic_load_explicit(&g_gc_count, memory_order_relaxed) - 1, memory_order_relaxed);
+    }
+    if (done) {
+      pthread_mutex_unlock(&g_gc_lock);
+      while (done) {
+        zone_db_snapshot_t *d = done;
+        done = d->gc_next;
+        garb_free(&d->garb);
+        free(d);
+      }
+      pthread_mutex_lock(&g_gc_lock);
+      continue;
+    }
+    if (!g_gc_head) {
+      if (g_gc_joinable) break;                    /* the manager: the thread ends, gc_snapshot_wait_idle() joins it */
+      pthread_cond_wait(&g_gc_cond, &g_gc_lock);
+      continue;
+    }
+    /* the head waits for a reader */
+    int64_t now = burst_now_ms();
+    int64_t age = now - g_gc_head->gc_retired_ms;
+    if (age >= g_gc_warn_ms && now >= g_gc_next_warn_ms) {
+      g_gc_next_warn_ms = now + GC_WARN_EVERY_MS;
+      uint64_t ep = g_gc_head->retire_epoch;
+      int refs = atomic_load_explicit(&g_gc_head->reader_count, memory_order_relaxed);
+      size_t waiting = atomic_load_explicit(&g_gc_count, memory_order_relaxed);
+      pthread_mutex_unlock(&g_gc_lock);
+      gc_warn_stuck(ep, refs, age, waiting);
+      pthread_mutex_lock(&g_gc_lock);
+      continue;
+    }
+    /* look again soon: within a millisecond while the wait is young (a reload waits for nothing longer), then every 100 ms; a new
+     * snapshot in the queue wakes the thread at once */
+    int64_t step_ns = age < 1000 ? 1000000 : 100000000;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    ts.tv_nsec += step_ns;
+    if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+    (void)pthread_cond_timedwait(&g_gc_cond, &g_gc_lock, &ts);
+  }
+  atomic_store_explicit(&g_gc_running, false, memory_order_release);
+  pthread_mutex_unlock(&g_gc_lock);
+  return NULL;
+}
+
+/* The manager calls it before every fork(): the reclaim thread has drained the queue and is joined (no helper thread runs).  A reader that
+ * holds a snapshot for 30 s leaves it running ("forking anyway"), as before.  In the Backend (detached thread) it waits until the queue is
+ * empty.  A thread that could not be started is not waited for (nothing would free the queue). */
 void gc_snapshot_wait_idle(void) {
-  for (unsigned i = 0; i < g_gc_ntids; i++) pthread_join(g_gc_tids[i], NULL);
-  g_gc_ntids = 0;
-  for (int i = 0; atomic_load_explicit(&g_gc_live, memory_order_acquire) != 0; i++) {
-    if (i == 30000) {    /* 30 s: a reader that never leaves; the fork goes on, the threads stay */
-      syslog(LOG_WARNING, "[Manager] snapshot cleanup threads are still running; forking anyway");
+  for (int i = 0;; i++) {
+    pthread_mutex_lock(&g_gc_lock);
+    bool busy = atomic_load_explicit(&g_gc_running, memory_order_relaxed) && (g_gc_joinable || g_gc_head != NULL);
+    pthread_mutex_unlock(&g_gc_lock);
+    if (!busy) break;
+    if (i == 30000) {    /* 30 s: a reader that never leaves; the fork goes on, the thread stays */
+      syslog(LOG_WARNING, "[Manager] the snapshot reclaim thread still waits for a reader; forking anyway");
       return;
     }
     struct timespec ts = { 0, 1000000 };
     nanosleep(&ts, NULL);
   }
-}
-
-/* start the cleanup of a retired snapshot; false when no thread could be started (the snapshot is then kept) */
-static bool gc_snapshot_start(zone_db_snapshot_t *snap) {
-  pthread_t gc_tid;
-  pthread_attr_t attr;
-  pthread_attr_init(&attr);
-  bool track = g_gc_track && g_gc_ntids < GC_TRACK_MAX;      /* the manager: one thread creates and joins */
-  if (!track) pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-  atomic_fetch_add_explicit(&g_gc_live, 1, memory_order_relaxed);
-  bool ok = pthread_create(&gc_tid, &attr, gc_snapshot_thread, snap) == 0;
-  if (!ok) atomic_fetch_sub_explicit(&g_gc_live, 1, memory_order_release);
-  else if (track) g_gc_tids[g_gc_ntids++] = gc_tid;
-  pthread_attr_destroy(&attr);
-  return ok;
-}
-
-/* Start the cleanup thread of every queued snapshot that has none.  A snapshot whose thread could not be started stays queued, and
- * the garbage of every later snapshot waits behind it (the release is in order), so whoever publishes a snapshot, every cleanup thread
- * that ends and the control thread's tick try again.  One failure ends a round (no spinning on a full thread table). */
-static pthread_mutex_t g_gc_start_lock = PTHREAD_MUTEX_INITIALIZER;
-
-void gc_start_pending(void) {
   pthread_mutex_lock(&g_gc_start_lock);
-  for (;;) {
-    zone_db_snapshot_t *s = NULL;
-    pthread_mutex_lock(&g_gc_lock);
-    for (zone_db_snapshot_t *q = g_gc_head; q && !s; q = q->gc_next)
-      if (!q->gc_started) {
-        q->gc_started = true;                 /* (claimed: it cannot be drained, and so not freed, before its thread has run) */
-        s = q;
-      }
-    pthread_mutex_unlock(&g_gc_lock);
-    if (!s) break;
-    if (!gc_snapshot_start(s)) {
-      pthread_mutex_lock(&g_gc_lock);
-      s->gc_started = false;
-      pthread_mutex_unlock(&g_gc_lock);
-      syslog(LOG_ERR, "[Core] cannot start the snapshot cleanup thread; the old snapshot and the garbage queued behind it are kept until the next try");
-      break;
-    }
-    atomic_fetch_sub_explicit(&g_gc_unstarted, 1, memory_order_relaxed);
+  if (g_gc_have_tid) {
+    pthread_join(g_gc_tid, NULL);
+    g_gc_have_tid = false;
   }
   pthread_mutex_unlock(&g_gc_start_lock);
 }
 
+/* Start the reclaim thread when snapshots are queued and it does not run.  Called after every publication (outside the rebuild lock) and
+ * by the control thread's tick when gc_has_unstarted(): a start that failed is tried again there, and the queue is kept meanwhile. */
+void gc_start_pending(void) {
+  pthread_once(&g_gc_cond_once, gc_cond_init);
+  pthread_mutex_lock(&g_gc_start_lock);
+  pthread_mutex_lock(&g_gc_lock);
+  bool start = !atomic_load_explicit(&g_gc_running, memory_order_relaxed) && g_gc_head != NULL;
+  if (start) atomic_store_explicit(&g_gc_running, true, memory_order_relaxed);   /* claimed */
+  pthread_mutex_unlock(&g_gc_lock);
+  if (start) {
+    if (g_gc_have_tid) {          /* the thread before has ended (it clears g_gc_running last): join it */
+      pthread_join(g_gc_tid, NULL);
+      g_gc_have_tid = false;
+    }
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    if (!g_gc_joinable) pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&tid, &attr, gc_reclaim_thread, NULL) != 0) {
+      pthread_mutex_lock(&g_gc_lock);
+      atomic_store_explicit(&g_gc_running, false, memory_order_relaxed);
+      pthread_mutex_unlock(&g_gc_lock);
+      syslog(LOG_ERR, "[Core] cannot start the snapshot reclaim thread; the retired snapshots and their garbage are kept until the next try");
+    } else if (g_gc_joinable) {
+      g_gc_tid = tid;
+      g_gc_have_tid = true;
+    }
+    pthread_attr_destroy(&attr);
+  }
+  pthread_mutex_unlock(&g_gc_start_lock);
+}
+
+/* (the control thread's tick: no lock) */
 bool gc_has_unstarted(void) {
-  return atomic_load_explicit(&g_gc_unstarted, memory_order_relaxed) != 0;
+  return atomic_load_explicit(&g_gc_count, memory_order_relaxed) != 0 && !atomic_load_explicit(&g_gc_running, memory_order_relaxed);
 }
 
 size_t zdir_gc_queued(void) {
-  size_t n = 0;
-  pthread_mutex_lock(&g_gc_lock);
-  for (const zone_db_snapshot_t *q = g_gc_head; q; q = q->gc_next) n++;
-  pthread_mutex_unlock(&g_gc_lock);
-  return n;
+  return atomic_load_explicit(&g_gc_count, memory_order_relaxed);
 }
 
-void *gc_snapshot_thread(void *arg) {
-  zone_db_snapshot_t *snap = (zone_db_snapshot_t *)arg;
-  if (!snap) return NULL;
-  // タイムアウトしても解放しない (まだ読んでいるリーダーがいる)。待機関数が停滞を syslog に出す。
-  while (!rcu_writer_wait_until_safe(snap->retire_epoch, 60000)) {
+void gc_reclaim_stats(gc_reclaim_stats_t *out) {
+  memset(out, 0, sizeof(*out));
+  pthread_mutex_lock(&g_gc_lock);
+  out->snapshots_waiting = g_gc_head ? atomic_load_explicit(&g_gc_count, memory_order_relaxed) : 0;
+  if (g_gc_head) {
+    int64_t age = burst_now_ms() - g_gc_head->gc_retired_ms;
+    out->oldest_age_ms = age > 0 ? (uint64_t)age : 0;
   }
-  int retries = 0;
-  useconds_t sleep_time = 1;
-  while (atomic_load_explicit(&snap->reader_count, memory_order_acquire) > 0) {
-    rcu_exponential_backoff(&retries, &sleep_time);
-    /* 期限は設けない (参照を持つ読み手がいる限り解放できない) が、長引いたら記録する (wait_until_safe と同じ間隔) */
-    if (sleep_time >= 100000 && (retries % 10) == 0)
-      syslog(LOG_WARNING, "[GC] snapshot %p still has %d reader(s) after %d waits; not freed yet", (void *)snap,
-             (int)atomic_load_explicit(&snap->reader_count, memory_order_relaxed), retries);
-  }
-  free_zone_db_snapshot(snap);
-  atomic_fetch_sub_explicit(&g_gc_live, 1, memory_order_release);
-  return NULL;
+  pthread_mutex_unlock(&g_gc_lock);
+  out->zone_retire_waiting = atomic_load_explicit(&g_zone_retire_count, memory_order_relaxed);
+  out->warnings = atomic_load_explicit(&g_gc_warnings, memory_order_acquire);
 }
 
 static char *server_load_file_cb(parse_context_t *ctx, const char *rel_path, dev_t *out_dev, ino_t *out_ino) {
@@ -1225,6 +1326,7 @@ void zone_retire_process(bool wait) {
     }
     zone_entry_unref(e);
     free(r);
+    atomic_fetch_sub_explicit(&g_zone_retire_count, 1, memory_order_relaxed);
   }
   logev_post(LOGC_GENERAL, 2, NULL, 0, "[GC] retired zone versions: %u freed (%llu bytes), %u kept for readers or a running transfer (epoch %llu, %s)", n_freed,
              (unsigned long long)freed_bytes, n_kept, (unsigned long long)max_epoch, wait ? "waited for the grace period" : "no wait");
@@ -1244,6 +1346,7 @@ bool zone_retire_object(zone_db_entry_t *entry, void *obj, void (*free_fn)(void 
   r->obj = obj;
   r->free_fn = free_fn;
   r->epoch = epoch;
+  atomic_fetch_add_explicit(&g_zone_retire_count, 1, memory_order_relaxed);
   zone_retire_push(r);
   return true;
 }
@@ -1262,6 +1365,7 @@ static void zone_version_retire(zone_db_entry_t *entry, zone_version_t *old, uin
     r->from_prev = from_prev;
     zone_bytes_retired_add(zb, (int64_t)old->bytes);   /* until zone_retire_process() frees it */
     if (from_prev) atomic_fetch_add_explicit(&g_prev_inflight, (uint64_t)old->bytes, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_zone_retire_count, 1, memory_order_relaxed);
     zone_retire_push(r);
   } else if (!atomic_load_explicit(&entry->active_axfr, memory_order_acquire) &&
              !atomic_load_explicit(&entry->is_transferring, memory_order_acquire) &&

@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include "fi/kari_fi.h"
 #include "../dns_config_parser.h"
@@ -33,9 +34,16 @@ _Atomic(worker_ctx_t *) g_worker_ctxs = ATOMIC_VAR_INIT(NULL);
 int g_cwd_fd = -1;
 char g_startup_cwd[PATH_MAX] = "";
 
+/* the last "[GC]" message (R1: the warning about a snapshot held too long); written by the reclaim thread before it counts the warning */
+static char g_gc_log[1024];
 void syslog(int priority, const char *format, ...) {
     (void)priority;
-    (void)format;
+    char m[1024];
+    va_list ap;
+    va_start(ap, format);
+    vsnprintf(m, sizeof(m), format, ap);    /* (kdns_syslog() hands the formatted text as "%s") */
+    va_end(ap);
+    if (strncmp(m, "[GC]", 4) == 0) snprintf(g_gc_log, sizeof(g_gc_log), "%s", m);
 }
 
 server_config_t *acquire_config_snapshot(void) {
@@ -572,6 +580,76 @@ static void test_fi_gc_thread_start(void) {
     printf("  -> cleanup thread that cannot be started: kept, then freed by the next publish and by the tick\n");
 }
 
+/* ---------------------------------------------------------------------------
+ * R1 (0.7): one reclaim thread, in order, with counters.  A reader holds the current snapshot (a retained reference, as a zone transfer
+ * does); three publications later three snapshots wait, the held one first, and none of the later ones is freed before it (the order
+ * rule); the counters say so and grow with the wait; one warning names the retained reference and is not repeated within the minute.
+ * When the reader lets go, everything is freed and the counters are 0.
+ * ------------------------------------------------------------------------- */
+void gc_set_warn_ms_for_test(int64_t ms);
+
+static void test_gc_reclaim_queue(void) {
+    zone_config_t zc;
+    memset(&zc, 0, sizeof(zc));
+    zc.domain = (char *)"static.test.";
+    zc.type = (char *)"master";
+    view_config_t vcfg;
+    memset(&vcfg, 0, sizeof(vcfg));
+    vcfg.name = (char *)"default";
+    vcfg.zones = &zc;
+    server_config_t config;
+    memset(&config, 0, sizeof(config));
+    config.views = &vcfg;
+    atomic_store_explicit(&g_config_db.active, &config, memory_order_release);
+    fi_reset();
+    dbreg_reset();
+    assert(rebuild_zone_db_snapshot(&config, NULL, NULL, NULL, NULL, 0));
+    gc_snapshot_wait_idle();
+    gc_reclaim_stats_t gs;
+    gc_reclaim_stats(&gs);
+    assert(gs.snapshots_waiting == 0 && gs.oldest_age_ms == 0);
+    uint64_t w0 = gs.warnings;
+
+    gc_set_warn_ms_for_test(150);
+    zone_db_snapshot_t *held = acquire_retained_zone_snapshot();
+    assert(held);
+    gc_commit("q1.test.", 400, 1);
+    assert(snapshot_apply_db_delta() > 0);                   /* held retires */
+    gc_commit("q2.test.", 401, 1);
+    assert(snapshot_apply_db_delta() > 0);
+    gc_commit("q3.test.", 402, 1);
+    assert(snapshot_apply_db_delta() > 0);
+    for (int i = 0; i < 500; i++) {                           /* up to 5 s */
+        gc_reclaim_stats(&gs);
+        if (gs.warnings > w0) break;
+        usleep(10000);
+    }
+    assert(gs.warnings == w0 + 1);
+    assert(gs.snapshots_waiting == 3 && zdir_gc_queued() == 3);   /* the later two are drained but wait behind the held one */
+    assert(gs.oldest_age_ms >= 150);
+    assert(strstr(g_gc_log, "1 retained reference(s)") && strstr(g_gc_log, "(3 snapshot(s)"));
+    uint64_t age1 = gs.oldest_age_ms;
+    usleep(300000);
+    gc_reclaim_stats(&gs);
+    assert(gs.warnings == w0 + 1);                            /* not repeated within the minute */
+    assert(gs.oldest_age_ms >= age1 + 250 && gs.snapshots_waiting == 3);
+    assert(gc_has_unstarted() == false);                      /* one thread, running, waits */
+
+    release_zone_snapshot(held);
+    gc_snapshot_wait_idle();
+    gc_reclaim_stats(&gs);
+    assert(gs.snapshots_waiting == 0 && gs.oldest_age_ms == 0 && zdir_gc_queued() == 0);
+    zone_retire_process(true);
+    gc_reclaim_stats(&gs);
+    assert(gs.zone_retire_waiting == 0);
+    gc_set_warn_ms_for_test(60000);
+    fi_dir_check();
+    dbreg_reset();
+    atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
+    printf("  -> one reclaim thread: a held snapshot keeps the later ones (3 waiting), one warning, all freed after the release\n");
+}
+
+
 /* review low L4 dns_zone_image.c [3]: thaw_zone_arena() of an image with the zone's own ECS trusted-resolver list, with the Nth allocation failing, for
  * every N.  The thaw either fails or gives the zone its list: it must not succeed with the parsed list missing (the zone would fall back to the
  * server's trusted-resolver list). */
@@ -627,6 +705,7 @@ int main(void) {
     test_fi_directory_delta();
     test_fi_delta_hide();
     test_fi_gc_thread_start();
+    test_gc_reclaim_queue();
     test_fi_catalog_membership();
     tmpdir_remove(g_cdir);
     printf("[+] test_fi_snapshot passed successfully.\n");

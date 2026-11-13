@@ -5100,6 +5100,14 @@ void *control_thread_func(void *arg) {
                 st.dnstap_reconnects = dc.reconnects;
                 st.dnstap_link = dc.link;
               }
+              {
+                gc_reclaim_stats_t gs;
+                gc_reclaim_stats(&gs);   /* R1: the reclaim queue of this process (the Backend's) */
+                st.reclaim_snapshots_waiting = gs.snapshots_waiting;
+                st.reclaim_oldest_age_ms = gs.oldest_age_ms;
+                st.reclaim_zone_versions_waiting = gs.zone_retire_waiting;
+                st.reclaim_warnings = gs.warnings;
+              }
               snprintf(st.version, sizeof(st.version), "%s", KARIDNS_VERSION);
               snprintf(st.hostname, sizeof(st.hostname), "%s", g_host_status_info.un.nodename);
               snprintf(st.os_name, sizeof(st.os_name), "%s", g_host_status_info.un.sysname);
