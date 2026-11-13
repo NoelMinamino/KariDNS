@@ -7852,6 +7852,22 @@ int main(int argc, char **argv) {
     }
   }
   close(g_notify_ipc[0]); // Frontend側端点をクローズ
+  server_config_t *cfg = &g_config_db.config_a;
+  /* The ring of the threads that are not workers (AXFR, async I/O) has slots of 64 KB: about 270 MB of address space at the default queue size.
+   * dnstap is switched on at start-up only, so it is allocated only then; without it write_dnstap_event() finds no ring and returns.
+   * Set up before the first thread that can use it or read its counters starts (the async I/O threads below, then the control thread and the
+   * workers): events, size and mask are plain fields; head, tail and the counters are zero as the global is (no atomic_init() needed). */
+  if (cfg->dnstap.enabled && cfg->dnstap.socket_path) {
+    uint32_t dnstap_aux_buf_size = (cfg->dnstap.queue_size >= 64) ? cfg->dnstap.queue_size : 4096;
+    if ((dnstap_aux_buf_size & (dnstap_aux_buf_size - 1)) != 0) {
+      uint32_t p = 1;
+      while (p < dnstap_aux_buf_size) p <<= 1;
+      dnstap_aux_buf_size = p;
+    }
+    g_aux_dnstap_ring.size = dnstap_aux_buf_size;
+    g_aux_dnstap_ring.mask = dnstap_aux_buf_size - 1;
+    g_aux_dnstap_ring.events = calloc(dnstap_aux_buf_size, sizeof(dnstap_aux_event_t));
+  }
   // O-15: ここから先はスレッドが動いているので、致命的なエラーは backend_exit() (_exit) で終える
   if (!init_async_io_pool()) {
     fprintf(stderr, "[ERROR] [Backend] Failed to start the async I/O threads; aborting startup\n");
@@ -7864,7 +7880,6 @@ int main(int argc, char **argv) {
   }
   rrl_init();
 
-  server_config_t *cfg = &g_config_db.config_a;
   uint32_t qlog_buf_size = cfg->query_log_buffer_size;
   if (qlog_buf_size < 1024 || (qlog_buf_size & (qlog_buf_size - 1)) != 0) {
     qlog_buf_size = 32768;
@@ -7918,23 +7933,6 @@ int main(int argc, char **argv) {
     if (pthread_create(&threads[i], NULL, worker_thread_func, &ctxs[i]) != 0)
       backend_exit(EXIT_FAILURE);
   }
-
-  /* The ring of the threads that are not workers (AXFR, async I/O) has slots of 64 KB: about 270 MB of address space at the default queue size.
-   * dnstap is switched on at start-up only, so it is allocated only then; without it write_dnstap_event() finds no ring and returns. */
-  if (cfg->dnstap.enabled && cfg->dnstap.socket_path) {
-    uint32_t dnstap_aux_buf_size = (cfg->dnstap.queue_size >= 64) ? cfg->dnstap.queue_size : 4096;
-    if ((dnstap_aux_buf_size & (dnstap_aux_buf_size - 1)) != 0) {
-      uint32_t p = 1;
-      while (p < dnstap_aux_buf_size) p <<= 1;
-      dnstap_aux_buf_size = p;
-    }
-    g_aux_dnstap_ring.size = dnstap_aux_buf_size;
-    g_aux_dnstap_ring.mask = dnstap_aux_buf_size - 1;
-    g_aux_dnstap_ring.events = calloc(dnstap_aux_buf_size, sizeof(dnstap_aux_event_t));
-  }
-  atomic_init(&g_aux_dnstap_ring.head, 0);
-  atomic_init(&g_aux_dnstap_ring.tail, 0);
-  atomic_init(&g_aux_dnstap_ring.dropped, 0);
 
   while (atomic_load(&g_bound_workers) < num_workers)
     sched_yield();
