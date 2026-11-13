@@ -72,8 +72,9 @@ echo "-- the package"
 mkdir -p "$T/src/signer" "$T/src/node" "$T/src/packaging" "$T/src/docs" "$T/out"
 cp -R signer/bin signer/lib signer/package.json signer/package-lock.json "$T/src/signer/"
 cp -R node/lib node/package.json "$T/src/node/"
-cp -R packaging/freebsd packaging/version.sh "$T/src/packaging/" && cp VERSION "$T/src/"      # (version.sh: the number of the package, docs/RELEASING.md)
+cp -R packaging/freebsd packaging/version.sh packaging/install.sh "$T/src/packaging/" && cp VERSION Makefile "$T/src/"      # (version.sh: the number of the package, docs/RELEASING.md)
 cp docs/karidns-signer.md "$T/src/docs/"
+mkdir -p "$T/src/man" && cp man/karidns-signer.8 "$T/src/man/"      # (the package is staged with make install-signer install-man-signer install-docs-signer)
 cp karidns-signer.conf.sample "$T/src/"
 export npm_config_prefer_offline=true
 if (cd "$T/src" && sh packaging/freebsd/build_signer_pkg.sh 9.9.9 "$T/out") > "$T/build.out" 2>&1; then ok "build_signer_pkg.sh builds the package"; else bad "build_signer_pkg.sh failed" "$(tail -15 "$T/build.out")"; done_; fi
@@ -85,14 +86,14 @@ grep -q '^Origin *: dns/karidns-signer$' "$T/info.out" && ok "origin dns/karidns
 pkg info -d -F "$PKG" 2> /dev/null | grep -q 'node24-' && ok "it depends on node24" || bad "no dependency on node24"
 pkg info -d -F "$PKG" 2> /dev/null | grep -q 'bind-tools-' && ok "...and on bind-tools (dnssec-keygen, dnssec-signzone)" || bad "no dependency on bind-tools"
 pkg info -l -F "$PKG" 2> /dev/null | tail -n +2 | sed 's/^[[:space:]]*//' > "$T/files.txt"
-for f in /usr/local/sbin/karidns-signer /usr/local/etc/rc.d/karidns_signer /usr/local/etc/karidns/karidns-signer.conf.sample /usr/local/share/doc/karidns/karidns-signer.md \
+for f in /usr/local/sbin/karidns-signer /usr/local/etc/rc.d/karidns_signer /usr/local/etc/karidns/karidns-signer.conf.sample /usr/local/share/man/man8/karidns-signer.8.gz /usr/local/share/doc/karidns/karidns-signer.md \
          /usr/local/libexec/karidns-signer/signer/bin/karidns-signer.js /usr/local/libexec/karidns-signer/signer/lib/cli.js /usr/local/libexec/karidns-signer/signer/package.json \
          /usr/local/libexec/karidns-signer/node/lib/run.js /usr/local/libexec/karidns-signer/node/package.json /usr/local/libexec/karidns-signer/node_modules/pg/package.json; do
     grep -qx "$f" "$T/files.txt" && ok "the package holds $f" || bad "the package does not hold $f"
 done
 grep -Eq '^/usr/local/libexec/karidns-signer/(signer|node)/test/' "$T/files.txt" && bad "the package holds the test files of the program" || ok "no test file of the program in the package"
 grep -q 'node_modules/\.bin' "$T/files.txt" && bad "the package holds node_modules/.bin" || ok "no node_modules/.bin (no link into the tree)"
-grep -v '^/usr/local/\(sbin/karidns-signer\|etc/rc.d/karidns_signer\|etc/karidns/karidns-signer.conf.sample\|share/doc/karidns/karidns-signer.md\|libexec/karidns-signer/\)' "$T/files.txt" > "$T/other.txt"
+grep -v '^/usr/local/\(sbin/karidns-signer\|etc/rc.d/karidns_signer\|etc/karidns/karidns-signer.conf.sample\|share/man/man8/karidns-signer.8.gz\|share/doc/karidns/karidns-signer.md\|libexec/karidns-signer/\)' "$T/files.txt" > "$T/other.txt"
 [ ! -s "$T/other.txt" ] && ok "nothing outside the paths of the package" || bad "files outside the paths of the package" "$(head -5 "$T/other.txt")"
 # the scripts and the user
 mkdir "$T/root" && tar -xf "$PKG" -C "$T/root" 2> /dev/null

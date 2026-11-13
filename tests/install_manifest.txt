@@ -1,0 +1,73 @@
+# install_manifest.txt - what `make install` and its component targets put where (the Makefile, "Installation"), checked by
+# tests/run_install_test.sh against a staged tree.  One line per file: COMPONENT MODE PATH [SOURCE].
+#   COMPONENT  the target that installs it: server, dag, db, sqlite3, postgresql (the SQL files of a driver, part of install-db), signer,
+#              webadmin, man-X, docs-X (X = server, dag, db, signer, webadmin)
+#   MODE       the mode with the default BINMODE (0555); "tree" is every file under the directory SOURCE of the repository, mode 0444
+#   PATH       ${PREFIX}, ${SYSCONFDIR} and ${LIBEXECDIR} are the directories of ./configure; a man page is PATH or PATH.gz (MANCOMPRESS)
+#   SOURCE     the file of the tree it is a copy of (default: the name of PATH at the top of the tree; man/NAME for a page)
+server 0555 ${PREFIX}/sbin/karidns
+server 0555 ${PREFIX}/bin/karictl
+server 0555 ${PREFIX}/bin/karicheck
+server 0555 ${PREFIX}/bin/karidns-tapstat
+server 0555 ${PREFIX}/etc/rc.d/karidns packaging/freebsd/rc.d/karidns
+server 0644 ${SYSCONFDIR}/karidns/karidns.conf.sample
+server 0644 ${SYSCONFDIR}/karidns/karictl.conf.sample
+server 0644 ${SYSCONFDIR}/karidns/zones/example.test.zone.sample packaging/freebsd/zones/example.test.zone.sample
+dag 0555 ${PREFIX}/bin/dag
+db 0555 ${LIBEXECDIR}/karidns-dbloader
+db 0555 ${PREFIX}/bin/karidns-zone
+sqlite3 0444 ${PREFIX}/share/karidns/db/karidns_ext.sqlite3.sql db/karidns_ext.sqlite3.sql
+sqlite3 0444 ${PREFIX}/share/karidns/db/karidns_ext_v1_to_v2.sqlite3.sql db/karidns_ext_v1_to_v2.sqlite3.sql
+sqlite3 0444 ${PREFIX}/share/karidns/db/karidns_audit.sqlite3.sql db/karidns_audit.sqlite3.sql
+sqlite3 0444 ${PREFIX}/share/karidns/db/karidns_auth.sqlite3.sql db/karidns_auth.sqlite3.sql
+postgresql 0444 ${PREFIX}/share/karidns/db/karidns_ext.pgsql.sql db/karidns_ext.pgsql.sql
+postgresql 0444 ${PREFIX}/share/karidns/db/karidns_ext_v1_to_v2.pgsql.sql db/karidns_ext_v1_to_v2.pgsql.sql
+postgresql 0444 ${PREFIX}/share/karidns/db/karidns_loader_role.pgsql.sql db/karidns_loader_role.pgsql.sql
+postgresql 0444 ${PREFIX}/share/karidns/db/karidns_writer_role.pgsql.sql db/karidns_writer_role.pgsql.sql
+postgresql 0444 ${PREFIX}/share/karidns/db/karidns_api_role.pgsql.sql db/karidns_api_role.pgsql.sql
+postgresql 0444 ${PREFIX}/share/karidns/db/karidns_check_role.pgsql.sql db/karidns_check_role.pgsql.sql
+postgresql 0444 ${PREFIX}/share/karidns/db/karidns_signer_role.pgsql.sql db/karidns_signer_role.pgsql.sql
+signer 0555 ${PREFIX}/sbin/karidns-signer packaging/freebsd/karidns-signer
+signer 0555 ${PREFIX}/etc/rc.d/karidns_signer packaging/freebsd/rc.d/karidns_signer
+signer 0644 ${SYSCONFDIR}/karidns/karidns-signer.conf.sample
+signer 0555 ${LIBEXECDIR}/karidns-signer/signer/bin/karidns-signer.js signer/bin/karidns-signer.js
+signer tree ${LIBEXECDIR}/karidns-signer/signer/lib signer/lib
+signer 0444 ${LIBEXECDIR}/karidns-signer/signer/package.json signer/package.json
+signer 0444 ${LIBEXECDIR}/karidns-signer/signer/package-lock.json signer/package-lock.json
+signer tree ${LIBEXECDIR}/karidns-signer/node/lib node/lib
+signer 0444 ${LIBEXECDIR}/karidns-signer/node/package.json node/package.json
+signer tree ${LIBEXECDIR}/karidns-signer/node_modules signer/node_modules
+webadmin 0555 ${PREFIX}/sbin/karidns-webadmin packaging/freebsd/karidns-webadmin
+webadmin 0555 ${PREFIX}/etc/rc.d/karidns_webadmin packaging/freebsd/rc.d/karidns_webadmin
+webadmin 0644 ${SYSCONFDIR}/karidns/karidns-webadmin.conf.sample
+webadmin 0555 ${LIBEXECDIR}/karidns-webadmin/webadmin/bin/karidns-webadmin.js webadmin/bin/karidns-webadmin.js
+webadmin tree ${LIBEXECDIR}/karidns-webadmin/webadmin/lib webadmin/lib
+webadmin tree ${LIBEXECDIR}/karidns-webadmin/webadmin/ui webadmin/ui
+webadmin 0444 ${LIBEXECDIR}/karidns-webadmin/webadmin/package.json webadmin/package.json
+webadmin 0444 ${LIBEXECDIR}/karidns-webadmin/webadmin/package-lock.json webadmin/package-lock.json
+webadmin tree ${LIBEXECDIR}/karidns-webadmin/node/lib node/lib
+webadmin 0444 ${LIBEXECDIR}/karidns-webadmin/node/package.json node/package.json
+webadmin tree ${LIBEXECDIR}/karidns-webadmin/node_modules webadmin/node_modules
+man-server 0444 ${PREFIX}/share/man/man8/karidns.8
+man-server 0444 ${PREFIX}/share/man/man5/karidns.conf.5
+man-server 0444 ${PREFIX}/share/man/man8/karictl.8
+man-server 0444 ${PREFIX}/share/man/man8/karicheck.8
+man-server 0444 ${PREFIX}/share/man/man1/karidns-tapstat.1
+man-dag 0444 ${PREFIX}/share/man/man1/dag.1
+man-db 0444 ${PREFIX}/share/man/man8/karidns-dbloader.8
+man-db 0444 ${PREFIX}/share/man/man8/karidns-zone.8
+man-signer 0444 ${PREFIX}/share/man/man8/karidns-signer.8
+man-webadmin 0444 ${PREFIX}/share/man/man8/karidns-webadmin.8
+docs-server 0444 ${PREFIX}/share/doc/karidns/karidns.md docs/karidns.md
+docs-server 0444 ${PREFIX}/share/doc/karidns/karictl.md docs/karictl.md
+docs-server 0444 ${PREFIX}/share/doc/karidns/karicheck.md docs/karicheck.md
+docs-server 0444 ${PREFIX}/share/doc/karidns/karidns-tapstat.md docs/karidns-tapstat.md
+docs-dag 0444 ${PREFIX}/share/doc/karidns/dag.md docs/dag.md
+docs-dag 0444 ${PREFIX}/share/doc/karidns/dag_replay.md docs/dag_replay.md
+docs-db 0444 ${PREFIX}/share/doc/karidns/karidns-dbloader.md docs/karidns-dbloader.md
+docs-db 0444 ${PREFIX}/share/doc/karidns/karidns-zone.md docs/karidns-zone.md
+docs-signer 0444 ${PREFIX}/share/doc/karidns/karidns-signer.md docs/karidns-signer.md
+docs-webadmin 0444 ${PREFIX}/share/doc/karidns/karidns-webadmin.md docs/karidns-webadmin.md
+docs-webadmin 0444 ${PREFIX}/share/doc/karidns/karidns-api.md docs/karidns-api.md
+docs-webadmin 0444 ${PREFIX}/share/doc/karidns/karidns-webadmin-gui.md docs/karidns-webadmin-gui.md
+docs-webadmin 0444 ${PREFIX}/share/doc/karidns/karidns-webadmin-gui-checklist.md docs/karidns-webadmin-gui-checklist.md

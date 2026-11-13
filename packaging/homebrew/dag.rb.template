@@ -22,6 +22,7 @@ class Dag < Formula
     system "./configure", *args
     system "make", "dag"
     bin.install "dag"
+    man1.install "man/dag.1" if File.exist?("man/dag.1")      # generated from docs/dag.md (make man; 0.7 and later)
     doc.install "README.md", "docs/dag.md" if File.exist?("docs/dag.md")
   end
 

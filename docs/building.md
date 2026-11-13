@@ -27,7 +27,7 @@ It finds the compiler (`CC`, else `cc`, `gcc` or `clang`), proves with a small t
 
 | Option | Meaning |
 |---|---|
-| `--prefix=DIR` | Recorded as `PREFIX` in `config.mk` for the packaging scripts, and the base of the defaults of `--sysconfdir` and `--libexecdir`. It is compiled in as `-DKARIDNS_PREFIX` (only when it is not `/usr/local`) for one name: the FreeBSD ca_root_nss bundle `PREFIX/share/certs/ca-root-nss.crt` that `dag` looks for. The `Makefile` has no `install` target: the packages and Homebrew stage the files themselves. Default `/usr/local`. |
+| `--prefix=DIR` | Recorded as `PREFIX` in `config.mk` for the packaging scripts, and the base of the defaults of `--sysconfdir` and `--libexecdir`. It is compiled in as `-DKARIDNS_PREFIX` (only when it is not `/usr/local`) for one name: the FreeBSD ca_root_nss bundle `PREFIX/share/certs/ca-root-nss.crt` that `dag` looks for. `make install` puts the files under it (see INSTALLING). Default `/usr/local`. |
 | `--sysconfdir=DIR` | The directory the tools look in for their configuration when they are not told where: `DIR/karidns/karidns.conf` (`karicheck`, `karidns-zone`), `DIR/karidns/karictl.conf` (`karictl`), the example in the help of `karidns-dbloader`. It is compiled in as `-DKARIDNS_SYSCONFDIR="DIR"` (`dns_utils.h`). `dag` looks for its CA bundle (`+tls-ca` without a file) at `DIR/ssl/cert.pem`, as one of its fixed places (below). Default `PREFIX/etc`; the sources default to `/usr/local/etc`, and only another directory adds a flag, so the default build is the build without `configure`. The rc scripts, the packages and the manuals keep the FreeBSD layout (`/usr/local/etc`). Only letters, digits and `_ . / + @ -` are allowed. |
 | `--libexecdir=DIR` | Where `karidns` finds the database loader when `loader-path` is not set: `DIR/karidns-dbloader` (`KARIDNS_DB_DEFAULT_LOADER_PATH` in `dns_config_parser.h`; `karicheck conf` and the server both use it). Compiled in as `-DKARIDNS_LIBEXECDIR="DIR"`. Default `PREFIX/libexec`. The FreeBSD packages install the loader in `/usr/local/libexec` and the manuals say so; a package for another layout passes `--libexecdir`. |
 | `--with-db-drivers=LIST` | The drivers of `karidns-dbloader` and `karidns-zone`: `auto` (the default: the drivers whose library is found), `none`, `sqlite3`, `postgresql`, or both (`"sqlite3 postgresql"` or `sqlite3,postgresql`). A driver that is named and not found is an error. `make DB_DRIVERS=...` on the command line still wins over `config.mk`. |
@@ -61,6 +61,35 @@ A few things are not in `config.mk` on purpose:
 - **`HDRS`, `ALL_C`, the coverage tools**: file lists and developer targets.
 - **The release number**: `VERSION_FILE` in `config.mk` is the file `VERSION` at the time of `./configure`. `make set-version V=x.y.z` (`docs/RELEASING.md`) writes the new number there too; if `VERSION` is edited by other means, run `./configure` again.
 
+## INSTALLING
+
+`make install` puts the programs, the sample configuration, the manual pages and the manuals where the options of `./configure` say (0.7). The `Makefile` holds the one list of what goes where (the block "Installation"); the FreeBSD packages are made from it (`make install DESTDIR=<stage>`, then the package lists exactly the staged files), and `tests/run_install_test.sh` compares a staged tree with `tests/install_manifest.txt`. An install target never builds: build first, as the user that owns the tree, then install (as root for a real installation, or into `DESTDIR` as anybody).
+
+```sh
+./configure && make && make karidns-dbloader karidns-zone     # the last two only with database drivers
+make install                                                  # as root
+make install DESTDIR=/tmp/stage                               # staged: the files land under /tmp/stage/usr/local/...
+make uninstall                                                # removes exactly what make install put there
+```
+
+| Target | Installs | Where (defaults) |
+|---|---|---|
+| `install-server` | `karidns`; `karictl`, `karicheck`, `karidns-tapstat`; the rc script; `karidns.conf.sample`, `karictl.conf.sample`, `zones/example.test.zone.sample` | `SBINDIR` (`PREFIX/sbin`); `BINDIR` (`PREFIX/bin`); `RCDIR` (`PREFIX/etc/rc.d`); `SYSCONFDIR/karidns` |
+| `install-dag` | `dag` (what the dag packages of Linux, macOS and Homebrew ship) | `BINDIR` |
+| `install-db` | `karidns-dbloader`; `karidns-zone`; the SQL files of the drivers in `DB_DRIVERS` | `LIBEXECDIR`; `BINDIR`; `DATADIR/db` (`PREFIX/share/karidns/db`) |
+| `install-signer`, `install-webadmin` | the Node.js programs with `node_modules` (run `npm ci --omit=dev --ignore-scripts` in `signer/` or `webadmin/` first), the wrapper, the rc script, the sample configuration | `LIBEXECDIR/karidns-signer/`, `LIBEXECDIR/karidns-webadmin/`; `SBINDIR`; `RCDIR`; `SYSCONFDIR/karidns` |
+| `install-man-X` | the manual pages of X (`server`: karidns(8), karidns.conf(5), karictl(8), karicheck(8), karidns-tapstat(1); `dag`: dag(1); `db`: karidns-dbloader(8), karidns-zone(8); `signer`, `webadmin`) | `MANDIR/manN` (`PREFIX/share/man`) |
+| `install-docs-X` | the Markdown manuals of X | `DOCDIR` (`PREFIX/share/doc/karidns`) |
+| `install` | `install-server`, `install-dag`, `install-man` and `install-docs` of both, and `install-db` with its pages and manuals when `DB_DRIVERS` is not empty | |
+
+Every target has an `uninstall-...` twin; `make uninstall` is the twin of `make install`. Uninstalling removes the files the install target puts there, then the directories of KariDNS that are left empty (a path with a component that starts with `karidns`: `etc/karidns/zones`, `share/doc/karidns`, `libexec/karidns-signer`, ...); `bin`, `share/man/man8` and the like are never removed, and neither is a file it did not install (a `karidns.conf` you made stays, and so does its directory).
+
+- **Directories.** `PREFIX`, `SYSCONFDIR` and `LIBEXECDIR` come from `config.mk` (the defaults of `./configure` without it); `BINDIR`, `SBINDIR`, `DATADIR`, `DOCDIR`, `MANDIR` and `RCDIR` follow `PREFIX` and can be set on the command line like any of them (`make install MANDIR=/usr/share/man`). `DESTDIR` is put before every path. The rc scripts and the wrappers of the signer and the WebAdmin name `/usr/local` paths inside: they are for the FreeBSD layout, whatever `PREFIX` is.
+- **Modes and owners.** Programs and scripts `BINMODE` (`0555`; the Debian package uses `0755`), samples `0644`, manual pages, manuals, SQL files and the files of the Node.js programs `0444` (directories `0755`). As root the files belong to root (uid and gid 0); as anybody else to that user: a package is built unprivileged and its list names root:wheel itself.
+- **Configuration.** Only the samples are installed (`*.sample`); an existing configuration is never overwritten. Copy the sample and edit it (docs/distribution.md).
+- **Manual pages.** `MANCOMPRESS=yes` installs `NAME.gz` (`gzip -9n`), `no` the page as it is; the default `auto` compresses on FreeBSD, as the ports do. The pages are generated from the Markdown manuals and committed under `man/` (`make man`, docs/RELEASING.md), so installing needs no tool beyond `gzip`.
+- **BSD make and GNU make.** The install targets work with both (`tests/run_install_test.sh` runs each make it finds).
+
 ## EXAMPLES
 
 ```sh
@@ -75,7 +104,7 @@ A package build (for example `packaging/freebsd/build_pkg.sh`) runs `./configure
 
 ## SEE ALSO
 
-[RELEASING.md](RELEASING.md), [distribution.md](distribution.md), `tests/run_configure_test.sh`, the top of the `Makefile`.
+[RELEASING.md](RELEASING.md), [distribution.md](distribution.md), `tests/run_configure_test.sh`, `tests/run_install_test.sh`, the top of the `Makefile` and its block "Installation", `packaging/install.sh`.
 
 ---
 

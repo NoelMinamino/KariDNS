@@ -9,6 +9,7 @@
 # karidns_enable="YES"
 # karidns_flags=""
 # karidns_config="/usr/local/etc/karidns/karidns.conf"
+# karidns_log_owner=""     the owner of /var/log/named (default: the `user` of the configuration file; see karidns_run_user below)
 #
 
 . /etc/rc.subr
@@ -24,6 +25,7 @@ load_rc_config "${name}"
 : ${karidns_enable:="NO"}
 : ${karidns_config:="/usr/local/etc/karidns/karidns.conf"}
 : ${karidns_flags:="${karidns_config}"}
+: ${karidns_log_owner:=""}
 
 required_files="${karidns_config}"
 extra_commands="reload checkconf"
@@ -31,18 +33,39 @@ reload_cmd="karidns_reload"
 checkconf_cmd="karidns_checkconf"
 start_precmd="karidns_prestart"
 
+# karidns_run_user: the user the server runs as, which owns /var/log/named (docs/distribution.md "The user karidns").  The server takes it
+# from options { user "..."; } of its configuration; so does this: karidns_log_owner when rc.conf sets it, else that `user` statement when
+# the user exists, else bind, named or karidns, the first that exists (bind and named as before 0.7).  The package creates karidns and its
+# sample configuration names it; a configuration of an earlier version that names bind or named keeps that user and its directories.
+karidns_run_user()
+{
+    if [ -n "${karidns_log_owner}" ]; then
+        echo "${karidns_log_owner}"
+        return 0
+    fi
+    _u=$(sed -e 's,//.*,,' -e 's,#.*,,' "${karidns_config}" 2>/dev/null | awk '$1 == "user" { v = $2; gsub(/[";]/, "", v); if (v != "") { print v; exit } }')
+    if [ -n "${_u}" ] && id -u "${_u}" >/dev/null 2>&1; then
+        echo "${_u}"
+        return 0
+    fi
+    for _u in bind named karidns; do
+        if id -u "${_u}" >/dev/null 2>&1; then
+            echo "${_u}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 karidns_prestart()
 {
     # Validate config with karicheck before starting
     if [ -x /usr/local/bin/karicheck ]; then
         /usr/local/bin/karicheck conf "${karidns_config}" || return 1
     fi
-    # Determine runtime user/group for directory ownership (bind or named)
-    _owner="bind"
-    if ! id -u "${_owner}" >/dev/null 2>&1; then
-        _owner="named"
-    fi
-    _group="${_owner}"
+    # the owner of the log directory: the user the server runs as
+    _owner=$(karidns_run_user) || { echo "${name}: none of the users of the configuration, bind, named or karidns exists" >&2; return 1; }
+    _group=$(id -gn "${_owner}")
 
     # Ensure run / log directory exists
     # /var/run/karidns must be root:wheel (0755) to satisfy ensure_priv_dir_safe()

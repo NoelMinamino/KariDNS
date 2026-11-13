@@ -24,9 +24,9 @@ options {
     // 起動後にドロップする特権ユーザーとグループ
     // root起動時は必須。一般ユーザーで直接起動する場合は省略するか、
     // 起動ユーザー自身を指定する (他ユーザーを指定すると起動エラー)
-    // (FreeBSD の BIND 用の標準のユーザーとグループは "bind"。ここは実際に存在するものに合わせる)
-    user "named";
-    group "named";
+    // (FreeBSD のパッケージはユーザーとグループ "karidns" を作る。以前の版の設定にある "bind" や "named" もそのまま使える)
+    user "karidns";
+    group "karidns";
 
     // 作業ディレクトリ (BIND の directory)。設定すると、相対パスの zone の file、
     // pid-file、ログの file、include、ゾーンファイルの $INCLUDE はすべてここからの

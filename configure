@@ -20,13 +20,15 @@ Finds the compiler and the libraries and writes config.mk (read by make) and con
 before on FreeBSD, Linux (BSD make or GNU make 4) and in MSYS2; on macOS (GNU make 3.81) it needs config.mk.
 
 Options:
-  --prefix=DIR            the installation prefix, recorded as PREFIX in config.mk for the packaging scripts; the Makefile has no
-                          install target (default: /usr/local)
+  --prefix=DIR            the installation prefix, recorded as PREFIX in config.mk: make install puts the programs in DIR/bin and
+                          DIR/sbin, the manual pages in DIR/share/man, the manuals in DIR/share/doc/karidns, the SQL files in
+                          DIR/share/karidns/db and the rc scripts in DIR/etc/rc.d (default: /usr/local)
   --sysconfdir=DIR        the directory the tools look in for their configuration (DIR/karidns/karidns.conf, DIR/karidns/karictl.conf):
                           compiled into karictl, karicheck and karidns-zone as -DKARIDNS_SYSCONFDIR; dag also looks for its CA
-                          bundle at DIR/ssl/cert.pem (default: PREFIX/etc)
+                          bundle at DIR/ssl/cert.pem; make install puts the sample configuration in DIR/karidns (default: PREFIX/etc)
   --libexecdir=DIR        where karidns finds karidns-dbloader when `loader-path` is not set: DIR/karidns-dbloader, compiled in as
-                          -DKARIDNS_LIBEXECDIR (default: PREFIX/libexec).  A prefix other than /usr/local is compiled in as
+                          -DKARIDNS_LIBEXECDIR, and where make install puts it and the programs of karidns-signer and
+                          karidns-webadmin (default: PREFIX/libexec).  A prefix other than /usr/local is compiled in as
                           -DKARIDNS_PREFIX for the second CA bundle of dag, PREFIX/share/certs/ca-root-nss.crt
   --with-db-drivers=LIST  the drivers of karidns-dbloader and karidns-zone: auto, none, or sqlite3, postgresql or both, separated by a
                           space or a comma (default: auto, the drivers whose library is found).  A driver that is named and not
@@ -42,7 +44,8 @@ Options:
 Environment or arguments: CC (default: cc, gcc or clang, the first that exists), CFLAGS, LDFLAGS.
 
 OpenSSL and zlib are needed by every build and are an error when missing.  After a new run of ./configure, run `make clean`: the objects
-of the earlier build do not know the new options.
+of the earlier build do not know the new options.  Then make, and make install (DESTDIR=DIR stages into DIR; make uninstall removes it
+again; docs/building.md "INSTALLING" lists the targets of each part).
 
 Examples:
   ./configure

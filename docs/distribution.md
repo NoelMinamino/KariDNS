@@ -10,12 +10,12 @@ In the commands below, replace `?.?.?` with the release version (for example `0.
 
 | OS / Platform | Artifact | Included Binaries / Assets | Installation Method |
 |---|---|---|---|
-| **FreeBSD** 14.x / 15.x (amd64) | `karidns-?.?.?-FreeBSD-14-amd64.pkg`, `karidns-?.?.?-FreeBSD-15-amd64.pkg`; with a database loader: `karidns-sqlite3-?.?.?-FreeBSD-14-amd64.pkg`, `karidns-postgresql-...`, `karidns-db-...`, each for FreeBSD 14 and 15 (see [§2.5](#25-packages-with-the-database-loader)); the daemons on top of a database package: `karidns-signer-...` ([§2.6](#26-the-signer-package)) and `karidns-webadmin-...` ([§2.7](#27-the-webadmin-package)) | `karidns`, `karictl`, `karicheck`, `dag`, sample configs, rc.d script, manuals (database packages: `karidns-dbloader` and the SQL files) | `pkg add` |
-| **Linux (RPM)** RHEL 9 / Rocky / AlmaLinux / Fedora (x86_64) | `dag-?.?.?-1.el9.x86_64.rpm` | `dag` | `dnf install` / `rpm -ivh` |
-| **Linux (DEB)** Ubuntu / Debian (amd64) | `dag_?.?.?_amd64.deb` | `dag` | `dpkg -i` |
-| **Linux (Generic)** x86_64 | `dag-?.?.?-linux-x86_64.tar.gz` | `dag` (standalone binary) | Extract & copy to `/usr/local/bin` |
-| **macOS** Apple Silicon (arm64) | `dag-?.?.?-macos-arm64.dmg`, `dag-?.?.?-macos-arm64.tar.gz` | `dag` (arm64 binary) | Mount DMG / extract tarball |
-| **Homebrew** (macOS, Linux) | Formula `dag.rb` in `NoelMinamino/homebrew-tap` | `dag` (built from the source tarball) | `brew install NoelMinamino/tap/dag` |
+| **FreeBSD** 14.x / 15.x (amd64) | `karidns-?.?.?-FreeBSD-14-amd64.pkg`, `karidns-?.?.?-FreeBSD-15-amd64.pkg`; with a database loader: `karidns-sqlite3-?.?.?-FreeBSD-14-amd64.pkg`, `karidns-postgresql-...`, `karidns-db-...`, each for FreeBSD 14 and 15 (see [§2.5](#25-packages-with-the-database-loader)); the daemons on top of a database package: `karidns-signer-...` ([§2.6](#26-the-signer-package)) and `karidns-webadmin-...` ([§2.7](#27-the-webadmin-package)) | `karidns`, `karictl`, `karicheck`, `karidns-tapstat`, `dag`, sample configs, rc.d script, manual pages and manuals (database packages: `karidns-dbloader`, `karidns-zone` and the SQL files) | `pkg add` |
+| **Linux (RPM)** RHEL 9 / Rocky / AlmaLinux / Fedora (x86_64) | `dag-?.?.?-1.el9.x86_64.rpm` | `dag`, `dag(1)` | `dnf install` / `rpm -ivh` |
+| **Linux (DEB)** Ubuntu / Debian (amd64) | `dag_?.?.?_amd64.deb` | `dag`, `dag(1)` | `dpkg -i` |
+| **Linux (Generic)** x86_64 | `dag-?.?.?-linux-x86_64.tar.gz` | `dag` (standalone binary), `dag.1` | Extract & copy to `/usr/local/bin` |
+| **macOS** Apple Silicon (arm64) | `dag-?.?.?-macos-arm64.dmg`, `dag-?.?.?-macos-arm64.tar.gz` | `dag` (arm64 binary), `dag.1` | Mount DMG / extract tarball |
+| **Homebrew** (macOS, Linux) | Formula `dag.rb` in `NoelMinamino/homebrew-tap` | `dag` (built from the source tarball), `dag(1)` | `brew install NoelMinamino/tap/dag` |
 | **Windows** x86_64 | `dag-?.?.?-windows-x86_64.zip` | `dag.exe` and the MinGW runtime DLLs it needs | Extract & copy to a directory in `%PATH%` |
 
 Each release also contains `SHA256SUMS.txt` (see [§7](#7-verifying-downloads)).
@@ -46,6 +46,8 @@ pkg add https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/karidns
 Use `pkg add -f` to replace an already installed version in place.
 
 ### 2.2 Installed Components
+The packages are staged with `make install` (docs/building.md "INSTALLING") and hold exactly what it puts there, owned by root:wheel. Programs and scripts are mode 0555, the samples 0644, the manual pages, manuals and SQL files 0444.
+
 - **Binaries:**
   - `/usr/local/sbin/karidns` (Authoritative DNS daemon)
   - `/usr/local/bin/karictl` (Control channel client)
@@ -58,12 +60,16 @@ Use `pkg add -f` to replace an already installed version in place.
   - `/usr/local/etc/karidns/zones/example.test.zone.sample`
 - **Service Management:**
   - `/usr/local/etc/rc.d/karidns`
+- **Manual pages** (`man karidns`, generated from the Markdown manuals):
+  - `/usr/local/share/man/man8/karidns.8.gz`, `man5/karidns.conf.5.gz` (the configuration file), `man8/karictl.8.gz`, `man8/karicheck.8.gz`, `man1/karidns-tapstat.1.gz`, `man1/dag.1.gz`
 - **Manuals:**
   - `/usr/local/share/doc/karidns/` (`karidns.md`, `karictl.md`, `karicheck.md`, `karidns-tapstat.md`, `dag.md`, `dag_replay.md`)
+- **Created by the package** (not in its file list): the user and group `karidns` and the directories `/var/run/karidns` and `/var/log/named` (§2.4).
 - **Database packages only** (§2.5):
   - `/usr/local/libexec/karidns-dbloader` (the database loader, root:wheel, 0555)
   - `/usr/local/bin/karidns-zone` (the zone importer and exporter, with the same drivers, root:wheel, 0555)
   - `/usr/local/share/karidns/db/*.sql` (extension tables, change-log triggers, role script of the packaged drivers)
+  - `/usr/local/share/man/man8/karidns-dbloader.8.gz`, `/usr/local/share/man/man8/karidns-zone.8.gz`
   - `/usr/local/share/doc/karidns/karidns-dbloader.md`
   - `/usr/local/share/doc/karidns/karidns-zone.md`
 
@@ -86,12 +92,23 @@ The rc.d script supports these `rc.conf` variables:
 | `karidns_enable` | `NO` | Start `karidns` at boot. |
 | `karidns_config` | `/usr/local/etc/karidns/karidns.conf` | Configuration file. |
 | `karidns_flags` | `${karidns_config}` | Arguments passed to `karidns`. |
+| `karidns_log_owner` | (the run user) | The owner of `/var/log/named`, when it is not the `user` of the configuration (§2.4). |
 
-Before starting, the script validates the configuration with `karicheck conf`, creates `/var/run/karidns` (root:wheel, 0755) and `/var/log/named` (owned by the `bind` user, or `named` if `bind` does not exist). `service karidns reload` runs `karictl reload` (or sends `SIGHUP` when `karictl` is not installed), and `service karidns checkconf` runs `karicheck conf`.
+Before starting, the script validates the configuration with `karicheck conf`, creates `/var/run/karidns` (root:wheel, 0755) and `/var/log/named` (owned by the user the server runs as, §2.4). `service karidns reload` runs `karictl reload` (or sends `SIGHUP` when `karictl` is not installed), and `service karidns checkconf` runs `karicheck conf`.
+
+### 2.4 The user karidns
+
+The server starts as root, binds its ports and opens its files, then drops to the user and group of `options { user "..."; group "..."; }` in its configuration (karidns(8)). Since 0.7 the server packages create that user:
+
+- **Pre-install** creates the group and the user `karidns` when they are missing (`pw groupadd karidns`, `pw useradd karidns -g karidns -h - -d /nonexistent -s /usr/sbin/nologin`: no password, no login shell, no home), as the signer and WebAdmin packages create theirs; `pw` chooses the uid and gid (no number is registered with the ports). **Post-install** creates `/var/run/karidns` (root:wheel, 0755) and, when it is missing, `/var/log/named` (karidns:karidns, 0755).
+- **The sample configuration** (`karidns.conf.sample`) names `user "karidns"; group "karidns";`, so a fresh installation from the sample runs as `karidns`.
+- **The rc script** gives `/var/log/named` at every start to the user the server will run as: `karidns_log_owner` when `rc.conf` sets it, else the `user` of the configuration when that user exists, else `bind`, `named` or `karidns`, the first that exists (`bind` and `named` were the only choices before 0.7). It refuses to start when none exists.
+- **Upgrades.** An installation of an earlier version keeps its `karidns.conf`, and with it the user it names (`bind`, the FreeBSD user of BIND, or `named`): the server goes on running as that user, and the rc script keeps `/var/log/named` that user's. The package creates the user `karidns` all the same, unused until the configuration names it. To move to `karidns`, change `user` and `group`, give the files and directories the server writes (the log files, a `directory` with writable data) to `karidns`, and restart.
+- **Removal.** `pkg delete` leaves the user and group `karidns`, `/var/run/karidns` and `/var/log/named` (a configuration and the logs may still use them; the signer and WebAdmin packages leave their users too) and says so; `pw userdel karidns` removes the user and its group.
 
 ### 2.5 Packages with the database loader
 
-Zones can be served from a PowerDNS 5.1 SQLite3 or PostgreSQL database ([`karidns-dbloader(8)`](karidns-dbloader.md)). The server never links a database library; only the loader `karidns-dbloader` does, so the loader and its dependencies decide which package you install. There are four FreeBSD packages, built from the same server and tools by `packaging/freebsd/build_pkg.sh --db none|sqlite3|postgresql|both`. They install the same files, so each one `conflicts` with the other three (install only one):
+Zones can be served from a PowerDNS 5.1 SQLite3 or PostgreSQL database ([`karidns-dbloader(8)`](karidns-dbloader.md)). The server never links a database library; only the loader `karidns-dbloader` does, so the loader and its dependencies decide which package you install. There are four FreeBSD packages, built from the same server and tools by `packaging/freebsd/build_pkg.sh --db none|sqlite3|postgresql|both`. They install the same files, so only one can be installed: `pkg add` refuses a second one because its files are already there (each package also lists the other three as `conflicts`, which `pkg add` of pkg 2.8 does not act on). The database packages `provide` `karidns-zone`, which the signer and WebAdmin packages `require`; every server package provides `karicheck`:
 
 | Package | `--db` | `karidns-dbloader` | Dependencies besides `libidn2` |
 |---|---|---|---|
@@ -112,11 +129,11 @@ pkg add ./dist/karidns-sqlite3-0.6.2-FreeBSD-15-amd64.pkg
 
 ### 2.6 The signer package
 
-[`karidns-signer`](karidns-signer.md) (the daemon that keeps database zones signed) is a package of its own, built by `packaging/freebsd/build_signer_pkg.sh [version] [output_dir]` (Node.js, no compiler; the build host needs `node24`, `npm-node24` and `bind-tools`; the script runs `npm ci --omit=dev --ignore-scripts` in `signer/`). It installs `/usr/local/libexec/karidns-signer/` (the program and its `node_modules`, root:wheel), `/usr/local/sbin/karidns-signer` (wrapper), `/usr/local/etc/rc.d/karidns_signer`, `/usr/local/etc/karidns/karidns-signer.conf.sample` and `/usr/local/share/doc/karidns/karidns-signer.md`, and creates the user and group `karidns-signer` (pre-install script). It depends on `node24` and `bind-tools`. It also needs `karidns-zone`, which `karidns-sqlite3`, `karidns-postgresql` and `karidns-db` install; those three conflict with each other, so the dependency cannot name one of them, and the pre-install script refuses the installation when `/usr/local/bin/karidns-zone` is missing. Install a database package first (`pkg add` of a downloaded file does not fetch dependencies: install `node24` and `bind-tools` first, as in §2.1), then the signer; `karidns-zone` must have the driver of the signer's database (`karidns-signer --check` says if not). The release workflow builds and installs it for each FreeBSD version.
+[`karidns-signer`](karidns-signer.md) (the daemon that keeps database zones signed) is a package of its own, built by `packaging/freebsd/build_signer_pkg.sh [version] [output_dir]` (Node.js, no compiler; the build host needs `node24`, `npm-node24` and `bind-tools`; the script runs `npm ci --omit=dev --ignore-scripts` in `signer/`). It installs `/usr/local/libexec/karidns-signer/` (the program and its `node_modules`, root:wheel), `/usr/local/sbin/karidns-signer` (wrapper), `/usr/local/etc/rc.d/karidns_signer`, `/usr/local/etc/karidns/karidns-signer.conf.sample`, `/usr/local/share/man/man8/karidns-signer.8.gz` and `/usr/local/share/doc/karidns/karidns-signer.md`, and creates the user and group `karidns-signer` (pre-install script). It depends on `node24` and `bind-tools`. It also needs `karidns-zone`, which `karidns-sqlite3`, `karidns-postgresql` and `karidns-db` install; those three conflict with each other, so a dependency cannot name one of them: the package `requires` `karidns-zone`, which the three `provide` (0.7), and `pkg add` refuses it while none of them is installed (`Missing provide karidns-zone`). A database package of 0.6 or earlier provides nothing: upgrade it before the signer. The pre-install script also refuses the installation when `/usr/local/bin/karidns-zone` is missing. Install a database package first (`pkg add` of a downloaded file does not fetch dependencies: install `node24` and `bind-tools` first, as in §2.1), then the signer; `karidns-zone` must have the driver of the signer's database (`karidns-signer --check` says if not). The release workflow builds and installs it for each FreeBSD version.
 
 ### 2.7 The WebAdmin package
 
-[`karidns-webadmin`](karidns-webadmin.md) (the HTTP API of a database: logins, users and grants, zones, change sets, versions and templates; [API reference](karidns-api.md)) is a package of its own, built by `packaging/freebsd/build_webadmin_pkg.sh [version] [output_dir]` (Node.js, no compiler; the build host needs `node24` and `npm-node24`; the script runs `npm ci --omit=dev --ignore-scripts` in `webadmin/`). It installs `/usr/local/libexec/karidns-webadmin/` (the program in `webadmin/`, the code it shares with the signer in `node/`, and the one dependency in `node_modules`; root:wheel, read-only), `/usr/local/sbin/karidns-webadmin` (wrapper), `/usr/local/etc/rc.d/karidns_webadmin`, `/usr/local/etc/karidns/karidns-webadmin.conf.sample`, `/usr/local/share/doc/karidns/karidns-webadmin.md` and `karidns-api.md`, and creates the user and group `karidns-webadmin` (pre-install script; no login shell, no password). It depends on `node24` only. It needs `karidns-zone` and `karicheck`, which `karidns-sqlite3`, `karidns-postgresql` and `karidns-db` install; those three conflict with each other, so the dependency cannot name one of them, and the pre-install script refuses the installation when either program is missing. Install a database package first, then `node24` (`pkg add` does not fetch dependencies), then the WebAdmin; `karidns-zone` must have the driver of the database (`karidns-webadmin --check` says if not). The SQL files of the roles and the schema are in `/usr/local/share/karidns/db/` (database packages). The release workflow builds and installs it for each FreeBSD version; `tests/run_webadmin_pkg_test.sh` builds it, unpacks it and runs the program and the rc script from the unpacked tree.
+[`karidns-webadmin`](karidns-webadmin.md) (the HTTP API of a database: logins, users and grants, zones, change sets, versions and templates; [API reference](karidns-api.md)) is a package of its own, built by `packaging/freebsd/build_webadmin_pkg.sh [version] [output_dir]` (Node.js, no compiler; the build host needs `node24` and `npm-node24`; the script runs `npm ci --omit=dev --ignore-scripts` in `webadmin/`). It installs `/usr/local/libexec/karidns-webadmin/` (the program in `webadmin/`, the code it shares with the signer in `node/`, and the one dependency in `node_modules`; root:wheel, read-only), `/usr/local/sbin/karidns-webadmin` (wrapper), `/usr/local/etc/rc.d/karidns_webadmin`, `/usr/local/etc/karidns/karidns-webadmin.conf.sample`, `/usr/local/share/man/man8/karidns-webadmin.8.gz`, `/usr/local/share/doc/karidns/karidns-webadmin.md`, `karidns-api.md`, `karidns-webadmin-gui.md` and `karidns-webadmin-gui-checklist.md`, and creates the user and group `karidns-webadmin` (pre-install script; no login shell, no password). It depends on `node24` only. It needs `karidns-zone` and `karicheck`, which `karidns-sqlite3`, `karidns-postgresql` and `karidns-db` install; those three conflict with each other, so a dependency cannot name one of them: the package `requires` both, which the database packages `provide` (0.7; upgrade a database package of 0.6 first), and the pre-install script refuses the installation when either program is missing. Install a database package first, then `node24` (`pkg add` does not fetch dependencies), then the WebAdmin; `karidns-zone` must have the driver of the database (`karidns-webadmin --check` says if not). The SQL files of the roles and the schema are in `/usr/local/share/karidns/db/` (database packages). The release workflow builds and installs it for each FreeBSD version; `tests/run_webadmin_pkg_test.sh` builds it, unpacks it and runs the program and the rc script from the unpacked tree.
 
 ---
 
@@ -139,7 +156,7 @@ sudo dpkg -i dag_?.?.?_amd64.deb
 ```
 
 ### 3.3 Tarball (Generic Linux)
-The tarball contains a `dag-?.?.?/` directory with `dag`, `LICENSE`, `README.md`, `dag.md` and `dag_replay.md`:
+The rpm and the deb install `dag` in `/usr/bin` and its manual page in `/usr/share/man/man1` (`man dag`). The tarball contains a `dag-?.?.?/` directory with `dag`, the manual page `dag.1`, `LICENSE`, `README.md`, `dag.md` and `dag_replay.md`:
 ```sh
 curl -LO https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag-?.?.?-linux-x86_64.tar.gz
 tar -xzf dag-?.?.?-linux-x86_64.tar.gz
@@ -159,14 +176,16 @@ sudo cp dag-?.?.?/dag /usr/local/bin/
 
 ### 4.2 Standalone DMG (.dmg)
 1. Download `dag-?.?.?-macos-arm64.dmg` from GitHub Releases.
-2. Double click to mount the DMG (volume name `DAG`). It contains `bin/dag`, `INSTALL.txt`, `LICENSE`, `README.md`, `dag.md` and `dag_replay.md`.
-3. Copy `bin/dag` to `/usr/local/bin`:
+2. Double click to mount the DMG (volume name `DAG`). It contains `bin/dag`, the manual page `dag.1`, `INSTALL.txt`, `LICENSE`, `README.md`, `dag.md` and `dag_replay.md`.
+3. Copy `bin/dag` to `/usr/local/bin` and the page to `/usr/local/share/man/man1`:
    ```sh
    sudo cp /Volumes/DAG/bin/dag /usr/local/bin/
+   sudo mkdir -p /usr/local/share/man/man1 && sudo cp /Volumes/DAG/dag.1 /usr/local/share/man/man1/
    ```
+   The tarball of §4.1 holds `dag.1` as well.
 
 ### 4.3 Homebrew Tap
-The release workflow publishes the formula to `NoelMinamino/homebrew-tap`. It builds `dag` from the release source tarball and depends on `openssl@3` and `zlib` (`libidn2` is optional, `--with-libidn2`):
+The release workflow publishes the formula to `NoelMinamino/homebrew-tap`. It builds `dag` from the release source tarball, installs its manual page (from 0.7), and depends on `openssl@3` and `zlib` (`libidn2` is optional, `--with-libidn2`):
 ```sh
 brew install NoelMinamino/tap/dag
 ```

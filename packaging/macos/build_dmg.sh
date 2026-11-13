@@ -34,6 +34,7 @@ cp LICENSE "${TAR_STAGE}/dag-${VERSION}/" 2>/dev/null || true
 cp README.md "${TAR_STAGE}/dag-${VERSION}/" 2>/dev/null || true
 cp docs/dag.md "${TAR_STAGE}/dag-${VERSION}/" 2>/dev/null || true
 cp docs/dag_replay.md "${TAR_STAGE}/dag-${VERSION}/" 2>/dev/null || true
+cp man/dag.1 "${TAR_STAGE}/dag-${VERSION}/"                    # the manual page (generated from docs/dag.md: make man)
 
 tar -czf "${OUT_DIR}/dag-${VERSION}-macos-${ARCH}.tar.gz" -C "${TAR_STAGE}" "dag-${VERSION}"
 rm -rf "${TAR_STAGE}"
@@ -47,6 +48,7 @@ cp LICENSE "${DMG_STAGE}/" 2>/dev/null || true
 cp README.md "${DMG_STAGE}/" 2>/dev/null || true
 cp docs/dag.md "${DMG_STAGE}/" 2>/dev/null || true
 cp docs/dag_replay.md "${DMG_STAGE}/" 2>/dev/null || true
+cp man/dag.1 "${DMG_STAGE}/"
 
 cat << 'EOF' > "${DMG_STAGE}/INSTALL.txt"
 DAG (DNS Anomaly Generator) - Installation Guide
@@ -57,6 +59,9 @@ To install the `dag` command into your system:
      sudo cp /Volumes/DAG/bin/dag /usr/local/bin/
   3. Ensure it is executable:
      sudo chmod +x /usr/local/bin/dag
+  4. The manual page (man dag):
+     sudo mkdir -p /usr/local/share/man/man1
+     sudo cp /Volumes/DAG/dag.1 /usr/local/share/man/man1/
 
 To verify:
   dag www.google.com A @8.8.8.8

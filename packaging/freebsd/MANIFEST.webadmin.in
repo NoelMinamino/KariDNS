@@ -20,6 +20,7 @@ categories: [
     "net",
     "sysutils"
 ]
+requires: [ "karidns-zone", "karicheck" ]
 scripts: {
     pre-install: <<EOD
 if [ ! -x /usr/local/bin/karidns-zone ] || [ ! -x /usr/local/bin/karicheck ]; then
