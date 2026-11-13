@@ -4,10 +4,11 @@
 # The lock is <db>.signer.lock, a SQLite file held in SQLite's exclusive locking mode; what holds it is the kernel (fcntl(2) byte-range locks), not a pid.
 #   L1  the holder's lock is a POSIX lock in the kernel (F_GETLK from another process names the holder's pid on SQLite's lock bytes), a second process is
 #       refused with the holder's pid in the message, and after kill -9 of the holder the kernel shows no lock and the next process takes it;
-#   L2  50 rounds of 4 processes started at the same instant: in every round exactly one takes the lock, and the times that winners hold it never overlap;
+#   L2  50 rounds of 4 processes started at the same instant: in every round exactly one takes the lock (it holds it 2 s, longer than the 1 s a loser
+#       waits), and the times that winners hold it never overlap;
 #   L3  a 0.6.x lock file (a pid as text) naming a live process that is not a signer (pid 1) does not block the start: it becomes the lock file;
 #   L4  a read-only directory: the lock file cannot be made, and the message says so (as root this part runs as the user nobody, or is SKIPped).
-# Runs as any user.  SKIP (exit 0) without node 22.13 or newer, or perl's Fcntl F_GETLK.  About a minute and a half.
+# Runs as any user.  SKIP (exit 0) without node 22.13 or newer, or perl's Fcntl F_GETLK.  About three minutes.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
@@ -101,7 +102,7 @@ while [ $r -le $ROUNDS ]; do
     T0=$(( $("$NODE" -e 'console.log(Date.now())') + 700 ))
     RP=""
     for k in 1 2 3 4; do
-        "$NODE" "$T/lock.mjs" "$F" race "$T0" 300 > "$T/r$k.out" 2>/dev/null &
+        "$NODE" "$T/lock.mjs" "$F" race "$T0" 2000 > "$T/r$k.out" 2>/dev/null &
         RP="$RP $!"
     done
     for p in $RP; do wait "$p"; done

@@ -93,6 +93,10 @@ test('the lock file cannot be made: the message says what is needed', () => {
       try {
         assert.throws(() => acquireFileLock(path.join(ro, 'x.lock'), { sqlite }), /cannot take the lock file .*write access to the directory/);
       } finally { fs.chmodSync(ro, 0o700); }
+      const rof = path.join(dir, 'theirs.lock');                                // a lock file left by a run as another user: not writable
+      acquireFileLock(rof, { sqlite })();
+      fs.chmodSync(rof, 0o444);
+      assert.throws(() => acquireFileLock(rof, { sqlite }), /cannot take the lock file .*theirs\.lock: .*chown it to the signer's user or remove it while no signer runs/);
     }
     const bad = { DatabaseSync: class { constructor() { throw Object.assign(new Error('disk I/O error'), { errcode: 10 }); } } };
     assert.throws(() => acquireFileLock(path.join(dir, 'y.lock'), { sqlite: bad }), /cannot take the lock file .*y\.lock: disk I\/O error$/);

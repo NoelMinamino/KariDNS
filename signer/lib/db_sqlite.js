@@ -20,6 +20,7 @@ const SQLITE_NOTADB = 26;
 const SQLITE_READONLY = 8;
 const SQLITE_CANTOPEN = 14;
 const sqliteCode = (e) => (Number.isInteger(e?.errcode) ? e.errcode & 0xff : -1);
+const LOCK_WAIT_MS = 1000;
 
 // The pid that the holder wrote into the lock file (PRAGMA user_version: the 4 octets at offset 60 of the header, big-endian), or 0.  Read with plain
 // file I/O by a process that does NOT hold the lock: closing a descriptor of the file drops every POSIX lock the process has on it.
@@ -33,7 +34,7 @@ export function lockHolderPid(path) {
 }
 
 // One signer per database file (K-2, 0.7).  The lock is held by the kernel: <db>.signer.lock is a second SQLite file, opened with
-// locking_mode=EXCLUSIVE, and written once in an exclusive transaction; in that mode SQLite keeps its EXCLUSIVE lock (fcntl(2) byte-range locks on
+// locking_mode=EXCLUSIVE set inside the exclusive transaction that writes it once; in that mode SQLite keeps its EXCLUSIVE lock (fcntl(2) byte-range locks on
 // FreeBSD) after the commit until the connection is closed, and the kernel drops it when the process ends, however it ends (SIGKILL, a crash, a
 // reboot).  No pid is trusted: the pid inside (user_version) is only for the message of the one that loses.  The file is never removed (removing a
 // file that another process has open and is about to lock would let two processes lock two files).  A 0.6.x lock file (a pid as text) is not a
@@ -44,9 +45,15 @@ export function acquireFileLock(path, { sqlite, pid = process.pid }) {
     let db;
     try {
       db = new sqlite.DatabaseSync(path);
-      db.exec('PRAGMA locking_mode = EXCLUSIVE');
+      // The exclusive lock is taken in SQLite's NORMAL locking mode, and the mode is made EXCLUSIVE only inside the transaction that holds it.  In
+      // EXCLUSIVE mode from the start, every starter that reads the file keeps the SHARED lock it took on the way (that mode never lets a lock go),
+      // so starters that race all wait for one another and none wins (seen on FreeBSD with 4 processes started at once).  In NORMAL mode a starter
+      // that does not get the lock lets go of what it took; the busy timeout lets the others' attempts end before one gives up.  Once committed in
+      // EXCLUSIVE mode the lock is kept until the connection closes.  A starter that finds the lock held is refused after LOCK_WAIT_MS.
+      db.exec(`PRAGMA busy_timeout = ${LOCK_WAIT_MS}`);
       db.exec('PRAGMA journal_mode = MEMORY');          // no -journal file next to the lock file
       db.exec('BEGIN EXCLUSIVE');
+      db.exec('PRAGMA locking_mode = EXCLUSIVE');
       db.exec(`PRAGMA user_version = ${pid | 0}`);
       db.exec('COMMIT');
       return () => { try { db.close(); } catch { /* closed */ } };
@@ -61,7 +68,10 @@ export function acquireFileLock(path, { sqlite, pid = process.pid }) {
         try { fs.truncateSync(path, 0); } catch (te) { throw new Error(`cannot take the lock file ${path}: ${te.message}`); }
         continue;
       }
-      const hint = code === SQLITE_CANTOPEN || code === SQLITE_READONLY ? ' (the signer creates and writes this file: it needs write access to the directory of the database)' : '';
+      // the file stays after a run (see above): one made by another user (a run as root) cannot be written by the service user
+      const hint = code !== SQLITE_CANTOPEN && code !== SQLITE_READONLY ? ''
+        : fs.existsSync(path) ? ' (the signer must be able to write it: if it belongs to another user, from a run as that user, chown it to the signer\'s user or remove it while no signer runs)'
+          : ' (the signer creates and writes this file: it needs write access to the directory of the database)';
       throw new Error(`cannot take the lock file ${path}: ${e.message}${hint}`);
     }
   }
