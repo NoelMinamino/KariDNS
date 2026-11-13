@@ -90,6 +90,7 @@ X (CONF_ZONE_SECONDARY_OPTIONS_ON_PRIMARY, "conf.zone.secondary-options-on-prima
 X (CONF_ZONE_MULTI_MASTER, "conf.zone.multi-master", 'N', "multi-master has no effect with fewer than two primaries")
 X (CONF_ZONE_REFRESH_RANGE, "conf.zone.refresh-range", 'W', "min-refresh-time is larger than max-refresh-time")
 X (CONF_ZONE_RETRY_RANGE, "conf.zone.retry-range", 'W', "min-retry-time is larger than max-retry-time")
+X (CONF_ZONE_PRIMARY_SETTINGS_UNSIGNED, "conf.zone.primary-settings-unsigned", 'W', "a secondary takes the settings of its primary over a transfer without TSIG")
 X (CONF_CONTROL_KEY_TSIG, "conf.control-key.tsig", 'W', "a control-channel key is also used for TSIG")
 X (CONF_DIRECTORY_ACCESS, "conf.directory.access", 'E', "options { directory } cannot be accessed")
 X (CONF_DIRECTORY_NOT_DIR, "conf.directory.not-dir", 'E', "options { directory } is not a directory")

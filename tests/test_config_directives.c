@@ -3640,6 +3640,33 @@ static void expect_silent(const char *label, const char *txt, server_config_t *c
     if (msg[0]) { g_failed++; printf("  [FAIL] %s: not silent: %s\n", label, msg); }
 }
 
+/* 0.7 (audit M3): a secondary that takes its primary's settings (primary-settings yes, the default) over a transfer without TSIG is
+ * warned about, with the place of the primaries statement; a key of the zone, of the entry or of a remote-servers list, and
+ * primary-settings no, are silent (docs/karidns.md, Extended AXFR version 3) */
+static void test_primary_settings_unsigned(void) {
+    printf("[*] primary-settings over an unsigned transfer (audit M3)...\n");
+    server_config_t cfg;
+    char txt[1024];
+    const char *key = "key \"k\" { algorithm hmac-sha256; secret \"dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl\"; };\n";
+    if (ok_with("no key", "zone \"z.test\" {\n type slave;\n masters { 192.0.2.1; 192.0.2.2; };\n};",
+                "line 3|zone 'z.test.'|primary 192.0.2.1 (and 1 more) has no TSIG key|primary-settings no", &cfg))
+        free_server_config_fields(&cfg);
+    snprintf(txt, sizeof(txt), "%sview \"v\" { zone \"z.test\" { type secondary; primaries { 192.0.2.1 key \"k\"; 192.0.2.2; }; }; };", key);
+    if (ok_with("in a view, one of two unsigned", txt, "zone 'z.test.' (view 'v')|primary 192.0.2.2 has no TSIG key", &cfg))
+        free_server_config_fields(&cfg);
+    snprintf(txt, sizeof(txt), "%szone \"z.test\" { type slave; masters { 192.0.2.1; }; tsig-key \"k\"; };", key);
+    expect_silent("the zone's tsig-key", txt, &cfg);
+    free_server_config_fields(&cfg);
+    snprintf(txt, sizeof(txt), "%szone \"z.test\" { type slave; masters { 192.0.2.1 key \"k\"; }; };", key);
+    expect_silent("the entry's key", txt, &cfg);
+    free_server_config_fields(&cfg);
+    snprintf(txt, sizeof(txt), "%sremote-servers \"p\" { 192.0.2.1 key \"k\"; };\nzone \"z.test\" { type slave; masters { p; }; };", key);
+    expect_silent("the key of a remote-servers list", txt, &cfg);
+    free_server_config_fields(&cfg);
+    expect_silent("primary-settings no", "zone \"z.test\" { type slave; masters { 192.0.2.1; }; primary-settings no; };", &cfg);
+    free_server_config_fields(&cfg);
+}
+
 static void test_bind_logging(void) {
     printf("[*] logging { } (BIND 9.20), querylog, controls { }...\n");
     server_config_t cfg;
@@ -5245,6 +5272,7 @@ int main(void) {
     test_statements_need_a_semicolon();
     test_also_notify_bind();
     test_primaries_and_notify_mode();
+    test_primary_settings_unsigned();
     test_strict_options_and_key();
     test_bind_compat_paths();
     test_bind_logging();

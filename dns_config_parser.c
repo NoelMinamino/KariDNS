@@ -477,6 +477,8 @@ static void free_zone_ext_fields(zone_ext_t *x) {
   }
   acl_set_free(&x->acl);
   notify_targets_free(x->masters, x->masters_count);
+  free(x->masters_loc);
+  x->masters_loc = NULL;
   if (x->masters_parsed) {
     free(x->masters_parsed);
     x->masters_parsed = NULL;
@@ -5495,6 +5497,12 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       notify_targets_free(x->masters, x->masters_count);
       x->masters = NULL;
       x->masters_count = 0;
+      {
+        char mloc[300];
+        ctx_location(ctx, mloc, sizeof(mloc));
+        free(x->masters_loc);
+        x->masters_loc = strdup(mloc);   /* (NULL when out of memory: the message after the parse has no place then) */
+      }
       if (parse_notify_targets(ctx, what, &x->masters, &x->masters_count, true) != 0) {
         free(key);
         free_zone_config(zone);
@@ -8271,6 +8279,41 @@ static int control_keys_resolve(token_ctx_t *ctx, server_config_t *cfg) {
   return 0;
 }
 
+/* 0.7 (audit M3): a secondary zone that takes the settings of its primary (primary-settings yes, the default; Extended AXFR version 3) from a
+ * primary whose transfer is not signed.  The settings carry ACLs (allow-transfer, ecs-trusted-resolvers): anybody who can answer instead of
+ * the primary can widen them (docs/karidns.md, the [!WARNING] of "Secondary zones: Extended AXFR version 3 and the settings of the
+ * primary").  After the lists are expanded, so that the key of a remote-servers list counts (zone_primary_key()).  Shared by karicheck and
+ * the server's start-up and reload log; a database or catalog member secondary has no zone { } and is not looked at. */
+static void primary_settings_notes(const server_config_t *config) {
+  for (const view_config_t *v = config->views; v; v = v->next)
+    for (const zone_config_t *z = v->zones; z; z = z->next) {
+      const zone_ext_t *zx = z->ext;
+      if (!zx || zx->primary_settings_off || zx->masters_count <= 0 || !z->type ||
+          (strcasecmp(z->type, "slave") != 0 && strcasecmp(z->type, "secondary") != 0))
+        continue;
+      int unsigned_n = 0, first = -1;
+      for (int i = 0; i < zx->masters_count; i++)
+        if (!zone_primary_key(zx, i)) {
+          if (first < 0) first = i;
+          unsigned_n++;
+        }
+      if (first < 0) continue;
+      const char *loc = zx->masters_loc ? zx->masters_loc : "configuration";
+      bool dflt = !v->name || strcmp(v->name, "__default__") == 0;
+      char more[48] = "";
+      if (unsigned_n > 1) snprintf(more, sizeof(more), " (and %d more)", unsigned_n - 1);
+      const char *ip = zx->masters[first].ip ? zx->masters[first].ip : "?";
+      syslog(LOG_WARNING, "[Config] %s: zone '%s'%s%s%s: primary %s%s has no TSIG key, and primary-settings is yes (the default): the settings the primary "
+             "sends with the zone (allow-transfer, ecs-trusted-resolvers, ...) are taken from an unsigned transfer. Sign it (tsig-key, or key in "
+             "primaries) or write 'primary-settings no;' (docs/karidns.md, Extended AXFR version 3, WARNING)", loc, z->domain,
+             dflt ? "" : " (view '", dflt ? "" : v->name, dflt ? "" : "')", ip, more);
+      dns_diag_at(DIAG_WARNING, DC_CONF_ZONE_PRIMARY_SETTINGS_UNSIGNED, loc, "%s: zone '%s'%s%s%s: primary %s%s has no TSIG key, and primary-settings is yes "
+                  "(the default): the settings the primary sends with the zone (allow-transfer, ecs-trusted-resolvers, ...) are taken from an unsigned "
+                  "transfer. Sign it (tsig-key, or key in primaries) or write 'primary-settings no;' (docs/karidns.md, Extended AXFR version 3, WARNING)\n",
+                  loc, z->domain, dflt ? "" : " (view '", dflt ? "" : v->name, dflt ? "" : "')", ip, more);
+    }
+}
+
 static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) {
   int nr_rc = 0;
   memset(config, 0, sizeof(server_config_t));
@@ -9662,6 +9705,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   }
   ctx->scope_keys = NULL;
   if (servers_check_keys(ctx, config) != 0) return -1;
+  primary_settings_notes(config);
 
   config->any_zone_tcp_opts = false;
   for (view_config_t *v = config->views; v && !config->any_zone_tcp_opts; v = v->next) {
@@ -10075,6 +10119,7 @@ static zone_ext_t *zone_ext_clone(const zone_ext_t *s) {
   *d = *s;
   /* every pointer of the copy is rebuilt below; until then it must not alias the source */
   d->masters = NULL; d->masters_count = 0; d->masters_parsed = NULL; /* notify_mode is copied with *d = *s */
+  d->masters_loc = NULL;   /* only the messages after the parse read it: not copied */
   d->tsig_key = NULL;
   d->tsig_keys = NULL; d->tsig_keys_count = 0;
   d->also_notify = NULL; d->also_notify_count = 0; /* also_notify_set is copied with *d = *s */

@@ -364,6 +364,7 @@ typedef struct zone_inview {
 typedef struct zone_ext {
   notify_target_t *masters; /* primaries / masters: addresses with port and optional TSIG key (list names are expanded when the parse ends) */
   int masters_count;
+  char *masters_loc;        /* "file:line" of the primaries / masters statement (owned; NULL when not written), for the messages after the parse */
   cidr_entry_t *masters_parsed;
   char *tsig_key;
   char **tsig_keys;

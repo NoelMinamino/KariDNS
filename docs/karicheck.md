@@ -357,6 +357,7 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `conf.zone.multi-master` | note | multi-master has no effect with fewer than two primaries |
 | `conf.zone.refresh-range` | warning | min-refresh-time is larger than max-refresh-time |
 | `conf.zone.retry-range` | warning | min-retry-time is larger than max-retry-time |
+| `conf.zone.primary-settings-unsigned` | warning | a secondary takes the settings of its primary over a transfer without TSIG |
 | `conf.control-key.tsig` | warning | a control-channel key is also used for TSIG |
 | `conf.directory.access` | error | options { directory } cannot be accessed |
 | `conf.directory.not-dir` | error | options { directory } is not a directory |

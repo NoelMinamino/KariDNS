@@ -1331,6 +1331,9 @@ received settings are in force. A change of the settings alone (no new serial) r
 > secondary: widen `allow-transfer`, add a trusted ECS resolver. Sign the transfer with a TSIG key (`tsig-key` in the secondary's
 > zone, `allow-transfer { key ...; }` on the primary) whenever the settings are accepted, or write the statements that matter in the
 > secondary's own `zone {}` (they win) or set `primary-settings no;`.
+> Since 0.7 a secondary `zone {}` with `primary-settings yes` (the default) and a primary that has no key (neither `tsig-key` in the zone
+> nor `key` in its `primaries` entry or list) is reported by `karicheck conf` (`conf.zone.primary-settings-unsigned`, with the place of
+> the `primaries` statement) and logged at warning (`config`) when the server reads the configuration.
 
 ### Forward and program zones: not applied upstream
 
