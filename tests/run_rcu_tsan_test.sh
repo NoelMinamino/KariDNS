@@ -14,6 +14,8 @@
 #   reloads of the secondary (Pass 2 while transfers run).
 # Part 4: tests/run_db_cache_test.sh with karidns-tsan (D1a step 5).  Part 5: tests/run_db_xfer_test.sh with karidns-tsan: AXFR and IXFR of zones that are
 #   out of memory (the transfer threads wait for the fetch stream) concurrent with queries and with the cache manager taking zones out (D1a step 7).
+# Part 6: tests/run_db_fetchconc_test.sh with karidns-tsan and karidns-dbloader-tsan.  Part 7: tests/run_axfr_stall_reload_test.sh with karidns-tsan:
+#   stalled outbound transfers during reloads, UPDATEs, reconfig and inbound transfers (R11).
 # Any ThreadSanitizer report fails the test.
 
 . "$(dirname "$0")/lib_proc.sh"
@@ -363,6 +365,21 @@ if [ "$(id -u)" = "0" ] && kari_make_dbloader >/dev/null 2>&1 && kari_make_dbloa
     fi
 else
     echo "SKIP: needs root and karictl / karidns-dbloader / karidns-dbloader-tsan"
+fi
+
+echo "--- part 7: karidns-tsan with stalled outbound transfers during reloads, UPDATEs, reconfig, a relaying secondary and 140 stalled clients (R11; tests/run_axfr_stall_reload_test.sh)"
+if [ -x ./karidns-tsan ]; then
+    # (the child test's port window lies above the ones of parts 2 and 3; the time bounds are scaled for TSan)
+    out=$(env KARIDNS=./karidns-tsan STALL_TEST_TIME_MULT=5 ${KARI_PORT_BASE:+KARI_PORT_BASE=$((KARI_PORT_BASE + 300))} sh tests/run_axfr_stall_reload_test.sh 2>&1)
+    cr=$?
+    echo "$out" | tail -5
+    if [ $cr -ne 0 ] || echo "$out" | grep -q "ThreadSanitizer"; then
+        echo "FAIL: run_axfr_stall_reload_test.sh with karidns-tsan"
+        echo "$out" | grep -v "^  PASS" | head -40
+        rc=1
+    fi
+else
+    echo "SKIP: karidns-tsan is not built"
 fi
 
 if [ $rc -eq 0 ]; then

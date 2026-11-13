@@ -18,7 +18,8 @@
 #   E. (root, the server with the test hooks: ./karidns-evict, SQLite3) a database zone: its transfer stalled, `karictl evict` (TEST ONLY) is
 #      refused while the transfer runs; the loader replaces the zone (a new serial in the database, `karictl reload`); the transfer delivers
 #      the old version; after it the zone can be taken out of memory.
-# The server is ./karidns-asan when it is built (a sanitizer report fails the test), else ./karidns.  Waits are on conditions, never fixed
+# The server is ./karidns-asan when it is built (a sanitizer report fails the test), else ./karidns.  KARIDNS=... picks another (STALL_TEST_TIME_MULT=n
+# multiplies the time bounds, for a TSan server).  Waits are on conditions, never fixed
 # sleeps.  Loopback only.  SKIP when perl, dag or karictl is missing; part E is skipped (said in the output) without its prerequisites.
 # ==============================================================================
 
@@ -52,6 +53,7 @@ FAILED=0
 pass() { echo "  PASS: $1"; }
 fail() { echo "  FAIL: $1"; FAILED=$((FAILED + 1)); }
 now_ms() { perl -MTime::HiRes=time -e 'printf("%d\n", time * 1000)'; }
+TMUL=${STALL_TEST_TIME_MULT:-1}     # the time bounds below are multiplied by this (tests/run_rcu_tsan_test.sh part 7: a TSan server is slower)
 export ASAN_OPTIONS="${ASAN_OPTIONS:-abort_on_error=0:detect_leaks=0}"
 
 USER_OPT=""
@@ -108,7 +110,7 @@ timed_ok() {
     l=$1; mx=$2; shift 2
     t0=$(now_ms); out=$("$@"); t1=$(now_ms)
     case "$out" in
-        OK*) [ $((t1 - t0)) -le "$mx" ] && pass "$l ($((t1 - t0)) ms: $out)" || fail "$l: $((t1 - t0)) ms ($out)" ;;
+        OK*) [ $((t1 - t0)) -le $((mx * TMUL)) ] && pass "$l ($((t1 - t0)) ms: $out)" || fail "$l: $((t1 - t0)) ms ($out)" ;;
         *) fail "$l: '$out'" ;;
     esac
 }
@@ -163,7 +165,7 @@ chmod 644 "$T/example.test.zone"
 timed_ok "reload after the zone file changed, the transfer stalled: OK within 2 s, no zone failed" 2000 ctl a reload
 [ "$(serial_of "$PA" example.test)" = "2" ] && pass "queries see the new serial (2)" || fail "serial: $(serial_of "$PA" example.test)"
 U=$(update "$PA" example.test u1.example.test 192.0.2.11)
-case "$U" in "rcode=0 "*) M=${U#*ms=}; [ "$M" -lt 2000 ] && pass "a dynamic UPDATE during the stall: NOERROR at once ($U)" || fail "the UPDATE took $M ms" ;; *) fail "the UPDATE: $U" ;; esac
+case "$U" in "rcode=0 "*) M=${U#*ms=}; [ "$M" -lt $((2000 * TMUL)) ] && pass "a dynamic UPDATE during the stall: NOERROR at once ($U)" || fail "the UPDATE took $M ms" ;; *) fail "the UPDATE: $U" ;; esac
 ./dag @127.0.0.1 -p "$PA" u1.example.test A +short +nohexdump +time=2 +tries=2 | grep -q 192.0.2.11 && pass "the update is served" || fail "u1.example.test not served"
 [ "$(serial_of "$PA" example.test)" = "3" ] && pass "serial 3 after the UPDATE" || fail "serial: $(serial_of "$PA" example.test)"
 # an IXFR from serial 1 (the differences 1 -> 2, 1000 TXT RRs changed by the reload, and 2 -> 3, the UPDATE: about 450 KB), stalled; then UPDATEs
@@ -281,7 +283,7 @@ CPIDS="$CPIDS $MANY"
 i=0; while [ ! -s "$T/many.ready" ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i + 1)); done
 i=0; while [ "$(status_num d "xfers running")" != "140" ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i + 1)); done
 t0=$(now_ms); N=$(status_num d "xfers running"); t1=$(now_ms)
-[ "$N" = "140" ] && [ $((t1 - t0)) -lt 3000 ] && pass "karictl status answers in $((t1 - t0)) ms with 140 transfers running" || fail "status: '$N' transfers, $((t1 - t0)) ms ($(cat "$T/many.err"))"
+[ "$N" = "140" ] && [ $((t1 - t0)) -lt $((3000 * TMUL)) ] && pass "karictl status answers in $((t1 - t0)) ms with 140 transfers running" || fail "status: '$N' transfers, $((t1 - t0)) ms ($(cat "$T/many.err"))"
 timed_ok "a reload with 140 stalled transfers" 3000 ctl d reload
 : > "$T/go.many"
 wait "$MANY" 2>/dev/null
