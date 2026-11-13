@@ -10,8 +10,8 @@
 #   S  trace 2, the loader is killed: the new one comes up at level 2 (its first line, written before it talks to the Backend, says so; the
 #      manager's line says --debug 2)
 #   N  notrace: the same events (a plugin and the loader started again, a reload) leave no debug line, while their notice / info lines arrive
-#   R  a reload that replaces the channel: the manager's, a router's and the broker's lines go to the new file, none to the old one (before
-#      0.7 M2 they kept the channels of the start-up)
+#   R  a reload that replaces the channel: the manager's, a router's and the broker's lines go to the new file (before 0.7 M2 they kept the
+#      channels of the start-up); only their warnings and errors also reach the old one, the channel of the start (the floor)
 #   F  a log file removed by hand is not made again by the manager (root): the lines of the manager are lost until a reload makes the file
 #      again, as the run user, and then they arrive
 # Needs root (the server drops to nobody, the loader runs as nobody and must be root-owned).  SKIP otherwise, and without the binaries,
@@ -159,7 +159,14 @@ kill_plugin
 wait_starts $((S0 + 1)) || fail "R: the plugin was not started again"
 wl "$DYN2" "general: notice: \[Plugin\] zone '[^']*prog.example[^']*' in view '[^']*': starting the plugin again" 20 && pass "R: a notice of the manager goes to the new channel" || fail "R: manager notice"
 wl "$DYN2" 'database: debug 1: \[DB\] debug level 1 (was 0)' && pass "R: the loader's lines (logged by the manager) go to the new channel" || fail "R: loader not in the new file"
-[ "$(wc -l < "$DYN")" = "$B0" ] && pass "R: the old file got nothing after the reload" || { fail "R: lines in the old file after the reload"; tail -n +$((B0 + 1)) "$DYN"; }
+# 0.7: the floor (dns_log.c klog_record()): the warnings and errors of the manager, a router or the broker still reach the start's channel of
+# their category, whatever the Backend hands over; nothing below warning does
+OLD_NEW=$(tail -n +$((B0 + 1)) "$DYN")
+if echo "$OLD_NEW" | grep -v -E '^(general|database): (warning|error|critical): ' | grep -q .; then
+    fail "R: lines below warning in the old file after the reload"; echo "$OLD_NEW"
+else pass "R: the old file got no line below warning after the reload"; fi
+echo "$OLD_NEW" | grep -q "^general: warning: \[Plugin\] zone '[^']*prog.example[^']*' in view '[^']*': the plugin (pid [0-9]*) was killed by signal" &&
+    pass "R: the manager's warning (the plugin was killed) still reaches the start's channel as well" || { fail "R: no warning of the manager in the start's file"; echo "$OLD_NEW"; }
 
 # ================================================================ F: a removed file is not made again by the manager
 echo "== F: a removed log file"
