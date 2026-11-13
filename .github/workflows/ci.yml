@@ -169,7 +169,9 @@ jobs:
   # ---------------------------------------------------------------------------
   # The browser tests of the web interface (0.7: category gui of tests/run_all_suite.sh, left out of a plain suite run): Firefox headless through geckodriver
   # on FreeBSD 15.1 (the packages are built for 15.x).  A job of its own, so that a flaky browser step does not fail the server's build-and-test job.  It runs
-  # on every push to main, by hand, and on a pull request that touches the web interface, the service, the code they share, their tests or this workflow.
+  # on every push to main, by hand, and on a pull request that touches the web interface, the service, the code they share, their tests or this workflow,
+  # or a source of the programs the scenarios run besides the server (karidns-zone, karicheck, karidns-dbloader, karictl, dag: the files the Makefile
+  # links into them, the database code included); a change to a file that only the server links does not start a browser.
   # ---------------------------------------------------------------------------
   webadmin-gui-freebsd:
     name: WebAdmin browser tests (FreeBSD 15.1)
@@ -190,9 +192,9 @@ jobs:
         run: |
           run=true
           if [ "$EVENT" = "pull_request" ] && [ -n "$PR_BASE" ] && git cat-file -e "$PR_BASE^{commit}" 2>/dev/null; then
-            if ! git diff --name-only "$PR_BASE" HEAD | grep -Eq '^(webadmin/|node/|db/|tests/lib_webadmin_gui\.sh$|tests/run_webadmin_(gui|gui_pg|oidc|oidc_gui)_test\.sh$|tests/run_all_suite\.sh$|tests/lib_proc\.sh$|\.github/workflows/ci\.yml$)'; then
+            if ! git diff --name-only "$PR_BASE" HEAD | grep -Eq '^(webadmin/|node/|db/|tests/lib_webadmin_gui\.sh$|tests/run_webadmin_(gui|gui_pg|oidc|oidc_gui)_test\.sh$|tests/run_all_suite\.sh$|tests/lib_proc\.sh$|\.github/workflows/ci\.yml$|tools/(karidns_zone|karicheck|karictl|karidns_tool_linkage|dag[a-z0-9_]*|dnstap_decode)\.[ch]$|karidns_dbloader\.c$|dns_(zone_(import|export|changes|render|msg|text|rows|lint|parser)|pdns_reader|presigned|db_[a-z0-9_]+|tinydns_parser|config_parser|tsig_acl|diag|wire|utils|cidr)\.[ch]$)'; then
               run=false
-              echo "the web interface, the service, their tests and this workflow are unchanged: the browser tests are not run"
+              echo "the web interface, the service, the tools the scenarios run, their tests and this workflow are unchanged: the browser tests are not run"
             fi
           fi
           echo "run=$run" >> "$GITHUB_OUTPUT"
