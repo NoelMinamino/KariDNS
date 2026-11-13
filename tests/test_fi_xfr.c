@@ -294,6 +294,12 @@ static void test_fi_axfr_start_section_copies(void) {
         send_axfr_response(1, "fiv3.example.", req, (uint16_t)q, NULL, &entry, NULL, 0, &ca, sizeof(struct sockaddr_in), NULL, false);
         assert(atomic_load(&arena.ver.xfr_refs) == 0);
     });
+    /* version 2: the configuration's trusted resolvers are copied instead (version 3 carries them in the settings) */
+    req[q - 5] = 2;
+    FI_SWEEP({
+        send_axfr_response(1, "fiv3.example.", req, (uint16_t)q, NULL, &entry, NULL, 0, &ca, sizeof(struct sockaddr_in), NULL, false);
+        assert(atomic_load(&arena.ver.xfr_refs) == 0);
+    });
 
     atomic_store(&g_config_db.active, cfg0);
     free_server_config_fields(cfg);

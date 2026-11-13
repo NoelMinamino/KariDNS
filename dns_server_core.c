@@ -172,6 +172,30 @@ static void xfr_test_delay(void) {
 /* TEST ONLY (as xfr-delay): `karictl xfr-fail thread|memory|off` makes the TCP zone transfer dispatch behave as if pthread_create() (XD_NO_THREAD) or the
  * allocation of the transfer's arguments (XD_NO_MEMORY) had failed, so that the refusal of those branches can be tested (run_xfr_dispatch_fault_test.sh). */
 static _Atomic int g_test_xfr_fail;
+/* TEST ONLY (as xfr-delay): `karictl rcu-hold <ms>` starts a thread that holds an auxiliary read section for that long (at most 120 s), so that a test can
+ * hold back the grace periods of the writers with a reader that is not a transfer (R11: a transfer holds none while it waits for its client;
+ * run_rcu_reclaim_status_test.sh).  The command answers once the thread is inside its section. */
+static _Atomic int g_test_rcu_hold_in;
+static void *test_rcu_hold_thread(void *arg) {
+  const uint32_t ms = (uint32_t)(uintptr_t)arg;
+  rcu_aux_read_lock();
+  atomic_store_explicit(&g_test_rcu_hold_in, 1, memory_order_release);
+  struct timespec ts = { (time_t)(ms / 1000), (long)(ms % 1000) * 1000000L };
+  nanosleep(&ts, NULL);
+  rcu_aux_read_unlock();
+  return NULL;
+}
+static bool test_rcu_hold(uint32_t ms) {
+  pthread_t t;
+  atomic_store_explicit(&g_test_rcu_hold_in, 0, memory_order_relaxed);
+  if (pthread_create(&t, NULL, test_rcu_hold_thread, (void *)(uintptr_t)ms) != 0) return false;
+  pthread_detach(t);
+  for (int i = 0; i < 5000 && !atomic_load_explicit(&g_test_rcu_hold_in, memory_order_acquire); i++) {
+    struct timespec w = { 0, 1000000L };
+    nanosleep(&w, NULL);
+  }
+  return atomic_load_explicit(&g_test_rcu_hold_in, memory_order_acquire) != 0;
+}
 #endif
 
 #define response_log_enabled(cfg) ((cfg) && (cfg)->logging.responses_enabled)
@@ -5403,6 +5427,13 @@ void *control_thread_func(void *arg) {
                 atomic_store_explicit(&g_test_xfr_fail, f, memory_order_relaxed);
                 (void)ctl_send_all(cfd, "OK\n", 3);
               } else (void)ctl_send_all(cfd, "ERROR expected thread, memory or off\n", 37);
+            } else if (strcmp(cmd, "rcu-hold") == 0 && arg) {
+              /* TEST ONLY (as evict): an auxiliary read section held for <ms> by a thread of its own (test_rcu_hold()), at most 120 s */
+              char *end = NULL;
+              unsigned long ms = strtoul(arg, &end, 10);
+              if (end && end != arg && *end == '\0' && ms > 0 && ms <= 120000 && test_rcu_hold((uint32_t)ms))
+                (void)ctl_send_all(cfd, "OK\n", 3);
+              else (void)ctl_send_all(cfd, "ERROR bad hold\n", 15);
 #endif
             } else if (strcmp(cmd, "trace") == 0 || strcmp(cmd, "notrace") == 0) {
               char treply[128];
