@@ -733,9 +733,12 @@ static alias_tab_t *tab_build(void) {
 static alias_tab_t *g_old_tab;                     /* waiting for its grace period */
 static uint64_t g_old_epoch;
 
+/* wait: a short, quiet try (0.7; it waited up to 5 s, with the stall line, for a reader that stays in its section): the table is freed after
+ * its grace period only, and while a reader holds it the next table is built at a later pass (publish()) */
+#define ALIAS_REAP_TRY_MS 50
 static void reap_old(bool wait) {
     if (!g_old_tab) return;
-    if (wait ? rcu_writer_wait_until_safe(g_old_epoch, 5000) : rcu_writer_is_safe(g_old_epoch)) {
+    if (wait ? rcu_writer_try_wait(g_old_epoch, ALIAS_REAP_TRY_MS) : rcu_writer_is_safe(g_old_epoch)) {
         free(g_old_tab);
         g_old_tab = NULL;
     }

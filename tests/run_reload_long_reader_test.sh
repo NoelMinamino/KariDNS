@@ -6,11 +6,15 @@
 # TEST ONLY `karictl rcu-hold <ms>` (a thread that holds an auxiliary read section; the server with the test hooks: ./karidns of
 # `make coverage`, else ./karidns-evict of `make evict`).
 #   1. 3000 small file zones: a full `karictl reload` (every zone file read again, a grace period was waited for every 1024 zones and at the end:
-#      60 s each before) takes about as long during the hold as without it, and answers "OK reloaded"; a second reload during the hold answers
-#      at once "ERROR reload postponed" (the configuration is double-buffered: its buffer may still be read by the reader) and the server does
-#      it by itself when the hold is over; `retired zone versions waiting` rises during the hold and goes back to 0 after it.
+#      60 s each before) takes about as long during the hold as without it, and answers "OK reloaded"; a second reload during the hold waits
+#      for the readers of normal operation (here 1 s: no program or forward zone), then answers "ERROR reload postponed" (the configuration is
+#      double-buffered: its buffer may still be read by the reader) and the server does it by itself when the hold is over; `retired zone versions waiting` rises during the hold and goes back to 0 after it.
 #   2. (root, the loader with SQLite3, sqlite3) 1500 database zones change during the hold: the ingest batch (a grace period was waited for
 #      every 1024 zones) is applied while the reader holds, the zones are served with their new serial; the counts go back to 0 after it.
+#      A second full reload during the hold is postponed; a row changed meanwhile is served once the tick applies it (the postponed reload asks
+#      the loader as the command would have); the postponement makes at most three log lines.
+#   3. A program zone whose plugin takes 1.5 s (program-timeout 3000): with such a query in flight, `reconfig` and `reload` back to back both
+#      answer OK (the reload waits for the query, at most program-timeout + 0.5 s; it answered "postponed" after 0.1 s before).
 # SKIP without perl or the test hooks; part 2 prints "SKIP: part 2: ..." without its prerequisites.
 # ==============================================================================
 
@@ -99,7 +103,8 @@ V=$(status_num a "retired zone versions waiting")
 [ -n "$V" ] && [ "$V" -ge 1000 ] && pass "the replaced versions wait for the reader (retired zone versions waiting: $V)" || fail "retired zone versions waiting: '$V'"
 set -- $(timed a reload)
 echo "   a second reload during the hold: $*"
-case "$*" in *"reload postponed"*) [ "$1" -lt 2000 ] && pass "a second reload during the hold answers at once ($1 ms): postponed, the configuration's buffer may still be read" || fail "the postponement took $1 ms" ;; *) fail "the second reload: $*" ;; esac
+# (an explicit reload waits for the readers of normal operation first: here 1 s, as there is no program or forward zone; at most 5 s)
+case "$*" in *"reload postponed"*) [ "$1" -ge 900 ] && [ "$1" -lt 5500 ] && pass "a second reload during the hold answers after the 1 s wait for normal readers ($1 ms): postponed, the configuration's buffer may still be read" || fail "the postponement took $1 ms" ;; *) fail "the second reload: $*" ;; esac
 N0=$(grep -c "reloaded successfully" "$T/a.log")
 ctl a status | grep -q "^retired zone snapshots waiting: [1-9]" && pass "status: a retired snapshot waits for the reader" || fail "status: $(ctl a status | grep 'retired zone')"
 echo "   (waiting for the end of the hold)"
@@ -159,10 +164,46 @@ EOF
     V=$(status_num b "retired zone versions waiting")
     [ -n "$V" ] && [ "$V" -ge 1000 ] && pass "the replaced versions wait for the reader (retired zone versions waiting: $V)" || fail "retired zone versions waiting: '$V'"
     echo "   (waiting for the end of the hold)"
+    # a second full reload during the hold is postponed; it is to ask the loader too: a row changed meanwhile is served once the tick applies it
+    sqlite3 "$T/db/z.db" "UPDATE records SET content = REPLACE(content, ' 2 3600 600 ', ' 3 3600 600 ') WHERE type = 'SOA' AND domain_id = (SELECT id FROM domains WHERE name = 'd0007.test');"
+    R=$(ctl b reload | head -1)
+    case "$R" in *"reload postponed"*) pass "a second full reload during the hold is postponed" ;; *) fail "the second reload: '$R'" ;; esac
     i=0; while [ "$(status_num b "retired zone versions waiting")" != "0" ] && [ $i -lt 900 ]; do sleep 0.1; i=$((i + 1)); done
     [ "$(status_num b "retired zone versions waiting")" = "0" ] && pass "the hold over, the retired versions are freed (0)" || fail "retired zone versions waiting: $(status_num b "retired zone versions waiting")"
+    i=0; while [ "$(serial_of "$P2" d0007.test)" != "3" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done
+    [ "$(serial_of "$P2" d0007.test)" = "3" ] && pass "the tick applied the postponed reload with its request to the loader: the changed row is served (serial 3)" \
+        || fail "after the postponed reload: d0007.test serial '$(serial_of "$P2" d0007.test)' (the loader was not asked)"
+    grep -q "The postponed reload was applied" "$T/b.log" && pass "the log says the postponed reload was applied" || fail "no 'The postponed reload was applied' line"
+    N=$(grep -ci "postponed" "$T/b.log")
+    [ "$N" -le 3 ] && pass "the postponed reload makes $N log line(s): once, a reminder at most once a minute, the outcome (it was one a second)" || fail "$N log lines about the postponed reload"
     sanitizer_clean b
 fi
+
+echo "== 3. a slow program zone query (the plugin takes 1.5 s, program-timeout 3000) in flight: reconfig and reload back to back answer OK"
+P3=$(kari_port 2 $((P1 + 2)))
+PROG_USER=""
+[ "$(id -u)" = "0" ] && PROG_USER="program-user \"nobody\";"
+cp "$ROOT_DIR/tests/plugins/dnstestscript.pl" "$T/plugin.pl" && chmod 755 "$T/plugin.pl"   # (executable, and readable by the program-user)
+cat > "$T/c.conf" <<EOF
+options { port $P3; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT allow-program-zones yes; };
+control-channel { socket "$T/c.sock"; algorithm hmac-sha256; secret "$SECRET"; };
+zone "p.test" { type program; program "$T/plugin.pl"; program-args { "192.0.2.7"; }; $PROG_USER program-timeout 3000; };
+EOF
+chmod 644 "$T/c.conf"
+"$KARIDNS" -f "$T/c.conf" > "$T/c.log" 2>&1 &
+PIDS="$PIDS $!"
+i=0; until ./dag @127.0.0.1 -p "$P3" normal.p.test A +short +nohexdump +time=2 +tries=1 2>/dev/null | grep -q 192.0.2.7 || [ $i -ge 75 ]; do sleep 0.2; i=$((i + 1)); done
+[ $i -lt 75 ] && pass "the program zone answers" || fail "the program zone does not answer"
+./dag @127.0.0.1 -p "$P3" slow.p.test A +short +nohexdump +time=6 +tries=1 > "$T/slow.out" 2>&1 &
+SLOW=$!
+sleep 0.3   # (the query reaches the plugin: it holds an async I/O read section for 1.5 s from then on)
+set -- $(timed c reconfig)
+case "$*" in *" OK"*) pass "reconfig with the slow query in flight: OK ($1 ms)" ;; *) fail "reconfig: $*" ;; esac
+set -- $(timed c reload)
+case "$*" in *"OK reloaded"*) pass "reload right after it: OK ($1 ms; it waited for the slow query, up to program-timeout + 0.5 s)" ;; *) fail "reload after reconfig: $*" ;; esac
+wait "$SLOW"
+grep -q 192.0.2.7 "$T/slow.out" && pass "the slow query is answered" || fail "the slow query: $(cat "$T/slow.out")"
+sanitizer_clean c
 
 if [ "$FAILED" -eq 0 ]; then
     echo "=== run_reload_long_reader_test: all checks passed ==="

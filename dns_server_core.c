@@ -3775,8 +3775,37 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
   }
 }
 
-#define RELOAD_READERS_WAIT_MS 100   /* the try for the readers of the configuration before (perform_config_reload_ext()) */
+/* The readers of the configuration before (perform_config_reload_wait()).  An explicit reload (control channel, SIGHUP) waits for them as long as a
+ * reader may stay in its section in normal operation: a worker that waits for a program zone's plugin (program-timeout) or for a forward zone's
+ * forwarders (forward-timeout, one budget for all of them), plus a margin; at least RELOAD_WAIT_MIN_MS, at most RELOAD_WAIT_MAX_MS (a reader that
+ * stays longer than that is not a normal one: the reload is postponed).  The control tick's retry of a postponed reload only tries
+ * (RELOAD_RETRY_TRY_MS): it runs every second until the readers have left. */
+#define RELOAD_WAIT_MIN_MS 1000
+#define RELOAD_WAIT_MAX_MS 5000
+#define RELOAD_WAIT_MARGIN_MS 500
+#define RELOAD_RETRY_TRY_MS 100
+STATIC_TEST int reload_readers_wait_ms(const server_config_t *cfg) {
+  uint32_t longest = 0;
+  for (const view_config_t *v = cfg ? cfg->views : NULL; v; v = v->next)
+    for (const zone_config_t *z = v->zones; z; z = z->next) {
+      if (!z->type) continue;
+      uint32_t t = 0;
+      if (strcasecmp(z->type, "program") == 0) t = zext(z)->program_timeout_ms > 0 ? zext(z)->program_timeout_ms : 2000;        /* (dns_plugin_sup.c) */
+      else if (strcasecmp(z->type, "forward") == 0) t = zext(z)->forward_timeout_ms > 0 ? zext(z)->forward_timeout_ms : 2000;  /* (dispatch_forward_zone()) */
+      if (t > longest) longest = t;
+    }
+  uint64_t ms = (uint64_t)longest + RELOAD_WAIT_MARGIN_MS;
+  if (ms < RELOAD_WAIT_MIN_MS) ms = RELOAD_WAIT_MIN_MS;
+  if (ms > RELOAD_WAIT_MAX_MS) ms = RELOAD_WAIT_MAX_MS;
+  return (int)ms;
+}
+
+static config_reload_result_t perform_config_reload_wait(bool skip_unchanged, int readers_wait_ms);
 STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged) {
+  return perform_config_reload_wait(skip_unchanged, reload_readers_wait_ms(atomic_load_explicit(&g_config_db.active, memory_order_acquire)));
+}
+
+static config_reload_result_t perform_config_reload_wait(bool skip_unchanged, int readers_wait_ms) {
   config_reload_result_t res;
   memset(&res, 0, sizeof(res));
   char *config_str = read_entire_file(g_config_path, NULL, NULL);
@@ -3798,16 +3827,10 @@ STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged
    * 設定の writer は制御スレッドだけで、ワーカー以外のスレッドも設定は
    * 読み取り区間の中で読むので、この待機の後は standby を解放してよい。
    * The configuration is double-buffered (config_a / config_b): the new one is parsed into the struct that a reader of the generation before
-   * may still hold, so this check guards that reuse and stays.  0.7: it is a short try (RELOAD_READERS_WAIT_MS), not a 10 s wait: a reader that
-   * stays in its section makes the reload answer "postponed" at once, and the control tick tries it again every second (run_config_reload(),
-   * g_reload_pending) until the reader has left; the log line is written once a minute at most. */
-  if (!rcu_writer_try_wait(g_config_db.retire_epoch, RELOAD_READERS_WAIT_MS)) {
-    static time_t last_log;
-    const time_t now_s = time(NULL);
-    if (now_s - last_log >= 60) {
-      last_log = now_s;
-      syslog(LOG_WARNING, "[Config] Reload postponed: existing readers still active on previous configuration; it is retried every second.");
-    }
+   * may still hold, so this check guards that reuse and stays.  0.7: an explicit reload waits readers_wait_ms (reload_readers_wait_ms(): the
+   * readers of normal operation), the tick's retry a short try; a reader that stays longer makes the reload "postponed" (run_config_reload()
+   * writes the log lines and remembers what the reload is to do). */
+  if (!rcu_writer_try_wait(g_config_db.retire_epoch, readers_wait_ms)) {
     res.status = CONFIG_RELOAD_POSTPONED;
     snprintf(res.detail, sizeof(res.detail), "readers of the previous configuration are still active");
     free(config_str);
@@ -3915,18 +3938,47 @@ static bool g_reload_pending_full = false; /* 延期したものに全ゾーン�
 
 _Atomic uint64_t g_reload_failures_total = 0;   /* karictl stats, alerts reload-failures-above: reloads that failed or left zones unloaded (the control thread writes it) */
 
-static config_reload_result_t run_config_reload(bool skip_unchanged) {
+static bool g_reload_pending_db = false;   /* the postponed reload includes a full control-channel reload: ask the loader after it (B6a) */
+static time_t g_reload_pending_logged;     /* when the postponement or its last reminder was logged */
+
+/* A reload, and what follows it when it is applied.  ask_db (a full control-channel `reload`): the database loader is asked to compare its sources
+ * with the zones served (B6a, design 5.2); *db_rid (may be NULL) gets the request id, 0 = none.  retry: the control tick's retry of a postponed
+ * reload (a short try for the readers); otherwise an explicit one (the readers of normal operation are waited for).  A postponed reload is
+ * remembered with what it was to do (full, the database request) and applied by the tick; the postponement is logged once, a reminder at
+ * most once a minute, the outcome once. */
+static config_reload_result_t run_config_reload(bool skip_unchanged, bool ask_db, bool retry, uint64_t *db_rid) {
+  if (db_rid) *db_rid = 0;
   bool full = !skip_unchanged || g_reload_pending_full;
-  config_reload_result_t r = perform_config_reload_ext(!full);
+  ask_db = ask_db || g_reload_pending_db;
+  const bool was_pending = g_reload_pending;
+  config_reload_result_t r = perform_config_reload_wait(!full, retry ? RELOAD_RETRY_TRY_MS
+                                                                     : reload_readers_wait_ms(atomic_load_explicit(&g_config_db.active, memory_order_acquire)));
   if (r.status == CONFIG_RELOAD_READ_ERROR || r.status == CONFIG_RELOAD_PARSE_ERROR || r.status == CONFIG_RELOAD_REJECTED ||
       r.status == CONFIG_RELOAD_ZONE_ERRORS)
     atomic_fetch_add_explicit(&g_reload_failures_total, 1, memory_order_relaxed);
   if (r.status == CONFIG_RELOAD_POSTPONED) {
+    const time_t now_s = time(NULL);
+    if (!was_pending) {
+      syslog(LOG_WARNING, "[Config] Reload postponed: readers of the previous configuration are still active; the server applies it when they have left");
+      g_reload_pending_logged = now_s;
+    } else if (now_s - g_reload_pending_logged >= 60) {
+      syslog(LOG_NOTICE, "[Config] The postponed reload still waits for readers of the previous configuration");
+      g_reload_pending_logged = now_s;
+    }
     g_reload_pending = true;
     g_reload_pending_full = full;
-  } else {
-    g_reload_pending = false;
-    g_reload_pending_full = false;
+    g_reload_pending_db = ask_db;
+    return r;
+  }
+  if (was_pending)
+    syslog(r.status == CONFIG_RELOAD_OK ? LOG_NOTICE : LOG_WARNING, "[Config] The postponed reload was %s", r.status == CONFIG_RELOAD_OK ? "applied"
+           : r.status == CONFIG_RELOAD_ZONE_ERRORS ? "applied, with zones that failed to load" : "not applied (see the lines above)");
+  g_reload_pending = false;
+  g_reload_pending_full = false;
+  g_reload_pending_db = false;
+  if (ask_db && (r.status == CONFIG_RELOAD_OK || r.status == CONFIG_RELOAD_ZONE_ERRORS) && db_ingest_enabled()) {
+    const uint64_t rid = db_ingest_reload(true, NULL, NULL, false);
+    if (db_rid) *db_rid = rid;
   }
   return r;
 }
@@ -5061,24 +5113,22 @@ void *control_thread_func(void *arg) {
                 release_zone_snapshot(snap);
               } else {
                 syslog(LOG_NOTICE, "[Control] Received full reload command");
-                config_reload_result_t rr = run_config_reload(false);
+                /* B6a (design 5.2): after the configuration, ask the loader to compare its sources with the zones served (run_config_reload(); also
+                 * when the reload is postponed and the tick applies it); the answer is not waited for (karictl dbstatus shows the batch) */
+                uint64_t rid = 0;
+                config_reload_result_t rr = run_config_reload(false, true, false, &rid);
                 char reply[CTRL_RELOAD_REPLY_SIZE];
                 int rlen = format_reload_reply(&rr, "OK reloaded", reply, sizeof(reply));
-                /* B6a (design 5.2): after the configuration, ask the loader to compare its sources with the zones served;
-                 * the answer is not waited for (karictl dbstatus shows the batch) */
-                if ((rr.status == CONFIG_RELOAD_OK || rr.status == CONFIG_RELOAD_ZONE_ERRORS) && db_ingest_enabled()) {
-                  uint64_t rid = db_ingest_reload(true, NULL, NULL, false);
-                  if (rid && rlen > 0 && reply[rlen - 1] == '\n' && (size_t)rlen + 64 < sizeof(reply)) {
-                    rlen--;
-                    rlen += snprintf(reply + rlen, sizeof(reply) - (size_t)rlen, "; DB reload requested (request %llu)\n",
-                                     (unsigned long long)rid);
-                  }
+                if (rid && rlen > 0 && reply[rlen - 1] == '\n' && (size_t)rlen + 64 < sizeof(reply)) {
+                  rlen--;
+                  rlen += snprintf(reply + rlen, sizeof(reply) - (size_t)rlen, "; DB reload requested (request %llu)\n",
+                                   (unsigned long long)rid);
                 }
                 (void)ctl_send_all(cfd, reply, (size_t)rlen);
               }
             } else if (strcmp(cmd, "reconfig") == 0) {
               syslog(LOG_NOTICE, "[Control] Received reconfig command");
-              config_reload_result_t rr = run_config_reload(true);
+              config_reload_result_t rr = run_config_reload(true, false, false, NULL);
               char reply[CTRL_RELOAD_REPLY_SIZE];
               int rlen = format_reload_reply(&rr, "OK", reply, sizeof(reply));
               (void)ctl_send_all(cfd, reply, (size_t)rlen);
@@ -5487,7 +5537,7 @@ void *control_thread_func(void *arg) {
         if (ev_list[i].data > 1)
           syslog(LOG_NOTICE, "[Config] %ld SIGHUP signals arrived while busy; reloading once", (long)ev_list[i].data);
         if (sighup_from_manager((long)ev_list[i].data))
-          run_config_reload(true);
+          run_config_reload(true, false, false, NULL);
       } else if (ev_list[i].filter == EVFILT_SIGNAL &&
                  (ev_list[i].ident == SIGTERM || ev_list[i].ident == SIGINT)) {
         /* O-03: 起動後の SIGTERM / SIGINT はここで受け、dnstap を閉じてから終了する */
@@ -5505,9 +5555,8 @@ void *control_thread_func(void *arg) {
         plug_backend_timer();           /* 0.6.2: freed plugin objects (and their STOPs), STARTs to ask again, owed KILLs */
         auxlog_push();                  /* 0.7 M2: a logging state a full queue did not take */
         if (g_reload_pending) {
-          /* O-10: 読み手が残っていて延期したリロードを捨てずにやり直す */
-          syslog(LOG_NOTICE, "[Config] Retrying the postponed reload");
-          run_config_reload(!g_reload_pending_full);
+          /* O-10: 読み手が残っていて延期したリロードを捨てずにやり直す (run_config_reload() logs the postponement once, a reminder a minute, the outcome) */
+          run_config_reload(!g_reload_pending_full, false, true, NULL);
         }
         // Check control clients timeout: 5s unauthenticated or 15s inactive
         ctrl_client_t *curr_c = g_ctrl_clients;

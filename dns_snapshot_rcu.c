@@ -1355,19 +1355,27 @@ static size_t zone_retire_recount(void) {
 #define ZONE_RETIRE_WAIT_MS 50
 #define ZONE_RETIRE_BACKOFF_MS 1000
 static _Atomic int64_t g_retire_nowait_until_ms;    /* burst_now_ms() before which a wait is not tried again */
+/* the (kept, freed) counts of the last debug-2 line of zone_retire_process(), shared by its callers; UINT64_MAX: none since the stack was empty */
+static _Atomic uint64_t g_retire_last_counts = UINT64_MAX;
 void zone_retire_process(bool wait) {
   zone_retire_t *list = atomic_exchange_explicit(&g_zone_retire_head, NULL, memory_order_acquire);
-  if (!list) return;
+  if (!list) {
+    atomic_store_explicit(&g_retire_last_counts, UINT64_MAX, memory_order_relaxed);   /* (the next non-empty state is logged) */
+    return;
+  }
   uint64_t max_epoch = 0;
   for (zone_retire_t *r = list; r; r = r->next) {
     if (r->epoch > max_epoch) max_epoch = r->epoch;
   }
   bool all_safe;
+  const char *how = "no wait";               /* (what the debug line says about the grace period) */
   if (wait && burst_now_ms() >= atomic_load_explicit(&g_retire_nowait_until_ms, memory_order_relaxed)) {
     all_safe = rcu_writer_try_wait(max_epoch, ZONE_RETIRE_WAIT_MS);
+    how = all_safe ? "the grace period is over" : "the grace period did not end within the short wait (readers in their sections)";
     if (!all_safe) atomic_store_explicit(&g_retire_nowait_until_ms, burst_now_ms() + ZONE_RETIRE_BACKOFF_MS, memory_order_relaxed);
   } else {
     all_safe = rcu_writer_is_safe(max_epoch);
+    if (wait) how = "no wait (after a short wait that did not end, none is tried for a second)";
   }
   unsigned n_freed = 0, n_kept = 0;          /* (the debug 2 line of the batch) */
   uint64_t freed_bytes = 0;
@@ -1403,11 +1411,10 @@ void zone_retire_process(bool wait) {
   }
   /* debug 2, once per change: a node that a transfer keeps (R11: up to max-transfer-time-out, or an inbound transfer) would otherwise make the same
    * line at every control tick.  The last numbers are shared by the threads that call this (the control thread, a reload, the ingest thread). */
-  static _Atomic uint64_t last_counts = UINT64_MAX;
   const uint64_t counts = ((uint64_t)n_kept << 32) | n_freed;
-  if (atomic_exchange_explicit(&last_counts, counts, memory_order_relaxed) != counts)
+  if (atomic_exchange_explicit(&g_retire_last_counts, counts, memory_order_relaxed) != counts)
     logev_post(LOGC_GENERAL, 2, NULL, 0, "[GC] retired zone versions: %u freed (%llu bytes), %u kept for readers or a running transfer (epoch %llu, %s)", n_freed,
-               (unsigned long long)freed_bytes, n_kept, (unsigned long long)max_epoch, wait ? "waited for the grace period" : "no wait");
+               (unsigned long long)freed_bytes, n_kept, (unsigned long long)max_epoch, how);
 }
 
 /* entry に属する物 obj を、世代 epoch の猶予期間が過ぎ、かつ entry が転送の受信中でなくなってから free_fn(obj) で解放する

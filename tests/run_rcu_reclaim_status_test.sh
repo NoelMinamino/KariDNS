@@ -155,7 +155,7 @@ else
     # (a full reload: every zone file read again; it waited 60 s for this reader before 0.7)
     reload_ok "a full reload during the hold answers at once"
     t0=$(now_ms); R=$(ctl reload); t1=$(now_ms)
-    case "$R" in *"reload postponed"*) [ $((t1 - t0)) -lt 2000 ] && pass "a second reload answers at once ($((t1 - t0)) ms): postponed while the reader may hold the configuration's other buffer" || fail "the second reload took $((t1 - t0)) ms" ;; *) fail "the second reload: '$R'" ;; esac
+    case "$R" in *"reload postponed"*) [ $((t1 - t0)) -lt 5500 ] && pass "a second reload answers after the wait for the readers of normal operation ($((t1 - t0)) ms, at most 5 s): postponed while the reader may hold the configuration's other buffer" || fail "the second reload took $((t1 - t0)) ms" ;; *) fail "the second reload: '$R'" ;; esac
     i=0; while [ "$(status_num "retired zone snapshots waiting")" != "1" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
     W=$(status_num "retired zone snapshots waiting")
     [ "$W" = "1" ] && pass "after the reload the old snapshot waits for the reader (retired zone snapshots waiting: 1)" || fail "after the reload: '$W' snapshots waiting"

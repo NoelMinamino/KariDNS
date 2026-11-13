@@ -1517,6 +1517,7 @@ void *async_io_worker_func(void *arg);
 config_reload_result_t reload_all_zones(void);
 config_reload_result_t perform_config_reload(void);
 config_reload_result_t perform_config_reload_ext(bool skip_unchanged);
+int reload_readers_wait_ms(const server_config_t *cfg);   /* 0.7: how long an explicit reload waits for the readers of the configuration before */
 void escape_qname_for_log(const char *src, char *dst, size_t dst_size);
 void write_query_log(worker_ctx_t *ctx, const void *client_addr, socklen_t addr_len,
                      const char *qname, uint16_t qclass, uint16_t qtype,

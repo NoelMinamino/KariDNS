@@ -96,6 +96,7 @@ my %HANDLERS = (
     'trunc-rdata'  => \&build_truncated_rdata_response,
     'oversized'    => \&build_oversized_response,
     'drop'         => \&build_nodata_response,
+    'slow'         => sub { select(undef, undef, undef, 1.5); return build_normal_a_response(@_); },   # (a plugin that takes 1.5 s: run_reload_long_reader_test.sh)
 );
 
 sub read_raw_line {

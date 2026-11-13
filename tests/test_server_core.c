@@ -4575,6 +4575,31 @@ static void test_crypto_prewarm_survives_capability_mode(void) {
 #endif
 }
 
+/* 0.7: how long an explicit reload waits for the readers of the configuration before: the longest program-timeout or forward-timeout of the
+ * configuration plus 500 ms, at least 1 s, at most 5 s */
+static void test_reload_readers_wait_ms(void) {
+    printf("[TEST] Server Core: reload_readers_wait_ms() from program-timeout / forward-timeout...\n");
+    assert(reload_readers_wait_ms(NULL) == 1000);
+    static const struct { const char *conf; int ms; } c[] = {
+        { "zone \"p.test\" { type master; file \"p.zone\"; };\n", 1000 },
+        { "options { allow-program-zones yes; };\nzone \"p.test\" { type program; program \"/bin/cat\"; };\n", 2500 },
+        { "options { allow-program-zones yes; };\nzone \"p.test\" { type program; program \"/bin/cat\"; program-timeout 3000; };\n"
+          "zone \"f.test\" { type forward; forwarders { 192.0.2.1; }; forward-timeout 1200; };\n", 3500 },
+        { "zone \"f.test\" { type forward; forwarders { 192.0.2.1; }; forward-timeout 100; };\n", 1000 },
+        { "zone \"f.test\" { type forward; forwarders { 192.0.2.1; }; forward-timeout 9000; };\n", 5000 },
+    };
+    for (size_t i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        server_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        assert(parse_named_conf(c[i].conf, &cfg) == 0);
+        int ms = reload_readers_wait_ms(&cfg);
+        if (ms != c[i].ms) printf("  case %zu: %d ms, expected %d\n", i, ms, c[i].ms);
+        assert(ms == c[i].ms);
+        free_server_config_fields(&cfg);
+    }
+    printf("  -> reload_readers_wait_ms passed.\n");
+}
+
 static void test_perform_config_reload_valid_and_diff(void) {
     printf("[TEST] Server Core: perform_config_reload with valid zone files and AST updates...\n");
     char conf_path[256];
@@ -8064,6 +8089,7 @@ int main(void) {
     test_meta_types_and_utils_helpers();
     test_setup_ipc_tables_and_reload_error_paths();
     test_perform_config_reload_valid_and_diff();
+    test_reload_readers_wait_ms();
     test_active_broker_connect_loop();
     test_broker_connect_reply_handling();
     test_broker_connect_opts_and_xfr_tcp_sockopts();
