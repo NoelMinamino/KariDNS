@@ -497,6 +497,7 @@ typedef struct zone_db_entry_s {
    * last_successful_transfer + expire (従来どおり SOA EXPIRE で数える)。 */
   _Atomic(time_t) expire_at;
   _Atomic(time_t) last_stale_log_time;
+  _Atomic(time_t) last_denial_gap_log;   /* 0.7 (audit): when a missing NSEC / NSEC3 proof of this zone was last logged (dns_query_engine.c note_denial_gap()) */
   time_t last_loaded_mtime;
   off_t last_loaded_size;        /* with the mtime: a reload re-reads a file only when one of them changed (reload_master_zone()) */
   /* 他のゾーンがこのゾーンの名前をグルーに使っている (prelink が印を付ける)。公開時に
