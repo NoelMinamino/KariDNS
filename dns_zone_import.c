@@ -16,10 +16,12 @@
 #include "dns_zone_rows.h"
 #include "dns_zone_export.h"
 #include "dns_zone_lint.h"
+#include "dns_zone_parser.h"
 #include "dns_wire.h"
 
 #define ZI_STDIN_NAME "standard input"
 #define ZI_STDIN_MAX ((size_t)64 << 20)             /* the limit of karicheck for a zone on standard input */
+#define ZI_FILE_MAX ZONE_INCLUDE_MAX_BYTES         /* 0.7 (audit Low): a file as large as the server reads (KARIDNS_MAX_CONFIG_FILE_SIZE, its $INCLUDE limit too) */
 
 struct zi_s {
     zi_opts_t o;
@@ -167,7 +169,9 @@ zi_t *zi_open(const zi_opts_t *o) {
 
 typedef struct { char *text; size_t len; time_t mtime; const char *shown; bool from_file; } zi_text_t;     /* from_file: shown is a real path ( is read from its directory) */
 
-static bool zi_read_fd(zi_t *z, int fd, size_t size_hint, size_t max, const char *shown, zi_text_t *t) {
+/* max: the limit of the input (ZI_STDIN_MAX on standard input, ZI_FILE_MAX for a file); a file that grows past it while it is read is refused
+ * as one that was too large when it was examined */
+static bool zi_read_fd(zi_t *z, int fd, size_t size_hint, size_t max, bool from_stdin, const char *shown, zi_text_t *t) {
     size_t cap = size_hint ? size_hint + 1 : 65536, len = 0;
     char *buf = malloc(cap + 1);
     if (!buf) {
@@ -182,7 +186,8 @@ static bool zi_read_fd(zi_t *z, int fd, size_t size_hint, size_t max, const char
                 while ((more = read(fd, &probe, 1)) < 0 && errno == EINTR) {}
                 if (more == 0) break;
                 free(buf);
-                ZI_ERR(z, DC_IO_STDIN_TOO_LARGE, shown, "The zone text on standard input is larger than %zu bytes", max);
+                if (from_stdin) ZI_ERR(z, DC_IO_STDIN_TOO_LARGE, shown, "The zone text on standard input is larger than %zu bytes", max);
+                else ZI_ERR(z, DC_IO_FILE_TOO_LARGE, shown, "%s is larger than %zu bytes (the largest zone file the server reads)", shown, max);
                 return false;
             }
             size_t nc = cap * 2;
@@ -200,7 +205,7 @@ static bool zi_read_fd(zi_t *z, int fd, size_t size_hint, size_t max, const char
         if (got < 0) {
             int e = errno;
             free(buf);
-            if (max) ZI_ERR(z, DC_IO_STDIN_READ, shown, "Could not read standard input: %s", strerror(e));
+            if (from_stdin) ZI_ERR(z, DC_IO_STDIN_READ, shown, "Could not read standard input: %s", strerror(e));
             else ZI_ERR(z, DC_IO_READ, shown, "Could not read %s: %s", shown, strerror(e));
             return false;
         }
@@ -229,7 +234,7 @@ static bool zi_get_text(zi_t *z, const zi_input_t *in, zi_text_t *t) {
         t->mtime = in->mtime;
     } else if (in->path && strcmp(in->path, "-") == 0) {
         t->shown = ZI_STDIN_NAME;
-        if (!zi_read_fd(z, 0, 0, ZI_STDIN_MAX, t->shown, t)) return false;
+        if (!zi_read_fd(z, 0, 0, ZI_STDIN_MAX, true, t->shown, t)) return false;
         t->mtime = in->mtime;
     } else if (in->path) {
         t->shown = in->path;
@@ -250,7 +255,12 @@ static bool zi_get_text(zi_t *z, const zi_input_t *in, zi_text_t *t) {
             close(fd);
             return false;
         }
-        bool ok = zi_read_fd(z, fd, sb.st_size > 0 ? (size_t)sb.st_size : 0, 0, in->path, t);
+        if ((uint64_t)sb.st_size > (uint64_t)ZI_FILE_MAX) {
+            ZI_ERR(z, DC_IO_FILE_TOO_LARGE, in->path, "%s is larger than %zu bytes (the largest zone file the server reads)", in->path, ZI_FILE_MAX);
+            close(fd);
+            return false;
+        }
+        bool ok = zi_read_fd(z, fd, sb.st_size > 0 ? (size_t)sb.st_size : 0, ZI_FILE_MAX, false, in->path, t);
         close(fd);
         if (!ok) return false;
         t->mtime = sb.st_mtime;

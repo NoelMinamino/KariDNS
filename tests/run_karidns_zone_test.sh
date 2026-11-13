@@ -437,6 +437,12 @@ errhas "...says so" "not a regular file"
 expectc "a configuration larger than 16 MiB" 1 "$T/big.conf" import example.test "$T/ex.zone"
 errhas "...says so" "larger than"
 rm -f "$T/big.conf"
+# 0.7 (audit Low): a zone file is held to the size the server reads (256 MiB), as standard input is to 64 MiB; a sparse file, refused
+# from its size before anything is read
+truncate -s 268435457 "$T/huge.zone"
+expect "a zone file larger than 256 MiB" 1 import huge.test "$T/huge.zone"
+errhas "...says so" "is larger than 268435456 bytes"
+rm -f "$T/huge.zone"
 if [ ! -e /usr/local/etc/karidns/karidns.conf ] && [ ! -e /usr/local/etc/karidns.conf ]; then
     mkzone "$T/dd2.zone" dd2.test. 1
     run "without -c and without a default configuration, --sqlite3 is enough" 0 import --sqlite3 "$DB" dd2.test "$T/dd2.zone"

@@ -299,6 +299,7 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `io.stat` | error | a file could not be examined with stat |
 | `io.stdin.read` | error | reading standard input failed |
 | `io.stdin.too-large` | error | the zone text on standard input is larger than 64 MiB |
+| `io.file.too-large` | error | a configuration or zone file is larger than the server reads (256 MiB) |
 | `io.pipe` | error | a pipe for the database loader could not be created |
 | `io.fork` | error | the database loader could not be started |
 | `internal.oom` | error | out of memory |

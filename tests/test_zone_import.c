@@ -1132,6 +1132,21 @@ static void t_inputs(void) {
     CHECK(strstr(g_log, "$INCLUDE file could not be read") != NULL);
     unlink(lnk);
     unlink(fifo);
+    /* 0.7 (audit Low): a zone file larger than the server reads (256 MiB) is refused from its size, as standard input is above 64 MiB
+     * (a sparse file: nothing is read) */
+    {
+        char huge[600];
+        snprintf(huge, sizeof(huge), "%s/huge.zone", g_dir);
+        int hf = open(huge, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        CHECK(hf >= 0 && ftruncate(hf, (off_t)268435457) == 0);
+        if (hf >= 0) close(hf);
+        zi_input_t hin = { huge, NULL, 0, 0 };
+        log_reset();
+        CHECK(z && zi_import_zone(z, &hin, NULL, &r) == ZI_FAIL);
+        LOG_HAS("io.file.too-large");
+        CHECK(strstr(g_log, "is larger than 268435456 bytes") != NULL);
+        unlink(huge);
+    }
     /* standard input: the text of a file on file descriptor 0; $INCLUDE is refused */
     write_file(path, "$ORIGIN stdin.test.\n$TTL 300\n@ IN SOA ns1 hostmaster 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n", 0644);
     int saved = dup(0), fd = open(path, O_RDONLY);
