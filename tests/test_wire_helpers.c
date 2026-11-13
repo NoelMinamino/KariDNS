@@ -2430,7 +2430,7 @@ static void test_wire_zone_parser_caa_and_https_records(void) {
     printf("[TEST] Zone Parser: CAA and HTTPS SVCB records...\n");
     zone_arena_t arena; zone_arena_init(&arena);
     parse_context_t ctx; memset(&ctx, 0, sizeof(ctx)); ctx.default_origin = "example.com.";
-    const char *zstr = "@ IN CAA 0 issue \"letsencrypt.org\"\n@ IN HTTPS 1 . alpn=\"h2,h3\"\n";
+    const char *zstr = "@ IN CAA 0 issue \"ca.example.test\"\n@ IN HTTPS 1 . alpn=\"h2,h3\"\n";
     char *b = arena_strdup(&arena, zstr);
     int count = parse_zone_fast(b, strlen(b), &arena, &ctx);
     CHECK(count >= 2);
@@ -2451,7 +2451,7 @@ static void test_wire_tinydns_parser_generic_colon_prefix(void) {
     printf("[TEST] TinyDNS Parser: ':' generic record line parsing...\n");
     zone_arena_t arena; zone_arena_init(&arena);
     parse_context_t ctx; memset(&ctx, 0, sizeof(ctx));
-    char data[] = ":example.com:257:\\000\\005issueletsencrypt.org:300\n";
+    char data[] = ":example.com:257:\\000\\005issueca.example.test:300\n";
     int count = parse_tinydns_data(data, strlen(data), &arena, &ctx);
     CHECK(count >= 0);
     zone_arena_destroy(&arena);

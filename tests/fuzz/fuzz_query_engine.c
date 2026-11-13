@@ -96,7 +96,7 @@ static const char g_main_zone_text[] =
     "example.com. IN AAAA 2001:db8::1\n"
     "example.com. IN MX 10 mail.example.com.\n"
     "example.com. IN TXT \"v=spf1 -all\"\n"
-    "example.com. IN CAA 0 issue \"letsencrypt.org\"\n"
+    "example.com. IN CAA 0 issue \"ca.example.test\"\n"
     "ns1.example.com. IN A 192.0.2.2\n"
     "ns2.example.com. IN A 192.0.2.3\n"
     "mail.example.com. IN A 192.0.2.10\n"

@@ -1174,7 +1174,7 @@ static const char *RR_LINES[] = {
     "IN APL 1:192.168.0.0/24 !2:2001:db8::/32 1:0.0.0.0/0 2:::/0", "IN AVC \"app-name:x\"",
     "IN AMTRELAY 10 0 1 192.0.2.2", "IN AMTRELAY 10 1 2 2001:db8::2",
     "IN AMTRELAY 10 0 3 relay.example.", "IN AMTRELAY 10 0 0 .",
-    "IN CAA 0 issue \"letsencrypt.org\"", "IN CAA 128 iodef \"mailto:a@example\"",
+    "IN CAA 0 issue \"ca.example.test\"", "IN CAA 128 iodef \"mailto:a@example\"",
     "IN CDS 12345 8 2 AABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899",
     "IN CDNSKEY 257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ==",
     "IN CERT 1 12345 8 AQIDBAUG", "IN CERT PKIX 1 RSASHA256 AQIDBAUG", "IN CNAME target.example.", "IN CSYNC 66 3 A NS AAAA",

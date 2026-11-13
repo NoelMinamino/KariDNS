@@ -1619,7 +1619,7 @@ int main() {
             .type_code = 257,
             .ttl_value = 3600,
             .rdata_count = 3,
-            .rdata = (char *[]){ "0", long_tag, "letsencrypt.org" }
+            .rdata = (char *[]){ "0", long_tag, "ca.example.test" }
         };
         if (serialize_dns_record(buf, sizeof(buf), &off, &caa_rec, &c, NULL, 0) != -1) {
             printf("FAIL: CAA tag_len > 255 was not rejected\n");

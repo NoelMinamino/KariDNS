@@ -126,7 +126,7 @@ static const char *ROUNDTRIP_LINES[] = {
     "IN AMTRELAY 10 1 2 2001:db8::2",
     "IN AMTRELAY 10 0 3 relay.example.",
     "IN AMTRELAY 10 0 0 .",
-    "IN CAA 0 issue \"letsencrypt.org\"",
+    "IN CAA 0 issue \"ca.example.test\"",
     "IN CDS 12345 8 2 AABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899",
     "IN CDNSKEY 257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ==",
     "IN CERT 1 12345 8 AQIDBAUG",

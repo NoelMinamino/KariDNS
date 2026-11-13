@@ -121,7 +121,7 @@ ns1     IN SSHFP 4 2 (
 ; ----------------------------------------------------------------------------
 ; CAA
 ; ----------------------------------------------------------------------------
-@       IN CAA 0 issue "letsencrypt.org"
+@       IN CAA 0 issue "ca.example.test"
 @       IN CAA 0 issuewild ";"
 @       IN CAA 0 iodef "mailto:security@example.com"
 
@@ -287,7 +287,7 @@ www.example.com. IN NSEC mail.example.com. A AAAA RRSIG NSEC
 @ IN NSEC3PARAM 1 0 10 AABBCCDD
 
 ; ZONEMD: ゾーン全体の内容から計算するダイジェスト
-@       IN ZONEMD 2026071001 1 1 a89448daa3525cf7a5192db756f8366fe5bcfb1e5d49ee7f088f530ed78f074df1e05dc56dd8fac9ac6736ba568a7021
+@       IN ZONEMD 2026071001 1 1 75d9aa9904de6f2bd83bb7814616f7cc0524e4d099c8f1485bff75087fc417d3a07b770b57cfd8fe0419cc8fe5aaf425
 
 ; CDS / CDNSKEY: 子ゾーンが親ゾーンにDS/DNSKEY更新を通知
 @       IN CDS     23534 13 2 fcdb742c06b9a17cd02ccd070f9b8f4a9376e1f1a34b960bfab565fbea4e01d8

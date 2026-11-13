@@ -22,7 +22,7 @@ host-cname  IN  CNAME   host-a.alltypes.test.
 host-ptr    IN  PTR     target.alltypes.test.
 host-srv    IN  SRV     0 5 5060 sip.alltypes.test.
 sip         IN  A       192.0.2.50
-host-caa    IN  CAA     0 issue "letsencrypt.org"
+host-caa    IN  CAA     0 issue "ca.example.test"
 host-naptr  IN  NAPTR   100 10 "U" "E2U+sip" "!^.*$!sip:info@alltypes.test!" .
 host-sshfp  IN  SSHFP   1 1 123456789abcdef67890123456789abcdef67890
 host-tlsa   IN  TLSA    3 1 1 d2ab16567042b3b0f3def420a2f47c00572b89657b42074ec6f66b622fbc7878

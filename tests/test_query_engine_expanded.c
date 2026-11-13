@@ -139,7 +139,7 @@ static void test_all_rr_types_and_resolution(void) {
         "@       IN MX    10 mail.example.com.\n"
         "mail    IN A     192.0.2.10\n"
         "@       IN TXT   \"v=spf1 -all\"\n"
-        "@       IN CAA   0 issue \"letsencrypt.org\"\n"
+        "@       IN CAA   0 issue \"ca.example.test\"\n"
         "ptr     IN PTR   target.example.com.\n"
         "_sip._tcp IN SRV 10 60 5060 srv.example.com.\n"
         "srv     IN A     192.0.2.30\n"
@@ -8987,7 +8987,7 @@ static void test_query_engine_feature_case_235(void) {
 
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "caa.example.", .is_standalone_mode = true, .err_out = &err };
-    const char ztext[] = "$ORIGIN caa.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n@ IN CAA 0 issue \"letsencrypt.org\"\n@ IN CAA 0 iodef \"mailto:security@example.com\"\nns1 IN A 192.0.2.1\n";
+    const char ztext[] = "$ORIGIN caa.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n@ IN CAA 0 issue \"ca.example.test\"\n@ IN CAA 0 iodef \"mailto:security@example.com\"\nns1 IN A 192.0.2.1\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
     assert(test_build_index(&arena, true) == 0);
 
