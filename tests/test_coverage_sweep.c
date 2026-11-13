@@ -1070,9 +1070,9 @@ static void test_engine_helper_edges(void) {
     compress_ctx_t cc; compress_ctx_init(&cc);
     uint8_t res[512];
     assert(find_delegation(NULL, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, &cnt, false,
-                           "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false) == false);
+                           "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false, NULL) == false);
     assert(find_delegation(zi, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, &cnt, false,
-                           "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false) == false);
+                           "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false, NULL) == false);
     assert(append_glue_records(NULL, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, ADDITIONAL_AUTH_YES, NULL, false));
     assert(append_glue_records(zi, NULL, "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, ADDITIONAL_AUTH_YES, NULL, false));
     assert(append_glue_records(zi, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, ADDITIONAL_AUTH_NO, NULL, false));

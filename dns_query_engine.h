@@ -212,7 +212,8 @@ bool find_delegation(const zone_image_t *img, const char *qname,
                      const char *client_loc_tag,
                      additional_from_auth_t policy,
                      const glue_sibling_ctx_t *sib_ctx,
-                     bool dnssec_ok);
+                     bool dnssec_ok,
+                     zone_db_entry_t *gap_entry);   /* 0.7: the entry a missing proof is said for (note_denial_gap()), NULL: not said */
 int build_synthetic_servfail(const uint8_t *req, size_t req_len,
                              uint8_t *res, size_t max_res_len);
 bool question_section_matches(const uint8_t *resp, size_t resp_len,

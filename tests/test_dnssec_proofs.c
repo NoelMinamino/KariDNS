@@ -23,6 +23,8 @@
 #include "dns_query_engine.h"
 #include "dns_server_internal.h"
 #include "dns_dynamic_update.h"
+#include "dns_log.h"   /* logev_set_mask(), LOGC_DNSSEC (the Opt-Out test) */
+#undef syslog         /* this file defines its own syslog() stub */
 
 // Prototypes for internal query engine functions under test
 void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
@@ -1927,11 +1929,188 @@ static void test_wildcard_cname_chain_proofs_nsec3(void) {
     printf("  -> two expansions, two NSEC3 proofs.\n");
 }
 
+/* ---- 0.7 (review): NSEC3 Opt-Out, an empty non-terminal above an insecure delegation (RFC 5155 6, 7.1, 7.2.1, 7.2.2, 7.2.4, 7.2.7) ----
+ * oo.test: b.oo.test exists only because of the insecure delegation c.b.oo.test, so it has no NSEC3 (7.1: "unless the empty non-terminal
+ * is only derived from an insecure delegation covered by an Opt-Out NSEC3 RR"); d.oo.test is an insecure delegation; w and v are empty
+ * non-terminals of wildcards (authoritative: they have NSEC3).  The proofs name the closest PROVABLE encloser (7.2.1), here the apex, and
+ * the NSEC3 that covers the next closer name b.oo.test (8.3: the longest ancestor matched, the name one label longer covered).  Without
+ * the Opt-Out flag the same zone lacks NSEC3 RRs it must have: the gap is said (note_denial_gap(); e->last_denial_gap_log). */
+typedef struct { const char *name; const char *types; char hash[33]; } oo_name_t;
+static int oo_cmp(const void *a, const void *b) { return strcmp(((const oo_name_t *)a)->hash, ((const oo_name_t *)b)->hash); }
+static oo_name_t g_oo[] = {
+    { "oo.test.", " NS SOA RRSIG NSEC3PARAM", "" }, { "ns1.oo.test.", " A RRSIG", "" }, { "a.oo.test.", " A RRSIG", "" },
+    { "cn.oo.test.", " CNAME RRSIG", "" }, { "w.oo.test.", "", "" }, { "*.w.oo.test.", " A RRSIG", "" },
+    { "v.oo.test.", "", "" }, { "*.v.oo.test.", " CNAME RRSIG", "" },
+};
+#define OO_N (sizeof(g_oo) / sizeof(g_oo[0]))
+
+static void oo_hash(const char *name, char out[33]) {
+    assert(compute_nsec3_hash(name, 1, 0, (const uint8_t *)"", 0, out, 33));
+    for (char *p = out; *p; p++) *p = (char)toupper((unsigned char)*p);
+}
+/* the hash of `name` when an NSEC3 of the chain has it as owner, else the owner hash of the NSEC3 that covers it (the chain is complete) */
+static const char *oo_proof(const char *name) {
+    static char ret[8][33];
+    static int k;
+    char h[33];
+    oo_hash(name, h);
+    const char *best = g_oo[OO_N - 1].hash;            /* below the first owner: the last one covers it (the chain wraps) */
+    for (size_t i = 0; i < OO_N; i++)
+        if (strcmp(g_oo[i].hash, h) <= 0) best = g_oo[i].hash;
+    char *o = ret[k++ & 7];
+    memcpy(o, best, 33);
+    return o;
+}
+static bool oo_owner(const char *have, const char *hash) {
+    return strncasecmp(have, hash, 32) == 0 && strcasecmp(have + 32, ".oo.test.") == 0;
+}
+/* the NSEC3 RRs of the Authority section are exactly the set {h1, h2, h3} (NULL: none; one record may serve two parts of a proof) */
+static void oo_expect_hashes(const gr_resp_t *r, const char *what, const char *h1, const char *h2, const char *h3) {
+    const char *w[3] = { h1, h2, h3 };
+    const char *u[3];
+    size_t n = 0;
+    for (int i = 0; i < 3; i++) {
+        if (!w[i]) continue;
+        bool dup = false;
+        for (size_t j = 0; j < n; j++) if (strcmp(u[j], w[i]) == 0) dup = true;
+        if (!dup) u[n++] = w[i];
+    }
+    int have = 0;
+    for (int i = 0; i < r->nrr; i++) {
+        if (r->rr[i].sect != 2 || r->rr[i].type != 50) continue;
+        have++;
+        bool ok = false;
+        for (size_t j = 0; j < n; j++) if (oo_owner(r->rr[i].name, u[j])) ok = true;
+        if (!ok) { fprintf(stderr, "%s: unexpected NSEC3 %s\n", what, r->rr[i].name); dump_resp(r); assert(0); }
+    }
+    if ((size_t)have != n) { fprintf(stderr, "%s: %d NSEC3 RRs, %zu expected\n", what, have, n); dump_resp(r); assert(0); }
+}
+
+static void oo_setup(int opt_out) {
+    for (size_t i = 0; i < OO_N; i++) oo_hash(g_oo[i].name, g_oo[i].hash);
+    qsort(g_oo, OO_N, sizeof(g_oo[0]), oo_cmp);
+    static char zone[16384];
+    int w = snprintf(zone, sizeof(zone),
+        "$ORIGIN oo.test.\n$TTL 300\n"
+        "@ SOA ns1 h 1 3600 600 86400 60\n"
+        "@ RRSIG SOA 8 2 300 " P9_SIG " oo.test. AAAAAAAA\n"
+        "@ NS ns1\n"
+        "@ RRSIG NS 8 2 300 " P9_SIG " oo.test. AAAAAAAA\n"
+        "@ NSEC3PARAM 1 0 0 -\n"
+        "@ RRSIG NSEC3PARAM 8 2 300 " P9_SIG " oo.test. AAAAAAAA\n"
+        "ns1 A 192.0.2.1\n"
+        "ns1 RRSIG A 8 3 300 " P9_SIG " oo.test. AAAAAAAA\n"
+        "a A 192.0.2.2\n"
+        "a RRSIG A 8 3 300 " P9_SIG " oo.test. AAAAAAAA\n"
+        "c.b NS ns.out.test.\n"              /* insecure; b.oo.test is an empty non-terminal made only by it */
+        "d NS ns.out.test.\n"                /* insecure */
+        "cn CNAME x.w.oo.test.\n"            /* a CNAME to a name that a wildcard makes */
+        "cn RRSIG CNAME 8 3 300 " P9_SIG " oo.test. AAAAAAAA\n"
+        "*.w A 192.0.2.5\n"
+        "*.w RRSIG A 8 3 300 " P9_SIG " oo.test. AAAAAAAA\n"
+        "*.v CNAME a.oo.test.\n"             /* a wildcard CNAME */
+        "*.v RRSIG CNAME 8 3 300 " P9_SIG " oo.test. AAAAAAAA\n");
+    assert(w > 0);
+    for (size_t i = 0; i < OO_N; i++) {
+        int x = snprintf(zone + w, sizeof(zone) - (size_t)w, "%s NSEC3 1 %d 0 - %s%s\n%s RRSIG NSEC3 8 3 300 " P9_SIG " oo.test. AAAAAAAA\n",
+                         g_oo[i].hash, opt_out, g_oo[(i + 1) % OO_N].hash, g_oo[i].types, g_oo[i].hash);
+        assert(x > 0 && (size_t)x < sizeof(zone) - (size_t)w);
+        w += x;
+    }
+    gr_setup("oo.test.", zone);
+}
+
+static void oo_query(const char *qname, uint16_t qtype, gr_resp_t *r) {
+    atomic_store_explicit(&g_gr.entry.last_denial_gap_log, 0, memory_order_relaxed);
+    gr_query(qname, qtype, true, r);
+}
+static bool oo_gap_said(void) { return atomic_load_explicit(&g_gr.entry.last_denial_gap_log, memory_order_relaxed) != 0; }
+
+static void test_nsec3_optout_empty_non_terminal(void) {
+    printf("[TEST] DNSSEC: NSEC3 Opt-Out: the closest provable encloser above an empty non-terminal (RFC 5155 7.2.1)...\n");
+    uint32_t saved_mask = atomic_load_explicit(&g_logev_mask[LOGC_DNSSEC], memory_order_relaxed);
+    logev_set_mask(LOGC_DNSSEC, LOGEV_BIT(LOG_LVL_WARNING));   /* note_denial_gap() looks only when the category takes warnings */
+    gr_resp_t r;
+    oo_setup(1);
+    char h_apex[33];
+    oo_hash("oo.test.", h_apex);
+
+    /* name error below the empty non-terminal (7.2.2): the apex matched, b.oo.test covered, *.oo.test covered.  (7361f26: the encloser was
+     * b.oo.test, which no NSEC3 matches, with x.b and *.b covered: no closest encloser proof that a validator accepts, 8.3 / 8.4.) */
+    oo_query("x.b.oo.test.", 1, &r);
+    CHECK(&r, r.rcode == 3 && r.aa && gr_count(&r, 2, 6) == 1);
+    oo_expect_hashes(&r, "NXDOMAIN below an Opt-Out ENT", h_apex, oo_proof("b.oo.test."), oo_proof("*.oo.test."));
+    CHECK(&r, !oo_gap_said());
+    /* two labels below: the same encloser and next closer name */
+    oo_query("y.x.b.oo.test.", 1, &r);
+    CHECK(&r, r.rcode == 3);
+    oo_expect_hashes(&r, "NXDOMAIN two labels below the ENT", h_apex, oo_proof("b.oo.test."), oo_proof("*.oo.test."));
+    /* a name error beside the authoritative names keeps its closest encloser: the apex matched, q.oo.test covered */
+    oo_query("q.oo.test.", 1, &r);
+    CHECK(&r, r.rcode == 3);
+    oo_expect_hashes(&r, "NXDOMAIN at the apex", h_apex, oo_proof("q.oo.test."), oo_proof("*.oo.test."));
+    CHECK(&r, !oo_gap_said());
+
+    /* DS at the delegation under the ENT (7.2.4): the closest provable encloser proof, next closer b.oo.test (an Opt-Out cover) */
+    oo_query("c.b.oo.test.", 43, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && gr_count(&r, 1, -1) == 0 && gr_count(&r, 2, 6) == 1);
+    oo_expect_hashes(&r, "DS at c.b (7.2.4)", h_apex, oo_proof("b.oo.test."), NULL);
+    CHECK(&r, !oo_gap_said());
+    /* the referral to it (7.2.7) */
+    oo_query("www.c.b.oo.test.", 1, &r);
+    CHECK(&r, r.rcode == 0 && !r.aa && gr_count(&r, 2, 2) == 1);
+    oo_expect_hashes(&r, "referral to c.b (7.2.7)", h_apex, oo_proof("b.oo.test."), NULL);
+    CHECK(&r, !oo_gap_said());
+    /* DS at, and a referral to, the delegation right below the apex: next closer d.oo.test */
+    oo_query("d.oo.test.", 43, &r);
+    CHECK(&r, r.rcode == 0 && r.aa);
+    oo_expect_hashes(&r, "DS at d (7.2.4)", h_apex, oo_proof("d.oo.test."), NULL);
+    oo_query("www.d.oo.test.", 1, &r);
+    CHECK(&r, r.rcode == 0 && !r.aa);
+    oo_expect_hashes(&r, "referral to d (7.2.7)", h_apex, oo_proof("d.oo.test."), NULL);
+    CHECK(&r, !oo_gap_said());
+
+    /* no data at the ENT itself: no NSEC3 matches it, and 7.2.3 has no other proof: the answer carries none (unchanged), and nothing is
+     * said (the zone is right; see the report of this review for the options) */
+    oo_query("b.oo.test.", 1, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && gr_count(&r, 1, -1) == 0 && gr_count(&r, 2, 6) == 1 && gr_count(&r, 2, 50) == 0);
+    CHECK(&r, !oo_gap_said());
+
+    /* a CNAME to a name that a wildcard makes (7.2.6 for x.w.oo.test: the cover of its next closer name) */
+    oo_query("cn.oo.test.", 1, &r);
+    CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 5) == 1 && gr_count(&r, 1, 1) == 1);
+    CHECK(&r, wcn3_has_owner_hash(&r, 2, oo_proof("x.w.oo.test.")));
+    CHECK(&r, !oo_gap_said());
+    /* a wildcard CNAME: the proof of the expansion on the way (7.2.6) */
+    oo_query("z.v.oo.test.", 1, &r);
+    CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 5) == 1 && gr_count(&r, 1, 1) == 1);
+    CHECK(&r, wcn3_has_owner_hash(&r, 2, oo_proof("z.v.oo.test.")));
+    CHECK(&r, !oo_gap_said());
+    zone_arena_destroy(&g_gr.arena);
+
+    /* the same zone without the Opt-Out flag: b, c.b and d lack the NSEC3 RRs they must have (RFC 5155 6, 7.1): said, the answers as before */
+    oo_setup(0);
+    oo_query("c.b.oo.test.", 43, &r);
+    CHECK(&r, r.rcode == 0 && oo_gap_said());
+    oo_query("www.d.oo.test.", 1, &r);
+    CHECK(&r, r.rcode == 0 && !r.aa && oo_gap_said());
+    oo_query("x.b.oo.test.", 1, &r);
+    CHECK(&r, r.rcode == 3 && oo_gap_said());
+    oo_query("b.oo.test.", 1, &r);                   /* no data at a name without NSEC3 outside an Opt-Out span (7.2.3) */
+    CHECK(&r, r.rcode == 0 && oo_gap_said());
+    oo_query("q.oo.test.", 1, &r);                   /* a whole proof: nothing said */
+    CHECK(&r, r.rcode == 3 && !oo_gap_said());
+    zone_arena_destroy(&g_gr.arena);
+    logev_set_mask(LOGC_DNSSEC, saved_mask);
+    printf("  -> closest provable encloser proofs; gaps said only without Opt-Out.\n");
+}
+
 int main(void) {
     printf("=== Starting DNSSEC Negative-Proof Tests ===\n");
     test_cname_owner_nsec_rrsig_questions();
     test_wildcard_cname_chain_proofs_nsec();
     test_wildcard_cname_chain_proofs_nsec3();
+    test_nsec3_optout_empty_non_terminal();
     test_dnssec_wire_decode_roundtrip();
     test_dnssec_wire_decode_usable();
     test_dnssec_wire_decode_malformed();

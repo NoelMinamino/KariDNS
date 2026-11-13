@@ -10,8 +10,16 @@
 #              at the name); five queries give one line (the minute of the zone).
 #   gap3.test  NSEC3, the NSEC3 of the apex removed: NXDOMAIN for x.gap3.test (no NSEC3 of the closest encloser).
 #   ok.test, ok3.test  the same zones whole (NSEC, NSEC3) with a wildcard: NXDOMAIN, NODATA, wildcard answer and wildcard NODATA log nothing.
+#   oo3.test   NSEC3 Opt-Out (dnssec-signzone -A), whole: the insecure delegations c.b.oo3.test (b.oo3.test is an empty non-terminal made
+#              only by it, without an NSEC3 of its own: RFC 5155 7.1) and d.oo3.test, a CNAME to a name a wildcard makes, a wildcard CNAME.
+#              Name error below b, DS at c.b and d, referrals to them, no data at b, the CNAMEs: nothing is logged, and the name error, the
+#              DS answers and the referrals carry the closest provable encloser proof (RFC 5155 7.2.1: the NSEC3 of the apex, the Opt-Out NSEC3
+#              that covers b.oo3.test or d.oo3.test).  With delv (BIND 9.20) the name error and the DS answer under b validate with the zone's
+#              KSK as trust anchor ("fully validated").
+# "Nothing is logged" is proved with a marker: after the healthy queries one answer of gap.test is made that logs; when its line is in the
+# log, the lines of the earlier queries (the same Backend, the same logger) would be there as well.
 #
-# Needs dnssec-keygen, dnssec-signzone and nsec3hash; SKIP otherwise.
+# Needs dnssec-keygen, dnssec-signzone and nsec3hash; SKIP otherwise.  delv is optional (its checks SKIP without it).
 set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -66,6 +74,23 @@ EOF
                  dnssec-keygen -q -a ECDSAP256SHA256 "$z" >/dev/null 2>&1 ) || { echo "[SKIP] dnssec-keygen failed"; exit 0; }
     for k in "$W"/K"$z".+*.key; do echo "\$INCLUDE $k" >> "$W/$z.zone"; done
 done
+# oo3.test: NSEC3 Opt-Out; b.oo3.test is an empty non-terminal made only by the insecure delegation c.b.oo3.test
+cat > "$W/oo3.test.zone" <<'EOF'
+$TTL 300
+$ORIGIN oo3.test.
+@ IN SOA ns1 hostmaster 1 3600 600 86400 60
+@ IN NS ns1
+ns1 IN A 192.0.2.1
+a IN A 192.0.2.10
+c.b IN NS ns.out.example.
+d IN NS ns.out.example.
+cn IN CNAME x.w.oo3.test.
+*.w IN A 192.0.2.20
+*.v IN CNAME a.oo3.test.
+EOF
+( cd "$W" && dnssec-keygen -q -a ECDSAP256SHA256 -f KSK oo3.test > oo3.ksk 2>/dev/null &&
+             dnssec-keygen -q -a ECDSAP256SHA256 oo3.test >/dev/null 2>&1 ) || { echo "[SKIP] dnssec-keygen failed"; exit 0; }
+for k in "$W"/Koo3.test.+*.key; do echo "\$INCLUDE $k" >> "$W/oo3.test.zone"; done
 sign() {
     _z=$1; shift
     ( cd "$W" && dnssec-signzone -q -S -K . -O full "$@" -o "$_z" -f "$_z.signed" "$_z.zone" >/dev/null 2>&1 ) ||
@@ -75,6 +100,7 @@ sign gap.test
 sign ok.test
 sign gap3.test -3 AA11 -H 0
 sign ok3.test -3 AA11 -H 0
+sign oo3.test -3 - -A -H 0
 
 # the gaps: the NSEC of b.gap.test, the NSEC3 of the apex of gap3.test (the RRSIGs stay: they cover nothing then)
 awk '!($1 == "b.gap.test." && $4 == "NSEC")' "$W/gap.test.signed" > "$W/gap.test.cut"
@@ -91,6 +117,7 @@ zone "gap.test" { type master; file "$W/gap.test.cut"; };
 zone "gap3.test" { type master; file "$W/gap3.test.cut"; };
 zone "ok.test" { type master; file "$W/ok.test.signed"; };
 zone "ok3.test" { type master; file "$W/ok3.test.signed"; };
+zone "oo3.test" { type master; file "$W/oo3.test.signed"; };
 EOF
 
 "$BIN" -f "$W/k.conf" > "$W/server.log" 2>&1 &
@@ -106,6 +133,13 @@ ask() {
     "$DAG" "$1" "$2" @127.0.0.1 -p $PORT +dnssec +norec +nohexdump +tries=1 +time=2 2>/dev/null | sed -n 's/.*status: \([A-Z]*\),.*/\1/p'
 }
 
+# the owner hashes of the NSEC3 RRs in the Authority section of a DO=1 answer (upper case, one per line)
+n3_owners() {
+    "$DAG" "$1" "$2" @127.0.0.1 -p $PORT +dnssec +norec +nohexdump +tries=1 +time=2 2>/dev/null |
+        awk '$4 == "NSEC3" { h = toupper($1); sub(/\..*/, "", h); print h }' | sort -u
+}
+h3() { nsec3hash - 1 0 "$1" | awk '{ print toupper($1) }'; }
+
 # the healthy zones first: nothing may be said
 for z in ok.test ok3.test; do
     [ "$(ask "nx.$z" A)" = NXDOMAIN ] || bad "$z: NXDOMAIN expected"
@@ -113,16 +147,47 @@ for z in ok.test ok3.test; do
     [ "$(ask "x.w.$z" A)" = NOERROR ] || bad "$z: wildcard answer expected"
     [ "$(ask "x.w.$z" TXT)" = NOERROR ] || bad "$z: wildcard NODATA expected"
 done
-sleep 0.5
-if grep -q '\[DNSSEC\]' "$W/server.log"; then
-    grep '\[DNSSEC\]' "$W/server.log"
+# the Opt-Out zone: name error below the ENT, DS at and referrals to the delegations, no data at the ENT, the CNAMEs
+[ "$(ask x.b.oo3.test A)" = NXDOMAIN ] || bad "oo3.test: NXDOMAIN below the ENT expected"
+[ "$(ask c.b.oo3.test DS)" = NOERROR ] || bad "oo3.test: DS NODATA at c.b expected"
+[ "$(ask d.oo3.test DS)" = NOERROR ] || bad "oo3.test: DS NODATA at d expected"
+[ "$(ask www.c.b.oo3.test A)" = NOERROR ] || bad "oo3.test: referral to c.b expected"
+[ "$(ask www.d.oo3.test A)" = NOERROR ] || bad "oo3.test: referral to d expected"
+[ "$(ask b.oo3.test A)" = NOERROR ] || bad "oo3.test: NODATA at the ENT expected"
+[ "$(ask cn.oo3.test A)" = NOERROR ] || bad "oo3.test: CNAME to a wildcard name expected"
+[ "$(ask z.v.oo3.test A)" = NOERROR ] || bad "oo3.test: wildcard CNAME expected"
+# the marker: an answer of gap.test that logs; once its line is there, a line of the queries above would be too
+[ "$(ask bb.gap.test A)" = NXDOMAIN ] || bad "gap.test: NXDOMAIN expected"
+if ! kari_wait_log "$W/server.log" "\[DNSSEC\] zone 'gap.test'" 10; then
+    bad "the marker (a gap of gap.test) was not logged: the check below proves nothing"
+elif grep '\[DNSSEC\]' "$W/server.log" | grep -v "zone 'gap.test'"; then
     bad "a whole zone logged a missing proof"
 else
-    ok "whole NSEC and NSEC3 zones (NXDOMAIN, NODATA, wildcard answer, wildcard NODATA): nothing logged"
+    ok "whole NSEC, NSEC3 and NSEC3 Opt-Out zones (NXDOMAIN, NODATA, wildcard answer and NODATA, DS, referrals, CNAMEs): nothing logged before the marker"
+fi
+
+# the closest provable encloser proof of the Opt-Out zone (RFC 5155 7.2.1): the NSEC3 of the apex, and the cover of b.oo3.test / d.oo3.test
+HA=$(h3 oo3.test)
+for q in "x.b.oo3.test A" "c.b.oo3.test DS" "www.c.b.oo3.test A" "d.oo3.test DS" "www.d.oo3.test A"; do
+    # shellcheck disable=SC2086
+    if n3_owners $q | grep -qx "$HA"; then ok "oo3.test $q: the NSEC3 of the closest provable encloser (the apex)"
+    else bad "oo3.test $q: no NSEC3 of the apex: $(n3_owners $q | tr '\n' ' ')"; fi
+done
+if command -v delv >/dev/null 2>&1; then
+    awk '$4 == "DNSKEY" && $5 == 257 { printf "trust-anchors { \"oo3.test.\" static-key %s %s %s \"", $5, $6, $7; for (i = 8; i <= NF; i++) printf "%s", $i; print "\"; };" }' \
+        "$W/oo3.test.signed" > "$W/anchor.conf"
+    for q in "x.b.oo3.test A" "c.b.oo3.test DS" "d.oo3.test DS" "q.oo3.test A"; do
+        # shellcheck disable=SC2086
+        out=$(delv @127.0.0.1 -p $PORT -a "$W/anchor.conf" +root=oo3.test. $q 2>&1) || true
+        if printf '%s\n' "$out" | grep -q "negative response, fully validated"; then ok "delv: $q: fully validated"
+        else bad "delv: $q: $(printf '%s\n' "$out" | grep '^;' | tr '\n' ' ' | cut -c1-200)"; fi
+    done
+else
+    echo "[SKIP] delv is not installed: the Opt-Out proofs are not validated"
 fi
 
 # the gaps: the answers are unchanged (status), and one line per zone
-for n in 1 2 3; do
+for n in 1 2; do   # (the marker above was the first)
     [ "$(ask bb.gap.test A)" = NXDOMAIN ] || bad "gap.test: NXDOMAIN expected"
 done
 [ "$(ask b.gap.test TXT)" = NOERROR ] || bad "gap.test: NODATA expected"
@@ -145,6 +210,9 @@ n3=$(grep -c "\[DNSSEC\] zone 'gap3.test'" "$W/server.log" || true)
     bad "lines: gap.test $n1, gap3.test $n3 (1 each expected)"
 grep -q "KariDNS [0-9]* - - \[DNSSEC\]" "$W/server.log" && ok "at the default channel (default_syslog: warning passes)" ||
     bad "the line did not reach the default channel"
+# and at the end, after every line of the gaps came: still nothing of the whole zones
+if grep '\[DNSSEC\]' "$W/server.log" | grep -v "zone 'gap.test'\|zone 'gap3.test'"; then bad "a whole zone logged a missing proof (at the end)"
+else ok "at the end: lines of gap.test and gap3.test only"; fi
 grep -i "AddressSanitizer\|runtime error" "$W/server.log" && bad "sanitizer report"
 
 echo "Passed: $PASS  Failed: $FAIL"
