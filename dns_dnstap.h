@@ -100,6 +100,9 @@ void dnstap_enable_reconnect(const char *socket_path);
  * 双方向プロトコル)。終わるか timeout_ms が過ぎたら戻る。終わっていれば true。 */
 #define DNSTAP_SHUTDOWN_WAIT_MS 3000
 bool dnstap_shutdown(int timeout_ms);
+#ifdef KARIDNS_UNIT_TEST
+void dnstap_test_reset_stop(void);
+#endif
 
 /* 送信スレッドが送る直前に meta->query_zone を埋める関数を登録する (起動時、main())。
  * 実体は dns_query_engine.c の dnstap_fill_query_zone() (ゾーン DB を引く)。 */

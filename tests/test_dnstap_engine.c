@@ -705,8 +705,9 @@ static void test_dnstap_loss_counters(void) {
     dnstap_get_counters(&c);
     assert(c.queue_full == c0.queue_full + 3 + 5);
 
-    pthread_cancel(th);
+    assert(dnstap_shutdown(DNSTAP_SHUTDOWN_WAIT_MS));   /* not connected: the sender returns at once (no pthread_cancel: TSan) */
     pthread_join(th, NULL);
+    dnstap_test_reset_stop();
     atomic_store(&g_worker_ctxs, NULL);
     atomic_store(&g_worker_count, 0);
     free(worker.dnstap_ring.events);

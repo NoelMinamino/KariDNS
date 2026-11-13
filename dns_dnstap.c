@@ -447,6 +447,13 @@ bool dnstap_shutdown(int timeout_ms) {
     return atomic_load_explicit(&g_dnstap_stop_state, memory_order_acquire) == 2;
 }
 
+#ifdef KARIDNS_UNIT_TEST
+/* a unit test that stopped a sender with dnstap_shutdown() (rather than pthread_cancel(), which hangs under ThreadSanitizer) starts the next one */
+void dnstap_test_reset_stop(void) {
+    atomic_store_explicit(&g_dnstap_stop_state, 0, memory_order_release);
+}
+#endif
+
 static void (*g_dnstap_zone_filler)(dnstap_event_meta_t *, const uint8_t *, size_t);
 
 void dnstap_set_zone_filler(void (*fn)(dnstap_event_meta_t *, const uint8_t *, size_t)) {
