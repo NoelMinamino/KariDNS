@@ -16,6 +16,8 @@
 #      created empty at the start (and handed to the run user), written only above level 0; karictl trace / trace <n> / notrace and their
 #      errors, karictl status "debug level: N", the permission `trace` of a restricted key (and its refusal for a read-only key); karidns -d N
 #      (and its errors) with a `severity dynamic` channel that starts and stops writing the debug 3 lines of query-errors with the level
+#   S  KARIDNS_NOSYSLOG=1 (exported by lib_proc.sh): the syslog lines on stderr only, as LOG_PERROR prints them; without it they reach the
+#      system log (read where the host keeps daemon.info lines; SKIP otherwise)
 # Runs as root or as an ordinary user (the log directory is world-writable for the run user "nobody").
 # ==============================================================================
 set -u
@@ -54,9 +56,9 @@ fail() { echo "FAIL: $*"; FAILS=$((FAILS + 1)); }
 cleanup() {
     set +e
     kari_kill_tree $PIDS
-    for n in c1 q1 q2 q3 q4 x1 d1 d2; do kari_kill_conf "$W/$n.conf"; done
+    for n in c1 q1 q2 q3 q4 x1 d1 d2 s1 s2; do kari_kill_conf "$W/$n.conf"; done
     if [ "$FAILS" -ne 0 ]; then
-        for f in c1 q1 q2 q3 q4 x1 d1 d2; do echo "--- $f.log (tail)"; tail -25 "$W/$f.log" 2>/dev/null; done
+        for f in c1 q1 q2 q3 q4 x1 d1 d2 s1 s2; do echo "--- $f.log (tail)"; tail -25 "$W/$f.log" 2>/dev/null; done
     fi
     if [ -n "${KARI_KEEP_TMP:-}" ]; then echo "kept: $W"; else rm -rf "$W"; fi
 }
@@ -486,6 +488,40 @@ wait_grep 'www.three.other.test' "$LG/dyn.log" 10      # (the line of the query 
 grep -q 'www.three.other.test' "$LG/dyn.log" && ! grep -q 'www.two.other.test' "$LG/dyn.log" && pass "D: at level 2 the debug 3 lines are not written" || fail "D: a debug 3 line at level 2"
 [ $run_before = yes ] || [ ! -e "$PWD/karidns.run" ] && pass "D: without a directory no karidns.run is made (in the directory the server was started in)" || fail "D: a karidns.run without a directory"
 stop $D2PID
+
+# ------------------------------------------------------------------------------------------------ S: KARIDNS_NOSYSLOG
+# lib_proc.sh exports KARIDNS_NOSYSLOG=1: what the server gives syslog(3) goes to its stderr only, in the form of LOG_PERROR's copy.  s1 runs
+# with it, s2 without; each logs a query name of its own to the default category (default_syslog).  The system log files are read where the
+# host has them: s2's line must reach one of them (else the host keeps no daemon.info line where this test can read it: SKIP), s1's none.
+SYSLOGS=""
+for f in /var/log/messages /var/log/daemon.log /var/log/debug.log /var/log/all.log; do [ -r "$f" ] && SYSLOGS="$SYSLOGS $f"; done
+mkq s1 $P2 "querylog yes;" ""
+mkq s2 $P3 "querylog yes;" ""
+KARIDNS_NOSYSLOG=1 "$KARIDNS" -f "$W/s1.conf" > "$W/s1.log" 2>&1 &
+S1PID=$!; PIDS="$PIDS $S1PID"
+env -u KARIDNS_NOSYSLOG "$KARIDNS" -f "$W/s2.conf" > "$W/s2.log" 2>&1 &
+S2PID=$!; PIDS="$PIDS $S2PID"
+wait_up $P2 20 || fail "S: s1 did not start"
+wait_up $P3 20 || fail "S: s2 did not start"
+M1="nosyslog-on-$$.pri.test" M2="nosyslog-off-$$.pri.test"
+query $P2 "$M1"; query $P3 "$M2"
+wait_grep "query: $M1 IN A" "$W/s1.log" 10
+grep -Eq "^KariDNS [0-9]+ - - client 127.0.0.1#[0-9]+ \($M1\.\): query: $M1 IN A" "$W/s1.log" &&
+    pass "S: KARIDNS_NOSYSLOG=1: the syslog line is on stderr as LOG_PERROR prints it (KariDNS <pid> - - <text>)" || { fail "S: s1.log"; tail -5 "$W/s1.log"; }
+wait_grep "query: $M2 IN A" "$W/s2.log" 10 && pass "S: without it the stderr copy is there too" || fail "S: s2.log"
+if [ -z "$SYSLOGS" ]; then
+    echo "SKIP: S: no system log file to read"
+else
+    _i=0; while [ $_i -lt 10 ] && ! grep -q "$M2" $SYSLOGS 2>/dev/null; do sleep 1; _i=$((_i + 1)); done
+    if grep -q "$M2" $SYSLOGS 2>/dev/null; then
+        pass "S: without KARIDNS_NOSYSLOG the line reaches the system log"
+        grep -q "$M1" $SYSLOGS 2>/dev/null && fail "S: with KARIDNS_NOSYSLOG=1 the line reached the system log" || pass "S: with KARIDNS_NOSYSLOG=1 nothing reached the system log"
+    else
+        echo "SKIP: S: the host's syslog keeps no daemon.info line in a file this test can read ($SYSLOGS)"
+    fi
+fi
+stop $S1PID
+stop $S2PID
 
 echo "== $PASSES passed, $FAILS failed"
 [ "$FAILS" -eq 0 ]

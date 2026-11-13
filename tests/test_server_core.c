@@ -3918,6 +3918,39 @@ static void test_klog_destinations_and_batches(void) {
     assert(dflt && dflt[-1] == ' ' && dflt[-5] == '.');                           /* default_stderr prints the time: "28-Oct-2026 03:04:05.678 [Config] ..." */
     free(s);
     assert(klog_lines(errfile) == 1 + 1 + 600);                                   /* the notice, the default_stderr line, 600 batched lines */
+    /* 0.7 M4, KARIDNS_NOSYSLOG=1: the syslog channel's line goes to stderr as LOG_PERROR prints it ("KariDNS <pid> - - <text>"); a line too
+     * long is cut and still ends in a newline; only "1" counts, and the flag follows the environment each time it is read */
+    setenv("KARIDNS_NOSYSLOG", "1", 1);
+    assert(klog_nosyslog_from_env("KariDNS"));
+    saved = dup(2);
+    fd = open(errfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    assert(saved >= 0 && fd >= 0);
+    dup2(fd, 2);
+    close(fd);
+    kdns_logc(LOGC_QUERIES, LOG_NOTICE, "nosyslog line");
+    static char longmsg[KLOG_MSG_MAX * 2];
+    memset(longmsg, 'x', sizeof(longmsg) - 1);
+    longmsg[sizeof(longmsg) - 1] = '\0';
+    klog_syslog_text(LOG_ERR, longmsg);
+    dup2(saved, 2);
+    close(saved);
+    s = klog_slurp(errfile);
+    char want[64];
+    snprintf(want, sizeof(want), "KariDNS %ld - - ", (long)getpid());
+    const char *sl = strstr(s, want);
+    assert(sl && (sl == s || sl[-1] == '\n'));
+    const char *nl = strchr(sl, '\n');
+    const char *sm = strstr(sl, " nosyslog line\n");                                                   /* the syslog channel sy: the time, the text */
+    assert(nl && sm && sm + strlen(" nosyslog line") == nl);
+    assert(strstr(s, "queries: notice: nosyslog line\n") != NULL);                                     /* the stderr channel as before */
+    const char *lx = strstr(nl + 1, want);
+    assert(lx && lx[strlen(want)] == 'x' && s[strlen(s) - 1] == '\n' && strlen(lx) <= KLOG_MSG_MAX + 256);
+    free(s);
+    assert(klog_lines(errfile) == 3);
+    setenv("KARIDNS_NOSYSLOG", "0", 1);
+    assert(!klog_nosyslog_from_env("KariDNS"));
+    unsetenv("KARIDNS_NOSYSLOG");
+    assert(!klog_nosyslog_from_env(NULL));
     char lim[300], lim0[310], lim1[310];
     snprintf(lim, sizeof(lim), "%s/lim.log", dir);
     snprintf(lim0, sizeof(lim0), "%s/lim.log.0", dir);

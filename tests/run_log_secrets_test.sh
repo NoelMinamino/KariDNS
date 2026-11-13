@@ -21,6 +21,7 @@
 # Needs root (the servers drop to nobody, the loader runs as nobody).  SKIP otherwise, and without the binaries, SQLite3 or perl.
 # ==============================================================================
 . "$(dirname "$0")/lib_proc.sh"
+KARIDNS_NOSYSLOG=0   # this test reads the system log on purpose (lib_proc.sh exports 1)
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN="${BIN_DIR:-$ROOT}"
@@ -146,7 +147,7 @@ serial_of() { d "$1" pri.test SOA +short | awk '{ print $3 }'; }
 macs() { awk '/TSIG[ \t]+hmac-sha256/ { for (i = 1; i <= NF; i++) if ($i == "32") { print $(i + 1); break } }' "$@"; }   # the MACs of the TSIG RRs dag printed
 
 : > "$T/macs"
-syslog_mark() { for f in /var/log/messages /var/log/debug.log /var/log/all.log; do [ -f "$f" ] && wc -c < "$f" | tr -d ' ' > "$T/mark.$(basename "$f")"; done; }
+syslog_mark() { for f in /var/log/messages /var/log/daemon.log /var/log/debug.log /var/log/all.log; do [ -f "$f" ] && wc -c < "$f" | tr -d ' ' > "$T/mark.$(basename "$f")"; done; }
 syslog_mark
 
 # ================================================================ start: P at level 99, S at level 0
@@ -299,7 +300,7 @@ ctl p trace 99 > /dev/null
 kill -TERM $PSRV $SSRV 2>/dev/null
 _i=0; while [ $_i -lt 100 ] && { kill -0 $PSRV 2>/dev/null || kill -0 $SSRV 2>/dev/null; }; do sleep 0.1; _i=$((_i + 1)); done
 kari_kill_tree $PSRV $SSRV; PSRV="" SSRV=""
-for f in /var/log/messages /var/log/debug.log /var/log/all.log; do
+for f in /var/log/messages /var/log/daemon.log /var/log/debug.log /var/log/all.log; do
     [ -f "$f" ] || continue
     m=$(cat "$T/mark.$(basename "$f")" 2>/dev/null || echo 0)
     tail -c +$((m + 1)) "$f" > "$T/syslog.$(basename "$f")" 2>/dev/null

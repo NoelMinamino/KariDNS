@@ -261,7 +261,7 @@ void klog_channel_emit(log_channel_t *ch, int cat, int level, const struct times
     case LOGDEST_SYSLOG: {
       char line[KLOG_MSG_MAX + 160];
       klog_build_line(ch, cat, level, ts, msg, line, sizeof(line));
-      syslog(ch->syslog_facility | klog_syslog_priority(level), "%s", line);
+      klog_syslog_text(ch->syslog_facility | klog_syslog_priority(level), line);
       return;
     }
     case LOGDEST_STDERR:
@@ -647,6 +647,17 @@ fail:
   return NULL;
 }
 
+/* syslog(3) itself (through klog_syslog_text(): KARIDNS_NOSYSLOG), not the routing: the messages of klog_state_apply() */
+static void klog_syslogf(int prio, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void klog_syslogf(int prio, const char *fmt, ...) {
+  char msg[KLOG_MSG_MAX];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, ap);
+  va_end(ap);
+  klog_syslog_text(prio, msg);
+}
+
 /* A record from the Backend in a process that only appends (the manager, a router, the broker): the level, and the channels when the record
  * has them.  `who` names this process in the messages ("Manager", "Frontend 0", "Broker").  The record is hostile input (kls_parse()); what
  * it names can only make klog_aux_append() write to a file the Backend could write itself.  false: refused (logged, at most 16 times). */
@@ -655,7 +666,7 @@ bool klog_state_apply(const uint8_t *buf, size_t len, const char *who) {
   kls_state_t s;
   const char *why = kls_parse(buf, len, &s);
   if (why) {
-    if (refused++ < 16) syslog(LOG_ERR, "[Logging] %s: a logging state from the Backend was refused: %s", who, why);
+    if (refused++ < 16) klog_syslogf(LOG_ERR, "[Logging] %s: a logging state from the Backend was refused: %s", who, why);
     return false;
   }
   bool taken = false;
@@ -665,8 +676,8 @@ bool klog_state_apply(const uint8_t *buf, size_t len, const char *who) {
       taken = true;
     } else {
       if (rt) log_runtime_free(rt);
-      syslog(LOG_ERR, "[Logging] %s: cannot take the logging configuration of the Backend (out of memory, or the one before is still in use); "
-                      "keeping the one in use", who);
+      klog_syslogf(LOG_ERR, "[Logging] %s: cannot take the logging configuration of the Backend (out of memory, or the one before is still in use); "
+                            "keeping the one in use", who);
     }
   }
   klog_set_debug_level(s.debug_level);
@@ -722,7 +733,7 @@ static void klog_route(int cat, int prio, const char *fmt, va_list ap, int saved
   klog_sanitize(msg);
   log_runtime_t *rt = t_inside ? NULL : log_runtime_acquire();
   if (!rt) {
-    syslog(prio, "%s", msg);
+    klog_syslog_text(prio, msg);
     return;
   }
   /* A thread that is cancelled (the unit tests do that to the worker threads they start) must not be stopped while it holds the runtime or

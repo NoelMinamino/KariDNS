@@ -837,6 +837,7 @@ bool identity_names_root(const char *user, const char *group, char *err, size_t 
 #include <errno.h>
 #include <stdarg.h>
 #include <syslog.h>
+#include <unistd.h>
 #include "dns_logcat.h"
 #include "dns_log.h"
 #undef syslog   /* the calls below are the real syslog() (or the unit test's stub), not kdns_syslog() */
@@ -901,6 +902,32 @@ size_t klog_vformat(char *buf, size_t n, const char *fmt, va_list ap, int saved_
   return (size_t)r < n ? (size_t)r : n - 1;
 }
 
+/* KARIDNS_NOSYSLOG=1: set once at start-up, before any thread or fork (the children inherit it).  The integration tests export it
+ * (tests/lib_proc.sh) so that the servers they start do not fill the build host's system log; they read the messages on the server's
+ * stderr, which is the same with and without it. */
+static bool g_klog_nosyslog;
+static char g_klog_ident[32];
+
+bool klog_nosyslog_from_env(const char *ident) {
+  const char *e = getenv("KARIDNS_NOSYSLOG");
+  snprintf(g_klog_ident, sizeof(g_klog_ident), "%s", ident ? ident : "");
+  g_klog_nosyslog = e && strcmp(e, "1") == 0;
+  return g_klog_nosyslog;
+}
+
+void klog_syslog_text(int prio, const char *msg) {
+  if (!g_klog_nosyslog) {
+    syslog(prio, "%s", msg);
+    return;
+  }
+  char line[KLOG_MSG_MAX + 256];
+  int r = snprintf(line, sizeof(line) - 1, "%s %ld - - %s", g_klog_ident, (long)getpid(), msg);
+  size_t len = r < 0 ? 0 : (size_t)r < sizeof(line) - 1 ? (size_t)r : sizeof(line) - 2;
+  line[len++] = '\n';
+  ssize_t w = write(STDERR_FILENO, line, len);
+  (void)w;
+}
+
 static void klog_dispatch(int cat, int prio, const char *fmt, va_list ap, int saved_errno) {
   klog_hook_t hook = atomic_load_explicit(&g_klog_hook, memory_order_acquire);
   if (hook) {
@@ -909,7 +936,7 @@ static void klog_dispatch(int cat, int prio, const char *fmt, va_list ap, int sa
   }
   char msg[KLOG_MSG_MAX];
   klog_vformat(msg, sizeof(msg), fmt, ap, saved_errno);
-  syslog(prio, "%s", msg);
+  klog_syslog_text(prio, msg);
 }
 
 void kdns_syslog(int prio, const char *fmt, ...) {

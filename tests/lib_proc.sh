@@ -6,6 +6,13 @@
 # instances on the host (another working copy, a long-running server) must
 # survive a test run.
 
+# The servers a test starts write nothing to the host's system log (0.7 M4): with KARIDNS_NOSYSLOG=1 karidns prints what it would give
+# syslog(3) on its stderr only, in the form of the LOG_PERROR copy it prints anyway ("KariDNS <pid> - - <text>"), so a test that reads the
+# stderr of a foreground server sees the same lines.  A test that reads the system log on purpose sets KARIDNS_NOSYSLOG=0 after sourcing
+# this file (tests/run_log_secrets_test.sh); a value already in the environment is kept.
+KARIDNS_NOSYSLOG=${KARIDNS_NOSYSLOG:-1}
+export KARIDNS_NOSYSLOG
+
 # kari_kill_tree PID... : SIGKILL each PID and all of its descendants.
 # karidns runs as supervisor + backend + frontend routers + broker, so killing
 # only $! would leave the children behind. Each process is stopped before its

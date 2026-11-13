@@ -1538,7 +1538,7 @@ void *query_logger_thread_func(void *arg) {
                 if (ev_total > last_reported_ev_dropped) {
                     uint64_t diff = ev_total - last_reported_ev_dropped;
                     last_reported_ev_dropped = ev_total;
-                    syslog(LOG_WARNING, "[QueryLog] Dropped %" PRIu64 " event log messages (update-security, update, xfer-out, query-errors) due to ring buffer overflow (high load)", diff);
+                    syslog(LOG_WARNING, "[QueryLog] Dropped %" PRIu64 " event log messages (events and debug lines of any category) due to ring buffer overflow (high load)", diff);
                 }
             }
         } else if (num_workers > 0 && workers) {
@@ -6867,6 +6867,9 @@ int main(int argc, char **argv) {
     SHA1_Update(&dummy_sha, "dummy", 5);
     SHA1_Final(dummy_digest, &dummy_sha);
   }
+
+  /* KARIDNS_NOSYSLOG=1 (a test hook, docs/karidns.md ENVIRONMENT): what would go to syslog(3) goes to stderr only, in LOG_PERROR's form */
+  klog_nosyslog_from_env("KariDNS");
 
   bool foreground = false;
   const char *config_file = NULL;

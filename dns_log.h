@@ -32,6 +32,11 @@ void klog_set_hook(klog_hook_t hook);
 size_t klog_vformat(char *buf, size_t n, const char *fmt, va_list ap, int saved_errno);
 void kdns_syslog(int prio, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void kdns_logc(int cat, int prio, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+/* The one place that hands a finished line to syslog(3) (dns_utils.c, dns_log.c).  After klog_nosyslog_from_env() found KARIDNS_NOSYSLOG=1 (a test
+ * hook, docs/karidns.md ENVIRONMENT) the line goes to standard error only, as "<ident> <pid> - - <text>": the copy openlog()'s LOG_PERROR prints
+ * on FreeBSD, so a foreground server's stderr is unchanged and the system log gets nothing. */
+void klog_syslog_text(int prio, const char *msg);
+bool klog_nosyslog_from_env(const char *ident);
 
 /* ---- event messages (batch 14: update-security, update, xfer-out, query-errors) ----
  *
