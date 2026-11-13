@@ -36,6 +36,8 @@ cp LICENSE "${TAR_DIR}/dag-${VERSION}/" 2>/dev/null || true
 cp README.md "${TAR_DIR}/dag-${VERSION}/" 2>/dev/null || true
 cp docs/dag.md "${TAR_DIR}/dag-${VERSION}/" 2>/dev/null || true
 cp docs/dag_replay.md "${TAR_DIR}/dag-${VERSION}/" 2>/dev/null || true
+cp man/dag-replay.1 "${TAR_DIR}/dag-${VERSION}/"               # dag --replay (from docs/dag_replay.md)
+cp man/dag.1 "${TAR_DIR}/dag-${VERSION}/"                      # the manual page (generated from docs/dag.md: make man)
 tar -czf "${OUT_DIR}/dag-${VERSION}-linux-${RPM_ARCH}.tar.gz" -C "${TAR_DIR}" "dag-${VERSION}"
 rm -rf "${TAR_DIR}"
 
@@ -44,10 +46,10 @@ if command -v dpkg-deb >/dev/null 2>&1; then
     echo "==> Packaging Debian (.deb) package..."
     DEB_DIR="$(mktemp -d -t dag-deb-XXXXXX)"
     mkdir -p "${DEB_DIR}/DEBIAN"
-    mkdir -p "${DEB_DIR}/usr/bin"
     mkdir -p "${DEB_DIR}/usr/share/doc/dag"
-    
-    install -m 0755 dag "${DEB_DIR}/usr/bin/dag"
+
+    # /usr/bin/dag and /usr/share/man/man1/dag.1.gz, from the list of the Makefile (docs/building.md "Installing")
+    make install-dag install-man-dag DESTDIR="${DEB_DIR}" PREFIX=/usr BINMODE=0755 MANCOMPRESS=yes
     cp LICENSE "${DEB_DIR}/usr/share/doc/dag/copyright" 2>/dev/null || true
     cp docs/dag.md "${DEB_DIR}/usr/share/doc/dag/README.md" 2>/dev/null || true
 

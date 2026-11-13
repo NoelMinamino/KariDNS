@@ -2,7 +2,7 @@
 set -e
 
 # ==============================================================================
-# KariDNS karicheck(1) Deep Static Lint Rules Test Suite
+# KariDNS karicheck(8) Deep Static Lint Rules Test Suite
 # ==============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

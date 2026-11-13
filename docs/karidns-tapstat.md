@@ -1,7 +1,7 @@
-# KARIDNS-TAPSTAT(8) — KariDNS Reference Manual
+# KARIDNS-TAPSTAT(1) — KariDNS Reference Manual
 
 ```text
-KARIDNS-TAPSTAT(8)               KariDNS Manual               KARIDNS-TAPSTAT(8)
+KARIDNS-TAPSTAT(1)               KariDNS Manual               KARIDNS-TAPSTAT(1)
 ```
 
 ---
@@ -172,4 +172,4 @@ karidns-tapstat -r queries.fstrm -f json -n 50
 
 ## SEE ALSO
 
-[`karidns(8)`](karidns.md), [`dag_replay(1)`](dag_replay.md) (replays the same dnstap files), [dnstap](https://dnstap.info/), the Frame Streams protocol (libfstrm, `fstrm_capture`).
+[`karidns(8)`](karidns.md), [`dag-replay(1)`](dag_replay.md) (replays the same dnstap files), [dnstap](https://dnstap.info/), the Frame Streams protocol (libfstrm, `fstrm_capture`).

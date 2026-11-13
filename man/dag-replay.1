@@ -1,0 +1,514 @@
+.TH DAG\-REPLAY 1 "2026-11-13" "KariDNS" "KariDNS Manual"
+.\" Generated from docs/dag_replay.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
+.SH NAME
+dag\-replay \- High-Performance DNS Traffic Replay and Differential Testing
+Engine
+.SH SYNOPSIS
+.RS 2
+.nf
+dag \-\-replay <traffic_file> \-\-server1 <host[:port]> [\-\-server2 <host[:port]>]
+    [\-\-compare\-recorded] [\-\-diff] [\-\-ignore\-ttl] [\-\-output\-diff <file>]
+    [\-\-rate <qps>] [\-\-workers <N>] [\-\-timeout\-ms <ms>]
+    [\-\-stop\-after <N>] [\-\-max\-queries <N>]
+    [\-\-transport <udp|tcp|tls|doh>] [\-\-server1\-transport <transport>] [\-\-server2\-transport <transport>]
+    [\-\-output <text|json>] [+dnssec | +do] [+nodnssec | +nodo]
+.fi
+.RE
+.SH DESCRIPTION
+\fBdag \-\-replay\fR is an asynchronous, multi-threaded traffic replay and
+differential testing utility built into the \fBdag(1)\fR diagnostic suite.
+.PP
+It reads DNS queries from live traffic capture files (\fBPCAP\fR, \fBdnstap /
+Frame Streams\fR) or plain text query lists, transmits them concurrently across
+one or two target DNS nameservers, and evaluates response consistency.
+.PP
+When dual servers are specified (\fB\-\-server1\fR and \fB\-\-server2\fR), or
+when single server with recorded responses is specified
+(\fB\-\-compare\-recorded\fR), \fBdag \-\-replay\fR performs \fBsemantic,
+order-independent differential comparison\fR of the responses across every DNS
+section (Header, Question, Answer, Authority, and Additional). It categorizes
+differences into granular bitmask flags, detects subtle protocol inconsistencies
+(such as glue record omissions, DNSSEC RRSIG/NSEC differences, and CNAME chain
+discrepancies), and outputs structured statistics in human-readable or JSON
+format.
+.SH OPTIONS
+.SS Server Target Specifications
+.TP 8
+\fB\-\-server1 <host[:port]>\fR
+Address and optional port of the primary target nameserver. Without a port, the
+default of the server's transport is used: \fB53\fR (udp/tcp), \fB853\fR (tls),
+\fB443\fR (doh). Accepted forms: \fBhost\fR, \fBhost:port\fR, \fBhost#port\fR,
+\fB[IPv6]\fR, \fB[IPv6]:port\fR, \fB[IPv6]#port\fR and \fBIPv6#port\fR
+(e.g. \fB192.0.2.1:5353\fR, \fB[2001:db8::1]:5353\fR, \fB2001:db8::1#5353\fR). A
+bare IPv6 address without brackets or \fB#\fR is taken as an address without a
+port. \fB%\fR is not accepted as a port separator because it is the IPv6 zone ID
+delimiter (RFC 6874). An invalid value or a port outside 1-65535 is a usage
+error (exit 1). IPv6 targets are shown as \fB[addr]:port\fR in the reports.
+.TP 8
+\fB\-\-server2 <host[:port]>\fR
+Address and optional port of the secondary comparison nameserver (default port
+as for \fB\-\-server1\fR). Specifying \fB\-\-server2\fR automatically enables
+differential testing mode (\fB\-\-diff\fR). Mutually exclusive with
+\fB\-\-compare\-recorded\fR.
+.TP 8
+\fB\-\-compare\-recorded\fR
+Compare live responses from \fB\-\-server1\fR against the original recorded
+responses stored within the capture file (\fB.pcap\fR or \fB.dnstap\fR). Does
+not require a secondary live server. Mutually exclusive with
+\fB\-\-server2\fR. Not supported for text query files (\fBqueries.txt\fR). It is
+strongly recommended to specify \fB\-\-ignore\-ttl\fR with this option to avoid
+false differences caused by normal cache/TTL aging.
+.SS Replay & Engine Control
+.TP 8
+\fB\-\-replay <traffic_file>\fR
+Path to the input traffic source. Automatically detects format:
+.RS 8
+.IP \(bu 2
+\fBPCAP file\fR (magic \fB0xa1b2c3d4\fR or \fB0xd4c3b2a1\fR)
+.IP \(bu 2
+\fBdnstap Frame Streams file\fR (initial escape word \fB0x00000000\fR)
+.IP \(bu 2
+\fBText query file\fR (line-by-line domain name and type)
+.RE
+.TP 8
+\fB\-\-rate <qps>\fR, \fB\-\-rate\-limit <qps>\fR
+Limit the maximum query transmission rate to the specified queries-per-second
+(QPS). Replay pacing applies microsecond sleeps between task generation. When
+omitted or set to \fB0\fR, queries are dispatched as fast as the workers and
+targets permit.
+.TP 8
+\fB\-\-workers <N>\fR, \fB\-\-concurrency <N>\fR
+Number of concurrent worker threads processing the replay queue (default:
+\fB1\fR, maximum: \fB64\fR). Each worker thread independently handles network
+exchanges and response comparisons.
+.TP 8
+\fB\-\-max\-queries <N>\fR
+Stop replay processing after dispatching \fBN\fR queries.
+.TP 8
+\fB\-\-timeout\-ms <ms>\fR
+Network socket I/O timeout in milliseconds for each query-response exchange
+(default: \fB2000\fR ms; \fB0\fR or a negative value means the default).
+.SS Differential Testing Options
+.TP 8
+\fB\-\-diff\fR
+Explicitly enable differential response comparison. Automatically activated when
+\fB\-\-server2\fR or \fB\-\-compare\-recorded\fR is provided.
+.TP 8
+\fB\-\-ignore\-ttl\fR
+Ignore TTL differences when comparing resource records across servers or against
+recorded responses. When enabled, two identical record sets with differing TTL
+values (e.g., due to caching state, TTL countdown, or differing zone minimum TTL
+configurations) are treated as identical. Strongly recommended when using
+\fB\-\-compare\-recorded\fR.
+.TP 8
+\fB\-\-stop\-after <N>\fR
+Early termination threshold. Stops reading the input and discards the queued
+queries once \fBN\fR mismatched responses have been found (between
+\fB\-\-server1\fR and \fB\-\-server2\fR, or against the recorded
+responses). Queries already being processed by the workers are still completed.
+.TP 8
+\fB\-\-output\-diff <file>\fR
+Write one line per mismatched query to \fB<file>\fR. Use \fB\-\fR to stream the
+lines to \fBstdout\fR. Without this option, the first mismatches (while at most
+10 responses have been compared) are printed to \fBstderr\fR in text output
+mode.
+.SS Transport Control
+.TP 8
+\fB\-\-transport <udp|tcp|tls|doh>\fR
+Explicitly force the global transport protocol for all replayed queries,
+overriding any transport recorded in the input capture file. \fBtls\fR (alias
+\fBdot\fR) is DNS over TLS (RFC 7858, ALPN \fBdot\fR) and \fBdoh\fR (alias
+\fBhttps\fR) is DNS over HTTPS (RFC 8484, \fBPOST /dns\-query\fR over
+HTTP/1.1). Each DoT/DoH query uses its own TLS connection; server certificates
+are not verified (as with \fBdag +tls\fR / \fB+https\fR without \fB+tls\-ca\fR),
+and SNI is sent when the server is given by name. Any other value is an error
+(exit status 1).
+.TP 8
+\fB\-\-server1\-transport <udp|tcp|tls|doh>\fR
+Force the transport protocol specifically for queries sent to
+\fB\-\-server1\fR. Allows cross-transport differential testing (e.g., UDP
+vs. TCP validation on the same server).
+.TP 8
+\fB\-\-server2\-transport <udp|tcp|tls|doh>\fR
+Force the transport protocol specifically for queries sent to \fB\-\-server2\fR.
+.SS Query Options & Output Format
+.TP 8
+\fB+dnssec\fR, \fB+do\fR
+Set the DNSSEC OK (DO) bit (0x8000) in the EDNS0 OPT record for synthetic
+queries generated from text query lists.
+.TP 8
+\fB+nodnssec\fR, \fB+nodo\fR
+Clear the DO bit in EDNS0 OPT records for synthetic text queries (default).
+.TP 8
+\fB\-\-output <text|json>\fR, \fB\-\-output\-format <text|json>\fR
+Select report output format. \fBtext\fR (default) prints a formatted console
+summary. \fBjson\fR emits a machine-readable JSON document containing latency
+histograms, RCODE breakdowns, and differential counters.
+.SH INPUT FORMATS & PROTOCOL PRESERVATION
+\fBdag \-\-replay\fR supports three distinct traffic input sources:
+.SS 1. dnstap Frame Streams (.fstrm / .dnstap)
+Standard binary log format specified by Farsight Security and widely implemented
+in KariDNS, BIND 9, Unbound, NSD, and Knot DNS.
+.IP \(bu 2
+\fBHandshake & Frame Handling\fR: Parses the bidirectional Frame Streams
+container, safely skipping control frames (\fBSTART\fR, \fBSTOP\fR, \fBREADY\fR,
+\fBACCEPT\fR, \fBFINISH\fR).
+.IP \(bu 2
+\fBProtobuf Deserialization\fR: Decodes Google Protocol Buffers
+\fBdnstap.Dnstap\fR wrapper and extracts \fBdnstap.Message\fR content.
+.IP \(bu 2
+\fBQuery Extraction\fR: Extracts \fBquery_message\fR (field 10) wire
+payloads. Verifies \fBQR == 0\fR and \fBQDCOUNT >= 1\fR, automatically ignoring
+server response frames (\fBresponse_message\fR, field 14).
+.IP \(bu 2
+\fBTransport Fidelity\fR: Extracts \fBsocket_protocol\fR (field 3: \fB1 =
+UDP\fR, \fB2 = TCP\fR). Replayed queries faithfully reproduce the recorded
+transport protocol without requiring command-line flags.
+.SS 2. PCAP Live Captures (.pcap)
+Standard packet capture format generated by \fBtcpdump\fR, \fBwireshark\fR, or
+switch port mirrors.
+.IP \(bu 2
+\fBLink Layer Decoding\fR: Supports Ethernet (\fBLINKTYPE_ETHERNET\fR, 1), Linux
+cooked capture (\fBLINKTYPE_LINUX_SLL\fR, 113, and \fBLINKTYPE_LINUX_SLL2\fR,
+276, as written by \fBtcpdump \-i any\fR on current Linux), Raw IP
+(\fBLINKTYPE_RAW\fR, 12 / 101), BSD loopback (\fBLINKTYPE_NULL\fR, 0: 4-byte
+address family in the capturing host's byte order) and OpenBSD loopback
+(\fBLINKTYPE_LOOP\fR, 108: the same in network byte order). Other link types are
+auto-detected as raw IP or Ethernet.
+.IP \(bu 2
+\fBVLAN Support\fR: Transparently unpacks 802.1Q tagged Ethernet frames
+(Ethertype \fB0x8100\fR).
+.IP \(bu 2
+\fBNetwork & Transport Layer\fR: Inspects IPv4 and IPv6 headers. Correctly
+handles variable-length IP options and TCP header extensions.
+.IP \(bu 2
+\fBProtocol Fidelity\fR: Distinguishes between UDP (\fBIPPROTO_UDP\fR, 17) and
+TCP (\fBIPPROTO_TCP\fR, 6). For TCP captures, the 2-byte DNS length prefix is
+stripped and parsed into wire-format queries. Original transport is retained for
+each replayed packet.
+.IP \(bu 2
+\fBQuery Filtering\fR: Validates that the packet is a query (\fBQR == 0\fR) with
+at least one question. Non-DNS or response packets are ignored.
+.SS 3. Plain Text Query Lists (.txt)
+Convenient human-readable query list format with one entry per line:
+.PP
+.RS 2
+.nf
+# Domain Name               QTYPE   [Options]
+example.com                 A
+www.example.com             AAAA
+sec.example.com             DNSKEY  +dnssec
+mail.example.com            MX      +tcp
+corp.example.com            AXFR    +tcp
+.fi
+.RE
+.IP \(bu 2
+\fBComment & Empty Line Skipping\fR: Lines beginning with \fB#\fR or \fB;\fR and
+blank lines are ignored.
+.IP \(bu 2
+\fBTransport Flags\fR: Adding \fB+tcp\fR or \fB+udp\fR on a line sets the
+transport for that individual query.
+.IP \(bu 2
+\fBDNSSEC Flags\fR: Adding \fB+dnssec\fR or \fB+do\fR sets the DO bit in EDNS0
+OPT for that query.
+.IP \(bu 2
+\fBPacket Construction\fR: Automatically generates RFC 1035 compliant DNS wire
+packets with randomized Transaction IDs and standard RD flags.
+.SH TRANSPORT RESOLUTION HIERARCHY
+When dispatching queries to target servers, \fBdag \-\-replay\fR determines the
+transport protocol using the following strict priority:
+.IP 1. 4
+\fBPer-Server Transport Option (\fB\-\-server1\-transport\fB /
+\fB\-\-server2\-transport\fB)\fR If set on the CLI, this overrides all other
+settings for the corresponding server.
+.IP 2. 4
+\fBGlobal Transport Option (\fB\-\-transport\fB)\fR If explicitly specified on
+the CLI (e.g., \fB\-\-transport tcp\fR), forces all replayed queries across both
+servers to use the given transport.
+.IP 3. 4
+\fBCapture Transport (\fBtask.transport\fB)\fR If no CLI transport override is
+provided, the engine uses the original transport recorded in the input:
+.RS 4
+.IP \(bu 2
+dnstap: \fBMessage.socket_protocol\fR (\fBUDP\fR or \fBTCP\fR)
+.IP \(bu 2
+PCAP: L4 IP header protocol (\fBUDP\fR or \fBTCP\fR)
+.IP \(bu 2
+Text files: Per-line \fB+tcp\fR or \fB+udp\fR directive
+.RE
+.IP 4. 4
+\fBDefault Transport\fR If none of the above apply, defaults to \fB"udp"\fR.
+.SH DIFFERENTIAL COMPARISON ENGINE
+When comparing responses from \fB\-\-server1\fR and \fB\-\-server2\fR, \fBdag
+\-\-replay\fR employs an order-independent RRset comparison algorithm. DNS
+servers are permitted by RFC 1035 and RFC 2181 to return resource records within
+an RRset in any order (round-robin rotation) and use varying compression pointer
+schemes.
+.PP
+The comparison engine normalizes and evaluates differences across 13 distinct
+categories:
+.PP
+.TS
+lb lb lbw(44)
+l l lw(44).
+\&Flag Name	\&Bitmask	\&Description
+_
+\&\fB\fBDIFF_RCODE\fB\fR	\&\fB0x0001\fR	T{
+Response RCODE mismatch (e.g., \fBNOERROR\fR vs. \fBNXDOMAIN\fR or
+\fBSERVFAIL\fR).
+T}
+\&\fB\fBDIFF_FLAGS\fB\fR	\&\fB0x0002\fR	\&Header flags mismatch (\fBAA\fR or \fBTC\fR).
+\&\fB\fBDIFF_ANCOUNT\fB\fR	\&\fB0x0004\fR	\&Record count mismatch in the Answer section.
+\&\fB\fBDIFF_NSCOUNT\fB\fR	\&\fB0x0008\fR	T{
+Record count mismatch in the Authority section.
+T}
+\&\fB\fBDIFF_ARCOUNT\fB\fR	\&\fB0x0010\fR	T{
+Record count mismatch in the Additional section.
+T}
+\&\fB\fBDIFF_ANSWER_RRSET\fB\fR	\&\fB0x0020\fR	T{
+Semantic mismatch in Answer RRset data (owner name, type, class, or RDATA).
+T}
+\&\fB\fBDIFF_AUTH_RRSET\fB\fR	\&\fB0x0040\fR	\&Semantic mismatch in Authority RRset data.
+\&\fB\fBDIFF_ADD_RRSET\fB\fR	\&\fB0x0080\fR	\&Semantic mismatch in Additional RRset data.
+\&\fB\fBDIFF_GLUE_MISSING\fB\fR	\&\fB0x0100\fR	T{
+In-bailiwick glue record missing or mismatched in referral responses.
+T}
+\&\fB\fBDIFF_EDNS\fB\fR	\&\fB0x0200\fR	T{
+EDNS0 presence, UDP payload size, extended RCODE, version, DO bit, COOKIE
+presence, or option mismatch.
+T}
+\&\fB\fBDIFF_DNSSEC_RRSIG\fB\fR	\&\fB0x0400\fR	T{
+DNSSEC RRSIG signature presence, type covered, or validity difference.
+T}
+\&\fB\fBDIFF_DNSSEC_NSEC\fB\fR	\&\fB0x0800\fR	T{
+DNSSEC NSEC / NSEC3 denial of existence record difference.
+T}
+\&\fB\fBDIFF_CNAME_CHAIN\fB\fR	\&\fB0x1000\fR	T{
+CNAME redirection alias chain length or target mismatch.
+T}
+.TE
+.SH OUTPUT FORMATS
+.SS 1. Standard Text Report (Default)
+Printed to standard output upon completion. The server 2 and differential blocks
+appear only with \fB\-\-server2\fR or \fB\-\-compare\-recorded\fR (with
+\fB\-\-compare\-recorded\fR the second block is titled \fBRecorded (from
+capture)\fR and shows the capture file instead of an address, without an RTT):
+.PP
+.RS 2
+.nf
+================ DNS Replay Summary ================
+Total Queries Replayed: 1000
+Transport:              udp
+Workers:                1
+\&
+\-\-\- Server 1 (127.0.0.1:53) \-\-\-
+  Server 1: 1000 responses
+  Sent:     1000
+  Received: 1000
+  Timeouts: 0
+  Avg RTT:  0.42 ms
+  RCODEs:   NOERROR=950 NXDOMAIN=50 SERVFAIL=0 REFUSED=0
+\&
+\-\-\- Server 2 (127.0.0.1:5353) \-\-\-
+  Responses: 1000
+  Sent/Pairs: 1000
+  Received:  1000
+  Timeouts:  0
+  Avg RTT:   0.38 ms
+  RCODEs:    NOERROR=950 NXDOMAIN=50 SERVFAIL=0 REFUSED=0
+\&
+\-\-\- Differential Comparison \-\-\-
+  Compared:           1000
+  Identical responses: 998 (99.8%)
+  Mismatched responses: 2
+  RCODE Mismatches:   0
+  Flags Mismatches:   0
+  ANCOUNT Mismatches: 1
+  RRset Mismatches:   1
+  Glue Missing:       0
+  EDNS Diffs:         0
+  DNSSEC RRSIG Diffs: 1
+  DNSSEC NSEC Diffs:  0
+  CNAME Chain Diffs:  0
+====================================================
+.fi
+.RE
+.PP
+\fBTransport\fR shows the \fB\-\-transport\fR value (default \fBudp\fR), not the
+per-query transport taken from the capture.
+.SS 2. JSON Report (\-\-output json)
+Structured document suitable for CI/CD assertions and telemetry ingestion. With
+\fB\-\-compare\-recorded\fR, the second object is named \fBrecorded\fR and has a
+\fBsource\fR (the capture file) instead of \fBtarget\fR; without a second server
+or \fB\-\-compare\-recorded\fR, only \fBtotal_queries\fR and \fBserver1\fR are
+printed.
+.PP
+.RS 2
+.nf
+{
+  "total_queries": 1000,
+  "server1": {
+    "target": "127.0.0.1:53",
+    "sent": 1000,
+    "received": 1000,
+    "timeouts": 0,
+    "avg_rtt_ms": 0.42,
+    "noerror": 950,
+    "nxdomain": 50,
+    "servfail": 0
+  },
+  "server2": {
+    "target": "127.0.0.1:5353",
+    "sent": 1000,
+    "received": 1000,
+    "timeouts": 0,
+    "avg_rtt_ms": 0.38,
+    "noerror": 950,
+    "nxdomain": 50,
+    "servfail": 0
+  },
+  "diff": {
+    "compared": 1000,
+    "identical": 998,
+    "identical_queries": 998,
+    "mismatched_queries": 2,
+    "rcode_mismatches": 0,
+    "flags_mismatches": 0,
+    "ancount_mismatches": 1,
+    "rrset_mismatches": 1,
+    "glue_missing_diffs": 0,
+    "edns_diffs": 0,
+    "dnssec_rrsig_diffs": 1,
+    "dnssec_nsec_diffs": 0,
+    "cname_chain_diffs": 0
+  }
+}
+.fi
+.RE
+.SS 3. Difference Stream (\-\-output-diff <file>)
+Each mismatch records the query sequence number, the names of the differing
+categories, and the hexadecimal bitmask:
+.PP
+.RS 2
+.nf
+[DIFF #42] Reachability mismatch: Live=OK Recorded/S2=TIMEOUT (flags=0x0001)
+[DIFF #108] Diff: [DNSSEC_RRSIG]  (flags=0x0400)
+[DIFF #512] Diff: [ANCOUNT] [ANSWER]  (flags=0x0024)
+.fi
+.RE
+.SH EXIT STATUS
+.TP 8
+\fB0\fR
+The replay ran to completion (or was stopped by \fB\-\-max\-queries\fR /
+\fB\-\-stop\-after\fR) and, when responses were compared (\fB\-\-server2\fR or
+\fB\-\-compare\-recorded\fR), no mismatch was found. A single-server replay
+without comparison always exits with 0.
+.TP 8
+\fB1\fR
+Responses were compared and at least one mismatch was found
+(\fBmismatched_queries > 0\fR, including one server not answering); or a usage
+error (missing \fB\-\-replay\fR / \fB\-\-server1\fR, unknown transport),
+\fB\-\-compare\-recorded\fR combined with \fB\-\-server2\fR or with a text query
+file, the input file cannot be opened, TLS could not be initialized, or a memory
+allocation failure.
+.SH EXAMPLES
+.SS 1. Replay dnstap Traffic to a Target Nameserver
+Replay a live dnstap log captured via \fBfstrm_capture\fR or KariDNS against a
+local server:
+.PP
+.RS 2
+.nf
+dag \-\-replay /var/log/dnstap.fstrm \-\-server1 127.0.0.1:53
+.fi
+.RE
+.PP
+\fINote: Queries that were originally received over TCP will automatically be
+replayed over TCP; queries received over UDP will be replayed over UDP.\fR
+.SS 2. Differential Regression Testing Across Implementations
+Verify consistency between BIND 9 and KariDNS using a captured PCAP trace:
+.PP
+.RS 2
+.nf
+dag \-\-replay traffic.pcap \e
+    \-\-server1 127.0.0.1:53 \e
+    \-\-server2 127.0.0.1:5353 \e
+    \-\-diff \-\-ignore\-ttl \e
+    \-\-output\-diff /tmp/differences.log
+.fi
+.RE
+.SS 3. High-Concurrency Stress & Benchmarking
+Replay a 100,000 query text list at 10,000 QPS across 16 worker threads:
+.PP
+.RS 2
+.nf
+dag \-\-replay queries.txt \e
+    \-\-server1 192.0.2.1:53 \e
+    \-\-rate 10000 \e
+    \-\-workers 16
+.fi
+.RE
+.SS 4. Continuous Integration Early Abort
+In automated CI pipelines, stop at the first response mismatch; the exit status
+is 1 when a mismatch was found:
+.PP
+.RS 2
+.nf
+dag \-\-replay regression_suite.txt \e
+    \-\-server1 127.0.0.1:53 \e
+    \-\-server2 127.0.0.1:1053 \e
+    \-\-diff \-\-stop\-after 1 \e
+    \-\-output json
+.fi
+.RE
+.SS 5. Cross-Protocol Validation (UDP vs. TCP)
+Verify that a server produces identical answers whether queried over UDP or TCP:
+.PP
+.RS 2
+.nf
+dag \-\-replay queries.txt \e
+    \-\-server1 127.0.0.1:53 \-\-server1\-transport udp \e
+    \-\-server2 127.0.0.1:53 \-\-server2\-transport tcp \e
+    \-\-diff
+.fi
+.RE
+.PP
+Compare a server's DNS over TLS (port 853) and DNS over HTTPS (port 443) front
+ends with its plain TCP answers:
+.PP
+.RS 2
+.nf
+dag \-\-replay queries.txt \e
+    \-\-server1 dns.example.net \-\-server1\-transport tls \e
+    \-\-server2 dns.example.net \-\-server2\-transport tcp \-\-diff
+\&
+dag \-\-replay queries.txt \e
+    \-\-server1 dns.example.net \-\-server1\-transport doh \e
+    \-\-server2 dns.example.net \-\-server2\-transport tcp \-\-diff
+.fi
+.RE
+.SS 6. Single-Server Recorded Response Comparison
+Verify live server behavior against baseline responses recorded in a PCAP or
+dnstap capture without spinning up a second server:
+.PP
+.RS 2
+.nf
+dag \-\-replay traffic.dnstap \e
+    \-\-server1 127.0.0.1:53 \e
+    \-\-compare\-recorded \e
+    \-\-ignore\-ttl
+.fi
+.RE
+.PP
+.RS 2
+.nf
+dag \-\-replay traffic.pcap \e
+    \-\-server1 127.0.0.1:53 \e
+    \-\-compare\-recorded \e
+    \-\-ignore\-ttl \e
+    \-\-output json
+.fi
+.RE
+.SH SEE ALSO
+\fBdag(1)\fR, \fBkaridns(8)\fR, \fBkaricheck(8)\fR, \fBkarictl(8)\fR
+.SH AUTHORS
+Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)

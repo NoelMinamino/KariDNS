@@ -72,8 +72,9 @@ echo "-- the package"
 mkdir -p "$T/src/signer" "$T/src/node" "$T/src/packaging" "$T/src/docs" "$T/out"
 cp -R signer/bin signer/lib signer/package.json signer/package-lock.json "$T/src/signer/"
 cp -R node/lib node/package.json "$T/src/node/"
-cp -R packaging/freebsd packaging/version.sh "$T/src/packaging/" && cp VERSION "$T/src/"      # (version.sh: the number of the package, docs/RELEASING.md)
+cp -R packaging/freebsd packaging/version.sh packaging/install.sh "$T/src/packaging/" && cp VERSION Makefile "$T/src/"      # (version.sh: the number of the package, docs/RELEASING.md)
 cp docs/karidns-signer.md "$T/src/docs/"
+mkdir -p "$T/src/man" && cp man/karidns-signer.8 "$T/src/man/"      # (the package is staged with make install-signer install-man-signer install-docs-signer)
 cp karidns-signer.conf.sample "$T/src/"
 export npm_config_prefer_offline=true
 if (cd "$T/src" && sh packaging/freebsd/build_signer_pkg.sh 9.9.9 "$T/out") > "$T/build.out" 2>&1; then ok "build_signer_pkg.sh builds the package"; else bad "build_signer_pkg.sh failed" "$(tail -15 "$T/build.out")"; done_; fi
@@ -85,14 +86,14 @@ grep -q '^Origin *: dns/karidns-signer$' "$T/info.out" && ok "origin dns/karidns
 pkg info -d -F "$PKG" 2> /dev/null | grep -q 'node24-' && ok "it depends on node24" || bad "no dependency on node24"
 pkg info -d -F "$PKG" 2> /dev/null | grep -q 'bind-tools-' && ok "...and on bind-tools (dnssec-keygen, dnssec-signzone)" || bad "no dependency on bind-tools"
 pkg info -l -F "$PKG" 2> /dev/null | tail -n +2 | sed 's/^[[:space:]]*//' > "$T/files.txt"
-for f in /usr/local/sbin/karidns-signer /usr/local/etc/rc.d/karidns_signer /usr/local/etc/karidns/karidns-signer.conf.sample /usr/local/share/doc/karidns/karidns-signer.md \
+for f in /usr/local/sbin/karidns-signer /usr/local/etc/rc.d/karidns_signer /usr/local/etc/karidns/karidns-signer.conf.sample /usr/local/share/man/man8/karidns-signer.8.gz /usr/local/share/doc/karidns/karidns-signer.md \
          /usr/local/libexec/karidns-signer/signer/bin/karidns-signer.js /usr/local/libexec/karidns-signer/signer/lib/cli.js /usr/local/libexec/karidns-signer/signer/package.json \
          /usr/local/libexec/karidns-signer/node/lib/run.js /usr/local/libexec/karidns-signer/node/package.json /usr/local/libexec/karidns-signer/node_modules/pg/package.json; do
     grep -qx "$f" "$T/files.txt" && ok "the package holds $f" || bad "the package does not hold $f"
 done
 grep -Eq '^/usr/local/libexec/karidns-signer/(signer|node)/test/' "$T/files.txt" && bad "the package holds the test files of the program" || ok "no test file of the program in the package"
 grep -q 'node_modules/\.bin' "$T/files.txt" && bad "the package holds node_modules/.bin" || ok "no node_modules/.bin (no link into the tree)"
-grep -v '^/usr/local/\(sbin/karidns-signer\|etc/rc.d/karidns_signer\|etc/karidns/karidns-signer.conf.sample\|share/doc/karidns/karidns-signer.md\|libexec/karidns-signer/\)' "$T/files.txt" > "$T/other.txt"
+grep -v '^/usr/local/\(sbin/karidns-signer\|etc/rc.d/karidns_signer\|etc/karidns/karidns-signer.conf.sample\|share/man/man8/karidns-signer.8.gz\|share/doc/karidns/karidns-signer.md\|libexec/karidns-signer/\)' "$T/files.txt" > "$T/other.txt"
 [ ! -s "$T/other.txt" ] && ok "nothing outside the paths of the package" || bad "files outside the paths of the package" "$(head -5 "$T/other.txt")"
 # the scripts and the user
 mkdir "$T/root" && tar -xf "$PKG" -C "$T/root" 2> /dev/null
@@ -170,11 +171,10 @@ TMPFS=NO
 mkdir "$T/mnt_probe"
 if mount -t tmpfs tmpfs "$T/mnt_probe" 2> "$T/mnt.err"; then umount "$T/mnt_probe"; TMPFS=YES; else echo "SKIP: the system refuses a tmpfs mount ($(head -1 "$T/mnt.err")): the tmpfs on the work directory (the rc script runs with karidns_signer_tmpfs=NO)"; fi
 RC="env karidns_signer_user=nobody karidns_signer_config=$CONF karidns_signer_wrapper=$T/wrapper.sh karidns_signer_tmpfs=$TMPFS sh $ROOT/packaging/freebsd/rc.d/karidns_signer"
-$RC oneconfigtest > "$T/rc_cfg.out" 2>&1 && ok "configtest runs --check as the service user" || bad "configtest" "$(cat "$T/rc_cfg.out")"
-grep -q "the configuration is fine" "$T/rc_cfg.out" && ok "...and the configuration is fine" || bad "configtest output" "$(cat "$T/rc_cfg.out")"
-[ -d "$RCDIR/work" ] && same "the work directory is made, mode 0700" "$(stat -f %Lp "$RCDIR/work")" 700 || bad "the work directory was not made"
-same "...owned by the service user" "$(stat -f %Su "$RCDIR/work")" nobody
-same "...and its parent is mode 0700" "$(stat -f %Lp "$RCDIR")" 700
+# configtest makes nothing (the work directory is made by the start; tests/run_rc_service_dirs_test.sh has the cases of the rule)
+RCMODE=$(stat -f %Lp "$RCDIR")
+$RC oneconfigtest > "$T/rc_cfg.out" 2>&1
+grep -q "does not exist yet: start makes it" "$T/rc_cfg.out" && [ ! -e "$RCDIR/work" ] && ok "configtest before the first start: says the start makes the work directory, makes nothing" || bad "configtest before the start" "$(cat "$T/rc_cfg.out")"
 # syslog: does a line of logger(1) reach /var/log/messages here?
 SYSLOG=NO
 logger -p daemon.notice -t karidns-signer-probe "probe $$" 2> /dev/null
@@ -188,6 +188,11 @@ i=0; while [ $i -lt 100 ] && [ -z "$CHILD" ]; do CHILD=$(cat /var/run/karidns_si
 same "the pid directory is the service user's" "$(stat -f %Su /var/run/karidns_signer)" nobody
 same "the daemon runs as the service user" "$(ps -o user= -p "$CHILD" 2> /dev/null | tr -d ' ')" nobody
 $RC onestatus > /dev/null 2>&1 && ok "status finds it" || bad "status"
+[ -d "$RCDIR/work" ] && same "the start made the work directory, mode 0700" "$(stat -f %Lp "$RCDIR/work")" 700 || bad "the work directory was not made"
+same "...owned by the service user" "$(stat -f %Su "$RCDIR/work")" nobody
+same "...and left its parent as it was" "$(stat -f %Lp "$RCDIR")" "$RCMODE"
+$RC oneconfigtest > "$T/rc_cfg.out" 2>&1 && ok "configtest runs --check as the service user" || bad "configtest" "$(cat "$T/rc_cfg.out")"
+grep -q "the configuration is fine" "$T/rc_cfg.out" && ok "...and the configuration is fine" || bad "configtest output" "$(cat "$T/rc_cfg.out")"
 if [ $SYSLOG = YES ]; then
     i=0; while [ $i -lt 100 ] && ! grep -q "karidns-signer.*karidns-signer [^ ]* started (sqlite3" /var/log/messages 2> /dev/null; do sleep 0.2; i=$((i + 1)); done
     grep "karidns-signer" /var/log/messages | tail -20 | grep -q "started (sqlite3, 1 worker(s))" && ok "the daemon logs to syslog (it started)" || bad "no 'started' line in /var/log/messages" "$(tail -3 /var/log/messages)"

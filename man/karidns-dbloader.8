@@ -1,0 +1,1970 @@
+.TH KARIDNS\-DBLOADER 8 "2026-11-14" "KariDNS" "KariDNS Manual"
+.\" Generated from docs/karidns-dbloader.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
+.SH NAME
+karidns\-dbloader \- reads the PowerDNS 5.1 tables of a SQLite3 or PostgreSQL
+database and hands the zones to the KariDNS Backend
+.SH SYNOPSIS
+.RS 2
+.nf
+karidns\-dbloader \-\-drivers
+karidns\-dbloader \-\-dump OUT \-\-driver sqlite3 \-\-database\-file PATH [options]
+karidns\-dbloader \-\-dump OUT \-\-driver postgresql \-\-conninfo\-file FILE [\-\-schema NAME] [options]
+karidns\-dbloader \-\-check \-\-driver sqlite3 \-\-database\-file PATH [options]
+karidns\-dbloader \-\-check \-\-driver postgresql \-\-conninfo\-file FILE [\-\-schema NAME] [options]
+karidns\-dbloader \-s FD [\-\-fetch\-fd FD] [\-\-state\-file PATH] [\-\-log\-stderr] [\-\-debug N]
+.fi
+.RE
+.PP
+\fB\-s FD\fR is the mode \fBkaridns\fR runs; you do not start it by
+hand. \fB\-\-drivers\fR, \fB\-\-dump\fR and \fB\-\-check\fR are for
+administrators and for tests.
+.SH DESCRIPTION
+\fBkaridns\fR never links a database library. When \fBoptions { database
+{ ... }; }\fR (or a \fBview\fR database option) is configured, the manager
+process starts \fB\fBkaridns\-dbloader\fB\fR (the loader) as a child. The loader
+opens the database, reads the zones, converts every zone with the same readers
+and checks as the zone-file parsers, and sends the result to the Backend over a
+socket pair that the manager created before it dropped privileges (stream
+\fBKDB1\fR, framed messages whose zone data is in Extended AXFR format). The
+Backend builds the zones with the engine that also builds zone-file zones, so a
+zone answers byte for byte the same from a file and from the database. See
+\fBkaridns(8)\fR, "\fBdatabase { ... }\fR (in \fBoptions\fR) and the view
+database options", for the configuration options and for everything a database
+zone can carry (settings, ACLs, tags, secondary zones, ALIAS records).
+.PP
+What the loader does while \fBkaridns\fR runs:
+.IP \(bu 2
+\fBStart.\fR It says HELLO (version, drivers), receives the configuration of the
+databases from the Backend, asks for the Backend's inventory (the zones it
+already has) and reads every zone. A zone whose content digest equals the
+Backend's version is not sent. The first zones are served as soon as the first
+batch part is published; a line \fBinitial load complete\fR is logged when the
+first batch is done.
+.IP \(bu 2
+\fBReload.\fR \fBkarictl reload\fR makes it compare the databases with the
+inventory: new zones, zones whose SOA serial differs, zones the change log table
+\fBkaridns_changes\fR lists as edited, and zones the Backend refused last time
+are read and sent; zones that left the database get a delete. \fBkarictl reload
+<zone>\fR reads that one zone. When a reload has to read more than
+\fBbulk\-threshold\fR percent of the zones, one scan of all records replaces the
+per-zone queries.
+.IP \(bu 2
+\fBAuto reload\fR (\fBauto\-reload yes;\fR). The loader polls (SQLite3) or
+listens (PostgreSQL \fBLISTEN\fR) and sends a batch by itself after the first
+commit plus the \fBcoalesce\fR window.
+.IP \(bu 2
+\fBSeveral servers on one PostgreSQL database.\fR It reads
+\fBkaridns_reload_requests\fR and writes its outcome to
+\fBkaridns_server_status\fR (see \fBkaridns(8)\fR, "Several servers on one
+PostgreSQL database").
+.IP \(bu 2
+\fBSerial 0.\fR A zone whose SOA serial is 0 is loaded as it is; the loader logs
+a warning (\fBthe SOA serial is 0; ...\fR) when it sends that version of the
+zone, not again while the zone is unchanged. \fB\-\-check\fR reports the same as
+a warning.
+.IP \(bu 2
+\fBCrash.\fR If the loader dies, \fBkaridns\fR keeps answering from the zones it
+has and the manager starts a new loader (after 1 s, 2 s, 4 s ... 60 s; the delay
+restarts after 10 minutes without a crash). A new loader compares \fBevery\fR
+zone with the Backend's inventory before it reports its first batch (the whole
+database is read once; see "Measurements").
+.SS Privileges
+.IP \(bu 2
+The loader runs as \fBloader\-user\fR / \fBloader\-group\fR and \fBnever as
+root\fR (\fBloader\-user\fR is required when \fBkaridns\fR starts as root). It
+has no access to \fBkaridns.conf\fR, only to the database and to its socket;
+everything else reaches it over the stream.
+.IP \(bu 2
+It is an ordinary process (not in a Capsicum sandbox): it needs the database
+library and file or socket access, and what it reads from the database is
+untrusted input that the shared reader validates. What it sends is untrusted for
+the Backend, which validates the stream again and stays in capability mode: all
+descriptors are opened by the manager at start, the Backend opens nothing new.
+.IP \(bu 2
+It reads only. The SQLite3 driver opens the file read-write (a reader of a WAL
+database must write the \fB\-shm\fR file) but sets \fBPRAGMA query_only=1\fR, so
+no statement of the connection can change data; PostgreSQL transactions are
+\fBREAD ONLY\fR and the role should have no more than
+\fBdb/karidns_loader_role.pgsql.sql\fR gives it. The one thing the PostgreSQL
+loader writes is its own row in \fBkaridns_server_status\fR.
+.IP \(bu 2
+\fBloader\-path\fR (default \fB/usr/local/libexec/karidns\-dbloader\fR, or
+\fBDIR/karidns\-dbloader\fR for a build with \fB./configure
+\-\-libexecdir=DIR\fR) must be a regular executable file owned by root (or by
+the user who runs \fBkaridns\fR when that is not root) and not writable by group
+or others; \fBkaridns\fR checks this at start and before every
+restart. \fBkaricheck conf\fR reports a problem in advance.
+.IP \(bu 2
+\fBSQLite3:\fR the database must be in WAL mode (\fBPRAGMA journal_mode =
+WAL\fR). A reader of a WAL database still writes the \fB\-shm\fR file, so
+\fBloader\-user\fR needs read and write permission on the database file and on
+its directory (to create \fB\-wal\fR and \fB\-shm\fR), and the file should not
+be readable by everyone. \fBPostgreSQL:\fR the \fBconninfo\-file\fR has mode
+0600 or 0400 and belongs to \fBloader\-user\fR; use a UNIX socket or
+\fBsslmode=verify\-full\fR.
+.IP \(bu 2
+\fBkaricheck db\fR checks all of this in advance, from the same code (below).
+.SS Drivers
+The loader has the drivers it was built with: \fBkaridns\-dbloader
+\-\-drivers\fR prints them, one per line, and the loader says them in its
+HELLO. \fBkaridns\fR refuses \fBdatabase { driver x; }\fR when the installed
+loader does not have \fBx\fR (and \fBkaricheck conf\fR says \fBdriver x is not
+available in this installation\fR). To build:
+.PP
+.RS 2
+.nf
+make karidns\-dbloader DB_DRIVERS="sqlite3 postgresql"
+.fi
+.RE
+.PP
+\fBDB_DRIVERS\fR is any subset of \fBsqlite3 postgresql\fR (default
+\fBsqlite3\fR); the SQLite3 driver needs \fBlibsqlite3\fR, the PostgreSQL driver
+\fBlibpq\fR (PostgreSQL 13 or newer on the server). The FreeBSD packages are
+described under "Packages".
+.SH OPTIONS
+.TP 8
+\fB\-\-dump OUT\fR
+Write the stream exactly as the loader sends it to the Backend (HELLO,
+BATCH_BEGIN, per zone ZONE_BEGIN / ZONE_DATA... / ZONE_END or ZONE_FAILED,
+BATCH_END) to the file \fBOUT\fR (\fB\-\fR = standard output). Zones come in
+\fBdomains.id\fR order and the HELLO of a dump carries pid 0, so two runs on one
+database state write the same bytes, whatever the number of
+\fB\-\-loader\-threads\fR. It reads the database in one snapshot and does not
+start a server. The output file is removed on an error.
+.TP 8
+\fB\-\-check\fR
+Check mode, what \fBkaricheck db\fR runs. It reads the same tables through the
+same code as the production load, sends nothing, writes nothing to the database,
+and prints what is wrong or odd as lines of the check protocol on standard
+output (the schema, every zone with the checks of \fBkaricheck zone\fR, the
+settings texts, the views a zone is mapped to). Run it as the user the loader
+runs as; its output is meant to be read by \fBkaricheck\fR. No \fB\-\-dump\fR.
+.TP 8
+\fB\-\-state\-file PATH\fR
+With \fB\-s\fR (started by \fBkaridns\fR when \fBloader\-state\-file\fR is set):
+the file the loader keeps the hot list in (D1a step 7). The loader reads it at
+its start, sends its zones to the Backend as \fBWARM_LIST\fR after the startup
+load, and writes it again (\fBPATH.tmp\fR, mode 0600, \fBfsync\fR, \fBrename\fR)
+when the Backend sends a \fBHOT_LIST\fR, merged with what it had. A file that is
+missing is the first start; one that is empty, truncated, damaged (the last line
+is \fBEND <count> <checksum>\fR) or larger than 64 MiB is ignored with a log
+line and replaced by the next list. The loader user needs write permission on
+the \fBdirectory\fR of the file. The Backend never names this path to the loader
+(it comes from the command line the supervisor builds from \fBkaridns.conf\fR),
+so a compromised Backend cannot make the loader write anywhere. With
+\fB\-\-check\fR: check that the loader can use it (the directory exists and can
+be written, the file can be read and is valid); \fBkaricheck db\fR passes it.
+.TP 8
+\fB\-\-drivers\fR
+Print the compiled-in drivers, one per line, and exit.
+.TP 8
+\fB\-s FD\fR
+Stream mode: \fBFD\fR is the socket to the Backend. Started by
+\fBkaridns\fR. The loader ends when the Backend closes the stream or on
+\fBSIGTERM\fR / \fBSIGINT\fR (also in the middle of a long load: it stops at the
+next zone, within milliseconds); \fBSIGHUP\fR is ignored.
+.TP 8
+\fB\-\-log\-stderr\fR
+With \fB\-s\fR: write the messages to standard error instead of syslog, one line
+each, \fB<N>[DB] text\fR with \fBN\fR the syslog priority (0 .. 7) and a newline
+at the end, at most 500 bytes (a longer text is cut and ends in \fB...\fR;
+control characters become \fB?\fR). \fBkaridns\fR starts the loader this way,
+with a pipe as its standard error, reads the lines and logs them in the
+\fBdatabase\fR category (see MESSAGES). Since 0.7 this includes the messages of
+the code the loader shares with the server (the zone checks, such as \fB[Zone]
+example.com.: using NSEC3PARAM ...\fR), which went to syslog before: the line is
+\fB<N>[DB] [Zone] text\fR. Without this option \fB\-s\fR logs to syslog
+(identity \fBkaridns\-dbloader\fR, \fB[DB]\fR in front of the text). If standard
+error cannot be written (the pipe is closed), the message goes to syslog. It is
+an error without \fB\-s\fR.
+.TP 8
+\fBKARIDNS_NOSYSLOG=1\fR (environment)
+The test hook of \fBkaridns(8)\fR (ENVIRONMENT, 0.7): every line the loader
+would give syslog(3) goes to standard error only, as \fBkaridns\-dbloader <pid>
+\- \- <text>\fR (the copy \fBLOG_PERROR\fR prints in stream mode anyway), and
+the system log gets nothing: in stream mode without \fB\-\-log\-stderr\fR, when
+the pipe of \fB\-\-log\-stderr\fR is closed, and for the messages of the shared
+code in \fB\-\-dump\fR and \fB\-\-check\fR mode (which have no \fBopenlog()\fR
+and went to the system log). Only the value \fB1\fR counts; the integration
+tests export it (\fBtests/lib_proc.sh\fR). A loader that \fBkaridns\fR starts
+has a cleared environment and \fB\-\-log\-stderr\fR, so it is not affected.
+.TP 8
+\fB\-\-debug N\fR
+The debug level, 0 .. 99 (default 0): the debug messages up to it are written
+(0.7).  \fBkaridns\fR passes the level in force when it starts the loader
+(\fBkaridns \-d\fR, \fBkarictl trace\fR), so a loader started again while the
+level is raised comes up with it, and in stream mode the Backend tells the
+loader every later change (the KDB1 message \fBDEBUG\fR).  With
+\fB\-\-log\-stderr\fR a debug message is the line \fB<7:L>[DB] text\fR, \fBL\fR
+its level; without it, syslog priority \fBdebug\fR; with \fB\-\-dump\fR a line
+on standard error; \fB\-\-check\fR writes none.  At level 1 the loader says when
+it connected (driver, file named), its level changes and its batches; at level 2
+also each zone it sent (serial, size, a summary or for a fetch) or left out
+because the Backend has its version, each fetch request of the Backend (queued,
+answered busy or refused because too many wait) and a connection used again.  No
+debug message contains a password, the content of a conninfo file or a driver's
+error text (which can repeat parts of the connection string): the files are
+named, never read out.
+.TP 8
+\fB\-\-driver DRIVER\fR
+\fBsqlite3\fR or \fBpostgresql\fR (a driver that was compiled in).
+.TP 8
+\fB\-\-database\-file FILE\fR
+SQLite3: the database file; it must be in WAL mode. The name is used byte for
+byte (\fB%XX\fR is not decoded); a name that starts with \fBfile:\fR is refused
+(write \fB./file:...\fR).
+.TP 8
+\fB\-\-conninfo\-file FILE\fR
+PostgreSQL: the file that holds the libpq connection string (owned by the user
+that runs the loader, mode 0600 or 0400; its content is never logged).
+.TP 8
+\fB\-\-schema NAME\fR
+PostgreSQL: the schema that holds the tables (default: the \fBsearch_path\fR of
+the role).
+.TP 8
+\fB\-\-view\-index N\fR
+The view index in ZONE_BEGIN / ZONE_FAILED, 0..65535, default 0.
+.TP 8
+\fB\-\-zone NAME\fR
+Dump only this zone, read with one query per zone instead of the bulk scan.
+.TP 8
+\fB\-\-default\-ttl N\fR
+TTL for a \fBrecords.ttl\fR that is NULL, 1..2147483647, default 3600.
+.TP 8
+\fB\-\-loader\-threads N\fR
+1..16, default 1. N workers, each with its own database connection, read and
+convert disjoint sets of zones (consecutive zones in \fBdomains.id\fR order);
+the output is written in \fBdomains.id\fR order whatever N is. The workers take
+their snapshots after the main thread took its own (the zone list, the metadata
+and the keys); with SQLite3 each of them also reads the change log position of
+its snapshot, and if a commit came in between (a position other than the main
+thread's) the source is read again from the start, before anything of it is
+sent, up to three readings (the last one goes on and logs that a zone can be a
+mix of two commits until the next reload). PostgreSQL does not make this check
+(its change log cursor is the xmin of the snapshot). In stream mode the number
+comes from the configuration (\fBloader\-threads\fR). The fetch stream (the
+zones the Backend asks for) is served by a pool of the same size: one thread
+reads the requests, and up to N workers (started when a request finds none idle)
+read one zone each on a connection of their own; the messages of one zone go out
+together, so zones of two workers never mix. Before, one thread read the zones
+one at a time (about 500 a second at 11 records a zone in SQLite3).
+.TP 8
+\fB\-\-map\-view NAME\fR
+Keep only the zones that \fBkaridns_domain_views\fR maps to the view \fBNAME\fR
+(a domain without a row is kept): what a view that uses the shared source of a
+server gets.
+.TP 8
+\fB\-s FD\fR, \fB\-\-fetch\-fd FD\fR
+Stream mode, what \fBkaridns\fR runs: \fBFD\fR is the socket to the Backend
+(descriptor 3). \fB\-\-fetch\-fd FD\fR (descriptor 4) is the second stream, for
+fetches (below); without it the loader works as before.
+.TP 8
+\fB\-\-auto\-reload\fR, \fB\-\-server\-id ID\fR, \fB\-\-ecs\-tag NAME\fR, \fB\-\-location\-tag NAME\fR, \fB\-\-max\-zone\-records N\fR, \fB\-\-max\-zone\-bytes N\fR
+With \fB\-\-check\fR only: the values of the configuration that change what is
+an error (change log triggers are required with auto reload; \fBserver\-id\fR of
+a PostgreSQL view; the tags of \fBoptions { ecs\-tags }\fR /
+\fBlocation\-tags\fR records may name; the limits of the database
+block). \fBkaricheck db\fR passes them from \fBkaridns.conf\fR.
+.TP 8
+\fB\-\-version\fR, \fB\-h\fR, \fB\-\-help\fR
+Print the version, or the usage text.
+.SH THE FETCH STREAM
+D1a (milestone 2). \fBkaridns\fR starts the loader with a second socket,
+descriptor 4, next to the stream on descriptor 3 (\fB\-s 3 \-\-fetch\-fd 4\fR);
+a restart makes a new pair of each and hands the Backend's two ends over
+together. It is a second KDB1 stream (see \fBdns_db_stream.h\fR) for the one
+thing that must not wait behind a batch: the Backend asks for one zone because a
+parked query waits for it.
+.IP \(bu 2
+\fBRequests.\fR \fBFETCH_REQ\fR (request id, view, zone, priority 0 query / 1
+warm-up / 2 background, mode 0 the zone / 1 its summary; an optional range,
+which this loader refuses). A thread of the loader reads them into a queue of
+256, takes the most urgent first (the oldest within a priority) and reads the
+zone through the same code as a one-zone reload: its own connection and
+snapshot, no batch, no inventory, no results. A request beyond the queue is
+answered \fBZONE_FAILED\fR "busy" (the first eight; more are dropped and the
+Backend's own time-out ends them).
+.IP \(bu 2
+\fBAnswers.\fR \fBZONE_BEGIN\fR .. \fBZONE_DATA\fR .. \fBZONE_END\fR with the
+request id in \fBZONE_BEGIN\fR (a secondary or catalog zone has no data, as in a
+batch); or the \fBsummary\fR (mode 1, primary zones): \fBZONE_BEGIN\fR with the
+summary flag and \fBZONE_END\fR, carrying the serial, the SOA refresh / retry /
+expire and whether the zone is presigned (metadata \fBPRESIGNED=1\fR), no
+records, a zero digest. The summary of a zone with no location tags or tinydns
+attributes also carries its \fBapex\fR (ZONE_BEGIN tags 15 to 21; the same in
+the summaries of a batch): the SOA's names, minimum and TTL, the NS targets (at
+most 8, the lowest TTL of the RRset) and the A / AAAA records of the NS targets
+that are inside the zone (at most 8 for a name, in the order of the zone, the
+lowest TTL of the records of one type), read with \fBscan_apex\fR; a zone with
+more than that sends no apex. With them goes tag 22, the \fBNOTIFY addresses\fR
+(D1a step 7): the A and AAAA records, in \fBany zone of the same source\fR,
+whose name is an NS target that is \fIoutside\fR the zone (found by name,
+\fBrecords.name = lower(<NS target>)\fR: an equality on the name index, one
+lookup per NS record; PowerDNS stores names in lower case, a name stored with
+capitals is not found), at most 8 for one target and 1152 bytes in all (the
+first ones in \fBrecords.id\fR order; more do not take the apex away, they are
+cut), as records of the NS index in tag 20, the type and the address. The
+Backend keeps them with the apex only for a zone that sends NOTIFY to its NS
+hosts (\fBnotify yes\fR or \fBprimary\-only\fR) and sends NOTIFY to them when
+the zone changes while its data is out of memory (\fBkaridns(8)\fR, "Zone
+transfers" and "NOTIFY"); it checks the list again (format, the index of a name
+outside the zone). A loader that does not send the tag costs the NOTIFY to those
+hosts, nothing else. The Backend answers an SOA question for a zone that is out
+of memory from it (\fBkaridns(8)\fR, "SOA questions for a zone that is out of
+memory"). After a reload that makes a zone keep an apex, the Backend asks for
+the summary of the zones out of memory that have none (mode 1, priority
+warm-up). Or \fBZONE_FAILED\fR with the request id and the reason (the zone is
+not in the database, its type is not supported, no SOA, the database could not
+be read, busy). Never silence. The Backend's state machine for this stream
+(\fBkdb_sm_init_fetch()\fR) accepts nothing else, and discards a zone it did not
+ask for.
+.IP \(bu 2
+\fBThe end of the stream.\fR The fetch stream is as vital as the first one: when
+the Backend closes it (it does after a protocol error of the loader, a full send
+buffer or an out-of-memory) or it breaks, the loader ends with status 3 and the
+supervisor starts another one with a new pair of streams (after the usual 1, 2,
+4 ... 60 s). A loader that went on without a fetch stream would fail every later
+fetch "not connected" until it died for some other reason.
+.IP \(bu 2
+\fBInventory.\fR The Backend's \fBINVENTORY\fR entries have a \fBresident\fR
+flag (0 for a zone whose data was taken out of memory or left out because of
+\fBmemory\-limit\fR: the entry then carries the serial and no digest). A zone
+that is not resident is not sent by a full comparison (no digest to compare); a
+zone that changed still is.
+.IP \(bu 2
+\fBNot in this milestone.\fR The settings text and the addresses of name servers
+outside the zone in the summary (design 7), and a request for a range of a zone.
+.SH THE HOT LIST AND THE STATE FILE
+D1a step 7. With \fB\-\-state\-file\fR the loader keeps, for the Backend, the
+list of the zones that are asked for most (see \fBkaridns.conf\fR,
+\fBloader\-state\-file\fR, \fBhot\-list\-size\fR, \fBhot\-list\-interval\fR and
+\fBwarm\-before\-serve\fR). Two messages on the first stream carry it, both in
+parts (at most 16384 zones and 1 MiB each; the zones are named by view name and
+zone name, because the file outlives a reconfiguration):
+.IP \(bu 2
+\fB\fBHOT_LIST\fB\fR (Backend to loader): the zones most asked for, hottest
+first, with the size the file may have. The loader checks it as it checks
+everything the Backend sends: at most 100000 zones, the parts in order (a part
+that does not follow drops the list, not the stream), a view that its CONFIG
+does not have is dropped, the names are canonical (the stream decoder refuses
+anything else). When the last part has come the loader merges it into the list
+of the file (the new zones first, then the zones of the old list that are not in
+the new one, up to the size), writes the file if the list changed, and answers
+\fB\fBHOT_ACK\fB\fR (written, unchanged, failed with the reason, or no file
+configured). A HOT_ACK is sent between two batches, never inside one.
+.IP \(bu 2
+\fB\fBWARM_LIST\fB\fR (loader to Backend): once, after the startup load, the
+zones of the file in order (an empty list when the file is missing or damaged),
+with what the loader found in the file at its start (\fBloaded\fR,
+\fBmissing\fR, \fBcorrupt\fR, \fBunreadable\fR) for \fBkarictl dbstatus\fR.
+.PP
+The file is text: \fBKARIDNS\-HOT\-LIST 1\fR, one line \fBview<TAB>zone\fR for
+each zone, hottest first, and \fBEND <count> <checksum>\fR (FNV-1a over the
+entry lines, eight hex digits). \fBPermissions.\fR The loader runs as
+\fBloader\-user\fR and writes in the directory of the file: give it a directory
+of its own, owned by \fBloader\-user\fR, mode 0700 (\fBinstall \-d \-o
+karidns\-db \-m 0700 /var/db/karidns/state\fR). The file is created with mode
+0600. The Backend, in capability mode, never opens it. The loader opens the file
+with \fBO_NOFOLLOW\fR, so \fBa state file that is a symbolic link is
+UNREADABLE\fR (\fBkarictl dbstatus\fR shows
+\fBstate\-file: ... at_start=unreadable, ignored\fR), even when the link points
+to a good file: give \fBloader\-state\-file\fR the real path (a link in a
+directory \fIabove\fR the file is fine; only the last component counts). A state
+file that exists and cannot be read (permissions, a link, not a regular file) is
+\fBnot replaced\fR: the loader says so in its log and in the acknowledgement of
+every hot list (\fBfailed\fR), and keeps going without a state file until it is
+fixed or removed. The count and checksum of the \fBEND\fR line must have exactly
+the form written (decimal digits, one space, eight lower case hex digits); the
+limit of a list is the one its first part says. The file is not trusted when it
+is read: it may be damaged, or written by somebody who could write in the
+directory; whatever its contents, the Backend reads only zones it has in its
+directory, at most 100000 of them, at the rate of \fBfetch\-rate\fR.
+.SH MESSAGES
+Run on its own (\fB\-\-dump\fR, \fB\-\-check\fR), the loader writes its messages
+to standard error, \fBkaridns\-dbloader: text\fR, as it always did (the dump
+tests and scripts read those lines).
+.PP
+Started by \fBkaridns\fR (\fB\-s\fR), the loader's standard error is a pipe that
+the supervisor (the manager process, which also restarts the loader) creates for
+every start: \fBkaridns\-dbloader \-s 3 [\-\-fetch\-fd 4] [\-\-state\-file PATH]
+\-\-log\-stderr\fR. The loader writes \fB<N>[DB] text\fR lines; the supervisor
+reads the pipe without blocking and logs each line in the \fBdatabase\fR
+category of BIND's \fBlogging { }\fR statement, with the severity of \fBN\fR
+(\fB<3>\fR error, \fB<4>\fR warning, \fB<5>\fR notice, \fB<6>\fR info) and, for
+a debug message (0.7, \fB\-\-debug\fR), \fB<7:L>\fR with \fBL\fR its debug
+level, 1 .. 99, logged at \fBdebug L\fR (the loader writes levels 1 and 2; an
+\fBL\fR above 10, the highest level of the server's own messages, is logged at
+\fBdebug 10\fR; a channel with \fBseverity dynamic\fR writes it while the debug
+level in force is at least \fBL\fR, \fBseverity debug <n>\fR when \fBn\fR is at
+least \fBL\fR; the text is cut at 255 bytes), so a configuration such as
+.PP
+.RS 2
+.nf
+logging {
+    channel dbfile { file "/var/log/karidns/database.log" versions 5 size 10m; severity info; print\-time yes; print\-severity yes; print\-category yes; };
+    category database { dbfile; };
+};
+.fi
+.RE
+.PP
+collects the messages of the loader together with the \fB[DB]\fR messages of the
+Backend (stream, batches, installs). Example lines:
+.PP
+.RS 2
+.nf
+28\-Oct\-2026 12:34:56.789 database: warning: [DB] zone 'zero.example.test.' (domains.id 2): the SOA serial is 0; PowerDNS may compute the served serial (SOA\-EDIT, auto\-serial), but KariDNS uses the stored value as it is, so secondaries and NOTIFY see serial 0
+28\-Oct\-2026 12:34:56.790 database: info: [DB] state file /var/db/karidns/hot.list: 12 zone(s) of the hot list
+28\-Oct\-2026 12:35:10.001 database: warning: [DB] 480 line(s) of the loader's output were not logged (more than 50 per second)
+.fi
+.RE
+.PP
+A message is logged once: when the loader is supervised it does not also write
+to syslog (syslog is only the fallback when the pipe cannot be written), and
+with no \fBcategory database\fR the lines go to the channels of \fBdefault\fR /
+\fBdefault_syslog\fR like any other category. The bytes of the pipe are
+untrusted input of the manager, which runs with root's rights until it drops
+them:
+.IP \(bu 2
+a line is cut at 512 bytes of text and ends in \fB...\fR; the rest of a longer
+line is read and thrown away, never kept;
+.IP \(bu 2
+everything but printable ASCII is written as \fB\exNN\fR (a NUL, ESC, a CR that
+does not end a CRLF, bytes of 0x80 and above), a tab as a space, so that nothing
+a database name contains can start a line of the log or hide in it;
+.IP \(bu 2
+a line without \fB<N>\fR (or \fB<7:L>\fR with \fBL\fR 1 .. 99 written without a
+leading 0) is logged at \fBnotice\fR with the text as it is, so a line of
+another version is never lost; empty lines are dropped; the end of the stream or
+the loader's end logs a last line that has no newline;
+.IP \(bu 2
+at most 50 lines per second of \fBwarning\fR and worse are logged, and at most
+50 of the others (notice, info, debug: the shared zone code says one info line
+per presigned zone, and such a flood must not drop an error of the same second);
+the others are counted and reported by one \fBwarning\fR line when their second
+is over (also when the loader writes nothing more);
+.IP \(bu 2
+one read takes at most 64 KiB, and the manager looks at its signals between
+reads, so a loader that floods the pipe cannot keep the manager from
+\fBSIGTERM\fR; a full pipe makes the loader wait;
+.IP \(bu 2
+the pipe is made for every start (close-on-exec, read end non-blocking), drained
+when the loader ends and then closed: restarts do not leave descriptors behind.
+.SH EXIT STATUS
+.TP 8
+\fB0\fR
+Every zone was written (\fB\-\-dump\fR), or nothing wrong was found
+(\fB\-\-check\fR).
+.TP 8
+\fB1\fR
+The stream is complete but some zones went out as ZONE_FAILED (the reason is on
+standard error), or \fB\-\-check\fR found errors.
+.TP 8
+\fB2\fR
+Usage error (a bad option or option value, a stray argument, a missing or
+contradicting option; the usage text or the reason goes to standard error);
+nothing was read. \fB\-h\fR / \fB\-\-help\fR print the usage text to standard
+output and exit with 0. The other tools use 2 for usage errors too
+(\fBkaricheck\fR, \fBkarictl\fR, \fBkaridns\fR).
+.TP 8
+\fB3\fR
+Error: database, schema, output or memory.
+.TP 8
+\fB4\fR
+Transient database error (busy); try again.
+.SH SCHEMA AND TRIGGER FILES
+The loader reads the tables of the \fBPowerDNS 5.1 generic SQLite3 / PostgreSQL
+backend\fR (\fBdomains\fR, \fBrecords\fR, \fBdomainmetadata\fR,
+\fBcryptokeys\fR; the PowerDNS schema file is not part of KariDNS: take
+\fBschema.sqlite3.sql\fR or \fBschema.pgsql.sql\fR from PowerDNS). KariDNS adds
+its own tables and triggers in the files below. The extension is optional;
+without it a database still loads, but there is no change log (zones are
+compared by SOA serial only), no view mapping, no profiles and no tags, and
+\fBkaricheck db\fR says what that costs.
+.TP 8
+\fBdb/karidns_ext.sqlite3.sql\fR
+SQLite3: schema version 3 (version 2 plus the tables \fBkaridns_audit_log\fR and
+\fBkaridns_audit_actor\fR, and \fBkaridns_key_requests\fR and
+\fBkaridns_signer_state\fR of the signer, which the loader does not use; the
+audit triggers are in \fBdb/karidns_audit.sqlite3.sql\fR, applied when the
+WebAdmin or the signer is used, and the users, groups and grants of the WebAdmin
+in the file \fBdb/karidns_auth.sqlite3.sql\fR, which the API ATTACHes: the
+loader never opens it). \fBkaridns_changes\fR (the change log: which domain
+changed, written by triggers on \fBdomains\fR, \fBrecords\fR,
+\fBdomainmetadata\fR, \fBcryptokeys\fR and the tables below), a trigger that
+keeps the newest 1,000,000 log rows, \fBkaridns_domain_views\fR,
+\fBkaridns_profiles\fR, \fBkaridns_record_tags\fR, \fBkaridns_record_tinydns\fR,
+\fBkaridns_zone_tagdefs\fR, \fBkaridns_schema_version\fR. Apply it once, as the
+owner of the database, after the PowerDNS schema. It can be applied again.
+.TP 8
+\fBdb/karidns_ext.pgsql.sql\fR
+PostgreSQL: schema version 3 (version 2 plus the schema \fBkaridns_auth\fR:
+users, groups, grants, the audit log, the RLS functions and policies; see THE
+AUTH SCHEMA, ROLES AND THE AUDIT LOG below). The same tables with
+statement-level triggers (one log row per distinct domain per statement),
+\fBNOTIFY karidns_changes\fR for auto reload, and the multi-server tables
+\fBkaridns_reload_requests\fR and \fBkaridns_server_status\fR. PostgreSQL 13 or
+newer. Apply it in the schema that holds the PowerDNS tables.
+.TP 8
+\fBdb/karidns_ext_v1_to_v2.sqlite3.sql\fR, \fBdb/karidns_ext_v1_to_v2.pgsql.sql\fR
+Convert a database from schema version 1 (the extension files of the early
+betas) to version 2. The loader reads both versions and serves a version 1
+database without a change log.
+.TP 8
+\fBdb/karidns_writer_role.pgsql.sql\fR
+PostgreSQL: the privileges of the role that \fBkaridns\-zone\fR imports with
+(\fBpsql \-v role=... \-v schema=...\fR). \fBSELECT, INSERT, UPDATE, DELETE\fR
+on \fBdomains\fR, \fBrecords\fR and \fBdomainmetadata\fR, the \fBkaridns_*\fR
+zone tables, what the change-log triggers need, and only the column privilege
+\fBSELECT (domain_id)\fR on \fBcryptokeys\fR (never \fBcontent\fR, the private
+keys). Not for the loader: give the loader \fBkaridns_loader_role.pgsql.sql\fR.
+.PP
+A bulk import writes one change-log row per changed row (SQLite3) or per
+statement (PostgreSQL); a big import makes the next reload compare every zone
+once. The files carry their own documentation in their first lines.
+.PP
+The users, groups, grants, database roles, row level security and the audit log
+of the WebAdmin and the signer (the schema \fBkaridns_auth\fR,
+\fBdb/karidns_api_role.pgsql.sql\fR, \fBdb/karidns_signer_role.pgsql.sql\fR,
+\fBdb/karidns_audit.sqlite3.sql\fR, \fBdb/karidns_auth.sqlite3.sql\fR) are
+described in THE AUTH SCHEMA, ROLES AND THE AUDIT LOG, below.
+.SS Indexes
+The extension files create \fBkaridns_zone_tagdefs_domain_idx\fR on
+\fBkaridns_zone_tagdefs (domain_id)\fR (the loader reads the tag definitions of
+one zone at a time; without the index every such read scans the table). It was
+added after schema version 2, which stays 2: apply \fBdb/karidns_ext.*.sql\fR
+(or the \fBv1_to_v2\fR script) again to get it on an existing database.
+.PP
+\fBThe loader is read-only and never creates an index.\fR Two optional
+PostgreSQL indexes on the PowerDNS tables make the big reads faster; create them
+yourself when the database is large:
+.TP 8
+\fBCREATE INDEX records_soa_cover_idx ON records (domain_id) INCLUDE (name, content) WHERE type = 'SOA' AND disabled = false;\fR
+The zone list of every full comparison (\fBkarictl reload\fR, auto reload, a
+loader restart) joins each domain to its apex SOA. With this partial covering
+index the join is an index-only merge over one row per zone. The loader looks
+the index up once per connection (\fBpg_indexes\fR) and then leaves the
+planner's \fBcursor_tuple_fraction\fR at its default (0.1) for the list; without
+the index it plans the list for all of its rows (\fB1\fR), which is then the
+faster plan. Measured at 1,000,000 zones x 11 records (\fBpsql\fR, 3 runs):
+without the index 2.2 s planned for all rows (one pass over the SOA rows)
+against 2.6 s at the default (a walk of the whole \fBrecords\fR table through
+its \fBdomain_id\fR index); with the index 1.7 s planned for all rows (the
+planner still reads every SOA row) against 1.0 s at the default (the index-only
+merge).
+.TP 8
+\fBCREATE INDEX domains_lower_name_idx ON domains (lower(name));\fR
+A one-zone read of a zone that is not in the database (a deletion, a typo in
+\fBkarictl reload <zone>\fR) falls back to \fBlower(d.name)\fR, a table scan of
+\fBdomains\fR without this expression index (about 0.2 s at 1,000,000 zones).
+.PP
+\fBMigration note: \fBrecords.name\fB of address rows must be in lower case.\fR
+When a zone is out of memory (\fBmemory\-limit\fR), the Backend sends its NOTIFY
+from the zone's summary, and the summary carries the addresses of the NS targets
+that are \fIoutside\fR the zone (tag 22 of \fBZONE_BEGIN\fR,
+\fBKDB_NOTIFY_ADDR_PER_NS\fR per name). The loader reads them with \fBg.name =
+lower(<NS target>)\fR (SQLite3 and PostgreSQL alike), an exact comparison that
+the index on \fBrecords (name)\fR serves; it does not fold the case of
+\fBrecords.name\fR. An A / AAAA row of such a target whose \fBname\fR has an
+upper case letter is not found, and that name server gets no NOTIFY while the
+zone is out of memory (the addresses \fIinside\fR the zone are matched
+case-insensitively and are not affected). PowerDNS stores names in lower case,
+so a database written by PowerDNS or by \fBzone2sql\fR is fine; before pointing
+the loader at data from another source or edited by hand, check \fBSELECT id,
+name FROM records WHERE type IN ('A', 'AAAA') AND name <> lower(name);\fR and
+fix the rows (\fBUPDATE records SET name = lower(name) WHERE name <>
+lower(name);\fR).
+.PP
+\fBZone names that differ only in case are not supported.\fR PowerDNS stores
+\fBdomains.name\fR in lower case, and so should the data: two rows of one source
+such as \fBExample.test\fR and \fBexample.test\fR are two rows for PostgreSQL's
+case-sensitive unique index (the PowerDNS PostgreSQL schema has a \fBCHECK\fR
+constraint \fBc_lowercase_name\fR that refuses upper case, and SQLite3's schema
+declares the column \fBCOLLATE NOCASE\fR; such rows only exist when a constraint
+was dropped or the data was written around it). The loader keeps the one-zone
+lookup (\fB\-\-zone\fR, used by reload requests and auto reload) fast: it
+matches the indexed name exactly first and falls back to \fBlower()\fR only when
+that finds nothing. With such duplicates a full read and a one-zone read may
+therefore pick different rows. \fBkaricheck db\fR (\fBkaridns\-dbloader
+\-\-check\fR) warns about every pair of \fBdomains\fR rows of one source whose
+names are equal ignoring case, with both \fBdomains.id\fR values (both drivers);
+fix the data, do not rely on either row.
+.SH THE AUTH SCHEMA, ROLES AND THE AUDIT LOG (0.6.0)
+Schema version 3 adds what the WebAdmin API and the signer daemon need: users,
+groups and grants, database roles held to their grants by row level security
+(RLS, PostgreSQL only), an audit log, and the signer's two tables. The server
+and \fBkaridns\-dbloader\fR use none of it (but for the metadata
+\fBX\-KARIDNS\-SIGNER\fR, below). A database that only has the loader's and the
+importer's roles behaves as it did before: RLS is off and nothing is logged.
+.PP
+\fBThe signer's tables (0.6.0 item C).\fR The daemon that uses them is
+\fBkaridns\-signer(8)\fR. \fBkaridns_key_requests\fR and
+\fBkaridns_signer_state\fR are in \fBdb/karidns_ext.pgsql.sql\fR and
+\fBdb/karidns_ext.sqlite3.sql\fR (per data schema, like the other
+\fBkaridns_*\fR tables; apply the file again to a version 3 database that lacks
+them; the schema version stays 3). They go away with their zone (\fBON DELETE
+CASCADE\fR), are covered by the audit (\fBenable_audit\fR; the SQLite3 audit
+file has their triggers) and write \fBno\fR row to \fBkaridns_changes\fR: the
+signer writes its state after every run, and a signer that followed its own
+state would never stop.
+.TP 8
+\fBkaridns_key_requests\fR
+\fBid\fR, \fBdomain_id\fR, \fBkind\fR (\fBenable\fR = start signing the zone:
+generate the first key or keys, set the metadata; \fBadd\fR = one more key),
+\fBalgorithm\fR (8, 10, 13, 14, 15, 16; default 13), \fBbits\fR (RSA only,
+1024..8192), \fBkey_type\fR (\fBcsk\fR, \fBksk\fR, \fBzsk\fR; default
+\fBcsk\fR), \fBnsec\fR (\fBnsec3\fR, \fBnsec\fR; \fBenable\fR only), \fBstate\fR
+(\fBpending\fR, \fBdone\fR, \fBfailed\fR), \fBmessage\fR, \fBrequested_by\fR (a
+principal id), \fBcreated_at\fR, \fBdone_at\fR (set when the state is not
+\fBpending\fR). The WebAdmin (a global master or the domain master of the zone)
+or an operator files a row; the signer answers it. A unique partial index
+(\fBkaridns_key_requests_one_pending_idx\fR) allows \fBone pending request per
+zone\fR: a second one is refused until the first is answered. On PostgreSQL the
+WebAdmin's role may \fBINSERT\fR only the columns \fBdomain_id\fR, \fBkind\fR,
+\fBalgorithm\fR, \fBbits\fR, \fBkey_type\fR, \fBnsec\fR and \fBrequested_by\fR
+(not the state, the message, \fBdone_at\fR or the id), and the signer's role may
+\fBUPDATE\fR only \fBstate\fR, \fBmessage\fR and \fBdone_at\fR.
+.TP 8
+\fBkaridns_signer_state\fR
+\fBdomain_id\fR (the key), \fBsigned_at\fR, \fBsigned_serial\fR,
+\fBmin_expire\fR (the earliest RRSIG expiration of the zone, as \fBkaridns\-zone
+import \-\-signer\fR reports it), \fBnext_due\fR (when the signer wants to look
+at the zone again; indexed), \fBattempts\fR (failed runs since the last
+success), \fBlast_error\fR, \fBlast_duration_ms\fR. Only the signer writes it.
+.TP 8
+\fBkaridns_signer_monitor\fR (a view)
+one row per zone with \fBX\-KARIDNS\-SIGNER\fR = 1 (0.6.1): \fBdomain_id\fR,
+\fBzone\fR, the columns of \fBkaridns_signer_state\fR (empty for a zone without
+a state row), \fBstatus\fR (the first that applies of \fBexpired\fR,
+\fBfailing\fR, \fBoverdue\fR (\fBnext_due\fR over an hour ago), \fBexpiring\fR
+(signatures end within two days), \fBunsigned\fR, \fBok\fR) and
+\fBseconds_to_expiry\fR. For a monitoring system: \fBkaridns\-signer(8)\fR,
+"Monitoring". PostgreSQL: it is the owner's and does not apply the reader's row
+level security; grant \fBSELECT\fR on the view to the monitoring role and on
+nothing else.
+.PP
+PostgreSQL stores the times as \fBtimestamptz\fR; SQLite3 as unix seconds
+(\fBINTEGER\fR), like \fBkaridns_changes.changed_at\fR.
+.PP
+\fBThe zones of the signer (\fBX\-KARIDNS\-SIGNER\fB).\fR \fBkaridns\-zone
+import \-\-signer\fR writes the metadata \fBX\-KARIDNS\-SIGNER\fR = \fB1\fR on a
+zone the signer keeps signed. The server and the loader know it in one place:
+with \fBdatabase { signer\-wait yes; }\fR (the default) the loader does not
+reload such a zone because of the change log or a moved serial, only on a reload
+request or in a full comparison, so a change that is not signed yet is not
+served (\fBkaridns(8)\fR, "The signer's zones"). \fBPowerDNS\fR on the same
+database reads it live and serves a change at once, signed or not: there the
+zone is only as safe as the order of the writes; keep PowerDNS and the signer
+apart, or let the signer be the only writer of a signed zone's DNSSEC records.
+.SS What version 3 adds
+.TP 8
+PostgreSQL (\fBdb/karidns_ext.pgsql.sql\fR)
+The schema \fBkaridns_auth\fR with the tables \fBprincipals\fR,
+\fBcredentials\fR, \fBmemberships\fR, \fBprincipal_closure\fR,
+\fBrr_policies\fR, \fBgrants\fR, \fBaudit_log\fR and \fBschema_version\fR; the
+functions and triggers that keep them consistent; the RLS policies for the
+tables of the data schema (they do nothing while RLS is off); and the audit
+triggers of \fBkaridns_auth\fR itself. There is one \fBkaridns_auth\fR for the
+whole database, shared by every data schema (a view that has a schema of its own
+applies the same file there and adds its own triggers and policies).
+.TP 8
+SQLite3
+\fBdb/karidns_ext.sqlite3.sql\fR adds the tables \fBkaridns_audit_log\fR and
+\fBkaridns_audit_actor\fR to the zone file. The users, groups and grants live in
+a file of their own, \fBdb/karidns_auth.sqlite3.sql\fR, so that the loader,
+which only opens the zone file, can never read a password hash. SQLite3 has no
+roles and no RLS: the API does the checks that PostgreSQL does in the policies.
+.PP
+Items D and E (the API, templates, zone versions) add tables and functions to
+version 3 in the same way (below, "The API tables, the zone generation and
+versions, and the check role"). Both: the version row says 3
+(\fBkaridns_auth.schema_version\fR and \fBkaridns_schema_version\fR). The loader
+and \fBkaricheck db\fR read versions 1, 2 and 3. There is no v2-to-v3 file:
+apply the version 3 file again and the database becomes version 3 (it only adds
+objects). Version 1 needs the \fBv1_to_v2\fR file first.
+.SS Files and the order to apply them
+.IP 1. 4
+The PowerDNS schema (from PowerDNS, not part of KariDNS).
+.IP 2. 4
+PostgreSQL: \fBdb/karidns_ext.pgsql.sql\fR, as the owner of the PowerDNS tables,
+who needs \fBCREATE\fR on the database (for \fBCREATE SCHEMA
+karidns_auth\fR). Once per data schema; it can be applied again. SQLite3:
+\fBsqlite3 zones.sqlite3 < db/karidns_ext.sqlite3.sql\fR, and \fBsqlite3
+auth.sqlite3 < db/karidns_auth.sqlite3.sql\fR as the user of the API.
+.IP 3. 4
+The roles of the tools, as an administrator, once per data schema:
+\fBdb/karidns_loader_role.pgsql.sql\fR (the server's loader),
+\fBdb/karidns_writer_role.pgsql.sql\fR (\fBkaridns\-zone\fR),
+\fBdb/karidns_api_role.pgsql.sql\fR (the WebAdmin API),
+\fBdb/karidns_signer_role.pgsql.sql\fR (the signer). They can be run in any
+order and again.
+.IP 4. 4
+\fBGRANT karidns_rls_trusted TO <the PowerDNS gpgsql role>;\fR and the same for
+every other role that must see everything (backup, monitoring). The loader and
+writer scripts do it for their role.
+.IP 5. 4
+SQLite3 only, when the API or the signer is used: \fBsqlite3 zones.sqlite3 <
+db/karidns_audit.sqlite3.sql\fR (the audit triggers).
+.PP
+.RS 2
+.nf
+psql \-v ON_ERROR_STOP=1 \-f db/karidns_ext.pgsql.sql karidns
+psql \-v ON_ERROR_STOP=1 \-v role=karidns_api    \-v schema=public \-f db/karidns_api_role.pgsql.sql karidns
+psql \-v ON_ERROR_STOP=1 \-v role=karidns_signer \-v schema=public \-f db/karidns_signer_role.pgsql.sql karidns
+.fi
+.RE
+.PP
+The ext file only creates things. RLS and the audit triggers on the PowerDNS
+tables are switched on by the API and signer role scripts
+(\fBkaridns_auth.enable_rls()\fR, \fBenable_audit()\fR); switching RLS on in the
+ext file would hide every row from the loader, from \fBkaridns\-zone\fR and from
+PowerDNS itself. \fBkaridns_auth.disable_rls('public')\fR and
+\fBdisable_audit('public')\fR switch them off again.
+.SS Users, groups and tenants
+A \fBprincipal\fR is a user or a group (\fBprincipals.kind\fR). Names are unique
+ignoring case. A \fBuser\fR may have \fBcredentials\fR (a password hash as a PHC
+string, \fB$argon2id$\fR or \fB$scrypt$\fR: the database checks the prefix only;
+an opaque TOTP secret, which the API should store encrypted with a key of its
+own; an OIDC issuer and subject; failed-login and lock fields). Only the API
+role reads the credentials, and only a user's own row and, for a global master,
+all of them.
+.PP
+A \fBmembership\fR puts a user or a group into a group. Groups nest, at most 8
+deep; a cycle is refused, and so is a user as a group. \fBprincipal_closure\fR
+lists every principal with all the groups it is in, directly or not (plus itself
+at depth 0); triggers keep it, so a policy joins it instead of recursing. A
+group that is in no group is a \fBtenant\fR; a principal's tenants are the top
+groups of its closure. The database only stores this; the API uses it ("grant
+only inside my tenant", lists). A disabled principal, or a grant held through a
+disabled group, counts for nothing.
+.SS Record policies (rr_policies)
+A grant carries a record policy: \fBallowed_types\fR (a list; never a
+DNSSEC-managed type: \fBRRSIG\fR, \fBNSEC\fR, \fBNSEC3\fR, \fBNSEC3PARAM\fR,
+\fBDNSKEY\fR, \fBCDS\fR, \fBCDNSKEY\fR; \fBDS\fR is an ordinary type),
+\fBallow_wildcard\fR, \fBallow_delegation\fR (\fBNS\fR below the apex),
+\fBallow_dname\fR, \fBapex_editable\fR, \fBttl_min\fR and \fBttl_max\fR, and
+\fBmax_rr\fR. All the flags default to false. The database enforces everything
+but \fBmax_rr\fR, which the API checks.
+.SS Grants
+A grant gives a principal a role on zones. The zone is named by \fB(data schema,
+zone name)\fR, not by \fBdomains.id\fR: there is one \fBkaridns_auth\fR and
+several data schemas, and in SQLite3 the grants are in another file. Names are
+stored lower case without the final dot.
+.TP 8
+\fBglobal_master\fR
+Every zone of the database. Its record policy still limits the records it may
+write.
+.TP 8
+\fBdomain_master\fR
+One zone: all its records that the record policy allows.
+.TP 8
+\fBsubdomain_master\fR
+One zone, and only the names at or below a suffix inside it (at a label
+boundary: \fBevilsub.example.com\fR is not under \fBsub.example.com\fR). It may
+not change the apex.
+.PP
+The principal's effective grants are its own and those of every group it is
+in. A trigger on \fBdomains\fR removes the grants of a zone that is deleted and
+renames them when the zone is renamed, so a grant never moves to a new zone of
+the same name that someone else creates later. On SQLite3 the API does this
+cleanup itself (the grants are in another file).
+.PP
+\fBNo escalation.\fR A trigger on \fBkaridns_auth.grants\fR binds the sessions
+of the API role (and of every role that is a member of it; the owner and other
+roles are the operator and are not bound). A global master may grant anything. A
+domain master may grant \fBdomain_master\fR or \fBsubdomain_master\fR on its own
+zone, with a record policy that is a \fBsubset\fR of the one it holds (fewer
+types, no flag it lacks, a TTL range inside its own, \fBmax_rr\fR not higher; no
+limit counts as the highest). A subdomain master may not grant. A grant may be
+deleted by a global master, or by a domain master of the zone for a grant it
+could have made. \fBgranted_by\fR and \fBgranted_at\fR are set by the trigger. A
+record policy that a global master changes later is trusted.
+.SS Roles (PostgreSQL)
+The role scripts take \fB\-v role=\fR and \fB\-v schema=\fR, so a site can name
+its roles. Each script revokes every earlier privilege of its role on the tables
+of the schema first.
+.TP 8
+\fBdb/karidns_api_role.pgsql.sql\fR
+The role the API connects as (created \fBNOLOGIN\fR if it does not exist:
+\fBGRANT\fR it to the login role, which must not be a member of
+\fBkaridns_rls_trusted\fR). \fBSELECT, INSERT, UPDATE, DELETE\fR on
+\fBdomains\fR, \fBrecords\fR, \fBdomainmetadata\fR and the \fBkaridns_*\fR zone
+tables, only the column privilege \fBSELECT (id, domain_id, flags, active,
+published)\fR on \fBcryptokeys\fR (never \fBcontent\fR), the users, groups,
+grants and credentials of \fBkaridns_auth\fR (the only role that reads
+\fBcredentials\fR), \fBSELECT\fR on the audit log, \fBEXECUTE\fR on
+\fBkaridns_auth.bump_serial()\fR. \fBSELECT\fR and \fBINSERT\fR (no
+\fBDELETE\fR) on \fBkaridns_reload_requests\fR; nothing on
+\fBkaridns_changes\fR. No \fBTRUNCATE\fR, no write to the audit log. It switches
+RLS and the audit log on. The script stops, before it changes anything, if the
+role is a superuser or has \fBBYPASSRLS\fR, is a member of
+\fBkaridns_rls_trusted\fR, or is, or is a member of, the owner of the tables
+(directly or through other roles).
+.TP 8
+\fBdb/karidns_signer_role.pgsql.sql\fR
+The signer: reads every table including \fBcryptokeys.content\fR and the change
+log \fBkaridns_changes\fR (it follows the log to see which zones changed);
+inserts and deletes the DNSSEC-managed record types; updates records (a trigger
+decides what: below); writes the metadata kinds \fBPRESIGNED\fR,
+\fBNSEC3PARAM\fR and \fBX\-KARIDNS\-SIGNER\fR; inserts reload requests and new
+keys (\fBINSERT\fR on \fBcryptokeys\fR, no \fBUPDATE\fR or \fBDELETE\fR);
+answers the key requests (\fBSELECT\fR, and \fBUPDATE\fR of the columns
+\fBstate\fR, \fBmessage\fR and \fBdone_at\fR only, on
+\fBkaridns_key_requests\fR); keeps its schedule (\fBSELECT\fR, \fBINSERT\fR,
+\fBUPDATE\fR, \fBDELETE\fR on \fBkaridns_signer_state\fR). Nothing on
+\fBkaridns_auth\fR, nothing written to \fBkaridns_changes\fR. It is a trusted
+daemon held to its types by RLS and a trigger, not bound by grants, and its role
+is \fBnot\fR in \fBkaridns_auth.audit_restricted_roles\fR (\fBkaridns\-zone
+import \-\-signer\fR writes the audit in summary mode: a re-sign replaces every
+signature, and a row per signature is a log that nobody reads). Its write
+policies of \fBrecords\fR and \fBdomainmetadata\fR exist twice, permissive and
+\fBRESTRICTIVE\fR, so setting \fBkaridns.principal\fR to a global master does
+not let it write an \fBA\fR record. The trigger on \fBrecords\fR (for the roles
+in \fBkaridns_auth.signer_roles\fR) holds it to its columns: a DNSSEC record may
+change in any column; \fBevery other record only in \fBordername\fB and
+\fBauth\fB\fR (the NSEC3 hash of its owner and the authoritative flag, which a
+signature chain needs; the trigger is declared \fBBEFORE UPDATE OF\fR every
+column but those two, so it does not fire for an \fBUPDATE\fR of just those two,
+like \fBpdnsutil rectify\-zone\fR's, and costs nothing there); an SOA row only
+in its serial, \fBordername\fR and \fBauth\fR (type, name, domain, TTL,
+priority, the flag and the rest of the content stay), and it neither inserts nor
+deletes an SOA. The same refusals as for the API role apply at install time.
+.TP 8
+\fBdb/karidns_check_role.pgsql.sql\fR
+The check role of the API (items D and E): the writer role's privileges,
+membership of \fBkaridns_rls_trusted\fR and of \fBkaridns_never_commit\fR,
+\fBUSAGE\fR on \fBkaridns_auth\fR and \fBEXECUTE\fR on \fBbump_serial\fR; its
+transactions cannot commit a write (below).
+.TP 8
+\fBdb/karidns_loader_role.pgsql.sql\fR, \fBdb/karidns_writer_role.pgsql.sql\fR
+As before, plus membership in \fBkaridns_rls_trusted\fR. Nothing on
+\fBkaridns_auth\fR. The loader and \fBkaridns\-zone\fR read and write everything
+with RLS on, in either script order.
+.TP 8
+the owner
+Owns everything and is not subject to RLS (no \fBFORCE\fR). The only role that
+may \fBUPDATE\fR or \fBDELETE\fR audit rows.
+.PP
+Nobody gets \fBBYPASSRLS\fR or superuser.
+.SS What row level security checks
+The API sets \fBSET LOCAL karidns.principal = '<id>'\fR in every transaction;
+the policies read it. A missing, empty or non-numeric setting, a principal that
+does not exist and a disabled principal are all "no principal": no rows, no
+writes.
+.PP
+A row is \fBwritable\fR when one effective grant of the principal covers it: the
+name is in the grant's scope, the type is allowed and not DNSSEC-managed, the
+TTL (NULL counts as 0) is in the policy's range, a wildcard label needs
+\fBallow_wildcard\fR, \fBNS\fR below the apex needs \fBallow_delegation\fR,
+\fBDNAME\fR needs \fBallow_dname\fR, and the apex needs \fBapex_editable\fR and
+a role other than subdomain master. Two grants never combine for one row. The
+SOA changes only through \fBkaridns_auth.bump_serial(schema, domain_id)\fR (adds
+1, RFC 1982; any grant on the zone may call it), or for a global master whose
+policy allows it. The type names \fBTYPE2\fR, \fBTYPE6\fR, \fBTYPE39\fR and
+\fBTYPE46\fR ... \fBTYPE60\fR are read as the names they stand for, so an alias
+gets the rules of the name. A record outside its zone, a row without a name and
+(outside the apex) an empty non-terminal follow the same scope rule.
+.PP
+A row is \fBvisible\fR when a grant of the principal reaches it: a domain master
+sees the records of its zone, a subdomain master those of its suffix, a global
+master every zone; the SOA and the apex \fBNS\fR are visible to every grant on
+the zone. A row without a name, a row whose name is outside its zone and a row
+without a zone are invisible to the API, a global master included (the owner
+repairs them). A trailing dot of \fBdomains.name\fR is ignored.
+.PP
+The signer's tables follow the same rule: a global master or the domain master
+of the zone files a key request (\fBINSERT\fR into \fBkaridns_key_requests\fR:
+state \fBpending\fR, no message, \fBrequested_by\fR the acting principal itself)
+and sees the requests of its zones; any grant on the zone reads
+\fBkaridns_signer_state\fR; the API cannot change either table (the signer
+does).
+.PP
+The other tables follow the zone: \fBdomains\fR, \fBdomainmetadata\fR, the tag
+tables, the key table (without \fBcontent\fR) and the views are visible to a
+grant on the zone; a global master writes \fBdomains\fR, \fBdomainmetadata\fR
+(not the kinds the signer owns) and \fBkaridns_domain_views\fR; a domain master
+writes \fBkaridns_zone_tagdefs\fR; the tag rows of a record follow the
+record. \fBprincipals\fR, \fBmemberships\fR and \fBrr_policies\fR are readable
+by every API session (a login looks the user up by name before it has a
+principal id) and changed by a global master. The audit log is visible to a
+global master (all of it) and to a domain master (the rows of its zones).
+.PP
+\fBWhat the API must check itself.\fR The database cannot see: that one grant
+allows a whole change set (it checks each row alone), \fBmax_rr\fR, a CNAME
+beside other data and the other zone checks (\fBkaricheck \-\-json\fR), and that
+a change set stays in one zone.
+.SS karidns_rls_trusted
+The policies bind every role that is not a member of \fBkaridns_rls_trusted\fR,
+a \fBNOLOGIN\fR role the scripts create. A role that must see and write
+everything joins it: the loader and writer scripts do it for their role, and for
+the PowerDNS \fBgpgsql\fR backend's role and any other role you run
+.PP
+.RS 2
+.nf
+GRANT karidns_rls_trusted TO <the PowerDNS gpgsql role>;
+.fi
+.RE
+.PP
+A role that uses the tables without it is refused (no rows, or \fBpermission
+denied for function\fR) once RLS is on. The table owner is not subject to RLS
+and is the "operator" for the grant trigger: do not make the owner a member of
+the API role. The maintenance triggers of the data tables (the change log
+\fBkaridns_changes\fR and its prune, the reload requests and their prune) run as
+the owner with a pinned \fBsearch_path\fR, so the API and signer roles need no
+right on the change log and cannot read, forge or delete it.
+.SS The trust boundary
+\fBkaridns.principal\fR is a custom setting that any session can set. The API is
+trusted to set it to the logged-in user. RLS catches the API's own mistakes (a
+missing \fBWHERE\fR, a wrong zone id); it does not stop a compromised API
+process or a stolen database password of the API role. That is why the API role
+gets nothing of \fBcryptokeys.content\fR, nothing of what the signer or the
+owner may do, and no way to change or delete audit rows. Treat the API's
+database password like the key to every zone it has a grant on.
+.SS The audit log
+With the audit triggers on, every change of the tables of the data schema and of
+\fBkaridns_auth\fR is logged. PostgreSQL: \fBkaridns_auth.audit_log\fR; SQLite3:
+\fBkaridns_audit_log\fR in the zone file and \fBkaridns_auth_audit\fR in the
+auth file. The columns:
+.PP
+.TS
+lbw(35) lbw(36)
+lw(35) lw(36).
+\&Column	\&Meaning
+_
+\&\fBid\fR, \fBat\fR	\&A running number, the time.
+\&\fBxid\fR	T{
+The transaction (PostgreSQL), to group the rows of one commit.
+T}
+\&\fBdb_role\fR	T{
+The database role (the role after \fBSET ROLE\fR, else the login
+role). \fBkaridns\-zone\fR on SQLite3: \fBkaridns\-zone:<OS user>\fR.
+T}
+\&\fBprincipal_id\fR, \fBprincipal_name\fR	T{
+\fBkaridns.principal\fR of the session and its name (copied, so it survives the
+deletion of the principal). NULL without one.
+T}
+\&\fBchange_set\fR	T{
+\fBkaridns.change_set\fR of the session: the API's change set.
+T}
+T{
+\fBdata_schema\fR, \fBtable_name\fR, \fBop\fR, \fBzone_name\fR, \fBrow_id\fR
+T}	T{
+Where: the table, \fBI\fR, \fBU\fR or \fBD\fR, the zone, the row's id.
+T}
+\&\fBbefore\fR, \fBafter\fR	\&The row as JSON.
+.TE
+.PP
+\fBRedaction.\fR \fBcryptokeys.content\fR, \fBcredentials.password_hash\fR and
+\fBcredentials.totp_secret\fR are written as \fB"<redacted>"\fR: the API reads
+the audit log, and keys and secrets must not reach it.
+.PP
+\fBSummary mode.\fR A big import writes two rows per record (the old row and the
+new one). A role other than the API role may \fBSET LOCAL karidns.audit
+= 'summary'\fR (\fBkaridns\-zone import \-\-audit summary\fR does, and \fBimport
+\-\-signer\fR does by default): the audit then writes one row per transaction,
+table, operation and zone that counts the statements and the rows
+(\fB{"summary": true, "statements": 100000, "rows": 100000}\fR), filled in when
+the transaction commits. The API role and any role that is a member of it (also
+after \fBSET ROLE\fR) cannot turn the detail off; the restricted roles are the
+rows of \fBkaridns_auth.audit_restricted_roles\fR, which only the owner
+writes. The tables of \fBkaridns_auth\fR are always logged row by row. SQLite3
+has no summary mode.
+.PP
+\fBAppend only.\fR Only the owner has \fBINSERT\fR, \fBUPDATE\fR or \fBDELETE\fR
+on the log; the triggers are \fBSECURITY DEFINER\fR and insert as the
+owner. Nobody gets \fBTRUNCATE\fR, and a \fBTRUNCATE\fR of an audited table is
+not logged (use \fBDELETE\fR).
+.PP
+\fBPruning.\fR Nothing is pruned automatically. The owner deletes by date:
+.PP
+.RS 2
+.nf
+DELETE FROM karidns_auth.audit_log WHERE at < now() \- interval '1 year';
+.fi
+.RE
+.PP
+Run it in batches on a big log (\fBWHERE id IN (SELECT id ... LIMIT 100000)\fR)
+and \fBVACUUM\fR afterwards. At scale, partition the table by month (declare
+\fBaudit_log\fR partitioned by \fBat\fR and drop old partitions); that needs a
+migration of the table and is planned for 0.7.
+.SS SQLite3
+.IP \(bu 2
+The audit triggers are in \fBdb/karidns_audit.sqlite3.sql\fR; a site that does
+not use the API or the signer does not apply them and logs nothing. Persistent
+triggers can only read their own database, so the actor lives in the zone file:
+\fBkaridns_audit_actor\fR has one row (principal, change set, database
+role). SQLite3 has one writer at a time (\fBBEGIN IMMEDIATE\fR): the API writes
+the actor row first in its transaction and deletes it last. A writer that does
+not is logged with a NULL principal. \fBkaridns\-zone\fR writes its own row
+(\fBkaridns\-zone:<OS user>\fR) and deletes it before the commit.
+.IP \(bu 2
+The auth file holds the principals, credentials, memberships, record policies
+and grants. Its own changes are logged by triggers into \fBkaridns_auth_audit\fR
+in the auth file. \fBThe auth file belongs to the user of the API and has mode
+0600\fR; the loader's user must not be able to read it (it holds the password
+hashes). Run \fBPRAGMA foreign_keys=ON\fR on the connection.
+.IP \(bu 2
+The checks that need no API are in the file: the \fBCHECK\fR constraints, users
+only in \fBcredentials\fR, no cycle, depth 8, and the closure table. What
+PostgreSQL does in policies and in the escalation trigger, the API must do on
+SQLite3, and it must delete or rename the grants of a zone it deletes or
+renames.
+.SS The API tables, the zone generation and versions, and the check role (0.6.0 items D and E)
+The API with permission checks, the zone templates and the zone versions add
+these objects to schema version 3 (the version row stays 3: 0.6.0 is not
+released). \fBThe server, \fBkaridns\-dbloader\fB and \fBkaricheck db\fB use
+none of them\fR: they do not read the tables, and a database that has them
+passes \fBkaricheck db\fR and the loader's schema check as it did without
+them. The commands that use them are \fBkaridns\-zone apply\fR and \fBimport\fR
+(generation, versions) and the WebAdmin API (\fBkaridns\-webadmin\fR: \fBGET
+/auth/me\fR, the sessions, tokens, principals, policies, grants and the audit
+log are these tables).
+.TP 8
+\fBkaridns_zone_state\fR
+\fIWhere:\fR each data schema / the zone file
+.br
+\fIWhat it holds:\fR \fBdomain_id\fR, \fBgeneration\fR, \fBchanged_at\fR: the
+\fBgeneration\fR of the zone. Written by the triggers of the owner only
+(PostgreSQL: \fBkaridns_log_domains()\fR, the function that writes the change
+log, grows it the first time a transaction changes a zone, so a row-by-row
+import of a million records bumps it once; SQLite3: the trigger
+\fBkaridns_changes_generation\fR on \fBkaridns_changes\fR, once per changed
+row). It follows exactly the set of tables that write \fBkaridns_changes\fR. A
+zone with no row has generation 0. \fBON DELETE CASCADE\fR.
+.TP 8
+\fBkaridns_zone_versions\fR, \fBkaridns_zone_version_rrsets\fR
+\fIWhere:\fR each data schema / the zone file
+.br
+\fIWhat it holds:\fR The \fBversions\fR of a zone, one row per committed change
+set: \fBversion\fR (per zone, from 1), \fBkind\fR (\fBcreate\fR, \fBedit\fR,
+\fBtemplate\fR, \fBimport\fR, \fBrollback\fR), \fBchange_set\fR,
+\fBprincipal_id\fR, \fBprincipal_name\fR, \fBdb_role\fR, \fBat\fR, \fBcomment\fR
+(1 KiB), \fBserial_before\fR, \fBserial_after\fR, \fBgeneration_before\fR,
+\fBgeneration_after\fR, \fBrollback_of\fR, \fBdelta_complete\fR; and the RRsets
+the version changed (\fBowner\fR in the form of \fBrecords.name\fR, \fBtype\fR,
+\fBbefore\fR and \fBafter\fR: canonical lines \fB<ttl> <TYPE> <rdata>\fR joined
+by LF, NULL for absent). The newest 100 versions per zone are kept (a constant
+in \fBkaridns_zone_versions_prune_fn\fR / the trigger
+\fBkaridns_zone_versions_prune\fR). Not audited: they are derived from the
+audited rows.
+.TP 8
+\fBsessions\fR, \fBapi_tokens\fR
+\fIWhere:\fR \fBkaridns_auth\fR / the auth file
+.br
+\fIWhat it holds:\fR Browser sessions and API tokens: the SHA-256 of the cookie
+(\fBid_hash\fR) and of the CSRF token (\fBcsrf_hash\fR), \fBprincipal_id\fR,
+times (\fBcreated_at\fR, \fBlast_seen\fR, \fBexpires_at\fR), \fBtotp_ok\fR,
+\fBclient\fR; for a token its \fBname\fR, \fBsecret_hash\fR, \fBread_only\fR,
+\fBexpires_at\fR (at most 366 days after \fBcreated_at\fR), \fBlast_used_at\fR,
+\fBrevoked_at\fR. Deleted with their principal. The audit writes the hashes as
+\fB<redacted>\fR and does not log a change of \fBlast_seen\fR alone.
+.TP 8
+\fBoidc_states\fR
+\fIWhere:\fR \fBkaridns_auth\fR / the auth file
+.br
+\fIWhat it holds:\fR The state of a sign-in with an OpenID Connect provider that
+has started and not come back (item F, milestone M5): the SHA-256 of the
+\fBstate\fR parameter (the key) and of the cookie that ties the flow to the
+browser, the provider's name, the nonce, the PKCE code verifier, the route to
+return to, \fBcreated_at\fR, \fBexpires_at\fR (ten minutes; at most an hour by a
+constraint). Used once: read and deleted by the callback. Not
+audited. \fBPostgreSQL: the API role has no privilege on the table\fR; it calls
+the SECURITY DEFINER functions \fBoidc_state_put(...)\fR (false when 1000 are
+waiting), \fBoidc_state_take(state_hash)\fR (returns the row of an unexpired
+state and deletes it) and \fBoidc_lookup(issuer, subject)\fR (the id of the
+user, not disabled, whom the identity \fBcredentials.oidc_issuer\fR,
+\fBoidc_subject\fR is linked to), and \fBsweep_expired()\fR deletes the states
+that are over.
+.TP 8
+\fBtemplates\fR, \fBtemplate_records\fR
+\fIWhere:\fR \fBkaridns_auth\fR / the auth file
+.br
+\fIWhat it holds:\fR Zone data templates: name, description, \fBrevision\fR
+(grows by one with every change of the template or of a record), the SOA
+defaults (\fBsoa_mname\fR, \fBsoa_rname\fR, \fBsoa_refresh\fR, \fBsoa_retry\fR,
+\fBsoa_expire\fR, \fBsoa_minimum\fR); the records \fB(template_id, ordinal)\fR
+with \fBowner\fR (\fB@\fR or a relative name in lower case, no final dot),
+\fBtype\fR (no DNSSEC type), \fBttl\fR, \fBcontent\fR. Written by a global
+master, read by every principal; audited.
+.PP
+\fBRow level security (PostgreSQL).\fR \fBsessions\fR and \fBapi_tokens\fR: the
+principal's own rows, a global master all of them. \fBtemplates\fR and
+\fBtemplate_records\fR: everybody reads, a global master
+writes. \fBkaridns_zone_state\fR: readable with a grant on the
+zone. \fBkaridns_zone_versions\fR: readable with a grant on the zone, insertable
+by the principal itself (\fBprincipal_id = karidns.principal\fR);
+\fBkaridns_zone_version_rrsets\fR: readable and insertable by the rule of
+\fBrr_visible\fR (a subdomain master reads the history of its names
+only). Nobody with an API policy updates or deletes a version. A request that
+carries only a cookie or a token cannot find its row under those policies, so
+two SECURITY DEFINER lookups return the row of an unexpired credential of a
+principal that is not disabled and nothing else:
+\fBkaridns_auth.session_lookup(id_hash)\fR and
+\fBkaridns_auth.api_token_lookup(id, secret_hash)\fR (\fBEXECUTE\fR is granted
+to the API role). A third SECURITY DEFINER function,
+\fBkaridns_auth.sweep_expired()\fR, deletes the sessions whose absolute time is
+over, of every principal (the policy shows the API role the rows of its own
+principal only): the hourly sweep of the API calls it. The API role also gets
+\fBSELECT\fR on \fBkaridns_server_status\fR. A fourth SECURITY DEFINER function,
+\fBkaridns_auth.prune_audit(days)\fR (0.6.1), deletes the audit rows older than
+\fBdays\fR days (at least 7, the oldest 10,000 a call): no role has a right on
+\fBaudit_log\fR, so this is how the WebAdmin's option \fBaudit\-retention\fR
+prunes it; it is granted to the API role only.
+.PP
+\fBWhy the generation counts every change.\fR The signer's re-sign writes DNSSEC
+records, the ordername and auth of other records, the SOA serial and its own
+metadata, and the trigger counts them like any other change; skipping some rows
+would need the content of an SOA to be parsed in SQL on both databases and would
+leave a hole in "every writer bumps it". The price is that a signed zone can
+make a commit run of the API fail with "changed" once per signing, which the API
+repeats; the "changed outside the API" mark of the version list (a gap between
+\fBgeneration_after\fR of one version and \fBgeneration_before\fR of the next)
+is therefore noisy on signed zones and the API ignores a gap in which only
+DNSSEC rows and the SOA serial changed.
+.PP
+\fBThe check role (\fBdb/karidns_check_role.pgsql.sql\fB).\fR A change set of a
+subdomain master is checked against the whole zone, and row level security shows
+the API's session only the part its principal has a grant on. The API therefore
+runs \fBkaridns\-zone apply \-\-dry\-run\fR as a \fBcheck role\fR: a member of
+\fBkaridns_rls_trusted\fR (it sees every row and passes every write policy) that
+\fBcan never commit\fR. The script makes the role a member of the group role
+\fBkaridns_never_commit\fR and attaches to every table the dry run writes
+(\fBdomains\fR, \fBrecords\fR, \fBdomainmetadata\fR, the \fBkaridns_*\fR zone
+tables, \fBkaridns_changes\fR, \fBkaridns_zone_state\fR, the version tables,
+\fBkaridns_key_requests\fR, and \fBkaridns_auth.audit_log\fR) a deferred
+constraint trigger, \fBkaridns_auth.enable_never_commit(schema)\fR, whose
+function raises at COMMIT for a session whose login role (\fBsession_user\fR) is
+a member of \fBkaridns_never_commit\fR and is not a superuser. The test is two
+built-in calls in the \fBWHEN\fR condition, so other roles pay almost
+nothing. \fBSET ROLE\fR, \fBSET CONSTRAINTS ALL IMMEDIATE\fR and a \fBPREPARE
+TRANSACTION\fR do not get around it (the last fires deferred triggers; keep
+\fBmax_prepared_transactions\fR at 0 anyway), and the role cannot drop the
+triggers (it owns nothing). The script refuses a superuser, the owner of the
+tables (or a member of it) and a member of an API role
+(\fBkaridns_auth.assert_check_role()\fR), grants the writer role's privileges
+(by running \fBdb/karidns_writer_role.pgsql.sql\fR for the role), \fBUSAGE\fR on
+\fBkaridns_auth\fR and \fBEXECUTE\fR on \fBkaridns_auth.bump_serial\fR. Use a
+login role of its own for it. \fBkaridns_auth.disable_never_commit(schema)\fR
+removes the triggers; do it before you drop \fBkaridns_never_commit\fR.
+.PP
+\fBMigration.\fR There is no new schema version. A database made before these
+objects (version 2 or version 3) gets them when the files are applied again:
+PostgreSQL \fBdb/karidns_ext.pgsql.sql\fR (once per data schema, as the owner;
+it creates \fBkaridns_zone_state\fR with a row of generation 0 for every zone,
+the version tables, the \fBkaridns_auth\fR tables and functions, the new
+triggers and policies, and replaces \fBkaridns_log_domains()\fR), then the role
+scripts again (\fBdb/karidns_api_role.pgsql.sql\fR,
+\fBdb/karidns_writer_role.pgsql.sql\fR, \fBdb/karidns_signer_role.pgsql.sql\fR,
+the new \fBdb/karidns_check_role.pgsql.sql\fR; they grant on the new tables and
+create the policies; the loader role needs nothing, it already reads every
+\fBkaridns_*\fR table); SQLite3 \fBdb/karidns_ext.sqlite3.sql\fR on the zone
+file, \fBdb/karidns_audit.sqlite3.sql\fR if the audit is used, and
+\fBdb/karidns_auth.sqlite3.sql\fR on the auth file. Applied again, every file
+only adds objects. \fBtests/run_db_schema_migrate_test.sh\fR runs it.
+.SS What RLS and the audit cost
+Measured on 2026-11-06 with \fBtests/perf/auth_rls_bench.sh\fR on the FreeBSD
+15.1 build host (4 vCPU, shared with other jails), PostgreSQL 18.6 with
+\fBshared_buffers\fR 128 MB, \fBfsync\fR off, a private cluster. Each figure is
+the median of 3 runs, each run a new connection. The big zone has 100,000
+records; the user is in a group that is domain master of it. Times are the
+client's, with the rows sent to \fB/dev/null\fR.
+.PP
+.TS
+lbw(16) lbw(16) lbw(16) lbw(17)
+lw(16) lw(16) lw(16) lw(17).
+\&What	T{
+Without RLS (the owner)
+T}	T{
+\fBkaridns_api\fR, RLS on
+T}	\&Notes
+_
+T{
+\fBSELECT *\fR of the 100,000 records of the zone, domain master
+T}	\&33.6 ms	\&193.9 ms	T{
+5.8 times; 150 ms on a connection that is already warm
+T}
+T{
+the same with 100,001 zones and 10,002 grants in the database
+T}	\&35.6 ms	\&207.1 ms	T{
+the grant lookups are by index: the time stays flat
+T}
+T{
+the same, global master
+T}	\&33.6 ms	\&745 ms (815 ms)	T{
+every row also checks its name against its own zone
+T}
+T{
+\fBSELECT count(*)\fR of the zones, a user with one zone out of 100,001
+T}	\&-	\&9.0 ms	T{
+1,330 ms before the grants were read once per statement
+T}
+T{
+one record by name
+T}	\&-	\&2.7 ms	\&
+T{
+change set: \fBINSERT\fR of 1,000 records (one statement, one transaction)
+T}	T{
+82 ms (15 ms with the audit off)
+T}	T{
+172 ms (155 ms with 100,001 zones)
+T}	\&
+T{
+change set: \fBUPDATE\fR of 1,000 records
+T}	T{
+85 ms (24 ms with the audit off)
+T}	\&257 ms (234 ms)	T{
+the policy is checked for the old and the new row
+T}
+T{
+change set: \fBDELETE\fR of 1,000 records
+T}	T{
+80 ms (13 ms with the audit off)
+T}	\&166 ms (156 ms)	\&
+.TE
+.PP
+The owner's change sets above have the audit triggers on (the API scripts switch
+them on); the figures in brackets are the same measurement with the other
+100,000 zones and 10,000 grants. The cost of RLS on a read is the checks that
+make a row visible: the name must be inside the zone (and, for a subdomain
+master, inside its suffix). Writes are checked row by row with the full
+rules. The grants are read once per statement, not once per row; the lookups use
+the indexes \fBgrants (data_schema, zone_name)\fR and \fBgrants
+(principal_id)\fR and the key of \fBprincipal_closure\fR (an index-only scan of
+0.02 ms, the whole lookup 0.04 ms). The measurement used 100,000 zones and
+10,000 grants because the host is shared; the lookups are by index, so more
+zones should not change them.
+.PP
+\fBkaridns\-zone import\fR (replace mode, \fB\-\-serial keep\fR) of the same
+100,000 records as the writer role, a zone that already has them (so 100,000
+rows are deleted and inserted again), RLS on:
+.PP
+.TS
+lbw(40) lb lb
+lw(40) l l.
+\&Audit	\&Time	\&Audit rows
+_
+T{
+off (\fBkaridns_auth.disable_audit('public')\fR)
+T}	\&17.2 s	\&0
+\&on, \fB\-\-audit rows\fR	\&36.1 s (2.1 times)	\&200,000
+\&on, \fB\-\-audit summary\fR	\&35.7 s	\&2
+.TE
+.PP
+The audit costs about 0.1 ms per changed row (the row trigger builds the JSON of
+the old and the new row and looks up the zone) or, in summary mode, about 0.2 ms
+per statement (the importer inserts one row per statement). Summary mode saves
+the space of the log, not the time. Both figures include the statement triggers
+with transition tables and the maintenance triggers that run as the owner (the
+change log; the trigger of the signer is described next).
+.PP
+\fBThe trigger of the signer and what it costs the others.\fR The trigger
+\fBkaridns_signer_soa_upd\fR on \fBrecords\fR is \fBBEFORE UPDATE OF <every
+column but ordername and auth> FOR EACH ROW\fR, so an \fBUPDATE\fR of just
+\fBordername\fR and \fBauth\fR (the signer's own, \fBpdnsutil
+rectify\-zone\fR's) never calls it. The column list is part of the trigger (it
+is read from the table when \fBdb/karidns_ext.pgsql.sql\fR is applied, so a
+column a later PowerDNS adds is covered when the file is applied again), and
+PostgreSQL will not drop a listed column of \fBrecords\fR while the trigger
+exists: \fBDROP TRIGGER karidns_signer_soa_upd ON records\fR first, then apply
+the file again. For any other \fBUPDATE\fR it runs once per row for \fBevery\fR
+role, the operator's and PowerDNS's too, and asks
+\fBkaridns_auth.is_signer_caller()\fR first: is the login role or the \fBSET
+ROLE\fR role one of the rows of \fBkaridns_auth.signer_roles\fR or a member of
+one? That function does not run a recursive query:
+\fBpg_has_role(.., 'MEMBER')\fR walks the memberships through the backend's own
+cache, a superuser (the operator; the role scripts refuse a superuser as the
+signer) is answered from the server's \fBis_superuser\fR setting (with \fBSET
+ROLE\fR in use the login role's \fBrolsuper\fR is looked up, because
+\fBpg_has_role\fR says yes for every superuser), and the answer is \fBnot\fR
+cached in a transaction-local setting: any session can set a custom setting, so
+a signer could write "I am no signer" before its first \fBUPDATE\fR. For a
+signer the row is then compared as JSON without \fBordername\fR and \fBauth\fR,
+and an SOA row is held to its serial. Measured on PostgreSQL 18, FreeBSD,
+100,000 rows of \fBrecords\fR (one \fBUPDATE\fR of all of them by the owner,
+median of five runs after a \fBVACUUM\fR): \fBSET ttl = ttl + 1\fR: 4.3 s with
+the former trigger (a \fBWHEN\fR clause with \fBcanon_type()\fR and two
+\fBto_jsonb()\fR per row, and a recursive query in \fBis_signer_caller()\fR),
+0.90 s now, 0.69 s with no signer trigger at all; \fBSET content = content\fR:
+2.1 s, 0.87 s, 0.69 s; \fBSET ordername = .., auth = ..\fR: 2.1 s, 0.72 s (the
+trigger does not fire), 0.69 s.
+.PP
+\fBA re-sign writes a few change-log rows and \fBNOTIFY\fBs.\fR \fBkaridns\-zone
+import \-\-signer\fR does not write a record per statement: the DNSSEC records
+are deleted by a \fBDELETE ... WHERE id = ANY(...)\fR, inserted by one
+\fBINSERT ... SELECT FROM unnest(...)\fR and the ordername and auth of the other
+records updated by one \fBUPDATE ... FROM unnest(...)\fR (a statement for every
+20,000 rows or 200,000 ids). The change log (\fBkaridns_changes\fR) and the
+audit in summary mode are written by statement triggers, so a zone of 2000
+hosts, signed again, gives 5 rows in \fBkaridns_changes\fR and 3 in the audit
+log (\fBtests/run_karidns_zone_pg_test.sh\fR), and \fBNOTIFY karidns_changes\fR
+a few times, not once per record. SQLite3 runs the single-row statements: its
+triggers fire per row, so the change log has a row per changed row there (one
+write transaction, one \fBNOTIFY\fR\-less poll of \fBPRAGMA data_version\fR for
+the loader) and the audit a row per row.
+.SH PACKAGES
+\fBpackaging/freebsd/build_pkg.sh \-\-db none|sqlite3|postgresql|both\fR builds
+four FreeBSD packages from the same server and tools; only the loader and its
+dependencies differ. They install the same files, so they \fBconflicts\fR with
+each other (install one).
+.PP
+.TS
+lb lb lbw(33)
+l l lw(33).
+\&Package	\&\fBkaridns\-dbloader\fR	\&Dependencies added
+_
+\&\fBkaridns\fR	\&not installed	\&none
+\&\fBkaridns\-sqlite3\fR	\&SQLite3 driver	\&\fBdatabases/sqlite3\fR
+\&\fBkaridns\-postgresql\fR	\&PostgreSQL driver	T{
+\fBdatabases/postgresqlNN\-client\fR (libpq; NN is the version the build host
+linked)
+T}
+\&\fBkaridns\-db\fR	\&both drivers	\&both
+.TE
+.PP
+The database packages install \fB/usr/local/libexec/karidns\-dbloader\fR
+(root:wheel, mode 0555), \fBkaridns\-zone\fR
+(\fB/usr/local/bin/karidns\-zone\fR, with the same drivers, and its manual),
+this manual, and the SQL files of their drivers in
+\fB/usr/local/share/karidns/db/\fR. The signer daemon \fBkaridns\-signer\fR is a
+package of its own (\fBkaridns\-signer\fR, Distribution Guide, 2.6). In a
+package without the loader \fBkaricheck db\fR reports \fBDB support is not
+installed\fR. See Distribution Guide.
+.SH MEASUREMENTS
+Measured on 2026-10-26 on the FreeBSD 15.1 build host (4 vCPU, about 10 GB RAM,
+virtual disk), \fBkaridns\fR 0.5.0 built from the v0.6 beta branch (milestone
+B12), SQLite3 3.53.3, a SQLite3 source whose file was copied just before each
+run (warm page cache). The database generator is
+\fBtests/db/gen_sqlite3_zones.sh\fR; the measurement scripts and raw results are
+kept with the project's benchmark records, outside the source tree. Every figure
+is \fBone run\fR unless it says "median"; the host is shared with the load
+generator, so differences of a few percent are noise.
+.PP
+.TS
+lb lb rb rb
+l l r r.
+\&Data set	\&Zones x records	\&Records	\&SQLite3 file
+_
+\&\fBz10k\fR	\&10,000 x 1,000	\&10,000,000	\&1.30 GB
+\&\fBz1m\fR	\&1,000,000 x 11	\&11,000,000	\&1.51 GB
+.TE
+.PP
+(\fBtests/db/gen_sqlite3_zones.sh\fR: names \fBz<i>.test\fR, per zone SOA, 2 NS,
+apex A and MX, \fBwww\fR, and A / CNAME / AAAA / TXT / MX hosts;
+\fBdb/karidns_ext.sqlite3.sql\fR applied after the bulk load. Each database is
+made in about 30 s.)
+.PP
+\fBPostgreSQL measurements (the beta leftovers).\fR The same two data sets in
+PostgreSQL 18.6 on the same host, with \fBtests/db/gen_pgsql_zones.sh CONNINFO
+ZONES RRS\fR (the same rows as the SQLite3 generator,
+\fBtests/db/pdns_schema.pgsql.sql\fR, \fBdb/karidns_ext.pgsql.sql\fR applied
+after the load, \fBANALYZE domains, records\fR; 90 s for \fBz10k\fR and 103 s
+for \fBz1m\fR, about 2.4 GB and 2.6 GB). Every run worked on a clone of the
+database (\fBCREATE DATABASE ... TEMPLATE\fR, 3.1 s) that was dropped
+afterwards, as the SQLite3 runs worked on a copy of the file. The loader
+connected over the UNIX socket as an unprivileged role with a
+\fBconninfo\-file\fR, the server had its default settings (\fBmax_connections
+20\fR, no tuning), the default thread counts (\fBingest\-threads 1\fR,
+\fBloader\-threads 1\fR), and the edits of the steps were made with
+\fBpsql\fR. The harness is the one of the SQLite3 figures with those edits
+changed; the steps are the same (start, \fBkarictl reload\fR with nothing / 1% /
+10% changed, \fBkarictl reload <zone>\fR five times for an add, five for a
+change, one delete, and auto reload eight times with \fBpoll\-interval 1\fR and
+\fBcoalesce 200\fR). One run each unless it says otherwise; the database server
+shares the host with \fBkaridns\fR and the load generator, and the virtual disk
+is slow, so single outliers (a checkpoint) are in the figures.
+.TP 8
+T-START: first answer / \fBinitial load complete\fR
+\fIz10k: before; after:\fR 1.7-2.1 s / 31.7-32.2 s (2 runs); 1.2 s / 31.4-31.6 s
+(2 runs)
+.br
+\fIz1m: before; after:\fR 3.2 s / 37.8-38.2 s (2 runs); 3.0 s / 38.0-38.2 s (2
+runs)
+.br
+\fISQLite3 z10k / z1m:\fR 1.0 s / 24.1 s, 1.9 s / 33.4 s
+.TP 8
+Peak RSS of the Backend / of the loader
+\fIz10k: before; after:\fR 1,077 MB / 12.5 MB; 1,077 MB / 11-12 MB
+.br
+\fIz1m: before; after:\fR 2,970 MB / 281 MB; 2,936-2,940 MB / 280-281 MB
+.br
+\fISQLite3 z10k / z1m:\fR 1,079 MB / 15 MB, 2,998 MB / 280-380 MB
+.TP 8
+\fBkarictl reload\fR, nothing changed
+\fIz10k: before; after:\fR 0.82 s; \fB0.22 s\fR
+.br
+\fIz1m: before; after:\fR 4.5 s; 4.2 s
+.br
+\fISQLite3 z10k / z1m:\fR 0.04 s, 3.3 s
+.TP 8
+\fBkarictl reload\fR, 1% of the zones edited
+\fIz10k: before; after:\fR 1.5 s; \fB0.89 s\fR
+.br
+\fIz1m: before; after:\fR 9.6 s; \fB5.3 s\fR
+.br
+\fISQLite3 z10k / z1m:\fR 0.29 s, 3.9 s
+.TP 8
+\fBkarictl reload\fR, 10% edited, under load (20 s \fBdnsperf\fR; QPS before / mean while reloading / lowest second, queries lost, longest latency)
+\fIz10k: before; after:\fR 10.5 s (467k / 322k / 178k, 0, 0.94 s); \fB4.3-4.6
+s\fR (333k / 258k / 135k, 0, 0.85 s and 560k / 261k / 160k, 0, 0.76 s)
+.br
+\fIz1m: before; after:\fR 60 s (377k / 237k / 92k, 0, 0.94 s; the load ended
+before the reload did); \fB14.2-15.0 s\fR (463k / 274k / 34k, 0, 1.83 s and 320k
+/ 229k / 6k, 0, 1.87 s)
+.br
+\fISQLite3 z10k / z1m:\fR 2.6 s, 17.7 s
+.TP 8
+T-ZONEADD: add a zone, \fBkarictl reload <zone>\fR (5 runs)
+\fIz10k: before; after:\fR 13-14 ms; 13-14 ms
+.br
+\fIz1m: before; after:\fR 43-69 ms; 44-76 ms
+.br
+\fISQLite3 z10k / z1m:\fR 7-8 ms, 28-44 ms
+.TP 8
+one zone changed (5 runs) / deleted
+\fIz10k: before; after:\fR 19-21 ms / 36 ms; 18-21 ms / 39-40 ms
+.br
+\fIz1m: before; after:\fR 12-15 ms, twice 0.38 s and 0.93 s / 272 ms; 13-14 ms,
+once 35 ms / 1.1-1.2 s
+.br
+\fISQLite3 z10k / z1m:\fR 11-12 ms / 7 ms, 6-8 ms / 27-37 ms
+.TP 8
+T-AUTORELOAD: commit to served (8 runs)
+\fIz10k: before; after:\fR 0.95 s (0.946-0.959; 0.84-0.85 s with \fBcoalesce
+100\fR); \fB0.41-0.43 s\fR
+.br
+\fIz1m: before; after:\fR 2.7-2.8 s; 2.5-2.6 s
+.br
+\fISQLite3 z10k / z1m:\fR 0.28-1.02 s, 1.2-2.2 s
+.PP
+(Each pair is the figure of the first measurement, then the figure after this
+change: the zone list query and the grouped reads of changed zones, see
+below. The second figure is from two rounds on the same day, the best-known
+state of the host; the old binary measured again in rounds of its own gave
+\fBz10k\fR 0.75-0.90 s for the reload without changes, 1.4-1.9 s for 1%, 9.8 s
+for 10% and 0.94-0.97 s for auto reload, \fBz1m\fR 4.7-4.8 s, 10.3-10.6 s, 60-69
+s and 2.7-2.9 s, so the earlier column stands. One round of the old binary also
+had single outliers while the host was busy (43 s for the 10% reload at
+\fBz10k\fR, 19 s and 28 s for the first two auto reloads at \fBz1m\fR); they are
+not in the figures. The deletion at \fBz1m\fR is the \fBlower(d.name)\fR scan of
+the second \fBfind_zone\fR query described below; it took 0.4-1.3 s in every
+series on the same day, old binary and new.)
+.PP
+Notes on PostgreSQL:
+.IP \(bu 2
+\fBThe start\fR is 30% (\fBz10k\fR) and 15% (\fBz1m\fR) slower than with SQLite3
+and the first answer comes 1-1.3 s later; the loader reading alone takes 29.0 s
+/ 34.4 s (see the thread sweep), so the Backend adds the same 2-3.5 s as
+before. The goal (answering within 60 s) is met.
+.IP \(bu 2
+\fBA reload that compares everything is slower than with SQLite3.\fR Where the
+time goes (a timestamp at every step of the loader, \fBz1m\fR, nothing changed,
+4.2 s): 1.95 s are in the Backend before the loader is asked anything
+(\fBkarictl reconfig\fR alone takes the same 1.95 s: the new snapshot is built
+from the 1,000,000 database zones of the registry, a cost of the Backend that
+has nothing to do with the database driver and that SQLite3 pays too), 2.0 s in
+the zone list (the query is 1.7 s in \fBpsql\fR: one pass over the 11,000,000
+records for the 1,000,000 SOA rows), 0.25 s in the comparison with the Backend's
+inventory, 0.03 s to free the list. At \fBz10k\fR the same steps take 0.2 s in
+all.
+.RS 2
+.IP \(bu 2
+\fBThe zone list.\fR It used to join each domain to its apex SOA on
+\fBlower(r.name) = lower(d.name)\fR, which PostgreSQL could answer only by
+reading the records of every zone (0.8 s at \fBz10k\fR, 2.0 s at \fBz1m\fR), and
+the list is read by every full comparison, so by every auto batch. It joins on
+the plain name now (\fBr.name = d.name\fR, served by the standard indexes on
+\fBrecords\fR), with the case-insensitive comparison as a per-zone fallback for
+a zone whose SOA owner differs in case (which the schema's
+\fBc_lowercase_name\fR constraint forbids), and the loader plans the list for
+all of its rows (\fBSET LOCAL cursor_tuple_fraction = 1\fR for this one query; a
+cursor is planned for its first 10% by default): 0.2 s at \fBz10k\fR (the reload
+without changes 0.8 s to 0.22 s, the auto reload 0.95 s to 0.42 s, of which 0.2
+s is \fBcoalesce\fR) and 1.8 s at \fBz1m\fR (the planner reads the SOA rows once
+there; 2.0 s before). If one zone has SOA records of two spellings of its name,
+the list takes the lowest \fBrecords.id\fR of the exact spelling (before: of all
+spellings); that is a data error anyway, as for \fBdomains.name\fR below. The
+SQLite3 driver now orders the same way (\fBORDER BY d.id, r.id\fR: the smallest
+\fBrecords.id\fR among several enabled SOAs, explicitly).
+.IP \(bu 2
+\fBThe changed zones.\fR A reload that changes fewer zones than
+\fBbulk\-threshold\fR percent (default 25) of the source reads them without
+scanning everything. A zone read on its own costs a statement per table and
+three round trips per statement (\fBDECLARE\fR, \fBFETCH\fR, \fBCLOSE\fR): about
+fifteen with the extension tables, 0.55 ms per zone on the local socket
+(\fBz1m\fR, 100,000 changed zones: metadata 7.1 s, records 11.4 s, tags and
+tinydns attributes 29.6 s, conversion 6.5 s of the 54.6 s the loader spent). The
+PostgreSQL driver now has \fBscan_records_in\fR, \fBscan_metadata_in\fR and
+\fBscan_ext_in\fR: up to 128 changed zones (consecutive in the list) are read
+with one statement per table (\fBdomain_id = ANY ($1::bigint[])\fR), the records
+still streamed through the cursor, so the loader holds the metadata and
+extension rows of 128 zones and the records of one, as before. The zones are
+converted and sent in the same order, the stream is the same bytes
+(\fBtests/test_db_pgsql.c\fR compares the group calls with the single-zone calls
+row by row; \fBtests/run_db_pg_group_reload_test.sh\fR runs 160 changed zones
+among 700). The loader spent 11.0 s instead of 54.6 s on the 100,000 zones; the
+whole reload 14-15 s instead of 60 s. \fBbulk\-threshold\fR keeps its meaning
+(the share of zones above which one scan of all records is cheaper than reading
+the changed ones); only the cost of reading below it fell, so the break-even
+moved: for PostgreSQL a higher threshold than 25% may now pay. A reload of one
+zone (\fBkarictl reload <zone>\fR, \fB\-\-zone\fR) is read as before. SQLite3
+reads zone by zone (a statement costs no round trip there). With
+\fBloader\-threads\fR above 1 each worker reads groups of up to 64 zones.
+.IP \(bu 2
+\fBWhat is left.\fR The reload without changes at \fBz1m\fR (4.2 s) is the
+Backend's 1.95 s, the list's 2.0 s and the comparison's 0.25 s; the list could
+only be made much cheaper by not comparing the SOA serials, which the design
+keeps as the safety net behind the change log, and the PostgreSQL server of the
+host has \fBmax_parallel_workers_per_gather 0\fR. A reload that changes 10% of
+10,000 zones of 1,000 records (4.3-4.6 s) is dominated by converting and sending
+1,000,000 records, not by round trips. More \fBloader\-threads\fR (each thread
+opens its own connection, mind \fBmax_connections\fR) help both, as in the
+thread sweep.
+.RE
+.IP \(bu 2
+\fB\fBfind_zone\fB for a zone that is not there\fR (a deletion, or a typo in
+\fBkarictl reload\fR): the exact-spelling query uses the index on
+\fBdomains.name\fR (0.04-0.2 ms at 1,000,000 zones, whether the zone exists or
+not); when it finds nothing, the second query with \fBlower(d.name)\fR scans the
+table: 189-218 ms at 1,000,000 zones (5 runs with \fBpsql\fR; \fBSeq Scan on
+domains\fR), which is most of the 272 ms of the delete above. It is the price of
+finding a zone stored with capital letters; PowerDNS stores names in lower case,
+and \fBkaricheck db\fR warns about two rows that differ only in case. An index
+\fBCREATE INDEX ON domains (lower(name))\fR would make the fallback an index
+search too; the loader does not need it and does not create it.
+.IP \(bu 2
+\fBAuto reload\fR with \fBLISTEN\fR sees a commit at once; the figures above are
+the comparison that follows. A hot standby refuses \fBLISTEN\fR; see below.
+.PP
+\fBA PostgreSQL hot standby (streaming replica).\fR Tried with a scratch primary
+and a standby of it on the build host (two throwaway clusters under their own
+directory, ports 5442 and 5443, started by the \fBpostgres\fR user, removed
+afterwards): 50 zones, \fBkaridns\fR reading the standby over the UNIX socket as
+an ordinary role. \fBLISTEN\fR is refused (\fBcannot execute LISTEN during
+recovery\fR), and the loader behaves as follows.
+.IP \(bu 2
+\fIReload requests\fR (\fBkaridns_reload_requests\fR, written on the primary and
+replicated): the loader logs once that it cannot \fBLISTEN karidns_reload\fR and
+reads the requests every \fBpoll\-interval\fR; a request inserted on the primary
+is applied after 0.6 s (replication lag, the timer, one zone read). \fBkarictl
+reload\fR works as on a primary.
+.IP \(bu 2
+\fIThe status row\fR (\fBkaridns_server_status\fR) cannot be written on a
+read-only server (\fBcannot set transaction read\-write mode during
+recovery\fR): the loader logs it once (it stayed one line for four requests),
+\fBkarictl dbstatus\fR shows it as the last error of the reload requests
+(\fBstatus written never\fR), the requests are still applied and the server
+keeps answering.
+.IP \(bu 2
+\fIAuto reload\fR (\fBauto\-reload yes\fR) did not work on a standby before: the
+loader's change detector needed the notification, so every poll failed
+(\fBcannot watch the database: ... LISTEN\fR, \fBlast poll never\fR in
+\fBdbstatus\fR) and no change was ever picked up. The PostgreSQL driver now
+reads a fingerprint of \fBkaridns_changes\fR (the number of rows and the highest
+\fBseq\fR) every \fBpoll\-interval\fR when \fBLISTEN\fR is refused, the loader
+logs \fBthe server refuses LISTEN (a standby?); the change log is read every N s
+instead\fR once, and a zone added on the primary is served after 0.75 s, a
+changed record after 1.0 s (\fBpoll\-interval 1\fR, \fBcoalesce 200\fR, local
+replication). The cost is one index-only \fBcount(*)\fR per poll over at most
+1,000,000 log rows. \fBtests/test_db_pgsql.c\fR tests the fingerprint (a commit,
+a row with a lower \fBseq\fR that commits last, a lost connection) by setting
+the driver's \fBlisten_failed\fR flag; the standby itself is a manual procedure:
+\fBpg_basebackup \-R\fR of a primary with \fBwal_level replica\fR, the standby
+started with its own \fB\-p\fR, the database block pointing at the standby's
+socket and port.
+.PP
+\fBTargets of the release plan with the default settings\fR (\fBingest\-threads
+1\fR, \fBloader\-threads 1\fR):
+.TP 8
+T-START: start to answering (first zones / \fBinitial load complete\fR)
+\fIz10k:\fR 1.0 s / 24.1 s
+.br
+\fIz1m:\fR 1.9 s / 33.4 s
+.br
+\fIGoal:\fR answering within 60 s
+.br
+\fIMet:\fR yes
+.TP 8
+T-START with \fBingest\-threads 2\fR, \fBloader\-threads 2\fR
+\fIz10k:\fR 1.1 s / 12.8 s
+.br
+\fIz1m:\fR 1.9 s / 19.2 s
+.br
+\fIMet:\fR yes
+.TP 8
+Peak RSS of the Backend (all zones loaded)
+\fIz10k:\fR 1,079 MB
+.br
+\fIz1m:\fR 2,998 MB
+.TP 8
+Peak RSS of the loader
+\fIz10k:\fR 15 MB
+.br
+\fIz1m:\fR 280-380 MB
+.TP 8
+T-ZONEADD: add a zone, \fBkarictl reload <zone>\fR to the answer (5 runs, 2 series)
+\fIz10k:\fR 7-8 ms (before the fixes below: 27 ms)
+.br
+\fIz1m:\fR 28-44 ms (before: 0.17-0.19 s, once 0.71 s; before the one-zone
+lookup fix: 0.8-1.3 s on a fresh run, 1.1-2.7 s in the long run)
+.br
+\fIGoal:\fR under 1 s
+.br
+\fIMet:\fR yes
+.TP 8
+one zone changed / deleted, the same
+\fIz10k:\fR 11-12 ms / 7 ms (before: 18-19 ms / 26 ms)
+.br
+\fIz1m:\fR 6-8 ms, once 0.56 s / 27-37 ms (before: 26-45 ms / 0.18-0.64 s;
+before the one-zone lookup fix: 0.3-1.5 s / 0.75-1.0 s)
+.br
+\fIGoal:\fR under 1 s
+.br
+\fIMet:\fR yes
+.TP 8
+T-AUTORELOAD: commit to served (8 runs, \fBpoll\-interval 1\fR, \fBcoalesce 200\fR)
+\fIz10k:\fR 0.28-1.02 s
+.br
+\fIz1m:\fR 1.2-2.2 s (median 1.25 s)
+.br
+\fIGoal:\fR a few seconds
+.br
+\fIMet:\fR yes
+.TP 8
+T-RECOVER, Backend killed (\fBkill \-9\fR): the server exits and was started again at once: first answer / \fBinitial load complete\fR
+\fIz10k:\fR 1.0 s / 24.2 s
+.br
+\fIz1m:\fR 2.0 s / 33.6 s
+.br
+\fIGoal:\fR within T-START
+.br
+\fIMet:\fR yes
+.TP 8
+T-RECOVER, loader killed: answers continue; new loader connected / has compared every zone
+\fIz10k:\fR 1.06 s / 24.4 s
+.br
+\fIz1m:\fR 1.1 s / 29.4 s
+.TP 8
+\fBkarictl reload\fR, nothing changed
+\fIz10k:\fR 0.04 s
+.br
+\fIz1m:\fR 3.3 s
+.TP 8
+\fBkarictl reload\fR, 1% of the zones edited
+\fIz10k:\fR 0.29 s
+.br
+\fIz1m:\fR 3.9 s
+.TP 8
+\fBkarictl reload\fR, 10% of the zones edited, under load (see below)
+\fIz10k:\fR 2.6 s
+.br
+\fIz1m:\fR 17.7 s
+.PP
+Notes:
+.IP \(bu 2
+\fBThere are no persisted images in this release\fR, so "restart" is a start:
+the whole database is read again. T-START is met without them for 10^7 records
+and for 10^6 zones on this host; the time is the time the loader needs to read
+and convert the database (\fBkaridns\-dbloader \-\-dump\fR alone: 23.6 s for
+\fBz10k\fR, 27.9 s for \fBz1m\fR with one thread), the Backend adds about 0.5 s
+(\fBz10k\fR) and 5 s (\fBz1m\fR).
+.IP \(bu 2
+\fBA restarted loader reads the whole database\fR (it compares every zone with
+the Backend's inventory before its first batch; 24 s / 29 s above). The Backend
+answers from its zones all the time. T-RECOVER for a killed Backend was measured
+by starting the server again immediately after it exited (it exits 0.06-0.16 s
+after the kill).
+.IP \(bu 2
+\fBT-ZONEADD at 1,000,000 zones.\fR The first measurement missed the target
+because a one-zone reload read the list of all zones of the source. The loader
+now looks the zone up by name (\fBfind_zone\fR of the drivers, an index on
+\fBdomains.name\fR; PostgreSQL falls back to \fBlower()\fR only when the exact
+spelling is not found) and asks the inventory for that one name. What remained
+(an add 0.17 s, a delete 0.2-0.6 s at 1,000,000 zones) was profiled in the beta
+leftovers: 58 ms were still in the loader, because the SQLite3 \fBfind_zone\fR
+was written \fBname = ? OR name = ?\fR with an explicit \fBCOLLATE\fR, for which
+SQLite chooses \fBSCAN domains\fR (8,400 pages) instead of the index; it is an
+\fBIN\fR list now (\fBEXPLAIN QUERY PLAN\fR: \fBSEARCH name_index\fR). About 105
+ms were in the Backend: \fBsnapshot_apply_db_delta()\fR copied the zone list of
+the view and rebuilt both hash tables from every name (90 ms of the 105; the
+delta of the first second of a start does the same with 25,000 zones). It now
+copies the hash tables of the old snapshot (\fBmemcpy\fR) and patches them: an
+added zone is appended and linked, a removed one is unlinked and the last entry
+takes its slot, so the work per change is a chain walk; the tables are rebuilt
+only when the load factor would pass one half, or when a catalog consumer
+leaves. What was still proportional to the number of zones was the copy of the
+tables (about 30 MB at 1,000,000 zones) and one reference count per zone for the
+new snapshot (and one release per zone when the old snapshot was freed by its
+cleanup thread): \fBsnapshot_apply_db_delta()\fR took 19 ms instead of 105
+ms. D1a (the zone directory) removed that: the views of a snapshot share one
+directory per view, \fBsnapshot_apply_db_delta()\fR inserts and removes the
+changed elements in place (open addressing; a tombstone for a removal, a bigger
+table only when the load would pass one half) and publishes a snapshot that only
+holds the names, the match-clients and a reference of each directory, so the
+work is proportional to the change. What leaves the directory is freed when the
+snapshot that was current at that time and every older one are drained. A new
+entry that replaces a served one (a database zone that changes kind, for example
+from primary to secondary) takes the place of the old one in the directory at
+the commit, not at the next delta. The other 10-20 ms of an add are the loader's
+read, the stream and the first query. Of about 40 single reloads one in twenty
+was delayed by about 0.5 s (0.56 s once, 0.57 s before the change); it also
+happened for a change, which publishes no delta, and the cause was not found.
+.IP \(bu 2
+\fBThe 0.13 / 0.26 / 0.52 s one-zone reloads\fR (about one in twenty at
+1,000,000 zones, with either source, add, change or delete, delta or not) had
+two causes in the Backend, both fixed after B13: the control thread's one-second
+tick walked every zone of the snapshot inside an RCU read section (90-250 ms at
+1,000,000 zones) looking for secondaries to refresh and for NOTIFY requests, so
+a \fBkarictl reload <zone>\fR that arrived during the walk waited for it, and
+the grace period of the batch (\fBzone_retire_process\fR) waited for that read
+section with sleeps that doubled up to 131 ms, which made a walk of 70 ms cost
+131 ms and one of 250 ms cost 524 ms. The tick now looks only at the view's list
+of secondaries and catalog members (\fBtick_entries\fR, built with the hash
+tables and inherited by the one-zone delta), walks every zone only when a NOTIFY
+was requested since its last full walk, and the grace-period wait sleeps at most
+1 ms at a time. Measured afterwards with 100 one-zone changes at 1,000,000 zones
+(SQLite3): \fBkarictl reload <zone>\fR answered in 5-11 ms and the change was
+served 15-25 ms after the command (the tail up to 77 ms is the \fBdag\fR process
+of the measurement; 0 ms of query time). The tick also no longer costs 10-25% of
+a core at 1,000,000 zones.
+.IP \(bu 2
+\fBT-AUTORELOAD\fR depends on \fBpoll\-interval\fR (SQLite3) and \fBcoalesce\fR;
+the table uses 1 s and 200 ms. With PostgreSQL a commit is seen by \fBLISTEN\fR
+at once; the latency is then the \fBcoalesce\fR window plus the comparison, see
+the PostgreSQL table below.
+.IP \(bu 2
+\fBReload under load.\fR \fBdnsperf \-c 4 \-T 2 \-q 200\fR ran for 20 s over
+random names of the data set while 10% of the zones were edited and \fBkarictl
+reload\fR was started 4 s in. Queries per second before the reload / mean /
+lowest second during it: \fBz10k\fR 550k / 198k / 6.6k, \fBz1m\fR 403k / 227k /
+12k; no query was lost and the longest latency was 0.56 s (\fBz10k\fR) and 1.2 s
+(\fBz1m\fR). Queries are still answered, but throughput falls while the reload
+is busy, in some seconds nearly to zero: on 4 vCPU the load generator, the two
+query threads, the Backend's builder and the loader compete for the same cores,
+so part of this is the test setup; the T-RELOAD target (p99 within a small
+factor of idle) was not measured.
+.IP \(bu 2
+\fBMemory.\fR About 108 bytes per record (\fBz10k\fR) and 3.0 KB per zone of 11
+records (\fBz1m\fR) in the Backend; the loader stays at 15 MB for a few large
+zones and needs about 300 MB for the inventory and the zone list of 1,000,000
+zones. A reload that edits 10% of the zones keeps the old versions of the
+changed zones until they are freed: the Backend peaked 82 MB above its idle size
+at \fBz10k\fR (1,000 zones of 1,000 records) and 34 MB at \fBz1m\fR. Each extra
+\fBloader\-thread\fR adds about 25-40 MB to the loader with large zones (15, 53,
+93 MB for 1, 2, 4 threads at \fBz10k\fR) and little with small ones.
+.IP \(bu 2
+\fBT-QPS (L)\fR (no database block, \fBtests/karidns\-test.conf\fR, \fBdnsperf
+\-c 4 \-T 2 \-q 200 \-l 20\fR, three runs, host idle): the v0.6 beta branch 475k
+(median of 6 runs; 495k and 461k in the two rounds) against 483k for \fBmain\fR
+before the database work (484k and 465k), the figure of 2026-10-09 being
+481k. The spread between runs of one build (445k-508k) is larger than the
+difference: no regression.
+.PP
+\fBThread sweep.\fR Start of \fBkaridns\fR with each combination, in seconds
+until \fBinitial load complete\fR (one run each; reloads in the full results):
+.PP
+.TS
+rb rb rb rb rbw(11) rbw(12)
+r r r r rw(11) rw(12).
+\&\fBingest\-threads\fR	\&\fBloader\-threads\fR	\&\fBz10k\fR	\&\fBz1m\fR	T{
+\fBz10k\fR reload, 10% changed, under load
+T}	T{
+\fBz1m\fR reload, 10% changed, under load
+T}
+_
+\&1	\&1	\&24.1	\&33.8	\&2.6 s	\&14.3 s
+\&1	\&2	\&14.7	\&21.0	\&1.5 s	\&8.7 s
+\&1	\&4	\&15.3	\&21.2	\&1.6 s	\&9.0 s
+\&2	\&1	\&24.1	\&34.8	\&2.7 s	\&16.9 s
+\&2	\&2	\&12.8	\&19.2	\&1.4 s	\&10.1 s
+\&2	\&4	\&10.9	\&19.0	\&1.3 s	\&7.6 s
+\&4	\&1	\&24.1	\&34.4	\&2.9 s	\&15.0 s
+\&4	\&2	\&14.2	\&20.0	\&1.4 s	\&10.7 s
+\&4	\&4	\&10.5	\&20.1	\&1.2 s	\&11.9 s
+.TE
+.PP
+The loader alone (\fB\-\-dump\fR, 1 / 2 / 4 threads): \fBz10k\fR 23.6 / 12.4 /
+6.7 s and \fBz1m\fR 27.9 / 15.2 / 8.3 s with SQLite3; 29.0 / 15.5 / 8.6 s and
+34.4 / 19.6 / 11.5 s with PostgreSQL 18.6 on the same host (database of 2.6 GB
+for \fBz1m\fR). The start of \fBkaridns\fR with a PostgreSQL source is in the
+next section.
+.PP
+\fBRecommended values\fR (the defaults stay 1, so a small host or a database of
+a few zones needs no tuning):
+.IP \(bu 2
+The loader is the bottleneck of a start and of a big reload: with
+\fBloader\-threads 1\fR, more \fBingest\-threads\fR change nothing (24 s, 34 s
+above). \fB\fBloader\-threads 2\fB\fR takes about 40% off (\fBz10k\fR 24.1 to
+14.7 s, \fBz1m\fR 33.8 to 21.0 s).
+.IP \(bu 2
+\fB\fBingest\-threads 2\fB together with \fBloader\-threads 2\fB\fR is the best
+general setting on 4 cores: 12.8 s and 19.2 s, nearly the best of the sweep, and
+it leaves two cores for the query threads. \fBloader\-threads 4\fR gains up to
+another 15% with large zones (\fBz10k\fR 10.9 s) and nothing with many small
+ones (\fBz1m\fR 19.0 s), and takes the cores the query threads need while a
+reload runs. \fBingest\-threads 4\fR gave nothing over 2.
+.IP \(bu 2
+Rule of thumb: \fBloader\-threads\fR and \fBingest\-threads\fR of about half the
+number of cores, never more than the cores minus the query threads; 1 on hosts
+with one or two cores. \fBingest\-threads\fR is read when the server starts.
+.IP \(bu 2
+For PostgreSQL the same holds; each loader thread opens its own connection, so
+check \fBmax_connections\fR.
+.SH EXAMPLES
+The examples were run once with the package \fBkaridns\-db\fR installed under a
+scratch root, so \fB/usr/local/...\fR below is a path of that installation
+(\fBsqlite3\fR is the SQLite3 command line tool, \fBschema.sqlite3.sql\fR the
+PowerDNS schema file; names are test names). \fBexample.test\fR and
+\fB192.0.2.0/24\fR are reserved for documentation.
+.PP
+\fBA SQLite3 database with one zone.\fR
+.PP
+.RS 2
+.nf
+$ sqlite3 zones.sqlite3 < schema.sqlite3.sql
+wal
+$ sqlite3 zones.sqlite3 < /usr/local/share/karidns/db/karidns_ext.sqlite3.sql
+$ cat zone.sql
+INSERT INTO domains (name, type) VALUES ('example.test', 'NATIVE');
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
+  SELECT id, 'example.test', 'SOA', 'ns1.example.test. hostmaster.example.test. 1 3600 600 86400 300', 3600, 0, 0 FROM domains WHERE name = 'example.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
+  SELECT id, 'example.test', 'NS', 'ns1.example.test.', 3600, 0, 0 FROM domains WHERE name = 'example.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
+  SELECT id, 'www.example.test', 'A', '192.0.2.10', 300, 0, 0 FROM domains WHERE name = 'example.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
+  SELECT id, 'ns1.example.test', 'A', '192.0.2.1', 3600, 0, 0 FROM domains WHERE name = 'example.test';
+$ sqlite3 zones.sqlite3 < zone.sql
+.fi
+.RE
+.PP
+\fBWhich drivers, which version.\fR
+.PP
+.RS 2
+.nf
+$ karidns\-dbloader \-\-drivers
+sqlite3
+postgresql
+$ karidns\-dbloader \-\-version
+karidns\-dbloader 0.6.2
+.fi
+.RE
+.PP
+\fBWrite the stream the Backend would get.\fR The bytes do not depend on the
+number of loader threads, and \fB\-\-zone\fR reads one zone with a query of its
+own:
+.PP
+.RS 2
+.nf
+$ karidns\-dbloader \-\-dump zones.kdb \-\-driver sqlite3 \-\-database\-file zones.sqlite3
+$ karidns\-dbloader \-\-dump zones4.kdb \-\-driver sqlite3 \-\-database\-file zones.sqlite3 \-\-loader\-threads 4 && cmp zones.kdb zones4.kdb
+$ karidns\-dbloader \-\-dump \- \-\-driver sqlite3 \-\-database\-file zones.sqlite3 \-\-zone example.test | wc \-c
+     579
+.fi
+.RE
+.PP
+\fBCheck the database before it goes live.\fR \fB\-\-check\fR prints lines of
+the check protocol (\fBI\fR information, \fBZ\fR a zone, \fBE\fR an error,
+\fBW\fR a warning, \fBR\fR the result: zones, errors, warnings), \fBkaricheck
+db\fR prints the same in the style of \fBkaricheck zone\fR:
+.PP
+.RS 2
+.nf
+$ karidns\-dbloader \-\-check \-\-driver sqlite3 \-\-database\-file zones.sqlite3
+I               0       karidns_* schema version 2
+Z       example.test.   1       primary *
+R       1       0       0
+$ cat karidns.conf
+options {
+    pid\-file "none";
+    database { driver sqlite3; database\-file "/home/claude/b13doc/zones.sqlite3"; loader\-path "/usr/local/libexec/karidns\-dbloader"; acl\-ceiling { 192.0.2.0/24; }; };
+};
+$ karicheck db karidns.conf
+[INFO] Loading config karidns.conf...
+[INFO] Checking Database file '/home/claude/b13doc/zones.sqlite3' (the default view) with the rights of the user claude (uid 1002)
+[INFO] Database file '/home/claude/b13doc/zones.sqlite3': karidns_* schema version 2
+[RESULT] Database file '/home/claude/b13doc/zones.sqlite3': 1 zone(s) read, 0 error(s), 0 warning(s)
+[OK] Database file '/home/claude/b13doc/zones.sqlite3' is valid.
+[INFO] Checked 1 database (1 zone). Errors: 0, warnings: 0
+.fi
+.RE
+.PP
+A row the loader would refuse (the exit status is 1; \fB\-\-dump\fR would send
+the zone as \fBZONE_FAILED\fR):
+.PP
+.RS 2
+.nf
+$ sqlite3 zones.sqlite3 "INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'bad.example.test', 'A', '192.0.2.999', 300, 0, 0 FROM domains WHERE name = 'example.test';"
+$ karicheck db karidns.conf
+[INFO] Loading config karidns.conf...
+[INFO] Checking Database file '/home/claude/b13doc/zones.sqlite3' (the default view) with the rights of the user claude (uid 1002)
+[INFO] Database file '/home/claude/b13doc/zones.sqlite3': karidns_* schema version 2
+[ERROR] Database file '/home/claude/b13doc/zones.sqlite3': zone 'example.test.' (domains.id 1): records.id 5: invalid IPv4 address literal in A record
+[RESULT] Database file '/home/claude/b13doc/zones.sqlite3': 1 zone(s) read, 1 error(s), 0 warning(s)
+[INFO] Checked 1 database (1 zone). Errors: 1, warnings: 0
+[FAIL] Database file '/home/claude/b13doc/zones.sqlite3' has errors.
+.fi
+.RE
+.PP
+\fBPostgreSQL.\fR The role \fBkaridns_loader\fR was created by \fBCREATE ROLE
+karidns_loader LOGIN;\fR, the PowerDNS tables exist in the database
+\fBkaridns\fR, the extension file is applied by the owner of the tables, and the
+role script by a superuser such as \fBpostgres\fR (it alters the role, which
+needs more than the right to the tables). The loader then reads with the
+privileges of that role only:
+.PP
+.RS 2
+.nf
+$ psql \-d karidns \-f /usr/local/share/karidns/db/karidns_ext.pgsql.sql
+$ psql \-v ON_ERROR_STOP=1 \-v role=karidns_loader \-v schema=public \-f /usr/local/share/karidns/db/karidns_loader_role.pgsql.sql karidns
+$ psql \-d karidns \-c "SET ROLE karidns_loader; SELECT content FROM cryptokeys"
+SET
+ERROR:  permission denied for table cryptokeys
+$ cat conninfo
+host=/tmp dbname=karidns
+$ karidns\-dbloader \-\-check \-\-driver postgresql \-\-conninfo\-file conninfo
+W               0       the role claude can read cryptokeys.content (the private keys); the loader needs only domain_id (db/karidns_loader_role.pgsql.sql grants just that)
+I               0       karidns_* schema version 2
+R       0       0       1
+.fi
+.RE
+.PP
+(The last \fB\-\-check\fR ran as the owner of the tables, hence the warning
+about \fBcryptokeys.content\fR; with \fBuser=karidns_loader\fR in the conninfo
+file and the loader running as that role it does not appear. The conninfo file
+must have mode 0600 and belong to the user who runs the loader.)
+.SH FILES
+.TP 8
+\fB/usr/local/bin/karidns\-zone\fR
+The importer and exporter of zones (database packages; \fBkaridns\-zone(8)\fR).
+.TP 8
+\fB/usr/local/libexec/karidns\-signer/\fR, \fB/usr/local/sbin/karidns\-signer\fR
+The signer daemon and its wrapper (the package \fBkaridns\-signer\fR;
+\fBkaridns\-signer(8)\fR).
+.TP 8
+\fB/usr/local/share/karidns/db/\fR
+The SQL files above (database packages; \fBdb/\fR in a source tree).
+.TP 8
+the file of \fBloader\-state\-file\fR (default: none)
+The hot list (above), text, mode 0600, written by the loader in its own
+directory.
+.TP 8
+\fBtests/db/gen_sqlite3_zones.sh\fR
+The generator of the measurement databases (source tree).
+.TP 8
+\fBtests/db/gen_pgsql_zones.sh\fR
+The same data set in a PostgreSQL database (source tree).
+.SH SEE ALSO
+.IP \(bu 2
+\fBkaridns(8)\fR \[u2014] the \fBdatabase\fR block, database zones, settings,
+auto reload, several servers
+.IP \(bu 2
+\fBkarictl(8)\fR \[u2014] \fBreload\fR, \fBdbstatus\fR
+.IP \(bu 2
+\fBkaridns\-zone(8)\fR \[u2014] import and export of zones (writes the tables
+this loader reads)
+.IP \(bu 2
+\fBkaridns\-signer(8)\fR \[u2014] keeps the zones signed; uses the signer
+tables, role and reload requests described here
+.IP \(bu 2
+Distribution Guide \[u2014] the four FreeBSD packages
+.SH AUTHORS
+Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)

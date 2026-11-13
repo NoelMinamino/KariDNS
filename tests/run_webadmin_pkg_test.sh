@@ -54,8 +54,9 @@ echo "-- the package"
 mkdir -p "$T/src/webadmin" "$T/src/node" "$T/src/packaging" "$T/src/docs" "$T/out"
 cp -R webadmin/bin webadmin/lib webadmin/ui webadmin/package.json webadmin/package-lock.json "$T/src/webadmin/"
 cp -R node/lib node/package.json "$T/src/node/"
-cp -R packaging/freebsd packaging/version.sh "$T/src/packaging/" && cp VERSION "$T/src/"      # (version.sh: the number of the package, docs/RELEASING.md)
+cp -R packaging/freebsd packaging/version.sh packaging/install.sh "$T/src/packaging/" && cp VERSION Makefile "$T/src/"      # (version.sh: the number of the package, docs/RELEASING.md)
 cp docs/karidns-webadmin.md docs/karidns-api.md docs/karidns-webadmin-gui.md docs/karidns-webadmin-gui-checklist.md "$T/src/docs/"
+mkdir -p "$T/src/man" && cp man/karidns-webadmin.8 "$T/src/man/"      # (the package is staged with make install-webadmin install-man-webadmin install-docs-webadmin)
 cp karidns-webadmin.conf.sample "$T/src/"
 export npm_config_prefer_offline=true
 if (cd "$T/src" && sh packaging/freebsd/build_webadmin_pkg.sh 9.9.9 "$T/out") > "$T/build.out" 2>&1; then ok "build_webadmin_pkg.sh builds the package"; else bad "build_webadmin_pkg.sh failed" "$(tail -15 "$T/build.out")"; done_; fi
@@ -67,14 +68,14 @@ grep -q '^Origin *: dns/karidns-webadmin$' "$T/info.out" && ok "origin dns/karid
 pkg info -d -F "$PKG" 2> /dev/null | grep -q 'node24-' && ok "it depends on node24" || bad "no dependency on node24"
 pkg info -d -F "$PKG" 2> /dev/null | grep -q 'bind-tools' && bad "it depends on bind-tools (only the signer needs them)" || ok "...and on nothing else it does not use"
 pkg info -l -F "$PKG" 2> /dev/null | tail -n +2 | sed 's/^[[:space:]]*//' > "$T/files.txt"
-for f in /usr/local/sbin/karidns-webadmin /usr/local/etc/rc.d/karidns_webadmin /usr/local/etc/karidns/karidns-webadmin.conf.sample /usr/local/share/doc/karidns/karidns-webadmin.md \
+for f in /usr/local/sbin/karidns-webadmin /usr/local/etc/rc.d/karidns_webadmin /usr/local/etc/karidns/karidns-webadmin.conf.sample /usr/local/share/man/man8/karidns-webadmin.8.gz /usr/local/share/doc/karidns/karidns-webadmin.md \
          /usr/local/share/doc/karidns/karidns-api.md /usr/local/share/doc/karidns/karidns-webadmin-gui.md /usr/local/share/doc/karidns/karidns-webadmin-gui-checklist.md /usr/local/libexec/karidns-webadmin/webadmin/bin/karidns-webadmin.js /usr/local/libexec/karidns-webadmin/webadmin/lib/cli.js /usr/local/libexec/karidns-webadmin/webadmin/ui/index.html \
          /usr/local/libexec/karidns-webadmin/node/lib/run.js /usr/local/libexec/karidns-webadmin/node/package.json /usr/local/libexec/karidns-webadmin/node_modules/pg/package.json; do
     grep -qx "$f" "$T/files.txt" && ok "the package holds $f" || bad "the package does not hold $f"
 done
 grep -Eq '^/usr/local/libexec/karidns-webadmin/(webadmin|node)/test/' "$T/files.txt" && bad "the package holds the test files of the program" || ok "no test file of the program in the package"
 grep -q 'node_modules/\.bin' "$T/files.txt" && bad "the package holds node_modules/.bin" || ok "no node_modules/.bin (no link into the tree)"
-grep -v '^/usr/local/\(sbin/karidns-webadmin\|etc/rc.d/karidns_webadmin\|etc/karidns/karidns-webadmin.conf.sample\|share/doc/karidns/karidns-\(webadmin\|webadmin-gui\|webadmin-gui-checklist\|api\).md\|libexec/karidns-webadmin/\)' "$T/files.txt" > "$T/other.txt"
+grep -v '^/usr/local/\(sbin/karidns-webadmin\|etc/rc.d/karidns_webadmin\|etc/karidns/karidns-webadmin.conf.sample\|share/man/man8/karidns-webadmin.8.gz\|share/doc/karidns/karidns-\(webadmin\|webadmin-gui\|webadmin-gui-checklist\|api\).md\|libexec/karidns-webadmin/\)' "$T/files.txt" > "$T/other.txt"
 [ ! -s "$T/other.txt" ] && ok "nothing outside the paths of the package" || bad "files outside the paths of the package" "$(head -5 "$T/other.txt")"
 # the scripts and the user
 mkdir "$T/root" && tar -xf "$PKG" -C "$T/root" 2> /dev/null
@@ -216,9 +217,10 @@ RC="env karidns_webadmin_user=nobody karidns_webadmin_config=$CONF karidns_webad
 mkdir -p "$T/rcdir" && chown nobody "$T/rcdir"
 $RC oneconfigtest > "$T/rc_cfg.out" 2>&1 && ok "configtest runs --check as the service user" || bad "configtest" "$(cat "$T/rc_cfg.out")"
 grep -q "the configuration is fine" "$T/rc_cfg.out" && ok "...and the configuration is fine" || bad "configtest output" "$(cat "$T/rc_cfg.out")"
-[ -d "$KEYDIR" ] && same "the directory of the TOTP key is made, mode 0700" "$(stat -f %Lp "$KEYDIR")" 700 || bad "the directory of the TOTP key was not made"
-same "...owned by the service user" "$(stat -f %Su "$KEYDIR")" nobody
+[ ! -e "$KEYDIR" ] && ok "...and makes nothing (the start makes the directory of the TOTP key)" || bad "configtest made the directory of the TOTP key"
 $RC onestart > "$T/rc_start.out" 2>&1 && ok "onestart" || bad "onestart" "$(cat "$T/rc_start.out")"
+[ -d "$KEYDIR" ] && same "the start made the directory of the TOTP key, mode 0700" "$(stat -f %Lp "$KEYDIR")" 700 || bad "the directory of the TOTP key was not made"
+same "...owned by the service user" "$(stat -f %Su "$KEYDIR")" nobody
 i=0; while [ $i -lt 100 ] && ! $NODE -e "fetch('http://127.0.0.1:$PORT/api/v1/health').then((r) => process.exit(r.status === 200 ? 0 : 1), () => process.exit(1))"; do sleep 0.2; i=$((i + 1)); done
 $NODE -e "fetch('http://127.0.0.1:$PORT/api/v1/health').then((r) => process.exit(r.status === 200 ? 0 : 1), () => process.exit(1))" && ok "the daemon answers /health" || bad "the daemon does not answer" "$(cat "$T/rc_start.out")"
 SUP=$(cat /var/run/karidns_webadmin/supervisor.pid 2> /dev/null); CHILD=$(cat /var/run/karidns_webadmin/child.pid 2> /dev/null)

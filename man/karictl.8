@@ -1,0 +1,653 @@
+.TH KARICTL 8 "2026-11-14" "KariDNS" "KariDNS Manual"
+.\" Generated from docs/karictl.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
+.SH NAME
+karictl \- Remote Control and Management Utility for KariDNS
+.SH SYNOPSIS
+.RS 2
+.nf
+karictl [\-c config_path | \-f config_path] [\-s socket_path] [\-t seconds] <command> [arguments...]
+karictl \-v | \-\-version
+karictl \-h | \-\-help
+karictl tsig\-keygen [keyname]
+.fi
+.RE
+.SH DESCRIPTION
+\fBkarictl\fR is the management utility for the \fBkaridns(8)\fR authoritative
+DNS server daemon. It communicates with the daemon over a local UNIX domain
+socket (default \fB/var/run/karidns/control.sock\fR) and authenticates each
+connection with an HMAC challenge-response handshake: the server sends a
+64-character challenge, and \fBkarictl\fR answers with the HMAC of the challenge
+keyed with the shared secret. The HMAC algorithm is \fBcontrol\-channel {
+algorithm }\fR on the server and \fBalgorithm\fR in \fBkarictl.conf\fR (both
+default to \fBhmac\-sha256\fR).
+.SH OPTIONS
+.TP 8
+\fB\-c config_path\fR, \fB\-f config_path\fR
+Path to the \fBkarictl\fR configuration file (default:
+\fB/usr/local/etc/karidns/karictl.conf\fR; if that file does not exist and
+\fB/usr/local/etc/karictl.conf\fR does, the latter is used).
+.TP 8
+\fB\-s socket_path\fR
+UNIX domain socket to connect to. Takes precedence over the \fBsocket\fR setting
+of the configuration file (default: \fB/var/run/karidns/control.sock\fR).
+.TP 8
+\fB\-t seconds\fR
+How long to wait for each part of the server's reply: the challenge, and then
+each read of the answer (1\[u2013]86400, default 60, as \fBrndc \-t\fR). When
+the server sends nothing for that long, \fBkarictl\fR prints \fBno reply from
+the server within N s\fR and fails. A full \fBreload\fR of the zone files
+answers when the reload is done, so a server with very many zone files may need
+a larger value; database zones answer at once (\fBkarictl dbstatus\fR shows the
+progress).
+.TP 8
+\fB\-v\fR, \fB\-\-version\fR
+Display version information and exit.
+.TP 8
+\fB\-h\fR, \fB\-\-help\fR
+Print the command list with the \fBreload <zone> [view] [force]\fR syntax and
+examples, and exit.
+.SH COMMANDS
+Commands that take a zone name accept an optional view name as the next
+argument. The view name is required when the zone exists in more than one view;
+otherwise the command fails with \fBERROR zone exists in multiple views; specify
+view\fR.
+.TP 8
+\fBstatus\fR
+Query and display runtime statistics from the running \fBkaridns\fR daemon:
+.RS 8
+.IP \(bu 2
+Version, host name, OS, architecture and kernel release and CPU count of the
+running server (taken when it started), and its worker thread count
+.IP \(bu 2
+Server boot time, time of the last successful (re)configuration (both to the
+second) and the configuration file path
+.PP
+\fBkarictl\fR and \fBkaridns\fR must be the same version: the reply is a binary
+structure, and a reply of another size is shown as is and exits with status 3.
+.IP \(bu 2
+Number of zones, \fBdebug level: N\fR (the debug level in force: \fBkaridns
+\-d\fR, \fBtrace\fR, \fBnotrace\fR; where \fBrndc status\fR prints it) and
+number of running AXFR/IXFR transfers
+.IP \(bu 2
+Whether query and response logging are enabled
+.IP \(bu 2
+Current and high-water TCP connection counts
+.IP \(bu 2
+Size of the zone versions and IXFR deltas (D1a): the bytes of the published
+versions of the zones (the version, its image and its glue block) and of the
+IXFR deltas the zones keep (the data of the difference only), for the zones that
+come from the database and for the others, as \fBresident\fR (what the zones
+serve now) and \fBretired\fR (versions that a newer one replaced and that are
+not freed yet, because a reader or a transfer may still hold them). It is not
+the whole memory of a zone: the zone entry itself, its per-zone counters and the
+response cache are not in it. An IXFR delta that left the history stays counted
+as resident until the last transfer that reads it has released it. Read only:
+nothing limits them yet
+.IP \(bu 2
+The bytes the zones keep for \fBrollback\fR (the previous versions, see
+\fBrollback\fR): \fBzone versions kept for rollback: database zones N bytes,
+other zones N bytes\fR. They are not served; they are freed when the
+\fBrollback\-window\fR is over, or earlier when the database \fBmemory\-limit\fR
+needs the room
+.IP \(bu 2
+Frontend process health status
+.IP \(bu 2
+Security counters: RRL dropped/slipped responses, Extended DNS Error counters
+(18 Prohibited, 20 Not Authoritative, 21 Not Supported, other) and truncated
+dnstap messages
+.IP \(bu 2
+dnstap (0.7): \fBdnstap dropped (queue full): N\fR (messages lost because a ring
+was full: the collector reads too slowly, or \fBqueue\-size\fR is too small),
+\fBdnstap dropped (not connected): N\fR (messages lost while no collector was
+connected), \fBdnstap connected: yes|no|no (not configured)\fR and \fBdnstap
+reconnects: N\fR (connections made by the background retry); see karidns(8)
+\fBdnstap\fR "Loss". Without a \fBdnstap\fR block the counters are 0, as
+\fBdnstap truncated\fR is
+.RE
+.TP 8
+\fBreload [zone [view] [force]]\fR
+Without arguments, re-read the configuration file and \fBall\fR zone files (see
+\fBreconfig\fR for the replies; a full reload also drops the changes of dynamic
+updates), then, when the configuration has a \fBdatabase\fR block, ask the
+database loader to compare its databases with the zones served: the loader sends
+the zones that are new, whose serial differs, that the change log
+(\fBkaridns_changes\fR, see \fBdb/karidns_ext.*.sql\fR) lists as edited, or
+whose last version was refused, and a \fBZONE_DELETE\fR for the zones that left
+the database. The reply does not wait for the loader: \fBOK reloaded; DB reload
+requested (request N)\fR; \fBkarictl dbstatus\fR shows the batch when it is
+done. With a zone name, reload only that zone: a primary zone re-reads its zone
+file (errors such as a missing file, a parse error, a missing SOA or a running
+AXFR are reported), and a secondary zone starts a new transfer from its
+primary. For a \fBprogram zone\fR (\fBtype program\fR, 0.6.2) the operator who
+names the zone asks for its data to be read again, and the plugin is dealt with
+by the first of these that applies: (1) the zone's program settings
+(\fBprogram\fR, \fBprogram\-args\fR, \fBprogram\-user\fR,
+\fBprogram\-timeout\fR, \fBprogram\-max\-failures\fR,
+\fBdisable\-auto\-tc\-flag\fR, \fBprogram\-reload\-line\fR) in the active
+configuration are not those of its running plugin: a new plugin is started, and
+when it is up the old one is stopped, as for a reload; (2) the settings are the
+same and the zone has \fBprogram\-reload\-line yes;\fR: the plugin gets the
+\fBRELOAD\fR line and is not restarted; (3) the settings are the same and the
+zone has no \fBprogram\-reload\-line\fR (or \fBno\fR): a plugin without that
+line can read its data again only by starting again, so a new plugin with the
+same settings is started and replaces the old one in the same way (queries are
+answered throughout). This differs from a full \fBreload\fR (and \fBreconfig\fR,
+\fBSIGHUP\fR), which leaves a plugin whose settings did not change alone, with
+the \fBRELOAD\fR line where configured. The reload of a zone does not read
+\fBkaridns.conf\fR again (run \fBreconfig\fR or a full \fBreload\fR first to
+apply an edit; those already replace the plugins of changed zones, so case 1
+arises when that replacement was refused or has not been answered yet, and the
+reload asks for it again at once). \fBforce\fR has no effect. The replies: \fBOK
+reloaded (program zone: the program settings changed; a new plugin was asked
+for, the old one answers until it is up)\fR (1), \fBOK reloaded (program zone:
+RELOAD line sent to the plugin)\fR (2), \fBOK reloaded (program zone: no
+program\-reload\-line; a new plugin with the same settings was asked for, the
+old one answers until it is up)\fR (3), \fBOK reloaded (program zone: a plugin
+was asked for; the zone answers when it is up)\fR (a plugin that never came up,
+or a refused replacement, is asked for again), \fBOK reloaded (program zone: a
+new plugin with these settings is already on its way)\fR, and \fBERROR no plugin
+runs for this zone: allow\-program\-zones is not yes, or the zone has no
+program\fR. A zone that is not in \fBkaridns.conf\fR is looked up in the
+database. For a \fBdatabase zone\fR the loader reads that zone only (also a zone
+just added to the database, which the server does not know yet). When several
+views take database zones and no view is named, the loader is asked about every
+one of them (a mapping in \fBkaridns_domain_views\fR may have moved the zone)
+and the reply is one line, \fB<z>: view <v1>: <result>; view <v2>: <result>\fR,
+\fBOK\fR when at least one view has the zone and \fBERROR\fR when it is rejected
+or failed there or when no view has it (\fBzone not found (it is not in the
+database of any view that takes database zones)\fR); a named view gives the
+single-view replies below, converts it, and sends it when its content differs
+from the version the server serves, whatever its serial; \fBforce\fR sends it
+even when the content is the same (D1a: not a zone that is out of memory and
+unchanged; there is nothing in memory to replace, the next query reads it from
+the database, and the reply is \fBunchanged, serial <n> (not in
+memory)\fR). \fBkarictl\fR waits for the loader's answer, but the server does
+not: the connection is parked and answered when the result arrives, or after
+\fBdb\-reload\-timeout\fR seconds (\fBERROR timeout: ...\fR; the reload may
+still be applied). At most 32 clients wait at once; the next ones get \fBERROR
+too many reloads are waiting for the database loader; try again
+later\fR. Replies (all \fBOK\fR unless marked):
+.RS 8
+.IP \(bu 2
+\fBOK zone <z> (view <v>): applied, serial <n>\fR: the new version is served.
+.IP \(bu 2
+\fBOK zone <z> (view <v>): unchanged, serial <n>\fR: the loader found the
+content equal to the served version. With memory-limit, \fB (not in memory)\fR
+follows for a zone whose data is out of memory; it is not read, also with
+\fBforce\fR.
+.IP \(bu 2
+\fBOK zone <z> (view <v>): loaded, serial <n>, but hidden by the zone in
+karidns.conf\fR (or \fB... by a catalog member of the same name\fR).
+.IP \(bu 2
+\fBOK zone <z> (view <v>): deleted (it is no longer in the database)\fR.
+.IP \(bu 2
+\fBERROR zone <z> (view <v>): rejected: <reason>; the last good version, if any,
+keeps serving\fR: the server refused the zone.
+.IP \(bu 2
+\fBERROR zone <z> (view <v>): failed: <reason>\fR: the loader could not read or
+convert the zone (a bad row, a missing SOA, an unreadable database); the last
+good version keeps serving.
+.IP \(bu 2
+\fBERROR zone not found (...)\fR: the database does not have the zone (or the
+view does not exist).
+.IP \(bu 2
+several views, none named: \fBOK zone <z>: view a: not in the database; view b:
+applied, serial <n>\fR: the result of each view that takes database zones, in
+configuration order (\fBnot in the database\fR, \fBapplied, serial <n>\fR,
+\fBunchanged, serial <n>\fR, \fBdeleted (...)\fR, \fBrejected: ...\fR,
+\fBfailed: ...\fR).
+.PP
+.RS 2
+.nf
+karictl reload                       # configuration, zone files, and a comparison of the databases
+karictl reload example.test          # one zone, from its file or from the database
+karictl reload example.test force    # send the database zone even if it is unchanged
+.fi
+.RE
+.RE
+.TP 8
+\fBreconfig\fR
+Re-read the configuration file and apply it (added or removed zones, ACLs, rate
+limits, ...). Zone files whose modification time and size have not changed are
+not re-read. This is the same as sending \fBSIGHUP\fR to the server. When the
+\fBzone { }\fR blocks of every view are the ones of the running configuration,
+the zones served from the database are taken over as they are (a reload at
+1,000,000 database zones takes about 30 ms instead of walking every zone), and
+the loader is told about the new configuration afterwards. \fBreload\fR (without
+arguments) and \fBreconfig\fR answer:
+.RS 8
+.IP \(bu 2
+\fBOK\fR (\fBOK reloaded\fR for \fBreload\fR): the configuration was applied and
+every zone loaded. When a setting that needs a restart changed, \fB(restart
+needed for: port, ...)\fR follows.
+.IP \(bu 2
+\fBERROR configuration applied, but N zone(s) failed to load: <zones>\fR: the
+new configuration is in use, and the listed zones (also logged to syslog) answer
+SERVFAIL until their files can be loaded.
+.IP \(bu 2
+\fBERROR configuration not applied: <reason>\fR: the file could not be read, has
+an error (see syslog or \fBkaricheck conf\fR), or a log file could not be
+opened; the running configuration is kept.
+.IP \(bu 2
+\fBERROR reload postponed: ...\fR: readers of the previous configuration were
+still active; the server retries the reload by itself every second.
+.PP
+Every \fBERROR\fR reply makes \fBkarictl\fR exit with status 3.
+.RE
+.TP 8
+\fBstop\fR
+Stop the \fBkaridns\fR daemon.
+.TP 8
+\fBnotify <zone> [view]\fR
+Send DNS NOTIFY messages for \fB<zone>\fR now: to the \fBalso\-notify\fR servers
+and to the addresses of the zone's apex NS hosts, except the host named in the
+SOA MNAME field (RFC 1996 \[u00A7]3.2). Zones served from a database are found
+too; one that is hidden by a configured zone or a catalog member of the same
+name answers \fBERROR zone is not served from the database ...\fR.
+.TP 8
+\fBretransfer <zone> [view]\fR
+For a secondary zone (including a catalog member zone), discard the current
+serial and start a new transfer (AXFR) from the primary immediately. For any
+other zone the server answers \fBERROR zone is not a secondary\fR and karictl
+exits with status 3; the zone is not changed. A \fBSLAVE\fR or \fBCONSUMER\fR
+zone from the database (milestone B7b) is a secondary and is transferred again
+like any other; a \fBNATIVE\fR / \fBMASTER\fR zone from the database is a
+primary zone: the answer is \fBERROR zone is a primary zone from the database;
+read it again with 'karictl reload <zone>'\fR.
+.TP 8
+\fBrollback <zone> [view] [local]\fR
+Put the zone back to the version it had before its last reload. The server keeps
+the version that a \fBzone-file reload\fR (\fBreload\fR, \fBreload <zone>\fR,
+\fBreconfig\fR that re-reads the file) or an \fBinstall from the database\fR
+replaces, for \fBrollback\-window\fR (default 1 hour; \fB0\fR keeps nothing;
+\fBoptions\fR, \fBview\fR and \fBzone\fR, see karidns(8)). A dynamic update, a
+zone transfer and a rollback do not replace it: after a reload and three
+updates, \fBrollback\fR goes back to the version before the reload and the three
+updates are gone with it. A reload that brings the very same content does not
+replace it either, so a second \fBreload\fR of the file you just fixed does not
+push the good version out. The old content is published again with \fBSOA serial
+= the current serial + 1\fR (RFC 1982; a serial of 4294967295 gives 1), an IXFR
+difference is recorded and NOTIFY is sent, as for a reload, so the secondaries
+follow and never see a serial that goes back. Reply: \fBOK rolled back: serial
+<new> (was <current>)\fR. \fBzonestatus\fR shows \fB rolled back (serial <new>,
+from <current>)\fR until the next publication (a reload, an update, a database
+install), and, while a previous version is kept, \fB previous version kept
+(serial <n>, <bytes> bytes, <s> s left)\fR. With \fBlocal\fR the old version is
+published \fBunchanged, with its old serial, on this server only\fR: no NOTIFY
+is sent and the IXFR history of the zone is dropped, so a secondary that has the
+newer serial does not follow (it never accepts a lower serial) and a secondary
+that is behind transfers the whole zone. Use it for a signed zone, or to look at
+the old data. The view name is written first when there are both: \fBrollback
+example.test internal local\fR (a view that is itself named \fBlocal\fR is
+written twice: \fBrollback example.test local local\fR). Replies that are
+\fBERROR\fR (karictl exits with 3, nothing is changed):
+.RS 8
+.IP \(bu 2
+\fBno previous version: ...\fR: the zone was not reloaded within
+\fBrollback\-window\fR since it was loaded, the window ran out, or it was rolled
+back already (\fBonce per reload\fR; there is no redo; reload the file again to
+get a version to go back to).
+.IP \(bu 2
+\fBrollback\-window is 0 for this zone: no previous version is kept\fR.
+.IP \(bu 2
+\fBrollback is for primary zones; a secondary gets its data from the primary\fR:
+a secondary, a catalog member, a \fBforward\fR zone. A catalog zone (\fBa
+catalog zone cannot be rolled back\fR) and a \fBprogram\fR zone are refused too.
+.IP \(bu 2
+\fBzone is signed; roll back in the DB and re\-sign\fR: the version to go back
+to holds RRSIG or DNSKEY records. KariDNS cannot sign, and a new serial would
+leave the SOA with a signature that does not match. Roll back where the zone is
+signed, or use \fBlocal\fR.
+.IP \(bu 2
+\fBbusy (AXFR in progress)\fR; \fBthe zone was taken out of memory; nothing to
+roll back\fR (a database zone whose data left memory, or one hidden by a zone of
+the same name). What a later reload does:
+.IP \(bu 2
+\fBZone file.\fR \fBreload <zone>\fR and a full \fBreload\fR keep the
+rolled-back version while the file is the one that was read (same modification
+time and size), and say so (\fBOK kept the rolled\-back version: ...\fR). Fix
+the file and reload, or \fBreload <zone> force\fR to read it again (which brings
+the data back that you rolled back). A change only in a file that the zone
+\fB$INCLUDE\fRs is not noticed by that check: use \fBforce\fR. \fBreconfig\fR
+already skips files that did not change. A restart reads the file again.
+.IP \(bu 2
+\fBDatabase zone.\fR The server compares the loader's (source id, serial,
+digest) with what it recorded when it installed the zone, and a rollback does
+not change that record, so the rolled-back version stays until the data in the
+database change; the next change is installed normally. Meanwhile the zone is
+pinned in memory like one that a dynamic update changed (\fBdbstatus <zone>\fR
+says \fBrolled back: serial N, from M; pinned in memory ...\fR), because the
+database cannot give the old version back. With several servers on one database,
+a rollback on one makes them differ until the database changes; a rollback in
+the database (\fBkaridns_*\fR data) is the durable fix.
+.IP \(bu 2
+The command needs the permission \fBrollback\fR of a restricted control key
+(\fBallow\-commands { rollback; }\fR), and is logged with the key name like the
+other commands.
+.PP
+.RS 2
+.nf
+karictl reload example.test          # the new file has a mistake
+karictl rollback example.test        # serial N+1, the old data, the secondaries follow
+karictl rollback example.test local  # the old version as it was, this server only
+.fi
+.RE
+.RE
+.TP 8
+\fBzonestatus <zone> [view]\fR
+Display the SOA serial and refresh interval of \fB<zone>\fR (\fBOK serial=<n>
+refresh=<n> retry=<n> expire=<n>\fR; for a secondary the values the zone uses,
+held to \fBmin\-refresh\-time\fR ... \fBmax\-retry\-time\fR). For a zone from
+the database the line goes on with \fBsource=database view=<v> id=<domains.id>
+result=<applied|rejected|shadowed (hidden by ...)>\fR and the last error, if
+any. A secondary that applies settings received from its primary (Extended AXFR
+version 3, see karidns(8)) adds \fBsettings=primary\fR (and \fBnote: ...\fR when
+part of them is not in force, e.g. a TSIG key the received \fBallow\-transfer\fR
+names is not defined here).
+.TP 8
+\fBobservatory [zone [view]]\fR
+Display per-zone statistics for all zones, or only for the given zone (and
+view): role (primary/secondary), SOA serial, query counts (total and TCP),
+response codes (NOERROR, NXDOMAIN, NODATA, SERVFAIL, REFUSED), EDNS/DO/ECS query
+counts, RRL dropped/slipped counts, successful inbound AXFR/IXFR transfers
+(secondary, with \fBFailed\-refreshes\fR: the refreshes that failed at every
+primary asked) or NOTIFY messages sent (primary) with the time of the last one,
+and response cache hits and misses (the cache is shared by all zones, so it has
+no per-zone size). A zone that other views share with \fBzone { in\-view }\fR
+(karidns(8) "Zones shared between views") is listed once, in the view that owns
+it, as \fBZone: <name> (view: <owner>, shared to views: <a>, <b>)\fR;
+\fBstatus\fR counts it once, and \fBnotify\fR, \fBzonestatus\fR and \fBreload\fR
+name it with or without a view (a referencing view's name reaches the owner's
+zone).
+.TP 8
+\fBstats [\-f prometheus|json] [zone [view]] [\-\-zones PATTERN] [\-\-limit N] [\-\-after CURSOR]\fR
+Print the counters of the server, its views and zones, for monitoring. The
+default format is the Prometheus text exposition format (metric names
+\fBkaridns_*\fR, labels \fBzone\fR, \fBview\fR, \fBrcode\fR, \fBproto\fR, ...),
+which the node_exporter textfile collector reads; \fB\-f json\fR (or
+\fB\-\-format json\fR) prints one JSON object. (\fB\-f\fR after \fBstats\fR is
+the format; the \fB\-f\fR before the command is still the configuration
+file.) The exit status is 0 only when the whole output was written, so
+\fBkarictl stats > file.$$ && mv file.$$ file\fR never leaves a half-written
+file. The output has a \fBserver\fR part (version, boot time, zone count,
+workers, TCP clients, zone memory, query, response, EDNS, NOTIFY, transfer,
+response-cache, rate-limit and Extended DNS Error counters, failed transfers,
+failed reloads, raised alerts, and dnstap: \fBkaridns_dnstap_truncated_total\fR,
+\fBkaridns_dnstap_dropped_total{reason="queue_full"|"not_connected"}\fR, the
+gauge \fBkaridns_dnstap_connected\fR (1 or 0; 0 also without a \fBdnstap\fR
+block) and \fBkaridns_dnstap_reconnects_total\fR; in JSON
+\fBdnstap_truncated\fR, \fBdnstap_dropped\fR \fB{queue_full, not_connected}\fR,
+\fBdnstap_connected\fR (true / false) and \fBdnstap_reconnects\fR), then
+\fBviews\fR (zones, queries and responses summed per view; only when every zone
+is listed), then one set of series \fBper zone\fR (queries by transport,
+responses by RCODE, EDNS / DO / ECS queries, rate-limit drops and slips, NOTIFY,
+transfers in and their failures, response cache hits and misses, SOA serial,
+role, time of the last transfer). The counters are cumulative since the server
+started (Prometheus \fBcounter\fRs); a zone that a reload replaces starts again
+at 0, which \fBrate()\fR handles as a counter reset. Queries that no zone
+answered (REFUSED for a name outside every zone, FORMERR, NOTIMP, ...) belong to
+no zone: they are in \fBkaridns_unzoned_responses_total{rcode}\fR, and
+\fBkaridns_responses_total{rcode}\fR is the zones' responses plus
+those. \fBkaridns_queries_total{proto}\fR counts the queries answered for a
+zone. \fBstats <zone> [view]\fR prints one zone (the same as \fBobservatory
+<zone>\fR, without the other zones). Without a zone name every zone is listed,
+fetched in pages of 2000 (the server never builds one reply with all zones) in
+the order of its zone tables (the order of the names' hashes, not alphabetical;
+a zone added or removed while the listing runs may or may not be
+seen). \fB\-\-zones PATTERN\fR lists only the zones whose name matches the glob
+(\fB*\fR, \fB?\fR, \fB[a\-z]\fR, at most four \fB*\fR; case-insensitive;
+\fBexample.*\fR matches \fBexample.test.\fR), \fB\-\-limit N\fR stops after N
+zones and, if there are more, ends the output with \fB# more zones: karictl
+stats \-\-after <cursor>\fR (JSON: \fB"more":true,"after":"<cursor>"\fR), and
+\fB\-\-after CURSOR\fR continues there. A cursor is a position in the server's
+zone tables, so a page costs the server the page, not the number of zones (at
+most 65536 table slots are looked at for one page; a glob that matches little
+gives short pages that karictl asks for one after the other). A cursor from
+before a reload that rebuilt the tables is refused (\fBcursor is stale\fR, exit
+3); a text listing that meets this while it runs starts again (up to three
+times), a JSON listing, which is written as it comes, stops with the error. The
+totals of the zones' counters in the server part (queries by transport, NODATA,
+EDNS, NOTIFY, transfers) are summed with one walk of all zones per command (see
+the release notes for the time at 1,000,000 zones). Values with white space are
+refused (write a space in a name as \fB\e032\fR). The text format is valid
+exposition format whatever the number of zones: karictl collects the zones first
+(184 bytes and the zone name, about 25 bytes, per zone: about 210 MB for
+1,000,000 zones; use \fB\-\-zones\fR and \fB\-\-limit\fR to bound it) and writes
+every metric family once, in one piece, with \fB# HELP\fR and \fB# TYPE\fR
+once. \fB\-f json\fR is written as the pages come and keeps nothing. The command
+needs the read permission of a restricted control key, like \fBobservatory\fR.
+.RS 8
+.PP
+.RS 2
+.nf
+karictl stats > /var/tmp/node_exporter/karidns.prom.$$ && mv /var/tmp/node_exporter/karidns.prom.$$ /var/tmp/node_exporter/karidns.prom
+karictl stats \-f json example.test
+karictl stats \-\-zones '*.example.test' \-\-limit 100
+.fi
+.RE
+.RE
+.TP 8
+\fBdbstatus [zone [view]]\fR
+Show the state of the zones served from a database (\fBoptions { database
+{ ... }; }\fR, SQLite3 or PostgreSQL through \fBkaridns\-dbloader\fR). Without
+arguments: whether the loader is connected (with its process ID, version and
+drivers, and since when), how many DB zones the server holds (served, hidden by
+a zone of the same name in \fBkaridns.conf\fR, hidden by a catalog member of the
+same name, and zones with a rejected version), the last batch the loader
+delivered (id, kind \fBstartup\fR / \fBfull\fR / \fBdiff\fR / \fBzone\fR /
+\fBauto\fR; a \fBreload\fR is a \fBdiff\fR batch, a \fBreload <zone>\fR a
+\fBzone\fR batch, time, and its applied / rejected / shadowed / deleted counts),
+the state of auto reload (\fBauto reload: off\fR, or \fBon\fR with
+poll-interval, coalesce, the number of auto batches since the start and, per
+view, the last poll, the applied change log position, the pending changes and
+the last error; B9; under a view a line \fBwaiting for the signer: N zone(s): a,
+b, ...\fR when zones with the metadata \fBX\-KARIDNS\-SIGNER\fR = \fB1\fR
+changed and wait for \fBkaridns\-signer\fR to sign them and ask for a reload,
+see \fBsigner\-wait\fR in \fBkaridns(8)\fR), for a PostgreSQL view whose schema
+has the multi-server tables (B11) one line \fBreload requests (view <name>):
+server\-id <id>, last applied generation <n>, ok yes|no, status written
+<time>|never, last error: <text>|none\fR (the id this server reports under in
+\fBkaridns_server_status\fR, the highest \fBkaridns_reload_requests\fR
+generation it has applied, whether every zone of that reload loaded, when its
+status row was last written, and why a read of the requests or a write of the
+status row failed; the server keeps serving when it cannot write the row), the
+size of the zone versions and IXFR deltas (the same numbers as in \fBstatus\fR),
+the fetches of whole zones from the database (\fBfetch: rate=N/s
+refused_by_rate=N issued=N\fR; \fBissued\fR counts the zones the Backend asked
+the loader for: a query, a transfer, the warm-up), the NOTIFY of zones that are
+out of memory (D1a: \fBnotify of zones out of memory: queued=N deferred=N\fR,
+the zones whose serial changed while their data was out of memory that were
+handed to the control thread, and the ones that did not fit in the ring of 1024
+and are queued later), the zone transfers of zones that are out of memory (D1a,
+\fBtransfers of zones out of memory: waited=N loaded=N failed=N
+summary_answers=N marked=N timeout=Nms\fR: transfers that had to wait for the
+zone, the zones they got, the ones that ended with SERVFAIL, the IXFRs answered
+from the summary without reading the zone, the zones marked evict-next, and
+\fBtransfer\-fetch\-timeout\fR) and the cost of the zone directory (\fBzone
+directory: N elements, B bytes in the registry + I bytes in the indexes of the
+views (P bytes per zone)\fR; the entries and images are not in it). The warm-up
+and the cache (D1a step 7): \fBresidency: directory=N resident=N out_of_memory=N
+evictions=N\fR (the zones of the directory with and without data in memory),
+\fBqueries: answered=N parked=N hit_rate=P%\fR (the queries the zones answered,
+and the ones that had to wait for their zone; the hit rate is the share answered
+by a zone already in memory), \fBwarm: received=0|1 queued=N loaded=N skipped=N
+(memory limit N, already in memory or gone N) failed=N pending=N in_flight=N\fR
+(the zones of the loader's hot list: queued to read, read, not read because the
+memory limit's high water mark was reached or because they were in memory or
+gone, failed, still waiting, being read), \fBwarm\-before\-serve: off\fR,
+\fBholding the queries (N ms left)\fR or \fBqueries accepted after N ms\fR (the
+queries are held while the hot list is read; the control channel is not), and
+\fBstate\-file: <path> at_start=... hot_lists_sent=N ... acks: written=N
+unchanged=N failed=N ...\fR (what the loader found in its state file at its
+start, how many hot lists the Backend sent, and what the loader answered;
+\fBstate\-file: none\fR without \fBloader\-state\-file\fR). These lines come
+after the \fBzone directory:\fR line; the lines before keep their form. Then,
+the totals since the server started, and the last protocol error of the loader
+link. With a zone name (and optionally a view): that zone's view, database id,
+SOA serial, status (\fBapplied\fR, \fBrejected\fR or \fBshadowed\fR) and the
+last error, then, for a \fBSLAVE\fR or \fBCONSUMER\fR zone (B7b), its type,
+masters and TSIG key and the last successful transfer with the serial (the data
+of such a zone is kept in memory only; \fBsettings from the primary: in force\fR
+when the primary sent settings, B8t-2), then (B7a) the settings it runs with:
+where they come from (\fBprofile 'name'\fR with the zone's own metadata
+overriding it, \fBthe zone's own metadata\fR, or \fBnone\fR), its
+\fBallow\-transfer\fR and \fBallow\-update\fR entries with their match mode, the
+entries \fBacl\-ceiling\fR cuts away (\fBlies outside acl\-ceiling\fR, \fBis
+narrowed by acl\-ceiling\fR, or \fBno acl\-ceiling is configured: these ACLs
+refuse everybody\fR) and a \fBsettings error\fR line when a TSIG key the
+settings name is no longer defined in \fBkaridns.conf\fR. The summary also
+counts the distinct settings (zones with the same settings share one block) and
+the zones that name an undefined key. A zone that was rejected keeps serving its
+last good version (its serial is shown). Without a \fBdatabase\fR block the
+server answers \fBERROR no database block is configured\fR.
+.RS 8
+.PP
+.RS 2
+.nf
+karictl dbstatus
+karictl dbstatus example.test
+.fi
+.RE
+.RE
+.TP 8
+\fBtrace [level]\fR
+Change the debug level in force of the server (0.7; \fBrndc trace\fR): without
+an argument one more (at most 99), with one that level, a number from 0 to
+99. The reply is \fBOK debug level is now N\fR; a level that is not a number
+from 0 to 99 is answered \fBERROR trace: the debug level must be a number from 0
+to 99\fR, a second argument \fBERROR trace takes one argument at most: ...\fR
+(exit status 3, the level is not changed). The server logs each change as
+\fB[Control] debug level is now N\fR (category \fBgeneral\fR, notice). The
+channels with \fBseverity dynamic\fR write the messages up to the level, and the
+built-in \fBdefault_debug\fR (the file \fBkaridns.run\fR in \fBoptions {
+directory }\fR) writes everything up to it while it is above 0; see karidns(8),
+\fBlogging\fR. The level is not kept across a restart (\fBkaridns \-d\fR sets it
+at the start). Every process of the server follows (0.7): the sandboxed process,
+which has the control channel, hands the level to the supervisor (with the
+supervisors of the plugins and of \fBkaridns\-dbloader\fR), the UDP routers, the
+connect broker and the loader, and a loader that is started again later comes up
+with the level in force.
+.RS 8
+.PP
+.RS 2
+.nf
+karictl trace 3      # the debug 3 lines of query\-errors (why a query was REFUSED) appear in the dynamic channels
+karictl notrace
+.fi
+.RE
+.RE
+.TP 8
+\fBnotrace\fR
+Set the debug level to 0 (\fBrndc notrace\fR); the reply is \fBOK debug level is
+now 0\fR. An argument is refused (\fBERROR notrace takes no argument\fR).
+.RS 8
+.PP
+\fBtrace\fR and \fBnotrace\fR need the permission \fBtrace\fR of a restricted
+control key (\fBallow\-commands { trace; }\fR); a \fBread\-only yes\fR key alone
+does not have it.
+.RE
+.TP 8
+\fBtsig\-keygen [keyname]\fR
+Generate a 256-bit random TSIG secret with OpenSSL \fBRAND_bytes(3)\fR and print
+a \fBkey\fR block (\fBalgorithm hmac\-sha256\fR) ready for
+\fBkaridns.conf\fR. The default key name is \fBtransfer\-key\fR. This command
+does not contact the server and does not read the configuration file.
+.RS 8
+.PP
+.RS 2
+.nf
+karictl tsig\-keygen transfer\-key
+.fi
+.RE
+.RE
+.SH CONFIGURATION FILE (karictl.conf)
+By default, \fBkarictl\fR reads the shared secret from
+\fB/usr/local/etc/karidns/karictl.conf\fR. The package installs
+\fBkarictl.conf.sample\fR next to it.
+.SS Configuration Syntax
+.RS 2
+.nf
+socket "/var/run/karidns/control.sock";
+\&
+key "karictl" {
+    algorithm "hmac\-sha256";
+    secret "UkVQTEFDRS1NRTpvcGVuc3NsLXJhbmQtYmFzZTY0LTMy"; // placeholder: replace with `openssl rand \-base64 32`
+};
+.fi
+.RE
+.PP
+The \fBsecret\fR defined in \fBkarictl.conf\fR must match the secret configured
+in the \fBcontrol\-channel\fR block of \fBkaridns.conf\fR.
+.PP
+The file is not parsed as a full configuration file: \fBkarictl\fR takes the
+quoted value that follows the \fBfirst\fR occurrence of the word \fBsecret\fR,
+and the quoted value that follows the first occurrence of the word \fBsocket\fR,
+anywhere in the file \fBoutside comments (\fB#\fB, \fB//\fB, \fB/* */\fB) and
+quoted strings\fR (the sample's own comment mentions \fB{ secret "..."; }\fR,
+which an earlier version took for the secret). White space after the \fB=\fR
+padding of the secret is ignored. The value after the first \fBalgorithm\fR
+(quoted or not) selects the HMAC: \fBhmac\-md5\fR, \fBhmac\-sha1\fR,
+\fBhmac\-sha224\fR, \fBhmac\-sha256\fR (default), \fBhmac\-sha384\fR or
+\fBhmac\-sha512\fR; it must match the server's \fBcontrol\-channel { algorithm
+}\fR, and an unsupported name exits with status 2. The key name is not used. The
+secret may decode to at most 256 bytes. \fBkarictl\fR prints a warning when the
+file is readable by group or other users; it should have mode \fB0600\fR.
+.PP
+\fBRestricted keys.\fR The server can hold several keys, each allowed to run
+only some commands (\fBcontrol\-channel { keys { } }\fR in \fBkaridns.conf\fR,
+"Restricted control keys"). \fBkarictl\fR needs nothing for that: give each user
+a \fBkarictl.conf\fR with the \fBsecret\fR and the \fBalgorithm\fR of the key it
+should use. The server finds the key by the response to its challenge. A command
+the key may not run is answered with \fBERROR command not allowed for key
+"<name>"\fR and \fBkarictl\fR exits with status 3; the server logs it with the
+key name. To let a user other than the server's in, the server's
+\fBcontrol\-channel { allow\-group }\fR must name a group that user belongs to
+(the socket is then group-writable); the user needs the \fBkarictl.conf\fR of
+its key and no access to \fBkaridns.conf\fR.
+.SH EXIT STATUS
+.TP 8
+\fB0\fR
+Command executed successfully (including \fBtsig\-keygen\fR and \fB\-v\fR).
+.TP 8
+\fB1\fR
+Socket path too long, connection failure to the control socket, or failure to
+receive the challenge.
+.TP 8
+\fB2\fR
+Usage error (no command, an unknown option, \fBnotify\fR / \fBretransfer\fR /
+\fBzonestatus\fR / \fBrollback\fR without a zone name; the usage text goes to
+standard error and nothing is sent to the server), or the secret could not be
+read or decoded from the configuration file, the challenge was invalid, or
+authentication failed. A command the server does not know is not a usage error
+for \fBkarictl\fR: the server answers \fBERROR unknown command\fR and the exit
+status is 3. \fB\-h\fR and \fB\-\-help\fR print the usage text to standard
+output and exit with 0.
+.TP 8
+\fB3\fR
+The server returned an error (\fBERROR ...\fR, including a failed \fBreload\fR
+or \fBreconfig\fR, a \fBtrace\fR level that is not a number from 0 to 99, a
+command that the key is not allowed to run, a database zone that was rejected or
+could not be read, and a reload that timed out) or an invalid \fBstatus\fR or
+\fBobservatory\fR response (also \fBdbstatus\fR without a database block).
+.SH FILES
+.TP 8
+\fB/usr/local/etc/karidns/karictl.conf\fR
+Default control channel client configuration file.
+.TP 8
+\fB/var/run/karidns/control.sock\fR
+Default UNIX domain socket endpoint monitored by the \fBkaridns\fR daemon.
+.SH SEE ALSO
+.IP \(bu 2
+\fBkaridns(8)\fR \[u2014] KariDNS authoritative DNS server daemon
+.IP \(bu 2
+\fBkaricheck(8)\fR \[u2014] Configuration and zone file validation utility
+.IP \(bu 2
+\fBkaridns\-dbloader(8)\fR \[u2014] The database loader that \fBreload\fR and
+\fBdbstatus\fR talk to
+.IP \(bu 2
+\fBdag(1)\fR \[u2014] DNS anomaly generator and test client
+.IP \(bu 2
+\fBKariDNS RFC Guideline\fR \[u2014] Detailed RFC compliance and design boundary
+document
+.SH AUTHORS
+Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)

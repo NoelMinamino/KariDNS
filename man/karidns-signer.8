@@ -1,0 +1,987 @@
+.TH KARIDNS\-SIGNER 8 "2026-11-13" "KariDNS" "KariDNS Manual"
+.\" Generated from docs/karidns-signer.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
+.SH NAME
+karidns\-signer \- keeps the zones of a KariDNS database (PostgreSQL or SQLite3)
+signed: static DNSSEC, signed again before the signatures run out and whenever a
+zone changes
+.SH SYNOPSIS
+.RS 2
+.nf
+karidns\-signer [\-c <config>]
+karidns\-signer [\-c <config>] \-\-check
+karidns\-signer \-\-version | \-h | \-\-help
+.fi
+.RE
+.SH DESCRIPTION
+\fBkaridns\-signer\fR (0.6.0, item C) is a Node.js daemon that
+\fBorchestrates\fR the signing of the zones in a PowerDNS 5.1 database that
+\fBkaridns(8)\fR serves through \fBkaridns\-dbloader(8)\fR. It does no DNSSEC
+arithmetic and does not touch the zone data itself:
+.PP
+.TS
+lbw(35) lbw(36)
+lw(35) lw(36).
+\&Task	\&Done by
+_
+\&generate keys	\&BIND 9.20 \fBdnssec\-keygen\fR
+T{
+sign the zone (NSEC / NSEC3 chain, RRSIG, SOA serial)
+T}	T{
+BIND 9.20 \fBdnssec\-signzone\fR (its own verification step is \fBverify\fR)
+T}
+T{
+read the zone, write the DNSSEC records back
+T}	T{
+\fBkaridns\-zone\fR (\fBexport \-\-signer\fR, \fBimport \-\-signer\fR)
+T}
+\&check the signed zone	\&\fBkaricheck zone\fR
+\&ask the server to read the zone	T{
+a row in \fBkaridns_reload_requests\fR (PostgreSQL) or \fBkarictl reload\fR
+(SQLite3)
+T}
+.TE
+.PP
+What Node does itself: the schedule (\fBkaridns_signer_state\fR), the key
+requests (\fBkaridns_key_requests\fR), the keys (\fBcryptokeys\fR rows to
+\fBK*.private\fR / \fBK*.key\fR files and back, with \fBnode:crypto\fR for the
+public half of a key), and the child processes. The only npm package is \fBpg\fR
+(exact version, \fBpackage\-lock.json\fR, installed with \fBnpm ci
+\-\-ignore\-scripts\fR); SQLite3 uses the \fBnode:sqlite\fR of Node. Node 22.13
+or newer is needed (the package uses Node 24).
+.PP
+The signer serves the model of the rest of KariDNS: \fBstatic\fR DNSSEC. The
+signed zone is data in the database, the server serves it as it is. There is no
+online signing, \fBno automated key rollover\fR (the procedure is the
+operator's, below), and no CDS / CDNSKEY publication; those belong to a later
+release.
+.PP
+A zone is the signer's when it has the domain metadata \fBX\-KARIDNS\-SIGNER\fR
+= \fB1\fR. The signer sets it itself: \fBa key request of kind \fBenable\fB is
+how a zone is put under the signer\fR (below), or \fBkaridns\-zone import
+\-\-signer\fR of a zone you signed yourself.
+.SH OPTIONS
+.TP 8
+\fB\-c\fR, \fB\-\-config\fR \fIfile\fR
+The configuration file. Default
+\fB/usr/local/etc/karidns/karidns\-signer.conf\fR.
+.TP 8
+\fB\-\-check\fR
+Read the configuration, check the permissions of the work directory and of the
+\fBconninfo\-file\fR, that the SQLite3 file can be opened for writing, the
+versions of \fBdnssec\-keygen\fR, \fBdnssec\-signzone\fR, \fBkaridns\-zone\fR
+(and that it has the driver of \fBdatabase\fR), \fBkaricheck\fR and, with
+SQLite3, \fBkarictl\fR; then exit. Every line is \fBok: ...\fR or
+\fBproblem: ...\fR. Exit status 0 when fine, 1 when there is a problem. It does
+not connect to the database.
+.TP 8
+\fB\-v\fR, \fB\-\-version\fR
+Print the version.
+.TP 8
+\fB\-h\fR, \fB\-\-help\fR
+Print the usage.
+.PP
+\fBSignals.\fR \fBSIGTERM\fR and \fBSIGINT\fR stop the daemon after the zones
+that are being signed are finished (their key files are wiped), exit status 0; a
+second signal does not interrupt a zone. \fBSIGHUP\fR reads the configuration
+file again: a file with a mistake is refused and the old settings
+stay. \fBdatabase\fR, \fBconninfo\-file\fR, \fBsqlite\-file\fR, \fBschema\fR and
+\fBwork\-dir\fR need a restart (SIGHUP logs a warning and keeps the old value);
+so do \fBlog\fR and the paths of the tools (\fBkaridns\-zone\fR,
+\fBkaricheck\fR, \fBkarictl\fR, \fBbind\-tools\fR), which are read at start
+only. Everything else (\fBworkers\fR, the signature times, \fBverify\fR,
+\fBnsec3\-opt\-out\fR, the per-zone sections, \fBtimeout\fR, \fBdebounce\fR,
+\fBkarictl\-config\fR, \fBkarictl\-socket\fR) is used from the next zone on.
+.PP
+\fBExit status.\fR 0 after \fBSIGTERM\fR / \fBSIGINT\fR, or for \fB\-\-help\fR,
+\fB\-\-version\fR and a fine \fB\-\-check\fR; 1 for a configuration or database
+problem, a fatal error while running (the connection to the database is lost and
+cannot be made again) or a \fB\-\-check\fR problem; 2 for a usage error.
+.SH CONFIGURATION FILE
+Lines of \fBkey = value\fR; \fB#\fR starts a comment (in a value, after white
+space); a value may be in double quotes; \fB[zone <name>]\fR starts the section
+of one zone. A key written twice in one place, an unknown key and a bad value
+are errors that name the line. Durations are a number with an optional unit
+\fBs\fR, \fBm\fR, \fBh\fR, \fBd\fR or \fBw\fR (a bare number is
+seconds). \fBkaridns\-signer.conf.sample\fR shows all of it.
+.TP 8
+\fBdatabase\fR
+\fIDefault:\fR (required)
+.br
+\fIMeaning:\fR \fBpg\fR or \fBsqlite3\fR.
+.TP 8
+\fBconninfo\-file\fR
+\fIMeaning:\fR \fBpg\fR: the file with the connection string of the signer's
+role. A regular file (no link) owned by the user the signer runs as, mode
+\fB0600\fR or \fB0400\fR (checked like the loader checks its own). Keywords:
+\fBhost\fR, \fBport\fR, \fBdbname\fR, \fBuser\fR, \fBpassword\fR, \fBsslmode\fR,
+\fBconnect_timeout\fR, \fBapplication_name\fR; another keyword is refused. The
+Node driver has no opportunistic TLS: \fBsslmode=disable\fR, \fBallow\fR,
+\fBprefer\fR and no \fBsslmode\fR all mean plain text. For a host that is not
+local (a Unix socket directory, \fBlocalhost\fR, \fB127.0.0.0/8\fR and \fB::1\fR
+are local) without \fBrequire\fR, \fBverify\-ca\fR or \fBverify\-full\fR,
+\fB\-\-check\fR prints \fBwarning: the connection to the database at HOST is not
+encrypted (sslmode=X); use sslmode=verify\-full (require encrypts but does not
+check the server)\fR and the start logs it; it is a warning, not a
+refusal. \fBrequire\fR encrypts but does not check the server's certificate;
+\fBverify\-full\fR does. \fBsslrootcert\fR is not read: a certificate from your
+own CA needs that CA in the service's environment
+(\fBNODE_EXTRA_CA_CERTS=/path/to/ca.pem\fR).
+.TP 8
+\fBschema\fR
+\fIDefault:\fR the role's \fBsearch_path\fR
+.br
+\fIMeaning:\fR \fBpg\fR: the schema of the PowerDNS and \fBkaridns_*\fR tables.
+.TP 8
+\fBsqlite\-file\fR
+\fIMeaning:\fR \fBsqlite3\fR: the database file. The user needs write access to
+the file \fBand its directory\fR (\fB<file>.signer.lock\fR is created there, WAL
+files too). The file holds the private keys of the zones: when other users (not
+the owner, not the group) can read it, \fB\-\-check\fR and the start warn
+(\fBchmod o\-rwx\fR it).
+.TP 8
+\fBkarictl\-config\fR
+\fIMeaning:\fR \fBsqlite3\fR: the \fBkarictl\fR configuration of the restricted
+key that asks the server to reload a zone (below). Required for \fBsqlite3\fR.
+.TP 8
+\fBkarictl\-socket\fR
+\fIDefault:\fR from that file
+.br
+\fIMeaning:\fR \fBsqlite3\fR: the control socket (\fBkarictl \-s\fR).
+.TP 8
+\fBwork\-dir\fR
+\fIDefault:\fR \fB/var/db/karidns\-signer/work\fR
+.br
+\fIMeaning:\fR Where the key files and the work files of a zone live while it is
+signed: \fB<work\-dir>/<zone>.<pid>.<n>/\fR, mode \fB0700\fR, files
+\fB0600\fR. It must be a directory of the signer's user with no access for group
+or others (checked at start). Put it on tmpfs (the rc script does).
+.TP 8
+\fBworkers\fR
+\fIDefault:\fR half of the CPUs, at least 1
+.br
+\fIMeaning:\fR Zones signed at the same time (1 to 256).
+.TP 8
+\fBkaridns\-zone\fR
+\fIDefault:\fR \fB/usr/local/bin/karidns\-zone\fR
+.br
+\fIMeaning:\fR Must have the driver of \fBdatabase\fR (\fBkaridns\-zone
+\-\-version\fR lists them).
+.TP 8
+\fBkaricheck\fR
+\fIDefault:\fR \fB/usr/local/bin/karicheck\fR
+.TP 8
+\fBkarictl\fR
+\fIDefault:\fR \fB/usr/local/bin/karictl\fR
+.br
+\fIMeaning:\fR \fBsqlite3\fR only.
+.TP 8
+\fBbind\-tools\fR
+\fIDefault:\fR \fB/usr/local/bin\fR
+.br
+\fIMeaning:\fR The directory of \fBdnssec\-keygen\fR and \fBdnssec\-signzone\fR
+(BIND 9.20, the FreeBSD package \fBbind\-tools\fR).
+.TP 8
+\fBvalidity\fR
+\fIDefault:\fR \fB14d\fR
+.br
+\fIMeaning:\fR How long a signature is valid (\fBdnssec\-signzone \-e
+now+validity\fR). At least 60 s.
+.TP 8
+\fBrefresh\fR
+\fIDefault:\fR \fB302400\fR (3.5 days)
+.br
+\fIMeaning:\fR A signature is made again when this much of its life is left.
+.TP 8
+\fBjitter\fR
+\fIDefault:\fR \fB1d\fR
+.br
+\fIMeaning:\fR A random part of it, per run, is taken off the due time (and
+given to \fBdnssec\-signzone \-j\fR), so many zones do not all fall due at the
+same second.
+.TP 8
+\fBverify\fR
+\fIDefault:\fR \fByes\fR
+.br
+\fIMeaning:\fR \fBno\fR passes \fB\-P\fR to \fBdnssec\-signzone\fR: no
+verification of the signed zone.
+.TP 8
+\fBnsec3\-opt\-out\fR
+\fIDefault:\fR \fBno\fR
+.br
+\fIMeaning:\fR NSEC3 Opt-Out (RFC 5155 section 6) for the zone's chain;
+\fB\-A\fR. It applies from the next run.
+.TP 8
+\fBdebounce\fR
+\fIDefault:\fR \fB5\fR
+.br
+\fIMeaning:\fR Seconds after the last change of a zone before it is signed
+again; a burst of changes waits at most 6 times as long (30 s).
+.TP 8
+\fBtimeout\fR
+\fIDefault:\fR \fB1800\fR
+.br
+\fIMeaning:\fR Seconds a child process may run (at least 10); then it is killed
+and the zone fails.
+.TP 8
+\fBlog\fR
+\fIDefault:\fR \fBstderr\fR
+.br
+\fIMeaning:\fR \fBstderr\fR, or a syslog facility (\fBdaemon\fR,
+\fBlocal0\fR ... \fBlocal7\fR, ...): lines go to \fBlogger(1)\fR, tag
+\fBkaridns\-signer\fR, priority \fBnotice\fR.
+.PP
+\fBvalidity\fR, \fBrefresh\fR, \fBjitter\fR, \fBverify\fR and
+\fBnsec3\-opt\-out\fR can also be set per zone, in a \fB[zone <name>]\fR
+section; the zone name is plain LDH (letters, digits, hyphen, underscore; IDNs
+in their punycode form) and written once. The whole must satisfy \fBrefresh >
+0\fR and \fB\fBrefresh + jitter < validity\fB\fR for the global values and for
+every zone (otherwise every signature would fall due at once); \fB\-\-check\fR
+and \fBSIGHUP\fR say which one does not.
+.PP
+.RS 2
+.nf
+database = pg
+conninfo\-file = /usr/local/etc/karidns/signer.conninfo
+log = daemon
+workers = 2
+validity = 14d
+refresh = 3d
+jitter = 12h
+\&
+[zone example.test]
+validity = 30d
+refresh = 7d
+jitter = 2d
+\&
+[zone optout.example.test]
+nsec3\-opt\-out = yes
+.fi
+.RE
+.SH SETUP
+.IP 1. 4
+\fBThe database\fR must be at schema version 3 with the signer's tables: apply
+\fBdb/karidns_ext.pgsql.sql\fR or \fBdb/karidns_ext.sqlite3.sql\fR
+(\fBkaridns\-dbloader(8)\fR, "The signer's tables"). PostgreSQL: \fBpsql \-v
+ON_ERROR_STOP=1 \-v role=karidns_signer \-v schema=public \-f
+db/karidns_signer_role.pgsql.sql <db>\fR as the owner, then \fBGRANT
+karidns_signer TO <login role>\fR (or create the role with \fBLOGIN\fR). The
+script refuses a role that could bypass row level security.
+.IP 2. 4
+\fBThe signer's user.\fR The FreeBSD package \fBkaridns\-signer\fR (install one
+of \fBkaridns\-sqlite3\fR, \fBkaridns\-postgresql\fR or \fBkaridns\-db\fR first:
+it needs their \fBkaridns\-zone\fR) installs the program under
+\fB/usr/local/libexec/karidns\-signer\fR with its \fBnode_modules\fR, a wrapper
+\fB/usr/local/sbin/karidns\-signer\fR, the rc script \fBkaridns_signer\fR,
+\fBkaridns\-signer.conf.sample\fR and the user and group \fBkaridns\-signer\fR;
+it depends on \fBnode24\fR and \fBbind\-tools\fR (Distribution Guide, 2.6). The
+signer must \fBnot\fR run as root, as the server's user or as the database
+owner.
+.IP 3. 4
+\fBThe configuration file\fR and, for PostgreSQL, the conninfo file (\fBchown
+karidns\-signer\fR, \fBchmod 0600\fR). Check it as the signer's user: \fBservice
+karidns_signer configtest\fR, or \fBsu \-m karidns\-signer \-c 'karidns\-signer
+\-\-check \-c /usr/local/etc/karidns/karidns\-signer.conf'\fR. Before the first
+start the work directory does not exist yet: configtest says so
+(\fBwork\-dir ... does not exist yet: start makes it\fR) and \fB\-\-check\fR
+reports it; configtest makes nothing.
+.IP 4. 4
+\fBThe server.\fR \fBdatabase { signer\-wait yes; }\fR is the default; see "The
+server waits for the signer". With SQLite3 add the restricted control key of the
+signer to the server (below).
+.IP 5. 4
+\fBStart:\fR \fBsysrc karidns_signer_enable=YES; service karidns_signer
+start\fR. \fBThe work directory.\fR An existing \fBwork\-dir\fR is never
+changed: it must be a directory of the signer's user with mode \fB0700\fR (what
+\fB\-\-check\fR wants), else the start is refused. A missing one is made (the
+user's, \fB0700\fR) only in an existing parent, or in
+\fB/var/db/karidns\-signer\fR (the home of the package's user, the parent of the
+default), which is made too; any other missing parent, a relative path, a
+\fB.\fR or \fB..\fR component and a symbolic link in the path are refused (no
+chain of directories is made as root). The rc script mounts a tmpfs
+(\fBkaridns_signer_tmpfs_size\fR, default 256m, mode \fB0700\fR) on the
+\fBwork\-dir\fR of the configuration file, starts the daemon with
+\fBdaemon(8)\fR (restart after 10 s if it dies, for instance because the
+database was down at boot), sets \fBulimit \-c 0\fR, and unmounts the tmpfs on
+stop. Under the rc script standard error goes to /dev/null, so set \fBlog =
+daemon\fR (or another facility) in the configuration file. \fBservice
+karidns_signer reload\fR sends \fBSIGHUP\fR. \fBkaridns_signer_cpuset="2\-3"\fR
+starts it under \fBcpuset \-l\fR.
+.IP 6. 4
+\fBPut a zone under the signer\fR (next section).
+.SH KEY REQUESTS
+A row in \fBkaridns_key_requests\fR asks the signer for something. The WebAdmin
+files the rows (a global master or the zone's domain master); an operator can do
+it with SQL:
+.PP
+.RS 2
+.nf
+\-\- start signing example.test: a CSK, ECDSA P\-256, NSEC3 without salt and with 0 iterations (RFC 9276)
+INSERT INTO karidns_key_requests (domain_id, kind)
+  SELECT id, 'enable' FROM domains WHERE name = 'example.test';
+\-\- more of it: KSK + ZSK instead of a CSK, ECDSA P\-384, NSEC instead of NSEC3
+INSERT INTO karidns_key_requests (domain_id, kind, algorithm, key_type, nsec)
+  SELECT id, 'enable', 14, 'ksk', 'nsec' FROM domains WHERE name = 'example.test';
+\-\- the answer
+SELECT r.id, d.name, r.kind, r.state, r.message FROM karidns_key_requests r JOIN domains d ON d.id = r.domain_id ORDER BY r.id DESC LIMIT 10;
+.fi
+.RE
+.TP 8
+\fBkind\fR
+\fBenable\fR: start signing the zone. The signer generates the first key (a
+\fBcsk\fR) or keys (\fBkey_type\fR \fBksk\fR or \fBzsk\fR makes a KSK \fBand\fR
+a ZSK), signs the zone, stores the keys, and sets the metadata
+\fBX\-KARIDNS\-SIGNER\fR, \fBPRESIGNED\fR and (NSEC3)
+\fBNSEC3PARAM\fR. \fBadd\fR: one more key (\fBksk\fR or \fBzsk\fR; \fBcsk\fR
+makes a key with the SEP bit, like \fBksk\fR) for a zone the signer signs; the
+zone is signed again with it at once.
+.TP 8
+\fBalgorithm\fR
+8 (RSASHA256), 10 (RSASHA512), 13 (ECDSAP256SHA256, the default), 14
+(ECDSAP384SHA384), 15 (Ed25519), 16 (Ed448). Algorithms 5 and 7 (SHA-1) are
+refused (RFC 8624).
+.TP 8
+\fBbits\fR
+RSA only, 1024 to 8192.
+.TP 8
+\fBkey_type\fR
+\fBcsk\fR (default; one key with the SEP bit signs everything), \fBksk\fR (flags
+257) or \fBzsk\fR (flags 256).
+.TP 8
+\fBnsec\fR
+\fBenable\fR only: \fBnsec3\fR (default) or \fBnsec\fR. A zone that is signed
+already keeps its chain; the parameters are those of its \fBNSEC3PARAM\fR
+metadata.
+.TP 8
+\fBstate\fR, \fBmessage\fR, \fBdone_at\fR
+\fBpending\fR, then \fBdone\fR or \fBfailed\fR with the reason. One pending
+request per zone: a second is refused until the first is answered.
+.PP
+The requests are polled every 5 seconds, 50 at a time; when a batch is started
+in full, the next one is read at once, so a bulk of requests is not held to 10
+zones per second. An \fBenable\fR request for a zone that has keys and the
+metadata \fBPRESIGNED\fR already (for instance a zone PowerDNS signed, keys in
+\fBcryptokeys\fR) generates \fBno\fR key: the signer takes over with the keys
+that are there. A zone with keys but without \fBPRESIGNED\fR is refused, because
+the server does not serve such a zone (no online signing).
+.PP
+\fBWhere the keys go.\fR \fBdnssec\-keygen\fR runs in the work directory; the
+key is read from its \fB.private\fR file (Private-key-format v1.2, the form
+PowerDNS keeps in \fBcryptokeys.content\fR), the files are wiped, the tag
+computed by the signer is compared with the one \fBdnssec\-keygen\fR chose (RFC
+4034 appendix B). The key is stored in \fBcryptokeys\fR (\fBflags\fR 257 or 256,
+\fBactive\fR and \fBpublished\fR true) \fBafter\fR the signed zone is written,
+so a key can never be in the database without a zone that uses it. If that
+\fBINSERT\fR fails (database failover, say) the signer tries again for about 10
+minutes (15 times, from 1 s to 60 s) with the same key; if it cannot, the
+request is \fBfailed\fR with the message that the keys were lost and the DNSKEYs
+have to be replaced with a request of kind \fBadd\fR.
+.SH HOW A ZONE IS SIGNED
+For each zone, in a work directory of its own (wiped on every path, also after
+an error and at start):
+.IP 1. 4
+\fBLock.\fR PostgreSQL:
+\fBpg_try_advisory_lock(hashtextextended('karidns\-signer:<id>', 0))\fR, so
+several signer instances can share a database and a zone is signed by one of
+them (a zone that another instance holds is tried again after 30 s). SQLite3:
+one signer per database file (\fB<file>.signer.lock\fR).
+.IP 2. 4
+\fBKeys.\fR The \fBcryptokeys\fR rows with \fBactive\fR or \fBpublished\fR
+become the DNSKEY RRs of the zone; the \fBactive\fR ones are written as key
+files (\fB0600\fR) and sign. The zone needs an active key with the SEP bit
+(flags 257), because the DS record at the parent is made from one.
+.IP 3. 4
+\fBExport.\fR \fBkaridns\-zone export \-\-signer\fR: the zone as the input of
+\fBdnssec\-signzone\fR, without the NSEC / NSEC3 records (the database has none,
+and a zone that was changed since it was signed has no complete chain) but with
+all its signatures, those over the chain too (0.6.1), so that the ones that
+still verify are kept. The DNSKEY lines are replaced by the ones of the keys.
+.IP 4. 4
+\fBSign.\fR \fBdnssec\-signzone \-q \-o <zone> \-O full \-e now+<validity> \-i
+<refresh+jitter> \-j <jitter> \-N increment \-R \-u [\-3 \- \-H 0 [\-A]] [\-P]
+(\-z | \-x)\fR with the key files of the \fBactive\fR keys. A CSK or a lone key
+signs everything (\fB\-z\fR); with a KSK and a ZSK only the KSK signs the DNSKEY
+RRset (\fB\-x\fR). The SOA serial is increased by one (\fB\-N
+increment\fR). Signatures that have more than \fBrefresh + jitter\fR left are
+kept (\fB\-i\fR), so a change does not re-sign the whole zone. \fB\-R\fR drops
+the signatures of keys that are no longer in the zone. \fB\-u\fR (0.6.1) builds
+the chain again from the parameters above (a new salt, opt-out or NSEC <-> NSEC3
+takes effect; without \fB\-u\fR \fBdnssec\-signzone\fR refuses a chain with
+another salt) and keeps every signature over it that still
+verifies. \fBdnssec\-signzone\fR verifies the result unless \fB\-P\fR (\fBverify
+no\fR).
+.IP 5. 4
+\fBCheck.\fR \fBkaricheck zone <zone> <signed file>\fR.
+.IP 6. 4
+\fBWrite.\fR \fBkaridns\-zone import \-\-signer \-\-json [\-\-reload]\fR in one
+transaction: the DNSSEC rows are brought to the file's (0.6.1: only the rows
+that differ are deleted and inserted; rows that are the same stay, with their
+ids, and are not in the change log), the SOA serial updated, \fBordername\fR /
+\fBauth\fR updated, the metadata set. If the zone changed since the export,
+nothing is written (exit status 3) and the signer starts again at once (up to 3
+times in a row, then it counts as an error). The result carries the new serial,
+the \fBearliest RRSIG expiration\fR and the id of the write.
+.IP 7. 4
+\fBReload.\fR PostgreSQL: the row in \fBkaridns_reload_requests\fR is written by
+\fBimport \-\-signer \-\-reload\fR in the same transaction as the
+signatures. SQLite3: \fBkarictl reload <zone>\fR with the signer's restricted
+key. A failed reload is a warning (the zone is signed; the server serves the old
+version until it reloads).
+.IP 8. 4
+\fBState.\fR \fBkaridns_signer_state\fR: \fBsigned_at\fR, \fBsigned_serial\fR,
+\fBmin_expire\fR, \fBnext_due\fR, \fBattempts\fR = 0, \fBlast_error\fR
+NULL. Keys of an \fBenable\fR request are stored now (see above) and the request
+is answered.
+.PP
+\fBDeviations from a plain \fBdnssec\-signzone\fB run, and why.\fR \fB\-i\fR is
+\fBrefresh + jitter\fR (the run is placed up to \fBjitter\fR before the refresh
+point). No timing metadata is written to the key files (\fB\-S\fR is not used)
+and \fB\-Q\fR is not used (without timing metadata it would sign everything
+again on every run). The DNSKEY RRs of all active and published keys are
+appended to the input, because \fBdnssec\-signzone\fR 9.20 takes the keys from
+the zone's DNSKEY RRset. Since 0.6.1 the NSEC / NSEC3 chain is built again in
+every run, but the signatures over it that still verify are kept (the export
+carries them, \fBdnssec\-signzone \-u\fR), and \fBimport \-\-signer\fR writes
+only the DNSSEC rows that differ. Measured for one changed A record in a zone of
+100,000 records (SQLite3, three runs each, median): the log of changed rows has
+7 rows instead of 400,023, \fBdnssec\-verify\fR accepts the result, and the run
+takes about 29 s instead of 31 s (CPU 37 s against 37 s; the importer needs 6 s
+instead of 12 s, the export 1.3 s and \fBdnssec\-signzone\fR 3.5 s of CPU more,
+and the export 290 MB more memory). So the gain is mostly in what is written and
+what an IXFR and the audit log carry, not in time. A retired key (published, not
+active) keeps the signatures it made over RRsets that did not change until they
+expire; on a changed RRset its old signature (invalid, harmless) stays next to
+the new one.
+.PP
+\fBOn error\fR nothing is written: the zone keeps its last good signed
+data. \fBattempts\fR is increased, \fBlast_error\fR is set (cut to 1 KB, no key
+material), and \fBnext_due\fR is now plus 1 minute, doubling to 1 hour. An
+operator who has fixed the cause resets it with \fBUPDATE karidns_signer_state
+SET next_due = <now>\fR (PostgreSQL: \fBnow()\fR, SQLite3:
+\fBstrftime('%s','now')\fR); the signer sees it within a few seconds. A zone
+whose \fBX\-KARIDNS\-SIGNER\fR metadata was removed is skipped and its state row
+dropped.
+.SH SCHEDULING
+.IP \(bu 2
+\fBBefore expiry.\fR \fBnext_due\fR = the earliest RRSIG expiration of the zone
+\[u2212] \fBrefresh\fR \[u2212] a random part of \fBjitter\fR. (Not \fBsigned_at
++ validity \[u2212] refresh\fR: \fB\-i\fR keeps older signatures that still have
+time, so some of them expire earlier than the new ones.) The due zones are read
+in \fBnext_due\fR order with a limit (an index), so a million zones cost no full
+scan. A signer zone without a state row is due at once.
+.IP \(bu 2
+\fBOn change.\fR PostgreSQL: \fBLISTEN karidns_changes\fR (and a look at the
+change log every 30 s as a safety net); SQLite3: a poll of \fBkaridns_changes\fR
+every 2 s. A change to a signer zone makes it due \fBdebounce\fR seconds after
+the last change. The signer's own writes (the id the importer reports: the
+transaction id on PostgreSQL, the range of \fBseq\fR on SQLite3) are not
+changes; a record merged in without a serial bump is. A change that the signer
+had read when a run of the zone started (the signer reads the change log before
+it starts a run; a key request right after the zone was made) is covered by that
+run when it signs the zone: it is not signed a second time for it; a run that
+does not sign the zone (busy, locked, skipped, failed) leaves the change to make
+the zone due.
+.IP \(bu 2
+\fBAt start and every hour\fR a catch-up scan makes due the zones that have no
+state row, that changed after their last signature, or whose SOA serial is not
+the one the signer wrote. A change log that was pruned beyond the signer's
+position triggers the same scan.
+.IP \(bu 2
+\fBWorkers.\fR \fBworkers\fR zones are signed at a time. A database that is busy
+(exit status 4 of \fBkaridns\-zone\fR, or a PostgreSQL write that was rolled
+back for a concurrent update: \fBcould not serialize access\fR, \fBdeadlock
+detected\fR) is tried again after 5 s, doubling to 1 minute; nothing was
+written.
+.SH THE SERVER WAITS FOR THE SIGNER
+A change to a signed zone (by the WebAdmin, a script, \fBkaridns\-zone
+import\fR) puts records into the database that have no valid signature yet. A
+validating resolver must never see a changed RRset with a stale signature, so
+with \fBdatabase { signer\-wait yes; }\fR (the default; \fBkaridns(8)\fR, "The
+signer's zones") the loader \fBdoes not reload a zone with
+\fBX\-KARIDNS\-SIGNER\fB = 1 because of the change log\fR. It reloads on a
+reload request: the signer's after it has written the signatures. Until then the
+server serves the last signed version. Consequences:
+.IP \(bu 2
+\fBLatency.\fR A change is served \fBdebounce\fR + the signing time + the reload
+later. The signing time of a small zone is a fraction of a second; see the
+measurements.
+.IP \(bu 2
+\fBA stopped or failing signer\fR keeps changes from being served. \fBkarictl
+dbstatus\fR shows \fBwaiting for the signer: N zone(s): ...\fR; a count that
+does not go down means the signer is not working. \fBsigner\-wait no;\fR serves
+changes at once, unsigned.
+.IP \(bu 2
+\fBNot held back:\fR a zone the server does not have yet, a full comparison
+(start, restart, \fBkarictl reload\fR of every zone, a replaced database file)
+and a refused zone. In those moments an unsigned change can be served; the
+signer catches up within seconds.
+.IP \(bu 2
+\fBPowerDNS\fR on the same database reads it live and serves a change at once,
+signed or not. Keep it apart from the zones the signer signs.
+.SH DATABASE ROLES, AND RELOADS WITH SQLITE3
+\fBPostgreSQL.\fR The signer connects as the role of
+\fBdb/karidns_signer_role.pgsql.sql\fR (row level security on). It reads the
+tables and \fBcryptokeys.content\fR and the change log; inserts and deletes the
+DNSSEC record types; updates \fBordername\fR, \fBauth\fR and the SOA serial (a
+trigger holds it to that); writes the three metadata kinds; \fBinserts\fR keys
+(no update, no delete); answers key requests (\fBstate\fR, \fBmessage\fR,
+\fBdone_at\fR); owns \fBkaridns_signer_state\fR; inserts reload requests. It
+cannot write an A record, change a key or touch the users and grants. The
+WebAdmin's role files key requests and reads the state table; it cannot read
+\fBcryptokeys.content\fR. Details: \fBkaridns\-dbloader(8)\fR, "Roles and row
+level security". PostgreSQL 13 or newer.
+.PP
+\fBSQLite3.\fR There are no roles: the file is opened by the signer's user (and
+by the server's loader and the API), so keep the file and its directory in a
+group both can write, or run the loader's user and the signer under one account
+of your choosing. SQLite3 has no reload requests, so the signer asks the server
+over the control channel with \fBkarictl\fR, with a key that can do \fBnothing
+but \fBreload\-zone\fB\fR:
+.PP
+.RS 2
+.nf
+# karidns.conf
+key "signer" { algorithm hmac\-sha256; secret "c2lnbmVyLXNlY3JldC0wMTIzNDU2Nzg5YWJjZGVmMDEyMw=="; };   # a secret of your own
+options {
+    control\-channel {
+        socket "/var/run/karidns/karidns.sock";
+        keys { "signer" read\-only yes allow\-commands { reload\-zone; }; };
+    };
+};
+.fi
+.RE
+.PP
+.RS 2
+.nf
+# /usr/local/etc/karidns/signer\-karictl.conf (owner karidns\-signer, mode 0600); karictl\-config points here
+socket "/var/run/karidns/karidns.sock";
+key "signer" { algorithm hmac\-sha256; secret "c2lnbmVyLXNlY3JldC0wMTIzNDU2Nzg5YWJjZGVmMDEyMw=="; };
+.fi
+.RE
+.PP
+The key may reload one named zone (\fBkarictl reload <zone>\fR), never all, and
+can read nothing else of the server (\fBkaridns(8)\fR, "Restricted control
+keys"). The control socket must be reachable by the signer's user.
+.SH SECURITY
+.IP \(bu 2
+\fBNo shell.\fR Every child process is \fBspawn(file, argv)\fR with absolute
+paths, a fixed environment (\fBPATH\fR, \fBLANG=C\fR, \fBLC_ALL=C\fR,
+\fBTZ=UTC\fR, \fBHOME\fR, and \fBLLVM_PROFILE_FILE\fR when it is set, which only
+a coverage build reads), a timeout and a cap of 1 MB on each output stream.
+.IP \(bu 2
+\fBZone names\fR are checked (canonical, plain LDH, no leading hyphen) before
+they reach a file name or an argv word.
+.IP \(bu 2
+\fBKey material\fR exists only in the database, in the \fB0700\fR work directory
+(on tmpfs) for the time a zone is signed, and in the memory of
+\fBdnssec\-signzone\fR. The files are overwritten and unlinked after each zone
+and on every error path; leftovers of a crash (\fBkill \-9\fR) are wiped at the
+next start. The rc script and the wrapper set \fBulimit \-c 0\fR. Keys and key
+text are never logged; messages of the tools are cut to 1 KB.
+.IP \(bu 2
+\fBPrivilege.\fR Its own user, no root. The database role cannot write user data
+(above). The conninfo file is checked like the loader's.
+.IP \(bu 2
+\fBThe one npm dependency\fR is \fBpg\fR with an exact version and an integrity
+hash in \fBpackage\-lock.json\fR; install scripts are off
+(\fB\-\-ignore\-scripts\fR), CI runs \fBnpm audit \-\-audit\-level=high\fR.
+.IP \(bu 2
+\fBThe tools.\fR BIND's \fBdnssec\-signzone\fR parses the exported zone, which
+is data from your own database; it runs in the work directory as the signer's
+user.
+.SH MONITORING
+Look at \fBkaridns_signer_monitor\fR (0.6.1; apply the new
+\fBdb/karidns_ext.*.sql\fR again to get the view). It has one row per zone the
+signer keeps (\fBX\-KARIDNS\-SIGNER = 1\fR) with its \fBkaridns_signer_state\fR
+columns and a \fBstatus\fR, the first that applies of \fBexpired\fR (the
+earliest RRSIG expiration, \fBmin_expire\fR, has passed: validating resolvers
+refuse the zone now), \fBfailing\fR (\fBlast_error\fR is set), \fBoverdue\fR
+(\fBnext_due\fR is more than an hour in the past: the signer is stuck or not
+running), \fBexpiring\fR (the signatures end within two days; the signer
+re-signs long before that, so this and not \fBoverdue\fR means it fails to
+sign), \fBunsigned\fR (no state row yet: never signed, or the signer is not
+running) and \fBok\fR. \fBseconds_to_expiry\fR is \fBmin_expire \- now\fR
+(negative when expired). \fBA zone whose signatures run out is the failure to
+alert on\fR: the server serves signatures that validating resolvers reject once
+they expire (SERVFAIL for the whole zone). Alert on every \fBstatus\fR but
+\fBok\fR.
+.PP
+.RS 2
+.nf
+SELECT zone, status, seconds_to_expiry, attempts, last_error, signed_at, min_expire, next_due FROM karidns_signer_monitor WHERE status <> 'ok' ORDER BY seconds_to_expiry;
+.fi
+.RE
+.PP
+PostgreSQL: the view belongs to the owner; give a monitoring role \fBGRANT
+SELECT ON karidns_signer_monitor TO monitor;\fR and nothing else (the view does
+not apply the reader's row level security, so that role sees every signer zone,
+and it cannot read \fBcryptokeys\fR). SQLite3: the times are unix seconds, as in
+the table. The thresholds (one hour, two days) are fixed in the view; for
+others, query \fBkaridns_signer_state\fR directly:
+.PP
+.RS 2
+.nf
+\-\- PostgreSQL: zones with an error, zones overdue, zones whose signatures end within two days
+SELECT d.name, s.attempts, s.last_error, s.signed_at, s.min_expire, s.next_due
+  FROM karidns_signer_state s JOIN domains d ON d.id = s.domain_id
+ WHERE s.last_error IS NOT NULL OR s.next_due < now() \- interval '1 hour' OR s.min_expire < now() + interval '2 days';
+\-\- SQLite3: the same with unix seconds
+SELECT d.name, s.attempts, s.last_error, s.signed_at, s.min_expire, s.next_due
+  FROM karidns_signer_state s JOIN domains d ON d.id = s.domain_id
+ WHERE s.last_error IS NOT NULL OR s.next_due < strftime('%s','now') \- 3600 OR s.min_expire < strftime('%s','now') + 172800;
+\-\- signer zones that have no state row (not signed yet, or the signer is not running)
+SELECT d.name FROM domains d JOIN domainmetadata m ON m.domain_id = d.id AND m.kind = 'X\-KARIDNS\-SIGNER' AND m.content = '1'
+ WHERE NOT EXISTS (SELECT 1 FROM karidns_signer_state s WHERE s.domain_id = d.id);
+.fi
+.RE
+.PP
+Also watch: \fBkarictl dbstatus\fR (zones waiting for the signer), the requests
+with \fBstate = 'failed'\fR or \fBpending\fR for a long time, the daemon's log
+(\fBsigned <zone>: serial N, M ms\fR; errors as \fB<zone>: ...\fR), and an
+external check of the served zone (\fBdag @server example.test SOA +dnssec\fR
+and \fBdnssec\-verify\fR on an export). The signing time of the last run is in
+\fBlast_duration_ms\fR.
+.SH KEY ROLLOVER
+The signer does not roll keys by itself; it follows the columns \fBactive\fR and
+\fBpublished\fR of \fBcryptokeys\fR: the DNSKEY RRset is made of the rows with
+either set, and the \fBactive\fR keys sign. The operator does the rollover with
+the timing of RFC 7583 (section 3 defines the intervals; section 4 the
+methods). Take the TTLs from your zone and the parent: \fBthe DNSKEY TTL, the
+largest TTL of the signed RRsets, the DS TTL at the parent, the propagation
+delay between your servers, and the signature \fBvalidity\fB\fR. Use a database
+owner session; the signer's role cannot update or delete keys.
+.PP
+\fBZSK, pre-publish (RFC 7583 section 4).\fR The new key is published before it
+signs.
+.IP 1. 4
+Make a key with \fBdnssec\-keygen \-a 13 \-K <dir> example.test\fR (a ZSK; flags
+256). Insert it \fBpublished, not active\fR: \fBINSERT INTO cryptokeys
+(domain_id, flags, active, published, content) VALUES (<id>, 256, false,
+true, '<the text of the .private file>');\fR. The insert is in the change log,
+the signer signs the zone again (the DNSKEY RRset now has the new key and is
+signed). \fIA request of kind \f(BIadd\fI makes a key that is active at once;
+that is a double-signature rollover, also valid, but not this one.\fR
+.IP 2. 4
+Wait at least the DNSKEY TTL plus the propagation delay.
+.IP 3. 4
+Switch: \fBUPDATE cryptokeys SET active = true WHERE id = <new>; UPDATE
+cryptokeys SET active = false WHERE id = <old>;\fR. The zone is signed again:
+the new key signs every RRset at once, and the signatures of the old key stay
+next to them until they expire (every RRset carries both for now; an RRset that
+changes later is signed by the new key only). The old key stays published.
+.IP 4. 4
+Wait the largest TTL of the zone plus the propagation delay, so that every cache
+has seen the new signatures.
+.IP 5. 4
+Retire: \fBDELETE FROM cryptokeys WHERE id = <old>;\fR. The signer drops the old
+DNSKEY RR and the signatures of the old key (\fB\-R\fR) and nothing else
+changes.
+.PP
+Every step makes the signer sign the zone again (a few hundred milliseconds for
+a small zone); \fBdnssec\-verify\fR accepts the zone after each of them (checked
+on pc200 with a KSK, two ZSKs and a small zone).
+.PP
+\fBKSK, double-DS (RFC 7583 section 4).\fR With a CSK the same applies (a CSK is
+a KSK).
+.IP 1. 4
+File a request \fBadd\fR with \fBkey_type\fR \fBksk\fR (or insert a key with
+flags 257). The new KSK is active and published; both KSKs sign the DNSKEY
+RRset. (When the old key is a CSK, both keys sign the whole zone until the old
+one is retired, a double signature.)
+.IP 2. 4
+Compute the DS of the new key (\fBdag @server example.test DNSKEY +short\fR,
+then \fBdnssec\-dsfromkey \-f <file> example.test\fR, or from the \fB.key\fR
+text) and add it at the parent. Wait until the parent serves it and its TTL has
+passed.
+.IP 3. 4
+Remove the old DS at the parent. Wait the DS TTL and the propagation delay.
+.IP 4. 4
+Stop signing with the old key: \fBUPDATE cryptokeys SET active = false WHERE id
+= <old>\fR; wait the DNSKEY TTL; \fBDELETE FROM cryptokeys WHERE id = <old>\fR.
+.PP
+Algorithm rollovers (RFC 6781) follow the same steps with the two algorithms'
+keys both present; plan them by hand. Never delete a key whose DS is still at
+the parent.
+.SH LIMITS
+.IP \(bu 2
+\fBThe first signing of a zone is also the longest\fR; the NSEC / NSEC3 chain is
+rebuilt on every run (above), so a re-sign of a big zone costs nearly as much
+CPU as the first signing (the measurements show the factor), while the
+signatures that are still good are kept.
+.IP \(bu 2
+\fBCatch-up limit.\fR A change by someone else without a serial bump within
+about 1 to 2 seconds of the last signature is found only at the next change of
+the zone or at expiry, not by the change log (it cannot be told from the
+signer's own rows by time). The hourly scan compares the SOA serial and finds
+the usual cases. On PostgreSQL a long-running transaction elsewhere (an old
+\fBxmin\fR) can leave a signed zone listed as waiting until its next reload.
+.IP \(bu 2
+\fBRetired keys\fR keep their old signatures until they expire (above).
+.IP \(bu 2
+\fBSQLite3: a row per changed row.\fR Its triggers write one change-log row per
+changed row (PostgreSQL: a few per write), and the signer reads 20,000 rows at a
+time (a full batch is followed by the next read at once, 0.6.1; before that, one
+batch per 2-s poll). The rows of its own write for a zone of 100,000 records are
+skipped over in a few seconds; a change made by someone else in that time is
+seen after it. Memory: a run of \fBkaridns\-zone import \-\-signer\fR for
+100,000 records peaks at 640 to 750 MB (see the measurements); with big zones
+keep \fBworkers\fR low.
+.IP \(bu 2
+\fBAlgorithms\fR 8, 10, 13, 14, 15, 16. Algorithm 5 and 7 are refused. A zone
+name must be plain LDH.
+.IP \(bu 2
+\fBZone types.\fR Only primary zones (\fBNATIVE\fR, \fBMASTER\fR) with one SOA
+at the apex.
+.IP \(bu 2
+\fBOne signer per SQLite3 file\fR; several on PostgreSQL (advisory locks).
+.IP \(bu 2
+\fBNot in this release:\fR automated rollover, CDS / CDNSKEY, online signing,
+DNSSEC validation, signing with an HSM.
+.IP \(bu 2
+\fBNSEC or NSEC3\fR is chosen by the request that starts the signing; a signed
+zone keeps the setting in its \fBNSEC3PARAM\fR metadata (\fBnsec3\-opt\-out\fR
+is read at every run). There is no request to change it.
+.SH RUNNING IT ELSEWHERE
+The signer never competes with the server for CPU if you do not let it. Signing
+is CPU heavy for a short time (a big zone, many zones due together),
+\fBdnssec\-signzone\fR is single threaded, and \fBworkers\fR multiplies it.
+.IP \(bu 2
+\fBSame host:\fR give the signer CPUs of its own and keep \fBworkers\fR no
+larger than their number, for example \fBkaridns_signer_cpuset="3"\fR in
+\fBrc.conf\fR (\fBcpuset \-l 3\fR) or \fBcpuset \-l 3 \-p
+<pid>\fR. \fBkaridns\fR does not pin its threads (since 0.6.1), so it uses
+whatever CPUs are free; on a host with few CPUs, leave most of them to the
+server (on 4 CPUs at most one or two for the signer). \fBrtprio\fR / \fBnice\fR
+do not matter for a CPU set of its own.
+.IP \(bu 2
+\fBOther host:\fR the signer needs only the database (and, with SQLite3, the
+file and the server's control socket, which is why PostgreSQL is the choice for
+this), \fBkaridns\-zone\fR, \fBkaricheck\fR, \fBbind\-tools\fR and Node. Install
+the same package on a host that runs no server, enable only
+\fBkaridns_signer\fR, and use a conninfo file that names the database host
+(\fBsslmode=verify\-full\fR). The signed data reaches the servers through the
+database; their loaders reload on the reload requests.
+.IP \(bu 2
+\fBSeveral instances\fR on one PostgreSQL database share the zones (advisory
+locks). They need the same configuration.
+.SH MEASUREMENTS
+Measured on the build host of the project on 2026-11-06, with the defaults of
+this manual (ECDSA P-256 CSK, NSEC3 without salt and with 0 iterations,
+\fBvalidity\fR 14d, \fBrefresh\fR 3.5 days, \fBjitter\fR 1 day, \fBverify
+yes\fR), \fBlog = stderr\fR, the work directory on the ordinary disk (the jail
+has no tmpfs), and no server: the SQLite3 reload (\fBkarictl reload\fR) fails
+fast on every zone (no socket), so each run includes one failed
+\fBkarictl\fR. The numbers are the host's, not a guarantee.
+.PP
+.TS
+lb lbw(63)
+l lw(63).
+\&	\&
+_
+\&Host	T{
+FreeBSD 15.1-RELEASE-p4 amd64, a jail on a shared host, 4 vCPUs (QEMU Virtual
+CPU version 2.5+), 10 GiB RAM
+T}
+\&Software	T{
+Node.js 24.19.0, BIND 9.20.29 (\fBbind\-tools\fR), SQLite 3.53.3, PostgreSQL
+18.6 (a private local cluster, TCP over 127.0.0.1, \fBfsync\fR off,
+\fBshared_buffers\fR 128 MB), \fBpg\fR 8.23.1
+T}
+\&Signer	T{
+\fBworkers\fR = 2 (the default for 4 CPUs) unless said otherwise; one signer
+process
+T}
+.TE
+.PP
+\fBOne zone of 100,000 records\fR (SOA, 2 NS, 99,997 A; SQLite3, 93 MB database
+file after signing; \fBworkers\fR 2, one zone):
+.PP
+.TS
+lbw(22) lbw(23) lbw(23)
+lw(22) lw(23) lw(23).
+\&	T{
+First signing (key request)
+T}	T{
+Signing again after one new A record
+T}
+_
+T{
+The run of the signer (log: \fBsigned <zone>: ... ms\fR)
+T}	T{
+27.2 s (27.1 to 27.3 in three runs)
+T}	\&31.7 s (31.7 to 31.8)
+T{
+\fBkaridns\-zone export \-\-signer\fR
+T}	\&0.7 s, 131 MB peak RSS	\&2.2 s, 340 MB
+\&\fBdnssec\-signzone\fR	T{
+14.9 s (18.4 s CPU), 168 MB
+T}	T{
+16.3 s (22.7 s CPU), 162 MB
+T}
+T{
+\fBkaridns\-zone import \-\-signer\fR
+T}	T{
+9.7 s, 638 MB (994 MB before the memory work below)
+T}	T{
+11.4 s, 747 MB (1,085 MB before)
+T}
+T{
+Peak RSS of the signer (Node)
+T}	T{
+160 to 200 MB over the runs (it holds no zone data)
+T}	\&
+T{
+From the request, or the change, to the new serial in the database
+T}	\&28 s	T{
+39 s (2 s poll of the change log + 5 s \fBdebounce\fR + the run)
+T}
+.TE
+.PP
+The signing again is not faster than the first signing: the NSEC3 chain and its
+signatures are made new in every run (see "How a zone is signed"), and the
+importer writes the chain again. The exported signed zone is 46 MB;
+\fBdnssec\-verify \-z\fR takes 13 s on it. \fBkaridns\-zone import \-\-signer\fR
+is the largest of the three: it holds the parsed signed file (400,000 records
+for this zone, about 320 MB), the rows made from it and the zone read back from
+the database to check it. It frees the file's text and arena as soon as they are
+compared and the rows before it reads the written zone back, so the peak is that
+read-back (PostgreSQL: 997 MB before, 628 MB now, 10.5 s). Two such zones at
+once would use about 1.3 GB together for these programs: keep \fBworkers\fR low
+for big zones.
+.PP
+\fBMany small zones\fR (6 records each: SOA, 2 NS, 3 A; SQLite3 unless said; the
+run is the whole pipeline of a zone: \fBdnssec\-keygen\fR (first signing only),
+export, \fBdnssec\-signzone\fR, \fBkaricheck\fR, import, reload attempt):
+.PP
+.TS
+lbw(10) lbw(10) lb lbw(11) lbw(11) lbw(11)
+lw(10) lw(10) l lw(11) lw(11) lw(11).
+\&	\&\fBworkers\fR	\&zones	T{
+First signing (key requests)
+T}	T{
+Signing again (every zone due at once)
+T}	T{
+Peak RSS of Node
+T}
+_
+\&SQLite3	\&1	\&2,000	T{
+286 s = 7.0 zones/s (136 ms per run)
+T}	T{
+265 s = 7.5 zones/s (127 ms)
+T}	\&281 MB
+\&SQLite3	T{
+2 (default)
+T}	\&2,000	T{
+160 s = 12.5 zones/s (150 ms)
+T}	T{
+145 s = 13.8 zones/s (137 ms)
+T}	\&284 MB
+\&SQLite3	T{
+2 (default)
+T}	\&10,000	T{
+840 s = 11.9 zones/s (162 ms)
+T}	T{
+696 s = 14.4 zones/s (134 ms)
+T}	\&276 MB
+T{
+PostgreSQL (signer role, RLS on)
+T}	T{
+2 (default)
+T}	\&2,000	T{
+166 s = 12.0 zones/s (154 ms)
+T}	T{
+155 s = 12.9 zones/s (147 ms)
+T}	\&199 MB
+.TE
+.PP
+Two workers give 1.8 times the throughput of one on 4 CPUs. At 14 zones a second
+(1.2 million a day) and a zone signed again about every 10 days (\fBvalidity\fR
+14d, \fBrefresh\fR 3.5d, \fBjitter\fR 1d), the re-signing of about 12 million
+small zones would use the two workers fully, with the CPUs to themselves
+(arithmetic from the table, not measured; the changes of the zones and the load
+of the database come on top). The CI runs PostgreSQL 17; the numbers above are
+PostgreSQL 18.
+.SH FILES
+.TP 8
+\fB/usr/local/etc/karidns/karidns\-signer.conf\fR
+The configuration file (\fBkaridns\-signer.conf.sample\fR).
+.TP 8
+\fB/usr/local/sbin/karidns\-signer\fR
+The wrapper (\fBulimit \-c 0\fR, then \fB/usr/local/bin/node
+/usr/local/libexec/karidns\-signer/signer/bin/karidns\-signer.js\fR).
+.TP 8
+\fB/usr/local/libexec/karidns\-signer/\fR
+The program (\fBsigner/bin/\fR, \fBsigner/lib/\fR), the Node code it shares with
+\fBkaridns\-webadmin\fR (\fBnode/lib/\fR, imported as \fB../../node/lib\fR) and
+its \fBnode_modules\fR (\fBpg\fR). \fBroot:wheel\fR, not writable.
+.TP 8
+\fB/usr/local/etc/rc.d/karidns_signer\fR
+The rc script (\fBkaridns_signer_enable\fR, \fB_config\fR, \fB_user\fR,
+\fB_tmpfs\fR, \fB_tmpfs_size\fR, \fB_cpuset\fR, \fB_flags\fR; commands
+\fBstart\fR, \fBstop\fR, \fBrestart\fR, \fBstatus\fR, \fBreload\fR,
+\fBconfigtest\fR).
+.TP 8
+\fB/var/db/karidns\-signer/work\fR
+The default work directory (tmpfs, \fB0700\fR, owned by \fBkaridns\-signer\fR).
+.TP 8
+\fB/var/run/karidns_signer/\fR
+The pid files of \fBdaemon(8)\fR (\fBsupervisor.pid\fR for \fBservice
+karidns_signer stop\fR, \fBchild.pid\fR for \fBreload\fR); the directory belongs
+to the signer's user because the rc script runs \fBdaemon\fR as that user
+(rc.subr does it with \fBsu \-m\fR, for \fBkaridns_signer_user\fR), so
+\fBdaemon\fR writes them as that user.
+.TP 8
+\fB<sqlite\-file>.signer.lock\fR
+The lock file of a SQLite3 database (the pid of the signer).
+.TP 8
+\fB/usr/local/share/karidns/db/karidns_signer_role.pgsql.sql\fR
+The privileges of the PostgreSQL role (\fBdb/\fR in a source tree).
+.SH EXAMPLES
+Check a configuration as the signer's user, then start the daemon in the
+foreground with the log on the terminal:
+.PP
+.RS 2
+.nf
+su \-m karidns\-signer \-c 'karidns\-signer \-\-check \-c /usr/local/etc/karidns/karidns\-signer.conf'
+su \-m karidns\-signer \-c 'karidns\-signer \-c /usr/local/etc/karidns/karidns\-signer.conf'      # log = stderr in that file
+.fi
+.RE
+.PP
+Sign a new zone and look at the answer:
+.PP
+.RS 2
+.nf
+karidns\-zone import \-c /usr/local/etc/karidns/karidns.conf example.test example.test.zone
+psql \-c "INSERT INTO karidns_key_requests (domain_id, kind) SELECT id, 'enable' FROM domains WHERE name = 'example.test'" pdns
+psql \-c "SELECT state, message FROM karidns_key_requests ORDER BY id DESC LIMIT 1" pdns
+dag @192.0.2.53 example.test DNSKEY +dnssec +nohexdump
+.fi
+.RE
+.PP
+Check the signed zone of the database from outside:
+.PP
+.RS 2
+.nf
+karidns\-zone export \-c /usr/local/etc/karidns/karidns.conf example.test example.test.signed
+dnssec\-verify \-z \-o example.test example.test.signed      # \-z: a CSK (one key with the SEP bit signs everything) is not a "missing ZSK"; leave \-z out for a KSK and a ZSK
+.fi
+.RE
+.SH SEE ALSO
+.IP \(bu 2
+\fBkaridns\-zone(8)\fR \[u2014] \fBimport \-\-signer\fR, \fBexport \-\-signer\fR
+.IP \(bu 2
+\fBkaridns\-dbloader(8)\fR \[u2014] the schema, the signer's tables, roles and
+row level security
+.IP \(bu 2
+\fBkaridns(8)\fR \[u2014] \fBdatabase { signer\-wait }\fR, "The signer's zones",
+restricted control keys
+.IP \(bu 2
+\fBkarictl(8)\fR \[u2014] \fBreload\fR, \fBdbstatus\fR
+.IP \(bu 2
+\fBkaricheck(8)\fR \[u2014] \fBkaricheck zone\fR
+.IP \(bu 2
+Distribution Guide \[u2014] the FreeBSD packages
+.IP \(bu 2
+RFC 4034, RFC 4035 (DNSSEC), RFC 5155 (NSEC3), RFC 6781 and RFC 7583 (key
+rollover), RFC 8624 (algorithms), RFC 9276 (NSEC3 parameters)
+.SH AUTHORS
+Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)

@@ -21,24 +21,40 @@ categories: [
     "net",
     "sysutils"
 ]
+conflicts: [ __CONFLICTS__ ]
+provides: [ __PROVIDES__ ]
+scripts: {
+    pre-install: <<EOD
+pw groupshow karidns >/dev/null 2>&1 || pw groupadd karidns
+pw usershow karidns >/dev/null 2>&1 || pw useradd karidns -g karidns -h - -d /nonexistent -s /usr/sbin/nologin -c "KariDNS server"
+EOD
+    post-install: <<EOD
+install -d -o root -g wheel -m 0755 /var/run/karidns
+EOD
+}
+messages: [
+    {
+        type: "install",
+        message: <<EOD
+karidns runs as the user karidns, which this package created: copy /usr/local/etc/karidns/karidns.conf.sample to
+/usr/local/etc/karidns/karidns.conf (its user and group are karidns) and edit it. A configuration of an earlier version that names the
+user bind or named keeps running as that user. An existing /var/log/named is left as it is; when it is missing, the rc script creates
+it for the user and group of the configuration (or karidns_log_owner of rc.conf) and refuses to start when it cannot tell them
+(docs/distribution.md "The user karidns"). karidns-signer and karidns-webadmin 0.7 require karidns-zone and karicheck, which the
+server packages provide since 0.7: with pkg add, upgrade this package before them (docs/distribution.md 2.6).
+EOD
+    },
+    {
+        type: "remove",
+        message: <<EOD
+The user and group karidns, /var/run/karidns and /var/log/named (made by the rc script) are left in place (a configuration and the logs may still use them).
+To remove them when nothing else uses them: pw userdel karidns (it removes the group karidns too), rm -r /var/run/karidns /var/log/named.
+EOD
+    }
+]
 deps: {
 __DEPS__
 }
 files: {
-    /usr/local/sbin/karidns: "",
-    /usr/local/bin/karictl: "",
-    /usr/local/bin/karicheck: "",
-    /usr/local/bin/karidns-tapstat: "",
-    /usr/local/bin/dag: "",
-    /usr/local/etc/rc.d/karidns: { "perm": "0555" },
-    /usr/local/etc/karidns/karidns.conf.sample: "",
-    /usr/local/etc/karidns/karictl.conf.sample: "",
-    /usr/local/etc/karidns/zones/example.test.zone.sample: "",
-__DB_FILES__
-    /usr/local/share/doc/karidns/karidns.md: "",
-    /usr/local/share/doc/karidns/karictl.md: "",
-    /usr/local/share/doc/karidns/karicheck.md: "",
-    /usr/local/share/doc/karidns/karidns-tapstat.md: "",
-    /usr/local/share/doc/karidns/dag.md: "",
-    /usr/local/share/doc/karidns/dag_replay.md: ""
+__FILES__
 }

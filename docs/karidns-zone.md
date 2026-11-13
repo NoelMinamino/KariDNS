@@ -1,4 +1,4 @@
-# KARIDNS-ZONE(1) — KariDNS Zone Importer and Exporter
+# KARIDNS-ZONE(8) — KariDNS Zone Importer and Exporter
 
 ## NAME
 
@@ -160,7 +160,7 @@ delete <owner> <type>
                        "before": [ "300 A 192.0.2.1" ], "after": [ "300 A 192.0.2.10", "300 A 192.0.2.11" ] } ] }
 ```
 
-`diff` has one entry per RRset changed, in owner, type order (the SOA RRset too, when the file wrote it); `change` is `add`, `replace` or `delete`; `before` / `after` are arrays of the canonical lines, null when the RRset was not / is not there. `version` is the number the version row has (a dry run writes it and rolls it back); `records_before` / `records_after` count the records the session could see. When the zone changed (exit status 3) or is busy (4) the document has `changed` or `busy` true and no other key but `zone`, `dry_run`, `committed` and `created`. The messages (the zone checks) are in `messages[]` as always, with the codes of `karicheck(1)`.
+`diff` has one entry per RRset changed, in owner, type order (the SOA RRset too, when the file wrote it); `change` is `add`, `replace` or `delete`; `before` / `after` are arrays of the canonical lines, null when the RRset was not / is not there. `version` is the number the version row has (a dry run writes it and rolls it back); `records_before` / `records_after` count the records the session could see. When the zone changed (exit status 3) or is busy (4) the document has `changed` or `busy` true and no other key but `zone`, `dry_run`, `committed` and `created`. The messages (the zone checks) are in `messages[]` as always, with the codes of `karicheck(8)`.
 
 **`--types-list`** prints the record types a change file may name, one per line (with `--json`: the key `types`, `"command": "types"`).
 
@@ -288,7 +288,7 @@ The BIND text is `$ORIGIN`, `$TTL` (the TTL most records have), the tag definiti
 
 ## JSON OUTPUT
 
-`karidns-zone --json <command> ...` writes the document of [`karicheck --json`](karicheck.md#json-output) with the first key `"karidns-zone": 1` and `"command": "import"`, `"export"`, `"apply"`, `"render"` or `"types"`; `import --signer` adds the key `signer` after `zones` (above), `apply` the key `apply` (above), `render` the key `render` (above), `--types-list` the key `types`; `messages[]`, `counts` and `zones[]` are as there (`zones[]` has one entry per zone imported or exported; `format` is `bind`, `tinydns`, or `database` for a zone that failed before its format was known; `file` is the input or output file). Standard output carries only the document, standard error nothing; the exit status is the one of the text mode. The codes are those of [`karicheck(1)`](karicheck.md) (`usage.*`, `io.*`, `conf.*`, `zone.*`, `db.import.*`, `db.export.*`, `db.zone.*`; the list is in the manual of `karicheck`).
+`karidns-zone --json <command> ...` writes the document of [`karicheck --json`](karicheck.md#json-output) with the first key `"karidns-zone": 1` and `"command": "import"`, `"export"`, `"apply"`, `"render"` or `"types"`; `import --signer` adds the key `signer` after `zones` (above), `apply` the key `apply` (above), `render` the key `render` (above), `--types-list` the key `types`; `messages[]`, `counts` and `zones[]` are as there (`zones[]` has one entry per zone imported or exported; `format` is `bind`, `tinydns`, or `database` for a zone that failed before its format was known; `file` is the input or output file). Standard output carries only the document, standard error nothing; the exit status is the one of the text mode. The codes are those of [`karicheck(8)`](karicheck.md) (`usage.*`, `io.*`, `conf.*`, `zone.*`, `db.import.*`, `db.export.*`, `db.zone.*`; the list is in the manual of `karicheck`).
 
 ## AUDIT
 
@@ -439,7 +439,7 @@ then `karictl reconfig`. A signed zone is exported with its signatures and the N
 
 - [`karidns-dbloader(8)`](karidns-dbloader.md) — the loader that reads the zones the importer writes; the SQL files, the packages
 - [`karidns-signer(8)`](karidns-signer.md) — the daemon that runs `export --signer` and `import --signer` and keeps the zones signed
-- [`karicheck(1)`](karicheck.md) — the zone checks (`karicheck zone`), `karicheck db`, the JSON document and the message codes
+- [`karicheck(8)`](karicheck.md) — the zone checks (`karicheck zone`), `karicheck db`, the JSON document and the message codes
 - [`karictl(8)`](karictl.md) — `reload`, `dbstatus`, `rollback`
 - the database chapter of [`karidns-dbloader(8)`](karidns-dbloader.md) — the generation, version, session, token and template tables, the check role, the migration of a database made before them
 - [`karidns(8)`](karidns.md) — the `database` block, views, database zones, `check-*` options and limits

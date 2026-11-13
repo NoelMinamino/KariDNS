@@ -1,0 +1,1506 @@
+.TH DAG 1 "2026-11-13" "KariDNS" "KariDNS Manual"
+.\" Generated from docs/dag.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
+.SH NAME
+dag \- DNS Anomaly Generator, Protocol Inspector, and Multi-Server Verification
+Utility
+.SH SYNOPSIS
+.RS 2
+.nf
+dag [@server[:port][,...]] [\-p port] [\-b address[#port]] [\-c class] [\-f filename]
+    [\-k keyfile] [\-m] [\-q name] [\-t type] [\-u] [\-v] [\-x addr]
+    [\-y [hmac:]name:secret] [\-4 | \-6] [name] [type] [class] [queryopt...]
+\&
+dag [\-h | \-\-help]
+\&
+dag [\-\-break\-help]
+\&
+dag \-\-replay <traffic_file> \-\-server1 <host[:port]> [replay\-opts...]
+\&
+dag [global\-queryopt...] [query...]
+.fi
+.RE
+.SH DESCRIPTION
+\fBdag\fR (\fBDNS Anomaly Generator\fR) is a DNS test client, protocol
+inspector, multi-server consistency checker, and packet fuzzer developed for the
+\fBKariDNS\fR project.
+.PP
+\fBdag\fR provides dig-compatible command-line syntax and output formatting,
+while offering additional testing capabilities:
+.IP 1. 4
+\fBProtocol Mutation & Fuzzing (\fB\-\-break\fB)\fR: \fBdag\fR can craft
+malformed, edge-case, or boundary-testing DNS packets (such as compression
+pointer loops, oversized labels, invalid header counts, or TCP stream anomalies)
+to evaluate the robustness of DNS server implementations.
+.IP 2. 4
+\fBMulti-Server Consistency Comparison (\fB+allcompare\fB)\fR: Users can supply
+a comma-separated list of nameservers (e.g.,
+\fB@192.0.2.1,198.51.100.1,203.0.113.1:5353\fR). \fBdag\fR queries each server
+and can output a matrix comparing response equivalence (\fBMATCH_EXACT\fR,
+\fBMATCH_SEMANTIC\fR, or \fB[DIFF]\fR).
+.IP 3. 4
+\fBWeb Wire-Format Inspection (\fB+ldnsz\fB)\fR: Encodes the raw wire-format
+query and response using zlib compression and Base64URL encoding, generating
+inspection URLs for ldns.jp <https://ldns.jp/> or multi-server binary diff URLs.
+.IP 4. 4
+\fBTransports & Protocol Extensions\fR: Support for \fBDNS over TLS (DoT)\fR,
+\fBDNS over HTTPS (DoH)\fR, \fBPlain HTTP DNS\fR, \fBHAProxy PROXYv2\fR, \fBEDNS
+Client Subnet (ECS)\fR, \fBDNS Cookies\fR, \fBExtended DNS Errors (EDE)\fR,
+\fBMultiple QTYPE (RFC 10029)\fR, \fBDynamic Updates (RFC 2136)\fR, and
+\fBTransaction Security (TSIG / SIG(0))\fR.
+.IP 5. 4
+\fBTraffic Replay & Differential Engine (\fB\-\-replay\fB)\fR: Asynchronously
+replays recorded DNS queries from PCAP traces, dnstap Frame Streams, or text
+query lists against target nameservers, providing order-independent semantic
+differential testing across dual servers and automatic protocol preservation
+(TCP/UDP). See \fBdag\-replay(1)\fR for full reference.
+.IP 6. 4
+\fBMemory Arenas\fR: Uses bump-allocated memory arenas (\fBzone_arena_t\fR) for
+scratch allocations during query processing.
+.SS Default Lookup Behavior
+.IP \(bu 2
+Unless \fB@server\fR is explicitly provided, \fBdag\fR reads nameserver
+addresses from \fB/etc/resolv.conf\fR (on Windows, from the system's DNS server
+list). If no server is found, it queries \fB127.0.0.1\fR (on Windows:
+\fB1.1.1.1\fR).
+.IP \(bu 2
+When no domain name is supplied, \fBdag\fR queries the root zone (\fB.\fR) for
+\fBNS\fR records. If a domain name is supplied without a type, it defaults to
+\fBA\fR (or \fBPTR\fR if \fB\-x\fR is specified). The name, type and class may
+be given in any order.
+.IP \(bu 2
+The query has the RD and AD bits set, like \fBdig\fR.
+.IP \(bu 2
+Like \fBdig\fR, queries carry an EDNS0 OPT record (version 0, UDP payload size
+1232) with a random 8-byte client cookie by default; \fB+noedns\fR and
+\fB+nocookie\fR turn them off. Dynamic UPDATE and NOTIFY messages
+(\fB\-\-update\-*\fR, \fB\-\-prereq\-*\fR, \fB+opcode=UPDATE\fR,
+\fB+opcode=NOTIFY\fR) get no OPT record unless an EDNS option is given
+explicitly, like \fBnsupdate\fR.
+.IP \(bu 2
+In the normal output format, a hex dump of the query (\fBQuery (N bytes):\fR)
+and of the response is printed in addition to the dig-style sections. Use
+\fB+nohexdump\fR to turn this off; the dumps are not printed with \fB+short\fR
+or \fB+yaml\fR (and the response dump not with \fB+nocomments\fR). \fB+noall\fR
+turns them off too, so \fB+noall +answer\fR prints only the answer like
+\fBdig\fR; \fB+hexdump\fR after \fB+noall\fR brings them back.
+.IP \(bu 2
+A response that \fBdag\fR receives and then discards (a message shorter than the
+12-octet header, a transaction ID, question or opcode mismatch, or a mismatching
+client COOKIE; RFC 5452 section 9.1) is dumped as well, right after its warning
+line: \fB;; Discarded response (N bytes, UDP from 192.0.2.1#53):\fR followed by
+the hex dump of the received octets (\fBTCP\fR over TCP). \fBdig\fR shows only
+the warning. The message is still discarded, so the exit code and the retry
+behaviour are the same as in \fBdig\fR. This dump follows the response dump: it
+is turned off by \fB+nohexdump\fR, \fB+nohexdump\-response\fR,
+\fB+nocomments\fR, \fB+noall\fR, \fB+short\fR and \fB+yaml\fR.
+.IP \(bu 2
+Unlike \fBdig\fR, a truncated UDP response (\fBTC=1\fR) is printed like any
+other response before \fB;; Truncated, retrying in TCP mode.\fR and the TCP
+retry to the same server; both responses are recorded for the comparison summary
+and \fB+ldnsz\fR (see Note on TC (Truncation) Retries). \fB+ignore\fR keeps the
+UDP response and does not retry.
+.IP \(bu 2
+Per-user defaults can be configured via \fB${HOME}/.digrc\fR. This file is read
+and its options applied before command-line arguments, unless the \fB\-r\fR
+option is supplied.
+.IP \(bu 2
+Up to 64 queries can be given on one command line (see MULTIPLE QUERIES & BATCH
+PROCESSING).
+.SH OPTIONS
+.SS Query Target & General Options
+.TP 8
+\fB\-4\fR
+Force query transport over IPv4 only.
+.TP 8
+\fB\-6\fR
+Force query transport over IPv6 only.
+.TP 8
+\fB\-b address[#port]\fR
+Set the source IP address and optional source port for the query. \fBaddress\fR
+must be a valid interface address on the local host.
+.TP 8
+\fB\-c class\fR
+Set the query class. The default is \fBIN\fR (Internet). Other supported classes
+include \fBCH\fR / \fBCHAOS\fR, \fBHS\fR / \fBHESIOD\fR, or numeric
+\fBCLASSnn\fR syntax (e.g., \fBCLASS3\fR).
+.TP 8
+\fB\-f filename\fR
+Batch mode. Reads a list of query requests from \fBfilename\fR line by
+line. Blank lines and lines beginning with \fB#\fR or \fB;\fR are ignored. Each
+line is processed as an independent set of query arguments.
+.TP 8
+\fB\-h\fR, \fB\-\-help\fR
+Print a comprehensive usage summary and exit.
+.TP 8
+\fB\-\-break\-help\fR
+Print the list of all available \fB\-\-break\fR mutation and fuzzing options and
+exit.
+.TP 8
+\fB\-k keyfile\fR
+Sign queries using TSIG with credentials read from a BIND-compatible key file,
+or with SIG(0) when the file is a BIND \fB.private\fR key (see TSIG TRANSACTION
+SECURITY).
+.TP 8
+\fB\-m\fR
+Enable memory usage debugging. Upon completion, \fBdag\fR prints process maximum
+resident set size (\fBru_maxrss\fR) via \fBgetrusage(2)\fR. \fI(Not available on
+Windows)\fR
+.TP 8
+\fB\-p port\fR
+Send queries to the specified port instead of the default port 53 (or 853 for
+DoT, 443 for DoH, 80 for Plain HTTP).
+.TP 8
+\fB\-q name\fR
+Explicitly specify the domain name to query. Useful to distinguish domain names
+that overlap with record types or options.
+.TP 8
+\fB\-r\fR
+Do not read options from \fB${HOME}/.digrc\fR.
+.TP 8
+\fB\-t type\fR
+Explicitly specify the resource record type. Supports standard mnemonics
+(\fBA\fR, \fBAAAA\fR, \fBNS\fR, \fBSOA\fR, \fBMX\fR, \fBTXT\fR, \fBSRV\fR,
+\fBHTTPS\fR, \fBSVCB\fR, \fBDS\fR, \fBDNSKEY\fR, \fBANY\fR, \fBAXFR\fR,
+\fBIXFR=serial\fR, etc.) as well as generic \fBTYPEnn\fR syntax (RFC
+3597). \fBRESINFO\fR (RFC 9606) and \fBWALLET\fR are printed like \fBTXT\fR
+(quoted character-strings), \fBEID\fR and \fBNIMLOC\fR as one hex string, and
+\fBNULL\fR, \fBUINFO\fR, \fBUID\fR, \fBGID\fR and \fBUNSPEC\fR in the RFC 3597
+\fB\e# <length> <hex>\fR form, as dig 9.20 does.
+.TP 8
+\fB\-u\fR
+Display query elapsed times in microseconds (\[u00B5]s) instead of milliseconds
+(ms).
+.TP 8
+\fB\-v\fR, \fB\-\-version\fR
+Display the version string (\fBKariDNS dag v...\fR) and exit.
+.TP 8
+\fB\-x addr\fR
+Simplified reverse DNS lookup for IPv4 and IPv6 addresses. Automatically
+converts dotted-decimal IPv4 addresses into \fBin\-addr.arpa\fR and
+colon-delimited IPv6 addresses into \fBip6.arpa\fR (nibble format), setting the
+query type to \fBPTR\fR and class to \fBIN\fR.
+.TP 8
+\fB\-y [hmac:]name:secret\fR
+Sign queries using TSIG with the provided base64-encoded shared secret. The
+algorithm prefix can be \fBhmac\-md5\fR, \fBhmac\-sha1\fR, \fBhmac\-sha224\fR,
+\fBhmac\-sha256\fR (default), \fBhmac\-sha384\fR, or \fBhmac\-sha512\fR.
+.TP 8
+\fB\-\-hex <hex>\fR, \fB\-\-hex=<hex>\fR
+Transmit an arbitrary raw DNS wire-format packet provided as a hexadecimal
+string (up to 65,535 bytes). Allows direct crafting and replay of custom or
+malformed DNS messages.
+.SH TRANSPORT & PROTOCOL OPTIONS
+.TP 8
+\fB+[no]tcp\fR, \fB+[no]vc\fR
+Use TCP transport instead of UDP. \fB+vc\fR ("virtual circuit") and
+\fB\-\-tcp\fR are synonyms for \fB+tcp\fR. \fB+novc\fR / \fB+notcp\fR force
+UDP. \fBAXFR\fR and large \fBIXFR\fR queries automatically elevate to TCP unless
+\fB+udp\fR is explicitly forced.
+.TP 8
+\fB+udp\fR
+Force UDP transport.
+.TP 8
+\fB+tcp\-mss=N\fR
+Set the TCP maximum segment size (\fBTCP_MAXSEG\fR) of the query connection to
+\fBN\fR bytes. Implies \fB+tcp\fR. Corresponds to the server's \fBtcp\-mss\fR
+(see karidns(8)).
+.TP 8
+\fB+tcp\-window=N\fR
+Set the TCP receive and send buffer sizes (\fBSO_RCVBUF\fR / \fBSO_SNDBUF\fR) of
+the query connection to \fBN\fR bytes before connecting. Implies \fB+tcp\fR.
+.TP 8
+\fB+[no]tls\fR
+Use \fBDNS over TLS (DoT)\fR (RFC 7858). When enabled, default destination port
+switches to 853.
+.TP 8
+\fB+tls\-ca[=file]\fR
+Enable TLS server certificate verification. If a PEM \fBfile\fR is specified,
+certificate authorities are loaded from it; otherwise, the system default trust
+store is used. \fB+notls\-ca\fR disables certificate validation.
+.TP 8
+\fB+tls\-certfile=file\fR, \fB+tls\-keyfile=file\fR
+Set client certificate chain and private key in PEM format for mutual TLS (mTLS)
+authentication. Both options must be provided together.
+.TP 8
+\fB+tls\-hostname=hostname\fR
+Specify the expected Server Name Indication (SNI) and hostname for TLS
+certificate verification.
+.TP 8
+\fB+[no]https[=endpoint]\fR
+Use \fBDNS over HTTPS (DoH)\fR (RFC 8484) over TLS. Default port is 443; default
+endpoint URI path is \fB/dns\-query\fR. Request method defaults to HTTP POST.
+.TP 8
+\fB+[no]https\-get[=endpoint]\fR
+Use DoH with HTTP GET method (transmitting wire query as Base64URL in
+\fB?dns=\fR query parameter).
+.TP 8
+\fB+[no]https\-post[=endpoint]\fR
+Use DoH with HTTP POST method (transmitting wire query in HTTP payload body).
+.PP
+DoH notes: like \fBdig\fR, the DNS message ID is random (RFC 8484 \[u00A7]4.1
+recommends 0 for cache friendliness; \fBdig\fR 9.20 does not use 0
+either). \fBdag\fR speaks HTTP/1.1, whereas \fBdig\fR uses HTTP/2 (RFC 8484
+\[u00A7]5.2 recommends HTTP/2).
+.TP 8
+\fB+[no]http\-plain[=endpoint]\fR, \fB+[no]http\-plain\-get[=endpoint]\fR, \fB+[no]http\-plain\-post[=endpoint]\fR
+Send DNS queries over unencrypted plain HTTP (RFC 8484 message format). Default
+port is 80; default endpoint is \fB/dns\-query\fR; the default method is
+POST. \fB+http\fR, \fB+http\-get\fR and \fB+http\-post\fR are aliases.
+.TP 8
+\fB+[no]proxy[=spec]\fR
+Prepend a \fBHAProxy PROXYv2\fR binary header before the DNS packet.
+.RS 8
+.IP \(bu 2
+If \fBspec\fR is omitted (\fB+proxy\fR), sends a PROXYv2 header with \fBLOCAL\fR
+command.
+.IP \(bu 2
+If \fBspec\fR is provided in \fBsrc_addr[#src_port]\-dst_addr[#dst_port]\fR
+format (e.g., \fB+proxy=192.0.2.1#1234\-192.0.2.2#53\fR), sends a PROXYv2
+\fBPROXY\fR command reflecting the specified connection endpoints.
+.IP \(bu 2
+On TCP-based transports the header is sent right after the TCP connection is
+established, \fBbefore\fR any TLS handshake (DoT/DoH). On UDP it is prepended to
+each datagram.
+.RE
+.TP 8
+\fB+[no]proxy\-plain[=spec]\fR
+Alias for \fB+proxy\fR, kept for \fBdig\fR/\fBkdig\fR compatibility; behaves
+identically.
+.TP 8
+\fB+[no]keepopen\fR
+Keep the TCP, TLS or HTTPS connection open between consecutive queries to the
+same server (RFC 7766 connection reuse), e.g. when several queries are given on
+the command line or in a batch file.
+.TP 8
+\fB+[no]dns64prefix\fR
+Automatically query \fBipv4only.arpa\fR for \fBAAAA\fR records to discover local
+DNS64 prefixes (RFC 7050). Known difference: \fBdig +dns64prefix\fR ignores
+\fB+noedns\fR and \fB+qr\fR for its lookups; \fBdag\fR applies them.
+.TP 8
+\fB+timeout=N\fR, \fB+time=N\fR
+Set query network timeout in seconds (default: 5 seconds). \fB+time=N\fR
+functions as a synonym/alias.
+.TP 8
+\fB+tries=N\fR
+Set the total number of transmission attempts to \fBN\fR (default: 1 attempt).
+.TP 8
+\fB+retry=N\fR
+Set the number of transmission retries to \fBN\fR (total attempts will be \fBN +
+1\fR).
+.SH DNS HEADER & QUERY FLAGS
+.TP 8
+\fB+[no]rec\fR, \fB+[no]recurse\fR, \fB+[no]rdflag\fR
+Set or clear the \fBRD (Recursion Desired)\fR header bit. Recursion is enabled
+by default. Automatically disabled when \fB+trace\fR or \fB+nssearch\fR is
+active.
+.TP 8
+\fB+[no]adflag\fR
+Set or clear the \fBAD (Authenticated Data)\fR bit in the query header.
+.TP 8
+\fB+[no]cdflag\fR
+Set or clear the \fBCD (Checking Disabled)\fR bit in the query header,
+requesting the upstream server not to perform DNSSEC validation.
+.TP 8
+\fB+[no]aaflag\fR, \fB+[no]aaonly\fR
+Set or clear the \fBAA (Authoritative Answer)\fR bit in the query header.
+.TP 8
+\fB+[no]tcflag\fR
+Set or clear the \fBTC (Truncation)\fR bit in the query header.
+.TP 8
+\fB+[no]raflag\fR
+Set or clear the \fBRA (Recursion Available)\fR bit in the query header.
+.TP 8
+\fB+[no]zflag\fR
+Set or clear the reserved \fBZ\fR bit in the DNS header.
+.TP 8
+\fB+opcode=N\fR
+Override the DNS header \fBOPCODE\fR. Accepts numeric values (0\[u2013]15) or
+standard mnemonic strings (\fBQUERY\fR, \fBIQUERY\fR, \fBSTATUS\fR,
+\fBNOTIFY\fR, \fBUPDATE\fR). Example: \fB+opcode=UPDATE\fR or
+\fB+opcode=5\fR. \fB+noopcode\fR restores the default (\fBQUERY\fR).
+.TP 8
+\fB+qid=N\fR
+Override the 16-bit DNS Query ID (0\[u2013]65535). If omitted, a
+cryptographically secure random ID is generated via \fBarc4random(3)\fR (or
+platform CSPRNG / OpenSSL \fBRAND_bytes\fR on non-BSD platforms).
+.TP 8
+\fB+[no]header\-only\fR
+Send a query containing only the 12-byte DNS header with \fBQDCOUNT=0\fR (no
+QUESTION section).
+.TP 8
+\fB+[no]ignore\fR
+Ignore truncation (\fBTC=1\fR) in UDP responses instead of automatically
+retrying over TCP.
+.TP 8
+\fB+[no]fail\fR
+When querying multiple nameservers or using failover lists, controls whether to
+try the next nameserver when receiving a \fBSERVFAIL\fR response.
+.TP 8
+\fB+[no]trace\fR
+Trace the DNS delegation path iteratively starting from the root nameservers
+(\fB.\fR). By default (\fB+noglue\fR, matching BIND 9.20+ \fBdig\fR behavior),
+\fBdag +trace\fR ignores the \fBADDITIONAL\fR section of referral responses and
+resolves the delegated nameserver names (A/AAAA) to follow delegation paths down
+to authoritative servers, displaying each intermediate answer. Nameserver names
+are resolved through \fB@server\fR when it offers recursion (\fBRA=1\fR in its
+root \fBNS\fR response); when \fB@server\fR is authoritative-only (e.g. a root
+server address such as \fB@192.0.2.1\fR), they are resolved through the system
+resolver (\fB/etc/resolv.conf\fR, port 53) like BIND \fBdig\fR, and names that
+cannot be resolved are reported as \fB;; couldn't get address
+for '<name>'\fR. Specify \fB+glue\fR to restore the previous behavior of using
+in-bailiwick Glue records from the \fBADDITIONAL\fR section (falling back to
+resolver lookups only when no glue is present). Honors \fB+tcp\fR and
+automatically falls back to TCP when receiving truncated (\fBTC=1\fR)
+responses. Like BIND \fBdig\fR, \fB+trace\fR implies \fB+noadditional\fR, so the
+\fBADDITIONAL\fR section of each hop is not displayed; give \fB+additional\fR
+after \fB+trace\fR to show it again. \fB+trace\fR also implies \fB+dnssec\fR
+(every hop is sent with DO=1, so RRSIG, DS and NSEC records are shown) and
+\fB+authority\fR (so \fB+noall +answer +trace\fR still shows the referrals), as
+\fBdig\fR 9.20 does; options are applied in order, so \fB+trace +nodnssec\fR or
+\fB+trace +noauthority\fR turns them off again. The output starts with the same
+banner as a normal lookup (\fB; <<>> dag <<>> ...\fR, \fB;; global options:
++cmd\fR). A response whose Authority section has no NS records (an authoritative
+NODATA answer, or an RFC 9824 compact denial with RCODE NOERROR) ends the trace
+like an answer. Each hop ends with \fB;; Received N bytes from ADDR#PORT(name)
+in T ms\fR, where \fBname\fR is the \fB@server\fR text (or the system resolver
+address) for the first query and the nameserver name the address belongs to for
+the later ones, as in BIND \fBdig\fR. Like BIND \fBdig\fR 9.20, the trace ends
+at the authoritative answer: a \fBCNAME\fR (or \fBDNAME\fR) in the final answer
+is displayed but not followed; use \fB+trace2\fR to follow CNAME/DNAME chains
+across zones.
+.TP 8
+\fB+[no]trace2[=brief|normal|verbose]\fR
+Resolve the name the way a full iterative resolver (BIND \fBnamed\fR, Unbound)
+does, \fBwithout relying on any local or system resolver\fR. Unlike
+\fB+trace\fR, which asks \fB@server\fR / \fB/etc/resolv.conf\fR for the root NS
+set and for nameserver addresses, \fB+trace2\fR primes from built-in root hints
+(IANA \fBnamed.root\fR; or \fB@server\fR / \fB+roothints=FILE\fR when given)
+with a \fB. NS\fR query (RFC 8109), follows referrals with RD=0, and resolves
+nameserver names that come without glue (e.g. \fBexample.jp. NS
+ns1.example.net.\fR) itself, starting from the closest zone cut it has already
+learned. Referral data outside the queried zone's bailiwick is discarded (RFC
+2181 \[u00A7]5.4.1). CNAME and DNAME chains are followed across zones; DS
+queries are sent to the parent side of the zone cut. Lame servers (REFUSED,
+upward/sideways referrals, non-authoritative empty answers), SERVFAIL and
+timeouts make it try the next server; FORMERR/NOTIMP to an EDNS query is retried
+without EDNS. CNAME loops, nameserver dependency loops (\fBa.test NS ns.b.alt\fR
+/ \fBb.alt NS ns.a.test\fR), recursion depth (8) and the total query budget
+(\fB+trace2\-maxqueries\fR, default 200) all end the resolution with \fB;;
+resolution failed: <reason>\fR instead of looping. Every hop on the main
+delegation path is displayed like \fB+trace\fR (\fB;; Received N bytes from
+ADDR#PORT(ns\-name) in T ms\fR). The mode selects how nameserver-name
+sub-resolutions are shown: \fBnormal\fR (default) prints one line per
+sub-resolution (\fB;; [sub] ns1.example.net \-> 192.0.2.53 (4 queries)\fR),
+\fBverbose\fR prints every sub query and response prefixed with \fB;; [sub N]
+name/type @addr(ns) for zone\fR, and \fBbrief\fR hides them. A final summary
+line reports the status, total/sub-resolution query counts, lame servers,
+timeouts and elapsed time. Query IDs are randomized per query. \fB\-p\fR applies
+to every hop (useful for test hierarchies); \fB\-4\fR/\fB\-6\fR, \fB+tcp\fR,
+\fB+time\fR, \fB+tries\fR, \fB+edns\fR/\fB+bufsize\fR/\fB+dnssec\fR apply to
+every query. Glue: by default (and with \fB+glue\fR/\fB+glue=all\fR) any glue
+within the bailiwick of the referring zone is used; \fB+glue=indomain\fR or an
+explicit \fB+noglue\fR uses only in-domain glue (which a delegation cannot work
+without, RFC 9471) and resolves the rest. Glue outside the bailiwick of the
+referring zone (e.g. an \fBA\fR record for \fBns.other.example.\fR returned in a
+referral from the \fBzone.example.\fR servers) is never trusted, not even with
+\fB+glue=all\fR, because those servers are not authoritative for it; it is
+reported as \fB;; ignoring out\-of\-bailiwick glue for '<ns>' (not under
+<zone>)\fR and the nameserver name is resolved from its own authoritative
+servers instead. Implies \fB+noadditional\fR. Cannot be combined with
+\fB+trace\fR or \fB+nssearch\fR. \fB+trace2\fR does not validate DNSSEC. Like
+\fBdig +trace\fR, the exit status is 0 whenever the trace ran, including when
+resolution fails (\fB;; resolution failed: ...\fR / \fB;; trace2: SERVFAIL\fR);
+it is 9 only when priming fails (no root server could be reached). When given on
+the command line with \fB\-f\fR, \fB+trace2\fR and its options apply to every
+line of the batch file.
+.TP 8
+\fB+[no]qmin\fR, \fB+qmin=a|ns|off\fR
+QNAME minimisation (RFC 9156) for \fB+trace2\fR. Off by default. When enabled,
+each zone is asked only for the next label below it (\fB+qmin\fR / \fB+qmin=a\fR
+probes with type A as RFC 9156 recommends; \fB+qmin=ns\fR probes with type NS as
+in RFC 7816) until the delegation for the full name is reached, then the real
+question is sent. If a server answers a minimised probe with NXDOMAIN or an
+error, \fBdag\fR falls back to the full name (relaxed mode, like Unbound). At
+most 10 minimised queries are sent per resolution.
+.TP 8
+\fB+roothints=FILE\fR
+Use root hints from \fBFILE\fR (named.root format: \fB. NS name\fR and \fBname
+A/AAAA address\fR lines, TTL and class optional; plain \fBname address\fR lines
+are also accepted) instead of the built-in hints for \fB+trace2\fR
+priming. \fB@server\fR takes precedence.
+.TP 8
+\fB+trace2\-maxqueries=N\fR
+Abort \fB+trace2\fR after \fBN\fR queries in total (1-100000, default 200),
+counting priming and nameserver-name sub-resolutions.
+.TP 8
+\fB+[no]nssearch\fR
+Look up authoritative nameservers for the zone containing the query name and
+display the SOA record from each responding nameserver. Honors \fB+tcp\fR and
+automatically falls back to TCP when receiving truncated (\fBTC=1\fR)
+responses. By default, \fBdag +nssearch\fR resolves nameserver addresses using
+the system resolver (matching BIND 9 \fBdig\fR behavior, \fB+noglue\fR). You can
+also specify \fB+glue\fR to query nameservers directly using in-bailiwick A/AAAA
+records from the \fBADDITIONAL\fR section without consulting
+\fB/etc/resolv.conf\fR (useful in isolated or test network environments).
+.TP 8
+\fB+[no]glue\fR
+Control whether in-bailiwick Glue records (A/AAAA) present in the
+\fBADDITIONAL\fR section are prioritized over system resolver lookups
+(\fB/etc/resolv.conf\fR). For \fB+trace\fR, \fB+noglue\fR is the default
+(matching BIND 9.20+ \fBdig\fR, which no longer trusts \fBADDITIONAL\fR section
+data while tracing); \fB+glue\fR restores the legacy behavior of following
+referral chains via attached glue records. For \fB+nssearch\fR, \fB+noglue\fR is
+the default (matching BIND 9 \fBdig\fR), and enabling \fB+glue\fR allows
+\fBdag\fR to query authoritative nameservers directly using attached glue
+records from NS responses without relying on the system resolver.
+.TP 8
+\fB+glue=all|indomain\fR
+Select which glue records \fB+glue\fR trusts. \fBall\fR is the same as plain
+\fB+glue\fR (any A/AAAA in \fBADDITIONAL\fR whose owner matches an NS
+target). \fBindomain\fR reproduces the stricter glue checking introduced in BIND
+\fBnamed\fR 9.18.41 / 9.20.15 / 9.21.14 (ISC KB: Impact of Stricter Glue
+Checking <https://kb.isc.org/docs/strict\-glue>): glue is trusted only when the
+NS target (right side) is a subdomain of the NS owner (left side),
+e.g. \fBexample.org. NS ns1.example.org.\fR. Sibling or unrelated glue
+(e.g. \fBa.example. NS ns1.b.example.\fR) is ignored and reported as \fB;;
+ignoring out\-of\-domain glue for '<ns>' (NS of '<zone>')\fR, and those NS names
+are resolved instead. This is useful for checking whether a delegation that
+relied on out-of-domain glue still resolves on updated BIND resolvers. Applies
+to both \fB+trace\fR and \fB+nssearch\fR.
+.TP 8
+\fB+[no]search\fR, \fB+[no]defname\fR
+Enable or disable domain search list processing as defined in
+\fB/etc/resolv.conf\fR. Like \fBdig\fR, a name with fewer dots than \fBndots\fR
+is tried with each search domain first and then as given, otherwise the other
+way round; the next candidate is tried only after \fBNXDOMAIN\fR. Only the final
+lookup is printed (use \fB+showsearch\fR to see the others), the server cookie
+learned from one candidate is sent with the next, and no comparison table is
+printed for the candidates.
+.TP 8
+\fB+domain=name\fR
+Set the search list to contain the single domain \fBname\fR and enable search
+processing.
+.TP 8
+\fB+ndots=N\fR
+Set the threshold for the number of dots that must appear in a domain name for
+it to be considered absolute before search domain appending takes place.
+.TP 8
+\fB+[no]idn\fR
+Toggle Internationalized Domain Names (IDN) processing for both input and output
+simultaneously.
+.TP 8
+\fB+[no]idnin\fR, \fB+[no]idnout\fR
+Independently control IDN conversion for input query domain names (Punycode
+encoding via \fBlibidn2\fR) and output response domain names (Unicode decoding).
+.SH EDNS0 EXTENSIONS
+Queries carry an EDNS0 OPT record and a client cookie by default (like
+\fBdig\fR). UPDATE and NOTIFY messages get an OPT record only when one of the
+options in this section is given.
+.TP 8
+\fB+[no]edns[=N]\fR
+Send an OPT pseudo-RR (on by default); \fB+edns=N\fR sets the EDNS version to
+\fBN\fR (default: 0). \fB+noedns\fR sends no OPT record.
+.TP 8
+\fB+bufsize=N\fR
+Set the advertised EDNS0 UDP buffer size, 0\[u2013]65535 (default: 1232 bytes,
+compliant with DNS Flag Day recommendations). Enables EDNS.
+.TP 8
+\fB+[no]dnssec\fR, \fB+[no]do\fR
+Set the \fBDO (DNSSEC OK)\fR bit in the EDNS0 OPT record, requesting DNSSEC RRs
+(RRSIG, NSEC, NSEC3, DS) from the authoritative server.
+.TP 8
+\fB+[no]keepalive\fR
+Send the \fBEDNS TCP Keepalive (RFC 7828)\fR option (Option Code 11) in the OPT
+pseudo-RR. Like \fBdig\fR 9.20, the option is also sent over UDP, although RFC
+7828 \[u00A7]3.2.1 says clients MUST NOT include it in UDP queries (\fBdag\fR
+follows \fBdig\fR here). A received value is printed as \fB; TCP\-KEEPALIVE:
+10.0 secs\fR (units of 100 ms).
+.TP 8
+\fB+[no]expire\fR
+Send the \fBEDNS EXPIRE (RFC 7314)\fR option (Option Code 9) in the query. A
+returned value is printed like \fBdig\fR: \fB; EXPIRE: 1209600 (2 weeks)\fR (in
+YAML \fBEXPIRE: 1209600 # 2 weeks\fR).
+.TP 8
+\fB+[no]cookie[=hex]\fR
+Send the \fBDNS Cookie (RFC 7873 / RFC 9018)\fR option. Sent by default with a
+random 8-byte client cookie (like \fBdig\fR); \fB+nocookie\fR turns it off. If
+\fBhex\fR is supplied, sets the client (8 bytes) or client+server cookie value.
+.TP 8
+\fB+[no]badcookie\fR
+When a cookie was sent and the server returns \fBBADCOOKIE\fR, retry with the
+returned Server Cookie (\fB;; BADCOOKIE, retrying.\fR) and, if that is answered
+with \fBBADCOOKIE\fR again, over TCP (\fB;; BADCOOKIE, retrying in TCP
+mode.\fR), as RFC 7873 \[u00A7]5.3 and \fBdig\fR do. Enabled by default.
+.TP 8
+\fB+[no]showbadcookie\fR
+Print the \fBBADCOOKIE\fR answer (banner, message and statistics, like
+\fBdig\fR) before retrying.
+.TP 8
+\fB+subnet=addr[/prefix]\fR
+Send the \fBEDNS Client Subnet (ECS)\fR option (RFC 7871) with the specified
+IPv4 or IPv6 network prefix (e.g., \fB+subnet=192.0.2.0/24\fR or
+\fB+subnet=2001:db8::/56\fR). Specifying \fB+subnet=0\fR (or \fB0/0\fR,
+\fB0.0.0.0/0\fR, \fB::/0\fR) sends an empty source address with prefix length 0
+to signal privacy preference. \fB+nosubnet\fR removes the option.
+.TP 8
+\fB+[no]nsid\fR
+Request the \fBName Server Identifier (NSID)\fR option (RFC 5001).
+.TP 8
+\fB+padding[=N]\fR, \fB+nopadding\fR
+Add the EDNS(0) Padding option (RFC 7830) so that the query size becomes a
+multiple of the block size \fBN\fR (default: 468, the RFC 8467
+recommendation). The expected TSIG record is taken into account when TSIG is
+used. Like \fBdig\fR, \fB+qr\fR shows this option as \fB; PADDING:\fR without
+its length; a padding option received from the server is shown as \fB; PADDING:
+(N bytes)\fR.
+.TP 8
+\fB+[no]mqtype=TYPE[,TYPE...]\fR
+Send the \fBMultiple QTYPE (RFC 10029)\fR EDNS option (Option Code 20),
+requesting multiple resource record types (e.g., \fB+mqtype=A,AAAA,HTTPS\fR) in
+a single query transaction. Up to 16 types; \fB+nomqtype\fR removes the option.
+.TP 8
+\fB+ednsopt=code[:hex]\fR
+Specify a custom EDNS option code (0\[u2013]65535) and optional payload encoded
+in hexadecimal string. Up to 8 \fB+ednsopt\fR parameters can be supplied.
+.TP 8
+\fB+noednsopt\fR
+Clear all configured custom EDNS options.
+.TP 8
+\fB+ednsflags=N\fR, \fB+[no]ednsflags\fR
+Set or reset the raw 16-bit EDNS Z-flags in the OPT record. \fB+ednsflags=N\fR
+sets the flag bits to \fBN\fR, while \fB+ednsflags\fR (without \fB=\fR) or
+\fB+noednsflags\fR resets the flags to \fB0\fR.
+.TP 8
+\fB+[no]coflag\fR, \fB+[no]co\fR
+Set the \fBCompact Answers OK (CO)\fR flag in the OPT record to signal support
+for Compact Denial of Existence.
+.TP 8
+\fB+[no]ednsnegotiation\fR
+Enable EDNS version negotiation fallback if a server returns \fBBADVERS\fR.
+.TP 8
+\fB+[no]showbadvers\fR
+Display diagnostic output when EDNS version negotiation is triggered.
+.SH TSIG TRANSACTION SECURITY
+\fBdag\fR supports TSIG (RFC 8945) transaction signatures to authenticate
+requests (such as AXFR, IXFR, Dynamic Updates, and NOTIFY) against authoritative
+servers.
+.TP 8
+\fB\-y [hmac:]name:secret\fR
+Set TSIG key inline. \fBhmac\fR specifies the HMAC algorithm:
+.RS 8
+.IP \(bu 2
+\fBhmac\-md5\fR
+.IP \(bu 2
+\fBhmac\-sha1\fR
+.IP \(bu 2
+\fBhmac\-sha224\fR
+.IP \(bu 2
+\fBhmac\-sha256\fR (default)
+.IP \(bu 2
+\fBhmac\-sha384\fR
+.IP \(bu 2
+\fBhmac\-sha512\fR \fBname\fR is the TSIG key identity; \fBsecret\fR is the
+base64-encoded secret.
+.RE
+.TP 8
+\fB+tsig=[hmac:]name:secret\fR
+Query-option equivalent of \fB\-y\fR.
+.TP 8
+\fB\-k keyfile\fR
+Read TSIG key definition or BIND SIG(0) private key from file. \fBdag\fR
+automatically determines the key type:
+.RS 8
+.IP \(bu 2
+\fBTSIG (Shared Secret)\fR: Standard BIND-style key file (e.g., generated by
+\fBtsig\-keygen\fR):
+.RS 2
+.PP
+.RS 2
+.nf
+key "tsig\-key.example.com" {
+    algorithm hmac\-sha256;
+    secret "6p9y...==";
+};
+.fi
+.RE
+.RE
+.IP \(bu 2
+\fBSIG(0) (Public-Key / DNSSEC Private Key)\fR: BIND \fBdnssec\-keygen\fR
+generated \fB.private\fR file (e.g.,
+\fBKexample.com.+013+12345.private\fR). When a file starting with
+\fBPrivate\-key\-format:\fR is passed, \fBdag\fR automatically switches to
+SIG(0) signing, deriving the signer domain name, algorithm, and key tag from the
+file and filename without needing extra flags, matching BIND \fBdig\fR behavior.
+.RE
+.TP 8
+\fB+fuzztime[=timestamp]\fR
+Manually override the TSIG or SIG(0) signing time (seconds since Unix epoch) to
+test clock skew tolerances and replay attack defenses. Default timestamp if
+\fB+fuzztime\fR is passed without argument is
+\fB1646972129\fR. \fB+nofuzztime\fR restores current system clock.
+.SH SIG(0) TRANSACTION SECURITY (RFC 2931 / RFC 3007)
+\fBdag\fR supports client-side SIG(0) asymmetric key transaction signatures (RFC
+2931 / RFC 3007) for authenticating Dynamic DNS UPDATE and query requests using
+public-key cryptography (RSA, ECDSA P-256/P-384, Ed25519,
+ML-DSA-44). Server-side verification in KariDNS is out of scope.
+.TP 8
+\fB+sig0\-pkey=file\fR
+Specify the private key file in PKCS#8 / traditional PEM format (\fB.key\fR or
+\fB.pem\fR) or BIND DNSSEC private key format (\fB.private\fR). The key
+algorithm is auto-detected (supporting RSA, ECDSA P-256, Ed25519, and
+ML-DSA-44). Setting this option automatically enables SIG(0) signing.
+.TP 8
+\fB+sig0\-name=name\fR
+Specify the signer's domain name (identity of the KEY RR), e.g.,
+\fBupdate\-key.example.com.\fR. Required when using PEM keys; automatically
+extracted when using BIND \fB\-k\fR / \fB.private\fR keys.
+.TP 8
+\fB+sig0\-alg=N\fR
+Override the algorithm number (e.g., 8 for RSASHA256, 13 for ECDSAP256SHA256, 15
+for ED25519, 18 for MLDSA44). If omitted, \fBdag\fR automatically determines the
+algorithm from the loaded private key.
+.PP
+.RS 4
+\fBML-DSA-44 (algorithm 18, \fBMLDSA44\fB)\fR follows
+draft-westerbaan-dnssec-mldsa
+<https://datatracker.ietf.org/doc/draft\-westerbaan\-dnssec\-mldsa/>: the
+KEY/DNSKEY public key is the bare 1312-octet FIPS 204 encoding and the signature
+the bare 2420-octet pure ML-DSA signature with an empty context string. It needs
+\fBdag\fR built against OpenSSL 3.5 or later. A BIND \fB.private\fR file carries
+the key in \fBPrivateKey:\fR as either the 32-octet seed or the 2560-octet
+expanded private key; a PEM file is read as is (e.g. \fBopenssl genpkey
+\-algorithm ML\-DSA\-44\fR). A message with a 2.4 KB signature exceeds the usual
+UDP payload sizes, so use \fB+tcp\fR for signed UPDATEs.
+.RE
+.TP 8
+\fB+sig0\-keytag=N\fR
+Override the 16-bit key tag (0\[u2013]65535). If omitted, \fBdag\fR
+automatically computes the key tag from the public key using RFC 4034 Appendix B
+and standard KEY RR wire formatting.
+.TP 8
+\fB+[no]sig0\fR
+Toggle SIG(0) transaction signing. Automatically enabled when \fB+sig0\-pkey\fR
+or a BIND \fB.private\fR key via \fB\-k\fR is provided. \fB+nosig0\fR disables
+SIG(0) signing.
+.PP
+.RS 4
+\fBNote:\fR TSIG (\fB\-y\fR, \fB+tsig\fR, or \fB\-k <tsig_file>\fR) and SIG(0)
+(\fB+sig0\-pkey\fR, \fB+sig0\fR, or \fB\-k <private_file>\fR) are mutually
+exclusive per transaction. \fB+fuzztime\fR controls the signature inception and
+expiration timestamps for testing.
+.RE
+.SH DYNAMIC DNS UPDATE (RFC 2136)
+\fBdag\fR can formulate and send Dynamic DNS UPDATE requests (\fBOPCODE=5\fR),
+supporting record additions, deletions, and prerequisite evaluations. The query
+name is used as the zone name. Up to 16 update operations and 16 prerequisites
+can be given per message. The header bits between Opcode and RCODE are Z in an
+UPDATE message (RFC 2136 \[u00A7]2.2), so RD and AD are sent as 0 unless
+\fB+rec\fR or \fB+adflag\fR is given explicitly.
+.SS Update Operations
+.TP 8
+\fB\-\-update\-add <RR>\fR
+Add a resource record to the zone. Format: \fB"<name> <ttl> [class] <type>
+<rdata>"\fR
+.RS 8
+.PP
+.RS 2
+.nf
+dag example.com @127.0.0.1 \-k update.key \-\-update\-add "web.example.com 300 IN A 192.0.2.10"
+.fi
+.RE
+.RE
+.TP 8
+\fB\-\-update\-del <name> [type]\fR
+Delete all records for \fB<name>\fR, or delete all records of \fB<type>\fR on
+\fB<name>\fR.
+.RS 8
+.PP
+.RS 2
+.nf
+dag example.com @127.0.0.1 \-k update.key \-\-update\-del "oldhost.example.com A"
+.fi
+.RE
+.RE
+.TP 8
+\fB\-\-update\-del\-exact <RR>\fR
+Delete a specific resource record matching full RDATA.
+.RS 8
+.PP
+.RS 2
+.nf
+dag example.com @127.0.0.1 \-k update.key \-\-update\-del\-exact "web.example.com 0 IN A 192.0.2.10"
+.fi
+.RE
+.RE
+.PP
+The RDATA of \fB\-\-update\-add\fR, \fB\-\-update\-del\-exact\fR and
+\fB\-\-prereq\-yxrrset\fR may be written in the generic form of RFC 3597
+\[u00A7]5, \fB\e# <length> <hex>\fR, for unknown types and for known ones (the
+length must equal the number of octets, and for a known type the octets must be
+valid RDATA for it). The hex digits may be split into blank-separated tokens; an
+operand may have up to 65543 tokens, and a larger one is an error (nothing is
+truncated silently). This is how a record that the presentation format cannot
+show is sent, for example a zero-length unknown-type RR or a \fBTXT\fR string
+with a NUL octet:
+.PP
+.RS 2
+.nf
+dag example.com @127.0.0.1 \-k update.key \-\-update\-add 'x.example.com 300 IN TYPE65534 \e# 0'
+dag example.com @127.0.0.1 \-k update.key \-\-update\-add 'x.example.com 300 IN TXT \e# 4 03610062'
+.fi
+.RE
+.SS Prerequisites
+.TP 8
+\fB\-\-prereq\-yxdomain <name>\fR
+Prerequisite: Domain \fB<name>\fR must exist (at least one RR of any type).
+.TP 8
+\fB\-\-prereq\-nxdomain <name>\fR
+Prerequisite: Domain \fB<name>\fR must NOT exist.
+.TP 8
+\fB\-\-prereq\-yxrrset <name> <type> [rdata]\fR
+Prerequisite: RRset of \fB<type>\fR on \fB<name>\fR must exist (optionally
+matching exact \fB<rdata>\fR).
+.TP 8
+\fB\-\-prereq\-nxrrset <name> <type>\fR
+Prerequisite: RRset of \fB<type>\fR on \fB<name>\fR must NOT exist.
+.TP 8
+\fB\-\-prereq=<kind:name[:type][:rdata]>\fR
+Alternative colon-delimited format for specifying prerequisites (e.g.,
+\fB\-\-prereq=nxdomain:host.example.com\fR or
+\fB\-\-prereq=yxrrset:host.example.com:A:192.0.2.1\fR).
+.SH PROTOCOL ANOMALY GENERATOR & FUZZING (\-\-break)
+.RS 4
+\fBWarning:\fR \fBIntended for Local Testing & Security Audits Only\fR Do not
+execute \fB\-\-break\fR anomaly tests against external or production public DNS
+servers without explicit authorization.
+.RE
+.PP
+.RS 4
+\fBNote:\fR Only one \fIstructural\fR \fB\-\-break\fR mutation
+(e.g. \fBcompression\-loop\fR, \fBcompression\-forward\fR,
+\fBlabel\-too\-long\fR, \fBreserved\-length\-bits\fR, \fBoversized\-qname\fR,
+\fBtruncated\-question\fR, \fBnotify\-no\-question\fR) can be active per
+query. If multiple structural breaks are specified, only the first one is
+applied and subsequent ones are ignored with a warning. Transport/header flags
+can be combined freely.
+.RE
+.PP
+\fBdag\fR provides built-in packet mutators to test server resilience against
+protocol edge cases, malformed wire formats, and parser exploits.
+.SS Mutation Kinds (\-\-break <kind>[=<param>])
+.TS
+lb lbw(22) lbw(22)
+l lw(22) lw(22).
+\&Mutation Kind	\&Description	T{
+Tested Vulnerability / Spec
+T}
+_
+\&\fBcompression\-loop\fR	T{
+Generates a self-referencing DNS compression pointer (\fB0xC00C \-> 0xC00C\fR).
+T}	T{
+Infinite pointer recursion / CPU DoS
+T}
+\&\fBcompression\-forward\fR	T{
+Compression pointer targeting an unread forward offset in the packet.
+T}	T{
+Out-of-bounds read / illegal pointer
+T}
+\&\fBlabel\-too\-long[=N]\fR	T{
+Sets a domain label length byte to \fBN\fR (\fB63 < N < 192\fR, default: 100).
+T}	T{
+Buffer overflow (> 63 octet RFC limit)
+T}
+\&\fBreserved\-length\-bits\fR	T{
+Sets label length byte to \fB0x40\fR (unallocated RFC 1035 bit pattern).
+T}	T{
+Parser crash on unassigned label types
+T}
+\&\fBoversized\-qname\fR	T{
+Builds a QNAME exceeding 255 total octets using chained subdomains.
+T}	T{
+Domain name buffer overflow
+T}
+\&\fBqdcount=N\fR	T{
+Overrides header \fBQDCOUNT\fR with \fBN\fR (e.g., \fBqdcount=2\fR without
+second question).
+T}	T{
+Question section out-of-bounds reading
+T}
+\&\fBtruncated\-question\fR	T{
+Truncates the wire packet abruptly in the middle of a label or type field.
+T}	T{
+Premature EOF parsing panic
+T}
+\&\fBopt\-rdlen=N\fR	T{
+Overstates OPT record \fBRDLENGTH\fR (e.g., 500 bytes when actual payload is
+small).
+T}	T{
+EDNS0 RDATA boundary overrun
+T}
+\&\fBarcount=N\fR	T{
+Overrides header \fBARCOUNT\fR to indicate non-existent additional records.
+T}	T{
+Additional record array indexing errors
+T}
+\&\fBopcode=N\fR	T{
+Overrides the header \fBOPCODE\fR with \fBN\fR (e.g. an unassigned value such as
+15).
+T}	T{
+Unhandled Opcode crash / state machine
+T}
+\&\fBqr\-bit\fR	T{
+Sets the \fBQR\fR bit to 1 on an outgoing query (sending a response as a query).
+T}	T{
+Server reflection / loop amplification
+T}
+\&\fBnotify\-no\-question\fR	T{
+Sends \fBOPCODE=4\fR (NOTIFY) with \fBQDCOUNT=0\fR.
+T}	T{
+RFC 1996 missing zone question panic
+T}
+\&\fBtoo\-short[=N]\fR	T{
+Sends only the first \fBN\fR bytes of the message (default: 3).
+T}	T{
+Short packet header read violation
+T}
+\&\fBshort\-header[=N]\fR	T{
+Alias for \fBtoo\-short[=N]\fR.
+T}	\&(same as \fBtoo\-short\fR)
+\&\fBtcp\-length\-overclaim[=N]\fR	T{
+(\fITCP only\fR) Prefixes a 2-byte TCP length \fBN\fR bytes larger than sent
+data (default: \fBN=10\fR).
+T}	T{
+TCP frame starvation / hanging worker
+T}
+\&\fBtcp\-zero\-length\fR	T{
+(\fITCP only\fR) Sends a 2-byte TCP length prefix of \fB0\fR.
+T}	T{
+Zero-length packet hang or memory leak
+T}
+\&\fBtcp\-idle\-hold[=SEC]\fR	T{
+(\fITCP only\fR) Sends only the length prefix, holds the connection for up to
+\fBSEC\fR seconds (default: \fBSEC=20\fR) and reports when/if the server
+disconnects.
+T}	T{
+Slowloris / connection pool exhaustion
+T}
+\&\fBupdate\-meta\-type[=N]\fR	T{
+(\fIUPDATE only\fR) Injects a meta-type RR of type \fBN\fR (default: 41 = OPT)
+into the Update Section.
+T}	T{
+Meta-RR validation in dynamic updates
+T}
+.TE
+.PP
+The TCP-only kinds require \fB+tcp\fR (or \fB\-\-tcp\fR).
+.SS Automated Batch Fuzzing
+.TP 8
+\fB\-\-break all\fR, \fB\-\-test\-all\fR
+Sequentially executes the predefined set of built-in anomaly test cases against
+the target server (each with a 1-second timeout and a single try), printing the
+response status or timeout for each test case.
+.TP 8
+\fB\-\-hex=<hexstring>\fR
+Directly transmits the raw hexadecimal byte stream as a DNS packet without
+validation or reconstruction.
+.SH MULTI-SERVER QUERY & CONSISTENCY COMPARISON (+allcompare, +ldnsz)
+\fBdag\fR allows querying multiple nameservers in parallel or sequentially
+within a single invocation.
+.SS Multi-Server Target Syntax
+Multiple servers are specified via a comma-separated list after \fB@\fR:
+.PP
+.RS 2
+.nf
+dag example.com A @192.0.2.1,198.51.100.1,203.0.113.1:5353,[2001:db8::53]
+.fi
+.RE
+.SS Response Equivalence Comparison (+allcompare)
+When more than one response to the same question is collected (several servers,
+or a UDP answer followed by a TCP retry), \fBdag\fR prints a comparison summary
+after the individual answers. Each response is compared with the base response,
+the first complete (non-truncated) response to the same question (QNAME, QTYPE,
+QCLASS) and, for zone transfers, the same message number. The summary is not
+printed for \fB+trace\fR, \fB+trace2\fR and \fB+nssearch\fR, whose responses
+answer different questions (BIND \fBdig\fR prints no such table either);
+\fB+ldnsz\fR still produces the trace viewer URL for them.
+.IP \(bu 2
+\fB[BASE]\fR: The reference response.
+.IP \(bu 2
+\fBMATCH_EXACT\fR: Binary byte-for-byte match (excluding the 16-bit Query ID).
+.IP \(bu 2
+\fBMATCH_SEMANTIC\fR: Same RCODE, and the same set of resource records in the
+answer, authority and additional sections, regardless of record order. By
+default TTLs are ignored.
+.IP \(bu 2
+\fB[DIFF]\fR: Different RCODE or a different record set.
+.PP
+\fB+allcompare\fR makes the semantic comparison stricter: TTLs are included in
+the record hash (column \fBSEM_HASH(+TTL)\fR), so records that differ only in
+their TTL are reported as \fB[DIFF]\fR.
+.PP
+.RS 2
+.nf
+;; === MULTI\-SERVER COMPARISON SUMMARY ===
+SERVER             | PROTO | RCODE   | ANS | AUT | ADD | SEM_HASH   | TIME   | MATCH STATUS
+\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-+\-\-\-\-\-\-\-+\-\-\-\-\-\-\-\-\-+\-\-\-\-\-+\-\-\-\-\-+\-\-\-\-\-+\-\-\-\-\-\-\-\-\-\-\-\-+\-\-\-\-\-\-\-\-+\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-
+192.0.2.1          | UDP   | NOERROR |   1 |   0 |   1 | 0x5A3C19E2 |   12ms | [BASE]
+198.51.100.1       | UDP   | NOERROR |   1 |   0 |   1 | 0x5A3C19E2 |   18ms | MATCH_SEMANTIC
+203.0.113.1#5353   | UDP   | NOERROR |   1 |   0 |   1 | 0x5A3C19E2 |   15ms | MATCH_EXACT
+\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-+\-\-\-\-\-\-\-+\-\-\-\-\-\-\-\-\-+\-\-\-\-\-+\-\-\-\-\-+\-\-\-\-\-+\-\-\-\-\-\-\-\-\-\-\-\-+\-\-\-\-\-\-\-\-+\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-
+.fi
+.RE
+.PP
+.RS 4
+\fBNote on TC (Truncation) Retries:\fR When a query triggers automatic TCP retry
+due to a truncated UDP response (\fBTC=1\fR), \fBdag\fR intentionally displays
+both the UDP response and the TCP retry, and records them as separate rows
+(\fBUDP\fR, then \fBTCP\fR) in the summary table. This allows users to
+explicitly observe and diagnose the transport fallback process (\fBdig\fR prints
+only the TCP answer). The truncated response is never the base: the TCP answer
+is \fB[BASE]\fR and the UDP row is compared with it. With \fB+ldnsz\fR, the diff
+URL carries both messages (UDP first), so the truncated and the complete
+response can be compared side by side.
+.RE
+.SS LDNSZ Web Inspection URLs (+ldnsz)
+When \fB+ldnsz\fR is supplied:
+.IP \(bu 2
+\fBSingle Server\fR: Generates a web inspector URL on
+\fBhttps://ldns.jp/?dnsz=<payload>\fR, allowing detailed GUI analysis of
+wire-format packets.
+.IP \(bu 2
+\fBMultiple Servers\fR: Generates a diff URL on
+\fBhttps://ldns.jp/diff/#c=<payload1>,<payload2>\fR, allowing visual
+side-by-side binary comparison.
+.IP \(bu 2
+\fB\fB+trace\fB\fR: Generates a trace viewer URL on
+\fBhttps://ldns.jp/trace/#c=<payload1>,<payload2>,...\fR (one payload per
+delegation hop, same encoding as the diff URL), allowing the delegation path to
+be inspected step by step.
+.SH DISPLAY & FORMATTING OPTIONS
+.TP 8
+\fB+[no]short\fR
+Provide a terse, machine-readable answer containing only the RDATA of the ANSWER
+section.
+.TP 8
+\fB+[no]multiline\fR, \fB+[no]multi\fR
+Print records (such as SOA, DNSKEY, RRSIG, and HTTPS) in human-readable
+multi-line format with field descriptions and structured comments. Short form
+(\fB+[no]multi\fR) is also supported.
+.TP 8
+\fB+[no]yaml\fR
+Output the parsed DNS messages in the YAML format of \fBdig +yaml\fR. The
+display options apply as in \fBdig\fR: \fB+noall\fR, \fB+[no]question\fR,
+\fB+[no]answer\fR, ... select the sections, \fB+nocomments\fR drops
+\fBOPT_PSEUDOSECTION\fR, \fB+qr\fR prints the query as \fBRECURSIVE_QUERY\fR (or
+\fBAUTH_QUERY\fR with \fB+norec\fR), and \fBquery_time\fR/\fBresponse_time\fR
+carry the real send and receive times (milliseconds). A TSIG or SIG(0) record is
+shown as \fBTSIG_PSEUDOSECTION\fR / \fBSIG0_PSEUDOSECTION\fR.
+.TP 8
+\fB+[no]ttlunits\fR
+Display TTL values using human-friendly time unit suffixes (\fBs\fR, \fBm\fR,
+\fBh\fR, \fBd\fR, \fBw\fR). Implies \fB+ttlid\fR.
+.TP 8
+\fB+[no]class\fR
+Toggle display of the CLASS field in record listings.
+.TP 8
+\fB+[no]ttlid\fR
+Toggle display of the TTL field in record listings.
+.TP 8
+\fB+[no]unknownformat\fR
+Format all record RDATA using RFC 3597 unknown record presentation format
+(\fB\e# <length> <hex>\fR).
+.TP 8
+\fB+[no]crypto\fR
+Toggle display of raw cryptographic key data in DNSKEY, DS, and RRSIG
+records. When disabled, keys are displayed as \fB[ key id = ... ]\fR or
+\fB[omitted]\fR.
+.TP 8
+\fB+[no]rrcomments\fR
+Display explanatory inline comments for DNSSEC records (e.g., Key Tag, algorithm
+name). As in \fBdig\fR, \fB+multiline\fR turns them on unless
+\fB+norrcomments\fR is given: \fB) ; KSK; alg = ECDSAP256SHA256 ; key id =
+23534\fR for DNSKEY/CDNSKEY, \fB); alg = ... ; key id = N\fR for KEY/RKEY, and
+the SOA field comments.
+.TP 8
+\fB+[no]comments\fR
+Toggle display of comment banners (;; ->>HEADER<<-, opcode, status, flags).
+.TP 8
+\fB+[no]cmd\fR
+Toggle printing of the initial command-line version banner.
+.TP 8
+\fB+[no]stats\fR
+Toggle printing of query statistics (query time, server IP, timestamp, message
+size).
+.TP 8
+\fB+[no]question\fR, \fB+[no]answer\fR, \fB+[no]authority\fR, \fB+[no]additional\fR
+Individually toggle display of the respective DNS packet sections.
+.TP 8
+\fB+[no]all\fR
+Turn all display flags (sections, comments, statistics, command banner and the
+hex dumps) on (\fB+all\fR) or off (\fB+noall\fR).
+.TP 8
+\fB+[no]qr\fR
+Print the outgoing query before transmitting. As in \fBdig\fR, the display
+options apply to it, a TSIG record is shown as \fB;; TSIG PSEUDOSECTION:\fR,
+\fB;; QUERY SIZE\fR belongs to \fB+stats\fR, and zone transfer queries are shown
+as plain records.
+.TP 8
+\fB+[no]identify\fR
+When \fB+short\fR is enabled, display the responding server IP and port
+alongside the answer.
+.TP 8
+\fB+[no]idn\fR
+Enable or disable Internationalized Domain Name (IDN) Punycode conversion.
+.TP 8
+\fB+[no]onesoa\fR
+Print only the initial SOA record during AXFR transfers instead of both starting
+and ending SOAs.
+.TP 8
+\fB+[no]expandaaaa\fR
+Display IPv6 AAAA record addresses in fully expanded 8-group notation
+(e.g. \fB2001:0db8:0000:0000:...\fR) instead of compressed notation.
+.TP 8
+\fB+[no]split=N\fR
+Split long base64 and hex strings into chunks of \fBN\fR characters, rounded up
+to a multiple of 4 (default: 56; 44 in multiline mode). \fB+nosplit\fR or
+\fB+split=0\fR disables splitting.
+.TP 8
+\fB+[no]besteffort\fR
+Accepted for \fBdig\fR compatibility. Like \fBdig\fR 9.20, \fBdag\fR prints
+malformed responses with or without it (see Malformed Responses).
+.TP 8
+\fB+[no]showsearch\fR
+Print every lookup of search list processing, including the \fBNXDOMAIN\fR
+answers that make \fBdag\fR try the next candidate (implies \fB+search\fR).
+.TP 8
+\fB+[no]hexdump\fR
+Show (default) or suppress the hex dumps of both the outgoing query and the
+incoming response.
+.TP 8
+\fB+[no]hexdump\-query\fR
+Show or suppress the hex dump of the outgoing query only.
+.TP 8
+\fB+[no]hexdump\-response\fR
+Show or suppress the hex dump of the incoming response only. It also controls
+the dump of a discarded response (see "Default Lookup Behavior").
+.SS dig-compatible message presentation
+.IP \(bu 2
+Records and question lines are laid out like \fBdig\fR 9.20: each field starts
+at a fixed column and is reached with tabs (tab width 8) and spaces, or a single
+space when the previous field already passed the column (BIND
+\fBmasterdump.c\fR). The columns of TTL, class, type and RDATA are 24/32/40/48,
+24/24/32/40 with \fB+nottlid\fR or \fB+noclass\fR, and 24/24/24/32 with
+\fB+multiline\fR or with both \fB+nottlid\fR and \fB+noclass\fR; the question
+line has no TTL and always shows the class. Continuation lines of
+\fB+multiline\fR RDATA are indented to the RDATA column (four tabs). Scripts
+that split the output should split on white space, not on single spaces.
+.IP \(bu 2
+Type 128 (RFC 9824 \fBNXNAME\fR) is printed as \fBTYPE128\fR, as \fBdig\fR 9.20
+does (also in NSEC type bit maps); \fBNXNAME\fR is still accepted as input.
+.IP \(bu 2
+Names are printed in presentation format like \fBdig\fR: besides \fB.\fR and
+\fB\e\fR, the characters \fB"\fR \fB(\fR \fB)\fR \fB;\fR \fB@\fR \fB$\fR are
+escaped (\fBc\e(p.example.\fR), and octets outside 0x21-0x7E as \fB\eDDD\fR, in
+every format (normal, \fB+short\fR, \fB+yaml\fR).
+.IP \(bu 2
+EDNS options appear in the order received: \fBNSID: 6b 61 ("ka")\fR,
+\fBCLIENT\-SUBNET: 192.0.2.0/24/0\fR, \fBCOOKIE: ... (good|bad|echoed)\fR (no
+status when no cookie was sent), \fBEXPIRE: N (duration)\fR, \fBTCP\-KEEPALIVE:
+10.0 secs\fR, \fBPADDING: (N bytes)\fR, \fBEDE: 18 (Prohibited): (text)\fR
+(codes above 24 by number only), and unknown options as \fBOPT=65001: de ad
+("..")\fR. \fBdag\fR sends its own options in \fBdig\fR's order (NSID,
+CLIENT-SUBNET, COOKIE, EXPIRE, TCP-KEEPALIVE, \fB+ednsopt\fR, PADDING).
+.IP \(bu 2
+RCODE names follow \fBdig\fR: the extended RCODE 16 is \fBBADVERS\fR, 11-15 are
+\fBRESERVEDn\fR, other unnamed values \fB?N\fR; the TSIG Error field uses
+\fBBADSIG\fR, \fBBADKEY\fR, \fBBADTIME\fR, ... An unassigned opcode is
+\fBRESERVEDn\fR.
+.IP \(bu 2
+Signature verification failures read like \fBdig\fR: \fB;; Couldn't verify
+signature: tsig indicates error\fR (the server set the TSIG Error), \fBtsig
+verify failure\fR (MAC or key mismatch), \fBclocks are unsynchronized\fR,
+\fBexpected a TSIG or SIG(0)\fR.
+.IP \(bu 2
+Zone transfers are printed as records only; an error answer prints its records
+(for example the TSIG) and \fB; Transfer failed.\fR without
+statistics. AXFR/IXFR queries are sent with RD=0, as \fBdig\fR does.
+.IP \(bu 2
+An empty line precedes the command banner, the first section after the OPT
+pseudosection has no empty line before it, and an empty line follows the
+statistics, as in \fBdig\fR. \fB;; WHEN:\fR uses a zero-padded day (\fBTue Oct
+06 ...\fR).
+.SS Malformed Responses
+\fBdag\fR parses responses with the same outcome as \fBdig\fR 9.20 (BIND
+\fBdns_message_parse()\fR), whether or not \fB+besteffort\fR is given:
+.IP \(bu 2
+An answer shorter than the 12-octet header, with the wrong ID or opcode, or
+whose question differs from the one sent is reported (\fB;; Warning: short (<
+header size) message received\fR, \fB;; Warning: ID mismatch: expected ID N, got
+M\fR, \fB;; Warning: Opcode mismatch: expected QUERY, got STATUS\fR, \fB;; ;;
+Question section mismatch: got NAME/TYPE/CLASS\fR) and ignored; \fBdag\fR keeps
+waiting for the right answer until the timeout (RFC 5452 \[u00A7]9.1). Each
+timed-out attempt prints \fB;; communications error to ADDR#PORT: timed
+out\fR. An answer without the QR bit is accepted with \fB;; Warning: query
+response not set\fR.
+.IP \(bu 2
+Over TCP \fBdag\fR does not wait for another answer, like \fBdig\fR: an answer
+shorter than the header or with the wrong ID ends the lookup with \fB;; ERROR:
+short (< header size) message\fR or \fB;; ERROR: ID mismatch: expected ID N, got
+M\fR, and a question mismatch ends it after the warning; nothing else is printed
+and the exit code is 0. An answer with another opcode is reported and \fBdag\fR
+reads the next message on the same connection; if the server closes it, \fB;;
+communications error to ADDR#PORT: end of file\fR counts as a failed attempt.
+.IP \(bu 2
+With \fB+short\fR the same parse warnings and "Got bad packet" dumps are
+printed, followed by the records that parsed. With \fB+yaml\fR no \fB;;\fR line
+is printed: a message that cannot be parsed prints nothing, a malformed message
+shows only the records (and the OPT pseudo-RR) that parsed, and a lookup that
+gets no usable answer prints a \fB\- type: DIG_ERROR\fR document. The YAML
+\fBtype\fR is \fBRECURSIVE_RESPONSE\fR only when both RD and RA are set, a set Z
+bit is shown as \fBMBZ: 0x4\fR, and an unnamed RCODE as its number.
+.IP \(bu 2
+A name whose compression pointer does not point backwards (loops, forward
+pointers; RFC 1035 \[u00A7]4.1.4), a name that needs more compression pointers
+than BIND 9.20.30 follows (CVE-2026-19630: more than 2 in a row that point at
+pointers, more than 128 for one name, more than 4 per octet of the message over
+all its names), a label of type 01 or 10, or a name longer than 255 octets makes
+the message unusable: \fBdag\fR prints \fB;; Got bad packet: bad compression
+pointer\fR (\fBbad label type\fR, \fBname too long\fR), the size and a dump in
+\fBdig\fR's format, and nothing else.
+.IP \(bu 2
+Running out of data, or RDATA that does not fit its type (A/AAAA length, names
+in NS/CNAME/MX/SOA/SRV/..., TXT strings, SVCB parameters, OPT options), ends the
+parse at that record: \fB;; Warning: Message parser reports malformed message
+packet.\fR, the records before it, and \fB;; WARNING: Message has N extra bytes
+at end\fR counted from the start of the bad RDATA.
+.IP \(bu 2
+A second OPT record, an OPT outside the ADDITIONAL section, more than one
+question, or a record whose class differs from the question's is reported as
+malformed, and the message is still shown (stray OPT records as \fB. 0 CLASS4096
+OPT\fR). A response without a question prints \fB;; missing question section\fR.
+.IP \(bu 2
+Data after the last record only produces the "extra bytes" warning.
+.SH MULTIPLE QUERIES & BATCH PROCESSING
+\fBdag\fR allows specifying multiple query tuples on a single command line:
+.PP
+.RS 2
+.nf
+dag +qr example.com A @192.0.2.53 +subnet=192.0.2.0/24 \-x 192.0.2.1 @198.51.100.53 +noqr
+.fi
+.RE
+.PP
+In this mode:
+.IP \(bu 2
+Options preceding the first domain name tuple act as \fBglobal defaults\fR.
+.IP \(bu 2
+Query-specific options override the global options for that particular query.
+.IP \(bu 2
+Options like \fB+cmd\fR and \fB+short\fR maintain global effect across all
+queries.
+.IP \(bu 2
+As in \fBdig\fR, the \fB; <<>> dag <<>>\fR banner is printed once, for the first
+query.
+.PP
+\fB\-f <file>\fR reads queries from a file, one line at a time, exactly as
+\fBdig\fR 9.20 does: lines starting with \fB#\fR or \fB;\fR and empty lines are
+skipped only before the first query; every later line is parsed as a query line
+(a later \fB; note\fR line queries \fB;.\fR and \fBnote.\fR, a later empty line
+queries \fB. NS\fR, the default query). A line may hold several queries (name /
+type / class tuples, as on the command line). Every line starts from all the
+options given on the command line (transport, display, EDNS, TSIG,
+\fB@server\fR, \fB\-p\fR, ...) and the options on the line override them, except
+\fB+[no]tcp\fR and \fB+[no]vc\fR, which \fBdig\fR 9.20 ignores on batch lines
+(the transport is the one given on the command line); the lines run in one
+process, so \fB+keepopen\fR keeps the TCP/TLS/HTTPS connection open across
+lines. The first query prints the full banner, later lines only the \fB; <<>>
+dag <<>> ...\fR line. The exit status is that of the last line that failed
+(e.g. 9 when its servers could not be reached), 0 when all lines got an answer.
+.PP
+.RS 2
+.nf
+dag @192.0.2.53 +tcp +keepopen +nohexdump \-f queries.txt
+.fi
+.RE
+.SH EXIT STATUS
+.TP 8
+\fB0\fR
+Successful transaction. A valid DNS response was received from the server
+(including \fBNXDOMAIN\fR, \fBREFUSED\fR, or other standard DNS error RCODEs).
+.TP 8
+\fB1\fR
+Usage error, invalid command-line options, or DNS query formulation failure.
+.TP 8
+\fB8\fR
+Could not open batch file specified via \fB\-f\fR.
+.TP 8
+\fB9\fR
+Network error or timeout. No reply was received from any target nameserver.
+.TP 8
+\fB10\fR
+Internal execution error or out of memory.
+.SH FILES
+.TP 8
+\fB/etc/resolv.conf\fR
+Default system nameserver configuration and search domains.
+.TP 8
+\fB${HOME}/.digrc\fR
+User default options applied automatically on every invocation unless \fB\-r\fR
+is provided.
+.SH EXAMPLES
+.SS Basic Lookups
+.RS 2
+.nf
+# Query A record using system resolver
+dag example.com A
+\&
+# Query specific nameserver on custom port
+dag example.com AAAA @127.0.0.1 \-p 5353
+\&
+# Reverse DNS lookup
+dag \-x 192.0.2.53 @127.0.0.1
+.fi
+.RE
+.SS DNSSEC & Extended Protocol Testing
+.RS 2
+.nf
+# Query with DO bit, NSID, and EDNS Client Subnet
+dag example.com A @127.0.0.1 +dnssec +nsid +subnet=203.0.113.0/24
+\&
+# Output structured YAML with microsecond resolution
+dag example.com ANY @127.0.0.1 +yaml \-u
+\&
+# Trace delegation hierarchy from root
+dag example.com A +trace
+\&
+# Resolve like a full resolver, without any local resolver
+dag example.jp A +trace2
+\&
+# Same, showing every query made to resolve glueless nameservers, with QNAME minimisation
+dag example.jp A +trace2=verbose +qmin
+.fi
+.RE
+.SS Multi-Server Comparison & LDNSZ Integration
+.RS 2
+.nf
+# Compare answers across three servers (TTLs included)
+dag example.com A @192.0.2.1,198.51.100.1,203.0.113.1 +allcompare
+\&
+# Generate visual online diff URL
+dag example.com A @192.0.2.1,198.51.100.1 +ldnsz
+.fi
+.RE
+.SS Modern Transports (DoT / DoH / PROXYv2)
+.RS 2
+.nf
+# Query via DNS over TLS (DoT)
+dag example.com A @127.0.0.1 +tls +tls\-ca=/etc/ssl/cert.pem
+\&
+# Query via DNS over HTTPS (DoH) using GET
+dag example.com A @doh.example.net +https\-get
+\&
+# Query via HAProxy PROXYv2 encapsulation
+dag example.com A @127.0.0.1 +proxy=192.0.2.10#45000\-192.0.2.1#53
+.fi
+.RE
+.SS Zone Transfers & Updates
+.RS 2
+.nf
+# Full zone transfer over TCP with TSIG
+dag example.com AXFR @127.0.0.1 \-k /etc/rndc.key
+\&
+# Incremental zone transfer from serial 2026082301
+dag example.com IXFR=2026082301 @127.0.0.1
+\&
+# Dynamic DNS Update (add record with prerequisite)
+dag example.com @127.0.0.1 \-k /etc/rndc.key \e
+    \-\-prereq\-nxdomain newhost.example.com \e
+    \-\-update\-add "newhost.example.com 300 IN A 192.0.2.99"
+\&
+# Dynamic DNS Update with SIG(0) transaction signature (RFC 3007 / RFC 2931)
+dag example.com @127.0.0.1 +sig0\-pkey=key.pem +sig0\-name=update\-key.example.com. \e
+    \-\-update\-add "newhost.example.com 300 IN A 192.0.2.99"
+.fi
+.RE
+.SS Protocol Fuzzing & Anomaly Testing
+.RS 2
+.nf
+# Test server compression loop handling
+dag example.com A @127.0.0.1 \-\-break compression\-loop
+\&
+# Test oversized label handling
+dag example.com A @127.0.0.1 \-\-break label\-too\-long=120
+\&
+# Run complete automated anomaly fuzzing suite
+dag example.com A @127.0.0.1 \-\-test\-all
+.fi
+.RE
+.SH STANDARDS & RFC COMPLIANCE
+\fBdag\fR strictly adheres to IETF RFC standards:
+.IP \(bu 2
+\fBRFC 1034 / RFC 1035\fR: Domain Names \[u2014] Concepts and Implementation
+.IP \(bu 2
+\fBRFC 1995\fR: Incremental Zone Transfer in DNS (IXFR)
+.IP \(bu 2
+\fBRFC 1996\fR: Mechanism for Prompt Notification of Zone Changes (DNS NOTIFY)
+.IP \(bu 2
+\fBRFC 2136\fR: Dynamic Updates in the Domain Name System (DNS UPDATE)
+.IP \(bu 2
+\fBRFC 2931\fR: DNS Request and Transaction Signatures ( SIG(0)s ) (client-side
+transaction signing in \fBdag\fR; server-side verification is out of scope)
+.IP \(bu 2
+\fBRFC 3007\fR: Secure Domain Name System (DNS) Dynamic Update (client-side
+SIG(0) transaction signing in \fBdag\fR; server-side verification is out of
+scope)
+.IP \(bu 2
+\fBRFC 3597\fR: Handling of Unknown DNS Resource Record Types
+.IP \(bu 2
+\fBRFC 4033 / RFC 4034 / RFC 4035\fR: Resource Records for the DNS Security
+Extensions (DNSSEC)
+.IP \(bu 2
+\fBRFC 5001\fR: DNS Name Server Identifier (NSID) Option
+.IP \(bu 2
+\fBRFC 5936\fR: DNS Zone Transfer Protocol (AXFR)
+.IP \(bu 2
+\fBRFC 7050\fR: Discovery of the IPv6 Prefix Used for IPv6 Address Synthesis
+(DNS64)
+.IP \(bu 2
+\fBRFC 7314\fR: Extension Mechanisms for DNS (EDNS) EXPIRE Option
+.IP \(bu 2
+\fBRFC 7766\fR: DNS Transport over TCP - Implementation Requirements
+.IP \(bu 2
+\fBRFC 7828\fR: The edns-tcp-keepalive EDNS0 Option
+.IP \(bu 2
+\fBRFC 7830 / RFC 8467\fR: The EDNS(0) Padding Option & Padding Policies
+.IP \(bu 2
+\fBRFC 7858\fR: Specification for DNS over Transport Layer Security (DoT)
+.IP \(bu 2
+\fBRFC 7871\fR: Client Subnet in DNS Queries (ECS)
+.IP \(bu 2
+\fBRFC 7873 / RFC 9018\fR: Domain Name System (DNS) Cookies
+.IP \(bu 2
+\fBRFC 8484\fR: DNS Queries over HTTPS (DoH)
+.IP \(bu 2
+\fBRFC 8914\fR: Extended DNS Errors (EDE)
+.IP \(bu 2
+\fBRFC 8945\fR: Secret Key Transaction Authentication for DNS (TSIG)
+.IP \(bu 2
+\fBRFC 9460\fR: Service Binding and Parameter Specification via the DNS (SVCB /
+HTTPS RRs)
+.IP \(bu 2
+\fBRFC 10029\fR: Multiple Question Types in DNS Queries (MQTYPE)
+.SH SEE ALSO
+.IP \(bu 2
+\fBkaridns(8)\fR \[u2014] KariDNS authoritative DNS server daemon
+.IP \(bu 2
+\fBkarictl(8)\fR \[u2014] KariDNS server management and control utility
+.IP \(bu 2
+\fBkaricheck(8)\fR \[u2014] Configuration and zone file validation utility
+.IP \(bu 2
+\fBdag\-replay(1)\fR \[u2014] Traffic replay and differential testing (\fBdag
+\-\-replay\fR)
+.IP \(bu 2
+\fBdag.c\fR \[u2014] Source implementation of the DNS Anomaly Generator
+.IP \(bu 2
+\fBKariDNS RFC Guideline\fR \[u2014] Detailed RFC compliance and design boundary
+document
+.SH SECURITY & FUZZING
+.SS Historical Vulnerability Fixes
+.IP \(bu 2
+\fBAPL (TYPE 42) afdlength Stack Buffer Overflow (CWE-121 / CWE-787)\fR:
+\fBformat_rdata_for_display()\fR (used during \fB+yaml\fR formatting and
+\fB+allcompare\fR record hash calculation) copied \fBafdlength\fR bytes into a
+fixed \fBuint8_t addr[16]\fR buffer without upper-bound clamping. Fixed by
+clamping copy length: \fBcopy_len = (afdlength > sizeof(addr)) ? sizeof(addr) :
+afdlength;\fR and emitting a diagnostic indicator \fB[APL afdlength=%u invalid
+for AFI=%u]\fR. Regression testing is automated via
+\fBtests/run_dag_apl_afdlength_overflow_test.sh\fR and continuous fuzzer
+\fBtests/fuzz/fuzz_dag_hash\fR.
+.IP \(bu 2
+\fB\fB+trace\fB CNAME Tracking Stack Exhaustion via Deep Recursion (CWE-674 /
+CWE-789)\fR: \fBrun_trace_query_impl()\fR recursively invoked itself up to
+\fBTRACE_MAX_CNAME_DEPTH\fR (16) times when traversing CNAME delegation
+chains. Each recursive frame allocated ~270 KB of stack buffers
+(\fBroot_qbuf\fR, \fBroot_resp\fR, \fBqbuf\fR, \fBresp\fR at 65,535 bytes each
+plus local arrays), consuming up to 4.3 MB of stack under unoptimized
+(\fB\-O0\fR) or instrumented (ASan/TSan) builds where Tail Call Optimization
+(TCO) is inhibited. Fixed by converting the CNAME resolution into an iterative
+loop (\fBcname_depth\fR loop) and allocating the four 65 KB I/O buffers on the
+heap with guaranteed cleanup, reducing per-call stack usage to a single ~16 KB
+frame. Since then \fB+trace\fR no longer follows CNAMEs at all (it stops at the
+CNAME answer like BIND \fBdig\fR 9.20; chains are followed by \fB+trace2\fR,
+which bounds them at 16 links and detects loops). Regression testing is
+automated via \fBtests/run_dag_trace_deep_cname_stack_test.sh\fR.
+.SS Fuzzing & Differential Test Harnesses
+\fBmake fuzz_dag_all\fR builds the following libFuzzer harnesses (\fBsh
+tests/run_fuzz_smoke_test.sh dag\fR runs a short smoke test of them):
+.PP
+.TS
+lbw(27) lbw(14) lbw(27)
+lw(27) lw(14) lw(27).
+\&Target	\&Description	\&Scope
+_
+T{
+\fBfuzz_dag\fR (\fBfuzz_dag_response\fR)
+T}	T{
+Response parser and display
+T}	T{
+Response decoding and dig-style formatting
+T}
+\&\fBfuzz_dag_hash\fR	T{
+Packet semantic hash & RDATA formatting
+T}	T{
+\fBcalculate_packet_hashes()\fR \[u2192] \fBformat_rdata_for_display()\fR
+T}
+\&\fBfuzz_dag_iter_classify\fR	T{
+\fB+trace2\fR response classification
+T}	T{
+\fBdag_iter_classify()\fR: CNAME/DNAME chains, referral and glue extraction with
+bailiwick checks, SOA detection
+T}
+\&\fBfuzz_dag_replay_pcap_reader\fR	T{
+\fB\-\-replay\fR PCAP frame decoder
+T}	T{
+Link-layer (Ethernet, Linux SLL / SLL2, raw, NULL, LOOP) / IP / UDP / TCP
+decoding
+T}
+\&\fBfuzz_dag_replay_diff\fR	T{
+\fB\-\-replay\fR differential engine
+T}	\&\fBdiff_dns_responses()\fR
+\&\fBfuzz_dag_tcp_reassembly\fR	T{
+TCP stream reassembly for PCAP replay
+T}	T{
+Segment ordering and DNS-over-TCP framing
+T}
+\&\fBfuzz_dag_chunked_http\fR	T{
+DoH HTTP/1.1 chunked transfer decoder
+T}	T{
+\fBdecode_http_response_body()\fR boundary values
+T}
+\&\fBfuzz_dag_rdata_yaml\fR	T{
+Direct RDATA parser & display formatter
+T}	T{
+\fBformat_rdata_for_display()\fR with \fBdopt=NULL\fR and \fB+yaml\fR
+T}
+\&\fBfuzz_dag_axfr_stream\fR	T{
+Multi-message AXFR streaming state machine
+T}	T{
+Stateful multi-packet \fBaxfr_state_t\fR sequence transitions
+T}
+\&\fBfuzz_dag_cli_args\fR	T{
+Command-line option & malformation parser
+T}	T{
+\fBparse_arg_slice()\fR, \fBparse_break_arg()\fR
+T}
+\&\fBfuzz_dag_batch_file\fR	T{
+Batch query file (\fB\-f\fR) tokenizer & parser
+T}	T{
+Line tokenizer and token boundary validation
+T}
+\&\fBrr_differential_test.pl\fR	T{
+Structured RR semantic oracle / diff test
+T}	T{
+NAPTR, SRV, SOA, CAA, MX field transpositions
+T}
+.TE
+.SH AUTHORS
+Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)

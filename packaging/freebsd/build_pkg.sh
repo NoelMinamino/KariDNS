@@ -2,10 +2,10 @@
 set -e
 
 # build_pkg.sh - Build a FreeBSD .pkg package for KariDNS & tools
-# Usage: ./packaging/freebsd/build_pkg.sh [--db none|sqlite3|postgresql|both] [version] [output_dir]
+# Usage: ./packaging/freebsd/build_pkg.sh [--db none|sqlite3|postgresql|both] [--no-build] [version] [output_dir]
 #
 # The server and the tools are the same in every package; --db only decides whether karidns-dbloader (the database
-# loader, docs/karidns-dbloader.md) is built and installed, with which drivers, and which dependencies come with it
+# loader, docs/karidns-dbloader.md) and karidns-zone are built and installed, with which drivers, and which dependencies come with them
 # (beta design 1.6):
 #
 #   --db none        (default)  karidns             no loader                      no database dependency
@@ -13,20 +13,26 @@ set -e
 #   --db postgresql             karidns-postgresql  PostgreSQL driver              databases/postgresqlNN-client (libpq)
 #   --db both                   karidns-db          both drivers                   both
 #
-# The four packages install the same files, so pkg refuses to install a second one over the first (a file conflict; the
-# manifest key `conflicts` is not used: pkg 2.x cannot register a conflict with a package that is not installed).  NN of postgresqlNN-client is
-# the version of the package that provides the libpq the loader was linked against (found with ldd and pkg which); the
-# build host decides, nothing is hard-coded.  Run once per package (each run rebuilds everything: `make clean`).
+# The files are staged with `make install-... DESTDIR=<stage>` (the Makefile is the one list of what goes where) and the package lists what
+# was staged, with its modes and the owner root:wheel (packaging/freebsd/pkg_files.sh).  The four packages hold the same files and conflict
+# with each other: `pkg add` refuses the second one because of the overlap of the files (pkg 2.8 does not act on the `conflicts` the manifest lists); the database packages provide karidns-zone, which karidns-signer
+# and karidns-webadmin require.  The packages create the user and group karidns (pre-install, no login, no home) and the directory
+# /var/run/karidns (root:wheel 0755; /var/log/named is made by the rc script for the user of the configuration); the user is left when the package is removed
+# (docs/distribution.md "The user karidns").  NN of postgresqlNN-client is the version of the package that provides the libpq the loader
+# was linked against (found with ldd and pkg which); the build host decides, nothing is hard-coded.  Run once per package (each run rebuilds
+# everything: `make clean`).  --no-build packages the binaries that are already built in the tree (tests/run_install_test.sh).
 
 usage() {
     awk 'NR >= 4 && /^#/ { print; next } NR >= 4 { exit }' "$0" | sed 's/^# \{0,1\}//'
 }
 
 DB=none
+BUILD=yes
 while [ $# -gt 0 ]; do
     case "$1" in
         --db) DB="${2:-}"; shift 2 ;;
         --db=*) DB="${1#--db=}"; shift ;;
+        --no-build) BUILD=no; shift ;;
         -h|--help) usage; exit 0 ;;
         --) shift; break ;;
         -*) echo "build_pkg.sh: unknown option $1" >&2; usage >&2; exit 2 ;;
@@ -43,21 +49,29 @@ esac
 
 VERSION_ARG="${1:-}"; . packaging/version.sh   # the file VERSION when no number is given
 OUT_DIR="${2:-./dist}"
+. packaging/freebsd/pkg_files.sh
 
 ARCH=$(pkg config ABI 2>/dev/null || echo "FreeBSD:$(uname -r | cut -d. -f1):$(uname -m)")
 ABI_SUFFIX=$(echo "$ARCH" | tr ':' '-')
-STAGE_DIR="$(mktemp -d -t karidns-pkg-stage)"
-MANIFEST_DIR="$(mktemp -d -t karidns-pkg-manifest)"
 
-echo "==> Building KariDNS binaries for FreeBSD (${ARCH}, version ${VERSION}, package ${PKG_NAME})..."
-# --march=none: portable baseline ISA, not the build host CPU (-march=native); the drivers are the package's (docs/building.md)
-./configure --march=none --with-db-drivers="${DRIVERS:-none}"
-make clean
-make VERSION="${VERSION}" all
+if [ "$BUILD" = yes ]; then
+    echo "==> Building KariDNS binaries for FreeBSD (${ARCH}, version ${VERSION}, package ${PKG_NAME})..."
+    # --march=none: portable baseline ISA, not the build host CPU (-march=native); the drivers are the package's (docs/building.md)
+    ./configure --march=none --with-db-drivers="${DRIVERS:-none}"
+    make clean
+    make VERSION="${VERSION}" all
+    if [ -n "$DRIVERS" ]; then
+        make VERSION="${VERSION}" karidns-dbloader
+        # karidns-zone (the importer and exporter, docs/karidns-zone.md) is linked with the same drivers
+        make VERSION="${VERSION}" karidns-zone
+    fi
+else
+    echo "==> Packaging the KariDNS binaries of the tree (${ARCH}, version ${VERSION}, package ${PKG_NAME}; --no-build)..."
+    for b in karidns karictl karicheck karidns-tapstat dag $( [ -n "$DRIVERS" ] && echo karidns-dbloader karidns-zone ); do
+        [ -x "$b" ] || { echo "ERROR: $b is not built (--no-build)" >&2; exit 1; }
+    done
+fi
 if [ -n "$DRIVERS" ]; then
-    make VERSION="${VERSION}" karidns-dbloader
-    # karidns-zone (the importer and exporter, docs/karidns-zone.md) is linked with the same drivers
-    make VERSION="${VERSION}" karidns-zone
     # the loader must report exactly the drivers of the package (the server refuses a driver the loader does not have)
     GOT=$(./karidns-dbloader --drivers | tr '\n' ' ' | sed 's/ $//')
     if [ "$GOT" != "$DRIVERS" ]; then
@@ -125,81 +139,47 @@ for d in $DRIVERS; do
     fi
 done
 
-echo "==> Preparing staging root..."
-mkdir -p "${STAGE_DIR}/usr/local/sbin"
-mkdir -p "${STAGE_DIR}/usr/local/bin"
-mkdir -p "${STAGE_DIR}/usr/local/etc/rc.d"
-mkdir -p "${STAGE_DIR}/usr/local/etc/karidns/zones"
-mkdir -p "${STAGE_DIR}/usr/local/share/doc/karidns"
+STAGE_DIR="$(mktemp -d -t karidns-pkg-stage)"
+MANIFEST_DIR="$(mktemp -d -t karidns-pkg-manifest)"
+trap 'rm -rf "${STAGE_DIR}" "${MANIFEST_DIR}"' EXIT
 mkdir -p "${OUT_DIR}"
 
-# Install binaries
-install -m 0755 karidns "${STAGE_DIR}/usr/local/sbin/karidns"
-install -m 0755 karictl "${STAGE_DIR}/usr/local/bin/karictl"
-install -m 0755 karicheck "${STAGE_DIR}/usr/local/bin/karicheck"
-install -m 0755 karidns-tapstat "${STAGE_DIR}/usr/local/bin/karidns-tapstat"
-install -m 0755 dag "${STAGE_DIR}/usr/local/bin/dag"
+echo "==> Staging with make install (DESTDIR=${STAGE_DIR})..."
+# the server, the tools and dag, their manual pages and manuals; with a loader, the database parts as well
+TARGETS="install-server install-dag install-man-server install-man-dag install-docs-server install-docs-dag"
+[ -z "$DRIVERS" ] || TARGETS="$TARGETS install-db install-man-db install-docs-db"
+# shellcheck disable=SC2086
+pkg_stage "${STAGE_DIR}" DB_DRIVERS="${DRIVERS}" $TARGETS
 
-# Install rc.d script
-install -m 0555 packaging/freebsd/rc.d/karidns "${STAGE_DIR}/usr/local/etc/rc.d/karidns"
-
-# Install sample configuration & sample zone
-install -m 0644 karidns.conf.sample "${STAGE_DIR}/usr/local/etc/karidns/karidns.conf.sample"
-install -m 0644 karictl.conf.sample "${STAGE_DIR}/usr/local/etc/karidns/karictl.conf.sample"
-install -m 0644 packaging/freebsd/zones/example.test.zone.sample "${STAGE_DIR}/usr/local/etc/karidns/zones/example.test.zone.sample"
-
-# Install the manuals
-for m in karidns karictl karicheck karidns-tapstat dag dag_replay; do
-    install -m 0644 "docs/${m}.md" "${STAGE_DIR}/usr/local/share/doc/karidns/${m}.md"
+# metadata: the other three packages conflict; the database packages provide karidns-zone (karidns-signer and karidns-webadmin require it)
+CONFLICTS=""
+for p in karidns karidns-sqlite3 karidns-postgresql karidns-db; do
+    [ "$p" = "$PKG_NAME" ] || CONFLICTS="${CONFLICTS}${CONFLICTS:+, }\"$p\""
 done
-
-# The database loader, its manual and the SQL files (extension tables, change-log triggers, role script) of the drivers it has.
-# The loader is installed where `loader-path` points by default; it has to be owned by root and not writable by group or others
-# (karidns checks that), so the manifest names the owner instead of relying on the user who ran this script.
-DB_FILES=""
+PROVIDES="\"karicheck\""
 DB_DESC=""
 if [ -n "$DRIVERS" ]; then
-    mkdir -p "${STAGE_DIR}/usr/local/libexec"
-    mkdir -p "${STAGE_DIR}/usr/local/share/karidns/db"
-    install -m 0555 karidns-dbloader "${STAGE_DIR}/usr/local/libexec/karidns-dbloader"
-    install -m 0644 docs/karidns-dbloader.md "${STAGE_DIR}/usr/local/share/doc/karidns/karidns-dbloader.md"
-    # karidns-zone runs as an ordinary user, so it goes to bin (not to libexec like the loader)
-    install -m 0755 karidns-zone "${STAGE_DIR}/usr/local/bin/karidns-zone"
-    install -m 0644 docs/karidns-zone.md "${STAGE_DIR}/usr/local/share/doc/karidns/karidns-zone.md"
-    DB_FILES="    /usr/local/libexec/karidns-dbloader: { uname: \"root\", gname: \"wheel\", perm: \"0555\" },
-    /usr/local/bin/karidns-zone: { uname: \"root\", gname: \"wheel\", perm: \"0555\" },
-    /usr/local/share/doc/karidns/karidns-zone.md: { uname: \"root\", gname: \"wheel\", perm: \"0644\" },
-    /usr/local/share/doc/karidns/karidns-dbloader.md: { uname: \"root\", gname: \"wheel\", perm: \"0644\" },"
-    SQL_FILES=""
-    for d in $DRIVERS; do
-        case "$d" in
-            sqlite3)    SQL_FILES="${SQL_FILES} db/karidns_ext.sqlite3.sql db/karidns_ext_v1_to_v2.sqlite3.sql db/karidns_audit.sqlite3.sql db/karidns_auth.sqlite3.sql" ;;
-            postgresql) SQL_FILES="${SQL_FILES} db/karidns_ext.pgsql.sql db/karidns_ext_v1_to_v2.pgsql.sql db/karidns_loader_role.pgsql.sql db/karidns_writer_role.pgsql.sql db/karidns_api_role.pgsql.sql db/karidns_check_role.pgsql.sql db/karidns_signer_role.pgsql.sql" ;;
-        esac
-    done
-    for f in $SQL_FILES; do
-        install -m 0644 "$f" "${STAGE_DIR}/usr/local/share/karidns/db/$(basename "$f")"
-        DB_FILES="${DB_FILES}
-    /usr/local/share/karidns/db/$(basename "$f"): { uname: \"root\", gname: \"wheel\", perm: \"0644\" },"
-    done
+    PROVIDES="${PROVIDES}, \"karidns-zone\""
     DB_DESC="This package includes karidns-dbloader and karidns-zone with the driver(s): ${DRIVERS}."
 fi
 
 echo "==> Generating +MANIFEST..."
 printf '%s\n' "$DEPS" | sed '/^$/d' > "${MANIFEST_DIR}/deps.txt"
-printf '%s\n' "$DB_FILES" | sed '/^$/d' > "${MANIFEST_DIR}/dbfiles.txt"
+pkg_files "${STAGE_DIR}" > "${MANIFEST_DIR}/files.txt"
 printf '%s\n' "$DB_DESC" | sed '/^$/d' > "${MANIFEST_DIR}/dbdesc.txt"
 sed -e "s/__VERSION__/${VERSION}/g" \
     -e "s/__ARCH__/${ARCH}/g" \
     -e "s/__NAME__/${PKG_NAME}/g" \
-    packaging/freebsd/MANIFEST.in | tr -d '\r' | awk -v dd="${MANIFEST_DIR}/deps.txt" -v df="${MANIFEST_DIR}/dbfiles.txt" -v dc="${MANIFEST_DIR}/dbdesc.txt" '
+    -e "s/__CONFLICTS__/${CONFLICTS}/g" \
+    -e "s/__PROVIDES__/${PROVIDES}/g" \
+    packaging/freebsd/MANIFEST.in | tr -d '\r' | awk -v dd="${MANIFEST_DIR}/deps.txt" -v ff="${MANIFEST_DIR}/files.txt" -v dc="${MANIFEST_DIR}/dbdesc.txt" '
     function put(f,   l) { while ((getline l < f) > 0) print l; close(f) }
     $0 == "__DEPS__" { put(dd); next }
-    $0 == "__DB_FILES__" { put(df); next }
+    $0 == "__FILES__" { put(ff); next }
     $0 == "__DB_DESC__" { put(dc); next }
     { print }' > "${MANIFEST_DIR}/+MANIFEST"
 
-rm -f "${MANIFEST_DIR}"/deps.txt "${MANIFEST_DIR}"/dbfiles.txt "${MANIFEST_DIR}"/dbdesc.txt
+rm -f "${MANIFEST_DIR}"/deps.txt "${MANIFEST_DIR}"/files.txt "${MANIFEST_DIR}"/dbdesc.txt
 echo "==> Creating FreeBSD pkg..."
 pkg create -m "${MANIFEST_DIR}" -r "${STAGE_DIR}" -o "${OUT_DIR}"
 
@@ -209,9 +189,6 @@ PKG_TARGET="${OUT_DIR}/${PKG_NAME}-${VERSION}-${ABI_SUFFIX}.pkg"
 if [ -f "$PKG_DEFAULT" ]; then
     mv "$PKG_DEFAULT" "$PKG_TARGET"
 fi
-
-# Cleanup
-rm -rf "${STAGE_DIR}" "${MANIFEST_DIR}"
 
 echo "==> Successfully created FreeBSD package in ${OUT_DIR}:"
 ls -lh "${OUT_DIR}/${PKG_NAME}-${VERSION}"*.pkg*

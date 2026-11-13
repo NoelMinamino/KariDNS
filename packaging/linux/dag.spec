@@ -29,13 +29,15 @@ test -f dag || make dag
 
 %install
 rm -rf %{buildroot}
-mkdir -p %{buildroot}%{_bindir}
-install -m 0755 dag %{buildroot}%{_bindir}/dag
+# dag and its manual page, from the list of the Makefile (docs/building.md "Installing"); rpmbuild compresses the page
+make install-dag install-man-dag DESTDIR=%{buildroot} PREFIX=%{_prefix} BINDIR=%{_bindir} MANDIR=%{_mandir} BINMODE=0755 MANCOMPRESS=no
 
 %files
 %license LICENSE
 %doc README.md docs/dag.md
 %{_bindir}/dag
+%{_mandir}/man1/dag-replay.1*
+%{_mandir}/man1/dag.1*
 
 %changelog
 * Sun Aug 23 2026 Noel Minamino <noel@karidns.org> - 1.0.0-1

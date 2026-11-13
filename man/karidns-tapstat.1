@@ -1,0 +1,252 @@
+.TH KARIDNS\-TAPSTAT 1 "2026-11-13" "KariDNS" "KariDNS Manual"
+.\" Generated from docs/karidns-tapstat.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
+.SH NAME
+karidns\-tapstat \- Aggregates the dnstap stream of \fBkaridns\fR into periodic
+query statistics
+.SH SYNOPSIS
+.RS 2
+.nf
+karidns\-tapstat \-s socket [options]
+karidns\-tapstat \-r file [options]
+karidns\-tapstat \-V | \-h
+.fi
+.RE
+.SH DESCRIPTION
+\fBkaridns\-tapstat\fR is the "query analytics" tool of KariDNS. The server does
+not analyse queries itself (nothing is added to the query path beyond the
+existing counters and dnstap <https://dnstap.info/>); this separate program
+consumes the dnstap stream and counts, per interval:
+.IP \(bu 2
+the \fBzone\fR the query belongs to,
+.IP \(bu 2
+the query name (\fBqname\fR),
+.IP \(bu 2
+the query type (\fBqtype\fR),
+.IP \(bu 2
+the response code (\fBrcode\fR), and
+.IP \(bu 2
+the \fBclient prefix\fR (the client address cut to /24 for IPv4 and /56 for
+IPv6).
+.PP
+It works in one of two ways:
+.IP \(bu 2
+\fB\-s socket\fR \[u2014] it listens on a UNIX domain socket as a \fBFrame
+Streams\fR receiver. \fBkaridns\fR (or any dnstap sender) connects to that
+socket (\fBdnstap { socket "..."; }\fR), the two sides run the bidirectional
+handshake (the sender's READY, the receiver's ACCEPT, the sender's START), data
+frames follow, and the sender ends with STOP, which the receiver answers with
+FINISH. Every \fB\-i\fR seconds it writes a summary and starts over. A sender
+that goes away is simply reconnected by \fBkaridns\fR; several senders may be
+connected at once (up to 16), and their frames are added together.
+.IP \(bu 2
+\fB\-r file\fR \[u2014] it reads a Frame Streams file (START, data frames,
+optional STOP; \fB\-\fR reads standard input) and writes one summary at the end.
+.PP
+The summary goes to standard output, or, with \fB\-o\fR, into a file that is
+replaced atomically. Nothing is uploaded or sent anywhere: files and standard
+output only.
+.PP
+\fBkaridns\-tapstat\fR is an ordinary unprivileged process (it is not in
+Capsicum capability mode). Run it as its own user. It is a POSIX program
+(FreeBSD, Linux, macOS); it is not part of the Windows build of \fBdag\fR.
+.SS Input is untrusted
+Everything on the socket and in the file is treated as hostile: Frame Streams
+lengths are capped before a buffer is sized from them (data frames 256 KiB,
+control frames 512 bytes), every protobuf field is bounds-checked, only the DNS
+header and question are read from the embedded DNS message, and a sender that
+breaks the protocol (data before START, a wrong content type, an oversized
+frame, ...) has its connection closed with a message on standard error. A sender
+that does not finish the handshake within 5 seconds is dropped. The content type
+accepted is \fBprotobuf:dnstap.Dnstap\fR.
+.SS What is counted
+\fBkaridns\fR sends \fBAUTH_QUERY\fR and \fBAUTH_RESPONSE\fR messages (\fBdnstap
+{ log\-queries yes; log\-responses yes; }\fR; both by default).
+.IP \(bu 2
+The zone, qname, qtype and client tables count the messages of one type, chosen
+with \fB\-t\fR: \fBresponse\fR (default) or \fBquery\fR. With \fB\-t response\fR
+the messages of the other type are only counted in the totals. If \fBkaridns\fR
+is set to log queries only, use \fB\-t query\fR.
+.IP \(bu 2
+The rcode table always counts \fBAUTH_RESPONSE\fR messages (a query has no
+response code). It is the low four bits of the DNS header (RFC 1035 section
+4.1.1); the EDNS extended part (RFC 6891) is not added.
+.IP \(bu 2
+\fBZone\fR: with \fB\-z\fR (or \fB\-Z\fR) the zone is the longest listed name
+that the query name is at or below (compared label by label, case-insensitive);
+a name below none of them is \fBother\fR. Without a zone list, the zone that the
+server put into the dnstap message (\fBquery_zone\fR) is used; a message without
+one (REFUSED, ...) is \fBother\fR.
+.IP \(bu 2
+\fBClient prefix\fR: the \fBquery_address\fR of the message. An IPv4-mapped IPv6
+address (\fB::ffff:a.b.c.d\fR) is counted as IPv4. \fB\-4\fR and \fB\-6\fR
+change the prefix lengths.
+.IP \(bu 2
+The query name is lower-cased and written in master-file notation (a dot inside
+a label as \fB\e.\fR, unprintable bytes as \fB\eDDD\fR). It is read from the
+question of the message, which must not be compressed; a message whose question
+is malformed is counted under \fBmalformed\fR and not in the name tables.
+.SS Bounded memory
+Each of the five tables holds at most \fB\-k\fR keys (default 10000; qname keys
+take about 280 bytes each, so \fB\-k 1000000\fR needs roughly 300 MB for that
+table; the other tables are much smaller). The tables use the \fBSpace-Saving\fR
+algorithm (Metwally, Agrawal and El Abbadi, "Efficient Computation of Frequent
+and Top-k Elements in Data Streams", 2005): while there is room a new key is
+added; when the table is full, a key that is not in it replaces the kept key
+with the smallest count and inherits that count, then counts its own
+event. Memory is fixed by \fB\-k\fR (a min-heap and a hash index, nothing
+allocated per event, O(log k) per event). The result is a list of the heaviest
+keys of the interval that does not depend on the order of arrival: a heavy name
+that first appears after the table filled up still gets into the list. The price
+is that a count may be too high. For every listed key the true count lies
+between \fBcount \- error\fR and \fBcount\fR; \fBerror\fR is the count the key
+inherited when it replaced another key (0 for a key that was never in
+doubt). Every key whose true count is above \fBevents / k\fR is certainly in the
+list, and the counts of all kept keys add up to \fBevents\fR. \fBevictions\fR is
+the number of events that replaced a key; with 0 evictions all counts are
+exact. Choose \fB\-k\fR large enough that the keys you care about stay well
+above \fBevents / k\fR. The tables are reset after every summary, so memory
+never grows with time. The hash of the tables is keyed with a random value drawn
+at start, so names cannot be chosen to collide.
+.SH OPTIONS
+.TP 8
+\fB\-s socket\fR
+Listen on this UNIX socket. A stale socket file of an earlier run is removed; a
+socket that another process still listens on, or any other kind of file, is an
+error. The file is created with mode \fB660\fR (see \fB\-m\fR) and removed again
+on exit. A UNIX socket path holds at most 103 bytes.
+.TP 8
+\fB\-r file\fR
+Read a Frame Streams file. \fB\-\fR is standard input.
+.TP 8
+\fB\-z names\fR
+Comma-separated zone names (\fBexample.test,example.org\fR). May be given more
+than once. Names are written without escapes; \fB.\fR is the root zone.
+.TP 8
+\fB\-Z file\fR
+Zone names, one per line; \fB#\fR starts a comment.
+.TP 8
+\fB\-i seconds\fR
+Summary interval for \fB\-s\fR, 1 to 86400 (default 60). Not used with
+\fB\-r\fR.
+.TP 8
+\fB\-f format\fR
+\fBtext\fR (default), \fBjson\fR (one line per summary) or \fBprom\fR
+(Prometheus text exposition format).
+.TP 8
+\fB\-o file\fR
+Write each summary to this file, replacing the previous one: the text is written
+to \fBfile.tmp.<pid>\fR in the same directory and renamed, so a reader (for
+instance the node_exporter textfile collector) never sees a half-written
+file. The file is created with mode 644. Without \fB\-o\fR, summaries are
+appended to standard output.
+.TP 8
+\fB\-k n\fR
+Keys kept per dimension, 1 to 1000000 (default 10000).
+.TP 8
+\fB\-n n\fR
+Entries printed per dimension, most frequent first (default 20; 0 = all that are
+kept).
+.TP 8
+\fB\-t type\fR
+\fBresponse\fR (default) or \fBquery\fR: the message type counted for zone,
+qname, qtype and client.
+.TP 8
+\fB\-4 bits\fR, \fB\-6 bits\fR
+Client prefix lengths, 0 to 32 (default 24) and 0 to 128 (default 56).
+.TP 8
+\fB\-m mode\fR
+Octal permission of the socket file (default \fB660\fR). The sender
+(\fBkaridns\fR) must be able to connect to the socket: the Backend of
+\fBkaridns\fR connects through its unprivileged broker, so give the socket a
+group or mode that the user of \fBkaridns\fR can write to.
+.TP 8
+\fB\-V\fR, \fB\-\-version\fR
+Print the version.
+.TP 8
+\fB\-h\fR, \fB\-\-help\fR
+Print the usage.
+.PP
+On \fBSIGINT\fR or \fBSIGTERM\fR the summary of the interval in progress is
+written and the program exits.
+.PP
+The exit status is 0, 1 for a runtime error (a bad file, a protocol error in a
+file, a failing output) and 2 for a usage error.
+.SH OUTPUT
+.SS text
+.RS 2
+.nf
+karidns\-tapstat 2026\-11\-11T12:00:00Z \- 2026\-11\-11T12:01:00Z (60.0 s)
+frames 1204  bad 0  queries 0  responses 1204  other\-messages 0  no\-question 0  malformed 0
+zone: events 1204  keys 2  evictions 0
+         900  example.test.
+         304  other
+qname: events 1204  keys 87  evictions 0
+         211  www.example.test.
+         ...
+qtype: events 1204  keys 4  evictions 0
+         ...
+rcode: events 1204  keys 3  evictions 0
+         ...
+client: events 1204  keys 5  evictions 0
+         610  192.0.2.0/24
+         ...
+.fi
+.RE
+.PP
+A key that may be over-counted is followed by \fB(may be over\-counted by up to
+E)\fR; see "Bounded memory". \fBframes\fR is the number of dnstap frames,
+\fBbad\fR those that could not be decoded, \fBother\-messages\fR those of a
+message type that is neither query nor response, \fBno\-question\fR messages
+with an empty question section, \fBmalformed\fR those whose question could not
+be read.
+.SS json
+One JSON object per summary on one line: \fBstart\fR, \fBend\fR, \fBseconds\fR,
+the counters above (\fBframes\fR, \fBbad_frames\fR, \fBqueries\fR,
+\fBresponses\fR, \fBother_messages\fR, \fBno_question\fR, \fBmalformed\fR) and
+\fBdimensions\fR, an object with \fBzone\fR, \fBqname\fR, \fBqtype\fR,
+\fBrcode\fR and \fBclient\fR, each
+\fB{"events":N,"keys":N,"evictions":N,"top":[{"key":"...","count":N,"error":N},...]}\fR;
+\fBcount\fR may be too high by up to \fBerror\fR (Space-Saving).
+.SS prom
+Gauges for the interval just ended (the counters restart after every summary, so
+they are not Prometheus counters): \fBkaridns_tapstat_interval_seconds\fR,
+\fBkaridns_tapstat_last_summary_timestamp_seconds\fR,
+\fBkaridns_tapstat_messages{kind=...}\fR,
+\fBkaridns_tapstat_events{dimension=...,kind="total"|"evictions"}\fR,
+\fBkaridns_tapstat_count{dimension=...,key=...}\fR for the most frequent keys
+and \fBkaridns_tapstat_count_error{dimension=...,key=...}\fR for the over-count
+bound of each key where it is not 0. Label values are escaped as the format
+requires (\fB\e\e\fR, \fB\e"\fR, \fB\en\fR). With \fB\-o\fR into the textfile
+directory of node_exporter this gives query statistics without opening another
+port.
+.SH EXAMPLES
+Statistics of two zones as a Prometheus textfile, refreshed every minute:
+.PP
+.RS 2
+.nf
+karidns\-tapstat \-s /var/run/karidns/tapstat.sock \-z example.test,example.org \-i 60 \-f prom \-o /var/tmp/karidns_tapstat.prom
+.fi
+.RE
+.PP
+with, in \fBkaridns.conf\fR:
+.PP
+.RS 2
+.nf
+dnstap {
+    socket "/var/run/karidns/tapstat.sock";
+    log\-responses yes;
+};
+.fi
+.RE
+.PP
+The 50 most asked names of a recorded Frame Streams file, as JSON:
+.PP
+.RS 2
+.nf
+karidns\-tapstat \-r queries.fstrm \-f json \-n 50
+.fi
+.RE
+.SH SEE ALSO
+\fBkaridns(8)\fR, \fBdag\-replay(1)\fR (replays the same dnstap files), dnstap
+<https://dnstap.info/>, the Frame Streams protocol (libfstrm,
+\fBfstrm_capture\fR).

@@ -50,7 +50,7 @@ From a source tree (no package): `cd webadmin && npm ci --ignore-scripts`, then 
 | `/usr/local/etc/karidns/karidns-webadmin.conf` | root:karidns-webadmin, 0640 | the settings (no secret) |
 | `api.conninfo`, `check.conninfo` (PostgreSQL) | karidns-webadmin, **0600** | the connection of the roles `karidns_api` and the check role, with passwords if the database needs them; `--check` and the start refuse any other owner or mode |
 | `/usr/local/libexec/karidns-webadmin/webadmin/ui/` | root, 0444 files in 0755 directories | the files of the web interface (`ui-dir`); read once at the start, served under `/` and `/ui/` |
-| `/var/db/karidns-webadmin/totp.key` | karidns-webadmin, **0600** | the AES-256 key that wraps the TOTP secrets in the database; made at the first start; the directory is made by the rc script (0700) |
+| `/var/db/karidns-webadmin/totp.key` | karidns-webadmin, **0600** | the AES-256 key that wraps the TOTP secrets in the database; made at the first start; the directory is made by the rc script at the start (0700) when it is missing and its parent exists; an existing directory is never changed, and a `.` or `..` component or a symbolic link in its path is refused |
 | the auth file, `auth.sqlite3` (SQLite3) | karidns-webadmin, **0600** | users, password hashes, grants, sessions, tokens, templates; `--check` refuses a wider mode |
 | the zone file, `zones.sqlite3` (SQLite3) | karidns-webadmin, group of the loader, 0660, directory writable by that group | the zones; SQLite3 opens it read-write even to read (WAL mode) |
 | `tls.key` (only for the built-in TLS) | karidns-webadmin, **0600** | the certificate key; `--check` refuses any other owner or mode |
@@ -475,4 +475,4 @@ Zone of 1,000 records, one page of 500: 5 to 7 ms (SQLite3), 8 to 17 ms (Postgre
 
 ## SEE ALSO
 
-[User manual of the web interface](karidns-webadmin-gui.md) (the screens by role, the messages, the measurements, the glossary) and its [accessibility and browser checklist](karidns-webadmin-gui-checklist.md), [API reference](karidns-api.md) (`karidns-webadmin(8)`: every endpoint, error and setting), [`karidns-zone(1)`](karidns-zone.md), [`karidns-dbloader(8)`](karidns-dbloader.md) ("The auth schema, roles and the audit log"), [`karidns-signer(8)`](karidns-signer.md), [`karictl(1)`](karictl.md) (restricted control keys), [`karicheck(1)`](karicheck.md).
+[User manual of the web interface](karidns-webadmin-gui.md) (the screens by role, the messages, the measurements, the glossary) and its [accessibility and browser checklist](karidns-webadmin-gui-checklist.md), [API reference](karidns-api.md) (`karidns-webadmin(8)`: every endpoint, error and setting), [`karidns-zone(8)`](karidns-zone.md), [`karidns-dbloader(8)`](karidns-dbloader.md) ("The auth schema, roles and the audit log"), [`karidns-signer(8)`](karidns-signer.md), [`karictl(8)`](karictl.md) (restricted control keys), [`karicheck(8)`](karicheck.md).
