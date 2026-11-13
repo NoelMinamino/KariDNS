@@ -39,17 +39,6 @@ void syslog(int priority, const char *format, ...) {
     (void)format;
     g_syslog_calls++;
 }
-#ifdef __GLIBC__
-/* glibc with _FORTIFY_SOURCE (the Makefile's default flags) compiles a syslog() call into __syslog_chk(), which the definition above does not
- * replace: count that entry point too, or the Linux build never sees the call (CI: "Portable unit tests on Linux") */
-void __syslog_chk(int priority, int flag, const char *format, ...);
-void __syslog_chk(int priority, int flag, const char *format, ...) {
-    (void)priority;
-    (void)flag;
-    (void)format;
-    g_syslog_calls++;
-}
-#endif
 
 /* print_response() into a buffer (stdout through a temporary file) */
 static void dag_print_to(const uint8_t *pkt, size_t len, char *out, size_t cap) {

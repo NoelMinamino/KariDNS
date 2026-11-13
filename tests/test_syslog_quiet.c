@@ -7,9 +7,14 @@
  *   - every other test writes nothing to the system log, or, with KARIDNS_TEST_SYSLOG=1 in the environment, to standard error (to see
  *     the messages while debugging a test).  A test that sends its own standard error to /dev/null around a parse that must fail (as
  *     test_config_directives does) hides those messages too.
- * (glibc with _FORTIFY_SOURCE turns syslog() into __syslog_chk(), which this does not replace: on Linux the messages still go to the
- * system log, as before.  FreeBSD, where the suite runs, has no such wrapper.)
+ *
+ * glibc with _FORTIFY_SOURCE (the Makefile's default flags) compiles a syslog() / vsyslog() call into __syslog_chk() / __vsyslog_chk(),
+ * which a definition of syslog() does not replace: a test that counts or reads the messages saw none of them on Linux, and the others
+ * wrote to the system log there.  The two functions at the end of this file (glibc only) hand such calls to the syslog() of the test
+ * binary, the test's own or the weak one below.  This file is compiled without _FORTIFY_SOURCE so that its own syslog() calls are calls
+ * of that symbol and not of __syslog_chk() again.  FreeBSD and macOS have no such wrapper.
  */
+#undef _FORTIFY_SOURCE
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -32,3 +37,24 @@ __attribute__((weak)) void syslog(int priority, const char *format, ...) {
     fputc('\n', stderr);
     va_end(ap);
 }
+
+#ifdef __GLIBC__
+/* The entry points glibc's <bits/syslog.h> uses under _FORTIFY_SOURCE (see the top of the file).  The text is formatted here, %m included
+ * (glibc's printf knows it), and passed on as one string. */
+void __vsyslog_chk(int priority, int flag, const char *format, va_list ap);
+void __syslog_chk(int priority, int flag, const char *format, ...);
+
+void __vsyslog_chk(int priority, int flag, const char *format, va_list ap) {
+    (void)flag;
+    char line[2048];
+    vsnprintf(line, sizeof(line), format, ap);
+    syslog(priority, "%s", line);
+}
+
+void __syslog_chk(int priority, int flag, const char *format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    __vsyslog_chk(priority, flag, format, ap);
+    va_end(ap);
+}
+#endif
