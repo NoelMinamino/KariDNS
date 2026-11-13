@@ -1,4 +1,4 @@
-.TH KARIDNS 8 "2026-11-13" "KariDNS" "KariDNS Manual"
+.TH KARIDNS 8 "2026-11-14" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns \- Authoritative DNS Server Daemon for FreeBSD
@@ -343,6 +343,43 @@ authenticated via an HMAC challenge-response (\fBcontrol\-channel { algorithm
 }\fR, default HMAC-SHA256) using the \fBkarictl(8)\fR utility. A key can be
 restricted to some commands (\fBcontrol\-channel { keys { } }\fR, see above);
 every command is logged with the name of the key.
+.PP
+\fBReloads and long readers (0.7).\fR A reload (\fBkarictl reload\fR,
+\fBreconfig\fR, \fBSIGHUP\fR), a database batch and a dynamic UPDATE replace
+zone versions and snapshots; the old ones are freed once no thread of the server
+can still read them (the grace period of the epoch RCU). A thread that stays
+long in a read section does not make any of them wait: a reload answers as soon
+as the configuration and the zones are applied, and the memory the old versions
+take stays allocated until that thread leaves, then it is freed by the control
+thread's tick and the reclaim thread. During that time \fBkarictl status\fR
+shows it (\fBretired zone snapshots waiting\fR, \fBretired zone versions
+waiting\fR, rising and then falling back to 0) and after 60 s the server writes
+the warning \fB[GC] the oldest retired zone snapshot has waited ...\fR naming
+what holds it. Memory grows by the versions replaced meanwhile: a full reload
+during such a reader keeps a second copy of every zone it re-read. For database
+zones \fBmemory\-limit\fR is a target (up to about 1.5 times the value in normal
+operation, see "Memory limit"): the retired versions such a reader holds
+(\fBheld\fR in the \fBcache:\fR line of \fBkarictl dbstatus\fR) are not weighed
+against it, so the cache manager neither takes zones out nor leaves a batch's
+zones out for memory only the reader's leaving frees, and the memory in use
+passes the limit by them until the reader leaves (measured: 3000 database zones
+under \fBmemory\-limit 2m\fR, three batches during a 90 s reader: 1.6 times the
+limit); then they are freed at once. The one thing that does wait is a reload
+while a reader may still hold the configuration before the last one (the
+configuration is kept in two buffers): an explicit reload (\fBkarictl reload\fR,
+\fBreconfig\fR, \fBSIGHUP\fR) waits for such readers as long as they can last in
+normal operation (the longest \fBprogram\-timeout\fR or \fBforward\-timeout\fR
+of the configuration or of the one before, under which those readers began, plus
+half a second, at least 1 s, at most 5 s), and if one is still there it answers
+\fBERROR reload postponed\fR and the server applies the reload by itself, with
+everything it was to do (for \fBkarictl reload\fR the request to the database
+loader), within a second of that reader leaving. A reload command while one is
+postponed does not wait again: it is merged into the postponed one (a full
+reload, the request to the loader) and answers \fBERROR reload postponed\fR
+after a short try (0.1 s) unless the readers have left.  The log says so once,
+then at most once a minute while it waits, and once when the reload is
+applied. Since 0.7 a zone transfer that waits for its client is not such a
+reader (see "Outbound transfers").
 .SH PROGRAM ZONE PLUGINS (TEST-ONLY FEATURE)
 KariDNS supports dynamic external program-backed zones (\fBtype program;\fR)
 exclusively for testing and anomaly fuzzing.

@@ -1,4 +1,4 @@
-.TH KARIDNS\-SIGNER 8 "2026-11-13" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-SIGNER 8 "2026-11-14" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-signer.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-signer \- keeps the zones of a KariDNS database (PostgreSQL or SQLite3)
@@ -383,7 +383,40 @@ an error and at start):
 \fBpg_try_advisory_lock(hashtextextended('karidns\-signer:<id>', 0))\fR, so
 several signer instances can share a database and a zone is signed by one of
 them (a zone that another instance holds is tried again after 30 s). SQLite3:
-one signer per database file (\fB<file>.signer.lock\fR).
+one signer per database file. Since 0.7 the lock is held by the kernel:
+\fB<file>.signer.lock\fR is a small SQLite file of its own that the signer locks
+with a \fBBEGIN EXCLUSIVE\fR transaction, switches to SQLite's exclusive locking
+mode inside it (\fBPRAGMA locking_mode = EXCLUSIVE\fR, one write, commit) and
+keeps open while it runs; SQLite keeps the file's lock (a \fBfcntl(2)\fR
+byte-range lock) until the file is closed, and the kernel drops it when the
+process ends, however it ends (\fBkill \-9\fR, a crash, a reboot), so there is
+no stale lock to remove and no pid to trust. A second signer started on the same
+database waits one second for the lock (so that signers started at the same
+instant settle on exactly one) and then stops with \fBanother karidns\-signer
+(pid N) works on this database: <file>.signer.lock is locked\fR (the pid is the
+one the holder wrote into the file, for this message only). The lock file is
+left in place when the signer stops (removing it could let two signers lock two
+different files). Its path is not trusted, since the directory is writable and
+another account may write it too (a WebAdmin sharing the file): the signer
+creates a missing lock file itself (\fBO_CREAT|O_EXCL|O_NOFOLLOW\fR, mode 0600)
+and accepts an existing one only as a regular file owned by the signer's user
+with one link; a symbolic link, a directory, a FIFO or device, a file of another
+user (after a run as root, for a test: chown it to the service user or remove it
+while no signer runs) or a hard link stops the start with \fBcannot take the
+lock file <file>.signer.lock: it is ...\fR and is left as it is. After SQLite
+has opened and locked the file, the signer checks that the path still names the
+same inode and that the file has no tables before it writes to
+it. \fBnode:sqlite\fR does not hand out SQLite's descriptor, so one window stays
+open: another account that can write the directory can swap the path between the
+check and SQLite's open and swap it back before the second look; the worst it
+gets is a short lock on the file it pointed to and a refused start, never a
+write to it unless that file is empty or a SQLite file without tables (then the
+pid goes into its header). Keep the database directory writable only by the
+signer's user (and the group of a WebAdmin you trust) to close it. A 0.6.x lock
+file (a pid as text) is not a database: the first 0.7 signer empties it and uses
+it, whatever pid it names, so stop the 0.6.x signer before you start 0.7 (a
+package upgrade restarts the service). The lock needs \fBfcntl\fR locks that
+work across processes, as on UFS and ZFS; a database on NFS is not supported.
 .IP 2. 4
 \fBKeys.\fR The \fBcryptokeys\fR rows with \fBactive\fR or \fBpublished\fR
 become the DNSKEY RRs of the zone; the \fBactive\fR ones are written as key
@@ -931,7 +964,9 @@ to the signer's user because the rc script runs \fBdaemon\fR as that user
 \fBdaemon\fR writes them as that user.
 .TP 8
 \fB<sqlite\-file>.signer.lock\fR
-The lock file of a SQLite3 database (the pid of the signer).
+The lock file of a SQLite3 database: a SQLite file held locked by the running
+signer (the pid of the last holder inside, \fBPRAGMA user_version\fR). It stays
+when the signer stops.
 .TP 8
 \fB/usr/local/share/karidns/db/karidns_signer_role.pgsql.sql\fR
 The privileges of the PostgreSQL role (\fBdb/\fR in a source tree).

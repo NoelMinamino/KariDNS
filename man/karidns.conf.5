@@ -828,7 +828,12 @@ worker threads (\fB0\fR means 5000). Queries over the limit are not logged.
 .br
 \fIDescription:\fR Entries in each worker's query log ring buffer; a power of
 two between 1024 and 1048576. When a ring is 80 % full, query logging is
-suspended to protect query processing.
+suspended to protect query processing. Since 0.7 each worker also has an
+\fBevent ring\fR of its own for the event and debug messages of its thread (see
+"Event messages" under LOGGING), of an eighth of this size and at least 1024
+entries (4096 by default), so that they never take room from the query log. An
+entry is 424 bytes: by default a worker's two rings take 13.9 MB + 1.7 MB (0.6:
+13.9 MB for the one ring). Read at start-up only.
 .TP 8
 \fBrate\-limit { ... };\fR
 \fIDefault:\fR not set (no RRL)
@@ -1842,11 +1847,12 @@ this authoritative server has nothing to write to them: \fBdispatch\fR,
 of the server, in the form BIND writes them (\fBlib/ns/update.c\fR,
 \fBxfrout.c\fR, \fBquery.c\fR): "client <address>#<port>: <text>". They arise on
 the query path, so they do not write anything there: a worker thread of the
-Backend puts a fixed-size record into its own ring (the ring of the query log,
-which carries the records of \fBcategory queries\fR as well), and the query
-logger thread formats it and writes it to the channels of the category; a
-message from any other thread (a transfer thread, the asynchronous resolver
-threads) is formatted and written at once. Consequences:
+Backend puts a fixed-size record into its own \fBevent ring\fR (0.7: a ring
+apart from the one of the query log, \fBcategory queries\fR, so that these
+records never take room from the query log; before 0.7 both shared one ring),
+and the query logger thread formats it and writes it to the channels of the
+category; a message from any other thread (a transfer thread, the asynchronous
+resolver threads) is formatted and written at once. Consequences:
 .IP \(bu 2
 A category costs nothing while no channel passes the message: whether some
 non-null channel of the category (or of \fBdefault\fR, or \fBdefault_syslog\fR
@@ -1885,24 +1891,33 @@ limit of each.
 lines a second\fR (0.7) in each of its two budgets, so that a debug session at
 level 3 sees one line per message; the lines over it are still counted and
 reported the same way, and at \fBkarictl notrace\fR the limits above are
-back. The number is held to what a worker's ring and the query logger thread can
-carry: a ring has 1024 records at the least (\fBquery\-log\-buffer\-size\fR,
-32768 by default) and is emptied every 1 ms while there is work and every 10 ms
-when idle; 1000 lines a second in each of a dozen busy categories is some 120
-records per 10 ms and some 12000 lines a second for the logger thread. A channel
-with \fBseverity debug <n>\fR and a \fBsize\fR limit (0.6 configurations have
-them) now also receives the debug lines of 0.7 at debug level 0, so it reaches
-its \fBsize\fR sooner: with \fBversions\fR it rolls over sooner, without
-\fBversions\fR it stops taking lines sooner (the notices and errors after that
-point are not written to it either); give such a channel a lower \fBdebug
-<n>\fR, a larger \fBsize\fR or \fBversions\fR if that matters.
+back. The number is held to what a worker's event ring and the query logger
+thread can carry: an event ring has 1024 records at the least (an eighth of
+\fBquery\-log\-buffer\-size\fR, 4096 by default) and is emptied every 1 ms while
+there is work and every 10 ms when idle; 1000 lines a second in each of a dozen
+busy categories is some 120 records per 10 ms and some 12000 lines a second for
+the logger thread. A channel with \fBseverity debug <n>\fR and a \fBsize\fR
+limit (0.6 configurations have them) now also receives the debug lines of 0.7 at
+debug level 0, so it reaches its \fBsize\fR sooner: with \fBversions\fR it rolls
+over sooner, without \fBversions\fR it stops taking lines sooner (the notices
+and errors after that point are not written to it either); give such a channel a
+lower \fBdebug <n>\fR, a larger \fBsize\fR or \fBversions\fR if that matters.
 .IP \(bu 2
-The ring takes at most 90% of its slots for these records, and a debug record
-(level 1 and up) at most half of them, so that a debug flood never brings the
-ring to the 80% at which the query log stops itself; one that finds it fuller is
+The event ring is for these records only (0.7, K-11): a debug flood fills at
+most the event ring, never the query log's, so it can never bring the query log
+to the 80% at which it stops itself. Inside the event ring a debug record (level
+1 and up) may take at most half of the slots, so that the other half is always
+there for the lines at \fBinfo\fR and above; a record that finds no room is
 dropped and counted (a worker never waits for the log), and the query logger
 thread reports the count (\fB[QueryLog] Dropped N event log messages ...\fR,
-category \fBgeneral\fR) every five seconds, like the dropped queries.
+category \fBgeneral\fR) every five seconds, like the dropped queries. The logger
+thread empties, worker by worker, the event ring and then the query log ring,
+each up to what was in it when it got there: neither waits for the other for
+more than one pass, and a line at \fBwarning\fR waits at most behind the debug
+records already in its ring (half of it at most), never behind query log
+records. The other threads (transfer, asynchronous resolver and control threads)
+write their messages at once and have no ring; the response log and dnstap have
+rings of their own as before.
 .IP \(bu 2
 Names that came from the network are written in their presentation form: a byte
 outside \fB0x21..0x7e\fR as \fB\eDDD\fR, a control character that is left
@@ -3045,9 +3060,11 @@ BIND's: a secondary whose primary publishes REFRESH 60 checks every 300 s unless
 given up after the total time (also in the middle of a message that arrives a
 few octets at a time), or when no message arrives for the idle time; an outbound
 one when it takes longer than the total time or a send waits the idle time for
-the client. (The environment variable \fBKARIDNS_XFER_MINUTE_SECS=n\fR, 1..60,
-makes a "minute" n seconds -- a test hook, like BIND's \fBnamed \-T
-transferinsecs\fR.)
+the client. While it waits, an outbound transfer holds only the zone version it
+sends (see "Outbound transfers: one version from start to end" below): a reload
+or an UPDATE does not wait for it. (The environment variable
+\fBKARIDNS_XFER_MINUTE_SECS=n\fR, 1..60, makes a "minute" n seconds -- a test
+hook, like BIND's \fBnamed \-T transferinsecs\fR.)
 .TP 8
 \fBtransfers\-in\fR, \fBtransfers\-out\fR, \fBtransfers\-per\-ns\fR
 \fIDefault:\fR \fB10\fR, \fB10\fR, \fB2\fR
@@ -3058,7 +3075,9 @@ progress": a reason of the server, not EDE 18 Prohibited), inbound transfers
 from one primary address. A refresh over a limit waits for a later tick. \fB0\fR
 is accepted (no inbound transfer / every outbound one
 refused). \fBtransfers\-out\fR replaces the former fixed limit of 4 transfers of
-one zone.
+one zone. Each running outbound transfer is a thread and a TCP connection of its
+own; it holds no reader slot of the server while it waits for its client, so
+\fBtransfers\-out\fR may be raised above 128 (0.7, R11).
 .TP 8
 \fBserial\-query\-rate\fR, \fBnotify\-rate\fR
 \fIDefault:\fR \fB20\fR
@@ -3160,6 +3179,42 @@ primaries ns\-b source 192.0.2.2 { 198.51.100.1; 198.51.100.2 key "tk"; };
 zone "example.test" { type secondary; primaries { ns\-b; 203.0.113.9 port 5353; }; multi\-master yes; };
 .fi
 .RE
+.SS Outbound transfers: one version from start to end (0.7, R11)
+An AXFR or IXFR that this server sends is made from \fBone version of the
+zone\fR, the one served when the transfer started, from its first message to its
+last, whatever happens to the zone meanwhile: a \fBreload\fR or \fBreconfig\fR
+that reads a new file, a dynamic UPDATE, a \fBkarictl rollback\fR, a new version
+received by a secondary that relays the zone, a database zone that the loader
+replaces, the zone removed from the configuration or given another type. This is
+RFC 1035 \[u00A7]6.3 (a primary that creates a new version during a transfer
+"should continue to send the old version if possible" and "should never send
+part of one version and part of another"); RFC 5936 \[u00A7]3 asks the client to
+reconstruct the zone as it exists for the given serial, and an IXFR (RFC 1995
+\[u00A7]4) is bracketed by the SOA the server had then. The transfer is also
+made with the \fBconfiguration as it was when it started\fR (the requester's
+location tag, the settings and tag definitions sent in an Extended AXFR,
+\fBtransfer\-format\fR, \fBprovide\-ixfr\fR, \fBsend\-extended\-errors\fR): a
+reload that changes them, or revokes \fBallow\-transfer\fR, does not change or
+end a transfer that runs.
+.PP
+None of these changes waits for a transfer, and none of them fails because of
+one: a \fBreload\fR of a zone that is being transferred answers \fBOK
+reloaded\fR, an UPDATE is applied at once (it waited up to 5 s and answered
+SERVFAIL before 0.7), a secondary installs the version it received. A client
+that reads slowly or not at all (until \fBmax\-transfer\-idle\-out\fR /
+\fBmax\-transfer\-time\-out\fR) holds \fBonly the zone version it is sent\fR in
+memory: it holds no read section of the server, no retired zone snapshot and no
+configuration, so reclamation and reloads go on (\fBkarictl status\fR:
+\fBretired zone snapshots waiting\fR stays 0, \fBretired zone versions
+waiting\fR counts the version until the transfer ends). A database zone stays in
+memory while one of its transfers runs (\fBmemory\-limit\fR takes it out after
+the transfer). An IXFR keeps the differences it sends even when later changes
+push them out of \fBixfr\-history\fR. What transfers can hold back is bounded:
+at most \fBtransfers\-out\fR zone versions at once (one per running transfer;
+transfers of the same version share it), plus the IXFR differences those
+transfers send, each for at most \fBmax\-transfer\-time\-out\fR (when it is not
+0; a client that keeps reading slowly can hold its version that long, one that
+stops is cut off after \fBmax\-transfer\-idle\-out\fR).
 .SS server <prefix> { ... } (BIND 9.20)
 .RS 2
 .nf
@@ -4083,13 +4138,16 @@ checks"). \fBkaricheck conf\fR still checks the block without a connection.
 .SS Memory limit (D1a)
 \fBdatabase { memory\-limit <size>; }\fR (\fBK\fR, \fBM\fR, \fBG\fR suffixes, 1M
 to 1024G; unset = no limit, every database zone stays in memory and nothing in
-this section applies) limits what the zones of the database hold in memory: the
-versions in use \fBand\fR the ones that were replaced or taken out but are not
-freed yet (a reader or a transfer may still hold them). It counts the data of
-the zones (their images, the glue, the IXFR differences), not the directory (a
-few hundred bytes per zone, listed by \fBkarictl dbstatus\fR), the park tables
-or the loader's process. A reload of \fBkaridns.conf\fR changes it: within 50 ms
-when a limit is set, within a second when there was none.
+this section applies) is a target for what the zones of the database hold in
+memory, not a hard limit: the versions in use, the previous versions kept for
+rollback, \fBand\fR the ones that were replaced or taken out but are not freed
+yet -- except, since 0.7, retired versions that a reader or a transfer holds
+(\fBheld\fR, see below): taking zones out cannot free them, so they are not
+weighed against the limit. It counts the data of the zones (their images, the
+glue, the IXFR differences), not the directory (a few hundred bytes per zone,
+listed by \fBkarictl dbstatus\fR), the park tables or the loader's process. A
+reload of \fBkaridns.conf\fR changes it: within 50 ms when a limit is set,
+within a second when there was none.
 .IP \(bu 2
 \fB\fBmemory\-limit\fB is not a limit on the size of the process (design
 8.1).\fR It counts the data of the zones only. What the process holds on top is
@@ -4329,13 +4387,16 @@ profile) is \fBpin\fR (never taken out), \fBno\-cache\fR (taken out as soon as
 its queries are answered) or \fBauto\fR (the default: frequency decides). A
 pinned zone is read at the start even above the limit.
 .IP \(bu 2
-\fBThe limit is a target, not a hard cap.\fR The cache manager enforces it;
-usage can exceed it for a while, by design: (1) a zone is installed (read for a
-query, or a changed zone of a batch) before the next round of the manager can
-take another out, and the manager runs every 50 ms; (2) a zone that was taken
-out counts against the limit until its entry is freed, which happens after the
-next publication of the zones and the drain of the older snapshot (typically 100
-ms to a second), and a version that a reader or a long transfer (AXFR) still
+\fBThe limit is a target, not a hard cap.\fR Plan for up to about 1.5 times the
+value in normal operation when database batches change zones that are in memory
+(about 1.1 times without batches), and set \fBmemory\-limit\fR with that margin
+below the memory the process may use for zone data. The cache manager enforces
+it; usage can exceed it for a while, by design: (1) a zone is installed (read
+for a query, or a changed zone of a batch) before the next round of the manager
+can take another out, and the manager runs every 50 ms; (2) a zone that was
+taken out counts against the limit until its entry is freed, which happens after
+the next publication of the zones and the drain of the older snapshot (typically
+100 ms to a second), and a version that a reader or a long transfer (AXFR) still
 holds counts as long as it is held; (3) a zone that came into memory less than
 100 ms ago is not taken out, and a more valuable zone is not taken before
 cheaper ones that are only too young would cover what is left. What keeps the
@@ -4347,16 +4408,46 @@ read. The expected overshoot is the zones read in about a second at the rate the
 queries ask for zones that are out of memory: with the load of
 \fBtests/run_db_cache_test.sh\fR (4 clients, about 1000 queries a second, 28% of
 them for zones that are out of memory) the largest value seen was 108% of the
-limit; the test accepts at most 115% plus 256 KB.
+limit; the test accepts at most 115% plus 256 KB. Where the 1.5 comes from: what
+is served stops growing by fetches at 110 % of the limit, but a batch installs
+the changed zones that are in memory regardless; on top come for a moment the
+old versions a batch replaces (freed after a grace period that normally ends in
+milliseconds, at the latest when the ingest has published 1024 more zones or at
+the end of the batch: up to the size of every zone in memory if one batch
+replaces all of them), the zones taken out until their entry is freed, and the
+previous versions until the manager drops them (they count and go first). So the
+bound in theory is about twice the limit plus the previous versions, for a batch
+that replaces every zone in memory at once; measured with the zones and the load
+of \fBtests/run_db_cache_test.sh\fR (800 zones, \fBmemory\-limit 3m\fR, 4
+clients) and a batch that changes every zone every 2 s or 100 zones every
+second, \fBpeak\fR was 1.34 to 1.52 times the limit (1.10 without
+batches). \fBThe exception:\fR while a thread stays long in its read section
+(rare; \fBkarictl status\fR \fBretired zone versions waiting\fR, and the warning
+after 60 s), the versions replaced or taken out meanwhile come on top until it
+leaves (measured: 1.6 times the limit with three replacements of every zone in
+memory during a 90 s hold; 2.2 times when queries brought 620 more zones in
+during a 60 s hold, \fBtests/run_db_memlimit_reader_test.sh\fR);
+\fBlong_reader=1\fR in the \fBcache:\fR line of \fBkarictl dbstatus\fR shows
+such a reader (sampled every second); the cache manager does not count them
+(option B, 0.7) and does not take zones out or leave a batch's zones out for
+them, and a version a stalled outbound zone transfer pins is counted the same
+way.
 .IP \(bu 2
 \fB\fBkarictl dbstatus\fB\fR has a line \fBcache:
-limit=... resident=... retired=... inflight=... evictions=... rounds=... cold=... marked=... misses=... shed=... pinned=... peak=... victim_freq=...\fR:
+limit=... resident=... retired=... previous=... inflight=... held=... long_reader=... evictions=... rounds=... cold=... marked=... misses=... shed=... pinned=... peak=... victim_freq=...\fR:
 \fBretired\fR is what was replaced or taken out and is not freed yet,
-\fBinflight\fR the part of it that was taken out, \fBcold\fR the zones that came
-without data, \fBmarked\fR the zones that were read but are not kept
-(admission), \fBmisses\fR the queries that had to wait for a zone, \fBshed\fR
-the reads not made because of the 110% bound, \fBpeak\fR the largest resident +
-retired seen when a zone was installed or a round ran.
+\fBinflight\fR the part of it that was taken out, \fBheld\fR (0.7) the part of
+it that a reader or a transfer holds (versions kept after a short wait for their
+grace period did not end, or retired more than a second ago, and while
+\fBlong_reader\fR is 1 every retired version except those taken out
+(\fBinflight\fR) and the previous versions dropped under memory pressure, which
+are not shown on their own: so \fBheld\fR + \fBinflight\fR can be below
+\fBretired\fR; not weighed against the limit), \fBlong_reader\fR (0.7) 1 while a
+thread of the server has been in a read section for a second or more, \fBcold\fR
+the zones that came without data, \fBmarked\fR the zones that were read but are
+not kept (admission), \fBmisses\fR the queries that had to wait for a zone,
+\fBshed\fR the reads not made because of the 110% bound, \fBpeak\fR the largest
+resident + retired + previous seen when a zone was installed or a round ran.
 .IP \(bu 2
 \fBZone transfers of a zone that is out of memory (AXFR, IXFR).\fR The client is
 checked first, as \fBallow\-query\fR is for a parked query:

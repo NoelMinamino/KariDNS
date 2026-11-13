@@ -90,6 +90,23 @@ other zones N bytes\fR. They are not served; they are freed when the
 \fBrollback\-window\fR is over, or earlier when the database \fBmemory\-limit\fR
 needs the room
 .IP \(bu 2
+What waits to be freed (0.7): \fBretired zone snapshots waiting: N (oldest N
+ms)\fR (zone-db snapshots that a reload or a change replaced and that a reader
+still holds: a dynamic update, a control command, a zone transfer that waits for
+a database zone to be read (\fBtransfer\-fetch\-timeout\fR), or a thread inside
+a read section; they are freed in order, so one held snapshot keeps the later
+ones too. A transfer that is being sent holds none, 0.7 R11), \fBretired zone
+versions waiting: N\fR (zone versions and objects on the retire stack, not freed
+yet: a reader that stays in its read section keeps every version replaced after
+it entered (a reload, an UPDATE, a database batch never wait for it: the count
+rises and falls when it leaves), a reader holds them, or the version is the one
+a running outbound transfer sends: it is freed when that transfer ends) and
+\fBreclaim warnings (snapshot held over 60 s): N\fR. Nothing limits these and no
+reader is cut off; when the oldest snapshot has waited more than 60 s, karidns
+writes a warning in the category \fBgeneral\fR (\fB[GC] the oldest retired zone
+snapshot has waited N s ...: held by ...\fR, naming the kind of reader slot or
+the retained references), at most once a minute while it waits
+.IP \(bu 2
 Frontend process health status
 .IP \(bu 2
 Security counters: RRL dropped/slipped responses, Extended DNS Error counters
@@ -213,8 +230,11 @@ not re-read. This is the same as sending \fBSIGHUP\fR to the server. When the
 \fBzone { }\fR blocks of every view are the ones of the running configuration,
 the zones served from the database are taken over as they are (a reload at
 1,000,000 database zones takes about 30 ms instead of walking every zone), and
-the loader is told about the new configuration afterwards. \fBreload\fR (without
-arguments) and \fBreconfig\fR answer:
+the loader is told about the new configuration afterwards. \fBreload\fR and
+\fBreconfig\fR answer when the configuration and the zones are applied, not when
+the memory they replaced is freed (0.7): a thread that stays in a read section
+of the server only keeps that memory longer (\fBretired zone versions waiting\fR
+in \fBstatus\fR). \fBreload\fR (without arguments) and \fBreconfig\fR answer:
 .RS 8
 .IP \(bu 2
 \fBOK\fR (\fBOK reloaded\fR for \fBreload\fR): the configuration was applied and
@@ -223,14 +243,28 @@ needed for: port, ...)\fR follows.
 .IP \(bu 2
 \fBERROR configuration applied, but N zone(s) failed to load: <zones>\fR: the
 new configuration is in use, and the listed zones (also logged to syslog) answer
-SERVFAIL until their files can be loaded.
+SERVFAIL until their files can be loaded. A zone transfer that is being sent
+does not make a zone fail (0.7: before, a reload waited 5 s for it and listed
+the zone here); it goes on with the version it started with.
 .IP \(bu 2
 \fBERROR configuration not applied: <reason>\fR: the file could not be read, has
 an error (see syslog or \fBkaricheck conf\fR), or a log file could not be
 opened; the running configuration is kept.
 .IP \(bu 2
-\fBERROR reload postponed: ...\fR: readers of the previous configuration were
-still active; the server retries the reload by itself every second.
+\fBERROR reload postponed: ...\fR: a thread of the server was still reading the
+configuration before the last one. The configuration is kept in two buffers and
+the new one is read into the one that thread may still hold, so the reload is
+not done now. \fBreload\fR and \fBreconfig\fR first wait for such readers as
+long as they last in normal operation: the longest \fBprogram\-timeout\fR or
+\fBforward\-timeout\fR of the configuration plus 0.5 s, at least 1 s and at most
+5 s (a worker that waits for a program zone's plugin or a forward zone's
+forwarders reads the configuration meanwhile). Only a reader that stays longer
+gives this reply, within that time. The server then applies the reload by
+itself, with what the command was to do (\fBreload\fR: every zone file and the
+request to the database loader), within a second of the reader leaving; the log
+says when (\fBThe postponed reload was applied\fR). karictl exits with status 3
+for this reply, as for every \fBERROR\fR. A zone transfer that waits for a slow
+client is not such a reader (0.7).
 .PP
 Every \fBERROR\fR reply makes \fBkarictl\fR exit with status 3.
 .RE
@@ -299,9 +333,9 @@ to holds RRSIG or DNSKEY records. KariDNS cannot sign, and a new serial would
 leave the SOA with a signature that does not match. Roll back where the zone is
 signed, or use \fBlocal\fR.
 .IP \(bu 2
-\fBbusy (AXFR in progress)\fR; \fBthe zone was taken out of memory; nothing to
-roll back\fR (a database zone whose data left memory, or one hidden by a zone of
-the same name). What a later reload does:
+\fBthe zone was taken out of memory; nothing to roll back\fR (a database zone
+whose data left memory, or one hidden by a zone of the same name). What a later
+reload does:
 .IP \(bu 2
 \fBZone file.\fR \fBreload <zone>\fR and a full \fBreload\fR keep the
 rolled-back version while the file is the one that was read (same modification
@@ -372,12 +406,18 @@ file.) The exit status is 0 only when the whole output was written, so
 file. The output has a \fBserver\fR part (version, boot time, zone count,
 workers, TCP clients, zone memory, query, response, EDNS, NOTIFY, transfer,
 response-cache, rate-limit and Extended DNS Error counters, failed transfers,
-failed reloads, raised alerts, and dnstap: \fBkaridns_dnstap_truncated_total\fR,
+failed reloads, raised alerts, the reclaim queue (the gauges
+\fBkaridns_reclaim_snapshots_waiting\fR,
+\fBkaridns_reclaim_oldest_snapshot_age_seconds\fR,
+\fBkaridns_reclaim_zone_versions_waiting\fR and the counter
+\fBkaridns_reclaim_warnings_total\fR; in JSON \fBreclaim\fR
+\fB{snapshots_waiting, oldest_snapshot_age_ms, zone_versions_waiting,
+warnings}\fR in \fBserver\fR) and dnstap (\fBkaridns_dnstap_truncated_total\fR,
 \fBkaridns_dnstap_dropped_total{reason="queue_full"|"not_connected"}\fR, the
 gauge \fBkaridns_dnstap_connected\fR (1 or 0; 0 also without a \fBdnstap\fR
 block) and \fBkaridns_dnstap_reconnects_total\fR; in JSON
 \fBdnstap_truncated\fR, \fBdnstap_dropped\fR \fB{queue_full, not_connected}\fR,
-\fBdnstap_connected\fR (true / false) and \fBdnstap_reconnects\fR), then
+\fBdnstap_connected\fR (true / false) and \fBdnstap_reconnects\fR)), then
 \fBviews\fR (zones, queries and responses summed per view; only when every zone
 is listed), then one set of series \fBper zone\fR (queries by transport,
 responses by RCODE, EDNS / DO / ECS queries, rate-limit drops and slips, NOTIFY,

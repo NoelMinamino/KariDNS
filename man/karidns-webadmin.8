@@ -1,4 +1,4 @@
-.TH KARIDNS\-WEBADMIN 8 "2026-11-13" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-WEBADMIN 8 "2026-11-14" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-webadmin.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-webadmin \- the service that gives people and programs an HTTP API for
@@ -683,7 +683,13 @@ automated tests run Firefox (\fBtests/run_webadmin_gui_test.sh\fR on SQLite3 and
 geckodriver; the screens of zones need root and a real \fBkaridns\fR, so that
 the update button is checked with \fBdag\fR; on the FreeBSD build host that
 needs \fBpkg install firefox geckodriver dejavu\fR: Firefox crashes at the start
-on a system without a font).
+on a system without a font). They are the category \fBgui\fR of
+\fBtests/run_all_suite.sh\fR (with \fBtests/run_webadmin_oidc_gui_test.sh\fR,
+the browser part of the sign-in with a provider): a plain suite run leaves them
+out and says so; \fBsh tests/run_all_suite.sh \-\-with\-gui\fR or
+\fB\-\-only\-gui\fR runs them, and CI runs them in a job of their own
+(\fBwebadmin\-gui\-freebsd\fR), so that a browser step cannot fail the build of
+the server (0.7).
 .IP \(bu 2
 \fBIdentity providers\fR (item F, milestone M5; set-up under SIGNING IN WITH AN
 IDENTITY PROVIDER). With \fB[oidc]\fR sections the sign-in screen has a button
@@ -778,6 +784,32 @@ limit, follows no redirect, and refuses an address that is not https, has
 credentials, or is an IP address. The proxy in front of the service needs
 nothing new: the browser, not the service, talks to the provider's authorization
 endpoint, and it comes back to \fBpublic\-origin\fR like any visitor.
+.PP
+\fBWhat is checked before the service contacts a provider, and what is not.\fR
+The issuer is \fBtrusted configuration\fR: only the administrator who writes the
+configuration file chooses it, and the service then contacts the hosts that the
+issuer and its discovery document name. What is checked: the issuer is an https
+URL without a query, a fragment or credentials, at most 255 characters (http
+only for a provider on this machine: \fBlocalhost\fR, \fB127.x.x.x\fR,
+\fB::1\fR); every address that is fetched or handed to the browser (the
+discovery document, \fBauthorization_endpoint\fR, \fBtoken_endpoint\fR,
+\fBjwks_uri\fR) is an absolute URL of at most 2048 characters, https (for an
+http loopback issuer: http or https on a loopback host only), without
+credentials or a fragment, and, for an https issuer, a host name, not an IP
+address (for an http loopback issuer the host must be \fBlocalhost\fR, an IPv4
+literal \fB127.x.x.x\fR or \fB[::1]\fR, so an IP literal is accepted there);
+each request has 10 seconds, a size limit (64 KiB for the discovery document,
+256 KiB for the key set, 128 KiB for the token answer) and must answer JSON; a
+redirect (3xx) is not followed but counts as a failure; and the \fBissuer\fR
+inside the discovery document must be exactly the configured issuer (OpenID
+Connect Discovery 1.0, section 4.3), or the provider is not used. What is
+\fBnot\fR checked: the address that a host name resolves to. A name in the
+issuer or in the discovery document may resolve to an address of the internal
+network or of this machine, and the service connects to it; refusing private
+addresses would break the common case of an identity provider on the internal
+network. Configure only issuers you trust, and if the service must not reach
+other internal hosts, restrict its outgoing connections with the firewall as
+above.
 .PP
 \fB4. Link the users.\fR In the web interface: \fIAdministration\fR, the user,
 \fIIdentity at a provider\fR: the provider, the \fBsubject\fR, \fILink the
