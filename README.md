@@ -371,6 +371,8 @@ make karidns-tsan karidns-dbloader-tsan
 
 # Full test suite, one test per CPU at a time (-j N to change, -j 1 for one at a time; integration tests that need loopback aliases run only as root)
 sh tests/run_all_suite.sh
+# The browser tests of the web interface (Firefox, geckodriver) are left out unless asked for: --with-gui, or --only-gui
+sh tests/run_all_suite.sh --with-gui
 
 # Coverage report (clang source-based coverage; see docs/COVERAGE_STATUS.md)
 make coverage

@@ -10,7 +10,9 @@
 #                   SECURITY DEFINER functions do the work, and the service never logs that RLS refused what it had allowed;
 #   3  the browser: Firefox headless (webadmin/test/e2e/gui_oidc.mjs) signs in at the provider and comes back (the cookie of a Strict session set by the redirect from
 #                   another site is sent by the page: plan assumption 10), refusals, the link in the administration.
-# Environment: ZONE (./karidns-zone), KARICHECK (./karicheck), NODE, FIREFOX, GECKODRIVER, KARIDNS_TEST_PG (a conninfo of a maintenance database), GUI_MAX_RSS_MIB.
+# Parts 1 and 2 by default (0.7): part 3 drives a browser and is run by tests/run_webadmin_oidc_gui_test.sh (OIDC_PARTS=3), a test of the category gui of
+# tests/run_all_suite.sh, which the suite runs only with --with-gui or --only-gui; OIDC_PARTS="1 2 3" runs all three here.
+# Environment: OIDC_PARTS (the parts, default "1 2"), ZONE (./karidns-zone), KARICHECK (./karicheck), NODE, FIREFOX, GECKODRIVER, KARIDNS_TEST_PG (a conninfo of a maintenance database), GUI_MAX_RSS_MIB.
 # SKIP (exit 0, with the reason) a part without node 22.13, the sqlite3 tool, the binaries, PostgreSQL (and webadmin/node_modules/pg), Firefox or geckodriver.  About two minutes.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -42,7 +44,7 @@ cleanup() {
 trap cleanup EXIT
 trap "exit 130" INT TERM
 
-want() { case " ${OIDC_PARTS:-1 2 3} " in *" $1 "*) return 0 ;; esac; return 1; }
+want() { case " ${OIDC_PARTS:-1 2} " in *" $1 "*) return 0 ;; esac; return 1; }
 PASS=0; FAILS=0
 ok() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 bad() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; [ -n "${2:-}" ] && printf '%s\n' "$2" | head -12 | sed 's/^/         /'; }
