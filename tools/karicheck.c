@@ -33,6 +33,15 @@
 #include <openssl/sha.h>
 #include "karidns_tool_linkage.h"
 
+/* the klog hook of karicheck (main()): the syslog lines of the shared code are dropped */
+static void karicheck_klog_drop(int cat, int prio, const char *fmt, va_list ap, int saved_errno) {
+    (void)cat;
+    (void)prio;
+    (void)fmt;
+    (void)ap;
+    (void)saved_errno;
+}
+
 // Stub for open_via_dir_cache used by dns_config_parser.c
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) {
     (void)mode;
@@ -2135,10 +2144,10 @@ int main(int argc, char **argv) {
     const char *code_log = getenv("KARICHECK_CODE_LOG");
     if (code_log && *code_log) dns_diag_code_log(code_log);
 #endif
-    /* 0.7: the parsers' syslog(3) lines are karicheck's messages (stdout / stderr, or the JSON document), not lines of the host's system log:
-     * named-checkconf writes none.  A line that the parser also gives dns_diag() is printed once (dns_diag.h dns_diag_klog_hook()). */
-    klog_set_hook(dns_diag_klog_hook);
-    atexit(dns_diag_flush_log);
+    /* 0.7: nothing of the shared parsers goes to the host's system log (named-checkconf writes none).  karicheck's messages are the
+     * dns_diag() ones, as before: a parser site whose syslog line tells the user something gives dns_diag() its twin, the others are the
+     * server's log only (tests/run_logging_test.sh, lint L2), so the syslog lines are dropped and nothing is printed twice. */
+    klog_set_hook(karicheck_klog_drop);
     if (argc >= 2 && strcmp(argv[1], "--json") == 0) {
         /* --json comes before the command; stdout carries only the document, written when the run is over */
         argv[1] = argv[0];

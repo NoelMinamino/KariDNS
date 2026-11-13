@@ -88,12 +88,6 @@ int dns_diag_json_finish(FILE *fp, int status);
 /* Free what JSON mode keeps and leave JSON mode (tests; karicheck lets the process end) */
 void dns_diag_json_reset(void);
 
-/* 0.7: a tool's klog hook (dns_log.h klog_set_hook(); the type is klog_hook_t): the syslog(3) lines of the shared parsers become the tool's
- * messages instead of going to the system log, each printed once (a line whose dns_diag() twin follows is dropped).  dns_diag_flush_log()
- * prints a line still waiting (the other output functions call it; a tool calls it once more before it ends, e.g. with atexit()). */
-void dns_diag_klog_hook(int cat, int prio, const char *fmt, va_list ap, int saved_errno);
-void dns_diag_flush_log(void);
-
 /* JSON string content for in[0..n): '"' and '\\' escaped, every byte below 0x20 and 0x7F as \u00XX, a byte that is not part of a valid
  * UTF-8 sequence replaced by U+FFFD.  The result goes to out like snprintf(): at most cap - 1 bytes and a NUL; returns the length the full
  * result has. */

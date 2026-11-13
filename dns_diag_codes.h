@@ -32,7 +32,6 @@ X (IO_FILE_TOO_LARGE, "io.file.too-large", 'E', "a configuration or zone file is
 X (IO_PIPE, "io.pipe", 'E', "a pipe for the database loader could not be created")
 X (IO_FORK, "io.fork", 'E', "the database loader could not be started")
 X (INTERNAL_OOM, "internal.oom", 'E', "out of memory")
-X (INTERNAL_LOG_MESSAGE, "internal.log-message", 'N', "a message the shared parsers give the server's log, printed by the tool with the severity of its priority (no code of its own)")
 
 /* ---- conf: the configuration parser (dns_config_parser.c) ---- */
 X (CONF_SYNTAX, "conf.syntax", 'E', "a syntax error in a configuration statement")
@@ -50,6 +49,7 @@ X (CONF_VIEW_KEY_DUPLICATE, "conf.view.key-duplicate", 'E', "a TSIG key is defin
 X (CONF_OPTION_BIND_UNIMPLEMENTED, "conf.option.bind-unimplemented", 'W', "a BIND option that KariDNS does not implement is ignored")
 X (CONF_OPTION_UNKNOWN, "conf.option.unknown", 'E', "an option that is neither a KariDNS option nor a BIND option for the statement")
 X (CONF_TSIG_ALGORITHM, "conf.tsig.algorithm", 'E', "a TSIG algorithm that KariDNS does not support")
+X (CONF_TSIG_ALGORITHM_DEPRECATED, "conf.tsig.algorithm-deprecated", 'W', "a TSIG algorithm that is deprecated and insecure (HMAC-MD5, HMAC-SHA1; RFC 8945)")
 X (CONF_TSIG_SECRET_LENGTH, "conf.tsig.secret-length", 'E', "a TSIG secret is too long for its algorithm")
 X (CONF_TSIG_SECRET_BASE64, "conf.tsig.secret-base64", 'E', "a TSIG secret is not valid base64")
 X (CONF_TSIG_SECRET_PLACEHOLDER, "conf.tsig.secret-placeholder", 'W', "a secret is still the placeholder of the sample configuration")

@@ -359,60 +359,7 @@ static void json_store(int sev, dns_diag_code_t code, const char *file, long lin
     m->line = line > 0 ? line : g.ctx_line;
 }
 
-/* ---- the syslog lines of the shared code in a tool (0.7) ----
- * The configuration and zone parsers are the server's: they give syslog(3) their messages (dns_log.h), and most of the ones a tool must show
- * also through dns_diag(), right after the syslog() call and with the same text.  A tool that installs dns_diag_klog_hook() (klog_set_hook())
- * keeps them off the system log (named-checkconf writes none): the line waits here until the next message; when that is its dns_diag() twin
- * (the same text without the "[Prefix] "), the line is dropped, else it is printed as a message of its own (internal.log-message, with the
- * severity of its priority).  So a message is printed once and none is lost.  Single-threaded, as the tools' parse is. */
-static struct {
-    bool has;
-    int prio;
-    char text[1024];
-} g_klog;
-
-static const char *klog_body(const char *t) {
-    if (t[0] == '[') {
-        const char *e = strchr(t, ']');
-        if (e && e[1] == ' ') return e + 2;
-    }
-    return t;
-}
-
-void dns_diag_flush_log(void) {
-    if (!g_klog.has) return;
-    g_klog.has = false;
-    int p = g_klog.prio & 7;                    /* LOG_PRIMASK: emerg .. err, warning, notice, info / debug */
-    int sev = p <= 3 ? DIAG_ERROR : p == 4 ? DIAG_WARNING : p == 5 ? DIAG_NOTE : (DIAG_INFO | DIAG_STDERR);
-    dns_diag(sev, DC_INTERNAL_LOG_MESSAGE, NULL, 0, "%s\n", g_klog.text);
-}
-
-void dns_diag_klog_hook(int cat, int prio, const char *fmt, va_list ap, int saved_errno) {
-    (void)cat;
-    (void)saved_errno;                          /* (no message of the code the tools share uses %m) */
-    dns_diag_flush_log();
-    vsnprintf(g_klog.text, sizeof(g_klog.text), fmt, ap);
-    g_klog.prio = prio;
-    g_klog.has = true;
-}
-
-/* before a message: the waiting syslog line is its twin (dropped) or a message of its own (printed first) */
-static void klog_settle(const char *fmt, va_list ap) {
-    if (!g_klog.has) return;
-    char buf[sizeof(g_klog.text) + 8];
-    va_list ap2;
-    va_copy(ap2, ap);
-    int n = vsnprintf(buf, sizeof(buf), fmt, ap2);
-    va_end(ap2);
-    size_t l = n < 0 ? 0 : (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1;
-    buf[l] = '\0';
-    while (l > 0 && (buf[l - 1] == '\n' || buf[l - 1] == '\r')) buf[--l] = '\0';
-    if (strcmp(klog_body(g_klog.text), buf) == 0) g_klog.has = false;
-    else dns_diag_flush_log();
-}
-
 void dns_vdiag(int sev, dns_diag_code_t code, const char *file, long line, const char *fmt, va_list ap) {
-    klog_settle(fmt, ap);
     dns_diag_code_note(code);
     if (dns_diag_json_enabled()) {
         json_store(sev, code, file, line, fmt, ap);
@@ -482,7 +429,6 @@ void dns_diag_at(int sev, dns_diag_code_t code, const char *loc, const char *fmt
 }
 
 void dns_vdiag_detail(const char *fmt, va_list ap) {
-    dns_diag_flush_log();
     if (!dns_diag_json_enabled()) {
         vfprintf(stderr, fmt, ap);
     } else if (g.nmsgs > 0 && g.dropped == 0) {
@@ -509,12 +455,10 @@ void dns_diag_detail(const char *fmt, ...) {
 }
 
 void dns_vdiag_plain(FILE *fp, const char *fmt, va_list ap) {
-    dns_diag_flush_log();
     if (!dns_diag_json_enabled()) vfprintf(fp, fmt, ap);
 }
 
 void dns_vdiag_ok(const char *fmt, va_list ap) {
-    dns_diag_flush_log();
     if (dns_diag_json_enabled()) return;
     fprintf(stdout, "[%s] ", "OK");
     vfprintf(stdout, fmt, ap);
@@ -537,7 +481,6 @@ static void json_int_or_null(FILE *fp, long v) {
 }
 
 int dns_diag_json_finish(FILE *fp, int status) {
-    dns_diag_flush_log();
     const char *result = status == 0 ? "ok" : status == 2 ? "usage" : "fail";
     fputs("{\n  ", fp);
     json_str(fp, g.tool[0] ? g.tool : "karicheck");

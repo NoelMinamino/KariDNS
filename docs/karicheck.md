@@ -303,7 +303,6 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `io.pipe` | error | a pipe for the database loader could not be created |
 | `io.fork` | error | the database loader could not be started |
 | `internal.oom` | error | out of memory |
-| `internal.log-message` | note | a message the shared parsers give the server's log, printed by the tool with the severity of its priority (no code of its own) |
 | `conf.syntax` | error | a syntax error in a configuration statement |
 | `conf.value.invalid` | error | the value of an option is not one the option accepts |
 | `conf.value.range` | error | a numeric option is outside its range |
@@ -319,6 +318,7 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `conf.option.bind-unimplemented` | warning | a BIND option that KariDNS does not implement is ignored |
 | `conf.option.unknown` | error | an option that is neither a KariDNS option nor a BIND option for the statement |
 | `conf.tsig.algorithm` | error | a TSIG algorithm that KariDNS does not support |
+| `conf.tsig.algorithm-deprecated` | warning | a TSIG algorithm that is deprecated and insecure (HMAC-MD5, HMAC-SHA1; RFC 8945) |
 | `conf.tsig.secret-length` | error | a TSIG secret is too long for its algorithm |
 | `conf.tsig.secret-base64` | error | a TSIG secret is not valid base64 |
 | `conf.tsig.secret-placeholder` | warning | a secret is still the placeholder of the sample configuration |

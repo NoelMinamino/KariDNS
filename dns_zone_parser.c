@@ -2645,9 +2645,11 @@ static void select_nsec3_params(zone_arena_t *arena) {
   if (seen == 0) return;
   const nsec3_params_t *a = &arena->nsec3_active;
   if (!a->param) {
+    /* log only: the lint reports zone.nsec3param.unusable */
     syslog(LOG_NOTICE, "[Zone] %s: none of the %zu NSEC3PARAM RRs is usable (Flags 0, algorithm 1, salt of at most "
            "255 octets; RFC 5155 s4.1.2); NSEC3 is not used for denial of existence", apex, seen);
   } else if (usable > 1 || best_rank < 3) {
+    /* log only: which NSEC3PARAM the server uses; the lint reports zone.nsec3.chain-missing and zone.nsec3.chain-orphan */
     syslog(LOG_NOTICE, "[Zone] %s: using NSEC3PARAM 1 0 %u %s (%zu usable of %zu; chain %s)", apex, a->iterations,
            a->param->rdata[3], usable, seen,
            best_rank == 3 ? "complete" : (best_rank == 2 ? "INCOMPLETE" : "MISSING"));
@@ -2685,6 +2687,7 @@ static void harmonize_rrset_ttls(zone_arena_t *arena) {
     }
 
     if (ri->ttl_value != min_ttl) {
+      /* log only: the lint reports zone.ttl.inconsistent */
       syslog(LOG_WARNING, "[Zone] RRset '%s' type %u: inconsistent TTLs normalized to %u (RFC 2181 s5.2)",
              ri->name, ri->type_code, min_ttl);
     }
@@ -2722,6 +2725,7 @@ static void harmonize_rrset_ttls(zone_arena_t *arena) {
       if (rj->type_code != covered || !rj->name) continue;
       if (strcasecmp(rj->name, ri->name) != 0) continue;
       if (ri->ttl_value != rj->ttl_value) {
+        /* log only: what the server does at load time; karicheck does not report it */
         syslog(LOG_WARNING, "[Zone] RRSIG covering type %u at '%s': TTL %u adjusted to %u (RFC 4035 s2.2)",
                covered, ri->name, ri->ttl_value, rj->ttl_value);
       }
@@ -2768,6 +2772,7 @@ int build_zone_index(zone_arena_t *arena, bool harmonize_ttls) {
   if (arena->hash_size == 0) arena->hash_size = 1;
   arena->hash_table = malloc(sizeof(int) * arena->hash_size);
   if (!arena->hash_table) {
+    /* log only: the load fails */
     syslog(LOG_ERR, "[Zone] build_zone_index: OOM during hash_table allocation");
     return -1;
   }
@@ -2807,12 +2812,14 @@ int build_zone_index(zone_arena_t *arena, bool harmonize_ttls) {
     } else {
       /* X-22: without the index every NSEC lookup would scan the whole zone (the random-subdomain cost of R-34);
        * fail like the NSEC3 index instead (the callers treat it as a load / transfer / UPDATE failure). */
+      /* log only: the load fails */
       syslog(LOG_ERR, "[Zone] build_zone_index: OOM during NSEC index allocation");
       return -1;
     }
   }
 
   if (build_nsec3_index(arena) != 0) {
+    /* log only: the load fails */
     syslog(LOG_ERR, "[Zone] build_zone_index: OOM during NSEC3 index allocation");
     return -1;
   }
