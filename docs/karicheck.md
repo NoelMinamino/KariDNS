@@ -299,6 +299,7 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `io.stat` | error | a file could not be examined with stat |
 | `io.stdin.read` | error | reading standard input failed |
 | `io.stdin.too-large` | error | the zone text on standard input is larger than 64 MiB |
+| `io.file.too-large` | error | a configuration or zone file is larger than the server reads (256 MiB) |
 | `io.pipe` | error | a pipe for the database loader could not be created |
 | `io.fork` | error | the database loader could not be started |
 | `internal.oom` | error | out of memory |
@@ -317,6 +318,7 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `conf.option.bind-unimplemented` | warning | a BIND option that KariDNS does not implement is ignored |
 | `conf.option.unknown` | error | an option that is neither a KariDNS option nor a BIND option for the statement |
 | `conf.tsig.algorithm` | error | a TSIG algorithm that KariDNS does not support |
+| `conf.tsig.algorithm-deprecated` | warning | a TSIG algorithm that is deprecated and insecure (HMAC-MD5, HMAC-SHA1; RFC 8945) |
 | `conf.tsig.secret-length` | error | a TSIG secret is too long for its algorithm |
 | `conf.tsig.secret-base64` | error | a TSIG secret is not valid base64 |
 | `conf.tsig.secret-placeholder` | warning | a secret is still the placeholder of the sample configuration |
@@ -357,6 +359,7 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `conf.zone.multi-master` | note | multi-master has no effect with fewer than two primaries |
 | `conf.zone.refresh-range` | warning | min-refresh-time is larger than max-refresh-time |
 | `conf.zone.retry-range` | warning | min-retry-time is larger than max-retry-time |
+| `conf.zone.primary-settings-unsigned` | warning | a secondary takes the settings of its primary over a transfer without TSIG |
 | `conf.control-key.tsig` | warning | a control-channel key is also used for TSIG |
 | `conf.directory.access` | error | options { directory } cannot be accessed |
 | `conf.directory.not-dir` | error | options { directory } is not a directory |

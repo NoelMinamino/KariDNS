@@ -10,8 +10,11 @@
 #include <string.h>
 
 #include "zone2sql.h"
+#include "../../dns_log.h"
+#undef syslog
 
 int main(int argc, char **argv) {
+    klog_nosyslog_from_env("zone2sql");   /* 0.7: the shared parsers' syslog(3) lines on stderr only under KARIDNS_NOSYSLOG=1 (tests/lib_proc.sh) */
     z2s_dialect_t dialect = Z2S_SQLITE3;
     const char *apex_override = NULL;
     bool tinydns = false;

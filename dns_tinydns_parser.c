@@ -1128,6 +1128,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             if (arena->location_count >= 4096) {
                 /* D14 (review low L4 dns_tinydns_parser.c [15]): fail closed.  A location line that is dropped changes who gets which
                  * answer, and the load used to succeed with a partial map */
+                /* log only: the caller reports err_out (zone.syntax) */
                 syslog(LOG_ERR, "[tinydns] more than 4096 location (%%) lines (line %lu): the data file is refused", linenum);
                 if (ctx && ctx->err_out) {
                     ctx->err_out->error_message = "Too many location lines (more than 4096 '%' lines)";

@@ -3,6 +3,7 @@
 # tests/run_logging_test.sh - logging { } and controls { } of BIND 9.20 (batch 6)
 # ==============================================================================
 #   L  lint: every "[Prefix]" a syslog() site of the server uses is in the category table of dns_log.c
+#   L2 lint: every syslog() call of the parsers karicheck runs has its dns_diag() twin or a "log only" comment (tests/check_log_twins.pl)
 #   K  karicheck conf: logging / controls / statistics-channels: warnings and errors with file:line; a stock BIND logging + controls passes
 #   C  categories to channels in a running server: per-category files, severity filtering (info / warning / critical), print-time local /
 #      iso8601-utc, print-category / print-severity, the category `default`, a stderr channel, a syslog channel (the server's stderr copy of
@@ -123,6 +124,13 @@ for p in $(grep -h -o '"\[[A-Za-z0-9]*[] ]' "$ROOT"/dns_*.c | grep -v '/dns_log.
 done
 # dns_log.c itself shows "[Prefix]" in a comment and is read by the loop above; its own strings are table entries
 [ -z "$bad" ] && pass "L: every [Prefix] of the sources is in the category table" || fail "L: prefixes missing from the table of dns_log.c:$bad"
+# L2 (0.7): karicheck drops the parsers' syslog lines (nothing is printed twice); each syslog() call of the parsers it runs has its dns_diag()
+# twin or is marked "log only" (tests/check_log_twins.pl), so that what a line tells the user is not lost either
+if out=$(perl "$DIR/check_log_twins.pl" "$ROOT/dns_config_parser.c" "$ROOT/dns_zone_parser.c" "$ROOT/dns_tinydns_parser.c" 2>&1); then
+    pass "L2: $(printf '%s\n' "$out" | tail -1)"
+else
+    fail "L2: syslog() lines of the parsers without a dns_diag() twin: $out"
+fi
 
 # ------------------------------------------------------------------------------------------------ K: karicheck conf
 kc_check() { # kc_check NAME CONF EXPECT PATTERN... : error = rc != 0, warn = rc 0; every PATTERN in the output

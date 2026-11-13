@@ -2029,7 +2029,7 @@ static void test_delegation_referral_and_ds_handling(void) {
     bool del_res = find_delegation(arena.image, "www.child.example.com.",
                                    "example.com.", res, sizeof(res), &offset,
                                    &comp_ctx, &nscount, &arcount, false /* not DS */,
-                                   NULL, NULL, NULL, ADDITIONAL_AUTH_YES, &sib_ctx, false);
+                                   NULL, NULL, NULL, ADDITIONAL_AUTH_YES, &sib_ctx, false, NULL);
     assert(del_res == true);
     assert(nscount >= 1); // NS in authority section
     assert(arcount >= 1); // Glue A in additional section
@@ -2042,7 +2042,7 @@ static void test_delegation_referral_and_ds_handling(void) {
     del_res = find_delegation(arena.image, "child.example.com.",
                               "example.com.", res, sizeof(res), &offset,
                               &comp_ctx, &nscount, &arcount, true /* is DS query */,
-                              NULL, NULL, NULL, ADDITIONAL_AUTH_YES, &sib_ctx, false);
+                              NULL, NULL, NULL, ADDITIONAL_AUTH_YES, &sib_ctx, false, NULL);
     assert(del_res == false); // Must return false so DS is handled as authoritative answer/NODATA
 
     zone_arena_destroy(&arena);

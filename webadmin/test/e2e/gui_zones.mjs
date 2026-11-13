@@ -131,6 +131,9 @@ const logout = async () => {
   await b.exec(() => { window.location.hash = '#/'; });                 // (the next sign-in starts at the start page, not at the page that was open)
 };
 const open = async (hash, h1re) => { await b.exec((x) => { window.location.hash = x; }, hash); await waitH1(h1re ?? /./); };
+// The new-zone screen shows its title at once and its form only after the list of templates has come (zonecreate.js load()): wait for the form, not the title
+const waitCreateForm = () => b.waitCss('main [name=name]', { message: 'the form of a new zone' });
+const openCreate = async () => { await open('#/create/main', /^New zone in main$/); await waitCreateForm(); };
 // the records page of a zone, once its table is there (every zone of the scenarios has an SOA)
 const zonePage = async (zone) => {
   await open(`#/zones/main/${zone}`, new RegExp(`^${zone.replace(/\./g, '\\.')}`));
@@ -434,6 +437,7 @@ try {
     await b.waitCss('table tbody tr');
     await click('New zone');
     await waitH1(/^New zone in main$/);
+    await waitCreateForm();
     await labelsOk('new zone');
     // the template
     await fill('name', 'tpl.test');
@@ -450,7 +454,7 @@ try {
     await rowIs('www', 'A', '192.0.2.41', 'the copied record');
     await rowIs('@', 'MX', '10 mail.tpl.test.', 'the relative name of the template became absolute');
     // a form
-    await open('#/create/main', /^New zone in main$/);
+    await openCreate();
     await fill('name', 'form.test');
     await fill('mname', 'ns1.form.test');
     await fill('rname', 'hostmaster.form.test');
@@ -464,7 +468,7 @@ try {
     await rowIs('_sip._tcp', 'SRV', '10 5 5060 sip.form.test.', 'a name inside the data, absolute');
     await rowIs('@', 'NS', 'ns1.form.test.\nns2.form.test.', 'the name servers');
     // a zone file
-    await open('#/create/main', /^New zone in main$/);
+    await openCreate();
     await fill('name', 'text.test');
     await setSelect('how', 'text');
     await fill('zone_text', '$ORIGIN text.test.\n$TTL 300\n@ IN SOA ns1 hostmaster 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\nweb IN A 192.0.2.2\n');
@@ -477,7 +481,7 @@ try {
   });
 
   await scenario('a refusal is told at the field: a zone that exists, a name server that is not a host name', async () => {
-    await open('#/create/main', /^New zone in main$/);
+    await openCreate();
     await fill('name', 'form.test');
     await fill('mname', 'ns1.form.test');
     await fill('rname', 'hostmaster.form.test');

@@ -102,7 +102,17 @@ typedef struct {
     /* 0.7: the debug level in force (karidns -d, karictl trace / notrace).  At the end, so the fields before keep their offsets; the structure
      * grows by 8 bytes (int + tail padding), and a karictl of another version sees a reply of another size (docs/karictl.md "status") */
     int debug_level;
+    /* 0.7: dnstap messages recorded but not delivered to the collector, and the link (dns_dnstap.h dnstap_get_counters()).  Appended as
+     * debug_level was: the structure grows again (32 bytes), so karictl and karidns of different versions refuse each other's reply */
+    uint64_t dnstap_dropped_queue_full;
+    uint64_t dnstap_dropped_not_connected;
+    uint64_t dnstap_reconnects;
+    int dnstap_link;   /* KARIDNS_DNSTAP_LINK_* */
 } karidns_status_t;
+
+#define KARIDNS_DNSTAP_LINK_OFF  0   /* no dnstap block */
+#define KARIDNS_DNSTAP_LINK_DOWN 1   /* configured, no collector connected */
+#define KARIDNS_DNSTAP_LINK_UP   2
 
 // ============================================================================
 // 定数 (dns_server_core.c から移動)

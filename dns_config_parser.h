@@ -364,6 +364,7 @@ typedef struct zone_inview {
 typedef struct zone_ext {
   notify_target_t *masters; /* primaries / masters: addresses with port and optional TSIG key (list names are expanded when the parse ends) */
   int masters_count;
+  char *masters_loc;        /* "file:line" of the primaries / masters statement (owned; NULL when not written), for the messages after the parse */
   cidr_entry_t *masters_parsed;
   char *tsig_key;
   char **tsig_keys;
@@ -1133,12 +1134,6 @@ bool config_xfr_source_allowed(int family, const uint8_t addr[16], bool xfer);
 /* Fills cfg->xfr_sources from every level of the configuration; called when the parse ends.  -1 = out of memory or more than
  * KARIDNS_XFR_SOURCES_MAX distinct addresses (an error with the place has been printed) */
 int config_collect_xfr_sources(token_ctx_t *ctx, server_config_t *cfg);
-/* The TSIG key that signs the requests to primary i of a zone (and verifies its answers; also the key a NOTIFY from it must carry):
- * the primary's own `key`, else the zone's tsig-key, else NULL.  Precedence as for also-notify. */
-static inline const char *zone_primary_key(const zone_ext_t *x, int i) {
-  if (i >= 0 && i < x->masters_count && x->masters[i].key && x->masters[i].key[0]) return x->masters[i].key;
-  return x->tsig_key && x->tsig_key[0] ? x->tsig_key : NULL;
-}
 /* The IXFR history depth of a zone: its own ixfr-history, else the options value, else IXFR_HISTORY_DEFAULT (zone/cfg may be NULL). */
 int ixfr_history_effective(const server_config_t *cfg, const zone_config_t *zone);
 /* I2: the inbound transfer limits of a secondary zone: the zone's max-zone-records / max-zone-bytes, else the options

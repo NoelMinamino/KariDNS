@@ -89,12 +89,12 @@ run_exit_check() {
 echo "=== Running Option & Compatibility Tests ==="
 
 # 1. Base query & flags
-run_check "Standard A query" "$DAG @127.0.0.1 -p $PORT example.com A" "93.184.216.34"
+run_check "Standard A query" "$DAG @127.0.0.1 -p $PORT example.com A" "192.0.2.34"
 run_check "Show Query (+qr)" "$DAG @127.0.0.1 -p $PORT example.com A +qr" ";; Sending:"
 run_check "Microsecond stats (-u)" "$DAG @127.0.0.1 -p $PORT example.com A -u" ";; Query time:.*usec"
 
 # 2. Layout & Formatting
-run_check "No class (+noclass)" "$DAG @127.0.0.1 -p $PORT example.com A +noclass" "example.com\.[[:space:]]+[0-9]+[[:space:]]+A[[:space:]]+93\.184\.216\.34"
+run_check "No class (+noclass)" "$DAG @127.0.0.1 -p $PORT example.com A +noclass" "example.com\.[[:space:]]+[0-9]+[[:space:]]+A[[:space:]]+192\.0\.2\.34"
 run_check "TTL units (+ttlunits)" "$DAG @127.0.0.1 -p $PORT example.com A +ttlunits" "example.com\.[[:space:]]+[0-9]+[smhd][[:space:]]+IN[[:space:]]+A"
 run_check "Unknown format (+unknownformat)" "$DAG @127.0.0.1 -p $PORT example.com A +unknownformat" 'CLASS1[[:space:]]+TYPE1[[:space:]]+\\#[[:space:]]+[0-9]+'
 

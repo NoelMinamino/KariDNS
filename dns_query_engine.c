@@ -768,28 +768,95 @@ STATIC_TEST bool attach_nsec3_record(const zone_image_t *img, uint32_t rr,
                                 attached, attached_count);
 }
 
-/* RFC 5155 §7.2.3 / §7.2.4: no NSEC3 matches `name` (an unsigned delegation in an Opt-Out span): the closest provable
- * encloser proof, the NSEC3 that matches the closest encloser and the one that covers the next closer name (§7.2.1;
- * the cover has the Opt-Out bit). Shared by the referral (find_delegation) and the NODATA answer to a DS query at
- * that delegation. false = it did not fit (the caller sets TC). */
+/* 0.7 (audit Low): a proof that RFC 4035 §3.1.3 (NSEC) or RFC 5155 §7.2 (NSEC3) requires in a negative or wildcard answer, and that the
+ * signed zone does not hold (a gap in its chain: the signer's fault, the server cannot make the record).  The answer goes out as before,
+ * without it (the validator then fails it); the operator is told at warning, category dnssec, as BIND reports damaged zone data at
+ * warning.  On the query path: logev_post() (a record into the worker's ring, the category's rate limit), no allocation, and at most
+ * one line per zone a minute (last_denial_gap_log; a CAS, so two workers do not both write it).  Only reached when the proof is missing. */
+#define DENIAL_GAP_LOG_INTERVAL 60
+/* The NSEC3 that covers `hash` has the Opt-Out flag (RFC 5155 §3.1.2.1: the least significant bit of Flags, the second octet of the RDATA): a
+ * name in its span may lawfully have no NSEC3 of its own (an empty non-terminal above an unsigned delegation, §6), so no gap is said. */
+static bool nsec3_opt_out_at(const zone_image_t *img, uint32_t chain, const char *hash) {
+  uint32_t c = find_covering_nsec3(img, chain, hash);
+  return c != ZONE_IMAGE_NONE && zone_image_rr_rdlen(img, c) >= 2 && (zone_image_rr_rdata(img, c)[1] & 1);
+}
+static void note_denial_gap(zone_db_entry_t *e, const char *name, const char *what) {
+  if (!e || !logev_wanted(LOGC_DNSSEC, LOG_LVL_WARNING)) return;
+  time_t now = time(NULL);
+  time_t last = atomic_load_explicit(&e->last_denial_gap_log, memory_order_relaxed);
+  if (last != 0 && now >= last && now - last < DENIAL_GAP_LOG_INTERVAL) return;
+  if (!atomic_compare_exchange_strong_explicit(&e->last_denial_gap_log, &last, now, memory_order_relaxed, memory_order_relaxed)) return;
+  char zn[DNS_NAME_TEXT_SIZE], qn[DNS_NAME_TEXT_SIZE];
+  logev_name_text(e->domain, zn, sizeof(zn));
+  logev_name_text(name ? name : "", qn, sizeof(qn));
+  logev_post(LOGC_DNSSEC, LOG_LVL_WARNING, NULL, 0, "[DNSSEC] zone '%s': no %s for '%s': the answer goes out without that proof (the zone's "
+             "denial chain has a gap: sign the zone again); said once a minute", zn, what, qn);
+}
+
+/* RFC 5155 §7.2.1: the closest provable encloser of qname, for the closest encloser proof of a name error (§7.2.2), a DS NODATA (§7.2.4) and
+ * a referral (§7.2.7).  It is the closest encloser (find_closest_encloser()) when an NSEC3 matches it.  When none does and the NSEC3 that
+ * covers its hash has the Opt-Out flag, the closest encloser is an empty non-terminal that exists only above insecure delegations (§7.1:
+ * it "MUST have a corresponding NSEC3 RR, unless the empty non-terminal is only derived from an insecure delegation covered by an Opt-Out
+ * NSEC3 RR") and cannot be proved; "the closest enclosing authoritative name is used instead" (§7.2.1): the closest ancestor that an NSEC3
+ * matches, the walk going on through names whose hash is in an Opt-Out span.  The validator then finds that name matched and the name one
+ * label longer covered (§8.3).  *match = the matching NSEC3, ZONE_IMAGE_NONE when no name on the way has one (a gap of the chain: the closest
+ * encloser itself is returned).  The result points into qname or is zone_apex; no copy, no allocation. */
+static const char *closest_provable_encloser(const zone_image_t *img, const zone_n3_t *n3, const char *qname, const char *zone_apex,
+                                             const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag,
+                                             uint32_t *match) {
+  const char *ce = find_closest_encloser(img, qname, zone_apex, client_loc, client_ecs_tag, client_loc_tag);
+  if (!ce) ce = zone_apex;
+  *match = ZONE_IMAGE_NONE;
+  for (const char *c = ce;;) {
+    char h[64];
+    if (!compute_nsec3_hash(c, n3->algorithm, n3->iterations, n3->salt, n3->salt_len, h, sizeof(h))) break;
+    uint32_t m = find_matching_nsec3(img, n3->chain, h, zone_apex);
+    if (m != ZONE_IMAGE_NONE) {
+      *match = m;
+      return c;
+    }
+    if (domain_names_match_ci(c, zone_apex) || !nsec3_opt_out_at(img, n3->chain, h)) break;
+    const char *dot = strchr_unescaped(c, '.');
+    if (!dot || dot[1] == '\0' || !domain_name_is_at_or_below(dot + 1, zone_apex)) break;
+    c = dot + 1;
+  }
+  return ce;
+}
+
+/* RFC 5155 §7.2.4 (DS NODATA) / §7.2.7 (referral): no NSEC3 matches `name` (an unsigned delegation in an Opt-Out span): the closest provable
+ * encloser proof (§7.2.1), the NSEC3 that matches the closest provable encloser and the one that covers the next closer name, which "MUST have
+ * the Opt-Out bit set".  A part that the zone does not hold, or a cover without the Opt-Out flag (then the name needed an NSEC3 of its own,
+ * §6), is a gap (note_denial_gap(); gap_entry NULL: not said; rfc names the section).  false = it did not fit (the caller sets TC). */
 static bool attach_nsec3_optout_proof(const zone_image_t *img, const zone_n3_t *n3, const char *name,
                                       const char *zone_apex, const char client_loc[2], const char *client_ecs_tag,
                                       const char *client_loc_tag, uint8_t *res, size_t max_res_len, uint16_t *offset,
                                       compress_ctx_t *comp_ctx, uint16_t *nscount,
-                                      const zone_image_rr_t **attached, int *attached_count) {
-  const char *encloser = find_closest_encloser(img, name, zone_apex, client_loc, client_ecs_tag, client_loc_tag);
-  if (!encloser) return true;
-  char h[64];
-  if (compute_nsec3_hash(encloser, n3->algorithm, n3->iterations, n3->salt, n3->salt_len, h, sizeof(h)) &&
-      !attach_nsec3_record(img, find_matching_nsec3(img, n3->chain, h, zone_apex), res, max_res_len, offset, comp_ctx,
-                           nscount, attached, attached_count))
+                                      const zone_image_rr_t **attached, int *attached_count,
+                                      zone_db_entry_t *gap_entry, const char *rfc) {
+  uint32_t ce_rec;
+  const char *encloser = closest_provable_encloser(img, n3, name, zone_apex, client_loc, client_ecs_tag, client_loc_tag, &ce_rec);
+  char what[160];
+  if (ce_rec == ZONE_IMAGE_NONE) {
+    snprintf(what, sizeof(what), "NSEC3 that matches the closest provable encloser (%s)", rfc);
+    note_denial_gap(gap_entry, encloser, what);
+  }
+  if (!attach_nsec3_record(img, ce_rec, res, max_res_len, offset, comp_ctx, nscount, attached, attached_count))
     return false;
   char nc_name[DNS_NAME_TEXT_SIZE];
+  char h[64];
   if (find_next_closer_name(name, encloser, nc_name, sizeof(nc_name)) &&
-      compute_nsec3_hash(nc_name, n3->algorithm, n3->iterations, n3->salt, n3->salt_len, h, sizeof(h)) &&
-      !attach_nsec3_record(img, find_covering_nsec3(img, n3->chain, h), res, max_res_len, offset, comp_ctx, nscount,
-                           attached, attached_count))
-    return false;
+      compute_nsec3_hash(nc_name, n3->algorithm, n3->iterations, n3->salt, n3->salt_len, h, sizeof(h))) {
+    uint32_t nc = find_covering_nsec3(img, n3->chain, h);
+    if (nc == ZONE_IMAGE_NONE) {
+      snprintf(what, sizeof(what), "NSEC3 that covers the next closer name (%s)", rfc);
+      note_denial_gap(gap_entry, nc_name, what);
+    } else if (!nsec3_opt_out_at(img, n3->chain, h)) {
+      snprintf(what, sizeof(what), "NSEC3 that matches the name, and it is in no Opt-Out span (%s)", rfc);
+      note_denial_gap(gap_entry, name, what);
+    }
+    if (!attach_nsec3_record(img, nc, res, max_res_len, offset, comp_ctx, nscount, attached, attached_count))
+      return false;
+  }
   return true;
 }
 
@@ -805,7 +872,8 @@ STATIC_TEST bool find_delegation(const zone_image_t *img, const char *qname,
                             const char *client_loc_tag,
                             additional_from_auth_t policy,
                             const glue_sibling_ctx_t *sib_ctx,
-                            bool dnssec_ok) {
+                            bool dnssec_ok,
+                            zone_db_entry_t *gap_entry) {
   if (!img || img->n_names == 0)
     return false;
   /* E3: no owner below the apex has an NS RR: there is no zone cut to find, so skip the hash lookup per label */
@@ -860,6 +928,8 @@ STATIC_TEST bool find_delegation(const zone_image_t *img, const char *qname,
                 }
               }
               if (nsec == ZONE_IMAGE_NONE) {
+                /* RFC 4035 3.1.4: the NSEC of the delegation proves that it has no DS; a signed zone without it has a gap */
+                if (zone_image_nsec_count(img) > 0) note_denial_gap(gap_entry, name, "NSEC of the delegation (RFC 4035 3.1.4)");
                 nsec = find_covering_nsec(img, name);
                 nsec_ttl = 0xFFFFFFFF;
               }
@@ -881,7 +951,7 @@ STATIC_TEST bool find_delegation(const zone_image_t *img, const char *qname,
                     }
                   } else if (!attach_nsec3_optout_proof(img, &n3, name, zone_apex, client_loc, client_ecs_tag,
                                                         client_loc_tag, res, max_res_len, offset, comp_ctx, nscount,
-                                                        attached, &attached_cnt)) {
+                                                        attached, &attached_cnt, gap_entry, "RFC 5155 7.2.7")) {
                     // Opt-Out: Closest Provable Encloser matching NSEC3 and Next Closer covering NSEC3 (RFC 5155 §7.2.3)
                     res[2] |= 0x02;
                     return true;
@@ -1005,6 +1075,7 @@ typedef struct {
   const char *qname;
   const char *apex;
   zone_version_t *zone;
+  zone_db_entry_t *entry;     /* the zone's entry: a missing proof is said for it (note_denial_gap()) */
 } wc_proof_t;
 
 typedef struct {
@@ -1024,7 +1095,7 @@ static const char *wc_proof_dup(wc_proofs_t *p, const char *s) {
   return d;
 }
 
-static void wc_proof_add(wc_proofs_t *p, const char *qname, const char *apex, zone_version_t *zone) {
+static void wc_proof_add(wc_proofs_t *p, const char *qname, const char *apex, zone_version_t *zone, zone_db_entry_t *entry) {
   if (p->n >= WC_PROOF_MAX) { p->overflow = true; return; }
   const char *q = wc_proof_dup(p, qname);
   const char *a = q ? wc_proof_dup(p, apex) : NULL;
@@ -1032,6 +1103,7 @@ static void wc_proof_add(wc_proofs_t *p, const char *qname, const char *apex, zo
   p->e[p->n].qname = q;
   p->e[p->n].apex = a;
   p->e[p->n].zone = zone;
+  p->e[p->n].entry = entry;
   p->n++;
 }
 
@@ -1146,7 +1218,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
                                         : (cfg ? cfg->additional_from_auth : ADDITIONAL_AUTH_YES);
     bool is_ds_query = (num_qtypes > 0 && qtypes[0] == 43);
     if (find_delegation(img, current_qname, db_entry->domain, res,
-                        max_res_len, offset, comp_ctx, nscount, arcount, is_ds_query, client_loc, client_ecs_tag, client_loc_tag, policy, &sib_ctx, dnssec_ok)) {
+                        max_res_len, offset, comp_ctx, nscount, arcount, is_ds_query, client_loc, client_ecs_tag, client_loc_tag, policy, &sib_ctx, dnssec_ok, db_entry)) {
       return;
     }
 
@@ -1422,7 +1494,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
                 if (qtypes[0] != 5 && qtypes[0] != 255) { follow_cname = true; }
               }
               if (follow_cname) {
-                wc_proof_add(&wc_proofs, current_qname, db_entry->domain, current_zone);   /* one proof per expansion (see wc_proof_t) */
+                wc_proof_add(&wc_proofs, current_qname, db_entry->domain, current_zone, db_entry);   /* one proof per expansion (see wc_proof_t) */
                 if (image_serialize_rr(img, k, res, max_res_len, offset, comp_ctx, current_qname, eff_ttl) < 0) {
                   res[2] |= 0x02;
                   return;
@@ -1635,10 +1707,12 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
     zone_n3_t n3;
     bool has_n3 = dnssec_ok && zone_nsec3(img, db_entry->domain, &n3);
     if (dnssec_ok && !has_n3) {
+      const bool nsec_signed = zone_image_nsec_count(img) > 0;   /* a zone without NSEC records is not signed: no proof is missing */
       /* O-17: attach_denial_record() は同じ NSEC を 2 回書かず、RRSIG が入らないときも失敗を返す */
       if (found && wc_found) {
         // RFC 4035 §3.1.3.3: Wildcard answer proof (QNAME non-existence)
         uint32_t cover = find_covering_nsec(img, current_qname);
+        if (cover == ZONE_IMAGE_NONE && nsec_signed) note_denial_gap(db_entry, current_qname, "NSEC that proves no closer match (RFC 4035 3.1.3.3)");
         if (!attach_denial_record(img, cover, 0xFFFFFFFF, res, max_res_len, offset, comp_ctx, nscount,
                                   nsec_attached, &nsec_attached_cnt))
           nsec_failed = true;
@@ -1651,6 +1725,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
             uint32_t wc_id = zone_image_find_name(img, wc_name);
             if (wc_id != ZONE_IMAGE_NONE) {
               uint32_t rk = zone_image_rrset_next(img, wc_id, 47, zone_image_name_first_rr(img, wc_id));
+              if (rk == ZONE_IMAGE_NONE && nsec_signed) note_denial_gap(db_entry, wc_name, "NSEC of the wildcard owner (RFC 4035 3.1.3.4)");
               if (rk != ZONE_IMAGE_NONE) {
                 if (!attach_denial_record(img, rk, 0xFFFFFFFF, res, max_res_len, offset, comp_ctx,
                                           nscount, nsec_attached, &nsec_attached_cnt))
@@ -1681,12 +1756,15 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
         if (ent_nodata && !nsec_failed && !nsec_at_name) {
           // An ENT owns no NSEC; the NSEC that covers it (its next name is a descendant) proves it exists.
           uint32_t cover = find_covering_nsec(img, current_qname);
+          if (cover == ZONE_IMAGE_NONE && nsec_signed) note_denial_gap(db_entry, current_qname, "NSEC that covers the empty non-terminal (RFC 4035 3.1.3.1)");
           if (!attach_denial_record(img, cover, 0xFFFFFFFF, res, max_res_len, offset, comp_ctx, nscount,
                                     nsec_attached, &nsec_attached_cnt))
             nsec_failed = true;
         }
+        if (!ent_nodata && !nsec_at_name && nsec_signed) note_denial_gap(db_entry, current_qname, "NSEC of the name (RFC 4035 3.1.3.1)");
       } else if (!found) {
         uint32_t cover = find_covering_nsec(img, current_qname);
+        if (cover == ZONE_IMAGE_NONE && nsec_signed) note_denial_gap(db_entry, current_qname, "NSEC that covers the name (RFC 4035 3.1.3.2)");
         if (!attach_denial_record(img, cover, 0xFFFFFFFF, res, max_res_len, offset, comp_ctx, nscount,
                                   nsec_attached, &nsec_attached_cnt))
           nsec_failed = true;
@@ -1699,6 +1777,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
             if (written > 0 && (size_t)written < sizeof(wc_name)) {
               if (cover == ZONE_IMAGE_NONE || !nsec_covers_name(img, cover, wc_name)) {
                 uint32_t wc_cover = find_covering_nsec(img, wc_name);
+                if (wc_cover == ZONE_IMAGE_NONE && nsec_signed) note_denial_gap(db_entry, wc_name, "NSEC that covers the wildcard (RFC 4035 3.1.3.2)");
                 if (!attach_denial_record(img, wc_cover, 0xFFFFFFFF, res, max_res_len, offset, comp_ctx,
                                           nscount, nsec_attached, &nsec_attached_cnt))
                   nsec_failed = true;
@@ -1721,6 +1800,10 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
           char ce_hash[64];
           if (compute_nsec3_hash(encloser, algo, iterations, salt, salt_len, ce_hash, sizeof(ce_hash))) {
             uint32_t ce_rec = find_matching_nsec3(img, n3.chain, ce_hash, db_entry->domain);
+            /* a wildcard answer needs no NSEC3 of the closest encloser (§7.2.6: the expansion proves it); wildcard NODATA does (§7.2.5).
+             * The encloser owns the wildcard, so it is an authoritative name (or an empty non-terminal made by it) and has an NSEC3 also
+             * in an Opt-Out zone (§7.1) */
+            if (ce_rec == ZONE_IMAGE_NONE && !all_matched) note_denial_gap(db_entry, encloser, "NSEC3 that matches the closest encloser (RFC 5155 7.2.5)");
             if (ce_rec != ZONE_IMAGE_NONE) {
               if (!attach_nsec3_record(img, ce_rec, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                 nsec_failed = true;
@@ -1733,6 +1816,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
             char nc_hash[64];
             if (compute_nsec3_hash(nc_name, algo, iterations, salt, salt_len, nc_hash, sizeof(nc_hash))) {
               uint32_t nc_cover = find_covering_nsec3(img, n3.chain, nc_hash);
+              if (nc_cover == ZONE_IMAGE_NONE) note_denial_gap(db_entry, nc_name, "NSEC3 that covers the next closer name (RFC 5155 7.2.6)");
               if (nc_cover != ZONE_IMAGE_NONE) {
                 if (!attach_nsec3_record(img, nc_cover, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                   nsec_failed = true;
@@ -1747,6 +1831,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
             char wc_hash[64];
             if (compute_nsec3_hash(wc_name, algo, iterations, salt, salt_len, wc_hash, sizeof(wc_hash))) {
               uint32_t wc_rec = find_matching_nsec3(img, n3.chain, wc_hash, db_entry->domain);
+              if (wc_rec == ZONE_IMAGE_NONE) note_denial_gap(db_entry, wc_name, "NSEC3 that matches the wildcard (RFC 5155 7.2.5)");
               if (wc_rec != ZONE_IMAGE_NONE) {
                 if (!attach_nsec3_record(img, wc_rec, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                   nsec_failed = true;
@@ -1759,30 +1844,38 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
           char q_hash[64];
           if (compute_nsec3_hash(current_qname, algo, iterations, salt, salt_len, q_hash, sizeof(q_hash))) {
             uint32_t m_rec = find_matching_nsec3(img, n3.chain, q_hash, db_entry->domain);
+            /* §7.2.3 (the NSEC3 that matches the name).  Without one:
+             *  - DS at an unsigned delegation in an Opt-Out span (§7.2.4): the closest provable encloser proof (review query_engine [9]);
+             *  - another type at a name whose hash is in an Opt-Out span: an empty non-terminal that only insecure delegations make, which
+             *    §7.1 lets have no NSEC3.  §7.2.3 cannot be met literally there; the answer carries §7.2.1's closest provable encloser
+             *    proof (the NSEC3 of the closest provable encloser, the Opt-Out NSEC3 that covers the next closer name), as BIND 9.20
+             *    does (named 9.20.30; delv 9.20.30 validates it as a negative response).  A part of it the zone lacks is a gap;
+             *  - anything else is a gap of the chain: said, the answer goes out without it. */
+            bool opt_out_ent = m_rec == ZONE_IMAGE_NONE && qtypes[0] != 43 && nsec3_opt_out_at(img, n3.chain, q_hash);
+            if (m_rec == ZONE_IMAGE_NONE && qtypes[0] != 43 && !opt_out_ent) note_denial_gap(db_entry, current_qname, "NSEC3 that matches the name (RFC 5155 7.2.3)");
             if (m_rec != ZONE_IMAGE_NONE) {
               if (!attach_nsec3_record(img, m_rec, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                 nsec_failed = true;
               }
-            } else if (qtypes[0] == 43 &&
+            } else if ((qtypes[0] == 43 || opt_out_ent) &&
                        !attach_nsec3_optout_proof(img, &n3, current_qname, db_entry->domain, client_loc, client_ecs_tag,
                                                   client_loc_tag, res, max_res_len, offset, comp_ctx, nscount,
-                                                  attached_nsec3, &attached_nsec3_cnt)) {
-              /* RFC 5155 §7.2.4: DS at an unsigned delegation in an Opt-Out span has no matching NSEC3; the closest
-               * provable encloser proof instead (review query_engine [9]) */
+                                                  attached_nsec3, &attached_nsec3_cnt, db_entry,
+                                                  qtypes[0] == 43 ? "RFC 5155 7.2.4" : "RFC 5155 7.2.1, no data at an Opt-Out empty non-terminal")) {
               nsec_failed = true;
             }
           }
         } else if (!found) {
-          // NXDOMAIN: Closest Encloser, Next Closer, Wildcard
-          const char *encloser = find_closest_encloser(img, current_qname, db_entry->domain, client_loc, client_ecs_tag, client_loc_tag);
-          if (!encloser) encloser = db_entry->domain;
-          char ce_hash[64];
-          if (compute_nsec3_hash(encloser, algo, iterations, salt, salt_len, ce_hash, sizeof(ce_hash))) {
-            uint32_t ce_rec = find_matching_nsec3(img, n3.chain, ce_hash, db_entry->domain);
-            if (ce_rec != ZONE_IMAGE_NONE) {
-              if (!attach_nsec3_record(img, ce_rec, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
-                nsec_failed = true;
-              }
+          // NXDOMAIN (RFC 5155 §7.2.2): the closest provable encloser proof (§7.2.1: the closest encloser, or above an empty non-terminal
+          // that only insecure delegations in an Opt-Out span make, the closest ancestor an NSEC3 matches), and the NSEC3 that covers the
+          // wildcard at that encloser
+          uint32_t ce_rec;
+          const char *encloser = closest_provable_encloser(img, &n3, current_qname, db_entry->domain, client_loc, client_ecs_tag,
+                                                           client_loc_tag, &ce_rec);
+          if (ce_rec == ZONE_IMAGE_NONE) note_denial_gap(db_entry, encloser, "NSEC3 that matches the closest encloser (RFC 5155 7.2.2)");
+          if (ce_rec != ZONE_IMAGE_NONE) {
+            if (!attach_nsec3_record(img, ce_rec, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
+              nsec_failed = true;
             }
           }
 
@@ -1791,6 +1884,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
             char nc_hash[64];
             if (compute_nsec3_hash(nc_name, algo, iterations, salt, salt_len, nc_hash, sizeof(nc_hash))) {
               uint32_t nc_cover = find_covering_nsec3(img, n3.chain, nc_hash);
+              if (nc_cover == ZONE_IMAGE_NONE) note_denial_gap(db_entry, nc_name, "NSEC3 that covers the next closer name (RFC 5155 7.2.2)");
               if (nc_cover != ZONE_IMAGE_NONE) {
                 if (!attach_nsec3_record(img, nc_cover, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                   nsec_failed = true;
@@ -1804,6 +1898,10 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
           char wc_hash[64];
           if (!nsec_failed && compute_nsec3_hash(wc_name, algo, iterations, salt, salt_len, wc_hash, sizeof(wc_hash))) {
             uint32_t wc_cover = find_covering_nsec3(img, n3.chain, wc_hash);
+            /* (a wildcard that exists at a closest provable encloser above the closest encloser cannot be covered: no proof can be
+             * made, and signing again would not change that; not a gap) */
+            if (wc_cover == ZONE_IMAGE_NONE && find_matching_nsec3(img, n3.chain, wc_hash, db_entry->domain) == ZONE_IMAGE_NONE)
+              note_denial_gap(db_entry, wc_name, "NSEC3 that covers the wildcard (RFC 5155 7.2.2)");
             if (wc_cover != ZONE_IMAGE_NONE) {
               if (!attach_nsec3_record(img, wc_cover, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                 nsec_failed = true;
@@ -1826,6 +1924,8 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
       zone_n3_t wc_n3;
       if (!zone_nsec3(wc_img, wc_apex, &wc_n3)) {
         uint32_t cover = find_covering_nsec(wc_img, first_wc_qname);
+        if (cover == ZONE_IMAGE_NONE && zone_image_nsec_count(wc_img) > 0)
+          note_denial_gap(wc_proofs.e[wi].entry, first_wc_qname, "NSEC that proves no closer match (RFC 4035 3.1.3.3)");
         if (!attach_denial_record(wc_img, cover, 0xFFFFFFFF, res, max_res_len, offset, comp_ctx, nscount,
                                   nsec_attached, &nsec_attached_cnt))
           nsec_failed = true;
@@ -1853,6 +1953,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
             char nc_hash[64];
             if (compute_nsec3_hash(nc_name, algo, iterations, salt, salt_len, nc_hash, sizeof(nc_hash))) {
               uint32_t nc_cover = find_covering_nsec3(wc_img, wc_n3.chain, nc_hash);
+              if (nc_cover == ZONE_IMAGE_NONE) note_denial_gap(wc_proofs.e[wi].entry, nc_name, "NSEC3 that covers the next closer name (RFC 5155 7.2.6)");
               if (nc_cover != ZONE_IMAGE_NONE) {
                 if (!attach_nsec3_record(wc_img, nc_cover, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                   nsec_failed = true;

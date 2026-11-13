@@ -15,6 +15,8 @@
 #include "../dns_db_checkproto.h"
 #include "../dns_cidr.h"
 #include "../dns_tsig_acl.h"
+#include "../dns_log.h"
+#undef syslog   /* karicheck calls no syslog() of its own; dns_log.h is here for klog_set_hook() */
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -30,6 +32,15 @@
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include "karidns_tool_linkage.h"
+
+/* the klog hook of karicheck (main()): the syslog lines of the shared code are dropped */
+static void karicheck_klog_drop(int cat, int prio, const char *fmt, va_list ap, int saved_errno) {
+    (void)cat;
+    (void)prio;
+    (void)fmt;
+    (void)ap;
+    (void)saved_errno;
+}
 
 // Stub for open_via_dir_cache used by dns_config_parser.c
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) {
@@ -63,6 +74,15 @@ KARIDNS_TOOL_FN char *read_file_or_die(const char *path, bool *out_failed) {
         fclose(f);
         if (out_failed) *out_failed = true;
         dns_diag(DIAG_ERROR, DC_IO_READ, path, 0, "Could not read file: %s\n", path);
+        return NULL;
+    }
+    /* 0.7 (audit Low): no larger than the server reads a configuration or zone file (read_entire_file(), server_load_file_cb()).  Checked
+     * on the size the buffer is made for, and at most that much is read: a file that grows after this is read as the size it had here. */
+    if ((uint64_t)len > (uint64_t)KARIDNS_MAX_CONFIG_FILE_SIZE) {
+        fclose(f);
+        if (out_failed) *out_failed = true;
+        dns_diag(DIAG_ERROR, DC_IO_FILE_TOO_LARGE, path, 0, "%s is larger than %lld bytes (the largest file the server reads)\n", path,
+                 (long long)KARIDNS_MAX_CONFIG_FILE_SIZE);
         return NULL;
     }
     char *buf = malloc(len + 1);
@@ -2125,6 +2145,10 @@ int main(int argc, char **argv) {
     const char *code_log = getenv("KARICHECK_CODE_LOG");
     if (code_log && *code_log) dns_diag_code_log(code_log);
 #endif
+    /* 0.7: nothing of the shared parsers goes to the host's system log (named-checkconf writes none).  karicheck's messages are the
+     * dns_diag() ones, as before: a parser site whose syslog line tells the user something gives dns_diag() its twin, the others are the
+     * server's log only (tests/run_logging_test.sh, lint L2), so the syslog lines are dropped and nothing is printed twice. */
+    klog_set_hook(karicheck_klog_drop);
     if (argc >= 2 && strcmp(argv[1], "--json") == 0) {
         /* --json comes before the command; stdout carries only the document, written when the run is over */
         argv[1] = argv[0];

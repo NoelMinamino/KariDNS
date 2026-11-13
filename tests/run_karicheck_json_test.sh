@@ -240,6 +240,10 @@ STDIN_FILE=$T/empty.zone
 jrun "stdin, empty input" 1 zone ex.test - && has "stdin: an empty input is a syntax error, as an empty file is" zone.syntax
 STDIN_FILE=
 jrun "an empty file" 1 zone ex.test "$T/empty.zone" && has "an empty file is a syntax error" zone.syntax
+# a file: the size the server reads (256 MiB), checked from its size (a sparse file)
+truncate -s 268435457 "$T/huge.zone"
+jrun "a file larger than 256 MiB" 1 zone ex.test "$T/huge.zone" && has "file: too large" io.file.too-large
+rm -f "$T/huge.zone"
 # the text mode reads standard input as well
 "$KC" zone ex.test - < "$T/good.zone" > "$T/o.txt" 2>&1; st=$?
 if [ "$st" = 0 ] && grep -q "Zone 'ex.test.' is valid" "$T/o.txt"; then ok "text mode: zone ex.test - reads standard input"; else bad "text mode: stdin" "$(cat "$T/o.txt")"; fi

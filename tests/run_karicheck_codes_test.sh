@@ -55,6 +55,11 @@ fx() {
     if [ $JSONOK = 0 ]; then "$KC" "$@" > /dev/null 2>&1 < /dev/null; return; fi
     "$KC" --json "$@" > "$OUT" 2> /dev/null < /dev/null
     if $JC "$OUT" has "$code"; then ok "$code"; else bad "$code: not in the document of: karicheck --json $*" "$($JC "$OUT" get 'messages.*.code' | tr '\n' ' ')"; fi
+    # 0.7: each message once, and no syslog line of the parsers (tools/karicheck.c drops them; tests/check_log_twins.pl)
+    if ! perl -MJSON::PP -e 'local $/; my $d = JSON::PP->new->decode(<STDIN>); my %s;
+            for my $m (@{$d->{messages}}) { my $t = $m->{text} // ""; exit 1 if $t =~ /^\[[A-Za-z0-9]+\] / || $s{$t}++ } exit 0' < "$OUT"; then
+        bad "$code: a message is in the document twice, or a syslog line is: karicheck --json $*" "$($JC "$OUT" get 'messages.*.text')"
+    fi
 }
 cfix() {            # cfix CODE 'configuration text' [command]
     printf '%s\n' "$2" > "$T/f.conf"
@@ -88,6 +93,8 @@ cfix conf.acl.update-order "key \"k\" { algorithm hmac-sha256; secret \"$SEC\"; 
 cfix conf.transfers-out-zero 'options { transfers-out 0; transfers-per-ns 0; };'
 cfix conf.transfers-per-ns-zero 'options { transfers-out 0; transfers-per-ns 0; };'
 cfix conf.tsig.algorithm "key \"k\" { algorithm hmac-foo; secret \"$SEC\"; };"
+cfix conf.tsig.algorithm-deprecated "key \"k\" { algorithm hmac-sha1; secret \"$SEC\"; };"
+cfix io.read "include \"$T/no-such-include.conf\";"
 cfix conf.tsig.secret-length "key \"k\" { algorithm hmac-sha256; secret \"$LONGSEC\"; };"
 cfix conf.key.duplicate "key \"k\" { algorithm hmac-sha256; secret \"$SEC\"; }; key \"k\" { algorithm hmac-sha256; secret \"$SEC\"; };"
 cfix conf.key.view-clash "key \"k\" { algorithm hmac-sha256; secret \"$SEC\"; }; view \"v\" { key \"k\" { algorithm hmac-sha256; secret \"$SEC\"; }; };"
@@ -265,7 +272,6 @@ zone.zonemd.canonical
 internal.oom
 io.fork
 io.pipe
-io.read
 io.stat
 io.stdin.read
 zone.zonemd.compute-failed

@@ -53,6 +53,7 @@ static const struct { const char *prefix; int cat; } k_prefix_cat[] = {
   { "Notify", LOGC_NOTIFY },
   { "Update", LOGC_UPDATE },
   { "TSIG", LOGC_SECURITY }, { "Cookie", LOGC_SECURITY },
+  { "DNSSEC", LOGC_DNSSEC },
   { "Zone", LOGC_ZONELOAD }, { "ZoneLoader", LOGC_ZONELOAD }, { "Image", LOGC_ZONELOAD }, { "tinydns", LOGC_ZONELOAD },
   { "DB", LOGC_DATABASE },
   { "Network", LOGC_NETWORK },

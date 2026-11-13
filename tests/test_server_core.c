@@ -2274,6 +2274,7 @@ static void test_control_restricted_keys(void) {
         karidns_status_t kst;
         memcpy(&kst, out + 3, sizeof(kst));
         assert(kst.debug_level == 7);
+        assert(kst.dnstap_link == KARIDNS_DNSTAP_LINK_OFF);   /* 0.7: no dnstap block here */
         klog_set_debug_level(0);
     }
 

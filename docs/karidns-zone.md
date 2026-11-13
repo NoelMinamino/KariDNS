@@ -30,7 +30,7 @@ karidns-zone --version | -h | --help
 
 ### What an import does
 
-1. Reads the text (a file, `-` for standard input, at most 64 MiB there) and parses it. A syntax error names the file and the line.
+1. Reads the text (a file, at most 256 MiB as the server reads a zone file, or `-` for standard input, at most 64 MiB there; a larger input is refused, `io.file.too-large` or `io.stdin.too-large`, not cut) and parses it. A syntax error names the file and the line.
 2. Runs the checks of `karicheck zone` on it (with the `check-*` options of the configuration, below). An **error** fails the import and nothing is written. A **warning** is printed and the import goes on; `--strict` makes a warning fail it.
 3. In one transaction: finds the zone or creates it, applies the serial rule, deletes and inserts the rows, puts the zone in the view, adds the reload request.
 4. **Reads the zone back in the same transaction** through the loader's reader (`dns_pdns_reader.c`), applies the size limits of the configuration and the checks of `karicheck db` to it, and commits **only if the loader would load what was written.** A merge that puts a CNAME beside other data, an ALIAS beside an A record, a zone over `max-records`, rows the reader refuses: the transaction is rolled back and the database is as it was (`db.import.verify`, `zone.limits`, `zone.cname.coexists`, ...). A dry run does all of this too.
@@ -414,7 +414,7 @@ then `karictl reconfig`. A signed zone is exported with its signatures and the N
 
 ## LIMITS
 
-- `import` reads up to 64 MiB from standard input. A zone file read from standard input cannot use `$INCLUDE` (there is no directory to read from; `zone.include-stdin`).
+- `import` reads up to 64 MiB from standard input and a zone file of up to 256 MiB (the server's limit for a zone file and an `$INCLUDE`; since 0.7, a larger file used to be read whole). A zone file read from standard input cannot use `$INCLUDE` (there is no directory to read from; `zone.include-stdin`).
 - One zone per `import <zone> <file>`: a BIND-format file with several zones is not split. `import --all` reads tinydns data files only.
 - The size limits are those of the configuration (`max-records`, ...) and of the database block (`max-zone-records`, `max-zone-bytes`); the loader reads at most `max-zone-records` records of a zone.
 - What does not carry over from a tinydns data file: the SOA serial a `.` line takes from the data file's modification time is stored as the number the importer saw (use a `Z` line, or `--serial`), and the text of the data file (comments, order, `-` lines) is not kept.

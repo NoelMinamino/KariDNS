@@ -268,7 +268,8 @@ done
 # KARI_PORT_BASE_MIN in the environment moves the windows (two suites on one host, e.g. two CI-like runs of agents on a shared build host)
 KARI_PORT_BASE_MIN="${KARI_PORT_BASE_MIN:-20000}"
 KARI_PORT_SLOT_SPAN=1000
-# 20000 + 29 * 1000 + 999 = 48999, below the ephemeral port range (49152 ..)
+# 20000 + 29 * 1000 + 999 = 48999: below the IANA dynamic range (49152 ..), but inside the ephemeral range of FreeBSD (net.inet.ip.portrange.first
+# is 10000 by default) and of Linux (32768 ..), so an outgoing connection of another process can hold a port of a window before a test binds it
 KARI_MAX_JOBS=29
 
 detect_ncpu() {
@@ -435,7 +436,7 @@ register_test "unit" "bin" "test_tinydns_paths" "tinydns parser: 23 valid line f
 register_test "unit" "bin" "test_sig0_sign" "RFC 2931 SIG(0) signing verified independently with OpenSSL (RSA/ECDSA/Ed25519)"
 register_test "unit" "bin" "test_snapshot_rebuild" "Zone snapshot rebuild across views, zone lookup & reload_master_zone verdicts"
 register_test "unit" "bin" "test_dag_reassembly" "dag pcap L4 extraction (all link types, padding, fragments) & randomized TCP reassembly (reorder, retransmit, seq wraparound)"
-register_test "unit" "bin" "test_dag_format" "dag RDATA display: RFC 1035 decimal escaping, RFC 8777 AMTRELAY, display->parse round trip of every RR type"
+register_test "unit" "bin" "test_dag_format" "dag RDATA display: RFC 1035 decimal escaping, RFC 8777 AMTRELAY, display->parse round trip of every RR type; 0.7: no syslog line for a malformed answer"
 register_test "unit" "bin" "test_query_engine_protocol" "Query engine protocol: BADVERS, FORMERR/NOTIMP, foreign classes, IXFR/UDP, SOA EXPIRE, NOTIFY+TSIG authorization"
 register_test "unit" "bin" "test_response_cache" "Shared response cache: fill on miss, byte-identical answers, invalidation by generation"
 register_test "unit" "bin" "test_dnssec_proofs" "DNSSEC negative proofs: RFC 5155 App A/B (NSEC3) & RFC 4035 App A/B (NSEC) example zones"
@@ -469,6 +470,7 @@ register_test "dnssec" "sh" "tests/run_zonemd_val_test.sh" "RFC 8976 ZONEMD veri
 register_test "dnssec" "sh" "tests/run_dnssec_negative_soa_rrsig_test.sh" "RFC 4035 Negative response SOA covering RRSIG"
 register_test "dnssec" "sh" "tests/run_ds_delegation_test.sh" "RFC 4035 3.1.4.1 DS at a delegation point: parent answers, referrals, DS for a hosted child apex from the parent (R-32)"
 register_test "dnssec" "sh" "tests/run_dnssec_answer_sections_test.sh" "DNSSEC answers on signed zones: RRSIGs in Authority/Additional, grouped RRsets, NSEC3PARAM choice and 255-octet salt, DS from the parent, delv validation (R-03, R-04, O-16, O-17, R-31, R-32; SKIP without dnssec-signzone)"
+register_test "dnssec" "sh" "tests/run_dnssec_denial_gap_test.sh" "DNSSEC: a gap in the NSEC / NSEC3 chain of a signed zone is logged once a minute per zone, whole zones log nothing (0.7, audit Low; SKIP without dnssec-signzone)"
 register_test "dnssec" "sh" "tests/run_nsec3_owner_query_test.sh" "RFC 5155 7.2.8 queries for NSEC3 owner names: NXDOMAIN with the NSEC3 proof for every QTYPE (UDP/TCP, MQTYPE, minimal-any), apex wildcard answers them as BIND does, RCODE/Answer equal to named, AXFR keeps the NSEC3 RRs (SKIP without dnssec-signzone)"
 
 # 4. Dynamic Update (RFC 2136)
@@ -493,7 +495,7 @@ register_test "catalog" "sh" "tests/run_cve_coo_test.sh" "RFC 9432 CoO tracking 
 
 # 8. DNSTAP Telemetry Logging
 register_test "dnstap" "sh" "tests/run_dnstap_capture_test.sh" "DNSTAP frame streams capture verification"
-register_test "dnstap" "sh" "tests/run_tapstat_test.sh" "karidns-tapstat: file and socket mode, hostile senders, a real karidns dnstap stream aggregated per zone/qname/qtype/rcode/client prefix"
+register_test "dnstap" "sh" "tests/run_tapstat_test.sh" "karidns-tapstat: file and socket mode, hostile senders, a real karidns dnstap stream aggregated per zone/qname/qtype/rcode/client prefix; log-queries no sends AUTH_RESPONSE only"
 register_test "core" "sh" "tests/run_server_core_matrix_test.sh" "Server runtime matrix: dual-stack wildcard, IPv6 NOTIFY, TCP misuse, RRL/TC, log rotation, control errors, daemon/CLI, primary+secondary" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
 register_test "core" "sh" "tests/run_server_core_fi_test.sh" "Server fault injection: startup/runtime syscall failures via LD_PRELOAD shim (no crash allowed)" "serial"   # stress, perf, sanitizer, fuzz or its own parallelism
 
@@ -531,7 +533,7 @@ register_test "core" "sh" "tests/run_log_rotation_timestamp_test.sh" "suffix tim
 register_test "core" "sh" "tests/run_tcp_timeouts_test.sh" "TCP first-message and idle timeouts, partial messages do not extend them (D-06, R-24)"
 register_test "core" "sh" "tests/run_tcp_stall_rcu_test.sh" "A TCP client that does not read its large answers: the worker's send waits outside the read section, two reloads in a row are not postponed (review H2)"
 register_test "core" "sh" "tests/run_forward_failover_test.sh" "Forward zones share forward-timeout between forwarders, mismatched replies ignored (D-20)"
-register_test "core" "sh" "tests/run_dnstap_lifecycle_test.sh" "dnstap query_zone, reconnect through the broker, STOP/FINISH at shutdown (O-03)"
+register_test "core" "sh" "tests/run_dnstap_lifecycle_test.sh" "dnstap query_zone, reconnect through the broker, STOP/FINISH at shutdown (O-03); 0.7: dropped (queue full, not connected), connected and reconnects in karictl status / stats"
 register_test "core" "sh" "tests/run_rrl_bind_keys_test.sh" "RRL keyed like BIND: name, zone for NXDOMAIN, wildcard, client prefix length (D-05)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
 register_test "core" "sh" "tests/run_capsicum_enosys_test.sh" "cap_enter ENOSYS logged, failing backend start-up ends cleanly (O-02, O-15)"
 register_test "core" "sh" "tests/run_manager_signal_race_test.sh" "Manager ends by itself when the Backend dies while routers start; children that ignore SIGTERM are SIGKILLed after the bounded wait, a second SIGTERM at once"

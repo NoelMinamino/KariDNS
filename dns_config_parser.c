@@ -43,7 +43,7 @@ static void *safe_realloc_or_die(void *ptr, size_t size) {
   }
   void *p = realloc(ptr, size);
   if (!p) {
-    syslog(LOG_CRIT, "[Config] Out of memory during config parse (requested %zu bytes)", size);
+    syslog(LOG_CRIT, "[Config] Out of memory during config parse (requested %zu bytes)", size);   /* log only: the parse fails (conf.parse-failed) */
 #ifdef KARIDNS_UNIT_TEST
     return NULL;
 #else
@@ -59,7 +59,7 @@ static void *safe_calloc_or_die(size_t nmemb, size_t size) {
   }
   void *p = calloc(nmemb, size);
   if (!p) {
-    syslog(LOG_CRIT, "[Config] Out of memory during config parse (requested %zu bytes)", nmemb * size);
+    syslog(LOG_CRIT, "[Config] Out of memory during config parse (requested %zu bytes)", nmemb * size);   /* log only: the parse fails (conf.parse-failed) */
 #ifdef KARIDNS_UNIT_TEST
     return NULL;
 #else
@@ -313,6 +313,7 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
       }
       if (tok_file.type != TOKEN_STRING) {
         syslog(LOG_ERR, "[Config] syntax error: expected filename after 'include'");
+        dns_diag_at(DIAG_ERROR, DC_CONF_SYNTAX, NULL, "syntax error: expected filename after 'include'\n");
         free_token(&tok_file);
         ctx->error_occurred = true;
         return (conf_token_t){TOKEN_EOF, NULL, false};
@@ -326,6 +327,7 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
       }
       if (tok_semi.type != TOKEN_SEMICOLON) {
         syslog(LOG_ERR, "[Config] syntax error: missing ';' after include filename '%s'", tok_file.value);
+        dns_diag_at(DIAG_ERROR, DC_CONF_SYNTAX, NULL, "syntax error: missing ';' after include filename '%s'\n", tok_file.value);
         free_token(&tok_file);
         free_token(&tok_semi);
         ctx->error_occurred = true;
@@ -358,6 +360,7 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
 
       if (ctx->depth + 1 >= MAX_INCLUDE_DEPTH) {
         syslog(LOG_ERR, "[Config] include depth exceeded (max %d): '%s'", MAX_INCLUDE_DEPTH, resolved);
+        dns_diag_at(DIAG_ERROR, DC_CONF_SYNTAX, NULL, "include depth exceeded (max %d): '%s'\n", MAX_INCLUDE_DEPTH, resolved);
         ctx->error_occurred = true;
         return (conf_token_t){TOKEN_EOF, NULL, false};
       }
@@ -367,6 +370,7 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
       char *content = read_entire_file(resolved, &inc_dev, &inc_ino);
       if (!content) {
         syslog(LOG_ERR, "[Config] failed to read include file '%s'", resolved);
+        dns_diag_at(DIAG_ERROR, DC_IO_READ, NULL, "failed to read include file '%s'\n", resolved);
         ctx->error_occurred = true;
         return (conf_token_t){TOKEN_EOF, NULL, false};
       }
@@ -385,6 +389,7 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
       }
       if (circular) {
         syslog(LOG_ERR, "[Config] circular include detected: '%s'", resolved);
+        dns_diag_at(DIAG_ERROR, DC_CONF_SYNTAX, NULL, "circular include detected: '%s'\n", resolved);
         free(content);
         ctx->error_occurred = true;
         return (conf_token_t){TOKEN_EOF, NULL, false};
@@ -477,6 +482,8 @@ static void free_zone_ext_fields(zone_ext_t *x) {
   }
   acl_set_free(&x->acl);
   notify_targets_free(x->masters, x->masters_count);
+  free(x->masters_loc);
+  x->masters_loc = NULL;
   if (x->masters_parsed) {
     free(x->masters_parsed);
     x->masters_parsed = NULL;
@@ -1430,7 +1437,7 @@ char *read_entire_file_stat(const char *path, struct stat *out_st) {
   if (fstat(fd, out_st) != 0) {
     memset(out_st, 0, sizeof(*out_st));
   } else if (!S_ISREG(out_st->st_mode)) {   /* a FIFO, a device or a directory is not a configuration or zone file */
-    syslog(LOG_ERR, "[Config] '%s' is not a regular file", path);
+    syslog(LOG_ERR, "[Config] '%s' is not a regular file", path);   /* log only: the caller reports the file (an include: io.read) */
     memset(out_st, 0, sizeof(*out_st));
     close(fd);
     return NULL;
@@ -1462,7 +1469,7 @@ char *read_entire_file_stat(const char *path, struct stat *out_st) {
   fclose(f);
   /* the lexers stop at a NUL, so the rest of the file would be silently ignored: refuse the file */
   if (fsize > 0 && memchr(str, '\0', (size_t)fsize) != NULL) {
-    syslog(LOG_ERR, "[Config] '%s' contains a NUL byte", path);
+    syslog(LOG_ERR, "[Config] '%s' contains a NUL byte", path);   /* log only: the caller reports the file (an include: io.read) */
     free(str);
     return NULL;
   }
@@ -1478,6 +1485,7 @@ static void skip_unknown_block(token_ctx_t *ctx) {
         char loc[256];
         ctx_location(ctx, loc, sizeof(loc));
         syslog(LOG_WARNING, "[Config] %s: end of file inside an unknown statement or block (a missing '}' or ';'?)", loc);
+        dns_diag_at(DIAG_WARNING, DC_CONF_WARNING, loc, "%s: end of file inside an unknown statement or block (a missing '}' or ';'?)\n", loc);
       }
       free_token(&tok);
       break;
@@ -1611,7 +1619,7 @@ bool match_cidr(const char *client_ip_str, const char *cidr_str) {
     /* digits only, as cidr_entry_parse(): strtol would also take leading space, '+' and '-' */
     if (slash[1] >= '0' && slash[1] <= '9') val = strtol(slash + 1, &endptr, 10);
     if (!endptr || *endptr != '\0' || val > 128) {
-        syslog(LOG_WARNING, "[Config] Invalid CIDR prefix in ACL entry: '%s' (rejecting, no match)", cidr_str);
+        syslog(LOG_WARNING, "[Config] Invalid CIDR prefix in ACL entry: '%s' (rejecting, no match)", cidr_str);   /* log only: a match at run time; the parse checks the entries */
         return false;
     }
     prefix = (int)val;
@@ -2286,9 +2294,10 @@ static int chaos_finish(token_ctx_t *ctx, server_config_t *cfg) {
                  c->r_id, cfg->nsid_string);
       return -1;
     }
-    if (!cfg->nsid_string && strlen(c->r_id) > KARIDNS_NSID_MAX)   /* as for `nsid`: too long to be sent, so it is not the NSID (id.server still answers) */
+    if (!cfg->nsid_string && strlen(c->r_id) > KARIDNS_NSID_MAX) {   /* as for `nsid`: too long to be sent, so it is not the NSID (id.server still answers) */
       syslog(LOG_WARNING, "[Config] server-id is longer than %d octets: it is not used as the NSID of the responses", KARIDNS_NSID_MAX);
-    else if (!cfg->nsid_string && (cfg->nsid_string = strdup(c->r_id)) == NULL) return -1;
+      cfg_diag(ctx, DIAG_WARNING, DC_CONF_WARNING, "server-id is longer than %d octets: it is not used as the NSID of the responses\n", KARIDNS_NSID_MAX);
+    } else if (!cfg->nsid_string && (cfg->nsid_string = strdup(c->r_id)) == NULL) return -1;
   }
   if (cfg->dnstap.enabled && cfg->dnstap.bind_form && !cfg->dnstap.socket_path) {   /* BIND check_dnstap(): 'dnstap-output' must be set if 'dnstap' is set */
     conf_error(ctx, "dnstap", "'dnstap-output' must be set if 'dnstap' is set (dnstap-output unix \"/path/to/socket\";)");
@@ -3033,6 +3042,18 @@ static int parse_alias_resolvers(token_ctx_t *ctx, const char *where, ip_port_t 
   return 0;
 }
 
+/* A rate-limit option that is ignored: the server's log and karicheck (a warning; the parse goes on).  fmt has no final line feed. */
+static void rrl_ignored(token_ctx_t *ctx, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void rrl_ignored(token_ctx_t *ctx, const char *fmt, ...) {
+  char msg[512];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, ap);
+  va_end(ap);
+  syslog(LOG_WARNING, "[Config] %s", msg);
+  cfg_diag(ctx, DIAG_WARNING, DC_CONF_WARNING, "%s\n", msg);
+}
+
 static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
   conf_token_t tok = get_next_token(ctx);
   if (tok.type != TOKEN_LBRACE) {
@@ -3109,30 +3130,30 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
 
     if (strcmp(key, "responses-per-second") == 0) {
       if (valid) rrl->responses_per_second = (int)num_val;
-      else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+      else rrl_ignored(ctx, "Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
     } else if (strcmp(key, "nodata-per-second") == 0) {
       if (valid) {
         rrl->nodata_per_second = (int)num_val;
         rrl->nodata_per_second_set = true;
       } else {
-        syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+        rrl_ignored(ctx, "Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
       }
     } else if (strcmp(key, "nxdomains-per-second") == 0) {
       if (valid) rrl->nxdomains_per_second = (int)num_val;
-      else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+      else rrl_ignored(ctx, "Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
     } else if (strcmp(key, "errors-per-second") == 0) {
       if (valid) rrl->errors_per_second = (int)num_val;
-      else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+      else rrl_ignored(ctx, "Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
     } else if (strcmp(key, "referrals-per-second") == 0) {
       if (valid) {
         rrl->referrals_per_second = (int)num_val;
         rrl->referrals_per_second_set = true;
       } else {
-        syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+        rrl_ignored(ctx, "Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
       }
     } else if (strcmp(key, "all-per-second") == 0) {
       if (valid) rrl->all_per_second = (int)num_val;
-      else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+      else rrl_ignored(ctx, "Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
     } else if (strcmp(key, "ipv4-prefix-length") == 0 || strcmp(key, "ipv6-prefix-length") == 0) {
       /* D-05: BIND と同じ名前と範囲 (IPv4 0-32、IPv6 0-128) */
       bool v4 = (key[3] == '4');
@@ -3146,19 +3167,19 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
           rrl->ipv6_prefix_length_set = true;
         }
       } else {
-        syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s' (0-%ld), ignoring",
+        rrl_ignored(ctx, "Invalid value '%s' for rate-limit option '%s' (0-%ld), ignoring",
                val, key, max_len);
       }
     } else if (strcmp(key, "qps-scale") == 0 || strcmp(key, "min-table-size") == 0 ||
                strcmp(key, "max-table-size") == 0) {
       /* BIND の設定をそのまま読めるように受け付けるが、表は固定長でこれらは効かない (D-05) */
-      syslog(LOG_WARNING, "[Config] rate-limit option '%s' is accepted for BIND compatibility but has no effect", key);
+      rrl_ignored(ctx, "rate-limit option '%s' is accepted for BIND compatibility but has no effect", key);
     } else if (strcmp(key, "window") == 0) {
       if (*endptr == '\0' && num_val > 0) rrl->window_seconds = (int)num_val;
-      else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+      else rrl_ignored(ctx, "Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
     } else if (strcmp(key, "slip") == 0) {
       if (valid) rrl->slip = (int)num_val;
-      else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+      else rrl_ignored(ctx, "Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
     } else if (strcmp(key, "log-only") == 0 || strcmp(key, "early-drop") == 0) {
       bool *dst = (strcmp(key, "log-only") == 0) ? &rrl->log_only : &rrl->early_drop;
       if (!parse_config_bool(val, dst)) {
@@ -3168,7 +3189,7 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
         return -1;
       }
     } else {
-      syslog(LOG_WARNING, "[Config] Unknown rate-limit option '%s'", key);
+      rrl_ignored(ctx, "Unknown rate-limit option '%s'", key);
     }
     free(key);
     free(val);
@@ -5172,6 +5193,7 @@ static tsig_key_t *parse_key_block(token_ctx_t *ctx) {
         }
         if (strcasestr(val, "md5") || strcasestr(val, "sha1")) {
           syslog(LOG_WARNING, "[Config] Warning: TSIG algorithm '%s' is deprecated and insecure (RFC 8945)", val);
+          cfg_diag(ctx, DIAG_WARNING, DC_CONF_TSIG_ALGORITHM_DEPRECATED, "Warning: TSIG algorithm '%s' is deprecated and insecure (RFC 8945)\n", val);
         }
         tsig->algorithm = val;
         val = NULL;
@@ -5495,6 +5517,12 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       notify_targets_free(x->masters, x->masters_count);
       x->masters = NULL;
       x->masters_count = 0;
+      {
+        char mloc[300];
+        ctx_location(ctx, mloc, sizeof(mloc));
+        free(x->masters_loc);
+        x->masters_loc = strdup(mloc);   /* (NULL when out of memory: the message after the parse has no place then) */
+      }
       if (parse_notify_targets(ctx, what, &x->masters, &x->masters_count, true) != 0) {
         free(key);
         free_zone_config(zone);
@@ -5971,17 +5999,21 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
   if (zone->type && strcasecmp(zone->type, "program") == 0) {
     if (zone->file) {
       syslog(LOG_WARNING, "[Config] Zone '%s' is type 'program' but has 'file' configured; ignoring file", zone->domain);
+      dns_diag(DIAG_WARNING, DC_CONF_WARNING, NULL, 0, "Zone '%s' is type 'program' but has 'file' configured; ignoring file\n", zone->domain);
     }
     if (x->masters_count > 0) {
       syslog(LOG_WARNING, "[Config] Zone '%s' is type 'program' but has 'masters' configured; ignoring masters", zone->domain);
+      dns_diag(DIAG_WARNING, DC_CONF_WARNING, NULL, 0, "Zone '%s' is type 'program' but has 'masters' configured; ignoring masters\n", zone->domain);
     }
   }
   if (zone->type && strcasecmp(zone->type, "forward") == 0) {
     if (zone->file) {
       syslog(LOG_WARNING, "[Config] Zone '%s' is type 'forward' but has 'file' configured; ignoring file", zone->domain);
+      dns_diag(DIAG_WARNING, DC_CONF_WARNING, NULL, 0, "Zone '%s' is type 'forward' but has 'file' configured; ignoring file\n", zone->domain);
     }
     if (x->masters_count > 0) {
       syslog(LOG_WARNING, "[Config] Zone '%s' is type 'forward' but has 'masters' configured; ignoring masters", zone->domain);
+      dns_diag(DIAG_WARNING, DC_CONF_WARNING, NULL, 0, "Zone '%s' is type 'forward' but has 'masters' configured; ignoring masters\n", zone->domain);
     }
   }
   if (x->allow_update_count > 0 && zone->type &&
@@ -8271,6 +8303,44 @@ static int control_keys_resolve(token_ctx_t *ctx, server_config_t *cfg) {
   return 0;
 }
 
+/* 0.7 (audit M3): a secondary zone that takes the settings of its primary (primary-settings yes, the default; Extended AXFR version 3) from a
+ * primary whose transfer is not signed.  The settings carry ACLs (allow-transfer, ecs-trusted-resolvers): anybody who can answer instead of
+ * the primary can widen them (docs/karidns.md, the [!WARNING] of "Secondary zones: Extended AXFR version 3 and the settings of the
+ * primary").  After the lists are expanded (so that the key of a remote-servers list counts) and after servers_check_keys() (every key
+ * named is defined).  The key is the one the transfer signs with (xfr_primary_setup()): peer_key_name() of the primaries element's key, the
+ * `server` statement of the view that covers the primary's address (config_server_find_ip(): the view's own list, else the top-level one)
+ * and the zone's tsig-key.  Shared by karicheck and the server's start-up and reload log; a database or catalog member secondary has no
+ * zone { } and is not looked at. */
+static void primary_settings_notes(const server_config_t *config) {
+  for (const view_config_t *v = config->views; v; v = v->next)
+    for (const zone_config_t *z = v->zones; z; z = z->next) {
+      const zone_ext_t *zx = z->ext;
+      if (!zx || zx->primary_settings_off || zx->masters_count <= 0 || !z->type ||
+          (strcasecmp(z->type, "slave") != 0 && strcasecmp(z->type, "secondary") != 0))
+        continue;
+      int unsigned_n = 0, first = -1;
+      for (int i = 0; i < zx->masters_count; i++)
+        if (!peer_key_name(zx->masters[i].key, config_server_find_ip(config, v->name, zx->masters[i].ip), zx->tsig_key)) {
+          if (first < 0) first = i;
+          unsigned_n++;
+        }
+      if (first < 0) continue;
+      const char *loc = zx->masters_loc ? zx->masters_loc : "configuration";
+      bool dflt = !v->name || strcmp(v->name, "__default__") == 0;
+      char more[48] = "";
+      if (unsigned_n > 1) snprintf(more, sizeof(more), " (and %d more)", unsigned_n - 1);
+      const char *ip = zx->masters[first].ip ? zx->masters[first].ip : "?";
+      syslog(LOG_WARNING, "[Config] %s: zone '%s'%s%s%s: primary %s%s has no TSIG key, and primary-settings is yes (the default): the settings the primary "
+             "sends with the zone (allow-transfer, ecs-trusted-resolvers, ...) are taken from an unsigned transfer. Sign it (tsig-key, key in "
+             "primaries, or keys in a server statement) or write 'primary-settings no;' (docs/karidns.md, Extended AXFR version 3, WARNING)", loc, z->domain,
+             dflt ? "" : " (view '", dflt ? "" : v->name, dflt ? "" : "')", ip, more);
+      dns_diag_at(DIAG_WARNING, DC_CONF_ZONE_PRIMARY_SETTINGS_UNSIGNED, loc, "%s: zone '%s'%s%s%s: primary %s%s has no TSIG key, and primary-settings is yes "
+                  "(the default): the settings the primary sends with the zone (allow-transfer, ecs-trusted-resolvers, ...) are taken from an unsigned "
+                  "transfer. Sign it (tsig-key, key in primaries, or keys in a server statement) or write 'primary-settings no;' (docs/karidns.md, Extended AXFR version 3, WARNING)\n",
+                  loc, z->domain, dflt ? "" : " (view '", dflt ? "" : v->name, dflt ? "" : "')", ip, more);
+    }
+}
+
 static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) {
   int nr_rc = 0;
   memset(config, 0, sizeof(server_config_t));
@@ -9085,7 +9155,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
               syslog(LOG_ERR, "[Config] Duplicate zone '%s' defined in view '%s'; rejecting configuration", z->domain, view->name);
               cfg_diag(ctx, DIAG_ERROR, DC_CONF_ZONE_DUPLICATE, "Duplicate zone '%s' defined in view '%s'\n", z->domain, view->name);
             } else {
-              syslog(LOG_ERR, "[Config] Out of memory indexing zone '%s'", z->domain);
+              syslog(LOG_ERR, "[Config] Out of memory indexing zone '%s'", z->domain);   /* log only: the parse fails (conf.parse-failed) */
             }
             free_zone_config(z);
             free_partial_view(view);
@@ -9232,7 +9302,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           syslog(LOG_ERR, "[Config] Duplicate zone '%s' defined (top-level); rejecting configuration", zone->domain);
           cfg_diag(ctx, DIAG_ERROR, DC_CONF_ZONE_DUPLICATE, "Duplicate zone '%s' defined\n", zone->domain);
         } else {
-          syslog(LOG_ERR, "[Config] Out of memory indexing zone '%s'", zone->domain);
+          syslog(LOG_ERR, "[Config] Out of memory indexing zone '%s'", zone->domain);   /* log only: the parse fails (conf.parse-failed) */
         }
         free_zone_config(zone);
         return -1;
@@ -9405,6 +9475,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             }
             if (strcasestr(val, "md5") || strcasestr(val, "sha1")) {
               syslog(LOG_WARNING, "[Config] Warning: TSIG algorithm '%s' is deprecated and insecure (RFC 8945)", val);
+              cfg_diag(ctx, DIAG_WARNING, DC_CONF_TSIG_ALGORITHM_DEPRECATED, "Warning: TSIG algorithm '%s' is deprecated and insecure (RFC 8945)\n", val);
             }
             if (config->control.algorithm) free(config->control.algorithm);
             config->control.algorithm = val;
@@ -9499,6 +9570,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   if (control_keys_resolve(ctx, config) != 0) return -1;
   if (saw_view_block && saw_top_level_zone) {
     syslog(LOG_ERR, "Cannot mix top-level zone and view blocks");
+    cfg_diag(ctx, DIAG_ERROR, DC_CONF_SYNTAX, "Cannot mix top-level zone and view blocks\n");
     // トップレベル直付けの zone_config_t リストを完全解放してリークを防ぐ
     zone_config_t *curr = config->zones;
     while (curr) {
@@ -9662,6 +9734,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   }
   ctx->scope_keys = NULL;
   if (servers_check_keys(ctx, config) != 0) return -1;
+  primary_settings_notes(config);
 
   config->any_zone_tcp_opts = false;
   for (view_config_t *v = config->views; v && !config->any_zone_tcp_opts; v = v->next) {
@@ -10075,6 +10148,7 @@ static zone_ext_t *zone_ext_clone(const zone_ext_t *s) {
   *d = *s;
   /* every pointer of the copy is rebuilt below; until then it must not alias the source */
   d->masters = NULL; d->masters_count = 0; d->masters_parsed = NULL; /* notify_mode is copied with *d = *s */
+  d->masters_loc = NULL;   /* only the messages after the parse read it: not copied */
   d->tsig_key = NULL;
   d->tsig_keys = NULL; d->tsig_keys_count = 0;
   d->also_notify = NULL; d->also_notify_count = 0; /* also_notify_set is copied with *d = *s */

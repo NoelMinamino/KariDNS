@@ -40,6 +40,9 @@
 #include "../dns_zone_rows.h"
 #include "../dns_zone_text.h"
 
+/* dns_zone_import.c, KARIDNS_UNIT_TEST: zi_read_fd() on a descriptor */
+size_t zi_test_read_fd(zi_t *z, int fd, size_t size_hint, size_t max);
+
 #ifdef KARIDNS_DB_SQLITE3
 #include <sqlite3.h>
 #endif
@@ -1132,6 +1135,47 @@ static void t_inputs(void) {
     CHECK(strstr(g_log, "$INCLUDE file could not be read") != NULL);
     unlink(lnk);
     unlink(fifo);
+    /* 0.7 (audit Low): a zone file larger than the server reads (256 MiB) is refused from its size, as standard input is above 64 MiB
+     * (a sparse file: nothing is read) */
+    {
+        char huge[600];
+        snprintf(huge, sizeof(huge), "%s/huge.zone", g_dir);
+        int hf = open(huge, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        CHECK(hf >= 0 && ftruncate(hf, (off_t)268435457) == 0);
+        if (hf >= 0) close(hf);
+        zi_input_t hin = { huge, NULL, 0, 0 };
+        log_reset();
+        CHECK(z && zi_import_zone(z, &hin, NULL, &r) == ZI_FAIL);
+        LOG_HAS("io.file.too-large");
+        CHECK(strstr(g_log, "is larger than 268435456 bytes") != NULL);
+        unlink(huge);
+    }
+    /* 0.7 (review): a source that holds more than its size said (a file that grew while it was read) is never accepted past the limit: the
+     * buffer grows to the limit at most and one more byte decides (zi_read_fd(); a pipe with n bytes, a size hint of hint, the limit max) */
+    {
+        static const struct { size_t hint, n, max; bool ok; } cs[] = {
+            { 10, 150, 100, false },    /* the buffer used to double from the hint past the limit: 176 bytes of room, 150 accepted */
+            { 100, 101, 100, false },   /* a hint of the limit used to leave room for one byte more */
+            { 200, 101, 100, false },   /* a hint above the limit */
+            { 10, 100, 100, true },     /* exactly the limit */
+            { 100, 100, 100, true },
+            { 0, 99, 100, true },
+        };
+        char data[256];
+        memset(data, 'x', sizeof(data));
+        for (size_t i = 0; i < sizeof(cs) / sizeof(cs[0]); i++) {
+            int p[2];
+            CHECK(pipe(p) == 0);
+            CHECK(write(p[1], data, cs[i].n) == (ssize_t)cs[i].n);
+            close(p[1]);
+            log_reset();
+            size_t got = zi_test_read_fd(z, p[0], cs[i].hint, cs[i].max);
+            close(p[0]);
+            CHECK_MSG(cs[i].ok ? got == cs[i].n : got == (size_t)-1, "case %zu: hint %zu, %zu bytes, limit %zu: got %zu", i, cs[i].hint, cs[i].n,
+                      cs[i].max, got);
+            if (!cs[i].ok) LOG_HAS("io.file.too-large");
+        }
+    }
     /* standard input: the text of a file on file descriptor 0; $INCLUDE is refused */
     write_file(path, "$ORIGIN stdin.test.\n$TTL 300\n@ IN SOA ns1 hostmaster 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n", 0644);
     int saved = dup(0), fd = open(path, O_RDONLY);

@@ -10,6 +10,7 @@
 #   perl tests/mock_dnstap_receiver.pl --socket /path/to/socket [--output <file>]
 #                                      [--max-frames <N>] [--timeout <sec>]
 #                                      [--connections <N>] [--drop-after <N>]
+#                                      [--stall-after <N> --stall <sec>]
 # ==============================================================================
 
 use strict;
@@ -25,6 +26,8 @@ my $timeout_sec = 10;
 my $verbose     = 0;
 my $connections = 1;
 my $drop_after  = 0;
+my $stall_after = 0;
+my $stall_sec   = 0;
 
 GetOptions(
     'socket=s'     => \$socket_path,
@@ -34,9 +37,11 @@ GetOptions(
     'verbose|v'    => \$verbose,
     'connections=i' => \$connections,
     'drop-after=i'  => \$drop_after,
+    'stall-after=i' => \$stall_after,
+    'stall=f'       => \$stall_sec,
     'help|h'       => sub {
         print "Usage: $0 --socket <path> [--output <file>] [--max-frames <N>] [--timeout <sec>] "
-            . "[--connections <N>] [--drop-after <N>]\n";
+            . "[--connections <N>] [--drop-after <N>] [--stall-after <N> --stall <sec>]\n";
         exit 0;
     }
 );
@@ -64,7 +69,9 @@ my $frame_count = 0;
 
 # --connections N: serve N connections one after the other (the sender reconnects after a
 # drop). --drop-after K: close the first connection after K data frames, like a collector
-# that is restarted.
+# that is restarted. --stall-after K --stall S: on the first connection, stop reading after
+# K data frames for S seconds (a collector that cannot keep up: the sender's queue fills),
+# then close it like --drop-after.
 CONNECTION: for my $conn_no (1 .. $connections) {
     my @ready = $sel->can_read($timeout_sec);
     if (!@ready) {
@@ -118,6 +125,14 @@ CONNECTION: for my $conn_no (1 .. $connections) {
         last CONNECTION if ($max_frames > 0 && $frame_count >= $max_frames);
         if ($conn_no == 1 && $drop_after > 0 && $conn_frames >= $drop_after) {
             print $out_fh "[DNSTAP] dropping connection #1\n";
+            $out_fh->flush();
+            last;
+        }
+        if ($conn_no == 1 && $stall_after > 0 && $conn_frames >= $stall_after) {
+            print $out_fh "[DNSTAP] stalling connection #1\n";
+            $out_fh->flush();
+            select(undef, undef, undef, $stall_sec);
+            print $out_fh "[DNSTAP] dropping connection #1 after the stall\n";
             $out_fh->flush();
             last;
         }

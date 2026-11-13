@@ -498,7 +498,7 @@ sub process_dns_query {
     # --------------------------------------------------------------------------
     # Default fallback: Standard A record
     # --------------------------------------------------------------------------
-    my $answers = encode_name($qname) . pack('nnNn', 1, 1, 300, 4) . pack('C4', 93, 184, 216, 34);
+    my $answers = encode_name($qname) . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 34);
     my $opt_rr = '';
     my $ar_count = 0;
     if ($has_edns) {

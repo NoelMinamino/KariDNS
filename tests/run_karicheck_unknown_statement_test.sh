@@ -9,6 +9,7 @@
 # 2026-10-28 (with file:line); unknown top-level blocks are still skipped (logging { } is strict since batch 6).
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+. "$ROOT/tests/lib_proc.sh"   # (KARIDNS_NOSYSLOG=1: nothing to the host's system log when run on its own)
 cd "$ROOT" || exit 1
 KARIDNS=${KARIDNS:-./karidns}
 for b in ./karicheck "$KARIDNS"; do
