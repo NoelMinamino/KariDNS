@@ -7,7 +7,9 @@
 #   L2  50 rounds of 4 processes started at the same instant: in every round exactly one takes the lock (it holds it 2 s, longer than the 1 s a loser
 #       waits), and the times that winners hold it never overlap;
 #   L3  a 0.6.x lock file (a pid as text) naming a live process that is not a signer (pid 1) does not block the start: it becomes the lock file;
-#   L4  a read-only directory: the lock file cannot be made, and the message says so (as root this part runs as the user nobody, or is SKIPped).
+#   L4  a read-only directory: the lock file cannot be made, and the message says so (as root this part runs as the user nobody, or is SKIPped);
+#   L5  the lock path is not trusted: a symbolic link to a plain file is refused and its target untouched; as root, a lock file that belongs to nobody
+#       is refused and not written (SKIP without root).
 # Runs as any user.  SKIP (exit 0) without node 22.13 or newer, or perl's Fcntl F_GETLK.  About three minutes.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -148,6 +150,31 @@ case "$MSG" in
     *) fail "L4: $MSG" ;;
 esac
 chmod 755 "$RO"
+
+echo "-- L5: the lock path is not trusted (a link, a file of another user)"
+printf 'keep me\n' > "$T/target.txt"
+ln -s "$T/target.txt" "$T/l5.sqlite3.signer.lock"
+MSG=$("$NODE" "$T/lock.mjs" "$T/l5.sqlite3.signer.lock" hold 2>/dev/null)
+echo "   $MSG"
+case "$MSG" in
+    "refused cannot take the lock file $T/l5.sqlite3.signer.lock: it is a symbolic link"*) pass "L5: a symbolic link is refused" ;;
+    *) fail "L5: link: $MSG" ;;
+esac
+[ "$(cat "$T/target.txt")" = "keep me" ] && pass "L5: the target of the link is untouched" || fail "L5: the target of the link changed"
+if [ "$(id -u)" = 0 ] && id nobody > /dev/null 2>&1; then
+    : > "$T/l6.sqlite3.signer.lock"
+    chown nobody "$T/l6.sqlite3.signer.lock"
+    NU=$(id -u nobody)
+    MSG=$("$NODE" "$T/lock.mjs" "$T/l6.sqlite3.signer.lock" hold 2>/dev/null)
+    echo "   $MSG"
+    case "$MSG" in
+        "refused cannot take the lock file $T/l6.sqlite3.signer.lock: it belongs to uid $NU, not to the signer's user (uid 0): chown it"*) pass "L5: a file of another user (nobody) is refused (root)" ;;
+        *) fail "L5: other user: $MSG" ;;
+    esac
+    [ -s "$T/l6.sqlite3.signer.lock" ] && fail "L5: the file of the other user was written" || pass "L5: the file of the other user is untouched"
+else
+    echo "SKIP: L5 file of another user (needs root and the user nobody)"
+fi
 
 if [ $FAIL = 0 ]; then echo "=== run_signer_lock_test: all checks passed ==="; exit 0; fi
 echo "=== run_signer_lock_test: FAILED ==="
