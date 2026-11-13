@@ -8282,8 +8282,11 @@ static int control_keys_resolve(token_ctx_t *ctx, server_config_t *cfg) {
 /* 0.7 (audit M3): a secondary zone that takes the settings of its primary (primary-settings yes, the default; Extended AXFR version 3) from a
  * primary whose transfer is not signed.  The settings carry ACLs (allow-transfer, ecs-trusted-resolvers): anybody who can answer instead of
  * the primary can widen them (docs/karidns.md, the [!WARNING] of "Secondary zones: Extended AXFR version 3 and the settings of the
- * primary").  After the lists are expanded, so that the key of a remote-servers list counts (zone_primary_key()).  Shared by karicheck and
- * the server's start-up and reload log; a database or catalog member secondary has no zone { } and is not looked at. */
+ * primary").  After the lists are expanded (so that the key of a remote-servers list counts) and after servers_check_keys() (every key
+ * named is defined).  The key is the one the transfer signs with (xfr_primary_setup()): peer_key_name() of the primaries element's key, the
+ * `server` statement of the view that covers the primary's address (config_server_find_ip(): the view's own list, else the top-level one)
+ * and the zone's tsig-key.  Shared by karicheck and the server's start-up and reload log; a database or catalog member secondary has no
+ * zone { } and is not looked at. */
 static void primary_settings_notes(const server_config_t *config) {
   for (const view_config_t *v = config->views; v; v = v->next)
     for (const zone_config_t *z = v->zones; z; z = z->next) {
@@ -8293,7 +8296,7 @@ static void primary_settings_notes(const server_config_t *config) {
         continue;
       int unsigned_n = 0, first = -1;
       for (int i = 0; i < zx->masters_count; i++)
-        if (!zone_primary_key(zx, i)) {
+        if (!peer_key_name(zx->masters[i].key, config_server_find_ip(config, v->name, zx->masters[i].ip), zx->tsig_key)) {
           if (first < 0) first = i;
           unsigned_n++;
         }
@@ -8304,12 +8307,12 @@ static void primary_settings_notes(const server_config_t *config) {
       if (unsigned_n > 1) snprintf(more, sizeof(more), " (and %d more)", unsigned_n - 1);
       const char *ip = zx->masters[first].ip ? zx->masters[first].ip : "?";
       syslog(LOG_WARNING, "[Config] %s: zone '%s'%s%s%s: primary %s%s has no TSIG key, and primary-settings is yes (the default): the settings the primary "
-             "sends with the zone (allow-transfer, ecs-trusted-resolvers, ...) are taken from an unsigned transfer. Sign it (tsig-key, or key in "
-             "primaries) or write 'primary-settings no;' (docs/karidns.md, Extended AXFR version 3, WARNING)", loc, z->domain,
+             "sends with the zone (allow-transfer, ecs-trusted-resolvers, ...) are taken from an unsigned transfer. Sign it (tsig-key, key in "
+             "primaries, or keys in a server statement) or write 'primary-settings no;' (docs/karidns.md, Extended AXFR version 3, WARNING)", loc, z->domain,
              dflt ? "" : " (view '", dflt ? "" : v->name, dflt ? "" : "')", ip, more);
       dns_diag_at(DIAG_WARNING, DC_CONF_ZONE_PRIMARY_SETTINGS_UNSIGNED, loc, "%s: zone '%s'%s%s%s: primary %s%s has no TSIG key, and primary-settings is yes "
                   "(the default): the settings the primary sends with the zone (allow-transfer, ecs-trusted-resolvers, ...) are taken from an unsigned "
-                  "transfer. Sign it (tsig-key, or key in primaries) or write 'primary-settings no;' (docs/karidns.md, Extended AXFR version 3, WARNING)\n",
+                  "transfer. Sign it (tsig-key, key in primaries, or keys in a server statement) or write 'primary-settings no;' (docs/karidns.md, Extended AXFR version 3, WARNING)\n",
                   loc, z->domain, dflt ? "" : " (view '", dflt ? "" : v->name, dflt ? "" : "')", ip, more);
     }
 }

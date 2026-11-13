@@ -3135,11 +3135,11 @@ static void test_primaries_and_notify_mode(void) {
             CHECK(strcmp(x->masters[0].ip, "192.0.2.1") == 0 && x->masters[0].port == 5300 && x->masters[0].list == NULL);
             CHECK(x->masters[1].port == 5301 && x->masters[1].key && strcmp(x->masters[1].key, "k1") == 0);
             CHECK(strcmp(x->masters[2].ip, "2001:db8::5") == 0 && x->masters[2].port == 5400);
-            CHECK_STR(zone_primary_key(x, 0), "k2");   /* no key of its own: the zone's tsig-key */
-            CHECK_STR(zone_primary_key(x, 1), "k1");   /* its own key wins */
+            CHECK_STR(peer_key_name(x->masters[0].key, NULL, x->tsig_key), "k2");   /* no key of its own: the zone's tsig-key */
+            CHECK_STR(peer_key_name(x->masters[1].key, NULL, x->tsig_key), "k1");   /* its own key wins */
         }
         x = zext(zone_in_view(&cfg, "__default__", "t.test"));
-        CHECK(x->masters_count == 2 && x->masters[0].port == 5353 && x->masters[1].port == 5360 && zone_primary_key(x, 0) == NULL);
+        CHECK(x->masters_count == 2 && x->masters[0].port == 5353 && x->masters[1].port == 5360 && peer_key_name(x->masters[0].key, NULL, x->tsig_key) == NULL);
         free_server_config_fields(&cfg);
     }
     if (parse_ok("zone \"s.test\" { type slave; masters { 192.0.2.1; }; primaries { 192.0.2.2 port 5353; 192.0.2.3; }; };", &cfg)) {
@@ -3665,6 +3665,33 @@ static void test_primary_settings_unsigned(void) {
     free_server_config_fields(&cfg);
     expect_silent("primary-settings no", "zone \"z.test\" { type slave; masters { 192.0.2.1; }; primary-settings no; };", &cfg);
     free_server_config_fields(&cfg);
+    /* the `keys` of the server statement that covers the primary sign the transfer as well (peer_key_name(), xfr_primary_setup()): the
+     * warning takes the key the transfer takes, view by view */
+    snprintf(txt, sizeof(txt), "%sserver 192.0.2.1 { keys k; };\nzone \"z.test\" { type secondary; primaries { 192.0.2.1; }; };", key);
+    expect_silent("the keys of a top-level server statement", txt, &cfg);
+    free_server_config_fields(&cfg);
+    snprintf(txt, sizeof(txt), "%sserver 192.0.2.0/24 { keys k; };\nzone \"z.test\" { type secondary; primaries { 192.0.2.1; 192.0.2.9; }; };", key);
+    expect_silent("the keys of a server statement for a prefix", txt, &cfg);
+    free_server_config_fields(&cfg);
+    snprintf(txt, sizeof(txt), "%sserver 192.0.2.0/24 { keys k; };\nzone \"z.test\" { type secondary; primaries { 192.0.2.1; 198.51.100.1; }; };", key);
+    if (ok_with("a primary outside the server statement's prefix", txt, "primary 198.51.100.1 has no TSIG key", &cfg))
+        free_server_config_fields(&cfg);
+    snprintf(txt, sizeof(txt), "%sview \"v\" { server 192.0.2.1 { keys k; }; zone \"z.test\" { type secondary; primaries { 192.0.2.1; }; }; };", key);
+    expect_silent("the keys of a view's own server statement", txt, &cfg);
+    free_server_config_fields(&cfg);
+    /* a view's own server statements replace the top-level ones as a whole (config_server_find()): the top-level key does not reach it */
+    snprintf(txt, sizeof(txt), "%sserver 192.0.2.1 { keys k; };\nview \"v\" { server 192.0.2.7 { keys k; }; zone \"z.test\" { type secondary; primaries { 192.0.2.1; }; }; };", key);
+    if (ok_with("a view with server statements of its own", txt, "zone 'z.test.' (view 'v')|primary 192.0.2.1 has no TSIG key", &cfg))
+        free_server_config_fields(&cfg);
+    snprintf(txt, sizeof(txt), "%sserver 192.0.2.1 { keys k; };\nview \"v\" { zone \"z.test\" { type secondary; primaries { 192.0.2.1; }; }; };", key);
+    expect_silent("a view without server statements takes the top-level ones", txt, &cfg);
+    free_server_config_fields(&cfg);
+    snprintf(txt, sizeof(txt), "%sserver 192.0.2.1 { transfers 2; };\nzone \"z.test\" { type secondary; primaries { 192.0.2.1; }; };", key);
+    if (ok_with("a server statement without keys", txt, "primary 192.0.2.1 has no TSIG key|or keys in a server statement", &cfg))
+        free_server_config_fields(&cfg);
+    /* a key that is not defined: the configuration is refused (servers_check_keys()) before the warning is looked at */
+    expect_an_error("a server statement with an undefined key", "server 192.0.2.1 { keys nokey; };\nzone \"z.test\" { type secondary; primaries { 192.0.2.1; }; };",
+                    "server '192.0.2.1': unknown key 'nokey'");
 }
 
 static void test_bind_logging(void) {
