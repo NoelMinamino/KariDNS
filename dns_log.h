@@ -58,6 +58,16 @@ void logev_set_mask(int cat, uint32_t mask);
 /* the bit of level in a mask */
 #define LOGEV_BIT(level) (1u << ((level) - LOGEV_LEVEL_MIN))
 
+/* ---- the debug level in force (0.7: BIND's `named -d`, `rndc trace` / `notrace`) ----
+ * One value for the process, 0 .. 99 (BIND's range).  It is a switch, not a data structure: read relaxed.  A `severity dynamic` channel passes
+ * the messages up to it, and the built-in default_debug writes only while it is above 0 (dns_log.c klog_channel_passes()).  It is changed only
+ * through klog_set_debug_level() (dns_log.c), which also recomputes g_logev_mask: the event path stays one atomic load. */
+#define KLOG_DEBUG_LEVEL_MAX 99
+extern _Atomic int g_klog_debug_level;
+static inline int klog_debug_level(void) {
+  return atomic_load_explicit(&g_klog_debug_level, memory_order_relaxed);
+}
+
 typedef void (*logev_sink_t)(void *ctx, int cat, int level, const char *client_ip, int client_port, const char *msg);
 void logev_set_thread_sink(logev_sink_t fn, void *ctx);
 /* The line of a record for the channels: "client <ip>#<port>: <msg>" (no client: msg).  Returns the length. */

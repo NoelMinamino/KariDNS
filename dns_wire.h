@@ -99,6 +99,9 @@ typedef struct {
     uint64_t other_bytes_retired;
     uint64_t db_bytes_previous;       /* the versions kept for `karictl rollback` (rollback-window), not served */
     uint64_t other_bytes_previous;
+    /* 0.7: the debug level in force (karidns -d, karictl trace / notrace).  At the end, so the fields before keep their offsets; the structure
+     * grows by 8 bytes (int + tail padding), and a karictl of another version sees a reply of another size (docs/karictl.md "status") */
+    int debug_level;
 } karidns_status_t;
 
 // ============================================================================

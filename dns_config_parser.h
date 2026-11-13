@@ -555,6 +555,8 @@ typedef struct log_channel {
   int current_date;
   bool size_reached;          /* a file with a size limit and no versions is full: nothing is written until it is shorter (BIND FILE_MAXREACHED) */
   time_t size_recheck;        /* when the file was last looked at while it was full */
+  bool debug_only;            /* the built-in default_debug (BIND ISC_LOG_DEBUGONLY): written only while the debug level is above 0; its file is
+                               * optional (a file that cannot be opened makes it a null channel, with a warning).  Never set by the parser */
   pthread_mutex_t lock;
   struct log_channel *next;
 } log_channel_t;
@@ -574,7 +576,12 @@ typedef struct {
    * when `category responses` lists one.  The query path reads only these two. */
   bool queries_enabled;
   bool responses_enabled;
+  /* the file of the built-in default_debug channel: "karidns.run" in options { directory } (BIND: named.run in the working directory); NULL
+   * without a directory, and default_debug is then a null channel.  Set by config_apply_directory(); only the server opens it (dns_log.c) */
+  char *debug_file;
 } logging_config_t;
+
+#define KLOG_DEBUG_FILE_NAME "karidns.run"
 
 /* One `controls { inet ...; }` entry as written (BIND 9.20 lib/isccfg/namedconf.c inetcontrol_fields).  karictl uses control-channel; these
  * are only checked and then ignored. */
@@ -590,7 +597,9 @@ typedef struct {
 
 /* The commands of the control channel as permission bits (a key's permission is a mask of these).  `reload` is the full reload and
  * `reload-zone` is `reload <zone> [view] [force]`; CTLP_READ covers status, zonestatus, observatory, dbstatus, stats and obspage (BIND's read-only set);
- * CTLP_OTHER is every other word (test-only commands, unknown commands): only a key with full power reaches them. */
+ * CTLP_TRACE is `trace [<level>]` and `notrace` (0.7: the debug level; its own name, because debug output can show more than the read-only commands);
+ * CTLP_OTHER is every other word (test-only commands, unknown commands): only a key with full power reaches them.  The bits are never stored or
+ * sent anywhere (a key's mask is built when the configuration is read), so a new one may be added at the top. */
 #define CTLP_RELOAD      (1u << 0)
 #define CTLP_RELOAD_ZONE (1u << 1)
 #define CTLP_RECONFIG    (1u << 2)
@@ -600,10 +609,11 @@ typedef struct {
 #define CTLP_ROLLBACK    (1u << 6)
 #define CTLP_READ        (1u << 7)
 #define CTLP_OTHER       (1u << 8)
-#define CTLP_FULL        ((1u << 9) - 1u)
-/* the bit a command needs: reload with an argument is CTLP_RELOAD_ZONE, without CTLP_RELOAD */
+#define CTLP_TRACE       (1u << 9)
+#define CTLP_FULL        ((1u << 10) - 1u)
+/* the bit a command needs: reload with an argument is CTLP_RELOAD_ZONE, without CTLP_RELOAD; trace and notrace are CTLP_TRACE */
 uint32_t control_command_perm(const char *cmd, bool has_arg);
-/* the bit of an allow-commands name (reload, reload-zone, reconfig, stop, notify, retransfer, rollback); 0 = not a name */
+/* the bit of an allow-commands name (reload, reload-zone, reconfig, stop, notify, retransfer, rollback, trace); 0 = not a name */
 uint32_t control_perm_from_name(const char *name);
 
 /* One key of control-channel { keys { } }.  The names are read first and the key { } statements may come later in the file, so the

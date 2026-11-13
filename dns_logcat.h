@@ -45,8 +45,8 @@ typedef enum {
 /* "choose the category from the "[Prefix]" of the message" (see dns_log.c) */
 #define LOGC_AUTO (-1)
 
-/* Severities as in BIND (lib/isc/include/isc/log.h): critical .. info are negative, 0 is "dynamic" (the debug level in force; KariDNS has
- * no debug level, so it is 0), debug N is N. */
+/* Severities as in BIND (lib/isc/include/isc/log.h): critical .. info are negative, 0 is "dynamic" (the debug level in force: karidns -d,
+ * karictl trace; dns_log.h klog_debug_level()), debug N is N. */
 #define LOG_LVL_CRITICAL (-5)
 #define LOG_LVL_ERROR (-4)
 #define LOG_LVL_WARNING (-3)

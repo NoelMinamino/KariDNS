@@ -931,6 +931,7 @@ void kdns_logc(int cat, int prio, const char *fmt, ...) {
 /* ---- event messages (dns_log.h): the mask, the rate limit, the thread's sink ---- */
 
 _Atomic uint32_t g_logev_mask[LOGC_COUNT];
+_Atomic int g_klog_debug_level;   /* (dns_log.h; set by dns_log.c klog_set_debug_level()) */
 static _Atomic(klog_level_hook_t) g_klog_level_hook;
 static _Thread_local struct { logev_sink_t fn; void *ctx; } t_logev_sink;
 

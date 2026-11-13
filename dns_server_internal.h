@@ -1389,7 +1389,10 @@ bool klog_guard_enter(void);
 void klog_guard_leave(bool prev);
 int klog_category_for_message(const char *fmt);
 int klog_level_from_priority(int prio);
-bool klog_level_passes(int channel_level, int level);
+bool klog_level_passes(int channel_level, int level, int debug_level);   /* a channel severity, a message level, the debug level in force */
+bool klog_channel_passes(const log_channel_t *ch, int level);            /* ... of a channel, at the level in force (and default_debug's rule) */
+bool klog_parse_debug_level(const char *s, int *out);                    /* "0" .. "99" */
+void klog_set_debug_level(int level);                                    /* the level in force, and g_logev_mask[] with it */
 size_t klog_build_line(const log_channel_t *ch, int cat, int level, const struct timespec *ts, const char *msg, char *out, size_t n);
 void klog_channel_emit(log_channel_t *ch, int cat, int level, const struct timespec *ts, const char *msg);
 void klog_record(log_runtime_t *rt, int cat, int level, const struct timespec *ts, const char *msg);

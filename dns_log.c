@@ -3,8 +3,9 @@
  * The messages come from syslog() calls turned into kdns_syslog() by dns_log.h; klog_route() below is the hook that receives them.  The
  * BIND behaviour followed here is lib/isc/log.c isc_log_doit():
  *   - a category with channels writes to those channels; a category without writes to the channels of the `default` category; with none
- *     there either, to the built-in default_syslog (named adds default_debug, which writes nothing here: KariDNS has no debug level);
- *   - a channel passes a message when its severity is at least the message's (`dynamic`: when the debug level, 0 here, is);
+ *     there either, to the built-in default_syslog and default_debug (bin/named/log.c named_log_setdefaultcategory());
+ *   - a channel passes a message when its severity is at least the message's (`dynamic`: when the debug level in force is; the built-in
+ *     default_debug only while that level is above 0, ISC_LOG_DEBUGONLY);
  *   - a line is "<time> <category>: <severity>: <text>", each part when the channel asks for it;
  *   - syslog channels call syslog(facility | priority, ...), file channels append, stderr channels write to descriptor 2.
  *
@@ -32,7 +33,7 @@
 #undef syslog   /* the real syslog() below; dns_log.h only matters to the callers */
 
 /* ---- the category of a message: its "[Prefix]" ----
- * Every syslog() site of the server starts its text with "[Prefix] "; the table maps the prefixes to BIND's categories.  tests/run_log_test.sh
+ * Every syslog() site of the server starts its text with "[Prefix] "; the table maps the prefixes to BIND's categories.  tests/run_logging_test.sh
  * checks that every prefix used in the sources is in the table.  Messages without a prefix, or with one that is not in the table, are
  * "general".  A site whose prefix gives the wrong category says so with kdns_logc(). */
 static const struct { const char *prefix; int cat; } k_prefix_cat[] = {
@@ -77,10 +78,35 @@ int klog_level_from_priority(int prio) {
   }
 }
 
-/* isc_log_doit(): `if (channel->level == ISC_LOG_DYNAMIC) { if (dlevel < level) continue; } else if (channel->level < level) continue;`.  The debug
- * level in force is 0 (there is no -d / rndc trace). */
-bool klog_level_passes(int channel_level, int level) {
-  return channel_level == LOG_LVL_DYNAMIC ? level <= 0 : level <= channel_level;
+/* BIND 9.20.4 lib/isc/log.c isc_log_doit(): `if (channel->level == ISC_LOG_DYNAMIC) { if (lctx->debug_level < level) continue; } else if
+ * (channel->level < level) continue;`.  A `severity debug n` channel is a fixed level n: it passes up to debug n whatever the level in force
+ * (bin/named/logconf.c channel_fromconf() gives a channel of the file no ISC_LOG_DEBUGONLY flag). */
+bool klog_level_passes(int channel_level, int level, int debug_level) {
+  return channel_level == LOG_LVL_DYNAMIC ? level <= debug_level : level <= channel_level;
+}
+
+/* The same for a channel with the level in force: and, before it, isc_log_doit()'s `if ((channel->flags & ISC_LOG_DEBUGONLY) != 0 &&
+ * lctx->debug_level == 0) continue;` -- the built-in default_debug writes nothing at level 0, not even an error. */
+static bool klog_channel_passes_at(const log_channel_t *ch, int level, int debug_level) {
+  if (ch->debug_only && debug_level == 0) return false;
+  return klog_level_passes(ch->level, level, debug_level);
+}
+
+bool klog_channel_passes(const log_channel_t *ch, int level) {
+  return klog_channel_passes_at(ch, level, klog_debug_level());
+}
+
+/* A debug level as `named -d` and `rndc trace <level>` take it: decimal digits only, 0 .. 99 (BIND's range).  false: not a level. */
+bool klog_parse_debug_level(const char *s, int *out) {
+  if (!s || !*s) return false;
+  int v = 0;
+  for (const char *p = s; *p; p++) {
+    if (*p < '0' || *p > '9') return false;
+    v = v * 10 + (*p - '0');
+    if (v > KLOG_DEBUG_LEVEL_MAX) return false;
+  }
+  *out = v;
+  return true;
 }
 
 /* syslog_map[] */
@@ -184,7 +210,9 @@ void klog_set_role(klog_role_t role) {
  * for this line and never roll it here. */
 static void klog_aux_append(const log_channel_t *ch, const char *line, size_t len) {
   if (!ch->file_path) return;
-  int fd = open_via_dir_cache(ch->file_path, O_WRONLY | O_APPEND | O_CREAT, 0644, true);
+  /* default_debug: only appended to.  The Backend created karidns.run at the start and the start-up gave it to the run user; this process
+   * (the manager is root) must not create one of its own when it has gone */
+  int fd = open_via_dir_cache(ch->file_path, O_WRONLY | O_APPEND | (ch->debug_only ? 0 : O_CREAT), 0644, true);
   if (fd < 0) return;
   ssize_t w = write(fd, line, len);
   (void)w;
@@ -331,22 +359,29 @@ static log_channel_t *rt_find(log_runtime_t *rt, const char *name) {
   return NULL;
 }
 
-/* lib/isc/log.c isc_logconfig_create() and bin/named/log.c: default_syslog (daemon, info), default_stderr (stderr, info, with the time),
- * default_debug (a file, named.run, that is written only with a debug level above 0 -- here it writes nothing) and null */
-static bool rt_add_builtins(log_runtime_t *rt, log_channel_t **tail) {
+/* lib/isc/log.c isc_logconfig_create() and bin/named/log.c named_log_setdefaultchannels(): default_syslog (daemon, info), default_stderr
+ * (stderr, info, with the time), default_debug (`file "named.run"; severity dynamic;` with the time and ISC_LOG_DEBUGONLY: written only while
+ * the debug level is above 0) and null.  KariDNS's default_debug is the file lc->debug_file (karidns.run in options { directory }), and a null
+ * channel without a directory.  *dbg: the built-in default_debug. */
+static bool rt_add_builtins(const logging_config_t *lc, log_channel_t **tail, log_channel_t **dbg) {
+  const char *df = lc ? lc->debug_file : NULL;
   log_channel_t *b[4] = {
     rt_new_channel("default_syslog", LOGDEST_SYSLOG, LOG_LVL_INFO, LOGTIME_NONE),
     rt_new_channel("default_stderr", LOGDEST_STDERR, LOG_LVL_INFO, LOGTIME_LOCAL),
-    rt_new_channel("default_debug", LOGDEST_NULL, LOG_LVL_DYNAMIC, LOGTIME_LOCAL),
+    rt_new_channel("default_debug", df ? LOGDEST_FILE : LOGDEST_NULL, LOG_LVL_DYNAMIC, LOGTIME_LOCAL),
     rt_new_channel("null", LOGDEST_NULL, LOG_LVL_DYNAMIC, LOGTIME_NONE),
   };
   bool ok = true;
+  *dbg = b[2];
+  if (b[2]) {
+    b[2]->debug_only = true;
+    if (df && !(b[2]->file_path = strdup(df))) ok = false;
+  }
   for (int i = 0; i < 4; i++) {
     if (!b[i]) { ok = false; continue; }
     *tail = b[i];
     tail = &b[i]->next;
   }
-  (void)rt;
   return ok;
 }
 
@@ -363,19 +398,27 @@ log_runtime_t *log_runtime_build(const logging_config_t *lc, bool hand_off, logr
     *tail = c;
     tail = &c->next;
   }
-  if (!rt_add_builtins(rt, tail)) goto fail;
-  /* the table: a category's own channels, else the `default` category's, else the built-in default_syslog */
+  log_channel_t *builtin_dbg = NULL;
+  if (!rt_add_builtins(lc, tail, &builtin_dbg)) goto fail;
+  /* the table: a category's own channels, else the `default` category's, else default_syslog and default_debug (ARM 8.2.10: "category default
+   * { default_syslog; default_debug; };"; a channel of the file with one of these names stands in for the built-in one, as in BIND) */
+  bool dbg_used = false;
   for (int cat = 0; cat < LOGC_COUNT; cat++) {
     const log_cat_cfg_t *src = lc && lc->cat[cat].n > 0 ? &lc->cat[cat] : lc && lc->cat[LOGC_DEFAULT].n > 0 ? &lc->cat[LOGC_DEFAULT] : NULL;
     if (!src) {
       rt->route[cat][rt->nroute[cat]++] = rt_find(rt, "default_syslog");
-      continue;
+      rt->route[cat][rt->nroute[cat]++] = rt_find(rt, "default_debug");
+    } else {
+      for (int i = 0; i < src->n; i++) {
+        log_channel_t *c = rt_find(rt, src->name[i]);
+        if (c) rt->route[cat][rt->nroute[cat]++] = c;
+      }
     }
-    for (int i = 0; i < src->n; i++) {
-      log_channel_t *c = rt_find(rt, src->name[i]);
-      if (c) rt->route[cat][rt->nroute[cat]++] = c;
-    }
+    for (int i = 0; i < rt->nroute[cat]; i++) dbg_used |= rt->route[cat][i] == builtin_dbg;
   }
+  /* karidns.run is created only when some category writes to the built-in default_debug (BIND opens named.run when it first writes to it;
+   * the Backend cannot create a file after the start, so it is opened here, before the sandbox, and at a reload through the directory fd) */
+  if (!dbg_used) builtin_dbg->dest = LOGDEST_NULL;
   int rc = log_open_channels(rt->channels, hand_off);
   if (rc != 0) {
     *status = rc > 0 ? LOGRT_RESTART : LOGRT_ERROR;
@@ -433,8 +476,37 @@ void klog_guard_leave(bool prev) {
   t_inside = prev;
 }
 
-static uint32_t rt_level_mask(const log_runtime_t *rt, int cat);
+static uint32_t rt_level_mask(const log_runtime_t *rt, int cat, int debug_level);
 static void klog_emit_level(int cat, int level, const char *msg);
+
+/* bumped by every install, after the new runtime is current (klog_refresh_masks()) */
+static _Atomic uint32_t g_rt_gen;
+
+/* g_logev_mask[] from the installed runtime and the debug level in force: what log_runtime_install() and klog_set_debug_level() both need.  An
+ * install (a reload, on the thread that runs it) and a level change (the control thread) can overlap; each stores its masks and then looks
+ * again: when the runtime or the level changed meanwhile, its masks may be the stale ones and it computes them again.  The last writer has
+ * therefore always seen the runtime and the level in force.  No lock, nothing allocated; a worker that reads a mask in between sees the old or
+ * the new value of that category, either of which was right a moment ago. */
+static void klog_refresh_masks(void) {
+  for (;;) {
+    uint32_t gen = atomic_load(&g_rt_gen);
+    int dl = klog_debug_level();
+    log_runtime_t *rt = log_runtime_acquire();
+    if (!rt) return;
+    for (int c = 0; c < LOGC_COUNT; c++) logev_set_mask(c, rt_level_mask(rt, c, dl));   /* (the event messages of dns_log.h look at it before they build anything) */
+    log_runtime_release(rt);
+    if (atomic_load(&g_rt_gen) == gen && klog_debug_level() == dl) return;
+  }
+}
+
+/* `named -d`, `rndc trace` / `notrace` (BIND bin/named/server.c named_server_setdebuglevel(): isc_log_setdebuglevel()).  Opens nothing: a
+ * channel that is to receive the output exists already (Rule 2). */
+void klog_set_debug_level(int level) {
+  if (level < 0) level = 0;
+  if (level > KLOG_DEBUG_LEVEL_MAX) level = KLOG_DEBUG_LEVEL_MAX;
+  atomic_store_explicit(&g_klog_debug_level, level, memory_order_relaxed);
+  klog_refresh_masks();
+}
 
 bool log_runtime_install(log_runtime_t *nrt) {
   int old = atomic_load(&g_rt_cur);
@@ -448,7 +520,8 @@ bool log_runtime_install(log_runtime_t *nrt) {
   nrt->slot = ns;
   atomic_store(&g_rt_slot[ns], nrt);
   atomic_store(&g_rt_cur, ns);
-  for (int c = 0; c < LOGC_COUNT; c++) logev_set_mask(c, rt_level_mask(nrt, c));   /* (the event messages of dns_log.h look at it before they build anything) */
+  atomic_fetch_add(&g_rt_gen, 1);
+  klog_refresh_masks();
   klog_set_level_hook(klog_emit_level);
   klog_set_hook(klog_route);
   if (old >= 0) {
@@ -475,20 +548,22 @@ log_channel_t *const *log_runtime_route(const log_runtime_t *rt, int cat, int *n
 
 /* One record to the channels of its category. */
 void klog_record(log_runtime_t *rt, int cat, int level, const struct timespec *ts, const char *msg) {
+  const int dl = klog_debug_level();
   for (int i = 0; i < rt->nroute[cat]; i++) {
     log_channel_t *ch = rt->route[cat][i];
-    if (klog_level_passes(ch->level, level)) klog_channel_emit(ch, cat, level, ts, msg);
+    if (klog_channel_passes_at(ch, level, dl)) klog_channel_emit(ch, cat, level, ts, msg);
   }
 }
 
-/* The levels a category passes (the bits of g_logev_mask: dns_log.h), for the channels that write somewhere */
-static uint32_t rt_level_mask(const log_runtime_t *rt, int cat) {
+/* The levels a category passes at that debug level (the bits of g_logev_mask: dns_log.h), for the channels that write somewhere.  The mask
+ * stops at debug 10 (LOGEV_LEVEL_MAX): a level above is never asked for (logev_wanted() says no). */
+static uint32_t rt_level_mask(const log_runtime_t *rt, int cat, int debug_level) {
   uint32_t mask = 0;
   for (int i = 0; i < rt->nroute[cat]; i++) {
     const log_channel_t *ch = rt->route[cat][i];
     if (ch->dest == LOGDEST_NULL) continue;
     for (int l = LOGEV_LEVEL_MIN; l <= LOGEV_LEVEL_MAX; l++)
-      if (klog_level_passes(ch->level, l)) mask |= LOGEV_BIT(l);
+      if (klog_channel_passes_at(ch, l, debug_level)) mask |= LOGEV_BIT(l);
   }
   return mask;
 }
@@ -505,6 +580,11 @@ static void klog_sanitize(char *msg) {
 /* The hook of kdns_syslog() / kdns_logc().  A message logged while a message is being written (a rotation that fails, say) goes to syslog()
  * directly, so that a log call cannot wait for the channel lock its own thread holds. */
 static void klog_route(int cat, int prio, const char *fmt, va_list ap, int saved_errno) {
+  const int level = klog_level_from_priority(prio);
+  if (cat < 0 || cat >= LOGC_COUNT) cat = klog_category_for_message(fmt);
+  /* a debug message that no channel wants is not formatted (the mask of the category says so: one atomic load).  Only debug: the masks of a
+   * runtime that is being installed lag it by a moment, and an error must not be lost in that moment */
+  if (level > 0 && !t_inside && !logev_wanted(cat, level)) return;
   char msg[KLOG_MSG_MAX];
   klog_vformat(msg, sizeof(msg), fmt, ap, saved_errno);
   klog_sanitize(msg);
@@ -520,7 +600,7 @@ static void klog_route(int cat, int prio, const char *fmt, va_list ap, int saved
   bool guard = klog_guard_enter();
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
-  klog_record(rt, cat < 0 || cat >= LOGC_COUNT ? klog_category_for_message(fmt) : cat, klog_level_from_priority(prio), &ts, msg);
+  klog_record(rt, cat, level, &ts, msg);
   klog_guard_leave(guard);
   log_runtime_release(rt);
   pthread_setcancelstate(cancel_state, NULL);

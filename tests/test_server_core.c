@@ -2050,6 +2050,33 @@ static void test_control_restricted_keys(void) {
     assert(strncmp(out, "ERROR no previous version", 25) == 0);
     test_ctrl_once(&sun, EVP_sha256(), admin_secret, "bogus\n", out, sizeof(out));
     assert(strcmp(out, "ERROR unknown command\n") == 0);
+    /* 0.7: trace / notrace through the dispatcher; a full key has the permission */
+    test_ctrl_once(&sun, EVP_sha256(), admin_secret, "trace 5\n", out, sizeof(out));
+    assert(strcmp(out, "OK debug level is now 5\n") == 0 && klog_debug_level() == 5);
+    test_ctrl_once(&sun, EVP_sha256(), main_secret, "trace\n", out, sizeof(out));
+    assert(strcmp(out, "OK debug level is now 6\n") == 0);
+    test_ctrl_once(&sun, EVP_sha256(), admin_secret, "trace 1 2\n", out, sizeof(out));
+    assert(strncmp(out, "ERROR trace takes one argument", 30) == 0 && klog_debug_level() == 6);
+    test_ctrl_once(&sun, EVP_sha256(), admin_secret, "notrace\n", out, sizeof(out));
+    assert(strcmp(out, "OK debug level is now 0\n") == 0 && klog_debug_level() == 0);
+    {   /* status carries the level */
+        test_ctrl_once(&sun, EVP_sha256(), admin_secret, "trace 7\n", out, sizeof(out));
+        int sfd = test_ctrl_login(&sun, EVP_sha256(), admin_secret);
+        assert(sfd >= 0);
+        assert(send(sfd, "status\n", 7, 0) == 7);
+        size_t got = 0;
+        while (got < 3 + sizeof(karidns_status_t)) {
+            ssize_t k = recv(sfd, out + got, sizeof(out) - got, 0);
+            if (k <= 0) break;
+            got += (size_t)k;
+        }
+        close(sfd);
+        assert(got == 3 + sizeof(karidns_status_t) && strncmp(out, "OK ", 3) == 0);
+        karidns_status_t kst;
+        memcpy(&kst, out + 3, sizeof(kst));
+        assert(kst.debug_level == 7);
+        klog_set_debug_level(0);
+    }
 
     /* "web": read-only commands and reload <zone> only */
     test_ctrl_once(&sun, EVP_sha512(), web_secret, "status\n", out, sizeof(out));
@@ -2065,7 +2092,8 @@ static void test_control_restricted_keys(void) {
     atomic_store_explicit(&z_master.notify_now, false, memory_order_relaxed);
     atomic_store_explicit(&z_slave.refresh_now, false, memory_order_relaxed);
     static const char *const web_refused[] = { "reload\n", "reconfig\n", "stop\n", "notify example.com.\n", "retransfer slave.example.\n",
-                                               "rollback example.com.\n", "bogus\n", "evict x.test\n", "xfr-delay 5\n" };
+                                               "rollback example.com.\n", "bogus\n", "evict x.test\n", "xfr-delay 5\n", "trace\n", "trace 3\n",
+                                               "notrace\n" };
     for (size_t i = 0; i < sizeof(web_refused) / sizeof(web_refused[0]); i++) {
         test_ctrl_once(&sun, EVP_sha512(), web_secret, web_refused[i], out, sizeof(out));
         assert(strcmp(out, refused_web) == 0);
@@ -2077,6 +2105,17 @@ static void test_control_restricted_keys(void) {
     assert(strncmp(out, "OK serial=", 10) == 0);
     test_ctrl_once(&sun, EVP_sha256(), ro_secret, "reload slave.example.\n", out, sizeof(out));
     assert(strcmp(out, "ERROR command not allowed for key \"ro\"\n") == 0);
+    test_ctrl_once(&sun, EVP_sha256(), ro_secret, "notrace\n", out, sizeof(out));
+    assert(strcmp(out, "ERROR command not allowed for key \"ro\"\n") == 0);
+    /* allow-commands { trace; }: trace and notrace, nothing else */
+    keys[2].perm = CTLP_READ | CTLP_TRACE;
+    test_ctrl_once(&sun, EVP_sha256(), ro_secret, "trace 2\n", out, sizeof(out));
+    assert(strcmp(out, "OK debug level is now 2\n") == 0);
+    test_ctrl_once(&sun, EVP_sha256(), ro_secret, "notrace\n", out, sizeof(out));
+    assert(strcmp(out, "OK debug level is now 0\n") == 0);
+    test_ctrl_once(&sun, EVP_sha256(), ro_secret, "reload slave.example.\n", out, sizeof(out));
+    assert(strcmp(out, "ERROR command not allowed for key \"ro\"\n") == 0);
+    keys[2].perm = CTLP_READ;
 
     /* the wrong algorithm for a key and an unknown secret are refused at login */
     assert(test_ctrl_login(&sun, EVP_sha256(), web_secret) == -1);
@@ -3096,13 +3135,31 @@ static void test_klog_categories_levels_lines(void) {
     assert(klog_level_from_priority(LOG_INFO) == LOG_LVL_INFO && klog_level_from_priority(LOG_DEBUG) == 1);
     assert(klog_level_from_priority(LOG_LOCAL3 | LOG_WARNING) == LOG_LVL_WARNING);
 
-    /* a channel passes a message whose level is at most its own; dynamic: at most the debug level in force (0) */
-    assert(klog_level_passes(LOG_LVL_CRITICAL, LOG_LVL_CRITICAL) && !klog_level_passes(LOG_LVL_CRITICAL, LOG_LVL_ERROR));
-    assert(klog_level_passes(LOG_LVL_WARNING, LOG_LVL_ERROR) && klog_level_passes(LOG_LVL_WARNING, LOG_LVL_WARNING));
-    assert(!klog_level_passes(LOG_LVL_WARNING, LOG_LVL_NOTICE) && !klog_level_passes(LOG_LVL_WARNING, LOG_LVL_INFO));
-    assert(klog_level_passes(LOG_LVL_INFO, LOG_LVL_INFO) && !klog_level_passes(LOG_LVL_INFO, 1));
-    assert(klog_level_passes(LOG_LVL_DYNAMIC, LOG_LVL_INFO) && klog_level_passes(LOG_LVL_DYNAMIC, LOG_LVL_CRITICAL) && !klog_level_passes(LOG_LVL_DYNAMIC, 1));
-    assert(klog_level_passes(3, 1) && klog_level_passes(3, 3) && !klog_level_passes(3, 4) && klog_level_passes(3, LOG_LVL_INFO));
+    /* a channel passes a message whose level is at most its own; dynamic: at most the debug level in force (the third argument) */
+    assert(klog_level_passes(LOG_LVL_CRITICAL, LOG_LVL_CRITICAL, 0) && !klog_level_passes(LOG_LVL_CRITICAL, LOG_LVL_ERROR, 0));
+    assert(klog_level_passes(LOG_LVL_WARNING, LOG_LVL_ERROR, 0) && klog_level_passes(LOG_LVL_WARNING, LOG_LVL_WARNING, 0));
+    assert(!klog_level_passes(LOG_LVL_WARNING, LOG_LVL_NOTICE, 0) && !klog_level_passes(LOG_LVL_WARNING, LOG_LVL_INFO, 0));
+    assert(klog_level_passes(LOG_LVL_INFO, LOG_LVL_INFO, 0) && !klog_level_passes(LOG_LVL_INFO, 1, 0));
+    assert(klog_level_passes(LOG_LVL_DYNAMIC, LOG_LVL_INFO, 0) && klog_level_passes(LOG_LVL_DYNAMIC, LOG_LVL_CRITICAL, 0) && !klog_level_passes(LOG_LVL_DYNAMIC, 1, 0));
+    assert(klog_level_passes(3, 1, 0) && klog_level_passes(3, 3, 0) && !klog_level_passes(3, 4, 0) && klog_level_passes(3, LOG_LVL_INFO, 0));
+    /* 0.7, BIND isc_log_doit(): dynamic follows the level in force; a fixed level (info, debug n) does not, at any level */
+    for (int dl = 0; dl <= KLOG_DEBUG_LEVEL_MAX; dl += 33) {
+        assert(klog_level_passes(LOG_LVL_DYNAMIC, LOG_LVL_ERROR, dl) && klog_level_passes(LOG_LVL_DYNAMIC, dl, dl) && !klog_level_passes(LOG_LVL_DYNAMIC, dl + 1, dl));
+        assert(klog_level_passes(3, 3, dl) && !klog_level_passes(3, 4, dl) && klog_level_passes(LOG_LVL_INFO, LOG_LVL_INFO, dl) && !klog_level_passes(LOG_LVL_INFO, 1, dl));
+        assert(klog_level_passes(LOG_LVL_WARNING, LOG_LVL_WARNING, dl) && !klog_level_passes(LOG_LVL_WARNING, LOG_LVL_NOTICE, dl));
+    }
+    assert(klog_level_passes(LOG_LVL_DYNAMIC, 1, 1) && klog_level_passes(LOG_LVL_DYNAMIC, 3, 5) && !klog_level_passes(LOG_LVL_DYNAMIC, 6, 5));
+    assert(klog_level_passes(LOG_LVL_DYNAMIC, 99, 99) && !klog_level_passes(LOG_LVL_DYNAMIC, 100, 99));
+    /* the level as -d and trace take it: digits, 0 .. 99 */
+    {
+        int v = -1;
+        assert(klog_parse_debug_level("0", &v) && v == 0 && klog_parse_debug_level("7", &v) && v == 7 && klog_parse_debug_level("99", &v) && v == 99);
+        assert(klog_parse_debug_level("007", &v) && v == 7);
+        v = -1;
+        static const char *const bad[] = { "", "100", "-1", "+3", " 3", "3 ", "3x", "x", "1e2", "999999999999999999999" };
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) assert(!klog_parse_debug_level(bad[i], &v) && v == -1);
+        assert(!klog_parse_debug_level(NULL, &v));
+    }
 
     /* the lines.  The zone is UTC so that the local formats can be compared with text */
     setenv("TZ", "UTC", 1);
@@ -3319,6 +3376,161 @@ static void test_klog_routing(void) {
     unlink(p_dyn);
     rmdir(dir);
     printf("  -> routing passed.\n");
+}
+
+int ctrl_trace_command(const char *cmd, const char *arg, const char *extra, char *reply, size_t n);
+
+/* 0.7 M1: the debug level in force.  The masks of the event messages follow it; `severity dynamic` follows it, `debug n` does not; the built-in
+ * default_debug is karidns.run in options { directory }, written only above level 0, created only when a category writes to it, and never
+ * an error when it cannot be opened; trace / notrace as the control thread runs them. */
+static void test_klog_debug_level(void) {
+    printf("[TEST] Logging: the debug level in force (masks, dynamic, default_debug / karidns.run, trace / notrace)...\n");
+    setenv("TZ", "UTC", 1);
+    tzset();
+    klog_set_debug_level(0);
+    char dir[] = "/tmp/karidns_kdbg_XXXXXX";
+    assert(mkdtemp(dir));
+    char conf[2048], p_dyn[300], p_fix[300], p_run[300], p_other[300];
+    snprintf(p_dyn, sizeof(p_dyn), "%s/dyn.log", dir);
+    snprintf(p_fix, sizeof(p_fix), "%s/fix.log", dir);
+    snprintf(p_run, sizeof(p_run), "%s/karidns.run", dir);
+    snprintf(p_other, sizeof(p_other), "%s/other", dir);
+
+    /* masks: query-errors has a dynamic channel, xfer-out a `debug 2` one, update nothing but the default (default_syslog, info) */
+    snprintf(conf, sizeof(conf),
+             "logging { channel dyn { file \"%s\"; severity dynamic; print-severity yes; }; channel fix { file \"%s\"; severity debug 2; print-severity yes; };\n"
+             " category query-errors { dyn; }; category config { dyn; }; category xfer-out { fix; }; };", p_dyn, p_fix);
+    klog_install_conf(conf);
+    assert(logev_wanted(LOGC_QUERY_ERRORS, LOG_LVL_INFO) && !logev_wanted(LOGC_QUERY_ERRORS, 1));
+    assert(logev_wanted(LOGC_XFER_OUT, 2) && !logev_wanted(LOGC_XFER_OUT, 3));
+    assert(logev_wanted(LOGC_UPDATE, LOG_LVL_INFO) && !logev_wanted(LOGC_UPDATE, 1));
+    kdns_syslog(LOG_DEBUG, "[Config] at level 0");                           /* dynamic at 0: not written (nor formatted: the mask says no) */
+    assert(klog_lines(p_dyn) == 0);
+    klog_set_debug_level(3);
+    assert(klog_debug_level() == 3);
+    assert(logev_wanted(LOGC_QUERY_ERRORS, 1) && logev_wanted(LOGC_QUERY_ERRORS, 3) && !logev_wanted(LOGC_QUERY_ERRORS, 4));
+    assert(logev_wanted(LOGC_XFER_OUT, 2) && !logev_wanted(LOGC_XFER_OUT, 3));   /* debug 2 is debug 2 at every level */
+    assert(!logev_wanted(LOGC_UPDATE, 1));                                      /* default_syslog is info; no directory: no default_debug file */
+    kdns_syslog(LOG_DEBUG, "[Config] at level 3");
+    kdns_syslog(LOG_ERR, "[Config] an error");
+    klog_set_debug_level(0);
+    assert(!logev_wanted(LOGC_QUERY_ERRORS, 1) && logev_wanted(LOGC_QUERY_ERRORS, LOG_LVL_INFO));
+    kdns_syslog(LOG_DEBUG, "[Config] at level 0 again");
+    klog_expect(p_dyn, "debug 1: [Config] at level 3\nerror: [Config] an error\n");
+    klog_set_debug_level(-4);                                                   /* held to 0 .. 99 */
+    assert(klog_debug_level() == 0);
+    klog_set_debug_level(500);
+    assert(klog_debug_level() == KLOG_DEBUG_LEVEL_MAX && logev_wanted(LOGC_QUERY_ERRORS, LOGEV_LEVEL_MAX));
+    klog_set_debug_level(0);
+    /* a new runtime is installed with the masks of the level in force */
+    klog_set_debug_level(2);
+    klog_install_conf(conf);
+    assert(logev_wanted(LOGC_QUERY_ERRORS, 2) && !logev_wanted(LOGC_QUERY_ERRORS, 3));
+    klog_set_debug_level(0);
+    assert(!logev_wanted(LOGC_QUERY_ERRORS, 1));
+
+    /* default_debug: no logging statement, a directory: karidns.run is created at once (empty), written only above level 0, with the time */
+    snprintf(conf, sizeof(conf), "options { directory \"%s\"; };", dir);
+    {
+        server_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        assert(parse_named_conf(conf, &cfg) == 0 && cfg.logging.debug_file && strcmp(cfg.logging.debug_file, p_run) == 0);
+        free_server_config_fields(&cfg);
+        memset(&cfg, 0, sizeof(cfg));
+        assert(parse_named_conf("options { };", &cfg) == 0 && cfg.logging.debug_file == NULL);   /* no directory: no file */
+        free_server_config_fields(&cfg);
+    }
+    klog_install_conf(conf);
+    struct stat st;
+    assert(stat(p_run, &st) == 0 && st.st_size == 0);
+    kdns_syslog(LOG_ERR, "[Config] level 0: default_syslog only");
+    assert(klog_lines(p_run) == 0 && !logev_wanted(LOGC_ZONELOAD, 1));
+    klog_set_debug_level(1);
+    assert(logev_wanted(LOGC_ZONELOAD, 1) && !logev_wanted(LOGC_ZONELOAD, 2) && logev_wanted(LOGC_ZONELOAD, LOG_LVL_INFO));
+    kdns_syslog(LOG_INFO, "[Zone] info at level 1");
+    kdns_syslog(LOG_DEBUG, "[Zone] debug 1 at level 1");
+    klog_set_debug_level(0);
+    kdns_syslog(LOG_ERR, "[Zone] error at level 0");
+    {
+        char *s = klog_slurp(p_run);
+        /* "28-Oct-2026 03:04:05.678 [Zone] ..." (print-time, no category, no severity: BIND's default_debug) */
+        assert(klog_lines(p_run) == 2 && strstr(s, " [Zone] info at level 1\n") && strstr(s, " [Zone] debug 1 at level 1\n") && s[2] == '-' && s[20] == '.');
+        free(s);
+    }
+    /* a supervisor / router / broker process appends to it by name, but never creates it */
+    unlink(p_run);
+    klog_set_debug_level(1);
+    klog_set_role(KLOG_ROLE_AUX);
+    kdns_syslog(LOG_ERR, "[Manager] not created by the manager");
+    klog_set_role(KLOG_ROLE_BACKEND);
+    klog_set_debug_level(0);
+    assert(access(p_run, F_OK) != 0);
+
+    /* not created when no category writes to the built-in one: a category default without it, or a channel of the file of that name */
+    snprintf(conf, sizeof(conf), "options { directory \"%s\"; }; logging { category default { default_syslog; }; };", dir);
+    klog_install_conf(conf);
+    assert(access(p_run, F_OK) != 0);
+    snprintf(conf, sizeof(conf), "options { directory \"%s\"; }; logging { channel default_debug { file \"%s\"; severity dynamic; }; };", dir, p_other);
+    klog_install_conf(conf);
+    assert(access(p_run, F_OK) != 0 && access(p_other, F_OK) == 0);
+    unlink(p_other);
+    /* ... and a category that names it explicitly creates it */
+    snprintf(conf, sizeof(conf), "options { directory \"%s\"; }; logging { category default { default_syslog; }; category notify { default_debug; }; };", dir);
+    klog_install_conf(conf);
+    assert(access(p_run, F_OK) == 0);
+    unlink(p_run);
+
+    /* a karidns.run that cannot be opened (a directory there) or is refused (a hard link) is a warning: the runtime is built, default_debug is null */
+    snprintf(conf, sizeof(conf), "options { directory \"%s\"; };", dir);
+    assert(mkdir(p_run, 0755) == 0);
+    klog_install_conf(conf);                                                    /* (asserts LOGRT_OK) */
+    klog_set_debug_level(1);
+    assert(!logev_wanted(LOGC_ZONELOAD, 1));                                    /* nothing writes a debug message now */
+    klog_set_debug_level(0);
+    assert(rmdir(p_run) == 0);
+    int fd = open(p_other, O_WRONLY | O_CREAT, 0644);
+    assert(fd >= 0);
+    close(fd);
+    assert(link(p_other, p_run) == 0);
+    klog_install_conf(conf);
+    klog_set_debug_level(1);
+    kdns_syslog(LOG_ERR, "[Zone] not into a hard link");
+    klog_set_debug_level(0);
+    assert(stat(p_other, &st) == 0 && st.st_size == 0);
+    unlink(p_run);
+    unlink(p_other);
+
+    /* trace / notrace (the control thread's handler) */
+    char r[128];
+    assert(ctrl_trace_command("trace", NULL, NULL, r, sizeof(r)) > 0 && strcmp(r, "OK debug level is now 1\n") == 0 && klog_debug_level() == 1);
+    ctrl_trace_command("trace", NULL, NULL, r, sizeof(r));
+    assert(strcmp(r, "OK debug level is now 2\n") == 0);
+    ctrl_trace_command("trace", "99", NULL, r, sizeof(r));
+    assert(strcmp(r, "OK debug level is now 99\n") == 0);
+    ctrl_trace_command("trace", NULL, NULL, r, sizeof(r));                    /* one more than 99 is 99 */
+    assert(strcmp(r, "OK debug level is now 99\n") == 0 && klog_debug_level() == 99);
+    ctrl_trace_command("trace", "100", NULL, r, sizeof(r));
+    assert(strcmp(r, "ERROR trace: the debug level must be a number from 0 to 99\n") == 0 && klog_debug_level() == 99);
+    ctrl_trace_command("trace", "x", NULL, r, sizeof(r));
+    assert(strncmp(r, "ERROR trace: the debug level", 28) == 0);
+    ctrl_trace_command("trace", "3", "4", r, sizeof(r));
+    assert(strcmp(r, "ERROR trace takes one argument at most: the debug level (0-99)\n") == 0 && klog_debug_level() == 99);
+    ctrl_trace_command("notrace", "1", NULL, r, sizeof(r));
+    assert(strcmp(r, "ERROR notrace takes no argument\n") == 0 && klog_debug_level() == 99);
+    ctrl_trace_command("trace", "4", NULL, r, sizeof(r));
+    assert(strcmp(r, "OK debug level is now 4\n") == 0 && klog_debug_level() == 4);
+    ctrl_trace_command("notrace", NULL, NULL, r, sizeof(r));
+    assert(strcmp(r, "OK debug level is now 0\n") == 0 && klog_debug_level() == 0);
+    char small[8];
+    assert(ctrl_trace_command("notrace", NULL, NULL, small, sizeof(small)) == (int)sizeof(small) - 1 && small[7] == '\0');
+    assert(ctrl_trace_command("notrace", NULL, NULL, small, 0) == 0);
+
+    test_retire_runtime(NULL);
+    klog_set_debug_level(0);
+    unlink(p_dyn);
+    unlink(p_fix);
+    assert(rmdir(dir) == 0);
+    printf("  -> debug level passed.\n");
 }
 
 static void test_klog_destinations_and_batches(void) {
@@ -7077,6 +7289,7 @@ int main(void) {
         test_klog_categories_levels_lines();
         test_klog_format();
         test_klog_routing();
+        test_klog_debug_level();
         test_klog_destinations_and_batches();
         test_klog_rolling();
         test_klog_replacement_under_load();
@@ -7160,6 +7373,7 @@ int main(void) {
     test_klog_categories_levels_lines();
     test_klog_format();
     test_klog_routing();
+    test_klog_debug_level();
     test_klog_destinations_and_batches();
     test_klog_rolling();
     test_klog_replacement_under_load();

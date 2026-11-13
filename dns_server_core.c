@@ -731,6 +731,14 @@ static off_t log_file_accept(int fd, const char *path, uid_t target_uid) {
   return st.st_size;
 }
 
+/* The built-in default_debug (karidns.run) that cannot be used: a warning, and a null channel.  BIND treats named.run that cannot be opened the
+ * same way (isc_log_doit() skips the channel); a start or a reload never fails for it, and a later reload tries again. */
+static void log_debug_file_unusable(log_channel_t *ch, const char *why) {
+  syslog(LOG_WARNING, "[Logging] The debug file '%s' (built-in channel default_debug) is not used: %s; the debug output goes only to the "
+                      "channels of the logging statement", ch->file_path, why);
+  ch->dest = LOGDEST_NULL;
+}
+
 int log_open_channels(log_channel_t *list, bool hand_off) {
   bool hard = false, restart = false;
   uid_t target_uid = (uid_t)-1;
@@ -753,6 +761,10 @@ int log_open_channels(log_channel_t *list, bool hand_off) {
       if (size < 0) {
         close(ch->fd);
         ch->fd = -1;
+        if (ch->debug_only) {
+          log_debug_file_unusable(ch, "it was refused (see the message before)");
+          continue;
+        }
         hard = true;
       } else {
         if (geteuid() == 0 && target_uid != (uid_t)-1) {
@@ -762,6 +774,10 @@ int log_open_channels(log_channel_t *list, bool hand_off) {
       }
     } else {
       int open_errno = errno;
+      if (ch->debug_only) {
+        log_debug_file_unusable(ch, strerror(open_errno));
+        continue;
+      }
 #ifdef ENOTCAPABLE
       /* a reload names a directory that was not opened before the sandbox: nothing can open it now, a restart can */
       if (open_errno == ENOTCAPABLE && atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire)) {
@@ -1390,7 +1406,7 @@ void *query_logger_thread_func(void *arg) {
                     snprintf(msg, sizeof(msg), "client %s#%d (%s): query: %s %s %s %s", client_ip, client_port,
                              safe_qname, safe_qname, class_str, type_str, edns_str);
                     for (int i = 0; i < nch; i++)
-                        if (klog_level_passes(route[i]->level, LOG_LVL_INFO) &&
+                        if (klog_channel_passes(route[i], LOG_LVL_INFO) &&
                             qlog_rate_admit(drain_sec, &chan_sec[i], &chan_count[i], chan_limit[i]))
                             klog_batch_add(&batches[i], route[i], LOGC_QUERIES, LOG_LVL_INFO, &ev->ts, msg);
 
@@ -3732,6 +3748,29 @@ static config_reload_result_t run_config_reload(bool skip_unchanged) {
 
 #define CTRL_RELOAD_REPLY_SIZE 768
 
+/* karictl trace [<level>] / notrace (rndc trace / notrace; BIND 9.20.4 bin/named/server.c named_server_setdebuglevel(): no level = one more, up to
+ * 99; a level that is not a number from 0 to 99 is refused; then "debug level is now %u" in category general).  `extra` is a word after the level.
+ * Changing the level opens and allocates nothing (dns_log.c klog_set_debug_level()).  Returns the length of the reply written to `reply`. */
+STATIC_TEST int ctrl_trace_command(const char *cmd, const char *arg, const char *extra, char *reply, size_t n) {
+  int lvl = 0;
+  int r;
+  if (n == 0) return 0;
+  if (strcmp(cmd, "notrace") == 0 && arg) {
+    r = snprintf(reply, n, "ERROR notrace takes no argument\n");
+  } else if (strcmp(cmd, "notrace") != 0 && extra) {
+    r = snprintf(reply, n, "ERROR trace takes one argument at most: the debug level (0-%d)\n", KLOG_DEBUG_LEVEL_MAX);
+  } else if (strcmp(cmd, "notrace") != 0 && arg && !klog_parse_debug_level(arg, &lvl)) {
+    r = snprintf(reply, n, "ERROR trace: the debug level must be a number from 0 to %d\n", KLOG_DEBUG_LEVEL_MAX);
+  } else {
+    if (strcmp(cmd, "notrace") == 0) lvl = 0;
+    else if (!arg) lvl = klog_debug_level() < KLOG_DEBUG_LEVEL_MAX ? klog_debug_level() + 1 : KLOG_DEBUG_LEVEL_MAX;
+    klog_set_debug_level(lvl);
+    syslog(LOG_NOTICE, "[Control] debug level is now %d", lvl);
+    r = snprintf(reply, n, "OK debug level is now %d\n", lvl);
+  }
+  return r < 0 ? 0 : (size_t)r < n ? r : (int)n - 1;
+}
+
 /* D-13: reload / reconfig の応答。失敗は "ERROR ..." にして karictl が終了コード 3 を返せるようにする */
 static int format_reload_reply(const config_reload_result_t *r, const char *ok_text, char *buf, size_t sz) {
   char note[sizeof(r->restart_needed) + 32] = "";
@@ -4845,6 +4884,7 @@ void *control_thread_func(void *arg) {
               snprintf(st.os_release, sizeof(st.os_release), "%s", g_host_status_info.un.release);
               snprintf(st.machine, sizeof(st.machine), "%s", g_host_status_info.un.machine);
               st.ncpus = g_host_status_info.ncpus;
+              st.debug_level = klog_debug_level();
               {
                 zone_bytes_t zb_db, zb_other;
                 zone_bytes_get(ZBYTES_DB, &zb_db);
@@ -5133,6 +5173,10 @@ void *control_thread_func(void *arg) {
                 (void)ctl_send_all(cfd, "OK\n", 3);
               } else (void)ctl_send_all(cfd, "ERROR expected thread, memory or off\n", 37);
 #endif
+            } else if (strcmp(cmd, "trace") == 0 || strcmp(cmd, "notrace") == 0) {
+              char treply[128];
+              int tl = ctrl_trace_command(cmd, arg, view_arg, treply, sizeof(treply));
+              (void)ctl_send_all(cfd, treply, (size_t)tl);
             } else if (strcmp(cmd, "dbstatus") == 0) {
               /* beta design 5.2: the loader, the batches and the DB zones of the registry */
               char dbbuf[8192];
@@ -6575,14 +6619,24 @@ int main(int argc, char **argv) {
           }
       } else if (strcmp(argv[i], "-P") == 0 && i + 1 < argc) {
           cli_pid_file = argv[++i];
+      } else if (strcmp(argv[i], "-d") == 0) {
+          /* named -d <debug-level>: the debug level in force from the start (karictl trace / notrace change it later) */
+          int lvl;
+          if (i + 1 >= argc || !klog_parse_debug_level(argv[i + 1], &lvl)) {
+              fprintf(stderr, "[ERROR] Invalid debug level '%s' for -d (expected a number from 0 to %d)\n", i + 1 < argc ? argv[i + 1] : "",
+                      KLOG_DEBUG_LEVEL_MAX);
+              return 2;
+          }
+          i++;
+          klog_set_debug_level(lvl);
       } else {
           config_file = argv[i];
       }
   }
 
   if (!config_file) {
-    fprintf(stderr, "Usage: %s [-v | --version] [-f] [-p <port|pid_file>] [-P <pid_file>] [-c <config_file> | <config_file>]\n", argv[0]);
-    syslog(LOG_ERR, "Usage: %s [-v | --version] [-f] [-p <port|pid_file>] [-P <pid_file>] [-c <config_file> | <config_file>]", argv[0]);
+    fprintf(stderr, "Usage: %s [-v | --version] [-f] [-d <debug_level>] [-p <port|pid_file>] [-P <pid_file>] [-c <config_file> | <config_file>]\n", argv[0]);
+    syslog(LOG_ERR, "Usage: %s [-v | --version] [-f] [-d <debug_level>] [-p <port|pid_file>] [-P <pid_file>] [-c <config_file> | <config_file>]", argv[0]);
     return 2;
   }
   if (!getcwd(g_startup_cwd, sizeof(g_startup_cwd))) {
