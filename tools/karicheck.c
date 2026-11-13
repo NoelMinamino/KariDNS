@@ -67,14 +67,6 @@ KARIDNS_TOOL_FN char *read_file_or_die(const char *path, bool *out_failed) {
         dns_diag(DIAG_ERROR, DC_IO_NOT_REGULAR, path, 0, "Not a regular file: %s\n", path);
         return NULL;
     }
-    /* 0.7 (audit Low): no larger than the server reads a configuration or zone file (read_entire_file(), server_load_file_cb()) */
-    if ((uint64_t)st.st_size > (uint64_t)KARIDNS_MAX_CONFIG_FILE_SIZE) {
-        fclose(f);
-        if (out_failed) *out_failed = true;
-        dns_diag(DIAG_ERROR, DC_IO_FILE_TOO_LARGE, path, 0, "%s is larger than %lld bytes (the largest file the server reads)\n", path,
-                 (long long)KARIDNS_MAX_CONFIG_FILE_SIZE);
-        return NULL;
-    }
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -82,6 +74,15 @@ KARIDNS_TOOL_FN char *read_file_or_die(const char *path, bool *out_failed) {
         fclose(f);
         if (out_failed) *out_failed = true;
         dns_diag(DIAG_ERROR, DC_IO_READ, path, 0, "Could not read file: %s\n", path);
+        return NULL;
+    }
+    /* 0.7 (audit Low): no larger than the server reads a configuration or zone file (read_entire_file(), server_load_file_cb()).  Checked
+     * on the size the buffer is made for, and at most that much is read: a file that grows after this is read as the size it had here. */
+    if ((uint64_t)len > (uint64_t)KARIDNS_MAX_CONFIG_FILE_SIZE) {
+        fclose(f);
+        if (out_failed) *out_failed = true;
+        dns_diag(DIAG_ERROR, DC_IO_FILE_TOO_LARGE, path, 0, "%s is larger than %lld bytes (the largest file the server reads)\n", path,
+                 (long long)KARIDNS_MAX_CONFIG_FILE_SIZE);
         return NULL;
     }
     char *buf = malloc(len + 1);

@@ -170,9 +170,11 @@ zi_t *zi_open(const zi_opts_t *o) {
 typedef struct { char *text; size_t len; time_t mtime; const char *shown; bool from_file; } zi_text_t;     /* from_file: shown is a real path ( is read from its directory) */
 
 /* max: the limit of the input (ZI_STDIN_MAX on standard input, ZI_FILE_MAX for a file); a file that grows past it while it is read is refused
- * as one that was too large when it was examined */
+ * as one that was too large when it was examined.  The buffer never grows beyond max bytes (size_hint is only where it starts): when it is
+ * full at max, one more byte read decides, so more than max bytes are never accepted, whatever size_hint said. */
 static bool zi_read_fd(zi_t *z, int fd, size_t size_hint, size_t max, bool from_stdin, const char *shown, zi_text_t *t) {
     size_t cap = size_hint ? size_hint + 1 : 65536, len = 0;
+    if (max && cap > max) cap = max;
     char *buf = malloc(cap + 1);
     if (!buf) {
         ZI_ERR(z, DC_INTERNAL_OOM, shown, "out of memory");
@@ -191,6 +193,7 @@ static bool zi_read_fd(zi_t *z, int fd, size_t size_hint, size_t max, bool from_
                 return false;
             }
             size_t nc = cap * 2;
+            if (max && nc > max) nc = max;          /* (the limit is reached before the buffer is larger: the probe above decides) */
             char *nb = realloc(buf, nc + 1);
             if (!nb) {
                 free(buf);
@@ -217,6 +220,18 @@ static bool zi_read_fd(zi_t *z, int fd, size_t size_hint, size_t max, bool from_
     t->len = len;
     return true;
 }
+
+#ifdef KARIDNS_UNIT_TEST
+/* tests/test_zone_import.c: zi_read_fd() on a descriptor (a pipe that holds more than size_hint said); the length read, or (size_t)-1 */
+size_t zi_test_read_fd(zi_t *z, int fd, size_t size_hint, size_t max);
+size_t zi_test_read_fd(zi_t *z, int fd, size_t size_hint, size_t max) {
+    zi_text_t t;
+    memset(&t, 0, sizeof(t));
+    if (!zi_read_fd(z, fd, size_hint, max, false, "test input", &t)) return (size_t)-1;
+    free(t.text);
+    return t.len;
+}
+#endif
 
 /* The text of the input: memory (copied), standard input ("-") or a regular file.  false: a message was given. */
 static bool zi_get_text(zi_t *z, const zi_input_t *in, zi_text_t *t) {
