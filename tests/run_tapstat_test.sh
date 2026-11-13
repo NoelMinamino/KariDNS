@@ -258,6 +258,32 @@ has "$TMP_DIR/live.sum" "client=127.0.0.0/24=5" "client prefix"
 grep -q "protocol error" "$TMP_DIR/live.err" && fail "protocol error from karidns: $(cat "$TMP_DIR/live.err")" || pass "no protocol error from karidns"
 grep -q "no FINISH" "$TMP_DIR/karidns.log" && fail "karidns got no FINISH after STOP" || pass "karidns logged no missing FINISH after STOP"
 
+# ---- 4b. log-queries no: only AUTH_RESPONSE frames (docs/karidns.md "Counting": one frame per query) ----
+echo "[4b] karidns (log-queries no) -> karidns-tapstat"
+sed -e 's/log-queries yes;/log-queries no;/' "$TMP_DIR/karidns.conf" > "$TMP_DIR/karidns_r.conf"
+chmod 644 "$TMP_DIR/karidns_r.conf"
+"$TAPSTAT" -s "$DSOCK" -i 1 -t response -f json -m 666 > "$TMP_DIR/live_r.json" 2> "$TMP_DIR/live_r.err" &
+TAP_PID=$!
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -S "$DSOCK" ] && break; sleep 0.2; done
+"$KARIDNS" -f -c "$TMP_DIR/karidns_r.conf" > "$TMP_DIR/karidns_r.log" 2>&1 &
+SERVER_PID=$!
+sleep 1.5   # (as in 4: connected to the tool before the first query)
+"$DAG" @127.0.0.1 -p $PORT +nohexdump www.example.test A >/dev/null 2>&1
+"$DAG" @127.0.0.1 -p $PORT +nohexdump +tcp www.example.test A >/dev/null 2>&1
+"$DAG" @127.0.0.1 -p $PORT +nohexdump nx.example.test A >/dev/null 2>&1
+kill -TERM "$SERVER_PID"
+wait "$SERVER_PID" 2>/dev/null
+SERVER_PID=""
+sleep 1.5   # one more summary interval of the tool
+kill -TERM "$TAP_PID"
+wait "$TAP_PID"
+TAP_PID=""
+perl "$MOCK" sum "$TMP_DIR/live_r.json" > "$TMP_DIR/live_r.sum"
+has "$TMP_DIR/live_r.sum" "frames=3" "log-queries no: three frames for three queries"
+has "$TMP_DIR/live_r.sum" "queries=0" "log-queries no: no AUTH_QUERY frame"
+has "$TMP_DIR/live_r.sum" "responses=3" "log-queries no: one AUTH_RESPONSE per query (3)"
+has "$TMP_DIR/live_r.sum" "qname=www.example.test.=2" "log-queries no: -t response counts each query once"
+
 # ---- 5. the examples of --help ----
 echo "[5] --help examples"
 cd "$TMP_DIR" || exit 1

@@ -495,7 +495,7 @@ register_test "catalog" "sh" "tests/run_cve_coo_test.sh" "RFC 9432 CoO tracking 
 
 # 8. DNSTAP Telemetry Logging
 register_test "dnstap" "sh" "tests/run_dnstap_capture_test.sh" "DNSTAP frame streams capture verification"
-register_test "dnstap" "sh" "tests/run_tapstat_test.sh" "karidns-tapstat: file and socket mode, hostile senders, a real karidns dnstap stream aggregated per zone/qname/qtype/rcode/client prefix"
+register_test "dnstap" "sh" "tests/run_tapstat_test.sh" "karidns-tapstat: file and socket mode, hostile senders, a real karidns dnstap stream aggregated per zone/qname/qtype/rcode/client prefix; log-queries no sends AUTH_RESPONSE only"
 register_test "core" "sh" "tests/run_server_core_matrix_test.sh" "Server runtime matrix: dual-stack wildcard, IPv6 NOTIFY, TCP misuse, RRL/TC, log rotation, control errors, daemon/CLI, primary+secondary" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
 register_test "core" "sh" "tests/run_server_core_fi_test.sh" "Server fault injection: startup/runtime syscall failures via LD_PRELOAD shim (no crash allowed)" "serial"   # stress, perf, sanitizer, fuzz or its own parallelism
 
