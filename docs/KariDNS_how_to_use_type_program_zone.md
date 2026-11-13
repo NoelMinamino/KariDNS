@@ -107,7 +107,25 @@ RELOAD\n
 - No length and no packet follow it, and KariDNS waits for no answer: the plugin must not write anything for it. The next `QUERY` comes as usual.
 - It tells the plugin to read its own data again (a table, a file, a database).
 - It is written between two exchanges, never inside one: when a query is in progress, the line follows right after its reply.
-- Without `program-reload-line yes;` (the default) the line is never sent, so a plugin that treats an unknown line as an error (as the examples below do) keeps working.
+- Without `program-reload-line yes;` (the default) the line is never sent, so a plugin written for 0.6.1, or one that exits on a line it does not know, keeps working. (The examples below skip a line that is not `QUERY`, so they read past `RELOAD` but do not reload anything.)
+
+A plugin that uses it reads its data again when the line comes, and goes on reading the next line. In the Perl example below:
+
+```perl
+my %table = load_table();                 # your own data: a file, a database, ...
+
+while (my $line = <STDIN>) {
+    chomp($line);
+    if ($line eq 'RELOAD') {              # no length, no packet, no answer
+        %table = load_table();
+        next;
+    }
+    my ($cmd, $proto, $client_ip) = split(/\s+/, $line);
+    next unless $cmd && $cmd eq 'QUERY';
+    ...
+```
+
+Without the line, `karictl reload <zone>` starts the plugin again instead (section 1), which also makes it read its data.
 
 ---
 
