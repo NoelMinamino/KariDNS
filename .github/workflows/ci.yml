@@ -45,7 +45,8 @@ jobs:
             set -e
 
             echo "::group::📦 [Setup] Install test dependencies (perl5, sqlite3 for karidns-dbloader and its tests)"
-            pkg install -y perl5 || true
+            # no "|| true": the manual-page gate below needs perl (a failed install must fail here, as the coverage job does)
+            pkg install -y perl5
             pkg install -y sqlite3
             echo "::endgroup::"
 
@@ -101,8 +102,9 @@ jobs:
 
             echo "::group::📖 [Manual pages] man/ is what make man makes of docs/*.md; mandoc -T lint"
             # tests/run_md2man_test.sh: the converter's fixtures, the committed pages against a fresh man/generate.sh, no mandoc message at WARNING
-            # or worse (perl5 is installed above, mandoc is in the base system).  A stale page fails here: run make man and commit the pages
-            sh tests/run_md2man_test.sh < /dev/null
+            # or worse (perl5 is installed above, mandoc is in the base system; KARIDNS_TEST_REQUIRE=1: a missing perl or mandoc is a failure, not a SKIP).
+            # A stale page fails here: run make man and commit the pages
+            KARIDNS_TEST_REQUIRE=1 sh tests/run_md2man_test.sh < /dev/null
             echo "::endgroup::"
 
             echo "::group::📦 [Install] make install against tests/install_manifest.txt; the packages list what make install stages"
