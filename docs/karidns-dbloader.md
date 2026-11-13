@@ -12,7 +12,7 @@ karidns-dbloader --dump OUT --driver sqlite3 --database-file PATH [options]
 karidns-dbloader --dump OUT --driver postgresql --conninfo-file FILE [--schema NAME] [options]
 karidns-dbloader --check --driver sqlite3 --database-file PATH [options]
 karidns-dbloader --check --driver postgresql --conninfo-file FILE [--schema NAME] [options]
-karidns-dbloader -s FD
+karidns-dbloader -s FD [--fetch-fd FD] [--state-file PATH] [--log-stderr] [--debug N]
 ```
 
 `-s FD` is the mode `karidns` runs; you do not start it by hand. `--drivers`, `--dump` and `--check` are for administrators and for tests.
@@ -68,6 +68,9 @@ make karidns-dbloader DB_DRIVERS="sqlite3 postgresql"
 
 `--log-stderr`
 : With `-s`: write the messages to standard error instead of syslog, one line each, `<N>[DB] text` with `N` the syslog priority (0 .. 7) and a newline at the end, at most 500 bytes (a longer text is cut and ends in `...`; control characters become `?`). `karidns` starts the loader this way, with a pipe as its standard error, reads the lines and logs them in the `database` category (see MESSAGES). Without this option `-s` logs to syslog (identity `karidns-dbloader`, `[DB]` in front of the text). If standard error cannot be written (the pipe is closed), the message goes to syslog. It is an error without `-s`.
+
+`--debug N`
+: The debug level, 0 .. 99 (default 0): the debug messages up to it are written (0.7).  `karidns` passes the level in force when it starts the loader (`karidns -d`, `karictl trace`), so a loader started again while the level is raised comes up with it, and in stream mode the Backend tells the loader every later change (the KDB1 message `DEBUG`).  With `--log-stderr` a debug message is the line `<7:L>[DB] text`, `L` its level; without it, syslog priority `debug`; with `--dump` a line on standard error; `--check` writes none.  No debug message contains a password, the content of a conninfo file or a driver's error text (which can repeat parts of the connection string): the files are named, never read out.
 
 `--driver DRIVER`
 : `sqlite3` or `postgresql` (a driver that was compiled in).
@@ -128,7 +131,7 @@ The file is text: `KARIDNS-HOT-LIST 1`, one line `view<TAB>zone` for each zone, 
 
 Run on its own (`--dump`, `--check`), the loader writes its messages to standard error, `karidns-dbloader: text`, as it always did (the dump tests and scripts read those lines).
 
-Started by `karidns` (`-s`), the loader's standard error is a pipe that the supervisor (the manager process, which also restarts the loader) creates for every start: `karidns-dbloader -s 3 [--fetch-fd 4] [--state-file PATH] --log-stderr`. The loader writes `<N>[DB] text` lines; the supervisor reads the pipe without blocking and logs each line in the `database` category of BIND's `logging { }` statement, with the severity of `N` (`<3>` error, `<4>` warning, `<5>` notice, `<6>` info), so a configuration such as
+Started by `karidns` (`-s`), the loader's standard error is a pipe that the supervisor (the manager process, which also restarts the loader) creates for every start: `karidns-dbloader -s 3 [--fetch-fd 4] [--state-file PATH] --log-stderr`. The loader writes `<N>[DB] text` lines; the supervisor reads the pipe without blocking and logs each line in the `database` category of BIND's `logging { }` statement, with the severity of `N` (`<3>` error, `<4>` warning, `<5>` notice, `<6>` info) and, for a debug message (0.7, `--debug`), `<7:L>` with `L` its debug level, 1 .. 99, logged at `debug L` (a channel with `severity dynamic` writes it while the debug level in force is at least `L`, `severity debug <n>` when `n` is at least `L`; the text is cut at 255 bytes), so a configuration such as
 
 ```
 logging {
@@ -149,7 +152,7 @@ A message is logged once: when the loader is supervised it does not also write t
 
 - a line is cut at 512 bytes of text and ends in `...`; the rest of a longer line is read and thrown away, never kept;
 - everything but printable ASCII is written as `\xNN` (a NUL, ESC, a CR that does not end a CRLF, bytes of 0x80 and above), a tab as a space, so that nothing a database name contains can start a line of the log or hide in it;
-- a line without `<N>` is logged at `notice`; empty lines are dropped; the end of the stream or the loader's end logs a last line that has no newline;
+- a line without `<N>` (or `<7:L>` with `L` 1 .. 99 written without a leading 0) is logged at `notice` with the text as it is, so a line of another version is never lost; empty lines are dropped; the end of the stream or the loader's end logs a last line that has no newline;
 - at most 50 lines per second are logged; the others are counted and reported by one `warning` line when their second is over (also when the loader writes nothing more);
 - one read takes at most 64 KiB, and the manager looks at its signals between reads, so a loader that floods the pipe cannot keep the manager from `SIGTERM`; a full pipe makes the loader wait;
 - the pipe is made for every start (close-on-exec, read end non-blocking), drained when the loader ends and then closed: restarts do not leave descriptors behind.
