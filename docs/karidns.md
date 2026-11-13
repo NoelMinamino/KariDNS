@@ -476,7 +476,7 @@ logging {
 
 Every channel has exactly one destination (`file`, `syslog`, `stderr` or `null`); `file` takes its options in any order, each once. `severity` defaults to `info`. A line is `<time> <category>: <severity>: <text>`, each part when the channel asks for it (`print-time` `yes` or `local`: `28-Oct-2026 12:34:56.789`; `iso8601`: `2026-10-28T12:34:56.789` in local time without a zone, as BIND writes it; `iso8601-utc`: `2026-10-28T03:34:56.789Z`). Control characters in a message (text that came from the network, such as a key name) are written as `?`, so a message cannot start a line of its own. A statement that is not `channel` or `category`, an option a channel does not have, a value that is not valid, a channel with no or two destinations, a category name that BIND 9.20 does not have and a channel name that is not defined (or built in) are configuration errors with the file and line, in `karidns` (start and reload) and in `karicheck conf`.
 
-**Built-in channels** (usable in a `category` without being defined, as in BIND): `default_syslog` (syslog, facility `daemon`, `info`), `default_stderr` (standard error, `info`, with the time), `default_debug` and `null`. A channel of the file with the name of a built-in channel replaces it (a warning says so). A channel defined twice: the later definition is used (a warning).
+**Built-in channels** (usable in a `category` without being defined, as in BIND): `default_syslog` (syslog, facility `daemon`, `info`), `default_stderr` (standard error, `info`, with the time), `default_debug` and `null`. A channel of the file with the name of a built-in channel replaces it (a warning says so). A channel defined twice: the later definition is used (a warning). A syslog line is also printed on standard error (`openlog(3)` with `LOG_PERROR`: `KariDNS <pid> - - <text>`), which is how a foreground server shows its messages; with `KARIDNS_NOSYSLOG=1` (ENVIRONMENT, a test hook) it goes there only.
 
 **`default_debug` and `karidns.run`.** As BIND's (`file "named.run"; severity dynamic;` with the time, in the working directory), `default_debug` is the file **`karidns.run` in `options { directory }`**, `severity dynamic` with the time (`print-time yes`, no category, no severity), and it writes **only while the debug level is above 0** (BIND's `ISC_LOG_DEBUGONLY`): nothing at level 0, not even an error, and from level 1 on every message up to the level (errors, warnings, notices, info and the debug lines). Differences from BIND:
 - BIND creates `named.run` when it first writes to it. The sandboxed process cannot create a file after the start, so KariDNS opens `karidns.run` (creating it empty, appending when it is there) **at every start**, before the sandbox, like the other log files, and hands it to `user` / `group`; `karictl trace` then works without a `logging` statement. A reload opens it again through the directory descriptor the server holds. It is opened only when some category writes to `default_debug`: a category without channels while there is no `category default` (so with no `logging` statement at all), or a category that names it; when every category has channels without it (a `category default` that does not name it, say), or a channel of the file is named `default_debug`, `karidns.run` is left alone. It is never rolled (no `versions` / `size`).
@@ -1689,6 +1689,19 @@ For complete configuration syntax, query evaluation flows, and Extended AXFR det
 
 `SIGTERM`, `SIGINT`
 : Sent to the manager process, stops all child processes (backend, frontend routers, connect broker), removes the PID file and exits. A child that has not ended 10 seconds after the SIGTERM it was sent is killed with SIGKILL (logged); a second `SIGTERM` or `SIGINT` to the manager kills the remaining children at once. The exit status is then non-zero.
+
+---
+
+## ENVIRONMENT
+
+`TZ`
+: The time zone of the time stamps (`print-time local`); passed on to `karidns-dbloader` and the program zone plugins.
+
+`KARIDNS_NOSYSLOG=1`
+: A test hook (0.7, in the spirit of BIND's `named -T nosyslog`): every line the server would give `syslog(3)` -- the built-in `default_syslog`, `syslog` channels, and the messages written before the logging statement is in force -- goes to standard error only, as `KariDNS <pid> - - <text>`, the same copy that `openlog(3)`'s `LOG_PERROR` prints on standard error anyway. The system log gets nothing; file and `stderr` channels are unchanged. Only the value `1` counts. The integration tests export it (`tests/lib_proc.sh`), so that the servers they start do not fill the build host's `/var/log/messages` and still show their messages on the standard error the tests read. Do not set it for a daemonized server: its standard error is `/dev/null`, so those lines would be lost.
+
+`KARIDNS_XFER_MINUTE_SECS=n`
+: A test hook: a "minute" of the transfer time limits is n seconds (1..60); see `max-transfer-time-in` and the related options.
 
 ---
 
