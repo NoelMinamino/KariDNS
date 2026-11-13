@@ -113,6 +113,19 @@ bool rcu_writer_is_safe(uint64_t retire_epoch) {
   return readers_safe(retire_epoch, NULL);
 }
 
+bool rcu_writer_try_wait(uint64_t retire_epoch, int budget_ms) {
+  struct timespec start, now;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  for (;;) {
+    if (readers_safe(retire_epoch, NULL)) return true;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    const int64_t elapsed_ms = (int64_t)(now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000;
+    if (elapsed_ms >= budget_ms) return false;
+    struct timespec ts = { 0, 1000000L };
+    nanosleep(&ts, NULL);
+  }
+}
+
 static void blockers_add(char *buf, size_t len, size_t *off, int n, int first, const char *kind) {
   if (n == 0 || *off >= len) return;
   int w = first >= 0 ? snprintf(buf + *off, len - *off, "%s%d %s slot(s) (the first: %d)", *off ? ", " : "", n, kind, first)

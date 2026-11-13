@@ -1123,6 +1123,29 @@ static void test_retire_object_and_entry_config(void) {
         zone_arena_destroy(&b1); zone_arena_destroy(&b2); zone_arena_destroy(&b3);
     }
 
+    /* 0.7: zone_retire_process(true) only bounds memory: with a reader that stays in its section it tries the grace period for at most 50 ms,
+     * then does not try again for a second (a rebuild calls it every 1024 zones); nothing is freed before the reader leaves */
+    {
+        struct timespec t0, t1;
+        rcu_aux_read_lock();
+        uint64_t ep2 = rcu_writer_advance_epoch();
+        g_retired_obj_freed = 0;
+        assert(zone_retire_object(e, malloc(8), retired_obj_free, ep2));
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        zone_retire_process(true);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        int64_t ms = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        assert(ms >= 45 && ms < 1000 && g_retired_obj_freed == 0);          /* one short try (it waited 60 s before) */
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        zone_retire_process(true);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        ms = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        assert(ms < 40 && g_retired_obj_freed == 0);                         /* the back-off: no second try */
+        rcu_aux_read_unlock();
+        zone_retire_process(true);                                           /* (still in the back-off: no wait needed, the reader is gone) */
+        assert(g_retired_obj_freed == 1 && atomic_load(&e->snapshot_refs) == 1);
+    }
+
     /* zone_entry_config(): the DB zone's own settings; the others go through the config index */
     zone_config_t dbc;
     memset(&dbc, 0, sizeof(dbc));

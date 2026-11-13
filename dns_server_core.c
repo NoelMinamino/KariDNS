@@ -3775,6 +3775,7 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
   }
 }
 
+#define RELOAD_READERS_WAIT_MS 100   /* the try for the readers of the configuration before (perform_config_reload_ext()) */
 STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged) {
   config_reload_result_t res;
   memset(&res, 0, sizeof(res));
@@ -3795,9 +3796,18 @@ STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged
    * standby は前回の公開で退いた設定で、retire_epoch はその公開で得た値
    * (公開してから世代を進めるので、これ以下の世代のリーダーだけが standby を持ちうる)。
    * 設定の writer は制御スレッドだけで、ワーカー以外のスレッドも設定は
-   * 読み取り区間の中で読むので、この待機の後は standby を解放してよい。*/
-  if (!rcu_writer_wait_until_safe(g_config_db.retire_epoch, 10000)) {
-    syslog(LOG_WARNING, "[Config] Reload postponed: existing readers still active on previous configuration (timeout 10s).");
+   * 読み取り区間の中で読むので、この待機の後は standby を解放してよい。
+   * The configuration is double-buffered (config_a / config_b): the new one is parsed into the struct that a reader of the generation before
+   * may still hold, so this check guards that reuse and stays.  0.7: it is a short try (RELOAD_READERS_WAIT_MS), not a 10 s wait: a reader that
+   * stays in its section makes the reload answer "postponed" at once, and the control tick tries it again every second (run_config_reload(),
+   * g_reload_pending) until the reader has left; the log line is written once a minute at most. */
+  if (!rcu_writer_try_wait(g_config_db.retire_epoch, RELOAD_READERS_WAIT_MS)) {
+    static time_t last_log;
+    const time_t now_s = time(NULL);
+    if (now_s - last_log >= 60) {
+      last_log = now_s;
+      syslog(LOG_WARNING, "[Config] Reload postponed: existing readers still active on previous configuration; it is retried every second.");
+    }
     res.status = CONFIG_RELOAD_POSTPONED;
     snprintf(res.detail, sizeof(res.detail), "readers of the previous configuration are still active");
     free(config_str);

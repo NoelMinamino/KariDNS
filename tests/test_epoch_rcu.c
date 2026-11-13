@@ -377,9 +377,29 @@ static void test_describe_blockers(void) {
   printf("  [PASS] workers, loggers, async I/O and auxiliary slots are told apart; the text is cut to the buffer\n");
 }
 
+/* 0.7: rcu_writer_try_wait() waits at most its budget and writes no line: true at once without a reader, false after the budget with one */
+static void test_try_wait(void) {
+  printf("[TEST] rcu_writer_try_wait(): a short, quiet try...\n");
+  uint64_t e = rcu_writer_advance_epoch();
+  assert(rcu_writer_try_wait(e, 20));
+  rcu_aux_read_lock();
+  e = rcu_writer_advance_epoch();
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  g_stall_log[0] = '\0';
+  assert(!rcu_writer_try_wait(e, 30));
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  const int64_t ms = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+  assert(ms >= 30 && ms < 1000 && g_stall_log[0] == '\0');
+  rcu_aux_read_unlock();
+  assert(rcu_writer_try_wait(e, 30));
+  printf("  [PASS] no reader: true at once; a reader: false after the budget, no log line\n");
+}
+
 int main(void) {
   printf("=== Epoch RCU tests (R-25) ===\n");
   test_describe_blockers();
+  test_try_wait();
   test_publish_order();
   test_aux_slots();
   test_aux_slot_released_at_thread_exit();

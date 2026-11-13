@@ -8,7 +8,7 @@
 #     "OK reloaded" at once (no zone failed), "retired zone snapshots waiting" goes back to 0, a second reload is not postponed, and
 #     "retired zone versions waiting" is at most 1 (the version the transfer sends) until the client goes away, then 0.
 #  2. A reader that does hold a read section (`karictl rcu-hold <ms>`, a TEST ONLY command of the build with the test hooks: ./karidns of
-#     `make coverage`, else ./karidns-evict of `make evict`) keeps the snapshot that a reconfig retires: "retired zone snapshots waiting: 1"
+#     `make coverage`, else ./karidns-evict of `make evict`) keeps the snapshot that a reload retires (the reload itself answers at once: it does not wait for the reader, 0.7): "retired zone snapshots waiting: 1"
 #     with an age that grows, the stats gauges and the JSON "reclaim" object, one warning after 60 s naming the auxiliary slot that holds
 #     it, the warning counter 1; when the hold ends the counts go back to 0.  Without such a build part 2 is skipped (said in the output).
 # About 90 seconds with part 2.  Needs perl.  SKIP without it.
@@ -152,12 +152,13 @@ else
     H=$(ctl rcu-hold 70000)
     [ "$H" = "OK" ] && pass "karictl rcu-hold 70000 (TEST ONLY)" || fail "rcu-hold: '$H'"
     ctl rcu-hold 999999 | grep -q '^ERROR' && pass "rcu-hold refuses more than 120 s" || fail "rcu-hold 999999 was accepted"
-    # (reconfig: a reload would also re-read the zone and its last zone_retire_process(true) would wait up to 60 s for this reader)
-    R=$(ctl reconfig)
-    echo "   reconfig: $R"
+    # (a full reload: every zone file read again; it waited 60 s for this reader before 0.7)
+    reload_ok "a full reload during the hold answers at once"
+    t0=$(now_ms); R=$(ctl reload); t1=$(now_ms)
+    case "$R" in *"reload postponed"*) [ $((t1 - t0)) -lt 2000 ] && pass "a second reload answers at once ($((t1 - t0)) ms): postponed while the reader may hold the configuration's other buffer" || fail "the second reload took $((t1 - t0)) ms" ;; *) fail "the second reload: '$R'" ;; esac
     i=0; while [ "$(status_num "retired zone snapshots waiting")" != "1" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
     W=$(status_num "retired zone snapshots waiting")
-    [ "$W" = "1" ] && pass "after a reconfig the old snapshot waits for the reader (retired zone snapshots waiting: 1)" || fail "after the reload: '$W' snapshots waiting"
+    [ "$W" = "1" ] && pass "after the reload the old snapshot waits for the reader (retired zone snapshots waiting: 1)" || fail "after the reload: '$W' snapshots waiting"
     A1=$(oldest_ms)
     sleep 2
     A2=$(oldest_ms)

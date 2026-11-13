@@ -1346,8 +1346,15 @@ static size_t zone_retire_recount(void) {
   return n;
 }
 
-/* 解放待ちを処理する。wait なら最も新しい世代まで猶予期間を待つ (再構築の途中でまとめて解放する)。
- * 読み取り区間の外から呼ぶこと。まだ解放できないもの (読み手、転送中、writer が使用中) は積み直す。 */
+/* 解放待ちを処理する。wait なら最も新しい世代まで猶予期間を少しだけ待つ (再構築や DB の取り込みの途中でまとめて解放し、メモリを抑える)。
+ * 読み取り区間の外から呼ぶこと。まだ解放できないもの (読み手、転送中、writer が使用中) は積み直す。
+ * The wait only bounds memory (0.7): it is at most ZONE_RETIRE_WAIT_MS, and once it did not end in time the following calls do not wait for
+ * ZONE_RETIRE_BACKOFF_MS (a rebuild of many zones does not pay the budget again every 1024 zones).  A reader that stays in its section costs
+ * memory -- the nodes stay on the stack, `retired zone versions waiting` counts them, the control tick and the next call free them -- never the
+ * time of the reload, the ingest batch or the control thread.  Nothing is freed before its grace period and its pins, as before. */
+#define ZONE_RETIRE_WAIT_MS 50
+#define ZONE_RETIRE_BACKOFF_MS 1000
+static _Atomic int64_t g_retire_nowait_until_ms;    /* burst_now_ms() before which a wait is not tried again */
 void zone_retire_process(bool wait) {
   zone_retire_t *list = atomic_exchange_explicit(&g_zone_retire_head, NULL, memory_order_acquire);
   if (!list) return;
@@ -1355,7 +1362,13 @@ void zone_retire_process(bool wait) {
   for (zone_retire_t *r = list; r; r = r->next) {
     if (r->epoch > max_epoch) max_epoch = r->epoch;
   }
-  bool all_safe = wait ? rcu_writer_wait_until_safe(max_epoch, 60000) : rcu_writer_is_safe(max_epoch);
+  bool all_safe;
+  if (wait && burst_now_ms() >= atomic_load_explicit(&g_retire_nowait_until_ms, memory_order_relaxed)) {
+    all_safe = rcu_writer_try_wait(max_epoch, ZONE_RETIRE_WAIT_MS);
+    if (!all_safe) atomic_store_explicit(&g_retire_nowait_until_ms, burst_now_ms() + ZONE_RETIRE_BACKOFF_MS, memory_order_relaxed);
+  } else {
+    all_safe = rcu_writer_is_safe(max_epoch);
+  }
   unsigned n_freed = 0, n_kept = 0;          /* (the debug 2 line of the batch) */
   uint64_t freed_bytes = 0;
   while (list) {
