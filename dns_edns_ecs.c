@@ -103,7 +103,8 @@ server_cookie_status_t verify_server_cookie(const server_config_t *cfg, const ch
                   ((uint32_t)server_cookie[6] << 8)  |  (uint32_t)server_cookie[7];
     int32_t age = (int32_t)(now - ts);          /* >0: cookie is `age` seconds old; <0: from the future */
     if (age > SERVER_COOKIE_VALID_PAST_SECS || age < -SERVER_COOKIE_VALID_FUTURE_SECS) {
-        logev_post(LOGC_SECURITY, 3, client_ip, 0, "[Cookie] server cookie not valid: its time stamp is %d s %s (RFC 9018 4.3)", age < 0 ? -age : age,
+        logev_post(LOGC_SECURITY, 3, client_ip, 0, "[Cookie] server cookie not valid: its time stamp is %u s %s (RFC 9018 4.3)",
+                   age < 0 ? 0u - (uint32_t)age : (uint32_t)age,      /* (unsigned: -INT32_MIN has no int32_t) */
                    age < 0 ? "in the future" : "old");
         return SERVER_COOKIE_INVALID;
     }
