@@ -60,7 +60,7 @@ void run_frontend_router(pid_t backend_pid, int router_id);
 void backend_sig_handler(int sig);
 void backend_sighup_noop(int sig);
 bool sighup_decide(int drained, bool from_manager, long delivered, bool *last_reload);
-void daemonize(void);
+bool daemonize(void);
 void supervisor_sig_handler(int sig);
 void cleanup_pid_file(void);
 void setup_ipc_tables(int num_workers);
@@ -876,6 +876,91 @@ static void test_find_configured_domain(void) {
 
     atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
     printf("  -> find_configured_domain passed.\n");
+}
+
+// ----------------------------------------------------------------------------
+// 0.7: the control socket a refused start bound (ctl_bound_*), a log directory shared with the pid file / control socket directory
+// (startup_dir_shared_with_log; tests/run_startup_refused_cleanup_test.sh runs both in a real start as root)
+// ----------------------------------------------------------------------------
+static int test_bind_unix(int dfd, const char *name) {
+    struct sockaddr_un un;
+    memset(&un, 0, sizeof(un));
+    un.sun_family = AF_UNIX;
+    strlcpy(un.sun_path, name, sizeof(un.sun_path));
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    assert(s >= 0);
+    assert(bindat(dfd, s, (struct sockaddr *)&un, sizeof(un)) == 0);
+    return s;
+}
+
+static void test_startup_refused_cleanup(void) {
+    printf("[TEST] Server Core: the control socket of a refused start, a log directory shared with the pid file directory...\n");
+    char base[] = "/tmp/karidns_ctlbound_XXXXXX";
+    assert(mkdtemp(base) != NULL);
+    int dfd = open(base, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    assert(dfd >= 0);
+    struct stat st;
+
+    // the socket this start bound goes, through the directory descriptor (a duplicate: the caller closes its own)
+    int s = test_bind_unix(dfd, "c.sock");
+    assert(ctl_bound_set(dfd, "c.sock"));
+    ctl_bound_unlink();
+    assert(fstatat(dfd, "c.sock", &st, AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT);
+    close(s);
+    ctl_bound_unlink();                               // (nothing bound any more: a no-op)
+
+    // a socket another server bound at that name meanwhile stays
+    s = test_bind_unix(dfd, "c.sock");
+    assert(ctl_bound_set(dfd, "c.sock"));
+    close(s);
+    s = test_bind_unix(dfd, "c2.sock");               // (made while the first exists: another inode) and moved over the name
+    assert(renameat(dfd, "c2.sock", dfd, "c.sock") == 0);
+    ctl_bound_unlink();
+    assert(fstatat(dfd, "c.sock", &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISSOCK(st.st_mode));
+
+    // after ctl_bound_forget() (the Backend has it) nothing is removed
+    assert(ctl_bound_set(dfd, "c.sock"));
+    ctl_bound_forget();
+    ctl_bound_unlink();
+    assert(fstatat(dfd, "c.sock", &st, AT_SYMLINK_NOFOLLOW) == 0);
+    close(s);
+    assert(unlinkat(dfd, "c.sock", 0) == 0);
+
+    // bound by path (no directory descriptor)
+    char path[256];
+    snprintf(path, sizeof(path), "%s/p.sock", base);
+    s = test_bind_unix(AT_FDCWD, path);
+    assert(ctl_bound_set(-1, path));
+    ctl_bound_unlink();
+    assert(lstat(path, &st) != 0 && errno == ENOENT);
+    close(s);
+
+    // not a socket, missing, too long: nothing is recorded (and nothing removed)
+    int f = openat(dfd, "plain", O_WRONLY | O_CREAT | O_EXCL, 0600);
+    assert(f >= 0);
+    close(f);
+    assert(!ctl_bound_set(dfd, "plain"));
+    ctl_bound_unlink();
+    assert(fstatat(dfd, "plain", &st, 0) == 0);
+    assert(!ctl_bound_set(dfd, "missing.sock"));
+    assert(!ctl_bound_set(-1, NULL));
+    char longname[200];
+    memset(longname, 'a', sizeof(longname) - 1);
+    longname[sizeof(longname) - 1] = '\0';
+    assert(!ctl_bound_set(dfd, longname));
+    assert(unlinkat(dfd, "plain", 0) == 0);
+
+    // startup_dir_shared_with_log(): no log channel of the runtime is in this directory, a directory that does not exist, no path
+    snprintf(path, sizeof(path), "%s/k.pid", base);
+    assert(!startup_dir_shared_with_log(path, "pid file"));
+    assert(!startup_dir_shared_with_log("/nonexistent-karidns-test-dir/k.pid", "pid file"));
+    assert(!startup_dir_shared_with_log(NULL, "pid file"));
+    assert(!startup_dir_shared_with_log("ctl.sock", "control socket"));   // (no directory, or "/": not checked, as in main())
+    assert(!startup_dir_shared_with_log("/ctl.sock", "control socket"));
+
+    close(dfd);
+    assert(rmdir(base) == 0);
+    printf("  -> ctl_bound_* and startup_dir_shared_with_log passed.\n");
 }
 
 // ----------------------------------------------------------------------------
@@ -7572,6 +7657,7 @@ int main(void) {
     test_obspage_select_and_totals();
     test_find_configured_domain();
     test_ensure_priv_dir_safe();
+    test_startup_refused_cleanup();
     test_server_core_program_zone_reload_fingerprint_and_added();
     test_server_core_notify_tsig_key_matching_and_transfer_bg_ctx();
     test_server_core_rrl_slip_truncation_and_metrics();

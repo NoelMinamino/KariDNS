@@ -6374,6 +6374,59 @@ STATIC_TEST bool control_socket_in_use(const char *path) {
   return in_use;
 }
 
+/* 0.7: the control socket this start bound, until the Backend has it.  A start that ends before (a refusal after the bind: allow-group, the
+ * log hand-off, the loader / plugin pairs, the fork of the Backend; every exit() and return from main(), through atexit()) removes that file
+ * and nothing else: through a descriptor of the directory that was checked (unlinkat), and only while the name is still the socket it made
+ * (device and inode), so a socket another server bound meanwhile stays.  After the fork the socket is the Backend's: it stays after a stop, as
+ * before, and the next start replaces it. */
+static struct {
+  bool bound;
+  int dir_fd;                          /* a duplicate of the checked directory's descriptor; -1: bound by path */
+  char name[sizeof(((struct sockaddr_un *)0)->sun_path)];   /* the name in dir_fd, or the path */
+  dev_t dev;
+  ino_t ino;
+} g_ctl_bound = { false, -1, "", 0, 0 };
+
+/* the start goes on (the Backend owns the socket) or the socket is gone: nothing to remove; the directory descriptor is closed (it must not
+ * reach the Backend) */
+STATIC_TEST void ctl_bound_forget(void) {
+  if (g_ctl_bound.dir_fd >= 0) close(g_ctl_bound.dir_fd);
+  g_ctl_bound.dir_fd = -1;
+  g_ctl_bound.bound = false;
+}
+
+/* right after the bind: `name` in `dir_fd` (or the path when dir_fd < 0) is the socket this start made.  false: it cannot be told apart
+ * (nothing will be removed) */
+STATIC_TEST bool ctl_bound_set(int dir_fd, const char *name) {
+  struct stat st;
+  ctl_bound_forget();
+  if (!name || strlen(name) >= sizeof(g_ctl_bound.name)) return false;
+  g_ctl_bound.dir_fd = dir_fd >= 0 ? fcntl(dir_fd, F_DUPFD_CLOEXEC, 0) : -1;
+  if ((dir_fd >= 0 && g_ctl_bound.dir_fd < 0) ||
+      (g_ctl_bound.dir_fd >= 0 ? fstatat(g_ctl_bound.dir_fd, name, &st, AT_SYMLINK_NOFOLLOW) : lstat(name, &st)) != 0 || !S_ISSOCK(st.st_mode)) {
+    ctl_bound_forget();
+    return false;
+  }
+  strlcpy(g_ctl_bound.name, name, sizeof(g_ctl_bound.name));
+  g_ctl_bound.dev = st.st_dev;
+  g_ctl_bound.ino = st.st_ino;
+  g_ctl_bound.bound = true;
+  return true;
+}
+
+/* atexit(): removes the socket this start bound (above); a no-op after ctl_bound_forget() */
+STATIC_TEST void ctl_bound_unlink(void) {
+  if (g_ctl_bound.bound) {
+    struct stat st;
+    int fd = g_ctl_bound.dir_fd;
+    bool same = (fd >= 0 ? fstatat(fd, g_ctl_bound.name, &st, AT_SYMLINK_NOFOLLOW) : lstat(g_ctl_bound.name, &st)) == 0 && S_ISSOCK(st.st_mode) &&
+                st.st_dev == g_ctl_bound.dev && st.st_ino == g_ctl_bound.ino;
+    if (same && (fd >= 0 ? unlinkat(fd, g_ctl_bound.name, 0) : unlink(g_ctl_bound.name)) != 0)
+      syslog(LOG_WARNING, "[Startup] Could not remove the control socket '%s' of the refused start: %s", g_ctl_bound.name, strerror(errno));
+  }
+  ctl_bound_forget();
+}
+
 STATIC_TEST void cleanup_pid_file(void) {
   if (g_supervisor_pid != 0 && getpid() == g_supervisor_pid) {
     if (g_pid_fd >= 0) {
@@ -6387,17 +6440,19 @@ STATIC_TEST void cleanup_pid_file(void) {
   }
 }
 
-STATIC_TEST void daemonize(void) {
+/* false (errno set): a fork or setsid() failed; the caller, the process that started or the first child, refuses the start like any other
+ * refusal before it (0.7: this used to exit() here, which left the log files it had made root-owned and the pid file behind) */
+STATIC_TEST bool daemonize(void) {
   pid_t pid = fork();
   if (pid < 0)
-    exit(EXIT_FAILURE);
+    return false;
   if (pid > 0)
     exit(EXIT_SUCCESS);
   if (setsid() < 0)
-    exit(EXIT_FAILURE);
+    return false;
   pid = fork();
   if (pid < 0)
-    exit(EXIT_FAILURE);
+    return false;
   if (pid > 0)
     exit(EXIT_SUCCESS);
   /* No chdir("/") here (BIND's named_os_daemonize() does not either): the daemon keeps the directory it was started in, or options
@@ -6409,7 +6464,7 @@ STATIC_TEST void daemonize(void) {
   close(STDERR_FILENO);
   int fd = open("/dev/null", O_RDWR);
   if (fd < 0)
-    return; // /dev/null を開けなければ諦める
+    return true; // /dev/null を開けなければ諦める
   if (fd != STDIN_FILENO) {
     /* [L-1] fd が stdin でない場合は dup2 で stdin に持ってきて元の fd を閉じる */
     dup2(fd, STDIN_FILENO);
@@ -6422,6 +6477,7 @@ STATIC_TEST void daemonize(void) {
   cap_rights_init(&io_rights, CAP_READ, CAP_WRITE, CAP_FSTAT);
   for (int stdio_fd = STDIN_FILENO; stdio_fd <= STDERR_FILENO; stdio_fd++)
     cap_rights_limit(stdio_fd, &io_rights);
+  return true;
 }
 
 /* SO_RCVBUF / SO_SNDBUF of an IPC socket.  A refusal or a smaller buffer than asked for (the kernel clamps to kern.ipc.maxsockbuf and
@@ -6449,6 +6505,7 @@ STATIC_TEST void setup_ipc_tables(int num_workers) {
     for (int w = 0; w < num_workers; w++) {
       if (socketpair(AF_UNIX, SOCK_DGRAM, 0, g_ipc_fds[f][w]) < 0) {
         syslog(LOG_CRIT, "[IPC] Failed to create socketpair for router %d worker %d: %m", f, w);
+        log_startup_refused();   // 0.7: (start-up only) the log files this start made go to the run user, as on the other refusals
         exit(1);
       }
       fcntl(g_ipc_fds[f][w][0], F_SETFL,
@@ -6464,6 +6521,7 @@ STATIC_TEST void setup_ipc_tables(int num_workers) {
 
   if (socketpair(AF_UNIX, SOCK_DGRAM, 0, g_notify_ipc) < 0) {
     syslog(LOG_CRIT, "[IPC] Failed to create notify socketpair: %m");
+    log_startup_refused();
     exit(1);
   }
   fcntl(g_notify_ipc[0], F_SETFL,
@@ -6486,6 +6544,7 @@ STATIC_TEST void setup_ipc_tables(int num_workers) {
 
   if (socketpair(AF_UNIX, SOCK_DGRAM, 0, g_notify_resp_ipc) < 0) {
     syslog(LOG_CRIT, "[IPC] Failed to create NOTIFY response socketpair: %m");
+    log_startup_refused();
     exit(1);
   }
   fcntl(g_notify_resp_ipc[0], F_SETFL, fcntl(g_notify_resp_ipc[0], F_GETFL, 0) | O_NONBLOCK);
@@ -6733,6 +6792,36 @@ bool ensure_priv_dir_safe(const char *dir_buf) {
   bool ok = priv_dir_fd_safe(dfd, dir_buf);
   close(dfd);
   return ok;
+}
+
+/* 0.7: true (logged; the start is refused) when the directory of `path` (the pid file or the control socket) is also the directory of a log
+ * file, and this start made it for the log (prepare_log_dir() hands such a directory to the run user) or it is already not root-owned or
+ * writable by group / other.  The run user writes to a log directory (it rolls and makes the files there); it must not be able to write to the
+ * directory of the pid file or of the control socket (ensure_priv_dir_safe()): with both in one directory such a start worked once and the
+ * next one was refused.  A root-owned directory that was there keeps working as before.  Only as root (the directories are compared by device
+ * and inode; nothing is opened or changed). */
+STATIC_TEST bool startup_dir_shared_with_log(const char *path, const char *what) {
+  char dir[PATH_MAX], base[PATH_MAX];
+  struct stat ds;
+  const char *slash = path ? strrchr(path, '/') : NULL;
+  /* (as in main(): a name without a directory, or in "/", gets no ensure_priv_dir_safe() check either) */
+  if (geteuid() != 0 || !slash || slash == path || !split_path_for_openat(path, dir, sizeof(dir), base, sizeof(base)) || stat(dir, &ds) != 0) return false;
+  for (log_channel_t *ch = log_runtime_current_channels(); ch; ch = ch->next) {
+    char ldir[PATH_MAX], lbase[PATH_MAX];
+    struct stat ls;
+    if (ch->dest != LOGDEST_FILE || !ch->file_path || !split_path_for_openat(ch->file_path, ldir, sizeof(ldir), lbase, sizeof(lbase)) ||
+        stat(ldir, &ls) != 0 || ls.st_dev != ds.st_dev || ls.st_ino != ds.st_ino)
+      continue;
+    if (!log_dir_was_created(ldir) && ds.st_uid == 0 && !(ds.st_mode & (S_IWGRP | S_IWOTH))) continue;
+    syslog(LOG_ERR, "[Startup] Refusing to start: the %s directory '%s' is also the directory of the log file '%s'; the run user writes to a "
+                    "log directory, and must not be able to write to the %s directory: put the log files in a directory of their own", what, dir,
+           ch->file_path, what);
+    fprintf(stderr, "[ERROR] Refusing to start: the %s directory '%s' is also the directory of the log file '%s'; the run user writes to a "
+                    "log directory, and must not be able to write to the %s directory: put the log files in a directory of their own\n", what,
+            dir, ch->file_path, what);
+    return true;
+  }
+  return false;
 }
 
 #ifndef KARIDNS_UNIT_TEST
@@ -7051,6 +7140,16 @@ int main(int argc, char **argv) {
       return 1;
     }
   }
+  /* 0.7: a log directory that is also the pid file or control socket directory (startup_dir_shared_with_log()), before daemonize() so that the
+   * reason reaches the terminal */
+  if ((effective_pid_file && strcmp(effective_pid_file, "none") != 0 && startup_dir_shared_with_log(effective_pid_file, "pid file")) ||
+      (g_config_db.config_a.control.enabled &&
+       startup_dir_shared_with_log(g_config_db.config_a.control.socket_path ? g_config_db.config_a.control.socket_path : "/var/run/karidns/control.sock",
+                                   "control socket"))) {
+    free_server_config_fields(&g_config_db.config_a);
+    log_startup_refused();
+    return 1;
+  }
   if (effective_pid_file && strcmp(effective_pid_file, "none") != 0 && effective_pid_file[0] != '\0') {
     char dir_buf[1024];
     strncpy(dir_buf, effective_pid_file, sizeof(dir_buf) - 1);
@@ -7110,8 +7209,21 @@ int main(int argc, char **argv) {
     }
   }
 
-  if (!foreground) {
-    daemonize();
+  if (!foreground && !daemonize()) {
+    /* 0.7: the fork or setsid() of daemonize() failed.  This process is the one that started (the first fork: exit status 1) or the first
+     * child (the one that started has exited with 0); stderr is still the terminal's.  It holds the lock of the pid file: the file is this
+     * start's and goes, as when a later step refuses the start */
+    int e = errno;
+    syslog(LOG_ERR, "[Startup] Refusing to start: cannot run as a daemon: %s", strerror(e));
+    fprintf(stderr, "[ERROR] Refusing to start: cannot run as a daemon: %s\n", strerror(e));
+    if (g_pid_fd >= 0) {
+      strlcpy(g_pid_file_path, effective_pid_file, sizeof(g_pid_file_path));
+      g_supervisor_pid = getpid();
+      cleanup_pid_file();
+    }
+    free_server_config_fields(&g_config_db.config_a);
+    log_startup_refused();
+    return 1;
   }
   start_connect_broker();
 
@@ -7219,6 +7331,8 @@ int main(int argc, char **argv) {
                        : bind(g_control_sock, (struct sockaddr *)&un, sizeof(un))) == 0) {
         fcntl(g_control_sock, F_SETFL, fcntl(g_control_sock, F_GETFL, 0) | O_NONBLOCK);
         listen(g_control_sock, 128);
+        if (ctl_bound_set(dir_fd, dir_fd >= 0 ? leaf_name : un.sun_path))
+          atexit(ctl_bound_unlink);     /* 0.7: a start that ends before the Backend has the socket removes it (g_ctl_bound) */
         const bool want_grp = g_config_db.config_a.control.has_allow_gid;
         if (g_run_identity.has_user || want_grp) {
           /* [SEC] ソケットFDに対する fchown() は FreeBSD で EINVAL となるため、
@@ -7339,6 +7453,7 @@ int main(int argc, char **argv) {
     cleanup_pid_file();
     exit(1);
   }
+  ctl_bound_forget();   // 0.7: the control socket is the Backend's now (both processes; the directory descriptor does not reach the sandbox)
 
   if (backend_pid > 0) {
     // === Parent Process (Process Manager / Supervisor) ===
