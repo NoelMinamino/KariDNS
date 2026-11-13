@@ -29,9 +29,13 @@ pass() { echo "PASS: $*"; }
 
 # The program of one process: node lock.mjs FILE hold          -> "locked" and holds until killed, or "refused <message>" and exit 3
 #                                           FILE race T0 MS     -> waits for the time T0 (ms), tries; "won <pid> <t0> <t1>" after holding MS ms, or "lost <message>"
+# (copies of the two modules, which import only node: built-ins, so that the user nobody of L4 can read them whatever the modes of the tree)
+mkdir -p "$T/lib"
+cp signer/lib/db_sqlite.js node/lib/sqlite.js "$T/lib/"
+chmod 755 "$T/lib"; chmod 644 "$T/lib/"*.js
 cat > "$T/lock.mjs" <<EOF
-import { acquireFileLock } from '$ROOT/signer/lib/db_sqlite.js';
-import { loadSqlite } from '$ROOT/node/lib/sqlite.js';
+import { acquireFileLock } from '$T/lib/db_sqlite.js';
+import { loadSqlite } from '$T/lib/sqlite.js';
 const sqlite = await loadSqlite();
 const [file, mode, t0, ms] = process.argv.slice(2);
 if (mode === 'race') { while (Date.now() < Number(t0)) { /* the same instant for all */ } }
@@ -128,7 +132,7 @@ RO="$T/ro"
 mkdir "$RO"
 chmod 555 "$RO"
 if [ "$(id -u)" = 0 ]; then
-    if id nobody > /dev/null 2>&1 && su -m nobody -c "test -r '$T/lock.mjs' && test -r '$ROOT/signer/lib/db_sqlite.js'" 2>/dev/null; then
+    if id nobody > /dev/null 2>&1 && su -m nobody -c "test -r '$T/lock.mjs' && test -x '$NODE'" 2>/dev/null; then
         MSG=$(su -m nobody -c "'$NODE' '$T/lock.mjs' '$RO/x.sqlite3.signer.lock' hold" 2>/dev/null)
     else
         MSG="SKIP"
@@ -138,7 +142,7 @@ else
 fi
 echo "   $MSG"
 case "$MSG" in
-    SKIP) echo "SKIP: L4 (root, and the user nobody cannot read the tree)" ;;
+    SKIP) echo "SKIP: L4 (root, and there is no user nobody that can run $NODE and read $T)" ;;
     "refused cannot take the lock file $RO/x.sqlite3.signer.lock: "*"write access to the directory of the database)") pass "L4: refused with a message that names the file and what is needed" ;;
     *) fail "L4: $MSG" ;;
 esac
