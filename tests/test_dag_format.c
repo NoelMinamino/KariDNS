@@ -32,6 +32,90 @@ int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) 
 
 #define N(a) (sizeof(a) / sizeof((a)[0]))
 
+/* 0.7: what reaches syslog(3) (this definition wins over tests/test_syslog_quiet.c's weak one) */
+static int g_syslog_calls;
+void syslog(int priority, const char *format, ...) {
+    (void)priority;
+    (void)format;
+    g_syslog_calls++;
+}
+
+/* print_response() into a buffer (stdout through a temporary file) */
+static void dag_print_to(const uint8_t *pkt, size_t len, char *out, size_t cap) {
+    display_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.show_question = o.show_answer = o.show_authority = o.show_additional = o.show_comments = true;
+    fflush(stdout);
+    FILE *tf = tmpfile();
+    assert(tf);
+    int saved = dup(1);
+    dup2(fileno(tf), 1);
+    print_response(pkt, len, NULL, &o);
+    fflush(stdout);
+    dup2(saved, 1);
+    close(saved);
+    rewind(tf);
+    size_t n = fread(out, 1, cap - 1, tf);
+    out[n] = '\0';
+    fclose(tf);
+}
+
+/* 0.7: a malformed answer gives the shared wire parser's "RR from wire: ..." syslog lines; dag (main() installs dag_klog_drop()) sends none
+ * of them to the system log, as dig writes none, and its own output still reports the defect */
+static void test_dag_no_syslog_for_malformed_answers(void) {
+    printf("[TEST] dag: a malformed answer writes nothing to syslog, and dag's output reports it...\n");
+    struct { uint16_t type, rdlen_claimed, rdlen_real; const char *shown; } cases[] = {
+        { 1, 3, 3, "Message parser reports malformed message packet" },     /* A of 3 octets: "A record rdlen != 4" */
+        { 1, 200, 4, "Message parser reports malformed message packet" },   /* RDLENGTH past the end: "rdlen 200 goes out of bounds" */
+        { 48, 2, 2, "malformed" },                                          /* DNSKEY of 2 octets: "malformed RDATA ... kept as opaque data" */
+    };
+    for (size_t i = 0; i < N(cases); i++) {
+        uint8_t p[512];
+        memset(p, 0, 12);
+        p[0] = 0x12; p[1] = 0x34; p[2] = 0x84; p[5] = 1; p[7] = 1;   /* QR AA, QDCOUNT 1, ANCOUNT 1 */
+        size_t o = 12;
+        o += (size_t)write_uncompressed_name(p, o, sizeof(p), "www.example.");
+        p[o++] = 0; p[o++] = (uint8_t)cases[i].type; p[o++] = 0; p[o++] = 1;
+        size_t an = o;
+        p[o++] = 0xc0; p[o++] = 12;                                      /* owner: the question name */
+        p[o++] = 0; p[o++] = (uint8_t)cases[i].type; p[o++] = 0; p[o++] = 1;
+        p[o++] = 0; p[o++] = 0; p[o++] = 1; p[o++] = 44;
+        p[o++] = (uint8_t)(cases[i].rdlen_claimed >> 8); p[o++] = (uint8_t)cases[i].rdlen_claimed;
+        for (uint16_t k = 0; k < cases[i].rdlen_real; k++) p[o++] = (uint8_t)(k + 1);
+        dns_record_t rec;
+        uint16_t type;
+        size_t off;
+
+        klog_set_hook(NULL);                       /* without dag's hook: the shared parser's line goes to syslog() */
+        g_syslog_calls = 0;
+        off = an;
+        (void)parse_resource_record(p, o, &off, &g_dag_arena, &rec, &type);
+        assert(g_syslog_calls > 0);
+
+        fflush(stdout);
+        int saved = dup(1), dn = open("/dev/null", O_WRONLY);
+        dup2(dn, 1);
+        char *argv[] = { "dag", "-h", NULL };
+        assert(dag_main(2, argv) == 0);            /* main() installs the hook first */
+        fflush(stdout);
+        dup2(saved, 1);
+        close(saved);
+        close(dn);
+        g_syslog_calls = 0;
+        off = an;
+        (void)parse_resource_record(p, o, &off, &g_dag_arena, &rec, &type);
+        char out[8192];
+        dag_print_to(p, o, out, sizeof(out));
+        assert(g_syslog_calls == 0);
+        if (!strstr(out, cases[i].shown)) {
+            fprintf(stderr, "case %zu: no \"%s\" in:\n%s\n", i, cases[i].shown, out);
+            assert(0);
+        }
+    }
+    klog_set_hook(NULL);
+    printf("  -> no syslog line, the defect is in dag's output.\n");
+}
+
 static const char *ROUNDTRIP_LINES[] = {
     "IN A 192.0.2.1",
     "IN AAAA 2001:db8::1",
@@ -1079,6 +1163,7 @@ int main(void) {
     test_dag_format_case_28();
     test_dag_format_case_29();
     test_dag_format_case_30();
+    test_dag_no_syslog_for_malformed_answers();
     printf("=== All dag RDATA Display Tests PASSED ===\n");
     return 0;
 }

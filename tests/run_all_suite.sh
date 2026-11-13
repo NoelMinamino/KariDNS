@@ -436,7 +436,7 @@ register_test "unit" "bin" "test_tinydns_paths" "tinydns parser: 23 valid line f
 register_test "unit" "bin" "test_sig0_sign" "RFC 2931 SIG(0) signing verified independently with OpenSSL (RSA/ECDSA/Ed25519)"
 register_test "unit" "bin" "test_snapshot_rebuild" "Zone snapshot rebuild across views, zone lookup & reload_master_zone verdicts"
 register_test "unit" "bin" "test_dag_reassembly" "dag pcap L4 extraction (all link types, padding, fragments) & randomized TCP reassembly (reorder, retransmit, seq wraparound)"
-register_test "unit" "bin" "test_dag_format" "dag RDATA display: RFC 1035 decimal escaping, RFC 8777 AMTRELAY, display->parse round trip of every RR type"
+register_test "unit" "bin" "test_dag_format" "dag RDATA display: RFC 1035 decimal escaping, RFC 8777 AMTRELAY, display->parse round trip of every RR type; 0.7: no syslog line for a malformed answer"
 register_test "unit" "bin" "test_query_engine_protocol" "Query engine protocol: BADVERS, FORMERR/NOTIMP, foreign classes, IXFR/UDP, SOA EXPIRE, NOTIFY+TSIG authorization"
 register_test "unit" "bin" "test_response_cache" "Shared response cache: fill on miss, byte-identical answers, invalidation by generation"
 register_test "unit" "bin" "test_dnssec_proofs" "DNSSEC negative proofs: RFC 5155 App A/B (NSEC3) & RFC 4035 App A/B (NSEC) example zones"

@@ -23,6 +23,22 @@
 #include "dag_edns_client.h"
 #include "dag_transport.h"
 #include "karidns_tool_linkage.h"
+#ifndef _WIN32
+#include "../dns_log.h"
+#undef syslog   /* dag calls no syslog() of its own; dns_log.h is here for klog_set_hook() */
+
+/* The wire code dag shares with the server (dns_wire.c) gives syslog(3) what it cannot parse ("RR from wire: ..."): from dag such lines would
+ * reach the host's system log whenever a server sends a malformed answer, where dig writes nothing.  dag reports the same defects in its own
+ * output (the message parser: "Got bad packet", "Message parser reports malformed message packet"; "(malformed)" in an RDATA), so the lines are
+ * dropped.  (On Windows the shared code's syslog() is a no-op already.) */
+static void dag_klog_drop(int cat, int prio, const char *fmt, va_list ap, int saved_errno) {
+    (void)cat;
+    (void)prio;
+    (void)fmt;
+    (void)ap;
+    (void)saved_errno;
+}
+#endif
 
 
 
@@ -5853,6 +5869,7 @@ int main(int argc, char **argv) {
 #ifndef _WIN32
     // サーバーからのTCP切断時におけるSIGPIPEによるプロセス強制終了を防止
     signal(SIGPIPE, SIG_IGN);
+    klog_set_hook(dag_klog_drop);   /* nothing of the shared code goes to the system log (dig writes none) */
 #endif
     g_dag_answer_check = dag_check_answer; /* opcode / question checks of UDP answers (T-12) */
     g_dag_discard_dump = dag_dump_discarded;
