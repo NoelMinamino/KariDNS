@@ -561,14 +561,14 @@ R	1	0	0
 $ cat karidns.conf
 options {
     pid-file "none";
-    database { driver sqlite3; database-file "/home/claude/b13doc/zones.sqlite3"; loader-path "/usr/local/libexec/karidns-dbloader"; acl-ceiling { 192.0.2.0/24; }; };
+    database { driver sqlite3; database-file "/home/dnsadmin/zones.sqlite3"; loader-path "/usr/local/libexec/karidns-dbloader"; acl-ceiling { 192.0.2.0/24; }; };
 };
 $ karicheck db karidns.conf
 [INFO] Loading config karidns.conf...
-[INFO] Checking Database file '/home/claude/b13doc/zones.sqlite3' (the default view) with the rights of the user claude (uid 1002)
-[INFO] Database file '/home/claude/b13doc/zones.sqlite3': karidns_* schema version 2
-[RESULT] Database file '/home/claude/b13doc/zones.sqlite3': 1 zone(s) read, 0 error(s), 0 warning(s)
-[OK] Database file '/home/claude/b13doc/zones.sqlite3' is valid.
+[INFO] Checking Database file '/home/dnsadmin/zones.sqlite3' (the default view) with the rights of the user dnsadmin (uid 1001)
+[INFO] Database file '/home/dnsadmin/zones.sqlite3': karidns_* schema version 2
+[RESULT] Database file '/home/dnsadmin/zones.sqlite3': 1 zone(s) read, 0 error(s), 0 warning(s)
+[OK] Database file '/home/dnsadmin/zones.sqlite3' is valid.
 [INFO] Checked 1 database (1 zone). Errors: 0, warnings: 0
 ```
 
@@ -578,12 +578,12 @@ A row the loader would refuse (the exit status is 1; `--dump` would send the zon
 $ sqlite3 zones.sqlite3 "INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'bad.example.test', 'A', '192.0.2.999', 300, 0, 0 FROM domains WHERE name = 'example.test';"
 $ karicheck db karidns.conf
 [INFO] Loading config karidns.conf...
-[INFO] Checking Database file '/home/claude/b13doc/zones.sqlite3' (the default view) with the rights of the user claude (uid 1002)
-[INFO] Database file '/home/claude/b13doc/zones.sqlite3': karidns_* schema version 2
-[ERROR] Database file '/home/claude/b13doc/zones.sqlite3': zone 'example.test.' (domains.id 1): records.id 5: invalid IPv4 address literal in A record
-[RESULT] Database file '/home/claude/b13doc/zones.sqlite3': 1 zone(s) read, 1 error(s), 0 warning(s)
+[INFO] Checking Database file '/home/dnsadmin/zones.sqlite3' (the default view) with the rights of the user dnsadmin (uid 1001)
+[INFO] Database file '/home/dnsadmin/zones.sqlite3': karidns_* schema version 2
+[ERROR] Database file '/home/dnsadmin/zones.sqlite3': zone 'example.test.' (domains.id 1): records.id 5: invalid IPv4 address literal in A record
+[RESULT] Database file '/home/dnsadmin/zones.sqlite3': 1 zone(s) read, 1 error(s), 0 warning(s)
 [INFO] Checked 1 database (1 zone). Errors: 1, warnings: 0
-[FAIL] Database file '/home/claude/b13doc/zones.sqlite3' has errors.
+[FAIL] Database file '/home/dnsadmin/zones.sqlite3' has errors.
 ```
 
 **PostgreSQL.** The role `karidns_loader` was created by `CREATE ROLE karidns_loader LOGIN;`, the PowerDNS tables exist in the database `karidns`, the extension file is applied by the owner of the tables, and the role script by a superuser such as `postgres` (it alters the role, which needs more than the right to the tables). The loader then reads with the privileges of that role only:
@@ -597,7 +597,7 @@ ERROR:  permission denied for table cryptokeys
 $ cat conninfo
 host=/tmp dbname=karidns
 $ karidns-dbloader --check --driver postgresql --conninfo-file conninfo
-W		0	the role claude can read cryptokeys.content (the private keys); the loader needs only domain_id (db/karidns_loader_role.pgsql.sql grants just that)
+W		0	the role dnsadmin can read cryptokeys.content (the private keys); the loader needs only domain_id (db/karidns_loader_role.pgsql.sql grants just that)
 I		0	karidns_* schema version 2
 R	0	0	1
 ```
