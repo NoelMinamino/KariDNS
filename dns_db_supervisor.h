@@ -26,14 +26,16 @@
 #endif
 
 /* The messages of the loader (batch 14).  The loader's stderr is a pipe made for every start (the loader gets --log-stderr and writes
- * "<N>[DB] text" lines, N = the syslog priority; 0.7 M2: "<7:L>[DB] text" is a message at debug level L, 1..99, which a reader that knows only
- * "<N>" logs as text at LOG_NOTICE).  The supervisor reads it without blocking, line by line, and logs every line in the
- * `database` category (kdns_logc(LOGC_DATABASE, ...)), so that `logging { category database { ...; }; }` decides where it goes.  The bytes are
- * untrusted: db_logrd_t cuts a line at DB_LOG_TEXT_MAX, escapes everything but printable ASCII, accepts any end of line / end of stream, and
- * forwards at most DB_LOG_RATE_LINES lines per second (the rest are counted and reported once).  A read takes at most DB_LOG_READ_BUDGET
+ * "<N>[DB] text" lines, N = the syslog priority; 0.7 M2: "<7:L>[DB] text" is a message at debug level L, 1..99 (logged at debug 10 at most,
+ * the highest level of the server's messages), which a reader that knows only "<N>" logs as text at LOG_NOTICE).  The supervisor reads it
+ * without blocking, line by line, and logs every line in the `database` category (kdns_logc(LOGC_DATABASE, ...)), so that
+ * `logging { category database { ...; }; }` decides where it goes.  The bytes are untrusted: db_logrd_t cuts a line at DB_LOG_TEXT_MAX,
+ * escapes everything but printable ASCII, accepts any end of line / end of stream, and forwards at most DB_LOG_RATE_LINES lines per second
+ * of warning and worse, and as many of the other lines (two budgets: a flood of info lines does not drop an error; the rest are counted and
+ * reported once).  A read takes at most DB_LOG_READ_BUDGET
  * bytes, so a loader that floods the pipe cannot keep the supervisor from its signals; the loader blocks on a full pipe meanwhile. */
 #define DB_LOG_TEXT_MAX 512        /* the longest text of a line (after the "<N>" priority), escaped; a longer line ends in "..." */
-#define DB_LOG_RATE_LINES 50       /* lines forwarded per second */
+#define DB_LOG_RATE_LINES 50       /* lines forwarded per second: of warning and worse, and of the others (each) */
 #define DB_LOG_READ_BUDGET 65536   /* bytes taken from the pipe by one db_sup_log_read() */
 
 /* prio: the syslog priority; level: 0, or the debug level of a "<7:L>" line (0.7 M2) */
@@ -44,7 +46,8 @@ typedef struct {
   bool over;                /* the line is longer than DB_LOG_TEXT_MAX: the rest of it is dropped */
   bool pending_cr;          /* the last byte was a CR: dropped when a LF follows, else it is part of the text */
   int64_t window_ms;        /* start of the second being counted */
-  unsigned window_lines;
+  unsigned window_lines;    /* lines of that second below warning (debug lines among them) */
+  unsigned window_urgent;   /* ... of warning and worse */
   unsigned long suppressed; /* lines dropped by the rate limit since the last report */
 } db_logrd_t;
 

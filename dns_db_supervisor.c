@@ -69,7 +69,8 @@ size_t db_logrd_prefix(const char *text, int *prio, int *level) {
   return i + 1;
 }
 
-/* One complete line: a priority (db_logrd_prefix()) and the text, subject to the rate limit */
+/* One complete line: a priority (db_logrd_prefix()) and the text, subject to the rate limit.  0.7: the warnings and errors have a budget of
+ * their own, so that the info and debug lines of a busy second (the shared zone code says one line per presigned zone) cannot drop them */
 static void logrd_line(db_logrd_t *rd, int64_t now_ms, db_logrd_sink_t sink, void *ud) {
   if (rd->over) {
     memcpy(rd->buf + rd->len, "...", 3);
@@ -85,9 +86,11 @@ static void logrd_line(db_logrd_t *rd, int64_t now_ms, db_logrd_sink_t sink, voi
       if (rd->suppressed) logrd_report(rd, sink, ud);
       rd->window_ms = now_ms;
       rd->window_lines = 0;
+      rd->window_urgent = 0;
     }
-    if (rd->window_lines < DB_LOG_RATE_LINES) {
-      rd->window_lines++;
+    unsigned *count = level == 0 && prio <= LOG_WARNING ? &rd->window_urgent : &rd->window_lines;
+    if (*count < DB_LOG_RATE_LINES) {
+      (*count)++;
       sink(prio, level, text, ud);
     } else {
       rd->suppressed++;
@@ -149,8 +152,10 @@ void db_logrd_tick(db_logrd_t *rd, int64_t now_ms, db_logrd_sink_t sink, void *u
 
 void db_log_sink(int prio, int level, const char *text, void *ud) {
   (void)ud;
-  /* a debug line goes at its own level (the manager's channels and level decide, dns_log.h logev_post(): one atomic load when nobody wants it) */
-  if (level > 0) logev_post(LOGC_DATABASE, level, NULL, 0, text[0] == '[' ? "%s" : "[DB] %s", text);
+  /* a debug line goes at its own level (the manager's channels and level decide, dns_log.h logev_post(): one atomic load when nobody wants it);
+   * above debug 10, the highest level a message of the server has (LOGEV_LEVEL_MAX), at debug 10, so that a `severity debug 99` channel or
+   * `karictl trace 99` still shows it (the loader writes none above 10) */
+  if (level > 0) logev_post(LOGC_DATABASE, level > LOGEV_LEVEL_MAX ? LOGEV_LEVEL_MAX : level, NULL, 0, text[0] == '[' ? "%s" : "[DB] %s", text);
   else kdns_logc(LOGC_DATABASE, prio, text[0] == '[' ? "%s" : "[DB] %s", text);
 }
 

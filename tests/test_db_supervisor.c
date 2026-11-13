@@ -337,6 +337,15 @@ static void feed_str(db_logrd_t *rd, const char *s, size_t n, int64_t t, lines_t
     db_logrd_feed(rd, s, n, t, collect, l);
 }
 
+/* the level hook of the event messages (logev_post()): the last line and its level */
+static int g_ev_level;
+static char g_ev_text[KLOG_MSG_MAX];
+static void ev_hook(int cat, int level, const char *msg) {
+    if (cat != LOGC_DATABASE) return;
+    g_ev_level = level;
+    snprintf(g_ev_text, sizeof(g_ev_text), "%s", msg);
+}
+
 static void test_log_reader(void) {
     printf("db_logrd: the loader's lines\n");
     db_logrd_t rd;
@@ -429,6 +438,18 @@ static void test_log_reader(void) {
         CHECK(db_logrd_prefix("", &p, &lv) == 0 && p == 5 && lv == 0);
         CHECK(db_logrd_prefix("<7:9>", &p, &lv) == 5 && p == 7 && lv == 9);
         db_log_sink(7, 2, "[DB] a debug line nobody wants", NULL);          /* (no channel: dropped by logev_post()) */
+        /* 0.7: a level above 10 (LOGEV_LEVEL_MAX, the highest of the server's messages) is logged at debug 10, not dropped */
+        logev_set_mask(LOGC_DATABASE, ~0u);
+        klog_set_level_hook(ev_hook);
+        g_ev_level = -100;
+        db_log_sink(7, 42, "[DB] a debug line at 42", NULL);
+        CHECK_MSG(g_ev_level == LOGEV_LEVEL_MAX && strstr(g_ev_text, "[DB] a debug line at 42"), "level %d", g_ev_level);
+        db_log_sink(7, 99, "x", NULL);
+        CHECK(g_ev_level == LOGEV_LEVEL_MAX && strcmp(g_ev_text, "[DB] x") == 0);
+        db_log_sink(7, 2, "[DB] at 2", NULL);
+        CHECK(g_ev_level == 2);
+        klog_set_level_hook(NULL);
+        logev_set_mask(LOGC_DATABASE, 0);
     }
 
     /* a line longer than the limit is cut and marked; so is a line of bytes that grow when escaped; the next line is fine */
@@ -484,6 +505,27 @@ static void test_log_reader(void) {
     CHECK_HAS(l.text[DB_LOG_RATE_LINES], "20 line(s) of the loader's output were not logged");
     db_logrd_tick(&rd, 9000, collect, &l);
     CHECK(l.n == DB_LOG_RATE_LINES + 1);                                     /* said once */
+    /* 0.7: warnings and errors have a budget of their own: a flood of info lines (the shared zone code: one per presigned zone) does not drop
+     * them; their budget is as small, and the debug lines are in the budget of the info lines */
+    {
+        static const char *const in[] = { "<6>[Zone] info\n", "<3>[DB] an error\n", "<4>[DB] a warning\n", "<3>e\n", "<7:2>d\n", "<7>d\n" };
+        memset(&l, 0, sizeof(l));
+        db_logrd_init(&rd);
+        for (int i = 0; i < 200; i++) feed_str(&rd, in[0], strlen(in[0]), 7000, &l);
+        feed_str(&rd, in[1], strlen(in[1]), 7000, &l);
+        feed_str(&rd, in[2], strlen(in[2]), 7000, &l);
+        CHECK_MSG(l.n == DB_LOG_RATE_LINES + 2, "%d lines passed", l.n);
+        CHECK(l.prio[DB_LOG_RATE_LINES] == 3 && strcmp(l.text[DB_LOG_RATE_LINES], "[DB] an error") == 0);
+        CHECK(l.prio[DB_LOG_RATE_LINES + 1] == 4 && strcmp(l.text[DB_LOG_RATE_LINES + 1], "[DB] a warning") == 0);
+        for (int i = 0; i < 100; i++) feed_str(&rd, in[3], strlen(in[3]), 7000, &l);
+        CHECK(l.n == 2 * DB_LOG_RATE_LINES);
+        feed_str(&rd, in[4], strlen(in[4]), 7000, &l);
+        feed_str(&rd, in[5], strlen(in[5]), 7000, &l);
+        CHECK(l.n == 2 * DB_LOG_RATE_LINES);
+        db_logrd_tick(&rd, 8000, collect, &l);
+        CHECK(l.n == 2 * DB_LOG_RATE_LINES + 1);
+        CHECK_HAS(l.text[2 * DB_LOG_RATE_LINES], "204 line(s) of the loader's output were not logged");
+    }
     /* ... and a flood that ends with the stream is reported by the flush */
     memset(&l, 0, sizeof(l));
     db_logrd_init(&rd);
