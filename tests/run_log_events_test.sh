@@ -7,6 +7,7 @@
 #      the rate limit: a flood of refused UPDATEs writes at most about 10 lines per second and a report of the rest
 #   X  xfer-out: AXFR / IXFR over TCP (started, ended with messages / records / bytes / time), IXFR that falls back to AXFR, an up-to-date IXFR,
 #      refusals (allow-transfer, a zone that is not served, a bad TSIG), the IXFR over UDP
+#   B  the debug lines have a rate budget of their own: a burst of UDP IXFRs with a `severity debug 1` channel at debug level 0 keeps every info line
 #   Q  query-errors: the reasons of SERVFAIL / FORMERR / REFUSED at the levels the channel asks for
 #   R  the paths: the same messages from a worker thread (through the ring) and from the transfer thread (directly); the categories without a
 #      channel cost nothing and write nothing
@@ -245,6 +246,55 @@ d x.test IXFR=0 +tcp | grep -q "SOA" && pass "X: IXFR with provide-ixfr no is an
 has "X: provide-ixfr no: debug 4 line" "$LG/xfer_dbg4b.log" "xfer-out: debug 4: client 127\.0\.0\.1#[0-9]*: transfer of 'x\.test/IN': IXFR delta response disabled due to 'provide-ixfr no;' being set"
 has "X: ... and the AXFR-style IXFR" "$LG/xfer_dbg4b.log" "AXFR-style IXFR started (serial 1)"
 kari_kill_tree $S3; PIDS=""
+wait_free $P1
+
+# the debug lines have a rate budget of their own: a `severity debug 1` channel receives them at debug level 0, and a burst that makes more of them
+# in a second than the 50 of xfer-out must not cost one of its info lines.  100 IXFR requests over UDP sent at once: 60 up to date (two debug 1
+# lines each: the ACL decision and "IXFR poll up to date"), 40 behind (the ACL line and one info line, "IXFR over UDP: serial 1 is behind 2").
+echo "== B: debug lines do not take the budget of the info lines"
+zonefile "$W/rl.zone" rl.test 2
+cat > "$W/s7.conf" <<EOF
+options { port $P1; listen-on { 127.0.0.1; }; pid-file "none"; $USER_OPT };
+logging {
+$(chan xd1 "$LG/xfer_burst.log" "debug 1")
+    category xfer-out { xd1; };
+};
+zone "rl.test" { type primary; file "$W/rl.zone"; allow-transfer { 127.0.0.1; }; };
+EOF
+"$KARIDNS" -f "$W/s7.conf" > "$W/s7.log" 2>&1 &
+PIDS="$PIDS $!"
+S7=$!
+_i=0; while [ $_i -lt 20 ]; do d rl.test SOA +short | grep -q hostmaster && break; sleep 0.5; _i=$((_i + 1)); done
+GOT=$(perl -e '
+    use IO::Socket::INET;
+    use IO::Select;
+    my ($port) = @ARGV;
+    my $name = "\x02rl\x04test\x00";
+    my @s;
+    for my $i (0 .. 99) {                        # one socket each (its own port: each info line is a line of its own), all sent before any is read
+        my $serial = $i < 60 ? 2 : 1;
+        my $soa = $name . pack("nnNn", 6, 1, 0, 22) . "\x00\x00" . pack("NNNNN", $serial, 0, 0, 0, 0);
+        my $pkt = pack("n6", $i + 1, 0, 1, 0, 1, 0) . $name . pack("nn", 251, 1) . $soa;
+        my $so = IO::Socket::INET->new(PeerAddr => "127.0.0.1", PeerPort => $port, Proto => "udp") or die "socket: $!";
+        $so->send($pkt);
+        push @s, $so;
+    }
+    my $sel = IO::Select->new(@s);
+    my ($behind, $left, $buf) = (0, 100);
+    while ($left > 0 && (my @r = $sel->can_read(3))) {
+        for my $so (@r) { $so->recv($buf, 4096); $behind++ if length($buf) >= 2 && unpack("n", $buf) > 60; $sel->remove($so); $left--; }
+    }
+    print "$behind\n";
+' "$P1" 2>/dev/null)
+GOT=${GOT:-0}
+[ "$GOT" -ge 30 ] && pass "B: $GOT of the 40 behind requests were answered" || fail "B: only $GOT of the 40 behind requests were answered"
+BPAT="xfer-out: info: client 127\.0\.0\.1#[0-9]*: transfer of 'rl\.test/IN': IXFR over UDP: serial 1 is behind 2"
+_i=0; while [ $_i -lt 50 ] && [ "$(count "$BPAT" "$LG/xfer_burst.log")" -lt "$GOT" ]; do sleep 0.2; _i=$((_i + 1)); done
+N=$(count "$BPAT" "$LG/xfer_burst.log")
+[ "$N" -eq "$GOT" ] && pass "B: every info line of the burst is written ($N of $GOT)" || fail "B: $N info lines for $GOT answered requests"
+has "B: the burst had more debug lines than the limit (their own report)" "$LG/xfer_burst.log" "xfer-out: debug 1: [0-9]* message(s) suppressed by the rate limit of 50 per second"
+hasnt "B: no info line was suppressed" "$LG/xfer_burst.log" "xfer-out: info: [0-9]* message(s) suppressed"
+kari_kill_tree $S7; PIDS=""
 wait_free $P1
 
 # ------------------------------------------------------------------------------------------------ Q: query-errors

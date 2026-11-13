@@ -1365,6 +1365,34 @@ static void test_logev_helpers(void) {
     assert(logev_admit_at(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, 5001, &rep, &rl) && rep == 0);
     assert(!logev_admit_at(-1, LOG_LVL_INFO, 1, &rep, &rl) && !logev_admit_at(LOGC_COUNT, LOG_LVL_INFO, 1, &rep, &rl));
     assert(logev_admit_at(LOGC_XFER_OUT, LOG_LVL_INFO, 7000, &rep, &rl));   /* every category counts for itself */
+    /* the debug lines have a budget of their own: at debug level 0 (a `severity debug 1` channel still receives them) a flood of debug 1 lines in
+     * xfer-out does not take the 50 a second of its notices and errors; each budget counts and reports its own dropped lines, at their own level */
+    logev_rate_reset();
+    {
+        int nd = 0, nn = 0;
+        uint32_t r3 = 0;
+        int l3 = 0;
+        for (int i = 0; i < 1000; i++) nd += logev_admit_at(LOGC_XFER_OUT, 1, 8000, &r3, &l3) ? 1 : 0;
+        assert(nd == 50 && r3 == 0);                                        /* bounded: the category's limit */
+        for (int i = 0; i < 50; i++) nn += logev_admit_at(LOGC_XFER_OUT, i % 2 ? LOG_LVL_NOTICE : LOG_LVL_ERROR, 8000, &r3, &l3) ? 1 : 0;
+        assert(nn == 50 && r3 == 0);                                        /* every notice and error passes */
+        assert(!logev_admit_at(LOGC_XFER_OUT, LOG_LVL_NOTICE, 8000, &r3, &l3));       /* the 51st is over its own limit */
+        assert(!logev_admit_at(LOGC_XFER_OUT, 2, 8000, &r3, &l3));
+        r3 = 99;
+        assert(logev_admit_at(LOGC_XFER_OUT, LOG_LVL_INFO, 8001, &r3, &l3) && r3 == 1 && l3 == LOG_LVL_NOTICE);   /* the notices' count, not the debug lines' */
+        r3 = 99;
+        assert(logev_admit_at(LOGC_XFER_OUT, 1, 8001, &r3, &l3) && r3 == 951 && l3 == 2);                      /* the debug lines', at a debug level */
+        /* above debug level 0 both budgets have LOGEV_DEBUG_RATE: the M3 limits hold for each */
+        logev_rate_reset();
+        atomic_store_explicit(&g_klog_debug_level, 3, memory_order_relaxed);
+        nd = nn = 0;
+        for (int i = 0; i < 1005; i++) nd += logev_admit_at(LOGC_XFER_OUT, 3, 9000, &r3, &l3) ? 1 : 0;
+        for (int i = 0; i < 1005; i++) nn += logev_admit_at(LOGC_XFER_OUT, LOG_LVL_INFO, 9000, &r3, &l3) ? 1 : 0;
+        assert(nd == (int)LOGEV_DEBUG_RATE && nn == (int)LOGEV_DEBUG_RATE);
+        assert(logev_admit_at(LOGC_XFER_OUT, LOG_LVL_INFO, 9001, &r3, &l3) && r3 == 5 && l3 == LOG_LVL_INFO);
+        assert(logev_admit_at(LOGC_XFER_OUT, 3, 9001, &r3, &l3) && r3 == 5 && l3 == 3);
+        atomic_store_explicit(&g_klog_debug_level, 0, memory_order_relaxed);
+    }
 
     /* the direct path (a thread without a ring): the line goes to the level hook, once the mask and the rate limit allow it */
     logev_rate_reset();
@@ -1393,6 +1421,20 @@ static void test_logev_helpers(void) {
     logev_flush_suppressed((int64_t)time(NULL) + 5);
     assert(g_ev_n == 21 && g_ev_last_level == 1 && strcmp(g_ev_last, "5 message(s) suppressed by the rate limit of 20 per second") == 0);
     logev_set_mask(LOGC_XFER_IN, 0);
+    /* the two budgets through the tick: 60 debug 1 lines and 60 notices in xfer-out at level 0 write 50 of each and two reports, one per budget,
+     * each at the level of the last line it dropped and with the limit that applied (50) */
+    logev_rate_reset();
+    g_ev_n = 0;
+    logev_set_mask(LOGC_XFER_OUT, LOGEV_BIT(1) | LOGEV_BIT(LOG_LVL_NOTICE));
+    for (int i = 0; i < 60; i++) logev_post(LOGC_XFER_OUT, 1, NULL, 0, "d");
+    for (int i = 0; i < 60; i++) logev_post(LOGC_XFER_OUT, LOG_LVL_NOTICE, NULL, 0, "n");
+    assert(g_ev_n == 100);
+    g_ev_n = 0;
+    logev_flush_suppressed((int64_t)time(NULL) + 5);
+    assert(g_ev_n == 2);
+    assert(g_ev_level[0] == LOG_LVL_NOTICE && strcmp(g_ev_line[0], "10 message(s) suppressed by the rate limit of 50 per second") == 0);
+    assert(g_ev_level[1] == 1 && strcmp(g_ev_line[1], "10 message(s) suppressed by the rate limit of 50 per second") == 0);
+    logev_set_mask(LOGC_XFER_OUT, 0);
     /* a text longer than the record is cut; no hook, no routing */
     logev_rate_reset();
     g_ev_n = 0;

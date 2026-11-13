@@ -46,6 +46,8 @@ bool klog_nosyslog_from_env(const char *ident);
  *     a bit for every level that some non-null channel of the category passes.  Without a configured sink for the level nothing else is done,
  *     so a caller checks it before it builds anything for the message.
  *   - a rate limit per category and second (logev_admit_at()); the messages over it are counted and reported once, "N messages suppressed".
+ *     The lines at critical .. info and the debug lines (level > 0) have a budget each, of the same limit, so a debug line never takes the
+ *     place of a notice or an error (a `severity debug n` channel receives debug lines at debug level 0 too).
  *   - a worker thread (logev_set_thread_sink()) writes a fixed-size record into its ring (the query log ring of dns_server_core.c); the query
  *     logger thread formats it and routes it to the channels.  Any other thread formats the line itself and routes it at once.
  * The text is formatted into LOGEV_MSG_MAX bytes (cut); a name that came from the network must be escaped by the caller (escape_qname_for_log()).
@@ -89,7 +91,7 @@ void logev_name_text(const char *name, char *out, size_t n);
  * number of messages the second before dropped (to be said once); logev_flush_suppressed() is called by the query logger thread about every
  * 10 ms so that a report is not left waiting for the next message. */
 bool logev_admit_at(int cat, int level, int64_t now, uint32_t *report, int *report_level);
-/* 0.7 M3 (D-5): the limit of every category while the debug level in force is above 0 (BIND has none; a debug session at level 3 wants one line per
+/* 0.7 M3 (D-5): the limit of every category, of each of its two budgets, while the debug level in force is above 0 (BIND has none; a debug session at level 3 wants one line per
  * message, and the 10-50 lines a second of level 0 would hide most of them).  Why 1000: a worker's ring has 1024 records at the least (32768 by
  * default, query-log-buffer-size) and the query logger thread empties it every 1 ms while there is work and every 10 ms when idle; a debug record
  * may only take the ring up to half (qlog_event_sink(): below the 80% at which the query log stops itself), so 1000 lines a second in each of

@@ -1015,7 +1015,8 @@ size_t logev_format_line(char *out, size_t n, const char *client_ip, int client_
 static const uint32_t k_logev_limit_default = 20;
 uint32_t logev_rate_limit(int cat) {
   /* 0.7 M3 (D-5): while the debug level in force is above 0 every category may write LOGEV_DEBUG_RATE lines a second (dns_log.h says why that
-   * number); at level 0 the limits below are back.  The messages over it are still counted and reported. */
+   * number); at level 0 the limits below are back.  The messages over it are still counted and reported.  The limit is that of each of the two
+   * budgets of the category (g_logev_rl below: the lines at info and up, the debug lines). */
   if (klog_debug_level() > 0) return LOGEV_DEBUG_RATE;
   switch (cat) {
     case LOGC_UPDATE_SECURITY: return 10;
@@ -1026,35 +1027,43 @@ uint32_t logev_rate_limit(int cat) {
   }
 }
 
+/* Two budgets per category (0.7 M3): [0] the lines at critical .. info, [1] the debug lines (level > 0).  Each has the limit above, its own count
+ * and its own count of the dropped, so a debug line never takes the place of a line at info and up: a `severity debug n` channel receives the
+ * debug lines at debug level 0 as well, and before the split the debug lines M3 added to xfer-out (one or two per request) used up the 50 a
+ * second of its notices and errors.  A category whose lines are all at one kind of level (query-errors without the query log: debug only) is
+ * limited exactly as before; one with both may write the limit of each.  A suppressed report is made at the level of the last line its budget
+ * dropped, so it is itself a line of that budget's kind. */
 static struct {
   _Atomic int64_t sec;            /* the second being counted */
   _Atomic uint32_t count;         /* messages passed in it */
   _Atomic uint32_t suppressed;    /* messages dropped since the last report */
   _Atomic int level;              /* the level of the last one dropped (the report is made at it) */
-} g_logev_rl[LOGC_COUNT];
+} g_logev_rl[LOGC_COUNT][2];
 
 void logev_rate_reset(void) {
-  for (int i = 0; i < LOGC_COUNT; i++) {
-    atomic_store(&g_logev_rl[i].sec, 0);
-    atomic_store(&g_logev_rl[i].count, 0);
-    atomic_store(&g_logev_rl[i].suppressed, 0);
-    atomic_store(&g_logev_rl[i].level, LOG_LVL_INFO);
-  }
+  for (int i = 0; i < LOGC_COUNT; i++)
+    for (int b = 0; b < 2; b++) {
+      atomic_store(&g_logev_rl[i][b].sec, 0);
+      atomic_store(&g_logev_rl[i][b].count, 0);
+      atomic_store(&g_logev_rl[i][b].suppressed, 0);
+      atomic_store(&g_logev_rl[i][b].level, b ? 1 : LOG_LVL_INFO);
+    }
 }
 
 bool logev_admit_at(int cat, int level, int64_t now, uint32_t *report, int *report_level) {
   *report = 0;
   if (cat < 0 || cat >= LOGC_COUNT) return false;
-  int64_t s = atomic_load_explicit(&g_logev_rl[cat].sec, memory_order_relaxed);
-  if (s != now && atomic_compare_exchange_strong(&g_logev_rl[cat].sec, &s, now)) {   /* the first message of a new second */
-    atomic_store_explicit(&g_logev_rl[cat].count, 0, memory_order_relaxed);
-    *report = atomic_exchange_explicit(&g_logev_rl[cat].suppressed, 0, memory_order_relaxed);
-    *report_level = atomic_load_explicit(&g_logev_rl[cat].level, memory_order_relaxed);
+  const int b = level > 0;
+  int64_t s = atomic_load_explicit(&g_logev_rl[cat][b].sec, memory_order_relaxed);
+  if (s != now && atomic_compare_exchange_strong(&g_logev_rl[cat][b].sec, &s, now)) {   /* the first message of a new second */
+    atomic_store_explicit(&g_logev_rl[cat][b].count, 0, memory_order_relaxed);
+    *report = atomic_exchange_explicit(&g_logev_rl[cat][b].suppressed, 0, memory_order_relaxed);
+    *report_level = atomic_load_explicit(&g_logev_rl[cat][b].level, memory_order_relaxed);
   }
-  if (atomic_load_explicit(&g_logev_rl[cat].count, memory_order_relaxed) >= logev_rate_limit(cat) ||
-      atomic_fetch_add_explicit(&g_logev_rl[cat].count, 1, memory_order_relaxed) >= logev_rate_limit(cat)) {
-    atomic_fetch_add_explicit(&g_logev_rl[cat].suppressed, 1, memory_order_relaxed);
-    atomic_store_explicit(&g_logev_rl[cat].level, level, memory_order_relaxed);
+  if (atomic_load_explicit(&g_logev_rl[cat][b].count, memory_order_relaxed) >= logev_rate_limit(cat) ||
+      atomic_fetch_add_explicit(&g_logev_rl[cat][b].count, 1, memory_order_relaxed) >= logev_rate_limit(cat)) {
+    atomic_fetch_add_explicit(&g_logev_rl[cat][b].suppressed, 1, memory_order_relaxed);
+    atomic_store_explicit(&g_logev_rl[cat][b].level, level, memory_order_relaxed);
     return false;
   }
   return true;
@@ -1082,13 +1091,14 @@ static void logev_report(int cat, int level, uint32_t n) {
 void logev_flush_suppressed(int64_t now) {
   /* every category (0.7 M3: the debug messages of all of them go through the rate limit; before, only these four had event messages:
    * update-security, update, query-errors, xfer-out) */
-  for (int c = 0; c < LOGC_COUNT; c++) {
-    if (atomic_load_explicit(&g_logev_rl[c].suppressed, memory_order_relaxed) == 0) continue;
-    if (atomic_load_explicit(&g_logev_rl[c].sec, memory_order_relaxed) == now) continue;     /* its second is not over */
-    uint32_t n = atomic_exchange_explicit(&g_logev_rl[c].suppressed, 0, memory_order_relaxed);
-    if (n && logev_wanted(c, atomic_load_explicit(&g_logev_rl[c].level, memory_order_relaxed)))
-      logev_report(c, atomic_load_explicit(&g_logev_rl[c].level, memory_order_relaxed), n);
-  }
+  for (int c = 0; c < LOGC_COUNT; c++)
+    for (int b = 0; b < 2; b++) {                   /* both budgets (the lines at info and up, the debug lines), each reported for itself */
+      if (atomic_load_explicit(&g_logev_rl[c][b].suppressed, memory_order_relaxed) == 0) continue;
+      if (atomic_load_explicit(&g_logev_rl[c][b].sec, memory_order_relaxed) == now) continue;     /* its second is not over */
+      uint32_t n = atomic_exchange_explicit(&g_logev_rl[c][b].suppressed, 0, memory_order_relaxed);
+      int lv = atomic_load_explicit(&g_logev_rl[c][b].level, memory_order_relaxed);
+      if (n && logev_wanted(c, lv)) logev_report(c, lv, n);
+    }
 }
 
 void logev_vpost(int cat, int level, const char *client_ip, int client_port, const char *fmt, va_list ap) {
