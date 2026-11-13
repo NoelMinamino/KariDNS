@@ -13,7 +13,9 @@ A paragraph with \fBcode\fR, \fBbold\fR, \fIitalic\fR, \f(BIboth\fR, \fBbold
 with \fBcode\fB inside\fR, a link to a manual, a link to a site
 <https://www.example.org/docs> and https://www.example.net/ on two lines,
 \fB\-c\fR and \-\-check, a file db/*.sql that stays as it is, an escaped * star
-and a | pipe.
+and a | pipe. A link with parentheses
+<https://www.example.org/wiki/Name_(disambiguation)> keeps its whole address,
+and (a link in parentheses <https://www.example.org/a>) keeps the closing one.
 .SS A subsection
 .IP 1. 4
 the first step
@@ -27,6 +29,18 @@ another bullet
 .RE
 .IP 3. 4
 the third step
+.PP
+Numbered with 1. for every item, and from 7:
+.IP 1. 4
+one
+.IP 2. 4
+two
+.IP 3. 4
+three
+.IP 7. 4
+seven
+.IP 8. 4
+eight
 .IP \(bu 2
 an item with a lazy continuation
 .RS 2

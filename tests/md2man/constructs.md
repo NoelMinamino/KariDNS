@@ -22,7 +22,8 @@ example-tool [-c config] [--check] <zone>
 
 A paragraph with `code`, **bold**, *italic*, ***both***, **bold with `code` inside**, a [link to a manual](karictl.md),
 a [link to a site](https://www.example.org/docs) and <https://www.example.net/> on two lines, `-c` and --check, a
-file db/*.sql that stays as it is, an escaped \* star and a \| pipe.
+file db/*.sql that stays as it is, an escaped \* star and a \| pipe. A [link with parentheses](https://www.example.org/wiki/Name_(disambiguation))
+keeps its whole address, and (a [link in parentheses](https://www.example.org/a)) keeps the closing one.
 
 ### A subsection
 
@@ -31,6 +32,15 @@ file db/*.sql that stays as it is, an escaped \* star and a \| pipe.
    - a bullet
    - another bullet
 3. the third step
+
+Numbered with 1. for every item, and from 7:
+
+1. one
+1. two
+1. three
+
+7) seven
+7) eight
 
 - an item
   with a lazy continuation

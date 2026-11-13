@@ -31,5 +31,9 @@ and "double quotes", tabs	inside, and characters outside ASCII: é — ✓ 日�
 | = | T{ |
 | \| | `.x` |
 
+| Key | Text that is wrapped in a text block of tbl |
+|---|---|
+| a | T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} T} |
+
 term with .dot
 : .SH a definition that starts with a dot

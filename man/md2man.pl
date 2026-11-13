@@ -10,7 +10,7 @@
 #   # title                 the first one gives NAME when the manual has no NAME section
 #   ## heading              .SH          ### heading and deeper: .SS (no font in a heading: the text only)
 #   paragraph               .PP          the lines of one paragraph are joined into one line of roff
-#   - item, * item, 1. item .IP with a bullet or the number; the lines indented under an item are its blocks (nested lists, code, paragraphs),
+#   - item, * item, 1. item .IP with a bullet or the number (counted from the first item's: 1. 1. 1. is 1. 2. 3.); the lines indented under an item are its blocks (nested lists, code, paragraphs),
 #                           the blocks after the first one inside .RS/.RE
 #   term + ": text"         a definition list (the option lists): .TP with the term, the text and the indented lines under it as its body
 #   ```fenced code```       .nf/.fi, indented by 2 (inside an item as well); tabs expanded to 8 columns
@@ -23,12 +23,13 @@
 #
 # Everything roff would interpret is escaped: a backslash is \e, a line never starts with "." or "'" (\& before it), a hyphen in code, in an
 # option (-x, --name) and at the start of a word is \- (so that a copied option is ASCII), every character outside ASCII is \[uXXXX], a double
-# quote in a macro argument is \(dq, and a table cell starts with \& (a cell "_" or "=" would be a rule in tbl).
+# quote in a macro argument is \(dq, a table cell starts with \& (a cell "_" or "=" would be a rule in tbl), and so does a line of a wrapped
+# cell (T{ ... T}) that starts with "T}".
 #
 # Options:
 #   -s SECTION         the section (1, 5, 8): .TH
 #   -n NAME            the name of the page (.TH and the NAME line)
-#   -d DATE            the date of .TH (the Makefile passes the contents of man/DATE, so that a page does not change with the day)
+#   -d DATE            the date of .TH (man/generate.sh passes the day the text of the page last changed, so that it does not change daily)
 #   --name-desc TEXT   the text of the NAME line (instead of the NAME section of the manual or its title)
 #   --synopsis LINE    a SYNOPSIS line, repeatable, when the manual has no SYNOPSIS section
 #   --only REGEX       keep only the ## sections whose heading matches (NAME and SYNOPSIS are always made)
@@ -165,12 +166,14 @@ sub item_lines {
 sub parse_list {
     my ($L, $i) = @_;
     $L->[$i] =~ /^( *)([-*+]|\d{1,9}[.)])/;
-    my $ind = length $1;
-    my $ordered = $2 =~ /\d/ ? 1 : 0;
+    my ($ind, $m0) = (length $1, $2);
+    my $ordered = $m0 =~ /\d/ ? 1 : 0;
+    my $delim = $m0 =~ /([.)])$/ ? $1 : '';                                               # CommonMark 5.3: 1. and 1) are two lists
     my $same = sub {
         my ($l) = @_;
         return 0 unless $l =~ /^( *)([-*+]|\d{1,9}[.)])( +|$)/;
-        return length($1) == $ind && (($2 =~ /\d/ ? 1 : 0) == $ordered);
+        my ($n, $m) = (length $1, $2);
+        return $n == $ind && (($m =~ /\d/ ? 1 : 0) == $ordered) && (!$ordered || substr($m, -1) eq $delim);
     };
     my @items;
     while ($i < @$L && $same->($L->[$i])) {
@@ -262,9 +265,12 @@ sub esc {
     return $t;
 }
 
+# the destination of a link: no space, parentheses only in balanced pairs (CommonMark 6.3; https://www.example.org/Name_(x) stays whole)
+my $LINKDEST = qr/(?:[^()\s]|\((?:[^()\s])*\))*/;
+
 sub plain {                                                                              # the text without the Markdown (headings, widths)
     my ($s) = @_;
-    $s =~ s/\[((?:[^\]\\]|\\.)*)\]\([^)\s]*\)/$1/g;
+    $s =~ s/\[((?:[^\]\\]|\\.)*)\]\($LINKDEST\)/$1/g;
     $s =~ s/<((?:https?|mailto):[^>\s]+)>/$1/g;
     $s =~ s/(`+)(.*?[^`])\1(?!`)/$2/g;
     $s =~ s/\*\*\*(?=\S)(.+?)(?<=[^\s\\])\*\*\*/$1/g;
@@ -305,7 +311,7 @@ sub inl {
             $prev = substr($1, -1);
             next;
         }
-        if ($s =~ s/^\[((?:[^\]\\]|\\.)*)\]\(([^)\s]*)\)//) {                              # link
+        if ($s =~ s/^\[((?:[^\]\\]|\\.)*)\]\(($LINKDEST)\)//) {                            # link
             my ($t, $u) = ($1, $2);
             $out .= inl($t, $font);
             $out .= ' <' . esc($u, 1) . '>' if $u =~ m{^(?:https?|mailto):} && plain($t) ne $u;
@@ -369,8 +375,9 @@ sub render {
             }
             emit('.fi', '.RE');
         } elsif ($t eq 'ul' || $t eq 'ol') {
+            my $num = $t eq 'ol' ? ($b->{items}[0]{marker} =~ /^(\d+)/)[0] + 0 : 0;    # CommonMark 5.2: the first number starts, then counted
             for my $it (@{ $b->{items} }) {
-                my ($tag, $w) = $t eq 'ul' ? ('\(bu', 2) : ($it->{marker} =~ s/\)$/./r, 4);
+                my ($tag, $w) = $t eq 'ul' ? ('\(bu', 2) : ($num++ . '.', 4);
                 emit(".IP $tag $w");
                 render_item($it->{blocks}, $ind + $w, $w);
             }
@@ -449,7 +456,7 @@ sub render_table {
         my $cell = sub {
             my ($k, $t) = @_;
             return '\&' . inl($t) unless $wrap[$k] && length plain($t) > $c[$k];
-            return join("\n", 'T{', wrap(inl($t)), 'T}');
+            return join("\n", 'T{', (map { /^T\}/ ? "\\&$_" : $_ } wrap(inl($t))), 'T}');    # a line "T}..." would end the text block
         };
         my $fmt = sub { my ($bold) = @_; return join(' ', map { $b->{align}[$_] . $bold . ($wrap[$_] ? "w($c[$_])" : '') } 0 .. $n - 1) };
         emit('.PP') unless $first;

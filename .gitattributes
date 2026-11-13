@@ -1,0 +1,17 @@
+# Line ends that matter outside Git: these files are LF in every checkout, also with core.autocrlf=true (Windows).  Only these: the rest
+# of the tree is left to each clone's settings (no `* text=auto`, nothing renormalised; every file below is LF in the repository already,
+# so this changes nothing in it, only what a new checkout writes).
+#
+# the generated manual pages and the converter's fixtures: installed and compared byte for byte (tests/run_md2man_test.sh, make install)
+man/*.1 text eol=lf
+man/*.5 text eol=lf
+man/*.8 text eol=lf
+tests/md2man/* text eol=lf
+# the list make install is compared with (read line by line by tests/run_install_test.sh)
+tests/install_manifest.txt text eol=lf
+# shell scripts: sh does not run a script with CR LF line ends (the rc scripts and wrappers have no .sh)
+*.sh text eol=lf
+configure text eol=lf
+packaging/freebsd/rc.d/* text eol=lf
+packaging/freebsd/karidns-signer text eol=lf
+packaging/freebsd/karidns-webadmin text eol=lf

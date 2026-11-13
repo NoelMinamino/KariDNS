@@ -13,7 +13,7 @@ OUT=${1:-man}
 mkdir -p "$OUT"
 TODAY=$(date +%Y-%m-%d)
 TMP=$(mktemp "${TMPDIR:-/tmp}/karidns_man.XXXXXX")
-trap 'rm -f "$TMP"' EXIT
+trap 'rm -f "$TMP" "$TMP.page"' EXIT
 
 # page FILE SECTION NAME OPTION...: man/NAME.SECTION from docs/FILE
 page() {
@@ -22,10 +22,13 @@ page() {
     perl man/md2man.pl -s "$sec" -n "$name" -d @DATE@ "$@" "docs/$md" > "$TMP"
     old=man/$name.$sec
     date=$TODAY
-    if [ -f "$old" ] && [ "$(sed 1d "$TMP")" = "$(sed 1d "$old")" ] && [ "$(sed -n 1p "$TMP" | sed 's/"@DATE@"//')" = "$(sed -n 1p "$old" | sed 's/"[0-9-]*"//')" ]; then
+    # (a committed page with CR LF line ends, a checkout made before .gitattributes said eol=lf, is the same text)
+    if [ -f "$old" ] && [ "$(sed 1d "$TMP")" = "$(sed 1d "$old" | tr -d '\r')" ] && [ "$(sed -n 1p "$TMP" | sed 's/"@DATE@"//')" = "$(sed -n 1p "$old" | tr -d '\r' | sed 's/"[0-9-]*"//')" ]; then
         date=$(sed -n '1s/^\.TH [^ ]* [^ ]* "\([0-9-]*\)".*/\1/p' "$old")
     fi
-    sed "1s/\"@DATE@\"/\"$date\"/" "$TMP" > "$OUT/$name.$sec"
+    sed "1s/\"@DATE@\"/\"$date\"/" "$TMP" > "$TMP.page"
+    # an unchanged page is not written again (its file keeps its line ends and time)
+    if ! [ -f "$OUT/$name.$sec" ] || ! tr -d '\r' < "$OUT/$name.$sec" | cmp -s - "$TMP.page"; then cp "$TMP.page" "$OUT/$name.$sec"; fi
 }
 
 CONF='^(CONFIGURATION OVERVIEW|CONFIGURATION REFERENCE|TRANSPORT TUNING)'
