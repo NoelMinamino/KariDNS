@@ -1036,6 +1036,65 @@ static void retired_obj_free(void *p) {
     free(p);
 }
 
+/* 0.7 (memory-limit, option B): the retired bytes a reader holds are not weighed against the limit; a version retired a moment ago is */
+static void test_cache_used_bytes_and_held(void) {
+    printf("[TEST] Snapshot Rebuild: memory-limit counts retired bytes except those a reader holds...\n");
+    zone_bytes_t zb = { .resident = 100, .retired = 50, .previous = 10 };
+    assert(dbreg_cache_used_bytes(&zb, 0) == 160);
+    assert(dbreg_cache_used_bytes(&zb, 30) == 130);
+    assert(dbreg_cache_used_bytes(&zb, 50) == 110);
+    assert(dbreg_cache_used_bytes(&zb, 80) == 110);              /* (held read a moment after retired: never below what is served) */
+
+    zone_db_entry_t *e = create_new_zone_entry("held.example", "");
+    assert(e);
+    e->source = ZONE_SRC_DB;                                      /* (class ZBYTES_DB) */
+    zone_retire_process(true);
+    assert(zone_bytes_retired_held(ZBYTES_DB) == 0);
+    zone_arena_t b1, b2;
+    zone_arena_init(&b1); zone_arena_init(&b2);
+    zone_version_t *v1 = zone_version_new(&b1), *v2 = zone_version_new(&b2);
+    assert(v1 && v2);
+    v1->bytes = 4096;
+    pthread_mutex_lock(&e->writer_lock);
+    zone_publish(e, v1);
+    rcu_aux_read_lock();                                          /* a reader that stays */
+    zone_publish(e, v2);                                          /* v1 retired: a reader may still read it */
+    pthread_mutex_unlock(&e->writer_lock);
+    zone_retire_held_ms_set_for_test(60000);
+    zone_retire_process(false);
+    assert(zone_bytes_retired_held(ZBYTES_DB) == 0);              /* retired a moment ago: counted as before (its grace period is just not over) */
+    zone_retire_process(true);                                    /* the short wait does not end: a reader stays, the version is held at once */
+    assert(zone_bytes_retired_held(ZBYTES_DB) == 4096);
+    zone_retire_process(false);                                   /* (in the back-off a pass that was asked to wait treats it the same; one that was not goes by the age) */
+    assert(zone_bytes_retired_held(ZBYTES_DB) == 0);
+    zone_retire_held_ms_set_for_test(0);
+    zone_retire_process(false);
+    assert(zone_bytes_retired_held(ZBYTES_DB) == 4096);           /* kept for the reader past the short grace period: held, not counted */
+    zone_bytes_t now;
+    zone_bytes_get(ZBYTES_DB, &now);
+    assert(now.retired >= 4096 && dbreg_cache_used_bytes(&now, zone_bytes_retired_held(ZBYTES_DB)) == now.resident + now.previous + now.retired - 4096);
+    rcu_aux_read_unlock();
+    zone_retire_process(false);                                   /* the reader gone: freed, and the stack is empty */
+    assert(zone_bytes_retired_held(ZBYTES_DB) == 0);
+    zone_retire_process(false);
+    assert(zone_bytes_retired_held(ZBYTES_DB) == 0);
+    zone_retire_held_ms_set_for_test(1000);
+    /* the cache manager's sampler: a reader in its section for a second or more is a long reader; a later one is not counted before its second */
+    const int64_t t = 1000000000000000LL;            /* (beyond any earlier sample of a real clock) */
+    (void)cache_reader_sample(t);                                 /* (a sample is taken) */
+    rcu_aux_read_lock();
+    assert(!cache_reader_sample(t + 1000));                       /* it entered after the sample: not yet */
+    assert(!cache_reader_sample(t + 1500));                       /* (between two samples nothing changes) */
+    assert(cache_reader_sample(t + 2000));                        /* in its section since the sample before: a long reader */
+    assert(dbreg_cache_long_reader());
+    rcu_aux_read_unlock();
+    assert(!cache_reader_sample(t + 3000));                       /* it has left */
+    assert(atomic_load(&e->snapshot_refs) == 1);
+    free_zone_db_entry(e);                                        /* (frees v2, the active version) */
+    zone_arena_destroy(&b1); zone_arena_destroy(&b2);
+    printf("  -> memory-limit accounting passed.\n");
+}
+
 /* B0: zone_retire_object() frees an object only after the grace period and while the entry has no AXFR out /
  * transfer in (the same conditions as a retired version); zone_entry_config() picks dbcfg for DB zones */
 static void test_retire_object_and_entry_config(void) {
@@ -1889,6 +1948,7 @@ int main(void) {
     test_snapshot_rebuild_case_33();
     test_snapshot_rebuild_case_35();
     test_retire_object_and_entry_config();
+    test_cache_used_bytes_and_held();
     test_snapshot_in_view();
     test_zone_rollback();
     /* Remove the scratch directory in-process: detached snapshot GC threads may

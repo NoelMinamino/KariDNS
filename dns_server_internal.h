@@ -1012,6 +1012,17 @@ typedef struct {
   uint64_t previous;   /* the versions that zones keep for `karictl rollback` (entry->prev): nobody reads them, a rollback or the rollback-window ends them */
 } zone_bytes_t;
 void zone_bytes_get(int cls, zone_bytes_t *out);
+/* 0.7 (memory-limit, option B): the retired bytes of class cls that a reader or a transfer has held for more than a short grace period
+ * (dns_snapshot_rcu.c, zone_retire_process()); the cache manager does not count them.  dbreg_cache_used_bytes(): what it counts. */
+uint64_t zone_bytes_retired_held(int cls);
+uint64_t dbreg_cache_used_bytes(const zone_bytes_t *zb, uint64_t held);
+bool dbreg_cache_long_reader(void);              /* a thread of the server is in a read section for a second or more (sampled by the cache manager) */
+#ifdef KARIDNS_UNIT_TEST
+bool cache_reader_sample(int64_t now_ms);        /* (the cache manager's sampler: unit tests) */
+#endif
+#ifdef KARIDNS_UNIT_TEST
+void zone_retire_held_ms_set_for_test(int64_t ms);
+#endif
 int zone_bytes_class(const zone_db_entry_t *e);
 /* for the IXFR history (dns_axfr_ixfr.c): a difference was stored in / left the history of a zone of class cls */
 void zone_bytes_resident_add(int cls, int64_t delta);
@@ -1170,6 +1181,8 @@ int dbreg_find_info(const char *view, const char *name, dbreg_info_t *out, int m
 typedef struct {
   uint64_t limit, resident, retired, inflight;   /* bytes: the limit (0 = none), the version bytes in memory, replaced / evicted but not freed, evicted but not freed */
   uint64_t previous;                             /* versions kept for karictl rollback (not served); the manager drops them before it evicts a zone */
+  uint64_t held;                                 /* of retired: what the cache manager does not weigh against the limit (held by a reader or a transfer) */
+  bool long_reader;                              /* a thread has been in a read section for a second or more (dbreg_cache_long_reader()) */
   uint64_t evictions, rounds, cold, marked, misses;
   uint64_t xfr_marked;                           /* zones a transfer brought into memory that were marked evict-next (dbreg_xfr_loaded()) */
   uint64_t xfr[4];                               /* transfers of zones that were out of memory, by DBREG_XFR_* */
