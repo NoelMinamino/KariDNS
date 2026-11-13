@@ -440,6 +440,37 @@ static void test_suspend_and_log(void) {
     free(log);
 }
 
+/* 0.7: a tool's klog hook: a syslog line whose dns_diag() twin follows is printed once (the twin), one without a twin as a message of its own
+ * with the severity of its priority, before the next output; nothing waits after dns_diag_flush_log() */
+static void hook_call(int prio, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void hook_call(int prio, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    dns_diag_klog_hook(0, prio, fmt, ap, 0);
+    va_end(ap);
+}
+
+static void test_klog_hook(void) {
+    char out[2048], err[2048];
+    cap_t co, ce;
+    cap_begin(&co, 1);
+    cap_begin(&ce, 2);
+    hook_call(4, "[Config] %s: twin", "f.conf:1");
+    dns_diag(DIAG_WARNING, DC_CONF_WARNING, NULL, 0, "%s: twin\n", "f.conf:1");
+    hook_call(4, "[Config] alone %d", 1);
+    hook_call(3, "[Zone] second");
+    dns_diag(DIAG_ERROR, DC_CONF_SYNTAX, NULL, 0, "other\n");
+    hook_call(5, "a note");
+    dns_diag_plain(stdout, "plain\n");
+    hook_call(6, "[Zone] info");
+    dns_diag_flush_log();
+    dns_diag_flush_log();
+    cap_end(&ce, err, sizeof(err));
+    cap_end(&co, out, sizeof(out));
+    CHECK_STR(out, "plain\n");
+    CHECK_STR(err, "[WARNING] f.conf:1: twin\n[WARNING] [Config] alone 1\n[ERROR] [Zone] second\n[ERROR] other\n[NOTE] a note\n[INFO] [Zone] info\n");
+}
+
 int main(void) {
     const char *base = getenv("TMPDIR");
     snprintf(g_dir, sizeof(g_dir), "%s/test_dns_diag.XXXXXX", base && *base ? base : "/tmp");
@@ -450,6 +481,7 @@ int main(void) {
     test_table();
     test_escape();
     test_text_mode();
+    test_klog_hook();
     test_json_document();
     test_limits();
     test_suspend_and_log();

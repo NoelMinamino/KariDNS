@@ -32,6 +32,7 @@ X (IO_FILE_TOO_LARGE, "io.file.too-large", 'E', "a configuration or zone file is
 X (IO_PIPE, "io.pipe", 'E', "a pipe for the database loader could not be created")
 X (IO_FORK, "io.fork", 'E', "the database loader could not be started")
 X (INTERNAL_OOM, "internal.oom", 'E', "out of memory")
+X (INTERNAL_LOG_MESSAGE, "internal.log-message", 'N', "a message the shared parsers give the server's log, printed by the tool with the severity of its priority (no code of its own)")
 
 /* ---- conf: the configuration parser (dns_config_parser.c) ---- */
 X (CONF_SYNTAX, "conf.syntax", 'E', "a syntax error in a configuration statement")

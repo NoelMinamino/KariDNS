@@ -15,6 +15,8 @@
 #include "../dns_db_checkproto.h"
 #include "../dns_cidr.h"
 #include "../dns_tsig_acl.h"
+#include "../dns_log.h"
+#undef syslog   /* karicheck calls no syslog() of its own; dns_log.h is here for klog_set_hook() */
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -2133,6 +2135,10 @@ int main(int argc, char **argv) {
     const char *code_log = getenv("KARICHECK_CODE_LOG");
     if (code_log && *code_log) dns_diag_code_log(code_log);
 #endif
+    /* 0.7: the parsers' syslog(3) lines are karicheck's messages (stdout / stderr, or the JSON document), not lines of the host's system log:
+     * named-checkconf writes none.  A line that the parser also gives dns_diag() is printed once (dns_diag.h dns_diag_klog_hook()). */
+    klog_set_hook(dns_diag_klog_hook);
+    atexit(dns_diag_flush_log);
     if (argc >= 2 && strcmp(argv[1], "--json") == 0) {
         /* --json comes before the command; stdout carries only the document, written when the run is over */
         argv[1] = argv[0];

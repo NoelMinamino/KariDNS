@@ -40,6 +40,8 @@
 #include "dns_db_driver.h"
 #include "dns_diag.h"
 #include "dns_utils.h"
+#include "dns_log.h"
+#undef syslog   /* (for klog_nosyslog_from_env(); this file calls no syslog() itself) */
 #include "dns_zone_changes.h"
 #include "dns_zone_export.h"
 #include "dns_zone_import.h"
@@ -1433,6 +1435,10 @@ static int kz_run(int argc, char **argv, bool *json_out) {
 
 int main(int argc, char **argv) {
     bool json = false;
+    /* 0.7: the shared parsers' syslog(3) lines (a [Zone] NSEC3PARAM note, a [Config] warning) go to stderr only under KARIDNS_NOSYSLOG=1, the
+     * switch the tests export (tests/lib_proc.sh), and to the system log otherwise, as before (karicheck prints them as its own messages;
+     * here they would reach the JSON document the signer and the WebAdmin read) */
+    klog_nosyslog_from_env("karidns-zone");
     int rc = kz_run(argc, argv, &json);
     if (json && dns_diag_json_enabled() && dns_diag_json_finish(stdout, rc) != 0) {
         fprintf(stderr, "karidns-zone: cannot write the JSON document: %s\n", strerror(errno));

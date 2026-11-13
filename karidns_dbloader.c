@@ -65,7 +65,7 @@
 #include "dns_pdns_reader.h"
 #include "dns_zone_lint.h"
 #include "dns_log.h"
-#undef syslog   /* this file's own syslog() calls are the real one (vlg()'s fallback); only the hook below is wanted from dns_log.h */
+#undef syslog   /* vlg()'s fallback calls klog_syslog_text() (the KARIDNS_NOSYSLOG switch) itself; only the hook below is wanted from dns_log.h */
 
 #ifndef KARIDNS_VERSION
 #define KARIDNS_VERSION "dev"
@@ -152,7 +152,9 @@ static void vlg(int prio, int level, const char *fmt, va_list ap) {
             } while (w < 0 && errno == EINTR);
             if (w == n) return;
         }
-        syslog(prio, "[DB] %s", msg);
+        char sl[sizeof(msg) + 8];
+        snprintf(sl, sizeof(sl), "[DB] %s", msg);
+        klog_syslog_text(prio, sl);         /* syslog(3), or stderr only with KARIDNS_NOSYSLOG=1 */
     } else {
         fprintf(stderr, "karidns-dbloader: %s\n", msg);
     }
@@ -5746,6 +5748,10 @@ int main(int argc, char **argv) {
     const char *chk_server_id = NULL, *chk_zone_checks = NULL;
     const char *chk_ecs[256], *chk_loc[256];
     int n_chk_ecs = 0, n_chk_loc = 0;
+    /* 0.7: KARIDNS_NOSYSLOG=1 (the test switch of the server, dns_log.h klog_syslog_text()): what would go to syslog goes to standard error
+     * only, as the LOG_PERROR copy, in every mode (stream mode without --log-stderr, the fallback of a closed pipe, the shared code's messages
+     * in dump and check mode).  A supervised loader has a cleared environment and --log-stderr: it is not affected. */
+    klog_nosyslog_from_env("karidns-dbloader");
     int ch;
     while ((ch = getopt_long(argc, argv, "hs:", longopts, NULL)) != -1) {
         switch (ch) {

@@ -303,6 +303,7 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `io.pipe` | error | a pipe for the database loader could not be created |
 | `io.fork` | error | the database loader could not be started |
 | `internal.oom` | error | out of memory |
+| `internal.log-message` | note | a message the shared parsers give the server's log, printed by the tool with the severity of its priority (no code of its own) |
 | `conf.syntax` | error | a syntax error in a configuration statement |
 | `conf.value.invalid` | error | the value of an option is not one the option accepts |
 | `conf.value.range` | error | a numeric option is outside its range |

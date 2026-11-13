@@ -286,7 +286,10 @@ while [ $k -le $R ]; do
     if [ "$rs" != "$rp" ]; then fail "round $k: exit status SQLite3 $rs, PostgreSQL $rp"; head -3 "$D/pg.dump.err" | sed 's/^/         /'; fi
     if [ "$rs" -ge 2 ] || [ "$rp" -ge 2 ]; then fail "round $k: a dump failed (SQLite3 $rs, PostgreSQL $rp)"; head -3 "$D/pg.dump.err" | sed 's/^/         /'; k=$((k + 1)); continue; fi
     dumpcmp "round $k: the dump of PostgreSQL equals the dump of SQLite3" "$D/sq.kdb" "$D/pg.kdb" && NSTREAM=$((NSTREAM + 1))
-    diff "$D/sq.dump.err" "$D/pg.dump.err" > /dev/null 2>&1 && pass "the loader says the same about the rows (stderr identical)" || { fail "stderr of the dumps differs"; diff "$D/sq.dump.err" "$D/pg.dump.err" | head -6 | sed 's/^/         /'; }
+    # the lines the shared code gives syslog(3) are on stderr only with KARIDNS_NOSYSLOG=1 (lib_proc.sh), which the PostgreSQL run (as_pg, another
+    # user) does not inherit: they are not what the loader says about the rows, and they carry the pid
+    for _e in sq pg; do grep -v '^karidns-dbloader [0-9]* - - ' "$D/$_e.dump.err" > "$D/$_e.dump.err.own" || true; done
+    diff "$D/sq.dump.err.own" "$D/pg.dump.err.own" > /dev/null 2>&1 && pass "the loader says the same about the rows (stderr identical)" || { fail "stderr of the dumps differs"; diff "$D/sq.dump.err.own" "$D/pg.dump.err.own" | head -6 | sed 's/^/         /'; }
     if [ $k -eq 1 ]; then       # the PostgreSQL example of --help runs (the test's paths and schema in it) and writes the stream just made
         ex=$("$LOADER" --help | sed -n '/^examples:/,$p' | grep '^  karidns-dbloader --dump .*--driver postgresql' | head -1)
         cmd=$(printf '%s\n' "$ex" | sed -e "s#^  karidns-dbloader#as_pg $PGLOADER#" -e "s#/tmp/zones.kdb#$D/ex.kdb#" -e "s#/usr/local/etc/karidns/database.conf#$T/ci#" -e "s#--schema pdns#--schema $SCH#")
