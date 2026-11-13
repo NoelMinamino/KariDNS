@@ -13,6 +13,7 @@
 #include "../dns_dynamic_update.h"
 
 #include <limits.h>
+#include <arpa/inet.h>
 #include "../dns_server_internal.h"
 #include "../dns_query_engine.h"
 #include "../dns_snapshot_rcu.h"
@@ -240,12 +241,75 @@ static void test_fi_axfr_install_failure_keeps_state(void) {
     assert(failed > 0 && installed > 0);
 }
 
+/* R11: every allocation of the start section of an Extended AXFR (version 3) fails in turn: the copies of the configuration (the settings text,
+ * the tag definitions the zone's RRs use), the extended attributes, the message buffer.  The transfer is ended or refused, nothing leaks, and the
+ * version's pin is given back every time. */
+static void test_fi_axfr_start_section_copies(void) {
+    server_config_t *cfg = calloc(1, sizeof(*cfg));
+    assert(cfg && parse_named_conf("options { location-tags { tag \"lt-a\" { 192.0.2.0/24; }; }; ecs-trusted-resolvers { 192.0.2.50; }; };\n"
+                                   "zone \"fiv3.example\" { type master; file \"fiv3.zone\"; additional-from-auth no; };\n", cfg) == 0);
+    server_config_t *cfg0 = atomic_load(&g_config_db.active);
+    atomic_store(&g_config_db.active, cfg);
+
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "fiv3.example.", .is_standalone_mode = true, .err_out = &err };
+    char zone_text[] = "fiv3.example. 3600 IN SOA ns1.fiv3.example. admin.fiv3.example. 100 3600 1800 604800 86400\n"
+                       "fiv3.example. 3600 IN NS ns1.fiv3.example.\n"
+                       "ns1.fiv3.example. 300 IN A 192.0.2.1\n"
+                       "$LOCATION lt-a\nloc.fiv3.example. 60 IN A 192.0.2.30\n$LOCATION\n";
+    assert(parse_zone_fast(zone_text, sizeof(zone_text) - 1, &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+    arena.image = zone_image_freeze(&arena, "fiv3.example.");
+    assert(arena.image != NULL);
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "fiv3.example.", sizeof(entry.domain));
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
+    pthread_mutex_init(&entry.writer_lock, NULL);
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+
+    /* AXFR with the KariDNS extension, version 3 (Option 65153: the version and the FNV-1a hash of the zone name) */
+    uint8_t req[256] = {0};
+    req[0] = 0x12; req[1] = 0x35;
+    req[5] = 1;
+    size_t q = 12;
+    q += write_uncompressed_name(req, q, sizeof(req), "fiv3.example.");
+    req[q++] = 0; req[q++] = 252; req[q++] = 0; req[q++] = 1;
+    req[11] = 1;
+    req[q++] = 0; req[q++] = 0; req[q++] = 41; req[q++] = 0x10; req[q++] = 0; req[q++] = 0; req[q++] = 0; req[q++] = 0; req[q++] = 0;
+    uint32_t h = calc_fnv1a_str("fiv3.example.");
+    req[q++] = 0; req[q++] = 9;
+    req[q++] = 0xFE; req[q++] = 0x81; req[q++] = 0; req[q++] = 5; req[q++] = 3;
+    req[q++] = (uint8_t)(h >> 24); req[q++] = (uint8_t)(h >> 16); req[q++] = (uint8_t)(h >> 8); req[q++] = (uint8_t)h;
+    struct sockaddr_storage ca;
+    memset(&ca, 0, sizeof(ca));
+    ((struct sockaddr_in *)&ca)->sin_family = AF_INET;
+    inet_pton(AF_INET, "192.0.2.5", &((struct sockaddr_in *)&ca)->sin_addr);
+
+    FI_SWEEP({
+        send_axfr_response(1, "fiv3.example.", req, (uint16_t)q, NULL, &entry, NULL, 0, &ca, sizeof(struct sockaddr_in), NULL, false);
+        assert(atomic_load(&arena.ver.xfr_refs) == 0);
+    });
+
+    atomic_store(&g_config_db.active, cfg0);
+    free_server_config_fields(cfg);
+    free(cfg);
+    pthread_mutex_destroy(&entry.writer_lock);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+    zone_arena_destroy(&arena);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     printf("[*] Running test_fi_xfr...\n");
     test_fi_xfr_parsing();
     test_fi_soa_serial_bump();
     test_fi_axfr_send_and_recv();
+    test_fi_axfr_start_section_copies();
     test_fi_axfr_install_failure_keeps_state();
     printf("[+] test_fi_xfr passed successfully.\n");
     return 0;

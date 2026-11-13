@@ -178,12 +178,7 @@ int db_zone_build_install(db_zone_build_t *b, zone_db_entry_t *entry, bool *noti
     set_why(why, whylen, "the SOA serial is not the one ZONE_BEGIN declared");
     return -1;
   }
-  pthread_mutex_lock(&entry->writer_lock);
-  if (!wait_for_active_axfr(entry, 5000)) {
-    pthread_mutex_unlock(&entry->writer_lock);
-    set_why(why, whylen, "busy: a zone transfer is in progress");
-    return -1;
-  }
+  pthread_mutex_lock(&entry->writer_lock);     /* (R11: a transfer of the zone that runs meanwhile goes on with the version it pinned) */
   /* like reload_master_zone() for a primary of a file: the values come with the version; R-21: a NOTIFY goes out
    * when the version of a zone that was loaded changes, not at the first load */
   zone_version_t *cur = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);

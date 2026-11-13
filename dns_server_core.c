@@ -3114,9 +3114,9 @@ process_tcp_client: ;
             /* The element of the zone is looked up once and its entry loaded once (one acquire): the memory cache (D1a) takes the data of a DB zone out of
              * memory and brings it back at any moment, so the settings, the "not in memory" path and the zone that is transferred are all decided from this
              * one reading.  (They were three readings: a zone evicted between them was answered "non-authoritative zone" (REFUSED), one that came into
-             * memory between them was refused as an ACL denial.)  The entry stays valid while it is used: the read section (rcu_reader_enter() above) and
-             * the snapshot this thread holds, which the transfer thread retains; an entry that was taken out of memory meanwhile is retired with that
-             * snapshot, and its version with it.  The exact name: a transfer is of the zone whose apex is the QNAME (RFC 5936 §2.1.1, RFC 1995 §3),
+             * memory between them was refused as an ACL denial.)  The entry stays valid while it is used: the read section (rcu_reader_enter() above),
+             * then the transfer thread's hold (xfr_entry_hold(), R11); the element stays valid with the snapshot this thread holds, which the transfer
+             * thread retains until it has the entry.  The exact name: a transfer is of the zone whose apex is the QNAME (RFC 5936 §2.1.1, RFC 1995 §3),
              * never of a zone that encloses it. */
             zdir_elem_t *xel = zdir_find_exact(xfr_view, qname);
             xfr_entry = zdir_entry(xel);
@@ -3214,7 +3214,7 @@ process_tcp_client: ;
                 xfr_deny = XD_QUOTA;
                 xfr_deny_limit = out_limit;
               } else {
-                if (entry) atomic_fetch_add(&entry->active_axfr, 1);
+                if (entry) xfr_entry_hold(entry);   /* R11: a reference and active_axfr (two atomics; the read section keeps the entry alive here) */
                 axfr_worker_args_t *args = malloc(sizeof(axfr_worker_args_t));
 #ifdef KARIDNS_TEST_EVICT
                 if (args && atomic_load_explicit(&g_test_xfr_fail, memory_order_relaxed) == XD_NO_MEMORY) {   /* TEST ONLY: as if malloc() had failed */
@@ -3283,7 +3283,7 @@ process_tcp_client: ;
                   if (t_err != 0) {
                     release_zone_snapshot(args->snap);
                     free(args);
-                    if (entry) atomic_fetch_sub(&entry->active_axfr, 1);
+                    if (entry) xfr_entry_release(entry);
                     xfr_counter_release(&g_xfr_out_active);
                     allowed = false;
                     xfr_deny = XD_NO_THREAD;
@@ -3296,7 +3296,7 @@ process_tcp_client: ;
                     break;
                   }
                 } else {
-                  if (entry) atomic_fetch_sub(&entry->active_axfr, 1);
+                  if (entry) xfr_entry_release(entry);
                   xfr_counter_release(&g_xfr_out_active);
                   allowed = false;
                   xfr_deny = XD_NO_MEMORY;
@@ -4975,9 +4975,6 @@ void *control_thread_func(void *arg) {
                             break;
                         case RELOAD_ERR_MISSING_SOA:
                             (void)ctl_send_all(cfd, "ERROR missing SOA\n", 18);
-                            break;
-                        case RELOAD_ERR_BUSY:
-                            (void)ctl_send_all(cfd, "ERROR busy (AXFR in progress)\n", 30);
                             break;
                     }
                   } else if (lr.zcfg->type && (strcasecmp(lr.zcfg->type, "slave") == 0 || strcasecmp(lr.zcfg->type, "secondary") == 0)) {

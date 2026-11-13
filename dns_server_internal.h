@@ -1023,7 +1023,6 @@ typedef enum {
   ZRB_OFF,           /* rollback-window is 0 for the zone: no previous version is kept */
   ZRB_NOT_PRIMARY,   /* a secondary or a catalog member: its primary sends the data again */
   ZRB_SIGNED,        /* the zone holds RRSIG / DNSKEY: a new serial would break the signature of the SOA */
-  ZRB_BUSY,          /* a zone transfer is running */
   ZRB_EVICTED,       /* the zone was taken out of memory meanwhile */
   ZRB_FAILED         /* out of memory, or the old version does not fit the limits now (syslog says) */
 } zone_rollback_result_t;
@@ -1196,13 +1195,16 @@ void dbreg_cache_test_pause(bool on);                              /* TEST ONLY:
 void dbreg_cache_test_set_victim_freq(uint32_t f);                 /* TEST ONLY: the frequency a zone that is loaded now is compared with */
 #endif
 /* D1a step 7 (design 7): AXFR / IXFR of a zone that is in the directory and not in memory.  The transfer thread waits for the zone (a fetch it asks for), then
- * holds it with dbreg_xfr_acquire(): under the registry lock it reads the element's entry and counts the transfer in the entry's active_axfr, so that the
+ * holds it with dbreg_xfr_acquire(): under the registry lock it reads the element's entry and holds it (xfr_entry_hold(): active_axfr and a reference), so that the
  * cache manager's eviction (same lock) cannot take the zone out between the two.  NULL: no data in memory now.  dbreg_xfr_loaded(): the zone is in memory
  * because a transfer asked for it: it is marked evict-next (and XFRLOAD) unless it is pinned, was changed by an UPDATE, or is asked for more often than the zones
  * the manager took out last (frequency); the first query that arrives drops the mark (the scan of the manager).  dbreg_bg_loaded(): the same for a zone that
  * only a background fetch brought (D1a step 8), marked BGLOAD instead: the first to go under memory pressure, kept while there is room.  dbreg_xfr_note():
  * the counters of karictl dbstatus. */
 zone_db_entry_t *dbreg_xfr_acquire(zdir_elem_t *z);
+/* R11: an outbound transfer's hold of its entry (a reference and active_axfr; dns_snapshot_rcu.c), and its release (the last reference frees the entry) */
+void xfr_entry_hold(zone_db_entry_t *e);
+void xfr_entry_release(zone_db_entry_t *e);
 void dbreg_xfr_loaded(const char *view, const char *zone);
 void dbreg_bg_loaded(const char *view, const char *zone);
 enum { DBREG_XFR_WAITED = 0, DBREG_XFR_LOADED, DBREG_XFR_FAILED, DBREG_XFR_SUMMARY };   /* waited for a fetch; got the zone; gave up (SERVFAIL); answered an IXFR from the summary */

@@ -285,8 +285,10 @@ static void test_handle_dynamic_update_pipeline(void) {
     atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
     atomic_store_explicit(&entry.serial, 1000, memory_order_release);
 
-    // 1. AXFR in progress -> Rejected with SERVFAIL (rcode 2)
+    // 1. R11: an AXFR of the zone runs and holds the version it sends: the UPDATE is applied at once (no wait, no SERVFAIL), the transfer keeps its version
+    zone_version_t *z_sent = atomic_load_explicit(&entry.rcu.active, memory_order_acquire);
     atomic_store_explicit(&entry.active_axfr, 1, memory_order_release);
+    atomic_fetch_add(&z_sent->xfr_refs, 1);
 
     uint8_t pkt[512] = {0};
     pkt[0] = 0x12; pkt[1] = 0x34;
@@ -310,14 +312,17 @@ static void test_handle_dynamic_update_pipeline(void) {
     pkt[off++] = 0; pkt[off++] = 4;
     pkt[off++] = 192; pkt[off++] = 0; pkt[off++] = 2; pkt[off++] = 1;
 
-    int r_axfr = handle_dynamic_update(pkt, off, &entry, "127.0.0.1", "key-admin");
-    assert(r_axfr == 2); // SERVFAIL due to active AXFR
-
+    struct timespec u0, u1;
+    clock_gettime(CLOCK_MONOTONIC, &u0);
+    int r_success = handle_dynamic_update(pkt, off, &entry, "127.0.0.1", "key-admin");
+    clock_gettime(CLOCK_MONOTONIC, &u1);
+    assert(r_success == 0); // NOERROR
+    assert(u1.tv_sec - u0.tv_sec < 2);                                     /* (it waited 5 s for the transfer before R11) */
+    assert(atomic_load_explicit(&entry.rcu.active, memory_order_acquire) != z_sent && z_sent->image != NULL && atomic_load(&z_sent->xfr_refs) == 1);
+    atomic_fetch_sub(&z_sent->xfr_refs, 1);
     atomic_store_explicit(&entry.active_axfr, 0, memory_order_release);
 
-    // 2. Normal Successful Update
-    int r_success = handle_dynamic_update(pkt, off, &entry, "127.0.0.1", "key-admin");
-    assert(r_success == 0); // NOERROR
+    // 2. The checks of the successful update
     assert(atomic_load_explicit(&entry.serial, memory_order_acquire) == 1001);
     assert(atomic_load_explicit(&entry.notify_now, memory_order_acquire) == true);
     assert(atomic_load_explicit(&entry.rcu.active, memory_order_acquire)->heap); /* a new heap version was published */

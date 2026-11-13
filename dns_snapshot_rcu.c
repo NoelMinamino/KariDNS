@@ -810,7 +810,7 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
     }
     free(entry->groups);
   }
-  wait_for_active_axfr(entry, 0);
+  /* (an outbound transfer holds a reference of its own, xfr_entry_hold(): no transfer runs on an entry that is freed) */
   zone_prev_release_on_free(entry);                 /* the version kept for karictl rollback goes with the entry */
   pthread_mutex_destroy(&entry->writer_lock);
   pthread_mutex_destroy(&entry->ixfr_history.lock);
@@ -1325,6 +1325,20 @@ static void zone_entry_unref(zone_db_entry_t *e) {
   if (atomic_fetch_sub_explicit(&e->snapshot_refs, 1, memory_order_acq_rel) == 1) free_zone_db_entry(e);
 }
 
+/* R11: an outbound transfer holds its zone entry with a reference of its own (the entry outlives the stream whatever happens to the zone meanwhile:
+ * removed by a reconfig, a new type, replaced in the database) and counts itself in active_axfr (a transfer runs: the cache manager does not evict the
+ * zone, dbreg_evict_locked()).  Taken where the entry is known to be alive (a read section on a snapshot that lists it, or the registry lock); no
+ * lock, no allocation (the TCP dispatch takes it).  The release gives both back; the last reference frees the entry. */
+void xfr_entry_hold(zone_db_entry_t *e) {
+  atomic_fetch_add_explicit(&e->snapshot_refs, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&e->active_axfr, 1, memory_order_acq_rel);
+}
+
+void xfr_entry_release(zone_db_entry_t *e) {
+  atomic_fetch_sub_explicit(&e->active_axfr, 1, memory_order_acq_rel);
+  zone_entry_unref(e);
+}
+
 /* the nodes on the retire stack (gc_snapshot_detach_only(), in the child of fork(): no other thread) */
 static size_t zone_retire_recount(void) {
   size_t n = 0;
@@ -1749,13 +1763,7 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
     syslog(LOG_ERR, "[Zone] Failed to read file '%s' for zone '%s'.", file, entry->domain);
     return RELOAD_ERR_FILE_READ;
   }
-  pthread_mutex_lock(&entry->writer_lock);
-  if (!wait_for_active_axfr(entry, 5000)) {
-    syslog(LOG_WARNING, "[Zone] Reload of zone '%s' postponed: active AXFR in progress (timeout 5s).", entry->domain);
-    free(buf);
-    pthread_mutex_unlock(&entry->writer_lock);
-    return RELOAD_ERR_BUSY;
-  }
+  pthread_mutex_lock(&entry->writer_lock);     /* (R11: an outbound transfer of the zone goes on with the version it pinned; the reload does not wait for it) */
   zone_version_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
   /* S5 B-3: the zone is built in a builder of its own (freed on every way out) and published as a new version */
   zone_arena_t z_builder;
@@ -2079,7 +2087,6 @@ const char *zone_rollback_text(zone_rollback_result_t r) {
     case ZRB_OFF: return "rollback-window is 0 for this zone: no previous version is kept";
     case ZRB_NOT_PRIMARY: return "rollback is for primary zones; a secondary gets its data from the primary";
     case ZRB_SIGNED: return "zone is signed; roll back in the DB and re-sign";
-    case ZRB_BUSY: return "busy (AXFR in progress)";
     case ZRB_EVICTED: return "the zone was taken out of memory; nothing to roll back";
     default: return "cannot publish the previous version (see syslog)";
   }
@@ -2100,11 +2107,6 @@ zone_rollback_result_t zone_rollback(zone_db_entry_t *entry, bool local, uint32_
   if (!local && image_has_dnssec(p->image)) {
     pthread_mutex_unlock(&entry->writer_lock);
     return ZRB_SIGNED;
-  }
-  if (!wait_for_active_axfr(entry, 5000)) {
-    pthread_mutex_unlock(&entry->writer_lock);
-    syslog(LOG_WARNING, "[Zone] Rollback of zone '%s' postponed: active AXFR in progress (timeout 5s).", entry->domain);
-    return ZRB_BUSY;
   }
   /* the old content is built again from its image (as an UPDATE builds on the active one), and published like any other version */
   zone_arena_t builder;
@@ -3221,7 +3223,7 @@ zone_db_entry_t *dbreg_xfr_acquire(zdir_elem_t *z) {
     zone_db_entry_t *e;
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
     e = zdir_entry(z);
-    if (e) atomic_fetch_add_explicit(&e->active_axfr, 1, memory_order_acq_rel);     /* (dbreg_evict_locked() reads it under this lock) */
+    if (e) xfr_entry_hold(e);     /* (the registry's reference keeps it alive here; dbreg_evict_locked() reads active_axfr under this lock) */
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     return e;
 }

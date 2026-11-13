@@ -1798,7 +1798,7 @@ static void test_zone_rollback(void) {
     /* the words of every reply */
     for (int r = ZRB_OK; r <= ZRB_FAILED; r++) assert(zone_rollback_text((zone_rollback_result_t)r) != NULL);
     assert(strstr(zone_rollback_text(ZRB_SIGNED), "signed") && strstr(zone_rollback_text(ZRB_OFF), "rollback-window") &&
-           strstr(zone_rollback_text(ZRB_NO_PREV), "no previous version") && strstr(zone_rollback_text(ZRB_BUSY), "busy") &&
+           strstr(zone_rollback_text(ZRB_NO_PREV), "no previous version") &&
            strstr(zone_rollback_text(ZRB_EVICTED), "memory") && strstr(zone_rollback_text(ZRB_NOT_PRIMARY), "primary") &&
            strstr(zone_rollback_text(ZRB_FAILED), "syslog"));
     assert(zone_rollback_text(ZRB_OK)[0] == '\0');

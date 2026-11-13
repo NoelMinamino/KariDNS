@@ -134,13 +134,13 @@ typedef struct {
   size_t tsig_secret_decoded_len;
   uint8_t tsig_mac[64]; /* >= EVP_MAX_MD_SIZE */
   size_t tsig_mac_len;
-  zone_db_entry_t *entry;
-  zone_db_snapshot_t *snap;
+  zone_db_entry_t *entry;   /* held by the caller with xfr_entry_hold() (R11: a reference and active_axfr); the thread gives it back (xfr_entry_release()) */
+  zone_db_snapshot_t *snap; /* retained by the caller; the thread releases it as soon as it has the entry (or has copied the apex it answers from) */
   uint32_t idle_out_secs;   /* max-transfer-idle-out: the longest a send may wait for the client (0 = no limit) */
   uint32_t time_out_secs;   /* max-transfer-time-out: the longest the whole transfer may take (0 = no limit) */
   /* D1a step 7 (design 7, 12-6): the zone is in the directory and its data is not in memory: entry is NULL and elem is the zone's directory element, kept
    * valid by snap.  The thread answers an IXFR from the summary's apex when the client has the serial it describes, else calls await(elem, view_name),
-   * which returns the zone's entry with the transfer counted in active_axfr (db_ingest_xfr_await()), or NULL (then the client gets SERVFAIL +
+   * which returns the zone's entry held with xfr_entry_hold() (db_ingest_xfr_await(), dbreg_xfr_acquire()), or NULL (then the client gets SERVFAIL +
    * EDE 14, RFC 5936 2.2, 4.1.2).  A caller that has the entry sets neither. */
   zdir_elem_t *elem;
   char view_name[KARIDNS_VIEW_NAME_MAX];
@@ -189,7 +189,5 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
                         const struct sockaddr_storage *server_addr, bool has_server_addr);
 
 void *axfr_worker_thread(void *arg);
-
-bool wait_for_active_axfr(zone_db_entry_t *entry, int timeout_ms);
 
 #endif /* DNS_AXFR_IXFR_H */
