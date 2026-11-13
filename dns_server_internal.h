@@ -265,7 +265,7 @@ typedef struct {
 } axfr_session_t;
 
 // クエリログ用 固定長イベント構造体 (バイナリ保持)
-// batch 14: the ring also carries the event messages of the worker (dns_log.h logev_*: update-security, update, xfer-out, query-errors).  A record of
+// batch 14: the record also carries the event messages of the worker (0.7, K-11: in the worker's event ring ev_ring, not in the query log ring) (dns_log.h logev_*: update-security, update, xfer-out, query-errors).  A record of
 // kind QLOG_KIND_EVENT has the finished text in qname, the client address as text in client_text and its port in client_port, the category and the
 // level (LOG_LVL_*, or a debug level); everything else is unused.  Fixed size, nothing allocated, and the strings are cut.
 #define QLOG_KIND_QUERY 0
@@ -299,8 +299,12 @@ typedef struct {
     alignas(64) _Atomic uint32_t head;
     alignas(64) _Atomic uint32_t tail;
     alignas(64) _Atomic uint64_t dropped_count;
-    _Atomic uint64_t ev_dropped;        // batch 14: event messages that found the ring too full
+    _Atomic uint64_t ev_dropped;        // batch 14: event messages that found the ring too full (0.7: counted on the event ring)
 } qlog_ring_t;
+
+/* 0.7 (K-11): the event ring of a worker (worker_ctx_t.ev_ring) has query-log-buffer-size / QLOG_EV_RING_DIVISOR records, at least QLOG_EV_RING_MIN */
+#define QLOG_EV_RING_DIVISOR 8u
+#define QLOG_EV_RING_MIN 1024u
 
 /* S5 B-3: the published version of a zone is a heap zone_version_t (image + glue + flags); a writer builds a new one and
  * publishes it with zone_publish(), the old one goes on the retire stack. Before the first publish `active` is
@@ -312,7 +316,8 @@ typedef struct {
 struct worker_ctx {
   int thread_id;
   zone_rcu_t *rcu_db;
-  qlog_ring_t qlog_ring;
+  qlog_ring_t qlog_ring;          /* the query log records (QLOG_KIND_QUERY) */
+  qlog_ring_t ev_ring;            /* 0.7 (K-11): the worker's event and debug messages (QLOG_KIND_EVENT, qlog_event_sink()) */
   dnstap_ring_t dnstap_ring;
   alignas(64) _Atomic uint64_t query_count;
   alignas(64) _Atomic uint64_t rcu_observed_epoch;

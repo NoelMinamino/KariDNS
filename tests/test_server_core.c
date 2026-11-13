@@ -387,6 +387,7 @@ static void test_read_dns_tcp_message_deadline(void) {
 // 6. Query Log Max QPS & Circuit Breaker Test
 // ----------------------------------------------------------------------------
 bool qlog_rate_admit(time_t now, time_t *sec, uint32_t *count, uint32_t limit);
+void qlog_event_sink(void *vctx, int cat, int level, const char *client_ip, int client_port, const char *msg);
 static void test_query_log_max_qps_and_circuit_breaker(void) {
     printf("[TEST] Server Core: get_effective_query_log_max_qps & write_query_log...\n");
 
@@ -484,8 +485,35 @@ static void test_query_log_max_qps_and_circuit_breaker(void) {
     write_query_log(&worker, &cli_sin, sizeof(cli_sin), "skipped.example.", 1, 1, false, false, IPPROTO_UDP, 50000);
     assert(atomic_load_explicit(&worker.qlog_ring.head, memory_order_relaxed) == head_before);
 
+    // 0.7 (K-11): a debug flood never suspends the query log.  The events and debug lines go to the worker's event ring; however many come, the query
+    // log ring is untouched, the circuit breaker stays off and the queries are still recorded.  Info and above find the half that debug cannot take.
+    atomic_store_explicit(&worker.qlog_ring.head, 0, memory_order_relaxed);
+    atomic_store_explicit(&worker.qlog_ring.tail, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_qlog_circuit_broken, false, memory_order_relaxed);
+    worker.log_emitted_this_sec = 0;
+    worker.ev_ring.size = 16;
+    worker.ev_ring.mask = 15;
+    worker.ev_ring.events = calloc(16, sizeof(qlog_event_t));
+    atomic_init(&worker.ev_ring.head, 0);
+    atomic_init(&worker.ev_ring.tail, 0);
+    atomic_init(&worker.ev_ring.ev_dropped, 0);
+    for (int i = 0; i < 1000; i++) qlog_event_sink(&worker, LOGC_QUERY_ERRORS, 3, "192.0.2.1", 53, "debug flood");
+    assert(atomic_load_explicit(&worker.ev_ring.head, memory_order_relaxed) == 8);                 /* half of the event ring */
+    assert(atomic_load_explicit(&worker.ev_ring.ev_dropped, memory_order_relaxed) == 992);
+    assert(atomic_load_explicit(&worker.qlog_ring.head, memory_order_relaxed) == 0);
+    assert(!atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed));
+    for (int i = 0; i < 12; i++) qlog_event_sink(&worker, LOGC_GENERAL, LOG_LVL_WARNING, NULL, 0, "a warning in the flood");
+    assert(atomic_load_explicit(&worker.ev_ring.head, memory_order_relaxed) == 16);                /* 8 warnings found room */
+    assert(atomic_load_explicit(&worker.ev_ring.ev_dropped, memory_order_relaxed) == 996);
+    for (int i = 0; i < 8; i++)
+        write_query_log(&worker, &cli_sin, sizeof(cli_sin), "after.flood.example.", 1, 1, false, false, IPPROTO_UDP, 50000);
+    assert(atomic_load_explicit(&worker.qlog_ring.head, memory_order_relaxed) == 8);
+    assert(!atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed));
+    assert(strcmp(worker.qlog_ring.events[7].qname, "after.flood.example.") == 0 && worker.qlog_ring.events[7].kind == QLOG_KIND_QUERY);
+    free(worker.ev_ring.events);
+
     free(worker.qlog_ring.events);
-    printf("  -> get_effective_query_log_max_qps & write_query_log passed.\n");
+    printf("  -> get_effective_query_log_max_qps & write_query_log passed (a debug flood leaves the query log alone).\n");
 }
 
 // ----------------------------------------------------------------------------
@@ -1512,6 +1540,13 @@ static void test_event_ring_and_logger(void) {
     atomic_init(&worker.qlog_ring.tail, 0);
     atomic_init(&worker.qlog_ring.dropped_count, 0);
     atomic_init(&worker.qlog_ring.ev_dropped, 0);
+    worker.ev_ring.size = 64;                                                /* 0.7 (K-11): the events have a ring of their own */
+    worker.ev_ring.mask = 63;
+    worker.ev_ring.events = calloc(64, sizeof(qlog_event_t));
+    atomic_init(&worker.ev_ring.head, 0);
+    atomic_init(&worker.ev_ring.tail, 0);
+    atomic_init(&worker.ev_ring.dropped_count, 0);
+    atomic_init(&worker.ev_ring.ev_dropped, 0);
 
     atomic_store_explicit(&g_config_db.active, &mock_cfg, memory_order_release);
     atomic_store_explicit(&g_worker_ctxs, &worker, memory_order_release);
@@ -1537,9 +1572,11 @@ static void test_event_ring_and_logger(void) {
     logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, NULL, 0, "line\nwith\rcontrol\tand\x01 bytes");
     for (int wait_i = 0; wait_i < 200; wait_i++) {
         if (atomic_load_explicit(&worker.qlog_ring.tail, memory_order_relaxed) == atomic_load_explicit(&worker.qlog_ring.head, memory_order_relaxed) &&
+            atomic_load_explicit(&worker.ev_ring.tail, memory_order_relaxed) == atomic_load_explicit(&worker.ev_ring.head, memory_order_relaxed) &&
             test_file_has(sec_path, "control") && test_file_has(qe_path, "SERVFAIL")) break;
         usleep(5000);
     }
+    assert(atomic_load_explicit(&worker.qlog_ring.head, memory_order_relaxed) == 1);   /* the events went to the event ring, none to the query log's */
     assert(test_file_has(sec_path, "update-security: info: client 192.0.2.7#40000: signer \"k\" approved\n"));
     assert(test_file_has(sec_path, "update-security: error: client 2001:db8::7#40001: update 'e.test/IN' denied\n"));
     assert(test_file_has(sec_path, "update-security: info: line?with?control\tand? bytes\n"));          /* a line cannot start inside a message */
@@ -1547,48 +1584,59 @@ static void test_event_ring_and_logger(void) {
     assert(!test_file_has(qe_path, "debug 4"));
     assert(!test_file_has(sec_path, "left.over") && !test_file_has(qe_path, "left.over"));
 
-    /* the ring is nearly full (90%): the event is dropped and counted, the thread goes on */
+    /* the event ring is full: the event is dropped and counted, the thread goes on (0.7: the events' own ring, filled to the last slot) */
     atomic_store_explicit(&worker.qlog_ring.tail, 0, memory_order_relaxed);
     atomic_store_explicit(&worker.qlog_ring.head, 0, memory_order_relaxed);
     test_stop_thread(th);
     atomic_store_explicit(&g_worker_ctxs, NULL, memory_order_release);
     atomic_store_explicit(&g_worker_count, 0, memory_order_relaxed);
     logev_rate_reset();
-    atomic_store_explicit(&worker.qlog_ring.tail, 0, memory_order_relaxed);
-    atomic_store_explicit(&worker.qlog_ring.head, 58, memory_order_relaxed);          /* 58 of 64 slots (the limit is 64 / 10 * 9 = 54) */
+    atomic_store_explicit(&worker.ev_ring.tail, 0, memory_order_relaxed);
+    atomic_store_explicit(&worker.ev_ring.head, 64, memory_order_relaxed);            /* 64 of 64 slots */
     logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, "192.0.2.7", 1, "dropped");
-    assert(atomic_load_explicit(&worker.qlog_ring.head, memory_order_relaxed) == 58);
-    assert(atomic_load_explicit(&worker.qlog_ring.ev_dropped, memory_order_relaxed) == 1);
-    atomic_store_explicit(&worker.qlog_ring.head, 53, memory_order_relaxed);
+    assert(atomic_load_explicit(&worker.ev_ring.head, memory_order_relaxed) == 64);
+    assert(atomic_load_explicit(&worker.ev_ring.ev_dropped, memory_order_relaxed) == 1);
+    atomic_store_explicit(&worker.ev_ring.head, 63, memory_order_relaxed);
     logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, "192.0.2.7", 1, "kept");
-    assert(atomic_load_explicit(&worker.qlog_ring.head, memory_order_relaxed) == 54);
-    assert(atomic_load_explicit(&worker.qlog_ring.ev_dropped, memory_order_relaxed) == 1);
-    /* 0.7 M3 (D-5): a debug record stops at half the ring (32 of 64), under the query log's 80% */
+    assert(atomic_load_explicit(&worker.ev_ring.head, memory_order_relaxed) == 64);
+    assert(atomic_load_explicit(&worker.ev_ring.ev_dropped, memory_order_relaxed) == 1);
+    /* a full query log ring (past its 80%) takes nothing from the events */
+    atomic_store_explicit(&worker.qlog_ring.head, 60, memory_order_relaxed);
+    atomic_store_explicit(&worker.ev_ring.head, 10, memory_order_relaxed);
+    logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, "192.0.2.7", 1, "kept, the query log ring full");
+    assert(atomic_load_explicit(&worker.ev_ring.head, memory_order_relaxed) == 11 && atomic_load_explicit(&worker.qlog_ring.head, memory_order_relaxed) == 60);
+    atomic_store_explicit(&worker.qlog_ring.head, 0, memory_order_relaxed);
+    /* 0.7 M3 (D-5), K-11: a debug record stops at half the event ring (32 of 64), the other half is for info and above */
     const uint32_t qe_mask = atomic_load_explicit(&g_logev_mask[LOGC_QUERY_ERRORS], memory_order_relaxed);
     logev_set_mask(LOGC_QUERY_ERRORS, LOGEV_BIT(3));
-    atomic_store_explicit(&worker.qlog_ring.head, 32, memory_order_relaxed);
+    atomic_store_explicit(&worker.ev_ring.head, 32, memory_order_relaxed);
     logev_post(LOGC_QUERY_ERRORS, 3, "192.0.2.7", 1, "debug, dropped");
-    assert(atomic_load_explicit(&worker.qlog_ring.head, memory_order_relaxed) == 32);
-    assert(atomic_load_explicit(&worker.qlog_ring.ev_dropped, memory_order_relaxed) == 2);
-    atomic_store_explicit(&worker.qlog_ring.head, 31, memory_order_relaxed);
+    assert(atomic_load_explicit(&worker.ev_ring.head, memory_order_relaxed) == 32);
+    assert(atomic_load_explicit(&worker.ev_ring.ev_dropped, memory_order_relaxed) == 2);
+    logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, "192.0.2.7", 1, "info after the debug half");
+    assert(atomic_load_explicit(&worker.ev_ring.head, memory_order_relaxed) == 33);
+    atomic_store_explicit(&worker.ev_ring.head, 31, memory_order_relaxed);
     logev_post(LOGC_QUERY_ERRORS, 3, "192.0.2.7", 1, "debug, kept");
-    assert(atomic_load_explicit(&worker.qlog_ring.head, memory_order_relaxed) == 32);
-    assert(atomic_load_explicit(&worker.qlog_ring.ev_dropped, memory_order_relaxed) == 2);
+    assert(atomic_load_explicit(&worker.ev_ring.head, memory_order_relaxed) == 32);
+    assert(atomic_load_explicit(&worker.ev_ring.ev_dropped, memory_order_relaxed) == 2);
     logev_set_mask(LOGC_QUERY_ERRORS, qe_mask);
-    /* a worker without a ring (it could not allocate one): nothing is written, nothing breaks */
-    qlog_event_t *saved = worker.qlog_ring.events;
-    worker.qlog_ring.events = NULL;
+    assert(atomic_load_explicit(&worker.qlog_ring.ev_dropped, memory_order_relaxed) == 0);   /* (nothing is counted on the query log ring) */
+    /* a worker without an event ring (it could not allocate one): nothing is written, nothing breaks */
+    qlog_event_t *saved = worker.ev_ring.events;
+    worker.ev_ring.events = NULL;
     logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, "192.0.2.7", 1, "no ring");
-    worker.qlog_ring.events = saved;
+    worker.ev_ring.events = saved;
     /* an out-of-range port and a missing client are stored as "unknown" */
-    atomic_store_explicit(&worker.qlog_ring.head, 0, memory_order_relaxed);
+    atomic_store_explicit(&worker.ev_ring.head, 0, memory_order_relaxed);
     logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, NULL, 99999, "no client");
-    assert(worker.qlog_ring.events[0].kind == QLOG_KIND_EVENT && worker.qlog_ring.events[0].client_port == 0 && worker.qlog_ring.events[0].client_text[0] == '\0');
+    assert(worker.ev_ring.events[0].kind == QLOG_KIND_EVENT && worker.ev_ring.events[0].client_port == 0 && worker.ev_ring.events[0].client_text[0] == '\0');
     logev_set_thread_sink(NULL, NULL);
 
     /* the report of suppressed messages when no further message comes: the logger thread's tick (logev_flush_suppressed()) writes it */
     atomic_store_explicit(&worker.qlog_ring.head, 0, memory_order_relaxed);
     atomic_store_explicit(&worker.qlog_ring.tail, 0, memory_order_relaxed);
+    atomic_store_explicit(&worker.ev_ring.head, 0, memory_order_relaxed);
+    atomic_store_explicit(&worker.ev_ring.tail, 0, memory_order_relaxed);
     logev_rate_reset();
     atomic_store_explicit(&g_worker_ctxs, &worker, memory_order_release);
     atomic_store_explicit(&g_worker_count, 1, memory_order_relaxed);
@@ -1609,6 +1657,7 @@ static void test_event_ring_and_logger(void) {
     test_retire_runtime(rt);                                                 /* the empty runtime: the masks are recomputed */
     assert(!logev_wanted(LOGC_QUERY_ERRORS, 1));
     free(worker.qlog_ring.events);
+    free(worker.ev_ring.events);
     unlink(sec_path);
     unlink(qe_path);
     printf("  -> event ring and logger thread passed.\n");

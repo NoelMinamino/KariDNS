@@ -1328,19 +1328,19 @@ void *response_logger_thread_func(void *arg) {
     return NULL;
 }
 
-/* batch 14: the sink of the event messages (dns_log.h logev_post()) of a worker thread.  The record goes into the worker's own query log ring (this
- * thread is its one producer, as for a query); the query logger thread formats it and routes it to the channels.  Fixed size, nothing allocated; the
- * texts are cut.  The events have their own limit on the ring (90%: they come after the 80% at which the query log stops itself; a debug record 50%), and
- * what does not fit is counted in ev_dropped.  Called only when a channel passes the message (logev_wanted()) and the rate limit has admitted it. */
+/* batch 14: the sink of the event messages (dns_log.h logev_post()) of a worker thread.  0.7 (K-11): the record goes into the worker's own EVENT ring
+ * (ev_ring; this thread is its one producer, as for the query log ring), not into the query log ring, so that events and debug lines can never take
+ * room from the query log or bring it to the 80% at which it stops itself.  The query logger thread formats it and routes it to the channels.  Fixed
+ * size, nothing allocated; the texts are cut.  Inside the event ring a debug record may fill it only to half, so that a debug flood always leaves the
+ * other half to info and above; what does not fit is counted in ev_dropped.  Called only when a channel passes the message (logev_wanted()) and the
+ * rate limit has admitted it. */
 STATIC_TEST void qlog_event_sink(void *vctx, int cat, int level, const char *client_ip, int client_port, const char *msg) {
     worker_ctx_t *ctx = vctx;
-    qlog_ring_t *ring = &ctx->qlog_ring;
+    qlog_ring_t *ring = &ctx->ev_ring;
     if (!ring->events) return;
     uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
     uint32_t t = atomic_load_explicit(&ring->tail, memory_order_acquire);
-    /* 0.7 M3 (D-5): a debug record (level > 0) may fill the ring only to half, so that a debug flood can never bring it to the 80% at which the
-     * query log stops itself (write_query_log()); the other events keep their 90% */
-    if (h - t >= (level > 0 ? ring->size / 2 : ring->size / 10 * 9)) {
+    if (h - t >= (level > 0 ? ring->size / 2 : ring->size)) {
         atomic_fetch_add_explicit(&ring->ev_dropped, 1, memory_order_relaxed);
         return;
     }
@@ -1476,8 +1476,12 @@ void *query_logger_thread_func(void *arg) {
         bool any_work = false;
 
         if (rt && num_workers > 0 && workers) {
-            for (int w = 0; w < num_workers; w++) {
-                qlog_ring_t *ring = &workers[w].qlog_ring;
+            /* 0.7 (K-11): two rings per worker, each with one producer (the worker) and this one consumer.  Each pass takes, worker by worker, the
+             * event ring and then the query log ring, each up to what its producer had written when the pass reached it: neither waits for the other
+             * for more than one pass, and an event of warning or above waits at most behind the debug records already in its ring (half of it at most,
+             * qlog_event_sink()), never behind query log records. */
+            for (int w = 0; w < num_workers * 2; w++) {
+                qlog_ring_t *ring = (w & 1) ? &workers[w / 2].qlog_ring : &workers[w / 2].ev_ring;
                 if (!ring->events) continue;
 
                 uint32_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);
@@ -1576,17 +1580,17 @@ void *query_logger_thread_func(void *arg) {
                     syslog(LOG_WARNING, "[QueryLog] Dropped %" PRIu64 " queries due to ring buffer overflow (high load)", diff);
                 }
                 uint64_t ev_total = 0;
-                for (int w = 0; w < num_workers; w++) ev_total += atomic_load_explicit(&workers[w].qlog_ring.ev_dropped, memory_order_relaxed);
+                for (int w = 0; w < num_workers; w++) ev_total += atomic_load_explicit(&workers[w].ev_ring.ev_dropped, memory_order_relaxed);
                 if (ev_total > last_reported_ev_dropped) {
                     uint64_t diff = ev_total - last_reported_ev_dropped;
                     last_reported_ev_dropped = ev_total;
-                    syslog(LOG_WARNING, "[QueryLog] Dropped %" PRIu64 " event log messages (events and debug lines of any category) due to ring buffer overflow (high load)", diff);
+                    syslog(LOG_WARNING, "[QueryLog] Dropped %" PRIu64 " event log messages (events and debug lines of any category) because a worker's event ring was full (high load)", diff);
                 }
             }
         } else if (num_workers > 0 && workers) {
-            // クエリロギング未設定時はエントリを破棄してCPU消費を防ぐ
-            for (int w = 0; w < num_workers; w++) {
-                qlog_ring_t *ring = &workers[w].qlog_ring;
+            // クエリロギング未設定時はエントリを破棄してCPU消費を防ぐ (no logging runtime: both rings, the query log's and the events')
+            for (int w = 0; w < num_workers * 2; w++) {
+                qlog_ring_t *ring = (w & 1) ? &workers[w / 2].qlog_ring : &workers[w / 2].ev_ring;
                 if (!ring->events) continue;
                 uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
                 atomic_store_explicit(&ring->tail, h, memory_order_relaxed);
@@ -7909,6 +7913,15 @@ int main(int argc, char **argv) {
     atomic_init(&ctxs[i].qlog_ring.tail, 0);
     atomic_init(&ctxs[i].qlog_ring.dropped_count, 0);
     atomic_init(&ctxs[i].qlog_ring.ev_dropped, 0);
+    /* 0.7 (K-11): the event ring, an eighth of the query log ring and at least 1024 records (docs/karidns.md query-log-buffer-size) */
+    uint32_t ev_buf_size = qlog_buf_size / QLOG_EV_RING_DIVISOR >= QLOG_EV_RING_MIN ? qlog_buf_size / QLOG_EV_RING_DIVISOR : QLOG_EV_RING_MIN;
+    ctxs[i].ev_ring.size = ev_buf_size;
+    ctxs[i].ev_ring.mask = ev_buf_size - 1;
+    ctxs[i].ev_ring.events = calloc(ev_buf_size, sizeof(qlog_event_t));
+    atomic_init(&ctxs[i].ev_ring.head, 0);
+    atomic_init(&ctxs[i].ev_ring.tail, 0);
+    atomic_init(&ctxs[i].ev_ring.dropped_count, 0);
+    atomic_init(&ctxs[i].ev_ring.ev_dropped, 0);
 
     uint32_t dnstap_buf_size = (cfg->dnstap.queue_size >= 64) ? cfg->dnstap.queue_size : 4096;
     if ((dnstap_buf_size & (dnstap_buf_size - 1)) != 0) {
@@ -7926,7 +7939,7 @@ int main(int argc, char **argv) {
 
     atomic_init(&ctxs[i].query_count, 0);
     atomic_init(&ctxs[i].rcu_observed_epoch, RCU_EPOCH_IDLE);
-    if (!ctxs[i].qlog_ring.events || !ctxs[i].dnstap_ring.events)
+    if (!ctxs[i].qlog_ring.events || !ctxs[i].ev_ring.events || !ctxs[i].dnstap_ring.events)
       backend_exit(EXIT_FAILURE);
   }
 
