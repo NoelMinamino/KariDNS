@@ -1,0 +1,1059 @@
+.TH KARIDNS\-ZONE 8 "2026-11-13" "KariDNS" "KariDNS Manual"
+.\" Generated from docs/karidns-zone.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
+.SH NAME
+karidns\-zone \- writes a zone file into a PowerDNS 5.1 database (\fBimport\fR)
+and a zone of the database into a zone file (\fBexport\fR)
+.SH SYNOPSIS
+.RS 2
+.nf
+karidns\-zone import [options] <zone> <file|\->
+karidns\-zone import \-\-all [options] <tinydns\-data\-file>
+karidns\-zone import \-\-signer [options] <zone> <signed\-zone\-file|\->
+karidns\-zone export [options] <zone> [<file>]
+karidns\-zone export \-\-signer [options] <zone> [<file>]
+karidns\-zone export \-\-all \-\-dir <dir> [options]
+karidns\-zone apply [options] \-\-changes <file|\-> <zone>
+karidns\-zone apply [options] \-\-zone\-file <file|\-> [\-\-delete\-others] <zone>
+karidns\-zone \-\-types\-list [\-\-json]
+karidns\-zone render \-\-json <zone>
+karidns\-zone \-\-version | \-h | \-\-help
+.fi
+.RE
+.SH DESCRIPTION
+\fBkaridns\-zone\fR is the command line of the 0.6.0 ZoneImporter and
+ZoneExporter. It reads the settings of the database the way
+\fBkaridns\-dbloader(8)\fR and \fBkaricheck db\fR do (the \fBdatabase { }\fR
+block and the views of \fBkaridns.conf\fR), or takes them from the command
+line. It is an ordinary program: it runs as an ordinary user and never needs
+root. The server and the loader do not use it; it is how zone files get into the
+database and out of it again (backups, the DB-outage fallback below, a signer
+that writes its records through \fB\-\-types\fR), and, with \fBapply\fR, how the
+WebAdmin API changes the RRsets of a zone (below).
+.IP \(bu 2
+\fBimport\fR reads a zone file (BIND format, with \fB$INCLUDE\fR,
+\fB$GENERATE\fR, \fB$LOCATION\fR and \fB$ECS\-SUBNET\fR tags; or a tinydns data
+file) with the parser of the server and writes the zone as rows of the PowerDNS
+schema, in ONE transaction per zone: owners in lower case without the final dot,
+MX and SRV priorities in \fBprio\fR, a signed zone in the layout PowerDNS stores
+for a zone with \fBPRESIGNED=1\fR (see \fBkaridns(8)\fR, "Database zones"), tags
+and tinydns attributes in the \fBkaridns_*\fR tables. It does not run SQL text:
+every value is a bound parameter.
+.IP \(bu 2
+\fBapply\fR changes RRsets of a zone from a change file, with the zone's
+generation checked, the serial raised, the version of the change written and a
+JSON diff of the RRsets (below, "apply and the change file").
+.IP \(bu 2
+\fBexport\fR writes a zone of the database as a zone file. The zone is read the
+way the loader reads it (every row checked, a presigned zone with the NSEC3PARAM
+/ NSEC3 / NSEC records the server rebuilds), so what is exported is what the
+server serves. The text is in \fBcanonical order\fR (RFC 4034 section 6.1, owner
+names first, then type, then RDATA), so two exports of the same zone are the
+same file and \fBdiff\fR shows the real change. The text is parsed again before
+a byte is written and must give the same records.
+.SS What an import does
+.IP 1. 4
+Reads the text (a file, \fB\-\fR for standard input, at most 64 MiB there) and
+parses it. A syntax error names the file and the line.
+.IP 2. 4
+Runs the checks of \fBkaricheck zone\fR on it (with the \fBcheck\-*\fR options
+of the configuration, below). An \fBerror\fR fails the import and nothing is
+written. A \fBwarning\fR is printed and the import goes on; \fB\-\-strict\fR
+makes a warning fail it.
+.IP 3. 4
+In one transaction: finds the zone or creates it, applies the serial rule,
+deletes and inserts the rows, puts the zone in the view, adds the reload
+request.
+.IP 4. 4
+\fBReads the zone back in the same transaction\fR through the loader's reader
+(\fBdns_pdns_reader.c\fR), applies the size limits of the configuration and the
+checks of \fBkaricheck db\fR to it, and commits \fBonly if the loader would load
+what was written.\fR A merge that puts a CNAME beside other data, an ALIAS
+beside an A record, a zone over \fBmax\-records\fR, rows the reader refuses: the
+transaction is rolled back and the database is as it was
+(\fBdb.import.verify\fR, \fBzone.limits\fR, \fBzone.cname.coexists\fR, ...). A
+dry run does all of this too.
+.IP 5. 4
+Commits. The triggers of \fBdb/karidns_ext.*.sql\fR write the change to
+\fBkaridns_changes\fR, so a running server with \fBauto\-reload\fR picks the
+zone up by itself; \fB\-\-reload\fR also adds a row to
+\fBkaridns_reload_requests\fR (PostgreSQL), and otherwise \fBkarictl reload\fR
+does it.
+.PP
+The type of an existing zone (\fBdomains.type\fR) is never changed; a new zone
+is \fBNATIVE\fR (what \fBpdnsutil load\-zone\fR creates), or \fBMASTER\fR with
+\fB\-\-type MASTER\fR. A zone whose \fBdomains.type\fR is not \fBNATIVE\fR or
+\fBMASTER\fR is not a zone the server serves from records: the import goes on,
+with the warning \fBdb.import.not\-primary\fR, and the records are not read
+back.
+.SS Modes
+.TP 8
+\fB\-\-mode replace\fR (the default)
+The records of the zone are replaced by the file's. The metadata the importer
+owns (\fBPRESIGNED\fR, \fBNSEC3PARAM\fR, \fBX\-KARIDNS\-FORMAT\fR) and the
+zone's tag definitions (\fBkaridns_zone_tagdefs\fR) are replaced too; every
+other \fBdomainmetadata\fR row of the zone (\fBALLOW\-AXFR\-FROM\fR, profile
+names, ...) is kept.
+.TP 8
+\fB\-\-mode merge\fR
+\fBRRset merge.\fR Every (owner, type) in the file replaces that RRset in the
+database; the RRsets that are not in the file stay. Deleting needs replace
+mode. The file may be a part of the zone: the checks of the file do not demand
+SOA, NS and glue then (the whole zone is checked when it is read back). The
+owned metadata the file declares replaces the database's.
+.TP 8
+\fB\-\-types T1,T2\fR
+Limits either mode to records of these types: only they are deleted and only
+they are written; metadata and tag definitions are not touched. (The signer does
+not use it: it has \fB\-\-signer\fR, below.) Up to 64 types, case does not
+matter.
+.TP 8
+\fB\-\-dry\-run\fR (\fB\-n\fR)
+Does everything except the commit. The RRsets that would be added, replaced or
+deleted are listed (\fBdb.import.change\fR, notes), and the summary says \fBdry
+run, nothing was written\fR. \fB\-\-verbose\fR lists them for a real import too.
+.SS SOA serial (RFC 1982)
+For an existing zone whose SOA is written, the new serial must be \fBgreater\fR
+than the serial in the database (serial number arithmetic, RFC 1982 section
+3.2); otherwise the import fails with \fBdb.import.serial\fR. Secondaries and
+IXFR only see a change when the serial grows.
+.TP 8
+\fB\-\-serial grow\fR (the default)
+The rule above.
+.TP 8
+\fB\-\-serial increment\fR
+Writes the database serial + 1, whatever the file says.
+.TP 8
+\fB\-\-serial keep\fR
+Writes the file's serial as it is (restoring a backup, importing an export of
+the same zone).
+.PP
+A new zone takes the file's serial. A merge or a \fB\-\-types\fR import that
+does not write the SOA does not touch the serial.
+.SS Signer mode (\-\-signer)
+\fBkaridns\-zone import \-\-signer <zone> <file>\fR writes a zone that
+\fBkaridns\-signer\fR signed (0.6.0 item C). The file is the zone as
+\fBdnssec\-signzone\fR wrote it from an \fBexport\fR of the zone; the tool takes
+from it the DNSSEC records and nothing else, so it works with the rights of the
+signer role alone (below) and cannot change the data of the zone. In ONE
+transaction:
+.IP 1. 4
+The \fBRRSIG\fR, \fBNSEC\fR, \fBNSEC3\fR, \fBNSEC3PARAM\fR and \fBDNSKEY\fR
+records of the database are replaced by the file's, in the layout PowerDNS
+stores a presigned zone in (no \fBNSEC\fR, \fBNSEC3\fR or \fBNSEC3PARAM\fR rows,
+the chain is rebuilt by the reader; \fBordername\fR is the NSEC3 hash, or the
+reversed relative name of an NSEC zone). \fBCDS\fR and \fBCDNSKEY\fR are not
+touched. \fBOnly the rows that differ are written\fR (0.6.1): both sides are
+sorted by owner, type, RDATA text, TTL, priority, \fBordername\fR and \fBauth\fR
+and walked once; a row the database has and the file has too (field for field,
+the text of the RDATA as it is spelled) stays untouched, with its id, a row only
+in the database is deleted (a disabled one too), a row only in the file is
+inserted. A signing that changes one record therefore writes a few rows, and the
+change log (SQLite3: a row per changed row) and the audit log list those. The
+metadata of step 5 is written only where it differs, too. A row spelled
+differently from the file's is replaced, never kept wrongly.
+.IP 2. 4
+The SOA of the file must be the database's SOA but for the serial, which must be
+\fBgreater\fR (RFC 1982); it is written with \fBUPDATE\fR.
+.IP 3. 4
+\fBEvery other record of the file must equal the database's\fR, compared as
+RRsets in canonical form (RFC 4034 section 6.2): owner (without regard to case),
+type, class, the RDATA in wire form with the names inside the RDATA of the types
+that section lists in lower case, and the TTL of the RRset (the lowest of its
+records, RFC 2181 section 5.2: the TTL the server serves). Both sides are read
+the way the server reads a zone (the zone parser for the file, the loader's
+reader for the rows; the DNSSEC records left out), so the way a row is spelled
+does not matter: hex or names in upper case, an AAAA that is not compressed, a
+TXT without quotes or with escapes, the same row twice, an RRset whose rows have
+different TTLs, a NULL TTL (the default TTL of the loader), a disabled row (not
+served, not compared). An export of a zone, signed and given back, is accepted
+whatever the rows look like; a real change is not. If the zone changed since the
+export, nothing is written: the message is \fBdb.import.changed\fR (it names the
+first RRset that differs), the \fB\-\-json\fR document has \fB"signer":
+{"changed": true}\fR and the exit status is \fB3\fR. The signer then signs the
+zone again. The same goes for a serial that does not grow, and for a change that
+another session commits while the tool writes: on PostgreSQL the transaction is
+\fBREPEATABLE READ\fR, so a row it writes that another session changed after the
+tool read the zone (SQLSTATE 40001, or a record that is gone) is a change of the
+zone, not a failure; on SQLite3 the one write lock rules it out.
+.IP 4. 4
+\fBordername\fR and \fBauth\fR of the records that stay (and of the empty
+non-terminals the database holds) are set as a presigned zone has them
+(\fBauth\fR 0 for the NS records of a delegation and the names below it), with
+\fBUPDATE\fR where they differ.
+.IP 5. 4
+The metadata \fBPRESIGNED\fR = 1, \fBNSEC3PARAM\fR (none for an NSEC zone) and
+\fBX\-KARIDNS\-SIGNER\fR = 1 are written (where they are not so already). A
+running server then no longer reloads the zone because of the change log, only
+on a reload request (\fBkaridns(8)\fR, \fBsigner\-wait\fR).
+.IP 6. 4
+The zone is read back through the loader's reader as for any import; a zone the
+loader would refuse is not committed.
+.PP
+\fB\-\-signer\fR takes a zone that exists, is a primary zone (\fBNATIVE\fR or
+\fBMASTER\fR) and has one SOA at the apex, and a file in BIND format that is
+signed (RRSIG records and a complete NSEC or NSEC3 chain; otherwise
+\fBdb.import.signer\fR). It cannot be combined with \fB\-\-mode\fR,
+\fB\-\-types\fR, \fB\-\-serial\fR, \fB\-\-view\fR, \fB\-\-type\fR, \fB\-\-all\fR
+or a tinydns data file: those are usage errors (exit status
+2). \fB\-\-dry\-run\fR, \fB\-\-reload\fR (PostgreSQL: the reload request is
+committed with the data, so the loader sees both together), \fB\-\-strict\fR,
+\fB\-\-verbose\fR, \fB\-\-audit\fR and \fB\-\-json\fR work as for any import. A
+signer import writes a whole zone again (every signature), so on PostgreSQL it
+asks for the audit in \fBsummary mode\fR unless \fB\-\-audit rows\fR is given,
+and it writes ordername and auth, the DNSSEC rows and the metadata in a few
+statements (\fBunnest()\fR of arrays): the change log gets a few rows and
+\fBkaridns_changes\fR one \fBNOTIFY\fR per statement, not one per
+record. (SQLite3 triggers fire per row whatever the statements: the change log
+and the audit have a row per changed row.)
+.PP
+The first signing needs nothing in the database but the zone: no
+\fBcryptokeys\fR rows and no \fBPRESIGNED\fR metadata. \fBkaridns\-zone
+export\fR writes the zone as the unsigned zone it is, and \fBimport
+\-\-signer\fR of the signed text then sets \fBPRESIGNED\fR, \fBNSEC3PARAM\fR
+(NSEC3) and \fBX\-KARIDNS\-SIGNER\fR; the signer inserts the keys it signed with
+after that.
+.PP
+\fBA normal import into a zone the signer signs.\fR A zone with the metadata
+\fBX\-KARIDNS\-SIGNER\fR = 1 keeps its DNSSEC records when an operator imports
+into it with a plain \fBkaridns\-zone import\fR (replace or merge): the
+\fBRRSIG\fR, \fBNSEC\fR, \fBNSEC3\fR, \fBNSEC3PARAM\fR, \fBDNSKEY\fR, \fBCDS\fR
+and \fBCDNSKEY\fR rows and the metadata \fBPRESIGNED\fR and \fBNSEC3PARAM\fR
+stay as they are, and only the other data is replaced (or merged); a file with
+DNSSEC records of its own is taken without them (the message
+\fBdb.import.signer\-zone\fR says how many were ignored). The read-back checks
+the zone without its DNSSEC records. The loader does not serve the new data
+before the signer has signed it (\fBsigner\-wait\fR); the signer notices the
+change in the change log and signs the zone again.
+.PP
+\fBResult.\fR The text output ends with \fBZone 'x' signed: SOA serial A \-> B,
+N DNSSEC record(s) written, M removed, K record(s) updated (ordername, auth);
+the earliest RRSIG expires T\fR. With \fB\-\-json\fR the document has one more
+key, \fBsigner\fR, after \fBzones\fR:
+.PP
+.RS 2
+.nf
+"signer": { "zone": "example.test", "changed": false, "committed": true, "serial": 11, "old_serial": 10,
+            "dnssec_records_written": 20, "dnssec_records_removed": 0, "records_updated": 9,
+            "rrsets_added": 16, "rrsets_replaced": 0, "rrsets_deleted": 0,
+            "earliest_expire": "2026\-11\-20T02:29:12Z", "earliest_expire_epoch": 1795141752,
+            "write_id": { "xid": null, "seq_first": 11, "seq_last": 42 } }
+.fi
+.RE
+.IP \(bu 2
+\fBearliest_expire\fR is the earliest signature expiration of the zone
+\fBafter\fR the write, as a UTC time (and \fBearliest_expire_epoch\fR, unix
+seconds). The expiration field of an RRSIG is a 32-bit number of seconds modulo
+2^32, compared with serial number arithmetic (RFC 4034 section 3.1.5, RFC 1982),
+so the earliest is the one that comes first in that order, and the 32-bit value
+is put into the 64-bit time nearest to now. The signer schedules the next run
+from it: the earliest expiration minus its refresh interval.
+.IP \(bu 2
+\fBwrite_id\fR says which rows of \fBkaridns_changes\fR this write made, so that
+the signer does not take its own write for a change of the zone. PostgreSQL:
+\fBxid\fR is \fBpg_current_xact_id()\fR of the write transaction (the \fBxid\fR
+column of the rows the triggers wrote), \fBseq_first\fR and \fBseq_last\fR are
+null. SQLite3: \fBseq_first\fR and \fBseq_last\fR are the first and the last
+\fBkaridns_changes.seq\fR of the transaction (the transaction holds the one
+write lock, so all rows between them are its own; both null when it wrote no
+row, and \fBxid\fR is null).
+.IP \(bu 2
+With \fBchanged\fR true there is no other key but \fBzone\fR and \fBcommitted\fR
+(false). A dry run gives the same numbers with \fBcommitted\fR false.
+.PP
+\fBBusy.\fR When another importer holds the zone, or the database is locked for
+longer than the tool waits (SQLite3: 5 seconds; PostgreSQL: \fBlock_timeout\fR,
+10 seconds), nothing is written and the exit status is \fB4\fR
+(\fBdb.import.busy\fR; \fB"signer": {"changed": false, "committed": false,
+"busy": true}\fR with \fB\-\-json\fR), not 1: try again. Any other import exits
+with 1 in this case.
+.SS Views and the database
+The database comes from, in this order: \fB\-\-sqlite3 FILE\fR or
+\fB\-\-conninfo\-file FILE\fR (with \fB\-\-schema NAME\fR), else the
+configuration. \fB\-c FILE\fR names the configuration; without it
+\fB/usr/local/etc/karidns/karidns.conf\fR (or \fB/usr/local/etc/karidns.conf\fR)
+is read when it exists. \fB\-\-no\-config\fR reads none. With a configuration:
+.IP \(bu 2
+\fBoptions { database { driver ...; database\-file ...; } }\fR (or
+\fBconninfo\-file\fR, \fBschema\fR) is the database; \fB\-\-view NAME\fR selects
+a view of the configuration: its \fBdatabase\-file\fR / \fBdatabase\-schema\fR
+if it has one of its own, else the shared source. A view with \fBdatabase
+none;\fR takes no zones (\fBdb.view\-none\fR); a view that is not defined is
+\fBdb.view\-not\-found\fR.
+.IP \(bu 2
+With \fB\-\-view\fR and the shared source, \fBimport\fR puts the zone in that
+view (\fBkaridns_domain_views\fR; the loader serves a zone without any row in
+every view) and \fBexport\fR lists only the zones of that view. A view with a
+source of its own ignores \fBkaridns_domain_views\fR: no row is written.
+.IP \(bu 2
+\fBThe server's rules for a database zone of that view are applied, so a zone
+the server would refuse is not written:\fR the \fBcheck\-*\fR options
+(\fBcheck\-names\fR, \fBcheck\-mx\fR, \fBcheck\-integrity\fR,
+\fBcheck\-wildcard\fR, ... as \fBkaricheck\fR and \fBkaridns\-dbloader
+\-\-check\fR use them), the size limits \fBmax\-records\fR,
+\fBmax\-records\-per\-type\fR, \fBmax\-types\-per\-name\fR and
+\fBmax\-zone\-ttl\fR (options, view), the location and ECS tag definitions of
+\fBoptions { }\fR, and \fBdefault\-ttl\fR, \fBmax\-zone\-records\fR and
+\fBmax\-zone\-bytes\fR of the database block (for the reader that reads the zone
+back, and for \fBexport\fR).
+.IP \(bu 2
+\fBThe file zones of the configuration\fR (\fBzone "x" { type master; file ...;
+};\fR of the view, or of every view without \fB\-\-view\fR) are passed to the
+importer: importing a zone that is also a file zone prints
+\fBdb.import.file\-zone\fR: the file zone has priority, so the server keeps
+serving the file, not the database zone (see \fBkaridns(8)\fR, D-PRIO).
+.PP
+Without a configuration the checks have their default severities and there are
+no limits.
+.SS Formats
+.TP 8
+\fB\-\-format bind|tinydns|auto\fR (import)
+The format of the input. \fBauto\fR (the default) takes a tinydns data file for
+a name ending in \fB.tinydns\fR or \fB.data\fR or called \fBdata\fR, and BIND
+format for everything else, including standard input. \fB\-\-all\fR always reads
+a tinydns data file. A tinydns zone is imported as a zone with
+\fBX\-KARIDNS\-FORMAT tinydns\fR; the time stamps, countdown TTLs and location
+codes go to \fBkaridns_record_tinydns\fR, the \fB%\fR lines to
+\fBkaridns_zone_tagdefs\fR. A BIND-format file cannot hold those.
+.TP 8
+\fB\-\-format bind|tinydns|auto\fR (export)
+\fBauto\fR (the default) writes a zone with \fBX\-KARIDNS\-FORMAT tinydns\fR as
+a tinydns data file and every other zone in BIND format. \fB\-\-format bind\fR
+of a tinydns zone fails and names the record when it has an attribute BIND
+format cannot say. Tags and tag definitions are written as \fB$LOCATION\fR,
+\fB$ECS\-SUBNET\fR and \fB$LOCATION\-TAG\fR / \fB$ECS\-SUBNET\-TAG\fR, so an
+import of the export gives the same rows.
+.PP
+A signed (PRESIGNED) zone is exported as the server serves it, with the
+NSEC3PARAM / NSEC3 / NSEC records the server rebuilds from the rows, so \fBthe
+file alone can serve the zone\fR (below).
+.SS apply and the change file (0.6.0 items D and E)
+\fBkaridns\-zone apply \-\-changes <file|\-> <zone>\fR changes RRsets of a zone
+that is in the database: the \fBRRset merge\fR of \fBimport \-\-mode merge\fR,
+with deletes, from a small change file instead of a zone file. It is what the
+WebAdmin API runs for every change of a zone (the API renders the file from a
+request; an operator may write one by hand), and it does the work in one
+transaction:
+.IP 1. 4
+Reads the change file (a file, \fB\-\fR for standard input, at most 64 MiB) with
+the parser of \fBdns_zone_changes.c\fR (below). A line it refuses fails the
+whole file, names the line and writes nothing.
+.IP 2. 4
+Turns the \fBrr\fR lines into zone text under \fB$ORIGIN <zone>.\fR and runs the
+checks of \fBkaricheck zone\fR on it exactly as \fBimport \-\-mode merge\fR does
+(a part of a zone is not judged by the SOA, NS and glue it lacks). An error
+fails the change.
+.IP 3. 4
+In ONE transaction (\fBREPEATABLE READ\fR on PostgreSQL): locks the zone, reads
+its \fBgeneration\fR (below) and fails with exit status \fB3\fR when
+\fB\-\-expect\-generation\fR names another, deletes and inserts the RRsets,
+\fBraises the SOA serial by one\fR when the change set changed the zone and
+wrote no SOA record of its own (RFC 1982 section 3.1; with \fB\-\-principal\fR
+through \fBkaridns_auth.bump_serial()\fR, the only way the API's role may change
+an SOA), reads the zone back through the loader's reader (the whole zone, or
+with \fB\-\-readback changed\fR only the rows written), writes the \fBversion\fR
+(below) and commits, or rolls back for \fB\-\-dry\-run\fR.
+.IP 4. 4
+Reports the RRsets that changed, each with its records before and after, in the
+text output as \fBdb.import.change\fR notes and in the \fB\-\-json\fR document
+as the key \fBapply\fR (below).
+.PP
+A change set that changes nothing writes nothing: no version, no new serial. The
+RRsets of the change that equal the zone's are not deleted and written again
+either: only the RRsets that change are written (a write that changes nothing is
+still a write for the audit log and for row level security). \fB\-\-zone\-file
+FILE\fR (below, "OPTIONS") takes a zone file instead of a change file. A zone
+that is not a primary zone (\fBSLAVE\fR, \fBCONSUMER\fR, \fBPRODUCER\fR), a zone
+that is not in the database (without \fB\-\-create\fR), the deletion of the apex
+SOA, and a zone that already exists (with \fB\-\-create\fR) are errors
+(\fBdb.apply.zone\fR). \fB\-\-create\fR makes a new zone (\fB\-\-type NATIVE\fR
+or \fBMASTER\fR, \fB\-\-view\fR): the \fBrr\fR lines are the whole zone and are
+checked as one (SOA, NS and glue are needed); its version 1 has the kind
+\fBcreate\fR.
+.PP
+\fBThe change file\fR (\fBdns_zone_changes.h\fR) has one operation per line,
+fields separated by blanks, lines ended by LF (a CR before it is dropped); empty
+lines and lines that begin with \fB#\fR are ignored:
+.PP
+.RS 2
+.nf
+rr <owner> <ttl> <type> <rdata>
+delete <owner> <type>
+.fi
+.RE
+.IP \(bu 2
+\fBrr\fR puts a record into the new RRset (owner, type): \fBevery RRset that has
+\fBrr\fB lines is replaced\fR by its \fBrr\fR lines, in one step, whatever it
+had before. \fBdelete\fR deletes the RRset. The same RRset in a \fBdelete\fR
+line and in an \fBrr\fR line is an error; two \fBdelete\fR lines of one RRset
+are one.
+.IP \(bu 2
+\fBowner\fR is an absolute name with the final dot, made of letters, digits,
+\fB_\fR, \fB*\fR, \fB\-\fR, \fB/\fR and \fB.\fR (labels of 1 to 63 octets, 253
+octets in all; case does not matter, it is stored in lower case), and it is the
+zone or a name below it at a label boundary: \fBwww.example.test.\fR is in
+\fBexample.test.\fR, \fBwwwexample.test.\fR is not. A name outside the zone is
+an error (it is not dropped as a zone file's would be).
+.IP \(bu 2
+\fBttl\fR is decimal, 0 to 2147483647 (RFC 2181 section 8). \fBtype\fR is a
+record type name or \fBTYPEnnn\fR, any case, letters, digits and \fB\-\fR. The
+types the signer owns (\fBRRSIG NSEC NSEC3 NSEC3PARAM DNSKEY CDS CDNSKEY\fR) and
+the meta types (\fBANY AXFR IXFR OPT TSIG TKEY MAILA MAILB\fR) are refused, also
+in their \fBTYPEnnn\fR spelling. \fBkaridns\-zone \-\-types\-list\fR prints the
+names a change file may use.
+.IP \(bu 2
+\fBrdata\fR is the rest of the line in the presentation format of the zone
+parser (names in it that are not absolute are relative to the zone), not empty,
+at most 65535 octets. It must be safe in a zone file by the rules of the
+loader's reader (\fBdns_pdns_reader.h\fR, RFC 1035 section 5.1): no control
+character but TAB, no \fB;\fR outside quotes, no leading \fB$\fR, no open quote
+or group, no trailing backslash, no bare \fB@\fR. A field can therefore never
+end its line, start a directive or hide the rest of its line, whatever a
+renderer put into it. The parser is fuzzed
+(\fBtests/fuzz/fuzz_zone_changes.c\fR).
+.PP
+\fBThe generation.\fR \fBkaridns_zone_state\fR has a number per zone that grows
+whenever a transaction changes a row of the zone (records, metadata, the
+\fBkaridns_*\fR zone tables), written by triggers of the owner: nothing else
+writes it. \fBapply \-\-dry\-run\fR prints it; \fB\-\-expect\-generation N\fR
+makes the transaction fail with exit status 3 (\fBdb.import.changed\fR, nothing
+written) unless the zone has that generation, and on PostgreSQL a writer that
+committed after the transaction's snapshot makes its own write fail with a
+serialization failure, which is the same exit status 3. So the API validates a
+change set against the zone it read, and commits only when nobody changed the
+zone in between (it repeats the check when it is told "changed"). Every writer
+grows the number, the signer included: the SOA serial a re-sign raises is a
+change of the zone, so a signed zone can make the commit run of the API exit
+with 3 now and then, and the API repeats the two steps. PostgreSQL grows it once
+per transaction and zone, SQLite3 once per changed row; only equality means
+anything.
+.PP
+\fBVersions.\fR \fBkaridns_zone_versions\fR and
+\fBkaridns_zone_version_rrsets\fR (db/karidns_ext.*.sql) hold one row per
+committed change set of a zone: its number (per zone, from 1), the kind
+(\fBcreate\fR, \fBedit\fR, \fBtemplate\fR, \fBimport\fR, \fBrollback\fR;
+\fB\-\-version\-kind\fR), the principal (\fB\-\-principal\fR,
+\fB\-\-principal\-name\fR) and the database role, the change set
+(\fB\-\-change\-set\fR), the comment (\fB\-\-comment\fR), the SOA serial and the
+generation before and after, the version a rollback restores
+(\fB\-\-rollback\-of\fR), and for each RRset the change made, the RRset before
+and after as canonical lines \fB<ttl> <TYPE> <rdata>\fR (names absolute, in the
+order of the exporter), NULL for absent. The rows are written in the transaction
+of the change itself, from the RRsets it replaced and wrote; the audit log stays
+the complete record. The newest 100 versions of a zone are kept (the number in
+the trigger; \fBtests/run_karidns_zone_apply_test.sh\fR replaces it by 3). The
+DNSSEC types, tags and tinydns attributes, and a change of the SOA serial alone,
+are not versioned. A change of more than 10000 RRsets is listed without its
+RRsets (\fBdelta_complete\fR false). \fBimport\fR writes a version too (kind
+\fBimport\fR, no principal) when the tables exist, so the history has no silent
+gaps; a signer import (\fB\-\-signer\fR) writes none. A database without the
+tables works as before.
+.PP
+\fBRoles.\fR An operator runs \fBapply\fR with the writer role. The WebAdmin API
+runs it twice per change set: the \fBcheck run\fR (\fBapply \-\-dry\-run\fR,
+then nothing stays) as the \fBcheck role\fR of
+\fBdb/karidns_check_role.pgsql.sql\fR, a trusted session that sees the whole
+zone and so can judge a change of a subdomain master against it, and the
+\fBcommit run\fR as the API's role (\fB\-\-readback changed
+\-\-expect\-generation G \-\-principal P \-\-change\-set C\fR), where row level
+security checks every row again. The check role cannot commit: a transaction of
+its login role that wrote a row of any table the dry run writes is refused at
+COMMIT ("the check role never commits"; a deferred constraint trigger,
+\fBkaridns_auth.enable_never_commit()\fR). \fB\-\-readback changed\fR reads back
+only the rows this transaction wrote and runs them through the loader's reader;
+the checks of the whole zone were made by the check run at the same generation
+(row level security shows the API's session only the part of the zone its
+principal has a grant on, so a read-back of the whole zone would judge a part),
+and the tool checks that every row written is read back.
+.PP
+\fBThe \fBapply\fB document.\fR With \fB\-\-json\fR the document has the key
+\fB"command": "apply"\fR and, after \fBzones\fR, the key \fBapply\fR:
+.PP
+.RS 2
+.nf
+"apply": { "zone": "example.test.", "dry_run": true, "committed": false, "changed": false, "busy": false, "created": false,
+           "generation": 17, "generation_after": 21, "serial": { "before": 41, "after": 42 }, "serial_bumped": true,
+           "version": 5, "delta_complete": true, "records_before": 1200, "records_after": 1201, "warnings": 0,
+           "diff": [ { "owner": "www.example.test.", "type": "A", "change": "replace",
+                       "before": [ "300 A 192.0.2.1" ], "after": [ "300 A 192.0.2.10", "300 A 192.0.2.11" ] } ] }
+.fi
+.RE
+.PP
+\fBdiff\fR has one entry per RRset changed, in owner, type order (the SOA RRset
+too, when the file wrote it); \fBchange\fR is \fBadd\fR, \fBreplace\fR or
+\fBdelete\fR; \fBbefore\fR / \fBafter\fR are arrays of the canonical lines, null
+when the RRset was not / is not there. \fBversion\fR is the number the version
+row has (a dry run writes it and rolls it back); \fBrecords_before\fR /
+\fBrecords_after\fR count the records the session could see. When the zone
+changed (exit status 3) or is busy (4) the document has \fBchanged\fR or
+\fBbusy\fR true and no other key but \fBzone\fR, \fBdry_run\fR, \fBcommitted\fR
+and \fBcreated\fR. The messages (the zone checks) are in \fBmessages[]\fR as
+always, with the codes of \fBkaricheck(8)\fR.
+.PP
+\fB\fB\-\-types\-list\fB\fR prints the record types a change file may name, one
+per line (with \fB\-\-json\fR: the key \fBtypes\fR, \fB"command": "types"\fR).
+.SS render (0.6.0 item F, the WebAdmin GUI)
+\fBkaridns\-zone render \-\-json <zone>\fR turns \fBstored PowerDNS records\fR
+into the text a change file takes as \fBrdata\fR. It reads no database and no
+configuration: it is a filter, and it is what the WebAdmin API runs (one run for
+a page of RRsets) for \fBGET .../rrsets?rdata=1\fR, so that what a client read
+can be sent back in a change set unchanged. The stored form
+(\fBrecords.content\fR) is not that form: names have no final dot (the change
+file reads them relative to the zone), and the priority of MX and SRV is in a
+column of its own.
+.PP
+Standard input has one record a line, four fields separated by one TAB, lines
+ended by LF (the last may lack it):
+.PP
+.RS 2
+.nf
+<owner> TAB <type> TAB <prio> TAB <content>
+.fi
+.RE
+.PP
+\fBowner\fR and \fBtype\fR are \fBrecords.name\fR and \fBrecords.type\fR,
+\fBprio\fR is \fBrecords.prio\fR as decimal digits (an optional \fB\-\fR sign)
+or \fB\-\fR for NULL, \fBcontent\fR is \fBrecords.content\fR, the rest of the
+line (it may hold TABs). A line that does not have this shape, or more than
+200,000 lines, refuses the whole input (exit status 1, \fBdb.render.input\fR,
+nothing on standard output but the document); it is the caller's mistake. A
+record that the loader's reader refuses is not: each record is judged alone.
+.PP
+Each record is read as the loader reads a row (\fBdns_pdns_reader.c\fR: the
+line-safety rules of RFC 1035 section 5.1, the priority of MX and SRV put in
+front, the zone parser), inside a zone of its own for \fB<zone>\fR, and written
+by the zone-file writer of the exporter (\fBdns_zone_text.c\fR: every name
+absolute, the root name as \fB.\fR, strings quoted and escaped, RFC 3597 generic
+form for the types that have none). The text is given only if it \fBreads back
+as the same record\fR: it is read again, as a record with the priority in its
+content (the way a change set brings it back), and must be the same type and the
+same canonical RDATA (RFC 4034 section 6.2). There is no second RDATA
+parser. PowerDNS \fBALIAS\fR and \fBLUA\fR have no text of their own and are
+refused (shown as stored).
+.PP
+.RS 2
+.nf
+"render": { "rdata": [ "10 mail2.example.test.", null, "\e"hello\e" \e"wor ld\e"" ],
+            "errors": [ { "index": 1, "text": "invalid IPv4 address literal in A record" } ] }
+.fi
+.RE
+.PP
+\fBrdata\fR has one entry for each input line, in order: the text, or
+\fBnull\fR; \fBerrors\fR says why for each \fBnull\fR (the reader's reason
+without the zone or the row; \fBindex\fR counts from 0). The exit status is 0
+when the input was understood, whatever became of the records. \fB\-\-json\fR is
+required, and no other option is (the answer is a document of the schema of
+\fBkaricheck \-\-json\fR, \fB"command": "render"\fR). The input path is fuzzed
+(\fBtests/fuzz/fuzz_zone_changes.c\fR, which also checks that a rendered text is
+one safe line that renders again, to a fixed point).
+.SH OPTIONS
+.TP 8
+\fB\-c\fR, \fB\-\-config FILE\fR
+The configuration file (above).
+.TP 8
+\fB\-\-no\-config\fR
+Read no configuration.
+.TP 8
+\fB\-\-view NAME\fR
+The view (above).
+.TP 8
+\fB\-\-sqlite3 FILE\fR
+The SQLite3 database file. The importer needs read and write permission on the
+file and its directory (the database is in WAL mode).
+.TP 8
+\fB\-\-conninfo\-file FILE\fR, \fB\-\-schema NAME\fR
+PostgreSQL: the file with the libpq connection string (a regular file owned by
+the user running the tool, mode 0600 or 0400; checked before it is read), and
+the schema that holds the tables (default: the \fBsearch_path\fR of the role).
+.TP 8
+\fB\-\-all\fR
+\fBimport\fR: every zone with an SOA (\fB.\fR or \fBZ\fR line) of a tinydns data
+file, each in a transaction of its own; a zone that fails does not stop the
+others. \fBexport\fR: every primary zone of the database (needs \fB\-\-dir\fR).
+.TP 8
+\fB\-\-mode replace|merge\fR, \fB\-\-types T1,T2\fR, \fB\-\-dry\-run\fR (\fB\-n\fR), \fB\-\-serial grow|increment|keep\fR, \fB\-\-verbose\fR
+Above.
+.TP 8
+\fB\-\-signer\fR
+\fBimport\fR: the file is a zone signed by \fBkaridns\-signer\fR; write its
+DNSSEC records and nothing else (above). Exit status 3 when the zone changed
+since the file was made, 4 when the zone is busy. The audit is in summary mode
+unless \fB\-\-audit rows\fR is given.
+.RS 8
+.PP
+\fBexport\fR: the zone as the input of \fBdnssec\-signzone\fR (below, "Export
+for the signer"): the NSEC / NSEC3 chain (rows the PowerDNS layout does not
+have) and the metadata \fBPRESIGNED\fR and \fBNSEC3PARAM\fR are left out, the
+signatures (those over the chain too, since 0.6.1) and the DNSKEY records stay.
+.RE
+.TP 8
+\fB\-\-strict\fR
+A warning of the zone checks fails the import. Without it warnings are printed
+and the import goes on. An error always fails.
+.TP 8
+\fB\-\-reload\fR
+Also add a row to \fBkaridns_reload_requests\fR in the transaction (PostgreSQL),
+so every server on the database reloads the zone. A database without the table
+gives the warning \fBdb.import.no\-reload\fR.
+.TP 8
+\fB\-\-type NATIVE|MASTER\fR
+\fBdomains.type\fR of a \fBnew\fR zone (default \fBNATIVE\fR).
+.TP 8
+\fB\-\-audit rows|summary\fR
+\fBimport\fR: how the audit log sees this import (default \fBrows\fR; see AUDIT
+below). Any other value is a usage error, and so is the option with
+\fBexport\fR.
+.TP 8
+\fB\-\-format bind|tinydns|auto\fR
+Above.
+.TP 8
+\fB\-\-dir DIR\fR
+\fBexport \-\-all\fR: the directory for one file per zone; made when it does not
+exist (one level).
+.TP 8
+\fB\-\-force\fR
+\fBexport\fR: replace output files that exist. Without it an existing file is an
+error and is not touched.
+.TP 8
+\fB\-\-json\fR
+One JSON document on standard output (below).
+.TP 8
+\fB\-\-changes FILE\fR (apply)
+The change file; \fB\-\fR is standard input. Required, unless
+\fB\-\-zone\-file\fR is given.
+.TP 8
+\fB\-\-zone\-file FILE\fR (apply)
+Instead of \fB\-\-changes\fR: the RRsets of a \fBzone file\fR (BIND format;
+\fB\-\fR is standard input, where \fB$INCLUDE\fR is refused; the plain records
+only, no DNSSEC records, location / ECS tags or tinydns attributes) replace
+those RRsets of the zone, as \fBimport \-\-mode merge\fR does, with the checks,
+the generation, the version and the read-back of \fBapply\fR. An apex SOA of the
+file that differs from the zone's in the serial only is left alone (the serial
+is raised as for any change, \fB\-\-serial increment\fR); one that differs
+otherwise is written. It is what the WebAdmin API runs for an import.
+.TP 8
+\fB\-\-delete\-others\fR (apply)
+With \fB\-\-zone\-file\fR: also delete the RRsets of the zone that the file does
+not have, except the apex SOA and, in a zone kept signed by
+\fBkaridns\-signer\fR, the DNSSEC records. Not with \fB\-\-create\fR.
+.TP 8
+\fB\-\-create\fR (apply)
+The zone must not exist and is made; the \fBrr\fR lines (or the zone file) are
+the whole zone (\fB\-\-type NATIVE|MASTER\fR, \fB\-\-view\fR).
+.TP 8
+\fB\-\-expect\-generation N\fR (apply)
+Fail with exit status 3 unless the zone has this generation. Not with
+\fB\-\-create\fR.
+.TP 8
+\fB\-\-serial grow|increment|keep\fR (apply)
+As for import, but the default is \fBincrement\fR: a change that wrote no SOA of
+its own raises the serial by one; an SOA in the change file gets the database
+serial + 1.
+.TP 8
+\fB\-\-principal ID\fR, \fB\-\-principal\-name NAME\fR, \fB\-\-change\-set ID\fR (apply)
+Who acts and for which change set. PostgreSQL: \fBSET LOCAL karidns.principal\fR
+and \fBkaridns.change_set\fR for the transaction (the audit log and the policies
+of the API's role read them), and the serial is raised with
+\fBkaridns_auth.bump_serial()\fR. SQLite3: the values go into the row of
+\fBkaridns_audit_actor\fR and the version row. The id is 1 to 18 digits, the
+change set 1 to 64 of letters, digits, \fB.\fR, \fB_\fR, \fB:\fR and \fB\-\fR.
+.TP 8
+\fB\-\-readback zone|changed\fR (apply)
+\fBzone\fR (the default) reads the whole zone back through the loader's reader;
+\fBchanged\fR only the rows this transaction wrote (the commit run of the API).
+.TP 8
+\fB\-\-version\-kind edit|template|import|rollback\fR, \fB\-\-rollback\-of N\fR, \fB\-\-comment TEXT\fR (apply)
+The kind of the version row (\fBcreate\fR is chosen by \fB\-\-create\fR), the
+version a rollback restores (needed with \fBrollback\fR, an error otherwise),
+and the comment (at most 1024 octets).
+.TP 8
+\fB\-\-types\-list\fR
+Print the record types a change file may name and exit.
+.TP 8
+\fB\-h\fR, \fB\-\-help\fR
+Print the usage and exit with 0.
+.TP 8
+\fB\-v\fR, \fB\-\-version\fR
+Print the version and the drivers this build has, and exit with 0.
+.SH EXPORT OUTPUT
+\fBexport <zone>\fR writes to standard output; \fBexport <zone> <file>\fR writes
+the file (\fB\-\fR is standard output). \fB<zone>\fR is a name with or without
+the final dot, in any case. Only primary zones (\fBNATIVE\fR, \fBMASTER\fR) have
+records the server serves; a \fBSLAVE\fR, \fBCONSUMER\fR or \fBPRODUCER\fR zone
+is \fBdb.export.zone\-type\fR. A zone with a row in \fBcryptokeys\fR but without
+\fBPRESIGNED\fR is refused (the server does not serve it: online signing is not
+supported).
+.PP
+The BIND text is \fB$ORIGIN\fR, \fB$TTL\fR (the TTL most records have), the tag
+definitions, then one record per line: owners relative to the zone (\fB@\fR for
+the apex), names inside the zone in RDATA relative, other names absolute with
+the dot, TTL written when it differs from \fB$TTL\fR, strings quoted, long
+base64 / hex blobs not wrapped. Every name, string and tag that comes from the
+database is escaped, so no value can end its line, start a directive or a
+comment or open a group; a record the format cannot hold makes the export fail
+and names it (\fBrecord 12 (www.example.test. A): ...\fR).
+.PP
+\fBFiles.\fR A file is written to a temporary file in its directory and moved
+into place: a zone that cannot be read leaves nothing, and a reader never sees
+half a file. Without \fB\-\-force\fR the name is taken with \fBlink(2)\fR, so a
+file that appeared in between is never replaced. Output files are never opened
+through a symbolic link: an existing link is not followed (without
+\fB\-\-force\fR it is an error, with \fB\-\-force\fR the link itself is
+replaced). With \fB\-\-json\fR the zone text cannot go to standard output: give
+a file.
+.PP
+\fB\fBexport \-\-all \-\-dir DIR\fB\fR writes \fB<name>.zone\fR (BIND format) or
+\fB<name>.tinydns\fR (a tinydns data file) for every primary zone, in the order
+of the names. The name is the zone name with every byte that is not a letter,
+digit, \fB\-\fR, \fB_\fR or \fB.\fR (a dot as the first character included)
+written as \fB%XX\fR, so a name never contains a path separator, starts with a
+dot or contains a control character, and two zones never give the same file. A
+zone that cannot be exported (the reader refuses its rows) is reported and the
+others are written; the exit status is 1. With \fB\-\-view\fR only the zones of
+the view are written.
+.SS Export for the signer (\-\-signer)
+\fBkaridns\-zone export \-\-signer <zone> <file>\fR writes the zone as the
+\fBinput of \fBdnssec\-signzone\fB\fR, which is what \fBkaridns\-signer\fR
+needs. The plain export is the zone as the server serves it, and the server
+serves a signed zone only when its NSEC3 chain is complete: a zone that someone
+changed after it was signed (a new name has no NSEC3 record and no signature
+over it yet) is refused by the reader (\fBpresigned zone: no RRSIG(NSEC3) owner
+for 'new.example.test.'\fR), and so by the plain export. With \fB\-\-signer\fR
+the rows are read without the chain: the NSEC, NSEC3 and NSEC3PARAM records and
+the metadata \fBPRESIGNED\fR and \fBNSEC3PARAM\fR are left out, so there is
+nothing to rebuild or check. The RRSIG records (those over the chain as well,
+since 0.6.1) and the DNSKEY, CDS and CDNSKEY records stay, so that
+\fBdnssec\-signzone \-i \-u\fR keeps the signatures that are still good (an
+RRset that changed has a signature that no longer verifies, and is signed again;
+a chain record that changed or is new is signed, one that is gone loses its
+signature) and makes the chain again; \fBimport \-\-signer\fR then writes only
+the rows that differ. A signature over a chain record is exported only while its
+owner is still a name of the zone (NSEC) or its hash is still the
+\fBordername\fR of a row (NSEC3): the signature of a name that is gone would be
+an orphan that the reader refuses. Sign this text with \fBdnssec\-signzone
+\-u\fR (the signer does): without \fB\-u\fR the old chain is kept as it is and a
+name that is new has no chain record. The text is the data of the database as it
+is, signed and unsigned alike; the check "a zone with a row in \fBcryptokeys\fR
+but without \fBPRESIGNED\fR is refused" is not made, because the metadata is not
+read. On an unsigned zone \fB\-\-signer\fR gives the same text as the plain
+export. It takes the options of \fBexport\fR (\fB\-\-all \-\-dir\fR as well) and
+none of \fBimport\fR.
+.SH JSON OUTPUT
+\fBkaridns\-zone \-\-json <command> ...\fR writes the document of \fBkaricheck
+\-\-json\fR with the first key \fB"karidns\-zone": 1\fR and \fB"command":
+"import"\fR, \fB"export"\fR, \fB"apply"\fR, \fB"render"\fR or \fB"types"\fR;
+\fBimport \-\-signer\fR adds the key \fBsigner\fR after \fBzones\fR (above),
+\fBapply\fR the key \fBapply\fR (above), \fBrender\fR the key \fBrender\fR
+(above), \fB\-\-types\-list\fR the key \fBtypes\fR; \fBmessages[]\fR,
+\fBcounts\fR and \fBzones[]\fR are as there (\fBzones[]\fR has one entry per
+zone imported or exported; \fBformat\fR is \fBbind\fR, \fBtinydns\fR, or
+\fBdatabase\fR for a zone that failed before its format was known; \fBfile\fR is
+the input or output file). Standard output carries only the document, standard
+error nothing; the exit status is the one of the text mode. The codes are those
+of \fBkaricheck(8)\fR (\fBusage.*\fR, \fBio.*\fR, \fBconf.*\fR, \fBzone.*\fR,
+\fBdb.import.*\fR, \fBdb.export.*\fR, \fBdb.zone.*\fR; the list is in the manual
+of \fBkaricheck\fR).
+.SH AUDIT
+A database of schema version 3 (\fBdb/karidns_ext.*.sql\fR) has an audit log:
+\fBkaridns_auth.audit_log\fR on PostgreSQL, \fBkaridns_audit_log\fR on
+SQLite3. It is empty and stays empty until the audit triggers are attached
+(PostgreSQL: \fBSELECT karidns_auth.enable_audit('public')\fR, which the role
+scripts of the WebAdmin do; SQLite3: apply
+\fBdb/karidns_audit.sqlite3.sql\fR). With the triggers on, every row
+\fBkaridns\-zone import\fR changes is logged: the table, the operation (\fBI\fR,
+\fBU\fR, \fBD\fR), the zone, the row before and after as JSON, and who did it.
+.PP
+\fBWho.\fR PostgreSQL: the database role of the connection (\fBdb_role\fR), and
+no principal. SQLite3: triggers can only read their own database, so the
+importer writes one row to the table \fBkaridns_audit_actor\fR first in its
+transaction and deletes it before the commit; the row says \fBkaridns\-zone:<OS
+user>\fR. A database without that table (schema version 2) gets no row and the
+import is as before. \fBimport\fR does not set \fBkaridns.principal\fR: a
+session that does (the WebAdmin) is logged under that principal; \fBapply
+\-\-principal P \-\-change\-set C\fR sets it (and, on SQLite3, writes it into
+the actor row) and the audit rows of the change carry both.
+.TP 8
+\fB\-\-audit rows\fR (the default)
+One audit row per changed record, tag, tag definition and metadata row. A
+replace-import of a zone of a million records writes two million rows.
+.TP 8
+\fB\-\-audit summary\fR
+PostgreSQL: each write transaction of the run begins with \fBSET LOCAL
+karidns.audit = 'summary'\fR. The audit then writes one row for the transaction,
+the table, the operation and the zone, which counts the statements and the rows
+(\fB{"summary": true, "statements": 1000000, "rows": 1000000}\fR in
+\fBafter\fR); the first statement inserts the row and the totals are written
+into it when the transaction commits. The role of the WebAdmin
+(\fBkaridns_api\fR) cannot turn the detail off, and neither can a login role
+that is a member of it, also after \fBSET ROLE\fR to another role: the
+restricted roles are the rows of the table
+\fBkaridns_auth.audit_restricted_roles\fR (owner only; the role script of the
+WebAdmin adds the role name it was given). The importer's role can, and so can
+the signer's (\fBkaridns_signer\fR: a trusted daemon whose output is machine
+made; \fBimport \-\-signer\fR uses summary mode by default). SQLite3: the audit
+has rows only; the option is accepted and the actor row is written as with
+\fBrows\fR.
+.PP
+\fBZone names in the log.\fR Every audit row of a zone's data names the zone
+(\fBzone_name\fR), also the rows that a zone delete removes through foreign keys
+(records, metadata, tag definitions, views). The one exception: the rows of
+\fBkaridns_record_tags\fR and \fBkaridns_record_tinydns\fR that go with their
+record (when the record or its zone is deleted) have \fBzone_name\fR NULL,
+because the record is gone when they are deleted. The \fBD\fR row of the record
+carries the zone, and its \fBrow_id\fR is the \fBrecord_id\fR of those
+rows. (PostgreSQL remembers the name of a zone that is being deleted in a
+transaction-local setting \fBkaridns.zc_<hash of the schema>_<domain id>\fR; it
+ends with the transaction.)
+.PP
+\fBRow level security.\fR When the role script of the WebAdmin or of the signer
+has switched row level security on (PostgreSQL), the importer's role must be a
+member of \fBkaridns_rls_trusted\fR, or it sees no
+rows. \fBdb/karidns_writer_role.pgsql.sql\fR makes its role a member, whichever
+script ran first. See THE AUTH SCHEMA, ROLES AND THE AUDIT LOG in
+\fBkaridns\-dbloader(8)\fR.
+.PP
+\fBCost.\fR A replace-import of 100,000 records into PostgreSQL 18 (one
+\fBINSERT\fR per record, one transaction) took 17 s without the audit, 36 s with
+\fB\-\-audit rows\fR and 36 s with \fB\-\-audit summary\fR. Summary mode saves
+space in the log, not time.
+.SH EXIT STATUS
+.TP 8
+\fB0\fR
+Every zone was imported or exported (warnings do not change this).
+.TP 8
+\fB1\fR
+Something failed: an error of the zone checks, a serial that does not grow, a
+zone the loader would refuse, the database, a configuration that cannot be read,
+an output file. Nothing of a failed zone was written to the database.
+.TP 8
+\fB2\fR
+Usage error (an unknown option or command, a missing value, an option of the
+other command, a wrong number of arguments, \fB\-\-json\fR with an export to
+standard output, \fB\-\-signer\fR with \fB\-\-mode\fR, \fB\-\-types\fR,
+\fB\-\-serial\fR, \fB\-\-view\fR, \fB\-\-type\fR or \fB\-\-all\fR). The usage
+goes to standard error (the message only, in the document, with \fB\-\-json\fR);
+nothing was done.
+.TP 8
+\fB3\fR
+\fBimport \-\-signer\fR: the zone in the database is no longer the zone the
+signed file was made from (a record or the SOA differs, or the serial does not
+grow, or another session changed the zone while the tool wrote it). Nothing was
+written (\fBdb.import.changed\fR). Sign the zone again. \fBapply\fR: the zone is
+not at the generation \fB\-\-expect\-generation\fR named, or a session that
+committed after the snapshot of the transaction changed a row it wrote. Nothing
+was written; check the change again.
+.TP 8
+\fB4\fR
+\fBimport \-\-signer\fR, \fBapply\fR: the zone is locked by another import, or
+the database is busy for longer than the tool waits. Nothing was written
+(\fBdb.import.busy\fR). Try again.
+.SH THE WRITER ROLE (PostgreSQL)
+\fBimport\fR writes \fBdomains\fR, \fBrecords\fR, \fBdomainmetadata\fR and the
+\fBkaridns_*\fR zone tables; \fBexport\fR only
+reads. \fBdb/karidns_writer_role.pgsql.sql\fR gives a role exactly that and no
+more (the database packages install it in \fB/usr/local/share/karidns/db/\fR,
+next to \fBkaridns_loader_role.pgsql.sql\fR, which the server's loader uses; do
+not give the loader this role):
+.PP
+.RS 2
+.nf
+psql \-X \-v ON_ERROR_STOP=1 \-c "CREATE ROLE karidns_writer LOGIN"
+psql \-X \-v ON_ERROR_STOP=1 \-v role=karidns_writer \-v schema=public \-f /usr/local/share/karidns/db/karidns_writer_role.pgsql.sql karidns
+.fi
+.RE
+.PP
+(\fBrole\fR is the importer's role, \fBschema\fR the schema of the tables; run
+it once per schema when views have schemas of their own; it can be run
+again.) The role gets \fBSELECT, INSERT, UPDATE, DELETE\fR on \fBdomains\fR,
+\fBrecords\fR and \fBdomainmetadata\fR; \fBSELECT\fR on every \fBkaridns_*\fR
+table and \fBINSERT, UPDATE, DELETE\fR on the zone tables
+(\fBkaridns_domain_views\fR, \fBkaridns_record_tags\fR,
+\fBkaridns_record_tinydns\fR, \fBkaridns_zone_tagdefs\fR); what the change log
+and the reload requests need (\fBINSERT, DELETE\fR on \fBkaridns_changes\fR and
+\fBkaridns_reload_requests\fR, because the triggers run with the rights of the
+writer); \fBUSAGE\fR on the sequences. For \fBcryptokeys\fR all rights are
+revoked and only the \fBcolumn\fR privilege \fBSELECT (domain_id)\fR is granted
+(the importer asks whether a zone has keys, to warn that unsigned data makes the
+loader refuse a zone with keys): \fBthe role can never read
+\fBcryptokeys.content\fB\fR, the private keys. Authentication is yours: a UNIX
+socket with peer authentication for the user who runs the tool is the simplest;
+put the connection string in a file of mode 0600:
+.PP
+.RS 2
+.nf
+# /usr/local/etc/karidns/writer.conninfo
+host=/var/run/postgresql dbname=karidns user=karidns_writer
+.fi
+.RE
+.PP
+\fBkaridns\-zone import \-\-conninfo\-file
+/usr/local/etc/karidns/writer.conninfo example.test
+example.test.zone\fR. SQLite3 has no roles: the user running the tool needs read
+and write access to the database file and its directory.
+.SS The signer role
+\fBimport \-\-signer\fR needs less: \fBdb/karidns_signer_role.pgsql.sql\fR (see
+\fBkaridns\-dbloader(8)\fR, "Roles and row level security") gives the signer's
+role \fBSELECT\fR on everything, \fBINSERT\fR and \fBDELETE\fR on the DNSSEC
+records, \fBUPDATE\fR of records (a trigger lets it change only \fBordername\fR
+and \fBauth\fR of a record that is not a DNSSEC record, and of an SOA record
+only the serial besides), and the three metadata kinds it owns. The tool deletes
+the DNSSEC records by id and never touches the tag tables, so that role is
+enough, with row level security on.
+.SH EXAMPLES
+Import a zone file into the database of the configuration, then check what was
+written:
+.PP
+.RS 2
+.nf
+karidns\-zone import \-c /usr/local/etc/karidns/karidns.conf example.test /var/zones/example.test.zone
+karicheck db
+.fi
+.RE
+.PP
+See what a merge would change without writing it; take the data from standard
+input:
+.PP
+.RS 2
+.nf
+karidns\-zone import \-\-sqlite3 /var/db/karidns/pdns.sqlite3 \-\-dry\-run \-\-mode merge example.test \- < new\-records.zone
+.fi
+.RE
+.PP
+Import every zone of a tinydns data file (each in its own transaction), then
+export one back:
+.PP
+.RS 2
+.nf
+karidns\-zone import \-\-all \-\-sqlite3 /var/db/karidns/pdns.sqlite3 /var/tinydns/root/data
+karidns\-zone export \-c /usr/local/etc/karidns/karidns.conf example.test > example.test.zone
+.fi
+.RE
+.PP
+Write a zone that \fBdnssec\-signzone\fR signed from an export of it (what
+\fBkaridns\-signer\fR does; the exit status is 3 when the zone changed
+meanwhile):
+.PP
+.RS 2
+.nf
+karidns\-zone export \-\-signer \-c karidns.conf example.test example.test.in
+dnssec\-signzone \-o example.test \-f example.test.signed \-N increment \-3 \- \-H 0 \-K keys example.test.in Kexample.test.+013+11111 Kexample.test.+013+22222
+karidns\-zone import \-\-signer \-\-json \-c karidns.conf example.test example.test.signed
+.fi
+.RE
+.PP
+See a stored MX record as a change set takes it (the priority in front, every
+name absolute):
+.PP
+.RS 2
+.nf
+printf 'mail.example.test\etMX\et10\etmail2.example.test\en' | karidns\-zone render \-\-json example.test
+.fi
+.RE
+.PP
+Take the serial from the database (a changed file whose serial was not raised),
+or restore a backup as it was:
+.PP
+.RS 2
+.nf
+karidns\-zone import \-\-serial increment \-c karidns.conf example.test example.test.zone
+karidns\-zone import \-\-serial keep      \-c karidns.conf example.test /var/backups/zones/example.test.zone
+.fi
+.RE
+.SS Backups with export \-\-all
+.RS 2
+.nf
+karidns\-zone export \-\-all \-\-dir /var/backups/zones/$(date +%Y%m%d) \-c /usr/local/etc/karidns/karidns.conf
+.fi
+.RE
+.PP
+writes one file per zone (\fBexample.test.zone\fR,
+\fBlan.example.tinydns\fR, ...). The files are canonical, so a \fBdiff \-r\fR of
+two backups shows what changed; a restore is \fBkaridns\-zone import \-\-serial
+keep\fR of the files. The round trip is exact: file -> import -> export ->
+import -> export gives the same bytes both times, for signed, tagged, tinydns,
+\fB$GENERATE\fR and \fB$INCLUDE\fR zones (\fBtests/run_karidns_zone_test.sh\fR).
+.SS When the database is down: export, then a file zone
+The loader needs the database; a file zone does not. Keep a recent export and
+serve it from a file when the database is gone (D-PRIO: a file zone in
+\fBkaridns.conf\fR has priority over the database zone of the same name, so the
+server serves the file as soon as it is configured):
+.PP
+.RS 2
+.nf
+karidns\-zone export \-c karidns.conf example.test /usr/local/etc/karidns/zones/example.test.zone
+.fi
+.RE
+.PP
+.RS 2
+.nf
+zone "example.test" { type master; file "/usr/local/etc/karidns/zones/example.test.zone"; };
+.fi
+.RE
+.PP
+then \fBkarictl reconfig\fR. A signed zone is exported with its signatures and
+the NSEC3 records, so the file serves it as the database did. Remove the
+\fBzone\fR statement when the database is back (\fBkaridns\-zone import
+\-\-serial increment\fR first if the file was changed).
+.SH LIMITS
+.IP \(bu 2
+\fBimport\fR reads up to 64 MiB from standard input. A zone file read from
+standard input cannot use \fB$INCLUDE\fR (there is no directory to read from;
+\fBzone.include\-stdin\fR).
+.IP \(bu 2
+One zone per \fBimport <zone> <file>\fR: a BIND-format file with several zones
+is not split. \fBimport \-\-all\fR reads tinydns data files only.
+.IP \(bu 2
+The size limits are those of the configuration (\fBmax\-records\fR, ...) and of
+the database block (\fBmax\-zone\-records\fR, \fBmax\-zone\-bytes\fR); the
+loader reads at most \fBmax\-zone\-records\fR records of a zone.
+.IP \(bu 2
+What does not carry over from a tinydns data file: the SOA serial a \fB.\fR line
+takes from the data file's modification time is stored as the number the
+importer saw (use a \fBZ\fR line, or \fB\-\-serial\fR), and the text of the data
+file (comments, order, \fB\-\fR lines) is not kept.
+.IP \(bu 2
+Two importers of one zone wait for each other (a transaction-level advisory lock
+on PostgreSQL, \fBBEGIN IMMEDIATE\fR on SQLite3) and give up after the busy
+timeout with \fBdb.import.busy\fR; try again.
+.IP \(bu 2
+\fBexport\fR of a zone with more records than \fBmax\-zone\-records\fR (default
+10,000,000 for the reader) fails like the loader does.
+.SH FILES
+.TP 8
+\fB/usr/local/share/karidns/db/karidns_check_role.pgsql.sql\fR
+The privileges of the check role of the API (the writer role's, membership of
+\fBkaridns_rls_trusted\fR and \fBkaridns_never_commit\fR, the never-commit
+triggers; database packages).
+.TP 8
+\fB/usr/local/etc/karidns/karidns.conf\fR
+The configuration read when \fB\-c\fR is not given.
+.TP 8
+\fB/usr/local/share/karidns/db/karidns_writer_role.pgsql.sql\fR
+The privileges of the PostgreSQL role that imports (database packages; \fBdb/\fR
+in a source tree).
+.TP 8
+\fB/usr/local/bin/karidns\-zone\fR
+The tool (database packages; the SQLite3 / PostgreSQL drivers of the package are
+linked in: \fBkaridns\-zone \-\-version\fR lists them).
+.SH SEE ALSO
+.IP \(bu 2
+\fBkaridns\-dbloader(8)\fR \[u2014] the loader that reads the zones the importer
+writes; the SQL files, the packages
+.IP \(bu 2
+\fBkaridns\-signer(8)\fR \[u2014] the daemon that runs \fBexport \-\-signer\fR
+and \fBimport \-\-signer\fR and keeps the zones signed
+.IP \(bu 2
+\fBkaricheck(8)\fR \[u2014] the zone checks (\fBkaricheck zone\fR), \fBkaricheck
+db\fR, the JSON document and the message codes
+.IP \(bu 2
+\fBkarictl(8)\fR \[u2014] \fBreload\fR, \fBdbstatus\fR, \fBrollback\fR
+.IP \(bu 2
+the database chapter of \fBkaridns\-dbloader(8)\fR \[u2014] the generation,
+version, session, token and template tables, the check role, the migration of a
+database made before them
+.IP \(bu 2
+\fBkaridns(8)\fR \[u2014] the \fBdatabase\fR block, views, database zones,
+\fBcheck\-*\fR options and limits
+.IP \(bu 2
+Distribution Guide \[u2014] the FreeBSD packages
+.SH AUTHORS
+Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)

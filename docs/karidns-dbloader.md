@@ -607,7 +607,7 @@ R	0	0	1
 ## FILES
 
 `/usr/local/bin/karidns-zone`
-: The importer and exporter of zones (database packages; [`karidns-zone(1)`](karidns-zone.md)).
+: The importer and exporter of zones (database packages; [`karidns-zone(8)`](karidns-zone.md)).
 
 `/usr/local/libexec/karidns-signer/`, `/usr/local/sbin/karidns-signer`
 : The signer daemon and its wrapper (the package `karidns-signer`; [`karidns-signer(8)`](karidns-signer.md)).
@@ -627,7 +627,7 @@ the file of `loader-state-file` (default: none)
 
 - [`karidns(8)`](karidns.md) — the `database` block, database zones, settings, auto reload, several servers
 - [`karictl(8)`](karictl.md) — `reload`, `dbstatus`
-- [`karidns-zone(1)`](karidns-zone.md) — import and export of zones (writes the tables this loader reads)
+- [`karidns-zone(8)`](karidns-zone.md) — import and export of zones (writes the tables this loader reads)
 - [`karidns-signer(8)`](karidns-signer.md) — keeps the zones signed; uses the signer tables, role and reload requests described here
 - [Distribution Guide](distribution.md) — the four FreeBSD packages
 

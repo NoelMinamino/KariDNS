@@ -806,7 +806,7 @@ dag example.com A @127.0.0.1 --test-all
 
 - [`karidns(8)`](karidns.md) — KariDNS authoritative DNS server daemon
 - [`karictl(8)`](karictl.md) — KariDNS server management and control utility
-- [`karicheck(1)`](karicheck.md) — Configuration and zone file validation utility
+- [`karicheck(8)`](karicheck.md) — Configuration and zone file validation utility
 - [`dag_replay(1)`](dag_replay.md) — Traffic replay and differential testing (`dag --replay`)
 - [`dag.c`](../tools/dag.c) — Source implementation of the DNS Anomaly Generator
 - [`KariDNS RFC Guideline`](../KariDNS_RFC_GUIDELINE.md) — Detailed RFC compliance and design boundary document

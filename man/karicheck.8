@@ -1,0 +1,2657 @@
+.TH KARICHECK 8 "2026-11-13" "KariDNS" "KariDNS Manual"
+.\" Generated from docs/karicheck.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
+.SH NAME
+karicheck \- Configuration and Zone File Validation Utility for KariDNS
+.SH SYNOPSIS
+.RS 2
+.nf
+karicheck conf [config_path]
+\&
+karicheck zones [config_path]
+\&
+karicheck zone <domain> [config_path]
+\&
+karicheck zone <domain> <zone_file_path>
+\&
+karicheck zone <domain> \-
+\&
+karicheck db [view] [config_path]
+\&
+karicheck \-\-json conf|zones|zone|db ...
+\&
+karicheck \-v | \-\-version
+\&
+karicheck \-h | \-\-help
+.fi
+.RE
+.SH DESCRIPTION
+\fBkaricheck\fR is a static validation and syntax inspection tool for
+\fBkaridns(8)\fR configuration files and zone files (BIND-style RFC 1035 master
+files and djbdns/tinydns \fBdata\fR files). It is the KariDNS counterpart of
+BIND's \fBnamed\-checkconf\fR / \fBnamed\-checkzone\fR.
+.PP
+It validates configuration files and zone files for syntax errors, structural
+constraints, record-level field ranges, DNSSEC algorithm recommendations (RFC
+8624), CDS/CDNSKEY delete signals (RFC 8078), and RFC 8976 ZONEMD message
+digests. The configuration file is parsed with the same parser as \fBkaridns\fR.
+.PP
+When \fBconfig_path\fR is omitted, \fB/usr/local/etc/karidns/karidns.conf\fR is
+used (or \fB/usr/local/etc/karidns.conf\fR if only that file exists).
+.SH COMMANDS
+.TP 8
+\fBconf [config_path]\fR
+Validate the configuration file (see Configuration checks).
+.TP 8
+\fBzones [config_path]\fR
+Validate the configuration file, then every \fBtype master\fR / \fBtype
+primary\fR zone declared in it (the type name is case-insensitive), using each
+zone's \fBfile\-format\fR. Secondary, forward and program zones are not checked
+and are reported as skipped. Prints the number of checked and skipped zones and
+the number of errors at the end (\fBChecked N zones (M skipped). Errors: E\fR).
+.TP 8
+\fBzone <domain> [config_path]\fR
+Look up \fB<domain>\fR in the configuration file and validate its zone file with
+the zone's settings (\fBfile\-format\fR, \fBcatalog\-zone\fR, tags). If several
+views define the zone, each view's definition is checked; the exit status is 1
+if any of them fails.
+.TP 8
+\fBzone <domain> <zone_file_path>\fR
+Standalone mode: parse and validate \fB<zone_file_path>\fR as a BIND-format zone
+for \fB<domain>\fR without a configuration file. The third argument is treated
+as a configuration file if it contains \fB.conf\fR, and as a zone file
+otherwise. A relative path is resolved against the current directory; the server
+resolves relative zone paths (also with \fB../\fR) against the directory it was
+started from.
+.TP 8
+\fBzone <domain> \-\fR
+The zone text is read from standard input (BIND format, at most 64 MiB; a bigger
+input is refused with \fBio.stdin.too\-large\fR, it is not cut). The messages
+and the JSON document call the file \fB<stdin>\fR. \fB$INCLUDE\fR is refused
+(\fBzone.include\-stdin\fR): there is no directory to include from. This is for
+a caller that holds the zone in memory (a web interface that validates an edited
+zone before it writes it to the database) and wants no temporary file.
+.TP 8
+\fB\-\-json\fR \fIcommand\fR ...
+Write the result as one JSON document on standard output (see JSON OUTPUT)
+instead of the text lines. \fB\-\-json\fR comes before the command. Standard
+output then carries nothing but the document, and standard error nothing at all
+(except when the document cannot be written). The exit status is the same as
+without \fB\-\-json\fR. \fB\-h\fR and \fB\-v\fR are not commands with
+\fB\-\-json\fR: they are usage errors.
+.TP 8
+\fBdb [view] [config_path]\fR
+Read the PowerDNS tables of \fBoptions { database { } }\fR (read only, through
+\fBkaridns\-dbloader \-\-check\fR) and check the schema, every zone (with the
+checks of \fBzone\fR), the settings texts, the views, and the zones of the
+configuration that hide a database zone. With \fBview\fR, only the zones that
+view gets are reported. A single argument is a view unless it contains a \fB/\fR
+or ends in \fB.conf\fR. See Database checks.
+.TP 8
+\fB\-v\fR, \fB\-\-version\fR
+Print the version and exit.
+.SH VALIDATION CHECKS
+.SS Configuration checks
+.IP \(bu 2
+Syntax of the whole file, including \fBinclude\fR files, with the same rules as
+\fBkaridns\fR (undefined TSIG keys in \fBtsig\-key\fR / \fBallow\-transfer\fR,
+duplicate zones/views/keys/acls, invalid option values, ...).
+.IP \(bu 2
+Boolean values other than
+\fByes\fR/\fBtrue\fR/\fB1\fR/\fBno\fR/\fBfalse\fR/\fB0\fR are errors.
+.IP \(bu 2
+\fBalso\-notify\fR (in \fBoptions\fR, \fBview\fR and \fBzone\fR) and the
+top-level \fBremote\-servers\fR / \fBprimaries\fR / \fBmasters\fR lists are
+checked with the BIND 9.20 grammar (see \fBkaridns(8)\fR, "\fBalso\-notify\fR
+and \fBremote\-servers\fR"). A syntax error names the file, the line and the
+statement (\fB[ERROR] karidns.conf:12: zone 'example.test.' also\-notify:
+expected ';' after '192.0.2.1' but found '}'\fR). These are errors: a list name
+that is not defined (or an address that is not an IP address), a list that
+includes itself or nests deeper than 8 levels, a list defined twice, a \fBkey\fR
+that no \fBkey { }\fR block defines, a \fBport\fR outside 1-65535 or on a list
+name, more than 256 addresses after the lists are expanded, and \fBtls\fR (not
+implemented). The same checks apply to \fBprimaries\fR / \fBmasters\fR of a zone
+(a list name is resolved through the same lists, a per-primary \fBkey\fR must be
+defined) and \fBnotify\fR takes \fByes\fR, \fBno\fR, \fBexplicit\fR,
+\fBprimary\-only\fR or \fBmaster\-only\fR in \fBoptions\fR, \fBview\fR and
+\fBzone\fR (anything else is an error naming the line).
+.IP \(bu 2
+An unknown statement inside \fBzone { }\fR or \fBview { }\fR is an error
+(\fB[ERROR] zone 'example.test.': unknown option 'alow\-transfer' ...\fR):
+\fBkaridns\fR used to skip such a statement without a word, so a typo silently
+left a zone open or closed. Options that BIND 9 documents for a \fBzone\fR or
+\fBview\fR statement but KariDNS does not implement (\fBallow\-query\fR,
+\fBinline\-signing\fR, \fBdnssec\-policy\fR, \fBauto\-dnssec\fR,
+\fBkey\-directory\fR, \fBmax\-journal\-size\fR, \fBzone\-statistics\fR,
+\fBrecursion\fR, ...) give a warning (\fB[WARNING] ... is a BIND option that
+KariDNS does not implement; it is ignored\fR) and are skipped. An unknown key
+inside \fBcontrol\-channel { }\fR is an error too (\fB[ERROR] control\-channel:
+unknown option 'port' (supported: socket, secret, algorithm, allow\-group,
+keys)\fR): \fBkaridns\fR refuses to start with it, so \fBkaricheck conf\fR does
+not call such a file valid. The same holds for \fBoptions { }\fR and \fBkey {
+}\fR, with the file and line (\fB[ERROR] karidns.conf:12: options: unknown
+option 'bind\-adress' ...\fR); BIND options of \fBoptions { }\fR that KariDNS
+does not implement (\fBrecursion\fR, \fBforwarders\fR, ...) give a warning, and
+a \fBkey\fR without \fBsecret\fR or \fBalgorithm\fR is an error. \fBlogging {
+}\fR and \fBcontrols { }\fR are strict as well (an unknown statement or option,
+a channel with no or two destinations, an unknown category, an undefined
+channel, an invalid size or severity, a \fBunix\fR control, an unknown key or a
+duplicate address in \fBcontrols\fR are errors with the file and line); what
+KariDNS accepts but does not do (\fBbuffered yes\fR, a \fBsize\fR without
+\fBversions\fR, an \fBinet\fR control, \fBstatistics\-channels\fR) gives a
+warning. Unknown top-level blocks are still skipped without a message.
+.IP \(bu 2
+Address match lists (BIND 9.20 ARM "Address Match Lists"): \fBallow\-query\fR,
+\fBallow\-query\-on\fR, \fBallow\-transfer\fR, \fBallow\-update\fR and
+\fBallow\-notify\fR (in \fBoptions\fR, \fBview\fR and \fBzone\fR),
+\fBmatch\-clients\fR, \fBecs\-trusted\-resolvers\fR and \fBacl\fR take an
+address, a prefix, \fBany\fR, \fBnone\fR, \fBlocalhost\fR, \fBlocalnets\fR,
+\fBkey <name>\fR (not in \fBecs\-trusted\-resolvers\fR; in \fBmatch\-clients\fR
+it selects the view by the TSIG key of the request), a defined \fBacl\fR name,
+or a nested \fB{ ... }\fR list, each optionally negated with \fB!\fR; in
+\fBallow\-update\fR the bare name of a defined key is accepted as well. Anything
+else is an error, and so is a statement written twice in the same block,
+\fBport\fR / \fBtransport\fR in front of the braces of \fBallow\-transfer\fR, an
+\fBacl\fR that contains itself, lists nested more than 8 deep, and
+\fBtransfer\-acl\-match\fR / \fBupdate\-acl\-match\fR with an
+\fBallow\-transfer\fR / \fBallow\-update\fR that has a negated key (the flat
+evaluation they ask for cannot say that). Errors name the place of the element
+(\fB[ERROR] karidns.conf:12: zone 'example.test.' allow\-query: entry 'internal'
+is not an address, prefix, any, none, localhost, localnets or a defined acl\fR,
+\fB... key 'k9' is not defined in any key {} block\fR, \fB... expected ';' after
+the element but found '}'\fR). \fBlocalhost\fR and \fBlocalnets\fR are expanded
+from the interfaces of the host \fBkaricheck\fR runs on where the flat lists
+need them; the server evaluates them against its own start-up snapshot (see
+karidns(8) "Address match lists"). A view whose \fBmatch\-clients\fR names a
+\fBkey\fR and that follows a view which surely matches every client (\fBany\fR,
+\fB0.0.0.0/0\fR with \fB::/0\fR, no \fBmatch\-clients\fR) gets a \fB[WARNING]\fR
+with \fBfile:line\fR ("KariDNS warning (BIND does not check this) ... can never
+be chosen"); it is not an error.
+.IP \(bu 2
+\fBWarnings when a list means something else since the first-match evaluation\fR
+(karidns(8) "Address match lists"): for a zone that writes its own
+\fBallow\-transfer\fR with no \fBtransfer\-acl\-match\fR, a list that has
+addresses and \fBkey\fR elements now lets in a client from a listed address
+\fBor\fR signed with a listed key, where it used to need the address \fBand\fR
+the key (more permissive: \fB[WARNING] Zone 'example.test.': allow\-transfer
+lists addresses and keys: it now lets in ...\fR); write \fBtransfer\-acl\-match
+all;\fR to keep the old meaning, or \fBany\fR to say it on purpose. For
+\fBallow\-update\fR with keys and negated entries, the order now decides, so a
+negated entry before a key refuses that key's requests (stricter;
+\fBupdate\-acl\-match any;\fR keeps the old meaning). No warning is printed for
+a list of addresses only, for a list with an explicit \fBtransfer\-acl\-match\fR
+/ \fBupdate\-acl\-match\fR, or for a zone whose ACL comes from \fBoptions\fR or
+\fBview\fR (those statements did nothing before).
+.IP \(bu 2
+\fBserver <prefix> { ... }\fR and \fBkey { }\fR in \fBview { }\fR (BIND 9.20;
+karidns(8) "\fBserver\fR" and "\fBkey\fR"). Errors with file and line: an
+unknown, ancient (\fBrequest\-sit\fR, \fBsupport\-ixfr\fR) or twice-written
+option, a bad value, bits beyond the prefix length (\fB'192.0.2.1/24' is an
+invalid prefix (extra bits specified)\fR), the same prefix twice in one list
+(\fBalready exists, previous definition: file:line\fR),
+\fBtransfer\-source\-v6\fR / \fBnotify\-source\-v6\fR for an IPv4 server and
+\fBtransfer\-source\fR / \fBnotify\-source\fR for an IPv6 server (\fB... is not
+legal for an IPv4 server\fR), a \fBkeys\fR name that is not defined for \fBevery
+view that uses the statement\fR (\fBserver '192.0.2.1': unknown key 'k' (in
+view 'v2')\fR: a view's own keys count only in that view), a view key with the
+name of a global key or a second key of one name in a view, and a key used in a
+zone of a view (\fBtsig\-key\fR, \fBallow\-transfer\fR, \fBallow\-update\fR, a
+\fBprimaries\fR / \fBalso\-notify\fR \fBkey\fR) that is neither global nor in
+that view. Warnings (\fBaccepted, no effect in KariDNS\fR): \fBbogus\fR,
+\fBtcp\-keepalive\fR, \fBpadding\fR, \fBsend\-cookie\fR, \fBrequire\-cookie\fR,
+\fBquery\-source\fR, \fBquery\-source\-v6\fR; \fBpadding\fR above 512 says
+\fBlowered to 512\fR. \fB[NOTE]\fR for a view that has \fBserver\fR statements
+of its own while the top level has some: the top-level ones do not apply in that
+view. The source addresses of \fBserver\fR statements are in the \fB[INFO]
+Source addresses\fR line.
+.IP \(bu 2
+A logging \fBcategory\fR may list several channels (up to 8; BIND writes to all
+of them). A \fBsize\fR without \fBversions\fR on a log file gives a warning: the
+file stops at that size (BIND behaviour) instead of being truncated as earlier
+KariDNS versions did.
+.IP \(bu 2
+BIND option values (karidns(8) "BIND option values"): \fBtcp\-idle\-timeout\fR
+and \fBtcp\-initial\-timeout\fR are in BIND's unit of 100 ms, a number written
+in the old KariDNS milliseconds needs the suffix \fBms\fR, and a bare number
+above 1200 is an error with file and line (\fBoptions tcp\-idle\-timeout: 10000
+is more than the maximum of 1200 (120 seconds) ... write 10000ms\fR); a value
+below BIND's minimum gives the BIND warning (\fBvalue is out of range: raising
+to 25\fR). \fBversion\fR, \fBhostname\fR and \fBserver\-id\fR take a quoted
+string, \fBnone\fR (and \fBhostname\fR for \fBserver\-id\fR); a \fBserver\-id\fR
+that differs from \fBnsid\fR is an error. \fBminimal\-responses\fR takes
+\fByes\fR, \fBno\fR, \fBno\-auth\fR or \fBno\-auth\-recursive\fR in
+\fBoptions\fR and in \fBview\fR (the view's value is the one its clients
+get). \fBmax\-records\fR, \fBmax\-records\-per\-type\fR,
+\fBmax\-types\-per\-name\fR, \fBmax\-zone\-ttl\fR, \fBserial\-update\-method\fR,
+\fBrollback\-window\fR (a number of seconds or a time with units; \fB0\fR keeps
+no previous version for \fBkarictl rollback\fR; a bad value is an error with
+file and line), \fBmasterfile\-format\fR (\fBraw\fR is an error) and the
+\fBcheck\-*\fR options are read in \fBoptions\fR, \fBview\fR and
+\fBzone\fR. Both names of a buffer setting with two values
+(\fBudp\-recvbuf\-size\fR and \fBudp\-receive\-buffer\fR, \fBudp\-bufsize\fR and
+\fBmax\-udp\-size\fR) are an error. \fBdnstap\fR is read in BIND's grammar too
+(\fBdnstap { auth; }; dnstap\-output unix "...";\fR; \fBdnstap\-output file\fR,
+mixing the two grammars and \fBdnstap\fR without \fBdnstap\-output\fR are
+errors). \fBcatalog\-zones\fR marks the zones it names; a name that is no zone
+gives a warning. \fBupdate\-policy\fR rules are checked (an unsupported
+\fBdeny\fR, \fBlocal\fR, a count such as \fBA(3)\fR, and \fBallow\-update\fR in
+the same zone are errors; an unsupported \fBgrant\fR is dropped with a
+warning). What is accepted without effect gives a warning (\fBcheck\-sibling\fR,
+\fBcheck\-spf\fR, \fBcheck\-svcb\fR, \fBedns\-udp\-size\fR,
+\fBtcp\-keepalive\-timeout\fR, \fBfstrm\-set\-*\fR, \fBdefault\-primaries\fR).
+.IP \(bu 2
+\fBcontrol\-channel { keys { } }\fR (karidns(8) "Restricted control keys"): an
+\fBallow\-group\fR that names no group (or a bad gid) is an error with file and
+line (the name is looked up on the host karicheck runs on); an unknown key name,
+a key listed twice, two keys with one secret, \fBallow\-commands\fR without
+\fBread\-only yes\fR and an unknown or test-only command name are errors with
+file and line. A key listed in \fBkeys { }\fR that is also used for TSIG
+anywhere (\fBallow\-transfer\fR, \fBallow\-update\fR, \fBallow\-notify\fR,
+\fBallow\-query\fR, \fBmatch\-clients\fR, a zone's \fBtsig\-key\fR,
+\fBprimaries\fR / \fBalso\-notify\fR entries, \fBserver { keys }\fR,
+\fBupdate\-policy\fR, an \fBacl { }\fR block, \fBacl\-ceiling\fR) is a warning
+with the place of the use: whoever holds the key for DNS could also control the
+server.
+.IP \(bu 2
+\fBtype program\fR zones: \fBprogram\fR must be set and be an absolute path, and
+\fBprogram\-args\fR may have at most 62 entries, and there may be at most 256
+program zones (errors); a \fBprogram\fR that is not executable and a
+\fBprogram\-user\fR that differs from \fBoptions { user }\fR give
+warnings. \fBallow\-program\-zones yes;\fR is required when any program zone
+exists.
+.IP \(bu 2
+\fBalias\-resolver { ... };\fR (in \fBoptions\fR, in a zone, and in \fBoptions {
+database { } }\fR): at most 8 entries, each an IP address (a host name is an
+error).
+.IP \(bu 2
+\fBlisten\-on\fR / \fBlisten\-on\-v6\fR / \fBblackhole\fR / \fBbind\-address\fR
+(BIND 9.20 ARM "Interfaces", "blackhole"; karidns(8) "Listening addresses"): the
+lists are evaluated against the interface addresses of the machine
+\fBkaricheck\fR runs on, and \fB[INFO] Listening (UDP and TCP) on: ...\fR shows
+the addresses that result (IPv6 as \fB[addr]:port\fR). Errors with file and
+line: \fBtls\fR, \fBhttp\fR or \fBproxy\fR (not supported), an invalid or
+repeated \fBport\fR, an unknown acl name or a \fBkey\fR element in the list, a
+\fBbind\-address\fR element that is not an IP address, one address with two
+ports (\fBoptions listen\-on: address 192.0.2.1 is listened on at port 53
+(karidns.conf:2) and at port 5353\fR), more than 64 addresses. Warnings: an
+address in a \fBlisten\-on\fR list that no interface of this machine has (BIND
+does not listen on it either), an IPv6 address in \fBlisten\-on\fR (or IPv4 in
+\fBlisten\-on\-v6\fR), and statements that select no address at all
+(\fBkaridns\fR refuses to start then). A configuration written for another host
+therefore warns about its addresses when checked here.
+.IP \(bu 2
+\fBtype forward\fR zones must have \fBforwarders\fR; a forwarder equal to one of
+the addresses the server listens on (\fBlisten\-on\fR, \fBlisten\-on\-v6\fR,
+\fBbind\-address\fR, with their ports) gives a self-loop warning. A note
+(\fB[INFO]\fR) reminds that in BIND \fBtype forward\fR is a resolver-side zone
+type, so a BIND configuration that relies on it is not equivalent.
+.IP \(bu 2
+BIND 9.20 compatibility of paths and syntax: \fBoptions { directory }\fR must
+exist and be a directory (errors; a relative one gives a warning, BIND
+recommends an absolute path), and the relative \fBfile\fR, \fBinclude\fR,
+\fBpid\-file\fR and log paths are resolved against it as \fBkaridns\fR does. A
+class after a zone or view name is accepted when it is \fBIN\fR and an error
+with file and line otherwise (\fBzone 'x.test.': class 'CH' is not supported
+(only IN)\fR). The zone types \fBhint\fR, \fBstub\fR, \fBstatic\-stub\fR,
+\fBmirror\fR, \fBredirect\fR (and \fBdelegation\-only\fR) give a warning with
+file and line (\fBthe zone is not loaded\fR) and the rest of their block is
+skipped, so a stock BIND \fBnamed.conf\fR passes with warnings
+only. \fBin\-view\fR is checked as BIND does (\fBlib/isccfg/check.c\fR): the
+zone must exist in a view that is defined earlier -- as a \fBzone { }\fR of it,
+or, when that view takes zones from the database or has a catalog zone, as a
+name that is looked for in the database or the catalog at run time and so cannot
+be checked here (D1a, in-view phase 2) (\fB'in\-view' zone 'x.test.' does not
+exist in view 'v1', or view 'v1' is not yet defined\fR; a type that cannot be
+shared in KariDNS gives its own message), only \fBin\-view\fR, \fBforward\fR and
+\fBforwarders\fR may be written with it (\fBzone 'x.test.': 'in\-view' used with
+incompatible zone options\fR; \fBallow\-query\fR, \fBallow\-query\-on\fR,
+\fBallow\-transfer\fR, \fBallow\-update\fR and \fBallow\-notify\fR are accepted
+with the KariDNS \fBin\-view\-settings view\fR), and \fBin\-view\-settings\fR
+takes \fBowner\fR or \fBview\fR; every message has the file and
+line. \fBkaricheck zones\fR and \fBkaricheck zone\fR check a shared zone once,
+in the view that owns it. \fBmax\-records\-per\-type\fR or
+\fBmax\-types\-per\-name\fR above BIND's default of 100 gives a warning (the
+value is applied as written). A \fBport\fR that is not a number in 1-65535 is an
+error with file and line.
+.IP \(bu 2
+Every CIDR in \fBecs\-tags\fR and \fBlocation\-tags\fR (in \fBoptions\fR and in
+zones) must be valid (the server refuses to start with one that is not, too);
+\fBecs\-tags\fR without \fBecs\-enable yes;\fR gives a warning.
+.IP \(bu 2
+The lexer reports a \fB/* comment\fR or a quoted string that is never closed,
+and a token longer than 4096 bytes, as syntax errors; an unknown top-level
+statement is a warning that names it and its line (\fBunknown statement 'zonee'
+is skipped\fR); an address-list element with host bits below the prefix length
+(\fB10.0.0.1/8\fR) is a warning with file and line.
+.IP \(bu 2
+The placeholder secret of \fBkaridns.conf.sample\fR is an error for the
+\fBcontrol\-channel\fR secret and for a key that an ACL, an \fBupdate\-policy\fR
+rule or \fBcontrol\-channel { keys }\fR uses
+(\fBconf.tsig.secret\-placeholder\-used\fR), and a warning for a key nobody
+uses. A database configuration whose CONFIG message for the loader would exceed
+1 MiB is an error.
+.IP \(bu 2
+\fBtransfer\-acl\-match\fR and \fBupdate\-acl\-match\fR take \fBany\fR or
+\fBall\fR (anything else is an error). A warning says when an option has nothing
+to choose between: without \fBallow\-transfer\fR / \fBallow\-update\fR (the
+zone's, the view's or \fBoptions\fR' counts), or with an ACL that lists only
+addresses or only keys (see karidns(8) "Address match lists" and "Settings of
+database zones").
+.IP \(bu 2
+\fBoptions { database { ... }; }\fR (no database connection is opened): the
+driver is built into \fBkaridns\-dbloader\fR (\fB\-\-drivers\fR);
+\fBloader\-user\fR / \fBloader\-group\fR exist; \fBloader\-path\fR is a regular
+executable owned by root (or by the user who runs \fBkaricheck\fR, standing in
+for the user who runs \fBkaridns\fR, when that is not root) and not writable by
+group or others (a loader that fails these checks is an error, is not executed,
+and the check is made on the open file that is then executed, as karidns does);
+a \fBloader\-user\fR / \fBloader\-group\fR / \fBuser\fR / \fBgroup\fR /
+\fBprogram\-user\fR that resolves to uid or gid 0, also under another name
+(\fBroot\fR, \fBtoor\fR, \fBwheel\fR), is an error (karidns refuses it); and not
+writable by group or others; a SQLite3 file exists, is a database in WAL mode
+and is not readable by everyone; a PostgreSQL \fBconninfo\-file\fR has mode 0600
+or 0400, belongs to the loader user and names a UNIX socket or
+\fBsslmode=verify\-full\fR (warning otherwise); with PostgreSQL the
+\fBserver\-id\fR (the name of this server's row in \fBkaridns_server_status\fR;
+1 to 64 bytes, the parser enforces that) gives a warning when it has characters
+other than ASCII letters, digits and \fB. \- _ :\fR, and so does a missing
+\fBserver\-id\fR when the host name (the default) is empty or longer than 64
+bytes (then no status row can be written); a \fBserver\-id\fR together with an
+\fBalias\-resolver\fR (in \fBoptions { database { } }\fR or in \fBoptions\fR)
+gives a warning that ALIAS answers can differ between the servers that share the
+database, because each server's resolver and the moment of its lookup decide
+them (milestone B11b; the SOA serials and the zone transfers are the same; a
+resolver named only in a zone's profile text is not seen; LUA records are never
+run, so they need no warning); \fBacl\-ceiling\fR entries are valid and its keys
+are defined. \fBacl\-ceiling\-match\fR must be \fBany\fR or \fBall\fR; \fBall\fR
+gives a warning when the ceiling lists only addresses or only keys (that kind
+alone decides then). A database block \fBwithout \fBacl\-ceiling\fB\fR gives a
+warning: the ACLs a database zone carries (transfers, dynamic updates) refuse
+every client until a ceiling is set.
+.SS Zone checks
+.IP 1. 4
+\fBZone File Directives\fR:
+.RS 4
+.IP \(bu 2
+\fB$ORIGIN\fR, \fB$TTL\fR, \fB$INCLUDE\fR (up to 16 nesting levels and 32 files
+per zone), \fB$GENERATE\fR (BIND syntax, any RR type, at most 100,000 records
+per directive; see karidns(8) "ZONE FILE FORMAT")
+.IP \(bu 2
+\fB$INCLUDE\fR follows the rules of the server (karidns(8) "ZONE FILE FORMAT"):
+a relative name is read from \fBoptions { directory }\fR when \fBkaricheck\fR
+knows one (a zone checked through a configuration), else from the directory of
+the zone file; an absolute path or one that leaves the base through \fB..\fR is
+accepted only inside the directory of the zone file or \fBdirectory\fR, and
+anything else is an error (\fB$INCLUDE '/etc/hosts' is outside the directories
+opened at startup (zone file dir, directory): ...\fR), so the verdict is the
+same as \fBkaridns\fR' (standalone mode used to accept any absolute path).
+.IP \(bu 2
+TTLs: a \fB$TTL\fR, record TTL or \fB$GENERATE\fR TTL that is not digits with
+optional \fBs\fR/\fBm\fR/\fBh\fR/\fBd\fR/\fBw\fR units, or above 2147483647, is
+an error at its position (it used to become 3600); so are malformed SOA refresh,
+retry, expire and minimum fields and a SOA serial that is not a plain number
+0-4294967295 (BIND 9.20 \fBfromtext_soa()\fR; the same in the \fBZ\fR line of a
+tinydns file); a number after a unit (\fB1h30\fR) is not a TTL. A zone in which
+some record has no TTL at all (no \fB$TTL\fR, no earlier TTL, no SOA to take the
+minimum from) gives a warning that names the file and line of the first such
+record (\fBzone.db:12: no TTL specified for 'www.example.test.' ...\fR, the path
+of the \fB$INCLUDE\fR file when it is in one) and how many records there are:
+BIND rejects it ("no TTL specified"), \fBkaridns\fR serves those records with
+3600.
+.IP \(bu 2
+Classes: a zone has the class of its first record; a record of another class is
+an error at its line (\fBclass 'CH' != zone class 'IN'\fR, as BIND
+\fBlib/dns/master.c\fR).
+.IP \(bu 2
+\fBRESINFO\fR is a singleton type (RFC 9606 \[u00A7]3): two different RESINFO
+records at one name are an error (\fBmultiple RRs of singleton type\fR, the
+server does not load the zone).
+.IP \(bu 2
+TXT-like types (\fBTXT\fR, \fBSPF\fR, \fBAVC\fR, \fBNINFO\fR, \fBRESINFO\fR,
+\fBWALLET\fR): a \fB<character\-string>\fR of more than 255 octets gives a
+warning with file and line, \fBBIND rejects this\fR; \fBkaridns\fR serves it
+split into 255-octet strings.
+.IP \(bu 2
+\fB\e# <length> <hex>\fR RDATA may be written in any number of tokens (up to the
+512 fields of a line) for every type.
+.IP \(bu 2
+KariDNS steering directives \fB$LOCATION\fR, \fB$LOCATION\-TAG\fR,
+\fB$ECS\-SUBNET\fR, \fB$ECS\-SUBNET\-TAG\fR: records that reference an undefined
+location or ECS tag are errors
+.IP \(bu 2
+tinydns \fBdata\fR files (through a configuration file with \fBfile\-format
+tinydns;\fR): invalid location prefix lengths (\fB/n\fR above 32, error),
+duplicate location codes, malformed IPv6 fields of \fB3\fR/\fB6\fR lines, and
+SRV/NAPTR/SSHFP field ranges of generic lines
+.RE
+.IP 2. 4
+\fBZone Integrity & Structural Invariants\fR:
+.RS 4
+.IP \(bu 2
+Exactly one SOA record at the zone apex that every client sees, and at least one
+NS record at the apex. A tinydns zone (one \fBZ\fR line per location) and a zone
+with \fB$LOCATION\fR / \fB$ECS\-SUBNET\fR tags may hold more SOA records when
+each of the others has a location, a time stamp or a tag; every SOA record of
+the zone must have the same serial (error, RFC 2181 \[u00A7]6.1), none may be
+restricted (or accompanied by another SOA) in a zone that holds DNSSEC records
+(RRSIG, DNSKEY, NSEC, NSEC3: error, the signature of the SOA RRset would not
+hold for every client), and a SOA restricted to a tinydns location the zone does
+not define, or whose countdown time stamp is over, is seen by nobody
+(warning). Several SOA records that every client sees are an error as
+before. See karidns(8) "Several SOA records".
+.IP \(bu 2
+CNAME exclusivity (CNAME must not co-exist with other record types at the same
+owner name, except DNSSEC RRs), CNAME loops, CNAME chains (warning), NS/MX
+targets that point to a CNAME (error, RFC 2181 \[u00A7]10.3) and SRV targets
+that point to a CNAME (warning, RFC 2782 "the name MUST NOT be an alias"; BIND's
+\fBcheck\-srv\-cname\fR default is also a warning)
+.IP \(bu 2
+Out-of-zone records (owner not at or below the zone name, e.g. address records
+for name servers outside the zone) give a warning and are left out of all
+further checks, because the server does not load them (RFC 1034 \[u00A7]4.2);
+the exit status is not affected
+.IP \(bu 2
+In-bailiwick NS targets (apex and delegations) must have an A/AAAA record in the
+zone (error); in-bailiwick MX and SRV targets without A/AAAA give a warning
+only, because no RFC requires an address for them. Records occluded by a
+delegation give warnings
+.IP \(bu 2
+Inconsistent TTLs within one RRset (warning); RRs with a location, time stamp or
+tag are not harmonized with RRs that every client sees, and an unrestricted and
+a restricted RR of one name and type with different TTLs are reported as such (a
+client that sees both gets an RRset with differing TTLs; the TTLs are kept)
+.IP \(bu 2
+SOA MNAME pointing to a CNAME (warning)
+.IP \(bu 2
+Meta-types (e.g. \fBOPT\fR, \fBTSIG\fR, \fBAXFR\fR) must not appear in zone data
+.IP \(bu 2
+PowerDNS ALIAS and LUA records (TYPE65401 / TYPE65402 of CLASS IN, see
+karidns(8) "POWERDNS ALIAS AND LUA RECORDS"): an ALIAS name that also owns an A
+or AAAA RRset, an ALIAS in a zone with DNSKEY, RRSIG, NSEC, NSEC3 or NSEC3PARAM
+records, and malformed ALIAS / LUA RDATA are errors (the server does not load
+such a zone); an \fB[INFO]\fR line counts the ALIAS records (A and AAAA at those
+names are NODATA unless an \fBalias\-resolver\fR is configured), and a warning
+says that LUA records are kept for transfers and never answered
+.IP \(bu 2
+The \fBcheck\-*\fR options of the zone's configuration set the severity of some
+of the findings above and add checks that report nothing without them
+(karidns(8) "BIND option values"): \fBcheck\-integrity\fR (the NS glue and the
+MX / SRV addresses; \fBno\fR skips them), \fBcheck\-mx\-cname\fR (an MX target
+that is a CNAME: error without the option), \fBcheck\-srv\-cname\fR (warning
+without the option), \fBcheck\-wildcard\fR (a \fB*\fR label that is not the
+first), \fBcheck\-dup\-records\fR (the same RR twice), \fBcheck\-mx\fR (an MX
+target that is an IP address) and \fBcheck\-names\fR (host names of A, AAAA and
+MX owners and of NS, MX, SRV and SOA MNAME targets). The size limits
+\fBmax\-records\fR, \fBmax\-records\-per\-type\fR, \fBmax\-types\-per\-name\fR
+and \fBmax\-zone\-ttl\fR (primary zones) are errors here because the server does
+not load such a zone. \fBkaricheck db\fR passes the options-level severities to
+\fBkaridns\-dbloader \-\-check \-\-zone\-checks\fR.
+.IP \(bu 2
+Every record must be serializable to wire format
+.IP \(bu 2
+A name with two different CNAME records, or two different DNAME records, is an
+error (\fBzone.pdns\-types\fR; BIND: "multiple RRs of singleton type"); the same
+RR twice, and records that tinydns locations or \fB$LOCATION\-TAG\fR /
+\fB$ECS\-SUBNET\-TAG\fR tags keep apart, are not
+.IP \(bu 2
+Zone file syntax that BIND also refuses: a \fB$\fR word that is not a directive,
+\fB$ORIGIN\fR without a name, a record line that starts with a blank before any
+record ("no current owner name"), a \fB\eDDD\fR escape above 255, \fB\e000\fR in
+a field that is not a TXT string, an entry of a \fB$LOCATION\-TAG\fR /
+\fB$ECS\-SUBNET\-TAG\fR definition that is not an address or CIDR; in tinydns
+data a TTL that is not decimal digits and more than 4096 \fB%\fR location lines
+.IP \(bu 2
+Catalog zones (\fBcatalog\-zone yes;\fR): \fBversion.<zone> TXT "2"\fR is
+required, and group TXT records without a member PTR record give warnings
+.RE
+.IP 3. 4
+\fBRecord Field Validation\fR:
+.RS 4
+.IP \(bu 2
+A/AAAA addresses; SRV, NAPTR, CAA (RFC 8659 tags and flags), SSHFP, HIP, WKS,
+GPOS, X25, ISDN, EUI48/EUI64, CSYNC, DSYNC and SVCB/HTTPS target fields
+.IP \(bu 2
+WKS: the protocol is a number (0-255) or \fBTCP\fR / \fBUDP\fR (any case), as
+the server reads it; a port is a number (0-65535) or a service name from the
+server's built-in table (RFC 1035 \[u00A7]3.4.2; the IANA names of the common
+ports, e.g. \fBsmtp\fR, \fBhttp\fR, \fBdomain\fR); any other port gives a
+warning, and the record is reported as an error because the server cannot load
+it
+.IP \(bu 2
+NSEC3PARAM at the apex: Flags other than 0 are an error (RFC 5155 \[u00A7]4.1.2:
+such an NSEC3PARAM MUST be ignored, and the server ignores it); a hash algorithm
+other than 1 (SHA-1), an iteration count other than 0 (RFC 9276 \[u00A7]3.1:
+MUST be 0) and a non-empty salt (RFC 9276 \[u00A7]3.1: SHOULD NOT) give
+warnings; more than 100 iterations are an error, and more than 150 (RFC 9276
+\[u00A7]3.2) are refused with \fBzone.pdns\-types\fR because the server does not
+load such a zone (a zone file, a transfer and a database or presigned zone are
+all held to this limit; BIND 9.20 only warns above 50 and loads the zone). A
+warning is also given when no NSEC3PARAM is usable, or when the one the server
+uses has no NSEC3 RRs
+.IP \(bu 2
+NSEC3 records are checked once per chain (RRs with the same hash algorithm,
+iterations and salt), not once per RR: hash algorithm, reserved flag bits,
+opt-out (RFC 9276 \[u00A7]3.1), iterations and salt as above, and a warning for
+a chain that matches no NSEC3PARAM with Flags 0 (the server does not use it)
+.RE
+.IP 4. 4
+\fBDNSSEC Algorithm & Digest Verification (RFC 8624 / RFC 8078)\fR:
+.RS 4
+.IP \(bu 2
+Evaluates DNSSEC algorithms in DNSKEY and RRSIG records against RFC 8624 status
+recommendations (e.g., flagging deprecated SHA-1 or MD5 algorithms)
+.IP \(bu 2
+Validates DS digest types (warning on deprecated digests) and, for the known
+types, the length of the DS / CDS digest (SHA-1 20, SHA-256 32, GOST 32, SHA-384
+48 octets: RFC 4034 \[u00A7]5.1.4, RFC 4509 \[u00A7]2, RFC 6605 \[u00A7]5; an
+error, as BIND refuses it); SSHFP fingerprints are checked the same way (SHA-1
+20, SHA-256 32 octets: RFC 4255 \[u00A7]3.1.2, RFC 6594 \[u00A7]5), in a zone
+file and in a tinydns \fB_\fR line
+.IP \(bu 2
+The algorithm numbers of the IANA registry are known: 17 (SM2SM3), 23
+(ECC-GOST12) and the private 252-254 draw no "unknown algorithm" warning; SSHFP
+algorithm 6 (Ed448, RFC 8709) is assigned; CAA \fBissuemail\fR (RFC 9495) and
+\fBissuevmc\fR are known tags
+.IP \(bu 2
+The address records that another delegation of the zone names as an NS target
+(sibling glue, RFC 9471) are not reported as occluded; BIND does not report them
+either
+.IP \(bu 2
+ML-DSA-44 (algorithm 18, draft-westerbaan-dnssec-mldsa): warns when a
+DNSKEY/CDNSKEY public key is not 1312 octets or an RRSIG signature is not 2420
+octets
+.IP \(bu 2
+Recognizes RFC 8078 CDS and CDNSKEY delete signals (Algorithm=0 / DigestType=0)
+without false-positive warnings
+.RE
+.IP 5. 4
+\fBRFC 8976 ZONEMD Message Digest Verification\fR:
+.RS 4
+.IP \(bu 2
+The ZONEMD serial must match the SOA serial, and ZONEMD should be at the zone
+apex.
+.IP \(bu 2
+ZONEMD records with scheme 1 (SIMPLE) and hash algorithm 1 (SHA-384) or 2
+(SHA-512) are verified by computing the zone digest of RFC 8976 \[u00A7]3.3: RRs
+in DNSSEC canonical form and order (RFC 4034 \[u00A7]6.2 and \[u00A7]6.3, with
+RFC 6840 \[u00A7]5.1: owner names and the domain names in the RDATA of the types
+listed there in lower case), duplicates digested once, occluded data and
+non-apex ZONEMD RRs included, the apex ZONEMD RRs and their RRSIG left
+out. Out-of-zone records are not part of the zone and therefore not part of the
+digest.
+.IP \(bu 2
+Other schemes and hash algorithms are reported as not verified
+(\fB[INFO]\fR). Two ZONEMD RRs with the same scheme and hash algorithm, and a
+digest whose length does not match the hash algorithm, are errors (RFC 8976
+\[u00A7]4).
+.IP \(bu 2
+Every ZONEMD with a supported scheme and hash algorithm must match. This is
+stricter than the RFC 8976 \[u00A7]4 verifier rule (one matching ZONEMD is
+enough): karicheck checks the zone before it is published, and a recipient may
+support only one of the hash algorithms.
+.IP \(bu 2
+The digest is verified even when the zone has other errors.
+.RE
+.PP
+Each zone check prints \fB[RESULT] Zone '<zone>': <n> error(s), <n>
+warning(s)\fR followed by \fB[OK]\fR or \fB[FAIL]\fR. The counts are the numbers
+of \fB[ERROR]\fR and \fB[WARNING]\fR lines printed for that zone, including the
+ZONEMD verification; \fB[INFO]\fR lines are not counted.
+.SS Database checks (karicheck db)
+\fBkaricheck db [view] [config_path]\fR reads the PowerDNS tables that
+\fBoptions { database { } }\fR names, \fBread only\fR, and reports what the
+server would refuse or what looks wrong, before the data goes live. It links no
+database library: it runs \fBkaridns\-dbloader \-\-check\fR (see
+\fBkaridns(8)\fR "Settings of database zones") once per database the views read,
+and prints what the loader finds in the style of \fBkaricheck zone\fR. The
+loader reads through the same driver calls and the same reader as the production
+load, so a zone that \fB\-\-check\fR accepts is a zone the loader sends, and the
+other way round. Nothing is written to the database (the connection is
+\fBquery_only\fR / \fBREAD ONLY\fR, no status row is written, no \fBLISTEN\fR).
+.PP
+\fB[view]\fR limits the output to the zones that view gets: those of its own
+database, or, for a view on the shared database, those
+\fBkaridns_domain_views\fR maps to it (or all, when a zone has no row). A single
+argument is a view unless it contains a \fB/\fR or ends in \fB.conf\fR, in which
+case it is the configuration file. \fBkaricheck conf\fR still does the checks
+that need no connection; \fBkaricheck db\fR assumes it was run. It needs a
+loader that can be executed and has the driver, and it checks the loader file
+the way \fBkaridns\fR does before it runs it (a regular file owned by root, or
+by the user who runs \fBkaricheck\fR when that is not root, and not writable by
+group or others; a violation is an error, as in \fBkaricheck conf\fR); if
+\fBloader\-path\fR does not exist, it says \fBDB support is not installed\fR
+(the package without \fBkaridns\-dbloader\fR).
+.PP
+\fBRights.\fR The check should see the database the way the loader of
+\fBkaridns\fR does:
+.IP \(bu 2
+run by \fBroot\fR, \fBkaricheck\fR drops to \fBloader\-user\fR /
+\fBloader\-group\fR before it executes the loader (it refuses to run the loader
+as root, so \fBloader\-user\fR must be set); so does \fBkaricheck conf\fR for
+\fB\-\-drivers\fR: the loader is never run as root, nor with a loader that
+failed the owner and mode checks; the child gets an empty environment, working
+directory \fB/\fR and no descriptor above 2;
+.IP \(bu 2
+run by \fBanother user\fR, it uses that user's rights.
+.PP
+The first \fB[INFO]\fR line of each database names the rights used. When the
+database file or the \fBconninfo\-file\fR cannot be used with them, the message
+names the file and the missing permission (\fBis not readable by the user ...:
+it needs read permission\fR, \fBhas no search (x) permission on the
+directory ...\fR, SQLite3: \fBis not writable by the user ...\fR because even a
+reader of a WAL database writes the \fB\-shm\fR file, and its directory or the
+\fB\-wal\fR / \fB\-shm\fR files must be writable), and no zone is read.
+.PP
+Every database gets a line \fB[RESULT] Database ...: N zone(s) read, E error(s),
+W warning(s)\fR followed by \fB[OK]\fR or \fB[FAIL]\fR, then one summary line. A
+zone the loader would refuse is reported with its first failing row, as the
+loader does (one bad row fails the zone): \fBzone 'example.test.' (domains.id
+3): records.id 41: ...\fR. Everything that came from the database is escaped
+before it is printed. The exit status is 1 when any error was found or the check
+could not be run, else 0 (warnings do not change it). With \fB\-\-json\fR each
+finding is a message of the document (code, place and zone), and the zones are
+the entries of \fBzones\fR (\fB"format": "database"\fR; \fBfile\fR is null).
+.PP
+.TS
+lbw(51) lb
+lw(51) l.
+\&Check	\&Level
+_
+\&\fBSchema\fR	\&
+T{
+a PowerDNS table or column the loader reads is missing (\fBdomains\fR,
+\fBrecords\fR, \fBdomainmetadata\fR, \fBcryptokeys\fR; all missing columns are
+named)
+T}	\&error
+T{
+none of the \fBkaridns_*\fR tables exists (a plain PowerDNS database), or one is
+missing or incomplete (what it costs is said: no change log, no view mapping, no
+profiles, no tags)
+T}	\&warning
+\&\fBkaridns_schema_version\fR is newer than 3 / has no row	\&error / warning
+T{
+\fBauto\-reload yes\fR and \fBkaridns_changes\fR is missing, or change log
+triggers are missing (named)
+T}	\&error
+T{
+PostgreSQL: \fBkaridns_changes\fR has no \fBxid\fR column (schema version 1: no
+change log)
+T}	\&warning
+T{
+PostgreSQL: the role cannot \fBSELECT\fR a table the loader reads, or
+\fBcryptokeys.domain_id\fR
+T}	\&error
+T{
+PostgreSQL: the role can read \fBcryptokeys.content\fR (the private keys)
+T}	\&warning
+T{
+PostgreSQL: the role cannot \fBINSERT\fR / \fBUPDATE\fR
+\fBkaridns_server_status\fR; only one of the multi-server tables exists;
+\fBserver\-id\fR is set but they are missing
+T}	\&warning
+\&the schema named by \fBdatabase\-schema\fR does not exist	\&error
+\&\fBEvery zone\fR	\&
+T{
+the reader's refusals, with \fBrecords.id\fR: a content the zone parser rejects,
+an unsupported type, an owner outside the zone, a name that is not a domain
+name, a prio that contradicts the content (MX / SRV), a TTL out of range, a row
+that is not safe as a line of text, no enabled apex SOA, a \fBSLAVE\fR /
+\fBCONSUMER\fR without usable \fBmasters\fR
+T}	\&error
+T{
+\fBALIAS\fR in a \fBPRESIGNED\fR zone, \fBENABLE\-LUA\-RECORDS=1\fR, malformed
+\fBALIAS\fR / \fBLUA\fR data
+T}	\&error
+T{
+\fBLUA\fR records (kept for transfers, never answered); \fBALIAS\fR records
+(\fB[INFO]\fR, NODATA unless an \fBalias\-resolver\fR is set)
+T}	\&warning / info
+T{
+records with a NULL \fBttl\fR (\fBdefault\-ttl\fR is used); a \fBprio\fR on a
+type other than MX / SRV; metadata that is ignored
+T}	\&warning
+\&the SOA serial is 0	\&warning
+T{
+every check of \fBkaricheck zone\fR on the zone (the very same code): missing NS
+at the apex, CNAME with other data, glue and delegation rules, inconsistent TTLs
+in an RRset, field ranges of SRV / NAPTR / CAA / SSHFP / HIP / WKS ..., DNSSEC
+algorithm and digest recommendations, NSEC3 and NSEC3PARAM rules, ZONEMD
+verification
+T}	\&as in \fBkaricheck zone\fR
+T{
+a \fBPRODUCER\fR zone: the catalog zone itself is not served yet (decision D9, a
+later 0.6.x release), but its member zones are (\fBits N member zones are
+served\fR); secondaries that take the catalog from KariDNS will not get
+it. Migrating from PowerDNS works; only the catalog zone is missing. Exit status
+0 when this is the only finding
+T}	\&warning
+T{
+\fBdomains.catalog\fR names a zone that is not a \fBPRODUCER\fR zone of the
+database
+T}	\&warning
+T{
+two \fBdomains\fR rows of one source whose names are equal ignoring case
+(\fBExample.test\fR and \fBexample.test\fR; both drivers; the message names both
+\fBdomains.id\fR): not supported, PowerDNS stores names in lower case, and a
+full read and a one-zone read (reload request, auto reload) may pick different
+rows
+T}	\&warning
+\&\fBKeys and presigned zones\fR	\&
+T{
+\fBcryptokeys\fR rows without \fBPRESIGNED=1\fR (PowerDNS would sign online,
+KariDNS serves signed data only)
+T}	\&error
+T{
+\fBNSEC3PARAM\fR metadata with a bad syntax; a presigned NSEC3 or NSEC chain
+that does not match the zone (a name without its \fBRRSIG(NSEC3)\fR owner, an
+\fBordername\fR that is not the hash, parameters outside RFC 5155 \[u00A7]10.3)
+T}	\&error
+\&NSEC3 iterations other than 0 (RFC 9276)	\&warning
+T{
+a presigned NSEC3 zone without an \fBRRSIG(NSEC3PARAM)\fR at the apex: the TTL
+of the rebuilt \fBNSEC3PARAM\fR is the SOA MINIMUM, because the TTL the signer
+used is unknown
+T}	\&warning
+\&\fBSettings (metadata and profiles)\fR	\&
+T{
+the settings text of a zone or of its profile (\fBkaridns_profiles\fR) does not
+parse in restricted mode, the profile is not defined
+T}	\&error
+T{
+the settings name a TSIG key that \fBkaridns.conf\fR does not define
+T}	\&error
+T{
+an \fBallow\-transfer\fR / \fBallow\-update\fR / \fBecs\-trusted\-resolvers\fR
+entry that lies outside \fBacl\-ceiling\fR, a key that \fBacl\-ceiling\fR does
+not list, or ACLs while no \fBacl\-ceiling\fR is configured (a database ACL
+refuses every client then)
+T}	\&warning
+T{
+\fBloader\-state\-file\fR (D1a step 7): the directory does not exist or cannot
+be written by the loader user (the loader writes \fB<file>.tmp\fR there and
+renames it), the file cannot be read by it
+T}	\&error
+T{
+\fBloader\-state\-file\fR that is not a valid hot list (empty, truncated, a bad
+count or checksum: the loader ignores it and the next list replaces it); a
+directory that everybody can write in; \fBloader\-state\-file\fR or
+\fBwarm\-before\-serve\fR without \fBmemory\-limit\fR (\fBkaricheck conf\fR)
+T}	\&warning
+\&\fBZones of \fBkaridns.conf\fB and views\fR	\&
+T{
+a zone of the same name in the view of the configuration hides the database
+zone: with \fBfile\fR / \fBtype master\fR (D-PRIO), \fBtype program\fR / \fBtype
+forward\fR (D-PROG)
+T}	\&warning
+T{
+a \fBkaridns_domain_views\fR row names a view that is not defined, or one that
+does not read the database through the shared source
+T}	\&warning
+\&a zone that only such rows map is served by no view	\&warning
+.TE
+.PP
+Examples (the paths are those of a test installation; \fBexample.test\fR and
+friends are test names):
+.PP
+.RS 2
+.nf
+$ karicheck db /usr/local/etc/karidns/karidns.conf
+[INFO] Loading config /usr/local/etc/karidns/karidns.conf...
+[INFO] Checking Database file '/usr/local/etc/karidns/zones.sqlite3' (the default view) with the rights of the user claude (uid 1002)
+[INFO] Database file '/usr/local/etc/karidns/zones.sqlite3': karidns_* schema version 2
+[WARNING] Database file '/usr/local/etc/karidns/zones.sqlite3': zone 'example.test.' (domains.id 1): records.id 4: 1 record(s) have a NULL ttl; default\-ttl 3600 used (first shown)
+[WARNING] Database file '/usr/local/etc/karidns/zones.sqlite3': zone 'example.test.' (domains.id 1): allow\-transfer entry '198.51.100.0/24' is outside acl\-ceiling; a client there is refused
+[ERROR] Database file '/usr/local/etc/karidns/zones.sqlite3': zone 'broken.test.' (domains.id 2): records.id 9: invalid IPv4 address literal in A record
+[WARNING] Database file '/usr/local/etc/karidns/zones.sqlite3': zone 'shadow.test.' (domains.id 3): D\-PRIO: the default view has a zone with this name in the configuration (file '/usr/local/etc/karidns/shadow.zone'); it hides the database zone
+[RESULT] Database file '/usr/local/etc/karidns/zones.sqlite3': 3 zone(s) read, 1 error(s), 3 warning(s)
+[FAIL] Database file '/usr/local/etc/karidns/zones.sqlite3' has errors.
+[INFO] Checked 1 database (3 zones). Errors: 1, warnings: 3
+.fi
+.RE
+.PP
+Run by root, the same check says \fBwith the rights of
+loader\-user 'karidns\-db' (karicheck was run by root and drops to it, as
+karidns does for the loader)\fR. A package without the loader, and a database
+file the user cannot read:
+.PP
+.RS 2
+.nf
+$ karicheck db /usr/local/etc/karidns/noloader.conf
+[ERROR] DB support is not installed: the database loader '/usr/local/etc/karidns/no\-such\-loader' does not exist (this installation has no karidns\-dbloader; install the karidns\-sqlite3, karidns\-postgresql or karidns\-db package, or set loader\-path)
+\&
+$ karicheck db /usr/local/etc/karidns/karidns.conf
+[ERROR] Database file '/usr/local/etc/karidns/zones.sqlite3': database file '/usr/local/etc/karidns/zones.sqlite3' is not readable by the user claude (uid 1002): it needs read permission (mode 0000, owner uid 1002, group gid 0)
+.fi
+.RE
+.SH JSON OUTPUT
+\fBkaricheck \-\-json <command> ...\fR runs the same checks as the text mode and
+writes one JSON document (RFC 8259, UTF-8) on standard output when the run is
+over. A caller that always parses standard output gets an answer for every run,
+a usage error included. Nothing else is written to standard output, and nothing
+to standard error unless the document itself cannot be written (then the status
+is 1 and a line says so).
+.PP
+.RS 2
+.nf
+{
+  "karicheck": 1,
+  "version": "0.6.2",
+  "command": "zone",
+  "result": "fail",
+  "counts": { "error": 1, "warning": 2, "checked": 1, "skipped": 0, "dropped": 0 },
+  "truncated": false,
+  "messages": [
+    { "severity": "error", "code": "zone.syntax", "text": "Syntax error in db/example.test.zone at line 12\enReason: invalid TTL", "file": "db/example.test.zone", "line": 12, "zone": "example.test.", "view": null }
+  ],
+  "zones": [
+    { "zone": "example.test.", "view": null, "file": "db/example.test.zone", "format": "bind", "result": "fail", "errors": 1, "warnings": 2 }
+  ]
+}
+.fi
+.RE
+.PP
+.TS
+lb lbw(41)
+l lw(41).
+\&Field	\&Meaning
+_
+\&\fBkaricheck\fR	T{
+The schema version, an integer. It is raised only when a field changes its
+meaning or goes away; a new field does not raise it. Read the fields you know
+and ignore the others.
+T}
+\&\fBversion\fR	\&The version of \fBkaricheck\fR.
+\&\fBcommand\fR	T{
+\fBconf\fR, \fBzones\fR, \fBzone\fR or \fBdb\fR (\fBimport\fR or \fBexport\fR
+for \fBkaridns\-zone\fR); \fBnull\fR when the command line named none that
+exists.
+T}
+\&\fBresult\fR	T{
+\fBok\fR (exit status 0), \fBfail\fR (1: problems found) or \fBusage\fR (2:
+usage error).
+T}
+\&\fBcounts.error\fR, \fBcounts.warning\fR	T{
+The messages of those severities, also the ones that did not fit into
+\fBmessages\fR.
+T}
+\&\fBcounts.checked\fR, \fBcounts.skipped\fR	T{
+Zones checked and zones skipped (a type that has no zone file); for \fBdb\fR,
+\fBchecked\fR is the number of zones read. 0 for \fBconf\fR.
+T}
+\&\fBcounts.dropped\fR, \fBtruncated\fR	T{
+At most 10000 messages and 100000 \fBzones\fR entries are kept; the rest is only
+counted. \fBdropped\fR is the number of messages left out, \fBtruncated\fR is
+true when anything was left out.
+T}
+\&\fBmessages[]\fR	T{
+Every finding in the order \fBkaricheck\fR found it.
+T}
+\&\fBmessages[].severity\fR	\&\fBerror\fR, \fBwarning\fR, \fBnote\fR or \fBinfo\fR.
+\&\fBmessages[].code\fR	T{
+The code of the problem (below); a string, in every message.
+T}
+\&\fBmessages[].text\fR	T{
+The text the text mode prints, without the \fB[ERROR]\fR tag and the final line
+feed. A continuation (\fBReason: ...\fR of a syntax error, the expected and
+computed digest of a ZONEMD mismatch) follows after a line feed. May hold any
+characters (it quotes names from the files).
+T}
+\&\fBmessages[].file\fR, \fB.line\fR	T{
+Where the problem is: the file (\fB<stdin>\fR for standard input), and the line
+(a positive integer) or \fBnull\fR when it is not known. For \fBdb\fR both are
+\fBnull\fR.
+T}
+\&\fBmessages[].zone\fR, \fB.view\fR	T{
+The zone (absolute name, as \fBkaricheck\fR shows it) and the view the message
+is about, or \fBnull\fR. The view of a configuration without \fBview { }\fR is
+\fB__default__\fR; \fBnull\fR when there is no view (a standalone zone file, a
+message about the configuration as a whole).
+T}
+\&\fBzones[]\fR	T{
+One entry per zone checked, in order: \fBzone\fR, \fBview\fR and \fBfile\fR
+(\fBnull\fR when unknown), \fBformat\fR (\fBbind\fR, \fBtinydns\fR or
+\fBdatabase\fR), \fBresult\fR (\fBok\fR or \fBfail\fR) and the numbers of
+\fBerrors\fR and \fBwarnings\fR found while it was checked.
+T}
+.TE
+.PP
+\fBkaridns\-zone \-\-json\fR (\fBkaridns\-zone(8)\fR) writes the same document:
+the first key is \fB"karidns\-zone": 1\fR instead of \fB"karicheck": 1\fR,
+\fBcommand\fR is \fBimport\fR or \fBexport\fR, \fBzones[]\fR has one entry per
+zone imported or exported (\fBfile\fR is the input or output file), and the
+codes are the \fBdb.import.*\fR, \fBdb.export.*\fR and \fBdb.zone.*\fR ones
+below (with \fBusage.*\fR, \fBio.*\fR, \fBconf.*\fR and \fBzone.*\fR).
+.PP
+All strings are valid JSON strings: \fB"\fR and \fB\e\fR are escaped, every
+control character (below U+0020, and U+007F) is written as \fB\eu00XX\fR, and a
+byte that is not part of valid UTF-8 (a zone file, a file name or the database
+can hold anything) is replaced by U+FFFD. A text longer than 4096 bytes is cut
+and ends with \fB...\fR.
+.PP
+\fBStability.\fR A code is never renamed and never used for another problem once
+released. A code that is no longer printed stays in the list, marked retired. A
+code names the problem, not the text: the same code may come with several texts
+(they carry the details), and the text of a message may change without its
+code. New codes may appear in any release; treat a code you do not know by its
+\fBseverity\fR. The codes of \fBkaridns\-dbloader\fR findings that carry none of
+their own are \fBdb.finding\fR.
+.PP
+Examples:
+.PP
+.RS 2
+.nf
+karicheck \-\-json zone example.test /etc/karidns/zones/example.test.zone
+karicheck \-\-json zone example.test \- < edited.zone
+karicheck \-\-json conf /usr/local/etc/karidns/karidns.conf
+karicheck \-\-json db /usr/local/etc/karidns/karidns.conf
+.fi
+.RE
+.SS Message codes
+Severity is the usual one of the code; a check whose severity the configuration
+sets (\fBcheck\-*\fR options) prints the severity in force.
+.PP
+<!-- BEGIN CODES (generated by tests/check_diag_codes.pl \-\-print-docs; do not
+edit) -->
+.TP 8
+\fBusage.command.missing\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR no command was given
+.TP 8
+\fBusage.command.unknown\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the command is not one the tool has (karicheck: conf, zones,
+zone, db; karidns-zone: import, export)
+.TP 8
+\fBusage.args\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a command got too few or too many arguments
+.TP 8
+\fBusage.option\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an option is unknown, lacks its value, has a value that is not
+valid, or cannot be used with another option
+.TP 8
+\fBio.open\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a file could not be opened
+.TP 8
+\fBio.not\-regular\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a path that must be a regular file is not one
+.TP 8
+\fBio.read\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a file could not be read
+.TP 8
+\fBio.stat\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a file could not be examined with stat
+.TP 8
+\fBio.stdin.read\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR reading standard input failed
+.TP 8
+\fBio.stdin.too\-large\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the zone text on standard input is larger than 64 MiB
+.TP 8
+\fBio.pipe\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a pipe for the database loader could not be created
+.TP 8
+\fBio.fork\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the database loader could not be started
+.TP 8
+\fBinternal.oom\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR out of memory
+.TP 8
+\fBconf.syntax\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a syntax error in a configuration statement
+.TP 8
+\fBconf.value.invalid\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the value of an option is not one the option accepts
+.TP 8
+\fBconf.value.range\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a numeric option is outside its range
+.TP 8
+\fBconf.warning\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an option is accepted but has no effect, or is written in a way
+KariDNS reads differently from BIND
+.TP 8
+\fBconf.acl.entry\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an entry of an ACL is not valid
+.TP 8
+\fBconf.acl.list\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an address match list cannot be resolved
+.TP 8
+\fBconf.acl.duplicate\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an acl is defined twice or has a built-in name
+.TP 8
+\fBconf.alias\-resolver\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an alias-resolver entry is not an IP address, or the list is too
+long
+.TP 8
+\fBconf.server.key\-unknown\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a server statement names a TSIG key that is not defined
+.TP 8
+\fBconf.key.view\-clash\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a key in a view has the name of a top-level key
+.TP 8
+\fBconf.key.duplicate\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a TSIG key is defined twice
+.TP 8
+\fBconf.view.key\-duplicate\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a TSIG key is defined twice in a view
+.TP 8
+\fBconf.option.bind\-unimplemented\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a BIND option that KariDNS does not implement is ignored
+.TP 8
+\fBconf.option.unknown\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an option that is neither a KariDNS option nor a BIND option for
+the statement
+.TP 8
+\fBconf.tsig.algorithm\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a TSIG algorithm that KariDNS does not support
+.TP 8
+\fBconf.tsig.secret\-length\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a TSIG secret is too long for its algorithm
+.TP 8
+\fBconf.tsig.secret\-base64\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a TSIG secret is not valid base64
+.TP 8
+\fBconf.tsig.secret\-placeholder\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a secret is still the placeholder of the sample configuration
+.TP 8
+\fBconf.tsig.secret\-placeholder\-used\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the secret of the control channel, or of a key that an ACL or an
+update-policy rule uses, is the placeholder of the sample configuration
+.TP 8
+\fBconf.zone.name\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a zone name is not valid (bad escape, empty label, or too long)
+.TP 8
+\fBconf.zone.duplicate\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a zone is defined twice
+.TP 8
+\fBconf.zone.type\-resolver\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a BIND zone type for resolvers is not loaded
+.TP 8
+\fBconf.zone.type\-unknown\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an unknown zone type
+.TP 8
+\fBconf.zone.file\-format\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR file-format is neither bind nor tinydns
+.TP 8
+\fBconf.zone.update\-on\-secondary\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR allow-update on a secondary zone is refused at run time
+.TP 8
+\fBconf.zone.tsig\-key\-undefined\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the tsig-key of a zone is not defined
+.TP 8
+\fBconf.zone.transfer\-key\-undefined\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an allow-transfer key of a zone is not defined
+.TP 8
+\fBconf.database\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an error in options { database { } } or in the database options
+of a view
+.TP 8
+\fBconf.notify\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an error in also-notify or in a remote-servers list
+.TP 8
+\fBconf.xfr\-source.limit\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR more distinct transfer or NOTIFY source addresses than KariDNS
+can bind
+.TP 8
+\fBconf.directory.changed\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR options { directory } differs from the directory the running
+server uses
+.TP 8
+\fBconf.cookie.secret\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR cookie-secret is not 32 hexadecimal digits
+.TP 8
+\fBconf.cookie.secret\-count\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR more cookie-secret entries than the limit
+.TP 8
+\fBconf.cookie.algorithm\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a cookie-algorithm other than siphash24
+.TP 8
+\fBconf.query\-log.max\-qps\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR query-log-max-qps is not valid
+.TP 8
+\fBconf.query\-log.buffer\-size\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR query-log-buffer-size is not a power of 2 in range
+.TP 8
+\fBconf.minimal\-any\-ttl\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR minimal-any-ttl is not a non-negative integer
+.TP 8
+\fBconf.wire\-cache.max\-records\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR wire-cache-max-records is not a non-negative integer
+.TP 8
+\fBconf.control\-channel.placement\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR control-channel is written inside options { }
+.TP 8
+\fBconf.control\-channel.option\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an unknown option in control-channel { }
+.TP 8
+\fBconf.view.name\-length\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a view name is too long
+.TP 8
+\fBconf.view.duplicate\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a view is defined twice
+.TP 8
+\fBconf.loading\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR the configuration file that is being checked
+.TP 8
+\fBconf.parse\-failed\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the configuration file could not be parsed (the reason is in the
+messages before it)
+.TP 8
+\fBconf.listen\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR the addresses the server listens on
+.TP 8
+\fBconf.xfr\-source.list\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR the transfer and NOTIFY source addresses
+.TP 8
+\fBconf.startup\-notify\-rate\fR
+\fISeverity:\fR note
+.br
+\fIMeaning:\fR startup-notify-rate is accepted but has no effect
+.TP 8
+\fBconf.transfers\-in\-zero\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR transfers-in 0: no zone is transferred in
+.TP 8
+\fBconf.transfers\-out\-zero\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR transfers-out 0: every zone transfer request is refused
+.TP 8
+\fBconf.transfers\-per\-ns\-zero\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR transfers-per-ns 0: no zone is transferred in
+.TP 8
+\fBconf.view.servers\-override\fR
+\fISeverity:\fR note
+.br
+\fIMeaning:\fR a view with its own server statements does not use the top-level
+ones
+.TP 8
+\fBconf.zone.secondary\-options\-on\-primary\fR
+\fISeverity:\fR note
+.br
+\fIMeaning:\fR refresh and inbound-transfer options have no effect in a primary
+zone
+.TP 8
+\fBconf.zone.multi\-master\fR
+\fISeverity:\fR note
+.br
+\fIMeaning:\fR multi-master has no effect with fewer than two primaries
+.TP 8
+\fBconf.zone.refresh\-range\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR min-refresh-time is larger than max-refresh-time
+.TP 8
+\fBconf.zone.retry\-range\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR min-retry-time is larger than max-retry-time
+.TP 8
+\fBconf.control\-key.tsig\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a control-channel key is also used for TSIG
+.TP 8
+\fBconf.directory.access\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR options { directory } cannot be accessed
+.TP 8
+\fBconf.directory.not\-dir\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR options { directory } is not a directory
+.TP 8
+\fBconf.directory.relative\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR options { directory } is a relative path
+.TP 8
+\fBconf.acl.transfer\-match\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR transfer-acl-match has no effect
+.TP 8
+\fBconf.acl.transfer\-order\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR allow-transfer with addresses and keys is evaluated in BIND's
+first-match order
+.TP 8
+\fBconf.acl.update\-match\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR update-acl-match has no effect
+.TP 8
+\fBconf.acl.update\-order\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR allow-update with keys and negated entries is evaluated in BIND's
+first-match order
+.TP 8
+\fBconf.zone.program\-path\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the program of a program zone is not an absolute path
+.TP 8
+\fBconf.zone.program\-exec\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the program of a program zone is not executable
+.TP 8
+\fBconf.zone.program\-user\-root\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR program-user is root by another name
+.TP 8
+\fBconf.zone.program\-user\-differs\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR program-user differs from options user
+.TP 8
+\fBconf.zone.program\-args\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR program-args has more entries than supported
+.TP 8
+\fBconf.zone.program\-count\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR more zones of type program than supported (256)
+.TP 8
+\fBconf.zone.program\-missing\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a program zone has no program path
+.TP 8
+\fBconf.zone.forward\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR type forward keeps its KariDNS meaning, which differs from BIND
+.TP 8
+\fBconf.zone.forward\-missing\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a forward zone has no forwarders
+.TP 8
+\fBconf.zone.forward\-loop\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a forwarder points at this server itself
+.TP 8
+\fBconf.program\-zones.disabled\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR program zones are configured but allow-program-zones is not
+enabled
+.TP 8
+\fBconf.tag.cidr\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a CIDR in ecs-tags or location-tags is not valid
+.TP 8
+\fBconf.ecs.disabled\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR ecs-tags are defined but ecs-enable is not set
+.TP 8
+\fBconf.identity.root\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR options user or group is root by another name
+.TP 8
+\fBconf.database.no\-driver\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR options { database { } } has no driver
+.TP 8
+\fBconf.database.loader\-user\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the loader-user does not exist
+.TP 8
+\fBconf.database.loader\-user\-missing\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR no loader-user is set
+.TP 8
+\fBconf.database.loader\-group\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the loader-group does not exist
+.TP 8
+\fBconf.database.identity\-root\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR loader-user or loader-group is root by another name
+.TP 8
+\fBconf.database.loader\-file\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the loader file fails the ownership, mode or execute checks
+.TP 8
+\fBconf.database.loader\-answer\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the loader did not answer \-\-drivers
+.TP 8
+\fBconf.database.driver\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the loader was not built with the configured driver
+.TP 8
+\fBconf.database.drivers\-not\-run\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR \-\-drivers was not run because karicheck is run by root
+.TP 8
+\fBconf.database.state\-file\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR loader-state-file has no effect without memory-limit
+.TP 8
+\fBconf.database.warm\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR warm-before-serve has no effect without memory-limit
+.TP 8
+\fBconf.database.acl\-ceiling\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR no acl-ceiling: the ACLs of database zones refuse every client
+.TP 8
+\fBconf.database.acl\-ceiling\-match\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR acl-ceiling-match all has no effect with one kind of entry
+.TP 8
+\fBconf.database.file\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the SQLite3 database file does not exist
+.TP 8
+\fBconf.database.file\-type\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the SQLite3 database file is not a regular file
+.TP 8
+\fBconf.database.file\-readable\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the SQLite3 database file is readable by everyone
+.TP 8
+\fBconf.database.dir\-writable\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the directory of the SQLite3 database file is writable by
+everyone
+.TP 8
+\fBconf.database.file\-unreadable\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the SQLite3 database file cannot be read to check its journal
+mode
+.TP 8
+\fBconf.database.file\-empty\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the SQLite3 database file is empty
+.TP 8
+\fBconf.database.file\-format\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the file is not an SQLite3 database
+.TP 8
+\fBconf.database.wal\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the SQLite3 database is not in WAL mode
+.TP 8
+\fBconf.database.conninfo\-file\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the conninfo-file cannot be examined
+.TP 8
+\fBconf.database.conninfo\-mode\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the conninfo-file mode is not 0600 or 0400
+.TP 8
+\fBconf.database.conninfo\-owner\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the conninfo-file does not belong to the loader user
+.TP 8
+\fBconf.database.conninfo\-tls\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the connection has neither a UNIX socket host nor
+sslmode=verify-full
+.TP 8
+\fBconf.database.server\-id\-sqlite\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR server-id is ignored with sqlite3
+.TP 8
+\fBconf.database.server\-id\-chars\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR server-id has characters other than letters, digits and . - _ :
+.TP 8
+\fBconf.database.server\-id\-host\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR server-id is not set and the host name does not fit
+.TP 8
+\fBconf.alerts.option\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an unknown statement in alerts { }, or interval /
+reload-failures-above in the alerts { } of a zone
+.TP 8
+\fBconf.alerts.range\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an alerts { } value is not a number, is negative, is above 100
+for servfail-ratio-above, or is outside 10..3600 for interval
+.TP 8
+\fBconf.alerts.empty\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an alerts { } block sets no limit, so nothing is checked
+.TP 8
+\fBconf.database.alias\-resolver\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an alias-resolver with server-id: servers sharing a database can
+answer ALIAS names differently
+.TP 8
+\fBzone.not\-found\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the zone is not in the configuration
+.TP 8
+\fBzone.skipped\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR a zone without a zone file is not checked
+.TP 8
+\fBzone.summary\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR the number of zones checked and skipped, and the errors
+.TP 8
+\fBzone.syntax\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a syntax error in the zone file or a record that the zone parser
+or a zone validation refuses
+.TP 8
+\fBzone.include\-stdin\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR $INCLUDE is refused in a zone read from standard input
+.TP 8
+\fBzone.empty\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the zone has no records
+.TP 8
+\fBzone.out\-of\-zone\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a record outside the zone is ignored
+.TP 8
+\fBzone.tinydns.out\-of\-zone\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR tinydns records that belong to no zone of the view are ignored
+.TP 8
+\fBzone.tinydns.skipped\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR tinydns lines with data that cannot be kept are left out
+.TP 8
+\fBzone.ttl.missing\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR records have no TTL and no $TTL
+.TP 8
+\fBzone.string.long\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a character-string of more than 255 octets
+.TP 8
+\fBzone.limits\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the zone breaks a size limit of the configuration
+.TP 8
+\fBzone.pdns\-types\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR records the server does not accept: bad ALIAS or LUA, a second
+CNAME / DNAME / RESINFO at a name, NSEC3 iterations above 150
+.TP 8
+\fBzone.program\-skipped\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR a program zone has no zone file to validate
+.TP 8
+\fBzone.dnssec.algorithm\-deprecated\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a DNSSEC algorithm that RFC 8624 forbids or does not recommend
+.TP 8
+\fBzone.dnssec.algorithm\-unknown\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an unknown DNSSEC algorithm number
+.TP 8
+\fBzone.dnssec.key\-base64\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a DNSSEC key or signature is not valid base64
+.TP 8
+\fBzone.dnssec.mldsa\-length\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an ML-DSA key or signature has the wrong length
+.TP 8
+\fBzone.ds.digest\-null\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR DS digest type 0 outside of the CDS delete signal
+.TP 8
+\fBzone.ds.digest\-deprecated\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a DS digest type that is deprecated
+.TP 8
+\fBzone.ds.digest\-unknown\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an unknown DS digest type
+.TP 8
+\fBzone.ds.digest\-length\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a DS or CDS digest whose length does not fit its digest type
+.TP 8
+\fBzone.cds.delete\-content\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a CDS or CDNSKEY delete signal whose content is not the one RFC
+8078 section 4 gives
+.TP 8
+\fBzone.dnskey.protocol\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a DNSKEY or CDNSKEY whose protocol field is not 3
+.TP 8
+\fBzone.zonemd.scheme\-invalid\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the ZONEMD scheme is not a number from 0 to 255
+.TP 8
+\fBzone.zonemd.hash\-invalid\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the ZONEMD hash algorithm is not a number from 0 to 255
+.TP 8
+\fBzone.zonemd.canonical\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a record cannot be put in canonical form, so the ZONEMD digest is
+not computed
+.TP 8
+\fBzone.zonemd.serial\-mismatch\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the ZONEMD serial differs from the SOA serial
+.TP 8
+\fBzone.zonemd.unsupported\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR a ZONEMD with an unsupported scheme or hash algorithm is not
+verified
+.TP 8
+\fBzone.zonemd.duplicate\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR more than one ZONEMD with the same scheme and hash algorithm
+.TP 8
+\fBzone.zonemd.digest\-length\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the ZONEMD digest has the wrong length
+.TP 8
+\fBzone.zonemd.compute\-failed\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the ZONEMD digest could not be computed
+.TP 8
+\fBzone.zonemd.mismatch\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the ZONEMD digest does not match the zone
+.TP 8
+\fBzone.zonemd.not\-apex\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a ZONEMD record is not at the zone apex
+.TP 8
+\fBzone.zonemd.fields\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a ZONEMD record has fewer than four fields
+.TP 8
+\fBzone.glue.missing\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an in-bailiwick NS target has no A or AAAA record
+.TP 8
+\fBzone.target.no\-address\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an in-bailiwick MX, SRV or similar target has no A or AAAA record
+.TP 8
+\fBzone.cname.coexists\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a CNAME shares its name with other record types
+.TP 8
+\fBzone.cname.coexists\-other\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a CNAME co-exists with other records (RFC 1912)
+.TP 8
+\fBzone.record.occluded\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a record is hidden by a delegation above it
+.TP 8
+\fBzone.cut.data\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a record other than NS, DS, DNSSEC or address data at a
+delegation point
+.TP 8
+\fBzone.cname.target\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an NS or MX record points to a CNAME
+.TP 8
+\fBzone.srv.cname\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an SRV record points to a CNAME
+.TP 8
+\fBzone.cname.loop\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a CNAME points to itself
+.TP 8
+\fBzone.cname.chain\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a CNAME points to another CNAME
+.TP 8
+\fBzone.wildcard.non\-terminal\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an owner name contains a wildcard that is not the leftmost label
+.TP 8
+\fBzone.dup\-records\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an RRset has duplicate records
+.TP 8
+\fBzone.mx.address\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an MX target is an IP address
+.TP 8
+\fBzone.names.owner\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an owner name is not a valid host name (check-names)
+.TP 8
+\fBzone.names.target\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a name in record data is not a valid host name (check-names)
+.TP 8
+\fBzone.nsec3param.not\-apex\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an NSEC3PARAM is not at the zone apex
+.TP 8
+\fBzone.nsec3param.hash\-algorithm\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an NSEC3PARAM with a hash algorithm other than 1
+.TP 8
+\fBzone.nsec3param.flags\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an NSEC3PARAM with Flags other than 0
+.TP 8
+\fBzone.nsec3param.iterations\-high\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR NSEC3PARAM iterations that are excessively high
+.TP 8
+\fBzone.nsec3param.iterations\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR NSEC3PARAM iterations other than 0 (RFC 9276)
+.TP 8
+\fBzone.nsec3param.salt\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an NSEC3PARAM that uses a salt (RFC 9276)
+.TP 8
+\fBzone.nsec3param.unusable\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR no NSEC3PARAM of the zone is usable
+.TP 8
+\fBzone.nsec3.chain\-missing\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR no NSEC3 records with the parameters of the NSEC3PARAM
+.TP 8
+\fBzone.nsec3.hash\-algorithm\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an NSEC3 chain with a hash algorithm other than 1
+.TP 8
+\fBzone.nsec3.flags\-reserved\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR NSEC3 records with reserved Flags bits set
+.TP 8
+\fBzone.nsec3.opt\-out\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR NSEC3 opt-out is set
+.TP 8
+\fBzone.nsec3.iterations\-high\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR NSEC3 iterations that are excessively high
+.TP 8
+\fBzone.nsec3.iterations\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR NSEC3 iterations other than 0 (RFC 9276)
+.TP 8
+\fBzone.nsec3.salt\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an NSEC3 chain that uses a salt (RFC 9276)
+.TP 8
+\fBzone.nsec3.chain\-orphan\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an NSEC3 chain that matches no usable NSEC3PARAM
+.TP 8
+\fBzone.ttl.inconsistent\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the records of an RRset have different TTLs (RFC 2181 section
+5.2)
+.TP 8
+\fBzone.ttl.inconsistent\-visibility\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR restricted and unrestricted records of an RRset have different
+TTLs
+.TP 8
+\fBzone.alias.present\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR the zone has ALIAS records
+.TP 8
+\fBzone.lua.present\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the zone has LUA records, which are never executed
+.TP 8
+\fBzone.location.prefix\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a tinydns location prefix longer than /32
+.TP 8
+\fBzone.location.duplicate\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a tinydns location code is defined twice
+.TP 8
+\fBzone.location.tag\-undefined\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a record names a location tag that is not defined
+.TP 8
+\fBzone.ecs.tag\-undefined\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a record names an ECS subnet tag that is not defined
+.TP 8
+\fBzone.tinydns.ipv6\-hex\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a tinydns line needs a 32-character hexadecimal IPv6 address
+.TP 8
+\fBzone.tinydns.ip6int\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR a tinydns type 6 line generates a PTR in the deprecated ip6.int
+.TP 8
+\fBzone.a.fields\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an A record without exactly one field
+.TP 8
+\fBzone.a.address\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an A record with an invalid IPv4 address
+.TP 8
+\fBzone.aaaa.fields\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an AAAA record without exactly one field
+.TP 8
+\fBzone.aaaa.address\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an AAAA record with an invalid IPv6 address
+.TP 8
+\fBzone.csync.type\-unknown\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a CSYNC record names an unknown type
+.TP 8
+\fBzone.svcb.target\-dot\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an SVCB or HTTPS TargetName does not end with a dot
+.TP 8
+\fBzone.hip.fields\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a HIP record has fewer than three fields
+.TP 8
+\fBzone.hip.key\-base64\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the public key of a HIP record is not valid base64
+.TP 8
+\fBzone.wks.protocol\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the protocol of a WKS record is neither a number nor TCP or UDP
+.TP 8
+\fBzone.wks.port\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a port of a WKS record is neither a number nor a known service
+.TP 8
+\fBzone.gpos.fields\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a GPOS record does not have exactly three fields
+.TP 8
+\fBzone.x25.fields\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an X25 record has no field
+.TP 8
+\fBzone.isdn.fields\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an ISDN record does not have one or two fields
+.TP 8
+\fBzone.eui48\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an EUI48 record is not six octets
+.TP 8
+\fBzone.eui64\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an EUI64 record is not eight octets
+.TP 8
+\fBzone.srv.fields\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an SRV record without four fields
+.TP 8
+\fBzone.srv.priority\-range\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the priority of an SRV record is out of range
+.TP 8
+\fBzone.srv.weight\-range\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the weight of an SRV record is out of range
+.TP 8
+\fBzone.srv.port\-range\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the port of an SRV record is out of range
+.TP 8
+\fBzone.naptr.fields\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a NAPTR record without six fields
+.TP 8
+\fBzone.naptr.order\-range\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the order of a NAPTR record is out of range
+.TP 8
+\fBzone.naptr.preference\-range\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the preference of a NAPTR record is out of range
+.TP 8
+\fBzone.naptr.flags\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the flags of a NAPTR record are not alphanumeric
+.TP 8
+\fBzone.naptr.regexp\-replacement\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a NAPTR record sets both a regexp and a replacement
+.TP 8
+\fBzone.caa.fields\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a CAA record without three fields
+.TP 8
+\fBzone.caa.flags\-range\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the flags of a CAA record are out of range
+.TP 8
+\fBzone.caa.flags\-undefined\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a CAA record sets undefined flag bits
+.TP 8
+\fBzone.caa.tag\-syntax\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a CAA tag does not match the RFC 8659 syntax
+.TP 8
+\fBzone.caa.tag\-critical\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an unknown CAA tag with the critical flag set
+.TP 8
+\fBzone.caa.tag\-unknown\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an unrecognized CAA tag
+.TP 8
+\fBzone.sshfp.fields\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an SSHFP record without three fields
+.TP 8
+\fBzone.sshfp.algorithm\-range\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the algorithm of an SSHFP record is out of range
+.TP 8
+\fBzone.sshfp.algorithm\-unassigned\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an SSHFP algorithm that is not assigned
+.TP 8
+\fBzone.sshfp.fptype\-range\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the fingerprint type of an SSHFP record is out of range
+.TP 8
+\fBzone.sshfp.fptype\-unassigned\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an SSHFP fingerprint type that is not assigned
+.TP 8
+\fBzone.sshfp.fingerprint\-hex\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the fingerprint of an SSHFP record is not hexadecimal
+.TP 8
+\fBzone.sshfp.fingerprint\-length\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the fingerprint of an SSHFP record does not have the length of
+its fingerprint type
+.TP 8
+\fBzone.soa.mname\-cname\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the SOA MNAME points to a CNAME
+.TP 8
+\fBzone.meta\-type\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a meta-type appears as a standalone RRset
+.TP 8
+\fBzone.dsync.type\-unknown\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a DSYNC record names an unknown RR type
+.TP 8
+\fBzone.record.wire\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a record cannot be serialized to wire format
+.TP 8
+\fBzone.soa.missing\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the zone has no SOA record at the apex
+.TP 8
+\fBzone.soa.multiple\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR more than one SOA record that every client sees
+.TP 8
+\fBzone.soa.invalid\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the SOA records of the zone are not valid
+.TP 8
+\fBzone.soa.location\-undefined\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the SOA record is restricted to a location the zone does not
+define
+.TP 8
+\fBzone.soa.expired\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the SOA record has expired
+.TP 8
+\fBzone.ns.missing\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the zone has no NS record at the apex
+.TP 8
+\fBzone.catalog.version\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a catalog zone lacks its version TXT record
+.TP 8
+\fBzone.catalog.name\-too\-long\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a name in a catalog zone is too long to check
+.TP 8
+\fBzone.catalog.orphan\-group\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a group TXT record of a catalog zone has no member PTR record
+.TP 8
+\fBzone.catalog.member\-ptrs\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a member node of a catalog zone has more than one PTR record
+.TP 8
+\fBzone.catalog.member\-duplicate\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR two member nodes of a catalog zone name the same zone
+.TP 8
+\fBdb.finding\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a finding of karidns-dbloader \-\-check that carries no code of
+its own (the severity is the message's)
+.TP 8
+\fBdb.checking\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR the database that is being checked
+.TP 8
+\fBdb.summary\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR the number of databases and zones checked
+.TP 8
+\fBdb.disabled\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the configuration has no database block
+.TP 8
+\fBdb.loader\-missing\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the database loader is not installed
+.TP 8
+\fBdb.view\-not\-found\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the view named on the command line is not defined
+.TP 8
+\fBdb.view\-none\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the view takes no zones from the database
+.TP 8
+\fBdb.nothing\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR no view reads a database
+.TP 8
+\fBdb.identity.no\-loader\-user\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR run by root without a loader-user, so there are no rights to
+check with
+.TP 8
+\fBdb.identity.root\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR loader-user or loader-group is root by another name
+.TP 8
+\fBdb.identity.user\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the loader-user does not exist
+.TP 8
+\fBdb.identity.group\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the loader-group does not exist
+.TP 8
+\fBdb.loader.line\-too\-long\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the loader wrote a line that is too long
+.TP 8
+\fBdb.loader.failed\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the loader did not finish its check
+.TP 8
+\fBdb.loader.protocol\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the loader printed lines that are not part of its protocol
+.TP 8
+\fBdb.protocol.zone\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a zone line of the loader does not decode
+.TP 8
+\fBdb.protocol.settings\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a settings line of the loader does not decode
+.TP 8
+\fBdb.view.undefined\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR karidns_domain_views names a view that is not defined
+.TP 8
+\fBdb.view.not\-shared\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR karidns_domain_views names a view that does not read the shared
+source
+.TP 8
+\fBdb.view.unserved\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR karidns_domain_views maps the zone only to views that do not read
+it
+.TP 8
+\fBdb.zone.shadowed\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a zone of the configuration hides the database zone
+.TP 8
+\fBdb.zone.shadowed\-program\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a program or forward zone of the configuration hides the database
+zone
+.TP 8
+\fBdb.settings.ceiling\-entry\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an ACL entry of the settings is outside acl-ceiling
+.TP 8
+\fBdb.settings.ceiling\-key\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a key of the settings is not listed in acl-ceiling
+.TP 8
+\fBdb.settings.ceiling\-missing\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the settings have ACL entries but acl-ceiling is not configured
+.TP 8
+\fBdb.settings.profile\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the settings text of a profile does not parse
+.TP 8
+\fBdb.settings.zone\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the settings of a zone do not parse
+.TP 8
+\fBdb.settings.combined\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the settings of a profile and of its zone together do not parse
+.TP 8
+\fBdb.settings.key\-undefined\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the settings name a TSIG key that is not defined
+.TP 8
+\fBdb.import.open\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the database could not be opened for writing
+.TP 8
+\fBdb.import.schema\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the database lacks a table or a column the import needs
+.TP 8
+\fBdb.import.option\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an import option is not valid: a zone type, a view name or a
+record type of the types filter
+.TP 8
+\fBdb.import.zone\-name\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the zone name is not valid, or the zone is not in the tinydns
+data file
+.TP 8
+\fBdb.import.rows\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the zone cannot be written as rows of the PowerDNS schema
+.TP 8
+\fBdb.import.serial\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the SOA serial of the file does not grow past the serial in the
+database (RFC 1982)
+.TP 8
+\fBdb.import.checks\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the zone checks found errors; nothing was written
+.TP 8
+\fBdb.import.strict\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the zone checks printed warnings and strict mode is on
+.TP 8
+\fBdb.import.busy\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR another import holds the zone or the database; nothing was
+written
+.TP 8
+\fBdb.import.write\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a database write failed; the transaction was rolled back and
+nothing was written
+.TP 8
+\fBdb.import.keys\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the zone has cryptokeys but the imported data is not presigned,
+so the loader refuses the zone
+.TP 8
+\fBdb.import.file\-zone\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the zone is also a file zone of the configuration, and the file
+zone is served
+.TP 8
+\fBdb.import.no\-reload\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a reload request was asked for but the database has no
+karidns_reload_requests table
+.TP 8
+\fBdb.import.dry\-run\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR a dry run: everything but the commit was done, and nothing was
+written
+.TP 8
+\fBdb.import.verify\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the zone read back from the transaction is not one the loader
+would load; the transaction was rolled back
+.TP 8
+\fBdb.import.not\-primary\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the zone in the database is not a primary zone, so the records
+written were not checked
+.TP 8
+\fBdb.import.done\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR a zone was imported, with the number of RRsets added, replaced
+and deleted
+.TP 8
+\fBdb.import.summary\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR the end of an import of several zones: how many were imported and
+how many failed
+.TP 8
+\fBdb.import.change\fR
+\fISeverity:\fR note
+.br
+\fIMeaning:\fR an RRset the import adds, replaces or deletes (listed for
+\-\-dry-run and \-\-verbose)
+.TP 8
+\fBdb.import.changed\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the zone changed under the tool (import \-\-signer: it is not the
+zone the file was made from; apply: not at \-\-expect-generation); nothing was
+written (exit 3)
+.TP 8
+\fBdb.apply.changes\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR apply: the change file is not valid: a line, an owner, a type, a
+TTL or an RDATA a change file does not take
+.TP 8
+\fBdb.apply.zone\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR apply: the zone is not there (or is there, with \-\-create), is
+not a primary zone, or the change would take its SOA away
+.TP 8
+\fBdb.render.input\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR render: the records on standard input are not lines of the form
+owner TAB type TAB prio TAB content, or there are too many
+.TP 8
+\fBdb.import.signer\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR import \-\-signer cannot take this file or zone: the file is not
+a signed zone, or the zone is not a primary zone of the database; nothing was
+written
+.TP 8
+\fBdb.import.signer\-zone\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR the zone is signed by karidns-signer: the import kept its DNSSEC
+records and signer metadata, and the zone is served again after the next signing
+.TP 8
+\fBdb.export.open\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the database could not be opened
+.TP 8
+\fBdb.export.not\-found\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the zone is not in the database, or not in the view asked for
+.TP 8
+\fBdb.export.zone\-type\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the zone is not a primary zone: its records are not what the
+server serves
+.TP 8
+\fBdb.export.read\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the rows of the zone could not be read
+.TP 8
+\fBdb.export.zone\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the rows of the zone do not make a zone the server would load
+.TP 8
+\fBdb.export.write\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the zone could not be written as text
+.TP 8
+\fBdb.export.warning\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the reader of the database zone printed a warning about the rows
+it exports
+.TP 8
+\fBdb.export.done\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR a zone was exported to a file, or every zone to a directory
+.TP 8
+\fBdb.zone.no\-source\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR no database was named: no \-\-sqlite3 or \-\-conninfo-file, and
+no configuration with options { database { } }
+.TP 8
+\fBdb.zone.driver\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR the database driver is not one this build of karidns-zone has
+.TP 8
+\fBdb.zone.output\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an output file or directory could not be used, created, written
+or renamed
+.TP 8
+\fBdb.zone.output\-exists\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR an output file exists and \-\-force was not given
+.PP
+<!-- END CODES -->
+.SH EXIT STATUS
+.TP 8
+\fB0\fR
+All checked configuration files and zone files are valid. Warnings do not change
+the exit status. \fB\-h\fR and \fB\-\-help\fR print the usage text to standard
+output and also exit with 0 (as \fBkarictl\fR and \fBkaridns\-dbloader\fR do).
+.TP 8
+\fB1\fR
+Problems found: unreadable file, syntax error, validation error, or ZONEMD
+digest mismatch detected. \fBdb\fR: an error in the database or its data, a
+database that cannot be read with the rights of the loader, or a loader that is
+not installed (\fBDB support is not installed\fR).
+.TP 8
+\fB2\fR
+Usage error (a missing or unknown command, missing or too many arguments; the
+usage text goes to standard error). Nothing was checked. Before this release a
+usage error exited with 1. With \fB\-\-json\fR the document holds the usage
+error (\fBusage.*\fR) and nothing is written to standard error.
+.SH EXAMPLES
+.SS Check Configuration File Syntax
+.RS 2
+.nf
+karicheck conf /usr/local/etc/karidns/karidns.conf
+.fi
+.RE
+.SS Validate All Zones Declared in Configuration
+.RS 2
+.nf
+karicheck zones /usr/local/etc/karidns/karidns.conf
+.fi
+.RE
+.SS Validate a Zone Using Its Configuration
+.RS 2
+.nf
+karicheck zone example.com /usr/local/etc/karidns/karidns.conf
+.fi
+.RE
+.SS Validate a Specific Master Zone Standalone
+.RS 2
+.nf
+karicheck zone example.com master/example.com.zone
+.fi
+.RE
+.SS Check the Zones of a Database
+.RS 2
+.nf
+karicheck db /usr/local/etc/karidns/karidns.conf
+karicheck db internal /usr/local/etc/karidns/karidns.conf
+.fi
+.RE
+.SH SEE ALSO
+.IP \(bu 2
+\fBkaridns(8)\fR \[u2014] KariDNS authoritative DNS server daemon
+.IP \(bu 2
+\fBkarictl(8)\fR \[u2014] KariDNS server management and control utility
+.IP \(bu 2
+\fBkaridns\-dbloader(8)\fR \[u2014] The database loader that \fBkaricheck db\fR
+runs with \fB\-\-check\fR
+.IP \(bu 2
+\fBdag(1)\fR \[u2014] DNS anomaly generator and test client
+.IP \(bu 2
+\fBKariDNS RFC Guideline\fR \[u2014] Detailed RFC compliance and design boundary
+document
+.SH AUTHORS
+Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)

@@ -249,4 +249,4 @@ English and Japanese terms as the two languages of the interface use them.
 
 ## SEE ALSO
 
-[Service manual](karidns-webadmin.md) (installing, the configuration, TLS and the reverse proxy, identity providers, security, measurements of the API), [API reference](karidns-api.md) (every endpoint, error and setting), [accessibility and browser checklist](karidns-webadmin-gui-checklist.md), [`karidns-zone(1)`](karidns-zone.md), [`karicheck(1)`](karicheck.md), [`karidns-signer(8)`](karidns-signer.md).
+[Service manual](karidns-webadmin.md) (installing, the configuration, TLS and the reverse proxy, identity providers, security, measurements of the API), [API reference](karidns-api.md) (every endpoint, error and setting), [accessibility and browser checklist](karidns-webadmin-gui-checklist.md), [`karidns-zone(8)`](karidns-zone.md), [`karicheck(8)`](karicheck.md), [`karidns-signer(8)`](karidns-signer.md).

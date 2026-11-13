@@ -355,11 +355,11 @@ dnssec-verify -z -o example.test example.test.signed      # -z: a CSK (one key w
 
 ## SEE ALSO
 
-- [`karidns-zone(1)`](karidns-zone.md) — `import --signer`, `export --signer`
+- [`karidns-zone(8)`](karidns-zone.md) — `import --signer`, `export --signer`
 - [`karidns-dbloader(8)`](karidns-dbloader.md) — the schema, the signer's tables, roles and row level security
 - [`karidns(8)`](karidns.md) — `database { signer-wait }`, "The signer's zones", restricted control keys
 - [`karictl(8)`](karictl.md) — `reload`, `dbstatus`
-- [`karicheck(1)`](karicheck.md) — `karicheck zone`
+- [`karicheck(8)`](karicheck.md) — `karicheck zone`
 - [Distribution Guide](distribution.md) — the FreeBSD packages
 - RFC 4034, RFC 4035 (DNSSEC), RFC 5155 (NSEC3), RFC 6781 and RFC 7583 (key rollover), RFC 8624 (algorithms), RFC 9276 (NSEC3 parameters)
 

@@ -1,0 +1,101 @@
+.TH EXAMPLE\-TOOL 8 "2026-11-13" "KariDNS" "KariDNS Manual"
+.\" Generated from tests/md2man/constructs.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
+.SH NAME
+example\-tool \- a tool that shows every construct of the manuals
+.SH SYNOPSIS
+.RS 2
+.nf
+example\-tool [\-c config] [\-\-check] <zone>
+.fi
+.RE
+.SH DESCRIPTION
+A paragraph with \fBcode\fR, \fBbold\fR, \fIitalic\fR, \f(BIboth\fR, \fBbold
+with \fBcode\fB inside\fR, a link to a manual, a link to a site
+<https://www.example.org/docs> and https://www.example.net/ on two lines,
+\fB\-c\fR and \-\-check, a file db/*.sql that stays as it is, an escaped * star
+and a | pipe.
+.SS A subsection
+.IP 1. 4
+the first step
+.IP 2. 4
+the second step, with a nested list:
+.RS 4
+.IP \(bu 2
+a bullet
+.IP \(bu 2
+another bullet
+.RE
+.IP 3. 4
+the third step
+.IP \(bu 2
+an item with a lazy continuation
+.RS 2
+.PP
+and a second paragraph
+.PP
+.RS 2
+.nf
+example\-tool \-\-check
+.fi
+.RE
+.RE
+.IP \(bu 2
+a last item
+.PP
+.RS 4
+\fBWarning:\fR A callout of two lines.
+.RE
+.PP
+.RS 4
+A plain quote.
+.RE
+.SH OPTIONS
+.TP 8
+\fB\-c\fR \fIfile\fR
+The configuration file.
+.RS 8
+.PP
+A second paragraph of the option.
+.RE
+.TP 8
+\fB\-\-check\fR
+Check and exit.
+.SH TABLES
+.TS
+lb rb
+l r.
+\&Name	\&Value
+_
+\&a	\&1
+\&\fBb\-c\fR	\&22
+.TE
+.PP
+.TS
+lb lbw(46) lb
+l lw(46) l.
+\&Column one	\&Column two	\&Column three
+_
+\&short	T{
+a cell with a long text that has to be wrapped inside the table because the
+table would be too wide otherwise
+T}	\&x
+\&another	\&more words	\&y
+.TE
+.TP 8
+\fBuser "<name>";\fR
+\fIDefault:\fR none
+.br
+\fIDescription:\fR A cell so long that the table cannot stay a table in an
+eighty column terminal: it says the same thing again and again, it says the same
+thing again and again, it says the same thing again and again, it says the same
+thing again and again, it says the same thing again and again, it says the same
+thing again and again, it says the same thing again and again, it says the same
+thing again and again.
+.TP 8
+\fBport <n>;\fR
+\fIDefault:\fR 53
+.br
+\fIDescription:\fR The port.
+.SH SEE ALSO
+.IP \(bu 2
+\fBkarictl(8)\fR \[u2014] the control utility

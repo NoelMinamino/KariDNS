@@ -1,7 +1,7 @@
-# KARICHECK(1) — KariDNS Reference Manual
+# KARICHECK(8) — KariDNS Reference Manual
 
 ```text
-KARICHECK(1)                   KariDNS Manual                   KARICHECK(1)
+KARICHECK(8)                   KariDNS Manual                   KARICHECK(8)
 ```
 
 ---
@@ -266,7 +266,7 @@ $ karicheck db /usr/local/etc/karidns/karidns.conf
 | `messages[].zone`, `.view` | The zone (absolute name, as `karicheck` shows it) and the view the message is about, or `null`. The view of a configuration without `view { }` is `__default__`; `null` when there is no view (a standalone zone file, a message about the configuration as a whole). |
 | `zones[]` | One entry per zone checked, in order: `zone`, `view` and `file` (`null` when unknown), `format` (`bind`, `tinydns` or `database`), `result` (`ok` or `fail`) and the numbers of `errors` and `warnings` found while it was checked. |
 
-`karidns-zone --json` ([`karidns-zone(1)`](karidns-zone.md)) writes the same document: the first key is `"karidns-zone": 1` instead of `"karicheck": 1`, `command` is `import` or `export`, `zones[]` has one entry per zone imported or exported (`file` is the input or output file), and the codes are the `db.import.*`, `db.export.*` and `db.zone.*` ones below (with `usage.*`, `io.*`, `conf.*` and `zone.*`).
+`karidns-zone --json` ([`karidns-zone(8)`](karidns-zone.md)) writes the same document: the first key is `"karidns-zone": 1` instead of `"karicheck": 1`, `command` is `import` or `export`, `zones[]` has one entry per zone imported or exported (`file` is the input or output file), and the codes are the `db.import.*`, `db.export.*` and `db.zone.*` ones below (with `usage.*`, `io.*`, `conf.*` and `zone.*`).
 
 All strings are valid JSON strings: `"` and `\` are escaped, every control character (below U+0020, and U+007F) is written as `\u00XX`, and a byte that is not part of valid UTF-8 (a zone file, a file name or the database can hold anything) is replaced by U+FFFD. A text longer than 4096 bytes is cut and ends with `...`.
 
@@ -670,5 +670,5 @@ karicheck db internal /usr/local/etc/karidns/karidns.conf
 Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)
 
 ```text
-KariDNS                         September 2026                  KARICHECK(1)
+KariDNS                         September 2026                  KARICHECK(8)
 ```

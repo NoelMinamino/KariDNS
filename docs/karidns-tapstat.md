@@ -1,7 +1,7 @@
-# KARIDNS-TAPSTAT(8) — KariDNS Reference Manual
+# KARIDNS-TAPSTAT(1) — KariDNS Reference Manual
 
 ```text
-KARIDNS-TAPSTAT(8)               KariDNS Manual               KARIDNS-TAPSTAT(8)
+KARIDNS-TAPSTAT(1)               KariDNS Manual               KARIDNS-TAPSTAT(1)
 ```
 
 ---

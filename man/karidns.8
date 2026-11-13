@@ -1,0 +1,1184 @@
+.TH KARIDNS 8 "2026-11-13" "KariDNS" "KariDNS Manual"
+.\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
+.SH NAME
+karidns \- Authoritative DNS Server Daemon for FreeBSD
+.SH SYNOPSIS
+.RS 2
+.nf
+karidns [\-v | \-\-version | \-V] [\-f] [\-d debug_level] [\-p port | \-p pid_file] [\-P pid_file] [\-c config_file | config_file]
+.fi
+.RE
+.SH DESCRIPTION
+\fBkaridns\fR is an authoritative DNS server designed for FreeBSD. It uses a
+privilege-separated multi-process architecture with FreeBSD \fBCapsicum\fR
+sandboxing, atomic RCU-based configuration/zone management, and pre-allocated
+memory arenas.
+.SS Architectural Structure
+.IP 1. 4
+\fBPrivilege Separation & Capsicum Sandboxing\fR:
+.RS 4
+.IP \(bu 2
+\fBManager (Supervisor) Process\fR: The process started by the administrator. It
+parses the configuration, performs the startup checks, forks the other processes
+and supervises them: if any child exits, all children are stopped and the
+manager exits. The exceptions are \fBkaridns\-dbloader\fR (the database loader,
+see \fBdatabase { ... }\fR below) and, since 0.6.2, the plugins of \fBtype
+program\fR zones (PROGRAM ZONE PLUGINS): they are restarted after 1 s, 2 s, 4
+s ... 60 s while the Backend keeps answering. \fBSIGHUP\fR is forwarded to the
+backend.
+.IP \(bu 2
+\fBFrontend Router Processes\fR: Bind the privileged network sockets (UDP/TCP
+port 53) and dispatch network traffic to the backend workers. One router is
+started on hosts with up to 3 CPU cores, two on larger hosts.
+.IP \(bu 2
+\fBBackend Process\fR: Operates in FreeBSD Capsicum capability mode
+(\fBcap_enter(2)\fR). DNS packet parsing and response generation are performed
+by the worker threads (one or two on hosts with up to 3 cores, otherwise the
+number of cores minus two) without direct filesystem access or socket creation
+permissions. Configuration and zone files are accessed via pre-opened directory
+descriptors (\fBopenat(2)\fR / \fBrenameat(2)\fR).
+.IP \(bu 2
+\fBCPUs\fR: the routers and the worker threads are not pinned to CPUs (since
+0.6.1), so the scheduler can move a thread that another busy thread displaces;
+pinned workers used to keep the queries already handed to them for 0.5 to 2 s
+when something else on the host used a whole CPU. To keep other work
+(\fBkaridns\-signer\fR, PostgreSQL) off the server's CPUs, give that work a CPU
+set of its own with \fBcpuset(1)\fR instead. When you measure with \fBdnsperf\fR
+on the same host, run it with \fBnice \-n 20\fR or from another host: dnsperf
+2.14 busy-loops at the end of a run, and the time its threads take from the
+server shows as answers of 0.5 to 2 s.
+.IP \(bu 2
+\fBConnect Broker\fR: A small unprivileged helper that opens the outbound
+connections the sandboxed backend cannot create itself (zone transfers of
+secondary zones from their primary, forward-zone queries, and reconnecting to
+the dnstap collector). It starts a non-blocking \fBconnect(2)\fR and hands the
+socket back at once; the backend waits for the connection to complete within its
+own time limit, so one slow server does not hold up other outbound
+connections. It only connects to UNIX sockets for the \fBdnstap\fR socket
+configured at startup.
+.IP \(bu 2
+\fBStartup order\fR: user and group are looked up once, before any thread is
+started, and the same identity is used by all processes and for log and
+control-socket ownership. Control commands (\fBkarictl\fR), \fBSIGHUP\fR and the
+control thread's timers are processed only after the backend has dropped
+privileges and entered capability mode.
+.IP \(bu 2
+If the kernel has no \fBCAPABILITY_MODE\fR (\fBcap_enter(2)\fR fails with
+\fBENOSYS\fR), the backend logs \fBCapsicum is not available ... running WITHOUT
+the capability\-mode sandbox\fR at \fBLOG_CRIT\fR and keeps running. Any other
+\fBcap_enter(2)\fR failure aborts startup.
+.IP \(bu 2
+\fBShutdown\fR: on \fBSIGTERM\fR/\fBSIGINT\fR, \fBkarictl stop\fR, or when the
+manager process goes away, the backend sends the dnstap frames that are still
+queued, ends the Frame Streams session (STOP / FINISH) and exits. A second
+signal exits at once.
+.RE
+.IP 2. 4
+\fBRead-Copy-Update (RCU) Architecture\fR:
+.RS 4
+.IP \(bu 2
+Zone data and configuration pointers are swapped atomically using C11 atomic
+operations (\fBmemory_order_acquire\fR / \fBmemory_order_release\fR), allowing
+worker threads to serve queries concurrently during zone reloads without
+locking.
+.RE
+.IP 3. 4
+\fBMemory Arena Allocator (\fBzone_arena_t\fB)\fR:
+.RS 4
+.IP \(bu 2
+For ordinary read-only queries (e.g. standard \fBQUERY\fR lookups) over UDP and
+TCP, dynamic memory allocations (\fBmalloc\fR/\fBfree\fR) are not used; stack
+buffers and bump-allocated memory arenas (\fBzone_arena_t\fR) are used for
+request handling. TCP connection state comes from a pool of 1000 connection
+contexts allocated when the backend starts (memory pages are only used once a
+context has been used), and each worker thread builds its TCP responses in a
+buffer allocated at startup.
+.IP \(bu 2
+Exceptions:
+.RS 2
+.IP \(bu 2
+Dynamic Update (\fBRFC 2136\fR, OPCODE=5): applying an update thaws the zone's
+published image into a builder (\fBthaw_zone_arena\fR, using \fBrealloc\fR),
+applies the update, freezes a new image and publishes it as a new version (the
+old version is freed after the RCU grace period), and computes an IXFR diff
+(\fBcompute_ixfr_diff\fR, using \fBmalloc\fR) so that secondaries can be
+notified incrementally. This path is synchronous with the query but is
+inherently a write path, not the hot read path.
+.IP \(bu 2
+\fBtype forward\fR and \fBtype program\fR zones: the query is copied to the heap
+and handed to a separate pool of I/O threads through a queue protected by a
+mutex, so that waiting for the forwarder or the program does not block a worker
+thread.
+.IP \(bu 2
+Outgoing zone transfers (AXFR/IXFR): each transfer runs in its own thread, which
+receives its parameters in a heap block.
+.RE
+.RE
+.IP 4. 4
+\fBKqueue Event Loop\fR:
+.RS 4
+.IP \(bu 2
+Network I/O events for TCP connections and UDP sockets are managed using FreeBSD
+\fBkqueue(2)\fR.
+.RE
+.SH OPTIONS & ARGUMENTS
+.TP 8
+\fB<config_file>\fR, \fB\-c config_file\fR
+Path to the configuration file (e.g.,
+\fB/usr/local/etc/karidns/karidns.conf\fR). This argument is required; there is
+no built-in default path. Any argument that is not one of the options below is
+taken as the configuration file.
+.TP 8
+\fB\-f\fR
+Run in the foreground instead of daemonizing into the background. In foreground
+mode, no PID file is created unless one is set explicitly (\fB\-P\fR, \fB\-p
+<path>\fR or \fBpid\-file\fR).
+.TP 8
+\fB\-d debug_level\fR
+The debug level in force from the start, 0\[u2013]99 (BIND's \fBnamed \-d\fR;
+default 0). A value that is not a number from 0 to 99, or \fB\-d\fR without a
+value, is a usage error (exit status 2). The level decides what the channels
+with \fBseverity dynamic\fR and the built-in \fBdefault_debug\fR (the file
+\fBkaridns.run\fR) write; \fBkarictl trace\fR and \fBnotrace\fR change it while
+the server runs and \fBkarictl status\fR shows it. See \fBSeverities and the
+debug level\fR under \fBlogging { ... }\fR.
+.TP 8
+\fB\-p port\fR, \fB\-p pid_file\fR
+The meaning depends on the value. If the whole value is a decimal number, it is
+the \fBlisten port\fR (1\[u2013]65535; other numbers are an error) and overrides
+\fBoptions { port ...; }\fR (also on reload); for example \fB\-p 10053\fR. Any
+other value is taken as the path of the PID lock file, like \fB\-P\fR, with a
+warning that recommends \fB\-P\fR.
+.TP 8
+\fB\-P pid_file\fR
+Path to the PID lock file (overrides \fBoptions { pid\-file "..."; }\fR;
+default: \fB/var/run/karidns/karidns.pid\fR when daemonized). Specify \fBnone\fR
+to disable PID locking.
+.TP 8
+\fB\-v\fR, \fB\-\-version\fR, \fB\-V\fR
+Print the version information and exit.
+.PP
+.RS 4
+\fBNote:\fR \fBUser, Group, and Sandboxing Controls:\fR
+.IP \(bu 2
+Process privileges (\fBuser\fR and \fBgroup\fR) are configured exclusively via
+the \fBoptions { user "..."; group "..."; }\fR directive in the configuration
+file rather than command-line arguments.
+.IP \(bu 2
+Traditional \fBchroot\fR is not implemented; filesystem and system call
+sandboxing is enforced via FreeBSD native \fBCapsicum\fR (\fBcap_enter(2)\fR
+capability mode) in the backend worker process.
+.RE
+.SS Running as a non-root user
+\fBkaridns\fR does not have to be started as root. There are two supported ways
+to run it:
+.PP
+.TS
+lb lb lbw(32)
+l l lw(32).
+\&Started as	\&\fBoptions { user ...; }\fR	\&Behavior
+_
+\&root	\&set	T{
+Binds sockets and opens files as root, then drops to \fBuser\fR/\fBgroup\fR
+(recommended for port 53).
+T}
+\&root	\&not set	T{
+Refused: running as root without a privilege drop is not permitted (also with
+only \fBgroup\fR set, which would keep uid 0).
+T}
+\&non-root user \fIU\fR	\&not set	\&Runs as \fIU\fR.
+\&non-root user \fIU\fR	\&\fBuser "U";\fR (itself)	T{
+Runs as \fIU\fR; the privilege drop is skipped.
+T}
+\&non-root user \fIU\fR	\&another user	T{
+Refused: a non-root process cannot switch users.
+T}
+.TE
+.PP
+When started as a non-root user, \fBgroup\fR (if set) must be that user's
+current primary group, and \fBprogram\-user\fR of \fBtype program\fR zones
+(which defaults to \fBoptions { user }\fR) must be that user as well.
+.PP
+Everything the process needs must then be usable by that user. \fBkaridns
+refuses to start\fR (non-zero exit status and an \fB[ERROR]\fR message on stderr
+and syslog) instead of running half-broken when:
+.IP \(bu 2
+the listen port cannot be bound over UDP \fBor\fR TCP \[u2014] ports below 1024
+(such as 53) require root, so use e.g. \fBport 10053;\fR or \fB\-p 10053\fR; a
+port already in use by another process is refused too;
+.IP \(bu 2
+a \fBlogging { channel { file "..."; }; }\fR file cannot be opened (e.g. under
+\fB/var/log\fR); choose a directory the user can write to;
+.IP \(bu 2
+the PID file cannot be created: when daemonized, the default is
+\fB/var/run/karidns/karidns.pid\fR, so pass \fB\-P <path>\fR / \fBpid\-file
+"<path>";\fR, or \fBpid\-file "none";\fR;
+.IP \(bu 2
+\fBcontrol\-channel\fR is enabled and its UNIX socket cannot be bound: the
+default is \fB/var/run/karidns/control.sock\fR, so set \fBcontrol\-channel {
+socket "<path>"; ... };\fR to a path in a directory the user can write to (and
+point \fBkarictl\fR at the same path);
+.IP \(bu 2
+another instance is running: its PID file is locked, or a server answers on the
+control socket (\fBAnother KariDNS instance is already running\fR). The running
+instance's PID file and control socket are left as they are.
+.PP
+These checks run \fBbefore\fR the process daemonizes, so in daemon mode the
+failure is reported to the invoking shell/rc script as well. The same
+fail-closed rules apply when started as root (a log file that cannot be opened,
+an unbindable port or control socket all abort startup). On \fBkarictl
+reconfig\fR / \fBSIGHUP\fR, a configuration whose log files cannot be opened is
+rejected and the running configuration is kept.
+.PP
+Example (\fB/home/dns/karidns.conf\fR, started by user \fBdns\fR with \fBkaridns
+/home/dns/karidns.conf\fR):
+.PP
+.RS 2
+.nf
+options {
+    port 10053;
+    user "dns";                          // optional: the invoking user itself
+    pid\-file "/home/dns/run/karidns.pid";
+};
+logging {
+    channel queries_log { file "/home/dns/log/queries.log" versions 3 size 10M; };
+    category queries { queries_log; };
+};
+control\-channel {
+    socket "/home/dns/run/control.sock";
+    algorithm "hmac\-sha256";
+    secret "...";
+};
+.fi
+.RE
+.SH CONFIGURATION
+The configuration file is described in karidns.conf(5).
+.SH ROLLBACK (karictl rollback)
+A reload with a mistake in the zone file, or a bad change in the database, is
+served at once. \fBkarictl rollback <zone> [view] [local]\fR puts the zone back
+to what it served before. It is for \fBprimary zones\fR (a zone file or a
+database zone); a secondary gets its data from its primary, and catalog zones
+and \fBprogram\fR zones are refused with an \fBERROR\fR.
+.PP
+\fBWhat is kept.\fR When a \fBzone-file reload\fR (\fBkarictl reload\fR,
+\fBreload <zone>\fR, \fBreconfig\fR that reads the file, \fBSIGHUP\fR) or an
+\fBinstall from the database\fR replaces the version a zone serves, the old
+version is kept as the zone's \fIprevious version\fR for \fBrollback\-window\fR
+(default \fB1h\fR, \fB0\fR = keep nothing; \fBoptions\fR, \fBview\fR or
+\fBzone\fR). Only the version before the last reload is kept: a new reload
+replaces it (the older one is freed), and a dynamic UPDATE or a zone transfer
+does not touch it, so \fBrollback\fR goes back to before the reload and drops
+the updates made since. A reload that brings exactly the content the zone has
+already does not replace it. The previous version is not reachable by the query
+path (no reader sees it), so queries cost what they cost without it; the control
+thread's tick frees it when the window is over. Its bytes are the class
+\fBprevious\fR of the zone memory totals (\fBkarictl status\fR, \fBkarictl
+dbstatus\fR, \fBkarictl zonestatus\fR for the one zone), and with a database
+\fBmemory\-limit\fR previous versions are dropped before any zone is taken out
+of memory (see "Memory limit"). Every path that frees a zone (removal in a
+reconfig, a database delete, shutdown) frees its previous version too.
+.PP
+\fBSerial, IXFR, NOTIFY (RFC 1982, RFC 1995, RFC 1996).\fR The old content is
+published with the SOA serial of the \fBcurrent\fR version plus one (RFC 1982
+serial arithmetic; after 4294967295 the serial is 1, as for a dynamic UPDATE),
+so a secondary sees an ordinary newer serial and never a serial that goes back
+(RFC 1034 4.3.5: a lower serial is not accepted). The difference between the
+version in service and the old content is recorded for IXFR and NOTIFY is sent,
+as for a reload. \fBlocal\fR publishes the old version \fBunchanged, with its
+old serial, on this server only\fR: the secondaries do not follow (a secondary
+that has the newer serial keeps it and one that is behind transfers the whole
+zone), no NOTIFY is sent and the IXFR history is dropped.
+.PP
+\fBSigned zones.\fR KariDNS serves pre-signed zones and cannot sign. A new
+serial would leave the signature of the SOA that does not match, so the rollback
+of a zone whose previous version holds RRSIG or DNSKEY records is refused
+(\fBzone is signed; roll back in the DB and re\-sign\fR). \fBrollback <zone>
+local\fR is allowed: the old version, with its old serial and its signatures, on
+this server.
+.PP
+\fBAfter a rollback.\fR The previous version is used up: a second rollback is
+refused until the zone is reloaded again (no redo). \fBkarictl zonestatus\fR
+shows \fBrolled back (serial N, from M)\fR until the next publication (a reload,
+an UPDATE, a database install).
+.IP \(bu 2
+\fBZone file.\fR The file still has the data that were rolled back. \fBreload
+<zone>\fR and a full \fBreload\fR keep the rolled-back version while the file is
+the one that was read (the same modification time and size) and say so; a
+changed file is read as usual. \fBreload <zone> force\fR reads the file again
+(and brings the bad data back), and so does a restart. The check looks at the
+file the zone names, not at the files it \fB$INCLUDE\fRs: use \fBforce\fR after
+a change in an included file. Fix the file and reload.
+.IP \(bu 2
+\fBDatabase zone.\fR The server decides whether the loader's zone is new by the
+source id, serial and digest it recorded when it installed the zone (the loader
+compares its own with what the server sent in its inventory); a rollback leaves
+that record alone. So \fBreload <zone>\fR answers \fBunchanged\fR, a full
+\fBreload\fR and a restarted loader send nothing for the zone, and the
+rolled-back version stays until the data in the database change; the next change
+is installed as usual and ends the rolled-back state. \fBreload <zone> force\fR
+sends the database's data again. While it is rolled back the zone is pinned in
+memory (see "Memory limit"). \fBWith several primaries on one database\fR a
+rollback on one server makes the servers differ from each other until the
+database changes: the other primaries serve the new data. The durable fix is to
+roll the change back in the database.
+.IP \(bu 2
+A restricted control key may be given the command: \fBallow\-commands {
+rollback; };\fR.
+.IP \(bu 2
+The command is logged at NOTICE with the key name, like the others, and the
+rollback itself is logged: \fB[Zone] Zone 'example.test.' rolled back: serial 7
+(was 6)\fR.
+.PP
+.RS 2
+.nf
+options { rollback\-window 2h; };
+zone "example.test" { type master; file "example.test.zone"; };
+zone "scratch.test" { type master; file "scratch.test.zone"; rollback\-window 0; };   # keeps nothing
+.fi
+.RE
+.SH CONTROL CHANNEL & MANAGEMENT
+Runtime administration of \fBkaridns\fR is managed over a local UNIX domain
+socket (default \fB/var/run/karidns/control.sock\fR, see \fBcontrol\-channel\fR)
+authenticated via an HMAC challenge-response (\fBcontrol\-channel { algorithm
+}\fR, default HMAC-SHA256) using the \fBkarictl(8)\fR utility. A key can be
+restricted to some commands (\fBcontrol\-channel { keys { } }\fR, see above);
+every command is logged with the name of the key.
+.SH PROGRAM ZONE PLUGINS (TEST-ONLY FEATURE)
+KariDNS supports dynamic external program-backed zones (\fBtype program;\fR)
+exclusively for testing and anomaly fuzzing.
+.PP
+.RS 2
+.nf
+options {
+    allow\-program\-zones yes; # Required to enable type program zones
+};
+\&
+zone "anomaly.test." {
+    type program;
+    program "/usr/local/bin/mock_server.pl";
+    program\-args { "\-\-verbose"; };
+    program\-timeout 2000; # timeout in milliseconds (default: 2000)
+    program\-max\-failures 5; # consecutive failures before the circuit breaker opens (default: 5)
+    program\-user "nobody"; # optional privilege drop for plugin process (default: options { user })
+    disable\-auto\-tc\-flag no; # yes: send oversized UDP replies as\-is (default: no)
+    program\-reload\-line no; # yes: a reload writes the line "RELOAD" to the plugin (default: no)
+};
+.fi
+.RE
+.PP
+.RS 4
+\fBNote:\fR \fBDesign Boundaries and Processing Semantics:\fR
+.IP \(bu 2
+\fBPre-filtering & Packet Validation\fR: KariDNS enforces standard basic DNS
+header validation (QDCOUNT, valid OPCODES, EDNS version <= 0, valid QCLASS)
+prior to dispatching queries to the program plugin. Corrupted queries that
+violate fundamental DNS framing are responded to directly by KariDNS
+(e.g. FORMERR / NOTIMP / REFUSED) before reaching the plugin.
+.IP \(bu 2
+\fBUDP Truncation (\fBdisable\-auto\-tc\-flag\fB)\fR: With the default \fBno\fR,
+a plugin reply larger than the UDP limit (EDNS UDP payload size, capped by the
+server's UDP buffer size; 512 without EDNS) is replaced by a TC=1 reply with an
+empty answer. With \fByes\fR, KariDNS sends the plugin reply as-is (up to 65,535
+bytes), so the plugin itself is responsible for setting TC=1 on UDP.
+.IP \(bu 2
+\fBTCP & AXFR Semantics\fR: TCP queries (including \fBAXFR\fR / \fBIXFR\fR) sent
+to a program zone are forwarded directly to the plugin as a single
+query-response transaction. Multi-envelope streaming AXFR is not supported. A
+transfer request that is not shaped like one (RFC 5936 \[u00A7]2.1, RFC 1995
+\[u00A7]3) is answered FORMERR, and one of a class other than IN REFUSED (EDE
+20), before the plugin is asked (see "The class of a transfer
+request"). \fBallow\-transfer\fR does not apply to a program zone: whether an
+AXFR or IXFR is answered is the plugin's decision. It gets the client address
+with every query and can refuse (REFUSED) whom it does not want to serve the
+whole zone to.
+.IP \(bu 2
+\fBSecurity & Isolation\fR: Plugin processes are started by the manager process
+(outside the Capsicum sandbox, as \fBkaridns\-dbloader\fR is) and drop
+privileges (\fBprogram\-user\fR). The manager hands the backend the plugin's
+stdin, its stdout and its process descriptor over a socket pair made before the
+backend was forked; the backend limits each descriptor at once
+(\fBcap_rights_limit()\fR: write, read, \fBpdkill()\fR) and treats every message
+of the manager as untrusted. The path, the arguments and the user of a plugin
+come from the manager's own reading of \fBkaridns.conf\fR, never from the
+backend. All internal control channels, frontend IPC, and network sockets are
+strictly closed via \fBclosefrom(3)\fR before executing the plugin. The plugin
+starts with an empty environment (only \fBTZ\fR of the server is kept). A
+\fBprogram\-user\fR that resolves to uid 0 or whose primary group is gid 0 is
+refused (by \fBkaricheck conf\fR, at start, and by the manager whenever a reload
+or the start-up asks it for a zone's plugin). At most 256 zones of type
+\fBprogram\fR can be configured.
+.IP \(bu 2
+\fBRestarts\fR: a plugin that exits, or that is killed at
+\fBprogram\-max\-failures\fR, is started again after 1, 2, 4, ... 60 s (back to
+1 s after 10 minutes of running), the backoff of \fBkaridns\-dbloader\fR; its
+zone answers SERVFAIL meanwhile. The manager starts at most 4 plugins per second
+once a burst of 256 is used.
+.IP \(bu 2
+\fBThe \fBRELOAD\fB line\fR: with \fBprogram\-reload\-line yes;\fR a reload
+(\fBkarictl reload\fR / \fBreconfig\fR, \fBSIGHUP\fR) writes the line
+\fBRELOAD\fR to the zone's plugin, between two queries, and waits for no answer:
+the plugin reads its own data again. Without it (the default) the line is never
+sent, so a plugin written to the earlier protocol, which may take an unknown
+line as an error, keeps working.
+.IP \(bu 2
+\fBReload\fR (\fBSIGHUP\fR, \fBkarictl reload\fR / \fBreconfig\fR): a program
+zone the reload adds gets its plugin; a zone whose \fBprogram\fR,
+\fBprogram\-args\fR, \fBprogram\-user\fR, \fBprogram\-timeout\fR,
+\fBprogram\-max\-failures\fR, \fBdisable\-auto\-tc\-flag\fR or
+\fBprogram\-reload\-line\fR changed gets a new plugin, and the old one answers
+until the new one runs and is then stopped; the plugin of a removed zone is
+stopped; a plugin whose settings did not change is left alone (it gets the
+\fBRELOAD\fR line with \fBprogram\-reload\-line yes;\fR). \fBkarictl reload
+<zone>\fR is for the one zone, from the active configuration, and does not leave
+the plugin alone: new settings get a new plugin; the same settings with
+\fBprogram\-reload\-line yes;\fR get the \fBRELOAD\fR line; the same settings
+without it get a new plugin with the same settings, which replaces the old one
+in the same way (a plugin without the line can read its data again only by
+starting again). The reply says which of the three happened. A plugin the
+manager refuses to start (the configuration file changed again, a user it cannot
+look up, no memory) is asked for again after 1, 2, 4, ... 60 s and at the next
+reload; a refused replacement leaves the running plugin serving. None of this
+needs a restart.
+.PP
+For full architectural details, IPC wire specifications, and complete runnable
+examples in Perl, Python, C, Rust, and Go, see \fBKariDNS: Complete Guide
+to 'type program' Zones\fR.
+.RE
+.SH FORWARD ZONES
+KariDNS supports forwarding queries for specific zones to designated upstream
+nameservers (\fBtype forward;\fR).
+.PP
+.RS 2
+.nf
+zone "corp.example.com." {
+    type forward;
+    forwarders { 192.0.2.53; 198.51.100.53 port 5353; };
+    # forwarders port 5353 { 192.0.2.53; };   the port of the list is the default of its addresses (without any: options { port }, else 53)
+    forward\-timeout 2000; # total time budget in milliseconds for all forwarders (default: 2000)
+};
+.fi
+.RE
+.PP
+.RS 4
+\fBNote:\fR \fBForward Zone Processing Semantics:\fR
+.IP \(bu 2
+\fBTransparent Query Relaying\fR: KariDNS does not maintain zone resource
+records locally for forward zones. Incoming queries matching the zone are
+forwarded to the configured \fBforwarders\fR list in order, failing over to the
+next forwarder within the shared \fBforward\-timeout\fR budget. Each forwarder
+gets the remaining time divided by the number of forwarders not tried yet (with
+two forwarders and the default 2000 ms: 1000 ms each, the second one also gets
+what the first one did not use). A reply whose ID, QR bit or question does not
+match is discarded and the wait for that forwarder continues (RFC 5452
+\[u00A7]9.1). The fallback to TCP after a truncated reply, including its
+connection setup, uses the time that is still left.
+.IP \(bu 2
+\fBNo Subprocess Overhead\fR: Unlike \fBtype program\fR zones, forward zones do
+not spawn external processes and do not require global opt-in flags like
+\fBallow\-program\-zones\fR.
+.IP \(bu 2
+\fBImmediate Reload Support\fR: Changes to \fBforwarders\fR or
+\fBforward\-timeout\fR take effect immediately upon configuration reload
+(\fBSIGHUP\fR / \fBkarictl reload\fR) without requiring a full server restart.
+.IP \(bu 2
+\fBUnsupported Operations\fR: Dynamic Update (RFC 2136) and \fBNOTIFY\fR
+requests are not supported on forward zones and are rejected with \fBNOTIMP\fR;
+a zone transfer (\fBAXFR\fR/\fBIXFR\fR, TCP or UDP) is REFUSED with EDE 20 (Not
+Authoritative), as for a zone this server does not have.
+.IP \(bu 2
+\fBSecurity & Transaction ID Randomization\fR: When relaying to upstream
+forwarders, KariDNS assigns a fresh cryptographic random transaction ID
+(\fBarc4random\fR) and verifies that the upstream response Question section and
+ID match before relaying the answer with the client's original transaction ID
+restored.
+.RE
+.SH POWERDNS ALIAS AND LUA RECORDS (milestone B9a)
+KariDNS reads, serves and transfers the two record types that PowerDNS adds to
+the DNS: \fBALIAS\fR (a name that stands for the addresses of another name, the
+"ANAME" idea) and \fBLUA\fR (a record whose answer is the result of a Lua
+snippet). They are not IETF types. PowerDNS stores them as private-use types of
+CLASS IN and sends them like that in a zone transfer (RFC 6895 \[u00A7]3.1):
+ALIAS is \fBTYPE65401\fR (RDATA = the target name, uncompressed, RFC 3597
+\[u00A7]4) and LUA is \fBTYPE65402\fR (RDATA = the 16-bit type of the answer,
+then the code as \fB<character\-string>\fRs). KariDNS keeps exactly that form,
+so an AXFR out is byte for byte what PowerDNS sends
+(\fBoutgoing\-axfr\-expand\-alias=no\fR), and a zone transferred in from
+PowerDNS keeps its ALIAS and LUA records.
+.PP
+.RS 4
+\fBNote:\fR The Extended AXFR records of KariDNS use the same two type numbers
+(65401, 65402) in \fBCLASS 65302\fR. Everything that reads or writes a transfer
+tells them apart by the pair (type, class), never by the type alone: a record of
+CLASS IN is a zone record, whatever its type number; a record of CLASS 65302 is
+an Extended AXFR record, whatever it holds.
+.RE
+.PP
+\fBZone files.\fR \fBALIAS <target>\fR and \fBLUA <type> "<code>" ["<more
+code>" ...]\fR are accepted next to the generic forms (\fBTYPE65401 \e#
+15 ...\fR, RFC 3597 \[u00A7]5). A relative target is relative to the origin. The
+code of a LUA record is cut into \fB<character\-string>\fRs of at most 255
+octets, as PowerDNS does. In a PowerDNS database the rows are \fBtype = ALIAS\fR
+with the target in \fBcontent\fR (\fBt.target.example.\fR) and \fBtype = LUA\fR
+with \fBA ";return {'192.0.2.1'}"\fR. \fBtests/db/zone2sql\fR writes these rows.
+.PP
+.RS 2
+.nf
+@    300 IN ALIAS lb.target.example.      ; A / AAAA of the apex from another name (RFC 1034 \[u00A7]3.6.2 forbids a CNAME here)
+www  300 IN ALIAS lb.target.example.
+txt  300 IN LUA   TXT ";return 'hello'"   ; kept for transfers, never answered
+.fi
+.RE
+.PP
+\fBZone rules\fR (a zone that breaks them is not loaded; \fBkaricheck zone\fR
+and \fBkaricheck zones\fR report them; a database zone that breaks them is
+rejected with the reason in the log and in \fBkarictl dbstatus\fR; an incoming
+transfer that breaks them is refused):
+.IP \(bu 2
+an ALIAS name must not also own an A or AAAA RRset (the ALIAS stands for
+them). TXT, MX, NS and the other types may coexist;
+.IP \(bu 2
+a zone with an ALIAS must not hold DNSSEC records (DNSKEY, RRSIG, NSEC, NSEC3,
+NSEC3PARAM), and a database zone with \fBPRESIGNED\fR metadata must not hold an
+ALIAS: an expanded answer cannot be signed offline. KariDNS does no online
+signing;
+.IP \(bu 2
+the RDATA of both types must be well formed (one uncompressed name; a type and
+\fB<character\-string>\fRs that fill the RDATA);
+.IP \(bu 2
+\fBENABLE\-LUA\-RECORDS\fR metadata with the value \fB1\fR rejects the database
+zone (LUA records are not run, so enabling them would silently change the
+answers); \fB0\fR or no row is fine.
+.SS Default behaviour (no alias-resolver)
+This is PowerDNS with \fBexpand\-alias=no\fR and \fBenable\-lua\-records=no\fR,
+and the answers are the same (checked against PowerDNS 5.1.4,
+\fBtests/run_db_alias_lua_test.sh\fR):
+.PP
+.TS
+lbw(35) lbw(36)
+lw(35) lw(36).
+\&Query	\&Answer
+_
+T{
+A or AAAA (or any other type the name does not own) at an ALIAS name
+T}	\&NOERROR, no data
+T{
+\fBTYPE65401\fR at an ALIAS name, and \fBANY\fR there
+T}	T{
+the ALIAS RR (\fBANY\fR lists it with the other RRsets)
+T}
+T{
+ALIAS at a wildcard, a name below it
+T}	T{
+the ALIAS RR for \fBTYPE65401\fR and \fBANY\fR, no data for A and AAAA (an ALIAS
+RR is a plain RR in this mode)
+T}
+T{
+anything at a name that owns \fBonly LUA\fR records, including \fBTYPE65402\fR
+and \fBANY\fR
+T}	T{
+NXDOMAIN (as if the name did not exist; a wildcard that holds only LUA records
+is not there either)
+T}
+T{
+\fBANY\fR or \fBTYPE65402\fR at a name with LUA and other records
+T}	T{
+\fBANY\fR lists the other RRsets only; \fBTYPE65402\fR gets no data
+T}
+\&AXFR / IXFR, Extended AXFR	T{
+every ALIAS and LUA RR, as TYPE65401 / TYPE65402
+T}
+.TE
+.PP
+A name that owns LUA records and descendants is an empty non-terminal like any
+other (NOERROR, no data).
+.SS Expansion (alias-resolver)
+.RS 2
+.nf
+options { alias\-resolver { 192.0.2.53; 2001:db8::53 port 5353; }; };   # every zone
+zone "example.test." { ...; alias\-resolver { 192.0.2.54; }; };         # this zone only (replaces the options value)
+.fi
+.RE
+.PP
+\fBalias\-resolver\fR names 1 to 8 resolvers (IP addresses, never names). A
+zone's list replaces the options list; for the zones of the database the order
+is the zone's settings text (or its profile), then \fBoptions { alias\-resolver
+}\fR, then \fBoptions { database { alias\-resolver } }\fR. It works for file
+zones, transferred zones and database zones alike. A statement may be written in
+the settings text of a database zone and in a profile (it is not sent with
+Extended AXFR: a resolver address is local to the server). A configuration
+reload takes effect at once.
+.PP
+With it, A and AAAA at an ALIAS name are answered with the addresses the
+resolver gives for the target, as PowerDNS does with \fBexpand\-alias=yes\fR and
+\fBresolver=...\fR:
+.PP
+.TS
+lbw(35) lbw(36)
+lw(35) lw(36).
+\&Query	\&Answer
+_
+\&A, AAAA	T{
+the addresses of the target (the CNAME chain of the resolver's answer is
+followed, at most 8 hops); NOERROR with no data when the target has none
+T}
+\&\fBANY\fR	T{
+the expanded A and AAAA only (PowerDNS answers \fBANY\fR at an ALIAS name with
+these two and leaves the other RRsets out)
+T}
+\&\fBTYPE65401\fR	T{
+no data: the ALIAS RR is not an answer any more (AXFR still carries it)
+T}
+T{
+a target that cannot be resolved: the resolver does not answer, or answers
+SERVFAIL, REFUSED or NXDOMAIN, a CNAME loop or a chain longer than 8
+T}	T{
+SERVFAIL (with EDE 22 when the client sent EDNS and \fBsend\-extended\-errors\fR
+is on)
+T}
+\&a wildcard ALIAS	T{
+not expanded (as in PowerDNS 5.1.4): no data for A and AAAA, the ALIAS RR for
+\fBANY\fR
+T}
+T{
+the glue of an MX / NS / SRV target that is an ALIAS name
+T}	\&none
+.TE
+.PP
+\fBHow it is done.\fR The Backend never waits for a resolver. One auxiliary
+thread resolves every ALIAS target of the published zones in advance, through
+the same broker path as the forwarders of a \fBtype forward\fR zone and the
+transfers of a secondary (no socket call is added to the sandboxed Backend): a
+UDP query with RD=1 and EDNS0, TCP when the answer is truncated; the answer must
+come back on the connected socket with the right ID and the question asked, and
+RCODE NOERROR (RFC 5452 \[u00A7]9.1). The thread publishes the results as one
+immutable table that queries only read (the table is replaced and the old one
+freed after a grace period, like zone versions). Answers that carry expanded
+addresses are never put into the shared response cache. The resolver is trusted:
+nothing is DNSSEC-validated.
+.IP \(bu 2
+\fBTTL.\fR The TTL of an expanded answer is the smaller of the ALIAS record's
+TTL and what is left of the TTL of the resolver's answer (the TTL of the final A
+/ AAAA RRset, as PowerDNS takes it; CNAME TTLs are not mixed in), counting down,
+so a downstream cache never keeps the data longer than the resolver
+allowed. (PowerDNS gives the upstream TTL as it is, without the ALIAS record's
+TTL and without counting down.)
+.IP \(bu 2
+\fBRefresh.\fR A target is queried again after two thirds of its TTL and at
+least 5 seconds after the last time (an upstream TTL of 0 gives a 5 second
+refresh and TTL 0 answers). A new zone version keeps the results of the targets
+it still has; a target that no zone has any more is dropped.
+.IP \(bu 2
+\fBFailure.\fR A target that has \fBnever\fR been resolved (a zone that was just
+loaded, or a resolver that is down since the start) answers SERVFAIL until the
+first resolution works; PowerDNS resolves at the first query, so the first
+answers after a load may be SERVFAIL where PowerDNS would wait. A target that
+\fBwas\fR resolved keeps its last result when a refresh fails: it is served for
+up to one day after its TTL ran out, with TTL 30 (RFC 8767 \[u00A7]4, \[u00A7]5;
+the answer is the last known data, not an error), and the refresh is retried in
+the background after 5 s, 10 s, 20 s ... up to 320 s. After a day without a
+success the target answers SERVFAIL. A resolver set that does not answer at all
+is left alone for 10 s between tries.
+.IP \(bu 2
+\fBBounds.\fR At most 1,024 ALIAS records per zone are looked at (the rest
+answer SERVFAIL, logged), 16,384 jobs in all (a target is two jobs: A and AAAA),
+32 addresses per type, 64 different resolver lists, 20 upstream queries per 200
+ms tick (about 100 per second) and 3 s for one resolution. The results are about
+100 octets each.
+.IP \(bu 2
+\fBLogs.\fR The first failure of a target and its recovery are logged once
+(\fB[Alias] ...\fR in syslog).
+.PP
+Differences from PowerDNS, on purpose: the TTL rule above; the stale answers and
+the "never resolved" SERVFAIL window; the SOA record that every NODATA answer
+carries (RFC 2308 \[u00A7]2.2; PowerDNS 5.1.4 sends none with the NODATA of an
+expansion); a truncated answer of the resolver is retried over TCP (PowerDNS
+5.1.4 takes it for an answer without data); an ALIAS beside A / AAAA and an
+ALIAS in a signed zone are zone errors; \fBENABLE\-LUA\-RECORDS=1\fR is
+refused. LUA records themselves are \fBnot\fR run: this release implements what
+PowerDNS does with \fBenable\-lua\-records=no\fR (design decision D13).
+.PP
+.RS 4
+\fBNote:\fR Dynamic Update (RFC 2136) works on zones that hold ALIAS records,
+but an update that would put an A or AAAA RR at an ALIAS name is refused with
+the rest of the zone check (SERVFAIL), and the "name is in use" prerequisite
+counts a name that holds only LUA records as in use although queries get
+NXDOMAIN.
+.RE
+.PP
+.RS 4
+\fBNote:\fR Several servers that share one PostgreSQL database answer the A and
+AAAA queries at an ALIAS name from their own resolver and at their own moment,
+so those answers can differ between the servers (zone transfers and SOA serials
+do not); LUA records are never run and so are the same. See "Several servers as
+primaries" under the PostgreSQL driver, and \fBkaricheck conf\fR, which warns
+about \fBserver\-id\fR together with \fBalias\-resolver\fR.
+.RE
+.SH ZONE FILE FORMAT
+The default \fBfile\-format\fR is the master file format of RFC 1035 \[u00A7]5
+as BIND reads it.
+.IP \(bu 2
+\fBRecords\fR: \fB<owner> [<TTL>] [<class>] <type> <RDATA>\fR; TTL and class may
+appear in either order, each once. PowerDNS's \fBALIAS <target>\fR and \fBLUA
+<type> "<code>"\fR are accepted too (see POWERDNS ALIAS AND LUA RECORDS). Type
+and class mnemonics are case-insensitive (\fBin a\fR, \fBIN Mx\fR). Unknown
+types and classes use the RFC 3597 forms \fBTYPEnn\fR, \fBCLASSnn\fR and \fB\e#
+<length> <hex>\fR. The generic form of a type the server knows must carry RDATA
+that is valid for that type (RFC 3597 \[u00A7]5): \fBPTR \e# 0\fR, \fBNS \e# 3
+010203\fR or a compressed name in the hex are zone file errors, reported by
+\fBkaricheck zone\fR at the record's line. The same rule applies to the generic
+\fB:\fR lines of a tinydns data file (\fB:name:type:rdata\fR):
+\fB:x.example:1:\e001\fR (an A of one octet) is an error at that line. tinydns
+itself stores any octets there; KariDNS used to serve such RDATA as it
+was. Zero-length RDATA is legal for a type without a defined format
+(\fBTYPE65534 \e# 0\fR) and is transferred (AXFR/IXFR) and served like any other
+record.
+.IP \(bu 2
+\fB\fB\e# <length> <hex>\fB\fR (RFC 3597 \[u00A7]5): the hex digits may be split
+over any number of tokens, for every type, as far as the limit of a record line
+allows (512 fields; a line with more is a zone file error, use \fB( )\fR and
+fewer, longer tokens). The tokens are the RDATA octets whatever the type's own
+text form is, so the same record with 3 tokens or with 100 is the same record.
+.IP \(bu 2
+\fBLong strings\fR: a \fB<character\-string>\fR of a TXT-like type (\fBTXT\fR,
+\fBSPF\fR, \fBAVC\fR, \fBNINFO\fR, \fBRESINFO\fR, \fBWALLET\fR) over 255 octets
+is cut into 255-octet strings (RFC 1035 \[u00A7]3.3.14 allows several strings),
+which BIND 9.20 does not do: it refuses the zone. \fBkaridns\fR serves and
+transfers the split form without a message; \fBkaricheck zone\fR warns with the
+file and line (\fBa character\-string of more than 255 octets ... BIND rejects
+this\fR).
+.IP \(bu 2
+\fBSingleton types\fR: \fBRESINFO\fR (RFC 9606 \[u00A7]3; BIND marks it
+\fBDNS_RDATATYPEATTR_SINGLETON\fR) may have only one record at a name. Two
+records with different RDATA at one name refuse the zone (BIND: \fBmultiple RRs
+of singleton type\fR, \fBDNS_R_SINGLETON\fR from \fBlib/dns/rdataslab.c\fR) in a
+zone file, in a transfer (AXFR/IXFR: the zone keeps its old data and the error
+is logged), in a database zone and in \fBkaricheck zone\fR /
+\fBkaridns\-dbloader \-\-check\fR; the same RDATA twice is one record. A dynamic
+update that adds a second, different one to a name fails with SERVFAIL and
+changes nothing (BIND \fBlib/ns/update.c\fR \fBreplaces_p()\fR replaces only
+CNAME, DNAME, SOA, NSEC, RRSIG, WKS and NSEC3PARAM, so RESINFO is not replaced:
+delete the old record in the same update to replace it).
+.IP \(bu 2
+\fBTypes with an unusual text form\fR (as BIND 9.20 reads them; no name
+compression in any of them, RFC 3597 \[u00A7]4): \fBRESINFO\fR (261, RFC 9606)
+and \fBWALLET\fR (262, IANA registry) are one or more
+\fB<character\-string>\fRs, written and displayed like \fBTXT\fR (BIND
+\fBgeneric_fromtext_txt()\fR); \fBEID\fR (31) and \fBNIMLOC\fR (32) are hex
+digits in one or more tokens (\fBEID 0102 0304\fR), an odd number of digits or a
+non-hex character is a zone file error, and they are displayed as one hex
+string. \fBNULL\fR (10) and the obsolete \fBUINFO\fR (100), \fBUID\fR (101),
+\fBGID\fR (102) and \fBUNSPEC\fR (103) have a name but no text form in BIND
+9.18/9.20 (\fBgen.c\fR only registers the names): they are accepted only as
+\fB\e# <length> <hex>\fR (a text form is a zone file error) and \fBdag\fR shows
+them in that form.
+.IP \(bu 2
+\fBCase of names\fR: owner names and the domain names inside RDATA are answered
+and transferred with the letters as written (RFC 4343 \[u00A7]4.1), for every
+type, from a zone file and from a database alike. The only exception is name
+compression (types NS, CNAME, PTR, MX, SOA, MINFO and the owner): a name that is
+compressed against an earlier name of the same message that differs only in case
+shows the case of the earlier one, as RFC 4343 \[u00A7]4.1 allows. The
+lower-case form of RFC 4034 \[u00A7]6.2 is used only where DNSSEC needs the
+canonical form (ZONEMD digests, UPDATE and IXFR comparisons, \fBkaricheck\fR).
+.IP \(bu 2
+\fBClasses\fR: \fBIN\fR (the default when the class is omitted), \fBCH\fR,
+\fBHS\fR and \fBCLASSnn\fR are kept with the record. The server answers queries
+of class IN and CH; records of other classes are loaded but not answered
+(queries of those classes are REFUSED). \fBNONE\fR, \fBANY\fR, \fBCLASS0\fR and
+class 65302 (used internally by KariDNS) are errors. \fBA zone has one class\fR,
+the class of its first record (a record without a class has it): a later record
+of another class is a zone file error at its line, with BIND's text
+(\fBlib/dns/master.c\fR) \fBclass 'CH' != zone class 'IN'\fR (\fBclass 'IN' !=
+zone class 'CH'\fR when the first record is a CH one). The same holds for the
+records of \fB$INCLUDE\fR files and \fB$GENERATE\fR.
+.IP \(bu 2
+\fBOmitted TTL\fR (same order as BIND): the TTL on the record; else \fB$TTL\fR
+(RFC 2308 \[u00A7]4); else the last TTL written explicitly on a record (RFC 1035
+\[u00A7]5.1, also across \fB$INCLUDE\fR); else, for an SOA record, its MINIMUM
+field, which then acts like \fB$TTL\fR; else 3600. BIND rejects such a zone ("no
+TTL specified"); here the zone loads, the server logs a warning with the file
+and line of the first such record and the number of records that got 3600
+(\fB<file>:<line>: no TTL specified for '<owner>' ...\fR; an \fB$INCLUDE\fR file
+is named by its own path), and \fBkaricheck zone\fR / \fBkaricheck conf\fR warn
+in the same words.
+.IP \(bu 2
+\fBTTL notation\fR (BIND 9.20 ARM 3.5.3 and 3.5.5.4: "Valid TTLs are of the
+range 0-2147483647 seconds"): digits with \fBs\fR, \fBm\fR, \fBh\fR, \fBd\fR,
+\fBw\fR units in any letter case, e.g. \fB3600\fR, \fB1h30m\fR, \fB1w2d\fR; as
+in BIND (lib/dns/ttl.c \fBbind_ttl()\fR) a number without a unit is accepted
+only on its own (\fB30\fR), not after a unit (\fB1h30\fR is an error), and the
+text may be at most 63 characters long. A \fB$TTL\fR or record TTL that is not
+in that notation (\fB1x\fR, \fBabc\fR, a sign, \fB1h\-5\fR) or above 2147483647
+is a zone file error at that position, as is a \fB$TTL\fR without a value. It
+used to be read as 3600 without a word. The SOA refresh, retry, expire and
+minimum fields use the same notation (up to 4294967295) and are errors when
+malformed. \fBThe SOA serial\fR must be a plain decimal number 0-4294967295
+(leading zeros allowed): BIND 9.20 reads it as a number token
+(lib/dns/rdata/generic/soa_6.c \fBfromtext_soa()\fR, lib/isc/lex.c,
+lib/isc/parseint.c) and rejects the zone for a sign, a unit, a hex prefix, an
+empty value or a value above 32 bits; here such a serial is a zone file error
+(\fBInvalid SOA serial ...\fR / \fBSOA serial out of range ...\fR) at its
+position, also in the \fBZ\fR line of a tinydns data file (an empty tinydns
+serial still means the time stamp of the data file). It used to be read as 0 or
+cut to 32 bits. A TTL above 2147483647 in a transferred or database record is
+still served as 2147483647 (RFC 8767 \[u00A7]4).
+.IP \(bu 2
+\fB\fB$ORIGIN <name>\fB\fR and the origin argument of \fB\fB$INCLUDE <file>
+[<origin>]\fB\fR: a name without a trailing dot is relative to the current
+origin (RFC 1035 \[u00A7]5.1). \fB$INCLUDE\fR does not change the origin of the
+including file.
+.IP \(bu 2
+\fB\fB$INCLUDE\fB paths\fR (BIND 9.20 ARM 3.5.5.3: "The filename can be an
+absolute path, or a relative path"): a relative name is read from \fBoptions {
+directory }\fR when it is set (BIND: named's working directory), otherwise from
+the directory of the zone file. The server reads files in capability mode and
+can open only directories that it opened when it started, so the file must lie
+inside one of two trees: the directory of the zone file, or \fBdirectory\fR. An
+absolute path, or a path that leaves the base through \fB..\fR, is accepted only
+when the normalized path (no symbolic link is looked at) stays inside one of
+those trees; any other is a zone file error, for example
+\fB$INCLUDE '/etc/hosts' is outside the directories opened at startup (zone file
+dir, directory): the sandboxed server can read only below them\fR. \fBkaricheck
+zone\fR applies the same rules and gives the same message. A reload may bring in
+a file in a sub-directory that did not exist at start-up, as long as it is below
+one of those trees.
+.IP \(bu 2
+\fB\fB$GENERATE <range> <lhs> [<TTL>] [<class>] <type> <rhs>\fB\fR (BIND
+syntax): \fB<range>\fR is \fBstart\-stop[/step]\fR (at most 100,000
+records). For each value, \fB$\fR in \fB<lhs>\fR and \fB<rhs>\fR is replaced by
+the value, \fB${offset[,width[,base]]}\fR with base \fBd\fR, \fBo\fR, \fBx\fR,
+\fBX\fR, \fBn\fR or \fBN\fR (\fBn\fR/\fBN\fR: nibbles in reverse order separated
+by dots, as for \fBip6.arpa\fR; the width counts the dots), \fB$$\fR gives
+\fB$\fR and \fB\e$\fR a literal \fB$\fR. Any RR type can be generated; the
+resulting line is read like any other record line, so
+\fB$ECS\-SUBNET\fR/\fB$LOCATION\fR tags and the TTL rules apply. \fB<rhs>\fR is
+one field: quote RDATA that contains spaces, e.g. \fB$GENERATE 1\-10 host$ MX
+"10 mail$"\fR. The quotes only keep the field together; the text inside is split
+on blanks again, so one TXT character-string that contains a blank cannot be
+generated (BIND keeps \fBTXT "a b"\fR as one string): put such records in the
+zone file itself.
+.SH TINYDNS ZONE FORMAT
+KariDNS can load zone data directly from djbdns/tinydns-style plain-text
+\fBdata\fR files (not the compiled \fBdata.cdb\fR), in addition to standard
+BIND-style zone files.
+.PP
+.RS 2
+.nf
+zone "example.com." {
+    type master;
+    file "/usr/local/etc/karidns/data/example.com.tinydns";
+    file\-format tinydns;   # omit for the default "bind" format
+};
+.fi
+.RE
+.PP
+A single \fBdata\fR file that mixes forward-zone records (e.g. \fB=host:ip\fR)
+and reverse-zone records (\fBin\-addr.arpa.\fR) can be referenced from multiple
+\fBzone {}\fR blocks simultaneously; each zone automatically keeps only the
+records belonging to it (longest-suffix match against all configured zone names,
+so parent/child zone delegation is handled correctly without duplicate records).
+.PP
+.RS 4
+\fBNote:\fR \fBNumeric fields and lines that cannot be kept:\fR the tinydns
+parser does not limit the 8-, 16- and 32-bit numeric fields of the extension
+lines (\fBS\fR, \fBN\fR, \fB_\fR, ...). djbdns itself truncates such a value;
+KariDNS keeps it, and a record whose value does not fit its field is left out
+with a warning when the zone is loaded (\fBkaricheck\fR reports it as
+\fBzone.record.wire\fR). An SSHFP line whose fingerprint is not hexadecimal is
+left out as well; \fBkaricheck\fR reports it once per file
+(\fBzone.tinydns.skipped\fR).
+.RE
+.PP
+.RS 4
+\fBNote:\fR \fBtinydns Format Support Scope:\fR
+.IP \(bu 2
+\fBVerified against djbdns 1.05 source\fR: Record types \fB.\fR \fB&\fR \fB+\fR
+\fB=\fR \fB\-\fR \fB@\fR \fB'\fR \fB^\fR \fBC\fR \fBZ\fR \fB:\fR are supported,
+including exact default TTL values, the \fBx\fR (nameserver/MX target) expansion
+rules, 127-byte TXT character-string chunking, and the same lenient IPv4 octet
+parsing (no range validation, trailing garbage tolerated) as the original
+\fBtinydns\-data\fR.
+.IP \(bu 2
+\fBExtensions\fR (not in djbdns 1.05). Empty numeric fields are 0; the default
+TTL is 86400; \fBtimestamp\fR and \fBlo\fR work as for the other types:
+.RS 2
+.IP \(bu 2
+\fB3fqdn:ip6:ttl:timestamp:lo\fR: AAAA. \fBip6\fR is 32 hex digits without
+colons (e.g. \fB20010db8000000000000000000000001\fR).
+.IP \(bu 2
+\fB6fqdn:ip6:ttl:timestamp:lo\fR: AAAA plus PTR records under \fBip6.arpa\fR and
+\fBip6.int\fR.
+.IP \(bu 2
+\fBSfqdn:ip:x:port:weight:priority:ttl:timestamp:lo\fR: SRV with target \fBx\fR
+(a full name, no expansion), plus an A record for \fBx\fR when \fBip\fR is
+given.
+.IP \(bu 2
+\fBNfqdn:order:pref:flags:service:regexp:replacement:ttl:timestamp:lo\fR:
+NAPTR. \fBflags\fR, \fBservice\fR and \fBregexp\fR take the octal escapes of
+\fB:\fR records.
+.IP \(bu 2
+\fB_fqdn:algorithm:fptype:fingerprint:ttl:timestamp:lo\fR: SSHFP with a hex
+fingerprint; a line whose fingerprint is not valid hex is skipped.
+.RE
+.IP \(bu 2
+\fB\fBtimestamp\fB field\fR: Supported with \fBreal-time query evaluation\fR,
+identical to original djbdns behavior. A record whose \fBtimestamp\fR is in the
+future is excluded dynamically on every query (not just at load time). The
+\fBttl=0\fR "countdown TTL" variant is likewise computed on every query: the
+remaining seconds until the timestamp are clamped to [2, 3600] and served as the
+record TTL.
+.IP \(bu 2
+\fB\fB%\fB location (split-horizon by client IP)\fR: Supported natively during
+query resolution. KariDNS compiles \fB%<loc>:<prefix>\fR location lines and
+trailing \fB:loc\fR record fields into memory, performing bitwise longest-prefix
+matching against the querying client's source IPv4 address with zero heap
+allocation on the hot path. As an extension, \fB<prefix>\fR may end in \fB/n\fR
+(\fB/0\fR\[u2013]\fB/32\fR) to give the prefix length in bits,
+e.g. \fB%in:10.0.0.0/8\fR.
+.RE
+.SS Several SOA records, and a client that sees none (milestone B8t-1)
+A zone can have one SOA record per client group: a \fBZ\fR line per location in
+a tinydns data file (the format allows it: \fBtinydns\-data.c\fR stores the SOA
+like every record, with its location and time stamp), or \fB$LOCATION\fR /
+\fB$ECS\-SUBNET\fR\-tagged SOA records in a zone file. Several SOA records that
+every client sees stay an error (\fBkaricheck\fR). The rules, for a zone file
+and for a database zone alike:
+.IP \(bu 2
+\fBOne serial.\fR All SOA records of the zone have the same serial (RFC 2181
+\[u00A7]6.1: one SOA per zone, so one zone serial). A zone that breaks this is
+not loaded: a reload logs \fBzone '...' not loaded from '...': the SOA records
+of zone '...' have different serials (...)\fR and the version in service stays;
+\fBkaricheck\fR reports an error. A zone that holds DNSSEC records (RRSIG,
+DNSKEY, NSEC, NSEC3) cannot have several or restricted SOA records either: the
+signature of the SOA RRset would not hold for every client.
+.IP \(bu 2
+\fBReference SOA.\fR The SOA record without a location, time stamp or tag if
+there is one, else the first in file (row) order. Everything that is zone-wide
+comes from it: the serial (SOA queries of a secondary, NOTIFY, IXFR, the serial
+that Dynamic Update raises in all of them), refresh / retry / expire, and the
+EDNS EXPIRE value (RFC 7314).
+.IP \(bu 2
+\fBAnswers.\fR The SOA a client gets is the first SOA it can see, with the rules
+that decide the other records (its tinydns location, its \fB$LOCATION\fR /
+\fB$ECS\-SUBNET\fR tag, the tinydns time stamp and countdown, as
+\fBtdlookup.c\fR does). A query for the SOA (or ANY) at the apex gets that one
+SOA only. NXDOMAIN and NODATA carry it in the authority section (RFC 2308
+\[u00A7]3) and its MINIMUM is the negative TTL (RFC 2308 \[u00A7]5).
+.IP \(bu 2
+\fBA client that sees no SOA\fR of the zone, whether or not it sees an NS
+record, gets \fBREFUSED with AA=0 and Extended DNS Error 18 (Prohibited, RFC
+8914 \[u00A7]4.19)\fR, for every name and type of the zone and for a zone
+transfer. This is the answer of BIND 9.20 to a client a zone is not served to
+(no matching view, \fBallow\-query\fR denial); \fBtdlookup.c\fR differs: with a
+visible NS it answers a referral without AA, and with nothing visible it sends
+no response. The zone is treated as not served to that client: the closest zone
+decides, there is no fall back to the answer of a parent zone (a parent's
+referral to the child is not shown), and a CNAME chain that leads into such a
+zone ends at the CNAME.
+.IP \(bu 2
+\fBStandard AXFR and IXFR\fR (a request without the KariDNS extension, e.g. from
+BIND, NSD or \fBdig\fR) of a zone with per-client records is the zone \fBas the
+requester sees it now\fR, as \fBaxfrdns.c\fR builds it: the RRs the requester's
+address does not match (tinydns location, \fB$LOCATION\fR tag) or that are not
+active (time stamp) are not sent, a record with a countdown TTL is sent with TTL
+2, no location, tag or time stamp is sent, an \fB$ECS\-SUBNET\fR\-tagged RR is
+not sent (a transfer has no client subnet), the opening and closing SOA is the
+first SOA the requester sees, and a requester that sees none is refused
+(REFUSED, AA=0, EDE 18). Every other SOA record is left out of the body. A zone
+without such RRs is transferred as before. (Before this release a standard
+transfer left out every restricted RR, and it kept all SOA records.) An IXFR of
+such a zone is answered with the whole zone, as RFC 1995 \[u00A7]4 allows,
+unless the requester is up to date (then one SOA).
+.IP \(bu 2
+\fBExtended AXFR of such a zone (milestone B8t-2)\fR is the whole zone, for a
+KariDNS secondary that speaks version 3 (see "Secondary zones: Extended AXFR
+version 3 and the settings of the primary"): the frame is the reference SOA,
+every SOA record travels in the body with its attributes, and the secondary ends
+up with exactly the SOA set of the primary and answers each client as the
+primary does. A secondary of version 2 is refused (REFUSED with a text): sending
+it the reference SOA alone would show a hidden SOA to everybody. A KariDNS
+secondary outside every SOA's location can still refresh: the extension makes
+the primary answer with the reference SOA whatever the requester's address is (a
+SOA or IXFR question that carries the extension option for the zone gets it
+too).
+.IP \(bu 2
+\fBTTLs of an RRset (milestone B8t-2).\fR The TTLs of the RRs of one name and
+type are brought to the lowest one (RFC 2181 \[u00A7]5.2) only among RRs that
+are seen by the same clients: no location / tag / time stamp, or the same. An RR
+that only some clients see keeps the TTL it was written with, also when an RR
+that everybody sees has the same name and type: a client that sees both gets an
+RRset whose RRs have different TTLs, as it does from tinydns
+(\fB+www:192.0.2.1:300\fR and \fB+www:192.0.2.2:60::in\fR). \fBkaricheck\fR
+warns for that case (an unrestricted and a restricted RR of one name and type
+with different TTLs). A zone without such RRs is unchanged. The rule is the same
+for zone files, database zones and zones received from a primary.
+.IP \(bu 2
+\fBCache.\fR A zone with restricted RRs is never served from the response cache,
+so the answer cannot be shared between clients.
+.PP
+The reference run against djbdns 1.05
+(\fBtests/run_tinydns_soa_location_test.sh\fR with \fBDJBDNS_DIR\fR) shows the
+same SOA for each location, the same NXDOMAIN and the same transfer records; the
+difference is the client that sees no SOA (above).
+.SH CLIENT GEOLOCATION & SUBNET STEERING (ECS & LOCATION)
+KariDNS provides high-performance, record-level split-horizon response steering
+across both BIND and tinydns zone formats:
+.IP \(bu 2
+\fBBIND Zone \fB$LOCATION\fB & \fB$LOCATION\-TAG\fB\fR: Steers responses based
+on the querying client's immediate socket IP address (IPv4 and IPv6). Tags can
+be defined directly in zone files (\fB$LOCATION\-TAG <tag> <cidrs>\fR) or in
+\fBkaridns.conf\fR (\fBlocation\-tags\fR).
+.IP \(bu 2
+\fBBIND Zone \fB$ECS\-SUBNET\fB & \fB$ECS\-SUBNET\-TAG\fB\fR: Steers responses
+based on EDNS0 Client Subnet (ECS, RFC 7871) options supplied by trusted
+recursive resolvers (\fBecs\-enable yes;\fR and
+\fBecs\-trusted\-resolvers\fR). Tags can be defined in zone files
+(\fB$ECS\-SUBNET\-TAG\fR) or in \fBkaridns.conf\fR (\fBecs\-tags\fR).
+.IP \(bu 2
+\fBtinydns \fBlocation\fB (\fB%\fB)\fR: Steers responses based on client IPv4
+longest-prefix matching declared with \fB%<loc>:<prefix>\fR lines and trailing
+\fB:loc\fR record tags.
+.IP \(bu 2
+\fBSeveral SOA records per zone (B8t-1)\fR: a SOA can carry a tinydns location
+or time stamp, or a \fB$LOCATION\fR / \fB$ECS\-SUBNET\fR tag; a client gets the
+first SOA it sees, and a client that sees none is refused. See "Several SOA
+records, and a client that sees none" in the tinydns section.
+.IP \(bu 2
+\fBTTLs of records that only some clients see (B8t-2)\fR: the lowest-TTL rule
+for an RRset (RFC 2181 \[u00A7]5.2) applies only among records with the same
+location, tag and time stamp; a record with a location, tag or time stamp keeps
+the TTL it was written with, also beside a record for everybody. \fBkaricheck\fR
+warns when the two have different TTLs. See "Several SOA records, and a client
+that sees none".
+.IP \(bu 2
+\fBKariDNS Extended AXFR (Option 65153)\fR: Replicates zone directives, tags,
+the SOA set and (version 3) the primary's zone settings across KariDNS primary
+and secondary servers, while providing a standard AXFR fallback (Plan B) for
+non-KariDNS clients: the zone as the requester sees it. See "Secondary zones:
+Extended AXFR version 3 and the settings of the primary".
+.PP
+For complete configuration syntax, query evaluation flows, and Extended AXFR
+details, see \fBKariDNS: Client Geolocation & Subnet Steering Guide\fR.
+.SH EXIT STATUS
+.TP 8
+\fB0\fR
+\fB\-v\fR / \fB\-\-version\fR, or the server was stopped (\fBSIGTERM\fR,
+\fBSIGINT\fR, \fBkarictl stop\fR).
+.TP 8
+\fB1\fR
+The server did not start or stopped on an error: the configuration file cannot
+be read or has errors, a port, log file, PID file or control socket cannot be
+opened, or the server could not carry on.
+.TP 8
+\fB2\fR
+Usage error: no configuration file was given, or the value of \fB\-p\fR is a
+number outside 1-65535. The usage text goes to standard error (and syslog);
+nothing was started. The tools \fBkaricheck\fR, \fBkarictl\fR and
+\fBkaridns\-dbloader\fR use 2 for usage errors in the same way; \fBdag\fR
+follows \fBdig\fR instead.
+.SH SIGNALS
+.TP 8
+\fBSIGHUP\fR
+Same as \fBkarictl reconfig\fR: re-reads the configuration file and swaps it in
+atomically (RCU). Zone files whose modification time and size have not changed
+since they were loaded are not re-read; use \fBkarictl reload\fR to re-read all
+zone files. Send it to the manager process (the PID in the PID file); the
+manager forwards it to the backend. When it reaches every process (\fBpkill
+\-HUP karidns\fR), the server still reloads once: the backend acts only on the
+manager's forward, and a \fBSIGHUP\fR sent to the backend process alone is
+logged and ignored.
+.TP 8
+\fBSIGTERM\fR, \fBSIGINT\fR
+Sent to the manager process, stops all child processes (backend, frontend
+routers, connect broker), removes the PID file and exits. A child that has not
+ended 10 seconds after the SIGTERM it was sent is killed with SIGKILL (logged);
+a second \fBSIGTERM\fR or \fBSIGINT\fR to the manager kills the remaining
+children at once. The exit status is then non-zero.
+.SH ENVIRONMENT
+.TP 8
+\fBTZ\fR
+The time zone of the time stamps (\fBprint\-time local\fR); passed on to
+\fBkaridns\-dbloader\fR and the program zone plugins.
+.TP 8
+\fBKARIDNS_NOSYSLOG=1\fR
+A test hook (0.7, in the spirit of BIND's \fBnamed \-T nosyslog\fR): every line
+the server would give \fBsyslog(3)\fR -- the built-in \fBdefault_syslog\fR,
+\fBsyslog\fR channels, and the messages written before the logging statement is
+in force -- goes to standard error only, as \fBKariDNS <pid> \- \- <text>\fR,
+the same copy that \fBopenlog(3)\fR's \fBLOG_PERROR\fR prints on standard error
+anyway. The system log gets nothing; file and \fBstderr\fR channels are
+unchanged. Only the value \fB1\fR counts. The integration tests export it
+(\fBtests/lib_proc.sh\fR), so that the servers they start do not fill the build
+host's \fB/var/log/messages\fR and still show their messages on the standard
+error the tests read. Do not set it for a daemonized server: its standard error
+is \fB/dev/null\fR, so those lines would be lost.
+.TP 8
+\fBKARIDNS_XFER_MINUTE_SECS=n\fR
+A test hook: a "minute" of the transfer time limits is n seconds (1..60); see
+\fBmax\-transfer\-time\-in\fR and the related options.
+.SH FILES
+.TP 8
+\fB/usr/local/etc/karidns/karidns.conf\fR
+Configuration file used by the FreeBSD \fBrc.d\fR script
+(\fBkaridns_config\fR). The package installs \fBkaridns.conf.sample\fR next to
+it.
+.TP 8
+\fB/var/run/karidns/control.sock\fR
+Default UNIX domain socket for control communication with \fBkarictl\fR.
+.TP 8
+\fB/var/run/karidns/karidns.pid\fR
+Default process ID file when daemonized.
+.TP 8
+\fB<directory>/karidns.run\fR
+The built-in \fBdefault_debug\fR channel (BIND's \fBnamed.run\fR), in \fBoptions
+{ directory }\fR: created at the start, written while the debug level
+(\fB\-d\fR, \fBkarictl trace\fR) is above 0. Not made without a directory. See
+\fBlogging { ... }\fR.
+.TP 8
+\fB/usr/local/libexec/karidns\-dbloader\fR
+The database loader (the packages \fBkaridns\-sqlite3\fR,
+\fBkaridns\-postgresql\fR and \fBkaridns\-db\fR; the default
+\fBloader\-path\fR).
+.TP 8
+\fB/usr/local/bin/karidns\-zone\fR
+The zone importer and exporter (the same packages; \fBkaridns\-zone(8)\fR).
+.TP 8
+\fB/usr/local/share/karidns/db/\fR
+The SQL files for the databases (\fBkaridns_ext.*.sql\fR,
+\fBkaridns_ext_v1_to_v2.*.sql\fR, \fBkaridns_loader_role.pgsql.sql\fR,
+\fBkaridns_writer_role.pgsql.sql\fR); \fBdb/\fR in a source tree. See
+\fBkaridns\-dbloader(8)\fR.
+.TP 8
+\fB/usr/local/share/doc/karidns/\fR
+These manuals (\fBkaridns.md\fR, \fBkarictl.md\fR, \fBkaricheck.md\fR,
+\fBdag.md\fR, \fBdag_replay.md\fR and, with the loader,
+\fBkaridns\-dbloader.md\fR, \fBkaridns\-zone.md\fR and
+\fBkaridns\-signer.md\fR).
+.SH SEE ALSO
+karidns.conf(5)
+.IP \(bu 2
+\fBkarictl(8)\fR \[u2014] KariDNS server management and control utility
+.IP \(bu 2
+\fBkaricheck(8)\fR \[u2014] Configuration and zone file validation utility
+.IP \(bu 2
+\fBkaridns\-dbloader(8)\fR \[u2014] The database loader: drivers, SQL files,
+privileges, packages, measurements
+.IP \(bu 2
+\fBkaridns\-signer(8)\fR \[u2014] The signer daemon: keeps the zones of a
+database signed (key requests, scheduling, key rollover)
+.IP \(bu 2
+\fBkaridns\-zone(8)\fR \[u2014] Import and export of zones in a PowerDNS
+database (modes, serial rules, views, the writer role, backups)
+.IP \(bu 2
+\fBdag(1)\fR \[u2014] DNS anomaly generator and test client
+.IP \(bu 2
+\fBKariDNS 'type program' Zone Guide\fR \[u2014] Complete guide to external
+dynamic program zone plugins (IPC specs, Perl/Python/C/Rust/Go implementations)
+.IP \(bu 2
+\fBKariDNS Client Geolocation & Subnet Steering Guide\fR \[u2014] Comprehensive
+guide for BIND $LOCATION, $ECS-SUBNET, tinydns location, and Extended AXFR
+.IP \(bu 2
+\fBKariDNS RFC Guideline\fR \[u2014] Detailed RFC compliance and design boundary
+document
+.SH AUTHORS
+Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)
