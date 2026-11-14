@@ -307,6 +307,9 @@ int  store_repair(store_t *s);
 /* ---- statistics, verification ---- */
 void store_stats(const store_t *s, store_stats_t *out);                 /* O(views), no lock */
 int  store_seg_info(const store_t *s, uint32_t num, store_seg_info_t *out);  /* num 1..seg_count */
+/* Page-cache residency estimate: mincore() on up to `pages` random pages of the appended part of the segments (MAP mode; -ENOTSUP in
+ * COPY mode, -errno when mincore() is refused, e.g. in a sandbox).  *sampled pages looked at, *resident of them in memory.  Bounded, no lock. */
+int  store_resident_sample(const store_t *s, unsigned pages, uint64_t seed, uint64_t *sampled, uint64_t *resident);
 /* Full consistency check (O(zones), takes the writer mutex): every record valid, every zone reachable through ix / sx, counters
  * and live bytes equal the recount, the free list intact, no duplicate names.  For tests, `karictl store verify`, the scrub. */
 int  store_check(store_t *s, store_check_report_t *rep);

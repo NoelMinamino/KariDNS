@@ -55,9 +55,11 @@ typedef struct {
   uint8_t zlen;
   uint8_t vlen;
   uint16_t udp_len;                  /* UDP: the request length */
-  uint16_t reserved;
+  uint8_t attach;                    /* 0.7 store S2: parked for an ATTACH from the store (park_mark_attach()): the deadline is the attach deadline, the time to answer is noted */
+  uint8_t reserved;
   uint32_t gen;                      /* changes every time the entry is given out */
   int64_t deadline_ms;               /* CLOCK_MONOTONIC */
+  int64_t t_park_ns;                 /* attach parks only: CLOCK_MONOTONIC in ns when the query was parked */
   char view[PARK_VIEW_MAX + 1];      /* the view the query came in on */
   char zone[PARK_ZONE_MAX + 1];      /* the zone the query waits for, as the directory names it (canonical, lower case) */
   union {
@@ -105,6 +107,10 @@ park_entry_t *park_get(park_table_t *t, int32_t idx, uint32_t gen);
 uint32_t park_wake(park_table_t *t, const char *view, const char *zone);
 /* WAIT -> TIMEOUT for them: the fetch failed, so the worker answers at once as it does when the time is up. */
 uint32_t park_fail(park_table_t *t, const char *view, const char *zone);
+/* 0.7 store S2: the queries that wait for (view, zone) stay parked, with a new deadline (the attach did not work and the zone is fetched now: the park-timeout runs from here).  Returns how many. */
+uint32_t park_retry(park_table_t *t, const char *view, const char *zone, int64_t new_deadline_ms);
+/* the entry idx (just parked) waits for an ATTACH from the store (the worker notes the time it took, dns_store_status.h), with the time in ns now */
+void park_mark_attach(park_table_t *t, int32_t idx, int64_t now_ns);
 uint32_t park_wake_all(park_table_t *t);
 /* WAIT -> TIMEOUT for every entry whose deadline is now or past.  Returns how many. */
 uint32_t park_expire(park_table_t *t, int64_t now_ms);
@@ -121,6 +127,7 @@ int64_t park_next_deadline_ms(const park_table_t *t, int64_t now_ms);
 typedef struct {
   uint8_t vlen, zlen;
   bool failed;                       /* the fetch failed: the queries waiting for the zone are answered at once, not woken */
+  bool retry;                        /* 0.7 store S2: the attach did not work (a stale or damaged record): the zone is fetched from the database now; the queries that wait for it get a new deadline (park_retry()) and stay parked */
   char view[PARK_VIEW_MAX + 1];
   char zone[PARK_ZONE_MAX + 1];
 } park_key_t;
@@ -129,10 +136,12 @@ typedef struct {
   park_key_t k[PARK_WAKE_RING];
   _Atomic uint32_t head, tail;       /* producer writes head, consumer tail; indexes grow without wrapping, slot = index % ring */
   _Atomic bool overflow;             /* a wake was dropped: the consumer wakes everything */
+  _Atomic bool plock;                /* 0.7 store S2: the producers (the ingest thread, the store threads) take turns: a short spin lock; the consumer is lock free */
   _Atomic uint64_t dropped;
 } park_wake_ring_t;
 
 bool park_wake_push(park_wake_ring_t *r, const char *view, const char *zone, bool failed);
+bool park_wake_push_ex(park_wake_ring_t *r, const char *view, const char *zone, bool failed, bool retry);
 bool park_wake_pop(park_wake_ring_t *r, park_key_t *out);
 bool park_wake_take_overflow(park_wake_ring_t *r);
 /* Is there anything for the consumer: a key in the ring, or a dropped wake?  Two loads, no clock; the worker asks before it does the rest. */
@@ -228,6 +237,8 @@ void park_wake_broadcast(const char *view, const char *zone, bool failed);
  * per worker however many keys were queued, which the thread calls when it has done its batch of work (a trigger is a system call: seven microseconds a worker). */
 void park_wake_queue_all(const char *view, const char *zone, bool failed);
 void park_wake_queue_one(int w, const char *view, const char *zone, bool failed);
+/* the attach of (view, zone) did not work and a fetch is on its way: every worker's parked queries for it get a new deadline and stay parked */
+void park_wake_queue_retry(const char *view, const char *zone);
 void park_wake_flush(void);
 /* The ingest thread's kqueue and the ident a worker triggers after pushing a fetch request (-1: none). */
 #define PARK_FETCH_IDENT 0x66657463u   /* "fetc" */
@@ -246,5 +257,21 @@ bool park_fetch_request_any(const char *view, const char *zone, uint8_t prio, ui
 void park_bg_fetch(const char *view, const char *zone);
 /* ingest side: the next request from any worker or from park_fetch_request_any() (round robin), false when there is none */
 bool park_fetch_next(park_fetch_req_t *out);
+
+/* ---- 0.7 store S2: ATTACH requests, from the workers to the store threads (dns_db_store.c) ----
+ * A query for a database zone that is out of memory and whose current version the store holds is parked with the attach deadline (200 ms); the worker asks the
+ * store threads, not the ingest thread (whose 90-100 us per zone would queue the attach behind a fill).  Per worker one single-producer ring, as the fetch
+ * rings; the store threads take requests one at a time under a consumer lock (they are few, and it is not the query path).  The sleep protocol is the fetch
+ * thread's: a worker triggers the store threads' kqueue only when one of them may be asleep. */
+#define PARK_ATTACH_IDENT 0x61747463u  /* "attc" */
+#define PARK_ATTACH_DEADLINE_MS 200
+bool park_attach_request(int w, const char *view, const char *zone);
+/* The store threads' side: the next request from any worker (round robin).  false: none. */
+bool park_attach_next(park_fetch_req_t *out);
+void park_attach_set_notify(int kq);
+bool park_attach_sleep_prepare(void);   /* before waiting: says "asleep" and looks once more; true: there is a request, do not wait */
+void park_attach_sleep_done(void);
+bool park_attach_pending(void);
+uint64_t park_attach_dropped(void);       /* requests the rings could not take */
 
 #endif /* DNS_PARK_H */

@@ -606,6 +606,204 @@ karictl dbstatus example.test
 .RE
 .RE
 .TP 8
+\fBstore [\-j | \-k] [zone <name> [view]]\fR
+Show the zone store of the database zones (0.7): its state, the zones in it, the
+zones in memory, how often zones were attached and how fast, the queries that
+had to wait for a zone ("cold" queries), the second-level cache and the memory
+advice. Every figure is a counter, a value kept where it changes, or a bounded
+sample: a request never walks the zones, and a poll costs the same at 10 million
+zones as at a hundred, so it is safe once a second. Reading never resets a
+counter. \fBstore\fR needs the same permission as \fBdbstatus\fR (a
+\fBread\-only yes\fR key has it).
+.RS 8
+.PP
+Three forms of the same figures: the default is text in sections for a person;
+\fB\-j\fR is one JSON object; \fB\-k\fR is one \fBkey=value\fR line per figure
+for shell scripts. WebAdmin and the dnstap-live dashboard poll the JSON
+form. \fBzone <name> [view]\fR shows the record of one zone instead: one index
+lookup, the zone is not attached (a name that exists in several views needs the
+view; case and a trailing dot do not matter). Without a store in the
+configuration, or before the Backend has opened it, the command still works:
+\fBstore.state\fR is \fBnone\fR, and the attach counters and the memory figures
+are there.
+.PP
+.RS 2
+.nf
+karictl store
+karictl store \-j
+karictl store \-k | grep '^store.attach.p99_us='
+karictl store zone example.test
+karictl store \-j zone example.test external
+.fi
+.RE
+.PP
+On ZFS the server cannot read the ARC statistics (it runs in a sandbox);
+\fBstore.cache.kind\fR is \fBarc\fR, and \fBkarictl\fR itself appends the
+\fBstore.cache.arc.*\fR keys from \fBkstat.zfs.misc.arcstats.*\fR. On UFS the
+share of segment pages that are in memory is a \fBmincore(2)\fR sample of at
+most 4096 random pages, taken at most every 10 seconds; where \fBmincore\fR is
+not allowed \fBstore.cache.page.available\fR is 0 and
+\fBstore.cache.page.note\fR says \fBn/a\fR and why.
+.PP
+\fBThe names of the keys are an interface.\fR They are flat and dotted, the same
+in the \fB\-j\fR and the \fB\-k\fR form; in JSON every number is a number (an
+integer, never a string, never a float) and every other value a
+string. \fBschema\fR is the version of the list (now 1): a key is never renamed
+or given another unit within a schema, new keys can appear at any time, so a
+reader takes the keys it knows and ignores the others. Names ending in
+\fB_bytes\fR are bytes, \fB_us\fR microseconds, \fB_pct\fR an integer
+percentage; a latency percentile is the upper bound of the bucket it falls in
+(the buckets are 1, 2, 4, ... 8388608 microseconds, so it is exact to a factor
+of 2); \fBmax_us\fR is exact. A rate is the difference of a counter between two
+polls divided by the difference of \fBstore.time.mono_ms\fR (the server's
+monotonic clock in milliseconds; \fBstore.time.unix\fR is the wall clock in
+seconds).
+.TP 8
+\fBschema\fR
+Version of this key list (1)
+.TP 8
+\fBstore.time.mono_ms\fR, \fBstore.time.unix\fR
+Server's monotonic clock in milliseconds, wall clock in seconds, at the moment
+of the reply
+.TP 8
+\fBstore.state\fR
+\fBnone\fR (no store), \fBok\fR, or \fBdegraded\fR (the last write failed: disk
+full)
+.TP 8
+\fBstore.state_bits\fR
+The state as bits: 1 disk full, 2 repaired at the last open
+.TP 8
+\fBstore.format\fR, \fBstore.mode\fR, \fBstore.fstype\fR, \fBstore.uuid\fR
+Store format version; \fBmap\fR (segments mapped) or \fBcopy\fR (read with
+\fBpread\fR, for ZFS); file system type; store identity (32 hex digits). With
+\fBstore.state\fR \fBnone\fR this and every key down to \fBstore.cache.*\fR is
+absent
+.TP 8
+\fBstore.clean_flag\fR
+1 when the superblock on disk says "clean stop" (0 while the server runs)
+.TP 8
+\fBstore.zones.known\fR, \fB.stored\fR, \fB.rejected\fR, \fB.free\fR
+Zones in the store by state: known without an image (the database fetch has
+them), stored (an image is in the store), rejected (flagged by the last
+reconcile), free table slots
+.TP 8
+\fBstore.zones.attached\fR
+Zones attached (in memory as images) now: successful attaches minus detaches
+.TP 8
+\fBstore.zones.image_bytes\fR
+Bytes of the stored images (records)
+.TP 8
+\fBstore.views.count\fR
+Views in the store
+.TP 8
+\fBstore.view.<n>.name\fR, \fB.known\fR, \fB.stored\fR, \fB.rejected\fR, \fB.image_bytes\fR
+The same per view, \fB<n>\fR = 0, 1, ... (the store's view number)
+.TP 8
+\fBstore.tables.zt_records\fR, \fB.zt_capacity\fR, \fB.nx_used_bytes\fR, \fB.nx_dead_bytes\fR
+Zone table records in use and room; long names, used and dead
+.TP 8
+\fBstore.tables.ix_gen\fR, \fB.ix_slots\fR, \fB.ix_used\fR, \fB.ix_live\fR, \fB.sx_gen\fR, \fB.sx_slots\fR, \fB.sx_used\fR, \fB.sx_live\fR
+Name index and source index: generation, slots, slots used, live entries
+.TP 8
+\fBstore.segments.count\fR, \fB.used_bytes\fR, \fB.live_bytes\fR, \fB.dead_pct\fR
+Image segments: number, bytes appended, bytes still referenced, share that a
+cleaner would free
+.TP 8
+\fBstore.journal.lsn\fR, \fB.checkpoint_lsn\fR, \fB.committed_lsn\fR, \fB.bytes\fR, \fB.gen\fR
+Journal position, last checkpoint, last durable commit, size, generation
+.TP 8
+\fBstore.checkpoint.count\fR, \fB.last_unix\fR, \fB.last_us\fR
+Checkpoints since the open, when the last one ended, how long it took
+.TP 8
+\fBstore.writes.commits\fR, \fB.puts\fR, \fB.replaces\fR, \fB.deletes\fR, \fB.growths\fR, \fB.errors\fR
+Writer counters since the open
+.TP 8
+\fBstore.recovery.created\fR, \fB.was_clean\fR, \fB.used_older_super\fR, \fB.rebuilt\fR, \fB.journals_read\fR, \fB.records_replayed\fR, \fB.journal_torn\fR, \fB.rebuilt_zones\fR, \fB.dropped_zones\fR, \fB.open_us\fR
+What the last open found and did, and how long it took
+.TP 8
+\fBstore.cache.kind\fR
+\fBpage\fR (UFS: \fBmincore\fR sample), \fBarc\fR (ZFS), \fBcopy\fR
+.TP 8
+\fBstore.cache.page.available\fR
+1 when the sample worked, else 0 and \fBstore.cache.page.note\fR ("n/a: ...")
+.TP 8
+\fBstore.cache.page.sampled_pages\fR, \fB.resident_pages\fR, \fB.resident_pct\fR, \fB.sample_age_ms\fR
+The sample: pages looked at, of them in memory, the share, age of the sample
+.TP 8
+\fBstore.cache.note\fR
+On ZFS: \fBsee karictl (ARC kstats)\fR
+.TP 8
+\fBstore.cache.arc.available\fR, \fB.size_bytes\fR, \fB.target_bytes\fR, \fB.target_min_bytes\fR, \fB.target_max_bytes\fR, \fB.hits\fR, \fB.misses\fR, \fB.hit_pct\fR, \fB.compressed_bytes\fR, \fB.uncompressed_bytes\fR
+ARC figures, added by \fBkarictl\fR on ZFS (a kstat that cannot be read is left
+out)
+.TP 8
+\fBstore.attach.count\fR
+Zones attached from the store since the start
+.TP 8
+\fBstore.attach.failed\fR
+Attaches that failed; \fBstore.attach.fail.checksum\fR, \fB.record\fR,
+\fB.invalid\fR, \fB.io\fR, \fB.memory\fR, \fB.other\fR by cause
+.TP 8
+\fBstore.attach.p50_us\fR, \fB.p90_us\fR, \fB.p99_us\fR, \fB.max_us\fR
+Time of an attach
+.TP 8
+\fBstore.attach.hist.le_<2^i>us\fR, \fB.hist.more\fR
+The histogram: attaches that took at most 1, 2, 4, ... 8388608 microseconds
+(each in its own bucket, not cumulative), and longer; not in the text form
+.TP 8
+\fBstore.detach.count\fR
+Zones taken out of memory; \fBstore.detach.limit\fR (memory-limit), \fB.room\fR
+(to make room for another zone), \fB.operator\fR, \fB.other\fR by reason
+.TP 8
+\fBstore.cold.attach\fR, \fB.fetch\fR, \fB.timeout\fR
+Queries for a zone that was not attached: answered after an attach, sent to a
+database fetch (a zone with no image, or a damaged one), ended by the park
+time-out
+.TP 8
+\fBstore.cold.p50_us\fR, \fB.p90_us\fR, \fB.p99_us\fR, \fB.max_us\fR, \fB.hist.le_<2^i>us\fR, \fB.hist.more\fR
+Time from the parked query to its answer, for \fBstore.cold.attach\fR
+.TP 8
+\fBstore.memory.available\fR
+1 when the figures below are there
+.TP 8
+\fBstore.memory.zones\fR, \fB.records\fR, \fB.basis\fR
+Zones and records the estimate is for, and where the size of a zone comes from
+(\fBassumed\fR, \fBresident\fR, \fBrecords\fR)
+.TP 8
+\fBstore.memory.counted_all_bytes\fR, \fB.avg_zone_bytes\fR, \fB.backend_all_bytes\fR, \fB.loader_all_bytes\fR, \fB.directory_bytes\fR
+What \fBmemory\-limit\fR counts with every zone in memory, the average zone, the
+Backend and the loader with every zone in memory, the directory alone
+.TP 8
+\fBstore.memory.recommended_limit_bytes\fR, \fB.working_min_bytes\fR, \fB.fit_min_bytes\fR, \fB.limit_bytes\fR, \fB.fit_pct\fR, \fB.backend_limit_bytes\fR, \fB.loader_limit_bytes\fR
+\fBmemory\-limit\fR that keeps every zone, that keeps half, below which the
+server says ERROR, the one in force (0 = none), the share of the zones that fit,
+the Backend and the loader under it
+.TP 8
+\fBstore.memory.level\fR
+\fBok\fR, \fBnotice\fR, \fBwarning\fR or \fBerror\fR: what the server says in
+syslog about \fBmemory\-limit\fR
+.TP 8
+\fBstore.zone.name\fR, \fB.view\fR, \fB.zid\fR, \fB.state\fR
+With \fBzone <name>\fR: the record of one zone (only these keys, besides
+\fBschema\fR and \fBstore.time.*\fR): name, view, zone id, \fBstored\fR or
+\fBknown\fR
+.TP 8
+\fBstore.zone.serial\fR, \fB.flags\fR, \fB.source\fR, \fB.source_id\fR, \fB.stamp_gen\fR, \fB.stamp_time\fR, \fB.settings\fR
+SOA serial of the stored version, flag bits, source number and the zone's id in
+that database, version stamp, settings id
+.TP 8
+\fBstore.zone.image_bytes\fR, \fB.segment\fR, \fB.offset\fR, \fB.digest\fR
+Size of the image, where it lies (segment and byte offset; not for a known
+zone), digest of the zone content (hex)
+.TP 8
+\fBstore.zone.attached\fR
+1 when the zone is attached now (where the server can tell)
+.PP
+A bad argument, a zone that is not in the store (\fBERROR zone not found\fR), a
+name in several views without a view, or \fBzone\fR without a store are answered
+\fBERROR ...\fR (exit status 3).
+.RE
+.TP 8
 \fBtrace [level]\fR
 Change the debug level in force of the server (0.7; \fBrndc trace\fR): without
 an argument one more (at most 99), with one that level, a number from 0 to

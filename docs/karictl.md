@@ -151,6 +151,66 @@ Commands that take a zone name accept an optional view name as the next argument
   karictl dbstatus example.test
   ```
 
+`store [-j | -k] [zone <name> [view]]`
+: Show the zone store of the database zones (0.7): its state, the zones in it, the zones in memory, how often zones were attached and how fast, the queries that had to wait for a zone ("cold" queries), the second-level cache and the memory advice. Every figure is a counter, a value kept where it changes, or a bounded sample: a request never walks the zones, and a poll costs the same at 10 million zones as at a hundred, so it is safe once a second. Reading never resets a counter. `store` needs the same permission as `dbstatus` (a `read-only yes` key has it).
+
+  Three forms of the same figures: the default is text in sections for a person; `-j` is one JSON object; `-k` is one `key=value` line per figure for shell scripts. WebAdmin and the dnstap-live dashboard poll the JSON form. `zone <name> [view]` shows the record of one zone instead: one index lookup, the zone is not attached (a name that exists in several views needs the view; case and a trailing dot do not matter). Without a store in the configuration, or before the Backend has opened it, the command still works: `store.state` is `none`, and the attach counters and the memory figures are there.
+  ```sh
+  karictl store
+  karictl store -j
+  karictl store -k | grep '^store.attach.p99_us='
+  karictl store zone example.test
+  karictl store -j zone example.test external
+  ```
+
+  On ZFS the server cannot read the ARC statistics (it runs in a sandbox); `store.cache.kind` is `arc`, and `karictl` itself appends the `store.cache.arc.*` keys from `kstat.zfs.misc.arcstats.*`. On UFS the share of segment pages that are in memory is a `mincore(2)` sample of at most 4096 random pages, taken at most every 10 seconds; where `mincore` is not allowed `store.cache.page.available` is 0 and `store.cache.page.note` says `n/a` and why.
+
+  **The names of the keys are an interface.** They are flat and dotted, the same in the `-j` and the `-k` form; in JSON every number is a number (an integer, never a string, never a float) and every other value a string. `schema` is the version of the list (now 1): a key is never renamed or given another unit within a schema, new keys can appear at any time, so a reader takes the keys it knows and ignores the others. Names ending in `_bytes` are bytes, `_us` microseconds, `_pct` an integer percentage; a latency percentile is the upper bound of the bucket it falls in (the buckets are 1, 2, 4, ... 8388608 microseconds, so it is exact to a factor of 2); `max_us` is exact. A rate is the difference of a counter between two polls divided by the difference of `store.time.mono_ms` (the server's monotonic clock in milliseconds; `store.time.unix` is the wall clock in seconds).
+
+  | Key | Meaning |
+  |---|---|
+  | `schema` | Version of this key list (1) |
+  | `store.time.mono_ms`, `store.time.unix` | Server's monotonic clock in milliseconds, wall clock in seconds, at the moment of the reply |
+  | `store.state` | `none` (no store), `ok`, or `degraded` (the last write failed: disk full) |
+  | `store.state_bits` | The state as bits: 1 disk full, 2 repaired at the last open |
+  | `store.format`, `store.mode`, `store.fstype`, `store.uuid` | Store format version; `map` (segments mapped) or `copy` (read with `pread`, for ZFS); file system type; store identity (32 hex digits). With `store.state` `none` this and every key down to `store.cache.*` is absent |
+  | `store.clean_flag` | 1 when the superblock on disk says "clean stop" (0 while the server runs) |
+  | `store.zones.known`, `.stored`, `.rejected`, `.free` | Zones in the store by state: known without an image (the database fetch has them), stored (an image is in the store), rejected (flagged by the last reconcile), free table slots |
+  | `store.zones.attached` | Zones attached (in memory as images) now: successful attaches minus detaches |
+  | `store.zones.image_bytes` | Bytes of the stored images (records) |
+  | `store.views.count` | Views in the store |
+  | `store.view.<n>.name`, `.known`, `.stored`, `.rejected`, `.image_bytes` | The same per view, `<n>` = 0, 1, ... (the store's view number) |
+  | `store.tables.zt_records`, `.zt_capacity`, `.nx_used_bytes`, `.nx_dead_bytes` | Zone table records in use and room; long names, used and dead |
+  | `store.tables.ix_gen`, `.ix_slots`, `.ix_used`, `.ix_live`, `.sx_gen`, `.sx_slots`, `.sx_used`, `.sx_live` | Name index and source index: generation, slots, slots used, live entries |
+  | `store.segments.count`, `.used_bytes`, `.live_bytes`, `.dead_pct` | Image segments: number, bytes appended, bytes still referenced, share that a cleaner would free |
+  | `store.journal.lsn`, `.checkpoint_lsn`, `.committed_lsn`, `.bytes`, `.gen` | Journal position, last checkpoint, last durable commit, size, generation |
+  | `store.checkpoint.count`, `.last_unix`, `.last_us` | Checkpoints since the open, when the last one ended, how long it took |
+  | `store.writes.commits`, `.puts`, `.replaces`, `.deletes`, `.growths`, `.errors` | Writer counters since the open |
+  | `store.recovery.created`, `.was_clean`, `.used_older_super`, `.rebuilt`, `.journals_read`, `.records_replayed`, `.journal_torn`, `.rebuilt_zones`, `.dropped_zones`, `.open_us` | What the last open found and did, and how long it took |
+  | `store.cache.kind` | `page` (UFS: `mincore` sample), `arc` (ZFS), `copy` |
+  | `store.cache.page.available` | 1 when the sample worked, else 0 and `store.cache.page.note` ("n/a: ...") |
+  | `store.cache.page.sampled_pages`, `.resident_pages`, `.resident_pct`, `.sample_age_ms` | The sample: pages looked at, of them in memory, the share, age of the sample |
+  | `store.cache.note` | On ZFS: `see karictl (ARC kstats)` |
+  | `store.cache.arc.available`, `.size_bytes`, `.target_bytes`, `.target_min_bytes`, `.target_max_bytes`, `.hits`, `.misses`, `.hit_pct`, `.compressed_bytes`, `.uncompressed_bytes` | ARC figures, added by `karictl` on ZFS (a kstat that cannot be read is left out) |
+  | `store.attach.count` | Zones attached from the store since the start |
+  | `store.attach.failed` | Attaches that failed; `store.attach.fail.checksum`, `.record`, `.invalid`, `.io`, `.memory`, `.other` by cause |
+  | `store.attach.p50_us`, `.p90_us`, `.p99_us`, `.max_us` | Time of an attach |
+  | `store.attach.hist.le_<2^i>us`, `.hist.more` | The histogram: attaches that took at most 1, 2, 4, ... 8388608 microseconds (each in its own bucket, not cumulative), and longer; not in the text form |
+  | `store.detach.count` | Zones taken out of memory; `store.detach.limit` (memory-limit), `.room` (to make room for another zone), `.operator`, `.other` by reason |
+  | `store.cold.attach`, `.fetch`, `.timeout` | Queries for a zone that was not attached: answered after an attach, sent to a database fetch (a zone with no image, or a damaged one), ended by the park time-out |
+  | `store.cold.p50_us`, `.p90_us`, `.p99_us`, `.max_us`, `.hist.le_<2^i>us`, `.hist.more` | Time from the parked query to its answer, for `store.cold.attach` |
+  | `store.memory.available` | 1 when the figures below are there |
+  | `store.memory.zones`, `.records`, `.basis` | Zones and records the estimate is for, and where the size of a zone comes from (`assumed`, `resident`, `records`) |
+  | `store.memory.counted_all_bytes`, `.avg_zone_bytes`, `.backend_all_bytes`, `.loader_all_bytes`, `.directory_bytes` | What `memory-limit` counts with every zone in memory, the average zone, the Backend and the loader with every zone in memory, the directory alone |
+  | `store.memory.recommended_limit_bytes`, `.working_min_bytes`, `.fit_min_bytes`, `.limit_bytes`, `.fit_pct`, `.backend_limit_bytes`, `.loader_limit_bytes` | `memory-limit` that keeps every zone, that keeps half, below which the server says ERROR, the one in force (0 = none), the share of the zones that fit, the Backend and the loader under it |
+  | `store.memory.level` | `ok`, `notice`, `warning` or `error`: what the server says in syslog about `memory-limit` |
+  | `store.zone.name`, `.view`, `.zid`, `.state` | With `zone <name>`: the record of one zone (only these keys, besides `schema` and `store.time.*`): name, view, zone id, `stored` or `known` |
+  | `store.zone.serial`, `.flags`, `.source`, `.source_id`, `.stamp_gen`, `.stamp_time`, `.settings` | SOA serial of the stored version, flag bits, source number and the zone's id in that database, version stamp, settings id |
+  | `store.zone.image_bytes`, `.segment`, `.offset`, `.digest` | Size of the image, where it lies (segment and byte offset; not for a known zone), digest of the zone content (hex) |
+  | `store.zone.attached` | 1 when the zone is attached now (where the server can tell) |
+
+  A bad argument, a zone that is not in the store (`ERROR zone not found`), a name in several views without a view, or `zone` without a store are answered `ERROR ...` (exit status 3).
+
 `trace [level]`
 : Change the debug level in force of the server (0.7; `rndc trace`): without an argument one more (at most 99), with one that level, a number from 0 to 99. The reply is `OK debug level is now N`; a level that is not a number from 0 to 99 is answered `ERROR trace: the debug level must be a number from 0 to 99`, a second argument `ERROR trace takes one argument at most: ...` (exit status 3, the level is not changed). The server logs each change as `[Control] debug level is now N` (category `general`, notice). The channels with `severity dynamic` write the messages up to the level, and the built-in `default_debug` (the file `karidns.run` in `options { directory }`) writes everything up to it while it is above 0; see karidns(8), `logging`. The level is not kept across a restart (`karidns -d` sets it at the start). Every process of the server follows (0.7): the sandboxed process, which has the control channel, hands the level to the supervisor (with the supervisors of the plugins and of `karidns-dbloader`), the UDP routers, the connect broker and the loader, and a loader that is started again later comes up with the level in force.
   ```sh

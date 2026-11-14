@@ -998,6 +998,8 @@ bool zone_retire_object(zone_db_entry_t *entry, void *obj, void (*free_fn)(void 
 /* builder を新しい版として公開する (dns_axfr_ixfr.c)。entry->writer_lock を持って呼ぶ。約束は定義の前の注釈に */
 /* keep_prev: the version it replaces becomes entry->prev for the zone's rollback-window (a database install); false: zone_publish() */
 int zone_install_builder(zone_db_entry_t *entry, zone_arena_t *builder, const char *what, bool keep_prev);
+/* its second half (0.7 store S2): publish a version that is made already (glue, response cache flag, IXFR difference against cur_active (NULL: none), publication).  writer_lock is held */
+void zone_install_version(zone_db_entry_t *entry, zone_version_t *standby, const zone_version_t *cur_active, bool keep_prev);
 /* the size limits of the zone (max-records, ...) checked on a built zone before it is installed; 0 = ok (see dns_axfr_ixfr.c) */
 int zone_limits_gate(zone_db_entry_t *entry, zone_arena_t *builder, const char *what);
 /* 公開直前に呼ぶ: 応答キャッシュに入れてよいか (rcache_ok) を決める。ゾーンの設定は zone_entry_config(cfg, entry)
@@ -1269,6 +1271,26 @@ bool dbreg_test_evict(const char *view, const char *name);        /* TEST ONLY, 
 enum { DBREG_FETCH_STARTED = 0, DBREG_FETCH_RESIDENT, DBREG_FETCH_BUSY, DBREG_FETCH_NONE };
 int dbreg_fetch_begin(const char *view, const char *zone);
 void dbreg_fetch_end(const char *view, const char *zone);
+/* 0.7 store S2 (dns_db_store.c): an attach makes the entry of a zone that is out of memory from the store's record instead of asking the loader.  dbreg_attach_begin():
+ * as dbreg_fetch_begin() (ABSENT -> LOADING under the registry lock; DBREG_ATT_STARTED), and gives what the directory knows of the version it offers (its source id, serial, digest
+ * unless the element has none yet: digest_set false) and a reference of the zone's settings (info->sh, NULL = none; give it back with zone_ext_shared_unref()).  The attach
+ * ends like a fetch: dbreg_commit() (the entry is made) or dbreg_fetch_end().  DBREG_ATT_RESIDENT: in memory already; BUSY: a fetch or an attach is on its way; NOT: not a zone to
+ * attach (not in the registry, deleted, hidden, rejected, shared).  dbreg_pin_entry(): the entry of a zone in memory, held (a reference and active_axfr) until xfr_entry_release();
+ * the store's write-through keeps the version it copies from going away with it.  dbreg_set_evict_hook(): called, with the registry lock held, for every zone taken out of memory,
+ * with DBREG_EVICT_* (the counters of `karictl store`; the hook must not lock). */
+enum { DBREG_ATT_STARTED = 0, DBREG_ATT_RESIDENT, DBREG_ATT_BUSY, DBREG_ATT_NOT };
+typedef struct {
+  int64_t source_id;
+  uint32_t serial;
+  uint16_t flags;
+  bool digest_set;
+  uint8_t digest[32];
+  zone_ext_shared_t *sh;
+} dbreg_attach_info_t;
+int dbreg_attach_begin(const char *view, const char *zone, dbreg_attach_info_t *info);
+zone_db_entry_t *dbreg_pin_entry(const char *view, const char *zone);
+enum { DBREG_EVICT_OTHER = 0, DBREG_EVICT_LIMIT, DBREG_EVICT_ROOM };
+void dbreg_set_evict_hook(void (*cb)(int reason));
 bool dbreg_apply_summary(const char *view, const char *zone, int64_t source_id, uint32_t serial, bool has_timers, uint32_t refresh,
                          uint32_t retry, uint32_t expire);
 enum { DBREG_SUM_NONE = 0, DBREG_SUM_SAME, DBREG_SUM_DIFFERS };

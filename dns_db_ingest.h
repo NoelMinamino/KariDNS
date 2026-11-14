@@ -57,6 +57,8 @@ typedef struct { uint64_t id; bool ok; char text[200]; } db_reload_result_t;
 
 /* Is the ingest thread running (a database block is configured)? */
 bool db_ingest_enabled(void);
+/* 0.7 store S2: a new entry for a primary zone of the database (the attach in dns_db_store.c makes its entry like an install does); NULL: out of memory */
+zone_db_entry_t *db_ingest_new_entry(const char *view, const char *zone, zone_ext_shared_t *shared);
 /* all: RELOAD_REQ scope all (the caller has reloaded the configuration already).  Otherwise one zone of the view
  * `view` (a view name).  Returns the request id (> 0), or 0 when the thread is not running or the ring is full.
  * Control thread only. */

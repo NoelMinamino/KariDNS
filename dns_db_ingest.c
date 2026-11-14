@@ -35,6 +35,7 @@
 
 #include "dns_config_parser.h"
 #include "dns_db_install.h"
+#include "dns_db_store.h"
 #include "dns_db_stream.h"
 #include "dns_epoch_rcu.h"
 #include "dns_mem_advice.h"
@@ -122,6 +123,7 @@ typedef struct ing_job {
   uint64_t fetch_id;
   bool summary, unsolicited, has_timers;
   bool dir_entry;                        /* D1a milestone 4: the zone came as a summary in a batch (cold, no data was sent); timers are applied after the commit */
+  uint8_t batch_kind;                    /* 0.7 store S2: KDB_BATCH_* of the batch the zone came in (KDB_BATCH_STARTUP for a fetch) */
   bool cold;                             /* D1a step 5: a zone of a batch that is not kept in memory (the limit is reached): serial, digest and settings go into the directory, the data is discarded */
   uint32_t t_refresh, t_retry, t_expire;
   zdir_apex_t *apex;                     /* D1a step 6: the apex of a summary that is kept (see apex_from_begin()); the job owns it until dbreg_set_apex() takes it */
@@ -1006,6 +1008,11 @@ static zone_db_entry_t *new_db_entry(const char *view, const char *zone, zone_ex
   return e;
 }
 
+/* 0.7 store S2: the entry of an attach (dns_db_store.c): a primary zone of the database, with the interned settings (NULL: none) */
+zone_db_entry_t *db_ingest_new_entry(const char *view, const char *zone, zone_ext_shared_t *shared) {
+  return new_db_entry(view, zone, shared, KDB_ZK_PRIMARY);
+}
+
 /* does the settings block of the entry already hold exactly these settings? */
 static bool entry_has_settings(const zone_db_entry_t *e, const zone_ext_shared_t *sh) {
   const zone_config_t *c = atomic_load_explicit(&e->dbcfg, memory_order_acquire);
@@ -1095,6 +1102,8 @@ static void job_execute(ing_job_t *j) {
       /* a summary is the directory entry the loader asked for; a body that was left out (memory-limit) tells the loader that the Backend has no data of the
        * zone, so that its inventory stops saying so (the next change is a summary, with the apex that a body cannot give) */
       j->status = j->dir_entry ? KDB_ST_APPLIED : KDB_ST_NOT_RESIDENT;
+      /* 0.7 store S2: a summary that comes after the first batch means the loader found the zone changed (a change log entry, a reload): what the store holds of it is not trusted any more */
+      if (j->dir_entry && j->batch_kind != KDB_BATCH_STARTUP) db_store_invalidate(j->view_name, j->zone, j->source_id, j->serial);
     } else {
       job_reject(j, "out of memory registering the zone");
       (void)dbreg_reject(j->view_name, j->zone, j->source_id, j->reason);
@@ -1183,6 +1192,7 @@ static void job_execute(ing_job_t *j) {
   }
   j->serial = atomic_load(&entry->serial);
   j->status = shadowed ? KDB_ST_SHADOWED : KDB_ST_APPLIED;
+  db_store_write_through(j->view_name, j->zone, j->source_id, j->serial, j->digest);       /* 0.7 store S2: the version is in memory and registered; the store gets a copy */
   db_zone_build_free(j->build);
   j->build = NULL;
   return;
@@ -1914,6 +1924,7 @@ static ing_job_t *job_from_begin(ing_t *g, const kdb_zone_begin_t *zb, bool of_b
   j->view = zb->view;
   snprintf(j->zone, sizeof(j->zone), "%s", zb->name);
   j->source_id = zb->source_id;
+  j->batch_kind = of_batch && g->in_batch ? g->batch_kind : KDB_BATCH_STARTUP;
   j->serial = zb->serial;
   j->rr_count = zb->rr_count;
   j->fetch_id = zb->request_id;
@@ -2065,6 +2076,7 @@ static void on_zone_delete(ing_t *g, const kdb_msg_t *m) {
       if (g->cur_req >= 0 && g->reqs[g->cur_req].view == zd->view && domain_names_match_ci(g->reqs[g->cur_req].zone, zd->name))
         g->req_outcome = ROUT_DELETED;
       g->b_deleted++;
+      db_store_delete(vname, zd->name);                  /* 0.7 store S2 */
       atomic_fetch_add_explicit(&g_st.tot_deleted, 1, memory_order_relaxed);
       syslog(LOG_INFO, "[DB] zone '%s' (view '%s') deleted", zd->name, vname);
     } else if (r == 0) {
@@ -2078,6 +2090,7 @@ static void on_zone_delete(ing_t *g, const kdb_msg_t *m) {
 static void on_batch_end(ing_t *g, const kdb_msg_t *m) {
   const kdb_batch_end_t *b = &m->u.batch_end;
   sync_all(g);
+  db_store_batch_end();                                  /* 0.7 store S2: what the batch wrote to the store is made durable */
   atomic_store_explicit(&g_st.b_applied, g->b_applied, memory_order_relaxed);
   atomic_store_explicit(&g_st.b_rejected, g->b_rejected, memory_order_relaxed);
   atomic_store_explicit(&g_st.b_shadowed, g->b_shadowed, memory_order_relaxed);

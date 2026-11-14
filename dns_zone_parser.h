@@ -146,7 +146,11 @@ typedef struct {
   _Atomic uint64_t generation;                                                                       \
   /* R11: the outbound transfers (AXFR / IXFR) that send this version.  A transfer takes it inside a read section and gives  \
    * it back when the stream is over; the retire stack does not free a version while it is above 0 (zone_retire_process()) */ \
-  _Atomic int xfr_refs;
+  _Atomic int xfr_refs;                                                                                \
+  /* 0.7 (store S2): an image that is not a malloc block of this version (it points into a mapped store segment, or is the copy the store \
+   * read): image_free(image_ref) gives it back instead of free(image) (zone_version_new_ext()).  NULL: the image is a malloc block */ \
+  void (*image_free)(void *ref);                                                                       \
+  void *image_ref;
 typedef struct zone_version_s {
   ZONE_VERSION_FIELDS
 } zone_version_t;
@@ -221,6 +225,11 @@ void zone_arena_free_include_buffers(zone_arena_t *arena);
 /* S5 B-3: make the published version out of a frozen builder: a new heap zone_version_t takes over builder->image (the builder
  * keeps nothing of it and can be destroyed). NULL on out of memory; the builder still owns the image then. */
 zone_version_t *zone_version_new(zone_arena_t *builder);
+/* 0.7 (store S2): a published version whose image is not a malloc block: it points into a mapped store segment (MAP) or is the buffer the
+ * store read (COPY).  image_bytes is what the version counts for the image in memory-limit (the mapped bytes, or the heap block); image_free(ref)
+ * is called when the version is freed (zone_version_free(): after its grace period, so a reader never sees the segment go) and gives the image back.
+ * NULL on out of memory; image is then still the caller's. */
+zone_version_t *zone_version_new_ext(struct zone_image_s *image, size_t image_bytes, void (*image_free)(void *ref), void *ref);
 /* Frees the image, the glue block and the version itself (a version that is not heap, e.g. a test's arena, is left alone). */
 void zone_version_free(zone_version_t *ver);
 /* What a zone entry points to before its first publish: no image, never freed. */

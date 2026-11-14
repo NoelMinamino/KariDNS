@@ -795,6 +795,21 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
         kc_warning(&t, DC_CONF_DATABASE_STATE_FILE, "database: loader-state-file has no effect without memory-limit (every zone stays in memory, so there is no hot list to warm from)\n");
     if (db->warm_before_serve && db->memory_limit == 0)
         kc_warning(&t, DC_CONF_DATABASE_WARM, "database: warm-before-serve only waits for the directory to be loaded without memory-limit (every zone is read at the start)\n");
+    /* 0.7 store S2: the directory of the zone store: karidns makes the last component of an explicit directory (mode 0700, the user it runs as) and refuses to start when it cannot use it */
+    if (db->store_dir && !db->store_none) {
+        struct stat ssb;
+        if (stat(db->store_dir, &ssb) == 0) {
+            if (!S_ISDIR(ssb.st_mode)) kc_error(&t, DC_CONF_DATABASE, "database store '%s' is not a directory\n", db->store_dir);
+        } else if (errno == ENOENT) {
+            char par[PATH_MAX];
+            const char *sl = strrchr(db->store_dir, '/');
+            if (!sl) snprintf(par, sizeof(par), ".");
+            else if (sl == db->store_dir) snprintf(par, sizeof(par), "/");
+            else snprintf(par, sizeof(par), "%.*s", (int)(sl - db->store_dir), db->store_dir);
+            if (stat(par, &ssb) != 0 || !S_ISDIR(ssb.st_mode))
+                kc_error(&t, DC_CONF_DATABASE, "database store '%s' does not exist and neither does its parent directory '%s' (karidns makes the last component only)\n", db->store_dir, par);
+        }
+    }
     /* B7a: without acl-ceiling the ACLs a database zone carries (allow-transfer, allow-update from the metadata or a profile)
      * refuse every client; the zones still answer queries */
     if (db->acl_ceiling_count == 0 && db->acl_ceiling_keys_count == 0)

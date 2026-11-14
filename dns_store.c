@@ -2320,6 +2320,36 @@ int store_seg_info(const store_t *s, uint32_t num, store_seg_info_t *o) {
   return 0;
 }
 
+/* Page-cache residency estimate (design 9.1): mincore() on up to `pages` random pages of the appended part of the segments.  Only
+ * MAP mode has mappings to ask about.  Bounded by `pages`; no lock (the segments stay mapped until close, like every reader). */
+int store_resident_sample(const store_t *cs, unsigned pages, uint64_t seed, uint64_t *sampled, uint64_t *resident) {
+  store_t *s = (store_t *)cs;
+  *sampled = *resident = 0;
+  if (s->mode != STORE_MODE_MAP) return -ENOTSUP;
+  uint32_t nseg = (uint32_t)VG(s, V_NSEGS);
+  if (nseg > ST_MAXSEG) nseg = ST_MAXSEG;
+  uint64_t total = 0;
+  for (uint32_t n = 1; n <= nseg; n++) total += VG(s, V_SEG(n, 0)) / s->pagesz;
+  if (total == 0 || pages == 0) return 0;
+  uint64_t x = seed ? seed : 0x9E3779B97F4A7C15ull;
+  for (unsigned i = 0; i < pages; i++) {
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;                   /* xorshift64 */
+    uint64_t pick = x % total;
+    for (uint32_t n = 1; n <= nseg; n++) {
+      uint64_t np = VG(s, V_SEG(n, 0)) / s->pagesz;
+      if (pick >= np) { pick -= np; continue; }
+      seg_t *g = seg_get(s, n);
+      if (!g || !g->map || (pick + 1) * s->pagesz > g->maplen) break;
+      char vec = 0;
+      if (mincore(g->map + pick * s->pagesz, s->pagesz, &vec) != 0) return *sampled ? 0 : -errno;
+      (*sampled)++;
+      if (vec & 1) (*resident)++;
+      break;
+    }
+  }
+  return 0;
+}
+
 #define CHK_FAIL(...) do { rep->errors++; if (!rep->first_error[0]) snprintf(rep->first_error, sizeof(rep->first_error), __VA_ARGS__); } while (0)
 
 int store_check(store_t *s, store_check_report_t *rep) {

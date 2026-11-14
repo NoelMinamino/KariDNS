@@ -50,7 +50,7 @@ LDFLAGS += -flto -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS) $(HARDEN_LDFLAGS
 
 
 TARGET = karidns
-SRCS = dns_server_core.c dns_log.c dns_log_state.c dns_db_stream.c dns_db_ingest.c dns_park.c dns_mem_advice.c dns_db_install.c dns_db_supervisor.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_dynamic_update.c dns_axfr_ixfr.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c
+SRCS = dns_server_core.c dns_log.c dns_log_state.c dns_db_stream.c dns_db_ingest.c dns_db_store.c dns_park.c dns_mem_advice.c dns_store_status.c dns_store.c dns_db_install.c dns_db_supervisor.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_dynamic_update.c dns_axfr_ixfr.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c
 OBJS = $(SRCS:.c=.o)
 
 # dag を構成するモジュール (dag.c 以外)。fuzz / unit test / asan ビルドでも共有する
@@ -73,7 +73,7 @@ FUZZ_TARGET = tests/fuzz/fuzz_dns_wire
 FUZZ_SRCS = tests/fuzz/fuzz_dns_wire.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
 FUZZ_CORE_TARGET = tests/fuzz/fuzz_dns_server_core
-FUZZ_CORE_SRCS = tests/fuzz/fuzz_dns_server_core.c dns_log.c dns_log_state.c dns_db_stream.c dns_db_ingest.c dns_park.c dns_mem_advice.c dns_db_install.c dns_db_supervisor.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_dynamic_update.c dns_axfr_ixfr.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c
+FUZZ_CORE_SRCS = tests/fuzz/fuzz_dns_server_core.c dns_log.c dns_log_state.c dns_db_stream.c dns_db_ingest.c dns_db_store.c dns_park.c dns_mem_advice.c dns_store_status.c dns_store.c dns_db_install.c dns_db_supervisor.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_dynamic_update.c dns_axfr_ixfr.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c
 
 FUZZ_QUERY_ENGINE_TARGET = tests/fuzz/fuzz_query_engine
 FUZZ_QUERY_ENGINE_SRCS = tests/fuzz/fuzz_query_engine.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_dynamic_update.c dns_axfr_ixfr.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c
@@ -376,7 +376,7 @@ TEST_COV_SWEEP_TOOLS_SRCS = tests/test_coverage_sweep_tools.c tests/test_coverag
 TEST_COV_SWEEP_DAG_SRCS = tests/test_coverage_sweep_dag.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
 TEST_DAGREASM_SRCS = tests/test_dag_reassembly.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c $(TEST_SYSLOG_QUIET)
 TEST_DAG_TOOLS_SRCS = tests/test_dag_tools.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_tsig_client.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_transport.c tools/dag_http.c dns_zone_parser.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_wire.c dns_utils.c $(TEST_SYSLOG_QUIET)
-TEST_SERVER_CORE_SRCS = tests/test_server_core.c dns_server_core.c dns_log.c dns_log_state.c dns_db_stream.c dns_db_ingest.c dns_park.c dns_mem_advice.c dns_db_install.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_SERVER_CORE_SRCS = tests/test_server_core.c dns_server_core.c dns_log.c dns_log_state.c dns_db_stream.c dns_db_ingest.c dns_db_store.c dns_park.c dns_mem_advice.c dns_store_status.c dns_store.c dns_db_install.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
 
 FI_WRAP_LDFLAGS  = -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=strdup -Wl,--wrap=strndup -Wl,--wrap=posix_memalign
 FI_WRAP_LDFLAGS += -Wl,--wrap=open -Wl,--wrap=openat -Wl,--wrap=fopen -Wl,--wrap=read -Wl,--wrap=write -Wl,--wrap=send -Wl,--wrap=sendto -Wl,--wrap=recv -Wl,--wrap=recvfrom
@@ -444,6 +444,19 @@ test_store-tsan: $(TEST_STORE_SRCS)
 test_store-asan: $(TEST_STORE_SRCS:.c=.uta.o)
 	$(CC) $(TEST_STORE_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lpthread
 
+# 0.7 WP5: `karictl store` - the attach counters and the report (dns_store_status.c)
+TEST_STORE_STATUS_SRCS = tests/test_store_status.c dns_store_status.c dns_store.c dns_epoch_rcu.c dns_mem_advice.c $(TEST_SYSLOG_QUIET)
+
+.PHONY: store_status_test
+test_store_status: $(TEST_STORE_STATUS_SRCS)
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_STORE_STATUS_SRCS) -o test_store_status $(LDFLAGS) -lpthread
+
+store_status_test: test_store_status
+	./test_store_status
+
+test_store_status-asan: $(TEST_STORE_STATUS_SRCS:.c=.uta.o)
+	$(CC) $(TEST_STORE_STATUS_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lpthread
+
 # the stand-in for the Backend on both streams of the loader (tests/run_db_fetch_test.sh)
 FETCH_BACKEND_SRCS = tests/db/fetch_backend.c dns_db_stream.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
@@ -464,6 +477,18 @@ db_fetch_test: test_db_fetch
 
 test_db_fetch-tsan: $(TEST_DB_FETCH_SRCS)
 	$(CC) $(TSAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DB_FETCH_SRCS) -o $@ $(TSAN_LDFLAGS) -lcrypto -lpthread -lm
+
+# 0.7 store S2: the zone store in the server (write-through, attach, accounting; MAP and COPY in two processes)
+TEST_DB_STORE_SRCS = $(TEST_SERVER_CORE_SRCS:tests/test_server_core.c=tests/test_db_store.c) $(TEST_SYSLOG_QUIET)
+
+test_db_store: $(TEST_DB_STORE_SRCS)
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DB_STORE_SRCS) -o test_db_store $(LDFLAGS) -lcrypto -lpthread -lm
+
+db_store_test: test_db_store
+	./test_db_store
+
+test_db_store-tsan: $(TEST_DB_STORE_SRCS)
+	$(CC) $(TSAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DB_STORE_SRCS) -o $@ $(TSAN_LDFLAGS) -lcrypto -lpthread -lm
 
 # the server core unit test (the logger threads, the transfer dispatch) under ThreadSanitizer (tests/run_rcu_tsan_test.sh part 1c)
 test_server_core-tsan: $(TEST_SERVER_CORE_SRCS)
@@ -776,7 +801,7 @@ test_epoch_rcu-tsan: $(TEST_EPOCH_RCU_SRCS)
 
 # The unit tests that tests/run_rcu_tsan_units_test.sh runs under ThreadSanitizer, for one parallel make
 # (the test builds them with -j: one cc per binary, about 100 s one after the other on the build host)
-TSAN_TEST_BINS = test_epoch_rcu-tsan test_zone_dir-tsan test_park-tsan test_db_fetch-tsan test_park_worker-tsan test_db_stream-tsan test_pdns_reader-tsan test_db_registry-tsan test_server_core-tsan test_store-tsan
+TSAN_TEST_BINS = test_epoch_rcu-tsan test_zone_dir-tsan test_park-tsan test_db_fetch-tsan test_park_worker-tsan test_db_stream-tsan test_pdns_reader-tsan test_db_registry-tsan test_server_core-tsan test_db_store-tsan test_store-tsan
 tsan-test-bins: $(TSAN_TEST_BINS)
 .PHONY: tsan-test-bins
 
@@ -949,7 +974,7 @@ fi_dag_test: test_fi_dag
 
 # Binaries behind unit-tests, so they can be built in parallel first
 # (`make -j$(nproc) unit-test-bins`); the tests themselves then run one by one.
-UT_BINS = test_dns_diag test_mem_advice test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_server_stmt test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_tapstat test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_db_stream test_pdns_reader test_presigned test_zone_text test_zone_import test_db_supervisor test_plugin_msg test_db_sqlite3 test_db_registry test_zone_dir test_park test_db_fetch test_park_worker test_db_pgsql test_store
+UT_BINS = test_dns_diag test_mem_advice test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_server_stmt test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_tapstat test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_db_stream test_pdns_reader test_presigned test_zone_text test_zone_import test_db_supervisor test_plugin_msg test_db_sqlite3 test_db_registry test_zone_dir test_park test_db_fetch test_park_worker test_db_pgsql test_db_store test_store
 
 unit-test-bins: $(UT_BINS)
 
@@ -958,7 +983,7 @@ unit-test-bins: $(UT_BINS)
 # `make sweep-tests` runs them on their own. They are not part of unit-tests.
 sweep-tests: coverage_sweep_test coverage_sweep_dag_test coverage_sweep_net_test coverage_sweep_tools_test
 
-unit-tests: dns_diag_test mem_advice_test cidr_test tinydns_test asan_test include_test config_directives_test acl_match_test listen_on_test xfr_opts_test server_stmt_test wire_helpers_test zone_image_test zone_parser_paths_test tinydns_paths_test sig0_sign_test snapshot_rebuild_test dnssec_proofs_test qe_protocol_test dag_format_test dag_iter_test dag_reassembly_test hash_test epoch_rcu_test dnstap_test tapstat_test edns_ecs_test rfc_vectors_test dynamic_update_test axfr_ixfr_test rrl_test query_expanded_test response_cache_test vulnerability_test catalog_zone_test snapshot_sandbox_test dag_tools_test server_core_test fi_parsers_test fi_wire_test fi_snapshot_test fi_xfr_test fi_misc_test fi_dag_test db_stream_test pdns_reader_test presigned_test zone_text_test zone_import_test db_supervisor_test plugin_msg_test db_sqlite3_test db_registry_test zone_dir_test park_test db_fetch_test park_worker_test db_pgsql_test store_test
+unit-tests: dns_diag_test mem_advice_test cidr_test tinydns_test asan_test include_test config_directives_test acl_match_test listen_on_test xfr_opts_test server_stmt_test wire_helpers_test zone_image_test zone_parser_paths_test tinydns_paths_test sig0_sign_test snapshot_rebuild_test dnssec_proofs_test qe_protocol_test dag_format_test dag_iter_test dag_reassembly_test hash_test epoch_rcu_test dnstap_test tapstat_test edns_ecs_test rfc_vectors_test dynamic_update_test axfr_ixfr_test rrl_test query_expanded_test response_cache_test vulnerability_test catalog_zone_test snapshot_sandbox_test dag_tools_test server_core_test fi_parsers_test fi_wire_test fi_snapshot_test fi_xfr_test fi_misc_test fi_dag_test db_stream_test pdns_reader_test presigned_test zone_text_test zone_import_test db_supervisor_test plugin_msg_test db_sqlite3_test db_registry_test zone_dir_test park_test db_fetch_test park_worker_test db_pgsql_test store_test db_store_test
 
 # --- Unit tests under ASan + UBSan --------------------------------------------
 # The plain test_* targets above are built with the production CFLAGS (-O3 -flto),
@@ -1002,6 +1027,8 @@ test_park-asan: $(TEST_PARK_SRCS:.c=.uta.o)
 
 test_db_fetch-asan: $(TEST_DB_FETCH_SRCS:.c=.uta.o)
 	$(CC) $(TEST_DB_FETCH_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto -lpthread -lm
+test_db_store-asan: $(TEST_DB_STORE_SRCS:.c=.uta.o)
+	$(CC) $(TEST_DB_STORE_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto -lpthread -lm
 
 test_park_worker-asan: $(TEST_PARK_WORKER_SRCS:.c=.uta.o)
 	$(CC) $(TEST_PARK_WORKER_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto -lpthread -lm
@@ -1167,7 +1194,7 @@ test_dag_reassembly-asan: $(TEST_DAGREASM_SRCS:.c=.utn.o)
 test_server_core-asan: $(TEST_SERVER_CORE_SRCS:.c=.uta.o)
 	$(CC) $(TEST_SERVER_CORE_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-UT_ASAN_BINS = test_dns_diag-asan test_mem_advice-asan test_cidr-asan test_tinydns_parser-asan test_asan_overflow-asan test_conf_include-asan test_config_directives-asan test_acl_match-asan test_listen_on-asan test_xfr_opts-asan test_server_stmt-asan test_wire_helpers-asan test_zone_image-asan test_zone_parser_paths-asan test_tinydns_paths-asan test_sig0_sign-asan test_snapshot_rebuild-asan test_dnssec_proofs-asan test_query_engine_protocol-asan test_dag_format-asan test_dag_iter-asan test_dag_reassembly-asan test_hash_table-asan test_epoch_rcu-asan test_dnstap_engine-asan test_tapstat-asan test_edns_ecs_engine-asan test_rfc_vectors-asan test_dynamic_update_engine-asan test_axfr_ixfr_engine-asan test_rrl_engine-asan test_query_engine_expanded-asan test_response_cache-asan test_vulnerability_fixes-asan test_catalog_zone_engine-asan test_snapshot_sandbox_engine-asan test_dag_tools-asan test_coverage_sweep_net-asan test_server_core-asan test_db_stream-asan test_pdns_reader-asan test_presigned-asan test_zone_text-asan test_zone_import-asan test_db_supervisor-asan test_plugin_msg-asan test_db_sqlite3-asan test_db_registry-asan test_zone_dir-asan test_park-asan test_db_fetch-asan test_park_worker-asan test_db_pgsql-asan test_store-asan
+UT_ASAN_BINS = test_dns_diag-asan test_mem_advice-asan test_cidr-asan test_tinydns_parser-asan test_asan_overflow-asan test_conf_include-asan test_config_directives-asan test_acl_match-asan test_listen_on-asan test_xfr_opts-asan test_server_stmt-asan test_wire_helpers-asan test_zone_image-asan test_zone_parser_paths-asan test_tinydns_paths-asan test_sig0_sign-asan test_snapshot_rebuild-asan test_dnssec_proofs-asan test_query_engine_protocol-asan test_dag_format-asan test_dag_iter-asan test_dag_reassembly-asan test_hash_table-asan test_epoch_rcu-asan test_dnstap_engine-asan test_tapstat-asan test_edns_ecs_engine-asan test_rfc_vectors-asan test_dynamic_update_engine-asan test_axfr_ixfr_engine-asan test_rrl_engine-asan test_query_engine_expanded-asan test_response_cache-asan test_vulnerability_fixes-asan test_catalog_zone_engine-asan test_snapshot_sandbox_engine-asan test_dag_tools-asan test_coverage_sweep_net-asan test_server_core-asan test_db_stream-asan test_pdns_reader-asan test_presigned-asan test_zone_text-asan test_zone_import-asan test_db_supervisor-asan test_plugin_msg-asan test_db_sqlite3-asan test_db_registry-asan test_zone_dir-asan test_park-asan test_db_fetch-asan test_park_worker-asan test_db_pgsql-asan test_db_store-asan test_store-asan
 
 # the binaries alone (tests/run_all_suite.sh --asan runs them in parallel); make -j builds them in parallel
 unit-test-bins-asan: $(UT_ASAN_BINS)
@@ -1676,7 +1703,7 @@ clean: clean-fuzz coverage-clean
 	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck $(TAPSTAT_TARGET) $(TAPSTAT_OBJS) karidns-tapstat-asan bench_serialize bench_rrl $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
 	@# karicheck's objects outside $(OBJS): an uninstrumented copy left here would be linked into the coverage build
 	rm -f dns_zone_lint.o dns_db_checkproto.o karicheck-codelog test_coverage_sweep_tools-codelog
-	rm -f karidns-zone karidns-zone-asan karidns-asan karidns-tsan karidns-evict *.ev.o test_epoch_rcu-tsan test_zone_dir-tsan test_zone_dir test_park-tsan test_db_fetch-tsan test_server_core-tsan test_park_worker-tsan test_db_registry-tsan test_db_stream-tsan test_pdns_reader-tsan test_park test_db_fetch test_park_worker *.asan.o *.tsan.o test_asan_overflow test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_server_stmt test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_tapstat test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_stream test_pdns_reader test_presigned test_zone_text test_zone_import test_db_supervisor test_plugin_msg test_db_sqlite3 test_db_registry test_db_pgsql karidns-dbloader karidns-dbloader-tsan karidns-dbloader-asan tests/db/zone2sql tests/db/zone2kdb test_store test_store-asan test_store-tsan
+	rm -f karidns-zone karidns-zone-asan karidns-asan karidns-tsan karidns-evict *.ev.o test_epoch_rcu-tsan test_zone_dir-tsan test_zone_dir test_park-tsan test_db_fetch-tsan test_server_core-tsan test_park_worker-tsan test_db_registry-tsan test_db_stream-tsan test_pdns_reader-tsan test_park test_db_fetch test_park_worker *.asan.o *.tsan.o test_asan_overflow test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_server_stmt test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_tapstat test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_stream test_pdns_reader test_presigned test_zone_text test_zone_import test_db_supervisor test_plugin_msg test_db_sqlite3 test_db_registry test_db_pgsql karidns-dbloader karidns-dbloader-tsan karidns-dbloader-asan tests/db/zone2sql tests/db/zone2kdb test_store test_store-asan test_store-tsan test_db_store test_db_store-asan test_db_store-tsan
 	rm -f $(UT_ASAN_BINS)
 	rm -f *.uta.o *.utn.o tests/*.uta.o tests/*.utn.o tools/*.uta.o tools/*.utn.o
 	rm -f tests/fi/kari_fi_preload.so
@@ -1865,7 +1892,7 @@ $(EVICT_TARGET): $(EVICT_OBJS)
 # X-34: the suffix rules for the sanitizer, unit-test and fuzz objects (.asan.o, .tsan.o, .uta.o, .utn.o, .fz.o)
 # have no header dependencies, so a header change relinked stale objects. Each of these objects depends on every
 # project header: coarse (a header change rebuilds them all) but the same with BSD make and GNU make.
-PROJECT_HDRS = dns_alias.h dns_axfr_ixfr.h dns_db_driver.h dns_db_ingest.h dns_park.h dns_mem_advice.h dns_db_install.h dns_db_stream.h dns_pdns_reader.h dns_presigned.h dns_zone_rows.h dns_zone_text.h dns_zone_changes.h dns_zone_render.h dns_zone_import.h dns_zone_export.h dns_zone_msg.h tests/db/zone2sql.h tests/db/zrows_feed.h tests/db/xfr_mocks.h tests/db/pdns_roundtrip.h tests/db/pdns_confcheck.h dns_catalog_zone.h dns_cidr.h dns_config_parser.h dns_dnstap.h dns_dynamic_update.h dns_edns_ecs.h dns_epoch_rcu.h dns_priv_sandbox.h dns_query_engine.h dns_rrl.h dns_server_internal.h dns_siphash.h dns_snapshot_rcu.h dns_tsig_acl.h dns_utils.h dns_wire.h dns_zone_parser.h dns_zone_lint.h dns_db_checkproto.h dns_diag.h dns_diag_codes.h tests/fi/kari_fi.h tests/sweep_watchdog.h tools/dag_axfr_client.h tools/dag_batch.h tools/dag_edns_client.h tools/dag_http.h tools/dag_internal.h tools/dag_iter.h tools/dag_output_yaml.h tools/dag_pcap_l4.h tools/dag_replay.h tools/dag_roothints.h tools/dag_tcp_reassembly.h tools/dag_trace.h tools/dag_trace_common.h tools/dag_transport.h tools/dag_tsig_client.h tools/dnstap_decode.h tools/tapstat_core.h tools/karidns_tool_linkage.h  dns_zone_image.h
+PROJECT_HDRS = dns_alias.h dns_axfr_ixfr.h dns_db_driver.h dns_db_ingest.h dns_db_store.h dns_park.h dns_mem_advice.h dns_db_install.h dns_db_stream.h dns_pdns_reader.h dns_presigned.h dns_zone_rows.h dns_zone_text.h dns_zone_changes.h dns_zone_render.h dns_zone_import.h dns_zone_export.h dns_zone_msg.h tests/db/zone2sql.h tests/db/zrows_feed.h tests/db/xfr_mocks.h tests/db/pdns_roundtrip.h tests/db/pdns_confcheck.h dns_catalog_zone.h dns_cidr.h dns_config_parser.h dns_dnstap.h dns_dynamic_update.h dns_edns_ecs.h dns_epoch_rcu.h dns_priv_sandbox.h dns_query_engine.h dns_rrl.h dns_server_internal.h dns_siphash.h dns_snapshot_rcu.h dns_tsig_acl.h dns_utils.h dns_wire.h dns_zone_parser.h dns_zone_lint.h dns_db_checkproto.h dns_diag.h dns_diag_codes.h tests/fi/kari_fi.h tests/sweep_watchdog.h tools/dag_axfr_client.h tools/dag_batch.h tools/dag_edns_client.h tools/dag_http.h tools/dag_internal.h tools/dag_iter.h tools/dag_output_yaml.h tools/dag_pcap_l4.h tools/dag_replay.h tools/dag_roothints.h tools/dag_tcp_reassembly.h tools/dag_trace.h tools/dag_trace_common.h tools/dag_transport.h tools/dag_tsig_client.h tools/dnstap_decode.h tools/tapstat_core.h tools/karidns_tool_linkage.h  dns_zone_image.h
 $(ASAN_OBJS) $(TSAN_OBJS) $(EVICT_OBJS): $(PROJECT_HDRS)
 $(TEST_TAPSTAT_SRCS:.c=.uta.o) $(TEST_ASAN_SRCS:.c=.utn.o) $(TEST_DNSDIAG_SRCS:.c=.utn.o) $(TEST_AXFR_IXFR_SRCS:.c=.uta.o) $(TEST_CATALOG_SRCS:.c=.uta.o) $(TEST_CIDR_SRCS:.c=.uta.o) $(TEST_CONFDIR_SRCS:.c=.utn.o) $(TEST_CONF_SRCS:.c=.utn.o) $(TEST_COV_SWEEP_DAG_SRCS:.c=.uta.o) $(TEST_COV_SWEEP_NET_SRCS:.c=.uta.o) $(TEST_COV_SWEEP_SRCS:.c=.uta.o) $(TEST_COV_SWEEP_TOOLS_SRCS:.c=.uta.o) $(TEST_DAGFORMAT_SRCS:.c=.uta.o) $(TEST_DAGREASM_SRCS:.c=.utn.o) $(TEST_DAG_ITER_SRCS:.c=.uta.o) $(TEST_DAG_TOOLS_SRCS:.c=.uta.o) $(TEST_DNSSECPROOFS_SRCS:.c=.uta.o) $(TEST_DNSTAP_SRCS:.c=.uta.o) $(TEST_DYN_UPDATE_SRCS:.c=.uta.o) $(TEST_EDNS_ECS_SRCS:.c=.uta.o) $(TEST_EPOCH_RCU_SRCS:.c=.uta.o) $(TEST_HASH_SRCS:.c=.uta.o) $(TEST_QEPROTO_SRCS:.c=.uta.o) $(TEST_QUERY_EXP_SRCS:.c=.uta.o) $(TEST_RFC_VECTORS_SRCS:.c=.uta.o) $(TEST_RRL_SRCS:.c=.uta.o) $(TEST_SANDBOX_SRCS:.c=.uta.o) $(TEST_SERVER_CORE_SRCS:.c=.uta.o) $(TEST_SIG0_SRCS:.c=.utn.o) $(TEST_SNAPREBUILD_SRCS:.c=.uta.o) $(TEST_TINYDNS_SRCS:.c=.utn.o) $(TEST_TINYPATHS_SRCS:.c=.utn.o) $(TEST_WIREHELP_SRCS:.c=.utn.o) $(TEST_ZONEIMAGE_SRCS:.c=.utn.o) $(TEST_ZONEPATHS_SRCS:.c=.utn.o) $(TEST_DBSTREAM_SRCS:.c=.uta.o) : $(PROJECT_HDRS)
 $(FUZZ_TAPSTAT_SRCS:.c=.fz.o) $(FUZZ_CONF_SRCS:.c=.fz.o) $(FUZZ_JSON_ESCAPE_SRCS:.c=.fz.o) $(FUZZ_ZONE_TEXT_SRCS:.c=.fz.o) $(FUZZ_ZONE_CHANGES_SRCS:.c=.fz.o) $(FUZZ_CORE_SRCS:.c=.fz.o) $(FUZZ_DAG_AXFR_STREAM_SRCS:.c=.fz.o) $(FUZZ_DAG_BATCH_FILE_SRCS:.c=.fz.o) $(FUZZ_DAG_CHUNKED_HTTP_SRCS:.c=.fz.o) $(FUZZ_DAG_CLI_ARGS_SRCS:.c=.fz.o) $(FUZZ_DAG_HASH_SRCS:.c=.fz.o) $(FUZZ_DAG_ITER_SRCS:.c=.fz.o) $(FUZZ_DAG_RDATA_YAML_SRCS:.c=.fz.o) $(FUZZ_DAG_REPLAY_DIFF_SRCS:.c=.fz.o) $(FUZZ_DAG_REPLAY_PCAP_READER_SRCS:.c=.fz.o) $(FUZZ_DAG_SRCS:.c=.fz.o) $(FUZZ_DAG_TCP_REASSEMBLY_SRCS:.c=.fz.o) $(FUZZ_DYNAMIC_UPDATE_SRCS:.c=.fz.o) $(FUZZ_QUERY_ENGINE_SRCS:.c=.fz.o) $(FUZZ_SRCS:.c=.fz.o) $(FUZZ_TSIG_SRCS:.c=.fz.o) $(FUZZ_TSIG_VERIFY_SRCS:.c=.fz.o) $(FUZZ_XFR_PACKET_SRCS:.c=.fz.o) $(FUZZ_ZONE_SRCS:.c=.fz.o) $(FUZZ_ZONE_IMAGE_SRCS:.c=.fz.o) $(FUZZ_ZONE_IMAGE_VALIDATE_SRCS:.c=.fz.o) $(FUZZ_DB_STREAM_SRCS:.c=.fz.o) $(FUZZ_DB_CHECKLINE_SRCS:.c=.fz.o) : $(PROJECT_HDRS)

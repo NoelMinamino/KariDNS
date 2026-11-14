@@ -173,6 +173,29 @@ uint32_t park_fail(park_table_t *t, const char *view, const char *zone) {
   return n;
 }
 
+uint32_t park_retry(park_table_t *t, const char *view, const char *zone, int64_t new_deadline_ms) {
+  size_t vl, zl;
+  if (!t->e || t->nwait == 0 || !key_fits(view, zone, &vl, &zl)) return 0;
+  uint32_t n = 0, seen = 0, waiting = t->nwait;
+  for (uint32_t i = 0; i < t->cap && seen < waiting; i++) {
+    park_entry_t *e = &t->e[i];
+    if (e->state != PARK_WAIT) continue;
+    seen++;
+    if (entry_is(e, view, vl, zone, zl)) {
+      if (new_deadline_ms > e->deadline_ms) e->deadline_ms = new_deadline_ms;
+      e->attach = 0;                                      /* (it waits for a fetch now: its time is not an attach's) */
+      n++;
+    }
+  }
+  return n;                                               /* (min_deadline_ms only has to be <= every deadline: a later park_expire() sets it right) */
+}
+
+void park_mark_attach(park_table_t *t, int32_t idx, int64_t now_ns) {
+  if (!t->e || idx < 0 || (uint32_t)idx >= t->cap || t->e[idx].state != PARK_WAIT) return;
+  t->e[idx].attach = 1;
+  t->e[idx].t_park_ns = now_ns;
+}
+
 uint32_t park_wake_all(park_table_t *t) {
   if (!t->e || t->nwait == 0) return 0;
   uint32_t n = 0;
@@ -256,10 +279,11 @@ int64_t park_next_deadline_ms(const park_table_t *t, int64_t now_ms) {
 }
 
 /* ------------------------------------------------------------------ rings */
-static bool key_set(park_key_t *k, const char *view, const char *zone, bool failed) {
+static bool key_set(park_key_t *k, const char *view, const char *zone, bool failed, bool retry) {
   size_t vl, zl;
   if (!key_fits(view, zone, &vl, &zl)) return false;
   k->failed = failed;
+  k->retry = retry;
   k->vlen = (uint8_t)vl;
   k->zlen = (uint8_t)zl;
   memcpy(k->view, view, vl + 1);
@@ -267,16 +291,25 @@ static bool key_set(park_key_t *k, const char *view, const char *zone, bool fail
   return true;
 }
 
-bool park_wake_push(park_wake_ring_t *r, const char *view, const char *zone, bool failed) {
+/* (0.7 store S2: the ingest thread and the store threads both produce keys, so the producers take turns: a spin lock held for the copy of one key) */
+bool park_wake_push_ex(park_wake_ring_t *r, const char *view, const char *zone, bool failed, bool retry) {
+  while (atomic_exchange_explicit(&r->plock, true, memory_order_acquire)) {}
   uint32_t head = atomic_load_explicit(&r->head, memory_order_relaxed);
   uint32_t tail = atomic_load_explicit(&r->tail, memory_order_acquire);
-  if (head - tail >= PARK_WAKE_RING || !key_set(&r->k[head % PARK_WAKE_RING], view, zone, failed)) {
+  bool ok = true;
+  if (head - tail >= PARK_WAKE_RING || !key_set(&r->k[head % PARK_WAKE_RING], view, zone, failed, retry)) {
     atomic_store_explicit(&r->overflow, true, memory_order_release);
     atomic_fetch_add_explicit(&r->dropped, 1, memory_order_relaxed);
-    return false;
+    ok = false;
+  } else {
+    atomic_store_explicit(&r->head, head + 1, memory_order_release);
   }
-  atomic_store_explicit(&r->head, head + 1, memory_order_release);
-  return true;
+  atomic_store_explicit(&r->plock, false, memory_order_release);
+  return ok;
+}
+
+bool park_wake_push(park_wake_ring_t *r, const char *view, const char *zone, bool failed) {
+  return park_wake_push_ex(r, view, zone, failed, false);
 }
 
 bool park_wake_pop(park_wake_ring_t *r, park_key_t *out) {
@@ -388,6 +421,14 @@ void park_wake_queue_all(const char *view, const char *zone, bool failed) {
   for (int w = 0; w < PARK_MAX_WORKERS; w++) park_wake_queue_one(w, view, zone, failed);
 }
 
+void park_wake_queue_retry(const char *view, const char *zone) {
+  for (int w = 0; w < PARK_MAX_WORKERS; w++) {
+    if (!atomic_load_explicit(&g_wreg[w], memory_order_acquire)) continue;
+    (void)park_wake_push_ex(&g_wake[w], view, zone, false, true);
+    atomic_fetch_or_explicit(&g_wtrig[w / 64], 1ull << (w % 64), memory_order_release);
+  }
+}
+
 void park_wake_flush(void) {
   for (int i = 0; i < (int)(sizeof(g_wtrig) / sizeof(g_wtrig[0])); i++) {
     uint64_t m = atomic_exchange_explicit(&g_wtrig[i], 0, memory_order_acq_rel);
@@ -402,6 +443,71 @@ void park_wake_flush(void) {
 void park_wake_broadcast(const char *view, const char *zone, bool failed) {
   park_wake_queue_all(view, zone, failed);
   park_wake_flush();
+}
+
+/* ------------------------------------------------------------------ ATTACH requests (0.7 store S2; the idea is in dns_park.h) */
+static park_fetch_ring_t g_attach[PARK_MAX_WORKERS];
+static _Atomic int g_attach_kq = -1;
+static _Atomic int g_attach_asleep;                      /* the store threads that are about to wait for events, or wait */
+static _Atomic bool g_attach_clock;                      /* the consumer lock of park_attach_next() */
+static _Atomic uint32_t g_attach_rr;
+static _Atomic int g_attach_wmax;                        /* the highest worker that asked, plus one */
+
+void park_attach_set_notify(int kq) { atomic_store_explicit(&g_attach_kq, kq, memory_order_relaxed); }
+
+static void trigger_attach(void) {
+  atomic_thread_fence(memory_order_seq_cst);
+  if (atomic_load_explicit(&g_attach_asleep, memory_order_relaxed) > 0) trigger(atomic_load_explicit(&g_attach_kq, memory_order_relaxed), PARK_ATTACH_IDENT);
+}
+
+bool park_attach_request(int w, const char *view, const char *zone) {
+  if (w < 0 || w >= PARK_MAX_WORKERS) return false;
+  int cur = atomic_load_explicit(&g_attach_wmax, memory_order_relaxed);
+  while (cur < w + 1 && !atomic_compare_exchange_weak_explicit(&g_attach_wmax, &cur, w + 1, memory_order_relaxed, memory_order_relaxed)) {}
+  if (!park_fetch_push(&g_attach[w], view, zone, 0, 0)) return false;
+  trigger_attach();
+  return true;
+}
+
+bool park_attach_pending(void) {
+  int wm = atomic_load_explicit(&g_attach_wmax, memory_order_relaxed);
+  for (int w = 0; w < wm; w++)
+    if (atomic_load_explicit(&g_attach[w].head, memory_order_acquire) != atomic_load_explicit(&g_attach[w].tail, memory_order_relaxed)) return true;
+  return false;
+}
+
+bool park_attach_sleep_prepare(void) {
+  atomic_fetch_add_explicit(&g_attach_asleep, 1, memory_order_relaxed);
+  atomic_thread_fence(memory_order_seq_cst);
+  if (!park_attach_pending()) return false;
+  atomic_fetch_sub_explicit(&g_attach_asleep, 1, memory_order_relaxed);
+  return true;
+}
+
+void park_attach_sleep_done(void) { atomic_fetch_sub_explicit(&g_attach_asleep, 1, memory_order_relaxed); }
+
+bool park_attach_next(park_fetch_req_t *out) {
+  if (atomic_exchange_explicit(&g_attach_clock, true, memory_order_acquire)) return false;      /* (another store thread is taking one; it wakes a sibling when more wait) */
+  bool got = false;
+  int wm = atomic_load_explicit(&g_attach_wmax, memory_order_relaxed);
+  uint32_t start = atomic_fetch_add_explicit(&g_attach_rr, 1, memory_order_relaxed);
+  for (int i = 0; i < wm && !got; i++) {
+    int w = (int)((start + (uint32_t)i) % (uint32_t)wm);
+    if (park_fetch_pop(&g_attach[w], out)) {
+      out->claimed = false;
+      out->worker = (int16_t)w;
+      got = true;
+    }
+  }
+  atomic_store_explicit(&g_attach_clock, false, memory_order_release);
+  if (got && park_attach_pending()) trigger(atomic_load_explicit(&g_attach_kq, memory_order_relaxed), PARK_ATTACH_IDENT);
+  return got;
+}
+
+uint64_t park_attach_dropped(void) {
+  uint64_t n = 0;
+  for (int w = 0; w < PARK_MAX_WORKERS; w++) n += atomic_load_explicit(&g_attach[w].dropped, memory_order_relaxed);
+  return n;
 }
 
 /* ------------------------------------------------------------------ places and tokens (B2 W5, 0.7 P-B; the idea is in dns_park.h) */

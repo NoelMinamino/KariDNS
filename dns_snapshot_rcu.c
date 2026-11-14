@@ -3108,6 +3108,59 @@ void dbreg_fetch_end(const char *view, const char *zone) {
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
 }
 
+/* ---- 0.7 store S2: an attach reads the zone from the store instead of asking the loader (dns_db_store.c) ---- */
+
+/* As dbreg_fetch_begin(), and what the attach has to know of the directory's element: the version it offers (source id, serial, digest) and the settings of the zone, read
+ * under the registry lock.  DBREG_ATT_STARTED: the zone is ABSENT and is LOADING now (end it with dbreg_fetch_end() when the attach did not make an entry); RESIDENT: it is
+ * in memory already; BUSY: a fetch or another attach is on its way; NOT: not a zone to attach (not in the registry, deleted, hidden, an error state, no data to speak of).
+ * info->sh holds a reference of the settings (the caller gives it back with zone_ext_shared_unref()), NULL = the zone has none. */
+int dbreg_attach_begin(const char *view, const char *zone, dbreg_attach_info_t *info) {
+    int rc = DBREG_ATT_NOT;
+    memset(info, 0, sizeof(*info));
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
+    if (z && !(z->flags & ZDIR_F_DELETED) && !z->shadowed && (z->kind & (ZDIR_K_STATIC | ZDIR_K_SHARED | ZDIR_K_BORROWED)) == 0) {
+        uint8_t st = atomic_load_explicit(&z->state, memory_order_relaxed);
+        if (zdir_entry(z)) {
+            rc = DBREG_ATT_RESIDENT;
+        } else if (st == ZDIR_ST_LOADING) {
+            rc = DBREG_ATT_BUSY;
+        } else if (st == ZDIR_ST_ABSENT && z->last_result == DBREG_APPLIED) {
+            info->source_id = z->source_id;
+            info->serial = zdir_serial(z);
+            info->flags = z->flags;
+            if (z->digest) {
+                memcpy(info->digest, z->digest, 32);
+                for (int i = 0; i < 32; i++) info->digest_set |= info->digest[i] != 0;
+            }
+            zone_ext_shared_t *sh = atomic_load_explicit(&z->sh, memory_order_relaxed);
+            if (sh) zone_ext_shared_ref(sh);
+            info->sh = sh;
+            atomic_store_explicit(&z->state, ZDIR_ST_LOADING, memory_order_release);
+            rc = DBREG_ATT_STARTED;
+        }
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return rc;
+}
+
+/* The entry of a zone, held (a reference and active_axfr: the cache manager does not take it out of memory) until xfr_entry_release(): the store's write-through keeps the
+ * version it copies alive this way.  NULL: no entry. */
+zone_db_entry_t *dbreg_pin_entry(const char *view, const char *zone) {
+    zone_db_entry_t *e = NULL;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
+    if (z && !(z->flags & ZDIR_F_DELETED) && (e = zdir_entry(z)) != NULL) xfr_entry_hold(e);
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return e;
+}
+
+static _Atomic(void (*)(int)) g_evict_hook;
+void dbreg_set_evict_hook(void (*cb)(int reason)) { atomic_store_explicit(&g_evict_hook, cb, memory_order_release); }
+static _Thread_local int t_evict_reason;      /* DBREG_EVICT_*: why the thread that is evicting does it (set by the cache round and by room on demand) */
+
 bool dbreg_apply_summary(const char *view, const char *zone, int64_t source_id, uint32_t serial, bool has_timers, uint32_t refresh,
                          uint32_t retry, uint32_t expire) {
     bool applied = false;
@@ -3489,6 +3542,8 @@ static uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
     /* 0.7 B2: the element is in the index with no entry from here on: the ALIAS targets of the zone are not wanted any more.  No snapshot changes now, so
      * the scan of the alias thread is asked for here (it used to notice a new snapshot pointer). */
     if (had_alias) alias_notify();
+    void (*eh)(int) = atomic_load_explicit(&g_evict_hook, memory_order_acquire);
+    if (eh) eh(t_evict_reason);                        /* 0.7 store S2: the counters of `karictl store` (dns_store_status.h) */
     void (*notify)(void) = atomic_load_explicit(&g_pending_notify, memory_order_acquire);
     if (notify) notify();                              /* the ingest thread publishes the delta (and so retires the entry) */
     return bytes ? bytes : 1;
@@ -3861,7 +3916,9 @@ uint32_t dbreg_cache_round(void) {
          * round ends here and the next one, when they are old enough, decides (CACHE_MIN_RESIDENT_MS at most).  With few young zones, as under a
          * steady load, this never holds the round back. */
         if (!flagged && young_bytes >= need - freed) break;
+        t_evict_reason = DBREG_EVICT_LIMIT;
         uint64_t got = dbreg_evict_locked(c->rv, c->z);
+        t_evict_reason = 0;
         if (!got) continue;
         freed += c->bytes;
         evicted++;
@@ -3907,7 +3964,10 @@ static void room_take_pass(const cache_cand_t *cand, size_t nc, bool relaxed, ui
     for (size_t i = 0; i < nc && *freed < want; i++) {
         const cache_cand_t *c = &cand[i];
         if (relaxed ? !(c->young && c->relax) : c->young) continue;
-        if (!dbreg_evict_locked(c->rv, c->z)) continue;
+        t_evict_reason = DBREG_EVICT_ROOM;
+        const uint64_t room_got = dbreg_evict_locked(c->rv, c->z);
+        t_evict_reason = 0;
+        if (!room_got) continue;
         *freed += c->bytes;
         (*evicted)++;
         if (relaxed) (*nrelaxed)++;

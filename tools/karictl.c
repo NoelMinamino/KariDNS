@@ -13,6 +13,9 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <time.h>
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#include <stdint.h>
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -193,6 +196,63 @@ static ssize_t ctl_recv(int sock, void *buf, size_t len) {
     return r;
 }
 
+/* 0.7 WP5, `karictl store` on ZFS: the ARC figures.  The server cannot read the kstat sysctls inside its sandbox, karictl can (it runs outside
+ * it), so the reply of the server ends with them: the same keys in the same format (design 9.1).  Values are 64-bit counters (or 32-bit,
+ * which a zero-initialised little-endian 64-bit buffer also holds). */
+static bool karictl_arc_read(const char *name, uint64_t *v) {
+    char key[96];
+    uint64_t x = 0;
+    size_t l = sizeof(x);
+    snprintf(key, sizeof(key), "kstat.zfs.misc.arcstats.%s", name);
+    if (sysctlbyname(key, &x, &l, NULL, 0) != 0 || (l != 4 && l != 8)) return false;
+    *v = x;
+    return true;
+}
+static void karictl_store_add_arc(char *buf, size_t cap, size_t *len, int fmt /* 0 text, 1 JSON, 2 key=value */) {
+    static const struct { const char *kstat, *key; } m[] = {
+        { "size", "size_bytes" }, { "c", "target_bytes" }, { "c_min", "target_min_bytes" }, { "c_max", "target_max_bytes" },
+        { "hits", "hits" }, { "misses", "misses" }, { "compressed_size", "compressed_bytes" }, { "uncompressed_size", "uncompressed_bytes" },
+    };
+    char key[8][32];
+    uint64_t val[10];
+    int n = 0;
+    uint64_t hits = 0, misses = 0;
+    bool have_h = false, have_m = false;
+    for (size_t i = 0; i < sizeof(m) / sizeof(m[0]); i++) {
+        uint64_t v;
+        if (!karictl_arc_read(m[i].kstat, &v)) continue;
+        if (strcmp(m[i].key, "hits") == 0) { hits = v; have_h = true; }
+        if (strcmp(m[i].key, "misses") == 0) { misses = v; have_m = true; }
+        snprintf(key[n], sizeof(key[n]), "%s", m[i].key);
+        val[n++] = v;
+    }
+    char add[1024];
+    size_t a = 0;
+#define ARC_PUT(...) do { int w_ = snprintf(add + a, sizeof(add) - a, __VA_ARGS__); if (w_ > 0 && (size_t)w_ < sizeof(add) - a) a += (size_t)w_; } while (0)
+    uint64_t pct = 0;
+    bool have_pct = have_h && have_m && hits + misses > 0;
+    if (have_pct) pct = hits * 100 / (hits + misses);
+    if (fmt == 1) {
+        ARC_PUT(",\"store.cache.arc.available\":%d", n > 0 ? 1 : 0);
+        for (int i = 0; i < n; i++) ARC_PUT(",\"store.cache.arc.%s\":%llu", key[i], (unsigned long long)val[i]);
+        if (have_pct) ARC_PUT(",\"store.cache.arc.hit_pct\":%llu", (unsigned long long)pct);
+        ARC_PUT("}\n");
+        while (*len > 0 && (buf[*len - 1] == '\n' || buf[*len - 1] == '}')) { (*len)--; if (buf[*len] == '}') break; }
+        buf[*len] = '\0';
+    } else if (fmt == 2) {
+        ARC_PUT("store.cache.arc.available=%d\n", n > 0 ? 1 : 0);
+        for (int i = 0; i < n; i++) ARC_PUT("store.cache.arc.%s=%llu\n", key[i], (unsigned long long)val[i]);
+        if (have_pct) ARC_PUT("store.cache.arc.hit_pct=%llu\n", (unsigned long long)pct);
+    } else {
+        ARC_PUT("\narc:\n");
+        if (n == 0) ARC_PUT("  available = 0\n");
+        for (int i = 0; i < n; i++) ARC_PUT("  %s = %llu\n", key[i], (unsigned long long)val[i]);
+        if (have_pct) ARC_PUT("  hit_pct = %llu\n", (unsigned long long)pct);
+    }
+#undef ARC_PUT
+    if (*len + a < cap) { memcpy(buf + *len, add, a); *len += a; buf[*len] = '\0'; }
+}
+
 static void karictl_usage(FILE *fp, const char *argv0) {
     fprintf(fp, "Usage: %s [-c config_path] [-f config_path] [-s socket_path] [-t seconds] [-v] <command> [args...]\n", argv0);
     fprintf(fp, "  -t seconds                  how long to wait for the server's reply (1-86400, default 60)\n");
@@ -232,6 +292,10 @@ static void karictl_usage(FILE *fp, const char *argv0) {
         "                              go on with (--after).  -f here is the format; before the command it is the\n"
         "                              configuration file\n"
         "  dbstatus [zone [view]]      the database loader, the last batch, the zones of the database\n"
+        "  store [-j | -k] [zone <name> [view]]\n"
+        "                              the zone store (database zones kept on disk): state, zones, attaches, cold queries, cache,\n"
+        "                              memory.  -j prints one JSON object, -k key=value lines (stable key names: docs/karictl.md);\n"
+        "                              zone <name> shows one zone's record (an index lookup, the zone is not attached)\n"
         "  trace [level]               raise the debug level by one (up to 99), or set it (0-99): the channels with\n"
         "                              severity dynamic, and karidns.run in options { directory }, follow it\n"
         "  notrace                     set the debug level to 0\n"
@@ -1155,7 +1219,16 @@ int main(int argc, char **argv) {
     ssize_t r;
 
     char cmd_msg[512];
-    if (optind + 3 < argc) {                       /* reload <zone> <view> force */
+    if (strcmp(argv[optind], "store") == 0) {          /* store [-j | -k] [zone <name> [view]]: every word goes on */
+        size_t ml = (size_t)snprintf(cmd_msg, sizeof(cmd_msg), "store");
+        for (int ai = optind + 1; ai < argc; ai++) {
+            int w = snprintf(cmd_msg + ml, sizeof(cmd_msg) - ml, " %s", argv[ai]);
+            if (w < 0 || (size_t)w >= sizeof(cmd_msg) - ml - 2) { fprintf(stderr, "karictl: store: the arguments are too long\n"); close(sock); return 2; }
+            ml += (size_t)w;
+        }
+        cmd_msg[ml++] = 0x0a;
+        cmd_msg[ml] = 0;
+    } else if (optind + 3 < argc) {                       /* reload <zone> <view> force */
         snprintf(cmd_msg, sizeof(cmd_msg), "%s %s %s %s\n", argv[optind], argv[optind + 1], argv[optind + 2], argv[optind + 3]);
     } else if (optind + 2 < argc) {
         snprintf(cmd_msg, sizeof(cmd_msg), "%s %s %s\n", argv[optind], argv[optind + 1], argv[optind + 2]);
@@ -1265,6 +1338,36 @@ int main(int argc, char **argv) {
             close(sock);
             return 3;
         }
+    } else if (strcmp(argv[optind], "store") == 0) {
+        /* 0.7 WP5: the reply is text, JSON (-j) or key=value lines (-k) of up to 32 KiB; the server closes the connection after it.  On ZFS
+         * the ARC figures are added here (the server's sandbox cannot read them). */
+        static char sbuf[65536];
+        size_t total = 0;
+        while (total < sizeof(sbuf) - 1) {
+            r = ctl_recv(sock, sbuf + total, sizeof(sbuf) - 1 - total);
+            if (r <= 0) break;
+            total += (size_t)r;
+        }
+        sbuf[total] = '\0';
+        close(sock);
+        if (total == 0) {
+            fprintf(stderr, "karictl: store: the server sent no reply\n");
+            return 3;
+        }
+        if (strncmp(sbuf, "ERROR", 5) == 0) {
+            printf("%s", sbuf);
+            return 3;
+        }
+        int sfmt = 0;
+        for (int ai = optind + 1; ai < argc; ai++) {
+            if (strcmp(argv[ai], "zone") == 0) break;
+            if (strcmp(argv[ai], "-j") == 0) sfmt = 1;
+            else if (strcmp(argv[ai], "-k") == 0) sfmt = 2;
+        }
+        const char *arc_mark = sfmt == 1 ? "\"store.cache.kind\":\"arc\"" : sfmt == 2 ? "store.cache.kind=arc\n" : "\n  kind = arc\n";
+        if (strstr(sbuf, arc_mark)) karictl_store_add_arc(sbuf, sizeof(sbuf), &total, sfmt);
+        fwrite(sbuf, 1, total, stdout);
+        return 0;
     } else if (strcmp(argv[optind], "observatory") == 0) {
         size_t total = 0;
         while (total < sizeof(buf) - 1) {

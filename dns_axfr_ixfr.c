@@ -1094,7 +1094,14 @@ int zone_install_builder(zone_db_entry_t *entry, zone_arena_t *builder, const ch
     syslog(LOG_ERR, "[Zone] Out of memory publishing the zone after %s for '%s'", what, entry->domain);
     return -1;
   }
+  zone_install_version(entry, standby, cur_active, keep_prev);
+  return 0;
+}
 
+/* The second half of zone_install_builder(), for a version that is made already (the builder's image frozen, or an image the store read, S2): the sibling glue, the
+ * response cache flag, the IXFR difference against `cur_active` (NULL: none, the first version of an entry) and the publication.  entry->writer_lock is held; the
+ * version is the zone's from here (it cannot fail). */
+void zone_install_version(zone_db_entry_t *entry, zone_version_t *standby, const zone_version_t *cur_active, bool keep_prev) {
   // 設定は制御スレッドが並行して入れ替えるので、読み取り区間の中で読む
   rcu_aux_read_lock();
   zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
@@ -1114,9 +1121,8 @@ int zone_install_builder(zone_db_entry_t *entry, zone_arena_t *builder, const ch
   release_config_snapshot(active_cfg_prelink);
   rcu_aux_read_unlock();
 
-  compute_ixfr_diff(entry, cur_active, standby);
+  if (cur_active) compute_ixfr_diff(entry, cur_active, standby);
   zone_publish_ex(entry, standby, keep_secs);
-  return 0;
 }
 
 /* The primary says the zone is up to date (an IXFR answered with the one SOA of our serial, or a SOA query with the same serial): the

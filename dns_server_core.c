@@ -64,6 +64,8 @@
 #include "dns_db_supervisor.h"
 #include "dns_plugin_sup.h"
 #include "dns_db_ingest.h"
+#include "dns_db_store.h"
+#include "dns_store_status.h"
 #include "dns_db_stream.h"
 #include "dns_park.h"
 #include "dns_alias.h"
@@ -2303,6 +2305,12 @@ static int64_t park_now_ms(void) {
   return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+static int64_t park_now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
+}
+
 /* The worker's decision before it parks a query for a zone that is out of memory and asks for it (dns_park.h, "the worker's decision").  The query is never refused here (0.7
  * P-B: fetch-concurrency, fetch-rate and the memory limit make a request wait in the ingest thread, not a query fail): the gate only marks the zone as claimed, so that one
  * request is made for it however many workers ask.  The worker that finds the mark up parks and asks without a claim (the ingest thread drops that request while the mark is
@@ -2332,13 +2340,23 @@ static bool udp_park(udp_pass_t *w, const view_snapshot_t *view, const zdir_elem
   /* a zone that the view shares by in-view from the database of another view (D1a phase 2) is asked for, and woken, in the name of the view that holds it */
   const char *hv = zdir_holder_view(view, pel);
   bool ask = (!w->woken || atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) == ZDIR_ST_ABSENT) && !park_has_wait(w->park, hv, pel->name);
-  int gate = ask ? fetch_gate(hv, pel) : FETCH_GATE_ASK;
-  int32_t pi = park_udp(w->park, now, (uint32_t)left, hv, pel->name, w->active_fd, ipc, req, len);
+  /* 0.7 store S2: the store holds the version of the zone the directory has: the query parks for an attach (200 ms), and a store thread makes the entry; no claim, no fetch */
+  bool attach = ask && atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) == ZDIR_ST_ABSENT && db_store_attach_possible(hv, pel->name, zdir_serial(pel));
+  int gate = ask && !attach ? fetch_gate(hv, pel) : FETCH_GATE_ASK;
+  int32_t pi = park_udp(w->park, now, (uint32_t)(attach && left > PARK_ATTACH_DEADLINE_MS ? PARK_ATTACH_DEADLINE_MS : left), hv, pel->name, w->active_fd, ipc, req, len);
   if (pi < 0) {
     if (gate == FETCH_GATE_TAKEN) park_claim_release(hv, pel->name);
     return false;
   }
-  if (ask && !park_fetch_request(w->worker_idx, hv, pel->name, (uint8_t)(KDB_FETCH_PRIO_QUERY | (gate == FETCH_GATE_TAKEN ? PARK_PRIO_CLAIMED : 0)), KDB_FETCH_FULL)) {
+  if (attach) {
+    park_mark_attach(w->park, pi, park_now_ns());
+    if (!park_attach_request(w->worker_idx, hv, pel->name)) {      /* (the ring is full: the database has it) */
+      attach = false;
+      (void)park_retry(w->park, hv, pel->name, now + left);
+      gate = fetch_gate(hv, pel);
+    }
+  }
+  if (ask && !attach && !park_fetch_request(w->worker_idx, hv, pel->name, (uint8_t)(KDB_FETCH_PRIO_QUERY | (gate == FETCH_GATE_TAKEN ? PARK_PRIO_CLAIMED : 0)), KDB_FETCH_FULL)) {
     if (gate == FETCH_GATE_TAKEN) park_claim_release(hv, pel->name);
     park_release(w->park, &w->park->e[pi]);            /* the request could not be handed over (ring full): nobody would ever wake it */
     return false;
@@ -2628,8 +2646,14 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
   if (t->nwait == 0 && t->nready == 0 && !(ring && park_wake_pending(ring))) return;     /* nothing is parked and nobody said anything: no clock, no exchange */
   park_key_t k;
   while (ring && park_wake_pop(ring, &k)) {
-    if (k.failed) (void)park_fail(t, k.view, k.zone);
-    else (void)park_wake(t, k.view, k.zone);
+    if (k.retry) {                                      /* 0.7 store S2: the attach did not work; the zone is fetched from the database and the queries wait for it the park-timeout */
+      uint32_t n = park_retry(t, k.view, k.zone, park_now_ms() + (int64_t)w->park_timeout_ms);
+      for (uint32_t i = 0; i < n; i++) store_status_note_cold(0, STORE_COLD_FETCH);
+    } else if (k.failed) {
+      (void)park_fail(t, k.view, k.zone);
+    } else {
+      (void)park_wake(t, k.view, k.zone);
+    }
   }
   if (ring && park_wake_take_overflow(ring)) (void)park_wake_all(t);          /* a wake was lost: every query looks again */
   (void)park_expire(t, park_now_ms());
@@ -2638,6 +2662,7 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
   park_entry_t *e;
   while ((e = park_next_done(t, &cur))) {
     bool timed_out = e->state == PARK_TIMEOUT;
+    if (e->attach) store_status_note_cold(timed_out ? 0 : (uint64_t)(park_now_ns() - e->t_park_ns), timed_out ? STORE_COLD_TIMEOUT : STORE_COLD_ATTACH);       /* (0.7 store S2) */
     if (e->kind == PARK_UDP) {
       udp_ipc_t *ipc = (udp_ipc_t *)w->batch->rx_buffers[0];
       *ipc = e->u.udp.ipc;
@@ -3451,10 +3476,19 @@ process_tcp_client: ;
                 bool ask = (ctx_tcp->park_deadline_ms == 0 || atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) == ZDIR_ST_ABSENT) &&
                            !park_has_wait(&park, hv, pel->name);       /* (as in udp_park(): a request that comes back and finds the zone out of memory again asks again) */
                 uint32_t cidx = (uint32_t)(ctx_tcp - g_tcp_pool);
-                int gate = ask ? fetch_gate(hv, pel) : FETCH_GATE_ASK;       /* (as in udp_park()) */
-                int32_t pi = park_tcp(&park, pnow, (uint32_t)left, hv, pel->name, client_fd, cidx, ctx_tcp->gen);
+                bool attach = ask && atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) == ZDIR_ST_ABSENT && db_store_attach_possible(hv, pel->name, zdir_serial(pel));   /* (0.7 store S2, as in udp_park()) */
+                int gate = ask && !attach ? fetch_gate(hv, pel) : FETCH_GATE_ASK;       /* (as in udp_park()) */
+                int32_t pi = park_tcp(&park, pnow, (uint32_t)(attach && left > PARK_ATTACH_DEADLINE_MS ? PARK_ATTACH_DEADLINE_MS : left), hv, pel->name, client_fd, cidx, ctx_tcp->gen);
                 if (pi < 0 && gate == FETCH_GATE_TAKEN) park_claim_release(hv, pel->name);
-                if (pi >= 0 && ask && !park_fetch_request(ctx->thread_id, hv, pel->name, (uint8_t)(KDB_FETCH_PRIO_QUERY | (gate == FETCH_GATE_TAKEN ? PARK_PRIO_CLAIMED : 0)), KDB_FETCH_FULL)) {
+                if (pi >= 0 && attach) {
+                  park_mark_attach(&park, pi, park_now_ns());
+                  if (!park_attach_request(ctx->thread_id, hv, pel->name)) {
+                    attach = false;
+                    (void)park_retry(&park, hv, pel->name, pnow + left);
+                    gate = fetch_gate(hv, pel);
+                  }
+                }
+                if (pi >= 0 && ask && !attach && !park_fetch_request(ctx->thread_id, hv, pel->name, (uint8_t)(KDB_FETCH_PRIO_QUERY | (gate == FETCH_GATE_TAKEN ? PARK_PRIO_CLAIMED : 0)), KDB_FETCH_FULL)) {
                   if (gate == FETCH_GATE_TAKEN) park_claim_release(hv, pel->name);
                   park_release(&park, &park.e[pi]);          /* the request could not be handed over (ring full): nobody would wake it */
                   pi = -1;
@@ -3797,6 +3831,10 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
     if (str_differs(o->database.loader_group, n->database.loader_group)) append_list_item(buf, sz, "database loader-group");
     if (str_differs(db_loader_path(o), db_loader_path(n))) append_list_item(buf, sz, "database loader-path");
     if (str_differs(o->database.loader_state_file, n->database.loader_state_file)) append_list_item(buf, sz, "database loader-state-file");
+    if (str_differs(o->database.store_dir, n->database.store_dir) || o->database.store_none != n->database.store_none) append_list_item(buf, sz, "database store");
+    if (o->database.store_mode != n->database.store_mode) append_list_item(buf, sz, "database store-mode");
+    if (o->database.store_threads != n->database.store_threads) append_list_item(buf, sz, "database store-threads");
+    if (o->database.store_paranoid != n->database.store_paranoid) append_list_item(buf, sz, "database store-paranoid");
   }
 }
 
@@ -4183,6 +4221,22 @@ static bool ctl_send_until(int fd, const void *buf, size_t len, int64_t deadline
 
 static bool ctl_send_all(int fd, const void *buf, size_t len) {
   return ctl_send_until(fd, buf, len, park_now_ms() + CTL_REPLY_MS);
+}
+
+/* 0.7 WP5: the memory figures of `karictl store` (the inputs of dns_db_ingest.c's ma_inputs(), fetch-concurrency left at its default) */
+static bool ctrl_store_memory(ma_est_t *out) {
+  dbreg_residency_t rs;
+  zone_bytes_t zdb;
+  ma_in_t in;
+  dbreg_residency(&rs);
+  zone_bytes_get(ZBYTES_DB, &zdb);
+  memset(&in, 0, sizeof(in));
+  in.zones = rs.total;
+  in.resident_zones = rs.resident;
+  in.resident_bytes = zdb.resident;
+  in.limit = dbreg_cache_limit();
+  ma_estimate(&in, out);
+  return true;
 }
 
 /* B6a: an answer of the database loader for a parked `reload <zone>` client (control thread) */
@@ -5550,6 +5604,12 @@ void *control_thread_func(void *arg) {
               size_t dblen = db_ingest_status(arg, view_arg, dbbuf, sizeof(dbbuf));
               if (dblen == 0) (void)ctl_send_all(cfd, "ERROR no database block is configured\n", 38);
               else (void)ctl_send_all(cfd, dbbuf, dblen);
+            } else if (strcmp(cmd, "store") == 0) {
+              /* 0.7 WP5: the zone store, the attach counters, the memory advice (dns_store_status.c; text, -j JSON, -k key=value, zone <name>) */
+              char stbuf[STORE_STATUS_OUT_MAX];
+              store_status_set_memory_fn(ctrl_store_memory);
+              size_t stlen = store_status_control(arg, view_arg, stbuf, sizeof(stbuf));
+              (void)ctl_send_all(cfd, stbuf, stlen);
             } else {
               syslog(LOG_ERR, "[Control] Received unknown command: %s", cmd);
               (void)ctl_send_all(cfd, "ERROR unknown command\n", 22);
@@ -6532,6 +6592,7 @@ __attribute__((noreturn)) void backend_shutdown(int code) {
   }
   syslog(LOG_NOTICE, "[Backend] Shutting down");
   dnstap_shutdown(DNSTAP_SHUTDOWN_WAIT_MS);
+  db_store_stop();                       // 0.7 store S2: what is queued is written, the store is checkpointed
   backend_exit(code);
 }
 
@@ -7661,6 +7722,19 @@ int main(int argc, char **argv) {
     cleanup_pid_file();
     exit(1);
   }
+  // 0.7 store S2: the zone store directory is opened (made, checked, locked) here, as root, and the Backend inherits the descriptor (design 2.1)
+  {
+    char st_msg[512];
+    if (!db_store_frontend_open(&g_config_db.config_a.database, g_run_identity.privileged, g_run_identity.has_user ? g_run_identity.uid : (uid_t)-1,
+                                g_run_identity.has_group ? g_run_identity.gid : (gid_t)-1, st_msg, sizeof(st_msg))) {
+      syslog(LOG_CRIT, "[Startup] %s", st_msg);
+      fprintf(stderr, "[ERROR] %s\n", st_msg);
+      if (g_broker_pid > 0) kill(g_broker_pid, SIGTERM);
+      cleanup_pid_file();
+      exit(1);
+    }
+    if (st_msg[0]) syslog(LOG_NOTICE, "[Startup] %s", st_msg);
+  }
   // beta design 1.2 step 2: the loader sockets exist before the Backend is forked
   {
     char db_err[512];
@@ -7698,6 +7772,7 @@ int main(int argc, char **argv) {
     // === Parent Process (Process Manager / Supervisor) ===
     klog_set_role(KLOG_ROLE_AUX);   // the Backend rolls the log files; this process appends to them by name
     db_sup_after_fork_supervisor(&dbsup); // the Backend's ends of the loader sockets belong to the Backend
+    db_store_frontend_close();            // 0.7 store S2: the store directory is the Backend's (the routers and the loader do not get it)
     plug_sup_after_fork_manager(&g_plug_sup);
     g_plug_sup.logstate = klog_state_apply;   // 0.7 M2: the Backend's debug level and logging runtime come on the plugin pair
     sigset_t unblock_set;
@@ -8168,6 +8243,11 @@ int main(int argc, char **argv) {
 
   // beta design 1.3 / 1.5: the db ingest thread.  It limits the rights of the two descriptors the supervisor made
   // (stream, control) and uses only them (read / write / recvmsg / kevent) once the sandbox is on.
+  if (cfg->database.enabled && !db_store_start(cfg)) {     // 0.7 store S2: the store and its threads exist before the first zone is installed
+    syslog(LOG_ERR, "[Backend] Cannot start the zone store; aborting startup");
+    fprintf(stderr, "[ERROR] [Backend] Cannot start the zone store; aborting startup\n");
+    backend_exit(EXIT_FAILURE);
+  }
   if (cfg->database.enabled && !db_ingest_start(g_db_stream_fd, g_db_ctrl_fd, g_db_fetch_fd)) {
     syslog(LOG_ERR, "[Backend] Cannot start the database ingest thread; aborting startup");
     fprintf(stderr, "[ERROR] [Backend] Cannot start the database ingest thread; aborting startup\n");

@@ -1340,12 +1340,15 @@ static int pg_manifest_page(db_conn_t *c, int64_t after_id, unsigned limit, db_m
         return -1;
     }
     if (!c->has_zone_state) return need_schema3(c, "manifest_page", "karidns_zone_state");
-    /* the page of domains is cut first (an index scan on the primary key, LIMIT), then joined; the rows of one domain stay together */
-    char sql[800];
+    /* the page of domains is cut first (an index scan on the primary key, LIMIT), then joined; the rows of one domain stay together.  Every joined
+     * table carries the page's lower bound as well (S0, 10M rows): with the equality alone PostgreSQL merge-joins karidns_zone_state from its first row on
+     * every page (1.9 s for a page at id 5M); with the bound a page is ~10 ms. */
+    char sql[900];
     snprintf(sql, sizeof(sql),
              "SELECT d.id, d.name, d.type, s.generation, s.changed_at, %s FROM (SELECT id, name, type FROM domains WHERE id > $1::bigint ORDER BY id LIMIT $2::bigint) d "
-             "LEFT JOIN karidns_zone_state s ON s.domain_id = d.id %s ORDER BY d.id%s",
-             c->has_domain_views ? "v.view_name" : "NULL::text", c->has_domain_views ? "LEFT JOIN karidns_domain_views v ON v.domain_id = d.id" : "",
+             "LEFT JOIN karidns_zone_state s ON s.domain_id = d.id AND s.domain_id > $1::bigint %s ORDER BY d.id%s",
+             c->has_domain_views ? "v.view_name" : "NULL::text",
+             c->has_domain_views ? "LEFT JOIN karidns_domain_views v ON v.domain_id = d.id AND v.domain_id > $1::bigint" : "",
              c->has_domain_views ? ", v.view_name COLLATE \"C\"" : "");
     char p1[32], p2[32];
     snprintf(p1, sizeof(p1), "%lld", (long long)after_id);
