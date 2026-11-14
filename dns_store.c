@@ -571,8 +571,22 @@ static inline uint32_t zrec_stored_crc(const r64_t *zt) {
  * under load) makes readers wait, not fail: spin, yield, then sleep in short steps; only after ST_SEQ_GIVEUP_US the cell is taken for damaged (a counter that a crash left odd is
  * repaired by the replay or the rebuild, so this bound is for a forged one). */
 #define ST_SEQ_GIVEUP_US 500000u
+#define ST_SEQ_SPIN_NOSLEEP 200u          /* a thread that must never sleep (a query worker): the number of looks at a cell that is being written, then it gives up */
 typedef struct { unsigned n; uint64_t t0; } seqwait_t;
+static _Thread_local bool t_st_nosleep;   /* store_reader_nosleep() */
+static _Thread_local bool t_st_busy;      /* a lookup of this thread gave up on a cell that was being written (store_reader_busy_take()) */
+void store_reader_nosleep(bool on) { t_st_nosleep = on; t_st_busy = false; }
+bool store_reader_busy_take(void) {
+  bool b = t_st_busy;
+  t_st_busy = false;
+  return b;
+}
 static bool seq_wait(seqwait_t *w) {
+  if (t_st_nosleep) {                     /* a query worker never yields or sleeps here: a bounded spin, then "not now" (the caller falls back to the slow path) */
+    if (w->n++ < ST_SEQ_SPIN_NOSLEEP) return true;
+    t_st_busy = true;
+    return false;
+  }
   if (w->n++ < 16) return true;
   if (w->n < 256) {
     sched_yield();
@@ -2221,6 +2235,28 @@ uint32_t store_find(const store_t *s, uint16_t view, const char *name, size_t le
   for (size_t i = 0; i < len; i++) fn[i] = st_lc((uint8_t)name[i]);
   const ixgen_t *g = atomic_load_explicit(&s->ix, memory_order_acquire);
   return ix_lookup(s, g, view, fn, len, st_hash_name(s, view, fn, len));
+}
+unsigned store_find_cand(const store_t *s, uint16_t view, const char *fname, size_t len, uint32_t *zids, unsigned max) {
+  if (len > STORE_NAME_MAX || !max) return 0;
+  const ixgen_t *g = atomic_load_explicit(&s->ix, memory_order_acquire);
+  uint64_t h = st_hash_name(s, view, (const uint8_t *)fname, len);
+  uint32_t tag = st_tag(h);
+  uint64_t n = g->nslots, pos = st_pos(h, n);
+  unsigned got = 0;
+  for (uint64_t i = 0; i < n && got < max; i++) {
+    uint64_t v = atomic_load_explicit(&g->slots[pos], memory_order_acquire);
+    if (v == 0) break;
+    uint32_t z = (uint32_t)v;
+    if (z != STORE_NONE && (uint32_t)(v >> 32) == tag) zids[got++] = z;
+    if (++pos == n) pos = 0;
+  }
+  return got;
+}
+bool store_zid_is(const store_t *s, uint32_t zid, uint16_t view, const char *name, size_t len) {
+  if (len > STORE_NAME_MAX) return false;
+  uint8_t fn[256];
+  for (size_t i = 0; i < len; i++) fn[i] = st_lc((uint8_t)name[i]);
+  return st_name_eq(s, zid, view, fn, len);
 }
 uint32_t store_find_source(const store_t *s, uint16_t source, int64_t domain_id, uint16_t view) {
   const ixgen_t *g = atomic_load_explicit(&s->sx, memory_order_acquire);

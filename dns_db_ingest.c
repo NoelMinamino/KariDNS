@@ -217,6 +217,8 @@ typedef struct {
   bool inv_active;
   dbreg_cursor_t inv_cur;
   uint64_t inv_sent;
+  uint32_t inv_zid;                    /* 0.7 S3: the zones of the store are listed by zone id after the registry (inv_store_pass()) */
+  bool inv_store;                      /* ... and the registry's part is done */
   /* reload requests sent to the loader whose answer the control thread is waiting for (B6a, design 5.2) */
   struct {
     bool active;
@@ -638,7 +640,7 @@ static bool build_config(ing_t *g, ing_cfg_t *snap) {
     kdb_enc_u32(&g->enc, 5, db->default_ttl);
     kdb_enc_u8(&g->enc, 6, (uint8_t)db->bulk_threshold);
     kdb_enc_u32(&g->enc, 7, db->loader_threads);
-    if (db->memory_limit) kdb_enc_u8(&g->enc, 8, 1);       /* D1a milestone 4: the directory only for the zones that are not in memory (design 3.3) */
+    if (db->memory_limit && !dbdir()) kdb_enc_u8(&g->enc, 8, 1);       /* D1a milestone 4: the directory only for the zones that are not in memory (design 3.3); with the zone store (S3) the store is the directory and a zone is sent whole */
     kdb_enc_u8(&g->enc, 9, db->signer_wait ? 1 : 0);        /* 0.6.0 item C: a changed zone of the signer waits for the signer */
     ok = kdb_enc_end(&g->enc) == 0 && !too_many && idx <= 0xFFFF &&(snap->nviews == 0 || (g->view_names && g->view_db));
   }
@@ -1103,7 +1105,6 @@ static void job_execute(ing_job_t *j) {
        * zone, so that its inventory stops saying so (the next change is a summary, with the apex that a body cannot give) */
       j->status = j->dir_entry ? KDB_ST_APPLIED : KDB_ST_NOT_RESIDENT;
       /* 0.7 store S2: a summary that comes after the first batch means the loader found the zone changed (a change log entry, a reload): what the store holds of it is not trusted any more */
-      if (j->dir_entry && j->batch_kind != KDB_BATCH_STARTUP) db_store_invalidate(j->view_name, j->zone, j->source_id, j->serial);
     } else {
       job_reject(j, "out of memory registering the zone");
       (void)dbreg_reject(j->view_name, j->zone, j->source_id, j->reason);
@@ -1184,15 +1185,15 @@ static void job_execute(ing_job_t *j) {
   }
   if (new_cfg) db_entry_retire_config(entry, old_cfg, cfg_epoch);
   bool shadowed = false;
-  if (dbreg_commit(j->view_name, j->zone, entry, created, j->source_id, atomic_load(&entry->serial), j->digest,
+  const uint32_t serial_now = atomic_load(&entry->serial);      /* (before the commit: a zone of the store that is over the limit is not kept, the entry is gone) */
+  if (dbreg_commit(j->view_name, j->zone, entry, created, j->source_id, serial_now, j->digest,
                    &shadowed) != 0) {
     if (created) free_zone_db_entry(entry);
     job_reject(j, "out of memory registering the zone");
     goto rejected;
   }
-  j->serial = atomic_load(&entry->serial);
+  j->serial = serial_now;
   j->status = shadowed ? KDB_ST_SHADOWED : KDB_ST_APPLIED;
-  db_store_write_through(j->view_name, j->zone, j->source_id, j->serial, j->digest);       /* 0.7 store S2: the version is in memory and registered; the store gets a copy */
   db_zone_build_free(j->build);
   j->build = NULL;
   return;
@@ -1698,6 +1699,7 @@ typedef struct {
 static bool inv_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   inv_ctx_t *c = ud;
   ing_t *g = c->g;
+  if (z->kind & ZDIR_K_STORED) return true;              /* 0.7 S3: a zone of the store is listed from the store (inv_store_pass()), in memory or not */
   bool resident = zdir_entry(z) != NULL;
   if (!z->digest || (!resident && (z->shadowed || z->source_id == 0))) return true;     /* never applied: nothing the loader could skip */
   /* B6a: a zone whose last version was refused (or could not be read) is offered again by a loader that starts now: it
@@ -1728,6 +1730,47 @@ static bool inv_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   return true;
 }
 
+/* 0.7 S3: the zones of the store, a chunk at a time by zone id (no walk of anything that grows with the zones in the heap).  A zone with an image is listed as in memory,
+ * with its digest: the loader leaves it alone when the database has the same version.  A zone whose last version was refused (STORE_F_REJECTED_NEW) is not listed, as the
+ * registry's elements of such zones are not: a loader that starts now offers it again.  true: the end of the store. */
+static bool inv_store_pass(ing_t *g, inv_ctx_t *c) {
+  store_t *st = db_store_handle();
+  if (!st) return true;
+  bool end = true;
+  store_read_lock();
+  store_zone_t z;
+  for (;;) {
+    if (c->n >= ING_INV_CHUNK) {
+      end = false;
+      break;
+    }
+    int more = store_iter(st, &g->inv_zid, &z);
+    if (more == 0) break;
+    if (more < 0 || (z.flags & STORE_F_REJECTED_NEW) || (z.state != STORE_STATE_STORED && z.state != STORE_STATE_KNOWN)) continue;
+    const char *vn = store_view_name(st, z.view);
+    int idx = -1;
+    for (uint32_t i = 0; vn && i < g->nview_names; i++) {
+      if (strcasecmp(g->view_names[i], vn) == 0) {
+        idx = (int)i;
+        break;
+      }
+    }
+    if (idx < 0) continue;                               /* a view that left the configuration */
+    char zn[STORE_NAME_MAX + 2];
+    snprintf(zn, sizeof(zn), "%s.", z.name);
+    const bool resident = z.state == STORE_STATE_STORED;
+    if (kdb_enc_nest_begin(&g->enc, 1) != 0 || kdb_enc_u16(&g->enc, 1, (uint16_t)idx) != 0 || kdb_enc_name(&g->enc, 2, zn) != 0 ||
+        kdb_enc_i64(&g->enc, 3, z.source_id) != 0 || kdb_enc_u32(&g->enc, 4, z.serial) != 0 ||
+        (resident && kdb_enc_bytes(&g->enc, 5, z.digest, KDB_DIGEST_LEN) != 0) || kdb_enc_u8(&g->enc, 6, resident ? 1 : 0) != 0 || kdb_enc_nest_end(&g->enc) != 0) {
+      c->bad = true;
+      break;
+    }
+    c->n++;
+  }
+  store_read_unlock();
+  return end;
+}
+
 static void pump_inventory(ing_t *g) {
   burst_yield_t by = BURST_YIELD_INIT;
   while (g->inv_active && g->stream_fd >= 0 && g->out_len - g->out_off < ING_INV_QUEUE_LOW) {
@@ -1738,7 +1781,12 @@ static void pump_inventory(ing_t *g) {
       send_enc(g);
       return;
     }
-    bool done = dbreg_walk(&g->inv_cur, inv_cb, &c);
+    bool done = true;
+    if (!g->inv_store) {
+      done = dbreg_walk(&g->inv_cur, inv_cb, &c);
+      if (done) g->inv_store = true;
+    }
+    if (done && dbdir()) done = inv_store_pass(g, &c);
     if (c.bad || kdb_enc_end(&g->enc) != 0) {
       g->enc.err = true;
       send_enc(g);
@@ -1768,6 +1816,8 @@ static void on_inventory_req(ing_t *g) {
   g->inv_active = true;
   memset(&g->inv_cur, 0, sizeof(g->inv_cur));
   g->inv_sent = 0;
+  g->inv_zid = 0;
+  g->inv_store = false;
   pump_inventory(g);
 }
 
@@ -1806,6 +1856,7 @@ static void on_batch_begin(ing_t *g, const kdb_msg_t *m) {
  * high mark of the limit with this zone counted (about 160 bytes a record, what the declared record count says), and not for a zone that was asked
  * for (a fetch), one that is in memory (its update is installed), one that is pinned, or one in a view that does not take database zones. */
 static bool cache_wants_cold(const ing_job_t *j) {
+  if (dbdir()) return false;                          /* 0.7 S3: the zone store is the directory: a zone is sent whole and goes to the store, whether it is kept in memory is decided when it is registered */
   if (!dbreg_cache_limit() || j->fetch_id || (j->shared && j->shared->ext.cache_mode == 1)) return false;
   if (dbreg_lookup_entry(j->view_name, j->zone)) return false;
   return dbreg_cache_over_high((uint64_t)j->rr_count * 160u);
@@ -2076,7 +2127,6 @@ static void on_zone_delete(ing_t *g, const kdb_msg_t *m) {
       if (g->cur_req >= 0 && g->reqs[g->cur_req].view == zd->view && domain_names_match_ci(g->reqs[g->cur_req].zone, zd->name))
         g->req_outcome = ROUT_DELETED;
       g->b_deleted++;
-      db_store_delete(vname, zd->name);                  /* 0.7 store S2 */
       atomic_fetch_add_explicit(&g_st.tot_deleted, 1, memory_order_relaxed);
       syslog(LOG_INFO, "[DB] zone '%s' (view '%s') deleted", zd->name, vname);
     } else if (r == 0) {
@@ -2438,7 +2488,7 @@ typedef struct {
 static bool apexw_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   apexw_t *c = ud;
   if (++c->chunk > REEVAL_CHUNK || c->n >= APEXW_BATCH) return false;      /* stop before this zone: the next step starts at it */
-  if (zdir_entry(z) || atomic_load_explicit((_Atomic(zdir_apex_t *) *)&z->apex, memory_order_relaxed) || (z->flags & (ZDIR_F_DELETED | ZDIR_F_WARM | ZDIR_F_NOAPEX)) || !z->digest || z->shadowed ||
+  if ((z->kind & ZDIR_K_STORED) || zdir_entry(z) || atomic_load_explicit((_Atomic(zdir_apex_t *) *)&z->apex, memory_order_relaxed) || (z->flags & (ZDIR_F_DELETED | ZDIR_F_WARM | ZDIR_F_NOAPEX)) || !z->digest || z->shadowed ||
       atomic_load_explicit((_Atomic uint8_t *)&z->state, memory_order_relaxed) == ZDIR_ST_ERROR || strlen(z->name) > PARK_ZONE_MAX || strlen(view) > PARK_VIEW_MAX)
     return true;
   if (!dbreg_apex_wanted_cfg(c->cfg, view, z->name, atomic_load_explicit((_Atomic(zone_ext_shared_t *) *)&z->sh, memory_order_acquire))) return true;
@@ -3617,6 +3667,7 @@ static void hot_tick(const ing_cfg_t *c) {
   static dbreg_hot_t *s_hot;
   static int64_t s_due;
   int64_t now = now_ms();
+  if (dbdir()) return;                       /* 0.7 S3: no hot list: a zone is attached from the store when it is asked for (50 us), and the page cache / ARC survived the restart (design 6.2) */
   if (!s_hot) {
     if (s_due == 0) s_due = now + (int64_t)c->hot_interval * 1000;
     if (now < s_due) return;
@@ -3671,7 +3722,7 @@ static void ma_inputs(ma_in_t *in, const dbreg_residency_t *rs, uint64_t limit) 
   zone_bytes_t zdb;
   zone_bytes_get(ZBYTES_DB, &zdb);
   memset(in, 0, sizeof(*in));
-  in->zones = rs->total;
+  in->zones = dbdir() ? rs->resident : rs->total;       /* 0.7 S3: a zone of the store that is not in memory costs no heap: the directory the advice counts is the zones in memory */
   in->resident_zones = rs->resident;
   in->resident_bytes = zdb.resident;
   in->limit = limit;
@@ -3962,6 +4013,44 @@ zone_db_entry_t *db_ingest_xfr_await(zdir_elem_t *el, const char *view) {
   return NULL;
 }
 
+/* 0.7 store S3: the same for a zone of the store that is not in memory (it has no element): the thread has a store thread's job done on its own thread (the attach of a stored zone), or
+ * asks the ingest thread for the zone (a zone the store knows without an image), until the zone is in memory or the time is up.  The entry is held as db_ingest_xfr_await() holds it. */
+zone_db_entry_t *db_ingest_xfr_await_zone(const char *zone, const char *view) {
+  const int64_t end = now_ms() + (int64_t)atomic_load_explicit(&g_xfr_timeout_ms, memory_order_relaxed);
+  int64_t next_ask = 0;
+  bool waited = false;
+  for (;;) {
+    zone_db_entry_t *e = dbreg_pin_entry(view, zone);
+    if (e) {
+      if (waited) {
+        dbreg_xfr_note(DBREG_XFR_LOADED);
+        dbreg_xfr_loaded(view, zone);                  /* the zone is here for this transfer: the first to go when memory is needed (design 7) */
+      }
+      return e;
+    }
+    if (!waited) {
+      waited = true;
+      dbreg_xfr_note(DBREG_XFR_WAITED);
+    }
+    const int64_t now = now_ms();
+    if (now >= end) break;
+    if (now >= next_ask) {
+      dbdir_rec_t rec;
+      if (dbdir() && dbdir()->rec_get(view, zone, &rec) && rec.state == STORE_STATE_STORED) {
+        db_store_attach_zone(view, zone);                /* (the zone is attached on this thread; a failure falls back to a fetch, which the next round waits for) */
+        next_ask = now + XFR_REREQUEST_MS;
+      } else {
+        next_ask = now + (park_fetch_request_any(view, zone, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL) ? XFR_REREQUEST_MS : XFR_REREQUEST_MS / 5);
+      }
+      continue;                                          /* (look again at once: an attach that worked has made the entry) */
+    }
+    struct timespec ts = { 0, XFR_POLL_NS };
+    nanosleep(&ts, NULL);
+  }
+  dbreg_xfr_note(DBREG_XFR_FAILED);
+  return NULL;
+}
+
 bool db_ingest_enabled(void) {
   return atomic_load_explicit(&g_ing_kq, memory_order_acquire) >= 0;
 }
@@ -4231,6 +4320,22 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     c.cfg = acquire_config_snapshot();
     (void)dbreg_walk(&cur, status_cb, &c);
     rcu_aux_read_unlock();
+    if (c.matches == 0 && dbdir()) {                     /* 0.7 S3: a zone of the store that is not in memory has no registry element: one index lookup per view, no attach */
+      char canon[260];
+      snprintf(canon, sizeof(canon), "%s", zone);
+      size_t cl = strlen(canon);
+      if (cl > 0 && canon[cl - 1] != '.' && cl + 1 < sizeof(canon)) {
+        canon[cl] = '.';
+        canon[cl + 1] = '\0';
+      }
+      dbreg_info_t info[8];
+      int ni = dbreg_find_info(view, canon, info, 8);
+      for (int i = 0; i < ni && i < 8; i++) {
+        c.matches++;
+        st_append(&c, "zone %s view %s: source id %lld, serial %u, status applied (in the zone store, not in memory: it is attached when a query needs it)\n", canon, info[i].view,
+                  (long long)info[i].source_id, (unsigned)info[i].serial);
+      }
+    }
     if (c.matches == 0) st_append(&c, "zone %s: not in the database registry\n", zone);
     return c.len;
   }
@@ -4311,8 +4416,19 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
               dbreg_count_updated());
     size_t nel, rbytes, ibytes;
     dbreg_dir_bytes(&nel, &rbytes, &ibytes);
-    st_append(&c, "zone directory: %zu elements, %zu bytes in the registry + %zu bytes in the indexes of the views (%zu bytes per zone)\n",
-              nel, rbytes, ibytes, nel ? (rbytes + ibytes) / nel : (size_t)0);
+    if (dbdir()) {                                        /* 0.7 S3: the zone store is the directory; the heap holds the zones that are in memory */
+      store_stats_t sst;
+      store_t *sth = db_store_handle();
+      if (sth) {
+        store_stats(sth, &sst);
+        st_append(&c, "zone directory: the zone store (%llu zones: %llu stored, %llu known; its index and tables are files, %llu bytes on disk per zone for the tables), the heap holds %zu elements for the zones in memory: %zu bytes in the registry + %zu bytes in the indexes of the views, %llu zones in the attach table\n",
+                  (unsigned long long)(sst.zones_stored + sst.zones_known), (unsigned long long)sst.zones_stored, (unsigned long long)sst.zones_known, 160ull, nel, rbytes, ibytes,
+                  (unsigned long long)dbdir()->counters(4));
+      }
+    } else {
+      st_append(&c, "zone directory: %zu elements, %zu bytes in the registry + %zu bytes in the indexes of the views (%zu bytes per zone)\n",
+                nel, rbytes, ibytes, nel ? (rbytes + ibytes) / nel : (size_t)0);
+    }
     st_append(&c, "alias: scans=%llu (the alias thread's scans of the zones for ALIAS records: they follow ALIAS zones coming, changing and going and the configuration, not every zone a fetch brings)\n",
               (unsigned long long)alias_scan_count());
     {

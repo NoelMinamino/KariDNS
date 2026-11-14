@@ -2963,6 +2963,21 @@ void *axfr_worker_thread(void *arg) {
       answered = true;
       log_rcode = 2;
     }
+  } else if (!entry && args->store_zone[0]) {
+    /* 0.7 store S3: a zone of the store that is not in memory: a store thread attaches it (the wait is bounded as for a zone of the registry) */
+    if (args->await_zone && (entry = args->await_zone(args->store_zone, args->view_name)) != NULL) {
+      /* held by the wait */
+    } else {
+      xfr_log(LOG_LVL_WARNING, args->client_ip, args->client_port, args->store_zone,
+              "%s request failed: the zone data could not be read in time (SERVFAIL, Not Ready)", args->qtype == 251 ? "IXFR" : "AXFR");
+      release_zone_snapshot(args->snap);
+      args->snap = NULL;
+      xfr_arm_out_limits(args);
+      axfr_send_error(args->client_fd, args->req, args->req_len, 2, false, args->send_ede, 14, "Not Ready", pkey, args->tsig_mac, args->tsig_mac_len, &args->client_addr,
+                      args->client_len, &args->server_addr, args->has_server_addr);
+      answered = true;
+      log_rcode = 2;
+    }
   }
   /* R11: the entry is held (xfr_entry_hold()), and send_axfr_response() pins the version it sends in its own short read section: the snapshot the
    * dispatch retained is not needed any more, and is not kept for the length of the stream (a stalled client would hold back the reclamation of

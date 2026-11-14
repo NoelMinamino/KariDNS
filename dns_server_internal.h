@@ -619,6 +619,7 @@ enum { ZDIR_ST_ABSENT = 0, ZDIR_ST_RESIDENT, ZDIR_ST_LOADING, ZDIR_ST_ERROR };
 #define ZDIR_K_STATIC    0x02u     /* the zone of a zone { } block of karidns.conf */
 #define ZDIR_K_SHARED    0x04u     /* a zone shared from another view by `in-view`: the entry is the owner view's */
 #define ZDIR_K_BORROWED  0x08u     /* the element holds no reference of its entry (unit tests, fuzzers) */
+#define ZDIR_K_STORED    0x10u     /* 0.7 store S3: a database zone of the zone store that is in memory (attached) or on its way into it: the registry knows it, the directory's index does not (the attach table does: zid -> element, dns_db_store.c) */
 
 /* D1a step 6 (design 12-12): the apex of a zone that is not in memory, from its summary: what the answer to an SOA question at the apex is made of
  * (RFC 1035 3.3.13, 3.3.11).  Names are wire names without compression (RFC 3597 4 does not apply: SOA and NS are well-known types).  data: MNAME,
@@ -671,7 +672,9 @@ struct zdir_elem {
   _Atomic uint32_t serial;     /* DB: the serial of the version offered last (the SOA of the entry for a secondary).  Written under g_zone_db_rebuild_lock; a worker reads it (build_apex_soa_answer()): zdir_serial() */
   uint32_t refresh, retry, expire;   /* the SOA timers of the version served */
   uint32_t hash;               /* calc_fnv1a_strn(name, klen): the index hash */
-  _Atomic uint32_t freq;       /* D1a step 5: how often the zone is asked for (GDSF, cache admission).  Non-resident zone: +1 per query that parks; the cache manager folds the queries of a resident zone in (observatory counter) and halves it at each round */
+  uint32_t zid;                /* ZDIR_K_STORED: the zone id in the store (dns_store.h) */
+  uint16_t sview;              /* ... and the id of its view in the store */
+  _Atomic uint32_t freq;      /* D1a step 5: how often the zone is asked for (GDSF, cache admission).  Non-resident zone: +1 per query that parks; the cache manager folds the queries of a resident zone in (observatory counter) and halves it at each round */
   uint32_t qseen;              /* D1a step 5: the zone entry's query counter (low 32 bits) when the cache manager last folded it into freq */
   uint32_t t_load;             /* D1a step 5: when the data came into memory (ms of a monotonic clock, 32 bits): a zone is not taken out again before its queries are answered */
   _Atomic uint8_t state;       /* ZDIR_ST_*: written under g_zone_db_rebuild_lock, read without it (a worker looks at it before it parks a query) */
@@ -764,7 +767,86 @@ typedef struct view_snapshot {
   zdir_ivdb_t *ivdb;
   size_t ivdb_cap;               /* slots of the table (a power of two); 0 with ivdb == NULL */
   size_t ivdb_n;                 /* names in it */
+  /* 0.7 store S3: the id of the view in the zone store (zref_view_sid()): 0 = not looked up yet; low 16 bits 0xFFFF = the view has none (the high 16 bits: the store's view generation at
+   * that look, so that a view that the store gets later is found); else the store view id + 1.  Set lazily by the lookup. */
+  _Atomic uint32_t sid_state;
 } view_snapshot_t;
+
+/* ---- 0.7 store S3: the zone store is the directory of the database zones (design 2.2) ----
+ * With the store on, a database zone (a primary: not a catalog consumer, not a secondary) is found by the name index of the store (ix) and not in the view's heap directory.  The
+ * heap directory keeps what is not in the store (zone { } blocks, catalog members, secondaries, the stubs of in-view, and the database zones of a server without a store).  The
+ * lookup asks, at every suffix of the name, the heap directory first and then the store, so a zone of karidns.conf or a catalog member hides a database zone of the same name
+ * (D-PRIO, D17-1) without a flag in the store, and a longer database apex wins over a shorter static one.  A database zone that is in memory (attached) has a registry element
+ * (ZDIR_K_STORED) that the attach table (zid -> element, lock-free, dns_db_store.c) reaches; a zone that is not has none and costs no heap.  The result of a lookup is a zref_t. */
+#define ZREF_NOZID 0xFFFFFFFFu
+enum { ZREF_ST_NONE = 0, ZREF_ST_ABSENT, ZREF_ST_KNOWN };    /* a store zone that is not in memory: its image is stored / it has no image (it is read from the database) */
+typedef struct zref {
+  zone_db_entry_t *entry;        /* the data in memory (a heap element's, or the attached zone's); NULL: not in memory */
+  zdir_elem_t *el;               /* the heap directory's element, or the registry's element of an attached store zone; NULL for a store zone that is not in memory */
+  uint32_t zid;                  /* the zone id in the store; ZREF_NOZID: not a store zone */
+  uint32_t serial;               /* a store zone that is not in memory: the serial of its record */
+  uint32_t settings;             /* ... and the id of its settings (zref_settings()) */
+  uint16_t flags;                /* ... and the flags of its record (STORE_F_*) */
+  int16_t sview;                 /* the view's id in the store, -1: none */
+  uint8_t zstate;                /* ZREF_ST_* */
+  bool busy;                     /* the store had a cell that was being written: the zone is not known now (a worker parks the query for a store thread; it never waits) */
+  const char *hview;             /* the name of the view that holds the zone (the owner's for a zone shared by in-view) */
+  char name[256];                /* a store zone that is not in memory: its canonical name with the trailing dot (use zref_name()) */
+} zref_t;
+static inline void zref_clear(zref_t *z) {
+  z->entry = NULL; z->el = NULL; z->zid = ZREF_NOZID; z->serial = 0; z->settings = 0; z->flags = 0; z->sview = -1; z->zstate = ZREF_ST_NONE; z->busy = false; z->hview = NULL; z->name[0] = '\0';
+}
+static inline bool zref_present(const zref_t *z) { return z->el != NULL || z->zid != ZREF_NOZID || z->busy; }
+static inline const char *zref_name(const zref_t *z) { return z->el ? z->el->name : z->name; }
+/* the state of a zone out of memory the way the worker reads it: ZDIR_ST_ABSENT (a store zone: stored or known, or an element that is) / LOADING / ERROR */
+static inline uint8_t zref_state(const zref_t *z) {
+  return z->el ? atomic_load_explicit((const _Atomic uint8_t *)&z->el->state, memory_order_acquire) : (uint8_t)ZDIR_ST_ABSENT;
+}
+/* the serial of a zone out of memory: the element's, or the store record's */
+static inline uint32_t zref_serial(const zref_t *z) { return z->el ? atomic_load_explicit(&z->el->serial, memory_order_relaxed) : z->serial; }
+/* the settings (allow-query, allow-transfer ...) of a zone that is not in memory: the element's, or the interned block of the store's settings id; NULL: none.  Read section only. */
+zone_ext_shared_t *zref_settings(const zref_t *z);
+
+/* What dns_db_store.c installs when the store is the directory (g_dbdir; NULL: no store, everything above is the heap directory only and the registry works as before 0.7).  All of it
+ * is called by the registry and the lookup, which cannot link the store (the unit tests of the engine do not). */
+typedef struct dbdir_rec {
+  uint32_t zid;
+  uint8_t state;                 /* STORE_STATE_KNOWN / STORE_STATE_STORED */
+  uint16_t flags;                /* STORE_F_* */
+  uint32_t serial, settings;
+  int64_t source_id;
+  uint8_t digest[32];
+} dbdir_rec_t;
+typedef struct dbdir_ops {
+  int (*view_sid)(const char *view_name);                                    /* the store's id of the view, -1 none */
+  uint32_t (*view_gen)(void);                                                /* changes when the store gets a view */
+  unsigned (*depth_max)(int sid);                                            /* the most labels a stored zone of the view has (0: none) */
+  bool (*find)(int sid, const char *fname, size_t len, zref_t *out);         /* one probe of the name index (the folded name, no trailing dot); out->busy: a cell was being written */
+  zone_ext_shared_t *(*settings)(uint32_t id);                               /* the interned settings of a store settings id (not referenced) */
+  uint32_t (*settings_id)(zone_ext_shared_t *sh);                            /* the id of settings (assigned and made durable when it has none); 0 = none */
+  bool (*rec_get)(const char *view, const char *zone, dbdir_rec_t *out);     /* the store's record of a zone (the name with its trailing dot) */
+  int (*put)(const char *view, const char *zone, zone_db_entry_t *entry, int64_t source_id, uint32_t serial, const uint8_t digest[32], uint32_t settings, uint32_t *zid);
+  int (*del)(const char *view, const char *zone, int64_t source_id, bool *had);   /* delete by name (when source_id is 0 or the record's) */
+  void (*set_known)(uint32_t zid);                                           /* the record loses its image (damaged, or the version is not trusted) */
+  void (*note_flags)(uint32_t zid, uint16_t set, uint16_t clear);
+  bool (*attach_put)(zdir_elem_t *el);                                       /* the attach table: the registry lock is held (all three) */
+  void (*attach_remove)(const zdir_elem_t *el);
+  size_t (*attach_count)(void);
+  zdir_elem_t *(*attach_get)(uint32_t zid);
+  zdir_elem_t *(*attach_next)(size_t *pos);                                  /* the elements of the attach table, in table order (read section); *pos starts at 0; NULL at the end */
+  uint64_t (*attach_tab_id)(void);                                           /* identifies the table a position belongs to (a table that grew is another one) */
+  uint64_t (*counters)(int what);                                            /* the figures of the store for the status lines */
+} dbdir_ops_t;
+extern _Atomic(const dbdir_ops_t *) g_dbdir;
+static inline const dbdir_ops_t *dbdir(void) { return atomic_load_explicit(&g_dbdir, memory_order_acquire); }
+/* the longest-suffix match of qname and the zone named exactly domain, in the heap directory of the view and in the store: found (true) or not.  The store is asked at every suffix after the
+ * heap directory (see above); the in-view names too (the owner view's store).  zdir_find_suffix() / zdir_find_exact() below stay the heap directory alone. */
+bool zref_find_suffix(const view_snapshot_t *view, const char *qname, zref_t *out);
+bool zref_find_exact(const view_snapshot_t *view, const char *domain, zref_t *out);
+/* the store's id of the view (looked up once and kept in the view of the snapshot): -1 none */
+int zref_view_sid(const view_snapshot_t *view);
+/* find_zone_for_query_ex() with a zref_t; the DS rule of R-32 as there */
+zone_db_entry_t *find_zone_for_query_zref(view_snapshot_t *view, const char *qname, uint16_t qtype, zref_t *out);
 
 /* The view that holds the zone of an element a lookup in `view` returned: the view's own name, or -- for a zone shared by in-view from the database of another view -- the owner
  * view's.  It is the name the registry knows the zone by (a request to read a zone, a wake-up, a NOTIFY, the table of transfers). */

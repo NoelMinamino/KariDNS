@@ -117,10 +117,12 @@ uint64_t store_status_hist_pct(const uint64_t *hist, unsigned p, uint64_t max_ns
 static _Atomic(store_t *) g_store;
 static bool (*_Atomic g_mem_fn)(ma_est_t *);
 static bool (*_Atomic g_att_fn)(uint32_t);
+static uint64_t (*_Atomic g_att_count_fn)(void);
 
 void store_status_bind(store_t *s) { atomic_store_explicit(&g_store, s, memory_order_release); }
 void store_status_set_memory_fn(bool (*fn)(ma_est_t *out)) { atomic_store_explicit(&g_mem_fn, fn, memory_order_release); }
 void store_status_set_attached_fn(bool (*fn)(uint32_t zid)) { atomic_store_explicit(&g_att_fn, fn, memory_order_release); }
+void store_status_set_attached_count_fn(uint64_t (*fn)(void)) { atomic_store_explicit(&g_att_count_fn, fn, memory_order_release); }
 
 /* ------------------------------------------------------------------------------------------------------------------------------ */
 /* the entry list                                                                                                                 */
@@ -392,6 +394,8 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.clean_flag", st->clean_flag ? 1 : 0);
 
   uint64_t attached = a->attaches > a->detaches ? a->attaches - a->detaches : 0;
+  uint64_t (*acf)(void) = atomic_load_explicit(&g_att_count_fn, memory_order_acquire);
+  if (acf) attached = acf();                       /* 0.7 S3: the zones in memory are counted by the attach table (an install puts a zone in memory too, not only an attach) */
   uint64_t image_bytes = 0;
   for (uint32_t v = 0; v < st->nviews && v < STORE_MAX_VIEWS; v++) image_bytes += st->views[v].image_bytes;
   U("store.zones.known", st->zones_known);

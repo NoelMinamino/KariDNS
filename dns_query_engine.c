@@ -47,10 +47,16 @@ static _Thread_local bool t_resolve_alias_failed;
  * workers, priority background, one request for a zone in a few seconds, and nothing while a fetch of it is on its way), no I/O and no waiting here.  NULL: no hook
  * (the engine on its own, a tool). */
 void (*g_query_bg_fetch)(const char *view_name, const char *zone) = NULL;
-static void bg_fetch_nonresident(const view_snapshot_t *view, const zdir_elem_t *pel) {
-  if (!pel || !view || !view->name || !g_query_bg_fetch || zdir_entry(pel)) return;
-  if (atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) != ZDIR_ST_ABSENT) return;     /* (LOADING: on its way; ERROR: nothing to read) */
-  g_query_bg_fetch(zdir_holder_view(view, pel), pel->name);
+void (*g_query_bg_attach)(const char *view_name, const char *zone) = NULL;
+static void bg_fetch_nonresident(const view_snapshot_t *view, const zref_t *pel) {
+  if (!pel || !view || !view->name || pel->entry || !zref_present(pel) || pel->busy) return;
+  if (zref_state(pel) != ZDIR_ST_ABSENT) return;     /* (LOADING: on its way; ERROR: nothing to read) */
+  const char *hv = pel->hview ? pel->hview : view->name;
+  if (!pel->el && pel->zstate == ZREF_ST_ABSENT) {     /* 0.7 S3: a zone of the store with its image: a store thread attaches it */
+    if (g_query_bg_attach) g_query_bg_attach(hv, zref_name(pel));
+    return;
+  }
+  if (g_query_bg_fetch) g_query_bg_fetch(hv, zref_name(pel));
 }
 
 /* allow-query / allow-query-on (BIND 9.20 ARM): what the ACL check needs besides the client address.  The transport sets the address
@@ -519,12 +525,12 @@ STATIC_TEST bool append_glue_records(const zone_image_t *img, const char *target
 
   // 3. Fallback: Search sibling authoritative zones in view dynamically if policy == ADDITIONAL_AUTH_YES
   if (policy == ADDITIONAL_AUTH_YES && sib_ctx && sib_ctx->view) {
-    zdir_elem_t *sib_pel = NULL;
-    zone_db_entry_t *sib_entry = find_zone_for_query_ex(sib_ctx->view, target, 0, &sib_pel);
-    if (!sib_entry && sib_pel) {
+    zref_t sib_pel;
+    zone_db_entry_t *sib_entry = find_zone_for_query_zref(sib_ctx->view, target, 0, &sib_pel);
+    if (!sib_entry && zref_present(&sib_pel)) {
       /* a sibling zone that is in the directory and not in memory (D1a): no glue from it now, the answer is not stored, the zone is asked for in the background */
       t_resolve_sibling_glue = true;
-      bg_fetch_nonresident(sib_ctx->view, sib_pel);
+      bg_fetch_nonresident(sib_ctx->view, &sib_pel);
     }
     if (sib_entry) {
       zone_version_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
@@ -1595,16 +1601,17 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
        * 「QNAME に最も近い祖先のゾーン」を選ぶので、対象が今のゾーンの下でも、同じビューに子ゾーンが
        * あればそちらで答える (以前は親ゾーンに留まり、子への委任を返していた)。DS は R-32 の規則で
        * find_zone_for_query() が親ゾーンを選ぶ。forward/program ゾーンのデータは持たないので CNAME で止める。 */
-      zdir_elem_t *new_pel = NULL;
-      zone_db_entry_t *new_db_entry = view ? find_zone_for_query_ex(view, current_qname, qtypes[0], &new_pel) : find_zone_for_query(view, current_qname, qtypes[0]);
+      zref_t new_pel;
+      zref_clear(&new_pel);
+      zone_db_entry_t *new_db_entry = view ? find_zone_for_query_zref(view, current_qname, qtypes[0], &new_pel) : find_zone_for_query(view, current_qname, qtypes[0]);
       if (!view && domain_name_is_at_or_below(current_qname, db_entry->domain) &&
           !(qtypes[0] == 43 && domain_names_match_ci(current_qname, db_entry->domain)))
         new_db_entry = db_entry; // ビューの無い呼び出し (応答キャッシュの構築など) はこのゾーンだけで続ける
-      if (!new_db_entry && new_pel) {
+      if (!new_db_entry && zref_present(&new_pel)) {
         /* the zone the chain leads into is in the directory and not in memory (D1a): the chain stops here, the answer is not stored (the zone may be
          * resident the next time), and the zone is asked for in the background */
         t_resolve_crossed_zone = true;
-        bg_fetch_nonresident(view, new_pel);
+        bg_fetch_nonresident(view, &new_pel);
         return;
       }
       if (!new_db_entry || new_db_entry->kind == ZONE_KIND_FORWARD || new_db_entry->kind == ZONE_KIND_PROGRAM)
@@ -3317,9 +3324,9 @@ static int build_apex_soa_answer(const uint8_t *req, size_t req_len, uint8_t *re
       off += nl;
       const bool in_zone = domain_name_is_at_or_below(nm, elem->name);
       if (policy == ADDITIONAL_AUTH_IN_DOMAIN && !in_zone) continue;
-      zdir_elem_t *pe = NULL;
-      zone_db_entry_t *ze = find_zone_for_query_ex(view, nm, 1, &pe);
-      if (ze != NULL || (pe != NULL && pe != elem) || (in_zone && pe != elem)) return -1;
+      zref_t pz;
+      zone_db_entry_t *ze = find_zone_for_query_zref(view, nm, 1, &pz);
+      if (ze != NULL || (zref_present(&pz) && pz.el != elem) || (in_zone && pz.el != elem)) return -1;
     }
   }
   size_t limit = max_res_len;                               /* what the body may use: the room for the OPT (RFC 6891 7) and for the TSIG (RFC 8945 5.3) is kept back */
@@ -3455,7 +3462,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
                               bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                               zone_db_snapshot_t *snap, server_config_t *cfg,
                               zone_db_entry_t **out_matched_entry, tsig_request_t *tsig,
-                              const query_route_t *route, const zdir_elem_t *not_ready_zone);
+                              const query_route_t *route, const zref_t *not_ready_zone);
 
 static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len, uint8_t *res,
                                              size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
@@ -3463,7 +3470,7 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
                                              bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                                              zone_db_snapshot_t *snap, server_config_t *cfg,
                                              zone_db_entry_t **out_matched_entry, const query_route_t *route,
-                                             const zdir_elem_t *not_ready_zone);
+                                             const zref_t *not_ready_zone);
 
 int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
                                size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
@@ -3486,7 +3493,7 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
                                              bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                                              zone_db_snapshot_t *snap, server_config_t *cfg,
                                              zone_db_entry_t **out_matched_entry, const query_route_t *route,
-                                             const zdir_elem_t *not_ready_zone) {
+                                             const zref_t *not_ready_zone) {
   t_query_rrl_info.zone = NULL; /* D-05: 早い段階で返す応答 (エラー) のために先に消す */
   t_query_rrl_info.wildcard = false;
   t_qerr_why = NULL;
@@ -3502,13 +3509,18 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
    * has made that very check (route->tsig).  Only a message that carries an additional section can be signed, so tsig_check_request()
    * returns at once for the others. */
   query_route_t own_route;
+  zref_t own_pel;                                        /* (the zone that is not in memory: not_ready_zone points to it, so it lives as long as the function) */
   if (snap && !route) {
     bool done = false;
     own_route.view = select_view_req(snap, cfg, client_ip, req, req_len, &tsig, &done);
-    zdir_elem_t *own_pel = NULL;
-    own_route.entry = own_route.view ? find_zone_for_query_ex(own_route.view, qname, ((req[2] >> 3) & 0x0F) == 0 ? qtype : 0, &own_pel) : NULL;
-    /* D1a: a zone that is in the directory and not in memory (TLS, DoH and the other callers that do not park): "not ready", not REFUSED */
-    if (!own_route.entry && own_pel && !not_ready_zone) not_ready_zone = own_pel;
+    zref_clear(&own_pel);
+    own_route.entry = own_route.view ? find_zone_for_query_zref(own_route.view, qname, ((req[2] >> 3) & 0x0F) == 0 ? qtype : 0, &own_pel) : NULL;
+    /* D1a: a zone that is in the directory and not in memory (TLS, DoH and the other callers that do not park): "not ready", not REFUSED.  A zone of the store is asked for in the background (the
+     * next query finds it in memory) */
+    if (!own_route.entry && zref_present(&own_pel) && !not_ready_zone) {
+      not_ready_zone = &own_pel;
+      bg_fetch_nonresident(own_route.view, &own_pel);
+    }
     own_route.tsig = done ? &tsig : NULL;
     route = &own_route;
   }
@@ -3559,7 +3571,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
                               bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                               zone_db_snapshot_t *snap, server_config_t *cfg,
                               zone_db_entry_t **out_matched_entry, tsig_request_t *tsig,
-                              const query_route_t *route, const zdir_elem_t *not_ready_zone) {
+                              const query_route_t *route, const zref_t *not_ready_zone) {
   char current_qname[DNS_NAME_TEXT_SIZE];
   strlcpy(current_qname, qname, sizeof(current_qname));
   char current_qname_lc[DNS_NAME_TEXT_SIZE];
@@ -3739,12 +3751,12 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
      * checks of the message above (a malformed request is still a FORMERR), before any work on the zone.  The answer is an error answer of that
      * zone for rate limiting (the global limits), and goes through the TSIG handling of the caller like every other answer: signed with the
      * key of a verified request, RFC 8945 5.3 (the request given here has the TSIG record taken off, 5.2). */
-    t_query_rrl_info.zone = not_ready_zone->name;
+    t_query_rrl_info.zone = zref_name(not_ready_zone);
     /* the zone's own settings come from the interned block the element kept when its data left memory (zdir_elem_t.sh); only the ACL levels read them */
     zone_config_t zc;
     memset(&zc, 0, sizeof(zc));
-    zc.domain = (char *)not_ready_zone->name;
-    zone_ext_shared_t *nrsh = atomic_load_explicit(&not_ready_zone->sh, memory_order_acquire);
+    zc.domain = (char *)zref_name(not_ready_zone);
+    zone_ext_shared_t *nrsh = zref_settings(not_ready_zone);
     zc.ext = nrsh ? &nrsh->ext : NULL;
     tsig_key_t *nr_tkey = (tsig && tsig->status == TSIG_REQ_VALID) ? tsig->key : NULL;
     if (opcode == 4) {
@@ -3761,10 +3773,10 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       if (qtype != 6) {
         urc = 1;                                        // FORMERR
         qe_log_update_zone_error(client_ip, urc, current_qname);
-      } else if (!view || !domain_names_match_ci(not_ready_zone->name, current_qname)) {
+      } else if (!view || !domain_names_match_ci(zref_name(not_ready_zone), current_qname)) {
         urc = 9;                                        // NOTAUTH
         qe_log_update_zone_error(client_ip, urc, current_qname);
-      } else if (qe_update_query_acl_denies(cfg, &zc, view->name, client_ip, not_ready_zone->name)) {
+      } else if (qe_update_query_acl_denies(cfg, &zc, view->name, client_ip, zref_name(not_ready_zone))) {
         urc = 5;                                        // REFUSED: allow-query first, as for a zone in memory (a zone of the database is a primary)
         add_ede(&edns, send_ede, 18, "Query refused due to access control");
       } else {
@@ -3780,7 +3792,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
         } else {
           urc = 5;                                      // REFUSED
           add_ede(&edns, send_ede, 18, "Query refused due to access control");
-          qe_log_update_decision(client_ip, not_ready_zone->name, nr_tkey ? nr_tkey->name : NULL, false, cfg, &zc, view->name);
+          qe_log_update_decision(client_ip, zref_name(not_ready_zone), nr_tkey ? nr_tkey->name : NULL, false, cfg, &zc, view->name);
         }
       }
       return dns_build_error_response(req, req_len, res, max_res_len, (uint8_t)urc, 0, urc == 1 ? dns_error_qd_echo(req, req_len) : qdcount, &edns,
@@ -3793,8 +3805,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       add_ede(&edns, send_ede, 18, "Query refused due to access control");
       return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
     }
-    if (opcode == 0 && qtype == 6 && qdcount == 1 && view && domain_names_match_ci(not_ready_zone->name, current_qname)) {
-      const zdir_apex_t *ap = atomic_load_explicit(&not_ready_zone->apex, memory_order_acquire);
+    if (opcode == 0 && qtype == 6 && qdcount == 1 && view && domain_names_match_ci(zref_name(not_ready_zone), current_qname)) {
+      const zdir_apex_t *ap = (not_ready_zone->el ? atomic_load_explicit(&not_ready_zone->el->apex, memory_order_acquire) : NULL);
       if (ap) {
         /* the size the zone in memory would answer with (the EDNS size of the client on UDP), and the TSIG signing needs the same limit */
         const size_t alimit = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
@@ -3802,7 +3814,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
         if (tsig) tsig->res_limit = alimit;
         const additional_from_auth_t apolicy = zext(&zc)->additional_from_auth_specified ? zext(&zc)->additional_from_auth
                                                                                          : (cfg ? cfg->additional_from_auth : ADDITIONAL_AUTH_YES);
-        int alen = build_apex_soa_answer(req, req_len, res, alimit, not_ready_zone, ap, &edns, is_tcp, query_minimal_mode(cfg, view, req), apolicy, view,
+        int alen = build_apex_soa_answer(req, req_len, res, alimit, not_ready_zone->el, ap, &edns, is_tcp, query_minimal_mode(cfg, view, req), apolicy, view,
                                          comp_ctx, tsig, cfg, NULL);
         if (alen >= DNS_HEADER_SIZE) return alen;
         if (tsig) tsig->res_limit = tsig_limit;
@@ -3812,7 +3824,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
      * the transport -- a client that may not transfer is REFUSED here, without the zone being read.  One that may gets the answer from the summary (the one SOA,
      * TC when it is behind) when the apex describes the version the directory has, else it waits for the zone like any other query.  An AXFR over UDP has the
      * same checks and then its FORMERR (RFC 5936 §4.2), as for a zone in memory (below): it never makes the server read the zone. */
-    if (opcode == 0 && (qtype == 251 || qtype == 252) && !is_tcp && qdcount == 1 && domain_names_match_ci(not_ready_zone->name, current_qname)) {
+    if (opcode == 0 && (qtype == 251 || qtype == 252) && !is_tcp && qdcount == 1 && domain_names_match_ci(zref_name(not_ready_zone), current_qname)) {
       /* RFC 5936 §2.1.2, RFC 1995 §3: QCLASS is the class of the zone (IN): an IXFR of another class has no zone here, as for a zone in memory (below) */
       const size_t ix_qend = get_question_end_offset(req, req_len, 1);
       const uint16_t ix_class = ix_qend >= DNS_HEADER_SIZE + 5 ? (uint16_t)((req[ix_qend - 2] << 8) | req[ix_qend - 1]) : 1;
@@ -3822,12 +3834,12 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
         return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
       }
       if (!udp_ixfr_allowed(cfg, &zc, view, client_ip, nr_tkey)) {
-        xfr_log_denied(client_ip, qe_client_port(), not_ready_zone->name, 1, qtype, XD_ACL, 0);
+        xfr_log_denied(client_ip, qe_client_port(), zref_name(not_ready_zone), 1, qtype, XD_ACL, 0);
         add_ede(&edns, send_ede, 18, "Query refused due to access control");
         return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
       }
       if (qtype == 252) {
-        xfr_log_denied(client_ip, qe_client_port(), not_ready_zone->name, 1, 252, XD_UDP_AXFR, 0);
+        xfr_log_denied(client_ip, qe_client_port(), zref_name(not_ready_zone), 1, 252, XD_UDP_AXFR, 0);
         return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg); // FORMERR
       }
       /* RFC 1995 §3, RFC 5936 §2.1: then the shape of the request, as on TCP (after the ACL, as BIND): a request that is not shaped like an IXFR request, with
@@ -3835,18 +3847,18 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       uint32_t cs = 0;
       const xfr_shape_t shape = xfr_request_shape(req, req_len, NULL, NULL, &cs);
       if (shape != XFR_SHAPE_OK) {
-        xfr_log_denied(client_ip, qe_client_port(), not_ready_zone->name, 1, 251, XD_BAD_REQUEST, (uint32_t)shape);
+        xfr_log_denied(client_ip, qe_client_port(), zref_name(not_ready_zone), 1, 251, XD_BAD_REQUEST, (uint32_t)shape);
         return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg);
       }
-      const zdir_apex_t *iap = atomic_load_explicit(&not_ready_zone->apex, memory_order_acquire);
+      const zdir_apex_t *iap = (not_ready_zone->el ? atomic_load_explicit(&not_ready_zone->el->apex, memory_order_acquire) : NULL);
       if (iap) {
         const size_t alimit = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
         const size_t tsig_limit = tsig ? tsig->res_limit : 0;
         if (tsig) tsig->res_limit = alimit;
-        int ilen = build_apex_soa_answer(req, req_len, res, alimit, not_ready_zone, iap, &edns, is_tcp, MINIMAL_YES, ADDITIONAL_AUTH_YES, view, comp_ctx, tsig, cfg, &cs);
+        int ilen = build_apex_soa_answer(req, req_len, res, alimit, not_ready_zone->el, iap, &edns, is_tcp, MINIMAL_YES, ADDITIONAL_AUTH_YES, view, comp_ctx, tsig, cfg, &cs);
         if (ilen >= DNS_HEADER_SIZE) {
           if (logev_wanted(LOGC_XFER_OUT, 1))
-            xfr_log_udp_ixfr(client_ip, qe_client_port(), not_ready_zone->name, cs, iap->serial, cs == iap->serial || serial_is_newer(cs, iap->serial), true);
+            xfr_log_udp_ixfr(client_ip, qe_client_port(), zref_name(not_ready_zone), cs, iap->serial, cs == iap->serial || serial_is_newer(cs, iap->serial), true);
           return ilen;
         }
         if (tsig) tsig->res_limit = tsig_limit;
@@ -4647,7 +4659,7 @@ int process_dns_query_cap_routed(const uint8_t *req, size_t req_len, uint8_t *re
 int process_dns_not_ready_routed(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len, size_t res_cap, const char *qname,
                                  uint16_t qtype, const char *client_ip, compress_ctx_t *comp_ctx, bool is_tcp,
                                  const rate_limit_config_t **out_rrl_cfg, zone_db_snapshot_t *snap, const query_route_t *route,
-                                 const zdir_elem_t *elem, bool probe) {
+                                 const zref_t *elem, bool probe) {
   server_config_t *cfg = acquire_config_snapshot();
   zone_db_entry_t *matched_entry = NULL;
   t_nr_probe = probe;

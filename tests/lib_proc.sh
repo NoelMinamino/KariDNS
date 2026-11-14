@@ -181,3 +181,20 @@ kari_make_dbloader_tsan() {
         kari_make karidns-dbloader-tsan "DB_DRIVERS=$(kari_default_db_drivers)"
     fi
 }
+
+# 0.7 store S3, DB_DIFF_STORE=cold (run_db_file_diff_test.sh, run_db_signed_diff_test.sh): the database server B (pid in SB) was started with a `store` (STORE_STMT in its conf) and has read
+# every zone; it is stopped (a clean stop) and started again on the same store with an idle program in the place of the loader, so every answer of B is made from the store alone
+# ("store-cold": a zone is attached on the first query for it).  store_cold_restart DIR CONFNAME LOG: the conf file is DIR/CONFNAME, LOG the log of the first run; the caller defines
+# wait_log, pass, fail and KARIDNS.  Without DB_DIFF_STORE=cold it does nothing.
+store_stmt() { [ "${DB_DIFF_STORE:-}" = cold ] && printf 'store "%s/store";' "$1"; return 0; }   # store_stmt DIR: the `store` statement of the database server (or nothing)
+store_cold_restart() {
+    [ "${DB_DIFF_STORE:-}" = cold ] || return 0
+    kill -TERM "$SB" 2>/dev/null
+    i=0; while [ $i -lt 100 ] && kill -0 "$SB" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    printf '#!/bin/sh\nexec sleep 100000\n' > "$1/idle-loader"; chown 0:0 "$1/idle-loader"; chmod 755 "$1/idle-loader"
+    sed "s|loader-path \"[^\"]*\"|loader-path \"$1/idle-loader\"|" "$1/$2" > "$1/cold-$2"
+    "$KARIDNS" -c "$1/cold-$2" -f > "$3.cold" 2>&1 &
+    SB=$!
+    if ! wait_log "$3.cold" "\[Store\] the zone store is on" 30; then fail "store-cold: the database server did not open its store again"; sed 's/^/         /' "$3.cold" | tail -10; return 1; fi
+    pass "store-cold: the database server runs on its store with an idle loader (every zone is attached on its first query)"
+}

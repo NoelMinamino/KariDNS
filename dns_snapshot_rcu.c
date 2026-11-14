@@ -13,6 +13,7 @@
 #include "dns_tsig_acl.h"
 #include "dns_query_engine.h"
 #include "dns_alias.h"
+#include "dns_store.h"          /* (the constants of the store's records; the lookup reaches the store through g_dbdir) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -650,7 +651,8 @@ zdir_elem_t *zdir_find_exact(const view_snapshot_t *view, const char *domain) {
 }
 
 zone_db_entry_t *find_zone_exact_in_view(view_snapshot_t *view, const char *domain) {
-  return zdir_entry(zdir_find_exact(view, domain));
+  zref_t z;
+  return zref_find_exact(view, domain, &z) ? z.entry : NULL;
 }
 
 
@@ -740,8 +742,190 @@ zdir_elem_t *zdir_find_suffix(const view_snapshot_t *view, const char *qname) {
   return (root || !iv) ? root : zdir_ivdb_find(view, calc_fnv1a_strn("", 0), "", 0);
 }
 
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 0.7 store S3: the lookup that asks the heap directory and the store (design 2.2)                              */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+_Atomic(const dbdir_ops_t *) g_dbdir = ATOMIC_VAR_INIT(NULL);
+
+zone_ext_shared_t *zref_settings(const zref_t *z) {
+  if (z->el) return atomic_load_explicit((_Atomic(zone_ext_shared_t *) *)&z->el->sh, memory_order_acquire);
+  const dbdir_ops_t *ops = dbdir();
+  return ops && z->settings ? ops->settings(z->settings) : NULL;
+}
+
+/* the id of the view in the store; the answer is kept in the view of the snapshot (see view_snapshot_t.sid_state) */
+int zref_view_sid(const view_snapshot_t *view) {
+  const dbdir_ops_t *ops = dbdir();
+  if (!ops || !view || !view->name) return -1;
+  _Atomic uint32_t *sp = (_Atomic uint32_t *)&view->sid_state;
+  uint32_t st = atomic_load_explicit(sp, memory_order_relaxed);
+  if (st != 0 && (st & 0xFFFFu) != 0xFFFFu) return (int)(st & 0xFFFFu) - 1;
+  uint32_t gen = ops->view_gen() & 0xFFFFu;
+  if (st != 0 && (st >> 16) == gen) return -1;
+  int sid = ops->view_sid(view->name);
+  atomic_store_explicit(sp, sid >= 0 ? (uint32_t)(sid + 1) : (0xFFFFu | (gen << 16)), memory_order_relaxed);
+  return sid;
+}
+
+/* the owner view of a name that the view shares by in-view from the database of another view (NULL: the view lists no such name) */
+static const view_snapshot_t *zdir_ivdb_src(const view_snapshot_t *view, uint32_t hash, const char *key, size_t klen) {
+  if (!view->ivdb_cap) return NULL;
+  size_t i = hash & (view->ivdb_cap - 1);
+  for (;;) {
+    const zdir_ivdb_t *l = &view->ivdb[i];
+    if (!l->name) return NULL;
+    if (l->hash == hash && l->klen == klen && strncasecmp(l->name, key, klen) == 0) return l->src;
+    i = (i + 1) & (view->ivdb_cap - 1);
+  }
+}
+
+static void zref_from_elem(zref_t *out, zdir_elem_t *el, const char *hview) {
+  out->el = el;
+  out->entry = zdir_entry(el);
+  out->hview = hview;
+  if (el->kind & ZDIR_K_STORED) {
+    out->zid = el->zid;
+    out->sview = (int16_t)el->sview;
+  }
+}
+
+/* the number of labels of name[0..len) (escapes respected): what the store's depth counts keep (store_name_labels()) */
+static unsigned zref_labels(const char *name, size_t len) {
+  if (len == 0) return 0;
+  unsigned c = 1;
+  for (size_t i = 0; i < len; i++) {
+    if (name[i] == '\\' && i + 1 < len) i++;
+    else if (name[i] == '.') c++;
+  }
+  return c;
+}
+
+/* One probe of `view`'s own zones (the heap directory, then the store) and of `owner`'s when the view shares the name by in-view.  The folded name and the depth
+ * information are of the store lookup only. */
+typedef struct {
+  const dbdir_ops_t *ops;
+  char fn[260];            /* the folded name (lower case) */
+  bool fold_done;
+} zref_walk_t;
+
+static bool zref_probe_store(const view_snapshot_t *vs, zref_walk_t *w, const char *qname, const char *cursor, size_t remaining, unsigned labels, zref_t *out) {
+  const dbdir_ops_t *ops = w->ops;
+  int sid = zref_view_sid(vs);
+  if (sid < 0) return false;
+  unsigned dmax = ops->depth_max(sid);
+  if (dmax < 63 && labels > dmax) return false;                                            /* the depth skip: no stored zone is that deep (the root zone has 0 labels) */
+  if (!w->fold_done && remaining > 0) {                                                     /* (the folded name is made once, on the first suffix that has to ask the store) */
+    size_t n = zone_key_len(qname);
+    for (size_t i = 0; i < n && i < sizeof(w->fn) - 1; i++) w->fn[i] = (char)tolower((unsigned char)qname[i]);
+    w->fold_done = true;
+  }
+  const char *f = remaining ? w->fn + (cursor - qname) : "";
+  zref_clear(out);
+  if (!ops->find(sid, f, remaining, out)) return false;
+  out->sview = (int16_t)sid;
+  out->hview = vs->name;
+  if (out->busy && out->name[0] == '\0') {                                                 /* (the zone the cell would have been: the canonical name for the park) */
+    memcpy(out->name, f, remaining);
+    out->name[remaining] = '.';
+    out->name[remaining + 1] = '\0';
+  }
+  return true;
+}
+
+bool zref_find_suffix(const view_snapshot_t *view, const char *qname, zref_t *out) {
+  zref_clear(out);
+  if (!view || !qname) return false;
+  const zdir_tab_t *t = zdir_tab_of(view);
+  const dbdir_ops_t *ops = dbdir();
+  const bool iv = view->ivdb_n != 0;
+  if (!t && !iv && !ops) return false;
+  zref_walk_t w = { .ops = ops, .fold_done = false };
+  size_t q_len = zone_key_len(qname);
+  unsigned labels = ops ? zref_labels(qname, q_len) : 0;
+  const char *cursor = qname;
+  size_t remaining = q_len;
+  while (remaining > 0) {
+    uint32_t h = calc_fnv1a_strn(cursor, remaining);
+    zdir_elem_t *hit = t ? zdir_tab_find(t, h, cursor, remaining) : NULL;
+    if (hit) {
+      zref_from_elem(out, hit, view->name);
+      return true;
+    }
+    /* a name the view shares by in-view from another view's database hides a zone of that name in the view's own database, as a zone { } block does (D-PRIO): the stub is asked
+     * before the view's own store, and when the owner has no such zone the name is nobody's here */
+    const view_snapshot_t *src = iv ? zdir_ivdb_src(view, h, cursor, remaining) : NULL;
+    if (src) {
+      const zdir_tab_t *st = zdir_tab_of(src);
+      hit = st ? zdir_tab_find(st, h, cursor, remaining) : NULL;
+      if (hit) {
+        zref_from_elem(out, hit, src->name ? src->name : view->name);
+        return true;
+      }
+      if (ops && zref_probe_store(src, &w, qname, cursor, remaining, labels, out)) return true;
+    } else if (ops && zref_probe_store(view, &w, qname, cursor, remaining, labels, out)) {
+      return true;
+    }
+    const char *dot = strchr_unescaped(cursor, '.');
+    if (!dot || (size_t)(dot - cursor) >= remaining) break;
+    remaining -= (size_t)(dot - cursor) + 1;
+    cursor = dot + 1;
+    labels--;
+  }
+  /* the root zone (".") */
+  {
+    uint32_t h = calc_fnv1a_strn("", 0);
+    zdir_elem_t *root = t ? zdir_tab_find(t, h, "", 0) : NULL;
+    if (root) {
+      zref_from_elem(out, root, view->name);
+      return true;
+    }
+    const view_snapshot_t *rsrc = iv ? zdir_ivdb_src(view, h, "", 0) : NULL;
+    if (rsrc) {
+      const zdir_tab_t *st = zdir_tab_of(rsrc);
+      root = st ? zdir_tab_find(st, h, "", 0) : NULL;
+      if (root) {
+        zref_from_elem(out, root, rsrc->name ? rsrc->name : view->name);
+        return true;
+      }
+      if (ops && zref_probe_store(rsrc, &w, qname, "", 0, 0, out)) return true;
+    } else if (ops && zref_probe_store(view, &w, qname, "", 0, 0, out)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool zref_find_exact(const view_snapshot_t *view, const char *domain, zref_t *out) {
+  zref_clear(out);
+  if (!view || !domain) return false;
+  const zdir_tab_t *t = zdir_tab_of(view);
+  const dbdir_ops_t *ops = dbdir();
+  if (!t && !view->ivdb_n && !ops) return false;
+  size_t klen = zone_key_len(domain);
+  uint32_t h = calc_fnv1a_strn(domain, klen);
+  zdir_elem_t *hit = t ? zdir_tab_find(t, h, domain, klen) : NULL;
+  if (hit) {
+    zref_from_elem(out, hit, view->name);
+    return true;
+  }
+  zref_walk_t w = { .ops = ops, .fold_done = false };
+  const view_snapshot_t *src = view->ivdb_n ? zdir_ivdb_src(view, h, domain, klen) : NULL;       /* (an in-view name hides a zone of the view's own database: D-PRIO) */
+  if (src) {
+    const zdir_tab_t *st = zdir_tab_of(src);
+    hit = st ? zdir_tab_find(st, h, domain, klen) : NULL;
+    if (hit) {
+      zref_from_elem(out, hit, src->name ? src->name : view->name);
+      return true;
+    }
+    return ops && zref_probe_store(src, &w, domain, domain, klen, zref_labels(domain, klen), out);
+  }
+  return ops && zref_probe_store(view, &w, domain, domain, klen, zref_labels(domain, klen), out);
+}
+
 zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
-  return zdir_entry(zdir_find_suffix(view, qname));
+  zref_t z;
+  return zref_find_suffix(view, qname, &z) ? z.entry : NULL;
 }
 
 /* R-32: RFC 4035 §3.1.4.1 / §3.1.5: DS は委任点の親側にしか無い権威データで、子ゾーンは DS を持たない。
@@ -749,24 +933,34 @@ zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
  * ルート) で探し直し、あればそのゾーンから答える (DS、または親の SOA と NSEC/NSEC3 による NODATA。親がさらに
  * 上で委任していれば参照応答)。親を持たないとき、または親が forward ゾーン (権威データを持たない) のときは
  * 子の頂点から権威のある NODATA を返す (§3.1.4.1 がこの場合に定める応答)。QUERY 以外は qtype に 0 を渡す。 */
-zone_db_entry_t *find_zone_for_query_ex(view_snapshot_t *view, const char *qname, uint16_t qtype, zdir_elem_t **elem_out) {
-  zdir_elem_t *el = zdir_find_suffix(view, qname);
-  zone_db_entry_t *entry = zdir_entry(el);
-  if (elem_out) *elem_out = el;
+zone_db_entry_t *find_zone_for_query_zref(view_snapshot_t *view, const char *qname, uint16_t qtype, zref_t *out) {
+  zref_t own;
+  zref_t *z = out ? out : &own;
+  (void)zref_find_suffix(view, qname, z);
+  zone_db_entry_t *entry = z->entry;
   if (qtype != 43 || !entry || !domain_names_match_ci(entry->domain, qname)) return entry;
   size_t q_len = zone_key_len(qname);
   if (q_len == 0) return entry; // ルート自身の DS は親を持たない
   const char *dot = strchr_unescaped(qname, '.');
   const char *parent = (dot && (size_t)(dot - qname) < q_len) ? dot + 1 : ".";
-  zdir_elem_t *pel = zdir_find_suffix(view, parent);
-  zone_db_entry_t *p = zdir_entry(pel);
-  if (pel && !p) {                       /* the parent is in the directory and not in memory: the answer comes from it, so it is the zone to wait for */
-    if (elem_out) *elem_out = pel;
+  zref_t par;
+  (void)zref_find_suffix(view, parent, &par);
+  zone_db_entry_t *p = par.entry;
+  if (zref_present(&par) && !p) {        /* the parent is in the directory and not in memory (or the store could not say now): the answer comes from it, so it is the zone to wait for */
+    *z = par;
     return NULL;
   }
   if (!p || p == entry || p->kind == ZONE_KIND_FORWARD) return entry;
-  if (elem_out) *elem_out = pel;
+  *z = par;
   return p;
+}
+
+/* the heap element of the lookup, for the callers that know the directory only (an attached store zone's registry element is returned too; a store zone that is not in memory has none) */
+zone_db_entry_t *find_zone_for_query_ex(view_snapshot_t *view, const char *qname, uint16_t qtype, zdir_elem_t **elem_out) {
+  zref_t z;
+  zone_db_entry_t *e = find_zone_for_query_zref(view, qname, qtype, &z);
+  if (elem_out) *elem_out = z.el;
+  return e;
 }
 
 zone_db_entry_t *find_zone_for_query(view_snapshot_t *view, const char *qname, uint16_t qtype) {
@@ -1785,6 +1979,7 @@ void zone_publish(zone_db_entry_t *entry, zone_version_t *next) {
 typedef struct {
   zone_db_entry_t *entry;
   view_snapshot_t *view;
+  bool held;                   /* 0.7 S3: a zone of the store that is in memory is not kept by the snapshot: the todo holds it (xfr_entry_hold()) until it is done */
 } glue_todo_t;
 
 /* ---- the arrivals (0.7 B2): zones that became reachable since the last tick, by name (a stack that the threads that publish push on and the tick takes
@@ -1848,7 +2043,19 @@ static bool glue_todo_add(glue_todo_t **todo, size_t *n, size_t *cap, zone_db_en
   }
   (*todo)[*n].entry = e;
   (*todo)[*n].view = view;
+  (*todo)[*n].held = false;
   (*n)++;
+  return true;
+}
+
+/* the same for a zone of the store that is in memory (found in a read section): the entry is held until the todo is done */
+static bool glue_todo_add_held(glue_todo_t **todo, size_t *n, size_t *cap, zone_db_entry_t *e, view_snapshot_t *view) {
+  const size_t before = *n;
+  if (!glue_todo_add(todo, n, cap, e, view)) return false;
+  if (*n > before) {
+    xfr_entry_hold(e);
+    (*todo)[*n - 1].held = true;
+  }
   return true;
 }
 
@@ -1902,6 +2109,17 @@ void zone_glue_refresh_dependents(bool force) {
       }
       rcu_aux_read_unlock();
     }
+    if (dbdir() && !oom) {                          /* 0.7 S3: the zones of the store that are in memory are not in the directories */
+      rcu_aux_read_lock();
+      size_t apos = 0;
+      for (zdir_elem_t *ael; !oom && (ael = dbdir()->attach_next(&apos)) != NULL;) {
+        zone_db_entry_t *e = zdir_entry(ael);
+        view_snapshot_t *view = e ? snapshot_find_view(snap, e->view_name) : NULL;
+        burst_yield(&by);
+        if (view && glue_entry_stale(view, e) && !glue_todo_add_held(&todo, &n, &cap, e, view)) oom = true;
+      }
+      rcu_aux_read_unlock();
+    }
   } else {
     atomic_fetch_add_explicit(&g_glue_targeted, 1, memory_order_relaxed);
     rcu_aux_read_lock();
@@ -1922,10 +2140,13 @@ void zone_glue_refresh_dependents(bool force) {
         for (const char *p = a->domain; *p && !oom;) {
           const char *dot = strchr_unescaped(p, '.');
           p = dot ? dot + 1 : p + strlen(p);
-          zdir_elem_t *zel = zdir_find_suffix(view, *p ? p : ".");
-          zone_db_entry_t *e = zdir_entry(zel);
+          zref_t zr;
+          (void)zref_find_suffix(view, *p ? p : ".", &zr);
+          zone_db_entry_t *e = zr.entry;
           /* (a containing zone that this view only shares from another is looked at in its own view: its glue is looked up there) */
-          if (e && view_owns_elem(zel) && strcmp(zdir_holder_view(view, zel), view->name) == 0 && glue_entry_stale(view, e) && !glue_todo_add(&todo, &n, &cap, e, view)) oom = true;
+          if (e && (!zr.el || view_owns_elem(zr.el)) && zr.hview && strcmp(zr.hview, view->name) == 0 && glue_entry_stale(view, e)) {
+            if (zr.zid != ZREF_NOZID ? !glue_todo_add_held(&todo, &n, &cap, e, view) : !glue_todo_add(&todo, &n, &cap, e, view)) oom = true;
+          }
         }
       }
     }
@@ -1952,6 +2173,7 @@ void zone_glue_refresh_dependents(bool force) {
       atomic_store_explicit(&a->generation, zone_data_generation_next(), memory_order_release);
     }
     pthread_mutex_unlock(&e->writer_lock);
+    if (todo[i].held) xfr_entry_release(e);
   }
   free(todo);
   release_zone_snapshot(snap);
@@ -2823,8 +3045,218 @@ static bool dbreg_offered_still_locked(const dbreg_zone_t *z, const dbreg_attach
            (!o->digest_set || (z->digest && memcmp(z->digest, o->digest, 32) == 0));
 }
 
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 0.7 store S3: database zones that live in the zone store (design 4.1, 6.3).  The store's index is their directory: a registry element exists  */
+/* only while the zone is in memory (or on its way into it: LOADING) and has ZDIR_K_STORED; the attach table (g_dbdir->attach_put) reaches it, */
+/* the index of the view never does, so nothing here publishes a zone-database snapshot.  What leaves the table is retired by the epoch RCU.  */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* a zone that the store keeps: a primary of the database */
+static bool store_zone_entry(const zone_db_entry_t *e) {
+    return e && e->source == ZONE_SRC_DB && !e->is_secondary && !e->is_catalog_member && e->kind == ZONE_KIND_PRIMARY;
+}
+
+/* the element goes (it was taken out of the attach table and the registry, a grace period ago); its entry is the retire's business */
+static void store_elem_free_cb(void *p) {
+    zdir_elem_t *z = p;
+    free(z->error);
+    free(z->digest);
+    free(atomic_load_explicit(&z->apex, memory_order_relaxed));
+    zone_ext_shared_unref(atomic_load_explicit(&z->sh, memory_order_relaxed));
+    free(z);
+}
+static void noop_free_cb(void *p) { (void)p; }
+static char g_noop_obj;
+
+/* The entry `e` (with the element or without it) was taken out of the readers' reach: one reference of the registry is given back after the grace period (zone_retire_object() keeps
+ * the entry alive for the readers until then and frees it when the last reference goes).  obj / fn: what is freed with it (the element), or nothing.  The lock may be held. */
+static void store_retire_locked(zone_db_entry_t *e, void *obj, void (*fn)(void *)) {
+    uint64_t ep = rcu_writer_advance_epoch();
+    if (zone_retire_object(e, obj, fn, ep)) {
+        zone_entry_unref(e);
+        return;
+    }
+    /* no memory for the retire node: wait for the grace period here (rare) */
+    (void)rcu_writer_wait_until_safe(ep, 60000);
+    fn(obj);
+    zone_entry_unref(e);
+}
+
+/* the interned settings of the entry (NULL: none) */
+static zone_ext_shared_t *store_entry_settings(const zone_db_entry_t *e) {
+    const zone_config_t *dc = atomic_load_explicit(&e->dbcfg, memory_order_acquire);
+    return dc && dc->ext_shared ? (zone_ext_shared_t *)dc->ext : NULL;
+}
+
+/* an element of the registry in the LOADING state for a record of the store: a fetch or an attach is on its way (the lock is held).  NULL: out of memory. */
+static dbreg_zone_t *store_elem_make_locked(dbreg_view_t *rv, const char *view, const char *name, const dbdir_rec_t *rec) {
+    const dbdir_ops_t *ops = dbdir();
+    dbreg_zone_t *z = dbreg_add(rv, name, zdir_name_hash(name));
+    if (!z) return NULL;
+    uint8_t *dg = malloc(32);
+    if (!dg) {
+        dbreg_unlink(rv, z);
+        free(z);
+        return NULL;
+    }
+    memcpy(dg, rec->digest, 32);
+    z->digest = dg;
+    z->kind |= ZDIR_K_STORED;
+    z->zid = rec->zid;
+    int sid = ops->view_sid(view);
+    z->sview = sid >= 0 ? (uint16_t)sid : 0;
+    z->source_id = rec->source_id;
+    atomic_store_explicit(&z->serial, rec->serial, memory_order_relaxed);
+    z->last_result = DBREG_APPLIED;
+    z->flags = (uint16_t)((rec->flags & 0x1 ? ZDIR_F_PRESIGNED : 0) | (rec->flags & 0x2 ? ZDIR_F_ALIAS : 0) | (rec->flags & 0x4 ? ZDIR_F_WILDCARD : 0));
+    atomic_store_explicit(&z->state, ZDIR_ST_LOADING, memory_order_release);
+    return z;
+}
+
+/* an element without an entry that nobody needs leaves the registry (it was never in the attach table or the index: nobody holds it; the lock is held) */
+static void store_elem_drop_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
+    dbreg_unlink(rv, z);
+    store_elem_free_cb(z);
+}
+
+/* The commit of an install or an attach of a store zone.  -2: the store did not take the zone (the caller registers it as a zone of the heap directory); -1 as dbreg_commit().
+ * `*cold`: the zone was written to the store and is not kept in memory (the entry is freed here: a first fill that is over the limit). */
+static int dbreg_commit_store(const char *view, const char *name, zone_db_entry_t *entry, bool created, int64_t source_id, uint32_t serial, const uint8_t digest[32],
+                              bool *shadowed, const dbreg_attach_info_t *offered) {
+    const dbdir_ops_t *ops = dbdir();
+    const bool sh_cfg = dbreg_config_shadows(view, name);
+    uint32_t zid = ZREF_NOZID;
+    dbdir_rec_t prev;
+    bool had_rec = false;
+    if (!offered) {
+        had_rec = ops->rec_get(view, name, &prev);
+        int pr = ops->put(view, name, entry, source_id, serial, digest, ops->settings_id(store_entry_settings(entry)), &zid);
+        if (pr != 0) {
+            if (!created) {                       /* the zone is in memory and the store could not take its new version: it stays there, and is not taken out of memory (the record is the old version) */
+                pthread_mutex_lock(&g_zone_db_rebuild_lock);
+                dbreg_view_t *prv = dbreg_view_get(view, false);
+                dbreg_zone_t *pz = prv ? dbreg_find(prv, name, zdir_name_hash(name)) : NULL;
+                if (pz && (pz->kind & ZDIR_K_STORED)) pz->flags |= ZDIR_F_PIN;
+                pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+                syslog(LOG_ERR, "[Store] zone '%s' (view '%s'): the store could not take the new version (%s); it is served from memory and kept there", name, view, strerror(pr < 0 ? -pr : pr));
+            } else {
+                return -2;
+            }
+        }
+    }
+    int rc = -1;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    const bool sh_cat = !sh_cfg && dbreg_catalog_member_locked(view, name);
+    const bool sh = sh_cfg || sh_cat;
+    dbreg_view_t *rv = dbreg_view_get(view, true);
+    if (!rv) goto out;
+    const uint32_t h = zdir_name_hash(name);
+    dbreg_zone_t *z = dbreg_find(rv, name, h);
+    if (offered) {
+        if (!z || !(z->kind & ZDIR_K_STORED) || !dbreg_offered_still_locked(z, offered)) goto out;      /* (a summary, a delete or a new version came after the record was read; nothing is changed) */
+        zid = z->zid;
+    }
+    if (zid == ZREF_NOZID && z && (z->kind & ZDIR_K_STORED)) zid = z->zid;        /* (the put failed above and the zone is in memory: the old record's id) */
+    bool fresh = false;
+    if (!z) {
+        if (!(z = dbreg_add(rv, name, h))) goto out;
+        fresh = true;
+    }
+    z->flags &= (uint16_t)~ZDIR_F_BUSY;                           /* the install that marked it (dbreg_lookup_entry_busy()) is over; the lock is held */
+    zone_db_entry_t *cur = zdir_entry(z);
+    if (!created && cur != entry) {
+        syslog(LOG_ERR, "[DB] zone %s (view '%s'): the entry that was updated is no longer the zone's; the new version is not served", name, view);
+        if (fresh) store_elem_drop_locked(rv, z);
+        goto out;
+    }
+    const bool replace = created && cur && cur != entry;
+    uint8_t *new_digest = NULL;
+    if (!z->digest && !(new_digest = malloc(32))) {
+        if (fresh) store_elem_drop_locked(rv, z);
+        goto out;
+    }
+    if (new_digest) z->digest = new_digest;
+    /* what the zone was before: a record of the store with another serial (it was out of memory and changed: the NOTIFY is due) */
+    const bool had_version = cur != NULL || had_rec || (!fresh && z->digest && z->last_result == DBREG_APPLIED && (z->kind & ZDIR_K_STORED));
+    const uint32_t old_serial = cur ? zdir_serial(z) : had_rec ? prev.serial : zdir_serial(z);
+    /* the first fill over the limit: the zone is in the store and is not attached (its data would only be taken out again) */
+    const uint8_t cm = store_entry_settings(entry) ? store_entry_settings(entry)->ext.cache_mode : 0;
+    const bool cold = !offered && created && !cur && !had_rec && !sh && cm != 1 && dbreg_cache_limit() && dbreg_cache_over_high(0);
+    if (cold) {
+        if (fresh) store_elem_drop_locked(rv, z);
+        else if (z->kind & ZDIR_K_STORED) {                       /* (a leftover element of an earlier fetch or attach) */
+            dbreg_unlink(rv, z);
+            store_elem_free_cb(z);
+        }
+        pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+        free_zone_db_entry(entry);                                /* never reachable: its version leaves the resident total */
+        if (shadowed) *shadowed = sh;
+        return 0;
+    }
+    if ((z->kind & ZDIR_K_STORED) && z->zid != zid && cur) ops->attach_remove(z);       /* (the record has another id now) */
+    z->kind |= ZDIR_K_STORED;
+    z->zid = zid;
+    {
+        int sid = ops->view_sid(view);
+        z->sview = sid >= 0 ? (uint16_t)sid : 0;
+    }
+    const bool alias_touch = created && (entry_has_alias(entry) || entry_has_alias(cur));
+    if (created) {
+        atomic_store_explicit(&z->entry, entry, memory_order_release);       /* the initial reference of the entry is the registry's */
+        if (replace) {
+            atomic_fetch_add_explicit(&g_gone_queries, atomic_load_explicit(&cur->observatory.queries_total, memory_order_relaxed), memory_order_relaxed);
+            store_retire_locked(cur, &g_noop_obj, noop_free_cb);              /* (a reader may hold the old entry: the retire stack frees it after the grace period) */
+        }
+    }
+    z->source_id = source_id;
+    zdir_set_serial_locked(z, serial);
+    z->flags &= (uint16_t)~ZDIR_F_NOAPEX;
+    memcpy(z->digest, digest, 32);
+    z->last_result = DBREG_APPLIED;
+    z->shadowed = sh;
+    z->shadow_by = sh_cfg ? DBREG_SH_CONFIG : sh_cat ? DBREG_SH_CATALOG : DBREG_SH_NONE;
+    if (created) {
+        z->flags &= (uint16_t)~(ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD | ZDIR_F_BGLOAD);
+        z->qseen = 0;
+        z->t_load = (uint32_t)cache_mono_ms();
+    }
+    zdir_elem_sync(z, entry);
+    if (!sh) {
+        if (!ops->attach_put(z)) {                                 /* (no memory for the table: the zone is not served from memory; the next query attaches it) */
+            if (fresh) store_elem_drop_locked(rv, z);
+            goto out;
+        }
+    } else {
+        ops->attach_remove(z);                                     /* hidden by a zone of karidns.conf or a catalog member: not reachable through the store */
+    }
+    if (created) zone_glue_note_arrival(view, name);
+    if (alias_touch) alias_notify();
+    if ((z->flags & ZDIR_F_NOTIFY_DUE) || (created && !cur && had_version && old_serial != serial && !sh)) (void)nrn_queue_locked(z, rv->name);
+    if (z->flags & ZDIR_F_EVICT_NEXT) cache_note_next();
+    dbreg_set_error(z, NULL);
+    rc = 0;
+out:
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    if (shadowed) *shadowed = sh;
+    if (created && atomic_load_explicit(&g_cache_limit, memory_order_relaxed)) cache_peak_note();
+    return rc;
+}
+
 static int dbreg_commit_x(const char *view, const char *name, zone_db_entry_t *entry, bool created, int64_t source_id,
                           uint32_t serial, const uint8_t digest[32], bool *shadowed, const dbreg_attach_info_t *offered) {
+    if (dbdir() && store_zone_entry(entry)) {
+        /* the zone goes to the store unless a zone of the heap directory has this name already (one that the store could not take earlier): that one stays as it is */
+        bool legacy = false;
+        pthread_mutex_lock(&g_zone_db_rebuild_lock);
+        dbreg_view_t *lrv = dbreg_view_get(view, false);
+        dbreg_zone_t *lz = lrv ? dbreg_find(lrv, name, zdir_name_hash(name)) : NULL;
+        legacy = lz && !(lz->kind & ZDIR_K_STORED) && dbreg_zone_known(lz);
+        pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+        if (!legacy) {
+            int sr = dbreg_commit_store(view, name, entry, created, source_id, serial, digest, shadowed, offered);
+            if (sr != -2) return sr;
+        }
+    }
     bool sh_cfg = dbreg_config_shadows(view, name);
     int rc = -1;
     zdir_gent_t *gent = NULL;
@@ -3095,6 +3527,10 @@ bool dbreg_reject(const char *view, const char *name, int64_t source_id, const c
         }
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    if (ok && dbdir()) {                                  /* 0.7 S3: the store's record of the zone (an older version that keeps serving) is not offered to a loader as up to date */
+        dbdir_rec_t r;
+        if (dbdir()->rec_get(view, name, &r)) dbdir()->note_flags(r.zid, STORE_F_REJECTED_NEW, 0);
+    }
     return ok;
 }
 
@@ -3104,6 +3540,15 @@ int dbreg_fetch_begin(const char *view, const char *zone) {
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
     dbreg_view_t *rv = dbreg_view_get(view, false);
     dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
+    const dbdir_ops_t *dops = dbdir();
+    dbdir_rec_t drec;
+    if (!z && dops && dops->rec_get(view, zone, &drec)) {      /* 0.7 S3: a zone of the store that is not in memory: an element for the fetch (the lock is held; rec_get() does not take it) */
+        if (!rv) rv = dbreg_view_get(view, true);
+        z = rv ? store_elem_make_locked(rv, view, zone, &drec) : NULL;
+        if (z) rc = DBREG_FETCH_STARTED;
+        pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+        return rc;
+    }
     if (z && !(z->flags & ZDIR_F_DELETED)) {
         if (zdir_entry(z)) {
             rc = DBREG_FETCH_RESIDENT;
@@ -3122,8 +3567,10 @@ void dbreg_fetch_end(const char *view, const char *zone) {
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
     dbreg_view_t *rv = dbreg_view_get(view, false);
     dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
-    if (z && !zdir_entry(z) && atomic_load_explicit(&z->state, memory_order_relaxed) == ZDIR_ST_LOADING)
-        atomic_store_explicit(&z->state, ZDIR_ST_ABSENT, memory_order_release);
+    if (z && !zdir_entry(z) && atomic_load_explicit(&z->state, memory_order_relaxed) == ZDIR_ST_LOADING) {
+        if ((z->kind & ZDIR_K_STORED) && z->last_result == DBREG_APPLIED && !z->error) store_elem_drop_locked(rv, z);      /* (a zone of the store that is not in memory has no element) */
+        else atomic_store_explicit(&z->state, ZDIR_ST_ABSENT, memory_order_release);
+    }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
 }
 
@@ -3139,6 +3586,30 @@ int dbreg_attach_begin(const char *view, const char *zone, dbreg_attach_info_t *
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
     dbreg_view_t *rv = dbreg_view_get(view, false);
     dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
+    const dbdir_ops_t *dops = dbdir();
+    dbdir_rec_t drec;
+    if (!z && dops && dops->rec_get(view, zone, &drec) && drec.state == 2 /* STORE_STATE_STORED */) {      /* 0.7 S3: a zone of the store that is not in memory: an element for the attach */
+        if (!rv) rv = dbreg_view_get(view, true);
+        z = rv ? store_elem_make_locked(rv, view, zone, &drec) : NULL;
+        if (z) {
+            info->source_id = z->source_id;
+            info->serial = zdir_serial(z);
+            info->flags = z->flags;
+            memcpy(info->digest, z->digest, 32);
+            for (int i = 0; i < 32; i++) info->digest_set |= info->digest[i] != 0;
+            zone_ext_shared_t *sh = drec.settings ? dops->settings(drec.settings) : NULL;
+            if (drec.settings && !sh) {                           /* (the settings text of the record is not known: the zone is fetched from the database, which sends them) */
+                store_elem_drop_locked(rv, z);
+                rc = DBREG_ATT_NOT;
+            } else {
+                if (sh) zone_ext_shared_ref(sh);
+                info->sh = sh;
+                rc = DBREG_ATT_STARTED;
+            }
+        }
+        pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+        return rc;
+    }
     if (z && !(z->flags & ZDIR_F_DELETED) && !z->shadowed && (z->kind & (ZDIR_K_STATIC | ZDIR_K_SHARED | ZDIR_K_BORROWED)) == 0) {
         uint8_t st = atomic_load_explicit(&z->state, memory_order_relaxed);
         if (zdir_entry(z)) {
@@ -3212,6 +3683,13 @@ bool dbreg_zone_version(const char *view, const char *zone, int64_t *source_id, 
         *source_id = z->source_id;
         *serial = zdir_serial(z);
         found = true;
+    } else if (!z && dbdir()) {                               /* 0.7 S3: a zone of the store that is not in memory */
+        dbdir_rec_t r;
+        if (dbdir()->rec_get(view, zone, &r)) {
+            *source_id = r.source_id;
+            *serial = r.serial;
+            found = true;
+        }
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     return found;
@@ -3484,7 +3962,9 @@ void dbreg_set_pending_notify(void (*cb)(void)) { atomic_store_explicit(&g_pendi
  * The entry is not freed here: a reader of the index may hold it, and so may a control command with a retained snapshot.  Its reference goes
  * with the replaced-entry list (rv->repl) to the garbage of the snapshot that the next delta retires, and is given back when that snapshot is
  * drained, exactly as a replaced entry's is.  Until then the version's bytes are in the retired total (not the resident one), and in g_evict_inflight. */
+static uint64_t store_detach_locked(dbreg_view_t *rv, dbreg_zone_t *z);
 static uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
+    if (z->kind & ZDIR_K_STORED) return store_detach_locked(rv, z);          /* 0.7 S3: a zone of the store leaves memory: the record stays, the element goes (no snapshot is published) */
     zone_db_entry_t *e = zdir_entry(z);
     if (!e || e->source != ZONE_SRC_DB || e->is_secondary || e->is_catalog_member || e->catalog_member_count > 0 || z->shadowed ||
         (z->kind & (ZDIR_K_SHARED | ZDIR_K_STATIC | ZDIR_K_BORROWED)) || (z->flags & (ZDIR_F_PIN | ZDIR_F_DELETED | ZDIR_F_GARB | ZDIR_F_BUSY | ZDIR_F_NOTIFY_DEFER)) ||      /* (NOTIFY_DEFER: the ring was full, the sweep has not queued its NOTIFY yet; the apex made from the image would lack the NS addresses of the loader) */
@@ -3566,6 +4046,81 @@ static uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
     void (*notify)(void) = atomic_load_explicit(&g_pending_notify, memory_order_acquire);
     if (notify) notify();                              /* the ingest thread publishes the delta (and so retires the entry) */
     return bytes ? bytes : 1;
+}
+
+/* 0.7 store S3: the zone of the store that is in memory leaves it (the cache manager, room on demand, an operator).  The conditions are those of dbreg_evict_locked(); the
+ * record stays in the store, so nothing is lost and the next query attaches the zone again.  The element leaves the attach table and the registry; it and the entry are retired by
+ * the epoch RCU (no snapshot is published, nothing is queued for a delta).  Per-zone state that does not outlive the entry: the counters go into the total of the zones that
+ * left (g_gone_queries, design 6.1).  The lock is held.  Returns the bytes the version held (at least 1), or 0: not now. */
+static uint64_t store_detach_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
+    const dbdir_ops_t *ops = dbdir();
+    zone_db_entry_t *e = zdir_entry(z);
+    if (!ops || !e || !store_zone_entry(e) || e->catalog_member_count > 0 || z->shadowed || (z->flags & (ZDIR_F_PIN | ZDIR_F_DELETED | ZDIR_F_GARB | ZDIR_F_BUSY | ZDIR_F_NOTIFY_DEFER)) ||
+        atomic_load_explicit(&z->state, memory_order_relaxed) != ZDIR_ST_RESIDENT || e->evicted_bytes)
+        return 0;
+    if (ops->attach_get(z->zid) != z) return 0;
+    if (nrn_pending_locked(rv->name, z->name)) return 0;       /* its NOTIFY is queued: the control thread looks the zone up in memory */
+    if (atomic_load_explicit(&e->active_axfr, memory_order_acquire) > 0 || atomic_load_explicit(&e->is_transferring, memory_order_acquire)) return 0;
+    if (atomic_load_explicit(&e->snapshot_refs, memory_order_acquire) != 1) return 0;     /* (a reader that holds the entry with a reference, or an object of the entry on the retire stack) */
+    if (pthread_mutex_trylock(&e->writer_lock) != 0) return 0;
+    if (atomic_load_explicit(&e->updated, memory_order_relaxed)) {        /* a dynamic UPDATE changed it: only the memory has the change (pinned until the database's version replaces it) */
+        pthread_mutex_unlock(&e->writer_lock);
+        return 0;
+    }
+    e->evicted = true;                                 /* (writer_lock is held) an UPDATE that waited for the lock sees it and does not change this entry */
+    ixfr_history_reset(e);
+    atomic_fetch_add_explicit(&g_gone_queries, atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed), memory_order_relaxed);
+    zone_version_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
+    uint64_t bytes = (a && a->counted) ? a->bytes : 0;
+    const uint64_t fixed = bytes ? atomic_load_explicit(&e->fixed_charged, memory_order_relaxed) : 0;
+    bytes += fixed;
+    const bool had_alias = (z->flags & ZDIR_F_ALIAS) != 0 || (a && a->image && (a->image->flags & ZONE_IMAGE_F_ALIAS));
+    if (bytes) {
+        a->counted = false;
+        zone_bytes_resident_add(ZBYTES_DB, -(int64_t)bytes);       /* (the version and the entry's share; free_zone_db_entry() gives back what is in evicted_bytes) */
+        zone_bytes_retired_add(ZBYTES_DB, (int64_t)bytes);
+        e->evicted_bytes = bytes;
+        atomic_fetch_add_explicit(&g_evict_inflight, (int64_t)bytes, memory_order_relaxed);
+    } else {
+        e->evicted_bytes = 0;
+    }
+    pthread_mutex_unlock(&e->writer_lock);
+    ops->attach_remove(z);
+    dbreg_unlink(rv, z);
+    z->flags |= ZDIR_F_DELETED;
+    atomic_fetch_add_explicit(&g_evictions, 1, memory_order_relaxed);
+    logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] zone '%s' (view '%s') taken out of memory by memory-limit: %llu bytes, %llu queries since it came in", z->name, rv->name,
+               (unsigned long long)bytes, (unsigned long long)atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed));
+    store_retire_locked(e, z, store_elem_free_cb);
+    if (had_alias) alias_notify();
+    void (*eh)(int) = atomic_load_explicit(&g_evict_hook, memory_order_acquire);
+    if (eh) eh(t_evict_reason);
+    return bytes ? bytes : 1;
+}
+
+/* 0.7 store S3: the zone left the database: its record and (when it is in memory) its element go.  1: something was deleted; 0: nothing (no such zone, or another source id owns the name) */
+static int dbreg_delete_store(const char *view, const char *name, int64_t source_id) {
+    const dbdir_ops_t *ops = dbdir();
+    bool had = false;
+    (void)ops->del(view, name, source_id, &had);
+    bool removed = false;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, name, zdir_name_hash(name)) : NULL;
+    if (z && (z->kind & ZDIR_K_STORED) && (source_id == 0 || z->source_id == source_id || z->source_id == 0)) {
+        zone_db_entry_t *e = zdir_entry(z);
+        const bool had_alias = e && (entry_has_alias(e) || (z->flags & ZDIR_F_ALIAS));
+        ops->attach_remove(z);
+        dbreg_unlink(rv, z);
+        z->flags |= ZDIR_F_DELETED;
+        if (e) store_retire_locked(e, z, store_elem_free_cb);
+        else store_elem_free_cb(z);                       /* (never in the attach table: no reader has it) */
+        atomic_store_explicit(&g_glue_dirty, true, memory_order_release);      /* a zone that leaves publishes nothing: the zones whose glue came from it are told */
+        if (had_alias) alias_notify();
+        removed = true;
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return (had || removed) ? 1 : 0;
 }
 
 /* ---- D1a step 7: transfers of zones that are out of memory (design 7, 12-6) ---- */
@@ -4256,6 +4811,7 @@ bool dbreg_test_evict(const char *view, const char *name) {
 
 int dbreg_delete(const char *view, const char *name, int64_t source_id) {
     int rc = 0;
+    if (dbdir() && dbreg_delete_store(view, name, source_id)) return 1;       /* 0.7 S3: a zone of the store (a zone of the heap directory is looked for below) */
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
     dbreg_view_t *rv = dbreg_view_get(view, false);
     dbreg_zone_t *z = rv ? dbreg_find(rv, name, zdir_name_hash(name)) : NULL;
@@ -4363,7 +4919,7 @@ static size_t dbreg_collect_view_locked(const view_config_t *vc, view_snapshot_t
                        z->shadow_by == DBREG_SH_CATALOG ? "catalog member" : "zone in karidns.conf");
             z->shadowed = sh;
             z->shadow_by = by_cfg ? DBREG_SH_CONFIG : by_cat ? DBREG_SH_CATALOG : DBREG_SH_NONE;
-            if (!sh) list[n++] = z;
+            if (!sh && !(z->kind & ZDIR_K_STORED)) list[n++] = z;       /* (0.7 S3: a zone of the store is not in the directory's index: the lookup asks the store) */
         }
     }
     *out = list;
@@ -4801,13 +5357,14 @@ void dbreg_counts(size_t *total, size_t *rejected, size_t *shadowed) {
         const dbreg_view_t *rv = &g_dbreg_views[v];
         for (size_t b = 0; b < rv->nb; b++) {
             for (const dbreg_zone_t *z = rv->tab[b]; z; z = z->next) {
-                if (dbreg_zone_known(z)) t++;
+                if (dbreg_zone_known(z) && !(z->kind & ZDIR_K_STORED)) t++;
                 if (z->last_result == DBREG_REJECTED) r++;
                 if (dbreg_zone_known(z) && z->shadowed) s++;
             }
         }
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    if (dbdir()) t += (size_t)dbdir()->counters(0);              /* 0.7 S3: the zones of the store (the elements above are the ones in memory) */
     if (total) *total = t;
     if (rejected) *rejected = r;
     if (shadowed) *shadowed = s;
@@ -4831,6 +5388,13 @@ static void res_fn(const dbreg_zone_t *z, void *ud) {
     dbreg_residency_t *o = ud;
     if (!dbreg_zone_known(z) || z->shadowed || (z->flags & ZDIR_F_DELETED)) return;
     const zone_db_entry_t *e = zdir_entry(z);
+    if (z->kind & ZDIR_K_STORED) {                      /* 0.7 S3: counted with the store's zones (dbreg_residency()) */
+        if (e) {
+            o->resident++;
+            o->queries += atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed);
+        }
+        return;
+    }
     o->total++;
     if (e) {
         o->resident++;
@@ -4846,13 +5410,17 @@ static void res_reset(void *ud) { memset(ud, 0, sizeof(dbreg_residency_t)); }
 void dbreg_residency(dbreg_residency_t *o) {
     memset(o, 0, sizeof(*o));
     dbreg_count_walk(res_fn, res_reset, o);
+    if (dbdir()) {                                              /* 0.7 S3: the zones of the store are in the directory; the ones in memory were counted above */
+        o->total += (size_t)dbdir()->counters(0);
+        o->absent = o->total > o->resident ? o->total - o->resident : 0;
+    }
     o->queries += atomic_load_explicit(&g_gone_queries, memory_order_relaxed);
 }
 
 typedef struct { size_t t, r, sc, sk; } cnt2_t;
 static void cnt2_fn(const dbreg_zone_t *z, void *ud) {
     cnt2_t *c = ud;
-    if (dbreg_zone_known(z)) c->t++;
+    if (dbreg_zone_known(z) && !(z->kind & ZDIR_K_STORED)) c->t++;
     if (z->last_result == DBREG_REJECTED) c->r++;
     if (dbreg_zone_known(z) && z->shadowed) {
         if (z->shadow_by == DBREG_SH_CATALOG) c->sk++;
@@ -4864,6 +5432,7 @@ static void cnt2_reset(void *ud) { memset(ud, 0, sizeof(cnt2_t)); }
 void dbreg_counts2(size_t *total, size_t *rejected, size_t *shadowed_config, size_t *shadowed_catalog) {
     cnt2_t c = { 0, 0, 0, 0 };
     dbreg_count_walk(cnt2_fn, cnt2_reset, &c);                    /* (in slices: dbreg_count_walk) */
+    if (dbdir()) c.t += (size_t)dbdir()->counters(0);               /* 0.7 S3: the zones of the store (the elements above are the ones in memory) */
     if (total) *total = c.t;
     if (rejected) *rejected = c.r;
     if (shadowed_config) *shadowed_config = c.sc;
@@ -4896,6 +5465,25 @@ int dbreg_find_info(const char *view, const char *name, dbreg_info_t *out, int m
             o->last_result = z->last_result;
             o->flags = z->flags;
             if (z->error) snprintf(o->error, sizeof(o->error), "%s", z->error);
+        }
+        n++;
+    }
+    const dbdir_ops_t *dops = dbdir();
+    zone_db_snapshot_t *dsnap = dops ? atomic_load_explicit(&g_zone_db_active, memory_order_acquire) : NULL;
+    for (size_t v = 0; dsnap && v < dsnap->view_count; v++) {        /* 0.7 S3: a zone of the store that is not in memory has no element: one index lookup */
+        const char *vn = dsnap->views[v].name;
+        if (!vn || (view && strcasecmp(vn, view) != 0)) continue;
+        bool seen = false;
+        for (int i = 0; i < n && i < max; i++) seen = seen || strcasecmp(out[i].view, vn) == 0;
+        dbdir_rec_t r;
+        if (seen || !dops->rec_get(vn, name, &r)) continue;
+        if (n < max) {
+            dbreg_info_t *o = &out[n];
+            memset(o, 0, sizeof(*o));
+            snprintf(o->view, sizeof(o->view), "%s", vn);
+            o->source_id = r.source_id;
+            o->serial = r.serial;
+            o->last_result = DBREG_APPLIED;
         }
         n++;
     }
@@ -4932,7 +5520,11 @@ void dbreg_reset(void) {
             dbreg_zone_t *z = rv->tab[b];
             while (z) {
                 dbreg_zone_t *nx = z->next;
-                if (d) (void)zdir_remove(d, z);
+                if (z->kind & ZDIR_K_STORED) {
+                    if (dbdir()) dbdir()->attach_remove(z);          /* 0.7 S3 */
+                } else if (d) {
+                    (void)zdir_remove(d, z);
+                }
                 garb_elem(&g_garb, z);
                 z = nx;
             }

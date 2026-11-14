@@ -2,37 +2,40 @@
 #define DNS_DB_STORE_H
 
 /*
- * dns_db_store - the zone store in the server (0.7 store S2; design: planning/planing_0.7.x_store_10m_design.md sections 2.1, 3.4, 4.1, 4.2).
+ * dns_db_store - the zone store in the server (0.7 store S2 and S3; design: planning/planing_0.7.x_store_10m_design.md sections 2.1, 2.2, 3.4, 4.1, 4.2).
  *
- * dns_store.c is the store itself (files, index, journal).  This module is what the server does with it while the zone directory is still in the
- * heap (S3 moves the directory into the store):
+ * dns_store.c is the store itself (files, index, journal).  This module is what the server does with it:
  *
  *   - The directory.  The process that starts the server (the "Frontend" side of the privilege separation: it runs as root and has not forked the
  *     Backend yet) opens or makes the store directory, checks who owns it and who can write to it, takes an exclusive lock on it (one server per
  *     store) and hands the descriptor to the Backend by fork().  The Backend limits the rights of the descriptor (cap_rights_limit()) and the
- *     store opens its files beneath it (openat()), also in capability mode.  `database { store "<dir>" | none; }` names the directory; without it
+ *     store opens its files beneath it (openat(), also in capability mode).  `database { store "<dir>" | none; }` names the directory; without it
  *     the default /var/db/karidns/store is used when /var/db/karidns exists (and the server runs without a store, as before, when it does not or
  *     cannot use it); an explicit directory that cannot be used refuses the start.
  *
- *   - Write-through.  A database zone that was installed (validated, frozen, published and entered in the registry) is copied into the store by the
- *     writer thread with the version the loader sent (source id, serial, digest), unless the store has that very version already.  A zone that the
- *     database deletes is deleted from the store; a zone that the loader announces as changed (a summary in a batch that is not the first) is set
- *     back to "known" (no image), so it is read from the database once more.  The ingest thread only queues the work: it pins the version
- *     (xfr_refs) and the entry (xfr_entry_hold(), which also keeps the cache manager from taking the zone out) until the writer is done.
+ *   - S3: the store is the directory of the database zones.  db_store_start() installs the operations of g_dbdir (dns_server_internal.h): the lookup of
+ *     the query path asks the store's name index at every suffix after the heap directory, a zone that is in memory (attached) has a registry element that
+ *     the attach table of this module reaches by the zone id, a zone that is not in memory costs no heap at all.  What the registry asks of the store (a
+ *     zone's record, its put and delete, the settings by id) is here too.  Without a store (`store none;`, the directory unusable, the store cannot be
+ *     opened) g_dbdir stays NULL and every database zone is a zone of the heap directory, as before 0.7.
  *
- *   - Attach.  A query for a zone that is out of memory (directory element ABSENT: not read yet after a start, or taken out by memory-limit) whose
- *     store record is stored and current (the record's serial is the directory's; the source id and, when the directory knows one, the digest
- *     agree) is not fetched from the loader: the worker parks it with the attach deadline (200 ms) and asks the store threads; a store thread reads
- *     the image (MAP: a pointer into the mapped segment; COPY: a buffer), checks it (the store's checksum, the whole structure: zone_image_validate(), at every attach - the
- *     checksum is not keyed and detects damage, not a forgery; the apex name), makes the entry like an install does (zone_install_version(), dbreg_commit_attach(): conditional on the version the directory offers) and wakes
- *     the parked queries.  A record that is missing, stale or damaged falls back to the fetch (the queries that wait are given the park-timeout
- *     again).  The version of an attached zone counts for memory-limit with its image: the mapped bytes (MAP) or the buffer (COPY), the same number
- *     when the version is counted and when it is given back.  Detaching is the eviction of today (the record stays in the store); a MAP version keeps its
- *     segment mapped until the version is freed, after its grace period (zone_version_free() -> image_free()).
+ *   - Write-through.  The install of a zone (the ingest thread: dbreg_commit()) copies the version into the store before the zone is registered
+ *     (dbdir_ops_t.put): the record's zid is the zone's id in the attach table.  A zone that the database deletes is deleted from the store with its element.
  *
- * Threads: one writer thread (the store's writer mutex serialises writers anyway; one thread keeps the order of the jobs), `store-threads` attach
- * threads, and whoever calls the functions below.  Nothing here runs on the query path except db_store_attach_possible(), which is a lookup in
- * the store's index and one table cell, inside the worker's read section.
+ *   - Attach.  A query for a zone whose record is stored and that is not in memory is not fetched from the loader: the worker parks it with the attach deadline
+ *     (200 ms) and asks the store threads; a store thread reads the image (MAP: a pointer into the mapped segment; COPY: a buffer), checks it (the store's
+ *     checksum, the whole structure: zone_image_validate(), at every attach - the checksum is not keyed and detects damage, not a forgery; the apex name),
+ *     makes the entry like an install does (zone_install_version(), dbreg_commit_attach(): conditional on the version the record offered) and wakes the
+ *     parked queries.  A record that is missing, stale or damaged falls back to the fetch (the queries that wait are given the park-timeout again).  The version
+ *     of an attached zone counts for memory-limit with its image: the mapped bytes (MAP) or the buffer (COPY), the same number when the version is counted and when it
+ *     is given back.  Detaching is the eviction of the cache manager (the record stays in the store); a MAP version keeps its segment mapped until the version is
+ *     freed, after its grace period (zone_version_free() -> image_free()).
+ *
+ *   - Settings.  The interned settings text of a zone (its allow-query, allow-transfer, ... ) gets an id that the record names; the texts are in settings.dat
+ *     in the store's directory, so that a zone that is not in memory can be answered and attached with the loader stopped.
+ *
+ * Threads: one ticker (the store's group commit and checkpoint), `store-threads` attach threads, and whoever calls the functions below (the ingest threads write,
+ * the workers look).
  */
 
 #include <stdbool.h>
@@ -43,9 +46,6 @@
 #include "dns_config_parser.h"
 #include "dns_store.h"
 
-#define DB_STORE_WQ_MAX 4096        /* queued write-through jobs; a producer that finds the queue full waits for the writer (jobs are never run out of order) */
-#define DB_STORE_WQ_WAIT_S 10       /* ... at most this long; then the job is dropped (counted, db_store_counters_t.wt_dropped) */
-#define DB_STORE_PIN_MAX_BYTES (64ull << 20)   /* image bytes that queued write-through jobs may keep pinned in memory (above memory-limit during a first fill); a producer waits for the writer beyond it */
 
 /* ---- the directory (the process that forks the Backend) ---- */
 
@@ -71,42 +71,28 @@ void db_store_stop(void);
 bool db_store_enabled(void);
 store_t *db_store_handle(void);
 
-/* ---- write-through (the ingest threads) ---- */
+/* ---- the ingest threads ---- */
 
-/* view, zone: as the registry knows them (the zone with its trailing dot).  The version the zone has in memory (serial `serial`) goes to the store; digest: the loader's.
- * Queues the work and returns; no-op without a store, for a zone that has no data in memory, a dynamic UPDATE changed, or another serial by now. */
-void db_store_write_through(const char *view, const char *zone, int64_t source_id, uint32_t serial, const uint8_t digest[32]);
-/* the zone left the database: its record goes */
-void db_store_delete(const char *view, const char *zone);
-/* the loader says the zone changed (a summary in a later batch): the record keeps the zone's name and version but not its image */
-void db_store_invalidate(const char *view, const char *zone, int64_t source_id, uint32_t serial);
-/* a batch ended: everything queued before is made durable (group commit) */
+/* a batch ended: what it wrote to the store is made durable (group commit) */
 void db_store_batch_end(void);
-/* wait until every job queued so far is done (tests, karictl store checkpoint); false: time out (ms) */
+/* compatibility of the tests of S2 (the writes are made by the thread that installs the zone now: nothing is queued) */
 bool db_store_sync(int timeout_ms);
 
-/* ---- attach (the workers, the store threads) ---- */
+/* ---- attach (the store threads) ---- */
 
-/* The worker's decision before it parks a query for a zone that is out of memory: does the store hold the version the directory has (the record is stored, its serial is
- * `dir_serial`)?  Inside a read section.  The store threads check the rest (source id, digest, checksum) when they attach. */
-bool db_store_attach_possible(const char *view, const char *zone, uint32_t dir_serial);
 /* the attach of one request, on the calling thread (what a store thread does with every request; a test calls it too; the zone with its trailing dot) */
 void db_store_attach_zone(const char *view, const char *zone);
 
 /* ---- counters (tests; `karictl store` has the counters of dns_store_status.h) ---- */
 typedef struct {
-  uint64_t wt_queued, wt_inline, wt_put, wt_skipped, wt_deleted, wt_invalidated, wt_errors, wt_dropped;
+  uint64_t wt_queued, wt_inline, wt_put, wt_skipped, wt_deleted, wt_invalidated, wt_errors, wt_dropped;     /* wt_put: versions written; wt_skipped: the store had the version; wt_deleted; wt_invalidated: records set back to "known" */
   uint64_t attach_ok, attach_stale, attach_missing, attach_damaged, attach_fallback, attach_resident, attach_busy;
   uint64_t attached_bytes;       /* image bytes counted for the versions that were attached and are not freed yet */
   uint64_t versions_live;        /* attached versions not freed yet (their images are not given back) */
   uint64_t validated, validate_ns;   /* images checked by zone_image_validate() at an attach, and the nanoseconds that took */
-  uint64_t pin_waits;            /* write-through jobs that had to wait for the pinned image bytes to go below DB_STORE_PIN_MAX_BYTES */
-  uint64_t pinned_peak;          /* the most image bytes that queued write-through jobs held at one time */
+  uint64_t pin_waits;            /* (unused since S3) */
+  uint64_t pinned_peak;          /* (unused since S3) */
 } db_store_counters_t;
 void db_store_counters(db_store_counters_t *out);
-#ifdef KARIDNS_UNIT_TEST
-/* a test: another bound for the pinned bytes of write-through jobs */
-void db_store_test_pin_cap(uint64_t bytes);
-#endif
 
 #endif /* DNS_DB_STORE_H */

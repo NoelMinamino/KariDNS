@@ -86,6 +86,8 @@ void store_status_bind(store_t *s);
 void store_status_set_memory_fn(bool (*fn)(ma_est_t *out));
 /* optional: is the zone with this zid attached right now?  Adds store.zone.attached to `zone <name>` and is not needed for the counts */
 void store_status_set_attached_fn(bool (*fn)(uint32_t zid));
+/* the number of zones in memory (the attach table): `store.zones.attached`; without it the figure is attaches minus detaches */
+void store_status_set_attached_count_fn(uint64_t (*fn)(void));
 
 /* ---- the report ---- */
 /* Writes the report into out (NUL-terminated, never more than cap - 1 bytes) and returns its length; 0 when cap is too small to

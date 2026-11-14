@@ -1893,6 +1893,65 @@ static void test_visibility(void) {
   }
 }
 
+/* 0.7 S3 (WP6): a query worker never sleeps for the store.  A cell whose sequence counter is odd (a writer in the middle of it, or one that a crash left so) is waited for by a thread that
+ * may sleep (yield, sleep, give up after 500 ms) and by a thread that may not (store_reader_nosleep(): a bounded spin, then the lookup finds nothing and says "busy"). */
+static void test_reader_nosleep(void) {
+  printf("[a reader that must not sleep gives up on a cell that is being written]\n");
+  tdir_t d;
+  tdir_new(&d, "nosleep");
+  store_opts_t o;
+  small_opts(&o);
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  for (uint32_t i = 0; i < 10; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  char nm[160];
+  name_of(4, nm, sizeof(nm));
+  uint32_t z = find_i(s, 0, 4);
+  CHECK(z != STORE_NONE);
+  /* the candidates of the index: the zone id, not verified */
+  uint32_t cand[4];
+  unsigned nc = store_find_cand(s, 0, nm, strlen(nm), cand, 4);
+  CHECK(nc >= 1 && cand[0] == z);
+  CHECK(store_zid_is(s, z, 0, nm, strlen(nm)));
+  CHECK(!store_zid_is(s, z, 1, nm, strlen(nm)));                        /* (another view) */
+  /* the sequence counter of the zc cell (bytes 60..63) is made odd */
+  int fd = openat(d.fd, "zc.1", O_RDWR);
+  CHECK(fd >= 0);
+  uint32_t odd = 1, even = 0;
+  CHECK(fd >= 0 && pwrite(fd, &odd, 4, (off_t)16384 + (off_t)z * 64 + 60) == 4);
+  store_reader_nosleep(true);
+  (void)store_reader_busy_take();
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  store_read_lock();
+  uint32_t r = store_find(s, 0, nm, strlen(nm));
+  store_zone_t zz;
+  int gr = store_zone_get(s, z, &zz);
+  bool is = store_zid_is(s, z, 0, nm, strlen(nm));
+  store_read_unlock();
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  const long us = (long)((t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000L);
+  CHECK_EQ(r, STORE_NONE);
+  CHECK(gr == -EBADMSG && !is);
+  CHECK(store_reader_busy_take());                                      /* (the lookup says it gave up) */
+  CHECK(!store_reader_busy_take());                                     /* (and the flag is taken) */
+  CHECK(us < 100000);                                                   /* (three looks: a spin each, not the 500 ms of a thread that may wait) */
+  printf("  three lookups of the cell that is being written: %ld us in all\n", us);
+  /* the writer is done: the same calls see the zone */
+  CHECK(fd >= 0 && pwrite(fd, &even, 4, (off_t)16384 + (off_t)z * 64 + 60) == 4);
+  store_read_lock();
+  CHECK_EQ(store_find(s, 0, nm, strlen(nm)), z);
+  CHECK_EQ(store_zone_get(s, z, &zz), 0);
+  store_read_unlock();
+  CHECK(!store_reader_busy_take());
+  store_reader_nosleep(false);
+  if (fd >= 0) close(fd);
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
 /* L6: a zone id that a delete frees is not reused while a reader that could have found the zone is still in its read section */
 static void test_reuse_after_grace(void) {
   printf("[a zone id is reused after the grace period]\n");
@@ -2073,6 +2132,7 @@ int main(void) {
   if (WANT("forge")) { test_forged_superblock(); test_forged_journal(); test_free_list_head(); }
   if (WANT("vis")) test_visibility();
   if (WANT("reuse")) test_reuse_after_grace();
+  if (WANT("nosleep")) test_reader_nosleep();
   if (WANT("growfail")) test_growth_sync_fails();
   if (WANT("cleanck")) test_clean_checkpoint();
   if (WANT("full")) test_disk_full();

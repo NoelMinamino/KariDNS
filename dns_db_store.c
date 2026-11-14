@@ -195,65 +195,43 @@ bad:
   return false;
 }
 
+
 /* ------------------------------------------------------------------------------------------------------------- */
 /* state                                                                                                          */
 /* ------------------------------------------------------------------------------------------------------------- */
 
-enum { WJ_PUT = 1, WJ_DEL, WJ_KNOWN, WJ_COMMIT };
-
-typedef struct {
-  int kind;
-  char view[PARK_VIEW_MAX + 1];
-  char zone[DBS_NAME_MAX];            /* the store's name: lower case, no trailing dot */
-  store_meta_t meta;
-  zone_db_entry_t *entry;             /* PUT: held (xfr_entry_hold()) until the job is done */
-  zone_version_t *ver;                /* PUT: pinned (xfr_refs) */
-  uint64_t pin_bytes;                 /* PUT: the image bytes this job holds in memory (counted in G.pinned_bytes until it is released) */
-} wjob_t;
-
 #define DBS_MAX_ATTACH_THREADS 8
+#define DBS_SET_CHUNK 1024u              /* settings ids per chunk */
+#define DBS_SET_CHUNKS 1024u             /* ... and chunks: up to a million distinct settings texts */
 
 static struct {
   _Atomic(store_t *) st;
   _Atomic bool attach_on;
-  /* writer */
+  /* the thread that keeps the store's time (group commit, checkpoint) */
   pthread_t wthr;
   bool wthr_started;
   pthread_mutex_t wlock;
-  pthread_cond_t wcv;                 /* a job arrived, or stop */
-  pthread_cond_t wdone;               /* the queue became empty and idle */
-  pthread_cond_t wpin;                /* the bytes that queued jobs hold went down (a producer waits for it) */
-  pthread_cond_t wspace;              /* a job was taken from a full queue (a producer waits for it) */
-  wjob_t *wq;
-  uint32_t wq_head, wq_n;
-  bool wbusy, wstop;
+  pthread_cond_t wcv;
+  bool wstop;
   /* attach threads */
   pthread_t athr[DBS_MAX_ATTACH_THREADS];
   int nathr;
   int akq;
   _Atomic bool astop;
+  /* the deepest label count of the stored zones of each view (an upper bound; the depth skip of the lookup) */
+  _Atomic uint16_t dmax[STORE_MAX_VIEWS];
+  _Atomic uint32_t view_gen;
   /* counters */
   _Atomic uint64_t wt_queued, wt_inline, wt_put, wt_skipped, wt_deleted, wt_invalidated, wt_errors, wt_dropped;
   _Atomic uint64_t attach_ok, attach_stale, attach_missing, attach_damaged, attach_fallback, attach_resident, attach_busy;
   _Atomic uint64_t attached_bytes, versions_live;
   _Atomic uint64_t validated, validate_ns;       /* images checked by zone_image_validate() at an attach, and the time they took */
-  uint64_t pinned_bytes;               /* under wlock: image bytes pinned by queued and running write-through jobs */
-  uint64_t pin_cap;                    /* the bound of pinned_bytes (DB_STORE_PIN_MAX_BYTES; a test sets another) */
   _Atomic uint64_t pin_waits, pinned_peak;
   _Atomic int64_t last_err_log_ns;
-} G = { .wlock = PTHREAD_MUTEX_INITIALIZER, .wcv = PTHREAD_COND_INITIALIZER, .wdone = PTHREAD_COND_INITIALIZER, .wspace = PTHREAD_COND_INITIALIZER, .wpin = PTHREAD_COND_INITIALIZER, .pin_cap = DB_STORE_PIN_MAX_BYTES, .akq = -1 };
+} G = { .wlock = PTHREAD_MUTEX_INITIALIZER, .wcv = PTHREAD_COND_INITIALIZER, .akq = -1 };
 
 bool db_store_enabled(void) { return atomic_load_explicit(&G.st, memory_order_acquire) != NULL; }
 store_t *db_store_handle(void) { return atomic_load_explicit(&G.st, memory_order_acquire); }
-
-#ifdef KARIDNS_UNIT_TEST
-void db_store_test_pin_cap(uint64_t bytes) {
-  pthread_mutex_lock(&G.wlock);
-  G.pin_cap = bytes;
-  atomic_store(&G.pinned_peak, 0);
-  pthread_mutex_unlock(&G.wlock);
-}
-#endif
 
 void db_store_counters(db_store_counters_t *o) {
   o->wt_queued = atomic_load(&G.wt_queued);
@@ -295,48 +273,6 @@ static void store_log_cb(void *ctx, int level, const char *msg) {
   syslog(level == 3 ? LOG_ERR : level == 4 ? LOG_WARNING : LOG_INFO, "[Store] %s", msg);
 }
 
-/* ------------------------------------------------------------------------------------------------------------- */
-/* write-through                                                                                                  */
-/* ------------------------------------------------------------------------------------------------------------- */
-
-static void job_release(wjob_t *j) {
-  if (j->ver) atomic_fetch_sub_explicit(&j->ver->xfr_refs, 1, memory_order_acq_rel);
-  if (j->entry) xfr_entry_release(j->entry);
-  j->ver = NULL;
-  j->entry = NULL;
-  if (j->pin_bytes) {
-    pthread_mutex_lock(&G.wlock);
-    G.pinned_bytes -= j->pin_bytes < G.pinned_bytes ? j->pin_bytes : G.pinned_bytes;
-    pthread_cond_broadcast(&G.wpin);
-    pthread_mutex_unlock(&G.wlock);
-    j->pin_bytes = 0;
-  }
-}
-
-/* The bytes of the images that queued write-through jobs hold (a version is kept alive, and its zone in memory, until the writer has copied it) are bounded: a first fill of
- * a database bigger than memory-limit would otherwise pin up to DB_STORE_WQ_MAX zones above the limit.  A producer waits (bounded) for the writer to bring the total down;
- * one job always passes when nothing else is pinned, so a zone bigger than the bound is not stuck.  false: the wait ran out (the write-through of this version is dropped). */
-static bool pin_reserve(uint64_t bytes) {
-  pthread_mutex_lock(&G.wlock);
-  if (G.wthr_started && !G.wstop && G.pinned_bytes > 0 && G.pinned_bytes + bytes > G.pin_cap) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += DB_STORE_WQ_WAIT_S;
-    atomic_fetch_add(&G.pin_waits, 1);
-    while (G.wthr_started && !G.wstop && G.pinned_bytes > 0 && G.pinned_bytes + bytes > G.pin_cap) {
-      if (pthread_cond_timedwait(&G.wpin, &G.wlock, &ts) != 0) break;
-    }
-    if (G.wthr_started && !G.wstop && G.pinned_bytes > 0 && G.pinned_bytes + bytes > G.pin_cap) {
-      pthread_mutex_unlock(&G.wlock);
-      return false;
-    }
-  }
-  G.pinned_bytes += bytes;
-  if (G.pinned_bytes > atomic_load_explicit(&G.pinned_peak, memory_order_relaxed)) atomic_store_explicit(&G.pinned_peak, G.pinned_bytes, memory_order_relaxed);
-  pthread_mutex_unlock(&G.wlock);
-  return true;
-}
-
 static void note_error(const char *what, const char *zone, int rc) {
   atomic_fetch_add(&G.wt_errors, 1);
   int64_t now = mono_ns();
@@ -344,6 +280,414 @@ static void note_error(const char *what, const char *zone, int rc) {
     atomic_store_explicit(&G.last_err_log_ns, now, memory_order_relaxed);
     syslog(LOG_ERR, "[Store] %s of zone '%s' failed: %s; the zone is served from memory and read from the database again when it is asked for", what, zone, strerror(rc < 0 ? -rc : rc));
   }
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* the settings of the zones: the interned texts by id, kept in settings.dat (a zone's record names its settings by id)   */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* A record of the store holds the id of the settings of the zone, and a zone that is not in memory has to be answered (allow-query) and attached (its entry's settings) with
+ * the loader stopped: the texts live in a file of their own in the store's directory, appended when a settings text is first used and made durable before a record names it,
+ * and are read at the start.  Config-sized (one text per distinct settings of the zones, as the interned objects in the heap are today).  File: records of
+ * u32 magic, u32 length, u32 crc32c, then the key of the interned object (profile name, NUL, profile text, NUL, zone text); a torn tail is cut at the next start. */
+#define DBS_SET_MAGIC 0x4B534554u        /* "KSET" */
+static struct {
+  pthread_mutex_t lock;
+  int fd;
+  off_t end;
+  uint32_t n;                                              /* the ids in use are 1..n */
+  _Atomic(_Atomic(zone_ext_shared_t *) *) chunk[DBS_SET_CHUNKS];
+} SET = { .lock = PTHREAD_MUTEX_INITIALIZER, .fd = -1 };
+
+static uint32_t set_crc(const uint8_t *p, size_t n) {            /* CRC-32C, bitwise (the texts are short and few) */
+  uint32_t c = 0xFFFFFFFFu;
+  for (size_t i = 0; i < n; i++) {
+    c ^= p[i];
+    for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0x82F63B78u & (uint32_t)-(int32_t)(c & 1u));
+  }
+  return ~c;
+}
+
+static zone_ext_shared_t *set_get(uint32_t id) {
+  if (id == 0 || id > SET.n) return NULL;
+  uint32_t c = (id - 1) / DBS_SET_CHUNK;
+  _Atomic(zone_ext_shared_t *) *ch = atomic_load_explicit(&SET.chunk[c], memory_order_acquire);
+  return ch ? atomic_load_explicit(&ch[(id - 1) % DBS_SET_CHUNK], memory_order_acquire) : NULL;
+}
+
+/* the object of a stored key: parsed again as the ingest parses what the loader sends, and interned */
+static zone_ext_shared_t *set_rebuild(const uint8_t *key, size_t klen) {
+  size_t pnlen = strnlen((const char *)key, klen);
+  if (pnlen >= klen) return NULL;
+  const char *ptext = (const char *)key + pnlen + 1;
+  size_t ptlen = strnlen(ptext, klen - pnlen - 1);
+  if (pnlen + 1 + ptlen + 1 > klen) return NULL;
+  const char *ztext = ptext + ptlen + 1;
+  size_t zlen = klen - (pnlen + 1 + ptlen + 1);
+  char *merged = malloc(ptlen + 1 + zlen + 1);
+  char *kc = malloc(klen + 1);
+  if (!merged || !kc) {
+    free(merged);
+    free(kc);
+    return NULL;
+  }
+  memcpy(merged, ptext, ptlen);
+  merged[ptlen] = '\n';
+  memcpy(merged + ptlen + 1, ztext, zlen);
+  memcpy(kc, key, klen);
+  kc[klen] = '\0';
+  zone_ext_shared_t *sh = db_settings_find(kc, klen);
+  if (sh) {
+    free(merged);
+    free(kc);
+    return sh;
+  }
+  char err[200];
+  sh = db_settings_parse(merged, ptlen + 1 + zlen, err, sizeof(err));
+  free(merged);
+  if (!sh) {
+    free(kc);
+    return NULL;
+  }
+  sh->key = kc;
+  sh->key_len = klen;
+  sh->hash = db_settings_hash(kc, klen);
+  snprintf(sh->profile, sizeof(sh->profile), "%.*s", (int)(pnlen < sizeof(sh->profile) - 1 ? pnlen : sizeof(sh->profile) - 1), (const char *)key);
+  return db_settings_intern(sh);
+}
+
+static bool set_put_slot(uint32_t id, zone_ext_shared_t *sh) {
+  uint32_t c = (id - 1) / DBS_SET_CHUNK;
+  if (c >= DBS_SET_CHUNKS) return false;
+  _Atomic(zone_ext_shared_t *) *ch = atomic_load_explicit(&SET.chunk[c], memory_order_relaxed);
+  if (!ch) {
+    ch = calloc(DBS_SET_CHUNK, sizeof(*ch));
+    if (!ch) return false;
+    atomic_store_explicit(&SET.chunk[c], ch, memory_order_release);
+  }
+  atomic_store_explicit(&ch[(id - 1) % DBS_SET_CHUNK], sh, memory_order_release);
+  return true;
+}
+
+/* read the file at the start; a bad or torn tail is cut.  The fd stays open for the appends. */
+static void set_load(int dirfd) {
+  SET.fd = openat(dirfd, "settings.dat", O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  if (SET.fd < 0) {
+    syslog(LOG_WARNING, "[Store] cannot open settings.dat (%s): zones whose settings are not known are read from the database", strerror(errno));
+    return;
+  }
+  struct stat st;
+  if (fstat(SET.fd, &st) != 0) return;
+  off_t off = 0;
+  for (;;) {
+    uint32_t h[3];
+    if (pread(SET.fd, h, sizeof(h), off) != (ssize_t)sizeof(h) || h[0] != DBS_SET_MAGIC || h[1] == 0 || h[1] > (1u << 20) || off + 12 + (off_t)h[1] > st.st_size) break;
+    uint8_t *buf = malloc(h[1]);
+    if (!buf) break;
+    if (pread(SET.fd, buf, h[1], off + 12) != (ssize_t)h[1] || set_crc(buf, h[1]) != h[2]) {
+      free(buf);
+      break;
+    }
+    zone_ext_shared_t *sh = set_rebuild(buf, h[1]);
+    free(buf);
+    if (!sh) {                                     /* a text that does not parse any more (the parser changed): the id stays unused, a zone that names it is read from the database */
+      SET.n++;
+    } else {
+      SET.n++;
+      if (!set_put_slot(SET.n, sh)) {
+        zone_ext_shared_unref(sh);
+        break;
+      }
+      sh->store_id = SET.n;
+    }
+    off += 12 + (off_t)h[1];
+  }
+  if (off < st.st_size && ftruncate(SET.fd, off) != 0) syslog(LOG_WARNING, "[Store] settings.dat: the torn end cannot be cut: %s", strerror(errno));
+  SET.end = off;
+}
+
+/* the id of the settings (assigned and made durable when it has none yet); 0: none, or the id could not be made (the zone is then not put in the store) */
+static uint32_t dir_settings_id(zone_ext_shared_t *sh) {
+  if (!sh) return 0;
+  uint32_t id = atomic_load_explicit(&sh->store_id, memory_order_acquire);
+  if (id) return id;
+  pthread_mutex_lock(&SET.lock);
+  id = atomic_load_explicit(&sh->store_id, memory_order_relaxed);
+  if (!id && SET.fd >= 0 && sh->key && sh->key_len > 0 && sh->key_len <= (1u << 20) && SET.n + 1 < DBS_SET_CHUNKS * DBS_SET_CHUNK) {
+    uint8_t *buf = malloc(12 + sh->key_len);
+    if (buf) {
+      uint32_t h[3] = { DBS_SET_MAGIC, (uint32_t)sh->key_len, set_crc((const uint8_t *)sh->key, sh->key_len) };
+      memcpy(buf, h, 12);
+      memcpy(buf + 12, sh->key, sh->key_len);
+      if (pwrite(SET.fd, buf, 12 + sh->key_len, SET.end) == (ssize_t)(12 + sh->key_len) && fdatasync(SET.fd) == 0 && set_put_slot(SET.n + 1, sh)) {
+        zone_ext_shared_ref(sh);                       /* (the table's reference: the object lives as long as the process) */
+        SET.end += (off_t)(12 + sh->key_len);
+        SET.n++;
+        id = SET.n;
+        atomic_store_explicit(&sh->store_id, id, memory_order_release);
+      } else if (ftruncate(SET.fd, SET.end) != 0) {
+        syslog(LOG_WARNING, "[Store] settings.dat: the failed record cannot be cut: %s", strerror(errno));
+      }
+      free(buf);
+    }
+  }
+  pthread_mutex_unlock(&SET.lock);
+  return id;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* the attach table: zid -> the registry's element of a zone of the store that is in memory                      */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* Open addressing, lock-free for readers (the query path, in its read section), one writer at a time (the registry lock is held by every caller; the table has a mutex of its own
+ * as well).  An element is put in after it is complete and taken out before it is retired, so a reader that has it may use it until it leaves its read section.  A table that
+ * grows is replaced as a whole and the old one is freed after the grace period of the epoch RCU: inserts and removals publish no zone-database snapshot (design 4.1). */
+typedef struct att_tab {
+  size_t cap, mask;
+  _Atomic(zdir_elem_t *) slot[];
+} att_tab_t;
+typedef struct att_retired {
+  struct att_retired *next;
+  att_tab_t *t;
+  uint64_t epoch;
+} att_retired_t;
+#define ATT_TOMB ((zdir_elem_t *)(uintptr_t)1)
+#define ATT_MIN_CAP 1024u
+static struct {
+  pthread_mutex_t lock;
+  _Atomic(att_tab_t *) tab;
+  size_t live, used;                 /* used = live + tombstones */
+  att_retired_t *retired;
+  _Atomic uint64_t puts, removes, grows;
+} AT = { .lock = PTHREAD_MUTEX_INITIALIZER };
+
+static inline size_t att_hash(uint32_t zid) {
+  uint64_t x = (uint64_t)zid * 0x9E3779B97F4A7C15ull;
+  return (size_t)(x >> 32);
+}
+
+static zdir_elem_t *dir_attach_get(uint32_t zid) {
+  const att_tab_t *t = atomic_load_explicit(&AT.tab, memory_order_acquire);
+  if (!t) return NULL;
+  size_t i = att_hash(zid) & t->mask;
+  for (;;) {
+    zdir_elem_t *e = atomic_load_explicit(&t->slot[i], memory_order_acquire);
+    if (!e) return NULL;
+    if (e != ATT_TOMB && e->zid == zid) return e;
+    i = (i + 1) & t->mask;
+  }
+}
+
+static void att_retired_run_locked(bool force) {
+  att_retired_t **pp = &AT.retired;
+  while (*pp) {
+    att_retired_t *r = *pp;
+    if (force || rcu_writer_is_safe(r->epoch)) {
+      *pp = r->next;
+      free(r->t);
+      free(r);
+    } else {
+      pp = &r->next;
+    }
+  }
+}
+
+static bool att_rehash_locked(size_t want_cap) {
+  att_tab_t *nt = malloc(sizeof(*nt) + want_cap * sizeof(_Atomic(zdir_elem_t *)));
+  if (!nt) return false;
+  nt->cap = want_cap;
+  nt->mask = want_cap - 1;
+  for (size_t i = 0; i < want_cap; i++) atomic_init(&nt->slot[i], NULL);
+  att_tab_t *old = atomic_load_explicit(&AT.tab, memory_order_relaxed);
+  size_t n = 0;
+  for (size_t i = 0; old && i < old->cap; i++) {
+    zdir_elem_t *e = atomic_load_explicit(&old->slot[i], memory_order_relaxed);
+    if (!e || e == ATT_TOMB) continue;
+    size_t j = att_hash(e->zid) & nt->mask;
+    while (atomic_load_explicit(&nt->slot[j], memory_order_relaxed)) j = (j + 1) & nt->mask;
+    atomic_store_explicit(&nt->slot[j], e, memory_order_relaxed);
+    n++;
+  }
+  atomic_store_explicit(&AT.tab, nt, memory_order_release);
+  uint64_t ep = rcu_writer_advance_epoch();
+  AT.live = AT.used = n;
+  atomic_fetch_add_explicit(&AT.grows, 1, memory_order_relaxed);
+  if (old) {
+    att_retired_t *r = malloc(sizeof(*r));
+    if (r) {
+      r->t = old;
+      r->epoch = ep;
+      r->next = AT.retired;
+      AT.retired = r;
+    } else {
+      (void)rcu_writer_wait_until_safe(ep, 60000);            /* (no memory for the node: the grace period is waited for here) */
+      free(old);
+    }
+  }
+  return true;
+}
+
+static bool dir_attach_put(zdir_elem_t *el) {
+  pthread_mutex_lock(&AT.lock);
+  att_retired_run_locked(false);
+  att_tab_t *t = atomic_load_explicit(&AT.tab, memory_order_relaxed);
+  if (!t || (AT.used + 1) * 2 > t->cap) {                       /* load above 1/2 (tombstones count): a bigger table, or the same size without the tombstones */
+    size_t cap = ATT_MIN_CAP;
+    while (cap < (AT.live + 1) * 4) cap <<= 1;
+    if (!att_rehash_locked(cap)) {
+      pthread_mutex_unlock(&AT.lock);
+      return false;
+    }
+    t = atomic_load_explicit(&AT.tab, memory_order_relaxed);
+  }
+  size_t i = att_hash(el->zid) & t->mask, tomb = (size_t)-1;
+  for (;;) {
+    zdir_elem_t *e = atomic_load_explicit(&t->slot[i], memory_order_relaxed);
+    if (!e) break;
+    if (e == ATT_TOMB) {
+      if (tomb == (size_t)-1) tomb = i;
+    } else if (e->zid == el->zid) {                              /* the same zone id: the element is replaced (or it is the same one) */
+      atomic_store_explicit(&t->slot[i], el, memory_order_release);
+      pthread_mutex_unlock(&AT.lock);
+      return true;
+    }
+    i = (i + 1) & t->mask;
+  }
+  if (tomb != (size_t)-1) i = tomb;
+  else AT.used++;
+  atomic_store_explicit(&t->slot[i], el, memory_order_release);
+  AT.live++;
+  atomic_fetch_add_explicit(&AT.puts, 1, memory_order_relaxed);
+  pthread_mutex_unlock(&AT.lock);
+  return true;
+}
+
+static void dir_attach_remove(const zdir_elem_t *el) {
+  pthread_mutex_lock(&AT.lock);
+  att_tab_t *t = atomic_load_explicit(&AT.tab, memory_order_relaxed);
+  if (t) {
+    size_t i = att_hash(el->zid) & t->mask;
+    for (;;) {
+      zdir_elem_t *e = atomic_load_explicit(&t->slot[i], memory_order_relaxed);
+      if (!e) break;
+      if (e == el) {
+        atomic_store_explicit(&t->slot[i], ATT_TOMB, memory_order_release);
+        AT.live--;
+        atomic_fetch_add_explicit(&AT.removes, 1, memory_order_relaxed);
+        break;
+      }
+      i = (i + 1) & t->mask;
+    }
+  }
+  pthread_mutex_unlock(&AT.lock);
+}
+
+static zdir_elem_t *dir_attach_next(size_t *pos) {
+  const att_tab_t *t = atomic_load_explicit(&AT.tab, memory_order_acquire);
+  while (t && *pos < t->cap) {
+    zdir_elem_t *e = atomic_load_explicit(&t->slot[(*pos)++], memory_order_acquire);
+    if (e && e != ATT_TOMB) return e;
+  }
+  return NULL;
+}
+static uint64_t dir_attach_tab_id(void) {
+  const att_tab_t *t = atomic_load_explicit(&AT.tab, memory_order_acquire);
+  return t ? ((uint64_t)(uintptr_t)t * 0x9e3779b97f4a7c15ull) ^ (uint64_t)t->cap : 0;
+}
+
+static size_t dir_attach_count(void) {
+  pthread_mutex_lock(&AT.lock);
+  size_t n = AT.live;
+  pthread_mutex_unlock(&AT.lock);
+  return n;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* the lookup and what the registry asks of the store (the operations of g_dbdir)                                */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+static int dir_view_sid(const char *view_name) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  return st ? store_view_id(st, view_name) : -1;
+}
+static uint32_t dir_view_gen(void) { return atomic_load_explicit(&G.view_gen, memory_order_relaxed); }
+static unsigned dir_depth_max(int sid) {
+  return sid >= 0 && sid < STORE_MAX_VIEWS ? atomic_load_explicit(&G.dmax[sid], memory_order_relaxed) : 0;
+}
+static zone_ext_shared_t *dir_settings(uint32_t id) { return set_get(id); }
+
+static void dmax_refresh(store_t *st, int vid) {
+  if (vid >= 0 && vid < STORE_MAX_VIEWS) atomic_store_explicit(&G.dmax[vid], (uint16_t)store_view_depth_max(st, (uint16_t)vid), memory_order_relaxed);
+}
+
+/* One probe of the name index for (view sid, folded name).  A zone in memory is found through the attach table and verified by the name of its element; a zone that is not is verified in the
+ * zone table.  A cell that was being written for longer than a worker may spin (store_reader_nosleep()) makes the answer "not known now" (out->busy). */
+static bool dir_find(int sid, const char *fname, size_t len, zref_t *out) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  if (!st || sid < 0 || sid >= STORE_MAX_VIEWS || len > STORE_NAME_MAX) return false;
+  (void)store_reader_busy_take();
+  uint32_t cand[4];
+  unsigned n = store_find_cand(st, (uint16_t)sid, fname, len, cand, 4);
+  for (unsigned i = 0; i < n; i++) {
+    zdir_elem_t *el = dir_attach_get(cand[i]);
+    if (el) {
+      if (el->sview == (uint16_t)sid && el->klen == len && strncasecmp(el->name, fname, len) == 0) {
+        zone_db_entry_t *e = zdir_entry(el);
+        if (!e) continue;
+        out->el = el;
+        out->entry = e;
+        out->zid = cand[i];
+        out->sview = (int16_t)sid;
+        return true;
+      }
+      continue;
+    }
+    if (!store_zid_is(st, cand[i], (uint16_t)sid, fname, len)) continue;
+    store_zone_t z;
+    if (store_zone_get(st, cand[i], &z) != 0) continue;
+    out->zid = z.zid;
+    out->sview = (int16_t)sid;
+    out->serial = z.serial;
+    out->settings = z.settings;
+    out->flags = z.flags;
+    out->zstate = z.state == STORE_STATE_STORED ? ZREF_ST_ABSENT : ZREF_ST_KNOWN;
+    memcpy(out->name, fname, len);
+    out->name[len] = '.';
+    out->name[len + 1] = '\0';
+    return true;
+  }
+  if (store_reader_busy_take()) {
+    out->busy = true;
+    memcpy(out->name, fname, len);
+    out->name[len] = '.';
+    out->name[len + 1] = '\0';
+    return true;
+  }
+  return false;
+}
+
+static bool dir_rec_get(const char *view, const char *zone, dbdir_rec_t *o) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  char name[DBS_NAME_MAX];
+  size_t nlen;
+  if (!st || !store_name(zone, name, sizeof(name), &nlen)) return false;
+  bool ok = false;
+  store_read_lock();
+  int vid = store_view_id(st, view);
+  uint32_t zid = vid >= 0 ? store_find(st, (uint16_t)vid, name, nlen) : STORE_NONE;
+  store_zone_t z;
+  if (zid != STORE_NONE && store_zone_get(st, zid, &z) == 0) {
+    o->zid = z.zid;
+    o->state = z.state;
+    o->flags = z.flags;
+    o->serial = z.serial;
+    o->settings = z.settings;
+    o->source_id = z.source_id;
+    memcpy(o->digest, z.digest, 32);
+    ok = true;
+  }
+  store_read_unlock();
+  return ok;
 }
 
 static void view_identity(const database_config_t *db, const view_config_t *v, uint8_t out[32]);
@@ -368,261 +712,207 @@ static void note_view_identity(store_t *st, int vid, const char *view) {
   if (ok) (void)store_set_cursor(st, (uint16_t)vid, 0, want, sizeof(want));
 }
 
-/* one job, on the writer thread (or on a producer that found the queue full) */
-static void job_run(store_t *st, wjob_t *j) {
-  if (j->kind == WJ_COMMIT) {
-    (void)store_commit(st);
-    return;
-  }
-  size_t nlen = strlen(j->zone);
-  int vid = store_view_id(st, j->view);
-  if (vid < 0 && j->kind != WJ_DEL) {
-    vid = store_view_add(st, j->view);
-    if (vid >= 0) note_view_identity(st, vid, j->view);
-  }
-  if (vid < 0) {
-    if (j->kind != WJ_DEL) note_error("the store has no room for another view", j->zone, vid);
-    return;
-  }
-  if (j->kind == WJ_DEL) {
-    int r = store_delete_name(st, (uint16_t)vid, j->zone, nlen);
-    if (r == 0) atomic_fetch_add(&G.wt_deleted, 1);
-    else if (r != -ENOENT) note_error("the delete", j->zone, r);
-    return;
-  }
-  if (j->kind == WJ_KNOWN) {
-    uint32_t zid = STORE_NONE;
-    store_read_lock();
-    zid = store_find(st, (uint16_t)vid, j->zone, nlen);
-    store_read_unlock();
-    if (zid == STORE_NONE) return;                          /* (nothing to set back) */
-    j->meta.source = (uint16_t)vid;
-    int r = store_set_known(st, (uint16_t)vid, j->zone, nlen, &j->meta, NULL);
-    if (r == 0) atomic_fetch_add(&G.wt_invalidated, 1);
-    else if (r != -ENOENT) note_error("the update", j->zone, r);
-    return;
-  }
-  /* WJ_PUT */
-  j->meta.source = (uint16_t)vid;
-  if (!j->ver || !j->ver->image) return;
-  /* the store has this version (a restart that reads every zone again): nothing to write */
-  store_zone_t cur;
-  bool same = false;
-  store_read_lock();
-  uint32_t zid = store_find(st, (uint16_t)vid, j->zone, nlen);
-  if (zid != STORE_NONE && store_zone_get(st, zid, &cur) == 0 && cur.state == STORE_STATE_STORED && cur.serial == j->meta.serial &&
-      cur.source_id == j->meta.source_id && memcmp(cur.digest, j->meta.digest, STORE_DIGEST_LEN) == 0) same = true;
-  store_read_unlock();
-  if (same) {
-    atomic_fetch_add(&G.wt_skipped, 1);
-    return;
-  }
-  const zone_image_t *img = j->ver->image;
-  int r = store_put(st, (uint16_t)vid, j->zone, nlen, &j->meta, img, img->total_size, NULL);
-  if (r == -EEXIST && j->meta.source_id != 0) {             /* the domain id is another zone of the store (a renamed domain): that one goes, the new name is put */
-    store_read_lock();
-    uint32_t old = store_find_source(st, j->meta.source, j->meta.source_id, (uint16_t)vid);
-    store_read_unlock();
-    if (old != STORE_NONE && store_delete(st, old) == 0) r = store_put(st, (uint16_t)vid, j->zone, nlen, &j->meta, img, img->total_size, NULL);
-  }
-  if (r == 0) atomic_fetch_add(&G.wt_put, 1);
-  else note_error("the write", j->zone, r);
-}
-
-static void *writer_thread(void *arg) {
-  (void)arg;
-  rcu_aux_thread_pin();
-  pthread_mutex_lock(&G.wlock);
-  for (;;) {
-    while (G.wq_n == 0 && !G.wstop) {
-      struct timespec ts;
-      clock_gettime(CLOCK_REALTIME, &ts);
-      ts.tv_sec += 1;
-      if (pthread_cond_timedwait(&G.wcv, &G.wlock, &ts) != 0 && G.wq_n == 0) {
-        store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
-        if (st) {
-          pthread_mutex_unlock(&G.wlock);
-          (void)store_tick(st);                           /* the time driven part: group commit, checkpoint */
-          pthread_mutex_lock(&G.wlock);
-        }
-      }
-    }
-    if (G.wq_n == 0 && G.wstop) break;
-    wjob_t j = G.wq[G.wq_head];
-    G.wq_head = (G.wq_head + 1) % DB_STORE_WQ_MAX;
-    G.wq_n--;
-    pthread_cond_signal(&G.wspace);
-    G.wbusy = true;
-    pthread_mutex_unlock(&G.wlock);
-    store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
-    if (st) job_run(st, &j);
-    job_release(&j);
-    pthread_mutex_lock(&G.wlock);
-    G.wbusy = false;
-    if (G.wq_n == 0) pthread_cond_broadcast(&G.wdone);
-  }
-  pthread_cond_broadcast(&G.wdone);
-  pthread_mutex_unlock(&G.wlock);
-  return NULL;
-}
-
-static void wq_push(wjob_t *j) {
+/* The version of the entry goes to the store (the install of the loader's zone has made the entry and published its version; the registry commit follows).  *zid: the zone's id.
+ * 0, or a negative errno; -ENOTSUP: not a zone the store can hold (the root zone, a name too long, no records, another serial by now). */
+static int dir_put(const char *view, const char *zone, zone_db_entry_t *entry, int64_t source_id, uint32_t serial, const uint8_t digest[32], uint32_t settings, uint32_t *zid_out) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
-  if (!st) {
-    job_release(j);
-    return;
-  }
-  pthread_mutex_lock(&G.wlock);
-  if (G.wthr_started && !G.wstop) {
-    /* The queue is full (the writer is slower than the loader): the producer waits (bounded) until the writer has taken a job, which holds the loader back.  It never runs
-     * the job itself: a job that overtakes the ones queued before it (a put after the delete of the same zone, an invalidation before the put it follows) would leave the
-     * store in the wrong state. */
-    if (G.wq_n >= DB_STORE_WQ_MAX) {
-      struct timespec ts;
-      clock_gettime(CLOCK_REALTIME, &ts);
-      ts.tv_sec += DB_STORE_WQ_WAIT_S;
-      while (G.wq_n >= DB_STORE_WQ_MAX && G.wthr_started && !G.wstop) {
-        if (pthread_cond_timedwait(&G.wspace, &G.wlock, &ts) != 0) break;
-      }
-    }
-    if (G.wq_n < DB_STORE_WQ_MAX && G.wthr_started && !G.wstop) {
-      G.wq[(G.wq_head + G.wq_n) % DB_STORE_WQ_MAX] = *j;
-      G.wq_n++;
-      pthread_cond_signal(&G.wcv);
-      pthread_mutex_unlock(&G.wlock);
-      atomic_fetch_add(&G.wt_queued, 1);
-      return;
-    }
-    pthread_mutex_unlock(&G.wlock);
-    /* the writer did not take a job for DB_STORE_WQ_WAIT_S seconds (a disk that hangs) or is stopping: the job is dropped.  That is safe: the store never trusts a record
-     * without comparing it with the directory (serial, source id, digest), and a record that is missing is read from the database */
-    atomic_fetch_add(&G.wt_dropped, 1);
-    note_error("the write queue is full: a write", j->zone, ETIMEDOUT);
-    job_release(j);
-    return;
-  }
-  pthread_mutex_unlock(&G.wlock);
-  /* no writer thread (before the start, in a test): the producer is the only one, and does the job itself */
-  atomic_fetch_add(&G.wt_inline, 1);
-  job_run(st, j);
-  job_release(j);
-}
-
-bool db_store_sync(int timeout_ms) {
-  if (!db_store_enabled()) return true;
-  struct timespec ts;
-  clock_gettime(CLOCK_REALTIME, &ts);
-  ts.tv_sec += timeout_ms / 1000;
-  ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
-  if (ts.tv_nsec >= 1000000000L) {
-    ts.tv_sec++;
-    ts.tv_nsec -= 1000000000L;
-  }
-  bool ok = true;
-  pthread_mutex_lock(&G.wlock);
-  while ((G.wq_n > 0 || G.wbusy) && G.wthr_started) {
-    if (pthread_cond_timedwait(&G.wdone, &G.wlock, &ts) != 0) {
-      ok = G.wq_n == 0 && !G.wbusy;
-      break;
-    }
-  }
-  pthread_mutex_unlock(&G.wlock);
-  return ok;
-}
-
-void db_store_write_through(const char *view, const char *zone, int64_t source_id, uint32_t serial, const uint8_t digest[32]) {
-  if (!db_store_enabled()) return;
-  wjob_t j;
-  memset(&j, 0, sizeof(j));
+  char name[DBS_NAME_MAX];
   size_t nlen;
-  if (!store_name(zone, j.zone, sizeof(j.zone), &nlen) || strlen(view) > PARK_VIEW_MAX) return;
-  zone_db_entry_t *e = dbreg_pin_entry(view, zone);
-  if (!e) return;
-  bool ok = false;
+  if (!st) return -ENODEV;
+  if (!store_name(zone, name, sizeof(name), &nlen)) return -ENOTSUP;
+  int vid = store_view_id(st, view);
+  if (vid < 0) {
+    vid = store_view_add(st, view);
+    if (vid < 0) {
+      note_error("the view", zone, vid);
+      return vid;
+    }
+    atomic_fetch_add(&G.view_gen, 1);
+    note_view_identity(st, vid, view);
+  }
+  /* the version is pinned while it is copied (a dynamic UPDATE or a newer install may replace it meanwhile) */
   zone_version_t *v = NULL;
   uint16_t flags = 0;
+  int rc = -ENOTSUP;
   rcu_aux_read_lock();
-  v = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
-  if (v && v->image && v->image->n_rrs > 0 && e->source == ZONE_SRC_DB && !e->is_secondary && !e->is_catalog_member &&
-      !atomic_load_explicit(&e->updated, memory_order_relaxed) && atomic_load_explicit(&e->serial, memory_order_relaxed) == serial) {
+  v = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+  if (v && v->image && v->image->n_rrs > 0 && atomic_load_explicit(&entry->serial, memory_order_relaxed) == serial) {
     atomic_fetch_add_explicit(&v->xfr_refs, 1, memory_order_acq_rel);
     if (v->image->flags & ZONE_IMAGE_F_ALIAS) flags |= STORE_F_ALIAS;
     if (v->image->flags & ZONE_IMAGE_F_WILDCARD) flags |= STORE_F_WILDCARD;
     if (v->image->n_nsec > 0 || v->image->n_n3chains > 0) flags |= STORE_F_PRESIGNED;
-    ok = true;
+    rc = 0;
   }
   rcu_aux_read_unlock();
-  if (!ok) {
-    xfr_entry_release(e);
-    return;
-  }
-  const uint64_t pin = v->image->total_size;                 /* (the version is pinned: xfr_refs) */
-  if (!pin_reserve(pin)) {
+  if (rc != 0) return rc;
+  store_meta_t m;
+  memset(&m, 0, sizeof(m));
+  m.source_id = source_id;
+  m.source = (uint16_t)vid;
+  m.flags = flags;
+  m.serial = serial;
+  m.settings = settings;
+  memcpy(m.digest, digest, STORE_DIGEST_LEN);
+  /* the store has this version already (a restart that reads every zone again): nothing to write */
+  store_zone_t cur;
+  bool same = false;
+  uint32_t zid = STORE_NONE;
+  store_read_lock();
+  zid = store_find(st, (uint16_t)vid, name, nlen);
+  if (zid != STORE_NONE && store_zone_get(st, zid, &cur) == 0 && cur.state == STORE_STATE_STORED && cur.serial == serial && cur.source_id == source_id && cur.settings == settings &&
+      memcmp(cur.digest, digest, STORE_DIGEST_LEN) == 0)
+    same = true;
+  store_read_unlock();
+  if (same) {
+    atomic_fetch_add(&G.wt_skipped, 1);
+    *zid_out = zid;
     atomic_fetch_sub_explicit(&v->xfr_refs, 1, memory_order_acq_rel);
-    xfr_entry_release(e);
-    atomic_fetch_add(&G.wt_dropped, 1);                       /* (the writer did not bring the pinned bytes down in time: this version is not copied; the zone is read from the database when it is asked for) */
-    return;
+    return 0;
   }
-  j.pin_bytes = pin;
-  j.kind = WJ_PUT;
-  snprintf(j.view, sizeof(j.view), "%s", view);
-  j.meta.source_id = source_id;
-  j.meta.flags = flags;
-  j.meta.serial = serial;
-  memcpy(j.meta.digest, digest, STORE_DIGEST_LEN);
-  j.entry = e;
-  j.ver = v;
-  wq_push(&j);
+  const unsigned labels = store_name_labels(name, nlen);
+  if (labels < 63 && labels > atomic_load_explicit(&G.dmax[vid], memory_order_relaxed)) atomic_store_explicit(&G.dmax[vid], (uint16_t)labels, memory_order_relaxed);
+  const zone_image_t *img = v->image;
+  int r = store_put(st, (uint16_t)vid, name, nlen, &m, img, img->total_size, &zid);
+  if (r == -EEXIST && source_id != 0) {                    /* the domain id is another zone of the store (a renamed domain): that one goes, the new name is put */
+    store_read_lock();
+    uint32_t old = store_find_source(st, m.source, source_id, (uint16_t)vid);
+    store_read_unlock();
+    if (old != STORE_NONE && store_delete(st, old) == 0) r = store_put(st, (uint16_t)vid, name, nlen, &m, img, img->total_size, &zid);
+  }
+  atomic_fetch_sub_explicit(&v->xfr_refs, 1, memory_order_acq_rel);
+  if (r == 0) {
+    atomic_fetch_add(&G.wt_put, 1);
+    *zid_out = zid;
+    return 0;
+  }
+  note_error("the write", zone, r);
+  return r;
 }
 
-void db_store_delete(const char *view, const char *zone) {
-  if (!db_store_enabled()) return;
-  wjob_t j;
-  memset(&j, 0, sizeof(j));
+static int dir_del(const char *view, const char *zone, int64_t source_id, bool *had) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  char name[DBS_NAME_MAX];
   size_t nlen;
-  if (!store_name(zone, j.zone, sizeof(j.zone), &nlen) || strlen(view) > PARK_VIEW_MAX) return;
-  j.kind = WJ_DEL;
-  snprintf(j.view, sizeof(j.view), "%s", view);
-  wq_push(&j);
+  *had = false;
+  if (!st || !store_name(zone, name, sizeof(name), &nlen)) return 0;
+  store_zone_t cur;
+  int vid;
+  uint32_t zid = STORE_NONE;
+  store_read_lock();
+  vid = store_view_id(st, view);
+  if (vid >= 0) zid = store_find(st, (uint16_t)vid, name, nlen);
+  int gr = zid != STORE_NONE ? store_zone_get(st, zid, &cur) : -ENOENT;
+  store_read_unlock();
+  if (gr != 0 && gr != -EBADMSG) return 0;
+  if (gr == 0 && source_id != 0 && cur.source_id != 0 && cur.source_id != source_id) return 0;      /* (another source id owns the name) */
+  int r = store_delete(st, zid);
+  if (r == 0) {
+    *had = true;
+    atomic_fetch_add(&G.wt_deleted, 1);
+    dmax_refresh(st, vid);
+  } else if (r != -ENOENT) {
+    note_error("the delete", zone, r);
+  }
+  return r;
 }
 
-void db_store_invalidate(const char *view, const char *zone, int64_t source_id, uint32_t serial) {
-  if (!db_store_enabled()) return;
-  wjob_t j;
-  memset(&j, 0, sizeof(j));
+/* the record loses its image (it is damaged, or the version is not trusted): the zone is read from the database again.  The name finds the record also when its cell cannot be read. */
+static void set_known_by_name(const char *view, const char *zone, int64_t source_id, uint32_t serial) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  char name[DBS_NAME_MAX];
   size_t nlen;
-  if (!store_name(zone, j.zone, sizeof(j.zone), &nlen) || strlen(view) > PARK_VIEW_MAX) return;
-  j.kind = WJ_KNOWN;
-  snprintf(j.view, sizeof(j.view), "%s", view);
-  j.meta.source_id = source_id;
-  j.meta.serial = serial;
-  wq_push(&j);
+  if (!st || !store_name(zone, name, sizeof(name), &nlen)) return;
+  int vid = store_view_id(st, view);
+  uint32_t zid = STORE_NONE;
+  store_read_lock();
+  if (vid >= 0) zid = store_find(st, (uint16_t)vid, name, nlen);
+  store_read_unlock();
+  if (zid == STORE_NONE) return;
+  store_meta_t m;
+  memset(&m, 0, sizeof(m));
+  m.source_id = source_id;
+  m.source = (uint16_t)vid;
+  m.serial = serial;
+  if (store_set_known(st, (uint16_t)vid, name, nlen, &m, NULL) == 0) atomic_fetch_add(&G.wt_invalidated, 1);
+}
+
+static void dir_note_flags(uint32_t zid, uint16_t set, uint16_t clear) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  if (st) (void)store_set_flags(st, zid, set, clear);
+}
+
+static uint64_t dir_counters(int what) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  if (!st) return 0;
+  store_stats_t ss;
+  store_read_lock();                                          /* (store_stats() reads the index generation, which a writer may retire: inside a read section) */
+  store_stats(st, &ss);
+  store_read_unlock();
+  switch (what) {
+  case 0: return ss.zones_known + ss.zones_stored;
+  case 1: return ss.zones_stored;
+  case 2: return ss.zones_known;
+  case 3: return ss.zones_rejected;
+  case 4: return AT.live;
+  default: return 0;
+  }
+}
+
+static const dbdir_ops_t g_ops = {
+  .view_sid = dir_view_sid,
+  .view_gen = dir_view_gen,
+  .depth_max = dir_depth_max,
+  .find = dir_find,
+  .settings = dir_settings,
+  .settings_id = dir_settings_id,
+  .rec_get = dir_rec_get,
+  .put = dir_put,
+  .del = dir_del,
+  .note_flags = dir_note_flags,
+  .attach_put = dir_attach_put,
+  .attach_remove = dir_attach_remove,
+  .attach_count = dir_attach_count,
+  .attach_get = dir_attach_get,
+  .attach_next = dir_attach_next,
+  .attach_tab_id = dir_attach_tab_id,
+  .counters = dir_counters,
+};
+
+/* the time of the store: group commit and checkpoint, once a second */
+static void *ticker_thread(void *arg) {
+  (void)arg;
+  rcu_aux_thread_pin();
+  pthread_mutex_lock(&G.wlock);
+  while (!G.wstop) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 1;
+    (void)pthread_cond_timedwait(&G.wcv, &G.wlock, &ts);
+    if (G.wstop) break;
+    store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+    if (st) {
+      pthread_mutex_unlock(&G.wlock);
+      (void)store_tick(st);
+      pthread_mutex_lock(&G.wlock);
+    }
+  }
+  pthread_mutex_unlock(&G.wlock);
+  return NULL;
+}
+
+bool db_store_sync(int timeout_ms) {
+  (void)timeout_ms;                                      /* (writes are made by the thread that installs the zone: nothing is queued) */
+  return true;
 }
 
 void db_store_batch_end(void) {
-  if (!db_store_enabled()) return;
-  wjob_t j;
-  memset(&j, 0, sizeof(j));
-  j.kind = WJ_COMMIT;
-  wq_push(&j);
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  if (st) (void)store_commit(st);                        /* what the batch wrote to the store is made durable (group commit) */
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
 /* attach                                                                                                         */
 /* ------------------------------------------------------------------------------------------------------------- */
-
-bool db_store_attach_possible(const char *view, const char *zone, uint32_t dir_serial) {
-  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
-  if (!st || !atomic_load_explicit(&G.attach_on, memory_order_relaxed)) return false;
-  int vid = store_view_id(st, view);
-  char name[DBS_NAME_MAX];
-  size_t nlen;
-  if (vid < 0 || !store_name(zone, name, sizeof(name), &nlen)) return false;
-  uint32_t zid = store_find(st, (uint16_t)vid, name, nlen);
-  if (zid == STORE_NONE) return false;
-  store_zone_t z;
-  return store_zone_get(st, zid, &z) == 0 && z.state == STORE_STATE_STORED && z.serial == dir_serial;
-}
 
 typedef struct {
   const store_t *st;
@@ -648,7 +938,52 @@ static void attach_fallback(const char *view, const char *zone, bool undo_loadin
 
 static uint32_t clamp_ttl(uint32_t v) { return v > 2147483647u ? 2147483647u : v; }
 
-void db_store_attach_zone(const char *view, const char *zone) {
+/* Design 6.4: the answers of a zone do not depend on which zones happen to be in memory.  The glue of a name server that lives in another zone of the view (the target of an NS, MX or SRV
+ * record outside this zone) is taken from that zone when it is in memory (append_glue_records()); a zone that is only stored would leave the first answer without it.  So the attach of a
+ * zone attaches, in the same job and before its queries are woken, the stored zones that its name server, mail and service targets are in (one level: those are attached without looking at
+ * their own targets; at most SIB_MAX of them, the first ones in the order of the zone). */
+#define SIB_MAX 8
+#define SIB_TARGETS 48
+static void attach_zone_x(const char *view, const char *zone, bool siblings);
+static void attach_siblings(const char *view, const char *zone) {
+  zone_db_entry_t *e = dbreg_pin_entry(view, zone);
+  if (!e) return;
+  static _Thread_local char names[SIB_MAX][DBS_NAME_MAX], holders[SIB_MAX][KARIDNS_VIEW_NAME_MAX];
+  char seen[SIB_TARGETS][DBS_NAME_MAX];
+  int n = 0, ns = 0;
+  rcu_aux_read_lock();
+  zone_version_t *v = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
+  const zone_image_t *img = v ? v->image : NULL;
+  zone_db_snapshot_t *snap = acquire_zone_snapshot();
+  view_snapshot_t *vs = snap ? snapshot_find_view(snap, view) : NULL;
+  if (img && vs) {
+    char tg[DNS_NAME_TEXT_SIZE];
+    for (uint32_t i = 0; i < img->n_rrs && n < SIB_MAX && ns < SIB_TARGETS; i++) {
+      const uint16_t ty = zone_image_rr_type(img, i);
+      if ((ty != 2 && ty != 15 && ty != 33) || zone_image_rr_target(img, i, tg, sizeof(tg)) != 0 || domain_name_is_at_or_below(tg, zone)) continue;
+      bool dup = false;
+      for (int k = 0; k < ns && !dup; k++) dup = domain_names_match_ci(seen[k], tg);
+      if (dup) continue;
+      snprintf(seen[ns++], sizeof(seen[0]), "%s", tg);
+      zref_t z;
+      zref_clear(&z);
+      if (!zref_find_suffix(vs, tg, &z) || z.entry || z.el || z.busy || z.zid == ZREF_NOZID || z.zstate != ZREF_ST_ABSENT) continue;
+      bool same = false;
+      for (int k = 0; k < n && !same; k++) same = domain_names_match_ci(names[k], zref_name(&z));
+      if (same) continue;
+      snprintf(names[n], sizeof(names[0]), "%s", zref_name(&z));
+      snprintf(holders[n], sizeof(holders[0]), "%s", z.hview ? z.hview : view);
+      n++;
+    }
+  }
+  rcu_aux_read_unlock();
+  xfr_entry_release(e);
+  for (int k = 0; k < n; k++) attach_zone_x(holders[k], names[k], false);
+}
+
+void db_store_attach_zone(const char *view, const char *zone) { attach_zone_x(view, zone, true); }
+
+static void attach_zone_x(const char *view, const char *zone, bool siblings) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   if (!st) {
     park_wake_queue_all(view, zone, true);
@@ -676,7 +1011,7 @@ void db_store_attach_zone(const char *view, const char *zone) {
   /* the zone is LOADING: every way out of here makes the entry (dbreg_commit()) or ends it (dbreg_fetch_end()) */
   int cause = STORE_ATT_ERR_OTHER;
   const char *why = "";
-  bool damaged = false, stale = false;
+  bool damaged = false;
   store_img_t img;
   bool have_img = false;
   zone_db_entry_t *entry = NULL;
@@ -702,8 +1037,7 @@ void db_store_attach_zone(const char *view, const char *zone) {
       atomic_fetch_add(&G.attach_stale, 1);
       why = "stale";
       cause = STORE_ATT_ERR_OTHER;
-      stale = true;                                          /* (the record is of another version than the directory's: set back to KNOWN, so that the worker's next look takes the fetch path at once, not an attach that fails again) */
-      goto fail;
+      goto fail;                                             /* (a newer version was stored after the element was made: the install that did it commits its own entry) */
     }
     r = store_image_read(st, zid, &img);
     have_img = r == 0;
@@ -799,8 +1133,8 @@ void db_store_attach_zone(const char *view, const char *zone) {
   pthread_mutex_unlock(&entry->writer_lock);
   ver = NULL;
   {
-    /* the directory must still offer the version that was read (a summary or a delete may have come meanwhile): checked in the commit, under the registry's lock, so
-     * that a summary cannot come between the check and the store (the fetch path is safe by name_in_flight(): the jobs of one name do not overlap) */
+    /* the directory must still offer the version that was read (a delete or a newer install may have come meanwhile): checked in the commit, under the registry's lock, so
+     * that nothing can come between the check and the store (the fetch path is safe by name_in_flight(): the jobs of one name do not overlap) */
     bool shadowed = false;
     if (dbreg_commit_attach(view, zone, entry, &ai, ai.digest_set ? ai.digest : sz.digest, &shadowed) != 0) {
       free_zone_db_entry(entry);                             /* never registered; its version (and the image) go with it */
@@ -817,6 +1151,7 @@ void db_store_attach_zone(const char *view, const char *zone) {
   atomic_fetch_add(&G.attach_ok, 1);
   store_status_note_attach((uint64_t)(mono_ns() - t0), STORE_ATT_OK);
   logev_post(LOGC_DATABASE, 2, NULL, 0, "[Store] zone '%s' (view '%s'), serial %u attached from the store in %lld us", zone, view, ai.serial, (long long)((mono_ns() - t0) / 1000));
+  if (siblings) attach_siblings(view, zone);                  /* (before the queries are woken: their first answer has the glue of the zones it depends on) */
   park_wake_queue_all(view, zone, false);
   return;
 fail:
@@ -827,9 +1162,7 @@ fail:
   if (damaged) {
     atomic_fetch_add(&G.attach_damaged, 1);
     syslog(LOG_WARNING, "[Store] the record of zone '%s' (view '%s') cannot be used (%s); the zone is read from the database again", zone, view, why);
-    db_store_invalidate(view, zone, ai.source_id, ai.serial);
-  } else if (stale) {
-    db_store_invalidate(view, zone, ai.source_id, ai.serial);
+    set_known_by_name(view, zone, ai.source_id, ai.serial);   /* (the next look takes the fetch path at once, not an attach that fails again) */
   }
   logev_post(LOGC_DATABASE, 2, NULL, 0, "[Store] zone '%s' (view '%s') not attached from the store: %s; fetched from the database", zone, view, why);
   store_status_note_attach(0, cause);
@@ -881,6 +1214,9 @@ static void *attach_thread(void *arg) {
 static void evict_hook(int reason) {
   store_status_note_detach_why(reason == DBREG_EVICT_LIMIT ? STORE_DET_LIMIT : reason == DBREG_EVICT_ROOM ? STORE_DET_ROOM : STORE_DET_OTHER);
 }
+
+static bool attached_fn(uint32_t zid) { return dir_attach_get(zid) != NULL; }
+static uint64_t attached_count_fn(void) { return (uint64_t)dir_attach_count(); }
 
 /* what identifies the database a view reads, so that a store that was filled from another one is not trusted: a hash of the driver and the source */
 static void view_identity(const database_config_t *db, const view_config_t *v, uint8_t out[32]) {
@@ -945,6 +1281,7 @@ bool db_store_start(const server_config_t *cfg) {
       syslog(LOG_ERR, "[Store] cannot limit the rights of the store directory: %s; it keeps its rights", strerror(errno));
   }
 #endif
+  set_load(g_dir.dirfd);                                     /* the settings texts: a zone that is not in memory is answered and attached with them */
   for (const view_config_t *v = cfg->views; v; v = v->next) {
     if (v->database_none || !v->name) continue;
     int vid = store_view_add(st, v->name);
@@ -962,16 +1299,15 @@ bool db_store_start(const server_config_t *cfg) {
       (void)store_set_cursor(st, (uint16_t)vid, 0, want, sizeof(want));
     }
   }
-  G.wq = calloc(DB_STORE_WQ_MAX, sizeof(*G.wq));
-  if (!G.wq) {
-    (void)store_close(st);
-    return false;
-  }
+  for (int vid = 0; vid < STORE_MAX_VIEWS; vid++) dmax_refresh(st, vid);
+  atomic_fetch_add(&G.view_gen, 1);
   atomic_store(&G.st, st);
   store_status_bind(st);
+  store_status_set_attached_fn(attached_fn);
+  store_status_set_attached_count_fn(attached_count_fn);
   dbreg_set_evict_hook(evict_hook);
   G.wstop = false;
-  if (pthread_create(&G.wthr, NULL, writer_thread, NULL) != 0) return false;
+  if (pthread_create(&G.wthr, NULL, ticker_thread, NULL) != 0) return false;
   G.wthr_started = true;
 #if defined(__FreeBSD__)
   G.akq = kqueue();
@@ -1001,6 +1337,7 @@ bool db_store_start(const server_config_t *cfg) {
     return true;
   }
   atomic_store(&G.attach_on, true);
+  atomic_store_explicit(&g_dbdir, &g_ops, memory_order_release);         /* from here the store is the directory of the database zones (zref_find_suffix()) */
   store_stats_t ss;
   store_stats(st, &ss);
   syslog(LOG_NOTICE, "[Store] the zone store is on: %s mode, %llu zone(s) stored, %llu known, %d attach thread(s)%s", ss.mode == STORE_MODE_MAP ? "map" : "copy",
@@ -1010,7 +1347,7 @@ bool db_store_start(const server_config_t *cfg) {
     struct stat dst;
     const char *dpath = db_store_dir_of(&cfg->database, &dflt);
     const unsigned dmode = fstat(g_dir.dirfd, &dst) == 0 ? (unsigned)(dst.st_mode & 0777) : 0;
-    syslog(LOG_NOTICE, "[Store] the zone store was created (first use) in %s%s: directory mode %04o (the user the server runs as), %s mode; it keeps a copy of the zone images of the database zones (about as much disk as the zones take in memory; it can be deleted while the server is stopped); `store none;` in the database block turns it off", dpath ? dpath : "?",
+    syslog(LOG_NOTICE, "[Store] the zone store was created (first use) in %s%s: directory mode %04o (the user the server runs as), %s mode; it is the directory of the database zones: it keeps the zone images, and a zone that is not in memory costs no heap (about as much disk as the zones take in memory; it can be deleted while the server is stopped); `store none;` in the database block turns it off", dpath ? dpath : "?",
            dflt ? " (the default directory)" : "", dmode, ss.mode == STORE_MODE_MAP ? "map" : "copy");
   }
   return true;
@@ -1033,7 +1370,6 @@ void db_store_stop(void) {
   pthread_mutex_lock(&G.wlock);
   G.wstop = true;
   pthread_cond_broadcast(&G.wcv);
-  pthread_cond_broadcast(&G.wspace);
   pthread_mutex_unlock(&G.wlock);
   if (G.wthr_started) pthread_join(G.wthr, NULL);
   G.wthr_started = false;

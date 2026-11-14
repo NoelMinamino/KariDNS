@@ -1139,10 +1139,13 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
       if (mname && !eff.notify_to_soa && domain_names_match_ci(ns_target, mname)) continue;
       // A. in-zone glue, B. otherwise the address in a sibling zone of the same view
       if (notify_add_glue(img, ns_target, targets, &ntargets, 64, key, ns_port)) continue;
-      zdir_elem_t *sib_el = NULL;                          /* (one lookup decides: the data of the zone may come into memory or leave it at any moment) */
-      zone_db_entry_t *sib_entry = view ? find_zone_for_query_ex(view, ns_target, 0, &sib_el) : NULL;
+      zref_t sib_z;                                        /* (one lookup decides: the data of the zone may come into memory or leave it at any moment) */
+      zref_clear(&sib_z);
+      zone_db_entry_t *sib_entry = view ? find_zone_for_query_zref(view, ns_target, 0, &sib_z) : NULL;
       if (!sib_entry) {                                    /* (a zone of the view that is out of memory: the glue of its apex, D1a step 7) */
-        if (entry && sib_el) (void)notify_add_sibling_apex(sib_el, ns_target, targets, &ntargets, 64, key, ns_port);
+        if (entry && sib_z.el) (void)notify_add_sibling_apex(sib_z.el, ns_target, targets, &ntargets, 64, key, ns_port);
+        else if (view && !sib_z.el && !sib_z.busy && sib_z.zid != ZREF_NOZID && sib_z.zstate == ZREF_ST_ABSENT && g_query_bg_attach)
+          g_query_bg_attach(sib_z.hview ? sib_z.hview : view->name, zref_name(&sib_z));       /* 0.7 S3: a zone of the store: attached in the background, its addresses are there at the next NOTIFY */
         continue;
       }
       if (sib_entry == entry) continue;

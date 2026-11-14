@@ -95,7 +95,7 @@ conf() {   # conf a|b "extra database statements"
     cat > "$T/$1.conf" <<EOF
 options {
     user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $port; notify no;
-    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; acl-ceiling { 127.0.0.1; };
+    database { driver sqlite3; database-file "${DBFILE:-$T/db/z.db}"; loader-user "nobody"; loader-path "${LPATH:-$T/karidns-dbloader}"; acl-ceiling { 127.0.0.1; };
                park-timeout 5000; $2 };
 };
 control-channel { socket "$T/$1.sock"; secret "$SECRET"; };
@@ -173,13 +173,15 @@ ls "$T/store" > "$T/store.ls" 2>&1
 grep -q '^super\.' "$T/store.ls" && pass "the directory holds a store ($(wc -l < "$T/store.ls" | tr -d ' ') files)" || fail "no store files in $T/store: $(cat "$T/store.ls")"
 [ "$(stat -f %Su "$T/store" 2>/dev/null || stat -c %U "$T/store")" = "nobody" ] && pass "the directory belongs to the user the server runs as" || fail "owner of the store directory: $(ls -ld "$T/store")"
 
-echo "== the first pass: the zones are read from the loader"
+echo "== the first pass: the startup batch put every zone in the store; the zones that do not fit under memory-limit are not kept in memory"
+stored_all() { [ "$(sf store.zones.stored)" -ge "$NZ" ] 2>/dev/null; }
+waitfor 60 stored_all && pass "the store holds all $NZ zones (written when they were installed)" || fail "the store holds $(sf store.zones.stored) of $NZ zones"
+[ "$(sf store.zones.attached)" -lt "$NZ" ] 2>/dev/null && pass "not every zone is in memory (memory-limit 1m): $(sf store.zones.attached) of $NZ attached" || fail "all zones are in memory: $(sf store.zones.attached)"
 pass_all 1 "$NZ" 1
 [ "$PASS_BAD" = 0 ] && pass "all $PASS_N queries of the first pass were answered right" || fail "$PASS_BAD of $PASS_N queries of the first pass were wrong"
 F1=$(fetches)
-[ "${F1:-0}" -gt 0 ] && pass "zones were read from the loader (fetch issued=$F1)" || fail "no fetch in the first pass: $($KA dbstatus | grep -E '^(fetch|cache):')"
-stored_all() { [ "$(sf store.zones.stored)" -ge "$NZ" ] 2>/dev/null; }
-waitfor 60 stored_all && pass "the store holds all $NZ zones (write-through)" || fail "the store holds $(sf store.zones.stored) of $NZ zones"
+[ "${F1:-0}" = 0 ] && pass "no zone was read from the loader in the first pass (the store is the directory: fetch issued=0)" || fail "fetch issued=$F1 in the first pass: $($KA dbstatus | grep -E '^(fetch|cache):')"
+[ "$(sf store.attach.count)" -gt 0 ] 2>/dev/null && pass "zones were attached from the store ($(sf store.attach.count))" || fail "no attach in the first pass"
 
 echo "== the second pass: zones that are out of memory are attached from the store"
 A0=$(sf store.attach.count); A0=${A0:-0}
@@ -253,12 +255,110 @@ pass_all 1 "$NZ" 3
 stop_one "$SRV"; SRV=""
 stop_one "$REF"; REF=""
 
+# ---------------------------------------------------------------- 0.7 S3: the store is the directory
+COLD_N=${STORE_COLD_ZONES:-20000}
+HEAP_N=${STORE_HEAP_ZONES:-100000}
+cc -O1 -o "$T/dbquery" tests/db/dbquery.c 2> "$T/cc.log" || { echo "SKIP: tests/db/dbquery.c does not compile"; cat "$T/cc.log"; }
+printf '#!/bin/sh\nexec sleep 100000\n' > "$T/idle-loader"
+chown 0:0 "$T/idle-loader"; chmod 755 "$T/idle-loader"
+# the Backend's resident set (KiB): the biggest karidns process
+backend_rss() {
+    ps -ax -o pid= -o rss= -o comm= | awk '$3 == "karidns" { if ($2 > m) m = $2 } END { print m + 0 }'
+}
+# start_cold a|b: a server whose loader never says anything (an idle program in its place): up when the store is open
+start_cold() {
+    : > "$T/$1.log"
+    "$KARIDNS" -c "$T/$1.conf" -f > "$T/$1.log" 2>&1 &
+    p=$!
+    if [ "$1" = a ]; then SRV=$p; else REF=$p; fi
+    i=0
+    while [ $i -lt 1200 ] && ! grep -q "\[Store\] the zone store is on" "$T/$1.log" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    grep -q "\[Store\] the zone store is on" "$T/$1.log" || { fail "server $1: the store did not come up"; tail -10 "$T/$1.log"; return 1; }
+    return 0
+}
+# the queries of the comparison: for every zone the apex types, a name that is not there, a wildcard, a CNAME, a delegation, DS, in the three flavours (plain, EDNS DO=0, DO=1)
+gen_cold_queries() {   # gen_cold_queries N > list
+    awk -v n="$1" 'BEGIN {
+        for (i = 1; i <= n; i++) {
+            z = "z" i ".test."
+            print z " SOA p"; print z " NS e"; print z " MX d"; print z " A p"; print z " AAAA e"; print z " DS d"; print z " DNSKEY d"
+            print "www." z " A p"; print "www." z " A d"; print "nx." z " A d"; print "a.b.nx." z " TXT e"
+            print "x.w." z " A d"; print "h3." z " A p"; print "h5." z " CNAME e"; print "h7." z " A d"; print "h2." z " TXT p"
+            print "www.sub." z " A d"; print "sub." z " NS e"; print "WWW." toupper(z) " A p"
+        }
+    }'
+}
+if [ -x "$T/dbquery" ]; then
+    echo "== store-cold: $COLD_N zones; a server restarted on the store with an idle loader answers like the reference (every zone, NXDOMAIN, NODATA, wildcard, CNAME, delegation, DS, DO=1)"
+    mkdir "$T/db2"
+    sh tests/db/gen_sqlite3_zones.sh "$T/db2/z.db" "$COLD_N" 20 > /dev/null 2>&1 || fail "the database of $COLD_N zones was not made"
+    sqlite3 "$T/db2/z.db" "INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, '*.w.' || name, 'A', '192.0.2.99', 300, 0, 0 FROM domains;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'sub.' || name, 'NS', 'ns.sub.' || name || '.', 300, 0, 0 FROM domains;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'ns.sub.' || name, 'A', '192.0.2.55', 300, 0, 0 FROM domains;" > /dev/null 2>&1
+    chown -R nobody "$T/db2"; chmod 600 "$T/db2/z.db"*
+    gen_cold_queries "$COLD_N" > "$T/cold.list"
+    DBFILE="$T/db2/z.db"
+    conf b "store none;"
+    start_one b
+    conf a "memory-limit 4m; store \"$T/store2\"; store-threads 2; store-mode ${STORE_MODE:-auto};"
+    start_one a
+    stored2() { [ "$(sf store.zones.stored)" -ge "$COLD_N" ] 2>/dev/null; }
+    waitfor 120 stored2 && pass "the store holds all $COLD_N zones" || fail "the store holds $(sf store.zones.stored) of $COLD_N zones"
+    stop_one "$SRV"; SRV=""
+    LPATH="$T/idle-loader"
+    conf a "memory-limit 4m; store \"$T/store2\"; store-threads 2; store-mode ${STORE_MODE:-auto};"
+    start_cold a && pass "the server is up on the store with an idle loader"
+    "$T/dbquery" -p "$PB" -t 5 "$T/cold.list" "$T/cold.ref" > /dev/null 2>&1
+    "$T/dbquery" -p "$PA" -t 5 "$T/cold.list" "$T/cold.a" > /dev/null 2>&1
+    NQC=$(wc -l < "$T/cold.list" | tr -d ' ')
+    if [ "$(wc -l < "$T/cold.a" | tr -d ' ')" = "$NQC" ] && cmp -s "$T/cold.ref" "$T/cold.a"; then pass "$NQC queries over $COLD_N zones: every answer is the reference's, byte for byte"; else fail "the cold answers differ from the reference ($(wc -l < "$T/cold.a" | tr -d ' ') of $NQC lines)"; diff "$T/cold.ref" "$T/cold.a" | head -6; fi
+    [ "$(fetches)" = 0 ] && pass "no zone was read from the loader" || fail "fetch issued=$(fetches)"
+    [ "$(sf store.attach.failed)" = 0 ] && pass "no attach failed ($(sf store.attach.count) attaches)" || fail "attach failures: $(sf store.attach.failed)"
+    $KA dbstatus "z$((COLD_N / 2)).test" > "$T/zs2.out" 2>&1
+    grep -q "z$((COLD_N / 2)).test" "$T/zs2.out" && pass "dbstatus <zone> finds a zone of the store: $(head -1 "$T/zs2.out" | cut -c1-110)" || fail "dbstatus <zone>: $(head -2 "$T/zs2.out")"
+    stop_one "$SRV"; SRV=""
+    stop_one "$REF"; REF=""
+    unset DBFILE LPATH
+
+    echo "== heap: $HEAP_N zones in the store, none attached"
+    mkdir "$T/db3"
+    sh tests/db/gen_sqlite3_zones.sh "$T/db3/z.db" "$HEAP_N" 7 > /dev/null 2>&1 || fail "the database of $HEAP_N zones was not made"
+    chown -R nobody "$T/db3"; chmod 600 "$T/db3/z.db"*
+    DBFILE="$T/db3/z.db"
+    conf a "memory-limit 4m; store \"$T/store3\"; store-threads 2; store-mode ${STORE_MODE:-auto};"
+    start_one a
+    stored3() { [ "$(sf store.zones.stored)" -ge "$HEAP_N" ] 2>/dev/null; }
+    waitfor 300 stored3 && pass "the store holds all $HEAP_N zones" || fail "the store holds $(sf store.zones.stored) of $HEAP_N zones"
+    stop_one "$SRV"; SRV=""
+    # a server with an empty store is the base: the same process with one zone
+    mkdir "$T/db4"; sh tests/db/gen_sqlite3_zones.sh "$T/db4/z.db" 1 7 > /dev/null 2>&1; chown -R nobody "$T/db4"; chmod 600 "$T/db4/z.db"*
+    DBFILE="$T/db4/z.db"; LPATH="$T/idle-loader"
+    conf a "memory-limit 4m; store \"$T/store4\"; store-threads 2; store-mode ${STORE_MODE:-auto};"
+    start_cold a
+    ./dag @127.0.0.1 -p "$PA" www.z1.test A +short +nohexdump +time=3 +tries=1 > /dev/null 2>&1
+    R0=$(backend_rss)
+    stop_one "$SRV"; SRV=""
+    DBFILE="$T/db3/z.db"
+    conf a "memory-limit 4m; store \"$T/store3\"; store-threads 2; store-mode ${STORE_MODE:-auto};"
+    start_cold a
+    ./dag @127.0.0.1 -p "$PA" www.z77.test A +short +nohexdump +time=5 +tries=1 > /dev/null 2>&1
+    R1=$(backend_rss)
+    EL=$($KA dbstatus | sed -n 's/^zone directory: .*the heap holds \([0-9]*\) elements.*/\1/p' | head -1)
+    [ "$(sf store.zones.stored)" -ge "$HEAP_N" ] 2>/dev/null && pass "the restarted server has all $HEAP_N zones in its store ($(sf store.zones.stored))" || fail "stored=$(sf store.zones.stored)"
+    [ "${EL:-99999}" -le 2 ] && pass "the heap holds $EL registry element(s) for $HEAP_N stored zones (only the zone that was asked for)" || fail "registry elements: ${EL:-?}"
+    DR=$((R1 - R0))
+    echo "  Backend RSS: $R0 KiB with an empty store, $R1 KiB with $HEAP_N stored zones (the store's mapped pages are in it): $DR KiB more"
+    [ "$DR" -le "${HEAP_RSS_MAX_KIB:-65536}" ] && pass "the Backend with $HEAP_N stored zones is within ${HEAP_RSS_MAX_KIB:-65536} KiB of the one with none ($DR KiB)" || fail "RSS grew by $DR KiB for $HEAP_N stored zones"
+    stop_one "$SRV"; SRV=""
+    unset DBFILE LPATH
+fi
+
 echo "== karicheck"
 kc() { ./karicheck conf "$T/k.conf" > "$T/kc.out" 2>&1; }
 conf a "store \"$T/none/such/dir\";"
 cp "$T/a.conf" "$T/k.conf"; kc; [ $? != 0 ] && grep -q "store" "$T/kc.out" && pass "a store directory whose parent does not exist is an error: $(grep store "$T/kc.out" | head -1 | cut -c1-120)" || fail "karicheck accepted a store directory with no parent"
-conf a "store \"$T/store\"; store-mode copy; store-threads 3; store-paranoid yes;"
-cp "$T/a.conf" "$T/k.conf"; kc; grep -E "ERROR|error" "$T/kc.out" | grep -qi "store" && fail "karicheck refused a good store configuration: $(grep -i store "$T/kc.out")" || pass "store, store-mode, store-threads and store-paranoid are accepted"
+conf a "store \"$T/store\"; store-mode copy; store-threads 3;"
+cp "$T/a.conf" "$T/k.conf"; kc; grep -E "ERROR|error" "$T/kc.out" | grep -qi "store" && fail "karicheck refused a good store configuration: $(grep -i store "$T/kc.out")" || pass "store, store-mode and store-threads are accepted"
 conf a "store none;"
 cp "$T/a.conf" "$T/k.conf"; kc; grep -E "ERROR|error" "$T/kc.out" | grep -qi "store" && fail "karicheck refused store none" || pass "store none is accepted"
 if [ "$(id -u)" = 0 ]; then

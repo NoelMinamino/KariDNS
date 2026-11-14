@@ -145,6 +145,10 @@ typedef struct {
   zdir_elem_t *elem;
   char view_name[KARIDNS_VIEW_NAME_MAX];
   zone_db_entry_t *(*await)(zdir_elem_t *elem, const char *view_name);
+  /* 0.7 store S3: the zone is a zone of the store that is not in memory (it has no element): store_zone is its name with the trailing dot, and the thread waits for its entry with
+   * await_zone(store_zone, view_name) (db_ingest_xfr_await_zone(): a store thread attaches it).  elem is NULL then.  The reply to IXFR is not made from an apex (there is none). */
+  char store_zone[256];
+  zone_db_entry_t *(*await_zone)(const char *zone, const char *view_name);
 } axfr_worker_args_t;
 _Static_assert(sizeof(((axfr_worker_args_t *)0)->req) >= XFR_REQUEST_MAX_LEN, "the transfer thread keeps the whole request (xfr_request_shape() accepts XFR_REQUEST_MAX_LEN)");
 

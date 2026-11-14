@@ -476,7 +476,34 @@ bool park_attach_request(int w, const char *view, const char *zone) {
   return true;
 }
 
+/* 0.7 store S3: attach requests of threads that are not parked-query workers (the engine's background attach for a CNAME or glue that leads into a stored zone, a DoT / DoH thread):
+ * a few slots, as the transfer threads' fetch slots, taken by compare-and-swap */
+#define PARK_ATTACH_ANY_SLOTS 16
+static park_fetch_req_t g_att_q[PARK_ATTACH_ANY_SLOTS];
+static _Atomic uint8_t g_att_st[PARK_ATTACH_ANY_SLOTS];
+
+bool park_attach_request_any(const char *view, const char *zone) {
+  size_t vl, zl;
+  if (!key_fits(view, zone, &vl, &zl)) return false;
+  for (int i = 0; i < PARK_ATTACH_ANY_SLOTS; i++) {
+    uint8_t free_st = 0;
+    if (!atomic_compare_exchange_strong_explicit(&g_att_st[i], &free_st, 1, memory_order_acquire, memory_order_relaxed)) continue;
+    park_fetch_req_t *q = &g_att_q[i];
+    memset(q, 0, sizeof(*q));
+    q->vlen = (uint8_t)vl;
+    q->zlen = (uint8_t)zl;
+    memcpy(q->view, view, vl + 1);
+    memcpy(q->zone, zone, zl + 1);
+    atomic_store_explicit(&g_att_st[i], 2, memory_order_release);
+    trigger_attach();
+    return true;
+  }
+  return false;
+}
+
 bool park_attach_pending(void) {
+  for (int k = 0; k < PARK_ATTACH_ANY_SLOTS; k++)
+    if (atomic_load_explicit(&g_att_st[k], memory_order_acquire) == 2) return true;
   int wm = atomic_load_explicit(&g_attach_wmax, memory_order_relaxed);
   for (int w = 0; w < wm; w++)
     if (atomic_load_explicit(&g_attach[w].head, memory_order_acquire) != atomic_load_explicit(&g_attach[w].tail, memory_order_relaxed)) return true;
@@ -496,6 +523,14 @@ void park_attach_sleep_done(void) { atomic_fetch_sub_explicit(&g_attach_asleep, 
 bool park_attach_next(park_fetch_req_t *out) {
   if (atomic_exchange_explicit(&g_attach_clock, true, memory_order_acquire)) return false;      /* (another store thread is taking one; it wakes a sibling when more wait) */
   bool got = false;
+  for (int k = 0; k < PARK_ATTACH_ANY_SLOTS && !got; k++) {
+    if (atomic_load_explicit(&g_att_st[k], memory_order_acquire) != 2) continue;
+    *out = g_att_q[k];
+    atomic_store_explicit(&g_att_st[k], 0, memory_order_release);
+    out->claimed = false;
+    out->worker = -1;
+    got = true;
+  }
   int wm = atomic_load_explicit(&g_attach_wmax, memory_order_relaxed);
   uint32_t start = atomic_fetch_add_explicit(&g_attach_rr, 1, memory_order_relaxed);
   for (int i = 0; i < wm && !got; i++) {
@@ -763,6 +798,19 @@ void park_bg_fetch(const char *view, const char *zone) {
   /* the slot is stamped after the request is queued: a request that found no free slot of the transfer threads is not remembered as made (the next query for the
    * zone makes it again), and a different zone that hashed to the same slot is asked for, not held back */
   if (!park_fetch_request_any(view, zone, KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_FULL)) return;
+  atomic_store_explicit(&g_bg_at[i], now, memory_order_relaxed);
+  atomic_store_explicit(&g_bg_key[i], h, memory_order_relaxed);
+}
+
+/* the same one-per-PARK_BG_MS rule for the background attach of a stored zone */
+void park_bg_attach(const char *view, const char *zone) {
+  uint64_t h = name_key(view, zone) ^ 0x9E3779B97F4A7C15ull;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  int64_t now = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+  size_t i = (size_t)(h % PARK_BG_SLOTS);
+  if (atomic_load_explicit(&g_bg_key[i], memory_order_relaxed) == h && now - atomic_load_explicit(&g_bg_at[i], memory_order_relaxed) < PARK_BG_MS) return;
+  if (!park_attach_request_any(view, zone)) return;
   atomic_store_explicit(&g_bg_at[i], now, memory_order_relaxed);
   atomic_store_explicit(&g_bg_key[i], h, memory_order_relaxed);
 }

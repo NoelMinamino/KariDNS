@@ -6642,7 +6642,6 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
     db->store_threads = (uint32_t)u;
     return 0;
   }
-  if (strcmp(key, "store-paranoid") == 0) return parse_bool_statement(ctx, NULL, key, &db->store_paranoid);
   if (strcmp(key, "warm-before-serve") == 0) {        /* seconds to hold back the queries until the zones of the hot list are read (0 = do not wait) */
     if (db_take_uint(ctx, key, false, 0, KARIDNS_DB_WARM_WAIT_MAX, &u) != 0) return -1;
     db->warm_before_serve = (uint32_t)u;

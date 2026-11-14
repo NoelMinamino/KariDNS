@@ -160,7 +160,7 @@ chown -R nobody "$T/db"; chmod 600 "$T/db/z.db"*
 } > "$T/a.conf"
 {
     printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n' "$PB"
-    printf '    database { driver sqlite3; database-file "%s/db/z.db"; loader-user "nobody"; loader-path "%s/karidns-dbloader"; acl-ceiling { 127.0.0.1; }; };\n};\n' "$T" "$T"
+    printf '    database { driver sqlite3; database-file "%s/db/z.db"; loader-user "nobody"; loader-path "%s/karidns-dbloader"; acl-ceiling { 127.0.0.1; }; %s };\n};\n' "$T" "$T" "$(store_stmt "$T")"
 } > "$T/b.conf"
 {   # C: no zone file, no database; a secondary of B for every zone (B7b)
     printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n};\n' "$PC"
@@ -172,6 +172,7 @@ SA=$!
 SB=$!
 if ! wait_log "$T/b.log" "\[DB\] initial load complete" 30; then fail "the database server did not finish its startup batch"; sed 's/^/         /' "$T/b.log" | tail -15; exit 1; fi
 sleep 0.5
+store_cold_restart "$T" b.conf "$T/b.log"
 "$KARIDNS" -c "$T/c.conf" -f > "$T/c.log" 2>&1 &
 SC=$!
 # C has every zone when each one answers its SOA record (the first transfer is made at the first tick of its control thread).

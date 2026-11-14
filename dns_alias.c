@@ -870,11 +870,13 @@ static void scan_zones(void) {
     server_config_t *cfg = acquire_config_snapshot();
     zone_db_snapshot_t *snap = acquire_zone_snapshot();
     if (cfg && snap && snap->views) {
-        for (size_t v = 0; v < snap->view_count; v++) {
-            view_snapshot_t *view = &snap->views[v];
+        for (size_t v = 0; v <= snap->view_count; v++) {
+            const bool att = v == snap->view_count;       /* 0.7 S3: after the views' directories, the zones of the zone store that are in memory (the attach table: a zone that is not has no ALIAS targets to resolve) */
+            if (att && !dbdir()) break;
             zdir_iter_t zit;
-            zdir_iter_init(&zit, view);
-            for (zdir_elem_t *zel; (zel = zdir_iter_next(&zit));) {
+            size_t apos = 0;
+            if (!att) zdir_iter_init(&zit, &snap->views[v]);
+            for (zdir_elem_t *zel; (zel = att ? dbdir()->attach_next(&apos) : zdir_iter_next(&zit));) {
                 zone_db_entry_t *e = zdir_entry(zel);
                 if (!e || !view_owns_elem(zel) || e->kind == ZONE_KIND_FORWARD || e->kind == ZONE_KIND_PROGRAM) continue;   /* a shared zone is scanned in its owner view */
                 zone_version_t *ver = atomic_load_explicit(&e->rcu.active, memory_order_acquire);

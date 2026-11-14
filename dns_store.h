@@ -250,6 +250,17 @@ void     store_read_unlock(void);
 /* zid of (view, name) or STORE_NONE.  Case-insensitive; the name is verified against zt / nx, so a damaged index entry makes a
  * zone invisible, never wrong. */
 uint32_t store_find(const store_t *s, uint16_t view, const char *name, size_t len);
+/* The query path's two-step lookup (0.7 S3).  store_find_cand(): the zids whose index slot has the tag of (view, name), in probe order, at most `max`, NOT verified against the
+ * zone table (the name must be folded: lower case); usually 0 or 1.  The caller verifies a candidate against what it holds (the name of an attached zone's element in the heap) or,
+ * for a zone that is not in memory, with store_zid_is() (the zone table's name, under the cell's sequence counter).  A damaged slot makes a zone invisible, never wrong. */
+unsigned store_find_cand(const store_t *s, uint16_t view, const char *fname, size_t len, uint32_t *zids, unsigned max);
+bool     store_zid_is(const store_t *s, uint32_t zid, uint16_t view, const char *name, size_t len);
+/* A thread that must never yield or sleep (a query worker) calls store_reader_nosleep(true) once: the readers of this file then spin a bounded time on a cell that is being
+ * written and give up (the lookup finds nothing, store_zone_get() says -EBADMSG) instead of yielding and sleeping up to 500 ms.  store_reader_busy_take() says (and clears) that
+ * this thread gave up since the last call: the answer of the lookup is then "not known now", and the caller takes the slow path (parks the query for a store thread, which does
+ * not mind sleeping) rather than treating the zone as absent or damaged. */
+void     store_reader_nosleep(bool on);
+bool     store_reader_busy_take(void);
 /* zid by (source, domain id, view) from the source index, or STORE_NONE */
 uint32_t store_find_source(const store_t *s, uint16_t source, int64_t domain_id, uint16_t view);
 /* zt + zc fields of a zone.  0, -ENOENT (free / out of range), -EBADMSG (CRC of the record wrong: a damaged zone; a
