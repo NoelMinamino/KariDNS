@@ -33,15 +33,6 @@
 #include "dns_utils.h"
 #include "dns_zone_image.h"
 
-#ifndef __has_feature
-#define __has_feature(x) 0
-#endif
-#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__) || __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
-#define DBS_SANITIZER 1
-#else
-#define DBS_SANITIZER 0
-#endif
-
 #define DBS_NAME_MAX 256
 
 static int64_t mono_ns(void) {
@@ -82,6 +73,51 @@ static void parent_of(const char *path, char *out, size_t cap) {
   else snprintf(out, cap, "%.*s", (int)(slash - path), path);
 }
 
+/* The lock file.  The directory belongs to the user the server runs as (or to root), so that user can put anything under the name "lock" before the start: a hard link to
+ * a file of root's (the start, as root, would give it to the run user), a FIFO (opening it would wait for ever), a link, a file of another user.  Nothing that is there is
+ * trusted: it is opened without following a link and without waiting (O_NOFOLLOW, O_NONBLOCK), and used only when it is a plain file with one name that belongs to root
+ * or to the run user; anything else loses the name (unlinkat() of the name only: what a hard link points to is not touched) and the file is made again with O_EXCL, which
+ * cannot open what exists.  Only a file that this call made, or one that passed the checks above, is given to the run user (fchown() on the descriptor that was checked).
+ * Returns the descriptor, or -1 with `why` filled. */
+static int lock_file_open(int dfd, bool privileged, uid_t uid, gid_t gid, char *why, size_t whylen, const char *path) {
+  for (int attempt = 0; attempt < 4; attempt++) {
+    const int fl = O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK;
+    bool made = true;
+    int fd = openat(dfd, "lock", fl | O_CREAT | O_EXCL, 0600);
+    if (fd < 0 && errno == EEXIST) {
+      made = false;
+      fd = openat(dfd, "lock", fl);
+      if (fd < 0 && errno == ENOENT) continue;                          /* (it went away between the two calls) */
+    }
+    if (fd >= 0) {
+      struct stat st;
+      uid_t owner_ok = privileged ? 0 : geteuid();
+      bool fine = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_nlink == 1 &&
+                  (made || st.st_uid == owner_ok || (privileged && uid != (uid_t)-1 && st.st_uid == uid));
+      if (fine) {
+        if (privileged && (uid != (uid_t)-1 || gid != (gid_t)-1) && (st.st_uid != uid || st.st_gid != gid) && fchown(fd, uid, gid) != 0) {
+          snprintf(why, whylen, "cannot give the lock file in %s to the user the server runs as: %s", path, strerror(errno));
+          close(fd);
+          return -1;
+        }
+        return fd;
+      }
+      close(fd);
+    } else if (errno != ELOOP && errno != ENXIO && errno != EMLINK) {
+      snprintf(why, whylen, "cannot open the lock file in %s: %s", path, strerror(errno));
+      return -1;
+    }
+    /* something that is not ours is under the name: the name goes, a new file is made */
+    syslog(LOG_WARNING, "[Store] the lock file in %s is not a plain file of root or of the user the server runs as (a link, a FIFO, another owner); it is replaced", path);
+    if (unlinkat(dfd, "lock", 0) != 0 && errno != ENOENT) {
+      snprintf(why, whylen, "cannot replace the lock file in %s: %s", path, strerror(errno));
+      return -1;
+    }
+  }
+  snprintf(why, whylen, "cannot make the lock file in %s (something keeps taking its name)", path);
+  return -1;
+}
+
 bool db_store_frontend_open(const database_config_t *db, bool privileged, uid_t uid, gid_t gid, char *msg, size_t msglen) {
   if (msg && msglen) msg[0] = '\0';
   db_store_frontend_close();
@@ -113,13 +149,10 @@ bool db_store_frontend_open(const database_config_t *db, bool privileged, uid_t 
     goto bad;
   }
   if (privileged) {
-    /* a directory that root or the user the server runs as owns, that nobody else can write in; it is handed to that user */
-    if (st.st_uid != 0 && uid != (uid_t)-1 && st.st_uid != uid) {
-      snprintf(why, sizeof(why), "the directory %s belongs to user %u, neither root nor the user the server runs as", path, (unsigned)st.st_uid);
-      goto bad;
-    }
-    if (st.st_mode & (S_IWGRP | S_IWOTH)) {
-      snprintf(why, sizeof(why), "the directory %s can be written by group or others (mode %o): it must not be", path, (unsigned)(st.st_mode & 07777));
+    /* a directory that root or the user the server runs as owns, that nobody else can write in; it is handed to that user (the same rule as karicheck's) */
+    char own[200];
+    if (!store_dir_owner_ok(&st, true, uid, geteuid(), own, sizeof(own))) {
+      snprintf(why, sizeof(why), "the directory %s %s", path, own);
       goto bad;
     }
     if ((uid != (uid_t)-1 || gid != (gid_t)-1) && fchown(dfd, uid, gid) != 0) {
@@ -131,8 +164,9 @@ bool db_store_frontend_open(const database_config_t *db, bool privileged, uid_t 
       goto bad;
     }
   } else {
-    if (st.st_uid != geteuid()) {
-      snprintf(why, sizeof(why), "the directory %s belongs to user %u, not to the user the server runs as", path, (unsigned)st.st_uid);
+    char own[200];
+    if (!store_dir_owner_ok(&st, false, (uid_t)-1, geteuid(), own, sizeof(own))) {
+      snprintf(why, sizeof(why), "the directory %s %s", path, own);
       goto bad;
     }
     if ((st.st_mode & 077) != 0 && fchmod(dfd, 0700) != 0) {
@@ -141,12 +175,8 @@ bool db_store_frontend_open(const database_config_t *db, bool privileged, uid_t 
     }
   }
   /* one server per store: a lock file inside it, held for as long as the descriptor is open (the Backend inherits it) */
-  lfd = openat(dfd, "lock", O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
-  if (lfd < 0) {
-    snprintf(why, sizeof(why), "cannot open the lock file in %s: %s", path, strerror(errno));
-    goto bad;
-  }
-  if (privileged && (uid != (uid_t)-1 || gid != (gid_t)-1)) (void)fchown(lfd, uid, gid);
+  lfd = lock_file_open(dfd, privileged, uid, gid, why, sizeof(why), path);
+  if (lfd < 0) goto bad;
   if (flock(lfd, LOCK_EX | LOCK_NB) != 0) {
     snprintf(why, sizeof(why), errno == EWOULDBLOCK ? "the directory %s is in use by another server" : "cannot lock the directory %s: %s", path, strerror(errno));
     goto bad;
@@ -178,13 +208,13 @@ typedef struct {
   store_meta_t meta;
   zone_db_entry_t *entry;             /* PUT: held (xfr_entry_hold()) until the job is done */
   zone_version_t *ver;                /* PUT: pinned (xfr_refs) */
+  uint64_t pin_bytes;                 /* PUT: the image bytes this job holds in memory (counted in G.pinned_bytes until it is released) */
 } wjob_t;
 
 #define DBS_MAX_ATTACH_THREADS 8
 
 static struct {
   _Atomic(store_t *) st;
-  bool paranoid;
   _Atomic bool attach_on;
   /* writer */
   pthread_t wthr;
@@ -192,6 +222,8 @@ static struct {
   pthread_mutex_t wlock;
   pthread_cond_t wcv;                 /* a job arrived, or stop */
   pthread_cond_t wdone;               /* the queue became empty and idle */
+  pthread_cond_t wpin;                /* the bytes that queued jobs hold went down (a producer waits for it) */
+  pthread_cond_t wspace;              /* a job was taken from a full queue (a producer waits for it) */
   wjob_t *wq;
   uint32_t wq_head, wq_n;
   bool wbusy, wstop;
@@ -204,11 +236,24 @@ static struct {
   _Atomic uint64_t wt_queued, wt_inline, wt_put, wt_skipped, wt_deleted, wt_invalidated, wt_errors, wt_dropped;
   _Atomic uint64_t attach_ok, attach_stale, attach_missing, attach_damaged, attach_fallback, attach_resident, attach_busy;
   _Atomic uint64_t attached_bytes, versions_live;
+  _Atomic uint64_t validated, validate_ns;       /* images checked by zone_image_validate() at an attach, and the time they took */
+  uint64_t pinned_bytes;               /* under wlock: image bytes pinned by queued and running write-through jobs */
+  uint64_t pin_cap;                    /* the bound of pinned_bytes (DB_STORE_PIN_MAX_BYTES; a test sets another) */
+  _Atomic uint64_t pin_waits, pinned_peak;
   _Atomic int64_t last_err_log_ns;
-} G = { .wlock = PTHREAD_MUTEX_INITIALIZER, .wcv = PTHREAD_COND_INITIALIZER, .wdone = PTHREAD_COND_INITIALIZER, .akq = -1 };
+} G = { .wlock = PTHREAD_MUTEX_INITIALIZER, .wcv = PTHREAD_COND_INITIALIZER, .wdone = PTHREAD_COND_INITIALIZER, .wspace = PTHREAD_COND_INITIALIZER, .wpin = PTHREAD_COND_INITIALIZER, .pin_cap = DB_STORE_PIN_MAX_BYTES, .akq = -1 };
 
 bool db_store_enabled(void) { return atomic_load_explicit(&G.st, memory_order_acquire) != NULL; }
 store_t *db_store_handle(void) { return atomic_load_explicit(&G.st, memory_order_acquire); }
+
+#ifdef KARIDNS_UNIT_TEST
+void db_store_test_pin_cap(uint64_t bytes) {
+  pthread_mutex_lock(&G.wlock);
+  G.pin_cap = bytes;
+  atomic_store(&G.pinned_peak, 0);
+  pthread_mutex_unlock(&G.wlock);
+}
+#endif
 
 void db_store_counters(db_store_counters_t *o) {
   o->wt_queued = atomic_load(&G.wt_queued);
@@ -228,6 +273,10 @@ void db_store_counters(db_store_counters_t *o) {
   o->attach_busy = atomic_load(&G.attach_busy);
   o->attached_bytes = atomic_load(&G.attached_bytes);
   o->versions_live = atomic_load(&G.versions_live);
+  o->validated = atomic_load(&G.validated);
+  o->validate_ns = atomic_load(&G.validate_ns);
+  o->pin_waits = atomic_load(&G.pin_waits);
+  o->pinned_peak = atomic_load(&G.pinned_peak);
 }
 
 /* the store's name of a zone of the registry: no trailing dot (the registry's key keeps it); false: the root zone or too long */
@@ -255,6 +304,37 @@ static void job_release(wjob_t *j) {
   if (j->entry) xfr_entry_release(j->entry);
   j->ver = NULL;
   j->entry = NULL;
+  if (j->pin_bytes) {
+    pthread_mutex_lock(&G.wlock);
+    G.pinned_bytes -= j->pin_bytes < G.pinned_bytes ? j->pin_bytes : G.pinned_bytes;
+    pthread_cond_broadcast(&G.wpin);
+    pthread_mutex_unlock(&G.wlock);
+    j->pin_bytes = 0;
+  }
+}
+
+/* The bytes of the images that queued write-through jobs hold (a version is kept alive, and its zone in memory, until the writer has copied it) are bounded: a first fill of
+ * a database bigger than memory-limit would otherwise pin up to DB_STORE_WQ_MAX zones above the limit.  A producer waits (bounded) for the writer to bring the total down;
+ * one job always passes when nothing else is pinned, so a zone bigger than the bound is not stuck.  false: the wait ran out (the write-through of this version is dropped). */
+static bool pin_reserve(uint64_t bytes) {
+  pthread_mutex_lock(&G.wlock);
+  if (G.wthr_started && !G.wstop && G.pinned_bytes > 0 && G.pinned_bytes + bytes > G.pin_cap) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += DB_STORE_WQ_WAIT_S;
+    atomic_fetch_add(&G.pin_waits, 1);
+    while (G.wthr_started && !G.wstop && G.pinned_bytes > 0 && G.pinned_bytes + bytes > G.pin_cap) {
+      if (pthread_cond_timedwait(&G.wpin, &G.wlock, &ts) != 0) break;
+    }
+    if (G.wthr_started && !G.wstop && G.pinned_bytes > 0 && G.pinned_bytes + bytes > G.pin_cap) {
+      pthread_mutex_unlock(&G.wlock);
+      return false;
+    }
+  }
+  G.pinned_bytes += bytes;
+  if (G.pinned_bytes > atomic_load_explicit(&G.pinned_peak, memory_order_relaxed)) atomic_store_explicit(&G.pinned_peak, G.pinned_bytes, memory_order_relaxed);
+  pthread_mutex_unlock(&G.wlock);
+  return true;
 }
 
 static void note_error(const char *what, const char *zone, int rc) {
@@ -371,6 +451,7 @@ static void *writer_thread(void *arg) {
     wjob_t j = G.wq[G.wq_head];
     G.wq_head = (G.wq_head + 1) % DB_STORE_WQ_MAX;
     G.wq_n--;
+    pthread_cond_signal(&G.wspace);
     G.wbusy = true;
     pthread_mutex_unlock(&G.wlock);
     store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
@@ -392,16 +473,36 @@ static void wq_push(wjob_t *j) {
     return;
   }
   pthread_mutex_lock(&G.wlock);
-  if (G.wq_n < DB_STORE_WQ_MAX && G.wthr_started && !G.wstop) {
-    G.wq[(G.wq_head + G.wq_n) % DB_STORE_WQ_MAX] = *j;
-    G.wq_n++;
-    pthread_cond_signal(&G.wcv);
+  if (G.wthr_started && !G.wstop) {
+    /* The queue is full (the writer is slower than the loader): the producer waits (bounded) until the writer has taken a job, which holds the loader back.  It never runs
+     * the job itself: a job that overtakes the ones queued before it (a put after the delete of the same zone, an invalidation before the put it follows) would leave the
+     * store in the wrong state. */
+    if (G.wq_n >= DB_STORE_WQ_MAX) {
+      struct timespec ts;
+      clock_gettime(CLOCK_REALTIME, &ts);
+      ts.tv_sec += DB_STORE_WQ_WAIT_S;
+      while (G.wq_n >= DB_STORE_WQ_MAX && G.wthr_started && !G.wstop) {
+        if (pthread_cond_timedwait(&G.wspace, &G.wlock, &ts) != 0) break;
+      }
+    }
+    if (G.wq_n < DB_STORE_WQ_MAX && G.wthr_started && !G.wstop) {
+      G.wq[(G.wq_head + G.wq_n) % DB_STORE_WQ_MAX] = *j;
+      G.wq_n++;
+      pthread_cond_signal(&G.wcv);
+      pthread_mutex_unlock(&G.wlock);
+      atomic_fetch_add(&G.wt_queued, 1);
+      return;
+    }
     pthread_mutex_unlock(&G.wlock);
-    atomic_fetch_add(&G.wt_queued, 1);
+    /* the writer did not take a job for DB_STORE_WQ_WAIT_S seconds (a disk that hangs) or is stopping: the job is dropped.  That is safe: the store never trusts a record
+     * without comparing it with the directory (serial, source id, digest), and a record that is missing is read from the database */
+    atomic_fetch_add(&G.wt_dropped, 1);
+    note_error("the write queue is full: a write", j->zone, ETIMEDOUT);
+    job_release(j);
     return;
   }
   pthread_mutex_unlock(&G.wlock);
-  /* the queue is full (the writer is slower than the loader): the producer does the job, so nothing is dropped and the loader is held back */
+  /* no writer thread (before the start, in a test): the producer is the only one, and does the job itself */
   atomic_fetch_add(&G.wt_inline, 1);
   job_run(st, j);
   job_release(j);
@@ -455,6 +556,14 @@ void db_store_write_through(const char *view, const char *zone, int64_t source_i
     xfr_entry_release(e);
     return;
   }
+  const uint64_t pin = v->image->total_size;                 /* (the version is pinned: xfr_refs) */
+  if (!pin_reserve(pin)) {
+    atomic_fetch_sub_explicit(&v->xfr_refs, 1, memory_order_acq_rel);
+    xfr_entry_release(e);
+    atomic_fetch_add(&G.wt_dropped, 1);                       /* (the writer did not bring the pinned bytes down in time: this version is not copied; the zone is read from the database when it is asked for) */
+    return;
+  }
+  j.pin_bytes = pin;
   j.kind = WJ_PUT;
   snprintf(j.view, sizeof(j.view), "%s", view);
   j.meta.source_id = source_id;
@@ -554,7 +663,10 @@ void db_store_attach_zone(const char *view, const char *zone) {
     return;
   }
   if (b == DBREG_ATT_BUSY) {
-    atomic_fetch_add(&G.attach_busy, 1);                     /* (whoever is at it wakes every worker) */
+    /* a fetch (or another attach) of the zone is on its way and wakes the queries that wait when it is done.  They were parked for the attach deadline, though: they are
+     * given the park-timeout (a retry key), or they would be answered "not ready" at 200 ms behind a cold read that takes longer */
+    atomic_fetch_add(&G.attach_busy, 1);
+    park_wake_queue_retry(view, zone);
     return;
   }
   if (b != DBREG_ATT_STARTED) {
@@ -564,7 +676,7 @@ void db_store_attach_zone(const char *view, const char *zone) {
   /* the zone is LOADING: every way out of here makes the entry (dbreg_commit()) or ends it (dbreg_fetch_end()) */
   int cause = STORE_ATT_ERR_OTHER;
   const char *why = "";
-  bool damaged = false;
+  bool damaged = false, stale = false;
   store_img_t img;
   bool have_img = false;
   zone_db_entry_t *entry = NULL;
@@ -590,6 +702,7 @@ void db_store_attach_zone(const char *view, const char *zone) {
       atomic_fetch_add(&G.attach_stale, 1);
       why = "stale";
       cause = STORE_ATT_ERR_OTHER;
+      stale = true;                                          /* (the record is of another version than the directory's: set back to KNOWN, so that the worker's next look takes the fetch path at once, not an attach that fails again) */
       goto fail;
     }
     r = store_image_read(st, zid, &img);
@@ -612,7 +725,9 @@ void db_store_attach_zone(const char *view, const char *zone) {
     }
     goto fail;
   }
-  /* the image: the store's checksum has held; the structure is checked when asked (store-paranoid, sanitizer builds), the apex name always (the validator does not know the zone) */
+  /* the image: the store's checksum detects damage, not a forgery (it is not keyed), and what the engine serves must be an image that zone_image_validate() accepts (the
+   * offsets it follows are all checked there): every attach validates the image it read, the first read of a record and every later one (an image is about a kilobyte for the
+   * zones this store is for; the time is counted, db_store_counters_t.validate_ns).  The apex name too (the validator does not know the zone). */
   const zone_image_t *zi = img.data;
   if (img.len < sizeof(zone_image_t) || ((uintptr_t)img.data & 7u) != 0 || zi->magic != ZONE_IMAGE_MAGIC || zi->version != ZONE_IMAGE_VERSION || zi->total_size != img.len) {
     damaged = true;
@@ -620,9 +735,13 @@ void db_store_attach_zone(const char *view, const char *zone) {
     why = "not an image";
     goto fail;
   }
-  if (G.paranoid || DBS_SANITIZER) {
+  {
     char vw[96] = "";
-    if (zone_image_validate(img.data, img.len, vw, sizeof(vw)) != 0) {
+    const int64_t tv0 = mono_ns();
+    int vr = zone_image_validate(img.data, img.len, vw, sizeof(vw));
+    atomic_fetch_add(&G.validate_ns, (uint64_t)(mono_ns() - tv0));
+    atomic_fetch_add(&G.validated, 1);
+    if (vr != 0) {
       damaged = true;
       cause = STORE_ATT_ERR_INVALID;
       why = "the image is not valid";
@@ -680,12 +799,10 @@ void db_store_attach_zone(const char *view, const char *zone) {
   pthread_mutex_unlock(&entry->writer_lock);
   ver = NULL;
   {
-    /* the directory must still offer the version that was read (a summary or a delete may have come meanwhile: the fetch path checks the same) */
-    int64_t sid;
-    uint32_t sr;
+    /* the directory must still offer the version that was read (a summary or a delete may have come meanwhile): checked in the commit, under the registry's lock, so
+     * that a summary cannot come between the check and the store (the fetch path is safe by name_in_flight(): the jobs of one name do not overlap) */
     bool shadowed = false;
-    if (!dbreg_zone_version(view, zone, &sid, &sr) || sid != ai.source_id || sr != ai.serial ||
-        dbreg_commit(view, zone, entry, true, ai.source_id, ai.serial, ai.digest_set ? ai.digest : sz.digest, &shadowed) != 0) {
+    if (dbreg_commit_attach(view, zone, entry, &ai, ai.digest_set ? ai.digest : sz.digest, &shadowed) != 0) {
       free_zone_db_entry(entry);                             /* never registered; its version (and the image) go with it */
       entry = NULL;
       atomic_fetch_add(&G.attach_stale, 1);
@@ -710,6 +827,8 @@ fail:
   if (damaged) {
     atomic_fetch_add(&G.attach_damaged, 1);
     syslog(LOG_WARNING, "[Store] the record of zone '%s' (view '%s') cannot be used (%s); the zone is read from the database again", zone, view, why);
+    db_store_invalidate(view, zone, ai.source_id, ai.serial);
+  } else if (stale) {
     db_store_invalidate(view, zone, ai.source_id, ai.serial);
   }
   logev_post(LOGC_DATABASE, 2, NULL, 0, "[Store] zone '%s' (view '%s') not attached from the store: %s; fetched from the database", zone, view, why);
@@ -848,7 +967,6 @@ bool db_store_start(const server_config_t *cfg) {
     (void)store_close(st);
     return false;
   }
-  G.paranoid = db->store_paranoid;
   atomic_store(&G.st, st);
   store_status_bind(st);
   dbreg_set_evict_hook(evict_hook);
@@ -885,8 +1003,16 @@ bool db_store_start(const server_config_t *cfg) {
   atomic_store(&G.attach_on, true);
   store_stats_t ss;
   store_stats(st, &ss);
-  syslog(LOG_NOTICE, "[Store] the zone store is on: %s mode, %llu zone(s) stored, %llu known, %d attach thread(s)%s%s", ss.mode == STORE_MODE_MAP ? "map" : "copy",
-         (unsigned long long)ss.zones_stored, (unsigned long long)ss.zones_known, G.nathr, ss.recovery.was_clean ? "" : ", the last stop was not clean", G.paranoid ? ", paranoid" : "");
+  syslog(LOG_NOTICE, "[Store] the zone store is on: %s mode, %llu zone(s) stored, %llu known, %d attach thread(s)%s", ss.mode == STORE_MODE_MAP ? "map" : "copy",
+         (unsigned long long)ss.zones_stored, (unsigned long long)ss.zones_known, G.nathr, ss.recovery.was_clean ? "" : ", the last stop was not clean");
+  if (ss.recovery.created) {
+    bool dflt = false;
+    struct stat dst;
+    const char *dpath = db_store_dir_of(&cfg->database, &dflt);
+    const unsigned dmode = fstat(g_dir.dirfd, &dst) == 0 ? (unsigned)(dst.st_mode & 0777) : 0;
+    syslog(LOG_NOTICE, "[Store] the zone store was created (first use) in %s%s: directory mode %04o (the user the server runs as), %s mode; it keeps a copy of the zone images of the database zones (about as much disk as the zones take in memory; it can be deleted while the server is stopped); `store none;` in the database block turns it off", dpath ? dpath : "?",
+           dflt ? " (the default directory)" : "", dmode, ss.mode == STORE_MODE_MAP ? "map" : "copy");
+  }
   return true;
 }
 
@@ -907,9 +1033,12 @@ void db_store_stop(void) {
   pthread_mutex_lock(&G.wlock);
   G.wstop = true;
   pthread_cond_broadcast(&G.wcv);
+  pthread_cond_broadcast(&G.wspace);
   pthread_mutex_unlock(&G.wlock);
   if (G.wthr_started) pthread_join(G.wthr, NULL);
   G.wthr_started = false;
-  (void)store_commit(st);
-  (void)store_checkpoint(st);
+  /* a clean stop: the flag says so on disk, so the next start does not log an unclean stop and (after a reboot) does not rebuild the tables.  The store stays open, as
+   * workers may still look; a write after this (a straggler) clears the flag again before it changes anything. */
+  int r = store_checkpoint_clean(st);
+  if (r < 0) syslog(LOG_WARNING, "[Store] the clean checkpoint at the stop failed: %s; the next start recovers from the journal", strerror(-r));
 }

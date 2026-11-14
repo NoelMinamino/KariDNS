@@ -1651,9 +1651,9 @@ Loading zone files and building zone images (\fB[Zone]\fR, \fB[ZoneLoader]\fR,
 \fB[Image]\fR, \fB[tinydns]\fR).
 .TP 8
 \fBdatabase\fR
-The database zones (\fB[DB]\fR), and the messages of \fBkaridns\-dbloader\fR
-(read from its standard error by the supervisor, see karidns-dbloader(8)
-MESSAGES).
+The database zones (\fB[DB]\fR) and the zone store (\fB[Store]\fR), and the
+messages of \fBkaridns\-dbloader\fR (read from its standard error by the
+supervisor, see karidns-dbloader(8) MESSAGES).
 .TP 8
 \fBrate\-limit\fR
 Response rate limiting (\fB[RRL]\fR).
@@ -3721,8 +3721,18 @@ component is made; owned by root or the user the server runs as; not writable by
 group or others; not locked by another server): otherwise the server \fBrefuses
 to start\fR. \fBstore none;\fR turns the store off. A relative path is taken
 from \fBoptions { directory }\fR. One store belongs to one server (a lock file
-inside it). \fBkaricheck conf\fR reports a directory whose parent does not
-exist.
+inside it). The packages and \fBmake install\fR make \fB/var/db/karidns\fR
+(root, 0755), so the store is on by default as soon as a \fBdatabase { }\fR
+block is configured; the first start that makes it logs a NOTICE (\fB[Store] the
+zone store was created (first use) in /var/db/karidns/store (the default
+directory): directory mode 0700 ... \fRstore none;\fB in the database block
+turns it off\fR). Disk use: the compact image of every installed zone (about a
+kilobyte for a small zone, about as much as the zones take in memory), 64 bytes
++ 64 bytes of tables for each zone, the index files (about 24 bytes a zone) and
+a journal of at most 64 MiB; \fBkarictl store\fR shows the figures. \fBkaricheck
+conf\fR reports a directory whose parent does not exist, and one that the start
+would refuse for its owner or mode (not root or the user of \fBoptions { user
+}\fR, writable by group or others).
 .TP 8
 \fBstore\-mode auto|map|copy;\fR
 \fIDefault:\fR \fBauto\fR
@@ -3739,12 +3749,10 @@ cache and in the ARC). \fBauto\fR looks at the file system.
 \fIDescription:\fR 0.7, restart-only: the threads that attach zones from the
 store. One more thread writes the zones to the store.
 .TP 8
-\fBstore\-paranoid yes|no;\fR
-\fIDefault:\fR \fBno\fR
+`store-paranoid yes
+\fIDefault:\fR no;`
 .br
-\fIDescription:\fR 0.7, restart-only: check the whole structure of every image
-that is read from the store (\fBzone_image_validate()\fR), not only the checksum
-of the record and the zone's name. Sanitizer builds always do.
+\fIDescription:\fR \fBno\fR
 .TP 8
 \fBwarm\-before\-serve <s>;\fR
 \fIDefault:\fR \fB0\fR (off)
@@ -4607,40 +4615,52 @@ store, and a zone the loader announces as changed (a summary after the first
 batch) loses its image there. What was written survives \fBkill \-9\fR (a
 journal is replayed at the next start) and is durable against power loss after
 the next commit (the end of a batch, at the latest after 100 ms; a checkpoint
-every 30 s). \fBAttach.\fR A query for a zone that is not in memory (not read
-yet since the start, or taken out by \fBmemory\-limit\fR) whose record in the
-store is the version the directory has (same serial, source id and, when the
+every 30 s). A normal stop ends with a clean checkpoint: the next start reports
+a clean store and reads no journal; after \fBkill \-9\fR the journal is replayed
+(and after a power loss or crash of the host the derived tables are rebuilt,
+\fBkarictl store\fR says so). The memory that queued writes hold (a version
+stays in memory until its copy is written) is bounded at 64 MiB; a first fill of
+a database bigger than \fBmemory\-limit\fR is held back by it (the loader waits
+for the writer). \fBAttach.\fR A query for a zone that is not in memory (not
+read yet since the start, or taken out by \fBmemory\-limit\fR) whose record in
+the store is the version the directory has (same serial, source id and, when the
 directory has one, digest) is \fBnot\fR read from the loader: the query is
-parked for at most 200 ms, a store thread reads the image (\fBmap\fR: a pointer
-into the mapped segment; \fBcopy\fR: a buffer), checks the record's checksum and
-that the image is the zone's, makes the zone's entry the way an install does and
-wakes the query. The answer is the one the zone read from the database gives,
-byte for byte. A record that is missing, stale (another serial), damaged
-(checksum, structure) or a zone that was changed meanwhile falls back to the
-read from the database: the queries that wait for it are given the
-\fBpark\-timeout\fR again, a damaged record is logged (\fB[Store] the record of
-zone ... cannot be used\fR) and set back to "known", and the next install writes
-it again. Taking a zone out of memory (\fBmemory\-limit\fR) is what it always
-was; the record stays, the next query attaches it again. The mapped bytes
-(\fBmap\fR) or the buffer (\fBcopy\fR) of an attached image count for
-\fBmemory\-limit\fR as the rest of the zone does, and are given back when the
-zone's version is freed; a mapped image stays mapped until the last reader of
-the version is gone. \fBRestart.\fR After a start the loader sends the directory
-(a summary of every zone with \fBmemory\-limit\fR, the zones themselves
-without): a zone whose record in the store is current is attached when asked
-for, not read from the database, also while the loader is slow or stopped. (The
-directory is still made from what the loader sends in this version; a start
-without the loader answers nothing yet.) The store belongs to the database it
-was filled from: a start with another \fBdatabase\-file\fR or conninfo for a
-view drops that view's zones from the store. A serial that did not change is
-trusted: a zone changed in the database \fBwithout\fR a new serial while the
-server was down is answered from the store until the loader announces the change
-(a reload, the change log); give such changes a new serial. \fBFiles and
-privileges.\fR The directory is opened by the process that starts the server (as
-root), checked (owner, mode, locked), handed to the user the server runs as and
-inherited by the Backend, which limits the rights of the descriptor (look up,
-create, read, write, mmap, fsync, truncate, stat, unlink) and opens the files
-beneath it, also in the sandbox. The loader and the routers never get it.
+parked, a store thread reads the image (\fBmap\fR: a pointer into the mapped
+segment; \fBcopy\fR: a buffer), checks the record's checksum, the whole
+structure of the image (\fBzone_image_validate()\fR, every time) and that the
+image is the zone's, makes the zone's entry the way an install does (only if the
+directory still offers the version that was read: a summary that came meanwhile
+wins) and wakes the query. The attach is given 200 ms; a query whose attach is
+still queued then (the store threads are behind slow reads), or whose zone is
+being fetched by the loader already, goes on waiting for the rest of its
+\fBpark\-timeout\fR and is not answered "not ready" earlier. The answer is the
+one the zone read from the database gives, byte for byte. A record that is
+missing, stale (another serial), damaged (checksum, structure) or a zone that
+was changed meanwhile falls back to the read from the database: the queries that
+wait for it are given the \fBpark\-timeout\fR again, a damaged record is logged
+(\fB[Store] the record of zone ... cannot be used\fR) and set back to "known"
+(so is a record of another version than the directory's: the next query fetches
+at once), and the next install writes it again. Taking a zone out of memory
+(\fBmemory\-limit\fR) is what it always was; the record stays, the next query
+attaches it again. The mapped bytes (\fBmap\fR) or the buffer (\fBcopy\fR) of an
+attached image count for \fBmemory\-limit\fR as the rest of the zone does, and
+are given back when the zone's version is freed; a mapped image stays mapped
+until the last reader of the version is gone. \fBRestart.\fR After a start the
+loader sends the directory (a summary of every zone with \fBmemory\-limit\fR,
+the zones themselves without): a zone whose record in the store is current is
+attached when asked for, not read from the database, also while the loader is
+slow or stopped. (The directory is still made from what the loader sends in this
+version; a start without the loader answers nothing yet.) The store belongs to
+the database it was filled from: a start with another \fBdatabase\-file\fR or
+conninfo for a view drops that view's zones from the store. A serial that did
+not change is trusted: a zone changed in the database \fBwithout\fR a new serial
+while the server was down is answered from the store until the loader announces
+the change (a reload, the change log); give such changes a new serial. \fBFiles
+and privileges.\fR The directory is opened by the process that starts the server
+(as root), checked (owner, mode, locked), handed to the user the server runs as
+and inherited by the Backend, which limits the rights of the descriptor (look
+up, create, read, write, mmap, fsync, truncate, stat, unlink) and opens the
+files beneath it, also in the sandbox. The loader and the routers never get it.
 .IP \(bu 2
 \fB\fBkarictl dbstatus\fB shows it.\fR \fBresidency: directory=N resident=N
 out_of_memory=N evictions=N\fR (the zones of the directory with and without

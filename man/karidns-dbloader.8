@@ -379,6 +379,97 @@ limit of a list is the one its first part says. The file is not trusted when it
 is read: it may be damaged, or written by somebody who could write in the
 directory; whatever its contents, the Backend reads only zones it has in its
 directory, at most 100000 of them, at the rate of \fBfetch\-rate\fR.
+.SH THE STORE PROTOCOL (0.7)
+With the zone store (0.7) the loader keeps no table of the zones it has sent:
+its resident size does not grow with the number of zones (measured on FreeBSD
+15.1 with SQLite3, first fill: 12.8 MB at 10,000 zones, 14.5 MB at 100,000, 14.6
+MB at 1,000,000; after a drain of every zone: 13.4, 15.4 and 15.3 MB; the
+libraries and the page cache of SQLite3 are in that). The loader offers itself
+in \fBHELLO\fR (tag 5, \fBfeatures\fR bit 0); the Backend that wants the
+protocol sets \fBstore_proto\fR in \fBCONFIG\fR (tag 10). The loader then sends
+no \fBINVENTORY_REQ\fR, the Backend no \fBINVENTORY\fR, and nobody waits for
+\fBINVENTORY_END\fR. Without the flag everything works as before (the inventory
+of the zones the Backend has, \fBBATCH_*\fR, \fBZONE_*\fR with bodies).
+.IP \(bu 2
+\fBState.\fR Per view the loader holds a \fIcursor\fR of the change log and the
+\fIidentity\fR of the database the cursor belongs to. The Backend keeps both in
+its store and sends them back in \fBCONFIG\fR (per view: \fBcursor\fR,
+\fBcursor_valid\fR, \fBdb_ident\fR); the loader looks at them once, at its first
+load of the view, and after that goes on from its own position (a later
+\fBCONFIG\fR does not move it back; a change of the sources of the configuration
+makes it look again). The identity is opaque to the Backend: for SQLite3 the
+device and inode of the file, for PostgreSQL the schema; a restored PostgreSQL
+database is seen by its change log (a cursor above the server's is a gap).
+.IP \(bu 2
+\fBA drain.\fR With a usable cursor the loader reads the change log from it in
+pages of 2,048 log rows (\fBchanges_page\fR) and sends \fBCHANGES\fR: one entry
+for each distinct domain, \fBupsert\fR (the domain exists, the view serves it,
+its type can be loaded: with the name, kind and the version \fIstamp\fR
+\fB(generation, changed_at)\fR of \fBkaridns_zone_state\fR) or \fBdelete\fR (the
+domain is gone, the view's mapping no longer gives it to the view, or its type
+can no longer be loaded: with the name when the loader still has it, else by
+\fBsource_id\fR alone). A rename is an upsert with the new name and the same
+id. Domains with ids close together are read with one statement, others with one
+statement each. The last \fBCHANGES\fR of a drain has \fBlast = 1\fR and the
+cursor to keep; the Backend makes it durable when it has recorded the
+entries. An empty drain sends nothing.
+.IP \(bu 2
+\fBA pass.\fR Without a usable cursor (first fill, the change log has a gap, the
+identity differs, the database file was replaced, \fBkarictl reload \-force\fR)
+the loader takes the cursor of the log, sends \fBMANIFEST_BEGIN\fR (an estimate
+of the count, the cursor, the identity), pages of at most 2,048 entries
+(\fBMANIFEST\fR: id, name, kind, stamp), \fBMANIFEST_END\fR (the counts,
+\fBcomplete = 1\fR), and then drains from the cursor it took before the pass, so
+that what changed during the pass arrives as \fBCHANGES\fR. A page is one short
+statement (keyset paging by \fBdomains.id\fR: no statement or snapshot is held
+between pages, the WAL of SQLite3 can be checkpointed); a database error ends
+the pass with \fBcomplete = 0\fR (the Backend must not sweep). Zones the loader
+cannot send (a type it does not load, a name that is not a domain name) are not
+listed and are counted in \fBn_skipped\fR. The loader does not decide what is
+deleted: the Backend sweeps the zones of the source that the pass did not list,
+and applies its mass-delete guard (20 percent and more than 1,000 zones) to the
+counts.
+.IP \(bu 2
+\fBBodies.\fR The loader sends no zone body in this protocol. The Backend asks
+for the bodies it lacks (a stamp it does not have) with \fBFETCH_REQ\fR on the
+fetch stream, by name and, with tag 8, by \fBsource_id\fR; a pool of workers
+reads and converts the zone as for any fetch. A name that has another id in the
+database now answers \fBZONE_FAILED\fR ("renamed or created again";
+\fBCHANGES\fR says so). The summary of a fetch (mode 1) looks up the addresses
+of out-of-zone name servers for the NOTIFY of that one zone by query at that
+time; the loader has no list of them.
+.IP \(bu 2
+\fBReload requests.\fR \fBreload\fR (scope all) drains the change log; \fBreload
+\-force\fR makes a pass. A reload of one zone is a \fBCHANGES\fR entry with the
+\fBforce\fR flag (read the body whatever the stamp says), a \fBZONE_FAILED\fR
+when the zone cannot be loaded, or a \fBZONE_DELETE\fR by name (source id 0)
+when the database has no such zone. With auto reload the polling, \fBLISTEN\fR
+and the coalescing are as before; a change starts a drain. With signer-wait a
+changed zone with the metadata \fBX\-KARIDNS\-SIGNER=1\fR is held back in an
+auto drain (not sent; \fBdbstatus\fR shows how many wait) and goes out with a
+reload of that zone, a reload of everything, or when it is not the signer's any
+more.
+.IP \(bu 2
+\fBSources without the version 3 tables.\fR A PowerDNS schema without
+\fBkaridns_zone_state\fR has no stamps: every detected change is a pass, built
+from the zone list of the database (the loader then keeps that list in memory,
+as it always did), with the SOA serial in each entry in place of the
+stamp. Without \fBkaridns_changes\fR (but with \fBkaridns_zone_state\fR) every
+change is a pass too, and above 100,000 zones the next pass is not made before
+ten times the duration of the last one. Both are logged as unsuited above
+100,000 zones: apply \fBdb/karidns_ext.*.sql\fR.
+.IP \(bu 2
+\fBNot in this version.\fR The verify pass (\fBKDB_MF_VERIFY\fR: a pass whose
+entries carry the digest of each zone, for the Backend to compare with the zone
+it holds) is defined in the protocol and its decoder; the loader does not make
+it yet.
+.PP
+The messages are in \fBdns_db_stream.h\fR (\fBMANIFEST_BEGIN\fR, \fBMANIFEST\fR,
+\fBMANIFEST_END\fR, \fBCHANGES\fR; the Backend's state machine accepts them in a
+batch and counts them in \fBBATCH_END\fR: zones = manifest entries and upserts,
+deleted = deletes). \fBtests/run_db_manifest_test.sh\fR and
+\fBtests/run_db_pg_manifest_test.sh\fR check the protocol and the memory with a
+stand-in for the Backend.
 .SH MESSAGES
 Run on its own (\fB\-\-dump\fR, \fB\-\-check\fR), the loader writes its messages
 to standard error, \fBkaridns\-dbloader: text\fR, as it always did (the dump

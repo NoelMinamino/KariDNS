@@ -1550,6 +1550,495 @@ static void test_views_full(void) {
 }
 
 /* ------------------------------------------------------------------------------------------------------------------ */
+/* the review of S1 + S2: hostile superblock and journal, visibility of a new record, reuse of a zone id, growth, clean stop  */
+/* ------------------------------------------------------------------------------------------------------------------ */
+
+/* the layout of the superblock (sb_t of dns_store.c): the offsets of the fields that a forged copy changes */
+enum {
+  SB_BYTES = 65536, SBO_SEQ = 16, SBO_CRC = 60, SBO_JRN_GEN = 96, SBO_IX_GEN = 100, SBO_NVIEWS = 108, SBO_ZT_CAP = 112, SBO_IX_SLOTS = 120,
+  SBO_SX_SLOTS = 128, SBO_SEG_SIZE = 136, SBO_NX_CAP = 144, SBO_RSV = 152, SBO_VIEWS = 208, SBO_SRC = 2256, SBO_V = 7376
+};
+/* counter slots (V_* of dns_store.c) */
+enum { VI_HWM = 0, VI_FREE_HEAD = 1, VI_FREE_COUNT = 2, VI_NX_USED = 3, VI_NSEGS = 9, VI_CUR_SEG = 10, VI_IMG_BYTES = 14, VI_SEG1_USED = 32 + 256 + 2048 + 2 };
+
+/* change `n` bytes at `off` of a superblock copy and make its CRC right again: a forged copy that the CRC does not catch */
+static void sb_forge(const char *path, size_t off, const void *val, size_t n) {
+  uint8_t *b = malloc(SB_BYTES);
+  if (!b || read_at(path, 0, b, SB_BYTES) != 0) { CHECK(0); free(b); return; }
+  memcpy(b + off, val, n);
+  memset(b + SBO_CRC, 0, 4);
+  uint32_t crc = store_test_crc32c(0, b, SB_BYTES);
+  memcpy(b + SBO_CRC, &crc, 4);
+  CHECK_EQ(write_at(path, 0, b, SB_BYTES), 0);
+  free(b);
+}
+static void sb_forge_u64(const char *path, size_t off, uint64_t v) { sb_forge(path, off, &v, 8); }
+static void sb_forge_u32(const char *path, size_t off, uint32_t v) { sb_forge(path, off, &v, 4); }
+
+/* M2: a field of the superblock that is used as a size, a count or an index is bounded before it is used.  A copy that is wrong that way is not taken (the other
+ * copy is, and the journal chain that goes with it); both wrong: -EBADMSG (the caller quarantines).  ASan has to stay quiet. */
+static void test_forged_superblock(void) {
+  printf("[forged superblock copies (CRC right, a field wrong)]\n");
+  struct { const char *what; size_t off; uint64_t val; int n; } cases[] = {
+    { "ix slots 2^62", SBO_IX_SLOTS, 1ull << 62, 8 },
+    { "ix slots 2^61 (the size computation wraps to 0)", SBO_IX_SLOTS, 1ull << 61, 8 },
+    { "ix slots 2^61 + 1 (wraps to 8)", SBO_IX_SLOTS, (1ull << 61) + 1, 8 },
+    { "sx slots all ones", SBO_SX_SLOTS, ~0ull, 8 },
+    { "sx slots 0", SBO_SX_SLOTS, 0, 8 },
+    { "ix generation 0", SBO_IX_GEN, 0, 4 },
+    { "journal generation 0", SBO_JRN_GEN, 0, 4 },
+    { "segment size 0", SBO_SEG_SIZE, 0, 8 },
+    { "segment size 2^60", SBO_SEG_SIZE, 1ull << 60, 8 },
+    { "zt capacity 2^60", SBO_ZT_CAP, 1ull << 60, 8 },
+    { "nx capacity all ones", SBO_NX_CAP, ~0ull, 8 },
+    { "views count 33", SBO_NVIEWS, 33, 4 },
+    { "identity length 4 GiB", SBO_SRC + 3 * 80 + 12, 0xffffffffu, 4 },
+    { "current segment 2^31", SBO_V + 8 * VI_CUR_SEG, 0x7fffffffull, 8 },
+    { "segment count 5000", SBO_V + 8 * VI_NSEGS, 5000, 8 },
+    { "segment 1 used 2^60", SBO_V + 8 * VI_SEG1_USED, 1ull << 60, 8 },
+    { "high-water mark beyond the table", SBO_V + 8 * VI_HWM, 1ull << 40, 8 },
+    { "free list head beyond the table", SBO_V + 8 * VI_FREE_HEAD, 0x12345678ull, 8 },
+    { "name bytes used 2^45", SBO_V + 8 * VI_NX_USED, 1ull << 45, 8 },
+    { "a counter of 2^64 - 1", SBO_V + 8 * VI_IMG_BYTES, ~0ull, 8 },
+  };
+  for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    tdir_t d;
+    tdir_new(&d, "forge");
+    store_opts_t o;
+    small_opts(&o);
+    store_t *s = NULL;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (!s) { tdir_free(&d); continue; }
+    store_view_add(s, "default");
+    for (uint32_t i = 0; i < 50; i++) put_i(s, 0, i, 1, NULL);
+    CHECK_EQ(store_set_cursor(s, 3, 9, "ident", 5), 0);
+    CHECK_EQ(store_close(s), 0);
+    char pa[700], pb[700];
+    fpath(&d, "super.a", pa, sizeof(pa));
+    fpath(&d, "super.b", pb, sizeof(pb));
+    uint64_t sa = 0, sbq = 0;
+    CHECK_EQ(read_u64_at(pa, SBO_SEQ, &sa), 0);
+    CHECK_EQ(read_u64_at(pb, SBO_SEQ, &sbq), 0);
+    const char *newer = sa > sbq ? pa : pb;
+    if (cases[c].n == 4) sb_forge_u32(newer, cases[c].off, (uint32_t)cases[c].val); else sb_forge_u64(newer, cases[c].off, cases[c].val);
+    o.create = false;
+    int r = store_open(d.fd, &o, &s);
+    if (r != 0 || !s) {
+      printf("  [FAIL] %s: the older copy was not taken (open %d)\n", cases[c].what, r);
+      g_failed++;
+    } else {
+      store_stats_t st;
+      store_stats(s, &st);
+      if (!st.recovery.used_older_super) { printf("  [FAIL] %s: the forged copy was taken\n", cases[c].what); g_failed++; }
+      CHECK_EQ(st.zones_stored, 50);
+      CHECK(verify_i(s, 0, 49, 1));
+      bool valid;
+      uint64_t cv;
+      uint8_t id[STORE_IDENT_MAX];
+      size_t il;
+      CHECK_EQ(store_get_cursor(s, 3, &valid, &cv, id, &il), 0);
+      CHECK(valid && cv == 9 && il == 5);
+      check_consistent(s, cases[c].what);
+      CHECK_EQ(put_i(s, 0, 500, 1, NULL), 0);
+      CHECK_EQ(store_close(s), 0);
+    }
+    /* both copies the same wrong: nothing to open */
+    for (int k = 0; k < 2; k++) {
+      const char *p = k ? pb : pa;
+      if (cases[c].n == 4) sb_forge_u32(p, cases[c].off, (uint32_t)cases[c].val); else sb_forge_u64(p, cases[c].off, cases[c].val);
+    }
+    s = NULL;
+    CHECK_EQ(store_open(d.fd, &o, &s), -EBADMSG);
+    CHECK(s == NULL);
+    tdir_free(&d);
+  }
+  /* the name of a view without its terminating zero (a forged copy; the older one has it) */
+  {
+    tdir_t d;
+    tdir_new(&d, "forge");
+    store_opts_t o;
+    small_opts(&o);
+    store_t *s = NULL;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    store_view_add(s, "default");
+    CHECK_EQ(put_i(s, 0, 1, 1, NULL), 0);
+    CHECK_EQ(store_close(s), 0);
+    char pa[700], pb[700];
+    fpath(&d, "super.a", pa, sizeof(pa));
+    fpath(&d, "super.b", pb, sizeof(pb));
+    uint64_t sa = 0, sbq = 0;
+    CHECK_EQ(read_u64_at(pa, SBO_SEQ, &sa), 0);
+    CHECK_EQ(read_u64_at(pb, SBO_SEQ, &sbq), 0);
+    uint8_t name[64];
+    memset(name, 'A', sizeof(name));
+    sb_forge(sa > sbq ? pa : pb, SBO_VIEWS, name, sizeof(name));
+    o.create = false;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (s) {
+      store_stats_t st;
+      store_stats(s, &st);
+      CHECK(st.recovery.used_older_super);
+      CHECK_EQ(strlen(st.views[0].name), 7);
+      CHECK_EQ(store_close(s), 0);
+    }
+    tdir_free(&d);
+  }
+  /* the control: a field that nothing reads (the reserved words) forged the same way is no reason to refuse the copy */
+  {
+    tdir_t d;
+    tdir_new(&d, "forge");
+    store_opts_t o;
+    small_opts(&o);
+    store_t *s = NULL;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    CHECK_EQ(store_close(s), 0);
+    char pa[700], pb[700];
+    fpath(&d, "super.a", pa, sizeof(pa));
+    fpath(&d, "super.b", pb, sizeof(pb));
+    sb_forge_u64(pa, SBO_RSV, 5);
+    sb_forge_u64(pb, SBO_RSV, 5);
+    o.create = false;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (s) CHECK_EQ(store_close(s), 0);
+    tdir_free(&d);
+  }
+}
+
+/* a journal record that the CRC passes: ops are built by hand */
+typedef struct { uint8_t b[2048]; size_t n; uint32_t nops; } fj_t;
+static void fj_op(fj_t *j, uint16_t type, const void *pay, size_t pl) {
+  size_t padded = (pl + 7) & ~(size_t)7;
+  memset(j->b + j->n, 0, 8 + padded);
+  memcpy(j->b + j->n, &type, 2);
+  uint32_t l = (uint32_t)padded;
+  memcpy(j->b + j->n + 4, &l, 4);
+  memcpy(j->b + j->n + 8, pay, pl);
+  j->n += 8 + padded;
+  j->nops++;
+}
+static void fj_v(fj_t *j, uint32_t fid, uint64_t val) {
+  uint8_t p[24];
+  memset(p, 0, sizeof(p));
+  uint32_t n = 1;
+  memcpy(p, &n, 4);
+  memcpy(p + 8, &fid, 4);
+  memcpy(p + 16, &val, 8);
+  fj_op(j, 5, p, sizeof(p));
+}
+/* append the record (24 byte header + ops) to the journal file `path` as the record with sequence number lsn */
+static void fj_append(const char *path, fj_t *j, uint64_t lsn) {
+  uint8_t *rec = malloc(24 + j->n);
+  if (!rec) { CHECK(0); return; }
+  uint32_t magic = 0x4a52454bu, len = (uint32_t)(24 + j->n), crc = 0, nops = j->nops;
+  memcpy(rec, &magic, 4);
+  memcpy(rec + 4, &len, 4);
+  memcpy(rec + 8, &crc, 4);
+  memcpy(rec + 12, &nops, 4);
+  memcpy(rec + 16, &lsn, 8);
+  memcpy(rec + 24, j->b, j->n);
+  crc = store_test_crc32c(0, rec, len);
+  memcpy(rec + 8, &crc, 4);
+  struct stat st;
+  if (stat(path, &st) != 0) { CHECK(0); free(rec); return; }
+  CHECK_EQ(write_at(path, st.st_size, rec, len), 0);
+  free(rec);
+}
+
+/* M2: journal records that carry values which are used as indexes or sizes; the record is valid (CRC, sequence), its content is not.  The replay refuses the values,
+ * asks for the rebuild, and the store goes on as it was. */
+static void test_forged_journal(void) {
+  printf("[forged journal records]\n");
+  struct { const char *what; int kind; } cases[] = {
+    { "current segment", 0 }, { "segment used", 1 }, { "generation switch with 2^62 slots", 2 }, { "generation switch to a file that is not there", 3 },
+    { "a view id of 77", 4 }, { "a source of 99 and an identity of 200 bytes", 5 }, { "free list head, high-water mark, segment count", 6 } };
+  for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    tdir_t d;
+    tdir_new(&d, "forgej");
+    store_opts_t o;
+    small_opts(&o);
+    store_t *s = NULL;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (!s) { tdir_free(&d); continue; }
+    store_view_add(s, "default");
+    for (uint32_t i = 0; i < 20; i++) put_i(s, 0, i, 1, NULL);
+    store_stats_t st0;
+    store_stats(s, &st0);
+    CHECK_EQ(store_close(s), 0);
+    char jp[700];
+    uint32_t best = 0;
+    for (uint32_t g = 1; g < 100; g++) { struct stat sb; snprintf(jp, sizeof(jp), "%s/jrn.%u", d.path, g); if (stat(jp, &sb) == 0) best = g; }
+    snprintf(jp, sizeof(jp), "%s/jrn.%u", d.path, best);
+    fj_t j;
+    memset(&j, 0, sizeof(j));
+    switch (cases[c].kind) {
+    case 0: fj_v(&j, VI_CUR_SEG, 99999); break;
+    case 1: fj_v(&j, VI_SEG1_USED, 1ull << 60); break;
+    case 2: { uint8_t p[16]; uint32_t w = 0, g = 7; uint64_t ns = 1ull << 62; memcpy(p, &w, 4); memcpy(p + 4, &g, 4); memcpy(p + 8, &ns, 8); fj_op(&j, 8, p, 16); break; }
+    case 3: { uint8_t p[16]; uint32_t w = 1, g = 9; uint64_t ns = 4096; memcpy(p, &w, 4); memcpy(p + 4, &g, 4); memcpy(p + 8, &ns, 8); fj_op(&j, 8, p, 16); break; }
+    case 4: { uint8_t p[8 + 64]; memset(p, 0, sizeof(p)); uint32_t id = 77; memcpy(p, &id, 4); memcpy(p + 8, "evil", 4); fj_op(&j, 6, p, sizeof(p)); break; }
+    case 5: { uint8_t p[24 + 64]; memset(p, 0xaa, sizeof(p)); uint32_t src = 99, valid = 1, il = 200; uint64_t cur = 5; memcpy(p, &src, 4); memcpy(p + 4, &valid, 4); memcpy(p + 8, &cur, 8); memcpy(p + 16, &il, 4); fj_op(&j, 7, p, sizeof(p)); break; }
+    case 6: fj_v(&j, VI_FREE_HEAD, 0x7ffffff0ull); fj_v(&j, VI_HWM, 1ull << 40); fj_v(&j, VI_NSEGS, 4000); break;
+    }
+    fj_append(jp, &j, st0.lsn + 1);
+    o.create = false;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (s) {
+      store_stats_t st;
+      store_stats(s, &st);
+      CHECK_EQ(st.recovery.records_replayed, 1);
+      CHECK(st.recovery.rebuilt);                                        /* (the values were refused: the open asked for the rebuild) */
+      CHECK_EQ(st.zones_stored, 20);
+      CHECK(st.seg_count <= 4);
+      CHECK_EQ(st.nviews, 1);
+      CHECK(verify_i(s, 0, 19, 1));
+      check_consistent(s, cases[c].what);
+      CHECK_EQ(put_i(s, 0, 200, 1, NULL), 0);
+      CHECK(verify_i(s, 0, 200, 1));
+      CHECK_EQ(store_close(s), 0);
+    }
+    tdir_free(&d);
+  }
+}
+
+/* L5: the head of the free list names a zone that is alive (a forged counter array, CRC right): it is not taken for a free cell, the list is dropped */
+static void test_free_list_head(void) {
+  printf("[a free list head that is not a free cell]\n");
+  tdir_t d;
+  tdir_new(&d, "freehead");
+  store_opts_t o;
+  small_opts(&o);
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  for (uint32_t i = 0; i < 30; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  uint32_t live = find_i(s, 0, 5);
+  CHECK(live != STORE_NONE);
+  CHECK_EQ(store_close(s), 0);
+  char pa[700], pb[700];
+  fpath(&d, "super.a", pa, sizeof(pa));
+  fpath(&d, "super.b", pb, sizeof(pb));
+  for (int k = 0; k < 2; k++) {
+    sb_forge_u64(k ? pb : pa, SBO_V + 8 * VI_FREE_HEAD, live);
+    sb_forge_u64(k ? pb : pa, SBO_V + 8 * VI_FREE_COUNT, 3);
+  }
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    uint32_t z = STORE_NONE;
+    CHECK_EQ(put_i(s, 0, 100, 1, &z), 0);
+    CHECK(z != live);                                                    /* (it was taken for a free cell and overwritten before) */
+    CHECK(verify_i(s, 0, 5, 1));
+    CHECK(verify_i(s, 0, 100, 1));
+    store_stats_t st;
+    store_stats(s, &st);
+    CHECK_EQ(st.zones_free, 0);
+    CHECK_EQ(st.zones_stored, 31);
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
+/* L1: a reader that finds a zone sees its image, also in the moment before the counters of the record are applied (a new segment, the used bytes of the segment) */
+static store_t *g_vis_store;
+static uint32_t g_vis_i;
+static int g_vis_calls, g_vis_bad;
+static void vis_hook(store_t *s) {
+  if (s != g_vis_store || g_vis_i == UINT32_MAX) return;
+  char nm[160];
+  name_of(g_vis_i, nm, sizeof(nm));
+  g_vis_calls++;
+  store_read_lock();
+  uint32_t z = store_find(s, 0, nm, strlen(nm));
+  store_img_t im;
+  store_zone_t zi;
+  if (z == STORE_NONE || store_zone_get(s, z, &zi) != 0 || store_image_read(s, z, &im) != 0) {
+    g_vis_bad++;
+  } else {
+    uint64_t v;
+    if (!img_ok(im.data, im.len, g_vis_i, &v)) g_vis_bad++;
+    store_img_release(s, &im);
+  }
+  store_read_unlock();
+}
+static void test_visibility(void) {
+  printf("[a new record is readable before its counters are applied]\n");
+  for (int mode = STORE_MODE_MAP; mode <= STORE_MODE_COPY; mode++) {
+    tdir_t d;
+    tdir_new(&d, "vis");
+    store_opts_t o;
+    small_opts(&o);
+    o.mode = mode;
+    o.seg_size = 65536;                                                  /* (a new segment every ~90 records) */
+    store_t *s = NULL;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (!s) { tdir_free(&d); continue; }
+    store_view_add(s, "default");
+    g_vis_store = s;
+    g_vis_calls = g_vis_bad = 0;
+    store_test_before_counters = vis_hook;
+    for (uint32_t i = 0; i < 400; i++) {
+      g_vis_i = i;
+      CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+      g_vis_i = UINT32_MAX;
+    }
+    store_test_before_counters = NULL;
+    store_stats_t st;
+    store_stats(s, &st);
+    CHECK(st.seg_count >= 4);
+    CHECK_EQ(g_vis_calls, 400);
+    CHECK_EQ(g_vis_bad, 0);
+    CHECK_EQ(store_close(s), 0);
+    tdir_free(&d);
+  }
+}
+
+/* L6: a zone id that a delete frees is not reused while a reader that could have found the zone is still in its read section */
+static void test_reuse_after_grace(void) {
+  printf("[a zone id is reused after the grace period]\n");
+  tdir_t d;
+  tdir_new(&d, "reuse");
+  store_opts_t o;
+  small_opts(&o);
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  for (uint32_t i = 0; i < 10; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  uint32_t a = find_i(s, 0, 4);
+  /* no reader: the next zone takes the cell at once */
+  CHECK_EQ(store_delete(s, a), 0);
+  uint32_t z0 = STORE_NONE;
+  CHECK_EQ(put_i(s, 0, 20, 1, &z0), 0);
+  CHECK_EQ(z0, a);
+  /* a reader in its section: the cell stays out of reach until it is done */
+  store_read_lock();
+  CHECK_EQ(store_delete(s, z0), 0);
+  uint32_t z1 = STORE_NONE, z2 = STORE_NONE;
+  CHECK_EQ(put_i(s, 0, 21, 1, &z1), 0);
+  CHECK(z1 != z0);
+  CHECK_EQ(put_i(s, 0, 22, 1, &z2), 0);
+  CHECK(z2 != z0 && z2 != z1);
+  store_read_unlock();
+  uint32_t z3 = STORE_NONE;
+  CHECK_EQ(put_i(s, 0, 23, 1, &z3), 0);
+  CHECK_EQ(z3, z0);                                                      /* the reader is gone: the cell is free to use */
+  check_consistent(s, "reuse");
+  CHECK(verify_i(s, 0, 21, 1) && verify_i(s, 0, 22, 1) && verify_i(s, 0, 23, 1));
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
+/* L4: the sync after the journal record of a generation switch fails: the journal names the new generation, so the live index is the new one too (and a replay of
+ * what was left gives the same store) */
+static void test_growth_sync_fails(void) {
+  printf("[an index growth whose sync fails]\n");
+  tdir_t d;
+  tdir_new(&d, "growfail");
+  store_opts_t o;
+  small_opts(&o);
+  o.sync_policy = STORE_SYNC_NONE;
+  o.checkpoint_interval_ms = UINT32_MAX;
+  int pfd[2];
+  CHECK_EQ(pipe(pfd), 0);
+  fflush(stdout);
+  pid_t pid = fork();
+  if (pid == 0) {
+    store_t *c = NULL;
+    if (store_open(d.fd, &o, &c) != 0) _exit(2);
+    store_view_add(c, "default");
+    int rc = 0;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < 5000; i++) {
+      store_test_fail_commit = 1;
+      rc = put_i(c, 0, i, 1, NULL);
+      store_test_fail_commit = 0;
+      if (rc != 0) break;
+      n++;
+    }
+    store_stats_t st;
+    store_stats(c, &st);
+    uint64_t out[4] = { (uint64_t)(int64_t)rc, st.ix_gen, st.zones_stored, n };
+    if (write(pfd[1], out, sizeof(out)) != (ssize_t)sizeof(out)) _exit(3);
+    _exit(0);                                                            /* no close: what the journal holds is what the next open has */
+  }
+  int stt = 0;
+  waitpid(pid, &stt, 0);
+  CHECK(WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
+  uint64_t got[4] = { 0, 0, 0, 0 };
+  CHECK(read(pfd[0], got, sizeof(got)) == (ssize_t)sizeof(got));
+  close(pfd[0]);
+  close(pfd[1]);
+  CHECK_EQ((int64_t)got[0], -EIO);                                       /* (the put that wanted room was refused) */
+  CHECK(got[1] >= 2);                                                    /* (... and the live index is the new generation) */
+  o.create = false;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats_t st;
+    store_stats(s, &st);
+    CHECK_EQ(st.ix_gen, got[1]);                                         /* the journal and the memory of the process that was killed name the same generation */
+    CHECK_EQ(st.zones_stored, got[2]);
+    CHECK(!st.recovery.rebuilt);
+    check_consistent(s, "growth sync");
+    for (uint32_t i = 0; i < got[3]; i += 97) CHECK(verify_i(s, 0, i, 1));
+    CHECK_EQ(put_i(s, 0, 9000, 1, NULL), 0);
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
+/* M4: a clean checkpoint says "clean" on disk without closing the store: the next open reads no journal and, after a reboot, does not rebuild; a change after it clears the
+ * flag first (so the next open after a reboot rebuilds, as after any unclean stop) */
+static void test_clean_checkpoint(void) {
+  printf("[a clean checkpoint without close]\n");
+  tdir_t d;
+  tdir_new(&d, "clean");
+  store_opts_t o;
+  small_opts(&o);
+  for (int round = 0; round < 2; round++) {
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+      store_opts_t c = o;
+      store_t *x = NULL;
+      if (store_open(d.fd, &c, &x) != 0) _exit(2);
+      if (round == 0) {
+        store_view_add(x, "default");
+        for (uint32_t i = 0; i < 100; i++) if (put_i(x, 0, i, 1, NULL) != 0) _exit(3);
+      }
+      if (store_checkpoint_clean(x) != 0) _exit(4);
+      if (round == 1 && put_i(x, 0, 500, 1, NULL) != 0) _exit(5);       /* a straggler after the clean checkpoint */
+      _exit(0);
+    }
+    int stt = 0;
+    waitpid(pid, &stt, 0);
+    CHECK(WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
+    o.create = false;
+    o.boot_id = 100 + (uint64_t)round;                                   /* (the host was rebooted) */
+    store_t *s = NULL;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (!s) continue;
+    store_stats_t st;
+    store_stats(s, &st);
+    if (round == 0) {
+      CHECK(st.recovery.was_clean);                                      /* the stop that did not close is clean */
+      CHECK_EQ(st.recovery.records_replayed, 0);
+      CHECK(!st.recovery.rebuilt);
+      CHECK_EQ(st.zones_stored, 100);
+    } else {
+      CHECK(!st.recovery.was_clean);                                     /* the put after the checkpoint cleared the flag: unclean, another boot: the tables are rebuilt */
+      CHECK(st.recovery.rebuilt);
+      CHECK_EQ(st.zones_stored, 101);
+      CHECK(verify_i(s, 0, 500, 1));
+    }
+    check_consistent(s, "clean checkpoint");
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
+/* ------------------------------------------------------------------------------------------------------------------ */
 
 int main(void) {
   const char *base = getenv("KARIDNS_STORE_TESTDIR");
@@ -1581,6 +2070,11 @@ int main(void) {
   if (WANT("damage")) test_damage_cells();
   if (WANT("repair")) test_repair();
   if (WANT("super")) test_superblock_damage();
+  if (WANT("forge")) { test_forged_superblock(); test_forged_journal(); test_free_list_head(); }
+  if (WANT("vis")) test_visibility();
+  if (WANT("reuse")) test_reuse_after_grace();
+  if (WANT("growfail")) test_growth_sync_fails();
+  if (WANT("cleanck")) test_clean_checkpoint();
   if (WANT("full")) test_disk_full();
   if (WANT("kill")) test_kill_loop(iters);
   if (WANT("conc")) { test_concurrent(STORE_MODE_MAP); test_concurrent(STORE_MODE_COPY); }

@@ -296,6 +296,9 @@ int  store_tick(store_t *s);
 /* flush the files, write the other superblock copy with the checkpoint LSN, start a new journal, remove what no superblock
  * names any more (design 3.4 with a journal) */
 int  store_checkpoint(store_t *s);
+/* The same, with the clean flag: what store_close() does, but the store stays open and usable (a server that stops while its workers may still look).  The next
+ * writer call clears the flag again, durably, before it changes anything. */
+int  store_checkpoint_clean(store_t *s);
 /* Rebuild the derived tables (ix, sx, free list, counters, live bytes) from one sequential pass over zt and drop cells that are
  * damaged (CRC, impossible fields, an image location outside its segment) or duplicate a name or a source key, then checkpoint.
  * Heavy (O(zones), blocks the writer; readers continue on the old tables).  This is what the open does after a power loss,
@@ -318,6 +321,10 @@ int  store_check(store_t *s, store_check_report_t *rep);
 #ifdef KARIDNS_UNIT_TEST
 /* SIGKILL the process at the n-th crash point (0 = off); the points lie between every step of a write sequence */
 extern long store_test_crash_countdown;
+/* called by the writer between the ops of a journal record that publish a zone (cells, indexes) and the counters op of the same record: the window in which a reader can see a new zone before the counters of its segment (0 = off) */
+extern void (*store_test_before_counters)(store_t *s);
+/* commit_locked() fails with -EIO at the n-th call (0 = off): a failed fdatasync */
+extern long store_test_fail_commit;
 uint64_t store_test_siphash(unsigned c, unsigned d, const uint8_t key[16], const uint8_t *in, size_t len);
 uint32_t store_test_crc32c(uint32_t crc, const void *p, size_t n);
 uint64_t store_test_sum64(const void *p, size_t n);

@@ -53,6 +53,12 @@ int exec_file_exec_fd(int fd, const char *path, char *const argv[], char *const 
  * the user's primary group) being 0.  NULL names are skipped; a name that does not exist is not an error here (the callers say so).
  * Used for user / group, loader-user / loader-group and program-user, by karidns (start, reload) and karicheck. */
 bool identity_names_root(const char *user, const char *group, char *err, size_t errlen);
+/* The owner / mode rules of the directory of the zone store, in one place for karidns (db_store_frontend_open(), on the opened directory) and karicheck (an explicit
+ * `store "<dir>";`, on stat()).  privileged: the server is started by root (it hands the directory to run_uid, (uid_t)-1 = none): the directory belongs to root or to run_uid and
+ * group and others cannot write in it.  Not privileged: it belongs to `self`.  Mode bits beyond that are the server's to set (0700), not an error.  false: why says why (no
+ * leading path, no stop). */
+struct stat;
+bool store_dir_owner_ok(const struct stat *st, bool privileged, uid_t run_uid, uid_t self, char *why, size_t whylen);
 /* The descriptors (SCM_RIGHTS) of a received message: the first `cap` of them go to out[] (out may be NULL with cap 0), every other one
  * is closed, so that a peer cannot leave descriptors behind in the receiver (a CMSG_SPACE() buffer is rounded up and holds more than it
  * was sized for).  Never reads past msg_controllen: a kernel that shortens a cut message may leave cmsg_len as it was.  Returns the count

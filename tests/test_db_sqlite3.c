@@ -3677,6 +3677,438 @@ static void test_fetch_keep(void) {
     (void)err;
 }
 
+/* ---------------------------------------------------------------- the store protocol of the loader (0.7 WP7a) */
+typedef struct {
+    int bb, mb, mp, me, ch, zd, zf;
+    uint64_t entries, ups, dels, skipped;
+    bool complete, last, bad;
+    uint64_t me_cursor, mb_cursor, ch_cursor;
+    uint32_t mb_flags;
+    char first_name[64];
+} sc_t;
+
+/* what the Backend would see: the loader's messages through the state machine of the Backend */
+static void sc_read(int fd, kdb_framer_t *f, kdb_sm_t *sm, sc_t *c) {
+    uint8_t buf[65536];
+    for (;;) {
+        ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n <= 0) break;
+        if (kdb_framer_feed(f, buf, (size_t)n) != KDB_OK) {
+            c->bad = true;
+            return;
+        }
+        kdb_frame_t fr;
+        while (kdb_framer_next(f, &fr) == KDB_OK) {
+            kdb_msg_t m;
+            if (kdb_sm_accept(sm, &fr, &m) != KDB_OK) {
+                printf("    the state machine says: %s\n", sm->reason);
+                c->bad = true;
+                return;
+            }
+            switch (m.type) {
+            case KDB_T_BATCH_BEGIN: c->bb++; break;
+            case KDB_T_MANIFEST_BEGIN: c->mb++; c->mb_cursor = m.u.manifest_begin.cursor; c->mb_flags = m.u.manifest_begin.flags; break;
+            case KDB_T_MANIFEST: {
+                kdb_iter_t it;
+                kdb_manifest_entry_t e;
+                c->mp++;
+                c->entries += m.u.manifest.n_entries;
+                kdb_manifest_entries(&m, &it);
+                if (kdb_manifest_entries_next(&it, &e) && !c->first_name[0]) snprintf(c->first_name, sizeof(c->first_name), "%s", e.name);
+                break;
+            }
+            case KDB_T_MANIFEST_END:
+                c->me++;
+                c->complete = m.u.manifest_end.complete;
+                c->me_cursor = m.u.manifest_end.cursor;
+                c->skipped = m.u.manifest_end.n_skipped;
+                break;
+            case KDB_T_CHANGES: {
+                kdb_iter_t it;
+                kdb_changes_entry_t e;
+                c->ch++;
+                c->last = m.u.changes.last;
+                c->ch_cursor = m.u.changes.cursor;
+                kdb_changes_entries(&m, &it);
+                while (kdb_changes_entries_next(&it, &e)) {
+                    if (e.op == KDB_CH_UPSERT) c->ups++;
+                    else c->dels++;
+                }
+                break;
+            }
+            case KDB_T_ZONE_DELETE: c->zd++; break;
+            case KDB_T_ZONE_FAILED: c->zf++; break;
+            default: break;
+            }
+        }
+    }
+}
+
+static int g_sf_manifest, g_sf_gap, g_sf_chg, g_sf_cursor, g_sf_count, g_sf_schema;
+static int sf_manifest_page(db_conn_t *c, int64_t after, unsigned limit, db_manifest_cb cb, void *ud, int64_t *last, unsigned *n) {
+    if (g_sf_manifest > 0 && --g_sf_manifest == 0) {
+        *last = after;
+        *n = 0;
+        return -1;
+    }
+    return db_driver_sqlite3.manifest_page(c, after, limit, cb, ud, last, n);
+}
+static int sf_changes_page(db_conn_t *c, db_change_pos_t *pos, unsigned limit, db_change_entry_cb cb, void *ud, bool *more, bool *gap) {
+    if (g_sf_chg > 0 && --g_sf_chg == 0) return -1;
+    if (g_sf_gap > 0 && --g_sf_gap == 0) {
+        *more = false;
+        *gap = true;
+        return 0;
+    }
+    return db_driver_sqlite3.changes_page(c, pos, limit, cb, ud, more, gap);
+}
+static int sf_current_cursor(db_conn_t *c, uint64_t *cur) {
+    if (g_sf_cursor > 0 && --g_sf_cursor == 0) return -1;
+    return db_driver_sqlite3.current_cursor(c, cur);
+}
+static int sf_count(db_conn_t *c, const char *view, uint64_t *n) {
+    if (g_sf_count > 0 && --g_sf_count == 0) return -1;
+    return db_driver_sqlite3.count_domains(c, view, n);
+}
+static int sf_check_schema(db_conn_t *c, db_schema_info_t *si) {
+    if (g_sf_schema > 0 && --g_sf_schema == 0) return -1;
+    return db_driver_sqlite3.check_schema(c, si);
+}
+
+static void test_store_loader(void) {
+    printf("the store protocol of the loader (0.7 WP7a): a pass, a drain, the gap, the identity, signer-wait, the plain schema\n");
+    signal(SIGPIPE, SIG_IGN);
+    char path[600];
+    sqlite3 *db = make_db("sl.db", path, sizeof(path));
+    char *ext = slurp(g_ext_path);
+    CHECK(ext != NULL);
+    if (!db || !ext) return;
+    raw_exec(db, ext);
+    free(ext);
+    add_simple_zone(db, 1, 10, "a.test");
+    add_simple_zone(db, 2, 20, "b.test");
+    add_simple_zone(db, 3, 30, "c.test");
+    add_zone(db, 4, "p.test", "PRODUCER");
+    add_zone(db, 5, "s.test", "SLAVE");
+    raw_exec(db, "INSERT INTO karidns_domain_views (domain_id, view_name) VALUES (2, 'other'), (3, 'beta'), (3, 'gamma')");
+
+    db_driver_t sd = db_driver_sqlite3;
+    sd.manifest_page = sf_manifest_page;
+    sd.changes_page = sf_changes_page;
+    sd.current_cursor = sf_current_cursor;
+    sd.count_domains = sf_count;
+    sd.check_schema = sf_check_schema;
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    struct lio *io = calloc(1, sizeof(*io));
+    CHECK(io != NULL);
+    if (!io) return;
+    io->fd = sv[0];
+    io->cfg.signer_wait = true;
+    io->cfg.store_proto = true;
+    io->cfg.nviews = 2;
+    io->cfg.views = calloc(2, sizeof(lview_t));
+    io->cfg.views[0].index = 0;
+    io->cfg.views[0].name = strdup("beta");
+    io->cfg.views[0].shared = true;
+    io->cfg.views[1].index = 1;
+    io->cfg.views[1].name = strdup("gamma");
+    io->cfg.views[1].shared = true;
+    int slot = vslot_get(io, "beta");
+    CHECK(slot == 0);
+    ctx_t x;
+    memset(&x, 0, sizeof(x));
+    x.io = io;
+    x.drv = &sd;
+    x.nthreads = 1;
+    x.batch_id = 1;
+    x.batch_kind = KDB_BATCH_STARTUP;
+    x.vslot = (uint16_t)slot;
+    x.map_view = "beta";
+    x.store_proto = true;
+    kdb_enc_init(&x.enc);
+    lview_t *v = &io->cfg.views[0];
+    db_source_t src = { "sqlite3", path, NULL, NULL, 0 };
+    vstate_t *vs = &io->vst[0];
+    uint8_t *fbuf = malloc(KDB_MAX_BODY);
+    kdb_framer_t fr;
+    kdb_sm_t sm;
+    kdb_framer_init(&fr, KDB_FROM_LOADER, fbuf, KDB_MAX_BODY);
+    kdb_sm_init(&sm, NULL);
+    sm.state = KDB_S_READY;
+    sc_t c;
+#define SL_BEGIN(kind) do { x.batch_id++; x.batch_kind = (kind); x.batch_open = false; x.n_zones = x.n_failed = x.n_deleted = x.n_read = 0; memset(&c, 0, sizeof(c)); } while (0)
+#define SL_END() do { sc_read(sv[1], &fr, &sm, &c); if (x.batch_open) { x.batch_open = false; CHECK(send_batch_end(&x) == 0); sc_read(sv[1], &fr, &sm, &c); } } while (0)
+
+    /* the first fill: a pass over the zones of the view; the PRODUCER zone is not offered, the zone mapped to another view is not this view's */
+    SL_BEGIN(KDB_BATCH_STARTUP);
+    CHECK(store_view(&x, &src, v) == EXIT_OK);
+    SL_END();
+    CHECK(!c.bad && c.bb == 1 && c.mb == 1 && c.mp == 1 && c.me == 1 && c.complete && c.entries == 3 && c.skipped == 1 && c.ch == 0);
+    CHECK(vs->seq_valid && vs->seq == c.me_cursor && vs->seq == c.mb_cursor && vs->ident_len > 0 && strcmp(c.first_name, "a.test.") == 0);
+    CHECK(sm.state == KDB_S_READY && sm.n_zones == 3);
+    /* nothing changed: nothing is sent, not even a batch */
+    SL_BEGIN(KDB_BATCH_AUTO);
+    CHECK(store_view(&x, &src, v) == EXIT_OK);
+    SL_END();
+    CHECK(!c.bad && c.bb == 0 && c.mb == 0 && c.ch == 0 && !x.batch_open);
+    /* changes: a serial (ids 1 and 2 are close together: one statement reads both; 2 is mapped to another view: a delete), a new zone, a deleted zone, a zone that
+     * became a PRODUCER */
+    raw_exec(db, "UPDATE records SET content = 'ns1.a.test hostmaster.a.test 8 7200 3600 1209600 300' WHERE id = 10;"
+                 "UPDATE records SET ttl = 3601 WHERE id = 20;"
+                 "DELETE FROM records WHERE domain_id = 3; DELETE FROM domains WHERE id = 3;"
+                 "UPDATE domains SET type = 'PRODUCER' WHERE id = 5");
+    add_simple_zone(db, 6, 60, "n.test");
+    SL_BEGIN(KDB_BATCH_AUTO);
+    uint64_t before = vs->seq;
+    CHECK(store_view(&x, &src, v) == EXIT_OK);
+    SL_END();
+    CHECK(!c.bad && c.bb == 1 && c.mb == 0 && c.ch >= 1 && c.last && c.ups == 2 && c.dels == 3 && vs->seq > before && vs->seq == c.ch_cursor);
+    CHECK(sm.n_zones == 2 && sm.n_deleted == 3);
+    /* signer-wait: a zone of the signer that changed is held back in an auto batch, and goes out with a reload of everything */
+    raw_exec(db, "INSERT INTO domainmetadata (domain_id, kind, content) VALUES (1, 'X-KARIDNS-SIGNER', '1')");
+    SL_BEGIN(KDB_BATCH_AUTO);
+    CHECK(store_view(&x, &src, v) == EXIT_OK);                       /* the metadata row is a change of zone 1: held */
+    SL_END();
+    CHECK(!c.bad && c.ups == 0 && vs->nsigw == 1 && vs->sigw[0].id == 1);
+    SL_BEGIN(KDB_BATCH_AUTO);
+    raw_exec(db, "UPDATE records SET ttl = 3602 WHERE id = 10");
+    CHECK(store_view(&x, &src, v) == EXIT_OK);
+    SL_END();
+    CHECK(!c.bad && c.ups == 0 && vs->nsigw == 1);                    /* still held */
+    SL_BEGIN(KDB_BATCH_DIFF);
+    CHECK(store_view(&x, &src, v) == EXIT_OK);                       /* a reload: the held zone goes out */
+    SL_END();
+    CHECK(!c.bad && c.ups == 1 && vs->nsigw == 0 && c.ch == 1 && c.last);
+    /* a zone that was held and is deleted leaves the set; a one-zone reload covers the change rows it has read */
+    raw_exec(db, "UPDATE records SET ttl = 3603 WHERE id = 10");
+    SL_BEGIN(KDB_BATCH_AUTO);
+    CHECK(store_view(&x, &src, v) == EXIT_OK);
+    SL_END();
+    CHECK(vs->nsigw == 1);
+    raw_exec(db, "DELETE FROM records WHERE domain_id = 1; DELETE FROM domains WHERE id = 1");
+    SL_BEGIN(KDB_BATCH_AUTO);
+    CHECK(store_view(&x, &src, v) == EXIT_OK);
+    SL_END();
+    CHECK(!c.bad && c.dels == 1 && vs->nsigw == 0);
+    raw_exec(db, "INSERT INTO domainmetadata (domain_id, kind, content) VALUES (2, 'X-KARIDNS-SIGNER', '1')");
+    SL_BEGIN(KDB_BATCH_DIFF);
+    CHECK(store_view(&x, &src, v) == EXIT_OK);                       /* (zone 2 is mapped to another view: a delete, never held) */
+    SL_END();
+    CHECK(!c.bad && vs->nsigw == 0);
+
+    /* a gap in the change log: a pass; a pass with a cursor from the Backend that is another database's: a pass */
+    raw_exec(db, "UPDATE records SET ttl = 3604 WHERE id = 20");
+    g_sf_gap = 1;
+    SL_BEGIN(KDB_BATCH_AUTO);
+    CHECK(store_view(&x, &src, v) == EXIT_OK);
+    SL_END();
+    CHECK(!c.bad && c.mb == 1 && c.complete && c.entries == 1 && vs->seq_valid);
+    vs->ident[0] ^= 1;
+    SL_BEGIN(KDB_BATCH_AUTO);
+    CHECK(store_view(&x, &src, v) == EXIT_OK);
+    SL_END();
+    CHECK(!c.bad && c.mb == 1);
+    x.store_full = true;                                              /* reload -force */
+    SL_BEGIN(KDB_BATCH_DIFF);
+    CHECK(store_view(&x, &src, v) == EXIT_OK);
+    SL_END();
+    CHECK(!c.bad && c.mb == 1);
+    x.store_full = false;
+    vs->need_full = true;                                             /* the database file was replaced */
+    SL_BEGIN(KDB_BATCH_AUTO);
+    CHECK(store_view(&x, &src, v) == EXIT_OK);
+    SL_END();
+    CHECK(!c.bad && c.mb == 1 && !vs->need_full);
+    /* the cursor of the CONFIG of a fresh loader: used when the identity is the same, a pass when it is not */
+    uint64_t cur = vs->seq;
+    uint8_t ident[KDB_IDENT_MAX];
+    uint8_t ilen = vs->ident_len;
+    memcpy(ident, vs->ident, ilen);
+    memset(vs, 0, sizeof(*vs));
+    v->has_cursor = true;
+    v->cursor = cur;
+    v->ident_len = ilen;
+    memcpy(v->ident, ident, ilen);
+    SL_BEGIN(KDB_BATCH_STARTUP);
+    CHECK(store_view(&x, &src, v) == EXIT_OK);
+    SL_END();
+    CHECK(!c.bad && c.mb == 0 && vs->seq_valid && vs->seq == cur);
+    memset(vs, 0, sizeof(*vs));
+    v->ident[0] ^= 1;
+    SL_BEGIN(KDB_BATCH_STARTUP);
+    CHECK(store_view(&x, &src, v) == EXIT_OK);
+    SL_END();
+    CHECK(!c.bad && c.mb == 1);
+    memset(vs, 0, sizeof(*vs));
+    v->has_cursor = false;
+    SL_BEGIN(KDB_BATCH_STARTUP);
+    CHECK(store_view(&x, &src, v) == EXIT_OK);
+    SL_END();
+    CHECK(!c.bad && c.mb == 1 && c.entries == 1);
+
+    /* database errors: a pass that fails is ended with complete = 0 and made again; a drain that fails is read again */
+    raw_exec(db, "UPDATE records SET ttl = 3605 WHERE id = 20");
+    g_sf_manifest = 1;
+    vs->seq_valid = false;
+    SL_BEGIN(KDB_BATCH_AUTO);
+    CHECK(store_view(&x, &src, v) == EXIT_ERROR);
+    SL_END();
+    CHECK(!c.bad && c.mb == 1 && c.me == 1 && !c.complete && !vs->seq_valid);
+    g_sf_cursor = 1;
+    SL_BEGIN(KDB_BATCH_AUTO);
+    CHECK(store_view(&x, &src, v) == EXIT_ERROR);
+    SL_END();
+    CHECK(!c.bad && c.mb == 0);
+    g_sf_count = 1;                                                   /* only an estimate */
+    SL_BEGIN(KDB_BATCH_AUTO);
+    CHECK(store_view(&x, &src, v) == EXIT_OK);
+    SL_END();
+    CHECK(!c.bad && c.mb == 1 && c.complete);
+    g_sf_schema = 1;
+    SL_BEGIN(KDB_BATCH_AUTO);
+    CHECK(store_view(&x, &src, v) == EXIT_ERROR);
+    SL_END();
+    raw_exec(db, "UPDATE records SET ttl = 3606 WHERE id = 60");
+    g_sf_chg = 1;
+    before = vs->seq;
+    SL_BEGIN(KDB_BATCH_AUTO);
+    CHECK(store_view(&x, &src, v) == EXIT_ERROR);
+    SL_END();
+    CHECK(!c.bad && c.ups == 0 && vs->seq == before);
+    g_sf_manifest = 1;                                                /* a failing lookup of the changed zone in the drain */
+    SL_BEGIN(KDB_BATCH_AUTO);
+    CHECK(store_view(&x, &src, v) == EXIT_ERROR);
+    SL_END();
+    CHECK(!c.bad && vs->seq == before);
+    g_sf_manifest = 0;
+    SL_BEGIN(KDB_BATCH_AUTO);
+    CHECK(store_view(&x, &src, v) == EXIT_OK);
+    SL_END();
+    CHECK(!c.bad && c.ups == 1 && vs->seq > before);
+
+    /* a one-zone change covered by a one-zone reload is not a change when the drain reaches it */
+    raw_exec(db, "UPDATE records SET ttl = 3607 WHERE id = 60");
+    {
+        uint64_t m = 0;
+        sqlite3_stmt *st = NULL;
+        CHECK(sqlite3_prepare_v2(db, "SELECT max(seq) FROM karidns_changes", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW);
+        m = (uint64_t)sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+        CHECK(cov_set(vs, 6, m) == 0);
+        SL_BEGIN(KDB_BATCH_AUTO);
+        CHECK(store_view(&x, &src, v) == EXIT_OK);
+        SL_END();
+        CHECK(!c.bad && c.ups == 0 && c.dels == 0 && c.ch == 0);
+        cov_clear(vs);
+    }
+
+    /* the stream is gone: the write fails, and the load says so */
+    raw_exec(db, "UPDATE records SET ttl = 3608 WHERE id = 60");
+    close(sv[1]);
+    SL_BEGIN(KDB_BATCH_AUTO);
+    x.oom = false;
+    int rc = store_view(&x, &src, v);
+    CHECK(rc == EXIT_ERROR && x.io_error);
+    kdb_enc_reset(&x.enc);
+    x.io_error = false;
+    x.st.msg_open = false;
+    close(sv[0]);
+
+    /* the helpers */
+    uint8_t id1[KDB_IDENT_MAX], id2[KDB_IDENT_MAX];
+    uint8_t l1 = 0, l2 = 0;
+    db_source_t pg = { "postgresql", NULL, "/ci", "myschema", 0 };
+    st_ident(&pg, id1, &l1);
+    CHECK(l1 == strlen("postgresql:myschema") && memcmp(id1, "postgresql:myschema", l1) == 0);
+    db_source_t pg2 = { "postgresql", NULL, "/ci", NULL, 0 };
+    st_ident(&pg2, id2, &l2);
+    CHECK(l2 == strlen("postgresql:") && !st_ident_eq(id1, l1, id2, l2));
+    db_source_t gone = { "sqlite3", "/nonexistent/x.db", NULL, NULL, 0 };
+    st_ident(&gone, id2, &l2);
+    CHECK(l2 == 0 && st_ident_eq(id2, l2, id2, 0) && !st_ident_eq(id1, l1, id2, l2));
+    st_ident(&src, id1, &l1);
+    CHECK(l1 > 8 && memcmp(id1, "sqlite3:", 8) == 0 && st_ident_eq(id1, l1, id1, l1));
+    {
+        db_manifest_row_t r;
+        memset(&r, 0, sizeof(r));
+        ctx_t y;
+        memset(&y, 0, sizeof(y));
+        CHECK(st_mapped(&y, &r));                                     /* a source that is not shared: everything */
+        y.map_view = "Beta";
+        CHECK(st_mapped(&y, &r));                                     /* no row: every view */
+        r.nviews = 2;
+        r.views[0] = "alpha";
+        r.views[1] = "BETA";
+        CHECK(st_mapped(&y, &r));
+        y.map_view = "gamma";
+        CHECK(!st_mapped(&y, &r));
+    }
+    {   /* signer-wait set: add, keep sorted, delete */
+        struct lio *io2 = calloc(1, sizeof(*io2));
+        vstate_t v2;
+        memset(&v2, 0, sizeof(v2));
+        CHECK(sigw_add(io2, &v2, 5, "e.test.") == 0 && sigw_add(io2, &v2, 2, "b.test.") == 0 && sigw_add(io2, &v2, 5, "e.test.") == 0 && sigw_add(io2, &v2, 9, NULL) == 0);
+        CHECK(v2.nsigw == 3 && v2.sigw[0].id == 2 && v2.sigw[1].id == 5 && v2.sigw[2].id == 9 && strcmp(v2.sigw[2].name, "?") == 0);
+        sigw_del(io2, &v2, 7);
+        sigw_del(io2, &v2, 5);
+        CHECK(v2.nsigw == 2 && v2.sigw[1].id == 9);
+        sigw_free(&v2);
+        sigw_del(io2, &v2, 1);                                        /* (an empty set) */
+        free(io2);
+    }
+
+    /* a plain PowerDNS schema: no karidns_zone_state.  The caller lists the source from the zone list (a pass with serials, no cursor), a one-zone reload is a
+     * CHANGES entry that forces the body, a zone that is not there a ZONE_DELETE by name, a zone that cannot be loaded a ZONE_FAILED */
+    sqlite3_close(db);
+    char ppath[600];
+    sqlite3 *pdb = make_db("plain_sl.db", ppath, sizeof(ppath));
+    add_simple_zone(pdb, 1, 10, "a.test");
+    add_simple_zone(pdb, 2, 20, "b.test");
+    add_zone(pdb, 3, "p.test", "PRODUCER");
+    add_zone(pdb, 4, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test", "NATIVE");
+    sqlite3_close(pdb);
+    int sv2[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv2) == 0);
+    io->fd = sv2[0];
+    kdb_framer_init(&fr, KDB_FROM_LOADER, fbuf, KDB_MAX_BODY);
+    kdb_sm_init(&sm, NULL);
+    sm.state = KDB_S_READY;
+    db_source_t psrc = { "sqlite3", ppath, NULL, NULL, 0 };
+    x.map_view = NULL;
+    x.io_error = false;
+    SL_BEGIN(KDB_BATCH_STARTUP);
+    CHECK(store_view(&x, &psrc, v) == ST_PLAIN && x.conn == NULL);
+    CHECK(run_view(&x, &psrc, NULL, false) == EXIT_OK);
+    sc_read(sv2[1], &fr, &sm, &c);
+    if (x.batch_open) {
+        x.batch_open = false;
+        CHECK(send_batch_end(&x) == 0);
+    }
+    sc_read(sv2[1], &fr, &sm, &c);
+    CHECK(!c.bad && c.mb == 1 && c.mb_flags == KDB_MF_PLAIN && c.entries == 2 && c.skipped == 2 && c.me == 1 && c.complete);
+    SL_BEGIN(KDB_BATCH_ZONE);
+    CHECK(run_view(&x, &psrc, "a.test", false) == EXIT_OK);
+    sc_read(sv2[1], &fr, &sm, &c);
+    CHECK(!c.bad && c.ch == 1 && c.ups == 1 && !c.last);
+    CHECK(run_view(&x, &psrc, "nothere.test", false) == EXIT_OK);
+    sc_read(sv2[1], &fr, &sm, &c);
+    CHECK(!c.bad && c.zd == 1);
+    CHECK(run_view(&x, &psrc, "p.test", false) == EXIT_OK);
+    sc_read(sv2[1], &fr, &sm, &c);
+    CHECK(!c.bad && c.zf == 1);
+    CHECK(run_view(&x, &psrc, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test", false) == EXIT_OK);
+    sc_read(sv2[1], &fr, &sm, &c);
+    CHECK(!c.bad && c.zf == 1 && x.n_unwritten == 1);
+    close(sv2[1]);
+    close(sv2[0]);
+    kdb_enc_free(&x.enc);
+    io_free_views(io);
+    cfg_free(&io->cfg);
+    free(io);
+    free(fbuf);
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/db";
     snprintf(g_schema, sizeof(g_schema), "%s/pdns_schema.sqlite3.sql", dir);
@@ -3730,6 +4162,7 @@ int main(int argc, char **argv) {
     snprintf(g_audit_path, sizeof(g_audit_path), "%s/../../db/karidns_audit.sqlite3.sql", dir);
     test_writes();
     test_paged();
+    test_store_loader();
     test_manifest_rate();
     test_schema_versions();
     test_audit_actor();

@@ -931,8 +931,50 @@ static void test_claims(void) {
   park_claim_clear(park_claim_key("v1", "race.test."));
 }
 
+/* ------------------------------------------------------------------ 0.7 store S2 review M5: an attach that is still queued at its deadline */
+/* A query parked for an attach has the attach deadline (200 ms) and, in the entry, the deadline of its whole park-timeout.  When the attach deadline passes with the
+ * request still queued (the store threads are behind slow reads) the query is not timed out: it goes on waiting for the rest of its park-timeout, once.  A query that is
+ * given the retry (park_retry(): it waits for a fetch now) has no attach deadline any more.  A query that is not an attach park times out at its deadline as always. */
+static void test_attach_deadline(void) {
+  park_table_t t;
+  udp_ipc_t ipc = mk_ipc(1);
+  uint8_t pay[20];
+  memset(pay, 0, sizeof(pay));
+  CHECK(park_init(&t, 8));
+  int32_t a = park_udp(&t, 1000, 200, "v0", "att.test.", 3, &ipc, pay, 20);        /* attach: 200 ms of 1500 */
+  int32_t b = park_udp(&t, 1000, 200, "v0", "ret.test.", 3, &ipc, pay, 20);        /* attach, then the retry key */
+  int32_t c = park_udp(&t, 1000, 200, "v0", "fet.test.", 3, &ipc, pay, 20);        /* parked for a fetch: its own deadline */
+  CHECK(a >= 0 && b >= 0 && c >= 0);
+  park_mark_attach(&t, a, 5, 2500);
+  park_mark_attach(&t, b, 5, 2500);
+  CHECK(park_expire(&t, 1199) == 0);
+  CHECK(park_expire(&t, 1200) == 1 && t.nwait == 2 && t.nready == 1);            /* the fetch park (c) is out of time, the attach parks go on */
+  CHECK(t.e[a].state == PARK_WAIT && t.e[a].deadline_ms == 2500 && t.e[a].attach == 1);
+  CHECK(park_retry(&t, "v0", "ret.test.", 2400) == 1 && t.e[b].attach == 0 && t.e[b].deadline_ms == 2500);   /* (the later of the two deadlines; no attach deadline now) */
+  CHECK(park_next_deadline_ms(&t, 1300) == 1200);                                  /* the next time to look is the park-timeout, not the attach deadline */
+  CHECK(park_expire(&t, 2499) == 0 && t.nwait == 2);
+  CHECK(park_expire(&t, 2500) == 2 && t.nwait == 0);                               /* ... and now the time is up, once, for both */
+  /* a wake before that finds the extended entry as it finds any waiting one */
+  int32_t d = park_udp(&t, 3000, 200, "v0", "wk.test.", 3, &ipc, pay, 20);
+  park_mark_attach(&t, d, 5, 4500);
+  CHECK(park_expire(&t, 3300) == 0 && t.e[d].deadline_ms == 4500);
+  CHECK(park_wake(&t, "v0", "wk.test.") == 1 && t.e[d].state == PARK_READY);
+  uint32_t cur = 0;
+  park_entry_t *e;
+  while ((e = park_next_done(&t, &cur))) park_release(&t, e);
+  CHECK(t.nwait == 0 && t.nready == 0);
+  /* a full deadline that is not later than the attach deadline changes nothing */
+  int32_t f = park_udp(&t, 5000, 200, "v0", "same.test.", 3, &ipc, pay, 20);
+  park_mark_attach(&t, f, 5, 5100);
+  CHECK(park_expire(&t, 5200) == 1);
+  cur = 0;
+  while ((e = park_next_done(&t, &cur))) park_release(&t, e);
+  park_free(&t);
+}
+
 int main(void) {
   test_table();
+  test_attach_deadline();
   test_tcp();
   test_rings();
   test_concurrent();

@@ -12,6 +12,9 @@
 #                              links of npm), and anything that is neither a regular file nor a directory is refused
 #   owndir (SOURCE -)          TARGET is a directory of KariDNS's own (SYSCONFDIR/karidns, DATADIR, DOCDIR, LIBEXECDIR/karidns-signer, ...):
 #                              uninstall removes it and the directories below it when they are left empty; install does nothing with it
+#   vardir (SOURCE -)          TARGET is a directory that the server uses by its default configuration and that holds other things (/var/db/karidns: the
+#                              default zone store is made in it, and the database files may be): install makes it (root:wheel / the user that runs this, mode
+#                              0755; an existing one is left as it is), uninstall never removes it
 # Every source is checked before anything is copied: when one is missing, nothing is installed and the message names what to build.  Every
 # target name may hold only letters, digits and _ . / + @ - (the package lists and the shell take them as they are).  Owner and group are
 # root (0:0) when this runs as root, else the user that runs it: a package is built unprivileged and its list names root:wheel itself.  A
@@ -118,8 +121,12 @@ for e in "$@"; do
             case ${tgt##*/} in karidns*) ROOTS="$ROOTS $tgt" ;; esac
             continue
             ;;
+        vardir)
+            [ "$src" = - ] || die "bad entry '$e' (vardir:-:TARGET)"
+            continue
+            ;;
         man|tree|0[0-7][0-7][0-7]) ;;
-        *) die "bad kind '$kind' in '$e' (a mode such as 0555, man, tree, owndir)" ;;
+        *) die "bad kind '$kind' in '$e' (a mode such as 0555, man, tree, owndir, vardir)" ;;
     esac
     if [ "$ACTION" = uninstall ]; then
         if [ "$kind" = tree ] && { [ -e "$DEST$tgt" ] || [ -L "$DEST$tgt" ]; }; then
@@ -156,6 +163,7 @@ for e in "$@"; do
     tgt=${rest#*:}
     case $kind in
         owndir) ;;
+        vardir) if [ "$ACTION" = install ]; then mkdirs "$DEST$tgt"; fi ;;
         man)
             if [ "$ACTION" = install ]; then
                 if [ $GZ = yes ]; then

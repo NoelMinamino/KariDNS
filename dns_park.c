@@ -190,10 +190,11 @@ uint32_t park_retry(park_table_t *t, const char *view, const char *zone, int64_t
   return n;                                               /* (min_deadline_ms only has to be <= every deadline: a later park_expire() sets it right) */
 }
 
-void park_mark_attach(park_table_t *t, int32_t idx, int64_t now_ns) {
+void park_mark_attach(park_table_t *t, int32_t idx, int64_t now_ns, int64_t full_deadline_ms) {
   if (!t->e || idx < 0 || (uint32_t)idx >= t->cap || t->e[idx].state != PARK_WAIT) return;
   t->e[idx].attach = 1;
   t->e[idx].t_park_ns = now_ns;
+  t->e[idx].full_ms = full_deadline_ms;
 }
 
 uint32_t park_wake_all(park_table_t *t) {
@@ -218,7 +219,13 @@ uint32_t park_expire(park_table_t *t, int64_t now_ms) {
   for (uint32_t i = 0; i < t->cap && waiting + n < t->nwait; i++) {
     park_entry_t *e = &t->e[i];
     if (e->state != PARK_WAIT) continue;
-    if (e->deadline_ms <= now_ms) {
+    if (e->deadline_ms <= now_ms && e->attach && e->full_ms > now_ms) {
+      /* the attach deadline passed with the request still queued (the store threads are behind slow reads): the query goes on waiting for the rest of its park-timeout, as
+       * a query that waits for a fetch does; whoever finishes the zone wakes it, or the retry key of an attach that fails (park_retry()) */
+      e->deadline_ms = e->full_ms;
+      waiting++;
+      if (e->deadline_ms < min) min = e->deadline_ms;
+    } else if (e->deadline_ms <= now_ms) {
       e->state = PARK_TIMEOUT;
       n++;
     } else {

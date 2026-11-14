@@ -745,7 +745,7 @@ typedef struct {
   bool store_none;             /* `store none;`: no zone store, the zones are read from the database only (as before 0.7) */
   uint8_t store_mode;          /* `store-mode`: 0 auto (by the file system), 1 map, 2 copy (STORE_MODE_*) */
   uint32_t store_threads;      /* `store-threads`: threads that attach zones from the store, 1..8 (0 = the default, 2) */
-  bool store_paranoid;         /* `store-paranoid yes`: the structure of every image read from the store is checked at the attach (always checked in sanitizer builds) */
+  bool store_paranoid;         /* `store-paranoid yes`: no effect (accepted for the configurations that have it): the structure of every image read from the store is always checked at the attach */
   char *server_id;             /* postgresql only (B11) */
   char **alias_resolver;       /* stored only (B9a): IP address literals */
   int alias_resolver_count;

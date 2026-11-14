@@ -2349,7 +2349,7 @@ static bool udp_park(udp_pass_t *w, const view_snapshot_t *view, const zdir_elem
     return false;
   }
   if (attach) {
-    park_mark_attach(w->park, pi, park_now_ns());
+    park_mark_attach(w->park, pi, park_now_ns(), now + left);
     if (!park_attach_request(w->worker_idx, hv, pel->name)) {      /* (the ring is full: the database has it) */
       attach = false;
       (void)park_retry(w->park, hv, pel->name, now + left);
@@ -2671,7 +2671,7 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
       memcpy(req, e->u.udp.payload, len);
       w->active_fd = e->u.udp.fd;
       w->woken = true;
-      w->woken_deadline_ms = e->deadline_ms;
+      w->woken_deadline_ms = e->attach && e->full_ms > e->deadline_ms ? e->full_ms : e->deadline_ms;       /* (an attach park: the park-timeout, not the attach deadline) */
       w->not_ready = timed_out;
       park_release(t, e);                                 /* (before the request runs: it may park again, and takes a free entry) */
       w->n_tx = 0;
@@ -3481,7 +3481,7 @@ process_tcp_client: ;
                 int32_t pi = park_tcp(&park, pnow, (uint32_t)(attach && left > PARK_ATTACH_DEADLINE_MS ? PARK_ATTACH_DEADLINE_MS : left), hv, pel->name, client_fd, cidx, ctx_tcp->gen);
                 if (pi < 0 && gate == FETCH_GATE_TAKEN) park_claim_release(hv, pel->name);
                 if (pi >= 0 && attach) {
-                  park_mark_attach(&park, pi, park_now_ns());
+                  park_mark_attach(&park, pi, park_now_ns(), pnow + left);
                   if (!park_attach_request(ctx->thread_id, hv, pel->name)) {
                     attach = false;
                     (void)park_retry(&park, hv, pel->name, pnow + left);

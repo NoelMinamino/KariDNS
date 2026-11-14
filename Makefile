@@ -1568,7 +1568,11 @@ KARI_INSTALL = MANCOMPRESS="$(MANCOMPRESS)" sh packaging/install.sh
 # install.sh takes one only when its last component starts with "karidns" (DOCDIR=/usr/share/doc is not removed).
 INST_OWN = owndir:-:$(SYSCONFDIR)/karidns owndir:-:$(DATADIR) owndir:-:$(DOCDIR) owndir:-:$(LIBEXECDIR)/karidns-signer \
 	owndir:-:$(LIBEXECDIR)/karidns-webadmin
-INST_SERVER = $(BINMODE):karidns:$(SBINDIR)/karidns $(BINMODE):karictl:$(BINDIR)/karictl $(BINMODE):karicheck:$(BINDIR)/karicheck \
+# /var/db/karidns: the directory the default zone store (karidns database { }, `store`) is made in, /var/db/karidns/store (dns_config_parser.h KARIDNS_DB_DEFAULT_STORE_DIR; the
+# server makes only the last component, so without this directory the store is off).  Made by install (root, 0755), never removed by uninstall: the database files may live in it.
+VARDB ?= /var/db/karidns
+INST_VARDB = vardir:-:$(VARDB)
+INST_SERVER = $(INST_VARDB) $(BINMODE):karidns:$(SBINDIR)/karidns $(BINMODE):karictl:$(BINDIR)/karictl $(BINMODE):karicheck:$(BINDIR)/karicheck \
 	$(BINMODE):karidns-tapstat:$(BINDIR)/karidns-tapstat $(BINMODE):packaging/freebsd/rc.d/karidns:$(RCDIR)/karidns \
 	0644:karidns.conf.sample:$(SYSCONFDIR)/karidns/karidns.conf.sample 0644:karictl.conf.sample:$(SYSCONFDIR)/karidns/karictl.conf.sample \
 	0644:packaging/freebsd/zones/example.test.zone.sample:$(SYSCONFDIR)/karidns/zones/example.test.zone.sample

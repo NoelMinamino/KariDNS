@@ -99,6 +99,39 @@ static void run_loader(const uint8_t *p, size_t n, size_t chunk, uint8_t sel, ru
                 if (m.u.hot_ack.status >= KDB_HA_N) abort();
                 mix(&r->sum, m.u.hot_ack.list_id + m.u.hot_ack.zones + m.u.hot_ack.error.len);
             }
+            if (fr.type == KDB_T_MANIFEST) {                /* 0.7 WP7a: the iterator sees exactly the validated entries; the ones of one stream are the ones the decoder promised */
+                kdb_iter_t it;
+                kdb_manifest_entry_t en;
+                uint32_t k = 0;
+                kdb_manifest_entries(&m, &it);
+                while (kdb_manifest_entries_next(&it, &en)) {
+                    if (strlen(en.name) == 0 || en.kind > KDB_ZK_CATALOG) abort();
+                    mix(&r->sum, (uint64_t)en.source_id + en.stamp_gen + en.stamp_time + (en.stamped ? 1u : 0u) + (en.has_serial ? en.serial : 0u) + (en.has_digest ? en.digest[0] : 0u));
+                    k++;
+                }
+                if (k != m.u.manifest.n_entries || k > KDB_MANIFEST_PAGE_MAX || m.u.manifest.view >= 3) abort();
+                mix(&r->sum, m.u.manifest.page + m.u.manifest.batch_id);
+            }
+            if (fr.type == KDB_T_MANIFEST_BEGIN || fr.type == KDB_T_MANIFEST_END) {
+                const uint8_t il = fr.type == KDB_T_MANIFEST_BEGIN ? m.u.manifest_begin.ident_len : m.u.manifest_end.ident_len;
+                if (il > KDB_IDENT_MAX) abort();
+                mix(&r->sum, il + (fr.type == KDB_T_MANIFEST_BEGIN ? m.u.manifest_begin.cursor + m.u.manifest_begin.flags : m.u.manifest_end.cursor + m.u.manifest_end.n_entries));
+            }
+            if (fr.type == KDB_T_CHANGES) {
+                kdb_iter_t it;
+                kdb_changes_entry_t en;
+                uint32_t k = 0;
+                kdb_changes_entries(&m, &it);
+                while (kdb_changes_entries_next(&it, &en)) {
+                    if (en.op != KDB_CH_UPSERT && en.op != KDB_CH_DELETE) abort();
+                    if (en.op == KDB_CH_UPSERT && (!en.has_name || strlen(en.name) == 0)) abort();
+                    if (en.has_name && en.name[strlen(en.name) - 1] != '.') abort();
+                    mix(&r->sum, (uint64_t)en.source_id + en.op + en.stamp_gen + (en.force ? 7u : 0u) + (en.has_serial ? en.serial : 0u));
+                    k++;
+                }
+                if (k != m.u.changes.n_entries || m.u.changes.ident_len > KDB_IDENT_MAX || m.u.changes.view >= 3) abort();
+                mix(&r->sum, m.u.changes.cursor + (m.u.changes.last ? 1u : 0u));
+            }
             if (fr.type == KDB_T_AUTO_STATUS) {            /* B9: the iterator sees exactly the validated entries */
                 kdb_iter_t it;
                 kdb_auto_status_entry_t en;
@@ -139,7 +172,10 @@ static void run_backend(const uint8_t *p, size_t n) {
             kdb_config_view_t v;
             uint32_t k = 0;
             kdb_config_views(&m, &it);
-            while (kdb_config_views_next(&it, &v)) k++;
+            while (kdb_config_views_next(&it, &v)) {
+                if (v.ident_len > KDB_IDENT_MAX || (!v.has_cursor && v.cursor != 0)) abort();       /* 0.7 WP7a: a cursor is valid or none */
+                k++;
+            }
             if (k != m.u.config.n_views) abort();      /* the iterator sees exactly the validated entries */
         } else if (fr.type == KDB_T_INVENTORY) {
             kdb_iter_t it;
@@ -165,6 +201,7 @@ static void run_backend(const uint8_t *p, size_t n) {
             const kdb_fetch_req_t *q = &m.u.fetch_req;
             if (q->request_id == 0 || q->view >= 3 || strlen(q->name) == 0 || q->priority >= KDB_FETCH_PRIO_N || q->mode > KDB_FETCH_SUMMARY) abort();
             if (q->has_range && (strlen(q->range_lo) == 0 || strlen(q->range_hi) == 0)) abort();
+            if (q->source_id < 0) abort();                  /* 0.7 WP7a */
         }
     }
 }

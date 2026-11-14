@@ -49,7 +49,7 @@ struct kdb_tdef { const char *name; uint8_t n; const kdb_tspec_t *spec; };
     _Static_assert(sizeof(arr) / sizeof((arr)[0]) <= KDB_MAX_TAGS, "kdb_val_t arrays are KDB_MAX_TAGS long: " nm); \
     static const kdb_tdef_t var = { nm, (uint8_t)(sizeof(arr) / sizeof((arr)[0])), arr }
 
-static const kdb_tspec_t sp_hello[] = { S(KT_U16, KS_REQ, 0), S(KT_STR, KS_REQ, 64), S(KT_STR, KS_REQ, 32), S(KT_U32, KS_REQ, 0) };
+static const kdb_tspec_t sp_hello[] = { S(KT_U16, KS_REQ, 0), S(KT_STR, KS_REQ, 64), S(KT_STR, KS_REQ, 32), S(KT_U32, KS_REQ, 0), S(KT_U32, 0, 0) };
 static const kdb_tspec_t sp_batch_begin[] = { S(KT_U64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 4), S(KT_U64, KS_REQ, 0), S(KT_U64, 0, 0), S(KT_U64, 0, 0) };
 static const kdb_tspec_t sp_zone_begin[] = {
     S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_I64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 2),
@@ -85,12 +85,12 @@ TDEF(td_batch_end, "BATCH_END", sp_batch_end);
 static const kdb_tspec_t sp_cfg_view[] = {
     S(KT_U16, KS_REQ, 0), S(KT_STR, KS_REQ | KS_NE, 255), S(KT_PATH, KS_NE, 1023), S(KT_PATH, KS_NE, 1023),
     S(KT_U8, KS_REQ | KS_MAXV, 1), S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ, 0), S(KT_U64, KS_REQ, 0), S(KT_U64, KS_REQ, 0),
-    S(KT_U8, KS_MAXV, 1) };
+    S(KT_U8, KS_MAXV, 1), S(KT_U64, 0, 0), S(KT_U8, KS_MAXV, 1), S(KT_BYTES, 0, KDB_IDENT_MAX) };
 TDEF(td_cfg_view, "CONFIG.VIEW", sp_cfg_view);
 static const kdb_tspec_t sp_config[] = {
     S(KT_U64, KS_REQ, 0), S(KT_STR, KS_REQ | KS_NE, 32), S(KT_STR, 0, 64),
     { KT_NEST, 0, KDB_MAX_CONFIG_VIEWS, &td_cfg_view },
-    S(KT_U32, KS_MAXV, 2147483647u), S(KT_U8, KS_MAXV, 100), S(KT_U32, KS_MAXV, 16), S(KT_U8, KS_MAXV, 1), S(KT_U8, KS_MAXV, 1) };
+    S(KT_U32, KS_MAXV, 2147483647u), S(KT_U8, KS_MAXV, 100), S(KT_U32, KS_MAXV, 16), S(KT_U8, KS_MAXV, 1), S(KT_U8, KS_MAXV, 1), S(KT_U8, KS_MAXV, 1) };
 TDEF(td_config, "CONFIG", sp_config);
 static const kdb_tspec_t sp_reload_req[] = {
     S(KT_U64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 1), S(KT_U16, KS_VIEW, 0), S(KT_NAME, 0, 0), S(KT_U8, KS_REQ | KS_MAXV, 1) };
@@ -112,7 +112,7 @@ static const kdb_tspec_t sp_batch_result[] = {
 TDEF(td_batch_result, "BATCH_RESULT", sp_batch_result);
 static const kdb_tspec_t sp_fetch_req[] = {
     S(KT_U64, KS_REQ, 0), S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, KDB_FETCH_PRIO_N - 1),
-    S(KT_U8, KS_REQ | KS_MAXV, KDB_FETCH_SUMMARY), S(KT_NAME, 0, 0), S(KT_NAME, 0, 0) };
+    S(KT_U8, KS_REQ | KS_MAXV, KDB_FETCH_SUMMARY), S(KT_NAME, 0, 0), S(KT_NAME, 0, 0), S(KT_I64, 0, 0) };
 TDEF(td_fetch_req, "FETCH_REQ", sp_fetch_req);
 /* D1a step 7: HOT_LIST (Backend -> loader) and WARM_LIST (loader -> Backend) have one layout; tag 5 is for the first, 6 and 7 for the second */
 static const kdb_tspec_t sp_hot_entry[] = { S(KT_STR, KS_REQ | KS_NE, 255), S(KT_NAME, KS_REQ, 0) };
@@ -126,6 +126,31 @@ static const kdb_tspec_t sp_hot_ack[] = { S(KT_U64, KS_REQ, 0), S(KT_U8, KS_REQ 
 TDEF(td_hot_ack, "HOT_ACK", sp_hot_ack);
 static const kdb_tspec_t sp_debug[] = { S(KT_U8, KS_REQ | KS_MAXV, 99) };
 TDEF(td_debug, "DEBUG", sp_debug);
+
+/* 0.7 WP7a: the store protocol (the entries are claims of an untrusted loader: only their form is checked here) */
+static const kdb_tspec_t sp_manifest_begin[] = {
+    S(KT_U64, KS_REQ, 0), S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_U64, KS_REQ, 0), S(KT_U64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 1),
+    S(KT_BYTES, 0, KDB_IDENT_MAX), S(KT_U32, KS_REQ | KS_MAXV, KDB_MF_VERIFY | KDB_MF_PLAIN) };
+TDEF(td_manifest_begin, "MANIFEST_BEGIN", sp_manifest_begin);
+static const kdb_tspec_t sp_man_entry[] = {
+    S(KT_I64, KS_REQ, 0), S(KT_NAME, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, KDB_ZK_CATALOG), S(KT_U64, KS_REQ, 0), S(KT_U64, KS_REQ, 0),
+    S(KT_U8, KS_MAXV, KDB_EF_STAMPED), S(KT_U32, 0, 0), S(KT_BYTES, KS_EXACT, KDB_DIGEST_LEN) };
+TDEF(td_man_entry, "MANIFEST.ENTRY", sp_man_entry);
+static const kdb_tspec_t sp_manifest[] = {
+    S(KT_U64, KS_REQ, 0), S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_U32, KS_REQ, 0), { KT_NEST, 0, KDB_MANIFEST_PAGE_MAX, &td_man_entry } };
+TDEF(td_manifest, "MANIFEST", sp_manifest);
+static const kdb_tspec_t sp_manifest_end[] = {
+    S(KT_U64, KS_REQ, 0), S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_U64, KS_REQ, 0), S(KT_U64, KS_REQ, 0), S(KT_U64, KS_REQ, 0),
+    S(KT_U8, KS_REQ | KS_MAXV, 1), S(KT_BYTES, 0, KDB_IDENT_MAX), S(KT_U8, KS_REQ | KS_MAXV, 1) };
+TDEF(td_manifest_end, "MANIFEST_END", sp_manifest_end);
+static const kdb_tspec_t sp_ch_entry[] = {
+    S(KT_I64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, KDB_CH_DELETE), S(KT_NAME, 0, 0), S(KT_U8, KS_MAXV, KDB_ZK_CATALOG), S(KT_U64, 0, 0), S(KT_U64, 0, 0),
+    S(KT_U8, KS_MAXV, KDB_EF_STAMPED | KDB_EF_FORCE), S(KT_U32, 0, 0) };
+TDEF(td_ch_entry, "CHANGES.ENTRY", sp_ch_entry);
+static const kdb_tspec_t sp_changes[] = {
+    S(KT_U64, KS_REQ, 0), S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_U64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 1), S(KT_BYTES, 0, KDB_IDENT_MAX),
+    { KT_NEST, 0, KDB_MANIFEST_PAGE_MAX, &td_ch_entry } };
+TDEF(td_changes, "CHANGES", sp_changes);
 
 
 /* INVENTORY_REQ has no tags: any tag is unknown */
@@ -150,6 +175,10 @@ static const kdb_mdef_t mdefs[] = {
     { KDB_T_AUTO_STATUS, "AUTO_STATUS", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_auto_status },
     { KDB_T_WARM_LIST, "WARM_LIST", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_warm_list },
     { KDB_T_HOT_ACK, "HOT_ACK", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_hot_ack },
+    { KDB_T_MANIFEST_BEGIN, "MANIFEST_BEGIN", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_manifest_begin },
+    { KDB_T_MANIFEST, "MANIFEST", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_manifest },
+    { KDB_T_MANIFEST_END, "MANIFEST_END", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_manifest_end },
+    { KDB_T_CHANGES, "CHANGES", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_changes },
     { KDB_T_CONFIG, "CONFIG", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_config },
     { KDB_T_RELOAD_REQ, "RELOAD_REQ", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_reload_req },
     { KDB_T_INVENTORY, "INVENTORY", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_inventory },
@@ -387,6 +416,7 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         m->u.hello.loader_version = gstr(&V(2));
         m->u.hello.driver = gstr(&V(3));
         m->u.hello.pid = (uint32_t)V(4).u;
+        m->u.hello.features = V(5).present ? (uint32_t)V(5).u : 0;
         break;
     case KDB_T_INVENTORY_REQ:
         break;
@@ -541,6 +571,7 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         m->u.config.loader_threads = V(7).present ? (uint32_t)V(7).u : 0;
         m->u.config.dir_only = V(8).present && V(8).u != 0;
         m->u.config.signer_wait = !V(9).present || V(9).u != 0;
+        m->u.config.store_proto = V(10).present && V(10).u != 0;
         m->u.config.n_views = nrep;
         m->u.config.body = fr->body;
         m->u.config.body_len = fr->len;
@@ -578,12 +609,64 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         gname(r->name, &V(3));
         r->priority = (uint8_t)V(4).u;
         r->mode = (uint8_t)V(5).u;
+        r->source_id = V(8).present ? (int64_t)V(8).u : 0;
+        if (r->source_id < 0) FAIL(why, wl, KDB_E_RANGE, "FETCH_REQ: negative source id");
         if (V(6).present != V(7).present) FAIL(why, wl, KDB_E_TLV_MISSING, "FETCH_REQ: a range needs both range_lo and range_hi");
         if (V(6).present) {
             r->has_range = true;
             gname(r->range_lo, &V(6));
             gname(r->range_hi, &V(7));
         }
+        break;
+    }
+    case KDB_T_MANIFEST_BEGIN: {
+        kdb_manifest_begin_t *b = &m->u.manifest_begin;
+        b->batch_id = V(1).u;
+        b->view = (uint16_t)V(2).u;
+        b->count = V(3).u;
+        b->cursor = V(4).u;
+        b->cursor_valid = V(5).u != 0;
+        if (V(6).present) { memcpy(b->ident, V(6).p, V(6).len); b->ident_len = (uint8_t)V(6).len; }
+        b->flags = (uint32_t)V(7).u;
+        break;
+    }
+    case KDB_T_MANIFEST:
+        m->u.manifest.batch_id = V(1).u;
+        m->u.manifest.view = (uint16_t)V(2).u;
+        m->u.manifest.page = (uint32_t)V(3).u;
+        m->u.manifest.n_entries = nrep;
+        m->u.manifest.body = fr->body;
+        m->u.manifest.body_len = fr->len;
+        break;
+    case KDB_T_MANIFEST_END: {
+        kdb_manifest_end_t *e = &m->u.manifest_end;
+        e->batch_id = V(1).u;
+        e->view = (uint16_t)V(2).u;
+        e->n_entries = V(3).u;
+        e->n_skipped = V(4).u;
+        e->cursor = V(5).u;
+        e->cursor_valid = V(6).u != 0;
+        if (V(7).present) { memcpy(e->ident, V(7).p, V(7).len); e->ident_len = (uint8_t)V(7).len; }
+        e->complete = V(8).u != 0;
+        break;
+    }
+    case KDB_T_CHANGES: {
+        kdb_changes_t *c = &m->u.changes;
+        c->batch_id = V(1).u;
+        c->view = (uint16_t)V(2).u;
+        c->cursor = V(3).u;
+        c->last = V(4).u != 0;
+        if (V(5).present) { memcpy(c->ident, V(5).p, V(5).len); c->ident_len = (uint8_t)V(5).len; }
+        c->n_entries = nrep;
+        c->body = fr->body;
+        c->body_len = fr->len;
+        /* the rules the tag table cannot say: an upsert has a name and a kind (the iterator ends at an entry that does not) */
+        kdb_iter_t it;
+        kdb_changes_entry_t en;
+        uint32_t k = 0;
+        kdb_changes_entries(m, &it);
+        while (kdb_changes_entries_next(&it, &en)) k++;
+        if (k != nrep) FAIL(why, wl, KDB_E_TLV_MISSING, "CHANGES.ENTRY: an upsert needs its name (tag 3) and kind (tag 4)");
         break;
     }
     case KDB_T_INVENTORY_END:
@@ -676,6 +759,10 @@ bool kdb_config_views_next(kdb_iter_t *it, kdb_config_view_t *o) {
     o->max_zone_records = V(8).u;
     o->max_zone_bytes = V(9).u;
     o->shared_source = V(10).present ? (uint8_t)V(10).u : 0;
+    o->has_cursor = V(12).present && V(12).u != 0 && V(11).present;
+    o->cursor = o->has_cursor ? V(11).u : 0;
+    o->ident_len = 0;
+    if (V(13).present) { memcpy(o->ident, V(13).p, V(13).len); o->ident_len = (uint8_t)V(13).len; }
     return true;
 }
 
@@ -700,6 +787,57 @@ bool kdb_inventory_entries_next(kdb_iter_t *it, kdb_inventory_entry_t *o) {
     }
     if (V(5).present) memcpy(o->digest, V(5).p, KDB_DIGEST_LEN);
     else memset(o->digest, 0, KDB_DIGEST_LEN);
+    return true;
+}
+
+void kdb_manifest_entries(const kdb_msg_t *m, kdb_iter_t *it) {
+    bool ok = m->type == KDB_T_MANIFEST;
+    it->p = ok ? m->u.manifest.body : NULL;
+    it->left = ok ? m->u.manifest.body_len : 0;
+    it->view_count = m->view_count;
+}
+
+bool kdb_manifest_entries_next(kdb_iter_t *it, kdb_manifest_entry_t *o) {
+    kdb_val_t vals[KDB_MAX_TAGS];
+    if (!nest_next(it, 4, &td_man_entry, vals)) return false;
+    o->source_id = (int64_t)V(1).u;
+    gname(o->name, &V(2));
+    o->kind = (uint8_t)V(3).u;
+    o->stamp_gen = V(4).u;
+    o->stamp_time = V(5).u;
+    o->stamped = V(6).present && (V(6).u & KDB_EF_STAMPED) != 0;
+    o->has_serial = V(7).present;
+    o->serial = V(7).present ? (uint32_t)V(7).u : 0;
+    o->has_digest = V(8).present;
+    if (V(8).present) memcpy(o->digest, V(8).p, KDB_DIGEST_LEN);
+    else memset(o->digest, 0, KDB_DIGEST_LEN);
+    return true;
+}
+
+void kdb_changes_entries(const kdb_msg_t *m, kdb_iter_t *it) {
+    bool ok = m->type == KDB_T_CHANGES;
+    it->p = ok ? m->u.changes.body : NULL;
+    it->left = ok ? m->u.changes.body_len : 0;
+    it->view_count = m->view_count;
+}
+
+bool kdb_changes_entries_next(kdb_iter_t *it, kdb_changes_entry_t *o) {
+    kdb_val_t vals[KDB_MAX_TAGS];
+    if (!nest_next(it, 6, &td_ch_entry, vals)) return false;
+    o->source_id = (int64_t)V(1).u;
+    o->op = (uint8_t)V(2).u;
+    if (o->op != KDB_CH_UPSERT && o->op != KDB_CH_DELETE) { it->left = 0; return false; }
+    if (o->op == KDB_CH_UPSERT && (!V(3).present || !V(4).present)) { it->left = 0; return false; }
+    o->has_name = V(3).present;
+    if (V(3).present) gname(o->name, &V(3));
+    else o->name[0] = '\0';
+    o->kind = V(4).present ? (uint8_t)V(4).u : 0;
+    o->stamp_gen = V(5).present ? V(5).u : 0;
+    o->stamp_time = V(6).present ? V(6).u : 0;
+    o->stamped = V(7).present && (V(7).u & KDB_EF_STAMPED) != 0;
+    o->force = V(7).present && (V(7).u & KDB_EF_FORCE) != 0;
+    o->has_serial = V(8).present;
+    o->serial = V(8).present ? (uint32_t)V(8).u : 0;
     return true;
 }
 
@@ -900,8 +1038,9 @@ static bool sm_legal(const kdb_sm_t *sm, uint16_t t) {
         return (t == KDB_T_INVENTORY_REQ && !sm->inventory_req_seen && !sm->batch_seen) || t == KDB_T_BATCH_BEGIN ||
                t == KDB_T_AUTO_STATUS || t == KDB_T_WARM_LIST || t == KDB_T_HOT_ACK;
     case KDB_S_IN_BATCH:
+        if (sm->man_open) return t == KDB_T_MANIFEST || t == KDB_T_MANIFEST_END;       /* WP7a: inside a pass nothing but its pages and its end */
         return t == KDB_T_ZONE_BEGIN || t == KDB_T_ZONE_FAILED || t == KDB_T_ZONE_DELETE || t == KDB_T_PROFILE ||
-               t == KDB_T_BATCH_END;
+               t == KDB_T_BATCH_END || t == KDB_T_MANIFEST_BEGIN || t == KDB_T_CHANGES;
     case KDB_S_IN_ZONE: return t == KDB_T_ZONE_DATA || t == KDB_T_ZONE_END || t == KDB_T_ZONE_ABORT;
     case KDB_S_ERROR: break;
     }
@@ -934,8 +1073,41 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
         sm->batch_id = m->u.batch_begin.batch_id;
         sm->n_zones = sm->n_failed = sm->n_deleted = 0;
         sm->n_profiles = 0;
+        sm->man_open = false;
         sm->state = KDB_S_IN_BATCH;
         break;
+    case KDB_T_MANIFEST_BEGIN:
+        if (m->u.manifest_begin.batch_id != sm->batch_id) SMFAIL(sm, KDB_E_SEQ, "MANIFEST_BEGIN: batch id differs from BATCH_BEGIN");
+        sm->man_open = true;
+        sm->man_view = m->u.manifest_begin.view;
+        sm->man_page = 0;
+        sm->man_entries = 0;
+        break;
+    case KDB_T_MANIFEST:
+        if (m->u.manifest.batch_id != sm->batch_id || m->u.manifest.view != sm->man_view)
+            SMFAIL(sm, KDB_E_SEQ, "MANIFEST: batch or view differs from MANIFEST_BEGIN");
+        if (m->u.manifest.page != sm->man_page) SMFAIL(sm, KDB_E_SEQ, "MANIFEST: page %u, want %u", m->u.manifest.page, sm->man_page);
+        sm->man_page++;
+        sm->man_entries += m->u.manifest.n_entries;
+        sm->n_zones += m->u.manifest.n_entries;
+        break;
+    case KDB_T_MANIFEST_END:
+        if (m->u.manifest_end.batch_id != sm->batch_id || m->u.manifest_end.view != sm->man_view)
+            SMFAIL(sm, KDB_E_SEQ, "MANIFEST_END: batch or view differs from MANIFEST_BEGIN");
+        if (m->u.manifest_end.n_entries != sm->man_entries) SMFAIL(sm, KDB_E_COUNT, "MANIFEST_END: n_entries differs from the entries of the pages");
+        sm->man_open = false;
+        break;
+    case KDB_T_CHANGES: {
+        if (m->u.changes.batch_id != sm->batch_id) SMFAIL(sm, KDB_E_SEQ, "CHANGES: batch id differs from BATCH_BEGIN");
+        kdb_iter_t it;
+        kdb_changes_entry_t en;
+        kdb_changes_entries(m, &it);
+        while (kdb_changes_entries_next(&it, &en)) {
+            if (en.op == KDB_CH_UPSERT) sm->n_zones++;
+            else sm->n_deleted++;
+        }
+        break;
+    }
     case KDB_T_PROFILE:
         if (sm->n_profiles >= KDB_MAX_PROFILES) SMFAIL(sm, KDB_E_LIMIT_PROFILES, "PROFILE: more than %u profiles in a batch", KDB_MAX_PROFILES);
         sm->n_profiles++;

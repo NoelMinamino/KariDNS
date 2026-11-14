@@ -23,8 +23,8 @@
  *   - Attach.  A query for a zone that is out of memory (directory element ABSENT: not read yet after a start, or taken out by memory-limit) whose
  *     store record is stored and current (the record's serial is the directory's; the source id and, when the directory knows one, the digest
  *     agree) is not fetched from the loader: the worker parks it with the attach deadline (200 ms) and asks the store threads; a store thread reads
- *     the image (MAP: a pointer into the mapped segment; COPY: a buffer), checks it (the store's checksum, the apex name, with `store-paranoid` and in
- *     sanitizer builds the whole structure: zone_image_validate()), makes the entry like an install does (zone_install_version(), dbreg_commit()) and wakes
+ *     the image (MAP: a pointer into the mapped segment; COPY: a buffer), checks it (the store's checksum, the whole structure: zone_image_validate(), at every attach - the
+ *     checksum is not keyed and detects damage, not a forgery; the apex name), makes the entry like an install does (zone_install_version(), dbreg_commit_attach(): conditional on the version the directory offers) and wakes
  *     the parked queries.  A record that is missing, stale or damaged falls back to the fetch (the queries that wait are given the park-timeout
  *     again).  The version of an attached zone counts for memory-limit with its image: the mapped bytes (MAP) or the buffer (COPY), the same number
  *     when the version is counted and when it is given back.  Detaching is the eviction of today (the record stays in the store); a MAP version keeps its
@@ -43,7 +43,9 @@
 #include "dns_config_parser.h"
 #include "dns_store.h"
 
-#define DB_STORE_WQ_MAX 4096        /* queued write-through jobs; a producer that finds the queue full does the job itself */
+#define DB_STORE_WQ_MAX 4096        /* queued write-through jobs; a producer that finds the queue full waits for the writer (jobs are never run out of order) */
+#define DB_STORE_WQ_WAIT_S 10       /* ... at most this long; then the job is dropped (counted, db_store_counters_t.wt_dropped) */
+#define DB_STORE_PIN_MAX_BYTES (64ull << 20)   /* image bytes that queued write-through jobs may keep pinned in memory (above memory-limit during a first fill); a producer waits for the writer beyond it */
 
 /* ---- the directory (the process that forks the Backend) ---- */
 
@@ -97,7 +99,14 @@ typedef struct {
   uint64_t attach_ok, attach_stale, attach_missing, attach_damaged, attach_fallback, attach_resident, attach_busy;
   uint64_t attached_bytes;       /* image bytes counted for the versions that were attached and are not freed yet */
   uint64_t versions_live;        /* attached versions not freed yet (their images are not given back) */
+  uint64_t validated, validate_ns;   /* images checked by zone_image_validate() at an attach, and the nanoseconds that took */
+  uint64_t pin_waits;            /* write-through jobs that had to wait for the pinned image bytes to go below DB_STORE_PIN_MAX_BYTES */
+  uint64_t pinned_peak;          /* the most image bytes that queued write-through jobs held at one time */
 } db_store_counters_t;
 void db_store_counters(db_store_counters_t *out);
+#ifdef KARIDNS_UNIT_TEST
+/* a test: another bound for the pinned bytes of write-through jobs */
+void db_store_test_pin_cap(uint64_t bytes);
+#endif
 
 #endif /* DNS_DB_STORE_H */

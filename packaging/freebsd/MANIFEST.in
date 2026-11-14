@@ -30,6 +30,7 @@ pw usershow karidns >/dev/null 2>&1 || pw useradd karidns -g karidns -h - -d /no
 EOD
     post-install: <<EOD
 install -d -o root -g wheel -m 0755 /var/run/karidns
+install -d -o root -g wheel -m 0755 /var/db/karidns
 EOD
 }
 messages: [
@@ -47,8 +48,8 @@ EOD
     {
         type: "remove",
         message: <<EOD
-The user and group karidns, /var/run/karidns and /var/log/named (made by the rc script) are left in place (a configuration and the logs may still use them).
-To remove them when nothing else uses them: pw userdel karidns (it removes the group karidns too), rm -r /var/run/karidns /var/log/named.
+The user and group karidns, /var/run/karidns, /var/log/named (made by the rc script) and /var/db/karidns (the zone store /var/db/karidns/store and your database files may be in it) are left in place (a configuration, the logs and the data may still use them).
+To remove them when nothing else uses them: pw userdel karidns (it removes the group karidns too), rm -r /var/run/karidns /var/log/named, and /var/db/karidns when it holds nothing you need (the store alone: rm -r /var/db/karidns/store).
 EOD
     }
 ]

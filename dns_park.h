@@ -60,6 +60,7 @@ typedef struct {
   uint32_t gen;                      /* changes every time the entry is given out */
   int64_t deadline_ms;               /* CLOCK_MONOTONIC */
   int64_t t_park_ns;                 /* attach parks only: CLOCK_MONOTONIC in ns when the query was parked */
+  int64_t full_ms;                   /* attach parks only: the deadline of the whole park-timeout (CLOCK_MONOTONIC ms); an attach that is still queued at its own deadline is given this one */
   char view[PARK_VIEW_MAX + 1];      /* the view the query came in on */
   char zone[PARK_ZONE_MAX + 1];      /* the zone the query waits for, as the directory names it (canonical, lower case) */
   union {
@@ -109,8 +110,8 @@ uint32_t park_wake(park_table_t *t, const char *view, const char *zone);
 uint32_t park_fail(park_table_t *t, const char *view, const char *zone);
 /* 0.7 store S2: the queries that wait for (view, zone) stay parked, with a new deadline (the attach did not work and the zone is fetched now: the park-timeout runs from here).  Returns how many. */
 uint32_t park_retry(park_table_t *t, const char *view, const char *zone, int64_t new_deadline_ms);
-/* the entry idx (just parked) waits for an ATTACH from the store (the worker notes the time it took, dns_store_status.h), with the time in ns now */
-void park_mark_attach(park_table_t *t, int32_t idx, int64_t now_ns);
+/* the entry idx (just parked) waits for an ATTACH from the store (the worker notes the time it took, dns_store_status.h), with the time in ns now; full_deadline_ms: until when the query may wait at the most (park_expire() extends the attach deadline to it instead of timing the query out: an attach that is queued behind slow reads is not a failure) */
+void park_mark_attach(park_table_t *t, int32_t idx, int64_t now_ns, int64_t full_deadline_ms);
 uint32_t park_wake_all(park_table_t *t);
 /* WAIT -> TIMEOUT for every entry whose deadline is now or past.  Returns how many. */
 uint32_t park_expire(park_table_t *t, int64_t now_ms);

@@ -1288,6 +1288,9 @@ typedef struct {
   zone_ext_shared_t *sh;
 } dbreg_attach_info_t;
 int dbreg_attach_begin(const char *view, const char *zone, dbreg_attach_info_t *info);
+/* the commit of an attach (a new entry): dbreg_commit() on the condition, checked under the registry's lock, that the zone still has no entry and still offers the version
+ * `offered` (source id, serial, digest when set).  -1: not made (out of memory, or the offer changed); the caller keeps the entry. */
+int dbreg_commit_attach(const char *view, const char *name, zone_db_entry_t *entry, const dbreg_attach_info_t *offered, const uint8_t digest[32], bool *shadowed);
 zone_db_entry_t *dbreg_pin_entry(const char *view, const char *zone);
 enum { DBREG_EVICT_OTHER = 0, DBREG_EVICT_LIMIT, DBREG_EVICT_ROOM };
 void dbreg_set_evict_hook(void (*cb)(int reason));

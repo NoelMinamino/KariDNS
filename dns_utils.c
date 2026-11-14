@@ -716,6 +716,7 @@ const char *__tsan_default_suppressions(void) {
 #include <fcntl.h>
 #include <grp.h>
 #include <pwd.h>
+#include <sys/stat.h>
 
 #if defined(__FreeBSD__)
 #define KARIDNS_OPEN_EXEC O_EXEC   /* opened for execution only; fexecve() runs this very file */
@@ -788,6 +789,30 @@ int exec_file_exec_fd(int fd, const char *path, char *const argv[], char *const 
   execve(path, argv, envp);
 #endif
   return -1;
+}
+
+bool store_dir_owner_ok(const struct stat *st, bool privileged, uid_t run_uid, uid_t self, char *why, size_t whylen) {
+  if (privileged) {
+    /* root starts the server and hands the directory to the user it runs as: it belongs to root or to that user, and nobody else can write in it */
+    if (st->st_uid != 0 && run_uid != (uid_t)-1 && st->st_uid != run_uid) {
+      snprintf(why, whylen, "belongs to user %u, neither root nor the user the server runs as", (unsigned)st->st_uid);
+      return false;
+    }
+    if (st->st_uid != 0 && run_uid == (uid_t)-1 && st->st_uid != self) {
+      snprintf(why, whylen, "belongs to user %u, neither root nor the user the server runs as", (unsigned)st->st_uid);
+      return false;
+    }
+    if (st->st_mode & (S_IWGRP | S_IWOTH)) {
+      snprintf(why, whylen, "can be written by group or others (mode %o): it must not be", (unsigned)(st->st_mode & 07777));
+      return false;
+    }
+    return true;
+  }
+  if (st->st_uid != self) {
+    snprintf(why, whylen, "belongs to user %u, not to the user the server runs as", (unsigned)st->st_uid);
+    return false;
+  }
+  return true;
 }
 
 bool identity_names_root(const char *user, const char *group, char *err, size_t errlen) {

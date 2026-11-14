@@ -2817,8 +2817,14 @@ static void zdir_elem_sync(zdir_elem_t *z, zone_db_entry_t *entry) {
 
 static bool apex_replace_locked(dbreg_zone_t *z, zdir_apex_t *apex);
 
-int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, bool created, int64_t source_id,
-                 uint32_t serial, const uint8_t digest[32], bool *shadowed) {
+/* what dbreg_commit_attach() asks of the directory's element at the moment of the commit: the version the attach read the store's record for */
+static bool dbreg_offered_still_locked(const dbreg_zone_t *z, const dbreg_attach_info_t *o) {
+    return z && !(z->flags & ZDIR_F_DELETED) && !zdir_entry(z) && z->source_id == o->source_id && zdir_serial(z) == o->serial &&
+           (!o->digest_set || (z->digest && memcmp(z->digest, o->digest, 32) == 0));
+}
+
+static int dbreg_commit_x(const char *view, const char *name, zone_db_entry_t *entry, bool created, int64_t source_id,
+                          uint32_t serial, const uint8_t digest[32], bool *shadowed, const dbreg_attach_info_t *offered) {
     bool sh_cfg = dbreg_config_shadows(view, name);
     int rc = -1;
     zdir_gent_t *gent = NULL;
@@ -2829,6 +2835,7 @@ int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, boo
     if (!rv) goto out;
     uint32_t h = zdir_name_hash(name);
     dbreg_zone_t *z = dbreg_find(rv, name, h);
+    if (offered && !dbreg_offered_still_locked(z, offered)) goto out;      /* (an attach: a summary or a delete came after the store's record was read; nothing is changed) */
     bool fresh = false;
     if (!z) {
         if (!(z = dbreg_add(rv, name, h))) goto out;
@@ -2929,6 +2936,18 @@ out:
     if (shadowed) *shadowed = sh;
     if (created && atomic_load_explicit(&g_cache_limit, memory_order_relaxed)) cache_peak_note();
     return rc;
+}
+
+int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, bool created, int64_t source_id,
+                 uint32_t serial, const uint8_t digest[32], bool *shadowed) {
+    return dbreg_commit_x(view, name, entry, created, source_id, serial, digest, shadowed, NULL);
+}
+
+/* 0.7 store S2 (L3): the commit of an attach, conditional on what the directory offers at the moment of the commit (under the lock of the registry, so a summary of
+ * the ingest thread cannot come between the check and the store): the zone has no entry and still has the source id, the serial and (when it has one) the digest that the
+ * attach was started with.  -1 (also when the offer changed: nothing was changed, the caller keeps its entry). */
+int dbreg_commit_attach(const char *view, const char *name, zone_db_entry_t *entry, const dbreg_attach_info_t *offered, const uint8_t digest[32], bool *shadowed) {
+    return dbreg_commit_x(view, name, entry, true, offered->source_id, offered->serial, digest, shadowed, offered);
 }
 
 /* A zone of a batch that is not kept in memory because the limit is reached (design 3.3, 8.3): the directory element with the serial, the digest and

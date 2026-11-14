@@ -799,7 +799,21 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
     if (db->store_dir && !db->store_none) {
         struct stat ssb;
         if (stat(db->store_dir, &ssb) == 0) {
-            if (!S_ISDIR(ssb.st_mode)) kc_error(&t, DC_CONF_DATABASE, "database store '%s' is not a directory\n", db->store_dir);
+            if (!S_ISDIR(ssb.st_mode)) {
+                kc_error(&t, DC_CONF_DATABASE, "database store '%s' is not a directory\n", db->store_dir);
+            } else {
+                /* the owner and mode rules of the start (store_dir_owner_ok(), the function db_store_frontend_open() uses): root starts karidns and hands the directory to
+                 * `user`, so it must belong to root or to that user and not be writable by group or others; a start by a user needs a directory of that user */
+                uid_t run_uid = (uid_t)-1;
+                if (cfg->user) {
+                    struct passwd *rpw = getpwnam(cfg->user);
+                    if (rpw) run_uid = rpw->pw_uid;
+                }
+                bool priv = geteuid() == 0 || run_uid != (uid_t)-1;
+                char own[200];
+                if (!store_dir_owner_ok(&ssb, priv, run_uid, geteuid(), own, sizeof(own)))
+                    kc_error(&t, DC_CONF_DATABASE, "database store '%s' %s; karidns refuses to start\n", db->store_dir, own);
+            }
         } else if (errno == ENOENT) {
             char par[PATH_MAX];
             const char *sl = strrchr(db->store_dir, '/');

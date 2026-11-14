@@ -261,6 +261,20 @@ conf a "store \"$T/store\"; store-mode copy; store-threads 3; store-paranoid yes
 cp "$T/a.conf" "$T/k.conf"; kc; grep -E "ERROR|error" "$T/kc.out" | grep -qi "store" && fail "karicheck refused a good store configuration: $(grep -i store "$T/kc.out")" || pass "store, store-mode, store-threads and store-paranoid are accepted"
 conf a "store none;"
 cp "$T/a.conf" "$T/k.conf"; kc; grep -E "ERROR|error" "$T/kc.out" | grep -qi "store" && fail "karicheck refused store none" || pass "store none is accepted"
+if [ "$(id -u)" = 0 ]; then
+    # the owner and mode rules of the start (L8): the same refusals as the server's
+    mkdir -p "$T/wdir" && chmod 0777 "$T/wdir"
+    conf a "store \"$T/wdir\";"
+    cp "$T/a.conf" "$T/k.conf"; kc; [ $? != 0 ] && grep -q "written by group or others" "$T/kc.out" && pass "a store directory that group or others can write in is an error (as at the start)" || fail "karicheck accepted a store directory of mode 0777: $(grep -i store "$T/kc.out")"
+    mkdir -p "$T/odir" && chmod 0700 "$T/odir" && chown 12345:12345 "$T/odir"
+    conf a "store \"$T/odir\";"
+    cp "$T/a.conf" "$T/k.conf"; kc; [ $? != 0 ] && grep -q "belongs to user 12345" "$T/kc.out" && pass "a store directory of another user is an error (as at the start)" || fail "karicheck accepted a store directory of user 12345: $(grep -i store "$T/kc.out")"
+    mkdir -p "$T/rdir" && chmod 0700 "$T/rdir"
+    conf a "store \"$T/rdir\";"
+    cp "$T/a.conf" "$T/k.conf"; kc; grep -E "ERROR|error" "$T/kc.out" | grep -qi "store" && fail "karicheck refused a store directory of root, mode 0700: $(grep -i store "$T/kc.out")" || pass "a store directory of root, mode 0700, is accepted"
+else
+    skip_msg="owner and mode checks of the store directory need root"; echo "SKIP: $skip_msg"
+fi
 conf a "store-mode bogus;"
 cp "$T/a.conf" "$T/k.conf"; kc; [ $? != 0 ] && pass "store-mode bogus is an error" || fail "karicheck accepted store-mode bogus"
 

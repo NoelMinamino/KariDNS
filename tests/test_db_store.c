@@ -43,6 +43,7 @@
 #include "../dns_snapshot_rcu.h"
 #include "../dns_store.h"
 #include "../dns_utils.h"
+#include "../dns_zone_image.h"
 
 static int g_checks = 0, g_failed = 0;
 #define CHECK(cond) do { g_checks++; if (!(cond)) { g_failed++; \
@@ -168,6 +169,58 @@ static void send_zone(int fd, kdb_enc_t *e, const char *zone, uint32_t serial, u
     kdb_enc_raw_msg(e, KDB_T_ZONE_DATA, msg, n);
     kdb_enc_begin(e, KDB_T_ZONE_END);
     kdb_enc_u64(e, 1, 4);
+    kdb_enc_end(e);
+    ch_send(fd, e);
+}
+
+/* a zone of nA address records (SOA, NS, nA x A, SOA), in ZONE_DATA messages of 1000 records */
+static void send_big_zone(int fd, kdb_enc_t *e, const char *zone, uint32_t serial, int64_t sid, int nA) {
+    uint8_t dig[KDB_DIGEST_LEN];
+    memset(dig, (int)serial, sizeof(dig));
+    kdb_enc_begin(e, KDB_T_ZONE_BEGIN);
+    kdb_enc_u16(e, 1, 0); kdb_enc_name(e, 2, zone); kdb_enc_i64(e, 3, sid); kdb_enc_u8(e, 4, KDB_ZK_PRIMARY);
+    kdb_enc_u32(e, 5, serial); kdb_enc_u32(e, 6, 0); kdb_enc_u64(e, 7, (uint64_t)nA + 3); kdb_enc_bytes(e, 8, dig, sizeof(dig));
+    kdb_enc_end(e);
+    ch_send(fd, e);
+    static uint8_t msg[60000];
+    for (int start = 0; start < nA || start == 0; start += 1000) {
+        int n = nA - start < 1000 ? nA - start : 1000;
+        bool head = start == 0, tail = start + 1000 >= nA;
+        memset(msg, 0, 12);
+        msg[2] = 0x84;
+        size_t o = 12, rp[1];
+        int cnt = 0;
+        for (int k = -2; k < n + 1; k++) {
+            char owner[300], ns[300], mail[300];
+            snprintf(ns, sizeof(ns), "ns1.%s", zone);
+            snprintf(mail, sizeof(mail), "host.%s", zone);
+            uint16_t type;
+            if (k == -2) { if (!head) continue; type = 6; snprintf(owner, sizeof(owner), "%s", zone); }
+            else if (k == -1) { if (!head) continue; type = 2; snprintf(owner, sizeof(owner), "%s", zone); }
+            else if (k == n) { if (!tail) continue; type = 6; snprintf(owner, sizeof(owner), "%s", zone); }
+            else { type = 1; snprintf(owner, sizeof(owner), "h%d.%s", start + k, zone); }
+            size_t rd = put_rr_head(msg + o, owner, type, rp);
+            size_t s = o + rd, l = 0;
+            if (type == 6) {
+                l += put_name(msg + s, ns);
+                l += put_name(msg + s + l, mail);
+                l += put_u32(msg + s + l, serial); l += put_u32(msg + s + l, 3600); l += put_u32(msg + s + l, 600); l += put_u32(msg + s + l, 86400); l += put_u32(msg + s + l, 300);
+            } else if (type == 2) {
+                l += put_name(msg + s, ns);
+            } else {
+                msg[s] = 192; msg[s + 1] = 0; msg[s + 2] = 2; msg[s + 3] = (uint8_t)(1 + (start + k) % 250);
+                l = 4;
+            }
+            put_u16(msg + o + rp[0], (uint16_t)l);
+            o = s + l;
+            cnt++;
+        }
+        put_u16(msg + 6, (uint16_t)cnt);
+        kdb_enc_raw_msg(e, KDB_T_ZONE_DATA, msg, o);
+        ch_send(fd, e);
+    }
+    kdb_enc_begin(e, KDB_T_ZONE_END);
+    kdb_enc_u64(e, 1, (uint64_t)nA + 3);
     kdb_enc_end(e);
     ch_send(fd, e);
 }
@@ -344,6 +397,15 @@ static void *reader_thread(void *arg) {
         }
     }
     return NULL;
+}
+
+/* the digest the test loader sends for serial 1 (send_zone(): every byte is the serial) */
+static const uint8_t dig1[32] = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+
+/* the writer is slow: every journal record of the store takes a millisecond (the hook runs on the writer thread between the cells and the counters of a record) */
+static void slow_writer_hook(store_t *s) {
+    (void)s;
+    usleep(1000);
 }
 
 static int run_mode(const char *mode) {
@@ -553,6 +615,189 @@ static int run_mode(const char *mode) {
     CHECK(attach_by_worker("a4.test.", &k) == 1);
     CHECK(attach_by_worker("none.test.", &k) == 0);
 
+    /* -- M5: a fetch of the zone is on its way (LOADING): the attach that finds it busy gives the queries that wait the park-timeout (a retry key), not nothing */
+    CHECK(dbreg_fetch_begin("default", "a3.test.") == DBREG_FETCH_STARTED);            /* (a3 is out of memory, its record is stored) */
+    drain_wakes();
+    db_store_counters(&c0);
+    CHECK(park_attach_request(0, "default", "a3.test.") && wake_next(&k, 5000) && k.retry && !k.failed && strcmp(k.zone, "a3.test.") == 0);
+    db_store_counters(&c1);
+    CHECK(c1.attach_busy == c0.attach_busy + 1);
+    dbreg_fetch_end("default", "a3.test.");
+    CHECK(attach_by_worker("a3.test.", &k) == 1);                           /* (and when the fetch is over, the attach works) */
+
+    /* -- L3: a summary that comes after the record was read and before the commit wins: the attach commits nothing, the entry is not made */
+    CHECK(evict_zone("a0.test."));
+    {
+        dbreg_attach_info_t ai;
+        CHECK(dbreg_attach_begin("default", "a0.test.", &ai) == DBREG_ATT_STARTED && ai.serial == 1 && ai.source_id == 100);
+        CHECK(dbreg_apply_summary("default", "a0.test.", 100, 50, false, 0, 0, 0));          /* (the ingest thread: the directory offers serial 50 now) */
+        bool sh = false;
+        CHECK(dbreg_commit_attach("default", "a0.test.", NULL, &ai, ai.digest, &sh) != 0);
+        CHECK(zdir_entry(elem_of("a0.test.")) == NULL);
+        if (ai.sh) zone_ext_shared_unref(ai.sh);
+        dbreg_fetch_end("default", "a0.test.");
+        CHECK(dbreg_apply_summary("default", "a0.test.", 100, 1, false, 0, 0, 0));           /* (back to what the store has) */
+        CHECK(db_store_attach_possible("default", "a0.test.", 1));
+    }
+
+    /* -- L7: the directory offers the serial of the record with another digest (the same serial, another version): the attach is stale, the record is set back to known, and
+     *    the next query does not attach again but fetches at once */
+    {
+        uint8_t other[32];
+        memset(other, 0xee, sizeof(other));
+        CHECK(dbreg_commit_cold("default", "a0.test.", 100, 1, other, NULL) == 0);
+        CHECK(db_store_attach_possible("default", "a0.test.", 1));                           /* (the worker only sees the serial) */
+        db_store_counters(&c0);
+        CHECK(attach_by_worker("a0.test.", &k) == 0 && k.retry);
+        db_store_counters(&c1);
+        CHECK(c1.attach_stale == c0.attach_stale + 1);
+        CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "a0.test.") == 0);
+        CHECK(db_store_sync(5000));
+        CHECK(!db_store_attach_possible("default", "a0.test.", 1));                          /* (the record is "known": the worker takes the fetch path) */
+        send_zone(f[0], &e, "a0.test.", 1, m.u.fetch_req.request_id, 100);
+        CHECK(wake_next(&k, 5000) && !k.failed && !k.retry);
+        CHECK(db_store_sync(5000));
+        CHECK(db_store_attach_possible("default", "a0.test.", 1));                           /* (the install wrote it again) */
+    }
+
+    /* -- M3: a record whose image has the right checksum and a wrong structure (a forgery: the checksum is not keyed) is not served: it is found invalid at the attach */
+    {
+        uint8_t *forged = old_len ? malloc(old_len) : NULL;
+        size_t at = 0;
+        char vw[96];
+        for (size_t off = sizeof(zone_image_t); forged && off < old_len && !at; off++) {
+            for (int x = 0; x < 3 && !at; x++) {
+                memcpy(forged, old_copy, old_len);
+                forged[off] = x == 0 ? (uint8_t)(forged[off] ^ 0xff) : x == 1 ? 0xff : 0x00;
+                if (forged[off] != old_copy[off] && zone_image_validate(forged, old_len, vw, sizeof(vw)) != 0) at = off;
+            }
+        }
+        CHECK(forged && at != 0);
+        store_zone_t zi;
+        store_read_lock();
+        uint32_t zid = store_find(st, (uint16_t)store_view_id(st, "default"), "a7.test", 7);
+        CHECK(zid != STORE_NONE && store_zone_get(st, zid, &zi) == 0 && zi.state == STORE_STATE_STORED);
+        store_read_unlock();
+        store_meta_t meta;
+        memset(&meta, 0, sizeof(meta));
+        meta.source_id = zi.source_id; meta.source = zi.source; meta.flags = zi.flags; meta.serial = zi.serial; meta.settings = zi.settings;
+        meta.stamp_gen = zi.stamp_gen; meta.stamp_time = zi.stamp_time;
+        memcpy(meta.digest, zi.digest, sizeof(meta.digest));
+        CHECK(forged && store_put(st, (uint16_t)store_view_id(st, "default"), "a7.test", 7, &meta, forged, old_len, NULL) == 0);
+        CHECK(evict_zone("a7.test."));
+        CHECK(db_store_attach_possible("default", "a7.test.", 8));
+        db_store_counters(&c0);
+        CHECK(attach_by_worker("a7.test.", &k) == 0 && k.retry);
+        db_store_counters(&c1);
+        CHECK(c1.attach_damaged == c0.attach_damaged + 1 && c1.validated == c0.validated + 1);
+        CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "a7.test.") == 0);
+        send_zone(f[0], &e, "a7.test.", 8, m.u.fetch_req.request_id, 107);
+        CHECK(wake_next(&k, 5000) && !k.failed && !k.retry);
+        CHECK(db_store_sync(5000));
+        CHECK(evict_zone("a7.test.") && attach_by_worker("a7.test.", &k) == 1);            /* (the install wrote a good record) */
+        free(forged);
+        db_store_counters(&c1);
+        printf("  zone_image_validate() at the attach: %llu images, %.2f us each (%zu bytes the one of a zone with four records)\n", (unsigned long long)c1.validated,
+               c1.validated ? (double)c1.validate_ns / 1000.0 / (double)c1.validated : 0.0, old_len);
+    }
+
+    /* -- L2: the queue of write-through jobs is full (a slow writer): the producer waits, nothing runs out of order and nothing is dropped.  The last job of a zone wins:
+     *    a zone that was set back to known 4300 times and is then put is stored */
+    {
+        store_test_before_counters = slow_writer_hook;
+        db_store_counters(&c0);
+        for (int i = 0; i < DB_STORE_WQ_MAX + 200; i++) db_store_invalidate("default", "a0.test.", 100, 1);
+        db_store_write_through("default", "a0.test.", 100, 1, dig1);
+        CHECK(db_store_sync(120000));
+        store_test_before_counters = NULL;
+        db_store_counters(&c1);
+        CHECK(c1.wt_inline == c0.wt_inline && c1.wt_dropped == c0.wt_dropped);
+        CHECK(c1.wt_queued == c0.wt_queued + DB_STORE_WQ_MAX + 201);
+        store_zone_t zi;
+        store_read_lock();
+        uint32_t zid = store_find(st, (uint16_t)store_view_id(st, "default"), "a0.test", 7);
+        CHECK(zid != STORE_NONE && store_zone_get(st, zid, &zi) == 0 && zi.state == STORE_STATE_STORED);        /* (the put was the last job and came last) */
+        store_read_unlock();
+    }
+
+    /* -- the pinned bytes: a write-through job keeps the version in memory until the writer has copied it; their total is bounded (here 3000 bytes: a few images) and a producer
+     *    that would go beyond it waits for the writer */
+    {
+        store_test_before_counters = slow_writer_hook;
+        db_store_test_pin_cap(3000);
+        db_store_counters(&c0);
+        for (int i = 0; i < 60; i++) {
+            db_store_invalidate("default", "a0.test.", 100, 1);                                /* (the job before makes the put a real write: a copy of a record that is the same is skipped, and quick) */
+            db_store_write_through("default", "a0.test.", 100, 1, dig1);
+        }
+        CHECK(db_store_sync(60000));
+        store_test_before_counters = NULL;
+        db_store_counters(&c1);
+        CHECK(c1.pin_waits > c0.pin_waits);
+        CHECK(c1.pinned_peak > 0 && c1.pinned_peak <= 3000);
+        db_store_test_pin_cap(DB_STORE_PIN_MAX_BYTES);
+        printf("  pinned bytes: peak %llu of a bound of 3000 (%llu producer waits)\n", (unsigned long long)c1.pinned_peak, (unsigned long long)(c1.pin_waits - c0.pin_waits));
+    }
+
+    /* -- WP4: a summary of the same serial in a later batch (the loader found the zone changed: a change log entry, a reload) sets the record of a zone that is out of memory
+     *    back to "known": its image is not trusted any more, the next query fetches.  (A summary needs memory-limit; the first batch is not one: its summaries leave the store alone.) */
+    {
+        CHECK(evict_zone("a1.test."));
+        CHECK(db_store_attach_possible("default", "a1.test.", 2));
+        dbreg_cache_set_limit(1ull << 40);
+        db_store_counters(&c0);
+        batch_begin(a[0], &e, 5, KDB_BATCH_DIFF);
+        {
+            uint8_t zero[KDB_DIGEST_LEN] = { 0 };
+            kdb_enc_begin(&e, KDB_T_ZONE_BEGIN);
+            kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, "a1.test."); kdb_enc_i64(&e, 3, 101); kdb_enc_u8(&e, 4, KDB_ZK_PRIMARY);
+            kdb_enc_u32(&e, 5, 2); kdb_enc_u32(&e, 6, KDB_ZF_SUMMARY); kdb_enc_u64(&e, 7, 0); kdb_enc_bytes(&e, 8, zero, sizeof(zero));
+            kdb_enc_u32(&e, 12, 3600); kdb_enc_u32(&e, 13, 600); kdb_enc_u32(&e, 14, 86400);
+            kdb_enc_end(&e);
+            kdb_enc_begin(&e, KDB_T_ZONE_END);
+            kdb_enc_u64(&e, 1, 0);
+            kdb_enc_end(&e);
+            ch_send(a[0], &e);
+        }
+        CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_ZONE_RESULT);
+        batch_end(a[0], &e, &mainc, 5, 1, 0);
+        CHECK(db_store_sync(5000));
+        dbreg_cache_set_limit(0);
+        db_store_counters(&c1);
+        CHECK(c1.wt_invalidated == c0.wt_invalidated + 1);
+        store_zone_t zi;
+        store_read_lock();
+        uint32_t zid = store_find(st, (uint16_t)store_view_id(st, "default"), "a1.test", 7);
+        CHECK(zid != STORE_NONE && store_zone_get(st, zid, &zi) == 0 && zi.state == STORE_STATE_KNOWN && zi.serial == 2 && zi.img_len == 0);
+        store_read_unlock();
+        CHECK(!db_store_attach_possible("default", "a1.test.", 2));
+    }
+
+    /* -- the cost of the validation grows with the image (O(size)): a zone of 20000 addresses, attached three times */
+    {
+        batch_begin(a[0], &e, 4, KDB_BATCH_DIFF);
+        send_big_zone(a[0], &e, "big.test.", 1, 200, 20000);
+        batch_end(a[0], &e, &mainc, 4, 1, 0);
+        CHECK(db_store_sync(30000));
+        for (int i = 0; i < 100 && !(elem_of("big.test.") && zdir_entry(elem_of("big.test."))); i++) usleep(50000);
+        store_zone_t zi;
+        store_read_lock();
+        uint32_t zid = store_find(st, (uint16_t)store_view_id(st, "default"), "big.test", 8);
+        CHECK(zid != STORE_NONE && store_zone_get(st, zid, &zi) == 0 && zi.state == STORE_STATE_STORED);
+        store_read_unlock();
+        CHECK(evict_zone("big.test.") && db_store_attach_possible("default", "big.test.", 1));
+        db_store_counters(&c0);
+        int okc = 0;
+        for (int i = 0; i < 3; i++) {
+            okc += attach_by_worker("big.test.", &k) == 1;
+            CHECK(evict_zone("big.test."));
+        }
+        db_store_counters(&c1);
+        CHECK(okc == 3 && c1.validated == c0.validated + 3);
+        printf("  zone_image_validate() of a zone of 20000 addresses: %u bytes, %.2f ms each (%.1f ns/byte)\n", (unsigned)zi.img_len,
+               (double)(c1.validate_ns - c0.validate_ns) / 3.0 / 1e6, (double)(c1.validate_ns - c0.validate_ns) / 3.0 / (double)(zi.img_len ? zi.img_len : 1));
+    }
+
     /* a zone the database deletes is deleted from the store */
     batch_begin(a[0], &e, 3, KDB_BATCH_DIFF);
     kdb_enc_begin(&e, KDB_T_ZONE_DELETE);
@@ -615,6 +860,23 @@ static int run_mode(const char *mode) {
     free(old_copy);
     gc_snapshot_wait_idle();                                                 /* (the reclaim thread that the last delta started: joined, not left to the exit) */
     db_store_stop();
+    /* -- M4: a stop is a clean stop: the next open says so, replays nothing and (after a reboot) does not rebuild */
+    {
+        int dfd = open(sdir, O_RDONLY | O_DIRECTORY);
+        store_opts_t so;
+        store_opts_default(&so);
+        so.boot_id = 4242;                                                   /* (another boot than the one the store was written in) */
+        store_t *s2 = NULL;
+        CHECK(dfd >= 0 && store_open(dfd, &so, &s2) == 0 && s2);
+        if (s2) {
+            store_stats_t ss2;
+            store_stats(s2, &ss2);
+            CHECK(ss2.recovery.was_clean && ss2.recovery.records_replayed == 0 && !ss2.recovery.rebuilt && !ss2.recovery.journal_torn);
+            CHECK(ss2.zones_stored >= NZ - 1);
+            (void)store_close(s2);
+        }
+        if (dfd >= 0) close(dfd);
+    }
     char cmd[700];
     snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
     (void)!system(cmd);
@@ -622,8 +884,67 @@ static int run_mode(const char *mode) {
     return g_failed ? 1 : 0;
 }
 
+/* ---------------------------------------------------------------- M1: the lock file of the directory */
+/* The directory belongs to the user the server runs as, so that user can put anything under the name "lock" before the start.  Run as root, the start is privileged: it must not
+ * give a file of root's to the run user (a hard link), wait for a FIFO, follow a link, or trust a file of another user; run by a user, the same files are refused or replaced.
+ * The file the link names is never touched, and the lock file in the end is a plain file with one name that belongs to the user the server runs as. */
+static bool same_file(const struct stat *a, const struct stat *b) { return a->st_ino == b->st_ino && a->st_dev == b->st_dev; }
+static int lock_tests(void) {
+    printf("[the lock file of the store directory]\n");
+    char base[] = "/tmp/test_db_store_lock.XXXXXX";
+    if (!mkdtemp(base)) { perror("mkdtemp"); return 1; }
+    const bool root = geteuid() == 0;
+    const uid_t run_uid = root ? 65534 : (uid_t)-1;
+    const gid_t run_gid = root ? 65534 : (gid_t)-1;
+    char victim[700], sdir[700], lock[800], msg[400];
+    snprintf(victim, sizeof(victim), "%s/victim", base);
+    snprintf(sdir, sizeof(sdir), "%s/s", base);
+    snprintf(lock, sizeof(lock), "%s/lock", sdir);
+    database_config_t db;
+    memset(&db, 0, sizeof(db));
+    db.enabled = true;
+    db.store_dir = sdir;
+    for (int kase = 0; kase < 5; kase++) {
+        char cmd[800];
+        snprintf(cmd, sizeof(cmd), "rm -rf %s %s", sdir, victim);
+        (void)!system(cmd);
+        int vfd = open(victim, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+        CHECK(vfd >= 0 && write(vfd, "secret", 6) == 6);
+        if (vfd >= 0) close(vfd);
+        CHECK(mkdir(sdir, 0700) == 0);
+        struct stat v0, l0;
+        memset(&l0, 0, sizeof(l0));
+        CHECK(stat(victim, &v0) == 0);
+        const char *what = "";
+        switch (kase) {
+        case 0: what = "a hard link to another file (its owner is not changed, the name is replaced)"; CHECK(link(victim, lock) == 0); break;
+        case 1: what = "a FIFO"; CHECK(mkfifo(lock, 0600) == 0); break;
+        case 2: what = "a symbolic link"; CHECK(symlink(victim, lock) == 0); break;
+        case 3: what = "a plain file (kept)"; { int fd = open(lock, O_CREAT | O_RDWR, 0600); CHECK(fd >= 0); if (fd >= 0) close(fd); } CHECK(stat(lock, &l0) == 0); break;
+        case 4: what = "a file of another user"; if (root) { int fd = open(lock, O_CREAT | O_RDWR, 0600); CHECK(fd >= 0); if (fd >= 0) close(fd); CHECK(chown(lock, 12345, 12345) == 0); } else { what = "nothing"; } break;
+        }
+        printf("  %s\n", what);
+        alarm(30);                                                           /* (a FIFO that is opened the wrong way blocks for ever: the alarm ends the test) */
+        bool ok = db_store_frontend_open(&db, root, run_uid, run_gid, msg, sizeof(msg));
+        alarm(0);
+        CHECK(ok && db_store_dir_fd() >= 0);
+        struct stat v1, l1;
+        CHECK(stat(victim, &v1) == 0 && v1.st_uid == v0.st_uid && v1.st_gid == v0.st_gid && (v1.st_mode & 07777) == (v0.st_mode & 07777) && v1.st_size == 6 && v1.st_nlink == 1);
+        CHECK(lstat(lock, &l1) == 0 && S_ISREG(l1.st_mode) && l1.st_nlink == 1 && !same_file(&l1, &v1));
+        CHECK(l1.st_uid == (root ? run_uid : geteuid()));
+        if (kase == 3) CHECK(same_file(&l0, &l1));                           /* a lock file that is fine is kept, not made again */
+        db_store_frontend_close();
+    }
+    char cmd[800];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
+    (void)!system(cmd);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1) return run_mode(strcmp(argv[1], "copy") == 0 ? "copy" : "map");
+    if (lock_tests() != 0 || g_failed) { printf("%d checks, %d failed\n", g_checks, g_failed); return 1; }
+    printf("lock file: %d checks\n", g_checks);
     /* the second mode is a second process: the ingest thread and the store are process wide */
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "%s copy", argv[0]);

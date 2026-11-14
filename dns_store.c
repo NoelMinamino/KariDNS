@@ -112,6 +112,9 @@
 #define ST_MAXV         STORE_MAX_VIEWS
 #define ST_MAXSRC       STORE_MAX_SOURCES
 #define ST_MAXSEG       STORE_MAX_SEGS
+#define ST_IX_MAX_SLOTS (1ull << 36)      /* more than the 2^32 zone ids can fill (3 slots per zone); keeps every size computation far from a wrap */
+#define ST_SEG_MAX      (1ull << 42)      /* what a record location can address: 36 bits of 64 B units */
+#define ST_V_MAX        (1ull << 56)      /* no counter of the superblock is above this */
 
 /* flat counter array v[] (superblock + journal "V" ops) */
 enum {
@@ -125,7 +128,7 @@ enum {
 #define ST_NV             4400u
 
 /* journal op types */
-enum { OP_ZREC = 1, OP_NX, OP_IX, OP_SX, OP_V, OP_VIEW, OP_SRC, OP_GEN };
+enum { OP_ZREC = 1, OP_NX, OP_IX, OP_SX, OP_V, OP_VIEW, OP_SRC, OP_GEN, OP_REBUILD };
 
 /* file kinds */
 enum { FK_ZT = 1, FK_ZC, FK_NX, FK_IX, FK_SX, FK_SEG, FK_JRN };
@@ -265,6 +268,7 @@ struct store {
   uint32_t ix_gen, sx_gen;              /* current */
   uint32_t slot_jrn[2], slot_ix[2], slot_sx[2];
   uint64_t boot_id;
+  uint64_t free_epoch;                  /* writer: the retire epoch of the newest cell that was put on the free list (a cell is reused after its grace period) */
   _Atomic uint64_t ckpt_lsn, ckpt_time, ckpt_us;
   _Atomic bool clean_on_disk;
   _Atomic uint64_t v[ST_NV];
@@ -300,6 +304,8 @@ struct store {
 
 #ifdef KARIDNS_UNIT_TEST
 long store_test_crash_countdown = 0;
+void (*store_test_before_counters)(store_t *s) = NULL;
+long store_test_fail_commit = 0;
 static void st_crash_point(void) {
   long c = store_test_crash_countdown;
   if (c > 0 && --c == 0) kill(getpid(), SIGKILL);
@@ -561,6 +567,24 @@ static inline uint32_t zrec_stored_crc(const r64_t *zt) {
   return c;
 }
 
+/* How long a reader waits for a cell that is being written (odd sequence counter) or changed under its copy.  A writer that is descheduled in the middle of a cell (a host
+ * under load) makes readers wait, not fail: spin, yield, then sleep in short steps; only after ST_SEQ_GIVEUP_US the cell is taken for damaged (a counter that a crash left odd is
+ * repaired by the replay or the rebuild, so this bound is for a forged one). */
+#define ST_SEQ_GIVEUP_US 500000u
+typedef struct { unsigned n; uint64_t t0; } seqwait_t;
+static bool seq_wait(seqwait_t *w) {
+  if (w->n++ < 16) return true;
+  if (w->n < 256) {
+    sched_yield();
+    return true;
+  }
+  if (w->n == 256) w->t0 = st_now_us();
+  else if (st_now_us() - w->t0 > ST_SEQ_GIVEUP_US) return false;
+  struct timespec ts = { 0, 50000 };
+  nanosleep(&ts, NULL);
+  return true;
+}
+
 #define VG(s, i)    atomic_load_explicit(&(s)->v[(i)], memory_order_relaxed)
 #define VS(s, i, x) atomic_store_explicit(&(s)->v[(i)], (x), memory_order_relaxed)
 
@@ -600,17 +624,18 @@ static int zrec_read_cells(const store_t *s, uint32_t z, r64_t *zt, r64_t *zc) {
 static int zrec_read(const store_t *s, uint32_t z, r64_t *zt, r64_t *zc) {
   if ((uint64_t)z >= st_zt_cap(s) || (uint64_t)z >= st_zc_cap(s)) return -ENOENT;
   const _Atomic uint64_t *cc = zc_cell(s, z);
-  for (unsigned tries = 0; tries < 20000; tries++) {
+  seqwait_t sw = { 0, 0 };
+  for (;;) {
     uint32_t s1 = (uint32_t)(atomic_load_explicit(&cc[7], memory_order_acquire) >> 32);
     if (s1 & 1u) {
-      if (tries >= 16) sched_yield();
+      if (!seq_wait(&sw)) break;
       continue;
     }
     r64_load(zt_cell(s, z), zt);
     r64_load(cc, zc);
     atomic_thread_fence(memory_order_acquire);
     uint32_t s2 = (uint32_t)(atomic_load_explicit(&cc[7], memory_order_relaxed) >> 32);
-    if (s1 != s2) continue;
+    if (s1 != s2) { if (!seq_wait(&sw)) break; continue; }
     zc->w[7] &= 0xffffffffu;
     return zrec_crc(zt, zc) == zrec_stored_crc(zt) ? 0 : -EBADMSG;
   }
@@ -628,6 +653,25 @@ static inline uint8_t zt_state_fast(const store_t *s, uint32_t z) {
   return (uint8_t)(w3 >> 32);
 }
 
+/* Is `val` a value that slot `fid` of the counter array can have?  The superblock and the journal are checked by a CRC only, which a damaged file does not
+ * pass but a forged one does, so every value that is used as an index, a position or a size is bounded before it is taken in (needs zt and nx opened:
+ * their reserves are the limits of zone ids and name offsets). */
+static bool v_value_ok(const store_t *s, uint32_t fid, uint64_t val) {
+  if (fid >= ST_NV) return false;
+  uint64_t zmax = (uint64_t)s->zt.reserve / ST_REC;
+  switch (fid) {
+  case V_HWM:
+  case V_FREE_COUNT: return val <= zmax;
+  case V_FREE_HEAD: return val == STORE_NONE || val < zmax;
+  case V_NX_USED: return val <= (uint64_t)s->nx.reserve;
+  case V_NSEGS:
+  case V_CUR_SEG: return val <= ST_MAXSEG;
+  default: break;
+  }
+  if (fid >= V_SEG(0, 0) && fid < V_SEG(ST_MAXSEG + 1, 0)) return val <= ST_SEG_MAX;
+  return val <= ST_V_MAX;
+}
+
 /* the full name of a zone from its zt cell (inline part, or nx); false when the cell points outside nx */
 static bool zt_fullname(const store_t *s, const zt_t *z, uint8_t *out) {
   if (z->klen <= ST_NAME_INL) {
@@ -642,27 +686,44 @@ static bool zt_fullname(const store_t *s, const zt_t *z, uint8_t *out) {
   return true;
 }
 
-/* does the zt cell of z hold (view, name)?  fn is folded.  Hot path of every lookup: no CRC, only word loads. */
+/* does the zt cell of z hold (view, name)?  fn is folded.  Hot path of every lookup: no CRC, only word loads.  The words are read under the
+ * cell's sequence counter (see zrec_write): a cell that is being rewritten (a delete turns it into a FREE cell, a reuse writes another name) is
+ * never compared half old, half new. */
 static bool st_name_eq(const store_t *s, uint32_t z, uint16_t view, const uint8_t *fn, size_t len) {
-  if ((uint64_t)z >= st_zt_cap(s)) return false;
-  const _Atomic uint64_t *c = zt_cell(s, z);
-  uint64_t w3 = atomic_load_explicit(&c[3], memory_order_acquire);
-  uint8_t state = (uint8_t)(w3 >> 32), klen = (uint8_t)(w3 >> 40);
-  if (state == STORE_STATE_FREE || (uint16_t)w3 != view || klen != len) return false;
-  uint8_t nb[ST_NAME_INL + 2];   /* name bytes 0..1 are in w3, 2..33 in w4..w7 */
-  nb[0] = (uint8_t)(w3 >> 48);
-  nb[1] = (uint8_t)(w3 >> 56);
-  for (int i = 0; i < 4; i++) {
-    uint64_t w = atomic_load_explicit(&c[4 + i], memory_order_relaxed);
-    memcpy(nb + 2 + 8 * i, &w, 8);
+  if ((uint64_t)z >= st_zt_cap(s) || (uint64_t)z >= st_zc_cap(s)) return false;
+  const _Atomic uint64_t *c = zt_cell(s, z), *cc = zc_cell(s, z);
+  seqwait_t sw = { 0, 0 };
+  for (;;) {
+    uint32_t s1 = (uint32_t)(atomic_load_explicit(&cc[7], memory_order_acquire) >> 32);
+    if (s1 & 1u) {
+      if (!seq_wait(&sw)) break;
+      continue;
+    }
+    uint64_t w3 = atomic_load_explicit(&c[3], memory_order_acquire);
+    uint8_t state = (uint8_t)(w3 >> 32), klen = (uint8_t)(w3 >> 40);
+    if (state == STORE_STATE_FREE || (uint16_t)w3 != view || klen != len) {
+      atomic_thread_fence(memory_order_acquire);
+      if (s1 != (uint32_t)(atomic_load_explicit(&cc[7], memory_order_relaxed) >> 32)) { if (!seq_wait(&sw)) break; continue; }
+      return false;
+    }
+    uint8_t nb[ST_NAME_INL + 2];   /* name bytes 0..1 are in w3, 2..33 in w4..w7 */
+    nb[0] = (uint8_t)(w3 >> 48);
+    nb[1] = (uint8_t)(w3 >> 56);
+    for (int i = 0; i < 4; i++) {
+      uint64_t w = atomic_load_explicit(&c[4 + i], memory_order_relaxed);
+      memcpy(nb + 2 + 8 * i, &w, 8);
+    }
+    atomic_thread_fence(memory_order_acquire);
+    if (s1 != (uint32_t)(atomic_load_explicit(&cc[7], memory_order_relaxed) >> 32)) { if (!seq_wait(&sw)) break; continue; }
+    if (len <= ST_NAME_INL) return memcmp(nb, fn, len) == 0;
+    uint64_t off;
+    memcpy(&off, nb, 8);
+    if (memcmp(nb + 8, fn, ST_NAME_INL - 8) != 0) return false;
+    uint64_t avail = atomic_load_explicit(&s->nx_avail, memory_order_acquire);
+    if (off > avail || (uint64_t)len > avail - off) return false;
+    return memcmp(s->nx.base + off, fn, len) == 0;
   }
-  if (len <= ST_NAME_INL) return memcmp(nb, fn, len) == 0;
-  uint64_t off;
-  memcpy(&off, nb, 8);
-  if (memcmp(nb + 8, fn, ST_NAME_INL - 8) != 0) return false;
-  uint64_t avail = atomic_load_explicit(&s->nx_avail, memory_order_acquire);
-  if (off > avail || (uint64_t)len > avail - off) return false;
-  return memcmp(s->nx.base + off, fn, len) == 0;
+  return false;
 }
 
 /* ------------------------------------------------------------------------------------------------------------------ */
@@ -861,6 +922,7 @@ static int ixgen_create(store_t *s, uint32_t kind, uint32_t gen, uint64_t nslots
   return 0;
 }
 static int ixgen_open(store_t *s, uint32_t kind, uint32_t gen, uint64_t nslots, ixgen_t **out) {
+  if (nslots == 0 || nslots > ST_IX_MAX_SLOTS || gen == 0) return -EBADMSG;      /* (before any size is computed from it: a forged count would wrap those) */
   char name[32];
   st_name_ix(name, sizeof(name), kind == FK_IX ? "ix" : "sx", gen);
   ixgen_t *g = calloc(1, sizeof(*g));
@@ -874,7 +936,7 @@ static int ixgen_open(store_t *s, uint32_t kind, uint32_t gen, uint64_t nslots, 
   fhdr_t h;
   struct stat st;
   int r = st_pread_all(fd, &h, sizeof(h), 0);
-  if (r < 0 || !fhdr_ok(s, &h, kind, gen) || h.a != nslots || nslots == 0 || fstat(fd, &st) != 0 ||
+  if (r < 0 || !fhdr_ok(s, &h, kind, gen) || h.a != nslots || fstat(fd, &st) != 0 || st.st_size < 0 ||
       (uint64_t)st.st_size < ST_HDR_PAGE + nslots * 8) {
     ixgen_free(g);
     return -EBADMSG;
@@ -949,12 +1011,21 @@ static uint64_t slot_find_insert(const ixgen_t *g, uint64_t h, bool *was_empty) 
 }
 static bool sx_match(const store_t *s, uint32_t z, uint16_t source, uint16_t view, int64_t dom) {
   if ((uint64_t)z >= st_zt_cap(s) || (uint64_t)z >= st_zc_cap(s)) return false;
-  uint64_t w3 = atomic_load_explicit(&zt_cell(s, z)[3], memory_order_acquire);
-  if ((uint8_t)(w3 >> 32) == STORE_STATE_FREE || (uint16_t)w3 != view) return false;
   const _Atomic uint64_t *c = zc_cell(s, z);
-  uint64_t w0 = atomic_load_explicit(&c[0], memory_order_relaxed);
-  uint64_t w7 = atomic_load_explicit(&c[7], memory_order_relaxed);
-  return (int64_t)w0 == dom && (uint16_t)w7 == source;
+  seqwait_t sw = { 0, 0 };
+  for (;;) {                /* (under the sequence counter of the cell, as st_name_eq()) */
+    uint64_t w7 = atomic_load_explicit(&c[7], memory_order_acquire);
+    if ((uint32_t)(w7 >> 32) & 1u) {
+      if (!seq_wait(&sw)) break;
+      continue;
+    }
+    uint64_t w3 = atomic_load_explicit(&zt_cell(s, z)[3], memory_order_acquire);
+    uint64_t w0 = atomic_load_explicit(&c[0], memory_order_relaxed);
+    atomic_thread_fence(memory_order_acquire);
+    if ((uint32_t)(w7 >> 32) != (uint32_t)(atomic_load_explicit(&c[7], memory_order_relaxed) >> 32)) { if (!seq_wait(&sw)) break; continue; }
+    return (uint8_t)(w3 >> 32) != STORE_STATE_FREE && (uint16_t)w3 == view && (int64_t)w0 == dom && (uint16_t)w7 == source;
+  }
+  return false;
 }
 static uint32_t sx_lookup(const store_t *s, const ixgen_t *g, uint16_t source, uint16_t view, int64_t dom, uint64_t h) {
   uint32_t tag = st_tag(h);
@@ -1192,6 +1263,9 @@ static int apply_ops(store_t *s, const uint8_t *ops, size_t len) {
       break;
     }
     case OP_V: {
+#ifdef KARIDNS_UNIT_TEST
+      if (store_test_before_counters) store_test_before_counters(s);
+#endif
       uint32_t n;
       if (pl < 8) { bad = -EINVAL; break; }
       memcpy(&n, p, 4);
@@ -1201,7 +1275,7 @@ static int apply_ops(store_t *s, const uint8_t *ops, size_t len) {
         uint64_t val;
         memcpy(&fid, p + 8 + i * 16, 4);
         memcpy(&val, p + 8 + i * 16 + 8, 8);
-        if (fid >= ST_NV) { bad = -EINVAL; continue; }
+        if (!v_value_ok(s, fid, val)) { bad = -EINVAL; continue; }       /* (the value is used as an index or a size: not taken in) */
         VS(s, fid, val);
       }
       break;
@@ -1242,6 +1316,10 @@ static int apply_ops(store_t *s, const uint8_t *ops, size_t len) {
       if (which > 1 || switch_gen(s, which, gen, ns) < 0) bad = -EINVAL;
       break;
     }
+    case OP_REBUILD:
+      /* a marker that store_repair() logs before it changes a cell: a replay that finds it (the repair did not reach its checkpoint) has the derived tables rebuilt */
+      bad = -EINVAL;
+      break;
     default:
       bad = -EINVAL;
       break;
@@ -1276,11 +1354,16 @@ static int journal_open_new(store_t *s, uint32_t gen, uint64_t base_lsn) {
   return 0;
 }
 
+static int checkpoint_locked(store_t *s, bool clean);
+
 /* finish the builder's record (counters last), give it its LSN and CRC, write it.  The cells are not touched. */
 static int journal_append(store_t *s) {
   jb_t *j = &s->jb;
   int r = jb_flush_v(j);
   if (r < 0) return r;
+  /* the last checkpoint on disk says "clean stop" (store_checkpoint_clean()) and this is a change after it: the flag is cleared durably first, as the open does
+   * (a record after a clean flag would not make the next open after a power loss rebuild the tables) */
+  if (s->clean_on_disk && (r = checkpoint_locked(s, false)) < 0) return r;
   jrec_t h;
   h.magic = ST_MAGIC_JREC;
   h.len = (uint32_t)j->len;
@@ -1310,6 +1393,9 @@ static int journal_commit_apply(store_t *s) {
 }
 
 static int commit_locked(store_t *s) {
+#ifdef KARIDNS_UNIT_TEST
+  if (store_test_fail_commit > 0 && --store_test_fail_commit == 0) return -EIO;
+#endif
   uint32_t nsegs = (uint32_t)VG(s, V_NSEGS);
   if (nsegs > ST_MAXSEG) nsegs = ST_MAXSEG;
   for (uint32_t n = 1; n <= nsegs; n++) {
@@ -1369,6 +1455,20 @@ static void sb_fill(store_t *s, sb_t *b, bool clean, uint64_t seq, uint32_t jrn_
   b->f.crc = 0;
   b->f.crc = st_crc32c(0, b, sizeof(*b));
 }
+/* The fields of a superblock copy that are used as sizes, counts or indexes, against hard limits (the CRC is no protection against a forged copy).  The
+ * values that need the open files (zt, nx) are checked in adopt_sb(). */
+static bool sb_fields_ok(const sb_t *b) {
+  if (b->f.nviews > ST_MAXV || b->f.seq == 0) return false;
+  if (b->f.seg_size < 65536 || b->f.seg_size > ST_SEG_MAX) return false;
+  if (b->f.jrn_gen == 0 || b->f.ix_gen == 0 || b->f.sx_gen == 0) return false;
+  if (b->f.ix_slots == 0 || b->f.ix_slots > ST_IX_MAX_SLOTS || b->f.sx_slots == 0 || b->f.sx_slots > ST_IX_MAX_SLOTS) return false;
+  if (b->f.zt_cap > 0xFFFFFFFFull || b->f.nx_cap > (1ull << 40)) return false;
+  for (uint32_t i = 0; i < b->f.nviews; i++)
+    if (!memchr(b->f.views[i], 0, sizeof(b->f.views[i]))) return false;          /* (a view name is a string) */
+  for (uint32_t i = 0; i < ST_MAXSRC; i++)
+    if (b->f.src[i].identlen > STORE_IDENT_MAX) return false;
+  return true;
+}
 /* read and check one copy; 0 = ok, -ENOENT = no file, -EBADMSG = damaged */
 static int sb_read(store_t *s, int slot, sb_t *b) {
   int fd = s->sb_fd[slot];
@@ -1383,7 +1483,7 @@ static int sb_read(store_t *s, int slot, sb_t *b) {
   b->f.crc = crc;
   if (memcmp(b->f.magic, "KARISTOR", 8) != 0 || b->f.version != STORE_FORMAT_VERSION || b->f.size != ST_SB_SIZE || crc != calc)
     return -EBADMSG;
-  if (b->f.nviews > ST_MAXV || b->f.seq == 0) return -EBADMSG;
+  if (!sb_fields_ok(b)) return -EBADMSG;
   return 0;
 }
 static int sb_write(store_t *s, bool clean, uint32_t jrn_gen) {
@@ -1531,8 +1631,10 @@ static int index_regrow(store_t *s, uint64_t ix_slots, uint64_t sx_slots) {
     jb_vset(&s->jb, V_SX_LIVE, live_sx);
   }
   if (r == 0) r = journal_append(s);
-  if (r == 0) r = commit_locked(s);
-  if (r < 0) { ixgen_free(nix); ixgen_free(nsx); return r; }
+  if (r < 0) { ixgen_free(nix); ixgen_free(nsx); return r; }       /* (nothing is logged: the old generations stay, the new files are garbage that the next growth overwrites) */
+  /* The record is in the journal now, so the memory follows it whatever the sync says: a replay switches to the new generations, and so does this process.  A failed
+   * sync is reported (the growth, and the write that wanted room, fail) but does not leave the index on the old generation while the journal names the new one. */
+  const int rc_sync = commit_locked(s);
   /* the journal now names the new generations; publish them (the files stay open: apply_ops would only reopen them) */
   if (nix) {
     index_publish(s, 0, nix);
@@ -1546,6 +1648,7 @@ static int index_regrow(store_t *s, uint64_t ix_slots, uint64_t sx_slots) {
   }
   s->n_growths++;
   CRASH_POINT();
+  if (rc_sync < 0) return rc_sync;
   return checkpoint_locked(s, false);
 }
 
@@ -1743,17 +1846,23 @@ static int put_locked(store_t *s, uint16_t view, const char *name, size_t nlen, 
   if (!exists) {
     uint64_t fh = jb_vget(s, j, V_FREE_HEAD);
     bool from_free = false;
-    if (fh != STORE_NONE && fh < st_zt_cap(s)) {
+    /* a zone id comes back only after the grace period of the delete that freed it: a reader that found the zone by the index before the delete may still be
+     * looking at its cell (design 3.4).  Until then the table grows and the list keeps the cell. */
+    if (fh != STORE_NONE && fh < st_zt_cap(s) && rcu_writer_is_safe(s->free_epoch)) {
       r64_t fr, fc;
-      if (zrec_read_locked(s, (uint32_t)fh, &fr, &fc) == 0) {
-        zt_t ft;
-        zt_unpack(&fr, &ft);
+      zt_t ft;
+      memset(&ft, 0, sizeof(ft));
+      bool usable = fh < jb_vget(s, j, V_HWM) && zrec_read_locked(s, (uint32_t)fh, &fr, &fc) == 0;
+      if (usable) zt_unpack(&fr, &ft);
+      if (usable && ft.state == STORE_STATE_FREE) {
         nz = (uint32_t)fh;
         from_free = true;
         if ((r = jb_vset(j, V_FREE_HEAD, ft.loc & 0xffffffffu)) < 0 || (r = jb_vadd(s, j, V_FREE_COUNT, -1)) < 0) return r;
-      } else {                /* a damaged cell on the free list: drop the list (store_repair finds the cells again) and grow */
+      } else {                /* a damaged cell, or one that is not FREE, on the free list: drop the list (store_repair finds the cells again) and grow */
         if ((r = jb_vset(j, V_FREE_HEAD, STORE_NONE)) < 0 || (r = jb_vset(j, V_FREE_COUNT, 0)) < 0) return r;
       }
+    } else if (fh != STORE_NONE && fh >= st_zt_cap(s)) {
+      if ((r = jb_vset(j, V_FREE_HEAD, STORE_NONE)) < 0 || (r = jb_vset(j, V_FREE_COUNT, 0)) < 0) return r;
     }
     if (!from_free) {
       uint64_t hwm = jb_vget(s, j, V_HWM);
@@ -1933,7 +2042,10 @@ static int delete_locked(store_t *s, uint32_t z) {
   if (named && (r = jb_vadd(s, j, V_DEPTH(t.view, depth_bucket(name_labels(fn, t.klen))), -1)) < 0) return r;
   if (t.klen > ST_NAME_INL && (r = jb_vadd(s, j, V_NX_DEAD, t.klen)) < 0) return r;
   r = journal_commit_apply(s);
-  if (r == 0) s->n_deletes++;
+  if (r == 0) {
+    s->n_deletes++;
+    s->free_epoch = rcu_writer_advance_epoch();      /* (the cell is reused when no reader that could have found it is left: put_locked) */
+  }
   return r;
 }
 
@@ -2087,6 +2199,14 @@ int store_checkpoint(store_t *s) {
   pthread_mutex_unlock(&s->wlock);
   return r;
 }
+int store_checkpoint_clean(store_t *s) {
+  if (!s) return -EINVAL;
+  pthread_mutex_lock(&s->wlock);
+  int r = checkpoint_locked(s, true);
+  if (r < 0) note_error(s, r);
+  pthread_mutex_unlock(&s->wlock);
+  return r;
+}
 
 /* ------------------------------------------------------------------------------------------------------------------ */
 /* readers                                                                                                              */
@@ -2173,9 +2293,9 @@ int store_image_read(const store_t *cs, uint32_t zid, store_img_t *img) {
   uint32_t sn = (uint32_t)(t.loc >> ST_LOC_SHIFT);
   uint64_t off = (t.loc & ST_LOC_MASK) * 64;
   uint64_t rlen = st_reclen(t.klen, t.img_len);
-  if (sn == 0 || sn > ST_MAXSEG || sn > VG(s, V_NSEGS) || off < ST_SEGHDR) return -EBADMSG;
-  uint64_t used = VG(s, V_SEG(sn, 0));
-  if (off + rlen > used) return -EBADMSG;
+  /* The record is bounded by the segment file, not by the counters of the superblock array: a journal record applies the zone's cell before its counters (a
+   * reader that sees the new location must not find "beyond the used bytes"), and the record's bytes were written before the cell was. */
+  if (sn == 0 || sn > ST_MAXSEG || off < ST_SEGHDR || off + rlen > ST_SEG_MAX) return -EBADMSG;
   seg_t *g = seg_get(s, sn);
   if (!g) return -EBADMSG;
   const uint8_t *rec;
@@ -2184,6 +2304,10 @@ int store_image_read(const store_t *cs, uint32_t zid, store_img_t *img) {
     if (off + rlen > g->maplen) return -EBADMSG;
     rec = g->map + off;
   } else {
+    if (rlen > (1u << 20)) {            /* (before a big buffer is made: img_len is a field of a cell; a record of a megabyte or less is bounded by the read itself, without a system call for each read) */
+      struct stat fst;
+      if (fstat(g->fd, &fst) != 0 || fst.st_size < 0 || off + rlen > (uint64_t)fst.st_size) return -EBADMSG;
+    }
     copy = malloc((size_t)rlen);
     if (!copy) return -ENOMEM;
     r = st_pread_all(g->fd, copy, (size_t)rlen, (off_t)off);
@@ -2562,6 +2686,7 @@ static int rebuild_locked(store_t *s) {
   free(nv);
   index_publish(s, 0, nix);
   index_publish(s, 1, nsx);
+  s->free_epoch = rcu_writer_advance_epoch();         /* (cells that were dropped are reused after the readers of the old tables are gone) */
   s->rec.rebuilt = true;
   atomic_fetch_or(&s->state, STORE_ST_REPAIRED);
   return 0;
@@ -2572,7 +2697,11 @@ static int rebuild_locked(store_t *s) {
 int store_repair(store_t *s) {
   if (!s) return -EINVAL;
   pthread_mutex_lock(&s->wlock);
-  int r = rebuild_locked(s);
+  /* the rebuild changes cells, tables and counters that no journal record describes, and is only complete with its checkpoint: a marker in the journal first, so
+   * that a crash (or a failed checkpoint and a later crash) in between makes the open rebuild again instead of trusting half of it */
+  jb_reset(&s->jb);
+  int r = jb_op(&s->jb, OP_REBUILD, 8) ? journal_append(s) : -ENOMEM;
+  if (r == 0) r = rebuild_locked(s);
   if (r == 0) r = checkpoint_locked(s, false);
   if (r < 0) note_error(s, r);
   pthread_mutex_unlock(&s->wlock);
@@ -2621,6 +2750,12 @@ static int adopt_sb(store_t *s, const sb_t *b) {
   if (r < 0) goto fail;
   if (atomic_load(&s->zt.mapped) < b->f.zt_cap * ST_REC || atomic_load(&s->zc.mapped) < b->f.zt_cap * ST_REC ||
       atomic_load(&s->nx.mapped) < b->f.nx_cap || b->f.v[V_HWM] > b->f.zt_cap || b->f.v[V_NX_USED] > b->f.nx_cap) { r = -EBADMSG; goto fail; }
+  /* every counter is bounded before it is taken in (the segment counters are array indexes and file offsets, the free list head a zone id) */
+  for (uint32_t i = 0; i < ST_NV; i++)
+    if (!v_value_ok(s, i, b->f.v[i])) { r = -EBADMSG; goto fail; }
+  if (b->f.v[V_CUR_SEG] > b->f.v[V_NSEGS]) { r = -EBADMSG; goto fail; }
+  for (uint32_t n = 1; n <= b->f.v[V_NSEGS]; n++)
+    if (b->f.v[V_SEG(n, 0)] < ST_SEGHDR) { r = -EBADMSG; goto fail; }
   ixgen_t *ix = NULL, *sx = NULL;
   if ((r = ixgen_open(s, FK_IX, b->f.ix_gen, b->f.ix_slots, &ix)) < 0) goto fail;
   if ((r = ixgen_open(s, FK_SX, b->f.sx_gen, b->f.sx_slots, &sx)) < 0) { ixgen_free(ix); goto fail; }
@@ -2630,6 +2765,7 @@ static int adopt_sb(store_t *s, const sb_t *b) {
   s->sx_gen = b->f.sx_gen;
   for (uint32_t i = 0; i < ST_NV; i++) VS(s, i, b->f.v[i]);
   memcpy(s->views, b->f.views, sizeof(s->views));
+  for (uint32_t i = 0; i < ST_MAXV; i++) s->views[i][STORE_VIEW_NAME_MAX] = 0;
   atomic_store(&s->nviews, b->f.nviews);
   memcpy(s->src, b->f.src, sizeof(s->src));
   atomic_store(&s->nx_avail, b->f.v[V_NX_USED]);
