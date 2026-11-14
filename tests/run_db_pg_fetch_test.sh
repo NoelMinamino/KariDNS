@@ -10,8 +10,8 @@
 #   - with memory-limit 1m the warm-up stops at the high water mark and the zones in memory are the hottest ones, in the order of the list
 #   - warm-before-serve: a UDP and a TCP query wait until the hot list is read (fetch-rate 1: about ten seconds) and are answered; the time may be up first
 # Part 2, 300 zones of 100 addresses (c0000 .. c0299), a burst of one query for every zone while the zones are out of memory:
-#   - fetch-concurrency 2 sheds, loader-threads 4 without the setting allows 64 and sheds nothing, and every answer is the right one (the zones of the workers
-#     do not mix on the fetch stream)
+#   - fetch-concurrency 2 (0.7 P-B): the requests over the limit wait, nothing is shed and every answer is the right one; loader-threads 4 without the setting
+#     allows 64 and sheds nothing, and every answer is the right one (the zones of the workers do not mix on the fetch stream)
 #   - a short stress with memory-limit 1m (the cache manager takes zones out while the bursts ask for them again) and reloads in between: no query gets the
 #     address of another zone, and the server goes on answering
 #
@@ -244,7 +244,10 @@ start_srv
 [ "$(conc)" = "2" ] && pass "fetch-concurrency 2: dbstatus shows concurrency=2" || fail "concurrency: '$(conc)'"
 burst "$T/out2"
 S2=$(shed)
-[ "${S2:-0}" -gt 0 ] && pass "requests were shed ($S2): the limit is the configured one" || fail "nothing shed with fetch-concurrency 2"
+W2=$($KCTL dbstatus 2>/dev/null | grep '^fetchq:' | sed -n 's/.* waited=\([0-9]*\).*/\1/p')
+[ "${S2:-x}" = "0" ] && pass "nothing was shed (a request over fetch-concurrency waits)" || fail "shed=$S2 with fetch-concurrency 2"
+[ "${W2:-0}" -gt 0 ] && pass "requests waited ($W2): the limit is the configured one" || fail "nothing waited with fetch-concurrency 2"
+if cmp -s "$T/out2" "$T/expected"; then pass "all $NC queries were answered, with the right address"; else fail "wrong or missing answers: $(diff "$T/expected" "$T/out2" | head -5 | tr '\n' ' ')"; fi
 stop_srv
 
 conf 64m "fetch-rate 5000; loader-threads 4;" no

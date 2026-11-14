@@ -734,9 +734,8 @@ typedef struct {
   uint32_t park_max;           /* D1a: queries one worker parks for a zone that is not in memory, 1..65536 (0 = the default, 1024); restart-only */
   uint32_t park_timeout_ms;    /* D1a: how long a parked query waits for the zone, 10..60000 ms (0 = the default, 1500) */
   uint64_t memory_limit;       /* D1a step 5: bytes the database zones may hold in memory (resident + retired, not freed yet); 0 = no limit, every zone stays resident. 1M..1T */
-  bool over_limit_wait;        /* 0.7 B2 W8, over-limit wait|refuse: with the database zones above the hard limit (110% of memory-limit) a query for a zone that is out of memory waits for room (the ingest thread takes the coldest zones out on demand) instead of getting SERVFAIL + EDE 14 at once; default refuse */
-  uint32_t fetch_rate;         /* D1a: zones read from the database for queries per second, 1..100000 (0 = the default, 200); a token bucket with a burst of one second */
-  uint32_t fetch_concurrency;  /* D1a: fetches in flight to the loader while memory-limit is set, 2..256 (0 = loader-threads x 16, at least 16): fetch-rate, not this, should be what limits the reads; a request over it is shed */
+  uint32_t fetch_rate;         /* D1a: zones read from the database for queries per second, 1..100000; a token bucket with a burst of one second.  0 = unlimited, the default (0.7 P-A; `fetch-rate unlimited` or `fetch-rate 0`) */
+  uint32_t fetch_concurrency;  /* D1a: fetches in flight to the loader while memory-limit is set, 2..256 (0 = loader-threads x 16, at least 16): a request over it waits (0.7 P-B), it is not refused */
   uint32_t transfer_fetch_timeout_ms;   /* D1a step 7: how long an AXFR / IXFR of a zone that is not in memory waits for the zone, 100..600000 ms (0 = the default, 10000) */
   char *loader_state_file;     /* D1a step 7 (design 8.4): the file the loader keeps the hot list in (restart-only); NULL = none */
   uint32_t warm_before_serve;  /* D1a step 7: seconds the queries wait for the zones of the hot list to be read, 0..3600 (0 = do not wait, the default) */
@@ -757,7 +756,6 @@ typedef struct {
 #define KARIDNS_DB_MEMORY_LIMIT_MIN (1ull << 20)
 #define KARIDNS_DB_MEMORY_LIMIT_MAX (1ull << 40)
 #define KARIDNS_DB_FETCH_RATE_MAX 100000
-#define KARIDNS_DB_FETCH_RATE_DEFAULT 200
 #define KARIDNS_DB_FETCH_CONC_MIN 2
 #define KARIDNS_DB_FETCH_CONC_MAX 256
 #define KARIDNS_DB_FETCH_CONC_PER_THREAD 16  /* fetch-concurrency when it is not set: loader-threads times this (at least 16, the old fixed limit; at most the maximum) */

@@ -404,7 +404,7 @@ void park_wake_broadcast(const char *view, const char *zone, bool failed) {
   park_wake_flush();
 }
 
-/* ------------------------------------------------------------------ the admission gate (B2 W5; the idea is in dns_park.h) */
+/* ------------------------------------------------------------------ places and tokens (B2 W5, 0.7 P-B; the idea is in dns_park.h) */
 static _Atomic int32_t g_places;
 static _Atomic int32_t g_places_lim = INT32_MAX;         /* until the ingest thread sets fetch-concurrency */
 
@@ -414,6 +414,8 @@ uint32_t park_places_used(void) {
   int32_t v = atomic_load_explicit(&g_places, memory_order_relaxed);
   return v < 0 ? 0 : (uint32_t)v;
 }
+
+bool park_place_avail(void) { return atomic_load_explicit(&g_places, memory_order_relaxed) < atomic_load_explicit(&g_places_lim, memory_order_relaxed); }
 
 /* a compare-and-swap loop, not an add that is undone: the count never goes above the limit, not even for a moment (a taker that sees it full leaves at once) */
 bool park_place_take(void) {
@@ -435,7 +437,7 @@ void park_place_give(void) {
 /* The fetch-rate bucket: one 64-bit word, the tokens in thousandths in the low half and the time (ms, the low 32 bits of CLOCK_MONOTONIC) of the last change in the
  * high half.  The fill is computed from the time that has passed when a thread reads the word (rate thousandths a millisecond, at most one second of the rate);
  * a take writes the word with a compare-and-swap, a take that finds too few tokens writes nothing (a flood against an empty bucket is reads only).  0 is a bucket
- * that was never used: full. */
+ * that was never used: full.  With no rate (0, fetch-rate unlimited) the word is never touched: a take is one relaxed load. */
 #define PARK_RATE_MAX 4000000u                           /* (rate x 1000 must fit 32 bits) */
 #define PARK_RATE_BEHIND_MS 0x100000u                    /* (about 17 minutes) how far behind the stamp a caller's clock may be and still count as "no time has passed" */
 static _Atomic uint32_t g_rate;
@@ -503,19 +505,17 @@ void park_rate_give(void) {
   }
 }
 
-/* ---- the claims: one worker takes the place and the token for a zone, the others do not (B2 M1) ----
- * A claim is a place and a token taken at the gate for a request that is queued but not yet a fetch: the zone is not LOADING until the ingest thread has popped the request,
- * so every worker that looked at the zone meanwhile saw it ABSENT and took a place and a token of its own for the same fetch.  A few workers asking for one zone used up the
- * pool and the bucket, the other zones were told "not ready", and a worker's query for that zone was refused although the fetch was queued.  The mark says "a request
- * with a claim for this zone is queued": the first worker sets it (with the claim), the others park and ask without one (the ingest thread drops the request while the
- * mark is up, and the one fetch wakes them all, or fails them all), and the ingest thread clears the mark when it is done with the claimed request, whatever came of it
- * (a fetch started, shed, refused by rate, table full, view gone, the zone in memory or not there), or the worker that set it when the request could not be made.
- * Every mark was set with a claim that is on its way to exactly one of those, so none stays.
- * The marks are a table of hashes of (view, zone), a few slots apart from where the hash points (a claim is a place of fetch-concurrency, at most 256, in 1024 slots).  A
- * collision between two zones, or a window with no free slot, costs the gate (a worker that is told the zone is claimed asks without a claim, which the ingest thread
- * still handles as before), never an answer.  Two marks for one zone (two workers that raced, or a slot that was freed between their two looks) are both cleared by the one
+/* ---- the claims: one request for a zone that is out of memory, the others wait for its answer (B2 M1, 0.7 P-B) ----
+ * The zone is not LOADING until the ingest thread has popped a request (and, with the wait queue, until it has a place and a token for it), so every worker that looks at the
+ * zone meanwhile sees it ABSENT.  The mark says "a request with a claim for this zone is on its way or waits in the ingest thread's queue": the first worker sets it, the others
+ * park and ask without a claim (the ingest thread drops the request while the mark is up, and the one fetch wakes them all, or fails them all), and the ingest thread clears
+ * the mark when the request became a fetch, was dropped (park-timeout) or refused (the queue was full, the view is gone, the zone is in memory or not there), or the worker
+ * that set it when the request could not be made.  Every mark was set with a claim that is on its way to exactly one of those, so none stays.
+ * The marks are a table of hashes of (view, zone), a few slots apart from where the hash points.  A request that waits in the queue keeps its mark, so there can be as many
+ * marks as the queue is long (ING_WQ_MAX, 8192) plus the fetches in flight: 32768 slots keep the table at most a third full.  A collision between two zones, or a window
+ * with no free slot, costs the gate (a worker that is told the zone is claimed asks without a claim, which the ingest thread still handles as before), never an answer.  Two marks for one zone (two workers that raced, or a slot that was freed between their two looks) are both cleared by the one
  * clear: a duplicate claim that the ingest thread drops. */
-#define PARK_CLAIM_SLOTS 1024u                           /* (a power of two) */
+#define PARK_CLAIM_SLOTS 32768u                          /* (a power of two; 256 KB) */
 #define PARK_CLAIM_WIN 8u
 static _Atomic uint64_t g_claim[PARK_CLAIM_SLOTS];       /* 0: free */
 
@@ -556,33 +556,14 @@ void park_claim_clear(uint64_t key) {
   }
 }
 
-void park_claim_release(const char *view, const char *zone) {
-  park_place_give();
-  park_rate_give();
-  park_claim_clear(name_key(view, zone));
-}
-
-/* what a worker turned away at the gate: one line per worker, so that a flood of refusals does not make the workers fight over a counter */
-typedef struct {
-  _Alignas(64) _Atomic uint64_t shed;
-  _Atomic uint64_t rate;
-} gate_cnt_t;
-static gate_cnt_t g_gate[PARK_MAX_WORKERS];
-
-void park_gate_count(int w, bool rate) {
-  if (w < 0 || w >= PARK_MAX_WORKERS) w = 0;
-  atomic_fetch_add_explicit(rate ? &g_gate[w].rate : &g_gate[w].shed, 1, memory_order_relaxed);
-}
+void park_claim_release(const char *view, const char *zone) { park_claim_clear(name_key(view, zone)); }
 
 void park_stats_get(park_stats_t *out) {
   out->full = atomic_load_explicit(&g_park_full, memory_order_relaxed);
   out->timeout = atomic_load_explicit(&g_park_timeout, memory_order_relaxed);
   out->ring_dropped = 0;
-  out->gate_shed = out->gate_rate = 0;
   for (int w = 0; w < PARK_MAX_WORKERS; w++) {
     out->ring_dropped += atomic_load_explicit(&g_fetch[w].dropped, memory_order_relaxed);
-    out->gate_shed += atomic_load_explicit(&g_gate[w].shed, memory_order_relaxed);
-    out->gate_rate += atomic_load_explicit(&g_gate[w].rate, memory_order_relaxed);
   }
 }
 

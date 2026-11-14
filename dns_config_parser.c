@@ -6476,14 +6476,18 @@ static int db_take_string(token_ctx_t *ctx, const char *scope, const char *key, 
 }
 
 /* "<key> <number>;" with an optional K/M/G suffix (1024 based) when allow_suffix.  Digits only, lo..hi. */
-static int db_take_uint(token_ctx_t *ctx, const char *key, bool allow_suffix, uint64_t lo, uint64_t hi,
-                        uint64_t *out) {
+/* word: a keyword ("unlimited") that stands for `word_value` (NULL: none) */
+static int db_take_uint_word(token_ctx_t *ctx, const char *key, bool allow_suffix, uint64_t lo, uint64_t hi, const char *word, uint64_t word_value,
+                             uint64_t *out) {
   conf_token_t tok = get_next_token(ctx);
   if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
   const char *s = tok.value;
   bool ok = false;
   uint64_t v = 0;
-  if (isdigit((unsigned char)s[0])) {
+  if (word && strcasecmp(s, word) == 0) {
+    v = word_value;
+    ok = true;
+  } else if (isdigit((unsigned char)s[0])) {
     char *end = NULL;
     errno = 0;
     unsigned long long x = strtoull(s, &end, 10);
@@ -6512,6 +6516,10 @@ static int db_take_uint(token_ctx_t *ctx, const char *key, bool allow_suffix, ui
   free_token(&tok);
   *out = v;
   return 0;
+}
+
+static int db_take_uint(token_ctx_t *ctx, const char *key, bool allow_suffix, uint64_t lo, uint64_t hi, uint64_t *out) {
+  return db_take_uint_word(ctx, key, allow_suffix, lo, hi, NULL, 0, out);
 }
 
 static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const char *key) {
@@ -6593,19 +6601,8 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
     return 0;
   }
   if (strcmp(key, "fetch-rate") == 0) {       /* zones read for queries per second (token bucket, burst = one second): scattered queries for zones out of memory */
-    if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_FETCH_RATE_MAX, &u) != 0) return -1;
+    if (db_take_uint_word(ctx, key, false, 0, KARIDNS_DB_FETCH_RATE_MAX, "unlimited", 0, &u) != 0) return -1;     /* 0.7 P-A: unlimited (or 0) is the default: no limit */
     db->fetch_rate = (uint32_t)u;
-    return 0;
-  }
-  if (strcmp(key, "over-limit") == 0) {          /* 0.7 B2 W8: what a query for a zone out of memory gets while the database zones are above 110% of memory-limit */
-    char *v = NULL;
-    if (db_take_string(ctx, "database", key, 16, &v) != 0) { free(v); return -1; }
-    bool wait = strcasecmp(v, "wait") == 0;
-    bool ok = wait || strcasecmp(v, "refuse") == 0;
-    if (!ok) report_bad_value(ctx, NULL, key, v, "refuse or wait");
-    free(v);
-    if (!ok) return -1;
-    db->over_limit_wait = wait;
     return 0;
   }
   if (strcmp(key, "fetch-concurrency") == 0) {   /* fetches in flight to the loader while memory-limit is set (the loader reads that many zones at once, loader-threads of them in parallel) */

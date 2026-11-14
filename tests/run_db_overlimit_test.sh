@@ -1,15 +1,16 @@
 #!/bin/sh
-# run_db_overlimit_test.sh - database { over-limit refuse | wait } (0.7 B2 W8), with the real karidns, the real karidns-dbloader and SQLite3.
+# run_db_overlimit_test.sh - room on demand above the hard limit of memory-limit (0.7 B2 W8, P-B), with the real karidns, the real karidns-dbloader and SQLite3.
 #
-# With memory-limit a query for a zone that is out of memory is answered SERVFAIL + EDE 14 at once while the zones in memory are above 110% of the limit (over-limit
-# refuse, the default).  With over-limit wait it parks like any other query: the ingest thread takes the coldest zones out of memory on demand (the minimum residency only
+# With memory-limit a query for a zone that is out of memory is never refused for the zones in memory being above 110% of the limit (there is no `over-limit` option any
+# more: it was removed before it was released).  It parks like any other query, the ingest thread takes the coldest zones out of memory on demand (the minimum residency only
 # relaxed for zones whose queries have been answered) and fetches the zone, and the query is answered when the zone is there.  Checked:
 #   - rounds of parallel queries for zones that do not fit memory-limit (24 zones of about 100 KB, memory-limit 1m, 4 queries at a time, each round at once after the last):
-#       refuse: every answer is the right one or "not ready" (SERVFAIL + EDE 14), `shed` of dbstatus counts the refusals, dbstatus says over_limit=refuse and the room counters are 0
-#       wait:   every query is answered on the first try (no EDE 14), nothing is shed, dbstatus says over_limit=wait and room_evictions > 0 (the zones were taken out on demand),
-#               nothing waits or is in flight afterwards and no place is held; the zones in memory stay within a bound
-#   - a reload (karictl reconfig) switches the mode both ways, and the server keeps answering
-#   - karicheck: over-limit wait without memory-limit is a warning (conf.database.over-limit), with it there is none; a value other than refuse / wait is an error
+#     every query is answered on the first try (no EDE 14), nothing is shed, room_evictions > 0 (the zones were taken out on demand), dbstatus has no over_limit field,
+#     nothing waits, is in flight or holds a place afterwards, and the zones in memory stay within a bound
+#   - the same with fetch-concurrency 2 and fetch-rate 100 (the requests wait for a place and for the bucket as well as for room)
+#   - reloads (karictl reconfig, changing fetch-concurrency and fetch-rate) while the rounds run: every query is still answered, nothing is lost or left behind (places,
+#     the queue, the claim marks: dbstatus is idle afterwards and the server answers)
+#   - karicheck: `over-limit` is not an option any more (an error), and a configuration with memory-limit has no message about it
 # Needs root (the loader runs as nobody).  SKIP without karidns, dag, karictl, karicheck, karidns-dbloader (SQLite3), sqlite3 or perl.
 . "$(dirname "$0")/lib_proc.sh"
 set -u
@@ -91,18 +92,13 @@ dbs() { $KCTL dbstatus 2>/dev/null; }
 field() {   # field LINE-PREFIX KEY: the number after KEY= on the first dbstatus line that starts with LINE-PREFIX
     dbs | grep "^$1" | head -1 | sed -n "s/.* $2=\([0-9]*\).*/\1/p"
 }
-mode() { dbs | grep '^cache:' | head -1 | sed -n 's/.* over_limit=\([a-z]*\).*/\1/p'; }
-wait_mode() {   # wait_mode refuse|wait: dbstatus shows the mode within 5 s
-    i=0; while [ $i -lt 50 ] && [ "$(mode)" != "$1" ]; do sleep 0.1; i=$((i + 1)); done
-    [ "$(mode)" = "$1" ]
-}
 waitfor() {   # waitfor SECONDS COMMAND...
     w=$1; shift
     i=0
     while [ $i -lt $((w * 10)) ]; do "$@" && return 0; sleep 0.1; i=$((i + 1)); done
     return 1
 }
-idle() { [ "$(field fetchq in_flight)" = "0" ] && [ "$(field fetchq places)" = "0" ] && [ "$(field cache room_waiting)" = "0" ]; }
+idle() { [ "$(field fetchq in_flight)" = "0" ] && [ "$(field fetchq places)" = "0" ] && [ "$(field fetchq queued)" = "0" ] && [ "$(field cache room_waiting)" = "0" ]; }
 # rounds(): ROUNDS rounds of P parallel queries for the next P zones (round after round at once), the zones in turn: the zones that do not fit memory-limit are read again and again.
 # GOOD, REFUSED and ODD count the answers: the right address, SERVFAIL with EDE 14, anything else
 rounds() {
@@ -131,61 +127,69 @@ rounds() {
     done
 }
 
-echo "== over-limit refuse (the default): the old behaviour"
+echo "== above the hard limit every query waits for room and is answered on the first try"
 conf ""
 start_srv
-wait_mode refuse && pass "dbstatus: over_limit=refuse" || fail "dbstatus cache line: $(dbs | grep '^cache:')"
-rounds
-echo "  answered $GOOD, refused (SERVFAIL + EDE 14) $REFUSED, other $ODD of $((ROUNDS * P)); shed=$(field cache shed) evictions=$(field cache evictions)"
-[ "$ODD" = 0 ] && pass "every query was answered or got 'not ready' (SERVFAIL, EDE 14)" || fail "$ODD queries got neither an answer nor 'not ready'"
-[ "$GOOD" -gt 0 ] && pass "queries for zones out of memory were answered ($GOOD)" || fail "no query was answered"
-SH=$(field cache shed)
-[ "${SH:-x}" = "$REFUSED" ] && pass "shed counts the refusals ($SH)" || fail "shed=$SH but $REFUSED queries were refused"
-[ "$(field cache room_evictions)" = "0" ] && [ "$(field cache room_waits)" = "0" ] && [ "$(field cache room_timeouts)" = "0" ] && pass "no room was made on demand" || fail "room counters: $(dbs | grep '^cache:')"
-[ "$REFUSED" -gt 0 ] && pass "the zones in memory went over 110% of memory-limit: $REFUSED queries were refused at once" || echo "  (no query was refused: the rounds did not push the zones over 110% this time)"
-waitfor 10 idle && pass "nothing is in flight or held afterwards" || fail "fetchq: $(dbs | grep '^fetchq:')"
-REFUSE_REF=$REFUSED
-stop_srv
-
-echo "== over-limit wait: the same rounds, every query answered on the first try"
-conf "over-limit wait;"
-start_srv
-wait_mode wait && pass "dbstatus: over_limit=wait" || fail "dbstatus cache line: $(dbs | grep '^cache:')"
+dbs | grep -q 'over_limit' && fail "dbstatus still has an over_limit field: $(dbs | grep '^cache:')" || pass "dbstatus has no over_limit field (there is one behaviour)"
 rounds
 echo "  answered $GOOD, refused $REFUSED, other $ODD of $((ROUNDS * P)); $(dbs | grep '^cache:' | sed 's/.*evictions=/evictions=/')"
-[ "$GOOD" = "$((ROUNDS * P))" ] && pass "all $GOOD queries were answered on the first try (the refuse run refused $REFUSE_REF)" || fail "answered $GOOD of $((ROUNDS * P)), refused $REFUSED, other $ODD"
+[ "$GOOD" = "$((ROUNDS * P))" ] && pass "all $GOOD queries were answered on the first try" || fail "answered $GOOD of $((ROUNDS * P)), refused $REFUSED, other $ODD"
 [ "$(field cache shed)" = "0" ] && pass "nothing was shed" || fail "shed=$(field cache shed)"
 RE=$(field cache room_evictions)
 [ "${RE:-0}" -gt 0 ] && pass "zones were taken out of memory on demand ($RE, $(field cache room_relaxed) of them younger than the minimum residency)" || fail "no zone was taken out on demand: $(dbs | grep '^cache:')"
 waitfor 10 idle && pass "nothing waits for room, is in flight or holds a place afterwards" || fail "fetchq: $(dbs | grep '^fetchq:'); $(dbs | grep '^cache:')"
 LIM=$(field cache limit); PEAK=$(field cache peak)
 [ "${PEAK:-0}" -lt $((LIM * 3)) ] && pass "the zones in memory stayed within a bound (peak $PEAK bytes, limit $LIM)" || fail "peak $PEAK against a limit of $LIM"
-[ "$(field cache room_timeouts)" = "0" ] && pass "no request ran out of time waiting for room" || fail "room_timeouts=$(field cache room_timeouts)"
-dbs | grep -q '^cache:.* over_limit=wait ' && pass "the cache line still says over_limit=wait" || fail "cache line: $(dbs | grep '^cache:')"
-
-echo "== a reload switches the mode, both ways"
-conf ""
-$KCTL reconfig > /dev/null 2>&1
-wait_mode refuse && pass "after karictl reconfig without over-limit: over_limit=refuse" || fail "mode after reconfig: '$(mode)'"
-[ "$(./dag @127.0.0.1 -p "$PORT" www.z0001.test A +short +nohexdump +time=8 +tries=1 2>/dev/null | head -1)" = "192.0.2.80" ] && pass "the server answers" || fail "no answer after the reload to refuse"
-conf "over-limit wait;"
-$KCTL reconfig > /dev/null 2>&1
-wait_mode wait && pass "after karictl reconfig with over-limit wait: over_limit=wait" || fail "mode after reconfig: '$(mode)'"
-rounds
-[ "$GOOD" = "$((ROUNDS * P))" ] && pass "the rounds are answered on the first try after the switch ($GOOD)" || fail "after the switch: answered $GOOD of $((ROUNDS * P)), refused $REFUSED, other $ODD"
-waitfor 10 idle && pass "nothing waits or is held afterwards" || fail "fetchq: $(dbs | grep '^fetchq:')"
+[ "$(field cache room_timeouts)" = "0" ] && [ "$(field fetchq queue_dropped)" = "0" ] && pass "no request ran out of time waiting" || fail "room_timeouts=$(field cache room_timeouts) queue_dropped=$(field fetchq queue_dropped)"
+[ "$(field fetchq queue_full)" = "0" ] && pass "the queue never filled up" || fail "queue_full=$(field fetchq queue_full)"
 stop_srv
 
-echo "== karicheck: the option is checked"
+echo "== the same with fetch-concurrency 2 and fetch-rate 100: the requests wait for a place and for the bucket as well"
+conf "fetch-concurrency 2; fetch-rate 100;"
+start_srv
+rounds
+echo "  answered $GOOD, refused $REFUSED, other $ODD of $((ROUNDS * P)); fetchq: $(dbs | grep '^fetchq:' | sed 's/.*queued=/queued=/')"
+[ "$GOOD" = "$((ROUNDS * P))" ] && pass "all $GOOD queries were answered on the first try" || fail "answered $GOOD of $((ROUNDS * P)), refused $REFUSED, other $ODD"
+[ "$(field cache shed)" = "0" ] && [ "$(dbs | grep '^fetch:' | sed -n 's/.* refused_by_rate=\([0-9]*\).*/\1/p')" = "0" ] && pass "nothing was shed or refused by rate" || fail "shed=$(field cache shed); $(dbs | grep '^fetch:')"
+[ "$(field fetchq peak)" -le 2 ] 2>/dev/null && pass "never more than 2 fetches in flight (peak $(field fetchq peak))" || fail "peak=$(field fetchq peak) with fetch-concurrency 2"
+waitfor 10 idle && pass "nothing waits, is in flight or holds a place afterwards" || fail "fetchq: $(dbs | grep '^fetchq:')"
+stop_srv
+
+echo "== reloads while the requests wait: nothing is lost, nothing is left behind"
+conf ""
+start_srv
+( n=0; while [ $n -lt 8 ]; do
+      case $((n % 4)) in
+          0) conf "fetch-concurrency 3;" ;;
+          1) conf "fetch-concurrency 2; fetch-rate 200;" ;;
+          2) conf "fetch-concurrency 64; fetch-rate 5000;" ;;
+          3) conf "" ;;
+      esac
+      $KCTL reconfig > /dev/null 2>&1
+      sleep 0.4
+      n=$((n + 1))
+  done ) &
+RLP=$!
+rounds
+wait "$RLP"
+echo "  answered $GOOD, refused $REFUSED, other $ODD of $((ROUNDS * P)) (eight reloads meanwhile)"
+[ "$GOOD" = "$((ROUNDS * P))" ] && pass "all $GOOD queries were answered on the first try although the configuration was reloaded eight times meanwhile" || fail "answered $GOOD of $((ROUNDS * P)), refused $REFUSED, other $ODD"
+[ "$(field cache shed)" = "0" ] && pass "nothing was shed" || fail "shed=$(field cache shed)"
+waitfor 10 idle && pass "nothing waits for room, is in flight or holds a place afterwards (the places, the queue and the claims are clean)" || fail "fetchq: $(dbs | grep '^fetchq:'); $(dbs | grep '^cache:')"
+[ "$(./dag @127.0.0.1 -p "$PORT" www.z0001.test A +short +nohexdump +time=8 +tries=1 2>/dev/null | head -1)" = "192.0.2.80" ] && pass "the server answers after the reloads" || fail "no answer after the reloads"
+rounds
+[ "$GOOD" = "$((ROUNDS * P))" ] && pass "and a second set of rounds is answered on the first try ($GOOD): no claim mark was left behind" || fail "second rounds: answered $GOOD of $((ROUNDS * P)), refused $REFUSED, other $ODD"
+waitfor 10 idle && pass "idle again" || fail "fetchq: $(dbs | grep '^fetchq:')"
+stop_srv
+
+echo "== karicheck: over-limit is not an option any more"
 kc() { ./karicheck conf "$T/k.conf" 2>&1; }
+conf ""
+kc | grep -q 'over-limit' && fail "karicheck mentions over-limit for a plain configuration: $(kc | grep over-limit)" || pass "a configuration with memory-limit: no message about over-limit"
 conf "over-limit wait;"
-kc | grep -q 'over-limit' && fail "karicheck complains about over-limit wait with memory-limit: $(kc | grep over-limit)" || pass "over-limit wait with memory-limit: no message about it"
-sed 's/memory-limit 1m;//' "$T/k.conf" > "$T/k2.conf"
-./karicheck conf "$T/k2.conf" 2>&1 | grep -q 'over-limit wait has no effect without memory-limit' && pass "over-limit wait without memory-limit is a warning" || fail "no warning: $(./karicheck conf "$T/k2.conf" 2>&1 | grep -i over-limit)"
-conf "over-limit sometimes;"
 ./karicheck conf "$T/k.conf" > "$T/kc.out" 2>&1
 KRC=$?
-[ "$KRC" != 0 ] && grep -q 'over-limit' "$T/kc.out" && pass "over-limit sometimes is an error (refuse or wait): $(grep over-limit "$T/kc.out" | head -1)" || fail "karicheck accepted 'over-limit sometimes' (rc $KRC): $(head -3 "$T/kc.out")"
+[ "$KRC" != 0 ] && grep -qi 'over-limit' "$T/kc.out" && pass "over-limit wait is an error (unknown option): $(grep -i over-limit "$T/kc.out" | head -1)" || fail "karicheck accepted 'over-limit wait' (rc $KRC): $(head -3 "$T/kc.out")"
 
 echo
 echo "run_db_overlimit_test: $PASS passed, $FAILS failed"

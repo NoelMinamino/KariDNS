@@ -90,6 +90,7 @@ static _Atomic bool g_fetch_died;          /* D1a: the fetch thread ended by its
  * which zone the findings are about ("" / 0: the source).  The run is single threaded. */
 static FILE *g_chk_out;
 static unsigned g_chk_errors, g_chk_warnings;
+static _Atomic uint64_t g_chk_records;                   /* 0.7 P-F: the records of the primary zones that were read (the `M` line: the memory the database needs, karicheck db) */
 static char g_chk_zone[DNS_NAME_TEXT_SIZE + 16];
 static int64_t g_chk_id;
 
@@ -1561,6 +1562,7 @@ static void chk_zone_report(ctx_t *x, const zinfo_t *zi, pdns_zone_t *z, const s
     for (size_t i = 0; i < z->n_warnings; i++) chk_line('W', chk_strip_zone(z->warnings[i]));
     if (z->warnings_dropped) chk_linef('W', "%zu more warning(s) were dropped", z->warnings_dropped);
     if (z->failed) return;
+    if (z->zkind == KDB_ZK_PRIMARY && z->arena_ready) atomic_fetch_add(&g_chk_records, (uint64_t)z->arena.count);
     if (z->zkind == KDB_ZK_PRIMARY && z->arena_ready) {
         kc_tally_t t = {0};
         t.sink = chk_sink;
@@ -5978,6 +5980,7 @@ int main(int argc, char **argv) {
         setvbuf(stdout, NULL, _IOLBF, 0);
         db_source_t csrc = { drv->name, dbfile, conninfo, schema, 0 };
         int cst = run_check(&x, &csrc);
+        fprintf(stdout, "M\t%u\t%llu\n", x.chk_zones, (unsigned long long)atomic_load(&g_chk_records));       /* 0.7 P-F: the zones and records read (karicheck db: what the database needs in memory) */
         fprintf(stdout, "R\t%u\t%u\t%u\n", x.chk_zones, g_chk_errors, g_chk_warnings);
         if (fflush(stdout) != 0 && cst < EXIT_ERROR) cst = EXIT_ERROR;
         ctx_view_reset(&x);

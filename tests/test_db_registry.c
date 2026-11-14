@@ -2379,7 +2379,7 @@ static void test_bgload_cache(void) {
     zone_retire_process(true);
 }
 
-/* ---- 0.7 B2 W8: room on demand (database { over-limit wait }): dbreg_cache_make_room() ---- */
+/* ---- 0.7 B2 W8: room on demand: dbreg_cache_make_room() ---- */
 static uint32_t room_mono32(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -2424,7 +2424,7 @@ static void room_teardown(void) {
 }
 
 static void test_room_on_demand(void) {
-    printf("[TEST] room on demand (over-limit wait): the coldest first, only as much as is needed, the minimum residency relaxed only for zones that served their queries...\n");
+    printf("[TEST] room on demand: the coldest first, only as much as is needed, the minimum residency relaxed only for zones that served their queries...\n");
     dbreg_cache_stats_t s0, s1;
     uint32_t rel = 0;
 

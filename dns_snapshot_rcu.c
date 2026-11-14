@@ -3653,11 +3653,7 @@ bool dbreg_cache_over_limit(void) {
     return zb.resident > cache_hard_line(lim);
 }
 
-/* 0.7 B2 W8, database { over-limit wait|refuse }: set from the configuration by the cache thread (a reload switches it), read by the workers' gate and the ingest thread */
-static _Atomic bool g_cache_over_wait;
 static _Atomic uint64_t g_room_evicted, g_room_relaxed;      /* zones taken out on demand (dbreg_cache_make_room()), of which younger than CACHE_MIN_RESIDENT_MS */
-void dbreg_cache_set_over_wait(bool wait) { atomic_store_explicit(&g_cache_over_wait, wait, memory_order_relaxed); }
-bool dbreg_cache_over_wait(void) { return atomic_load_explicit(&g_cache_over_wait, memory_order_relaxed); }
 
 void dbreg_cache_stats(dbreg_cache_stats_t *o) {
     zone_bytes_t zb;
@@ -3679,7 +3675,6 @@ void dbreg_cache_stats(dbreg_cache_stats_t *o) {
     o->victim_freq = atomic_load_explicit(&g_victim_freq, memory_order_relaxed);
     o->pinned_bytes = atomic_load_explicit(&g_cache_pinned_bytes, memory_order_relaxed);
     o->peak = atomic_load_explicit(&g_cache_peak, memory_order_relaxed);
-    o->over_wait = atomic_load_explicit(&g_cache_over_wait, memory_order_relaxed);
     o->room_evictions = atomic_load_explicit(&g_room_evicted, memory_order_relaxed);
     o->room_relaxed = atomic_load_explicit(&g_room_relaxed, memory_order_relaxed);
 }
@@ -3888,9 +3883,8 @@ uint32_t dbreg_cache_round(void) {
     return evicted;
 }
 
-/* ---- 0.7 B2 W8: room on demand (database { over-limit wait }) ----
- * With `over-limit refuse` (the default) a query for a zone that is out of memory is answered "not ready" at once while the zones in memory are above the hard line
- * (110% of the limit).  With `over-limit wait` the request waits in the ingest thread, which calls dbreg_cache_make_room() to take zones out of memory now (the cache manager
+/* ---- 0.7 B2 W8: room on demand ----
+ * A query for a zone that is out of memory is never refused for the zones in memory being above the hard line (110% of the limit): the request waits in the ingest thread, which calls dbreg_cache_make_room() to take zones out of memory now (the cache manager
  * does it every 50 ms, and not at all for zones younger than CACHE_MIN_RESIDENT_MS), and the fetch is made when there is room.  The rules that keep it from thrashing:
  *   - the same order as the manager: zones marked evict-next first, then the lowest frequency per byte (GDSF), so the coldest go first; pinned zones and zones that a dynamic
  *     UPDATE changed never; a zone with another state than RESIDENT (LOADING, ABSENT) is not in memory to take out (dbreg_evict_locked());

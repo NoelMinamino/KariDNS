@@ -13,6 +13,7 @@
 #include "../dns_zone_lint.h"
 #include "../dns_diag.h"
 #include "../dns_db_checkproto.h"
+#include "../dns_mem_advice.h"
 #include "../dns_cidr.h"
 #include "../dns_tsig_acl.h"
 #include "../dns_log.h"
@@ -794,9 +795,6 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
         kc_warning(&t, DC_CONF_DATABASE_STATE_FILE, "database: loader-state-file has no effect without memory-limit (every zone stays in memory, so there is no hot list to warm from)\n");
     if (db->warm_before_serve && db->memory_limit == 0)
         kc_warning(&t, DC_CONF_DATABASE_WARM, "database: warm-before-serve only waits for the directory to be loaded without memory-limit (every zone is read at the start)\n");
-    /* 0.7 B2 W8: over-limit only says what happens above the hard limit of memory-limit */
-    if (db->over_limit_wait && db->memory_limit == 0)
-        kc_warning(&t, DC_CONF_DATABASE_OVER_LIMIT, "database: over-limit wait has no effect without memory-limit (nothing is taken out of memory, so no query waits for room)\n");
     /* B7a: without acl-ceiling the ACLs a database zone carries (allow-transfer, allow-update from the metadata or a profile)
      * refuse every client; the zones still answer queries */
     if (db->acl_ceiling_count == 0 && db->acl_ceiling_keys_count == 0)
@@ -1297,6 +1295,8 @@ typedef struct {
     long long zid;
     bool have_r;
     unsigned r_errors;
+    bool have_m;                    /* the M line: zones and records of the database (0.7 P-F) */
+    uint64_t m_zones, m_records;
     char raw[3][160];               /* lines that are not protocol lines */
     unsigned nraw, nraw_all;
     bool overlong;
@@ -1613,7 +1613,7 @@ KARIDNS_TOOL_FN void kc_db_line(kc_dbrun_t *r, char *line) {
     shown[sk] = '\0';
     int n = chk_split(line, f, CHK_MAX_FIELDS);
     char tag = n > 0 && f[0][0] && !f[0][1] ? f[0][0] : 0;
-    bool proto = (tag && strchr("EWIOD", tag) && (n == 4 || n == 5)) || (tag == 'Z' && n >= 5) || (tag == 'S' && n == 6) || (tag == 'R' && n == 4);
+    bool proto = (tag && strchr("EWIOD", tag) && (n == 4 || n == 5)) || (tag == 'Z' && n >= 5) || (tag == 'S' && n == 6) || (tag == 'R' && n == 4) || (tag == 'M' && n == 3);
     if (!proto) {
         r->nraw_all++;
         if (r->nraw < 3) {
@@ -1627,6 +1627,12 @@ KARIDNS_TOOL_FN void kc_db_line(kc_dbrun_t *r, char *line) {
     }
     if (tag == 'S') {
         kc_db_settings(r, f);
+        return;
+    }
+    if (tag == 'M') {
+        r->have_m = true;
+        r->m_zones = strtoull(f[1], NULL, 10);
+        r->m_records = strtoull(f[2], NULL, 10);
         return;
     }
     if (tag == 'R') {
@@ -1690,9 +1696,12 @@ KARIDNS_TOOL_FN bool kc_db_identity(const database_config_t *db, uid_t *uid, gid
     return true;
 }
 
+/* what the loaders counted, summed over the sources (the M lines): the memory the database needs is computed from it */
+typedef struct { uint64_t zones, records; size_t sources; } kc_msum_t;
+
 /* Run the loader for one source.  Returns 0, or 1 when something was wrong (also: it could not be run). */
 KARIDNS_TOOL_FN int kc_db_run_source(const server_config_t *cfg, const kc_dbsrc_t *src, const view_config_t *only, bool sqlite, unsigned *zones_out,
-                                     int *errors_out, int *warnings_out) {
+                                     int *errors_out, int *warnings_out, kc_msum_t *msum) {
     const database_config_t *db = &cfg->database;
     char label[1200], who[400];
     if (sqlite) snprintf(label, sizeof(label), "Database file '%s'", kc_pr(src->source));
@@ -1866,9 +1875,44 @@ KARIDNS_TOOL_FN int kc_db_run_source(const server_config_t *cfg, const kc_dbsrc_
     if (r.t.errors > 0) dns_diag_plain(stderr, "[FAIL] %s has errors.\n", label);
     else dns_diag_plain(stdout, "[OK] %s is valid.\n", label);
     *zones_out += r.zones;
+    if (r.have_m && r.have_r && rc < 2) {
+        msum->zones += r.m_zones;
+        msum->records += r.m_records;
+        msum->sources++;
+    }
     *errors_out += r.t.errors;
     *warnings_out += r.t.warnings;
     return r.t.errors > 0 ? 1 : 0;
+}
+
+/* 0.7 P-F: what the databases need in memory (dns_mem_advice.c, the same figures and rules as the server's syslog lines and `karictl dbstatus`), from the
+ * zones and records the loaders counted; the whole configuration counts, so it is said once, not for every source.  The tool does not know how the zones
+ * are asked for, so what it says about memory-limit is the share of zones that fit and the recommendation, as the server says it at its start. */
+KARIDNS_TOOL_FN void kc_db_memory(const server_config_t *cfg, const kc_msum_t *ms, int *total_err, int *total_warn, int *bad) {
+    const database_config_t *db = &cfg->database;
+    ma_in_t in;
+    memset(&in, 0, sizeof(in));
+    in.zones = ms->zones;
+    in.have_records = true;
+    in.records = ms->records;
+    in.limit = db->memory_limit;
+    in.fetch_conc = db->fetch_concurrency ? db->fetch_concurrency : (db->loader_threads ? db->loader_threads : 1) * KARIDNS_DB_FETCH_CONC_PER_THREAD;
+    ma_est_t e;
+    ma_estimate(&in, &e);
+    char t[900];
+    ma_text_estimate(t, sizeof(t), &e);
+    dns_diag(DIAG_INFO, DC_DB_MEMORY_ESTIMATE, NULL, 0, "%s\n", t);
+    if (ma_text_advice(t, sizeof(t), &e) == 0) return;
+    if (e.level == MA_LEVEL_ERROR) {
+        dns_diag(DIAG_ERROR, DC_DB_MEMORY_LIMIT_TINY, NULL, 0, "%s\n", t);
+        (*total_err)++;
+        (*bad)++;
+    } else if (e.level == MA_LEVEL_WARNING) {
+        dns_diag(DIAG_WARNING, DC_DB_MEMORY_LIMIT_LOW, NULL, 0, "%s\n", t);
+        (*total_warn)++;
+    } else {
+        dns_diag(DIAG_NOTE, DC_DB_MEMORY_LIMIT_BELOW_ALL, NULL, 0, "%s\n", t);
+    }
 }
 
 /* karicheck db [view] [config_path] */
@@ -1964,18 +2008,20 @@ KARIDNS_TOOL_FN int kc_db_main(const char *config_path, const char *view_arg) {
     int bad = 0, total_err = 0, total_warn = 0;
     unsigned total_zones = 0;
     size_t ran = 0;
+    kc_msum_t msum = { 0, 0, 0 };
     for (size_t i = 0; i < nsrc; i++) {
         bool has_only = !only;
         for (size_t k = 0; k < srcs[i].nmem; k++)
             if (srcs[i].mem[k].v == only) has_only = true;
         if (!has_only) continue;
         ran++;
-        if (kc_db_run_source(&cfg, &srcs[i], only, sqlite, &total_zones, &total_err, &total_warn) != 0) bad++;
+        if (kc_db_run_source(&cfg, &srcs[i], only, sqlite, &total_zones, &total_err, &total_warn, &msum) != 0) bad++;
     }
     if (ran == 0) {
         dns_diag(DIAG_ERROR, DC_DB_NOTHING, NULL, 0, "No view reads a database: nothing to check\n");
         bad++;
     }
+    if (!only && ran > 0 && msum.sources == ran) kc_db_memory(&cfg, &msum, &total_err, &total_warn, &bad);
     dns_diag_counts(total_zones, 0);
     dns_diag(DIAG_INFO, DC_DB_SUMMARY, NULL, 0, "Checked %zu database%s (%u zone%s). Errors: %d, warnings: %d\n", ran, ran == 1 ? "" : "s", total_zones, total_zones == 1 ? "" : "s", total_err,
            total_warn);

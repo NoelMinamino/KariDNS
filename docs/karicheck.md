@@ -194,6 +194,11 @@ Every database gets a line `[RESULT] Database ...: N zone(s) read, E error(s), W
 | an `allow-transfer` / `allow-update` / `ecs-trusted-resolvers` entry that lies outside `acl-ceiling`, a key that `acl-ceiling` does not list, or ACLs while no `acl-ceiling` is configured (a database ACL refuses every client then) | warning |
 | `loader-state-file` (D1a step 7): the directory does not exist or cannot be written by the loader user (the loader writes `<file>.tmp` there and renames it), the file cannot be read by it | error |
 | `loader-state-file` that is not a valid hot list (empty, truncated, a bad count or checksum: the loader ignores it and the next list replaces it); a directory that everybody can write in; `loader-state-file` or `warm-before-serve` without `memory-limit` (`karicheck conf`) | warning |
+| **Memory (0.7, only when the whole configuration is checked, not for `karicheck db VIEW`)** | |
+| the zones and the records the loaders counted (`karidns-dbloader --check` prints an `M` line), what they need in memory (the Backend with every zone resident, the loader) and the `memory-limit` that keeps every zone, with the share of zones that fit under the configured `memory-limit` (the same figures and lines the server says in syslog at its start; `db.memory.estimate`); without `memory-limit` that is all it says | info |
+| `memory-limit` is below what every zone needs (`db.memory.limit-below-all`) | note |
+| `memory-limit` keeps less than half of the zones in memory (`db.memory.limit-low`): counted in the warnings | warning |
+| `memory-limit` cannot hold the zones of the reads in flight, 4 x `fetch-concurrency` (`db.memory.limit-tiny`): counted in the errors, exit status 1 | error |
 | **Zones of `karidns.conf` and views** | |
 | a zone of the same name in the view of the configuration hides the database zone: with `file` / `type master` (D-PRIO), `type program` / `type forward` (D-PROG) | warning |
 | a `karidns_domain_views` row names a view that is not defined, or one that does not read the database through the shared source | warning |
@@ -393,7 +398,6 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `conf.database.drivers-not-run` | warning | --drivers was not run because karicheck is run by root |
 | `conf.database.state-file` | warning | loader-state-file has no effect without memory-limit |
 | `conf.database.warm` | warning | warm-before-serve has no effect without memory-limit |
-| `conf.database.over-limit` | warning | over-limit has no effect without memory-limit |
 | `conf.database.acl-ceiling` | warning | no acl-ceiling: the ACLs of database zones refuse every client |
 | `conf.database.acl-ceiling-match` | warning | acl-ceiling-match all has no effect with one kind of entry |
 | `conf.database.file` | error | the SQLite3 database file does not exist |
@@ -545,6 +549,10 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `db.finding` | error | a finding of karidns-dbloader --check that carries no code of its own (the severity is the message's) |
 | `db.checking` | info | the database that is being checked |
 | `db.summary` | info | the number of databases and zones checked |
+| `db.memory.estimate` | info | what the database needs in memory, computed from its zone and record counts: the Backend, the loader, and the memory-limit that keeps every zone |
+| `db.memory.limit-below-all` | note | memory-limit is below what every zone needs: the share of zones that fit, and the recommended memory-limit |
+| `db.memory.limit-low` | warning | memory-limit keeps less than half of the zones in memory: most queries will wait for a read of the database |
+| `db.memory.limit-tiny` | error | memory-limit cannot hold the zones of the reads that run at once (fetch-concurrency): nearly every query for a database zone waits or fails |
 | `db.disabled` | error | the configuration has no database block |
 | `db.loader-missing` | error | the database loader is not installed |
 | `db.view-not-found` | error | the view named on the command line is not defined |

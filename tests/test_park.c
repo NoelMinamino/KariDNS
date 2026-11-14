@@ -529,6 +529,16 @@ static void test_places(void) {
   park_place_give();
   park_places_set_limit(INT32_MAX);
   CHECK(park_places_used() == 0);
+  /* park_place_avail(): is a place free (nothing is taken) */
+  park_places_set_limit(2);
+  CHECK(park_place_avail() && park_place_take() && park_place_avail() && park_place_take() && !park_place_avail() && park_places_used() == 2);
+  park_place_give();
+  CHECK(park_place_avail() && park_places_used() == 1);
+  park_place_give();
+  park_places_set_limit(1);
+  CHECK(park_place_take() && !park_place_avail());
+  park_place_give();
+  park_places_set_limit(INT32_MAX);
 }
 
 /* the bucket: the fill by time, the burst, the half-full rule for the background work, a token given back, the wrap of the 32-bit clock, a clock that is a little behind */
@@ -536,9 +546,17 @@ static void test_rate(void) {
   printf("[admission gate: the fetch-rate bucket]\n");
   park_rate_set(0);
   CHECK(park_rate_take(5000, false) && park_rate_take(5000, true) && park_rate_check(5000, true) && park_rate_level(5000) == 0);   /* (no rate: no limit) */
-  park_rate_set(10);
+  /* 0.7 P-A: with no rate (the default) a take is one load and returns: the word of the bucket is never written (no compare-and-swap on the query path), however many take */
+  park_rate_reset();
+  bool all_ok = true;
+  for (int i = 0; i < 100000; i++) all_ok = park_rate_take(7000 + i, i % 2 == 0) && all_ok;
+  CHECK(all_ok);
+  park_rate_give();
+  park_rate_set(10);                                                     /* no reset: a bucket that was never used is full */
+  CHECK(park_rate_level(9000) == 10000);
   park_rate_reset();
   const int64_t t = 1000000;
+
   CHECK(park_rate_level(t) == 10000);                                    /* a new bucket is full: one second of the rate */
   for (int i = 0; i < 10; i++) CHECK(park_rate_take(t, false));
   CHECK(!park_rate_take(t, false) && park_rate_level(t) == 0);
@@ -672,25 +690,17 @@ static void test_claim_ring(void) {
   /* the raw ring keeps the bit, park_fetch_next() takes it off */
   CHECK(park_fetch_request(2, "v1", "c.test.", KDB_FETCH_PRIO_WARM | PARK_PRIO_CLAIMED, KDB_FETCH_FULL));
   CHECK(park_fetch_pop(park_fetch_ring(2), &q) && q.prio == (KDB_FETCH_PRIO_WARM | PARK_PRIO_CLAIMED));
-  /* a claim that was not used: both go back */
+  /* a claim that was not used: the mark goes, and nothing else is touched (a worker holds neither a place nor a token any more: 0.7 P-B) */
   park_places_set_limit(2);
   park_rate_set(10);
   park_rate_reset();
-  CHECK(park_place_take() && park_rate_take(1000, false) && park_places_used() == 1 && park_rate_level(1000) == 9000);
+  uint64_t ck = park_claim_key("v1", "c.test.");
+  CHECK(park_claim_mark(ck) && park_claim_held(ck));
   park_claim_release("v1", "c.test.");
-  CHECK(park_places_used() == 0 && park_rate_level(1000) == 10000);
+  CHECK(!park_claim_held(ck) && park_places_used() == 0 && park_rate_level(1000) == 10000);
   park_places_set_limit(INT32_MAX);
   park_rate_set(0);
   park_rate_reset();
-  /* the refusals are counted per worker, and the totals add them */
-  park_stats_t s0, s1;
-  park_stats_get(&s0);
-  park_gate_count(2, false);
-  park_gate_count(2, false);
-  park_gate_count(3, true);
-  park_gate_count(-1, false);                                            /* (out of range: counted on worker 0, not lost, not a crash) */
-  park_stats_get(&s1);
-  CHECK(s1.gate_shed - s0.gate_shed == 3 && s1.gate_rate - s0.gate_rate == 1);
   park_unregister_worker(2);
 }
 
@@ -872,13 +882,15 @@ static void test_claims(void) {
   park_claim_clear(b);
   park_claim_clear(c);
   CHECK(!park_claim_held(a) && !park_claim_held(b) && !park_claim_held(c));
-  /* the release of a claim that was not used: place, token and mark */
+  /* the release of a claim that was not used: the mark goes, a place and a token that others hold are not touched (a worker holds neither: 0.7 P-B) */
   park_places_set_limit(2);
   park_rate_set(10);
   park_rate_reset();
   CHECK(park_place_take() && park_rate_take(1000, false) && park_claim_mark(a) && park_places_used() == 1 && park_rate_level(1000) == 9000);
   park_claim_release("v1", "a.test.");
-  CHECK(park_places_used() == 0 && park_rate_level(1000) == 10000 && !park_claim_held(a));
+  CHECK(park_places_used() == 1 && park_rate_level(1000) == 9000 && !park_claim_held(a));
+  park_place_give();
+  park_rate_give();
   park_places_set_limit(INT32_MAX);
   park_rate_set(0);
   park_rate_reset();

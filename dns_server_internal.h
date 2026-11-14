@@ -1206,7 +1206,6 @@ typedef struct {
   uint64_t xfr[4];                               /* transfers of zones that were out of memory, by DBREG_XFR_* */
   uint64_t pinned_bytes, peak;
   uint32_t victim_freq;
-  bool over_wait;                                /* database { over-limit wait } is in effect (0.7 B2 W8) */
   uint64_t room_evictions, room_relaxed;         /* zones taken out on demand for a query that waited for room (also in evictions), and of those the ones younger than the minimum residency */
 } dbreg_cache_stats_t;
 void dbreg_cache_set_limit(uint64_t limit);
@@ -1246,14 +1245,10 @@ void dbreg_xfr_note(int kind);
 void dbreg_cache_note_miss(void);                                 /* a query had to wait for a zone (the worker) */
 bool dbreg_cache_over_high(uint64_t extra);                        /* would the zone databases be above the high mark with `extra` more bytes? (false without a limit) */
 bool dbreg_cache_over_limit(void);                                 /* are the database zones above the limit itself? */
-/* 0.7 B2 W8, database { over-limit wait }: above the hard limit a query for a zone out of memory waits for room instead of being refused.  dbreg_cache_set_over_wait():
- * the cache thread sets it from the configuration (a reload switches it); dbreg_cache_over_wait() is what the workers' gate and the ingest thread read.
- * dbreg_cache_make_room(): called by the ingest thread only, with the database zones above the hard limit and `nwant` fetches waiting: takes out of memory, now, the coldest
+/* 0.7 B2 W8, room on demand: above the hard limit a query for a zone out of memory waits for room (it is never refused for it).  dbreg_cache_make_room(): called by the ingest thread only, with the database zones above the hard limit and `nwant` fetches waiting: takes out of memory, now, the coldest
  * zones (the order of the cache manager's round) until there is room for `nwant` more zones of the average size, at most down to the manager's low mark.  Zones older than
  * the minimum residency first; only if that is not enough, younger ones whose queries have been answered (at least one) and that have been in memory for ten milliseconds.
  * Returns how many were taken out; *relaxed (if not NULL) how many of them were younger than the minimum residency. */
-void dbreg_cache_set_over_wait(bool wait);
-bool dbreg_cache_over_wait(void);
 uint32_t dbreg_cache_make_room(uint32_t nwant, uint32_t *relaxed);
 /* A zone of a batch that is not kept in memory because the limit is reached: the directory element with the serial and the digest the loader sent,
  * no data (the next query for it fetches it).  0 on success. */

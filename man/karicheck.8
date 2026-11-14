@@ -650,144 +650,120 @@ before it is printed. The exit status is 1 when any error was found or the check
 could not be run, else 0 (warnings do not change it). With \fB\-\-json\fR each
 finding is a message of the document (code, place and zone), and the zones are
 the entries of \fBzones\fR (\fB"format": "database"\fR; \fBfile\fR is null).
-.PP
-.TS
-lbw(51) lb
-lw(51) l.
-\&Check	\&Level
-_
-\&\fBSchema\fR	\&
-T{
-a PowerDNS table or column the loader reads is missing (\fBdomains\fR,
-\fBrecords\fR, \fBdomainmetadata\fR, \fBcryptokeys\fR; all missing columns are
-named)
-T}	\&error
-T{
-none of the \fBkaridns_*\fR tables exists (a plain PowerDNS database), or one is
-missing or incomplete (what it costs is said: no change log, no view mapping, no
-profiles, no tags)
-T}	\&warning
-\&\fBkaridns_schema_version\fR is newer than 3 / has no row	\&error / warning
-T{
-\fBauto\-reload yes\fR and \fBkaridns_changes\fR is missing, or change log
-triggers are missing (named)
-T}	\&error
-T{
-PostgreSQL: \fBkaridns_changes\fR has no \fBxid\fR column (schema version 1: no
-change log)
-T}	\&warning
-T{
-PostgreSQL: the role cannot \fBSELECT\fR a table the loader reads, or
-\fBcryptokeys.domain_id\fR
-T}	\&error
-T{
+.TP 8
+\fBSchema\fR
+.TP 8
+a PowerDNS table or column the loader reads is missing (\fBdomains\fR, \fBrecords\fR, \fBdomainmetadata\fR, \fBcryptokeys\fR; all missing columns are named)
+error
+.TP 8
+none of the \fBkaridns_*\fR tables exists (a plain PowerDNS database), or one is missing or incomplete (what it costs is said: no change log, no view mapping, no profiles, no tags)
+warning
+.TP 8
+\fBkaridns_schema_version\fR is newer than 3 / has no row
+error / warning
+.TP 8
+\fBauto\-reload yes\fR and \fBkaridns_changes\fR is missing, or change log triggers are missing (named)
+error
+.TP 8
+PostgreSQL: \fBkaridns_changes\fR has no \fBxid\fR column (schema version 1: no change log)
+warning
+.TP 8
+PostgreSQL: the role cannot \fBSELECT\fR a table the loader reads, or \fBcryptokeys.domain_id\fR
+error
+.TP 8
 PostgreSQL: the role can read \fBcryptokeys.content\fR (the private keys)
-T}	\&warning
-T{
-PostgreSQL: the role cannot \fBINSERT\fR / \fBUPDATE\fR
-\fBkaridns_server_status\fR; only one of the multi-server tables exists;
-\fBserver\-id\fR is set but they are missing
-T}	\&warning
-\&the schema named by \fBdatabase\-schema\fR does not exist	\&error
-\&\fBEvery zone\fR	\&
-T{
-the reader's refusals, with \fBrecords.id\fR: a content the zone parser rejects,
-an unsupported type, an owner outside the zone, a name that is not a domain
-name, a prio that contradicts the content (MX / SRV), a TTL out of range, a row
-that is not safe as a line of text, no enabled apex SOA, a \fBSLAVE\fR /
-\fBCONSUMER\fR without usable \fBmasters\fR
-T}	\&error
-T{
-\fBALIAS\fR in a \fBPRESIGNED\fR zone, \fBENABLE\-LUA\-RECORDS=1\fR, malformed
-\fBALIAS\fR / \fBLUA\fR data
-T}	\&error
-T{
-\fBLUA\fR records (kept for transfers, never answered); \fBALIAS\fR records
-(\fB[INFO]\fR, NODATA unless an \fBalias\-resolver\fR is set)
-T}	\&warning / info
-T{
-records with a NULL \fBttl\fR (\fBdefault\-ttl\fR is used); a \fBprio\fR on a
-type other than MX / SRV; metadata that is ignored
-T}	\&warning
-\&the SOA serial is 0	\&warning
-T{
-every check of \fBkaricheck zone\fR on the zone (the very same code): missing NS
-at the apex, CNAME with other data, glue and delegation rules, inconsistent TTLs
-in an RRset, field ranges of SRV / NAPTR / CAA / SSHFP / HIP / WKS ..., DNSSEC
-algorithm and digest recommendations, NSEC3 and NSEC3PARAM rules, ZONEMD
-verification
-T}	\&as in \fBkaricheck zone\fR
-T{
-a \fBPRODUCER\fR zone: the catalog zone itself is not served yet (decision D9, a
-later 0.6.x release), but its member zones are (\fBits N member zones are
-served\fR); secondaries that take the catalog from KariDNS will not get
-it. Migrating from PowerDNS works; only the catalog zone is missing. Exit status
-0 when this is the only finding
-T}	\&warning
-T{
-\fBdomains.catalog\fR names a zone that is not a \fBPRODUCER\fR zone of the
-database
-T}	\&warning
-T{
-two \fBdomains\fR rows of one source whose names are equal ignoring case
-(\fBExample.test\fR and \fBexample.test\fR; both drivers; the message names both
-\fBdomains.id\fR): not supported, PowerDNS stores names in lower case, and a
-full read and a one-zone read (reload request, auto reload) may pick different
-rows
-T}	\&warning
-\&\fBKeys and presigned zones\fR	\&
-T{
-\fBcryptokeys\fR rows without \fBPRESIGNED=1\fR (PowerDNS would sign online,
-KariDNS serves signed data only)
-T}	\&error
-T{
-\fBNSEC3PARAM\fR metadata with a bad syntax; a presigned NSEC3 or NSEC chain
-that does not match the zone (a name without its \fBRRSIG(NSEC3)\fR owner, an
-\fBordername\fR that is not the hash, parameters outside RFC 5155 \[u00A7]10.3)
-T}	\&error
-\&NSEC3 iterations other than 0 (RFC 9276)	\&warning
-T{
-a presigned NSEC3 zone without an \fBRRSIG(NSEC3PARAM)\fR at the apex: the TTL
-of the rebuilt \fBNSEC3PARAM\fR is the SOA MINIMUM, because the TTL the signer
-used is unknown
-T}	\&warning
-\&\fBSettings (metadata and profiles)\fR	\&
-T{
-the settings text of a zone or of its profile (\fBkaridns_profiles\fR) does not
-parse in restricted mode, the profile is not defined
-T}	\&error
-T{
+warning
+.TP 8
+PostgreSQL: the role cannot \fBINSERT\fR / \fBUPDATE\fR \fBkaridns_server_status\fR; only one of the multi-server tables exists; \fBserver\-id\fR is set but they are missing
+warning
+.TP 8
+the schema named by \fBdatabase\-schema\fR does not exist
+error
+.TP 8
+\fBEvery zone\fR
+.TP 8
+the reader's refusals, with \fBrecords.id\fR: a content the zone parser rejects, an unsupported type, an owner outside the zone, a name that is not a domain name, a prio that contradicts the content (MX / SRV), a TTL out of range, a row that is not safe as a line of text, no enabled apex SOA, a \fBSLAVE\fR / \fBCONSUMER\fR without usable \fBmasters\fR
+error
+.TP 8
+\fBALIAS\fR in a \fBPRESIGNED\fR zone, \fBENABLE\-LUA\-RECORDS=1\fR, malformed \fBALIAS\fR / \fBLUA\fR data
+error
+.TP 8
+\fBLUA\fR records (kept for transfers, never answered); \fBALIAS\fR records (\fB[INFO]\fR, NODATA unless an \fBalias\-resolver\fR is set)
+warning / info
+.TP 8
+records with a NULL \fBttl\fR (\fBdefault\-ttl\fR is used); a \fBprio\fR on a type other than MX / SRV; metadata that is ignored
+warning
+.TP 8
+the SOA serial is 0
+warning
+.TP 8
+every check of \fBkaricheck zone\fR on the zone (the very same code): missing NS at the apex, CNAME with other data, glue and delegation rules, inconsistent TTLs in an RRset, field ranges of SRV / NAPTR / CAA / SSHFP / HIP / WKS ..., DNSSEC algorithm and digest recommendations, NSEC3 and NSEC3PARAM rules, ZONEMD verification
+as in \fBkaricheck zone\fR
+.TP 8
+a \fBPRODUCER\fR zone: the catalog zone itself is not served yet (decision D9, a later 0.6.x release), but its member zones are (\fBits N member zones are served\fR); secondaries that take the catalog from KariDNS will not get it. Migrating from PowerDNS works; only the catalog zone is missing. Exit status 0 when this is the only finding
+warning
+.TP 8
+\fBdomains.catalog\fR names a zone that is not a \fBPRODUCER\fR zone of the database
+warning
+.TP 8
+two \fBdomains\fR rows of one source whose names are equal ignoring case (\fBExample.test\fR and \fBexample.test\fR; both drivers; the message names both \fBdomains.id\fR): not supported, PowerDNS stores names in lower case, and a full read and a one-zone read (reload request, auto reload) may pick different rows
+warning
+.TP 8
+\fBKeys and presigned zones\fR
+.TP 8
+\fBcryptokeys\fR rows without \fBPRESIGNED=1\fR (PowerDNS would sign online, KariDNS serves signed data only)
+error
+.TP 8
+\fBNSEC3PARAM\fR metadata with a bad syntax; a presigned NSEC3 or NSEC chain that does not match the zone (a name without its \fBRRSIG(NSEC3)\fR owner, an \fBordername\fR that is not the hash, parameters outside RFC 5155 \[u00A7]10.3)
+error
+.TP 8
+NSEC3 iterations other than 0 (RFC 9276)
+warning
+.TP 8
+a presigned NSEC3 zone without an \fBRRSIG(NSEC3PARAM)\fR at the apex: the TTL of the rebuilt \fBNSEC3PARAM\fR is the SOA MINIMUM, because the TTL the signer used is unknown
+warning
+.TP 8
+\fBSettings (metadata and profiles)\fR
+.TP 8
+the settings text of a zone or of its profile (\fBkaridns_profiles\fR) does not parse in restricted mode, the profile is not defined
+error
+.TP 8
 the settings name a TSIG key that \fBkaridns.conf\fR does not define
-T}	\&error
-T{
-an \fBallow\-transfer\fR / \fBallow\-update\fR / \fBecs\-trusted\-resolvers\fR
-entry that lies outside \fBacl\-ceiling\fR, a key that \fBacl\-ceiling\fR does
-not list, or ACLs while no \fBacl\-ceiling\fR is configured (a database ACL
-refuses every client then)
-T}	\&warning
-T{
-\fBloader\-state\-file\fR (D1a step 7): the directory does not exist or cannot
-be written by the loader user (the loader writes \fB<file>.tmp\fR there and
-renames it), the file cannot be read by it
-T}	\&error
-T{
-\fBloader\-state\-file\fR that is not a valid hot list (empty, truncated, a bad
-count or checksum: the loader ignores it and the next list replaces it); a
-directory that everybody can write in; \fBloader\-state\-file\fR or
-\fBwarm\-before\-serve\fR without \fBmemory\-limit\fR (\fBkaricheck conf\fR)
-T}	\&warning
-\&\fBZones of \fBkaridns.conf\fB and views\fR	\&
-T{
-a zone of the same name in the view of the configuration hides the database
-zone: with \fBfile\fR / \fBtype master\fR (D-PRIO), \fBtype program\fR / \fBtype
-forward\fR (D-PROG)
-T}	\&warning
-T{
-a \fBkaridns_domain_views\fR row names a view that is not defined, or one that
-does not read the database through the shared source
-T}	\&warning
-\&a zone that only such rows map is served by no view	\&warning
-.TE
+error
+.TP 8
+an \fBallow\-transfer\fR / \fBallow\-update\fR / \fBecs\-trusted\-resolvers\fR entry that lies outside \fBacl\-ceiling\fR, a key that \fBacl\-ceiling\fR does not list, or ACLs while no \fBacl\-ceiling\fR is configured (a database ACL refuses every client then)
+warning
+.TP 8
+\fBloader\-state\-file\fR (D1a step 7): the directory does not exist or cannot be written by the loader user (the loader writes \fB<file>.tmp\fR there and renames it), the file cannot be read by it
+error
+.TP 8
+\fBloader\-state\-file\fR that is not a valid hot list (empty, truncated, a bad count or checksum: the loader ignores it and the next list replaces it); a directory that everybody can write in; \fBloader\-state\-file\fR or \fBwarm\-before\-serve\fR without \fBmemory\-limit\fR (\fBkaricheck conf\fR)
+warning
+.TP 8
+\fBMemory (0.7, only when the whole configuration is checked, not for \fBkaricheck db VIEW\fB)\fR
+.TP 8
+the zones and the records the loaders counted (\fBkaridns\-dbloader \-\-check\fR prints an \fBM\fR line), what they need in memory (the Backend with every zone resident, the loader) and the \fBmemory\-limit\fR that keeps every zone, with the share of zones that fit under the configured \fBmemory\-limit\fR (the same figures and lines the server says in syslog at its start; \fBdb.memory.estimate\fR); without \fBmemory\-limit\fR that is all it says
+info
+.TP 8
+\fBmemory\-limit\fR is below what every zone needs (\fBdb.memory.limit\-below\-all\fR)
+note
+.TP 8
+\fBmemory\-limit\fR keeps less than half of the zones in memory (\fBdb.memory.limit\-low\fR): counted in the warnings
+warning
+.TP 8
+\fBmemory\-limit\fR cannot hold the zones of the reads in flight, 4 x \fBfetch\-concurrency\fR (\fBdb.memory.limit\-tiny\fR): counted in the errors, exit status 1
+error
+.TP 8
+\fBZones of \fBkaridns.conf\fB and views\fR
+.TP 8
+a zone of the same name in the view of the configuration hides the database zone: with \fBfile\fR / \fBtype master\fR (D-PRIO), \fBtype program\fR / \fBtype forward\fR (D-PROG)
+warning
+.TP 8
+a \fBkaridns_domain_views\fR row names a view that is not defined, or one that does not read the database through the shared source
+warning
+.TP 8
+a zone that only such rows map is served by no view
+warning
 .PP
 Examples (the paths are those of a test installation; \fBexample.test\fR and
 friends are test names):
@@ -1489,11 +1465,6 @@ enabled
 \fISeverity:\fR warning
 .br
 \fIMeaning:\fR warm-before-serve has no effect without memory-limit
-.TP 8
-\fBconf.database.over\-limit\fR
-\fISeverity:\fR warning
-.br
-\fIMeaning:\fR over-limit has no effect without memory-limit
 .TP 8
 \fBconf.database.acl\-ceiling\fR
 \fISeverity:\fR warning
@@ -2266,6 +2237,31 @@ its own (the severity is the message's)
 \fISeverity:\fR info
 .br
 \fIMeaning:\fR the number of databases and zones checked
+.TP 8
+\fBdb.memory.estimate\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR what the database needs in memory, computed from its zone and
+record counts: the Backend, the loader, and the memory-limit that keeps every
+zone
+.TP 8
+\fBdb.memory.limit\-below\-all\fR
+\fISeverity:\fR note
+.br
+\fIMeaning:\fR memory-limit is below what every zone needs: the share of zones
+that fit, and the recommended memory-limit
+.TP 8
+\fBdb.memory.limit\-low\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR memory-limit keeps less than half of the zones in memory: most
+queries will wait for a read of the database
+.TP 8
+\fBdb.memory.limit\-tiny\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR memory-limit cannot hold the zones of the reads that run at once
+(fetch-concurrency): nearly every query for a database zone waits or fails
 .TP 8
 \fBdb.disabled\fR
 \fISeverity:\fR error

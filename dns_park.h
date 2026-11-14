@@ -139,25 +139,26 @@ bool park_wake_take_overflow(park_wake_ring_t *r);
 bool park_wake_pending(const park_wake_ring_t *r);
 
 /* ---- the worker's decision before it parks a query and asks for its zone (implemented in dns_server_core.c, used by the UDP and the TCP path; tests call it) ----
- * FETCH_GATE_ASK: no claim, ask as before (no gate; or the zone is LOADING; or a worker has claimed the zone already, see "the claims" in dns_park.c: park, and ask without
- * a claim).  FETCH_GATE_TAKEN: a place and a token are held and the zone is marked as claimed, ask with PARK_PRIO_CLAIMED and give them back with park_claim_release() if
- * the request is not made.  FETCH_GATE_REFUSE: answer "not ready" now (counted in `shed` or `refused_by_rate`; with database { over-limit wait } the database zones being over the
- * hard limit is not a reason: the request waits for room in the ingest thread).  w: the worker's ring index; view: the name of the view
- * that holds the zone (zdir_holder_view(), what the request carries). */
-enum { FETCH_GATE_ASK = 0, FETCH_GATE_TAKEN, FETCH_GATE_REFUSE };
-int fetch_gate(int w, const char *view, const zdir_elem_t *pel, int64_t now_ms);
+ * A query for a zone that is out of memory is never refused here (0.7 P-B): whatever fetch-concurrency, fetch-rate or the memory limit say, the query parks and the request
+ * is made; the ingest thread keeps it in its queue until a place, a token and room are there (dns_db_ingest.c, "the wait queue"), or until park-timeout.  The gate only
+ * keeps a zone from being asked for twice (see "the claims" in dns_park.c).
+ * FETCH_GATE_ASK: no claim, ask as before (no memory-limit; or the zone is not ABSENT: LOADING means a fetch is on its way, ERROR and RESIDENT are answered by the ingest
+ * thread; or a worker has claimed the zone already: park, and ask without a claim, the ingest thread drops that request while the claim is marked and the one fetch wakes
+ * every worker).  FETCH_GATE_TAKEN: the zone is marked as claimed; ask with PARK_PRIO_CLAIMED, and clear the mark with park_claim_release() if the request is not made.
+ * view: the name of the view that holds the zone (zdir_holder_view(), what the request carries). */
+enum { FETCH_GATE_ASK = 0, FETCH_GATE_TAKEN };
+int fetch_gate(const char *view, const zdir_elem_t *pel);
 
 /* ---- worker -> ingest: please fetch ---- */
-/* Set in the prio a worker passes to park_fetch_request(): the worker has taken a place of the fetch table and a token of the fetch-rate bucket for this request
- * (park_place_take(), park_rate_take(); B2 W5).  The ingest thread gives them back on every path that does not end in a fetch (see "the admission gate" below).
- * park_fetch_next() strips the bit and reports it as park_fetch_req_t.claimed. */
+/* Set in the prio a worker passes to park_fetch_request(): the worker has marked the zone as claimed for this request (park_claim_mark()).  The ingest thread clears the mark
+ * on every path that does not leave it to a queued request (see "the claims" in dns_park.c).  park_fetch_next() strips the bit and reports it as park_fetch_req_t.claimed. */
 #define PARK_PRIO_CLAIMED 0x80
 
 typedef struct {
   uint8_t prio;                      /* KDB_FETCH_PRIO_* (park_fetch_push() stores what it is given; park_fetch_next() hands out the plain value) */
   uint8_t mode;                      /* KDB_FETCH_FULL / KDB_FETCH_SUMMARY */
   uint8_t vlen, zlen;
-  bool claimed;                      /* park_fetch_next() only: the request holds a place and a token */
+  bool claimed;                      /* park_fetch_next() only: the request holds the claim mark of its zone */
   int16_t worker;                    /* park_fetch_next() only: the ring (worker) it came from, -1 for a thread that is not a worker */
   char view[PARK_VIEW_MAX + 1];
   char zone[PARK_ZONE_MAX + 1];
@@ -177,26 +178,20 @@ typedef struct {
   uint64_t full;                     /* queries not parked because the worker's table was full */
   uint64_t timeout;                  /* parked queries that reached their deadline */
   uint64_t ring_dropped;             /* fetch requests the workers could not queue (their ring to the ingest thread was full) */
-  uint64_t gate_shed;                /* B2 W5: queries the workers turned away at the admission gate: no place free, or the database zones over the limit (counted in `shed`) */
-  uint64_t gate_rate;                /* ... and because the fetch-rate bucket was empty (counted in `refused_by_rate`) */
 } park_stats_t;
 void park_stats_get(park_stats_t *out);
 
-/* ---- the admission gate (B2 W5) ----
- * Without it every query for a zone that is out of memory parks and pushes a request, and the ingest thread (one thread, 10 us a request at best) decides: shed,
- * refuse by rate, or fetch.  Under a flood of misses that thread did nothing else (97% of a core in fetch_issue, most of it kevent calls that wake the workers
- * of a shed), reads and installs waited behind it, and the rings overflowed.  Now the worker decides before it parks:
- *   place   one of fetch-concurrency places for the whole-zone fetches that are on their way (queued in a ring, or in flight).  A lock-free counter bounded by
- *           the limit: park_place_take() / park_place_give().
- *   token   one of the tokens of the fetch-rate bucket, a lock-free bucket (milli-tokens and a time stamp in one word, compare-and-swap): park_rate_take() /
- *           park_rate_give().  The ingest thread takes its tokens from the same bucket (the warm-up, the background requests, the summaries, a worker without
- *           the gate), so the one rate is what fetch-rate says.
- * A worker that got both asks with PARK_PRIO_CLAIMED; one that got neither answers "not ready" at once and does not touch the ring.  The ingest thread gives
- * place and token back on every path that does not become a fetch (a duplicate, a shed, a zone already in memory, a view that is gone, a full table), and the
- * place also when the fetch is over (completed, failed, dropped, the loader gone): a place is held from the claim to exactly one of those, so none leaks. */
+/* ---- places and tokens (B2 W5, changed by 0.7 P-B) ----
+ * Only the ingest thread takes them now: a worker's request waits in the ingest thread's queue until it can have both (a request is never refused for the lack of one).
+ *   place   one of fetch-concurrency places for the whole-zone fetches that are on their way (in flight to the loader).  A counter bounded by the limit:
+ *           park_place_take() / park_place_give(); the place is held from the take to the end of the fetch (completed, failed, dropped, the loader gone).
+ *   token   one of the tokens of the fetch-rate bucket (milli-tokens and a time stamp in one word, compare-and-swap): park_rate_take() / park_rate_give().  With no rate
+ *           (fetch-rate unlimited, the default) there is no bucket: the functions return at once, no atomic write.  The warm-up, the background requests and the summaries
+ *           take their tokens from the same bucket, so the one rate is what fetch-rate says. */
 void park_places_set_limit(uint32_t limit);       /* fetch-concurrency in effect; a lower limit takes effect as the places in use are given back */
 uint32_t park_places_used(void);
 bool park_place_take(void);                       /* false: every place is taken */
+bool park_place_avail(void);                      /* is a place free now (no take)? */
 void park_place_give(void);                       /* (never below 0: a place given back twice does not make room) */
 void park_rate_set(uint32_t per_s);               /* fetch-rate; 0: no limit (nothing is set yet) */
 /* Take a token.  half: only from a bucket that is at least half full (what the queries leave for the warm-up, the summaries and the background requests).
@@ -206,18 +201,16 @@ bool park_rate_check(int64_t now_ms, bool half);  /* the same without taking it 
 uint32_t park_rate_level(int64_t now_ms);         /* the tokens in the bucket, in thousandths (0 without a rate) */
 void park_rate_give(void);                        /* a token taken for a read that was not made */
 void park_rate_reset(void);                       /* a full bucket (tests) */
-/* The claims (B2 M1, "the claims" in dns_park.c): the first worker that asks for a zone that is out of memory takes the place and the token and marks the zone, the others
+/* The claims (B2 M1, "the claims" in dns_park.c): the first worker that asks for a zone that is out of memory marks the zone, the others
  * park and ask without a claim.  The key is the hash of (view, zone) (never 0).  park_claim_held(): is a claim marked.  park_claim_mark(): mark it; false: it was marked
- * already (give back what was taken and ask without a claim); true: this caller holds the claim (also when there was no room for the mark).  park_claim_clear(): the claim
- * is over, whatever came of it (the ingest thread calls it for every request that has PARK_PRIO_CLAIMED). */
+ * already (ask without a claim); true: this caller holds the claim (also when there was no room for the mark).  park_claim_clear(): the claim is over (the ingest thread
+ * calls it when the request became a fetch, was dropped or refused; a request that waits in its queue keeps the mark). */
 uint64_t park_claim_key(const char *view, const char *zone);
 bool park_claim_held(uint64_t key);
 bool park_claim_mark(uint64_t key);
 void park_claim_clear(uint64_t key);
-/* The worker's side of a claim that was not used (the park table was full, the ring was full): place and token are given back and the mark is cleared. */
+/* The worker's side of a claim that was not used (the park table was full, the ring was full): the mark is cleared. */
 void park_claim_release(const char *view, const char *zone);
-/* A worker turned a query away at the gate (rate: because of the bucket, else because of the places or the memory limit); counted per worker, no shared line. */
-void park_gate_count(int w, bool rate);
 
 /* ---- the workers' rings, and the notifications ---- */
 /* Worker w (0 .. PARK_MAX_WORKERS-1) has its rings in these arrays.  kq: the kqueue the ingest thread triggers (-1: no notification,

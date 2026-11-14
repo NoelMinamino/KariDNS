@@ -539,7 +539,7 @@ static void test_database_block(void) {
         "loader-group \"karidns-db\"; loader-path \"/usr/local/libexec/karidns-dbloader\"; "
         "acl-ceiling { 192.0.2.0/24; }; auto-reload yes; poll-interval 5; coalesce 250; default-ttl 600; "
         "bulk-threshold 40; max-zone-records 5000; max-zone-bytes 64M; db-reload-timeout 45; ingest-threads 4; "
-        "loader-threads 8; park-max 2048; park-timeout 800; memory-limit 3g; fetch-rate 500; fetch-concurrency 40; over-limit wait; transfer-fetch-timeout 2500; server-id \"ns1\"; alias-resolver { 192.0.2.53; 2001:db8::53; }; }; };";
+        "loader-threads 8; park-max 2048; park-timeout 800; memory-limit 3g; fetch-rate 500; fetch-concurrency 40; transfer-fetch-timeout 2500; server-id \"ns1\"; alias-resolver { 192.0.2.53; 2001:db8::53; }; }; };";
     if (parse_ok(full, &cfg)) {
         const database_config_t *d = &cfg.database;
         CHECK(d->enabled);
@@ -557,7 +557,6 @@ static void test_database_block(void) {
         CHECK(d->fetch_rate == 500);                                                  /* D1a: fetch-rate */
         CHECK(d->fetch_concurrency == 40);                                            /* D1a: fetch-concurrency */
         CHECK(d->transfer_fetch_timeout_ms == 2500);                                  /* D1a step 7: transfer-fetch-timeout */
-        CHECK(d->over_limit_wait);                                                   /* 0.7 B2 W8: over-limit wait */
         CHECK_STR(d->server_id, "ns1");
         CHECK(d->alias_resolver_count == 2);
         free_server_config_fields(&cfg);
@@ -571,8 +570,7 @@ static void test_database_block(void) {
         CHECK(d->db_reload_timeout == 30 && d->ingest_threads == 1 && d->loader_threads == 1);
         CHECK(d->park_max == 0 && d->park_timeout_ms == 0);                          /* (0: the worker's defaults, 1024 and 1500 ms) */
         CHECK(d->memory_limit == 0);                                                  /* (0: no limit, every database zone stays in memory) */
-        CHECK(d->fetch_rate == 0);                                                    /* (0: the default, 200 zones per second) */
-        CHECK(!d->over_limit_wait);                                                   /* (0.7 B2 W8: over-limit refuse, the old behaviour) */
+        CHECK(d->fetch_rate == 0);                                                    /* (0.7 P-A: 0 is the default, unlimited) */
         CHECK(d->transfer_fetch_timeout_ms == 0);                                     /* (0: the default, 10 seconds) */
         CHECK_STR(db_loader_path(&cfg), KARIDNS_DB_DEFAULT_LOADER_PATH);
         free_server_config_fields(&cfg);
@@ -606,33 +604,30 @@ static void test_database_block(void) {
     expect_reject("transfer-fetch-timeout 99", DBP "transfer-fetch-timeout 99; }; };");
     expect_reject("transfer-fetch-timeout 600001", DBP "transfer-fetch-timeout 600001; }; };");
     expect_reject("transfer-fetch-timeout abc", DBP "transfer-fetch-timeout abc; }; };");
-    expect_reject("fetch-rate 0", DBP "fetch-rate 0; }; };");
     expect_reject("fetch-rate 100001", DBP "fetch-rate 100001; }; };");
     expect_reject("fetch-rate abc", DBP "fetch-rate abc; }; };");
     expect_reject("fetch-concurrency 1", DBP "fetch-concurrency 1; }; };");
     expect_reject("fetch-concurrency 257", DBP "fetch-concurrency 257; }; };");
     expect_reject("fetch-concurrency abc", DBP "fetch-concurrency abc; }; };");
-    /* 0.7 B2 W8: over-limit refuse | wait (a word, either case; the last one wins like any option) */
+    /* 0.7 P-A: fetch-rate unlimited (the default) or 0: no limit; a number is the rate */
     {
-        static const struct { const char *text; bool wait; } ol[] = {
-            { "over-limit wait;", true }, { "over-limit refuse;", false }, { "over-limit WAIT;", true }, { "over-limit Refuse;", false },
-            { "over-limit wait; over-limit refuse;", false }, { "over-limit refuse; over-limit wait;", true },
+        static const struct { const char *text; uint32_t rate; } fr[] = {
+            { "fetch-rate unlimited;", 0 }, { "fetch-rate UNLIMITED;", 0 }, { "fetch-rate 0;", 0 }, { "fetch-rate 1;", 1 }, { "fetch-rate 100000;", 100000 },
+            { "fetch-rate 50; fetch-rate unlimited;", 0 }, { "fetch-rate unlimited; fetch-rate 50;", 50 },
         };
-        for (size_t i = 0; i < sizeof(ol) / sizeof(ol[0]); i++) {
+        for (size_t i = 0; i < sizeof(fr) / sizeof(fr[0]); i++) {
             char conf[256];
-            snprintf(conf, sizeof(conf), DBP "memory-limit 64m; %s }; };", ol[i].text);
+            snprintf(conf, sizeof(conf), DBP "%s }; };", fr[i].text);
             if (parse_ok(conf, &cfg)) {
-                CHECK(cfg.database.over_limit_wait == ol[i].wait && cfg.database.memory_limit == 64ull << 20);
+                CHECK(cfg.database.fetch_rate == fr[i].rate);
                 free_server_config_fields(&cfg);
             }
         }
     }
-    expect_reject("over-limit 1", DBP "over-limit 1; }; };");
-    expect_reject("over-limit abc", DBP "over-limit abc; }; };");
-    expect_reject("over-limit yes", DBP "over-limit yes; }; };");
-    expect_reject("over-limit without a value", DBP "over-limit; }; };");
-    expect_reject("over-limit wait without a semicolon", DBP "over-limit wait }; };");
-    expect_reject("over-limit a quoted long word", DBP "over-limit \"refuse-and-then-some-more\"; }; };");
+    expect_reject("fetch-rate unlimited without a semicolon", DBP "fetch-rate unlimited }; };");
+    expect_reject("fetch-rate unlimited2", DBP "fetch-rate unlimited2; }; };");
+    /* 0.7: over-limit (refuse | wait) was removed before it was released: above the hard line a query always waits for room */
+    expect_reject("over-limit wait (removed)", DBP "over-limit wait; }; };");
     expect_reject("max-zone-records 1", DBP "max-zone-records 1; }; };");
     expect_reject("max-zone-bytes 100", DBP "max-zone-bytes 100; }; };");
     expect_reject("max-zone-bytes junk", DBP "max-zone-bytes 1X; }; };");
