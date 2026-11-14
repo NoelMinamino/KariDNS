@@ -34,6 +34,9 @@
 #include "dns_zone_image.h"
 
 #define DBS_NAME_MAX 256
+#define DBS_CFGID 8                        /* 0.7 WP7b: bytes of the cursor's identity that are the hash of the view's configuration; the loader's own identity follows (at most STORE_IDENT_MAX - 8 bytes) */
+#define DBS_GUARD_PCT 20u                  /* decision D7: the sweep of a pass deletes nothing when it would delete more than this share of the view's zones ... */
+#define DBS_GUARD_MIN 1000u                /* ... and more than this many */
 
 static int64_t mono_ns(void) {
   struct timespec ts;
@@ -221,6 +224,8 @@ static struct {
   /* the deepest label count of the stored zones of each view (an upper bound; the depth skip of the lookup) */
   _Atomic uint16_t dmax[STORE_MAX_VIEWS];
   _Atomic uint32_t view_gen;
+  _Atomic int64_t room_next_ns;                  /* 0.7 WP7b: the next time an attach may make room under the hard line of memory-limit */
+  _Atomic uint64_t cfgid[STORE_MAX_VIEWS];      /* 0.7 WP7b: the first 8 bytes of the hash of the view's configuration (view_identity()): the start of the identity kept with the cursor */
   /* counters */
   _Atomic uint64_t wt_queued, wt_inline, wt_put, wt_skipped, wt_deleted, wt_invalidated, wt_errors, wt_dropped;
   _Atomic uint64_t attach_ok, attach_stale, attach_missing, attach_damaged, attach_fallback, attach_resident, attach_busy;
@@ -645,6 +650,7 @@ static bool dir_find(int sid, const char *fname, size_t len, zref_t *out) {
     if (!store_zid_is(st, cand[i], (uint16_t)sid, fname, len)) continue;
     store_zone_t z;
     if (store_zone_get(st, cand[i], &z) != 0) continue;
+    if (z.flags & STORE_F_NONSTORE) continue;                  /* (a secondary or catalog zone of the database: a heap zone; the record is the reconcile's) */
     out->zid = z.zid;
     out->sview = (int16_t)sid;
     out->serial = z.serial;
@@ -676,8 +682,10 @@ static bool dir_rec_get(const char *view, const char *zone, dbdir_rec_t *o) {
   int vid = store_view_id(st, view);
   uint32_t zid = vid >= 0 ? store_find(st, (uint16_t)vid, name, nlen) : STORE_NONE;
   store_zone_t z;
-  if (zid != STORE_NONE && store_zone_get(st, zid, &z) == 0) {
+  if (zid != STORE_NONE && store_zone_get(st, zid, &z) == 0 && !(z.flags & STORE_F_NONSTORE)) {
     o->zid = z.zid;
+    o->stamp_gen = z.stamp_gen;
+    o->stamp_time = z.stamp_time;
     o->state = z.state;
     o->flags = z.flags;
     o->serial = z.serial;
@@ -709,7 +717,26 @@ static void note_view_identity(store_t *st, int vid, const char *view) {
   }
   release_config_snapshot(cfg);
   rcu_aux_read_unlock();
-  if (ok) (void)store_set_cursor(st, (uint16_t)vid, 0, want, sizeof(want));
+  if (ok) {
+    uint64_t id8;
+    memcpy(&id8, want, DBS_CFGID);
+    atomic_store_explicit(&G.cfgid[vid], id8, memory_order_relaxed);
+    (void)store_set_cursor(st, (uint16_t)vid, 0, want, DBS_CFGID);
+  }
+}
+
+/* the id of the view in the store; the store gets the view when it has none (the configuration was reloaded with a new view).  < 0: no room */
+static int view_ensure(store_t *st, const char *view) {
+  int vid = store_view_id(st, view);
+  if (vid >= 0) return vid;
+  vid = store_view_add(st, view);
+  if (vid < 0) {
+    note_error("the view", view, vid);
+    return vid;
+  }
+  atomic_fetch_add(&G.view_gen, 1);
+  note_view_identity(st, vid, view);
+  return vid;
 }
 
 /* The version of the entry goes to the store (the install of the loader's zone has made the entry and published its version; the registry commit follows).  *zid: the zone's id.
@@ -720,16 +747,8 @@ static int dir_put(const char *view, const char *zone, zone_db_entry_t *entry, i
   size_t nlen;
   if (!st) return -ENODEV;
   if (!store_name(zone, name, sizeof(name), &nlen)) return -ENOTSUP;
-  int vid = store_view_id(st, view);
-  if (vid < 0) {
-    vid = store_view_add(st, view);
-    if (vid < 0) {
-      note_error("the view", zone, vid);
-      return vid;
-    }
-    atomic_fetch_add(&G.view_gen, 1);
-    note_view_identity(st, vid, view);
-  }
+  int vid = view_ensure(st, view);
+  if (vid < 0) return vid;
   /* the version is pinned while it is copied (a dynamic UPDATE or a newer install may replace it meanwhile) */
   zone_version_t *v = NULL;
   uint16_t flags = 0;
@@ -756,15 +775,24 @@ static int dir_put(const char *view, const char *zone, zone_db_entry_t *entry, i
   /* the store has this version already (a restart that reads every zone again): nothing to write */
   store_zone_t cur;
   bool same = false;
+  uint16_t cflags = 0;
   uint32_t zid = STORE_NONE;
   store_read_lock();
   zid = store_find(st, (uint16_t)vid, name, nlen);
-  if (zid != STORE_NONE && store_zone_get(st, zid, &cur) == 0 && cur.state == STORE_STATE_STORED && cur.serial == serial && cur.source_id == source_id && cur.settings == settings &&
-      memcmp(cur.digest, digest, STORE_DIGEST_LEN) == 0)
-    same = true;
+  if (zid != STORE_NONE && store_zone_get(st, zid, &cur) == 0) {
+    if (cur.source_id == source_id || cur.source_id == 0) {          /* 0.7 WP7b: the stamp the reconcile asked this version with stays with the record (the body carries none) */
+      m.stamp_gen = cur.stamp_gen;
+      m.stamp_time = cur.stamp_time;
+    }
+    if (cur.state == STORE_STATE_STORED && cur.serial == serial && cur.source_id == source_id && cur.settings == settings && memcmp(cur.digest, digest, STORE_DIGEST_LEN) == 0 &&
+        cur.stamp_gen == m.stamp_gen && cur.stamp_time == m.stamp_time)
+      same = true;
+    cflags = cur.flags;
+  }
   store_read_unlock();
   if (same) {
     atomic_fetch_add(&G.wt_skipped, 1);
+    if (cflags & (STORE_F_STALE | STORE_F_REJECTED_NEW)) (void)store_set_flags(st, zid, 0, STORE_F_STALE | STORE_F_REJECTED_NEW);       /* (the body that was asked for is this version) */
     *zid_out = zid;
     atomic_fetch_sub_explicit(&v->xfr_refs, 1, memory_order_acq_rel);
     return 0;
@@ -944,7 +972,7 @@ static uint32_t clamp_ttl(uint32_t v) { return v > 2147483647u ? 2147483647u : v
  * their own targets; at most SIB_MAX of them, the first ones in the order of the zone). */
 #define SIB_MAX 8
 #define SIB_TARGETS 48
-static void attach_zone_x(const char *view, const char *zone, bool siblings);
+static void attach_zone_x(const char *view, const char *zone, bool siblings, bool bg);
 static void attach_siblings(const char *view, const char *zone) {
   zone_db_entry_t *e = dbreg_pin_entry(view, zone);
   if (!e) return;
@@ -978,18 +1006,32 @@ static void attach_siblings(const char *view, const char *zone) {
   }
   rcu_aux_read_unlock();
   xfr_entry_release(e);
-  for (int k = 0; k < n; k++) attach_zone_x(holders[k], names[k], false);
+  for (int k = 0; k < n; k++) attach_zone_x(holders[k], names[k], false, true);               /* (nobody waits for a sibling: it goes first when memory-limit needs room) */
 }
 
-void db_store_attach_zone(const char *view, const char *zone) { attach_zone_x(view, zone, true); }
+void db_store_attach_zone(const char *view, const char *zone) { attach_zone_x(view, zone, true, false); }
+void db_store_attach_zone_sync(const char *view, const char *zone) { attach_zone_x(view, zone, false, true); }
 
-static void attach_zone_x(const char *view, const char *zone, bool siblings) {
+/* An attach brings a zone into memory, so it has to respect the hard line of memory-limit as a fetch does (a fetch waits for room, the wait queue of the ingest thread): the store thread takes the coldest zones
+ * out of memory when the database zones are above the hard line, at most once in a millisecond for all of them (32 zones each time), and attaches in any case (an attach is not made to wait: a zone that is stored is answered, and the cache manager
+ * brings the zones back under the limit).  Without this a burst of queries for cold zones (or transfers) attached every zone it asked for faster than the manager's rounds took them out (4.5 MB resident under a limit of 1 MB). */
+static void attach_make_room(void) {
+  if (!dbreg_cache_limit() || !dbreg_cache_over_limit()) return;
+  const int64_t now = mono_ns();
+  int64_t next = atomic_load_explicit(&G.room_next_ns, memory_order_relaxed);
+  if (now < next || !atomic_compare_exchange_strong_explicit(&G.room_next_ns, &next, now + 1000000, memory_order_relaxed, memory_order_relaxed)) return;
+  (void)dbreg_cache_make_room(32, NULL);
+}
+
+/* bg: nobody waits for the zone (the background attach of a CNAME or glue target): it is marked to go first when memory-limit needs room, like a zone a background fetch brought */
+static void attach_zone_x(const char *view, const char *zone, bool siblings, bool bg) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   if (!st) {
     park_wake_queue_all(view, zone, true);
     return;
   }
   const int64_t t0 = mono_ns();
+  attach_make_room();
   dbreg_attach_info_t ai;
   int b = dbreg_attach_begin(view, zone, &ai);
   if (b == DBREG_ATT_RESIDENT) {                             /* (another attach or a fetch was first) */
@@ -1147,6 +1189,7 @@ static void attach_zone_x(const char *view, const char *zone, bool siblings) {
     }
   }
   dbreg_touch_loaded(view, zone);
+  if (bg) dbreg_bg_loaded(view, zone);
   zone_ext_shared_unref(ai.sh);
   atomic_fetch_add(&G.attach_ok, 1);
   store_status_note_attach((uint64_t)(mono_ns() - t0), STORE_ATT_OK);
@@ -1178,7 +1221,7 @@ static void *attach_thread(void *arg) {
     bool any = false;
     while (park_attach_next(&q)) {
       any = true;
-      db_store_attach_zone(q.view, q.zone);
+      attach_zone_x(q.view, q.zone, true, q.prio == 2 /* park_attach_request_bg() */);
     }
     if (any) park_wake_flush();
     if (park_attach_sleep_prepare()) continue;
@@ -1253,6 +1296,482 @@ static void purge_view(store_t *st, int vid) {
   if (n_del) syslog(LOG_WARNING, "[Store] the store held %u zone(s) of view %d that were read from another database: they are dropped", (unsigned)n_del, vid);
 }
 
+/* ------------------------------------------------------------------------------------------------------------- */
+/* the reconcile: the loader's manifest and changes against the store (0.7 WP7b)                                  */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* a bitmap over zone ids that grows as needed (1 bit per zone: 1.25 MB at 10,000,000) */
+typedef struct { uint64_t *w; size_t nw; } bits_t;
+static bool bits_grow(bits_t *b, uint32_t zid) {
+  size_t need = (size_t)zid / 64 + 1;
+  if (need <= b->nw) return true;
+  size_t nn = b->nw ? b->nw : 1024;
+  while (nn < need) nn *= 2;
+  uint64_t *nw = realloc(b->w, nn * sizeof(*nw));
+  if (!nw) return false;
+  memset(nw + b->nw, 0, (nn - b->nw) * sizeof(*nw));
+  b->w = nw;
+  b->nw = nn;
+  return true;
+}
+static void bits_set(bits_t *b, uint32_t zid) {
+  if (zid == STORE_NONE || !bits_grow(b, zid)) return;
+  b->w[zid / 64] |= 1ull << (zid % 64);
+}
+static void bits_clear(bits_t *b, uint32_t zid) {
+  if (zid == STORE_NONE || (size_t)zid / 64 >= b->nw) return;
+  b->w[zid / 64] &= ~(1ull << (zid % 64));
+}
+static bool bits_get(const bits_t *b, uint32_t zid) { return (size_t)zid / 64 < b->nw && (b->w[zid / 64] >> (zid % 64) & 1); }
+static void bits_free(bits_t *b) {
+  free(b->w);
+  b->w = NULL;
+  b->nw = 0;
+}
+
+/* All of it is the ingest thread's, but the figures (RC.s, the guard) are read by the control thread (karictl store, dbstatus): under RC.mu */
+static struct {
+  pthread_mutex_t mu;
+  /* the pass */
+  bool active, force;
+  int vid;
+  char view[STORE_VIEW_NAME_MAX + 1];
+  bits_t seen;
+  int64_t t0_ns;
+  /* the secondary and catalog records that the scan has asked for since the start (the zone loads once a run unless it changes) */
+  bits_t np_done;
+  /* the mass-delete guard: the views whose sweep is held back */
+  bool held[STORE_MAX_VIEWS];
+  db_recon_status_t s;
+} RC = { .mu = PTHREAD_MUTEX_INITIALIZER };
+
+static void rc_lock(void) { pthread_mutex_lock(&RC.mu); }
+static void rc_unlock(void) { pthread_mutex_unlock(&RC.mu); }
+
+void db_recon_note_fetch(int what, uint64_t n) {
+  rc_lock();
+  if (what == DBR_FETCHED) RC.s.fetched += n;
+  else if (what == DBR_FETCH_FAILED) RC.s.fetch_failed += n;
+  else if (what == DBR_IN_FLIGHT) RC.s.in_flight = n;
+  rc_unlock();
+}
+
+void db_recon_status(db_recon_status_t *out) {
+  rc_lock();
+  *out = RC.s;
+  out->active = RC.active;
+  if (RC.active) {
+    snprintf(out->view, sizeof(out->view), "%s", RC.view);
+    out->duration_ms = (uint64_t)((mono_ns() - RC.t0_ns) / 1000000);
+  }
+  unsigned gv = 0;
+  for (int i = 0; i < STORE_MAX_VIEWS; i++) gv += RC.held[i] ? 1 : 0;
+  out->guard_views = gv;
+  rc_unlock();
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  out->known_now = 0;
+  if (st) {
+    store_stats_t *ss = malloc(sizeof(*ss));
+    if (ss) {
+      store_read_lock();
+      store_stats(st, ss);
+      store_read_unlock();
+      out->known_now = ss->zones_known;
+      free(ss);
+    }
+  }
+}
+
+/* the store's cursor of a view: the loader's own part of the identity follows the configuration's DBS_CFGID bytes */
+bool db_recon_cursor_get(const char *view, uint64_t *cursor, uint8_t *ident, size_t *ident_len) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  if (!st || !view) return false;
+  int vid = store_view_id(st, view);
+  if (vid < 0 || vid >= STORE_MAX_VIEWS) return false;
+  bool valid = false;
+  uint8_t have[STORE_IDENT_MAX];
+  size_t hl = 0;
+  if (store_get_cursor(st, (uint16_t)vid, &valid, cursor, have, &hl) != 0 || !valid || hl <= DBS_CFGID || hl > STORE_IDENT_MAX) return false;
+  uint64_t id8;
+  memcpy(&id8, have, DBS_CFGID);
+  if (id8 != atomic_load_explicit(&G.cfgid[vid], memory_order_relaxed)) return false;      /* (the store was not filled for this configuration) */
+  memcpy(ident, have + DBS_CFGID, hl - DBS_CFGID);
+  *ident_len = hl - DBS_CFGID;
+  return true;
+}
+
+void db_recon_cursor_put(const char *view, uint64_t cursor, const uint8_t *ident, size_t ident_len) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  if (!st || !view) return;
+  int vid = store_view_id(st, view);
+  if (vid < 0 || vid >= STORE_MAX_VIEWS) return;
+  rc_lock();
+  bool held = RC.held[vid];
+  rc_unlock();
+  if (held) return;                                         /* (a restart then makes a pass again and finds the same) */
+  uint8_t buf[STORE_IDENT_MAX];
+  uint64_t id8 = atomic_load_explicit(&G.cfgid[vid], memory_order_relaxed);
+  memcpy(buf, &id8, DBS_CFGID);
+  size_t il = ident_len > STORE_IDENT_MAX - DBS_CFGID ? STORE_IDENT_MAX - DBS_CFGID : ident_len;      /* (a longer identity is cut: it never equals the loader's again, which makes a pass at every start) */
+  if (il) memcpy(buf + DBS_CFGID, ident, il);
+  int r = store_set_cursor(st, (uint16_t)vid, cursor, buf, DBS_CFGID + il);
+  if (r < 0) {
+    note_error("the cursor", view, r);
+  } else {
+    rc_lock();
+    RC.s.cursors++;
+    rc_unlock();
+  }
+}
+
+/* One entry (design 5.3, 5.4).  See dns_db_store.h for the rules. */
+int db_recon_apply(const char *view, const db_recon_entry_t *e, uint32_t *zid_out) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  if (zid_out) *zid_out = STORE_NONE;
+  if (!st || !view || !e || !e->name) return DBR_ERROR;
+  char name[DBS_NAME_MAX];
+  size_t nlen;
+  if (!store_name(e->name, name, sizeof(name), &nlen)) return DBR_UNSTORABLE;
+  int vid = view_ensure(st, view);
+  if (vid < 0) return DBR_ERROR;
+  const bool np = e->kind != KDB_ZK_PRIMARY;
+  uint32_t zs = STORE_NONE, zn = STORE_NONE;
+  store_zone_t rs, rn;
+  bool has_s = false, has_n = false;
+  store_read_lock();
+  if (e->source_id != 0) zs = store_find_source(st, (uint16_t)vid, e->source_id, (uint16_t)vid);
+  zn = store_find(st, (uint16_t)vid, name, nlen);
+  if (zs != STORE_NONE) has_s = store_zone_get(st, zs, &rs) == 0;
+  if (zn != STORE_NONE && zn != zs) has_n = store_zone_get(st, zn, &rn) == 0;
+  store_read_unlock();
+  (void)has_n;
+  bool renamed = false;
+  if (zs != STORE_NONE && zs != zn) {                       /* the domain has another name now: the old name goes (its element too), the zone is made under the new one */
+    if (has_s) {
+      char old[STORE_NAME_MAX + 2];
+      snprintf(old, sizeof(old), "%s.", rs.name);
+      (void)dbreg_delete(view, old, e->source_id);
+    } else {
+      int dr = store_delete(st, zs);
+      if (dr < 0 && dr != -ENOENT) return DBR_ERROR;
+    }
+    renamed = true;
+    zs = STORE_NONE;
+    has_s = false;
+  }
+  store_meta_t m;
+  memset(&m, 0, sizeof(m));
+  m.source_id = e->source_id;
+  m.source = (uint16_t)vid;
+  m.flags = np ? STORE_F_NONSTORE : 0;
+  m.stamp_gen = e->stamped ? e->gen : 0;
+  m.stamp_time = e->stamped ? e->time : 0;
+  uint32_t zid = STORE_NONE;
+  int res = DBR_SAME;
+  int r = 0;
+  if (!has_s) {                                             /* a zone that is new, or whose name another domain held: a record without an image */
+    r = store_set_known(st, (uint16_t)vid, name, nlen, &m, &zid);
+    res = renamed ? DBR_RENAMED : DBR_NEW;
+    if (r == 0) {
+      const unsigned labels = store_name_labels(name, nlen);
+      if (labels < 63 && labels > atomic_load_explicit(&G.dmax[vid], memory_order_relaxed)) atomic_store_explicit(&G.dmax[vid], (uint16_t)labels, memory_order_relaxed);
+    }
+  } else {
+    zid = rs.zid;
+    const bool known = rs.state == STORE_STATE_KNOWN, stale = (rs.flags & STORE_F_STALE) != 0, rej = (rs.flags & STORE_F_REJECTED_NEW) != 0;
+    const bool kind_eq = ((rs.flags & STORE_F_NONSTORE) != 0) == np;
+    const bool stamp_eq = e->stamped && rs.stamp_gen == e->gen && rs.stamp_time == e->time;
+    if (!kind_eq) {                                         /* a primary became a secondary or the other way: the zone is made again (its image is not the new kind's) */
+      r = store_set_known(st, (uint16_t)vid, name, nlen, &m, &zid);
+      res = DBR_CHANGED;
+    } else if (np) {                                        /* a secondary or catalog zone: the record is only the memory of it */
+      if (!e->force && stamp_eq) {
+        res = DBR_SAME;
+      } else {
+        r = store_set_stamp(st, zid, m.stamp_gen, m.stamp_time, 0, STORE_F_REJECTED_NEW);
+        res = DBR_CHANGED;
+      }
+    } else if (!e->force && e->stamped && stamp_eq) {
+      res = rej ? DBR_KEPT : (known || stale) ? DBR_PENDING : DBR_SAME;
+    } else if (!e->force && !e->stamped && e->has_serial && rs.state == STORE_STATE_STORED && rs.serial == e->serial) {
+      res = (stale && !rej) ? DBR_PENDING : DBR_SAME;
+    } else if (!e->force && !e->stamped && !e->has_serial && (known || stale) && !rej) {          /* (a zone without a version stamp is always asked for: it already is) */
+      res = DBR_PENDING;
+    } else {                                                /* another version: the stamp is recorded, the body is asked for; the image (if any) keeps serving until then */
+      r = store_set_stamp(st, zid, m.stamp_gen, m.stamp_time, known ? 0 : STORE_F_STALE, STORE_F_REJECTED_NEW);
+      res = DBR_CHANGED;
+    }
+  }
+  if (r < 0) {
+    note_error("the record of the reconcile", e->name, r);
+    return DBR_ERROR;
+  }
+  if (np && (res == DBR_NEW || res == DBR_CHANGED || res == DBR_RENAMED)) bits_clear(&RC.np_done, zid);
+  if (zid_out) *zid_out = zid;
+  return res;
+}
+
+static void rc_count(int res, bool in_pass) {
+  rc_lock();
+  if (in_pass) RC.s.entries++;
+  switch (res) {
+  case DBR_NEW: if (in_pass) RC.s.created++; break;
+  case DBR_CHANGED: if (in_pass) RC.s.changed++; break;
+  case DBR_RENAMED: if (in_pass) RC.s.renamed++; break;
+  case DBR_PENDING: if (in_pass) RC.s.pending++; break;
+  case DBR_KEPT: if (in_pass) RC.s.kept++; break;
+  case DBR_SAME: if (in_pass) RC.s.same++; break;
+  default: break;
+  }
+  if (res == DBR_NEW || res == DBR_CHANGED || res == DBR_RENAMED) RC.s.wanted++;
+  if (!in_pass && res >= 0) RC.s.change_upserts++;
+  rc_unlock();
+}
+
+int db_recon_change(const char *view, const db_recon_entry_t *e, uint32_t *zid) {
+  int r = db_recon_apply(view, e, zid);
+  rc_count(r, false);
+  return r;
+}
+
+bool db_recon_begin(const char *view, uint64_t estimate, bool force, char *why, size_t whylen) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  if (!st) {
+    snprintf(why, whylen, "there is no zone store");
+    return false;
+  }
+  int vid = view_ensure(st, view);
+  if (vid < 0) {
+    snprintf(why, whylen, "the zone store has no room for the view (%s)", strerror(-vid));
+    return false;
+  }
+  if (RC.active) syslog(LOG_WARNING, "[Store] the pass of view '%s' did not end; it is dropped", RC.view);
+  store_stats_t *ss = malloc(sizeof(*ss));
+  uint64_t have = 0;
+  if (ss) {
+    store_read_lock();
+    store_stats(st, ss);
+    store_read_unlock();
+    have = ss->zt_records;
+    free(ss);
+  }
+  if (estimate > have && estimate <= 16000000ull) (void)store_reserve(st, estimate);        /* (a first fill: the tables are made big enough once; the estimate is the loader's claim, bounded) */
+  rc_lock();
+  bits_free(&RC.seen);
+  RC.active = true;
+  RC.force = force;
+  RC.vid = vid;
+  snprintf(RC.view, sizeof(RC.view), "%s", view);
+  RC.t0_ns = mono_ns();
+  struct timespec rt;
+  clock_gettime(CLOCK_REALTIME, &rt);
+  db_recon_status_t *s = &RC.s;
+  s->started_unix = (uint64_t)rt.tv_sec;
+  s->duration_ms = 0;
+  s->estimate = estimate;
+  s->entries = s->created = s->same = s->changed = s->renamed = s->pending = s->kept = s->skipped = 0;
+  s->swept = s->unlisted = s->total = 0;
+  s->passes++;
+  snprintf(s->view, sizeof(s->view), "%s", view);
+  rc_unlock();
+  (void)bits_grow(&RC.seen, (uint32_t)(have + (estimate < 16000000ull ? estimate : 16000000ull) + 4096));
+  return true;
+}
+
+int db_recon_entry(const db_recon_entry_t *e, uint32_t *zid_out) {
+  if (!RC.active) return DBR_ERROR;
+  uint32_t zid = STORE_NONE;
+  int r = db_recon_apply(RC.view, e, &zid);
+  if (zid != STORE_NONE) bits_set(&RC.seen, zid);
+  rc_count(r, true);
+  if (zid_out) *zid_out = zid;
+  return r;
+}
+
+void db_recon_abort(void) {
+  rc_lock();
+  if (RC.active) {
+    syslog(LOG_WARNING, "[Store] the pass of view '%s' was cut off (the loader's stream ended); nothing is swept, the next pass starts again", RC.view);
+    RC.active = false;
+    bits_free(&RC.seen);
+  }
+  rc_unlock();
+}
+
+/* the zones of the view in the store, a few thousand at a time (the read section does not last for a pass over ten million zones) */
+#define RC_CHUNK 4096u
+#define RC_VICTIMS 128u
+typedef struct { char zone[STORE_NAME_MAX + 2]; int64_t sid; } rc_victim_t;
+
+void db_recon_end(bool complete, uint64_t n_skipped, bool cursor_valid, uint64_t cursor, const uint8_t *ident, size_t ident_len, db_recon_end_t *out) {
+  memset(out, 0, sizeof(*out));
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  if (!RC.active || !st) return;
+  const int vid = RC.vid;
+  char view[STORE_VIEW_NAME_MAX + 1];
+  snprintf(view, sizeof(view), "%s", RC.view);
+  const bool force = RC.force;
+  out->duration_ms = (uint64_t)((mono_ns() - RC.t0_ns) / 1000000);
+  rc_lock();
+  RC.s.skipped = n_skipped;
+  rc_unlock();
+  if (!complete) {
+    syslog(LOG_WARNING, "[Store] view '%s': the pass was not complete (the loader had a database error): nothing is swept, no cursor is kept; the next pass starts again", view);
+    goto done;
+  }
+  /* the zones of the view that the pass did not list */
+  uint64_t total = 0, unlisted = 0;
+  uint32_t cur = 0;
+  store_zone_t z;
+  for (bool end = false; !end;) {
+    store_read_lock();
+    for (unsigned n = 0; n < RC_CHUNK; n++) {
+      int more = store_iter(st, &cur, &z);
+      if (more == 0) {
+        end = true;
+        break;
+      }
+      if (more < 0 || z.view != (uint16_t)vid) continue;
+      total++;
+      if (!bits_get(&RC.seen, z.zid)) unlisted++;
+    }
+    store_read_unlock();
+  }
+  out->total = total;
+  out->unlisted = unlisted;
+  const bool guard = unlisted > DBS_GUARD_MIN && unlisted * 100u > total * DBS_GUARD_PCT && !force;
+  rc_lock();
+  RC.s.total = total;
+  RC.s.unlisted = unlisted;
+  rc_unlock();
+  if (guard) {
+    out->held = true;
+    struct timespec rt;
+    clock_gettime(CLOCK_REALTIME, &rt);
+    rc_lock();
+    RC.held[vid] = true;
+    snprintf(RC.s.guard_view, sizeof(RC.s.guard_view), "%s", view);
+    RC.s.guard_unlisted = unlisted;
+    RC.s.guard_total = total;
+    RC.s.guard_unix = (uint64_t)rt.tv_sec;
+    rc_unlock();
+    syslog(LOG_ERR, "[Store] view '%s': the pass over the database lists %llu zone(s) fewer than the %llu the Backend holds for it (more than %u percent, and more than %u): NOTHING IS DELETED, the "
+                    "zones keep being served and the cursor is not advanced. If the database is right, `karictl reload -force` deletes them; if not, repair the source",
+           view, (unsigned long long)unlisted, (unsigned long long)total, DBS_GUARD_PCT, DBS_GUARD_MIN);
+    goto done;
+  }
+  rc_lock();
+  RC.held[vid] = false;                                     /* (a pass that finds nothing alarming, or that the operator asked for, lets go of an old hold) */
+  rc_unlock();
+  if (unlisted > 0) {
+    uint64_t deleted = 0;
+    rc_victim_t *vic = malloc(RC_VICTIMS * sizeof(*vic));
+    if (vic) {
+      cur = 0;
+      for (bool end = false; !end;) {
+        unsigned nv = 0;
+        store_read_lock();
+        while (nv < RC_VICTIMS) {
+          int more = store_iter(st, &cur, &z);
+          if (more == 0) {
+            end = true;
+            break;
+          }
+          if (more < 0 || z.view != (uint16_t)vid || bits_get(&RC.seen, z.zid)) continue;
+          snprintf(vic[nv].zone, sizeof(vic[nv].zone), "%s.", z.name);
+          vic[nv].sid = z.source_id;
+          nv++;
+        }
+        store_read_unlock();
+        for (unsigned i = 0; i < nv; i++)
+          if (dbreg_delete(view, vic[i].zone, vic[i].sid) > 0) deleted++;
+      }
+      free(vic);
+    }
+    out->swept = true;
+    out->deleted = deleted;
+    rc_lock();
+    RC.s.swept = deleted;
+    rc_unlock();
+    syslog(LOG_NOTICE, "[Store] view '%s': %llu zone(s) the database no longer lists were deleted (%llu of %llu)%s", view, (unsigned long long)deleted, (unsigned long long)unlisted,
+           (unsigned long long)total, force ? " (a pass the operator asked for)" : "");
+    dmax_refresh(st, vid);
+  }
+  if (cursor_valid) db_recon_cursor_put(view, cursor, ident, ident_len);
+done:
+  rc_lock();
+  RC.active = false;
+  RC.s.duration_ms = out->duration_ms;
+  bits_free(&RC.seen);
+  rc_unlock();
+}
+
+int db_recon_delete(const char *view, int64_t source_id, const char *name) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  if (!st || !view) return 0;
+  char zone[STORE_NAME_MAX + 2];
+  zone[0] = '\0';
+  if (name && *name) {
+    snprintf(zone, sizeof(zone), "%s", name);
+  } else if (source_id != 0) {                              /* the loader does not have the name (the row is gone): the source index has it */
+    int vid = store_view_id(st, view);
+    store_zone_t z;
+    store_read_lock();
+    uint32_t zid = vid >= 0 ? store_find_source(st, (uint16_t)vid, source_id, (uint16_t)vid) : STORE_NONE;
+    bool ok = zid != STORE_NONE && store_zone_get(st, zid, &z) == 0;
+    store_read_unlock();
+    if (ok) snprintf(zone, sizeof(zone), "%s.", z.name);
+  }
+  int r = zone[0] ? dbreg_delete(view, zone, source_id) : 0;
+  rc_lock();
+  if (r > 0) RC.s.change_deletes++;
+  rc_unlock();
+  return r > 0 ? 1 : 0;
+}
+
+int db_recon_scan(uint32_t *cursor, unsigned budget, db_scan_item_t *out) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  if (!st) return 0;
+  store_zone_t z;
+  int rc = 2;
+  store_read_lock();
+  while (budget--) {
+    int more = store_iter(st, cursor, &z);
+    if (more == 0) {
+      rc = 0;
+      break;
+    }
+    if (more < 0) continue;
+    const bool np = (z.flags & STORE_F_NONSTORE) != 0;
+    bool want;
+    if (np) want = !bits_get(&RC.np_done, z.zid);
+    else if (z.flags & STORE_F_REJECTED_NEW) want = false;
+    else want = z.state == STORE_STATE_KNOWN || (z.flags & STORE_F_STALE) != 0;
+    if (!want) continue;
+    const char *vn = store_view_name(st, z.view);
+    if (!vn) continue;
+    snprintf(out->view, sizeof(out->view), "%s", vn);
+    snprintf(out->zone, sizeof(out->zone), "%s.", z.name);
+    out->source_id = z.source_id;
+    out->zid = z.zid;
+    out->nonstore = np;
+    out->stamp_gen = z.stamp_gen;
+    out->stamp_time = z.stamp_time;
+    if (np) bits_set(&RC.np_done, z.zid);
+    rc = 1;
+    break;
+  }
+  store_read_unlock();
+  return rc;
+}
+
+void db_recon_scan_retry(uint32_t zid) { bits_clear(&RC.np_done, zid); }
+
+static bool recon_status_cb(store_recon_t *o) {
+  db_recon_status(o);
+  return true;
+}
+
 bool db_store_start(const server_config_t *cfg) {
   if (g_dir.dirfd < 0 || !cfg || !cfg->database.enabled) return true;
   const database_config_t *db = &cfg->database;
@@ -1294,9 +1813,16 @@ bool db_store_start(const server_config_t *cfg) {
     bool valid = false;
     uint64_t cursor = 0;
     view_identity(db, v, want);
-    if (store_get_cursor(st, (uint16_t)vid, &valid, &cursor, have, &hl) != 0 || !valid || hl != sizeof(want) || memcmp(have, want, sizeof(want)) != 0) {
+    {
+      uint64_t id8;
+      memcpy(&id8, want, DBS_CFGID);
+      atomic_store_explicit(&G.cfgid[vid], id8, memory_order_relaxed);
+    }
+    /* the identity kept with the cursor: the first DBS_CFGID bytes are the hash of the view's configuration (an older store has the whole hash: its first bytes are the same), the rest
+     * is the loader's identity of its database (db_recon_cursor_put()) */
+    if (store_get_cursor(st, (uint16_t)vid, &valid, &cursor, have, &hl) != 0 || !valid || hl < DBS_CFGID || memcmp(have, want, DBS_CFGID) != 0) {
       purge_view(st, vid);
-      (void)store_set_cursor(st, (uint16_t)vid, 0, want, sizeof(want));
+      (void)store_set_cursor(st, (uint16_t)vid, 0, want, DBS_CFGID);
     }
   }
   for (int vid = 0; vid < STORE_MAX_VIEWS; vid++) dmax_refresh(st, vid);
@@ -1305,6 +1831,7 @@ bool db_store_start(const server_config_t *cfg) {
   store_status_bind(st);
   store_status_set_attached_fn(attached_fn);
   store_status_set_attached_count_fn(attached_count_fn);
+  store_status_set_recon_fn(recon_status_cb);
   dbreg_set_evict_hook(evict_hook);
   G.wstop = false;
   if (pthread_create(&G.wthr, NULL, ticker_thread, NULL) != 0) return false;

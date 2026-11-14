@@ -815,6 +815,7 @@ typedef struct dbdir_rec {
   uint16_t flags;                /* STORE_F_* */
   uint32_t serial, settings;
   int64_t source_id;
+  uint64_t stamp_gen, stamp_time;   /* 0.7 WP7b: the version stamp of the record (the loader's manifest or change entry that asked for this version of the zone) */
   uint8_t digest[32];
 } dbdir_rec_t;
 typedef struct dbdir_ops {

@@ -79,6 +79,23 @@ void store_status_reset(void);                                /* tests only */
 /* p-th percentile (0..100) of a histogram, in us: the upper bound of the bucket that holds it; the maximum for the last bucket */
 uint64_t store_status_hist_pct(const uint64_t *hist, unsigned p, uint64_t max_ns);
 
+/* 0.7 WP7b: the reconcile with the loader (the passes, the background fetch, the mass-delete guard); filled by dns_db_store.c */
+typedef struct store_recon {
+  bool active;                   /* a pass is running */
+  char view[STORE_VIEW_NAME_MAX + 1];       /* of the running pass, or of the last one */
+  uint64_t started_unix, duration_ms;
+  uint64_t estimate, entries, created, same, changed, renamed, pending, kept, skipped;     /* of the last (or running) pass */
+  uint64_t swept, unlisted, total;          /* the last sweep: zones deleted, zones the pass did not list, zones of the view */
+  uint64_t passes, wanted, change_upserts, change_deletes, cursors;       /* since the start */
+  uint64_t known_now;            /* the records in the state KNOWN now (the store's counter) */
+  uint64_t fetched, fetch_failed, in_flight;        /* bodies the background fetch brought / could not bring / has in flight */
+  unsigned guard_views;          /* views whose sweep the guard holds back */
+  char guard_view[STORE_VIEW_NAME_MAX + 1];
+  uint64_t guard_unlisted, guard_total, guard_unix;
+} store_recon_t;
+/* fills *out and returns true, or returns false when the server has none (no loader) */
+void store_status_set_recon_fn(bool (*fn)(store_recon_t *out));
+
 /* ---- what the server tells this module ---- */
 /* the open store (NULL: "store not configured", state=none) */
 void store_status_bind(store_t *s);

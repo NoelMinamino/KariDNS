@@ -259,6 +259,9 @@ void park_bg_fetch(const char *view, const char *zone);
 /* 0.7 store S3: the same for a zone of the store that is not in memory (its image is stored): a store thread attaches it.  park_attach_request_any(): from any thread (slots taken by
  * compare-and-swap, as the transfer threads' fetch requests); park_bg_attach(): one request for a zone in a few seconds. */
 bool park_attach_request_any(const char *view, const char *zone);
+/* 0.7 WP7b: the same for a zone that nobody waits for (the background attach of a CNAME or glue target): the request carries the priority "background" (2), so that the store thread
+ * marks the zone that it attaches to be the first to go when memory-limit needs room, as for a zone a background fetch brought (dbreg_bg_loaded()) */
+bool park_attach_request_bg(const char *view, const char *zone);
 void park_bg_attach(const char *view, const char *zone);
 /* ingest side: the next request from any worker or from park_fetch_request_any() (round robin), false when there is none */
 bool park_fetch_next(park_fetch_req_t *out);

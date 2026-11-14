@@ -1,4 +1,4 @@
-.TH KARICTL 8 "2026-11-14" "KariDNS" "KariDNS Manual"
+.TH KARICTL 8 "2026-11-15" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karictl.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karictl \- Remote Control and Management Utility for KariDNS
@@ -129,7 +129,7 @@ reconnects: N\fR (connections made by the background retry); see karidns(8)
 \fBdnstap truncated\fR is
 .RE
 .TP 8
-\fBreload [zone [view] [force]]\fR
+\fBreload [\-force | zone [view] [force]]\fR
 Without arguments, re-read the configuration file and \fBall\fR zone files (see
 \fBreconfig\fR for the replies; a full reload also drops the changes of dynamic
 updates), then, when the configuration has a \fBdatabase\fR block, ask the
@@ -171,25 +171,42 @@ was asked for; the zone answers when it is up)\fR (a plugin that never came up,
 or a refused replacement, is asked for again), \fBOK reloaded (program zone: a
 new plugin with these settings is already on its way)\fR, and \fBERROR no plugin
 runs for this zone: allow\-program\-zones is not yes, or the zone has no
-program\fR. A zone that is not in \fBkaridns.conf\fR is looked up in the
-database. For a \fBdatabase zone\fR the loader reads that zone only (also a zone
-just added to the database, which the server does not know yet). When several
-views take database zones and no view is named, the loader is asked about every
-one of them (a mapping in \fBkaridns_domain_views\fR may have moved the zone)
-and the reply is one line, \fB<z>: view <v1>: <result>; view <v2>: <result>\fR,
-\fBOK\fR when at least one view has the zone and \fBERROR\fR when it is rejected
-or failed there or when no view has it (\fBzone not found (it is not in the
-database of any view that takes database zones)\fR); a named view gives the
-single-view replies below, converts it, and sends it when its content differs
-from the version the server serves, whatever its serial; \fBforce\fR sends it
-even when the content is the same (D1a: not a zone that is out of memory and
-unchanged; there is nothing in memory to replace, the next query reads it from
-the database, and the reply is \fBunchanged, serial <n> (not in
-memory)\fR). \fBkarictl\fR waits for the loader's answer, but the server does
-not: the connection is parked and answered when the result arrives, or after
-\fBdb\-reload\-timeout\fR seconds (\fBERROR timeout: ...\fR; the reload may
-still be applied). At most 32 clients wait at once; the next ones get \fBERROR
-too many reloads are waiting for the database loader; try again
+program\fR. \fBreload \-force\fR (0.7, the zone store) is the full reload for
+which the loader lists every zone of its databases again (a manifest pass)
+instead of reading the change log from its cursor. With the zone store the
+Backend deletes the zones of a view that the pass does not list, unless that
+would delete more than 20 percent of the view's zones and more than 1,000: then
+nothing is deleted, \fBERROR\fR is logged, \fBkarictl dbstatus\fR shows
+\fBMASS\-DELETE GUARD HELD\fR and \fBkarictl store\fR has
+\fBstore.recon.guard.*\fR. \fBThe operator's release of that guard is \fBreload
+\-force\fB\fR: the pass it asks for is not held back, the zones the database no
+longer lists are deleted and the guard is let go. It needs the permission
+\fBreload\fR of a restricted control key, like a full \fBreload\fR. A zone that
+is not in \fBkaridns.conf\fR is looked up in the database. For a \fBdatabase
+zone\fR the loader reads that zone only (also a zone just added to the database,
+which the server does not know yet). When several views take database zones and
+no view is named, the loader is asked about every one of them (a mapping in
+\fBkaridns_domain_views\fR may have moved the zone) and the reply is one line,
+\fB<z>: view <v1>: <result>; view <v2>: <result>\fR, \fBOK\fR when at least one
+view has the zone and \fBERROR\fR when it is rejected or failed there or when no
+view has it (\fBzone not found (it is not in the database of any view that takes
+database zones)\fR); a named view gives the single-view replies below, converts
+it, and sends it when its content differs from the version the server serves,
+whatever its serial; \fBforce\fR sends it even when the content is the same
+(D1a: not a zone that is out of memory and unchanged; there is nothing in memory
+to replace, the next query reads it from the database, and the reply is
+\fBunchanged, serial <n> (not in memory)\fR). With the zone store (0.7) a reload
+of one zone without \fBforce\fR is decided by the version stamp of the database
+(\fBkaridns_zone_state\fR; the serial for a source without stamps; a zone
+without a stamp is always read): a zone that did not change is \fBunchanged,
+serial <n> (not in memory)\fR and is not read, one that changed has its body
+read, and the answer waits for it; \fBforce\fR reads the body whatever the stamp
+says, also for a zone that is not in memory (nearly every zone of a big server
+is stored and not in memory). \fBkarictl\fR waits for the loader's answer, but
+the server does not: the connection is parked and answered when the result
+arrives, or after \fBdb\-reload\-timeout\fR seconds (\fBERROR timeout: ...\fR;
+the reload may still be applied). At most 32 clients wait at once; the next ones
+get \fBERROR too many reloads are waiting for the database loader; try again
 later\fR. Replies (all \fBOK\fR unless marked):
 .RS 8
 .IP \(bu 2
@@ -595,7 +612,14 @@ summary also counts the distinct settings (zones with the same settings share
 one block) and the zones that name an undefined key. A zone that was rejected
 keeps serving its last good version (its serial is shown). Without a
 \fBdatabase\fR block the server answers \fBERROR no database block is
-configured\fR.
+configured\fR. With the zone store (0.7) the \fBstore pass:\fR line shows the
+reconcile with the loader: the pass that runs or ran last (the entries it
+listed, new / changed / renamed / unchanged / already asked for / refused with
+this version), the sweep (zones the pass did not list, deleted), the bodies
+(records without one now, fetched, failed, in flight) and the changes applied; a
+\fBMASS\-DELETE GUARD HELD:\fR line says that a sweep was held back (more than
+20 percent of a view's zones and more than 1,000 are not in the database) and
+that \fBkarictl reload \-force\fR releases it.
 .RS 8
 .PP
 .RS 2
@@ -782,6 +806,39 @@ the Backend and the loader under it
 \fBstore.memory.level\fR
 \fBok\fR, \fBnotice\fR, \fBwarning\fR or \fBerror\fR: what the server says in
 syslog about \fBmemory\-limit\fR
+.TP 8
+\fBstore.recon.available\fR
+1 when the figures below are there (the Backend has a loader that speaks the
+store protocol)
+.TP 8
+\fBstore.recon.pass.active\fR, \fB.view\fR, \fB.started_unix\fR, \fB.duration_ms\fR, \fB.estimate\fR
+The pass of the loader that is running or was the last: its view, when it
+started, how long it took (so far), the entries the loader announced
+.TP 8
+\fBstore.recon.pass.entries\fR, \fB.created\fR, \fB.changed\fR, \fB.renamed\fR, \fB.same\fR, \fB.pending\fR, \fB.kept\fR, \fB.skipped\fR
+What the pass found: zones listed, new, with another stamp, renamed, unchanged,
+already asked for, refused with this stamp and not asked for again, and the ones
+the loader could not offer (\fBn_skipped\fR)
+.TP 8
+\fBstore.recon.sweep.total\fR, \fB.unlisted\fR, \fB.deleted\fR
+The last sweep: zones of the view in the store, of them not listed by the pass,
+deleted
+.TP 8
+\fBstore.recon.passes\fR, \fB.wanted\fR, \fB.cursors_kept\fR
+Since the start: passes, zones whose body was asked for by a pass or a change,
+cursors made durable
+.TP 8
+\fBstore.recon.bodies.known\fR, \fB.fetched\fR, \fB.failed\fR, \fB.in_flight\fR
+Records without a body now (known), and what the background fetch has done since
+the start: bodies brought, failed, asked for and not here yet
+.TP 8
+\fBstore.recon.changes.upserts\fR, \fB.deletes\fR
+Entries of the change log applied (upserts and deletes)
+.TP 8
+\fBstore.recon.guard.held_views\fR
+Views whose sweep the mass-delete guard holds back (0 normally). With 1 or more:
+\fB.view\fR, \fB.unlisted\fR (zones the pass did not list), \fB.total\fR,
+\fB.since_unix\fR and \fB.release\fR (\fBkarictl reload \-force\fR)
 .TP 8
 \fBstore.zone.name\fR, \fB.view\fR, \fB.zid\fR, \fB.state\fR
 With \fBzone <name>\fR: the record of one zone (only these keys, besides

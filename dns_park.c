@@ -482,7 +482,7 @@ bool park_attach_request(int w, const char *view, const char *zone) {
 static park_fetch_req_t g_att_q[PARK_ATTACH_ANY_SLOTS];
 static _Atomic uint8_t g_att_st[PARK_ATTACH_ANY_SLOTS];
 
-bool park_attach_request_any(const char *view, const char *zone) {
+static bool attach_request_any(const char *view, const char *zone, uint8_t prio) {
   size_t vl, zl;
   if (!key_fits(view, zone, &vl, &zl)) return false;
   for (int i = 0; i < PARK_ATTACH_ANY_SLOTS; i++) {
@@ -494,12 +494,16 @@ bool park_attach_request_any(const char *view, const char *zone) {
     q->zlen = (uint8_t)zl;
     memcpy(q->view, view, vl + 1);
     memcpy(q->zone, zone, zl + 1);
+    q->prio = prio;
     atomic_store_explicit(&g_att_st[i], 2, memory_order_release);
     trigger_attach();
     return true;
   }
   return false;
 }
+
+bool park_attach_request_any(const char *view, const char *zone) { return attach_request_any(view, zone, 0); }
+bool park_attach_request_bg(const char *view, const char *zone) { return attach_request_any(view, zone, 2); }
 
 bool park_attach_pending(void) {
   for (int k = 0; k < PARK_ATTACH_ANY_SLOTS; k++)
@@ -810,7 +814,7 @@ void park_bg_attach(const char *view, const char *zone) {
   int64_t now = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
   size_t i = (size_t)(h % PARK_BG_SLOTS);
   if (atomic_load_explicit(&g_bg_key[i], memory_order_relaxed) == h && now - atomic_load_explicit(&g_bg_at[i], memory_order_relaxed) < PARK_BG_MS) return;
-  if (!park_attach_request_any(view, zone)) return;
+  if (!park_attach_request_bg(view, zone)) return;
   atomic_store_explicit(&g_bg_at[i], now, memory_order_relaxed);
   atomic_store_explicit(&g_bg_key[i], h, memory_order_relaxed);
 }

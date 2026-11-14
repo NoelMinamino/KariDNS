@@ -11,6 +11,10 @@
  *   4. stale (another serial in the directory), missing (no record), damaged (a byte of the record changed): the attach falls back to the fetch (the queries that wait
  *      get a retry key, the loader gets the request); a damaged record is set back to "known" and written again by the install
  *   5. a version that is attached is read by another thread while the zone is taken out of memory and attached again, over and over (TSan, ASan)
+ *   6. (0.7 WP7b, the processes proto0, proto1, proto2: run_proto()) the store protocol: the loader's manifest and changes against the store: a first fill from an empty store, the
+ *      bodies fetched in the background and by a query, changes (stamps, unstamped zones, forced reload, delete by id and by name, rename), the sweep, the mass-delete guard and its
+ *      release by a forced pass, an incomplete pass, secondary zones, the cursor and the identity kept in the store and sent in CONFIG, and a restart (a new process on the store left
+ *      by a process that was not stopped): only the interrupted work is asked for, and only the changes after the cursor are applied
  * The store is in MAP mode; run with the argument `copy` for COPY mode (main() runs both when it is started without one).
  */
 #ifndef _GNU_SOURCE
@@ -1064,6 +1068,593 @@ static int run_mode(const char *mode) {
     return g_failed ? 1 : 0;
 }
 
+/* ---------------------------------------------------------------- 0.7 WP7b: the store protocol (the Backend's side of the loader's manifest and changes) */
+/* The test is the loader of the store protocol: HELLO with features bit 0, a MANIFEST pass, CHANGES, and the answers to the Backend's FETCH_REQs on the fetch stream.  Phase 1 makes a first
+ * fill, changes, a rename, deletes, a sweep, the mass-delete guard and its release by a forced pass, and ends without a clean stop (the process just exits: the store is recovered from its
+ * journal); phase 2 is a new process on the same directory: the CONFIG carries the cursor and the identity, nothing is asked for except the work that was interrupted, only the changes after
+ * the cursor are applied. */
+#define PN 5000                                                         /* zones of the first fill */
+static const char *g_pident = "ident-1";
+
+static void pn_name(char *out, size_t cap, int i) { snprintf(out, cap, "m%04d.test.", i); }
+static int pn_index(const char *name) { return name[0] == 'm' && name[1] >= '0' && name[1] <= '9' ? atoi(name + 1) : -1; }
+
+static void p_batch_begin(int fd, kdb_enc_t *e, uint64_t id, int kind, uint64_t req) {
+    kdb_enc_begin(e, KDB_T_BATCH_BEGIN);
+    kdb_enc_u64(e, 1, id); kdb_enc_u8(e, 2, (uint8_t)kind); kdb_enc_u64(e, 3, 0);
+    if (req) kdb_enc_u64(e, 4, req);
+    kdb_enc_end(e);
+    ch_send(fd, e);
+}
+static void p_manifest_begin(int fd, kdb_enc_t *e, uint64_t batch, uint64_t count, uint64_t cursor, bool valid) {
+    kdb_enc_begin(e, KDB_T_MANIFEST_BEGIN);
+    kdb_enc_u64(e, 1, batch); kdb_enc_u16(e, 2, 0); kdb_enc_u64(e, 3, count); kdb_enc_u64(e, 4, cursor); kdb_enc_u8(e, 5, valid ? 1 : 0);
+    kdb_enc_bytes(e, 6, g_pident, strlen(g_pident)); kdb_enc_u32(e, 7, 0);
+    kdb_enc_end(e);
+    ch_send(fd, e);
+}
+typedef struct { int64_t sid; char name[64]; uint8_t kind; bool stamped; uint64_t gen, time; } pz_t;
+static void p_manifest_page(int fd, kdb_enc_t *e, uint64_t batch, uint32_t page, const pz_t *z, int n) {
+    kdb_enc_begin(e, KDB_T_MANIFEST);
+    kdb_enc_u64(e, 1, batch); kdb_enc_u16(e, 2, 0); kdb_enc_u32(e, 3, page);
+    for (int i = 0; i < n; i++) {
+        kdb_enc_nest_begin(e, 4);
+        kdb_enc_i64(e, 1, z[i].sid); kdb_enc_name(e, 2, z[i].name); kdb_enc_u8(e, 3, z[i].kind); kdb_enc_u64(e, 4, z[i].gen); kdb_enc_u64(e, 5, z[i].time);
+        if (z[i].stamped) kdb_enc_u8(e, 6, KDB_EF_STAMPED);
+        kdb_enc_nest_end(e);
+    }
+    kdb_enc_end(e);
+    ch_send(fd, e);
+}
+static void p_manifest_end(int fd, kdb_enc_t *e, uint64_t batch, uint64_t n, uint64_t skipped, uint64_t cursor, bool complete) {
+    kdb_enc_begin(e, KDB_T_MANIFEST_END);
+    kdb_enc_u64(e, 1, batch); kdb_enc_u16(e, 2, 0); kdb_enc_u64(e, 3, n); kdb_enc_u64(e, 4, skipped); kdb_enc_u64(e, 5, cursor); kdb_enc_u8(e, 6, 1);
+    kdb_enc_bytes(e, 7, g_pident, strlen(g_pident)); kdb_enc_u8(e, 8, complete ? 1 : 0);
+    kdb_enc_end(e);
+    ch_send(fd, e);
+}
+typedef struct { int64_t sid; uint8_t op; char name[64]; bool has_name; uint8_t kind; bool stamped; uint64_t gen, time; bool force; } pc_t;
+static void p_changes(int fd, kdb_enc_t *e, uint64_t batch, uint64_t cursor, bool last, const pc_t *c, int n) {
+    kdb_enc_begin(e, KDB_T_CHANGES);
+    kdb_enc_u64(e, 1, batch); kdb_enc_u16(e, 2, 0); kdb_enc_u64(e, 3, cursor); kdb_enc_u8(e, 4, last ? 1 : 0); kdb_enc_bytes(e, 5, g_pident, strlen(g_pident));
+    for (int i = 0; i < n; i++) {
+        kdb_enc_nest_begin(e, 6);
+        kdb_enc_i64(e, 1, c[i].sid); kdb_enc_u8(e, 2, c[i].op);
+        if (c[i].has_name) kdb_enc_name(e, 3, c[i].name);
+        if (c[i].op == KDB_CH_UPSERT) {
+            kdb_enc_u8(e, 4, c[i].kind); kdb_enc_u64(e, 5, c[i].gen); kdb_enc_u64(e, 6, c[i].time);
+            uint8_t fl = (uint8_t)((c[i].stamped ? KDB_EF_STAMPED : 0) | (c[i].force ? KDB_EF_FORCE : 0));
+            if (fl) kdb_enc_u8(e, 7, fl);
+        }
+        kdb_enc_nest_end(e);
+    }
+    kdb_enc_end(e);
+    ch_send(fd, e);
+}
+static void p_batch_end(int fd, kdb_enc_t *e, uint64_t id, uint32_t nz, uint32_t ndel) {
+    kdb_enc_begin(e, KDB_T_BATCH_END);
+    kdb_enc_u64(e, 1, id); kdb_enc_u32(e, 2, nz); kdb_enc_u32(e, 3, 0); kdb_enc_u32(e, 4, ndel);
+    kdb_enc_end(e);
+    ch_send(fd, e);
+}
+/* BATCH_RESULT of the batch (the answers of a store batch are only that) */
+static bool p_result(ch_t *mainc, kdb_msg_t *m, int ms) {
+    while (ch_next(mainc, m, ms)) {
+        if (m->type == KDB_T_BATCH_RESULT) return true;
+    }
+    return false;
+}
+
+/* the versions the test's database has: serial of zone i (the body the loader sends) */
+static uint32_t g_pserial[PN + 16];
+static int g_pasked[PN + 16];                                           /* FETCH_REQs seen for zone i */
+static int g_pprio[PN + 16];
+static int64_t g_psid[PN + 16];
+static int g_pother;                                                    /* requests for names that are not mNNNN */
+static char g_pothername[16][64];
+
+/* answer the FETCH_REQs that arrive within `ms` of silence (the loader of the store protocol: the body of every zone asked for); returns how many were answered.  skip: leave the answer out of
+ * the zones with an index in [skip_lo, skip_hi) (an interrupted fill) */
+static int serve_fetches(ch_t *fetchc, int fd, kdb_enc_t *e, int ms, int skip_lo, int skip_hi) {
+    int n = 0;
+    kdb_msg_t m;
+    while (ch_next(fetchc, &m, ms)) {
+        if (m.type != KDB_T_FETCH_REQ) continue;
+        const kdb_fetch_req_t *r = &m.u.fetch_req;
+        int i = pn_index(r->name);
+        if (i < 0 || i >= PN + 16) {
+            if (g_pother < 16) snprintf(g_pothername[g_pother], sizeof(g_pothername[0]), "%s", r->name);
+            g_pother++;
+            kdb_enc_begin(e, KDB_T_ZONE_FAILED);
+            kdb_enc_u16(e, 1, r->view); kdb_enc_name(e, 2, r->name); kdb_enc_i64(e, 3, r->source_id); kdb_enc_str(e, 4, "no body in the test"); kdb_enc_u64(e, 5, r->request_id);
+            kdb_enc_end(e);
+            ch_send(fd, e);
+            continue;
+        }
+        g_pasked[i]++;
+        g_pprio[i] = r->priority;
+        g_psid[i] = r->source_id;
+        if (i >= skip_lo && i < skip_hi) continue;
+        send_zone(fd, e, r->name, g_pserial[i] ? g_pserial[i] : 1, r->request_id, r->source_id);
+        n++;
+    }
+    return n;
+}
+
+static int64_t p_sid(int i) { return 1000 + i; }
+
+static void store_counts(store_t *st, uint64_t *known, uint64_t *stored) {
+    store_stats_t ss;
+    store_read_lock();
+    store_stats(st, &ss);
+    store_read_unlock();
+    *known = ss.zones_known;
+    *stored = ss.zones_stored;
+}
+
+static bool wait_stored(store_t *st, uint64_t want, int ms) {
+    for (int t = 0; t < ms / 20; t++) {
+        uint64_t k, s;
+        store_counts(st, &k, &s);
+        if (s == want && k == 0) return true;
+        usleep(20000);
+    }
+    return false;
+}
+
+static bool zrec(store_t *st, const char *name, store_zone_t *z) {
+    store_read_lock();
+    int vid = store_view_id(st, "default");
+    uint32_t zid = vid >= 0 ? store_find(st, (uint16_t)vid, name, strlen(name)) : STORE_NONE;
+    bool ok = zid != STORE_NONE && store_zone_get(st, zid, z) == 0;
+    store_read_unlock();
+    return ok;
+}
+
+
+/* the zones listed by a full pass: every zone but the omitted ones; zone 30 is "m0030b" (renamed), zone 12 has no stamp (a row of the database without a state row) */
+static bool g_renamed30;
+static void p_zone(pz_t *z, int i) {
+    memset(z, 0, sizeof(*z));
+    z->sid = p_sid(i);
+    if (i == 30 && g_renamed30) snprintf(z->name, sizeof(z->name), "m0030b.test.");
+    else pn_name(z->name, sizeof(z->name), i);
+    z->stamped = i != 12;
+    z->gen = z->stamped ? g_pserial[i] : 0;
+    z->time = z->stamped ? 10 * z->gen : 0;
+}
+
+static void full_pass(int fd, kdb_enc_t *e, uint64_t batch, const bool *omit, uint64_t cursor, bool complete) {
+    static pz_t page[2048];
+    int n = 0;
+    uint32_t pg = 0;
+    uint64_t total = 0;
+    p_manifest_begin(fd, e, batch, PN, cursor, true);
+    for (int i = 0; i < PN; i++) {
+        if (omit && omit[i]) continue;
+        p_zone(&page[n++], i);
+        total++;
+        if (n == 2048) {
+            p_manifest_page(fd, e, batch, pg++, page, n);
+            n = 0;
+        }
+    }
+    if (n) p_manifest_page(fd, e, batch, pg++, page, n);
+    p_manifest_end(fd, e, batch, total, 3, cursor, complete);
+}
+
+/* the cursor the store keeps for view "default": its value, the loader's identity after the configuration's 8 bytes */
+static bool cursor_is(store_t *st, uint64_t want) {
+    bool valid = false;
+    uint64_t cur = 0;
+    uint8_t id[STORE_IDENT_MAX];
+    size_t il = 0;
+    int vid = store_view_id(st, "default");
+    if (vid < 0 || store_get_cursor(st, (uint16_t)vid, &valid, &cur, id, &il) != 0) return false;
+    return valid && cur == want && il == 8 + strlen(g_pident) && memcmp(id + 8, g_pident, strlen(g_pident)) == 0;
+}
+
+static uint64_t zones_now(store_t *st) {
+    uint64_t k, s;
+    store_counts(st, &k, &s);
+    return k + s;
+}
+
+static int count_asked(int lo, int hi) {
+    int n = 0;
+    for (int i = lo; i < hi; i++) n += g_pasked[i];
+    return n;
+}
+
+static int run_proto(int phase, const char *dir) {
+    printf("[the store protocol: phase %d]\n", phase);
+    char sdir[600];
+    snprintf(sdir, sizeof(sdir), "%s/s", dir);
+    static server_config_t cfg;
+    char conf[2048];
+    snprintf(conf, sizeof(conf),
+             "options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; store \"%s\"; store-mode map; "
+             "store-threads 2; }; };\n"
+             "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", sdir);
+    CHECK(parse_named_conf(conf, &cfg) == 0);
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    rebuild_zone_db_from_config(&cfg, false);
+    char msg[400];
+    CHECK(db_store_frontend_open(&cfg.database, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg)) && db_store_dir_fd() >= 0);
+    CHECK(db_store_start(&cfg) && db_store_enabled());
+    store_t *st = db_store_handle();
+    CHECK(st != NULL);
+    int a[2], f[2], cs[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, f) == 0 && socketpair(AF_UNIX, SOCK_SEQPACKET, 0, cs) == 0);
+    int ends[3] = { a[1], f[1], cs[1] };
+    for (int i = 0; i < 3; i++) fcntl(ends[i], F_SETFL, fcntl(ends[i], F_GETFL, 0) | O_NONBLOCK);
+    park_register_worker(0, -1);
+    CHECK(db_ingest_start(a[1], cs[1], f[1]));
+    static ch_t mainc, fetchc;
+    ch_init(&mainc, a[0], KDB_FROM_BACKEND);
+    ch_init(&fetchc, f[0], KDB_FROM_BACKEND);
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    kdb_msg_t m;
+    park_key_t k;
+    memset(&g_wctx, 0, sizeof(g_wctx));
+    g_query_bg_fetch = no_bg_fetch;
+    g_query_bg_attach = no_bg_fetch;
+    for (int i = 0; i < PN + 16; i++) g_pserial[i] = 1;
+
+    kdb_enc_begin(&e, KDB_T_HELLO);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242);
+    if (phase > 0) kdb_enc_u32(&e, 5, KDB_FEAT_STORE);
+    kdb_enc_end(&e);
+    ch_send(a[0], &e);
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG);
+    CHECK(m.u.config.store_proto == (phase > 0));
+    {
+        kdb_iter_t it;
+        kdb_config_view_t cv;
+        kdb_config_views(&m, &it);
+        CHECK(kdb_config_views_next(&it, &cv));
+        if (phase <= 1) {
+            CHECK(!cv.has_cursor);                                       /* (a legacy loader gets none; a first fill has none) */
+        } else {
+            CHECK(cv.has_cursor && cv.cursor == 230 && cv.ident_len == strlen(g_pident) && memcmp(cv.ident, g_pident, cv.ident_len) == 0);
+        }
+    }
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_DEBUG);
+    if (phase == 0) {
+        /* the loader that does not offer the protocol gets the inventory as before: INVENTORY_REQ is answered (an inventory of the store: empty) */
+        kdb_enc_begin(&e, KDB_T_INVENTORY_REQ);
+        kdb_enc_end(&e);
+        ch_send(a[0], &e);
+        bool end = false;
+        while (!end && ch_next(&mainc, &m, 5000)) end = m.type == KDB_T_INVENTORY_END;
+        CHECK(end);
+        CHECK(!ch_next(&fetchc, &m, 200));
+        goto done;
+    }
+    uint64_t kn, sd;
+    const int vid = store_view_id(st, "default");
+    CHECK(vid >= 0);
+
+    if (phase == 1) {
+        CHECK(!ch_next(&fetchc, &m, 200));                               /* an empty store has nothing to ask for */
+
+        /* -- A. the first fill: a pass.  BATCH_RESULT comes when the entries are recorded, the bodies follow */
+        p_batch_begin(a[0], &e, 1, KDB_BATCH_STARTUP, 0);
+        full_pass(a[0], &e, 1, NULL, 77, true);
+        p_batch_end(a[0], &e, 1, PN, 0);
+        CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.n_applied == PN && m.u.batch_result.n_rejected == 0);
+        store_counts(st, &kn, &sd);
+        CHECK(kn == PN && sd == 0);                                      /* (no body has come: the loader is not answering yet) */
+        CHECK(cursor_is(st, 77));                                        /* (the cursor is kept once the entries are recorded) */
+        {
+            store_zone_t z;
+            CHECK(zrec(st, "m0010.test", &z) && z.state == STORE_STATE_KNOWN && z.source_id == p_sid(10) && z.stamp_gen == 1 && z.stamp_time == 10);
+            zref_t zr;
+            CHECK(zref_of("m4000.test.", &zr) && zr.entry == NULL && zr.zid != ZREF_NOZID && zr.zstate == ZREF_ST_KNOWN);      /* (the name index is complete: the zone is known) */
+        }
+        /* a query for a zone that is known and has no body goes to the fetch queue (priority 0, with the domain id) and is answered */
+        drain_wakes();
+        CHECK(park_fetch_request(0, "default", "m4000.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+        int n = serve_fetches(&fetchc, f[0], &e, 1500, -1, -1);
+        CHECK(n >= PN - 100);
+        CHECK(wake_for("m4000.test.", &k, 5000) && !k.failed && !k.retry);
+        CHECK(g_pprio[4000] == 0 && g_psid[4000] == p_sid(4000));       /* (asked for by the query, and with the id the record holds) */
+        CHECK(g_pprio[1000] == KDB_FETCH_PRIO_BACKGROUND && g_psid[1000] == p_sid(1000));
+        CHECK(wait_stored(st, PN, 30000));
+        {
+            uint8_t out[1232];
+            int rl = ask_engine(&g_wctx, &g_cc, "www.m4000.test.", 1, out);
+            CHECK(rl > 12 && (out[3] & 0x0F) == 0 && ((out[6] << 8) | out[7]) == 1);
+            store_zone_t z;
+            CHECK(zrec(st, "m0010.test", &z) && z.state == STORE_STATE_STORED && z.serial == 1 && z.stamp_gen == 1 && z.stamp_time == 10 && !(z.flags & STORE_F_STALE));
+        }
+        int bad = 0;
+        for (int i = 0; i < PN; i++) bad += g_pasked[i] != 1;
+        CHECK(bad == 0);                                                 /* (every zone was asked for once) */
+
+        /* -- B. changes: a new stamp, the same stamp, an unstamped zone, a forced one, deletes by id and by name, a rename */
+        memset(g_pasked, 0, sizeof(g_pasked));
+        g_pserial[10] = 2;
+        g_pserial[12] = 7;
+        pc_t c[8];
+        memset(c, 0, sizeof(c));
+        c[0] = (pc_t){ .sid = p_sid(10), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 2, .time = 20 };  pn_name(c[0].name, sizeof(c[0].name), 10);
+        c[1] = (pc_t){ .sid = p_sid(11), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 1, .time = 10 };  pn_name(c[1].name, sizeof(c[1].name), 11);
+        c[2] = (pc_t){ .sid = p_sid(12), .op = KDB_CH_UPSERT, .has_name = true, .stamped = false };                       pn_name(c[2].name, sizeof(c[2].name), 12);
+        c[3] = (pc_t){ .sid = p_sid(20), .op = KDB_CH_DELETE };
+        c[4] = (pc_t){ .sid = p_sid(21), .op = KDB_CH_DELETE, .has_name = true };                                           pn_name(c[4].name, sizeof(c[4].name), 21);
+        c[5] = (pc_t){ .sid = p_sid(30), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 1, .time = 10 };  snprintf(c[5].name, sizeof(c[5].name), "m0030b.test.");
+        c[6] = (pc_t){ .sid = p_sid(13), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 1, .time = 10, .force = true };  pn_name(c[6].name, sizeof(c[6].name), 13);
+        CHECK(evict_zone("m0010.test."));                                /* (the zone whose stamp changes is out of memory: its NOTIFY is queued when the new body is installed, as for a summary before) */
+        { char nv[64], nz[300]; while (dbreg_notify_pop(nv, sizeof(nv), nz, sizeof(nz))) {} }
+        p_batch_begin(a[0], &e, 2, KDB_BATCH_AUTO, 0);
+        p_changes(a[0], &e, 2, 90, true, c, 7);
+        p_batch_end(a[0], &e, 2, 5, 2);
+        { bool pr = p_result(&mainc, &m, 10000); if (!pr || m.u.batch_result.n_applied != 4) printf("  B: got=%d applied=%u unchanged=%u rejected=%u deleted=%u\n", pr, m.u.batch_result.n_applied, m.u.batch_result.n_unchanged, m.u.batch_result.n_rejected, m.u.batch_result.n_deleted); CHECK(pr && m.u.batch_result.n_applied == 4 && m.u.batch_result.n_unchanged == 1 && m.u.batch_result.n_deleted == 2); }
+        CHECK(serve_fetches(&fetchc, f[0], &e, 700, -1, -1) == 4);
+        CHECK(g_pasked[10] == 1 && g_pasked[11] == 0 && g_pasked[12] == 1 && g_pasked[13] == 1 && g_pasked[30] == 1 && count_asked(0, PN) == 4);
+        {
+            char nv[64], nz[300];
+            bool m10 = false;
+            for (int t = 0; t < 100 && !m10; t++) {
+                while (dbreg_notify_pop(nv, sizeof(nv), nz, sizeof(nz))) { if (strcmp(nz, "m0010.test.") == 0) m10 = true; }
+                if (!m10) usleep(20000);
+            }
+            CHECK(m10);                                                  /* (the NOTIFY of a zone that changed while it was out of memory is queued) */
+        }
+        CHECK(wait_stored(st, PN - 2, 10000));
+        {
+            store_zone_t z;
+            CHECK(zrec(st, "m0010.test", &z) && z.state == STORE_STATE_STORED && z.serial == 2 && z.stamp_gen == 2 && z.stamp_time == 20 && !(z.flags & STORE_F_STALE));
+            CHECK(zrec(st, "m0011.test", &z) && z.serial == 1 && z.stamp_gen == 1);
+            CHECK(zrec(st, "m0012.test", &z) && z.serial == 7 && z.stamp_gen == 0 && z.stamp_time == 0);
+            CHECK(!zrec(st, "m0020.test", &z) && !zrec(st, "m0021.test", &z) && !zrec(st, "m0030.test", &z));       /* (deleted by id, by name; renamed) */
+            CHECK(zrec(st, "m0030b.test", &z) && z.source_id == p_sid(30) && z.state == STORE_STATE_STORED);
+            zref_t zr;
+            CHECK(!zref_of("m0020.test.", &zr) && !zref_of("m0030.test.", &zr) && zref_of("m0030b.test.", &zr));
+        }
+        CHECK(cursor_is(st, 90));
+        g_renamed30 = true;
+
+        /* -- C. a pass that finds the same versions asks for nothing (but the zone that has no stamp, which is always asked for) */
+        memset(g_pasked, 0, sizeof(g_pasked));
+        static bool omit[PN];
+        memset(omit, 0, sizeof(omit));
+        omit[20] = omit[21] = true;                                      /* (gone from the database) */
+        p_batch_begin(a[0], &e, 3, KDB_BATCH_FULL, 0);
+        full_pass(a[0], &e, 3, omit, 100, true);
+        p_batch_end(a[0], &e, 3, PN - 2, 0);
+        CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.n_deleted == 0);
+        (void)serve_fetches(&fetchc, f[0], &e, 700, -1, -1);
+        CHECK(count_asked(0, PN) == 1 && g_pasked[12] == 1);
+        CHECK(zones_now(st) == PN - 2 && cursor_is(st, 100));
+
+        /* -- D. a pass that does not list 200 zones (4 percent): they are deleted */
+        memset(omit, 0, sizeof(omit));
+        omit[20] = omit[21] = true;
+        for (int i = 100; i < 300; i++) omit[i] = true;
+        memset(g_pasked, 0, sizeof(g_pasked));
+        p_batch_begin(a[0], &e, 4, KDB_BATCH_FULL, 0);
+        full_pass(a[0], &e, 4, omit, 110, true);
+        p_batch_end(a[0], &e, 4, PN - 202, 0);
+        CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.n_deleted == 200);
+        (void)serve_fetches(&fetchc, f[0], &e, 500, -1, -1);
+        CHECK(zones_now(st) == PN - 202 && cursor_is(st, 110));
+        {
+            store_zone_t z;
+            CHECK(!zrec(st, "m0100.test", &z) && !zrec(st, "m0299.test", &z) && zrec(st, "m0300.test", &z));
+        }
+
+        /* -- E. the mass-delete guard: a pass that does not list 1600 zones (32 percent) deletes nothing, keeps the cursor, and says so */
+        memset(omit, 0, sizeof(omit));
+        omit[20] = omit[21] = true;
+        for (int i = 100; i < 300; i++) omit[i] = true;
+        for (int i = 1000; i < 2600; i++) omit[i] = true;
+        p_batch_begin(a[0], &e, 5, KDB_BATCH_FULL, 0);
+        full_pass(a[0], &e, 5, omit, 120, true);
+        p_batch_end(a[0], &e, 5, PN - 202 - 1600, 0);
+        CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.n_deleted == 0);
+        CHECK(zones_now(st) == PN - 202);                                /* (nothing was deleted) */
+        {
+            store_zone_t z;
+            CHECK(zrec(st, "m1500.test", &z) && z.state == STORE_STATE_STORED);
+            db_recon_status_t rs;
+            db_recon_status(&rs);
+            CHECK(rs.guard_views == 1 && rs.guard_unlisted == 1600 && strcmp(rs.guard_view, "default") == 0);
+            static char kv[STORE_STATUS_OUT_MAX];
+            CHECK(store_status_format(kv, sizeof(kv), STORE_FMT_KV, NULL) > 0);
+            CHECK(strstr(kv, "store.recon.guard.held_views=1") != NULL && strstr(kv, "store.recon.guard.unlisted=1600") != NULL && strstr(kv, "store.recon.guard.release=\"karictl reload -force\"") != NULL);
+        }
+        CHECK(cursor_is(st, 110));                                       /* (not advanced) */
+        /* changes while the guard holds: the cursor stays too */
+        p_batch_begin(a[0], &e, 6, KDB_BATCH_AUTO, 0);
+        c[0] = (pc_t){ .sid = p_sid(11), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 1, .time = 10 };  pn_name(c[0].name, sizeof(c[0].name), 11);
+        p_changes(a[0], &e, 6, 130, true, c, 1);
+        p_batch_end(a[0], &e, 6, 1, 0);
+        CHECK(p_result(&mainc, &m, 10000));
+        CHECK(cursor_is(st, 110));
+
+        /* -- F. the operator's `karictl reload -force` is a pass the guard does not hold back */
+        uint64_t rid = db_ingest_reload(true, NULL, NULL, true);
+        CHECK(rid > 0);
+        bool got = false;
+        while (!got && ch_next(&mainc, &m, 5000)) got = m.type == KDB_T_RELOAD_REQ;
+        CHECK(got && m.u.reload_req.request_id == rid && m.u.reload_req.scope == 0 && m.u.reload_req.force == 1);
+        p_batch_begin(a[0], &e, 7, KDB_BATCH_FULL, rid);
+        full_pass(a[0], &e, 7, omit, 200, true);
+        p_batch_end(a[0], &e, 7, PN - 202 - 1600, 0);
+        CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.n_deleted == 1600);
+        CHECK(zones_now(st) == PN - 202 - 1600);
+        {
+            store_zone_t z;
+            db_recon_status_t rs;
+            db_recon_status(&rs);
+            CHECK(!zrec(st, "m1500.test", &z) && zrec(st, "m0999.test", &z) && zrec(st, "m2600.test", &z));
+            CHECK(rs.guard_views == 0 && rs.swept == 1600);
+        }
+        CHECK(cursor_is(st, 200));
+
+        /* -- G. a pass the loader could not finish (complete = 0) deletes nothing and keeps no cursor */
+        memset(omit, 1, sizeof(omit));
+        p_batch_begin(a[0], &e, 8, KDB_BATCH_FULL, 0);
+        full_pass(a[0], &e, 8, omit, 300, false);
+        p_batch_end(a[0], &e, 8, 0, 0);
+        CHECK(p_result(&mainc, &m, 10000));
+        CHECK(zones_now(st) == PN - 202 - 1600 && cursor_is(st, 200));
+
+        /* -- H. a secondary zone: a record that only remembers it (no query finds it), asked for once, again when its stamp changes */
+        g_pother = 0;
+        memset(c, 0, sizeof(c));
+        c[0] = (pc_t){ .sid = 9001, .op = KDB_CH_UPSERT, .has_name = true, .kind = KDB_ZK_SECONDARY, .stamped = true, .gen = 1, .time = 5 };  snprintf(c[0].name, sizeof(c[0].name), "sec1.test.");
+        p_batch_begin(a[0], &e, 9, KDB_BATCH_AUTO, 0);
+        p_changes(a[0], &e, 9, 210, true, c, 1);
+        p_batch_end(a[0], &e, 9, 1, 0);
+        CHECK(p_result(&mainc, &m, 10000));
+        (void)serve_fetches(&fetchc, f[0], &e, 700, -1, -1);
+        CHECK(g_pother == 1 && strcmp(g_pothername[0], "sec1.test.") == 0);
+        {
+            store_zone_t z;
+            zref_t zr;
+            CHECK(zrec(st, "sec1.test", &z) && (z.flags & STORE_F_NONSTORE) && z.state == STORE_STATE_KNOWN);
+            CHECK(!zref_of("sec1.test.", &zr));                          /* (a heap zone: the store's index does not show it to a query) */
+        }
+        p_batch_begin(a[0], &e, 10, KDB_BATCH_AUTO, 0);
+        p_changes(a[0], &e, 10, 215, true, c, 1);                       /* (the same stamp) */
+        p_batch_end(a[0], &e, 10, 1, 0);
+        CHECK(p_result(&mainc, &m, 10000));
+        (void)serve_fetches(&fetchc, f[0], &e, 500, -1, -1);
+        CHECK(g_pother == 1);
+        c[0].gen = 2;
+        p_batch_begin(a[0], &e, 11, KDB_BATCH_AUTO, 0);
+        p_changes(a[0], &e, 11, 216, true, c, 1);                       /* (a new stamp) */
+        p_batch_end(a[0], &e, 11, 1, 0);
+        CHECK(p_result(&mainc, &m, 10000));
+        (void)serve_fetches(&fetchc, f[0], &e, 700, -1, -1);
+        CHECK(g_pother == 2);
+
+        /* -- H2. karictl reload <zone>: the loader marks the entry of a one-zone reload FORCE; without `force` the stamp decides (a zone that did not change is "unchanged" and is not read, BATCH_RESULT
+         * comes at once), with `force` the body is read and BATCH_RESULT, which the loader waits for, is held until it is installed */
+        {
+            db_reload_result_t rr;
+            memset(&rr, 0, sizeof(rr));
+            memset(g_pasked, 0, sizeof(g_pasked));
+            uint64_t r1 = db_ingest_reload(false, "default", "m0300.test.", false);
+            CHECK(r1 > 0);
+            bool got1 = false;
+            while (!got1 && ch_next(&mainc, &m, 5000)) got1 = m.type == KDB_T_RELOAD_REQ;
+            CHECK(got1 && m.u.reload_req.request_id == r1 && m.u.reload_req.scope == 1 && m.u.reload_req.force == 0);
+            pc_t c1[1];
+            memset(c1, 0, sizeof(c1));
+            c1[0] = (pc_t){ .sid = p_sid(300), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 1, .time = 10, .force = true };
+            pn_name(c1[0].name, sizeof(c1[0].name), 300);
+            p_batch_begin(a[0], &e, 20, KDB_BATCH_ZONE, r1);
+            p_changes(a[0], &e, 20, 0, false, c1, 1);
+            p_batch_end(a[0], &e, 20, 1, 0);
+            CHECK(p_result(&mainc, &m, 5000) && m.u.batch_result.n_unchanged == 1 && m.u.batch_result.n_applied == 0);
+            bool have = false;
+            for (int t = 0; t < 200 && !have; t++) { have = db_ingest_reload_result(&rr); if (!have) usleep(10000); }
+            CHECK(have && rr.id == r1 && rr.ok && strstr(rr.text, "unchanged, serial 1") != NULL);
+            CHECK(!ch_next(&fetchc, &m, 200));                           /* (nothing was read) */
+            uint64_t r2 = db_ingest_reload(false, "default", "m0300.test.", true);
+            CHECK(r2 > 0);
+            bool got2 = false;
+            while (!got2 && ch_next(&mainc, &m, 5000)) got2 = m.type == KDB_T_RELOAD_REQ;
+            CHECK(got2 && m.u.reload_req.request_id == r2 && m.u.reload_req.force == 1);
+            p_batch_begin(a[0], &e, 21, KDB_BATCH_ZONE, r2);
+            p_changes(a[0], &e, 21, 0, false, c1, 1);
+            p_batch_end(a[0], &e, 21, 1, 0);
+            CHECK(!p_result(&mainc, &m, 300));                           /* (the answer waits for the body) */
+            CHECK(serve_fetches(&fetchc, f[0], &e, 500, -1, -1) == 1 && g_pasked[300] == 1);
+            CHECK(p_result(&mainc, &m, 5000) && m.u.batch_result.n_applied == 1);
+            have = false;
+            for (int t = 0; t < 200 && !have; t++) { have = db_ingest_reload_result(&rr); if (!have) usleep(10000); }
+            CHECK(have && rr.id == r2 && rr.ok && strstr(rr.text, "serial 1") != NULL && strstr(rr.text, "applied") != NULL);
+        }
+
+        /* -- I. work that is interrupted: three zones change and the loader does not answer; the process ends as if it were killed */
+        memset(g_pasked, 0, sizeof(g_pasked));
+        memset(c, 0, sizeof(c));
+        for (int j = 0; j < 3; j++) {
+            c[j] = (pc_t){ .sid = p_sid(500 + j), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 5, .time = 50 };
+            pn_name(c[j].name, sizeof(c[j].name), 500 + j);
+        }
+        g_pserial[500] = g_pserial[501] = g_pserial[502] = 5;
+        p_batch_begin(a[0], &e, 12, KDB_BATCH_AUTO, 0);
+        p_changes(a[0], &e, 12, 230, true, c, 3);
+        p_batch_end(a[0], &e, 12, 3, 0);
+        CHECK(p_result(&mainc, &m, 10000));
+        (void)serve_fetches(&fetchc, f[0], &e, 700, 500, 503);          /* (the three requests are read and not answered) */
+        CHECK(g_pasked[500] == 1 && g_pasked[501] == 1 && g_pasked[502] == 1);
+        {
+            store_zone_t z;
+            CHECK(zrec(st, "m0500.test", &z) && z.state == STORE_STATE_STORED && (z.flags & STORE_F_STALE) && z.serial == 1 && z.stamp_gen == 5);     /* (the old image serves, the new stamp is the wanted one) */
+        }
+        CHECK(cursor_is(st, 230));
+        db_store_batch_end();
+        printf("%d checks, %d failed\n", g_checks, g_failed);
+        fflush(stdout);
+        _exit(g_failed ? 1 : 0);                                         /* (no clean stop: the next start recovers the store from its journal) */
+    }
+
+    /* -- phase 2: a new process on the same store.  The CONFIG carried the cursor (230) and the identity.  Nothing is listed again: only the interrupted work is asked for, and the changes after the cursor are applied */
+    store_counts(st, &kn, &sd);
+    CHECK(sd == PN - 202 - 1600 && kn == 1);                              /* (the zones, and the secondary's record) */
+    CHECK(cursor_is(st, 230));
+    CHECK(attach_by_worker("m0700.test.", &k) == 1);                     /* (the loader has said nothing: the zone comes from the store alone) */
+    for (int i = 0; i < PN + 16; i++) g_pserial[i] = 1;
+    g_pserial[500] = g_pserial[501] = g_pserial[502] = 5;
+    g_pother = 0;
+    int answered = serve_fetches(&fetchc, f[0], &e, 1500, -1, -1);
+    CHECK(answered == 3 && g_pasked[500] == 1 && g_pasked[501] == 1 && g_pasked[502] == 1 && count_asked(0, PN) == 3);      /* (the three zones whose bodies were not here, nothing else) */
+    CHECK(g_pother == 1 && strcmp(g_pothername[0], "sec1.test.") == 0);  /* (and the secondary zone, once per run) */
+    {
+        store_zone_t z;
+        CHECK(zrec(st, "m0500.test", &z) && z.state == STORE_STATE_STORED && z.serial == 5 && !(z.flags & STORE_F_STALE));
+    }
+    memset(g_pasked, 0, sizeof(g_pasked));
+    {
+        pc_t c[2];
+        memset(c, 0, sizeof(c));
+        c[0] = (pc_t){ .sid = p_sid(600), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 9, .time = 90 };  pn_name(c[0].name, sizeof(c[0].name), 600);
+        g_pserial[600] = 9;
+        p_batch_begin(a[0], &e, 1, KDB_BATCH_STARTUP, 0);
+        p_changes(a[0], &e, 1, 240, true, c, 1);
+        p_batch_end(a[0], &e, 1, 1, 0);
+        CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.n_applied == 1);
+        CHECK(serve_fetches(&fetchc, f[0], &e, 700, -1, -1) == 1 && g_pasked[600] == 1 && count_asked(0, PN) == 1);
+        store_zone_t z;
+        CHECK(zrec(st, "m0600.test", &z) && z.serial == 9 && z.stamp_gen == 9);
+        CHECK(cursor_is(st, 240));
+    }
+done:
+    printf("%d checks, %d failed\n", g_checks, g_failed);
+    fflush(stdout);
+    _exit(g_failed ? 1 : 0);
+}
+
+static int proto_main(const char *self) {
+    char dir[600];
+    const char *tmp = getenv("TMPDIR");
+    snprintf(dir, sizeof(dir), "%s/test_db_store_proto.XXXXXX", tmp && *tmp ? tmp : "/tmp");
+    if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+    int bad = 0;
+    for (int phase = 0; phase < 3; phase++) {
+        char cmd[900];
+        snprintf(cmd, sizeof(cmd), "%s proto%d %s", self, phase, dir);
+        if (system(cmd) != 0) bad++;
+        if (phase == 0) {                                                /* (phase 0 is the legacy loader on an empty store: the next phases start on a new one) */
+            char rm[700];
+            snprintf(rm, sizeof(rm), "rm -rf %s/s", dir);
+            (void)!system(rm);
+        }
+    }
+    char rm[700];
+    snprintf(rm, sizeof(rm), "rm -rf %s", dir);
+    (void)!system(rm);
+    return bad ? 1 : 0;
+}
+
 /* ---------------------------------------------------------------- M1: the lock file of the directory */
 /* The directory belongs to the user the server runs as, so that user can put anything under the name "lock" before the start.  Run as root, the start is privileged: it must not
  * give a file of root's to the run user (a hard link), wait for a FIFO, follow a link, or trust a file of another user; run by a user, the same files are refused or replaced.
@@ -1122,6 +1713,7 @@ static int lock_tests(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] >= '0' && argv[1][5] <= '2') return run_proto(argv[1][5] - '0', argv[2]);
     if (argc > 1) return run_mode(strcmp(argv[1], "copy") == 0 ? "copy" : "map");
     if (lock_tests() != 0 || g_failed) { printf("%d checks, %d failed\n", g_checks, g_failed); return 1; }
     printf("lock file: %d checks\n", g_checks);
@@ -1130,5 +1722,6 @@ int main(int argc, char **argv) {
     snprintf(cmd, sizeof(cmd), "%s copy", argv[0]);
     int rc = system(cmd);
     int rc2 = run_mode("map");
-    return (rc != 0 || rc2 != 0) ? 1 : 0;
+    int rc3 = proto_main(argv[0]);
+    return (rc != 0 || rc2 != 0 || rc3 != 0) ? 1 : 0;
 }

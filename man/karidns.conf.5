@@ -4619,9 +4619,23 @@ loss after the next commit (the end of a batch, at the latest after 100 ms; a
 checkpoint every 30 s). A normal stop ends with a clean checkpoint: the next
 start reports a clean store and reads no journal; after \fBkill \-9\fR the
 journal is replayed (and after a power loss or crash of the host the derived
-tables are rebuilt, \fBkarictl store\fR says so). With the store on, the loader
-sends every zone whole (no summaries: \fBmemory\-limit\fR governs the zones in
-memory, not the directory), and a zone of a first fill that does not fit under
+tables are rebuilt, \fBkarictl store\fR says so). With the store on and a loader
+that offers it (0.7, the store protocol; docs/karidns-dbloader.md), the loader
+keeps no table of the zones: it lists them to the Backend (a pass) or says which
+changed (the change log from a cursor that the store keeps), the Backend makes a
+record for each zone at once (the name index is complete when the pass ends) and
+fetches the bodies in the background, a few at a time and after the queries; a
+query for a zone that has no body yet is read from the database and answered; a
+restart with the store transfers no zone, only the changes after the cursor
+arrive. A pass that lists fewer zones than the store holds deletes the zones it
+does not list (the sweep), \fBexcept\fR when that would be more than 20 percent
+of the view's zones and more than 1,000: the \fBmass-delete guard\fR deletes
+nothing then, keeps serving, logs \fBERROR\fR and shows it in \fBkarictl
+dbstatus\fR and \fBkarictl store\fR (\fBstore.recon.guard.*\fR); \fBkarictl
+reload \-force\fR is the operator's release (the pass it asks for deletes
+them). Otherwise (no store, a loader without the feature) the loader sends every
+zone whole (no summaries: \fBmemory\-limit\fR governs the zones in memory, not
+the directory), and a zone of a first fill that does not fit under
 \fBmemory\-limit\fR is written to the store and not kept in memory. The settings
 of a zone (its allow-query, allow-transfer, ...) are kept by id in
 \fBsettings.dat\fR, so that a zone that is not in memory is answered and

@@ -118,11 +118,13 @@ static _Atomic(store_t *) g_store;
 static bool (*_Atomic g_mem_fn)(ma_est_t *);
 static bool (*_Atomic g_att_fn)(uint32_t);
 static uint64_t (*_Atomic g_att_count_fn)(void);
+static bool (*_Atomic g_recon_fn)(store_recon_t *);
 
 void store_status_bind(store_t *s) { atomic_store_explicit(&g_store, s, memory_order_release); }
 void store_status_set_memory_fn(bool (*fn)(ma_est_t *out)) { atomic_store_explicit(&g_mem_fn, fn, memory_order_release); }
 void store_status_set_attached_fn(bool (*fn)(uint32_t zid)) { atomic_store_explicit(&g_att_fn, fn, memory_order_release); }
 void store_status_set_attached_count_fn(uint64_t (*fn)(void)) { atomic_store_explicit(&g_att_count_fn, fn, memory_order_release); }
+void store_status_set_recon_fn(bool (*fn)(store_recon_t *out)) { atomic_store_explicit(&g_recon_fn, fn, memory_order_release); }
 
 /* ------------------------------------------------------------------------------------------------------------------------------ */
 /* the entry list                                                                                                                 */
@@ -379,6 +381,52 @@ static void add_memory(list_t *l) {
   add_s(l, "store.memory.level", ma_level_name(m.level));
 }
 
+/* 0.7 WP7b: the reconcile with the loader: the pass (entries, wanted bodies, fetched, swept, the guard) and what the background fetch has done since the start */
+static void add_recon(list_t *l) {
+  bool (*fn)(store_recon_t *) = atomic_load_explicit(&g_recon_fn, memory_order_acquire);
+  store_recon_t *r = fn ? malloc(sizeof(*r)) : NULL;
+  if (!r || !fn(r)) {
+    free(r);
+    U("store.recon.available", 0);
+    return;
+  }
+  U("store.recon.available", 1);
+  U("store.recon.pass.active", r->active ? 1 : 0);
+  add_s(l, "store.recon.pass.view", r->view);
+  U("store.recon.pass.started_unix", r->started_unix);
+  U("store.recon.pass.duration_ms", r->duration_ms);
+  U("store.recon.pass.estimate", r->estimate);
+  U("store.recon.pass.entries", r->entries);
+  U("store.recon.pass.created", r->created);
+  U("store.recon.pass.changed", r->changed);
+  U("store.recon.pass.renamed", r->renamed);
+  U("store.recon.pass.same", r->same);
+  U("store.recon.pass.pending", r->pending);
+  U("store.recon.pass.kept", r->kept);
+  U("store.recon.pass.skipped", r->skipped);
+  U("store.recon.sweep.total", r->total);
+  U("store.recon.sweep.unlisted", r->unlisted);
+  U("store.recon.sweep.deleted", r->swept);
+  U("store.recon.passes", r->passes);
+  U("store.recon.wanted", r->wanted);
+  U("store.recon.bodies.known", r->known_now);
+  U("store.recon.bodies.fetched", r->fetched);
+  U("store.recon.bodies.failed", r->fetch_failed);
+  U("store.recon.bodies.in_flight", r->in_flight);
+  U("store.recon.changes.upserts", r->change_upserts);
+  U("store.recon.changes.deletes", r->change_deletes);
+  U("store.recon.cursors_kept", r->cursors);
+  U("store.recon.guard.held_views", r->guard_views);
+  if (r->guard_views) {
+    add_s(l, "store.recon.guard.view", r->guard_view);
+    U("store.recon.guard.unlisted", r->guard_unlisted);
+    U("store.recon.guard.total", r->guard_total);
+    U("store.recon.guard.since_unix", r->guard_unix);
+    add_s(l, "store.recon.guard.release", "karictl reload -force");
+  }
+  free(r);
+}
+
 static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a) {
   store_stats_t *st = malloc(sizeof(*st));
   if (!st) { l->ov = true; return; }
@@ -568,6 +616,7 @@ size_t store_status_format(char *out, size_t cap, int fmt, const char *zone) {
     else add_s(&l, "store.state", "none");
     add_attach(&l, a);
     add_memory(&l);
+    add_recon(&l);
   }
   sb_t b = { out, cap, 0, false };
   if (fmt == STORE_FMT_JSON) write_json(&b, &l);

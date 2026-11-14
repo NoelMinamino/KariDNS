@@ -1142,6 +1142,13 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
       zref_t sib_z;                                        /* (one lookup decides: the data of the zone may come into memory or leave it at any moment) */
       zref_clear(&sib_z);
       zone_db_entry_t *sib_entry = view ? find_zone_for_query_zref(view, ns_target, 0, &sib_z) : NULL;
+      if (!sib_entry && view && !sib_z.el && !sib_z.busy && sib_z.zid != ZREF_NOZID && sib_z.zstate == ZREF_ST_ABSENT && g_query_attach_sync) {
+        /* 0.7 WP7b: a zone of the store that is not in memory holds the address of this name server: it is attached now, so that this NOTIFY has the address (a NOTIFY that waited for the
+         * zone to come in the background was lost: nothing sends it again) */
+        g_query_attach_sync(sib_z.hview ? sib_z.hview : view->name, zref_name(&sib_z));
+        zref_clear(&sib_z);
+        sib_entry = find_zone_for_query_zref(view, ns_target, 0, &sib_z);
+      }
       if (!sib_entry) {                                    /* (a zone of the view that is out of memory: the glue of its apex, D1a step 7) */
         if (entry && sib_z.el) (void)notify_add_sibling_apex(sib_z.el, ns_target, targets, &ntargets, 64, key, ns_port);
         else if (view && !sib_z.el && !sib_z.busy && sib_z.zid != ZREF_NOZID && sib_z.zstate == ZREF_ST_ABSENT && g_query_bg_attach)

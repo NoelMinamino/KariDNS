@@ -186,7 +186,9 @@ kari_make_dbloader_tsan() {
 # every zone; it is stopped (a clean stop) and started again on the same store with an idle program in the place of the loader, so every answer of B is made from the store alone
 # ("store-cold": a zone is attached on the first query for it).  store_cold_restart DIR CONFNAME LOG: the conf file is DIR/CONFNAME, LOG the log of the first run; the caller defines
 # wait_log, pass, fail and KARIDNS.  Without DB_DIFF_STORE=cold it does nothing.
-store_stmt() { [ "${DB_DIFF_STORE:-}" = cold ] && printf 'store "%s/store";' "$1"; return 0; }   # store_stmt DIR: the `store` statement of the database server (or nothing)
+# store_stmt DIR: the `store` statement of the database server: a zone store in DIR/store with DB_DIFF_STORE=cold or DB_STORE=on (the store-on variants of the database tests,
+# 0.7 WP7b: tests/run_db_<name>_store_test.sh), else `store none;` (the old behaviour whatever /var/db/karidns says on the host)
+store_stmt() { if [ "${DB_DIFF_STORE:-}" = cold ] || [ "${DB_STORE:-}" = on ]; then printf 'store "%s/store";' "$1"; else printf 'store none;'; fi; return 0; }
 store_cold_restart() {
     [ "${DB_DIFF_STORE:-}" = cold ] || return 0
     kill -TERM "$SB" 2>/dev/null
@@ -197,4 +199,33 @@ store_cold_restart() {
     SB=$!
     if ! wait_log "$3.cold" "\[Store\] the zone store is on" 30; then fail "store-cold: the database server did not open its store again"; sed 's/^/         /' "$3.cold" | tail -10; return 1; fi
     pass "store-cold: the database server runs on its store with an idle loader (every zone is attached on its first query)"
+}
+
+# store_prefill (DB_STORE=on, 0.7 WP7b): the zones of a server that has a store are in memory after its first start (the store protocol brings every body in); the tests of the old behaviour
+# start from zones that are out of memory.  A server that is started again on its store has exactly that: the zones are stored and not in memory (they are attached on their first query).  So
+# after the first start of a test, once the background fetch has put every body in the store, the server is stopped and started again.  Once per test ($T/store.filled).  The caller
+# defines SRV, T, KARIDNS, KCTL (the karictl command line), stop_srv; the configuration is $T/k.conf and the log $T/srv.log.
+store_prefill() {
+    [ "${DB_STORE:-}" = on ] || return 0
+    [ -e "$T/store.filled" ] && return 0
+    : > "$T/store.filled"
+    _sp_i=0
+    while [ $_sp_i -lt 1800 ]; do
+        _sp_kv=$($KCTL store -k 2>/dev/null)
+        _sp_k=$(echo "$_sp_kv" | sed -n 's/^store\.zones\.known=//p')
+        _sp_s=$(echo "$_sp_kv" | sed -n 's/^store\.zones\.stored=//p')
+        _sp_f=$(echo "$_sp_kv" | sed -n 's/^store\.recon\.bodies\.in_flight=//p')
+        _sp_r=$(echo "$_sp_kv" | sed -n 's/^store\.zones\.rejected=//p')          # (a zone the loader cannot read, or the Backend refuses, stays known and is flagged: it is not waited for)
+        [ $((${_sp_k:-1} - ${_sp_r:-0})) -le 0 ] && [ "${_sp_s:-0}" -gt 0 ] && [ "${_sp_f:-1}" = 0 ] && break
+        sleep 0.1
+        _sp_i=$((_sp_i + 1))
+    done
+    $KCTL dbstatus 2>/dev/null | grep '^fetchq:' | tr ' ' '\n' | sed -n 's/^peak=//p' | head -1 > "$T/fill.peak"        # (the most fetches the fill had in flight: tests of fetch-concurrency look at it)
+    stop_srv
+    : > "$T/srv.log"
+    "$KARIDNS" -c "$T/k.conf" -f > "$T/srv.log" 2>&1 &
+    SRV=$!
+    _sp_i=0
+    while [ $_sp_i -lt 1800 ] && ! grep -q "\[DB\] initial load complete" "$T/srv.log" 2>/dev/null; do sleep 0.1; _sp_i=$((_sp_i + 1)); done
+    return 0
 }

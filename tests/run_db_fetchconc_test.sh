@@ -42,6 +42,7 @@ trap cleanup EXIT INT TERM
 PASS=0; FAILS=0
 pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
+STORE=${DB_STORE:-off}                              # on: the zone store is the directory (run_db_fetchconc_store_test.sh): the queries for zones out of memory are attaches, not fetches
 PORT=$(kari_port 0 $((20000 + $$ % 20000)))
 SECRET="dGVzdC1zZWNyZXQtMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"
 
@@ -74,7 +75,7 @@ conf() {   # conf "EXTRA database statements" [MEMORY-LIMIT]
     cat > "$T/k.conf" <<EOF
 options {
     user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT; notify no;
-    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; ${FRATE-fetch-rate 5000;} park-timeout 4000;
+    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; $(store_stmt "$T") ${FRATE-fetch-rate 5000;} park-timeout 4000;
                acl-ceiling { 127.0.0.1; }; memory-limit ${2:-64m}; $1 };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
@@ -87,6 +88,7 @@ start_srv() {
     i=0
     while [ $i -lt 1800 ] && ! grep -q "\[DB\] initial load complete" "$T/srv.log" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     grep -q "\[DB\] initial load complete" "$T/srv.log" && pass "the startup batch is complete ($((i / 10)) s)" || { fail "no 'initial load complete' after $((i / 10)) s"; tail -20 "$T/srv.log"; }
+    store_prefill
     sleep 1
 }
 conc() { $KCTL dbstatus 2>/dev/null | grep '^fetch:' | sed -n 's/.* concurrency=\([0-9]*\).*/\1/p' | tail -1; }
@@ -95,6 +97,7 @@ shed() { $KCTL dbstatus 2>/dev/null | sed -n 's/.* shed=\([0-9]*\) .*/\1/p' | ta
 rate() { $KCTL dbstatus 2>/dev/null | grep '^fetch:' | sed -n 's/.* rate=\([^ ]*\) .*/\1/p' | tail -1; }
 rbr() { $KCTL dbstatus 2>/dev/null | grep '^fetch:' | sed -n 's/.* refused_by_rate=\([0-9]*\).*/\1/p' | tail -1; }
 fq() { $KCTL dbstatus 2>/dev/null | grep '^fetchq:' | tr ' ' '\n' | sed -n "s/^$1=\([0-9]*\).*/\1/p" | head -1; }   # a number of the fetchq: line
+sattach() { $KCTL store -k 2>/dev/null | sed -n 's/^store\.attach\.count=//p'; }       # zones attached from the store since the start
 fq_hist() { $KCTL dbstatus 2>/dev/null | grep '^fetchq:' | tr ' ' '\n' | sed -n 's/^hist=//p' | tr ',' ' ' | awk '{ print $1 + $2 + $3 + $4 + $5 }'; }   # fetches installed, all buckets
 udp_burst() {   # udp_burst N: one query for www.<zone> of N zones, all sent at once over one UDP socket (no pause: more fetches are wanted than the table holds)
     perl -MIO::Socket::INET -e 'my ($port, $n) = @ARGV; my $s = IO::Socket::INET->new(PeerAddr => "127.0.0.1:$port", Proto => "udp") or die;
@@ -113,6 +116,11 @@ perl -e 'for $i (0..'"$((NZ - 1))"') { printf "www.c%04d.test 192.0.2.%d\n", $i,
 echo "== the default: loader-threads x 16"
 conf "loader-threads 3;"
 start_srv
+if [ "$STORE" = on ]; then
+    # the first start filled the store: the background fetch of the bodies is bounded by fetch-concurrency (at most half of it, so that the queries have the rest): the most fetches it had in flight
+    FP=$(cat "$T/fill.peak" 2>/dev/null)
+    [ -n "$FP" ] && [ "$FP" -ge 1 ] && [ "$FP" -le 24 ] && pass "the fill of the store (the background fetch of the bodies) had at most $FP fetches in flight (half of concurrency 48 is 24)" || fail "the fill had '$FP' fetches in flight (want 1..24)"
+fi
 [ "$(conc)" = "48" ] && pass "loader-threads 3: dbstatus shows concurrency=48" || fail "concurrency: '$(conc)'"
 stop_srv
 FRATE=""
@@ -140,7 +148,12 @@ start_srv
 burst "$T/out2"
 S2=$(shed)
 [ "${S2:-0}" = "0" ] && pass "nothing was shed (0.7 P-B: a request over the limit waits, it is not refused)" || fail "shed=$S2 with fetch-concurrency 2"
-[ "$(fq waited)" -gt 0 ] 2>/dev/null && [ "$(fq queue_peak)" -ge 1 ] 2>/dev/null && pass "requests waited ($(fq waited), at most $(fq queue_peak) at once): the limit is the one in the configuration" || fail "nothing waited with fetch-concurrency 2: waited='$(fq waited)' queue_peak='$(fq queue_peak)'"
+if [ "$STORE" = on ]; then
+    # a query for a stored zone is an attach (a read of the store on a store thread): the loader is not asked, so no fetch place is taken and nothing waits for one
+    [ "$(fq waited)" = 0 ] && [ "$(sattach)" -ge "$NZ" ] 2>/dev/null && pass "no request waited for a fetch place: the zones were attached from the store ($(sattach) attaches)" || fail "waited='$(fq waited)', attaches '$(sattach)'"
+else
+    [ "$(fq waited)" -gt 0 ] 2>/dev/null && [ "$(fq queue_peak)" -ge 1 ] 2>/dev/null && pass "requests waited ($(fq waited), at most $(fq queue_peak) at once): the limit is the one in the configuration" || fail "nothing waited with fetch-concurrency 2: waited='$(fq waited)' queue_peak='$(fq queue_peak)'"
+fi
 if cmp -s "$T/out2" "$T/expected"; then pass "all $NZ queries were answered, and with the right address"; else fail "wrong or missing answers: $(diff "$T/expected" "$T/out2" | head -5 | tr '\n' ' ')"; fi
 settle
 FQ=$($KCTL dbstatus 2>/dev/null | grep '^fetchq:')
@@ -148,11 +161,19 @@ case "$FQ" in
     "fetchq: in_flight="*" places="*" peak="*" table_full="*" ring_dropped="*" park_full="*" park_timeout="*" loader_busy="*" ingest_busy="*"% hist="*,*,*,*,*" queued="*" queue_peak="*" waited="*" queue_dropped="*" queue_full="*) pass "dbstatus has the fetchq: line with all its fields" ;;
     *) fail "no complete fetchq: line: '$FQ'" ;;
 esac
-[ "$(fq peak)" -ge 1 ] 2>/dev/null && [ "$(fq peak)" -le 2 ] && pass "fetchq: peak=$(fq peak) (never more than fetch-concurrency 2 in flight)" || fail "fetchq: peak='$(fq peak)' with fetch-concurrency 2"
+if [ "$STORE" = on ]; then
+    [ "$(fq peak)" = 0 ] && pass "fetchq: peak=0 (the loader was asked for nothing)" || fail "fetchq: peak='$(fq peak)' with the zones stored"
+else
+    [ "$(fq peak)" -ge 1 ] 2>/dev/null && [ "$(fq peak)" -le 2 ] && pass "fetchq: peak=$(fq peak) (never more than fetch-concurrency 2 in flight)" || fail "fetchq: peak='$(fq peak)' with fetch-concurrency 2"
+fi
 [ "$(fq in_flight)" = "0" ] && pass "fetchq: in_flight=0 after the burst" || fail "fetchq: in_flight='$(fq in_flight)'"
 [ "$(fq places)" = "0" ] && [ "$(fq queued)" = "0" ] && pass "fetchq: places=0 and queued=0 after the burst (every place is back, nothing waits)" || fail "fetchq: places='$(fq places)' queued='$(fq queued)' after the burst"
 [ "$(fq queue_dropped)" = "0" ] && [ "$(fq queue_full)" = "0" ] && pass "fetchq: nothing was dropped at its deadline or refused for a full queue" || fail "fetchq: queue_dropped='$(fq queue_dropped)' queue_full='$(fq queue_full)'"
-[ "$(fq_hist)" -gt 0 ] 2>/dev/null && pass "fetchq: the fetches that were installed are in hist ($(fq_hist))" || fail "fetchq: hist is empty"
+if [ "$STORE" = on ]; then
+    [ "$(fq_hist)" = 0 ] && pass "fetchq: hist is empty (no fetch)" || fail "fetchq: hist=$(fq_hist) with the zones stored"
+else
+    [ "$(fq_hist)" -gt 0 ] 2>/dev/null && pass "fetchq: the fetches that were installed are in hist ($(fq_hist))" || fail "fetchq: hist is empty"
+fi
 stop_srv
 
 echo "== the default with loader-threads 4: nothing is shed, the answers are the right ones"
@@ -163,8 +184,13 @@ burst "$T/out"
 S1=$(shed)
 [ "${S1:-0}" = "0" ] && pass "nothing was shed" || fail "shed=$S1"
 settle
-[ "$(fq_hist)" -ge "$NZ" ] 2>/dev/null && pass "fetchq: hist counts the $NZ fetches ($(fq_hist)), peak=$(fq peak)" || fail "fetchq: hist=$(fq_hist) after $NZ fetches"
-[ "$(fq peak)" -ge 1 ] 2>/dev/null && [ "$(fq in_flight)" = "0" ] && pass "fetchq: peak>=1 and in_flight=0 at rest" || fail "fetchq: peak='$(fq peak)' in_flight='$(fq in_flight)'"
+if [ "$STORE" = on ]; then
+    [ "$(sattach)" -ge "$NZ" ] 2>/dev/null && [ "$(fq_hist)" = 0 ] && pass "the $NZ zones were attached from the store ($(sattach) attaches) and none was fetched" || fail "attaches '$(sattach)', hist $(fq_hist)"
+    [ "$(fq in_flight)" = "0" ] && pass "fetchq: in_flight=0 at rest" || fail "fetchq: in_flight='$(fq in_flight)'"
+else
+    [ "$(fq_hist)" -ge "$NZ" ] 2>/dev/null && pass "fetchq: hist counts the $NZ fetches ($(fq_hist)), peak=$(fq peak)" || fail "fetchq: hist=$(fq_hist) after $NZ fetches"
+    [ "$(fq peak)" -ge 1 ] 2>/dev/null && [ "$(fq in_flight)" = "0" ] && pass "fetchq: peak>=1 and in_flight=0 at rest" || fail "fetchq: peak='$(fq peak)' in_flight='$(fq in_flight)'"
+fi
 [ "$(fq places)" = "0" ] && [ "$(fq queued)" = "0" ] && pass "fetchq: places=0 and queued=0 at rest" || fail "fetchq: places='$(fq places)' queued='$(fq queued)' at rest"
 [ "$(fq loader_busy)" = "0" ] && [ "$(fq park_full)" = "0" ] && pass "fetchq: no busy reply, no full park table in a normal burst" || fail "fetchq: loader_busy='$(fq loader_busy)' park_full='$(fq park_full)'"
 if cmp -s "$T/out" "$T/expected"; then pass "all $NZ answers are the right ones (the zones of the loader's workers did not mix)"; else fail "wrong or missing answers: $(diff "$T/expected" "$T/out" | head -5 | tr '\n' ' ')"; fi
@@ -184,7 +210,11 @@ T1=$(date +%s)
 head -40 "$T/expected" > "$T/expected40"
 if cmp -s "$T/outr" "$T/expected40"; then pass "all 40 queries were answered, with the right address, in $((T1 - T0)) s"; else fail "wrong or missing answers: $(diff "$T/expected40" "$T/outr" | head -5 | tr '\n' ' ')"; fi
 [ "$(rbr)" = "0" ] && [ "$(shed)" = "0" ] && pass "refused_by_rate=0 and shed=0: the requests over the rate waited for the bucket" || fail "refused_by_rate='$(rbr)' shed='$(shed)'"
-[ "$(fq waited)" -gt 0 ] 2>/dev/null && pass "fetchq: the requests over the rate waited (waited=$(fq waited))" || fail "fetchq: waited='$(fq waited)': nothing waited at a rate of 20 for 40 zones"
+if [ "$STORE" = on ]; then
+    [ "$(fq waited)" = 0 ] && pass "fetchq: nothing waited (fetch-rate protects the loader; an attach reads the store)" || fail "fetchq: waited='$(fq waited)' with the zones stored"
+else
+    [ "$(fq waited)" -gt 0 ] 2>/dev/null && pass "fetchq: the requests over the rate waited (waited=$(fq waited))" || fail "fetchq: waited='$(fq waited)': nothing waited at a rate of 20 for 40 zones"
+fi
 settle
 [ "$(fq queued)" = "0" ] && [ "$(fq places)" = "0" ] && pass "fetchq: queued=0 and places=0 afterwards" || fail "fetchq: queued='$(fq queued)' places='$(fq places)'"
 stop_srv
@@ -201,7 +231,11 @@ udp_burst "$NZ"
 settle
 echo "  (park_full=$(fq park_full) park_timeout=$(fq park_timeout) ring_dropped=$(fq ring_dropped) table_full=$(fq table_full) loader_busy=$(fq loader_busy) peak=$(fq peak) hist=$(fq_hist) shed=$(shed) queue_peak=$(fq queue_peak) waited=$(fq waited))"
 [ "$(fq park_full)" -gt 0 ] 2>/dev/null && pass "fetchq: park_full=$(fq park_full): queries found the table of parked queries full" || fail "fetchq: park_full='$(fq park_full)' after the burst"
-[ "$(fq peak)" -ge 1 ] 2>/dev/null && [ "$(fq_hist)" -gt 0 ] 2>/dev/null && pass "fetchq: peak=$(fq peak), the fetches that went through are in hist ($(fq_hist))" || fail "fetchq: peak='$(fq peak)' hist='$(fq_hist)'"
+if [ "$STORE" = on ]; then
+    [ "$(sattach)" -ge 1 ] 2>/dev/null && pass "fetchq: the queries that got through were attaches ($(sattach)), peak=$(fq peak)" || fail "fetchq: attaches '$(sattach)' peak='$(fq peak)' hist='$(fq_hist)'"
+else
+    [ "$(fq peak)" -ge 1 ] 2>/dev/null && [ "$(fq_hist)" -gt 0 ] 2>/dev/null && pass "fetchq: peak=$(fq peak), the fetches that went through are in hist ($(fq_hist))" || fail "fetchq: peak='$(fq peak)' hist='$(fq_hist)'"
+fi
 [ "$(fq in_flight)" = "0" ] && pass "fetchq: in_flight=0 once the burst is over" || fail "fetchq: in_flight='$(fq in_flight)'"
 [ "$(fq places)" = "0" ] && pass "fetchq: places=0 once the burst is over (park_full and ring drops gave their places back)" || fail "fetchq: places='$(fq places)' once the burst is over"
 i=0; while [ $i -lt 100 ] && [ "$(q_one www.c0001.test)" != "192.0.2.2" ]; do sleep 0.1; i=$((i + 1)); done

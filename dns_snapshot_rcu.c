@@ -3129,7 +3129,7 @@ static int dbreg_commit_store(const char *view, const char *name, zone_db_entry_
     dbdir_rec_t prev;
     bool had_rec = false;
     if (!offered) {
-        had_rec = ops->rec_get(view, name, &prev);
+        had_rec = ops->rec_get(view, name, &prev) && (prev.state == 2 /* STORE_STATE_STORED */ || prev.serial != 0);      /* (a record of the reconcile that no version came for yet is no version: a first fill is no change, no NOTIFY) */
         int pr = ops->put(view, name, entry, source_id, serial, digest, ops->settings_id(store_entry_settings(entry)), &zid);
         if (pr != 0) {
             if (!created) {                       /* the zone is in memory and the store could not take its new version: it stays there, and is not taken out of memory (the record is the old version) */
@@ -4815,7 +4815,7 @@ int dbreg_delete(const char *view, const char *name, int64_t source_id) {
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
     dbreg_view_t *rv = dbreg_view_get(view, false);
     dbreg_zone_t *z = rv ? dbreg_find(rv, name, zdir_name_hash(name)) : NULL;
-    if (z && z->source_id == source_id) {
+    if (z && (source_id == 0 || z->source_id == source_id)) {      /* (0.7 WP7b: source id 0 is a delete by name: the loader found no such zone in the database) */
         /* An element that is in the index, or waits in the queue of additions, leaves the index with the next delta; any other
          * one only older snapshots can have (a rebuild hid it): it goes to the garbage at once.  Never freed here: the readers of
          * an older snapshot can have found it in the shared directory. */

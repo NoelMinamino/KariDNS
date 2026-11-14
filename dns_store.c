@@ -2113,6 +2113,41 @@ int store_set_flags(store_t *s, uint32_t zid, uint16_t set, uint16_t clear) {
   return r;
 }
 
+/* 0.7 WP7b: the version stamp (zc) and the flags (zt) of a zone, in one journal record: the database has another version than the one the record holds, or the same one again */
+int store_set_stamp(store_t *s, uint32_t zid, uint64_t gen, uint64_t time, uint16_t set, uint16_t clear) {
+  if (!s) return -EINVAL;
+  pthread_mutex_lock(&s->wlock);
+  int r;
+  r64_t rt, rc;
+  if ((uint64_t)zid >= st_zt_cap(s) || zt_state_fast(s, zid) == STORE_STATE_FREE) r = -ENOENT;
+  else if ((r = zrec_read_locked(s, zid, &rt, &rc)) == 0) {
+    zt_t t;
+    zc_t c;
+    zt_unpack(&rt, &t);
+    zc_unpack(&rc, &c);
+    uint16_t nf = (uint16_t)((t.flags | set) & ~clear);
+    if (nf != t.flags || c.stamp_gen != gen || c.stamp_time != time) {
+      jb_t *j = &s->jb;
+      jb_reset(j);
+      int64_t dr = ((nf & STORE_F_REJECTED_NEW) ? 1 : 0) - ((t.flags & STORE_F_REJECTED_NEW) ? 1 : 0);
+      t.flags = nf;
+      c.stamp_gen = gen;
+      c.stamp_time = time;
+      zt_pack(&t, &rt);
+      zc_pack(&c, &rc);
+      zrec_seal(&rt, &rc);
+      if ((r = jb_zrec(j, zid, &rt, &rc)) == 0 && dr != 0) {
+        r = jb_vadd(s, j, V_REJECTED, dr);
+        if (r == 0) r = jb_vadd(s, j, V_VIEW(t.view, 2), dr);
+      }
+      if (r == 0) r = journal_commit_apply(s);
+    }
+  }
+  if (r < 0 && r != -ENOENT) note_error(s, r); else if (r == 0) { note_ok(s); r = post_write(s); }
+  pthread_mutex_unlock(&s->wlock);
+  return r;
+}
+
 int store_view_add(store_t *s, const char *name) {
   if (!s || !name || !*name || strlen(name) > STORE_VIEW_NAME_MAX) return -EINVAL;
   pthread_mutex_lock(&s->wlock);

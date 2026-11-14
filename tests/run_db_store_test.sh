@@ -180,7 +180,7 @@ waitfor 60 stored_all && pass "the store holds all $NZ zones (written when they 
 pass_all 1 "$NZ" 1
 [ "$PASS_BAD" = 0 ] && pass "all $PASS_N queries of the first pass were answered right" || fail "$PASS_BAD of $PASS_N queries of the first pass were wrong"
 F1=$(fetches)
-[ "${F1:-0}" = 0 ] && pass "no zone was read from the loader in the first pass (the store is the directory: fetch issued=0)" || fail "fetch issued=$F1 in the first pass: $($KA dbstatus | grep -E '^(fetch|cache):')"
+[ "${F1:-0}" = "$NZ" ] && pass "every zone was read from the loader once, by the background fetch of the store protocol, and the queries of the first pass read none (fetch issued=$F1)" || fail "fetch issued=$F1 in the first pass, want $NZ (one body per zone): $($KA dbstatus | grep -E '^(fetch|cache):')"
 [ "$(sf store.attach.count)" -gt 0 ] 2>/dev/null && pass "zones were attached from the store ($(sf store.attach.count))" || fail "no attach in the first pass"
 
 echo "== the second pass: zones that are out of memory are attached from the store"

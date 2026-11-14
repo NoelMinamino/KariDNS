@@ -45,6 +45,7 @@
 
 #include "dns_config_parser.h"
 #include "dns_store.h"
+#include "dns_store_status.h"
 
 
 /* ---- the directory (the process that forks the Backend) ---- */
@@ -78,10 +79,69 @@ void db_store_batch_end(void);
 /* compatibility of the tests of S2 (the writes are made by the thread that installs the zone now: nothing is queued) */
 bool db_store_sync(int timeout_ms);
 
+/* ---- 0.7 WP7b: the loader's manifest and change entries against the store (the ingest thread; store design 5.3, 5.4) ----
+ *
+ * The loader keeps no table of the zones; it lists them (a pass: MANIFEST_BEGIN, pages, MANIFEST_END) or says which changed (CHANGES).  What the Backend does with an entry:
+ *   - a zone it does not know: a record in the state KNOWN (the name index is complete after the pass; the body is fetched in the background, or when a query asks for it);
+ *   - a zone whose version stamp (generation, changed_at of karidns_zone_state; the serial for a source without stamps; a zone without a state row is always asked for) is not the
+ *     record's: the stamp is recorded and the record is marked STORE_F_STALE (its image keeps serving until the new body is installed); a zone the record has no image for stays KNOWN;
+ *   - the same stamp: nothing.  A version that was refused (STORE_F_REJECTED_NEW) with this stamp is not asked for again;
+ *   - a zone whose id has another name (a rename) loses the old name; a name that another id holds is taken over;
+ *   - a secondary or catalog zone is a KNOWN record with STORE_F_NONSTORE: it is a zone of the heap directory (never stored, never found by a query), and the record only makes the next
+ *     start load it again.
+ * A pass marks one bit per zone id; at its end (complete) the zones of the view that the pass did not list are deleted (the sweep), unless that would delete more than 20 percent of the
+ * view's zones and more than 1,000 (decision D7, the mass-delete guard): then nothing is deleted, ERROR is logged and `karictl reload -force` (a pass that the operator asked for) deletes them.
+ * The cursor and the identity of the database are kept in the superblock per view: the first 8 bytes of the identity are the hash of the view's configuration (the store was not filled from
+ * another database), the rest is the loader's own identity. */
+typedef struct {
+  int64_t source_id;
+  const char *name;              /* canonical, with the trailing dot */
+  uint8_t kind;                  /* KDB_ZK_* (0 primary) */
+  bool stamped;                  /* the stamp is real (the zone has a karidns_zone_state row) */
+  uint64_t gen, time;
+  bool has_serial;               /* a source without stamps: the SOA serial */
+  uint32_t serial;
+  bool force;                    /* the body is wanted whatever the stamp says (a reload of the zone) */
+} db_recon_entry_t;
+/* the result of an entry */
+enum { DBR_UNSTORABLE = -2 /* the root zone, a name over 255 bytes: the store cannot hold it */, DBR_ERROR = -1, DBR_SAME = 0, DBR_NEW, DBR_CHANGED, DBR_RENAMED, DBR_PENDING /* already asked for, not here yet */, DBR_KEPT /* refused with this stamp: not asked for again */ };
+/* apply one entry (a pass entry also sets the zone's bit); *zid receives the record's zone id (STORE_NONE: none); the view's name as the registry knows it */
+int db_recon_apply(const char *view, const db_recon_entry_t *e, uint32_t *zid);
+/* a CHANGES upsert: db_recon_apply() and the count */
+int db_recon_change(const char *view, const db_recon_entry_t *e, uint32_t *zid);
+/* a pass over one view's source: false (why says why) when the store has no room for the view; force: the operator asked for this pass (the guard does not hold it back) */
+bool db_recon_begin(const char *view, uint64_t estimate, bool force, char *why, size_t whylen);
+/* one entry of the pass */
+int db_recon_entry(const db_recon_entry_t *e, uint32_t *zid);
+typedef struct { bool swept, held; uint64_t total, unlisted, deleted; uint64_t duration_ms; } db_recon_end_t;
+/* MANIFEST_END.  complete: every page was sent (else nothing is swept and no cursor is kept).  The cursor and the identity are made durable (not when the guard holds the sweep back) */
+void db_recon_end(bool complete, uint64_t n_skipped, bool cursor_valid, uint64_t cursor, const uint8_t *ident, size_t ident_len, db_recon_end_t *out);
+/* the stream ended in the middle of a pass: forget it (no sweep) */
+void db_recon_abort(void);
+/* a CHANGES delete: the zone of the source id (or of the name, when the loader has it) is deleted; 1 when something was deleted */
+int db_recon_delete(const char *view, int64_t source_id, const char *name);
+/* the cursor of a view: false when the store has none for the loader (a first fill).  ident: STORE_IDENT_MAX bytes */
+bool db_recon_cursor_get(const char *view, uint64_t *cursor, uint8_t *ident, size_t *ident_len);
+/* make the cursor durable (the entries it covers are recorded); a view whose guard holds a sweep back keeps its old cursor, so that a restart makes a pass again */
+void db_recon_cursor_put(const char *view, uint64_t cursor, const uint8_t *ident, size_t ident_len);
+/* a zone whose body is wanted (the background fetch): the records KNOWN or STALE that were not refused, the secondary and catalog records once per run.  *cursor: the zone id to continue at;
+ * budget: how many zones to look at.  1: an item; 0: the end of the store (cursor at the end); 2: the budget is used up without an item */
+typedef struct { char view[STORE_VIEW_NAME_MAX + 1]; char zone[STORE_NAME_MAX + 2]; int64_t source_id; uint32_t zid; bool nonstore; uint64_t stamp_gen, stamp_time; } db_scan_item_t;
+int db_recon_scan(uint32_t *cursor, unsigned budget, db_scan_item_t *out);
+/* the fetch of a secondary or catalog zone failed: it is wanted again at the next pass of the scan */
+void db_recon_scan_retry(uint32_t zid);
+/* the figures of the reconcile (karictl store / dbstatus) */
+typedef store_recon_t db_recon_status_t;        /* (dns_store_status.h: the report asks for it through a function) */
+void db_recon_status(db_recon_status_t *out);
+void db_recon_note_fetch(int what, uint64_t n);   /* DBR_FETCHED, DBR_FETCH_FAILED, DBR_IN_FLIGHT (a gauge) */
+enum { DBR_FETCHED = 0, DBR_FETCH_FAILED, DBR_IN_FLIGHT };
+
 /* ---- attach (the store threads) ---- */
 
 /* the attach of one request, on the calling thread (what a store thread does with every request; a test calls it too; the zone with its trailing dot) */
 void db_store_attach_zone(const char *view, const char *zone);
+/* the same for a zone that nobody waits for, on the calling thread (the control thread's NOTIFY): no siblings, marked to go first when memory-limit needs room (g_query_attach_sync) */
+void db_store_attach_zone_sync(const char *view, const char *zone);
 
 /* ---- counters (tests; `karictl store` has the counters of dns_store_status.h) ---- */
 typedef struct {

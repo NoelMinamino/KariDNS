@@ -261,6 +261,8 @@ static void karictl_usage(FILE *fp, const char *argv0) {
         "  status                      server status\n"
         "  reload                      reload the configuration and the zone files, then ask the database loader to compare\n"
         "                              its databases with the zones served (the reply returns at once: karictl dbstatus)\n"
+        "  reload -force               as reload, and the loader lists every zone of its databases again (a pass) instead of reading the change log: with the zone store it\n"
+        "                              is the release of the mass-delete guard (the zones the database no longer lists are deleted; see karictl store: store.recon.guard.*)\n"
         "  reload <zone> [view] [force]\n"
         "                              read one zone again: a zone file, or a zone of the database.  A program zone: a new plugin\n"
         "                              when its program settings in the active configuration changed; else the RELOAD line\n"

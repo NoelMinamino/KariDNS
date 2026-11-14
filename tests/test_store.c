@@ -421,6 +421,27 @@ static void test_basic(int mode) {
   store_stats(s, &st);
   CHECK_EQ(st.zones_rejected, 0);
   CHECK_EQ(store_set_flags(s, 5000, 1, 0), -ENOENT);
+  /* 0.7 WP7b: the stamp and the flags in one write (the reconcile's "the database has another version"): the zone keeps its state, serial and digest */
+  CHECK_EQ(store_set_stamp(s, z0, 7, 70, STORE_F_STALE | STORE_F_REJECTED_NEW, 0), 0);
+  store_read_lock();
+  CHECK_EQ(store_zone_get(s, z0, &zi), 0);
+  CHECK_EQ(zi.stamp_gen, 7);
+  CHECK_EQ(zi.stamp_time, 70);
+  CHECK_EQ(zi.state, STORE_STATE_KNOWN);
+  CHECK_EQ(zi.flags & (STORE_F_STALE | STORE_F_REJECTED_NEW), STORE_F_STALE | STORE_F_REJECTED_NEW);
+  store_read_unlock();
+  store_stats(s, &st);
+  CHECK_EQ(st.zones_rejected, 1);
+  CHECK_EQ(st.views[0].rejected, 1);
+  CHECK_EQ(store_set_stamp(s, z0, 8, 80, 0, STORE_F_STALE | STORE_F_REJECTED_NEW), 0);
+  store_read_lock();
+  CHECK_EQ(store_zone_get(s, z0, &zi), 0);
+  CHECK_EQ(zi.stamp_gen, 8);
+  CHECK_EQ(zi.flags & (STORE_F_STALE | STORE_F_REJECTED_NEW), 0);
+  store_read_unlock();
+  store_stats(s, &st);
+  CHECK_EQ(st.zones_rejected, 0);
+  CHECK_EQ(store_set_stamp(s, 5000, 1, 1, 0, 0), -ENOENT);
   check_consistent(s, "basic 1");
 
   /* the source key belongs to one zone */

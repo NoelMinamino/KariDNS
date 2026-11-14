@@ -131,6 +131,8 @@ typedef struct ing_job {
   bool iv_valid;                         /* a fetch of the whole zone: the version the directory had when the request was made (the zone is not installed if it has another by now) */
   int64_t iv_sid;
   uint32_t iv_serial;
+  bool iv_st_valid;                      /* 0.7 WP7b: the stamp of the store's record when the request was made: a body for another stamp (the database changed again, or the zone is gone) is dropped */
+  uint64_t iv_st_gen, iv_st_time;
 } ing_job_t;
 
 /* a fetch in flight: sent to the loader on the fetch stream, not answered yet */
@@ -148,6 +150,14 @@ typedef struct {
   bool placed;                           /* B2 W5: it holds a place of the pool of fetch-concurrency (park_place_take()), given back when the fetch is over */
   bool hot;                              /* a zone of the hot list (D1a step 7): counted in the warm-up progress */
   uint32_t hrank;                        /* of the hot list: how many zones of the list were asked for before this one (the list is read in its order) */
+  int64_t sid;                           /* 0.7 WP7b: the domain id the request names (FETCH_REQ tag 8; 0 = none) */
+  bool st_valid;                         /* ... the stamp of the store's record when the request was made (see ing_job_t.iv_st_valid) */
+  uint64_t st_gen, st_time;
+  bool bulk;                             /* asked for by the background fetch of the wanted bodies (the scan of the store), not by a query */
+  bool nonstore;                         /* ... a secondary or catalog zone (it has a record that only remembers it) */
+  bool loader_failed;                    /* the loader answered ZONE_FAILED (not "busy"): the zone is marked refused until its stamp changes */
+  bool reqfetch;                         /* the fetch of the zone a `karictl reload <zone>` asks for: the answer of the request waits for it */
+  uint32_t bzid;
   int64_t sent_ms;
   char view_name[KARIDNS_VIEW_NAME_MAX];
   char zone[DNS_NAME_TEXT_SIZE];
@@ -227,6 +237,7 @@ typedef struct {
     char view_name[KARIDNS_VIEW_NAME_MAX];
     char zone[DNS_NAME_TEXT_SIZE];
     int grp;                   /* >= 0: one view of a request that asks every view (grps[grp]) */
+    bool force;                /* 0.7 WP7b: `reload -force`: its pass is not held back by the mass-delete guard */
   } reqs[ING_REQ_MAX];
   /* B6b: `reload <zone>` without a view while several views take database zones: one RELOAD_REQ per view (ids with the
    * top bit set, so they cannot clash with the control thread's), one combined answer for the control thread */
@@ -239,6 +250,32 @@ typedef struct {
     char text[200];
   } grps[ING_REQ_MAX];
   uint64_t sub_seq;
+  /* 0.7 WP7b, the store protocol: negotiated by HELLO features and CONFIG store_proto.  The loader lists the zones (MANIFEST) or the changes (CHANGES); the bodies are fetched
+   * (the scan of the store below, or a query) */
+  uint32_t loader_feat;        /* HELLO features of this loader */
+  bool store_proto;
+  bool man_skip;               /* inside a MANIFEST pass that is not applied (the view or the store refuses it) */
+  uint32_t man_n;              /* entries of the pass (for the log line) */
+  bool bg_on, bg_again;        /* the background fetch of the wanted bodies is going / must go through the store once more when it ends */
+  uint32_t bg_zid;             /* ... the zone id it has reached */
+  uint32_t bg_fail;            /* ... the bodies of this round that could not be brought */
+  int64_t bg_retry_ms;         /* ... no new round before this time (a round with failures is made again) */
+  bool bg_idle_logged;
+  bool batch_force;              /* the batch answers a `karictl reload -force`: its pass is not held back by the mass-delete guard */
+  uint64_t all_force_id;       /* the request id of the last `reload -force` of everything */
+  bool ch_failed;                /* an entry of this pass / drain could not be recorded: its cursor is not kept */
+  uint32_t nbulk;                /* fetches of the wanted bodies in flight */
+  bool rf_has;                   /* what the job of the request fetch became (fetch_job_finish() to fetch_complete()) */
+  uint64_t rf_id;
+  uint8_t rf_status;
+  uint32_t rf_serial;
+  char rf_reason[KDB_REASON_LEN];
+  bool req_wait;               /* the zone of the request the batch answers is being fetched: the batch is not answered before it is here */
+  uint64_t req_fetch_id;
+  bool defer_end;              /* BATCH_END has come and the answer is held for it */
+  uint64_t defer_batch;
+  int64_t defer_ms;
+  uint32_t b_unchanged;        /* manifest entries and changes that needed nothing */
   int cur_req;                 /* the request the current batch answers (BATCH_BEGIN request_id), -1 = none */
   int req_outcome;             /* what the batch did to the requested zone: ROUT_* */
   uint32_t req_serial;
@@ -592,6 +629,9 @@ static bool build_config(ing_t *g, ing_cfg_t *snap) {
   if (cfg && cfg->database.enabled) {
     const database_config_t *db = &cfg->database;
     bool sqlite = db->driver && strcmp(db->driver, "sqlite3") == 0;
+    /* 0.7 WP7b: the store protocol needs the store (it keeps the cursors and the records) and a loader that speaks it (HELLO features bit 0) */
+    const bool store_proto = db_store_enabled() && (g->loader_feat & KDB_FEAT_STORE) != 0;
+    g->store_proto = store_proto;
     fill_snap(cfg, snap);
     if (g->view_names) {   /* the table of the previous CONFIG goes to the history (the loader may still read with it) */
       free(g->vhist[ING_VIEW_HIST - 1].names);
@@ -635,6 +675,16 @@ static bool build_config(ing_t *g, ing_cfg_t *snap) {
       kdb_enc_u64(&g->enc, 9, db->max_zone_bytes);
       /* B6b (design 7.1): a view on the global source gets the zones karidns_domain_views maps to it */
       if (sqlite ? !v->database_file : !v->database_schema) kdb_enc_u8(&g->enc, 10, 1);
+      if (store_proto) {                                    /* 0.7 WP7b: the cursor of the change log and the identity of the database it belongs to, as the store has them */
+        uint64_t cur = 0;
+        uint8_t ident[KDB_IDENT_MAX];
+        size_t il = 0;
+        if (v->name && db_recon_cursor_get(v->name, &cur, ident, &il) && il <= KDB_IDENT_MAX) {
+          kdb_enc_u64(&g->enc, 11, cur);
+          kdb_enc_u8(&g->enc, 12, 1);
+          if (il) kdb_enc_bytes(&g->enc, 13, ident, il);
+        }
+      }
       kdb_enc_nest_end(&g->enc);
     }
     kdb_enc_u32(&g->enc, 5, db->default_ttl);
@@ -642,6 +692,7 @@ static bool build_config(ing_t *g, ing_cfg_t *snap) {
     kdb_enc_u32(&g->enc, 7, db->loader_threads);
     if (db->memory_limit && !dbdir()) kdb_enc_u8(&g->enc, 8, 1);       /* D1a milestone 4: the directory only for the zones that are not in memory (design 3.3); with the zone store (S3) the store is the directory and a zone is sent whole */
     kdb_enc_u8(&g->enc, 9, db->signer_wait ? 1 : 0);        /* 0.6.0 item C: a changed zone of the signer waits for the signer */
+    if (store_proto) kdb_enc_u8(&g->enc, 10, 1);            /* 0.7 WP7b: the store protocol (no INVENTORY: the loader lists the zones or the changes, the Backend asks for the bodies) */
     ok = kdb_enc_end(&g->enc) == 0 && !too_many && idx <= 0xFFFF &&(snap->nviews == 0 || (g->view_names && g->view_db));
   }
   rcu_aux_read_unlock();
@@ -1135,6 +1186,17 @@ static void job_execute(ing_job_t *j) {
    * out of memory, and this is the data of it).  A directory that did not change since the request takes what the fetch brings: it may be newer than the directory
    * (the loader has not announced it yet), and dropping it would repeat the request until the loader does.  The jobs of one zone do not run at the same time
    * (name_in_flight()), so the check and the install see the same registry. */
+  if (j->fetch_id && j->iv_st_valid && dbdir()) {
+    /* 0.7 WP7b: the body is the version the record asked for when the request was made.  A record that has another stamp now (the database changed again: that body is asked for
+     * on its own) or none (the zone was deleted meanwhile: it must not come back) takes nothing from this one. */
+    dbdir_rec_t rec;
+    if (!dbdir()->rec_get(j->view_name, j->zone, &rec) || rec.stamp_gen != j->iv_st_gen || rec.stamp_time != j->iv_st_time) {
+      j->status = KDB_ST_UNCHANGED;
+      db_zone_build_free(j->build);
+      j->build = NULL;
+      return;
+    }
+  }
   if (j->fetch_id && j->iv_valid) {
     int64_t sid;
     uint32_t sr;
@@ -1593,6 +1655,10 @@ static void drop_stream(ing_t *g) {
   g->out_len = g->out_off = 0;
   g->hello_done = false;
   g->inv_active = false;
+  db_recon_abort();                           /* 0.7 WP7b: a pass that was cut off sweeps nothing */
+  g->man_skip = false;
+  g->defer_end = false;                       /* (the loader that waited for BATCH_RESULT is gone) */
+  g->req_wait = false;
   g->need_cleanup = true;                     /* zones in flight are finished by the main loop, not from here */
   kdb_enc_reset(&g->enc);
   if (atomic_exchange_explicit(&g_st.connected, false, memory_order_relaxed))
@@ -1680,9 +1746,19 @@ static void on_hello(ing_t *g, const kdb_msg_t *m) {
   atomic_store_explicit(&g_st.connected, true, memory_order_relaxed);
   as_reset();
   g->hello_done = true;
+  g->loader_feat = h->features;
+  g->bg_on = false;
   send_config(g, "handshake");
   g->debug_sent = -1;                                  /* 0.7 M2: a new loader learns the level in force after its CONFIG */
   send_debug(g);
+  if (g->store_proto) {                                /* 0.7 WP7b: the records the store holds that have no body (an interrupted fill, a changed zone, a secondary zone: they are heap zones) are fetched once now */
+    g->bg_on = true;
+    g->bg_zid = 0;
+    g->bg_again = false;
+    g->bg_fail = 0;
+    g->bg_retry_ms = 0;
+    syslog(LOG_INFO, "[DB] the store protocol is on for this loader (it lists the zones, the Backend asks for the bodies)");
+  }
 }
 
 /* ---- INVENTORY: the registry, a few hundred entries at a time so the output queue never holds all of it ---- */
@@ -1812,7 +1888,12 @@ static void pump_inventory(ing_t *g) {
   }
 }
 
+static void protocol_error(ing_t *g, const char *reason);
 static void on_inventory_req(ing_t *g) {
+  if (g->store_proto) {                                /* 0.7 WP7b: the store protocol has no inventory (the loader keeps no table of the zones) */
+    protocol_error(g, "INVENTORY_REQ with the store protocol on");
+    return;
+  }
   g->inv_active = true;
   memset(&g->inv_cur, 0, sizeof(g->inv_cur));
   g->inv_sent = 0;
@@ -1832,7 +1913,9 @@ static void on_batch_begin(ing_t *g, const kdb_msg_t *m) {
   g->batch_id = m->u.batch_begin.batch_id;
   batch_table_begin(g, m->u.batch_begin.cfg_generation);
   g->batch_kind = m->u.batch_begin.kind;
-  g->b_applied = g->b_rejected = g->b_shadowed = g->b_deleted = g->b_failed = 0;
+  g->b_applied = g->b_rejected = g->b_shadowed = g->b_deleted = g->b_failed = g->b_unchanged = 0;
+  g->ch_failed = false;
+  g->man_skip = false;
   clear_profiles(g);                                     /* B7a: the profiles of the previous batch */
   g->rejects_logged = 0;
   g->shadows_logged = 0;
@@ -1845,6 +1928,7 @@ static void on_batch_begin(ing_t *g, const kdb_msg_t *m) {
     for (int i = 0; i < ING_REQ_MAX; i++)
       if (g->reqs[i].active && g->reqs[i].id == m->u.batch_begin.request_id) g->cur_req = i;
   }
+  g->batch_force = m->u.batch_begin.request_id != 0 && (m->u.batch_begin.request_id == g->all_force_id || (g->cur_req >= 0 && g->reqs[g->cur_req].force));
   atomic_store_explicit(&g_st.batch_id, g->batch_id, memory_order_relaxed);
   atomic_store_explicit(&g_st.batch_kind, g->batch_kind, memory_order_relaxed);
   atomic_store_explicit(&g_st.batch_done, false, memory_order_relaxed);
@@ -2137,6 +2221,22 @@ static void on_zone_delete(ing_t *g, const kdb_msg_t *m) {
   send_zone_result(g, zd->view, zd->name, st, NULL);
 }
 
+/* the answer to the loader: BATCH_RESULT (the entries are recorded in the store; the bodies are not waited for, except that of a one-zone reload) */
+static void batch_finish(ing_t *g, uint64_t batch_id) {
+  g->defer_end = false;
+  answer_request(g);
+  g->in_batch = false;
+  batch_table_end(g);
+  kdb_enc_reset(&g->enc);
+  if (kdb_enc_begin(&g->enc, KDB_T_BATCH_RESULT) != 0 || kdb_enc_u64(&g->enc, 1, batch_id) != 0 ||
+      kdb_enc_u32(&g->enc, 3, g->b_applied + g->b_shadowed) != 0 || kdb_enc_u32(&g->enc, 4, g->b_unchanged) != 0 ||
+      kdb_enc_u32(&g->enc, 5, g->b_rejected) != 0 || kdb_enc_u32(&g->enc, 6, g->b_deleted) != 0 ||
+      kdb_enc_end(&g->enc) != 0) {
+    g->enc.err = true;
+  }
+  send_enc(g);
+}
+
 static void on_batch_end(ing_t *g, const kdb_msg_t *m) {
   const kdb_batch_end_t *b = &m->u.batch_end;
   sync_all(g);
@@ -2159,21 +2259,24 @@ static void on_batch_end(ing_t *g, const kdb_msg_t *m) {
     /* the loader may have sent nothing (a restarted loader finds the Backend up to date): count the registry */
     size_t total, rej, shc, shk;
     dbreg_counts2(&total, &rej, &shc, &shk);
-    syslog(LOG_INFO, "[DB] initial load complete: %zu zone(s) served from the database", total);
+    if (dbdir()) total = (size_t)dbdir()->counters(0);       /* 0.7: the zone store is the directory (the registry holds only the zones in memory) */
+    if (g->store_proto) {
+      db_recon_status_t rs;
+      db_recon_status(&rs);
+      syslog(LOG_INFO, "[DB] initial load complete: %zu zone(s) served from the database (%llu of them still without a body: fetched in the background, or when a query asks for it)", total, (unsigned long long)rs.known_now);
+    } else {
+      syslog(LOG_INFO, "[DB] initial load complete: %zu zone(s) served from the database", total);
+    }
   }
   if (g->batch_kind == KDB_BATCH_STARTUP || g->batch_kind == KDB_BATCH_FULL)
     atomic_store_explicit(&g_ma_event, true, memory_order_relaxed);        /* 0.7 P-F: the cache thread says what the database needs */
-  answer_request(g);
-  g->in_batch = false;
-  batch_table_end(g);
-  kdb_enc_reset(&g->enc);
-  if (kdb_enc_begin(&g->enc, KDB_T_BATCH_RESULT) != 0 || kdb_enc_u64(&g->enc, 1, b->batch_id) != 0 ||
-      kdb_enc_u32(&g->enc, 3, g->b_applied + g->b_shadowed) != 0 || kdb_enc_u32(&g->enc, 4, 0) != 0 ||
-      kdb_enc_u32(&g->enc, 5, g->b_rejected) != 0 || kdb_enc_u32(&g->enc, 6, g->b_deleted) != 0 ||
-      kdb_enc_end(&g->enc) != 0) {
-    g->enc.err = true;
+  if (g->req_wait) {                                     /* 0.7 WP7b: a reload of one zone: the body is being fetched, and the answer says what became of it: the loader (it waits for BATCH_RESULT) and the request wait for it */
+    g->defer_end = true;
+    g->defer_batch = b->batch_id;
+    g->defer_ms = now_ms();
+    return;
   }
-  send_enc(g);
+  batch_finish(g, b->batch_id);
 }
 
 /* B9: the loader's report on auto reload, one entry per view that has it on */
@@ -2243,6 +2346,194 @@ static void on_hot_ack(const kdb_msg_t *m) {
   if (a->status == KDB_HA_FAILED) syslog(LOG_WARNING, "[DB] the loader could not write its state file: %.*s", (int)a->error.len, a->error.p ? a->error.p : "");
 }
 
+/* ------------------------------------------------------------------------------------------------------------- */
+/* the store protocol (0.7 WP7b, store design 5.3, 5.4): the loader lists the zones, the Backend decides what it wants */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* the background fetch of the wanted bodies has work: the scan of the store starts (or goes through the store once more when it ends) */
+static void bulk_kick(ing_t *g) {
+  if (!g->store_proto) return;
+  if (!g->bg_on) {
+    g->bg_on = true;
+    g->bg_zid = 0;
+    g->bg_fail = 0;
+    g->bg_again = false;
+    g->bg_retry_ms = 0;
+    g->bg_idle_logged = false;
+  } else {
+    g->bg_again = true;
+  }
+}
+
+/* what an entry became, in the numbers of the batch (BATCH_RESULT, dbstatus); true: a body is wanted */
+static bool entry_note(ing_t *g, int r, const char *zone, bool *unstorable_logged) {
+  switch (r) {
+  case DBR_NEW:
+  case DBR_CHANGED:
+  case DBR_RENAMED:
+    g->b_applied++;
+    atomic_fetch_add_explicit(&g_st.tot_applied, 1, memory_order_relaxed);
+    return true;
+  case DBR_PENDING:
+    g->b_applied++;
+    return true;
+  case DBR_SAME:
+  case DBR_KEPT:
+    g->b_unchanged++;
+    return false;
+  case DBR_UNSTORABLE:
+    g->b_rejected++;
+    atomic_fetch_add_explicit(&g_st.tot_rejected, 1, memory_order_relaxed);
+    if (!*unstorable_logged) {
+      *unstorable_logged = true;
+      syslog(LOG_WARNING, "[DB] zone '%s' cannot be kept in the zone store (the root zone, or a name over 255 bytes): it is not loaded while the store protocol is on (`store none;` in the database block turns the store off)", zone);
+    }
+    return false;
+  default:
+    g->b_rejected++;
+    atomic_fetch_add_explicit(&g_st.tot_rejected, 1, memory_order_relaxed);
+    g->ch_failed = true;
+    return false;
+  }
+}
+
+static void on_manifest_begin(ing_t *g, const kdb_msg_t *m) {
+  const kdb_manifest_begin_t *mb = &m->u.manifest_begin;
+  g->man_skip = true;
+  g->man_n = 0;
+  if (!g->store_proto) {
+    protocol_error(g, "MANIFEST_BEGIN with the store protocol off");
+    return;
+  }
+  const char *vname = view_name_at(g, mb->view, true);
+  if (!vname[0]) {
+    syslog(LOG_WARNING, "[DB] a manifest pass for view %u, which the configuration does not have; it is ignored", (unsigned)mb->view);
+    return;
+  }
+  const bool force = g->batch_force;
+  char why[160];
+  if (!db_recon_begin(vname, mb->count, force, why, sizeof(why))) {
+    syslog(LOG_ERR, "[DB] view '%s': the manifest pass cannot be applied: %s", vname, why);
+    return;
+  }
+  g->man_skip = false;
+  syslog(LOG_INFO, "[DB] view '%s': a manifest pass starts (the loader lists every zone of its source, about %llu)%s", vname, (unsigned long long)mb->count,
+         force ? "; asked for by the operator (karictl reload -force)" : "");
+}
+
+static void on_manifest(ing_t *g, const kdb_msg_t *m) {
+  if (g->man_skip) return;
+  kdb_iter_t it;
+  kdb_manifest_entry_t e;
+  burst_yield_t by = BURST_YIELD_INIT;
+  bool wanted = false, unst = false;
+  uint32_t n = 0;
+  kdb_manifest_entries(m, &it);
+  while (kdb_manifest_entries_next(&it, &e)) {
+    db_recon_entry_t re;
+    memset(&re, 0, sizeof(re));
+    re.source_id = e.source_id;
+    re.name = e.name;
+    re.kind = e.kind;
+    re.stamped = e.stamped;
+    re.gen = e.stamp_gen;
+    re.time = e.stamp_time;
+    re.has_serial = e.has_serial;
+    re.serial = e.serial;
+    uint32_t zid;
+    int r = db_recon_entry(&re, &zid);
+    g->man_n++;
+    wanted |= entry_note(g, r, e.name, &unst);
+    if ((++n & 1023) == 0) burst_yield_check(&by);
+  }
+  if (wanted) bulk_kick(g);
+}
+
+static void on_manifest_end(ing_t *g, const kdb_msg_t *m) {
+  const kdb_manifest_end_t *me = &m->u.manifest_end;
+  if (g->man_skip) {
+    g->man_skip = false;
+    return;
+  }
+  if (me->n_entries != g->man_n) syslog(LOG_WARNING, "[DB] the manifest pass says %llu entries and the Backend saw %u", (unsigned long long)me->n_entries, g->man_n);
+  db_recon_end_t out;
+  if (g->ch_failed) syslog(LOG_ERR, "[DB] view '%s': an entry of the pass could not be recorded; the cursor is not kept, the next start lists the zones again", view_name_at(g, me->view, true));
+  db_recon_end(me->complete, me->n_skipped, me->cursor_valid && !g->ch_failed, me->cursor, me->ident_len ? me->ident : NULL, me->ident_len, &out);
+  db_recon_status_t st;
+  db_recon_status(&st);
+  g->b_deleted += (uint32_t)out.deleted;
+  atomic_fetch_add_explicit(&g_st.tot_deleted, out.deleted, memory_order_relaxed);
+  syslog(LOG_INFO, "[DB] view '%s': the manifest pass is over after %llu ms: %llu zone(s) listed (%llu new, %llu changed, %llu renamed, %llu already asked for, %llu unchanged, %llu refused with this "
+                   "version), %llu not offered by the loader, %llu of the %llu zone(s) the Backend held for the view were not listed and %s",
+         st.view, (unsigned long long)out.duration_ms, (unsigned long long)st.entries, (unsigned long long)st.created, (unsigned long long)st.changed, (unsigned long long)st.renamed,
+         (unsigned long long)st.pending, (unsigned long long)st.same, (unsigned long long)st.kept, (unsigned long long)st.skipped, (unsigned long long)out.unlisted,
+         (unsigned long long)out.total, out.held ? "NOT deleted (the mass-delete guard)" : out.swept ? "deleted" : me->complete ? "none was" : "no sweep was made (the pass was not complete)");
+  g->ch_failed = false;
+}
+
+/* the zone a `karictl reload <zone>` asks for is being fetched now: the answer of the request waits for it (BATCH_RESULT is held, on_batch_end()) */
+static void req_fetch_start(ing_t *g, uint16_t view, const char *view_name, const char *zone, int64_t sid, bool nonstore);
+
+static void on_changes(ing_t *g, const kdb_msg_t *m) {
+  const kdb_changes_t *c = &m->u.changes;
+  if (!g->store_proto) {
+    protocol_error(g, "CHANGES with the store protocol off");
+    return;
+  }
+  const char *vname = view_name_at(g, c->view, true);
+  if (!vname[0]) {
+    syslog(LOG_WARNING, "[DB] changes for view %u, which the configuration does not have; they are ignored", (unsigned)c->view);
+    return;
+  }
+  kdb_iter_t it;
+  kdb_changes_entry_t e;
+  burst_yield_t by = BURST_YIELD_INIT;
+  bool wanted = false, unst = false;
+  uint32_t n = 0;
+  kdb_changes_entries(m, &it);
+  while (kdb_changes_entries_next(&it, &e)) {
+    if (e.op == KDB_CH_DELETE) {
+      if (e.has_name) drain_name(g, vname, e.name);        /* (a zone of the same name may be in flight) */
+      if (db_recon_delete(vname, e.source_id, e.has_name ? e.name : NULL) > 0) {
+        g->b_deleted++;
+        atomic_fetch_add_explicit(&g_st.tot_deleted, 1, memory_order_relaxed);
+        if (g->cur_req >= 0 && g->reqs[g->cur_req].view == c->view && e.has_name && domain_names_match_ci(g->reqs[g->cur_req].zone, e.name)) g->req_outcome = ROUT_DELETED;
+        logev_post(LOGC_DATABASE, 1, NULL, 0, "[DB] zone '%s' (view '%s', id %lld) deleted", e.has_name ? e.name : "?", vname, (long long)e.source_id);
+      } else {
+        g->b_unchanged++;
+      }
+      continue;
+    }
+    db_recon_entry_t re;
+    memset(&re, 0, sizeof(re));
+    re.source_id = e.source_id;
+    re.name = e.name;
+    re.kind = e.kind;
+    re.stamped = e.stamped;
+    re.gen = e.stamp_gen;
+    re.time = e.stamp_time;
+    re.has_serial = e.has_serial;
+    re.serial = e.serial;
+    /* the loader marks the entry of a one-zone reload FORCE; the body is read whatever the stamp says only when the operator said `force` (karictl reload <zone> force): without it the stamp decides, and
+     * a zone that did not change is "unchanged" and is not read, whether or not its data is in memory */
+    const bool is_req = g->cur_req >= 0 && g->reqs[g->cur_req].view == c->view && domain_names_match_ci(g->reqs[g->cur_req].zone, e.name);
+    re.force = e.force && (!is_req || g->reqs[g->cur_req].force);
+    uint32_t zid;
+    int r = db_recon_change(vname, &re, &zid);
+    bool w = entry_note(g, r, e.name, &unst);
+    wanted |= w;
+    if (w && is_req)
+      req_fetch_start(g, c->view, vname, e.name, e.source_id, e.kind != KDB_ZK_PRIMARY);
+    if ((++n & 1023) == 0) burst_yield_check(&by);
+  }
+  if (c->last) {                                           /* the drain is complete up to this cursor, and every entry is in the store: it may be made durable */
+    if (g->ch_failed) syslog(LOG_ERR, "[DB] view '%s': an entry of the changes could not be recorded; the cursor is not kept, the next start reads the changes again", vname);
+    else db_recon_cursor_put(vname, c->cursor, c->ident_len ? c->ident : NULL, c->ident_len);
+    g->ch_failed = false;
+  }
+  if (wanted) bulk_kick(g);
+}
+
 static void handle_msg(ing_t *g, const kdb_msg_t *m) {
   switch (m->type) {
   case KDB_T_HELLO:
@@ -2275,6 +2566,18 @@ static void handle_msg(ing_t *g, const kdb_msg_t *m) {
     break;
   case KDB_T_BATCH_END:
     on_batch_end(g, m);
+    break;
+  case KDB_T_MANIFEST_BEGIN:
+    on_manifest_begin(g, m);
+    break;
+  case KDB_T_MANIFEST:
+    on_manifest(g, m);
+    break;
+  case KDB_T_MANIFEST_END:
+    on_manifest_end(g, m);
+    break;
+  case KDB_T_CHANGES:
+    on_changes(g, m);
     break;
   case KDB_T_PROFILE:
     on_profile(g, m);
@@ -2612,6 +2915,7 @@ static void request_all_views(ing_t *g, const rq_item_t *it, const char *canon) 
     int slot = slots[k++];
     g->reqs[slot].active = true;
     g->reqs[slot].id = (1ULL << 63) | ++g->sub_seq;
+    g->reqs[slot].force = it->force;
     g->reqs[slot].grp = gi;
     g->reqs[slot].view = (uint16_t)v;
     snprintf(g->reqs[slot].view_name, sizeof(g->reqs[slot].view_name), "%s", g->view_names[v]);
@@ -2633,6 +2937,7 @@ static void process_requests(ing_t *g) {
     case RQ_ALL:
       if (ready) {
         send_reload_req(g, it.id, true, 0, NULL, it.force);
+        if (it.force) g->all_force_id = it.id;
         syslog(LOG_NOTICE, "[DB] reload requested (request %llu): the loader compares every source with the zones served",
                (unsigned long long)it.id);
       } else {
@@ -2674,6 +2979,7 @@ static void process_requests(ing_t *g) {
       }
       g->reqs[slot].active = true;
       g->reqs[slot].id = it.id;
+      g->reqs[slot].force = it.force;
       g->reqs[slot].grp = -1;
       g->reqs[slot].view = (uint16_t)vi;
       snprintf(g->reqs[slot].view_name, sizeof(g->reqs[slot].view_name), "%s", g->view_names[vi]);
@@ -2876,6 +3182,7 @@ static bool fetch_send_req(ing_t *g, const ing_freq_t *r) {
   kdb_enc_reset(&g->fenc);
   if (kdb_enc_begin(&g->fenc, KDB_T_FETCH_REQ) != 0 || kdb_enc_u64(&g->fenc, 1, r->id) != 0 || kdb_enc_u16(&g->fenc, 2, r->view) != 0 ||
       kdb_enc_name(&g->fenc, 3, r->zone) != 0 || kdb_enc_u8(&g->fenc, 4, r->prio) != 0 || kdb_enc_u8(&g->fenc, 5, r->mode) != 0 ||
+      (g->store_proto && r->sid != 0 && r->mode == KDB_FETCH_FULL && kdb_enc_i64(&g->fenc, 8, r->sid) != 0) ||        /* 0.7 WP7b: the domain id the record holds (the loader answers ZONE_FAILED for another one) */
       kdb_enc_end(&g->fenc) != 0)
     g->fenc.err = true;
   return fetch_queue(g);
@@ -2895,6 +3202,73 @@ static ing_freq_t *fetch_find_zone(ing_t *g, uint16_t view, const char *zone, ui
     if (g->freq[i].active && g->freq[i].view == view && g->freq[i].mode == mode && domain_names_match_ci(g->freq[i].zone, zone)) return &g->freq[i];
   return NULL;
 }
+
+/* 0.7 WP7b: the stamp of the store's record of the zone (and its domain id, when the request has none) at the time of the request: the body that comes is installed only while the record has it */
+static void freq_stamp(ing_freq_t *r, const char *view, const char *zone) {
+  dbdir_rec_t rec;
+  if (dbdir() && dbdir()->rec_get(view, zone, &rec)) {
+    r->st_valid = true;
+    r->st_gen = rec.stamp_gen;
+    r->st_time = rec.stamp_time;
+    if (r->sid == 0) r->sid = rec.source_id;
+  }
+}
+
+/* The next body the reconcile wants (the scan of the store, db_recon_scan(): the records without an image, the ones whose version the database changed, the secondary and catalog
+ * zones once a run), as a fetch request of the lowest priority.  Only when the fetches in flight leave room (a part of fetch-concurrency: the queries have the rest), and in
+ * slices, so that a store of ten million records is not looked at in one go.  A round with failures is made again after a pause; a round that finds nothing ends the work (bg_on).
+ * *back: where the scan stood before the zone, for a request that cannot be made now. */
+#define ING_BULK_NFREQ 32          /* fetches of the wanted bodies in flight (at most half of fetch-concurrency) */
+#define ING_BULK_LOOK 4096         /* records the scan looks at in one call */
+static bool bulk_take(ing_t *g, park_fetch_req_t *q, uint32_t *zid, uint32_t *back, bool *np, int64_t *sid) {
+  if (!g->bg_on || g->fetch_fd < 0 || !dbdir()) return false;
+  if (g->bg_retry_ms && now_ms() < g->bg_retry_ms) return false;
+  if (g->nfreq >= fetch_sub_limit(ING_BULK_NFREQ)) return false;
+  for (int round = 0; round < 4; round++) {
+    db_scan_item_t it;
+    *back = g->bg_zid;
+    int rc = db_recon_scan(&g->bg_zid, ING_BULK_LOOK, &it);
+    if (rc == 2) continue;
+    if (rc == 0) {                                       /* the end of the store */
+      if (g->bg_again) {
+        g->bg_again = false;
+        g->bg_zid = 0;
+      } else if (g->bg_fail > 0) {
+        g->bg_retry_ms = now_ms() + 5000;
+        g->bg_zid = 0;
+        g->bg_fail = 0;
+      } else {
+        g->bg_on = false;
+        if (!g->bg_idle_logged) {
+          g->bg_idle_logged = true;
+          logev_post(LOGC_DATABASE, 1, NULL, 0, "[DB] the bodies the reconcile wanted are all asked for");
+        }
+      }
+      return false;
+    }
+    int vi = -1;
+    for (uint32_t i = 0; i < g->nview_names; i++)
+      if (g->view_db && g->view_db[i] && strcasecmp(g->view_names[i], it.view) == 0) {
+        vi = (int)i;
+        break;
+      }
+    if (vi < 0 || fetch_find_zone(g, (uint16_t)vi, it.zone, KDB_FETCH_FULL)) continue;      /* a view that left the configuration, or the body is on its way already */
+    memset(q, 0, sizeof(*q));
+    q->worker = -1;
+    snprintf(q->view, sizeof(q->view), "%s", it.view);
+    snprintf(q->zone, sizeof(q->zone), "%s", it.zone);
+    q->prio = KDB_FETCH_PRIO_BACKGROUND;
+    q->mode = KDB_FETCH_FULL;
+    *zid = it.zid;
+    *np = it.nonstore;
+    *sid = it.source_id;
+    return true;
+  }
+  g->fmore = true;                                       /* (the scan has not finished: look again after the streams were served) */
+  return false;
+}
+
+static void req_fetch_done(ing_t *g, const ing_freq_t *done, bool ok, const char *why);
 
 /* the request is over.  ok: the zone (or its summary) was received and installed; else the queries that wait for it are answered at once. */
 static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
@@ -2920,6 +3294,22 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
   else
     logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] fetch %llu of zone '%s' (view '%s') done in %lld ms%s", (unsigned long long)done.id, done.zone, done.view_name,
                (long long)(now_ms() - done.sent_ms), done.dropped ? ": unchanged, the version in memory stays" : "");
+  if (done.bulk) {                                       /* 0.7 WP7b: the background fetch of the wanted bodies */
+    if (g->nbulk) g->nbulk--;
+    db_recon_note_fetch(DBR_IN_FLIGHT, g->nbulk);
+    if (ok) {
+      db_recon_note_fetch(DBR_FETCHED, 1);
+    } else {
+      db_recon_note_fetch(DBR_FETCH_FAILED, 1);
+      if (!done.loader_failed) g->bg_fail++;             /* (a busy or lost loader: the round is made again; a zone the loader cannot read is marked refused below) */
+      if (done.nonstore && !done.loader_failed) db_recon_scan_retry(done.bzid);
+    }
+  }
+  if (!ok && done.loader_failed && dbdir()) {            /* the loader cannot read the zone: the record is marked refused (not asked for again before the database says another version) */
+    dbdir_rec_t rec;
+    if (dbdir()->rec_get(done.view_name, done.zone, &rec)) dbdir()->note_flags(rec.zid, STORE_F_REJECTED_NEW, 0);
+  }
+  req_fetch_done(g, &done, ok, why);
   if (dbreg_pending_count() > 0) apply_delta(g);         /* a zone that was new to the index becomes visible before its queries are woken */
   if (ok && !done.quiet && done.mode == KDB_FETCH_FULL) dbreg_touch_loaded(done.view_name, done.zone);
   /* a zone that only a background fetch (a CNAME or glue that leads into it, step 8) brought is the first to go when memory-limit needs room (BGLOAD): N cold name
@@ -2930,10 +3320,82 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
    * with no queries yet is the cache manager's first victim, and the warm-up must not read the zones that matter most only to lose them first.  The queries that follow
    * add to it. */
   if (ok && done.hot && !done.dropped && done.mode == KDB_FETCH_FULL) dbreg_warm_freq(done.view_name, done.zone, g->wl_count > done.hrank ? g->wl_count - done.hrank : 1);
-  if (ok && !done.dropped && !done.quiet && done.mode == KDB_FETCH_FULL && done.prio == KDB_FETCH_PRIO_BACKGROUND) dbreg_bg_loaded(done.view_name, done.zone);
+  if (ok && !done.dropped && !done.quiet && !done.bulk && done.mode == KDB_FETCH_FULL && done.prio == KDB_FETCH_PRIO_BACKGROUND) dbreg_bg_loaded(done.view_name, done.zone);
   if ((!ok || done.dropped) && done.want_summary) warm_add(g, done.view_name, done.zone);     /* (the summary that was not asked for because this request was on its way) */
   if (!done.quiet) park_wake_queue_all(done.view_name, done.zone, !ok);      /* (the triggers go out together, park_wake_flush())  */
   /* (the summary for the apex wakes nobody: no query waits for it, and the queries that wait for the data are not woken for nothing) */
+}
+
+/* 0.7 WP7b: `karictl reload <zone>` with the store protocol.  The loader's CHANGES entry (FORCE) made the record want its body; the zone is read now, not when the scan comes to it, and the
+ * answer of the request (and BATCH_RESULT, which the loader waits for) comes when it is here, so that the operator is told what became of the zone, as with the inventory. */
+static void req_fetch_start(ing_t *g, uint16_t view, const char *view_name, const char *zone, int64_t sid, bool nonstore) {
+  if (g->fetch_fd < 0 || g->req_wait) return;
+  ing_freq_t *e = fetch_find_zone(g, view, zone, KDB_FETCH_FULL);
+  if (e) {                                               /* already on its way (the scan or a query asked): the answer waits for that one */
+    e->reqfetch = true;
+    g->req_wait = true;
+    g->req_fetch_id = e->id;
+    g->rf_has = false;
+    return;
+  }
+  ing_freq_t *r = NULL;
+  for (uint32_t i = 0; i < ING_FETCH_MAX && !r; i++)
+    if (!g->freq[i].active) r = &g->freq[i];
+  if (!r) return;                                        /* (no free place: the zone is read by the scan, the request is answered as "unchanged") */
+  memset(r, 0, sizeof(*r));
+  r->active = true;
+  r->id = ++g->fseq;
+  r->view = view;
+  r->prio = KDB_FETCH_PRIO_QUERY;
+  r->mode = KDB_FETCH_FULL;
+  r->sid = sid;
+  r->nonstore = nonstore;
+  r->reqfetch = true;
+  r->sent_ms = now_ms();
+  snprintf(r->view_name, sizeof(r->view_name), "%s", view_name);
+  snprintf(r->zone, sizeof(r->zone), "%s", zone);
+  if (!nonstore) {
+    r->v_valid = dbreg_zone_version(view_name, zone, &r->v_sid, &r->v_serial);
+    freq_stamp(r, view_name, zone);
+  }
+  g->nfreq++;
+  atomic_store_explicit(&g_fq_inflight, g->nfreq, memory_order_relaxed);
+  atomic_fetch_add_explicit(&g_fetch_issued, 1, memory_order_relaxed);
+  g->req_wait = true;
+  g->req_fetch_id = r->id;
+  g->rf_has = false;
+  logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] fetch %llu: zone '%s' (view '%s'), whole zone, for a reload request", (unsigned long long)r->id, r->zone, r->view_name);
+  if (!fetch_send_req(g, r)) fetch_complete(g, r, false, "the loader's fetch stream is not connected");
+}
+
+/* the fetch of the zone of the reload request is over: what became of it is the outcome of the request, and the held BATCH_RESULT goes out */
+static void req_fetch_done(ing_t *g, const ing_freq_t *done, bool ok, const char *why) {
+  if (!g->req_wait || done->id != g->req_fetch_id) return;
+  g->req_wait = false;
+  if (g->rf_has && g->rf_id == done->id) {
+    g->rf_has = false;
+    switch (g->rf_status) {
+    case KDB_ST_APPLIED:
+    case KDB_ST_NOT_RESIDENT:
+      g->req_outcome = ROUT_APPLIED;
+      break;
+    case KDB_ST_SHADOWED:
+      g->req_outcome = ROUT_SHADOWED;
+      break;
+    case KDB_ST_REJECTED:
+      g->req_outcome = ROUT_REJECTED;
+      snprintf(g->req_reason, sizeof(g->req_reason), "%s", g->rf_reason);
+      break;
+    default:                                             /* the body was not needed after all (the version here is the database's): "unchanged" */
+      g->req_outcome = ROUT_NONE;
+      break;
+    }
+    g->req_serial = g->rf_serial;
+  } else if (!ok) {
+    g->req_outcome = ROUT_FAILED;
+    snprintf(g->req_reason, sizeof(g->req_reason), "%s", why && why[0] ? why : "no reason given");
+  }
+  if (g->defer_end) batch_finish(g, g->defer_batch);
 }
 
 static void fetch_job_finish(ing_t *g, ing_job_t *j) {
@@ -2943,6 +3405,13 @@ static void fetch_job_finish(ing_t *g, ing_job_t *j) {
     if (ok && !j->summary) g->since_retire++;
     if (r) {
       r->dropped = ok && !j->summary && j->status == KDB_ST_UNCHANGED;
+      if (r->reqfetch) {                                 /* 0.7 WP7b: what became of the zone a reload asked for */
+        g->rf_has = true;
+        g->rf_id = r->id;
+        g->rf_status = j->status;
+        g->rf_serial = j->serial;
+        snprintf(g->rf_reason, sizeof(g->rf_reason), "%s", j->reason);
+      }
       fetch_complete(g, r, ok, j->reason);
     }
   }
@@ -3192,6 +3661,9 @@ static void fetch_issue(ing_t *g) {
   bool warm = false;
   size_t warm_left = g->nwarm;                           /* the zones that were in the list when the pass started (those put back wait for the next pass) */
   bool hot = false;
+  bool bulk = false, bulk_np = false;                    /* 0.7 WP7b: the request in hand is of the background fetch of the wanted bodies (the scan of the store) */
+  uint32_t bulk_zid = 0, bulk_back = 0;                  /* ... the zone's id in the store, and where the scan stood before it */
+  int64_t bulk_sid = 0;
   bool hold_place = false, hold_tok = false;             /* what the request in hand holds (fetch_release()) */
   uint64_t hold_key = 0;                                 /* the claim mark of the request in hand */
   bool from_wq = false, wq_room = false;                 /* the request in hand was the head of the wait queue (0.7 P-B), and had been held up by room */
@@ -3203,6 +3675,7 @@ static void fetch_issue(ing_t *g) {
   for (;;) {
     fetch_release(&hold_place, &hold_tok, &hold_key);    /* (the request of the last round did not become a fetch: it was refused, a duplicate, or in memory) */
     from_wq = wq_room = false;
+    bulk = false;
     wq_deadline = 0;
     if (++handled > ING_FETCH_SLICE_N || ((handled & 7) == 0 && mono_ns() - t0 >= ING_FETCH_SLICE_NS)) {
       g->fmore = true;
@@ -3260,6 +3733,9 @@ static void fetch_issue(ing_t *g) {
         warm_add_ex(g, q.view, q.zone, hot, false);
         break;
       }
+    } else if (g->nwq == 0 && bulk_take(g, &q, &bulk_zid, &bulk_back, &bulk_np, &bulk_sid)) {      /* 0.7 WP7b: the bodies the reconcile wants, after the queries and the warm-up */
+      warm = hot = false;
+      bulk = true;
     } else {
       break;
     }
@@ -3323,6 +3799,11 @@ static void fetch_issue(ing_t *g) {
             if (!wq_wait(g, &q, &hold_place, &hold_tok, &hold_key, wq_deadline, wq_room, from_wq, now_ms())) wq_overflow(&q);
             continue;
           }
+          if (bulk) {                                       /* (0.7 WP7b: the scan stands before the zone again; it is asked for at the next pass) */
+            g->bg_zid = bulk_back;
+            if (bulk_np) db_recon_scan_retry(bulk_zid);
+            break;
+          }
           if (warm) {
             warm_add_ex(g, q.view, q.zone, hot, false);
             break;
@@ -3348,6 +3829,11 @@ static void fetch_issue(ing_t *g) {
           if (!wq_wait(g, &q, &hold_place, &hold_tok, &hold_key, wq_deadline, wq_room, from_wq, now_ms())) wq_overflow(&q);
           continue;
         }
+        if (bulk) {                                       /* (0.7 WP7b: the scan stands before the zone again; it is asked for at the next pass) */
+          g->bg_zid = bulk_back;
+            if (bulk_np) db_recon_scan_retry(bulk_zid);
+          break;
+        }
         if (warm) {
           warm_add_ex(g, q.view, q.zone, hot, false);
           break;
@@ -3359,7 +3845,7 @@ static void fetch_issue(ing_t *g) {
         continue;
       }
     }
-    int st = q.mode == KDB_FETCH_SUMMARY ? DBREG_FETCH_STARTED : dbreg_fetch_begin(g->view_names[vi], q.zone);       /* (a summary leaves the zone's state alone: queries are not held for it) */
+    int st = (q.mode == KDB_FETCH_SUMMARY || bulk) ? DBREG_FETCH_STARTED : dbreg_fetch_begin(g->view_names[vi], q.zone);       /* (a summary leaves the zone's state alone: queries are not held for it) */
     if (st == DBREG_FETCH_BUSY) continue;
     if (st != DBREG_FETCH_STARTED) {                     /* in memory already (woken), or not a zone of the registry (answered at once) */
       park_wake_queue_all(q.view, q.zone, st == DBREG_FETCH_NONE);
@@ -3369,6 +3855,11 @@ static void fetch_issue(ing_t *g) {
       if (!g->freq[i].active) r = &g->freq[i];
     if (!r) {                                            /* too many in flight: the queries run into their deadlines */
       if (q.mode != KDB_FETCH_SUMMARY) dbreg_fetch_end(g->view_names[vi], q.zone);
+      if (bulk) {                                       /* (0.7 WP7b: the scan stands before the zone again; it is asked for at the next pass) */
+        g->bg_zid = bulk_back;
+            if (bulk_np) db_recon_scan_retry(bulk_zid);
+        break;
+      }
       if (warm) {
         warm_add_ex(g, q.view, q.zone, hot, false);
         break;
@@ -3391,6 +3882,17 @@ static void fetch_issue(ing_t *g) {
       hold_key = 0;
     }
     if (q.mode != KDB_FETCH_SUMMARY) r->v_valid = dbreg_zone_version(g->view_names[vi], q.zone, &r->v_sid, &r->v_serial);
+    if (bulk) {                                           /* 0.7 WP7b */
+      r->bulk = true;
+      r->nonstore = bulk_np;
+      r->bzid = bulk_zid;
+      r->sid = bulk_sid;
+      g->nbulk++;
+      db_recon_note_fetch(DBR_IN_FLIGHT, g->nbulk);
+    } else if (r->v_valid) {
+      r->sid = r->v_sid;
+    }
+    if (q.mode != KDB_FETCH_SUMMARY) freq_stamp(r, g->view_names[vi], q.zone);
     r->active = true;
     r->id = ++g->fseq;
     r->view = (uint16_t)vi;
@@ -3466,6 +3968,11 @@ static void on_fetch_begin(ing_t *g, const kdb_zone_begin_t *zb) {
     j->iv_sid = r->v_sid;
     j->iv_serial = r->v_serial;
   }
+  if (r && r->st_valid) {                                /* 0.7 WP7b */
+    j->iv_st_valid = true;
+    j->iv_st_gen = r->st_gen;
+    j->iv_st_time = r->st_time;
+  }
   job_free(g->fcur);
   g->fcur = j;
 }
@@ -3490,6 +3997,7 @@ static void on_fetch_failed(ing_t *g, const kdb_zone_failed_t *zf) {
   char reason[KDB_REASON_LEN];
   sane_copy(reason, sizeof(reason), zf->reason.p, zf->reason.len);
   if (strcmp(reason, KDB_FETCH_BUSY_REASON) == 0) atomic_fetch_add_explicit(&g_fq_loader_busy, 1, memory_order_relaxed);
+  else r->loader_failed = true;
   fetch_complete(g, r, false, reason);
 }
 
@@ -3822,6 +4330,7 @@ static void *ingest_thread(void *arg) {
       if (wait_ms < 0 || wait_ms > tick) wait_ms = tick;
     }
     if ((g->nwarm > 0 || (g->apex_walk && g->fetch_fd >= 0)) && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;      /* zones to read before a query asks, or the walk for apexes (while there is a fetch stream): try again soon */
+    if (g->bg_on && g->fetch_fd >= 0 && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;           /* 0.7 WP7b: the bodies the reconcile wants are being asked for: look again soon (a pause after a failed round, a free place) */
     if (g->nwq > 0 && (wait_ms < 0 || wait_ms > ING_WQ_TICK_MS)) wait_ms = ING_WQ_TICK_MS;     /* 0.7 P-B: requests wait (for the bucket, room): look again, and at their deadlines */
     if (g->hold && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;           /* warm-before-serve: look at the warm-up and the time often */
     if (wait_ms < 0 || wait_ms > 10000) wait_ms = 10000;                  /* (the busy share of dbstatus is closed at the end of a window, so the thread wakes at least that often) */
@@ -3871,7 +4380,7 @@ static void *ingest_thread(void *arg) {
     if (g->inv_active) pump_inventory(g);
     if (g->need_cleanup) cleanup_stream_state(g);
     maybe_apply_delta(g);
-    if (g->nwarm > 0 || g->fmore || g->nwq > 0 || park_fetch_pending()) fetch_issue(g);
+    if (g->nwarm > 0 || g->fmore || g->nwq > 0 || g->bg_on || park_fetch_pending()) fetch_issue(g);
     apex_walk_step(g);
     fetch_expire(g);
     park_wake_flush();
@@ -4332,8 +4841,14 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
       int ni = dbreg_find_info(view, canon, info, 8);
       for (int i = 0; i < ni && i < 8; i++) {
         c.matches++;
-        st_append(&c, "zone %s view %s: source id %lld, serial %u, status applied (in the zone store, not in memory: it is attached when a query needs it)\n", canon, info[i].view,
-                  (long long)info[i].source_id, (unsigned)info[i].serial);
+        dbdir_rec_t rr;
+        const bool has_rr = dbdir()->rec_get(info[i].view, canon, &rr);
+        if (has_rr && rr.state == STORE_STATE_KNOWN)         /* 0.7 WP7b: the reconcile has the zone, its body is not here yet */
+          st_append(&c, "zone %s view %s: source id %lld, in the zone store without a body yet (not in memory; %s): the body is fetched in the background, or when a query asks for it\n", canon, info[i].view,
+                    (long long)info[i].source_id, (rr.flags & STORE_F_REJECTED_NEW) ? "refused: the loader cannot read it or the Backend rejected it; asked for again when the database says another version" : "asked for");
+        else
+          st_append(&c, "zone %s view %s: source id %lld, serial %u, status applied (in the zone store, not in memory: it is attached when a query needs it)%s\n", canon, info[i].view,
+                    (long long)info[i].source_id, (unsigned)info[i].serial, has_rr && (rr.flags & STORE_F_STALE) ? "; the database has another version, its body is fetched in the background" : "");
       }
     }
     if (c.matches == 0) st_append(&c, "zone %s: not in the database registry\n", zone);
@@ -4428,6 +4943,24 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     } else {
       st_append(&c, "zone directory: %zu elements, %zu bytes in the registry + %zu bytes in the indexes of the views (%zu bytes per zone)\n",
                 nel, rbytes, ibytes, nel ? (rbytes + ibytes) / nel : (size_t)0);
+    }
+    if (dbdir()) {                                        /* 0.7 WP7b: the reconcile with the loader (store design 5.3, 5.4): the pass, the bodies still to come, the mass-delete guard */
+      db_recon_status_t rs;
+      db_recon_status(&rs);
+      st_append(&c, "store pass: %s view=%s entries=%llu of about %llu (new %llu, changed %llu, renamed %llu, unchanged %llu, already asked for %llu, refused with this version %llu), not offered by the loader %llu; "
+                    "sweep: %llu of %llu zone(s) not listed, %llu deleted; bodies: %llu without one now, %llu fetched, %llu failed, %llu in flight (since the start: %llu wanted); changes: %llu upserts, %llu deletes; "
+                    "cursors kept %llu; passes %llu\n",
+                rs.active ? "running" : "idle", rs.view[0] ? rs.view : "-", (unsigned long long)rs.entries, (unsigned long long)rs.estimate, (unsigned long long)rs.created,
+                (unsigned long long)rs.changed, (unsigned long long)rs.renamed, (unsigned long long)rs.same, (unsigned long long)rs.pending, (unsigned long long)rs.kept,
+                (unsigned long long)rs.skipped, (unsigned long long)rs.unlisted, (unsigned long long)rs.total, (unsigned long long)rs.swept, (unsigned long long)rs.known_now,
+                (unsigned long long)rs.fetched, (unsigned long long)rs.fetch_failed, (unsigned long long)rs.in_flight, (unsigned long long)rs.wanted,
+                (unsigned long long)rs.change_upserts, (unsigned long long)rs.change_deletes, (unsigned long long)rs.cursors, (unsigned long long)rs.passes);
+      if (rs.guard_views) {
+        char tg[40];
+        fmt_time((int64_t)rs.guard_unix, tg, sizeof(tg));
+        st_append(&c, "MASS-DELETE GUARD HELD: view %s: the pass of %s did not list %llu of the %llu zone(s) the Backend holds (more than 20 percent and more than 1000), so none was deleted and the cursor was not advanced; "
+                      "if the database is right, `karictl reload -force` deletes them\n", rs.guard_view, tg, (unsigned long long)rs.guard_unlisted, (unsigned long long)rs.guard_total);
+      }
     }
     st_append(&c, "alias: scans=%llu (the alias thread's scans of the zones for ALIAS records: they follow ALIAS zones coming, changing and going and the configuration, not every zone a fetch brings)\n",
               (unsigned long long)alias_scan_count());

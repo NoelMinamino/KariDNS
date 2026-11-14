@@ -73,6 +73,8 @@ enum { STORE_STATE_FREE = 0, STORE_STATE_KNOWN = 1, STORE_STATE_STORED = 2 };
 #define STORE_F_NOTIFY_DUE    0x0008u
 #define STORE_F_REJECTED_NEW  0x0010u
 #define STORE_F_UPDATED_PIN   0x0020u
+#define STORE_F_NONSTORE      0x0040u   /* 0.7 WP7b: a secondary or catalog zone of the database: the record only remembers the zone for the reconcile (it is a heap zone, never stored, never found by a query) */
+#define STORE_F_STALE         0x0080u   /* 0.7 WP7b: the database has another version of the zone than the image (the record's stamp is the wanted one): the body is fetched in the background; the image keeps serving meanwhile */
 
 /* access mode of the images */
 enum { STORE_MODE_AUTO = 0, STORE_MODE_MAP = 1, STORE_MODE_COPY = 2 };
@@ -293,6 +295,8 @@ int  store_delete(store_t *s, uint32_t zid);
 int  store_delete_name(store_t *s, uint16_t view, const char *name, size_t len);
 /* change zt.flags (set, then clear bits) without touching the image (NOTIFY_DUE, REJECTED_NEW, ...) */
 int  store_set_flags(store_t *s, uint32_t zid, uint16_t set, uint16_t clear);
+/* the stamp (zc) and the flags of a zone in one write: 0.7 WP7b, the reconcile records which version of the zone the database has */
+int  store_set_stamp(store_t *s, uint32_t zid, uint64_t gen, uint64_t time, uint16_t set, uint16_t clear);
 /* change-log cursor and database identity of a source (kept in the superblock; durable with the next commit) */
 int  store_set_cursor(store_t *s, uint16_t source, uint64_t cursor, const void *ident, size_t ident_len);
 /* valid = false: no cursor was ever stored.  ident (STORE_IDENT_MAX bytes) / *ident_len optional. */

@@ -2293,6 +2293,7 @@ static bool blackhole_drops(worker_ctx_t *ctx, const void *sa) {
 static void __attribute__((constructor)) bg_fetch_hook_init(void) {
   g_query_bg_fetch = park_bg_fetch;
   g_query_bg_attach = park_bg_attach;           /* 0.7 S3: a zone of the store that is not in memory is attached, not fetched */
+  g_query_attach_sync = db_store_attach_zone_sync;      /* 0.7 WP7b: ... and the NOTIFY of a changed zone attaches the zone of its name server on the spot */
 }
 
 /* ---- D1a milestone 2: parked queries (dns_park.h) ----
@@ -4065,6 +4066,7 @@ static time_t g_reload_pending_logged;     /* when the postponement or its last 
  * is already postponed: the new one is merged into it).  A postponed reload is
  * remembered with what it was to do (full, the database request) and applied by the tick; the postponement is logged once, a reminder at
  * most once a minute, the outcome once. */
+static bool g_db_reload_force;            /* 0.7 WP7b: the full reload that is being run (or postponed) is `reload -force`: control thread only */
 static config_reload_result_t run_config_reload(bool skip_unchanged, bool ask_db, bool retry, uint64_t *db_rid) {
   if (db_rid) *db_rid = 0;
   bool full = !skip_unchanged || g_reload_pending_full;
@@ -4097,7 +4099,8 @@ static config_reload_result_t run_config_reload(bool skip_unchanged, bool ask_db
   g_reload_pending_full = false;
   g_reload_pending_db = false;
   if (ask_db && (r.status == CONFIG_RELOAD_OK || r.status == CONFIG_RELOAD_ZONE_ERRORS) && db_ingest_enabled()) {
-    const uint64_t rid = db_ingest_reload(true, NULL, NULL, false);
+    const uint64_t rid = db_ingest_reload(true, NULL, NULL, g_db_reload_force);
+    g_db_reload_force = false;
     if (db_rid) *db_rid = rid;
   }
   return r;
@@ -5184,7 +5187,9 @@ void *control_thread_func(void *arg) {
 
             /* The permission of the key that authenticated this connection (a copy made at login).  Every command goes through this one check;
              * a refused command is answered and logged, and the connection stays open. */
-            const bool allowed = (c->perm & control_command_perm(cmd, arg != NULL)) != 0;
+            /* 0.7 WP7b: `reload -force` is the full reload whose pass the mass-delete guard of the zone store does not hold back (the operator's release; docs/karictl.md) */
+            const bool all_force = strcmp(cmd, "reload") == 0 && arg && strcmp(arg, "-force") == 0 && !view_arg;
+            const bool allowed = (c->perm & control_command_perm(cmd, arg != NULL && !all_force)) != 0;
             /* 0.7 M3, debug 3: how the line was taken apart and what the key's permissions said (the line itself is the NOTICE below) */
             logev_post(LOGC_GENERAL, 3, NULL, 0, "[Control] key \"%s\": command '%.32s', argument '%.64s', view '%.64s'%s: %s by the key's permissions", c->key_name, cmd,
                        arg ? arg : "", view_arg ? view_arg : "", want_force ? (opt_word && opt_word[0] == 'l' ? ", local" : ", force") : "",
@@ -5205,7 +5210,7 @@ void *control_thread_func(void *arg) {
             if (!allowed) {
               /* answered above */
             } else if (strcmp(cmd, "reload") == 0) {
-              if (arg && strlen(arg) > 0) {
+              if (arg && strlen(arg) > 0 && !all_force) {
                 char canon_buf[256];
                 const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
                 zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
@@ -5300,7 +5305,8 @@ void *control_thread_func(void *arg) {
                 release_config_snapshot(active);
                 release_zone_snapshot(snap);
               } else {
-                syslog(LOG_NOTICE, "[Control] Received full reload command");
+                syslog(LOG_NOTICE, "[Control] Received full reload command%s", all_force ? " (-force: the loader lists every zone again, and the mass-delete guard does not hold the sweep back)" : "");
+                g_db_reload_force = all_force;
                 /* B6a (design 5.2): after the configuration, ask the loader to compare its sources with the zones served (run_config_reload(); also
                  * when the reload is postponed and the tick applies it); the answer is not waited for (karictl dbstatus shows the batch) */
                 uint64_t rid = 0;
