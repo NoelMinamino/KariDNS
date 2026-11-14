@@ -36,6 +36,7 @@
 #include "../dns_zone_image.h"
 #include "../dns_tsig_acl.h"
 #include "../dns_cidr.h"
+#include "zone_image_walk.h"
 
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) {
     (void)mode; (void)writable;
@@ -744,6 +745,7 @@ static void check_thaw(const zone_arena_t *a, const zone_image_t *img, const uin
     zone_image_t *img2 = zone_image_freeze(&b, apex);
     CHECK(img2 != NULL);
     if (img2) {
+        CHECK(zone_image_validate(img2, img2->total_size, NULL, 0) == 0);   /* what thaw + freeze make is an image too */
         CHECK(img2->n_names == img->n_names && img2->n_rrs == img->n_rrs && img2->n_ext == img->n_ext &&
               img2->n_canon == img->n_canon && img2->n_nsec == img->n_nsec && img2->n_n3chains == img->n_n3chains &&
               img2->n_n3entries == img->n_n3entries && img2->n_glue == img->n_glue);
@@ -836,6 +838,378 @@ static void check_seq(const zone_arena_t *a, const zone_image_t *img, const uint
     CHECK(((img->flags & ZONE_IMAGE_F_PERM) != 0) == (img->off_perm != 0));
 }
 
+
+/* ------------------------------------------------------------------------------------------------ zone_image_validate()
+ * The store reads images back from disk and the readers dereference offsets unchecked, so a block that validates must be
+ * safe to read.  Three kinds of test:
+ *  - every image zone_image_freeze() makes validates (check_zone() calls check_validate() for every zone of this file);
+ *  - hand-made damage (one field at a time, see val_targeted()) is rejected; each case asserts that the block is not
+ *    accepted, whatever the reader would have done with it;
+ *  - a sweep of single byte changes and cut-off copies: a mutant is rejected or, when accepted, walked by every reader
+ *    in walk_image() (under ASan the exact-size copy makes any read outside the block an error) and its lookups must
+ *    still find every name where the hash table says it is. */
+static unsigned long g_val_rejected, g_val_accepted, g_val_images, g_val_cases;
+
+static uint8_t *dup_block(const void *p, size_t n) {
+    uint8_t *m = malloc(n ? n : 1);   /* exactly n octets: ASan sees a read past the end */
+    if (m && n) memcpy(m, p, n);
+    return m;
+}
+
+static unsigned long walk_image(const zone_image_t *img) {
+    unsigned bad = 0;
+    unsigned long sink = zimg_walk(img, &bad);
+    CHECK(bad == 0);
+    return sink;
+}
+
+/* one damaged copy: not accepted (the original is put back) */
+typedef struct { uint8_t *orig, *m; size_t n; const char *label; } vt_t;
+static void vt_reject(vt_t *t, const char *what, unsigned long idx) {
+    char why[200] = "";
+    int r = zone_image_validate(t->m, t->n, why, sizeof(why));
+    g_checks++;
+    g_val_cases++;
+    if (r == 0) {
+        g_failed++;
+        printf("  [FAIL] damaged image is accepted: %s %lu  (%s)\n", what, idx, t->label);
+    } else {
+        g_val_rejected++;
+        if (why[0] == '\0') { g_failed++; printf("  [FAIL] no reason for: %s %lu  (%s)\n", what, idx, t->label); }
+    }
+    memcpy(t->m, t->orig, t->n);
+}
+#define MUT(what, idx, ...) do { __VA_ARGS__; vt_reject(&t, what, (unsigned long)(idx)); } while (0)
+
+static void val_targeted(const zone_image_t *img) {
+    const size_t n = img->total_size;
+    vt_t t = { dup_block(img, n), dup_block(img, n), n, g_label };
+    if (!t.orig || !t.m) { free(t.orig); free(t.m); CHECK(!"memory"); return; }
+    uint8_t *m = t.m;
+    zone_image_t *H = (zone_image_t *)(void *)m;
+#define SEC(type, off) ((type *)(void *)(m + (off)))
+    zone_image_name_t *N = SEC(zone_image_name_t, H->off_names);
+    zone_image_rr_t *R = SEC(zone_image_rr_t, H->off_rrs);
+    zone_image_ext_t *E = SEC(zone_image_ext_t, H->off_ext);
+    zone_image_n3chain_t *C3 = SEC(zone_image_n3chain_t, H->off_n3chains);
+    uint32_t *HT = SEC(uint32_t, H->off_hash), *CA = SEC(uint32_t, H->off_canon), *NS = SEC(uint32_t, H->off_nsec);
+    uint32_t *N3E = SEC(uint32_t, H->off_n3entries), *GL = SEC(uint32_t, H->off_glue);
+    uint32_t *PM = H->off_perm ? SEC(uint32_t, H->off_perm) : NULL;
+    uint8_t *Z = m + H->off_zattr;
+    const size_t slen = n - H->off_strings;
+    const uint32_t nn = H->n_names, nr = H->n_rrs;
+    const uint32_t ids[3] = { 0, nn / 2, nn ? nn - 1 : 0 };
+    const uint32_t rids[3] = { 0, nr / 2, nr ? nr - 1 : 0 };
+
+    /* header */
+    MUT("magic", 0, H->magic ^= 1);
+    MUT("version", 0, H->version = 2);
+    MUT("total_size+8", 0, H->total_size += 8);
+    MUT("total_size-8", 0, H->total_size -= 8);
+    MUT("reserved", 0, H->reserved_ = 1);
+    MUT("unknown flag", 0, H->flags |= 0x200);
+    MUT("unknown flag 31", 0, H->flags |= 0x80000000u);
+    for (unsigned b = 1; b < 9; b++) MUT("image flag toggled", b, H->flags ^= 1u << b);
+    {
+        uint32_t *cnt[] = { &H->n_names, &H->n_rrs, &H->n_ext, &H->n_canon, &H->n_n3chains, &H->hash_size, &H->zattr_len };
+        for (size_t i = 0; i < sizeof(cnt) / sizeof(cnt[0]); i++) {
+            MUT("count+1", i, *cnt[i] += 1);
+            MUT("count+8", i, *cnt[i] += 8);
+            if (*cnt[i]) MUT("count-1", i, *cnt[i] -= 1);
+            MUT("count huge", i, *cnt[i] = 0xFFFFFFFFu);
+        }
+        uint32_t *small[] = { &H->n_nsec, &H->n_n3entries, &H->n_glue };   /* +-1 can stay inside the 8-byte padding */
+        for (size_t i = 0; i < sizeof(small) / sizeof(small[0]); i++) {
+            MUT("count+8", i, *small[i] += 8);
+            MUT("count huge", i, *small[i] = 0xFFFFFFFFu);
+            MUT("count 0x7FFFFFFF", i, *small[i] = 0x7FFFFFFFu);
+        }
+        uint32_t *offs[] = { &H->off_names, &H->off_rrs, &H->off_ext, &H->off_hash, &H->off_canon, &H->off_nsec, &H->off_n3chains,
+                             &H->off_n3entries, &H->off_glue, &H->off_zattr, &H->off_strings };
+        for (size_t i = 0; i < sizeof(offs) / sizeof(offs[0]); i++) {
+            MUT("offset+8", i, *offs[i] += 8);
+            MUT("offset-8", i, *offs[i] -= 8);
+            MUT("offset 0", i, *offs[i] = 0);
+            MUT("offset huge", i, *offs[i] = 0xFFFFFFF8u);
+        }
+        MUT("off_perm set", 0, H->off_perm = H->off_perm ? 0 : H->off_zattr; H->flags ^= ZONE_IMAGE_F_PERM);
+        MUT("off_perm only", 0, H->off_perm = H->off_perm ? 0 : H->off_zattr);
+    }
+    MUT("apex_name out of range", 0, H->apex_name = nn);
+    if (nn > 1) MUT("apex_name elsewhere", 0, H->apex_name = H->apex_name == 0 ? 1 : 0);
+    if (nn && H->apex_name == ZONE_IMAGE_NONE) MUT("apex_name from none", 0, H->apex_name = 0);
+    if (H->n3_param_rr == ZONE_IMAGE_NONE) {
+        MUT("n3_chain without param", 0, H->n3_chain = 0);
+        MUT("n3 iterations without param", 0, H->n3_iterations = 1);
+        MUT("n3 salt without param", 0, H->n3_salt_off = 8);
+    } else {
+        MUT("n3_param_rr range", 0, H->n3_param_rr = nr);
+        MUT("n3 iterations", 0, H->n3_iterations ^= 1);
+        MUT("n3 algorithm", 0, H->n3_algorithm ^= 1);
+        MUT("n3 salt_len", 0, H->n3_salt_len ^= 1);
+        MUT("n3_chain range", 0, H->n3_chain = H->n_n3chains);
+        if (H->n3_salt_len) MUT("n3 salt_off", 0, H->n3_salt_off = (uint32_t)slen);
+        if (H->n3_chain != ZONE_IMAGE_NONE) MUT("n3_chain none", 0, H->n3_chain = H->n3_chain == 0 && H->n_n3chains > 1 ? 1 : H->n_n3chains);
+    }
+
+    /* names */
+    for (int q = 0; q < 3 && nn; q++) {
+        uint32_t i = ids[q];
+        MUT("name first_rr+1", i, N[i].first_rr += 1);
+        MUT("name first_rr huge", i, N[i].first_rr = 0xFFFFFFFFu);
+        MUT("name count+1", i, N[i].rr_count_flags += 1);
+        MUT("name count 0", i, N[i].rr_count_flags &= ~ZONE_IMAGE_NAME_COUNT_MASK);
+        MUT("name count huge", i, N[i].rr_count_flags |= ZONE_IMAGE_NAME_COUNT_MASK);
+        MUT("name flag 31", i, N[i].rr_count_flags |= 0x80000000u);
+        for (unsigned b = 24; b < 31; b++)
+            if (b != 29) MUT("name flag toggled", i * 100 + b, N[i].rr_count_flags ^= 1u << b);
+        if (!(N[i].rr_count_flags & ZONE_IMAGE_NAME_GLUE) ) {
+            /* a name that is not a glue target cannot be flagged unless it has an address RR and is in the list: a name
+             * without an address RR is rejected for sure */
+            bool has_addr = false;
+            for (uint32_t k = N[i].first_rr; k < N[i].first_rr + (N[i].rr_count_flags & ZONE_IMAGE_NAME_COUNT_MASK); k++)
+                if (R[k].type == 1 || R[k].type == 28) has_addr = true;
+            if (!has_addr) MUT("glue flag without address", i, N[i].rr_count_flags |= ZONE_IMAGE_NAME_GLUE);
+        }
+        MUT("name text_off 0", i, N[i].text_off = 0);
+        MUT("name text_off padding", i, N[i].text_off = 4);
+        MUT("name text_off end", i, N[i].text_off = (uint32_t)slen);
+        MUT("name text_off huge", i, N[i].text_off = 0xFFFFFFFFu);
+        MUT("name wire_off padding", i, N[i].wire_off = 4);
+        MUT("name wire_off huge", i, N[i].wire_off = 0xFFFFFFFFu);
+        MUT("name wire_off = text", i, N[i].wire_off = N[i].text_off);
+        MUT("name hash", i, N[i].hash ^= 1);
+        MUT("name canon_rank", i, N[i].canon_rank = nn);
+        MUT("name canon_rank none", i, N[i].canon_rank = ZONE_IMAGE_NONE);
+        MUT("name text edited", i, m[H->off_strings + N[i].text_off] ^= 0x05);   /* another letter: the hash no longer fits */
+        {
+            /* the text without its terminator: the NUL of the name becomes a letter (the next string runs into it) */
+            size_t tl = strlen((const char *)m + H->off_strings + N[i].text_off);
+            MUT("name text unterminated", i, m[H->off_strings + N[i].text_off + tl] = 'x');
+        }
+    }
+    /* RRs */
+    for (int q = 0; q < 3 && nr; q++) {
+        uint32_t k = rids[q];
+        MUT("rr name_id+1", k, R[k].name_id += 1);
+        MUT("rr name_id range", k, R[k].name_id = nn);
+        MUT("rr name_id huge", k, R[k].name_id = 0xFFFFFFFFu);
+        MUT("rr ttl", k, R[k].ttl = 0x80000000u);
+        MUT("rr flags", k, R[k].flags |= 0x4);
+        MUT("rr rdata_len max", k, R[k].rdata_len = 65535);
+        MUT("rr rdata_off huge", k, R[k].rdata_off = 0xFFFFFFFFu);
+        if (R[k].rdata_len) {
+            MUT("rr rdata_off 0", k, R[k].rdata_off = 0);
+            MUT("rr rdata_off padding", k, R[k].rdata_off = 4);
+            MUT("rr rdata past the end", k, R[k].rdata_off = (uint32_t)(slen - R[k].rdata_len + 1));
+        } else {
+            MUT("rr rdata_off without length", k, R[k].rdata_off = 8);
+        }
+        MUT("rr ext_idx past n_ext", k, R[k].ext_idx = H->n_ext + 1);
+        MUT("rr ext_idx huge", k, R[k].ext_idx = 0xFFFFFFFFu);
+        if (R[k].ext_idx == 0) MUT("rr ext_idx unexpected", k, R[k].ext_idx = 1; );
+    }
+    for (uint32_t k = 0; k < nr && k < 400; k++) {
+        /* a name the RR types write one by one: NS, CNAME, PTR, MX end with the name, so cutting a byte leaves no whole name */
+        if ((R[k].flags & ZONE_IMAGE_RR_RAW) || R[k].rdata_len < 2) continue;
+        if (R[k].type == 2 || R[k].type == 5 || R[k].type == 12 || R[k].type == 15) {
+            MUT("rr name cut off", k, R[k].rdata_len -= 1);
+            break;
+        }
+    }
+    /* ext[] */
+    if (H->n_ext) {
+        MUT("ext flags", 0, E[0].flags |= 0x80);
+        MUT("ext pad", 0, E[0].pad = 1);
+        MUT("ext ecs_tag_off end", 0, E[0].ecs_tag_off = (uint32_t)slen);
+        MUT("ext loc_tag_off padding", 0, E[0].loc_tag_off = 4);
+        MUT("ext alt_text_off end", 0, E[0].alt_text_off = (uint32_t)slen);
+        MUT("ext alt_text_off huge", 0, E[0].alt_text_off = 0xFFFFFFFFu);
+        if (!E[0].alt_text_off) MUT("ext alt_wire_off alone", 0, E[0].alt_wire_off = 8);
+        if (!E[0].ecs_tag_off) MUT("ext ecs_tag_off text unterminated", 0, E[0].ecs_tag_off = (uint32_t)slen - 1; m[n - 1] = 'x');
+    }
+    /* the hash table */
+    if (nn) {
+        size_t a = 0, b = 0;
+        for (size_t i = 0; i < H->hash_size; i++) if (HT[i]) { if (!a) a = i + 1; else if (!b) b = i + 1; }
+        MUT("hash slot emptied", a - 1, HT[a - 1] = 0);
+        MUT("hash slot out of range", a - 1, HT[a - 1] = nn + 1);
+        if (b) {
+            MUT("hash name twice", b - 1, HT[b - 1] = HT[a - 1]);
+        }
+        MUT("hash table full", 0, for (size_t i = 0; i < H->hash_size; i++) if (!HT[i]) HT[i] = 1);
+        MUT("hash table without names", 0, memset(HT, 0, (size_t)H->hash_size * 4));
+    }
+    /* canonical order */
+    if (nn) {
+        MUT("canon out of range", 0, CA[0] = nn);
+        MUT("canon huge", 0, CA[nn - 1] = 0xFFFFFFFFu);
+    }
+    if (nn > 1) {
+        MUT("canon swapped", 0, uint32_t x = CA[0]; CA[0] = CA[1]; CA[1] = x);
+        MUT("canon twice", 0, CA[1] = CA[0]);
+        /* the ranks agree with the swap, the order does not */
+        MUT("canon out of order", 0, uint32_t x = CA[0]; CA[0] = CA[1]; CA[1] = x; N[CA[0]].canon_rank = 0; N[CA[1]].canon_rank = 1);
+        MUT("canon last two out of order", 0, uint32_t x = CA[nn - 2]; CA[nn - 2] = CA[nn - 1]; CA[nn - 1] = x;
+            N[CA[nn - 2]].canon_rank = nn - 2; N[CA[nn - 1]].canon_rank = nn - 1);
+    }
+    /* NSEC index */
+    if (H->n_nsec) {
+        MUT("nsec range", 0, NS[0] = nr);
+        MUT("nsec huge", 0, NS[0] = 0xFFFFFFFFu);
+        for (uint32_t k = 0; k < nr; k++)
+            if (R[k].type != 47) { MUT("nsec is no NSEC", k, NS[0] = k); break; }
+    }
+    if (H->n_nsec > 1) {
+        const char *s0 = (const char *)m + H->off_strings + N[R[NS[0]].name_id].text_off;
+        const char *s1 = (const char *)m + H->off_strings + N[R[NS[H->n_nsec - 1]].name_id].text_off;
+        if (strcasecmp(s0, s1) != 0) MUT("nsec reversed", 0, uint32_t x = NS[0]; NS[0] = NS[H->n_nsec - 1]; NS[H->n_nsec - 1] = x);
+    }
+    /* NSEC3 chains and entries */
+    if (H->n_n3chains) {
+        MUT("n3 chain count+1", 0, C3[0].count += 1);
+        MUT("n3 chain count 0", 0, C3[0].count = 0);
+        MUT("n3 chain first+1", 0, C3[0].first += 1);
+        MUT("n3 chain algorithm", 0, C3[0].algorithm ^= 1);
+        MUT("n3 chain iterations", 0, C3[0].iterations ^= 1);
+        MUT("n3 chain salt_len", 0, C3[0].salt_len ^= 1);
+        MUT("n3 chain salt_off huge", 0, C3[0].salt_off = 0xFFFFFFFFu);
+        MUT("n3 chain salt_off end", 0, C3[0].salt_off = (uint32_t)slen; C3[0].salt_len = 4);
+        if (C3[0].salt_len) MUT("n3 chain salt bytes", 0, m[H->off_strings + C3[0].salt_off] ^= 0x10);
+        MUT("n3 entry range", 0, N3E[0] = nr);
+        for (uint32_t k = 0; k < nr; k++)
+            if (R[k].type != 50) { MUT("n3 entry is no NSEC3", k, N3E[0] = k); break; }
+        if (C3[0].count > 1) {
+            const char *l0 = (const char *)m + H->off_strings + N[R[N3E[0]].name_id].text_off;
+            const char *l1 = (const char *)m + H->off_strings + N[R[N3E[1]].name_id].text_off;
+            if (strncasecmp(l0, l1, strcspn(l0, ".")) != 0) MUT("n3 entries out of order", 0, uint32_t x = N3E[0]; N3E[0] = N3E[1]; N3E[1] = x);
+        }
+    }
+    /* glue */
+    if (H->n_glue) {
+        MUT("glue range", 0, GL[0] = nn);
+        for (uint32_t id = 0; id < nn; id++) {
+            bool has_addr = false;
+            for (uint32_t k = N[id].first_rr; k < N[id].first_rr + (N[id].rr_count_flags & ZONE_IMAGE_NAME_COUNT_MASK); k++)
+                if (R[k].type == 1 || R[k].type == 28) has_addr = true;
+            if (!has_addr) { MUT("glue without address", id, GL[0] = id); break; }
+        }
+    }
+    if (H->n_glue > 1) MUT("glue twice", 0, GL[1] = GL[0]);
+    /* file order */
+    if (PM) {
+        MUT("perm range", 0, PM[0] = nr);
+        MUT("perm twice", 0, PM[1] = PM[0]);
+        MUT("perm huge", 0, PM[nr - 1] = 0xFFFFFFFFu);
+    }
+    /* zone level tables */
+    if (H->zattr_len) {
+        MUT("zattr nloc huge", 0, memset(Z, 0xFF, 4));
+        MUT("zattr empty", 0, memset(Z, 0, H->zattr_len));
+        int nloc = 0;
+        const tinydns_location_entry_t *loc = zone_image_locations(img, &nloc);
+        if (nloc > 0) {
+            size_t at = (size_t)((const uint8_t *)loc - (const uint8_t *)img) - H->off_zattr;
+            MUT("location prefix_bits", 0, Z[at + offsetof(tinydns_location_entry_t, prefix_bits)] = 33);
+        }
+        /* the first parsed CIDR of a tag: find its bytes in the area */
+        for (int kind = 0; kind < 2; kind++) {
+            zone_image_tags_t it;
+            zone_image_tag_t tg;
+            zone_image_tags_open(img, kind, &it);
+            bool done = false;
+            while (!done && zone_image_tags_next(&it, &tg)) {
+                const char *cidr;
+                cidr_entry_t parsed;
+                while (!done && zone_image_tag_next_cidr(&tg, &cidr, &parsed)) {
+                    if (!parsed.valid || parsed.is_any) continue;
+                    uint8_t *p = memmem(Z, H->zattr_len, &parsed, sizeof(parsed));
+                    if (!p) continue;
+                    size_t at = (size_t)(p - Z);
+                    MUT("cidr valid is no bool", kind, Z[at + offsetof(cidr_entry_t, valid)] = 2);
+                    MUT("cidr is_any is no bool", kind, Z[at + offsetof(cidr_entry_t, is_any)] = 7);
+                    MUT("cidr prefix too long", kind, Z[at + offsetof(cidr_entry_t, prefix)] = parsed.family == AF_INET ? 33 : 129);
+                    int fam = 99;
+                    MUT("cidr family", kind, memcpy(Z + at + offsetof(cidr_entry_t, family), &fam, sizeof(fam)));
+                    done = true;
+                }
+            }
+        }
+        int ntr = 0;
+        const acl_entry_t *acl = zone_image_ecs_trusted(img, &ntr);
+        if (ntr > 0) {
+            size_t at = (size_t)((const uint8_t *)acl - (const uint8_t *)img) - H->off_zattr;
+            MUT("acl is_deny is no bool", 0, Z[at + offsetof(acl_entry_t, is_deny)] = 2);
+            MUT("acl cidr valid is no bool", 0, Z[at + offsetof(acl_entry_t, cidr) + offsetof(cidr_entry_t, valid)] = 9);
+            MUT("acl padding not zero", 0, Z[at - 1] = 1; (void)0);
+        }
+    }
+#undef SEC
+    free(t.orig);
+    free(t.m);
+}
+
+/* cut-off, extended and misaligned copies */
+static void val_truncate(const zone_image_t *img) {
+    const size_t n = img->total_size;
+    char why[120];
+    size_t cuts[] = { 0, 1, 4, 7, 8, sizeof(zone_image_t) - 8, sizeof(zone_image_t) - 1, sizeof(zone_image_t), sizeof(zone_image_t) + 8,
+                      n / 2, n > 16 ? n - 16 : 0, n - 8, n - 1 };
+    for (size_t i = 0; i < sizeof(cuts) / sizeof(cuts[0]); i++) {
+        if (cuts[i] >= n) continue;
+        uint8_t *c = dup_block(img, cuts[i]);
+        CHECK(c && zone_image_validate(c, cuts[i], why, sizeof(why)) != 0);
+        free(c);
+    }
+    uint8_t *big = calloc(1, n + 16);
+    if (big) {
+        memcpy(big, img, n);
+        CHECK(zone_image_validate(big, n + 8, why, sizeof(why)) != 0);    /* longer than total_size */
+        CHECK(zone_image_validate(big + 1, n, why, sizeof(why)) != 0);    /* not 8-aligned */
+        memmove(big + 8, big, n);
+        CHECK(zone_image_validate(big + 8, n, why, sizeof(why)) == 0);    /* any 8-aligned address is fine */
+        free(big);
+    }
+    CHECK(zone_image_validate(NULL, n, why, sizeof(why)) != 0);
+    CHECK(zone_image_validate(img, n, NULL, 0) == 0);
+}
+
+/* single byte changes everywhere: rejected, or read by every reader without a fault */
+static void val_sweep(const zone_image_t *img, size_t max_positions) {
+    const size_t n = img->total_size;
+    uint8_t *m = dup_block(img, n);
+    if (!m) { CHECK(!"memory"); return; }
+    size_t step = n / max_positions;
+    if (step == 0) step = 1;
+    static const uint8_t pat[] = { 0x01, 0x20, 0x80, 0xFF };
+    char why[120];
+    for (size_t pos = 0; pos < n; pos += step) {
+        for (size_t p = 0; p < sizeof(pat); p++) {
+            m[pos] ^= pat[p];
+            if (zone_image_validate(m, n, why, sizeof(why)) == 0) {
+                g_val_accepted++;
+                (void)walk_image((const zone_image_t *)(const void *)m);
+            } else {
+                g_val_rejected++;
+            }
+            m[pos] ^= pat[p];
+        }
+    }
+    free(m);
+}
+
+static void check_validate(const zone_image_t *img) {
+    char why[200] = "";
+    int r = zone_image_validate(img, img->total_size, why, sizeof(why));
+    if (r != 0) printf("  [validate] %s: %s\n", g_label, why);
+    CHECK(r == 0);
+    if (r != 0) return;
+    g_val_images++;
+    val_truncate(img);
+    val_targeted(img);
+    val_sweep(img, img->n_rrs > 20000 ? 150 : 700);
+}
+
 /* ------------------------------------------------------------------------------------------------ driver per zone */
 static int g_zones_checked = 0;
 static unsigned long g_rrs_checked = 0;
@@ -865,6 +1239,7 @@ static void check_zone(const char *label, zone_t *z, const char *apex) {
     check_ext(a, img, map);
     check_zattr(a, img);
     check_seq(a, img, map);
+    check_validate(img);
 
     pass_sequence(a, img, map, 65535, MODE_PLAIN);
     if (!big) {
@@ -1461,6 +1836,7 @@ static void run_edges(void) {
     if (img) {
         CHECK(img->n_names == 0 && img->n_rrs == 0 && zone_image_find_name(img, "x.") == ZONE_IMAGE_NONE);
         CHECK(zone_image_canon_floor(img, "x.", NULL) == ZONE_IMAGE_NONE && zone_image_nsec_floor(img, "x.") == ZONE_IMAGE_NONE);
+        check_validate(img);   /* the empty image: no names, an all-empty hash table */
         zone_arena_t b;
         zone_arena_init(&b);
         CHECK(zone_image_thaw(img, &b) == 0 && b.count == 0);
@@ -1591,6 +1967,8 @@ int main(void) {
     printf("zones checked: %d, RRs: %lu, distinct RR types: %u, checks: %d, failed: %d\n", g_zones_checked, g_rrs_checked, types,
            g_checks, g_failed);
     CHECK(types >= 40);
+    printf("validate: %lu images, %lu damaged copies refused (targeted: %lu), %lu byte changes accepted and read through every accessor\n", g_val_images, g_val_rejected, g_val_cases, g_val_accepted);
+    CHECK(g_val_images >= 40 && g_val_cases >= 2000 && g_val_rejected > g_val_accepted);
     if (g_failed) { printf("FAILED (%d)\n", g_failed); return 1; }
     printf("ALL PASSED\n");
     return 0;

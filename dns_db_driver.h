@@ -42,6 +42,9 @@
 #define DB_ERR_RETRY (-2)
 #define DB_ERR_UNAVAILABLE (-3)
 #define DB_ERR_CONFLICT (-4)        /* a write that met a concurrent change: PostgreSQL serialization failure (40001) in a REPEATABLE READ transaction, or a row to update that is gone */
+#define DB_ERR_NEED_SCHEMA3 (-5)    /* 0.7 store (design 5, decision D3): the paged calls (manifest_page, current_cursor, changes_page) need karidns_zone_state and karidns_changes (schema version 3,
+                                       db/karidns_ext.*.sql); a plain PowerDNS schema has neither.  db_errmsg() names the missing table.  Not transient: the loader reports it (and that the
+                                       change log is required above 100,000 zones) instead of retrying. */
 #define DB_ERRLEN 400
 
 /* Where the data is.  Paths are UTF-8, used byte for byte: '%XX' is not decoded and a SQLite3 path is never read as a
@@ -169,6 +172,95 @@ typedef struct {
     void *ud;
 } db_ext_sink_t;
 
+/* ------------------------------------------------------------------------------------------------------------------------------
+ * 0.7 store, WP3 (store 10M design, section 5): the paged calls of the loader.  A source with ten million zones is never read as a
+ * whole list: the loader pages over `domains` by id (manifest_page), follows the change log in pages (changes_page) and sizes its
+ * index with count_domains.  Every call below is ONE statement (one snapshot of its own on both drivers: a PostgreSQL statement in
+ * READ COMMITTED sees one snapshot, a SQLite3 SELECT is one read transaction), so nothing is held between two pages and the WAL can be
+ * checkpointed during a pass.  Called inside begin_snapshot() they read that snapshot instead (the pages then share it; the cursor
+ * must then be taken inside it too).  Read only, prepared once per connection.
+ * ---------------------------------------------------------------------------------------------------------------------------- */
+#define DB_PAGE_MAX 100000u                 /* the most rows (manifest) or log rows (changes) of one page */
+#define DB_MANIFEST_MAX_VIEWS 32            /* the most karidns_domain_views rows of one domain a manifest row carries (more: an error naming the domain) */
+#define DB_MANIFEST_NAME_MAX 1023           /* longer domain / view names are an error naming the table and the id */
+#define DB_MANIFEST_TYPE_MAX 31
+#define DB_MANIFEST_VIEW_MAX 127
+
+/* One domain of a manifest page.  The strings are valid until the callback returns (they are copies: a row of the page is assembled from
+ * the join of `domains`, karidns_zone_state and karidns_domain_views). */
+typedef struct {
+    int64_t id;                             /* domains.id */
+    const char *name;                       /* domains.name as stored (never NULL, no NUL) */
+    const char *type;                       /* domains.type ("kind"); NULL when the column is NULL */
+    bool has_state;                         /* the zone has a karidns_zone_state row; false: stamp 0, 0 (the loader then compares by SOA serial, design 5.2) */
+    uint64_t stamp_gen, stamp_time;         /* the version stamp: karidns_zone_state.generation, changed_at */
+    unsigned nviews;                        /* karidns_domain_views rows of the domain (0 = no row: the loader's rule for "no mapping" applies); sorted by name in the C locale */
+    const char *views[DB_MANIFEST_MAX_VIEWS];
+} db_manifest_row_t;
+typedef int (*db_manifest_cb)(void *ud, const db_manifest_row_t *row);
+
+typedef enum {
+    DB_CHANGE_UPSERT = 1,                   /* the domain exists in the page's snapshot: read it and send it for every view it maps to */
+    DB_CHANGE_DELETE = 2                    /* the domain row is gone: ZONE_DELETE {source_id} for every view of the source */
+} db_change_op_t;
+/* One entry of a changes page: a distinct domain.  seq = the highest log position the domain has in this page.  op is the state of the
+ * `domains` table in the page's snapshot, not the logged operation (the log does not record one): upsert then delete is a delete,
+ * delete then re-create is an upsert, so entries are idempotent and their order within a page does not matter for correctness
+ * (they come in ascending seq). */
+typedef struct { uint64_t seq; int64_t domain_id; db_change_op_t op; } db_change_entry_t;
+typedef int (*db_change_entry_cb)(void *ud, const db_change_entry_t *e);
+
+/* The position of a change-log drain (a run of changes_page calls until `more` is false).  Initialise it with db_change_pos_init(cursor)
+ * where cursor is the value of current_cursor() taken before a manifest pass, or the cursor the previous drain ended at, and pass the
+ * same struct to every call.  After a call with *more == true it is the continuation; after a call with *more == false, pos->cursor is
+ * the cursor to continue from (store it as the applied cursor; it is the only member to persist; seq and settle are 0 then).
+ * Members are for the driver; the loader never interprets them. */
+typedef struct {
+    uint64_t cursor;                        /* SQLite3: the highest seq consumed.  PostgreSQL: the xmin floor: transactions below it are consumed */
+    uint64_t seq;                           /* PostgreSQL: seq consumed inside this drain (0 = at the start); SQLite3: unused */
+    uint64_t settle;                        /* PostgreSQL: the cursor the drain ends at (the snapshot xmin of its first page); SQLite3: unused */
+} db_change_pos_t;
+static inline void db_change_pos_init(db_change_pos_t *p, uint64_t cursor) {
+    p->cursor = cursor;
+    p->seq = 0;
+    p->settle = 0;
+}
+
+/* Assembles a manifest row from the rows of the join (one per domain and view).  Shared by both drivers; the row's strings are copies. */
+typedef struct {
+    db_manifest_row_t row;
+    bool open;
+    char name[DB_MANIFEST_NAME_MAX + 1], type[DB_MANIFEST_TYPE_MAX + 1];
+    char vbuf[DB_MANIFEST_MAX_VIEWS][DB_MANIFEST_VIEW_MAX + 1];
+} db_mgroup_t;
+/* NULL = ok, else the reason (the driver adds table and id): name NULL is "name is NULL" */
+static inline const char *db_mgroup_start(db_mgroup_t *g, int64_t id, const char *name, const char *type, bool has_state, uint64_t gen, uint64_t at) {
+    if (!name) return "column name is NULL";
+    size_t n = strlen(name);
+    if (n > DB_MANIFEST_NAME_MAX) return "column name is too long";
+    if (type && strlen(type) > DB_MANIFEST_TYPE_MAX) return "column type is too long";
+    memcpy(g->name, name, n + 1);
+    if (type) memcpy(g->type, type, strlen(type) + 1);
+    g->row.id = id;
+    g->row.name = g->name;
+    g->row.type = type ? g->type : NULL;
+    g->row.has_state = has_state;
+    g->row.stamp_gen = has_state ? gen : 0;
+    g->row.stamp_time = has_state ? at : 0;
+    g->row.nviews = 0;
+    g->open = true;
+    return NULL;
+}
+static inline const char *db_mgroup_view(db_mgroup_t *g, const char *view) {
+    if (g->row.nviews >= DB_MANIFEST_MAX_VIEWS) return "more karidns_domain_views rows than a manifest row carries (32)";
+    size_t n = strlen(view);
+    if (n > DB_MANIFEST_VIEW_MAX) return "column view_name is too long";
+    memcpy(g->vbuf[g->row.nviews], view, n + 1);
+    g->row.views[g->row.nviews] = g->vbuf[g->row.nviews];
+    g->row.nviews++;
+    return NULL;
+}
+
 typedef struct db_driver {
     const char *name;               /* "sqlite3", "postgresql" */
     int (*open)(db_conn_t **c, const db_source_t *src, char *err, size_t errlen);
@@ -261,6 +353,49 @@ typedef struct db_driver {
     /* D1a step 6: the apex SOA and NS rows (db_apex_row_t) of one zone (domain_id) or of all, ORDER BY domain_id, id; as scan_records in a snapshot.
      * NULL = the driver cannot tell: no apex goes with the summaries. */
     int (*scan_apex)(db_conn_t *c, const int64_t *domain_id, db_apex_cb cb, void *ud);
+
+    /* ---- 0.7 store, WP3: the paged calls (see the block above db_driver_t).  NULL = the driver has none. ---- */
+    /* The number of domains, to size the index at a first fill.  view NULL: every row of `domains`.  view set: the zones the view mapping gives
+     * to that view (karidns_dbloader.c apply_mapping rules): a domain without a karidns_domain_views row, plus the domains with a row naming the
+     * view.  The name is compared ASCII case-insensitively in SQL (SQLite3 NOCASE, PostgreSQL lower()), so the count is a sizing estimate for a
+     * view name with non-ASCII letters; without karidns_domain_views it is the number of domains.  One statement; inside or outside a snapshot.
+     * Needs check_schema() first.  0, -1, DB_ERR_RETRY. */
+    int (*count_domains)(db_conn_t *c, const char *view, uint64_t *n);
+
+    /* One page of the manifest: the domains with id > after_id in ascending id order (keyset paging: an index seek, no OFFSET, nothing held
+     * between pages), at most `limit` (1..DB_PAGE_MAX), each with name, type, version stamp and its view mapping rows as one db_manifest_row_t.
+     * *last_id = the id of the last row delivered (after_id when none), *nrows = how many were delivered; the pass is complete when
+     * *nrows < limit (a page of exactly `limit` rows is followed by one more call that may deliver none).  A callback returning non-zero stops
+     * the page (DB_STOPPED; *last_id and *nrows count what was delivered, the stopping row included).
+     * Semantics: ONE page is one statement, hence one consistent snapshot: a domain, its stamp and its mapping rows of the same page are from
+     * the same instant.  Different pages are different instants.  Within a pass every domain that exists for the whole pass is delivered exactly
+     * once in ascending id order; a domain created below the pass position after the pass passed it, or deleted, renamed, restamped or re-mapped
+     * between two pages, may be missing or stale in the pass.  That is by design: the loader takes the change-log cursor (current_cursor()) BEFORE
+     * the first page, and every change that committed after that moment is in changes_page() from that cursor on, so the pass plus the drain
+     * from the cursor is complete (a change the pass already saw is delivered twice; both are idempotent).  A domain id that appears in two
+     * pages never happens (ids are strictly increasing).
+     * Needs karidns_zone_state (D3): DB_ERR_NEED_SCHEMA3 on a plain PowerDNS schema, before anything is read.  karidns_domain_views is optional
+     * (nviews is 0 without it).  Needs check_schema() first.  0, DB_STOPPED, -1, DB_ERR_RETRY, DB_ERR_NEED_SCHEMA3. */
+    int (*manifest_page)(db_conn_t *c, int64_t after_id, unsigned limit, db_manifest_cb cb, void *ud, int64_t *last_id, unsigned *nrows);
+
+    /* The change-log position to start following from, as a cursor (the one changes_max() returns: SQLite3 the highest seq, PostgreSQL the xmin of
+     * the snapshot).  Take it BEFORE the first manifest page of a pass, and as the starting cursor of a source with no stored one.  Its value
+     * is the moment of the call: outside a snapshot every call is fresh, inside one it is the snapshot's.  DB_ERR_NEED_SCHEMA3 without
+     * karidns_changes.  0, -1, DB_ERR_RETRY, DB_ERR_NEED_SCHEMA3. */
+    int (*current_cursor)(db_conn_t *c, uint64_t *cursor);
+
+    /* One page of the change log after pos (see db_change_pos_t): the log rows after the position, at most `limit` (1..DB_PAGE_MAX) of them,
+     * deduplicated per domain within the page (one db_change_entry_t per distinct domain id, in ascending seq of its last row), each with the
+     * domain's state (upsert / delete) in the page's snapshot.  One statement, one snapshot.  *more = the page took `limit` log rows, so call
+     * again with the same pos; *more == false ends the drain and pos->cursor is the new cursor.  *gap = the log no longer reaches back to the
+     * cursor (rows were pruned; SQLite3 also: the log was emptied or the cursor is above its highest seq; PostgreSQL also: a
+     * cursor above the server's xmin.  PostgreSQL uses the pruning heuristic of changes_since, so an emptied log is not seen): the caller reconciles with a manifest pass instead (the entries delivered are still valid).  A drain of several
+     * pages may deliver a domain in more than one page.
+     * PostgreSQL: a transaction that took a lower seq may commit after a later page was read.  Every page reads the transactions at or above
+     * the drain's starting cursor (xmin floor), and the cursor the drain ends at is the xmin of its FIRST page's snapshot, so everything that
+     * committed after that snapshot is read again by the next drain (duplicates, never losses).  SQLite3: one writer, seq order is commit order.
+     * DB_ERR_NEED_SCHEMA3 without karidns_changes.  Needs check_schema() first.  0, DB_STOPPED, -1, DB_ERR_RETRY, DB_ERR_NEED_SCHEMA3. */
+    int (*changes_page)(db_conn_t *c, db_change_pos_t *pos, unsigned limit, db_change_entry_cb cb, void *ud, bool *more, bool *gap);
 
     /* ----------------------------------------------------------------------------------------------------------------------------
      * 0.6.0 ZoneImporter (M2): write access.  The loader never uses any of this: its connections come from open(), which is read only

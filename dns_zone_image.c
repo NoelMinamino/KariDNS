@@ -1389,3 +1389,446 @@ out:
     free(chk);
     return rc;
 }
+
+/* ------------------------------------------------------------------------------------------------------------
+ * validation: is this block an image the readers can use without checking anything?
+ *
+ * Every reader above (the query engine, AXFR / IXFR, the ECS code, the catalog and alias modules) dereferences image
+ * offsets and indexes unchecked: the block is written by zone_image_freeze() and never changes.  An image that is read
+ * back from disk (the store, S1) is no longer "written by this process", so it is checked once, before it is
+ * attached.  The check accepts exactly what zone_image_freeze() writes (same layout, same flag rules), so a valid
+ * image is not rejected and a corrupt one cannot make a reader leave [buf, buf + len).
+ *
+ * The cost is O(size) (one pass over every section; a name or a tag is read once per reference, at most
+ * DNS_NAME_TEXT_SIZE / V_MAX_TAG octets).  The only allocation is one bit array of max(n_names, n_rrs) bits, used for
+ * the hash table, the glue list and the file order; it is made after the cheap header and layout checks.
+ * ------------------------------------------------------------------------------------------------------------ */
+#define V_IMG_FLAGS (ZONE_IMAGE_F_TINYDNS | ZONE_IMAGE_F_EXT | ZONE_IMAGE_F_WILDCARD | ZONE_IMAGE_F_DNAME | ZONE_IMAGE_F_PERM | \
+                     ZONE_IMAGE_F_SOA_ATTR | ZONE_IMAGE_F_VIEW | ZONE_IMAGE_F_ALIAS | ZONE_IMAGE_F_CUT)
+#define V_NAME_FLAGS (ZONE_IMAGE_NAME_WILDCARD | ZONE_IMAGE_NAME_CUT | ZONE_IMAGE_NAME_DNAME | ZONE_IMAGE_NAME_APEX | \
+                      ZONE_IMAGE_NAME_NSEC | ZONE_IMAGE_NAME_GLUE | ZONE_IMAGE_NAME_ALIAS)
+#define V_MAX_TAG 1024u    /* octets of a tag name in ext[] (the zone file token limit is far below it) */
+
+typedef struct {
+    const uint8_t *s;      /* the strings area */
+    size_t slen;
+} vstr_t;
+
+static inline bool bm_get(const uint8_t *b, size_t i) { return (b[i >> 3] >> (i & 7)) & 1; }
+static inline void bm_set(uint8_t *b, size_t i) { b[i >> 3] |= (uint8_t)(1u << (i & 7)); }
+static inline void bm_clear(uint8_t *b, size_t nbits) { memset(b, 0, (nbits + 7) / 8); }
+
+/* The NUL terminated string at strings offset `off` (0 = none and the 8 octets of padding are not strings), at most
+ * `maxlen` octets before the NUL; NULL if there is none. */
+static const char *v_cstr(const vstr_t *vs, uint32_t off, size_t maxlen, size_t *n) {
+    if (off < 8 || off >= vs->slen) return NULL;
+    size_t avail = vs->slen - off;
+    const uint8_t *z = memchr(vs->s + off, 0, avail < maxlen + 1 ? avail : maxlen + 1);
+    if (!z) return NULL;
+    if (n) *n = (size_t)(z - (vs->s + off));
+    return (const char *)(vs->s + off);
+}
+
+/* An owner spelling: canonical text (it must encode to a wire name) and, if present (0 = none), the wire form beside
+ * it (an uncompressed name inside the area that equals the encoding of the text up to the case of letters). */
+static const char *v_owner(const vstr_t *vs, uint32_t text_off, uint32_t wire_off) {
+    const char *t = v_cstr(vs, text_off, DNS_NAME_TEXT_SIZE - 1, NULL);
+    if (!t) return NULL;
+    uint8_t w[256];
+    long wl = write_uncompressed_name_ext(w, 0, sizeof(w), t, false);
+    if (wl <= 0) return NULL;
+    if (wire_off) {
+        if (wire_off < 8 || wire_off >= vs->slen) return NULL;
+        size_t avail = vs->slen - wire_off;
+        int l = wire_name_len(vs->s + wire_off, avail < 255 ? avail : 255);
+        if (l != (int)wl) return NULL;
+        for (int i = 0; i < l; i++) {
+            uint8_t a = vs->s[wire_off + (uint32_t)i], b = w[i];
+            if (a >= 'A' && a <= 'Z') a |= 0x20;
+            if (b >= 'A' && b <= 'Z') b |= 0x20;
+            if (a != b) return NULL;
+        }
+    }
+    return t;
+}
+
+/* an NSEC3 owner: base32hex digits (RFC 4648 §7; RFC 5155 §3.3: one label, at most 63 octets), '.', and the zone name (what
+ * build_nsec3_index() indexes); find_matching_nsec3() reads the name after the label as owner + hlen + 1 */
+static bool v_n3_owner(const char *t, size_t *hlen) {
+    const char *dot = strchr(t, '.');
+    if (!dot || dot == t || dot[1] == '\0' || dot - t > 63) return false;
+    for (const char *p = t; p < dot; p++) {
+        char c = (char)((*p >= 'a' && *p <= 'z') ? *p - 32 : *p);
+        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'V'))) return false;
+    }
+    *hlen = (size_t)(dot - t);
+    return true;
+}
+
+/* cidr_entry_t as copied into the image (padding is not defined, the flags are read as bool: 0 or 1 only). A parsed
+ * entry that is used (valid, not "any") must match its family: the ECS code takes `prefix` bits from the address. */
+static bool v_cidr(const uint8_t *raw) {
+    if (raw[offsetof(cidr_entry_t, valid)] > 1 || raw[offsetof(cidr_entry_t, is_any)] > 1) return false;
+    cidr_entry_t e;
+    memcpy(&e, raw, sizeof(e));
+    if (e.valid && !e.is_any) {
+        if (e.family == AF_INET) return e.prefix <= 32;
+        if (e.family == AF_INET6) return e.prefix <= 128;
+        return false;
+    }
+    return true;
+}
+
+/* a string of the zone level tables: u32 length (0xFFFFFFFF = NULL), the octets, a NUL (see build_zattr()) */
+static bool vz_str(cursor_t *c, bool nullable) {
+    uint32_t n = get_u32(c);
+    if (c->bad) return false;
+    if (n == 0xFFFFFFFFu) return nullable;
+    if (c->len - c->pos < (size_t)n + 1 || memchr(c->p + c->pos, 0, (size_t)n + 1) != c->p + c->pos + n) return false;
+    c->pos += (size_t)n + 1;
+    return true;
+}
+
+static bool vz_tags(cursor_t *c) {
+    uint32_t n = get_u32(c);
+    if (c->bad || n > (c->len - c->pos) / 8) return false;   /* a definition is at least a length and a count */
+    for (uint32_t i = 0; i < n; i++) {
+        if (!vz_str(c, false)) return false;                  /* the tag name is returned to the engine */
+        uint32_t nc = get_u32(c);
+        if (c->bad) return false;
+        for (uint32_t j = 0; j < nc; j++) {
+            if (!vz_str(c, true) || c->len - c->pos < sizeof(cidr_entry_t) || !v_cidr(c->p + c->pos)) return false;
+            c->pos += sizeof(cidr_entry_t);
+        }
+    }
+    return true;
+}
+
+/* the zattr area, exactly as build_zattr() lays it out: nloc, locations, location tags, ECS tags, ntr, ntr strings,
+ * nparsed (= ntr), zero padding to 8, nparsed x acl_entry_t; nothing after it */
+static bool v_zattr(const uint8_t *p, size_t len) {
+    cursor_t c = { p, len, 0, false };
+    uint32_t nloc = get_u32(&c);
+    if (c.bad || (size_t)nloc > (c.len - c.pos) / sizeof(tinydns_location_entry_t)) return false;
+    for (uint32_t i = 0; i < nloc; i++) {
+        if (c.p[c.pos + offsetof(tinydns_location_entry_t, prefix_bits)] > 32) return false;
+        c.pos += sizeof(tinydns_location_entry_t);
+    }
+    if (!vz_tags(&c) || !vz_tags(&c)) return false;
+    uint32_t ntr = get_u32(&c);
+    if (c.bad || ntr > c.len - c.pos) return false;
+    for (uint32_t i = 0; i < ntr; i++)
+        if (!vz_str(&c, true)) return false;
+    uint32_t np = get_u32(&c);
+    if (c.bad || np != ntr) return false;
+    if (np == 0) return c.pos == c.len;
+    size_t at = (c.pos + 7) & ~(size_t)7;
+    if (at > c.len || (size_t)np != (c.len - at) / sizeof(acl_entry_t) || (c.len - at) % sizeof(acl_entry_t) != 0) return false;
+    for (size_t i = c.pos; i < at; i++)
+        if (p[i] != 0) return false;
+    for (uint32_t i = 0; i < np; i++) {
+        const uint8_t *e = p + at + (size_t)i * sizeof(acl_entry_t);
+        if (!v_cidr(e) || e[offsetof(acl_entry_t, is_deny)] > 1) return false;
+    }
+    return true;
+}
+
+int zone_image_validate(const void *buf, size_t len, char *why, size_t whylen) {
+    int rc = 0;
+    uint8_t *bits = NULL;
+#define BAD(...) do { if (why && whylen) snprintf(why, whylen, __VA_ARGS__); rc = -1; goto out; } while (0)
+    if (why && whylen) why[0] = '\0';
+    if (!buf) BAD("no image");
+    if (len < sizeof(zone_image_t)) BAD("%zu octets are shorter than the header", len);
+    if (((uintptr_t)buf & 7) != 0) BAD("the image is not 8-byte aligned");
+    if (len > 0xFFFFF000u || (len & 7) != 0) BAD("size %zu is not a multiple of 8 below 4 GiB", len);
+    const zone_image_t *img = (const zone_image_t *)buf;
+    if (img->magic != ZONE_IMAGE_MAGIC) BAD("bad magic %08x", img->magic);
+    if (img->version != ZONE_IMAGE_VERSION) BAD("unknown version %u", img->version);
+    if (img->total_size != len) BAD("total_size %u is not the size %zu", img->total_size, len);
+    if (img->flags & ~(uint32_t)V_IMG_FLAGS) BAD("unknown flags %x", img->flags);
+    if (img->reserved_ != 0) BAD("reserved field is not 0");
+
+    const uint32_t n_names = img->n_names, n_rrs = img->n_rrs, n_ext = img->n_ext;
+    if (n_names >= 0x7FFFFFFFu || n_rrs >= 0x7FFFFFFFu) BAD("count of names or RRs out of range");
+    if (img->n_canon != n_names) BAD("n_canon %u != n_names %u", img->n_canon, n_names);
+    if (n_ext > n_rrs || img->n_nsec > n_rrs || img->n_n3entries > n_rrs || img->n_n3chains > img->n_n3entries ||
+        img->n_glue > n_names)
+        BAD("a count exceeds what it counts");
+    if (((img->flags & ZONE_IMAGE_F_EXT) != 0) != (n_ext != 0)) BAD("F_EXT does not match n_ext %u", n_ext);
+    if (((img->flags & ZONE_IMAGE_F_PERM) != 0) != (img->off_perm != 0)) BAD("F_PERM does not match off_perm");
+    if (img->off_perm && n_rrs < 2) BAD("a file order of %u RRs", n_rrs);   /* freeze keeps one only when it differs from the identity */
+    {
+        /* hash_size: a power of two with an empty slot, or find_name() would not end */
+        uint32_t hs = img->hash_size;
+        if (hs < 4 || (hs & (hs - 1)) != 0 || hs <= n_names) BAD("hash_size %u", hs);
+    }
+
+    /* the layout of zone_image_freeze(): each section follows the one before, padded to 8, in this order; with the total size
+     * equal to the length this puts every section inside the block and none over another */
+    uint64_t o = sizeof(zone_image_t);
+#define SECTION(field, count, esize) do { \
+        if ((uint64_t)img->field != o) BAD("%s is %u, expected %llu", #field, img->field, (unsigned long long)o); \
+        o = (o + (uint64_t)(count) * (esize) + 7) & ~(uint64_t)7; \
+    } while (0)
+    SECTION(off_names, n_names, sizeof(zone_image_name_t));
+    SECTION(off_rrs, n_rrs, sizeof(zone_image_rr_t));
+    SECTION(off_ext, n_ext, sizeof(zone_image_ext_t));
+    SECTION(off_n3chains, img->n_n3chains, sizeof(zone_image_n3chain_t));
+    SECTION(off_hash, img->hash_size, sizeof(uint32_t));
+    SECTION(off_canon, img->n_canon, sizeof(uint32_t));
+    SECTION(off_nsec, img->n_nsec, sizeof(uint32_t));
+    SECTION(off_n3entries, img->n_n3entries, sizeof(uint32_t));
+    SECTION(off_glue, img->n_glue, sizeof(uint32_t));
+    if (img->off_perm) SECTION(off_perm, n_rrs, sizeof(uint32_t));
+    SECTION(off_zattr, img->zattr_len, 1);
+#undef SECTION
+    if ((uint64_t)img->off_strings != o || o + 8 > len) BAD("off_strings is %u, expected %llu", img->off_strings, (unsigned long long)o);
+    const uint8_t *base = (const uint8_t *)buf;
+    const vstr_t vs = { base + img->off_strings, len - img->off_strings };
+
+    if (n_names || n_rrs) {
+        size_t nbits = n_names > n_rrs ? n_names : n_rrs;
+        bits = calloc((nbits + 7) / 8 + 1, 1);
+        if (!bits) { if (why && whylen) snprintf(why, whylen, "out of memory"); rc = -2; goto out; }
+    }
+
+    const zone_image_name_t *names = zone_image_names(img);
+    const zone_image_rr_t *rrs = zone_image_rrs(img);
+    const zone_image_ext_t *exts = zone_image_exts(img);
+    const uint32_t apex = img->apex_name;
+    if (apex != ZONE_IMAGE_NONE && apex >= n_names) BAD("apex_name %u", apex);
+
+    /* names, their RRs and the extras of those RRs, one owner at a time: the owners partition rrs[] in order */
+    uint64_t run = 0;
+    uint32_t next_ext = 1, n_glue_flag = 0;
+    bool any_wild = false, any_dname = false, any_alias = false, any_cut = false, any_view = false, soa_attr = false;
+    for (uint32_t id = 0; id < n_names; id++) {
+        const zone_image_name_t *nm = &names[id];
+        const char *text = v_owner(&vs, nm->text_off, nm->wire_off);
+        if (!text) BAD("name %u: owner text / wire form", id);
+        if (nm->hash != dns_name_hash_ci(text)) BAD("name %u: hash", id);
+        if (nm->rr_count_flags & ~(ZONE_IMAGE_NAME_COUNT_MASK | V_NAME_FLAGS)) BAD("name %u: unknown flags", id);
+        uint32_t count = nm->rr_count_flags & ZONE_IMAGE_NAME_COUNT_MASK;
+        if (count == 0 || nm->first_rr != run || run + count > n_rrs) BAD("name %u: RRs [%u, +%u) of %u", id, nm->first_rr, count, n_rrs);
+        if (nm->canon_rank >= img->n_canon) BAD("name %u: canon_rank %u", id, nm->canon_rank);
+        bool has_ns = false, has_dname = false, has_nsec = false, has_alias = false, has_addr = false;
+        for (uint32_t k = nm->first_rr; k < nm->first_rr + count; k++) {
+            const zone_image_rr_t *r = &rrs[k];
+            if (r->name_id != id) BAD("RR %u: name_id %u, in the range of name %u", k, r->name_id, id);
+            if (r->ttl > 0x7FFFFFFFu) BAD("RR %u: ttl", k);
+            if (r->flags & ~(uint16_t)(ZONE_IMAGE_RR_RAW | ZONE_IMAGE_RR_NO_NAMEWIRE)) BAD("RR %u: flags", k);
+            if (r->rdata_len > IMG_MAX_RDLEN) BAD("RR %u: rdata_len %u", k, r->rdata_len);
+            if (r->rdata_len == 0 ? r->rdata_off != 0
+                                  : (r->rdata_off < 8 || (uint64_t)r->rdata_off + r->rdata_len > vs.slen))
+                BAD("RR %u: RDATA [%u, +%u) outside the strings area", k, r->rdata_off, r->rdata_len);
+            if (r->type == 2) has_ns = true;
+            else if (r->type == 39) has_dname = true;
+            else if (r->type == 47) has_nsec = true;
+            else if (r->type == DNS_TYPE_PDNS_ALIAS && r->class_val == 1) has_alias = true;
+            if (r->type == 1 || r->type == 28) has_addr = true;
+            if (!(r->flags & ZONE_IMAGE_RR_RAW) && r->rdata_len) {
+                /* image_serialize_rr() writes these types name by name: the names must be whole names of at most 255 octets */
+                const dns_rdata_name_layout_t *lay = dns_rdata_name_layout(r->type);
+                if (lay && lay->compress) {
+                    const uint8_t *rd = vs.s + r->rdata_off;
+                    size_t pos = lay->skip;
+                    for (unsigned q = 0; q < lay->nnames; q++) {
+                        int wl = pos < r->rdata_len ? wire_name_len(rd + pos, r->rdata_len - pos < 255 ? r->rdata_len - pos : 255) : -1;
+                        if (wl < 0) BAD("RR %u (type %u): RDATA has no whole name %u", k, r->type, q);
+                        pos += (size_t)wl;
+                    }
+                }
+            }
+            if (r->ext_idx) {
+                if (r->ext_idx != next_ext || r->ext_idx > n_ext) BAD("RR %u: ext_idx %u (expected %u of %u)", k, r->ext_idx, next_ext, n_ext);
+                next_ext++;
+                const zone_image_ext_t *e = &exts[r->ext_idx - 1];
+                if ((e->flags & ~(uint8_t)ZONE_IMAGE_EXT_COUNTDOWN) || e->pad != 0) BAD("ext %u: flags", r->ext_idx - 1);
+                if ((e->ecs_tag_off && !v_cstr(&vs, e->ecs_tag_off, V_MAX_TAG, NULL)) ||
+                    (e->loc_tag_off && !v_cstr(&vs, e->loc_tag_off, V_MAX_TAG, NULL)))
+                    BAD("ext %u: tag", r->ext_idx - 1);
+                if (e->alt_text_off) {
+                    const char *alt = v_owner(&vs, e->alt_text_off, e->alt_wire_off);
+                    if (!alt || !domain_names_match_ci(alt, text)) BAD("ext %u: owner spelling", r->ext_idx - 1);
+                } else if (e->alt_wire_off) {
+                    BAD("ext %u: wire spelling without text", r->ext_idx - 1);
+                }
+                bool restricts = e->loc[0] != 0 || e->loc[1] != 0 || e->ecs_tag_off != 0 || e->loc_tag_off != 0 || e->ttd != 0;
+                if (restricts || (e->flags & ZONE_IMAGE_EXT_COUNTDOWN)) any_view = true;
+                if (restricts && id == apex && r->type == 6) soa_attr = true;
+            }
+        }
+        uint32_t want = 0;
+        if (has_ns && id != apex) want |= ZONE_IMAGE_NAME_CUT;
+        if (has_dname) want |= ZONE_IMAGE_NAME_DNAME;
+        if (has_nsec) want |= ZONE_IMAGE_NAME_NSEC;
+        if (has_alias) want |= ZONE_IMAGE_NAME_ALIAS;
+        if (text[0] == '*' && text[1] == '.') want |= ZONE_IMAGE_NAME_WILDCARD;
+        if (id == apex) want |= ZONE_IMAGE_NAME_APEX;
+        if ((nm->rr_count_flags & V_NAME_FLAGS & ~ZONE_IMAGE_NAME_GLUE) != want) BAD("name %u: flags %x, the RRs give %x", id, nm->rr_count_flags & V_NAME_FLAGS, want);
+        if (nm->rr_count_flags & ZONE_IMAGE_NAME_GLUE) {
+            if (!has_addr || ++n_glue_flag > IMG_MAX_PRELINK_TARGETS) BAD("name %u: glue flag", id);
+        }
+        any_wild |= (want & ZONE_IMAGE_NAME_WILDCARD) != 0;
+        any_dname |= has_dname;
+        any_alias |= has_alias;
+        any_cut |= (want & ZONE_IMAGE_NAME_CUT) != 0;
+        run += count;
+    }
+    if (run != n_rrs) BAD("the names hold %llu of %u RRs", (unsigned long long)run, n_rrs);
+    if (next_ext != n_ext + 1) BAD("%u of %u ext entries are used", next_ext - 1, n_ext);
+    {
+        uint32_t want = (img->flags & (ZONE_IMAGE_F_TINYDNS | ZONE_IMAGE_F_PERM)) | (n_ext ? ZONE_IMAGE_F_EXT : 0) |
+                        (any_view ? ZONE_IMAGE_F_VIEW : 0) | (any_wild ? ZONE_IMAGE_F_WILDCARD : 0) |
+                        (any_dname ? ZONE_IMAGE_F_DNAME : 0) | (any_alias ? ZONE_IMAGE_F_ALIAS : 0) |
+                        (any_cut ? ZONE_IMAGE_F_CUT : 0) | (soa_attr ? ZONE_IMAGE_F_SOA_ATTR : 0);
+        if (img->flags != want) BAD("flags %x, the contents give %x", img->flags, want);
+    }
+
+    /* the name hash table (zone_image_find_name()): linear probing, every slot is empty or a name id + 1, every name
+     * once, and every name is reachable from its home slot without crossing an empty slot */
+    if (n_names) {
+        const uint32_t *tab = zone_image_u32s(img, img->off_hash);
+        const size_t hs = img->hash_size, mask = hs - 1;
+        size_t empty = hs, occupied = 0;
+        for (size_t i = 0; i < hs; i++) {
+            if (tab[i] > n_names) BAD("hash slot %zu: %u", i, tab[i]);
+            if (tab[i] == 0) { if (empty == hs) empty = i; }
+            else occupied++;
+        }
+        if (occupied != n_names || empty == hs) BAD("hash table holds %zu of %u names", occupied, n_names);
+        bm_clear(bits, n_names);
+        size_t cluster = 0;
+        for (size_t j = 1; j <= hs; j++) {
+            size_t i = (empty + j) & mask;
+            if (tab[i] == 0) { cluster = 0; continue; }
+            uint32_t id = tab[i] - 1;
+            if (bm_get(bits, id)) BAD("hash table: name %u twice", id);
+            bm_set(bits, id);
+            cluster++;
+            if (((i - (names[id].hash & mask)) & mask) >= cluster) BAD("hash table: name %u is not reachable from its slot", id);
+        }
+    } else {
+        const uint32_t *tab = zone_image_u32s(img, img->off_hash);
+        for (size_t i = 0; i < img->hash_size; i++)
+            if (tab[i] != 0) BAD("hash slot %zu of a zone without names", i);
+    }
+
+    /* canonical order: a permutation of the names, strictly ascending (zone_image_canon_floor() is a binary search) */
+    {
+        const uint32_t *canon = zone_image_u32s(img, img->off_canon);
+        const char *prev = NULL;
+        for (uint32_t i = 0; i < img->n_canon; i++) {
+            if (canon[i] >= n_names || names[canon[i]].canon_rank != i) BAD("canon[%u] = %u", i, canon[i]);
+            const char *t = (const char *)vs.s + names[canon[i]].text_off;
+            if (prev && compare_canonical_name(prev, t) >= 0) BAD("canon[%u] is not after canon[%u]", i, i - 1);
+            prev = t;
+        }
+    }
+
+    /* NSEC index: NSEC RRs, owners in canonical order (zone_image_nsec_floor()) */
+    {
+        const uint32_t *nsec = zone_image_u32s(img, img->off_nsec);
+        const char *prev = NULL;
+        for (uint32_t i = 0; i < img->n_nsec; i++) {
+            if (nsec[i] >= n_rrs || rrs[nsec[i]].type != 47) BAD("nsec[%u] = %u", i, nsec[i]);
+            const char *t = (const char *)vs.s + names[rrs[nsec[i]].name_id].text_off;
+            if (prev && compare_canonical_name(prev, t) > 0) BAD("nsec[%u] is out of order", i);
+            prev = t;
+        }
+    }
+
+    /* NSEC3 chains: consecutive runs of NSEC3 RRs with the chain's parameters, hash labels in ascending order
+     * (zone_image_n3chain_lower_bound()), owners that find_matching_nsec3() can split */
+    {
+        const zone_image_n3chain_t *chs = zone_image_n3chains(img);
+        const uint32_t *ent = zone_image_u32s(img, img->off_n3entries);
+        uint64_t first = 0;
+        for (uint32_t c = 0; c < img->n_n3chains; c++) {
+            const zone_image_n3chain_t *ch = &chs[c];
+            if (ch->first != first || ch->count == 0 || ch->count > img->n_n3entries - first) BAD("NSEC3 chain %u: entries [%u, +%u)", c, ch->first, ch->count);
+            if (ch->salt_len == 0 ? ch->salt_off != 0 : (ch->salt_off < 8 || (uint64_t)ch->salt_off + ch->salt_len > vs.slen))
+                BAD("NSEC3 chain %u: salt", c);
+            const char *plabel = NULL;
+            size_t plen = 0;
+            for (uint32_t i = 0; i < ch->count; i++) {
+                uint32_t rr = ent[first + i];
+                zone_image_nsec3_t v;
+                if (rr >= n_rrs || rrs[rr].type != 50 || zone_image_nsec3(img, rr, &v) != 0) BAD("NSEC3 chain %u entry %u: RR %u", c, i, rr);
+                if (v.algorithm != ch->algorithm || v.iterations != ch->iterations || v.salt_len != ch->salt_len ||
+                    (v.salt_len && memcmp(v.salt, vs.s + ch->salt_off, v.salt_len) != 0))
+                    BAD("NSEC3 chain %u entry %u: parameters differ from the chain's", c, i);
+                const char *label = (const char *)vs.s + names[rrs[rr].name_id].text_off;
+                size_t hl;
+                if (!v_n3_owner(label, &hl)) BAD("NSEC3 chain %u entry %u: owner", c, i);
+                if (plabel) {
+                    int cmp = strncasecmp(plabel, label, plen < hl ? plen : hl);
+                    if (cmp == 0) cmp = plen < hl ? -1 : (plen > hl ? 1 : 0);
+                    if (cmp > 0) BAD("NSEC3 chain %u entry %u: out of hash order", c, i);
+                }
+                plabel = label;
+                plen = hl;
+            }
+            first += ch->count;
+        }
+        if (first != img->n_n3entries) BAD("the NSEC3 chains hold %llu of %u entries", (unsigned long long)first, img->n_n3entries);
+    }
+
+    /* the NSEC3 parameters of the zone (zone_nsec3() in the engine hands salt / chain to the lookups) */
+    if (img->n3_param_rr == ZONE_IMAGE_NONE) {
+        if (img->n3_chain != ZONE_IMAGE_NONE || img->n3_salt_off || img->n3_iterations || img->n3_algorithm || img->n3_salt_len)
+            BAD("NSEC3 parameters without an NSEC3PARAM RR");
+    } else {
+        zone_image_nsec3_t v;
+        if (img->n3_param_rr >= n_rrs || rrs[img->n3_param_rr].type != 51 || zone_image_nsec3(img, img->n3_param_rr, &v) != 0)
+            BAD("n3_param_rr %u", img->n3_param_rr);
+        if (img->n3_salt_len == 0 ? img->n3_salt_off != 0 : (img->n3_salt_off < 8 || (uint64_t)img->n3_salt_off + img->n3_salt_len > vs.slen))
+            BAD("n3_salt_off");
+        if (v.algorithm != img->n3_algorithm || v.iterations != img->n3_iterations || v.salt_len != img->n3_salt_len ||
+            (v.salt_len && memcmp(v.salt, vs.s + img->n3_salt_off, v.salt_len) != 0))
+            BAD("the NSEC3 parameters are not those of n3_param_rr");
+        if (img->n3_chain != ZONE_IMAGE_NONE) {
+            if (img->n3_chain >= img->n_n3chains) BAD("n3_chain %u", img->n3_chain);
+            const zone_image_n3chain_t *ch = &zone_image_n3chains(img)[img->n3_chain];
+            if (ch->algorithm != img->n3_algorithm || ch->iterations != img->n3_iterations || ch->salt_len != img->n3_salt_len ||
+                (ch->salt_len && memcmp(vs.s + ch->salt_off, vs.s + img->n3_salt_off, ch->salt_len) != 0))
+                BAD("n3_chain %u has other parameters than the zone's", img->n3_chain);
+        }
+    }
+
+    /* glue targets: distinct names that have an A / AAAA RR; every name flagged GLUE is among them */
+    if (n_names) {
+        const uint32_t *gl = zone_image_u32s(img, img->off_glue);
+        bm_clear(bits, n_names);
+        for (uint32_t i = 0; i < img->n_glue; i++) {
+            if (gl[i] >= n_names || bm_get(bits, gl[i])) BAD("glue[%u] = %u", i, gl[i]);
+            bm_set(bits, gl[i]);
+            bool has_addr = false;
+            for (uint32_t k = names[gl[i]].first_rr, e = k + (names[gl[i]].rr_count_flags & ZONE_IMAGE_NAME_COUNT_MASK); k < e; k++)
+                if (rrs[k].type == 1 || rrs[k].type == 28) { has_addr = true; break; }
+            if (!has_addr) BAD("glue[%u]: name %u has no address", i, gl[i]);
+        }
+        for (uint32_t id = 0; id < n_names; id++)
+            if ((names[id].rr_count_flags & ZONE_IMAGE_NAME_GLUE) && !bm_get(bits, id)) BAD("name %u is flagged glue but not in the list", id);
+    } else if (img->n_glue) {
+        BAD("glue targets of a zone without names");
+    }
+
+    /* file order: a permutation of the RRs (AXFR out and thaw walk it) */
+    if (img->off_perm && n_rrs) {
+        const uint32_t *perm = zone_image_u32s(img, img->off_perm);
+        bm_clear(bits, n_rrs);
+        for (uint32_t i = 0; i < n_rrs; i++) {
+            if (perm[i] >= n_rrs || bm_get(bits, perm[i])) BAD("perm[%u] = %u", i, perm[i]);
+            bm_set(bits, perm[i]);
+        }
+    }
+
+    /* zone level tables */
+    if (img->zattr_len && !v_zattr(base + img->off_zattr, img->zattr_len)) BAD("zone level tables (locations, tags, trusted resolvers)");
+out:
+#undef BAD
+    free(bits);
+    return rc;
+}

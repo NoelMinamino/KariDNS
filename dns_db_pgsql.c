@@ -101,6 +101,8 @@ struct db_conn {
     bool audit_summary;             /* open_write(): every write transaction starts with SET LOCAL karidns.audit = 'summary' (w_set_audit) */
     bool repeatable;                /* open_write(): every write transaction is REPEATABLE READ (w_set_snapshot: the signer) */
     bool has_zone_state, has_versions;      /* items D and E (open_write() connections only): karidns_zone_state; karidns_zone_versions and karidns_zone_version_rrsets */
+    uint32_t r_prepared;            /* 0.7 WP3: bit i = the read statement RS_* is prepared on this session */
+    db_mgroup_t mg;                 /* manifest_page: the row being assembled */
     bool have_actor;                /* w_set_actor(): every write transaction starts with SET LOCAL karidns.principal / karidns.change_set */
     char actor_pid[24], actor_cs[80];
 };
@@ -496,10 +498,10 @@ static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
             return -1;
         }
     }
-    /* items D and E: the zone generation and the zone versions.  Only a connection that writes (karidns-zone) cares; they are no tables the loader reads, so they
+    /* items D and E: the zone generation and the zone versions.  A connection that writes (karidns-zone) cares, and (0.7 WP3) manifest_page needs karidns_zone_state on a read connection too; they are no tables the loader reads, so they
      * are no entries of k_tables (the loader's privilege check of `karicheck db` would ask for them) */
     c->has_zone_state = c->has_versions = false;
-    if (c->writable) {
+    {
         ret = exec_rows(c, "SELECT to_regclass('karidns_zone_state') IS NOT NULL, to_regclass('karidns_zone_versions') IS NOT NULL AND to_regclass('karidns_zone_version_rrsets') IS NOT NULL",
                         0, NULL, &r, "schema");
         if (ret != 0) return ret;
@@ -1276,6 +1278,204 @@ static int pg_changes_since(db_conn_t *c, uint64_t after, db_change_cb cb, void 
 /* ------------------------------------------------------------------------------------------------------------- */
 /* notifications                                                                                                  */
 /* ------------------------------------------------------------------------------------------------------------- */
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 0.7 store, WP3: the paged calls (dns_db_driver.h).  Each is one statement (one snapshot), prepared once per    */
+/* session; no BEGIN / COMMIT round trips, nothing is held between pages.                                        */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+enum { RS_COUNT, RS_COUNT_VIEW, RS_MANIFEST, RS_CHANGES, RS_GAP };
+
+static int rs_exec(db_conn_t *c, int idx, const char *sql, int np, const char *const *pv, PGresult **out, const char *what) {
+    char name[16];
+    snprintf(name, sizeof(name), "kzr%d", idx);
+    if (!(c->r_prepared & (1u << idx))) {
+        PGresult *p = PQprepare(c->pg, name, sql, np, NULL);
+        if (!p || PQresultStatus(p) != PGRES_COMMAND_OK) {
+            int ret = pq_fail(c, p, what);
+            PQclear(p);
+            return ret;
+        }
+        PQclear(p);
+        c->r_prepared |= 1u << idx;
+    }
+    PGresult *r = PQexecPrepared(c->pg, name, np, pv, NULL, NULL, 0);
+    if (!r || PQresultStatus(r) != PGRES_TUPLES_OK) {
+        int ret = pq_fail(c, r, what);
+        PQclear(r);
+        return ret;
+    }
+    *out = r;
+    return 0;
+}
+
+static int need_schema3(db_conn_t *c, const char *what, const char *table) {
+    set_err(c, "%s: %s does not exist in this database (a plain PowerDNS schema: the 0.7 store needs karidns_zone_state and karidns_changes, "
+               "schema version 3, db/karidns_ext.pgsql.sql)", what, table);
+    return DB_ERR_NEED_SCHEMA3;
+}
+
+static int pg_count_domains(db_conn_t *c, const char *view, uint64_t *n) {
+    *n = 0;
+    bool by_view = view && c->has_domain_views;
+    PGresult *r = NULL;
+    const char *pv[1] = { view };
+    int ret = by_view ? rs_exec(c, RS_COUNT_VIEW,
+                                "SELECT (SELECT count(*) FROM domains) - (SELECT count(DISTINCT domain_id) FROM karidns_domain_views)"
+                                " + (SELECT count(DISTINCT domain_id) FROM karidns_domain_views WHERE lower(view_name) = lower($1::text))",
+                                1, pv, &r, "count_domains")
+                      : rs_exec(c, RS_COUNT, "SELECT count(*) FROM domains", 0, NULL, &r, "count_domains");
+    if (ret != 0) return ret;
+    long long v = PQgetisnull(r, 0, 0) ? 0 : strtoll(PQgetvalue(r, 0, 0), NULL, 10);
+    *n = v < 0 ? 0 : (uint64_t)v;
+    PQclear(r);
+    return 0;
+}
+
+static int pg_manifest_page(db_conn_t *c, int64_t after_id, unsigned limit, db_manifest_cb cb, void *ud, int64_t *last_id, unsigned *nrows) {
+    *last_id = after_id;
+    *nrows = 0;
+    if (limit == 0 || limit > DB_PAGE_MAX) {
+        set_err(c, "manifest_page: the limit must be 1 to %u", DB_PAGE_MAX);
+        return -1;
+    }
+    if (!c->has_zone_state) return need_schema3(c, "manifest_page", "karidns_zone_state");
+    /* the page of domains is cut first (an index scan on the primary key, LIMIT), then joined; the rows of one domain stay together */
+    char sql[800];
+    snprintf(sql, sizeof(sql),
+             "SELECT d.id, d.name, d.type, s.generation, s.changed_at, %s FROM (SELECT id, name, type FROM domains WHERE id > $1::bigint ORDER BY id LIMIT $2::bigint) d "
+             "LEFT JOIN karidns_zone_state s ON s.domain_id = d.id %s ORDER BY d.id%s",
+             c->has_domain_views ? "v.view_name" : "NULL::text", c->has_domain_views ? "LEFT JOIN karidns_domain_views v ON v.domain_id = d.id" : "",
+             c->has_domain_views ? ", v.view_name COLLATE \"C\"" : "");
+    char p1[32], p2[32];
+    snprintf(p1, sizeof(p1), "%lld", (long long)after_id);
+    snprintf(p2, sizeof(p2), "%u", limit);
+    const char *pv[2] = { p1, p2 };
+    PGresult *r = NULL;
+    int ret = rs_exec(c, RS_MANIFEST, sql, 2, pv, &r, "manifest_page");
+    if (ret != 0) return ret;
+    db_mgroup_t *g = &c->mg;
+    g->open = false;
+    for (int i = 0; i < PQntuples(r) && ret == 0; i++) {
+        int64_t id = cell_i64(r, i, 0);
+        if (g->open && id != g->row.id) {
+            g->open = false;
+            (*nrows)++;
+            *last_id = g->row.id;
+            if (cb(ud, &g->row) != 0) {
+                ret = DB_STOPPED;
+                break;
+            }
+        }
+        bool bad = false;
+        if (!g->open) {
+            const char *name = cell_text(c, r, i, 1, "domains", id, "name", &bad);
+            const char *type = cell_text(c, r, i, 2, "domains", id, "type", &bad);
+            bool has_state = !PQgetisnull(r, i, 3);
+            const char *why = bad ? NULL : db_mgroup_start(g, id, name, type, has_state, (uint64_t)cell_i64(r, i, 3), (uint64_t)cell_i64(r, i, 4));
+            if (why) {
+                set_err(c, "table domains id %lld: %s", (long long)id, why);
+                bad = true;
+            }
+            if (bad) {
+                ret = -1;
+                break;
+            }
+        }
+        const char *vn = cell_text(c, r, i, 5, "karidns_domain_views", id, "view_name", &bad);
+        const char *why = !bad && vn ? db_mgroup_view(g, vn) : NULL;
+        if (why) {
+            set_err(c, "table karidns_domain_views domain %lld: %s", (long long)id, why);
+            bad = true;
+        }
+        if (bad) ret = -1;
+    }
+    if (ret == 0 && g->open) {
+        g->open = false;
+        (*nrows)++;
+        *last_id = g->row.id;
+        if (cb(ud, &g->row) != 0) ret = DB_STOPPED;
+    }
+    g->open = false;
+    PQclear(r);
+    return ret;
+}
+
+static int pg_current_cursor(db_conn_t *c, uint64_t *cursor) {
+    *cursor = 0;
+    if (!c->has_changes) return need_schema3(c, "current_cursor", "karidns_changes");
+    return snapshot_xmin(c, cursor);
+}
+
+static int pg_changes_page(db_conn_t *c, db_change_pos_t *pos, unsigned limit, db_change_entry_cb cb, void *ud, bool *more, bool *gap) {
+    *more = false;
+    *gap = false;
+    if (limit == 0 || limit > DB_PAGE_MAX) {
+        set_err(c, "changes_page: the limit must be 1 to %u", DB_PAGE_MAX);
+        return -1;
+    }
+    if (!c->has_changes) return need_schema3(c, "changes_page", "karidns_changes");
+    /* The window: `limit` log rows of the transactions at or above the drain's floor (xid >= cursor) with seq above the drain's progress, one entry per
+     * domain (its highest seq), the domain's existence and the snapshot's xmin from the same statement (x is always one row, so the xmin comes even
+     * when the window is empty); mn, mx and cnt describe the whole window. */
+    static const char sql[] =
+        "WITH w AS (SELECT seq, domain_id FROM karidns_changes WHERE xid >= $1::xid8 AND seq > $2::bigint ORDER BY seq LIMIT $3::bigint), "
+        "a AS (SELECT domain_id, seq, min(seq) OVER () AS mn, max(seq) OVER () AS mx, count(*) OVER () AS cnt, "
+        "max(seq) OVER (PARTITION BY domain_id) AS dm FROM w), "
+        "x AS (SELECT pg_snapshot_xmin(pg_current_snapshot())::text AS xm) "
+        "SELECT a.domain_id, a.seq, EXISTS (SELECT 1 FROM domains d WHERE d.id = a.domain_id), a.mn, a.mx, a.cnt, x.xm "
+        "FROM x LEFT JOIN a ON a.seq = a.dm ORDER BY a.seq";
+    char p1[32], p2[32], p3[32];
+    snprintf(p1, sizeof(p1), "%llu", (unsigned long long)pos->cursor);
+    snprintf(p2, sizeof(p2), "%llu", (unsigned long long)pos->seq);
+    snprintf(p3, sizeof(p3), "%u", limit);
+    const char *pv[3] = { p1, p2, p3 };
+    PGresult *r = NULL;
+    int ret = rs_exec(c, RS_CHANGES, sql, 3, pv, &r, "changes_page");
+    if (ret != 0) return ret;
+    bool first = pos->seq == 0;
+    uint64_t xmin = strtoull(PQgetvalue(r, 0, 6), NULL, 10);
+    uint64_t settle = first ? xmin : pos->settle;
+    uint64_t mx = pos->seq;
+    int64_t cnt = 0;
+    for (int i = 0; i < PQntuples(r); i++) {
+        if (PQgetisnull(r, i, 0)) continue;                        /* the empty window: x alone */
+        mx = strtoull(PQgetvalue(r, i, 4), NULL, 10);
+        cnt = strtoll(PQgetvalue(r, i, 5), NULL, 10);
+        db_change_entry_t e;
+        e.seq = strtoull(PQgetvalue(r, i, 1), NULL, 10);
+        e.domain_id = cell_i64(r, i, 0);
+        e.op = cell_true(r, i, 2) ? DB_CHANGE_UPSERT : DB_CHANGE_DELETE;
+        if (cb(ud, &e) != 0) {
+            ret = DB_STOPPED;
+            break;
+        }
+    }
+    PQclear(r);
+    if (ret != 0) return ret;
+    if (first && pos->cursor > 0) {
+        if (pos->cursor > xmin) {
+            *gap = true;                                           /* a cursor from the future: not this cluster's counter */
+        } else {
+            /* pruned rows (the heuristic of changes_since): the log has rows, its first seq is not 1 and nothing is left below the cursor */
+            const char *gv[1] = { p1 };
+            ret = rs_exec(c, RS_GAP, "SELECT (SELECT min(seq) FROM karidns_changes), EXISTS (SELECT 1 FROM karidns_changes WHERE xid < $1::xid8)",
+                          1, gv, &r, "changes_page");
+            if (ret != 0) return ret;
+            if (!PQgetisnull(r, 0, 0) && strtoll(PQgetvalue(r, 0, 0), NULL, 10) > 1 && !cell_true(r, 0, 1)) *gap = true;
+            PQclear(r);
+        }
+    }
+    *more = cnt >= (int64_t)limit;
+    if (*more) {
+        pos->seq = mx;
+        pos->settle = settle;
+    } else {
+        pos->cursor = settle > pos->cursor ? settle : pos->cursor;
+        pos->seq = pos->settle = 0;
+    }
+    return 0;
+}
 
 static int ensure_listen(db_conn_t *c) {
     if (c->listening) return 0;
@@ -2126,6 +2326,7 @@ const db_driver_t db_driver_postgresql = {
     .find_zone = pg_find_zone,                  /* B13 */
     .scan_records_in = pg_scan_records_in, .scan_metadata_in = pg_scan_metadata_in, .scan_ext_in = pg_scan_ext_in,      /* B13b */
     .scan_apex = pg_scan_apex,                  /* D1a step 6 */
+    .count_domains = pg_count_domains, .manifest_page = pg_manifest_page, .current_cursor = pg_current_cursor, .changes_page = pg_changes_page,      /* 0.7 store, WP3 */
     /* M2, the ZoneImporter: write access (open_write connections only) */
     .open_write = pg_open_write, .w_begin = pg_w_begin, .w_commit = pg_w_commit, .w_rollback = pg_w_rollback,
     .w_create_zone = pg_w_create_zone, .w_delete_records = pg_w_delete_records, .w_insert_record = pg_w_insert_record,

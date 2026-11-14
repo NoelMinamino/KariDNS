@@ -137,7 +137,7 @@ fi
 if [ "$MODE" = "karidns" ] || [ "$MODE" = "all" ]; then
     [ "$MODE" = "all" ] && echo ""
     run_fuzz_group "KariDNS Server Fuzzer Smoke Run" \
-        fuzz_dns_wire fuzz_dns_server_core fuzz_zone_parser fuzz_zone_image \
+        fuzz_dns_wire fuzz_dns_server_core fuzz_zone_parser fuzz_zone_image fuzz_zone_image_validate \
         fuzz_conf_parser fuzz_tsig_sign fuzz_tsig_verify \
         fuzz_query_engine fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_pdns_content fuzz_pdns_metadata fuzz_db_checkline fuzz_json_escape fuzz_zone_text fuzz_zone_changes fuzz_db_logline fuzz_plugin_msg fuzz_nsec3_rebuild fuzz_alias_response
 fi

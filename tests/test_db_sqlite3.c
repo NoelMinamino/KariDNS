@@ -2799,6 +2799,377 @@ static void test_writes(void) {
 }
 
 
+
+/* ------------------------------------------------------------------ 0.7 store, WP3: the paged calls */
+typedef struct {
+    int64_t *id;
+    size_t n, cap;
+    char **name;
+    unsigned char *has_state, *nviews;
+    uint64_t *gen;
+    char views[2][24];                      /* the views of the last row that had two */
+    int stop_after;
+    bool ordered;
+    int64_t prev;
+} mp_t;
+
+static int mp_cb(void *ud, const db_manifest_row_t *r) {
+    mp_t *a = ud;
+    if (a->n >= a->cap) {
+        a->cap = a->cap ? a->cap * 2 : 1024;
+        a->id = realloc(a->id, a->cap * sizeof(*a->id));
+        a->name = realloc(a->name, a->cap * sizeof(*a->name));
+        a->has_state = realloc(a->has_state, a->cap);
+        a->nviews = realloc(a->nviews, a->cap);
+        a->gen = realloc(a->gen, a->cap * sizeof(*a->gen));
+    }
+    if (a->n > 0 && r->id <= a->prev) a->ordered = false;
+    a->prev = r->id;
+    a->id[a->n] = r->id;
+    a->name[a->n] = strdup(r->name);
+    a->has_state[a->n] = r->has_state;
+    a->nviews[a->n] = (unsigned char)r->nviews;
+    a->gen[a->n] = r->stamp_gen;
+    if (r->nviews == 2) {
+        snprintf(a->views[0], sizeof(a->views[0]), "%s", r->views[0]);
+        snprintf(a->views[1], sizeof(a->views[1]), "%s", r->views[1]);
+    }
+    a->n++;
+    return a->stop_after && (int)a->n >= a->stop_after;
+}
+
+static int mp_count_cb(void *ud, const db_manifest_row_t *r) {
+    (void)r;
+    (*(size_t *)ud)++;
+    return 0;
+}
+
+static void mp_free(mp_t *a) {
+    for (size_t i = 0; i < a->n; i++) free(a->name[i]);
+    free(a->id);
+    free(a->name);
+    free(a->has_state);
+    free(a->nviews);
+    free(a->gen);
+    memset(a, 0, sizeof(*a));
+    a->ordered = true;
+}
+
+/* the whole pass: pages of `limit` until a short page; the rows of all pages are appended to *a */
+static int mp_pass(const db_driver_t *D, db_conn_t *c, unsigned limit, mp_t *a, unsigned *npages) {
+    int64_t after = 0;
+    *npages = 0;
+    for (;;) {
+        int64_t last;
+        unsigned n;
+        int rc = D->manifest_page(c, after, limit, mp_cb, a, &last, &n);
+        if (rc != 0) return rc;
+        (*npages)++;
+        if (n < limit) return 0;
+        after = last;
+    }
+}
+
+typedef struct { size_t n; uint64_t seq[64]; int64_t dom[64]; db_change_op_t op[64]; } cp_t;
+static int cp_cb(void *ud, const db_change_entry_t *e) {
+    cp_t *a = ud;
+    if (a->n < 64) {
+        a->seq[a->n] = e->seq;
+        a->dom[a->n] = e->domain_id;
+        a->op[a->n] = e->op;
+    }
+    a->n++;
+    return 0;
+}
+static int cp_stop_cb(void *ud, const db_change_entry_t *e) {
+    (void)ud;
+    (void)e;
+    return 1;
+}
+static int cp_find(const cp_t *a, int64_t dom) {
+    for (size_t i = 0; i < a->n && i < 64; i++)
+        if (a->dom[i] == dom) return (int)i;
+    return -1;
+}
+
+static void test_paged(void) {
+    printf("paged calls: count_domains, manifest_page, current_cursor, changes_page (WP3)\n");
+    char path[600], err[DB_ERRLEN];
+    const db_driver_t *D = &db_driver_sqlite3;
+    db_schema_info_t si;
+
+    /* a plain PowerDNS schema: DB_ERR_NEED_SCHEMA3 with the table named; count_domains still works */
+    sqlite3 *pdb = make_db("paged_plain.db", path, sizeof(path));
+    add_simple_zone(pdb, 5, 1, "plain.test");
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL);
+    if (c) {
+        int64_t last = 7;
+        unsigned n = 9;
+        uint64_t cur = 5, cnt = 0;
+        db_change_pos_t pos;
+        bool more = true, gap = true;
+        cp_t cp = {0};
+        mp_t mp = { .ordered = true };
+        CHECK(D->check_schema(c, &si) == 0 && !si.has_zone_state && !si.has_changes);
+        CHECK(D->manifest_page(c, 0, 10, mp_cb, &mp, &last, &n) == DB_ERR_NEED_SCHEMA3 && n == 0 && last == 0 && mp.n == 0);
+        CHECK_HAS(D->errmsg(c), "karidns_zone_state");
+        CHECK(D->current_cursor(c, &cur) == DB_ERR_NEED_SCHEMA3 && cur == 0);
+        CHECK_HAS(D->errmsg(c), "karidns_changes");
+        db_change_pos_init(&pos, 0);
+        CHECK(D->changes_page(c, &pos, 10, cp_cb, &cp, &more, &gap) == DB_ERR_NEED_SCHEMA3 && !more && !gap && cp.n == 0);
+        CHECK(D->count_domains(c, NULL, &cnt) == 0 && cnt == 1);
+        CHECK(D->count_domains(c, "any", &cnt) == 0 && cnt == 1);      /* (no karidns_domain_views: every domain is in every view) */
+        D->close(c);
+    }
+    sqlite3_close(pdb);
+
+    /* 10,000 domains with ids 2, 4, ... (gaps), a version stamp from the triggers, and a view mapping on 30 % of them */
+    sqlite3 *db = make_db("paged.db", path, sizeof(path));
+    char *ext = slurp(g_ext_path);
+    CHECK(ext != NULL);
+    if (ext) raw_exec(db, ext);
+    free(ext);
+    raw_exec(db, "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10000) "
+                 "INSERT INTO domains (id, name, type) SELECT i * 2, printf('z%05d.pg.test', i), CASE WHEN i % 7 = 0 THEN 'MASTER' ELSE 'NATIVE' END FROM n");
+    raw_exec(db, "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10000) "
+                 "INSERT INTO karidns_domain_views (domain_id, view_name) SELECT i * 2, 'Beta' FROM n WHERE i % 10 IN (2, 3)");
+    raw_exec(db, "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10000) "
+                 "INSERT INTO karidns_domain_views (domain_id, view_name) SELECT i * 2, 'alpha' FROM n WHERE i % 10 IN (1, 2)");
+    raw_exec(db, "DELETE FROM karidns_zone_state WHERE domain_id = 8");           /* a zone without a state row: stamp 0, 0 */
+    c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL);
+    if (!c) {
+        sqlite3_close(db);
+        return;
+    }
+    CHECK(D->check_schema(c, &si) == 0 && si.has_zone_state && si.has_changes && si.has_domain_views);
+    CHECK(D->manifest_page != NULL && D->changes_page != NULL && D->current_cursor != NULL && D->count_domains != NULL);
+
+    uint64_t cnt = 0;
+    CHECK(D->count_domains(c, NULL, &cnt) == 0 && cnt == 10000);
+    CHECK(D->count_domains(c, "alpha", &cnt) == 0 && cnt == 9000);           /* 70 % without a row + 20 % with one for alpha */
+    CHECK(D->count_domains(c, "BETA", &cnt) == 0 && cnt == 9000);            /* ASCII case-insensitive */
+    CHECK(D->count_domains(c, "gamma", &cnt) == 0 && cnt == 7000);
+
+    /* the cursor is taken before the pass */
+    uint64_t cur0 = 0;
+    CHECK(D->current_cursor(c, &cur0) == 0 && cur0 > 10000);
+
+    /* pages cover every id exactly once, in order, whatever the page size (1000; 777 with a short last page; 10000 = one full page and an empty one; one page) */
+    static const unsigned sizes[] = { 1000, 777, 10000, 100000 };
+    for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
+        mp_t a = { .ordered = true };
+        unsigned pages = 0;
+        CHECK(mp_pass(D, c, sizes[k], &a, &pages) == 0);
+        CHECK_MSG(a.n == 10000 && a.ordered, "limit %u: %zu rows", sizes[k], a.n);
+        bool exact = a.n == 10000;
+        for (size_t i = 0; exact && i < a.n; i++) exact = a.id[i] == (int64_t)(i + 1) * 2;
+        CHECK_MSG(exact, "limit %u: ids are 2, 4, ... 20000", sizes[k]);
+        CHECK_MSG(pages == (10000 + sizes[k] - 1) / sizes[k] + (10000 % sizes[k] == 0 ? 1 : 0), "limit %u: %u pages", sizes[k], pages);
+        mp_free(&a);
+    }
+    {   /* stamps and mappings of known rows: i = 1 (alpha), 2 (alpha + Beta), 3 (Beta), 4 (id 8: no state row), 10 (nothing) */
+        mp_t a = { .ordered = true };
+        unsigned pages;
+        CHECK(mp_pass(D, c, 1000, &a, &pages) == 0 && a.n == 10000);
+        CHECK(a.nviews[0] == 1 && a.has_state[0] && a.gen[0] == 2);              /* the trigger: the domain insert + one view row */
+        CHECK(a.nviews[1] == 2 && a.gen[1] == 3);
+        CHECK(a.nviews[2] == 1 && a.gen[2] == 2);
+        CHECK(a.id[3] == 8 && !a.has_state[3] && a.gen[3] == 0 && a.nviews[3] == 0);
+        CHECK(a.nviews[9] == 0 && a.gen[9] == 1 && !strcmp(a.name[9], "z00010.pg.test"));
+        CHECK(!strcmp(a.views[0], "Beta") && !strcmp(a.views[1], "alpha"));      /* sorted in the C locale: "Beta" < "alpha" */
+        mp_free(&a);
+    }
+    {   /* a callback that stops the page; limit 0 and above the maximum are errors; a page past the end is empty */
+        mp_t a = { .ordered = true };
+        int64_t last = -1;
+        unsigned n = 99;
+        a.stop_after = 3;
+        CHECK(D->manifest_page(c, 0, 100, mp_cb, &a, &last, &n) == DB_STOPPED && n == 3 && last == 6 && a.n == 3);
+        mp_free(&a);
+        CHECK(D->manifest_page(c, 0, 0, mp_cb, &a, &last, &n) == -1 && D->manifest_page(c, 0, DB_PAGE_MAX + 1, mp_cb, &a, &last, &n) == -1);
+        CHECK(D->manifest_page(c, 20000, 10, mp_cb, &a, &last, &n) == 0 && n == 0 && last == 20000);
+        CHECK(D->manifest_page(c, 19998, 10, mp_cb, &a, &last, &n) == 0 && n == 1 && last == 20000);
+        mp_free(&a);
+    }
+
+    /* changes during a pass: the first half of the pass, then edits, then the rest of it; the drain from the cursor taken before reports every edit */
+    {
+        mp_t a = { .ordered = true };
+        int64_t last;
+        unsigned n;
+        CHECK(D->manifest_page(c, 0, 5000, mp_cb, &a, &last, &n) == 0 && n == 5000 && last == 10000);
+        raw_exec(db, "INSERT INTO domains (id, name, type) VALUES (100001, 'new.pg.test', 'NATIVE')");          /* after the pass position: the pass sees it too */
+        raw_exec(db, "INSERT INTO domains (id, name, type) VALUES (3, 'low.pg.test', 'NATIVE')");               /* below the pass position: only the drain sees it */
+        raw_exec(db, "INSERT INTO records (domain_id, name, type, content) VALUES (20, 'a.z00010.pg.test', 'A', '192.0.2.1')");
+        raw_exec(db, "INSERT INTO records (domain_id, name, type, content) VALUES (20, 'b.z00010.pg.test', 'A', '192.0.2.2')");     /* twice: one entry */
+        raw_exec(db, "DELETE FROM domains WHERE id = 40");                                                      /* already delivered, now gone */
+        raw_exec(db, "DELETE FROM domains WHERE id = 19990");                                                   /* not yet delivered, gone before the pass gets there */
+        raw_exec(db, "INSERT INTO domains (id, name, type) VALUES (100002, 'gone.pg.test', 'NATIVE')");        /* upsert, then delete: a delete */
+        raw_exec(db, "DELETE FROM domains WHERE id = 100002");
+        CHECK(D->manifest_page(c, last, 100000, mp_cb, &a, &last, &n) == 0 && n == 5000);                       /* 5000 left - id 19990 + id 100001 */
+        size_t seen40 = 0, seen19990 = 0, seen3 = 0, seen100001 = 0;
+        for (size_t i = 0; i < a.n; i++) {
+            seen40 += a.id[i] == 40;
+            seen19990 += a.id[i] == 19990;
+            seen3 += a.id[i] == 3;
+            seen100001 += a.id[i] == 100001;
+        }
+        CHECK(seen40 == 1 && seen19990 == 0 && seen3 == 0 && seen100001 == 1);     /* the pass is stale for id 40 and misses id 3: the drain covers both */
+        mp_free(&a);
+        cp_t cp = {0};
+        db_change_pos_t pos;
+        bool more = true, gap = true;
+        db_change_pos_init(&pos, cur0);
+        CHECK(D->changes_page(c, &pos, 1000, cp_cb, &cp, &more, &gap) == 0 && !more && !gap);
+        CHECK_MSG(cp.n == 6, "%zu entries", cp.n);
+        int i;
+        CHECK((i = cp_find(&cp, 100001)) >= 0 && cp.op[i] == DB_CHANGE_UPSERT);
+        CHECK((i = cp_find(&cp, 3)) >= 0 && cp.op[i] == DB_CHANGE_UPSERT);
+        CHECK((i = cp_find(&cp, 20)) >= 0 && cp.op[i] == DB_CHANGE_UPSERT);        /* two log rows, one entry */
+        CHECK((i = cp_find(&cp, 40)) >= 0 && cp.op[i] == DB_CHANGE_DELETE);
+        CHECK((i = cp_find(&cp, 19990)) >= 0 && cp.op[i] == DB_CHANGE_DELETE);
+        CHECK((i = cp_find(&cp, 100002)) >= 0 && cp.op[i] == DB_CHANGE_DELETE);    /* created and deleted: the state counts */
+        bool asc = true;
+        for (size_t k = 1; k < cp.n && k < 64; k++) asc = asc && cp.seq[k] > cp.seq[k - 1];
+        CHECK(asc);
+        uint64_t now = 0;
+        CHECK(D->current_cursor(c, &now) == 0 && pos.cursor == now && pos.seq == 0 && pos.settle == 0);
+        /* the next drain from the stored cursor: nothing, the cursor stays */
+        memset(&cp, 0, sizeof(cp));
+        CHECK(D->changes_page(c, &pos, 1000, cp_cb, &cp, &more, &gap) == 0 && cp.n == 0 && !more && !gap && pos.cursor == now);
+    }
+
+    /* pages of the log: 10 edits of 10 distinct domains with 4 log rows per page -> 3 pages; exactly 8 rows -> two full pages and an empty one */
+    {
+        uint64_t start = 0, now = 0;
+        CHECK(D->current_cursor(c, &start) == 0);
+        for (int k = 0; k < 10; k++) sqlf(db, "INSERT INTO records (domain_id, name, type, content) VALUES (%d, 'p.pg.test', 'A', '192.0.2.9')", 200 + 2 * k);
+        db_change_pos_t pos;
+        db_change_pos_init(&pos, start);
+        int pages = 0;
+        size_t total = 0;
+        bool more = true, gap = false;
+        int64_t seen[32];
+        while (more && pages < 10) {
+            cp_t cp = {0};
+            CHECK(D->changes_page(c, &pos, 4, cp_cb, &cp, &more, &gap) == 0 && !gap);
+            for (size_t k = 0; k < cp.n && total < 32; k++) seen[total++] = cp.dom[k];
+            pages++;
+        }
+        CHECK_MSG(pages == 3 && total == 10 && !more, "pages %d, entries %zu", pages, total);
+        int distinct = 0;
+        for (int k = 0; k < 10; k++) {
+            int found = 0;
+            for (size_t j = 0; j < total; j++) found += seen[j] == 200 + 2 * k;
+            distinct += found == 1;
+        }
+        CHECK(distinct == 10);
+        CHECK(D->current_cursor(c, &now) == 0 && pos.cursor == now);
+
+        CHECK(D->current_cursor(c, &start) == 0);
+        for (int k = 0; k < 8; k++) sqlf(db, "INSERT INTO records (domain_id, name, type, content) VALUES (%d, 'q.pg.test', 'A', '192.0.2.9')", 300 + 2 * k);
+        db_change_pos_init(&pos, start);
+        cp_t c1 = {0}, c2 = {0}, c3 = {0};
+        CHECK(D->changes_page(c, &pos, 4, cp_cb, &c1, &more, &gap) == 0 && more && c1.n == 4);
+        CHECK(D->changes_page(c, &pos, 4, cp_cb, &c2, &more, &gap) == 0 && more && c2.n == 4);
+        CHECK(D->changes_page(c, &pos, 4, cp_cb, &c3, &more, &gap) == 0 && !more && c3.n == 0 && !gap);
+        CHECK(D->current_cursor(c, &now) == 0 && pos.cursor == now);
+        /* a callback that stops: DB_STOPPED and the position does not move */
+        CHECK(D->current_cursor(c, &start) == 0);
+        sqlf(db, "INSERT INTO records (domain_id, name, type, content) VALUES (400, 'r.pg.test', 'A', '192.0.2.9')");
+        db_change_pos_init(&pos, start);
+        CHECK(D->changes_page(c, &pos, 4, cp_stop_cb, NULL, &more, &gap) == DB_STOPPED && pos.cursor == start);
+        CHECK(D->changes_page(c, &pos, 0, cp_cb, &c1, &more, &gap) == -1);
+    }
+
+    /* gaps: pruned rows, a cursor above the end of the log, an emptied log */
+    {
+        uint64_t top = 0;
+        CHECK(D->current_cursor(c, &top) == 0 && top > 100);
+        raw_exec(db, "DELETE FROM karidns_changes WHERE seq <= 50");
+        db_change_pos_t pos;
+        cp_t cp = {0};
+        bool more = false, gap = false;
+        db_change_pos_init(&pos, 10);
+        CHECK(D->changes_page(c, &pos, 100000, cp_cb, &cp, &more, &gap) == 0 && gap && cp.n > 0);
+        memset(&cp, 0, sizeof(cp));
+        db_change_pos_init(&pos, 60);
+        CHECK(D->changes_page(c, &pos, 100000, cp_cb, &cp, &more, &gap) == 0 && !gap && cp.n > 0);
+        memset(&cp, 0, sizeof(cp));
+        db_change_pos_init(&pos, top + 1000);
+        CHECK(D->changes_page(c, &pos, 100, cp_cb, &cp, &more, &gap) == 0 && gap && cp.n == 0);
+        db_change_pos_init(&pos, top);
+        CHECK(D->changes_page(c, &pos, 100, cp_cb, &cp, &more, &gap) == 0 && !gap && cp.n == 0);
+        raw_exec(db, "DELETE FROM karidns_changes");
+        db_change_pos_init(&pos, top);
+        CHECK(D->changes_page(c, &pos, 100, cp_cb, &cp, &more, &gap) == 0 && gap);
+    }
+
+    /* inside a snapshot the pages share it: a domain created between two pages is invisible until the snapshot ends */
+    {
+        mp_t a = { .ordered = true };
+        int64_t last;
+        unsigned n;
+        CHECK(D->begin_snapshot(c) == 0);
+        CHECK(D->manifest_page(c, 100001, 10, mp_cb, &a, &last, &n) == 0 && n == 0);
+        raw_exec(db, "INSERT INTO domains (id, name, type) VALUES (100003, 'snap.pg.test', 'NATIVE')");
+        CHECK(D->manifest_page(c, 100001, 10, mp_cb, &a, &last, &n) == 0 && n == 0);
+        CHECK(D->end_snapshot(c) == 0);
+        CHECK(D->manifest_page(c, 100001, 10, mp_cb, &a, &last, &n) == 0 && n == 1 && last == 100003);
+        mp_free(&a);
+    }
+    D->close(c);
+    sqlite3_close(db);
+}
+
+/* The rate of manifest_page at 1,000,000 generated rows (KARIDNS_TEST_MANIFEST_ROWS=1000000; off by default: the point is to confirm the
+ * page is not pathological, not to compare).  No triggers: the domains, the state rows and the mapping are bulk inserted. */
+static void test_manifest_rate(void) {
+    const char *e = getenv("KARIDNS_TEST_MANIFEST_ROWS");
+    if (!e || atol(e) <= 0) return;
+    long rows = atol(e);
+    printf("manifest_page rate at %ld rows\n", rows);
+    char path[600], err[DB_ERRLEN];
+    sqlite3 *db = make_db("paged_rate.db", path, sizeof(path));
+    raw_exec(db, "CREATE TABLE karidns_zone_state (domain_id INTEGER PRIMARY KEY REFERENCES domains(id) ON UPDATE CASCADE ON DELETE CASCADE,"
+                 " generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0), changed_at INTEGER NOT NULL DEFAULT 0)");
+    raw_exec(db, "CREATE TABLE karidns_domain_views (domain_id INTEGER NOT NULL REFERENCES domains(id) ON DELETE CASCADE, view_name VARCHAR(64) NOT NULL,"
+                 " PRIMARY KEY (domain_id, view_name))");
+    sqlf(db, "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < %ld) INSERT INTO domains (id, name, type) "
+             "SELECT i, printf('zone%%07d.rate.test', i), 'NATIVE' FROM n", rows);
+    raw_exec(db, "INSERT INTO karidns_zone_state (domain_id, generation, changed_at) SELECT id, 1 + id % 5, 1700000000 + id FROM domains");
+    raw_exec(db, "INSERT INTO karidns_domain_views (domain_id, view_name) SELECT id, 'v' || (id % 3) FROM domains WHERE id % 4 = 0");
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL);
+    if (c) {
+        db_schema_info_t si;
+        CHECK(db_driver_sqlite3.check_schema(c, &si) == 0 && si.has_zone_state);
+        struct timespec t0, t1;
+        int64_t after = 0, last;
+        unsigned n, pages = 0;
+        size_t total = 0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (;;) {
+            int rc = db_driver_sqlite3.manifest_page(c, after, 16384, mp_count_cb, &total, &last, &n);
+            if (rc != 0) {
+                CHECK(rc == 0);
+                break;
+            }
+            pages++;
+            if (n < 16384) break;
+            after = last;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double s = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+        CHECK(total == (size_t)rows);
+        printf("  manifest_page: %zu rows in %u pages of 16384, %.2f s, %.0f rows/s\n", total, pages, s, s > 0 ? (double)total / s : 0.0);
+        db_driver_sqlite3.close(c);
+    }
+    sqlite3_close(db);
+}
+
 /* schema version 3 (0.6.0 item B): versions 1 to 3 are read, 4 is refused (check_schema and schema_findings) */
 static void sv_finding(void *ud, char level, const char *text) {
     char *buf = ud;
@@ -3358,6 +3729,8 @@ int main(int argc, char **argv) {
     snprintf(g_ext_path, sizeof(g_ext_path), "%s/../../db/karidns_ext.sqlite3.sql", dir);
     snprintf(g_audit_path, sizeof(g_audit_path), "%s/../../db/karidns_audit.sqlite3.sql", dir);
     test_writes();
+    test_paged();
+    test_manifest_rate();
     test_schema_versions();
     test_audit_actor();
     test_cli();

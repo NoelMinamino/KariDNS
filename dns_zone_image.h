@@ -335,4 +335,24 @@ int zone_image_zattr_load(const zone_image_t *img, zone_arena_t *a);
  * not linked into the arena's record array. 0 = ok, -1 = cannot be decoded. Load path only (allocates). */
 int zone_image_rr_to_record(const zone_image_t *img, uint32_t rr, zone_arena_t *arena, dns_record_t *rec);
 
+/* ---- validation of an image that was not made by this process (read back from the store, S1) ----
+ *
+ * 0 = the block is an image the readers above can use: every offset, length, count and index in the header and in
+ * names[], rrs[], ext[], the canonical / NSEC / NSEC3 / glue / file-order arrays, the hash table, the strings
+ * (owner text and wire form, RDATA, tags) and the zone level tables is inside [buf, buf + len) and consistent with the
+ * rest, the name / image flags are those zone_image_freeze() would set for the contents, and the arrays the readers
+ * binary-search (canon, NSEC, the NSEC3 chains) are in order.  The accepted set is what zone_image_freeze() writes: an
+ * image that comes out of it always validates.
+ *
+ *   buf   the image, 8-byte aligned (the readers use typed pointers into it); a malloc()ed or mmap()ed block is
+ *   len   exactly zone_image_t.total_size (a multiple of 8, below 4 GiB)
+ *   why   (may be NULL) receives a short reason when the result is not 0
+ *
+ * Returns 0 valid, -1 not valid, -2 out of memory (no verdict).  O(len) time; allocates one bit array of
+ * max(n_names, n_rrs) bits (freed before it returns).  Does not read outside [buf, buf + len).  Not checked (the readers
+ * handle them themselves): the contents of RDATA beyond the domain names of the types serialize_dns_record() compresses
+ * (every reader takes the RDATA length from the RR and bounds its parse), NSEC / RRSIG semantics, TTL values.
+ * The checksum of the stored record is the caller's (the store's) business. */
+int zone_image_validate(const void *buf, size_t len, char *why, size_t whylen);
+
 #endif
