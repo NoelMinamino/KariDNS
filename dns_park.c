@@ -27,6 +27,9 @@ static bool key_fits(const char *view, const char *zone, size_t *vl, size_t *zl)
   return *vl > 0 && *vl <= PARK_VIEW_MAX && *zl > 0 && *zl <= PARK_ZONE_MAX;
 }
 
+/* totals of all workers for park_stats_get(): bumped on the failure paths only (a full table, a deadline) */
+static _Atomic uint64_t g_park_full, g_park_timeout;
+
 /* ------------------------------------------------------------------ the table */
 bool park_init(park_table_t *t, uint32_t cap) {
   memset(t, 0, sizeof(*t));
@@ -59,6 +62,7 @@ static park_entry_t *park_take(park_table_t *t, int64_t now_ms, uint32_t timeout
   if (!t->e || !key_fits(view, zone, &vl, &zl)) return NULL;
   if (t->nfree == 0) {
     t->n_full++;
+    atomic_fetch_add_explicit(&g_park_full, 1, memory_order_relaxed);
     return NULL;
   }
   uint32_t idx = t->free_idx[--t->nfree];
@@ -202,6 +206,7 @@ uint32_t park_expire(park_table_t *t, int64_t now_ms) {
   t->nwait -= n;
   t->nready += n;                                       /* (a TIMEOUT entry is "done" too: the worker answers it) */
   t->n_timeout += n;
+  if (n) atomic_fetch_add_explicit(&g_park_timeout, n, memory_order_relaxed);
   t->min_deadline_ms = min;
   return n;
 }
@@ -359,6 +364,13 @@ void park_wake_broadcast(const char *view, const char *zone, bool failed) {
     (void)park_wake_push(&g_wake[w], view, zone, failed);        /* (a full ring: the overflow flag wakes everything) */
     trigger(atomic_load_explicit(&g_wkq[w], memory_order_relaxed), PARK_WAKE_IDENT);
   }
+}
+
+void park_stats_get(park_stats_t *out) {
+  out->full = atomic_load_explicit(&g_park_full, memory_order_relaxed);
+  out->timeout = atomic_load_explicit(&g_park_timeout, memory_order_relaxed);
+  out->ring_dropped = 0;
+  for (int w = 0; w < PARK_MAX_WORKERS; w++) out->ring_dropped += atomic_load_explicit(&g_fetch[w].dropped, memory_order_relaxed);
 }
 
 void park_fetch_set_notify(int kq) { atomic_store_explicit(&g_ingest_kq, kq, memory_order_relaxed); }

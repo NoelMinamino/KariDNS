@@ -2588,6 +2588,15 @@ static bool dbreg_catalog_member_locked(const char *view, const char *name) {
     return e && e->is_catalog_member;
 }
 
+/* does the version that the entry serves have ALIAS records?  (0.7 B2: the scan of the alias thread is asked for when such an entry comes or goes) */
+static bool entry_has_alias(const zone_db_entry_t *e) {
+    const zone_version_t *v = e ? atomic_load_explicit(&e->rcu.active, memory_order_acquire) : NULL;
+    return v && v->image && (v->image->flags & ZONE_IMAGE_F_ALIAS);
+}
+
+/* an element that the alias thread may have a job for: its flag says so (set when the registry committed the entry) or the version it serves has ALIAS */
+static bool elem_has_alias(zdir_elem_t *z) { return (z->flags & ZDIR_F_ALIAS) || entry_has_alias(zdir_entry(z)); }
+
 /* what the directory keeps of a zone that the entry says: state, the flags of the image, the SOA timers */
 static void zdir_elem_sync(zdir_elem_t *z, zone_db_entry_t *entry) {
     zone_version_t *v = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
@@ -2671,7 +2680,12 @@ int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, boo
         gent = NULL;
         atomic_fetch_add_explicit(&g_dbreg_pending, w, memory_order_relaxed);
     }
+    /* 0.7 B2: a zone that is in the index (an evicted one that comes back, a replaced one) is served from the new entry as soon as the store below is done: the alias
+     * thread is asked to look again after it, not when the version was published into the entry (that was before the entry was reachable).  A zone that is
+     * not in the index yet comes with the delta (snapshot_apply_db_delta()), which looks at the ALIAS flag of the element. */
+    const bool alias_touch = created && in_index && (entry_has_alias(entry) || entry_has_alias(cur));
     if (created) atomic_store_explicit(&z->entry, entry, memory_order_release);   /* the initial reference of the entry is the registry's */
+    if (alias_touch) alias_notify();
     if (queue_add) {
         rv->adds[rv->n_adds++] = z;
         z->flags |= ZDIR_F_QUEUED;
@@ -3225,6 +3239,10 @@ static uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
         return 0;
     }
     e->evicted = true;                                 /* (writer_lock is held) an UPDATE that waited for the lock sees it and does not change this entry */
+    /* 0.7 B2: the IXFR differences of the zone are not served while the zone is out of memory (nor are they needed when it comes back: a new entry has none),
+     * and what they hold counts as resident; they go now, not with the entry (which waits for the garbage of a snapshot).  A transfer that holds one keeps it
+     * until it is over (reference count); writer_lock before the history's lock is the order compute_ixfr_diff() takes them in. */
+    ixfr_history_reset(e);
     atomic_fetch_add_explicit(&g_gone_queries, atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed), memory_order_relaxed);
     zone_version_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
     uint64_t bytes = (a && a->counted) ? a->bytes : 0;
@@ -3248,6 +3266,7 @@ static uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
     }
     atomic_store_explicit(&z->entry, NULL, memory_order_release);
     atomic_store_explicit(&z->state, ZDIR_ST_ABSENT, memory_order_release);
+    const bool had_alias = (z->flags & ZDIR_F_ALIAS) != 0 || (a && a->image && (a->image->flags & ZONE_IMAGE_F_ALIAS));
     if (bytes) {
         a->counted = false;
         zone_bytes_resident_add(ZBYTES_DB, -(int64_t)bytes);
@@ -3268,6 +3287,9 @@ static uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
     /* 0.7 M3, debug 2: memory-limit took this zone out of memory */
     logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] zone '%s' (view '%s') taken out of memory by memory-limit: %llu bytes, %llu queries since it came in", z->name,
                rv->name, (unsigned long long)bytes, (unsigned long long)atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed));
+    /* 0.7 B2: the element is in the index with no entry from here on: the ALIAS targets of the zone are not wanted any more.  No snapshot changes now, so
+     * the scan of the alias thread is asked for here (it used to notice a new snapshot pointer). */
+    if (had_alias) alias_notify();
     void (*notify)(void) = atomic_load_explicit(&g_pending_notify, memory_order_acquire);
     if (notify) notify();                              /* the ingest thread publishes the delta (and so retires the entry) */
     return bytes ? bytes : 1;
@@ -3996,6 +4018,7 @@ typedef struct {
     struct dplan_hide { zdir_elem_t *z; uint8_t by; } *hide;   /* registry elements that an element already in the index hides (D17-1, D-PRIO) */
     size_t nhide, caphide;
     const char *vname;                  /* the view (for the log) */
+    bool alias_touch;                   /* set by dplan_apply(): an element that carries ALIAS records goes in or out of the index (0.7 B2) */
 } dplan_t;
 
 static void dplan_free(dplan_t *p) {
@@ -4035,9 +4058,11 @@ static void dplan_apply(dplan_t *p) {
     }
     for (size_t i = 0; i < p->nadd; i++) {
         zdir_elem_t *old = zdir_insert(d, p->add[i]);
+        if (elem_has_alias(p->add[i]) || (old && elem_has_alias(old))) p->alias_touch = true;
         if (old && zdir_goes_to_garbage(old)) garb_elem(&g_garb, old);
     }
     for (size_t i = 0; i < p->nrem; i++) {
+        if (elem_has_alias(p->rem[i])) p->alias_touch = true;
         (void)zdir_remove(d, p->rem[i]);
         if (zdir_goes_to_garbage(p->rem[i])) garb_elem(&g_garb, p->rem[i]);
     }
@@ -4187,6 +4212,7 @@ int snapshot_apply_db_delta(void) {
     }
     /* nothing can fail from here on */
     int changes = 0;
+    bool alias_touch = false;
     for (size_t v = 0; v < old_snap->view_count; v++) {
         dplan_t *p = &plans[v];
         if (!p->dir) continue;
@@ -4196,6 +4222,7 @@ int snapshot_apply_db_delta(void) {
         if (rv->n_removes > 0 || p->nrem > 0) atomic_store_explicit(&g_glue_dirty, true, memory_order_release);
         changes += (int)(p->nrem + p->nadd + p->repl_changes);
         dplan_apply(p);
+        alias_touch = alias_touch || p->alias_touch;
         dplan_free(p);
     }
     free(plans);
@@ -4204,6 +4231,9 @@ int snapshot_apply_db_delta(void) {
     dbreg_pending_drop_locked();
     gc_retire_locked(old_snap);
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    /* 0.7 B2: a zone with ALIAS records came into the index or left it, and the snapshot that says so is published: the alias thread looks again.  A delta of
+     * zones without ALIAS (a warm-up of a million database zones) asks for no scan. */
+    if (alias_touch) alias_notify();
 
     gc_start_pending();
     return changes;
@@ -5644,6 +5674,12 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         gc_retire_locked(old_snap);
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+
+    /* 0.7 B2: the set of zones (the configured ones that came or went, the catalog members, the zones shared by in-view) is what the new snapshot says from here on.
+     * The notice of zone_publish_ex() for a zone file that was read while the snapshot was built came before this publish, and a zone that left published
+     * nothing; the alias thread is asked after the publish, so that its scan sees the snapshot.  A rebuild is a reconfiguration or a catalog change, not a
+     * per-zone event, so the scan is asked for without looking for ALIAS records first. */
+    alias_notify();
 
     if (old_snap) gc_start_pending();
 

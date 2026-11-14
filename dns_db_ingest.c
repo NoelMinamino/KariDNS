@@ -13,6 +13,7 @@
  * Allocation happens on the load path only (start, stream buffers, zones), never on the query path.
  */
 #include "dns_db_ingest.h"
+#include "dns_alias.h"
 #include "dns_utils.h"
 
 #include <errno.h>
@@ -1334,6 +1335,23 @@ static uint32_t fetch_sub_limit(uint32_t cap) {
   return half < cap ? half : cap;
 }
 static _Atomic uint64_t g_fetch_issued;   /* fetches of a whole zone sent to the loader (queries, transfers, the warm-up) */
+/* dbstatus "fetchq:" (B2 W3): where a fetch can be held up; the ingest thread writes them, the control thread reads them; all cumulative since the start */
+static _Atomic uint32_t g_fq_inflight, g_fq_peak;          /* fetches in flight now (g->nfreq) and the most there have been */
+static _Atomic uint64_t g_fq_table_full;                   /* requests of queries refused because every place of the fetch table was taken */
+static _Atomic uint64_t g_fq_loader_busy;                  /* fetches the loader turned away ("busy": its queue was full) */
+#define FQ_HIST_N 5
+static _Atomic uint64_t g_fq_hist[FQ_HIST_N];              /* fetches installed, by the time from the request to the install: <=1 ms, <=10 ms, <=100 ms, <=1 s, more */
+static _Atomic uint32_t g_ing_busy_pct;                    /* share of the last window (~10 s) the ingest thread was not waiting for events */
+#define ING_BUSY_WINDOW_NS 10000000000LL
+static void fq_hist_add(int64_t ms) {
+  int b = ms <= 1 ? 0 : ms <= 10 ? 1 : ms <= 100 ? 2 : ms <= 1000 ? 3 : 4;
+  atomic_fetch_add_explicit(&g_fq_hist[b], 1, memory_order_relaxed);
+}
+static int64_t mono_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
 static _Atomic uint32_t g_xfr_timeout_ms = KARIDNS_DB_XFR_FETCH_TIMEOUT_DEFAULT;   /* database { transfer-fetch-timeout } */
 static _Atomic uint64_t g_apex_asked, g_apex_answered, g_apex_walks;   /* D1a step 6: summaries asked for (for the apex of a zone out of memory, after a reload) / their fetches that ended */
 static _Atomic uint32_t g_warm_n;                         /* the length of the list of zones to read (g->nwarm, for dbstatus) */
@@ -2792,6 +2810,8 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
   ing_freq_t done = *r;
   r->active = false;
   g->nfreq--;
+  atomic_store_explicit(&g_fq_inflight, g->nfreq, memory_order_relaxed);
+  if (ok) fq_hist_add(now_ms() - done.sent_ms);
   if (done.mode != KDB_FETCH_SUMMARY) {
     dbreg_fetch_end(done.view_name, done.zone);
   } else {                                               /* (a summary is not a fetch of the data: it took no LOADING state) */
@@ -3066,6 +3086,7 @@ static void fetch_issue(ing_t *g) {
         warm_add_ex(g, q.view, q.zone, hot, false);
         break;
       }
+      atomic_fetch_add_explicit(&g_fq_table_full, 1, memory_order_relaxed);
       park_wake_broadcast(q.view, q.zone, true);
       continue;
     }
@@ -3093,6 +3114,8 @@ static void fetch_issue(ing_t *g) {
     snprintf(r->view_name, sizeof(r->view_name), "%s", g->view_names[vi]);
     snprintf(r->zone, sizeof(r->zone), "%s", q.zone);
     g->nfreq++;
+    atomic_store_explicit(&g_fq_inflight, g->nfreq, memory_order_relaxed);
+    if (g->nfreq > atomic_load_explicit(&g_fq_peak, memory_order_relaxed)) atomic_store_explicit(&g_fq_peak, g->nfreq, memory_order_relaxed);
     logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] fetch %llu: zone '%s' (view '%s'), %s, %s%s; %u in flight", (unsigned long long)r->id, r->zone, r->view_name,
                r->mode == KDB_FETCH_SUMMARY ? "summary (the apex)" : "whole zone", r->prio == KDB_FETCH_PRIO_WARM ? "warm-up" :
                r->prio == KDB_FETCH_PRIO_BACKGROUND ? "background (CNAME or glue)" : "for a query", hot ? ", hot list" : "", (unsigned)g->nfreq);
@@ -3171,6 +3194,7 @@ static void on_fetch_failed(ing_t *g, const kdb_zone_failed_t *zf) {
   }
   char reason[KDB_REASON_LEN];
   sane_copy(reason, sizeof(reason), zf->reason.p, zf->reason.len);
+  if (strcmp(reason, KDB_FETCH_BUSY_REASON) == 0) atomic_fetch_add_explicit(&g_fq_loader_busy, 1, memory_order_relaxed);
   fetch_complete(g, r, false, reason);
 }
 
@@ -3426,6 +3450,7 @@ static void *ingest_thread(void *arg) {
   ing_t *g = arg;
   rcu_aux_thread_pin();
   struct kevent evs[8];
+  int64_t win_start = mono_ns(), busy_ns = 0, t_wake = win_start;
   for (;;) {
     struct timespec ts, *tp = NULL;
     int64_t wait_ms = -1;
@@ -3441,6 +3466,7 @@ static void *ingest_thread(void *arg) {
     }
     if ((g->nwarm > 0 || (g->apex_walk && g->fetch_fd >= 0)) && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;      /* zones to read before a query asks, or the walk for apexes (while there is a fetch stream): try again soon */
     if (g->hold && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;           /* warm-before-serve: look at the warm-up and the time often */
+    if (wait_ms < 0 || wait_ms > 10000) wait_ms = 10000;                  /* (the busy share of dbstatus is closed at the end of a window, so the thread wakes at least that often) */
     if (wait_ms >= 0) {
       ts.tv_sec = wait_ms / 1000;
       ts.tv_nsec = (wait_ms % 1000) * 1000000;
@@ -3452,6 +3478,7 @@ static void *ingest_thread(void *arg) {
       syslog(LOG_ERR, "[DB] the ingest thread stops: kevent: %s", strerror(errno));
       return NULL;
     }
+    t_wake = mono_ns();
     for (int i = 0; i < n; i++) {
       const struct kevent *e = &evs[i];
       if (e->filter == EVFILT_USER && e->ident == ING_EVT_RESULT) {
@@ -3486,6 +3513,15 @@ static void *ingest_thread(void *arg) {
     hold_check(g);
     if (g->stream_fd >= 0 && g->out_off < g->out_len) out_flush(g);
     if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);
+    {
+      int64_t t1 = mono_ns();
+      busy_ns += t1 - t_wake;
+      if (t1 - win_start >= ING_BUSY_WINDOW_NS) {
+        atomic_store_explicit(&g_ing_busy_pct, (uint32_t)(busy_ns * 100 / (t1 - win_start)), memory_order_relaxed);
+        win_start = t1;
+        busy_ns = 0;
+      }
+    }
   }
 }
 
@@ -3913,6 +3949,17 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     st_append(&c, "fetch: rate=%u/s refused_by_rate=%llu issued=%llu concurrency=%u\n", (unsigned)atomic_load_explicit(&g_fetch_rate, memory_order_relaxed),
               (unsigned long long)atomic_load_explicit(&g_fetch_limited, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_fetch_issued, memory_order_relaxed),
               (unsigned)atomic_load_explicit(&g_fetch_conc, memory_order_relaxed));
+    {
+      park_stats_t ps;
+      park_stats_get(&ps);
+      st_append(&c, "fetchq: in_flight=%u peak=%u table_full=%llu ring_dropped=%llu park_full=%llu park_timeout=%llu loader_busy=%llu ingest_busy=%u%% hist=%llu,%llu,%llu,%llu,%llu\n",
+                (unsigned)atomic_load_explicit(&g_fq_inflight, memory_order_relaxed), (unsigned)atomic_load_explicit(&g_fq_peak, memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(&g_fq_table_full, memory_order_relaxed), (unsigned long long)ps.ring_dropped, (unsigned long long)ps.full,
+                (unsigned long long)ps.timeout, (unsigned long long)atomic_load_explicit(&g_fq_loader_busy, memory_order_relaxed),
+                (unsigned)atomic_load_explicit(&g_ing_busy_pct, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_fq_hist[0], memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(&g_fq_hist[1], memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_fq_hist[2], memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(&g_fq_hist[3], memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_fq_hist[4], memory_order_relaxed));
+    }
     dbreg_cache_stats_t cs;
     dbreg_cache_stats(&cs);
     {
@@ -3941,6 +3988,8 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     dbreg_dir_bytes(&nel, &rbytes, &ibytes);
     st_append(&c, "zone directory: %zu elements, %zu bytes in the registry + %zu bytes in the indexes of the views (%zu bytes per zone)\n",
               nel, rbytes, ibytes, nel ? (rbytes + ibytes) / nel : (size_t)0);
+    st_append(&c, "alias: scans=%llu (the alias thread's scans of the zones for ALIAS records: they follow ALIAS zones coming, changing and going and the configuration, not every zone a fetch brings)\n",
+              (unsigned long long)alias_scan_count());
     {
       /* D1a step 7: what is in memory, how the queries fare, the warm-up and the state file.  The lines above keep their form. */
       dbreg_residency_t rs;

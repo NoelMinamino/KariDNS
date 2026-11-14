@@ -41,6 +41,7 @@
 #include "../dns_config_parser.h"
 #include "../dns_db_install.h"
 #include "../dns_db_stream.h"
+#include "../dns_alias.h"
 #include "../dns_utils.h"
 #include "db/xfr_mocks.h"
 
@@ -167,6 +168,21 @@ static void zone_msg(msg_t *m, const char *zone, uint32_t serial, int nrr) {
         char o[320];
         snprintf(o, sizeof(o), "h%d.%s", i, zone);
         msg_a(m, o, (uint8_t)(i + 1));
+    }
+    msg_soa(m, zone, serial);
+}
+
+static void zone_msg_alias(msg_t *m, const char *zone, uint32_t serial, bool with_alias) {
+    msg_init(m);
+    msg_soa(m, zone, serial);
+    char ns[300], o[320];
+    snprintf(ns, sizeof(ns), "ns.%s", zone);
+    msg_ns(m, zone, ns);
+    msg_a(m, ns, 1);
+    if (with_alias) {
+        uint8_t rd[300];
+        snprintf(o, sizeof(o), "www.%s", zone);
+        msg_rr(m, o, 65401, 1, rd, put_name(rd, "target.example.net."));
     }
     msg_soa(m, zone, serial);
 }
@@ -1131,9 +1147,19 @@ static void test_secondary_entries(void) {
     CHECK(mem1 && mem1 != hid && mem1->is_catalog_member);                                  /* D17-1: the member wins */
     CHECK(!in_snapshot("default", hid) && dbreg_find_info("default", "m1.test.", info, 1) == 1 && info[0].shadowed);
 
+    /* 0.7 B2: a member with ALIAS records goes with its consumer: the delta that takes it out of the index asks the alias thread to scan */
+    {
+        msg_t am;
+        char why2[128];
+        zone_msg_alias(&am, "m2.test.", 9, true);
+        CHECK(mem2 && install_msgs(mem2, "m2.test.", 5, &am, 1, why2, sizeof(why2), NULL) == 0);
+    }
+    uint64_t an0 = alias_test_notices();
     /* the consumer's row is deleted: it leaves with its members, and the DB zone they hid is served again */
     CHECK(dbreg_delete("default", "cat.test.", 12) == 1);
+    CHECK(alias_test_notices() == an0);
     CHECK(snapshot_apply_db_delta() >= 1);
+    CHECK(alias_test_notices() > an0);
     CHECK(!name_in_snapshot("default", "cat.test.") && !name_in_snapshot("default", "m2.test."));
     CHECK(in_snapshot("default", hid));
     CHECK(dbreg_find_info("default", "m1.test.", info, 1) == 1 && !info[0].shadowed);
@@ -2333,6 +2359,161 @@ static void test_prev_concurrent(void) {
     CHECK(d.previous == 0 && d.retired == 0 && zone_bytes_underflows() == 0);
 }
 
+/* ---- 0.7 B2: the IXFR history of a zone that is taken out of memory is released with it ---- */
+static uint64_t history_charge(const zone_db_entry_t *e) {
+    uint64_t n = 0;
+    for (int i = 0; e->ixfr_history.entries && i < e->ixfr_history.cap; i++)
+        if (e->ixfr_history.entries[i] && e->ixfr_history.entries[i]->acct) n += e->ixfr_history.entries[i]->bytes;
+    return n;
+}
+
+static void test_evict_drops_ixfr_history(void) {
+    printf("[TEST] eviction releases the IXFR history's resident charge; evict / fetch-back cycles keep the resident total bounded...\n");
+    dbreg_reset();
+    rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+    zone_bytes_t d0, d1;
+    zone_bytes_get(ZBYTES_DB, &d0);
+    const char *nm = "ih.test.";
+    uint32_t serial = 1;
+    zone_db_entry_t *e = add_zone("default", nm, serial, 60, 9500);
+    CHECK(e != NULL && snapshot_apply_db_delta() == 1);
+    uint64_t resident_one = 0;
+    for (int cycle = 0; cycle < 8; cycle++) {
+        for (int k = 0; k < 4; k++) {                                          /* four more versions: the history holds four differences (the default depth) */
+            serial++;
+            CHECK(add_zone("default", nm, serial, 60 + (int)(serial % 3) * 5, 9500) == e);
+        }
+        CHECK(e->ixfr_history.count == 4);
+        uint64_t hist = history_charge(e);
+        CHECK(hist > 0);
+        zone_bytes_get(ZBYTES_DB, &d1);
+        CHECK(d1.resident > d0.resident + hist);                               /* the version and the history are resident */
+        if (cycle == 0) resident_one = d1.resident - d0.resident;
+        CHECK(d1.resident - d0.resident <= resident_one + 2048);               /* the same zone, the same figure: no drift from cycle to cycle */
+        zone_prev_expire(time(NULL) + 1000000);                                /* (the version kept for rollback and the replaced ones hold the entry: it is evicted only when nothing else does) */
+        zone_retire_process(true);
+        CHECK(dbreg_test_evict("default", nm));
+        CHECK(e->ixfr_history.count == 0 && history_charge(e) == 0);           /* the differences went with the data, not with the entry */
+        zone_bytes_get(ZBYTES_DB, &d1);
+        CHECK(d1.resident == d0.resident);                                     /* nothing of the zone is resident (its version is in the retired total) */
+        CHECK(snapshot_apply_db_delta() >= 0);
+        gc_snapshot_wait_idle();
+        zone_retire_process(true);
+        zone_bytes_get(ZBYTES_DB, &d1);
+        CHECK(d1.resident == d0.resident && d1.retired == d0.retired);
+        e = add_zone("default", nm, serial, 60, 9500);                         /* fetched back (the serial the directory has: no NOTIFY is queued): a new entry, no history */
+        CHECK(e != NULL && e->ixfr_history.count == 0);
+    }
+    CHECK(dbreg_delete("default", nm, 9500) == 1);
+    CHECK(snapshot_apply_db_delta() >= 1);
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+    zone_bytes_get(ZBYTES_DB, &d1);
+    CHECK(d1.resident == d0.resident && d1.retired == d0.retired && zone_bytes_underflows() == 0);
+}
+
+/* ---- 0.7 B2: when the alias thread is asked to scan.  alias_test_notices() counts alias_notify() calls; a scan follows each (the thread runs a scan at
+ * most once per tick for any number of calls).  A zone without ALIAS records asks for nothing; one with them asks after it is reachable ---- */
+/* the install and the commit of the ingest thread, with the number of notices between the two steps: a notice of the install (the version is published into
+ * an entry nobody can reach yet) is not what makes the zone scanned */
+static zone_db_entry_t *put_zone_alias(const char *view, const char *zone, uint32_t serial, bool with_alias, int64_t id, bool new_entry_wanted, uint64_t *commit_notices) {
+    msg_t m;
+    zone_msg_alias(&m, zone, serial, with_alias);
+    zone_db_entry_t *e = new_entry_wanted ? NULL : dbreg_lookup_entry(view, zone);
+    bool created = false;
+    if (!e) { e = new_entry(view, zone); created = true; }
+    char why[128];
+    int irc = install_msgs(e, zone, with_alias ? 5 : 4, &m, 1, why, sizeof(why), NULL);       /* (SOA, NS, A, ALIAS, SOA) */
+    if (irc != 0) printf("  install of %s failed: %s\n", zone, why);
+    CHECK(irc == 0);
+    uint8_t dg[32] = { 7 };
+    bool sh = false;
+    uint64_t n0 = alias_test_notices();
+    CHECK(dbreg_commit(view, zone, e, created, id, serial, dg, &sh) == 0);
+    if (commit_notices) *commit_notices = alias_test_notices() - n0;
+    return e;
+}
+
+static void test_alias_notices(void) {
+    printf("[TEST] the alias thread is asked to scan after an ALIAS zone arrives, changes, is replaced, deleted, evicted or fetched back, and not for other zones...\n");
+    dbreg_reset();
+    rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+    uint64_t n0 = alias_test_notices(), cn = 0;
+
+    /* a warm-up of zones without ALIAS: arriving, changing, being evicted and fetched back, deleted - no notice */
+    for (int i = 0; i < 6; i++) {
+        char nm[64];
+        snprintf(nm, sizeof(nm), "plain%d.test.", i);
+        CHECK(add_zone("default", nm, 1, 3, 9600 + i) != NULL);
+    }
+    CHECK(snapshot_apply_db_delta() == 6);
+    CHECK(add_zone("default", "plain0.test.", 2, 4, 9600) != NULL);
+    CHECK(dbreg_test_evict("default", "plain1.test.") && snapshot_apply_db_delta() >= 0);
+    CHECK(add_zone("default", "plain1.test.", 2, 3, 9601) != NULL);
+    CHECK(dbreg_delete("default", "plain2.test.", 9602) == 1 && snapshot_apply_db_delta() >= 1);
+    CHECK(alias_test_notices() == n0);
+
+    /* an ALIAS zone arrives: it is not in the directory until the delta, which asks (the notice of the install came before and is not enough) */
+    zone_db_entry_t *a = put_zone_alias("default", "al.test.", 1, true, 9700, false, &cn);
+    CHECK(a && cn == 0);                                                        /* not in the index: no notice from the commit */
+    uint64_t n1 = alias_test_notices();
+    CHECK(snapshot_apply_db_delta() == 1);
+    CHECK(alias_test_notices() > n1);
+
+
+    /* it changes (a new version published into its entry), also into one without ALIAS and back: the publication asks */
+    n1 = alias_test_notices();
+    (void)put_zone_alias("default", "al.test.", 2, true, 9700, false, &cn);
+    CHECK(alias_test_notices() > n1);
+    n1 = alias_test_notices();
+    (void)put_zone_alias("default", "al.test.", 3, false, 9700, false, &cn);
+    CHECK(alias_test_notices() > n1);                                           /* the ALIAS records went */
+    n1 = alias_test_notices();
+    (void)put_zone_alias("default", "al.test.", 4, true, 9700, false, &cn);
+    CHECK(alias_test_notices() > n1);
+
+    /* a new entry replaces the one that is served (the element stays in the index; the old entry's ALIAS targets are not wanted, the new one's are) */
+    zone_db_entry_t *r = put_zone_alias("default", "al.test.", 5, false, 9700, true, &cn);
+    CHECK(r && r != a && cn >= 1);
+    CHECK(snapshot_apply_db_delta() >= 0);
+    r = put_zone_alias("default", "al.test.", 6, true, 9700, true, &cn);
+    CHECK(r && cn >= 1);
+    CHECK(snapshot_apply_db_delta() >= 0);
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+
+    /* it is taken out of memory (the element stays in the index with no entry: the scan must drop its targets) ... */
+    n1 = alias_test_notices();
+    CHECK(dbreg_test_evict("default", "al.test."));
+    CHECK(alias_test_notices() > n1);
+    CHECK(snapshot_apply_db_delta() >= 0);
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+
+    /* ... and fetched back: the entry is reachable at the commit and no snapshot is published for it, so the commit asks */
+    CHECK(dbreg_lookup_entry("default", "al.test.") == NULL);
+    r = put_zone_alias("default", "al.test.", 7, true, 9700, false, &cn);
+    CHECK(r && cn >= 1);
+
+    /* deleted: the element leaves the index with the next delta, which asks */
+    n1 = alias_test_notices();
+    CHECK(dbreg_delete("default", "al.test.", 9700) == 1);
+    CHECK(alias_test_notices() == n1);
+    CHECK(snapshot_apply_db_delta() >= 1);
+    CHECK(alias_test_notices() > n1);
+
+    /* a rebuild of the zone directory (a reconfiguration, a catalog change) asks after it published the snapshot */
+    n1 = alias_test_notices();
+    rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
+    CHECK(alias_test_notices() > n1);
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+}
+
 int main(void) {
     snprintf(g_dir, sizeof(g_dir), "/tmp/karidns_dbreg.XXXXXX");
     if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
@@ -2361,6 +2542,8 @@ int main(void) {
     test_prev_db();
     test_bgload_cache();
     test_prev_concurrent();
+    test_evict_drops_ixfr_history();
+    test_alias_notices();
     test_concurrent();
     gc_snapshot_wait_idle();      /* join the cleanup threads: none is left running (or leaked, for ThreadSanitizer) at exit */
     free(g_names);

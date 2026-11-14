@@ -4487,7 +4487,7 @@ static void *fetch_main(void *arg) {
     while (!g_stop && !atomic_load(&g_fetch_stop) && !atomic_load(&io->wstop) && !io->eof && !io->failed) {
         while (io->nfbusy > 0) {                              /* the requests that did not fit the queue (only this thread uses them) */
             freq_t *b = &io->fbusy[--io->nfbusy];
-            if (fetch_fail(&x, b, "busy: too many fetch requests are waiting") != 0) goto out;
+            if (fetch_fail(&x, b, KDB_FETCH_BUSY_REASON) != 0) goto out;
         }
         struct pollfd p = { fd, POLLIN, 0 };
         int pr = poll(&p, 1, 200);

@@ -156,6 +156,14 @@ typedef struct {
 bool park_fetch_push(park_fetch_ring_t *r, const char *view, const char *zone, uint8_t prio, uint8_t mode);
 bool park_fetch_pop(park_fetch_ring_t *r, park_fetch_req_t *out);
 
+/* ---- totals for `karictl dbstatus` (fetchq:), all workers, since the start; relaxed atomics, no lock on the query path ---- */
+typedef struct {
+  uint64_t full;                     /* queries not parked because the worker's table was full */
+  uint64_t timeout;                  /* parked queries that reached their deadline */
+  uint64_t ring_dropped;             /* fetch requests the workers could not queue (their ring to the ingest thread was full) */
+} park_stats_t;
+void park_stats_get(park_stats_t *out);
+
 /* ---- the workers' rings, and the notifications ---- */
 /* Worker w (0 .. PARK_MAX_WORKERS-1) has its rings in these arrays.  kq: the kqueue the ingest thread triggers (-1: no notification,
  * unit tests). */

@@ -274,6 +274,33 @@ static void send_notify_zone(int fd, kdb_enc_t *e, uint16_t view, const char *zo
     ch_send(fd, e);
 }
 
+static void send_failed_why(int fd, kdb_enc_t *e, uint16_t view, const char *zone, uint64_t req, const char *why) {
+    kdb_enc_begin(e, KDB_T_ZONE_FAILED);
+    kdb_enc_u16(e, 1, view); kdb_enc_name(e, 2, zone); kdb_enc_i64(e, 3, 0); kdb_enc_str(e, 4, why); kdb_enc_u64(e, 5, req);
+    kdb_enc_end(e);
+    ch_send(fd, e);
+}
+
+/* a number of the "fetchq:" line of dbstatus (B2 W3); name "hist" with idx picks one of the five bucket counts; ~0 when the line or field is missing */
+static unsigned long long fq_field(const char *name, int idx) {
+    char st[8192];
+    if (db_ingest_status(NULL, NULL, st, sizeof(st)) == 0) return ~0ull;
+    const char *l = strstr(st, "\nfetchq: ");
+    if (!l) return ~0ull;
+    char key[32];
+    snprintf(key, sizeof(key), " %s=", name);
+    const char *eol = strchr(l + 1, '\n');
+    const char *p = strstr(l, key);
+    if (!p || (eol && p > eol)) return ~0ull;
+    p += strlen(key);
+    for (int i = 0; i < idx; i++) {
+        p = strchr(p, ',');
+        if (!p) return ~0ull;
+        p++;
+    }
+    return strtoull(p, NULL, 10);
+}
+
 static void send_failed(int fd, kdb_enc_t *e, uint16_t view, const char *zone, uint64_t req) {
     kdb_enc_begin(e, KDB_T_ZONE_FAILED);
     kdb_enc_u16(e, 1, view); kdb_enc_name(e, 2, zone); kdb_enc_i64(e, 3, 0); kdb_enc_str(e, 4, "no such zone in the database"); kdb_enc_u64(e, 5, req);
@@ -1190,6 +1217,29 @@ int main(void) {
     send_failed(f[0], &e, 0, "r.test.", m.u.fetch_req.request_id);
     CHECK(wake_next(&k, 5000) && strcmp(k.zone, "r.test.") == 0 && k.failed);
     CHECK(zdir_entry(elem_of("default", "r.test.")) == NULL && atomic_load(&elem_of("default", "r.test.")->state) == ZDIR_ST_ABSENT);
+
+    /* -- B2 W3, dbstatus "fetchq:": the loader's "busy" reply is told from other failures; a fetch that is installed lands in the histogram; none is in flight at rest */
+    {
+        const unsigned long long busy0 = fq_field("loader_busy", 0), peak0 = fq_field("peak", 0), h0 = fq_field("hist", 0) + fq_field("hist", 1) + fq_field("hist", 2) + fq_field("hist", 3) + fq_field("hist", 4);
+        CHECK(busy0 != ~0ull && peak0 != ~0ull && fq_field("table_full", 0) != ~0ull && fq_field("ring_dropped", 0) != ~0ull && fq_field("park_full", 0) != ~0ull &&
+              fq_field("park_timeout", 0) != ~0ull && fq_field("ingest_busy", 0) != ~0ull && fq_field("hist", 4) != ~0ull);
+        CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));        /* (r.test. is out of memory after the failure above) */
+        CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ);
+        send_failed_why(f[0], &e, 0, "r.test.", m.u.fetch_req.request_id, KDB_FETCH_BUSY_REASON);
+        CHECK(wake_next(&k, 5000) && strcmp(k.zone, "r.test.") == 0 && k.failed);
+        CHECK(fq_field("loader_busy", 0) == busy0 + 1);                                 /* (counted) */
+        CHECK(fq_field("peak", 0) >= 1 && fq_field("in_flight", 0) == 0);
+        CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+        CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ);
+        send_failed(f[0], &e, 0, "r.test.", m.u.fetch_req.request_id);                   /* another failure: not "busy" */
+        CHECK(wake_next(&k, 5000) && k.failed);
+        CHECK(fq_field("loader_busy", 0) == busy0 + 1 && fq_field("hist", 0) + fq_field("hist", 1) + fq_field("hist", 2) + fq_field("hist", 3) + fq_field("hist", 4) == h0);   /* (failed fetches are not in the histogram) */
+        CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+        CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ);
+        send_zone(f[0], &e, 0, "r.test.", 7, m.u.fetch_req.request_id, 11);
+        CHECK(wake_next(&k, 5000) && strcmp(k.zone, "r.test.") == 0 && !k.failed);
+        CHECK(fq_field("hist", 0) + fq_field("hist", 1) + fq_field("hist", 2) + fq_field("hist", 3) + fq_field("hist", 4) == h0 + 1 && fq_field("in_flight", 0) == 0);
+    }
 
     /* -- a profile (settings text) comes before the zone on the fetch stream, which has its own profile table (that of the batches is not
      *    shared): the zone is installed with those settings */

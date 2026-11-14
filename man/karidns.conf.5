@@ -1749,9 +1749,9 @@ leave and the count of a catalog change; the processes the manager started; a
 plugin's restart backoff and a stopped plugin reaped; an ALIAS target that
 failed and its next try. 2: the steps of a reload (parsed, published with its
 generation, zones rebuilt with the time and the failures), a zone snapshot
-published, the freeing of retired zone versions, an ALIAS refresh and the next
-one. 3: a control command as it was taken apart and what the key's permissions
-said.
+published, the freeing of retired zone versions, a scan of the zones for ALIAS
+records, an ALIAS refresh and the next one. 3: a control command as it was taken
+apart and what the key's permissions said.
 .TP 8
 \fBconfig\fR
 1: an \fBinclude\fR read (its path and size, never its text). 2: \fBoptions {
@@ -4328,6 +4328,38 @@ queries accepted after N ms\fR; and \fBstate\-file: <path>
 at_start=loaded|missing|corrupt, ignored|unreadable, ignored (N zones)
 hot_lists_sent=N last_sent=<time> (N zones) acks: written=N unchanged=N failed=N
 last_ack=<what> (N zones in the file)\fR.
+.IP \(bu 2
+\fB\fBfetchq:\fB (0.7): where a fetch is held up.\fR \fBkarictl dbstatus\fR has
+the line \fBfetchq: in_flight=N peak=N table_full=N ring_dropped=N park_full=N
+park_timeout=N loader_busy=N ingest_busy=P% hist=A,B,C,D,E\fR right after the
+\fBfetch:\fR line. Everything is counted since the server started, except
+\fBin_flight\fR (now) and \fBingest_busy\fR (the last window). Read it from the
+query to the install: \fBpark_full\fR counts queries that found the worker's
+table of parked queries full (\fBpark\-max\fR) and were answered "not ready" at
+once; \fBring_dropped\fR, queries whose request for the zone could not be handed
+from the worker to the ingest thread (the worker's ring of 128 was full: the
+ingest thread is behind); \fBfetch\-rate\fR, \fBfetch\-concurrency\fR and
+\fBmemory\-limit\fR refuse requests before the fetch is made
+(\fBrefused_by_rate=\fR and \fBshed=\fR of the other lines); \fBtable_full\fR,
+requests refused because all 256 places of the fetch table were taken (normally
+0: \fBfetch\-concurrency\fR, at most the 256 places, stops the requests of whole
+zones first, so only requests for summaries of zones can find the table full
+next to a \fBfetch\-concurrency\fR of 256); \fBin_flight\fR and \fBpeak\fR are
+the fetches on their way now and the most there have been at one time (compare
+\fBpeak\fR with \fBfetch\-concurrency\fR to see whether the limit is the one
+that held requests back); \fBloader_busy\fR, fetches the loader turned away
+because its own queue of requests was full; \fBhist\fR is the time from the
+request to the install of the zone, for the fetches that succeeded, in five
+counts (up to 1 ms, up to 10 ms, up to 100 ms, up to 1 s, more);
+\fBpark_timeout\fR, parked queries whose zone was not there before
+\fBpark\-timeout\fR ran out; \fBingest_busy\fR is the share of the last ten
+seconds in which the ingest thread was working and not waiting for something to
+do (0 for the first ten seconds; near 100% means the thread is the
+limit). Typical readings: a high \fBingest_busy\fR with a slow \fBhist\fR points
+to the Backend (ingest thread or install), a \fBhist\fR with most counts in the
+last two buckets and a low \fBingest_busy\fR to the loader or the database,
+\fBtable_full\fR or \fBring_dropped\fR above 0 to more simultaneous misses than
+the fetch path takes.
 .IP \(bu 2
 \fBTaking zones out (the cache manager).\fR A thread looks every 50 ms, at a
 slice of at most 20000 zones of the registry at a time (the lock is held for a

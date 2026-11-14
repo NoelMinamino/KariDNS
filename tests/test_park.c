@@ -451,6 +451,39 @@ static void test_slots_not_starved(void) {
   park_unregister_worker(0);
 }
 
+/* B2 W3: the totals of dbstatus "fetchq:" (park_stats_get) follow the per-table counters and the ring drops, across tables */
+static void test_stats(void) {
+  park_stats_t s0, s1;
+  park_table_t t1, t2;
+  udp_ipc_t ipc;
+  uint8_t pay[64];
+  memset(&ipc, 0, sizeof(ipc));
+  memset(pay, 0, sizeof(pay));
+  CHECK(park_init(&t1, 1) && park_init(&t2, 1));
+  park_stats_get(&s0);
+  CHECK(park_udp(&t1, 0, 100, "v0", "a.test.", 3, &ipc, pay, 20) == 0);
+  CHECK(park_udp(&t1, 0, 100, "v0", "b.test.", 3, &ipc, pay, 20) == -1);            /* table 1 is full */
+  CHECK(park_tcp(&t1, 0, 100, "v0", "c.test.", 5, 1, 1) == -1);                      /* ... for TCP too */
+  CHECK(park_udp(&t2, 0, 100, "v0", "a.test.", 3, &ipc, pay, 20) == 0);
+  CHECK(park_udp(&t2, 0, 100, "v0", "b.test.", 3, &ipc, pay, 20) == -1);            /* table 2 (another worker) is full */
+  CHECK(park_expire(&t1, 50) == 0 && park_expire(&t1, 100) == 1 && park_expire(&t2, 100) == 1);
+  park_register_worker(5, -1);
+  park_fetch_ring_t *r5 = park_fetch_ring(5);
+  park_fetch_req_t q;
+  while (park_fetch_pop(r5, &q)) {}                                                  /* (what the earlier tests left) */
+  for (int i = 0; i < PARK_FETCH_RING; i++) CHECK(park_fetch_request(5, "v1", "ring.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+  CHECK(!park_fetch_request(5, "v1", "ring.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));   /* the ring is full: dropped */
+  CHECK(!park_fetch_request(5, "v1", "ring.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+  park_stats_get(&s1);
+  CHECK(s1.full - s0.full == 3 && s1.timeout - s0.timeout == 2 && s1.ring_dropped - s0.ring_dropped == 2);
+  while (park_fetch_pop(r5, &q)) {}
+  park_unregister_worker(5);
+  park_stats_get(&s0);
+  CHECK(s0.full == s1.full && s0.timeout == s1.timeout && s0.ring_dropped == s1.ring_dropped);   /* nothing moves by itself */
+  park_free(&t1);
+  park_free(&t2);
+}
+
 int main(void) {
   test_table();
   test_tcp();
@@ -458,6 +491,7 @@ int main(void) {
   test_concurrent();
   test_any();
   test_slots_not_starved();
+  test_stats();
   printf("\n%d checks, %d failed\n", g_checks, g_failed);
   if (g_failed) return 1;
   printf("=== test_park: all checks passed ===\n");

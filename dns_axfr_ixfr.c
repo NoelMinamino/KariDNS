@@ -262,6 +262,37 @@ static int ixfr_fill(const zone_image_t *img, const uint32_t *rrs, size_t n, dns
   return 0;
 }
 
+/* 0.7 B2, K-6: the memory of a difference.  The first pool of its arena used to be (records * 512 + 1024) bytes and the whole capacity was charged to the
+ * zone memory totals: 3.1 KB for a difference of one SOA.  The pool is now sized from the records it will hold (ixfr_rr_arena_estimate(), at least
+ * IXFR_POOL_FLOOR) and the charge is what is used: the pools up to the end of the allocations in the last one, the blocks' own overhead included
+ * (ixfr_txn_bytes()).  The figure is computed once, when the difference is put in the history, kept in txn->bytes and given back as it is (free_ixfr_txn()),
+ * so a charge and its release cannot differ. */
+#define IXFR_POOL_FLOOR 256
+#define IXFR_POOL_MAX (64 * 1024)
+#define IXFR_BLOCK_OVERHEAD 16          /* the header and rounding of a malloc block, counted for every block the difference holds */
+
+/* What the text record made from RR `rr` takes in the arena (zone_image_rr_to_record()), measured: an A record 80 bytes, a 10-character owner name with an SOA
+ * 320, NS / MX / PTR / AAAA 100 - 130, a DS with a 32-byte digest 256, a TXT of 37 bytes 160; the owner name is kept once more, the RDATA as text and as a wire
+ * form, the numbers as strings.  An estimate that errs on the high side: too low costs another pool (at least 1 KB), too high some unused bytes at the end
+ * (not charged). */
+static size_t ixfr_rr_arena_estimate(const zone_image_t *img, uint32_t rr) {
+  return 96 + 2 * strlen(zone_image_name_text(img, zone_image_rr_name(img, rr))) + 4 * (size_t)zone_image_rr_rdlen(img, rr);
+}
+
+/* the bytes of the arena's pools that hold data (the pools before the last one in full: their unused ends are resident too) */
+static size_t ixfr_arena_used(const zone_arena_t *a) {
+  if (a->data_pool_count == 0) return 0;
+  return a->pool_bytes - (a->current_pool_cap - a->current_pool_idx);
+}
+
+/* what a difference holds, for the zone memory totals: the transaction, its two record arrays, the data in its arena and the pool table, and the overhead of
+ * each of those blocks */
+static size_t ixfr_txn_bytes(const ixfr_txn_t *t) {
+  size_t blocks = 1 + (t->deleted ? 1 : 0) + (t->added ? 1 : 0) + (size_t)t->arena.data_pool_count + (t->arena.data_pools ? 1 : 0);
+  size_t table = t->arena.data_pools ? (size_t)t->arena.data_pool_cap * sizeof(char *) : 0;
+  return sizeof(*t) + ((size_t)t->deleted_count + (size_t)t->added_count) * sizeof(dns_record_t) + table + ixfr_arena_used(&t->arena) + blocks * IXFR_BLOCK_OVERHEAD;
+}
+
 static void ixfr_txn_release(ixfr_txn_t *txn) {
   if (txn && atomic_fetch_sub_explicit(&txn->ref_count, 1, memory_order_acq_rel) == 1) free_ixfr_txn(txn);
 }
@@ -343,8 +374,11 @@ void compute_ixfr_diff(zone_db_entry_t *entry, const zone_version_t *old_ver, co
   txn = calloc(1, sizeof(ixfr_txn_t));
   if (!txn) goto out;
   zone_arena_init(&txn->arena);
-  /* S4: a small difference does not get a 64 KiB first pool */
-  txn->arena.first_pool_cap = ((del_count + add_count) * 512 + 1024) < 64 * 1024 ? (del_count + add_count) * 512 + 1024 : 64 * 1024;
+  /* S4: a small difference does not get a 64 KiB first pool; K-6: the size follows the records (a difference of one SOA needs a few hundred bytes) */
+  size_t pool_est = 0;
+  for (size_t i = 0; i < del_count; i++) pool_est += ixfr_rr_arena_estimate(oi, del_rr[i]);
+  for (size_t i = 0; i < add_count; i++) pool_est += ixfr_rr_arena_estimate(ni, add_rr[i]);
+  txn->arena.first_pool_cap = pool_est < IXFR_POOL_FLOOR ? IXFR_POOL_FLOOR : pool_est > IXFR_POOL_MAX ? IXFR_POOL_MAX : pool_est;
   /* the records live in the transaction's own arena: the images are freed with their versions */
   if (del_count > 0) txn->deleted = calloc(del_count, sizeof(dns_record_t));
   if (add_count > 0) txn->added = calloc(add_count, sizeof(dns_record_t));
@@ -381,7 +415,7 @@ void compute_ixfr_diff(zone_db_entry_t *entry, const zone_version_t *old_ver, co
   h->entries[h->head] = txn;
   h->head = (uint8_t)((h->head + 1) % h->cap);
   /* D1a (8.1): what the history holds counts as resident while the difference is in it (free_ixfr_txn() gives it back) */
-  txn->bytes = sizeof(*txn) + ((size_t)del_count + add_count) * sizeof(dns_record_t) + txn->arena.pool_bytes;
+  txn->bytes = ixfr_txn_bytes(txn);
   txn->acct = (int8_t)(1 + zone_bytes_class(entry));
   zone_bytes_resident_add(txn->acct - 1, (int64_t)txn->bytes);
   pthread_mutex_unlock(&h->lock);

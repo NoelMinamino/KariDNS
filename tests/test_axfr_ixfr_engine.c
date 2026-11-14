@@ -7234,6 +7234,132 @@ static void test_ixfr_history_depth(void) {
     printf("  -> ixfr-history depth passed.\n");
 }
 
+/* 0.7 B2, K-6: the zone memory charge of an IXFR difference.  A zone of `nrr` A records and an SOA; `gen` changes the address of every record (so the
+ * difference against another generation has nrr deleted and nrr added records, plus the SOA pair when the serials differ). */
+static void init_axfr_zone_n(zone_arena_t *arena, const char *domain, unsigned serial, int nrr, int gen) {
+    memset(arena, 0, sizeof(*arena));
+    zone_arena_init(arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = domain, .is_standalone_mode = true, .err_out = &err };
+    size_t cap = 512 + (size_t)nrr * 64;
+    char *text = malloc(cap);
+    assert(text != NULL);
+    size_t n = (size_t)snprintf(text, cap, "$ORIGIN %s\n$TTL 3600\n@ IN SOA ns1.example.com. admin.example.com. %u 7200 3600 1209600 300\n", domain, serial);
+    for (int i = 0; i < nrr; i++)
+        n += (size_t)snprintf(text + n, cap - n, "host%d IN A 192.0.%d.%d\n", i, gen % 200, i % 250 + 1);
+    char *zone_buf = arena_strdup(arena, text);
+    free(text);
+    assert(parse_zone_fast(zone_buf, strlen(zone_buf), arena, &ctx) >= 0);
+    assert(build_zone_index(arena, true) == 0);
+    arena->image = zone_image_freeze(arena, domain);
+    assert(arena->image != NULL);
+}
+
+/* what the ring of `h` holds, the way free_ixfr_txn() will give it back */
+static uint64_t ixfr_ring_charge(const ixfr_history_t *h) {
+    uint64_t n = 0;
+    for (int i = 0; h->entries && i < h->cap; i++)
+        if (h->entries[i] && h->entries[i]->acct) n += h->entries[i]->bytes;
+    return n;
+}
+
+static void test_ixfr_diff_charge(void) {
+    printf("[TEST] AXFR/IXFR: the zone memory charge of an IXFR difference (K-6: used bytes, not the capacity of the first pool; add == release)...\n");
+    static const char dom[] = "charge.example.";
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, dom, sizeof(entry.domain));
+    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    entry.source = ZONE_SRC_DB;
+    pthread_mutex_init(&entry.writer_lock, NULL);
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+    const int cls = zone_bytes_class(&entry);
+    zone_bytes_t b0, b1;
+    zone_bytes_get(cls, &b0);
+
+    /* the difference of one SOA: the old charge was sizeof(txn) + 2 records + the whole first pool of 2048 bytes (3.1 KB) */
+    zone_arena_t o, n;
+    init_axfr_zone(&o, dom, "1");
+    init_axfr_zone(&n, dom, "2");
+    compute_ixfr_diff(&entry, &o, &n);
+    assert(entry.ixfr_history.count == 1);
+    ixfr_txn_t *t = entry.ixfr_history.entries[0];
+    assert(t->deleted_count == 1 && t->added_count == 1 && t->acct == 1 + cls);
+    zone_bytes_get(cls, &b1);
+    assert(b1.resident - b0.resident == t->bytes);                      /* what was added is what the transaction says it holds */
+    const size_t old_charge = sizeof(*t) + 2 * sizeof(dns_record_t) + 2048;
+    const size_t fixed = sizeof(*t) + 2 * sizeof(dns_record_t);          /* the transaction (it holds a whole zone_arena_t) and its two records */
+    printf("  SOA-only difference: charged %zu bytes (%zu for the transaction and its 2 records, %zu above them; the old charge %zu); pools %d, pool bytes %zu\n",
+           t->bytes, fixed, t->bytes - fixed, old_charge, t->arena.data_pool_count, t->arena.pool_bytes);
+    assert(t->arena.data_pool_count == 1);                              /* the estimate held the data: no second pool */
+    assert(t->arena.pool_bytes < 1024);                                 /* the first pool is no longer 2 KB */
+    assert(t->bytes + 1024 <= old_charge);                              /* at least 1 KB less than before */
+    assert(t->bytes < fixed + 1024);                                    /* above the transaction and its records: the two SOA records as text (320 bytes each) and the blocks' overhead */
+    ixfr_history_clear(&entry.ixfr_history);
+    zone_bytes_get(cls, &b1);
+    assert(b1.resident == b0.resident);                                 /* released as charged */
+    zone_arena_destroy(&o);
+    zone_arena_destroy(&n);
+
+    /* a difference of 40 changed records and the SOA: the estimate holds it in the first pool or adds one small pool; the charge is below the capacity */
+    init_axfr_zone_n(&o, dom, 10, 40, 1);
+    init_axfr_zone_n(&n, dom, 11, 40, 2);
+    compute_ixfr_diff(&entry, &o, &n);
+    assert(entry.ixfr_history.count == 1);
+    t = entry.ixfr_history.entries[0];
+    assert(t->deleted_count == 41 && t->added_count == 41);
+    const size_t cap_charge = sizeof(*t) + 82 * sizeof(dns_record_t) + t->arena.pool_bytes;
+    printf("  41 + 41 records: charged %zu bytes (the capacity formula would give %zu); pools %d, pool bytes %zu, first pool %zu\n", t->bytes, cap_charge,
+           t->arena.data_pool_count, t->arena.pool_bytes, t->arena.first_pool_cap);
+    assert(t->arena.data_pool_count <= 2);
+    assert(t->bytes < cap_charge + 64);                                 /* used + the blocks' overhead is not above the capacity by more than the overhead */
+    assert(t->arena.first_pool_cap >= 256 && t->arena.first_pool_cap <= 64 * 1024);
+    ixfr_history_clear(&entry.ixfr_history);
+    zone_arena_destroy(&o);
+    zone_arena_destroy(&n);
+
+    /* a ring cycle: more differences than the ring holds, of different sizes; after each one the resident total is the base plus the charges in the ring */
+    ixfr_history_set_depth(&entry, 3);
+    uint32_t serial = 100;
+    int gen = 1;
+    for (int k = 0; k < 11; k++) {
+        int nrr = (k % 4) * 15 + (k == 9 ? 300 : 0);                    /* 0, 15, 30, 45 records; 300 once (the first pool is capped, more pools follow) */
+        init_axfr_zone_n(&o, dom, serial, nrr, gen);
+        init_axfr_zone_n(&n, dom, serial + 1, nrr, gen + 1);
+        compute_ixfr_diff(&entry, &o, &n);
+        zone_arena_destroy(&o);
+        zone_arena_destroy(&n);
+        serial++;
+        gen++;
+        assert(entry.ixfr_history.count == (k + 1 < 3 ? k + 1 : 3));
+        zone_bytes_get(cls, &b1);
+        assert(b1.resident - b0.resident == ixfr_ring_charge(&entry.ixfr_history));
+    }
+    /* a smaller ring drops the oldest now, with its charge; a reset (what eviction does) leaves nothing */
+    ixfr_history_set_depth(&entry, 1);
+    zone_bytes_get(cls, &b1);
+    assert(entry.ixfr_history.count == 1 && b1.resident - b0.resident == ixfr_ring_charge(&entry.ixfr_history));
+    ixfr_history_reset(&entry);
+    zone_bytes_get(cls, &b1);
+    assert(entry.ixfr_history.count == 0 && b1.resident == b0.resident);
+    ixfr_history_set_depth(&entry, 2);
+    init_axfr_zone_n(&o, dom, 500, 20, 1);
+    init_axfr_zone_n(&n, dom, 501, 20, 2);
+    compute_ixfr_diff(&entry, &o, &n);                                  /* the ring is made again after a reset */
+    zone_arena_destroy(&o);
+    zone_arena_destroy(&n);
+    assert(entry.ixfr_history.count == 1);
+    zone_bytes_get(cls, &b1);
+    assert(b1.resident > b0.resident);
+    ixfr_history_clear(&entry.ixfr_history);
+    zone_bytes_get(cls, &b1);
+    assert(b1.resident == b0.resident && zone_bytes_underflows() == 0);
+
+    pthread_mutex_destroy(&entry.writer_lock);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+    printf("  -> IXFR difference charge passed.\n");
+}
+
 /* ---------------------------------------------------------------------------------------------------------------------------------
  * B8t-2: Extended AXFR version 3 - the encoder records, the receiver (SOA_SET, wrapped SOA RRs, SETTINGS), the sender (version
  * negotiation, v2 refusal, byte-identity of v2 and v3 for a plain zone) and the settings (render, precedence, fail closed).
@@ -8724,6 +8850,7 @@ int main(void) {
     test_ixfr_delta_empty_records();
     test_ixfr_history_ring_buffer_wrap();
     test_ixfr_history_depth();
+    test_ixfr_diff_charge();
     test_axfr_extended_option_version_mismatch();
     test_axfr_extended_option_hash_mismatch();
     test_send_axfr_response_zero_records_nosoa();

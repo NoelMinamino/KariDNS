@@ -75,14 +75,19 @@ Current and high-water TCP connection counts
 .IP \(bu 2
 Size of the zone versions and IXFR deltas (D1a): the bytes of the published
 versions of the zones (the version, its image and its glue block) and of the
-IXFR deltas the zones keep (the data of the difference only), for the zones that
-come from the database and for the others, as \fBresident\fR (what the zones
-serve now) and \fBretired\fR (versions that a newer one replaced and that are
-not freed yet, because a reader or a transfer may still hold them). It is not
-the whole memory of a zone: the zone entry itself, its per-zone counters and the
-response cache are not in it. An IXFR delta that left the history stays counted
-as resident until the last transfer that reads it has released it. Read only:
-nothing limits them yet
+IXFR deltas the zones keep (the records of the difference and the data in them
+as it is used, with the overhead of each block: a difference of one SOA counts
+about 1.8 KB; 0.7), for the zones that come from the database and for the
+others, as \fBresident\fR (what the zones serve now) and \fBretired\fR (versions
+that a newer one replaced and that are not freed yet, because a reader or a
+transfer may still hold them). It is not the whole memory of a zone: the zone
+entry itself, its per-zone counters and the response cache are not in it. An
+IXFR delta that left the history stays counted as resident until the last
+transfer that reads it has released it. A database zone that \fBmemory\-limit\fR
+takes out of memory gives up its IXFR deltas at once (they are not served while
+the zone is out of memory, and the zone comes back without them), so evicting
+and fetching a zone again does not add to the resident bytes. Read only: nothing
+limits them yet
 .IP \(bu 2
 The bytes the zones keep for \fBrollback\fR (the previous versions, see
 \fBrollback\fR): \fBzone versions kept for rollback: database zones N bytes,
@@ -494,52 +499,74 @@ status row failed; the server keeps serving when it cannot write the row), the
 size of the zone versions and IXFR deltas (the same numbers as in \fBstatus\fR),
 the fetches of whole zones from the database (\fBfetch: rate=N/s
 refused_by_rate=N issued=N\fR; \fBissued\fR counts the zones the Backend asked
-the loader for: a query, a transfer, the warm-up), the NOTIFY of zones that are
-out of memory (D1a: \fBnotify of zones out of memory: queued=N deferred=N\fR,
-the zones whose serial changed while their data was out of memory that were
-handed to the control thread, and the ones that did not fit in the ring of 1024
-and are queued later), the zone transfers of zones that are out of memory (D1a,
-\fBtransfers of zones out of memory: waited=N loaded=N failed=N
-summary_answers=N marked=N timeout=Nms\fR: transfers that had to wait for the
-zone, the zones they got, the ones that ended with SERVFAIL, the IXFRs answered
-from the summary without reading the zone, the zones marked evict-next, and
-\fBtransfer\-fetch\-timeout\fR) and the cost of the zone directory (\fBzone
-directory: N elements, B bytes in the registry + I bytes in the indexes of the
-views (P bytes per zone)\fR; the entries and images are not in it). The warm-up
-and the cache (D1a step 7): \fBresidency: directory=N resident=N out_of_memory=N
-evictions=N\fR (the zones of the directory with and without data in memory),
-\fBqueries: answered=N parked=N hit_rate=P%\fR (the queries the zones answered,
-and the ones that had to wait for their zone; the hit rate is the share answered
-by a zone already in memory), \fBwarm: received=0|1 queued=N loaded=N skipped=N
-(memory limit N, already in memory or gone N) failed=N pending=N in_flight=N\fR
-(the zones of the loader's hot list: queued to read, read, not read because the
-memory limit's high water mark was reached or because they were in memory or
-gone, failed, still waiting, being read), \fBwarm\-before\-serve: off\fR,
-\fBholding the queries (N ms left)\fR or \fBqueries accepted after N ms\fR (the
-queries are held while the hot list is read; the control channel is not), and
-\fBstate\-file: <path> at_start=... hot_lists_sent=N ... acks: written=N
-unchanged=N failed=N ...\fR (what the loader found in its state file at its
-start, how many hot lists the Backend sent, and what the loader answered;
-\fBstate\-file: none\fR without \fBloader\-state\-file\fR). These lines come
-after the \fBzone directory:\fR line; the lines before keep their form. Then,
-the totals since the server started, and the last protocol error of the loader
-link. With a zone name (and optionally a view): that zone's view, database id,
-SOA serial, status (\fBapplied\fR, \fBrejected\fR or \fBshadowed\fR) and the
-last error, then, for a \fBSLAVE\fR or \fBCONSUMER\fR zone (B7b), its type,
-masters and TSIG key and the last successful transfer with the serial (the data
-of such a zone is kept in memory only; \fBsettings from the primary: in force\fR
-when the primary sent settings, B8t-2), then (B7a) the settings it runs with:
-where they come from (\fBprofile 'name'\fR with the zone's own metadata
-overriding it, \fBthe zone's own metadata\fR, or \fBnone\fR), its
-\fBallow\-transfer\fR and \fBallow\-update\fR entries with their match mode, the
-entries \fBacl\-ceiling\fR cuts away (\fBlies outside acl\-ceiling\fR, \fBis
-narrowed by acl\-ceiling\fR, or \fBno acl\-ceiling is configured: these ACLs
-refuse everybody\fR) and a \fBsettings error\fR line when a TSIG key the
-settings name is no longer defined in \fBkaridns.conf\fR. The summary also
-counts the distinct settings (zones with the same settings share one block) and
-the zones that name an undefined key. A zone that was rejected keeps serving its
-last good version (its serial is shown). Without a \fBdatabase\fR block the
-server answers \fBERROR no database block is configured\fR.
+the loader for: a query, a transfer, the warm-up), then \fBfetchq: in_flight=N
+peak=N table_full=N ring_dropped=N park_full=N park_timeout=N loader_busy=N
+ingest_busy=P% hist=A,B,C,D,E\fR (0.7: where a fetch is held up; all counted
+since the start except \fBin_flight\fR and \fBingest_busy\fR: \fBin_flight\fR
+and \fBpeak\fR are the fetches on their way now and the most there have been at
+one time; \fBtable_full\fR, requests refused because the 256 places of the fetch
+table were all taken; \fBring_dropped\fR, requests the workers could not hand to
+the ingest thread because their ring of 128 was full; \fBpark_full\fR, queries
+that found the table of parked queries full (\fBpark\-max\fR);
+\fBpark_timeout\fR, parked queries whose zone was not there before
+\fBpark\-timeout\fR; \fBloader_busy\fR, fetches the loader turned away because
+its queue was full; \fBingest_busy\fR, the share of the last ten seconds the
+ingest thread was working instead of waiting, 0 for the first ten seconds;
+\fBhist\fR, the time from the request to the install of the fetches that
+succeeded: up to 1 ms, up to 10 ms, up to 100 ms, up to 1 s, more; see
+"\fBkarictl dbstatus\fR shows it" under "Memory limit (D1a)" in
+\fBkaridns(8)\fR), the NOTIFY of zones that are out of memory (D1a: \fBnotify of
+zones out of memory: queued=N deferred=N\fR, the zones whose serial changed
+while their data was out of memory that were handed to the control thread, and
+the ones that did not fit in the ring of 1024 and are queued later), the zone
+transfers of zones that are out of memory (D1a, \fBtransfers of zones out of
+memory: waited=N loaded=N failed=N summary_answers=N marked=N timeout=Nms\fR:
+transfers that had to wait for the zone, the zones they got, the ones that ended
+with SERVFAIL, the IXFRs answered from the summary without reading the zone, the
+zones marked evict-next, and \fBtransfer\-fetch\-timeout\fR) and the cost of the
+zone directory (\fBzone directory: N elements, B bytes in the registry + I bytes
+in the indexes of the views (P bytes per zone)\fR; the entries and images are
+not in it), then \fBalias: scans=N\fR (0.7: how many times the thread that
+resolves the targets of ALIAS records scanned the zone directory for them since
+the start; a scan follows a zone with ALIAS records coming, changing, going or
+being taken out of memory and a reconfiguration, not every zone that is fetched
+or evicted, so the number stays where it is while zones without ALIAS records
+come and go; see "Expansion" under POWERDNS ALIAS AND LUA RECORDS in
+\fBkaridns(8)\fR). The warm-up and the cache (D1a step 7): \fBresidency:
+directory=N resident=N out_of_memory=N evictions=N\fR (the zones of the
+directory with and without data in memory), \fBqueries: answered=N parked=N
+hit_rate=P%\fR (the queries the zones answered, and the ones that had to wait
+for their zone; the hit rate is the share answered by a zone already in memory),
+\fBwarm: received=0|1 queued=N loaded=N skipped=N (memory limit N, already in
+memory or gone N) failed=N pending=N in_flight=N\fR (the zones of the loader's
+hot list: queued to read, read, not read because the memory limit's high water
+mark was reached or because they were in memory or gone, failed, still waiting,
+being read), \fBwarm\-before\-serve: off\fR, \fBholding the queries (N ms
+left)\fR or \fBqueries accepted after N ms\fR (the queries are held while the
+hot list is read; the control channel is not), and \fBstate\-file: <path>
+at_start=... hot_lists_sent=N ... acks: written=N unchanged=N failed=N ...\fR
+(what the loader found in its state file at its start, how many hot lists the
+Backend sent, and what the loader answered; \fBstate\-file: none\fR without
+\fBloader\-state\-file\fR). These lines come after the \fBzone directory:\fR
+line; the lines before keep their form. Then, the totals since the server
+started, and the last protocol error of the loader link. With a zone name (and
+optionally a view): that zone's view, database id, SOA serial, status
+(\fBapplied\fR, \fBrejected\fR or \fBshadowed\fR) and the last error, then, for
+a \fBSLAVE\fR or \fBCONSUMER\fR zone (B7b), its type, masters and TSIG key and
+the last successful transfer with the serial (the data of such a zone is kept in
+memory only; \fBsettings from the primary: in force\fR when the primary sent
+settings, B8t-2), then (B7a) the settings it runs with: where they come from
+(\fBprofile 'name'\fR with the zone's own metadata overriding it, \fBthe zone's
+own metadata\fR, or \fBnone\fR), its \fBallow\-transfer\fR and
+\fBallow\-update\fR entries with their match mode, the entries
+\fBacl\-ceiling\fR cuts away (\fBlies outside acl\-ceiling\fR, \fBis narrowed by
+acl\-ceiling\fR, or \fBno acl\-ceiling is configured: these ACLs refuse
+everybody\fR) and a \fBsettings error\fR line when a TSIG key the settings name
+is no longer defined in \fBkaridns.conf\fR. The summary also counts the distinct
+settings (zones with the same settings share one block) and the zones that name
+an undefined key. A zone that was rejected keeps serving its last good version
+(its serial is shown). Without a \fBdatabase\fR block the server answers
+\fBERROR no database block is configured\fR.
 .RS 8
 .PP
 .RS 2

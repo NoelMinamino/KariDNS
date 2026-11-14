@@ -724,6 +724,21 @@ ms tick (about 100 per second) and 3 s for one resolution. The results are about
 .IP \(bu 2
 \fBLogs.\fR The first failure of a target and its recovery are logged once
 (\fB[Alias] ...\fR in syslog).
+.IP \(bu 2
+\fBScans (0.7).\fR The thread finds the targets by scanning the zone directory,
+which costs time in proportion to the number of zones, so it scans when it is
+told that the zones with ALIAS records may have changed, and when the
+configuration changes, and not whenever the zone snapshot changes. A zone with
+ALIAS records that is published, reloaded, updated, rolled back, transferred,
+read from the database, replaced, deleted or taken out of memory by
+\fBmemory\-limit\fR, a zone that comes back into memory, a reload or
+reconfiguration, and a change of the members of a catalog zone tell it, after
+the change can be seen by queries. Zones without ALIAS records tell nothing: a
+database of a million zones that is fetched into and evicted from all the time
+costs no scan. Several notices within one tick (100 ms) are one scan. \fBkarictl
+dbstatus\fR counts the scans since the start (\fBalias: scans=N\fR); the
+category \fBgeneral\fR at debug level 2 logs each one (\fB[Alias] scanning the
+zones for ALIAS records\fR).
 .PP
 Differences from PowerDNS, on purpose: the TTL rule above; the stale answers and
 the "never resolved" SERVFAIL window; the SOA record that every NODATA answer

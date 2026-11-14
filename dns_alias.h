@@ -85,7 +85,8 @@ bool alias_wire_lower(const uint8_t *rdata, size_t rdlen, uint8_t *out, size_t *
 
 /* ---- the thread ---- */
 bool alias_start(void);              /* before the sandbox; false = the thread could not start */
-void alias_notify(void);             /* a zone with ALIAS RRs was published or removed: rescan soon */
+void alias_notify(void);             /* the zones with ALIAS RRs may have changed (a version, or the set of zones the directory holds): rescan soon.  Call it after the change is visible */
+uint64_t alias_scan_count(void);     /* the scans of the zones since start (karictl dbstatus "alias: scans=") */
 
 /* ---- exposed for the unit tests ---- */
 typedef struct {
@@ -107,5 +108,6 @@ void alias_test_want(const alias_rset_t *rs, const uint8_t *name, size_t nlen); 
 void alias_test_pass(void);
 void alias_test_reset(void);
 size_t alias_test_job_count(void);
+uint64_t alias_test_notices(void);        /* alias_notify() calls so far */
 
 #endif

@@ -942,32 +942,38 @@ static void scan_zones(void) {
 /* ------------------------------------------------------------------------------------------------------------- */
 
 static _Atomic uint64_t g_dirty;
+static _Atomic uint64_t g_scans;
 static pthread_t g_tid;
 static bool g_started;
 
-void alias_notify(void) { atomic_fetch_add_explicit(&g_dirty, 1, memory_order_relaxed); }
+/* The scan is driven by these notices and by the configuration generation, not by a change of the zone snapshot (0.7 B2): a snapshot changes for every
+ * zone a database fetch brings in, and a million-zone warm-up scanned the whole directory over and over.  So whoever changes the set of zones that
+ * the directory holds, or the version of a zone, tells us after the change is visible (zone_publish_ex(), the registry commit, the delta that
+ * puts elements in or takes them out, the eviction, the rebuild of the snapshot) - release here, acquire in the thread: the scan sees the change. */
+void alias_notify(void) { atomic_fetch_add_explicit(&g_dirty, 1, memory_order_release); }
+
+uint64_t alias_scan_count(void) { return atomic_load_explicit(&g_scans, memory_order_relaxed); }
 
 static void *alias_thread(void *arg) {
     (void)arg;
     uint64_t seen_dirty = (uint64_t)-1, seen_gen = (uint64_t)-1;
-    const void *seen_snap = NULL;
     /* runs until the Backend ends with _exit(); nothing joins or stops it */
     for (;;) {
-        uint64_t d = atomic_load_explicit(&g_dirty, memory_order_relaxed);
+        uint64_t d = atomic_load_explicit(&g_dirty, memory_order_acquire);
         uint64_t gen = 0;
-        const void *sp;
         rcu_aux_read_lock();
         server_config_t *cfg = acquire_config_snapshot();
         if (cfg) {
             gen = cfg->generation;
             release_config_snapshot(cfg);
         }
-        sp = acquire_zone_snapshot();
         rcu_aux_read_unlock();
-        if (d != seen_dirty || gen != seen_gen || sp != seen_snap) {
+        if (d != seen_dirty || gen != seen_gen) {
             seen_dirty = d;
             seen_gen = gen;
-            seen_snap = sp;
+            uint64_t n = atomic_fetch_add_explicit(&g_scans, 1, memory_order_relaxed) + 1;
+            logev_post(LOGC_GENERAL, 2, NULL, 0, "[Alias] scanning the zones for ALIAS records (scan %llu; notices %llu, configuration generation %llu)", (unsigned long long)n,
+                       (unsigned long long)d, (unsigned long long)gen);
             scan_zones();
         }
         run_pass();
@@ -1000,6 +1006,9 @@ static void free_jobs(void) {
 /* ------------------------------------------------------------------------------------------------------------- */
 /* tests                                                                                                          */
 /* ------------------------------------------------------------------------------------------------------------- */
+
+/* tests: how many times alias_notify() was called (what the thread would turn into scans) */
+uint64_t alias_test_notices(void) { return atomic_load_explicit(&g_dirty, memory_order_relaxed); }
 
 void alias_test_reset(void) {
     free_jobs();
