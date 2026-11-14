@@ -4,7 +4,7 @@ origin: "dns/karidns"
 comment: "High-performance authoritative DNS server for FreeBSD with Capsicum sandboxing"
 arch: "__ARCH__"
 www: "https://github.com/NoelMinamino/KariDNS"
-maintainer: "noel@karidns.org"
+maintainer: "NoelMinamino@users.noreply.github.com"
 prefix: "/usr/local"
 licenselogic: "single"
 licenses: [

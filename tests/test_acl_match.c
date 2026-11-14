@@ -234,7 +234,7 @@ static void test_errors(void) {
     CHECK(rejects("acl a { a; }; options { allow-query { a; }; };"));
     CHECK(rejects("acl localnets { 192.0.2.1; };"));
     CHECK(rejects("acl a { key nokey; }; options { allow-query { a; }; };"));
-    CHECK(rejects(KEYS "zone \"a.test\" { type master; file \"z\"; allow-query { 1.2.3.4; allow-update { any; }; };"));
+    CHECK(rejects(KEYS "zone \"a.test\" { type master; file \"z\"; allow-query { 192.0.2.4; allow-update { any; }; };"));
     CHECK(rejects(KEYS "zone \"a.test\" { type master; file \"z\"; allow-transfer { !key k1; any; }; transfer-acl-match all; };"));
     CHECK(rejects(KEYS "zone \"a.test\" { type master; file \"z\"; allow-update { !key k1; any; }; update-acl-match any; };"));
     {   /* ... but the same lists are fine in BIND's own (first match) mode */

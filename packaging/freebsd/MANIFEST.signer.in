@@ -4,7 +4,7 @@ origin: "dns/karidns-signer"
 comment: "Signer daemon for KariDNS database zones (static DNSSEC)"
 arch: "__ARCH__"
 www: "https://github.com/NoelMinamino/KariDNS"
-maintainer: "noel@karidns.org"
+maintainer: "NoelMinamino@users.noreply.github.com"
 prefix: "/usr/local"
 licenselogic: "single"
 licenses: [

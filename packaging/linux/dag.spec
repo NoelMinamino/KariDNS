@@ -40,5 +40,5 @@ make install-dag install-man-dag DESTDIR=%{buildroot} PREFIX=%{_prefix} BINDIR=%
 %{_mandir}/man1/dag.1*
 
 %changelog
-* Sun Aug 23 2026 Noel Minamino <noel@karidns.org> - 1.0.0-1
+* Sun Aug 23 2026 Noel Minamino <NoelMinamino@users.noreply.github.com> - 1.0.0-1
 - Initial packaging for dag

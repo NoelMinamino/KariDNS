@@ -362,7 +362,7 @@ test('login locks per account and network: ten failures, doubling, a day at most
   assert.deepEqual([l.fail(1, '192.0.2.1'), l.fail(1, '192.0.2.2')], [{ failed: 1, until: null }, { failed: 2, until: null }]);
   assert.deepEqual(l.fail(1, '192.0.2.3'), { failed: 3, until: 1000 });          // the same /24: locked
   assert.equal(l.locked(1, '192.0.2.200'), true);
-  assert.equal(l.locked(1, '192.0.3.1'), false);                                // another network
+  assert.equal(l.locked(1, '198.51.100.1'), false);                             // another network
   assert.equal(l.locked(2, '192.0.2.1'), false);                                // another account
   assert.deepEqual([l.fail(1, '192.0.2.1').until, l.fail(1, '192.0.2.1').until, l.fail(1, '192.0.2.1').until], [2000, 4000, 4000]);
   assert.deepEqual(l.of(1), [{ network: '192.0.2.0/24', failed: 6, locked_until: 4000 }]);

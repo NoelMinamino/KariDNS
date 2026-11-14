@@ -59,7 +59,7 @@ Version: ${VERSION}
 Section: net
 Priority: optional
 Architecture: ${DEB_ARCH}
-Maintainer: Noel Minamino <noel@karidns.org>
+Maintainer: Noel Minamino <NoelMinamino@users.noreply.github.com>
 Description: DNS Anomaly Generator - High-performance DNS query tool and fuzzer
  DAG is a lightweight and powerful DNS testing and query inspection client.
 EOF

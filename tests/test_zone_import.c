@@ -2701,7 +2701,7 @@ static void t_changes_parser(void) {
         { "rr www.example.test. 300\n", "type is missing" },
         { "rr www.example.test. 300 RRSIG A\n", "DNSSEC types" },
         { "rr www.example.test. 300 TYPE0047 \\# 0\n", "DNSSEC types" },
-        { "rr www.example.test. 300 any 1.2.3.4\n", "meta types" },
+        { "rr www.example.test. 300 any 192.0.2.4\n", "meta types" },
         { "rr www.example.test. 300 1A x\n", "record type name" },
         { "rr www.example.test. 300 A\n", "RDATA is missing" },
         { "rr www.example.test. 300 TXT \"a\" ; $INCLUDE /etc/passwd\n", "not safe" },

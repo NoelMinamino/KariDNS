@@ -124,10 +124,10 @@ $TTL 3600
 @       IN SOA   ns1.example.com. hostmaster.example.com. 2026092401 7200 3600 1209600 3600
 @       IN NS    ns1.example.com.
 ns1     IN A     192.0.2.1
-orphan.otherdomain.org. IN A 192.0.2.99
+orphan.otherdomain.test. IN A 192.0.2.99
 EOF
 # R-27: out-of-zone glue is reported (and ignored) as out-of-zone data, like the server loader does
-run_check_zone_warn "Warn on out-of-bailiwick orphan glue" "example.com" "$TMP_DIR/orphan_glue.zone" "out-of-zone record 'orphan.otherdomain.org.' A ignored"
+run_check_zone_warn "Warn on out-of-bailiwick orphan glue" "example.com" "$TMP_DIR/orphan_glue.zone" "out-of-zone record 'orphan.otherdomain.test.' A ignored"
 
 # 4. In-bailiwick glue with invalid IPv4 / IPv6 address
 cat <<'EOF' > "$TMP_DIR/invalid_glue_ip.zone"
@@ -222,7 +222,7 @@ $TTL 3600
 @       IN SOA   ns1.example.com. hostmaster.example.com. 2026092401 7200 3600 1209600 3600
 @       IN NS    ns1.example.com.
 ns1     IN A     192.0.2.1
-sub     IN NS    ns1.child.org.
+sub     IN NS    ns1.child.test.
 hidden.sub IN TXT "this record is occluded by delegation at sub"
 EOF
 run_check_zone_warn "Warn on record occluded by child delegation" "example.com" "$TMP_DIR/delegation_occlusion.zone" "is occluded by delegation"

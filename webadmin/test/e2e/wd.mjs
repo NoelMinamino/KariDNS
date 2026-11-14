@@ -24,7 +24,7 @@ export const quietPrefs = (downloadDir) => ({
   'network.prefetch-next': false, 'network.dns.disablePrefetch': true, 'network.http.speculative-parallel-limit': 0, 'network.predictor.enabled': false,
   'network.proxy.type': 0, 'media.peerconnection.enabled': false, 'dom.webnotifications.enabled': false, 'permissions.default.desktop-notification': 2,
   'browser.contentblocking.report.lockwise.enabled': false, 'browser.discovery.enabled': false, 'extensions.pocket.enabled': false,
-  // few processes and little memory (measured on pc200: these cut 8 processes and 3.1 GiB of resident size, shared pages counted once for every process, to 5 and 2.0
+  // few processes and little memory (measured on the build host: these cut 8 processes and 3.1 GiB of resident size, shared pages counted once for every process, to 5 and 2.0
   // GiB): one content process for everything, no process for media, graphics, the network or extensions, no preloading, no session history to keep
   'media.rdd-process.enabled': false, 'media.utility-process.enabled': false, 'network.process.enabled': false, 'layers.gpu-process.enabled': false,
   'extensions.webextensions.remote': false, 'browser.tabs.remote.separatePrivilegedContentProcess': false, 'browser.tabs.remote.separatedMozillaDomains': '',

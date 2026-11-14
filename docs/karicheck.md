@@ -204,7 +204,7 @@ Examples (the paths are those of a test installation; `example.test` and friends
 ```text
 $ karicheck db /usr/local/etc/karidns/karidns.conf
 [INFO] Loading config /usr/local/etc/karidns/karidns.conf...
-[INFO] Checking Database file '/usr/local/etc/karidns/zones.sqlite3' (the default view) with the rights of the user claude (uid 1002)
+[INFO] Checking Database file '/usr/local/etc/karidns/zones.sqlite3' (the default view) with the rights of the user dnsadmin (uid 1001)
 [INFO] Database file '/usr/local/etc/karidns/zones.sqlite3': karidns_* schema version 2
 [WARNING] Database file '/usr/local/etc/karidns/zones.sqlite3': zone 'example.test.' (domains.id 1): records.id 4: 1 record(s) have a NULL ttl; default-ttl 3600 used (first shown)
 [WARNING] Database file '/usr/local/etc/karidns/zones.sqlite3': zone 'example.test.' (domains.id 1): allow-transfer entry '198.51.100.0/24' is outside acl-ceiling; a client there is refused
@@ -222,7 +222,7 @@ $ karicheck db /usr/local/etc/karidns/noloader.conf
 [ERROR] DB support is not installed: the database loader '/usr/local/etc/karidns/no-such-loader' does not exist (this installation has no karidns-dbloader; install the karidns-sqlite3, karidns-postgresql or karidns-db package, or set loader-path)
 
 $ karicheck db /usr/local/etc/karidns/karidns.conf
-[ERROR] Database file '/usr/local/etc/karidns/zones.sqlite3': database file '/usr/local/etc/karidns/zones.sqlite3' is not readable by the user claude (uid 1002): it needs read permission (mode 0000, owner uid 1002, group gid 0)
+[ERROR] Database file '/usr/local/etc/karidns/zones.sqlite3': database file '/usr/local/etc/karidns/zones.sqlite3' is not readable by the user dnsadmin (uid 1001): it needs read permission (mode 0000, owner uid 1002, group gid 0)
 ```
 
 
