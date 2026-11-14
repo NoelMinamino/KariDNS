@@ -125,9 +125,9 @@ sub wire_name {
 # CAA (Type 257)
 {
     open my $fh, '>:raw', "$dir_rdata/seed_caa.bin" or die $!;
-    # flags=0, tag="issue", value="letsencrypt.org"
+    # flags=0, tag="issue", value="ca.example.test"
     my $tag = "issue";
-    my $val = "letsencrypt.org";
+    my $val = "ca.example.test";
     my $caa = pack('CC', 0, length($tag)) . $tag . $val;
     print $fh pack('n', 257) . $caa;
     close $fh;
@@ -205,7 +205,7 @@ make_path($dir_pcap);
 {
     # Raw IP + UDP + DNS Query
     open my $fh, '>:raw', "$dir_pcap/seed_raw_udp_dns.raw" or die $!;
-    my $dns_msg = pack('n6', 0x9abc, 0x0100, 1, 0, 0, 0) . wire_name("test.net") . pack('nn', 15, 1);
+    my $dns_msg = pack('n6', 0x9abc, 0x0100, 1, 0, 0, 0) . wire_name("dns.test") . pack('nn', 15, 1);
     my $udp_hdr = pack('nnnn', 5353, 53, 8 + length($dns_msg), 0);
     my $ip_len = 20 + length($udp_hdr) + length($dns_msg);
     my $ip_hdr = pack('CCnnnCCnC4C4', 0x45, 0, $ip_len, 0x9abc, 0x4000, 64, 17, 0, 192, 0, 2, 3, 192, 0, 2, 53);

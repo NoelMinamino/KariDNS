@@ -1,7 +1,7 @@
 // patch_geckodriver.mjs <in> <out>: makes a COPY of geckodriver that a FreeBSD 15.0 userland can start.
 //
 // The geckodriver package is built on 15.1, and it asks libc for the version FBSD_1.9 (posix_spawn_file_actions_addchdir, a symbol it uses only when it finds it).  The
-// userland of the build host's jail (pc200) is 15.0, whose libc has no FBSD_1.9: ld-elf.so.1 refuses to start the program.  This changes the one entry of the
+// userland of the build host's jail is 15.0, whose libc has no FBSD_1.9: ld-elf.so.1 refuses to start the program.  This changes the one entry of the
 // version-needed table that names FBSD_1.9 into FBSD_1.8; the symbol is then looked up under that version, is not found, and, being weak, is null (Rust's std takes
 // the fork path).  Nothing else is changed.  Where geckodriver starts as it is (a 15.1 host, the CI VM), this is not needed and run_webadmin_gui_test.sh does not do it.
 

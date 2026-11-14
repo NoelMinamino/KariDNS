@@ -63,7 +63,7 @@ echo "[*] Initial OLD_SERIAL = $OLD_SERIAL"
 echo "[*] Modifying zone (adding ixfr-test-record) and reloading..."
 sed -i '' -E -e "s/^([[:space:]]*)[0-9]{10}([[:space:]]*;.*serial.*)/\1${NEW_SERIAL}\2/" "$TEST_ZONE"
 sed -i '' -E -e "/ixfr-test-record/d" "$TEST_ZONE"
-echo "ixfr-test-record IN A 1.2.3.99" >> "$TEST_ZONE"
+echo "ixfr-test-record IN A 203.0.113.99" >> "$TEST_ZONE"
 $KARICTL -f "$CTL_CONF" reload >/dev/null 2>&1
 sleep 1
 check_asan_log

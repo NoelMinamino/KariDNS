@@ -126,7 +126,7 @@ static const char *ROUNDTRIP_LINES[] = {
     "IN AMTRELAY 10 1 2 2001:db8::2",
     "IN AMTRELAY 10 0 3 relay.example.",
     "IN AMTRELAY 10 0 0 .",
-    "IN CAA 0 issue \"letsencrypt.org\"",
+    "IN CAA 0 issue \"ca.example.test\"",
     "IN CDS 12345 8 2 AABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899",
     "IN CDNSKEY 257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ==",
     "IN CERT 1 12345 8 AQIDBAUG",
@@ -630,7 +630,7 @@ static void test_dag_cli_parsing_helpers_and_error_paths(void) {
     spec1.qo.tsig_key.name = strdup("my-key.");
     spec1.qo.update_op_count = 1;
     spec1.qo.update_ops[0].kind = UPDATE_OP_ADD;
-    spec1.qo.update_ops[0].raw = strdup("test.example. 300 IN A 1.2.3.4");
+    spec1.qo.update_ops[0].raw = strdup("test.example. 300 IN A 192.0.2.4");
 
     init_query_spec(&spec2);
     deep_copy_query_opts(&spec2.qo, &spec1.qo);
@@ -671,14 +671,14 @@ static void test_dag_cli_parsing_helpers_and_error_paths(void) {
         "+tsig=hmac-sha256:testkey:c2VjcmV0MTIz", "+nosig0", "--test-all",
         "-x", "192.0.2.1", "-c", "IN", "-t", "A", "-q", "example.com", "-u", "-m",
         "-p", "5353", "-4", "-6", "-b", "127.0.0.1#12345",
-        "--update-add", "test.example. 300 IN A 1.2.3.4",
+        "--update-add", "test.example. 300 IN A 192.0.2.4",
         "--update-del", "test.example. A",
-        "--update-del-exact", "test.example. 300 IN A 1.2.3.4",
+        "--update-del-exact", "test.example. 300 IN A 192.0.2.4",
         "--prereq=nxdomain:test.example.",
         "--prereq-nxdomain", "nx.example.",
         "--prereq-yxdomain", "yx.example.",
         "--prereq-nxrrset", "test.example. A",
-        "--prereq-yxrrset", "test.example. A 1.2.3.4",
+        "--prereq-yxrrset", "test.example. A 192.0.2.4",
         "@127.0.0.1", "example.com", "A"
     };
     int n_args = sizeof(args) / sizeof(args[0]);

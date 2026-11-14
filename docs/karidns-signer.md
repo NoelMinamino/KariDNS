@@ -237,7 +237,7 @@ The signer does not roll keys by itself; it follows the columns `active` and `pu
 4. Wait the largest TTL of the zone plus the propagation delay, so that every cache has seen the new signatures.
 5. Retire: `DELETE FROM cryptokeys WHERE id = <old>;`. The signer drops the old DNSKEY RR and the signatures of the old key (`-R`) and nothing else changes.
 
-Every step makes the signer sign the zone again (a few hundred milliseconds for a small zone); `dnssec-verify` accepts the zone after each of them (checked on pc200 with a KSK, two ZSKs and a small zone).
+Every step makes the signer sign the zone again (a few hundred milliseconds for a small zone); `dnssec-verify` accepts the zone after each of them (checked on the build host with a KSK, two ZSKs and a small zone).
 
 **KSK, double-DS (RFC 7583 section 4).** With a CSK the same applies (a CSK is a KSK).
 

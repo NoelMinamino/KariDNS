@@ -250,7 +250,7 @@ static void test_snapshot_rcu_lifecycle_and_suffix_lookup(void) {
     zone_db_entry_t *found = find_zone_in_view(&view, "sub.host.example.com.");
     assert(found == entry);
 
-    zone_db_entry_t *not_found = find_zone_in_view(&view, "otherdomain.org.");
+    zone_db_entry_t *not_found = find_zone_in_view(&view, "otherdomain.test.");
     assert(not_found == NULL);
 
     // 4. abort_rebuild_snapshot

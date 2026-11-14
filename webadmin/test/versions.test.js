@@ -27,7 +27,7 @@ test('fold: one entry per RRset, its state before the first version that touched
   ]);
   assert.deepEqual(fold([]), []);
   // the same owner and type of another kind is another RRset; the order is by name, then type
-  assert.deepEqual(fold([row(1, 'b.t', 'A', null, A('1.1.1.1')), row(1, 'b.t', 'AAAA', null, '300 AAAA ::1'), row(1, 'a.t', 'MX', null, '300 MX 10 m.t.')]).map((e) => `${e.owner} ${e.type}`), ['a.t MX', 'b.t A', 'b.t AAAA']);
+  assert.deepEqual(fold([row(1, 'b.t', 'A', null, A('192.0.2.1')), row(1, 'b.t', 'AAAA', null, '300 AAAA ::1'), row(1, 'a.t', 'MX', null, '300 MX 10 m.t.')]).map((e) => `${e.owner} ${e.type}`), ['a.t MX', 'b.t A', 'b.t AAAA']);
 });
 
 test('diff: what is different at the two ends; an RRset that came back to its state is not; an SOA differs in more than the serial', () => {
@@ -45,11 +45,11 @@ test('diff: what is different at the two ends; an RRset that came back to its st
   assert.equal(showEntry('x.example.test', 'A', A('192.0.2.1'), null).change, 'delete');
   assert.equal(showEntry('x.example.test', 'A', A('192.0.2.1'), A('192.0.2.2')).change, 'replace');
   // the lines in any order are the same state; the serial and the case of the names do not count for an SOA
-  assert.equal(sameState('A', A('1.1.1.1', '2.2.2.2'), A('2.2.2.2', '1.1.1.1')), true);
+  assert.equal(sameState('A', A('192.0.2.1', '192.0.2.2'), A('192.0.2.2', '192.0.2.1')), true);
   assert.equal(sameState('SOA', soa(1), soa(9).replace('ns1.example.test.', 'NS1.example.test')), true);
   assert.equal(sameState('SOA', soa(1), soa(1, 5)), false);
   assert.equal(sameState('A', null, null), true);
-  assert.equal(sameState('A', null, A('1.1.1.1')), false);
+  assert.equal(sameState('A', null, A('192.0.2.1')), false);
   assert.equal(sameState('SOA', 'broken', 'broken2'), false);
 });
 
@@ -78,8 +78,8 @@ test('rollback: every RRset touched goes back to the state before the first vers
   refused(row(2, 'x.example.test', 'A', 'no ttl here', null));
   refused(row(2, 'x.example.test', 'TXT', '300 TXT "a" ; b', null));
   refused(row(2, 'x.example.test', 'TXT', null, '300 TXT "a" ; b'));
-  refused(row(2, 'x.example.test\nrr evil.example.test. 1 A 192.0.2.1', 'A', A('1.1.1.1'), null));
-  refused(row(2, 'x.example.test', 'A', A('1.1.1.1'), 'no ttl here'));
+  refused(row(2, 'x.example.test\nrr evil.example.test. 1 A 192.0.2.1', 'A', A('192.0.2.1'), null));
+  refused(row(2, 'x.example.test', 'A', A('192.0.2.1'), 'no ttl here'));
   assert.equal(rollbackRRsets(fold([row(2, 'x.example.test', 'TXT', null, '300 TXT "a ; b"')]), 'example.test', { force: true }).rrsets.length, 1, 'a semicolon inside quotes is data');
 });
 

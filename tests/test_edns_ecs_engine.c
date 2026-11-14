@@ -351,7 +351,7 @@ static void test_ecs_resolution(void) {
     tinydns_resolve_client_location(test_zimg(&zone), "192.0.2.123", resolved_loc);
     assert(resolved_loc[0] == 'j' && resolved_loc[1] == 'p');
 
-    tinydns_resolve_client_location(test_zimg(&zone), "1.2.3.4", resolved_loc);
+    tinydns_resolve_client_location(test_zimg(&zone), "203.0.113.4", resolved_loc);
     assert(resolved_loc[0] == 'u' && resolved_loc[1] == 's');
 
     /* bit-granular CIDR prefixes: longest match wins, ties go to the first definition */
@@ -434,7 +434,7 @@ static void test_ecs_scope_prefix(void) {
     tag = scope_case(t, 2, 1, "10.0.0.1", &scope);
     assert(tag == NULL);
     assert(scope == 1);
-    /* SOURCE /16 (198.51.0.0): not specific enough, SCOPE is longer than SOURCE (RFC 7871 §7.2.1) */
+    /* not a documentation range on purpose: a /16 that contains 198.51.100.0/24.  SOURCE /16 (198.51.0.0): not specific enough, SCOPE is longer than SOURCE (RFC 7871 §7.2.1) */
     tag = scope_case(t, 2, 1, "198.51.0.0", &scope);
     assert(tag == NULL);
     assert(scope == 18);

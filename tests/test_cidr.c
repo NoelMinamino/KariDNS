@@ -126,9 +126,9 @@ int main(void) {
     printf("[*] Starting CIDR binary optimization test suite...\n");
 
     /* 1. "any" and "any;" */
-    test_parity("any", "1.2.3.4");
+    test_parity("any", "192.0.2.4");
     test_parity("any", "2001:db8::1");
-    test_parity("any;", "1.2.3.4");
+    test_parity("any;", "192.0.2.4");
     test_parity("any;", "::1");
 
     /* 2. IPv4 Exact and Subnets */
@@ -137,7 +137,7 @@ int main(void) {
     test_parity("192.168.1.0/24", "192.168.2.1");
     test_parity("10.0.0.0/8", "10.255.255.255");
     test_parity("10.0.0.0/8", "11.0.0.1");
-    test_parity("0.0.0.0/0", "1.2.3.4");
+    test_parity("0.0.0.0/0", "192.0.2.4");
     test_parity("0.0.0.0/0", "255.255.255.255");
     test_parity("192.0.2.1/32", "192.0.2.1");
     test_parity("192.0.2.1/32", "192.0.2.2");

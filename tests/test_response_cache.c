@@ -341,7 +341,7 @@ static void test_wire_cache_consistency(void) {
         "example.com. 3600 IN NS ns2.example.com.\n"
         "example.com. 3600 IN MX 10 mail.example.com.\n"
         "example.com. 3600 IN TXT \"v=spf1 include:_spf.example.com ~all\"\n"
-        "example.com. 3600 IN CAA 0 issue \"letsencrypt.org\"\n"
+        "example.com. 3600 IN CAA 0 issue \"ca.example.test\"\n"
         "ns1.example.com. 3600 IN A 192.0.2.1\n"
         "ns2.example.com. 3600 IN AAAA 2001:db8::2\n"
         "mail.example.com. 3600 IN A 192.0.2.10\n"

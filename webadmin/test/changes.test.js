@@ -74,7 +74,7 @@ test('the text of a record: nothing that could end its line or hide the rest of 
   for (const [text, re] of [
     ['a\nb', /control/], ['a\rb', /control/], ['a\0b', /control/], ['a\tb', /control/], ['a\x7fb', /control/],
     ['$INCLUDE /etc/passwd', /directive/], ['$ORIGIN x.', /directive/],
-    ['1.2.3.4 ; comment', /comment/], ['(1.2.3.4', /parentheses/], ['1.2.3.4)', /parentheses/],
+    ['192.0.2.4 ; comment', /comment/], ['(192.0.2.4', /parentheses/], ['192.0.2.4)', /parentheses/],
     ['"open quote', /not closed/], ['"a" "b', /not closed/], ['trailing\\', /backslash/], ['"x\\"', /not closed/],
     // a backslash takes the next character literally outside quotes too, as pdns_text_check() reads it in karidns-zone: `\"` opens no quote, so the `;` is a comment
     ['a\\" ; b', /comment/], ['a\\"', null], ['a\\(b', null], ['a\\;b', null], ['x\\\\" ; y', /not closed/],
@@ -84,7 +84,7 @@ test('the text of a record: nothing that could end its line or hide the rest of 
   }
   // and through a request: the pointer names the record
   bad(() => parseChangeSet({ rrsets: [rr('a.example.test', 'TXT', 1, '"ok"', '"x" ; y')] }, 'example.test'), '/rrsets/0/records/1/content');
-  bad(() => parseChangeSet({ rrsets: [rr('a.example.test', 'TXT', 1, 'a\nrr evil.example.test. 1 A 1.2.3.4')] }, 'example.test'), '/rrsets/0/records/0/content');
+  bad(() => parseChangeSet({ rrsets: [rr('a.example.test', 'TXT', 1, 'a\nrr evil.example.test. 1 A 192.0.2.4')] }, 'example.test'), '/rrsets/0/records/0/content');
 });
 
 test('the change file: one line per operation, absolute names, and the maps from the lines back to the request', () => {
@@ -184,7 +184,7 @@ test('a new zone: the SOA and name servers of the request, or a zone text', () =
   bad(() => createRRsets(parseCreate({ name: 'n.test', soa: { mname: 'a.n.test', rname: 'h.n.test' }, nameservers: ['c;d'] }), 'n.test'), '/nameservers/0');
   bad(() => createRRsets(parseCreate({ name: 'n.test', soa: { mname: 'a.n.test', rname: 'h.n.test' }, nameservers: ['c.n.test'], rrsets: [{ name: 'x.n.test', type: 'A', changetype: 'DELETE' }] }), 'n.test'), '/rrsets/0/changetype');
   bad(() => createRRsets(parseCreate({ name: 'n.test', soa: { mname: 'a.n.test', rname: 'h.n.test' }, nameservers: ['c.n.test'], rrsets: [rr('n.test', 'NS', 1, 'x.')] }), 'n.test'), '/rrsets/0');
-  bad(() => createRRsets(parseCreate({ name: 'n.test', soa: { mname: 'a.n.test', rname: 'h.n.test' }, nameservers: ['c.n.test'], rrsets: [rr('x.n.test', 'A', 1, '1.2.3.4'), rr('x.n.test', 'A', 1, '1.2.3.5')] }), 'n.test'), '/rrsets/1');
+  bad(() => createRRsets(parseCreate({ name: 'n.test', soa: { mname: 'a.n.test', rname: 'h.n.test' }, nameservers: ['c.n.test'], rrsets: [rr('x.n.test', 'A', 1, '192.0.2.4'), rr('x.n.test', 'A', 1, '1.2.3.5')] }), 'n.test'), '/rrsets/1');
   assert.equal(rrsetLabel(3).path, '/rrsets/3');
 });
 

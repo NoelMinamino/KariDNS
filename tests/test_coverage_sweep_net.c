@@ -1065,7 +1065,7 @@ static void test_replay(fsrv_t *s, fsrv_t *s2) {
 static void test_client_helpers(void) {
     printf("[TEST] net sweep: dag client helpers...\n");
     for (int a = 0; a < 256; a++) (void)dnssec_algo_name((uint8_t)a);
-    const char *subnets[] = { "0", "0/0", "::/0", "192.0.2.0/24", "192.0.2.1/33", "2001:db8::/129", "2001:db8::1/61", "bogus", "1.2.3.4",
+    const char *subnets[] = { "0", "0/0", "::/0", "192.0.2.0/24", "192.0.2.1/33", "2001:db8::/129", "2001:db8::1/61", "bogus", "192.0.2.4",
                               "10.0.0.0/0", "10.1.2.3/7", "::1", "/8", "" };
     for (size_t i = 0; i < N(subnets); i++) { query_opts_t qo; memset(&qo, 0, sizeof(qo)); (void)parse_subnet_arg(subnets[i], &qo); }
     const char *brk[] = { "compression-loop", "compression-forward", "label-too-long", "reserved-length-bits", "oversized-qname",

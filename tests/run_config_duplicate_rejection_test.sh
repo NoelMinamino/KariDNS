@@ -64,13 +64,13 @@ options {
     group "nobody";
 };
 view "internal" {
-    zone "example1.com" {
+    zone "example1.test" {
         type master;
         file "zones/example1.zone";
     };
 };
 view "internal" {
-    zone "example2.com" {
+    zone "example2.test" {
         type master;
         file "zones/example2.zone";
     };
@@ -111,11 +111,11 @@ key "key2" {
     algorithm hmac-sha256;
     secret "k999999999012345678901234567890123456789012=";
 };
-zone "example1.com" {
+zone "example1.test" {
     type master;
     file "zones/example1.zone";
 };
-zone "example2.com" {
+zone "example2.test" {
     type master;
     file "zones/example2.zone";
 };

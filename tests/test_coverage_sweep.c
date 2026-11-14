@@ -1174,7 +1174,7 @@ static const char *RR_LINES[] = {
     "IN APL 1:192.168.0.0/24 !2:2001:db8::/32 1:0.0.0.0/0 2:::/0", "IN AVC \"app-name:x\"",
     "IN AMTRELAY 10 0 1 192.0.2.2", "IN AMTRELAY 10 1 2 2001:db8::2",
     "IN AMTRELAY 10 0 3 relay.example.", "IN AMTRELAY 10 0 0 .",
-    "IN CAA 0 issue \"letsencrypt.org\"", "IN CAA 128 iodef \"mailto:a@example\"",
+    "IN CAA 0 issue \"ca.example.test\"", "IN CAA 128 iodef \"mailto:a@example\"",
     "IN CDS 12345 8 2 AABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899",
     "IN CDNSKEY 257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ==",
     "IN CERT 1 12345 8 AQIDBAUG", "IN CERT PKIX 1 RSASHA256 AQIDBAUG", "IN CNAME target.example.", "IN CSYNC 66 3 A NS AAAA",
@@ -1265,7 +1265,7 @@ static void test_wire_rr_sweep(void) {
         "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
         "a.very.long.label.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.",
         "alpn=", "port=99999", "key99999=1", "mandatory=bogus", "ipv4hint=1.2.3.x", "ipv6hint=zz", "ech=@@",
-        "\\# 2 01", "\\# 1 0102", "1:1.2.3.4/33", "3:1.2.3.4/8", "!1:1.2.3.0/24", "RSASHA1", "UNKNOWNALG", "TYPE70000", "BOGUS",
+        "\\# 2 01", "\\# 1 0102", "1:192.0.2.4/33", "3:192.0.2.4/8", "!1:192.0.2.0/24", "RSASHA1", "UNKNOWNALG", "TYPE70000", "BOGUS",
         "20301301000000", "2030010100000", "1m", "99999999m", "91", "181", "60.5", "S", "W", "-1m" };
     uint8_t scratch[4096];
     for (size_t i = 0; i < z.count; i++) {
@@ -1670,7 +1670,7 @@ static const char *ZP_SNIPPETS[] = {
     "$LOCATION-TAG\n", "$LOCATION-TAG t bogus/99\n", "$LOCATION-TAG t {\n", "$LOCATION\n",
     "$LOCATION unknown\nx A 192.0.2.1\n", "$LOCATION \"\"\n", "$LOCATION default\n",
     "$ECS-SUBNET-TAG eu 198.51.100.0/24\n$ECS-SUBNET eu\ny A 192.0.2.2\n$ECS-SUBNET \"\"\n",
-    "$ECS-SUBNET-TAG\n", "$ECS-SUBNET\n", "$ECS-SUBNET nope\n", "$ECS-SUBNET-TAG e { 1.2.3.0/24 }\n",
+    "$ECS-SUBNET-TAG\n", "$ECS-SUBNET\n", "$ECS-SUBNET nope\n", "$ECS-SUBNET-TAG e { 192.0.2.0/24 }\n",
     "$FOO bar\n", "$\n", "   A 192.0.2.9\n", "@ A 192.0.2.9\n\t300 IN AAAA 2001:db8::9\n",
     "a 300 IN A 192.0.2.1\na IN 300 A 192.0.2.1\na CH TXT \"x\"\na HS A 192.0.2.1\na NONE A 192.0.2.1\n",
     "a 1h30m A 192.0.2.1\na 99999999999 A 192.0.2.1\na 2w A 192.0.2.1\n",
@@ -1693,7 +1693,7 @@ static void test_zone_parser_sweep(void) {
     }
     /* token-level mutation of every RR line */
     static const char *tok_garbage[] = { "", "x", "-1", "99999999999", "65536", "0", "(", ")", "\"", "\\",
-        "a..b", "*", "@", "IN", "TYPE0", "\\# 1 zz", "1:1.2.3.0/33", "1.2.3.4.5", "::g", "=" };
+        "a..b", "*", "@", "IN", "TYPE0", "\\# 1 zz", "1:192.0.2.0/33", "1.2.3.4.5", "::g", "=" };
     for (size_t i = 0; i < NELEM(RR_LINES); i++) {
         char line[1024];
         strncpy(line, RR_LINES[i], sizeof(line) - 1); line[sizeof(line) - 1] = 0;
@@ -2008,7 +2008,7 @@ static void test_ecs_cookie_rrl_dnstap_edges(void) {
     tinydns_location_entry_t locs[3] = { { {'j','p'}, {192,0,2,0}, 24 }, { {'u','s'}, {10,0,0,0}, 8 }, { {'a','l'}, {0}, 0 } };
     za.locations = locs; za.location_count = 3;
     for (size_t i = 0; i < NELEM(ips); i++) { char lo[2]; tinydns_resolve_client_location(test_zimg(&za), ips[i], lo); }
-    char lo2[2]; tinydns_resolve_client_location(test_zimg(&za), "192.0.2.77", lo2); tinydns_resolve_client_location(NULL, "1.2.3.4", lo2);
+    char lo2[2]; tinydns_resolve_client_location(test_zimg(&za), "192.0.2.77", lo2); tinydns_resolve_client_location(NULL, "203.0.113.4", lo2);
     za.locations = NULL; za.location_count = 0;
     zone_arena_destroy(&za);
     /* wrap_tinydns_record */
@@ -2562,7 +2562,7 @@ static void test_config_sweep(void) {
     const char *odd[] = { "", "/* unterminated", "options { directory \"unterminated", "options { port 1; }; /* x */ # y\n",
         "options { directory \"a\\\"b\"; };", "include;", "include \"/nonexistent/x.conf\";", "include \"\";",
         "options { include \"/nonexistent\"; };", "zone { };", "zone \"x\" { type master; file; };", "view { };",
-        "key \"k\" { algorithm; };", "acl x { 1.2.3.4/99; };", "options { bind-address { 1.2.3.4 port x; }; };",
+        "key \"k\" { algorithm; };", "acl x { 192.0.2.4/99; };", "options { bind-address { 192.0.2.4 port x; }; };",
         "options { udp-recvbuf-size 9999999999G; };", "options { tcp-idle-timeout -5; };", "options { cookie-secret \"zz\"; };",
         "options { cookie-secret \"000102030405060708090a0b0c0d0e0f\"; cookie-secret \"000102030405060708090a0b0c0d0e0f\"; cookie-secret \"000102030405060708090a0b0c0d0e0f\"; cookie-secret \"000102030405060708090a0b0c0d0e0f\"; cookie-secret \"000102030405060708090a0b0c0d0e0f\"; };",
         "options { max-mqtypes 0; minimal-any-ttl x; wire-cache-max-records -1; };",

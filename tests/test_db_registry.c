@@ -1404,7 +1404,7 @@ static void test_dir_elements(void) {
     CHECK(zdir_find_exact(v, "nope.test.") == NULL && zdir_find_exact(v, NULL) == NULL && zdir_find_exact(NULL, "a.test.") == NULL);
     /* the longest suffix wins; the root zone is last; the label boundary is an unescaped dot */
     CHECK(zdir_find_suffix(v, "x.y.sub.a.test.") == es && zdir_find_suffix(v, "x.a.test.") == ea && zdir_find_suffix(v, "a.test") == ea);
-    CHECK(zdir_find_suffix(v, "a\\.test.") == NULL && zdir_find_suffix(v, "other.org.") == NULL && zdir_find_suffix(v, NULL) == NULL);
+    CHECK(zdir_find_suffix(v, "a\\.test.") == NULL && zdir_find_suffix(v, "other.invalid.") == NULL && zdir_find_suffix(v, NULL) == NULL);
     CHECK(find_zone_in_view(v, "www.de.test.") == zdir_entry(ef) && find_zone_exact_in_view(v, "a.test.") == a);
     /* the counters, the walk (each element once), the listing order (zone { } blocks first) */
     CHECK(zdir_count(v) == 3 && zdir_count_static(v) == 1 && zdir_count_shared(v) == 0 && zdir_count_owned(v) == 3);
@@ -1649,7 +1649,7 @@ static void test_dir_fetch_state(void) {
     CHECK(find_zone_for_query_ex(v, "www.a.test.", 1, &pel) == NULL && pel == ea);
     CHECK(find_zone_for_query(v, "www.a.test.", 1) == NULL);
     CHECK(find_zone_for_query_ex(v, "www.fs.test.", 1, &pel) == zdir_entry(ef) && pel == ef);
-    CHECK(find_zone_for_query_ex(v, "other.org.", 1, &pel) == NULL && pel == NULL);
+    CHECK(find_zone_for_query_ex(v, "other.invalid.", 1, &pel) == NULL && pel == NULL);
     CHECK(find_zone_for_query_ex(v, "www.a.test.", 1, NULL) == NULL);
     /* DS (RFC 4035 3.1.4.1): the query for the DS of a child apex is answered from the parent; when the parent has no data the parent is the zone to wait for */
     zone_db_entry_t *child = add_zone("default", "c.a.test.", 3, 1, 302);

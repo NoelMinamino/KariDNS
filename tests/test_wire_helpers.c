@@ -1858,7 +1858,7 @@ static void test_zone_parser_invalid_ttl_value_rejection(void) {
     parse_context_t ctx;
     memset(&ctx, 0, sizeof(ctx));
 
-    const char *zstr = "$TTL 9999999999999999999999999\n@ IN A 1.2.3.4\n";
+    const char *zstr = "$TTL 9999999999999999999999999\n@ IN A 192.0.2.4\n";
     char *b = arena_strdup(&arena, zstr);
     parse_zone_fast(b, strlen(b), &arena, &ctx);
     zone_arena_destroy(&arena);
@@ -1870,7 +1870,7 @@ static void test_zone_parser_origin_substitution_at_symbol(void) {
     zone_arena_init(&arena);
     parse_context_t ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.default_origin = "myorigin.com.";
+    ctx.default_origin = "myorigin.test.";
 
     const char *zstr = "@ IN A 192.0.2.1\n";
     char *b = arena_strdup(&arena, zstr);
@@ -1885,10 +1885,10 @@ static void test_zone_parser_multiline_parentheses_continuation(void) {
     zone_arena_init(&arena);
     parse_context_t ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.default_origin = "multi.com.";
+    ctx.default_origin = "multi.test.";
 
     const char *zstr = 
-        "@ IN SOA ns1.multi.com. hostmaster.multi.com. (\n"
+        "@ IN SOA ns1.multi.test. hostmaster.multi.test. (\n"
         "    2026092401 ; serial\n"
         "    7200       ; refresh\n"
         "    3600       ; retry\n"
@@ -1907,9 +1907,9 @@ static void test_zone_parser_soa_negative_ttl_parsing(void) {
     zone_arena_init(&arena);
     parse_context_t ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.default_origin = "soa.com.";
+    ctx.default_origin = "soa.test.";
 
-    const char *zstr = "@ IN SOA ns.soa.com. admin.soa.com. 1 3600 1800 604800 86400\n";
+    const char *zstr = "@ IN SOA ns.soa.test. admin.soa.test. 1 3600 1800 604800 86400\n";
     char *b = arena_strdup(&arena, zstr);
     bool ok = (parse_zone_fast(b, strlen(b), &arena, &ctx) > 0);
     CHECK(ok == true);
@@ -1934,7 +1934,7 @@ static void test_tinydns_parser_prefix_ampersand_and_dot(void) {
     zone_arena_init(&arena);
     parse_context_t ctx;
     memset(&ctx, 0, sizeof(ctx));
-    char data[] = "&example.com:1.2.3.4:ns1.example.com:300\n.example.com:1.2.3.4:ns1.example.com:300\n";
+    char data[] = "&example.com:192.0.2.4:ns1.example.com:300\n.example.com:192.0.2.4:ns1.example.com:300\n";
     int count = parse_tinydns_data(data, strlen(data), &arena, &ctx);
     CHECK(count > 0);
     zone_arena_destroy(&arena);
@@ -2296,7 +2296,7 @@ static void test_wire_cidr_ipv4_slash_zero_any(void) {
     printf("[TEST] CIDR: IPv4 0.0.0.0/0 matching any IPv4 address...\n");
     cidr_entry_t entry;
     CHECK(cidr_entry_parse(&entry, "0.0.0.0/0") == true);
-    CHECK(cidr_entry_match_str(&entry, "1.2.3.4") == true);
+    CHECK(cidr_entry_match_str(&entry, "192.0.2.4") == true);
     CHECK(cidr_entry_match_str(&entry, "255.255.255.255") == true);
 }
 
@@ -2430,7 +2430,7 @@ static void test_wire_zone_parser_caa_and_https_records(void) {
     printf("[TEST] Zone Parser: CAA and HTTPS SVCB records...\n");
     zone_arena_t arena; zone_arena_init(&arena);
     parse_context_t ctx; memset(&ctx, 0, sizeof(ctx)); ctx.default_origin = "example.com.";
-    const char *zstr = "@ IN CAA 0 issue \"letsencrypt.org\"\n@ IN HTTPS 1 . alpn=\"h2,h3\"\n";
+    const char *zstr = "@ IN CAA 0 issue \"ca.example.test\"\n@ IN HTTPS 1 . alpn=\"h2,h3\"\n";
     char *b = arena_strdup(&arena, zstr);
     int count = parse_zone_fast(b, strlen(b), &arena, &ctx);
     CHECK(count >= 2);
@@ -2451,7 +2451,7 @@ static void test_wire_tinydns_parser_generic_colon_prefix(void) {
     printf("[TEST] TinyDNS Parser: ':' generic record line parsing...\n");
     zone_arena_t arena; zone_arena_init(&arena);
     parse_context_t ctx; memset(&ctx, 0, sizeof(ctx));
-    char data[] = ":example.com:257:\\000\\005issueletsencrypt.org:300\n";
+    char data[] = ":example.com:257:\\000\\005issueca.example.test:300\n";
     int count = parse_tinydns_data(data, strlen(data), &arena, &ctx);
     CHECK(count >= 0);
     zone_arena_destroy(&arena);

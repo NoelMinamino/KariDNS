@@ -129,7 +129,7 @@ int main(void) {
         "example.com.",
         "sub.example.com.",
         "deep.sub.example.com.",
-        "test.com.",
+        "test.example.",
         "zone0.example.",
         "zone145.example.", 
         ".", // root zone
@@ -156,7 +156,7 @@ int main(void) {
     assert(entry3 != NULL && strcmp(entry3->domain, ".") == 0);
     
     // 4. Missing zone lookup
-    zone_db_entry_t *entry4 = snapshot_get_zone(snap, "doesnotexist.com.");
+    zone_db_entry_t *entry4 = snapshot_get_zone(snap, "doesnotexist.example.");
     assert(entry4 == NULL);
     
     // 5. find_zone_in_view tests:
@@ -196,7 +196,7 @@ int main(void) {
     assert(fz_nodot_z != NULL && strcmp(fz_nodot_z->domain, "nodots.example.") == 0);
 
     // 5.7 Root zone fallback for unmatched domain
-    zone_db_entry_t *fz_root = find_zone_in_view(vs, "unrelated.domain.org.");
+    zone_db_entry_t *fz_root = find_zone_in_view(vs, "unrelated.domain.invalid.");
     assert(fz_root != NULL && strcmp(fz_root->domain, ".") == 0);
 
     // 5.8 Root zone query itself
@@ -206,12 +206,12 @@ int main(void) {
     assert(fz_root_empty != NULL && strcmp(fz_root_empty->domain, ".") == 0);
 
     // 5.9 O-08: an escaped dot is part of a label, not a label boundary. "a\.example.com." is the
-    //     label "a.example" under "com." (no such zone here -> root), and "x.a\.test.com." is not
-    //     below "test.com.".
+    //     label "a.example" under "com." (no such zone here -> root), and "x.a\.test.example." is not
+    //     below "test.example.".
     for (int pass = 0; pass < 1; pass++) {
         zone_db_entry_t *e1 = find_zone_in_view(vs, "a\\.example.com.");
         assert(e1 != NULL && strcmp(e1->domain, ".") == 0);
-        zone_db_entry_t *e2 = find_zone_in_view(vs, "x.a\\.test.com.");
+        zone_db_entry_t *e2 = find_zone_in_view(vs, "x.a\\.test.example.");
         assert(e2 != NULL && strcmp(e2->domain, ".") == 0);
         zone_db_entry_t *e3 = find_zone_in_view(vs, "a\\.b.example.com.");   // label "a.b" under example.com.
         assert(e3 != NULL && strcmp(e3->domain, "example.com.") == 0);
@@ -224,11 +224,11 @@ int main(void) {
     // 6. View WITHOUT root zone -> fallback returns NULL
     const char *no_root_domains[] = {
         "example.com.",
-        "test.com."
+        "test.example."
     };
     zone_db_snapshot_t *snap_no_root = build_test_snapshot(no_root_domains, 2, false);
     assert(snap_no_root != NULL);
-    assert(find_zone_in_view(&snap_no_root->views[0], "unrelated.org.") == NULL);
+    assert(find_zone_in_view(&snap_no_root->views[0], "unrelated.invalid.") == NULL);
     assert(find_zone_in_view(&snap_no_root->views[0], ".") == NULL);
     free_test_snapshot(snap_no_root);
 
@@ -245,19 +245,19 @@ int main(void) {
         NULL, // Simulated failed allocation in regular zone loading
         "sub.example.com.",
         NULL,
-        "test.com."
+        "test.example."
     };
     zone_db_snapshot_t *snap_teeth = build_test_snapshot(teeth_missing_domains, 5, false);
     assert(snap_teeth != NULL);
     // Exact lookups
     assert(snapshot_get_zone(snap_teeth, "example.com.") != NULL);
-    assert(snapshot_get_zone(snap_teeth, "test.com.") != NULL);
+    assert(snapshot_get_zone(snap_teeth, "test.example.") != NULL);
     // Suffix lookups
     zone_db_entry_t *fzt1 = find_zone_in_view(&snap_teeth->views[0], "www.example.com.");
     assert(fzt1 != NULL && strcmp(fzt1->domain, "example.com.") == 0);
     zone_db_entry_t *fzt2 = find_zone_in_view(&snap_teeth->views[0], "www.sub.example.com.");
     assert(fzt2 != NULL && strcmp(fzt2->domain, "sub.example.com.") == 0);
-    assert(find_zone_in_view(&snap_teeth->views[0], "notfound.org.") == NULL);
+    assert(find_zone_in_view(&snap_teeth->views[0], "notfound.invalid.") == NULL);
     free_test_snapshot(snap_teeth);
 
     printf("PASS: All Hash Table & Suffix Lookup Tests Completed Successfully!\n");

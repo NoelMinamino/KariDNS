@@ -978,7 +978,7 @@ static void test_metadata(void) {
         expect_settings("allow-transfer both", m, 2, "allow-transfer { 192.0.2.0/24; key \"xfr\"; }; transfer-acl-match any;", 0);
     }
     {   /* AUTO-NS and garbage cannot be expressed; the list must not become wider than the metadata: none */
-        db_meta_row_t m[] = { M("ALLOW-AXFR-FROM", "AUTO-NS"), M("ALLOW-AXFR-FROM", "1.2.3.4; any") };
+        db_meta_row_t m[] = { M("ALLOW-AXFR-FROM", "AUTO-NS"), M("ALLOW-AXFR-FROM", "192.0.2.4; any") };
         expect_settings("allow-transfer unsupported", m, 2, "allow-transfer { none; };", 2);
     }
     {
@@ -1729,7 +1729,7 @@ static int gen_corpus(const char *dir) {
     const char *meta2 = "ALLOW-DNSUPDATE-FROM" FS "10.0.0.0/8" RS "TSIG-ALLOW-DNSUPDATE" FS "u" RS "ALLOW-AXFR-FROM" FS "AUTO-NS" RS
                         "ALSO-NOTIFY" FS "bogus" RS "X-KARIDNS-IXFR-HISTORY" FS "-1" RS "TSIG-ALLOW-AXFR" FS "k\"; x \"";
     write_file(dir, "metadata_dropped.bin", meta2, strlen(meta2));
-    const char *meta3 = "ALLOW-AXFR-FROM" FS "1.2.3.4; any" RS "AXFR-MASTER-TSIG" FS "a b" RS "X-KARIDNS-NOTIFY-RETRIES" FS "3; x";
+    const char *meta3 = "ALLOW-AXFR-FROM" FS "192.0.2.4; any" RS "AXFR-MASTER-TSIG" FS "a b" RS "X-KARIDNS-NOTIFY-RETRIES" FS "3; x";
     write_file(dir, "metadata_hostile.bin", meta3, strlen(meta3));
     return 0;
 }

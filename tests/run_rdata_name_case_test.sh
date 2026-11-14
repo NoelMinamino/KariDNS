@@ -49,36 +49,36 @@ $TTL 300
 @ IN SOA ns1 hostmaster 1 3600 600 86400 300
 @ IN NS ns1
 ns1 IN A 192.0.2.1
-minfo IN MINFO RM.One.COM. EM.Two.ORG.
+minfo IN MINFO RM.One.EXAMPLE. EM.Two.INVALID.
 rp IN RP Mbox.Case.TEST. Txt.case.Test.
 afsdb IN AFSDB 1 AFS.Case.test.
 rt IN RT 10 Rt.Case.TEST.
 kx IN KX 10 Kx.Case.TEST.
 px IN PX 10 Map822.Case.test. MapX400.case.TEST.
-mx IN MX 10 MAIL.Mx.NET.
+mx IN MX 10 MAIL.Mx.Example.NET.
 srv IN SRV 1 2 5060 SIP.Case.Test.
 naptr IN NAPTR 100 10 "S" "SIP+D2U" "" _SIP._udp.Case.Test.
 lp IN LP 10 L.Case.TEST.
 dn IN DNAME Target.Case.Test.
-cn IN CNAME Cname.Cn.INFO.
-ptr IN PTR Host.Ptr.BIZ.
+cn IN CNAME Cname.Cn.Example.ORG.
+ptr IN PTR Host.Ptr.Example.COM.
 EOF
 
 # type -> a string of the text answer (dag text format) that has the letters as written in the zone
 cat > "$T/expect.txt" <<'EOF'
-minfo|MINFO|RM.One.COM. EM.Two.ORG.
+minfo|MINFO|RM.One.EXAMPLE. EM.Two.INVALID.
 rp|RP|Mbox.Case.TEST. Txt.case.Test.
 afsdb|AFSDB|1 AFS.Case.test.
 rt|RT|10 Rt.Case.TEST.
 kx|KX|10 Kx.Case.TEST.
 px|PX|10 Map822.Case.test. MapX400.case.TEST.
-mx|MX|10 MAIL.Mx.NET.
+mx|MX|10 MAIL.Mx.Example.NET.
 srv|SRV|1 2 5060 SIP.Case.Test.
 naptr|NAPTR|_SIP._udp.Case.Test.
 lp|LP|10 L.Case.TEST.
 dn|DNAME|Target.Case.Test.
-cn|CNAME|Cname.Cn.INFO.
-ptr|PTR|Host.Ptr.BIZ.
+cn|CNAME|Cname.Cn.Example.ORG.
+ptr|PTR|Host.Ptr.Example.COM.
 EOF
 
 printf 'options {\n    %s pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n};\nzone "case.test" { type primary; file "%s/case.test.zone"; allow-transfer { 127.0.0.1; }; };\n' "$USER_LINE" "$PA" "$T" > "$T/a.conf"

@@ -149,7 +149,7 @@ static void test_bump_soa_serial(void) {
     assert(strcmp(arena.records[0].rdata[2], "1") == 0);
 
     // Non-existent zone name
-    uint32_t s_none = bump_soa_serial_in_arena(&arena, "otherzone.com.");
+    uint32_t s_none = bump_soa_serial_in_arena(&arena, "otherzone.example.");
     assert(s_none == 0);
 
     // X-17: the arena cannot allocate the new serial text -> 0 (failure), SOA unchanged
@@ -472,7 +472,7 @@ static void test_send_notify_to_all_comprehensive(void) {
     zcfg1.next = &zcfg2;
 
     memset(&zcfg2, 0, sizeof(zcfg2));
-    zcfg2.domain = "sibling.com.";
+    zcfg2.domain = "sib.example.";
     zcfg2.next = NULL;
 
     view_cfg.zones = &zcfg1;
@@ -484,7 +484,7 @@ static void test_send_notify_to_all_comprehensive(void) {
     assert(snap != NULL);
 
     zone_db_entry_t *z1 = snapshot_get_zone(snap, "example.com.");
-    zone_db_entry_t *z2 = snapshot_get_zone(snap, "sibling.com.");
+    zone_db_entry_t *z2 = snapshot_get_zone(snap, "sib.example.");
     assert(z1 && z2);
 
     init_sample_zone_arena(test_zone_slot(z1, 0), "example.com.", "100");
@@ -492,7 +492,7 @@ static void test_send_notify_to_all_comprehensive(void) {
     // Add NS records and glue in z1
     // NS 1: ns1.example.com (matches SOA MNAME -> excluded)
     // NS 2: ns2.example.com -> in-zone A and AAAA glue
-    // NS 3: ns1.sibling.com -> sibling zone glue
+    // NS 3: ns1.sib.example -> sibling zone glue
     zone_arena_t *a1 = test_zone_slot(z1, 0);
     dns_record_t *new_recs = realloc(a1->records, sizeof(dns_record_t) * 16);
     assert(new_recs);
@@ -518,7 +518,7 @@ static void test_send_notify_to_all_comprehensive(void) {
     DNS_RECORD_BIND_RDATA(r_ns3);
     r_ns3.name = arena_strdup(a1, "example.com.");
     r_ns3.type_code = 2; r_ns3.rdata_count = 1;
-    r_ns3.rdata[0] = arena_strdup(a1, "ns1.sibling.com.");
+    r_ns3.rdata[0] = arena_strdup(a1, "ns1.sib.example.");
     a1->records[a1->count++] = r_ns3;
 
     // In-zone A & AAAA glue for ns2.example.com
@@ -539,8 +539,8 @@ static void test_send_notify_to_all_comprehensive(void) {
     assert(test_build_index(a1, true) == 0);
     atomic_store_explicit(&z1->rcu.active, &a1->ver, memory_order_release);
 
-    // Sibling zone z2: sibling.com
-    init_sample_zone_arena(test_zone_slot(z2, 0), "sibling.com.", "100");
+    // Sibling zone z2: sib.example
+    init_sample_zone_arena(test_zone_slot(z2, 0), "sib.example.", "100");
     zone_arena_t *a2 = test_zone_slot(z2, 0);
     dns_record_t *new_recs2 = realloc(a2->records, sizeof(dns_record_t) * 16);
     assert(new_recs2);
@@ -549,14 +549,14 @@ static void test_send_notify_to_all_comprehensive(void) {
 
     dns_record_t r_sib4; memset(&r_sib4, 0, sizeof(r_sib4));
     DNS_RECORD_BIND_RDATA(r_sib4);
-    r_sib4.name = arena_strdup(a2, "ns1.sibling.com.");
+    r_sib4.name = arena_strdup(a2, "ns1.sib.example.");
     r_sib4.type_code = 1; r_sib4.rdata_count = 1;
     r_sib4.rdata[0] = arena_strdup(a2, "198.51.100.30");
     a2->records[a2->count++] = r_sib4;
 
     dns_record_t r_sib6; memset(&r_sib6, 0, sizeof(r_sib6));
     DNS_RECORD_BIND_RDATA(r_sib6);
-    r_sib6.name = arena_strdup(a2, "ns1.sibling.com.");
+    r_sib6.name = arena_strdup(a2, "ns1.sib.example.");
     r_sib6.type_code = 28; r_sib6.rdata_count = 1;
     r_sib6.rdata[0] = arena_strdup(a2, "2001:db8:ffff::30");
     a2->records[a2->count++] = r_sib6;
@@ -584,7 +584,7 @@ static void test_send_notify_to_all_comprehensive(void) {
         }
     }
 
-    /* the also-notify addresses (the invalid one is skipped: 2 of the 3) and the NS hosts' glue: in-zone A/AAAA of ns2, sibling A/AAAA of ns1.sibling.com */
+    /* the also-notify addresses (the invalid one is skipped: 2 of the 3) and the NS hosts' glue: in-zone A/AAAA of ns2, sibling A/AAAA of ns1.sib.example */
     assert(got_v4_also && got_v6_also);
     assert(pkt_count == 6);
     assert(atomic_load_explicit(&z1->observatory.notify_sent, memory_order_acquire) > 0);
@@ -611,7 +611,7 @@ static void test_notify_zone_out_of_memory(void) {
     view_cfg.name = "default";
     zone_config_t zsib;
     memset(&zsib, 0, sizeof(zsib));
-    zsib.domain = "sibling.com.";
+    zsib.domain = "sib.example.";
     view_cfg.zones = &zsib;
     cfg.views = &view_cfg;
     notify_target_t also[1];
@@ -623,9 +623,9 @@ static void test_notify_zone_out_of_memory(void) {
     atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
     zone_db_snapshot_t *snap = rebuild_zone_db_snapshot(&cfg, NULL, NULL, NULL, NULL, 0);
     assert(snap != NULL);
-    zone_db_entry_t *zs = snapshot_get_zone(snap, "sibling.com.");
+    zone_db_entry_t *zs = snapshot_get_zone(snap, "sib.example.");
     assert(zs);
-    init_sample_zone_arena(test_zone_slot(zs, 0), "sibling.com.", "100");
+    init_sample_zone_arena(test_zone_slot(zs, 0), "sib.example.", "100");
     zone_arena_t *as = test_zone_slot(zs, 0);
     dns_record_t *nr = realloc(as->records, sizeof(dns_record_t) * 16);
     assert(nr);
@@ -633,17 +633,17 @@ static void test_notify_zone_out_of_memory(void) {
     as->records_cap = 16;
     dns_record_t r4; memset(&r4, 0, sizeof(r4));
     DNS_RECORD_BIND_RDATA(r4);
-    r4.name = arena_strdup(as, "ns1.sibling.com.");
+    r4.name = arena_strdup(as, "ns1.sib.example.");
     r4.type_code = 1; r4.rdata_count = 1;
     r4.rdata[0] = arena_strdup(as, "198.51.100.30");
     as->records[as->count++] = r4;
     assert(test_build_index(as, true) == 0);
     atomic_store_explicit(&zs->rcu.active, &as->ver, memory_order_release);
 
-    /* the apex of nr.example.: MNAME ns0.nr.example. (not an NS host), NS: ns1.sibling.com. (outside, a sibling in memory), ns2.nr.example. (inside, glue 192.0.2.22),
+    /* the apex of nr.example.: MNAME ns0.nr.example. (not an NS host), NS: ns1.sib.example. (outside, a sibling in memory), ns2.nr.example. (inside, glue 192.0.2.22),
      * ns9.provider.example. (outside, the loader's addresses: A 198.51.100.9 and AAAA 2001:db8::9), ns0.nr.example. (the MNAME: left out unless notify-to-soa) */
     static const uint8_t names[] = "\3ns0\2nr\7example\0" "\5admin\2nr\7example\0"
-                                   "\3ns1\7sibling\3com\0" "\3ns2\2nr\7example\0" "\3ns9\10provider\7example\0" "\3ns0\2nr\7example\0";
+                                   "\3ns1\3sib\7example\0" "\3ns2\2nr\7example\0" "\3ns9\10provider\7example\0" "\3ns0\2nr\7example\0";
     const size_t ml = 16, rl = 18, nsl = 17 + 16 + 22 + 16;
     static const uint8_t glue[] = { 1, 1, 0, 0, 1, 0x2c, 192, 0, 2, 22 };       /* ns index 1?  the NS list below is 0 ns1.sibling, 1 ns2.nr, 2 ns9.provider, 3 ns0.nr */
     static const uint8_t naddr[] = { 2, 1, 198, 51, 100, 9, 2, 28, 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9 };
@@ -994,7 +994,7 @@ static void test_dynamic_update_prerequisites_and_error_paths(void) {
 
     // 4. Zone name mismatch -> NOTAUTH (9)
     BUILD_HEADER(pkt, off, 0, 0);
-    assert(process_update_sections(pkt, off, "other.com.", &arena, &ur) == 9);
+    assert(process_update_sections(pkt, off, "other.example.", &arena, &ur) == 9);
 
     // 5. Prereq: name out of zone -> NOTZONE (10)
     BUILD_HEADER(pkt, off, 1, 0);

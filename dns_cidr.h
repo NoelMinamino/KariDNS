@@ -35,7 +35,7 @@ typedef struct {
     bool is_deny;
 } acl_entry_t;
 
-/* Parse a CIDR string (e.g., "192.0.2.0/24", "2001:db8::/32", "any", "1.2.3.4") into cidr_entry_t */
+/* Parse a CIDR string (e.g., "192.0.2.0/24", "2001:db8::/32", "any", "192.0.2.1") into cidr_entry_t */
 bool cidr_entry_parse(cidr_entry_t *entry, const char *cidr_str);
 
 /* Match raw network bytes against parsed CIDR (family: AF_INET or AF_INET6);

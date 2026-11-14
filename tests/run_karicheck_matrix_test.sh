@@ -106,7 +106,7 @@ echo "=== Running karicheck Diagnostic Matrix ==="
 # ---- clean zone: no false positives -----------------------------------------------------------------
 zone_case clean 0 "0 error(s)" '_sip._tcp SRV 10 60 5060 ns.z.example.
 n NAPTR 100 10 "u" "E2U+sip" "!^.*$!sip:info@example.com!" .
-c CAA 0 issue "letsencrypt.org"
+c CAA 0 issue "ca.example.test"
 s SSHFP 1 1 AABBCCDDEEFF00112233445566778899AABBCCDD
 @ NSEC3PARAM 1 0 0 -
 w WKS 192.0.2.1 6 25

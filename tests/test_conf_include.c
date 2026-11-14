@@ -127,7 +127,7 @@ int main(void) {
                     "/* Block comment */\n");
         create_file("tests_inc_tmp/main_empty.conf",
                     "include \"empty.conf\";\n"
-                    "zone \"empty-test.org\" {\n"
+                    "zone \"empty-test.test\" {\n"
                     "    type master;\n"
                     "    file \"test.zone\";\n"
                     "    allow-transfer {\n"
@@ -146,7 +146,7 @@ int main(void) {
 
         assert(res == 0);
         assert(cfg.views->zones != NULL);
-        assert(strcmp(cfg.views->zones->domain, "empty-test.org.") == 0);
+        assert(strcmp(cfg.views->zones->domain, "empty-test.test.") == 0);
         assert(zext(cfg.views->zones)->allow_transfer_count == 1);
         assert(strcmp(zext(cfg.views->zones)->allow_transfer[0], "127.0.0.1") == 0);
         free_server_config_fields(&cfg);
