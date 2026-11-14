@@ -10,7 +10,7 @@ The interface is built to meet **WCAG 2.1 level AA**. It is not certified: no au
 
 ## 1. THE WCAG 2.1 AA CHECKLIST
 
-"Script" means a check that runs in the tests: **U** = `webadmin/test/ui_review.test.js` or another unit test (Node, fake DOM, `tests/run_webadmin_unit_test.sh`); **B** = the browser tests (`webadmin/test/e2e/a11y.mjs`, run in every screen the scenarios open, and the scenarios themselves: `tests/run_webadmin_gui_test.sh`, `tests/run_webadmin_gui_pg_test.sh`). "Manual" is part 2 or 3.
+"Script" means a check that runs in the tests: **U** = `webadmin/test/ui_review.test.js` or another unit test (Node, fake DOM, `tests/run_webadmin_unit_test.sh`); **B** = the browser tests (`webadmin/test/e2e/a11y.mjs`, run in every screen the scenarios open, and the scenarios themselves: `tests/run_webadmin_gui_test.sh`, `tests/run_webadmin_gui_pg_test.sh`; the category `gui` of `tests/run_all_suite.sh`, run with `--with-gui` or `--only-gui`). "Manual" is part 2 or 3.
 
 | SC | Name | Status | How it is met, and how it is checked |
 |---|---|---|---|

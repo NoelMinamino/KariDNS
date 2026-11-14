@@ -14,6 +14,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <fcntl.h>
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
@@ -180,31 +181,6 @@ static void init_axfr_zone(zone_arena_t *arena, const char *domain, const char *
     assert(b_rc == 0);
     arena->image = zone_image_freeze(arena, domain); /* S5 B-2: AXFR out reads the image */
     assert(arena->image != NULL);
-}
-
-// ----------------------------------------------------------------------------
-// 1. wait_for_active_axfr Test
-// ----------------------------------------------------------------------------
-static void test_wait_for_active_axfr_branches(void) {
-    printf("[TEST] AXFR/IXFR: wait_for_active_axfr branches...\n");
-    // NULL entry
-    assert(wait_for_active_axfr(NULL, 100) == true);
-
-    zone_db_entry_t entry;
-    memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "example.com", sizeof(entry.domain));
-    atomic_init(&entry.active_axfr, 0);
-
-    // Active == 0
-    assert(wait_for_active_axfr(&entry, 0) == true);
-    assert(wait_for_active_axfr(&entry, 50) == true);
-
-    // Active > 0, timeout after 20ms
-    atomic_store(&entry.active_axfr, 1);
-    bool r_timeout = wait_for_active_axfr(&entry, 20);
-    assert(r_timeout == false);
-
-    printf("  -> wait_for_active_axfr passed.\n");
 }
 
 // ----------------------------------------------------------------------------
@@ -1243,6 +1219,7 @@ static void test_handle_axfr_event_and_worker_thread(void) {
     init_axfr_zone(test_zone_slot(&entry, 0), "worker.example.", "300");
     atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
     atomic_store_explicit(&entry.serial, 300, memory_order_release);
+    atomic_init(&entry.snapshot_refs, 1);              /* (as a zone directory holds it) */
 
     int sp_worker[2];
     int res = socketpair(AF_UNIX, SOCK_STREAM, 0, sp_worker);
@@ -1268,6 +1245,7 @@ static void test_handle_axfr_event_and_worker_thread(void) {
     memcpy(args->req, req, qoff);
     args->req_len = qoff;
     args->entry = &entry;
+    xfr_entry_hold(&entry);                            /* (as the TCP dispatch does, R11) */
 
     pthread_t th;
     res = pthread_create(&th, NULL, axfr_worker_thread, args);
@@ -1288,6 +1266,7 @@ static void test_handle_axfr_event_and_worker_thread(void) {
 
     close(sp_worker[1]);
     pthread_join(th, NULL);
+    assert(atomic_load(&entry.active_axfr) == 0 && atomic_load(&entry.snapshot_refs) == 1);   /* (the thread gave its hold back) */
 
     zone_arena_destroy(test_zone_slot(&entry, 0));
     pthread_mutex_destroy(&entry.writer_lock);
@@ -1305,7 +1284,7 @@ static zone_db_entry_t *nr_await_stub(zdir_elem_t *el, const char *view) {
     (void)el;
     atomic_fetch_add(&g_nr_await_calls, 1);
     if (strcmp(view, "default") != 0 || !g_nr_await_entry) return NULL;
-    atomic_fetch_add(&g_nr_await_entry->active_axfr, 1);      /* (as db_ingest_xfr_await() counts the transfer) */
+    xfr_entry_hold(g_nr_await_entry);                  /* (as db_ingest_xfr_await() holds the entry) */
     return g_nr_await_entry;
 }
 
@@ -1507,11 +1486,12 @@ static void test_axfr_worker_zone_out_of_memory(void) {
     init_axfr_zone(test_zone_slot(&entry, 0), "nr.example.com.", "4242");
     atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
     atomic_store_explicit(&entry.serial, 4242, memory_order_release);
+    atomic_init(&entry.snapshot_refs, 1);
     g_nr_await_entry = &entry;
     nr_run(&rep, req, n, 252, NULL, el, nr_await_stub);
     nr_parse(&rep, &serial, &expire, &ede);
     assert(rep.nmsgs >= 1 && (rep.msg[3] & 0x0F) == 0 && rep.msg[7] >= 2 && serial == 4242 && atomic_load(&g_nr_await_calls) == 4);
-    assert(atomic_load(&entry.active_axfr) == 0);
+    assert(atomic_load(&entry.active_axfr) == 0 && atomic_load(&entry.snapshot_refs) == 1);
     g_nr_await_entry = NULL;
     zone_arena_destroy(test_zone_slot(&entry, 0));
     /* send-extended-errors no: the same SERVFAIL without the EDE (and the summary's FORMERR still answered) */
@@ -1526,6 +1506,303 @@ static void test_axfr_worker_zone_out_of_memory(void) {
     free(apex);
     free(el);
     printf("  -> a zone that is not in memory passed.\n");
+}
+
+// ----------------------------------------------------------------------------
+// R11: a transfer to a client that does not read holds no read section, no snapshot and no configuration; it pins its version only
+// ----------------------------------------------------------------------------
+static void p10_init_zone(zone_arena_t *arena, const char *domain, const char *serial, const char *extra);
+static size_t p10_query(uint8_t *q, size_t cap, const char *zone, uint16_t qtype, int64_t serial, bool edns, bool ext);
+
+/* fill the send buffer of fd (the client does not read): the next write of the transfer blocks.  Returns the octets written. */
+static size_t r11_fill(int fd) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    static uint8_t junk[4096];
+    size_t n = 0;
+    for (;;) {
+        ssize_t w = write(fd, junk, sizeof(junk));
+        if (w <= 0) break;
+        n += (size_t)w;
+    }
+    fcntl(fd, F_SETFL, fl);
+    return n;
+}
+
+/* read exactly n octets of fd (to drain the junk), and then everything until EOF into out (up to cap): returns the octets after the junk */
+static size_t r11_drain(int fd, size_t junk, uint8_t *out, size_t cap) {
+    uint8_t buf[8192];
+    while (junk > 0) {
+        ssize_t r = read(fd, buf, junk < sizeof(buf) ? junk : sizeof(buf));
+        assert(r > 0);
+        junk -= (size_t)r;
+    }
+    size_t got = 0;
+    for (;;) {
+        ssize_t r = read(fd, buf, sizeof(buf));
+        if (r <= 0) break;
+        if (out && got + (size_t)r <= cap) memcpy(out + got, buf, (size_t)r);
+        got += (size_t)r;
+    }
+    return got;
+}
+
+/* as p10_init_zone(), for a larger zone */
+static void r11_init_zone(zone_arena_t *arena, const char *domain, const char *serial, const char *extra) {
+    memset(arena, 0, sizeof(*arena));
+    zone_arena_init(arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = domain, .is_standalone_mode = true, .err_out = &err };
+    static char text[32768];
+    snprintf(text, sizeof(text), "$ORIGIN %s\n$TTL 3600\n@ IN SOA ns1.%s hostmaster.%s %s 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n%s",
+             domain, domain, domain, serial, extra);
+    char *buf = arena_strdup(arena, text);
+    assert(parse_zone_fast(buf, strlen(buf), arena, &ctx) >= 0);
+    assert(build_zone_index(arena, true) == 0);
+    arena->image = zone_image_freeze(arena, domain);
+    assert(arena->image != NULL);
+}
+
+typedef struct {
+    zone_db_entry_t *e;
+    int fd;
+    uint8_t q[512];
+    size_t ql;
+    struct sockaddr_storage ca;
+} r11_xfr_t;
+
+static void *r11_xfr_thread(void *arg) {
+    r11_xfr_t *x = arg;
+    send_axfr_response(x->fd, x->e->domain, x->q, (uint16_t)x->ql, NULL, x->e, NULL, 0, &x->ca, sizeof(struct sockaddr_in), NULL, false);
+    close(x->fd);
+    return NULL;
+}
+
+static void test_r11_stalled_transfer_holds_nothing_but_its_version(void) {
+    printf("[TEST] R11: a stalled AXFR holds no read section and no configuration, only the version it sends...\n");
+    server_config_t *cfg_a = calloc(1, sizeof(*cfg_a)), *cfg_b = calloc(1, sizeof(*cfg_b));
+    const char *conf = "options { location-tags { tag \"lt-a\" { 192.0.2.0/24; }; }; };\n"
+                       "zone \"r11.example\" { type master; file \"r11.zone\"; };\n";
+    assert(parse_named_conf(conf, cfg_a) == 0 && parse_named_conf(conf, cfg_b) == 0);
+    server_config_t *cfg0 = atomic_load(&g_config_db.active);
+    atomic_store(&g_config_db.active, cfg_a);
+
+    zone_db_entry_t e;
+    memset(&e, 0, sizeof(e));
+    strlcpy(e.domain, "r11.example.", sizeof(e.domain));
+    pthread_mutex_init(&e.writer_lock, NULL);
+    pthread_mutex_init(&e.ixfr_history.lock, NULL);
+    atomic_init(&e.snapshot_refs, 1);
+    atomic_init(&e.rcu.active, &zone_version_empty);
+    /* a zone with RRs that only the clients of location tag lt-a see: the tag's definition is the configuration's (resolve_bind_location_tag()) */
+    char body[16384] = "$LOCATION lt-a\nloc 60 IN A 192.0.2.30\n$LOCATION\n";
+    for (int i = 0; i < 120; i++) {
+        char l[96];
+        snprintf(l, sizeof(l), "h%03d 60 IN TXT \"padding padding padding padding padding padding padding %03d\"\n", i, i);
+        strlcat(body, l, sizeof(body));
+    }
+    zone_arena_t b1, b2;
+    r11_init_zone(&b1, "r11.example.", "100", body);
+    p10_init_zone(&b2, "r11.example.", "101", "new 60 IN A 192.0.2.99\n");
+    zone_version_t *v1 = zone_version_new(&b1), *v2 = zone_version_new(&b2);
+    assert(v1 && v2 && (v1->image->flags & ZONE_IMAGE_F_VIEW));
+    pthread_mutex_lock(&e.writer_lock);
+    zone_publish(&e, v1);
+    pthread_mutex_unlock(&e.writer_lock);
+
+    r11_xfr_t x;
+    memset(&x, 0, sizeof(x));
+    x.e = &e;
+    x.ql = p10_query(x.q, sizeof(x.q), "r11.example.", 252, -1, false, false);
+    struct sockaddr_in *sin = (struct sockaddr_in *)&x.ca;
+    sin->sin_family = AF_INET;
+    inet_pton(AF_INET, "192.0.2.5", &sin->sin_addr);
+
+    /* the reference: the same transfer to a client that reads */
+    g_tcp_out_len = 0;
+    send_axfr_response(-1, e.domain, x.q, (uint16_t)x.ql, NULL, &e, NULL, 0, &x.ca, sizeof(struct sockaddr_in), NULL, false);
+    size_t ref_len = g_tcp_out_len;
+    uint8_t *ref = malloc(ref_len);
+    memcpy(ref, g_tcp_out, ref_len);
+    bool has_loc = false;
+    for (size_t i = 0; i + 4 <= ref_len && !has_loc; i++) has_loc = memcmp(ref + i, "\x03loc", 4) == 0;
+    assert(ref_len > 4000 && has_loc);                                                  /* (the tagged RR is in it: the client sees lt-a) */
+
+    /* the stalled one */
+    int sp[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+    size_t junk = r11_fill(sp[0]);
+    x.fd = sp[0];
+    g_tcp_out_len = 0;
+    pthread_t th;
+    assert(pthread_create(&th, NULL, r11_xfr_thread, &x) == 0);
+    for (int i = 0; i < 2000 && atomic_load(&v1->xfr_refs) == 0; i++) usleep(1000);
+    assert(atomic_load(&v1->xfr_refs) == 1);                                            /* the transfer pinned v1 ... */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    assert(rcu_writer_wait_until_safe(rcu_writer_advance_epoch(), 5000));             /* ... and holds no read section while it waits for the client */
+    /* a new version, the old one retired: the grace period is over at once; v1 stays (pinned), v2 is served */
+    pthread_mutex_lock(&e.writer_lock);
+    zone_publish(&e, v2);
+    pthread_mutex_unlock(&e.writer_lock);
+    gc_reclaim_stats_t gs;
+    zone_retire_process(true);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    assert(t1.tv_sec - t0.tv_sec < 3);                                                  /* (before R11 the wait ran into its 60 s timeout) */
+    gc_reclaim_stats(&gs);
+    assert(gs.zone_retire_waiting >= 1 && atomic_load(&v1->xfr_refs) == 1 && v1->image != NULL);
+    /* the configuration is replaced and the old one freed, as a reload does after the grace period: the stream has its own copies */
+    atomic_store(&g_config_db.active, cfg_b);
+    free_server_config_fields(cfg_a);
+    free(cfg_a);
+
+    /* the client reads: the transfer is the old version, byte for byte */
+    uint8_t *got = malloc(ref_len + 1);
+    size_t got_len = r11_drain(sp[1], junk, got, ref_len + 1);
+    pthread_join(th, NULL);
+    close(sp[1]);
+    assert(got_len == ref_len && memcmp(got, ref, ref_len) == 0);
+    assert(atomic_load(&v1->xfr_refs) == 0);
+    zone_retire_process(true);                                                          /* v1 is freed now (ASan: nothing reads it after) */
+    assert(atomic_load(&e.snapshot_refs) == 1);
+
+    free(got);
+    free(ref);
+    atomic_store(&g_config_db.active, cfg0);
+    free_server_config_fields(cfg_b);
+    free(cfg_b);
+    zone_version_free(atomic_load(&e.rcu.active));
+    zone_arena_destroy(&b1);
+    zone_arena_destroy(&b2);
+    ixfr_history_clear(&e.ixfr_history);
+    pthread_mutex_destroy(&e.writer_lock);
+    pthread_mutex_destroy(&e.ixfr_history.lock);
+    printf("  -> stalled transfer passed.\n");
+}
+
+/* R11: the "up to date" answer of a zone that is out of memory copies the apex's SOA and releases the snapshot before it sends: an apex that is
+ * replaced and freed (as the snapshot's garbage is once nobody retains it) while the client does not read is not read again */
+static void test_r11_apex_answer_copies_before_send(void) {
+    printf("[TEST] R11: the up-to-date IXFR answer from the apex copies it and releases the snapshot before the send...\n");
+    zdir_apex_t *apex = nr_apex(4242);
+    zdir_elem_t *el = nr_elem("nr.example.com.", 4242, apex);
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 1);                     /* (retained for the thread, as the TCP dispatch does) */
+    uint8_t req[1024];
+    size_t n = nr_request(req, sizeof(req), "nr.example.com.", 251, 4242, false, false);
+    int sp[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+    size_t junk = r11_fill(sp[0]);
+    axfr_worker_args_t *args = calloc(1, sizeof(axfr_worker_args_t));
+    args->client_fd = sp[0];
+    args->send_ede = true;
+    strlcpy(args->client_ip, "127.0.0.1", sizeof(args->client_ip));
+    strlcpy(args->qname, "nr.example.com.", sizeof(args->qname));
+    args->qclass = 1;
+    args->qtype = 251;
+    memcpy(args->req, req, n);
+    args->req_len = (uint16_t)n;
+    args->elem = el;
+    args->snap = &snap;
+    args->await = nr_await_stub;
+    strlcpy(args->view_name, "default", sizeof(args->view_name));
+    const int calls0 = atomic_load(&g_nr_await_calls);
+    pthread_t th;
+    assert(pthread_create(&th, NULL, axfr_worker_thread, args) == 0);
+    for (int i = 0; i < 5000 && atomic_load(&snap.reader_count) != 0; i++) usleep(1000);
+    assert(atomic_load(&snap.reader_count) == 0);           /* released before the (blocked) send */
+    /* the apex is replaced and the old one freed while the answer waits for the client */
+    atomic_store(&el->apex, nr_apex(4300));
+    free(apex);
+    uint8_t out[4096];
+    size_t got = r11_drain(sp[1], junk, out, sizeof(out));
+    pthread_join(th, NULL);
+    close(sp[1]);
+    assert(got > 2 + 12 && atomic_load(&g_nr_await_calls) == calls0);
+    nr_reply_t rep;
+    memset(&rep, 0, sizeof(rep));
+    rep.len = ((size_t)out[0] << 8) | out[1];
+    assert(rep.len + 2 == got);
+    memcpy(rep.msg, out + 2, rep.len);
+    uint32_t serial;
+    int64_t expire;
+    int ede;
+    nr_parse(&rep, &serial, &expire, &ede);
+    assert(serial == 4242 && (rep.msg[3] & 0x0F) == 0);     /* the SOA of the apex as it was when the answer was made */
+    assert(atomic_load(&snap.reader_count) == 0);           /* (released once) */
+    free(atomic_load(&el->apex));
+    free(el);
+    printf("  -> apex answer passed.\n");
+}
+
+/* R11 review: when the SOA of the apex cannot be written (here an MNAME of 128 labels, which compress_name() refuses), the answer is not made from
+ * the apex and the thread waits for the zone instead: with the snapshot still retained, because the wait reads the element (db_ingest_xfr_await()) */
+static zone_db_snapshot_t *g_r11_snap;
+static int g_r11_refs_at_await = -1;
+static zone_db_entry_t *r11_await_records_snapshot(zdir_elem_t *el, const char *view) {
+    (void)view;
+    g_r11_refs_at_await = atomic_load(&g_r11_snap->reader_count);
+    (void)atomic_load(&el->state);                     /* (what the real wait reads: ASan would see a freed element) */
+    return NULL;                                       /* the zone does not come: SERVFAIL, EDE 14 */
+}
+
+static void test_r11_apex_write_failure_keeps_the_snapshot(void) {
+    printf("[TEST] R11: an apex whose SOA cannot be written falls back to the wait for the zone, with the snapshot retained...\n");
+    uint8_t names[300];
+    size_t ml = 0;
+    for (int i = 0; i < 128; i++) { names[ml++] = 1; names[ml++] = 'a'; }
+    names[ml++] = 0;
+    static const uint8_t rn[] = "\5admin\7example\3com";
+    const size_t rl = sizeof(rn);
+    memcpy(names + ml, rn, rl);
+    zdir_apex_t *apex = calloc(1, sizeof(*apex) + ml + rl);
+    apex->serial = 4242; apex->soa_ttl = 3600; apex->refresh = 7200; apex->retry = 3600; apex->expire = 1209600; apex->minimum = 300;
+    apex->mname_len = (uint16_t)ml; apex->rname_len = (uint16_t)rl;
+    memcpy(apex->data, names, ml + rl);
+    zdir_elem_t *el = nr_elem("nr.example.com.", 4242, apex);
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 1);
+    g_r11_snap = &snap;
+    uint8_t req[1024];
+    size_t n = nr_request(req, sizeof(req), "nr.example.com.", 251, 4242, true, false);
+    int sp[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+    axfr_worker_args_t *args = calloc(1, sizeof(axfr_worker_args_t));
+    args->client_fd = sp[0];
+    args->send_ede = true;
+    strlcpy(args->client_ip, "127.0.0.1", sizeof(args->client_ip));
+    strlcpy(args->qname, "nr.example.com.", sizeof(args->qname));
+    args->qclass = 1;
+    args->qtype = 251;
+    memcpy(args->req, req, n);
+    args->req_len = (uint16_t)n;
+    args->elem = el;
+    args->snap = &snap;
+    args->await = r11_await_records_snapshot;
+    strlcpy(args->view_name, "default", sizeof(args->view_name));
+    pthread_t th;
+    assert(pthread_create(&th, NULL, axfr_worker_thread, args) == 0);
+    uint8_t out[4096];
+    size_t got = r11_drain(sp[1], 0, out, sizeof(out));
+    pthread_join(th, NULL);
+    close(sp[1]);
+    assert(g_r11_refs_at_await == 1);                   /* the wait ran with the snapshot retained */
+    assert(atomic_load(&snap.reader_count) == 0);       /* and the thread released it once */
+    nr_reply_t rep;
+    memset(&rep, 0, sizeof(rep));
+    assert(got > 2 + 12);
+    rep.len = ((size_t)out[0] << 8) | out[1];
+    memcpy(rep.msg, out + 2, rep.len);
+    uint32_t serial;
+    int64_t expire;
+    int ede;
+    nr_parse(&rep, &serial, &expire, &ede);
+    assert((rep.msg[3] & 0x0F) == 2 && ede == 14);       /* SERVFAIL, Not Ready */
+    free(apex);
+    free(el);
+    printf("  -> apex write failure passed.\n");
 }
 
 static void test_axfr_bg_thread_and_free_ixfr_txn(void) {
@@ -3159,18 +3436,6 @@ static void test_ixfr_txn_allocation_and_free_cycles(void) {
     printf("  -> ixfr_txn cleanup cycles passed.\n");
 }
 
-static void test_wait_for_active_axfr_immediate_and_timeout(void) {
-    printf("[TEST] AXFR/IXFR: wait_for_active_axfr immediate return when count 0...\n");
-    zone_db_entry_t entry;
-    memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "example.com.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.active_axfr, 0, memory_order_relaxed);
-
-    bool ok = wait_for_active_axfr(&entry, 100);
-    assert(ok == true);
-    printf("  -> wait_for_active_axfr immediate return passed.\n");
-}
-
 
 /* ------------------------------------------------------------------------ Round 2 tests (+35) */
 
@@ -3280,16 +3545,6 @@ static void test_axfr_ixfr_eagain_nonblocking_drain(void) {
         close(sv[1]);
     }
     printf("  -> EAGAIN drain passed.\n");
-}
-
-static void test_axfr_ixfr_wait_for_active_axfr_timeout(void) {
-    printf("[TEST] AXFR/IXFR: wait_for_active_axfr timeout check...\n");
-    zone_db_entry_t entry;
-    memset(&entry, 0, sizeof(entry));
-    atomic_init(&entry.active_axfr, 0);
-    bool ok = wait_for_active_axfr(&entry, 50);
-    assert(ok == true);
-    printf("  -> wait timeout passed.\n");
 }
 
 static void test_axfr_ixfr_ixfr_txn_arena_cleanup(void) {
@@ -8441,7 +8696,6 @@ int main(void) {
     test_batch4_failover_and_sources();
     test_edns_expire_rfc7314();
     printf("=== Starting AXFR/IXFR Engine Unit Tests ===\n");
-    test_wait_for_active_axfr_branches();
     test_p10_transfer_responses();
     test_p10_extended_ixfr();
     test_p10_ixfr_request_client_serial();
@@ -8463,6 +8717,9 @@ int main(void) {
     test_handle_axfr_event_intermediate_unsigned_flow();
     test_handle_axfr_event_and_worker_thread();
     test_axfr_worker_zone_out_of_memory();
+    test_r11_stalled_transfer_holds_nothing_but_its_version();
+    test_r11_apex_answer_copies_before_send();
+    test_r11_apex_write_failure_keeps_the_snapshot();
     test_axfr_bg_thread_and_free_ixfr_txn();
     test_ixfr_delta_empty_records();
     test_ixfr_history_ring_buffer_wrap();
@@ -8497,7 +8754,6 @@ int main(void) {
     test_handle_axfr_event_eagain_and_partial_recv();
     test_handle_axfr_event_out_of_zone_bailiwick_record();
     test_ixfr_txn_allocation_and_free_cycles();
-    test_wait_for_active_axfr_immediate_and_timeout();
         test_snapshot_rcu_alloc_and_free_cycle();
     test_snapshot_rcu_reader_count_increment_decrement();
     test_snapshot_rcu_garbage_collection_epoch_advance();
@@ -8505,7 +8761,6 @@ int main(void) {
     test_axfr_ixfr_out_of_bailiwick_record_drop();
     test_axfr_ixfr_tinydns_location_records_in_axfr();
     test_axfr_ixfr_eagain_nonblocking_drain();
-    test_axfr_ixfr_wait_for_active_axfr_timeout();
     test_axfr_ixfr_ixfr_txn_arena_cleanup();
     test_axfr_ixfr_catalog_property_coo_sync();
     test_axfr_ixfr_catalog_property_group_sync();

@@ -157,6 +157,8 @@ typedef struct resolve_checkpoint {
 
 /* 共有の応答キャッシュを bytes 以内で確保する (以前の表は捨てる)。0 なら使わない。確保した大きさを返す */
 size_t response_cache_init(size_t bytes);
+/* The Backend, right after its fork: its own key for the response cache and the CNAME loop check (not the manager's) */
+void query_engine_key_redraw(void);
 /* ゾーンのデータを公開するたび (と兄弟ゾーンが変わるたび) に使う、一意の版の番号 */
 uint64_t zone_data_generation_next(void);
 program_plugin_t *find_program_plugin(const char *view_name, const char *domain);

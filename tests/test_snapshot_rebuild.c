@@ -1036,6 +1036,76 @@ static void retired_obj_free(void *p) {
     free(p);
 }
 
+/* 0.7 (memory-limit, option B): the retired bytes a reader holds are not weighed against the limit; a version retired a moment ago is */
+static void test_cache_used_bytes_and_held(void) {
+    printf("[TEST] Snapshot Rebuild: memory-limit counts retired bytes except those a reader holds...\n");
+    zone_bytes_t zb = { .resident = 100, .retired = 50, .previous = 10 };
+    assert(dbreg_cache_used_bytes(&zb, 0) == 160);
+    assert(dbreg_cache_used_bytes(&zb, 30) == 130);
+    assert(dbreg_cache_used_bytes(&zb, 50) == 110);
+    assert(dbreg_cache_used_bytes(&zb, 80) == 110);              /* (held read a moment after retired: never below what is served) */
+
+    zone_db_entry_t *e = create_new_zone_entry("held.example", "");
+    assert(e);
+    e->source = ZONE_SRC_DB;                                      /* (class ZBYTES_DB) */
+    zone_retire_process(true);
+    assert(zone_bytes_retired_held(ZBYTES_DB) == 0);
+    zone_arena_t b1, b2;
+    zone_arena_init(&b1); zone_arena_init(&b2);
+    zone_version_t *v1 = zone_version_new(&b1), *v2 = zone_version_new(&b2);
+    assert(v1 && v2);
+    v1->bytes = 4096;
+    pthread_mutex_lock(&e->writer_lock);
+    zone_publish(e, v1);
+    rcu_aux_read_lock();                                          /* a reader that stays */
+    zone_publish(e, v2);                                          /* v1 retired: a reader may still read it */
+    pthread_mutex_unlock(&e->writer_lock);
+    zone_retire_held_ms_set_for_test(60000);
+    zone_retire_process(false);
+    assert(zone_bytes_retired_held(ZBYTES_DB) == 0);              /* retired a moment ago: counted as before (its grace period is just not over) */
+    zone_retire_process(true);                                    /* the short wait does not end: a reader stays, the version is held at once */
+    assert(zone_bytes_retired_held(ZBYTES_DB) == 4096);
+    zone_retire_process(false);                                   /* a later pass that does not wait (the control tick): it stays held, whatever its age */
+    assert(zone_bytes_retired_held(ZBYTES_DB) == 4096);
+    zone_retire_process(true);                                    /* (one in the back-off: the same) */
+    assert(zone_bytes_retired_held(ZBYTES_DB) == 4096);
+    zone_retire_held_ms_set_for_test(0);
+    zone_retire_process(false);
+    assert(zone_bytes_retired_held(ZBYTES_DB) == 4096);           /* kept for the reader past the short grace period: held, not counted */
+    zone_bytes_t now;
+    zone_bytes_get(ZBYTES_DB, &now);
+    assert(now.retired >= 4096 && dbreg_cache_used_bytes(&now, zone_bytes_retired_held(ZBYTES_DB)) == now.resident + now.previous + now.retired - 4096);
+    rcu_aux_read_unlock();
+    zone_retire_process(false);                                   /* the reader gone: freed, and the stack is empty */
+    assert(zone_bytes_retired_held(ZBYTES_DB) == 0);
+    zone_retire_process(false);
+    assert(zone_bytes_retired_held(ZBYTES_DB) == 0);
+    zone_retire_held_ms_set_for_test(1000);
+    /* the cache manager's sampler: a reader in its section for a second or more is a long reader; a later one is not counted before its second */
+    const int64_t t = 1000000000000000LL;            /* (beyond any earlier sample of a real clock) */
+    (void)cache_reader_sample(t);                                 /* (a sample is taken) */
+    rcu_aux_read_lock();
+    assert(!cache_reader_sample(t + 1000));                       /* it entered after the sample: not yet */
+    assert(!cache_reader_sample(t + 1500));                       /* (between two samples nothing changes) */
+    assert(cache_reader_sample(t + 2000));                        /* in its section since the sample before: a long reader */
+    assert(dbreg_cache_long_reader());
+    rcu_aux_read_unlock();
+    assert(!cache_reader_sample(t + 3000));                       /* it has left */
+    /* the sampler's state is given back: a later sample at the real clock is taken again (it was left at t, and no time after it came) */
+    cache_reader_sample_reset_for_test();
+    (void)cache_reader_sample(1000);
+    rcu_aux_read_lock();
+    assert(!cache_reader_sample(2000));
+    assert(cache_reader_sample(3000));
+    rcu_aux_read_unlock();
+    assert(!cache_reader_sample(4000));
+    cache_reader_sample_reset_for_test();
+    assert(atomic_load(&e->snapshot_refs) == 1);
+    free_zone_db_entry(e);                                        /* (frees v2, the active version) */
+    zone_arena_destroy(&b1); zone_arena_destroy(&b2);
+    printf("  -> memory-limit accounting passed.\n");
+}
+
 /* B0: zone_retire_object() frees an object only after the grace period and while the entry has no AXFR out /
  * transfer in (the same conditions as a retired version); zone_entry_config() picks dbcfg for DB zones */
 static void test_retire_object_and_entry_config(void) {
@@ -1050,16 +1120,19 @@ static void test_retire_object_and_entry_config(void) {
     free(spare);
     assert(atomic_load(&e->snapshot_refs) == 1);
 
-    /* pinned by an outgoing AXFR: not freed even after a blocking grace period */
+    /* R11: an outgoing AXFR does not hold the entry's objects (it copied what it reads of the settings when it started): freed after the grace period */
     g_retired_obj_freed = 0;
     atomic_store(&e->active_axfr, 1);
     uint64_t ep = rcu_writer_advance_epoch();
     assert(zone_retire_object(e, malloc(8), retired_obj_free, ep));
     assert(atomic_load(&e->snapshot_refs) == 2);
     zone_retire_process(true);
-    assert(g_retired_obj_freed == 0 && atomic_load(&e->snapshot_refs) == 2);
-    /* pinned by an inbound transfer */
+    assert(g_retired_obj_freed == 1 && atomic_load(&e->snapshot_refs) == 1);
     atomic_store(&e->active_axfr, 0);
+    g_retired_obj_freed = 0;
+    /* pinned by an inbound transfer */
+    ep = rcu_writer_advance_epoch();
+    assert(zone_retire_object(e, malloc(8), retired_obj_free, ep));
     atomic_store(&e->is_transferring, true);
     zone_retire_process(true);
     assert(g_retired_obj_freed == 0 && atomic_load(&e->snapshot_refs) == 2);
@@ -1079,16 +1152,69 @@ static void test_retire_object_and_entry_config(void) {
     zone_retire_process(false);
     assert(g_retired_obj_freed == 2 && atomic_load(&e->snapshot_refs) == 1);
 
-    /* several objects on the stack, all pinned together */
-    atomic_store(&e->active_axfr, 1);
+    /* several objects on the stack, all pinned together (an inbound transfer) */
+    atomic_store(&e->is_transferring, true);
     ep = rcu_writer_advance_epoch();
     assert(zone_retire_object(e, malloc(8), retired_obj_free, ep));
     assert(zone_retire_object(e, malloc(8), retired_obj_free, ep));
     zone_retire_process(true);
     assert(g_retired_obj_freed == 2);
-    atomic_store(&e->active_axfr, 0);
+    atomic_store(&e->is_transferring, false);
     zone_retire_process(true);
     assert(g_retired_obj_freed == 4 && atomic_load(&e->snapshot_refs) == 1);
+
+    /* R11: a retired version is kept while a transfer holds it (its own xfr_refs), and only that one: the version retired after it, which no
+     * transfer holds, is freed at once; active_axfr (a transfer runs) holds nothing on the retire stack */
+    {
+        gc_reclaim_stats_t gs;
+        zone_retire_process(true);
+        gc_reclaim_stats(&gs);
+        const uint64_t base = gs.zone_retire_waiting;   /* (what earlier cases left) */
+        pthread_mutex_lock(&e->writer_lock);
+        zone_arena_t b1, b2, b3;
+        zone_arena_init(&b1); zone_arena_init(&b2); zone_arena_init(&b3);
+        zone_version_t *v1 = zone_version_new(&b1), *v2 = zone_version_new(&b2), *v3 = zone_version_new(&b3);
+        assert(v1 && v2 && v3);
+        zone_publish(e, v1);
+        atomic_fetch_add(&v1->xfr_refs, 1);              /* a transfer sends v1 */
+        atomic_store(&e->active_axfr, 1);
+        zone_publish(e, v2);                             /* v1 retired */
+        zone_publish(e, v3);                             /* v2 retired, nobody holds it */
+        pthread_mutex_unlock(&e->writer_lock);
+        zone_retire_process(true);
+        gc_reclaim_stats(&gs);
+        assert(gs.zone_retire_waiting == base + 1 && atomic_load(&e->snapshot_refs) == 2);   /* v1 waits (with its reference of the entry), v2 is gone */
+        assert(v1->image == NULL && atomic_load(&v1->xfr_refs) == 1);                 /* (still readable: ASan would report a use after free) */
+        atomic_fetch_sub(&v1->xfr_refs, 1);              /* the stream is over */
+        atomic_store(&e->active_axfr, 0);
+        zone_retire_process(true);
+        gc_reclaim_stats(&gs);
+        assert(gs.zone_retire_waiting == base && atomic_load(&e->snapshot_refs) == 1);
+        zone_arena_destroy(&b1); zone_arena_destroy(&b2); zone_arena_destroy(&b3);
+    }
+
+    /* 0.7: zone_retire_process(true) only bounds memory: with a reader that stays in its section it tries the grace period for at most 50 ms,
+     * then does not try again for a second (a rebuild calls it every 1024 zones); nothing is freed before the reader leaves */
+    {
+        struct timespec t0, t1;
+        rcu_aux_read_lock();
+        uint64_t ep2 = rcu_writer_advance_epoch();
+        g_retired_obj_freed = 0;
+        assert(zone_retire_object(e, malloc(8), retired_obj_free, ep2));
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        zone_retire_process(true);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        int64_t ms = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        assert(ms >= 45 && ms < 1000 && g_retired_obj_freed == 0);          /* one short try (it waited 60 s before) */
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        zone_retire_process(true);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        ms = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        assert(ms < 40 && g_retired_obj_freed == 0);                         /* the back-off: no second try */
+        rcu_aux_read_unlock();
+        zone_retire_process(true);                                           /* (still in the back-off: no wait needed, the reader is gone) */
+        assert(g_retired_obj_freed == 1 && atomic_load(&e->snapshot_refs) == 1);
+    }
 
     /* zone_entry_config(): the DB zone's own settings; the others go through the config index */
     zone_config_t dbc;
@@ -1765,7 +1891,7 @@ static void test_zone_rollback(void) {
     /* the words of every reply */
     for (int r = ZRB_OK; r <= ZRB_FAILED; r++) assert(zone_rollback_text((zone_rollback_result_t)r) != NULL);
     assert(strstr(zone_rollback_text(ZRB_SIGNED), "signed") && strstr(zone_rollback_text(ZRB_OFF), "rollback-window") &&
-           strstr(zone_rollback_text(ZRB_NO_PREV), "no previous version") && strstr(zone_rollback_text(ZRB_BUSY), "busy") &&
+           strstr(zone_rollback_text(ZRB_NO_PREV), "no previous version") &&
            strstr(zone_rollback_text(ZRB_EVICTED), "memory") && strstr(zone_rollback_text(ZRB_NOT_PRIMARY), "primary") &&
            strstr(zone_rollback_text(ZRB_FAILED), "syslog"));
     assert(zone_rollback_text(ZRB_OK)[0] == '\0');
@@ -1833,6 +1959,7 @@ int main(void) {
     test_snapshot_rebuild_case_33();
     test_snapshot_rebuild_case_35();
     test_retire_object_and_entry_config();
+    test_cache_used_bytes_and_held();
     test_snapshot_in_view();
     test_zone_rollback();
     /* Remove the scratch directory in-process: detached snapshot GC threads may

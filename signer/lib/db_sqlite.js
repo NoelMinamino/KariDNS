@@ -13,28 +13,139 @@ const META_KINDS = ['PRESIGNED', 'NSEC3PARAM', 'X-KARIDNS-SIGNER'];
 const CHUNK = 500;
 const CHANGES_BATCH = 20000;            // rows of the change log read at a time
 
-// One signer per database file: a lock file next to it holding our pid.  A file of a process that is gone is taken over.  Returns a function that
-// releases the lock.
-export function acquireFileLock(path, { pid = process.pid, kill = process.kill } = {}) {
-  for (let tries = 0; tries < 3; tries++) {
+// SQLite result codes (the primary code is the low byte of an extended one)
+const SQLITE_CORRUPT = 11;
+const SQLITE_BUSY = 5;
+const SQLITE_NOTADB = 26;
+const SQLITE_READONLY = 8;
+const SQLITE_CANTOPEN = 14;
+const sqliteCode = (e) => (Number.isInteger(e?.errcode) ? e.errcode & 0xff : -1);
+const LOCK_WAIT_MS = 1000;
+// (0 where the system has no such flag: Windows)
+const O_NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0;
+const O_NONBLOCK = fs.constants.O_NONBLOCK ?? 0;
+
+// The pid that the holder wrote into the lock file (PRAGMA user_version: the 4 octets at offset 60 of the header, big-endian), or 0.  Read with plain
+// file I/O by a process that does NOT hold the lock: closing a descriptor of the file drops every POSIX lock the process has on it.  Not through a
+// symbolic link, and a FIFO does not block it.
+export function lockHolderPid(path) {
+  let fd;
+  try {
+    fd = fs.openSync(path, fs.constants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    const b = Buffer.alloc(4);
+    return fs.readSync(fd, b, 0, 4, 60) === 4 ? b.readInt32BE(0) : 0;
+  } catch { return 0; } finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+
+// One signer per database file (K-2, 0.7).  The lock is held by the kernel: <db>.signer.lock is a second SQLite file, opened with
+// locking_mode=EXCLUSIVE set inside the exclusive transaction that writes it once; in that mode SQLite keeps its EXCLUSIVE lock (fcntl(2) byte-range locks on
+// FreeBSD) after the commit until the connection is closed, and the kernel drops it when the process ends, however it ends (SIGKILL, a crash, a
+// reboot).  No pid is trusted: the pid inside (user_version) is only for the message of the one that loses.  The file is never removed (removing a
+// file that another process has open and is about to lock would let two processes lock two files).  A 0.6.x lock file (a pid as text) is not a
+// database: it is emptied (truncation keeps the inode, so two starters racing over it still lock the same file) and used; the 0.6.x signer must not
+// be running any more.  Returns a function that releases the lock.
+//
+// The path is not trusted (0.7): the directory of the database is writable, maybe by another account too (a WebAdmin that shares the file), and
+// SQLite follows a symbolic link, as a truncation by name would.  The lock file is made here (O_CREAT|O_EXCL|O_NOFOLLOW, mode 0600: SQLite never
+// creates it through a link) or must be a regular file of the signer's effective user with one link; anything else (a symbolic link, a directory, a
+// FIFO, a device, a file of another user, a hard link) is refused and left as it is.  A 0.6.x file is emptied through a descriptor opened with
+// O_NOFOLLOW once fstat(2) shows the inode that lstat(2) saw.  node:sqlite does not hand out SQLite's descriptor, so once SQLite has opened the file the
+// path is looked at again (the same inode) and the file must have no schema (a lock file has none) before anything is written to it.  What is left
+// open: a swap of the path between the check and SQLite's open that is undone before the second look (docs/karidns-signer.md, "Lock").
+export function acquireFileLock(path, { sqlite, pid = process.pid, euid = process.geteuid?.() }) {
+  const ino = lockFileIdentity(path, euid);
+  for (let tries = 0; ; tries++) {
+    let db;
     try {
-      const fd = fs.openSync(path, 'wx', 0o600);
-      fs.writeSync(fd, `${pid}\n`);
-      fs.closeSync(fd);
-      return () => { try { fs.unlinkSync(path); } catch { /* gone */ } };
+      db = new sqlite.DatabaseSync(path);
+      // The exclusive lock is taken in SQLite's NORMAL locking mode, and the mode is made EXCLUSIVE only inside the transaction that holds it.  In
+      // EXCLUSIVE mode from the start, every starter that reads the file keeps the SHARED lock it took on the way (that mode never lets a lock go),
+      // so starters that race all wait for one another and none wins (seen on FreeBSD with 4 processes started at once).  In NORMAL mode a starter
+      // that does not get the lock lets go of what it took; the busy timeout lets the others' attempts end before one gives up.  Once committed in
+      // EXCLUSIVE mode the lock is kept until the connection closes.  A starter that finds the lock held is refused after LOCK_WAIT_MS.
+      db.exec(`PRAGMA busy_timeout = ${LOCK_WAIT_MS}`);
+      // SQLite has its descriptor now: the path must still name the file that was checked, and the file must have no tables (a swap of the path
+      // that was undone before this look), before anything can write to it (a journal_mode change rewrites the header of a WAL database)
+      sameLockFile(path, ino, euid);
+      if (db.prepare('SELECT count(*) AS n FROM sqlite_master').get().n !== 0) throw refuse(path, 'it is a database with tables, not a lock file');
+      db.exec('PRAGMA journal_mode = MEMORY');          // no -journal file next to the lock file
+      db.exec('BEGIN EXCLUSIVE');
+      db.exec('PRAGMA locking_mode = EXCLUSIVE');
+      db.exec(`PRAGMA user_version = ${pid | 0}`);
+      db.exec('COMMIT');
+      return () => { try { db.close(); } catch { /* closed */ } };
     } catch (e) {
-      if (e.code !== 'EEXIST') throw new Error(`cannot create the lock file ${path}: ${e.message}`);
+      try { db?.close(); } catch { /* not open */ }
+      if (e.lockFile) throw e;
+      const code = sqliteCode(e);
+      if (code === SQLITE_BUSY || /database is locked/.test(e.message)) {
+        const other = lockHolderPid(path);
+        throw new Error(`another karidns-signer ${other > 0 ? `(pid ${other}) ` : ''}works on this database: ${path} is locked`);
+      }
+      if ((code === SQLITE_NOTADB || code === SQLITE_CORRUPT || /not a database|malformed/.test(e.message)) && tries === 0) {
+        emptyLockFile(path, ino);
+        continue;
+      }
+      // the file stays after a run (see above) and is the signer's user's (checked above), but its mode may not let that user write it
+      const hint = code === SQLITE_CANTOPEN || code === SQLITE_READONLY
+        ? ' (the signer must be able to write it: chmod u+w it, or remove it while no signer runs)' : '';
+      throw new Error(`cannot take the lock file ${path}: ${e.message}${hint}`);
     }
-    let other = NaN;
-    try { other = Number(fs.readFileSync(path, 'utf8').trim()); } catch { /* gone again: try to create it */ }
-    if (Number.isInteger(other) && other > 0 && other !== pid) {
-      let alive = true;
-      try { kill(other, 0); } catch (e) { alive = e.code === 'EPERM'; }
-      if (alive) throw new Error(`another karidns-signer (pid ${other}) works on this database: ${path}`);
-    }
-    try { fs.unlinkSync(path); } catch { /* somebody else did */ }
   }
-  throw new Error(`cannot take the lock file ${path}`);
+}
+
+// A refusal of the lock file itself, passed on as it is
+const refuse = (path, why) => Object.assign(new Error(`cannot take the lock file ${path}: ${why}`), { lockFile: true });
+const OWNER_HINT = 'chown it to the signer\'s user or remove it while no signer runs';
+
+// What is wrong with the file at the lock path (lstat, bigint), or null
+function badLockFile(st, euid) {
+  if (st.isSymbolicLink()) return 'it is a symbolic link (refused: the signer does not lock or truncate a file through a link; remove it)';
+  if (!st.isFile()) return `it is ${st.isDirectory() ? 'a directory' : 'not a regular file'} (refused; remove it)`;
+  if (euid !== undefined && st.uid !== BigInt(euid)) return `it belongs to uid ${st.uid}, not to the signer's user (uid ${euid}): ${OWNER_HINT}`;
+  if (st.nlink !== 1n) return `it has ${st.nlink} hard links (refused: it must be a file of its own; remove it)`;
+  return null;
+}
+
+// The device and inode of the lock file, once checked (or made here, exclusively, never through a link)
+function lockFileIdentity(path, euid) {
+  for (let i = 0; ; i++) {
+    let st = null;
+    try { st = fs.lstatSync(path, { bigint: true }); } catch (e) { if (e.code !== 'ENOENT') throw refuse(path, e.message); }
+    if (!st) {
+      let fd;
+      try {
+        fd = fs.openSync(path, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, 0o600);
+        st = fs.fstatSync(fd, { bigint: true });
+      } catch (e) {
+        if (e.code === 'EEXIST' && i < 3) continue;              // made by another starter at the same instant (or planted): look at it
+        throw refuse(path, `${e.message} (the signer creates and writes this file: it needs write access to the directory of the database)`);
+      } finally { if (fd !== undefined) fs.closeSync(fd); }
+    }
+    const bad = badLockFile(st, euid);
+    if (bad) throw refuse(path, bad);
+    return { dev: st.dev, ino: st.ino };
+  }
+}
+
+// After SQLite has opened and locked it: the path still names the file that was checked
+function sameLockFile(path, ino, euid) {
+  let st;
+  try { st = fs.lstatSync(path, { bigint: true }); } catch (e) { throw refuse(path, `it was replaced while it was opened (${e.message})`); }
+  if (badLockFile(st, euid) || st.dev !== ino.dev || st.ino !== ino.ino) throw refuse(path, 'it was replaced while it was opened');
+}
+
+// A 0.6.x lock file (not a database) is emptied: through a descriptor that is not a link and is the inode that was checked
+function emptyLockFile(path, ino) {
+  let fd;
+  try {
+    fd = fs.openSync(path, fs.constants.O_WRONLY | O_NOFOLLOW | O_NONBLOCK);
+    const st = fs.fstatSync(fd, { bigint: true });
+    if (!st.isFile() || st.dev !== ino.dev || st.ino !== ino.ino) throw refuse(path, 'it was replaced while it was opened');
+    fs.ftruncateSync(fd, 0);
+  } catch (e) {
+    throw e.lockFile ? e : refuse(path, e.message);
+  } finally { if (fd !== undefined) fs.closeSync(fd); }
 }
 
 export class SqliteDb {
@@ -48,7 +159,7 @@ export class SqliteDb {
   }
 
   open() {
-    this.releaseLock = acquireFileLock(`${this.file}.signer.lock`);
+    this.releaseLock = acquireFileLock(`${this.file}.signer.lock`, { sqlite: this.sqlite });
     try {
       this.db = new this.sqlite.DatabaseSync(this.file);
       this.db.exec('PRAGMA busy_timeout = 10000');

@@ -25,8 +25,8 @@ jobs:
     name: Build and Test on FreeBSD ${{ matrix.release }}
     if: github.event_name != 'schedule' && github.event.action != 'labeled'
     runs-on: ubuntu-latest
-    # a hung test must fail the job instead of blocking it for hours.  The 15.1 job took 29 minutes (14.4: 32) before the browser tests of the web interface; they add the
-    # install of Firefox (a minute or two) and, on the build host, 1:45 of tests: about 40 minutes expected.  Look at the first run on 15.1 and raise this if it is near 50.
+    # a hung test must fail the job instead of blocking it for hours.  The 15.1 job took 29 minutes (14.4: 32) without the browser tests of the web interface, which
+    # run in the job webadmin-gui-freebsd since 0.7 (their result does not decide this job's).
     timeout-minutes: 55
     strategy:
       fail-fast: false
@@ -59,19 +59,6 @@ jobs:
             (cd webadmin && npm ci --ignore-scripts)
             node --version
             dnssec-signzone -V
-            echo "::endgroup::"
-
-            echo "::group::📦 [Setup] Firefox and geckodriver for the browser tests of the web interface (0.6.0 item F, FreeBSD 15.1 only)"
-            # run_webadmin_gui_test.sh drives Firefox (headless) through geckodriver; the packages are built for 15.x.  Firefox crashes at the start without a font.
-            # The tests use no network (a profile that talks to nothing, everything on 127.0.0.1): the network is for this step only.
-            # The packages preinstalled in the VM image can be older than the repository: pkg keeps an installed library whose soname
-            # is unchanged (libffi.so.8 lacked the LIBFFI_CALL_PLAN_8.4 symbol version libxul.so needs), so bring them up to date first.
-            if [ "${{ matrix.release }}" = "15.1" ]; then
-              pkg upgrade -y
-              pkg install -y firefox geckodriver dejavu
-              firefox --version
-              geckodriver --version | head -1
-            fi
             echo "::endgroup::"
 
             echo "::group::📦 [Setup] PostgreSQL server and libpq (PostgreSQL driver of karidns-dbloader, B10)"
@@ -164,16 +151,12 @@ jobs:
 
             echo "::group::🔏 [Signer, WebAdmin] karidns-signer and karidns-webadmin: unit tests, SQLite3 and PostgreSQL (root: with a server)"
             # A SKIP of a whole script must fail here (tests/run_all_suite.sh shows it as a note of a PASS): node24, bind-tools, signer/node_modules and webadmin/node_modules are installed above
-            # The browser tests of the web interface (the sign-in with a provider among them: its browser part) run on 15.1 only (Firefox is installed there); a SKIP fails the job like any other
-            GUI_TEST=""
-            if [ "${{ matrix.release }}" = "15.1" ]; then GUI_TEST="run_webadmin_gui_test,run_webadmin_gui_pg_test,run_webadmin_oidc_test"; fi
-            NODE_TESTS="run_signer_unit_test,run_signer_test,run_signer_pg_test,run_webadmin_unit_test,run_webadmin_test,run_webadmin_pg_test,run_webadmin_write_test,run_webadmin_write_pg_test,run_webadmin_versions_test,run_webadmin_versions_pg_test,run_webadmin_pkg_test,run_signer_pkg_test,run_release_roundtrip_test"
-            # 4 at a time through tests/run_all_suite.sh.  --serial-as-par: the browser tests are registered "serial" there (the others run next to the other tests since 0.6.2); every one of them
+            # The browser tests of the web interface (category gui of the suite) run in the job webadmin-gui-freebsd; the OpenID Connect test runs here without its browser part
+            NODE_TESTS="run_signer_unit_test,run_signer_test,run_signer_pg_test,run_signer_lock_test,run_webadmin_unit_test,run_webadmin_test,run_webadmin_pg_test,run_webadmin_write_test,run_webadmin_write_pg_test,run_webadmin_versions_test,run_webadmin_versions_pg_test,run_webadmin_oidc_test,run_webadmin_pkg_test,run_signer_pkg_test,run_release_roundtrip_test"
+            # 4 at a time through tests/run_all_suite.sh.  --serial-as-par: some of them are registered "serial" there (the others run next to the other tests since 0.6.2); every one of them
             # takes its ports (kari_port), its directory (mktemp) and its PostgreSQL roles and databases ($$) of its own.  --fail-on-skip: a test that exits 0 but prints a SKIP line
             # fails the job, as the loop did before
             sh ./tests/run_all_suite.sh -j 4 --test-timeout 1200 --serial-as-par --full-log --fail-on-skip --tests "$NODE_TESTS" < /dev/null
-            # the browser tests one after the other (a Firefox each; the memory of the VM)
-            if [ -n "$GUI_TEST" ]; then sh ./tests/run_all_suite.sh -j 1 --test-timeout 600 --full-log --fail-on-skip --tests "$GUI_TEST" < /dev/null; fi
             echo "::endgroup::"
 
             echo "::group::🛡️ [Sanitizer & Fuzzing] Run Comprehensive Smoke Tests"
@@ -182,6 +165,76 @@ jobs:
 
             echo ""
             echo "🎉 All FreeBSD builds and smoke tests passed!"
+
+  # ---------------------------------------------------------------------------
+  # The browser tests of the web interface (0.7: category gui of tests/run_all_suite.sh, left out of a plain suite run): Firefox headless through geckodriver
+  # on FreeBSD 15.1 (the packages are built for 15.x).  A job of its own, so that a flaky browser step does not fail the server's build-and-test job.  It runs
+  # on every push to main, by hand, and on a pull request that touches the web interface, the service, the code they share, their tests or this workflow,
+  # or a source of the programs the scenarios run besides the server (karidns-zone, karicheck, karidns-dbloader, karictl, dag: the files the Makefile
+  # links into them, the database code included); a change to a file that only the server links does not start a browser.
+  # ---------------------------------------------------------------------------
+  webadmin-gui-freebsd:
+    name: WebAdmin browser tests (FreeBSD 15.1)
+    if: github.event_name != 'schedule' && github.event.action != 'labeled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Does the change touch the web interface?
+        id: paths
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          run=true
+          if [ "$EVENT" = "pull_request" ] && [ -n "$PR_BASE" ] && git cat-file -e "$PR_BASE^{commit}" 2>/dev/null; then
+            if ! git diff --name-only "$PR_BASE" HEAD | grep -Eq '^(webadmin/|node/|db/|tests/lib_webadmin_gui\.sh$|tests/run_webadmin_(gui|gui_pg|oidc|oidc_gui)_test\.sh$|tests/run_all_suite\.sh$|tests/lib_proc\.sh$|\.github/workflows/ci\.yml$|tools/(karidns_zone|karicheck|karictl|karidns_tool_linkage|dag[a-z0-9_]*|dnstap_decode)\.[ch]$|karidns_dbloader\.c$|dns_(zone_(import|export|changes|render|msg|text|rows|lint|parser)|pdns_reader|presigned|db_[a-z0-9_]+|tinydns_parser|config_parser|tsig_acl|diag|wire|utils|cidr)\.[ch]$)'; then
+              run=false
+              echo "the web interface, the service, the tools the scenarios run, their tests and this workflow are unchanged: the browser tests are not run"
+            fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - name: Browser tests inside FreeBSD VM
+        if: steps.paths.outputs.run == 'true'
+        uses: vmactions/freebsd-vm@v1.4.8
+        with:
+          release: '15.1'
+          run: |
+            set -e
+
+            echo "::group::📦 [Setup] perl5, sqlite3, Node.js, PostgreSQL, Firefox and geckodriver"
+            # Firefox crashes at the start without a font.  The tests use no network (a profile that talks to nothing, everything on 127.0.0.1): the network is for this step only.
+            # The packages preinstalled in the VM image can be older than the repository: pkg keeps an installed library whose soname
+            # is unchanged (libffi.so.8 lacked the LIBFFI_CALL_PLAN_8.4 symbol version libxul.so needs), so bring them up to date first.
+            pkg upgrade -y
+            pkg install -y perl5 sqlite3 node24 npm-node24 curl postgresql17-server postgresql17-client firefox geckodriver dejavu
+            (cd webadmin && npm ci --ignore-scripts)
+            node --version
+            firefox --version
+            geckodriver --version | head -1
+            sysrc postgresql_enable=YES
+            service postgresql initdb
+            service postgresql start
+            export KARIDNS_TEST_PG="host=127.0.0.1 user=postgres"
+            export KARIDNS_TEST_PG_USER=postgres
+            i=0; until pg_isready -q -h 127.0.0.1 || [ $i -ge 30 ]; do sleep 1; i=$((i + 1)); done
+            echo "::endgroup::"
+
+            echo "::group::📦 [Build] the server, the loader and the tools the browser tests use"
+            NCPU=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+            ./configure --with-db-drivers="sqlite3 postgresql"
+            make -j"$NCPU" all karidns-dbloader karidns-zone
+            echo "::endgroup::"
+
+            echo "::group::🌐 [Browser] the tests of the category gui, one after the other (a Firefox each; the memory of the VM)"
+            # --fail-on-skip: a test that exits 0 but prints a SKIP line fails the job
+            sh ./tests/run_all_suite.sh -j 1 --test-timeout 600 --full-log --fail-on-skip --only-gui < /dev/null
+            echo "::endgroup::"
 
   unit-tests-portable:
     name: Portable unit tests (+ASan/UBSan) on ${{ matrix.name }}

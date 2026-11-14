@@ -143,7 +143,10 @@ typedef struct {
   bool counted;               /* zone_publish() put `bytes` in the zone memory totals (zone_bytes_get()) */ \
   size_t bytes;               /* D1a (8.1): what the version holds: the version, its image and the glue block; set when the image is frozen (zone_version_new()) and by zone_glue_track_build() */ \
   /* the published version / any change of a sibling zone: a new value (response cache key). 0 = unpublished/test */ \
-  _Atomic uint64_t generation;
+  _Atomic uint64_t generation;                                                                       \
+  /* R11: the outbound transfers (AXFR / IXFR) that send this version.  A transfer takes it inside a read section and gives  \
+   * it back when the stream is over; the retire stack does not free a version while it is above 0 (zone_retire_process()) */ \
+  _Atomic int xfr_refs;
 typedef struct zone_version_s {
   ZONE_VERSION_FIELDS
 } zone_version_t;

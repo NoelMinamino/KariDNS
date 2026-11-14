@@ -96,6 +96,9 @@ my %HANDLERS = (
     'trunc-rdata'  => \&build_truncated_rdata_response,
     'oversized'    => \&build_oversized_response,
     'drop'         => \&build_nodata_response,
+    # (a plugin that takes 1.5 s: run_reload_long_reader_test.sh; it appends a line to "<this script>.slow" when it starts, if that file exists)
+    'slow'         => sub { if (-e "$0.slow" && open(my $m, '>>', "$0.slow")) { print $m "start\n"; close $m; }
+                            select(undef, undef, undef, 1.5); return build_normal_a_response(@_); },
 );
 
 sub read_raw_line {

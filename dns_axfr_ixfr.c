@@ -169,29 +169,6 @@ void free_ixfr_txn(ixfr_txn_t *txn) {
   free(txn);
 }
 
-bool wait_for_active_axfr(zone_db_entry_t *entry, int timeout_ms) {
-  if (!entry) return true;
-  int retries = 0;
-  useconds_t sleep_time = 1;
-  struct timespec start, now;
-  clock_gettime(CLOCK_MONOTONIC, &start);
-
-  while (atomic_load_explicit(&entry->active_axfr, memory_order_acquire) > 0) {
-    if (timeout_ms > 0) {
-      clock_gettime(CLOCK_MONOTONIC, &now);
-      int64_t elapsed_ms = (int64_t)(now.tv_sec - start.tv_sec) * 1000 +
-                           (int64_t)(now.tv_nsec - start.tv_nsec) / 1000000;
-      if (elapsed_ms >= timeout_ms) {
-        syslog(LOG_WARNING, "[AXFR] wait_for_active_axfr timed out after %d ms for zone '%s'",
-               timeout_ms, entry->domain);
-        return false;
-      }
-    }
-    rcu_exponential_backoff(&retries, &sleep_time);
-  }
-  return true;
-}
-
 /* ---- IXFR difference (S5 B-2): two images are compared; the old builder no longer exists ----
  * An RR of one version is "in" the other when the other has an RR with the same owner (case-insensitive), type, class,
  * TTL, tinydns time stamp / location, tags and RDATA (RFC 2136 §1.1.1: equal RDATA is the same RR; names compare as
@@ -1024,7 +1001,7 @@ time_t xfr_expire_deadline(bool transferred, bool has_expire, uint32_t expire_op
  * 手順: 配列の縮小 -> build_zone_index(RRset の TTL をそろえる) -> zone_image_freeze -> 作り手の解放 -> 新しい版 ->
  *       グルーの追跡と応答キャッシュ (設定とスナップショットは読み取り区間の中で読む) -> compute_ixfr_diff -> zone_publish。
  * 呼ぶ側の約束:
- *   - entry->writer_lock を持って呼ぶ (呼んだ後も持ったまま。解放は呼ぶ側)。wait_for_active_axfr() も呼ぶ側が済ませる。
+ *   - entry->writer_lock を持って呼ぶ (呼んだ後も持ったまま。解放は呼ぶ側)。(R11: 送信中の転送は自分の版を xfr_refs で押さえているので待たない)
  *   - 書けない RR は zone_drop_unencodable_logged() で呼ぶ前に除いておく (SOA の取り出しがその後に要るため呼ぶ側に置く)。
  *   - serial / refresh / retry / expire / next_check / expire_at / last_successful_transfer と、統計 (observatory)、
  *     notify_request_send() は呼ぶ側が行う。
@@ -1366,15 +1343,8 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
             rx_len = session->settings_len;
           }
         }
+        /* (R11: an outbound transfer of this zone that runs meanwhile goes on with the version it pinned; the swap does not wait for it) */
         pthread_mutex_lock(&entry->writer_lock);
-        if (!wait_for_active_axfr(entry, 5000)) {
-          pthread_mutex_unlock(&entry->writer_lock);
-          if (unsigned_msgs) free(unsigned_msgs);
-          zone_arena_destroy(&tmp_arena);
-          free(rx_text);
-          syslog(LOG_WARNING, "[XFR] Inbound transfer swap for zone '%s' postponed: active AXFR in progress.", entry->domain);
-          return -1;
-        }
         /* BIND zone_xfrdone(): refresh and retry are held to [min-*-time, max-*-time], expire to [refresh + retry, 24 weeks] */
         if (has_soa && session->eff) xfr_clamp_timers(session->eff, refresh, retry, expire, &refresh, &retry, &expire);
         /* the serial and the timers come with the new version and are put back when it is not installed (like the database load,
@@ -2124,32 +2094,58 @@ static bool zone_has_multiple_or_restricted_soa(const zone_image_t *img) {
   return k != ZONE_IMAGE_NONE && zone_image_rrset_next(img, img->apex_name, 6, k + 1) != ZONE_IMAGE_NONE;
 }
 
-/* B8t-2 (v3): the settings of the zone as this server applies them, as a TYPE 65408 record; nothing when there are none.  A zone
- * whose data carries its own trusted resolvers does not repeat them.  A text that does not fit the record is not sent (logged). */
-static int axfr_emit_settings(axfr_emit_ctx_t *ec, const zone_db_entry_t *entry, bool omit_trusted) {
-  char *text = malloc(KARIDNS_SETTINGS_MAX + 1);
-  if (!text) return -1;
-  rcu_aux_read_lock();
-  server_config_t *cfg = acquire_config_snapshot();
-  size_t len = 0;
-  if (cfg) len = zone_settings_render(cfg, zone_entry_config(cfg, entry), omit_trusted, text, KARIDNS_SETTINGS_MAX + 1);
-  if (cfg) release_config_snapshot(cfg);
-  rcu_aux_read_unlock();
-  int rc = 0;
-  if (len == (size_t)-1)
-    kdns_logc(LOGC_XFER_OUT, LOG_WARNING, "[AXFR] zone '%s': the settings of the zone are longer than %u octets and are not sent", entry->domain, KARIDNS_SETTINGS_MAX);
-  else if (len > 0)
-    rc = xext_emit_settings(&ec->xe, text, len);
-  free(text);
-  return rc;
+/* R11: what an outbound transfer takes from the configuration.  It is copied in the transfer's start section (send_axfr_response()), so the
+ * stream that follows reads no configuration and holds no read section while it waits for the client (a reload or a reconfig frees the old
+ * configuration after the grace period).  The transfer is made with the configuration as it was when it started. */
+typedef struct {
+  char *settings;              /* v3: the settings of the zone as text (TYPE 65408); NULL: none to send */
+  size_t settings_len;
+  ecs_tag_def_t *tagdefs[2];   /* v3: the configuration's location-tags [0] / ecs-tags [1] (clones), with the ones the zone's RRs use marked */
+  bool *tagdef_used[2];
+  int ntagdefs[2];
+  char **trusted;              /* the configuration's ecs-trusted-resolvers (Extended AXFR v2 of a zone without its own) */
+  int ntrusted;
+  char *loc_tag;               /* the requester's location tag (standard AXFR of a zone with per-client RRs); NULL: none */
+} xfr_copies_t;
+
+static void xfr_copies_free(xfr_copies_t *c) {
+  free(c->settings);
+  for (int k = 0; k < 2; k++) {
+    free_ecs_tags_array(c->tagdefs[k], c->ntagdefs[k]);
+    free(c->tagdef_used[k]);
+  }
+  for (int i = 0; i < c->ntrusted; i++) free(c->trusted[i]);
+  free(c->trusted);
+  free(c->loc_tag);
+  memset(c, 0, sizeof(*c));
 }
 
-/* B8t-2 (v3): the tag definitions of the configuration (the zone's location-tags / ecs-tags, else options') that the RRs of a zone
- * use, when the zone data defines no tags of that kind itself (the data's own definitions are the only ones used then, as when the
- * zone is served): sent as tag definitions, so that the secondary resolves the tags as the primary does */
-static int axfr_emit_config_tags(axfr_emit_ctx_t *ec, const zone_image_t *img, const zone_db_entry_t *entry, const zone_arena_t *zattr) {
+/* B8t-2 (v3): the settings of the zone as this server applies them, as a TYPE 65408 record; nothing when there are none.  A zone whose data
+ * carries its own trusted resolvers does not repeat them.  A text that does not fit the record is not sent (logged).  Read section held.
+ * -1: out of memory. */
+static int xfr_copy_settings(xfr_copies_t *c, server_config_t *cfg, const zone_db_entry_t *entry, bool omit_trusted) {
+  if (!cfg) return 0;
+  char *text = malloc(KARIDNS_SETTINGS_MAX + 1);
+  if (!text) return -1;
+  size_t len = zone_settings_render(cfg, zone_entry_config(cfg, entry), omit_trusted, text, KARIDNS_SETTINGS_MAX + 1);
+  if (len == (size_t)-1)
+    kdns_logc(LOGC_XFER_OUT, LOG_WARNING, "[AXFR] zone '%s': the settings of the zone are longer than %u octets and are not sent", entry->domain, KARIDNS_SETTINGS_MAX);
+  if (len == (size_t)-1 || len == 0) {
+    free(text);
+    return 0;
+  }
+  c->settings = text;
+  c->settings_len = len;
+  return 0;
+}
+
+/* B8t-2 (v3): the tag definitions of the configuration (the zone's location-tags / ecs-tags, else options') that the RRs of a zone use, when
+ * the zone data defines no tags of that kind itself (the data's own definitions are the only ones used then, as when the zone is served):
+ * sent as tag definitions, so that the secondary resolves the tags as the primary does.  Read section held.  -1: out of memory. */
+static int xfr_copy_config_tags(xfr_copies_t *c, const zone_image_t *img, const zone_db_entry_t *entry, const zone_arena_t *zattr,
+                                server_config_t *cfg) {
   bool want_loc = zattr->bind_location_tag_count == 0, want_ecs = zattr->bind_ecs_tag_count == 0;
-  if (!want_loc && !want_ecs) return 0;
+  if (!cfg || (!want_loc && !want_ecs)) return 0;
   uint32_t used_loc[256], used_ecs[256];
   int nloc = 0, necs = 0;
   for (uint32_t rr = 0; rr < img->n_rrs; rr++) {
@@ -2166,34 +2162,56 @@ static int axfr_emit_config_tags(axfr_emit_ctx_t *ec, const zone_image_t *img, c
       if (i == necs && necs < 256) used_ecs[necs++] = e->ecs_tag_off;
     }
   }
-  if (nloc == 0 && necs == 0) return 0;
-  int rc = 0;
-  rcu_aux_read_lock();
-  server_config_t *cfg = acquire_config_snapshot();
-  const zone_config_t *zcfg = cfg ? zone_entry_config(cfg, entry) : NULL;
-  for (int kind = 0; kind < 2 && rc == 0 && cfg; kind++) {
+  const zone_config_t *zcfg = zone_entry_config(cfg, entry);
+  for (int kind = 0; kind < 2; kind++) {
+    const uint32_t *used = kind == 0 ? used_loc : used_ecs;
+    const int nused = kind == 0 ? nloc : necs;
+    if (nused == 0) continue;
     const ecs_tag_def_t *defs;
     int ndef;
     if (kind == 0) {
-      if (nloc == 0) continue;
       defs = (zcfg && zext(zcfg)->location_tags) ? zext(zcfg)->location_tags : cfg->location_tags;
       ndef = (zcfg && zext(zcfg)->location_tags) ? zext(zcfg)->location_tag_count : cfg->location_tag_count;
     } else {
-      if (necs == 0) continue;
       defs = (zcfg && zext(zcfg)->ecs_tags) ? zext(zcfg)->ecs_tags : cfg->ecs_tags;
       ndef = (zcfg && zext(zcfg)->ecs_tags) ? zext(zcfg)->ecs_tag_count : cfg->ecs_tag_count;
     }
-    for (int d = 0; d < ndef && rc == 0; d++) {
-      const uint32_t *used = kind == 0 ? used_loc : used_ecs;
-      int nused = kind == 0 ? nloc : necs;
-      bool uses = false;
-      for (int u = 0; u < nused && !uses; u++) uses = defs[d].tag && strcasecmp(defs[d].tag, zone_image_str(img, used[u])) == 0;
-      if (uses && xext_emit_tagdef(&ec->xe, kind == 1, &defs[d]) < 0) rc = -1;
+    if (!defs || ndef <= 0) continue;
+    c->tagdefs[kind] = clone_ecs_tags_array(defs, ndef);
+    c->tagdef_used[kind] = calloc((size_t)ndef, sizeof(bool));
+    if (!c->tagdefs[kind] || !c->tagdef_used[kind]) {
+      free_ecs_tags_array(c->tagdefs[kind], ndef);
+      c->tagdefs[kind] = NULL;
+      return -1;
     }
+    c->ntagdefs[kind] = ndef;
+    for (int d = 0; d < ndef; d++)
+      for (int u = 0; u < nused && !c->tagdef_used[kind][d]; u++)
+        c->tagdef_used[kind][d] = defs[d].tag && strcasecmp(defs[d].tag, zone_image_str(img, used[u])) == 0;
   }
-  if (cfg) release_config_snapshot(cfg);
-  rcu_aux_read_unlock();
-  return rc;
+  return 0;
+}
+
+/* The trusted resolvers of the configuration, copied (read section held).  -1: out of memory. */
+static int xfr_copy_trusted(xfr_copies_t *c, char *const *list, int count) {
+  if (!list || count <= 0) return 0;
+  c->trusted = calloc((size_t)count, sizeof(char *));
+  if (!c->trusted) return -1;
+  c->ntrusted = count;                     /* (xfr_copies_free() frees what was copied when a strdup() fails) */
+  for (int i = 0; i < count; i++)
+    if (list[i] && !(c->trusted[i] = strdup(list[i]))) return -1;
+  return 0;
+}
+
+static int axfr_emit_settings(axfr_emit_ctx_t *ec, const xfr_copies_t *c) {
+  return c->settings ? xext_emit_settings(&ec->xe, c->settings, c->settings_len) : 0;
+}
+
+static int axfr_emit_config_tags(axfr_emit_ctx_t *ec, const xfr_copies_t *c) {
+  for (int kind = 0; kind < 2; kind++)
+    for (int d = 0; d < c->ntagdefs[kind]; d++)
+      if (c->tagdef_used[kind][d] && xext_emit_tagdef(&ec->xe, kind == 1, &c->tagdefs[kind][d]) < 0) return -1;
+  return 0;
 }
 
 /* The message under construction: the header and question of the request, QR=1 AA=1 (R-05), no RRs yet.  The caller sets what is particular to it (the
@@ -2299,6 +2317,35 @@ static void xfr_log_aborted(const char *client_ip, int client_port, const char *
           ec->why ? ec->why : "the transfer could not be completed", (unsigned)ec->nmsgs, (unsigned)ec->nrecs, (unsigned long long)ec->nbytes);
 }
 
+/* An outbound AXFR / IXFR (R11).  The transfer serves one version of the zone from its first message to its last: RFC 1035 §6.3 (second
+ * paragraph): a primary that creates a new version during an AXFR "should continue to send the old version if possible" and "should never
+ * send part of one version and part of another"; RFC 5936 §3: the client is to reconstruct the zone as it exists "for the given zone
+ * serial number"; RFC 1995 §4: an IXFR is bracketed by the server's current SOA, so it too belongs to one version.
+ *
+ * The start section.  Everything the stream needs is taken in one short read section (rcu_aux_read_lock()) at the start; the stream after it
+ * holds no read section, so a client that stops reading (up to max-transfer-idle-out, max-transfer-time-out) holds back no grace period: not
+ * the reclamation of retired snapshots and versions, not a reload.  What the stream reads after the section, and why each is safe:
+ *   - pinned: the zone version (entry->rcu.active at the start, `ver`) by ver->xfr_refs, taken inside the section.  The retire stack does not
+ *     free a retired version while its xfr_refs is above 0 (zone_retire_process(), zone_version_retire()); a version that became the zone's
+ *     prev goes to the retire stack when it is dropped (zone_prev_drop_locked()) or is freed with the entry (below).  The version's image
+ *     (zone_image_t: RRs, names, RDATA, the tag and location strings, the extended attributes) is frozen when the version is made
+ *     (zone_image_freeze()) and never written after; the writers (reload, UPDATE, rollback, inbound transfer, database install) build a new
+ *     version and publish it.  ver->glue, ->generation and ->counted are written after the publication, and the stream reads none of them.
+ *   - held by the caller: the zone entry (zone_db_entry_t).  axfr_worker_thread() gets it with a reference (xfr_entry_hold(): snapshot_refs
+ *     and active_axfr) taken by the TCP dispatch or by dbreg_xfr_acquire(); the last reference frees it (free_zone_db_entry()), so the entry
+ *     outlives the stream even when the zone is removed from the configuration, changes type or is replaced in the database.  Of the entry the
+ *     stream reads domain and view_name (written when the entry is made) and, at the start, the atomics of the RFC 7314 EXPIRE value.
+ *   - refcounted: the IXFR differences (ixfr_txn_t), taken under ixfr_history.lock with ref_count; their records live in the difference's own
+ *     arena.  A difference that leaves the history meanwhile is freed by the last release.
+ *   - copied: every value from the configuration (xfr_copies_t and the locals below): send-extended-errors, the server statement's
+ *     transfer-format and provide-ixfr, the decision for an Extended AXFR, the location tag of the requester (zone_client_view() can point it
+ *     into the configuration), the settings text (v3), the tag definitions of the configuration (v3) and its trusted resolvers.  Revoking
+ *     allow-transfer or changing these during the stream does not change the stream.
+ *   - the transfer's own: the TSIG key (a copy, axfr_worker_args_t) and the multi-message signing state (RFC 8945 §5.3.1: the MAC of the
+ *     previous message, axfr_emit_ctx_t.tsig_mac), the extended attributes decoded from the image into a local arena (zattr), the message buffer.
+ *   - no RCU data: dnstap (write_dnstap_event() with no worker: atomics and the shared ring), the xfer-out log lines (logev / kdns_logc), the
+ *     statistics counters.
+ * The error answers that are decided in the start section (FORMERR, REFUSED, SERVFAIL) are sent after it. */
 void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
                         uint16_t req_len, tsig_key_t *tsig_key, zone_db_entry_t *entry,
                         uint8_t *req_mac, size_t req_mac_len,
@@ -2306,20 +2353,46 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
                         const struct sockaddr_storage *server_addr, bool has_server_addr) {
   char cip[INET6_ADDRSTRLEN];
   const int cport = xfr_client_text(client_addr, cip, sizeof(cip));
-  /* send-extended-errors for the error answers below (the caller is in a read section, axfr_worker_thread(); with no configuration the default, yes) */
-  const server_config_t *ecfg = acquire_config_snapshot();
-  const bool send_ede = ecfg ? ecfg->send_extended_errors : true;
-  /* RFC 5936 §2.1, RFC 1995 §3: a request that is not shaped like a transfer request is answered with FORMERR and no transfer.  The TCP dispatch has
-   * checked it already; this keeps a direct caller from reading a question or a serial the request does not have. */
+  /* the answer the start section decides: the stream, an error answer (err_rcode, err_ede, err_text), or nothing (a zone without an apex SOA) */
+  enum { XS_STREAM, XS_ERROR, XS_SILENT } outcome = XS_STREAM;
+  uint8_t err_rcode = 0;
+  uint16_t err_ede = 0xFFFF;
+  const char *err_text = NULL;
+  const char *start_why = NULL;          /* the stream cannot be made (out of memory in the start section): aborted, logged */
+  xfr_copies_t cp;
+  memset(&cp, 0, sizeof(cp));
+  zone_version_t *ver = NULL;            /* pinned (xfr_refs) from the start section to the end of the stream */
+  const zone_image_t *current_zone = NULL;
+  zone_arena_t zattr;                    /* Extended AXFR: the zone level tables, decoded from the image (freed at the end) */
+  zone_arena_init(&zattr);
+  ixfr_txn_t *txn_list[MAX_IXFR_HISTORY];
+  int txn_count = 0;
+  bool send_ede = true, is_extended_axfr = false, v3 = false, soa_multi = false, send_ixfr = false, one_answer = false;
+  bool ixfr_asked = false, client_up_to_date = false;
   uint16_t qtype = 0;
   size_t q_offset = 0;
-  uint32_t client_serial = 0;
+  uint32_t client_serial = 0, current_serial = 0, frame_rr = ZONE_IMAGE_NONE;
+  edns_info_t resp_edns = {0};
+  zone_image_view_t xview = { {0, 0}, NULL, NULL, 0 };
+  bool use_view = false;
+  const char *mn = "AXFR";
+  struct timespec t0;
+
+  rcu_aux_read_lock();
+  {
+    /* send-extended-errors for the error answers below (with no configuration the default, yes) */
+    const server_config_t *ecfg = acquire_config_snapshot();
+    send_ede = ecfg ? ecfg->send_extended_errors : true;
+    release_config_snapshot((server_config_t *)ecfg);
+  }
+  /* RFC 5936 §2.1, RFC 1995 §3: a request that is not shaped like a transfer request is answered with FORMERR and no transfer.  The TCP dispatch has
+   * checked it already; this keeps a direct caller from reading a question or a serial the request does not have. */
   const xfr_shape_t shape = xfr_request_shape(req, req_len, &qtype, &q_offset, &client_serial);
   if (shape != XFR_SHAPE_OK) {
     xfr_log_denied(cip, cport, entry ? entry->domain : qname, 1, 252, XD_BAD_REQUEST, (uint32_t)shape);
-    axfr_send_error(client_fd, req, req_len, 1, false, send_ede, 0xFFFF, NULL, tsig_key, req_mac, req_mac_len,
-                    client_addr, client_len, server_addr, has_server_addr);
-    return;
+    outcome = XS_ERROR;
+    err_rcode = 1;
+    goto start_done;
   }
   /* RFC 5936 §2.1.2, RFC 1995 §3: QCLASS is the class of the zone, and every zone here is IN; a transfer of another class has no zone (the TCP dispatch has
    * answered it already: this is for a direct caller) */
@@ -2327,35 +2400,30 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
   if (!entry || req_class != 1) {
     xfr_log_denied(cip, cport, qname, req_class, qtype, XD_NOZONE, 0);
     /* 権威を持たないゾーンへの転送要求: REFUSED、AA=0 (R-06)、EDE 20 Not Authoritative (RFC 8914 §4.21)、UDP と TCP の受付と同じ */
-    axfr_send_error(client_fd, req, req_len, 5, false, send_ede, 20, "This server is not authoritative for the queried zone", tsig_key, req_mac, req_mac_len,
-                    client_addr, client_len, server_addr, has_server_addr);
-    return;
+    outcome = XS_ERROR;
+    err_rcode = 5;
+    err_ede = 20;
+    err_text = "This server is not authoritative for the queried zone";
+    goto start_done;
   }
-  /* arena は呼び出し側 (axfr_worker_thread) の読み取り区間 (rcu_aux_read_lock) と entry->active_axfr
-   * (writer は wait_for_active_axfr() で待つ) で守られる。X-03: arena の reader_count は待つ側が
-   * 無かったので削除した。 */
-  zone_version_t *current_arena = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
-  const zone_image_t *current_zone = current_arena->image;
+  ver = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+  current_zone = ver->image;
   if (!current_zone || current_zone->n_rrs == 0) {
     /* X-19: まだデータの無いゾーン (未転送のセカンダリなど)。何も送らないとクライアントは
      * タイムアウトまで待つので、SERVFAIL と EDE 14 Not Ready (RFC 8914 §4.15) で終える。 */
     xfr_log(LOG_LVL_WARNING, cip, cport, entry->domain, "request denied: the zone has no data yet (SERVFAIL, Not Ready)");
-    axfr_send_error(client_fd, req, req_len, 2, false, send_ede, 14, "Zone not loaded", tsig_key, req_mac, req_mac_len,
-                    client_addr, client_len, server_addr, has_server_addr);
-    return;
+    ver = NULL;
+    outcome = XS_ERROR;
+    err_rcode = 2;
+    err_ede = 14;
+    err_text = "Zone not loaded";
+    goto start_done;
   }
+  /* the pin: taken inside the read section, so that a writer that retires `ver` after this sees it once its grace period is over */
+  atomic_fetch_add_explicit(&ver->xfr_refs, 1, memory_order_acq_rel);
 
-  uint8_t *res = calloc(1, 65535);
-  if (!res) {
-    /* no buffer for the transfer: refused as the TCP dispatch refuses it for want of memory (REFUSED, EDE 0 without a text, the reason only in the log),
-     * not dropped */
-    xfr_log_denied(cip, cport, entry->domain, req_class, qtype, XD_NO_MEMORY, 0);
-    axfr_send_error(client_fd, req, req_len, 5, false, send_ede, 0, NULL, tsig_key, req_mac, req_mac_len, client_addr, client_len, server_addr,
-                    has_server_addr);
-    return;
-  }
   bool is_ixfr = (qtype == 251);
-  const bool ixfr_asked = is_ixfr;        /* (is_ixfr says "answer incrementally" below, and goes false for an AXFR-style answer) */
+  ixfr_asked = is_ixfr;                  /* (is_ixfr says "answer incrementally" below, and goes false for an AXFR-style answer) */
   /* (RFC 1995 §3: an IXFR request has the SOA of the client's version in its Authority section; client_serial is its serial, checked by
    * xfr_request_shape() above, which answers FORMERR for a request without one, as BIND does with "IXFR request missing SOA") */
   uint16_t req_qd = (req[4] << 8) | req[5];
@@ -2363,7 +2431,6 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
   uint16_t req_ns = (req[8] << 8) | req[9];
   uint16_t req_ar = (req[10] << 8) | req[11];
   edns_info_t req_edns = {0};
-  bool is_extended_axfr = false;
   uint8_t ext_ver = 0; /* B8t-2: the version of the stream: what the requester speaks, if it is 2 or 3 */
   if (parse_edns_opt(req, req_len, req_qd, req_an, req_ns, req_ar, &req_edns) == 0) {
     if (req_edns.has_karidns_ext && KARIDNS_EXT_VERSION_OK(req_edns.karidns_ext_version)) {
@@ -2374,8 +2441,7 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
       }
     }
   }
-  const bool v3 = is_extended_axfr && ext_ver >= 3;
-  edns_info_t resp_edns = {0};
+  v3 = is_extended_axfr && ext_ver >= 3;
   /* R-16, RFC 5936 §2.2.5: 要求に OPT があれば最初のメッセージに OPT を1つ付ける */
   if (req_edns.present) resp_edns.present = true;
   if (is_extended_axfr) {
@@ -2394,23 +2460,24 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
 
   uint32_t soa_rr = zone_image_apex_soa(current_zone); /* the reference SOA: serial, the frame of an Extended AXFR */
   if (soa_rr == ZONE_IMAGE_NONE) {
-    free(res);
-    return;
+    outcome = XS_SILENT;
+    goto start_done;
   }
 
   /* An Extended AXFR of version 2 cannot carry several or restricted SOA RRs (the frame SOA has no attributes, and the receiver
    * ends the transfer at a second SOA).  Sending such a secondary the reference SOA alone would change what it serves (a hidden
    * SOA would become visible to everybody), so it is refused, as it was by B8t-1; version 3 carries the SOA set (SOA_SET).  A
    * standard AXFR is unaffected. */
-  const bool soa_multi = zone_has_multiple_or_restricted_soa(current_zone);
+  soa_multi = zone_has_multiple_or_restricted_soa(current_zone);
   if (is_extended_axfr && !v3 && soa_multi) {
     kdns_logc(LOGC_XFER_OUT, LOG_WARNING, "[AXFR] zone '%s': Extended AXFR refused: the zone has several or restricted SOA records "
            "(location, time stamp, tag) and the requester speaks version 2 of the extended format, which cannot carry them "
            "(upgrade the secondary)", entry->domain);
-    free(res);
-    axfr_send_error(client_fd, req, req_len, 5, false, send_ede, 0, "Extended transfer (version 2) of a zone with several or restricted SOA records is not supported; use version 3",
-                    tsig_key, req_mac, req_mac_len, client_addr, client_len, server_addr, has_server_addr);
-    return;
+    outcome = XS_ERROR;
+    err_rcode = 5;
+    err_ede = 0;
+    err_text = "Extended transfer (version 2) of a zone with several or restricted SOA records is not supported; use version 3";
+    goto start_done;
   }
 
   /* B8t-1: a standard AXFR of a zone with per-client RRs (tinydns locations and time stamps, $LOCATION / $ECS-SUBNET tags) is the zone
@@ -2418,43 +2485,39 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
    * SOA it sees, and a requester that sees no SOA is refused (REFUSED, EDE 18 Prohibited; RFC 8914 §4.19, as BIND answers a
    * client the zone is not served to). An ECS tag is never matched (a transfer has no client subnet). A zone without such
    * RRs is sent as before. */
-  zone_image_view_t xview = { {0, 0}, NULL, NULL, 0 };
-  uint32_t frame_rr = soa_rr;
+  frame_rr = soa_rr;
   if (!is_extended_axfr && (current_zone->flags & ZONE_IMAGE_F_VIEW)) {
-    char cip[INET6_ADDRSTRLEN] = "";
+    char vip[INET6_ADDRSTRLEN] = "";
     if (client_addr && client_addr->ss_family == AF_INET)
-      inet_ntop(AF_INET, &((const struct sockaddr_in *)client_addr)->sin_addr, cip, sizeof(cip));
+      inet_ntop(AF_INET, &((const struct sockaddr_in *)client_addr)->sin_addr, vip, sizeof(vip));
     else if (client_addr && client_addr->ss_family == AF_INET6)
-      inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, cip, sizeof(cip));
+      inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, vip, sizeof(vip));
     server_config_t *vcfg = acquire_config_snapshot();
     const zone_config_t *vzcfg = vcfg ? zone_entry_config(vcfg, entry) : NULL;
-    zone_client_view(current_zone, vcfg, vzcfg, cip, false, NULL, 0, &xview, NULL);
+    zone_client_view(current_zone, vcfg, vzcfg, vip, false, NULL, 0, &xview, NULL);
     if (vcfg) release_config_snapshot(vcfg);
+    /* R11: the tag can point into the configuration (resolve_bind_location_tag()): the stream uses a copy */
+    if (xview.loc_tag && !(cp.loc_tag = strdup(xview.loc_tag))) start_why = "out of memory copying the requester's location tag";
+    xview.loc_tag = cp.loc_tag;
+    use_view = true;
     frame_rr = zone_image_visible_soa(current_zone, &xview, NULL);
     if (frame_rr == ZONE_IMAGE_NONE) {
-      xfr_log(LOG_LVL_INFO, cip, cport, entry->domain, "request denied: the zone is not served to this client (REFUSED)");
-      free(res);
-      axfr_send_error(client_fd, req, req_len, 5, false, send_ede, 18, "Transfer refused: the zone is not served to this client", tsig_key,
-                      req_mac, req_mac_len, client_addr, client_len, server_addr, has_server_addr);
-      return;
+      xfr_log(LOG_LVL_INFO, vip, cport, entry->domain, "request denied: the zone is not served to this client (REFUSED)");
+      outcome = XS_ERROR;
+      err_rcode = 5;
+      err_ede = 18;
+      err_text = "Transfer refused: the zone is not served to this client";
+      goto start_done;
     }
   }
 
-  bool send_ixfr = false;
-  ixfr_txn_t *txn_list[MAX_IXFR_HISTORY];
-  int txn_count = 0;
-  uint32_t current_serial = 0;
   {
     zone_image_soa_t soa_nums;
     if (zone_image_soa(current_zone, soa_rr, NULL, 0, NULL, 0, &soa_nums) == 0) current_serial = soa_nums.serial;
   }
-  /* Extended AXFR: the zone level tables, decoded from the image (freed at the end) */
-  zone_arena_t zattr;
-  zone_arena_init(&zattr);
 
   /* The `server` statement that covers the requester (batch 5; the view's, else the top-level ones) can say provide-ixfr (it replaces the
    * zone's, view's and options' value for this client: BIND xfrout.c) and transfer-format one-answer. */
-  bool one_answer = false;
   bool provide_ixfr = true;
   {
     server_config_t *pcfg = acquire_config_snapshot();
@@ -2470,8 +2533,8 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
   /* R-15, RFC 1995 §2: 同じか新しい版 (RFC 1982 の比較) を持つクライアントには現在の SOA 1件で答える。BIND 9.20 lib/ns/xfrout.c ns_xfr_start():
    * this test (DNS_SERIAL_GE, "is_poll") comes before the provide-ixfr check, so provide-ixfr no does not change the answer to a client that is
    * up to date. */
-  bool client_up_to_date = is_ixfr && (client_serial == current_serial ||
-                                       serial_is_newer(client_serial, current_serial));
+  client_up_to_date = is_ixfr && (client_serial == current_serial ||
+                                  serial_is_newer(client_serial, current_serial));
   /* provide-ixfr no (BIND 9.20 ARM: "only responds with a full zone transfer (AXFR)"; xfrout.c "IXFR delta response disabled due to
    * 'provide-ixfr no;' being set", mnemonic "AXFR-style IXFR"): a client that is behind gets the whole zone, as with ixfr-history 0 (RFC 1995 §4
    * allows an AXFR-style answer to an IXFR request) */
@@ -2560,8 +2623,7 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
 
   /* what is sent, and the words for the log: an IXFR that is answered with the whole zone is an "AXFR-style IXFR" (xfrout.c) */
   const bool incremental = ixfr_asked && send_ixfr && txn_count > 0;
-  const char *const mn = incremental ? "IXFR" : is_extended_axfr ? "Extended AXFR" : ixfr_asked ? "AXFR-style IXFR" : "AXFR";
-  struct timespec t0;
+  mn = incremental ? "IXFR" : is_extended_axfr ? "Extended AXFR" : ixfr_asked ? "AXFR-style IXFR" : "AXFR";
   clock_gettime(CLOCK_MONOTONIC, &t0);
   /* 0.7 M3, debug 1: what the answer will be, and from what (the history of differences kept for the zone, ixfr-history) */
   xfr_log(1, cip, cport, entry->domain, "%s asked (client serial %u, ours %u): answering with %s, %d difference(s) of the history; %s%s%s", ixfr_asked ? "IXFR" : "AXFR",
@@ -2574,21 +2636,68 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
   else
     xfr_log_started(cip, cport, entry->domain, mn, tsig_key, incremental, client_serial, current_serial);
 
+  /* the copies of the configuration that the extension records of the stream need (R11: the stream reads no configuration) */
+  if (!start_why && !send_ixfr && is_extended_axfr && zone_image_zattr_load(current_zone, &zattr) != 0) start_why = "the extended data of the zone could not be read";
+  if (!start_why && v3 && ((send_ixfr && txn_count > 0) || !send_ixfr)) {
+    server_config_t *scfg = acquire_config_snapshot();
+    if (xfr_copy_settings(&cp, scfg, entry, zattr.bind_ecs_trusted_resolver_count > 0) != 0 ||
+        (!send_ixfr && xfr_copy_config_tags(&cp, current_zone, entry, &zattr, scfg) != 0))
+      start_why = "out of memory copying the settings of the zone for the transfer";
+    if (scfg) release_config_snapshot(scfg);
+  }
+  if (!start_why && !send_ixfr && is_extended_axfr && !v3 && zattr.bind_ecs_trusted_resolver_count == 0) {
+    server_config_t *tcfg = acquire_config_snapshot();
+    const zone_config_t *tzcfg = tcfg ? zone_entry_config(tcfg, entry) : NULL;
+    char *const *list = (tzcfg && zext(tzcfg)->ecs_trusted_resolvers) ? zext(tzcfg)->ecs_trusted_resolvers : (tcfg ? tcfg->ecs_trusted_resolvers : NULL);
+    const int count = (tzcfg && zext(tzcfg)->ecs_trusted_resolvers) ? zext(tzcfg)->ecs_trusted_resolvers_count : (tcfg ? tcfg->ecs_trusted_resolvers_count : 0);
+    if (xfr_copy_trusted(&cp, list, count) != 0) start_why = "out of memory copying the trusted resolvers for the transfer";
+    if (tcfg) release_config_snapshot(tcfg);
+  }
+start_done:
+  rcu_aux_read_unlock();
+
+  if (outcome != XS_STREAM) {
+    if (outcome == XS_ERROR)
+      axfr_send_error(client_fd, req, req_len, err_rcode, false, send_ede, err_ede, err_text, tsig_key, req_mac, req_mac_len,
+                      client_addr, client_len, server_addr, has_server_addr);
+    for (int t = 0; t < txn_count; t++)
+      if (atomic_fetch_sub_explicit(&txn_list[t]->ref_count, 1, memory_order_acq_rel) == 1) free_ixfr_txn(txn_list[t]);
+    xfr_copies_free(&cp);
+    zone_arena_destroy(&zattr);
+    if (ver) atomic_fetch_sub_explicit(&ver->xfr_refs, 1, memory_order_acq_rel);
+    return;
+  }
+
+  uint8_t *res = calloc(1, 65535);
+  if (!res) {
+    /* no buffer for the transfer: refused as the TCP dispatch refuses it for want of memory (REFUSED, EDE 0 without a text, the reason only in the log),
+     * not dropped */
+    xfr_log_denied(cip, cport, entry->domain, 1, qtype, XD_NO_MEMORY, 0);
+    axfr_send_error(client_fd, req, req_len, 5, false, send_ede, 0, NULL, tsig_key, req_mac, req_mac_len, client_addr, client_len, server_addr,
+                    has_server_addr);
+    for (int t = 0; t < txn_count; t++)
+      if (atomic_fetch_sub_explicit(&txn_list[t]->ref_count, 1, memory_order_acq_rel) == 1) free_ixfr_txn(txn_list[t]);
+    xfr_copies_free(&cp);
+    zone_arena_destroy(&zattr);
+    atomic_fetch_sub_explicit(&ver->xfr_refs, 1, memory_order_acq_rel);
+    return;
+  }
+
   axfr_emit_ctx_t ec;
   axfr_ec_start(&ec, res, req, q_offset, client_fd, is_extended_axfr, tsig_key, req_mac, req_mac_len, &resp_edns, client_addr, client_len,
                 server_addr, has_server_addr, entry->domain);
-  ec.view = (!is_extended_axfr && (current_zone->flags & ZONE_IMAGE_F_VIEW)) ? &xview : NULL;
+  ec.view = use_view ? &xview : NULL;
   xext_init(&ec.xe, entry->domain, axfr_xext_emit, &ec);
   ec.wrap_apex_soa = v3 && soa_multi && !send_ixfr;
   ec.one_answer = one_answer;
 
-  if (!send_ixfr && is_extended_axfr && zone_image_zattr_load(current_zone, &zattr) != 0) {
-    ec.why = "the extended data of the zone could not be read";
+  if (start_why) {
+    ec.why = start_why;
     goto axfr_error;
   }
   if (send_ixfr) {
     if (axfr_emit_item(&ec, NULL, current_zone, frame_rr) < 0) goto axfr_error;
-    if (v3 && txn_count > 0 && axfr_emit_settings(&ec, entry, zattr.bind_ecs_trusted_resolver_count > 0) < 0) goto axfr_error;
+    if (v3 && txn_count > 0 && axfr_emit_settings(&ec, &cp) < 0) goto axfr_error;
     for (int t = 0; t < txn_count; t++) {
       ixfr_txn_t *txn = txn_list[t];
       int soa_del_idx = -1;
@@ -2630,26 +2739,16 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
         for (; k != ZONE_IMAGE_NONE && nsoa < 0xFFFF; k = zone_image_rrset_next(current_zone, current_zone->apex_name, 6, k + 1)) nsoa++;
         if (xext_emit_soa_set(&ec.xe, nsoa) < 0) goto axfr_error;
       }
-      if (v3 && axfr_emit_settings(&ec, entry, zattr.bind_ecs_trusted_resolver_count > 0) < 0) goto axfr_error;
+      if (v3 && axfr_emit_settings(&ec, &cp) < 0) goto axfr_error;
       for (int i = 0; i < zattr.bind_location_tag_count; i++)
         if (xext_emit_tagdef(&ec.xe, false, &zattr.bind_location_tags[i]) < 0) goto axfr_error;
       for (int i = 0; i < zattr.bind_ecs_tag_count; i++)
         if (xext_emit_tagdef(&ec.xe, true, &zattr.bind_ecs_tags[i]) < 0) goto axfr_error;
-      if (v3 && axfr_emit_config_tags(&ec, current_zone, entry, &zattr) < 0) goto axfr_error;
-      server_config_t *axfr_cfg = acquire_config_snapshot();
-      const zone_config_t *axfr_zcfg = axfr_cfg ? zone_entry_config(axfr_cfg, entry) : NULL;
-      char **trusted_res = (zattr.bind_ecs_trusted_resolver_count > 0 && zattr.bind_ecs_trusted_resolvers)
-                            ? zattr.bind_ecs_trusted_resolvers : NULL;
-      int trusted_count = trusted_res ? zattr.bind_ecs_trusted_resolver_count : 0;
-      if (!trusted_res && !v3) {
-        trusted_res = (axfr_zcfg && zext(axfr_zcfg)->ecs_trusted_resolvers) ? zext(axfr_zcfg)->ecs_trusted_resolvers
-                                                                       : (axfr_cfg ? axfr_cfg->ecs_trusted_resolvers : NULL);
-        trusted_count = (axfr_zcfg && zext(axfr_zcfg)->ecs_trusted_resolvers) ? zext(axfr_zcfg)->ecs_trusted_resolvers_count
-                                                                   : (axfr_cfg ? axfr_cfg->ecs_trusted_resolvers_count : 0);
-      }
-      int trusted_rc = (trusted_count > 0 && trusted_res) ? xext_emit_trusted(&ec.xe, trusted_res, trusted_count) : 0;
-      if (axfr_cfg) release_config_snapshot(axfr_cfg);
-      if (trusted_rc < 0) goto axfr_error;
+      if (v3 && axfr_emit_config_tags(&ec, &cp) < 0) goto axfr_error;
+      /* the zone data's own trusted resolvers, else (version 2 only: version 3 sends them in the settings) the configuration's (copied above) */
+      char *const *trusted_res = (zattr.bind_ecs_trusted_resolver_count > 0 && zattr.bind_ecs_trusted_resolvers) ? zattr.bind_ecs_trusted_resolvers : cp.trusted;
+      int trusted_count = trusted_res == cp.trusted ? cp.ntrusted : zattr.bind_ecs_trusted_resolver_count;
+      if (trusted_count > 0 && trusted_res && xext_emit_trusted(&ec.xe, trusted_res, trusted_count) < 0) goto axfr_error;
       for (int i = 0; i < zattr.location_count; i++) {
         const tinydns_location_entry_t *loc = &zattr.locations[i];
         if (xext_emit_locdef(&ec.xe, loc->code, loc->prefix_bits, loc->prefix) < 0) goto axfr_error;
@@ -2673,18 +2772,11 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
 
   if (!(ixfr_asked && client_up_to_date))        /* (an up-to-date poll is the one line above) */
     xfr_log_ended(cip, cport, entry->domain, mn, &ec, &t0, current_serial);
-  for (int t = 0; t < txn_count; t++) {
-    if (atomic_fetch_sub_explicit(&txn_list[t]->ref_count, 1, memory_order_acq_rel) == 1) {
-       free_ixfr_txn(txn_list[t]);
-    }
-  }
-  if (res) free(res);
-  xext_free(&ec.xe);
-  zone_arena_destroy(&zattr);
-  return;
+  goto axfr_done;
 
 axfr_error:
   xfr_log_aborted(cip, cport, entry->domain, mn, &ec);
+axfr_done:
   xext_free(&ec.xe);
   zone_arena_destroy(&zattr);
   for (int t = 0; t < txn_count; t++) {
@@ -2692,7 +2784,10 @@ axfr_error:
        free_ixfr_txn(txn_list[t]);
     }
   }
-  if (res) free(res);
+  xfr_copies_free(&cp);
+  free(res);
+  /* the end of the stream: the version may be freed from now on (nothing below reads it) */
+  atomic_fetch_sub_explicit(&ver->xfr_refs, 1, memory_order_acq_rel);
 }
 
 /* D1a step 7 (design 7, 12-6): an IXFR for a zone that is in the directory and not in memory, from a client that has the serial the directory has (or a
@@ -2700,11 +2795,18 @@ axfr_error:
  * apex of the summary (the SOA, with the serial it describes), which the zone in memory would give with the same bytes: the same opening SOA, the OPT of
  * the first message (RFC 5936 §2.2.5, as send_axfr_response()), the RFC 7314 EXPIRE value, the KariDNS extension echo, and the TSIG of the request
  * (RFC 8945 §5.3).  A request without the client's SOA is a FORMERR (RFC 1995 §3), as for a zone in memory.  false: the answer needs the zone (not an IXFR,
- * no apex for the version the directory has, the client is behind): the caller waits for the zone. */
-static bool axfr_send_up_to_date_from_apex(const axfr_worker_args_t *a, tsig_key_t *tsig_key) {
+ * no apex for the version the directory has, the client is behind): the caller waits for the zone.
+ * The element and its apex are valid while a->snap is retained: an apex that is replaced goes to the garbage of a snapshot that is retired at or after
+ * a->snap, and the reclaim thread frees garbage only once that snapshot and every older one are drained (gc_reclaim_thread()).  R11: the answer (and
+ * the zone's name) is made while the snapshot is retained, and the snapshot is released before it is sent, so a client that does not read holds no
+ * snapshot.  The rule: true once the snapshot is released (answered, or the send failed); false only with the snapshot still retained. */
+static void xfr_arm_out_limits(const axfr_worker_args_t *a);
+static bool axfr_send_up_to_date_from_apex(axfr_worker_args_t *a, tsig_key_t *tsig_key) {
   if (a->qtype != 251 || !a->elem) return false;
   const zdir_apex_t *ap = atomic_load_explicit(&a->elem->apex, memory_order_acquire);
   if (!ap || ap->serial != zdir_serial(a->elem)) return false;
+  char zname[DNS_NAME_TEXT_SIZE];
+  snprintf(zname, sizeof(zname), "%s", a->elem->name);
   size_t q_offset = 0;
   uint32_t client_serial = 0;
   char cip[INET6_ADDRSTRLEN];
@@ -2712,19 +2814,24 @@ static bool axfr_send_up_to_date_from_apex(const axfr_worker_args_t *a, tsig_key
   /* RFC 5936 §2.1, RFC 1995 §3: a request that is not shaped like an IXFR request (no client SOA among them) is a FORMERR, as for a zone in memory */
   const xfr_shape_t shape = xfr_request_shape(a->req, a->req_len, NULL, &q_offset, &client_serial);
   if (shape != XFR_SHAPE_OK) {
-    xfr_log_denied(cip, cport, a->elem->name, 1, 251, XD_BAD_REQUEST, (uint32_t)shape);
+    release_zone_snapshot(a->snap);
+    a->snap = NULL;
+    xfr_log_denied(cip, cport, zname, 1, 251, XD_BAD_REQUEST, (uint32_t)shape);
+    xfr_arm_out_limits(a);
     axfr_send_error(a->client_fd, a->req, a->req_len, 1, false, a->send_ede, 0xFFFF, NULL, tsig_key, a->tsig_mac, a->tsig_mac_len, &a->client_addr, a->client_len,
                     &a->server_addr, a->has_server_addr);
     return true;
   }
   if (!(client_serial == ap->serial || serial_is_newer(client_serial, ap->serial))) return false;
+  uint8_t *res = malloc(65535);
+  if (!res) return false;
   edns_info_t req_edns = {0};
   edns_info_t resp_edns = {0};
   bool ext = false;
   if (parse_edns_opt(a->req, a->req_len, (uint16_t)((a->req[4] << 8) | a->req[5]), (uint16_t)((a->req[6] << 8) | a->req[7]),
                      (uint16_t)((a->req[8] << 8) | a->req[9]), (uint16_t)((a->req[10] << 8) | a->req[11]), &req_edns) == 0) {
     resp_edns.present = req_edns.present;
-    if (req_edns.has_karidns_ext && KARIDNS_EXT_VERSION_OK(req_edns.karidns_ext_version) && req_edns.karidns_ext_hash == calc_fnv1a_str(a->elem->name)) {
+    if (req_edns.has_karidns_ext && KARIDNS_EXT_VERSION_OK(req_edns.karidns_ext_version) && req_edns.karidns_ext_hash == calc_fnv1a_str(zname)) {
       ext = true;
       resp_edns.present = true;
       resp_edns.has_karidns_ext = true;
@@ -2737,24 +2844,42 @@ static bool axfr_send_up_to_date_from_apex(const axfr_worker_args_t *a, tsig_key
       resp_edns.send_expire_value = ap->expire;      /* a primary zone: the SOA's EXPIRE (RFC 7314 §3) */
     }
   }
-  uint8_t *res = malloc(65535);
-  if (!res) return false;
   axfr_emit_ctx_t ec;
   axfr_ec_start(&ec, res, a->req, q_offset, a->client_fd, ext, tsig_key, a->tsig_mac, a->tsig_mac_len, &resp_edns, &a->client_addr, a->client_len,
-                a->has_server_addr ? &a->server_addr : NULL, a->has_server_addr, a->elem->name);
+                a->has_server_addr ? &a->server_addr : NULL, a->has_server_addr, zname);
   uint16_t off = ec.offset;
-  bool done = apex_write_soa_rr(res, &off, KARIDNS_AXFR_MSG_LIMIT, a->elem->name, ap, &ec.comp_ctx) == 0;
-  if (done) {
-    ec.offset = off;
-    ec.answers = 1;
-    if (axfr_ec_finish(&ec) == 0)    /* (a failed send: the client is gone, the connection is closed below) */
-      xfr_log_udp_ixfr(cip, cport, a->elem->name, client_serial, ap->serial, true, true);
-    else
-      xfr_log_aborted(cip, cport, a->elem->name, "IXFR", &ec);
-    dbreg_xfr_note(DBREG_XFR_SUMMARY);
+  /* the SOA RR is written from the apex while the snapshot is retained; if it cannot be (false: the caller waits for the zone, with the snapshot still
+   * retained, as db_ingest_xfr_await() requires) nothing is sent */
+  if (apex_write_soa_rr(res, &off, KARIDNS_AXFR_MSG_LIMIT, zname, ap, &ec.comp_ctx) != 0) {
+    free(res);
+    return false;
   }
+  const uint32_t serial = ap->serial;
+  release_zone_snapshot(a->snap);          /* R11: nothing below reads the element or the apex; the send may wait for the client */
+  a->snap = NULL;
+  ec.offset = off;
+  ec.answers = 1;
+  xfr_arm_out_limits(a);
+  if (axfr_ec_finish(&ec) == 0)    /* (a failed send: the client is gone, the connection is closed below) */
+    xfr_log_udp_ixfr(cip, cport, zname, client_serial, serial, true, true);
+  else
+    xfr_log_aborted(cip, cport, zname, "IXFR", &ec);
+  dbreg_xfr_note(DBREG_XFR_SUMMARY);
   free(res);
-  return done;
+  return true;
+}
+
+/* max-transfer-time-out / max-transfer-idle-out (BIND 9.20; 0 = no limit): send_tcp_dns_message() gives the transfer up after the deadline, and after a
+ * send that waited the idle time for the client (the socket is blocking, so SO_SNDTIMEO makes the wait end).  Armed when the first message of the answer
+ * is about to go out: the wait for a database zone before it is bounded by transfer-fetch-timeout only (a zone that comes late is still transferred, an
+ * answer that it did not come is still sent: RFC 5936 4.1.2). */
+static void xfr_arm_out_limits(const axfr_worker_args_t *a) {
+  g_tcp_send_idle_secs = a->idle_out_secs;
+  g_tcp_send_deadline_secs = a->time_out_secs ? time(NULL) + (time_t)a->time_out_secs : 0;
+  if (a->idle_out_secs) {
+    struct timeval stv = { .tv_sec = (time_t)a->idle_out_secs, .tv_usec = 0 };
+    setsockopt(a->client_fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&stv, sizeof stv);
+  }
 }
 
 void *axfr_worker_thread(void *arg) {
@@ -2774,7 +2899,7 @@ void *axfr_worker_thread(void *arg) {
     pkey = &key_val;
   }
   /* D1a step 7: the zone is not in memory.  An IXFR from a client that is up to date is answered from the summary; for anything else the thread waits
-   * (not a worker, not holding the read section below) until the zone is read, and counts itself in the entry's active_axfr (db_ingest_xfr_await()).
+   * (not a worker, holding no read section) until the zone is read; it then holds the entry as the dispatch does (db_ingest_xfr_await(), xfr_entry_hold()).
    * No zone in time: the one error message of RFC 5936 2.2 (SERVFAIL, EDE 14 Not Ready, RFC 8914 4.15; the connection is not just dropped, 4.1.2). */
   bool answered = false;
   uint8_t log_rcode = 0;
@@ -2784,46 +2909,41 @@ void *axfr_worker_thread(void *arg) {
     } else if (args->await && (entry = args->await(args->elem, args->view_name)) == NULL) {
       xfr_log(LOG_LVL_WARNING, args->client_ip, args->client_port, args->elem->name,
               "%s request failed: the zone data could not be read in time (SERVFAIL, Not Ready)", args->qtype == 251 ? "IXFR" : "AXFR");
+      release_zone_snapshot(args->snap);
+      args->snap = NULL;
+      xfr_arm_out_limits(args);
       axfr_send_error(args->client_fd, args->req, args->req_len, 2, false, args->send_ede, 14, "Not Ready", pkey, args->tsig_mac, args->tsig_mac_len, &args->client_addr,
                       args->client_len, &args->server_addr, args->has_server_addr);
       answered = true;
       log_rcode = 2;
     }
   }
-  /* 転送の間、arena を読み取り区間で守る。スロットはスレッドごとに確保する
-   * (以前は通し番号の剰余で割り当てており、同時に動くスレッドが同じスロットを
-   * 共有すると、先に終わった側が区間を閉じてしまった)。*/
-  rcu_aux_read_lock();
-
-  /* max-transfer-time-out / max-transfer-idle-out (BIND 9.20; 0 = no limit): send_tcp_dns_message() gives the transfer up after the deadline,
-   * and after a send that waited the idle time for the client (the socket is blocking, so SO_SNDTIMEO makes the wait end) */
-  g_tcp_send_idle_secs = args->idle_out_secs;
-  g_tcp_send_deadline_secs = args->time_out_secs ? time(NULL) + (time_t)args->time_out_secs : 0;
-  if (args->idle_out_secs) {
-    struct timeval stv = { .tv_sec = (time_t)args->idle_out_secs, .tv_usec = 0 };
-    setsockopt(args->client_fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&stv, sizeof stv);
-  }
-  if (!answered)
+  /* R11: the entry is held (xfr_entry_hold()), and send_axfr_response() pins the version it sends in its own short read section: the snapshot the
+   * dispatch retained is not needed any more, and is not kept for the length of the stream (a stalled client would hold back the reclamation of
+   * every snapshot retired after it) */
+  release_zone_snapshot(args->snap);
+  args->snap = NULL;
+  if (!answered) {
+    xfr_arm_out_limits(args);
     send_axfr_response(args->client_fd, args->qname, args->req, args->req_len,
                        pkey, entry, args->tsig_mac, args->tsig_mac_len,
                        &args->client_addr, args->client_len,
                        args->has_server_addr ? &args->server_addr : NULL, args->has_server_addr);
+  }
   g_tcp_send_idle_secs = 0;
   g_tcp_send_deadline_secs = 0;
 
+  rcu_aux_read_lock();                    /* submit_response_log() reads the configuration */
   submit_response_log(LOG_ACT_SENT, args->client_ip, args->client_port, args->qname,
                       args->qclass, args->qtype, log_rcode, args->has_edns, args->dnssec_ok);
+  rcu_aux_read_unlock();
 
   close(args->client_fd);
   dec_tcp_clients();
-  zone_db_snapshot_t *worker_snap = args->snap;
   OPENSSL_cleanse(args->tsig_secret_decoded, sizeof(args->tsig_secret_decoded));
   if (args->has_tsig) OPENSSL_cleanse(&key_val, sizeof(key_val));
   free(args);
-  if (entry)
-    atomic_fetch_sub(&entry->active_axfr, 1);
-  rcu_aux_read_unlock();
-  release_zone_snapshot(worker_snap);
+  if (entry) xfr_entry_release(entry);    /* (the last reference frees the entry: a zone removed from the configuration during the stream) */
   /* the slot taken when the thread was started (transfers-out); a caller that did not take one (a unit test) must not drive the count negative */
   xfr_slot_give_back(&g_xfr_out_active);
   atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);

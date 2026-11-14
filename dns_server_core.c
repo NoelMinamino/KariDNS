@@ -172,6 +172,30 @@ static void xfr_test_delay(void) {
 /* TEST ONLY (as xfr-delay): `karictl xfr-fail thread|memory|off` makes the TCP zone transfer dispatch behave as if pthread_create() (XD_NO_THREAD) or the
  * allocation of the transfer's arguments (XD_NO_MEMORY) had failed, so that the refusal of those branches can be tested (run_xfr_dispatch_fault_test.sh). */
 static _Atomic int g_test_xfr_fail;
+/* TEST ONLY (as xfr-delay): `karictl rcu-hold <ms>` starts a thread that holds an auxiliary read section for that long (at most 120 s), so that a test can
+ * hold back the grace periods of the writers with a reader that is not a transfer (R11: a transfer holds none while it waits for its client;
+ * run_rcu_reclaim_status_test.sh).  The command answers once the thread is inside its section. */
+static _Atomic int g_test_rcu_hold_in;
+static void *test_rcu_hold_thread(void *arg) {
+  const uint32_t ms = (uint32_t)(uintptr_t)arg;
+  rcu_aux_read_lock();
+  atomic_store_explicit(&g_test_rcu_hold_in, 1, memory_order_release);
+  struct timespec ts = { (time_t)(ms / 1000), (long)(ms % 1000) * 1000000L };
+  nanosleep(&ts, NULL);
+  rcu_aux_read_unlock();
+  return NULL;
+}
+static bool test_rcu_hold(uint32_t ms) {
+  pthread_t t;
+  atomic_store_explicit(&g_test_rcu_hold_in, 0, memory_order_relaxed);
+  if (pthread_create(&t, NULL, test_rcu_hold_thread, (void *)(uintptr_t)ms) != 0) return false;
+  pthread_detach(t);
+  for (int i = 0; i < 5000 && !atomic_load_explicit(&g_test_rcu_hold_in, memory_order_acquire); i++) {
+    struct timespec w = { 0, 1000000L };
+    nanosleep(&w, NULL);
+  }
+  return atomic_load_explicit(&g_test_rcu_hold_in, memory_order_acquire) != 0;
+}
 #endif
 
 #define response_log_enabled(cfg) ((cfg) && (cfg)->logging.responses_enabled)
@@ -1328,19 +1352,19 @@ void *response_logger_thread_func(void *arg) {
     return NULL;
 }
 
-/* batch 14: the sink of the event messages (dns_log.h logev_post()) of a worker thread.  The record goes into the worker's own query log ring (this
- * thread is its one producer, as for a query); the query logger thread formats it and routes it to the channels.  Fixed size, nothing allocated; the
- * texts are cut.  The events have their own limit on the ring (90%: they come after the 80% at which the query log stops itself; a debug record 50%), and
- * what does not fit is counted in ev_dropped.  Called only when a channel passes the message (logev_wanted()) and the rate limit has admitted it. */
+/* batch 14: the sink of the event messages (dns_log.h logev_post()) of a worker thread.  0.7 (K-11): the record goes into the worker's own EVENT ring
+ * (ev_ring; this thread is its one producer, as for the query log ring), not into the query log ring, so that events and debug lines can never take
+ * room from the query log or bring it to the 80% at which it stops itself.  The query logger thread formats it and routes it to the channels.  Fixed
+ * size, nothing allocated; the texts are cut.  Inside the event ring a debug record may fill it only to half, so that a debug flood always leaves the
+ * other half to info and above; what does not fit is counted in ev_dropped.  Called only when a channel passes the message (logev_wanted()) and the
+ * rate limit has admitted it. */
 STATIC_TEST void qlog_event_sink(void *vctx, int cat, int level, const char *client_ip, int client_port, const char *msg) {
     worker_ctx_t *ctx = vctx;
-    qlog_ring_t *ring = &ctx->qlog_ring;
+    qlog_ring_t *ring = &ctx->ev_ring;
     if (!ring->events) return;
     uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
     uint32_t t = atomic_load_explicit(&ring->tail, memory_order_acquire);
-    /* 0.7 M3 (D-5): a debug record (level > 0) may fill the ring only to half, so that a debug flood can never bring it to the 80% at which the
-     * query log stops itself (write_query_log()); the other events keep their 90% */
-    if (h - t >= (level > 0 ? ring->size / 2 : ring->size / 10 * 9)) {
+    if (h - t >= (level > 0 ? ring->size / 2 : ring->size)) {
         atomic_fetch_add_explicit(&ring->ev_dropped, 1, memory_order_relaxed);
         return;
     }
@@ -1476,8 +1500,12 @@ void *query_logger_thread_func(void *arg) {
         bool any_work = false;
 
         if (rt && num_workers > 0 && workers) {
-            for (int w = 0; w < num_workers; w++) {
-                qlog_ring_t *ring = &workers[w].qlog_ring;
+            /* 0.7 (K-11): two rings per worker, each with one producer (the worker) and this one consumer.  Each pass takes, worker by worker, the
+             * event ring and then the query log ring, each up to what its producer had written when the pass reached it: neither waits for the other
+             * for more than one pass, and an event of warning or above waits at most behind the debug records already in its ring (half of it at most,
+             * qlog_event_sink()), never behind query log records. */
+            for (int w = 0; w < num_workers * 2; w++) {
+                qlog_ring_t *ring = (w & 1) ? &workers[w / 2].qlog_ring : &workers[w / 2].ev_ring;
                 if (!ring->events) continue;
 
                 uint32_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);
@@ -1576,17 +1604,17 @@ void *query_logger_thread_func(void *arg) {
                     syslog(LOG_WARNING, "[QueryLog] Dropped %" PRIu64 " queries due to ring buffer overflow (high load)", diff);
                 }
                 uint64_t ev_total = 0;
-                for (int w = 0; w < num_workers; w++) ev_total += atomic_load_explicit(&workers[w].qlog_ring.ev_dropped, memory_order_relaxed);
+                for (int w = 0; w < num_workers; w++) ev_total += atomic_load_explicit(&workers[w].ev_ring.ev_dropped, memory_order_relaxed);
                 if (ev_total > last_reported_ev_dropped) {
                     uint64_t diff = ev_total - last_reported_ev_dropped;
                     last_reported_ev_dropped = ev_total;
-                    syslog(LOG_WARNING, "[QueryLog] Dropped %" PRIu64 " event log messages (events and debug lines of any category) due to ring buffer overflow (high load)", diff);
+                    syslog(LOG_WARNING, "[QueryLog] Dropped %" PRIu64 " event log messages (events and debug lines of any category) because a worker's event ring was full (high load)", diff);
                 }
             }
         } else if (num_workers > 0 && workers) {
-            // クエリロギング未設定時はエントリを破棄してCPU消費を防ぐ
-            for (int w = 0; w < num_workers; w++) {
-                qlog_ring_t *ring = &workers[w].qlog_ring;
+            // クエリロギング未設定時はエントリを破棄してCPU消費を防ぐ (no logging runtime: both rings, the query log's and the events')
+            for (int w = 0; w < num_workers * 2; w++) {
+                qlog_ring_t *ring = (w & 1) ? &workers[w / 2].qlog_ring : &workers[w / 2].ev_ring;
                 if (!ring->events) continue;
                 uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
                 atomic_store_explicit(&ring->tail, h, memory_order_relaxed);
@@ -3110,9 +3138,9 @@ process_tcp_client: ;
             /* The element of the zone is looked up once and its entry loaded once (one acquire): the memory cache (D1a) takes the data of a DB zone out of
              * memory and brings it back at any moment, so the settings, the "not in memory" path and the zone that is transferred are all decided from this
              * one reading.  (They were three readings: a zone evicted between them was answered "non-authoritative zone" (REFUSED), one that came into
-             * memory between them was refused as an ACL denial.)  The entry stays valid while it is used: the read section (rcu_reader_enter() above) and
-             * the snapshot this thread holds, which the transfer thread retains; an entry that was taken out of memory meanwhile is retired with that
-             * snapshot, and its version with it.  The exact name: a transfer is of the zone whose apex is the QNAME (RFC 5936 §2.1.1, RFC 1995 §3),
+             * memory between them was refused as an ACL denial.)  The entry stays valid while it is used: the read section (rcu_reader_enter() above),
+             * then the transfer thread's hold (xfr_entry_hold(), R11); the element stays valid with the snapshot this thread holds, which the transfer
+             * thread retains until it has the entry.  The exact name: a transfer is of the zone whose apex is the QNAME (RFC 5936 §2.1.1, RFC 1995 §3),
              * never of a zone that encloses it. */
             zdir_elem_t *xel = zdir_find_exact(xfr_view, qname);
             xfr_entry = zdir_entry(xel);
@@ -3204,13 +3232,14 @@ process_tcp_client: ;
               xfr_eff_t out_eff;
               /* the settings of the view that owns the zone, not of the view the client came through (a zone shared with in-view is one object) */
               xfr_opts_effective(cfg, zcfg, entry ? entry->view_name : zdir_holder_view(xfr_view, xfr_el), &out_eff);
+              const bool out_send_ede = cfg ? cfg->send_extended_errors : false;   /* (read before the release, like the other values) */
               release_config_snapshot(cfg);
               if (!xfr_counter_acquire(&g_xfr_out_active, out_limit)) {
                 allowed = false; /* "Zone transfer requests in excess of the limit are refused" (ARM transfers-out) */
                 xfr_deny = XD_QUOTA;
                 xfr_deny_limit = out_limit;
               } else {
-                if (entry) atomic_fetch_add(&entry->active_axfr, 1);
+                if (entry) xfr_entry_hold(entry);   /* R11: a reference and active_axfr (two atomics; the read section keeps the entry alive here) */
                 axfr_worker_args_t *args = malloc(sizeof(axfr_worker_args_t));
 #ifdef KARIDNS_TEST_EVICT
                 if (args && atomic_load_explicit(&g_test_xfr_fail, memory_order_relaxed) == XD_NO_MEMORY) {   /* TEST ONLY: as if malloc() had failed */
@@ -3233,7 +3262,7 @@ process_tcp_client: ;
                   args->qtype = qtype;
                   args->has_edns = has_edns;
                   args->dnssec_ok = dnssec_ok;
-                  args->send_ede = cfg ? cfg->send_extended_errors : false;
+                  args->send_ede = out_send_ede;
                   args->req_len = msg_len > sizeof(args->req) ? sizeof(args->req) : msg_len;
                   memcpy(args->req, msg, args->req_len);
                   if (matched_key) {
@@ -3279,7 +3308,7 @@ process_tcp_client: ;
                   if (t_err != 0) {
                     release_zone_snapshot(args->snap);
                     free(args);
-                    if (entry) atomic_fetch_sub(&entry->active_axfr, 1);
+                    if (entry) xfr_entry_release(entry);
                     xfr_counter_release(&g_xfr_out_active);
                     allowed = false;
                     xfr_deny = XD_NO_THREAD;
@@ -3292,7 +3321,7 @@ process_tcp_client: ;
                     break;
                   }
                 } else {
-                  if (entry) atomic_fetch_sub(&entry->active_axfr, 1);
+                  if (entry) xfr_entry_release(entry);
                   xfr_counter_release(&g_xfr_out_active);
                   allowed = false;
                   xfr_deny = XD_NO_MEMORY;
@@ -3746,7 +3775,50 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
   }
 }
 
+/* The readers of the configuration before (perform_config_reload_wait()).  An explicit reload (control channel, SIGHUP) waits for them as long as a
+ * reader may stay in its section in normal operation: a worker that waits for a program zone's plugin (program-timeout) or for a forward zone's
+ * forwarders (forward-timeout, one budget for all of them), plus a margin; at least RELOAD_WAIT_MIN_MS, at most RELOAD_WAIT_MAX_MS (a reader that
+ * stays longer than that is not a normal one: the reload is postponed).  The control tick's retry of a postponed reload only tries
+ * (RELOAD_RETRY_TRY_MS): it runs every second until the readers have left. */
+#define RELOAD_WAIT_MIN_MS 1000
+#define RELOAD_WAIT_MAX_MS 5000
+#define RELOAD_WAIT_MARGIN_MS 500
+#define RELOAD_RETRY_TRY_MS 100
+STATIC_TEST int reload_readers_wait_ms(const server_config_t *cfg) {
+  uint32_t longest = 0;
+  for (const view_config_t *v = cfg ? cfg->views : NULL; v; v = v->next)
+    for (const zone_config_t *z = v->zones; z; z = z->next) {
+      if (!z->type) continue;
+      uint32_t t = 0;
+      if (strcasecmp(z->type, "program") == 0) t = zext(z)->program_timeout_ms > 0 ? zext(z)->program_timeout_ms : 2000;        /* (dns_plugin_sup.c) */
+      else if (strcasecmp(z->type, "forward") == 0) t = zext(z)->forward_timeout_ms > 0 ? zext(z)->forward_timeout_ms : 2000;  /* (dispatch_forward_zone()) */
+      if (t > longest) longest = t;
+    }
+  uint64_t ms = (uint64_t)longest + RELOAD_WAIT_MARGIN_MS;
+  if (ms < RELOAD_WAIT_MIN_MS) ms = RELOAD_WAIT_MIN_MS;
+  if (ms > RELOAD_WAIT_MAX_MS) ms = RELOAD_WAIT_MAX_MS;
+  return (int)ms;
+}
+
+/* The readers an explicit reload waits for began under the configuration before the active one (the standby buffer, intact while it is not reaped):
+ * the wait is sized from the larger of the two (a reload that removed a slow program zone still waits for its queries) */
+STATIC_TEST int reload_previous_readers_wait_ms(void) {
+  const server_config_t *active = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+  int ms = reload_readers_wait_ms(active);
+  if (g_config_db.standby_pending) {
+    const server_config_t *standby = (active == &g_config_db.config_a) ? &g_config_db.config_b : &g_config_db.config_a;
+    const int s = reload_readers_wait_ms(standby);
+    if (s > ms) ms = s;
+  }
+  return ms;
+}
+
+static config_reload_result_t perform_config_reload_wait(bool skip_unchanged, int readers_wait_ms);
 STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged) {
+  return perform_config_reload_wait(skip_unchanged, reload_previous_readers_wait_ms());
+}
+
+static config_reload_result_t perform_config_reload_wait(bool skip_unchanged, int readers_wait_ms) {
   config_reload_result_t res;
   memset(&res, 0, sizeof(res));
   char *config_str = read_entire_file(g_config_path, NULL, NULL);
@@ -3766,9 +3838,12 @@ STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged
    * standby は前回の公開で退いた設定で、retire_epoch はその公開で得た値
    * (公開してから世代を進めるので、これ以下の世代のリーダーだけが standby を持ちうる)。
    * 設定の writer は制御スレッドだけで、ワーカー以外のスレッドも設定は
-   * 読み取り区間の中で読むので、この待機の後は standby を解放してよい。*/
-  if (!rcu_writer_wait_until_safe(g_config_db.retire_epoch, 10000)) {
-    syslog(LOG_WARNING, "[Config] Reload postponed: existing readers still active on previous configuration (timeout 10s).");
+   * 読み取り区間の中で読むので、この待機の後は standby を解放してよい。
+   * The configuration is double-buffered (config_a / config_b): the new one is parsed into the struct that a reader of the generation before
+   * may still hold, so this check guards that reuse and stays.  0.7: an explicit reload waits readers_wait_ms (reload_readers_wait_ms(): the
+   * readers of normal operation), the tick's retry a short try; a reader that stays longer makes the reload "postponed" (run_config_reload()
+   * writes the log lines and remembers what the reload is to do). */
+  if (!rcu_writer_try_wait(g_config_db.retire_epoch, readers_wait_ms)) {
     res.status = CONFIG_RELOAD_POSTPONED;
     snprintf(res.detail, sizeof(res.detail), "readers of the previous configuration are still active");
     free(config_str);
@@ -3876,18 +3951,49 @@ static bool g_reload_pending_full = false; /* 延期したものに全ゾーン�
 
 _Atomic uint64_t g_reload_failures_total = 0;   /* karictl stats, alerts reload-failures-above: reloads that failed or left zones unloaded (the control thread writes it) */
 
-static config_reload_result_t run_config_reload(bool skip_unchanged) {
+static bool g_reload_pending_db = false;   /* the postponed reload includes a full control-channel reload: ask the loader after it (B6a) */
+static time_t g_reload_pending_logged;     /* when the postponement or its last reminder was logged */
+
+/* A reload, and what follows it when it is applied.  ask_db (a full control-channel `reload`): the database loader is asked to compare its sources
+ * with the zones served (B6a, design 5.2); *db_rid (may be NULL) gets the request id, 0 = none.  retry: the control tick's retry of a postponed
+ * reload (a short try for the readers); otherwise an explicit one (the readers of normal operation are waited for; only the short try when a reload
+ * is already postponed: the new one is merged into it).  A postponed reload is
+ * remembered with what it was to do (full, the database request) and applied by the tick; the postponement is logged once, a reminder at
+ * most once a minute, the outcome once. */
+static config_reload_result_t run_config_reload(bool skip_unchanged, bool ask_db, bool retry, uint64_t *db_rid) {
+  if (db_rid) *db_rid = 0;
   bool full = !skip_unchanged || g_reload_pending_full;
-  config_reload_result_t r = perform_config_reload_ext(!full);
+  ask_db = ask_db || g_reload_pending_db;
+  const bool was_pending = g_reload_pending;
+  /* a reload while one is postponed is merged into it (full, the database request): only the short try, so that n commands do not stack n waits
+   * on the control thread; the answer is "postponed" again unless the readers have left */
+  config_reload_result_t r = perform_config_reload_wait(!full, retry || was_pending ? RELOAD_RETRY_TRY_MS : reload_previous_readers_wait_ms());
   if (r.status == CONFIG_RELOAD_READ_ERROR || r.status == CONFIG_RELOAD_PARSE_ERROR || r.status == CONFIG_RELOAD_REJECTED ||
       r.status == CONFIG_RELOAD_ZONE_ERRORS)
     atomic_fetch_add_explicit(&g_reload_failures_total, 1, memory_order_relaxed);
   if (r.status == CONFIG_RELOAD_POSTPONED) {
+    const time_t now_s = time(NULL);
+    if (!was_pending) {
+      syslog(LOG_WARNING, "[Config] Reload postponed: readers of the previous configuration are still active; the server applies it when they have left");
+      g_reload_pending_logged = now_s;
+    } else if (now_s - g_reload_pending_logged >= 60) {
+      syslog(LOG_NOTICE, "[Config] The postponed reload still waits for readers of the previous configuration");
+      g_reload_pending_logged = now_s;
+    }
     g_reload_pending = true;
     g_reload_pending_full = full;
-  } else {
-    g_reload_pending = false;
-    g_reload_pending_full = false;
+    g_reload_pending_db = ask_db;
+    return r;
+  }
+  if (was_pending)
+    syslog(r.status == CONFIG_RELOAD_OK ? LOG_NOTICE : LOG_WARNING, "[Config] The postponed reload was %s", r.status == CONFIG_RELOAD_OK ? "applied"
+           : r.status == CONFIG_RELOAD_ZONE_ERRORS ? "applied, with zones that failed to load" : "not applied (see the lines above)");
+  g_reload_pending = false;
+  g_reload_pending_full = false;
+  g_reload_pending_db = false;
+  if (ask_db && (r.status == CONFIG_RELOAD_OK || r.status == CONFIG_RELOAD_ZONE_ERRORS) && db_ingest_enabled()) {
+    const uint64_t rid = db_ingest_reload(true, NULL, NULL, false);
+    if (db_rid) *db_rid = rid;
   }
   return r;
 }
@@ -4972,9 +5078,6 @@ void *control_thread_func(void *arg) {
                         case RELOAD_ERR_MISSING_SOA:
                             (void)ctl_send_all(cfd, "ERROR missing SOA\n", 18);
                             break;
-                        case RELOAD_ERR_BUSY:
-                            (void)ctl_send_all(cfd, "ERROR busy (AXFR in progress)\n", 30);
-                            break;
                     }
                   } else if (lr.zcfg->type && (strcasecmp(lr.zcfg->type, "slave") == 0 || strcasecmp(lr.zcfg->type, "secondary") == 0)) {
                     syslog(LOG_NOTICE, "[Control] Triggering retransfer for slave zone %s on reload", lr.zcfg->domain);
@@ -5025,24 +5128,22 @@ void *control_thread_func(void *arg) {
                 release_zone_snapshot(snap);
               } else {
                 syslog(LOG_NOTICE, "[Control] Received full reload command");
-                config_reload_result_t rr = run_config_reload(false);
+                /* B6a (design 5.2): after the configuration, ask the loader to compare its sources with the zones served (run_config_reload(); also
+                 * when the reload is postponed and the tick applies it); the answer is not waited for (karictl dbstatus shows the batch) */
+                uint64_t rid = 0;
+                config_reload_result_t rr = run_config_reload(false, true, false, &rid);
                 char reply[CTRL_RELOAD_REPLY_SIZE];
                 int rlen = format_reload_reply(&rr, "OK reloaded", reply, sizeof(reply));
-                /* B6a (design 5.2): after the configuration, ask the loader to compare its sources with the zones served;
-                 * the answer is not waited for (karictl dbstatus shows the batch) */
-                if ((rr.status == CONFIG_RELOAD_OK || rr.status == CONFIG_RELOAD_ZONE_ERRORS) && db_ingest_enabled()) {
-                  uint64_t rid = db_ingest_reload(true, NULL, NULL, false);
-                  if (rid && rlen > 0 && reply[rlen - 1] == '\n' && (size_t)rlen + 64 < sizeof(reply)) {
-                    rlen--;
-                    rlen += snprintf(reply + rlen, sizeof(reply) - (size_t)rlen, "; DB reload requested (request %llu)\n",
-                                     (unsigned long long)rid);
-                  }
+                if (rid && rlen > 0 && reply[rlen - 1] == '\n' && (size_t)rlen + 64 < sizeof(reply)) {
+                  rlen--;
+                  rlen += snprintf(reply + rlen, sizeof(reply) - (size_t)rlen, "; DB reload requested (request %llu)\n",
+                                   (unsigned long long)rid);
                 }
                 (void)ctl_send_all(cfd, reply, (size_t)rlen);
               }
             } else if (strcmp(cmd, "reconfig") == 0) {
               syslog(LOG_NOTICE, "[Control] Received reconfig command");
-              config_reload_result_t rr = run_config_reload(true);
+              config_reload_result_t rr = run_config_reload(true, false, false, NULL);
               char reply[CTRL_RELOAD_REPLY_SIZE];
               int rlen = format_reload_reply(&rr, "OK", reply, sizeof(reply));
               (void)ctl_send_all(cfd, reply, (size_t)rlen);
@@ -5099,6 +5200,14 @@ void *control_thread_func(void *arg) {
                 st.dnstap_dropped_not_connected = dc.not_connected;
                 st.dnstap_reconnects = dc.reconnects;
                 st.dnstap_link = dc.link;
+              }
+              {
+                gc_reclaim_stats_t gs;
+                gc_reclaim_stats(&gs);   /* R1: the reclaim queue of this process (the Backend's) */
+                st.reclaim_snapshots_waiting = gs.snapshots_waiting;
+                st.reclaim_oldest_age_ms = gs.oldest_age_ms;
+                st.reclaim_zone_versions_waiting = gs.zone_retire_waiting;
+                st.reclaim_warnings = gs.warnings;
               }
               snprintf(st.version, sizeof(st.version), "%s", KARIDNS_VERSION);
               snprintf(st.hostname, sizeof(st.hostname), "%s", g_host_status_info.un.nodename);
@@ -5394,6 +5503,13 @@ void *control_thread_func(void *arg) {
                 atomic_store_explicit(&g_test_xfr_fail, f, memory_order_relaxed);
                 (void)ctl_send_all(cfd, "OK\n", 3);
               } else (void)ctl_send_all(cfd, "ERROR expected thread, memory or off\n", 37);
+            } else if (strcmp(cmd, "rcu-hold") == 0 && arg) {
+              /* TEST ONLY (as evict): an auxiliary read section held for <ms> by a thread of its own (test_rcu_hold()), at most 120 s */
+              char *end = NULL;
+              unsigned long ms = strtoul(arg, &end, 10);
+              if (end && end != arg && *end == '\0' && ms > 0 && ms <= 120000 && test_rcu_hold((uint32_t)ms))
+                (void)ctl_send_all(cfd, "OK\n", 3);
+              else (void)ctl_send_all(cfd, "ERROR bad hold\n", 15);
 #endif
             } else if (strcmp(cmd, "trace") == 0 || strcmp(cmd, "notrace") == 0) {
               char treply[128];
@@ -5436,7 +5552,7 @@ void *control_thread_func(void *arg) {
         if (ev_list[i].data > 1)
           syslog(LOG_NOTICE, "[Config] %ld SIGHUP signals arrived while busy; reloading once", (long)ev_list[i].data);
         if (sighup_from_manager((long)ev_list[i].data))
-          run_config_reload(true);
+          run_config_reload(true, false, false, NULL);
       } else if (ev_list[i].filter == EVFILT_SIGNAL &&
                  (ev_list[i].ident == SIGTERM || ev_list[i].ident == SIGINT)) {
         /* O-03: 起動後の SIGTERM / SIGINT はここで受け、dnstap を閉じてから終了する */
@@ -5454,9 +5570,8 @@ void *control_thread_func(void *arg) {
         plug_backend_timer();           /* 0.6.2: freed plugin objects (and their STOPs), STARTs to ask again, owed KILLs */
         auxlog_push();                  /* 0.7 M2: a logging state a full queue did not take */
         if (g_reload_pending) {
-          /* O-10: 読み手が残っていて延期したリロードを捨てずにやり直す */
-          syslog(LOG_NOTICE, "[Config] Retrying the postponed reload");
-          run_config_reload(!g_reload_pending_full);
+          /* O-10: 読み手が残っていて延期したリロードを捨てずにやり直す (run_config_reload() logs the postponement once, a reminder a minute, the outcome) */
+          run_config_reload(!g_reload_pending_full, false, true, NULL);
         }
         // Check control clients timeout: 5s unauthenticated or 15s inactive
         ctrl_client_t *curr_c = g_ctrl_clients;
@@ -7819,6 +7934,7 @@ int main(int argc, char **argv) {
 
   // === Backend Process (backend_pid == 0) ===
   gc_snapshot_detach_only();
+  query_engine_key_redraw();   /* K-9: a key of its own (not the manager's), before its first thread and its first query */
   struct sigaction b_sa;
   memset(&b_sa, 0, sizeof(b_sa));
   b_sa.sa_handler = backend_sig_handler;
@@ -7901,6 +8017,15 @@ int main(int argc, char **argv) {
     atomic_init(&ctxs[i].qlog_ring.tail, 0);
     atomic_init(&ctxs[i].qlog_ring.dropped_count, 0);
     atomic_init(&ctxs[i].qlog_ring.ev_dropped, 0);
+    /* 0.7 (K-11): the event ring, an eighth of the query log ring and at least 1024 records (docs/karidns.md query-log-buffer-size) */
+    uint32_t ev_buf_size = qlog_buf_size / QLOG_EV_RING_DIVISOR >= QLOG_EV_RING_MIN ? qlog_buf_size / QLOG_EV_RING_DIVISOR : QLOG_EV_RING_MIN;
+    ctxs[i].ev_ring.size = ev_buf_size;
+    ctxs[i].ev_ring.mask = ev_buf_size - 1;
+    ctxs[i].ev_ring.events = calloc(ev_buf_size, sizeof(qlog_event_t));
+    atomic_init(&ctxs[i].ev_ring.head, 0);
+    atomic_init(&ctxs[i].ev_ring.tail, 0);
+    atomic_init(&ctxs[i].ev_ring.dropped_count, 0);
+    atomic_init(&ctxs[i].ev_ring.ev_dropped, 0);
 
     uint32_t dnstap_buf_size = (cfg->dnstap.queue_size >= 64) ? cfg->dnstap.queue_size : 4096;
     if ((dnstap_buf_size & (dnstap_buf_size - 1)) != 0) {
@@ -7918,7 +8043,7 @@ int main(int argc, char **argv) {
 
     atomic_init(&ctxs[i].query_count, 0);
     atomic_init(&ctxs[i].rcu_observed_epoch, RCU_EPOCH_IDLE);
-    if (!ctxs[i].qlog_ring.events || !ctxs[i].dnstap_ring.events)
+    if (!ctxs[i].qlog_ring.events || !ctxs[i].ev_ring.events || !ctxs[i].dnstap_ring.events)
       backend_exit(EXIT_FAILURE);
   }
 

@@ -108,6 +108,12 @@ typedef struct {
     uint64_t dnstap_dropped_not_connected;
     uint64_t dnstap_reconnects;
     int dnstap_link;   /* KARIDNS_DNSTAP_LINK_* */
+    /* 0.7 (R1): what waits to be freed (dns_snapshot_rcu.h gc_reclaim_stats()): retired zone-db snapshots, the age of the oldest in ms,
+     * the nodes of the zone-version retire stack, and the warnings about a snapshot held longer than 60 s.  Appended (32 bytes) */
+    uint64_t reclaim_snapshots_waiting;
+    uint64_t reclaim_oldest_age_ms;
+    uint64_t reclaim_zone_versions_waiting;
+    uint64_t reclaim_warnings;
 } karidns_status_t;
 
 #define KARIDNS_DNSTAP_LINK_OFF  0   /* no dnstap block */

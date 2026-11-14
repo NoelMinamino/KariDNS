@@ -12,7 +12,7 @@
 # Options:
 #   -c, --category <name>   Run tests matching category (unit, xfr, dnssec,
 #                           update, edns, rrl, catalog, tinydns, core, dag,
-#                           regression, all). Comma-separated or multiple -c.
+#                           regression, gui, all). Comma-separated or multiple -c.
 #   -f, --filter <pattern>  Run tests whose name matches pattern.
 #   -e, --exclude <list>    Skip tests whose name contains any of the
 #                           comma-separated substrings (e.g. used by
@@ -28,6 +28,10 @@
 #   --full-log              Print the whole log of a failed test.
 #   --test-timeout SECONDS  A test still running after SECONDS is stopped (its process group) and fails with "*** TIMEOUT" in its log.
 #   --asan                  Run the unit test binaries as their -asan builds (like make unit-tests-asan).
+#   --with-gui              Also run the browser tests of the web interface (category gui: Firefox and geckodriver).  Without it, or
+#                           --only-gui, -c gui or -t naming one of them, they are not run and do not count in the result; the summary
+#                           says how many were left out.
+#   --only-gui              Run only the browser tests (category gui).
 #   --serial-as-par         Run the tests registered "serial" next to the others (a list of tests that own their ports, directories and databases).
 #                           A test that sources tests/db/pg_lib.sh joins the group "pg" instead (one PostgreSQL test at a time).
 #   -v, --verbose           Print verbose real-time test output (implies -j 1).
@@ -116,6 +120,7 @@ TEST_TIMEOUT=0
 FULL_LOG=0
 ASAN_UNITS=0
 SERIAL_AS_PAR=0
+GUI_MODE=0          # 0: the browser tests (category gui) are left out unless named; 1: --with-gui; 2: --only-gui
 
 # Ensure LLVM_PROFILE_FILE is an absolute path so sub-scripts that change directory still write profdata
 if [ -n "${LLVM_PROFILE_FILE:-}" ]; then
@@ -211,6 +216,12 @@ while [ $# -gt 0 ]; do
         --serial-as-par)
             SERIAL_AS_PAR=1
             ;;
+        --with-gui)
+            GUI_MODE=1
+            ;;
+        --only-gui)
+            GUI_MODE=2
+            ;;
         --no-dag|--skip-dag)
             SKIP_DAG=1
             ;;
@@ -221,7 +232,12 @@ while [ $# -gt 0 ]; do
             echo "Options:"
             echo "  -c, --category <name>   Filter by category (comma-separated or multiple):"
             echo "                          unit, xfr, dnssec, update, edns, rrl, catalog,"
-            echo "                          dnstap, tinydns, core, regression, dag, all"
+            echo "                          dnstap, tinydns, core, regression, dag, gui, all"
+            echo "                          (gui, the browser tests of the web interface, only when named: -c gui,"
+            echo "                          -t, --with-gui or --only-gui)"
+            echo "  --with-gui              Also run the browser tests (category gui; Firefox, geckodriver).  Without it"
+            echo "                          they are left out of the run and its result, and the summary says so"
+            echo "  --only-gui              Run only the browser tests (category gui)"
             echo "  --no-dag, --skip-dag    Skip dag diagnostic client test suite"
             echo "  -f, --filter <pattern>  Filter tests matching name substring"
             echo "  -e, --exclude <list>    Skip tests whose name contains any comma-separated substring"
@@ -532,6 +548,10 @@ register_test "core" "sh" "tests/run_zone_path_dotdot_test.sh" "zone and log fil
 register_test "core" "sh" "tests/run_log_rotation_timestamp_test.sh" "suffix timestamp log rotation never overwrites, versions prunes (D-21)"
 register_test "core" "sh" "tests/run_tcp_timeouts_test.sh" "TCP first-message and idle timeouts, partial messages do not extend them (D-06, R-24)"
 register_test "core" "sh" "tests/run_tcp_stall_rcu_test.sh" "A TCP client that does not read its large answers: the worker's send waits outside the read section, two reloads in a row are not postponed (review H2)"
+register_test "core" "sh" "tests/run_rcu_reclaim_status_test.sh" "The reclaim queue of the zone snapshots (0.7 R1, K-1; R11): an AXFR client that reads nothing holds no snapshot (a reload answers OK at once, the counts stay 0, a second reload is not postponed); with the test hook (karictl rcu-hold) a reader that holds a read section keeps the retired snapshot: 'retired zone snapshots waiting: 1' with a growing age, the reclaim gauges (Prometheus and JSON), one warning after 60 s names the auxiliary slot, the counts go back to 0 when the hold ends (about 90 s; part 2 skipped without the hook; SKIP without perl)" "par"   # its own port window and directory
+register_test "core" "sh" "tests/run_axfr_stall_reload_test.sh" "R11: stalled outbound transfers (about 1 MB, TSIG) hold back only their version: a reload after a file change answers OK within 2 s, an UPDATE is applied at once, an IXFR keeps its differences while they leave the history, reconfig removes / retypes zones, a relaying secondary installs a new version, 140 stalled transfers leave the control channel answering; the transfers deliver the old version (message for message, every TSIG MAC verified); a database zone (root, karidns-evict) is not evicted during its transfer and the loader's replacement does not change it (about 60 s; part E skipped without its prerequisites)" "par"   # its own port window and directory
+register_test "core" "sh" "tests/run_reload_long_reader_test.sh" "0.7: a reader that stays in its read section (TEST ONLY karictl rcu-hold) costs memory, not time: a full reload of 3000 zones answers as fast as without it, a second one answers postponed at once and is done after the hold, a database batch of 1500 zones is applied during the hold, and the retired versions are freed after it (about 2 min; SKIP without the test hooks; part 2 needs root and SQLite3)" "par"   # its own port window and directory
+register_test "core" "sh" "tests/run_db_memlimit_reader_test.sh" "0.7 memory-limit option B: with a reader that stays (TEST ONLY karictl rcu-hold), the versions a database batch replaced are held (dbstatus held=), not weighed against memory-limit: no served zone is evicted and none is left out for them, and they are freed after the hold (root, SQLite3; SKIP without them or the test hooks)" "par"   # its own port window and directory
 register_test "core" "sh" "tests/run_forward_failover_test.sh" "Forward zones share forward-timeout between forwarders, mismatched replies ignored (D-20)"
 register_test "core" "sh" "tests/run_dnstap_lifecycle_test.sh" "dnstap query_zone, reconnect through the broker, STOP/FINISH at shutdown (O-03); 0.7: dropped (queue full, not connected), connected and reconnects in karictl status / stats"
 register_test "core" "sh" "tests/run_rrl_bind_keys_test.sh" "RRL keyed like BIND: name, zone for NXDOMAIN, wildcard, client prefix length (D-05)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
@@ -628,6 +648,7 @@ register_test "core" "sh" "tests/run_db_signer_wait_test.sh" "The loader waits f
 register_test "core" "sh" "tests/run_db_signer_wait_pg_test.sh" "The loader waits for the signer on PostgreSQL (0.6.1, P5 c; root only, SKIP otherwise): the S1 and S2 checks of run_db_signer_wait_test.sh with LISTEN karidns_changes (an ordinary zone follows, the signer zone waits and dbstatus names it, karictl reload clears it, new and deleted zones, a restart, signer-wait no, a zone that loses X-KARIDNS-SIGNER), and the cover marks of a one-zone reload (the xmin of the snapshot): a reload inside the coalesce window keeps the rows the batch reads later from listing the zone, a change after it lists it, an open older transaction keeps the documented limit" "serial"   # an open transaction holds back the change-log position of another test, and the PostgreSQL server is shared: alone
 register_test "core" "sh" "tests/run_signer_unit_test.sh" "karidns-signer unit tests (signer/test, node --test): configuration, key arithmetic of every algorithm against real dnssec-keygen and PowerDNS keys, argv, scheduling arithmetic, the work directory, the SQLite3 and PostgreSQL sides, the pipeline with fake tools, the daemon loop (SKIP without node 22.13)"
 register_test "core" "sh" "tests/run_signer_test.sh" "karidns-signer on SQLite3 with BIND's dnssec-keygen / dnssec-signzone / dnssec-verify (0.6.0 item C): first signing by key request for six algorithms, own writes are no change, a change during signing (exit status 3), re-signing before expiry, NSEC3 opt-out, KSK + ZSK, key requests of kind add, a PowerDNS-made key, a broken key, SIGHUP / SIGTERM / kill -9; root: served only when signed (signer-wait) and the restricted control key (SKIP without node 22.13, BIND's tools or sqlite3)" "par"   # its own ports, directory and roles (0.6.2: next to the others, as CI has run it)
+register_test "core" "sh" "tests/run_signer_lock_test.sh" "karidns-signer's single-instance lock on SQLite3 (0.7, K-2): a kernel lock (F_GETLK names the holder), refused with the holder's pid, gone after kill -9, 50 rounds of 4 simultaneous starts with one winner each and no overlapping holds, a 0.6.x pid file with a live foreign pid does not block, a read-only directory (SKIP without node 22.13 or perl Fcntl)" "par"   # its own directory
 register_test "core" "sh" "tests/run_signer_pg_test.sh" "karidns-signer on PostgreSQL as the signer role with row level security (0.6.0 item C): the scenarios of run_signer_test.sh, the role cannot write an A record or touch a key, the advisory lock keeps two instances off one zone, reload requests, LISTEN karidns_changes, the conninfo file check (SKIP without PostgreSQL, a role that may create roles, signer/node_modules/pg)" "group:pg"   # PostgreSQL: one at a time with the other PostgreSQL tests (0.6.2: no longer alone)
 register_test "core" "sh" "tests/run_webadmin_unit_test.sh" "karidns-webadmin unit tests (webadmin/test and node/test, node --test): configuration, validators, scrypt / TOTP / AES-GCM against the RFC vectors, the permission rules against tests/auth_vectors.json, both database backends, and the HTTP server over SQLite3 (login, sessions, CSRF, TOTP, tokens, grants without escalation, zones, RRsets, audit, limits, the command line); function coverage 100% (SKIP without node 22.13); item F, M1: the files of the GUI (static.js), ?rdata=1, from / contains, tagged, /version, the credentials actions; item F, M2: webadmin/ui (dom, format, router, i18n, the API client, the session timer, the QR encoder against libqrencode, the screens S1 S2 S15 S16 on a fake DOM, the GUI against the real service, the source scan, the catalogs) under the same gate; item F, M3: the zone screens (the draft change set, the pointers of the errors, the diff in pages of 200, S3 S4 S5 S5a S6 S7 S8 S13 S14 and the update button on a fake DOM, and against the real service with a scripted karidns-zone) under the same gate"
 register_test "core" "sh" "tests/run_webadmin_test.sh" "karidns-webadmin on SQLite3 (0.6.0 items D and E, M2): --check, --create-admin, the real server on a real port, TOTP enrolment, users / groups / policies / grants, what each role sees, paging, the export through karidns-zone, no escalation, audit log, tokens, CSRF and Origin, lockout, idle sessions, a disabled user, rate limit; the log holds no secret (SKIP without node 22.13, sqlite3 or the binaries)" "par"   # its own ports, directory and roles (0.6.2: next to the others, as CI has run it)
@@ -636,9 +657,10 @@ register_test "core" "sh" "tests/run_webadmin_write_test.sh" "karidns-webadmin w
 register_test "core" "sh" "tests/run_webadmin_write_pg_test.sh" "karidns-webadmin write side on PostgreSQL as the role karidns_api with row level security and a running karidns (0.6.0 items D and E, M3): the scenarios of run_webadmin_write_test.sh with the reload requests of the commit runs, the audit under the API role, the grants of a deleted zone gone by trigger, karidns_auth.sweep_expired(), RLS never disagreed with the API; item F, M4: the same history, template, administration and audit scenarios as the domain and subdomain masters under row level security (SKIP without root, PostgreSQL, a role that may create roles, an unprivileged PostgreSQL user, webadmin/node_modules/pg); item F, M1: the same additions on PostgreSQL" "group:pg"   # PostgreSQL: one at a time with the other PostgreSQL tests (0.6.2: no longer alone)
 register_test "core" "sh" "tests/run_webadmin_versions_test.sh" "karidns-webadmin history and templates on SQLite3 with a running karidns (0.6.0 items D and E, M4): the operator's import is version 1, changes through the API are versions (who, delta, diff of two versions and against the zone), a rollback is a new change set (a subdomain master restores its own names, a domain master cannot restore the apex, a conflict with what SQL did is 409 and force restores anyway, a rollback of a rollback), the marker for changes outside the versions (SQL yes, the signer no), a signer zone the API does not reload, templates (karicheck refuses a broken one), a zone made from a template, a template applied and rolled back (SKIP without root, node 22.13, sqlite3 or the binaries)" "par"   # its own ports, directory and roles (0.6.2: next to the others, as CI has run it)
 register_test "core" "sh" "tests/run_webadmin_versions_pg_test.sh" "karidns-webadmin history and templates on PostgreSQL as the role karidns_api with row level security and a running karidns (0.6.0 items D and E, M4): the scenarios of run_webadmin_versions_test.sh, the versions read under the policies of the API role, the audit log tells SQL from the signer, no reload request for the signer's zone, the version rows and the audit rows under the API role, RLS never disagreed with the API; item F, M4: the same history, template, administration and audit scenarios as the domain and subdomain masters under row level security (SKIP without root, PostgreSQL, a role that may create roles, an unprivileged PostgreSQL user, webadmin/node_modules/pg)" "group:pg"   # PostgreSQL: one at a time with the other PostgreSQL tests (0.6.2: no longer alone)
-register_test "core" "sh" "tests/run_webadmin_gui_test.sh" "The web interface of karidns-webadmin in Firefox (headless, geckodriver, our own WebDriver client; 0.6.0 item F, M2) on SQLite3: the sign-in and its refusals, the TOTP enrolment of a global master (the QR code drawn in the page, the key hidden until asked for, the secret gone afterwards), the code at the second sign-in, API tokens, the password, the keyboard alone, 'log out everywhere' signs out a second tab, the idle warning and the end of the session (no request on its own), Japanese, hostile texts in names (nothing runs), the 429 countdown, the labels of every screen, every resource of the origin, a violation of the page's policy is reported (SKIP without Firefox, geckodriver, fonts, node 22.13, sqlite3 or the binaries); item F, M3, as root with a real karidns: the zone screens (list and search, the records in text form, the MX round trip, an edit with the preview and the commit, the update button checked with dag, conflicts made behind the page in English and Japanese, refusals told where they belong, the draft over the end of the session, a subdomain master, new zones from a template / a form / a zone file, import and export, settings and metadata, a zone deleted after its name is typed again, DNSSEC, read-only zones, hostile zone data, the keyboard alone; item F, M4: the versions of a zone and a rollback (a change made behind the API's back is marked and is a conflict that needs the question about force), templates checked by the real karicheck and applied to a zone, the administration (users, groups, grants, the TOTP reset and the unlock, policies), what a domain master and a subdomain master see, the audit log); that part SKIPs without root" "serial"
-register_test "core" "sh" "tests/run_webadmin_gui_pg_test.sh" "The zone screens of the web interface in Firefox on PostgreSQL as the role karidns_api with row level security and a running karidns (0.6.0 item F, M3): the zone part of run_webadmin_gui_test.sh with the reload request of the update button, the loader, dag and the count of servers that applied it, the audit log under the API role, the zone versions, no reload request for the signer's zone, RLS never disagreed with the API; item F, M4: the same history, template, administration and audit scenarios as the domain and subdomain masters under row level security (SKIP without root, PostgreSQL, a role that may create roles, an unprivileged PostgreSQL user, webadmin/node_modules/pg, Firefox, geckodriver, fonts or the binaries)" "serial"
-register_test "core" "sh" "tests/run_webadmin_oidc_test.sh" "The sign-in with an OpenID Connect provider (karidns-webadmin, 0.6.0 item F, M5) against a fake provider on another site of the loopback address: SQLite3 and PostgreSQL as the role karidns_api with row level security (the role has no privilege on karidns_auth.oidc_states, its functions do the work; sweep_expired) run webadmin/test/it_oidc.mjs (link, the flow with PKCE, a replayed state, a state from another browser, spoiled ID tokens, the TOTP step of a global master, unlink, the audit log), and Firefox (webadmin/test/e2e/gui_oidc.mjs) clicks the button, comes back with a Strict session cookie set by a redirect from another site, is refused for an unlinked identity and links one in the administration (SKIP a part without node 22.13, sqlite3, PostgreSQL, webadmin/node_modules/pg, Firefox, geckodriver, fonts or the binaries)" "serial"
+register_test "gui" "sh" "tests/run_webadmin_gui_test.sh" "The web interface of karidns-webadmin in Firefox (headless, geckodriver, our own WebDriver client; 0.6.0 item F, M2) on SQLite3: the sign-in and its refusals, the TOTP enrolment of a global master (the QR code drawn in the page, the key hidden until asked for, the secret gone afterwards), the code at the second sign-in, API tokens, the password, the keyboard alone, 'log out everywhere' signs out a second tab, the idle warning and the end of the session (no request on its own), Japanese, hostile texts in names (nothing runs), the 429 countdown, the labels of every screen, every resource of the origin, a violation of the page's policy is reported (SKIP without Firefox, geckodriver, fonts, node 22.13, sqlite3 or the binaries); item F, M3, as root with a real karidns: the zone screens (list and search, the records in text form, the MX round trip, an edit with the preview and the commit, the update button checked with dag, conflicts made behind the page in English and Japanese, refusals told where they belong, the draft over the end of the session, a subdomain master, new zones from a template / a form / a zone file, import and export, settings and metadata, a zone deleted after its name is typed again, DNSSEC, read-only zones, hostile zone data, the keyboard alone; item F, M4: the versions of a zone and a rollback (a change made behind the API's back is marked and is a conflict that needs the question about force), templates checked by the real karicheck and applied to a zone, the administration (users, groups, grants, the TOTP reset and the unlock, policies), what a domain master and a subdomain master see, the audit log); that part SKIPs without root" "serial"
+register_test "gui" "sh" "tests/run_webadmin_gui_pg_test.sh" "The zone screens of the web interface in Firefox on PostgreSQL as the role karidns_api with row level security and a running karidns (0.6.0 item F, M3): the zone part of run_webadmin_gui_test.sh with the reload request of the update button, the loader, dag and the count of servers that applied it, the audit log under the API role, the zone versions, no reload request for the signer's zone, RLS never disagreed with the API; item F, M4: the same history, template, administration and audit scenarios as the domain and subdomain masters under row level security (SKIP without root, PostgreSQL, a role that may create roles, an unprivileged PostgreSQL user, webadmin/node_modules/pg, Firefox, geckodriver, fonts or the binaries)" "serial"
+register_test "core" "sh" "tests/run_webadmin_oidc_test.sh" "The sign-in with an OpenID Connect provider (karidns-webadmin, 0.6.0 item F, M5) against a fake provider on another site of the loopback address: SQLite3 and PostgreSQL as the role karidns_api with row level security (the role has no privilege on karidns_auth.oidc_states, its functions do the work; sweep_expired) run webadmin/test/it_oidc.mjs (link, the flow with PKCE, a replayed state, a state from another browser, spoiled ID tokens, the TOTP step of a global master, unlink, the audit log) (parts 1 and 2; the browser part 3 is run_webadmin_oidc_gui_test.sh, category gui) (SKIP a part without node 22.13, sqlite3, PostgreSQL, webadmin/node_modules/pg or the binaries)" "serial"
+register_test "gui" "sh" "tests/run_webadmin_oidc_gui_test.sh" "The browser part of run_webadmin_oidc_test.sh (OIDC_PARTS=3): Firefox (webadmin/test/e2e/gui_oidc.mjs) clicks the button of a fake provider, comes back with a Strict session cookie set by a redirect from another site, is refused for an unlinked identity and links one in the administration (SKIP without node 22.13, sqlite3, Firefox, geckodriver, fonts or the binaries)" "serial"
 register_test "core" "sh" "tests/run_webadmin_pkg_test.sh" "The FreeBSD package of karidns-webadmin (0.6.0 items D and E, M5): build_webadmin_pkg.sh builds it from a copy of the tree, pkg info (name, version, the dependency on node24, the files, the modes, the pre-install script), the unpacked package runs the program (--version, --check, --create-admin, a real server: health, login, SIGTERM), and as root the rc script with another user: configtest, onestart, both pid files, the user of the daemon, reload (SIGHUP reads public-origin again), onestop (SKIP without FreeBSD pkg, node24, npm, sqlite3, the built karidns-zone and karicheck; the rc part without root)" "par"   # its own ports, directory and roles (0.6.2: next to the others, as CI has run it)
 register_test "core" "sh" "tests/run_signer_pkg_test.sh" "The FreeBSD package of karidns-signer (0.6.0 items C and E, M5): build_signer_pkg.sh builds it from a copy of the tree, pkg info (name, version, the dependencies on node24 and bind-tools, the files, the modes, the pre-install script), the unpacked package runs the program (--version, --check, a daemon on SQLite3: start, SIGHUP, SIGTERM), and as root the rc script with another user: configtest, onestart, both pid files, the user of the daemon, the tmpfs on the work directory, syslog, reload (SIGHUP), onestop (SKIP without FreeBSD pkg, node24, bind-tools, npm, sqlite3, the built karidns-zone, karicheck and karictl; the rc part without root; the tmpfs and syslog parts where the system has none)" "par"   # its own ports, directory and roles (0.6.2: next to the others, as CI has run it)
 register_test "core" "sh" "tests/run_version_test.sh" "The release number has one source, the file VERSION (docs/RELEASING.md): it is x.y.z, the copies make set-version writes (package.json and package-lock.json of signer and webadmin, the GUI version.js) agree, no C fallback, Node module or packaging script holds a number of its own, the Makefile reads the file, tools/set_version.sh rewrites every copy on a scratch tree and refuses other forms, and the built programs report the number (SKIP line per program not built)"
@@ -772,6 +794,10 @@ fi
 is_category_selected() {
     _target_cat="$1"
     if [ "${SKIP_DAG}" -eq 1 ] && [ "${_target_cat}" = "dag" ]; then
+        return 1
+    fi
+    # --only-gui: the browser tests and nothing else (no unit binaries are built either)
+    if [ "${GUI_MODE}" -eq 2 ] && [ "${_target_cat}" != "gui" ]; then
         return 1
     fi
     if [ -z "${SELECTED_CATEGORIES}" ] || [ "${SELECTED_CATEGORIES}" = "all" ]; then
@@ -974,10 +1000,24 @@ fi
 # Selected tests: PLAN_FILE = index|category|type|command|mode|description
 TOTAL_RUN=0
 : > "${PLAN_FILE}"
+GUI_LEFT_OUT="${SUITE_TMP}/gui_left_out.txt"
+: > "${GUI_LEFT_OUT}"
 printf "%b" "${REGISTERED_TESTS}" | {
     _n=0
     while IFS='|' read -r _cat _type _cmd _mode _desc; do
         [ -z "${_cat}" ] && continue
+        # the browser tests (category gui) do not decide the verdict of a run unless asked for: --with-gui, --only-gui, -c gui or -t naming one.
+        # One that is left out is listed (GUI_LEFT_OUT) so that the summary says it was not run.
+        if [ "${_cat}" = "gui" ]; then
+            _gui_asked=0
+            [ "${GUI_MODE}" -ge 1 ] && _gui_asked=1
+            case ",${SELECTED_CATEGORIES}," in *,gui,*) _gui_asked=1 ;; esac
+            [ -n "${TEST_LIST}" ] && is_name_matched "${_cmd}" && _gui_asked=1
+            if [ "${_gui_asked}" -eq 0 ]; then
+                is_category_selected "${_cat}" && [ "${ASAN_UNITS}" -eq 0 ] && is_name_matched "${_cmd}" && echo "${_cmd}" >> "${GUI_LEFT_OUT}"
+                continue
+            fi
+        fi
         is_category_selected "${_cat}" || continue
         # --asan: the unit test binaries only (their -asan builds)
         [ "${ASAN_UNITS}" -eq 1 ] && { [ "${_type}" = "bin" ] || continue; }
@@ -993,6 +1033,15 @@ printf "%b" "${REGISTERED_TESTS}" | {
     done
 }
 TOTAL_RUN=$(wc -l < "${PLAN_FILE}" | tr -d ' ')
+GUI_LEFT_OUT_COUNT=$(wc -l < "${GUI_LEFT_OUT}" | tr -d ' ')
+# gui_note: the line that says which browser tests were left out of this run (they did not pass: they did not run)
+gui_note() {
+    [ "${GUI_LEFT_OUT_COUNT}" -gt 0 ] || return 0
+    echo ""
+    echo "${C_YELLOW}NOT RUN: ${GUI_LEFT_OUT_COUNT} browser test(s) of the web interface (category gui), not part of this result:${C_RESET}"
+    sed 's/^/  - /' "${GUI_LEFT_OUT}"
+    echo "  Run them with --with-gui (with the rest) or --only-gui (tests/TEST_MATRIX.md, \"Browser tests\")."
+}
 
 # run_job INDEX SLOT: run test INDEX of the plan in slot SLOT; the result line
 # (the line of summary.tsv) goes to ${RES_DIR}/INDEX.res.  Runs in a subshell
@@ -1299,6 +1348,7 @@ fi
 
 if [ ! -f "${SUMMARY_FILE}" ] || [ ! -s "${SUMMARY_FILE}" ]; then
     echo "${C_YELLOW}No matching tests found for execution.${C_RESET}"
+    gui_note
     exit 0
 fi
 
@@ -1321,7 +1371,7 @@ done < "${SUMMARY_FILE}"
 # KARI_SUITE_STATUS=<file>: the counts are written there once every test has run, so a caller that ignores the exit status (make
 # coverage-run) can tell a suite that finished, with or without failing tests, from one that stopped before running them (the file is missing).
 if [ -n "${KARI_SUITE_STATUS:-}" ]; then
-    printf 'total=%d passed=%d failed=%d skipped=%d\nfailed_tests=%s\n' "${TOTAL_COUNT}" "${PASSED_COUNT}" "${FAILED_COUNT}" "${SKIPPED_COUNT}" "${FAILED_TESTS}" > "${KARI_SUITE_STATUS}" ||
+    printf 'total=%d passed=%d failed=%d skipped=%d\nfailed_tests=%s\ngui_not_run=%d\n' "${TOTAL_COUNT}" "${PASSED_COUNT}" "${FAILED_COUNT}" "${SKIPPED_COUNT}" "${FAILED_TESTS}" "${GUI_LEFT_OUT_COUNT}" > "${KARI_SUITE_STATUS}" ||
         echo "WARN: could not write ${KARI_SUITE_STATUS}" >&2
 fi
 
@@ -1345,6 +1395,9 @@ else
 fi
 if [ "${SKIPPED_COUNT}" -gt 0 ]; then
     printf "  Skipped              : ${C_YELLOW}%d${C_RESET}\n" "${SKIPPED_COUNT}"
+fi
+if [ "${GUI_LEFT_OUT_COUNT}" -gt 0 ]; then
+    printf "  Not run (browser)    : ${C_YELLOW}%d${C_RESET} (category gui; --with-gui)\n" "${GUI_LEFT_OUT_COUNT}"
 fi
 printf "  Total Execution Time : %ds (jobs: %d)\n" "${TOTAL_DURATION}" "${JOBS}"
 echo "${C_BOLD}======================================================================${C_RESET}"
@@ -1381,11 +1434,17 @@ if [ "${FAILED_COUNT}" -gt 0 ]; then
             printf "  - ${C_RED}%-45s${C_RESET} [Category: %s, Exit Code: %s]\n" "${_c}" "${_cat}" "${_code}"
         fi
     done < "${SUMMARY_FILE}"
+    gui_note
     echo ""
     echo "${C_BG_RED} FAILURE ${C_RESET} One or more tests failed. Check logs in ${LOG_DIR}."
     exit 1
 else
+    gui_note
     echo ""
-    echo "${C_BG_GREEN} SUCCESS ${C_RESET} All ${TOTAL_COUNT} test cases passed successfully!"
+    if [ "${GUI_LEFT_OUT_COUNT}" -gt 0 ]; then
+        echo "${C_BG_GREEN} SUCCESS ${C_RESET} All ${TOTAL_COUNT} test cases run passed successfully (${GUI_LEFT_OUT_COUNT} browser test(s) not run)."
+    else
+        echo "${C_BG_GREEN} SUCCESS ${C_RESET} All ${TOTAL_COUNT} test cases passed successfully!"
+    fi
     exit 0
 fi

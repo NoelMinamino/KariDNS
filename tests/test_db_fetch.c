@@ -1287,7 +1287,7 @@ int main(void) {
     CHECK(elem_of("default", "r.test.")->retry == 2147483647u && elem_of("default", "r.test.")->expire == 7);
 
     /* -- zone transfers of zones that are out of memory (D1a step 7, design 7, 12-6): db_ingest_xfr_await() asks for the zone through the slots of
-     *    park_fetch_request_any() and returns the entry with the transfer counted in active_axfr.  A zone it brought is marked evict-next (and XFRLOAD)
+     *    park_fetch_request_any() and returns the entry held for the transfer (xfr_entry_hold()).   A zone it brought is marked evict-next (and XFRLOAD)
      *    unless it is pinned, was changed by an UPDATE or is asked for more often than the zones the manager took out; queries drop the mark.  The
      *    manager (a limit far above the zones in memory: no pressure) takes a marked zone out as soon as the transfer has ended. */
     {
@@ -1321,8 +1321,8 @@ int main(void) {
             await_t A = { elem_of("default", "s.test."), NULL, 0, 0 };
             CHECK(sen != NULL && A.el != NULL);
             await_thread(&A);
-            CHECK(A.res == sen && atomic_load(&sen->active_axfr) == 1 && A.t1 - A.t0 < 100);
-            atomic_fetch_sub(&sen->active_axfr, 1);
+            CHECK(A.res == sen && atomic_load(&sen->active_axfr) == 1 && atomic_load(&sen->snapshot_refs) == 2 && A.t1 - A.t0 < 100);   /* (R11: and a reference of its own) */
+            xfr_entry_release(sen);
             CHECK(!ch_next(&fetchc, &m, 100));
         }
 
@@ -1343,7 +1343,7 @@ int main(void) {
         usleep(600000);                                                        /* (the manager sees the mark and a transfer that holds the zone) */
         CHECK(zdir_entry(xe) == A.res && !dbreg_test_evict("default", "r.test."));
         uint64_t ev0 = dbreg_evictions();
-        atomic_fetch_sub(&A.res->active_axfr, 1);
+        xfr_entry_release(A.res);
         for (int i = 0; i < 100 && zdir_entry(xe) != NULL; i++) usleep(30000);
         CHECK(zdir_entry(xe) == NULL && dbreg_evictions() == ev0 + 1);         /* (taken out first: no pressure, nothing else to compare with) */
         CHECK(atomic_load(&xe->state) == ZDIR_ST_ABSENT);
@@ -1360,7 +1360,7 @@ int main(void) {
         CHECK(A.res != NULL && (elem_flags("r.test.") & (ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD)) == 0);
         dbreg_cache_stats(&cs1);
         CHECK(cs1.xfr_marked == cs0.xfr_marked + 1 && cs1.xfr[DBREG_XFR_LOADED] == cs0.xfr[DBREG_XFR_LOADED] + 2);
-        atomic_fetch_sub(&A.res->active_axfr, 1);
+        xfr_entry_release(A.res);
         usleep(600000);
         CHECK(zdir_entry(xe) == A.res);                                         /* (it stays: GDSF only) */
         CHECK(dbreg_test_evict("default", "r.test."));
@@ -1378,7 +1378,7 @@ int main(void) {
         atomic_store(&A.res->observatory.queries_total, 7);
         for (int i = 0; i < 100 && (elem_flags("r.test.") & (ZDIR_F_XFRLOAD | ZDIR_F_EVICT_NEXT)); i++) usleep(30000);
         CHECK((elem_flags("r.test.") & (ZDIR_F_XFRLOAD | ZDIR_F_EVICT_NEXT)) == 0);
-        atomic_fetch_sub(&A.res->active_axfr, 1);
+        xfr_entry_release(A.res);
         usleep(700000);
         CHECK(zdir_entry(xe) == A.res);                                         /* (a zone the queries use is not taken out because a transfer read it) */
         CHECK(dbreg_test_evict("default", "r.test."));
@@ -1443,7 +1443,7 @@ int main(void) {
             dbreg_xfr_loaded("default", "r.test.");
             dbreg_cache_stats(&cs1);
             CHECK(ae == qe && cs1.xfr_marked == mk0 && (elem_flags("r.test.") & (ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD)) == 0);
-            if (ae) atomic_fetch_sub(&ae->active_axfr, 1);
+            if (ae) xfr_entry_release(ae);
             usleep(500000);
             CHECK(zdir_entry(xe) == qe);                                                  /* (and the manager leaves it) */
             CHECK(dbreg_test_evict("default", "r.test."));

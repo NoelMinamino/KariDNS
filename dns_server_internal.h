@@ -265,7 +265,7 @@ typedef struct {
 } axfr_session_t;
 
 // クエリログ用 固定長イベント構造体 (バイナリ保持)
-// batch 14: the ring also carries the event messages of the worker (dns_log.h logev_*: update-security, update, xfer-out, query-errors).  A record of
+// batch 14: the record also carries the event messages of the worker (0.7, K-11: in the worker's event ring ev_ring, not in the query log ring) (dns_log.h logev_*: update-security, update, xfer-out, query-errors).  A record of
 // kind QLOG_KIND_EVENT has the finished text in qname, the client address as text in client_text and its port in client_port, the category and the
 // level (LOG_LVL_*, or a debug level); everything else is unused.  Fixed size, nothing allocated, and the strings are cut.
 #define QLOG_KIND_QUERY 0
@@ -299,8 +299,12 @@ typedef struct {
     alignas(64) _Atomic uint32_t head;
     alignas(64) _Atomic uint32_t tail;
     alignas(64) _Atomic uint64_t dropped_count;
-    _Atomic uint64_t ev_dropped;        // batch 14: event messages that found the ring too full
+    _Atomic uint64_t ev_dropped;        // batch 14: event messages that found the ring too full (0.7: counted on the event ring)
 } qlog_ring_t;
+
+/* 0.7 (K-11): the event ring of a worker (worker_ctx_t.ev_ring) has query-log-buffer-size / QLOG_EV_RING_DIVISOR records, at least QLOG_EV_RING_MIN */
+#define QLOG_EV_RING_DIVISOR 8u
+#define QLOG_EV_RING_MIN 1024u
 
 /* S5 B-3: the published version of a zone is a heap zone_version_t (image + glue + flags); a writer builds a new one and
  * publishes it with zone_publish(), the old one goes on the retire stack. Before the first publish `active` is
@@ -312,7 +316,8 @@ typedef struct {
 struct worker_ctx {
   int thread_id;
   zone_rcu_t *rcu_db;
-  qlog_ring_t qlog_ring;
+  qlog_ring_t qlog_ring;          /* the query log records (QLOG_KIND_QUERY) */
+  qlog_ring_t ev_ring;            /* 0.7 (K-11): the worker's event and debug messages (QLOG_KIND_EVENT, qlog_event_sink()) */
   dnstap_ring_t dnstap_ring;
   alignas(64) _Atomic uint64_t query_count;
   alignas(64) _Atomic uint64_t rcu_observed_epoch;
@@ -778,8 +783,8 @@ typedef struct zone_db_snapshot {
   zdir_garbage_t garb;
   struct zone_db_snapshot *gc_next;   /* the retired snapshots that are not drained yet, oldest first (g_gc_lock) */
   bool gc_queued;
-  bool gc_started;                    /* its cleanup thread was started (or is being started); false = a start failed and is tried again (g_gc_lock) */
-  bool gc_drained;
+  bool gc_drained;                    /* its views are released: freed with its garbage once every older one is drained (g_gc_lock) */
+  int64_t gc_retired_ms;              /* when it was retired (CLOCK_MONOTONIC, ms): the age of the oldest in karictl status */
 } zone_db_snapshot_t;
 
 /* A long walk over every zone (a rebuild at a million zones, the glue refresh, the registry walks of the ingest thread)
@@ -1007,6 +1012,18 @@ typedef struct {
   uint64_t previous;   /* the versions that zones keep for `karictl rollback` (entry->prev): nobody reads them, a rollback or the rollback-window ends them */
 } zone_bytes_t;
 void zone_bytes_get(int cls, zone_bytes_t *out);
+/* 0.7 (memory-limit, option B): the retired bytes of class cls that a reader or a transfer holds (the versions a pass of zone_retire_process()
+ * found held, until they are freed: dns_snapshot_rcu.c); the cache manager does not count them.  dbreg_cache_used_bytes(): what it counts. */
+uint64_t zone_bytes_retired_held(int cls);
+uint64_t dbreg_cache_used_bytes(const zone_bytes_t *zb, uint64_t held);
+bool dbreg_cache_long_reader(void);              /* a thread of the server is in a read section for a second or more (sampled by the cache manager) */
+#ifdef KARIDNS_UNIT_TEST
+bool cache_reader_sample(int64_t now_ms);        /* (the cache manager's sampler: unit tests) */
+void cache_reader_sample_reset_for_test(void);     /* (back to "never sampled") */
+#endif
+#ifdef KARIDNS_UNIT_TEST
+void zone_retire_held_ms_set_for_test(int64_t ms);
+#endif
 int zone_bytes_class(const zone_db_entry_t *e);
 /* for the IXFR history (dns_axfr_ixfr.c): a difference was stored in / left the history of a zone of class cls */
 void zone_bytes_resident_add(int cls, int64_t delta);
@@ -1018,7 +1035,6 @@ typedef enum {
   ZRB_OFF,           /* rollback-window is 0 for the zone: no previous version is kept */
   ZRB_NOT_PRIMARY,   /* a secondary or a catalog member: its primary sends the data again */
   ZRB_SIGNED,        /* the zone holds RRSIG / DNSKEY: a new serial would break the signature of the SOA */
-  ZRB_BUSY,          /* a zone transfer is running */
   ZRB_EVICTED,       /* the zone was taken out of memory meanwhile */
   ZRB_FAILED         /* out of memory, or the old version does not fit the limits now (syslog says) */
 } zone_rollback_result_t;
@@ -1166,6 +1182,8 @@ int dbreg_find_info(const char *view, const char *name, dbreg_info_t *out, int m
 typedef struct {
   uint64_t limit, resident, retired, inflight;   /* bytes: the limit (0 = none), the version bytes in memory, replaced / evicted but not freed, evicted but not freed */
   uint64_t previous;                             /* versions kept for karictl rollback (not served); the manager drops them before it evicts a zone */
+  uint64_t held;                                 /* of retired: what the cache manager does not weigh against the limit (held by a reader or a transfer) */
+  bool long_reader;                              /* a thread has been in a read section for a second or more (dbreg_cache_long_reader()) */
   uint64_t evictions, rounds, cold, marked, misses;
   uint64_t xfr_marked;                           /* zones a transfer brought into memory that were marked evict-next (dbreg_xfr_loaded()) */
   uint64_t xfr[4];                               /* transfers of zones that were out of memory, by DBREG_XFR_* */
@@ -1191,13 +1209,16 @@ void dbreg_cache_test_pause(bool on);                              /* TEST ONLY:
 void dbreg_cache_test_set_victim_freq(uint32_t f);                 /* TEST ONLY: the frequency a zone that is loaded now is compared with */
 #endif
 /* D1a step 7 (design 7): AXFR / IXFR of a zone that is in the directory and not in memory.  The transfer thread waits for the zone (a fetch it asks for), then
- * holds it with dbreg_xfr_acquire(): under the registry lock it reads the element's entry and counts the transfer in the entry's active_axfr, so that the
+ * holds it with dbreg_xfr_acquire(): under the registry lock it reads the element's entry and holds it (xfr_entry_hold(): active_axfr and a reference), so that the
  * cache manager's eviction (same lock) cannot take the zone out between the two.  NULL: no data in memory now.  dbreg_xfr_loaded(): the zone is in memory
  * because a transfer asked for it: it is marked evict-next (and XFRLOAD) unless it is pinned, was changed by an UPDATE, or is asked for more often than the zones
  * the manager took out last (frequency); the first query that arrives drops the mark (the scan of the manager).  dbreg_bg_loaded(): the same for a zone that
  * only a background fetch brought (D1a step 8), marked BGLOAD instead: the first to go under memory pressure, kept while there is room.  dbreg_xfr_note():
  * the counters of karictl dbstatus. */
 zone_db_entry_t *dbreg_xfr_acquire(zdir_elem_t *z);
+/* R11: an outbound transfer's hold of its entry (a reference and active_axfr; dns_snapshot_rcu.c), and its release (the last reference frees the entry) */
+void xfr_entry_hold(zone_db_entry_t *e);
+void xfr_entry_release(zone_db_entry_t *e);
 void dbreg_xfr_loaded(const char *view, const char *zone);
 void dbreg_bg_loaded(const char *view, const char *zone);
 enum { DBREG_XFR_WAITED = 0, DBREG_XFR_LOADED, DBREG_XFR_FAILED, DBREG_XFR_SUMMARY };   /* waited for a fetch; got the zone; gave up (SERVFAIL); answered an IXFR from the summary */
@@ -1510,6 +1531,8 @@ void *async_io_worker_func(void *arg);
 config_reload_result_t reload_all_zones(void);
 config_reload_result_t perform_config_reload(void);
 config_reload_result_t perform_config_reload_ext(bool skip_unchanged);
+int reload_readers_wait_ms(const server_config_t *cfg);   /* 0.7: how long an explicit reload waits for the readers of the configuration before */
+int reload_previous_readers_wait_ms(void);              /* (the larger of the active and the standby configuration's, while the standby is not reaped) */
 void escape_qname_for_log(const char *src, char *dst, size_t dst_size);
 void write_query_log(worker_ctx_t *ctx, const void *client_addr, socklen_t addr_len,
                      const char *qname, uint16_t qclass, uint16_t qtype,

@@ -4,7 +4,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { SqliteDb, acquireFileLock } from '../lib/db_sqlite.js';
+import { spawn, execFileSync } from 'node:child_process';
+import { SqliteDb, acquireFileLock, lockHolderPid } from '../lib/db_sqlite.js';
 import { loadSqlite } from '../../node/lib/sqlite.js';
 
 const sqlite = await loadSqlite();
@@ -25,28 +26,176 @@ function fresh() {
 const rmDir = (d) => { try { fs.rmSync(d, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); } catch (e) { if (process.platform !== "win32") throw e; } };
 const id = (raw, n) => raw.prepare('SELECT id FROM domains WHERE name = ?').get(n).id;
 
-test('one signer per database file; the lock of a dead process is taken over', () => {
+// A process of its own that takes the lock and holds it until it is killed (the lock is the kernel's, per process: the test must not be the holder
+// when it looks at the file, see lockHolderPid)
+const HOLDER = `
+import { acquireFileLock } from ${JSON.stringify(new URL('../lib/db_sqlite.js', import.meta.url).href)};
+import { loadSqlite } from ${JSON.stringify(new URL('../../node/lib/sqlite.js', import.meta.url).href)};
+const sqlite = await loadSqlite();
+try { acquireFileLock(process.env.KS_LOCK_FILE, { sqlite }); console.log('locked'); } catch (e) { console.log('refused ' + e.message); process.exit(3); }
+setInterval(() => {}, 1000);
+`;
+const startHolder = (file) => new Promise((resolve) => {
+  const child = spawn(process.execPath, ['--input-type=module', '-e', HOLDER], { env: { ...process.env, KS_LOCK_FILE: file }, stdio: ['ignore', 'pipe', 'ignore'] });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; if (out.includes('\n')) resolve({ child, line: out.trim() }); });
+  child.on('exit', () => resolve({ child, line: out.trim() }));
+});
+const killed = (child) => new Promise((resolve) => { child.once('exit', resolve); child.kill('SIGKILL'); });
+
+test('one signer per database file: the lock is the kernel\'s and goes with its holder, even after SIGKILL', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-lock-'));
   try {
     const f = path.join(dir, 'x.lock');
-    const rel = acquireFileLock(f, { pid: 100 });
-    assert.equal(fs.readFileSync(f, 'utf8'), '100\n');
-    assert.throws(() => acquireFileLock(f, { pid: 200, kill: () => true }), /another karidns-signer \(pid 100\)/);
-    assert.throws(() => acquireFileLock(f, { pid: 200, kill: () => { const e = new Error('x'); e.code = 'EPERM'; throw e; } }), /another karidns-signer/);
-    const dead = () => { const e = new Error('x'); e.code = 'ESRCH'; throw e; };
-    const rel2 = acquireFileLock(f, { pid: 200, kill: dead });                // takes over
-    assert.equal(fs.readFileSync(f, 'utf8'), '200\n');
-    rel2();
-    assert.ok(!fs.existsSync(f));
-    rel2();                                                                  // already gone
+    const a = await startHolder(f);
+    assert.equal(a.line, 'locked');
+    assert.throws(() => acquireFileLock(f, { sqlite }), new RegExp(`another karidns-signer \\(pid ${a.child.pid}\\) works on this database: .*x\\.lock is locked`));
+    const b = await startHolder(f);                                          // another process is refused as well
+    assert.match(b.line, /^refused another karidns-signer/);
+    await killed(a.child);                                                   // no clean-up by the holder: the kernel drops the lock
+    const rel = acquireFileLock(f, { sqlite, pid: 4242 });
     rel();
-    fs.writeFileSync(f, 'garbage\n');
-    const rel3 = acquireFileLock(f, { pid: 300 });                          // an unreadable pid: the file is stale
-    rel3();
-    fs.writeFileSync(f, '300\n');
-    const rel4 = acquireFileLock(f, { pid: 300 });                          // our own pid in the file: ours
-    rel4();
-    assert.throws(() => acquireFileLock(path.join(dir, 'no/such/dir/x.lock')), /cannot create the lock file/);
+    rel();                                                                   // twice is harmless
+    assert.ok(fs.existsSync(f));                                             // the file stays (never removed)
+    assert.equal(lockHolderPid(f), 4242);                                    // the pid of the last holder, for the message
+    const rel2 = acquireFileLock(f, { sqlite });                             // released: taken again
+    rel2();
+    assert.equal(lockHolderPid(path.join(dir, 'none')), 0);
+    fs.writeFileSync(path.join(dir, 'short'), 'x');
+    assert.equal(lockHolderPid(path.join(dir, 'short')), 0);
+  } finally { rmDir(dir); }
+});
+
+test('a 0.6.x lock file (a pid as text, even of a live process) does not block the start; it becomes the lock file', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-lock-'));
+  try {
+    const f = path.join(dir, 'x.lock');
+    fs.writeFileSync(f, `${process.ppid}\n`);                               // a live process that is not a signer
+    const rel = acquireFileLock(f, { sqlite, pid: 77 });
+    rel();
+    assert.equal(lockHolderPid(f), 77);
+    fs.writeFileSync(f, 'x'.repeat(5000));                                   // any other file that is not a database
+    acquireFileLock(f, { sqlite })();
+    const a = await startHolder(f);                                          // and it locks like one made new
+    assert.equal(a.line, 'locked');
+    assert.throws(() => acquireFileLock(f, { sqlite }), /another karidns-signer/);
+    await killed(a.child);
+  } finally { rmDir(dir); }
+});
+
+test('the lock file cannot be made: the message says what is needed', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-lock-'));
+  try {
+    assert.throws(() => acquireFileLock(path.join(dir, 'no/such/dir/x.lock'), { sqlite }), /cannot take the lock file .*x\.lock: .*write access to the directory/);
+    if (process.platform !== 'win32' && process.getuid?.() !== 0) {             // root writes into a read-only directory anyway
+      const ro = path.join(dir, 'ro');
+      fs.mkdirSync(ro, 0o500);
+      try {
+        assert.throws(() => acquireFileLock(path.join(ro, 'x.lock'), { sqlite }), /cannot take the lock file .*write access to the directory/);
+      } finally { fs.chmodSync(ro, 0o700); }
+      const rof = path.join(dir, 'theirs.lock');                                // a lock file left by a run as another user: not writable
+      acquireFileLock(rof, { sqlite })();
+      fs.chmodSync(rof, 0o444);
+      assert.throws(() => acquireFileLock(rof, { sqlite }), /cannot take the lock file .*theirs\.lock: .*chmod u\+w it, or remove it while no signer runs/);
+    }
+    const bad = { DatabaseSync: class { constructor() { throw Object.assign(new Error('disk I/O error'), { errcode: 10 }); } } };
+    assert.throws(() => acquireFileLock(path.join(dir, 'y.lock'), { sqlite: bad }), /cannot take the lock file .*y\.lock: disk I\/O error$/);
+    const notdb = { DatabaseSync: class { constructor() { throw Object.assign(new Error('file is not a database'), { errcode: 26 }); } } };
+    assert.throws(() => acquireFileLock(path.join(dir, 'z.lock'), { sqlite: notdb }), /cannot take the lock file .*z\.lock: file is not a database/);
+    assert.equal(fs.statSync(path.join(dir, 'z.lock')).size, 0);              // made here (exclusively), then the "0.6.x file" emptied once
+    fs.writeFileSync(path.join(dir, 'z.lock'), 'old');
+    assert.throws(() => acquireFileLock(path.join(dir, 'z.lock'), { sqlite: notdb }), /cannot take the lock file .*z\.lock: file is not a database/);
+    assert.equal(fs.statSync(path.join(dir, 'z.lock')).size, 0);
+  } finally { rmDir(dir); }
+});
+
+// The directory of the database may be writable by another account: the lock path is not trusted (0.7)
+test('the lock path: a link, a directory, a FIFO, a file of another user or a hard link is refused and left as it is', { skip: process.platform === 'win32' }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-lock-'));
+  try {
+    const p = (n) => path.join(dir, n);
+    // a symbolic link to a file that is not a database: the target is not truncated
+    fs.writeFileSync(p('plain.txt'), 'keep me\n');
+    fs.symlinkSync(p('plain.txt'), p('l1.lock'));
+    assert.throws(() => acquireFileLock(p('l1.lock'), { sqlite }), /cannot take the lock file .*l1\.lock: it is a symbolic link/);
+    assert.equal(fs.readFileSync(p('plain.txt'), 'utf8'), 'keep me\n');
+    // a dangling link: nothing is created at its target
+    fs.symlinkSync(p('made'), p('l0.lock'));
+    assert.throws(() => acquireFileLock(p('l0.lock'), { sqlite }), /it is a symbolic link/);
+    assert.equal(fs.existsSync(p('made')), false);
+    // a symbolic link to a SQLite database (the zone database, the WebAdmin's): not opened, not locked, not written
+    const other = p('other.sqlite3');
+    const o = new sqlite.DatabaseSync(other);
+    o.exec('CREATE TABLE t (x)');
+    o.close();
+    fs.symlinkSync(other, p('l2.lock'));
+    assert.throws(() => acquireFileLock(p('l2.lock'), { sqlite }), /it is a symbolic link/);
+    const holder = await startHolder(other);                                  // another process can lock it at once: we hold nothing on it
+    assert.equal(holder.line, 'refused cannot take the lock file ' + other + ': it is a database with tables, not a lock file');
+    const ro = new sqlite.DatabaseSync(other);
+    assert.equal(ro.prepare('PRAGMA user_version').get().user_version, 0);
+    ro.close();
+    // a directory, a FIFO (no hang), a hard link, a file of another user
+    fs.mkdirSync(p('d.lock'));
+    assert.throws(() => acquireFileLock(p('d.lock'), { sqlite }), /it is a directory/);
+    execFileSync('mkfifo', [p('f.lock')]);
+    assert.throws(() => acquireFileLock(p('f.lock'), { sqlite }), /it is not a regular file/);
+    assert.equal(lockHolderPid(p('f.lock')), 0);
+    assert.equal(lockHolderPid(p('l2.lock')), 0);                             // not read through a link either
+    fs.writeFileSync(p('h.lock'), '');
+    fs.linkSync(p('h.lock'), p('h2'));
+    assert.throws(() => acquireFileLock(p('h.lock'), { sqlite }), /it has 2 hard links/);
+    fs.writeFileSync(p('u.lock'), '');
+    const me = process.geteuid();
+    assert.throws(() => acquireFileLock(p('u.lock'), { sqlite, euid: me + 1 }), new RegExp(`it belongs to uid ${me}, not to the signer's user \\(uid ${me + 1}\\): chown it`));
+    assert.equal(fs.statSync(p('u.lock')).size, 0);
+    // a new lock file is made here, 0600
+    acquireFileLock(p('n.lock'), { sqlite })();
+    assert.equal(fs.statSync(p('n.lock')).mode & 0o777, 0o600);
+  } finally { rmDir(dir); }
+});
+
+test('the lock path swapped between the check and SQLite\'s open: refused, the other file is not written', { skip: process.platform === 'win32' }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-lock-'));
+  try {
+    const p = (n) => path.join(dir, n);
+    const other = p('other.sqlite3');
+    const o = new sqlite.DatabaseSync(other);
+    o.exec('CREATE TABLE t (x)');
+    o.exec('PRAGMA journal_mode = WAL');                                      // (as a shared zone database may be: a journal_mode change would rewrite it)
+    o.close();
+    const userVersion = () => {
+      const d = new sqlite.DatabaseSync(other);
+      try { return `${d.prepare('PRAGMA user_version').get().user_version}/${d.prepare('PRAGMA journal_mode').get().journal_mode}`; } finally { d.close(); }
+    };
+    // swapped for a link and left so: the second look sees it
+    const swapStay = { DatabaseSync: class { constructor(f) { fs.renameSync(f, `${f}.moved`); fs.symlinkSync(other, f); return new sqlite.DatabaseSync(f); } } };
+    assert.throws(() => acquireFileLock(p('a.lock'), { sqlite: swapStay }), /cannot take the lock file .*a\.lock: it was replaced while it was opened/);
+    assert.equal(userVersion(), '0/wal');
+    // swapped and put back before the second look: the file SQLite opened has tables, so it is not a lock file
+    const swapBack = { DatabaseSync: class { constructor(f) {
+      fs.renameSync(f, `${f}.moved`); fs.symlinkSync(other, f);
+      const d = new sqlite.DatabaseSync(f);
+      fs.unlinkSync(f); fs.renameSync(`${f}.moved`, f);
+      return d;
+    } } };
+    assert.throws(() => acquireFileLock(p('b.lock'), { sqlite: swapBack }), /cannot take the lock file .*b\.lock: it is a database with tables, not a lock file/);
+    assert.equal(userVersion(), '0/wal');
+    assert.throws(() => acquireFileLock(p('gone.lock'), { sqlite: { DatabaseSync: class { constructor(f) { fs.unlinkSync(f); return new sqlite.DatabaseSync(':memory:'); } } } }),
+      /gone\.lock: it was replaced while it was opened \(ENOENT/);
+    // a 0.6.x file swapped before it is emptied: the new file is not truncated
+    fs.writeFileSync(p('c.lock'), '123\n');
+    const notdbSwap = { DatabaseSync: class { constructor(f) {
+      fs.renameSync(f, `${f}.moved`); fs.writeFileSync(f, 'not ours\n');
+      throw Object.assign(new Error('file is not a database'), { errcode: 26 });
+    } } };
+    assert.throws(() => acquireFileLock(p('c.lock'), { sqlite: notdbSwap }), /c\.lock: it was replaced while it was opened/);
+    assert.equal(fs.readFileSync(p('c.lock'), 'utf8'), 'not ours\n');
+    const notdbGone = { DatabaseSync: class { constructor(f) { fs.unlinkSync(f); throw Object.assign(new Error('file is not a database'), { errcode: 26 }); } } };
+    fs.writeFileSync(p('e.lock'), '123\n');
+    assert.throws(() => acquireFileLock(p('e.lock'), { sqlite: notdbGone }), /e\.lock: ENOENT/);
+    fs.writeFileSync(p('plain.txt'), '');                                     // a path through a file: lstat fails with ENOTDIR
+    assert.throws(() => acquireFileLock(path.join(p('plain.txt'), 'x.lock'), { sqlite }), /cannot take the lock file .*x.lock: ENOTDIR/);
   } finally { rmDir(dir); }
 });
 
@@ -54,13 +203,6 @@ test('open: the lock file, the tables; close releases the lock', () => {
   const t = fresh();
   try {
     assert.ok(fs.existsSync(`${t.file}.signer.lock`));
-    const second = new SqliteDb({ file: t.file, sqlite });
-    fs.writeFileSync(`${t.file}.signer.lock`, `${process.ppid}\n`);        // another (live) process holds it
-    assert.throws(() => second.open(), /another karidns-signer/);
-    fs.writeFileSync(`${t.file}.signer.lock`, `${process.pid}\n`);
-    t.db.close();
-    assert.ok(!fs.existsSync(`${t.file}.signer.lock`));
-    t.db.open();
     t.db.close();
     t.db.close();
     t.db.open();
@@ -71,8 +213,16 @@ test('open: the lock file, the tables; close releases the lock', () => {
     new sqlite.DatabaseSync(file).close();
     const db = new SqliteDb({ file, sqlite });
     assert.throws(() => db.open(), /table karidns_signer_state does not exist/);
-    assert.ok(!fs.existsSync(`${file}.signer.lock`));
+    acquireFileLock(`${file}.signer.lock`, { sqlite })();                    // the failed open released it
   } finally { rmDir(dir); }
+});
+
+test('a second signer in the same process is refused too (SQLite keeps the locks of one process apart)', () => {
+  const t = fresh();
+  try {
+    const second = new SqliteDb({ file: t.file, sqlite });
+    assert.throws(() => second.open(), /another karidns-signer/);
+  } finally { t.done(); }
 });
 
 test('metadata, keys', async () => {

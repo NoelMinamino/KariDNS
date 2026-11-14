@@ -29,6 +29,7 @@
 #include "test_image_helper.h"
 #include "dns_snapshot_rcu.h"
 #include "dns_query_engine.h"
+#include "dns_siphash.h"
 #include "dns_alias.h"
 #include "dns_server_internal.h"
 #include "dns_dynamic_update.h"
@@ -980,6 +981,79 @@ static void test_parse_query_question_fast_cases(void) {
     assert(ok == false);
 
     printf("  -> parse_query_question_fast() tests passed.\n");
+}
+
+/* K-9: the CNAME/DNAME loop check's name hash (dns_query_engine.c) */
+uint64_t qn_hash64(const char *name);
+void query_engine_set_key_for_test(uint64_t k0, uint64_t k1);
+void query_engine_get_key_for_test(uint64_t *k0, uint64_t *k1);
+uint64_t rcache_tag(const char *qname_lc, uint16_t qtype, uint16_t qclass, uint64_t gen, uint64_t cfg_gen);
+
+static void test_qn_hash64_properties(void) {
+    printf("[TEST] Query Engine: keyed loop-check hash (case, trailing dot, escapes, key)...\n");
+    /* case-insensitive (ASCII), one unescaped trailing dot ignored */
+    assert(qn_hash64("A.Loop.Example.") == qn_hash64("a.loop.example"));
+    assert(qn_hash64("a.loop.example.") == qn_hash64("a.loop.example"));
+    /* only one trailing dot is dropped; dots elsewhere count */
+    assert(qn_hash64("a.loop.example..") != qn_hash64("a.loop.example."));
+    assert(qn_hash64("a.loop.example") != qn_hash64("aloop.example"));
+    /* an escaped dot is a character of the label: "a\.b." is not "a.b." and its last dot is still the root */
+    assert(qn_hash64("a\\.b.example.") != qn_hash64("a.b.example."));
+    assert(qn_hash64("a\\.b.example.") == qn_hash64("A\\.B.EXAMPLE"));
+    /* "\\." ends with an escaped backslash: the dot after it is the trailing dot */
+    assert(qn_hash64("x\\\\.") == qn_hash64("x\\\\"));
+    /* "x\." ends with an escaped dot, which is not dropped */
+    assert(qn_hash64("x\\.") != qn_hash64("x\\"));
+    assert(qn_hash64("x\\.") != qn_hash64("x"));
+    /* different names, different hashes; the root and the empty name are the same */
+    assert(qn_hash64("b.loop.example.") != qn_hash64("a.loop.example."));
+    assert(qn_hash64(".") == qn_hash64(""));
+    /* a name longer than the stack buffer is hashed in chained blocks and still told apart by its tail */
+    static char longa[3000], longb[3000];
+    memset(longa, 'a', sizeof(longa) - 1);
+    memcpy(longb, longa, sizeof(longb));
+    longb[sizeof(longb) - 2] = 'b';
+    assert(qn_hash64(longa) != qn_hash64(longb));
+    assert(qn_hash64(longa) == qn_hash64(longa));
+    /* the hash depends on the key */
+    uint64_t h1, h2, h3;
+    query_engine_set_key_for_test(1, 2);
+    h1 = qn_hash64("a.loop.example.");
+    query_engine_set_key_for_test(3, 4);
+    h2 = qn_hash64("a.loop.example.");
+    query_engine_set_key_for_test(1, 2);
+    h3 = qn_hash64("A.LOOP.EXAMPLE");
+    assert(h1 != h2 && h1 == h3);
+    /* both hashes are SipHash-2-4 under the current key: the loop check's of the normalised name, the response cache's of its tag bytes */
+    uint64_t k[2] = { 1, 2 };
+    assert(h1 == dns_siphash24((const uint8_t *)"a.loop.example", 14, k));
+    uint8_t tb[64];
+    size_t tn = 0;
+    uint64_t gen = 7, cfg_gen = 9;
+    memcpy(tb, "a.test", 6);
+    tn = 6;
+    tb[tn++] = 0; tb[tn++] = 1; tb[tn++] = 0; tb[tn++] = 1;      /* qtype A, qclass IN */
+    memcpy(tb + tn, &gen, 8);
+    tn += 8;
+    memcpy(tb + tn, &cfg_gen, 8);
+    tn += 8;
+    uint64_t t1 = rcache_tag("a.test", 1, 1, gen, cfg_gen);
+    assert(t1 == (dns_siphash24(tb, tn, k) ? dns_siphash24(tb, tn, k) : 1));
+    /* the Backend's redraw after its fork: a new key, which both hashes use from then on */
+    query_engine_key_redraw();
+    uint64_t r0, r1;
+    query_engine_get_key_for_test(&r0, &r1);
+    assert(!(r0 == 1 && r1 == 2));
+    uint64_t rk[2] = { r0, r1 };
+    assert(qn_hash64("a.loop.example.") == dns_siphash24((const uint8_t *)"a.loop.example", 14, rk) && qn_hash64("a.loop.example.") != h1);
+    uint64_t t2 = rcache_tag("a.test", 1, 1, gen, cfg_gen);
+    assert(t2 == (dns_siphash24(tb, tn, rk) ? dns_siphash24(tb, tn, rk) : 1) && t2 != t1);
+    query_engine_key_redraw();
+    uint64_t q0, q1;
+    query_engine_get_key_for_test(&q0, &q1);
+    assert(!(q0 == r0 && q1 == r1));                              /* every redraw is a new key */
+    query_engine_set_key_for_test(0x0123456789abcdefULL, 0xfedcba9876543210ULL);
+    printf("  -> keyed loop-check hash passed (and the Backend's redraw of the key).\n");
 }
 
 static void test_cname_loop_and_max_depth(void) {
@@ -11484,6 +11558,7 @@ int main(void) {
     test_resolve_name_servfail_rcode_clearing();
     test_response_section_order();
     test_parse_query_question_fast_cases();
+    test_qn_hash64_properties();
     test_cname_loop_and_max_depth();
     test_prelink_zone_additional_glue_policies();
     test_nsec3_hashing_and_intervals();

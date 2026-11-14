@@ -92,9 +92,9 @@ void logev_name_text(const char *name, char *out, size_t n);
  * 10 ms so that a report is not left waiting for the next message. */
 bool logev_admit_at(int cat, int level, int64_t now, uint32_t *report, int *report_level);
 /* 0.7 M3 (D-5): the limit of every category, of each of its two budgets, while the debug level in force is above 0 (BIND has none; a debug session at level 3 wants one line per
- * message, and the 10-50 lines a second of level 0 would hide most of them).  Why 1000: a worker's ring has 1024 records at the least (32768 by
- * default, query-log-buffer-size) and the query logger thread empties it every 1 ms while there is work and every 10 ms when idle; a debug record
- * may only take the ring up to half (qlog_event_sink(): below the 80% at which the query log stops itself), so 1000 lines a second in each of
+ * message, and the 10-50 lines a second of level 0 would hide most of them).  Why 1000: a worker's event ring has 1024 records at the least (4096 by
+ * default: query-log-buffer-size / 8, 0.7) and the query logger thread empties it every 1 ms while there is work and every 10 ms when idle; a debug record
+ * may only take the event ring up to half (qlog_event_sink(): the other half stays for info and above; the query log has a ring of its own), so 1000 lines a second in each of
  * the dozen categories a debug session can make busy is some 120 records per 10 ms, under the 512 a smallest ring leaves to debug records,
  * and some 12000 formatted lines a second for the logger thread, a small part of one core.  Records that still do not fit are dropped and
  * counted (ev_dropped, the "[QueryLog] Dropped N event log messages" warning): a worker never waits for the log. */

@@ -2472,10 +2472,6 @@ static void test_xfr_roundtrips(void) {
     zone_db_entry_t nosoa; xfr_entry_init(&nosoa, "$ORIGIN xfr.example.\n@ 60 IN NS ns\nns 60 IN A 192.0.2.1\n", dom);
     send_axfr_response(-1, dom, req, (uint16_t)rl, NULL, &nosoa, NULL, 0, &ca, sizeof(struct sockaddr_in), NULL, false);
     send_axfr_response(-1, dom, req, 14, NULL, &srv, NULL, 0, &ca, sizeof(struct sockaddr_in), NULL, false);   /* short question */
-    assert(wait_for_active_axfr(&srv, 10));
-    atomic_store_explicit(&srv.active_axfr, 1, memory_order_release);
-    assert(!wait_for_active_axfr(&srv, 20));
-    atomic_store_explicit(&srv.active_axfr, 0, memory_order_release);
     zone_arena_destroy(test_zone_slot(&empty, 0)); zone_arena_destroy(test_zone_slot(&empty, 1));
     zone_arena_destroy(test_zone_slot(&nosoa, 0)); zone_arena_destroy(test_zone_slot(&nosoa, 1));
     zone_arena_destroy(test_zone_slot(&srv, 0)); zone_arena_destroy(test_zone_slot(&srv, 1));

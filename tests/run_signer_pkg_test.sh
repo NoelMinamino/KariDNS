@@ -157,6 +157,7 @@ id nobody > /dev/null 2>&1 || { echo "SKIP: no user nobody for the rc script tes
 RCDIR=$T/rcdir
 chmod 755 "$T" "$T/root" "$T/root/usr" "$T/root/usr/local" "$T/root/usr/local/libexec" "$L" 2> /dev/null
 chown nobody "$DB" "$T"
+[ -e "$DB.signer.lock" ] && chown nobody "$DB.signer.lock"   # 0.7: the lock file stays after a run (the daemon above ran as root)
 mkdir "$RCDIR" && chown nobody "$RCDIR"
 rmdir "$WORK"
 cat > "$T/wrapper.sh" <<EOF

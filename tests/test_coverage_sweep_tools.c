@@ -264,6 +264,7 @@ static void *ctl_server(void *arg) {
             st.worker_threads = 4; st.frontend_alive = mode != 6; st.query_logging = true; st.rrl_dropped = 5;
             st.dnstap_dropped_queue_full = 7; st.dnstap_dropped_not_connected = 2; st.dnstap_reconnects = 1;   /* 0.7 */
             st.dnstap_link = mode == 6 ? KARIDNS_DNSTAP_LINK_DOWN : KARIDNS_DNSTAP_LINK_UP;
+            st.reclaim_snapshots_waiting = 2; st.reclaim_oldest_age_ms = 61500; st.reclaim_zone_versions_waiting = 3; st.reclaim_warnings = 1;   /* 0.7 R1 */
             snprintf(st.config_file, sizeof(st.config_file), "/etc/karidns.conf");
             char out[3 + sizeof(st)]; memcpy(out, "OK ", 3); memcpy(out + 3, &st, sizeof(st));
             send(c, out, mode == 7 ? 5 : sizeof(out), 0);

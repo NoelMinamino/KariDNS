@@ -3393,7 +3393,7 @@ static void hot_tick(const ing_cfg_t *c) {
   }
 }
 
-/* The cache manager (D1a step 5, design 8.2): every 100 ms it reads memory-limit (a reload changes it at once) and, with a limit, runs a round: the
+/* The cache manager (D1a step 5, design 8.2): with a limit, every 50 ms it reads memory-limit (a reload changes it at once) and runs a round: the
  * zones with the lowest frequency per byte are taken out of memory when the database zones are above the high mark.  Without a limit it only
  * looks at the configuration once a second. */
 static void *cache_thread(void *arg) {
@@ -3924,9 +3924,9 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
               (unsigned long long)cs.xfr[DBREG_XFR_WAITED], (unsigned long long)cs.xfr[DBREG_XFR_LOADED], (unsigned long long)cs.xfr[DBREG_XFR_FAILED],
               (unsigned long long)cs.xfr[DBREG_XFR_SUMMARY], (unsigned long long)cs.xfr_marked, (unsigned)atomic_load_explicit(&g_xfr_timeout_ms, memory_order_relaxed));
     if (cs.limit)
-      st_append(&c, "cache: limit=%llu resident=%llu retired=%llu previous=%llu inflight=%llu evictions=%llu rounds=%llu cold=%llu marked=%llu misses=%llu "
+      st_append(&c, "cache: limit=%llu resident=%llu retired=%llu previous=%llu inflight=%llu held=%llu long_reader=%d evictions=%llu rounds=%llu cold=%llu marked=%llu misses=%llu "
                     "shed=%llu pinned=%llu peak=%llu victim_freq=%u\n",
-                (unsigned long long)cs.limit, (unsigned long long)cs.resident, (unsigned long long)cs.retired, (unsigned long long)cs.previous, (unsigned long long)cs.inflight,
+                (unsigned long long)cs.limit, (unsigned long long)cs.resident, (unsigned long long)cs.retired, (unsigned long long)cs.previous, (unsigned long long)cs.inflight, (unsigned long long)cs.held, cs.long_reader ? 1 : 0,
                 (unsigned long long)cs.evictions, (unsigned long long)cs.rounds, (unsigned long long)cs.cold, (unsigned long long)cs.marked,
                 (unsigned long long)cs.misses, (unsigned long long)atomic_load_explicit(&g_fetch_shed, memory_order_relaxed),
                 (unsigned long long)cs.pinned_bytes, (unsigned long long)cs.peak, (unsigned)cs.victim_freq);

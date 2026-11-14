@@ -146,7 +146,7 @@ static void update_log_failure(const zone_db_entry_t *entry, const char *client_
 }
 
 /* Design note (review dns_dynamic_update.c [11]): an UPDATE builds the whole next version of the zone (thaw, apply, index, freeze) and holds the zone's
- * writer_lock for that time, and for up to 5 s while it waits for a running AXFR to finish (wait_for_active_axfr()).  That is the cost of the
+ * writer_lock for that time (an outbound transfer of the zone does not hold it up: it sends the version it pinned, R11).  That is the cost of the
  * immutable image design (readers never see a half-built zone, no lock on the query path); an incremental image update would be a change of that
  * design, not of this function.  Dynamic Update is transient in KariDNS (lost on reload), meant for small, infrequent changes. */
 int handle_dynamic_update(const uint8_t *req, size_t req_len,
@@ -160,11 +160,6 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
      * client is told to try again (the zone is read when a query needs it). */
     pthread_mutex_unlock(&entry->writer_lock);
     syslog(LOG_WARNING, "[Update] Dynamic update on zone '%s' not applied: the zone was taken out of memory meanwhile (try again).", entry->domain);
-    return 2; // SERVFAIL
-  }
-  if (!wait_for_active_axfr(entry, 5000)) {
-    pthread_mutex_unlock(&entry->writer_lock);
-    syslog(LOG_WARNING, "[Update] Dynamic update on zone '%s' rejected: active AXFR in progress.", entry->domain);
     return 2; // SERVFAIL
   }
 
