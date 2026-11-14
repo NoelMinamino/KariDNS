@@ -320,6 +320,7 @@ EL=$(perl -e "printf '%d', $T1 - $T0")
 echo "  the answer came after $EL s: $A1"
 [ "$A1" = "192.0.2.80" ] && [ "$EL" -ge 5 ] && [ "$EL" -le 55 ] && pass "the query waited for the warm-up and was answered ($EL s)" || fail "answer '$A1' after $EL s"
 dbs | grep -q '^warm-before-serve: queries accepted after [0-9]* ms' && pass "dbstatus: queries accepted after the warm-up" || fail "dbstatus: $(dbs | grep '^warm-before-serve')"
+i=0; while ! grep -q 'warm-before-serve: the hot list is read' "$T/srv.log" && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
 grep -q 'warm-before-serve: the hot list is read' "$T/srv.log" && pass "the log says the hot list was read" || fail "no 'hot list is read' line in the log"
 L=$(field warm loaded); [ "${L:-0}" = "$NZ" ] && pass "all $NZ zones were loaded when the queries were let in" || fail "loaded=$L"
 stop_srv
@@ -334,6 +335,7 @@ T1=$(now_s)
 EL=$(perl -e "printf '%.1f', $T1 - $T0")
 echo "  the answer came after $EL s: $a"
 [ "$a" = "192.0.2.80" ] && perl -e "exit(($EL >= 1.5 && $EL <= 12) ? 0 : 1)" && pass "the query was answered when the 3 s were up ($EL s)" || fail "answer '$a' after $EL s"
+i=0; while ! grep -q 'warm-before-serve: the time is up' "$T/srv.log" && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done   # (the ingest thread logs it a moment after the workers let the queries in)
 grep -q 'warm-before-serve: the time is up' "$T/srv.log" && pass "the log says the time was up" || fail "no 'time is up' line in the log"
 dbs | grep -q '^warm-before-serve: queries accepted after [0-9]* ms' && pass "dbstatus shows when the queries were let in" || fail "dbstatus: $(dbs | grep '^warm-before-serve')"
 stop_srv
