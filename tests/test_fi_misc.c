@@ -72,7 +72,7 @@ size_t resolve_ip_port_to_sockaddr(const char *ip, int port, struct sockaddr_sto
 static void test_fi_dynamic_update(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strncpy(entry.domain, "example.com.", sizeof(entry.domain) - 1);
+    entry.domain = "example.com.";
     strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);

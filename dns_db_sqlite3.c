@@ -34,8 +34,25 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sqlite3.h>
+#include <pthread.h>
 
 #include "dns_db_driver.h"
+
+#ifdef KARIDNS_UNIT_TEST
+/* the unit tests count the statements the driver parses: a fetch on a kept connection must parse none (B2, 0.7) */
+unsigned long g_sq_prepares;
+static int sq_prepare_counted(sqlite3 *db, const char *sql, int n, sqlite3_stmt **st, const char **tail) {
+    g_sq_prepares++;
+    return sqlite3_prepare_v2(db, sql, n, st, tail);
+}
+#define sqlite3_prepare_v2 sq_prepare_counted
+#endif
+
+/* The loader reads and does not look at SQLite memory statistics (sqlite3_memory_used() and friends are not called anywhere).  With them on, every
+ * allocation of the library takes one global mutex, which was 15 % of the CPU of a fetch worker (dtrace, 4 loader threads); it can only be
+ * turned off before the library is initialised, so the first open does it (SQLITE_MISUSE afterwards: ignored, the setting is an optimisation). */
+static pthread_once_t g_sq_once = PTHREAD_ONCE_INIT;
+static void sq_global_init(void) { (void)sqlite3_config(SQLITE_CONFIG_MEMSTATUS, 0); }
 
 struct db_conn {
     sqlite3 *db;
@@ -44,6 +61,7 @@ struct db_conn {
     ino_t ino;
     bool have_id;
     sqlite3_stmt *st_pv;
+    sqlite3_stmt *st_begin, *st_snap, *st_commit;       /* B2 (0.7): BEGIN, the first read of a snapshot, COMMIT: prepared once per connection, not parsed for every fetch */
     char err[DB_ERRLEN];
     bool in_snapshot;
     bool has_changes;
@@ -106,6 +124,16 @@ static int prep(db_conn_t *c, sqlite3_stmt **st, const char *sql) {
     return 0;
 }
 
+/* a statement without rows (BEGIN, COMMIT), prepared on first use and run again for every snapshot; errors as exec() reports them */
+static int step_once(db_conn_t *c, sqlite3_stmt **st, const char *sql) {
+    int ret = prep(c, st, sql);
+    if (ret != 0) return ret;
+    int rc = sqlite3_step(*st);
+    ret = rc == SQLITE_DONE || rc == SQLITE_ROW ? 0 : sql_fail(c, rc, sql);
+    sqlite3_reset(*st);
+    return ret;
+}
+
 static void rearm(sqlite3_stmt *st) {
     sqlite3_reset(st);
     sqlite3_clear_bindings(st);
@@ -151,6 +179,7 @@ static int64_t col_int(db_conn_t *c, sqlite3_stmt *st, int i, const char *table,
 static int sq_open_mode(db_conn_t **out, const db_source_t *src, char *err, size_t errlen, bool write) {
     *out = NULL;
     const char *path = src ? src->database_file : NULL;
+    pthread_once(&g_sq_once, sq_global_init);
     if (!path || !*path) {
         snprintf(err, errlen, "sqlite3: no database file given");
         return -1;
@@ -260,6 +289,9 @@ static void sq_close(db_conn_t *c) {
     if (c->in_wtxn) sqlite3_exec(c->db, "ROLLBACK", NULL, NULL, NULL);       /* an importer that gives up: nothing is committed */
     for (size_t i = 0; i < sizeof(c->st_w) / sizeof(c->st_w[0]); i++) sqlite3_finalize(c->st_w[i]);
     sqlite3_finalize(c->st_pv);
+    sqlite3_finalize(c->st_begin);
+    sqlite3_finalize(c->st_snap);
+    sqlite3_finalize(c->st_commit);
     free(c->path);
     sqlite3_finalize(c->st_apex_all);
     sqlite3_finalize(c->st_apex_one);
@@ -533,19 +565,17 @@ static int sq_begin_snapshot(db_conn_t *c) {
         set_err(c, "begin_snapshot: a snapshot is already open");
         return -1;
     }
-    int rc = exec(c, "BEGIN");
+    int rc = step_once(c, &c->st_begin, "BEGIN");
     if (rc != 0) return rc;
     c->in_snapshot = true;
     /* BEGIN is deferred: the WAL read transaction (the snapshot) starts with the first statement that reads */
-    sqlite3_stmt *st = NULL;
-    int sr = sqlite3_prepare_v2(c->db, "SELECT 1 FROM sqlite_master LIMIT 1", -1, &st, NULL);
-    if (sr == SQLITE_OK) {
-        sr = sqlite3_step(st);
-        if (sr == SQLITE_ROW || sr == SQLITE_DONE) sr = SQLITE_OK;
+    rc = prep(c, &c->st_snap, "SELECT 1 FROM sqlite_master LIMIT 1");
+    if (rc == 0) {
+        int sr = sqlite3_step(c->st_snap);
+        if (sr != SQLITE_ROW && sr != SQLITE_DONE) rc = sql_fail(c, sr, "begin snapshot");
+        sqlite3_reset(c->st_snap);
     }
-    sqlite3_finalize(st);
-    if (sr != SQLITE_OK) {
-        rc = sql_fail(c, sr, "begin snapshot");
+    if (rc != 0) {
         sqlite3_exec(c->db, "ROLLBACK", NULL, NULL, NULL);
         c->in_snapshot = false;
         return rc;
@@ -570,7 +600,7 @@ static int sq_end_snapshot(db_conn_t *c) {
     if (!c->in_snapshot) return 0;
     rearm_all(c);
     c->in_snapshot = false;
-    int rc = exec(c, "COMMIT");
+    int rc = step_once(c, &c->st_commit, "COMMIT");
     if (rc != 0) sqlite3_exec(c->db, "ROLLBACK", NULL, NULL, NULL);    /* (a failed COMMIT may leave the transaction open: the snapshot must not live on) */
     return rc;
 }

@@ -2303,6 +2303,42 @@ static int64_t park_now_ms(void) {
   return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+/* B2 W5: the worker's admission gate for a request for a zone that is out of memory (dns_park.h, "the admission gate").  Under a flood of queries for zones that are
+ * out of memory the ingest thread cannot be the one that says no: each "no" cost it a request, a state check and a wake-up of every worker.  So the worker takes a place
+ * of the fetch table (fetch-concurrency) and a token of fetch-rate itself, before it parks and asks.
+ * (the three results are in dns_park.h)
+ *   FETCH_GATE_ASK      no claim: ask the old way (no memory-limit, so no fetch-concurrency; or the zone is not ABSENT: LOADING means a fetch is on its way, and the query
+ *                       parks for it and asks anyway: the request is a duplicate that the ingest thread drops, and a request that finds the zone resident by then wakes
+ *                       the query, so a wake-up cannot be lost; ERROR and RESIDENT are answered by the ingest thread; or another worker has claimed the zone and its request
+ *                       is queued (park_claim_held()): the same, and while that claim is marked the ingest thread drops this request too, so the claimed fetch wakes
+ *                       this query when it is done, and when it is shed or refused the ingest thread wakes every worker, not only the one that claimed)
+ *   FETCH_GATE_TAKEN    a place and a token are held and the zone is marked as claimed: ask with PARK_PRIO_CLAIMED; whoever does not use the request gives them back
+ *                       (park_claim_release(), which clears the mark)
+ *   FETCH_GATE_REFUSE   the database zones are over the hard limit, or every place is taken (counted in `shed`), or the bucket is empty (`refused_by_rate`): "not ready" now */
+STATIC_TEST int fetch_gate(int widx, const char *view, const zdir_elem_t *pel, int64_t now_ms) {
+  if (!dbreg_cache_limit() || atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) != ZDIR_ST_ABSENT) return FETCH_GATE_ASK;
+  /* (B2 M1) The zone is LOADING only when the ingest thread has popped the request, so workers that look meanwhile all see it ABSENT.  The first takes the place and the token
+   * and marks the zone; the others find the mark and park and ask without a claim (a duplicate was never shed before the gate: it parked for the completion).  No lock: the
+   * mark is one compare-and-swap (park_claim_mark(), the claims in dns_park.c). */
+  uint64_t key = park_claim_key(view, pel->name);
+  if (park_claim_held(key)) return FETCH_GATE_ASK;
+  if (dbreg_cache_over_limit() || !park_place_take()) {
+    park_gate_count(widx, false);
+    return FETCH_GATE_REFUSE;
+  }
+  if (!park_rate_take(now_ms, false)) {
+    park_place_give();
+    park_gate_count(widx, true);
+    return FETCH_GATE_REFUSE;
+  }
+  if (!park_claim_mark(key)) {                           /* another worker marked it between the look above and now: its claim stands, this one goes back */
+    park_place_give();
+    park_rate_give();
+    return FETCH_GATE_ASK;
+  }
+  return FETCH_GATE_TAKEN;
+}
+
 /* Park the UDP request for the zone of `pel`.  true: parked (the caller answers nothing now). false: not parked (no park table, the time is
  * up, the table is full, the request too big): the caller answers "not ready". */
 static bool udp_park(udp_pass_t *w, const view_snapshot_t *view, const zdir_elem_t *pel, const udp_ipc_t *ipc, const uint8_t *req, size_t len) {
@@ -2315,9 +2351,18 @@ static bool udp_park(udp_pass_t *w, const view_snapshot_t *view, const zdir_elem
   /* a zone that the view shares by in-view from the database of another view (D1a phase 2) is asked for, and woken, in the name of the view that holds it */
   const char *hv = zdir_holder_view(view, pel);
   bool ask = (!w->woken || atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) == ZDIR_ST_ABSENT) && !park_has_wait(w->park, hv, pel->name);
+  int gate = ask ? fetch_gate(w->worker_idx, hv, pel, now) : FETCH_GATE_ASK;
+  if (gate == FETCH_GATE_REFUSE) {
+    if (!w->woken) dbreg_cache_note_miss();            /* (it is a miss as well: the cache manager counts the queries that wanted a zone that is out of memory) */
+    return false;
+  }
   int32_t pi = park_udp(w->park, now, (uint32_t)left, hv, pel->name, w->active_fd, ipc, req, len);
-  if (pi < 0) return false;
-  if (ask && !park_fetch_request(w->worker_idx, hv, pel->name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL)) {
+  if (pi < 0) {
+    if (gate == FETCH_GATE_TAKEN) park_claim_release(hv, pel->name);
+    return false;
+  }
+  if (ask && !park_fetch_request(w->worker_idx, hv, pel->name, (uint8_t)(KDB_FETCH_PRIO_QUERY | (gate == FETCH_GATE_TAKEN ? PARK_PRIO_CLAIMED : 0)), KDB_FETCH_FULL)) {
+    if (gate == FETCH_GATE_TAKEN) park_claim_release(hv, pel->name);
     park_release(w->park, &w->park->e[pi]);            /* the request could not be handed over (ring full): nobody would ever wake it */
     return false;
   }
@@ -3429,8 +3474,16 @@ process_tcp_client: ;
                 bool ask = (ctx_tcp->park_deadline_ms == 0 || atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) == ZDIR_ST_ABSENT) &&
                            !park_has_wait(&park, hv, pel->name);       /* (as in udp_park(): a request that comes back and finds the zone out of memory again asks again) */
                 uint32_t cidx = (uint32_t)(ctx_tcp - g_tcp_pool);
-                int32_t pi = park_tcp(&park, pnow, (uint32_t)left, hv, pel->name, client_fd, cidx, ctx_tcp->gen);
-                if (pi >= 0 && ask && !park_fetch_request(ctx->thread_id, hv, pel->name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL)) {
+                int gate = ask ? fetch_gate(ctx->thread_id, hv, pel, pnow) : FETCH_GATE_ASK;       /* (B2 W5, as in udp_park()) */
+                int32_t pi = -1;
+                if (gate == FETCH_GATE_REFUSE) {
+                  if (ctx_tcp->park_deadline_ms == 0) dbreg_cache_note_miss();
+                } else {
+                  pi = park_tcp(&park, pnow, (uint32_t)left, hv, pel->name, client_fd, cidx, ctx_tcp->gen);
+                  if (pi < 0 && gate == FETCH_GATE_TAKEN) park_claim_release(hv, pel->name);
+                }
+                if (pi >= 0 && ask && !park_fetch_request(ctx->thread_id, hv, pel->name, (uint8_t)(KDB_FETCH_PRIO_QUERY | (gate == FETCH_GATE_TAKEN ? PARK_PRIO_CLAIMED : 0)), KDB_FETCH_FULL)) {
+                  if (gate == FETCH_GATE_TAKEN) park_claim_release(hv, pel->name);
                   park_release(&park, &park.e[pi]);          /* the request could not be handed over (ring full): nobody would wake it */
                   pi = -1;
                 }

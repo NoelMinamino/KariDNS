@@ -124,7 +124,7 @@ static void test_catalog_process_membership_rfc9432(void) {
 
     zone_db_entry_t cat_entry;
     memset(&cat_entry, 0, sizeof(cat_entry));
-    strncpy(cat_entry.domain, "catalog.example", sizeof(cat_entry.domain) - 1);
+    cat_entry.domain = "catalog.example";
 
     zone_config_t cat_cfg;
     memset(&cat_cfg, 0, sizeof(cat_cfg));
@@ -314,11 +314,11 @@ static void test_find_catalog_parent_and_valid_properties(void) {
 
     zone_db_entry_t cat_parent;
     memset(&cat_parent, 0, sizeof(cat_parent));
-    strlcpy(cat_parent.domain, "catalog.example.", sizeof(cat_parent.domain));
+    cat_parent.domain = "catalog.example.";
 
     zone_db_entry_t other_z;
     memset(&other_z, 0, sizeof(other_z));
-    strlcpy(other_z.domain, "other.example.", sizeof(other_z.domain));
+    other_z.domain = "other.example.";
 
     zone_db_entry_t *entries[2] = {&cat_parent, &other_z};
     view_snapshot_t view;

@@ -477,6 +477,7 @@ typedef struct zone_config {
   char *type;
   bool is_catalog;
   bool ext_shared; /* ext points to the zone_ext_t at the start of a zone_ext_shared_t (reference counted, DB zones) */
+  uint32_t alloc_bytes; /* 0.7 B2: what the allocator holds for this block and its two strings, when db_zone_config_new_kind() made it (0: any other; zone_entry_fixed_now() adds it).  In the padding: sizeof stays 48 */
   zone_ext_t *ext; /* NULL = 全オプション既定。直接読まず zext() を使う */
   struct zone_config *next;
 } zone_config_t;

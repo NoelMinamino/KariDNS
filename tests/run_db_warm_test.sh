@@ -186,8 +186,14 @@ EV=$(field cache evictions)
 # D1a step 7 review: a zone the warm-up read starts with the frequency of its rank in the list (not 0), so that it is not the first the cache manager takes out
 # when queries bring other zones in.  The zones after the first K are asked for twice each now (their frequency is 2, below every rank): the zones that leave
 # memory are the lowest ranks and these new ones, not the top of the list (with frequency 0 for all of them a top zone goes too).
-n=$((K + 1))
-while [ $n -le $NZ ]; do q "www.$(zn $n).test" > /dev/null; q "www.$(zn $n).test" > /dev/null; n=$((n + 1)); done
+n=$((K + 1)); ok=1; ODD=0
+# (the first query of each is asked again while the server says "not ready": above 110% of memory-limit a fetch is refused until the cache manager has taken zones out,
+# and with the zones as big as the allocator makes them that can be the third zone read in a row; see kari_ask_retry)
+while [ $n -le $NZ ]; do
+    kari_ask_retry ./dag "$PORT" "www.$(zn $n).test" 192.0.2.80 || ok=0
+    ODD=$((ODD + KARI_ASK_ODD)); q "www.$(zn $n).test" > /dev/null; n=$((n + 1))
+done
+[ "$ok" = 1 ] && [ "$ODD" = 0 ] && pass "the zones that are out of memory are read on a query and answered (a refusal is SERVFAIL with EDE 14, and the query is asked again)" || fail "a zone that was out of memory got no answer (answered: $ok, other failures: $ODD)"
 waitfor 10 sh -c "[ \"\$(./karictl -c $T/karictl.conf dbstatus 2>/dev/null | grep '^cache:' | head -1 | sed -n 's/.* evictions=\([0-9]*\).*/\1/p')\" -ge 1 ]" && pass "the zones that queries brought in pushed memory over the limit: the manager took zones out ($(field cache evictions) evictions)" || fail "no eviction after queries for the other zones"
 sleep 2
 R=$(resident_zones)

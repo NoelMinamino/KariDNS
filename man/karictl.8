@@ -80,14 +80,16 @@ as it is used, with the overhead of each block: a difference of one SOA counts
 about 1.8 KB; 0.7), for the zones that come from the database and for the
 others, as \fBresident\fR (what the zones serve now) and \fBretired\fR (versions
 that a newer one replaced and that are not freed yet, because a reader or a
-transfer may still hold them). It is not the whole memory of a zone: the zone
-entry itself, its per-zone counters and the response cache are not in it. An
-IXFR delta that left the history stays counted as resident until the last
-transfer that reads it has released it. A database zone that \fBmemory\-limit\fR
-takes out of memory gives up its IXFR deltas at once (they are not served while
-the zone is out of memory, and the zone comes back without them), so evicting
-and fetching a zone again does not add to the resident bytes. Read only: nothing
-limits them yet
+transfer may still hold them). Since 0.7 the bytes of the zone entry itself (the
+entry, the lock it makes, a database zone's settings block, about 0.85 KB) are
+in it, counted with the zone's first version, and the images and glue blocks are
+counted at the size the allocator really holds. The directory, the response
+cache and the park tables are not in it. An IXFR delta that left the history
+stays counted as resident until the last transfer that reads it has released
+it. A database zone that \fBmemory\-limit\fR takes out of memory gives up its
+IXFR deltas at once (they are not served while the zone is out of memory, and
+the zone comes back without them), so evicting and fetching a zone again does
+not add to the resident bytes. Read only: nothing limits them yet
 .IP \(bu 2
 The bytes the zones keep for \fBrollback\fR (the previous versions, see
 \fBrollback\fR): \fBzone versions kept for rollback: database zones N bytes,
@@ -500,18 +502,20 @@ size of the zone versions and IXFR deltas (the same numbers as in \fBstatus\fR),
 the fetches of whole zones from the database (\fBfetch: rate=N/s
 refused_by_rate=N issued=N\fR; \fBissued\fR counts the zones the Backend asked
 the loader for: a query, a transfer, the warm-up), then \fBfetchq: in_flight=N
-peak=N table_full=N ring_dropped=N park_full=N park_timeout=N loader_busy=N
-ingest_busy=P% hist=A,B,C,D,E\fR (0.7: where a fetch is held up; all counted
-since the start except \fBin_flight\fR and \fBingest_busy\fR: \fBin_flight\fR
-and \fBpeak\fR are the fetches on their way now and the most there have been at
-one time; \fBtable_full\fR, requests refused because the 256 places of the fetch
-table were all taken; \fBring_dropped\fR, requests the workers could not hand to
-the ingest thread because their ring of 128 was full; \fBpark_full\fR, queries
-that found the table of parked queries full (\fBpark\-max\fR);
-\fBpark_timeout\fR, parked queries whose zone was not there before
-\fBpark\-timeout\fR; \fBloader_busy\fR, fetches the loader turned away because
-its queue was full; \fBingest_busy\fR, the share of the last ten seconds the
-ingest thread was working instead of waiting, 0 for the first ten seconds;
+places=N peak=N table_full=N ring_dropped=N park_full=N park_timeout=N
+loader_busy=N ingest_busy=P% hist=A,B,C,D,E\fR (0.7: where a fetch is held up;
+all counted since the start except \fBin_flight\fR and \fBingest_busy\fR:
+\fBin_flight\fR and \fBpeak\fR are the fetches on their way now and the most
+there have been at one time; \fBplaces\fR, the places of
+\fBfetch\-concurrency\fR in use now (whole-zone fetches queued for the ingest
+thread or in flight: 0 at rest); \fBtable_full\fR, requests refused because the
+256 places of the fetch table were all taken; \fBring_dropped\fR, requests the
+workers could not hand to the ingest thread because their ring of 128 was full;
+\fBpark_full\fR, queries that found the table of parked queries full
+(\fBpark\-max\fR); \fBpark_timeout\fR, parked queries whose zone was not there
+before \fBpark\-timeout\fR; \fBloader_busy\fR, fetches the loader turned away
+because its queue was full; \fBingest_busy\fR, the share of the last ten seconds
+the ingest thread was working instead of waiting, 0 for the first ten seconds;
 \fBhist\fR, the time from the request to the install of the fetches that
 succeeded: up to 1 ms, up to 10 ms, up to 100 ms, up to 1 s, more; see
 "\fBkarictl dbstatus\fR shows it" under "Memory limit (D1a)" in

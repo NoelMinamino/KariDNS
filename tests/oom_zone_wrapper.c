@@ -17,7 +17,7 @@ void *calloc(size_t nmemb, size_t size) {
     }
 
     size_t total = nmemb * size;
-    if (total == sizeof(zone_db_entry_t)) {
+    if (total == sizeof(zone_db_entry_t) + sizeof("zone1.example.com.")) {     /* (create_new_zone_entry(): the entry and its name, the three zones of run_zone_oom_partial_load_test.sh are all this long) */
         static int zone_calloc_count = 0;
         char *env_n = getenv("OOM_FAIL_NTH_ZONE_CALLOC");
         if (env_n) {

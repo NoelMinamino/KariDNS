@@ -115,6 +115,29 @@ kari_wait_answer() {
     return 1
 }
 
+# kari_ask_retry DAG PORT NAME EXPECT [TRIES]: ask 127.0.0.1:PORT for NAME (A) until the answer contains EXPECT, at most TRIES times (default 25), 0.2 s apart.
+# A query for a database zone that is out of memory is refused at once (SERVFAIL with EDE 14, Not Ready) while the zones in memory are above 110% of memory-limit:
+# the cache manager takes zones out every 50 ms (not the ones that came in less than 100 ms ago), and the client asks again, as a resolver does.  How many zones
+# the limit holds depends on the allocator's size classes (0.7 counts the blocks the allocator holds), so a test that asks for zones that are out of memory
+# one after the other must not count on every one of them being read at the first try.  KARI_ASK_REFUSED is how many of the tries were such refusals, KARI_ASK_ODD
+# how many were something else (a time-out, another rcode): a refusal is the server's answer, anything else is a defect.
+kari_ask_retry() {
+    KARI_ASK_REFUSED=0
+    KARI_ASK_ODD=0
+    _ka_i=0
+    while [ "$_ka_i" -lt "${5:-25}" ]; do
+        _ka_out=$("$1" @127.0.0.1 -p "$2" "$3" A +nohexdump +time=5 +tries=1 2>/dev/null)
+        case "$_ka_out" in
+            *"$4"*) return 0 ;;
+            *"status: SERVFAIL"*"EDE: 14"*) KARI_ASK_REFUSED=$((KARI_ASK_REFUSED + 1)) ;;
+            *) KARI_ASK_ODD=$((KARI_ASK_ODD + 1)) ;;
+        esac
+        sleep 0.2
+        _ka_i=$((_ka_i + 1))
+    done
+    return 1
+}
+
 # kari_make TARGET... : make as the user who ran sudo.  A test run as root (sudo sh tests/run_all_suite.sh) that runs a plain make leaves
 # root-owned objects and binaries in the tree, which the next build as the normal user cannot replace.  Without sudo it is a plain make.
 kari_make() {

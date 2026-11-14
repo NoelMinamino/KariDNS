@@ -366,7 +366,7 @@ static void test_wire_cache_consistency(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain));
+    db_entry.domain = "example.com.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -997,7 +997,7 @@ static void test_wire_cache_max_records_limit(void) {
         // Case E: Query resolution still works when cache is disabled (fallback to full path)
         zone_db_entry_t db_entry;
         memset(&db_entry, 0, sizeof(db_entry));
-        strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain));
+        db_entry.domain = "example.com.";
         atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
         zone_db_entry_t *entries[1] = { &db_entry };
@@ -1073,8 +1073,8 @@ static void test_rcache_cross_zone_cname_not_cached(void) {
     zone_db_entry_t ea, eb;
     memset(&ea, 0, sizeof(ea));
     memset(&eb, 0, sizeof(eb));
-    strncpy(ea.domain, "a.example.", sizeof(ea.domain) - 1);
-    strncpy(eb.domain, "b.example.", sizeof(eb.domain) - 1);
+    ea.domain = "a.example.";
+    eb.domain = "b.example.";
     atomic_store_explicit(&ea.rcu.active, &arena_a.ver, memory_order_release);
     atomic_store_explicit(&eb.rcu.active, &arena_b.ver, memory_order_release);
     zone_db_entry_t *entries[2] = { &ea, &eb };
@@ -1143,7 +1143,7 @@ static void test_rcache_cut_additional_not_cached(void) {
 
     zone_db_entry_t e;
     memset(&e, 0, sizeof(e));
-    strncpy(e.domain, "mx.example.", sizeof(e.domain) - 1);
+    e.domain = "mx.example.";
     atomic_store_explicit(&e.rcu.active, &arena.ver, memory_order_release);
     zone_db_entry_t *entries[1] = { &e };
     char *any_acl[1] = { (char *)"any" };
@@ -1204,7 +1204,7 @@ static void test_rcache_wildcard_mark_kept(void) {
     assert(arena.rcache_ok);
     zone_db_entry_t e;
     memset(&e, 0, sizeof(e));
-    strncpy(e.domain, "wc.example.", sizeof(e.domain) - 1);
+    e.domain = "wc.example.";
     atomic_store_explicit(&e.rcu.active, &arena.ver, memory_order_release);
     zone_db_entry_t *entries[1] = { &e };
     char *any_acl[1] = { (char *)"any" };
@@ -1268,7 +1268,7 @@ static void world_load(glue_world_t *w, int i, char *text, const char *origin) {
 
 static void world_publish(glue_world_t *w, int i, const char *origin) {
     memset(&w->ent[i], 0, sizeof(w->ent[i]));
-    strncpy(w->ent[i].domain, origin, sizeof(w->ent[i].domain) - 1);
+    w->ent[i].domain = origin;
     atomic_store_explicit(&w->ent[i].rcu.active, &w->arena[i].ver, memory_order_release);
     w->entries[i] = &w->ent[i];
 }
@@ -1598,7 +1598,7 @@ static void test_wire_cache_observatory_counters(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain));
+    db_entry.domain = "example.com.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -1824,8 +1824,8 @@ static void test_acl_before_response_cache(void) {
     zone_db_entry_t ea, eb;
     memset(&ea, 0, sizeof(ea));
     memset(&eb, 0, sizeof(eb));
-    strncpy(ea.domain, "a.example.", sizeof(ea.domain) - 1);
-    strncpy(eb.domain, "b.example.", sizeof(eb.domain) - 1);
+    ea.domain = "a.example.";
+    eb.domain = "b.example.";
     atomic_store_explicit(&ea.rcu.active, &arena_a.ver, memory_order_release);
     atomic_store_explicit(&eb.rcu.active, &arena_b.ver, memory_order_release);
     zone_db_entry_t *entries[2] = { &ea, &eb };

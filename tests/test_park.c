@@ -6,6 +6,11 @@
  * their fetch requests.  Under ThreadSanitizer (make test_park-tsan) it shows that the rings hand data over correctly, under
  * AddressSanitizer (make test_park-asan) that nothing is touched out of bounds.  Every parked query ends exactly once: answered after
  * a wake, answered after its timeout, or cancelled.
+ *
+ * B2 W5 (the admission gate of the workers): the pool of places (take / give, a lower limit, a place given back twice, eight threads against a limit of five), the
+ * fetch-rate bucket (fill, burst, the half rule, a token given back, the wrap of the clock, eight threads for exactly the burst), the claim bit on a request, the wake of
+ * one worker and one trigger per worker (park_wake_queue_one / _all / _flush), and the sleep protocol of the ingest thread (a trigger only while it may be asleep; producers
+ * against a consumer that sleeps: no request is left in a ring with the thread asleep).
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -18,6 +23,11 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
+#ifdef __FreeBSD__
+#include <sys/types.h>
+#include <sys/event.h>
+#include <sys/time.h>
+#endif
 
 #include "../dns_park.h"
 #include "../dns_db_stream.h"      /* KDB_FETCH_* (the values the rings carry) */
@@ -484,6 +494,431 @@ static void test_stats(void) {
   park_free(&t2);
 }
 
+
+/* ------------------------------------------------------------------ B2 W5: the admission gate */
+/* places: a lock-free pool bounded by the limit; a lower limit takes effect as places come back; a place given back twice makes no room */
+static void test_places(void) {
+  printf("[admission gate: places]\n");
+  park_places_set_limit(3);
+  CHECK(park_places_used() == 0);
+  CHECK(park_place_take() && park_place_take() && park_place_take());
+  CHECK(!park_place_take() && park_places_used() == 3);
+  park_place_give();
+  CHECK(park_places_used() == 2 && park_place_take() && !park_place_take());
+  park_places_set_limit(1);                                  /* lowered below what is in use: nothing is taken away, nothing new is given */
+  CHECK(!park_place_take() && park_places_used() == 3);
+  park_place_give();
+  park_place_give();
+  CHECK(!park_place_take() && park_places_used() == 1);      /* (as many as the limit) */
+  park_place_give();
+  CHECK(park_place_take() && !park_place_take());
+  park_places_set_limit(4);                                  /* raised: room at once */
+  CHECK(park_place_take() && park_place_take() && park_place_take() && !park_place_take() && park_places_used() == 4);
+  for (int i = 0; i < 4; i++) park_place_give();
+  park_place_give();                                         /* given back twice: no credit */
+  park_place_give();
+  CHECK(park_places_used() == 0);
+  park_places_set_limit(2);
+  CHECK(park_place_take() && park_place_take() && !park_place_take());
+  park_place_give();
+  park_place_give();
+  park_places_set_limit(0);                                  /* (fetch-concurrency is at least 2 in the server; 0 here means no place at all) */
+  CHECK(!park_place_take());
+  park_places_set_limit(1u << 31);                           /* (a limit that does not fit is capped, not negative) */
+  CHECK(park_place_take());
+  park_place_give();
+  park_places_set_limit(INT32_MAX);
+  CHECK(park_places_used() == 0);
+}
+
+/* the bucket: the fill by time, the burst, the half-full rule for the background work, a token given back, the wrap of the 32-bit clock, a clock that is a little behind */
+static void test_rate(void) {
+  printf("[admission gate: the fetch-rate bucket]\n");
+  park_rate_set(0);
+  CHECK(park_rate_take(5000, false) && park_rate_take(5000, true) && park_rate_check(5000, true) && park_rate_level(5000) == 0);   /* (no rate: no limit) */
+  park_rate_set(10);
+  park_rate_reset();
+  const int64_t t = 1000000;
+  CHECK(park_rate_level(t) == 10000);                                    /* a new bucket is full: one second of the rate */
+  for (int i = 0; i < 10; i++) CHECK(park_rate_take(t, false));
+  CHECK(!park_rate_take(t, false) && park_rate_level(t) == 0);
+  CHECK(!park_rate_take(t + 99, false) && park_rate_level(t + 99) == 990);   /* (a refusal writes nothing: the time still counts from t) */
+  CHECK(park_rate_take(t + 100, false) && !park_rate_take(t + 100, false));  /* 10 per second: one token per 100 ms */
+  CHECK(park_rate_level(t + 100 + 5000) == 10000);                       /* the burst is one second of the rate, however long it was idle */
+  /* a token that was not used goes back (a read that was not made), up to the burst */
+  park_rate_reset();
+  CHECK(park_rate_take(t, false) && park_rate_level(t) == 9000);
+  park_rate_give();
+  CHECK(park_rate_level(t) == 10000);
+  park_rate_give();
+  park_rate_give();
+  CHECK(park_rate_level(t) == 10000);
+  /* half: the queries come first.  At least half full (and a whole token) for the warm-up, the summaries, the background requests */
+  park_rate_set(100);
+  park_rate_reset();
+  for (int i = 0; i < 51; i++) CHECK(park_rate_take(t, false));          /* 49 tokens left of 100 */
+  CHECK(!park_rate_check(t, true) && !park_rate_take(t, true));
+  CHECK(park_rate_check(t, false) && park_rate_take(t, false));
+  park_rate_give();
+  park_rate_give();                                                      /* 50: half */
+  CHECK(park_rate_check(t, true) && park_rate_take(t, true));
+  park_rate_set(1);                                                      /* a rate of 1: half a token is not enough, one is: the rule is "a whole token" */
+  park_rate_reset();
+  CHECK(park_rate_take(t, true) && !park_rate_take(t, true) && !park_rate_take(t, false));
+  /* the rate drops: the bucket cannot hold more than the new burst */
+  park_rate_set(100);
+  park_rate_reset();
+  CHECK(park_rate_take(t, false));
+  park_rate_set(10);
+  CHECK(park_rate_level(t) == 10000);
+  /* the low 32 bits of the clock wrap (after 49 days of uptime); a clock read a few ms before another thread's time is not a huge jump */
+  park_rate_set(1000);
+  park_rate_reset();
+  const int64_t w0 = 0xFFFFFF00LL;
+  for (int i = 0; i < 1000; i++) CHECK(park_rate_take(w0, false));
+  CHECK(!park_rate_take(w0, false));
+  CHECK(!park_rate_take(w0 - 5, false) && park_rate_level(w0 - 5) == 0);   /* (5 ms behind the stamp: nothing has passed) */
+  const int64_t w1 = 0x100000000LL + 0x40;                               /* 0x140 = 320 ms later, across the wrap */
+  CHECK(park_rate_level(w1) == 320000);
+  for (int i = 0; i < 320; i++) CHECK(park_rate_take(w1, false));
+  CHECK(!park_rate_take(w1, false));
+  /* (B2 L1) a caller whose clock is seconds behind the stamp (it read the clock, lost the CPU, and another thread wrote a later time): nothing has passed for it.  The bucket
+   * does not refill (it did when the lag was over 256 ms: the difference wrapped to about 2^32 ms) and the stamp does not move back */
+  park_rate_set(10);
+  park_rate_reset();
+  for (int i = 0; i < 5; i++) CHECK(park_rate_take(t, false));           /* 5 left of 10, stamp t */
+  CHECK(park_rate_level(t - 1500) == 5000 && park_rate_level(t - 2000) == 5000 && park_rate_level(t - 600000) == 5000);
+  CHECK(park_rate_check(t - 1500, false) && park_rate_take(t - 1500, false) && park_rate_level(t) == 4000);      /* (a take from the past: 4, not 9) */
+  CHECK(park_rate_level(t + 100) == 5000);                               /* (the stamp is still t: 100 ms at 10 a second is one token) */
+  for (int i = 0; i < 4; i++) CHECK(park_rate_take(t, false));
+  CHECK(!park_rate_take(t - 2000, false) && !park_rate_take(t, false));  /* (empty: the past does not fill it) */
+  /* a stamp that is old, not ahead: idle for 25 days (the 32 bits of the clock have gone round past the half), the bucket is full again */
+  CHECK(park_rate_level(t + 0x80000005LL) == 10000 && park_rate_take(t + 0x80000005LL, false));
+  park_rate_set(0);
+  park_rate_reset();
+}
+
+#define GTH 8
+static _Atomic uint64_t g_gt_ok;
+static void *rate_taker(void *arg) {
+  (void)arg;
+  for (int i = 0; i < 400; i++)
+    if (park_rate_take(2000000, false)) atomic_fetch_add(&g_gt_ok, 1);
+  return NULL;
+}
+
+static _Atomic int g_held, g_held_max, g_held_bad;
+static _Atomic uint64_t g_pl_ok, g_pl_no;
+#define PL_LIMIT 5
+static void *place_user(void *arg) {
+  (void)arg;
+  for (int i = 0; i < 40000; i++) {
+    if (park_place_take()) {
+      int c = atomic_fetch_add(&g_held, 1) + 1;                          /* (the holders that this thread knows of: it must never be more than the limit) */
+      if (c > PL_LIMIT) atomic_fetch_add(&g_held_bad, 1);
+      int m = atomic_load(&g_held_max);
+      while (c > m && !atomic_compare_exchange_weak(&g_held_max, &m, c)) {}
+      atomic_fetch_add(&g_pl_ok, 1);
+      if (i % 64 == 0) usleep(1);
+      atomic_fetch_sub(&g_held, 1);
+      park_place_give();
+    } else {
+      atomic_fetch_add(&g_pl_no, 1);
+    }
+  }
+  return NULL;
+}
+
+/* the stress case: eight threads take and give places (never more holders than the limit, none lost) and take tokens from one bucket (exactly the burst) */
+static void test_gate_stress(void) {
+  printf("[admission gate: concurrent claims]\n");
+  pthread_t th[GTH];
+  park_places_set_limit(PL_LIMIT);
+  for (int i = 0; i < GTH; i++) pthread_create(&th[i], NULL, place_user, NULL);
+  for (int i = 0; i < GTH; i++) pthread_join(th[i], NULL);
+  printf("  %llu places taken, %llu refused, at most %d held at once\n", (unsigned long long)atomic_load(&g_pl_ok), (unsigned long long)atomic_load(&g_pl_no), atomic_load(&g_held_max));
+  CHECK(atomic_load(&g_held_bad) == 0 && atomic_load(&g_held_max) <= PL_LIMIT && atomic_load(&g_held_max) >= 2);
+  CHECK(atomic_load(&g_pl_ok) > 0 && atomic_load(&g_pl_no) > 0);        /* (both happened: the pool was contended) */
+  CHECK(park_places_used() == 0 && atomic_load(&g_held) == 0);
+  park_places_set_limit(INT32_MAX);
+  /* 1000 tokens in the bucket, no time passes: eight threads that try 400 times each get exactly 1000 */
+  park_rate_set(1000);
+  park_rate_reset();
+  atomic_store(&g_gt_ok, 0);
+  for (int i = 0; i < GTH; i++) pthread_create(&th[i], NULL, rate_taker, NULL);
+  for (int i = 0; i < GTH; i++) pthread_join(th[i], NULL);
+  CHECK(atomic_load(&g_gt_ok) == 1000);
+  park_rate_set(0);
+  park_rate_reset();
+}
+
+/* the claim bit travels with the request: a request of a worker comes out with claimed set, the plain priority and its ring; a request of a thread that is not a worker has none */
+static void test_claim_ring(void) {
+  printf("[admission gate: the claim on the request]\n");
+  park_fetch_req_t q;
+  park_register_worker(2, -1);
+  while (park_fetch_next(&q)) {}
+  CHECK(park_fetch_request(2, "v1", "c.test.", KDB_FETCH_PRIO_QUERY | PARK_PRIO_CLAIMED, KDB_FETCH_FULL));
+  CHECK(park_fetch_request(2, "v1", "u.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+  CHECK(park_fetch_request_any("v1", "x.test.", KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_FULL));
+  int seen = 0;
+  while (park_fetch_next(&q)) {
+    if (strcmp(q.zone, "c.test.") == 0) seen += (q.claimed && q.prio == KDB_FETCH_PRIO_QUERY && q.worker == 2 && q.mode == KDB_FETCH_FULL) ? 1 : 100;
+    else if (strcmp(q.zone, "u.test.") == 0) seen += (!q.claimed && q.prio == KDB_FETCH_PRIO_QUERY && q.worker == 2) ? 2 : 100;
+    else if (strcmp(q.zone, "x.test.") == 0) seen += (!q.claimed && q.prio == KDB_FETCH_PRIO_BACKGROUND && q.worker == -1) ? 4 : 100;
+    else seen += 1000;
+  }
+  CHECK(seen == 7);
+  /* the raw ring keeps the bit, park_fetch_next() takes it off */
+  CHECK(park_fetch_request(2, "v1", "c.test.", KDB_FETCH_PRIO_WARM | PARK_PRIO_CLAIMED, KDB_FETCH_FULL));
+  CHECK(park_fetch_pop(park_fetch_ring(2), &q) && q.prio == (KDB_FETCH_PRIO_WARM | PARK_PRIO_CLAIMED));
+  /* a claim that was not used: both go back */
+  park_places_set_limit(2);
+  park_rate_set(10);
+  park_rate_reset();
+  CHECK(park_place_take() && park_rate_take(1000, false) && park_places_used() == 1 && park_rate_level(1000) == 9000);
+  park_claim_release("v1", "c.test.");
+  CHECK(park_places_used() == 0 && park_rate_level(1000) == 10000);
+  park_places_set_limit(INT32_MAX);
+  park_rate_set(0);
+  park_rate_reset();
+  /* the refusals are counted per worker, and the totals add them */
+  park_stats_t s0, s1;
+  park_stats_get(&s0);
+  park_gate_count(2, false);
+  park_gate_count(2, false);
+  park_gate_count(3, true);
+  park_gate_count(-1, false);                                            /* (out of range: counted on worker 0, not lost, not a crash) */
+  park_stats_get(&s1);
+  CHECK(s1.gate_shed - s0.gate_shed == 3 && s1.gate_rate - s0.gate_rate == 1);
+  park_unregister_worker(2);
+}
+
+#ifdef __FreeBSD__
+static int kq_events(int kq) {
+  struct kevent ev[4];
+  struct timespec z = { 0, 0 };
+  return kevent(kq, NULL, 0, ev, 4, &z);
+}
+static int kq_make(unsigned ident) {
+  int kq = kqueue();
+  struct kevent ev;
+  EV_SET(&ev, ident, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+  if (kq >= 0 && kevent(kq, &ev, 1, NULL, 0, NULL) != 0) {
+    close(kq);
+    return -1;
+  }
+  return kq;
+}
+
+/* the keys go into the ring at once; the trigger comes with park_wake_flush(), once per worker; one worker's key reaches that worker alone */
+static void test_wake_queue(void) {
+  printf("[wake: one worker, and one trigger per worker]\n");
+  int kq6 = kq_make(PARK_WAKE_IDENT), kq7 = kq_make(PARK_WAKE_IDENT);
+  CHECK(kq6 >= 0 && kq7 >= 0);
+  park_register_worker(6, kq6);
+  park_register_worker(7, kq7);
+  park_key_t k;
+  while (park_wake_pop(park_wake_ring(6), &k)) {}
+  while (park_wake_pop(park_wake_ring(7), &k)) {}
+  park_wake_flush();
+  (void)kq_events(kq6);
+  (void)kq_events(kq7);
+  park_wake_queue_one(6, "v1", "a.test.", false);
+  park_wake_queue_one(6, "v1", "b.test.", true);
+  park_wake_queue_one(-1, "v1", "none.test.", true);                   /* a thread that is not a worker: nobody waits */
+  park_wake_queue_one(PARK_MAX_WORKERS + 1, "v1", "none.test.", true);
+  park_wake_queue_one(40, "v1", "none.test.", true);                   /* (not registered) */
+  CHECK(kq_events(kq6) == 0 && kq_events(kq7) == 0);                   /* the keys are in the ring, nobody was triggered yet */
+  CHECK(park_wake_pending(park_wake_ring(6)) && !park_wake_pending(park_wake_ring(7)));
+  park_wake_flush();
+  CHECK(kq_events(kq6) == 1 && kq_events(kq7) == 0);                   /* worker 6 once (for two keys), worker 7 not at all */
+  CHECK(park_wake_pop(park_wake_ring(6), &k) && strcmp(k.zone, "a.test.") == 0 && !k.failed);
+  CHECK(park_wake_pop(park_wake_ring(6), &k) && strcmp(k.zone, "b.test.") == 0 && k.failed);
+  CHECK(!park_wake_pop(park_wake_ring(6), &k) && !park_wake_pop(park_wake_ring(7), &k));
+  park_wake_flush();                                                   /* nothing queued since: no trigger */
+  CHECK(kq_events(kq6) == 0 && kq_events(kq7) == 0);
+  park_wake_queue_all("v1", "c.test.", false);
+  CHECK(kq_events(kq6) == 0 && kq_events(kq7) == 0);
+  park_wake_flush();
+  CHECK(kq_events(kq6) == 1 && kq_events(kq7) == 1);
+  CHECK(park_wake_pop(park_wake_ring(6), &k) && strcmp(k.zone, "c.test.") == 0 && park_wake_pop(park_wake_ring(7), &k) && strcmp(k.zone, "c.test.") == 0);
+  park_wake_broadcast("v1", "d.test.", false);                         /* the old call: key and trigger at once */
+  CHECK(kq_events(kq6) == 1 && kq_events(kq7) == 1);
+  CHECK(park_wake_pop(park_wake_ring(6), &k) && park_wake_pop(park_wake_ring(7), &k));
+  park_unregister_worker(7);
+  park_wake_queue_one(7, "v1", "e.test.", false);                      /* gone: no key, no trigger */
+  park_wake_flush();
+  CHECK(!park_wake_pop(park_wake_ring(7), &k) && kq_events(kq7) == 0);
+  park_unregister_worker(6);
+  close(kq6);
+  close(kq7);
+}
+
+/* the sleep protocol: a worker triggers only while the ingest thread may be asleep */
+static void test_sleep_protocol(void) {
+  printf("[sleep protocol: a trigger only when the ingest thread may be asleep]\n");
+  int ikq = kq_make(PARK_FETCH_IDENT);
+  CHECK(ikq >= 0);
+  park_fetch_set_notify(ikq);
+  park_register_worker(6, -1);
+  park_fetch_req_t q;
+  while (park_fetch_next(&q)) {}
+  CHECK(!park_fetch_pending());
+  CHECK(park_fetch_request(6, "v1", "s1.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+  CHECK(kq_events(ikq) == 0);                                          /* the thread is awake: no system call for it */
+  CHECK(park_fetch_pending() && park_fetch_sleep_prepare());           /* a request is there: it must not sleep, and it is not marked asleep */
+  CHECK(park_fetch_request(6, "v1", "s2.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL) && kq_events(ikq) == 0);
+  while (park_fetch_next(&q)) {}
+  CHECK(!park_fetch_pending() && !park_fetch_sleep_prepare());         /* nothing: it sleeps, and says so */
+  CHECK(park_fetch_request(6, "v1", "s3.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+  CHECK(kq_events(ikq) == 1);                                          /* ... so a request wakes it */
+  park_fetch_sleep_done();
+  CHECK(park_fetch_request(6, "v1", "s4.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL) && kq_events(ikq) == 0);
+  while (park_fetch_next(&q)) {}
+  /* a slot of a transfer thread (and park_bg_fetch(), which uses one) follows the same rule */
+  CHECK(!park_fetch_sleep_prepare());
+  CHECK(park_fetch_request_any("v1", "x1.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL) && kq_events(ikq) == 1);
+  park_fetch_sleep_done();
+  CHECK(park_fetch_request_any("v1", "x2.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL) && kq_events(ikq) == 0);
+  CHECK(park_fetch_pending() && park_fetch_sleep_prepare());           /* (a slot that is ready is a request too) */
+  while (park_fetch_next(&q)) {}
+  CHECK(!park_fetch_pending());
+  park_fetch_sleep_done();
+  park_unregister_worker(6);
+  park_fetch_set_notify(-1);
+  close(ikq);
+}
+
+/* the race: producers push requests while the ingest side goes to sleep.  The consumer waits for a trigger with a timeout, and finds a request pending after a timeout
+ * without the trigger having come: that is a lost wake-up.  (Without the fences of the protocol this shows up in the first seconds.) */
+#define SP_PROD 3
+#define SP_N 6000
+static int g_sp_kq;
+static _Atomic uint64_t g_sp_lost, g_sp_consumed, g_sp_sleeps;
+static void *sp_producer(void *arg) {
+  int w = 10 + (int)(intptr_t)arg;
+  unsigned seed = (unsigned)w * 2654435761u;
+  char zn[32];
+  for (int i = 0; i < SP_N; i++) {
+    snprintf(zn, sizeof(zn), "p%d-%d.test.", w, i);
+    while (!park_fetch_request(w, "v1", zn, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL)) usleep(50);
+    seed = seed * 1103515245u + 12345u;
+    if ((seed >> 16) % 5 == 0) usleep((seed >> 8) % 300);             /* (gaps: the consumer runs dry and goes to sleep) */
+  }
+  return NULL;
+}
+static void test_sleep_race(void) {
+  printf("[sleep protocol: producers against a consumer that goes to sleep]\n");
+  g_sp_kq = kq_make(PARK_FETCH_IDENT);
+  CHECK(g_sp_kq >= 0);
+  park_fetch_set_notify(g_sp_kq);
+  pthread_t th[SP_PROD];
+  for (int i = 0; i < SP_PROD; i++) park_register_worker(10 + i, -1);
+  atomic_store(&g_sp_lost, 0);
+  atomic_store(&g_sp_consumed, 0);
+  atomic_store(&g_sp_sleeps, 0);
+  for (long i = 0; i < SP_PROD; i++) pthread_create(&th[i], NULL, sp_producer, (void *)(intptr_t)i);
+  park_fetch_req_t q;
+  const uint64_t total = (uint64_t)SP_PROD * SP_N;
+  while (atomic_load(&g_sp_consumed) < total) {
+    while (park_fetch_next(&q)) atomic_fetch_add(&g_sp_consumed, 1);
+    if (atomic_load(&g_sp_consumed) >= total) break;
+    if (park_fetch_sleep_prepare()) continue;
+    struct kevent ev;
+    struct timespec ts = { 0, 300 * 1000000L };
+    atomic_fetch_add(&g_sp_sleeps, 1);
+    int n = kevent(g_sp_kq, NULL, 0, &ev, 1, &ts);
+    park_fetch_sleep_done();
+    if (n == 0 && park_fetch_pending()) {                              /* the time ran out with a request waiting: was a trigger on its way? */
+      usleep(20000);
+      if (kq_events(g_sp_kq) == 0) atomic_fetch_add(&g_sp_lost, 1);
+    }
+  }
+  for (int i = 0; i < SP_PROD; i++) pthread_join(th[i], NULL);
+  printf("  %llu requests, the consumer slept %llu times, %llu lost wake-ups\n", (unsigned long long)atomic_load(&g_sp_consumed), (unsigned long long)atomic_load(&g_sp_sleeps),
+         (unsigned long long)atomic_load(&g_sp_lost));
+  CHECK(atomic_load(&g_sp_consumed) == total && atomic_load(&g_sp_lost) == 0 && atomic_load(&g_sp_sleeps) > 10);
+  for (int i = 0; i < SP_PROD; i++) park_unregister_worker(10 + i);
+  park_fetch_set_notify(-1);
+  close(g_sp_kq);
+}
+#endif
+/* (B2 M1) the claim marks: one worker holds the claim for a zone, the others find it; a view is part of the key; a mark is cleared by the key; a window with no room, two
+ * marks for one zone, and the threads that race for one zone: exactly one wins */
+static _Atomic int g_cl_won;
+static _Atomic bool g_cl_go;
+static void *claim_racer(void *arg) {
+  (void)arg;
+  while (!atomic_load(&g_cl_go)) {}
+  if (park_claim_mark(park_claim_key("v1", "race.test."))) atomic_fetch_add(&g_cl_won, 1);
+  return NULL;
+}
+
+static void test_claims(void) {
+  printf("[admission gate: the claim marks of a zone]\n");
+  uint64_t a = park_claim_key("v1", "a.test."), b = park_claim_key("v2", "a.test."), c = park_claim_key("v1", "b.test.");
+  CHECK(a != 0 && b != 0 && c != 0 && a != b && a != c);
+  CHECK(a == park_claim_key("v1", "A.TEST."));                           /* (the zone's case does not matter: the directory's name and the request's are one) */
+  CHECK(!park_claim_held(a) && !park_claim_held(b));
+  CHECK(park_claim_mark(a) && park_claim_held(a) && !park_claim_held(b) && !park_claim_held(c));
+  CHECK(!park_claim_mark(a));                                            /* (marked already: the second worker does not hold the claim) */
+  CHECK(park_claim_mark(b) && park_claim_mark(c) && park_claim_held(b) && park_claim_held(c));
+  park_claim_clear(a);
+  CHECK(!park_claim_held(a) && park_claim_held(b) && park_claim_held(c));
+  park_claim_clear(a);                                                   /* (clearing what is not marked does nothing) */
+  CHECK(park_claim_mark(a) && !park_claim_mark(a));
+  park_claim_clear(a);
+  park_claim_clear(b);
+  park_claim_clear(c);
+  CHECK(!park_claim_held(a) && !park_claim_held(b) && !park_claim_held(c));
+  /* the release of a claim that was not used: place, token and mark */
+  park_places_set_limit(2);
+  park_rate_set(10);
+  park_rate_reset();
+  CHECK(park_place_take() && park_rate_take(1000, false) && park_claim_mark(a) && park_places_used() == 1 && park_rate_level(1000) == 9000);
+  park_claim_release("v1", "a.test.");
+  CHECK(park_places_used() == 0 && park_rate_level(1000) == 10000 && !park_claim_held(a));
+  park_places_set_limit(INT32_MAX);
+  park_rate_set(0);
+  park_rate_reset();
+  /* no room: the slots a key may use (a window of 8) are all taken by other zones: the claim stands without a mark (true), the zone cannot be found held, and the clear finds nothing */
+  {
+    enum { N = 4096 };
+    static uint64_t keys[N];
+    int used = 0, nk = 0;
+    for (; nk < N && used < 600; nk++) {
+      char z[32];
+      snprintf(z, sizeof(z), "fill%d.test.", nk);
+      keys[nk] = park_claim_key("v1", z);
+      if (park_claim_mark(keys[nk])) used++;
+    }
+    /* 600 marks in 1024 slots: some window is full; find a zone whose mark was not made although it was not held */
+    int nomark = 0;
+    for (int i = 0; i < nk; i++) {
+      if (!park_claim_held(keys[i])) {
+        CHECK(park_claim_mark(keys[i]));                                 /* (true: the claim is taken, no matter that there was no room for the mark) */
+        if (!park_claim_held(keys[i])) nomark++;
+        park_claim_clear(keys[i]);                                       /* (harmless) */
+      }
+    }
+    for (int i = 0; i < nk; i++) park_claim_clear(keys[i]);
+    for (int i = 0; i < nk; i++) CHECK(!park_claim_held(keys[i]));
+    printf("  %d marks set, %d claims without room for a mark\n", used, nomark);
+  }
+  /* sixteen threads against one zone: one holds the claim, and when it is cleared one more can */
+  pthread_t th[16];
+  atomic_store(&g_cl_won, 0);
+  atomic_store(&g_cl_go, false);
+  for (int i = 0; i < 16; i++) pthread_create(&th[i], NULL, claim_racer, NULL);
+  atomic_store(&g_cl_go, true);
+  for (int i = 0; i < 16; i++) pthread_join(th[i], NULL);
+  CHECK(atomic_load(&g_cl_won) == 1 && park_claim_held(park_claim_key("v1", "race.test.")));
+  park_claim_clear(park_claim_key("v1", "race.test."));
+  CHECK(!park_claim_held(park_claim_key("v1", "race.test.")) && park_claim_mark(park_claim_key("v1", "race.test.")));
+  park_claim_clear(park_claim_key("v1", "race.test."));
+}
+
 int main(void) {
   test_table();
   test_tcp();
@@ -492,6 +927,16 @@ int main(void) {
   test_any();
   test_slots_not_starved();
   test_stats();
+  test_places();
+  test_rate();
+  test_gate_stress();
+  test_claim_ring();
+  test_claims();
+#ifdef __FreeBSD__
+  test_wake_queue();
+  test_sleep_protocol();
+  test_sleep_race();
+#endif
   printf("\n%d checks, %d failed\n", g_checks, g_failed);
   if (g_failed) return 1;
   printf("=== test_park: all checks passed ===\n");

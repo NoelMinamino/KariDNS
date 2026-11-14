@@ -168,7 +168,7 @@ static void test_all_rr_types_and_resolution(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain));
+    db_entry.domain = "example.com.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -306,7 +306,7 @@ static void test_dnssec_negative_and_delegation_proofs(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strncpy(db_entry.domain, "sec.example.com.", sizeof(db_entry.domain));
+    db_entry.domain = "sec.example.com.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -445,7 +445,7 @@ static void test_tinydns_timestamp_countdown(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strncpy(db_entry.domain, "tiny.example.", sizeof(db_entry.domain));
+    db_entry.domain = "tiny.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -558,7 +558,7 @@ static void test_soa_set_per_client(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "soa.example.", sizeof(entry.domain));
+    entry.domain = "soa.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
     zone_db_entry_t *entries[1] = { &entry };
     char *any_acl[1] = { (char *)"any" };
@@ -671,7 +671,7 @@ static void test_mqtype_truncation(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain) - 1);
+    db_entry.domain = "example.com.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -784,7 +784,7 @@ static void test_resolve_name_servfail_rcode_clearing(void) {
     printf("[TEST] Query Engine: resolve_name() SERVFAIL and CNAME resolution...\n");
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain) - 1);
+    db_entry.domain = "example.com.";
 
     zone_version_t *empty_zone = NULL;
     zone_db_entry_t *db_entry_ptr = &db_entry;
@@ -875,7 +875,7 @@ static void test_response_section_order(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain) - 1);
+    db_entry.domain = "example.com.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *db_entry_ptr = &db_entry;
@@ -1099,7 +1099,7 @@ static void test_cname_loop_and_max_depth(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "loop.example.", sizeof(entry.domain));
+    entry.domain = "loop.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -1238,7 +1238,7 @@ static void test_prelink_zone_additional_glue_policies(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "glue.example.", sizeof(entry.domain));
+    entry.domain = "glue.example.";
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
@@ -1563,7 +1563,7 @@ static void gr_setup(const char *origin, const char *zone_text) {
     assert(buf != NULL);
     assert(parse_zone_fast(buf, strlen(buf), &g_gr.arena, &ctx) >= 0);
     assert(test_build_index(&g_gr.arena, true) == 0);
-    strncpy(g_gr.entry.domain, origin, sizeof(g_gr.entry.domain) - 1);
+    g_gr.entry.domain = origin;
     atomic_store_explicit(&g_gr.entry.rcu.active, &g_gr.arena.ver, memory_order_release);
     g_gr.entries[0] = &g_gr.entry;
     g_gr.acl[0] = (char *)"any";
@@ -2077,7 +2077,7 @@ static void test_delegation_referral_and_ds_handling(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "example.com.", sizeof(entry.domain));
+    entry.domain = "example.com.";
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
@@ -2717,7 +2717,7 @@ static void test_dname_synthesis_and_wildcard_proofs(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "dname.example.", sizeof(entry.domain));
+    entry.domain = "dname.example.";
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
@@ -2795,7 +2795,7 @@ static void test_query_engine_protocol_qclass_and_edns_branches(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "qproto.example.", sizeof(entry.domain));
+    entry.domain = "qproto.example.";
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
@@ -2896,7 +2896,7 @@ static void test_cname_target_overflow_and_tsig_query_paths(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "cname.example.", sizeof(entry.domain));
+    entry.domain = "cname.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -2954,7 +2954,7 @@ static void test_non_data_rrtypes_and_special_qtypes(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "special.example.", sizeof(entry.domain));
+    entry.domain = "special.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -3029,7 +3029,7 @@ static void test_covering_rrsig_and_buffer_exhaustion_branches(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "rrsig.example.", sizeof(entry.domain));
+    entry.domain = "rrsig.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -3088,7 +3088,7 @@ static void test_dname_loop_and_depth_limit(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "dname.example.", sizeof(entry.domain));
+    entry.domain = "dname.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -3134,7 +3134,7 @@ static void test_wildcard_cname_and_dname_synthesis(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "wildsyn.example.", sizeof(entry.domain));
+    entry.domain = "wildsyn.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -3187,7 +3187,7 @@ static void test_nsec3_wildcard_nodata_and_optout(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "nsec3opt.example.", sizeof(entry.domain));
+    entry.domain = "nsec3opt.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -3234,7 +3234,7 @@ static void test_nsec_apex_and_delegation_proofs(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "nsecproof.example.", sizeof(entry.domain));
+    entry.domain = "nsecproof.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -3313,7 +3313,7 @@ static void test_edns_client_subnet_cache_matching(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "ecs.example.", sizeof(entry.domain));
+    entry.domain = "ecs.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -3379,7 +3379,7 @@ static void test_dns_cookie_badcookie_and_timestamp_drift(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "cookie.example.", sizeof(entry.domain));
+    entry.domain = "cookie.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -3484,7 +3484,7 @@ static void test_udp_bufsize_global_and_zone(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "ubuf.example.", sizeof(entry.domain));
+    entry.domain = "ubuf.example.";
     strlcpy(entry.view_name, "__default__", sizeof(entry.view_name));
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
     zone_db_entry_t *entries[1] = {&entry};
@@ -3585,7 +3585,7 @@ static void test_truncated_response_keeps_opt(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "tcopt.example.", sizeof(entry.domain));
+    entry.domain = "tcopt.example.";
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
     zone_db_entry_t *entries[1] = {&entry};
@@ -3661,7 +3661,7 @@ static void test_rrl_slip_and_tc_response(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "rrltest.example.", sizeof(entry.domain));
+    entry.domain = "rrltest.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -3726,7 +3726,7 @@ static void test_proxy_v2_header_parsing(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "proxy.example.", sizeof(entry.domain));
+    entry.domain = "proxy.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -3772,7 +3772,7 @@ static void test_catalog_zone_queries_and_member_zones(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "catalog.example.", sizeof(entry.domain));
+    entry.domain = "catalog.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -3818,7 +3818,7 @@ static void test_any_query_with_dnssec_rrsigs(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "anydnssec.example.", sizeof(entry.domain));
+    entry.domain = "anydnssec.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -3863,7 +3863,7 @@ static void test_cname_pointing_to_delegation_referral(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "cnameref.example.", sizeof(entry.domain));
+    entry.domain = "cnameref.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -3956,7 +3956,7 @@ static void test_program_zone_dynamic_scripts(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "prog.example.", sizeof(entry.domain));
+    entry.domain = "prog.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -4000,7 +4000,7 @@ static void test_prelinked_glue_records_ordering(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "glueord.example.", sizeof(entry.domain));
+    entry.domain = "glueord.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -4044,7 +4044,7 @@ static void test_nsec3_salt_and_iteration_limits(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "nsec3lim.example.", sizeof(entry.domain));
+    entry.domain = "nsec3lim.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -4135,7 +4135,7 @@ static void test_tinydns_timestamp_decay_and_expiry(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "ttd.example.", sizeof(db_entry.domain));
+    db_entry.domain = "ttd.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&db_entry};
@@ -4202,7 +4202,7 @@ static void test_tsig_badkey_badsig_badtime_responses(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "tsigerr.example.", sizeof(entry.domain));
+    entry.domain = "tsigerr.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -4261,7 +4261,7 @@ static void test_dynamic_update_prerequisites_and_actions(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "dynup.example.", sizeof(entry.domain));
+    entry.domain = "dynup.example.";
     pthread_mutex_init(&entry.writer_lock, NULL);
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
@@ -4316,7 +4316,7 @@ static void test_udp_truncation_with_edns_buffer_size(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "trunc.example.", sizeof(entry.domain));
+    entry.domain = "trunc.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -4374,8 +4374,8 @@ static void test_multiple_views_acls_and_fallback(void) {
     zone_db_entry_t entry_int, entry_ext;
     memset(&entry_int, 0, sizeof(entry_int));
     memset(&entry_ext, 0, sizeof(entry_ext));
-    strlcpy(entry_int.domain, "split.example.", sizeof(entry_int.domain));
-    strlcpy(entry_ext.domain, "split.example.", sizeof(entry_ext.domain));
+    entry_int.domain = "split.example.";
+    entry_ext.domain = "split.example.";
     atomic_store_explicit(&entry_int.rcu.active, &arena_int.ver, memory_order_release);
     atomic_store_explicit(&entry_ext.rcu.active, &arena_ext.ver, memory_order_release);
 
@@ -4441,7 +4441,7 @@ static void test_dynamic_update_prereq_rrset_exists_value_independent(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "dyn1.example.", sizeof(entry.domain));
+    entry.domain = "dyn1.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     assert(record_exists_in_arena(&arena, &arena.records[2]) == true);
@@ -4719,7 +4719,7 @@ static void ecs_scope_zone_init(void) {
     rc = test_build_index(&g_ecs_scope_zone.arena, true);
     assert(rc == 0);
     (void)rc;
-    strlcpy(g_ecs_scope_zone.entry.domain, "ecs.example.", sizeof(g_ecs_scope_zone.entry.domain));
+    g_ecs_scope_zone.entry.domain = "ecs.example.";
     atomic_store_explicit(&g_ecs_scope_zone.entry.rcu.active, &g_ecs_scope_zone.arena.ver, memory_order_release);
     g_ecs_scope_zone_ready = true;
 }
@@ -7824,7 +7824,7 @@ static void test_query_engine_feature_case_201(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "soa.example.", sizeof(db_entry.domain));
+    db_entry.domain = "soa.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -7878,7 +7878,7 @@ static void test_query_engine_feature_case_202(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "any.example.", sizeof(db_entry.domain));
+    db_entry.domain = "any.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -7930,7 +7930,7 @@ static void test_query_engine_feature_case_203(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "cname2.example.", sizeof(db_entry.domain));
+    db_entry.domain = "cname2.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -7980,7 +7980,7 @@ static void test_query_engine_feature_case_204(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "dnamesyn.example.", sizeof(db_entry.domain));
+    db_entry.domain = "dnamesyn.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -8030,7 +8030,7 @@ static void test_query_engine_feature_case_205(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "wildsyn.example.", sizeof(db_entry.domain));
+    db_entry.domain = "wildsyn.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -8081,7 +8081,7 @@ static void test_query_engine_feature_case_206(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "wildexp.example.", sizeof(db_entry.domain));
+    db_entry.domain = "wildexp.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -8131,7 +8131,7 @@ static void test_query_engine_feature_case_207(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "edns.example.", sizeof(db_entry.domain));
+    db_entry.domain = "edns.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -8240,8 +8240,8 @@ static void test_query_engine_feature_case_211(void) {
     zone_db_entry_t e_int, e_ext;
     memset(&e_int, 0, sizeof(e_int));
     memset(&e_ext, 0, sizeof(e_ext));
-    strlcpy(e_int.domain, "view.example.", sizeof(e_int.domain));
-    strlcpy(e_ext.domain, "view.example.", sizeof(e_ext.domain));
+    e_int.domain = "view.example.";
+    e_ext.domain = "view.example.";
     atomic_store_explicit(&e_int.rcu.active, &arena_int.ver, memory_order_release);
     atomic_store_explicit(&e_ext.rcu.active, &arena_ext.ver, memory_order_release);
 
@@ -8678,7 +8678,7 @@ static void test_query_engine_feature_case_225(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "version.bind.", sizeof(db_entry.domain));
+    db_entry.domain = "version.bind.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -8722,7 +8722,7 @@ static void test_query_engine_feature_case_226(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "local.example.", sizeof(db_entry.domain));
+    db_entry.domain = "local.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -8759,7 +8759,7 @@ static void test_query_engine_feature_case_227(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "trunc.example.", sizeof(db_entry.domain));
+    db_entry.domain = "trunc.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -8796,7 +8796,7 @@ static void test_query_engine_feature_case_228(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "glue.example.", sizeof(db_entry.domain));
+    db_entry.domain = "glue.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -8835,7 +8835,7 @@ static void test_query_engine_feature_case_229(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "mxglue.example.", sizeof(db_entry.domain));
+    db_entry.domain = "mxglue.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -8874,7 +8874,7 @@ static void test_query_engine_feature_case_230(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "srvglue.example.", sizeof(db_entry.domain));
+    db_entry.domain = "srvglue.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -8913,7 +8913,7 @@ static void test_query_engine_feature_case_231(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "nodata.example.", sizeof(db_entry.domain));
+    db_entry.domain = "nodata.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -8952,7 +8952,7 @@ static void test_query_engine_feature_case_232(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "nx.example.", sizeof(db_entry.domain));
+    db_entry.domain = "nx.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -8991,7 +8991,7 @@ static void test_query_engine_feature_case_233(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "2.0.192.in-addr.arpa.", sizeof(db_entry.domain));
+    db_entry.domain = "2.0.192.in-addr.arpa.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -9029,7 +9029,7 @@ static void test_query_engine_feature_case_234(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "8.b.d.0.1.0.0.2.ip6.arpa.", sizeof(db_entry.domain));
+    db_entry.domain = "8.b.d.0.1.0.0.2.ip6.arpa.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -9067,7 +9067,7 @@ static void test_query_engine_feature_case_235(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "caa.example.", sizeof(db_entry.domain));
+    db_entry.domain = "caa.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -9105,7 +9105,7 @@ static void test_query_engine_feature_case_236(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "tlsa.example.", sizeof(db_entry.domain));
+    db_entry.domain = "tlsa.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -9143,7 +9143,7 @@ static void test_query_engine_feature_case_237(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "sshfp.example.", sizeof(db_entry.domain));
+    db_entry.domain = "sshfp.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -9181,7 +9181,7 @@ static void test_query_engine_feature_case_238(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "naptr.example.", sizeof(db_entry.domain));
+    db_entry.domain = "naptr.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -9219,7 +9219,7 @@ static void test_query_engine_feature_case_239(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "loc.example.", sizeof(db_entry.domain));
+    db_entry.domain = "loc.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -9257,7 +9257,7 @@ static void test_query_engine_feature_case_240(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "hinfo.example.", sizeof(db_entry.domain));
+    db_entry.domain = "hinfo.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -9323,7 +9323,7 @@ static void test_query_engine_feature_case_243(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "catalog.example.", sizeof(db_entry.domain));
+    db_entry.domain = "catalog.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -9698,7 +9698,7 @@ static void test_query_engine_opcode_header_validations(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "op.example.", sizeof(db_entry.domain));
+    db_entry.domain = "op.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -9784,7 +9784,7 @@ static void test_query_engine_dname_cname_wildcard_truncation(void) {
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
-    strlcpy(db_entry.domain, "matrix.example.", sizeof(db_entry.domain));
+    db_entry.domain = "matrix.example.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
@@ -9939,7 +9939,7 @@ static void b9_zone_load(b9_zone_t *z, const char *apex, const char *text) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = apex, .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast((char *)text, strlen(text), &z->arena, &ctx) >= 0);
     assert(test_build_index(&z->arena, true) == 0);
-    strncpy(z->entry.domain, apex, sizeof(z->entry.domain) - 1);
+    z->entry.domain = apex;
     atomic_store_explicit(&z->entry.rcu.active, &z->arena.ver, memory_order_release);
     z->entries[0] = &z->entry;
     z->acl[0] = (char *)"any";
@@ -10712,7 +10712,7 @@ static void test_minimal_responses_modes(void) {
     assert(test_build_index(&arena, true) == 0);
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "min.example.", sizeof(entry.domain));
+    entry.domain = "min.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
     /* { qname, qtype, mode } -> {answer, authority, additional} counts */
     static const struct { const char *qn; uint16_t qt; int mode; int an, ns, ar; } cases[] = {
@@ -10840,7 +10840,7 @@ static void test_require_server_cookie_and_view_udp_size(void) {
     assert(test_build_index(&arena, true) == 0);
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "ck.example.", sizeof(entry.domain));
+    entry.domain = "ck.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
     zone_db_entry_t *entries[1] = { &entry };
     char *any_acl[1] = { (char *)"any" };

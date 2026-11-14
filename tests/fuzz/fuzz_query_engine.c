@@ -157,7 +157,7 @@ static void init_rich_fuzz_engine(void) {
     assert(test_build_index(&g_fuzz_arena_main, true) == 0);
     
     memset(&g_fuzz_entries[0], 0, sizeof(g_fuzz_entries[0]));
-    strncpy(g_fuzz_entries[0].domain, "example.com.", sizeof(g_fuzz_entries[0].domain) - 1);
+    g_fuzz_entries[0].domain = "example.com.";
     atomic_store_explicit(&g_fuzz_entries[0].rcu.active, &g_fuzz_arena_main.ver, memory_order_release);
     g_fuzz_entry_ptrs[0] = &g_fuzz_entries[0];
 
@@ -170,7 +170,7 @@ static void init_rich_fuzz_engine(void) {
     assert(test_build_index(&g_fuzz_arena_sub, true) == 0);
     
     memset(&g_fuzz_entries[1], 0, sizeof(g_fuzz_entries[1]));
-    strncpy(g_fuzz_entries[1].domain, "sub.example.org.", sizeof(g_fuzz_entries[1].domain) - 1);
+    g_fuzz_entries[1].domain = "sub.example.org.";
     atomic_store_explicit(&g_fuzz_entries[1].rcu.active, &g_fuzz_arena_sub.ver, memory_order_release);
     g_fuzz_entry_ptrs[1] = &g_fuzz_entries[1];
 
@@ -183,7 +183,7 @@ static void init_rich_fuzz_engine(void) {
     assert(test_build_index(&g_fuzz_arena_nsec3, true) == 0);
     
     memset(&g_fuzz_entries[2], 0, sizeof(g_fuzz_entries[2]));
-    strncpy(g_fuzz_entries[2].domain, "signed.local.", sizeof(g_fuzz_entries[2].domain) - 1);
+    g_fuzz_entries[2].domain = "signed.local.";
     atomic_store_explicit(&g_fuzz_entries[2].rcu.active, &g_fuzz_arena_nsec3.ver, memory_order_release);
     g_fuzz_entry_ptrs[2] = &g_fuzz_entries[2];
 

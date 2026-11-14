@@ -2404,7 +2404,9 @@ zone_version_t *zone_version_new(zone_arena_t *builder) {
   if (!v) return NULL;
   v->image = builder->image;
   v->heap = true;
-  v->bytes = sizeof(*v) + (v->image ? v->image->total_size : 0);   /* D1a (8.1): recorded when the image is frozen into a version */
+  /* D1a (8.1): recorded when the image is frozen into a version.  0.7 (B1): the blocks the allocator really holds for the version and the image (size
+   * classes, headers), which memory-limit counts; the glue block is added by zone_glue_track_build() the same way */
+  v->bytes = dns_alloc_size(v, sizeof(*v)) + (v->image ? dns_alloc_size(v->image, v->image->total_size) : 0);
   builder->image = NULL;
   return v;
 }

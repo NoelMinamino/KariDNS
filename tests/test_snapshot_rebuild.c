@@ -502,7 +502,7 @@ static void test_snapshot_rebuild_case_2(void) {
     printf("[TEST] Snapshot Rebuild: Zone lookup case insensitivity...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "Case.Example.", sizeof(entry.domain));
+    entry.domain = "Case.Example.";
     assert(strcasecmp(entry.domain, "case.example.") == 0);
 }
 

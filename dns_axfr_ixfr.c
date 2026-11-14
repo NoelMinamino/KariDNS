@@ -329,6 +329,12 @@ void ixfr_history_set_depth(zone_db_entry_t *entry, int depth) {
   pthread_mutex_unlock(&h->lock);
 }
 
+void ixfr_history_init_depth(zone_db_entry_t *entry, int depth) {
+  if (depth < 0) depth = 0;
+  if (depth > MAX_IXFR_HISTORY) depth = MAX_IXFR_HISTORY;
+  entry->ixfr_history.depth_p1 = (uint8_t)(depth + 1);     /* (no ring yet, nobody else: nothing to trim, nothing to lock) */
+}
+
 void ixfr_history_reset(zone_db_entry_t *entry) {
   ixfr_history_t *h = &entry->ixfr_history;
   pthread_mutex_lock(&h->lock);

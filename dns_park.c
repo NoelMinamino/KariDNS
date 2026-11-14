@@ -332,9 +332,23 @@ static _Atomic int g_wkq[PARK_MAX_WORKERS];              /* the worker's kqueue,
 static _Atomic bool g_wreg[PARK_MAX_WORKERS];
 static _Atomic int g_ingest_kq = -1;
 static _Atomic uint32_t g_fetch_rr;
+static _Atomic int g_wmax;                               /* the highest worker whose ring was used, plus one: the ingest thread looks at these rings only (park_fetch_pending) */
+static _Atomic bool g_ingest_asleep;                     /* the ingest thread is about to wait for events, or waits (see "the sleep protocol") */
+static _Atomic uint64_t g_wtrig[(PARK_MAX_WORKERS + 63) / 64];   /* the workers that were given a key and are not triggered yet (park_wake_flush) */
+/* The requests of threads that are not workers (the transfer threads): a few slots that any number of threads may fill.  A slot is free (0), being
+ * filled by the thread that took it with a compare-and-swap (1) or ready for the ingest thread (2); the ingest thread empties ready slots.  No lock. */
+#define PARK_XFR_SLOTS 16
+static park_fetch_req_t g_xfr_q[PARK_XFR_SLOTS];
+static _Atomic uint8_t g_xfr_st[PARK_XFR_SLOTS];
+
+static void wmax_raise(int w) {
+  int cur = atomic_load_explicit(&g_wmax, memory_order_relaxed);
+  while (cur < w + 1 && !atomic_compare_exchange_weak_explicit(&g_wmax, &cur, w + 1, memory_order_relaxed, memory_order_relaxed)) {}
+}
 
 void park_register_worker(int w, int kq) {
   if (w < 0 || w >= PARK_MAX_WORKERS) return;
+  wmax_raise(w);
   atomic_store_explicit(&g_wkq[w], kq, memory_order_relaxed);
   atomic_store_explicit(&g_wreg[w], true, memory_order_release);
 }
@@ -345,7 +359,11 @@ void park_unregister_worker(int w) {
 }
 
 park_wake_ring_t *park_wake_ring(int w) { return (w >= 0 && w < PARK_MAX_WORKERS) ? &g_wake[w] : NULL; }
-park_fetch_ring_t *park_fetch_ring(int w) { return (w >= 0 && w < PARK_MAX_WORKERS) ? &g_fetch[w] : NULL; }
+park_fetch_ring_t *park_fetch_ring(int w) {
+  if (w < 0 || w >= PARK_MAX_WORKERS) return NULL;
+  wmax_raise(w);                                         /* (whoever gets the ring may push into it: the ingest thread has to look there) */
+  return &g_fetch[w];
+}
 
 #ifdef __FreeBSD__
 static void trigger(int kq, unsigned ident) {
@@ -358,36 +376,260 @@ static void trigger(int kq, unsigned ident) {
 static void trigger(int kq, unsigned ident) { (void)kq; (void)ident; }
 #endif
 
-void park_wake_broadcast(const char *view, const char *zone, bool failed) {
-  for (int w = 0; w < PARK_MAX_WORKERS; w++) {
-    if (!atomic_load_explicit(&g_wreg[w], memory_order_acquire)) continue;
-    (void)park_wake_push(&g_wake[w], view, zone, failed);        /* (a full ring: the overflow flag wakes everything) */
-    trigger(atomic_load_explicit(&g_wkq[w], memory_order_relaxed), PARK_WAKE_IDENT);
+/* The key goes into the ring now; the kqueue of the worker is triggered by park_wake_flush(), once however many keys came (the ring is what the worker reads: a
+ * key is there before its trigger is). */
+void park_wake_queue_one(int w, const char *view, const char *zone, bool failed) {
+  if (w < 0 || w >= PARK_MAX_WORKERS || !atomic_load_explicit(&g_wreg[w], memory_order_acquire)) return;
+  (void)park_wake_push(&g_wake[w], view, zone, failed);          /* (a full ring: the overflow flag wakes everything) */
+  atomic_fetch_or_explicit(&g_wtrig[w / 64], 1ull << (w % 64), memory_order_release);
+}
+
+void park_wake_queue_all(const char *view, const char *zone, bool failed) {
+  for (int w = 0; w < PARK_MAX_WORKERS; w++) park_wake_queue_one(w, view, zone, failed);
+}
+
+void park_wake_flush(void) {
+  for (int i = 0; i < (int)(sizeof(g_wtrig) / sizeof(g_wtrig[0])); i++) {
+    uint64_t m = atomic_exchange_explicit(&g_wtrig[i], 0, memory_order_acq_rel);
+    while (m) {
+      int w = i * 64 + __builtin_ctzll(m);
+      m &= m - 1;
+      trigger(atomic_load_explicit(&g_wkq[w], memory_order_relaxed), PARK_WAKE_IDENT);
+    }
   }
+}
+
+void park_wake_broadcast(const char *view, const char *zone, bool failed) {
+  park_wake_queue_all(view, zone, failed);
+  park_wake_flush();
+}
+
+/* ------------------------------------------------------------------ the admission gate (B2 W5; the idea is in dns_park.h) */
+static _Atomic int32_t g_places;
+static _Atomic int32_t g_places_lim = INT32_MAX;         /* until the ingest thread sets fetch-concurrency */
+
+void park_places_set_limit(uint32_t limit) { atomic_store_explicit(&g_places_lim, limit > (uint32_t)INT32_MAX ? INT32_MAX : (int32_t)limit, memory_order_relaxed); }
+
+uint32_t park_places_used(void) {
+  int32_t v = atomic_load_explicit(&g_places, memory_order_relaxed);
+  return v < 0 ? 0 : (uint32_t)v;
+}
+
+/* a compare-and-swap loop, not an add that is undone: the count never goes above the limit, not even for a moment (a taker that sees it full leaves at once) */
+bool park_place_take(void) {
+  int32_t lim = atomic_load_explicit(&g_places_lim, memory_order_relaxed);
+  int32_t c = atomic_load_explicit(&g_places, memory_order_relaxed);
+  while (c < lim) {
+    if (atomic_compare_exchange_weak_explicit(&g_places, &c, c + 1, memory_order_acq_rel, memory_order_relaxed)) return true;
+  }
+  return false;
+}
+
+void park_place_give(void) {
+  int32_t c = atomic_load_explicit(&g_places, memory_order_relaxed);
+  while (c > 0) {                                        /* (a place given back twice must not make room for one more fetch) */
+    if (atomic_compare_exchange_weak_explicit(&g_places, &c, c - 1, memory_order_acq_rel, memory_order_relaxed)) return;
+  }
+}
+
+/* The fetch-rate bucket: one 64-bit word, the tokens in thousandths in the low half and the time (ms, the low 32 bits of CLOCK_MONOTONIC) of the last change in the
+ * high half.  The fill is computed from the time that has passed when a thread reads the word (rate thousandths a millisecond, at most one second of the rate);
+ * a take writes the word with a compare-and-swap, a take that finds too few tokens writes nothing (a flood against an empty bucket is reads only).  0 is a bucket
+ * that was never used: full. */
+#define PARK_RATE_MAX 4000000u                           /* (rate x 1000 must fit 32 bits) */
+#define PARK_RATE_BEHIND_MS 0x100000u                    /* (about 17 minutes) how far behind the stamp a caller's clock may be and still count as "no time has passed" */
+static _Atomic uint32_t g_rate;
+static _Atomic uint64_t g_rate_st;
+
+void park_rate_set(uint32_t per_s) { atomic_store_explicit(&g_rate, per_s > PARK_RATE_MAX ? PARK_RATE_MAX : per_s, memory_order_relaxed); }
+void park_rate_reset(void) { atomic_store_explicit(&g_rate_st, 0, memory_order_relaxed); }
+
+static uint32_t rate_level(uint64_t st, uint32_t rate, int64_t now_ms, uint32_t *stamp) {
+  uint32_t cap = rate * 1000u, now32 = (uint32_t)now_ms;
+  if (now32 == 0) now32 = 1;
+  if (st == 0) {
+    *stamp = now32;
+    return cap;
+  }
+  uint32_t tok = (uint32_t)st, old = (uint32_t)(st >> 32), d = now32 - old;
+  /* A caller whose clock reading is behind the stamp (another thread read the clock later and wrote it; a thread that was preempted between its clock read and here)
+   * has had nothing pass: d = 0, and the stamp stays where it is.  Behind by anything up to PARK_RATE_BEHIND_MS counts (it was 256 ms: a thread that lost the CPU for more
+   * than that made d wrap to ~2^32, the bucket refilled to full and the stamp moved back).  Further behind is a stamp that is old (a bucket idle for weeks, the 32 bits
+   * of the clock having wrapped since): that is forward, a full bucket. */
+  if ((uint32_t)(old - now32) < PARK_RATE_BEHIND_MS) d = 0;
+  *stamp = d ? now32 : old;
+  uint64_t t = (uint64_t)tok + (uint64_t)d * rate;
+  return t > cap ? cap : (uint32_t)t;
+}
+
+static uint32_t rate_need(uint32_t rate, bool half) { return half && rate * 500u > 1000u ? rate * 500u : 1000u; }
+
+bool park_rate_take(int64_t now_ms, bool half) {
+  uint32_t rate = atomic_load_explicit(&g_rate, memory_order_relaxed);
+  if (!rate) return true;
+  uint32_t need = rate_need(rate, half);
+  uint64_t st = atomic_load_explicit(&g_rate_st, memory_order_relaxed);
+  for (;;) {
+    uint32_t stamp, lvl = rate_level(st, rate, now_ms, &stamp);
+    if (lvl < need) return false;
+    uint64_t ns = ((uint64_t)stamp << 32) | (lvl - 1000u);
+    if (atomic_compare_exchange_weak_explicit(&g_rate_st, &st, ns, memory_order_acq_rel, memory_order_relaxed)) return true;
+  }
+}
+
+bool park_rate_check(int64_t now_ms, bool half) {
+  uint32_t rate = atomic_load_explicit(&g_rate, memory_order_relaxed);
+  if (!rate) return true;
+  uint32_t stamp;
+  return rate_level(atomic_load_explicit(&g_rate_st, memory_order_relaxed), rate, now_ms, &stamp) >= rate_need(rate, half);
+}
+
+uint32_t park_rate_level(int64_t now_ms) {
+  uint32_t rate = atomic_load_explicit(&g_rate, memory_order_relaxed), stamp;
+  return rate ? rate_level(atomic_load_explicit(&g_rate_st, memory_order_relaxed), rate, now_ms, &stamp) : 0;
+}
+
+void park_rate_give(void) {
+  uint32_t rate = atomic_load_explicit(&g_rate, memory_order_relaxed);
+  uint64_t st = atomic_load_explicit(&g_rate_st, memory_order_relaxed);
+  if (!rate) return;
+  for (;;) {
+    if (st == 0) return;                                 /* never used: full */
+    uint64_t cap = (uint64_t)rate * 1000u, t = (uint64_t)(uint32_t)st + 1000u;
+    if (t > cap) t = cap;
+    if (t <= (uint32_t)st) return;
+    uint64_t ns = (st & 0xFFFFFFFF00000000ull) | t;
+    if (atomic_compare_exchange_weak_explicit(&g_rate_st, &st, ns, memory_order_acq_rel, memory_order_relaxed)) return;
+  }
+}
+
+/* ---- the claims: one worker takes the place and the token for a zone, the others do not (B2 M1) ----
+ * A claim is a place and a token taken at the gate for a request that is queued but not yet a fetch: the zone is not LOADING until the ingest thread has popped the request,
+ * so every worker that looked at the zone meanwhile saw it ABSENT and took a place and a token of its own for the same fetch.  A few workers asking for one zone used up the
+ * pool and the bucket, the other zones were told "not ready", and a worker's query for that zone was refused although the fetch was queued.  The mark says "a request
+ * with a claim for this zone is queued": the first worker sets it (with the claim), the others park and ask without one (the ingest thread drops the request while the
+ * mark is up, and the one fetch wakes them all, or fails them all), and the ingest thread clears the mark when it is done with the claimed request, whatever came of it
+ * (a fetch started, shed, refused by rate, table full, view gone, the zone in memory or not there), or the worker that set it when the request could not be made.
+ * Every mark was set with a claim that is on its way to exactly one of those, so none stays.
+ * The marks are a table of hashes of (view, zone), a few slots apart from where the hash points (a claim is a place of fetch-concurrency, at most 256, in 1024 slots).  A
+ * collision between two zones, or a window with no free slot, costs the gate (a worker that is told the zone is claimed asks without a claim, which the ingest thread
+ * still handles as before), never an answer.  Two marks for one zone (two workers that raced, or a slot that was freed between their two looks) are both cleared by the one
+ * clear: a duplicate claim that the ingest thread drops. */
+#define PARK_CLAIM_SLOTS 1024u                           /* (a power of two) */
+#define PARK_CLAIM_WIN 8u
+static _Atomic uint64_t g_claim[PARK_CLAIM_SLOTS];       /* 0: free */
+
+static uint64_t name_key(const char *view, const char *zone) {
+  uint64_t h = 1469598103934665603ULL;
+  for (const char *p = view; *p; p++) h = (h ^ (uint8_t)*p) * 1099511628211ULL;
+  h = (h ^ 0xFF) * 1099511628211ULL;
+  for (const char *p = zone; *p; p++) h = (h ^ (uint8_t)(*p | 0x20)) * 1099511628211ULL;
+  return h | 1;                                          /* (never 0, the free slot) */
+}
+
+uint64_t park_claim_key(const char *view, const char *zone) { return name_key(view, zone); }
+
+static size_t claim_slot(uint64_t key, unsigned j) { return (size_t)(((key >> 8) + j) & (PARK_CLAIM_SLOTS - 1u)); }
+
+bool park_claim_held(uint64_t key) {
+  for (unsigned j = 0; j < PARK_CLAIM_WIN; j++)
+    if (atomic_load_explicit(&g_claim[claim_slot(key, j)], memory_order_acquire) == key) return true;
+  return false;
+}
+
+bool park_claim_mark(uint64_t key) {
+  for (unsigned j = 0; j < PARK_CLAIM_WIN; j++) {
+    _Atomic uint64_t *s = &g_claim[claim_slot(key, j)];
+    uint64_t v = atomic_load_explicit(s, memory_order_acquire);
+    if (v == key) return false;
+    if (v == 0 && atomic_compare_exchange_strong_explicit(s, &v, key, memory_order_acq_rel, memory_order_acquire)) return true;
+    if (v == key) return false;                          /* (another worker took the slot between the load and the swap, for this very zone) */
+  }
+  return true;                                           /* no free slot in reach: the claim stands, without a mark */
+}
+
+void park_claim_clear(uint64_t key) {
+  for (unsigned j = 0; j < PARK_CLAIM_WIN; j++) {
+    _Atomic uint64_t *s = &g_claim[claim_slot(key, j)];
+    uint64_t v = key;
+    (void)atomic_compare_exchange_strong_explicit(s, &v, 0, memory_order_acq_rel, memory_order_relaxed);
+  }
+}
+
+void park_claim_release(const char *view, const char *zone) {
+  park_place_give();
+  park_rate_give();
+  park_claim_clear(name_key(view, zone));
+}
+
+/* what a worker turned away at the gate: one line per worker, so that a flood of refusals does not make the workers fight over a counter */
+typedef struct {
+  _Alignas(64) _Atomic uint64_t shed;
+  _Atomic uint64_t rate;
+} gate_cnt_t;
+static gate_cnt_t g_gate[PARK_MAX_WORKERS];
+
+void park_gate_count(int w, bool rate) {
+  if (w < 0 || w >= PARK_MAX_WORKERS) w = 0;
+  atomic_fetch_add_explicit(rate ? &g_gate[w].rate : &g_gate[w].shed, 1, memory_order_relaxed);
 }
 
 void park_stats_get(park_stats_t *out) {
   out->full = atomic_load_explicit(&g_park_full, memory_order_relaxed);
   out->timeout = atomic_load_explicit(&g_park_timeout, memory_order_relaxed);
   out->ring_dropped = 0;
-  for (int w = 0; w < PARK_MAX_WORKERS; w++) out->ring_dropped += atomic_load_explicit(&g_fetch[w].dropped, memory_order_relaxed);
+  out->gate_shed = out->gate_rate = 0;
+  for (int w = 0; w < PARK_MAX_WORKERS; w++) {
+    out->ring_dropped += atomic_load_explicit(&g_fetch[w].dropped, memory_order_relaxed);
+    out->gate_shed += atomic_load_explicit(&g_gate[w].shed, memory_order_relaxed);
+    out->gate_rate += atomic_load_explicit(&g_gate[w].rate, memory_order_relaxed);
+  }
 }
 
 void park_fetch_set_notify(int kq) { atomic_store_explicit(&g_ingest_kq, kq, memory_order_relaxed); }
 
-bool park_fetch_request(int w, const char *view, const char *zone, uint8_t prio, uint8_t mode) {
-  if (w < 0 || w >= PARK_MAX_WORKERS) return false;
-  if (!park_fetch_push(&g_fetch[w], view, zone, prio, mode)) return false;
-  trigger(atomic_load_explicit(&g_ingest_kq, memory_order_relaxed), PARK_FETCH_IDENT);
+/* The sleep protocol.  The ingest thread waits for events in kevent() with a timeout; a worker that has pushed a request must wake it, but a trigger is a system
+ * call (27% of the workers' time at 200k queries a second) and the thread is awake most of the time while there is work.  So a worker triggers only when the thread
+ * may be asleep, which the thread says with g_ingest_asleep:
+ *     worker:  push the request (the ring's head, release);  fence(seq_cst);  if (g_ingest_asleep) trigger.
+ *     ingest:  g_ingest_asleep = true;  fence(seq_cst);  if (a request is pending) { g_ingest_asleep = false; do not wait }  else wait;  g_ingest_asleep = false.
+ * With the two fences either the worker sees the flag (and triggers: the event is there when the thread waits, or wakes it) or the thread sees the request (and does
+ * not wait): the case in which the worker sees no flag and the thread sees no request cannot happen, so no request is left in a ring while the thread sleeps.
+ * A worker that sees the flag while the thread is already awake makes one trigger too many, which costs the thread one pass.  The thread looks for requests after
+ * every wait, not only when the event is the trigger (the requests that came while it was awake had no trigger). */
+static void trigger_ingest(void) {
+  atomic_thread_fence(memory_order_seq_cst);
+  if (atomic_load_explicit(&g_ingest_asleep, memory_order_relaxed)) trigger(atomic_load_explicit(&g_ingest_kq, memory_order_relaxed), PARK_FETCH_IDENT);
+}
+
+bool park_fetch_pending(void) {
+  int wm = atomic_load_explicit(&g_wmax, memory_order_relaxed);
+  for (int w = 0; w < wm; w++)
+    if (atomic_load_explicit(&g_fetch[w].head, memory_order_acquire) != atomic_load_explicit(&g_fetch[w].tail, memory_order_relaxed)) return true;
+  for (int k = 0; k < PARK_XFR_SLOTS; k++)
+    if (atomic_load_explicit(&g_xfr_st[k], memory_order_acquire) == 2) return true;
+  return false;
+}
+
+bool park_fetch_sleep_prepare(void) {
+  atomic_store_explicit(&g_ingest_asleep, true, memory_order_relaxed);
+  atomic_thread_fence(memory_order_seq_cst);
+  if (!park_fetch_pending()) return false;
+  atomic_store_explicit(&g_ingest_asleep, false, memory_order_relaxed);
   return true;
 }
 
-/* The requests of threads that are not workers (the transfer threads): a few slots that any number of threads may fill.  A slot is free (0), being
- * filled by the thread that took it with a compare-and-swap (1) or ready for the ingest thread (2); the ingest thread empties ready slots.  No lock. */
-#define PARK_XFR_SLOTS 16
-static park_fetch_req_t g_xfr_q[PARK_XFR_SLOTS];
-static _Atomic uint8_t g_xfr_st[PARK_XFR_SLOTS];
+void park_fetch_sleep_done(void) { atomic_store_explicit(&g_ingest_asleep, false, memory_order_relaxed); }
 
+bool park_fetch_request(int w, const char *view, const char *zone, uint8_t prio, uint8_t mode) {
+  if (w < 0 || w >= PARK_MAX_WORKERS) return false;
+  wmax_raise(w);
+  if (!park_fetch_push(&g_fetch[w], view, zone, prio, mode)) return false;
+  trigger_ingest();
+  return true;
+}
+
+/* (the slots are declared above, with the sleep protocol that looks at them) */
 bool park_fetch_request_any(const char *view, const char *zone, uint8_t prio, uint8_t mode) {
   size_t vl, zl;
   if (!key_fits(view, zone, &vl, &zl)) return false;
@@ -402,7 +644,7 @@ bool park_fetch_request_any(const char *view, const char *zone, uint8_t prio, ui
     memcpy(q->view, view, vl + 1);
     memcpy(q->zone, zone, zl + 1);
     atomic_store_explicit(&g_xfr_st[i], 2, memory_order_release);
-    trigger(atomic_load_explicit(&g_ingest_kq, memory_order_relaxed), PARK_FETCH_IDENT);
+    trigger_ingest();
     return true;
   }
   return false;
@@ -418,11 +660,7 @@ static _Atomic uint64_t g_bg_key[PARK_BG_SLOTS];
 static _Atomic int64_t g_bg_at[PARK_BG_SLOTS];
 
 void park_bg_fetch(const char *view, const char *zone) {
-  uint64_t h = 1469598103934665603ULL;
-  for (const char *p = view; *p; p++) h = (h ^ (uint8_t)*p) * 1099511628211ULL;
-  h = (h ^ 0xFF) * 1099511628211ULL;
-  for (const char *p = zone; *p; p++) h = (h ^ (uint8_t)(*p | 0x20)) * 1099511628211ULL;
-  h |= 1;
+  uint64_t h = name_key(view, zone);
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   int64_t now = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
@@ -439,16 +677,22 @@ bool park_fetch_next(park_fetch_req_t *out) {
   /* the workers' rings and the slots of the transfer threads take turns: the slots are one more source in the round robin, so that workers whose rings are always
    * full do not starve a transfer (which would run into its time-out) */
   uint32_t start = atomic_fetch_add_explicit(&g_fetch_rr, 1, memory_order_relaxed);
-  for (int i = 0; i <= PARK_MAX_WORKERS; i++) {
-    int w = (int)((start + (uint32_t)i) % (PARK_MAX_WORKERS + 1));
-    if (w == PARK_MAX_WORKERS) {
+  int wm = atomic_load_explicit(&g_wmax, memory_order_relaxed);          /* (only the rings that were ever used: 128 rings are 128 cache lines when the answer is "none") */
+  for (int i = 0; i <= wm; i++) {
+    int w = (int)((start + (uint32_t)i) % (uint32_t)(wm + 1));
+    if (w == wm) {
       for (int k = 0; k < PARK_XFR_SLOTS; k++) {
         if (atomic_load_explicit(&g_xfr_st[k], memory_order_acquire) != 2) continue;
         *out = g_xfr_q[k];
         atomic_store_explicit(&g_xfr_st[k], 0, memory_order_release);
+        out->claimed = false;
+        out->worker = -1;
         return true;
       }
     } else if (park_fetch_pop(&g_fetch[w], out)) {
+      out->claimed = (out->prio & PARK_PRIO_CLAIMED) != 0;
+      out->prio &= (uint8_t)~PARK_PRIO_CLAIMED;
+      out->worker = (int16_t)w;
       return true;
     }
   }

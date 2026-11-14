@@ -202,7 +202,7 @@ static void test_compute_ixfr_diff(void) {
     printf("[TEST] AXFR/IXFR: compute_ixfr_diff & history ring buffer...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strncpy(entry.domain, "example.com", sizeof(entry.domain) - 1);
+    entry.domain = "example.com";
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
     // 1. Setup Old Arena (serial 100)
@@ -304,7 +304,7 @@ static void test_compute_ixfr_diff_generic_and_edge_cases(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "example.org.", sizeof(entry.domain));
+    entry.domain = "example.org.";
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
     // 1. Same serial test -> no diff produced
@@ -782,7 +782,7 @@ static void test_send_axfr_response_ixfr_and_extended(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strncpy(entry.domain, "example.com.", sizeof(entry.domain) - 1);
+    entry.domain = "example.com.";
     strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
@@ -958,7 +958,7 @@ static void test_send_axfr_response_large_multi_chunk_tsig(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "large.example.", sizeof(entry.domain));
+    entry.domain = "large.example.";
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
@@ -1045,7 +1045,7 @@ static void test_handle_axfr_event_multi_message_and_tsig(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "multi.example.", sizeof(entry.domain));
+    entry.domain = "multi.example.";
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
@@ -1153,7 +1153,7 @@ static void test_handle_axfr_event_drops_unencodable(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "drop.example.", sizeof(entry.domain));
+    entry.domain = "drop.example.";
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
@@ -1211,7 +1211,7 @@ static void test_handle_axfr_event_and_worker_thread(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "worker.example.", sizeof(entry.domain));
+    entry.domain = "worker.example.";
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
@@ -1479,7 +1479,7 @@ static void test_axfr_worker_zone_out_of_memory(void) {
     /* the zone is there when the wait ends: the transfer is the usual one from the entry, and the thread gives its count back */
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "nr.example.com.", sizeof(entry.domain));
+    entry.domain = "nr.example.com.";
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
@@ -1589,7 +1589,7 @@ static void test_r11_stalled_transfer_holds_nothing_but_its_version(void) {
 
     zone_db_entry_t e;
     memset(&e, 0, sizeof(e));
-    strlcpy(e.domain, "r11.example.", sizeof(e.domain));
+    e.domain = "r11.example.";
     pthread_mutex_init(&e.writer_lock, NULL);
     pthread_mutex_init(&e.ixfr_history.lock, NULL);
     atomic_init(&e.snapshot_refs, 1);
@@ -1996,7 +1996,7 @@ static void test_send_axfr_response_error_and_edge_branches(void) {
     // 2. empty arena (count == 0) -> returns early
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "edge.example.", sizeof(entry.domain));
+    entry.domain = "edge.example.";
     zone_arena_t empty_arena;
     zone_arena_init(&empty_arena);
     atomic_store_explicit(&entry.rcu.active, &empty_arena.ver, memory_order_release);
@@ -2041,7 +2041,7 @@ static void test_compute_ixfr_diff_exhaustive(void) {
     printf("[TEST] AXFR/IXFR: compute_ixfr_diff exhaustive edge cases...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "diff.example.", sizeof(entry.domain));
+    entry.domain = "diff.example.";
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
     zone_arena_t old_a, new_a;
@@ -2252,7 +2252,7 @@ static void test_extended_ixfr_soa_state(void) {
     printf("[TEST] AXFR/IXFR: Extended IXFR resets the tag state before the SOA of the added part...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "tagged.example.", sizeof(entry.domain));
+    entry.domain = "tagged.example.";
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
@@ -2343,7 +2343,7 @@ static void test_send_axfr_response_full_matrix(void) {
     printf("[TEST] AXFR/IXFR: send_axfr_response() full extended & IXFR delta sending...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "matrix.example.", sizeof(entry.domain));
+    entry.domain = "matrix.example.";
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
@@ -2483,7 +2483,7 @@ static void test_handle_axfr_event_intermediate_unsigned_flow(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "tsigflow.example.", sizeof(entry.domain));
+    entry.domain = "tsigflow.example.";
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
@@ -2581,7 +2581,7 @@ static void test_ixfr_delta_empty_records(void) {
     printf("[TEST] AXFR/IXFR: compute_ixfr_diff with identical records (serial increment only)...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "deltaempty.example.", sizeof(entry.domain));
+    entry.domain = "deltaempty.example.";
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
     zone_arena_t old_a, new_a;
@@ -2610,7 +2610,7 @@ static void test_ixfr_history_ring_buffer_wrap(void) {
     printf("[TEST] AXFR/IXFR: history ring buffer heavy wrap-around...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "ringwrap.example.", sizeof(entry.domain));
+    entry.domain = "ringwrap.example.";
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
     ixfr_history_set_depth(&entry, MAX_IXFR_HISTORY);
 
@@ -2640,7 +2640,7 @@ static void test_axfr_extended_option_version_mismatch(void) {
     printf("[TEST] AXFR/IXFR: Option 65153 version mismatch fallback...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "optver.example.", sizeof(entry.domain));
+    entry.domain = "optver.example.";
     pthread_mutex_init(&entry.writer_lock, NULL);
     init_axfr_zone(test_zone_slot(&entry, 0), "optver.example.", "100");
     atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
@@ -2677,7 +2677,7 @@ static void test_axfr_extended_option_hash_mismatch(void) {
     printf("[TEST] AXFR/IXFR: Option 65153 hash mismatch fallback...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "opthash.example.", sizeof(entry.domain));
+    entry.domain = "opthash.example.";
     pthread_mutex_init(&entry.writer_lock, NULL);
     init_axfr_zone(test_zone_slot(&entry, 0), "opthash.example.", "100");
     atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
@@ -2713,7 +2713,7 @@ static void test_send_axfr_response_zero_records_nosoa(void) {
     printf("[TEST] AXFR/IXFR: send_axfr_response empty active zone...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "emptyzone.example.", sizeof(entry.domain));
+    entry.domain = "emptyzone.example.";
     zone_arena_t empty_a;
     zone_arena_init(&empty_a);
     atomic_store_explicit(&entry.rcu.active, &empty_a.ver, memory_order_release);
@@ -2735,7 +2735,7 @@ static void test_send_axfr_response_tsig_signing_error(void) {
     printf("[TEST] AXFR/IXFR: send_axfr_response invalid TSIG key algorithm...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "badtsig.example.", sizeof(entry.domain));
+    entry.domain = "badtsig.example.";
     pthread_mutex_init(&entry.writer_lock, NULL);
     init_axfr_zone(test_zone_slot(&entry, 0), "badtsig.example.", "100");
     atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
@@ -2762,7 +2762,7 @@ static void test_handle_axfr_event_socket_closed(void) {
     printf("[TEST] AXFR/IXFR: handle_axfr_event socket closed unexpected EOF...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "eof.example.", sizeof(entry.domain));
+    entry.domain = "eof.example.";
 
     reset_mock_tcp_stream(); // 0 messages pushed -> read_dns_tcp_message returns -1
 
@@ -2782,7 +2782,7 @@ static void test_handle_axfr_event_non_soa_first_packet(void) {
     printf("[TEST] AXFR/IXFR: handle_axfr_event reject stream with non-SOA first packet...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "nosoa1.example.", sizeof(entry.domain));
+    entry.domain = "nosoa1.example.";
 
     reset_mock_tcp_stream();
     uint8_t p1[256] = {0};
@@ -2815,7 +2815,7 @@ static void test_handle_axfr_event_serial_not_newer(void) {
     printf("[TEST] AXFR/IXFR: handle_axfr_event reject serial rollback...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "rollback.example.", sizeof(entry.domain));
+    entry.domain = "rollback.example.";
     atomic_store_explicit(&entry.serial, 300, memory_order_release);
 
     reset_mock_tcp_stream();
@@ -2854,7 +2854,7 @@ static void test_handle_axfr_event_tsig_badsig_abort(void) {
     printf("[TEST] AXFR/IXFR: handle_axfr_event TSIG BADSIG abort...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "tsigabort.example.", sizeof(entry.domain));
+    entry.domain = "tsigabort.example.";
 
     tsig_key_t key;
     memset(&key, 0, sizeof(key));
@@ -2945,7 +2945,7 @@ static void test_compute_ixfr_diff_rdata_order_insensitive(void) {
     printf("[TEST] AXFR/IXFR: compute_ixfr_diff RDATA order insensitivity...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "order.example.", sizeof(entry.domain));
+    entry.domain = "order.example.";
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
     zone_arena_t old_a, new_a;
@@ -3001,7 +3001,7 @@ static void test_compute_ixfr_diff_ttl_changes_only(void) {
     printf("[TEST] AXFR/IXFR: compute_ixfr_diff TTL change only detection...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "ttlchange.example.", sizeof(entry.domain));
+    entry.domain = "ttlchange.example.";
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
     zone_arena_t old_a, new_a;
@@ -3105,7 +3105,7 @@ static void test_compute_ixfr_diff_soa_serial_equal_or_less(void) {
     printf("[TEST] AXFR/IXFR: compute_ixfr_diff with equal or decreased serial...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "example.com.", sizeof(entry.domain));
+    entry.domain = "example.com.";
 
     zone_arena_t old_arena, new_arena;
     zone_arena_init(&old_arena);
@@ -3137,7 +3137,7 @@ static void test_compute_ixfr_diff_excessive_delta_count(void) {
     printf("[TEST] AXFR/IXFR: compute_ixfr_diff excessive delta count (>10000)...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "example.com.", sizeof(entry.domain));
+    entry.domain = "example.com.";
 
     zone_arena_t old_a, new_a;
     zone_arena_init(&old_a);
@@ -3158,7 +3158,7 @@ static void test_compute_ixfr_diff_generic_rdata_handling(void) {
     printf("[TEST] AXFR/IXFR: compute_ixfr_diff with RFC 3597 generic RDATA...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "example.com.", sizeof(entry.domain));
+    entry.domain = "example.com.";
 
     zone_arena_t old_a, new_a;
     zone_arena_init(&old_a);
@@ -3194,7 +3194,7 @@ static void test_compute_ixfr_diff_tinydns_timestamp_and_location(void) {
     printf("[TEST] AXFR/IXFR: compute_ixfr_diff with tinydns location tags...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "example.com.", sizeof(entry.domain));
+    entry.domain = "example.com.";
 
     zone_arena_t old_a, new_a;
     zone_arena_init(&old_a);
@@ -3270,7 +3270,7 @@ static void test_send_axfr_response_tinydns_loc_and_ecs(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "loc.example.", sizeof(entry.domain));
+    entry.domain = "loc.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     int sv[2];
@@ -3300,7 +3300,7 @@ static void test_send_axfr_response_soa_only_zone(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "soaonly.example.", sizeof(entry.domain));
+    entry.domain = "soaonly.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     int sv[2];
@@ -3333,7 +3333,7 @@ static void test_send_axfr_response_with_ns_and_glue(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "glue.example.", sizeof(entry.domain));
+    entry.domain = "glue.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_arena_destroy(&arena);
@@ -3358,7 +3358,7 @@ static void test_send_axfr_response_ixfr_single_soa_uptodate(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "uptodate.example.", sizeof(entry.domain));
+    entry.domain = "uptodate.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_arena_destroy(&arena);
@@ -3369,7 +3369,7 @@ static void test_send_axfr_response_ixfr_multi_history_chain(void) {
     printf("[TEST] AXFR/IXFR: send_axfr_response IXFR multi-delta history chain...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "chain.example.", sizeof(entry.domain));
+    entry.domain = "chain.example.";
 
     assert(entry.ixfr_history.count == 0);
     printf("  -> IXFR multi-delta history chain passed.\n");
@@ -3472,7 +3472,7 @@ static void test_axfr_ixfr_soa_serial_equal_up_to_date(void) {
     printf("[TEST] AXFR/IXFR: SOA serial equal up-to-date immediate response...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "uptodate.test.", sizeof(entry.domain));
+    entry.domain = "uptodate.test.";
     atomic_init(&entry.serial, 2026092401);
     assert(atomic_load(&entry.serial) == 2026092401);
     printf("  -> serial equal up-to-date passed.\n");
@@ -3576,7 +3576,7 @@ static void test_axfr_ixfr_catalog_property_group_sync(void) {
 static void test_axfr_ixfr_serial_equal_returns_single_soa(void) {
     printf("[TEST] AXFR/IXFR: IXFR query with client_serial == zone_serial...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "uptodate.example.", sizeof(entry.domain));
+    entry.domain = "uptodate.example.";
     atomic_init(&entry.serial, 2026092401);
     assert(atomic_load(&entry.serial) == 2026092401);
 }
@@ -3584,7 +3584,7 @@ static void test_axfr_ixfr_serial_equal_returns_single_soa(void) {
 static void test_axfr_ixfr_delta_single_delete_and_add(void) {
     printf("[TEST] AXFR/IXFR: IXFR delta single record delete and add...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "diff.example.", sizeof(entry.domain));
+    entry.domain = "diff.example.";
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
     init_axfr_zone(test_zone_slot(&entry, 0), "diff.example.", "100");
     init_axfr_zone(test_zone_slot(&entry, 1), "diff.example.", "200");
@@ -3601,7 +3601,7 @@ static void test_axfr_ixfr_delta_single_delete_and_add(void) {
 static void test_axfr_ixfr_delta_cname_addition(void) {
     printf("[TEST] AXFR/IXFR: IXFR delta with CNAME alias addition...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "cname.example.", sizeof(entry.domain));
+    entry.domain = "cname.example.";
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
     init_axfr_zone(test_zone_slot(&entry, 0), "cname.example.", "100");
     init_axfr_zone(test_zone_slot(&entry, 1), "cname.example.", "200");
@@ -3627,7 +3627,7 @@ static void test_axfr_ixfr_delta_cname_addition(void) {
 static void test_axfr_ixfr_delta_txt_record_modification(void) {
     printf("[TEST] AXFR/IXFR: IXFR delta with TXT record modification...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "txt.example.", sizeof(entry.domain));
+    entry.domain = "txt.example.";
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
     init_axfr_zone(test_zone_slot(&entry, 0), "txt.example.", "100");
     init_axfr_zone(test_zone_slot(&entry, 1), "txt.example.", "200");
@@ -3668,7 +3668,7 @@ static void test_axfr_ixfr_extended_tag_ecs_tagdef(void) {
 static void test_axfr_ixfr_feature_case_11(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 11...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone11.example.", sizeof(entry.domain));
+    entry.domain = "zone11.example.";
     atomic_init(&entry.serial, 1000 + 11);
     assert(atomic_load(&entry.serial) == 1000 + 11);
     
@@ -3684,7 +3684,7 @@ static void test_axfr_ixfr_feature_case_11(void) {
 static void test_axfr_ixfr_feature_case_12(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 12...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone12.example.", sizeof(entry.domain));
+    entry.domain = "zone12.example.";
     atomic_init(&entry.serial, 1000 + 12);
     assert(atomic_load(&entry.serial) == 1000 + 12);
     
@@ -3700,7 +3700,7 @@ static void test_axfr_ixfr_feature_case_12(void) {
 static void test_axfr_ixfr_feature_case_13(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 13...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone13.example.", sizeof(entry.domain));
+    entry.domain = "zone13.example.";
     atomic_init(&entry.serial, 1000 + 13);
     assert(atomic_load(&entry.serial) == 1000 + 13);
     
@@ -3716,7 +3716,7 @@ static void test_axfr_ixfr_feature_case_13(void) {
 static void test_axfr_ixfr_feature_case_14(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 14...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone14.example.", sizeof(entry.domain));
+    entry.domain = "zone14.example.";
     atomic_init(&entry.serial, 1000 + 14);
     assert(atomic_load(&entry.serial) == 1000 + 14);
     
@@ -3732,7 +3732,7 @@ static void test_axfr_ixfr_feature_case_14(void) {
 static void test_axfr_ixfr_feature_case_15(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 15...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone15.example.", sizeof(entry.domain));
+    entry.domain = "zone15.example.";
     atomic_init(&entry.serial, 1000 + 15);
     assert(atomic_load(&entry.serial) == 1000 + 15);
     
@@ -3748,7 +3748,7 @@ static void test_axfr_ixfr_feature_case_15(void) {
 static void test_axfr_ixfr_feature_case_16(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 16...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone16.example.", sizeof(entry.domain));
+    entry.domain = "zone16.example.";
     atomic_init(&entry.serial, 1000 + 16);
     assert(atomic_load(&entry.serial) == 1000 + 16);
     
@@ -3764,7 +3764,7 @@ static void test_axfr_ixfr_feature_case_16(void) {
 static void test_axfr_ixfr_feature_case_17(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 17...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone17.example.", sizeof(entry.domain));
+    entry.domain = "zone17.example.";
     atomic_init(&entry.serial, 1000 + 17);
     assert(atomic_load(&entry.serial) == 1000 + 17);
     
@@ -3780,7 +3780,7 @@ static void test_axfr_ixfr_feature_case_17(void) {
 static void test_axfr_ixfr_feature_case_18(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 18...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone18.example.", sizeof(entry.domain));
+    entry.domain = "zone18.example.";
     atomic_init(&entry.serial, 1000 + 18);
     assert(atomic_load(&entry.serial) == 1000 + 18);
     
@@ -3796,7 +3796,7 @@ static void test_axfr_ixfr_feature_case_18(void) {
 static void test_axfr_ixfr_feature_case_19(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 19...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone19.example.", sizeof(entry.domain));
+    entry.domain = "zone19.example.";
     atomic_init(&entry.serial, 1000 + 19);
     assert(atomic_load(&entry.serial) == 1000 + 19);
     
@@ -3812,7 +3812,7 @@ static void test_axfr_ixfr_feature_case_19(void) {
 static void test_axfr_ixfr_feature_case_20(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 20...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone20.example.", sizeof(entry.domain));
+    entry.domain = "zone20.example.";
     atomic_init(&entry.serial, 1000 + 20);
     assert(atomic_load(&entry.serial) == 1000 + 20);
     
@@ -3828,7 +3828,7 @@ static void test_axfr_ixfr_feature_case_20(void) {
 static void test_axfr_ixfr_feature_case_21(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 21...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone21.example.", sizeof(entry.domain));
+    entry.domain = "zone21.example.";
     atomic_init(&entry.serial, 1000 + 21);
     assert(atomic_load(&entry.serial) == 1000 + 21);
     
@@ -3844,7 +3844,7 @@ static void test_axfr_ixfr_feature_case_21(void) {
 static void test_axfr_ixfr_feature_case_22(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 22...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone22.example.", sizeof(entry.domain));
+    entry.domain = "zone22.example.";
     atomic_init(&entry.serial, 1000 + 22);
     assert(atomic_load(&entry.serial) == 1000 + 22);
     
@@ -3860,7 +3860,7 @@ static void test_axfr_ixfr_feature_case_22(void) {
 static void test_axfr_ixfr_feature_case_23(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 23...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone23.example.", sizeof(entry.domain));
+    entry.domain = "zone23.example.";
     atomic_init(&entry.serial, 1000 + 23);
     assert(atomic_load(&entry.serial) == 1000 + 23);
     
@@ -3876,7 +3876,7 @@ static void test_axfr_ixfr_feature_case_23(void) {
 static void test_axfr_ixfr_feature_case_24(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 24...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone24.example.", sizeof(entry.domain));
+    entry.domain = "zone24.example.";
     atomic_init(&entry.serial, 1000 + 24);
     assert(atomic_load(&entry.serial) == 1000 + 24);
     
@@ -3892,7 +3892,7 @@ static void test_axfr_ixfr_feature_case_24(void) {
 static void test_axfr_ixfr_feature_case_25(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 25...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone25.example.", sizeof(entry.domain));
+    entry.domain = "zone25.example.";
     atomic_init(&entry.serial, 1000 + 25);
     assert(atomic_load(&entry.serial) == 1000 + 25);
     
@@ -3908,7 +3908,7 @@ static void test_axfr_ixfr_feature_case_25(void) {
 static void test_axfr_ixfr_feature_case_26(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 26...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone26.example.", sizeof(entry.domain));
+    entry.domain = "zone26.example.";
     atomic_init(&entry.serial, 1000 + 26);
     assert(atomic_load(&entry.serial) == 1000 + 26);
     
@@ -3924,7 +3924,7 @@ static void test_axfr_ixfr_feature_case_26(void) {
 static void test_axfr_ixfr_feature_case_27(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 27...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone27.example.", sizeof(entry.domain));
+    entry.domain = "zone27.example.";
     atomic_init(&entry.serial, 1000 + 27);
     assert(atomic_load(&entry.serial) == 1000 + 27);
     
@@ -3940,7 +3940,7 @@ static void test_axfr_ixfr_feature_case_27(void) {
 static void test_axfr_ixfr_feature_case_28(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 28...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone28.example.", sizeof(entry.domain));
+    entry.domain = "zone28.example.";
     atomic_init(&entry.serial, 1000 + 28);
     assert(atomic_load(&entry.serial) == 1000 + 28);
     
@@ -3956,7 +3956,7 @@ static void test_axfr_ixfr_feature_case_28(void) {
 static void test_axfr_ixfr_feature_case_29(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 29...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone29.example.", sizeof(entry.domain));
+    entry.domain = "zone29.example.";
     atomic_init(&entry.serial, 1000 + 29);
     assert(atomic_load(&entry.serial) == 1000 + 29);
     
@@ -3972,7 +3972,7 @@ static void test_axfr_ixfr_feature_case_29(void) {
 static void test_axfr_ixfr_feature_case_30(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 30...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone30.example.", sizeof(entry.domain));
+    entry.domain = "zone30.example.";
     atomic_init(&entry.serial, 1000 + 30);
     assert(atomic_load(&entry.serial) == 1000 + 30);
     
@@ -3988,7 +3988,7 @@ static void test_axfr_ixfr_feature_case_30(void) {
 static void test_axfr_ixfr_feature_case_31(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 31...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone31.example.", sizeof(entry.domain));
+    entry.domain = "zone31.example.";
     atomic_init(&entry.serial, 1000 + 31);
     assert(atomic_load(&entry.serial) == 1000 + 31);
     
@@ -4004,7 +4004,7 @@ static void test_axfr_ixfr_feature_case_31(void) {
 static void test_axfr_ixfr_feature_case_32(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 32...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone32.example.", sizeof(entry.domain));
+    entry.domain = "zone32.example.";
     atomic_init(&entry.serial, 1000 + 32);
     assert(atomic_load(&entry.serial) == 1000 + 32);
     
@@ -4020,7 +4020,7 @@ static void test_axfr_ixfr_feature_case_32(void) {
 static void test_axfr_ixfr_feature_case_33(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 33...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone33.example.", sizeof(entry.domain));
+    entry.domain = "zone33.example.";
     atomic_init(&entry.serial, 1000 + 33);
     assert(atomic_load(&entry.serial) == 1000 + 33);
     
@@ -4036,7 +4036,7 @@ static void test_axfr_ixfr_feature_case_33(void) {
 static void test_axfr_ixfr_feature_case_34(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 34...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone34.example.", sizeof(entry.domain));
+    entry.domain = "zone34.example.";
     atomic_init(&entry.serial, 1000 + 34);
     assert(atomic_load(&entry.serial) == 1000 + 34);
     
@@ -4052,7 +4052,7 @@ static void test_axfr_ixfr_feature_case_34(void) {
 static void test_axfr_ixfr_feature_case_35(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 35...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone35.example.", sizeof(entry.domain));
+    entry.domain = "zone35.example.";
     atomic_init(&entry.serial, 1000 + 35);
     assert(atomic_load(&entry.serial) == 1000 + 35);
     
@@ -4068,7 +4068,7 @@ static void test_axfr_ixfr_feature_case_35(void) {
 static void test_axfr_ixfr_feature_case_36(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 36...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone36.example.", sizeof(entry.domain));
+    entry.domain = "zone36.example.";
     atomic_init(&entry.serial, 1000 + 36);
     assert(atomic_load(&entry.serial) == 1000 + 36);
     
@@ -4084,7 +4084,7 @@ static void test_axfr_ixfr_feature_case_36(void) {
 static void test_axfr_ixfr_feature_case_37(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 37...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone37.example.", sizeof(entry.domain));
+    entry.domain = "zone37.example.";
     atomic_init(&entry.serial, 1000 + 37);
     assert(atomic_load(&entry.serial) == 1000 + 37);
     
@@ -4100,7 +4100,7 @@ static void test_axfr_ixfr_feature_case_37(void) {
 static void test_axfr_ixfr_feature_case_38(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 38...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone38.example.", sizeof(entry.domain));
+    entry.domain = "zone38.example.";
     atomic_init(&entry.serial, 1000 + 38);
     assert(atomic_load(&entry.serial) == 1000 + 38);
     
@@ -4116,7 +4116,7 @@ static void test_axfr_ixfr_feature_case_38(void) {
 static void test_axfr_ixfr_feature_case_39(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 39...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone39.example.", sizeof(entry.domain));
+    entry.domain = "zone39.example.";
     atomic_init(&entry.serial, 1000 + 39);
     assert(atomic_load(&entry.serial) == 1000 + 39);
     
@@ -4132,7 +4132,7 @@ static void test_axfr_ixfr_feature_case_39(void) {
 static void test_axfr_ixfr_feature_case_40(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 40...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone40.example.", sizeof(entry.domain));
+    entry.domain = "zone40.example.";
     atomic_init(&entry.serial, 1000 + 40);
     assert(atomic_load(&entry.serial) == 1000 + 40);
     
@@ -4148,7 +4148,7 @@ static void test_axfr_ixfr_feature_case_40(void) {
 static void test_axfr_ixfr_feature_case_41(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 41...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone41.example.", sizeof(entry.domain));
+    entry.domain = "zone41.example.";
     atomic_init(&entry.serial, 1000 + 41);
     assert(atomic_load(&entry.serial) == 1000 + 41);
     
@@ -4164,7 +4164,7 @@ static void test_axfr_ixfr_feature_case_41(void) {
 static void test_axfr_ixfr_feature_case_42(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 42...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone42.example.", sizeof(entry.domain));
+    entry.domain = "zone42.example.";
     atomic_init(&entry.serial, 1000 + 42);
     assert(atomic_load(&entry.serial) == 1000 + 42);
     
@@ -4180,7 +4180,7 @@ static void test_axfr_ixfr_feature_case_42(void) {
 static void test_axfr_ixfr_feature_case_43(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 43...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone43.example.", sizeof(entry.domain));
+    entry.domain = "zone43.example.";
     atomic_init(&entry.serial, 1000 + 43);
     assert(atomic_load(&entry.serial) == 1000 + 43);
     
@@ -4196,7 +4196,7 @@ static void test_axfr_ixfr_feature_case_43(void) {
 static void test_axfr_ixfr_feature_case_44(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 44...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone44.example.", sizeof(entry.domain));
+    entry.domain = "zone44.example.";
     atomic_init(&entry.serial, 1000 + 44);
     assert(atomic_load(&entry.serial) == 1000 + 44);
     
@@ -4212,7 +4212,7 @@ static void test_axfr_ixfr_feature_case_44(void) {
 static void test_axfr_ixfr_feature_case_45(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 45...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone45.example.", sizeof(entry.domain));
+    entry.domain = "zone45.example.";
     atomic_init(&entry.serial, 1000 + 45);
     assert(atomic_load(&entry.serial) == 1000 + 45);
     
@@ -4228,7 +4228,7 @@ static void test_axfr_ixfr_feature_case_45(void) {
 static void test_axfr_ixfr_feature_case_46(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 46...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone46.example.", sizeof(entry.domain));
+    entry.domain = "zone46.example.";
     atomic_init(&entry.serial, 1000 + 46);
     assert(atomic_load(&entry.serial) == 1000 + 46);
     
@@ -4244,7 +4244,7 @@ static void test_axfr_ixfr_feature_case_46(void) {
 static void test_axfr_ixfr_feature_case_47(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 47...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone47.example.", sizeof(entry.domain));
+    entry.domain = "zone47.example.";
     atomic_init(&entry.serial, 1000 + 47);
     assert(atomic_load(&entry.serial) == 1000 + 47);
     
@@ -4260,7 +4260,7 @@ static void test_axfr_ixfr_feature_case_47(void) {
 static void test_axfr_ixfr_feature_case_48(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 48...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone48.example.", sizeof(entry.domain));
+    entry.domain = "zone48.example.";
     atomic_init(&entry.serial, 1000 + 48);
     assert(atomic_load(&entry.serial) == 1000 + 48);
     
@@ -4276,7 +4276,7 @@ static void test_axfr_ixfr_feature_case_48(void) {
 static void test_axfr_ixfr_feature_case_49(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 49...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone49.example.", sizeof(entry.domain));
+    entry.domain = "zone49.example.";
     atomic_init(&entry.serial, 1000 + 49);
     assert(atomic_load(&entry.serial) == 1000 + 49);
     
@@ -4292,7 +4292,7 @@ static void test_axfr_ixfr_feature_case_49(void) {
 static void test_axfr_ixfr_feature_case_50(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 50...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone50.example.", sizeof(entry.domain));
+    entry.domain = "zone50.example.";
     atomic_init(&entry.serial, 1000 + 50);
     assert(atomic_load(&entry.serial) == 1000 + 50);
     
@@ -4308,7 +4308,7 @@ static void test_axfr_ixfr_feature_case_50(void) {
 static void test_axfr_ixfr_feature_case_51(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 51...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone51.example.", sizeof(entry.domain));
+    entry.domain = "zone51.example.";
     atomic_init(&entry.serial, 1000 + 51);
     assert(atomic_load(&entry.serial) == 1000 + 51);
     
@@ -4324,7 +4324,7 @@ static void test_axfr_ixfr_feature_case_51(void) {
 static void test_axfr_ixfr_feature_case_52(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 52...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone52.example.", sizeof(entry.domain));
+    entry.domain = "zone52.example.";
     atomic_init(&entry.serial, 1000 + 52);
     assert(atomic_load(&entry.serial) == 1000 + 52);
     
@@ -4340,7 +4340,7 @@ static void test_axfr_ixfr_feature_case_52(void) {
 static void test_axfr_ixfr_feature_case_53(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 53...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone53.example.", sizeof(entry.domain));
+    entry.domain = "zone53.example.";
     atomic_init(&entry.serial, 1000 + 53);
     assert(atomic_load(&entry.serial) == 1000 + 53);
     
@@ -4356,7 +4356,7 @@ static void test_axfr_ixfr_feature_case_53(void) {
 static void test_axfr_ixfr_feature_case_54(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 54...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone54.example.", sizeof(entry.domain));
+    entry.domain = "zone54.example.";
     atomic_init(&entry.serial, 1000 + 54);
     assert(atomic_load(&entry.serial) == 1000 + 54);
     
@@ -4372,7 +4372,7 @@ static void test_axfr_ixfr_feature_case_54(void) {
 static void test_axfr_ixfr_feature_case_55(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 55...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone55.example.", sizeof(entry.domain));
+    entry.domain = "zone55.example.";
     atomic_init(&entry.serial, 1000 + 55);
     assert(atomic_load(&entry.serial) == 1000 + 55);
     
@@ -4388,7 +4388,7 @@ static void test_axfr_ixfr_feature_case_55(void) {
 static void test_axfr_ixfr_feature_case_56(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 56...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone56.example.", sizeof(entry.domain));
+    entry.domain = "zone56.example.";
     atomic_init(&entry.serial, 1000 + 56);
     assert(atomic_load(&entry.serial) == 1000 + 56);
     
@@ -4404,7 +4404,7 @@ static void test_axfr_ixfr_feature_case_56(void) {
 static void test_axfr_ixfr_feature_case_57(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 57...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone57.example.", sizeof(entry.domain));
+    entry.domain = "zone57.example.";
     atomic_init(&entry.serial, 1000 + 57);
     assert(atomic_load(&entry.serial) == 1000 + 57);
     
@@ -4420,7 +4420,7 @@ static void test_axfr_ixfr_feature_case_57(void) {
 static void test_axfr_ixfr_feature_case_58(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 58...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone58.example.", sizeof(entry.domain));
+    entry.domain = "zone58.example.";
     atomic_init(&entry.serial, 1000 + 58);
     assert(atomic_load(&entry.serial) == 1000 + 58);
     
@@ -4436,7 +4436,7 @@ static void test_axfr_ixfr_feature_case_58(void) {
 static void test_axfr_ixfr_feature_case_59(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 59...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone59.example.", sizeof(entry.domain));
+    entry.domain = "zone59.example.";
     atomic_init(&entry.serial, 1000 + 59);
     assert(atomic_load(&entry.serial) == 1000 + 59);
     
@@ -4452,7 +4452,7 @@ static void test_axfr_ixfr_feature_case_59(void) {
 static void test_axfr_ixfr_feature_case_60(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 60...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone60.example.", sizeof(entry.domain));
+    entry.domain = "zone60.example.";
     atomic_init(&entry.serial, 1000 + 60);
     assert(atomic_load(&entry.serial) == 1000 + 60);
     
@@ -4471,7 +4471,7 @@ static void test_axfr_ixfr_feature_case_60(void) {
 static void test_axfr_ixfr_send_axfr_response_ixfr_full_success_flow(void) {
     printf("[TEST] AXFR/IXFR: send_axfr_response IXFR full success flow...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "fullixfr.example.", sizeof(entry.domain));
+    entry.domain = "fullixfr.example.";
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
     
     zone_arena_t a_old, a_new;
@@ -4524,7 +4524,7 @@ static void test_axfr_ixfr_send_axfr_response_ixfr_full_success_flow(void) {
 static void test_axfr_ixfr_send_axfr_response_extended_trusted_resolvers(void) {
     printf("[TEST] AXFR/IXFR: send_axfr_response Extended AXFR trusted resolvers...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "extres.example.", sizeof(entry.domain));
+    entry.domain = "extres.example.";
     init_axfr_zone(test_zone_slot(&entry, 0), "extres.example.", "100");
     
     char *trusted[2] = { "192.0.2.1/32", "198.51.100.0/24" };
@@ -4551,7 +4551,7 @@ static void test_axfr_ixfr_send_axfr_response_extended_trusted_resolvers(void) {
 static void test_axfr_ixfr_send_axfr_response_location_and_ecs_transitions(void) {
     printf("[TEST] AXFR/IXFR: send_axfr_response LOC and ECS tag transitions...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "tagtrans.example.", sizeof(entry.domain));
+    entry.domain = "tagtrans.example.";
     init_axfr_zone(test_zone_slot(&entry, 0), "tagtrans.example.", "100");
     
     dns_record_t r1; memset(&r1, 0, sizeof(r1));
@@ -4594,7 +4594,7 @@ static void test_axfr_ixfr_send_axfr_response_location_and_ecs_transitions(void)
 static void test_axfr_ixfr_feature_case_61(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 61...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone61.example.", sizeof(entry.domain));
+    entry.domain = "zone61.example.";
     atomic_init(&entry.serial, 2026090000 + 61);
     assert(atomic_load(&entry.serial) == 2026090000 + 61);
     
@@ -4610,7 +4610,7 @@ static void test_axfr_ixfr_feature_case_61(void) {
 static void test_axfr_ixfr_feature_case_62(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 62...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone62.example.", sizeof(entry.domain));
+    entry.domain = "zone62.example.";
     atomic_init(&entry.serial, 2026090000 + 62);
     assert(atomic_load(&entry.serial) == 2026090000 + 62);
     
@@ -4626,7 +4626,7 @@ static void test_axfr_ixfr_feature_case_62(void) {
 static void test_axfr_ixfr_feature_case_63(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 63...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone63.example.", sizeof(entry.domain));
+    entry.domain = "zone63.example.";
     atomic_init(&entry.serial, 2026090000 + 63);
     assert(atomic_load(&entry.serial) == 2026090000 + 63);
     
@@ -4642,7 +4642,7 @@ static void test_axfr_ixfr_feature_case_63(void) {
 static void test_axfr_ixfr_feature_case_64(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 64...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone64.example.", sizeof(entry.domain));
+    entry.domain = "zone64.example.";
     atomic_init(&entry.serial, 2026090000 + 64);
     assert(atomic_load(&entry.serial) == 2026090000 + 64);
     
@@ -4658,7 +4658,7 @@ static void test_axfr_ixfr_feature_case_64(void) {
 static void test_axfr_ixfr_feature_case_65(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 65...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone65.example.", sizeof(entry.domain));
+    entry.domain = "zone65.example.";
     atomic_init(&entry.serial, 2026090000 + 65);
     assert(atomic_load(&entry.serial) == 2026090000 + 65);
     
@@ -4674,7 +4674,7 @@ static void test_axfr_ixfr_feature_case_65(void) {
 static void test_axfr_ixfr_feature_case_66(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 66...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone66.example.", sizeof(entry.domain));
+    entry.domain = "zone66.example.";
     atomic_init(&entry.serial, 2026090000 + 66);
     assert(atomic_load(&entry.serial) == 2026090000 + 66);
     
@@ -4690,7 +4690,7 @@ static void test_axfr_ixfr_feature_case_66(void) {
 static void test_axfr_ixfr_feature_case_67(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 67...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone67.example.", sizeof(entry.domain));
+    entry.domain = "zone67.example.";
     atomic_init(&entry.serial, 2026090000 + 67);
     assert(atomic_load(&entry.serial) == 2026090000 + 67);
     
@@ -4706,7 +4706,7 @@ static void test_axfr_ixfr_feature_case_67(void) {
 static void test_axfr_ixfr_feature_case_68(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 68...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone68.example.", sizeof(entry.domain));
+    entry.domain = "zone68.example.";
     atomic_init(&entry.serial, 2026090000 + 68);
     assert(atomic_load(&entry.serial) == 2026090000 + 68);
     
@@ -4722,7 +4722,7 @@ static void test_axfr_ixfr_feature_case_68(void) {
 static void test_axfr_ixfr_feature_case_69(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 69...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone69.example.", sizeof(entry.domain));
+    entry.domain = "zone69.example.";
     atomic_init(&entry.serial, 2026090000 + 69);
     assert(atomic_load(&entry.serial) == 2026090000 + 69);
     
@@ -4738,7 +4738,7 @@ static void test_axfr_ixfr_feature_case_69(void) {
 static void test_axfr_ixfr_feature_case_70(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 70...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone70.example.", sizeof(entry.domain));
+    entry.domain = "zone70.example.";
     atomic_init(&entry.serial, 2026090000 + 70);
     assert(atomic_load(&entry.serial) == 2026090000 + 70);
     
@@ -4754,7 +4754,7 @@ static void test_axfr_ixfr_feature_case_70(void) {
 static void test_axfr_ixfr_feature_case_71(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 71...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone71.example.", sizeof(entry.domain));
+    entry.domain = "zone71.example.";
     atomic_init(&entry.serial, 2026090000 + 71);
     assert(atomic_load(&entry.serial) == 2026090000 + 71);
     
@@ -4770,7 +4770,7 @@ static void test_axfr_ixfr_feature_case_71(void) {
 static void test_axfr_ixfr_feature_case_72(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 72...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone72.example.", sizeof(entry.domain));
+    entry.domain = "zone72.example.";
     atomic_init(&entry.serial, 2026090000 + 72);
     assert(atomic_load(&entry.serial) == 2026090000 + 72);
     
@@ -4786,7 +4786,7 @@ static void test_axfr_ixfr_feature_case_72(void) {
 static void test_axfr_ixfr_feature_case_73(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 73...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone73.example.", sizeof(entry.domain));
+    entry.domain = "zone73.example.";
     atomic_init(&entry.serial, 2026090000 + 73);
     assert(atomic_load(&entry.serial) == 2026090000 + 73);
     
@@ -4802,7 +4802,7 @@ static void test_axfr_ixfr_feature_case_73(void) {
 static void test_axfr_ixfr_feature_case_74(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 74...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone74.example.", sizeof(entry.domain));
+    entry.domain = "zone74.example.";
     atomic_init(&entry.serial, 2026090000 + 74);
     assert(atomic_load(&entry.serial) == 2026090000 + 74);
     
@@ -4818,7 +4818,7 @@ static void test_axfr_ixfr_feature_case_74(void) {
 static void test_axfr_ixfr_feature_case_75(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 75...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone75.example.", sizeof(entry.domain));
+    entry.domain = "zone75.example.";
     atomic_init(&entry.serial, 2026090000 + 75);
     assert(atomic_load(&entry.serial) == 2026090000 + 75);
     
@@ -4834,7 +4834,7 @@ static void test_axfr_ixfr_feature_case_75(void) {
 static void test_axfr_ixfr_feature_case_76(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 76...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone76.example.", sizeof(entry.domain));
+    entry.domain = "zone76.example.";
     atomic_init(&entry.serial, 2026090000 + 76);
     assert(atomic_load(&entry.serial) == 2026090000 + 76);
     
@@ -4850,7 +4850,7 @@ static void test_axfr_ixfr_feature_case_76(void) {
 static void test_axfr_ixfr_feature_case_77(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 77...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone77.example.", sizeof(entry.domain));
+    entry.domain = "zone77.example.";
     atomic_init(&entry.serial, 2026090000 + 77);
     assert(atomic_load(&entry.serial) == 2026090000 + 77);
     
@@ -4866,7 +4866,7 @@ static void test_axfr_ixfr_feature_case_77(void) {
 static void test_axfr_ixfr_feature_case_78(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 78...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone78.example.", sizeof(entry.domain));
+    entry.domain = "zone78.example.";
     atomic_init(&entry.serial, 2026090000 + 78);
     assert(atomic_load(&entry.serial) == 2026090000 + 78);
     
@@ -4882,7 +4882,7 @@ static void test_axfr_ixfr_feature_case_78(void) {
 static void test_axfr_ixfr_feature_case_79(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 79...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone79.example.", sizeof(entry.domain));
+    entry.domain = "zone79.example.";
     atomic_init(&entry.serial, 2026090000 + 79);
     assert(atomic_load(&entry.serial) == 2026090000 + 79);
     
@@ -4898,7 +4898,7 @@ static void test_axfr_ixfr_feature_case_79(void) {
 static void test_axfr_ixfr_feature_case_80(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 80...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone80.example.", sizeof(entry.domain));
+    entry.domain = "zone80.example.";
     atomic_init(&entry.serial, 2026090000 + 80);
     assert(atomic_load(&entry.serial) == 2026090000 + 80);
     
@@ -4914,7 +4914,7 @@ static void test_axfr_ixfr_feature_case_80(void) {
 static void test_axfr_ixfr_feature_case_81(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 81...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone81.example.", sizeof(entry.domain));
+    entry.domain = "zone81.example.";
     atomic_init(&entry.serial, 2026090000 + 81);
     assert(atomic_load(&entry.serial) == 2026090000 + 81);
     
@@ -4930,7 +4930,7 @@ static void test_axfr_ixfr_feature_case_81(void) {
 static void test_axfr_ixfr_feature_case_82(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 82...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone82.example.", sizeof(entry.domain));
+    entry.domain = "zone82.example.";
     atomic_init(&entry.serial, 2026090000 + 82);
     assert(atomic_load(&entry.serial) == 2026090000 + 82);
     
@@ -4946,7 +4946,7 @@ static void test_axfr_ixfr_feature_case_82(void) {
 static void test_axfr_ixfr_feature_case_83(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 83...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone83.example.", sizeof(entry.domain));
+    entry.domain = "zone83.example.";
     atomic_init(&entry.serial, 2026090000 + 83);
     assert(atomic_load(&entry.serial) == 2026090000 + 83);
     
@@ -4962,7 +4962,7 @@ static void test_axfr_ixfr_feature_case_83(void) {
 static void test_axfr_ixfr_feature_case_84(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 84...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone84.example.", sizeof(entry.domain));
+    entry.domain = "zone84.example.";
     atomic_init(&entry.serial, 2026090000 + 84);
     assert(atomic_load(&entry.serial) == 2026090000 + 84);
     
@@ -4978,7 +4978,7 @@ static void test_axfr_ixfr_feature_case_84(void) {
 static void test_axfr_ixfr_feature_case_85(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 85...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone85.example.", sizeof(entry.domain));
+    entry.domain = "zone85.example.";
     atomic_init(&entry.serial, 2026090000 + 85);
     assert(atomic_load(&entry.serial) == 2026090000 + 85);
     
@@ -4994,7 +4994,7 @@ static void test_axfr_ixfr_feature_case_85(void) {
 static void test_axfr_ixfr_feature_case_86(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 86...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone86.example.", sizeof(entry.domain));
+    entry.domain = "zone86.example.";
     atomic_init(&entry.serial, 2026090000 + 86);
     assert(atomic_load(&entry.serial) == 2026090000 + 86);
     
@@ -5010,7 +5010,7 @@ static void test_axfr_ixfr_feature_case_86(void) {
 static void test_axfr_ixfr_feature_case_87(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 87...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone87.example.", sizeof(entry.domain));
+    entry.domain = "zone87.example.";
     atomic_init(&entry.serial, 2026090000 + 87);
     assert(atomic_load(&entry.serial) == 2026090000 + 87);
     
@@ -5026,7 +5026,7 @@ static void test_axfr_ixfr_feature_case_87(void) {
 static void test_axfr_ixfr_feature_case_88(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 88...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone88.example.", sizeof(entry.domain));
+    entry.domain = "zone88.example.";
     atomic_init(&entry.serial, 2026090000 + 88);
     assert(atomic_load(&entry.serial) == 2026090000 + 88);
     
@@ -5042,7 +5042,7 @@ static void test_axfr_ixfr_feature_case_88(void) {
 static void test_axfr_ixfr_feature_case_89(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 89...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone89.example.", sizeof(entry.domain));
+    entry.domain = "zone89.example.";
     atomic_init(&entry.serial, 2026090000 + 89);
     assert(atomic_load(&entry.serial) == 2026090000 + 89);
     
@@ -5058,7 +5058,7 @@ static void test_axfr_ixfr_feature_case_89(void) {
 static void test_axfr_ixfr_feature_case_90(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 90...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone90.example.", sizeof(entry.domain));
+    entry.domain = "zone90.example.";
     atomic_init(&entry.serial, 2026090000 + 90);
     assert(atomic_load(&entry.serial) == 2026090000 + 90);
     
@@ -5074,7 +5074,7 @@ static void test_axfr_ixfr_feature_case_90(void) {
 static void test_axfr_ixfr_feature_case_91(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 91...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone91.example.", sizeof(entry.domain));
+    entry.domain = "zone91.example.";
     atomic_init(&entry.serial, 2026090000 + 91);
     assert(atomic_load(&entry.serial) == 2026090000 + 91);
     
@@ -5090,7 +5090,7 @@ static void test_axfr_ixfr_feature_case_91(void) {
 static void test_axfr_ixfr_feature_case_92(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 92...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone92.example.", sizeof(entry.domain));
+    entry.domain = "zone92.example.";
     atomic_init(&entry.serial, 2026090000 + 92);
     assert(atomic_load(&entry.serial) == 2026090000 + 92);
     
@@ -5106,7 +5106,7 @@ static void test_axfr_ixfr_feature_case_92(void) {
 static void test_axfr_ixfr_feature_case_93(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 93...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone93.example.", sizeof(entry.domain));
+    entry.domain = "zone93.example.";
     atomic_init(&entry.serial, 2026090000 + 93);
     assert(atomic_load(&entry.serial) == 2026090000 + 93);
     
@@ -5122,7 +5122,7 @@ static void test_axfr_ixfr_feature_case_93(void) {
 static void test_axfr_ixfr_feature_case_94(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 94...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone94.example.", sizeof(entry.domain));
+    entry.domain = "zone94.example.";
     atomic_init(&entry.serial, 2026090000 + 94);
     assert(atomic_load(&entry.serial) == 2026090000 + 94);
     
@@ -5138,7 +5138,7 @@ static void test_axfr_ixfr_feature_case_94(void) {
 static void test_axfr_ixfr_feature_case_95(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 95...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone95.example.", sizeof(entry.domain));
+    entry.domain = "zone95.example.";
     atomic_init(&entry.serial, 2026090000 + 95);
     assert(atomic_load(&entry.serial) == 2026090000 + 95);
     
@@ -5154,7 +5154,7 @@ static void test_axfr_ixfr_feature_case_95(void) {
 static void test_axfr_ixfr_feature_case_96(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 96...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone96.example.", sizeof(entry.domain));
+    entry.domain = "zone96.example.";
     atomic_init(&entry.serial, 2026090000 + 96);
     assert(atomic_load(&entry.serial) == 2026090000 + 96);
     
@@ -5170,7 +5170,7 @@ static void test_axfr_ixfr_feature_case_96(void) {
 static void test_axfr_ixfr_feature_case_97(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 97...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone97.example.", sizeof(entry.domain));
+    entry.domain = "zone97.example.";
     atomic_init(&entry.serial, 2026090000 + 97);
     assert(atomic_load(&entry.serial) == 2026090000 + 97);
     
@@ -5186,7 +5186,7 @@ static void test_axfr_ixfr_feature_case_97(void) {
 static void test_axfr_ixfr_feature_case_98(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 98...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone98.example.", sizeof(entry.domain));
+    entry.domain = "zone98.example.";
     atomic_init(&entry.serial, 2026090000 + 98);
     assert(atomic_load(&entry.serial) == 2026090000 + 98);
     
@@ -5202,7 +5202,7 @@ static void test_axfr_ixfr_feature_case_98(void) {
 static void test_axfr_ixfr_feature_case_99(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 99...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone99.example.", sizeof(entry.domain));
+    entry.domain = "zone99.example.";
     atomic_init(&entry.serial, 2026090000 + 99);
     assert(atomic_load(&entry.serial) == 2026090000 + 99);
     
@@ -5218,7 +5218,7 @@ static void test_axfr_ixfr_feature_case_99(void) {
 static void test_axfr_ixfr_feature_case_100(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 100...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone100.example.", sizeof(entry.domain));
+    entry.domain = "zone100.example.";
     atomic_init(&entry.serial, 2026090000 + 100);
     assert(atomic_load(&entry.serial) == 2026090000 + 100);
     
@@ -5234,7 +5234,7 @@ static void test_axfr_ixfr_feature_case_100(void) {
 static void test_axfr_ixfr_feature_case_101(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 101...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone101.example.", sizeof(entry.domain));
+    entry.domain = "zone101.example.";
     atomic_init(&entry.serial, 2026090000 + 101);
     assert(atomic_load(&entry.serial) == 2026090000 + 101);
     
@@ -5250,7 +5250,7 @@ static void test_axfr_ixfr_feature_case_101(void) {
 static void test_axfr_ixfr_feature_case_102(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 102...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone102.example.", sizeof(entry.domain));
+    entry.domain = "zone102.example.";
     atomic_init(&entry.serial, 2026090000 + 102);
     assert(atomic_load(&entry.serial) == 2026090000 + 102);
     
@@ -5266,7 +5266,7 @@ static void test_axfr_ixfr_feature_case_102(void) {
 static void test_axfr_ixfr_feature_case_103(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 103...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone103.example.", sizeof(entry.domain));
+    entry.domain = "zone103.example.";
     atomic_init(&entry.serial, 2026090000 + 103);
     assert(atomic_load(&entry.serial) == 2026090000 + 103);
     
@@ -5282,7 +5282,7 @@ static void test_axfr_ixfr_feature_case_103(void) {
 static void test_axfr_ixfr_feature_case_104(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 104...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone104.example.", sizeof(entry.domain));
+    entry.domain = "zone104.example.";
     atomic_init(&entry.serial, 2026090000 + 104);
     assert(atomic_load(&entry.serial) == 2026090000 + 104);
     
@@ -5298,7 +5298,7 @@ static void test_axfr_ixfr_feature_case_104(void) {
 static void test_axfr_ixfr_feature_case_105(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 105...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone105.example.", sizeof(entry.domain));
+    entry.domain = "zone105.example.";
     atomic_init(&entry.serial, 2026090000 + 105);
     assert(atomic_load(&entry.serial) == 2026090000 + 105);
     
@@ -5314,7 +5314,7 @@ static void test_axfr_ixfr_feature_case_105(void) {
 static void test_axfr_ixfr_feature_case_106(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 106...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone106.example.", sizeof(entry.domain));
+    entry.domain = "zone106.example.";
     atomic_init(&entry.serial, 2026090000 + 106);
     assert(atomic_load(&entry.serial) == 2026090000 + 106);
     
@@ -5330,7 +5330,7 @@ static void test_axfr_ixfr_feature_case_106(void) {
 static void test_axfr_ixfr_feature_case_107(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 107...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone107.example.", sizeof(entry.domain));
+    entry.domain = "zone107.example.";
     atomic_init(&entry.serial, 2026090000 + 107);
     assert(atomic_load(&entry.serial) == 2026090000 + 107);
     
@@ -5346,7 +5346,7 @@ static void test_axfr_ixfr_feature_case_107(void) {
 static void test_axfr_ixfr_feature_case_108(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 108...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone108.example.", sizeof(entry.domain));
+    entry.domain = "zone108.example.";
     atomic_init(&entry.serial, 2026090000 + 108);
     assert(atomic_load(&entry.serial) == 2026090000 + 108);
     
@@ -5362,7 +5362,7 @@ static void test_axfr_ixfr_feature_case_108(void) {
 static void test_axfr_ixfr_feature_case_109(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 109...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone109.example.", sizeof(entry.domain));
+    entry.domain = "zone109.example.";
     atomic_init(&entry.serial, 2026090000 + 109);
     assert(atomic_load(&entry.serial) == 2026090000 + 109);
     
@@ -5378,7 +5378,7 @@ static void test_axfr_ixfr_feature_case_109(void) {
 static void test_axfr_ixfr_feature_case_110(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 110...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone110.example.", sizeof(entry.domain));
+    entry.domain = "zone110.example.";
     atomic_init(&entry.serial, 2026090000 + 110);
     assert(atomic_load(&entry.serial) == 2026090000 + 110);
     
@@ -5394,7 +5394,7 @@ static void test_axfr_ixfr_feature_case_110(void) {
 static void test_axfr_ixfr_feature_case_111(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 111...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone111.example.", sizeof(entry.domain));
+    entry.domain = "zone111.example.";
     atomic_init(&entry.serial, 2026090000 + 111);
     assert(atomic_load(&entry.serial) == 2026090000 + 111);
     
@@ -5410,7 +5410,7 @@ static void test_axfr_ixfr_feature_case_111(void) {
 static void test_axfr_ixfr_feature_case_112(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 112...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone112.example.", sizeof(entry.domain));
+    entry.domain = "zone112.example.";
     atomic_init(&entry.serial, 2026090000 + 112);
     assert(atomic_load(&entry.serial) == 2026090000 + 112);
     
@@ -5426,7 +5426,7 @@ static void test_axfr_ixfr_feature_case_112(void) {
 static void test_axfr_ixfr_feature_case_113(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 113...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone113.example.", sizeof(entry.domain));
+    entry.domain = "zone113.example.";
     atomic_init(&entry.serial, 2026090000 + 113);
     assert(atomic_load(&entry.serial) == 2026090000 + 113);
     
@@ -5442,7 +5442,7 @@ static void test_axfr_ixfr_feature_case_113(void) {
 static void test_axfr_ixfr_feature_case_114(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 114...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone114.example.", sizeof(entry.domain));
+    entry.domain = "zone114.example.";
     atomic_init(&entry.serial, 2026090000 + 114);
     assert(atomic_load(&entry.serial) == 2026090000 + 114);
     
@@ -5458,7 +5458,7 @@ static void test_axfr_ixfr_feature_case_114(void) {
 static void test_axfr_ixfr_feature_case_115(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 115...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone115.example.", sizeof(entry.domain));
+    entry.domain = "zone115.example.";
     atomic_init(&entry.serial, 2026090000 + 115);
     assert(atomic_load(&entry.serial) == 2026090000 + 115);
     
@@ -5474,7 +5474,7 @@ static void test_axfr_ixfr_feature_case_115(void) {
 static void test_axfr_ixfr_feature_case_116(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 116...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone116.example.", sizeof(entry.domain));
+    entry.domain = "zone116.example.";
     atomic_init(&entry.serial, 2026090000 + 116);
     assert(atomic_load(&entry.serial) == 2026090000 + 116);
     
@@ -5490,7 +5490,7 @@ static void test_axfr_ixfr_feature_case_116(void) {
 static void test_axfr_ixfr_feature_case_117(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 117...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone117.example.", sizeof(entry.domain));
+    entry.domain = "zone117.example.";
     atomic_init(&entry.serial, 2026090000 + 117);
     assert(atomic_load(&entry.serial) == 2026090000 + 117);
     
@@ -5506,7 +5506,7 @@ static void test_axfr_ixfr_feature_case_117(void) {
 static void test_axfr_ixfr_feature_case_118(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 118...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone118.example.", sizeof(entry.domain));
+    entry.domain = "zone118.example.";
     atomic_init(&entry.serial, 2026090000 + 118);
     assert(atomic_load(&entry.serial) == 2026090000 + 118);
     
@@ -5522,7 +5522,7 @@ static void test_axfr_ixfr_feature_case_118(void) {
 static void test_axfr_ixfr_feature_case_119(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 119...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone119.example.", sizeof(entry.domain));
+    entry.domain = "zone119.example.";
     atomic_init(&entry.serial, 2026090000 + 119);
     assert(atomic_load(&entry.serial) == 2026090000 + 119);
     
@@ -5538,7 +5538,7 @@ static void test_axfr_ixfr_feature_case_119(void) {
 static void test_axfr_ixfr_feature_case_120(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 120...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone120.example.", sizeof(entry.domain));
+    entry.domain = "zone120.example.";
     atomic_init(&entry.serial, 2026090000 + 120);
     assert(atomic_load(&entry.serial) == 2026090000 + 120);
     
@@ -5554,7 +5554,7 @@ static void test_axfr_ixfr_feature_case_120(void) {
 static void test_axfr_ixfr_feature_case_121(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 121...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone121.example.", sizeof(entry.domain));
+    entry.domain = "zone121.example.";
     atomic_init(&entry.serial, 2026090000 + 121);
     assert(atomic_load(&entry.serial) == 2026090000 + 121);
     
@@ -5570,7 +5570,7 @@ static void test_axfr_ixfr_feature_case_121(void) {
 static void test_axfr_ixfr_feature_case_122(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 122...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone122.example.", sizeof(entry.domain));
+    entry.domain = "zone122.example.";
     atomic_init(&entry.serial, 2026090000 + 122);
     assert(atomic_load(&entry.serial) == 2026090000 + 122);
     
@@ -5586,7 +5586,7 @@ static void test_axfr_ixfr_feature_case_122(void) {
 static void test_axfr_ixfr_feature_case_123(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 123...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone123.example.", sizeof(entry.domain));
+    entry.domain = "zone123.example.";
     atomic_init(&entry.serial, 2026090000 + 123);
     assert(atomic_load(&entry.serial) == 2026090000 + 123);
     
@@ -5602,7 +5602,7 @@ static void test_axfr_ixfr_feature_case_123(void) {
 static void test_axfr_ixfr_feature_case_124(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 124...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone124.example.", sizeof(entry.domain));
+    entry.domain = "zone124.example.";
     atomic_init(&entry.serial, 2026090000 + 124);
     assert(atomic_load(&entry.serial) == 2026090000 + 124);
     
@@ -5618,7 +5618,7 @@ static void test_axfr_ixfr_feature_case_124(void) {
 static void test_axfr_ixfr_feature_case_125(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 125...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone125.example.", sizeof(entry.domain));
+    entry.domain = "zone125.example.";
     atomic_init(&entry.serial, 2026090000 + 125);
     assert(atomic_load(&entry.serial) == 2026090000 + 125);
     
@@ -5634,7 +5634,7 @@ static void test_axfr_ixfr_feature_case_125(void) {
 static void test_axfr_ixfr_feature_case_126(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 126...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone126.example.", sizeof(entry.domain));
+    entry.domain = "zone126.example.";
     atomic_init(&entry.serial, 2026090000 + 126);
     assert(atomic_load(&entry.serial) == 2026090000 + 126);
     
@@ -5650,7 +5650,7 @@ static void test_axfr_ixfr_feature_case_126(void) {
 static void test_axfr_ixfr_feature_case_127(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 127...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone127.example.", sizeof(entry.domain));
+    entry.domain = "zone127.example.";
     atomic_init(&entry.serial, 2026090000 + 127);
     assert(atomic_load(&entry.serial) == 2026090000 + 127);
     
@@ -5666,7 +5666,7 @@ static void test_axfr_ixfr_feature_case_127(void) {
 static void test_axfr_ixfr_feature_case_128(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 128...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone128.example.", sizeof(entry.domain));
+    entry.domain = "zone128.example.";
     atomic_init(&entry.serial, 2026090000 + 128);
     assert(atomic_load(&entry.serial) == 2026090000 + 128);
     
@@ -5682,7 +5682,7 @@ static void test_axfr_ixfr_feature_case_128(void) {
 static void test_axfr_ixfr_feature_case_129(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 129...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone129.example.", sizeof(entry.domain));
+    entry.domain = "zone129.example.";
     atomic_init(&entry.serial, 2026090000 + 129);
     assert(atomic_load(&entry.serial) == 2026090000 + 129);
     
@@ -5698,7 +5698,7 @@ static void test_axfr_ixfr_feature_case_129(void) {
 static void test_axfr_ixfr_feature_case_130(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 130...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone130.example.", sizeof(entry.domain));
+    entry.domain = "zone130.example.";
     atomic_init(&entry.serial, 2026090000 + 130);
     assert(atomic_load(&entry.serial) == 2026090000 + 130);
     
@@ -5714,7 +5714,7 @@ static void test_axfr_ixfr_feature_case_130(void) {
 static void test_axfr_ixfr_feature_case_131(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 131...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone131.example.", sizeof(entry.domain));
+    entry.domain = "zone131.example.";
     atomic_init(&entry.serial, 2026090000 + 131);
     assert(atomic_load(&entry.serial) == 2026090000 + 131);
     
@@ -5730,7 +5730,7 @@ static void test_axfr_ixfr_feature_case_131(void) {
 static void test_axfr_ixfr_feature_case_132(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 132...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone132.example.", sizeof(entry.domain));
+    entry.domain = "zone132.example.";
     atomic_init(&entry.serial, 2026090000 + 132);
     assert(atomic_load(&entry.serial) == 2026090000 + 132);
     
@@ -5746,7 +5746,7 @@ static void test_axfr_ixfr_feature_case_132(void) {
 static void test_axfr_ixfr_feature_case_133(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 133...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone133.example.", sizeof(entry.domain));
+    entry.domain = "zone133.example.";
     atomic_init(&entry.serial, 2026090000 + 133);
     assert(atomic_load(&entry.serial) == 2026090000 + 133);
     
@@ -5762,7 +5762,7 @@ static void test_axfr_ixfr_feature_case_133(void) {
 static void test_axfr_ixfr_feature_case_134(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 134...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone134.example.", sizeof(entry.domain));
+    entry.domain = "zone134.example.";
     atomic_init(&entry.serial, 2026090000 + 134);
     assert(atomic_load(&entry.serial) == 2026090000 + 134);
     
@@ -5778,7 +5778,7 @@ static void test_axfr_ixfr_feature_case_134(void) {
 static void test_axfr_ixfr_feature_case_135(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 135...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone135.example.", sizeof(entry.domain));
+    entry.domain = "zone135.example.";
     atomic_init(&entry.serial, 2026090000 + 135);
     assert(atomic_load(&entry.serial) == 2026090000 + 135);
     
@@ -5794,7 +5794,7 @@ static void test_axfr_ixfr_feature_case_135(void) {
 static void test_axfr_ixfr_feature_case_136(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 136...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone136.example.", sizeof(entry.domain));
+    entry.domain = "zone136.example.";
     atomic_init(&entry.serial, 2026090000 + 136);
     assert(atomic_load(&entry.serial) == 2026090000 + 136);
     
@@ -5810,7 +5810,7 @@ static void test_axfr_ixfr_feature_case_136(void) {
 static void test_axfr_ixfr_feature_case_137(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 137...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone137.example.", sizeof(entry.domain));
+    entry.domain = "zone137.example.";
     atomic_init(&entry.serial, 2026090000 + 137);
     assert(atomic_load(&entry.serial) == 2026090000 + 137);
     
@@ -5826,7 +5826,7 @@ static void test_axfr_ixfr_feature_case_137(void) {
 static void test_axfr_ixfr_feature_case_138(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 138...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone138.example.", sizeof(entry.domain));
+    entry.domain = "zone138.example.";
     atomic_init(&entry.serial, 2026090000 + 138);
     assert(atomic_load(&entry.serial) == 2026090000 + 138);
     
@@ -5842,7 +5842,7 @@ static void test_axfr_ixfr_feature_case_138(void) {
 static void test_axfr_ixfr_feature_case_139(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 139...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone139.example.", sizeof(entry.domain));
+    entry.domain = "zone139.example.";
     atomic_init(&entry.serial, 2026090000 + 139);
     assert(atomic_load(&entry.serial) == 2026090000 + 139);
     
@@ -5858,7 +5858,7 @@ static void test_axfr_ixfr_feature_case_139(void) {
 static void test_axfr_ixfr_feature_case_140(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 140...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone140.example.", sizeof(entry.domain));
+    entry.domain = "zone140.example.";
     atomic_init(&entry.serial, 2026090000 + 140);
     assert(atomic_load(&entry.serial) == 2026090000 + 140);
     
@@ -5874,7 +5874,7 @@ static void test_axfr_ixfr_feature_case_140(void) {
 static void test_axfr_ixfr_feature_case_141(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 141...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone141.example.", sizeof(entry.domain));
+    entry.domain = "zone141.example.";
     atomic_init(&entry.serial, 2026090000 + 141);
     assert(atomic_load(&entry.serial) == 2026090000 + 141);
     
@@ -5890,7 +5890,7 @@ static void test_axfr_ixfr_feature_case_141(void) {
 static void test_axfr_ixfr_feature_case_142(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 142...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone142.example.", sizeof(entry.domain));
+    entry.domain = "zone142.example.";
     atomic_init(&entry.serial, 2026090000 + 142);
     assert(atomic_load(&entry.serial) == 2026090000 + 142);
     
@@ -5906,7 +5906,7 @@ static void test_axfr_ixfr_feature_case_142(void) {
 static void test_axfr_ixfr_feature_case_143(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 143...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone143.example.", sizeof(entry.domain));
+    entry.domain = "zone143.example.";
     atomic_init(&entry.serial, 2026090000 + 143);
     assert(atomic_load(&entry.serial) == 2026090000 + 143);
     
@@ -5922,7 +5922,7 @@ static void test_axfr_ixfr_feature_case_143(void) {
 static void test_axfr_ixfr_feature_case_144(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 144...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone144.example.", sizeof(entry.domain));
+    entry.domain = "zone144.example.";
     atomic_init(&entry.serial, 2026090000 + 144);
     assert(atomic_load(&entry.serial) == 2026090000 + 144);
     
@@ -5938,7 +5938,7 @@ static void test_axfr_ixfr_feature_case_144(void) {
 static void test_axfr_ixfr_feature_case_145(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 145...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone145.example.", sizeof(entry.domain));
+    entry.domain = "zone145.example.";
     atomic_init(&entry.serial, 2026090000 + 145);
     assert(atomic_load(&entry.serial) == 2026090000 + 145);
     
@@ -5954,7 +5954,7 @@ static void test_axfr_ixfr_feature_case_145(void) {
 static void test_axfr_ixfr_feature_case_146(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 146...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone146.example.", sizeof(entry.domain));
+    entry.domain = "zone146.example.";
     atomic_init(&entry.serial, 2026090000 + 146);
     assert(atomic_load(&entry.serial) == 2026090000 + 146);
     
@@ -5970,7 +5970,7 @@ static void test_axfr_ixfr_feature_case_146(void) {
 static void test_axfr_ixfr_feature_case_147(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 147...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone147.example.", sizeof(entry.domain));
+    entry.domain = "zone147.example.";
     atomic_init(&entry.serial, 2026090000 + 147);
     assert(atomic_load(&entry.serial) == 2026090000 + 147);
     
@@ -5986,7 +5986,7 @@ static void test_axfr_ixfr_feature_case_147(void) {
 static void test_axfr_ixfr_feature_case_148(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 148...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone148.example.", sizeof(entry.domain));
+    entry.domain = "zone148.example.";
     atomic_init(&entry.serial, 2026090000 + 148);
     assert(atomic_load(&entry.serial) == 2026090000 + 148);
     
@@ -6002,7 +6002,7 @@ static void test_axfr_ixfr_feature_case_148(void) {
 static void test_axfr_ixfr_feature_case_149(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 149...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone149.example.", sizeof(entry.domain));
+    entry.domain = "zone149.example.";
     atomic_init(&entry.serial, 2026090000 + 149);
     assert(atomic_load(&entry.serial) == 2026090000 + 149);
     
@@ -6018,7 +6018,7 @@ static void test_axfr_ixfr_feature_case_149(void) {
 static void test_axfr_ixfr_feature_case_150(void) {
     printf("[TEST] AXFR/IXFR: protocol and state machine verification case 150...\n");
     zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zone150.example.", sizeof(entry.domain));
+    entry.domain = "zone150.example.";
     atomic_init(&entry.serial, 2026090000 + 150);
     assert(atomic_load(&entry.serial) == 2026090000 + 150);
     
@@ -6043,7 +6043,7 @@ static void test_axfr_ixfr_feature_case_151(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "example.com.", sizeof(entry.domain));
+    entry.domain = "example.com.";
     entry.serial = 20260901;
     atomic_init(&entry.is_transferring, true);
 
@@ -6092,7 +6092,7 @@ static void test_axfr_ixfr_feature_case_152(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "tsigzone.example.", sizeof(entry.domain));
+    entry.domain = "tsigzone.example.";
     atomic_init(&entry.is_transferring, true);
 
     axfr_bg_ctx_t *ctx = calloc(1, sizeof(axfr_bg_ctx_t));
@@ -6203,7 +6203,7 @@ static void test_axfr_ixfr_feature_case_154(void) {
     printf("[TEST] AXFR/IXFR: Case 154 - handle_axfr_event TSIG validation and unsigned message tracking...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "unsigned.example.", sizeof(entry.domain));
+    entry.domain = "unsigned.example.";
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
@@ -6326,7 +6326,7 @@ static void test_axfr_ixfr_feature_case_155(void) {
     printf("[TEST] AXFR/IXFR: Case 155 - Multi-packet chunking and QDCOUNT preservation in send_axfr_response...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "multichunk.example.", sizeof(entry.domain));
+    entry.domain = "multichunk.example.";
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
@@ -6384,7 +6384,7 @@ static void test_axfr_ixfr_feature_case_156(void) {
     printf("[TEST] AXFR/IXFR: Case 156 - Record too large to fit in any TCP message handling...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "huge.example.", sizeof(entry.domain));
+    entry.domain = "huge.example.";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
@@ -6435,7 +6435,7 @@ static void test_axfr_ixfr_feature_case_157(void) {
     printf("[TEST] AXFR/IXFR: Case 157 - axfr_error cleanup and transaction reference release...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "cleanup.example.", sizeof(entry.domain));
+    entry.domain = "cleanup.example.";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
@@ -6585,7 +6585,7 @@ static void test_edns_expire_rfc7314(void) {
      * parse_xfr_packet() on the secondary picks it up. */
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strncpy(entry.domain, "example.com.", sizeof(entry.domain) - 1);
+    entry.domain = "example.com.";
     strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
@@ -6762,7 +6762,7 @@ static void test_p10_transfer_responses(void) {
     printf("[TEST] AXFR/IXFR: phase 10 responses (R-15 serials, IXFR without SOA, R-16 OPT, X-19 empty zone)...\n");
     zone_db_entry_t e;
     memset(&e, 0, sizeof(e));
-    strlcpy(e.domain, "p10.example.", sizeof(e.domain));
+    e.domain = "p10.example.";
     strlcpy(e.view_name, "default", sizeof(e.view_name));
     pthread_mutex_init(&e.writer_lock, NULL);
     pthread_mutex_init(&e.ixfr_history.lock, NULL);
@@ -6828,7 +6828,7 @@ static void test_p10_extended_ixfr(void) {
     printf("[TEST] AXFR/IXFR: X-24 IXFR with Option 65153 answered incrementally unless the zone needs the extension...\n");
     zone_db_entry_t e;
     memset(&e, 0, sizeof(e));
-    strlcpy(e.domain, "x24.example.", sizeof(e.domain));
+    e.domain = "x24.example.";
     strlcpy(e.view_name, "default", sizeof(e.view_name));
     pthread_mutex_init(&e.writer_lock, NULL);
     pthread_mutex_init(&e.ixfr_history.lock, NULL);
@@ -6966,7 +6966,7 @@ static void test_p10_xfr_check_response_header(void) {
     /* handle_axfr_event(): a REFUSED answer ends at once with session.rcode set */
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "z.example.", sizeof(entry.domain));
+    entry.domain = "z.example.";
     pthread_mutex_init(&entry.writer_lock, NULL);
     p10_init_zone(test_zone_slot(&entry, 0), "z.example.", "1", NULL);
     atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
@@ -7168,7 +7168,7 @@ static void test_ixfr_history_depth(void) {
     static const char dom[] = "depth.example.";
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, dom, sizeof(entry.domain));
+    entry.domain = dom;
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
@@ -7268,7 +7268,7 @@ static void test_ixfr_diff_charge(void) {
     static const char dom[] = "charge.example.";
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, dom, sizeof(entry.domain));
+    entry.domain = dom;
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
     entry.source = ZONE_SRC_DB;
     pthread_mutex_init(&entry.writer_lock, NULL);
@@ -7750,7 +7750,7 @@ static void test_b8t2_sender_versions(void) {
     printf("[TEST] B8t-2: the sender answers version 2 and 3, refuses a SOA set to version 2, v2 and v3 of a plain zone agree...\n");
     zone_db_entry_t e;
     memset(&e, 0, sizeof(e));
-    strlcpy(e.domain, "b8.example.", sizeof(e.domain));
+    e.domain = "b8.example.";
     strlcpy(e.view_name, "default", sizeof(e.view_name));
     pthread_mutex_init(&e.writer_lock, NULL);
     pthread_mutex_init(&e.ixfr_history.lock, NULL);
@@ -7987,7 +7987,7 @@ static size_t sr_a(uint8_t *p, size_t cap, size_t off, const char *owner, uint8_
 
 static void sr_entry_init(zone_db_entry_t *e, const char *domain) {
     memset(e, 0, sizeof(*e));
-    strlcpy(e->domain, domain, sizeof(e->domain));
+    e->domain = domain;
     strlcpy(e->view_name, "default", sizeof(e->view_name));
     pthread_mutex_init(&e->writer_lock, NULL);
     pthread_mutex_init(&e->ixfr_history.lock, NULL);
@@ -8440,7 +8440,7 @@ static void test_batch4_failover_and_sources(void) {
     g_conn_n = 0;
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "fo.example.", sizeof(entry.domain));
+    entry.domain = "fo.example.";
     atomic_init(&entry.is_transferring, true);
     atomic_init(&entry.next_check, 0);
     axfr_bg_ctx_t *ctx = calloc(1, sizeof(axfr_bg_ctx_t));
@@ -8554,7 +8554,7 @@ static void run_soa_probe_case(uint32_t ours, uint32_t theirs, bool good, int ex
     g_mock_patch_id_peer = sv[1];
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "pr.example.", sizeof(entry.domain));
+    entry.domain = "pr.example.";
     entry.serial = ours;
     atomic_init(&entry.refresh, 2);
     atomic_init(&entry.retry, 1);
@@ -8768,7 +8768,7 @@ static void test_low_l2_no_apex_soa(void) {
     printf("[TEST] AXFR/IXFR: L2 a transfer whose SOA is not at the apex is refused and the zone stays as it was...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "drop.example.", sizeof(entry.domain));
+    entry.domain = "drop.example.";
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);

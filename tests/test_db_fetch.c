@@ -397,6 +397,102 @@ void syslog(int priority, const char *format, ...) {
     (void)format;
 }
 
+/* ---------------------------------------------------------------- B2 W5: the admission gate, places and tokens (helpers) */
+/* a number of a line of dbstatus: the line that starts with `line` ("fetch", "fetchq", "cache"), the field " name=" ; ~0 when it is not there */
+static unsigned long long st_field(const char *line, const char *name) {
+    char st[8192], key[48];
+    if (db_ingest_status(NULL, NULL, st, sizeof(st)) == 0) return ~0ull;
+    snprintf(key, sizeof(key), "\n%s: ", line);
+    const char *l = strstr(st, key);
+    if (!l) return ~0ull;
+    snprintf(key, sizeof(key), " %s=", name);
+    const char *eol = strchr(l + 1, '\n');
+    const char *p = strstr(l, key);
+    if (!p || (eol && p > eol)) return ~0ull;
+    return strtoull(p + strlen(key), NULL, 10);
+}
+
+/* wait (up to ms) until the number of places in use is n */
+static bool wait_places(uint32_t n, int ms) {
+    for (int i = 0; i < ms / 5 && park_places_used() != n; i++) usleep(5000);
+    return park_places_used() == n;
+}
+
+/* the next FETCH_REQ on the fetch stream of the loader's end (the test), waiting up to ms */
+static bool req_next(ch_t *c, kdb_msg_t *m, int ms) { return ch_next(c, m, ms) && m->type == KDB_T_FETCH_REQ; }
+
+/* a configuration with the database settings `dbextra` ("fetch-concurrency 8; fetch-rate 3; memory-limit 1024g;"), made active; waits until the manager's thread has taken
+ * the concurrency and the rate in force (dbstatus) and, when memory_limit != 0, set it as the limit in place of the one in the text */
+static void gate_cfg(const char *dbextra, unsigned conc, unsigned rate, uint64_t memory_limit) {
+    static server_config_t pool[16];
+    static int used;
+    char conf[1024];
+    snprintf(conf, sizeof(conf), "options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; %s }; };\n"
+             "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", dbextra);
+    server_config_t *c = &pool[used++ % 16];
+    CHECK(parse_named_conf(conf, c) == 0);
+    if (memory_limit) c->database.memory_limit = memory_limit;
+    atomic_store_explicit(&g_config_db.active, c, memory_order_release);
+    for (int i = 0; i < 300 && !(st_field("fetch", "concurrency") == conc && st_field("fetch", "rate") == rate && dbreg_cache_limit() == c->database.memory_limit); i++) usleep(20000);
+    CHECK(st_field("fetch", "concurrency") == conc && st_field("fetch", "rate") == rate && dbreg_cache_limit() == c->database.memory_limit);
+}
+
+/* the next wake key of worker w's ring, waiting up to ms (the ingest thread fills the rings one after the other) */
+static bool wake_ring_next(int w, park_key_t *kk, int ms) {
+    for (int i = 0; i < ms / 2; i++) {
+        if (park_wake_pop(park_wake_ring(w), kk)) return true;
+        usleep(2000);
+    }
+    return false;
+}
+
+static void drain_wakes(void) {
+    park_key_t kk;
+    for (int w = 0; w < 4; w++) while (park_wake_pop(park_wake_ring(w), &kk)) {}
+}
+
+/* what a worker does before it asks (fetch_gate() and the request itself, as udp_park() does it): 1 asked with a claim, 0 asked without, -1 turned away at the gate */
+static int worker_ask(int w, zdir_elem_t *pel, const char *view, const char *zone, uint8_t mode) {
+    int g = fetch_gate(w, view, pel, mono_ms());
+    if (g == FETCH_GATE_REFUSE) return -1;
+    if (!park_fetch_request(w, view, zone, (uint8_t)(KDB_FETCH_PRIO_QUERY | (g == FETCH_GATE_TAKEN ? PARK_PRIO_CLAIMED : 0)), mode)) {
+        if (g == FETCH_GATE_TAKEN) park_claim_release(view, zone);
+        return -2;
+    }
+    return g == FETCH_GATE_TAKEN ? 1 : 0;
+}
+
+/* the stress case: four workers ask for 40 cold zones as fast as they can while this process is the loader and answers every request "failed" */
+#define GS_W 4
+#define GS_Z 40
+#define GS_N 3000
+static zdir_elem_t *g_gs_el[GS_Z];
+static char g_gs_zone[GS_Z][24];
+static _Atomic int g_gs_done;
+static _Atomic uint64_t g_gs_refused, g_gs_claimed, g_gs_plain, g_gs_ringfull;
+static void *gs_worker(void *arg) {
+    int w = (int)(intptr_t)arg;
+    unsigned seed = 7919u * (unsigned)(w + 1);
+    for (int i = 0; i < GS_N; i++) {
+        seed = seed * 1103515245u + 12345u;
+        int z = (int)((seed >> 8) % GS_Z);
+        uint8_t mode = ((seed >> 20) % 16 == 0) ? KDB_FETCH_SUMMARY : KDB_FETCH_FULL;
+        if (mode == KDB_FETCH_SUMMARY) {                                   /* (a summary: no place, no gate; the ingest thread takes a token) */
+            if (!park_fetch_request(w, "default", g_gs_zone[z], KDB_FETCH_PRIO_QUERY, mode)) atomic_fetch_add(&g_gs_ringfull, 1);
+            else atomic_fetch_add(&g_gs_plain, 1);
+        } else {
+            int r = worker_ask(w, g_gs_el[z], "default", g_gs_zone[z], mode);
+            if (r < 0) atomic_fetch_add(r == -1 ? &g_gs_refused : &g_gs_ringfull, 1);
+            else atomic_fetch_add(r == 1 ? &g_gs_claimed : &g_gs_plain, 1);
+        }
+        park_key_t kk;
+        while (park_wake_pop(park_wake_ring(w), &kk)) {}                     /* (the worker reads its wake ring) */
+        if ((seed >> 24) % 8 == 0) usleep(20);
+    }
+    atomic_fetch_add(&g_gs_done, 1);
+    return NULL;
+}
+
 int main(void) {
     printf("[the Backend side of the fetch stream]\n");
     static server_config_t cfg;
@@ -1757,6 +1853,389 @@ int main(void) {
     CHECK(!ch_next(&fetch3, &m, 5000) && fetch3.eof);
     CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
     CHECK(wake_next(&k, 5000) && k.failed);
+
+    /* ======================================================================================================================================
+     * B2 W5: the admission gate.  A worker takes a place of the pool of fetch-concurrency and a token of fetch-rate before it parks and asks
+     * (fetch_gate(), PARK_PRIO_CLAIMED on the request); the ingest thread gives them back on every path that does not end in a fetch, and the
+     * place when the fetch is over.  The loader's end of a new pair of streams is made here (the one of the tests above has no fetch stream),
+     * the cold zones are zones of the batch of the cache tests taken out of memory with dbreg_test_evict().
+     * ====================================================================================================================================== */
+    {
+        printf("[B2 W5: places and tokens of the fetch requests, on every path]\n");
+        enum { NC = 320 };
+        static char cz[NC][24];
+        int a5[2], f5[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a5) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, f5) == 0);
+        hand_over(c[0], a5[1], f5[1]);
+        static ch_t fetch5;
+        ch_init(&fetch5, f5[0], KDB_FROM_BACKEND);
+        usleep(100000);
+        for (int w = 1; w < GS_W; w++) park_register_worker(w, -1);
+        int nc = 0;
+        for (int i = 300; i < 2500 && nc < NC; i++) {
+            snprintf(cz[nc], sizeof(cz[nc]), "z%04d.test.", i);
+            if (dbreg_lookup_entry("default", cz[nc]) != NULL && !dbreg_test_evict("default", cz[nc])) continue;       /* (in memory and cannot be taken out: not cold) */
+            if (elem_of("default", cz[nc]) == NULL) continue;
+            nc++;
+        }
+        CHECK(nc == NC);
+        for (int i = 0; i < 200 && dbreg_evict_inflight() != 0; i++) usleep(50000);
+        drain_wakes();
+        gate_cfg("fetch-concurrency 256; fetch-rate 100000; memory-limit 1024g;", 256, 100000, 0);
+        CHECK(park_places_used() == 0 && st_field("fetchq", "in_flight") == 0);
+        park_key_t k1;
+        kdb_msg_t m2;
+        #define COLD_EL(i) elem_of("default", cz[i])
+        #define IS_COLD(i) (COLD_EL(i) != NULL && zdir_entry(COLD_EL(i)) == NULL && atomic_load(&COLD_EL(i)->state) == ZDIR_ST_ABSENT)
+        CHECK(IS_COLD(0) && IS_COLD(1) && IS_COLD(2));
+
+        /* a fetch that ends well: the place is held while the fetch is in flight, the request reaches the loader with the plain priority, the place is back when the zone is
+         * installed (and before the workers are woken) */
+        CHECK(worker_ask(0, COLD_EL(0), "default", cz[0], KDB_FETCH_FULL) == 1 && park_places_used() == 1);
+        CHECK(req_next(&fetch5, &m, 5000) && strcmp(m.u.fetch_req.name, cz[0]) == 0 && m.u.fetch_req.priority == KDB_FETCH_PRIO_QUERY && m.u.fetch_req.mode == KDB_FETCH_FULL);
+        CHECK(park_places_used() == 1 && st_field("fetchq", "in_flight") == 1);
+        int zi = 0;
+        CHECK(sscanf(cz[0], "z%d", &zi) == 1);
+        send_zone(f5[0], &e, 0, cz[0], 1, m.u.fetch_req.request_id, 1000 + zi);
+        CHECK(wake_next(&k, 5000) && strcmp(k.zone, cz[0]) == 0 && !k.failed);
+        CHECK(park_places_used() == 0 && zdir_entry(COLD_EL(0)) != NULL);
+        /* a zone that is in memory by the time the ingest thread looks at a request that holds a claim: the workers are woken (not failed), nothing is asked, place and token
+         * go back */
+        CHECK(park_place_take() && park_rate_take(mono_ms(), false) && park_fetch_request(0, "default", cz[0], KDB_FETCH_PRIO_QUERY | PARK_PRIO_CLAIMED, KDB_FETCH_FULL));
+        CHECK(wake_next(&k, 5000) && strcmp(k.zone, cz[0]) == 0 && !k.failed);
+        CHECK(wait_places(0, 2000) && !ch_next(&fetch5, &m2, 200));
+        (void)dbreg_test_evict("default", cz[0]);                                  /* (cold again) */
+
+        /* a fetch that fails: the place is back, the workers are told */
+        CHECK(worker_ask(0, COLD_EL(1), "default", cz[1], KDB_FETCH_FULL) == 1 && park_places_used() == 1);
+        CHECK(req_next(&fetch5, &m, 5000) && strcmp(m.u.fetch_req.name, cz[1]) == 0);
+        send_failed(f5[0], &e, 0, cz[1], m.u.fetch_req.request_id);
+        CHECK(wake_next(&k, 5000) && strcmp(k.zone, cz[1]) == 0 && k.failed);
+        CHECK(park_places_used() == 0);
+
+        /* a second fetch of a zone that was taken out again: the same */
+        CHECK(worker_ask(0, COLD_EL(2), "default", cz[2], KDB_FETCH_FULL) == 1 && park_places_used() == 1);
+        CHECK(req_next(&fetch5, &m, 5000) && strcmp(m.u.fetch_req.name, cz[2]) == 0);
+        CHECK(sscanf(cz[2], "z%d", &zi) == 1);
+        send_zone(f5[0], &e, 0, cz[2], 1, m.u.fetch_req.request_id, 1000 + zi);
+        CHECK(wake_next(&k, 5000) && strcmp(k.zone, cz[2]) == 0 && !k.failed);
+        CHECK(wait_places(0, 2000));
+        (void)dbreg_test_evict("default", cz[2]);
+
+        /* two workers claimed a place for the same zone before the ingest thread looked (each saw the zone ABSENT): the second request is a duplicate, its place goes back,
+         * one FETCH_REQ is sent, one place is held until it is over */
+        CHECK(IS_COLD(3));
+        drain_wakes();
+        for (int w = 0; w < 2; w++) CHECK(park_place_take() && park_rate_take(mono_ms(), false) && park_fetch_request(w, "default", cz[3], KDB_FETCH_PRIO_QUERY | PARK_PRIO_CLAIMED, KDB_FETCH_FULL));
+        CHECK(req_next(&fetch5, &m, 5000) && strcmp(m.u.fetch_req.name, cz[3]) == 0);
+        CHECK(wait_places(1, 2000));
+        CHECK(!ch_next(&fetch5, &m2, 300));                                         /* (no second FETCH_REQ) */
+        send_failed(f5[0], &e, 0, cz[3], m.u.fetch_req.request_id);
+        CHECK(wake_next(&k, 5000) && k.failed && wake_ring_next(1, &k1, 2000) && k1.failed);     /* (the fetch is over: every worker is told) */
+        CHECK(wait_places(0, 2000));
+
+        /* a view that takes no database zones, a zone of the registry that does not exist: answered at once as failed, both go back */
+        CHECK(park_place_take() && park_rate_take(mono_ms(), false) && park_fetch_request(0, "nosuchview", "z.test.", KDB_FETCH_PRIO_QUERY | PARK_PRIO_CLAIMED, KDB_FETCH_FULL));
+        CHECK(wake_next(&k, 5000) && strcmp(k.view, "nosuchview") == 0 && k.failed && wait_places(0, 2000));
+        CHECK(park_place_take() && park_rate_take(mono_ms(), false) && park_fetch_request(0, "default", "ghost.test.", KDB_FETCH_PRIO_QUERY | PARK_PRIO_CLAIMED, KDB_FETCH_FULL));
+        CHECK(wake_next(&k, 5000) && strcmp(k.zone, "ghost.test.") == 0 && k.failed && wait_places(0, 2000));
+        CHECK(!ch_next(&fetch5, &m2, 200));
+
+        /* the database zones are over the hard limit: the request that holds a claim is shed, counted in `shed`, and the worker that asked is woken, with the workers that parked
+         * for the zone without a claim (B2 M1: their requests are dropped while the claim is marked); a request without a claim concerns only its worker (below) */
+        CHECK(IS_COLD(5));
+        {
+            dbreg_cache_stats_t cs;
+            dbreg_cache_stats(&cs);
+            dbreg_cache_test_pause(true);                                           /* (the manager does not take zones out to get under the limit) */
+            gate_cfg("fetch-concurrency 256; fetch-rate 100000;", 256, 100000, cs.resident / 4);
+            CHECK(dbreg_cache_over_limit());
+            unsigned long long s0 = st_field("cache", "shed");
+            drain_wakes();
+            CHECK(park_place_take() && park_rate_take(mono_ms(), false) && park_fetch_request(0, "default", cz[5], KDB_FETCH_PRIO_QUERY | PARK_PRIO_CLAIMED, KDB_FETCH_FULL));
+            CHECK(wake_next(&k, 5000) && strcmp(k.zone, cz[5]) == 0 && k.failed);
+            CHECK(wake_ring_next(1, &k1, 2000) && strcmp(k1.zone, cz[5]) == 0 && k1.failed && wake_ring_next(2, &k1, 2000) && k1.failed);       /* (a claim speaks for every worker) */
+            usleep(100000);
+            CHECK(st_field("cache", "shed") == s0 + 1 && wait_places(0, 2000) && !ch_next(&fetch5, &m2, 200));
+            /* a request without a claim: only the worker that asked */
+            drain_wakes();
+            CHECK(park_fetch_request(0, "default", cz[5], KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+            CHECK(wake_next(&k, 5000) && strcmp(k.zone, cz[5]) == 0 && k.failed);
+            usleep(100000);
+            CHECK(!park_wake_pop(park_wake_ring(1), &k1) && !park_wake_pop(park_wake_ring(2), &k1) && st_field("cache", "shed") == s0 + 2 && wait_places(0, 2000));
+            drain_wakes();
+            /* (B2 M1) a worker that found the zone claimed asked without a claim: while the mark is up its request is dropped (no shed of its own, nobody woken for it), and the claimed
+             * request speaks for it: both workers are told when that one is shed, and the mark and the place are gone */
+            uint64_t key5 = park_claim_key("default", cz[5]);
+            CHECK(park_place_take() && park_rate_take(mono_ms(), false) && park_claim_mark(key5));
+            CHECK(park_fetch_request(1, "default", cz[5], KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+            usleep(150000);
+            CHECK(!park_wake_pending(park_wake_ring(0)) && !park_wake_pending(park_wake_ring(1)) && st_field("cache", "shed") == s0 + 2 && park_claim_held(key5));
+            CHECK(park_fetch_request(0, "default", cz[5], KDB_FETCH_PRIO_QUERY | PARK_PRIO_CLAIMED, KDB_FETCH_FULL));
+            CHECK(wake_next(&k, 5000) && strcmp(k.zone, cz[5]) == 0 && k.failed && wake_ring_next(1, &k1, 2000) && k1.failed);
+            CHECK(wait_places(0, 2000) && !park_claim_held(key5) && st_field("cache", "shed") == s0 + 3);
+            drain_wakes();
+            /* the gate says no before the worker parks: the same counter, no place or token kept */
+            CHECK(worker_ask(0, COLD_EL(5), "default", cz[5], KDB_FETCH_FULL) == -1 && park_places_used() == 0 && st_field("cache", "shed") == s0 + 4);
+            CHECK(!park_wake_pending(park_wake_ring(0)) && !park_fetch_pending());
+            dbreg_cache_test_pause(false);
+            gate_cfg("fetch-concurrency 256; fetch-rate 100000; memory-limit 1024g;", 256, 100000, 0);
+        }
+
+        /* fetch-rate: a bucket of 3.  A request without a claim that finds it empty is refused by the ingest thread (counted in refused_by_rate, only the asking worker is
+         * woken, the place it took goes back); the gate refuses before the worker parks (the same counter, the place goes back); a claim that is a duplicate gives its token back,
+         * a failed fetch does not */
+        gate_cfg("fetch-concurrency 256; fetch-rate 3; memory-limit 1024g;", 256, 3, 0);
+        {
+            CHECK(IS_COLD(6) && IS_COLD(7));
+            drain_wakes();
+            park_rate_reset();
+            while (park_rate_take(mono_ms(), false)) {}                                 /* the bucket is empty */
+            unsigned long long r0 = st_field("fetch", "refused_by_rate");
+            CHECK(park_fetch_request(0, "default", cz[6], KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));         /* (no claim: the ingest thread takes a place, finds no token) */
+            CHECK(wake_next(&k, 5000) && strcmp(k.zone, cz[6]) == 0 && k.failed);
+            usleep(100000);
+            CHECK(!park_wake_pop(park_wake_ring(1), &k1) && st_field("fetch", "refused_by_rate") == r0 + 1 && wait_places(0, 2000));
+            while (park_rate_take(mono_ms(), false)) {}                                 /* (empty again: 3 tokens a second refill nothing in a few ms) */
+            CHECK(worker_ask(0, COLD_EL(6), "default", cz[6], KDB_FETCH_FULL) == -1 && park_places_used() == 0 && st_field("fetch", "refused_by_rate") == r0 + 2);
+            CHECK(!ch_next(&fetch5, &m2, 100));
+            park_rate_reset();                                                          /* 3 tokens */
+            for (int w = 0; w < 2; w++) CHECK(park_place_take() && park_rate_take(mono_ms(), false) && park_fetch_request(w, "default", cz[7], KDB_FETCH_PRIO_QUERY | PARK_PRIO_CLAIMED, KDB_FETCH_FULL));
+            CHECK(req_next(&fetch5, &m, 5000) && strcmp(m.u.fetch_req.name, cz[7]) == 0);
+            CHECK(wait_places(1, 2000));
+            uint32_t lv = park_rate_level(mono_ms());
+            CHECK(lv >= 1900 && lv < 2600);                                             /* (3 - 1 for the fetch; the duplicate's token is back) */
+            send_failed(f5[0], &e, 0, cz[7], m.u.fetch_req.request_id);
+            CHECK(wake_next(&k, 5000) && k.failed && wait_places(0, 2000));
+            lv = park_rate_level(mono_ms());
+            CHECK(lv >= 1900 && lv < 2600);                                             /* (a fetch that was made keeps its token, failed or not) */
+            drain_wakes();
+        }
+
+        /* the pool is shared by the gates and by the ingest thread: with fetch-concurrency 2 two requests without a claim take the two places at the ingest thread, a third
+         * is shed, and so is a worker at its gate */
+        gate_cfg("fetch-concurrency 2; fetch-rate 100000; memory-limit 1024g;", 2, 100000, 0);
+        {
+            CHECK(IS_COLD(8) && IS_COLD(9) && IS_COLD(10));
+            unsigned long long s0 = st_field("cache", "shed");
+            CHECK(park_fetch_request(0, "default", cz[8], KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL) && park_fetch_request(0, "default", cz[9], KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+            kdb_msg_t r8, r9;
+            CHECK(req_next(&fetch5, &r8, 5000) && req_next(&fetch5, &r9, 5000) && park_places_used() == 2);
+            CHECK(park_fetch_request(0, "default", cz[10], KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+            CHECK(wake_next(&k, 5000) && strcmp(k.zone, cz[10]) == 0 && k.failed && st_field("cache", "shed") == s0 + 1 && park_places_used() == 2);
+            CHECK(!ch_next(&fetch5, &m2, 200));
+            CHECK(worker_ask(1, COLD_EL(10), "default", cz[10], KDB_FETCH_FULL) == -1 && st_field("cache", "shed") == s0 + 2);
+            send_failed(f5[0], &e, 0, r8.u.fetch_req.name, r8.u.fetch_req.request_id);
+            send_failed(f5[0], &e, 0, r9.u.fetch_req.name, r9.u.fetch_req.request_id);
+            CHECK(wait_places(0, 2000));
+            drain_wakes();
+        }
+
+        /* (B2 M1) several workers ask for one zone that is out of memory before the ingest thread has looked at the first request (the zone is ABSENT for every one of them): the
+         * first takes the place and the token and marks the zone, the others take nothing and ask without a claim, whatever the pool says (a zone whose fetch is queued is not refused
+         * for the places that its own claim holds).  One FETCH_REQ, one place, no wake-up until the fetch is over, and then every worker is woken (or told of the failure).  Zones
+         * of other claims are admitted while the pool has room, and refused when it has not. */
+        gate_cfg("fetch-concurrency 2; fetch-rate 100000; memory-limit 1024g;", 2, 100000, 0);
+        {
+            CHECK(IS_COLD(140) && IS_COLD(141) && IS_COLD(142) && IS_COLD(143));
+            drain_wakes();
+            unsigned long long s0 = st_field("cache", "shed"), r0 = st_field("fetch", "refused_by_rate");
+            for (int round = 0; round < 2; round++) {                                       /* (round 0: the fetch is done; round 1: it fails) */
+                const char *zn = cz[140 + round];
+                uint64_t key = park_claim_key("default", zn);
+                int gt[GS_W];
+                for (int w = 0; w < GS_W; w++) gt[w] = fetch_gate(w, "default", COLD_EL(140 + round), mono_ms());
+                CHECK(gt[0] == FETCH_GATE_TAKEN && gt[1] == FETCH_GATE_ASK && gt[2] == FETCH_GATE_ASK && gt[3] == FETCH_GATE_ASK);
+                CHECK(park_places_used() == 1 && park_claim_held(key));                     /* (one place for four workers) */
+                /* another zone is admitted (the duplicates took no place), and with both places taken the next zone is refused, while a worker that asks for the zone that is claimed
+                 * is not (the pool is full, but its zone's fetch is queued) */
+                CHECK(fetch_gate(1, "default", COLD_EL(142), mono_ms()) == FETCH_GATE_TAKEN && park_places_used() == 2);
+                CHECK(fetch_gate(2, "default", COLD_EL(143), mono_ms()) == FETCH_GATE_REFUSE && park_places_used() == 2);
+                s0++;                                                                       /* (a refusal at the gate is counted in `shed`) */
+                CHECK(fetch_gate(3, "default", COLD_EL(140 + round), mono_ms()) == FETCH_GATE_ASK && park_places_used() == 2);
+                park_claim_release("default", cz[142]);                                     /* (a claim that is not used: place, token and mark go back) */
+                CHECK(park_places_used() == 1 && !park_claim_held(park_claim_key("default", cz[142])) && park_claim_held(key));
+                /* the requests, as udp_park() makes them: the workers without a claim reach the ingest thread first (they are dropped while the mark is up) */
+                for (int w = GS_W - 1; w >= 0; w--)
+                    CHECK(park_fetch_request(w, "default", zn, (uint8_t)(KDB_FETCH_PRIO_QUERY | (gt[w] == FETCH_GATE_TAKEN ? PARK_PRIO_CLAIMED : 0)), KDB_FETCH_FULL));
+                CHECK(req_next(&fetch5, &m, 5000) && strcmp(m.u.fetch_req.name, zn) == 0);
+                CHECK(!ch_next(&fetch5, &m2, 300));                                         /* (one FETCH_REQ) */
+                CHECK(park_places_used() == 1 && !park_claim_held(key) && st_field("cache", "shed") == s0 && st_field("fetch", "refused_by_rate") == r0);
+                for (int w = 0; w < GS_W; w++) CHECK(!park_wake_pending(park_wake_ring(w)));                  /* (nobody is woken or failed before the fetch is over) */
+                if (round == 0) {
+                    int zi140 = 0;
+                    CHECK(sscanf(zn, "z%d", &zi140) == 1);
+                    send_zone(f5[0], &e, 0, zn, 1, m.u.fetch_req.request_id, 1000 + zi140);
+                } else {
+                    send_failed(f5[0], &e, 0, zn, m.u.fetch_req.request_id);
+                }
+                for (int w = 0; w < GS_W; w++) CHECK(wake_ring_next(w, &k1, 5000) && strcmp(k1.zone, zn) == 0 && k1.failed == (round == 1));
+                CHECK(wait_places(0, 2000) && !park_claim_held(key));
+                CHECK((zdir_entry(COLD_EL(140 + round)) != NULL) == (round == 0));
+                if (round == 0) (void)dbreg_test_evict("default", zn);                      /* (cold again) */
+                drain_wakes();
+            }
+            /* the next worker takes the claim again when the last one was released */
+            CHECK(fetch_gate(3, "default", COLD_EL(141), mono_ms()) == FETCH_GATE_TAKEN && fetch_gate(0, "default", COLD_EL(141), mono_ms()) == FETCH_GATE_ASK);
+            park_claim_release("default", cz[141]);
+            CHECK(park_places_used() == 0 && !park_claim_held(park_claim_key("default", cz[141])));
+        }
+
+        /* a table of 256 places with a summary in flight: the 256th claim finds it full (table_full), the place goes back, the workers are woken (the claim speaks for them all) */
+        gate_cfg("fetch-concurrency 256; fetch-rate 100000; memory-limit 1024g;", 256, 100000, 0);
+        {
+            static char names[256][24];
+            static uint64_t ids[256];
+            unsigned long long t0 = st_field("fetchq", "table_full");
+            int got = 0, nsent = 0;
+            CHECK(park_fetch_request(0, "default", cz[NC - 1], KDB_FETCH_PRIO_QUERY, KDB_FETCH_SUMMARY));
+            CHECK(req_next(&fetch5, &m, 5000) && m.u.fetch_req.mode == KDB_FETCH_SUMMARY);
+            snprintf(names[got], sizeof(names[0]), "%s", m.u.fetch_req.name);
+            ids[got++] = m.u.fetch_req.request_id;
+            for (int i = 20; i < 20 + 255; i++) {
+                CHECK(IS_COLD(i));
+                CHECK(worker_ask(0, COLD_EL(i), "default", cz[i], KDB_FETCH_FULL) == 1);
+                nsent++;
+                if (nsent % 100 == 0 || i == 20 + 254) {
+                    while (got < 1 + nsent && req_next(&fetch5, &m, 5000)) {
+                        snprintf(names[got], sizeof(names[0]), "%s", m.u.fetch_req.name);
+                        ids[got++] = m.u.fetch_req.request_id;
+                    }
+                }
+            }
+            CHECK(got == 256 && park_places_used() == 255 && st_field("fetchq", "in_flight") == 256);
+            drain_wakes();
+            CHECK(IS_COLD(300) && worker_ask(0, COLD_EL(300), "default", cz[300], KDB_FETCH_FULL) == 1);        /* (255 places taken: the 256th is free) */
+            CHECK(wake_next(&k, 5000) && strcmp(k.zone, cz[300]) == 0 && k.failed);
+            usleep(100000);
+            CHECK(wake_ring_next(1, &k1, 2000) && strcmp(k1.zone, cz[300]) == 0 && k1.failed);      /* (a claim speaks for the workers that parked without one) */
+            CHECK(st_field("fetchq", "table_full") == t0 + 1 && wait_places(255, 2000) && !ch_next(&fetch5, &m2, 200));
+            for (int i = 0; i < got; i++) {
+                send_failed(f5[0], &e, 0, names[i], ids[i]);
+                if (i % 32 == 31) drain_wakes();
+            }
+            CHECK(wait_places(0, 5000));
+            for (int i = 0; i < 100 && st_field("fetchq", "in_flight") != 0; i++) usleep(20000);
+            CHECK(st_field("fetchq", "in_flight") == 0 && st_field("fetchq", "peak") == 256);
+            drain_wakes();
+        }
+
+        /* a reload that changes fetch-concurrency while claims are in flight: nothing is taken away or given twice; a lower limit takes effect as the places come back */
+        gate_cfg("fetch-concurrency 8; fetch-rate 100000; memory-limit 1024g;", 8, 100000, 0);
+        {
+            static char names[8][24];
+            static uint64_t ids[8];
+            for (int i = 0; i < 8; i++) {
+                CHECK(IS_COLD(40 + i) && worker_ask(0, COLD_EL(40 + i), "default", cz[40 + i], KDB_FETCH_FULL) == 1);
+                CHECK(req_next(&fetch5, &m, 5000));
+                snprintf(names[i], sizeof(names[0]), "%s", m.u.fetch_req.name);
+                ids[i] = m.u.fetch_req.request_id;
+            }
+            CHECK(park_places_used() == 8 && !park_place_take());
+            gate_cfg("fetch-concurrency 3; fetch-rate 100000; memory-limit 1024g;", 3, 100000, 0);
+            CHECK(park_places_used() == 8 && !park_place_take() && worker_ask(0, COLD_EL(60), "default", cz[60], KDB_FETCH_FULL) == -1);
+            for (int i = 0; i < 5; i++) send_failed(f5[0], &e, 0, names[i], ids[i]);
+            CHECK(wait_places(3, 3000) && !park_place_take());                           /* (as many as the new limit: none free) */
+            send_failed(f5[0], &e, 0, names[5], ids[5]);
+            CHECK(wait_places(2, 3000) && park_place_take());
+            park_place_give();
+            gate_cfg("fetch-concurrency 5; fetch-rate 100000; memory-limit 1024g;", 5, 100000, 0);
+            CHECK(park_place_take() && park_place_take() && park_place_take() && !park_place_take() && park_places_used() == 5);      /* (2 in flight, 3 more) */
+            park_place_give();
+            park_place_give();
+            park_place_give();
+            send_failed(f5[0], &e, 0, names[6], ids[6]);
+            send_failed(f5[0], &e, 0, names[7], ids[7]);
+            CHECK(wait_places(0, 3000));
+            drain_wakes();
+        }
+
+        /* the loader goes away with fetches in flight (a restarted loader asks them again; a loader without a fetch stream fails them): the places are not lost */
+        gate_cfg("fetch-concurrency 16; fetch-rate 100000; memory-limit 1024g;", 16, 100000, 0);
+        {
+            for (int i = 0; i < 4; i++) {
+                CHECK(IS_COLD(70 + i) && worker_ask(0, COLD_EL(70 + i), "default", cz[70 + i], KDB_FETCH_FULL) == 1);
+                CHECK(req_next(&fetch5, &m, 5000));
+            }
+            CHECK(park_places_used() == 4);
+            int a6[2], f6[2];
+            CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a6) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, f6) == 0);
+            hand_over(c[0], a6[1], f6[1]);                                                  /* a restarted loader: the same requests again on the new stream */
+            static ch_t fetch6;
+            ch_init(&fetch6, f6[0], KDB_FROM_BACKEND);
+            kdb_msg_t again[4];
+            for (int i = 0; i < 4; i++) CHECK(req_next(&fetch6, &again[i], 5000));
+            CHECK(park_places_used() == 4);
+            for (int i = 0; i < 2; i++) send_failed(f6[0], &e, 0, again[i].u.fetch_req.name, again[i].u.fetch_req.request_id);
+            CHECK(wait_places(2, 3000));
+            int a7[2];
+            CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a7) == 0);
+            hand_over(c[0], a7[1], -1);                                                     /* a loader with no fetch stream: what is in flight is failed */
+            CHECK(wait_places(0, 5000));
+            for (int i = 0; i < 100 && st_field("fetchq", "in_flight") != 0; i++) usleep(20000);
+            CHECK(st_field("fetchq", "in_flight") == 0);
+            drain_wakes();
+            /* (the stream is gone: a request is failed at once, its place goes back at once) */
+            CHECK(worker_ask(0, COLD_EL(74), "default", cz[74], KDB_FETCH_FULL) == 1);
+            CHECK(wake_next(&k, 5000) && k.failed && wait_places(0, 3000));
+            int a8[2], f8[2];
+            CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a8) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, f8) == 0);
+            hand_over(c[0], a8[1], f8[1]);                                                  /* and a fetch stream again for the stress below */
+            ch_init(&fetch5, f8[0], KDB_FROM_BACKEND);
+            f5[0] = f8[0];
+            usleep(100000);
+            drain_wakes();
+        }
+
+        /* four workers against the ingest thread: every request that is made is one of: refused at the gate, a request with a claim, one without; whatever the ingest thread
+         * does with it (dedupe, shed, FETCH_REQ, failed) no place is left behind and the places in use never go over the limit */
+        gate_cfg("fetch-concurrency 8; fetch-rate 100000; memory-limit 1024g;", 8, 100000, 0);
+        {
+            for (int i = 0; i < GS_Z; i++) {
+                snprintf(g_gs_zone[i], sizeof(g_gs_zone[0]), "%s", cz[100 + i]);
+                g_gs_el[i] = COLD_EL(100 + i);
+                CHECK(g_gs_el[i] != NULL);
+            }
+            atomic_store(&g_gs_done, 0);
+            atomic_store(&g_gs_refused, 0);
+            atomic_store(&g_gs_claimed, 0);
+            atomic_store(&g_gs_plain, 0);
+            atomic_store(&g_gs_ringfull, 0);
+            unsigned long long shed0 = st_field("cache", "shed"), is0 = st_field("fetch", "issued"), rate0 = st_field("fetch", "refused_by_rate");
+            pthread_t th[GS_W];
+            for (long w = 0; w < GS_W; w++) pthread_create(&th[w], NULL, gs_worker, (void *)(intptr_t)w);
+            uint64_t answered = 0;
+            uint32_t maxused = 0;
+            int quiet = 0;
+            while (atomic_load(&g_gs_done) < GS_W || quiet < 20) {
+                if (req_next(&fetch5, &m, 5)) {
+                    send_failed(f5[0], &e, 0, m.u.fetch_req.name, m.u.fetch_req.request_id);
+                    answered++;
+                    quiet = 0;
+                } else if (atomic_load(&g_gs_done) >= GS_W && !park_fetch_pending()) {
+                    quiet++;
+                }
+                if (park_places_used() > maxused) maxused = park_places_used();
+            }
+            for (int w = 0; w < GS_W; w++) pthread_join(th[w], NULL);
+            for (int i = 0; i < 200 && (park_places_used() != 0 || st_field("fetchq", "in_flight") != 0); i++) usleep(20000);
+            unsigned long long shed1 = st_field("cache", "shed"), is1 = st_field("fetch", "issued"), rate1 = st_field("fetch", "refused_by_rate");
+            printf("  %llu requests with a claim, %llu without, %llu turned away at the gate (shed counted %llu), %llu ring full; %llu fetches issued, %llu answered; most places used at once %u; peak in flight %llu\n",
+                   (unsigned long long)atomic_load(&g_gs_claimed), (unsigned long long)atomic_load(&g_gs_plain), (unsigned long long)atomic_load(&g_gs_refused), shed1 - shed0,
+                   (unsigned long long)atomic_load(&g_gs_ringfull), is1 - is0, (unsigned long long)answered, maxused, st_field("fetchq", "peak"));
+            CHECK(park_places_used() == 0 && st_field("fetchq", "in_flight") == 0);
+            for (int i = 0; i < GS_Z; i++) CHECK(!park_claim_held(park_claim_key("default", g_gs_zone[i])));       /* (every claim ended: no mark is left) */
+            CHECK(maxused <= 8);
+            CHECK(atomic_load(&g_gs_refused) > 0 && atomic_load(&g_gs_claimed) > 0 && is1 > is0);
+            CHECK((shed1 - shed0) + (rate1 - rate0) >= atomic_load(&g_gs_refused));      /* (the gate's refusals are in `shed` and `refused_by_rate`, with the ingest thread's) */
+            CHECK(answered >= is1 - is0);
+            drain_wakes();
+        }
+        for (int w = 1; w < GS_W; w++) park_unregister_worker(w);
+        gate_cfg("", 16, KARIDNS_DB_FETCH_RATE_DEFAULT, 0);
+        #undef COLD_EL
+        #undef IS_COLD
+    }
 
     usleep(300000);
     gc_snapshot_wait_idle();                          /* (the cleanup threads of the retired snapshots are joined, as the manager does before it forks) */

@@ -139,6 +139,7 @@ typedef struct {
   bool want_summary;                     /* a summary for the zone was not asked for because this request was on its way: if it fails or is dropped, the zone goes back to the list */
   bool dropped;                          /* the zone it brought was dropped (an older version than the directory's) */
   bool quiet;                            /* asked for by the list of zones to read (the apex after a reload), not by a query: nobody waits for it, so it wakes nobody */
+  bool placed;                           /* B2 W5: it holds a place of the pool of fetch-concurrency (park_place_take()), given back when the fetch is over */
   bool hot;                              /* a zone of the hot list (D1a step 7): counted in the warm-up progress */
   uint32_t hrank;                        /* of the hot list: how many zones of the list were asked for before this one (the list is read in its order) */
   int64_t sent_ms;
@@ -266,8 +267,7 @@ typedef struct {
   bool apex_walk;                        /* D1a step 6: after a reload, the zones out of memory that now keep an apex but have none are asked for (their summary) ... */
   dbreg_cursor_t apex_cur;               /* ... a few at a time, from here */
   uint32_t funsolicited;       /* zones nobody asked for, discarded (logged the first few) */
-  double ftokens;              /* the fetch-rate bucket (ingest thread only): tokens, and when it was filled */
-  int64_t ftok_ms;
+  bool fmore;                  /* B2 W5: the last fetch_issue() pass stopped at its bound (requests or time) with work left: the loop serves the streams and comes back */
 } ing_t;
 
 enum { ROUT_NONE = 0, ROUT_APPLIED, ROUT_SHADOWED, ROUT_REJECTED, ROUT_FAILED, ROUT_DELETED };
@@ -987,7 +987,9 @@ static zone_db_entry_t *new_db_entry(const char *view, const char *zone, zone_ex
   e->kind = zkind == KDB_ZK_PRIMARY ? ZONE_KIND_PRIMARY : ZONE_KIND_SECONDARY;
   e->is_secondary = zkind != KDB_ZK_PRIMARY;
   atomic_store_explicit(&e->dbcfg, dc, memory_order_release);
-  apply_ixfr_depth(e, dc);
+  rcu_aux_read_lock();                                  /* (0.7 B2: nobody else has the entry yet: the depth is set without its history lock) */
+  ixfr_history_init_depth(e, ixfr_history_effective(acquire_config_snapshot(), dc));
+  rcu_aux_read_unlock();
   return e;
 }
 
@@ -1327,7 +1329,12 @@ static uint32_t fetch_conc_eff(uint32_t conc, uint32_t loader_threads) {
   return conc;
 }
 static void set_fetch_limits(const ing_cfg_t *c) {
-  atomic_store_explicit(&g_fetch_conc, fetch_conc_eff(c->fetch_concurrency, c->loader_threads), memory_order_relaxed);
+  uint32_t eff = fetch_conc_eff(c->fetch_concurrency, c->loader_threads);
+  atomic_store_explicit(&g_fetch_conc, eff, memory_order_relaxed);
+  park_places_set_limit(eff);                /* the pool of places the workers and this thread draw from: a lower limit takes effect as the places in use are given back, none is lost */
+  uint32_t rate = c->fetch_rate ? c->fetch_rate : KARIDNS_DB_FETCH_RATE_DEFAULT;
+  atomic_store_explicit(&g_fetch_rate, rate, memory_order_relaxed);
+  park_rate_set(rate);                       /* the bucket the workers' gate and this thread share (dns_park.c) */
 }
 /* the zones nobody asked for yet (the warm-up, the walk for apexes) use at most this many places of the limit or `cap`, half the limit at the most, so that the queries have the rest */
 static uint32_t fetch_sub_limit(uint32_t cap) {
@@ -2809,6 +2816,7 @@ static ing_freq_t *fetch_find_zone(ing_t *g, uint16_t view, const char *zone, ui
 static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
   ing_freq_t done = *r;
   r->active = false;
+  if (done.placed) park_place_give();                    /* (B2 W5: the one place of the fetch goes back, whichever way it ended: installed, failed, dropped, the loader gone) */
   g->nfreq--;
   atomic_store_explicit(&g_fq_inflight, g->nfreq, memory_order_relaxed);
   if (ok) fq_hist_add(now_ms() - done.sent_ms);
@@ -2840,7 +2848,8 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
   if (ok && done.hot && !done.dropped && done.mode == KDB_FETCH_FULL) dbreg_warm_freq(done.view_name, done.zone, g->wl_count > done.hrank ? g->wl_count - done.hrank : 1);
   if (ok && !done.dropped && !done.quiet && done.mode == KDB_FETCH_FULL && done.prio == KDB_FETCH_PRIO_BACKGROUND) dbreg_bg_loaded(done.view_name, done.zone);
   if ((!ok || done.dropped) && done.want_summary) warm_add(g, done.view_name, done.zone);     /* (the summary that was not asked for because this request was on its way) */
-  if (!done.quiet) park_wake_broadcast(done.view_name, done.zone, !ok);      /* (the summary for the apex wakes nobody: no query waits for it, and the queries that wait for the data are not woken for nothing) */
+  if (!done.quiet) park_wake_queue_all(done.view_name, done.zone, !ok);      /* (the triggers go out together, park_wake_flush())  */
+  /* (the summary for the apex wakes nobody: no query waits for it, and the queries that wait for the data are not woken for nothing) */
 }
 
 static void fetch_job_finish(ing_t *g, ing_job_t *j) {
@@ -2899,27 +2908,12 @@ static void warm_add_ex(ing_t *g, const char *view, const char *zone, bool hot, 
   atomic_store_explicit(&g_warm_n, (uint32_t)g->nwarm, memory_order_relaxed);
 }
 
-/* the fetch-rate bucket (ingest thread only): fill it for the time that has passed; returns the rate */
-static uint32_t fetch_refill(ing_t *g) {
-  uint32_t frate = atomic_load_explicit(&g_fetch_rate, memory_order_relaxed);
-  int64_t tnow = now_ms();
-  if (g->ftok_ms == 0) {
-    g->ftokens = frate;
-  } else if (tnow > g->ftok_ms) {
-    g->ftokens += (double)(tnow - g->ftok_ms) * frate / 1000.0;
-    if (g->ftokens > frate) g->ftokens = frate;
-  }
-  g->ftok_ms = tnow;
-  return frate;
-}
-
 static void warm_add(ing_t *g, const char *view, const char *zone) { warm_add_ex(g, view, zone, false, false); }
 
 /* The hot items of the warm list are taken from its head only when there is room for them (so that the order of the list holds): the queries come first (fewer than
  * ING_WARM_NFREQ fetches in flight, the rate bucket at least half full), the limit is respected, and at the high water mark of memory-limit the rest of the hot
  * list is dropped (design 8.4: warming never takes memory from the zones that are in use).  1: read the head now; 0: not now (it stays); -1: the hot items were
  * dropped, look at the list again. */
-static uint32_t fetch_refill(ing_t *g);
 static void warm_drop_hot(ing_t *g) {
   size_t k = 0;
   for (size_t i = 0; i < g->nwarm; i++) {
@@ -2961,8 +2955,33 @@ static int warm_hot_gate(ing_t *g) {
     }
     if (g->nfreq >= atomic_load_explicit(&g_fetch_conc, memory_order_relaxed) || dbreg_cache_over_limit()) return 0;
   }
-  uint32_t frate = fetch_refill(g);
-  return g->ftokens >= (frate / 2.0 > 1.0 ? frate / 2.0 : 1.0) ? 1 : 0;
+  return park_rate_check(now_ms(), true) ? 1 : 0;        /* the bucket is at least half full (and has a token): the queries come first */
+}
+
+/* B2 W5: one pass of fetch_issue() handles at most this many requests, or runs about this long, and then the main loop serves the streams (the loader's answers, the
+ * installs, the delta) before it comes back: a flood of requests cannot keep the thread in here.  (At 200k queries a second for zones out of memory one pass ran 4 to
+ * 130 ms, 97% of the thread, and the FETCH_REQs of the whole pass were written at its end: a fetch took 10 to 100 ms to start and the loader's answers waited for the
+ * next pass.)  The FETCH_REQs made in a pass are written when it ends, so a request leaves at most about ING_FETCH_SLICE_NS after it was made. */
+#define ING_FETCH_SLICE_N 64
+#define ING_FETCH_SLICE_NS 1000000LL
+
+/* A request that is being handled may hold a place of the pool of fetch-concurrency (park_place_take(): a worker took it at its gate, or this thread takes it below) and a
+ * token of the fetch-rate bucket.  They are given back here on every path that does not end in a fetch; a fetch keeps the place (ing_freq_t.placed) until it is over
+ * (fetch_complete()) and the token is spent.  The claim mark of the zone (park_claim_mark(), B2 M1) is cleared on every path as well, a fetch that starts included (from then on the
+ * state is LOADING, which is what tells the workers); `key` is the mark's key, 0 when the request holds none. */
+static void fetch_release(bool *place, bool *tok, uint64_t *key) {
+  if (*place) park_place_give();
+  if (*tok) park_rate_give();
+  if (*key) park_claim_clear(*key);
+  *place = *tok = false;
+  *key = 0;
+}
+
+/* The request cannot be made (shed, refused by rate, no free slot of the table): its queries get "not ready" now.  A request that holds a claim speaks for every worker that
+ * parked for the zone without one (their requests are dropped while the mark is up, see below), so all of them are told; any other request concerns its worker only. */
+static void fetch_refuse(const park_fetch_req_t *q) {
+  if (q->claimed) park_wake_queue_all(q->view, q->zone, true);
+  else park_wake_queue_one(q->worker, q->view, q->zone, true);
 }
 
 static void fetch_issue(ing_t *g) {
@@ -2970,9 +2989,21 @@ static void fetch_issue(ing_t *g) {
   bool warm = false;
   size_t warm_left = g->nwarm;                           /* the zones that were in the list when the pass started (those put back wait for the next pass) */
   bool hot = false;
+  bool hold_place = false, hold_tok = false;             /* what the request in hand holds (fetch_release()) */
+  uint64_t hold_key = 0;                                 /* the claim mark of the request in hand */
+  int handled = 0;
+  int64_t t0 = mono_ns();
+  g->fmore = false;
   for (;;) {
+    fetch_release(&hold_place, &hold_tok, &hold_key);    /* (the request of the last round did not become a fetch: it was refused, a duplicate, or in memory) */
+    if (++handled > ING_FETCH_SLICE_N || ((handled & 7) == 0 && mono_ns() - t0 >= ING_FETCH_SLICE_NS)) {
+      g->fmore = true;
+      break;
+    }
     if (park_fetch_next(&q)) {
       warm = false;
+      hold_place = hold_tok = q.claimed;                 /* (a worker took both at its gate, and marked the zone) */
+      if (q.claimed) hold_key = park_claim_key(q.view, q.zone);
     } else if (g->nwarm > 0 && warm_left > 0) {
       size_t wi = 0;                                     /* the item to take: the head, or (hot items that cannot be read now) the first that is not hot */
       if (g->warm[0].hot) {                              /* (a hot item is not taken out of the list until it can be read, so that the order of the list holds) */
@@ -2989,6 +3020,7 @@ static void fetch_issue(ing_t *g) {
       warm = true;
       warm_left--;
       memset(&q, 0, sizeof(q));
+      q.worker = -1;
       snprintf(q.view, sizeof(q.view), "%s", g->warm[wi].view);
       snprintf(q.zone, sizeof(q.zone), "%s", g->warm[wi].zone);
       q.prio = KDB_FETCH_PRIO_WARM;
@@ -3022,13 +3054,16 @@ static void fetch_issue(ing_t *g) {
       }
     }
     if (vi < 0) {                                        /* a view that takes no zones from the database (or left): nothing to fetch */
-      park_wake_broadcast(q.view, q.zone, true);
+      park_wake_queue_all(q.view, q.zone, true);
       continue;
     }
     /* in flight for the same thing: its answer wakes this worker too.  A summary does not stand in for the zone (it wakes nobody, and the query would have to ask
      * again: the request for the zone is made); the zone in flight stands in for the summary (the apex of a zone that leaves memory is made from its image) */
     ing_freq_t *r = fetch_find_zone(g, (uint16_t)vi, q.zone, q.mode);
     if (r) continue;
+    /* a worker that found the zone claimed asked without a claim (B2 M1): the claimed request is queued, and it takes the place and the token, starts the fetch and wakes every
+     * worker (the completion), or fails them all (fetch_refuse()).  This request would take a place of its own, or be shed for the pool that the claim holds, so it is dropped. */
+    if (!q.claimed && !warm && q.mode == KDB_FETCH_FULL && q.worker >= 0 && park_claim_held(park_claim_key(q.view, q.zone))) continue;
     if (q.mode == KDB_FETCH_SUMMARY) {
       ing_freq_t *full = fetch_find_zone(g, (uint16_t)vi, q.zone, KDB_FETCH_FULL);
       if (full) {
@@ -3040,54 +3075,61 @@ static void fetch_issue(ing_t *g) {
       /* memory-limit (design 8.5): the zones that are fetched add to what the cache manager has to take out again, so with the database zones
        * above the limit, or too many fetches in flight, the request is not made: the queries get "not ready" now instead of at their deadline */
       uint64_t lim = dbreg_cache_limit();      /* (a summary brings no zone data: the limit does not hold it back, ING_SUMMARY_NFREQ bounds it) */
-      if (lim && (g->nfreq >= atomic_load_explicit(&g_fetch_conc, memory_order_relaxed) || dbreg_cache_over_limit())) {
-        if (warm) {
-          warm_add_ex(g, q.view, q.zone, hot, false);
-          break;
+      if (lim) {
+        /* the places of fetch-concurrency are one pool (park_place_take()): a request from a worker's gate holds its place already, any other (a transfer, the
+         * background, the warm-up, a worker without the gate) takes one here, so that fetches in flight and requests on their way together stay within the limit */
+        bool over = dbreg_cache_over_limit();
+        if (!over && !hold_place) hold_place = park_place_take();
+        if (over || !hold_place) {
+          if (warm) {
+            warm_add_ex(g, q.view, q.zone, hot, false);
+            break;
+          }
+          atomic_fetch_add_explicit(&g_fetch_shed, 1, memory_order_relaxed);
+          logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] fetch of zone '%s' (view '%s') shed by memory-limit: %s; its queries get \"not ready\"", q.zone, q.view,
+                     over ? "the database zones in memory are over the limit" : "as many fetches in flight as fetch-concurrency allows");
+          fetch_refuse(&q);                                  /* (only the worker that asked, unless the request holds a claim: the others have their own requests) */
+          continue;
         }
-        atomic_fetch_add_explicit(&g_fetch_shed, 1, memory_order_relaxed);
-        logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] fetch of zone '%s' (view '%s') shed by memory-limit: %s; its queries get \"not ready\"", q.zone, q.view,
-                   dbreg_cache_over_limit() ? "the database zones in memory are over the limit" : "as many fetches in flight as fetch-concurrency allows");
-        park_wake_broadcast(q.view, q.zone, true);
-        continue;
       }
     }
     /* fetch-rate (design 8.5): scattered queries for many zones that are out of memory must not make the loader read zones faster than this; a token
      * bucket (burst = one second of the rate) of zones read for queries.  Only a read that is really made takes a token (below); the queries
      * of a zone with no token get "not ready" at once. */
-    uint32_t frate = fetch_refill(g);
-    /* the queries come first: a summary for the apex (the walk after a reload) takes a token only from a bucket that is more than half full, so that the walk
-     * cannot leave the queries without one */
-    /* ... and so does a whole zone that the query path asks for in the background (a CNAME or glue leads into it, D1a step 8): the queries come first */
-    if (g->ftokens < 1.0 || (((warm && q.mode == KDB_FETCH_SUMMARY) || (q.prio == KDB_FETCH_PRIO_BACKGROUND && q.mode == KDB_FETCH_FULL)) && g->ftokens < frate / 2.0)) {
-      if (warm) {
-        warm_add_ex(g, q.view, q.zone, hot, false);
-        break;
+    /* (a request from a worker's gate has its token already; the bucket is the one the gates use, dns_park.c.  A token goes back, below, when no read is made.) */
+    if (!hold_tok) {
+      /* the queries come first: a summary for the apex (the walk after a reload) takes a token only from a bucket that is more than half full, so that the walk
+       * cannot leave the queries without one; ... and so does a whole zone that the query path asks for in the background (a CNAME or glue leads into it, D1a step 8) */
+      bool half = (warm && q.mode == KDB_FETCH_SUMMARY) || (q.prio == KDB_FETCH_PRIO_BACKGROUND && q.mode == KDB_FETCH_FULL);
+      hold_tok = park_rate_take(now_ms(), half);
+      if (!hold_tok) {
+        if (warm) {
+          warm_add_ex(g, q.view, q.zone, hot, false);
+          break;
+        }
+        atomic_fetch_add_explicit(&g_fetch_limited, 1, memory_order_relaxed);
+        logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] fetch of zone '%s' (view '%s') held back by fetch-rate %u/s: no token left; its queries get \"not ready\"", q.zone,
+                   q.view, (unsigned)atomic_load_explicit(&g_fetch_rate, memory_order_relaxed));
+        fetch_refuse(&q);
+        continue;
       }
-      atomic_fetch_add_explicit(&g_fetch_limited, 1, memory_order_relaxed);
-      logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] fetch of zone '%s' (view '%s') held back by fetch-rate %u/s: no token left; its queries get \"not ready\"", q.zone,
-                 q.view, frate);
-      park_wake_broadcast(q.view, q.zone, true);
-      continue;
     }
     int st = q.mode == KDB_FETCH_SUMMARY ? DBREG_FETCH_STARTED : dbreg_fetch_begin(g->view_names[vi], q.zone);       /* (a summary leaves the zone's state alone: queries are not held for it) */
     if (st == DBREG_FETCH_BUSY) continue;
     if (st != DBREG_FETCH_STARTED) {                     /* in memory already (woken), or not a zone of the registry (answered at once) */
-      park_wake_broadcast(q.view, q.zone, st == DBREG_FETCH_NONE);
+      park_wake_queue_all(q.view, q.zone, st == DBREG_FETCH_NONE);
       continue;
     }
-    g->ftokens -= 1.0;
     for (uint32_t i = 0; i < ING_FETCH_MAX && !r; i++)
       if (!g->freq[i].active) r = &g->freq[i];
     if (!r) {                                            /* too many in flight: the queries run into their deadlines */
       if (q.mode != KDB_FETCH_SUMMARY) dbreg_fetch_end(g->view_names[vi], q.zone);
       if (warm) {
-        g->ftokens += 1.0;
         warm_add_ex(g, q.view, q.zone, hot, false);
         break;
       }
       atomic_fetch_add_explicit(&g_fq_table_full, 1, memory_order_relaxed);
-      park_wake_broadcast(q.view, q.zone, true);
+      fetch_refuse(&q);
       continue;
     }
     if (q.mode == KDB_FETCH_SUMMARY) {
@@ -3097,6 +3139,12 @@ static void fetch_issue(ing_t *g) {
       atomic_fetch_add_explicit(&g_fetch_issued, 1, memory_order_relaxed);
     }
     memset(r, 0, sizeof(*r));
+    r->placed = hold_place;                              /* (the place stays with the fetch; the token is spent) */
+    hold_place = hold_tok = false;
+    if (hold_key) {                                      /* (the zone is LOADING: that is what the workers look at now) */
+      park_claim_clear(hold_key);
+      hold_key = 0;
+    }
     if (q.mode != KDB_FETCH_SUMMARY) r->v_valid = dbreg_zone_version(g->view_names[vi], q.zone, &r->v_sid, &r->v_serial);
     r->active = true;
     r->id = ++g->fseq;
@@ -3121,7 +3169,9 @@ static void fetch_issue(ing_t *g) {
                r->prio == KDB_FETCH_PRIO_BACKGROUND ? "background (CNAME or glue)" : "for a query", hot ? ", hot list" : "", (unsigned)g->nfreq);
     if (!fetch_send_req(g, r)) fetch_complete(g, r, false, "the loader's fetch stream is not connected");
   }
-  if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);
+  fetch_release(&hold_place, &hold_tok, &hold_key);
+  if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);      /* (the requests of the pass go out now) */
+  park_wake_flush();
 }
 
 static void fetch_protocol_error(ing_t *g, const char *reason) {
@@ -3428,7 +3478,6 @@ static void *cache_thread(void *arg) {
     snapshot_cfg(&c);
     uint64_t lim = c.enabled ? c.memory_limit : 0;
     dbreg_cache_set_limit(lim);
-    atomic_store_explicit(&g_fetch_rate, c.fetch_rate ? c.fetch_rate : KARIDNS_DB_FETCH_RATE_DEFAULT, memory_order_relaxed);
     set_fetch_limits(&c);
     atomic_store_explicit(&g_xfr_timeout_ms, c.xfr_timeout_ms ? c.xfr_timeout_ms : KARIDNS_DB_XFR_FETCH_TIMEOUT_DEFAULT, memory_order_relaxed);
     struct timespec ts = { 0, lim ? 50 * 1000000L : 0 };
@@ -3467,12 +3516,16 @@ static void *ingest_thread(void *arg) {
     if ((g->nwarm > 0 || (g->apex_walk && g->fetch_fd >= 0)) && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;      /* zones to read before a query asks, or the walk for apexes (while there is a fetch stream): try again soon */
     if (g->hold && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;           /* warm-before-serve: look at the warm-up and the time often */
     if (wait_ms < 0 || wait_ms > 10000) wait_ms = 10000;                  /* (the busy share of dbstatus is closed at the end of a window, so the thread wakes at least that often) */
+    if (g->fmore) wait_ms = 0;                                            /* B2 W5: the last pass of fetch_issue() stopped at its bound: serve what is ready on the streams, then go on */
+    /* B2 W5, the sleep protocol (dns_park.c): say "asleep", and look once more for requests, so that a worker that pushed one and saw no flag has not left it unseen */
+    if (park_fetch_sleep_prepare()) wait_ms = 0;
     if (wait_ms >= 0) {
       ts.tv_sec = wait_ms / 1000;
       ts.tv_nsec = (wait_ms % 1000) * 1000000;
       tp = &ts;
     }
     int n = kevent(g->kq, NULL, 0, evs, 8, tp);
+    park_fetch_sleep_done();
     if (n < 0) {
       if (errno == EINTR) continue;
       syslog(LOG_ERR, "[DB] the ingest thread stops: kevent: %s", strerror(errno));
@@ -3490,7 +3543,8 @@ static void *ingest_thread(void *arg) {
       } else if (e->filter == EVFILT_USER && e->ident == ING_EVT_HOT) {
         hot_send(g);                                     /* D1a step 7: the cache thread made a hot list */
       } else if (e->filter == EVFILT_USER && e->ident == PARK_FETCH_IDENT) {
-        fetch_issue(g);                                  /* D1a: a worker parked a query for a zone that is not in memory */
+        /* D1a: a worker parked a query for a zone that is not in memory: fetch_issue() below looks at every request that is there, whether this trigger came or not
+         * (a worker does not trigger while the thread is awake) */
       } else if (e->filter == EVFILT_USER) {
         on_config_event(g);
       } else if (g->ctrl_fd >= 0 && e->ident == (uintptr_t)g->ctrl_fd) {
@@ -3503,13 +3557,15 @@ static void *ingest_thread(void *arg) {
         else on_stream_readable(g);
       }
       if (g->need_cleanup) cleanup_stream_state(g);
+      park_wake_flush();                                 /* B2 W5: the workers that a completion woke are triggered once per event, not once per zone */
     }
     if (g->inv_active) pump_inventory(g);
     if (g->need_cleanup) cleanup_stream_state(g);
     maybe_apply_delta(g);
-    if (g->nwarm > 0) fetch_issue(g);
+    if (g->nwarm > 0 || g->fmore || park_fetch_pending()) fetch_issue(g);
     apex_walk_step(g);
     fetch_expire(g);
+    park_wake_flush();
     hold_check(g);
     if (g->stream_fd >= 0 && g->out_off < g->out_len) out_flush(g);
     if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);
@@ -3595,7 +3651,6 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
     g->hold_start_ms = now_ms();
     atomic_store_explicit(&g_hold_deadline_ms, g->hold_start_ms + (int64_t)snap.warm_wait * 1000, memory_order_relaxed);
   }
-  atomic_store_explicit(&g_fetch_rate, snap.fetch_rate ? snap.fetch_rate : KARIDNS_DB_FETCH_RATE_DEFAULT, memory_order_relaxed);
   set_fetch_limits(&snap);
   atomic_store_explicit(&g_xfr_timeout_ms, snap.xfr_timeout_ms ? snap.xfr_timeout_ms : KARIDNS_DB_XFR_FETCH_TIMEOUT_DEFAULT, memory_order_relaxed);
   pthread_t t;
@@ -3946,14 +4001,14 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
               (unsigned long long)zot.retired);
     st_append(&c, "zone versions kept for karictl rollback (rollback-window): database zones %llu bytes; other zones %llu bytes\n", (unsigned long long)zdb.previous,
               (unsigned long long)zot.previous);
+    park_stats_t ps;
+    park_stats_get(&ps);                                 /* (the workers' gate refuses are counted there: B2 W5, `shed` and `refused_by_rate` are the sum of both places) */
     st_append(&c, "fetch: rate=%u/s refused_by_rate=%llu issued=%llu concurrency=%u\n", (unsigned)atomic_load_explicit(&g_fetch_rate, memory_order_relaxed),
-              (unsigned long long)atomic_load_explicit(&g_fetch_limited, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_fetch_issued, memory_order_relaxed),
+              (unsigned long long)(atomic_load_explicit(&g_fetch_limited, memory_order_relaxed) + ps.gate_rate), (unsigned long long)atomic_load_explicit(&g_fetch_issued, memory_order_relaxed),
               (unsigned)atomic_load_explicit(&g_fetch_conc, memory_order_relaxed));
     {
-      park_stats_t ps;
-      park_stats_get(&ps);
-      st_append(&c, "fetchq: in_flight=%u peak=%u table_full=%llu ring_dropped=%llu park_full=%llu park_timeout=%llu loader_busy=%llu ingest_busy=%u%% hist=%llu,%llu,%llu,%llu,%llu\n",
-                (unsigned)atomic_load_explicit(&g_fq_inflight, memory_order_relaxed), (unsigned)atomic_load_explicit(&g_fq_peak, memory_order_relaxed),
+      st_append(&c, "fetchq: in_flight=%u places=%u peak=%u table_full=%llu ring_dropped=%llu park_full=%llu park_timeout=%llu loader_busy=%llu ingest_busy=%u%% hist=%llu,%llu,%llu,%llu,%llu\n",
+                (unsigned)atomic_load_explicit(&g_fq_inflight, memory_order_relaxed), (unsigned)park_places_used(), (unsigned)atomic_load_explicit(&g_fq_peak, memory_order_relaxed),
                 (unsigned long long)atomic_load_explicit(&g_fq_table_full, memory_order_relaxed), (unsigned long long)ps.ring_dropped, (unsigned long long)ps.full,
                 (unsigned long long)ps.timeout, (unsigned long long)atomic_load_explicit(&g_fq_loader_busy, memory_order_relaxed),
                 (unsigned)atomic_load_explicit(&g_ing_busy_pct, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_fq_hist[0], memory_order_relaxed),
@@ -3975,7 +4030,7 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
                     "shed=%llu pinned=%llu peak=%llu victim_freq=%u\n",
                 (unsigned long long)cs.limit, (unsigned long long)cs.resident, (unsigned long long)cs.retired, (unsigned long long)cs.previous, (unsigned long long)cs.inflight, (unsigned long long)cs.held, cs.long_reader ? 1 : 0,
                 (unsigned long long)cs.evictions, (unsigned long long)cs.rounds, (unsigned long long)cs.cold, (unsigned long long)cs.marked,
-                (unsigned long long)cs.misses, (unsigned long long)atomic_load_explicit(&g_fetch_shed, memory_order_relaxed),
+                (unsigned long long)cs.misses, (unsigned long long)(atomic_load_explicit(&g_fetch_shed, memory_order_relaxed) + ps.gate_shed),
                 (unsigned long long)cs.pinned_bytes, (unsigned long long)cs.peak, (unsigned)cs.victim_freq);
     else
       st_append(&c, "cache: no memory-limit (every database zone stays in memory)\n");

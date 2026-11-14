@@ -1797,10 +1797,12 @@ each server cookie taken or not (length, age, the number of the
 \fBdatabase\fR
 1: each zone of a batch (installed, version taken with the data out of memory,
 hidden, unchanged, rejected), how long the loader ran and how long the next
-start waits. 2: each fetch (asked, held back by \fBmemory\-limit\fR or
-\fBfetch\-rate\fR, done), a zone taken out of memory by \fBmemory\-limit\fR, and
-the loader's own lines (\fBkaridns\-dbloader(8)\fR). 10: each record of the
-loader's stream.
+start waits. 2: each fetch (asked, done; a request that reached the ingest
+thread and was held back by \fBmemory\-limit\fR or \fBfetch\-rate\fR; a query
+that a worker turned away before it parked, see \fBfetchq:\fR, is only counted,
+not logged per zone), a zone taken out of memory by \fBmemory\-limit\fR, and the
+loader's own lines (\fBkaridns\-dbloader(8)\fR). 10: each record of the loader's
+stream.
 .TP 8
 \fBnetwork\fR
 1: each UDP listener of a Frontend router. 2: the socket buffer sizes the system
@@ -3623,14 +3625,20 @@ limit" below). When the time is up the client gets the one error message of RFC
 \fIDefault:\fR \fBloader\-threads\fR x 16 (at least 16)
 .br
 \fIDescription:\fR D1a: how many zones may be on their way from the loader at
-once while \fBmemory\-limit\fR is set, 2..256. A request over it is shed
-(SERVFAIL + EDE 14 at once, counted as \fBshed\fR in \fBkarictl
-dbstatus\fR). The loader reads that many requests in parallel on
-\fBloader\-threads\fR workers (each with its own database connection), so the
-rate of reads is limited by \fBfetch\-rate\fR, not by one thread of the loader;
-the warm-up and the walk for apexes use at most half of it (and at most 8) so
-that the queries keep the rest. \fBdbstatus\fR shows the value as
-\fBconcurrency=\fR in the \fBfetch:\fR line.
+once while \fBmemory\-limit\fR is set, 2..256: the requests queued for the
+ingest thread and the fetches in flight together. The worker that gets the query
+takes one of these places (a counter that needs no lock) before it parks the
+query and asks, so a query over the limit is answered SERVFAIL + EDE 14 at once
+without a request, and is counted as \fBshed\fR in \fBkarictl dbstatus\fR (0.7:
+it used to be the ingest thread that said no, one request at a time). A query
+for a zone whose fetch is already on its way takes no place and waits for
+it. After a reload with another value the places in use are not taken away: a
+lower limit takes effect as the fetches end. The loader reads that many requests
+in parallel on \fBloader\-threads\fR workers (each with its own database
+connection), so the rate of reads is limited by \fBfetch\-rate\fR, not by one
+thread of the loader; the warm-up and the walk for apexes use at most half of it
+(and at most 8) so that the queries keep the rest. \fBdbstatus\fR shows the
+value as \fBconcurrency=\fR in the \fBfetch:\fR line.
 .TP 8
 \fBfetch\-rate <n>;\fR
 \fIDefault:\fR \fB200\fR
@@ -3638,7 +3646,10 @@ that the queries keep the rest. \fBdbstatus\fR shows the value as
 \fIDescription:\fR D1a: how many zones per second may be read from the database
 for queries (a token bucket with a burst of one second, 1..100000); a query for
 a zone that is out of memory when the bucket is empty is answered SERVFAIL + EDE
-14 at once. Slows down attacks that scatter queries over many cold zones;
+14 at once (0.7: the worker takes the token itself, from a bucket that the
+ingest thread shares, so the refusal costs the ingest thread nothing; the
+warm-up, the walk for apexes and the background requests take tokens from the
+same bucket). Slows down attacks that scatter queries over many cold zones;
 \fBkarictl dbstatus\fR shows \fBrefused_by_rate\fR. Since 0.6.2 a loader thread
 reads about 4,400 zones per second (SQLite3, 1M zones of 11 records, 8 vCPU;
 about 400 before, when every zone opened a database connection of its own), so
@@ -4143,27 +4154,54 @@ memory, not a hard limit: the versions in use, the previous versions kept for
 rollback, \fBand\fR the ones that were replaced or taken out but are not freed
 yet -- except, since 0.7, retired versions that a reader or a transfer holds
 (\fBheld\fR, see below): taking zones out cannot free them, so they are not
-weighed against the limit. It counts the data of the zones (their images, the
-glue, the IXFR differences), not the directory (a few hundred bytes per zone,
-listed by \fBkarictl dbstatus\fR), the park tables or the loader's process. A
-reload of \fBkaridns.conf\fR changes it: within 50 ms when a limit is set,
-within a second when there was none.
+weighed against the limit. Since 0.7 it counts what a zone holds while it is in
+memory: its version (the image and the glue block, each at the size the
+allocator really holds, not the size asked for), the IXFR differences, \fBand
+what the zone's entry costs by itself\fR -- the entry (about 0.65 KB with the
+allocator's rounding), the lock it makes (about 0.1 KB on FreeBSD) and, for a
+database zone, its settings block: about 0.85 KB per zone, which is about 40% of
+a zone of eleven records (before 0.7 the limit counted only the version and the
+image, 1.3 KB of the 3.2 KB such a zone needs). The entry's share is counted
+with the zone's first version and goes with it when the zone is taken out of
+memory. It does not count the directory (every zone of the database, about 0.45
+KB each, listed by \fBkarictl dbstatus\fR), the park tables or the loader's
+process. A reload of \fBkaridns.conf\fR changes it: within 50 ms when a limit is
+set, within a second when there was none.
 .IP \(bu 2
 \fB\fBmemory\-limit\fB is not a limit on the size of the process (design
-8.1).\fR It counts the data of the zones only. What the process holds on top is
-the directory (every zone of the database, about 167 bytes each: 167 MB for a
-million zones, whatever the limit), the response cache and the allocator's
-slack. Measured on the build host, the resident size of the Backend ran about
-20% above the limit at \fBmemory\-limit 1G\fR and about 40% above it at
-\fB512M\fR (the fixed part is a larger share of a small limit). \fBSizing
-example:\fR to keep the Backend within about 1.5 GB of RAM with a million zones,
-set \fBmemory\-limit 1G\fR (expect about 1.2 GB resident, which leaves room for
-a burst of transfers and the park tables); within about 700 MB, set \fB512M\fR
-(about 700 MB resident, of which 167 MB is the directory); never set the limit
-to the RAM you have. These are figures of one host and one data set (zones of
-eleven records), not a guarantee: watch \fBresidency\fR and \fBcache\fR in
-\fBkarictl dbstatus\fR and the process's own resident size for a few days before
-relying on a figure, and leave the memory of the loader process
+8.1).\fR It counts what the zones in memory hold, not what the process holds on
+top: the directory (every zone of the database, in memory or not), the response
+cache, the park tables, the threads' buffers and the allocator's slack. \fBThe
+formula (0.7):\fR the resident size of the Backend is about \fB70 MB + 0.45 KB x
+(zones in the database) + the \fBresident\fB bytes of the \fBcache:\fB line of
+\fBkarictl dbstatus\fB\fR, and \fBresident\fR stays about at the limit once the
+limit is reached (it reaches 90% to 105% of it). Each part was measured on the
+build host (FreeBSD 15.1, jemalloc, 8 virtual CPUs, SQLite3, zones of eleven
+records, every zone asked for once so that the limit evicts): with 50,000 zones
+in the database the resident size was 110 MB at \fBmemory\-limit 20M\fR, 128 MB
+at \fB40M\fR and 165 MB at \fB80M\fR (1.00 bytes of resident size for every byte
+\fBresident\fR grew), and with 20,000 zones 98 MB at \fB20M\fR and 116 MB at
+\fB40M\fR; the formula is within 2% of all five points. The 0.45 KB a zone of
+the database is what the two sizes of database differ by; the million-zone bench
+of 0.7 had a fixed part of about 350 MB at 1,000,000 zones, about 0.3 KB a zone,
+so 0.45 KB is the safer figure to plan with. With every zone of the database in
+memory and no limit the same formula holds with \fBresident\fR = what
+\fBdbstatus\fR shows (20,000 zones: 88 MB resident size for 42.6 MB
+\fBresident\fR; 50,000 zones: 159 MB for 106.4 MB). \fBBefore 0.7 the limit did
+not count the entry, its lock and the allocator's rounding\fR, so the Backend
+needed about 2.5 times the limit for the zones (3.2 KB of memory for each 1.3 KB
+counted: 177 MB at \fBmemory\-limit 40M\fR and 50,000 zones, against 128 MB
+now); the figure of "about 700 MB at \fB512M\fR" that this manual gave for a
+million zones was wrong for small zones. \fBSizing example:\fR to keep the
+Backend within about 1.5 GB of RAM with a million zones, the formula gives 70 MB
++ 0.45 GB for the directory + the limit, so \fBmemory\-limit 1G\fR is the
+largest that fits (\fB512M\fR: about 1.0 GB; \fB1G\fR: about 1.5 GB); never set
+the limit to the RAM you have, and leave room for a burst of transfers (the
+limit is a target, see below). The 0.45 KB a zone and the 70 MB were fitted on
+20,000 to 50,000 zones and are extrapolated to a million: they are the figures
+of one host and one data set, not a guarantee, so watch \fBresidency\fR and
+\fBcache\fR in \fBkarictl dbstatus\fR and the process's own resident size for a
+few days before relying on a figure, and leave the memory of the loader process
 (\fBloader\-threads\fR connections and one zone per worker) out of the Backend's
 share.
 .IP \(bu 2
@@ -4330,36 +4368,47 @@ hot_lists_sent=N last_sent=<time> (N zones) acks: written=N unchanged=N failed=N
 last_ack=<what> (N zones in the file)\fR.
 .IP \(bu 2
 \fB\fBfetchq:\fB (0.7): where a fetch is held up.\fR \fBkarictl dbstatus\fR has
-the line \fBfetchq: in_flight=N peak=N table_full=N ring_dropped=N park_full=N
-park_timeout=N loader_busy=N ingest_busy=P% hist=A,B,C,D,E\fR right after the
-\fBfetch:\fR line. Everything is counted since the server started, except
-\fBin_flight\fR (now) and \fBingest_busy\fR (the last window). Read it from the
-query to the install: \fBpark_full\fR counts queries that found the worker's
-table of parked queries full (\fBpark\-max\fR) and were answered "not ready" at
-once; \fBring_dropped\fR, queries whose request for the zone could not be handed
-from the worker to the ingest thread (the worker's ring of 128 was full: the
-ingest thread is behind); \fBfetch\-rate\fR, \fBfetch\-concurrency\fR and
-\fBmemory\-limit\fR refuse requests before the fetch is made
-(\fBrefused_by_rate=\fR and \fBshed=\fR of the other lines); \fBtable_full\fR,
-requests refused because all 256 places of the fetch table were taken (normally
-0: \fBfetch\-concurrency\fR, at most the 256 places, stops the requests of whole
-zones first, so only requests for summaries of zones can find the table full
-next to a \fBfetch\-concurrency\fR of 256); \fBin_flight\fR and \fBpeak\fR are
-the fetches on their way now and the most there have been at one time (compare
-\fBpeak\fR with \fBfetch\-concurrency\fR to see whether the limit is the one
-that held requests back); \fBloader_busy\fR, fetches the loader turned away
-because its own queue of requests was full; \fBhist\fR is the time from the
-request to the install of the zone, for the fetches that succeeded, in five
-counts (up to 1 ms, up to 10 ms, up to 100 ms, up to 1 s, more);
+the line \fBfetchq: in_flight=N places=N peak=N table_full=N ring_dropped=N
+park_full=N park_timeout=N loader_busy=N ingest_busy=P% hist=A,B,C,D,E\fR right
+after the \fBfetch:\fR line. Everything is counted since the server started,
+except \fBin_flight\fR (now) and \fBingest_busy\fR (the last window). Read it
+from the query to the install: \fBpark_full\fR counts queries that found the
+worker's table of parked queries full (\fBpark\-max\fR) and were answered "not
+ready" at once; \fBring_dropped\fR, queries whose request for the zone could not
+be handed from the worker to the ingest thread (the worker's ring of 128 was
+full: the ingest thread is behind); \fBfetch\-rate\fR, \fBfetch\-concurrency\fR
+and \fBmemory\-limit\fR refuse requests before the fetch is made
+(\fBrefused_by_rate=\fR of the \fBfetch:\fR line and \fBshed=\fR of the
+\fBcache:\fR line; since 0.7 the worker refuses the query itself before it parks
+it, with no request to the ingest thread, and both counters add what the workers
+and the ingest thread refused: a high \fBshed\fR with a low \fBingest_busy\fR is
+the workers keeping the flood away from the ingest thread, and
+\fBring_dropped\fR then stays near 0); \fBtable_full\fR, requests refused
+because all 256 places of the fetch table were taken (normally 0:
+\fBfetch\-concurrency\fR, at most the 256 places, stops the requests of whole
+zones first, so only a request that comes while summaries of zones are in flight
+can find the table full next to a \fBfetch\-concurrency\fR of 256);
+\fBin_flight\fR and \fBpeak\fR are the fetches on their way now and the most
+there have been at one time (compare \fBpeak\fR with \fBfetch\-concurrency\fR to
+see whether the limit is the one that held requests back), \fBplaces\fR (0.7)
+the places of \fBfetch\-concurrency\fR in use now: the whole-zone fetches that
+are queued for the ingest thread or in flight (0 at rest; a value that stays
+above 0 while \fBin_flight\fR is 0 and nothing is queued would be a place that
+was not given back: please report it); \fBloader_busy\fR, fetches the loader
+turned away because its own queue of requests was full; \fBhist\fR is the time
+from the request to the install of the zone, for the fetches that succeeded, in
+five counts (up to 1 ms, up to 10 ms, up to 100 ms, up to 1 s, more);
 \fBpark_timeout\fR, parked queries whose zone was not there before
 \fBpark\-timeout\fR ran out; \fBingest_busy\fR is the share of the last ten
 seconds in which the ingest thread was working and not waiting for something to
-do (0 for the first ten seconds; near 100% means the thread is the
-limit). Typical readings: a high \fBingest_busy\fR with a slow \fBhist\fR points
-to the Backend (ingest thread or install), a \fBhist\fR with most counts in the
-last two buckets and a low \fBingest_busy\fR to the loader or the database,
-\fBtable_full\fR or \fBring_dropped\fR above 0 to more simultaneous misses than
-the fetch path takes.
+do (0 for the first ten seconds; near 100% means the thread is the limit; since
+0.7 the thread handles at most 64 requests or about a millisecond at a time and
+then reads the loader's answers, so a flood of queries cannot keep it from
+installing the zones that arrive). Typical readings: a high \fBingest_busy\fR
+with a slow \fBhist\fR points to the Backend (ingest thread or install), a
+\fBhist\fR with most counts in the last two buckets and a low \fBingest_busy\fR
+to the loader or the database, \fBtable_full\fR or \fBring_dropped\fR above 0 to
+more simultaneous misses than the fetch path takes.
 .IP \(bu 2
 \fBTaking zones out (the cache manager).\fR A thread looks every 50 ms, at a
 slice of at most 20000 zones of the registry at a time (the lock is held for a
@@ -4478,8 +4527,10 @@ are not shown on their own: so \fBheld\fR + \fBinflight\fR can be below
 thread of the server has been in a read section for a second or more, \fBcold\fR
 the zones that came without data, \fBmarked\fR the zones that were read but are
 not kept (admission), \fBmisses\fR the queries that had to wait for a zone,
-\fBshed\fR the reads not made because of the 110% bound, \fBpeak\fR the largest
-resident + retired + previous seen when a zone was installed or a round ran.
+\fBshed\fR the reads not made because of the 110% bound or because every place
+of \fBfetch\-concurrency\fR was taken (counted where the query was turned away:
+at the worker or at the ingest thread), \fBpeak\fR the largest resident +
+retired + previous seen when a zone was installed or a round ran.
 .IP \(bu 2
 \fBZone transfers of a zone that is out of memory (AXFR, IXFR).\fR The client is
 checked first, as \fBallow\-query\fR is for a parked query:
