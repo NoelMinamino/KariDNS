@@ -90,6 +90,7 @@ static _Atomic bool g_fetch_died;          /* D1a: the fetch thread ended by its
  * which zone the findings are about ("" / 0: the source).  The run is single threaded. */
 static FILE *g_chk_out;
 static unsigned g_chk_errors, g_chk_warnings;
+static _Atomic uint64_t g_chk_records;                   /* 0.7 P-F: the records of the primary zones that were read (the `M` line: the memory the database needs, karicheck db) */
 static char g_chk_zone[DNS_NAME_TEXT_SIZE + 16];
 static int64_t g_chk_id;
 
@@ -482,7 +483,7 @@ typedef struct {
     bool fetch;
     /* 0.6.2, a worker of the fetch pool: the connection kept between requests, and what it was opened on.  Opening a SQLite3 connection took
      * about 1.9 ms of the 2.4 ms of a fetch (the first connection to a WAL file: the -shm and -wal files, the locks, the schema), which held a
-     * worker at about 400 zones/s.  Each request still has its own check_schema and snapshot.  Kept only for the same driver and source, and
+     * worker at about 400 zones/s.  Each request has its own snapshot; check_schema is repeated after FETCH_SCHEMA_RECHECK_MS only (keep_si).  Kept only for the same driver and source, and
      * for SQLite3 only while the file is the one that was opened (keep_dev / keep_ino); a kept connection that fails its first statement is
      * opened again once. */
     db_conn_t *keep;
@@ -490,6 +491,12 @@ typedef struct {
     char keep_key[1100];
     dev_t keep_dev;
     ino_t keep_ino;
+    /* B2 (0.7): what check_schema() said about the kept connection, and when.  A fetch reuses it instead of checking the schema again for every
+     * request (SQLite3: a dozen PRAGMA table_info parses; PostgreSQL: four round trips); it is looked at again after FETCH_SCHEMA_RECHECK_MS
+     * (a migration of a running database is noticed then), and never kept across a new connection. */
+    db_schema_info_t keep_si;
+    int64_t keep_si_at;
+    bool keep_si_ok;
     bool fetch_summary;
     const char *fetch_vname;          /* D1a: the view of the request being served (the fetch thread tells the inventory what it served) */
     bool dir_only;                    /* D1a milestone 4: CONFIG dir_only (memory-limit): zones the Backend has no data of are sent as summaries */
@@ -1555,6 +1562,7 @@ static void chk_zone_report(ctx_t *x, const zinfo_t *zi, pdns_zone_t *z, const s
     for (size_t i = 0; i < z->n_warnings; i++) chk_line('W', chk_strip_zone(z->warnings[i]));
     if (z->warnings_dropped) chk_linef('W', "%zu more warning(s) were dropped", z->warnings_dropped);
     if (z->failed) return;
+    if (z->zkind == KDB_ZK_PRIMARY && z->arena_ready) atomic_fetch_add(&g_chk_records, (uint64_t)z->arena.count);
     if (z->zkind == KDB_ZK_PRIMARY && z->arena_ready) {
         kc_tally_t t = {0};
         t.sink = chk_sink;
@@ -3102,6 +3110,9 @@ static int conn_for(ctx_t *x, const db_source_t *src, bool *reused, dev_t *dev, 
     return 0;
 }
 
+static int64_t now_ms(void);
+#define FETCH_SCHEMA_RECHECK_MS 5000
+
 static int run_view_once(ctx_t *x, const db_source_t *src, const char *only_zone, bool whole) {
     ctx_view_reset(x);
     x->only_name = only_zone;
@@ -3117,24 +3128,50 @@ static int run_view_once(ctx_t *x, const db_source_t *src, const char *only_zone
     uint64_t new_seq = 0;
     db_schema_info_t si;
     memset(&si, 0, sizeof(si));
-    rc = x->drv->check_schema(x->conn, &si);
-    if (rc != 0 && reused) {                              /* a kept connection that went bad (the server restarted, ...): once more with a new one */
-        x->drv->close(x->conn);
-        x->conn = NULL;
-        if ((rc = conn_for(x, src, &reused, &fdev, &fino)) != 0) {
-            status = rc;
+    bool snapped = false;
+    if (reused && x->keep_si_ok && now_ms() - x->keep_si_at < FETCH_SCHEMA_RECHECK_MS) {
+        /* the schema is the one the kept connection was checked against a moment ago: its first statement is the snapshot; when that fails the
+         * connection went bad, and the path below opens a new one and checks it */
+        si = x->keep_si;
+        if (x->drv->begin_snapshot(x->conn) == 0) {
+            snapped = true;
+        } else {
+            x->drv->close(x->conn);
+            x->conn = NULL;
+            if ((rc = conn_for(x, src, &reused, &fdev, &fino)) != 0) {
+                status = rc;
+                goto out;
+            }
+            memset(&si, 0, sizeof(si));
+        }
+    }
+    if (!snapped) {
+        x->keep_si_ok = false;
+        rc = x->drv->check_schema(x->conn, &si);
+        if (rc != 0 && reused) {                          /* a kept connection that went bad (the server restarted, ...): once more with a new one */
+            x->drv->close(x->conn);
+            x->conn = NULL;
+            if ((rc = conn_for(x, src, &reused, &fdev, &fino)) != 0) {
+                status = rc;
+                goto out;
+            }
+            memset(&si, 0, sizeof(si));
+            rc = x->drv->check_schema(x->conn, &si);
+        }
+        if (rc != 0) {
+            status = db_err(x, rc, "schema");
             goto out;
         }
-        memset(&si, 0, sizeof(si));
-        rc = x->drv->check_schema(x->conn, &si);
-    }
-    if (rc != 0) {
-        status = db_err(x, rc, "schema");
-        goto out;
-    }
-    if ((rc = x->drv->begin_snapshot(x->conn)) != 0) {
-        status = db_err(x, rc, "snapshot");
-        goto out;
+        if (x->fetch) {
+            x->keep_si = si;
+            x->keep_si_at = now_ms();
+            x->keep_si_ok = true;
+        }
+        if ((rc = x->drv->begin_snapshot(x->conn)) != 0) {
+            x->keep_si_ok = false;
+            status = db_err(x, rc, "snapshot");
+            goto out;
+        }
     }
     x->has_ext = si.has_ext && x->drv->scan_ext;
     /* the position of the change log in this snapshot, for the pool's workers to compare with (run_pool()); only a driver whose position is exact (SQLite3: the
@@ -4487,7 +4524,7 @@ static void *fetch_main(void *arg) {
     while (!g_stop && !atomic_load(&g_fetch_stop) && !atomic_load(&io->wstop) && !io->eof && !io->failed) {
         while (io->nfbusy > 0) {                              /* the requests that did not fit the queue (only this thread uses them) */
             freq_t *b = &io->fbusy[--io->nfbusy];
-            if (fetch_fail(&x, b, "busy: too many fetch requests are waiting") != 0) goto out;
+            if (fetch_fail(&x, b, KDB_FETCH_BUSY_REASON) != 0) goto out;
         }
         struct pollfd p = { fd, POLLIN, 0 };
         int pr = poll(&p, 1, 200);
@@ -5943,6 +5980,7 @@ int main(int argc, char **argv) {
         setvbuf(stdout, NULL, _IOLBF, 0);
         db_source_t csrc = { drv->name, dbfile, conninfo, schema, 0 };
         int cst = run_check(&x, &csrc);
+        fprintf(stdout, "M\t%u\t%llu\n", x.chk_zones, (unsigned long long)atomic_load(&g_chk_records));       /* 0.7 P-F: the zones and records read (karicheck db: what the database needs in memory) */
         fprintf(stdout, "R\t%u\t%u\t%u\n", x.chk_zones, g_chk_errors, g_chk_warnings);
         if (fflush(stdout) != 0 && cst < EXIT_ERROR) cst = EXIT_ERROR;
         ctx_view_reset(&x);

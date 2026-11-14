@@ -195,7 +195,7 @@ static void sw_add_zone(const char *origin, const char *text) {
     if (prc < 0) { fprintf(stderr, "zone %s parse failed at %zu: %s\n", origin, err.error_offset, err.error_message ? err.error_message : "?"); assert(0); }
     assert(test_build_index(a, true) == 0);
     zone_db_entry_t *e = &g_sw.entry[i];
-    strncpy(e->domain, origin, sizeof(e->domain) - 1);
+    e->domain = origin;
     strncpy(e->view_name, "default", sizeof(e->view_name) - 1);
     pthread_mutex_init(&e->writer_lock, NULL);
     atomic_store_explicit(&e->rcu.active, &a->ver, memory_order_release);
@@ -2220,7 +2220,7 @@ static void upd_entry_init(zone_db_entry_t *e) {
         "www IN A 192.0.2.80\nwww IN A 192.0.2.81\nwww IN TXT \"t\"\nalias IN CNAME www.upd.example.\n"
         "mx IN MX 10 www.upd.example.\n";
     memset(e, 0, sizeof(*e));
-    strcpy(e->domain, "upd.example."); strcpy(e->view_name, "default");
+    e->domain = "upd.example."; strcpy(e->view_name, "default");
     pthread_mutex_init(&e->writer_lock, NULL);
     pthread_mutex_init(&e->ixfr_history.lock, NULL);
     for (int k = 0; k < 2; k++) {
@@ -2329,7 +2329,7 @@ static void test_update_matrix(void) {
  * ======================================================================== */
 static void xfr_entry_init(zone_db_entry_t *e, const char *text, const char *origin) {
     memset(e, 0, sizeof(*e));
-    snprintf(e->domain, sizeof(e->domain), "%s", origin); strcpy(e->view_name, "default");
+    e->domain = origin; strcpy(e->view_name, "default");
     pthread_mutex_init(&e->writer_lock, NULL);
     pthread_mutex_init(&e->ixfr_history.lock, NULL);
     for (int k = 0; k < 2; k++) {

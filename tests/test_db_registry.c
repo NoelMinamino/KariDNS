@@ -37,10 +37,12 @@
 #include <syslog.h>
 #include <sys/stat.h>
 #include <ftw.h>
+#include <time.h>
 
 #include "../dns_config_parser.h"
 #include "../dns_db_install.h"
 #include "../dns_db_stream.h"
+#include "../dns_alias.h"
 #include "../dns_utils.h"
 #include "db/xfr_mocks.h"
 
@@ -167,6 +169,21 @@ static void zone_msg(msg_t *m, const char *zone, uint32_t serial, int nrr) {
         char o[320];
         snprintf(o, sizeof(o), "h%d.%s", i, zone);
         msg_a(m, o, (uint8_t)(i + 1));
+    }
+    msg_soa(m, zone, serial);
+}
+
+static void zone_msg_alias(msg_t *m, const char *zone, uint32_t serial, bool with_alias) {
+    msg_init(m);
+    msg_soa(m, zone, serial);
+    char ns[300], o[320];
+    snprintf(ns, sizeof(ns), "ns.%s", zone);
+    msg_ns(m, zone, ns);
+    msg_a(m, ns, 1);
+    if (with_alias) {
+        uint8_t rd[300];
+        snprintf(o, sizeof(o), "www.%s", zone);
+        msg_rr(m, o, 65401, 1, rd, put_name(rd, "target.example.net."));
     }
     msg_soa(m, zone, serial);
 }
@@ -1131,9 +1148,19 @@ static void test_secondary_entries(void) {
     CHECK(mem1 && mem1 != hid && mem1->is_catalog_member);                                  /* D17-1: the member wins */
     CHECK(!in_snapshot("default", hid) && dbreg_find_info("default", "m1.test.", info, 1) == 1 && info[0].shadowed);
 
+    /* 0.7 B2: a member with ALIAS records goes with its consumer: the delta that takes it out of the index asks the alias thread to scan */
+    {
+        msg_t am;
+        char why2[128];
+        zone_msg_alias(&am, "m2.test.", 9, true);
+        CHECK(mem2 && install_msgs(mem2, "m2.test.", 5, &am, 1, why2, sizeof(why2), NULL) == 0);
+    }
+    uint64_t an0 = alias_test_notices();
     /* the consumer's row is deleted: it leaves with its members, and the DB zone they hid is served again */
     CHECK(dbreg_delete("default", "cat.test.", 12) == 1);
+    CHECK(alias_test_notices() == an0);
     CHECK(snapshot_apply_db_delta() >= 1);
+    CHECK(alias_test_notices() > an0);
     CHECK(!name_in_snapshot("default", "cat.test.") && !name_in_snapshot("default", "m2.test."));
     CHECK(in_snapshot("default", hid));
     CHECK(dbreg_find_info("default", "m1.test.", info, 1) == 1 && !info[0].shadowed);
@@ -1349,6 +1376,139 @@ static void test_glue_dirty_on_delete(void) {
     xv = atomic_load(&x->rcu.active);
     CHECK(xv && xv->glue && xv->glue->ids[0] == 0);
     dbreg_reset();
+}
+
+/* ---------------------------------------------------------------- 8b. 0.7 B2: a zone that arrives is looked at by name, not by a walk of the directory */
+/* a zone with an NS (and its address) named by the caller; the same steps as the ingest thread: build, install, register, publish the delta */
+static zone_db_entry_t *put_ns_zone_in(const char *view, const char *zone, const char *ns_target, bool with_addr, int64_t id) {
+    msg_t m;
+    char why[128];
+    uint8_t dg[32] = { 0 };
+    bool sh = false;
+    zone_db_entry_t *e = new_entry(view, zone);
+    msg_init(&m);
+    msg_soa(&m, zone, 1);
+    msg_ns(&m, zone, ns_target);
+    if (with_addr) msg_a(&m, ns_target, 17);
+    msg_soa(&m, zone, 1);
+    CHECK(install_msgs(e, zone, with_addr ? 4 : 3, &m, 1, why, sizeof(why), NULL) == 0);
+    CHECK(dbreg_commit(view, zone, e, true, id, 1, dg, &sh) == 0);
+    CHECK(snapshot_apply_db_delta() == 1);
+    return e;
+}
+
+static zone_db_entry_t *put_ns_zone(const char *zone, const char *ns_target, bool with_addr, int64_t id) {
+    return put_ns_zone_in("default", zone, ns_target, with_addr, id);
+}
+
+static void test_glue_arrivals(void) {
+    printf("[TEST] the glue of dependents: a zone that arrives is looked at by name (the zones that contain it, the filter of outside targets), the walk stays for the rest...\n");
+    dbreg_reset();
+    rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+    zone_glue_refresh_dependents(true);
+    uint64_t w0, t0, z0, w1, t1, z1;
+
+    /* 1. a target outside the zone: the zone that holds it arrives later (the walk finds the dependent: provider names are in the filter) */
+    zone_db_entry_t *x = put_ns_zone("cust.test.", "ns.hosting.test.", false, 91);
+    zone_glue_refresh_dependents(false);
+    zone_version_t *xv = atomic_load(&x->rcu.active);
+    CHECK(xv && xv->glue && xv->glue->count == 1 && xv->glue->ids[0] == 0);
+    uint64_t gen0 = atomic_load(&xv->generation);
+    zone_db_entry_t *hosting = put_ns_zone("hosting.test.", "ns.hosting.test.", true, 92);
+    zone_glue_stats(&w0, &t0, &z0);
+    zone_glue_refresh_dependents(false);
+    zone_glue_stats(&w1, &t1, &z1);
+    xv = atomic_load(&x->rcu.active);
+    CHECK(xv->glue->ids[0] == hosting->id && atomic_load(&xv->generation) != gen0);   /* the glue of cust.test follows the zone that arrived */
+    CHECK(w1 == w0 + 1);                                                              /* (the name hosting.test is a parent of a target of cust.test: the filter says so) */
+
+    /* 2. a zone that nobody can depend on: no walk, no zone looked at again */
+    zone_glue_refresh_dependents(false);
+    zone_glue_stats(&w0, &t0, &z0);
+    gen0 = atomic_load(&xv->generation);
+    (void)put_ns_zone("unrelated.test.", "ns.unrelated.test.", true, 93);
+    zone_glue_refresh_dependents(false);
+    zone_glue_stats(&w1, &t1, &z1);
+    CHECK(w1 == w0 && t1 == t0 + 1 && z1 == z0);
+    CHECK(atomic_load(&atomic_load(&x->rcu.active)->generation) == gen0);
+
+    /* 3. a target inside the zone, and a zone below it arrives: the zone that contains it is looked at, still without a walk */
+    zone_db_entry_t *d = put_ns_zone("d.test.", "ns.sub.d.test.", false, 94);
+    zone_glue_refresh_dependents(false);
+    zone_version_t *dv = atomic_load(&d->rcu.active);
+    CHECK(dv && dv->glue && dv->glue->count == 1 && dv->glue->ids[0] == 0);          /* (it is in d.test itself) */
+    zone_glue_stats(&w0, &t0, &z0);
+    zone_db_entry_t *child = put_ns_zone("sub.d.test.", "ns.sub.d.test.", true, 95);
+    zone_glue_refresh_dependents(false);
+    zone_glue_stats(&w1, &t1, &z1);
+    dv = atomic_load(&d->rcu.active);
+    CHECK(dv->glue->ids[0] == child->id);                                            /* the new child zone answers for the name server now */
+    CHECK(w1 == w0 && t1 == t0 + 1 && z1 == z0 + 1);
+
+    /* 4. nothing to do: nothing is looked at */
+    zone_glue_stats(&w0, &t0, &z0);
+    zone_glue_refresh_dependents(false);
+    zone_glue_stats(&w1, &t1, &z1);
+    CHECK(w1 == w0 && t1 == t0 && z1 == z0);
+
+    /* 5. more arrivals than the list holds: the tick walks the directory (as it did for every arrival), and the answer is the same */
+    gen0 = atomic_load(&atomic_load(&x->rcu.active)->generation);
+    for (int i = 0; i < 20000; i++) zone_glue_note_arrival("default", "flood.test.");
+    zone_glue_stats(&w0, &t0, &z0);
+    zone_glue_refresh_dependents(false);
+    zone_glue_stats(&w1, &t1, &z1);
+    CHECK(w1 == w0 + 1);
+    CHECK(atomic_load(&atomic_load(&x->rcu.active)->generation) == gen0);            /* (nothing had changed: only the cost) */
+    /* the root's name and a name that is in no view are handled without a fault */
+    zone_glue_note_arrival("default", ".");
+    zone_glue_note_arrival("no-such-view", "a.b.test.");
+    zone_glue_refresh_dependents(false);
+
+    /* 6. a zone that leaves is still found by the walk (the delta marks it) */
+    CHECK(dbreg_delete("default", "hosting.test.", 92) == 1);
+    CHECK(snapshot_apply_db_delta() == 1);
+    zone_glue_refresh_dependents(false);
+    CHECK(atomic_load(&x->rcu.active)->glue->ids[0] == 0);
+    dbreg_reset();
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+}
+
+/* B2 L2: a database zone that view "a" holds and view "b" shares by in-view arrives: the zone of view b that contains its name (a target under its own apex) is looked at,
+ * though the arrival is noted in view a only; and a zone of view b that is not above the new name, and a view that has a zone of the same name of its own, are not */
+static void test_glue_arrivals_in_view(void) {
+    printf("[TEST] the glue of dependents: a database zone that arrives is looked at in the views that share it by in-view...\n");
+    dbreg_reset();
+    rebuild(load_conf("options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; }; };\n"
+                      "view \"a\" { match-clients { 127.0.0.1; }; };\n"
+                      "view \"b\" { match-clients { any; }; zone \"sub.outer.test\" { in-view \"a\"; }; };\n"
+                      "view \"c\" { match-clients { 127.0.0.2; }; };\n"));
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+    zone_glue_refresh_dependents(true);
+    uint64_t w0, t0, z0, w1, t1, z1;
+    /* outer.test of view b names a name server inside itself, under the name of a zone that is not there yet; the same in view c, which does not share the zone */
+    zone_db_entry_t *outer_b = put_ns_zone_in("b", "outer.test.", "ns.sub.outer.test.", false, 9601);
+    zone_db_entry_t *outer_c = put_ns_zone_in("c", "outer.test.", "ns.sub.outer.test.", false, 9602);
+    zone_glue_refresh_dependents(false);
+    zone_version_t *bv = atomic_load(&outer_b->rcu.active), *cv = atomic_load(&outer_c->rcu.active);
+    CHECK(bv && bv->glue && bv->glue->count == 1 && bv->glue->ids[0] == 0);
+    CHECK(cv && cv->glue && cv->glue->count == 1 && cv->glue->ids[0] == 0);
+    uint64_t gen_b = atomic_load(&bv->generation), gen_c = atomic_load(&cv->generation);
+    zone_glue_stats(&w0, &t0, &z0);
+    zone_db_entry_t *sub = put_ns_zone_in("a", "sub.outer.test.", "ns.sub.outer.test.", true, 9603);
+    zone_glue_refresh_dependents(false);
+    zone_glue_stats(&w1, &t1, &z1);
+    bv = atomic_load(&outer_b->rcu.active);
+    cv = atomic_load(&outer_c->rcu.active);
+    CHECK(bv->glue->ids[0] == sub->id && atomic_load(&bv->generation) != gen_b);       /* view b answers for the name through the shared zone now: its answers are made again */
+    CHECK(cv->glue->ids[0] == 0 && atomic_load(&cv->generation) == gen_c);             /* (view c does not have the zone: nothing to look at) */
+    CHECK(w1 == w0 && t1 == t0 + 1 && z1 == z0 + 1);                                    /* (a targeted look at one zone, no walk) */
+    dbreg_reset();
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
 }
 
 /* ---------------------------------------------------------------- 9. D1a: the zone directory */
@@ -2155,8 +2315,10 @@ static void test_zone_bytes(void) {
     zone_version_t *v1 = atomic_load(&z->rcu.active);
     size_t b1 = v1->bytes;
     CHECK(v1->counted && b1 > sizeof(zone_version_t) + v1->image->total_size - 1);
+    const uint64_t fx = atomic_load(&z->fixed_charged);                                 /* 0.7 B1: what the entry itself costs, counted with the first version */
+    CHECK(fx >= sizeof(zone_db_entry_t) && fx == zone_entry_fixed_now(z));
     zone_bytes_get(ZBYTES_DB, &db);
-    CHECK(db.resident == db0.resident + b1 && db.retired == db0.retired);               /* (no IXFR difference for the first load) */
+    CHECK(db.resident == db0.resident + b1 + fx && db.retired == db0.retired);          /* (no IXFR difference for the first load) */
     /* a new version: the old one is retired until it is freed */
     zone_db_entry_t *z_again = add_zone("default", "zb2.test.", 2, 6, 9201);
     CHECK(z_again == z);
@@ -2165,12 +2327,12 @@ static void test_zone_bytes(void) {
     ixfr_txn_t *txn = z->ixfr_history.count > 0 ? z->ixfr_history.entries[(z->ixfr_history.head + z->ixfr_history.cap - 1) % z->ixfr_history.cap] : NULL;
     CHECK(txn && txn->acct == 1 + ZBYTES_DB && txn->bytes >= sizeof(*txn) && txn->old_serial == 1 && txn->new_serial == 2);
     zone_bytes_get(ZBYTES_DB, &db);
-    CHECK(txn && db.resident == db0.resident + v2->bytes + txn->bytes);
+    CHECK(txn && db.resident == db0.resident + v2->bytes + txn->bytes + fx);            /* (the entry is counted once, not with every version) */
     CHECK(db.retired == db0.retired);                                                   /* (v1 is the zone's prev now, not on the retire stack) */
     CHECK(db.previous == db0.previous + b1 && z->prev == v1);
     zone_retire_process(true);
     zone_bytes_get(ZBYTES_DB, &db);
-    CHECK(db.retired == db0.retired && db.resident == db0.resident + v2->bytes + txn->bytes);
+    CHECK(db.retired == db0.retired && db.resident == db0.resident + v2->bytes + txn->bytes + fx);
     /* the zone leaves: its versions and its history go with the entry */
     CHECK(dbreg_delete("default", "zb2.test.", 9201) == 1 && snapshot_apply_db_delta() == 1);
     gc_snapshot_wait_idle();
@@ -2215,6 +2377,144 @@ static void test_bgload_cache(void) {
     rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
     gc_snapshot_wait_idle();
     zone_retire_process(true);
+}
+
+/* ---- 0.7 B2 W8: room on demand: dbreg_cache_make_room() ---- */
+static uint32_t room_mono32(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+static zdir_elem_t *room_elem(const char *zone) {
+    zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+    zdir_elem_t *el = zdir_find_exact(snapshot_find_view(s, "default"), zone);
+    release_zone_snapshot(s);
+    return el;
+}
+/* the zone has been in memory `ms` milliseconds (what the minimum residency and the floor of the room on demand look at) */
+static void room_age(const char *zone, uint32_t ms) {
+    zdir_elem_t *el = room_elem(zone);
+    CHECK(el != NULL);
+    if (el) el->t_load = room_mono32() - ms;
+}
+static bool room_resident(const char *zone) { return dbreg_lookup_entry("default", zone) != NULL; }
+static uint64_t room_resident_bytes(void) {
+    zone_bytes_t zb;
+    zone_bytes_get(ZBYTES_DB, &zb);
+    return zb.resident;
+}
+/* n zones of equal size, all old (500 ms); the registry starts empty */
+static void room_setup(int n, const char *names[], int nrr) {
+    dbreg_reset();
+    rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+    for (int i = 0; i < n; i++) {
+        CHECK(add_zone("default", names[i], 1, nrr, 9600 + i) != NULL && snapshot_apply_db_delta() == 1);
+        room_age(names[i], 500);
+    }
+}
+static void room_teardown(void) {
+    dbreg_cache_set_limit(0);
+    zone_retire_process(true);
+    dbreg_reset();
+    rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+}
+
+static void test_room_on_demand(void) {
+    printf("[TEST] room on demand: the coldest first, only as much as is needed, the minimum residency relaxed only for zones that served their queries...\n");
+    dbreg_cache_stats_t s0, s1;
+    uint32_t rel = 0;
+
+    /* no limit: nothing to take */
+    CHECK(dbreg_cache_make_room(1, &rel) == 0 && rel == 0);
+
+    /* S1: eight zones.  r0, r1 are hot (frequency), r2 is pinned, r3 was changed by an UPDATE, r4 came in just now and has served nobody, r5 came in 50 ms ago and has served
+     * queries, r6 and r7 are old and cold.  The limit puts the zones 12% over the limit: over the hard line (10%) by a little. */
+    {
+        const char *nm[8] = { "r0.test.", "r1.test.", "r2.test.", "r3.test.", "r4.test.", "r5.test.", "r6.test.", "r7.test." };
+        room_setup(8, nm, 20);
+        dbreg_warm_freq("default", "r0.test.", 100000);
+        dbreg_warm_freq("default", "r1.test.", 100000);
+        room_elem("r2.test.")->flags |= ZDIR_F_PIN;
+        atomic_store(&dbreg_lookup_entry("default", "r3.test.")->updated, true);
+        room_age("r4.test.", 0);                                                  /* (unserved: protected for its minimum residency) */
+        room_age("r5.test.", 50);
+        atomic_store(&dbreg_lookup_entry("default", "r5.test.")->observatory.queries_total, 3);
+        const uint64_t R = room_resident_bytes();
+        dbreg_cache_set_limit(R * 100 / 112);
+        CHECK(dbreg_cache_over_limit());
+        dbreg_cache_stats(&s0);
+        uint32_t n = dbreg_cache_make_room(1, &rel);
+        dbreg_cache_stats(&s1);
+        CHECK(n >= 1 && n <= 2 && rel == 0);                                       /* (a zone or two, none of them young) */
+        CHECK(!dbreg_cache_over_limit());                                          /* (there is room for the zone that waits) */
+        CHECK(s1.room_evictions == s0.room_evictions + n && s1.room_relaxed == s0.room_relaxed && s1.evictions == s0.evictions + n);
+        CHECK(!room_resident("r6.test.") && (n == 2) == !room_resident("r7.test."));      /* (the old cold ones go, in the order of their priority) */
+        CHECK(room_resident("r0.test.") && room_resident("r1.test.") && room_resident("r2.test.") && room_resident("r3.test.") && room_resident("r4.test.") &&
+              room_resident("r5.test."));                                          /* (hot, pinned, changed by an UPDATE, young: stay) */
+
+        /* S2: far more is wanted than the old zones that can go: the hot old ones go first (pass one), then the young zone that has served its queries (pass two); the young zone that
+         * has served nobody, the pinned zone and the changed zone stay whatever is wanted */
+        dbreg_cache_set_limit(room_resident_bytes() / 4);
+        CHECK(dbreg_cache_over_limit());
+        dbreg_cache_stats(&s0);
+        n = dbreg_cache_make_room(1, &rel);
+        dbreg_cache_stats(&s1);
+        CHECK(n >= 2 && rel == 1 && s1.room_relaxed == s0.room_relaxed + 1 && s1.room_evictions == s0.room_evictions + n);
+        CHECK(!room_resident("r0.test.") && !room_resident("r1.test.") && !room_resident("r5.test."));
+        CHECK(room_resident("r4.test.") && room_resident("r2.test.") && room_resident("r3.test."));
+        /* the unserved young zone is taken after its minimum residency, not before: served but younger than the floor (10 ms) stays, older than it goes (and counts as relaxed) */
+        atomic_store(&dbreg_lookup_entry("default", "r4.test.")->observatory.queries_total, 1);
+        room_age("r4.test.", 0);
+        CHECK(dbreg_cache_make_room(1, &rel) == 0 && room_resident("r4.test."));
+        room_age("r4.test.", 30);
+        dbreg_cache_stats(&s0);
+        CHECK(dbreg_cache_make_room(1, &rel) == 1 && rel == 1 && !room_resident("r4.test.") && room_resident("r2.test.") && room_resident("r3.test."));
+        dbreg_cache_stats(&s1);
+        CHECK(s1.room_relaxed == s0.room_relaxed + 1);
+        /* a pinned zone and a zone changed by an UPDATE: nothing more can go, however much is wanted (the caller's request waits, then times out) */
+        CHECK(dbreg_cache_make_room(8, &rel) == 0 && room_resident("r2.test.") && room_resident("r3.test."));
+        /* a zone that was taken out and is being fetched again (LOADING) is not a candidate: it has no data to take out */
+        CHECK(!room_resident("r6.test.") && dbreg_fetch_begin("default", "r6.test.") == DBREG_FETCH_STARTED);
+        CHECK(dbreg_cache_make_room(8, &rel) == 0 && !room_resident("r6.test."));
+        dbreg_fetch_end("default", "r6.test.");
+        room_teardown();
+    }
+
+    /* S3: as much as is needed and not more.  Thirty zones of one size, all old, the zones are 112% of the limit (over the hard line by 1.8% of the zones' bytes): room for one zone
+     * that waits takes two zones; room for three takes four; and with the limit far below the zones the manager's low mark (90% of the limit) is the floor, so a burst of waiting
+     * requests cannot empty the cache */
+    {
+        enum { NZ = 30 };
+        static char nmb[NZ][16];
+        const char *nm[NZ];
+        for (int i = 0; i < NZ; i++) {
+            snprintf(nmb[i], sizeof(nmb[i]), "q%d.test.", i);
+            nm[i] = nmb[i];
+        }
+        uint32_t got[2] = { 0, 0 };
+        for (int round = 0; round < 2; round++) {
+            room_setup(NZ, nm, 5);
+            const uint64_t R = room_resident_bytes();
+            dbreg_cache_set_limit(R * 100 / 112);
+            CHECK(dbreg_cache_over_limit());
+            got[round] = dbreg_cache_make_room(round == 0 ? 1 : 3, &rel);
+            CHECK(rel == 0 && !dbreg_cache_over_limit());
+            room_teardown();
+        }
+        CHECK(got[0] == 2 && got[1] == 4);
+        room_setup(NZ, nm, 5);
+        const uint64_t R = room_resident_bytes();
+        dbreg_cache_set_limit(R / 2);
+        uint32_t n = dbreg_cache_make_room(200, &rel);
+        const uint64_t after = room_resident_bytes(), low = (R / 2) / 100 * 90, one = R / NZ;
+        CHECK(n >= 16 && n <= 17 && after > 0 && after + one >= low);              /* (the low mark of the manager, less a zone at the most: the room made is capped by it) */
+        room_teardown();
+    }
+    CHECK(zone_bytes_underflows() == 0);
 }
 
 /* ---- karictl rollback for DB zones: prev from a database install, the memory limit drops it first, a rollback pins the zone ---- */
@@ -2333,6 +2633,263 @@ static void test_prev_concurrent(void) {
     CHECK(d.previous == 0 && d.retired == 0 && zone_bytes_underflows() == 0);
 }
 
+/* ---- 0.7 B2: the IXFR history of a zone that is taken out of memory is released with it ---- */
+static uint64_t history_charge(const zone_db_entry_t *e) {
+    uint64_t n = 0;
+    for (int i = 0; e->ixfr_history.entries && i < e->ixfr_history.cap; i++)
+        if (e->ixfr_history.entries[i] && e->ixfr_history.entries[i]->acct) n += e->ixfr_history.entries[i]->bytes;
+    return n;
+}
+
+static void test_evict_drops_ixfr_history(void) {
+    printf("[TEST] eviction releases the IXFR history's resident charge; evict / fetch-back cycles keep the resident total bounded...\n");
+    dbreg_reset();
+    rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+    zone_bytes_t d0, d1;
+    zone_bytes_get(ZBYTES_DB, &d0);
+    const char *nm = "ih.test.";
+    uint32_t serial = 1;
+    zone_db_entry_t *e = add_zone("default", nm, serial, 60, 9500);
+    CHECK(e != NULL && snapshot_apply_db_delta() == 1);
+    uint64_t resident_one = 0;
+    for (int cycle = 0; cycle < 8; cycle++) {
+        for (int k = 0; k < 4; k++) {                                          /* four more versions: the history holds four differences (the default depth) */
+            serial++;
+            CHECK(add_zone("default", nm, serial, 60 + (int)(serial % 3) * 5, 9500) == e);
+        }
+        CHECK(e->ixfr_history.count == 4);
+        uint64_t hist = history_charge(e);
+        CHECK(hist > 0);
+        zone_bytes_get(ZBYTES_DB, &d1);
+        CHECK(d1.resident > d0.resident + hist);                               /* the version and the history are resident */
+        if (cycle == 0) resident_one = d1.resident - d0.resident;
+        CHECK(d1.resident - d0.resident <= resident_one + 2048);               /* the same zone, the same figure: no drift from cycle to cycle */
+        zone_prev_expire(time(NULL) + 1000000);                                /* (the version kept for rollback and the replaced ones hold the entry: it is evicted only when nothing else does) */
+        zone_retire_process(true);
+        CHECK(dbreg_test_evict("default", nm));
+        CHECK(e->ixfr_history.count == 0 && history_charge(e) == 0);           /* the differences went with the data, not with the entry */
+        zone_bytes_get(ZBYTES_DB, &d1);
+        CHECK(d1.resident == d0.resident);                                     /* nothing of the zone is resident (its version is in the retired total) */
+        CHECK(snapshot_apply_db_delta() >= 0);
+        gc_snapshot_wait_idle();
+        zone_retire_process(true);
+        zone_bytes_get(ZBYTES_DB, &d1);
+        CHECK(d1.resident == d0.resident && d1.retired == d0.retired);
+        e = add_zone("default", nm, serial, 60, 9500);                         /* fetched back (the serial the directory has: no NOTIFY is queued): a new entry, no history */
+        CHECK(e != NULL && e->ixfr_history.count == 0);
+    }
+    CHECK(dbreg_delete("default", nm, 9500) == 1);
+    CHECK(snapshot_apply_db_delta() >= 1);
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+    zone_bytes_get(ZBYTES_DB, &d1);
+    CHECK(d1.resident == d0.resident && d1.retired == d0.retired && zone_bytes_underflows() == 0);
+}
+
+/* ---- 0.7 B1 / B2: what a resident zone costs besides its versions (the entry, its lock, the settings block) is counted with its first version and given
+ * back with the entry: through updates, evictions and fetches back, a delete, and for a zone of a file.  The entry is small (B2). ---- */
+static void test_zone_fixed_charge(void) {
+    printf("[TEST] memory-limit counts what the entry costs: charge == release over updates, evictions, fetches back and deletes; the entry is small...\n");
+    CHECK(sizeof(zone_db_entry_t) <= 600);                                           /* B2: it was 1032 */
+    dbreg_reset();
+    rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+    zone_bytes_t d0, d1;
+    zone_bytes_get(ZBYTES_DB, &d0);
+    const char *nm = "fx.test.";
+    uint32_t serial = 1;
+    zone_db_entry_t *e = add_zone("default", nm, serial, 3, 9700);
+    CHECK(e != NULL && snapshot_apply_db_delta() == 1);
+    CHECK(e->rx_note == NULL && atomic_load(&e->rx_present) == false);               /* (B2: no note block until there is a note) */
+    CHECK(strcmp(e->domain, nm) == 0 && (const char *)e->domain == (const char *)(e + 1));   /* (B2: the name is in the entry's block) */
+    uint64_t fx = atomic_load(&e->fixed_charged);
+    CHECK(fx >= e->block_bytes && e->block_bytes >= sizeof(zone_db_entry_t) + strlen(nm) + 1);
+    {   /* the history's lock is not made until the history is used (the first install compares nothing): it is still the zeroed (static) mutex (FreeBSD libthr, B2) */
+        static const unsigned char zero[sizeof(pthread_mutex_t)];
+        CHECK(memcmp(&e->ixfr_history.lock, zero, sizeof(zero)) == 0);
+        zone_db_entry_t *lk = create_new_zone_entry("lk.test.", "default");
+        CHECK(lk != NULL);
+        if (lk) {
+            /* (B2 L3) what the entry costs is worked out from what the entry code allocated: settings that are not from the allocator (a unit test's, static or on the stack)
+             * cost nothing and are never shown to it; settings made by db_zone_config_new() cost what the allocator holds for them */
+            lk->source = ZONE_SRC_DB;
+            uint32_t base = zone_entry_fixed_now(lk);
+            CHECK(base >= lk->block_bytes);
+            char sdomain[] = "lk.test.", stype[] = "master";
+            zone_config_t sc;
+            memset(&sc, 0, sizeof(sc));
+            sc.domain = sdomain;
+            sc.type = stype;
+            atomic_store(&lk->dbcfg, &sc);
+            CHECK(zone_entry_fixed_now(lk) == base);
+            atomic_store(&lk->dbcfg, NULL);
+            zone_config_t *hc = db_zone_config_new("lk.test.", NULL);
+            CHECK(hc != NULL && hc->alloc_bytes >= sizeof(*hc) + strlen("lk.test.") + 1 + strlen("master") + 1);
+            if (hc) {
+                atomic_store(&lk->dbcfg, hc);
+                CHECK(zone_entry_fixed_now(lk) == base + hc->alloc_bytes);
+            }
+            free_zone_db_entry(lk);                                                 /* (frees hc with it) */
+        }
+    }
+    for (int cycle = 0; cycle < 6; cycle++) {
+        for (int k = 0; k < 3; k++) {                                                 /* updates replace the version: the entry is counted once */
+            serial++;
+            CHECK(add_zone("default", nm, serial, 3 + k, 9700) == e);
+        }
+        zone_retire_process(true);
+        zone_bytes_get(ZBYTES_DB, &d1);
+        zone_version_t *v = atomic_load(&e->rcu.active);
+        CHECK(atomic_load(&e->fixed_charged) == fx);
+        uint64_t hist = history_charge(e);
+        CHECK(d1.resident == d0.resident + v->bytes + fx + hist);
+        zone_prev_expire(time(NULL) + 1000000);
+        zone_retire_process(true);
+        /* the zone leaves memory: its version and the entry's share go to the retired total together (the entry is freed with a snapshot's garbage) */
+        CHECK(dbreg_test_evict("default", nm));
+        zone_bytes_get(ZBYTES_DB, &d1);
+        CHECK(d1.resident == d0.resident);
+        CHECK(d1.retired >= d0.retired + v->bytes + fx);                               /* (not freed yet: the retired total holds them) */
+        CHECK(snapshot_apply_db_delta() >= 0);
+        gc_snapshot_wait_idle();
+        zone_retire_process(true);
+        zone_bytes_get(ZBYTES_DB, &d1);
+        CHECK(d1.resident == d0.resident && d1.retired == d0.retired);                 /* given back: what was counted is what is released */
+        e = add_zone("default", nm, serial, 3, 9700);                                  /* fetched back: a new entry, counted again from nothing */
+        CHECK(e != NULL && atomic_load(&e->fixed_charged) == fx);
+        CHECK(snapshot_apply_db_delta() >= 0);
+    }
+    CHECK(dbreg_delete("default", nm, 9700) == 1);
+    CHECK(snapshot_apply_db_delta() >= 1);
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+    zone_bytes_get(ZBYTES_DB, &d1);
+    CHECK(d1.resident == d0.resident && d1.retired == d0.retired && d1.previous == d0.previous && zone_bytes_underflows() == 0);
+
+    /* a zone of a file counts as well (the other class), with the entry's block and lock and no settings block; the entry leaves with its snapshot */
+    zone_bytes_t o0, o1;
+    zone_bytes_get(ZBYTES_OTHER, &o0);
+    write_zone_file("fxf.zone", "fxf.test.", "192.0.2.9");
+    char zf[300];
+    snprintf(zf, sizeof(zf), "%s/fxf.zone", g_dir);
+    rebuild(load_conf("view \"default\" { match-clients { any; }; zone \"fxf.test\" { type master; file \"%s\"; }; };\n", zf));
+    zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+    zone_db_entry_t *fz = find_zone_exact_in_view(snapshot_find_view(s, "default"), "fxf.test.");
+    release_zone_snapshot(s);
+    CHECK(fz != NULL && atomic_load(&fz->fixed_charged) >= fz->block_bytes);
+    zone_bytes_get(ZBYTES_OTHER, &o1);
+    CHECK(fz && o1.resident == o0.resident + atomic_load(&fz->rcu.active)->bytes + atomic_load(&fz->fixed_charged));
+    dbreg_reset();
+    rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+    zone_bytes_get(ZBYTES_OTHER, &o1);
+    CHECK(o1.resident == o0.resident && o1.retired == o0.retired && zone_bytes_underflows() == 0);
+}
+
+/* ---- 0.7 B2: when the alias thread is asked to scan.  alias_test_notices() counts alias_notify() calls; a scan follows each (the thread runs a scan at
+ * most once per tick for any number of calls).  A zone without ALIAS records asks for nothing; one with them asks after it is reachable ---- */
+/* the install and the commit of the ingest thread, with the number of notices between the two steps: a notice of the install (the version is published into
+ * an entry nobody can reach yet) is not what makes the zone scanned */
+static zone_db_entry_t *put_zone_alias(const char *view, const char *zone, uint32_t serial, bool with_alias, int64_t id, bool new_entry_wanted, uint64_t *commit_notices) {
+    msg_t m;
+    zone_msg_alias(&m, zone, serial, with_alias);
+    zone_db_entry_t *e = new_entry_wanted ? NULL : dbreg_lookup_entry(view, zone);
+    bool created = false;
+    if (!e) { e = new_entry(view, zone); created = true; }
+    char why[128];
+    int irc = install_msgs(e, zone, with_alias ? 5 : 4, &m, 1, why, sizeof(why), NULL);       /* (SOA, NS, A, ALIAS, SOA) */
+    if (irc != 0) printf("  install of %s failed: %s\n", zone, why);
+    CHECK(irc == 0);
+    uint8_t dg[32] = { 7 };
+    bool sh = false;
+    uint64_t n0 = alias_test_notices();
+    CHECK(dbreg_commit(view, zone, e, created, id, serial, dg, &sh) == 0);
+    if (commit_notices) *commit_notices = alias_test_notices() - n0;
+    return e;
+}
+
+static void test_alias_notices(void) {
+    printf("[TEST] the alias thread is asked to scan after an ALIAS zone arrives, changes, is replaced, deleted, evicted or fetched back, and not for other zones...\n");
+    dbreg_reset();
+    rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+    uint64_t n0 = alias_test_notices(), cn = 0;
+
+    /* a warm-up of zones without ALIAS: arriving, changing, being evicted and fetched back, deleted - no notice */
+    for (int i = 0; i < 6; i++) {
+        char nm[64];
+        snprintf(nm, sizeof(nm), "plain%d.test.", i);
+        CHECK(add_zone("default", nm, 1, 3, 9600 + i) != NULL);
+    }
+    CHECK(snapshot_apply_db_delta() == 6);
+    CHECK(add_zone("default", "plain0.test.", 2, 4, 9600) != NULL);
+    CHECK(dbreg_test_evict("default", "plain1.test.") && snapshot_apply_db_delta() >= 0);
+    CHECK(add_zone("default", "plain1.test.", 2, 3, 9601) != NULL);
+    CHECK(dbreg_delete("default", "plain2.test.", 9602) == 1 && snapshot_apply_db_delta() >= 1);
+    CHECK(alias_test_notices() == n0);
+
+    /* an ALIAS zone arrives: it is not in the directory until the delta, which asks (the notice of the install came before and is not enough) */
+    zone_db_entry_t *a = put_zone_alias("default", "al.test.", 1, true, 9700, false, &cn);
+    CHECK(a && cn == 0);                                                        /* not in the index: no notice from the commit */
+    uint64_t n1 = alias_test_notices();
+    CHECK(snapshot_apply_db_delta() == 1);
+    CHECK(alias_test_notices() > n1);
+
+
+    /* it changes (a new version published into its entry), also into one without ALIAS and back: the publication asks */
+    n1 = alias_test_notices();
+    (void)put_zone_alias("default", "al.test.", 2, true, 9700, false, &cn);
+    CHECK(alias_test_notices() > n1);
+    n1 = alias_test_notices();
+    (void)put_zone_alias("default", "al.test.", 3, false, 9700, false, &cn);
+    CHECK(alias_test_notices() > n1);                                           /* the ALIAS records went */
+    n1 = alias_test_notices();
+    (void)put_zone_alias("default", "al.test.", 4, true, 9700, false, &cn);
+    CHECK(alias_test_notices() > n1);
+
+    /* a new entry replaces the one that is served (the element stays in the index; the old entry's ALIAS targets are not wanted, the new one's are) */
+    zone_db_entry_t *r = put_zone_alias("default", "al.test.", 5, false, 9700, true, &cn);
+    CHECK(r && r != a && cn >= 1);
+    CHECK(snapshot_apply_db_delta() >= 0);
+    r = put_zone_alias("default", "al.test.", 6, true, 9700, true, &cn);
+    CHECK(r && cn >= 1);
+    CHECK(snapshot_apply_db_delta() >= 0);
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+
+    /* it is taken out of memory (the element stays in the index with no entry: the scan must drop its targets) ... */
+    n1 = alias_test_notices();
+    CHECK(dbreg_test_evict("default", "al.test."));
+    CHECK(alias_test_notices() > n1);
+    CHECK(snapshot_apply_db_delta() >= 0);
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+
+    /* ... and fetched back: the entry is reachable at the commit and no snapshot is published for it, so the commit asks */
+    CHECK(dbreg_lookup_entry("default", "al.test.") == NULL);
+    r = put_zone_alias("default", "al.test.", 7, true, 9700, false, &cn);
+    CHECK(r && cn >= 1);
+
+    /* deleted: the element leaves the index with the next delta, which asks */
+    n1 = alias_test_notices();
+    CHECK(dbreg_delete("default", "al.test.", 9700) == 1);
+    CHECK(alias_test_notices() == n1);
+    CHECK(snapshot_apply_db_delta() >= 1);
+    CHECK(alias_test_notices() > n1);
+
+    /* a rebuild of the zone directory (a reconfiguration, a catalog change) asks after it published the snapshot */
+    n1 = alias_test_notices();
+    rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
+    CHECK(alias_test_notices() > n1);
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+}
+
 int main(void) {
     snprintf(g_dir, sizeof(g_dir), "/tmp/karidns_dbreg.XXXXXX");
     if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
@@ -2346,6 +2903,8 @@ int main(void) {
     test_secondary_entries();
     test_reuse_fast_path();
     test_glue_dirty_on_delete();
+    test_glue_arrivals();
+    test_glue_arrivals_in_view();
     test_dir_elements();
     test_dir_fetch_state();
     test_hot_scan_order();
@@ -2360,7 +2919,11 @@ int main(void) {
     test_zone_bytes();
     test_prev_db();
     test_bgload_cache();
+    test_room_on_demand();
     test_prev_concurrent();
+    test_evict_drops_ixfr_history();
+    test_zone_fixed_charge();
+    test_alias_notices();
     test_concurrent();
     gc_snapshot_wait_idle();      /* join the cleanup threads: none is left running (or leaked, for ThreadSanitizer) at exit */
     free(g_names);

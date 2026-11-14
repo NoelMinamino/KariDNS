@@ -133,7 +133,7 @@ static void test_fi_axfr_send_and_recv(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "fixfr.example.", sizeof(entry.domain));
+    entry.domain = "fixfr.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
@@ -205,7 +205,7 @@ static void test_fi_axfr_install_failure_keeps_state(void) {
     FI_SWEEP({
         zone_db_entry_t entry;
         memset(&entry, 0, sizeof(entry));
-        strlcpy(entry.domain, "fiinst.example.", sizeof(entry.domain));
+        entry.domain = "fiinst.example.";
         strlcpy(entry.view_name, "default", sizeof(entry.view_name));
         pthread_mutex_init(&entry.writer_lock, NULL);
         pthread_mutex_init(&entry.ixfr_history.lock, NULL);
@@ -267,7 +267,7 @@ static void test_fi_axfr_start_section_copies(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "fiv3.example.", sizeof(entry.domain));
+    entry.domain = "fiv3.example.";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);

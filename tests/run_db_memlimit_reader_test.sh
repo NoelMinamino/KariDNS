@@ -78,7 +78,7 @@ kari_wait_answer ./dag "$P" d3000.test 60 || { fail "the server did not start"; 
 q=1; while [ $q -le 280 ]; do ./dag @127.0.0.1 -p "$P" "$(printf 'www.d%04d.test' $q)" A +short +nohexdump +time=3 +tries=2 > /dev/null 2>&1; q=$((q + 1)); done
 R0=$(stat resident); E0=$(stat evictions); C0=$(stat cold); M0=$(stat misses)
 echo "   after the queries: $(ctl dbstatus | grep '^cache:')"
-[ "${R0:-0}" -gt 1000000 ] && [ "${R0:-0}" -lt 1600000 ] && pass "280 zones in memory ($R0 bytes, below the high mark of 2m)" || fail "resident: '$R0'"
+[ "${R0:-0}" -gt 1000000 ] && [ "${R0:-0}" -lt 1992294 ] && pass "280 zones in memory ($R0 bytes, below the high mark of 2m)" || fail "resident: '$R0'"
 if [ -n "${MLR_NOHOLD:-}" ]; then H=OK; else H=$(ctl rcu-hold 60000); fi
 [ "$H" = "OK" ] && pass "karictl rcu-hold 60000 (TEST ONLY)" || fail "rcu-hold: '$H'"
 # the cache manager samples the readers every second: a reader is long once it has stayed from one sample to the next

@@ -773,26 +773,32 @@ zone_db_entry_t *find_zone_for_query(view_snapshot_t *view, const char *qname, u
   return find_zone_for_query_ex(view, qname, qtype, NULL);
 }
 
+/* The name of the zone is the FQDN with the trailing dot, at most 255 octets (a longer one is cut, as it always was); it is kept behind the struct in the
+ * same block (0.7 B2: 256 octets in every entry were most of the entry for the zones of a database). */
+#define ZONE_DOMAIN_MAX 255
 zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name) {
-  zone_db_entry_t *z = calloc(1, sizeof(zone_db_entry_t));
+  size_t dlen = domain ? strlen(domain) : 0;
+  const bool add_dot = dlen > 0 && dns_name_len_no_root(domain, dlen) == dlen && dlen + 1 <= ZONE_DOMAIN_MAX;
+  const size_t nlen = add_dot ? dlen + 1 : (dlen < ZONE_DOMAIN_MAX ? dlen : ZONE_DOMAIN_MAX);
+  const size_t asked = sizeof(zone_db_entry_t) + nlen + 1;
+  zone_db_entry_t *z = calloc(1, asked);
   if (!z) return NULL;
+  z->block_bytes = (uint32_t)dns_alloc_size(z, asked);      /* (what memory-limit counts for the entry: zone_entry_fixed_now()) */
   atomic_init(&z->active_axfr, 0);
   atomic_init(&z->snapshot_refs, 1);
   z->id = zone_entry_next_id();
 
-  size_t dlen = domain ? strlen(domain) : 0;
-  if (dlen > 0 && dns_name_len_no_root(domain, dlen) == dlen && dlen + 1 < sizeof(z->domain)) {
-    memcpy(z->domain, domain, dlen);
-    z->domain[dlen] = '.';
-    z->domain[dlen + 1] = '\0';
-  } else {
-    strncpy(z->domain, domain ? domain : "", sizeof(z->domain) - 1);
-    z->domain[sizeof(z->domain) - 1] = '\0';
-  }
+  char *name = (char *)(z + 1);
+  if (dlen > 0) memcpy(name, domain, add_dot ? dlen : nlen);
+  if (add_dot) name[dlen] = '.';
+  name[nlen] = '\0';
+  z->domain = name;
   strncpy(z->view_name, view_name ? view_name : "", sizeof(z->view_name) - 1);
   z->view_name[sizeof(z->view_name) - 1] = '\0';
   pthread_mutex_init(&z->writer_lock, NULL);
-  pthread_mutex_init(&z->ixfr_history.lock, NULL);
+  /* ixfr_history.lock is not initialized here: it relies on FreeBSD's libthr, where PTHREAD_MUTEX_INITIALIZER is NULL and the lock is made when it is first taken, so a
+   * zone whose IXFR history is never touched (a database zone that is served and not changed) does not pay ~110 octets for it (ixfr_history_init_depth()).  A zeroed
+   * lock is not a lock everywhere (macOS: the initializer is a signature), but the server core is FreeBSD-only (Linux and macOS build dag only), so nothing else runs this. */
   atomic_init(&z->rcu.active, &zone_version_empty);
   return z;
 }
@@ -817,6 +823,9 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
   ixfr_history_clear(&entry->ixfr_history);
   zone_version_t *active = atomic_load_explicit(&entry->rcu.active, memory_order_relaxed);
   if (active && active->counted) zone_bytes_resident_add(zone_bytes_class(entry), -(int64_t)active->bytes);   /* (8.1) */
+  /* 0.7 (B1): what the entry itself was counted at; an evicted entry's share left the resident total with its version (it is in evicted_bytes) */
+  if (atomic_load_explicit(&entry->fixed_charged, memory_order_relaxed) && !entry->evicted_bytes)
+    zone_bytes_resident_add(zone_bytes_class(entry), -(int64_t)atomic_load_explicit(&entry->fixed_charged, memory_order_relaxed));
   if (entry->evicted_bytes) {                       /* evicted: the active version was moved to the retired total when it left memory */
     zone_bytes_retired_add(zone_bytes_class(entry), -(int64_t)entry->evicted_bytes);
     atomic_fetch_sub_explicit(&g_evict_inflight, (int64_t)entry->evicted_bytes, memory_order_relaxed);
@@ -831,6 +840,7 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
   free(entry->catalog_master);
   free(entry->catalog_member_unique_id);
   free(entry->owning_catalog_domain);
+  free(entry->rx_note);
   free(entry);
 }
 
@@ -1183,6 +1193,61 @@ static void glue_lookup_siblings(const char *zone_domain, view_snapshot_t *view,
   }
 }
 
+/* ---- 0.7 (B2): which zones can a zone that arrives change the glue of?  (zone_glue_refresh_dependents())
+ * The old way set one flag at every first publication and the control thread then walked the whole directory (1,000,000 zones: 65 % of a core while
+ * a fetch workload brings thousands of zones a second).  Now an arrival is noted by name and the tick looks only at the zones that can depend on it:
+ *  - a zone that CONTAINS the new name (its targets under the zone's own apex, "ns.sub.example" in example): the zones above the new apex, a handful,
+ *    are looked at one by one, in the view that holds the new zone and in every view that shares it from there by in-view;
+ *  - a zone whose target is OUTSIDE its apex ("ns1.hosting.example" in a customer zone): g_glue_filter, a Bloom filter that holds, for every such
+ *    target, the target and each of its parent names (a zone that arrives with one of these names can take the target over).  A name that is not
+ *    in the filter cannot change any glue; one that is (or a false positive) falls back to the full walk, as before.
+ * Nothing else changes: the full walk stays for what has no name (a zone that left, a sibling that changed, force), and what a refresh does to a zone
+ * is the same function.  The filter only grows (a bit is not taken out when a zone goes: a stale bit costs a walk, never a missed one); it is never
+ * cleared, which keeps it free of locks: one 64 byte block per name, four bits in it, 1 MiB in all (about 0.05 % false positives at 100,000 distinct
+ * outside targets; it fills up, and the arrivals fall back to the walk, with millions).
+ * Ordering (why an arrival is never missed): a writer sets the bits of its targets, fences (seq_cst), and only then looks the siblings up
+ * (zone_glue_track_build()); a zone that arrives becomes reachable, is noted, and the tick takes the notes, fences, and only then reads the bits.
+ * Either the lookup saw the new zone (the glue is right), or it did not, and then the bits are there when the tick reads them. ---- */
+#define GLUE_FILTER_BLOCKS (1u << 14)
+static _Atomic uint64_t g_glue_filter[GLUE_FILTER_BLOCKS][8];
+
+static void glue_filter_pos(uint32_t h, size_t *block, uint32_t bits[4]) {
+  uint64_t x = (uint64_t)h * 0x9E3779B97F4A7C15ull;      /* (the name hash has 32 bits: spread them) */
+  x ^= x >> 29;
+  x *= 0xBF58476D1CE4E5B9ull;
+  x ^= x >> 32;
+  *block = (size_t)(x & (GLUE_FILTER_BLOCKS - 1));
+  uint64_t y = x >> 14;
+  for (int i = 0; i < 4; i++) bits[i] = (uint32_t)((y >> (i * 9)) & 511);
+}
+
+static void glue_filter_add(uint32_t h) {
+  size_t blk;
+  uint32_t bits[4];
+  glue_filter_pos(h, &blk, bits);
+  for (int i = 0; i < 4; i++) atomic_fetch_or_explicit(&g_glue_filter[blk][bits[i] >> 6], 1ull << (bits[i] & 63), memory_order_relaxed);
+}
+
+static bool glue_filter_has(uint32_t h) {
+  size_t blk;
+  uint32_t bits[4];
+  glue_filter_pos(h, &blk, bits);
+  for (int i = 0; i < 4; i++)
+    if (!(atomic_load_explicit(&g_glue_filter[blk][bits[i] >> 6], memory_order_relaxed) & (1ull << (bits[i] & 63)))) return false;
+  return true;
+}
+
+/* A zone with the apex `zone_domain` tracks the target `t`.  When t is not under the apex, a zone that arrives at t or at one of its parents can
+ * take it over: all of them go into the filter (the root is not: a zone with the root's name always makes the walk). */
+static void glue_filter_note_target(const char *zone_domain, const char *t) {
+  if (domain_name_is_at_or_below(t, zone_domain)) return;     /* (in the zone: a new zone below it is found from the zones above it) */
+  for (const char *s = t; s && *s;) {
+    glue_filter_add(dns_name_hash_ci(s));
+    const char *dot = strchr_unescaped(s, '.');
+    s = dot ? dot + 1 : NULL;
+  }
+}
+
 /* 公開前の版 (zone_image_freeze() の後) に、兄弟ゾーンのグルーの追跡情報を作る。Additional のグルーの
  * 実体はイメージにある (自分のアドレスは NAME_GLUE の印、兄弟のアドレスは応答のたびに兄弟から引く:
  * append_glue_records の 3.)。ここで作るのは、NS/MX/SRV の対象名のうち兄弟ゾーンにありうるものと、そのとき引けた
@@ -1212,6 +1277,7 @@ void zone_glue_track_build(zone_version_t *ver, const char *zone_domain, view_sn
     bool dup = false;
     for (int j = 0; j < n && !dup; j++) dup = domain_names_match_ci(pool + offs[j], tmp);
     if (dup) continue;
+    glue_filter_note_target(zone_domain, tmp);   /* (before the siblings are looked up below: see the ordering note at g_glue_filter) */
     size_t l = strlen(tmp) + 1;
     if (pool_len + l > pool_cap) {
       size_t nc = pool_cap ? pool_cap * 2 : 256;
@@ -1225,12 +1291,13 @@ void zone_glue_track_build(zone_version_t *ver, const char *zone_domain, view_sn
     offs[n++] = (uint32_t)pool_len;
     pool_len += l;
   }
+  atomic_thread_fence(memory_order_seq_cst);   /* the filter bits are visible before the siblings are looked up: an arrival that this lookup misses finds the bits */
   if (n > 0) {
     size_t head = (sizeof(zone_glue_t) + 7) & ~(size_t)7;
     size_t gbytes = head + (size_t)n * sizeof(uint64_t) + (size_t)n * sizeof(char *) + pool_len;
     zone_glue_t *g = malloc(gbytes);
     if (g) {
-      g->bytes = gbytes;
+      g->bytes = dns_alloc_size(g, gbytes);
       g->built_at = atomic_load_explicit(&g_publish_counter, memory_order_seq_cst);
       g->count = n;
       g->ids = (uint64_t *)(void *)((char *)g + head);
@@ -1240,7 +1307,7 @@ void zone_glue_track_build(zone_version_t *ver, const char *zone_domain, view_sn
       for (int k = 0; k < n; k++) g->targets[k] = strs + offs[k];
       glue_lookup_siblings(zone_domain, view, g->targets, g->ids, n);
       ver->glue = g;
-      ver->bytes += gbytes;                              /* D1a (8.1): the glue is part of what the version holds */
+      ver->bytes += g->bytes;                              /* D1a (8.1): the glue is part of what the version holds */
     }
   }
   free(pool);
@@ -1645,6 +1712,27 @@ static bool version_same_image(const zone_version_t *a, const zone_version_t *b)
          memcmp(a->image, b->image, a->image->total_size) == 0;
 }
 
+/* 0.7 (B1): what a zone costs in memory besides its versions, counted in the zone memory totals (and so weighed against memory-limit) while the entry
+ * has a resident version: the block of the entry and its name (the allocator's own size, create_new_zone_entry()), the lock the entry's writer_lock
+ * makes (libthr on FreeBSD allocates a ~112 octet block of its own for every mutex, measured on 15.1; glibc keeps the mutex inside the struct, so it is
+ * already in the block), and for a database zone its settings block with the two strings (what an interned settings object holds is shared and not
+ * counted).  The IXFR history's lock is not made until it is used; what the history holds is counted by its differences.  An entry that
+ * create_new_zone_entry() did not make (a unit test's, on the stack) has no block size and costs nothing here.  It is worked out once, when the first
+ * version is counted (the settings block can be replaced by another of about the same size: the figure stays what it was, so that what is given
+ * back is what was counted). */
+#if defined(__FreeBSD__)
+#define ZONE_LOCK_BYTES 112u
+#else
+#define ZONE_LOCK_BYTES 0u
+#endif
+uint32_t zone_entry_fixed_now(const zone_db_entry_t *e) {
+  if (e->block_bytes == 0) return 0;
+  uint64_t n = (uint64_t)e->block_bytes + ZONE_LOCK_BYTES;
+  const zone_config_t *dc = e->source == ZONE_SRC_DB ? atomic_load_explicit(&e->dbcfg, memory_order_acquire) : NULL;
+  if (dc) n += dc->alloc_bytes;                       /* (worked out where the block was allocated, so that this never asks the allocator about a block it may not own: a unit test's settings on the stack) */
+  return n > UINT32_MAX ? UINT32_MAX : (uint32_t)n;
+}
+
 /* next を公開する。entry->writer_lock を持って呼ぶ (S2)。退いた版は解放待ちに積む (S5 B-3: 版は heap のものだけ。
  * 空の版とテストが自分で持つ版は積まない)。他のゾーンのグルーに使われているゾーン、または初めて公開するゾーン
  * なら、制御スレッドに依存するゾーンの応答の版の更新を頼む。
@@ -1668,6 +1756,11 @@ void zone_publish_ex(zone_db_entry_t *entry, zone_version_t *next, int64_t keep_
     next->counted = true;
     zone_bytes_resident_add(zb, (int64_t)next->bytes);
   }
+  if (next && next->heap && atomic_load_explicit(&entry->fixed_charged, memory_order_relaxed) == 0) {   /* B1: ... with what the entry costs, once */
+    uint32_t fx = zone_entry_fixed_now(entry);
+    atomic_store_explicit(&entry->fixed_charged, fx, memory_order_relaxed);
+    if (fx) zone_bytes_resident_add(zb, (int64_t)fx);
+  }
   if (old != next && old->counted) {                     /* ... and the one it replaced is not (retired, if it is kept) */
     old->counted = false;
     zone_bytes_resident_add(zb, -(int64_t)old->bytes);
@@ -1677,8 +1770,10 @@ void zone_publish_ex(zone_db_entry_t *entry, zone_version_t *next, int64_t keep_
     if (keep) zone_prev_set_locked(entry, old, epoch, keep_prev_secs > UINT32_MAX ? UINT32_MAX : (uint32_t)keep_prev_secs);
     else zone_version_retire(entry, old, epoch, false);
   }
-  if (first || atomic_load_explicit(&entry->glue_provider, memory_order_relaxed))
-    atomic_store_explicit(&g_glue_dirty, true, memory_order_release);
+  if (atomic_load_explicit(&entry->glue_provider, memory_order_relaxed))
+    atomic_store_explicit(&g_glue_dirty, true, memory_order_release);   /* a zone that others take glue from changed: the zones that use it are not indexed */
+  else if (first)
+    zone_glue_note_arrival(entry->view_name, entry->domain);            /* a new zone: the tick looks at the zones that can use it (not the whole directory) */
   if (alias_touch)
     alias_notify();
 }
@@ -1692,56 +1787,157 @@ typedef struct {
   view_snapshot_t *view;
 } glue_todo_t;
 
+/* ---- the arrivals (0.7 B2): zones that became reachable since the last tick, by name (a stack that the threads that publish push on and the tick takes
+ * as a whole, as the retire stack).  More than GLUE_ARRIVALS_MAX in one tick (a reload of many zones, a database batch of tens of thousands) are not
+ * listed: the tick walks the directory then, as it always did. ---- */
+typedef struct glue_arrival_s {
+  struct glue_arrival_s *next;
+  char view[KARIDNS_VIEW_NAME_MAX];
+  char domain[];
+} glue_arrival_t;
+#define GLUE_ARRIVALS_MAX 16384
+static _Atomic(glue_arrival_t *) g_glue_arrivals;
+static _Atomic uint32_t g_glue_arrival_count;
+static _Atomic uint64_t g_glue_walks, g_glue_targeted, g_glue_targeted_zones;
+
+void zone_glue_note_arrival(const char *view, const char *domain) {
+  if (!domain) return;
+  glue_arrival_t *a = NULL;
+  if (atomic_fetch_add_explicit(&g_glue_arrival_count, 1, memory_order_relaxed) < GLUE_ARRIVALS_MAX) a = malloc(sizeof(*a) + strlen(domain) + 1);
+  if (!a) {                                         /* the list is full, or no memory: the walk finds it */
+    atomic_store_explicit(&g_glue_dirty, true, memory_order_release);
+    return;
+  }
+  snprintf(a->view, sizeof(a->view), "%s", view ? view : "");
+  strcpy(a->domain, domain);
+  glue_arrival_t *h = atomic_load_explicit(&g_glue_arrivals, memory_order_relaxed);
+  do {
+    a->next = h;
+  } while (!atomic_compare_exchange_weak_explicit(&g_glue_arrivals, &h, a, memory_order_release, memory_order_relaxed));
+}
+
+void zone_glue_stats(uint64_t *walks, uint64_t *targeted, uint64_t *targeted_zones) {
+  if (walks) *walks = atomic_load_explicit(&g_glue_walks, memory_order_relaxed);
+  if (targeted) *targeted = atomic_load_explicit(&g_glue_targeted, memory_order_relaxed);
+  if (targeted_zones) *targeted_zones = atomic_load_explicit(&g_glue_targeted_zones, memory_order_relaxed);
+}
+
+/* does the version that the zone serves hold a sibling address that is no longer what it was when the glue was looked up (another zone answers for the
+ * target now, or the sibling published since)? */
+static bool glue_entry_stale(view_snapshot_t *view, zone_db_entry_t *e) {
+  zone_version_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
+  zone_glue_t *g = a ? a->glue : NULL;
+  if (!g) return false;
+  for (int k = 0; k < g->count; k++) {
+    zone_db_entry_t *s = find_zone_in_view(view, g->targets[k]);
+    if (s && domain_names_match_ci(s->domain, e->domain)) s = NULL;
+    if ((s ? s->id : 0) != g->ids[k] || (s && atomic_load_explicit(&s->publish_order, memory_order_seq_cst) > g->built_at)) return true;
+  }
+  return false;
+}
+
+/* the zones whose glue is looked up again; false: no memory (the caller asks for a full walk) */
+static bool glue_todo_add(glue_todo_t **todo, size_t *n, size_t *cap, zone_db_entry_t *e, view_snapshot_t *view) {
+  if (*n && (*todo)[*n - 1].entry == e) return true;      /* (the zones above two arrivals are often the same) */
+  if (*n == *cap) {
+    size_t ncap = *cap ? *cap * 2 : 64;
+    glue_todo_t *t = realloc(*todo, ncap * sizeof(**todo));
+    if (!t) return false;
+    *todo = t;
+    *cap = ncap;
+  }
+  (*todo)[*n].entry = e;
+  (*todo)[*n].view = view;
+  (*n)++;
+  return true;
+}
+
 /* 兄弟ゾーンが変わった (公開された、追加・削除された) ゾーンの応答の版を上げる。兄弟のアドレスは
  * 応答のたびに兄弟から引くので、データは作り直さない。共有の応答キャッシュに残る古い応答を引かせない
  * ためだけに版を上げ、兄弟の id と調べた時点を記録し直す (メモリは確保しない)。
  * 制御スレッドから (起動時はメインスレッドから)、読み取り区間の外で呼ぶ。glue->ids と
- * glue->built_at を公開後に書くのはこの関数だけ。force でなければ、グルーに関わる公開があったときだけ調べる。 */
+ * glue->built_at を公開後に書くのはこの関数だけ。force でなければ、グルーに関わる公開があったときだけ調べる。
+ * 0.7 (B2): a zone that is new (a first publication, a database zone that became reachable) is a name in the list of arrivals, not a reason to walk the
+ * directory: the zones that can use it as a sibling are the zones that contain its name, and, through g_glue_filter, the zones with a target outside their
+ * apex at that name or below it.  The walk (every zone of every view, as before) stays for what has no name: a zone that left, a zone that others
+ * take glue from, force, a list that overflowed, and a name that the filter cannot clear. */
 void zone_glue_refresh_dependents(bool force) {
-  if (!atomic_exchange_explicit(&g_glue_dirty, false, memory_order_acq_rel) && !force) return;
+  bool full = atomic_exchange_explicit(&g_glue_dirty, false, memory_order_acq_rel) || force;
+  glue_arrival_t *arr = atomic_exchange_explicit(&g_glue_arrivals, NULL, memory_order_acquire);
+  if (arr) atomic_store_explicit(&g_glue_arrival_count, 0, memory_order_relaxed);
+  atomic_thread_fence(memory_order_seq_cst);        /* (the arrivals are read before the filter: see zone_glue_track_build()) */
+  for (glue_arrival_t *a = arr; a && !full; a = a->next) {
+    size_t len = dns_name_len_no_root(a->domain, strlen(a->domain));
+    full = len == 0 || glue_filter_has(dns_name_hash_ci(a->domain));
+  }
+  if (!full && !arr) return;
   zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
-  if (!snap) return;
+  if (!snap) {
+    while (arr) {
+      glue_arrival_t *n = arr->next;
+      free(arr);
+      arr = n;
+    }
+    return;
+  }
   glue_todo_t *todo = NULL;
   size_t n = 0, cap = 0;
   bool oom = false;
-  burst_yield_t by = BURST_YIELD_INIT;
-  for (size_t v = 0; v < snap->view_count && !oom; v++) {
-    view_snapshot_t *view = &snap->views[v];
-    rcu_aux_read_lock();
-    zdir_iter_t zit;
-    zdir_iter_init(&zit, view);
-    for (zdir_elem_t *zel; (zel = zdir_iter_next(&zit));) {
-      zone_db_entry_t *e = zdir_entry(zel);
-      if (!e || !view_owns_elem(zel)) continue;   /* a zone shared from another view is looked at in its own view */
-      burst_yield(&by);
-      zone_version_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
-      zone_glue_t *g = a ? a->glue : NULL;
-      if (!g) continue;
-      bool need = false;
-      for (int k = 0; k < g->count && !need; k++) {
-        zone_db_entry_t *s = find_zone_in_view(view, g->targets[k]);
-        if (s && domain_names_match_ci(s->domain, e->domain)) s = NULL;
-        need = (s ? s->id : 0) != g->ids[k] ||
-               (s && atomic_load_explicit(&s->publish_order, memory_order_seq_cst) > g->built_at);
-      }
-      if (!need) continue;
-      if (n == cap) {
-        size_t ncap = cap ? cap * 2 : 64;
-        glue_todo_t *t = realloc(todo, ncap * sizeof(*t));
-        if (!t) {
+  if (full) {
+    atomic_fetch_add_explicit(&g_glue_walks, 1, memory_order_relaxed);
+    burst_yield_t by = BURST_YIELD_INIT;
+    for (size_t v = 0; v < snap->view_count && !oom; v++) {
+      view_snapshot_t *view = &snap->views[v];
+      rcu_aux_read_lock();
+      zdir_iter_t zit;
+      zdir_iter_init(&zit, view);
+      for (zdir_elem_t *zel; (zel = zdir_iter_next(&zit));) {
+        zone_db_entry_t *e = zdir_entry(zel);
+        if (!e || !view_owns_elem(zel)) continue;   /* a zone shared from another view is looked at in its own view */
+        burst_yield(&by);
+        if (glue_entry_stale(view, e) && !glue_todo_add(&todo, &n, &cap, e, view)) {
           oom = true;
           break;
         }
-        todo = t;
-        cap = ncap;
       }
-      todo[n].entry = e;
-      todo[n].view = view;
-      n++;
+      rcu_aux_read_unlock();
+    }
+  } else {
+    atomic_fetch_add_explicit(&g_glue_targeted, 1, memory_order_relaxed);
+    rcu_aux_read_lock();
+    for (glue_arrival_t *a = arr; a && !oom; a = a->next) {
+      view_snapshot_t *owner = snapshot_find_view(snap, a->view);
+      if (!owner) continue;                          /* (the view is gone: its zones with it) */
+      /* The views that have the new zone: the view that holds it, and every view that shares it from there by in-view (an element of its own that holds the owner's
+       * entry, or, for a database zone, a name in the view's ivdb that ends in the owner's element: zdir_find_exact() finds both).  The zone's containing zones are in each
+       * of them (B2 L2: only the owner's were looked at, and a zone of another view with a target under its own apex at the new zone kept the answers made before the
+       * zone was there).  The entry says whose it is: entry->view_name stays the owner's in a view that shares it. */
+      for (size_t v = 0; v < snap->view_count && !oom; v++) {
+        view_snapshot_t *view = &snap->views[v];
+        if (view != owner) {
+          zone_db_entry_t *se = zdir_entry(zdir_find_exact(view, a->domain));
+          if (!se || strcmp(se->view_name, owner->name) != 0) continue;     /* (not shared from the owner: a zone of the same name of its own is its own arrival) */
+        }
+        /* the zones that contain the new name: the zone for every parent of it, from the nearest up to the root */
+        for (const char *p = a->domain; *p && !oom;) {
+          const char *dot = strchr_unescaped(p, '.');
+          p = dot ? dot + 1 : p + strlen(p);
+          zdir_elem_t *zel = zdir_find_suffix(view, *p ? p : ".");
+          zone_db_entry_t *e = zdir_entry(zel);
+          /* (a containing zone that this view only shares from another is looked at in its own view: its glue is looked up there) */
+          if (e && view_owns_elem(zel) && strcmp(zdir_holder_view(view, zel), view->name) == 0 && glue_entry_stale(view, e) && !glue_todo_add(&todo, &n, &cap, e, view)) oom = true;
+        }
+      }
     }
     rcu_aux_read_unlock();
   }
+  while (arr) {
+    glue_arrival_t *nx = arr->next;
+    free(arr);
+    arr = nx;
+  }
   if (oom) atomic_store_explicit(&g_glue_dirty, true, memory_order_release); /* 次の周期でやり直す */
+  atomic_fetch_add_explicit(&g_glue_targeted_zones, n, memory_order_relaxed);
   for (size_t i = 0; i < n; i++) {
     zone_db_entry_t *e = todo[i].entry;
     /* writer は公開の前に glue を作る。その途中の arena は active ではないが、公開と
@@ -2588,6 +2784,15 @@ static bool dbreg_catalog_member_locked(const char *view, const char *name) {
     return e && e->is_catalog_member;
 }
 
+/* does the version that the entry serves have ALIAS records?  (0.7 B2: the scan of the alias thread is asked for when such an entry comes or goes) */
+static bool entry_has_alias(const zone_db_entry_t *e) {
+    const zone_version_t *v = e ? atomic_load_explicit(&e->rcu.active, memory_order_acquire) : NULL;
+    return v && v->image && (v->image->flags & ZONE_IMAGE_F_ALIAS);
+}
+
+/* an element that the alias thread may have a job for: its flag says so (set when the registry committed the entry) or the version it serves has ALIAS */
+static bool elem_has_alias(zdir_elem_t *z) { return (z->flags & ZDIR_F_ALIAS) || entry_has_alias(zdir_entry(z)); }
+
 /* what the directory keeps of a zone that the entry says: state, the flags of the image, the SOA timers */
 static void zdir_elem_sync(zdir_elem_t *z, zone_db_entry_t *entry) {
     zone_version_t *v = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
@@ -2671,7 +2876,13 @@ int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, boo
         gent = NULL;
         atomic_fetch_add_explicit(&g_dbreg_pending, w, memory_order_relaxed);
     }
+    /* 0.7 B2: a zone that is in the index (an evicted one that comes back, a replaced one) is served from the new entry as soon as the store below is done: the alias
+     * thread is asked to look again after it, not when the version was published into the entry (that was before the entry was reachable).  A zone that is
+     * not in the index yet comes with the delta (snapshot_apply_db_delta()), which looks at the ALIAS flag of the element. */
+    const bool alias_touch = created && in_index && (entry_has_alias(entry) || entry_has_alias(cur));
     if (created) atomic_store_explicit(&z->entry, entry, memory_order_release);   /* the initial reference of the entry is the registry's */
+    if (created && in_index) zone_glue_note_arrival(view, name);       /* 0.7 (B2): the zone is reachable from here: the zones that can use it as a sibling are looked at by the tick */
+    if (alias_touch) alias_notify();
     if (queue_add) {
         rv->adds[rv->n_adds++] = z;
         z->flags |= ZDIR_F_QUEUED;
@@ -3225,9 +3436,15 @@ static uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
         return 0;
     }
     e->evicted = true;                                 /* (writer_lock is held) an UPDATE that waited for the lock sees it and does not change this entry */
+    /* 0.7 B2: the IXFR differences of the zone are not served while the zone is out of memory (nor are they needed when it comes back: a new entry has none),
+     * and what they hold counts as resident; they go now, not with the entry (which waits for the garbage of a snapshot).  A transfer that holds one keeps it
+     * until it is over (reference count); writer_lock before the history's lock is the order compute_ixfr_diff() takes them in. */
+    ixfr_history_reset(e);
     atomic_fetch_add_explicit(&g_gone_queries, atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed), memory_order_relaxed);
     zone_version_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
     uint64_t bytes = (a && a->counted) ? a->bytes : 0;
+    const uint64_t fixed = bytes ? atomic_load_explicit(&e->fixed_charged, memory_order_relaxed) : 0;      /* (0.7 B1: the entry's own cost leaves memory with the version) */
+    bytes += fixed;
     /* the settings the zone's allow-query is read from while its data is out (zdir_elem_t.sh) */
     const zone_config_t *dc = atomic_load_explicit(&e->dbcfg, memory_order_acquire);
     zone_ext_shared_t *nsh = (dc && dc->ext_shared) ? (zone_ext_shared_t *)dc->ext : NULL;
@@ -3248,9 +3465,10 @@ static uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
     }
     atomic_store_explicit(&z->entry, NULL, memory_order_release);
     atomic_store_explicit(&z->state, ZDIR_ST_ABSENT, memory_order_release);
+    const bool had_alias = (z->flags & ZDIR_F_ALIAS) != 0 || (a && a->image && (a->image->flags & ZONE_IMAGE_F_ALIAS));
     if (bytes) {
         a->counted = false;
-        zone_bytes_resident_add(ZBYTES_DB, -(int64_t)bytes);
+        zone_bytes_resident_add(ZBYTES_DB, -(int64_t)bytes);       /* (the version and the entry's share; free_zone_db_entry() gives back what is in evicted_bytes) */
         zone_bytes_retired_add(ZBYTES_DB, (int64_t)bytes);
         e->evicted_bytes = bytes;
         atomic_fetch_add_explicit(&g_evict_inflight, (int64_t)bytes, memory_order_relaxed);
@@ -3268,6 +3486,9 @@ static uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
     /* 0.7 M3, debug 2: memory-limit took this zone out of memory */
     logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] zone '%s' (view '%s') taken out of memory by memory-limit: %llu bytes, %llu queries since it came in", z->name,
                rv->name, (unsigned long long)bytes, (unsigned long long)atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed));
+    /* 0.7 B2: the element is in the index with no entry from here on: the ALIAS targets of the zone are not wanted any more.  No snapshot changes now, so
+     * the scan of the alias thread is asked for here (it used to notice a new snapshot pointer). */
+    if (had_alias) alias_notify();
     void (*notify)(void) = atomic_load_explicit(&g_pending_notify, memory_order_acquire);
     if (notify) notify();                              /* the ingest thread publishes the delta (and so retires the entry) */
     return bytes ? bytes : 1;
@@ -3418,15 +3639,21 @@ bool dbreg_cache_over_high(uint64_t extra) {
 /* The zones in memory are above the hard limit: no zone is fetched for a query meanwhile.  The retired bytes are not counted: they belong to versions that were
  * replaced or taken out and are freed within a second (the control tick, the end of a batch), and a fetch that was shed for them answered its query with "not
  * ready" although the memory in use was within the limit (two UPDATEs of big zones, one after the other). */
+/* the hard line (110% of the limit; with pinned zones that fill 90% of it or more, the pinned bytes plus 10%, and then 1/10 of that on top) */
+static uint64_t cache_hard_line(uint64_t lim) {
+    uint64_t pinned_now = atomic_load_explicit(&g_cache_pinned_bytes, memory_order_relaxed);
+    if (pinned_now > lim / 10 * 9) lim = pinned_now + lim / 10;     /* the pinned zones alone fill it: leave room for the others */
+    return lim + lim / CACHE_HARD_DIV;
+}
 bool dbreg_cache_over_limit(void) {
     uint64_t lim = atomic_load_explicit(&g_cache_limit, memory_order_relaxed);
     if (!lim) return false;
     zone_bytes_t zb;
     zone_bytes_get(ZBYTES_DB, &zb);
-    uint64_t pinned_now = atomic_load_explicit(&g_cache_pinned_bytes, memory_order_relaxed);
-    if (pinned_now > lim / 10 * 9) lim = pinned_now + lim / 10;     /* the pinned zones alone fill it: leave room for the others */
-    return zb.resident > lim + lim / CACHE_HARD_DIV;
+    return zb.resident > cache_hard_line(lim);
 }
+
+static _Atomic uint64_t g_room_evicted, g_room_relaxed;      /* zones taken out on demand (dbreg_cache_make_room()), of which younger than CACHE_MIN_RESIDENT_MS */
 
 void dbreg_cache_stats(dbreg_cache_stats_t *o) {
     zone_bytes_t zb;
@@ -3448,6 +3675,8 @@ void dbreg_cache_stats(dbreg_cache_stats_t *o) {
     o->victim_freq = atomic_load_explicit(&g_victim_freq, memory_order_relaxed);
     o->pinned_bytes = atomic_load_explicit(&g_cache_pinned_bytes, memory_order_relaxed);
     o->peak = atomic_load_explicit(&g_cache_peak, memory_order_relaxed);
+    o->room_evictions = atomic_load_explicit(&g_room_evicted, memory_order_relaxed);
+    o->room_relaxed = atomic_load_explicit(&g_room_relaxed, memory_order_relaxed);
 }
 
 typedef struct {
@@ -3458,7 +3687,14 @@ typedef struct {
     uint64_t bytes;
     uint32_t freq;
     bool young;                   /* in memory for less than CACHE_MIN_RESIDENT_MS: it is not taken out yet */
+    bool relax;                   /* young, but the queries it was read for are answered (room on demand may take it out, see dbreg_cache_make_room()) */
 } cache_cand_t;
+
+/* the priority of a candidate (the lowest goes first): zones marked evict-next or no-cache first, then those a background fetch brought, then GDSF */
+static double cache_prio(uint16_t flags, uint32_t f, uint64_t bytes, bool *next) {
+    *next = (flags & (ZDIR_F_EVICT_NEXT | ZDIR_F_NOCACHE)) != 0;
+    return *next ? -2.0 : (flags & ZDIR_F_BGLOAD) ? -1.0 : ((double)f + 1.0) * (4096.0 + (double)bytes / 4.0) / (double)bytes;
+}
 
 static int cache_cand_cmp(const void *a, const void *b) {
     const cache_cand_t *x = a, *y = b;
@@ -3571,7 +3807,7 @@ uint32_t dbreg_cache_round(void) {
             zone_db_entry_t *e = zdir_entry(z);
             if (!e || e->source != ZONE_SRC_DB || e->evicted_bytes) continue;
             zone_version_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
-            uint64_t bytes = (a && a->counted) ? a->bytes : 0;
+            uint64_t bytes = (a && a->counted) ? a->bytes + atomic_load_explicit(&e->fixed_charged, memory_order_relaxed) : 0;      /* (0.7 B1: what the zone holds, the entry included) */
             /* the frequency: the queries since the last time, plus the history (the misses of the time it was out of memory are in it) */
             uint32_t q32 = (uint32_t)atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed);
             uint32_t f = atomic_load_explicit(&z->freq, memory_order_relaxed);
@@ -3600,9 +3836,8 @@ uint32_t dbreg_cache_round(void) {
             s_cand[nc].bytes = bytes;
             s_cand[nc].freq = f;
             s_cand[nc].young = now32 - z->t_load < CACHE_MIN_RESIDENT_MS;
-            s_cand[nc].next = (z->flags & (ZDIR_F_EVICT_NEXT | ZDIR_F_NOCACHE)) != 0;
-            s_cand[nc].prio = s_cand[nc].next ? -2.0 : (z->flags & ZDIR_F_BGLOAD) ? -1.0
-                                                                                : ((double)f + 1.0) * (4096.0 + (double)bytes / 4.0) / (double)bytes;
+            s_cand[nc].relax = false;
+            s_cand[nc].prio = cache_prio(z->flags, f, bytes, &s_cand[nc].next);
             nc++;
         }
         b++;
@@ -3645,6 +3880,142 @@ uint32_t dbreg_cache_round(void) {
         syslog(LOG_WARNING, "[DB] the pinned database zones (%llu bytes) alone exceed memory-limit (%llu); every zone that is not pinned is taken out of memory",
                (unsigned long long)pinned_all, (unsigned long long)limit);
     }
+    return evicted;
+}
+
+/* ---- 0.7 B2 W8: room on demand ----
+ * A query for a zone that is out of memory is never refused for the zones in memory being above the hard line (110% of the limit): the request waits in the ingest thread, which calls dbreg_cache_make_room() to take zones out of memory now (the cache manager
+ * does it every 50 ms, and not at all for zones younger than CACHE_MIN_RESIDENT_MS), and the fetch is made when there is room.  The rules that keep it from thrashing:
+ *   - the same order as the manager: zones marked evict-next first, then the lowest frequency per byte (GDSF), so the coldest go first; pinned zones and zones that a dynamic
+ *     UPDATE changed never; a zone with another state than RESIDENT (LOADING, ABSENT) is not in memory to take out (dbreg_evict_locked());
+ *   - only as much as is needed: what the hard line is exceeded by plus room for the zones that wait (their number times the average size of the zones in memory), never
+ *     below the manager's low mark (90%), so a burst of waiting requests cannot empty the cache;
+ *   - the minimum residency is kept for every zone that is not needed: a zone younger than CACHE_MIN_RESIDENT_MS is taken only when the older ones do not cover what is needed
+ *     (a second pass), and only when its queries have been answered (the entry has counted one, so nobody is still parked or woken for it: a parked query waits for a zone
+ *     that is out of memory, and a woken one is answered within a turn of the worker's loop) and it has been in memory CACHE_ROOM_FLOOR_MS; a zone that has served nobody yet
+ *     is never taken before its minimum residency is over.
+ * The scan is read-only for the frequency counters (the manager folds them in), in slices of CACHE_SCAN_MAX from where the last call stopped, at most CACHE_ROOM_SLICES a call. */
+#define CACHE_ROOM_FLOOR_MS 10
+#define CACHE_ROOM_SLICES 4
+static size_t g_room_v, g_room_b;                  /* where the next call starts (the ingest thread's) */
+static cache_cand_t *s_room_cand;
+static size_t s_room_cap;
+
+/* one pass over the sorted candidates: the old ones, or (relaxed) the young ones that may go, until `want` is freed */
+static void room_take_pass(const cache_cand_t *cand, size_t nc, bool relaxed, uint64_t want, uint64_t *freed, uint32_t *evicted, uint32_t *nrelaxed, uint32_t *boundary,
+                           bool *took_unflagged) {
+    for (size_t i = 0; i < nc && *freed < want; i++) {
+        const cache_cand_t *c = &cand[i];
+        if (relaxed ? !(c->young && c->relax) : c->young) continue;
+        if (!dbreg_evict_locked(c->rv, c->z)) continue;
+        *freed += c->bytes;
+        (*evicted)++;
+        if (relaxed) (*nrelaxed)++;
+        if (!c->next) {
+            *took_unflagged = true;
+            if (c->freq > *boundary) *boundary = c->freq;
+        }
+    }
+}
+
+#ifdef KARIDNS_UNIT_TEST
+static _Atomic bool g_room_paused;                        /* a test makes the room on demand do nothing (the request has to wait) */
+void dbreg_cache_test_room_pause(bool on) { atomic_store_explicit(&g_room_paused, on, memory_order_relaxed); }
+#endif
+
+uint32_t dbreg_cache_make_room(uint32_t nwant, uint32_t *relaxed_out) {
+    uint32_t evicted = 0, nrelaxed = 0;
+    if (relaxed_out) *relaxed_out = 0;
+#ifdef KARIDNS_UNIT_TEST
+    if (atomic_load_explicit(&g_room_paused, memory_order_relaxed)) return 0;
+#endif
+    const uint64_t limit = atomic_load_explicit(&g_cache_limit, memory_order_relaxed);
+    if (!limit) return 0;
+    if (nwant == 0) nwant = 1;
+    uint32_t boundary = 0;
+    bool took_unflagged = false;
+    for (int slice = 0; slice < CACHE_ROOM_SLICES; slice++) {
+        int64_t now = cache_mono_ms();
+        uint32_t now32 = (uint32_t)now;
+        size_t nc = 0, visited = 0;
+        uint64_t sumb = 0, nres = 0;
+        bool wrapped = false;
+        pthread_mutex_lock(&g_zone_db_rebuild_lock);
+        if (g_dbreg_nviews == 0) {
+            pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+            break;
+        }
+        if (g_room_v >= g_dbreg_nviews) g_room_v = g_room_b = 0;
+        size_t v = g_room_v, b = g_room_b;
+        while (visited < CACHE_SCAN_MAX) {
+            if (v >= g_dbreg_nviews) {                          /* the end of the registry: the next call starts again */
+                v = b = 0;
+                wrapped = true;
+                break;
+            }
+            dbreg_view_t *rv = &g_dbreg_views[v];
+            if (b >= rv->nb) {
+                v++;
+                b = 0;
+                continue;
+            }
+            for (dbreg_zone_t *z = rv->tab[b]; z; z = z->next) {
+                visited++;
+                zone_db_entry_t *e = zdir_entry(z);
+                if (!e || e->source != ZONE_SRC_DB || e->evicted_bytes) continue;
+                zone_version_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
+                uint64_t bytes = (a && a->counted) ? a->bytes + atomic_load_explicit(&e->fixed_charged, memory_order_relaxed) : 0;
+                if (bytes == 0 || (z->flags & ZDIR_F_PIN) || atomic_load_explicit(&e->updated, memory_order_relaxed)) continue;
+                sumb += bytes;
+                nres++;
+                if (nc == s_room_cap) {
+                    size_t ncap = s_room_cap ? s_room_cap * 2 : 1024;
+                    cache_cand_t *n = realloc(s_room_cand, ncap * sizeof(*n));
+                    if (!n) continue;                           /* out of memory: take out what has been found */
+                    s_room_cand = n;
+                    s_room_cap = ncap;
+                }
+                /* the frequency the manager would have folded in by now (read-only: the manager's own pass does the folding and clears the marks) */
+                uint32_t q32 = (uint32_t)atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed);
+                uint32_t f = atomic_load_explicit(&z->freq, memory_order_relaxed);
+                uint32_t dq = q32 - z->qseen;
+                f = f > UINT32_MAX - dq ? UINT32_MAX : f + dq;
+                uint16_t fl = z->flags;
+                if ((fl & (ZDIR_F_XFRLOAD | ZDIR_F_BGLOAD)) && dq > 0) fl &= (uint16_t)~(ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD | ZDIR_F_BGLOAD);
+                const uint32_t age = now32 - z->t_load;
+                cache_cand_t *c = &s_room_cand[nc++];
+                c->rv = rv;
+                c->z = z;
+                c->bytes = bytes;
+                c->freq = f;
+                c->young = age < CACHE_MIN_RESIDENT_MS;
+                c->relax = c->young && age >= CACHE_ROOM_FLOOR_MS && atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed) != 0;
+                c->prio = cache_prio(fl, f, bytes, &c->next);
+            }
+            b++;
+        }
+        g_room_v = v;
+        g_room_b = b;
+        zone_bytes_t zb;
+        zone_bytes_get(ZBYTES_DB, &zb);
+        const uint64_t hard = cache_hard_line(limit), low = limit / 100 * CACHE_LOW_PCT;
+        const uint64_t room_for = (nres ? sumb / nres : 0) * nwant;                       /* the zones that wait: their number times the average size of a zone in memory */
+        uint64_t want = zb.resident + room_for > hard ? zb.resident + room_for - hard : 0;
+        const uint64_t cap = zb.resident > low ? zb.resident - low : 0;
+        if (want > cap) want = cap;                                                        /* (never below what the manager takes it to) */
+        uint64_t freed = 0;
+        if (want && nc) {
+            if (nc > 1) qsort(s_room_cand, nc, sizeof(*s_room_cand), cache_cand_cmp);
+            room_take_pass(s_room_cand, nc, false, want, &freed, &evicted, &nrelaxed, &boundary, &took_unflagged);
+            if (freed < want) room_take_pass(s_room_cand, nc, true, want, &freed, &evicted, &nrelaxed, &boundary, &took_unflagged);
+        }
+        pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+        if (freed >= want || wrapped) break;
+    }
+    if (took_unflagged) atomic_store_explicit(&g_victim_freq, boundary, memory_order_relaxed);
+    if (evicted) atomic_fetch_add_explicit(&g_room_evicted, evicted, memory_order_relaxed);
+    if (nrelaxed) atomic_fetch_add_explicit(&g_room_relaxed, nrelaxed, memory_order_relaxed);
+    if (relaxed_out) *relaxed_out = nrelaxed;
     return evicted;
 }
 
@@ -3996,6 +4367,7 @@ typedef struct {
     struct dplan_hide { zdir_elem_t *z; uint8_t by; } *hide;   /* registry elements that an element already in the index hides (D17-1, D-PRIO) */
     size_t nhide, caphide;
     const char *vname;                  /* the view (for the log) */
+    bool alias_touch;                   /* set by dplan_apply(): an element that carries ALIAS records goes in or out of the index (0.7 B2) */
 } dplan_t;
 
 static void dplan_free(dplan_t *p) {
@@ -4035,9 +4407,11 @@ static void dplan_apply(dplan_t *p) {
     }
     for (size_t i = 0; i < p->nadd; i++) {
         zdir_elem_t *old = zdir_insert(d, p->add[i]);
+        if (elem_has_alias(p->add[i]) || (old && elem_has_alias(old))) p->alias_touch = true;
         if (old && zdir_goes_to_garbage(old)) garb_elem(&g_garb, old);
     }
     for (size_t i = 0; i < p->nrem; i++) {
+        if (elem_has_alias(p->rem[i])) p->alias_touch = true;
         (void)zdir_remove(d, p->rem[i]);
         if (zdir_goes_to_garbage(p->rem[i])) garb_elem(&g_garb, p->rem[i]);
     }
@@ -4187,6 +4561,7 @@ int snapshot_apply_db_delta(void) {
     }
     /* nothing can fail from here on */
     int changes = 0;
+    bool alias_touch = false;
     for (size_t v = 0; v < old_snap->view_count; v++) {
         dplan_t *p = &plans[v];
         if (!p->dir) continue;
@@ -4194,8 +4569,11 @@ int snapshot_apply_db_delta(void) {
         /* a zone that leaves publishes nothing, so the zones whose glue came from it are told here: their cached
          * responses would keep the addresses of a zone that is gone (zone_glue_refresh_dependents() of the tick) */
         if (rv->n_removes > 0 || p->nrem > 0) atomic_store_explicit(&g_glue_dirty, true, memory_order_release);
+        for (size_t i = 0; i < p->nadd; i++)                       /* the zones that come into the index with this delta (an element with data: a zone that is out of memory has no glue to give) */
+            if (zdir_entry(p->add[i])) zone_glue_note_arrival(ns->views[v].name, p->add[i]->name);
         changes += (int)(p->nrem + p->nadd + p->repl_changes);
         dplan_apply(p);
+        alias_touch = alias_touch || p->alias_touch;
         dplan_free(p);
     }
     free(plans);
@@ -4204,6 +4582,9 @@ int snapshot_apply_db_delta(void) {
     dbreg_pending_drop_locked();
     gc_retire_locked(old_snap);
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    /* 0.7 B2: a zone with ALIAS records came into the index or left it, and the snapshot that says so is published: the alias thread looks again.  A delta of
+     * zones without ALIAS (a warm-up of a million database zones) asks for no scan. */
+    if (alias_touch) alias_notify();
 
     gc_start_pending();
     return changes;
@@ -4505,6 +4886,8 @@ zone_config_t *db_zone_config_new_kind(const char *domain, zone_ext_shared_t *sh
         free_zone_config(c);
         return NULL;
     }
+    /* what the allocator holds for the block and its two strings: what memory-limit counts for it (zone_entry_fixed_now()); the settings the zone shares are not in it */
+    c->alloc_bytes = (uint32_t)(dns_alloc_size(c, sizeof(*c)) + dns_alloc_size(c->domain, strlen(c->domain) + 1) + dns_alloc_size(c->type, strlen(c->type) + 1));
     if (shared) {                                   /* interned settings: this zone holds one reference */
         c->ext = &zone_ext_shared_ref(shared)->ext;
         c->ext_shared = true;
@@ -4543,11 +4926,14 @@ static void rx_merge_locked(zone_db_entry_t *entry, server_config_t *cfg) {
     const zone_config_t *base = entry->source == ZONE_SRC_DB ? atomic_load_explicit(&entry->dbcfg, memory_order_acquire)
                                                               : find_zone_config_in_view(cfg, entry->view_name, entry->domain);
     zone_config_t *nc = NULL;
-    entry->rx_note[0] = '\0';
+    char note[160];                  /* (0.7 B2: the note is kept in a block of its own, and only when there is one) */
+    note[0] = '\0';
     if (entry->rx_sh && !(base && zext(base)->primary_settings_off)) {
-        nc = zone_config_with_received_in_view(entry->domain, entry->view_name, base, &entry->rx_sh->ext, cfg, entry->rx_note, sizeof(entry->rx_note));
+        nc = zone_config_with_received_in_view(entry->domain, entry->view_name, base, &entry->rx_sh->ext, cfg, note, sizeof(note));
         if (!nc) syslog(LOG_ERR, "[AXFR] zone '%s': out of memory applying the settings received from the primary; they are not in force", entry->domain);
     }
+    free(entry->rx_note);
+    entry->rx_note = note[0] ? strdup(note) : NULL;
     entry->rx_base = base;
     entry->rx_gen = cfg->generation;
     const zone_config_t *old = atomic_load_explicit(&entry->rxcfg, memory_order_relaxed);
@@ -4581,7 +4967,7 @@ zone_ext_shared_t *zone_rx_settings_apply_locked(zone_db_entry_t *entry, zone_ex
         release_config_snapshot(cfg);
     }
     rcu_aux_read_unlock();
-    if (sh && entry->rx_note[0])
+    if (sh && entry->rx_note && entry->rx_note[0])
         syslog(LOG_WARNING, "[AXFR] zone '%s': settings received from the primary: %s", entry->domain, entry->rx_note);
     return old;
 }
@@ -4606,7 +4992,7 @@ bool zone_rx_settings_status(zone_db_entry_t *entry, char *note, size_t cap) {
     if (note && cap) {
         note[0] = '\0';
         if (on && pthread_mutex_trylock(&entry->writer_lock) == 0) {
-            snprintf(note, cap, "%s", entry->rx_note);
+            snprintf(note, cap, "%s", entry->rx_note ? entry->rx_note : "");
             pthread_mutex_unlock(&entry->writer_lock);
         }
     }
@@ -5644,6 +6030,12 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         gc_retire_locked(old_snap);
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+
+    /* 0.7 B2: the set of zones (the configured ones that came or went, the catalog members, the zones shared by in-view) is what the new snapshot says from here on.
+     * The notice of zone_publish_ex() for a zone file that was read while the snapshot was built came before this publish, and a zone that left published
+     * nothing; the alias thread is asked after the publish, so that its scan sees the snapshot.  A rebuild is a reconfiguration or a catalog change, not a
+     * per-zone event, so the scan is asked for without looking for ALIAS records first. */
+    alias_notify();
 
     if (old_snap) gc_start_pending();
 

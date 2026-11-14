@@ -219,6 +219,18 @@ fx db.settings.zone db "$T/f.conf"
 fx db.protocol.settings db "$T/f.conf"
 printf 'options {\n  user "%s";\n  database { driver sqlite3; database-file "%s/x.db"; loader-user "%s"; loader-path "%s/fake"; };\n};\nview "a" { database none; match-clients { any; }; };\n' "$LU" "$DBD" "$LU" "$DBD" > "$T/none.conf"
 fx db.nothing db "$T/none.conf"
+# 0.7 P-F: the loader's M line (1000 zones, 1,000,000 records: about 104 MB of zone data) against memory-limit: all fit, 58%, 29%, less than the reads in flight
+cat > "$DBD/fakem" <<'EOFAKE'
+#!/bin/sh
+case "$1" in --drivers) echo sqlite3; exit 0;; esac
+printf 'Z\tok.test.\t1\tprimary\t*\n'
+printf 'M\t1000\t1000000\n'
+printf 'R\t1\t0\t0\n'
+EOFAKE
+chmod 755 "$DBD/fakem"; [ $IS_ROOT = 1 ] && chown 0:0 "$DBD/fakem"
+dbconf 'memory-limit 64m;' "$DBD/fakem"; fx db.memory.estimate db "$T/f.conf"; fx db.memory.limit-below-all db "$T/f.conf"
+dbconf 'memory-limit 32m;' "$DBD/fakem"; fx db.memory.limit-low db "$T/f.conf"
+dbconf 'memory-limit 1m;' "$DBD/fakem"; fx db.memory.limit-tiny db "$T/f.conf"
 
 # only a run by root prints these (the loader is never run as root; the user is looked up first)
 if [ $IS_ROOT = 1 ]; then

@@ -248,7 +248,7 @@ static void gr_setup(const char *origin, const char *zone_text) {
     assert(buf != NULL);
     assert(parse_zone_fast(buf, strlen(buf), &g_gr.arena, &ctx) >= 0);
     assert(test_build_index(&g_gr.arena, true) == 0);
-    strncpy(g_gr.entry.domain, origin, sizeof(g_gr.entry.domain) - 1);
+    g_gr.entry.domain = origin;
     atomic_store_explicit(&g_gr.entry.rcu.active, &g_gr.arena.ver, memory_order_release);
     g_gr.entries[0] = &g_gr.entry;
     g_gr.acl[0] = (char *)"any";
@@ -672,7 +672,7 @@ static void test_notify_catalog_member(void) {
     gr_setup("member.example.", ZONE_TXT);
     g_gr.cfg = *cfg;
     g_gr.view.name = "__default__";
-    strncpy(g_gr.cat_entry.domain, "catalog.example.", sizeof(g_gr.cat_entry.domain) - 1);
+    g_gr.cat_entry.domain = "catalog.example.";
     g_gr.cat_entry.is_secondary = true;
     g_gr.entries[1] = &g_gr.cat_entry;
     view_set_entries(&g_gr.view, g_gr.entries, 2);
@@ -697,7 +697,7 @@ static void test_notify_catalog_member(void) {
     gr_setup("member.example.", ZONE_TXT);
     g_gr.cfg = *cfg;
     g_gr.view.name = "__default__";
-    strncpy(g_gr.cat_entry.domain, "catalog.example.", sizeof(g_gr.cat_entry.domain) - 1);
+    g_gr.cat_entry.domain = "catalog.example.";
     g_gr.entries[1] = &g_gr.cat_entry;
     view_set_entries(&g_gr.view, g_gr.entries, 2);
     g_gr.entry.is_catalog_member = true;
@@ -727,7 +727,7 @@ static void test_notify_catalog_member(void) {
     gr_setup("member.example.", ZONE_TXT);
     g_gr.cfg = *cfg;
     g_gr.view.name = "__default__";
-    strncpy(g_gr.cat_entry.domain, "catalog.example.", sizeof(g_gr.cat_entry.domain) - 1);
+    g_gr.cat_entry.domain = "catalog.example.";
     g_gr.entries[1] = &g_gr.cat_entry;
     view_set_entries(&g_gr.view, g_gr.entries, 2);
     g_gr.entry.is_catalog_member = true;
@@ -873,7 +873,7 @@ static void test_notify_server_stmt_key(void) {
     gr_setup("member.example.", ZONE_TXT);
     g_gr.cfg = *cfg;
     g_gr.view.name = "__default__";
-    strncpy(g_gr.cat_entry.domain, "catalog.example.", sizeof(g_gr.cat_entry.domain) - 1);
+    g_gr.cat_entry.domain = "catalog.example.";
     g_gr.cat_entry.is_secondary = true;
     g_gr.entries[1] = &g_gr.cat_entry;
     view_set_entries(&g_gr.view, g_gr.entries, 2);
@@ -1047,8 +1047,8 @@ static void test_sibling_zone_additional_glue_and_limits(void) {
     zone_db_entry_t entry_prim, entry_sib;
     memset(&entry_prim, 0, sizeof(entry_prim));
     memset(&entry_sib, 0, sizeof(entry_sib));
-    strlcpy(entry_prim.domain, "prim.example.", sizeof(entry_prim.domain));
-    strlcpy(entry_sib.domain, "sib.example.", sizeof(entry_sib.domain));
+    entry_prim.domain = "prim.example.";
+    entry_sib.domain = "sib.example.";
     atomic_store_explicit(&entry_prim.rcu.active, &arena_prim.ver, memory_order_release);
     atomic_store_explicit(&entry_sib.rcu.active, &arena_sib.ver, memory_order_release);
 
@@ -1505,7 +1505,7 @@ static void test_in_view_db_names(void) {
     /* a name of the view's own directory wins and is the view's own */
     zone_db_entry_t *other[1] = { &g_gr.cat_entry };
     memset(&g_gr.cat_entry, 0, sizeof(g_gr.cat_entry));
-    strncpy(g_gr.cat_entry.domain, "sub.example.", sizeof(g_gr.cat_entry.domain) - 1);
+    g_gr.cat_entry.domain = "sub.example.";
     atomic_store_explicit(&g_gr.cat_entry.rcu.active, &g_gr.arena.ver, memory_order_release);
     assert(view_set_entries(&views[0], other, 1));
     zdir_elem_t *own = zdir_find_suffix(&views[0], "www.sub.example.");

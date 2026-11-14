@@ -14,6 +14,9 @@
  *   - the time is up: SERVFAIL with Extended DNS Error 14 (RFC 8914 4.15), the question kept; so is a failed fetch (answered at once), a full
  *     park table, a request too big to park and a worker that has no park table
  *   - the request log and the dnstap query event of a parked request are written once (not again when it comes back)
+ *   - 0.7 P-B, the gate: with memory-limit a first query for a zone out of memory marks the zone as claimed before it parks and asks (the request carries
+ *     PARK_PRIO_CLAIMED); it is never refused for the lack of a place, a token or room (the ingest thread keeps the request waiting); the park table or the ring being
+ *     full clears the mark; a zone that is LOADING, an ERROR zone and a server without memory-limit are not claimed
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -27,6 +30,7 @@
 #include <stdbool.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <time.h>
 #include <syslog.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -854,6 +858,178 @@ int main(void) {
         atomic_store(&el->state, ZDIR_ST_ABSENT);
         unlink(xz);
         unlink(oz);
+    }
+
+    /* -- 0.7 P-B: the worker's gate.  With memory-limit set (dbreg_cache_limit() != 0) a query that is the first for a zone that is out of memory marks the zone as claimed
+     *    (fetch_gate(), the UDP path of udp_one()) and parks and asks with PARK_PRIO_CLAIMED.  It is never refused for fetch-concurrency, fetch-rate or the memory limit: the
+     *    ingest thread keeps the request waiting.  Every way out of udp_park() that does not end in a request on the ring clears the mark. */
+    {
+        printf("[the gate of the worker]\n");
+        park_stats_t g0, g1;
+        #define RNOW() ({ struct timespec ts_; clock_gettime(CLOCK_MONOTONIC, &ts_); (int64_t)ts_.tv_sec * 1000 + ts_.tv_nsec / 1000000; })
+        dbreg_cache_set_limit(1ull << 40);                                  /* (a limit that the zones in memory do not reach) */
+        park_places_set_limit(2);
+        park_rate_set(0);
+        park_rate_reset();
+        atomic_store(&el->entry, NULL);
+        atomic_store(&el->state, ZDIR_ST_ABSENT);
+        while (park_fetch_pop(park_fetch_ring(0), &q)) {}
+        CHECK(park_places_used() == 0 && table.nwait == 0 && table.nfree == table.cap);
+        const uint64_t key = park_claim_key("default", "park.test.");
+
+        /* the first query marks the zone and asks with the claim; a second for the same zone asks for nothing; neither takes a place or a token (the ingest thread does) */
+        park_stats_get(&g0);
+        SEND_QUERY(0x9001, true, 0);
+        CHECK(w.n_tx == 0 && table.nwait == 1 && park_places_used() == 0 && park_claim_held(key));
+        CHECK(park_fetch_pop(park_fetch_ring(0), &q) && (q.prio & PARK_PRIO_CLAIMED) && (q.prio & 0x7F) == KDB_FETCH_PRIO_QUERY && q.mode == KDB_FETCH_FULL);
+        SEND_QUERY(0x9002, true, 0);
+        CHECK(w.n_tx == 0 && table.nwait == 2 && park_places_used() == 0 && !park_fetch_pop(park_fetch_ring(0), &q));
+        /* the ingest thread (the test) clears the claim mark when it is done with the request, and wakes the queries */
+        park_claim_clear(key);
+        CHECK(park_wake_push(park_wake_ring(0), "default", "park.test.", true));
+        park_service(&w, -1);
+        FLUSH();
+        a = read_answer(sk[1]);
+        CHECK(a.got && a.rcode == 2 && a.ede == 14);
+        a = read_answer(sk[1]);
+        CHECK(a.got && a.rcode == 2 && a.ede == 14 && table.nwait == 0 && park_places_used() == 0);
+        park_stats_get(&g1);
+        CHECK(g1.full == g0.full && g1.ring_dropped == g0.ring_dropped);
+
+        /* every place is taken (by fetches in flight) and the bucket is empty: the query is not refused, it parks and asks as any other (the request waits in the ingest thread) */
+        CHECK(park_place_take() && park_place_take() && !park_place_avail());
+        park_rate_set(1);
+        park_rate_reset();
+        CHECK(park_rate_take(RNOW(), false));
+        SEND_QUERY(0x9101, true, 0);
+        CHECK(w.n_tx == 0 && table.nwait == 1 && park_places_used() == 2 && park_claim_held(key));
+        CHECK(park_fetch_pop(park_fetch_ring(0), &q) && (q.prio & PARK_PRIO_CLAIMED) && (q.prio & 0x7F) == KDB_FETCH_PRIO_QUERY);
+        CHECK(!park_rate_check(RNOW(), false));                              /* (the bucket was not touched) */
+        park_claim_clear(key);
+        (void)park_fail(&table, "default", "park.test.");
+        {
+            uint32_t cur = 0;
+            park_entry_t *pe;
+            while ((pe = park_next_done(&table, &cur))) park_release(&table, pe);
+        }
+        park_place_give();
+        park_place_give();
+        park_rate_set(0);
+        park_rate_reset();
+
+        /* the park table is full: the query is answered "not ready" (true overload), the mark goes back */
+        {
+            udp_ipc_t fi;
+            memset(&fi, 0, sizeof(fi));
+            uint8_t fp[32];
+            memset(fp, 0, sizeof(fp));
+            char fz[32];
+            for (uint32_t i = 0; i < table.cap; i++) {
+                snprintf(fz, sizeof(fz), "filler%u.test.", i);
+                CHECK(park_udp(&table, 1, 100000, "default", fz, sk[0], &fi, fp, 20) >= 0);
+            }
+            SEND_QUERY(0x9201, true, 0);
+            CHECK(w.n_tx == 1 && table.nfree == 0 && !park_fetch_pop(park_fetch_ring(0), &q) && park_places_used() == 0 && !park_claim_held(key));
+            FLUSH();
+            a = read_answer(sk[1]);
+            CHECK(a.got && a.id == 0x9201 && a.rcode == 2 && a.ede == 14);
+            for (uint32_t i = 0; i < table.cap; i++) {
+                snprintf(fz, sizeof(fz), "filler%u.test.", i);
+                (void)park_fail(&table, "default", fz);
+            }
+            uint32_t cur = 0;
+            park_entry_t *pe;
+            while ((pe = park_next_done(&table, &cur))) park_release(&table, pe);
+            CHECK(table.nfree == table.cap);
+        }
+
+        /* the ring to the ingest thread is full: the park entry goes back, the mark is cleared (the query is answered "not ready" at once) */
+        while (park_fetch_push(park_fetch_ring(0), "default", "other.test.", KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_SUMMARY)) {}
+        park_stats_get(&g0);
+        SEND_QUERY(0x9301, true, 0);
+        CHECK(w.n_tx == 1 && table.nwait == 0 && table.nfree == table.cap && park_places_used() == 0 && !park_claim_held(key));
+        park_stats_get(&g1);
+        CHECK(g1.ring_dropped - g0.ring_dropped == 1);
+        FLUSH();
+        a = read_answer(sk[1]);
+        CHECK(a.got && a.id == 0x9301 && a.rcode == 2 && a.ede == 14);
+        while (park_fetch_pop(park_fetch_ring(0), &q)) {}
+
+        /* the zone is LOADING (a fetch is on its way): no claim, and the query parks and asks the old way (the request is a duplicate for the ingest thread, and
+         * a zone that arrived meanwhile is woken: no wake-up is lost) */
+        atomic_store(&el->state, ZDIR_ST_LOADING);
+        SEND_QUERY(0x9501, true, 0);
+        CHECK(w.n_tx == 0 && table.nwait == 1 && park_places_used() == 0 && !park_claim_held(key));
+        CHECK(park_fetch_pop(park_fetch_ring(0), &q) && !(q.prio & PARK_PRIO_CLAIMED) && q.prio == KDB_FETCH_PRIO_QUERY);
+        (void)park_fail(&table, "default", "park.test.");
+        {
+            uint32_t cur = 0;
+            park_entry_t *pe;
+            while ((pe = park_next_done(&table, &cur))) park_release(&table, pe);
+        }
+        atomic_store(&el->state, ZDIR_ST_ABSENT);
+
+        /* no memory-limit: no claim at all (nothing is queued, the ingest thread's old way) */
+        dbreg_cache_set_limit(0);
+        SEND_QUERY(0x9601, true, 0);
+        CHECK(w.n_tx == 0 && table.nwait == 1 && park_fetch_pop(park_fetch_ring(0), &q) && !(q.prio & PARK_PRIO_CLAIMED) && !park_claim_held(key));
+        (void)park_fail(&table, "default", "park.test.");
+        {
+            uint32_t cur = 0;
+            park_entry_t *pe;
+            while ((pe = park_next_done(&table, &cur))) park_release(&table, pe);
+        }
+
+        /* fetch_gate() itself: the zone out of memory is ABSENT; the results */
+        dbreg_cache_set_limit(1ull << 40);
+        CHECK(fetch_gate("default", el) == FETCH_GATE_TAKEN && park_claim_held(key) && park_places_used() == 0);
+        park_claim_release("default", el->name);
+        CHECK(!park_claim_held(key));
+        atomic_store(&el->state, ZDIR_ST_ERROR);
+        CHECK(fetch_gate("default", el) == FETCH_GATE_ASK && !park_claim_held(key));   /* (ERROR: the ingest thread answers it) */
+        atomic_store(&el->state, ZDIR_ST_ABSENT);
+        /* (B2 M1) the zone is claimed: the next worker asks without a claim, whatever the places say (the pool is full: still not a refusal); the claim of another view is a claim
+         * of another zone; when the claim is released the next worker takes it */
+        CHECK(fetch_gate("default", el) == FETCH_GATE_TAKEN);
+        CHECK(fetch_gate("default", el) == FETCH_GATE_ASK && fetch_gate("default", el) == FETCH_GATE_ASK);
+        CHECK(park_place_take() && park_place_take());
+        CHECK(fetch_gate("default", el) == FETCH_GATE_ASK);
+        CHECK(fetch_gate("other", el) == FETCH_GATE_TAKEN);                  /* (a zone of another view is not claimed; the full pool is no reason to refuse) */
+        park_place_give();
+        park_place_give();
+        park_claim_release("other", el->name);
+        park_claim_release("default", el->name);
+        CHECK(park_places_used() == 0 && !park_claim_held(key));
+
+        /* the database zones are over the hard limit (the test adds bytes to the database total: 1,000,000 against a limit of 100,000): the query is not refused, it is claimed,
+         * parks and asks (the ingest thread makes room); the old refusal is gone */
+        {
+            park_places_set_limit(2);
+            zone_bytes_resident_add(ZBYTES_DB, 1000000);
+            dbreg_cache_set_limit(100000);
+            CHECK(dbreg_cache_over_limit());
+            CHECK(fetch_gate("default", el) == FETCH_GATE_TAKEN && park_claim_held(key));
+            park_claim_release("default", el->name);
+            SEND_QUERY(0xA002, true, 0);                                    /* (parked, one request with the claim, no answer now) */
+            CHECK(w.n_tx == 0 && table.nwait == 1 && park_places_used() == 0 && park_claim_held(key));
+            CHECK(park_fetch_pop(park_fetch_ring(0), &q) && (q.prio & PARK_PRIO_CLAIMED) && (q.prio & 0x7F) == KDB_FETCH_PRIO_QUERY && q.mode == KDB_FETCH_FULL);
+            /* the ingest thread could not make room before the deadline: the query times out like any parked query (SERVFAIL + EDE 14) */
+            park_claim_clear(key);
+            CHECK(park_expire(&table, RNOW() + 100000) == 1);
+            park_service(&w, -1);
+            FLUSH();
+            a = read_answer(sk[1]);
+            CHECK(a.got && a.id == 0xA002 && a.rcode == 2 && a.ede == 14 && table.nwait == 0 && table.nfree == table.cap && park_places_used() == 0);
+            zone_bytes_resident_add(ZBYTES_DB, -1000000);
+            park_places_set_limit(1);
+        }
+
+        dbreg_cache_set_limit(0);
+        park_places_set_limit(INT32_MAX);
+        park_rate_set(0);
+        park_rate_reset();
+        while (park_fetch_pop(park_fetch_ring(0), &q)) {}
+        CHECK(table.nwait == 0 && table.nready == 0 && table.nfree == table.cap);
     }
 
     /* -- nothing is parked and nobody said anything: park_service() returns at once (and with a key in the ring it does look) */

@@ -450,36 +450,52 @@ typedef enum {
   ZONE_SRC_DB,         /* データベースから取り込んだゾーン */
 } zone_source_t;
 
+/* 0.7 (B2): the fields are grouped by size, so that the one-octet flags and the 32-bit values share words instead of each leaving the padding of a
+ * 64-bit field behind it: the entry is 584 octets, was 1032.  With the name behind it, a database zone's entry fits the allocator's 640-octet class (jemalloc's
+ * next one below the old size is 1024 and the entry was in the 1280 class). */
 typedef struct zone_db_entry_s {
-  char domain[256];
+  /* The apex, FQDN with the trailing dot.  0.7 (B2): not an array of 256 octets in every entry (a database zone's name is about 20): create_new_zone_entry()
+   * puts the text behind the struct in the same block (the name never changes), and a test that keeps an entry on its stack points it at a string of its own. */
+  const char *domain;
   char view_name[KARIDNS_VIEW_NAME_MAX];
   zone_kind_t kind;
+  uint8_t source; /* zone_source_t: どこから来たゾーンか。作成時に決まり、変わらない */
+  bool is_catalog_member;
+  bool is_secondary;
+  bool evicted;                   /* the zone was taken out of memory (set under writer_lock): a writer that waited for the lock must not change this entry, the change would be lost */
+  _Atomic bool refresh_now;
+  _Atomic bool notify_now;
+  _Atomic bool is_transferring;
+  _Atomic bool updated;           /* (written under writer_lock; the cache manager's scan and dbstatus read it without: relaxed loads) a dynamic UPDATE changed this DB zone since it was read from the database (set under writer_lock): it is not taken out of memory, the change would be lost; the next install from the database clears it */
+  _Atomic bool rx_present;        /* rx_sh != NULL (read without the lock by the control thread's tick) */
+  /* 他のゾーンがこのゾーンの名前をグルーに使っている (prelink が印を付ける)。公開時に
+   * 制御スレッドへ依存するゾーンのグルーの作り直しを頼む */
+  _Atomic bool glue_provider;
+  _Atomic bool rolled_back;       /* the served version is the result of a rollback; cleared by the next publication */
+  bool prev_linked;               /* (belongs to g_prev_lock: see prev below) */
+  uint8_t xfr_ext_state;          /* B8t-2: what the primary speaks (XFR_EXT_*, dns_axfr_ixfr.h); written by the transfer thread only */
+  uint32_t block_bytes;           /* 0.7 (B1): the size of the block create_new_zone_entry() got from the allocator (0: the entry is not from there); never changes */
   zone_rcu_t rcu;
   pthread_mutex_t writer_lock;
   _Atomic(uint32_t) serial;
   _Atomic(uint32_t) refresh;
   _Atomic(uint32_t) retry;
   _Atomic(uint32_t) expire;
-  _Atomic(time_t) next_check;
-  _Atomic bool refresh_now;
-  _Atomic bool notify_now;
-  time_t notify_next;             /* notify-delay: the time before which the next set of NOTIFY messages for the zone is not sent (the control thread only) */
-  _Atomic bool is_transferring;
   _Atomic(int) active_axfr;
   _Atomic int snapshot_refs;
-  ixfr_history_t ixfr_history;
+  int catalog_member_count;
+  int group_count;
+  _Atomic uint32_t fixed_charged; /* 0.7 (B1): what the entry itself costs (zone_entry_fixed_now()), counted in the zone memory totals with the first version that is resident (zone_publish_ex()) and given back when the entry is freed, or, evicted, moved to the retired total with the version (the writer's: the cache manager reads it) */
+  _Atomic uint32_t prev_serial;
+  _Atomic uint32_t rb_serial, rb_from;
+  _Atomic(time_t) next_check;
+  time_t notify_next;             /* notify-delay: the time before which the next set of NOTIFY messages for the zone is not sent (the control thread only) */
   size_t evicted_bytes;           /* D1a step 5: the bytes of the version served that were moved to the retired total when the zone was evicted (0: not evicted) */
-  bool evicted;                   /* the zone was taken out of memory (set under writer_lock): a writer that waited for the lock must not change this entry, the change would be lost */
-  _Atomic bool updated;           /* (written under writer_lock; the cache manager's scan and dbstatus read it without: relaxed loads) a dynamic UPDATE changed this DB zone since it was read from the database (set under writer_lock): it is not taken out of memory, the change would be lost; the next install from the database clears it */
+  ixfr_history_t ixfr_history;
   zone_observatory_t observatory;
   catalog_member_id_t *catalog_members;
-  int catalog_member_count;
-  bool is_catalog_member;
-  bool is_secondary;
-  uint8_t source; /* zone_source_t: どこから来たゾーンか。作成時に決まり、変わらない */
   char *catalog_member_unique_id; /* S5: malloc。カタログのメンバーでなければ NULL (読むときは zone_entry_catalog_uid) */
   char **groups;
-  int group_count;
   catalog_master_t *catalog_master; /* B-3: malloc, catalog members only (primary and TSIG key of the catalog zone) */
   char *owning_catalog_domain;    /* S5: malloc。同上 (読むときは zone_entry_catalog_owner) */
   /* source == ZONE_SRC_DB のゾーンの設定 (それ以外は NULL)。読むのは zone_entry_config() だけ。
@@ -489,14 +505,12 @@ typedef struct zone_db_entry_s {
    * zone's own block (karidns.conf zone {}, or dbcfg) in which the statements the secondary did not write itself come from the
    * received settings (zone_config_with_received()); NULL = no received settings in force.  Read by zone_entry_config(); replaced
    * through the S2 retire stack.  rx_sh (the parsed text), rx_base, rx_gen and rx_note belong to the writers (entry->writer_lock) */
-  uint8_t xfr_ext_state;          /* B8t-2: what the primary speaks (XFR_EXT_*, dns_axfr_ixfr.h); written by the transfer thread only */
   time_t xfr_ext_set;             /* when it was learned */
   _Atomic(const zone_config_t *) rxcfg;
   zone_ext_shared_t *rx_sh;
-  _Atomic bool rx_present;        /* rx_sh != NULL (read without the lock by the control thread's tick) */
   const zone_config_t *rx_base;   /* the block rxcfg was made from (compared, never dereferenced) */
   uint64_t rx_gen;                /* server_config_t.generation of that merge */
-  char rx_note[160];              /* why part of the received settings is not in force ("" = all of it is) */
+  char *rx_note;                  /* why part of the received settings is not in force (NULL or "" = all of it is); malloc, only when there is a note; under writer_lock, read by zone_rx_settings_status() */
   _Atomic(time_t) last_successful_transfer;
   /* RFC 7314 §4: セカンダリの expire タイマーが切れる時刻。0 なら
    * last_successful_transfer + expire (従来どおり SOA EXPIRE で数える)。 */
@@ -505,9 +519,6 @@ typedef struct zone_db_entry_s {
   _Atomic(time_t) last_denial_gap_log;   /* 0.7 (audit): when a missing NSEC / NSEC3 proof of this zone was last logged (dns_query_engine.c note_denial_gap()) */
   time_t last_loaded_mtime;
   off_t last_loaded_size;        /* with the mtime: a reload re-reads a file only when one of them changed (reload_master_zone()) */
-  /* 他のゾーンがこのゾーンの名前をグルーに使っている (prelink が印を付ける)。公開時に
-   * 制御スレッドへ依存するゾーンのグルーの作り直しを頼む */
-  _Atomic bool glue_provider;
   /* エントリごとに一意 (アドレスの再利用と区別する)。グルーの作り直しの判定に使う */
   uint64_t id;
   /* 最後に公開したときの全体の公開カウンタ */
@@ -520,12 +531,8 @@ typedef struct zone_db_entry_s {
   zone_version_t *prev;
   uint64_t prev_epoch;            /* the RCU epoch at which prev left rcu.active (its retirement waits for it) */
   struct zone_db_entry_s *prev_next, *prev_prev;
-  bool prev_linked;
-  _Atomic uint32_t prev_serial;
   _Atomic uint64_t prev_bytes;    /* 0 = no prev */
   _Atomic(time_t) prev_deadline;  /* when the control thread's tick drops prev */
-  _Atomic bool rolled_back;       /* the served version is the result of a rollback; cleared by the next publication */
-  _Atomic uint32_t rb_serial, rb_from;
 } zone_db_entry_t;
 /* 制御チャネルで送る統計 (dns_wire.h、karictl も読む) も同じ長さで view 名を持つ */
 _Static_assert(sizeof(((zone_observatory_snapshot_t *)0)->view_name) == KARIDNS_VIEW_NAME_MAX,
@@ -964,6 +971,9 @@ void compute_ixfr_diff(zone_db_entry_t *entry, const zone_version_t *old_ver, co
 void free_ixfr_txn(ixfr_txn_t *txn);
 /* B-3: set the IXFR history depth of a zone (0..MAX_IXFR_HISTORY); a lower depth drops the oldest diffs now */
 void ixfr_history_set_depth(zone_db_entry_t *entry, int depth);
+/* 0.7 (B2): the same for an entry that nobody can reach yet (the ingest's new entry, before it is registered): no lock is taken, so that the entry's
+ * history lock is not made until something uses the history (create_new_zone_entry()) */
+void ixfr_history_init_depth(zone_db_entry_t *entry, int depth);
 /* frees the diffs and the ring */
 void ixfr_history_clear(ixfr_history_t *h);
 zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname);
@@ -994,6 +1004,13 @@ int zone_limits_gate(zone_db_entry_t *entry, zone_arena_t *builder, const char *
  * (DB のゾーンは dbcfg)。entry は view_name、domain、source (と DB のゾーンなら dbcfg) だけを読む */
 void build_zone_response_cache(zone_version_t *ver, server_config_t *cfg, const zone_db_entry_t *entry);
 void zone_glue_refresh_dependents(bool force);
+/* 0.7 (B1): what the entry itself costs in memory (its block, its lock, a database zone's settings), counted with its first resident version (dns_snapshot_rcu.c) */
+uint32_t zone_entry_fixed_now(const zone_db_entry_t *e);
+/* 0.7 (B2): a zone that became reachable by `domain` in `view` (a first publication, an entry that came into the index): the next zone_glue_refresh_dependents()
+ * looks at the zones that can use it, not at the whole directory.  Any thread, no lock.  zone_glue_stats(): full walks of the directory, ticks that were
+ * targeted, and zones whose glue those looked up again (the tests; nothing resets them). */
+void zone_glue_note_arrival(const char *view, const char *domain);
+void zone_glue_stats(uint64_t *walks, uint64_t *targeted, uint64_t *targeted_zones);
 uint64_t zone_entry_next_id(void);
 
 /* ---- zone memory accounting (D1a, design 8.1; dns_snapshot_rcu.c) ----
@@ -1189,6 +1206,7 @@ typedef struct {
   uint64_t xfr[4];                               /* transfers of zones that were out of memory, by DBREG_XFR_* */
   uint64_t pinned_bytes, peak;
   uint32_t victim_freq;
+  uint64_t room_evictions, room_relaxed;         /* zones taken out on demand for a query that waited for room (also in evictions), and of those the ones younger than the minimum residency */
 } dbreg_cache_stats_t;
 void dbreg_cache_set_limit(uint64_t limit);
 uint64_t dbreg_cache_limit(void);
@@ -1207,6 +1225,7 @@ void dbreg_residency(dbreg_residency_t *out);
 #ifdef KARIDNS_UNIT_TEST
 void dbreg_cache_test_pause(bool on);                              /* TEST ONLY: the manager does nothing while paused */
 void dbreg_cache_test_set_victim_freq(uint32_t f);                 /* TEST ONLY: the frequency a zone that is loaded now is compared with */
+void dbreg_cache_test_room_pause(bool on);                         /* TEST ONLY: dbreg_cache_make_room() takes nothing out while paused */
 #endif
 /* D1a step 7 (design 7): AXFR / IXFR of a zone that is in the directory and not in memory.  The transfer thread waits for the zone (a fetch it asks for), then
  * holds it with dbreg_xfr_acquire(): under the registry lock it reads the element's entry and holds it (xfr_entry_hold(): active_axfr and a reference), so that the
@@ -1226,6 +1245,11 @@ void dbreg_xfr_note(int kind);
 void dbreg_cache_note_miss(void);                                 /* a query had to wait for a zone (the worker) */
 bool dbreg_cache_over_high(uint64_t extra);                        /* would the zone databases be above the high mark with `extra` more bytes? (false without a limit) */
 bool dbreg_cache_over_limit(void);                                 /* are the database zones above the limit itself? */
+/* 0.7 B2 W8, room on demand: above the hard limit a query for a zone out of memory waits for room (it is never refused for it).  dbreg_cache_make_room(): called by the ingest thread only, with the database zones above the hard limit and `nwant` fetches waiting: takes out of memory, now, the coldest
+ * zones (the order of the cache manager's round) until there is room for `nwant` more zones of the average size, at most down to the manager's low mark.  Zones older than
+ * the minimum residency first; only if that is not enough, younger ones whose queries have been answered (at least one) and that have been in memory for ten milliseconds.
+ * Returns how many were taken out; *relaxed (if not NULL) how many of them were younger than the minimum residency. */
+uint32_t dbreg_cache_make_room(uint32_t nwant, uint32_t *relaxed);
 /* A zone of a batch that is not kept in memory because the limit is reached: the directory element with the serial and the digest the loader sent,
  * no data (the next query for it fetches it).  0 on success. */
 int dbreg_commit_cold(const char *view, const char *name, int64_t source_id, uint32_t serial, const uint8_t digest[32], zone_ext_shared_t *shared);

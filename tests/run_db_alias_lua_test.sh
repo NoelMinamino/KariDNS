@@ -16,6 +16,9 @@
 #   4. a secondary KariDNS gets the zone (Extended AXFR from KariDNS, a standard AXFR from PowerDNS) with ALIAS and LUA intact.
 #   5. as root (the loader runs as nobody): the same zone in a SQLite3 database answers like the file zone, in both modes, and the
 #      database zones that break the rules (ALIAS + A, ENABLE-LUA-RECORDS=1) are rejected.
+#   6. (0.7 B2) as root, with karidns-evict: the alias thread scans the zones when ALIAS zones change (a database zone arrives, changes, is
+#      evicted and fetched back, is deleted; a file zone loses its ALIAS record by a reload and gets it back) and not for the zones of a warm-up
+#      without ALIAS records (`karictl dbstatus`: `alias: scans=`; the cache manager takes zones out and fetches them all the time).
 # Parts that need a tool that is not there are SKIPped (reported).  Needs no root except part 5.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -531,6 +534,143 @@ EOF
         fail "no expansion of database zones after the reload"
     fi
     stop_pid "$DBPID"
+fi
+
+# ================================================================ 6. when the alias thread scans (0.7 B2)
+# The thread scans the zone directory for ALIAS records when it is told that the zones with ALIAS records may have changed (a version, the set of
+# zones, the configuration), not when the zone snapshot changes: a database that is fetched into and evicted from all the time changes it for every
+# zone and used to cost a scan of the whole directory each time.  `karictl dbstatus` counts the scans (`alias: scans=`).  Needs root (the loader runs
+# as nobody) and karidns-evict (the test-only `karictl evict`, as tests/run_db_park_test.sh).
+echo "== 6. the alias thread scans when ALIAS zones change, not for every zone a fetch brings (root, karidns-evict)"
+has_hook() { [ -x "$1" ] && grep -q 'no such zone in memory' "$1" 2>/dev/null; }
+EVK=""
+if has_hook "$KARIDNS"; then EVK=$KARIDNS; elif has_hook ./karidns-evict; then EVK=./karidns-evict; fi
+if [ "$(id -u)" != "0" ]; then
+    skip "the scan counter: needs root (the loader runs as nobody)"
+elif [ -z "$EVK" ] || [ ! -x ./karictl ] || [ ! -x ./karidns-dbloader ] || ! command -v sqlite3 >/dev/null 2>&1 || ! ./karidns-dbloader --drivers | grep -qx sqlite3 || ! id nobody >/dev/null 2>&1; then
+    skip "the scan counter: karidns-evict (make evict), karictl, karidns-dbloader with SQLite3, the sqlite3 CLI or the user nobody is missing"
+else
+    P_K=$((BASE + 8))
+    SECRET6="dGVzdC1zZWNyZXQtMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"
+    export ASAN_OPTIONS="detect_leaks=0:abort_on_error=0"      # (the evict command leaks the entries it takes out of memory on purpose; no effect on a build without ASan)
+    mkdir "$T/db6"
+    sqlite3 "$T/db6/z.db" < tests/db/pdns_schema.sqlite3.sql > /dev/null
+    NZ6=400; NH6=60
+    sqlite3 "$T/db6/z.db" <<SQL
+WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < $((NZ6 - 1)))
+INSERT INTO domains (name, type) SELECT printf('w%04d.test', i), 'NATIVE' FROM n;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
+  SELECT id, name, 'SOA', 'ns1.' || name || ' host.' || name || ' 1 3600 600 86400 300', 300, 0, 0 FROM domains;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.' || name, 300, 0, 0 FROM domains;
+WITH RECURSIVE k(j) AS (SELECT 0 UNION ALL SELECT j + 1 FROM k WHERE j < $((NH6 - 1)))
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
+  SELECT d.id, 'h' || k.j || '.' || d.name, 'A', printf('10.%d.%d.%d', (CAST(substr(d.name, 2, 4) AS INTEGER) % 200) + 1, k.j / 200, k.j % 200 + 1), 300, 0, 0
+  FROM domains d, k;
+SQL
+    chown -R nobody "$T/db6"; chmod 600 "$T/db6/z.db"*
+    install -o root -g wheel -m 755 ./karidns-dbloader "$T/karidns-dbloader6" 2>/dev/null || { cp ./karidns-dbloader "$T/karidns-dbloader6"; chown 0:0 "$T/karidns-dbloader6"; chmod 755 "$T/karidns-dbloader6"; }
+    cat > "$T/fz.test.zone" <<EOF
+\$ORIGIN fz.test.
+\$TTL 300
+@ SOA ns hostmaster 1 3600 600 86400 300
+@ NS ns
+ns A 192.0.2.1
+EOF
+    cp "$T/fz.test.zone" "$T/fz.test.zone.plain"
+    printf 'a ALIAS t.target.test.\n' >> "$T/fz.test.zone"
+    cat > "$T/karictl6.conf" <<EOF
+socket "$T/ctl6.sock";
+key "karictl" { algorithm hmac-sha256; secret "$SECRET6"; };
+EOF
+    chmod 600 "$T/karictl6.conf"
+    KCTL6="./karictl -c $T/karictl6.conf"
+    cat > "$T/k6.conf" <<EOF
+options {
+    user "nobody"; pid-file "none"; bind-address { 127.0.0.1; }; port $P_K; alias-resolver { 127.0.0.1 port $P_UP; };
+    database { driver sqlite3; database-file "$T/db6/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader6"; memory-limit 1m; auto-reload yes; poll-interval 1;
+               fetch-rate 5000; park-timeout 4000; acl-ceiling { 127.0.0.1; }; };
+};
+zone "fz.test." { type primary; file "$T/fz.test.zone"; };
+control-channel { socket "$T/ctl6.sock"; secret "$SECRET6"; };
+EOF
+    scans() { $KCTL6 dbstatus 2>/dev/null | sed -n 's/^alias: scans=\([0-9][0-9]*\).*/\1/p' | head -1; }
+    evictions() { $KCTL6 dbstatus 2>/dev/null | sed -n 's/^cache: .* evictions=\([0-9][0-9]*\) .*/\1/p' | head -1; }
+    wait_scans_above() {   # wait_scans_above N SECONDS: the scan counter is above N (the thread looks every ALIAS_TICK_MS)
+        i=0
+        while [ $i -lt $(($2 * 10)) ]; do
+            [ "$(scans)" -gt "$1" ] 2>/dev/null && return 0
+            sleep 0.1; i=$((i + 1))
+        done
+        return 1
+    }
+    dbx() {   # dbx SERIAL TARGET: the database zone dbx.test with one ALIAS (a transaction: the loader sees the zone whole)
+        sqlite3 "$T/db6/z.db" "BEGIN;
+INSERT INTO domains (name, type) VALUES ('dbx.test', 'NATIVE');
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'SOA', 'ns1.dbx.test host.dbx.test $1 3600 600 86400 300', 300, 0, 0 FROM domains WHERE name = 'dbx.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.dbx.test', 300, 0, 0 FROM domains WHERE name = 'dbx.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'ns1.dbx.test', 'A', '192.0.2.1', 300, 0, 0 FROM domains WHERE name = 'dbx.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'a.dbx.test', 'ALIAS', '$2', 120, 0, 0 FROM domains WHERE name = 'dbx.test';
+COMMIT;"
+    }
+    "$EVK" -c "$T/k6.conf" -f > "$T/k6.log" 2>&1 &
+    K6PID=$!; PIDS="$PIDS $K6PID"
+    if kari_wait_log "$T/k6.log" "\[DB\] initial load complete" 60; then pass "the database zones are loaded ($NZ6 zones of $NH6 records, memory-limit 1m)"; else fail "no 'initial load complete' line"; sed 's/^/         /' "$T/k6.log" | tail -8; fi
+    S=$(scans)
+    [ -n "$S" ] && pass "karictl dbstatus has the line 'alias: scans=$S'" || fail "karictl dbstatus has no 'alias: scans=' line"
+    if wait_value $P_K a.fz.test A "192.0.2.10" 20; then pass "the ALIAS of the file zone is resolved"; else fail "a.fz.test is not resolved"; fi
+
+    # a warm-up: queries for every zone, over and over; zones are fetched and the cache manager takes others out (the snapshot changes all the time), no zone has ALIAS records
+    sleep 1.5
+    S0=$(scans); E0=$(evictions)
+    for round in 1 2; do
+        z=0; while [ $z -lt $NZ6 ]; do
+            $DAG @127.0.0.1 -p "$P_K" "h1.$(printf 'w%04d' $z).test" A +short +nohexdump +time=5 +tries=1 > /dev/null 2>&1
+            z=$((z + 1))
+        done
+    done
+    S1=$(scans); E1=$(evictions)
+    [ "${E1:-0}" -ge $((${E0:-0} + 20)) ] 2>/dev/null && pass "the warm-up took zones out of memory and fetched them back ($((E1 - E0)) evictions)" || fail "too few evictions in the warm-up ($E0 -> $E1)"
+    [ -n "$S0" ] && [ "$S1" = "$S0" ] && pass "no scan during the warm-up of $NZ6 zones without ALIAS records (alias: scans=$S1)" || fail "the warm-up caused scans (alias: scans $S0 -> $S1)"
+
+    # a database zone with ALIAS records arrives
+    S=$(scans)
+    dbx 1 'v4.target.test.'                                           # (a target that no other zone has: one that another zone has needs no scan to be answered)
+    if wait_value $P_K a.dbx.test A "192.0.2.20" 30; then pass "an ALIAS zone that arrives from the database is resolved"; else fail "a.dbx.test is not resolved after it arrived"; fi
+    N=$(scans); [ "$N" -gt "$S" ] 2>/dev/null && pass "the zone's arrival caused a scan ($S -> $N)" || fail "no scan for the arrival of an ALIAS zone ($S -> $N)"
+    # ... changes (another target)
+    S=$(scans)
+    sqlite3 "$T/db6/z.db" "BEGIN; UPDATE records SET content = 'x.wild.target.test.' WHERE name = 'a.dbx.test' AND type = 'ALIAS';
+UPDATE records SET content = 'ns1.dbx.test host.dbx.test 2 3600 600 86400 300' WHERE name = 'dbx.test' AND type = 'SOA'; COMMIT;"
+    if wait_value $P_K a.dbx.test A "192.0.2.40" 30; then pass "an ALIAS that changes in the database is resolved to its new target"; else fail "a.dbx.test does not follow the change of the ALIAS"; fi
+    N=$(scans); [ "$N" -gt "$S" ] 2>/dev/null && pass "the change caused a scan ($S -> $N)" || fail "no scan for the change of an ALIAS zone ($S -> $N)"
+    # ... is taken out of memory by the cache manager (here: the test hook), and fetched back by a query
+    S=$(scans)
+    $KCTL6 evict dbx.test. 2>&1 | grep -q '^OK' && pass "dbx.test is out of memory (the test hook)" || fail "karictl evict dbx.test: $($KCTL6 evict dbx.test. 2>&1 | head -1)"
+    wait_scans_above "$S" 5 && pass "the eviction caused a scan (its targets are not wanted any more)" || fail "no scan after the eviction of an ALIAS zone"
+    S=$(scans)
+    if wait_value $P_K a.dbx.test A "192.0.2.40" 30; then pass "the zone that a query fetched back is resolved again"; else fail "a.dbx.test does not resolve after the fetch"; fi
+    wait_scans_above "$S" 5 && pass "the fetch of the ALIAS zone caused a scan (no snapshot was published for it)" || fail "no scan after the fetch of an ALIAS zone"
+    # ... and is deleted
+    S=$(scans)
+    sqlite3 "$T/db6/z.db" "BEGIN; DELETE FROM records WHERE domain_id = (SELECT id FROM domains WHERE name = 'dbx.test'); DELETE FROM domains WHERE name = 'dbx.test'; COMMIT;"
+    i=0; while [ $i -lt 300 ]; do case $(q $P_K a.dbx.test A) in 'REFUSED'*) break ;; esac; sleep 0.1; i=$((i + 1)); done
+    case $(q $P_K a.dbx.test A) in 'REFUSED'*) pass "a deleted ALIAS zone is not served" ;; *) fail "a.dbx.test is still served after the delete" ;; esac
+    wait_scans_above "$S" 5 && pass "the delete caused a scan" || fail "no scan after the delete of an ALIAS zone"
+
+    # a file zone: the ALIAS record is removed by a reload, and comes back
+    S=$(scans)
+    cp "$T/fz.test.zone.plain" "$T/fz.test.zone"
+    $KCTL6 reload fz.test. > /dev/null 2>&1
+    i=0; while [ $i -lt 100 ]; do case $(q $P_K a.fz.test A) in 'NXDOMAIN'*) break ;; esac; sleep 0.1; i=$((i + 1)); done
+    case $(q $P_K a.fz.test A) in 'NXDOMAIN'*) pass "the file zone without its ALIAS record: the name is gone" ;; *) fail "a.fz.test is still there after the reload" ;; esac
+    wait_scans_above "$S" 5 && pass "the reload that took the ALIAS record away caused a scan" || fail "no scan after the reload of a file zone that lost its ALIAS"
+    S=$(scans)
+    printf 'a ALIAS t.target.test.\n' >> "$T/fz.test.zone"
+    $KCTL6 reload fz.test. > /dev/null 2>&1
+    if wait_value $P_K a.fz.test A "192.0.2.10" 20; then pass "the file zone with its ALIAS record again: resolved"; else fail "a.fz.test does not resolve after the ALIAS came back"; fi
+    wait_scans_above "$S" 5 && pass "the reload that brought the ALIAS record back caused a scan" || fail "no scan after the ALIAS record came back"
+    kill -0 "$K6PID" 2>/dev/null && pass "the server is up" || fail "the server died"
+    stop_pid "$K6PID"
 fi
 
 # a sanitizer build (KARIDNS=./karidns-tsan or -asan) reports in the log of the server

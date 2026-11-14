@@ -3,8 +3,13 @@
 # karidns-dbloader and SQLite3.
 #
 #   - dbstatus shows the limit: loader-threads x 16 (at least 16) when fetch-concurrency is not set, the value when it is
-#   - fetch-concurrency 2 sheds a burst of queries for zones that are out of memory (the limit is the one in the configuration, not a constant)
-#   - the default with loader-threads 4: the same burst sheds nothing, and every answer is the right one (the zones of the workers do not mix on the fetch stream)
+#   - fetch-rate: unlimited is the default (0.7 P-A: dbstatus says so); a rate that is set makes the requests over it wait, not fail
+#   - fetch-concurrency 2: a burst of queries for zones that are out of memory is all answered (0.7 P-B): the requests over the limit wait in the ingest thread's queue
+#     (fetchq: queued / waited), at most 2 are in flight (the limit is the one in the configuration, not a constant), nothing is shed
+#   - the default with loader-threads 4: the same burst, and every answer is the right one (the zones of the workers do not mix on the fetch stream)
+#   - dbstatus "fetchq:" (0.7 B2 W3): all fields, peak under fetch-concurrency 2, the histogram, and a UDP burst with park-max 2 (park_full)
+#   - 0.7 B2 W5 / P-B, the places of fetch-concurrency (taken by the ingest thread when it makes a request): `places=` of the fetchq: line is 0 at rest after every burst
+#     (every path gives its place back), `queued=` too (nothing waits for ever), and a round of TCP queries over zones that the cache manager keeps taking out is answered right
 # Needs root (the loader runs as nobody).  SKIP without karidns, dag, karictl, karidns-dbloader (SQLite3), sqlite3 or perl.
 . "$(dirname "$0")/lib_proc.sh"
 set -u
@@ -22,7 +27,7 @@ command -v perl >/dev/null 2>&1 || { echo "SKIP: perl is not installed"; exit 0;
 "$LOADER" --drivers | grep -qx sqlite3 || { echo "SKIP: $LOADER has no SQLite3 driver"; exit 0; }
 id nobody >/dev/null 2>&1 || { echo "SKIP: no user nobody"; exit 0; }
 
-NZ=300
+NZ=400
 T=$(mktemp -d "${TMPDIR:-/tmp}/karidns_fetchconc.XXXXXX") || exit 1
 chmod 755 "$T"
 SRV=""
@@ -64,11 +69,12 @@ key "karictl" { algorithm hmac-sha256; secret "$SECRET"; };
 EOF
 chmod 600 "$T/karictl.conf"
 KCTL="./karictl -c $T/karictl.conf"
+FRATE="fetch-rate 5000;"   # the fetch-rate statement of conf(); FRATE="" leaves it out (the default: unlimited)
 conf() {   # conf "EXTRA database statements" [MEMORY-LIMIT]
     cat > "$T/k.conf" <<EOF
 options {
     user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT; notify no;
-    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; fetch-rate 5000; park-timeout 4000;
+    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; ${FRATE-fetch-rate 5000;} park-timeout 4000;
                acl-ceiling { 127.0.0.1; }; memory-limit ${2:-64m}; $1 };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
@@ -86,6 +92,18 @@ start_srv() {
 conc() { $KCTL dbstatus 2>/dev/null | grep '^fetch:' | sed -n 's/.* concurrency=\([0-9]*\).*/\1/p' | tail -1; }
 q_one() { ./dag @127.0.0.1 -p "$PORT" "$1" A +short +nohexdump +time=10 +tries=1 2>/dev/null | head -1; }
 shed() { $KCTL dbstatus 2>/dev/null | sed -n 's/.* shed=\([0-9]*\) .*/\1/p' | tail -1; }
+rate() { $KCTL dbstatus 2>/dev/null | grep '^fetch:' | sed -n 's/.* rate=\([^ ]*\) .*/\1/p' | tail -1; }
+rbr() { $KCTL dbstatus 2>/dev/null | grep '^fetch:' | sed -n 's/.* refused_by_rate=\([0-9]*\).*/\1/p' | tail -1; }
+fq() { $KCTL dbstatus 2>/dev/null | grep '^fetchq:' | tr ' ' '\n' | sed -n "s/^$1=\([0-9]*\).*/\1/p" | head -1; }   # a number of the fetchq: line
+fq_hist() { $KCTL dbstatus 2>/dev/null | grep '^fetchq:' | tr ' ' '\n' | sed -n 's/^hist=//p' | tr ',' ' ' | awk '{ print $1 + $2 + $3 + $4 + $5 }'; }   # fetches installed, all buckets
+udp_burst() {   # udp_burst N: one query for www.<zone> of N zones, all sent at once over one UDP socket (no pause: more fetches are wanted than the table holds)
+    perl -MIO::Socket::INET -e 'my ($port, $n) = @ARGV; my $s = IO::Socket::INET->new(PeerAddr => "127.0.0.1:$port", Proto => "udp") or die;
+        for my $i (0 .. $n - 1) { $s->send(pack("nnnnnn", $i + 1, 0x0100, 1, 0, 0, 0) . join("", map { chr(length $_) . $_ } ("www", sprintf("c%04d", $i), "test")) . chr(0) . pack("nn", 1, 1)); }
+        select(undef, undef, undef, 0.2)' "$PORT" "$1"
+}
+settle() {   # wait until no fetch is in flight (at most 15 s)
+    i=0; while [ $i -lt 150 ] && [ "$(fq in_flight)" != "0" ]; do sleep 0.1; i=$((i + 1)); done
+}
 burst() {   # burst OUTFILE: one query for www.<zone> of every zone, 60 at a time; "name answer" per line
     perl -e 'for $i (0..'"$((NZ - 1))"') { printf "www.c%04d.test\n", $i }' > "$T/names"
     xargs -P 60 -n 1 sh -c 'echo "$0 $(./dag @127.0.0.1 -p '"$PORT"' "$0" A +short +nohexdump +time=6 +tries=1 2>/dev/null | head -1)"' < "$T/names" | sort > "$1"
@@ -97,18 +115,44 @@ conf "loader-threads 3;"
 start_srv
 [ "$(conc)" = "48" ] && pass "loader-threads 3: dbstatus shows concurrency=48" || fail "concurrency: '$(conc)'"
 stop_srv
+FRATE=""
 conf ""
 start_srv
 [ "$(conc)" = "16" ] && pass "loader-threads 1: dbstatus shows concurrency=16 (the least)" || fail "concurrency: '$(conc)'"
+[ "$(rate)" = "unlimited" ] && pass "no fetch-rate: dbstatus shows rate=unlimited (0.7 P-A)" || fail "rate: '$(rate)' without fetch-rate"
 stop_srv
+FRATE="fetch-rate unlimited;"
+conf ""
+start_srv
+[ "$(rate)" = "unlimited" ] && pass "fetch-rate unlimited: rate=unlimited" || fail "rate: '$(rate)' with fetch-rate unlimited"
+stop_srv
+FRATE="fetch-rate 0;"
+conf ""
+start_srv
+[ "$(rate)" = "unlimited" ] && pass "fetch-rate 0: rate=unlimited" || fail "rate: '$(rate)' with fetch-rate 0"
+stop_srv
+FRATE="fetch-rate 5000;"
 
-echo "== fetch-concurrency 2: a burst of $NZ queries for zones out of memory is shed"
+echo "== fetch-concurrency 2: a burst of $NZ queries for zones out of memory is all answered (the requests over the limit wait)"
 conf "loader-threads 4; fetch-concurrency 2;"
 start_srv
 [ "$(conc)" = "2" ] && pass "dbstatus shows concurrency=2" || fail "concurrency: '$(conc)'"
 burst "$T/out2"
 S2=$(shed)
-[ "${S2:-0}" -gt 0 ] && pass "requests were shed ($S2): the limit is the configured one" || fail "nothing shed with fetch-concurrency 2"
+[ "${S2:-0}" = "0" ] && pass "nothing was shed (0.7 P-B: a request over the limit waits, it is not refused)" || fail "shed=$S2 with fetch-concurrency 2"
+[ "$(fq waited)" -gt 0 ] 2>/dev/null && [ "$(fq queue_peak)" -ge 1 ] 2>/dev/null && pass "requests waited ($(fq waited), at most $(fq queue_peak) at once): the limit is the one in the configuration" || fail "nothing waited with fetch-concurrency 2: waited='$(fq waited)' queue_peak='$(fq queue_peak)'"
+if cmp -s "$T/out2" "$T/expected"; then pass "all $NZ queries were answered, and with the right address"; else fail "wrong or missing answers: $(diff "$T/expected" "$T/out2" | head -5 | tr '\n' ' ')"; fi
+settle
+FQ=$($KCTL dbstatus 2>/dev/null | grep '^fetchq:')
+case "$FQ" in
+    "fetchq: in_flight="*" places="*" peak="*" table_full="*" ring_dropped="*" park_full="*" park_timeout="*" loader_busy="*" ingest_busy="*"% hist="*,*,*,*,*" queued="*" queue_peak="*" waited="*" queue_dropped="*" queue_full="*) pass "dbstatus has the fetchq: line with all its fields" ;;
+    *) fail "no complete fetchq: line: '$FQ'" ;;
+esac
+[ "$(fq peak)" -ge 1 ] 2>/dev/null && [ "$(fq peak)" -le 2 ] && pass "fetchq: peak=$(fq peak) (never more than fetch-concurrency 2 in flight)" || fail "fetchq: peak='$(fq peak)' with fetch-concurrency 2"
+[ "$(fq in_flight)" = "0" ] && pass "fetchq: in_flight=0 after the burst" || fail "fetchq: in_flight='$(fq in_flight)'"
+[ "$(fq places)" = "0" ] && [ "$(fq queued)" = "0" ] && pass "fetchq: places=0 and queued=0 after the burst (every place is back, nothing waits)" || fail "fetchq: places='$(fq places)' queued='$(fq queued)' after the burst"
+[ "$(fq queue_dropped)" = "0" ] && [ "$(fq queue_full)" = "0" ] && pass "fetchq: nothing was dropped at its deadline or refused for a full queue" || fail "fetchq: queue_dropped='$(fq queue_dropped)' queue_full='$(fq queue_full)'"
+[ "$(fq_hist)" -gt 0 ] 2>/dev/null && pass "fetchq: the fetches that were installed are in hist ($(fq_hist))" || fail "fetchq: hist is empty"
 stop_srv
 
 echo "== the default with loader-threads 4: nothing is shed, the answers are the right ones"
@@ -118,9 +162,50 @@ start_srv
 burst "$T/out"
 S1=$(shed)
 [ "${S1:-0}" = "0" ] && pass "nothing was shed" || fail "shed=$S1"
+settle
+[ "$(fq_hist)" -ge "$NZ" ] 2>/dev/null && pass "fetchq: hist counts the $NZ fetches ($(fq_hist)), peak=$(fq peak)" || fail "fetchq: hist=$(fq_hist) after $NZ fetches"
+[ "$(fq peak)" -ge 1 ] 2>/dev/null && [ "$(fq in_flight)" = "0" ] && pass "fetchq: peak>=1 and in_flight=0 at rest" || fail "fetchq: peak='$(fq peak)' in_flight='$(fq in_flight)'"
+[ "$(fq places)" = "0" ] && [ "$(fq queued)" = "0" ] && pass "fetchq: places=0 and queued=0 at rest" || fail "fetchq: places='$(fq places)' queued='$(fq queued)' at rest"
+[ "$(fq loader_busy)" = "0" ] && [ "$(fq park_full)" = "0" ] && pass "fetchq: no busy reply, no full park table in a normal burst" || fail "fetchq: loader_busy='$(fq loader_busy)' park_full='$(fq park_full)'"
 if cmp -s "$T/out" "$T/expected"; then pass "all $NZ answers are the right ones (the zones of the loader's workers did not mix)"; else fail "wrong or missing answers: $(diff "$T/expected" "$T/out" | head -5 | tr '\n' ' ')"; fi
 grep -q "fetch worker\|protocol error" "$T/srv.log" && fail "the log mentions a worker or a protocol error: $(grep 'fetch worker\|protocol error' "$T/srv.log" | head -2)" || pass "no worker or protocol error in the log"
 grep -q "AddressSanitizer\|runtime error:\|ThreadSanitizer" "$T/srv.log" 2>/dev/null && fail "sanitizer report in the server log" || pass "no sanitizer report in the server log"
+stop_srv
+
+echo "== fetch-rate 20: a burst of 40 queries for zones out of memory is answered, the ones over the rate wait"
+FRATE="fetch-rate 20;"
+conf "loader-threads 1;"
+start_srv
+[ "$(rate)" = "20/s" ] && pass "dbstatus shows rate=20/s" || fail "rate: '$(rate)'"
+perl -e 'for $i (0..39) { printf "www.c%04d.test\n", $i }' > "$T/names"
+T0=$(date +%s)
+xargs -P 40 -n 1 sh -c 'echo "$0 $(./dag @127.0.0.1 -p '"$PORT"' "$0" A +short +nohexdump +time=10 +tries=1 2>/dev/null | head -1)"' < "$T/names" | sort > "$T/outr"
+T1=$(date +%s)
+head -40 "$T/expected" > "$T/expected40"
+if cmp -s "$T/outr" "$T/expected40"; then pass "all 40 queries were answered, with the right address, in $((T1 - T0)) s"; else fail "wrong or missing answers: $(diff "$T/expected40" "$T/outr" | head -5 | tr '\n' ' ')"; fi
+[ "$(rbr)" = "0" ] && [ "$(shed)" = "0" ] && pass "refused_by_rate=0 and shed=0: the requests over the rate waited for the bucket" || fail "refused_by_rate='$(rbr)' shed='$(shed)'"
+[ "$(fq waited)" -gt 0 ] 2>/dev/null && pass "fetchq: the requests over the rate waited (waited=$(fq waited))" || fail "fetchq: waited='$(fq waited)': nothing waited at a rate of 20 for 40 zones"
+settle
+[ "$(fq queued)" = "0" ] && [ "$(fq places)" = "0" ] && pass "fetchq: queued=0 and places=0 afterwards" || fail "fetchq: queued='$(fq queued)' places='$(fq places)'"
+stop_srv
+FRATE="fetch-rate 5000;"
+
+# An overload that the fetch path shows: one burst of UDP packets (more queries than the loader reads while it works through them), loader-threads 1, and a table of
+# two parked queries per worker (park-max 2): the queries that find it full are answered "not ready" at once (park_full: true overload), the requests of the others wait for
+# a place of fetch-concurrency (16).  table_full and loader_busy cannot be forced from here: with memory-limit, fetch-concurrency (at most the 256 places of the table)
+# stops the requests first, and the loader's queue of 256 is never beaten by the Backend's 256 in flight.  Their fields are checked for presence (above) and by test_db_fetch.
+echo "== an overload: a burst of $NZ queries over one socket with park-max 2 fills the table of parked queries"
+conf "loader-threads 1; park-max 2;"
+start_srv
+udp_burst "$NZ"
+settle
+echo "  (park_full=$(fq park_full) park_timeout=$(fq park_timeout) ring_dropped=$(fq ring_dropped) table_full=$(fq table_full) loader_busy=$(fq loader_busy) peak=$(fq peak) hist=$(fq_hist) shed=$(shed) queue_peak=$(fq queue_peak) waited=$(fq waited))"
+[ "$(fq park_full)" -gt 0 ] 2>/dev/null && pass "fetchq: park_full=$(fq park_full): queries found the table of parked queries full" || fail "fetchq: park_full='$(fq park_full)' after the burst"
+[ "$(fq peak)" -ge 1 ] 2>/dev/null && [ "$(fq_hist)" -gt 0 ] 2>/dev/null && pass "fetchq: peak=$(fq peak), the fetches that went through are in hist ($(fq_hist))" || fail "fetchq: peak='$(fq peak)' hist='$(fq_hist)'"
+[ "$(fq in_flight)" = "0" ] && pass "fetchq: in_flight=0 once the burst is over" || fail "fetchq: in_flight='$(fq in_flight)'"
+[ "$(fq places)" = "0" ] && pass "fetchq: places=0 once the burst is over (park_full and ring drops gave their places back)" || fail "fetchq: places='$(fq places)' once the burst is over"
+i=0; while [ $i -lt 100 ] && [ "$(q_one www.c0001.test)" != "192.0.2.2" ]; do sleep 0.1; i=$((i + 1)); done
+[ "$(q_one www.c0001.test)" = "192.0.2.2" ] && pass "the server answers after the overload" || fail "no answer after the overload"
 stop_srv
 
 # A stress of the loader's pool of fetch workers: the zones do not fit memory-limit, so the cache manager takes zones out while the bursts ask for them again (each
@@ -147,6 +232,17 @@ done
 echo "  $RIGHT of $TOTAL queries got their address, $WRONG got another one"
 [ "$WRONG" -eq 0 ] && pass "no query got the address of another zone (zones in flight on four workers, taken out and read again)" || fail "$WRONG answers with the data of another zone"
 [ "$RIGHT" -ge $((TOTAL / 4)) ] && pass "a good part of the queries was answered ($RIGHT of $TOTAL) although the zones do not fit memory-limit" || fail "only $RIGHT of $TOTAL queries were answered"
+# the same over TCP: the connection of a query is parked, and the worker takes its place at the gate as for UDP (12 connections at a time; the cache manager keeps taking zones out)
+perl -e 'for $i (0..'"$((NZ - 1))"') { printf "www.c%04d.test\n", ($i * 11 + 5) % '"$NZ"' }' > "$T/names"
+xargs -P 12 -n 1 sh -c 'echo "$0 $(./dag @127.0.0.1 -p '"$PORT"' "$0" A +short +nohexdump +tcp +time=15 +tries=1 2>/dev/null | head -1)"' < "$T/names" | sort > "$T/outs"
+join "$T/expected" "$T/outs" > "$T/joined"
+TWRONG=$(awk 'NF == 3 && $3 != $2 { n++ } END { print n + 0 }' "$T/joined")
+TRIGHT=$(awk 'NF == 3 && $3 == $2 { n++ } END { print n + 0 }' "$T/joined")
+echo "  TCP: $TRIGHT of $NZ queries got their address, $TWRONG got another one"
+[ "$TWRONG" -eq 0 ] && pass "TCP: no query got the address of another zone" || fail "TCP: $TWRONG answers with the data of another zone"
+[ "$TRIGHT" -ge $((NZ / 4)) ] && pass "TCP: a good part of the queries was answered ($TRIGHT of $NZ)" || fail "TCP: only $TRIGHT of $NZ queries were answered"
+settle
+[ "$(fq in_flight)" = "0" ] && [ "$(fq places)" = "0" ] && pass "fetchq: in_flight=0 and places=0 after the UDP and TCP bursts and the reloads" || fail "fetchq: in_flight='$(fq in_flight)' places='$(fq places)' after the stress"
 EVS=$($KCTL dbstatus 2>/dev/null | grep '^cache:' | head -1 | sed -n 's/.* evictions=\([0-9]*\).*/\1/p')
 [ "${EVS:-0}" -gt 0 ] && pass "the cache manager took zones out during the bursts ($EVS evictions): the workers had zones to read again" || fail "no evictions: the stress did not churn the cache"
 i=0; while [ $i -lt 100 ] && [ "$(q_one www.c0001.test)" != "192.0.2.2" ]; do sleep 0.1; i=$((i + 1)); done

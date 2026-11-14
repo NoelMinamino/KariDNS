@@ -242,8 +242,8 @@ stop_srv
 
 echo "== zones in memory above the hard limit of memory-limit (two big zones that a transfer holds)"
 # a zone that is being transferred is not taken out of memory and is not counted among the pinned zones, so the zones in memory stay above 110% of the limit
-# for as long as the transfers last: the fetches for queries are shed, the walk for the apex (summaries) is not held back, and the manager brings the memory down
-# when the transfers end
+# for as long as the transfers last: the request for a query waits for room that cannot be made (0.7: it is not shed; the query is answered "not ready" when park-timeout
+# is over), the walk for the apex (summaries) is not held back, and the manager brings the memory down when the transfers end
 conf "notify no;" "memory-limit 1m;"
 start_srv
 perl tests/db/hold_axfr.pl 127.0.0.1 "$PORT" big.test 120 30 > "$T/hold1.out" 2>&1 &
@@ -256,7 +256,7 @@ grep -q held "$T/hold1.out" && grep -q held "$T/hold2.out" && pass "two big zone
 sleep 1
 LIM=$(stat limit); RES=$(stat resident)
 [ "$RES" -gt $((LIM / 10 * 11)) ] && pass "the zones in memory are above 110% of the limit and stay there ($RES > $LIM)" || fail "resident $RES is not over 110% of $LIM"
-[ -z "$(q www.e.test)" ] && oom e.test && pass "a query for a zone out of memory is answered not ready: its fetch is shed" || fail "www.e.test: $(q www.e.test)"
+[ -z "$(q www.e.test)" ] && oom e.test && pass "a query for a zone out of memory is answered not ready when park-timeout is over: its request waited for room that could not be made" || fail "www.e.test: $(q www.e.test)"
 W0=$(walks_now)
 conf "" "memory-limit 1m;"
 $KCTL reconfig > /dev/null 2>&1

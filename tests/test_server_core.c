@@ -799,7 +799,7 @@ static void test_fill_observatory_snapshot(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "observatory.example.", sizeof(entry.domain));
+    entry.domain = "observatory.example.";
     strlcpy(entry.view_name, "internal", sizeof(entry.view_name));
     entry.is_secondary = true;
     atomic_init(&entry.serial, 2026091901);
@@ -1796,14 +1796,14 @@ static void test_control_socket_thread_and_commands(void) {
 
     zone_db_entry_t z_master;
     memset(&z_master, 0, sizeof(z_master));
-    strlcpy(z_master.domain, "example.com.", sizeof(z_master.domain));
+    z_master.domain = "example.com.";
     strlcpy(z_master.view_name, "default", sizeof(z_master.view_name));
     atomic_init(&z_master.serial, 2026091901);
     atomic_init(&z_master.refresh, 3600);
 
     zone_db_entry_t z_slave;
     memset(&z_slave, 0, sizeof(z_slave));
-    strlcpy(z_slave.domain, "slave.example.", sizeof(z_slave.domain));
+    z_slave.domain = "slave.example.";
     strlcpy(z_slave.view_name, "default", sizeof(z_slave.view_name));
     z_slave.is_secondary = true;
     atomic_init(&z_slave.serial, 100);
@@ -2241,13 +2241,13 @@ static void test_control_restricted_keys(void) {
 
     zone_db_entry_t z_master;
     memset(&z_master, 0, sizeof(z_master));
-    strlcpy(z_master.domain, "example.com.", sizeof(z_master.domain));
+    z_master.domain = "example.com.";
     strlcpy(z_master.view_name, "default", sizeof(z_master.view_name));
     atomic_init(&z_master.serial, 2026091901);
     atomic_init(&z_master.refresh, 3600);
     zone_db_entry_t z_slave;
     memset(&z_slave, 0, sizeof(z_slave));
-    strlcpy(z_slave.domain, "slave.example.", sizeof(z_slave.domain));
+    z_slave.domain = "slave.example.";
     strlcpy(z_slave.view_name, "default", sizeof(z_slave.view_name));
     z_slave.is_secondary = true;
     atomic_init(&z_slave.serial, 100);
@@ -2689,7 +2689,7 @@ static void test_async_io_pool_and_tasks(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "async.example.com.", sizeof(entry.domain));
+    entry.domain = "async.example.com.";
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
@@ -4959,7 +4959,7 @@ static void test_control_status_and_stats_dump(void) {
     printf("[TEST] Server Core: Control STATUS and STATS dump...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "statdump.example.", sizeof(entry.domain));
+    entry.domain = "statdump.example.";
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     zone_observatory_snapshot_t snap;
@@ -5165,7 +5165,7 @@ static void test_control_zonestatus_empty_and_populated(void) {
     printf("[TEST] Server Core: Control ZONESTATUS formatting...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "zonestat.example.", sizeof(entry.domain));
+    entry.domain = "zonestat.example.";
     atomic_store_explicit(&entry.serial, 100, memory_order_release);
     assert(entry.serial == 100);
     printf("  -> ZONESTATUS formatting passed.\n");
@@ -5358,7 +5358,7 @@ static void test_fill_observatory_snapshot_all_counters(void) {
     printf("[TEST] Server Core: fill_observatory_snapshot all statistics fields...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "allstats.example.", sizeof(entry.domain));
+    entry.domain = "allstats.example.";
     atomic_store_explicit(&entry.observatory.queries_total, 42, memory_order_relaxed);
 
     server_config_t cfg;
@@ -7908,12 +7908,14 @@ static void test_obspage_select_and_totals(void) {
     printf("[TEST] Server Core: obspage_select (cursor paging in directory order, glob, stale cursor), stats_collect_totals, server counters...\n");
     enum { N = 23 };
     static zone_db_entry_t zs[N];
+    static char zs_name[N][32];
     zone_db_entry_t *va[N], *vb[N];
     size_t na = 0, nb = 0;
     memset(zs, 0, sizeof(zs));
     for (int i = 0; i < N; i++) {
         int k = (i * 7) % N;   /* scrambled: 7 and 23 are coprime */
-        snprintf(zs[i].domain, sizeof(zs[i].domain), "z%02d.%s.", k, (k % 5 == 0) ? "five" : "other");
+        snprintf(zs_name[i], sizeof(zs_name[i]), "z%02d.%s.", k, (k % 5 == 0) ? "five" : "other");
+        zs[i].domain = zs_name[i];
         snprintf(zs[i].view_name, sizeof(zs[i].view_name), "%s", (k % 4 == 0) ? "zeta" : "alpha");
         atomic_init(&zs[i].observatory.queries_total, (uint64_t)(k + 1));
         atomic_init(&zs[i].observatory.tcp_queries, (uint64_t)(k % 3));
@@ -8033,7 +8035,7 @@ static void test_server_core_rrl_slip_truncation_and_metrics(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strlcpy(entry.domain, "rrl-slip.example.", sizeof(entry.domain));
+    entry.domain = "rrl-slip.example.";
     atomic_init(&entry.observatory.rrl_dropped, 0);
     atomic_init(&entry.observatory.rrl_slipped, 0);
 

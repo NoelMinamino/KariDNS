@@ -53,7 +53,7 @@ static void init_fuzz_environment(void) {
     assert(test_build_index(&g_fuzz_arena, true) == 0);
 
     memset(&g_fuzz_entry, 0, sizeof(g_fuzz_entry));
-    strncpy(g_fuzz_entry.domain, "fuzz.local.", sizeof(g_fuzz_entry.domain) - 1);
+    g_fuzz_entry.domain = "fuzz.local.";
     atomic_store_explicit(&g_fuzz_entry.rcu.active, &g_fuzz_arena.ver, memory_order_release);
 
     g_fuzz_entries[0] = &g_fuzz_entry;

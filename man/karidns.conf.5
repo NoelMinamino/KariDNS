@@ -1749,9 +1749,9 @@ leave and the count of a catalog change; the processes the manager started; a
 plugin's restart backoff and a stopped plugin reaped; an ALIAS target that
 failed and its next try. 2: the steps of a reload (parsed, published with its
 generation, zones rebuilt with the time and the failures), a zone snapshot
-published, the freeing of retired zone versions, an ALIAS refresh and the next
-one. 3: a control command as it was taken apart and what the key's permissions
-said.
+published, the freeing of retired zone versions, a scan of the zones for ALIAS
+records, an ALIAS refresh and the next one. 3: a control command as it was taken
+apart and what the key's permissions said.
 .TP 8
 \fBconfig\fR
 1: an \fBinclude\fR read (its path and size, never its text). 2: \fBoptions {
@@ -1797,10 +1797,12 @@ each server cookie taken or not (length, age, the number of the
 \fBdatabase\fR
 1: each zone of a batch (installed, version taken with the data out of memory,
 hidden, unchanged, rejected), how long the loader ran and how long the next
-start waits. 2: each fetch (asked, held back by \fBmemory\-limit\fR or
-\fBfetch\-rate\fR, done), a zone taken out of memory by \fBmemory\-limit\fR, and
-the loader's own lines (\fBkaridns\-dbloader(8)\fR). 10: each record of the
-loader's stream.
+start waits. 2: each fetch (asked, done; a request that waits for a place, a
+token or room, 0.7: it is not logged per zone, see \fBqueued=\fR of
+\fBfetchq:\fR; one that is refused because the wait queue is full, or a
+background request that is not made), a zone taken out of memory by
+\fBmemory\-limit\fR, and the loader's own lines
+(\fBkaridns\-dbloader(8)\fR). 10: each record of the loader's stream.
 .TP 8
 \fBnetwork\fR
 1: each UDP listener of a Frontend router. 2: the socket buffer sizes the system
@@ -3623,27 +3625,45 @@ limit" below). When the time is up the client gets the one error message of RFC
 \fIDefault:\fR \fBloader\-threads\fR x 16 (at least 16)
 .br
 \fIDescription:\fR D1a: how many zones may be on their way from the loader at
-once while \fBmemory\-limit\fR is set, 2..256. A request over it is shed
-(SERVFAIL + EDE 14 at once, counted as \fBshed\fR in \fBkarictl
-dbstatus\fR). The loader reads that many requests in parallel on
-\fBloader\-threads\fR workers (each with its own database connection), so the
-rate of reads is limited by \fBfetch\-rate\fR, not by one thread of the loader;
-the warm-up and the walk for apexes use at most half of it (and at most 8) so
-that the queries keep the rest. \fBdbstatus\fR shows the value as
-\fBconcurrency=\fR in the \fBfetch:\fR line.
+once while \fBmemory\-limit\fR is set, 2..256. It protects the database: no more
+than this many reads are made at a time. A request over the limit \fBwaits\fR
+(0.7): the worker parks the query and asks as for any query, and the ingest
+thread keeps the request in an ordered queue (the oldest request first, one per
+zone, at most 8192 at a time) and makes it when a place is free; if
+\fBpark\-timeout\fR runs out first the request is dropped and the query gets
+SERVFAIL + EDE 14 like any parked query (counted in \fBpark_timeout\fR, and
+\fBqueue_dropped\fR of the \fBfetchq:\fR line). No query is answered "not ready"
+for the limit. A query for a zone whose fetch is already on its way waits for it
+and asks for nothing. After a reload with another value the places in use are
+not taken away: a lower limit takes effect as the fetches end. The loader reads
+that many requests in parallel on \fBloader\-threads\fR workers (each with its
+own database connection); the warm-up and the walk for apexes use at most half
+of it (and at most 8) so that the queries keep the rest. \fBdbstatus\fR shows
+the value as \fBconcurrency=\fR in the \fBfetch:\fR line, and the requests that
+wait as \fBqueued=\fR in the \fBfetchq:\fR line.
 .TP 8
-\fBfetch\-rate <n>;\fR
-\fIDefault:\fR \fB200\fR
+\fBfetch\-rate unlimited|<n>;\fR
+\fIDefault:\fR \fBunlimited\fR
 .br
-\fIDescription:\fR D1a: how many zones per second may be read from the database
-for queries (a token bucket with a burst of one second, 1..100000); a query for
-a zone that is out of memory when the bucket is empty is answered SERVFAIL + EDE
-14 at once. Slows down attacks that scatter queries over many cold zones;
-\fBkarictl dbstatus\fR shows \fBrefused_by_rate\fR. Since 0.6.2 a loader thread
-reads about 4,400 zones per second (SQLite3, 1M zones of 11 records, 8 vCPU;
-about 400 before, when every zone opened a database connection of its own), so
-this limit is the one that counts: raise it where the server must warm up
-quickly after a start or where many cold zones are asked for at once.
+\fIDescription:\fR D1a, changed in 0.7: how many zones per second may be read
+from the database for queries (a token bucket with a burst of one second,
+1..100000). The default is \fBno limit\fR (\fBunlimited\fR, or \fB0\fR, which
+means the same): a query for a zone that is in the database is answered with the
+latency of a database read, and the reads are bounded by
+\fBfetch\-concurrency\fR alone; with no limit the bucket does not exist and
+costs the query path nothing. Set a rate to protect a database that cannot take
+that many reads (a remote or shared PostgreSQL, say). The requests over the rate
+\fBwait\fR for a token like the requests over \fBfetch\-concurrency\fR (in the
+same queue, in order, up to \fBpark\-timeout\fR), they are not refused: at a
+rate below what the queries ask for the waits grow to \fBpark\-timeout\fR and
+the queries then get SERVFAIL + EDE 14, so the rate is a bound on what the
+database sees, not a defence against the clients. The warm-up, the walk for
+apexes and the background requests take tokens from the same bucket (the
+background requests and the summaries only from a bucket that is more than half
+full, and they do not wait: one that finds none is dropped, counted as
+\fBrefused_by_rate\fR in \fBkarictl dbstatus\fR). \fBkarictl dbstatus\fR shows
+\fBrate=unlimited\fR or \fBrate=N/s\fR. Since 0.6.2 a loader thread reads about
+4,400 zones per second (SQLite3, 1M zones of 11 records, 8 vCPU).
 .TP 8
 \fBmemory\-limit <size>;\fR
 \fIDefault:\fR none
@@ -4143,29 +4163,251 @@ memory, not a hard limit: the versions in use, the previous versions kept for
 rollback, \fBand\fR the ones that were replaced or taken out but are not freed
 yet -- except, since 0.7, retired versions that a reader or a transfer holds
 (\fBheld\fR, see below): taking zones out cannot free them, so they are not
-weighed against the limit. It counts the data of the zones (their images, the
-glue, the IXFR differences), not the directory (a few hundred bytes per zone,
-listed by \fBkarictl dbstatus\fR), the park tables or the loader's process. A
-reload of \fBkaridns.conf\fR changes it: within 50 ms when a limit is set,
-within a second when there was none.
+weighed against the limit. Since 0.7 it counts what a zone holds while it is in
+memory: its version (the image and the glue block, each at the size the
+allocator really holds, not the size asked for), the IXFR differences, \fBand
+what the zone's entry costs by itself\fR -- the entry (about 0.65 KB with the
+allocator's rounding), the lock it makes (about 0.1 KB on FreeBSD) and, for a
+database zone, its settings block: about 0.85 KB per zone, which is about 40% of
+a zone of eleven records (before 0.7 the limit counted only the version and the
+image, 1.3 KB of the 3.2 KB such a zone needs). The entry's share is counted
+with the zone's first version and goes with it when the zone is taken out of
+memory. It does not count the directory (every zone of the database, about 0.45
+KB each, listed by \fBkarictl dbstatus\fR), the park tables or the loader's
+process. A reload of \fBkaridns.conf\fR changes it: within 50 ms when a limit is
+set, within a second when there was none.
 .IP \(bu 2
 \fB\fBmemory\-limit\fB is not a limit on the size of the process (design
-8.1).\fR It counts the data of the zones only. What the process holds on top is
-the directory (every zone of the database, about 167 bytes each: 167 MB for a
-million zones, whatever the limit), the response cache and the allocator's
-slack. Measured on the build host, the resident size of the Backend ran about
-20% above the limit at \fBmemory\-limit 1G\fR and about 40% above it at
-\fB512M\fR (the fixed part is a larger share of a small limit). \fBSizing
-example:\fR to keep the Backend within about 1.5 GB of RAM with a million zones,
-set \fBmemory\-limit 1G\fR (expect about 1.2 GB resident, which leaves room for
-a burst of transfers and the park tables); within about 700 MB, set \fB512M\fR
-(about 700 MB resident, of which 167 MB is the directory); never set the limit
-to the RAM you have. These are figures of one host and one data set (zones of
-eleven records), not a guarantee: watch \fBresidency\fR and \fBcache\fR in
-\fBkarictl dbstatus\fR and the process's own resident size for a few days before
-relying on a figure, and leave the memory of the loader process
-(\fBloader\-threads\fR connections and one zone per worker) out of the Backend's
-share.
+8.1).\fR It counts what the zones in memory hold, not what the process holds on
+top: the directory (every zone of the database, in memory or not), the response
+cache, the park tables, the threads' buffers and the allocator's slack. \fBThe
+formula (0.7):\fR the resident size of the Backend is about \fB70 MB + 0.45 KB x
+(zones in the database) + the \fBresident\fB bytes of the \fBcache:\fB line of
+\fBkarictl dbstatus\fB\fR, and \fBresident\fR stays at 90% to 95% of the limit
+once the limit is reached. The loader is a separate process and comes on top
+(see below). The formula was checked on the build host (FreeBSD 15.1 amd64,
+jemalloc, 8 virtual CPUs, SQLite3, zones of eleven records and of about 100
+records, every zone asked for once so that the limit evicts) at 100,000 and
+1,000,000 zones with limits of 64M, 256M and 1G: it is within \-4% to +9% of all
+eight points (1,000,000 zones: 566 MB at \fB64M\fR, 732 MB at \fB256M\fR, 1,409
+MB at \fB1G\fR; the formula gives 577, 760 and 1,471 MB). \fBBefore 0.7 the
+limit did not count the entry, its lock and the allocator's rounding\fR, so the
+Backend needed about 2.5 times the limit for the zones; the figure of "about 700
+MB at \fB512M\fR" that this manual gave for a million zones was wrong for small
+zones. \fBSizing example:\fR to keep the Backend within about 1.5 GB of RAM with
+a million zones, the formula gives 70 MB + 0.45 GB for the directory + the
+limit, so \fBmemory\-limit 1G\fR is the largest that fits (\fB512M\fR: about 1.0
+GB; \fB1G\fR: about 1.5 GB); never set the limit to the RAM you have, and leave
+room for a burst of transfers (the limit is a target, see below). The figures
+are those of one host and one data set, not a guarantee: watch \fBresidency\fR
+and \fBcache\fR in \fBkarictl dbstatus\fR and the process's own resident size
+for a few days before relying on a figure. The tables below show the
+measurements.
+.RS 2
+.PP
+\fBMemory by number of zones.\fR The resident size of the Backend (\fBps \-o
+rss\fR) 10 seconds after the load, in MB, one \fBkaridns\fR on an idle
+host. \fISmall\fR is a zone of 11 records (SOA, 2 NS, A, MX, 6 A hosts),
+\fImedium\fR one of 98 records. "DB, all resident" is a database without
+\fBmemory\-limit\fR.
+.PP
+.TS
+rb rbw(12) rbw(13) rbw(13) rbw(13)
+r rw(12) rw(13) rw(13) rw(13).
+\&Zones	T{
+Zone files, small
+T}	T{
+DB, all resident, small
+T}	T{
+Zone files, medium
+T}	T{
+DB, all resident, medium
+T}
+_
+\&100	\&37	\&36	\&36	\&38
+\&1,000	\&39	\&39	\&47	\&50
+\&10,000	\&62	\&60	\&159	\&158
+\&100,000	\&304	\&280	\&1,281	\&1,232
+\&1,000,000	\&2,663	\&2,461	T{
+not measured (about 12 GB, more than the host has)
+T}	\&not measured
+.TE
+.PP
+The fixed part is about 35 MB. A zone costs about 2.4 to 2.7 KB when it has 11
+records and about 12 KB when it has 98 records, so the cost follows the number
+of records far more than the number of zones; a zone from a file costs about 0.2
+KB more than the same zone from the database, and loading a million zone files
+took 188 s against 34 s for the same zones from SQLite3. The routers and the
+manager show the same resident size as the Backend with zone files, but they
+share those pages with it: the host's memory use rose by the Backend's size once
+(2,657 MB for 1,000,000 small zone files), so count the Backend's resident size
+once, not the sum of the processes.
+.PP
+\fBWith \fBmemory\-limit\fB\fR (database zones, every zone asked for once after
+the start, Backend and loader in MB, \fBresident\fR = the \fBresident\fR bytes
+of the \fBcache:\fR line; the zones are in memory only as far as the limit lets
+them):
+.TP 8
+100,000
+\fIZone size:\fR small
+.br
+\fImemory-limit:\fR 64M
+.br
+\fIZones in memory:\fR 25,957
+.br
+\fIresident:\fR 57
+.br
+\fIBackend:\fR 184
+.br
+\fILoader:\fR 145
+.TP 8
+100,000
+\fIZone size:\fR small
+.br
+\fImemory-limit:\fR 256M
+.br
+\fIZones in memory:\fR 100,000 (all)
+.br
+\fIresident:\fR 218
+.br
+\fIBackend:\fR 317
+.br
+\fILoader:\fR 13
+.TP 8
+100,000
+\fIZone size:\fR medium
+.br
+\fImemory-limit:\fR 64M
+.br
+\fIZones in memory:\fR 5,545
+.br
+\fIresident:\fR 59
+.br
+\fIBackend:\fR 183
+.br
+\fILoader:\fR 103
+.TP 8
+100,000
+\fIZone size:\fR medium
+.br
+\fImemory-limit:\fR 256M
+.br
+\fIZones in memory:\fR 21,432
+.br
+\fIresident:\fR 230
+.br
+\fIBackend:\fR 377
+.br
+\fILoader:\fR 103
+.TP 8
+100,000
+\fIZone size:\fR medium
+.br
+\fImemory-limit:\fR 1G
+.br
+\fIZones in memory:\fR 90,388
+.br
+\fIresident:\fR 971
+.br
+\fIBackend:\fR 1,164
+.br
+\fILoader:\fR 101
+.TP 8
+1,000,000
+\fIZone size:\fR small
+.br
+\fImemory-limit:\fR 64M
+.br
+\fIZones in memory:\fR 26,225
+.br
+\fIresident:\fR 57
+.br
+\fIBackend:\fR 566
+.br
+\fILoader:\fR 635
+.TP 8
+1,000,000
+\fIZone size:\fR small
+.br
+\fImemory-limit:\fR 256M
+.br
+\fIZones in memory:\fR 109,233
+.br
+\fIresident:\fR 240
+.br
+\fIBackend:\fR 732
+.br
+\fILoader:\fR 632
+.TP 8
+1,000,000
+\fIZone size:\fR small
+.br
+\fImemory-limit:\fR 1G
+.br
+\fIZones in memory:\fR 432,041
+.br
+\fIresident:\fR 951
+.br
+\fIBackend:\fR 1,409
+.br
+\fILoader:\fR 635
+.PP
+Before any zone is asked for, the Backend holds only the directory: 67 MB at
+100,000 zones and about 340 MB at 1,000,000. With the same zones and no limit
+the loader needed 54 MB (100,000 zones) and 213 MB (1,000,000).
+.PP
+\fBHow to read it.\fR The Backend is a fixed part (about 70 MB with the threads'
+buffers and the park tables), plus about 0.45 KB for each zone of the database
+that is in the directory (also for a zone that is out of memory;
+\fBmemory\-limit\fR does not bound it), plus what the zones in memory hold,
+which is the part \fBmemory\-limit\fR bounds (at 90% to 95% of it). The loader
+is not bounded by it either: with \fBmemory\-limit\fR it read the summaries of
+all the zones at the start, so it needed about 550 MB at 1,000,000 zones and 635
+MB once zones were being read for queries (about 65 to 150 MB at 100,000 zones),
+and it must be counted on top of the Backend (without a limit it is smaller,
+about 0.2 KB a zone, because it only streams). \fBRule of thumb:\fR
+\fBmemory\-limit\fR = (the memory you can give the server - 70 MB - 0.45 KB x
+zones - the loader's share) / 1.1, rounded down, and then at most 1.5 times that
+in a burst (see below). For 1,000,000 small zones and 2 GB for the Backend and
+the loader together that is about \fB512M\fR (Backend about 1.0 GB, loader 0.6
+GB). If the zones asked for in a day fit under the limit nothing is taken out;
+if the working set is larger, a higher limit trades memory for fewer waits
+(\fBmisses\fR and \fBhit_rate\fR in \fBkarictl dbstatus\fR). Without a limit,
+plan about 2.5 KB for each small zone (and the zone's own size for a larger one)
+on top of the fixed part. Since 0.7 the server does this arithmetic itself and
+says it in syslog (next item).
+.RE
+.IP \(bu 2
+\fB\fBfetchq:\fB (0.7): where a fetch is held up.\fR \fBkarictl dbstatus\fR has
+the line \fBfetchq: in_flight=N peak=N table_full=N ring_dropped=N park_full=N
+park_timeout=N loader_busy=N ingest_busy=P% hist=A,B,C,D,E\fR right after the
+\fBfetch:\fR line. Everything is counted since the server started, except
+\fBin_flight\fR (now) and \fBingest_busy\fR (the last window). Read it from the
+query to the install: \fBpark_full\fR counts queries that found the worker's
+table of parked queries full (\fBpark\-max\fR) and were answered "not ready" at
+once; \fBring_dropped\fR, queries whose request for the zone could not be handed
+from the worker to the ingest thread (the worker's ring of 128 was full: the
+ingest thread is behind); \fBfetch\-rate\fR, \fBfetch\-concurrency\fR and
+\fBmemory\-limit\fR refuse requests before the fetch is made
+(\fBrefused_by_rate=\fR and \fBshed=\fR of the other lines); \fBtable_full\fR,
+requests refused because all 256 places of the fetch table were taken (reachable
+only without \fBmemory\-limit\fR, which stops requests at
+\fBfetch\-concurrency\fR, at most 256, first); \fBin_flight\fR and \fBpeak\fR
+are the fetches on their way now and the most there have been at one time
+(compare \fBpeak\fR with \fBfetch\-concurrency\fR to see whether the limit is
+the one that held requests back); \fBloader_busy\fR, fetches the loader turned
+away because its own queue of requests was full; \fBhist\fR is the time from the
+request to the install of the zone, for the fetches that succeeded, in five
+counts (up to 1 ms, up to 10 ms, up to 100 ms, up to 1 s, more);
+\fBpark_timeout\fR, parked queries whose zone was not there before
+\fBpark\-timeout\fR ran out; \fBingest_busy\fR is the share of the last ten
+seconds in which the ingest thread was working and not waiting for something to
+do (0 for the first ten seconds; near 100% means the thread is the
+limit). Typical readings: a high \fBingest_busy\fR with a slow \fBhist\fR points
+to the Backend (ingest thread or install), a \fBhist\fR with most counts in the
+last two buckets and a low \fBingest_busy\fR to the loader or the database,
+\fBtable_full\fR or \fBring_dropped\fR above 0 to more simultaneous misses than
+the fetch path takes.
 .IP \(bu 2
 \fBSOA questions for a zone that is out of memory.\fR The summary of a zone that
 sends NOTIFY (the effective \fBnotify\fR is not \fBno\fR) or has
@@ -4329,6 +4571,55 @@ at_start=loaded|missing|corrupt, ignored|unreadable, ignored (N zones)
 hot_lists_sent=N last_sent=<time> (N zones) acks: written=N unchanged=N failed=N
 last_ack=<what> (N zones in the file)\fR.
 .IP \(bu 2
+\fB\fBfetchq:\fB (0.7): where a fetch is held up.\fR \fBkarictl dbstatus\fR has
+the line \fBfetchq: in_flight=N places=N peak=N table_full=N ring_dropped=N
+park_full=N park_timeout=N loader_busy=N ingest_busy=P% hist=A,B,C,D,E queued=N
+queue_peak=N waited=N queue_dropped=N queue_full=N\fR right after the
+\fBfetch:\fR line. Everything is counted since the server started, except
+\fBin_flight\fR and \fBqueued\fR (now) and \fBingest_busy\fR (the last
+window). Read it from the query to the install: \fBpark_full\fR counts queries
+that found the worker's table of parked queries full (\fBpark\-max\fR) and were
+answered "not ready" at once (true overload); \fBring_dropped\fR, queries whose
+request for the zone could not be handed from the worker to the ingest thread
+(the worker's ring of 128 was full: the ingest thread is behind); the requests
+that cannot be made at once because of \fBfetch\-concurrency\fR,
+\fBfetch\-rate\fR or \fBmemory\-limit\fR \fBwait\fR (0.7): \fBqueued\fR is how
+many wait now, \fBqueue_peak\fR the most there have been, \fBwaited\fR how many
+had to wait (since the start), \fBqueue_dropped\fR how many ran out of
+\fBpark\-timeout\fR while they waited (their queries get SERVFAIL + EDE 14 from
+their workers, see \fBpark_timeout\fR), and \fBqueue_full\fR how many were
+refused because the queue (8192 requests) was full, which is the only refusal of
+a query left (also counted in \fBshed\fR of the \fBcache:\fR line); a
+\fBqueued\fR that stays above 0 while \fBin_flight\fR is 0 and the bucket is not
+empty would be a request that is stuck: please report it; \fBtable_full\fR,
+requests refused because all 256 places of the fetch table were taken (normally
+0: \fBfetch\-concurrency\fR, at most the 256 places, stops the requests of whole
+zones first, so only a request that comes while summaries of zones are in flight
+can find the table full next to a \fBfetch\-concurrency\fR of 256);
+\fBin_flight\fR and \fBpeak\fR are the fetches on their way now and the most
+there have been at one time (compare \fBpeak\fR with \fBfetch\-concurrency\fR to
+see whether the limit is the one that held requests back, and \fBwaited\fR to
+see how many it held), \fBplaces\fR the places of \fBfetch\-concurrency\fR in
+use now: the whole-zone fetches that are in flight (0 at rest; a value that
+stays above 0 while \fBin_flight\fR is 0 would be a place that was not given
+back: please report it); \fBloader_busy\fR, fetches the loader turned away
+because its own queue of requests was full; \fBhist\fR is the time from the
+request to the install of the zone, for the fetches that succeeded, in five
+counts (up to 1 ms, up to 10 ms, up to 100 ms, up to 1 s, more);
+\fBpark_timeout\fR, parked queries whose zone was not there before
+\fBpark\-timeout\fR ran out; \fBingest_busy\fR is the share of the last ten
+seconds in which the ingest thread was working and not waiting for something to
+do (0 for the first ten seconds; near 100% means the thread is the limit; the
+thread handles at most 64 requests or about a millisecond at a time and then
+reads the loader's answers, so a flood of queries cannot keep it from installing
+the zones that arrive). Typical readings: a high \fBingest_busy\fR with a slow
+\fBhist\fR points to the Backend (ingest thread or install), a \fBhist\fR with
+most counts in the last two buckets and a low \fBingest_busy\fR to the loader or
+the database, a \fBqueued\fR that is high and a \fBpeak\fR equal to
+\fBfetch\-concurrency\fR to a limit that is too low for the load,
+\fBqueue_dropped\fR or \fBpark_timeout\fR above 0 to more simultaneous misses
+than the fetch path takes.
+.IP \(bu 2
 \fBTaking zones out (the cache manager).\fR A thread looks every 50 ms, at a
 slice of at most 20000 zones of the registry at a time (the lock is held for a
 time that does not grow with the number of zones - measured on the build host:
@@ -4402,39 +4693,100 @@ holds counts as long as it is held; (3) a zone that came into memory less than
 cheaper ones that are only too young would cover what is left. What keeps the
 overshoot bounded: no zone is read for a query while the database zones are
 above \fB110%\fR of the limit, nor while \fBfetch\-concurrency\fR reads are
-already waiting (default \fBloader\-threads\fR x 16) (the queries then get
-SERVFAIL + EDE 14 at once), and \fBfetch\-rate\fR limits how fast zones are
-read. The expected overshoot is the zones read in about a second at the rate the
-queries ask for zones that are out of memory: with the load of
-\fBtests/run_db_cache_test.sh\fR (4 clients, about 1000 queries a second, 28% of
-them for zones that are out of memory) the largest value seen was 108% of the
-limit; the test accepts at most 115% plus 256 KB. Where the 1.5 comes from: what
-is served stops growing by fetches at 110 % of the limit, but a batch installs
-the changed zones that are in memory regardless; on top come for a moment the
-old versions a batch replaces (freed after a grace period that normally ends in
-milliseconds, at the latest when the ingest has published 1024 more zones or at
-the end of the batch: up to the size of every zone in memory if one batch
-replaces all of them), the zones taken out until their entry is freed, and the
-previous versions until the manager drops them (they count and go first). So the
-bound in theory is about twice the limit plus the previous versions, for a batch
-that replaces every zone in memory at once; measured with the zones and the load
-of \fBtests/run_db_cache_test.sh\fR (800 zones, \fBmemory\-limit 3m\fR, 4
-clients) and a batch that changes every zone every 2 s or 100 zones every
-second, \fBpeak\fR was 1.34 to 1.52 times the limit (1.10 without
-batches). \fBThe exception:\fR while a thread stays long in its read section
-(rare; \fBkarictl status\fR \fBretired zone versions waiting\fR, and the warning
-after 60 s), the versions replaced or taken out meanwhile come on top until it
-leaves (measured: 1.6 times the limit with three replacements of every zone in
-memory during a 90 s hold; 2.2 times when queries brought 620 more zones in
-during a 60 s hold, \fBtests/run_db_memlimit_reader_test.sh\fR);
+already in flight (default \fBloader\-threads\fR x 16) (the request of the query
+then waits, for room or for a place, see below), and \fBfetch\-rate\fR, when it
+is set, limits how fast zones are read. The expected overshoot is the zones read
+in about a second at the rate the queries ask for zones that are out of memory:
+with the load of \fBtests/run_db_cache_test.sh\fR (4 clients, about 1000 queries
+a second, 28% of them for zones that are out of memory) the largest value seen
+was 108% of the limit; the test accepts at most 115% plus 256 KB. Where the 1.5
+comes from: what is served stops growing by fetches at 110 % of the limit, but a
+batch installs the changed zones that are in memory regardless; on top come for
+a moment the old versions a batch replaces (freed after a grace period that
+normally ends in milliseconds, at the latest when the ingest has published 1024
+more zones or at the end of the batch: up to the size of every zone in memory if
+one batch replaces all of them), the zones taken out until their entry is freed,
+and the previous versions until the manager drops them (they count and go
+first). So the bound in theory is about twice the limit plus the previous
+versions, for a batch that replaces every zone in memory at once; measured with
+the zones and the load of \fBtests/run_db_cache_test.sh\fR (800 zones,
+\fBmemory\-limit 3m\fR, 4 clients) and a batch that changes every zone every 2 s
+or 100 zones every second, \fBpeak\fR was 1.34 to 1.52 times the limit (1.10
+without batches). \fBThe exception:\fR while a thread stays long in its read
+section (rare; \fBkarictl status\fR \fBretired zone versions waiting\fR, and the
+warning after 60 s), the versions replaced or taken out meanwhile come on top
+until it leaves (measured: 1.6 times the limit with three replacements of every
+zone in memory during a 90 s hold; 2.2 times when queries brought 620 more zones
+in during a 60 s hold, \fBtests/run_db_memlimit_reader_test.sh\fR);
 \fBlong_reader=1\fR in the \fBcache:\fR line of \fBkarictl dbstatus\fR shows
 such a reader (sampled every second); the cache manager does not count them
 (option B, 0.7) and does not take zones out or leave a batch's zones out for
 them, and a version a stalled outbound zone transfer pins is counted the same
 way.
 .IP \(bu 2
+\fBOver the hard line: room on demand (0.7).\fR The 110% line that keeps the
+overshoot bounded (above) never turns a query away. A query for a zone that is
+out of memory while the zones in memory are above the line is parked like any
+other (UDP and TCP; DoT and DoH do not park and get SERVFAIL + EDE 14 for such a
+zone) and its zone is asked for; the ingest thread, seeing the zones in memory
+above the hard line, takes zones out of memory \fBnow\fR (no waiting for the
+next round of the manager) and makes the request when the zones in memory are
+back under the line; the query is answered from the zone, on its first try (this
+is for servers on which queries for zones that do not fit \fBmemory\-limit\fR
+are normal: a million zones and a small limit). The request waits in the same
+queue as the requests that wait for a place of \fBfetch\-concurrency\fR or a
+token of \fBfetch\-rate\fR: the oldest first, one entry per zone (a second query
+for the same zone asks for nothing), holding the mark of its zone and nothing
+else (no place and no token are taken until the request is made, so the requests
+that wait cannot use up the pool). If there is no room before
+\fBpark\-timeout\fR (nothing can be taken out: everything that is left is
+pinned, changed by an UPDATE, or too young), the request is dropped and the
+queries get SERVFAIL + EDE 14 when their own time is up, like any parked query
+(counted in \fBpark_timeout\fR of the \fBfetchq:\fR line and in
+\fBroom_timeouts\fR; the retry of the client then finds the zones that the
+manager has taken out meanwhile). A reload (\fBkarictl reconfig\fR, SIGHUP)
+while requests wait loses none of them and leaves nothing behind: they go on
+waiting for what the new settings ask (a reload that takes \fBmemory\-limit\fR
+away makes them go at once). Zone transfers wait in the same queue; the
+background fetches (a CNAME or the glue of a name server) and the warm-up are
+not queries and do not wait: they are dropped above the line as before.
+.RS 2
+.IP \(bu 2
+\fBWhat is taken out, and how thrashing is avoided.\fR The same order as the
+cache manager's round: zones marked evict-next first, then the lowest frequency
+per byte (GDSF), so the coldest zones go first; pinned zones, zones a dynamic
+UPDATE changed and zones that a transfer reads never go; a zone that is not in
+memory (being fetched) has nothing to take. \fBOnly as much as is needed\fR:
+what the hard line is exceeded by, plus room for the requests that wait (their
+number times the average size of the zones in memory), and never below the
+manager's low mark (90% of the limit), so a burst of waiting requests cannot
+empty the cache. \fBThe minimum residency is kept for every zone that is not
+needed\fR: a zone that came into memory less than 100 ms ago is taken only when
+the older zones do not cover what is needed, and only when it has answered at
+least one query (so nobody waits for it: a parked query waits for a zone that is
+\fInot\fR in memory, and a woken one is answered within a turn of the worker's
+loop) and has been in memory for 10 ms; a zone that has served nobody yet, such
+as one that was just fetched for a query that is still being answered, is never
+taken before its 100 ms are over. The slice of the registry that is looked at is
+the manager's (20000 zones at a time, a few slices at most for one request), and
+the scan is not repeated within 10 ms when it found nothing, so a burst cannot
+make the thread scan the registry for every request. \fBdbstatus\fR shows the
+counts: \fBroom_evictions\fR (zones taken out on demand, also in
+\fBevictions\fR) and \fBroom_relaxed\fR (of those, the ones younger than 100
+ms).
+.IP \(bu 2
+\fBWhat it costs.\fR The memory of a zone that is taken out is freed after the
+next publication of the zones and the drain of the older snapshot (100 ms to a
+second, see above) and counts in \fBretired\fR until then, while the fetches
+that the room is made for go on (at \fBfetch\-rate\fR, when it is set): the
+zones in memory plus \fBretired\fR can therefore pass the 110% by about the
+zones read in that time. Set \fBmemory\-limit\fR with that margin, and
+\fBfetch\-concurrency\fR (and \fBfetch\-rate\fR) to what the host and the
+database can read.
+.RE
+.IP \(bu 2
 \fB\fBkarictl dbstatus\fB\fR has a line \fBcache:
-limit=... resident=... retired=... previous=... inflight=... held=... long_reader=... evictions=... rounds=... cold=... marked=... misses=... shed=... pinned=... peak=... victim_freq=...\fR:
+limit=... resident=... retired=... previous=... inflight=... held=... long_reader=... evictions=... rounds=... cold=... marked=... misses=... shed=... pinned=... peak=... victim_freq=... room_evictions=... room_relaxed=... room_waits=... room_timeouts=... room_waiting=...\fR:
 \fBretired\fR is what was replaced or taken out and is not freed yet,
 \fBinflight\fR the part of it that was taken out, \fBheld\fR (0.7) the part of
 it that a reader or a transfer holds (versions kept after a short wait for their
@@ -4446,8 +4798,16 @@ are not shown on their own: so \fBheld\fR + \fBinflight\fR can be below
 thread of the server has been in a read section for a second or more, \fBcold\fR
 the zones that came without data, \fBmarked\fR the zones that were read but are
 not kept (admission), \fBmisses\fR the queries that had to wait for a zone,
-\fBshed\fR the reads not made because of the 110% bound, \fBpeak\fR the largest
-resident + retired + previous seen when a zone was installed or a round ran.
+\fBshed\fR the requests that were refused (0.7: only the true refusals are left:
+a request that found the wait queue full, and the background requests that were
+dropped; a query that waits for a place, a token or room is not shed),
+\fBpeak\fR the largest resident + retired + previous seen when a zone was
+installed or a round ran, \fBroom_evictions\fR the zones taken out on demand for
+queries that waited for room and \fBroom_relaxed\fR the ones of them that were
+younger than the minimum residency, \fBroom_waits\fR the requests that had to
+wait for room (counted once each), \fBroom_timeouts\fR those of them that ran
+out of \fBpark\-timeout\fR before there was room, \fBroom_waiting\fR those that
+wait for room now (all since the start except \fBroom_waiting\fR).
 .IP \(bu 2
 \fBZone transfers of a zone that is out of memory (AXFR, IXFR).\fR The client is
 checked first, as \fBallow\-query\fR is for a parked query:
@@ -4460,55 +4820,56 @@ answered REFUSED (or NOTAUTH / FORMERR) exactly as for a zone in memory,
 transfer thread (a thread of its own, as for a zone in memory; no worker waits),
 which asks the Backend's ingest thread for the zone through the same fetch
 stream as the queries (\fBfetch: issued=\fR counts it) and polls for it: the
-request obeys \fBmemory\-limit\fR (it is not made while the database zones are
-above 110% of the limit) and \fBfetch\-rate\fR like a query's, but where a query
-is answered "not ready" at once, the transfer asks again every 100 ms until
+request obeys \fBfetch\-concurrency\fR, \fBfetch\-rate\fR and
+\fBmemory\-limit\fR (room above 110% of the limit) like a query's and waits in
+the same queue (0.7; an entry is dropped after \fBpark\-timeout\fR, and the
+transfer asks again every 100 ms, which makes a new one) until
 \fBtransfer\-fetch\-timeout\fR (default 10 s). A zone that cannot be had in that
 time (the loader is down or cannot read it, the memory stays over the limit, the
-rate is used up) gets the single error message of RFC 5936 2.2: SERVFAIL with
-Extended DNS Error 14 (Not Ready, RFC 8914 4.15), with the question copied and
-signed with the key of a validly signed request (RFC 8945 5.3); the connection
-is not just dropped (RFC 5936 4.1.2). A zone for which the loader has no usable
-version (state ERROR) is answered SERVFAIL at once. Once the zone is published
-in the usual way the transfer is the usual one: it counts in the zone's
-\fBactive_axfr\fR, so the cache manager does not take the zone out of memory
-while the transfer runs, and its answer is the answer of a zone in memory (the
-same record set for AXFR, for an IXFR from an old serial the whole zone in the
-AXFR-style answer of RFC 1995 4, because the history of differences is kept in
-memory only and a zone that was out of memory has none). A zone that \fBthe
-transfer\fR brought into memory is marked evict-next (and with it "brought by a
-transfer"): the cache manager takes it out as soon as the transfer is over,
-before any other zone and also when there is no memory pressure, so that
-transfers (a secondary that transfers a million zones) do not push the zones the
-queries use out of memory. The mark is not made, or is dropped, when the zone is
-pinned (\fBcache pin\fR), was changed by a dynamic UPDATE (it is never taken
-out), was in memory before (a transfer from memory changes nothing), is asked
-for more often than the zones the manager took out last (its frequency), or when
-a query asks for it while the transfer runs (the manager sees the query counter
-move at its next round). \fBAn IXFR from a client that is up to date\fR (the
-serial it sends equals the serial of the directory's version or is newer, RFC
-1982) is answered with the one SOA of RFC 1995 2 \fBfrom the summary's apex,
-without reading the zone\fR (a secondary that polls with IXFR does not make the
-server read its zones; the answer has the same SOA, the OPT record of the first
-message, the RFC 7314 EXPIRE option and the KariDNS extension echo that the zone
-in memory gives, and is signed when the request was); it needs the apex of the
-version the directory has (a zone with \fBallow\-transfer\fR or \fBnotify\fR has
-one, see above), otherwise the zone is read. An IXFR without the client's SOA is
-FORMERR (RFC 1995 3) without a read. \fBAn IXFR over UDP\fR (RFC 1995 4.2) is a
-zone transfer question too: \fBallow\-transfer\fR (the zone's
-\fBALLOW\-AXFR\-FROM\fR, \fBacl\-ceiling\fR, the TSIG key of the request) is
-checked first, for a zone in memory and for one that is out of memory, and a
-client that may not transfer is REFUSED with EDE 18 (as BIND's
-\fBns_xfr_start()\fR does before it looks at the transport; before this change a
-UDP IXFR was answered to anybody who could ask); a client that may gets, for a
-zone that is out of memory, the one SOA from the summary's apex without a read
-(the SOA only, TC=1 when the client is behind so that it asks again over TCP),
-byte for byte what the zone in memory answers, and waits for the zone only when
-the apex is missing or describes another version. Requests of transfer threads
-and of workers for a zone take turns in the Backend's request queue (a busy
-worker cannot starve a transfer). A zone whose NOTIFY waits in the ring is not
-taken out of memory meanwhile. \fBkarictl dbstatus\fR counts the waits, the
-zones got, the failures, the summary answers and the marks.
+queue stays too long for the time) gets the single error message of RFC 5936
+2.2: SERVFAIL with Extended DNS Error 14 (Not Ready, RFC 8914 4.15), with the
+question copied and signed with the key of a validly signed request (RFC 8945
+5.3); the connection is not just dropped (RFC 5936 4.1.2). A zone for which the
+loader has no usable version (state ERROR) is answered SERVFAIL at once. Once
+the zone is published in the usual way the transfer is the usual one: it counts
+in the zone's \fBactive_axfr\fR, so the cache manager does not take the zone out
+of memory while the transfer runs, and its answer is the answer of a zone in
+memory (the same record set for AXFR, for an IXFR from an old serial the whole
+zone in the AXFR-style answer of RFC 1995 4, because the history of differences
+is kept in memory only and a zone that was out of memory has none). A zone that
+\fBthe transfer\fR brought into memory is marked evict-next (and with it
+"brought by a transfer"): the cache manager takes it out as soon as the transfer
+is over, before any other zone and also when there is no memory pressure, so
+that transfers (a secondary that transfers a million zones) do not push the
+zones the queries use out of memory. The mark is not made, or is dropped, when
+the zone is pinned (\fBcache pin\fR), was changed by a dynamic UPDATE (it is
+never taken out), was in memory before (a transfer from memory changes nothing),
+is asked for more often than the zones the manager took out last (its
+frequency), or when a query asks for it while the transfer runs (the manager
+sees the query counter move at its next round). \fBAn IXFR from a client that is
+up to date\fR (the serial it sends equals the serial of the directory's version
+or is newer, RFC 1982) is answered with the one SOA of RFC 1995 2 \fBfrom the
+summary's apex, without reading the zone\fR (a secondary that polls with IXFR
+does not make the server read its zones; the answer has the same SOA, the OPT
+record of the first message, the RFC 7314 EXPIRE option and the KariDNS
+extension echo that the zone in memory gives, and is signed when the request
+was); it needs the apex of the version the directory has (a zone with
+\fBallow\-transfer\fR or \fBnotify\fR has one, see above), otherwise the zone is
+read. An IXFR without the client's SOA is FORMERR (RFC 1995 3) without a
+read. \fBAn IXFR over UDP\fR (RFC 1995 4.2) is a zone transfer question too:
+\fBallow\-transfer\fR (the zone's \fBALLOW\-AXFR\-FROM\fR, \fBacl\-ceiling\fR,
+the TSIG key of the request) is checked first, for a zone in memory and for one
+that is out of memory, and a client that may not transfer is REFUSED with EDE 18
+(as BIND's \fBns_xfr_start()\fR does before it looks at the transport; before
+this change a UDP IXFR was answered to anybody who could ask); a client that may
+gets, for a zone that is out of memory, the one SOA from the summary's apex
+without a read (the SOA only, TC=1 when the client is behind so that it asks
+again over TCP), byte for byte what the zone in memory answers, and waits for
+the zone only when the apex is missing or describes another version. Requests of
+transfer threads and of workers for a zone take turns in the Backend's request
+queue (a busy worker cannot starve a transfer). A zone whose NOTIFY waits in the
+ring is not taken out of memory meanwhile. \fBkarictl dbstatus\fR counts the
+waits, the zones got, the failures, the summary answers and the marks.
 .IP \(bu 2
 \fBNOTIFY for a zone that is out of memory (RFC 1996).\fR When the serial of a
 zone changes while its data is out of memory -- the loader sends a summary with
@@ -4569,23 +4930,25 @@ like the others, with no waiting and no I/O in the query path: the Backend hands
 (view, zone) to the ingest thread (one request for a zone in 5 seconds per
 Backend; none while a fetch of the zone is on its way or the zone has no usable
 version), as a request of priority \fIbackground\fR: it is subject to
-\fBmemory\-limit\fR (a request over the hard limit is shed), to
-\fBfetch\-rate\fR (a whole zone asked for in the background takes a token only
-from a bucket that is more than half full, so the queries come first), and, once
-the data is here, the cache manager admits the data as any zone that comes into
-memory (admission, design 8.3: above the high-water mark a zone that is asked
-for less often than the zones taken out last is marked to be the first to go),
-so a client that makes up names leading into zones nobody reads cannot push the
-zones that are read out of memory. A name that is in none of the zones of the
-view asks for nothing. A zone that only such a background fetch brought into
-memory is marked to be the first to go when \fBmemory\-limit\fR needs room
-(above the high-water mark), so many cold name servers behind the glue of one
-zone do not push the zones the queries use out of memory; unlike a zone that
-only a transfer brought, which is taken out when the transfer is over, it stays
-while there is room, so that the next query finds it (the mark is dropped when a
-query is answered from the zone; \fBmarked=\fR of the \fBtransfers of zones out
-of memory\fR line counts both). A request that finds no free slot of the
-transfer threads is not remembered as made: the next query makes it again.
+\fBmemory\-limit\fR (a request over the hard limit is dropped), to
+\fBfetch\-concurrency\fR (dropped when no place is free or queries wait for
+one), to \fBfetch\-rate\fR (a whole zone asked for in the background takes a
+token only from a bucket that is more than half full, so the queries come first;
+counted in \fBrefused_by_rate\fR when it is dropped), and, once the data is
+here, the cache manager admits the data as any zone that comes into memory
+(admission, design 8.3: above the high-water mark a zone that is asked for less
+often than the zones taken out last is marked to be the first to go), so a
+client that makes up names leading into zones nobody reads cannot push the zones
+that are read out of memory. A name that is in none of the zones of the view
+asks for nothing. A zone that only such a background fetch brought into memory
+is marked to be the first to go when \fBmemory\-limit\fR needs room (above the
+high-water mark), so many cold name servers behind the glue of one zone do not
+push the zones the queries use out of memory; unlike a zone that only a transfer
+brought, which is taken out when the transfer is over, it stays while there is
+room, so that the next query finds it (the mark is dropped when a query is
+answered from the zone; \fBmarked=\fR of the \fBtransfers of zones out of
+memory\fR line counts both). A request that finds no free slot of the transfer
+threads is not remembered as made: the next query makes it again.
 .IP \(bu 2
 \fBNot yet.\fR A NOTIFY \fIfor\fR a zone that is out of memory (a primary zone
 accepts none) is REFUSED , an UPDATE for it is checked (SOA question, apex,

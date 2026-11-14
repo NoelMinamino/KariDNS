@@ -653,6 +653,31 @@ const char *strchr_unescaped(const char *s, char c) {
     return NULL;
 }
 
+/* The size of the block the allocator really holds for p, which malloc()ed `asked` bytes: jemalloc (FreeBSD) rounds to a size class, glibc to 16 octets
+ * plus a header.  The zone memory totals (D1a) count this, not what was asked for, so that memory-limit weighs what the process holds.  Where the
+ * C library cannot say (Windows, an unknown libc) the answer is `asked` rounded up to 16. */
+#if defined(__FreeBSD__)
+#include <malloc_np.h>
+#define DNS_ALLOC_USABLE(p) malloc_usable_size(p)
+#elif defined(__linux__)
+#include <malloc.h>
+#define DNS_ALLOC_USABLE(p) malloc_usable_size((void *)(p))
+#elif defined(__APPLE__)
+#include <malloc/malloc.h>
+#define DNS_ALLOC_USABLE(p) malloc_size(p)
+#endif
+size_t dns_alloc_size(const void *p, size_t asked) {
+#ifdef DNS_ALLOC_USABLE
+    if (p) {
+        size_t u = DNS_ALLOC_USABLE(p);
+        if (u >= asked) return u;
+    }
+#else
+    (void)p;
+#endif
+    return (asked + 15) & ~(size_t)15;
+}
+
 /* ThreadSanitizer builds only: built-in suppressions (used without any TSAN_OPTIONS).  The system libcrypto is not built
  * with TSan, so the synchronization inside it (OpenSSL's run-once initialization and its atomics) is invisible, and an
  * interceptor it calls (bcmp, memcpy, ...) may be reported as a race; one such report came from two loader workers that

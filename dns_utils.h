@@ -97,6 +97,8 @@ size_t hex_decode(const char *hex, uint8_t *out, size_t out_cap);
 int compare_canonical_name(const char *name1, const char *name2);
 bool serial_is_newer(uint32_t s1, uint32_t s2);
 const char *strchr_unescaped(const char *s, char c);
+/* what the allocator holds for p, which was malloc()ed with `asked` bytes (see dns_utils.c) */
+size_t dns_alloc_size(const void *p, size_t asked);
 
 /* File paths and schema names of the database configuration and of the KDB1 stream (beta design 7.1, 1.4): valid
  * UTF-8 (RFC 3629 3/4: shortest form only, no surrogates U+D800..U+DFFF, nothing above U+10FFFF) without control

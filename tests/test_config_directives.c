@@ -570,7 +570,7 @@ static void test_database_block(void) {
         CHECK(d->db_reload_timeout == 30 && d->ingest_threads == 1 && d->loader_threads == 1);
         CHECK(d->park_max == 0 && d->park_timeout_ms == 0);                          /* (0: the worker's defaults, 1024 and 1500 ms) */
         CHECK(d->memory_limit == 0);                                                  /* (0: no limit, every database zone stays in memory) */
-        CHECK(d->fetch_rate == 0);                                                    /* (0: the default, 200 zones per second) */
+        CHECK(d->fetch_rate == 0);                                                    /* (0.7 P-A: 0 is the default, unlimited) */
         CHECK(d->transfer_fetch_timeout_ms == 0);                                     /* (0: the default, 10 seconds) */
         CHECK_STR(db_loader_path(&cfg), KARIDNS_DB_DEFAULT_LOADER_PATH);
         free_server_config_fields(&cfg);
@@ -604,12 +604,30 @@ static void test_database_block(void) {
     expect_reject("transfer-fetch-timeout 99", DBP "transfer-fetch-timeout 99; }; };");
     expect_reject("transfer-fetch-timeout 600001", DBP "transfer-fetch-timeout 600001; }; };");
     expect_reject("transfer-fetch-timeout abc", DBP "transfer-fetch-timeout abc; }; };");
-    expect_reject("fetch-rate 0", DBP "fetch-rate 0; }; };");
     expect_reject("fetch-rate 100001", DBP "fetch-rate 100001; }; };");
     expect_reject("fetch-rate abc", DBP "fetch-rate abc; }; };");
     expect_reject("fetch-concurrency 1", DBP "fetch-concurrency 1; }; };");
     expect_reject("fetch-concurrency 257", DBP "fetch-concurrency 257; }; };");
     expect_reject("fetch-concurrency abc", DBP "fetch-concurrency abc; }; };");
+    /* 0.7 P-A: fetch-rate unlimited (the default) or 0: no limit; a number is the rate */
+    {
+        static const struct { const char *text; uint32_t rate; } fr[] = {
+            { "fetch-rate unlimited;", 0 }, { "fetch-rate UNLIMITED;", 0 }, { "fetch-rate 0;", 0 }, { "fetch-rate 1;", 1 }, { "fetch-rate 100000;", 100000 },
+            { "fetch-rate 50; fetch-rate unlimited;", 0 }, { "fetch-rate unlimited; fetch-rate 50;", 50 },
+        };
+        for (size_t i = 0; i < sizeof(fr) / sizeof(fr[0]); i++) {
+            char conf[256];
+            snprintf(conf, sizeof(conf), DBP "%s }; };", fr[i].text);
+            if (parse_ok(conf, &cfg)) {
+                CHECK(cfg.database.fetch_rate == fr[i].rate);
+                free_server_config_fields(&cfg);
+            }
+        }
+    }
+    expect_reject("fetch-rate unlimited without a semicolon", DBP "fetch-rate unlimited }; };");
+    expect_reject("fetch-rate unlimited2", DBP "fetch-rate unlimited2; }; };");
+    /* 0.7: over-limit (refuse | wait) was removed before it was released: above the hard line a query always waits for room */
+    expect_reject("over-limit wait (removed)", DBP "over-limit wait; }; };");
     expect_reject("max-zone-records 1", DBP "max-zone-records 1; }; };");
     expect_reject("max-zone-bytes 100", DBP "max-zone-bytes 100; }; };");
     expect_reject("max-zone-bytes junk", DBP "max-zone-bytes 1X; }; };");

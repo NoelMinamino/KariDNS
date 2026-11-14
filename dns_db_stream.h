@@ -142,6 +142,7 @@
 #define KDB_MAX_BODY (1u << 20)      /* every message but ZONE_DATA */
 #define KDB_MAX_ZONE_DATA 65535u     /* ZONE_DATA body */
 #define KDB_REASON_LEN 128
+#define KDB_FETCH_BUSY_REASON "busy: too many fetch requests are waiting"   /* the loader's ZONE_FAILED reason when its fetch queue is full (the Backend counts these) */
 #define KDB_DIGEST_LEN 32
 #define KDB_VIEWS_ANY 0xFFFFFFFFu    /* view_count: do not check view indexes */
 #define KDB_MAX_CONFIG_VIEWS 1024

@@ -10,8 +10,8 @@
 #   - with memory-limit 1m the warm-up stops at the high water mark and the zones in memory are the hottest ones, in the order of the list
 #   - warm-before-serve: a UDP and a TCP query wait until the hot list is read (fetch-rate 1: about ten seconds) and are answered; the time may be up first
 # Part 2, 300 zones of 100 addresses (c0000 .. c0299), a burst of one query for every zone while the zones are out of memory:
-#   - fetch-concurrency 2 sheds, loader-threads 4 without the setting allows 64 and sheds nothing, and every answer is the right one (the zones of the workers
-#     do not mix on the fetch stream)
+#   - fetch-concurrency 2 (0.7 P-B): the requests over the limit wait, nothing is shed and every answer is the right one; loader-threads 4 without the setting
+#     allows 64 and sheds nothing, and every answer is the right one (the zones of the workers do not mix on the fetch stream)
 #   - a short stress with memory-limit 1m (the cache manager takes zones out while the bursts ask for them again) and reloads in between: no query gets the
 #     address of another zone, and the server goes on answering
 #
@@ -182,9 +182,16 @@ n=1; exp=""; while [ $n -le "$K" ]; do exp="$exp$n "; n=$((n + 1)); done
 grep -q 'reached the high water mark of memory-limit' "$LOG" && pass "the log says the warm-up stopped at the high water mark" || fail "no high water line in the log"
 LIM=$(field cache limit); RSD=$(field cache resident)
 [ "$RSD" -le $((LIM + LIM / 10)) ] && pass "the zones in memory ($RSD bytes) are within memory-limit ($LIM)" || fail "resident $RSD above the limit $LIM"
-n=$((K + 1)); ok=1
-while [ $n -le $NZ ]; do [ "$(q "www.$(zn $n).test")" = "192.0.2.80" ] || ok=0; n=$((n + 1)); done
+# (the zones are asked for one after the other: each one that is read adds a zone to what the cache manager has to take out, and above 110% of memory-limit a fetch is
+# refused until it has, so with the zones as big as the allocator makes them one of the last ones can get "not ready" at the first try: kari_ask_retry asks again)
+n=$((K + 1)); ok=1; REF=0; ODD=0
+while [ $n -le $NZ ]; do
+    kari_ask_retry ./dag "$PORT" "www.$(zn $n).test" 192.0.2.80 || ok=0
+    REF=$((REF + KARI_ASK_REFUSED)); ODD=$((ODD + KARI_ASK_ODD)); n=$((n + 1))
+done
 [ "$ok" = 1 ] && pass "the zones that are out of memory are fetched from PostgreSQL on a query and answered" || fail "a zone that was out of memory got no answer"
+[ "$ODD" = 0 ] && pass "a query that got no answer at once was refused with SERVFAIL and EDE 14, not dropped ($REF refused)" || fail "$ODD queries for zones out of memory got neither an answer nor 'not ready' (SERVFAIL, EDE 14)"
+waitfor 5 sh -c "[ \"\$(./karictl -c $T/karictl.conf dbstatus 2>/dev/null | grep '^cache:' | head -1 | sed -n 's/.* evictions=\([0-9]*\).*/\1/p')\" -ge 1 ]" && pass "the cache manager took zones out to make room for them (evictions $(field cache evictions))" || fail "no zone was taken out of memory"
 stop_srv
 
 echo "== part 1: warm-before-serve: the queries (UDP and TCP) wait for the hot list (fetch-rate 1: about ten seconds)"
@@ -237,7 +244,10 @@ start_srv
 [ "$(conc)" = "2" ] && pass "fetch-concurrency 2: dbstatus shows concurrency=2" || fail "concurrency: '$(conc)'"
 burst "$T/out2"
 S2=$(shed)
-[ "${S2:-0}" -gt 0 ] && pass "requests were shed ($S2): the limit is the configured one" || fail "nothing shed with fetch-concurrency 2"
+W2=$($KCTL dbstatus 2>/dev/null | grep '^fetchq:' | sed -n 's/.* waited=\([0-9]*\).*/\1/p')
+[ "${S2:-x}" = "0" ] && pass "nothing was shed (a request over fetch-concurrency waits)" || fail "shed=$S2 with fetch-concurrency 2"
+[ "${W2:-0}" -gt 0 ] && pass "requests waited ($W2): the limit is the configured one" || fail "nothing waited with fetch-concurrency 2"
+if cmp -s "$T/out2" "$T/expected"; then pass "all $NC queries were answered, with the right address"; else fail "wrong or missing answers: $(diff "$T/expected" "$T/out2" | head -5 | tr '\n' ' ')"; fi
 stop_srv
 
 conf 64m "fetch-rate 5000; loader-threads 4;" no

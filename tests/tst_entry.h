@@ -8,8 +8,10 @@
 
 static inline const zone_db_entry_t *tst_entry(const char *view, const char *domain) {
     static zone_db_entry_t e;
+    static char name[256];                     /* (the entry keeps a pointer to its name since 0.7 B2) */
     memset(&e, 0, sizeof(e));
-    snprintf(e.domain, sizeof(e.domain), "%s", domain);
+    snprintf(name, sizeof(name), "%s", domain);
+    e.domain = name;
     snprintf(e.view_name, sizeof(e.view_name), "%s", view ? view : "");
     return &e;
 }

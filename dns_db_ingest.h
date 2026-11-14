@@ -66,7 +66,7 @@ void db_ingest_reload_cancel(uint64_t id);
 /* One answer, if there is one (call until false after a DB_INGEST_CTL_EVENT).  Control thread only. */
 bool db_ingest_reload_result(db_reload_result_t *out);
 /* D1a step 7 (design 7, 12-6): a zone transfer thread (not a worker, not the ingest thread) waits for the zone of the directory element `el` (view `view`) to be
- * in memory: it asks the ingest thread for it (park_fetch_request_any(); the request obeys memory-limit and fetch-rate like a query's, and is made again every
+ * in memory: it asks the ingest thread for it (park_fetch_request_any(); the request waits for a place, a token and room like a query's, in the same queue, and is made again every
  * 100 ms while the zone is out of memory and nothing is on its way) and polls the element.  The wait ends after `database { transfer-fetch-timeout }`.  Returns the
  * entry of the zone held with xfr_entry_hold() (the caller gives it back with xfr_entry_release(); the zone is not taken out of memory meanwhile), or NULL: the time
  * is up, the fetch failed or the zone has no usable version (the caller answers SERVFAIL).  A zone this wait brought into memory is marked evict-next.  `el`

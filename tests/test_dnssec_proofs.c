@@ -274,7 +274,7 @@ static void gr_setup(const char *origin, const char *zone_text) {
      * is dropped before the index and the image are built, and so is never selected as the NSEC3 parameter */
     (void)zone_arena_drop_unencodable(&g_gr.arena, NULL, NULL);
     assert(test_build_index(&g_gr.arena, true) == 0);
-    strncpy(g_gr.entry.domain, origin, sizeof(g_gr.entry.domain) - 1);
+    g_gr.entry.domain = origin;
     atomic_store_explicit(&g_gr.entry.rcu.active, &g_gr.arena.ver, memory_order_release);
     g_gr.entries[0] = &g_gr.entry;
     g_gr.acl[0] = (char *)"any";
@@ -1608,7 +1608,7 @@ static void mz_add(const char *origin, const char *text) {
     char *buf = arena_strdup(&g_mz.arena[i], text);
     assert(buf && parse_zone_fast(buf, strlen(buf), &g_mz.arena[i], &ctx) >= 0);
     assert(test_build_index(&g_mz.arena[i], true) == 0);
-    strncpy(g_mz.entry[i].domain, origin, sizeof(g_mz.entry[i].domain) - 1);
+    g_mz.entry[i].domain = origin;
     g_mz.entry[i].kind = ZONE_KIND_PRIMARY;
     atomic_store_explicit(&g_mz.entry[i].rcu.active, &g_mz.arena[i].ver, memory_order_release);
     g_mz.entries[i] = &g_mz.entry[i];
@@ -1759,8 +1759,8 @@ static void test_ds_from_parent_zone(void) {
     zone_db_entry_t root, tld;
     memset(&root, 0, sizeof(root));
     memset(&tld, 0, sizeof(tld));
-    strcpy(root.domain, ".");
-    strcpy(tld.domain, "test.");
+    root.domain = ".";
+    tld.domain = "test.";
     zone_db_entry_t *ents[2] = { &tld, &root };
     view_snapshot_t v;
     memset(&v, 0, sizeof(v));

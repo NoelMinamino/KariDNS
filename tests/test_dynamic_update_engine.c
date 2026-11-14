@@ -275,7 +275,7 @@ static void test_handle_dynamic_update_pipeline(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strncpy(entry.domain, "example.com.", sizeof(entry.domain) - 1);
+    entry.domain = "example.com.";
     strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
@@ -377,7 +377,7 @@ static void test_handle_dynamic_update_drops_unencodable(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strncpy(entry.domain, "example.com.", sizeof(entry.domain) - 1);
+    entry.domain = "example.com.";
     strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
@@ -861,7 +861,7 @@ static void test_update_multi_tsig_keys(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strncpy(entry.domain, "example.com.", sizeof(entry.domain) - 1);
+    entry.domain = "example.com.";
     strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
@@ -1641,7 +1641,7 @@ static void test_update_prerequisite_rules(void) {
 
 static void upd_entry_init(zone_db_entry_t *entry) {
     memset(entry, 0, sizeof(*entry));
-    strlcpy(entry->domain, UZ, sizeof(entry->domain));
+    entry->domain = UZ;
     strlcpy(entry->view_name, "default", sizeof(entry->view_name));
     pthread_mutex_init(&entry->writer_lock, NULL);
     pthread_mutex_init(&entry->ixfr_history.lock, NULL);
@@ -1772,7 +1772,7 @@ static void test_update_dispatch_zone_section(void) {
     upd_entry_init(&prim);
     zone_db_entry_t sec;
     memset(&sec, 0, sizeof(sec));
-    strlcpy(sec.domain, "sec.example.", sizeof(sec.domain));
+    sec.domain = "sec.example.";
     strlcpy(sec.view_name, "default", sizeof(sec.view_name));
     zone_arena_init(test_zone_slot(&sec, 0));
     atomic_store_explicit(&sec.rcu.active, &test_zone_slot(&sec, 0)->ver, memory_order_release);
@@ -2683,7 +2683,7 @@ static void test_serial_update_methods(void) {
     /* the whole pipeline: a hand-built configuration whose options write the three limits and the method */
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strncpy(entry.domain, "example.com.", sizeof(entry.domain) - 1);
+    entry.domain = "example.com.";
     strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
@@ -2786,7 +2786,7 @@ static void test_update_policy_pipeline(void) {
     printf("[TEST] Dynamic Update: update-policy decides each change...\n");
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strncpy(entry.domain, "example.com.", sizeof(entry.domain) - 1);
+    entry.domain = "example.com.";
     strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);

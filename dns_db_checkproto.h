@@ -18,6 +18,8 @@
  *                                    the views of karidns_domain_views that name it ("*" = it has no row: every view of the source)
  *   S  <zone> <id> <text> <profile> <profile-text>
  *                                    the settings text of a zone (what the loader would send in ZONE_BEGIN) and the profile it names
+ *   M  <zones> <records>             0.7 P-F, before R: the zones read and the records of the primary zones among them (what the database needs
+ *                                    in memory: dns_mem_advice.h); decimal numbers
  *   R  <zones> <errors> <warnings>   the end of a run: zones read, findings counted by the loader
  * Text fields are escaped: a byte outside 0x20..0x7E and the backslash are written \DDD (three decimal digits), so a field never
  * contains a TAB or LF.  A line that does not start with a tag and a TAB is not part of the protocol (a message of the C library on
