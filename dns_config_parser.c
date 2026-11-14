@@ -6597,6 +6597,17 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
     db->fetch_rate = (uint32_t)u;
     return 0;
   }
+  if (strcmp(key, "over-limit") == 0) {          /* 0.7 B2 W8: what a query for a zone out of memory gets while the database zones are above 110% of memory-limit */
+    char *v = NULL;
+    if (db_take_string(ctx, "database", key, 16, &v) != 0) { free(v); return -1; }
+    bool wait = strcasecmp(v, "wait") == 0;
+    bool ok = wait || strcasecmp(v, "refuse") == 0;
+    if (!ok) report_bad_value(ctx, NULL, key, v, "refuse or wait");
+    free(v);
+    if (!ok) return -1;
+    db->over_limit_wait = wait;
+    return 0;
+  }
   if (strcmp(key, "fetch-concurrency") == 0) {   /* fetches in flight to the loader while memory-limit is set (the loader reads that many zones at once, loader-threads of them in parallel) */
     if (db_take_uint(ctx, key, false, KARIDNS_DB_FETCH_CONC_MIN, KARIDNS_DB_FETCH_CONC_MAX, &u) != 0) return -1;
     db->fetch_concurrency = (uint32_t)u;

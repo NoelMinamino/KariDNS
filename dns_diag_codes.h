@@ -128,6 +128,7 @@ X (CONF_DATABASE_DRIVER, "conf.database.driver", 'E', "the loader was not built 
 X (CONF_DATABASE_DRIVERS_NOT_RUN, "conf.database.drivers-not-run", 'W', "--drivers was not run because karicheck is run by root")
 X (CONF_DATABASE_STATE_FILE, "conf.database.state-file", 'W', "loader-state-file has no effect without memory-limit")
 X (CONF_DATABASE_WARM, "conf.database.warm", 'W', "warm-before-serve has no effect without memory-limit")
+X (CONF_DATABASE_OVER_LIMIT, "conf.database.over-limit", 'W', "over-limit has no effect without memory-limit")
 X (CONF_DATABASE_ACL_CEILING, "conf.database.acl-ceiling", 'W', "no acl-ceiling: the ACLs of database zones refuse every client")
 X (CONF_DATABASE_ACL_CEILING_MATCH, "conf.database.acl-ceiling-match", 'W', "acl-ceiling-match all has no effect with one kind of entry")
 X (CONF_DATABASE_FILE, "conf.database.file", 'E', "the SQLite3 database file does not exist")

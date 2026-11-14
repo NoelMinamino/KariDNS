@@ -3639,15 +3639,25 @@ bool dbreg_cache_over_high(uint64_t extra) {
 /* The zones in memory are above the hard limit: no zone is fetched for a query meanwhile.  The retired bytes are not counted: they belong to versions that were
  * replaced or taken out and are freed within a second (the control tick, the end of a batch), and a fetch that was shed for them answered its query with "not
  * ready" although the memory in use was within the limit (two UPDATEs of big zones, one after the other). */
+/* the hard line (110% of the limit; with pinned zones that fill 90% of it or more, the pinned bytes plus 10%, and then 1/10 of that on top) */
+static uint64_t cache_hard_line(uint64_t lim) {
+    uint64_t pinned_now = atomic_load_explicit(&g_cache_pinned_bytes, memory_order_relaxed);
+    if (pinned_now > lim / 10 * 9) lim = pinned_now + lim / 10;     /* the pinned zones alone fill it: leave room for the others */
+    return lim + lim / CACHE_HARD_DIV;
+}
 bool dbreg_cache_over_limit(void) {
     uint64_t lim = atomic_load_explicit(&g_cache_limit, memory_order_relaxed);
     if (!lim) return false;
     zone_bytes_t zb;
     zone_bytes_get(ZBYTES_DB, &zb);
-    uint64_t pinned_now = atomic_load_explicit(&g_cache_pinned_bytes, memory_order_relaxed);
-    if (pinned_now > lim / 10 * 9) lim = pinned_now + lim / 10;     /* the pinned zones alone fill it: leave room for the others */
-    return zb.resident > lim + lim / CACHE_HARD_DIV;
+    return zb.resident > cache_hard_line(lim);
 }
+
+/* 0.7 B2 W8, database { over-limit wait|refuse }: set from the configuration by the cache thread (a reload switches it), read by the workers' gate and the ingest thread */
+static _Atomic bool g_cache_over_wait;
+static _Atomic uint64_t g_room_evicted, g_room_relaxed;      /* zones taken out on demand (dbreg_cache_make_room()), of which younger than CACHE_MIN_RESIDENT_MS */
+void dbreg_cache_set_over_wait(bool wait) { atomic_store_explicit(&g_cache_over_wait, wait, memory_order_relaxed); }
+bool dbreg_cache_over_wait(void) { return atomic_load_explicit(&g_cache_over_wait, memory_order_relaxed); }
 
 void dbreg_cache_stats(dbreg_cache_stats_t *o) {
     zone_bytes_t zb;
@@ -3669,6 +3679,9 @@ void dbreg_cache_stats(dbreg_cache_stats_t *o) {
     o->victim_freq = atomic_load_explicit(&g_victim_freq, memory_order_relaxed);
     o->pinned_bytes = atomic_load_explicit(&g_cache_pinned_bytes, memory_order_relaxed);
     o->peak = atomic_load_explicit(&g_cache_peak, memory_order_relaxed);
+    o->over_wait = atomic_load_explicit(&g_cache_over_wait, memory_order_relaxed);
+    o->room_evictions = atomic_load_explicit(&g_room_evicted, memory_order_relaxed);
+    o->room_relaxed = atomic_load_explicit(&g_room_relaxed, memory_order_relaxed);
 }
 
 typedef struct {
@@ -3679,7 +3692,14 @@ typedef struct {
     uint64_t bytes;
     uint32_t freq;
     bool young;                   /* in memory for less than CACHE_MIN_RESIDENT_MS: it is not taken out yet */
+    bool relax;                   /* young, but the queries it was read for are answered (room on demand may take it out, see dbreg_cache_make_room()) */
 } cache_cand_t;
+
+/* the priority of a candidate (the lowest goes first): zones marked evict-next or no-cache first, then those a background fetch brought, then GDSF */
+static double cache_prio(uint16_t flags, uint32_t f, uint64_t bytes, bool *next) {
+    *next = (flags & (ZDIR_F_EVICT_NEXT | ZDIR_F_NOCACHE)) != 0;
+    return *next ? -2.0 : (flags & ZDIR_F_BGLOAD) ? -1.0 : ((double)f + 1.0) * (4096.0 + (double)bytes / 4.0) / (double)bytes;
+}
 
 static int cache_cand_cmp(const void *a, const void *b) {
     const cache_cand_t *x = a, *y = b;
@@ -3821,9 +3841,8 @@ uint32_t dbreg_cache_round(void) {
             s_cand[nc].bytes = bytes;
             s_cand[nc].freq = f;
             s_cand[nc].young = now32 - z->t_load < CACHE_MIN_RESIDENT_MS;
-            s_cand[nc].next = (z->flags & (ZDIR_F_EVICT_NEXT | ZDIR_F_NOCACHE)) != 0;
-            s_cand[nc].prio = s_cand[nc].next ? -2.0 : (z->flags & ZDIR_F_BGLOAD) ? -1.0
-                                                                                : ((double)f + 1.0) * (4096.0 + (double)bytes / 4.0) / (double)bytes;
+            s_cand[nc].relax = false;
+            s_cand[nc].prio = cache_prio(z->flags, f, bytes, &s_cand[nc].next);
             nc++;
         }
         b++;
@@ -3866,6 +3885,143 @@ uint32_t dbreg_cache_round(void) {
         syslog(LOG_WARNING, "[DB] the pinned database zones (%llu bytes) alone exceed memory-limit (%llu); every zone that is not pinned is taken out of memory",
                (unsigned long long)pinned_all, (unsigned long long)limit);
     }
+    return evicted;
+}
+
+/* ---- 0.7 B2 W8: room on demand (database { over-limit wait }) ----
+ * With `over-limit refuse` (the default) a query for a zone that is out of memory is answered "not ready" at once while the zones in memory are above the hard line
+ * (110% of the limit).  With `over-limit wait` the request waits in the ingest thread, which calls dbreg_cache_make_room() to take zones out of memory now (the cache manager
+ * does it every 50 ms, and not at all for zones younger than CACHE_MIN_RESIDENT_MS), and the fetch is made when there is room.  The rules that keep it from thrashing:
+ *   - the same order as the manager: zones marked evict-next first, then the lowest frequency per byte (GDSF), so the coldest go first; pinned zones and zones that a dynamic
+ *     UPDATE changed never; a zone with another state than RESIDENT (LOADING, ABSENT) is not in memory to take out (dbreg_evict_locked());
+ *   - only as much as is needed: what the hard line is exceeded by plus room for the zones that wait (their number times the average size of the zones in memory), never
+ *     below the manager's low mark (90%), so a burst of waiting requests cannot empty the cache;
+ *   - the minimum residency is kept for every zone that is not needed: a zone younger than CACHE_MIN_RESIDENT_MS is taken only when the older ones do not cover what is needed
+ *     (a second pass), and only when its queries have been answered (the entry has counted one, so nobody is still parked or woken for it: a parked query waits for a zone
+ *     that is out of memory, and a woken one is answered within a turn of the worker's loop) and it has been in memory CACHE_ROOM_FLOOR_MS; a zone that has served nobody yet
+ *     is never taken before its minimum residency is over.
+ * The scan is read-only for the frequency counters (the manager folds them in), in slices of CACHE_SCAN_MAX from where the last call stopped, at most CACHE_ROOM_SLICES a call. */
+#define CACHE_ROOM_FLOOR_MS 10
+#define CACHE_ROOM_SLICES 4
+static size_t g_room_v, g_room_b;                  /* where the next call starts (the ingest thread's) */
+static cache_cand_t *s_room_cand;
+static size_t s_room_cap;
+
+/* one pass over the sorted candidates: the old ones, or (relaxed) the young ones that may go, until `want` is freed */
+static void room_take_pass(const cache_cand_t *cand, size_t nc, bool relaxed, uint64_t want, uint64_t *freed, uint32_t *evicted, uint32_t *nrelaxed, uint32_t *boundary,
+                           bool *took_unflagged) {
+    for (size_t i = 0; i < nc && *freed < want; i++) {
+        const cache_cand_t *c = &cand[i];
+        if (relaxed ? !(c->young && c->relax) : c->young) continue;
+        if (!dbreg_evict_locked(c->rv, c->z)) continue;
+        *freed += c->bytes;
+        (*evicted)++;
+        if (relaxed) (*nrelaxed)++;
+        if (!c->next) {
+            *took_unflagged = true;
+            if (c->freq > *boundary) *boundary = c->freq;
+        }
+    }
+}
+
+#ifdef KARIDNS_UNIT_TEST
+static _Atomic bool g_room_paused;                        /* a test makes the room on demand do nothing (the request has to wait) */
+void dbreg_cache_test_room_pause(bool on) { atomic_store_explicit(&g_room_paused, on, memory_order_relaxed); }
+#endif
+
+uint32_t dbreg_cache_make_room(uint32_t nwant, uint32_t *relaxed_out) {
+    uint32_t evicted = 0, nrelaxed = 0;
+    if (relaxed_out) *relaxed_out = 0;
+#ifdef KARIDNS_UNIT_TEST
+    if (atomic_load_explicit(&g_room_paused, memory_order_relaxed)) return 0;
+#endif
+    const uint64_t limit = atomic_load_explicit(&g_cache_limit, memory_order_relaxed);
+    if (!limit) return 0;
+    if (nwant == 0) nwant = 1;
+    uint32_t boundary = 0;
+    bool took_unflagged = false;
+    for (int slice = 0; slice < CACHE_ROOM_SLICES; slice++) {
+        int64_t now = cache_mono_ms();
+        uint32_t now32 = (uint32_t)now;
+        size_t nc = 0, visited = 0;
+        uint64_t sumb = 0, nres = 0;
+        bool wrapped = false;
+        pthread_mutex_lock(&g_zone_db_rebuild_lock);
+        if (g_dbreg_nviews == 0) {
+            pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+            break;
+        }
+        if (g_room_v >= g_dbreg_nviews) g_room_v = g_room_b = 0;
+        size_t v = g_room_v, b = g_room_b;
+        while (visited < CACHE_SCAN_MAX) {
+            if (v >= g_dbreg_nviews) {                          /* the end of the registry: the next call starts again */
+                v = b = 0;
+                wrapped = true;
+                break;
+            }
+            dbreg_view_t *rv = &g_dbreg_views[v];
+            if (b >= rv->nb) {
+                v++;
+                b = 0;
+                continue;
+            }
+            for (dbreg_zone_t *z = rv->tab[b]; z; z = z->next) {
+                visited++;
+                zone_db_entry_t *e = zdir_entry(z);
+                if (!e || e->source != ZONE_SRC_DB || e->evicted_bytes) continue;
+                zone_version_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
+                uint64_t bytes = (a && a->counted) ? a->bytes + atomic_load_explicit(&e->fixed_charged, memory_order_relaxed) : 0;
+                if (bytes == 0 || (z->flags & ZDIR_F_PIN) || atomic_load_explicit(&e->updated, memory_order_relaxed)) continue;
+                sumb += bytes;
+                nres++;
+                if (nc == s_room_cap) {
+                    size_t ncap = s_room_cap ? s_room_cap * 2 : 1024;
+                    cache_cand_t *n = realloc(s_room_cand, ncap * sizeof(*n));
+                    if (!n) continue;                           /* out of memory: take out what has been found */
+                    s_room_cand = n;
+                    s_room_cap = ncap;
+                }
+                /* the frequency the manager would have folded in by now (read-only: the manager's own pass does the folding and clears the marks) */
+                uint32_t q32 = (uint32_t)atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed);
+                uint32_t f = atomic_load_explicit(&z->freq, memory_order_relaxed);
+                uint32_t dq = q32 - z->qseen;
+                f = f > UINT32_MAX - dq ? UINT32_MAX : f + dq;
+                uint16_t fl = z->flags;
+                if ((fl & (ZDIR_F_XFRLOAD | ZDIR_F_BGLOAD)) && dq > 0) fl &= (uint16_t)~(ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD | ZDIR_F_BGLOAD);
+                const uint32_t age = now32 - z->t_load;
+                cache_cand_t *c = &s_room_cand[nc++];
+                c->rv = rv;
+                c->z = z;
+                c->bytes = bytes;
+                c->freq = f;
+                c->young = age < CACHE_MIN_RESIDENT_MS;
+                c->relax = c->young && age >= CACHE_ROOM_FLOOR_MS && atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed) != 0;
+                c->prio = cache_prio(fl, f, bytes, &c->next);
+            }
+            b++;
+        }
+        g_room_v = v;
+        g_room_b = b;
+        zone_bytes_t zb;
+        zone_bytes_get(ZBYTES_DB, &zb);
+        const uint64_t hard = cache_hard_line(limit), low = limit / 100 * CACHE_LOW_PCT;
+        const uint64_t room_for = (nres ? sumb / nres : 0) * nwant;                       /* the zones that wait: their number times the average size of a zone in memory */
+        uint64_t want = zb.resident + room_for > hard ? zb.resident + room_for - hard : 0;
+        const uint64_t cap = zb.resident > low ? zb.resident - low : 0;
+        if (want > cap) want = cap;                                                        /* (never below what the manager takes it to) */
+        uint64_t freed = 0;
+        if (want && nc) {
+            if (nc > 1) qsort(s_room_cand, nc, sizeof(*s_room_cand), cache_cand_cmp);
+            room_take_pass(s_room_cand, nc, false, want, &freed, &evicted, &nrelaxed, &boundary, &took_unflagged);
+            if (freed < want) room_take_pass(s_room_cand, nc, true, want, &freed, &evicted, &nrelaxed, &boundary, &took_unflagged);
+        }
+        pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+        if (freed >= want || wrapped) break;
+    }
+    if (took_unflagged) atomic_store_explicit(&g_victim_freq, boundary, memory_order_relaxed);
+    if (evicted) atomic_fetch_add_explicit(&g_room_evicted, evicted, memory_order_relaxed);
+    if (nrelaxed) atomic_fetch_add_explicit(&g_room_relaxed, nrelaxed, memory_order_relaxed);
+    if (relaxed_out) *relaxed_out = nrelaxed;
     return evicted;
 }
 

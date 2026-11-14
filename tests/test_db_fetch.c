@@ -1982,6 +1982,157 @@ int main(void) {
             gate_cfg("fetch-concurrency 256; fetch-rate 100000; memory-limit 1024g;", 256, 100000, 0);
         }
 
+        /* ======================================================================================================================================
+         * B2 W8: database { over-limit wait }.  Above the hard limit (110% of memory-limit) a request of a worker for a zone that is out of memory is not shed: it waits in the
+         * ingest thread (holding its place, token and claim mark), the thread takes zones out of memory to make room (dbreg_cache_make_room(); the manager is paused here, so
+         * the evictions are the ingest thread's), and the fetch is made.  The deadline is park-timeout; a reload to refuse sheds what waits; fetch-concurrency and the requests
+         * that are no worker's keep the old rules.  (The rules of what is taken out are tested in test_db_registry.)
+         * ====================================================================================================================================== */
+        {
+            printf("[B2 W8: over-limit wait, room on demand]\n");
+            CHECK(IS_COLD(12) && IS_COLD(13) && IS_COLD(14) && IS_COLD(15) && IS_COLD(16) && IS_COLD(17) && IS_COLD(18) && IS_COLD(19));
+            drain_wakes();
+            dbreg_cache_test_pause(true);
+            dbreg_cache_stats_t w0;
+            uint64_t wlim = 0;
+            const char *WCONF = "fetch-concurrency 256; fetch-rate 100000; park-timeout 400; over-limit wait;";
+            /* a limit that the zones in memory are 5% over the hard line of (resident = 115% of it); the mode is in force when dbstatus says so */
+            #define W8_OVER(conf, conc) do { dbreg_cache_stats(&w0); wlim = w0.resident * 100 / 115; gate_cfg((conf), (conc), 100000, wlim); \
+                                             CHECK(dbreg_cache_over_limit()); } while (0)
+            #define W8_MODE(wait) do { char st_[8192]; int i_ = 0; for (; i_ < 300; i_++) { st_[0] = 0; (void)db_ingest_status(NULL, NULL, st_, sizeof(st_)); \
+                                       if (strstr(st_, (wait) ? " over_limit=wait " : " over_limit=refuse ")) break; usleep(20000); } CHECK(i_ < 300); } while (0)
+            W8_OVER(WCONF, 256);
+            W8_MODE(true);
+            CHECK(dbreg_cache_over_wait());
+
+            /* room is made at once: the request is not shed and not kept waiting; the fetch goes to the loader, the zones in memory are under the hard line */
+            {
+                unsigned long long ev0 = st_field("cache", "evictions"), re0 = st_field("cache", "room_evictions"), sh0 = st_field("cache", "shed"), wt0 = st_field("cache", "room_waits");
+                CHECK(worker_ask(0, COLD_EL(12), "default", cz[12], KDB_FETCH_FULL) == 1);
+                CHECK(req_next(&fetch5, &m, 5000) && strcmp(m.u.fetch_req.name, cz[12]) == 0 && m.u.fetch_req.mode == KDB_FETCH_FULL);
+                CHECK(!dbreg_cache_over_limit());
+                CHECK(st_field("cache", "evictions") > ev0 && st_field("cache", "room_evictions") > re0 && st_field("cache", "shed") == sh0 && st_field("cache", "room_waits") == wt0);
+                CHECK(!park_wake_pending(park_wake_ring(0)) && park_places_used() == 1 && !park_claim_held(park_claim_key("default", cz[12])));
+                int zi = 0;
+                CHECK(sscanf(cz[12], "z%d", &zi) == 1);
+                send_zone(f5[0], &e, 0, cz[12], 1, m.u.fetch_req.request_id, 1000 + zi);
+                CHECK(wake_next(&k, 5000) && strcmp(k.zone, cz[12]) == 0 && !k.failed && wait_places(0, 2000));
+                CHECK(st_field("cache", "room_waiting") == 0);
+                (void)dbreg_test_evict("default", cz[12]);
+                drain_wakes();
+            }
+
+            /* no room can be made yet (the room is paused): the request waits and holds its place and its claim; a worker that asks for the same zone without a claim is dropped (the
+             * claim speaks for it); at the first tick after room can be made the fetch is issued, and both workers are woken when the zone is in */
+            {
+                W8_OVER(WCONF, 256);
+                dbreg_cache_test_room_pause(true);
+                unsigned long long sh0 = st_field("cache", "shed"), wt0 = st_field("cache", "room_waits"), to0 = st_field("cache", "room_timeouts");
+                uint64_t key13 = park_claim_key("default", cz[13]);
+                CHECK(worker_ask(0, COLD_EL(13), "default", cz[13], KDB_FETCH_FULL) == 1);
+                usleep(150000);
+                CHECK(!ch_next(&fetch5, &m2, 100));
+                CHECK(st_field("cache", "room_waiting") == 1 && st_field("cache", "room_waits") == wt0 + 1 && park_places_used() == 1 && park_claim_held(key13));
+                CHECK(fetch_gate(1, "default", COLD_EL(13), mono_ms()) == FETCH_GATE_ASK && park_places_used() == 1);                 /* (claimed: parks without a claim) */
+                CHECK(park_fetch_request(1, "default", cz[13], KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+                usleep(100000);
+                CHECK(st_field("cache", "room_waiting") == 1 && st_field("cache", "room_waits") == wt0 + 1 && park_places_used() == 1);   /* (a duplicate, dropped) */
+                CHECK(!park_wake_pending(park_wake_ring(0)) && !park_wake_pending(park_wake_ring(1)) && st_field("cache", "shed") == sh0);
+                dbreg_cache_test_room_pause(false);
+                CHECK(req_next(&fetch5, &m, 5000) && strcmp(m.u.fetch_req.name, cz[13]) == 0);
+                CHECK(!dbreg_cache_over_limit() && st_field("cache", "room_waiting") == 0 && park_places_used() == 1 && !park_claim_held(key13));   /* (the place stays with the fetch) */
+                CHECK(st_field("cache", "room_timeouts") == to0);
+                int zi = 0;
+                CHECK(sscanf(cz[13], "z%d", &zi) == 1);
+                send_zone(f5[0], &e, 0, cz[13], 1, m.u.fetch_req.request_id, 1000 + zi);
+                CHECK(wake_ring_next(0, &k1, 5000) && !k1.failed && wake_ring_next(1, &k1, 5000) && strcmp(k1.zone, cz[13]) == 0 && !k1.failed);
+                CHECK(wait_places(0, 2000));
+                (void)dbreg_test_evict("default", cz[13]);
+                drain_wakes();
+            }
+
+            /* no room before park-timeout (400 ms): the request is dropped without a word (the workers' queries time out on their own), place and claim go back, nothing is fetched,
+             * and it is not counted as shed */
+            {
+                W8_OVER(WCONF, 256);
+                dbreg_cache_test_room_pause(true);
+                unsigned long long sh0 = st_field("cache", "shed"), to0 = st_field("cache", "room_timeouts");
+                uint64_t key14 = park_claim_key("default", cz[14]);
+                int64_t t0 = mono_ms();
+                CHECK(worker_ask(0, COLD_EL(14), "default", cz[14], KDB_FETCH_FULL) == 1);
+                usleep(150000);
+                CHECK(st_field("cache", "room_waiting") == 1 && park_places_used() == 1 && park_claim_held(key14));
+                for (int i = 0; i < 400 && st_field("cache", "room_waiting") != 0; i++) usleep(10000);
+                int64_t dt = mono_ms() - t0;
+                CHECK(st_field("cache", "room_waiting") == 0 && dt >= 380 && dt < 3000);
+                CHECK(st_field("cache", "room_timeouts") == to0 + 1 && wait_places(0, 2000) && !park_claim_held(key14) && st_field("cache", "shed") == sh0);
+                CHECK(!park_wake_pending(park_wake_ring(0)) && !ch_next(&fetch5, &m2, 100));
+                dbreg_cache_test_room_pause(false);
+                drain_wakes();
+            }
+
+            /* a reload to refuse (the default) while a request waits: it is shed by the old rule (counted in `shed`, its worker is told "not ready"), the place goes back, and the gate
+             * refuses at once from then on */
+            {
+                W8_OVER(WCONF, 256);
+                dbreg_cache_test_room_pause(true);
+                unsigned long long sh0 = st_field("cache", "shed");
+                CHECK(worker_ask(0, COLD_EL(15), "default", cz[15], KDB_FETCH_FULL) == 1);
+                usleep(100000);
+                CHECK(st_field("cache", "room_waiting") == 1 && park_places_used() == 1);
+                gate_cfg("fetch-concurrency 256; fetch-rate 100000; park-timeout 400;", 256, 100000, wlim);
+                W8_MODE(false);
+                CHECK(!dbreg_cache_over_wait());
+                CHECK(wake_next(&k, 5000) && strcmp(k.zone, cz[15]) == 0 && k.failed);
+                CHECK(st_field("cache", "room_waiting") == 0 && st_field("cache", "shed") == sh0 + 1 && wait_places(0, 2000) && !park_claim_held(park_claim_key("default", cz[15])));
+                CHECK(worker_ask(0, COLD_EL(16), "default", cz[16], KDB_FETCH_FULL) == -1 && st_field("cache", "shed") == sh0 + 2 && park_places_used() == 0);
+                CHECK(!ch_next(&fetch5, &m2, 100));
+                dbreg_cache_test_room_pause(false);
+                drain_wakes();
+            }
+
+            /* fetch-concurrency 2 in wait mode: two requests wait for room holding the two places; the third is refused at the gate and, from a worker without the gate, shed by the
+             * ingest thread (no place), both counted in `shed`; when room can be made both waiting requests are fetched, the oldest first.  A request that is no worker's (a transfer
+             * thread) is shed as before even with places free. */
+            {
+                W8_OVER("fetch-concurrency 2; fetch-rate 100000; park-timeout 2000; over-limit wait;", 2);
+                W8_MODE(true);
+                dbreg_cache_test_room_pause(true);
+                unsigned long long sh0 = st_field("cache", "shed"), wt0 = st_field("cache", "room_waits");
+                CHECK(worker_ask(0, COLD_EL(16), "default", cz[16], KDB_FETCH_FULL) == 1 && worker_ask(0, COLD_EL(17), "default", cz[17], KDB_FETCH_FULL) == 1);
+                usleep(100000);
+                CHECK(st_field("cache", "room_waiting") == 2 && st_field("cache", "room_waits") == wt0 + 2 && park_places_used() == 2);
+                CHECK(worker_ask(1, COLD_EL(18), "default", cz[18], KDB_FETCH_FULL) == -1 && st_field("cache", "shed") == sh0 + 1);
+                drain_wakes();
+                CHECK(park_fetch_request(0, "default", cz[18], KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));                       /* (no gate, no claim: the ingest thread finds no place) */
+                CHECK(wake_next(&k, 5000) && strcmp(k.zone, cz[18]) == 0 && k.failed && st_field("cache", "shed") == sh0 + 2 && st_field("cache", "room_waiting") == 2);
+                dbreg_cache_test_room_pause(false);
+                kdb_msg_t r16, r17;
+                CHECK(req_next(&fetch5, &r16, 5000) && req_next(&fetch5, &r17, 5000) && park_places_used() == 2);
+                CHECK(strcmp(r16.u.fetch_req.name, cz[16]) == 0 && strcmp(r17.u.fetch_req.name, cz[17]) == 0);                 /* (the oldest first) */
+                CHECK(st_field("cache", "room_waiting") == 0 && !dbreg_cache_over_limit());
+                send_failed(f5[0], &e, 0, r16.u.fetch_req.name, r16.u.fetch_req.request_id);
+                send_failed(f5[0], &e, 0, r17.u.fetch_req.name, r17.u.fetch_req.request_id);
+                CHECK(wait_places(0, 2000));
+                drain_wakes();
+                /* over the line again with the places free: a request that is no worker's is shed (the transfer, the background and the warm-up do not wait for room) */
+                W8_OVER("fetch-concurrency 2; fetch-rate 100000; park-timeout 2000; over-limit wait;", 2);
+                W8_MODE(true);
+                sh0 = st_field("cache", "shed");
+                wt0 = st_field("cache", "room_waits");
+                CHECK(park_fetch_request_any("default", cz[19], KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+                for (int i = 0; i < 200 && st_field("cache", "shed") == sh0; i++) usleep(10000);
+                CHECK(st_field("cache", "shed") == sh0 + 1 && st_field("cache", "room_waits") == wt0 && st_field("cache", "room_waiting") == 0 && wait_places(0, 2000));
+                CHECK(!ch_next(&fetch5, &m2, 100));
+            }
+            #undef W8_OVER
+            #undef W8_MODE
+            dbreg_cache_test_room_pause(false);
+            dbreg_cache_test_pause(false);
+            gate_cfg("fetch-concurrency 256; fetch-rate 100000; memory-limit 1024g;", 256, 100000, 0);
+            drain_wakes();
+        }
+
         /* fetch-rate: a bucket of 3.  A request without a claim that finds it empty is refused by the ingest thread (counted in refused_by_rate, only the asking worker is
          * woken, the place it took goes back); the gate refuses before the worker parks (the same counter, the place goes back); a claim that is a duplicate gives its token back,
          * a failed fetch does not */

@@ -67,6 +67,8 @@ _Static_assert(ZDIR_APEX_GLUE_PER_NS == KDB_NOTIFY_ADDR_PER_NS && ZDIR_APEX_NADD
 #define ING_RBUF 65536
 #define ING_FLUSH_AT 16384        /* queued bytes that are written at once; the rest goes out after the event round */
 #define ING_FETCH_MAX 256         /* fetches in flight (D1a): more is refused, the queries then wait for their own deadline */
+#define ING_ROOM_MAX 256          /* 0.7 B2 W8: requests that wait for room (over-limit wait); each holds a place of fetch-concurrency, so there are never more than that (at most 256) */
+#define ING_ROOM_TICK_MS 10       /* ... and how often the thread looks again while some wait: a new attempt to make room, and their deadlines */
 #define ING_WARM_NFREQ 8          /* fetches in flight below which the zones nobody asked for yet (pins) are read */
 #define ING_SUMMARY_NFREQ 8       /* summary fetches (the apex of a zone out of memory, after a reload) in flight: they bring no zone data, so memory-limit does not hold them back, this does */
 /* ING_FETCH_LIMITED (16 in flight, fixed) held the reads of the whole server to what one fetch thread of the loader did (about 500 a second) and shed the rest, whatever
@@ -83,6 +85,8 @@ typedef struct {
   uint64_t max_zone_records, max_zone_bytes;
   uint64_t memory_limit;
   uint32_t fetch_rate;
+  bool over_wait;              /* over-limit wait (0.7 B2 W8) */
+  uint32_t park_timeout_ms;    /* park-timeout: how long a request waits for room */
   uint32_t fetch_concurrency, loader_threads;
   uint32_t xfr_timeout_ms;
   uint32_t ingest_threads;
@@ -268,6 +272,11 @@ typedef struct {
   dbreg_cursor_t apex_cur;               /* ... a few at a time, from here */
   uint32_t funsolicited;       /* zones nobody asked for, discarded (logged the first few) */
   bool fmore;                  /* B2 W5: the last fetch_issue() pass stopped at its bound (requests or time) with work left: the loop serves the streams and comes back */
+  /* 0.7 B2 W8, over-limit wait: the requests of the workers that wait for room (fetch_issue(), "room on demand"), oldest first (a ring: room_head, nroom).  Each holds what it
+   * held when it came (the place, the token, the claim mark of its zone) until it becomes a fetch or its deadline passes. */
+  struct ing_room { park_fetch_req_t q; uint64_t key; int64_t deadline_ms; bool place, tok; } room[ING_ROOM_MAX];
+  uint32_t room_head, nroom;
+  int64_t room_next_ms;                  /* no attempt to make room before this time (the last one did not make it) */
 } ing_t;
 
 enum { ROUT_NONE = 0, ROUT_APPLIED, ROUT_SHADOWED, ROUT_REJECTED, ROUT_FAILED, ROUT_DELETED };
@@ -528,6 +537,8 @@ static void fill_snap(const server_config_t *cfg, ing_cfg_t *c) {
     c->max_zone_bytes = cfg->database.max_zone_bytes;
     c->memory_limit = cfg->database.memory_limit;
     c->fetch_rate = cfg->database.fetch_rate;
+    c->over_wait = cfg->database.over_limit_wait;
+    c->park_timeout_ms = cfg->database.park_timeout_ms ? cfg->database.park_timeout_ms : PARK_DEFAULT_TIMEOUT_MS;
     c->fetch_concurrency = cfg->database.fetch_concurrency;
     c->loader_threads = cfg->database.loader_threads;
     c->xfr_timeout_ms = cfg->database.transfer_fetch_timeout_ms;
@@ -1317,6 +1328,10 @@ static _Atomic uint64_t g_fetch_shed;   /* fetch requests not made because of me
 static _Atomic uint32_t g_fetch_rate = KARIDNS_DB_FETCH_RATE_DEFAULT;   /* database { fetch-rate }: zones read for queries per second */
 static _Atomic uint64_t g_fetch_limited;  /* fetch requests not made because the rate was used up */
 static _Atomic uint32_t g_fetch_conc = KARIDNS_DB_FETCH_CONC_PER_THREAD;   /* fetches in flight while memory-limit is set (database { fetch-concurrency }) */
+/* 0.7 B2 W8, over-limit wait (the room queue of ing_t): requests that had to wait for room, requests that ran out of time (park-timeout) before there was, requests waiting now */
+static _Atomic uint64_t g_room_waits, g_room_timeouts;
+static _Atomic uint32_t g_room_waiting;
+static _Atomic uint32_t g_park_timeout_ms = PARK_DEFAULT_TIMEOUT_MS;   /* database { park-timeout }: the deadline of a request that waits for room (the workers' own is read at their start) */
 
 /* the limit of fetches in flight: fetch-concurrency, or loader-threads x KARIDNS_DB_FETCH_CONC_PER_THREAD (at least 16) when it is not set; never more than the table holds */
 static uint32_t fetch_conc_eff(uint32_t conc, uint32_t loader_threads) {
@@ -1334,6 +1349,7 @@ static void set_fetch_limits(const ing_cfg_t *c) {
   park_places_set_limit(eff);                /* the pool of places the workers and this thread draw from: a lower limit takes effect as the places in use are given back, none is lost */
   uint32_t rate = c->fetch_rate ? c->fetch_rate : KARIDNS_DB_FETCH_RATE_DEFAULT;
   atomic_store_explicit(&g_fetch_rate, rate, memory_order_relaxed);
+  atomic_store_explicit(&g_park_timeout_ms, c->park_timeout_ms ? c->park_timeout_ms : PARK_DEFAULT_TIMEOUT_MS, memory_order_relaxed);
   park_rate_set(rate);                       /* the bucket the workers' gate and this thread share (dns_park.c) */
 }
 /* the zones nobody asked for yet (the warm-up, the walk for apexes) use at most this many places of the limit or `cap`, half the limit at the most, so that the queries have the rest */
@@ -2984,6 +3000,66 @@ static void fetch_refuse(const park_fetch_req_t *q) {
   else park_wake_queue_one(q->worker, q->view, q->zone, true);
 }
 
+/* ---- 0.7 B2 W8: room on demand (database { over-limit wait }) ----
+ * A request of a worker for a zone that is out of memory, while the database zones are above the hard limit and over-limit is wait, is not refused: it goes into the room queue
+ * of the thread (g->room, oldest first) with the place, the token and the claim mark it holds, and the thread takes zones out of memory to make room for it
+ * (dbreg_cache_make_room(): the coldest first, the minimum residency only relaxed as far as needed; the rules are there).  When the zones in memory are back under the hard line
+ * the request goes the normal way (the duplicate check, the fetch).  When park-timeout is over before that, it is dropped without a word: the queries that waited for it
+ * time out at their workers (SERVFAIL + EDE 14, `park_timeout` in dbstatus) and place, token and claim mark go back.  Only the requests of workers wait (a transfer, the
+ * background and the warm-up are not queries and keep being shed).  The queue is as long as the places allow (each request in it holds one). */
+static void room_expire(ing_t *g, int64_t now) {
+  while (g->nroom > 0) {
+    struct ing_room *r = &g->room[g->room_head];
+    if (r->deadline_ms > now) break;
+    fetch_release(&r->place, &r->tok, &r->key);
+    g->room_head = (g->room_head + 1) % ING_ROOM_MAX;
+    g->nroom--;
+    atomic_fetch_add_explicit(&g_room_timeouts, 1, memory_order_relaxed);
+  }
+  atomic_store_explicit(&g_room_waiting, g->nroom, memory_order_relaxed);
+}
+
+/* May the oldest waiting request go on?  There is room, or the mode is off now (a reload: the request goes the normal way, which refuses it while the zones are over the limit).
+ * Otherwise make room (not more often than every ING_ROOM_TICK_MS when that did not help: the scan holds the registry lock). */
+static bool room_head_ready(ing_t *g, int64_t now) {
+  if (!dbreg_cache_over_wait() || !dbreg_cache_over_limit()) return true;
+  if (now < g->room_next_ms) return false;
+  (void)dbreg_cache_make_room(g->nroom, NULL);
+  if (!dbreg_cache_over_limit()) return true;
+  g->room_next_ms = now + ING_ROOM_TICK_MS;
+  return false;
+}
+
+static void room_pop(ing_t *g, park_fetch_req_t *q, bool *place, bool *tok, uint64_t *key) {
+  struct ing_room *r = &g->room[g->room_head];
+  *q = r->q;
+  *place = r->place;
+  *tok = r->tok;
+  *key = r->key;
+  r->place = r->tok = false;
+  r->key = 0;
+  g->room_head = (g->room_head + 1) % ING_ROOM_MAX;
+  g->nroom--;
+  atomic_store_explicit(&g_room_waiting, g->nroom, memory_order_relaxed);
+}
+
+/* The request waits for room: what it holds goes with it (false: the queue is full, the caller refuses it as before and keeps what it holds) */
+static bool room_push(ing_t *g, const park_fetch_req_t *q, bool *place, bool *tok, uint64_t *key, int64_t now) {
+  if (g->nroom >= ING_ROOM_MAX) return false;
+  struct ing_room *r = &g->room[(g->room_head + g->nroom) % ING_ROOM_MAX];
+  r->q = *q;
+  r->place = *place;
+  r->tok = *tok;
+  r->key = *key;
+  r->deadline_ms = now + (int64_t)atomic_load_explicit(&g_park_timeout_ms, memory_order_relaxed);
+  *place = *tok = false;
+  *key = 0;
+  g->nroom++;
+  atomic_store_explicit(&g_room_waiting, g->nroom, memory_order_relaxed);
+  atomic_fetch_add_explicit(&g_room_waits, 1, memory_order_relaxed);
+  return true;
+}
+
 static void fetch_issue(ing_t *g) {
   park_fetch_req_t q;
   bool warm = false;
@@ -2994,14 +3070,18 @@ static void fetch_issue(ing_t *g) {
   int handled = 0;
   int64_t t0 = mono_ns();
   g->fmore = false;
+  if (g->nroom > 0) room_expire(g, now_ms());            /* (0.7 B2 W8: the requests that waited for room until park-timeout) */
   for (;;) {
     fetch_release(&hold_place, &hold_tok, &hold_key);    /* (the request of the last round did not become a fetch: it was refused, a duplicate, or in memory) */
     if (++handled > ING_FETCH_SLICE_N || ((handled & 7) == 0 && mono_ns() - t0 >= ING_FETCH_SLICE_NS)) {
       g->fmore = true;
       break;
     }
-    if (park_fetch_next(&q)) {
-      warm = false;
+    if (g->nroom > 0 && room_head_ready(g, now_ms())) {  /* the oldest request that waited for room goes first (it holds its place, token and claim mark) */
+      warm = hot = false;
+      room_pop(g, &q, &hold_place, &hold_tok, &hold_key);
+    } else if (park_fetch_next(&q)) {
+      warm = hot = false;                                /* (a query's request is not of the hot list, whatever the item before it in this pass was) */
       hold_place = hold_tok = q.claimed;                 /* (a worker took both at its gate, and marked the zone) */
       if (q.claimed) hold_key = park_claim_key(q.view, q.zone);
     } else if (g->nwarm > 0 && warm_left > 0) {
@@ -3079,6 +3159,21 @@ static void fetch_issue(ing_t *g) {
         /* the places of fetch-concurrency are one pool (park_place_take()): a request from a worker's gate holds its place already, any other (a transfer, the
          * background, the warm-up, a worker without the gate) takes one here, so that fetches in flight and requests on their way together stay within the limit */
         bool over = dbreg_cache_over_limit();
+        if (over && !warm && q.worker >= 0 && dbreg_cache_over_wait()) {
+          /* over-limit wait (0.7 B2 W8): the query waits for room instead of being refused.  With none waiting before it, room is made now (the zones that the cache manager would take
+           * at its next round, the coldest first); if that does not bring the zones in memory under the hard line, or others wait already, the request joins the room queue (see
+           * "room on demand" above) with its place, its token and its claim mark.  A request that came without a claim takes its place here; none free: shed as before. */
+          if (!hold_place) hold_place = park_place_take();
+          if (hold_place) {
+            int64_t tn = now_ms();
+            if (g->nroom == 0 && tn >= g->room_next_ms) {
+              (void)dbreg_cache_make_room(1, NULL);
+              over = dbreg_cache_over_limit();
+              if (over) g->room_next_ms = tn + ING_ROOM_TICK_MS;
+            }
+            if (over && room_push(g, &q, &hold_place, &hold_tok, &hold_key, tn)) continue;
+          }
+        }
         if (!over && !hold_place) hold_place = park_place_take();
         if (over || !hold_place) {
           if (warm) {
@@ -3478,6 +3573,7 @@ static void *cache_thread(void *arg) {
     snapshot_cfg(&c);
     uint64_t lim = c.enabled ? c.memory_limit : 0;
     dbreg_cache_set_limit(lim);
+    dbreg_cache_set_over_wait(lim && c.over_wait);
     set_fetch_limits(&c);
     atomic_store_explicit(&g_xfr_timeout_ms, c.xfr_timeout_ms ? c.xfr_timeout_ms : KARIDNS_DB_XFR_FETCH_TIMEOUT_DEFAULT, memory_order_relaxed);
     struct timespec ts = { 0, lim ? 50 * 1000000L : 0 };
@@ -3514,6 +3610,7 @@ static void *ingest_thread(void *arg) {
       if (wait_ms < 0 || wait_ms > tick) wait_ms = tick;
     }
     if ((g->nwarm > 0 || (g->apex_walk && g->fetch_fd >= 0)) && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;      /* zones to read before a query asks, or the walk for apexes (while there is a fetch stream): try again soon */
+    if (g->nroom > 0 && (wait_ms < 0 || wait_ms > ING_ROOM_TICK_MS)) wait_ms = ING_ROOM_TICK_MS;     /* 0.7 B2 W8: requests wait for room: make room again, and look at their deadlines */
     if (g->hold && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;           /* warm-before-serve: look at the warm-up and the time often */
     if (wait_ms < 0 || wait_ms > 10000) wait_ms = 10000;                  /* (the busy share of dbstatus is closed at the end of a window, so the thread wakes at least that often) */
     if (g->fmore) wait_ms = 0;                                            /* B2 W5: the last pass of fetch_issue() stopped at its bound: serve what is ready on the streams, then go on */
@@ -3562,7 +3659,7 @@ static void *ingest_thread(void *arg) {
     if (g->inv_active) pump_inventory(g);
     if (g->need_cleanup) cleanup_stream_state(g);
     maybe_apply_delta(g);
-    if (g->nwarm > 0 || g->fmore || park_fetch_pending()) fetch_issue(g);
+    if (g->nwarm > 0 || g->fmore || g->nroom > 0 || park_fetch_pending()) fetch_issue(g);
     apex_walk_step(g);
     fetch_expire(g);
     park_wake_flush();
@@ -4027,11 +4124,13 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
               (unsigned long long)cs.xfr[DBREG_XFR_SUMMARY], (unsigned long long)cs.xfr_marked, (unsigned)atomic_load_explicit(&g_xfr_timeout_ms, memory_order_relaxed));
     if (cs.limit)
       st_append(&c, "cache: limit=%llu resident=%llu retired=%llu previous=%llu inflight=%llu held=%llu long_reader=%d evictions=%llu rounds=%llu cold=%llu marked=%llu misses=%llu "
-                    "shed=%llu pinned=%llu peak=%llu victim_freq=%u\n",
+                    "shed=%llu pinned=%llu peak=%llu victim_freq=%u over_limit=%s room_evictions=%llu room_relaxed=%llu room_waits=%llu room_timeouts=%llu room_waiting=%u\n",
                 (unsigned long long)cs.limit, (unsigned long long)cs.resident, (unsigned long long)cs.retired, (unsigned long long)cs.previous, (unsigned long long)cs.inflight, (unsigned long long)cs.held, cs.long_reader ? 1 : 0,
                 (unsigned long long)cs.evictions, (unsigned long long)cs.rounds, (unsigned long long)cs.cold, (unsigned long long)cs.marked,
                 (unsigned long long)cs.misses, (unsigned long long)(atomic_load_explicit(&g_fetch_shed, memory_order_relaxed) + ps.gate_shed),
-                (unsigned long long)cs.pinned_bytes, (unsigned long long)cs.peak, (unsigned)cs.victim_freq);
+                (unsigned long long)cs.pinned_bytes, (unsigned long long)cs.peak, (unsigned)cs.victim_freq, cs.over_wait ? "wait" : "refuse",
+                (unsigned long long)cs.room_evictions, (unsigned long long)cs.room_relaxed, (unsigned long long)atomic_load_explicit(&g_room_waits, memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(&g_room_timeouts, memory_order_relaxed), (unsigned)atomic_load_explicit(&g_room_waiting, memory_order_relaxed));
     else
       st_append(&c, "cache: no memory-limit (every database zone stays in memory)\n");
     st_append(&c, "apex: asked=%llu answered=%llu walking=%d walks=%llu queued=%u (summaries asked for after a reload, for the apex of zones out of memory; queued: zones in the list that wait for a free place or a token)\n",

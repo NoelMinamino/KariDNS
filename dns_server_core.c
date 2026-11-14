@@ -2314,7 +2314,8 @@ static int64_t park_now_ms(void) {
  *                       this query when it is done, and when it is shed or refused the ingest thread wakes every worker, not only the one that claimed)
  *   FETCH_GATE_TAKEN    a place and a token are held and the zone is marked as claimed: ask with PARK_PRIO_CLAIMED; whoever does not use the request gives them back
  *                       (park_claim_release(), which clears the mark)
- *   FETCH_GATE_REFUSE   the database zones are over the hard limit, or every place is taken (counted in `shed`), or the bucket is empty (`refused_by_rate`): "not ready" now */
+ *   FETCH_GATE_REFUSE   the database zones are over the hard limit (not with over-limit wait: see below), or every place is taken (counted in `shed`), or the bucket is empty
+ *                       (`refused_by_rate`): "not ready" now */
 STATIC_TEST int fetch_gate(int widx, const char *view, const zdir_elem_t *pel, int64_t now_ms) {
   if (!dbreg_cache_limit() || atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) != ZDIR_ST_ABSENT) return FETCH_GATE_ASK;
   /* (B2 M1) The zone is LOADING only when the ingest thread has popped the request, so workers that look meanwhile all see it ABSENT.  The first takes the place and the token
@@ -2322,7 +2323,9 @@ STATIC_TEST int fetch_gate(int widx, const char *view, const zdir_elem_t *pel, i
    * mark is one compare-and-swap (park_claim_mark(), the claims in dns_park.c). */
   uint64_t key = park_claim_key(view, pel->name);
   if (park_claim_held(key)) return FETCH_GATE_ASK;
-  if (dbreg_cache_over_limit() || !park_place_take()) {
+  /* (0.7 B2 W8) database { over-limit wait }: above the hard limit the query is not refused: it takes its place and token as below, parks, and the ingest thread makes room for
+   * the zone before it fetches it (or lets the query time out).  Every other refusal (no place, empty bucket) stays. */
+  if ((!dbreg_cache_over_wait() && dbreg_cache_over_limit()) || !park_place_take()) {
     park_gate_count(widx, false);
     return FETCH_GATE_REFUSE;
   }

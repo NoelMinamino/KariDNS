@@ -152,6 +152,7 @@ dbconf() {          # dbconf EXTRA [LOADER-PATH [LOADER-USER]]
 }
 dbconf 'acl-ceiling { 192.0.2.0/24; }; acl-ceiling-match all;'; fx conf.database.acl-ceiling-match conf "$T/f.conf"
 dbconf 'loader-state-file "'"$DBD"'/state"; warm-before-serve 5;'; fx conf.database.state-file conf "$T/f.conf"; fx conf.database.warm conf "$T/f.conf"
+dbconf 'over-limit wait;'; fx conf.database.over-limit conf "$T/f.conf"
 dbconf ''; fx conf.database.loader-answer conf "$T/f.conf"
 dbconf '' "$DBD/noanswer" root; fx conf.database.identity-root conf "$T/f.conf"
 

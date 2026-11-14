@@ -1046,6 +1046,80 @@ int main(void) {
         park_claim_release("default", el->name);
         CHECK(park_places_used() == 0);
 
+        /* 0.7 B2 W8, database { over-limit wait }: the database zones are over the hard limit (the test adds bytes to the database total: 1,000,000 against a limit of 100,000).
+         * With the default (refuse) the gate says no at once, counted in `shed`, and takes no place; with wait the query is gated like any other: place, token and claim,
+         * it parks and asks (the ingest thread makes room); the other reasons to refuse stay (no place, no token), and a zone whose fetch is queued is not asked for twice */
+        {
+            park_places_set_limit(2);
+            park_rate_set(1000000);
+            park_rate_reset();
+            zone_bytes_resident_add(ZBYTES_DB, 1000000);
+            dbreg_cache_set_limit(100000);
+            CHECK(dbreg_cache_over_limit());
+            dbreg_cache_set_over_wait(false);
+            park_stats_get(&g0);
+            CHECK(fetch_gate(0, "default", el, RNOW()) == FETCH_GATE_REFUSE && park_places_used() == 0);
+            park_stats_get(&g1);
+            CHECK(g1.gate_shed - g0.gate_shed == 1 && g1.gate_rate == g0.gate_rate);
+            SEND_QUERY(0xA001, true, 0);                                    /* (refuse: "not ready" at once, nothing parked, nothing asked) */
+            CHECK(w.n_tx == 1 && table.nwait == 0 && !park_fetch_pop(park_fetch_ring(0), &q) && park_places_used() == 0);
+            FLUSH();
+            a = read_answer(sk[1]);
+            CHECK(a.got && a.id == 0xA001 && a.rcode == 2 && a.ede == 14);
+            dbreg_cache_set_over_wait(true);
+            CHECK(dbreg_cache_over_wait());
+            park_stats_get(&g0);
+            CHECK(fetch_gate(0, "default", el, RNOW()) == FETCH_GATE_TAKEN && park_places_used() == 1 && park_claim_held(park_claim_key("default", el->name)));
+            CHECK(fetch_gate(1, "default", el, RNOW()) == FETCH_GATE_ASK && park_places_used() == 1);          /* (claimed: the second worker parks and asks without a claim) */
+            park_claim_release("default", el->name);
+            CHECK(park_places_used() == 0 && !park_claim_held(park_claim_key("default", el->name)));
+            SEND_QUERY(0xA002, true, 0);                                    /* (wait: parked, one request with the claim, no answer now) */
+            CHECK(w.n_tx == 0 && table.nwait == 1 && park_places_used() == 1);
+            CHECK(park_fetch_pop(park_fetch_ring(0), &q) && (q.prio & PARK_PRIO_CLAIMED) && (q.prio & 0x7F) == KDB_FETCH_PRIO_QUERY && q.mode == KDB_FETCH_FULL);
+            park_stats_get(&g1);
+            CHECK(g1.gate_shed == g0.gate_shed && g1.gate_rate == g0.gate_rate);        /* (nothing was refused) */
+            /* the ingest thread could not make room before the deadline: the query times out like any parked query (SERVFAIL + EDE 14); the place and the claim go back */
+            park_place_give();
+            park_claim_clear(park_claim_key("default", "park.test."));
+            CHECK(park_expire(&table, RNOW() + 100000) == 1);
+            park_service(&w, -1);
+            FLUSH();
+            a = read_answer(sk[1]);
+            CHECK(a.got && a.id == 0xA002 && a.rcode == 2 && a.ede == 14 && table.nwait == 0 && table.nfree == table.cap && park_places_used() == 0);
+            /* every place taken: still refused (fetch-concurrency applies in wait mode), counted in shed, no token lost */
+            CHECK(park_place_take() && park_place_take());
+            RATE3();
+            park_stats_get(&g0);
+            CHECK(fetch_gate(0, "default", el, RNOW()) == FETCH_GATE_REFUSE && park_places_used() == 2);
+            park_stats_get(&g1);
+            CHECK(g1.gate_shed - g0.gate_shed == 1 && RATE3_FULL());
+            park_place_give();
+            park_place_give();
+            /* no token: refused by rate in wait mode as well, the place goes back */
+            park_rate_set(1);
+            park_rate_reset();
+            CHECK(park_rate_take(RNOW(), false));
+            park_stats_get(&g0);
+            CHECK(fetch_gate(0, "default", el, RNOW()) == FETCH_GATE_REFUSE && park_places_used() == 0);
+            park_stats_get(&g1);
+            CHECK(g1.gate_rate - g0.gate_rate == 1);
+            park_rate_set(1000000);
+            park_rate_reset();
+            /* the mode is switched back (a reload): refused again at once */
+            dbreg_cache_set_over_wait(false);
+            CHECK(fetch_gate(0, "default", el, RNOW()) == FETCH_GATE_REFUSE && park_places_used() == 0);
+            /* wait, and the zones in memory are not over the hard line: the gate is the ordinary one */
+            dbreg_cache_set_over_wait(true);
+            dbreg_cache_set_limit(1000000);
+            CHECK(!dbreg_cache_over_limit());
+            CHECK(fetch_gate(0, "default", el, RNOW()) == FETCH_GATE_TAKEN && park_places_used() == 1);
+            park_claim_release("default", el->name);
+            CHECK(park_places_used() == 0);
+            dbreg_cache_set_over_wait(false);
+            zone_bytes_resident_add(ZBYTES_DB, -1000000);
+            park_places_set_limit(1);
+        }
+
         dbreg_cache_set_limit(0);
         park_places_set_limit(INT32_MAX);
         park_rate_set(0);

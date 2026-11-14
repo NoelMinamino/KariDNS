@@ -393,6 +393,7 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `conf.database.drivers-not-run` | warning | --drivers was not run because karicheck is run by root |
 | `conf.database.state-file` | warning | loader-state-file has no effect without memory-limit |
 | `conf.database.warm` | warning | warm-before-serve has no effect without memory-limit |
+| `conf.database.over-limit` | warning | over-limit has no effect without memory-limit |
 | `conf.database.acl-ceiling` | warning | no acl-ceiling: the ACLs of database zones refuse every client |
 | `conf.database.acl-ceiling-match` | warning | acl-ceiling-match all has no effect with one kind of entry |
 | `conf.database.file` | error | the SQLite3 database file does not exist |

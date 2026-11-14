@@ -37,6 +37,7 @@
 #include <syslog.h>
 #include <sys/stat.h>
 #include <ftw.h>
+#include <time.h>
 
 #include "../dns_config_parser.h"
 #include "../dns_db_install.h"
@@ -2378,6 +2379,144 @@ static void test_bgload_cache(void) {
     zone_retire_process(true);
 }
 
+/* ---- 0.7 B2 W8: room on demand (database { over-limit wait }): dbreg_cache_make_room() ---- */
+static uint32_t room_mono32(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+static zdir_elem_t *room_elem(const char *zone) {
+    zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+    zdir_elem_t *el = zdir_find_exact(snapshot_find_view(s, "default"), zone);
+    release_zone_snapshot(s);
+    return el;
+}
+/* the zone has been in memory `ms` milliseconds (what the minimum residency and the floor of the room on demand look at) */
+static void room_age(const char *zone, uint32_t ms) {
+    zdir_elem_t *el = room_elem(zone);
+    CHECK(el != NULL);
+    if (el) el->t_load = room_mono32() - ms;
+}
+static bool room_resident(const char *zone) { return dbreg_lookup_entry("default", zone) != NULL; }
+static uint64_t room_resident_bytes(void) {
+    zone_bytes_t zb;
+    zone_bytes_get(ZBYTES_DB, &zb);
+    return zb.resident;
+}
+/* n zones of equal size, all old (500 ms); the registry starts empty */
+static void room_setup(int n, const char *names[], int nrr) {
+    dbreg_reset();
+    rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+    for (int i = 0; i < n; i++) {
+        CHECK(add_zone("default", names[i], 1, nrr, 9600 + i) != NULL && snapshot_apply_db_delta() == 1);
+        room_age(names[i], 500);
+    }
+}
+static void room_teardown(void) {
+    dbreg_cache_set_limit(0);
+    zone_retire_process(true);
+    dbreg_reset();
+    rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+}
+
+static void test_room_on_demand(void) {
+    printf("[TEST] room on demand (over-limit wait): the coldest first, only as much as is needed, the minimum residency relaxed only for zones that served their queries...\n");
+    dbreg_cache_stats_t s0, s1;
+    uint32_t rel = 0;
+
+    /* no limit: nothing to take */
+    CHECK(dbreg_cache_make_room(1, &rel) == 0 && rel == 0);
+
+    /* S1: eight zones.  r0, r1 are hot (frequency), r2 is pinned, r3 was changed by an UPDATE, r4 came in just now and has served nobody, r5 came in 50 ms ago and has served
+     * queries, r6 and r7 are old and cold.  The limit puts the zones 12% over the limit: over the hard line (10%) by a little. */
+    {
+        const char *nm[8] = { "r0.test.", "r1.test.", "r2.test.", "r3.test.", "r4.test.", "r5.test.", "r6.test.", "r7.test." };
+        room_setup(8, nm, 20);
+        dbreg_warm_freq("default", "r0.test.", 100000);
+        dbreg_warm_freq("default", "r1.test.", 100000);
+        room_elem("r2.test.")->flags |= ZDIR_F_PIN;
+        atomic_store(&dbreg_lookup_entry("default", "r3.test.")->updated, true);
+        room_age("r4.test.", 0);                                                  /* (unserved: protected for its minimum residency) */
+        room_age("r5.test.", 50);
+        atomic_store(&dbreg_lookup_entry("default", "r5.test.")->observatory.queries_total, 3);
+        const uint64_t R = room_resident_bytes();
+        dbreg_cache_set_limit(R * 100 / 112);
+        CHECK(dbreg_cache_over_limit());
+        dbreg_cache_stats(&s0);
+        uint32_t n = dbreg_cache_make_room(1, &rel);
+        dbreg_cache_stats(&s1);
+        CHECK(n >= 1 && n <= 2 && rel == 0);                                       /* (a zone or two, none of them young) */
+        CHECK(!dbreg_cache_over_limit());                                          /* (there is room for the zone that waits) */
+        CHECK(s1.room_evictions == s0.room_evictions + n && s1.room_relaxed == s0.room_relaxed && s1.evictions == s0.evictions + n);
+        CHECK(!room_resident("r6.test.") && (n == 2) == !room_resident("r7.test."));      /* (the old cold ones go, in the order of their priority) */
+        CHECK(room_resident("r0.test.") && room_resident("r1.test.") && room_resident("r2.test.") && room_resident("r3.test.") && room_resident("r4.test.") &&
+              room_resident("r5.test."));                                          /* (hot, pinned, changed by an UPDATE, young: stay) */
+
+        /* S2: far more is wanted than the old zones that can go: the hot old ones go first (pass one), then the young zone that has served its queries (pass two); the young zone that
+         * has served nobody, the pinned zone and the changed zone stay whatever is wanted */
+        dbreg_cache_set_limit(room_resident_bytes() / 4);
+        CHECK(dbreg_cache_over_limit());
+        dbreg_cache_stats(&s0);
+        n = dbreg_cache_make_room(1, &rel);
+        dbreg_cache_stats(&s1);
+        CHECK(n >= 2 && rel == 1 && s1.room_relaxed == s0.room_relaxed + 1 && s1.room_evictions == s0.room_evictions + n);
+        CHECK(!room_resident("r0.test.") && !room_resident("r1.test.") && !room_resident("r5.test."));
+        CHECK(room_resident("r4.test.") && room_resident("r2.test.") && room_resident("r3.test."));
+        /* the unserved young zone is taken after its minimum residency, not before: served but younger than the floor (10 ms) stays, older than it goes (and counts as relaxed) */
+        atomic_store(&dbreg_lookup_entry("default", "r4.test.")->observatory.queries_total, 1);
+        room_age("r4.test.", 0);
+        CHECK(dbreg_cache_make_room(1, &rel) == 0 && room_resident("r4.test."));
+        room_age("r4.test.", 30);
+        dbreg_cache_stats(&s0);
+        CHECK(dbreg_cache_make_room(1, &rel) == 1 && rel == 1 && !room_resident("r4.test.") && room_resident("r2.test.") && room_resident("r3.test."));
+        dbreg_cache_stats(&s1);
+        CHECK(s1.room_relaxed == s0.room_relaxed + 1);
+        /* a pinned zone and a zone changed by an UPDATE: nothing more can go, however much is wanted (the caller's request waits, then times out) */
+        CHECK(dbreg_cache_make_room(8, &rel) == 0 && room_resident("r2.test.") && room_resident("r3.test."));
+        /* a zone that was taken out and is being fetched again (LOADING) is not a candidate: it has no data to take out */
+        CHECK(!room_resident("r6.test.") && dbreg_fetch_begin("default", "r6.test.") == DBREG_FETCH_STARTED);
+        CHECK(dbreg_cache_make_room(8, &rel) == 0 && !room_resident("r6.test."));
+        dbreg_fetch_end("default", "r6.test.");
+        room_teardown();
+    }
+
+    /* S3: as much as is needed and not more.  Thirty zones of one size, all old, the zones are 112% of the limit (over the hard line by 1.8% of the zones' bytes): room for one zone
+     * that waits takes two zones; room for three takes four; and with the limit far below the zones the manager's low mark (90% of the limit) is the floor, so a burst of waiting
+     * requests cannot empty the cache */
+    {
+        enum { NZ = 30 };
+        static char nmb[NZ][16];
+        const char *nm[NZ];
+        for (int i = 0; i < NZ; i++) {
+            snprintf(nmb[i], sizeof(nmb[i]), "q%d.test.", i);
+            nm[i] = nmb[i];
+        }
+        uint32_t got[2] = { 0, 0 };
+        for (int round = 0; round < 2; round++) {
+            room_setup(NZ, nm, 5);
+            const uint64_t R = room_resident_bytes();
+            dbreg_cache_set_limit(R * 100 / 112);
+            CHECK(dbreg_cache_over_limit());
+            got[round] = dbreg_cache_make_room(round == 0 ? 1 : 3, &rel);
+            CHECK(rel == 0 && !dbreg_cache_over_limit());
+            room_teardown();
+        }
+        CHECK(got[0] == 2 && got[1] == 4);
+        room_setup(NZ, nm, 5);
+        const uint64_t R = room_resident_bytes();
+        dbreg_cache_set_limit(R / 2);
+        uint32_t n = dbreg_cache_make_room(200, &rel);
+        const uint64_t after = room_resident_bytes(), low = (R / 2) / 100 * 90, one = R / NZ;
+        CHECK(n >= 16 && n <= 17 && after > 0 && after + one >= low);              /* (the low mark of the manager, less a zone at the most: the room made is capped by it) */
+        room_teardown();
+    }
+    CHECK(zone_bytes_underflows() == 0);
+}
+
 /* ---- karictl rollback for DB zones: prev from a database install, the memory limit drops it first, a rollback pins the zone ---- */
 static void test_prev_db(void) {
     printf("[TEST] rollback of DB zones: prev from an install, the cache manager drops it before it evicts a zone, a rollback pins the zone...\n");
@@ -2780,6 +2919,7 @@ int main(void) {
     test_zone_bytes();
     test_prev_db();
     test_bgload_cache();
+    test_room_on_demand();
     test_prev_concurrent();
     test_evict_drops_ixfr_history();
     test_zone_fixed_charge();

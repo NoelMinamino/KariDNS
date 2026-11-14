@@ -141,7 +141,8 @@ bool park_wake_pending(const park_wake_ring_t *r);
 /* ---- the worker's decision before it parks a query and asks for its zone (implemented in dns_server_core.c, used by the UDP and the TCP path; tests call it) ----
  * FETCH_GATE_ASK: no claim, ask as before (no gate; or the zone is LOADING; or a worker has claimed the zone already, see "the claims" in dns_park.c: park, and ask without
  * a claim).  FETCH_GATE_TAKEN: a place and a token are held and the zone is marked as claimed, ask with PARK_PRIO_CLAIMED and give them back with park_claim_release() if
- * the request is not made.  FETCH_GATE_REFUSE: answer "not ready" now (counted in `shed` or `refused_by_rate`).  w: the worker's ring index; view: the name of the view
+ * the request is not made.  FETCH_GATE_REFUSE: answer "not ready" now (counted in `shed` or `refused_by_rate`; with database { over-limit wait } the database zones being over the
+ * hard limit is not a reason: the request waits for room in the ingest thread).  w: the worker's ring index; view: the name of the view
  * that holds the zone (zdir_holder_view(), what the request carries). */
 enum { FETCH_GATE_ASK = 0, FETCH_GATE_TAKEN, FETCH_GATE_REFUSE };
 int fetch_gate(int w, const char *view, const zdir_elem_t *pel, int64_t now_ms);

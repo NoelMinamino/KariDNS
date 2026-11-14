@@ -3656,6 +3656,25 @@ about 400 before, when every zone opened a database connection of its own), so
 this limit is the one that counts: raise it where the server must warm up
 quickly after a start or where many cold zones are asked for at once.
 .TP 8
+\fBover\-limit refuse|wait;\fR
+\fIDefault:\fR \fBrefuse\fR
+.br
+\fIDescription:\fR 0.7, with \fBmemory\-limit\fR: what a query for a zone that
+is out of memory gets while the zones in memory are above the hard line, 110% of
+\fBmemory\-limit\fR. \fBrefuse\fR (the default, as before): SERVFAIL + EDE 14 at
+once, counted as \fBshed\fR. \fBwait\fR: the query parks like any other (up to
+\fBpark\-timeout\fR), the ingest thread takes zones out of memory on demand to
+make room (the coldest first, the minimum residency of 100 ms relaxed only as
+far as needed and only for zones that have answered a query), fetches the zone,
+and the query is answered from it; when there is no room before
+\fBpark\-timeout\fR the answer is SERVFAIL + EDE 14 as for any parked
+query. \fBfetch\-concurrency\fR and \fBfetch\-rate\fR apply in both modes (a
+request that waits for room holds its place and its token). A reload (\fBkarictl
+reconfig\fR, SIGHUP) switches the mode; without \fBmemory\-limit\fR it has no
+effect (\fBkaricheck conf\fR says so). See "Over the hard line: refuse or wait"
+under "Memory limit" below. \fBdbstatus\fR shows the mode as \fBover_limit=\fR
+in the \fBcache:\fR line.
+.TP 8
 \fBmemory\-limit <size>;\fR
 \fIDefault:\fR none
 .br
@@ -4174,36 +4193,199 @@ top: the directory (every zone of the database, in memory or not), the response
 cache, the park tables, the threads' buffers and the allocator's slack. \fBThe
 formula (0.7):\fR the resident size of the Backend is about \fB70 MB + 0.45 KB x
 (zones in the database) + the \fBresident\fB bytes of the \fBcache:\fB line of
-\fBkarictl dbstatus\fB\fR, and \fBresident\fR stays about at the limit once the
-limit is reached (it reaches 90% to 105% of it). Each part was measured on the
-build host (FreeBSD 15.1, jemalloc, 8 virtual CPUs, SQLite3, zones of eleven
-records, every zone asked for once so that the limit evicts): with 50,000 zones
-in the database the resident size was 110 MB at \fBmemory\-limit 20M\fR, 128 MB
-at \fB40M\fR and 165 MB at \fB80M\fR (1.00 bytes of resident size for every byte
-\fBresident\fR grew), and with 20,000 zones 98 MB at \fB20M\fR and 116 MB at
-\fB40M\fR; the formula is within 2% of all five points. The 0.45 KB a zone of
-the database is what the two sizes of database differ by; the million-zone bench
-of 0.7 had a fixed part of about 350 MB at 1,000,000 zones, about 0.3 KB a zone,
-so 0.45 KB is the safer figure to plan with. With every zone of the database in
-memory and no limit the same formula holds with \fBresident\fR = what
-\fBdbstatus\fR shows (20,000 zones: 88 MB resident size for 42.6 MB
-\fBresident\fR; 50,000 zones: 159 MB for 106.4 MB). \fBBefore 0.7 the limit did
-not count the entry, its lock and the allocator's rounding\fR, so the Backend
-needed about 2.5 times the limit for the zones (3.2 KB of memory for each 1.3 KB
-counted: 177 MB at \fBmemory\-limit 40M\fR and 50,000 zones, against 128 MB
-now); the figure of "about 700 MB at \fB512M\fR" that this manual gave for a
-million zones was wrong for small zones. \fBSizing example:\fR to keep the
-Backend within about 1.5 GB of RAM with a million zones, the formula gives 70 MB
-+ 0.45 GB for the directory + the limit, so \fBmemory\-limit 1G\fR is the
-largest that fits (\fB512M\fR: about 1.0 GB; \fB1G\fR: about 1.5 GB); never set
-the limit to the RAM you have, and leave room for a burst of transfers (the
-limit is a target, see below). The 0.45 KB a zone and the 70 MB were fitted on
-20,000 to 50,000 zones and are extrapolated to a million: they are the figures
-of one host and one data set, not a guarantee, so watch \fBresidency\fR and
-\fBcache\fR in \fBkarictl dbstatus\fR and the process's own resident size for a
-few days before relying on a figure, and leave the memory of the loader process
-(\fBloader\-threads\fR connections and one zone per worker) out of the Backend's
-share.
+\fBkarictl dbstatus\fB\fR, and \fBresident\fR stays at 90% to 95% of the limit
+once the limit is reached. The loader is a separate process and comes on top
+(see below). The formula was checked on the build host (FreeBSD 15.1 amd64,
+jemalloc, 8 virtual CPUs, SQLite3, zones of eleven records and of about 100
+records, every zone asked for once so that the limit evicts) at 100,000 and
+1,000,000 zones with limits of 64M, 256M and 1G: it is within \-4% to +9% of all
+eight points (1,000,000 zones: 566 MB at \fB64M\fR, 732 MB at \fB256M\fR, 1,409
+MB at \fB1G\fR; the formula gives 577, 760 and 1,471 MB). \fBBefore 0.7 the
+limit did not count the entry, its lock and the allocator's rounding\fR, so the
+Backend needed about 2.5 times the limit for the zones; the figure of "about 700
+MB at \fB512M\fR" that this manual gave for a million zones was wrong for small
+zones. \fBSizing example:\fR to keep the Backend within about 1.5 GB of RAM with
+a million zones, the formula gives 70 MB + 0.45 GB for the directory + the
+limit, so \fBmemory\-limit 1G\fR is the largest that fits (\fB512M\fR: about 1.0
+GB; \fB1G\fR: about 1.5 GB); never set the limit to the RAM you have, and leave
+room for a burst of transfers (the limit is a target, see below). The figures
+are those of one host and one data set, not a guarantee: watch \fBresidency\fR
+and \fBcache\fR in \fBkarictl dbstatus\fR and the process's own resident size
+for a few days before relying on a figure. The tables below show the
+measurements.
+.RS 2
+.PP
+\fBMemory by number of zones.\fR The resident size of the Backend (\fBps \-o
+rss\fR) 10 seconds after the load, in MB, one \fBkaridns\fR on an idle
+host. \fISmall\fR is a zone of 11 records (SOA, 2 NS, A, MX, 6 A hosts),
+\fImedium\fR one of 98 records. "DB, all resident" is a database without
+\fBmemory\-limit\fR.
+.PP
+.TS
+rb rbw(12) rbw(13) rbw(13) rbw(13)
+r rw(12) rw(13) rw(13) rw(13).
+\&Zones	T{
+Zone files, small
+T}	T{
+DB, all resident, small
+T}	T{
+Zone files, medium
+T}	T{
+DB, all resident, medium
+T}
+_
+\&100	\&37	\&36	\&36	\&38
+\&1,000	\&39	\&39	\&47	\&50
+\&10,000	\&62	\&60	\&159	\&158
+\&100,000	\&304	\&280	\&1,281	\&1,232
+\&1,000,000	\&2,663	\&2,461	T{
+not measured (about 12 GB, more than the host has)
+T}	\&not measured
+.TE
+.PP
+The fixed part is about 35 MB. A zone costs about 2.4 to 2.7 KB when it has 11
+records and about 12 KB when it has 98 records, so the cost follows the number
+of records far more than the number of zones; a zone from a file costs about 0.2
+KB more than the same zone from the database, and loading a million zone files
+took 188 s against 34 s for the same zones from SQLite3. The routers and the
+manager show the same resident size as the Backend with zone files, but they
+share those pages with it: the host's memory use rose by the Backend's size once
+(2,657 MB for 1,000,000 small zone files), so count the Backend's resident size
+once, not the sum of the processes.
+.PP
+\fBWith \fBmemory\-limit\fB\fR (database zones, every zone asked for once after
+the start, Backend and loader in MB, \fBresident\fR = the \fBresident\fR bytes
+of the \fBcache:\fR line; the zones are in memory only as far as the limit lets
+them):
+.TP 8
+100,000
+\fIZone size:\fR small
+.br
+\fImemory-limit:\fR 64M
+.br
+\fIZones in memory:\fR 25,957
+.br
+\fIresident:\fR 57
+.br
+\fIBackend:\fR 184
+.br
+\fILoader:\fR 145
+.TP 8
+100,000
+\fIZone size:\fR small
+.br
+\fImemory-limit:\fR 256M
+.br
+\fIZones in memory:\fR 100,000 (all)
+.br
+\fIresident:\fR 218
+.br
+\fIBackend:\fR 317
+.br
+\fILoader:\fR 13
+.TP 8
+100,000
+\fIZone size:\fR medium
+.br
+\fImemory-limit:\fR 64M
+.br
+\fIZones in memory:\fR 5,545
+.br
+\fIresident:\fR 59
+.br
+\fIBackend:\fR 183
+.br
+\fILoader:\fR 103
+.TP 8
+100,000
+\fIZone size:\fR medium
+.br
+\fImemory-limit:\fR 256M
+.br
+\fIZones in memory:\fR 21,432
+.br
+\fIresident:\fR 230
+.br
+\fIBackend:\fR 377
+.br
+\fILoader:\fR 103
+.TP 8
+100,000
+\fIZone size:\fR medium
+.br
+\fImemory-limit:\fR 1G
+.br
+\fIZones in memory:\fR 90,388
+.br
+\fIresident:\fR 971
+.br
+\fIBackend:\fR 1,164
+.br
+\fILoader:\fR 101
+.TP 8
+1,000,000
+\fIZone size:\fR small
+.br
+\fImemory-limit:\fR 64M
+.br
+\fIZones in memory:\fR 26,225
+.br
+\fIresident:\fR 57
+.br
+\fIBackend:\fR 566
+.br
+\fILoader:\fR 635
+.TP 8
+1,000,000
+\fIZone size:\fR small
+.br
+\fImemory-limit:\fR 256M
+.br
+\fIZones in memory:\fR 109,233
+.br
+\fIresident:\fR 240
+.br
+\fIBackend:\fR 732
+.br
+\fILoader:\fR 632
+.TP 8
+1,000,000
+\fIZone size:\fR small
+.br
+\fImemory-limit:\fR 1G
+.br
+\fIZones in memory:\fR 432,041
+.br
+\fIresident:\fR 951
+.br
+\fIBackend:\fR 1,409
+.br
+\fILoader:\fR 635
+.PP
+Before any zone is asked for, the Backend holds only the directory: 67 MB at
+100,000 zones and about 340 MB at 1,000,000. With the same zones and no limit
+the loader needed 54 MB (100,000 zones) and 213 MB (1,000,000).
+.PP
+\fBHow to read it.\fR The Backend is a fixed part (about 70 MB with the threads'
+buffers and the park tables), plus about 0.45 KB for each zone of the database
+that is in the directory (also for a zone that is out of memory;
+\fBmemory\-limit\fR does not bound it), plus what the zones in memory hold,
+which is the part \fBmemory\-limit\fR bounds (at 90% to 95% of it). The loader
+is not bounded by it either: with \fBmemory\-limit\fR it read the summaries of
+all the zones at the start, so it needed about 550 MB at 1,000,000 zones and 635
+MB once zones were being read for queries (about 65 to 150 MB at 100,000 zones),
+and it must be counted on top of the Backend (without a limit it is smaller,
+about 0.2 KB a zone, because it only streams). \fBRule of thumb:\fR
+\fBmemory\-limit\fR = (the memory you can give the server - 70 MB - 0.45 KB x
+zones - the loader's share) / 1.1, rounded down, and then at most 1.5 times that
+in a burst (see below). For 1,000,000 small zones and 2 GB for the Backend and
+the loader together that is about \fB512M\fR (Backend about 1.0 GB, loader 0.6
+GB). If the zones asked for in a day fit under the limit nothing is taken out;
+if the working set is larger, a higher limit trades memory for fewer waits
+(\fBmisses\fR and \fBhit_rate\fR in \fBkarictl dbstatus\fR). Without a limit,
+plan about 2.5 KB for each small zone (and the zone's own size for a larger one)
+on top of the fixed part.
+.RE
 .IP \(bu 2
 \fBSOA questions for a zone that is out of memory.\fR The summary of a zone that
 sends NOTIFY (the effective \fBnotify\fR is not \fBno\fR) or has
@@ -4484,9 +4666,10 @@ cheaper ones that are only too young would cover what is left. What keeps the
 overshoot bounded: no zone is read for a query while the database zones are
 above \fB110%\fR of the limit, nor while \fBfetch\-concurrency\fR reads are
 already waiting (default \fBloader\-threads\fR x 16) (the queries then get
-SERVFAIL + EDE 14 at once), and \fBfetch\-rate\fR limits how fast zones are
-read. The expected overshoot is the zones read in about a second at the rate the
-queries ask for zones that are out of memory: with the load of
+SERVFAIL + EDE 14 at once; with \fBover\-limit wait\fR they wait for room
+instead, see below), and \fBfetch\-rate\fR limits how fast zones are read. The
+expected overshoot is the zones read in about a second at the rate the queries
+ask for zones that are out of memory: with the load of
 \fBtests/run_db_cache_test.sh\fR (4 clients, about 1000 queries a second, 28% of
 them for zones that are out of memory) the largest value seen was 108% of the
 limit; the test accepts at most 115% plus 256 KB. Where the 1.5 comes from: what
@@ -4514,8 +4697,72 @@ such a reader (sampled every second); the cache manager does not count them
 them, and a version a stalled outbound zone transfer pins is counted the same
 way.
 .IP \(bu 2
+\fBOver the hard line: refuse or wait (\fBover\-limit\fB, 0.7).\fR The 110% line
+that keeps the overshoot bounded (above) can be handled in two ways, chosen with
+\fBdatabase { over\-limit refuse|wait; }\fR. \fB\fBrefuse\fB\fR (the default) is
+what is described above: a query for a zone that is out of memory is answered
+SERVFAIL + EDE 14 at once while the zones in memory are above 110% of the limit,
+and the client asks again (a resolver does); the cache manager, which runs every
+50 ms and does not take a zone that came in less than 100 ms ago, brings the
+memory down meanwhile. \fB\fBwait\fB\fR is for servers on which queries for
+zones that do not fit \fBmemory\-limit\fR are normal (a million zones and a
+small limit): the worker does not refuse the query. It takes its place of
+\fBfetch\-concurrency\fR and its token of \fBfetch\-rate\fR as for any query for
+a zone out of memory, parks the query (UDP and TCP; DoT and DoH do not park and
+still get SERVFAIL + EDE 14) and asks for the zone; the ingest thread, seeing
+the zones in memory above the hard line, takes zones out of memory \fBnow\fR (no
+waiting for the next round of the manager) and fetches the zone when the zones
+in memory are back under the line; the query is answered from it, on its first
+try. A request that waits for room holds its place, its token and the mark of
+its zone, so a second query for the same zone does not ask twice; they wait in
+the order they came. If there is no room before \fBpark\-timeout\fR (nothing can
+be taken out: everything that is left is pinned, changed by an UPDATE, or too
+young), the request is dropped and the queries get SERVFAIL + EDE 14 when their
+own time is up, like any parked query (counted in \fBpark_timeout\fR of the
+\fBfetchq:\fR line and in \fBroom_timeouts\fR; the retry of the client then
+finds the zones that the manager has taken out meanwhile). A query that finds no
+place free, or no token, is refused at once in both modes (\fBshed\fR,
+\fBrefused_by_rate\fR): \fBwait\fR does not raise \fBfetch\-concurrency\fR. Zone
+transfers, the background fetches (a CNAME or the glue of a name server) and the
+warm-up are not queries and do not wait for room: they are shed above the line
+as before.
+.RS 2
+.IP \(bu 2
+\fBWhat is taken out, and how thrashing is avoided.\fR The same order as the
+cache manager's round: zones marked evict-next first, then the lowest frequency
+per byte (GDSF), so the coldest zones go first; pinned zones, zones a dynamic
+UPDATE changed and zones that a transfer reads never go; a zone that is not in
+memory (being fetched) has nothing to take. \fBOnly as much as is needed\fR:
+what the hard line is exceeded by, plus room for the requests that wait (their
+number times the average size of the zones in memory), and never below the
+manager's low mark (90% of the limit), so a burst of waiting requests cannot
+empty the cache. \fBThe minimum residency is kept for every zone that is not
+needed\fR: a zone that came into memory less than 100 ms ago is taken only when
+the older zones do not cover what is needed, and only when it has answered at
+least one query (so nobody waits for it: a parked query waits for a zone that is
+\fInot\fR in memory, and a woken one is answered within a turn of the worker's
+loop) and has been in memory for 10 ms; a zone that has served nobody yet, such
+as one that was just fetched for a query that is still being answered, is never
+taken before its 100 ms are over. The slice of the registry that is looked at is
+the manager's (20000 zones at a time, a few slices at most for one request), and
+the scan is not repeated within 10 ms when it found nothing, so a burst cannot
+make the thread scan the registry for every request. \fBdbstatus\fR shows the
+counts: \fBroom_evictions\fR (zones taken out on demand, also in
+\fBevictions\fR) and \fBroom_relaxed\fR (of those, the ones younger than 100
+ms).
+.IP \(bu 2
+\fBWhat it costs.\fR The memory of a zone that is taken out is freed after the
+next publication of the zones and the drain of the older snapshot (100 ms to a
+second, see above) and counts in \fBretired\fR until then, while the fetches
+that the room is made for go on at \fBfetch\-rate\fR: with \fBwait\fR the zones
+in memory plus \fBretired\fR can therefore pass the 110% more than with
+\fBrefuse\fR (which would have refused the queries meanwhile), by about the
+zones read in that time. Set \fBmemory\-limit\fR with that margin, and
+\fBfetch\-rate\fR to what the host and the database can read.
+.RE
+.IP \(bu 2
 \fB\fBkarictl dbstatus\fB\fR has a line \fBcache:
-limit=... resident=... retired=... previous=... inflight=... held=... long_reader=... evictions=... rounds=... cold=... marked=... misses=... shed=... pinned=... peak=... victim_freq=...\fR:
+limit=... resident=... retired=... previous=... inflight=... held=... long_reader=... evictions=... rounds=... cold=... marked=... misses=... shed=... pinned=... peak=... victim_freq=... over_limit=... room_evictions=... room_relaxed=... room_waits=... room_timeouts=... room_waiting=...\fR:
 \fBretired\fR is what was replaced or taken out and is not freed yet,
 \fBinflight\fR the part of it that was taken out, \fBheld\fR (0.7) the part of
 it that a reader or a transfer holds (versions kept after a short wait for their
@@ -4530,7 +4777,14 @@ not kept (admission), \fBmisses\fR the queries that had to wait for a zone,
 \fBshed\fR the reads not made because of the 110% bound or because every place
 of \fBfetch\-concurrency\fR was taken (counted where the query was turned away:
 at the worker or at the ingest thread), \fBpeak\fR the largest resident +
-retired + previous seen when a zone was installed or a round ran.
+retired + previous seen when a zone was installed or a round ran,
+\fBover_limit\fR (0.7) the mode of \fBover\-limit\fR (\fBrefuse\fR or
+\fBwait\fR), \fBroom_evictions\fR the zones taken out on demand for queries that
+waited for room and \fBroom_relaxed\fR the ones of them that were younger than
+the minimum residency, \fBroom_waits\fR the requests that had to wait for room,
+\fBroom_timeouts\fR those that ran out of \fBpark\-timeout\fR before there was
+room, \fBroom_waiting\fR those that wait now (all since the start except
+\fBroom_waiting\fR and \fBover_limit\fR).
 .IP \(bu 2
 \fBZone transfers of a zone that is out of memory (AXFR, IXFR).\fR The client is
 checked first, as \fBallow\-query\fR is for a parked query:

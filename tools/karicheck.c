@@ -794,6 +794,9 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
         kc_warning(&t, DC_CONF_DATABASE_STATE_FILE, "database: loader-state-file has no effect without memory-limit (every zone stays in memory, so there is no hot list to warm from)\n");
     if (db->warm_before_serve && db->memory_limit == 0)
         kc_warning(&t, DC_CONF_DATABASE_WARM, "database: warm-before-serve only waits for the directory to be loaded without memory-limit (every zone is read at the start)\n");
+    /* 0.7 B2 W8: over-limit only says what happens above the hard limit of memory-limit */
+    if (db->over_limit_wait && db->memory_limit == 0)
+        kc_warning(&t, DC_CONF_DATABASE_OVER_LIMIT, "database: over-limit wait has no effect without memory-limit (nothing is taken out of memory, so no query waits for room)\n");
     /* B7a: without acl-ceiling the ACLs a database zone carries (allow-transfer, allow-update from the metadata or a profile)
      * refuse every client; the zones still answer queries */
     if (db->acl_ceiling_count == 0 && db->acl_ceiling_keys_count == 0)

@@ -539,7 +539,7 @@ static void test_database_block(void) {
         "loader-group \"karidns-db\"; loader-path \"/usr/local/libexec/karidns-dbloader\"; "
         "acl-ceiling { 192.0.2.0/24; }; auto-reload yes; poll-interval 5; coalesce 250; default-ttl 600; "
         "bulk-threshold 40; max-zone-records 5000; max-zone-bytes 64M; db-reload-timeout 45; ingest-threads 4; "
-        "loader-threads 8; park-max 2048; park-timeout 800; memory-limit 3g; fetch-rate 500; fetch-concurrency 40; transfer-fetch-timeout 2500; server-id \"ns1\"; alias-resolver { 192.0.2.53; 2001:db8::53; }; }; };";
+        "loader-threads 8; park-max 2048; park-timeout 800; memory-limit 3g; fetch-rate 500; fetch-concurrency 40; over-limit wait; transfer-fetch-timeout 2500; server-id \"ns1\"; alias-resolver { 192.0.2.53; 2001:db8::53; }; }; };";
     if (parse_ok(full, &cfg)) {
         const database_config_t *d = &cfg.database;
         CHECK(d->enabled);
@@ -557,6 +557,7 @@ static void test_database_block(void) {
         CHECK(d->fetch_rate == 500);                                                  /* D1a: fetch-rate */
         CHECK(d->fetch_concurrency == 40);                                            /* D1a: fetch-concurrency */
         CHECK(d->transfer_fetch_timeout_ms == 2500);                                  /* D1a step 7: transfer-fetch-timeout */
+        CHECK(d->over_limit_wait);                                                   /* 0.7 B2 W8: over-limit wait */
         CHECK_STR(d->server_id, "ns1");
         CHECK(d->alias_resolver_count == 2);
         free_server_config_fields(&cfg);
@@ -571,6 +572,7 @@ static void test_database_block(void) {
         CHECK(d->park_max == 0 && d->park_timeout_ms == 0);                          /* (0: the worker's defaults, 1024 and 1500 ms) */
         CHECK(d->memory_limit == 0);                                                  /* (0: no limit, every database zone stays in memory) */
         CHECK(d->fetch_rate == 0);                                                    /* (0: the default, 200 zones per second) */
+        CHECK(!d->over_limit_wait);                                                   /* (0.7 B2 W8: over-limit refuse, the old behaviour) */
         CHECK(d->transfer_fetch_timeout_ms == 0);                                     /* (0: the default, 10 seconds) */
         CHECK_STR(db_loader_path(&cfg), KARIDNS_DB_DEFAULT_LOADER_PATH);
         free_server_config_fields(&cfg);
@@ -610,6 +612,27 @@ static void test_database_block(void) {
     expect_reject("fetch-concurrency 1", DBP "fetch-concurrency 1; }; };");
     expect_reject("fetch-concurrency 257", DBP "fetch-concurrency 257; }; };");
     expect_reject("fetch-concurrency abc", DBP "fetch-concurrency abc; }; };");
+    /* 0.7 B2 W8: over-limit refuse | wait (a word, either case; the last one wins like any option) */
+    {
+        static const struct { const char *text; bool wait; } ol[] = {
+            { "over-limit wait;", true }, { "over-limit refuse;", false }, { "over-limit WAIT;", true }, { "over-limit Refuse;", false },
+            { "over-limit wait; over-limit refuse;", false }, { "over-limit refuse; over-limit wait;", true },
+        };
+        for (size_t i = 0; i < sizeof(ol) / sizeof(ol[0]); i++) {
+            char conf[256];
+            snprintf(conf, sizeof(conf), DBP "memory-limit 64m; %s }; };", ol[i].text);
+            if (parse_ok(conf, &cfg)) {
+                CHECK(cfg.database.over_limit_wait == ol[i].wait && cfg.database.memory_limit == 64ull << 20);
+                free_server_config_fields(&cfg);
+            }
+        }
+    }
+    expect_reject("over-limit 1", DBP "over-limit 1; }; };");
+    expect_reject("over-limit abc", DBP "over-limit abc; }; };");
+    expect_reject("over-limit yes", DBP "over-limit yes; }; };");
+    expect_reject("over-limit without a value", DBP "over-limit; }; };");
+    expect_reject("over-limit wait without a semicolon", DBP "over-limit wait }; };");
+    expect_reject("over-limit a quoted long word", DBP "over-limit \"refuse-and-then-some-more\"; }; };");
     expect_reject("max-zone-records 1", DBP "max-zone-records 1; }; };");
     expect_reject("max-zone-bytes 100", DBP "max-zone-bytes 100; }; };");
     expect_reject("max-zone-bytes junk", DBP "max-zone-bytes 1X; }; };");
