@@ -430,6 +430,27 @@ deleted: the Backend sweeps the zones of the source that the pass did not list,
 and applies its mass-delete guard (20 percent and more than 1,000 zones) to the
 counts.
 .IP \(bu 2
+\fBThe lookup of a name (first start).\fR While the Backend has not had the
+first pass of a view, a query for a name that no known zone covers is parked and
+asked for: \fBFETCH_REQ\fR on the fetch stream with mode 2
+(\fBKDB_FETCH_LOOKUP\fR; tag 3 is a query name, tags 6 to 8 are not used) to a
+loader whose \fBHELLO\fR features have bit 1 (\fBKDB_FEAT_LOOKUP\fR, 0x2).  A
+fetch worker looks for the zones whose name is the name or one of its parents
+(never the root) with one statement of the driver (\fBfind_zones_in()\fR:
+SQLite3 \fBd.name COLLATE NOCASE IN (...)\fR, PostgreSQL \fBd.name =
+ANY(::text[])\fR, both through the index on \fBdomains.name\fR, the longest name
+first), drops the ones that the view does not serve (\fBkaridns_domain_views\fR,
+a type or a name the pass does not offer), and answers with \fBLOOKUP_RESULT\fR
+(19): \fBrequest_id\fR, \fBview\fR, \fBfound\fR and, when a zone was found, the
+entry of a \fBMANIFEST\fR (\fBsource_id\fR, \fBname\fR, \fBkind\fR,
+\fBstamp_gen\fR, \fBstamp_time\fR, flags, \fBserial\fR for a plain schema).  The
+closest zone the view serves being a secondary or catalog zone is no answer
+(\fBfound\fR 0).  A database error is \fBZONE_FAILED\fR with the request
+id.  The Backend treats the entry as a claim of an untrusted loader: the zone
+must enclose the name that was asked for, and it is recorded as a \fBMANIFEST\fR
+entry (a known zone: its body is fetched as for any zone), so the pass that is
+still going finds it.
+.IP \(bu 2
 \fBBodies.\fR The loader sends no zone body in this protocol. The Backend asks
 for the bodies it lacks (a stamp it does not have) with \fBFETCH_REQ\fR on the
 fetch stream, by name and, with tag 8, by \fBsource_id\fR; a pool of workers

@@ -561,35 +561,54 @@ part of that the bodies of the first fill (the background fetch of the zones the
 store lists without a body) took; \fBhist\fR, the time from the request to the
 install of the fetches that succeeded: up to 1 ms, up to 10 ms, up to 100 ms, up
 to 1 s, more; see "\fBkarictl dbstatus\fR shows it" under "Memory limit (D1a)"
-in \fBkaridns(8)\fR), the NOTIFY of zones that are out of memory (D1a: \fBnotify
-of zones out of memory: queued=N deferred=N\fR, the zones whose serial changed
-while their data was out of memory that were handed to the control thread, and
-the ones that did not fit in the ring of 1024 and are queued later), the zone
-transfers of zones that are out of memory (D1a, \fBtransfers of zones out of
-memory: waited=N loaded=N failed=N summary_answers=N marked=N timeout=Nms\fR:
-transfers that had to wait for the zone, the zones they got, the ones that ended
-with SERVFAIL, the IXFRs answered from the summary without reading the zone, the
-zones marked evict-next, and \fBtransfer\-fetch\-timeout\fR) and the cost of the
-zone directory (\fBzone directory: N elements, B bytes in the registry + I bytes
-in the indexes of the views (P bytes per zone)\fR; the entries and images are
-not in it), then \fBalias: scans=N\fR (0.7: how many times the thread that
-resolves the targets of ALIAS records scanned the zone directory for them since
-the start; a scan follows a zone with ALIAS records coming, changing, going or
-being taken out of memory and a reconfiguration, not every zone that is fetched
-or evicted, so the number stays where it is while zones without ALIAS records
-come and go; see "Expansion" under POWERDNS ALIAS AND LUA RECORDS in
-\fBkaridns(8)\fR). The warm-up and the cache (D1a step 7): \fBresidency:
-directory=N resident=N out_of_memory=N evictions=N\fR (the zones of the
-directory with and without data in memory), \fBqueries: answered=N parked=N
-hit_rate=P%\fR (the queries the zones answered, and the ones that had to wait
-for their zone; the hit rate is the share answered by a zone already in memory),
-\fBwarm: received=0|1 queued=N loaded=N skipped=N (memory limit N, already in
-memory or gone N) failed=N pending=N in_flight=N\fR (the zones of the loader's
-hot list: queued to read, read, not read because the memory limit's high water
-mark was reached or because they were in memory or gone, failed, still waiting,
-being read), \fBwarm\-before\-serve: off\fR, \fBholding the queries (N ms
-left)\fR or \fBqueries accepted after N ms\fR (the queries are held while the
-hot list is read; the control channel is not), and \fBstate\-file: <path>
+in \fBkaridns(8)\fR), then (0.7, the first fill of the zone store) \fBlookup of
+names while the first pass has not listed every zone: ready=yes|no in_flight=N
+found=N none=N failed=N refused=N same_name=N\fR (the by-name lookups of queries
+for a name that no stored zone covers while a view's first pass has not listed
+every zone, see "The first fill and the queries (0.7)" in \fBkaridns(8)\fR:
+\fBready\fR, the store protocol is on and the loader answers lookups, which is
+when a query is parked for one; \fBin_flight\fR, the lookups out now (at most
+32, counted from the worker's request to the end of the ingest thread's work on
+it); all the others are counted since the start: \fBfound\fR, lookups that gave
+a zone, which is then known (its query is answered from it); \fBnone\fR, lookups
+that found no zone of the view that encloses the name (the query is REFUSED, as
+for any name the server does not serve); \fBfailed\fR, lookups that ended in a
+failure (the loader or its fetch stream went away, the loader named a zone that
+does not enclose the name, or the zone could not be recorded; each is logged as
+\fB[DB] lookup of the name ... failed\fR, and the query is woken and refused,
+not failed); \fBrefused\fR, requests of the workers that the ingest thread did
+not send (a name the stream does not take, no connection of the fetch stream, no
+free place in the fetch table); \fBsame_name\fR, requests that joined a lookup
+of the same name that was on its way), the NOTIFY of zones that are out of
+memory (D1a: \fBnotify of zones out of memory: queued=N deferred=N\fR, the zones
+whose serial changed while their data was out of memory that were handed to the
+control thread, and the ones that did not fit in the ring of 1024 and are queued
+later), the zone transfers of zones that are out of memory (D1a, \fBtransfers of
+zones out of memory: waited=N loaded=N failed=N summary_answers=N marked=N
+timeout=Nms\fR: transfers that had to wait for the zone, the zones they got, the
+ones that ended with SERVFAIL, the IXFRs answered from the summary without
+reading the zone, the zones marked evict-next, and
+\fBtransfer\-fetch\-timeout\fR) and the cost of the zone directory (\fBzone
+directory: N elements, B bytes in the registry + I bytes in the indexes of the
+views (P bytes per zone)\fR; the entries and images are not in it), then
+\fBalias: scans=N\fR (0.7: how many times the thread that resolves the targets
+of ALIAS records scanned the zone directory for them since the start; a scan
+follows a zone with ALIAS records coming, changing, going or being taken out of
+memory and a reconfiguration, not every zone that is fetched or evicted, so the
+number stays where it is while zones without ALIAS records come and go; see
+"Expansion" under POWERDNS ALIAS AND LUA RECORDS in \fBkaridns(8)\fR). The
+warm-up and the cache (D1a step 7): \fBresidency: directory=N resident=N
+out_of_memory=N evictions=N\fR (the zones of the directory with and without data
+in memory), \fBqueries: answered=N parked=N hit_rate=P%\fR (the queries the
+zones answered, and the ones that had to wait for their zone; the hit rate is
+the share answered by a zone already in memory), \fBwarm: received=0|1 queued=N
+loaded=N skipped=N (memory limit N, already in memory or gone N) failed=N
+pending=N in_flight=N\fR (the zones of the loader's hot list: queued to read,
+read, not read because the memory limit's high water mark was reached or because
+they were in memory or gone, failed, still waiting, being read),
+\fBwarm\-before\-serve: off\fR, \fBholding the queries (N ms left)\fR or
+\fBqueries accepted after N ms\fR (the queries are held while the hot list is
+read; the control channel is not), and \fBstate\-file: <path>
 at_start=... hot_lists_sent=N ... acks: written=N unchanged=N failed=N ...\fR
 (what the loader found in its state file at its start, how many hot lists the
 Backend sent, and what the loader answered; \fBstate\-file: none\fR without
