@@ -186,9 +186,10 @@ jobs:
             NCPU=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
             # configure finds the compiler and the libraries and writes config.mk (docs/building.md); both database drivers are built.  The list is the one of
             # build-and-test-freebsd without the builds that only its unit and smoke tests use (tsan, fuzz_all, the unit test binaries, the ASan unit tests);
-            # fuzz_dag_all is made by run_dag_fuzzer_test.sh, here in parallel with the rest
+            # fuzz_dag_all is made by run_dag_fuzzer_test.sh, here in parallel with the rest; test_response_cache: run_response_cache_test.sh runs the binary
+            # (its own fallback compile line lacks sources the engine needs now and does not link)
             ./configure --with-db-drivers="sqlite3 postgresql"
-            make -j"$NCPU" all karicheck-codelog test_coverage_sweep_tools-codelog karidns-dbloader karidns-zone zone2sql zone2kdb fetch_backend karidns-evict asan tools-asan fuzz_dag_all
+            make -j"$NCPU" all karicheck-codelog test_coverage_sweep_tools-codelog karidns-dbloader karidns-zone zone2sql zone2kdb fetch_backend karidns-evict asan tools-asan fuzz_dag_all test_response_cache
             echo "::endgroup::"
 
             echo "::group::🛡️ [Functional & Protocol Tests] 4 at a time"
