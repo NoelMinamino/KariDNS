@@ -1507,6 +1507,10 @@ static _Atomic uint64_t g_fq_loader_busy;                  /* fetches the loader
 #define FQ_HIST_N 5
 static _Atomic uint64_t g_fq_hist[FQ_HIST_N];              /* fetches installed, by the time from the request to the install: <=1 ms, <=10 ms, <=100 ms, <=1 s, more */
 static _Atomic uint32_t g_ing_busy_pct;                    /* share of the last window (~10 s) the ingest thread was not waiting for events */
+/* 0.7, the by-name lookups of the first start (FETCH_REQ mode KDB_FETCH_LOOKUP): the loader answers them (HELLO features, the store protocol on), and what became of them */
+static _Atomic bool g_lookup_on;
+static _Atomic uint64_t g_lk_found, g_lk_none, g_lk_failed, g_lk_refused, g_lk_dup;
+bool db_ingest_lookup_ready(void) { return atomic_load_explicit(&g_lookup_on, memory_order_acquire); }
 #define ING_BUSY_WINDOW_NS 10000000000LL
 static _Atomic bool g_ma_event;                            /* 0.7 P-F: a start or a full load ended: the cache thread says what the database needs in memory (ma_tick()) */
 static void fq_hist_add(int64_t ms) {
@@ -1722,6 +1726,7 @@ static void drop_stream(ing_t *g) {
   g->out_len = g->out_off = 0;
   g->sresume = false;
   g->hello_done = false;
+  atomic_store_explicit(&g_lookup_on, false, memory_order_release);      /* (a new loader says again whether it looks names up) */
   g->inv_active = false;
   db_recon_abort();                           /* 0.7 WP7b: a pass that was cut off sweeps nothing */
   g->man_skip = false;
@@ -1817,6 +1822,7 @@ static void on_hello(ing_t *g, const kdb_msg_t *m) {
   g->loader_feat = h->features;
   g->bg_on = false;
   send_config(g, "handshake");
+  atomic_store_explicit(&g_lookup_on, g->stream_fd >= 0 && g->store_proto && (h->features & KDB_FEAT_LOOKUP) != 0, memory_order_release);      /* (send_config() may have dropped the stream) */
   g->debug_sent = -1;                                  /* 0.7 M2: a new loader learns the level in force after its CONFIG */
   send_debug(g);
   if (g->store_proto) {                                /* 0.7 WP7b: the records the store holds that have no body (an interrupted fill, a changed zone, a secondary zone: they are heap zones) are fetched once now */
@@ -3378,6 +3384,77 @@ static bool bulk_take(ing_t *g, park_fetch_req_t *q, uint32_t *zid, uint32_t *ba
 }
 
 static void req_fetch_done(ing_t *g, const ing_freq_t *done, bool ok, const char *why);
+static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why);
+
+/* ---- 0.7: the by-name lookups of the first start ----
+ * A query for a name that no stored zone of a view covers, while the first pass of the view has not listed every zone, would be refused as for any name the server does not serve; instead the worker
+ * parks it and asks for a lookup (FETCH_REQ mode KDB_FETCH_LOOKUP on the fetch stream, which a pass on the first stream does not hold up).  The loader finds the zone of the view that encloses the name
+ * (the longest one) and answers LOOKUP_RESULT; a zone it found is recorded as a MANIFEST entry would (a KNOWN record), and the queries that wait for the name are woken (as for the fetch of a zone:
+ * park_wake_queue_all()) and look the name up again: with a record they park for the zone and are answered from it, without they are refused as before.  Whatever becomes of the lookup the queries are
+ * woken, not failed.  The workers took a place of the lookups in flight before they made the request (park_lookup_take(), at most PARK_LOOKUP_MAX); every request taken from a ring gives it back here, once.
+ * A lookup takes a slot of the table of the fetches and counts in nfreq (it is a request on the stream), and none of the places or tokens of the fetches of zones. */
+static ing_freq_t *lookup_find(ing_t *g, uint16_t view, const char *name) {
+  if (g->nfreq == 0) return NULL;
+  for (uint32_t i = 0; i < ING_FETCH_MAX; i++)
+    if (g->freq[i].active && g->freq[i].mode == KDB_FETCH_LOOKUP && g->freq[i].view == view && domain_names_match_ci(g->freq[i].zone, name)) return &g->freq[i];
+  return NULL;
+}
+
+/* the name of a query as the stream wants it: canonical text, which the loader's decoder checks (a name it refuses would close the stream) */
+static bool lookup_name_ok(const char *name) {
+  char out[DNS_NAME_TEXT_SIZE];
+  const size_t n = strlen(name);
+  if (n == 0 || n >= sizeof(out) || (n == 1 && name[0] == '.')) return false;      /* (the root is not looked for) */
+  for (size_t i = 0; i < n; i++)
+    if ((unsigned char)name[i] < 0x21 || (unsigned char)name[i] > 0x7E) return false;
+  return dns_name_normalize(name, out, sizeof(out)) == n && memcmp(name, out, n) == 0 && dns_name_len_no_root(name, n) != n;
+}
+
+static void lookup_complete(const ing_freq_t *done, bool ok, const char *why) {
+  park_lookup_give();
+  if (!ok) {
+    atomic_fetch_add_explicit(&g_lk_failed, 1, memory_order_relaxed);
+    logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] lookup of the name '%s' (view '%s') failed: %s", done->zone, done->view_name, why && why[0] ? why : "no reason given");
+  }
+  park_wake_queue_all(done->view_name, done->zone, false);
+}
+
+/* a request of a worker (mode KDB_FETCH_LOOKUP) taken from a ring: vi is the loader's index of its view (-1: none) */
+static void lookup_issue(ing_t *g, const park_fetch_req_t *q, int vi) {
+  if (vi < 0 || g->fetch_fd < 0 || !atomic_load_explicit(&g_lookup_on, memory_order_acquire) || !lookup_name_ok(q->zone)) {      /* (the worker did not know: it asked, and is woken as for the end of a lookup) */
+    atomic_fetch_add_explicit(&g_lk_refused, 1, memory_order_relaxed);
+    park_lookup_give();
+    park_wake_queue_all(q->view, q->zone, false);
+    return;
+  }
+  if (lookup_find(g, (uint16_t)vi, q->zone)) {           /* the same name is on its way: its answer wakes every worker */
+    atomic_fetch_add_explicit(&g_lk_dup, 1, memory_order_relaxed);
+    park_lookup_give();
+    return;
+  }
+  ing_freq_t *r = NULL;
+  for (uint32_t i = 0; i < ING_FETCH_MAX && !r; i++)
+    if (!g->freq[i].active) r = &g->freq[i];
+  if (!r) {                                              /* every slot is taken */
+    atomic_fetch_add_explicit(&g_lk_refused, 1, memory_order_relaxed);
+    park_lookup_give();
+    park_wake_queue_all(q->view, q->zone, false);
+    return;
+  }
+  memset(r, 0, sizeof(*r));
+  r->active = true;
+  r->id = ++g->fseq;
+  r->view = (uint16_t)vi;
+  r->prio = KDB_FETCH_PRIO_QUERY;
+  r->mode = KDB_FETCH_LOOKUP;
+  r->sent_ms = now_ms();
+  snprintf(r->view_name, sizeof(r->view_name), "%s", g->view_names[vi]);
+  snprintf(r->zone, sizeof(r->zone), "%s", q->zone);
+  g->nfreq++;
+  atomic_store_explicit(&g_fq_inflight, g->nfreq, memory_order_relaxed);
+  logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] lookup %llu: the zone of the name '%s' (view '%s')", (unsigned long long)r->id, r->zone, r->view_name);
+  if (!fetch_send_req(g, r)) fetch_complete(g, r, false, "the loader's fetch stream is not connected");
+}
 
 /* the request is over.  ok: the zone (or its summary) was received and installed; else the queries that wait for it are answered at once. */
 static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
@@ -3386,6 +3463,10 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
   if (done.placed) park_place_give();                    /* (B2 W5: the one place of the fetch goes back, whichever way it ended: installed, failed, dropped, the loader gone) */
   g->nfreq--;
   atomic_store_explicit(&g_fq_inflight, g->nfreq, memory_order_relaxed);
+  if (done.mode == KDB_FETCH_LOOKUP) {                   /* 0.7: a lookup is not a fetch of a zone (no LOADING state, no place, no stamp): the queries that wait for the name look it up again */
+    lookup_complete(&done, ok, why);
+    return;
+  }
   if (ok) fq_hist_add(now_ms() - done.sent_ms);
   if (done.mode != KDB_FETCH_SUMMARY) {
     dbreg_fetch_end(done.view_name, done.zone);
@@ -3865,6 +3946,10 @@ static void fetch_issue(ing_t *g) {
         break;
       }
     }
+    if (q.mode == KDB_FETCH_LOOKUP) {                    /* 0.7: a name, not a zone: no claim, no place, no token (lookup_issue()) */
+      lookup_issue(g, &q, vi);
+      continue;
+    }
     if (vi < 0) {                                        /* a view that takes no zones from the database (or left): nothing to fetch */
       park_wake_queue_all(q.view, q.zone, true);
       continue;
@@ -4128,6 +4213,46 @@ static void on_fetch_failed(ing_t *g, const kdb_zone_failed_t *zf) {
   fetch_complete(g, r, false, reason);
 }
 
+/* LOOKUP_RESULT: the zone of the view that encloses the name of a lookup, or none.  The entry is a claim of an untrusted loader: the request must be one that is in flight, and the zone must enclose
+ * the name that was asked for (a loader that names another zone would put a zone that has nothing to do with the query into the store).  A zone that is recorded is a MANIFEST entry's record (KNOWN, or
+ * the stamp noted when the store has it already): its body is read when a query asks for it, or by the scan of the wanted bodies; the pass of the view that is still going lists it too, and finds the record. */
+static void on_lookup_result(ing_t *g, const kdb_lookup_result_t *l) {
+  ing_freq_t *r = fetch_find(g, l->request_id);
+  if (!r || r->mode != KDB_FETCH_LOOKUP || r->view != l->view) {
+    fetch_discard(g, NULL, "an answer of no lookup");
+    return;
+  }
+  if (!l->found) {
+    atomic_fetch_add_explicit(&g_lk_none, 1, memory_order_relaxed);
+    fetch_complete(g, r, true, NULL);
+    return;
+  }
+  if (!domain_name_is_at_or_below(r->zone, l->name) || strcmp(l->name, ".") == 0 || l->source_id <= 0) {
+    syslog(LOG_WARNING, "[DB] the loader answered the lookup of the name '%s' (view '%s') with a zone that does not enclose it; the answer is ignored", r->zone, r->view_name);
+    fetch_complete(g, r, false, "the loader named a zone that does not enclose the name");
+    return;
+  }
+  db_recon_entry_t re;
+  memset(&re, 0, sizeof(re));
+  re.source_id = l->source_id;
+  re.name = l->name;
+  re.kind = l->kind;
+  re.stamped = l->stamped;
+  re.gen = l->stamp_gen;
+  re.time = l->stamp_time;
+  re.has_serial = l->has_serial;
+  re.serial = l->serial;
+  uint32_t zid;
+  const int rc = db_recon_change(r->view_name, &re, &zid);
+  if (rc < 0) {
+    fetch_complete(g, r, false, "the zone could not be recorded");
+    return;
+  }
+  atomic_fetch_add_explicit(&g_lk_found, 1, memory_order_relaxed);
+  logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] lookup %llu: the name '%s' is in zone '%s' (view '%s', id %lld)", (unsigned long long)r->id, r->zone, l->name, r->view_name, (long long)l->source_id);
+  fetch_complete(g, r, true, NULL);
+}
+
 static void handle_fetch_msg(ing_t *g, const kdb_msg_t *m) {
   switch (m->type) {
   case KDB_T_PROFILE: {
@@ -4162,6 +4287,9 @@ static void handle_fetch_msg(ing_t *g, const kdb_msg_t *m) {
   }
   case KDB_T_ZONE_FAILED:
     on_fetch_failed(g, &m->u.zone_failed);
+    break;
+  case KDB_T_LOOKUP_RESULT:
+    on_lookup_result(g, &m->u.lookup_result);
     break;
   default:
     break;
@@ -5086,6 +5214,10 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
                 (unsigned long long)atomic_load_explicit(&g_wq_waited, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_wq_dropped, memory_order_relaxed),
                 (unsigned long long)atomic_load_explicit(&g_wq_full, memory_order_relaxed));
     }
+    st_append(&c, "lookup of names while the first pass has not listed every zone: ready=%s in_flight=%u found=%llu none=%llu failed=%llu refused=%llu same_name=%llu\n", db_ingest_lookup_ready() ? "yes" : "no",
+              (unsigned)park_lookup_used(), (unsigned long long)atomic_load_explicit(&g_lk_found, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_lk_none, memory_order_relaxed),
+              (unsigned long long)atomic_load_explicit(&g_lk_failed, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_lk_refused, memory_order_relaxed),
+              (unsigned long long)atomic_load_explicit(&g_lk_dup, memory_order_relaxed));
     dbreg_cache_stats_t cs;
     dbreg_cache_stats(&cs);
     {

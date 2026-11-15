@@ -53,6 +53,8 @@
 static int g_checks = 0, g_failed = 0;
 #define CHECK(cond) do { g_checks++; if (!(cond)) { g_failed++; \
     printf("  [FAIL] %s:%d: %s\n", __FILE__, __LINE__, #cond); } } while (0)
+#define CHECK_MSG(cond, ...) do { g_checks++; if (!(cond)) { g_failed++; \
+    printf("  [FAIL] %s:%d: %s: ", __FILE__, __LINE__, #cond); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 /* ---------------------------------------------------------------- the loader's end of a stream */
 typedef struct {
@@ -1081,6 +1083,42 @@ static int run_mode(const char *mode) {
         park_unregister_worker(1);
     }
 
+    /* -- (B1) a zone id that another zone has now: the claim was made for a zone that waited (a worker's query for "gone.test." parked for the attach of the id), the id is the record of "b1.test." when the store thread
+     *    looks: the workers of the claim are woken by the name of the zone that is attached, and then told the id, so that the query for the zone that is gone asks for its own fetch (it was left to run to its park-timeout) */
+    {
+        zref_t zb;
+        (void)evict_zone("a1.test.");
+        CHECK(zref_of("a1.test.", &zb) && zb.zid != ZREF_NOZID);
+        drain_wakes();
+        const uint16_t sv = (uint16_t)zb.sview;
+        CHECK(park_att_claim_tag(sv, zb.zid, 0, park_name_key("default", "gone.test.")) == 1 && park_attach_zid(0, sv, zb.zid));
+        park_att_requested(sv, zb.zid);
+        bool named = false, byid = false;
+        for (int t = 0; t < 5000 && !byid; t++) {
+            park_key_t kz;
+            if (park_wake_pop(park_wake_ring(0), &kz)) {
+                if (kz.ask == 0 && park_key_is(&kz, "default", "a1.test.")) named = true;
+                else if (kz.ask == 2 && kz.key == (((uint64_t)sv << 32) | zb.zid)) byid = named;      /* (after the wake by name: the order of the ring) */
+            } else {
+                usleep(1000);
+            }
+        }
+        CHECK(named && byid);
+        CHECK(in_memory("a1.test."));
+        /* the same claim made for the zone itself: no wake by the id (nothing was left behind) */
+        (void)evict_zone("a1.test.");
+        drain_wakes();
+        CHECK(park_att_claim_tag(sv, zb.zid, 0, park_name_key("default", "a1.test.")) == 1 && park_attach_zid(0, sv, zb.zid));
+        park_att_requested(sv, zb.zid);
+        CHECK(wake_for("a1.test.", &k, 5000));
+        usleep(50000);
+        park_key_t kz2;
+        bool idwake = false;
+        while (park_wake_pop(park_wake_ring(0), &kz2)) idwake |= kz2.ask == 2;
+        CHECK(!idwake);
+        CHECK(in_memory("a1.test."));
+    }
+
     /* -- the attach is one section of the registry's lock: what it finds at the commit is told apart (dbreg_attach_store(): resident, a fetch on its way, a record that is not the one that was read) */
     {
         dbdir_rec_t rec;
@@ -2023,6 +2061,44 @@ static int run_mode(const char *mode) {
                 CHECK(w1.versions_live == w0.versions_live);                             /* (the entry was given back) */
             }
 
+            /* W5c: the registration of a staged zone finds no view for the store's id (the store is closing, or the id is not one): the staged element leaves the table all the same (it held the zone's slot and its entry for ever) */
+            {
+                batch_begin(a[0], &e, 94, KDB_BATCH_DIFF);
+                send_zone(a[0], &e, "wn.test.", 3, 0, 5200);
+                batch_end(a[0], &e, &mainc, 94, 1, 0);
+                warm_zone("wn.test.");
+                CHECK(evict_zone("wn.test."));
+                zref_t zn;
+                CHECK(zref_of("wn.test.", &zn) && zn.zid != ZREF_NOZID);
+                drain_wakes();
+                db_store_counters(&w0);
+                atomic_store(&db_store_test_adopt_noview, true);
+                rcu_aux_read_lock();
+                snw = acquire_zone_snapshot();
+                vsw = snapshot_find_view(snw, "default");
+                const bool staged = vsw && ops->worker_attach(vsw, &zn, 0);
+                rcu_aux_read_unlock();
+                CHECK(staged);
+                for (int t = 0; t < 2500; t++) {
+                    db_store_counters(&w1);
+                    if (w1.wa_lost > w0.wa_lost) break;
+                    usleep(2000);
+                }
+                atomic_store(&db_store_test_adopt_noview, false);
+                CHECK(w1.wa_lost == w0.wa_lost + 1 && w1.wa_adopted == w0.wa_adopted);
+                wait_retired();
+                db_store_counters(&w1);
+                CHECK(w1.versions_live == w0.versions_live);                             /* (the entry was given back) */
+                CHECK(stored_only("wn.test."));                                         /* (not in memory, not staged) */
+                rcu_aux_read_lock();
+                snw = acquire_zone_snapshot();
+                vsw = snapshot_find_view(snw, "default");
+                CHECK(vsw && zref_of("wn.test.", &zn) && ops->worker_attach(vsw, &zn, 0));       /* (the zone's slot of the staging table is free: it is staged again) */
+                rcu_aux_read_unlock();
+                for (int t = 0; t < 2500 && !(in_memory("wn.test.") && dbdir()->attach_get(zn.zid)); t++) usleep(2000);
+                CHECK(in_memory("wn.test.") && dbdir()->attach_get(zn.zid) != NULL);        /* (and registered this time) */
+            }
+
             /* W6: a zone whose record is damaged: the worker does not attach it (the checksum), says nothing, and the zone is left to the store threads that read it from the database */
             {
                 const char *wz = "w1.test.";
@@ -2571,6 +2647,7 @@ static void preq_hook(const char *zone) {
     if (strcmp(zone, "m0000.test.") == 0 && atomic_load(&g_pent_at_req) < 0) atomic_store(&g_pent_at_req, atomic_load(&g_pent));
 }
 
+extern int64_t g_ing_fetch_timeout_ms;                                 /* dns_db_ingest.c: 30 s, shortened where a test waits for it */
 static int run_proto(int phase, const char *dir) {
     printf("[the store protocol: phase %d]\n", phase);
     char sdir[600];
@@ -2610,7 +2687,7 @@ static int run_proto(int phase, const char *dir) {
 
     kdb_enc_begin(&e, KDB_T_HELLO);
     kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242);
-    if (phase > 0) kdb_enc_u32(&e, 5, KDB_FEAT_STORE);
+    if (phase > 0) kdb_enc_u32(&e, 5, phase == 1 ? (KDB_FEAT_STORE | KDB_FEAT_LOOKUP) : KDB_FEAT_STORE);
     kdb_enc_end(&e);
     ch_send(a[0], &e);
     CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG);
@@ -2645,6 +2722,169 @@ static int run_proto(int phase, const char *dir) {
     if (phase == 1) {
         CHECK(!ch_next(&fetchc, &m, 200));                               /* an empty store has nothing to ask for */
 
+        /* -- A0. the lookup of a name (0.7, FETCH_REQ mode 2) while the first pass has not listed the zones: the loader (this test) answers on the fetch stream, which a pass does not hold up */
+        {
+            CHECK(db_store_view_pending(vid) && !db_store_view_pending(vid + 1) && !db_store_view_pending(-1));          /* (the view's list of zones is not complete) */
+            CHECK(db_ingest_lookup_ready());
+            const uint64_t zid_sid = 777000;
+            /* a zone is found: recorded as a MANIFEST entry would (KNOWN, with its stamp), and the worker's query for the name is woken (not failed) */
+            drain_wakes();
+            CHECK(park_lookup_take() && park_fetch_request(0, "default", "www.late.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && m.u.fetch_req.mode == KDB_FETCH_LOOKUP && strcmp(m.u.fetch_req.name, "www.late.test.") == 0 &&
+                  m.u.fetch_req.priority == KDB_FETCH_PRIO_QUERY && m.u.fetch_req.source_id == 0 && !m.u.fetch_req.has_range);
+            const uint64_t rid = m.u.fetch_req.request_id;
+            CHECK(park_lookup_take() && park_fetch_request(0, "default", "www.late.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));     /* (the same name again: one request on the stream) */
+            CHECK(!ch_next(&fetchc, &m, 300));
+            CHECK(park_lookup_used() == 1);                                                /* (the duplicate gave its place back) */
+            kdb_enc_begin(&e, KDB_T_LOOKUP_RESULT);
+            kdb_enc_u64(&e, 1, rid + 1000); kdb_enc_u16(&e, 2, 0); kdb_enc_u8(&e, 3, 0);      /* (an answer of no request is discarded; the stream goes on) */
+            kdb_enc_end(&e);
+            ch_send(f[0], &e);
+            kdb_enc_begin(&e, KDB_T_LOOKUP_RESULT);
+            kdb_enc_u64(&e, 1, rid); kdb_enc_u16(&e, 2, 0); kdb_enc_u8(&e, 3, 1);
+            kdb_enc_i64(&e, 4, (int64_t)zid_sid); kdb_enc_name(&e, 5, "late.test."); kdb_enc_u8(&e, 6, KDB_ZK_PRIMARY); kdb_enc_u64(&e, 7, 5); kdb_enc_u64(&e, 8, 6); kdb_enc_u8(&e, 9, KDB_EF_STAMPED);
+            kdb_enc_end(&e);
+            ch_send(f[0], &e);
+            CHECK(wake_for("www.late.test.", &k, 5000) && !k.failed && !k.retry);
+            CHECK(park_lookup_used() == 0);
+            {
+                store_zone_t lz;
+                CHECK(zrec(st, "late.test", &lz) && lz.state == STORE_STATE_KNOWN && lz.source_id == (int64_t)zid_sid && lz.stamp_gen == 5 && lz.stamp_time == 6);
+                zref_t zr;
+                CHECK(zref_of("late.test.", &zr) && zr.entry == NULL && zr.zid != ZREF_NOZID && zr.zstate == ZREF_ST_KNOWN);      /* (the query is looked up again: the zone is there, to be read) */
+                CHECK(db_recon_delete("default", (int64_t)zid_sid, NULL) == 1);       /* (not a zone of the pass that follows: the scan of the wanted bodies would ask for its body) */
+            }
+            /* no zone has the name: nothing is recorded; the query is woken, and answered as for any name that is not served */
+            drain_wakes();
+            CHECK(park_lookup_take() && park_fetch_request(0, "default", "nothing.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && m.u.fetch_req.mode == KDB_FETCH_LOOKUP && strcmp(m.u.fetch_req.name, "nothing.test.") == 0);
+            kdb_enc_begin(&e, KDB_T_LOOKUP_RESULT);
+            kdb_enc_u64(&e, 1, m.u.fetch_req.request_id); kdb_enc_u16(&e, 2, 0); kdb_enc_u8(&e, 3, 0);
+            kdb_enc_end(&e);
+            ch_send(f[0], &e);
+            CHECK(wake_for("nothing.test.", &k, 5000) && !k.failed && !k.retry);
+            CHECK(park_lookup_used() == 0);
+            {
+                zref_t zr;
+                CHECK(!zref_of("nothing.test.", &zr));
+            }
+            /* a loader that names a zone that does not enclose the name (or the root) is not believed: nothing is recorded, the query is woken */
+            for (int bad = 0; bad < 2; bad++) {
+                drain_wakes();
+                CHECK(park_lookup_take() && park_fetch_request(0, "default", "www.evil.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
+                CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "www.evil.test.") == 0);
+                kdb_enc_begin(&e, KDB_T_LOOKUP_RESULT);
+                kdb_enc_u64(&e, 1, m.u.fetch_req.request_id); kdb_enc_u16(&e, 2, 0); kdb_enc_u8(&e, 3, 1);
+                kdb_enc_i64(&e, 4, 888000 + bad); kdb_enc_name(&e, 5, bad ? "." : "other.test."); kdb_enc_u8(&e, 6, KDB_ZK_PRIMARY); kdb_enc_u64(&e, 7, 1); kdb_enc_u64(&e, 8, 1);
+                kdb_enc_end(&e);
+                ch_send(f[0], &e);
+                CHECK(wake_for("www.evil.test.", &k, 5000) && !k.failed);
+                CHECK(park_lookup_used() == 0);
+                store_zone_t lz;
+                CHECK(!zrec(st, "other.test", &lz));
+            }
+            /* a database error (ZONE_FAILED with the request id) wakes the query too (it is refused as before, not failed), and nothing is recorded */
+            drain_wakes();
+            CHECK(park_lookup_take() && park_fetch_request(0, "default", "x.fail.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "x.fail.test.") == 0);
+            kdb_enc_begin(&e, KDB_T_ZONE_FAILED);
+            kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, "x.fail.test."); kdb_enc_i64(&e, 3, 0); kdb_enc_str(&e, 4, "looking up the zone of a name: the database is busy"); kdb_enc_u64(&e, 5, m.u.fetch_req.request_id);
+            kdb_enc_end(&e);
+            ch_send(f[0], &e);
+            CHECK(wake_for("x.fail.test.", &k, 5000) && !k.failed);
+            CHECK(park_lookup_used() == 0);
+            /* a name the stream cannot carry (a request of a worker is checked before it is sent: a name the loader's decoder refuses would close the stream) is woken without a request */
+            drain_wakes();
+            CHECK(park_lookup_take() && park_fetch_request(0, "default", "No.Dot", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
+            CHECK(wake_for("No.Dot", &k, 5000) && !k.failed && !ch_next(&fetchc, &m, 200));
+            CHECK(park_lookup_used() == 0);
+            /* a view the configuration does not have: no request */
+            drain_wakes();
+            CHECK(park_lookup_take() && park_fetch_request(0, "noview", "a.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
+            for (int t = 0; t < 400 && park_lookup_used() != 0; t++) usleep(5000);
+            CHECK(park_lookup_used() == 0 && !ch_next(&fetchc, &m, 200));
+            /* a request that the loader does not answer ends as a failure of the lookup: the query is woken, the place is given back */
+            drain_wakes();
+            g_ing_fetch_timeout_ms = 300;
+            CHECK(park_lookup_take() && park_fetch_request(0, "default", "slow.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "slow.test.") == 0);
+            CHECK(wake_for("slow.test.", &k, 12000) && !k.failed);
+            g_ing_fetch_timeout_ms = 30000;
+            CHECK(park_lookup_used() == 0);
+            /* the worker's side (udp_one(): lookup_wanted(), udp_park_lookup()): a query for a name of a zone the pass has not listed is parked for the lookup, not refused; the zone that is found is read as any zone
+             * that the store knows without a body, and the query is answered from it */
+            {
+                static wk_t lw;
+                wk_init(&lw);
+                uint8_t lgot[1232];
+                int llen = 0;
+                drain_wakes();
+                wk_send(&lw, "late2.test.", 6);                                             /* (SOA) */
+                CHECK(lw.w.n_tx == 0 && lw.table.nwait == 1 && park_lookup_used() == 1);
+                CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && m.u.fetch_req.mode == KDB_FETCH_LOOKUP && strcmp(m.u.fetch_req.name, "late2.test.") == 0);
+                kdb_enc_begin(&e, KDB_T_LOOKUP_RESULT);
+                kdb_enc_u64(&e, 1, m.u.fetch_req.request_id); kdb_enc_u16(&e, 2, 0); kdb_enc_u8(&e, 3, 1);
+                kdb_enc_i64(&e, 4, 777100); kdb_enc_name(&e, 5, "late2.test."); kdb_enc_u8(&e, 6, KDB_ZK_PRIMARY); kdb_enc_u64(&e, 7, 1); kdb_enc_u64(&e, 8, 1); kdb_enc_u8(&e, 9, KDB_EF_STAMPED);
+                kdb_enc_end(&e);
+                ch_send(f[0], &e);
+                bool got_req = false;
+                for (int t = 0; t < 2500 && !got_req; t++) {                                  /* (the wake-up: the worker looks the query up again and parks it for the zone that is known now) */
+                    rcu_aux_read_lock();
+                    park_service(&lw.w, -1);
+                    rcu_aux_read_unlock();
+                    got_req = ch_next(&fetchc, &m, 2);
+                }
+                CHECK(got_req && m.type == KDB_T_FETCH_REQ && m.u.fetch_req.mode == KDB_FETCH_FULL && strcmp(m.u.fetch_req.name, "late2.test.") == 0 && m.u.fetch_req.source_id == 777100);
+                send_zone(f[0], &e, "late2.test.", 3, m.u.fetch_req.request_id, 777100);
+                CHECK(wk_wait_answer(&lw, lgot, &llen, 5000) && llen > 12 && (lgot[3] & 0x0F) == 0 && (lgot[2] & 0x04) != 0);        /* (NOERROR, authoritative) */
+                CHECK(park_lookup_used() == 0 && lw.table.nwait == 0);
+                CHECK(db_recon_delete("default", 777100, NULL) == 1);
+                /* no zone: the query is refused when the answer comes (the normal answer for a name that is not served) */
+                wk_send(&lw, "nothing2.test.", 1);
+                CHECK(lw.w.n_tx == 0 && lw.table.nwait == 1);
+                CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && m.u.fetch_req.mode == KDB_FETCH_LOOKUP && strcmp(m.u.fetch_req.name, "nothing2.test.") == 0);
+                kdb_enc_begin(&e, KDB_T_LOOKUP_RESULT);
+                kdb_enc_u64(&e, 1, m.u.fetch_req.request_id); kdb_enc_u16(&e, 2, 0); kdb_enc_u8(&e, 3, 0);
+                kdb_enc_end(&e);
+                ch_send(f[0], &e);
+                CHECK(wk_wait_answer(&lw, lgot, &llen, 5000) && (lgot[3] & 0x0F) == 5);          /* (REFUSED) */
+                CHECK(park_lookup_used() == 0 && lw.table.nwait == 0);
+                /* the same name asked twice by one worker is one request (the second query joins the first), and a DS query asks for the parent of its name */
+                wk_send(&lw, "dup.nothing2.test.", 1);
+                wk_send(&lw, "dup.nothing2.test.", 1);
+                CHECK(lw.w.n_tx == 0 && lw.table.nwait == 2 && park_lookup_used() == 1);
+                CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "dup.nothing2.test.") == 0);
+                CHECK(!ch_next(&fetchc, &m, 200));
+                kdb_enc_begin(&e, KDB_T_LOOKUP_RESULT);
+                kdb_enc_u64(&e, 1, m.u.fetch_req.request_id); kdb_enc_u16(&e, 2, 0); kdb_enc_u8(&e, 3, 0);
+                kdb_enc_end(&e);
+                ch_send(f[0], &e);
+                CHECK(wk_wait_answer(&lw, lgot, &llen, 5000) && (lgot[3] & 0x0F) == 5);
+                CHECK(wk_wait_answer(&lw, lgot, &llen, 5000) && (lgot[3] & 0x0F) == 5 && lw.table.nwait == 0);
+                wk_send(&lw, "ds.nothing3.test.", 43);
+                CHECK(lw.table.nwait == 1);
+                CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "nothing3.test.") == 0);        /* (the zone of a DS is the parent's) */
+                kdb_enc_begin(&e, KDB_T_LOOKUP_RESULT);
+                kdb_enc_u64(&e, 1, m.u.fetch_req.request_id); kdb_enc_u16(&e, 2, 0); kdb_enc_u8(&e, 3, 0);
+                kdb_enc_end(&e);
+                ch_send(f[0], &e);
+                CHECK(wk_wait_answer(&lw, lgot, &llen, 5000) && (lgot[3] & 0x0F) == 5);
+                /* the places of the lookups are used up: the query is refused at once, nothing is parked, no request is made */
+                park_lookup_set_limit(1);
+                g_ing_fetch_timeout_ms = 300;
+                wk_send(&lw, "first.nothing4.test.", 1);
+                CHECK(lw.table.nwait == 1);
+                wk_send(&lw, "second.nothing4.test.", 1);
+                CHECK(lw.table.nwait == 1 && lw.w.n_tx == 1 && wk_get(&lw, lgot) > 12 && (lgot[3] & 0x0F) == 5);
+                CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "first.nothing4.test.") == 0 && !ch_next(&fetchc, &m, 200));
+                park_lookup_set_limit(PARK_LOOKUP_MAX);
+                CHECK(wk_wait_answer(&lw, lgot, &llen, 8000) && (lgot[3] & 0x0F) == 5);          /* (never answered: the lookup times out, the query is refused as before) */
+                g_ing_fetch_timeout_ms = 30000;
+                CHECK(park_lookup_used() == 0 && lw.table.nwait == 0);
+                park_free(&lw.table);
+            }
+        }
+
         /* -- A. the first fill: a pass.  BATCH_RESULT comes when the entries are recorded, the bodies follow.  A worker asks for a zone of the pass while it is being worked through (the hooks): the thread
          *       gives the stream up for the request after the page it is in, it does not finish the pass first */
         db_recon_test_entry_hook = pent_hook;
@@ -2656,6 +2896,15 @@ static int run_proto(int phase, const char *dir) {
         db_recon_test_entry_hook = NULL;
         db_ingest_test_fetch_req_hook = NULL;
         CHECK(!db_store_directory_wait());                                              /* (the pass has ended: every zone is listed) */
+        {                                                                               /* once the pass has ended an unknown name is refused at once: nothing is parked, no lookup is asked for */
+            static wk_t lw2;
+            wk_init(&lw2);
+            uint8_t g2[1232];
+            const uint64_t lk0 = park_lookup_used();
+            wk_send(&lw2, "after.nothing5.test.", 1);
+            CHECK(lw2.w.n_tx == 1 && lw2.table.nwait == 0 && wk_get(&lw2, g2) > 12 && (g2[3] & 0x0F) == 5 && park_lookup_used() == lk0);
+            park_free(&lw2.table);
+        }
         {
             const int at = atomic_load(&g_pent_at_req), pushed = atomic_load(&g_pent_push);
             printf("  the request of a worker, made at entry %d of %d, was sent at entry %d\n", pushed, PN, at);
@@ -2689,7 +2938,7 @@ static int run_proto(int phase, const char *dir) {
             do {
                 if (ch_next(&fetchc, &m, 20) && m.type == KDB_T_FETCH_REQ) {
                     const int zi = pn_index(m.u.fetch_req.name);
-                    CHECK(zi >= 0 && zi < PN);
+                    CHECK_MSG(zi >= 0 && zi < PN, "a request for %s (mode %d)", m.u.fetch_req.name, (int)m.u.fetch_req.mode);
                     if (m.u.fetch_req.priority == KDB_FETCH_PRIO_QUERY) {
                         if (nrq1 < 64) {
                             req1_t *q = &rq1[nrq1++];

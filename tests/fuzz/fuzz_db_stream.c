@@ -80,6 +80,12 @@ static void run_loader(const uint8_t *p, size_t n, size_t chunk, uint8_t sel, ru
                 if (sm.fetch != (m.u.zone_failed.request_id != 0)) abort();
             }
             if (fr.type == KDB_T_ZONE_DATA) mix(&r->sum, m.u.zone_data.ancount);
+            if (fr.type == KDB_T_LOOKUP_RESULT) {            /* 0.7: only the fetch stream carries it; a zone found has its entry, as a manifest entry */
+                const kdb_lookup_result_t *l = &m.u.lookup_result;
+                if (!sm.fetch || l->request_id == 0) abort();
+                if (l->found && (strlen(l->name) == 0 || l->kind > KDB_ZK_CATALOG || l->name[strlen(l->name) - 1] != '.')) abort();
+                mix(&r->sum, l->request_id + (l->found ? (uint64_t)l->source_id + l->stamp_gen + l->stamp_time + strlen(l->name) : 0));
+            }
             if (fr.type == KDB_T_PROFILE) mix(&r->sum, m.u.profile.settings.len);
             if (fr.type == KDB_T_WARM_LIST) {               /* D1a step 7: the entries the decoder validated, a view name and a canonical zone name each */
                 kdb_iter_t it;
@@ -199,7 +205,8 @@ static void run_backend(const uint8_t *p, size_t n) {
             if (k != m.u.hot_list.n_entries || m.u.hot_list.limit > KDB_HOT_MAX) abort();
         } else if (fr.type == KDB_T_FETCH_REQ) {         /* D1a */
             const kdb_fetch_req_t *q = &m.u.fetch_req;
-            if (q->request_id == 0 || q->view >= 3 || strlen(q->name) == 0 || q->priority >= KDB_FETCH_PRIO_N || q->mode > KDB_FETCH_SUMMARY) abort();
+            if (q->request_id == 0 || q->view >= 3 || strlen(q->name) == 0 || q->priority >= KDB_FETCH_PRIO_N || q->mode > KDB_FETCH_LOOKUP) abort();
+            if (q->mode == KDB_FETCH_LOOKUP && (q->has_range || q->source_id != 0)) abort();      /* 0.7: a lookup has neither */
             if (q->has_range && (strlen(q->range_lo) == 0 || strlen(q->range_hi) == 0)) abort();
             if (q->source_id < 0) abort();                  /* 0.7 WP7a */
         }

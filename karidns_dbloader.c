@@ -493,6 +493,7 @@ typedef struct {
     /* D1a, the fetch thread (second stream): one zone for one FETCH_REQ, no batch, no inventory, no results.  Every ZONE_BEGIN and ZONE_FAILED
      * carries the request id; with fetch_summary the zone is not read, only its summary is sent. */
     bool fetch;
+    bool fetch_lookup;                /* 0.7: the request is a lookup of a name (FETCH_REQ mode KDB_FETCH_LOOKUP): lookup_run() instead of the zone */
     /* 0.6.2, a worker of the fetch pool: the connection kept between requests, and what it was opened on.  Opening a SQLite3 connection took
      * about 1.9 ms of the 2.4 ms of a fetch (the first connection to a WAL file: the -shm and -wal files, the locks, the schema), which held a
      * worker at about 400 zones/s.  Each request has its own snapshot; check_schema is repeated after FETCH_SCHEMA_RECHECK_MS only (keep_si).  Kept only for the same driver and source, and
@@ -2247,7 +2248,7 @@ static int run_zones(ctx_t *x, const db_source_t *src, bool bulk, size_t n_want)
 static int send_hello(ctx_t *x, const char *driver_list, uint32_t pid) {
     if (kdb_enc_begin(&x->enc, KDB_T_HELLO) != 0 || kdb_enc_u16(&x->enc, 1, KDB_VERSION) != 0 ||
         kdb_enc_str(&x->enc, 2, KARIDNS_VERSION) != 0 || kdb_enc_str(&x->enc, 3, driver_list) != 0 ||
-        kdb_enc_u32(&x->enc, 4, pid) != 0 || (x->io && kdb_enc_u32(&x->enc, 5, KDB_FEAT_STORE) != 0) || kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
+        kdb_enc_u32(&x->enc, 4, pid) != 0 || (x->io && kdb_enc_u32(&x->enc, 5, KDB_FEAT_STORE | KDB_FEAT_LOOKUP) != 0) || kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
         return -1;
     return 0;
 }
@@ -3928,6 +3929,87 @@ static int st_emit_listed(ctx_t *x, const db_schema_info_t *si, const char *only
 }
 
 
+/* ---- 0.7: the lookup of a name (FETCH_REQ mode KDB_FETCH_LOOKUP, fetch stream) ----
+ * The Backend's first start has not listed every zone yet and a query asks for a name that none of the zones it knows covers: which zone of this view encloses the name?  The candidates are the name and its parent
+ * names (never the root), asked of the database in one statement (find_zones_in()), the closest first.  The first one that the view serves (the mapping of karidns_domain_views, the rule of a pass) and whose type
+ * and name the pass offers too is the answer, described as a MANIFEST entry would describe it (the identity, the kind, the stamp); a closer zone that is not served here does not hide the zones above it.  Only a
+ * primary zone is an answer: when the closest zone the view serves is a secondary or a catalog one, nothing is found (the Backend serves those from its heap once the pass has had them loaded).  LOOKUP_RESULT
+ * says what was found, or that nothing was; a database error is ZONE_FAILED (fetch_one()).  The connection and the snapshot are those of a fetch. */
+static int lookup_send(ctx_t *x, const char *canon, int64_t id, uint8_t kind, bool stamped, uint64_t gen, uint64_t at, bool has_serial, uint32_t serial) {
+    if (kdb_enc_begin(&x->enc, KDB_T_LOOKUP_RESULT) != 0 || kdb_enc_u64(&x->enc, 1, x->fetch_req) != 0 || kdb_enc_u16(&x->enc, 2, x->view) != 0 ||
+        kdb_enc_u8(&x->enc, 3, canon ? 1 : 0) != 0 ||
+        (canon && (kdb_enc_i64(&x->enc, 4, id) != 0 || kdb_enc_name(&x->enc, 5, canon) != 0 || kdb_enc_u8(&x->enc, 6, kind) != 0 || kdb_enc_u64(&x->enc, 7, gen) != 0 ||
+                   kdb_enc_u64(&x->enc, 8, at) != 0 || (stamped && kdb_enc_u8(&x->enc, 9, KDB_EF_STAMPED) != 0) || (has_serial && kdb_enc_u32(&x->enc, 10, serial) != 0))) ||
+        kdb_enc_end(&x->enc) != 0) {
+        x->oom = true;
+        return EXIT_ERROR;
+    }
+    x->n_zones++;
+    fw_lock(x);
+    int rc = send_enc(x);
+    fw_unlock(x);
+    if (rc != 0) {
+        x->io_error = true;
+        return EXIT_ERROR;
+    }
+    return 0;
+}
+
+/* does the mapping give the zone `id` to the view (the rule of apply_mapping(): no row, or a row for this view)? */
+typedef struct { const char *view; bool any, mine; } lk_map_t;
+static int lk_map_cb(void *ud, int64_t did, const char *vn) {
+    (void)did;
+    lk_map_t *m = ud;
+    m->any = true;
+    if (strcasecmp(vn, m->view) == 0) m->mine = true;
+    return 0;
+}
+
+static int lookup_mapped(ctx_t *x, const db_schema_info_t *si, int64_t id, bool *mapped) {
+    *mapped = true;
+    if (!x->map_view || !si->has_domain_views) return 0;
+    lk_map_t m = { x->map_view, false, false };
+    int rc = x->drv->scan_domain_views(x->conn, &id, lk_map_cb, &m);
+    if (rc != 0) return db_err(x, rc, "reading karidns_domain_views");
+    *mapped = !m.any || m.mine;
+    return 0;
+}
+
+static int lookup_run(ctx_t *x, const db_schema_info_t *si, const char *qname) {
+    const char *names[DB_LOOKUP_MAX];
+    size_t n = 0;
+    for (const char *p = qname; *p && !(p[0] == '.' && p[1] == '\0') && n < DB_LOOKUP_MAX;) {          /* (the name that starts at p: the query name, then every parent up to the root) */
+        names[n++] = p;
+        const char *dot = strchr_unescaped(p, '.');
+        if (!dot) break;
+        p = dot + 1;
+    }
+    if (n == 0) return lookup_send(x, NULL, 0, 0, false, 0, 0, false, 0);
+    x->only_name = NULL;                                    /* (zone_cb() keeps every row) */
+    int rc = x->drv->find_zones_in(x->conn, names, n, zone_cb, x);
+    if (rc != 0) return x->oom ? EXIT_ERROR : db_err(x, rc, "looking up the zone of a name");
+    for (size_t i = 0; i < x->nz; i++) {                      /* (the longest name first) */
+        const zinfo_t *z = &x->zones[i];
+        if (zone_type_reason(z->type) || !z->canon || !domain_name_is_at_or_below(qname, z->canon)) continue;        /* (a zone the pass does not offer, or a spelling that is no ancestor of the name: the next one) */
+        bool mapped;
+        if ((rc = lookup_mapped(x, si, z->id, &mapped)) != 0) return rc;
+        if (!mapped) continue;
+        if (zone_sec_kind(z->type) != KDB_ZK_PRIMARY) break;
+        bool stamped = false;
+        uint64_t gen = 0, at = 0;
+        if (si->has_zone_state) {                             /* the stamp of the version, from the manifest row of the id (a zone that is gone by now is none) */
+            st_look_t l;
+            if ((rc = st_lookup(x, z->id, &l)) != 0) return db_err(x, rc, "reading the version of a zone");
+            if (!l.found) break;
+            stamped = l.has_state;
+            gen = l.gen;
+            at = l.at;
+        }
+        return lookup_send(x, z->canon, z->id, zone_sec_kind(z->type), stamped, gen, at, !stamped && z->has_serial, z->serial);
+    }
+    return lookup_send(x, NULL, 0, 0, false, 0, 0, false, 0);
+}
+
 static int run_view_once(ctx_t *x, const db_source_t *src, const char *only_zone, bool whole) {
     ctx_view_reset(x);
     x->only_name = only_zone;
@@ -3992,6 +4074,10 @@ static int run_view_once(ctx_t *x, const db_source_t *src, const char *only_zone
     /* the position of the change log in this snapshot, for the pool's workers to compare with (run_pool()); only a driver whose position is exact (SQLite3: the
      * highest seq; a PostgreSQL cursor is the xmin of the snapshot, which says nothing about commits in between) */
     x->pos_valid = x->nthreads > 1 && si.has_changes && x->drv->changes_max && !x->drv->changes_unsettled && x->drv->changes_max(x->conn, &x->pos_m) == 0;
+    if (x->fetch && x->fetch_lookup) {                    /* 0.7: the zone that encloses a name, not a zone that is asked for by its name */
+        status = lookup_run(x, &si, only_zone);
+        goto out_snap;
+    }
     /* B13: a one-zone request looks the zone up by name (index) instead of listing every zone of the source, so its cost does
      * not grow with the number of zones; a missing zone is the same empty result as before (nz == 0: a deletion in stream mode) */
     rc = x->only_name && x->drv->find_zone ? x->drv->find_zone(x->conn, x->only_name, zone_cb, x) : x->drv->list_zones(x->conn, zone_cb, x);
@@ -4748,7 +4834,7 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
             char shown[210];
             clean_reason(q->name, shown, sizeof(shown));
             lgd(2, "fetch %llu: zone '%s' (view %u, %s): %s (%u queued)", (unsigned long long)q->request_id, shown, (unsigned)q->view,
-                q->mode == KDB_FETCH_SUMMARY ? "summary" : "whole zone", !f ? "refused, too many are waiting (the Backend's request times out)"
+                q->mode == KDB_FETCH_SUMMARY ? "summary" : q->mode == KDB_FETCH_LOOKUP ? "lookup of a name" : "whole zone", !f ? "refused, too many are waiting (the Backend's request times out)"
                 : f >= io->fq && f < io->fq + FQ_MAX ? "queued" : "answered busy", queued);
         }
         break;
@@ -5243,10 +5329,12 @@ static int fetch_one(ctx_t *x, const lcfg_t *lc, const freq_t *r) {
     if (r->range) return fetch_fail(x, r, "this loader does not read a range of a zone");
     if (!drv) return fetch_fail(x, r, "the loader has no usable configuration yet");
     if (!v) return fetch_fail(x, r, "the view is not in the configuration");
+    if (r->mode == KDB_FETCH_LOOKUP && (!drv->find_zones_in || !lc->store_proto || !drv->manifest_page)) return fetch_fail(x, r, "this loader cannot look up the zone of a name with this driver or without the store protocol");
     x->fetch_req = r->id;
     x->fetch_vname = lc->store_proto ? NULL : v->name;     /* (the store protocol keeps no inventory for the fetch thread to tell) */
     x->fetch_source_id = r->source_id;
     x->fetch_summary = r->mode == KDB_FETCH_SUMMARY;
+    x->fetch_lookup = r->mode == KDB_FETCH_LOOKUP;
     x->drv = drv;
     x->view = r->view;
     x->nthreads = 1;
@@ -5268,6 +5356,7 @@ static int fetch_one(ctx_t *x, const lcfg_t *lc, const freq_t *r) {
     x->map_view = NULL;
     x->fetch_vname = NULL;
     x->fetch_source_id = 0;
+    x->fetch_lookup = false;
     if (x->io_error || x->oom || g_stop || atomic_load(&g_fetch_stop)) return -1;
     if (x->n_zones == 0 && x->n_failed == 0)                  /* nothing was sent: the Backend is waiting for an answer */
         return fetch_fail(x, r, x->errtext[0] ? x->errtext : "the zone could not be read");

@@ -355,5 +355,21 @@ int park_att_claim(uint16_t sview, uint32_t zid, int w);
 void park_att_requested(uint16_t sview, uint32_t zid);          /* the request of the claim is in a ring */
 uint32_t park_att_take(uint16_t sview, uint32_t zid);
 bool park_att_leave(uint16_t sview, uint32_t zid, int w);       /* worker w no longer waits for the zone (its entry was dropped without the zone) */
+/* B1: the claim also keeps the name key (park_name_key()) of the zone its first worker waits for (0: not known).  A zone id can be given to another zone after the claim was made; the store thread that
+ * takes the claim and finds that the record's zone has another key than the tag knows that the claim's waiters are for a zone that is gone, and tells them (park_wake_queue_zid()).
+ * park_att_claim_tag() is park_att_claim() with the key; park_att_take_tag() is park_att_take() that also returns the key of the claim (0 when there was none or none was kept). */
+int park_att_claim_tag(uint16_t sview, uint32_t zid, int w, uint64_t tag);
+uint32_t park_att_take_tag(uint16_t sview, uint32_t zid, uint64_t *tag);
+
+/* ---- 0.7: the by-name lookups of the first start (a query for a name that no zone of the store covers, while the first pass of a view has not listed every zone) ----
+ * A query like that parks and asks the loader which zone encloses its name (FETCH_REQ mode KDB_FETCH_LOOKUP, dns_db_ingest.c).  The lookups in flight, from the request of the worker to the
+ * end of the ingest thread's work on it, are counted in one number and bounded (PARK_LOOKUP_MAX): a flood of names that no zone has must neither fill the park tables nor take the fetch slots
+ * and the loader's threads from the zones that queries wait for.  The worker takes a place before it makes the request and a query that does not get one is refused at once, as without the lookup;
+ * the ingest thread gives the place back for every request it takes from a ring, whatever became of it. */
+#define PARK_LOOKUP_MAX 32
+bool park_lookup_take(void);
+void park_lookup_give(void);
+uint32_t park_lookup_used(void);
+void park_lookup_set_limit(uint32_t limit);       /* PARK_LOOKUP_MAX by default (tests) */
 
 #endif /* DNS_PARK_H */

@@ -175,11 +175,14 @@ void db_store_ma_inputs(ma_in_t *in);
 bool db_store_filling(void);
 /* 0.7 fix 8: a first fill whose first pass (the list of the zones) has not ended: the store does not know every zone yet (warm-before-serve holds the queries until it does) */
 bool db_store_directory_wait(void);
+/* ... of one view (its id in the store, zref_view_sid(); a view that has none: false) */
+bool db_store_view_pending(int sid);
 /* in every build (dns_db_store.c: the coverage of the test programs and of karidns merges) */
 extern int db_store_test_stg_fail;
 extern _Atomic bool db_store_test_not_resident;
 extern _Atomic bool db_store_test_resident;
 extern void (*_Atomic db_store_test_adopt_hook)(void);
+extern _Atomic bool db_store_test_adopt_noview;
 #ifdef KARIDNS_UNIT_TEST
 extern int db_store_test_set_fail;                      /* the n-th set_put_slot() of the settings table fails (0: off) */
 extern int db_store_test_attach_reserve_fail;           /* the n-th reserve of room in the attach table fails (0: off) */

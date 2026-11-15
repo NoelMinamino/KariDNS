@@ -730,6 +730,7 @@ int db_store_test_stg_fail = 0;                              /* the n-th put int
 _Atomic bool db_store_test_not_resident;                   /* the worker's attach finds no image in the page cache (tests: a page cannot be made to leave it) */
 _Atomic bool db_store_test_resident;                       /* the worker's attach finds the image in the page cache whatever mincore() says (tests: on ZFS, and any file system that does not report the pages that were written, mincore() says no) */
 void (*_Atomic db_store_test_adopt_hook)(void);           /* called by a store thread before it registers a staged zone (tests: hold it, and change the zone meanwhile) */
+_Atomic bool db_store_test_adopt_noview;                  /* the registration of a staged zone finds no view for the store's id (tests: the store is closing) */
 #ifdef KARIDNS_UNIT_TEST
 void (*db_store_test_hot_hook)(uint32_t zid);             /* called by the thread of hot.list before each zone (tests: the order, and time) */
 #endif
@@ -1243,19 +1244,40 @@ static void imgref_free(void *p) {
 
 /* the attach did not work (the record or the image cannot be used, the zone is not the store's to attach): the queries that wait for it are given the park-timeout again and the zone
  * is read from the database.  Only here does a stored zone go to the database.  The workers told are the ones that asked (the claim of the zone: sview, zid; every worker without one). */
+/* B1: the claim of a zone id is taken by the store thread that is done with the zone.  The zone id of a record can have been given to another zone since the first worker made the claim (the zone
+ * was deleted, a new one took the id): the workers of the claim then include queries for a zone that is gone, which the wake by the new zone's name does not reach (their key is another one) and which
+ * would wait for their park-timeout.  The claim keeps the name key of the zone its first worker waited for (park_att_claim_tag()); a key that is not the key of the zone the record holds now says it, and
+ * att_gone_wake() sends the workers of the claim the zone id too (park_wake_queue_zid()): the queries that wait for the id and are still waiting after the wake by name ask for the fetch of their own
+ * zone, which the database answers as for any zone that was deleted (a failure at once, not the park-timeout).  The wake by the id comes after the wake by name in each worker's ring, so the queries for
+ * the new zone are not asked about again.  No claim, or a claim without a key (a worker that attaches by itself), is as before. */
+static uint32_t att_take(const char *view, const char *zone, uint16_t sview, uint32_t zid, bool *gone) {
+  uint64_t tag = 0;
+  const uint32_t ws = park_att_take_tag(sview, zid, &tag);
+  *gone = tag != 0 && tag != park_name_key(view, zone);
+  return ws;
+}
+
+static void att_gone_wake(uint16_t sview, uint32_t zid, uint32_t ws, bool gone) {
+  if (gone) park_wake_queue_zid(sview, zid, ws);
+}
+
 static void attach_fallback(const char *view, const char *zone, uint16_t sview, uint32_t zid) {
   atomic_fetch_add(&G.attach_fallback, 1);
-  const uint32_t ws = zid != STORE_NONE ? park_att_take(sview, zid) : PARK_ATT_ALL;
+  bool gone = false;
+  const uint32_t ws = zid != STORE_NONE ? att_take(view, zone, sview, zid, &gone) : PARK_ATT_ALL;
   if (park_fetch_request_any(view, zone, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL)) park_wake_queue_retry(view, zone, ws, true);
   else park_wake_queue_ask(view, zone, ws);                  /* (every shared slot is taken: the workers that asked ask from their own rings, and the queries stay parked until their park-timeout; no SERVFAIL for a busy moment) */
+  att_gone_wake(sview, zid, ws, gone);
 }
 
 /* the zone is in memory: the workers that asked (the claim of the zone) are woken.  A zone that nobody asked for through a claim (a background attach: a CNAME or glue target, a sibling) has none, and
  * nobody waits for it: no key is sent (it would go to every worker, tens of thousands a second in an attach burst). */
 static void attach_wake(const char *view, const char *zone, uint16_t sview, uint32_t zid, bool nowait) {
-  const uint32_t ws = park_att_take(sview, zid);
+  bool gone;
+  const uint32_t ws = att_take(view, zone, sview, zid, &gone);
   if (nowait && ws == PARK_ATT_ALL) return;
   park_wake_queue_mask(view, zone, ws, false);
+  att_gone_wake(sview, zid, ws, gone);
 }
 
 static uint32_t clamp_ttl(uint32_t v) { return v > 2147483647u ? 2147483647u : v; }
@@ -1331,6 +1353,9 @@ void db_store_ma_inputs(ma_in_t *in) {
 /* 0.7 fix 8: is the list of the zones of a database view still being made (a first fill whose first pass has not ended)?  A query for a zone that the pass has not listed yet is refused as for any name
  * the server does not serve; warm-before-serve holds the queries meanwhile. */
 bool db_store_directory_wait(void) { return atomic_load_explicit(&G.dir_pending, memory_order_acquire) != 0; }
+
+/* the same for one view (its id in the store, zref_view_sid()): the list of its zones is not complete, so a name that no stored zone covers may still be a zone that the pass has not listed (0.7, the by-name lookup) */
+bool db_store_view_pending(int sid) { return sid >= 0 && sid < 32 && (atomic_load_explicit(&G.dir_pending, memory_order_acquire) & (1u << sid)) != 0; }
 
 bool db_store_filling(void) {
   db_recon_status_t r;
@@ -1567,7 +1592,10 @@ static void attach_core(const char *view, const char *zone, uint16_t sview, uint
         /* a fetch (or another attach) of the zone is on its way and wakes the queries that wait when it is done.  They were parked for the attach deadline, though: they are
          * given the park-timeout (a retry key), or they would be answered "not ready" at 200 ms behind a cold read that takes longer */
         atomic_fetch_add(&G.attach_busy, 1);
-        park_wake_queue_retry(view, zone, park_att_take(sview, zid), false);
+        bool gone;
+        const uint32_t ws = att_take(view, zone, sview, zid, &gone);
+        park_wake_queue_retry(view, zone, ws, false);
+        att_gone_wake(sview, zid, ws, gone);
       } else {
         atomic_fetch_add(&G.attach_stale, 1);
         if (!(fl & ATTF_QUIET)) attach_fallback(view, zone, sview, zid);
@@ -1728,8 +1756,16 @@ static void adopt_job(uint16_t sview, uint32_t zid) {
   rcu_aux_read_lock();
   zdir_elem_t *s = stg_get(zid);
   const char *view = st ? store_view_name(st, sview) : NULL;
+#ifdef KARIDNS_UNIT_TEST
+  if (atomic_load_explicit(&db_store_test_adopt_noview, memory_order_relaxed)) view = NULL;
+#endif
   if (!s || !view) {
     rcu_aux_read_unlock();
+    if (s) {                                                  /* the store is closing, or the view id is not one (B2): the staged element would stay in the table for ever (and hold its entry) and the zone id could not be staged again.  Nobody is left to wake: the worker that staged it answered, took the claim of the zone and woke the workers that had joined it (worker_attach()) */
+      stg_remove(s);
+      atomic_fetch_add_explicit(&G.wa_lost, 1, memory_order_relaxed);
+      dbreg_staged_retire(s, true);
+    }
     return;
   }
   zone_db_entry_t *entry = zdir_entry(s);

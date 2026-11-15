@@ -687,6 +687,42 @@ static int sq_find_zone(db_conn_t *c, const char *name, db_zone_cb cb, void *ud)
     return sq_zone_loop(c, st, cb, ud);
 }
 
+/* 0.7: the zones that have one of the names, closest (longest name) first (dns_db_driver.h find_zones_in()).  The statement has two placeholders for each name (the spellings with and without the dot: an IN list is a
+ * SEARCH on the name index even with the explicit collation, as for find_zone()), so its text depends on how many names there are, and it is prepared for the call. */
+static int sq_find_zones_in(db_conn_t *c, const char *const *names, size_t n, db_zone_cb cb, void *ud) {
+    if (n == 0 || n > DB_LOOKUP_MAX) {
+        set_err(c, "find_zones_in: %zu names (1 to %d)", n, DB_LOOKUP_MAX);
+        return -1;
+    }
+    char sql[2560];
+    size_t o = (size_t)snprintf(sql, sizeof(sql),
+                                "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content, r.id FROM domains d "
+                                "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND r.name = d.name AND r.disabled = 0 "
+                                "WHERE d.name COLLATE NOCASE IN (");
+    for (size_t i = 0; i < 2 * n; i++) o += (size_t)snprintf(sql + o, sizeof(sql) - o, "%s?%zu", i ? "," : "", i + 1);
+    snprintf(sql + o, sizeof(sql) - o, ") ORDER BY length(d.name) DESC, d.id, r.id");
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(c->db, sql, -1, &st, NULL);
+    if (rc != SQLITE_OK) return sql_fail(c, rc, "prepare");
+    char a[1100];                  /* the name without the dot, then the dot for the second spelling (SQLite copies the text: SQLITE_TRANSIENT) */
+    for (size_t i = 0; i < n; i++) {
+        size_t l = strlen(names[i]);
+        if (l > 1 && names[i][l - 1] == '.') l--;
+        if (l > sizeof(a) - 2) {                            /* longer than any domain name: it matches nothing (NULL is never equal to a name; an empty text would match the root zone) */
+            sqlite3_bind_null(st, (int)(2 * i + 1));
+            sqlite3_bind_null(st, (int)(2 * i + 2));
+            continue;
+        }
+        memcpy(a, names[i], l);
+        a[l] = '.';
+        sqlite3_bind_text(st, (int)(2 * i + 1), a, (int)l, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, (int)(2 * i + 2), a, (int)l + 1, SQLITE_TRANSIENT);
+    }
+    int ret = sq_zone_loop(c, st, cb, ud);
+    sqlite3_finalize(st);
+    return ret;
+}
+
 /* the rows of a prepared records statement (already bound) to the callback */
 static int rec_loop(db_conn_t *c, sqlite3_stmt *st, db_record_cb cb, void *ud) {
     int ret = 0;
@@ -1852,6 +1888,7 @@ const db_driver_t db_driver_sqlite3 = {
     /* B11 reload requests: PostgreSQL only (watch_requests, requests_max, reload_requests are NULL) */
     .schema_findings = sq_schema_findings,      /* B12 */
     .find_zone = sq_find_zone,                  /* B13 */
+    .find_zones_in = sq_find_zones_in,          /* 0.7: the lookup of a name */
     /* B13b scan_records_in, scan_metadata_in, scan_ext_in: PostgreSQL only (a statement costs no round trip here) */
     .scan_apex = sq_scan_apex,                  /* D1a step 6 */
     .count_domains = sq_count_domains, .manifest_page = sq_manifest_page, .current_cursor = sq_current_cursor, .changes_page = sq_changes_page,      /* 0.7 store, WP3 */

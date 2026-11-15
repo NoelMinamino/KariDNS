@@ -112,7 +112,7 @@ static const kdb_tspec_t sp_batch_result[] = {
 TDEF(td_batch_result, "BATCH_RESULT", sp_batch_result);
 static const kdb_tspec_t sp_fetch_req[] = {
     S(KT_U64, KS_REQ, 0), S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, KDB_FETCH_PRIO_N - 1),
-    S(KT_U8, KS_REQ | KS_MAXV, KDB_FETCH_SUMMARY), S(KT_NAME, 0, 0), S(KT_NAME, 0, 0), S(KT_I64, 0, 0) };
+    S(KT_U8, KS_REQ | KS_MAXV, KDB_FETCH_LOOKUP), S(KT_NAME, 0, 0), S(KT_NAME, 0, 0), S(KT_I64, 0, 0) };
 TDEF(td_fetch_req, "FETCH_REQ", sp_fetch_req);
 /* D1a step 7: HOT_LIST (Backend -> loader) and WARM_LIST (loader -> Backend) have one layout; tag 5 is for the first, 6 and 7 for the second */
 static const kdb_tspec_t sp_hot_entry[] = { S(KT_STR, KS_REQ | KS_NE, 255), S(KT_NAME, KS_REQ, 0) };
@@ -151,6 +151,11 @@ static const kdb_tspec_t sp_changes[] = {
     S(KT_U64, KS_REQ, 0), S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_U64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 1), S(KT_BYTES, 0, KDB_IDENT_MAX),
     { KT_NEST, 0, KDB_MANIFEST_PAGE_MAX, &td_ch_entry } };
 TDEF(td_changes, "CHANGES", sp_changes);
+/* 0.7: the answer to a lookup (FETCH_REQ mode 2); the tags 4..10 are the entry of a MANIFEST, flat */
+static const kdb_tspec_t sp_lookup_result[] = {
+    S(KT_U64, KS_REQ, 0), S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_U8, KS_REQ | KS_MAXV, 1), S(KT_I64, 0, 0), S(KT_NAME, 0, 0), S(KT_U8, KS_MAXV, KDB_ZK_CATALOG),
+    S(KT_U64, 0, 0), S(KT_U64, 0, 0), S(KT_U8, KS_MAXV, KDB_EF_STAMPED), S(KT_U32, 0, 0) };
+TDEF(td_lookup_result, "LOOKUP_RESULT", sp_lookup_result);
 
 
 /* INVENTORY_REQ has no tags: any tag is unknown */
@@ -179,6 +184,7 @@ static const kdb_mdef_t mdefs[] = {
     { KDB_T_MANIFEST, "MANIFEST", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_manifest },
     { KDB_T_MANIFEST_END, "MANIFEST_END", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_manifest_end },
     { KDB_T_CHANGES, "CHANGES", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_changes },
+    { KDB_T_LOOKUP_RESULT, "LOOKUP_RESULT", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_lookup_result },
     { KDB_T_CONFIG, "CONFIG", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_config },
     { KDB_T_RELOAD_REQ, "RELOAD_REQ", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_reload_req },
     { KDB_T_INVENTORY, "INVENTORY", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_inventory },
@@ -611,6 +617,7 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         r->mode = (uint8_t)V(5).u;
         r->source_id = V(8).present ? (int64_t)V(8).u : 0;
         if (r->source_id < 0) FAIL(why, wl, KDB_E_RANGE, "FETCH_REQ: negative source id");
+        if (r->mode == KDB_FETCH_LOOKUP && (V(6).present || V(7).present || V(8).present)) FAIL(why, wl, KDB_E_RANGE, "FETCH_REQ: a lookup takes no range and no source id");
         if (V(6).present != V(7).present) FAIL(why, wl, KDB_E_TLV_MISSING, "FETCH_REQ: a range needs both range_lo and range_hi");
         if (V(6).present) {
             r->has_range = true;
@@ -667,6 +674,28 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         kdb_changes_entries(m, &it);
         while (kdb_changes_entries_next(&it, &en)) k++;
         if (k != nrep) FAIL(why, wl, KDB_E_TLV_MISSING, "CHANGES.ENTRY: an upsert needs its name (tag 3) and kind (tag 4)");
+        break;
+    }
+    case KDB_T_LOOKUP_RESULT: {
+        kdb_lookup_result_t *l = &m->u.lookup_result;
+        l->request_id = V(1).u;
+        if (l->request_id == 0) FAIL(why, wl, KDB_E_RANGE, "LOOKUP_RESULT: request id 0");
+        l->view = (uint16_t)V(2).u;
+        l->found = V(3).u != 0;
+        if (!l->found) {
+            for (int t = 4; t <= 10; t++)
+                if (V(t).present) FAIL(why, wl, KDB_E_RANGE, "LOOKUP_RESULT: no zone found, and tag %d", t);
+            break;
+        }
+        if (!V(4).present || !V(5).present || !V(6).present || !V(7).present || !V(8).present) FAIL(why, wl, KDB_E_TLV_MISSING, "LOOKUP_RESULT: a zone needs tags 4 to 8");
+        l->source_id = (int64_t)V(4).u;
+        gname(l->name, &V(5));
+        l->kind = (uint8_t)V(6).u;
+        l->stamp_gen = V(7).u;
+        l->stamp_time = V(8).u;
+        l->stamped = V(9).present && (V(9).u & KDB_EF_STAMPED) != 0;
+        l->has_serial = V(10).present;
+        l->serial = V(10).present ? (uint32_t)V(10).u : 0;
         break;
     }
     case KDB_T_INVENTORY_END:
@@ -1027,7 +1056,7 @@ void kdb_sm_init_fetch(kdb_sm_t *sm, const kdb_limits_t *lim) {
 static bool sm_legal(const kdb_sm_t *sm, uint16_t t) {
     if (sm->fetch) {
         switch (sm->state) {
-        case KDB_S_READY: return t == KDB_T_ZONE_BEGIN || t == KDB_T_ZONE_FAILED || t == KDB_T_PROFILE;
+        case KDB_S_READY: return t == KDB_T_ZONE_BEGIN || t == KDB_T_ZONE_FAILED || t == KDB_T_PROFILE || t == KDB_T_LOOKUP_RESULT;
         case KDB_S_IN_ZONE: return t == KDB_T_ZONE_DATA || t == KDB_T_ZONE_END || t == KDB_T_ZONE_ABORT;
         default: return false;
         }
@@ -1120,6 +1149,8 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
         break;
     case KDB_T_ZONE_DELETE:
         sm->n_deleted++;
+        break;
+    case KDB_T_LOOKUP_RESULT:                   /* (only the fetch stream: sm_legal() allows it there and nowhere else) */
         break;
     case KDB_T_ZONE_BEGIN: {
         uint64_t n = m->u.zone_begin.rr_count;

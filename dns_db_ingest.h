@@ -41,6 +41,9 @@ void db_ingest_debug_changed(void);
  * kernel queues the UDP datagrams and the TCP connections wait in the listen queue (a client retries as it does for any slow server; no SERVFAIL is sent, a
  * resolver would hold that against the server); the control channel is not held.  Any thread; no lock. */
 bool db_ingest_hold_queries(void);
+/* 0.7: does the loader answer a lookup of a name (FETCH_REQ mode KDB_FETCH_LOOKUP: which zone of the view encloses it?) and is the store protocol on?  A query for a name that no stored zone covers, while a view's first
+ * pass has not listed every zone, is parked for a lookup only when this is true; otherwise it is refused at once.  Any thread; no lock. */
+bool db_ingest_lookup_ready(void);
 
 /* `karictl dbstatus [zone [view]]`: text for the control channel (design 5.2).  Returns the length written to out
  * (always NUL terminated), or 0 when the configuration has no database block.  Control thread. */
