@@ -279,11 +279,15 @@ parked query waits for it.
 \fBRequests.\fR \fBFETCH_REQ\fR (request id, view, zone, priority 0 query / 1
 warm-up / 2 background, mode 0 the zone / 1 its summary; an optional range,
 which this loader refuses). A thread of the loader reads them into a queue of
-256, takes the most urgent first (the oldest within a priority) and reads the
-zone through the same code as a one-zone reload: its own connection and
-snapshot, no batch, no inventory, no results. A request beyond the queue is
-answered \fBZONE_FAILED\fR "busy" (the first eight; more are dropped and the
-Backend's own time-out ends them).
+256, takes the most urgent first (the oldest within a priority; but a request
+that has waited 200 ms goes before every priority, the oldest such request
+first, so that a steady flow of priority 0 requests cannot keep a priority 2
+request, such as the background fetch of a zone that a query has joined, waiting
+past the Backend's park time-out. Every priority and mode is covered: the age
+counts, not the class) and reads the zone through the same code as a one-zone
+reload: its own connection and snapshot, no batch, no inventory, no results. A
+request beyond the queue is answered \fBZONE_FAILED\fR "busy" (the first eight;
+more are dropped and the Backend's own time-out ends them).
 .IP \(bu 2
 \fBAnswers.\fR \fBZONE_BEGIN\fR .. \fBZONE_DATA\fR .. \fBZONE_END\fR with the
 request id in \fBZONE_BEGIN\fR (a secondary or catalog zone has no data, as in a

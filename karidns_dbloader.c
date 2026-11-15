@@ -603,8 +603,13 @@ typedef struct {
 typedef struct { uint64_t id; uint16_t view; bool force; char zone[DNS_NAME_TEXT_SIZE]; } lreq_t;
 
 /* D1a: a FETCH_REQ waiting for the fetch thread (priority 0 = a parked query waits, 1 = warm-up, 2 = background) */
-typedef struct { uint64_t id; uint16_t view; uint8_t prio, mode; bool range; int64_t source_id; char zone[DNS_NAME_TEXT_SIZE]; } freq_t;
+typedef struct { uint64_t id; uint16_t view; uint8_t prio, mode; bool range; int64_t source_id; int64_t at; char zone[DNS_NAME_TEXT_SIZE]; } freq_t;   /* at: CLOCK_MONOTONIC ms of the enqueue */
 #define FQ_MAX 256                           /* more than this is answered "busy" (design 6.1) */
+/* A request that has waited this long in fq goes before the priorities (the oldest first): a Backend query that joined a request in flight (the background
+ * fetch of a zone) would otherwise wait for it behind every later priority 0 request, for as long as those keep coming, and run into the park time-out.
+ * KARIDNS_FETCH_AGING_MS in the environment replaces it (a test switch: the supervisor starts the loader with a cleared environment). */
+#define FQ_AGING_MS 200
+static int64_t g_fq_aging_ms = FQ_AGING_MS;
 
 #define LREQ_MAX 64
 #define IDX_SLOTS 65536                      /* view indexes are u16 */
@@ -4825,6 +4830,7 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
             f->mode = q->mode;
             f->range = q->has_range;
             f->source_id = q->source_id;
+            f->at = now_ms();
             snprintf(f->zone, sizeof(f->zone), "%s", q->name);
             pthread_cond_broadcast(&io->fq_cond);          /* (broadcast: a worker above fq_allowed would take the wake-up) */
         }
@@ -5377,7 +5383,8 @@ static void fetch_workers_stop(struct lio *io) {
     pthread_mutex_unlock(&io->fq_lock);
 }
 
-/* a worker of the pool: takes the most urgent request (priority 0 before 1 before 2, the oldest first) and runs it through the same reader as a one-zone
+/* a worker of the pool: takes the most urgent request (priority 0 before 1 before 2, the oldest first; but one that has waited FQ_AGING_MS goes first, the
+ * oldest of them, so that no priority starves another) and runs it through the same reader as a one-zone
  * reload, on a database connection of its own.  Worker n works only while loader-threads is more than n (a smaller loader-threads after a reconfiguration
  * lets the workers above it rest; they are not ended). */
 static void *fetch_worker(void *arg) {
@@ -5402,9 +5409,10 @@ static void *fetch_worker(void *arg) {
             pthread_mutex_unlock(&io->fq_lock);
             break;
         }
-        size_t best = 0;
-        for (size_t i = 1; i < io->nfq; i++)
-            if (io->fq[i].prio < io->fq[best].prio) best = i;
+        size_t best = 0;                                          /* (fq is in arrival order: [0] is the oldest, and if it is not aged none is) */
+        if (now_ms() - io->fq[0].at < g_fq_aging_ms)
+            for (size_t i = 1; i < io->nfq; i++)
+                if (io->fq[i].prio < io->fq[best].prio) best = i;
         freq_t r = io->fq[best];
         memmove(&io->fq[best], &io->fq[best + 1], (io->nfq - best - 1) * sizeof(io->fq[0]));
         io->nfq--;
@@ -6744,6 +6752,11 @@ int main(int argc, char **argv) {
      * only, as the LOG_PERROR copy, in every mode (stream mode without --log-stderr, the fallback of a closed pipe, the shared code's messages
      * in dump and check mode).  A supervised loader has a cleared environment and --log-stderr: it is not affected. */
     klog_nosyslog_from_env("karidns-dbloader");
+    const char *aging_env = getenv("KARIDNS_FETCH_AGING_MS");                 /* (a test switch, see FQ_AGING_MS) */
+    if (aging_env) {
+        unsigned long av;
+        if (parse_uint(aging_env, 1, 3600000, &av)) g_fq_aging_ms = (int64_t)av;
+    }
     int ch;
     while ((ch = getopt_long(argc, argv, "hs:", longopts, NULL)) != -1) {
         switch (ch) {
