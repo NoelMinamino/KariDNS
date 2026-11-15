@@ -320,6 +320,16 @@ static int imp_zone(const zi_opts_t *o, const char *origin, unsigned long serial
     return st;
 }
 
+/* n A records h0 .. h<n-1> (the addresses start at 192.0.2.<off>), for the imports large enough to ANALYZE records afterwards */
+static char *big_body(unsigned n, unsigned off) {
+    size_t cap = (size_t)n * 40 + 1, len = 0;
+    char *b = malloc(cap);
+    if (!b) abort();
+    b[0] = '\0';
+    for (unsigned i = 0; i < n; i++) len += (size_t)snprintf(b + len, cap - len, "h%u IN A 192.0.2.%u\n", i, (i + off) % 254 + 1);
+    return b;
+}
+
 typedef struct { char *p; size_t n, cap; } sbuf_t;
 static int sb_sink(void *ud, const char *d, size_t n) {
     sbuf_t *b = ud;
@@ -1599,6 +1609,41 @@ static void t_pg_role(void) {
     LOG_HAS("db.import.keys");
     CHECK(qn("SELECT count(*) FROM karidns_reload_requests") == 2 && qn("SELECT count(*) FROM karidns_domain_views") == 2);
     CHECK(qn("SELECT count(*) FROM karidns_changes") > 10);
+    /* 0.7: ANALYZE records after a large import.  The script grants MAINTAIN on records on PostgreSQL 17 and later (the writer role does not own it);
+     * without it the import goes on and says once per run that the role may not */
+    {
+        char *big = big_body(1000, 0);
+        bool pg17 = PQserverVersion(g_pg) >= 170000;
+        zi_opts_t wa = base_opts();
+        wa.src.conninfo_file = wci;
+        if (pg17) {
+            CHECK(qn("SELECT has_table_privilege('karidns_writer_t', 'public.records', 'MAINTAIN')::int") == 1);
+            log_reset();
+            CHECK_MSG(imp_zone(&wa, "an1.test", 1, big, &r) == ZI_OK && r.committed, "%s", g_log);
+            LOG_HAS("db.import.analyze");
+            LOG_HAS_NOT("db.import.analyze-denied");
+            be_exec("REVOKE MAINTAIN ON public.records FROM karidns_writer_t");
+        }
+        log_reset();
+        zi_t *za = zi_open(&wa);
+        CHECK(za != NULL);
+        if (za) {
+            const char *names[2] = { "an2.test", "an3.test" };
+            for (int i = 0; i < 2; i++) {
+                char *t = zone_text(names[i], 1, big);
+                zi_input_t in = { NULL, t, strlen(t), 0 };
+                zi_result_t ar;
+                CHECK_MSG(zi_import_zone(za, &in, NULL, &ar) == ZI_OK && ar.committed, "%s", g_log);       /* committed whatever the statistics */
+                free(t);
+            }
+            zi_close(za);
+        }
+        const char *d1 = strstr(g_log, " db.import.analyze-denied]");
+        CHECK_MSG(d1 && !strstr(d1 + 1, " db.import.analyze-denied]"), "the note must come once:\n%s", g_log);
+        LOG_HAS_NOT("db.import.analyze");
+        CHECK(nrec("an3.test") == 1003);
+        free(big);
+    }
     /* and it cannot read the private keys */
     PGconn *wc = PQconnectdb(ci);
     CHECK(PQstatus(wc) == CONNECTION_OK);
@@ -3134,6 +3179,100 @@ static void t_apply_driver(void) {
     }
 }
 
+/* 0.7: a committed import that wrote or removed 1000 records or more refreshes the statistics of records (ANALYZE, PostgreSQL); the role of the
+ * test owns the tables here (the writer role without MAINTAIN: t_pg_role) */
+static void t_analyze(void) {
+    printf("  ANALYZE records after a large import\n");
+    be_fresh(false);                                    /* new tables: no statistics of an earlier scenario (TRUNCATE keeps last_analyze) */
+    be_fresh(true);
+    zi_opts_t o = base_opts();
+    zi_result_t r;
+    char *b996 = big_body(996, 0), *b997 = big_body(997, 0);
+    const char *last = "SELECT count(*) FROM pg_stat_user_tables WHERE schemaname = 'public' AND relname = 'records' AND last_analyze IS NOT NULL";
+    log_reset();
+    CHECK(imp_zone(&o, "small.test", 1, K_BODY, &r) == ZI_OK && r.committed);
+    CHECK(imp_zone(&o, "a999.test", 1, b996, &r) == ZI_OK && r.records_inserted == 999);       /* one short of the threshold */
+    o.dry_run = true;
+    CHECK(imp_zone(&o, "dry.test", 1, b997, &r) == ZI_OK && !r.committed);                   /* nothing committed, nothing to analyze */
+    o.dry_run = false;
+    LOG_HAS_NOT("db.import.analyze");
+    if (g_be == BE_PG) CHECK(qn("%s", last) == 0);
+    /* the count is per run, not per zone: zones of 300 records through one zi_t (import --all, the API's batches) analyze after the fourth
+     * (1200 records written; the table was never analyzed), and the count starts again after it */
+    {
+        char *b297 = big_body(297, 0);
+        zi_t *za = zi_open(&o);
+        CHECK(za != NULL);
+        for (int i = 0; za && i < 8; i++) {
+            char name[32];
+            snprintf(name, sizeof(name), "run%d.test", i);
+            char *t = zone_text(name, 1, b297);
+            zi_input_t in = { NULL, t, strlen(t), 0 };
+            zi_result_t ar;
+            log_reset();
+            CHECK_MSG(zi_import_zone(za, &in, NULL, &ar) == ZI_OK && ar.committed && ar.records_inserted == 300, "%s", g_log);
+            free(t);
+            if (g_be == BE_PG && (i == 3 || i == 7)) {
+                CHECK_MSG(strstr(g_log, " db.import.analyze]") != NULL, "zone %d of the run: no ANALYZE\n%s", i + 1, g_log);
+                if (i == 3) CHECK(qn("%s", last) == 1);
+            } else {
+                CHECK_MSG(strstr(g_log, " db.import.analyze]") == NULL, "zone %d of the run: ANALYZE\n%s", i + 1, g_log);
+            }
+        }
+        if (za) zi_close(za);
+        free(b297);
+    }
+    log_reset();
+    CHECK(imp_zone(&o, "a1000.test", 1, b997, &r) == ZI_OK && r.records_inserted == 1000);
+    if (g_be == BE_SQLITE) {
+        CHECK(g_drv->w_analyze == NULL);                                                      /* SQLite3: nothing to refresh */
+        LOG_HAS_NOT("db.import.analyze");
+    } else {
+        LOG_HAS("db.import.analyze");
+        CHECK(qn("%s", last) == 1);
+        /* removing as many counts too: the zone replaced by a small one */
+        log_reset();
+        CHECK(imp_zone(&o, "a1000.test", 2, K_BODY, &r) == ZI_OK && r.records_deleted >= 997);
+        LOG_HAS("db.import.analyze");
+        /* another session holds SHARE UPDATE EXCLUSIVE (as an autovacuum does; the writes do not need it): ANALYZE (SKIP_LOCKED) does not wait
+         * for it and skips, an info; the import is committed */
+        be_exec("BEGIN; LOCK TABLE records IN SHARE UPDATE EXCLUSIVE MODE");
+        log_reset();
+        CHECK_MSG(imp_zone(&o, "locked.test", 1, b997, &r) == ZI_OK && r.committed, "%s", g_log);
+        be_exec("ROLLBACK");
+        LOG_HAS("db.import.analyze-skipped");
+        LOG_HAS_NOT("db.import.analyze-failed");
+        LOG_HAS_NOT("db.import.analyze");
+        CHECK(nrec("locked.test") == 1000);
+        /* fresh statistics are left alone, without a message: a table of 20000 records more (analyzed), then 1000 records changed (below 50 + 10 %) */
+        char *b19k = big_body(19997, 0);
+        log_reset();
+        CHECK_MSG(imp_zone(&o, "huge.test", 1, b19k, &r) == ZI_OK && r.records_inserted == 20000, "%s", g_log);
+        LOG_HAS("db.import.analyze");
+        long n1 = qn("SELECT analyze_count FROM pg_stat_user_tables WHERE schemaname = 'public' AND relname = 'records'");
+        log_reset();
+        CHECK_MSG(imp_zone(&o, "fresh.test", 1, b997, &r) == ZI_OK && r.records_inserted == 1000, "%s", g_log);
+        LOG_HAS_NOT("db.import.analyze");
+        LOG_HAS_NOT("db.import.analyze-skipped");
+        LOG_HAS_NOT("db.import.analyze-failed");
+        CHECK(qn("SELECT analyze_count FROM pg_stat_user_tables WHERE schemaname = 'public' AND relname = 'records'") == n1);
+        /* ANALYZE fails (an expression index whose function raises only under ANALYZE, which computes its statistics): a warning, the import
+         * is committed */
+        be_exec("CREATE FUNCTION an_fail(bigint) RETURNS bigint IMMUTABLE LANGUAGE plpgsql AS $$ BEGIN IF current_query() ILIKE 'ANALYZE%' THEN "
+                "RAISE EXCEPTION 'analyze fails (test)'; END IF; RETURN $1; END $$; CREATE INDEX an_fail_idx ON records ((an_fail(id)))");
+        log_reset();
+        CHECK_MSG(imp_zone(&o, "fail.test", 1, b19k, &r) == ZI_OK && r.committed, "%s", g_log);
+        LOG_HAS("db.import.analyze-failed");
+        LOG_HAS_NOT("db.import.analyze");
+        CHECK(strstr(g_log, "analyze fails (test)") != NULL);
+        CHECK(nrec("fail.test") == 20000);
+        be_exec("DROP INDEX an_fail_idx; DROP FUNCTION an_fail(bigint)");
+        free(b19k);
+    }
+    free(b996);
+    free(b997);
+}
+
 static void run_scenarios(void) {
     if (g_be == BE_SQLITE) t_changes_parser();
     t_new_zone();
@@ -3162,6 +3301,7 @@ static void run_scenarios(void) {
     t_apply();
     t_apply_text();
     t_apply_driver();
+    t_analyze();
 #ifdef KARIDNS_DB_POSTGRESQL
     if (g_be == BE_PG) {
         t_pg_session();
@@ -3240,6 +3380,7 @@ int main(int argc, char **argv) {
     }
     int ran = 0;
     bool ran_sqlite = false;
+    bool ran_pg = false;
 #ifdef KARIDNS_DB_SQLITE3
     printf("SQLite3\n");
     g_be = BE_SQLITE;
@@ -3261,6 +3402,7 @@ int main(int argc, char **argv) {
         g_have_ext = false;
         run_scenarios();
         ran++;
+        ran_pg = true;
     }
     pg_cleanup();
 #else
@@ -3273,7 +3415,8 @@ int main(int argc, char **argv) {
         for (int c = 1; c < DC__COUNT; c++) {
             const char *n = dns_diag_code_name((dns_diag_code_t)c);
             if ((strncmp(n, "db.import.", 10) == 0 || strncmp(n, "db.export.", 10) == 0) && strcmp(n, "db.import.rows") != 0 &&
-                strcmp(n, "db.import.summary") != 0 && strcmp(n, "db.import.change") != 0 && strcmp(n, "db.export.done") != 0)
+                strcmp(n, "db.import.summary") != 0 && strcmp(n, "db.import.change") != 0 && strcmp(n, "db.export.done") != 0 &&
+                (ran_pg || strncmp(n, "db.import.analyze", 17) != 0))          /* db.import.analyze*: PostgreSQL only */
                 CHECK_MSG(g_code_seen[c], "no scenario printed the code %s", n);
         }
     rm_tree(g_dir);

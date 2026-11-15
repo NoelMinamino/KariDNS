@@ -260,6 +260,9 @@ test('checkbox, select, message', () => {
   const s = select({ label: 'Lang', options: [{ value: 'en', label: 'English' }, { value: 'ja', label: 'JA' }], value: 'ja' });
   assert.equal(s.input.value, 'ja');
   assert.equal(s.input.children.length, 2);
+  assert.equal(s.input.getAttribute('aria-describedby'), null, 'no hint, nothing described');
+  const sh = select({ label: 'Kind', options: [{ value: 'a', label: 'A' }], value: 'a', hint: 'what it is' });
+  assert.equal(sh.node.querySelector(`#${sh.input.getAttribute('aria-describedby')}`).textContent, 'what it is');
   const m = message('error');
   assert.equal(m.node.getAttribute('role'), 'alert');
   assert.equal(m.node.hidden, true);

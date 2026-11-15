@@ -110,7 +110,7 @@ export function zoneView(ctx, { params, query }) {
 
     if (lockedBy === null) {
       panel = draftPanel(ctx, {
-        ds, zone: zname, info, draft, types: addableTypes(types, info.grants), reloadDefault: ctx.session.state.version?.ui?.reload_after_change === true,
+        ds, zone: zname, info, draft, types: addableTypes(types, info.grants),
         onCommitted: committed, onRefresh: loadPage,
       });
       fill(panelBox, panel.node);

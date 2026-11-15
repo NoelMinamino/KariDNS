@@ -82,6 +82,7 @@ export function makeFiles(dir) {
     process.on('exit', () => { try { fs.rmSync(template, { recursive: true, force: true }); } catch { /* left in the temporary directory */ } });
   }
   for (const f of ['zones.sqlite3', 'auth.sqlite3']) fs.copyFileSync(path.join(template, f), path.join(dir, f));
+  fs.chmodSync(path.join(dir, 'auth.sqlite3'), 0o600);          // (it holds the password hashes: inspect refuses it readable by others on POSIX)
 }
 
 // A running deployment: { app, backend, server, base, dir, request(), login(), close() }.  settings: more (or other) lines of the configuration; now: a clock.

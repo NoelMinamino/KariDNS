@@ -54,7 +54,6 @@ export function rollbackPanel(ctx, { ds, zone, info, n, frame }) {
   const flow = changeFlow(ctx, {
     zone,
     reloadable: !info.signer,
-    reloadDefault: ctx.session.state.version?.ui?.reload_after_change === true,
     previewLabel: t('rollback.preview'),
     commitLabel: t('rollback.commit'),
     run: (dry, v) => {

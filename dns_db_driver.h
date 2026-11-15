@@ -110,6 +110,9 @@ typedef struct {
     bool delta_complete;
 } db_version_t;
 
+/* 0.7: what w_analyze did */
+typedef enum { DB_ANALYZE_DONE, DB_ANALYZE_NOT_NEEDED, DB_ANALYZE_SKIPPED, DB_ANALYZE_DENIED } db_analyze_t;
+
 /* B12 (karidns-dbloader --check, `karicheck db`, beta design 7.2): what schema_findings() needs to know about the configuration. */
 typedef struct {
     bool auto_reload;               /* options { database { auto-reload yes; } }: the change log and its triggers are needed */
@@ -504,6 +507,18 @@ typedef struct db_driver {
      * without the tables.  The RRset rows are lines "<ttl> <TYPE> <rdata>" joined by LF; before / after NULL = the RRset was not there / is not there any more. */
     int (*w_insert_version)(db_conn_t *c, int64_t domain_id, const db_version_t *v, uint32_t *number, int64_t *id);
     int (*w_insert_version_rrset)(db_conn_t *c, int64_t version_id, const char *owner, const char *type, const char *before, const char *after);
+
+    /* ----------------------------------------------------------------------------------------------------------------------------
+     * 0.7: statistics after a bulk import.  Optional (NULL = the driver has none to refresh; SQLite3).
+     * ---------------------------------------------------------------------------------------------------------------------------- */
+    /* Refresh the planner statistics of the records table (until autovacuum's first analyze a freshly filled table has none, and the
+     * WebAdmin's RRset queries plan badly).  On an open_write() connection outside a transaction: call it after w_commit().  `changed` is
+     * the number of records the caller wrote or removed since its last call (the server's own count may not have them yet).  PostgreSQL:
+     * DB_ANALYZE_DENIED when the role may not (it must own the table, or hold MAINTAIN on it on a server >= 17); DB_ANALYZE_NOT_NEEDED when
+     * the statistics are fresh (analyzed before, and fewer rows changed since than autovacuum's default trigger, 50 + 10 % of the table);
+     * else ANALYZE (SKIP_LOCKED) records: DB_ANALYZE_DONE, or DB_ANALYZE_SKIPPED when another session held a conflicting lock (a running
+     * VACUUM or ANALYZE; ANALYZE does not wait for it, and so never cancels an autovacuum).  0 (*res set), -1, DB_ERR_RETRY. */
+    int (*w_analyze)(db_conn_t *c, uint64_t changed, db_analyze_t *res);
 } db_driver_t;
 
 #define DB_IN_MAX 128u        /* the most zones of one scan_*_in call */

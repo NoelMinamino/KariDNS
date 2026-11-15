@@ -7,6 +7,7 @@ import { EventEmitter } from 'node:events';
 import { parseConfig } from '../lib/config.js';
 import { parseArgs, checkSetup, openDb, main, USAGE, VERSION, DEFAULT_CONFIG, sqliteModeWarning } from '../lib/cli.js';
 import { loadSqlite } from '../../node/lib/sqlite.js';
+import { readPrivateFile } from '../../node/lib/conf.js';
 
 const out = () => { const w = []; return { w, write: (s) => { w.push(s); }, text: () => w.join('') }; };
 
@@ -122,23 +123,33 @@ test('--check: every problem is named', async () => {
 test('--check for PostgreSQL: the conninfo file, no karictl', async () => {
   const f = fakeRun({ '/kz': { code: 0, stdout: 'karidns-zone 0.6.0 (drivers: postgresql)\n', stderr: '', spawnError: null } });
   const pg = parseConfig('database = pg\nconninfo-file = /ci\nwork-dir = /w\nbind-tools = /bt\nkaridns-zone = /kz\nkaricheck = /kc');
-  const st = { isFile: () => true, uid: process.getuid?.() ?? 0, mode: 0o100600 };
-  const r = await checkSetup(pg, { run: f.run, st: { work: goodStat, conninfo: st } });
+  // (the real readPrivateFile over a file in memory: opened once, the checks on the descriptor, read from it)
+  const at = (mode, text = 'host=/tmp dbname=k') => (file, o) => readPrivateFile(file, {
+    ...o, fsx: { openSync: () => 5, closeSync: () => {}, fstatSync: () => ({ isFile: () => true, uid: process.getuid?.() ?? 0, mode: 0o100000 | mode }), readFileSync: (fd) => { assert.equal(fd, 5); return text; } },
+  });
+  const r = await checkSetup(pg, { run: f.run, st: { work: goodStat }, readPrivate: at(0o600) });
   assert.deepEqual(r.problems, []);
   assert.ok(r.notes.some((n) => /^conninfo-file \/ci: fine$/.test(n)));
   assert.ok(!f.calls.some((c) => c[0] === '/kctl'));
-  const bad = await checkSetup(pg, { run: f.run, st: { work: goodStat, conninfo: { ...st, mode: 0o100644 } } });
-  assert.match(bad.problems[0], /mode 0644/);
+  const bad = await checkSetup(pg, { run: f.run, st: { work: goodStat }, readPrivate: at(0o644) });
+  assert.deepEqual(bad.problems, ['/ci has mode 0644, it must be 0600 or 0400']);
+  assert.ok(!bad.notes.some((n) => /conninfo-file/.test(n)));
+  // a text that does not parse is a problem of --check now (the start refuses it); so is sslmode allow / prefer to another host (decision S-1, 0.7)
+  const unparsed = await checkSetup(pg, { run: f.run, st: { work: goodStat }, readPrivate: at(0o600, 'host=db.example.test nonsense') });
+  assert.deepEqual(unparsed.problems, ["conninfo-file /ci: conninfo: '=' is expected after nonsense"]);
+  const prefer = await checkSetup(pg, { run: f.run, st: { work: goodStat }, readPrivate: at(0o400, 'host=db.example.test sslmode=prefer') });
+  assert.deepEqual(prefer.problems, ['conninfo-file /ci: conninfo: sslmode=prefer to db.example.test would be plain text (karidns-signer does not negotiate TLS): use sslmode=disable for plain text on purpose, or require / verify-full']);
+  assert.deepEqual(prefer.warnings, []);
+  assert.deepEqual((await checkSetup(pg, { run: f.run, st: { work: goodStat }, readPrivate: at(0o600, 'host=localhost sslmode=prefer') })).problems, [], 'local: still plain text, no refusal');
 });
 
 test('--check and the start: a plain text connection to another host is a warning', async () => {
   const f = fakeRun({ '/kz': { code: 0, stdout: 'karidns-zone 0.6.0 (drivers: postgresql)\n', stderr: '', spawnError: null } });
   const pg = parseConfig('database = pg\nconninfo-file = /ci\nwork-dir = /w\nbind-tools = /bt\nkaridns-zone = /kz\nkaricheck = /kc');
-  const st = { isFile: () => true, uid: process.getuid?.() ?? 0, mode: 0o100600 };
-  const warnings = async (text) => (await checkSetup(pg, { run: f.run, st: { work: goodStat, conninfo: st }, readFile: () => text })).warnings;
+  const warnings = async (text) => (await checkSetup(pg, { run: f.run, st: { work: goodStat }, readPrivate: (file, o) => { assert.deepEqual([file, o.program], ['/ci', 'karidns-signer']); return text; } })).warnings;
   assert.deepEqual(await warnings('host=/tmp dbname=k'), []);
   assert.deepEqual(await warnings('host=db.example.test sslmode=verify-full'), []);
-  assert.deepEqual(await warnings('host=db.example.test sslmode=allow'), ['the connection to the database at db.example.test is not encrypted (sslmode=allow); use sslmode=verify-full (require encrypts but does not check the server)']);
+  assert.deepEqual(await warnings('host=db.example.test sslmode=disable'), ['the connection to the database at db.example.test is not encrypted (sslmode=disable); use sslmode=verify-full (require encrypts but does not check the server)']);
   assert.deepEqual(await warnings('host=db.example.test'), ['the connection to the database at db.example.test is not encrypted (no sslmode); use sslmode=verify-full (require encrypts but does not check the server)']);
   assert.deepEqual(await warnings('host=db.example.test nonsense'), []);
   const o = out();
@@ -156,12 +167,13 @@ test('--check and the start: a plain text connection to another host is a warnin
 
     async query() { return { rows: [{ ok: true }] }; }
   }
-  const open = (text, warn) => openDb(pg, { checkConninfo: () => null, importPg: async () => ({ Client: FakeClient }), readFile: () => text, onFatal: () => {}, warn });
+  const open = (text, warn) => openDb(pg, { importPg: async () => ({ Client: FakeClient }), readPrivate: () => text, onFatal: () => {}, warn });
   await (await open('host=192.0.2.5 sslmode=disable', (m) => warned.push(m))).close();
-  await (await open('host=127.0.0.2', (m) => warned.push(m))).close();
+  await (await open('host=127.0.0.2 sslmode=allow', (m) => warned.push(m))).close();
   await (await open('host=192.0.2.5')).close();
   assert.equal(warned.length, 1);
   assert.match(warned[0], /at 192\.0\.2\.5 is not encrypted \(sslmode=disable\)/);
+  await assert.rejects(open('host=192.0.2.5 sslmode=allow'), /^Error: conninfo: sslmode=allow to 192\.0\.2\.5 would be plain text \(karidns-signer does not negotiate TLS\)/);
   const log = [];
   const proc = new EventEmitter();
   const deps = {
@@ -209,7 +221,8 @@ test('openDb: SQLite3 and PostgreSQL', async () => {
     assert.deepEqual(warned, [`sqlite-file ${file} has mode 0644: other users can read the signing keys in it; remove their access (chmod o-rwx)`]);
     // PostgreSQL: a conninfo file that is not acceptable, then one that is
     const cfg = parseConfig('database = pg\nconninfo-file = /ci\nschema = ks');
-    await assert.rejects(openDb(cfg, { checkConninfo: () => '/ci has mode 0644' }), /mode 0644/);
+    await assert.rejects(openDb(cfg, { readPrivate: () => { throw new Error('/ci has mode 0644, it must be 0600 or 0400'); } }), /mode 0644/);
+    await assert.rejects(openDb(cfg), /^Error: cannot read \/ci: ENOENT$/, 'the real file: read once with its checks');
     const made = [];
     class FakeClient {
       constructor(o) { this.o = o; made.push(this); }
@@ -219,7 +232,7 @@ test('openDb: SQLite3 and PostgreSQL', async () => {
       async query(t) { return { rows: [{ ok: true }] }; }
     }
     for (const pg of [{ Client: FakeClient }, { default: { Client: FakeClient } }]) {
-      const d = await openDb(cfg, { checkConninfo: () => null, importPg: async () => pg, readFile: () => "host=/tmp dbname=k user=signer\n", onFatal: () => {} });
+      const d = await openDb(cfg, { importPg: async () => pg, readPrivate: () => "host=/tmp dbname=k user=signer\n", onFatal: () => {} });
       assert.equal(d.schema, 'ks');
       assert.deepEqual(made.at(-1).o, { host: '/tmp', database: 'k', user: 'signer' });
       await d.close();

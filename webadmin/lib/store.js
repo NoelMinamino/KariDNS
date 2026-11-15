@@ -113,6 +113,10 @@ export const clearLock = (tx, id) => tx.run(`UPDATE ${tx.A}credentials SET faile
 
 export const setTotp = (tx, id, wrapped, enabled) => tx.run(`UPDATE ${tx.A}credentials SET totp_secret = $2, totp_enabled = $3 WHERE principal_id = $1`, [id, wrapped, enabled]);
 
+// --rotate-totp-key: every stored secret, and the swap of one (only when it is still the text that was read: -> { changes })
+export const totpSecrets = (tx) => tx.all(`SELECT principal_id, totp_secret FROM ${tx.A}credentials WHERE totp_secret IS NOT NULL ORDER BY principal_id`);
+export const replaceTotp = (tx, id, before, after) => tx.run(`UPDATE ${tx.A}credentials SET totp_secret = $3 WHERE principal_id = $1 AND totp_secret = $2`, [id, before, after]);
+
 // (the lock of the account that 0.6.1 and before wrote; 0.6.2 locks per network in memory, ratelimit.js Lockouts.  A lock left in the database is still honoured until it
 // ends, and unlock / a new password clear it.  The tests use this to make such a lock.)
 export const recordLoginFailure = (tx, id, failed, lockedUntilMs) => tx.run(`UPDATE ${tx.A}credentials SET failed_logins = $2, locked_until = $3 WHERE principal_id = $1`,
@@ -137,6 +141,15 @@ export async function lookupSession(tx, idHash, nowMs) {
                       JOIN ${tx.A}principals p ON p.id = s.principal_id AND NOT p.disabled WHERE s.id_hash = $1 AND s.expires_at > $2`, [idHash, tx.ts(nowMs)]);
   return r && { principal_id: r.principal_id, csrf_hash: Buffer.from(r.csrf_hash), created: toMs(r.created_at), last_seen: toMs(r.last_seen), expires: toMs(r.expires_at), totp_ok: bool(r.totp_ok) };
 }
+
+// the idle time a user chose for its sessions (0.7, preferences): seconds, or null (the service's session-idle).  The upsert needs no read first: the policies
+// of PostgreSQL let a principal insert and update its own row only.
+export async function getIdleTimeout(tx, principalId) {
+  const r = await tx.get(`SELECT idle_timeout FROM ${tx.A}preferences WHERE principal_id = $1`, [principalId]);
+  return r?.idle_timeout ?? null;
+}
+export const setIdleTimeout = (tx, principalId, seconds) => tx.run(`INSERT INTO ${tx.A}preferences (principal_id, idle_timeout) VALUES ($1, $2)
+  ON CONFLICT (principal_id) DO UPDATE SET idle_timeout = excluded.idle_timeout`, [principalId, seconds]);
 
 export const touchSession = (tx, idHash, nowMs) => tx.run(`UPDATE ${tx.A}sessions SET last_seen = $2 WHERE id_hash = $1`, [idHash, tx.ts(nowMs)]);
 export const deleteSession = (tx, idHash) => tx.run(`DELETE FROM ${tx.A}sessions WHERE id_hash = $1`, [idHash]);
@@ -182,6 +195,15 @@ export async function getToken(tx, id) {
 
 export const revokeToken = (tx, id, nowMs) => tx.run(`UPDATE ${tx.A}api_tokens SET revoked_at = $2 WHERE id = $1 AND revoked_at IS NULL`, [id, tx.ts(nowMs)]);
 export const revokeTokensOf = (tx, principalId, nowMs) => tx.run(`UPDATE ${tx.A}api_tokens SET revoked_at = $2 WHERE principal_id = $1 AND revoked_at IS NULL`, [principalId, tx.ts(nowMs)]);
+
+// the tokens of groups that still work (0.7: POST /tokens refuses a group; tokens made before stay, --check names them).  The policy of api_tokens shows the API role only
+// its own principal's rows, so on PostgreSQL a SECURITY DEFINER function lists them (ids and names only).  -> [{ id, name, principal }]
+export async function groupTokens(tx, nowMs) {
+  return tx.dialect === 'pg'
+    ? tx.all(`SELECT id, name, principal FROM ${tx.A}group_tokens() ORDER BY id`)
+    : tx.all(`SELECT t.id, t.name, p.name AS principal FROM ${tx.A}api_tokens t JOIN ${tx.A}principals p ON p.id = t.principal_id
+               WHERE p.kind = 'group' AND t.revoked_at IS NULL AND t.expires_at > $1 ORDER BY t.id`, [tx.ts(nowMs)]);
+}
 
 // ---------------------------------------------------------------------------------------------------------------------------------- policies and grants
 const policy = (r, types) => ({
@@ -469,6 +491,24 @@ export async function missingTables(tx, schema, tables) {
     if (!found.ok) missing.push(t);
   }
   return missing;
+}
+
+// What db/karidns_api_role.pgsql.sql gives the API role on karidns_auth (the privileges the service uses) and where row level security must bind it.  A schema made
+// newer by applying db/karidns_ext.pgsql.sql again, without the role script after it, has a table the role may not use: every request would then fail.
+export const AUTH_PRIVILEGES = {
+  principals: 'SIUD', credentials: 'SIUD', memberships: 'SIUD', rr_policies: 'SIUD', grants: 'SIUD', sessions: 'SIUD', api_tokens: 'SIUD', preferences: 'SIUD',
+  templates: 'SIUD', template_records: 'SIUD', audit_log: 'S', principal_closure: 'S', schema_version: 'S',
+};
+const PRIV = { S: 'SELECT', I: 'INSERT', U: 'UPDATE', D: 'DELETE' };
+const NO_RLS = new Set(['principal_closure', 'schema_version']);       // (no policies: kept by triggers / read by everybody)
+// PostgreSQL only: -> { lacking: ['karidns_auth.t: INSERT', ...], noRls: ['karidns_auth.t', ...] } for the role of this connection
+export async function authAccess(tx) {
+  const pairs = Object.entries(AUTH_PRIVILEGES).flatMap(([t, ps]) => [...ps].map((p) => `('${t}', '${PRIV[p]}')`));
+  const rows = await tx.all(`SELECT v.t, v.p, has_table_privilege(format('karidns_auth.%I', v.t), v.p) AS may, row_security_active(format('karidns_auth.%I', v.t)) AS rls
+                               FROM (VALUES ${pairs.join(', ')}) AS v (t, p)`);
+  const lacking = rows.filter((r) => !bool(r.may)).map((r) => `karidns_auth.${r.t}: ${r.p}`);
+  const noRls = [...new Set(rows.filter((r) => !NO_RLS.has(r.t) && !bool(r.rls)).map((r) => `karidns_auth.${r.t}`))];
+  return { lacking, noRls };
 }
 
 export async function schemaVersions(tx, schema) {

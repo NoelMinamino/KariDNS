@@ -3,7 +3,8 @@
 // - The CSRF token is held in memory only (api.js sends it); after a page reload it is fetched again by GET /auth/me.
 // - F-14: NO background request extends the session.  The idle timeout of the service (every authenticated request moves `last_seen`) keeps its meaning: the GUI
 //   counts down from its own last request, warns two minutes before the end, and offers "stay signed in" (one GET /auth/me, made when the user asks).  The service
-//   writes last_seen at most once a minute, so the countdown ends a minute early.
+//   writes last_seen at most once a minute, so the countdown ends a minute early.  With a short idle time (the person's own choice on the account screen, or a low
+//   session-idle) both scale down: leadTimes() below.
 // - Logout, and "log out everywhere", tell the other tabs through a BroadcastChannel; they go to the sign-in screen.
 // - A 401 anywhere asks the app to sign in again over the current screen (reauth); the answer says whether it was the same principal.
 
@@ -11,6 +12,11 @@ export const CHANNEL = 'karidns-webadmin';
 export const WARN_BEFORE_MS = 120000;
 export const SAFETY_MS = 60000;
 const MAX_TIMER = 2 ** 31 - 1;
+
+// How early the GUI ends the countdown (margin) and warns before that end (warn), for an idle time in ms.  The service writes last_seen at most every
+// min(60 s, idle / 4) (lib/session.js), so the margin is the same; the warning is two minutes, or a quarter of the idle time where that is shorter:
+//   30 min: margin 60 s, warning 2 min    10 min: 60 s, 2 min    5 min: 60 s, 75 s    1 min: 15 s, 15 s
+export const leadTimes = (idleMs) => ({ margin: Math.min(SAFETY_MS, idleMs / 4), warn: Math.min(WARN_BEFORE_MS, idleMs / 4) });
 
 // opts: { api, timers: { setTimeout, clearTimeout }, now, BroadcastChannel (or null) }
 export function createSession({ api, timers, now, BroadcastChannel: BC }) {
@@ -40,8 +46,7 @@ export function createSession({ api, timers, now, BroadcastChannel: BC }) {
 
   // the end of this session as the GUI counts it: the idle time from the last request (less a minute), or the absolute end
   function deadlines() {
-    const margin = Math.min(SAFETY_MS, st.idleMs / 4);
-    const idle = st.lastActivity + st.idleMs - margin;
+    const idle = st.lastActivity + st.idleMs - leadTimes(st.idleMs).margin;
     return st.expiresAt && st.expiresAt <= idle ? { at: st.expiresAt, kind: 'max' } : { at: idle, kind: 'idle' };
   }
 
@@ -49,7 +54,8 @@ export function createSession({ api, timers, now, BroadcastChannel: BC }) {
     stopTimer();
     if (st.status !== 'in') return;
     const { at, kind } = deadlines();
-    const warnAt = at - Math.min(WARN_BEFORE_MS, (at - st.lastActivity) / 2);
+    // (the absolute end may come sooner than the idle end: the warning is then at most half the time that is left)
+    const warnAt = at - Math.min(leadTimes(st.idleMs).warn, (at - st.lastActivity) / 2);
     const t = now();
     if (t >= at) {
       st.status = 'expired';
@@ -152,6 +158,22 @@ export function createSession({ api, timers, now, BroadcastChannel: BC }) {
     await loadMe();
   }
 
+  // the person chose another idle time (the answer of PUT /auth/idle-timeout): the countdown uses it at once, in this tab and (through the channel) in the others,
+  // which apply it without sending it on.  -> whether it was taken (a tab that is signed out keeps nothing)
+  function applyIdle(r) {
+    if (st.status !== 'in' || !Number.isInteger(r?.idle_timeout) || r.idle_timeout <= 0) return false;
+    if (st.warned) emit('warn-clear');
+    st.idleMs = r.idle_timeout * 1000;
+    st.me.session = { ...st.me.session, idle_timeout: r.idle_timeout, idle_timeout_choice: r.idle_timeout_choice ?? null, idle_timeout_max: r.idle_timeout_max };
+    st.warned = false;
+    schedule();
+    emit('change');
+    return true;
+  }
+  function setIdle(r) {
+    if (applyIdle(r)) channel?.postMessage({ type: 'idle', idle_timeout: r.idle_timeout, idle_timeout_choice: r.idle_timeout_choice ?? null, idle_timeout_max: r.idle_timeout_max });
+  }
+
   // TOTP was confirmed: the session was replaced, the answer has the new CSRF token
   async function replaced(r) {
     api.setCsrf(r.csrf);
@@ -182,6 +204,8 @@ export function createSession({ api, timers, now, BroadcastChannel: BC }) {
         emit('other-tab-logout');
       } else if (type === 'login' && st.status !== 'in') {
         restore().then((ok) => ok && emit('other-tab-login')).catch(() => {});
+      } else if (type === 'idle') {
+        applyIdle(ev.data);
       }
     };
   }
@@ -195,6 +219,7 @@ export function createSession({ api, timers, now, BroadcastChannel: BC }) {
     login,
     logout,
     keepAlive,
+    setIdle,
     replaced,
     loadVersion,
     touch,

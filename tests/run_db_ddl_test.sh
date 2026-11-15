@@ -278,15 +278,15 @@ else
         for t in karidns_schema_version karidns_changes karidns_domain_views karidns_profiles karidns_record_tags karidns_record_tinydns karidns_zone_tagdefs karidns_reload_requests karidns_server_status; do
             [ "$(pq "SELECT count(*) FROM pg_tables WHERE tablename = '$t' AND schemaname = current_schema()")" = "1" ] && pass "table $t" || fail "table $t is missing"
         done
-        [ "$(pq "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND c.relname LIKE '%'")" = "55" ] &&
-            pass "55 triggers (9 tables x 3 + prune + the 3 of karidns_reload_requests + item B: the grants trigger on domains, 6 on principals / credentials / memberships, the audit of the 9 karidns_auth tables, the deferred summary trigger on audit_log, the escalation trigger on grants, the 3 on the SOA rows of records for the signer, items D and E: the retention of the versions, the revision of the templates and of their records)" ||
+        [ "$(pq "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND c.relname LIKE '%'")" = "56" ] &&
+            pass "56 triggers (9 tables x 3 + prune + the 3 of karidns_reload_requests + item B: the grants trigger on domains, 6 on principals / credentials / memberships, the audit of the 10 karidns_auth tables (preferences: 0.7), the deferred summary trigger on audit_log, the escalation trigger on grants, the 3 on the SOA rows of records for the signer, items D and E: the retention of the versions, the revision of the templates and of their records)" ||
             fail "trigger count $(pq "SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal")"
         # item B: no audit trigger and no RLS on the PowerDNS tables (the role scripts of the WebAdmin switch them on)
         [ "$(pq "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND t.tgname LIKE 'karidns_audit%' AND c.relnamespace = current_schema()::regnamespace")" = "0" ] &&
             [ "$(pq "SELECT count(*) FROM pg_class WHERE relrowsecurity AND relnamespace IN (current_schema()::regnamespace, 'karidns_auth'::regnamespace)")" = "0" ] &&
             pass "the file attaches no audit trigger to the PowerDNS tables and enables no row level security" || fail "audit triggers or RLS enabled by the ext file"
-        [ "$(pq "SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE p.polname LIKE 'karidns_rls_%' AND c.relnamespace IN (current_schema()::regnamespace, 'karidns_auth'::regnamespace)")" = "76" ] &&
-            pass "...but creates its 76 policies (39 on the schema's tables, 37 on karidns_auth), inactive while RLS is off" || fail "the RLS policies of the ext file"
+        [ "$(pq "SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE p.polname LIKE 'karidns_rls_%' AND c.relnamespace IN (current_schema()::regnamespace, 'karidns_auth'::regnamespace)")" = "80" ] &&
+            pass "...but creates its 80 policies (39 on the schema's tables, 41 on karidns_auth), inactive while RLS is off" || fail "the RLS policies of the ext file"
         [ "$(pq "SELECT count(*) FROM pg_proc WHERE pronamespace = 'karidns_auth'::regnamespace AND prokind = 'f' AND proconfig IS NULL")" = "0" ] && pass "every karidns_auth function pins its search_path" || fail "unpinned karidns_auth functions"
         [ "$(pq "SELECT count(*) FROM pg_proc p JOIN pg_trigger t ON t.tgfoid = p.oid WHERE p.pronamespace = 'karidns_auth'::regnamespace AND NOT p.prosecdef AND p.proname <> 'audit_zone_fn'")" = "0" ] &&
             pass "the trigger functions of karidns_auth are SECURITY DEFINER" || fail "a karidns_auth trigger function is not SECURITY DEFINER"

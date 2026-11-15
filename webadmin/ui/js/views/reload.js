@@ -1,14 +1,22 @@
 // The "update" button of a zone and what follows it (planning 3 S4 and S14, F-14).  A reload is explicit (D-RELOAD): the button asks the service to make the servers
 // read the zone again.  The page then looks at the zone and at the servers every five seconds, for two minutes at most (the only polling the interface does: it
-// would otherwise keep the session alive), and says how many servers have applied the request.  A zone the signer keeps signed has no button: the signer asks.
+// would otherwise keep the session alive), and says how many servers have applied the request.  A zone the signer keeps signed has no button: the signer asks.  A 429
+// (rate-reload) disables the button until Retry-After has passed, counting down in its label, as the other limits do.
 
 import { h } from '../dom.js';
 import { message, problemNodes } from '../widgets.js';
 import { zonePath } from '../zonelib.js';
 import { plain } from '../format.js';
+import { reloadOffer } from '../version.js';
 
 export const POLL_MS = 5000;
 export const WATCH_MS = 120000;
+
+// T-1: where the service cannot ask the servers to reload (SQLite3 without karictl-config: GET /version ui.reload_available false), the button and the box are
+// not offered; this says why, in their place
+export function reloadNote(ctx) {
+  return h('p', { class: 'hint' }, ctx.i18n.t('reload.unavailable'));
+}
 
 // -> { node, watch(), dispose() }.  watch(): look at the progress of a reload that was asked for some other way (a change set with "reload now").
 export function reloadControl(ctx, { ds, zone, signer }) {
@@ -20,6 +28,26 @@ export function reloadControl(ctx, { ds, zone, signer }) {
   let timer = null;
   let until = 0;
   let alive = true;
+  let waiting = null;                                     // the countdown of a 429
+
+  function stopWaiting() {
+    if (waiting !== null) timers.clearInterval(waiting);
+    waiting = null;
+    if (button) { button.disabled = false; button.textContent = t('reload.button'); }
+  }
+
+  function wait(seconds) {
+    stopWaiting();
+    let left = Math.max(1, seconds);
+    const tick = () => {
+      if (left <= 0) { stopWaiting(); return; }
+      button.disabled = true;
+      button.textContent = t('flow.wait', { seconds: left });
+      left -= 1;
+    };
+    tick();
+    waiting = timers.setInterval(tick, 1000);
+  }
 
   function stop() {
     if (timer !== null) timers.clearInterval(timer);
@@ -63,14 +91,18 @@ export function reloadControl(ctx, { ds, zone, signer }) {
       if (r.reload === 'requested') watch();
     } catch (e) {
       err.setNodes(...problemNodes(i18n, e), e.status === 400 && e.detail ? [' ', plain(e.detail)] : null);
-    } finally {
-      button.disabled = false;
+      if (e.status === 429 && e.retryAfter) { wait(e.retryAfter); return; }
     }
+    button.disabled = false;
   }
 
-  if (!signer) button = h('button', { type: 'button', class: 'primary', on: { click: press } }, t('reload.button'));
-  const node = h('div', { class: 'reload' },
-    signer ? h('p', { class: 'hint' }, t('reload.signer')) : h('div', { class: 'actions' }, button, h('span', { class: 'hint' }, t('reload.hint'))),
-    status.node, err.node);
-  return { node, watch, dispose() { alive = false; stop(); } };
+  let top;
+  if (signer) top = h('p', { class: 'hint' }, t('reload.signer'));
+  else if (!reloadOffer(ctx).available) top = reloadNote(ctx);
+  else {
+    button = h('button', { type: 'button', class: 'primary', on: { click: press } }, t('reload.button'));
+    top = h('div', { class: 'actions' }, button, h('span', { class: 'hint' }, t('reload.hint')));
+  }
+  const node = h('div', { class: 'reload' }, top, status.node, err.node);
+  return { node, watch, dispose() { alive = false; stop(); stopWaiting(); } };
 }

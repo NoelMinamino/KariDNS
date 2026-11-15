@@ -13,7 +13,7 @@ export const PRINCIPAL = { id: 7, kind: 'user', name: 'alice', display_name: 'Al
 export const GRANT_GLOBAL = { id: 1, role: 'global_master', dataset: null, zone: null, suffix: null, policy: POLICY, via: null };
 export const VERSION = {
   api: 1, version: GUI_VERSION, tools: { 'karidns-zone': 'karidns-zone 0.6.0' }, datasets: ['main'], types: ['A', 'AAAA', 'CNAME', 'MX', 'NS', 'SOA', 'SRV', 'TXT'],
-  ui: { reload_after_change: false, require_totp: 'none', max_rrsets: 1000, max_records: 1000, zone_text_limit: 1024 },
+  ui: { reload_after_change: false, reload_all: true, require_totp: 'none', max_rrsets: 1000, max_records: 1000, zone_text_limit: 1024 },
 };
 
 export const meDoc = (clock, { grants = [GRANT_GLOBAL], global = true } = {}) => ({

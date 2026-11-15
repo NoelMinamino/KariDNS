@@ -455,6 +455,61 @@ test('S15: tokens are listed with their state, made (shown once, copied, removed
   assert.match(none.text(), /You have no tokens/);
 });
 
+test('S15: sign out after inactivity (0.7): the times up to session-idle, saved with PUT /auth/idle-timeout, the countdown follows at once; refusals, nothing to choose', async () => {
+  const sel = (ui) => findAll(ui.root, (e) => e.tagName === 'SELECT' && e.getAttribute('name') === 'idle_timeout')[0];
+  const opts = (ui) => sel(ui).children.map((o) => [o.value, o.textContent]);
+  const routes = { 'PUT /auth/idle-timeout': (body) => reply(200, { idle_timeout: body.idle_timeout ?? 1800, idle_timeout_choice: body.idle_timeout, idle_timeout_max: 1800 }) };
+  const ui = await boot({ hash: '#/account', routes, st: { sessOver: { idle_timeout_choice: null, idle_timeout_max: 1800 } } });
+  const h3 = findAll(ui.root, (e) => e.tagName === 'H3' && e.textContent === en['account.idle-title']);
+  assert.equal(h3.length, 1, 'the form is in the session section, under its own heading');
+  assert.deepEqual(opts(ui), [['', 'The service default (30 minutes)'], ['300', '5 minutes'], ['600', '10 minutes'], ['900', '15 minutes'], ['1800', '30 minutes']]);
+  assert.equal(sel(ui).value, '');
+  const label = findAll(ui.root, (e) => e.tagName === 'LABEL' && e.htmlFor === sel(ui).getAttribute('id'));
+  assert.equal(label[0].textContent, en['account.idle-label']);
+  assert.match(ui.env.document.getElementById(sel(ui).getAttribute('aria-describedby')).textContent, /allows 30 minutes at most/);
+  const form = h3[0].parentNode;
+  sel(ui).value = '300';
+  await ui.submit(form);
+  assert.deepEqual(ui.last('PUT', '/auth/idle-timeout').body, { idle_timeout: 300 });
+  assert.equal(form.querySelector('p[role=status]').textContent, 'Saved. Your sessions now end after 5 minutes without a request.');
+  assert.ok(findAll(ui.root, (e) => e.tagName === 'DD' && e.textContent === '5 minutes').length === 1, 'the idle time shown above follows');
+  assert.equal(ui.app.session.state.idleMs, 300000, 'the countdown uses the new time at once');
+  assert.equal(ui.app.session.state.me.session.idle_timeout_choice, 300);
+  sel(ui).value = '';
+  await ui.submit(form);
+  assert.deepEqual(ui.last('PUT', '/auth/idle-timeout').body, { idle_timeout: null });
+  assert.equal(ui.app.session.state.idleMs, 1800000);
+  // a refusal is shown in the form
+  const bad = await boot({ hash: '#/account', routes: { 'PUT /auth/idle-timeout': problem(400, 'bad-request') }, st: { sessOver: { idle_timeout_max: 1800 } } });
+  const badForm = findAll(bad.root, (e) => e.tagName === 'H3' && e.textContent === en['account.idle-title'])[0].parentNode;
+  await bad.submit(badForm);
+  assert.equal(badForm.querySelector('p[role=alert]').hidden, false);
+  // a choice that is not in the list (set through the API) is shown and selected; one above a lowered session-idle says that the service's time applies
+  const odd = await boot({ hash: '#/account', st: { sessOver: { idle_timeout: 420, idle_timeout_choice: 420, idle_timeout_max: 1800 } } });
+  assert.deepEqual(opts(odd).map((o) => o[0]), ['', '300', '420', '600', '900', '1800']);
+  assert.equal(sel(odd).value, '420');
+  assert.equal(opts(odd)[2][1], '7 minutes');
+  const over = await boot({ hash: '#/account', st: { sessOver: { idle_timeout: 600, idle_timeout_choice: 2400, idle_timeout_max: 600 } } });
+  assert.deepEqual(opts(over).at(-1), ['2400', '40 minutes (longer than the service allows now: its time applies)']);
+  const secs = await boot({ hash: '#/account', st: { sessOver: { idle_timeout: 90, idle_timeout_choice: 90, idle_timeout_max: 240 } } });
+  // a session-idle under five minutes: 1, 2 and 3 minutes where they fit (one minute is said in the singular)
+  assert.deepEqual(opts(secs), [['', 'The service default (4 minutes)'], ['60', '1 minute'], ['90', '90 seconds'], ['120', '2 minutes'], ['180', '3 minutes']]);
+  const short = await boot({ hash: '#/account', st: { sessOver: { idle_timeout: 100, idle_timeout_choice: null, idle_timeout_max: 100 } } });
+  assert.deepEqual(opts(short), [['', 'The service default (100 seconds)'], ['60', '1 minute']]);
+  // session-idle of a minute or less and no choice: nothing to choose, the page says so; a service before 0.7 (no idle_timeout_max): its idle time is the maximum
+  const none = await boot({ hash: '#/account', st: { sessOver: { idle_timeout: 60, idle_timeout_choice: null, idle_timeout_max: 60 } } });
+  assert.equal(sel(none), undefined);
+  assert.match(none.text(), /The service signs out after 1 minute already/);
+  const tiny = await boot({ hash: '#/account', st: { sessOver: { idle_timeout: 1, idle_timeout_choice: null, idle_timeout_max: 1 } } });
+  assert.match(tiny.text(), /The service signs out after 1 second already/);
+  const old = await boot({ hash: '#/account' });
+  assert.equal(opts(old).length, 5);
+  // Japanese
+  const jp = await boot({ hash: '#/account', languages: ['ja'], st: { sessOver: { idle_timeout_max: 1800 } } });
+  assert.equal(opts(jp)[1][1], '5 分');
+  assert.ok(findAll(jp.root, (e) => e.tagName === 'H3' && e.textContent === ja['account.idle-title']).length === 1);
+});
+
 test('S15: the language is chosen here, kept, and the whole page follows at once; the sessions can be ended', async () => {
   const storage = new FakeStorage();
   const ui = await boot({ hash: '#/account', storage });

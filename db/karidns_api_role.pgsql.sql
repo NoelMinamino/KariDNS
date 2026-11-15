@@ -24,9 +24,11 @@
 --     (the signer's schedule and last error of the zones it has a grant on; the signer writes it); SELECT on karidns_schema_version; on cryptokeys only the COLUMN privilege SELECT (id, domain_id, flags, active, published), never `content`; USAGE on the
 --     sequences behind the serial columns.  Nothing on karidns_changes: the change log and the prune of the reload requests are written by the
 --     triggers of the data tables, which run as the owner.  karidns_auth: SELECT, INSERT, UPDATE, DELETE on principals, memberships, rr_policies, grants and
---     credentials (the only role that reads them); SELECT, INSERT, UPDATE, DELETE on sessions, api_tokens, templates and template_records;
---     SELECT on principal_closure, audit_log and schema_version; EXECUTE on the RLS functions, bump_serial, session_lookup, api_token_lookup, sweep_expired, oidc_state_put, oidc_state_take and oidc_lookup (no privilege on oidc_states itself).  Data schema, besides:
+--     credentials (the only role that reads them); SELECT, INSERT, UPDATE, DELETE on sessions, api_tokens, preferences (0.7), templates and template_records;
+--     SELECT on principal_closure, audit_log and schema_version; EXECUTE on the RLS functions, bump_serial, session_lookup, api_token_lookup, group_tokens, sweep_expired, oidc_state_put, oidc_state_take and oidc_lookup (no privilege on oidc_states itself).  Data schema, besides:
 --     SELECT on karidns_server_status and karidns_zone_state, SELECT and INSERT on karidns_zone_versions and karidns_zone_version_rrsets (item E).
+--     PostgreSQL 17 and later: MAINTAIN on records (0.7: karidns-zone, which the WebAdmin's imports run as this role, runs ANALYZE records after an import
+--     that wrote or removed 1000 records or more; the locks MAINTAIN allows are no more than UPDATE and DELETE already allow).
 --     Nothing else: no TRUNCATE, no write to the audit log, nothing on the key material or karidns_profiles.
 --   * the role's name is added to karidns_auth.audit_restricted_roles (it cannot turn the detail of the audit log off) and karidns_auth.api_roles (the trigger
 --     on grants applies the no-escalation rules to its sessions, and to the sessions of the roles that are members of it).
@@ -74,6 +76,11 @@ GRANT SELECT ON :"schema".karidns_server_status TO :"role";                     
 GRANT SELECT ON :"schema".karidns_zone_state TO :"role";                            -- the generation of the zones it has a grant on (the triggers of the owner write it)
 GRANT SELECT, INSERT ON :"schema".karidns_zone_versions, :"schema".karidns_zone_version_rrsets TO :"role";   -- the history of a zone: read it, append to it; no UPDATE, no DELETE
 GRANT SELECT (id, domain_id, flags, active, published) ON :"schema".cryptokeys TO :"role";
+-- PostgreSQL 17 and later: MAINTAIN on records, so that the WebAdmin's imports (karidns-zone as this role) can ANALYZE it after a large import (0.7)
+SELECT current_setting('server_version_num')::int >= 170000 AS pg17 \gset
+\if :pg17
+GRANT MAINTAIN ON :"schema".records TO :"role";
+\endif
 
 -- the sequences behind the serial columns of the tables the role inserts into (karidns_reload_requests has an identity column: no grant needed)
 SELECT format('GRANT USAGE ON SEQUENCE %I.%I TO %I', n.nspname, s.relname, :'role')
@@ -93,6 +100,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON karidns_auth.principals, karidns_auth.me
   karidns_auth.credentials TO :"role";
 GRANT SELECT ON karidns_auth.principal_closure, karidns_auth.audit_log, karidns_auth.schema_version TO :"role";
 GRANT SELECT, INSERT, UPDATE, DELETE ON karidns_auth.sessions, karidns_auth.api_tokens, karidns_auth.templates, karidns_auth.template_records TO :"role";
+GRANT SELECT, INSERT, UPDATE, DELETE ON karidns_auth.preferences TO :"role";      -- 0.7: the idle time a user chose (the policies: its own row only)
 GRANT USAGE ON SEQUENCE karidns_auth.principals_id_seq, karidns_auth.rr_policies_id_seq, karidns_auth.grants_id_seq, karidns_auth.api_tokens_id_seq,
   karidns_auth.templates_id_seq TO :"role";
 
@@ -107,6 +115,8 @@ SELECT format('GRANT EXECUTE ON FUNCTION %s(), %s(bigint, text) TO %I, karidns_r
 GRANT EXECUTE ON FUNCTION karidns_auth.bump_serial(text, integer) TO :"role";
 -- the lookups of a session by the hash of its cookie and of a token by its id and the hash of its secret (the policies show a principal its own rows only)
 GRANT EXECUTE ON FUNCTION karidns_auth.session_lookup(bytea), karidns_auth.api_token_lookup(bigint, bytea) TO :"role";
+-- the tokens of groups that still work, for --check (ids and names; 0.7)
+GRANT EXECUTE ON FUNCTION karidns_auth.group_tokens() TO :"role";
 -- the hourly sweep: deletes the expired sessions of every principal (the policy of sessions shows the role its own principal's rows only)
 GRANT EXECUTE ON FUNCTION karidns_auth.sweep_expired() TO :"role";
 -- the pruning of the audit log (option audit-retention of the service, 0.6.1): deletes rows older than the given days, at least 7; no role has a right on audit_log itself

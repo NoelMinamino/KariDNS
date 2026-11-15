@@ -116,6 +116,12 @@ test('S3: a person who is not a global master has no way to make a zone; the who
   await ui.click(ui.button(/Update every zone/));
   await ui.click(ui.button(/^Yes$/));
   assert.match(ui.q('p.msg.error').textContent, /kept signed by the signer/);
+  // SQLite3 (/version ui.reload_all false, or a service that does not say): the service would refuse it, so there is no button; the new zone stays
+  for (const ui2 of [{ ...VERSION.ui, reload_all: false }, { ...VERSION.ui, reload_all: undefined }]) {
+    const lite = await bootApp({ routes: zoneRoutes(), hash: '#/zones', version: { ...VERSION, ui: ui2 } });
+    assert.equal(lite.button(/Update every zone/), null);
+    assert.ok(lite.link(/^New zone$/));
+  }
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------------- S4
@@ -592,6 +598,24 @@ test('the update button: SQLite3 has no server status (no polling); the refusals
   answer = () => problem(503, 'reload-failed', { detail: 'failed: karictl said no' });
   await ui.click(ui.button(/^Update the servers now$/));
   assert.match(ui.q('section[aria-labelledby="update-title"] p.msg.error').textContent, /could not be told to reload/);
+  // rate-reload (0.7): a 429 says so and the button waits for Retry-After, counting down in its label, like the other limits
+  answer = () => problem(429, 'rate-limited', {}, { 'Retry-After': '3' });
+  await ui.click(ui.button(/^Update the servers now$/));
+  assert.match(ui.q('section[aria-labelledby="update-title"] p.msg.error').textContent, /Too many requests\. Wait a moment and try again\./);
+  const waiting = ui.button(/^Try again in 3 s$/);
+  assert.equal(waiting.disabled, true);
+  await ui.clock.advance(1000);
+  assert.equal(waiting.textContent, 'Try again in 2 s');
+  await ui.clock.advance(3000);
+  assert.equal(waiting.textContent, 'Update the servers now');
+  assert.equal(waiting.disabled, false);
+  answer = () => problem(429, 'rate-limited', {}, { 'Retry-After': '30' });
+  await ui.click(ui.button(/^Update the servers now$/));
+  assert.equal(ui.button(/^Try again in 30 s$/).disabled, true);
+  answer = () => problem(429, 'rate-limited');
+  await ui.clock.advance(31000);
+  await ui.click(ui.button(/^Update the servers now$/));
+  assert.equal(ui.button(/^Update the servers now$/).disabled, false, 'no Retry-After: no wait');
   // polling that meets a failure stops; so does leaving the page
   servers = [{ dataset: 'main', server_id: 'ns-a', generation: 1, ok: true, failed_zones: [] }];
   answer = () => reply(200, { zone: 'example.test.', change_set: 'c', reload: 'requested' });

@@ -10,7 +10,9 @@
 #       disabled user and nobody, a SELECT sees the rows the API would show, a write outside the scope is refused or changes no row (the queries the API would
 #       never send);
 #   P3  the server never logged that RLS refused what the API had allowed (that is a bug, planning 3.3 step 5);
-#   P4  --create-admin needs the connection of the table owner (the API role cannot make the first user), the connection files are checked like the loader's.
+#   P4  --create-admin needs the connection of the table owner (the API role cannot make the first user), the connection files are checked like the loader's;
+#   P5  --rotate-totp-key refuses the API role's connection (row level security binds it) before it writes anything, and with the owner's it wraps every stored
+#       TOTP secret again, keeps the old key as totp.key.old and leaves no totp.key.new.
 # SKIP (exit 0) when PostgreSQL is not reachable (tests/db/pg_lib.sh), the role may not create roles, the password login over 127.0.0.1 is not accepted, node 22.13
 # or newer, webadmin/node_modules/pg (run `npm ci --ignore-scripts` in webadmin/) or a binary is missing.  About 60 seconds.
 set -u
@@ -141,6 +143,12 @@ asu $APP --check > "$T/check.out" 2> "$T/check.err" && ok "--check is fine on a 
 chmod 644 "$T/ci_check"
 asu $APP --check > /dev/null 2> "$T/check.err" && bad "--check accepts a connection file with mode 0644" || ok "--check refuses a connection file that others can read"
 chmod 600 "$T/ci_check"
+# 0.7: the ext file applied again without the role script after it (a new auth table the API role has no privilege on): --check and the start refuse, naming the script
+pq "REVOKE ALL ON karidns_auth.preferences FROM $RA" > /dev/null
+asu $APP --check > /dev/null 2> "$T/check.err" && bad "--check accepts an API role without privileges on karidns_auth.preferences" || ok "--check refuses an API role that lacks privileges on an auth table"
+grep -q "karidns_auth.preferences: SELECT.*karidns_api_role.pgsql.sql" "$T/check.err" && ok "...and names the table and the role script" || bad "...the message" "$(cat "$T/check.err")"
+rolescript db/karidns_api_role.pgsql.sql $RA "the API role script again"
+asu $APP --check > /dev/null 2> "$T/check.err" && ok "--check is fine again after the role script" || bad "--check after the role script" "$(cat "$T/check.err")"
 
 echo "-- the server"
 rm -f "$T/server.pid"
@@ -194,6 +202,40 @@ if grep -Fq "$ADMIN_PW" "$T/server.log" || grep -Eq 'Sunrise-Harbor|Maple-Anchor
 grep -Eq '^[^ ]+ error ' "$T/server.log" && bad "the server logged an error" "$(grep ' error ' "$T/server.log" | head -3)" || ok "the server logged no error"
 same "no password hash in the audit log" "$(pq "SELECT count(*) FROM karidns_auth.audit_log WHERE before::text LIKE '%scrypt%' OR after::text LIKE '%scrypt%'")" 0
 [ "$(pq "SELECT count(*) FROM karidns_auth.audit_log WHERE principal_name = 'admin' AND db_role = '$RA'")" -gt 0 ] && ok "the administrator's changes are in the audit log under its name and the API role" || bad "no audit row names the administrator"
+
+echo "-- P5: --rotate-totp-key (the server is stopped) needs a role that row level security does not bind"
+# (opens.mjs: how many of the stored secrets, lines "<principal id> <wrapped secret>", open with the key of a file; exit 0 when all of them do)
+cat > "$T/opens.mjs" <<'EOF'
+import fs from 'node:fs';
+import { pathToFileURL } from 'node:url';
+const [lib, keyFile, list] = process.argv.slice(2);
+const { unwrapSecret } = await import(pathToFileURL(lib).href);
+const key = Buffer.from(fs.readFileSync(keyFile, 'utf8').trim(), 'hex');
+const lines = fs.readFileSync(list, 'utf8').split('\n').filter(Boolean);
+const open = lines.filter((l) => unwrapSecret(key, l.slice(0, l.indexOf(' ')), l.slice(l.indexOf(' ') + 1)) !== null).length;
+console.log(`${open} of ${lines.length}`);
+process.exit(lines.length && open === lines.length ? 0 : 1);
+EOF
+secrets() { pq "SELECT principal_id || ' ' || totp_secret FROM karidns_auth.credentials WHERE totp_secret IS NOT NULL ORDER BY principal_id" > "$T/secrets.txt"; chmod 644 "$T/secrets.txt" "$T/opens.mjs"; }
+opens() { asu "$NODE" "$T/opens.mjs" "$T/app/webadmin/lib/crypto.js" "$1" "$T/secrets.txt"; }
+KEY0=$(cat "$T/totp.key" 2>/dev/null)
+NSEC=$(pq "SELECT count(*) FROM karidns_auth.credentials WHERE totp_secret IS NOT NULL")
+SUM0=$(pq "SELECT md5(string_agg(principal_id || ':' || totp_secret, ',' ORDER BY principal_id)) FROM karidns_auth.credentials WHERE totp_secret IS NOT NULL")
+[ -n "$KEY0" ] && [ "$NSEC" -gt 0 ] && ok "there are TOTP secrets to wrap again ($NSEC, the enrolments of the scenarios)" || bad "no key file or no TOTP secret after the scenarios" "$(ls -l "$T"/totp.key* 2>&1)"
+secrets
+O=$(opens "$T/totp.key") && ok "...they open with the key of the service ($O)" || bad "the stored secrets do not open with the key of the service ($O)"
+asu $APP --rotate-totp-key --bootstrap-conninfo-file "$T/ci_api" > "$T/rot0.out" 2> "$T/rot0.err" && bad "--rotate-totp-key ran with the API role's connection" "$(cat "$T/rot0.out")" || ok "--rotate-totp-key refuses the API role's connection"
+grep -q "row level security binds the role of this connection on karidns_auth.credentials" "$T/rot0.err" && ok "...and says why, naming the table owner's connection" || bad "--rotate-totp-key message for the API role" "$(cat "$T/rot0.err")"
+if [ "$(cat "$T/totp.key")" = "$KEY0" ] && [ ! -e "$T/totp.key.new" ] && [ ! -e "$T/totp.key.old" ]; then ok "...the key file is unchanged, nothing written next to it"; else bad "the refused run changed the key files" "$(ls -l "$T"/totp.key* 2>&1)"; fi
+same "...and no stored secret changed" "$(pq "SELECT md5(string_agg(principal_id || ':' || totp_secret, ',' ORDER BY principal_id)) FROM karidns_auth.credentials WHERE totp_secret IS NOT NULL")" "$SUM0"
+asu $APP --rotate-totp-key --bootstrap-conninfo-file "$T/ci_owner" > "$T/rot1.out" 2> "$T/rot1.err" && ok "--rotate-totp-key with the owner's connection" || bad "--rotate-totp-key as the owner" "$(cat "$T/rot1.err" "$T/rot1.out")"
+grep -q "^the TOTP key is new: $NSEC secret(s) wrapped again with it in $T/totp.key\$" "$T/rot1.out" && ok "...it wrapped every secret again ($NSEC)" || bad "...the count of the secrets wrapped again" "$(cat "$T/rot1.out")"
+grep -q "^the old key is kept in $T/totp.key.old: delete it once the TOTP logins work\$" "$T/rot1.out" && ok "...and says where the old key is kept" || bad "...no word of totp.key.old" "$(cat "$T/rot1.out")"
+if [ "$(cat "$T/totp.key")" != "$KEY0" ] && [ "$(cat "$T/totp.key.old" 2>/dev/null)" = "$KEY0" ] && [ ! -e "$T/totp.key.new" ]; then ok "...the key is new, the old one is totp.key.old, no .new is left"; else bad "the key files after the rotation" "$(ls -l "$T"/totp.key* 2>&1)"; fi
+same "...both files have mode 0600" "$(ls -l "$T/totp.key" "$T/totp.key.old" | cut -c1-10 | sort -u)" "-rw-------"
+secrets
+O=$(opens "$T/totp.key") && ok "...every stored secret opens with the new key ($O)" || bad "the stored secrets do not open with the new key ($O)"
+O=$(opens "$T/totp.key.old"); same "...and none with the old one" "$O" "0 of $NSEC"
 
 echo
 echo "=== run_webadmin_pg_test: $FAILS failed, $PASS passed ==="

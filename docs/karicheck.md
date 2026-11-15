@@ -604,6 +604,10 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `db.render.input` | error | render: the records on standard input are not lines of the form owner TAB type TAB prio TAB content, or there are too many |
 | `db.import.signer` | error | import --signer cannot take this file or zone: the file is not a signed zone, or the zone is not a primary zone of the database; nothing was written |
 | `db.import.signer-zone` | info | the zone is signed by karidns-signer: the import kept its DNSSEC records and signer metadata, and the zone is served again after the next signing |
+| `db.import.analyze` | info | imports that wrote or removed 1000 records or more refreshed the stale planner statistics of the records table (ANALYZE, PostgreSQL) |
+| `db.import.analyze-skipped` | info | ANALYZE of the records table was skipped: another session (a VACUUM or ANALYZE, often autovacuum) held its lock |
+| `db.import.analyze-denied` | info | the database role may not ANALYZE the records table (owner, or MAINTAIN on PostgreSQL 17 and later); autovacuum refreshes the statistics later |
+| `db.import.analyze-failed` | warning | ANALYZE of the records table after an import failed; the import is committed |
 | `db.export.open` | error | the database could not be opened |
 | `db.export.not-found` | error | the zone is not in the database, or not in the view asked for |
 | `db.export.zone-type` | error | the zone is not a primary zone: its records are not what the server serves |

@@ -459,6 +459,9 @@ SUPER=$(pq "SELECT current_user")
 psql -X -q -At -v ON_ERROR_STOP=1 -v role="$SUPER" -v schema=public -f db/karidns_check_role.pgsql.sql "$PGC" > "$T/role4.out" 2>&1 && bad "a superuser or the owner cannot be the check role" || ok "the check role script refuses the owner / a superuser"
 pq "SELECT count(*) FROM pg_trigger WHERE tgname = 'karidns_never_commit'" > "$T/nc.out"
 [ "$(cat "$T/nc.out")" -ge 10 ] && ok "the never-commit triggers are on the tables the dry run writes ($(cat "$T/nc.out"))" || bad "never-commit triggers: $(cat "$T/nc.out")"
+# 0.7: the writer script grants MAINTAIN on records (PostgreSQL 17+, for ANALYZE); the check role script takes it back
+mt=$(pq "SELECT current_setting('server_version_num')::int < 170000 OR NOT has_table_privilege('$RK', 'records', 'MAINTAIN')")
+[ "$mt" = t ] && ok "the check role has no MAINTAIN on records" || bad "the check role has MAINTAIN on records"
 
 # principals: a global master, a domain master (policy web), a subdomain master (policy web)
 pq "INSERT INTO karidns_auth.rr_policies (name, allowed_types, allow_wildcard, allow_delegation, allow_dname, apex_editable, ttl_min, ttl_max) VALUES

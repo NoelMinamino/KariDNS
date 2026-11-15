@@ -10,6 +10,7 @@ import { canonicalOwner, inZone, absolute } from '../names.js';
 import { exportArgv, renderArgv } from '../tools.js';
 import { contentProblem, MAX_RRSETS, MAX_RECORDS, ZONE_TEXT_LIMIT } from '../changes.js';
 import { VERSION } from '../app.js';
+import { reloadAvailable } from '../config.js';
 import { dataset, zoneParam, zoneGrants, page } from './common.js';
 import { grantView } from './auth.js';
 
@@ -274,6 +275,6 @@ export function version(ctx) {
   const s = app.settings;
   return {
     version: VERSION, tools: app.versions, datasets: app.datasets.map((d) => d.name), types: app.types ? [...app.types].sort() : null,
-    ui: { reload_after_change: s['reload-after-change'], require_totp: s['require-totp'], max_rrsets: MAX_RRSETS, max_records: MAX_RECORDS, zone_text_limit: ZONE_TEXT_LIMIT },
+    ui: { reload_after_change: s['reload-after-change'], reload_available: reloadAvailable(s), reload_all: s.database === 'pg', require_totp: s['require-totp'], max_rrsets: MAX_RRSETS, max_records: MAX_RECORDS, zone_text_limit: ZONE_TEXT_LIMIT },
   };
 }

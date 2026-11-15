@@ -5,12 +5,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   relName, absName, recordLines, recordsText, parseRecordLine, rdataOf, expectOf, policyReason, editReason, zoneEditable, ttlRange, addableTypes, remaining, zonePath, datasetPath,
-  DNSSEC_TYPES,
+  DNSSEC_TYPES, PRIMARY_KINDS, kindLabel,
 } from '../ui/js/zonelib.js';
 import { createDrafts, replaceEntry, addEntry, deleteEntry, soaEntry, entryKey, rrsetOf } from '../ui/js/draft.js';
 import { segments, entryOf, placeOnEntries, placeOnFields } from '../ui/js/pointer.js';
 import { diffCounts, diffPage, lineText, DIFF_PAGE } from '../ui/js/diffmodel.js';
 import { rrsetsFromLines } from '../ui/js/views/zonecreate.js';
+import { reloadOffer } from '../ui/js/version.js';
 import { POLICY } from './ui_boot.js';
 
 test('paths: every part is encoded', () => {
@@ -281,4 +282,18 @@ test('the diff: counts, pages of 200 (clamped), the text of a line', () => {
   assert.equal(diffPage(diff, 1, 100).items[0].name, 'n100.');
   assert.equal(lineText({ ttl: 300, content: '192.0.2.1' }), '300 192.0.2.1');
   assert.equal(lineText({ content: 'x' }), '? x');
+});
+
+test('T-1: reloadOffer follows GET /version: no reload where the service says it cannot; the default only where it can; a service that does not say can', () => {
+  const at = (ui) => reloadOffer({ session: { state: { version: ui === undefined ? null : { ui } } } });
+  assert.deepEqual(at(undefined), { available: true, checked: false }, '/version not read');
+  assert.deepEqual(at({ reload_after_change: true }), { available: true, checked: true }, 'an older service');
+  assert.deepEqual(at({ reload_available: true, reload_after_change: false }), { available: true, checked: false });
+  assert.deepEqual(at({ reload_available: false, reload_after_change: true }), { available: false, checked: false });
+});
+
+test('T-2: the labels of the zone kinds: NATIVE and MASTER say what they are, the others are their names', () => {
+  const t = (id) => `<${id}>`;
+  assert.deepEqual(PRIMARY_KINDS, ['NATIVE', 'MASTER']);
+  assert.deepEqual(['NATIVE', 'MASTER', 'SLAVE', 'PRODUCER'].map((k) => kindLabel(t, k)), ['<kind.native>', '<kind.master>', 'SLAVE', 'PRODUCER']);
 });

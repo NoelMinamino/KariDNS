@@ -5,7 +5,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseConfig, validate, defaults, datasetList, listenHost, loadConfig } from '../lib/config.js';
+import { parseConfig, validate, defaults, datasetList, listenHost, loadConfig, reloadAvailable } from '../lib/config.js';
+import { wantReload } from '../lib/handlers/write.js';
 import { shape, value, query, encodeCursor, decodeCursor, LIMIT, CURSOR } from '../lib/validate.js';
 import { canonicalOwner, canonicalZone, inZone, absolute, dbName } from '../lib/names.js';
 import { ApiError, badRequest, forbidden, notFound, conflict, problem, mapDbError } from '../lib/errors.js';
@@ -46,6 +47,8 @@ test('configuration: SQLite3', () => {
   assert.equal(c.settings['scrypt-ln'], 17);
   assert.equal(c.settings['audit-retention'], 0);
   assert.equal(c.settings['rate-oidc-start'], 20);
+  assert.equal(c.settings['rate-reload'], 6);
+  assert.equal(parseConfig(`${SQLITE}\nrate-reload = 600`).settings['rate-reload'], 600);
   assert.equal(parseConfig(`${SQLITE}\naudit-retention = 7`).settings['audit-retention'], 7);
   assert.equal(c.settings['karidns-zone'], '/usr/local/bin/karidns-zone');
   assert.deepEqual(datasetList(c), [{ name: 'main', schema: '', views: [] }]);
@@ -86,6 +89,8 @@ test('configuration: mistakes are reported with the line', () => {
     ['scrypt-ln = 13', /scrypt-ln: expected 14 to 20/],
     ['rate-oidc-start = 0', /rate-oidc-start: expected 1 to 1000/],
     ['rate-oidc-start = 1001', /rate-oidc-start: expected 1 to 1000/],
+    ['rate-reload = 0', /rate-reload: expected 1 to 600 \(reloads a principal may ask for in a minute\)/],
+    ['rate-reload = 601', /rate-reload: expected 1 to 600/],
     ['audit-retention = 6', /audit-retention: expected 0 \(keep the audit log for ever\) or a number of days, 7 to 36500/],
     ['audit-retention = 36501', /audit-retention: expected 0/],
     ['audit-retention = 30d', /audit-retention: expected 0/],
@@ -129,6 +134,28 @@ test('configuration: what the whole must satisfy', () => {
   // a UNIX socket and a loopback name need no TLS
   assert.deepEqual(problems(PG), []);
   assert.deepEqual(problems(SQLITE.replace('127.0.0.1:8053', 'localhost:8053')), []);
+});
+
+test('T-1: a reload is available unless SQLite3 has no karictl-config; wantReload refuses exactly there', () => {
+  const cases = [
+    [{ database: 'pg' }, true],
+    [{ database: 'pg', 'karictl-config': '/k' }, true],
+    [{ database: 'sqlite3' }, false],
+    [{ database: 'sqlite3', 'karictl-config': undefined }, false],
+    [{ database: 'sqlite3', 'karictl-config': '/k' }, true],
+  ];
+  for (const [s, available] of cases) {
+    assert.equal(reloadAvailable(s), available, JSON.stringify(s));
+    const app = { settings: { ...s, 'reload-after-change': true } };
+    if (available) {
+      assert.equal(wantReload(app, true), true);
+      assert.equal(wantReload(app, undefined), true, 'the configuration\'s default');
+    } else {
+      assert.throws(() => wantReload(app, true), (e) => e.status === 400 && /needs 'karictl-config'/.test(e.detail));
+      assert.equal(wantReload(app, undefined), false, 'the default is dropped, not refused');
+    }
+    assert.equal(wantReload(app, false), false);
+  }
 });
 
 test('the sample configuration is a good configuration, also with the SQLite3 lines for the PostgreSQL ones', () => {
