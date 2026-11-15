@@ -2079,10 +2079,11 @@ static int run_mode(const char *mode) {
             CHECK(wk_wait_answer(&wk, got, &glen, 5000) && (got[3] & 0x0F) == 0);
 
             /* W9: the zone's name is not the record's (the zone id is another zone's now), a state that is not stored, a view that is shared by in-view: nothing is done */
+            /* (W8's room making may have taken wq1 out of memory already) */
             {
                 zref_t zz;
                 zref_clear(&zz);
-                CHECK(evict_zone("wq1.test.") && zref_of("wq1.test.", &zz) && zz.zid != ZREF_NOZID);
+                CHECK((!in_memory("wq1.test.") || evict_zone("wq1.test.")) && zref_of("wq1.test.", &zz) && zz.zid != ZREF_NOZID);
                 rcu_aux_read_lock();
                 snw = acquire_zone_snapshot();
                 vsw = snapshot_find_view(snw, "default");

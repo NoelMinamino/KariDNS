@@ -106,6 +106,7 @@ static inline void rcu_reader_enter(worker_ctx_t *ctx) {
 static inline void rcu_reader_exit(worker_ctx_t *ctx) {
   if (!ctx) return;
   rcu_epoch_exit(&ctx->rcu_observed_epoch);
+  if (t_rcu_own_observed == &ctx->rcu_observed_epoch) t_rcu_own_observed = NULL;   // (rcu_aux_read_lock() reads it: ctx may be a stack object of the caller)
 }
 
 // rcu_reader_slot_t を持つ常駐スレッドの読み取り区間 (rcu_reader_enter/exit と同じ)
@@ -116,6 +117,7 @@ static inline void rcu_slot_reader_enter(rcu_reader_slot_t *slot) {
 
 static inline void rcu_slot_reader_exit(rcu_reader_slot_t *slot) {
   rcu_epoch_exit(&slot->rcu_observed_epoch);
+  if (t_rcu_own_observed == &slot->rcu_observed_epoch) t_rcu_own_observed = NULL;
 }
 
 // worker_ctx_t を持たないスレッドの読み取り区間。入れ子にできる (最外側だけが世代を記録する)。
