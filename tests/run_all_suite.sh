@@ -318,6 +318,12 @@ KARI_PORT_SLOT_SPAN=1000
 # 20000 + 29 * 1000 + 999 = 48999: below the IANA dynamic range (49152 ..), but inside the ephemeral range of FreeBSD (net.inet.ip.portrange.first
 # is 10000 by default) and of Linux (32768 ..), so an outgoing connection of another process can hold a port of a window before a test binds it
 KARI_MAX_JOBS=29
+# KARI_PORT_EXTRA_BASE: 8 more windows of 1000 ports above all slot windows (49000 .. 56999 by default), for the workers of
+# tests/run_dag_ci_test.sh, whose sub-tests run up to 8 at a time and each take ports up to KARI_PORT_BASE + 990.  Without
+# them the sub-tests fell back to ports derived from their PID (20000 .. 40000), inside the slot windows of the other tests
+# and their PostgreSQL clusters (KARI_PORT_BASE + 999 of a slot: "bind: Address already in use" at -j 4)
+KARI_PORT_EXTRA_BASE=$((KARI_PORT_BASE_MIN + KARI_MAX_JOBS * KARI_PORT_SLOT_SPAN))
+export KARI_PORT_EXTRA_BASE
 
 detect_ncpu() {
     _n=$(sysctl -n hw.ncpu 2>/dev/null) || _n=""
