@@ -74,11 +74,17 @@ chmod 644 "$T/k.conf"
 echo "=== memory-limit does not count the retired versions a reader holds ($(basename "$KARIDNS")) ==="
 "$KARIDNS" -f "$T/k.conf" > "$T/k.log" 2>&1 &
 SRV=$!
+# the startup batch first (as tests/run_db_cache_test.sh): kari_wait_answer takes any answer, and a zone the batch has not reached yet is
+# REFUSED.  The queries below then brought fewer than 280 zones into memory (misses 276-279), and the zones they missed were counted during
+# the hold: an odd one as a cold zone of the batch (cold +1), an even one as a miss of the second round (misses +1)
+i=0; while [ $i -lt 600 ] && ! grep -q "\[DB\] initial load complete" "$T/k.log" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+grep -q "\[DB\] initial load complete" "$T/k.log" || { fail "no 'initial load complete' within 60 s"; tail -20 "$T/k.log"; exit 1; }
 kari_wait_answer ./dag "$P" d3000.test 60 || { fail "the server did not start"; tail -20 "$T/k.log"; exit 1; }
 q=1; while [ $q -le 280 ]; do ./dag @127.0.0.1 -p "$P" "$(printf 'www.d%04d.test' $q)" A +short +nohexdump +time=3 +tries=2 > /dev/null 2>&1; q=$((q + 1)); done
 R0=$(stat resident); E0=$(stat evictions); C0=$(stat cold); M0=$(stat misses)
 echo "   after the queries: $(ctl dbstatus | grep '^cache:')"
 [ "${R0:-0}" -gt 1000000 ] && [ "${R0:-0}" -lt 1992294 ] && pass "280 zones in memory ($R0 bytes, below the high mark of 2m)" || fail "resident: '$R0'"
+[ "${M0:-0}" -ge 280 ] && pass "each of the 280 queries waited for its zone (misses $M0)" || fail "misses after the 280 queries: '$M0' (a query was not answered from its zone)"
 if [ -n "${MLR_NOHOLD:-}" ]; then H=OK; else H=$(ctl rcu-hold 60000); fi
 [ "$H" = "OK" ] && pass "karictl rcu-hold 60000 (TEST ONLY)" || fail "rcu-hold: '$H'"
 # the cache manager samples the readers every second: a reader is long once it has stayed from one sample to the next

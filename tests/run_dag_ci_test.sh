@@ -12,7 +12,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEST_DIR="dag_ci_test_dir"
 PORT=$(kari_port 0 53555)
-# the ~35 sub-tests started below choose their own ports (no port window each)
+SRC_PORT=$(kari_port 1 54321)   # dag -b source port (Part 1)
+# the ~35 sub-tests started below must not share this window: under tests/run_all_suite.sh each worker of Section 20 gets
+# a window of its own from KARI_PORT_EXTRA_BASE (see there); run alone, the sub-tests choose their own ports
 unset KARI_PORT_BASE
 
 CLIENT_ARG="${1:-dag}"
@@ -161,7 +163,7 @@ run_check "DNSSEC DS query" "$DAG @127.0.0.1 -p $PORT example.com DS +dnssec" "(
 run_check "IPv4 preference flag (-4)" "$DAG @127.0.0.1 -p $PORT www.example.com A -4" "192.0.2.10"
 run_check "IPv6 preference flag (-6)" "$DAG @127.0.0.1 -p $PORT www.example.com AAAA -6 +timeout=1" "(2001:db8::10|timed out|no usable response|No acceptable nameservers|no servers could be reached)"
 run_check "Ignore .digrc flag (-r)" "$DAG @127.0.0.1 -p $PORT www.example.com A -r" "192.0.2.10"
-run_check "Source address & port bind (-b)" "$DAG @127.0.0.1 -p $PORT www.example.com A -b 127.0.0.1#54321" "192.0.2.10"
+run_check "Source address & port bind (-b)" "$DAG @127.0.0.1 -p $PORT www.example.com A -b 127.0.0.1#$SRC_PORT" "192.0.2.10"
 run_check "Short mode (+short)" "$DAG @127.0.0.1 -p $PORT www.example.com A +short" "^192\.0\.2\.10$"
 run_check "Show Query (+qr)" "$DAG @127.0.0.1 -p $PORT www.example.com A +qr" ";; Sending:"
 run_check "Microsecond stats (-u)" "$DAG @127.0.0.1 -p $PORT www.example.com A -u" ";; Query time:.*usec"
@@ -593,6 +595,11 @@ WORKER_PIDS=""
 w=1
 while [ "$w" -le "$PARALLEL_JOBS" ]; do
     (
+        # one port window per worker (its sub-tests run one after the other); PARALLEL_JOBS <= 8 = the windows reserved
+        if [ -n "${KARI_PORT_EXTRA_BASE:-}" ] && [ $((KARI_PORT_EXTRA_BASE + w * 1000)) -le 65536 ]; then
+            KARI_PORT_BASE=$((KARI_PORT_EXTRA_BASE + (w - 1) * 1000))
+            export KARI_PORT_BASE
+        fi
         while :; do
             claimed=""
             for ticket in "$QUEUE_DIR"/*.ready; do
