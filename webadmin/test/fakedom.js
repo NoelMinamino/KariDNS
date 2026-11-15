@@ -217,6 +217,7 @@ export class FakeStorage {
   constructor(init = {}) { this.m = new Map(Object.entries(init)); }
   getItem(k) { return this.m.has(k) ? this.m.get(k) : null; }
   setItem(k, v) { this.m.set(k, String(v)); }
+  removeItem(k) { this.m.delete(k); }
 }
 
 // BroadcastChannel: instances of one name hear each other (not themselves)

@@ -74,6 +74,19 @@ const vars = (block) => Object.fromEntries([...block.matchAll(/--([a-z-]+):\s*(#
 const light = vars(css.slice(css.indexOf(':root {'), css.indexOf('@media (prefers-color-scheme: dark)')));
 const darkStart = css.indexOf('@media (prefers-color-scheme: dark)');
 const dark = { ...light, ...vars(css.slice(darkStart, css.indexOf('* { box-sizing')) ) };
+// the dark scheme is written twice: for the system (unless the person chose light) and for the person's choice (data-theme="dark", theme.js)
+const forced = css.indexOf(':root[data-theme="dark"] {');
+const darkBySystem = vars(css.slice(darkStart, forced));
+const darkByChoice = vars(css.slice(forced, css.indexOf('* { box-sizing')));
+
+test('the colour scheme chosen on the account screen: the same dark colours as the system\'s, and a light choice wins over a dark system', () => {
+  assert.ok(forced > darkStart, 'the rule of data-theme="dark" follows the media query');
+  assert.ok(Object.keys(darkBySystem).length >= 17);
+  assert.deepEqual(darkByChoice, darkBySystem);
+  assert.match(css, /@media \(prefers-color-scheme: dark\) \{\s*:root:not\(\[data-theme="light"\]\) \{/);
+  assert.match(css, /:root\[data-theme="light"\] \{ color-scheme: light; \}/);
+  assert.match(css, /:root\[data-theme="dark"\] \{\s*color-scheme: dark;/);
+});
 
 const lum = (hex) => {
   const c = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255).map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4));
@@ -87,16 +100,22 @@ const TEXT = [
   ['muted', 'bg', 'footer, hints'], ['muted', 'panel', 'hints, reasons'], ['muted', 'notice-bg', 'hints in notices'], ['muted', 'error-bg', 'hints in errors'],
   ['accent', 'bg', 'links'], ['accent', 'panel', 'links in cards'], ['accent', 'notice-bg', 'links in notices'], ['accent-text', 'accent', 'primary buttons'],
   ['danger', 'bg', 'errors'], ['danger', 'panel', 'errors, danger buttons'], ['danger', 'error-bg', 'error messages'], ['danger', 'notice-bg', 'errors in notices'],
+  ['text', 'sunken', 'table heads, code, hovered buttons and rows'], ['muted', 'sunken', 'table head labels'], ['accent', 'sunken', 'links in hovered rows'], ['danger', 'sunken', 'errors in hovered rows'],
+  ['text', 'accent-soft', 'drafted rows'], ['accent', 'accent-soft', 'the current menu entry, links in drafted rows'], ['muted', 'accent-soft', 'hints in drafted rows'], ['accent-text', 'accent-hover', 'hovered primary buttons'],
+  ['text', 'ok-bg', 'success messages, new diff lines'], ['ok', 'ok-bg', 'the + of a new diff line'], ['muted', 'ok-bg', 'hints in success messages'], ['accent', 'ok-bg', 'links in success messages'],
 ];
 // the edges that identify a control or its state (1.4.11), against what is around them
 const NON_TEXT = [
   ['focus', 'bg', 'focus ring'], ['focus', 'panel', 'focus ring in cards'], ['focus', 'notice-bg', 'focus ring in notices'], ['focus', 'error-bg', 'focus ring in errors'],
   ['muted', 'bg', 'border of fields'], ['muted', 'panel', 'border of buttons'], ['accent', 'panel', 'selected row, primary button'], ['accent', 'bg', 'selected tab'],
   ['danger', 'panel', 'invalid field, danger button'], ['danger', 'bg', 'invalid field'], ['notice-line', 'panel', 'the frame of a secret'], ['notice-line', 'notice-bg', 'the bar of a notice'],
+  ['focus', 'sunken', 'focus ring in code and hovered rows'], ['focus', 'accent-soft', 'focus ring in drafted rows'], ['focus', 'ok-bg', 'focus ring in success messages'],
+  ['muted', 'sunken', 'border of a hovered button'], ['danger', 'error-bg', 'border of a hovered danger button, the bar of an error'], ['accent', 'accent-soft', 'the bar of the current menu entry'],
+  ['ok', 'ok-bg', 'the bar of a success message'], ['accent-hover', 'panel', 'hovered primary button'],
 ];
 
 test('the colours of the style sheet were read (both schemes, every name)', () => {
-  for (const name of ['bg', 'panel', 'text', 'muted', 'line', 'accent', 'accent-text', 'danger', 'notice-bg', 'notice-line', 'error-bg', 'focus']) {
+  for (const name of ['bg', 'panel', 'text', 'muted', 'line', 'accent', 'accent-text', 'danger', 'notice-bg', 'notice-line', 'error-bg', 'focus', 'sunken', 'accent-hover', 'accent-soft', 'ok', 'ok-bg']) {
     assert.match(light[name] ?? '', /^#[0-9a-f]{6}$/i, `light ${name}`);
     assert.match(dark[name] ?? '', /^#[0-9a-f]{6}$/i, `dark ${name}`);
   }
@@ -118,7 +137,7 @@ test('the style sheet keeps what the checklist relies on: a visible focus, reduc
   assert.match(css, /\[hidden\]\s*\{\s*display:\s*none\s*!important/);
   assert.ok(!/font-size:\s*\d+(\.\d+)?px/.test(css), 'a font size in pixels does not follow the setting of the browser');
   assert.match(css, /overflow-wrap:\s*anywhere/);
-  assert.ok(!/outline:\s*(none|0)\b/.test(css.replace(/main \{[^}]*\}/g, '')), 'outline is removed only from main (programmatic focus)');
+  assert.ok(!/outline:\s*(none|0)\b/.test(css.replace(/main(:focus-visible)? \{[^}]*\}/g, '')), 'outline is removed only from main (programmatic focus)');
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------------- label in name
