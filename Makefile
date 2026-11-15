@@ -1217,6 +1217,15 @@ COV_JOBS != (sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 2) | hea
 COV_SUITE_EXCLUDE ?= run_sanitizer_smoke_test,run_stress_test,run_rcu_tsan_test,run_rcu_tsan_units_test,run_fuzz_smoke_test
 COV_HTML_DIR = coverage_html
 COV_DATA    = coverage.profdata
+# CI runs the suite in parts, one per VM (.github/workflows/ci.yml, tests/TEST_MATRIX.md "Shards"): make coverage-run COV_SHARD=I/N runs part I of N
+# (tests/run_all_suite.sh --shard, with --pg-clusters: one PostgreSQL per slot) and replays the fuzz corpora in part 1 only; make coverage-shard-merge
+# turns its raw profiles into COV_SHARD_PROFDATA; a later job merges the parts (coverage-merge-shards, COV_SHARD_DATA) and makes the report from the
+# result (coverage-report COV_FROM_SHARDS=1).  Empty COV_SHARD: make coverage as it always was.
+COV_SHARD ?=
+COV_SHARD_PROFDATA ?= coverage_shard.profdata
+COV_SHARD_DIR ?= coverage_shards
+COV_SHARD_DATA ?= $(COV_SHARD_DIR)/*.profdata
+COV_FROM_SHARDS ?=
 
 COV_FUZZ_DIR = coverage_fuzz
 COV_FUZZ_CFLAGS = -fsanitize=fuzzer,address,undefined -fprofile-instr-generate -fcoverage-mapping -DKARIDNS_COVERAGE_LINKAGE -O0 -g -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -Wall -Wextra -std=c11 -fPIE $(VERSION_DEF) $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
@@ -1396,7 +1405,7 @@ COV_BIN_OBJS += -object=test_rrl_engine -object=test_query_engine_expanded -obje
 COV_BIN_OBJS += -object=test_catalog_zone_engine -object=test_snapshot_sandbox_engine -object=test_dag_tools -object=test_server_core
 COV_BIN_OBJS += -object=test_fi_parsers -object=test_fi_wire -object=test_fi_snapshot -object=test_fi_xfr -object=test_fi_misc -object=test_fi_dag
 COV_BIN_OBJS += -object=karicheck-codelog -object=test_coverage_sweep_tools-codelog -object=test_coverage_sweep -object=test_coverage_sweep_dag -object=test_coverage_sweep_net -object=test_coverage_sweep_tools
-COV_BIN_OBJS += -object=test_db_stream -object=test_db_registry -object=test_zone_dir -object=test_park -object=test_db_fetch -object=test_park_worker -object=test_pdns_reader -object=test_presigned -object=test_zone_text -object=test_zone_import -object=test_db_supervisor -object=test_plugin_msg test_plugin_msg
+COV_BIN_OBJS += -object=test_db_stream -object=test_db_registry -object=test_zone_dir -object=test_park -object=test_db_fetch -object=test_park_worker -object=test_pdns_reader -object=test_presigned -object=test_zone_text -object=test_zone_import -object=test_db_supervisor -object=test_plugin_msg
 COV_PG_OBJ != [ -n "$(DBPG_HAVE)" ] && printf -- '-object=test_db_pgsql' || true
 COV_BIN_OBJS += $(COV_PG_OBJ)
 # B11c: the loader itself (karidns_dbloader.c, with the drivers the build host has) and the SQLite3 driver / loader unit test
@@ -1428,20 +1437,39 @@ coverage-run:
 	@mkdir -p $(COV_DIR)
 	@chmod 1777 $(COV_DIR)
 	@rm -f coverage_suite.status
-	@KARI_SUITE_STATUS="$$(pwd)/coverage_suite.status" LLVM_PROFILE_FILE="$$(pwd)/$(COV_DIR)/$(COV_PROFILE_PAT_$(COV_CONTINUOUS))" sh tests/run_all_suite.sh -j $(COV_JOBS) --test-timeout 1200 --exclude "$(COV_SUITE_EXCLUDE)" || true
+	@shard_opts=''; [ -z "$(COV_SHARD)" ] || shard_opts="--shard $(COV_SHARD) --pg-clusters"; \
+	KARI_SUITE_STATUS="$$(pwd)/coverage_suite.status" LLVM_PROFILE_FILE="$$(pwd)/$(COV_DIR)/$(COV_PROFILE_PAT_$(COV_CONTINUOUS))" sh tests/run_all_suite.sh -j $(COV_JOBS) --test-timeout 1200 --exclude "$(COV_SUITE_EXCLUDE)" $$shard_opts || true
 	@# A failing test does not stop the coverage run (the gate judges the numbers), but a suite that stopped before running its tests
 	@# (no status file: e.g. a shell error while registering them) would only show up as very low coverage: fail here with the reason.
 	@test -s coverage_suite.status || { echo "Error: tests/run_all_suite.sh stopped before it ran the tests (no coverage_suite.status); see its output above."; exit 1; }
 	@grep -q '^total=[1-9]' coverage_suite.status || { echo "Error: tests/run_all_suite.sh ran no test: $$(cat coverage_suite.status)"; exit 1; }
 	@echo "Test suite: $$(head -n 1 coverage_suite.status)"
-	@$(MAKE) coverage-fuzz-run || true
+	@# the fuzz corpus replay is the same on every part: part 1 does it (an empty COV_SHARD is the whole run)
+	@case "$(COV_SHARD)" in ""|1/*) $(MAKE) coverage-fuzz-run || true ;; *) echo "(fuzz corpus replay: part 1 only)" ;; esac
 	@echo "Profile files in $(COV_DIR): $$(ls $(COV_DIR) | wc -l | tr -d ' ') (continuous mode: one file per instrumented binary)"
+
+# One part of a sharded run (COV_SHARD=I/N): its raw profiles merged into one indexed file, which is what the CI job hands to the merge job
+coverage-shard-merge:
+	@echo "=== Merging the Profile Data of this part ==="
+	@command -v $(LLVM_PROFDATA) >/dev/null 2>&1 || { echo "Error: $(LLVM_PROFDATA) not found in PATH."; exit 1; }
+	@ls $(COV_DIR)/*.profraw >/dev/null 2>&1 || { echo "Error: No profile data found in $(COV_DIR). Run 'make coverage-run' first."; exit 1; }
+	@sh tests/coverage_merge.sh "$(LLVM_PROFDATA)" $(COV_DIR) $(COV_SHARD_PROFDATA)
+
+# The parts merged: llvm-profdata adds the counters, so the result is the one a single run of every test would have written
+coverage-merge-shards:
+	@echo "=== Merging the Profile Data of the Parts ==="
+	@command -v $(LLVM_PROFDATA) >/dev/null 2>&1 || { echo "Error: $(LLVM_PROFDATA) not found in PATH."; exit 1; }
+	@ls $(COV_SHARD_DATA) >/dev/null 2>&1 || { echo "Error: No profile data of the parts found ($(COV_SHARD_DATA))."; exit 1; }
+	@echo "Parts: $$(ls $(COV_SHARD_DATA) | wc -l | tr -d ' ')"
+	$(LLVM_PROFDATA) merge -sparse $(COV_SHARD_DATA) -o $(COV_DATA)
 
 coverage-report:
 	@echo "=== Merging Profile Data & Generating Coverage Report ==="
 	@command -v $(LLVM_PROFDATA) >/dev/null 2>&1 || { echo "Error: $(LLVM_PROFDATA) not found in PATH."; exit 1; }
-	@ls $(COV_DIR)/*.profraw >/dev/null 2>&1 || { echo "Error: No profile data found in $(COV_DIR). Run 'make coverage-run' first."; exit 1; }
-	@sh tests/coverage_merge.sh "$(LLVM_PROFDATA)" $(COV_DIR) $(COV_DATA)
+	@# COV_FROM_SHARDS=1: $(COV_DATA) is there already (make coverage-merge-shards); no raw profiles on this host
+	@if [ -n "$(COV_FROM_SHARDS)" ]; then test -s $(COV_DATA) || { echo "Error: $(COV_DATA) not found. Run 'make coverage-merge-shards' first."; exit 1; }; \
+	else ls $(COV_DIR)/*.profraw >/dev/null 2>&1 || { echo "Error: No profile data found in $(COV_DIR). Run 'make coverage-run' first."; exit 1; }; \
+	sh tests/coverage_merge.sh "$(LLVM_PROFDATA)" $(COV_DIR) $(COV_DATA) || exit 1; fi
 	@mkdir -p $(COV_HTML_DIR)
 	$(LLVM_COV) show $(TARGET) $(COV_BIN_OBJS) -instr-profile=$(COV_DATA) -format=html -output-dir=$(COV_HTML_DIR) -ignore-filename-regex="tests/|scratch/|old_patches/|third_party/" -show-line-counts-or-regions -show-branches=count
 	@echo ""
@@ -1449,7 +1477,7 @@ coverage-report:
 	$(LLVM_COV) report $(TARGET) $(COV_BIN_OBJS) -instr-profile=$(COV_DATA) -ignore-filename-regex="tests/|scratch/|old_patches/|third_party/"
 	@echo ""
 	@echo "Full HTML coverage report available at: $(COV_HTML_DIR)/index.html"
-	@if [ -f tests/coverage_gate.pl ]; then perl tests/coverage_gate.pl --llvm-cov=$(LLVM_COV) --profdata=$(COV_DATA) || true; fi
+	@if [ -f tests/coverage_gate.pl ]; then perl tests/coverage_gate.pl --llvm-cov=$(LLVM_COV) --profdata=$(COV_DATA) --objects="$(COV_BIN_OBJS)" || true; fi
 
 # The suite result of coverage-run: success only with failed=0.  It runs after the report, so that a failing test still leaves the
 # coverage numbers (coverage-run keeps going past failing tests for that reason).
@@ -1458,6 +1486,15 @@ coverage-suite-check:
 	@if grep -q '^total=[0-9]* passed=[0-9]* failed=0 ' coverage_suite.status; then echo "Test suite: $$(head -n 1 coverage_suite.status)"; \
 	else echo "Error: the test suite has failing tests: $$(head -n 1 coverage_suite.status)"; \
 	     sed -n 's/^failed_tests=//p' coverage_suite.status | tr ' ' '\n' | sed 's/^/  FAILED: /'; exit 1; fi
+
+# The same for a sharded run: the status files of all parts in $(COV_SHARD_DIR) (*.status): every part 1..N there once, every selected test run
+# once (the totals add up to selected=), failed=0 in every part (tests/coverage_shards_check.sh)
+# The list of the binaries of the coverage report, for tests/coverage_gate.pl (which runs it when it is not given --objects): one list for both
+print-cov-bin-objs:
+	@echo $(COV_BIN_OBJS)
+
+coverage-suite-check-shards:
+	@sh tests/coverage_shards_check.sh $(COV_SHARD_DIR)
 
 # review Makefile [4]: one step after the other also under make -j (prerequisites would be free to run in parallel)
 coverage:
@@ -1857,6 +1894,6 @@ karidns-tapstat-asan: $(TAPSTAT_ASAN_SRCS)
 tools-asan: karicheck-asan dag-asan karictl-asan karidns-tapstat-asan
 
 # review Makefile [19]: targets that are no files (aliases, test runners, coverage steps)
-.PHONY: acl_match_test mem_advice_test asan_test axfr_ixfr_test bind_ecs_subnet_test catalog_zone_test cidr_test config_directives_test coverage coverage-build coverage-clean coverage-fuzz coverage-fuzz-build coverage-fuzz-run coverage-report coverage-run coverage-suite-check coverage_sweep_dag_test coverage_sweep_net_test coverage_sweep_test coverage_sweep_tools_test dag_format_test dag_iter_test dag_reassembly_test dag_tools_test db_fetch_test db_registry_test db_stream_test db_supervisor_test plugin_msg_test dns_diag_test dnssec_proofs_test dnstap_test dynamic_update_test edns_ecs_test epoch_rcu_test evict extended_axfr_test fi_dag_test fi_misc_test fi_parsers_test fi_snapshot_test fi_wire_test fi_xfr_test fuzz_all fuzz_conf fuzz_dag_all fuzz_dag_axfr_stream fuzz_dag_batch_file fuzz_dag_chunked_http fuzz_dag_cli_args fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_rdata_yaml fuzz_dag_replay_diff fuzz_dag_replay_pcap_reader fuzz_dag_tcp_reassembly fuzz_dag_test fuzz_karidns fuzz_karidns_test fuzz_test fuzz_zone hash_test include_test karicheck_matrix_test listen_on_test park_test park_worker_test pdns_reader_test presigned_test qe_protocol_test query_expanded_test rfc_vectors_test rrl_test server_core_test server_stmt_test sig0_sign_test snapshot_rebuild_test snapshot_sandbox_test sweep-tests test test-all tinydns_location_test tinydns_paths_test tinydns_test tinydns_timestamp_test unit-test-bins unit-tests unit-tests-asan unit-tests-portable unit-tests-portable-asan vulnerability_test wire_helpers_test xfr_opts_test zone_dir_test zone_image_test zone_import_test zone_parser_paths_test zone_text_test tapstat_test karidns-tapstat-asan
+.PHONY: acl_match_test mem_advice_test asan_test axfr_ixfr_test bind_ecs_subnet_test catalog_zone_test cidr_test config_directives_test coverage coverage-build coverage-clean coverage-fuzz coverage-fuzz-build coverage-fuzz-run coverage-report coverage-run coverage-shard-merge coverage-merge-shards coverage-suite-check coverage-suite-check-shards print-cov-bin-objs coverage_sweep_dag_test coverage_sweep_net_test coverage_sweep_test coverage_sweep_tools_test dag_format_test dag_iter_test dag_reassembly_test dag_tools_test db_fetch_test db_registry_test db_stream_test db_supervisor_test plugin_msg_test dns_diag_test dnssec_proofs_test dnstap_test dynamic_update_test edns_ecs_test epoch_rcu_test evict extended_axfr_test fi_dag_test fi_misc_test fi_parsers_test fi_snapshot_test fi_wire_test fi_xfr_test fuzz_all fuzz_conf fuzz_dag_all fuzz_dag_axfr_stream fuzz_dag_batch_file fuzz_dag_chunked_http fuzz_dag_cli_args fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_rdata_yaml fuzz_dag_replay_diff fuzz_dag_replay_pcap_reader fuzz_dag_tcp_reassembly fuzz_dag_test fuzz_karidns fuzz_karidns_test fuzz_test fuzz_zone hash_test include_test karicheck_matrix_test listen_on_test park_test park_worker_test pdns_reader_test presigned_test qe_protocol_test query_expanded_test rfc_vectors_test rrl_test server_core_test server_stmt_test sig0_sign_test snapshot_rebuild_test snapshot_sandbox_test sweep-tests test test-all tinydns_location_test tinydns_paths_test tinydns_test tinydns_timestamp_test unit-test-bins unit-tests unit-tests-asan unit-tests-portable unit-tests-portable-asan vulnerability_test wire_helpers_test xfr_opts_test zone_dir_test zone_image_test zone_import_test zone_parser_paths_test zone_text_test tapstat_test karidns-tapstat-asan
 # review Makefile [2]: the test objects of the DB / ACL tests were missing, so they survived a header edit
 $(TEST_PRESIGNED_SRCS:.c=.uta.o) $(TEST_PDNS_READER_SRCS:.c=.uta.o) $(TEST_DB_SUPERVISOR_SRCS:.c=.uta.o) $(TEST_DB_SQLITE3_SRCS:.c=.uta.o) $(TEST_DB_REGISTRY_SRCS:.c=.uta.o) $(TEST_ACLM_SRCS:.c=.utn.o) $(TEST_LISTEN_SRCS:.c=.utn.o) : $(PROJECT_HDRS)

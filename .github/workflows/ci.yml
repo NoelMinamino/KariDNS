@@ -21,13 +21,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # FreeBSD, per release (14.4, 15.1), in two jobs that run at the same time: this one builds everything (the server, the tools, the sanitizer and fuzz
+  # builds), checks ./configure, the manual pages and make install, and runs the unit tests (plain and under ASan/UBSan) and the smoke tests; functional-freebsd
+  # builds what its tests need and runs the functional and the signer / WebAdmin tests.  Split in two, the wall time of a release is that of the longer
+  # half (about 12 to 14 minutes each) instead of the sum (18 to 24).  The PostgreSQL tests (the unit tests test_db_pgsql and test_zone_import here) run with
+  # --pg-clusters: one PostgreSQL cluster per test slot, started and stopped by tests/run_all_suite.sh, so that the VM needs only the server package, not a
+  # started service (and the tests of the group pg no longer wait for each other).
+  # A hung test must fail the job instead of blocking it for hours: every test has a timeout (--test-timeout), the job has this one.
+  # ---------------------------------------------------------------------------
   build-and-test-freebsd:
     name: Build and Test on FreeBSD ${{ matrix.release }}
     if: github.event_name != 'schedule' && github.event.action != 'labeled'
     runs-on: ubuntu-latest
-    # a hung test must fail the job instead of blocking it for hours.  The 15.1 job took 29 minutes (14.4: 32) without the browser tests of the web interface, which
-    # run in the job webadmin-gui-freebsd since 0.7 (their result does not decide this job's).
-    timeout-minutes: 55
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
@@ -62,17 +69,12 @@ jobs:
             echo "::endgroup::"
 
             echo "::group::📦 [Setup] PostgreSQL server and libpq (PostgreSQL driver of karidns-dbloader, B10)"
-            # The job runs inside this VM, so the PostgreSQL "service" is a server started here (a service container of the
-            # runner is not reachable from the VM).  initdb's default pg_hba.conf trusts the UNIX socket and 127.0.0.1; the tests
-            # create and drop their own databases and roles (karidns_test_*) as the user postgres (tests/db/pg_lib.sh).
+            # The job runs inside this VM, so a PostgreSQL "service" is a server started here (a service container of the runner is not
+            # reachable from the VM).  No service is started: tests/run_all_suite.sh --pg-clusters (the unit tests below) runs initdb for
+            # every test slot, as the user postgres (the package makes it), with trust authentication on 127.0.0.1; the tests create and
+            # drop their own databases and roles (karidns_test_*) in it (tests/db/pg_lib.sh).
             pkg install -y postgresql17-server postgresql17-client
-            sysrc postgresql_enable=YES
-            service postgresql initdb
-            service postgresql start
-            export KARIDNS_TEST_PG="host=127.0.0.1 user=postgres"
             export KARIDNS_TEST_PG_USER=postgres
-            i=0; until pg_isready -q -h 127.0.0.1 || [ $i -ge 30 ]; do sleep 1; i=$((i + 1)); done
-            psql -X -At -h 127.0.0.1 -U postgres -d postgres -c "SELECT version()"
             echo "::endgroup::"
 
             echo "::group::📦 [Build] Parallel Build KariDNS, Sanitizers, Tests & Fuzzers"
@@ -106,7 +108,7 @@ jobs:
             # in full when the test fails.  The coverage sweeps are not part of unit-tests (the coverage job runs them).
             # Build every test binary in parallel first (stdin from /dev/null: no test may block reading the VM session's stdin).
             make -j"$NCPU" unit-test-bins
-            sh tests/run_all_suite.sh -j 4 --test-timeout 1200 --full-log -c unit -e coverage_sweep < /dev/null
+            sh tests/run_all_suite.sh -j 4 --test-timeout 1200 --full-log --pg-clusters -c unit -e coverage_sweep < /dev/null
             echo "::endgroup::"
 
             echo "::group::🛡️ [Sanitizers] Unit tests under ASan + UBSan, 4 at a time"
@@ -118,7 +120,7 @@ jobs:
             # -j: the ASan binaries (each links ~18 objects) build in parallel; --asan then runs the same binaries as
             # make unit-tests-asan does (tests/run_unit_with_watchdog.sh, UT_TIMEOUT 300 s each), 4 at a time; like it, not the test_fi_* fault-injection tests (no -asan build)
             make -j"$NCPU" unit-test-bins-asan < /dev/null
-            sh tests/run_all_suite.sh -j 4 --test-timeout 1200 --full-log --asan -e coverage_sweep,test_fi_ < /dev/null
+            sh tests/run_all_suite.sh -j 4 --test-timeout 1200 --full-log --pg-clusters --asan -e coverage_sweep,test_fi_ < /dev/null
             echo "::endgroup::"
 
             echo "::group::🔍 [Smoke Test] Test dag client against a local mock server"
@@ -126,10 +128,74 @@ jobs:
             sh ./tests/run_ci_dag_smoke.sh
             echo "::endgroup::"
 
+            echo "::group::🛡️ [Sanitizer & Fuzzing] Run Comprehensive Smoke Tests"
+            ./tests/run_sanitizer_smoke_test.sh
+            echo "::endgroup::"
+
+            echo ""
+            echo "🎉 All FreeBSD builds and smoke tests passed!"
+
+  # ---------------------------------------------------------------------------
+  # The second half of the FreeBSD jobs (see build-and-test-freebsd): the functional and protocol tests and the karidns-signer / karidns-webadmin tests,
+  # which need the server, the tools, the database tools and the ASan builds of a few programs, not the rest of the sanitizer and fuzz builds.  Both lists
+  # run with --pg-clusters (one PostgreSQL per test slot; the group pg of the registry is dropped, the PostgreSQL tests run next to the others).
+  # ---------------------------------------------------------------------------
+  functional-freebsd:
+    name: Functional tests on FreeBSD ${{ matrix.release }}
+    if: github.event_name != 'schedule' && github.event.action != 'labeled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['14.4', '15.1']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Functional tests inside FreeBSD VM
+        uses: vmactions/freebsd-vm@v1.4.8
+        with:
+          release: ${{ matrix.release }}
+          run: |
+            set -e
+
+            echo "::group::📦 [Setup] Install test dependencies (perl5, sqlite3 for karidns-dbloader and its tests)"
+            pkg install -y perl5
+            pkg install -y sqlite3
+            echo "::endgroup::"
+
+            echo "::group::📦 [Setup] Node.js, BIND tools and the npm dependencies of karidns-signer and karidns-webadmin"
+            # the signer and WebAdmin tests SKIP without these (and then fail here: --fail-on-skip below).  curl: tests/run_release_roundtrip_test.sh talks to
+            # the karidns-webadmin API with it
+            pkg install -y node24 npm-node24 bind-tools curl
+            (cd signer && npm ci --ignore-scripts)
+            (cd webadmin && npm ci --ignore-scripts)
+            node --version
+            dnssec-signzone -V
+            echo "::endgroup::"
+
+            echo "::group::📦 [Setup] PostgreSQL server and libpq (PostgreSQL driver of karidns-dbloader, B10)"
+            # No service: tests/run_all_suite.sh --pg-clusters starts a cluster per test slot as the user postgres (see build-and-test-freebsd)
+            pkg install -y postgresql17-server postgresql17-client
+            export KARIDNS_TEST_PG_USER=postgres
+            echo "::endgroup::"
+
+            echo "::group::📦 [Build] KariDNS, the database tools and the ASan builds the tests use"
+            NCPU=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+            # configure finds the compiler and the libraries and writes config.mk (docs/building.md); both database drivers are built.  The list is the one of
+            # build-and-test-freebsd without the builds that only its unit and smoke tests use (tsan, fuzz_all, the unit test binaries, the ASan unit tests);
+            # fuzz_dag_all is made by run_dag_fuzzer_test.sh, here in parallel with the rest; test_response_cache: run_response_cache_test.sh runs the binary
+            # (its own fallback compile line lacks sources the engine needs now and does not link)
+            ./configure --with-db-drivers="sqlite3 postgresql"
+            make -j"$NCPU" all karicheck-codelog test_coverage_sweep_tools-codelog karidns-dbloader karidns-zone zone2sql zone2kdb fetch_backend karidns-evict asan tools-asan fuzz_dag_all test_response_cache
+            echo "::endgroup::"
+
             echo "::group::🛡️ [Functional & Protocol Tests] 4 at a time"
             # The tests of this list, run by tests/run_all_suite.sh: 4 at a time, each in its own port window and temporary directory (KARI_PORT_BASE,
-            # KARI_TMP); the ones that share a resource (loopback aliases, one server's files, fixed ports) are registered as group or serial there
-            # and run one at a time.  A failed test prints its whole log.  --tests refuses a name that is not registered.
+            # KARI_TMP) and, with --pg-clusters, its own PostgreSQL; the ones that share a resource (loopback aliases, one server's files, fixed ports) are
+            # registered as group or serial there and run one at a time.  A failed test prints its whole log.  --tests refuses a name that is not registered.
             FUNC_TESTS="\
               run_paren_check_test,run_ttl_suffix_test,run_zonemd_val_test,run_glue_truncation_test,run_mqtype_qdcount0_test,\
               run_ixfr_roundtrip_test,run_catalog_zone_test,run_capsicum_axfr_test,run_dynamic_update_test,run_roundtrip_test,\
@@ -146,7 +212,7 @@ jobs:
               run_response_cache_test,run_rrl_window_test,run_tinydns_timestamp_test,run_ttl_harmonization_test,\
               run_ttl_harmonization_update_test,run_ttl_rfc2181_clamp_test,run_update_secondary_refused_test,\
               run_zone_oom_partial_load_test,run_zone_type_secondary_test"
-            sh ./tests/run_all_suite.sh -j 4 --test-timeout 1200 --full-log --tests "$FUNC_TESTS" < /dev/null
+            sh ./tests/run_all_suite.sh -j 4 --test-timeout 1200 --full-log --pg-clusters --tests "$FUNC_TESTS" < /dev/null
             echo "::endgroup::"
 
             echo "::group::🔏 [Signer, WebAdmin] karidns-signer and karidns-webadmin: unit tests, SQLite3 and PostgreSQL (root: with a server)"
@@ -156,15 +222,9 @@ jobs:
             # 4 at a time through tests/run_all_suite.sh.  --serial-as-par: some of them are registered "serial" there (the others run next to the other tests since 0.6.2); every one of them
             # takes its ports (kari_port), its directory (mktemp) and its PostgreSQL roles and databases ($$) of its own.  --fail-on-skip: a test that exits 0 but prints a SKIP line
             # fails the job, as the loop did before
-            sh ./tests/run_all_suite.sh -j 4 --test-timeout 1200 --serial-as-par --full-log --fail-on-skip --tests "$NODE_TESTS" < /dev/null
+            sh ./tests/run_all_suite.sh -j 4 --test-timeout 1200 --serial-as-par --full-log --fail-on-skip --pg-clusters --tests "$NODE_TESTS" < /dev/null
             echo "::endgroup::"
 
-            echo "::group::🛡️ [Sanitizer & Fuzzing] Run Comprehensive Smoke Tests"
-            ./tests/run_sanitizer_smoke_test.sh
-            echo "::endgroup::"
-
-            echo ""
-            echo "🎉 All FreeBSD builds and smoke tests passed!"
 
   # ---------------------------------------------------------------------------
   # The browser tests of the web interface (0.7: category gui of tests/run_all_suite.sh, left out of a plain suite run): Firefox headless through geckodriver
@@ -515,30 +575,104 @@ jobs:
   # Coverage quality gate (FreeBSD only: the server core needs kqueue/Capsicum).
   # Runs on every PR (in parallel with the other jobs), on pushes to main, nightly
   # and on demand. It is also the only CI job that runs the whole integration
-  # suite on FreeBSD. `make coverage` builds in parallel, skips the
-  # ASan/TSan-only suites (they run in build-and-test-freebsd) and runs the
-  # server fault-injection sweep and the dag network sweep in parallel lanes.
-  # The test suite itself runs `tests/run_all_suite.sh -j <ncpu>` (COV_JOBS in the
-  # Makefile): one port window and temporary directory per slot, tests registered
-  # "serial" one by one after the parallel batch (tests/TEST_MATRIX.md).
-  # The job fails when the gate's thresholds are not met or when a test of the
-  # suite fails (make coverage-suite-check: success only with failed=0).
+  # suite on FreeBSD.  Three stages, each in a FreeBSD 15.1 VM of its own:
+  #   coverage-build  `make coverage-build` once (instrumented server, tools, loader, unit tests, fuzz harnesses, ASan builds) and the helpers the
+  #                   suite would otherwise build in every VM; everything the build made is packed into the artifact cov-bins
+  #                   (tests/coverage_pack.sh).
+  #   coverage-shard  4 VMs at the same time, each unpacks cov-bins and runs a quarter of the suite (tests/run_all_suite.sh --shard I/4 --pg-clusters:
+  #                   the split by the times of tests/suite_durations.tsv, one PostgreSQL cluster per test slot), skipping ASan/TSan-only suites (they run
+  #                   in build-and-test-freebsd); part 1 also replays the fuzz corpora.  Every part merges its raw profiles into one file (make
+  #                   coverage-shard-merge) and uploads it with its suite status and its summary.tsv (artifact cov-shard-I).  The checkout path is the same
+  #                   in all VMs (/home/runner/work/...): the instrumented loader has the path of its profile directory compiled in.
+  #   coverage-gate   adds the profiles of the parts (llvm-profdata merge: the same counters as one run of every test), makes the report from the
+  #                   instrumented binaries of cov-bins (make coverage-report COV_FROM_SHARDS=1), applies the thresholds, and checks that every part
+  #                   is there, that together they ran every selected test once and that no test failed (make coverage-suite-check-shards).  It runs
+  #                   when a part failed too, so that the numbers and the failing tests show together.
+  # `make coverage` (one host, the whole suite) works as before.  The times of the tests in tests/suite_durations.tsv are refreshed from the artifact
+  # suite-durations of a run (tests/TEST_MATRIX.md, "Shards").
+  # The job fails when the gate's thresholds are not met or when a test of the suite fails.
+  # The VM action copies the whole workspace back to the runner when a step ends: every VM step removes what it does not hand on (tests/coverage_pack.sh clean).
   # ---------------------------------------------------------------------------
-  coverage-freebsd:
-    name: Coverage gate (FreeBSD 15.1)
+  coverage-build:
+    name: Coverage build (FreeBSD 15.1)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: make coverage inside FreeBSD VM
+      - name: Instrumented build inside FreeBSD VM
         uses: vmactions/freebsd-vm@v1.4.8
         with:
           release: '15.1'
           copyback: true
           run: |
             set -e
+            # everything the build makes is newer than this file (tests/coverage_pack.sh pack: no git in the VM needed)
+            touch .cov_stamp
+
+            echo "::group::📦 [Setup] perl5, sqlite3 and libpq"
+            # libpq (postgresql17-client) decides the database drivers of the instrumented loader (COV_DB_DRIVERS: sqlite3 and postgresql, config.mk: DBPG_HAVE)
+            pkg install -y perl5 sqlite3 postgresql17-client
+            echo "::endgroup::"
+
+            echo "::group::🔨 [Coverage] make coverage-build"
+            START=$(date +%s)
+            # the compiler and the libraries as config.mk says (libpq, when it is installed, decides COV_DB_DRIVERS).  --march=none: the build runs on
+            # other runners (coverage-shard), whose CPUs differ from this one's; the helpers and ASan builds made with the plain CFLAGS (zone2sql,
+            # fetch_backend, ...) had -march=native and died with SIGILL there (status 132)
+            ./configure --march=none
+            make coverage-clean coverage-build < /dev/null
+            # the helpers tests/run_all_suite.sh builds when they are missing (zone2sql, zone2kdb: the DB tests, fetch_backend: run_db_fetch_test.sh);
+            # built here once, so that the 4 VMs of coverage-shard do not.  karidns-evict is not needed: the instrumented karidns has the test command
+            # (-DKARIDNS_TEST_EVICT).  The loader and karidns-zone have the drivers the suite wants (the same libpq check), so it builds neither
+            make zone2sql zone2kdb fetch_backend < /dev/null
+            echo "make coverage-build took $(( $(date +%s) - START ))s"
+            echo "::endgroup::"
+
+            echo "::group::📦 [Pack] the build, for the VMs of coverage-shard and coverage-gate"
+            sh tests/coverage_pack.sh pack cov-bins.tar.zst .cov_stamp
+            ls -l cov-bins.tar.zst
+            sh tests/coverage_pack.sh clean cov-bins.tar.zst
+            rm -f .cov_stamp
+            echo "::endgroup::"
+
+      - name: Upload the instrumented build
+        uses: actions/upload-artifact@v4
+        with:
+          name: cov-bins
+          path: cov-bins.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+  coverage-shard:
+    name: Coverage suite ${{ matrix.shard }}/4 (FreeBSD 15.1)
+    needs: coverage-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # before the VM step: the VM action copies the workspace into the VM when its step starts
+      - name: Download the instrumented build
+        uses: actions/download-artifact@v4
+        with:
+          name: cov-bins
+
+      - name: Part ${{ matrix.shard }}/4 of the suite inside FreeBSD VM
+        uses: vmactions/freebsd-vm@v1.4.8
+        with:
+          release: '15.1'
+          copyback: true
+          run: |
+            set -e
+            SHARD=${{ matrix.shard }}
 
             echo "::group::📦 [Setup] perl5 + LLVM tools matching the base clang"
             # Base llvm-cov on FreeBSD 15 aborts in "show"; the llvmNN-lite package
@@ -552,39 +686,124 @@ jobs:
             (cd webadmin && npm ci --ignore-scripts)
             echo "::endgroup::"
 
-            echo "::group::📦 [Setup] PostgreSQL for the PostgreSQL driver tier (test_db_pgsql)"
+            echo "::group::📦 [Setup] PostgreSQL for the PostgreSQL driver tier (test_db_pgsql) and the tests that use it"
+            # No service: tests/run_all_suite.sh --pg-clusters starts a cluster per test slot as the user postgres (the package makes it).  libpq: the suite
+            # builds the loader with the PostgreSQL driver only when pkg-config finds libpq, which is what the instrumented one has
             pkg install -y postgresql17-server postgresql17-client
-            sysrc postgresql_enable=YES
-            service postgresql initdb
-            service postgresql start
-            export KARIDNS_TEST_PG="host=127.0.0.1 user=postgres"
             export KARIDNS_TEST_PG_USER=postgres
-            i=0; until pg_isready -q -h 127.0.0.1 || [ $i -ge 30 ]; do sleep 1; i=$((i + 1)); done
             echo "::endgroup::"
 
-            echo "::group::🧪 [Coverage] make coverage"
-            # the suite runs with -j $(sysctl -n hw.ncpu) (Makefile: COV_JOBS; make coverage COV_JOBS=1 runs it one test at a time)
+            echo "::group::📦 [Unpack] the instrumented build of coverage-build"
+            # tar -m: the files are newer than the sources, no make target rebuilds them (uninstrumented)
+            sh tests/coverage_pack.sh unpack cov-bins.tar.zst
+            echo "::endgroup::"
+
+            echo "::group::🧪 [Coverage] make coverage-run COV_SHARD=$SHARD/4"
             START=$(date +%s)
-            # the compiler and the libraries as config.mk says (libpq, when it is installed, decides COV_DB_DRIVERS)
-            ./configure
-            # the steps of `make coverage` without its last one, coverage-suite-check: it runs after the gate, so that both results are shown
-            make coverage-clean coverage-build coverage-run coverage-report < /dev/null
-            echo "make coverage took $(( $(date +%s) - START ))s"
+            # the suite runs with -j $(sysctl -n hw.ncpu) (Makefile: COV_JOBS).  A failing test does not stop the run (the gate judges the numbers
+            # and coverage-gate the suite); a suite that stopped early has no coverage_suite.status, which coverage-gate reports as a missing part
+            RUN=0
+            make coverage-run COV_SHARD="$SHARD/4" < /dev/null || RUN=$?
+            echo "make coverage-run took $(( $(date +%s) - START ))s (exit $RUN)"
+            echo "::endgroup::"
+
+            echo "::group::📦 [Result] the profile data and the status of this part"
+            mkdir -p shard-out
+            [ ! -f coverage_suite.status ] || cp coverage_suite.status "shard-out/shard-$SHARD.status"
+            [ ! -f tests/.test_logs/summary.tsv ] || cp tests/.test_logs/summary.tsv "shard-out/shard-$SHARD.summary.tsv"
+            if [ "$RUN" -eq 0 ]; then
+              make coverage-shard-merge COV_SHARD_PROFDATA="shard-out/shard-$SHARD.profdata" < /dev/null
+            fi
+            ls -l shard-out
+            # the build, the raw profiles and the logs stay in the VM (the copyback takes the whole workspace)
+            rm -rf coverage_raw tests/.test_logs signer/node_modules webadmin/node_modules
+            sh tests/coverage_pack.sh clean cov-bins.tar.zst
+            rm -f cov-bins.tar.zst
+            echo "::endgroup::"
+
+      - name: Upload the results of this part
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cov-shard-${{ matrix.shard }}
+          path: shard-out
+          retention-days: 1
+          if-no-files-found: error
+
+      # the part's own verdict (coverage-gate judges all of them, and runs when this one fails)
+      - name: Result of part ${{ matrix.shard }}/4
+        run: |
+          f=shard-out/shard-${{ matrix.shard }}.status
+          [ -s "$f" ] || { echo "::error title=Coverage suite ${{ matrix.shard }}/4::the suite stopped before it ran the tests (no status file)"; exit 1; }
+          head -n 1 "$f"
+          grep -q '^total=[0-9]* passed=[0-9]* failed=0 ' "$f" || { echo "::error title=Coverage suite ${{ matrix.shard }}/4::failing tests: $(sed -n 's/^failed_tests=//p' "$f")"; exit 1; }
+
+  coverage-gate:
+    name: Coverage gate (FreeBSD 15.1)
+    needs: [coverage-build, coverage-shard]
+    if: always() && needs.coverage-build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download the instrumented build
+        uses: actions/download-artifact@v4
+        with:
+          name: cov-bins
+
+      # the parts that delivered (a part that did not has no artifact: the suite check below names it)
+      - name: Download the results of the parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cov-shard-*
+          path: coverage_shards
+          merge-multiple: true
+
+      - name: Merge, report and gate inside FreeBSD VM
+        uses: vmactions/freebsd-vm@v1.4.8
+        with:
+          release: '15.1'
+          copyback: true
+          run: |
+            set -e
+
+            echo "::group::📦 [Setup] perl5 + LLVM tools matching the base clang"
+            # Base llvm-cov on FreeBSD 15 aborts in "show"; the llvmNN-lite package
+            # provides llvm-covNN / llvm-profdataNN, which the Makefile picks up.
+            V=$(cc --version | sed -n 's/.*clang version \([0-9][0-9]*\).*/\1/p' | head -n 1)
+            pkg install -y perl5 "llvm${V}-lite"
+            sh tests/coverage_pack.sh unpack cov-bins.tar.zst
+            ls coverage_shards
+            echo "::endgroup::"
+
+            echo "::group::🧪 [Coverage] merge the parts and make the report"
+            START=$(date +%s)
+            # the steps of `make coverage` after the suite: the profile data of the parts instead of the raw profiles of one run
+            REPORT=0
+            make coverage-merge-shards coverage-report COV_FROM_SHARDS=1 < /dev/null || REPORT=$?
+            echo "merge and report took $(( $(date +%s) - START ))s"
             echo "::endgroup::"
 
             echo "::group::🚦 [Gate] Phase 2 thresholds"
             GATE=0
             # stdin is the rest of this script (the VM action pipes it to sh): coverage_gate.pl reads a JSON summary from a piped stdin, which ate
             # the lines below ("Failed to parse JSON coverage summary", then "sh: Syntax error: Unterminated quoted string")
-            perl tests/coverage_gate.pl --llvm-cov="llvm-cov${V}" --profdata=coverage.profdata --phase=2 --strict < /dev/null || GATE=$?
+            [ "$REPORT" -ne 0 ] || perl tests/coverage_gate.pl --llvm-cov="llvm-cov${V}" --profdata=coverage.profdata --phase=2 --strict < /dev/null || GATE=$?
+            [ "$REPORT" -eq 0 ] || GATE=$REPORT
             echo "::endgroup::"
 
-            echo "::group::🧪 [Suite] the result of tests/run_all_suite.sh (success only with failed=0)"
+            echo "::group::🧪 [Suite] the status of the parts (success only when all of them ran, every selected test once, with failed=0)"
             SUITE=0
-            make coverage-suite-check < /dev/null || SUITE=$?
+            make coverage-suite-check-shards < /dev/null || SUITE=$?
             echo "::endgroup::"
-            [ "$SUITE" -eq 0 ] || echo "::error title=Test suite::failing tests: $(sed -n 's/^failed_tests=//p' coverage_suite.status)"
+            [ "$SUITE" -eq 0 ] || echo "::error title=Test suite::failing tests or missing parts: $(cat coverage_shards/*.status 2>/dev/null | sed -n 's/^failed_tests=//p' | tr '\n' ' ')"
+            [ "$REPORT" -eq 0 ] || echo "::error title=Coverage report::merging the parts or making the report failed"
             [ "$GATE" -eq 0 ] || echo "::error title=Coverage gate::the phase 2 thresholds are not met"
+            # the build and the profiles stay in the VM (the copyback takes the whole workspace)
+            sh tests/coverage_pack.sh clean cov-bins.tar.zst
+            rm -f cov-bins.tar.zst
             [ "$GATE" -eq 0 ] && [ "$SUITE" -eq 0 ]
 
       - name: Upload HTML coverage report
@@ -594,3 +813,19 @@ jobs:
           name: coverage-html
           path: coverage_html
           if-no-files-found: warn
+
+      # the times of this run's tests: tests/suite_durations.sh turns them into tests/suite_durations.tsv (tests/TEST_MATRIX.md, "Shards")
+      - name: The times of the tests of this run
+        if: always()
+        run: |
+          mkdir -p durations
+          if ls coverage_shards/*.summary.tsv >/dev/null 2>&1; then sh tests/suite_durations.sh coverage_shards/*.summary.tsv > durations/suite_durations.tsv; fi
+
+      - name: Upload the times of the tests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: suite-durations
+          path: durations
+          retention-days: 30
+          if-no-files-found: ignore
