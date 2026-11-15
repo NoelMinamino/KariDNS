@@ -29,10 +29,18 @@ void ma_estimate(const ma_in_t *in, ma_est_t *e) {
     memset(e, 0, sizeof(*e));
     e->zones = in->zones;
     e->limit = in->limit;
+    const bool st = in->store_mode != MA_STORE_NONE;
+    uint64_t avg_image = 0;                                    /* the store knows it (stored images / stored bytes) */
     if (in->have_records) {
         e->basis = MA_BASIS_RECORDS;
         e->records = in->records;
         e->counted_all = in->zones * MA_ZONE_BASE + in->records * MA_RECORD;
+    } else if (st && in->stored_zones > 0 && in->stored_image_bytes > 0 && (in->stored_zones >= MA_SAMPLE_ZONES || in->stored_zones >= in->zones)) {
+        /* the store counts its images: a zone's size is measured, whether or not the zone is in memory (the zones in memory are the busy ones; the store has every zone it has stored) */
+        e->basis = MA_BASIS_STORE;
+        avg_image = in->stored_image_bytes / in->stored_zones;
+        e->counted_all = in->zones * (MA_ZONE_BASE + avg_image);
+        e->records = in->zones * avg_image / MA_RECORD;
     } else if (in->zones > 0 && in->resident_zones > 0 && in->resident_bytes > 0 && (in->resident_zones >= MA_SAMPLE_ZONES || in->resident_zones >= in->zones)) {
         /* the zones that are in memory say how big a zone is: the zones asked for are the busy ones, so this can err on either side; the average is
          * not trusted from fewer than MA_SAMPLE_ZONES zones, unless they are all of them */
@@ -46,9 +54,16 @@ void ma_estimate(const ma_in_t *in, ma_est_t *e) {
         e->counted_all = in->zones * MA_ZONE_BASE + e->records * MA_RECORD;
     }
     e->avg_zone = in->zones ? e->counted_all / in->zones : 0;
-    e->directory = in->zones * MA_DIR_PER_ZONE;
-    e->backend_all = MA_FIXED_ALL + in->zones * MA_RSS_ZONE_BASE + e->records * MA_RSS_RECORD;
-    e->loader_all = MA_LOADER_FIXED + in->zones * MA_LOADER_ZONE_ALL;
+    /* With the store (0.7): the directory is the store's tables, file pages and not heap; the loader holds no table of the zones; and in MAP mode the image of a zone in memory is a file page
+     * too, so the Backend's heap is the rest of the counted bytes (the image's share of them: measured when the store has said, MA_STORE_IMAGE_PCT before) */
+    const uint64_t imgpct = st && in->store_mode == MA_STORE_MAP ? (avg_image ? avg_image * 100 / (MA_ZONE_BASE + avg_image) : MA_STORE_IMAGE_PCT) : 0;
+    const uint64_t img_all = e->counted_all / 100 * imgpct;
+    e->copy_mode = in->store_mode == MA_STORE_COPY;
+    e->directory = st ? 0 : in->zones * MA_DIR_PER_ZONE;
+    e->tables = st ? in->zones * MA_STORE_TABLE_PER_ZONE : 0;
+    e->mapped = st ? e->tables + img_all : 0;
+    e->backend_all = st ? MA_FIXED_ALL + (e->counted_all - img_all) : MA_FIXED_ALL + in->zones * MA_RSS_ZONE_BASE + e->records * MA_RSS_RECORD;
+    e->loader_all = st ? MA_LOADER_STORE : MA_LOADER_FIXED + in->zones * MA_LOADER_ZONE_ALL;
     e->recommended = round_up(e->counted_all / 100 * MA_HEADROOM_PCT, MA_ROUND);
     e->working_min = round_up(e->counted_all / MA_HIGH_MARK_PCT * MA_WORKING_PCT, MA_ROUND);
     uint64_t need_zones = (in->fetch_conc > MA_MIN_FETCH_ZONES ? in->fetch_conc : MA_MIN_FETCH_ZONES) * MA_FETCH_FACTOR;
@@ -58,8 +73,11 @@ void ma_estimate(const ma_in_t *in, ma_est_t *e) {
     if (in->limit == 0 || in->zones == 0) return;
     uint64_t fit = in->limit / 100 * MA_HIGH_MARK_PCT;
     e->fit_pct = e->counted_all == 0 || fit >= e->counted_all ? 100 : (uint32_t)(fit * 100 / e->counted_all);
-    e->backend_limit = MA_FIXED_LIMIT + e->directory + (fit < e->counted_all ? fit : e->counted_all);
-    e->loader_limit = MA_LOADER_FIXED + in->zones * MA_LOADER_ZONE_LIM;
+    const uint64_t kept = fit < e->counted_all ? fit : e->counted_all;
+    const uint64_t kept_img = kept / 100 * imgpct;
+    e->backend_limit = MA_FIXED_LIMIT + e->directory + (kept - kept_img);
+    e->loader_limit = st ? MA_LOADER_STORE : MA_LOADER_FIXED + in->zones * MA_LOADER_ZONE_LIM;
+    if (st) e->mapped = e->tables + kept_img;
     if (e->fit_pct >= 100) e->level = MA_LEVEL_INFO;
     else if (fit < need_zones * e->avg_zone) e->level = MA_LEVEL_ERROR;
     else if (e->fit_pct < MA_WORKING_PCT) e->level = MA_LEVEL_WARNING;
@@ -96,6 +114,7 @@ size_t ma_fmt_size(char *buf, size_t n, uint64_t bytes) {
 static const char *basis_text(const ma_est_t *e, char *b, size_t n) {
     if (e->basis == MA_BASIS_RECORDS) snprintf(b, n, "%" PRIu64 " records counted in the database", e->records);
     else if (e->basis == MA_BASIS_RESIDENT) snprintf(b, n, "%" PRIu64 " B a zone on average, from the zones in memory", e->avg_zone);
+    else if (e->basis == MA_BASIS_STORE) snprintf(b, n, "%" PRIu64 " B a zone on average, from the images in the store", e->avg_zone);
     else snprintf(b, n, "assumed %d records a zone: the zones in memory are too few to tell", MA_ASSUMED_RECORDS);
     return b;
 }

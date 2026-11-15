@@ -1,6 +1,8 @@
 #ifndef DNS_DB_STORE_H
 #define DNS_DB_STORE_H
 
+#include "dns_mem_advice.h"
+
 /*
  * dns_db_store - the zone store in the server (0.7 store S2 and S3; design: planning/planing_0.7.x_store_10m_design.md sections 2.1, 2.2, 3.4, 4.1, 4.2).
  *
@@ -25,7 +27,7 @@
  *   - Attach.  A query for a zone whose record is stored and that is not in memory is not fetched from the loader: the worker parks it with the attach deadline
  *     (200 ms) and asks the store threads; a store thread reads the image (MAP: a pointer into the mapped segment; COPY: a buffer), checks it (the store's
  *     checksum, the whole structure: zone_image_validate(), at every attach - the checksum is not keyed and detects damage, not a forgery; the apex name),
- *     makes the entry like an install does (zone_install_version(), dbreg_commit_attach(): conditional on the version the record offered) and wakes the
+ *     makes the entry like an install does (zone_install_version(), dbreg_attach_store(): the element and the commit in one section of the registry's lock) and wakes the
  *     parked queries.  A record that is missing, stale or damaged falls back to the fetch (the queries that wait are given the park-timeout again).  The version
  *     of an attached zone counts for memory-limit with its image: the mapped bytes (MAP) or the buffer (COPY), the same number when the version is counted and when it
  *     is given back.  Detaching is the eviction of the cache manager (the record stays in the store); a MAP version keeps its segment mapped until the version is
@@ -76,8 +78,6 @@ store_t *db_store_handle(void);
 
 /* a batch ended: what it wrote to the store is made durable (group commit) */
 void db_store_batch_end(void);
-/* compatibility of the tests of S2 (the writes are made by the thread that installs the zone now: nothing is queued) */
-bool db_store_sync(int timeout_ms);
 
 /* ---- 0.7 WP7b: the loader's manifest and change entries against the store (the ingest thread; store design 5.3, 5.4) ----
  *
@@ -166,6 +166,10 @@ extern void (*db_store_test_commit_hook)(int where, const char *zone);
 
 /* the attach of one request, on the calling thread (what a store thread does with every request; a test calls it too; the zone with its trailing dot) */
 void db_store_attach_zone(const char *view, const char *zone);
+/* 0.7 D6: what the store tells the memory advice (dns_mem_advice.h): its mode and the size of the images it holds (the size of a zone is measured, not assumed); nothing is changed when there is no store */
+void db_store_ma_inputs(ma_in_t *in);
+/* a first fill is going on: the reconcile has zones without an image and a pass or the background fetch of their bodies is running.  The server's own notices about the traffic ("memory-limit is too small") wait for it. */
+bool db_store_filling(void);
 #ifdef KARIDNS_UNIT_TEST
 extern int db_store_test_set_fail;                      /* the n-th set_put_slot() of the settings table fails (0: off) */
 extern int db_store_test_attach_reserve_fail;           /* the n-th reserve of room in the attach table fails (0: off) */

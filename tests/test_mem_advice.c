@@ -451,7 +451,25 @@ static void test_runtime(void) {
     CHECK(p == LOG_WARNING && strlen(small) < sizeof(small), "cut text: %s", small);
 }
 
+/* the ZFS sum: the Backend's heap, the ARC, the loader and a gigabyte for the system have to fit in RAM */
+static void test_arc(void) {
+    ma_arc_t a;
+    char t[512];
+    ma_arc_sum(2ull << 30, 4ull << 30, 20ull << 20, 16ull << 30, &a);
+    CHECK(a.level == MA_LEVEL_INFO && a.total == (2ull << 30) + (4ull << 30) + (20ull << 20) + MA_ARC_OTHER && a.pct == 43 && a.arc_fit == (16ull << 30) - (2ull << 30) - (20ull << 20) - MA_ARC_OTHER, "arc fits: level %d pct %u", a.level, a.pct);
+    CHECK(ma_text_arc(t, sizeof(t), &a) > 0 && strstr(t, "memory on ZFS") && !strstr(t, "lower vfs.zfs.arc.max"), "arc text %s", t);
+    ma_arc_sum(2ull << 30, 12ull << 30, 20ull << 20, 16ull << 30, &a);
+    CHECK(a.level == MA_LEVEL_NOTICE && ma_text_arc(t, sizeof(t), &a) > 0 && strstr(t, "little is left over"), "arc notice: %s", t);
+    ma_arc_sum(2ull << 30, 16ull << 30, 20ull << 20, 16ull << 30, &a);
+    CHECK(a.level == MA_LEVEL_WARNING && ma_text_arc(t, sizeof(t), &a) > 0 && strstr(t, "lower vfs.zfs.arc.max"), "arc warning: %s", t);
+    ma_arc_sum(2ull << 30, 16ull << 30, 20ull << 20, 0, &a);          /* the RAM is not known: nothing to compare with */
+    CHECK(a.level == MA_LEVEL_INFO && a.pct == 0 && a.arc_fit == 0, "arc without ram");
+    ma_arc_sum(20ull << 30, 16ull << 30, 20ull << 20, 1ull << 30, &a);   /* the rest alone does not fit */
+    CHECK(a.arc_fit == 0 && a.level == MA_LEVEL_WARNING, "arc rest does not fit");
+}
+
 int main(void) {
+    test_arc();
     test_w9_points();
     test_bases();
     test_levels();

@@ -191,6 +191,8 @@ typedef struct {
   bool parked, resume_pending, not_ready_now;
   uint16_t resume_len;
   int64_t park_deadline_ms;         /* of the request that was parked first (0: none); a second park of the same request keeps it */
+  int32_t park_idx;                 /* the handle of the parked entry (park_tcp()'s index and the entry's generation), valid while `parked`: the close takes the entry without a search */
+  uint32_t park_gen;
   /* AXFR/IXFR-in (handle_axfr_event): max-transfer-time-in as a wall-clock time_t (0 = none).  read_dns_tcp_message() gives up when it is
    * passed, also inside one message: SO_RCVTIMEO restarts on every recv(), so a primary dripping bytes would never time out */
   time_t read_deadline;
@@ -895,8 +897,6 @@ static inline const char *zref_name(const zref_t *z) { return z->el ? z->el->nam
 static inline uint8_t zref_state(const zref_t *z) {
   return z->el ? atomic_load_explicit((const _Atomic uint8_t *)&z->el->state, memory_order_acquire) : (uint8_t)ZDIR_ST_ABSENT;
 }
-/* the serial of a zone out of memory: the element's, or the store record's */
-static inline uint32_t zref_serial(const zref_t *z) { return z->el ? atomic_load_explicit(&z->el->serial, memory_order_relaxed) : z->serial; }
 /* the settings (allow-query, allow-transfer ...) of a zone that is not in memory: the element's, or the interned block of the store's settings id; NULL: none.  Read section only. */
 zone_ext_shared_t *zref_settings(const zref_t *z);
 /* a walk of the attach table in a read section that starts again when the table grows (fn returns false: stop, the walk returns false) */
@@ -1190,6 +1190,7 @@ int zone_limits_gate(zone_db_entry_t *entry, zone_arena_t *builder, const char *
  * (DB のゾーンは dbcfg)。entry は view_name、domain、source (と DB のゾーンなら dbcfg) だけを読む */
 void build_zone_response_cache(zone_version_t *ver, server_config_t *cfg, const zone_db_entry_t *entry);
 void zone_glue_refresh_dependents(bool force);
+bool zone_glue_thread_start(void);   /* 0.7 store: the thread that runs zone_glue_refresh_dependents(false) every few milliseconds (the control thread no longer does) */
 /* 0.7 (B1): what the entry itself costs in memory (its block, its lock, a database zone's settings), counted with its first resident version (dns_snapshot_rcu.c) */
 uint32_t zone_entry_fixed_now(const zone_db_entry_t *e);
 /* 0.7 (B2): a zone that became reachable by `domain` in `view` (a first publication, an entry that came into the index): the next zone_glue_refresh_dependents()
@@ -1513,26 +1514,22 @@ bool dbreg_test_evict(const char *view, const char *name);        /* TEST ONLY, 
 enum { DBREG_FETCH_STARTED = 0, DBREG_FETCH_RESIDENT, DBREG_FETCH_BUSY, DBREG_FETCH_NONE };
 int dbreg_fetch_begin(const char *view, const char *zone);
 void dbreg_fetch_end(const char *view, const char *zone);
-/* 0.7 store S2 (dns_db_store.c): an attach makes the entry of a zone that is out of memory from the store's record instead of asking the loader.  dbreg_attach_begin():
- * as dbreg_fetch_begin() (ABSENT -> LOADING under the registry lock; DBREG_ATT_STARTED), and gives what the directory knows of the version it offers (its source id, serial, digest
- * unless the element has none yet: digest_set false) and a reference of the zone's settings (info->sh, NULL = none; give it back with zone_ext_shared_unref()).  The attach
- * ends like a fetch: dbreg_commit() (the entry is made) or dbreg_fetch_end().  DBREG_ATT_RESIDENT: in memory already; BUSY: a fetch or an attach is on its way; NOT: not a zone to
- * attach (not in the registry, deleted, hidden, rejected, shared).  dbreg_pin_entry(): the entry of a zone in memory, held (a reference and active_axfr) until xfr_entry_release();
+/* 0.7 store S2 (dns_db_store.c): an attach makes the entry of a zone that is out of memory from the store's record instead of asking the loader.  The store thread reads the record and
+ * the image before it takes the registry's lock, makes the entry, and dbreg_attach_store() does the rest in ONE section of the lock: the zone's element (LOADING, from the record) and the
+ * commit of the entry (the record is looked at once more inside the lock).  DBREG_ATT_STARTED: the entry is the zone's now; RESIDENT: in memory already; BUSY: a fetch or an attach is on its way; STALE: the record
+ * is not the one the caller read (read it again); NOT: not a zone to attach (an element of another kind, out of memory): the caller keeps its entry.  dbreg_pin_entry(): the entry of a zone in memory, held (a reference and active_axfr) until xfr_entry_release();
  * the store's write-through keeps the version it copies from going away with it.  dbreg_set_evict_hook(): called, with the registry lock held, for every zone taken out of memory,
  * with DBREG_EVICT_* (the counters of `karictl store`; the hook must not lock). */
-enum { DBREG_ATT_STARTED = 0, DBREG_ATT_RESIDENT, DBREG_ATT_BUSY, DBREG_ATT_NOT };
-typedef struct {
+enum { DBREG_ATT_STARTED = 0, DBREG_ATT_RESIDENT, DBREG_ATT_BUSY, DBREG_ATT_NOT, DBREG_ATT_STALE };
+typedef struct {                 /* what the commit checks against the element (dbreg_offered_still_locked()) */
   int64_t source_id;
   uint32_t serial;
   uint16_t flags;
   bool digest_set;
+  bool bg;                       /* nobody waits for the zone: it goes first when memory-limit needs room */
   uint8_t digest[32];
-  zone_ext_shared_t *sh;
 } dbreg_attach_info_t;
-int dbreg_attach_begin(const char *view, const char *zone, dbreg_attach_info_t *info);
-/* the commit of an attach (a new entry): dbreg_commit() on the condition, checked under the registry's lock, that the zone still has no entry and still offers the version
- * `offered` (source id, serial, digest when set).  -1: not made (out of memory, or the offer changed); the caller keeps the entry. */
-int dbreg_commit_attach(const char *view, const char *name, zone_db_entry_t *entry, const dbreg_attach_info_t *offered, const uint8_t digest[32], bool *shadowed);
+int dbreg_attach_store(const char *view, const char *name, const dbdir_rec_t *rec, zone_db_entry_t *entry, bool bg);
 zone_db_entry_t *dbreg_pin_entry(const char *view, const char *zone);
 enum { DBREG_EVICT_OTHER = 0, DBREG_EVICT_LIMIT, DBREG_EVICT_ROOM };
 void dbreg_set_evict_hook(void (*cb)(int reason));

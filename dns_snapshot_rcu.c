@@ -2215,7 +2215,7 @@ typedef struct glue_arrival_s {
   char view[KARIDNS_VIEW_NAME_MAX];
   char domain[];
 } glue_arrival_t;
-#define GLUE_ARRIVALS_MAX 16384
+#define GLUE_ARRIVALS_MAX 262144       /* (about 30 MB when the thread is that far behind: it works through them in a few tens of milliseconds, an attach burst of 100,000 zones a second never gets near this) */
 static _Atomic(glue_arrival_t *) g_glue_arrivals;
 static _Atomic uint32_t g_glue_arrival_count;
 static _Atomic uint64_t g_glue_walks, g_glue_targeted, g_glue_targeted_zones;
@@ -2318,7 +2318,7 @@ static void glue_walk_reset(void *ud) {                      /* (the table grew:
  * directory: the zones that can use it as a sibling are the zones that contain its name, and, through g_glue_filter, the zones with a target outside their
  * apex at that name or below it.  The walk (every zone of every view, as before) stays for what has no name: a zone that left, a zone that others
  * take glue from, force, a list that overflowed, and a name that the filter cannot clear. */
-void zone_glue_refresh_dependents(bool force) {
+static void glue_refresh_dependents(bool force) {
   bool full = atomic_exchange_explicit(&g_glue_dirty, false, memory_order_acq_rel) || force;
   glue_arrival_t *arr = atomic_exchange_explicit(&g_glue_arrivals, NULL, memory_order_acquire);
   if (arr) atomic_store_explicit(&g_glue_arrival_count, 0, memory_order_relaxed);
@@ -2368,7 +2368,12 @@ void zone_glue_refresh_dependents(bool force) {
   } else {
     atomic_fetch_add_explicit(&g_glue_targeted, 1, memory_order_relaxed);
     rcu_aux_read_lock();
+    unsigned slice = 0;
     for (glue_arrival_t *a = arr; a && !oom; a = a->next) {
+      if (++slice % 256 == 0) {                      /* (an attach burst brings tens of thousands of names: the read section is left now and then, so that it does not hold up the grace period of everything else) */
+        rcu_aux_read_unlock();
+        rcu_aux_read_lock();
+      }
       view_snapshot_t *owner = snapshot_find_view(snap, a->view);
       if (!owner) continue;                          /* (the view is gone: its zones with it) */
       /* The views that have the new zone: the view that holds it, and every view that shares it from there by in-view (an element of its own that holds the owner's
@@ -2421,6 +2426,37 @@ void zone_glue_refresh_dependents(bool force) {
   }
   free(todo);
   release_zone_snapshot(snap);
+}
+
+/* The glue of the zones that others take glue from is looked at again by a thread of its own (0.7 store): the control thread answers karictl, and an attach burst brings tens of
+ * thousands of names a second, which the targeted look of each costs a few microseconds: with this on the control thread `karictl store` waited seven seconds behind it at a million
+ * zones.  The thread looks every GLUE_TICK_MS; the work is the same function, one run at a time (a reload of the configuration calls it from the control thread too). */
+static pthread_mutex_t g_glue_run = PTHREAD_MUTEX_INITIALIZER;
+void zone_glue_refresh_dependents(bool force) {
+  pthread_mutex_lock(&g_glue_run);
+  glue_refresh_dependents(force);
+  pthread_mutex_unlock(&g_glue_run);
+}
+
+#define GLUE_TICK_MS 20
+static pthread_t g_glue_tid;
+static bool g_glue_started;
+static void *glue_thread(void *arg) {
+  (void)arg;
+  rcu_aux_thread_pin();
+  for (;;) {                                        /* runs until the Backend ends with _exit(); nothing joins or stops it */
+    zone_glue_refresh_dependents(false);
+    struct timespec ts = { 0, GLUE_TICK_MS * 1000000L };
+    nanosleep(&ts, NULL);
+  }
+  return NULL;
+}
+
+bool zone_glue_thread_start(void) {
+  if (g_glue_started) return true;
+  if (pthread_create(&g_glue_tid, NULL, glue_thread, NULL) != 0) return false;
+  g_glue_started = true;
+  return true;
 }
 
 /* ゾーン外レコードのログ。1回の読み込みで出す行数を制限し、残りは件数だけにする。 */
@@ -3602,8 +3638,9 @@ static void zdir_elem_sync(zdir_elem_t *z, zone_db_entry_t *entry) {
 }
 
 static bool apex_replace_locked(dbreg_zone_t *z, zdir_apex_t *apex);
+static void mark_loaded_locked(dbreg_zone_t *z, bool bg);
 
-/* what dbreg_commit_attach() asks of the directory's element at the moment of the commit: the version the attach read the store's record for */
+/* what dbreg_attach_store() asks of the directory's element at the moment of the commit: the version the attach read the store's record for */
 static bool dbreg_offered_still_locked(const dbreg_zone_t *z, const dbreg_attach_info_t *o) {
     return z && !(z->flags & ZDIR_F_DELETED) && !zdir_entry(z) && z->source_id == o->source_id && zdir_serial(z) == o->serial &&
            (!o->digest_set || (z->digest && memcmp(z->digest, o->digest, 32) == 0));
@@ -3710,9 +3747,9 @@ static void store_elem_drop_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
 /* The commit of an install or an attach of a store zone.  -2: the store did not take the zone (the caller registers it as a zone of the heap directory); -1 as dbreg_commit().
  * `*cold`: the zone was written to the store and is not kept in memory (the entry is freed here: a first fill that is over the limit). */
 static int dbreg_commit_store(const char *view, const char *name, zone_db_entry_t *entry, bool created, int64_t source_id, uint32_t serial, const uint8_t digest[32],
-                              bool *shadowed, const dbreg_attach_info_t *offered) {
+                              bool *shadowed, const dbreg_attach_info_t *offered, bool locked, bool sh_cfg_in) {
     const dbdir_ops_t *ops = dbdir();
-    const bool sh_cfg = dbreg_config_shadows(view, name);
+    const bool sh_cfg = locked ? sh_cfg_in : dbreg_config_shadows(view, name);
     uint32_t zid = ZREF_NOZID;
     dbdir_rec_t prev;
     bool had_rec = false;
@@ -3737,7 +3774,7 @@ static int dbreg_commit_store(const char *view, const char *name, zone_db_entry_
     int rc = -1;
     bool err_sink = false;                                  /* the text of the zone is forgotten in the file ring too: after the lock (dbreg_err_forget()) */
     uint32_t err_zid = ZREF_NOZID;
-    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    if (!locked) pthread_mutex_lock(&g_zone_db_rebuild_lock);       /* (locked: the caller holds it, and has made the element of the zone: dbreg_attach_store()) */
     const bool sh_cat = !sh_cfg && dbreg_catalog_member_locked(view, name);
     const bool sh = sh_cfg || sh_cat;
     dbreg_view_t *rv = dbreg_view_get(view, true);
@@ -3833,10 +3870,15 @@ static int dbreg_commit_store(const char *view, const char *name, zone_db_entry_
     if (alias_touch) alias_notify();
     if ((z->flags & ZDIR_F_NOTIFY_DUE) || (created && !cur && had_version && old_serial != serial && !sh)) (void)nrn_queue_locked(z, rv->name);
     if (z->flags & ZDIR_F_EVICT_NEXT) cache_note_next(z);
+    if (offered && offered->bg) mark_loaded_locked(z, true);          /* (nobody waits for this zone: it goes first when memory-limit needs room) */
     err_sink = dbreg_err_forget(rv->name, z->name);
     err_zid = (z->kind & ZDIR_K_STORED) ? z->zid : ZREF_NOZID;
     rc = 0;
 out:
+    if (rc != 0 && locked && rv) {                          /* (the attach made the element: it is not kept when the commit did not take it) */
+        dbreg_zone_t *dz = dbreg_find(rv, name, zdir_name_hash(name));
+        if (dz && (dz->kind & ZDIR_K_STORED) && !zdir_entry(dz) && atomic_load_explicit(&dz->state, memory_order_relaxed) == ZDIR_ST_LOADING) store_elem_drop_locked(rv, dz);
+    }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     if (err_sink) dbreg_err_sink_clear(err_zid);
     if (shadowed) *shadowed = sh;
@@ -3845,7 +3887,7 @@ out:
 }
 
 static int dbreg_commit_x(const char *view, const char *name, zone_db_entry_t *entry, bool created, int64_t source_id,
-                          uint32_t serial, const uint8_t digest[32], bool *shadowed, const dbreg_attach_info_t *offered) {
+                          uint32_t serial, const uint8_t digest[32], bool *shadowed) {
     if (dbdir() && store_zone_entry(entry)) {
         /* the zone goes to the store unless a zone of the heap directory has this name already (one that the store could not take earlier): that one stays as it is */
         bool legacy = false;
@@ -3855,7 +3897,7 @@ static int dbreg_commit_x(const char *view, const char *name, zone_db_entry_t *e
         legacy = lz && !(lz->kind & ZDIR_K_STORED) && dbreg_zone_known(lz);
         pthread_mutex_unlock(&g_zone_db_rebuild_lock);
         if (!legacy) {
-            int sr = dbreg_commit_store(view, name, entry, created, source_id, serial, digest, shadowed, offered);
+            int sr = dbreg_commit_store(view, name, entry, created, source_id, serial, digest, shadowed, NULL, false, false);
             if (sr != -2) return sr;
         }
     }
@@ -3869,7 +3911,6 @@ static int dbreg_commit_x(const char *view, const char *name, zone_db_entry_t *e
     if (!rv) goto out;
     uint32_t h = zdir_name_hash(name);
     dbreg_zone_t *z = dbreg_find(rv, name, h);
-    if (offered && !dbreg_offered_still_locked(z, offered)) goto out;      /* (an attach: a summary or a delete came after the store's record was read; nothing is changed) */
     bool fresh = false;
     if (!z) {
         if (!(z = dbreg_add(rv, name, h))) goto out;
@@ -3974,14 +4015,7 @@ out:
 
 int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, bool created, int64_t source_id,
                  uint32_t serial, const uint8_t digest[32], bool *shadowed) {
-    return dbreg_commit_x(view, name, entry, created, source_id, serial, digest, shadowed, NULL);
-}
-
-/* 0.7 store S2 (L3): the commit of an attach, conditional on what the directory offers at the moment of the commit (under the lock of the registry, so a summary of
- * the ingest thread cannot come between the check and the store): the zone has no entry and still has the source id, the serial and (when it has one) the digest that the
- * attach was started with.  -1 (also when the offer changed: nothing was changed, the caller keeps its entry). */
-int dbreg_commit_attach(const char *view, const char *name, zone_db_entry_t *entry, const dbreg_attach_info_t *offered, const uint8_t digest[32], bool *shadowed) {
-    return dbreg_commit_x(view, name, entry, true, offered->source_id, offered->serial, digest, shadowed, offered);
+    return dbreg_commit_x(view, name, entry, created, source_id, serial, digest, shadowed);
 }
 
 /* A zone of a batch that is not kept in memory because the limit is reached (design 3.3, 8.3): the directory element with the serial, the digest and
@@ -4179,6 +4213,63 @@ static void rec_busy_pause(void) {
     struct timespec ts = { 0, 100000 };
     nanosleep(&ts, NULL);
 }
+
+/* 0.7 store S2 (L3), one section of the registry lock for the whole attach: the zone's element is made (LOADING, from the store's record that the caller read before the lock) and the
+ * new entry is committed to it, as dbreg_commit() commits an install, under the one lock, so that nothing can come between (a summary of the ingest thread, a delete, a fetch: they
+ * see the zone with no element, or resident).  Before this the attach took the lock for the begin, for the check of a heap zone of the same name, for the commit and for the touch, and the
+ * begin read the record under it (a fault on the table's page held every attach and the ingest thread up).  The record is looked at once more inside the lock, by name, a few hundred
+ * nanoseconds because the cells were read a moment ago: a delete, or a newer version, that came after the caller read it is seen here (a delete that comes later finds the element and
+ * takes it away).
+ * DBREG_ATT_STARTED: the entry is the zone's now (the caller must not free it); RESIDENT: the zone is in memory already; BUSY: a fetch or another attach is on its way (it wakes the
+ * queries); STALE: the record is not the one the caller read (read it again); NOT: not a zone to attach (an element of another kind, out of memory): the caller keeps its entry, and the
+ * zone is read from the database.  bg: nobody waits for the zone (a CNAME or glue target): it is marked to go first when memory-limit needs room (dbreg_bg_loaded()). */
+int dbreg_attach_store(const char *view, const char *name, const dbdir_rec_t *rec, zone_db_entry_t *entry, bool bg) {
+    const dbdir_ops_t *ops = dbdir();
+    if (!ops || !store_zone_entry(entry)) return DBREG_ATT_NOT;
+    dbreg_attach_info_t offered;
+    memset(&offered, 0, sizeof(offered));
+    offered.source_id = rec->source_id;
+    offered.serial = rec->serial;
+    offered.bg = bg;
+    memcpy(offered.digest, rec->digest, 32);
+    for (int i = 0; i < 32; i++) offered.digest_set |= offered.digest[i] != 0;
+    const bool sh_cfg = dbreg_config_shadows(view, name);               /* (the configuration's snapshot is not taken under the registry lock) */
+    for (int attempt = 0;; attempt++) {
+        pthread_mutex_lock(&g_zone_db_rebuild_lock);
+        dbreg_view_t *rv = dbreg_view_get(view, true);
+        dbreg_zone_t *z = rv ? dbreg_find(rv, name, zdir_name_hash(name)) : NULL;
+        if (!rv) {
+            pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+            return DBREG_ATT_NOT;
+        }
+        if (z) {                                                        /* (an element of the name that is not resident and not LOADING is not the store's to attach over) */
+            int rc = zdir_entry(z) ? DBREG_ATT_RESIDENT : atomic_load_explicit(&z->state, memory_order_relaxed) == ZDIR_ST_LOADING ? DBREG_ATT_BUSY : DBREG_ATT_NOT;
+            pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+            return rc;
+        }
+        dbdir_rec_t cur;
+        const int gr = rec_get_locked(ops, view, name, &cur);
+        if (gr < 0) {                                                   /* (a cell of the store is being written: not now) */
+            pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+            if (attempt >= REC_BUSY_TRIES) return DBREG_ATT_STALE;
+            rec_busy_pause();
+            continue;
+        }
+        if (gr == 0 || cur.state != 2 /* STORE_STATE_STORED */ || cur.zid != rec->zid || cur.serial != rec->serial || cur.source_id != rec->source_id || memcmp(cur.digest, rec->digest, 32) != 0) {
+            pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+            return DBREG_ATT_STALE;
+        }
+        z = store_elem_make_locked(rv, view, name, rec);
+        if (!z) {
+            pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+            return DBREG_ATT_NOT;
+        }
+        bool shadowed = false;
+        /* the commit unlocks (and drops the element it was given when it does not take the entry) */
+        if (dbreg_commit_store(view, name, entry, true, offered.source_id, offered.serial, offered.digest_set ? offered.digest : rec->digest, &shadowed, &offered, true, sh_cfg) != 0) return DBREG_ATT_NOT;
+        return DBREG_ATT_STARTED;
+    }
+}
 bool dbreg_err_get_locked(const char *view, const char *zone, uint32_t zid, char *out, size_t cap) {
     uint64_t stamp = 0;
     const dbdir_ops_t *ops = dbdir();
@@ -4236,77 +4327,6 @@ void dbreg_fetch_end(const char *view, const char *zone) {
         else atomic_store_explicit(&z->state, ZDIR_ST_ABSENT, memory_order_release);
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
-}
-
-/* ---- 0.7 store S2: an attach reads the zone from the store instead of asking the loader (dns_db_store.c) ---- */
-
-/* As dbreg_fetch_begin(), and what the attach has to know of the directory's element: the version it offers (source id, serial, digest) and the settings of the zone, read
- * under the registry lock.  DBREG_ATT_STARTED: the zone is ABSENT and is LOADING now (end it with dbreg_fetch_end() when the attach did not make an entry); RESIDENT: it is
- * in memory already; BUSY: a fetch or another attach is on its way; NOT: not a zone to attach (not in the registry, deleted, hidden, an error state, no data to speak of).
- * info->sh holds a reference of the settings (the caller gives it back with zone_ext_shared_unref()), NULL = the zone has none. */
-int dbreg_attach_begin(const char *view, const char *zone, dbreg_attach_info_t *info) {
-    int rc = DBREG_ATT_NOT;
-    for (int attempt = 0;; attempt++) {
-        rc = DBREG_ATT_NOT;
-        memset(info, 0, sizeof(*info));
-        pthread_mutex_lock(&g_zone_db_rebuild_lock);
-        dbreg_view_t *rv = dbreg_view_get(view, false);
-        dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
-        const dbdir_ops_t *dops = dbdir();
-        dbdir_rec_t drec;
-        int gr = !z && dops ? rec_get_locked(dops, view, zone, &drec) : 0;
-        if (gr < 0) {                                                  /* (a cell of the store is being written: not now) */
-            pthread_mutex_unlock(&g_zone_db_rebuild_lock);
-            if (attempt >= REC_BUSY_TRIES) return DBREG_ATT_BUSY;
-            rec_busy_pause();
-            continue;
-        }
-        if (gr > 0 && drec.state == 2 /* STORE_STATE_STORED */) {      /* 0.7 S3: a zone of the store that is not in memory: an element for the attach */
-            if (!rv) rv = dbreg_view_get(view, true);
-            z = rv ? store_elem_make_locked(rv, view, zone, &drec) : NULL;
-            if (z) {
-                info->source_id = z->source_id;
-                info->serial = zdir_serial(z);
-                info->flags = z->flags;
-                memcpy(info->digest, z->digest, 32);
-                for (int i = 0; i < 32; i++) info->digest_set |= info->digest[i] != 0;
-                zone_ext_shared_t *sh = drec.settings ? dops->settings(drec.settings) : NULL;
-                if (drec.settings && !sh) {                           /* (the settings text of the record is not known: the zone is fetched from the database, which sends them) */
-                    store_elem_drop_locked(rv, z);
-                    rc = DBREG_ATT_NOT;
-                } else {
-                    if (sh) zone_ext_shared_ref(sh);
-                    info->sh = sh;
-                    rc = DBREG_ATT_STARTED;
-                }
-            }
-            pthread_mutex_unlock(&g_zone_db_rebuild_lock);
-            return rc;
-        }
-        if (z && !(z->flags & ZDIR_F_DELETED) && !z->shadowed && (z->kind & (ZDIR_K_STATIC | ZDIR_K_SHARED | ZDIR_K_BORROWED)) == 0) {
-            uint8_t st = atomic_load_explicit(&z->state, memory_order_relaxed);
-            if (zdir_entry(z)) {
-                rc = DBREG_ATT_RESIDENT;
-            } else if (st == ZDIR_ST_LOADING) {
-                rc = DBREG_ATT_BUSY;
-            } else if (st == ZDIR_ST_ABSENT && z->last_result == DBREG_APPLIED) {
-                info->source_id = z->source_id;
-                info->serial = zdir_serial(z);
-                info->flags = z->flags;
-                if (z->digest) {
-                    memcpy(info->digest, z->digest, 32);
-                    for (int i = 0; i < 32; i++) info->digest_set |= info->digest[i] != 0;
-                }
-                zone_ext_shared_t *sh = atomic_load_explicit(&z->sh, memory_order_relaxed);
-                if (sh) zone_ext_shared_ref(sh);
-                info->sh = sh;
-                atomic_store_explicit(&z->state, ZDIR_ST_LOADING, memory_order_release);
-                rc = DBREG_ATT_STARTED;
-            }
-        }
-        pthread_mutex_unlock(&g_zone_db_rebuild_lock);
-        return rc;
-    }
 }
 
 /* The entry of a zone, held (a reference and active_axfr: the cache manager does not take it out of memory) until xfr_entry_release(): the store's write-through keeps the
@@ -4858,10 +4878,7 @@ zone_db_entry_t *dbreg_xfr_acquire(zdir_elem_t *z) {
 
 /* bg: a background fetch brought the zone (BGLOAD: the first to go under memory pressure, kept while there is room); else a transfer (EVICT_NEXT | XFRLOAD:
  * taken out when the transfer is over).  Both count in marked= of karictl dbstatus. */
-static void dbreg_mark_loaded(const char *view, const char *zone, bool bg) {
-    pthread_mutex_lock(&g_zone_db_rebuild_lock);
-    dbreg_view_t *rv = dbreg_view_get(view, false);
-    dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
+static void mark_loaded_locked(dbreg_zone_t *z, bool bg) {
     zone_db_entry_t *e = z ? zdir_entry(z) : NULL;
     /* a zone that queries have been answered from since it came into memory (a query woke it up: the fetch was shared, or it arrived first) is no transfer-only read;
      * qseen is the entry's query counter when the manager last folded it into freq (0 for a new entry) */
@@ -4878,6 +4895,12 @@ static void dbreg_mark_loaded(const char *view, const char *zone, bool bg) {
         }
         atomic_fetch_add_explicit(&g_xfr_marked, 1, memory_order_relaxed);
     }
+}
+
+static void dbreg_mark_loaded(const char *view, const char *zone, bool bg) {
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    mark_loaded_locked(rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL, bg);
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
 }
 

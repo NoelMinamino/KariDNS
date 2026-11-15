@@ -1839,7 +1839,7 @@ static void tcp_client_close(int kq, int client_fd, tcp_stream_ctx_t *ctx_tcp,
                              struct kevent *ev_list, int from, int n_events) {
   struct kevent ev_del[2];
   if (ctx_tcp->parked) {
-    if (t_park_tbl) (void)park_cancel_tcp(t_park_tbl, (uint32_t)(ctx_tcp - g_tcp_pool), ctx_tcp->gen);
+    if (t_park_tbl) (void)park_cancel_tcp(t_park_tbl, ctx_tcp->park_idx, ctx_tcp->park_gen);
     ctx_tcp->parked = false;
   }
   /* READ を先に: 期限切れで消えた ONESHOT タイマーの削除が失敗しても READ は外れる */
@@ -2364,6 +2364,52 @@ static park_plan_t park_plan(const park_table_t *pt, const view_snapshot_t *view
   return p;
 }
 
+/* The request that goes with a parked entry (the entry `pi` of the worker's table, just made by park_udp() / park_tcp()), by what park_plan() said:
+ *   attach  a stored zone that is not in memory: the zone's id in the store goes to the store threads, one request for the zone across the workers (park_att_claim(): the first worker asks,
+ *           the others join and are woken by the same attach); a zone the lookup could not name (its cell was being written) is asked for by name;
+ *   else    a database zone: the fetch request to the ingest thread (claimed or not, by the gate).
+ * A request that a full ring refuses is not a reason to answer the query or to read a stored zone from the database: the entry stays parked, marked pending (park_pending_set()), and
+ * park_service() makes the request again; the park-timeout is the only end of the wait.  The same for UDP and TCP. */
+static void park_ask(park_table_t *pt, int widx, int32_t pi, const park_plan_t *pp, const zref_t *pel) {
+  park_entry_t *e = &pt->e[pi];
+  if (pp->attach) {
+    if (pel->zid != ZREF_NOZID && pel->sview >= 0) {
+      const uint16_t sv = (uint16_t)pel->sview;
+      const int c = park_att_claim(sv, pel->zid, widx);
+      if (c == 0) return;                                /* (the request of another worker's claim is in a ring: this entry is woken with it) */
+      if (park_attach_zid(widx, sv, pel->zid)) park_att_requested(sv, pel->zid);
+      else park_pending_set(pt, e, PARK_PEND_ATTACH_ZID, ((uint64_t)sv << 32) | pel->zid, (uint8_t)widx);
+    } else if (!park_attach_request_any(pp->hv, pp->name)) {
+      park_pending_set(pt, e, PARK_PEND_ATTACH_NAME, 0, 0);
+    }
+    return;
+  }
+  const uint8_t prio = (uint8_t)(KDB_FETCH_PRIO_QUERY | (pp->gate == FETCH_GATE_TAKEN ? PARK_PRIO_CLAIMED : 0));
+  if (!park_fetch_request(widx, pp->hv, pp->name, prio, KDB_FETCH_FULL)) park_pending_set(pt, e, PARK_PEND_FETCH, 0, prio);
+}
+
+/* the requests that a full ring refused, again (park_service()); the oldest first, and no more once one is refused */
+static void park_ask_again(park_table_t *pt, int widx) {
+  park_entry_t *e;
+  while ((e = park_pending_head(pt))) {
+    bool ok;
+    switch (e->pend) {
+    case PARK_PEND_ATTACH_ZID: {
+      const uint16_t sv = (uint16_t)(e->preq >> 32);
+      const uint32_t zid = (uint32_t)e->preq;
+      ok = park_attach_zid(widx, sv, zid);
+      if (ok) park_att_requested(sv, zid);
+      break;
+    }
+    case PARK_PEND_ATTACH_NAME: ok = park_attach_request_any(park_entry_view(e), park_entry_zone(e)); break;
+    case PARK_PEND_FETCH: ok = park_fetch_request(widx, park_entry_view(e), park_entry_zone(e), e->prio, KDB_FETCH_FULL); break;
+    default: ok = true; break;
+    }
+    if (!ok) break;
+    park_pending_done(pt, e);
+  }
+}
+
 /* Park the UDP request for the zone of `pel`.  true: parked (the caller answers nothing now). false: not parked (no park table, the time is
  * up, the table is full, the request too big): the caller answers "not ready". */
 static bool udp_park(udp_pass_t *w, const view_snapshot_t *view, const zref_t *pel, const udp_ipc_t *ipc, const uint8_t *req, size_t len) {
@@ -2373,27 +2419,15 @@ static bool udp_park(udp_pass_t *w, const view_snapshot_t *view, const zref_t *p
   if (left <= 0) return false;
   park_plan_t pp = park_plan(w->park, view, pel, w->woken);
   const char *hv = pp.hv, *zname = pp.name;
-  const bool ask = pp.ask;
-  bool attach = pp.attach;
-  int gate = pp.gate;
+  const bool attach = pp.attach;
+  const int gate = pp.gate;
   int32_t pi = park_udp(w->park, now, (uint32_t)(attach && left > PARK_ATTACH_DEADLINE_MS ? PARK_ATTACH_DEADLINE_MS : left), hv, zname, w->active_fd, ipc, req, len);
   if (pi < 0) {
     if (gate == FETCH_GATE_TAKEN) park_claim_release(hv, zname);
     return false;
   }
-  if (attach) {
-    park_mark_attach(w->park, pi, park_now_ns(), now + left);
-    if (!park_attach_request(w->worker_idx, hv, zname)) {      /* (the ring is full: the database has it) */
-      attach = false;
-      (void)park_retry(w->park, hv, zname, now + left);
-      gate = zref_fetch_gate(hv, pel);
-    }
-  }
-  if (ask && !attach && !park_fetch_request(w->worker_idx, hv, zname, (uint8_t)(KDB_FETCH_PRIO_QUERY | (gate == FETCH_GATE_TAKEN ? PARK_PRIO_CLAIMED : 0)), KDB_FETCH_FULL)) {
-    if (gate == FETCH_GATE_TAKEN) park_claim_release(hv, zname);
-    park_release(w->park, &w->park->e[pi]);            /* the request could not be handed over (ring full): nobody would ever wake it */
-    return false;
-  }
+  if (attach) park_mark_attach(w->park, pi, park_now_ns(), now + left);
+  if (pp.ask) park_ask(w->park, w->worker_idx, pi, &pp, pel);
   if (!w->woken) dbreg_cache_note_miss();            /* a query that had to wait for its zone (the cache manager counts misses) */
   return true;
 }
@@ -2680,30 +2714,31 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
   if (t->nwait == 0 && t->nready == 0 && !(ring && park_wake_pending(ring))) return;     /* nothing is parked and nobody said anything: no clock, no exchange */
   park_key_t k;
   while (ring && park_wake_pop(ring, &k)) {
-    if (k.retry) {                                      /* 0.7 store S2: the attach did not work; the zone is fetched from the database and the queries wait for it the park-timeout */
-      uint32_t n = park_retry(t, k.view, k.zone, park_now_ms() + (int64_t)w->park_timeout_ms);
-      for (uint32_t i = 0; i < n; i++) store_status_note_cold(0, STORE_COLD_FETCH);
+    if (k.retry) {                                      /* 0.7 store S2: the attach did not work, or the zone is on its way by another route; the queries wait for it the park-timeout */
+      uint32_t n = park_retry_key(t, k.key, park_now_ms() + (int64_t)w->park_timeout_ms);
+      if (k.fetch)                                      /* (only a read from the database counts as one: a zone that another attach or fetch has is waited for) */
+        for (uint32_t i = 0; i < n; i++) store_status_note_cold(0, STORE_COLD_FETCH);
     } else if (k.failed) {
-      (void)park_fail(t, k.view, k.zone);
+      (void)park_fail_key(t, k.key);
     } else {
-      (void)park_wake(t, k.view, k.zone);
+      (void)park_wake_key(t, k.key);
     }
   }
   if (ring && park_wake_take_overflow(ring)) (void)park_wake_all(t);          /* a wake was lost: every query looks again */
   (void)park_expire(t, park_now_ms());
+  if (t->nunsent) park_ask_again(t, w->worker_idx);     /* the requests that a full ring refused */
   if (t->nready == 0) return;
-  uint32_t cur = 0;
   park_entry_t *e;
-  while ((e = park_next_done(t, &cur))) {
+  while ((e = park_next_done(t))) {
     bool timed_out = e->state == PARK_TIMEOUT;
     if (e->attach) store_status_note_cold(timed_out ? 0 : (uint64_t)(park_now_ns() - e->t_park_ns), timed_out ? STORE_COLD_TIMEOUT : STORE_COLD_ATTACH);       /* (0.7 store S2) */
     if (e->kind == PARK_UDP) {
       udp_ipc_t *ipc = (udp_ipc_t *)w->batch->rx_buffers[0];
-      *ipc = e->u.udp.ipc;
+      *ipc = *park_entry_ipc(e);
       uint8_t *req = w->batch->rx_buffers[0] + sizeof(udp_ipc_t);
       uint16_t len = e->udp_len;
-      memcpy(req, e->u.udp.payload, len);
-      w->active_fd = e->u.udp.fd;
+      memcpy(req, park_entry_req(e), len);
+      w->active_fd = e->fd;
       w->woken = true;
       w->woken_deadline_ms = e->attach && e->full_ms > e->deadline_ms ? e->full_ms : e->deadline_ms;       /* (an attach park: the park-timeout, not the attach deadline) */
       w->not_ready = timed_out;
@@ -2717,8 +2752,8 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
       w->woken = false;
       w->not_ready = false;
     } else {
-      uint32_t idx = e->u.tcp.ctx_idx, gen = e->u.tcp.ctx_gen;
-      int fd = e->u.tcp.fd;
+      uint32_t idx = e->ctx_idx, gen = e->ctx_gen;
+      int fd = e->fd;
       park_release(t, e);
       tcp_stream_ctx_t *c = (g_tcp_pool && idx < MAX_TCP_CLIENTS) ? &g_tcp_pool[idx] : NULL;
       if (c && c->gen == gen && c->parked) {                /* (the connection is still the one that parked) */
@@ -2894,6 +2929,7 @@ worker_startup_success:;
     struct timespec park_ts, *park_tp = NULL;
     if (park_on && park.nwait > 0) {
       int64_t left = park_next_deadline_ms(&park, park_now_ms());
+      if (park.nunsent && left > 1) left = 1;            /* (a request that a full ring refused is made again: look again soon) */
       park_ts.tv_sec = left / 1000;
       park_ts.tv_nsec = (left % 1000) * 1000000;
       park_tp = &park_ts;
@@ -3527,28 +3563,18 @@ process_tcp_client: ;
               if (park_on && !ctx_tcp->not_ready_now && left > 0) {
                 park_plan_t pp = park_plan(&park, route.view, &pel, ctx_tcp->park_deadline_ms != 0);       /* (as udp_park(): the view that holds the zone, the claim, the attach) */
                 const char *hv = pp.hv, *zname = pp.name;
-                const bool ask = pp.ask;
-                bool attach = pp.attach;
-                int gate = pp.gate;
+                const bool attach = pp.attach;
+                const int gate = pp.gate;
                 uint32_t cidx = (uint32_t)(ctx_tcp - g_tcp_pool);
                 int32_t pi = park_tcp(&park, pnow, (uint32_t)(attach && left > PARK_ATTACH_DEADLINE_MS ? PARK_ATTACH_DEADLINE_MS : left), hv, zname, client_fd, cidx, ctx_tcp->gen);
                 if (pi < 0 && gate == FETCH_GATE_TAKEN) park_claim_release(hv, zname);
-                if (pi >= 0 && attach) {
-                  park_mark_attach(&park, pi, park_now_ns(), pnow + left);
-                  if (!park_attach_request(ctx->thread_id, hv, zname)) {
-                    attach = false;
-                    (void)park_retry(&park, hv, zname, pnow + left);
-                    gate = zref_fetch_gate(hv, &pel);
-                  }
-                }
-                if (pi >= 0 && ask && !attach && !park_fetch_request(ctx->thread_id, hv, zname, (uint8_t)(KDB_FETCH_PRIO_QUERY | (gate == FETCH_GATE_TAKEN ? PARK_PRIO_CLAIMED : 0)), KDB_FETCH_FULL)) {
-                  if (gate == FETCH_GATE_TAKEN) park_claim_release(hv, zname);
-                  park_release(&park, &park.e[pi]);          /* the request could not be handed over (ring full): nobody would wake it */
-                  pi = -1;
-                }
                 if (pi >= 0) {
+                  if (attach) park_mark_attach(&park, pi, park_now_ns(), pnow + left);
+                  if (pp.ask) park_ask(&park, ctx->thread_id, pi, &pp, &pel);
                   if (ctx_tcp->park_deadline_ms == 0) dbreg_cache_note_miss();
                   ctx_tcp->park_deadline_ms = pnow + left;
+                  ctx_tcp->park_idx = pi;
+                  ctx_tcp->park_gen = park.e[pi].gen;
                   ctx_tcp->resume_len = msg_len;
                   ctx_tcp->parked = true;
                   rcu_reader_exit(ctx);
@@ -4291,6 +4317,7 @@ static bool ctrl_store_memory(ma_est_t *out) {
   in.resident_zones = rs.resident;
   in.resident_bytes = zdb.resident;
   in.limit = dbreg_cache_limit();
+  if (dbdir()) db_store_ma_inputs(&in);                  /* 0.7 D6: the store's mode and the size of its images */
   ma_estimate(&in, out);
   return true;
 }
@@ -5926,9 +5953,8 @@ void *control_thread_func(void *arg) {
       } else if (ev_list[i].filter == EVFILT_TIMER ||
                  ev_list[i].filter == EVFILT_USER) {
         time_t now = time(NULL);
-        /* S2: 兄弟ゾーンの公開 (転送、UPDATE、個別の reload) を、そのアドレスをグルーに使うゾーンの応答の版に反映し、
-         * 公開で不要になった古い版を猶予期間の後で解放する */
-        zone_glue_refresh_dependents(false);
+        /* 公開で不要になった古い版を猶予期間の後で解放する (兄弟ゾーンの公開をグルーに使うゾーンの応答の版に反映する zone_glue_refresh_dependents() は、0.7 store から
+         * 専用のスレッド zone_glue_thread_start() が行う: karictl に答える制御スレッドは待たされない) */
         zone_retire_process(false);
         zone_prev_expire(now);          /* karictl rollback: the previous versions whose rollback-window is over */
         config_standby_reap(false);
@@ -8513,6 +8539,10 @@ int main(int argc, char **argv) {
   // type forward zone and does nothing while no zone has an ALIAS record and an alias-resolver.
   if (!alias_start())
     syslog(LOG_ERR, "[Backend] Cannot start the ALIAS resolver thread; ALIAS records are not expanded");
+
+  // 0.7 store: the glue of the zones that others take glue from is looked at again by a thread of its own, not by the control thread (karictl waited behind it during an attach burst)
+  if (!zone_glue_thread_start())
+    syslog(LOG_ERR, "[Backend] Cannot start the glue thread; the glue of zones that changed is looked at again by a reload only");
 
   // beta design 1.3 / 1.5: the db ingest thread.  It limits the rights of the two descriptors the supervisor made
   // (stream, control) and uses only them (read / write / recvmsg / kevent) once the sandbox is on.

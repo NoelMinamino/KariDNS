@@ -3036,22 +3036,34 @@ static void space_checkpoint(store_t *s) {
     }
   }
   const int64_t avail = s->avail_est;
+  /* A first fill is not a growth to extrapolate: the store grows as fast as the database delivers (96 GB an hour at 54 GB free, then it stops: the zones are all there).  While zones are
+   * known without an image the size to come is known: the zones still to be stored at the size of those stored so far, and the warning is about that (and the hour figure is not made). */
+  uint64_t known = 0, stored = 0, imgb = 0;
+  const uint32_t nviews = atomic_load_explicit(&s->nviews, memory_order_acquire);
+  for (uint32_t i = 0; i < nviews && i < STORE_MAX_VIEWS; i++) {
+    known += VG(s, V_VIEW(i, 0));
+    stored += VG(s, V_VIEW(i, 1));
+    imgb += VG(s, V_VIEW(i, 3));
+  }
+  const bool filling = known > 0;
+  const uint64_t pending = filling && stored ? known * (imgb / stored) : 0;
   uint64_t full_h = 0;
-  if (rate && avail >= 0) full_h = (uint64_t)avail / rate + 1;
+  if (rate && avail >= 0 && !filling) full_h = (uint64_t)avail / rate + 1;
   atomic_store_explicit(&s->growth_bph, rate, memory_order_relaxed);
   atomic_store_explicit(&s->full_in_h, full_h, memory_order_relaxed);
   if (s->degraded && avail >= 0 && (uint64_t)avail >= s->reserve_bytes + s->reserve_bytes / 2) degraded_end(s);   /* (a put needs the reserve and its own bytes; a quota of 100 MB with segments of 64 MB never has two reserves and a segment) */
   uint32_t lvl = s->degraded ? 2u : 0u;
   if (!s->degraded && avail >= 0) {
     uint64_t low = 2 * s->reserve_bytes > bytes / 10 ? 2 * s->reserve_bytes : bytes / 10;
-    if ((uint64_t)avail < low || (full_h && full_h < 24)) lvl = 1;
+    if ((uint64_t)avail < low || (full_h && full_h < 24) || pending > (uint64_t)avail) lvl = 1;
   }
   atomic_store_explicit(&s->space_level, lvl, memory_order_relaxed);
   if (lvl == 1 && rl_ok(&s->last_warn_ms, 600000)) {
     uint64_t dead = 0;
     space_dead_totals(s, &dead);
-    char tf[160] = "";
+    char tf[240] = "";
     if (full_h) snprintf(tf, sizeof(tf), "; at the growth of the last hour (%" PRIu64 " bytes an hour) it is full in about %" PRIu64 " hour(s)", rate, full_h);
+    else if (pending) snprintf(tf, sizeof(tf), "; %" PRIu64 " zone(s) are still to be stored: at the size of the zones stored so far they take about %" PRIu64 " bytes more", known, pending);
     st_log(s, 4, "store: the file system is getting full: %" PRIu64 " bytes are free (%" PRIu64 " of them kept for the cleaner), the store holds %" PRIu64 " bytes (%" PRIu64
                  " bytes of the segments are dead and can be won by the cleaner)%s; when it is full new zone images are not stored (zones are kept without an image and read from the database)",
            (uint64_t)avail, s->reserve_bytes, bytes, dead, tf);
@@ -4317,12 +4329,16 @@ static void ix_prefetch(store_t *s) {
 static void *ra_main(void *arg) {
   store_t *s = arg;
   uint64_t t0 = st_now_us();
-  uint64_t bytes = (VG(s, V_HWM) * ST_REC + s->pagesz - 1) & ~((uint64_t)s->pagesz - 1);
-  uint64_t mapped = atomic_load_explicit(&s->zt.mapped, memory_order_acquire);
-  if (bytes > mapped) bytes = mapped;
-  if (bytes) {
-    (void)madvise(s->zt.base, (size_t)bytes, MADV_WILLNEED);
-    touch_pages(s->zt.base, (size_t)bytes, s->pagesz, &s->ra_stop);
+  const uint64_t want = (VG(s, V_HWM) * ST_REC + s->pagesz - 1) & ~((uint64_t)s->pagesz - 1);
+  /* zt and zc: a lookup reads the record of a zone in both (zc by every lookup and attach: the cell with the counters), and a page that is not in memory is a wait for the disk on the thread
+   * that asks (a worker's lookup, a store thread's attach) */
+  const struct { const uint8_t *base; uint64_t mapped; } tab[2] = { { s->zt.base, atomic_load_explicit(&s->zt.mapped, memory_order_acquire) },
+                                                                    { s->zc.base, atomic_load_explicit(&s->zc.mapped, memory_order_acquire) } };
+  for (int i = 0; i < 2; i++) {
+    uint64_t bytes = want < tab[i].mapped ? want : tab[i].mapped;
+    if (!bytes || !tab[i].base) continue;
+    (void)madvise((void *)(uintptr_t)tab[i].base, (size_t)bytes, MADV_WILLNEED);
+    touch_pages(tab[i].base, (size_t)bytes, s->pagesz, &s->ra_stop);
   }
   atomic_store_explicit(&s->ra_zt_us, st_now_us() - t0, memory_order_relaxed);
   atomic_store_explicit(&s->ra_done, true, memory_order_release);

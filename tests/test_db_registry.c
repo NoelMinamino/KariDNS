@@ -1455,7 +1455,7 @@ static void test_glue_arrivals(void) {
 
     /* 5. more arrivals than the list holds: the tick walks the directory (as it did for every arrival), and the answer is the same */
     gen0 = atomic_load(&atomic_load(&x->rcu.active)->generation);
-    for (int i = 0; i < 20000; i++) zone_glue_note_arrival("default", "flood.test.");
+    for (int i = 0; i < 270000; i++) zone_glue_note_arrival("default", "flood.test.");              /* (the list holds 262144 names: an attach burst does not get near it, a reload of a million zones does) */
     zone_glue_stats(&w0, &t0, &z0);
     zone_glue_refresh_dependents(false);
     zone_glue_stats(&w1, &t1, &z1);
@@ -3090,6 +3090,22 @@ static void test_error_ring(void) {
     dbreg_err_reset_for_test();
 }
 
+/* 0.7 store: the arrivals are taken by a thread of its own (the control thread is for karictl), once every few milliseconds, with no call from the test */
+static void test_glue_thread(void) {
+    printf("[the glue thread]\n");
+    uint64_t w0, t0, z0, w1, t1, z1;
+    zone_glue_stats(&w0, &t0, &z0);
+    CHECK(zone_glue_thread_start() && zone_glue_thread_start());                      /* (a second start is the same thread) */
+    zone_glue_note_arrival("default", "glue-thread.test.");
+    t1 = t0;
+    w1 = w0;
+    for (int i = 0; i < 500 && t1 == t0 && w1 == w0; i++) {
+        usleep(10000);
+        zone_glue_stats(&w1, &t1, &z1);
+    }
+    CHECK(t1 > t0 || w1 > w0);
+}
+
 int main(void) {
     snprintf(g_dir, sizeof(g_dir), "/tmp/karidns_dbreg.XXXXXX");
     if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
@@ -3127,6 +3143,7 @@ int main(void) {
     test_error_ring();
     test_alias_notices();
     test_concurrent();
+    test_glue_thread();
     gc_snapshot_wait_idle();      /* join the cleanup threads: none is left running (or leaked, for ThreadSanitizer) at exit */
     free(g_names);
     /* Remove the scratch directory in-process: the detached snapshot GC threads of test_concurrent may still be starting

@@ -736,15 +736,26 @@ typedef struct {
 typedef struct { conc_t *c; int id; } rarg_t;
 #define ERRK(k) do { atomic_fetch_add(&c->errors, 1); atomic_fetch_add(&c->errk[(k)], 1); } while (0)
 
+/* KARIDNS_STORE_LONG=1: the soak variants of the cases below (the default run is the one CI runs, a minute; the long one is for a local soak) */
+static bool store_long(void) {
+  const char *v = getenv("KARIDNS_STORE_LONG");
+  return v && v[0] == '1';
+}
+
 static void *reader_main(void *arg) {
   rarg_t *a = arg;
   conc_t *c = a->c;
   store_t *s = c->s;
+  const bool soak = store_long();
+  uint64_t rounds = 0;
   uint64_t seen[NSTABLE];
   memset(seen, 0, sizeof(seen));
   uint64_t rng = (uint64_t)a->id * 7919 + 1;
   uint8_t *copy = malloc(2048);
   while (!atomic_load(&c->stop)) {
+    /* the default run lets the readers give way now and then: eight threads that never stop make every step of the one writer (a grace period, a growth of the index) wait for a CPU, and the
+     * case takes minutes on a host with few of them; what is looked at (a lookup against a growth, a replace, a delete) is the same */
+    if (!soak && (++rounds & 63) == 0) sched_yield();
     rng = mix64(rng);
     uint32_t i;
     bool stable = (rng & 3) != 0;
@@ -3185,7 +3196,7 @@ static void test_scrub_tick(void) {
   CHECK_EQ(store_open(d.fd, &o, &s), 0);
   if (!s) { tdir_free(&d); return; }
   store_view_add(s, "default");
-  enum { N = 1500 };
+  const uint32_t N = store_long() ? 1500 : 800;                          /* (the rate is a bucket of 128 KiB a second: 800 zones are 4 s, enough for "not over in a moment" below) */
   for (uint32_t i = 0; i < N; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);          /* about a megabyte of images: 8 s at 128 KiB a second */
   store_stats_t st;
   uint64_t t0 = now_ms();
@@ -3261,6 +3272,9 @@ static void test_zfs_dir(const char *base, bool expect_warn, const char *what) {
 
 /* ---- the open: ix before the first answer, zt in the background; the journal cap ---- */
 
+static _Atomic int g_ra_cnt;
+static void ra_count_page(void) { atomic_fetch_add(&g_ra_cnt, 1); }
+
 static void test_open_defaults(void) {
   printf("[open: the defaults, ix read before the answer, zt read-ahead]\n");
   tdir_t d;
@@ -3278,10 +3292,14 @@ static void test_open_defaults(void) {
   CHECK_EQ(st.journal_max_bytes, 100u << 20);                             /* the cap: about a second of replay */
   CHECK_EQ(store_close(s), 0);
   o.create = false;
+  atomic_store(&g_ra_cnt, 0);
+  store_test_ra_page = ra_count_page;
   CHECK_EQ(store_open(d.fd, &o, &s), 0);
   if (s) {
     for (int k = 0; k < 500 && (store_stats(s, &st), !st.zt_readahead_done); k++) usleep(2000);
     CHECK(st.zt_readahead_done);
+    store_test_ra_page = NULL;
+    CHECK(atomic_load(&g_ra_cnt) >= 2 * (3000 * 64) / 4096);                 /* (the read-ahead touches the pages of zc as it does those of zt) */
     printf("  open %" PRIu64 " us (ix read %" PRIu64 " us), zt read ahead %" PRIu64 " us\n", st.recovery.open_us, st.ix_read_us, st.zt_readahead_us);
     CHECK(verify_i(s, 0, 100, 1));
     CHECK_EQ(store_close(s), 0);                                           /* (joins the thread) */
@@ -3783,9 +3801,9 @@ int main(void) {
   rm_rf(g_base);
   if (mkdir(g_base, 0700) != 0) { perror("mkdir base"); return 2; }
   bool big = getenv("KARIDNS_STORE_BIG") && getenv("KARIDNS_STORE_BIG")[0] == '1';
-  int iters = 200;
+  int iters = store_long() ? 200 : 75;                    /* (every 25 iterations the loop starts on a new store: three stores of kills in the default run) */
   if (getenv("KARIDNS_STORE_KILL_ITERS")) iters = atoi(getenv("KARIDNS_STORE_KILL_ITERS"));
-  if (UNDER_TSAN && !getenv("KARIDNS_STORE_KILL_ITERS")) iters = 40;
+  if (UNDER_TSAN && !getenv("KARIDNS_STORE_KILL_ITERS")) iters = 25;
   uint32_t n = UNDER_ASAN || UNDER_TSAN ? 100000 : 100000;
   setvbuf(stdout, NULL, _IOLBF, 0);
   printf("test_store: base %s\n", g_base);
@@ -3829,7 +3847,7 @@ int main(void) {
   if (WANT("openbench") && getenv("KARIDNS_STORE_OPENBENCH")) test_open_bench(strtoull(getenv("KARIDNS_STORE_OPENBENCH"), NULL, 10));
   if (WANT("kill")) test_kill_loop(iters, 0);
   if (WANT("clk")) {
-    int citers = getenv("KARIDNS_STORE_KILLC_ITERS") ? atoi(getenv("KARIDNS_STORE_KILLC_ITERS")) : (UNDER_TSAN ? 30 : 100);
+    int citers = getenv("KARIDNS_STORE_KILLC_ITERS") ? atoi(getenv("KARIDNS_STORE_KILLC_ITERS")) : (UNDER_TSAN ? 25 : store_long() ? 100 : 50);
     test_kill_loop(citers, 1);
   }
   if (WANT("cconc")) { test_compact_conc(STORE_MODE_MAP); test_compact_conc(STORE_MODE_COPY); }

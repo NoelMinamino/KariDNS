@@ -282,7 +282,7 @@ static bool wake_for(const char *zone, park_key_t *k, int ms) {
     end = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000 + ms;
     for (;;) {
         if (park_wake_pop(park_wake_ring(0), k)) {
-            if (strcmp(k->zone, zone) == 0) return true;
+            if (park_key_is(k, "default", zone)) return true;
             continue;
         }
         clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -353,10 +353,38 @@ static bool same_answers(const ans_t *x, const ans_t *y) {
     return true;
 }
 
+/* wait until the bytes of the zones that were taken out of memory are given back.  The retire stack is processed here, as the control thread does it in the server: nobody else does in this test, and
+ * the wait was whatever came by (25 ms for every call, 135 s in a run). */
+static void wait_retired(void) {
+    for (int i = 0; i < 5000; i++) {
+        zone_retire_process(true);
+        if (dbreg_evict_inflight() == 0) break;
+        usleep(1000);
+    }
+}
+
+/* The phases of this test run as processes of their own and end with _exit() (a child must not run the destructors of the parent's state).  A coverage build writes its counters at exit(): this
+ * writes them first, so that what a phase reaches is counted (the symbols are there in a coverage build only: the instrumentation of `make coverage`, and gcov's). */
+extern int __llvm_profile_write_file(void) __attribute__((weak));
+extern void __gcov_dump(void) __attribute__((weak));
+__attribute__((noreturn)) static void test_exit(int rc) {
+    fflush(stdout);
+    if (__llvm_profile_write_file) (void)__llvm_profile_write_file();
+    if (__gcov_dump) __gcov_dump();
+    _exit(rc);
+}
+
+/* the image of a version that a test made from a record of the store: given back with the version */
+static void timg_free(void *p) {
+    struct { store_t *st; store_img_t img; } *t = p;
+    store_img_release(t->st, &t->img);
+    free(t);
+}
+
 /* take the zone out of memory and wait until the registry's reference of its entry is gone (the garbage of the next delta is freed) */
 static bool evict_zone(const char *zone) {
     if (!dbreg_test_evict("default", zone)) return false;
-    for (int i = 0; i < 200 && dbreg_evict_inflight() != 0; i++) usleep(25000);
+    wait_retired();
     return true;
 }
 
@@ -366,10 +394,21 @@ static uint64_t resident_bytes(void) {
     return zb.resident;
 }
 
+static bool zref_of(const char *zone, zref_t *z);
+/* the request a worker makes for a stored zone that is not in memory (dns_server_core.c park_ask()): the zone's id in the store, one claim for the zone */
+static bool attach_request(const char *zone) {
+    zref_t z;
+    if (!zref_of(zone, &z) || z.zid == ZREF_NOZID || z.sview < 0) return park_attach_request_any("default", zone);       /* (the lookup does not know the zone, or could not read its cell: the request goes by name) */
+    if (park_att_claim((uint16_t)z.sview, z.zid, 0) == 0) return true;      /* (the request of the claim is in a ring already) */
+    if (!park_attach_zid(0, (uint16_t)z.sview, z.zid)) return false;
+    park_att_requested((uint16_t)z.sview, z.zid);
+    return true;
+}
+
 /* an attach as the worker asks for it: true when it woke the worker with the zone, false when the key says retry or failed */
 static int attach_by_worker(const char *zone, park_key_t *k) {
     drain_wakes();
-    if (!park_attach_request(0, "default", zone)) return -1;
+    if (!attach_request(zone)) return -1;
     if (!wake_for(zone, k, 5000)) return -2;
     return (k->failed || k->retry) ? 0 : 1;
 }
@@ -702,7 +741,7 @@ static int run_mode(const char *mode) {
 
     /* -- 3. attach at the worker's request: it wakes the worker, the loader is not asked, and the answers are the bytes they were */
     db_store_counters(&c0);
-    CHECK(attach_by_worker("a1.test.", &k) == 1 && strcmp(k.zone, "a1.test.") == 0);
+    CHECK(attach_by_worker("a1.test.", &k) == 1 && park_key_is(&k, "default", "a1.test."));
     {
         zref_t z;
         CHECK(zref_of("a1.test.", &z) && z.entry && z.el && atomic_load(&z.el->state) == ZDIR_ST_RESIDENT && zdir_serial(z.el) == 2);
@@ -789,7 +828,7 @@ static int run_mode(const char *mode) {
     CHECK(dbreg_fetch_begin("default", "a2.test.") == DBREG_FETCH_STARTED);            /* (the zone is out of memory, its record is stored) */
     drain_wakes();
     db_store_counters(&c0);
-    CHECK(park_attach_request(0, "default", "a2.test.") && wake_for("a2.test.", &k, 5000) && k.retry && !k.failed);
+    CHECK(attach_request("a2.test.") && wake_for("a2.test.", &k, 5000) && k.retry && !k.failed);
     db_store_counters(&c1);
     CHECK(c1.attach_busy == c0.attach_busy + 1);
     dbreg_fetch_end("default", "a2.test.");
@@ -813,7 +852,7 @@ static int run_mode(const char *mode) {
         if (map) {
             for (int i = 0; i < 200 && in_memory("a5.test."); i++) usleep(25000);              /* (the tick asks again when the zone was busy) */
             CHECK(!in_memory("a5.test."));                                                       /* (before: it kept serving the damaged pages) */
-            for (int i = 0; i < 100 && dbreg_evict_inflight() != 0; i++) usleep(25000);
+            wait_retired();
             CHECK(zref_of("a5.test.", &z5) && z5.entry == NULL && z5.zid != ZREF_NOZID && z5.zstate == ZREF_ST_KNOWN);
             CHECK(dbdir()->rec_get("default", "a5.test.", &rec) && rec.state == STORE_STATE_KNOWN);
             CHECK(attach_by_worker("a5.test.", &k) == 0 && k.retry);                             /* (the next query reads it from the database) */
@@ -834,15 +873,57 @@ static int run_mode(const char *mode) {
         CHECK(zone_bytes_underflows() == 0);
     }
 
+    /* -- (0.7 store) only the workers that asked are woken: worker 0 parks a query and asks, worker 1 does not (its ring stays empty); a worker that joins the claim of the zone is woken with it */
+    {
+        park_register_worker(1, -1);
+        park_key_t k1;
+        while (park_wake_pop(park_wake_ring(1), &k1)) {}
+        (void)evict_zone("a1.test.");
+        CHECK(attach_by_worker("a1.test.", &k) == 1 && park_key_is(&k, "default", "a1.test."));
+        CHECK(!park_wake_pop(park_wake_ring(1), &k1) && !park_wake_pending(park_wake_ring(1)));
+        zref_t z;
+        (void)evict_zone("a1.test.");
+        CHECK(zref_of("a1.test.", &z) && z.zid != ZREF_NOZID);
+        drain_wakes();
+        CHECK(park_att_claim((uint16_t)z.sview, z.zid, 0) == 1 && park_att_claim((uint16_t)z.sview, z.zid, 1) == 2);        /* (worker 1 joined before the request was made: it asks too) */
+        CHECK(park_attach_zid(0, (uint16_t)z.sview, z.zid));
+        park_att_requested((uint16_t)z.sview, z.zid);
+        CHECK(wake_for("a1.test.", &k, 5000));
+        for (int i = 0; i < 2000 && !park_wake_pending(park_wake_ring(1)); i++) usleep(1000);
+        CHECK(park_wake_pop(park_wake_ring(1), &k1) && park_key_is(&k1, "default", "a1.test.") && !k1.failed && !k1.retry);
+        CHECK(in_memory("a1.test."));
+        park_unregister_worker(1);
+    }
+
+    /* -- the attach is one section of the registry's lock: what it finds at the commit is told apart (dbreg_attach_store(): resident, a fetch on its way, a record that is not the one that was read) */
+    {
+        dbdir_rec_t rec;
+        CHECK(evict_zone("a1.test."));
+        CHECK(dbdir()->rec_get("default", "a1.test.", &rec) && rec.state == STORE_STATE_STORED);
+        CHECK(dbreg_fetch_begin("default", "a1.test.") == DBREG_FETCH_STARTED);
+        zone_db_entry_t *ent = db_ingest_new_entry("default", "a1.test.", NULL);
+        CHECK(ent != NULL && dbreg_attach_store("default", "a1.test.", &rec, ent, false) == DBREG_ATT_BUSY);       /* (a fetch has the zone) */
+        dbreg_fetch_end("default", "a1.test.");
+        rec.serial += 1;
+        CHECK(dbreg_attach_store("default", "a1.test.", &rec, ent, false) == DBREG_ATT_STALE);                      /* (the record is another version than the one that was read) */
+        free_zone_db_entry(ent);
+        CHECK(attach_by_worker("a1.test.", &k) == 1);
+        CHECK(dbdir()->rec_get("default", "a1.test.", &rec));
+        ent = db_ingest_new_entry("default", "a1.test.", NULL);
+        CHECK(ent != NULL && dbreg_attach_store("default", "a1.test.", &rec, ent, false) == DBREG_ATT_RESIDENT);   /* (in memory already) */
+        free_zone_db_entry(ent);
+    }
+
     /* -- the commit of an attach is conditional: a delete that comes after the record was read wins, nothing is made */
     CHECK(evict_zone("a0.test."));
     {
-        dbreg_attach_info_t ai;
-        CHECK(dbreg_attach_begin("default", "a0.test.", &ai) == DBREG_ATT_STARTED && ai.serial == 1 && ai.source_id == 100);
+        dbdir_rec_t rec;
+        CHECK(dbdir()->rec_get("default", "a0.test.", &rec) && rec.state == STORE_STATE_STORED && rec.serial == 1 && rec.source_id == 100);
         CHECK(dbreg_delete("default", "a0.test.", 100) == 1);
-        bool sh = false;
-        CHECK(dbreg_commit_attach("default", "a0.test.", NULL, &ai, ai.digest, &sh) != 0);
-        if (ai.sh) zone_ext_shared_unref(ai.sh);
+        zone_db_entry_t *ent = db_ingest_new_entry("default", "a0.test.", NULL);
+        CHECK(ent != NULL);
+        CHECK(dbreg_attach_store("default", "a0.test.", &rec, ent, false) == DBREG_ATT_STALE);       /* (the registry looks at the record again, inside its lock: it is gone) */
+        free_zone_db_entry(ent);
         CHECK(!in_memory("a0.test."));
         zref_t z;
         CHECK(!zref_of("a0.test.", &z));                                     /* (deleted from the store too) */
@@ -850,6 +931,30 @@ static int run_mode(const char *mode) {
         send_zone(a[0], &e, "a0.test.", 1, 0, 100);
         batch_end(a[0], &e, &mainc, 20, 1, 0);
         CHECK(in_memory("a0.test."));
+        /* a new entry for a zone that is in memory already (an install that was built before an attach made the zone resident, a SLAVE that becomes a primary) replaces the old one: the commit retires the
+         * old entry for the readers that may hold it, and gives it back after the grace period.  The entry is made as an attach makes it, from the image of the record. */
+        {
+            typedef struct { store_t *st; store_img_t img; } timg_t;
+            dbdir_rec_t rr;
+            CHECK(dbdir()->rec_get("default", "a0.test.", &rr) && rr.state == STORE_STATE_STORED);
+            timg_t *ti = calloc(1, sizeof(*ti));
+            ti->st = st;
+            store_read_lock();
+            CHECK(store_image_read(st, rr.zid, &ti->img) == 0);
+            store_read_unlock();
+            zone_db_entry_t *ne = db_ingest_new_entry("default", "a0.test.", NULL);
+            zone_version_t *nv = ti->img.data ? zone_version_new_ext((zone_image_t *)(uintptr_t)ti->img.data, ti->img.len, timg_free, ti) : NULL;
+            CHECK(ne != NULL && nv != NULL);
+            if (ne && nv) {
+                atomic_store_explicit(&ne->serial, rr.serial, memory_order_relaxed);
+                zone_install_version(ne, nv, NULL, false);
+                bool shd = false;
+                zone_db_entry_t *old = dbreg_lookup_entry("default", "a0.test.");
+                CHECK(old != NULL && old != ne && dbreg_commit("default", "a0.test.", ne, true, rr.source_id, rr.serial, rr.digest, &shd) == 0);
+                wait_retired();
+                CHECK(dbreg_lookup_entry("default", "a0.test.") == ne && zone_bytes_underflows() == 0);
+            }
+        }
     }
 
     /* -- a record whose image has the right checksum and a wrong structure (a forgery: the checksum is not keyed) is not served: it is found invalid at the attach */
@@ -1141,7 +1246,7 @@ static int run_mode(const char *mode) {
             if (dbreg_test_evict("default", zn)) gone++;
         }
         CHECK(gone > GZ / 4);
-        for (int i = 0; i < 200 && dbreg_evict_inflight() != 0; i++) usleep(5000);
+        wait_retired();
         usleep(100000);
         atomic_store(&g_rd_stop, true);
         for (int i = 0; i < 3; i++) pthread_join(rt[i], NULL);
@@ -1167,12 +1272,12 @@ static int run_mode(const char *mode) {
             for (int w = 0; w < 400 && !in_memory("a6.test."); w++) {
                 if (w % 100 == 0) {
                     drain_wakes();
-                    (void)park_attach_request(0, "default", "a6.test.");
+                    (void)attach_request("a6.test.");
                 }
                 usleep(1000);
             }
             if (in_memory("a6.test.")) cycles++;
-            for (int w = 0; w < 100 && dbreg_evict_inflight() != 0; w++) usleep(1000);
+            wait_retired();
         }
         atomic_store(&g_rd_stop, true);
         pthread_join(rt, NULL);
@@ -1183,7 +1288,7 @@ static int run_mode(const char *mode) {
                (unsigned long long)c1.attach_resident, (unsigned long long)c1.attach_busy);
         CHECK(cycles >= 20 && atomic_load(&g_rd_ok) > 0 && atomic_load(&g_rd_bad) == 0);
     }
-    for (int i = 0; i < 100 && dbreg_evict_inflight() != 0; i++) usleep(20000);
+    wait_retired();
     zone_retire_process(true);
     CHECK(zone_bytes_underflows() == 0);
 
@@ -1515,6 +1620,13 @@ static int run_mode(const char *mode) {
         for (int i = 0; i < NFAKE; i++) missed += seen[i] == 0;
         CHECK(g_walk_ud.grown && g_walk_ud.grew);                          /* (the table did grow in the middle of the walk) */
         CHECK(missed == 0);
+        /* the walk of the glue (the control thread used to make it, the glue thread does now) is the same walk: a table made again in the middle of it starts it again, and what it had collected is given back */
+        g_walk_ud.calls = 0;
+        g_walk_ud.grown = g_walk_ud.grew = false;
+        g_attach_walk_between = walk_grow_hook;
+        zone_glue_refresh_dependents(true);
+        g_attach_walk_between = NULL;
+        CHECK(g_walk_ud.grown);
         for (int i = 0; i < NFAKE + NBIG + NGROW; i++) {
             dbdir()->attach_remove(fakes[i]);
             free(fakes[i]);
@@ -2169,7 +2281,7 @@ static int run_proto(int phase, const char *dir) {
         db_store_batch_end();
         printf("%d checks, %d failed\n", g_checks, g_failed);
         fflush(stdout);
-        _exit(g_failed ? 1 : 0);                                         /* (no clean stop: the next start recovers the store from its journal) */
+        test_exit(g_failed ? 1 : 0);                                         /* (no clean stop: the next start recovers the store from its journal) */
     }
 
     /* -- phase 2: a new process on the same store.  The CONFIG carried the cursor (230) and the identity.  Nothing is listed again: only the interrupted work is asked for, and the changes after the cursor are applied */
@@ -2202,10 +2314,32 @@ static int run_proto(int phase, const char *dir) {
         CHECK(zrec(st, "m0600.test", &z) && z.serial == 9 && z.stamp_gen == 9);
         CHECK(cursor_is(st, 240));
     }
+    {
+        /* the report of one zone asks the server whether it is in memory (store.zone.attached), and the scan of the wanted bodies is put back for a zone whose body could not be fetched */
+        static char zr[STORE_STATUS_OUT_MAX];
+        CHECK(store_status_format(zr, sizeof(zr), STORE_FMT_KV, "m0600.test") > 0 && strstr(zr, "store.zone.attached=") != NULL);
+        db_recon_status_t fs;
+        db_recon_status(&fs);
+        CHECK(db_store_filling() == (fs.known_now > 0 && (fs.active || fs.in_flight > 0)));      /* (a first fill: zones without an image and a pass or the fetch of their bodies running) */
+        db_recon_scan_retry(7);
+        db_recon_scan_retry(0xF0000001u);
+        /* a view that the store did not know when it was opened (the configuration was reloaded with a new view) is added by its first zone, and its identity is noted */
+        db_recon_entry_t re;
+        memset(&re, 0, sizeof(re));
+        re.source_id = 900001;
+        re.name = "newview.test.";
+        re.kind = KDB_ZK_PRIMARY;
+        re.stamped = true;
+        re.gen = 1;
+        re.time = 1;
+        uint32_t zid = STORE_NONE;
+        const int vr = db_recon_change("viewb", &re, &zid);
+        CHECK(vr >= 0 && store_view_id(st, "viewb") >= 0);
+    }
 done:
     printf("%d checks, %d failed\n", g_checks, g_failed);
     fflush(stdout);
-    _exit(g_failed ? 1 : 0);
+    test_exit(g_failed ? 1 : 0);
 }
 
 
@@ -2512,7 +2646,7 @@ static int run_fixes(const char *dir) {
     db_store_batch_end();
     printf("%d checks, %d failed\n", g_checks, g_failed);
     fflush(stdout);
-    _exit(g_failed ? 1 : 0);
+    test_exit(g_failed ? 1 : 0);
 }
 
 /* ---------------------------------------------------------------- phase 6: a fetched body is installed only for the stamp it was asked for */
@@ -2610,10 +2744,17 @@ static void hk_set(int n, int act, const char *zone, int64_t sid, uint64_t gen, 
 
 typedef struct { char name[64]; uint64_t id; int64_t sid; } rq_t;
 /* the FETCH_REQs that come within `ms` of silence */
+/* The requests that the ingest thread makes of the loader, until it is quiet.  The first one is waited for `ms` (it may take a batch, a tick); once one has come the others follow within a few
+ * milliseconds, so the quiet that ends the collection is a fifth of that (at least 300 ms) and not `ms` again: with the full time after every request the cases of this test spent 26 s of a
+ * minute doing nothing.  KARIDNS_STORE_LONG=1 keeps the full time. */
 static int rq_collect(ch_t *fc, rq_t *out, int max, int ms) {
     int n = 0;
     kdb_msg_t m;
-    while (ch_next(fc, &m, ms)) {
+    const char *lg = getenv("KARIDNS_STORE_LONG");
+    const int quiet = lg && lg[0] == '1' ? ms : (ms / 5 < 300 ? 300 : ms / 5);
+    int wait = ms;
+    while (ch_next(fc, &m, wait)) {
+        if (m.type == KDB_T_FETCH_REQ) wait = quiet;
         if (m.type != KDB_T_FETCH_REQ || n >= max) continue;
         snprintf(out[n].name, sizeof(out[n].name), "%s", m.u.fetch_req.name);
         out[n].id = m.u.fetch_req.request_id;
@@ -2923,7 +3064,7 @@ static int run_stamp_race(const char *dir) {
     db_store_batch_end();
     printf("%d checks, %d failed\n", g_checks, g_failed);
     fflush(stdout);
-    _exit(g_failed ? 1 : 0);
+    test_exit(g_failed ? 1 : 0);
 }
 
 /* phase 4: a legacy loader (no store protocol) installs three zones with three settings texts; the process ends without a clean stop.  Phase 5: the next start, with the second record of settings.dat made
@@ -3021,7 +3162,7 @@ static int run_settings(int phase, const char *dir) {
     db_store_batch_end();
     printf("%d checks, %d failed\n", g_checks, g_failed);
     fflush(stdout);
-    _exit(g_failed ? 1 : 0);
+    test_exit(g_failed ? 1 : 0);
 }
 
 /* ---------------------------------------------------------------- S5: the light entry, the statistics of the zones that leave memory, eviction by samples, the attach table, the leftovers */
@@ -3212,7 +3353,7 @@ static int run_s5(const char *mode) {
         stats_collect_totals(sn, &t1);
         rcu_aux_read_unlock();
         CHECK(t1.queries_total == t0.queries_total);
-        for (int i = 0; i < 100 && dbreg_evict_inflight() != 0; i++) usleep(25000);
+        wait_retired();
     }
 
     /* -- 3. eviction by samples: the registry is not walked; the cold zones go, the hot zone and the pinned zone stay; the attach table gets smaller after a mass detach */
@@ -3236,7 +3377,7 @@ static int run_s5(const char *mode) {
         }
         dbreg_cache_set_limit(0);
         dbreg_cache_test_pause(true);
-        for (int i = 0; i < 100 && dbreg_evict_inflight() != 0; i++) usleep(25000);
+        wait_retired();
         dbreg_cache_stats(&cs1);
         const size_t left = dbdir()->attach_count();
         printf("  samples: %u zones taken out by the manager, %zu of %d left, resident %llu -> %llu\n", taken, left, NZ, (unsigned long long)res0, (unsigned long long)resident_bytes());
@@ -3255,7 +3396,7 @@ static int run_s5(const char *mode) {
         const uint64_t cap1 = dbdir()->counters(5);
         for (int i = 0; i < NZ; i++)
             if (in_memory(nm[i])) (void)dbreg_test_evict("default", nm[i]);
-        for (int i = 0; i < 200 && dbreg_evict_inflight() != 0; i++) usleep(25000);
+        wait_retired();
         CHECK(dbdir()->attach_count() == 0);
         const uint64_t cap2 = dbdir()->counters(5);
         printf("  attach table: %llu slots with %d zones, %llu slots with none (%llu shrinks)\n", (unsigned long long)cap1, NZ, (unsigned long long)cap2, (unsigned long long)dbdir()->counters(7));
@@ -3354,7 +3495,7 @@ static int run_s5(const char *mode) {
             dbreg_cache_stats(&p3);
             CHECK(p3.pinned_bytes == p0.pinned_bytes);
             CHECK(dbreg_test_evict("default", nm[30]));                                                                      /* (and a zone that left memory is not counted) */
-            for (int i = 0; i < 100 && dbreg_evict_inflight() != 0; i++) usleep(25000);
+            wait_retired();
         }
     }
 
@@ -3411,7 +3552,7 @@ static int run_s5(const char *mode) {
     snprintf(rm, sizeof(rm), "rm -rf %s", dir);
     (void)!system(rm);
     fflush(stdout);
-    _exit(g_failed ? 1 : 0);
+    test_exit(g_failed ? 1 : 0);
 }
 
 static int proto_main(const char *self) {
@@ -3579,7 +3720,7 @@ static int run_heap(int nz, const char *mode) {
         snprintf(zn, sizeof(zn), "z%07d.test.", i);
         CHECK(dbreg_test_evict("default", zn));
     }
-    for (int i = 0; i < 600 && (dbdir()->attach_count() > 0 || dbreg_evict_inflight() != 0); i++) usleep(100000);
+    for (int i = 0; i < 6000 && (dbdir()->attach_count() > 0 || dbreg_evict_inflight() != 0); i++) { zone_retire_process(true); usleep(10000); }
     const uint64_t h2 = heap_allocated();
     CHECK(dbdir()->attach_count() == 0);
     for (int i = 0; i < nz; i++) {
@@ -3598,10 +3739,11 @@ static int run_heap(int nz, const char *mode) {
     snprintf(rm, sizeof(rm), "rm -rf %s", dir);
     (void)!system(rm);
     fflush(stdout);
-    _exit(g_failed ? 1 : 0);
+    test_exit(g_failed ? 1 : 0);
 }
 
 int main(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IOLBF, 0);                       /* (a log that shows where the time goes, also through a pipe) */
     if (argc > 1 && strcmp(argv[1], "s5") == 0) return run_s5(argc > 2 ? argv[2] : "map");
     if (argc > 1 && strcmp(argv[1], "heap") == 0) return run_heap(argc > 2 ? atoi(argv[2]) : 100000, argc > 3 ? argv[3] : "map");
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '3') return run_fixes(argv[2]);

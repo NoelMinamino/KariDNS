@@ -1924,9 +1924,8 @@ KARIDNS_TOOL_FN int kc_db_run_source(const server_config_t *cfg, const kc_dbsrc_
  * are asked for, so what it says about memory-limit is the share of zones that fit and the recommendation, as the server says it at its start. */
 /* 0.7 S6 (store design 3.6): when the store is on ZFS (the images are read with pread() and the ARC is their cache), the Backend's heap, vfs.zfs.arc.max, the loader and about a
  * gigabyte for the system have to fit in RAM together.  Said as an information line (a sum that is over RAM says so in its text); the server cannot read these values in its sandbox. */
-KARIDNS_TOOL_FN void kc_db_zfs_memory(const database_config_t *db, const ma_est_t *e) {
+KARIDNS_TOOL_FN bool kc_db_store_on_zfs(const database_config_t *db) {
 #if defined(__FreeBSD__)
-    if (db->store_none || db->store_mode == 1) return;           /* (`store-mode map` keeps the images in the page cache: not what this sums) */
     char path[KARIDNS_DB_PATH_MAX + 1];
     snprintf(path, sizeof(path), "%s", db->store_dir ? db->store_dir : KARIDNS_DB_DEFAULT_STORE_DIR);
     struct statfs sfs;
@@ -1937,7 +1936,17 @@ KARIDNS_TOOL_FN void kc_db_zfs_memory(const database_config_t *db, const ma_est_
         if (!sl || sl == path) break;
         *sl = '\0';
     }
-    if (!have || strcmp(sfs.f_fstypename, "zfs") != 0) return;
+    return have && strcmp(sfs.f_fstypename, "zfs") == 0;
+#else
+    (void)db;
+    return false;
+#endif
+}
+
+KARIDNS_TOOL_FN void kc_db_zfs_memory(const database_config_t *db, const ma_est_t *e) {
+#if defined(__FreeBSD__)
+    if (db->store_none || db->store_mode == 1) return;           /* (`store-mode map` keeps the images in the page cache: not what this sums) */
+    if (!kc_db_store_on_zfs(db)) return;
     uint64_t arc = 0, ram = 0;
     size_t l = sizeof(arc);
     if (sysctlbyname("vfs.zfs.arc.max", &arc, &l, NULL, 0) != 0 || (l != 4 && l != 8)) return;
@@ -1963,6 +1972,7 @@ KARIDNS_TOOL_FN void kc_db_memory(const server_config_t *cfg, const kc_msum_t *m
     in.records = ms->records;
     in.limit = db->memory_limit;
     in.fetch_conc = db->fetch_concurrency ? db->fetch_concurrency : (db->loader_threads ? db->loader_threads : 1) * KARIDNS_DB_FETCH_CONC_PER_THREAD;
+    if (!db->store_none) in.store_mode = db->store_mode == 1 ? MA_STORE_MAP : db->store_mode == 2 ? MA_STORE_COPY : kc_db_store_on_zfs(db) ? MA_STORE_COPY : MA_STORE_MAP;      /* (0.7 D6: the store is the directory; the loader keeps no table) */
     ma_est_t e;
     ma_estimate(&in, &e);
     char t[900];

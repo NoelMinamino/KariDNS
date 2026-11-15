@@ -775,7 +775,9 @@ What the last open found and did, and how long it took
 .TP 8
 \fBstore.open.ix_read_us\fR, \fB.zt_readahead_us\fR, \fB.zt_readahead_done\fR
 The open reads the name index once before the first answer (\fBix_read_us\fR:
-how long that took); a thread then reads the zone table into memory in the
+how long that took, with the wait for the disk for every page that was not in
+memory: 17.6 MB of a million zones took 16.6 ms from a cold ARC and 1.4 ms from
+a warm one); a thread then reads the zone tables (zt and zc) into memory in the
 background (\fBzt_readahead_us\fR, 0 until \fBzt_readahead_done\fR is 1)
 .TP 8
 \fBstore.errors.total\fR
@@ -908,7 +910,8 @@ Zones taken out of memory; \fBstore.detach.limit\fR (memory-limit), \fB.room\fR
 .TP 8
 \fBstore.cold.attach\fR, \fB.fetch\fR, \fB.timeout\fR
 Queries for a zone that was not attached: answered after an attach, sent to a
-database fetch (a zone with no image, or a damaged one), ended by the park
+database fetch (a zone with no image, or a damaged one: a query that waits for a
+fetch or an attach that another query started is not counted), ended by the park
 time-out
 .TP 8
 \fBstore.cold.p50_us\fR, \fB.p90_us\fR, \fB.p99_us\fR, \fB.max_us\fR, \fB.hist.le_<2^i>us\fR, \fB.hist.more\fR
@@ -919,7 +922,14 @@ Time from the parked query to its answer, for \fBstore.cold.attach\fR
 .TP 8
 \fBstore.memory.zones\fR, \fB.records\fR, \fB.basis\fR
 Zones and records the estimate is for, and where the size of a zone comes from
-(\fBassumed\fR, \fBresident\fR, \fBrecords\fR)
+(\fBassumed\fR, \fBresident\fR, \fBrecords\fR, or \fBstore\fR: the average image
+of the zones the store holds)
+.TP 8
+\fBstore.memory.tables_bytes\fR, \fB.mapped_bytes\fR, \fB.copy_mode\fR
+With the store: the size of its tables (file pages, not heap: the directory
+costs the heap nothing), every file page the Backend maps for the zones (the
+tables, and in \fBmap\fR mode the images of the zones in memory), and 1 for
+\fBcopy\fR mode (the images are heap)
 .TP 8
 \fBstore.memory.counted_all_bytes\fR, \fB.avg_zone_bytes\fR, \fB.backend_all_bytes\fR, \fB.loader_all_bytes\fR, \fB.directory_bytes\fR
 What \fBmemory\-limit\fR counts with every zone in memory, the average zone, the

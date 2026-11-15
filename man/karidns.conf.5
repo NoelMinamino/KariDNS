@@ -3625,12 +3625,12 @@ limit" below). When the time is up the client gets the one error message of RFC
 \fIDefault:\fR \fBloader\-threads\fR x 16 (at least 16)
 .br
 \fIDescription:\fR D1a: how many zones may be on their way from the loader at
-once while \fBmemory\-limit\fR is set, 2..256. It protects the database: no more
-than this many reads are made at a time. A request over the limit \fBwaits\fR
-(0.7): the worker parks the query and asks as for any query, and the ingest
-thread keeps the request in an ordered queue (the oldest request first, one per
-zone, at most 8192 at a time) and makes it when a place is free; if
-\fBpark\-timeout\fR runs out first the request is dropped and the query gets
+once (0.7: with and without \fBmemory\-limit\fR), 2..256. It protects the
+database: no more than this many reads are made at a time. A request over the
+limit \fBwaits\fR (0.7): the worker parks the query and asks as for any query,
+and the ingest thread keeps the request in an ordered queue (the oldest request
+first, one per zone, at most 8192 at a time) and makes it when a place is free;
+if \fBpark\-timeout\fR runs out first the request is dropped and the query gets
 SERVFAIL + EDE 14 like any parked query (counted in \fBpark_timeout\fR, and
 \fBqueue_dropped\fR of the \fBfetchq:\fR line). No query is answered "not ready"
 for the limit. A query for a zone whose fetch is already on its way waits for it
@@ -3746,10 +3746,12 @@ holds the images (the default for UFS); \fBcopy\fR: an image is read into memory
 cache and in the ARC). \fBauto\fR looks at the file system.
 .TP 8
 \fBstore\-threads <n>;\fR
-\fIDefault:\fR \fB2\fR (1..8)
+\fIDefault:\fR \fB2\fR (1..32)
 .br
 \fIDescription:\fR 0.7, restart-only: the threads that attach zones from the
-store. One more thread writes the zones to the store.
+store. They wait for the disk when an image is not in the page cache, so more of
+them read more at once (a few per disk queue); a thread that has nothing to do
+costs nothing. One more thread writes the zones to the store.
 .TP 8
 \fBstore\-segment\-size <bytes>;\fR
 \fIDefault:\fR \fB256M\fR (\fB1M\fR..\fB4G\fR, K / M / G)
@@ -3783,25 +3785,27 @@ the hot list have been read. See "Warm-up" below.
 memory. \fBpark\-max\fR (1..65536, read when the server starts): how many such
 queries ONE WORKER holds while it waits for the zone (the limit is per worker,
 not for the server: with N workers the server holds up to N times as many; the
-table is allocated at start and its pages are not used until a query
-parks). Each entry takes about 4.5 KB (a parked UDP request of up to 4096 bytes
-is kept in it), so the largest value, 65536, is up to about 300 MB of address
-space per worker once the table is full; the default 1024 is about 4.5 MB per
-worker; a query beyond that, or one longer than 4096 bytes, is answered at
-once. \fBpark\-timeout\fR (10..60000 milliseconds): how long a parked query
-waits; then the answer is SERVFAIL with Extended DNS Error 14, Not Ready (RFC
-8914 4.15), as it is when the fetch of the zone failed (signed with the key of a
-validly signed request, RFC 8945 5.3; it counts for
-\fBrate\-limit\fR). \fBallow\-query\fR (and \fBallow\-query\-on\fR) is evaluated
-first, with the same chain as for a zone in memory, before a query parks or the
-zone is asked for: a client that may not ask gets REFUSED + EDE 18, uses no
-entry of the park table, makes the server read nothing and learns nothing about
-the zone. DoT and DoH, which do not park, answer SERVFAIL + EDE 14 for such a
-zone (REFUSED for a client that may not ask). A DB zone's own settings cannot
-contain \fBallow\-query\fR, so for a zone out of memory the view's and options'
-statements decide. Without \fBmemory\-limit\fR nothing takes a zone out of
-memory, so no query parks and these options change nothing (see "Memory limit"
-below and \fBkaridns\-dbloader(8)\fR, "The fetch stream").
+table is allocated at start and its pages are not used until a query parks). An
+entry takes a header of about 130 bytes and a block for the request, 256 bytes
+for the usual one (a request that does not fit, up to 4096 bytes with its names,
+takes a long block, of which the table has one for every eight entries), so the
+default 1024 is about 0.5 MB per worker and 16384 about 9 MB; every operation on
+the table is one step per query of the zone, whatever the size; a query beyond
+that, or one longer than 4096 bytes, is answered at once. \fBpark\-timeout\fR
+(10..60000 milliseconds): how long a parked query waits; then the answer is
+SERVFAIL with Extended DNS Error 14, Not Ready (RFC 8914 4.15), as it is when
+the fetch of the zone failed (signed with the key of a validly signed request,
+RFC 8945 5.3; it counts for \fBrate\-limit\fR). \fBallow\-query\fR (and
+\fBallow\-query\-on\fR) is evaluated first, with the same chain as for a zone in
+memory, before a query parks or the zone is asked for: a client that may not ask
+gets REFUSED + EDE 18, uses no entry of the park table, makes the server read
+nothing and learns nothing about the zone. DoT and DoH, which do not park,
+answer SERVFAIL + EDE 14 for such a zone (REFUSED for a client that may not
+ask). A DB zone's own settings cannot contain \fBallow\-query\fR, so for a zone
+out of memory the view's and options' statements decide. Without
+\fBmemory\-limit\fR nothing takes a zone out of memory, so no query parks and
+these options change nothing (see "Memory limit" below and
+\fBkaridns\-dbloader(8)\fR, "The fetch stream").
 .PP
 | \fBserver\-id "<id>";\fR | the host name | postgresql (milestone B11): the
 name under which this server writes its row of \fBkaridns_server_status\fR
@@ -4450,11 +4454,12 @@ query to the install: \fBpark_full\fR counts queries that found the worker's
 table of parked queries full (\fBpark\-max\fR) and were answered "not ready" at
 once; \fBring_dropped\fR, queries whose request for the zone could not be handed
 from the worker to the ingest thread (the worker's ring of 128 was full: the
-ingest thread is behind); \fBfetch\-rate\fR, \fBfetch\-concurrency\fR and
-\fBmemory\-limit\fR refuse requests before the fetch is made
-(\fBrefused_by_rate=\fR and \fBshed=\fR of the other lines); \fBtable_full\fR,
-requests refused because all 256 places of the fetch table were taken (reachable
-only without \fBmemory\-limit\fR, which stops requests at
+ingest thread is behind; the query stays parked and the request is made again,
+so this counts refusals, not lost queries); \fBfetch\-rate\fR,
+\fBfetch\-concurrency\fR and \fBmemory\-limit\fR refuse requests before the
+fetch is made (\fBrefused_by_rate=\fR and \fBshed=\fR of the other lines);
+\fBtable_full\fR, requests refused because all 256 places of the fetch table
+were taken (reachable only without \fBmemory\-limit\fR, which stops requests at
 \fBfetch\-concurrency\fR, at most 256, first); \fBin_flight\fR and \fBpeak\fR
 are the fetches on their way now and the most there have been at one time
 (compare \fBpeak\fR with \fBfetch\-concurrency\fR to see whether the limit is
@@ -4684,20 +4689,27 @@ buffer), checks the record's checksum, the whole structure of the image
 (\fBzone_image_validate()\fR, every time) and that the image is the zone's,
 makes the zone's entry the way an install does (only if the store still offers
 the version that was read: a newer install or a delete that came meanwhile wins)
-and wakes the query. The attach is given 200 ms; a query whose attach is still
-queued then goes on waiting for the rest of its \fBpark\-timeout\fR and is not
-answered "not ready" earlier. The query path never sleeps for the store: a
-worker that finds a table cell of the store being written spins a few hundred
-times and then parks the query for a store thread, which looks again. The answer
-is the one the zone read from the database gives, byte for byte. A record that
-is missing or damaged (checksum, structure) falls back to the read from the
-database (a zone the store knows without an image, "known", is read from the
-database): the queries that wait for it are given the \fBpark\-timeout\fR again,
-a damaged record is logged (\fB[Store] the record of zone ... cannot be used\fR)
-and set back to "known", and the next install writes it again. Taking a zone out
-of memory (\fBmemory\-limit\fR) is what it always was, for the zones in memory;
-the record stays, the next query attaches it again. The mapped bytes (\fBmap\fR)
-or the buffer (\fBcopy\fR) of an attached image count for \fBmemory\-limit\fR as
+and wakes the query. The worker asks with the zone's id in the store (8 bytes,
+one request for a zone however many workers have a query parked for it; the
+rings hold 4096 requests a worker), and only the workers that asked are woken. A
+full ring never sends a stored zone to the database: the query stays parked and
+the worker asks again until the ring has room, and the stored zone is not read
+from the loader for a query (\fBfetch issued\fR stays 0 for it, whatever the
+load; a burst of first queries for zones that are all stored is answered from
+the store). The attach is given 200 ms; a query whose attach is still queued
+then goes on waiting for the rest of its \fBpark\-timeout\fR and is not answered
+"not ready" earlier. The query path never sleeps for the store: a worker that
+finds a table cell of the store being written spins a few hundred times and then
+parks the query for a store thread, which looks again. The answer is the one the
+zone read from the database gives, byte for byte. A record that is missing or
+damaged (checksum, structure) falls back to the read from the database (a zone
+the store knows without an image, "known", is read from the database): the
+queries that wait for it are given the \fBpark\-timeout\fR again, a damaged
+record is logged (\fB[Store] the record of zone ... cannot be used\fR) and set
+back to "known", and the next install writes it again. Taking a zone out of
+memory (\fBmemory\-limit\fR) is what it always was, for the zones in memory; the
+record stays, the next query attaches it again. The mapped bytes (\fBmap\fR) or
+the buffer (\fBcopy\fR) of an attached image count for \fBmemory\-limit\fR as
 the rest of the zone does, and are given back when the zone's version is freed;
 a mapped image stays mapped until the last reader of the version is gone. A
 dynamic UPDATE keeps the zone it changed in memory until the database's version
@@ -4887,35 +4899,36 @@ window). Read it from the query to the install: \fBpark_full\fR counts queries
 that found the worker's table of parked queries full (\fBpark\-max\fR) and were
 answered "not ready" at once (true overload); \fBring_dropped\fR, queries whose
 request for the zone could not be handed from the worker to the ingest thread
-(the worker's ring of 128 was full: the ingest thread is behind); the requests
-that cannot be made at once because of \fBfetch\-concurrency\fR,
-\fBfetch\-rate\fR or \fBmemory\-limit\fR \fBwait\fR (0.7): \fBqueued\fR is how
-many wait now, \fBqueue_peak\fR the most there have been, \fBwaited\fR how many
-had to wait (since the start), \fBqueue_dropped\fR how many ran out of
-\fBpark\-timeout\fR while they waited (their queries get SERVFAIL + EDE 14 from
-their workers, see \fBpark_timeout\fR), and \fBqueue_full\fR how many were
-refused because the queue (8192 requests) was full, which is the only refusal of
-a query left (also counted in \fBshed\fR of the \fBcache:\fR line); a
-\fBqueued\fR that stays above 0 while \fBin_flight\fR is 0 and the bucket is not
-empty would be a request that is stuck: please report it; \fBtable_full\fR,
-requests refused because all 256 places of the fetch table were taken (normally
-0: \fBfetch\-concurrency\fR, at most the 256 places, stops the requests of whole
-zones first, so only a request that comes while summaries of zones are in flight
-can find the table full next to a \fBfetch\-concurrency\fR of 256);
-\fBin_flight\fR and \fBpeak\fR are the fetches on their way now and the most
-there have been at one time (compare \fBpeak\fR with \fBfetch\-concurrency\fR to
-see whether the limit is the one that held requests back, and \fBwaited\fR to
-see how many it held), \fBplaces\fR the places of \fBfetch\-concurrency\fR in
-use now: the whole-zone fetches that are in flight (0 at rest; a value that
-stays above 0 while \fBin_flight\fR is 0 would be a place that was not given
-back: please report it); \fBloader_busy\fR, fetches the loader turned away
-because its own queue of requests was full; \fBhist\fR is the time from the
-request to the install of the zone, for the fetches that succeeded, in five
-counts (up to 1 ms, up to 10 ms, up to 100 ms, up to 1 s, more);
-\fBpark_timeout\fR, parked queries whose zone was not there before
-\fBpark\-timeout\fR ran out; \fBingest_busy\fR is the share of the last ten
-seconds in which the ingest thread was working and not waiting for something to
-do (0 for the first ten seconds; near 100% means the thread is the limit; the
+(the worker's ring of 128 was full: the ingest thread is behind; the query stays
+parked and the request is made again, so this counts refusals, not lost
+queries); the requests that cannot be made at once because of
+\fBfetch\-concurrency\fR, \fBfetch\-rate\fR or \fBmemory\-limit\fR \fBwait\fR
+(0.7): \fBqueued\fR is how many wait now, \fBqueue_peak\fR the most there have
+been, \fBwaited\fR how many had to wait (since the start), \fBqueue_dropped\fR
+how many ran out of \fBpark\-timeout\fR while they waited (their queries get
+SERVFAIL + EDE 14 from their workers, see \fBpark_timeout\fR), and
+\fBqueue_full\fR how many were refused because the queue (8192 requests) was
+full, which is the only refusal of a query left (also counted in \fBshed\fR of
+the \fBcache:\fR line); a \fBqueued\fR that stays above 0 while \fBin_flight\fR
+is 0 and the bucket is not empty would be a request that is stuck: please report
+it; \fBtable_full\fR, requests refused because all 256 places of the fetch table
+were taken (normally 0: \fBfetch\-concurrency\fR, at most the 256 places, stops
+the requests of whole zones first, so only a request that comes while summaries
+of zones are in flight can find the table full next to a
+\fBfetch\-concurrency\fR of 256); \fBin_flight\fR and \fBpeak\fR are the fetches
+on their way now and the most there have been at one time (compare \fBpeak\fR
+with \fBfetch\-concurrency\fR to see whether the limit is the one that held
+requests back, and \fBwaited\fR to see how many it held), \fBplaces\fR the
+places of \fBfetch\-concurrency\fR in use now: the whole-zone fetches that are
+in flight (0 at rest; a value that stays above 0 while \fBin_flight\fR is 0
+would be a place that was not given back: please report it); \fBloader_busy\fR,
+fetches the loader turned away because its own queue of requests was full;
+\fBhist\fR is the time from the request to the install of the zone, for the
+fetches that succeeded, in five counts (up to 1 ms, up to 10 ms, up to 100 ms,
+up to 1 s, more); \fBpark_timeout\fR, parked queries whose zone was not there
+before \fBpark\-timeout\fR ran out; \fBingest_busy\fR is the share of the last
+ten seconds in which the ingest thread was working and not waiting for something
+to do (0 for the first ten seconds; near 100% means the thread is the limit; the
 thread handles at most 64 requests or about a millisecond at a time and then
 reads the loader's answers, so a flood of queries cannot keep it from installing
 the zones that arrive). Typical readings: a high \fBingest_busy\fR with a slow

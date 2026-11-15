@@ -232,6 +232,8 @@ static void karictl_store_add_arc_sum(char *buf, size_t cap, size_t *len, int fm
     if (sysctlbyname("vfs.zfs.arc.max", &arc_max, &l, NULL, 0) != 0 || (l != 4 && l != 8)) return;
     l = sizeof(ram);
     if (sysctlbyname("hw.physmem", &ram, &l, NULL, 0) != 0 || (l != 4 && l != 8)) ram = 0;
+    uint64_t copy = 1;
+    if (karictl_reply_num(buf, fmt, "copy_mode", &copy) && !copy) return;       /* (MAP mode: the images are file pages of the page cache, not heap and not the ARC: nothing to sum) */
     if (!karictl_reply_num(buf, fmt, "limit_bytes", &lim)) lim = 0;
     bool have = lim > 0 && karictl_reply_num(buf, fmt, "backend_limit_bytes", &be) && karictl_reply_num(buf, fmt, "loader_limit_bytes", &ld);
     if (!have) have = karictl_reply_num(buf, fmt, "backend_all_bytes", &be) && karictl_reply_num(buf, fmt, "loader_all_bytes", &ld);

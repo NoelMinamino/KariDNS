@@ -3650,7 +3650,7 @@ static bool wq_head_ready(ing_t *g, int64_t now) {
       return false;
     }
   }
-  if (dbreg_cache_limit() && !park_place_avail()) return false;
+  if (!park_place_avail() || g->nfreq >= ING_FETCH_MAX) return false;      /* (a place of fetch-concurrency, and a slot of the table: summaries and the warm-up use some) */
   return park_rate_check(now, false);
 }
 
@@ -3817,9 +3817,11 @@ static void fetch_issue(ing_t *g) {
     }
     if (q.mode != KDB_FETCH_SUMMARY) {
       /* memory-limit (design 8.5): the zones that are fetched add to what the cache manager has to take out again.  With the database zones above the hard line, or every place
-       * of fetch-concurrency taken, the request of a query waits (it is not refused); the others are not made. */
-      uint64_t lim = dbreg_cache_limit();      /* (a summary brings no zone data: the limit does not hold it back, ING_SUMMARY_NFREQ bounds it) */
-      if (lim) {
+       * of fetch-concurrency taken, the request of a query waits (it is not refused); the others are not made.  Without memory-limit the zones are never above the line, but the
+       * places of fetch-concurrency hold the queries back all the same: a zone that the store knows without an image, or one of a database without a store, is fetched for a
+       * query with no limit set too (0.7), and a burst of them waits for a place, not for a refusal when the 256 places of the table are taken.
+       * (A summary brings no zone data: the limit does not hold it back, ING_SUMMARY_NFREQ bounds it.) */
+      {
         /* the places of fetch-concurrency are one pool (park_place_take()): only this thread takes them (a fetch keeps its place until it is over), so that fetches in flight
          * stay within the limit */
         bool over = dbreg_cache_over_limit();
@@ -3889,16 +3891,15 @@ static void fetch_issue(ing_t *g) {
         continue;
       }
     }
-    int st = (q.mode == KDB_FETCH_SUMMARY || bulk) ? DBREG_FETCH_STARTED : dbreg_fetch_begin(g->view_names[vi], q.zone);       /* (a summary leaves the zone's state alone: queries are not held for it) */
-    if (st == DBREG_FETCH_BUSY) continue;
-    if (st != DBREG_FETCH_STARTED) {                     /* in memory already (woken), or not a zone of the registry (answered at once) */
-      park_wake_queue_all(q.view, q.zone, st == DBREG_FETCH_NONE);
-      continue;
-    }
+    /* a slot of the table first, before the registry is asked: a request that finds the table full is refused (or waits) without a lock of the registry (it used to make an element of the zone
+     * for the request and take it away again, two sections of the lock that every attach and every install wait for) */
     for (uint32_t i = 0; i < ING_FETCH_MAX && !r; i++)
       if (!g->freq[i].active) r = &g->freq[i];
-    if (!r) {                                            /* too many in flight: the queries run into their deadlines */
-      if (q.mode != KDB_FETCH_SUMMARY) dbreg_fetch_end(g->view_names[vi], q.zone);
+    if (!r) {                                            /* every slot is taken */
+      if (can_wait) {                                    /* a query's request waits for a slot, as for a place */
+        if (!wq_wait(g, &q, &hold_place, &hold_tok, &hold_key, wq_deadline, wq_room, from_wq, now_ms())) wq_overflow(&q);
+        continue;
+      }
       if (bulk) {                                       /* (0.7 WP7b: the scan stands before the zone again; it is asked for at the next pass) */
         g->bg_zid = bulk_back;
             if (bulk_np) db_recon_scan_retry(bulk_zid);
@@ -3910,6 +3911,12 @@ static void fetch_issue(ing_t *g) {
       }
       atomic_fetch_add_explicit(&g_fq_table_full, 1, memory_order_relaxed);
       fetch_refuse(&q);
+      continue;
+    }
+    int st = (q.mode == KDB_FETCH_SUMMARY || bulk) ? DBREG_FETCH_STARTED : dbreg_fetch_begin(g->view_names[vi], q.zone);       /* (a summary leaves the zone's state alone: queries are not held for it) */
+    if (st == DBREG_FETCH_BUSY) continue;
+    if (st != DBREG_FETCH_STARTED) {                     /* in memory already (woken), or not a zone of the registry (answered at once) */
+      park_wake_queue_all(q.view, q.zone, st == DBREG_FETCH_NONE);
       continue;
     }
     if (q.mode == KDB_FETCH_SUMMARY) {
@@ -4274,11 +4281,12 @@ static void ma_inputs(ma_in_t *in, const dbreg_residency_t *rs, uint64_t limit) 
   zone_bytes_t zdb;
   zone_bytes_get(ZBYTES_DB, &zdb);
   memset(in, 0, sizeof(*in));
-  in->zones = dbdir() ? rs->resident : rs->total;       /* 0.7 S3: a zone of the store that is not in memory costs no heap: the directory the advice counts is the zones in memory */
+  in->zones = rs->total;                                /* (0.7 D6: every zone of the database; with the store the zones that are not in memory cost no heap, and the estimate says so: its tables are file pages) */
   in->resident_zones = rs->resident;
   in->resident_bytes = zdb.resident;
   in->limit = limit;
   in->fetch_conc = atomic_load_explicit(&g_fetch_conc, memory_order_relaxed);
+  if (dbdir()) db_store_ma_inputs(in);                  /* the mode, and the size of the images the store holds */
 }
 static void ma_say(const ma_est_t *e) {
   char t[900];
@@ -4304,6 +4312,10 @@ static void ma_tick(uint64_t limit, int64_t now) {
   }
   if (!limit || now < next_rt) return;
   next_rt = now + MA_WINDOW_MS;
+  if (db_store_filling()) {                             /* 0.7 D9: a first fill is the load: the zones are read for the store, not for the traffic, and the queries it makes wait for the zones all the same; the window starts again when it is over */
+    g_ma_rt.have_prev = false;
+    return;
+  }
   park_stats_t ps;
   park_stats_get(&ps);
   dbreg_cache_stats_t cs;

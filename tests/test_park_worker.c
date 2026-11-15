@@ -467,14 +467,21 @@ int main(void) {
         CHECK(found);
     }
 
-    /* -- the request to fetch cannot be handed over (the ring is full): "not ready" at once, nothing stays parked that nobody would wake */
+    /* -- the request to fetch cannot be handed over (the ring is full): the query is not answered "not ready" for that; it stays parked, the request is marked pending and the
+     *    worker makes it again, at every pass, until the ring has room (0.7: a full ring is never a SERVFAIL) */
     while (park_fetch_push(park_fetch_ring(0), "default", "other.test.", KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_SUMMARY)) {}
     SEND_QUERY(0x7101, true, 0);
-    CHECK(w.n_tx == 1 && table.nwait == 0 && table.nfree == table.cap);
+    CHECK(w.n_tx == 0 && table.nwait == 1 && table.nunsent == 1 && !read_answer(sk[1]).got);
+    park_service(&w, -1);                                                        /* (the ring is still full: it waits) */
+    CHECK(w.n_tx == 0 && table.nwait == 1 && table.nunsent == 1 && !read_answer(sk[1]).got);
+    while (park_fetch_pop(park_fetch_ring(0), &q)) {}                           /* (the ingest thread took them: there is room) */
+    park_service(&w, -1);
+    CHECK(table.nwait == 1 && table.nunsent == 0 && park_fetch_pop(park_fetch_ring(0), &q) && strcmp(q.zone, "park.test.") == 0 && q.prio == KDB_FETCH_PRIO_QUERY && !park_fetch_pop(park_fetch_ring(0), &q));
+    (void)park_fail(&table, "default", "park.test.");                           /* (the fetch failed: the query is answered) */
+    park_service(&w, -1);
     FLUSH();
     a = read_answer(sk[1]);
-    CHECK(a.got && a.id == 0x7101 && a.rcode == 2 && a.ede == 14);
-    while (park_fetch_pop(park_fetch_ring(0), &q)) {}
+    CHECK(a.got && a.id == 0x7101 && a.rcode == 2 && a.ede == 14 && table.nwait == 0 && table.nfree == table.cap);
 
     /* -- a TSIG-signed request gets a signed "not ready" answer (RFC 8945 5.3: the key of the verified request, the request's MAC): the same
      *    handling as every other answer of the engine */
@@ -908,9 +915,9 @@ int main(void) {
         park_claim_clear(key);
         (void)park_fail(&table, "default", "park.test.");
         {
-            uint32_t cur = 0;
+            /* (done list: no cursor) */
             park_entry_t *pe;
-            while ((pe = park_next_done(&table, &cur))) park_release(&table, pe);
+            while ((pe = park_next_done(&table))) park_release(&table, pe);
         }
         park_place_give();
         park_place_give();
@@ -937,22 +944,26 @@ int main(void) {
                 snprintf(fz, sizeof(fz), "filler%u.test.", i);
                 (void)park_fail(&table, "default", fz);
             }
-            uint32_t cur = 0;
+            /* (done list: no cursor) */
             park_entry_t *pe;
-            while ((pe = park_next_done(&table, &cur))) park_release(&table, pe);
+            while ((pe = park_next_done(&table))) park_release(&table, pe);
             CHECK(table.nfree == table.cap);
         }
 
-        /* the ring to the ingest thread is full: the park entry goes back, the mark is cleared (the query is answered "not ready" at once) */
+        /* the ring to the ingest thread is full: the query stays parked with its request pending, and the claim mark stays with it (the request is made again, with the claim); the mark
+         * is given up when the entry is dropped without the request having been made */
         while (park_fetch_push(park_fetch_ring(0), "default", "other.test.", KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_SUMMARY)) {}
         park_stats_get(&g0);
         SEND_QUERY(0x9301, true, 0);
-        CHECK(w.n_tx == 1 && table.nwait == 0 && table.nfree == table.cap && park_places_used() == 0 && !park_claim_held(key));
+        CHECK(w.n_tx == 0 && table.nwait == 1 && table.nunsent == 1 && park_places_used() == 0 && park_claim_held(key));
         park_stats_get(&g1);
         CHECK(g1.ring_dropped - g0.ring_dropped == 1);
-        FLUSH();
-        a = read_answer(sk[1]);
-        CHECK(a.got && a.id == 0x9301 && a.rcode == 2 && a.ede == 14);
+        {
+            park_entry_t *pe = park_pending_head(&table);
+            CHECK(pe && pe->pend == PARK_PEND_FETCH && (pe->prio & PARK_PRIO_CLAIMED));
+            park_release(&table, pe);                                           /* (the query is gone before the request was made: the mark goes with it) */
+            CHECK(table.nunsent == 0 && table.nwait == 0 && !park_claim_held(key));
+        }
         while (park_fetch_pop(park_fetch_ring(0), &q)) {}
 
         /* the zone is LOADING (a fetch is on its way): no claim, and the query parks and asks the old way (the request is a duplicate for the ingest thread, and
@@ -963,9 +974,9 @@ int main(void) {
         CHECK(park_fetch_pop(park_fetch_ring(0), &q) && !(q.prio & PARK_PRIO_CLAIMED) && q.prio == KDB_FETCH_PRIO_QUERY);
         (void)park_fail(&table, "default", "park.test.");
         {
-            uint32_t cur = 0;
+            /* (done list: no cursor) */
             park_entry_t *pe;
-            while ((pe = park_next_done(&table, &cur))) park_release(&table, pe);
+            while ((pe = park_next_done(&table))) park_release(&table, pe);
         }
         atomic_store(&el->state, ZDIR_ST_ABSENT);
 
@@ -975,9 +986,9 @@ int main(void) {
         CHECK(w.n_tx == 0 && table.nwait == 1 && park_fetch_pop(park_fetch_ring(0), &q) && !(q.prio & PARK_PRIO_CLAIMED) && !park_claim_held(key));
         (void)park_fail(&table, "default", "park.test.");
         {
-            uint32_t cur = 0;
+            /* (done list: no cursor) */
             park_entry_t *pe;
-            while ((pe = park_next_done(&table, &cur))) park_release(&table, pe);
+            while ((pe = park_next_done(&table))) park_release(&table, pe);
         }
 
         /* fetch_gate() itself: the zone out of memory is ABSENT; the results */
