@@ -711,6 +711,11 @@ Zones in the store by state: known without an image (the database fetch has
 them), stored (an image is in the store), rejected (flagged by the last
 reconcile), free table slots
 .TP 8
+\fBstore.zones.nonstore\fR
+Zones of the database whose name the store cannot hold (the root zone): they
+have no record and are served from the heap directory (with the store protocol;
+the line is there when a loader is running)
+.TP 8
 \fBstore.zones.attached\fR
 Zones attached (in memory as images) now: successful attaches minus detaches
 .TP 8

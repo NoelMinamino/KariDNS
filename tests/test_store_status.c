@@ -259,6 +259,7 @@ static bool recon_fn(store_recon_t *o) {
   snprintf(o->view, sizeof(o->view), "default");
   o->entries = 5000; o->created = 4000; o->same = 900; o->changed = 100; o->estimate = 5000;
   o->fetched = 77; o->in_flight = 3; o->passes = 2; o->wanted = 4100; o->known_now = 5;
+  o->nonstore = 3;
   if (g_recon_guard) {
     o->guard_views = 1;
     snprintf(o->guard_view, sizeof(o->guard_view), "default");
@@ -314,6 +315,7 @@ static void test_none(void) {
   CHECK_EQ(kv_num("store.recon.available"), 1);
   CHECK_EQ(kv_num("store.recon.pass.entries"), 5000);
   CHECK_EQ(kv_num("store.recon.pass.created"), 4000);
+  CHECK_EQ(kv_num("store.zones.nonstore"), 3);
   CHECK_EQ(kv_num("store.recon.bodies.fetched"), 77);
   CHECK_EQ(kv_num("store.recon.guard.held_views"), 0);
   CHECK(kv_get("store.recon.guard.unlisted") == NULL);                /* (the guard keys are there only while it holds) */

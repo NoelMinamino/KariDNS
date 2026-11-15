@@ -409,6 +409,7 @@ static void add_recon(list_t *l) {
   U("store.recon.sweep.deleted", r->swept);
   U("store.recon.passes", r->passes);
   U("store.recon.wanted", r->wanted);
+  U("store.zones.nonstore", r->nonstore);
   U("store.recon.bodies.known", r->known_now);
   U("store.recon.bodies.fetched", r->fetched);
   U("store.recon.bodies.failed", r->fetch_failed);

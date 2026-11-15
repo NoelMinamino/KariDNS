@@ -88,6 +88,7 @@ typedef struct store_recon {
   uint64_t swept, unlisted, total;          /* the last sweep: zones deleted, zones the pass did not list, zones of the view */
   uint64_t passes, wanted, change_upserts, change_deletes, cursors;       /* since the start */
   uint64_t known_now;            /* the records in the state KNOWN now (the store's counter) */
+  uint64_t nonstore;             /* zones of the database the store cannot name (the root zone): zones of the heap directory, no record */
   uint64_t fetched, fetch_failed, in_flight;        /* bodies the background fetch brought / could not bring / has in flight */
   unsigned guard_views;          /* views whose sweep the guard holds back */
   char guard_view[STORE_VIEW_NAME_MAX + 1];

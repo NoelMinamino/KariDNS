@@ -592,6 +592,23 @@ static int run_mode(const char *mode) {
         CHECK(zref_of("a1.test.", &z) && z.serial == 2 && strcmp(zref_name(&z), "a1.test.") == 0 && z.hview && strcmp(z.hview, "default") == 0);
         CHECK(zref_of("A1.TEST", &z) && z.zid != ZREF_NOZID && strcmp(zref_name(&z), "a1.test.") == 0);        /* (case does not matter, nor the trailing dot) */
     }
+    {   /* a query name of 900+ characters of escapes: the suffix that is the zone is found far beyond the 260 bytes the folded copy once had (ASan: no read past it), and names over 255 ask nothing */
+        static char qn[1100];
+        qn[0] = '\0';
+        for (int k = 0; k < 225; k++) strcat(qn, "\x5c" "097");
+        strcat(qn, ".A1.TEST.");
+        rcu_aux_read_lock();
+        zone_db_snapshot_t *s = acquire_zone_snapshot();
+        zref_t z;
+        bool ok = zref_find_suffix(snapshot_find_view(s, "default"), qn, &z);
+        rcu_aux_read_unlock();
+        CHECK(ok && z.zid != ZREF_NOZID && strcmp(zref_name(&z), "a1.test.") == 0);
+        char big[300];
+        memset(big, 'a', 255);
+        big[255] = '\0';
+        zref_clear(&z);
+        CHECK(!dbdir()->find(0, big, 255, &z) || z.busy || z.zid == ZREF_NOZID);          /* (a name of the store's limit: the lookup is bounded by zref_t.name) */
+    }
     dbdir_rec_t rec;
     CHECK(dbdir()->rec_get("default", "a1.test.", &rec) && rec.state == STORE_STATE_STORED && rec.serial == 2 && rec.source_id == 101);
     CHECK(!dbdir()->rec_get("default", "nosuch.test.", &rec));
@@ -1113,7 +1130,7 @@ static void p_manifest_end(int fd, kdb_enc_t *e, uint64_t batch, uint64_t n, uin
     kdb_enc_end(e);
     ch_send(fd, e);
 }
-typedef struct { int64_t sid; uint8_t op; char name[64]; bool has_name; uint8_t kind; bool stamped; uint64_t gen, time; bool force; } pc_t;
+typedef struct { int64_t sid; uint8_t op; char name[400]; bool has_name; uint8_t kind; bool stamped; uint64_t gen, time; bool force; } pc_t;
 static void p_changes(int fd, kdb_enc_t *e, uint64_t batch, uint64_t cursor, bool last, const pc_t *c, int n) {
     kdb_enc_begin(e, KDB_T_CHANGES);
     kdb_enc_u64(e, 1, batch); kdb_enc_u16(e, 2, 0); kdb_enc_u64(e, 3, cursor); kdb_enc_u8(e, 4, last ? 1 : 0); kdb_enc_bytes(e, 5, g_pident, strlen(g_pident));
@@ -1161,6 +1178,7 @@ static int serve_fetches(ch_t *fetchc, int fd, kdb_enc_t *e, int ms, int skip_lo
     while (ch_next(fetchc, &m, ms)) {
         if (m.type != KDB_T_FETCH_REQ) continue;
         const kdb_fetch_req_t *r = &m.u.fetch_req;
+        if (getenv("H3DBG")) fprintf(stderr, "FETCHREQ len=%zu [%.20s]" "\n", strlen(r->name), r->name);
         int i = pn_index(r->name);
         if (i < 0 || i >= PN + 16) {
             if (g_pother < 16) snprintf(g_pothername[g_pother], sizeof(g_pothername[0]), "%s", r->name);
@@ -1570,6 +1588,62 @@ static int run_proto(int phase, const char *dir) {
             have = false;
             for (int t = 0; t < 200 && !have; t++) { have = db_ingest_reload_result(&rr); if (!have) usleep(10000); }
             CHECK(have && rr.id == r2 && rr.ok && strstr(rr.text, "serial 1") != NULL && strstr(rr.text, "applied") != NULL);
+        }
+
+        /* -- H3. the root zone, which the store cannot name: no record; the Backend asks for the body like a secondary zone's (it becomes a zone of the heap directory), counts it
+         * (store.zones.nonstore), asks again only for a new stamp, and does not keep the cursor of the view while it has one.  A name of over 255 bytes of text (escapes) can be neither stored nor keyed by
+         * the heap directory: it is refused (rejected), as before */
+        {
+            char longn[400];                                              /* (5 labels of 30 dots written as escapes: 300 bytes of text, 156 on the wire: over the 255 the store and the directory key) */
+            longn[0] = '\0';
+            for (int j = 0; j < 5; j++) {
+                for (int k = 0; k < 30; k++) strcat(longn, "\\.");
+                strcat(longn, ".");
+            }
+            memset(c, 0, sizeof(c));
+            c[0] = (pc_t){ .sid = 9100, .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 1, .time = 5 };  snprintf(c[0].name, sizeof(c[0].name), ".");
+            c[1] = (pc_t){ .sid = 9101, .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 1, .time = 5 };  snprintf(c[1].name, sizeof(c[1].name), "%s", longn);
+            g_pother = 0;
+            p_batch_begin(a[0], &e, 30, KDB_BATCH_AUTO, 0);
+            p_changes(a[0], &e, 30, 220, true, c, 2);
+            p_batch_end(a[0], &e, 30, 2, 0);
+            CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.n_applied == 1 && m.u.batch_result.n_rejected == 1);
+            (void)serve_fetches(&fetchc, f[0], &e, 700, -1, -1);
+            {
+                store_zone_t z;
+                db_recon_status_t rs;
+                db_recon_status(&rs);
+                CHECK(g_pother == 1);
+                CHECK(strcmp(g_pothername[0], ".") == 0);
+                CHECK(rs.nonstore == 1);
+                CHECK(!zrec(st, "", &z));                                /* (no record) */
+            }
+            CHECK(cursor_is(st, 216));                                   /* (not advanced while the view has such a zone) */
+            p_batch_begin(a[0], &e, 31, KDB_BATCH_AUTO, 0);
+            p_changes(a[0], &e, 31, 221, true, c, 2);                    /* (the same stamps: not asked for again) */
+            p_batch_end(a[0], &e, 31, 2, 0);
+            CHECK(p_result(&mainc, &m, 10000));
+            (void)serve_fetches(&fetchc, f[0], &e, 400, -1, -1);
+            CHECK(g_pother == 1);
+            c[0].gen = 2;
+            p_batch_begin(a[0], &e, 32, KDB_BATCH_AUTO, 0);
+            p_changes(a[0], &e, 32, 222, true, c, 1);                    /* (a new stamp of the root zone) */
+            p_batch_end(a[0], &e, 32, 1, 0);
+            CHECK(p_result(&mainc, &m, 10000));
+            (void)serve_fetches(&fetchc, f[0], &e, 700, -1, -1);
+            CHECK(g_pother == 2);
+            c[0] = (pc_t){ .sid = 9100, .op = KDB_CH_DELETE };                /* (by source id: the loader has no name for a zone whose row is gone) */
+            c[1] = (pc_t){ .sid = 9101, .op = KDB_CH_DELETE };
+            p_batch_begin(a[0], &e, 33, KDB_BATCH_AUTO, 0);
+            p_changes(a[0], &e, 33, 223, true, c, 2);                    /* (the refused zone is not known: nothing to delete) */
+            p_batch_end(a[0], &e, 33, 0, 2);
+            CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.n_deleted == 1);
+            {
+                db_recon_status_t rs;
+                db_recon_status(&rs);
+                CHECK(rs.nonstore == 0);
+            }
+            CHECK(cursor_is(st, 223));                                   /* (no such zone: the cursor goes on) */
         }
 
         /* -- I. work that is interrupted: three zones change and the loader does not answer; the process ends as if it were killed */

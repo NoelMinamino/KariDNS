@@ -779,6 +779,7 @@ typedef struct view_snapshot {
  * (D-PRIO, D17-1) without a flag in the store, and a longer database apex wins over a shorter static one.  A database zone that is in memory (attached) has a registry element
  * (ZDIR_K_STORED) that the attach table (zid -> element, lock-free, dns_db_store.c) reaches; a zone that is not has none and costs no heap.  The result of a lookup is a zref_t. */
 #define ZREF_NOZID 0xFFFFFFFFu
+#define ZREF_NAME_SIZE 258        /* the canonical name of a store zone with its dot and NUL: the store keeps names up to 255 bytes of text (STORE_NAME_MAX; dns_db_store.c checks it) */
 enum { ZREF_ST_NONE = 0, ZREF_ST_ABSENT, ZREF_ST_KNOWN };    /* a store zone that is not in memory: its image is stored / it has no image (it is read from the database) */
 typedef struct zref {
   zone_db_entry_t *entry;        /* the data in memory (a heap element's, or the attached zone's); NULL: not in memory */
@@ -791,7 +792,7 @@ typedef struct zref {
   uint8_t zstate;                /* ZREF_ST_* */
   bool busy;                     /* the store had a cell that was being written: the zone is not known now (a worker parks the query for a store thread; it never waits) */
   const char *hview;             /* the name of the view that holds the zone (the owner's for a zone shared by in-view) */
-  char name[256];                /* a store zone that is not in memory: its canonical name with the trailing dot (use zref_name()) */
+  char name[ZREF_NAME_SIZE];     /* a store zone that is not in memory: its canonical name with the trailing dot (use zref_name()) */
 } zref_t;
 static inline void zref_clear(zref_t *z) {
   z->entry = NULL; z->el = NULL; z->zid = ZREF_NOZID; z->serial = 0; z->settings = 0; z->flags = 0; z->sview = -1; z->zstate = ZREF_ST_NONE; z->busy = false; z->hview = NULL; z->name[0] = '\0';

@@ -560,9 +560,18 @@ entry with \fBforce\fR: the Backend asks for the body at once and holds
 command says \fBapplied, serial N\fR or \fBrejected\fR as before; a loader that
 is stopped gives the control channel's timeout.
 .IP \(bu 2
-\fBZones the store cannot name\fR (the root zone, a name over 255 bytes) are not
-kept and, with the store protocol, not loaded: they are counted as rejected and
-logged once per batch; \fBstore none;\fR keeps them in the heap as before.
+\fBZones the store cannot name\fR (the root zone, whose store name would be
+empty) have no record and are not kept in the store. The Backend remembers them
+in a small list of its own, asks for their bodies like a secondary zone's (once
+a run, and again when the database changes their version), and serves them from
+the heap directory, as it did before the store. It logs each one once at NOTICE,
+counts them (\fBstore.zones.nonstore\fR, \fBkarictl dbstatus\fR), and does not
+keep the cursor of a view that has one, so that every start lists the zones
+again and loads them. (The loader itself does not offer the root zone of a pdns
+database today: \fBthe root zone is not supported\fR.) A name of more than 255
+bytes of text, which only escapes make, can be neither stored nor keyed by the
+zone directory: it is counted as rejected and logged once per batch, with the
+store as without it.
 .IP \(bu 2
 \fBNot reported to the loader.\fR The loader's report of the failed zones of a
 reload (\fBkaridns_server_status.failed_zones\fR, B11) has the zones the loader

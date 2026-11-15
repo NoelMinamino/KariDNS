@@ -33,7 +33,9 @@
 #include "dns_utils.h"
 #include "dns_zone_image.h"
 
-#define DBS_NAME_MAX 256
+#define DBS_NAME_MAX 258          /* a store name (at most STORE_NAME_MAX) with its dot and NUL: the canonical name of a zref_t */
+_Static_assert(DBS_NAME_MAX >= STORE_NAME_MAX + 3, "DBS_NAME_MAX");
+_Static_assert(ZREF_NAME_SIZE >= STORE_NAME_MAX + 3, "ZREF_NAME_SIZE");
 #define DBS_CFGID 8                        /* 0.7 WP7b: bytes of the cursor's identity that are the hash of the view's configuration; the loader's own identity follows (at most STORE_IDENT_MAX - 8 bytes) */
 #define DBS_GUARD_PCT 20u                  /* decision D7: the sweep of a pass deletes nothing when it would delete more than this share of the view's zones ... */
 #define DBS_GUARD_MIN 1000u                /* ... and more than this many */
@@ -1329,6 +1331,19 @@ static void bits_free(bits_t *b) {
   b->nw = 0;
 }
 
+/* A zone whose name the store cannot hold (the root zone: the store's names have no trailing dot, so it would be the empty name) has no record.  The
+ * Backend remembers it here (config-sized: a handful of zones) so that it is fetched and served as a zone of the heap directory, as before the store.  The loader's stamp tells a new
+ * version.  A pseudo zone id (UN_ZID_BASE + id) names it to the scan and its retry. */
+#define UN_ZID_BASE 0xF0000000u
+typedef struct un_zone {
+  char view[STORE_VIEW_NAME_MAX + 1];
+  char *name;                    /* canonical, with the trailing dot */
+  int64_t sid;
+  bool stamped, has_serial, done, seen;
+  uint64_t gen, time;
+  uint32_t serial, id;
+} un_zone_t;
+
 /* All of it is the ingest thread's, but the figures (RC.s, the guard) are read by the control thread (karictl store, dbstatus): under RC.mu */
 static struct {
   pthread_mutex_t mu;
@@ -1342,11 +1357,174 @@ static struct {
   bits_t np_done;
   /* the mass-delete guard: the views whose sweep is held back */
   bool held[STORE_MAX_VIEWS];
+  /* the zones the store cannot name (the root zone, a text name over 255 bytes): no record, a list of their own (under mu) */
+  un_zone_t *un;
+  size_t un_n, un_cap;
+  uint32_t un_seq;
   db_recon_status_t s;
 } RC = { .mu = PTHREAD_MUTEX_INITIALIZER };
 
 static void rc_lock(void) { pthread_mutex_lock(&RC.mu); }
 static void rc_unlock(void) { pthread_mutex_unlock(&RC.mu); }
+
+/* ---- the zones the store cannot name (RC.un; every function takes RC.mu itself unless it says _locked) ---- */
+static _Atomic uint32_t UN_CNT;
+
+static int un_find_locked(const char *view, int64_t sid, const char *name) {
+  for (size_t i = 0; i < RC.un_n; i++) {
+    const un_zone_t *u = &RC.un[i];
+    if (strcmp(u->view, view) != 0) continue;
+    if ((sid != 0 && u->sid == sid) || (name && strcasecmp(u->name, name) == 0)) return (int)i;
+  }
+  return -1;
+}
+
+static void un_drop_locked(size_t i) {
+  free(RC.un[i].name);
+  RC.un[i] = RC.un[--RC.un_n];
+  atomic_store_explicit(&UN_CNT, (uint32_t)RC.un_n, memory_order_relaxed);
+}
+
+/* forget the zone of the source id (or the name): true, and its name in old */
+static bool un_remove(const char *view, int64_t sid, const char *name, char *old, size_t cap) {
+  if (atomic_load_explicit(&UN_CNT, memory_order_relaxed) == 0) return false;
+  bool r = false;
+  rc_lock();
+  int i = un_find_locked(view, sid, name);
+  if (i >= 0) {
+    snprintf(old, cap, "%s", RC.un[i].name);
+    un_drop_locked((size_t)i);
+    r = true;
+  }
+  rc_unlock();
+  return r;
+}
+
+static uint64_t un_count_view(const char *view) {
+  if (atomic_load_explicit(&UN_CNT, memory_order_relaxed) == 0) return 0;
+  uint64_t n = 0;
+  rc_lock();
+  for (size_t i = 0; i < RC.un_n; i++)
+    if (strcmp(RC.un[i].view, view) == 0) n++;
+  rc_unlock();
+  return n;
+}
+
+static void un_mark(const char *view) {
+  rc_lock();
+  for (size_t i = 0; i < RC.un_n; i++)
+    if (strcmp(RC.un[i].view, view) == 0) RC.un[i].seen = false;
+  rc_unlock();
+}
+
+/* the end of a complete pass: the zones the pass did not list are gone from the database */
+static uint64_t un_sweep(const char *view) {
+  uint64_t n = 0;
+  for (;;) {
+    char old[1026];
+    int64_t sid = 0;
+    bool got = false;
+    rc_lock();
+    for (size_t i = 0; i < RC.un_n && !got; i++)
+      if (!RC.un[i].seen && strcmp(RC.un[i].view, view) == 0) {
+        snprintf(old, sizeof(old), "%s", RC.un[i].name);
+        sid = RC.un[i].sid;
+        un_drop_locked(i);
+        got = true;
+      }
+    rc_unlock();
+    if (!got) break;
+    if (dbreg_delete(view, old, sid) > 0) n++;
+  }
+  return n;
+}
+
+/* An entry of a zone the store cannot name: the Backend remembers it (a new version is asked for like a secondary zone's body) and the body is installed as a zone of the heap directory.
+ * The result is the one of a record: NEW (a first sight), CHANGED (another version), RENAMED, PENDING (asked for, not here yet), SAME. */
+static int un_apply(const char *view, const db_recon_entry_t *e) {
+  /* the heap directory keys a name by at most 255 bytes of text too (its klen is a byte): a longer name (only escapes make one) cannot be served at all and is refused as before */
+  if (strlen(e->name) > STORE_NAME_MAX + 1 || strlen(view) > STORE_VIEW_NAME_MAX) return DBR_UNSTORABLE;
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  char old[1026], oldrec[1026];
+  old[0] = oldrec[0] = '\0';
+  if (e->source_id != 0 && st) {                            /* a zone that had a name the store could hold: its record goes (the zone is made again under the new name) */
+    int vid = view_ensure(st, view);
+    if (vid >= 0) {
+      store_zone_t rs;
+      store_read_lock();
+      uint32_t zs = store_find_source(st, (uint16_t)vid, e->source_id, (uint16_t)vid);
+      bool has = zs != STORE_NONE && store_zone_get(st, zs, &rs) == 0;
+      store_read_unlock();
+      if (has) snprintf(oldrec, sizeof(oldrec), "%s.", rs.name);
+    }
+  }
+  if (oldrec[0]) (void)dbreg_delete(view, oldrec, e->source_id);
+  int res;
+  bool is_new = false;
+  char *nn = strdup(e->name);
+  if (!nn) return DBR_UNSTORABLE;
+  rc_lock();
+  int i = un_find_locked(view, e->source_id, e->name);
+  if (i < 0) {
+    if (RC.un_n == RC.un_cap) {
+      size_t nc = RC.un_cap ? RC.un_cap * 2 : 8;
+      un_zone_t *nu = realloc(RC.un, nc * sizeof(*nu));
+      if (!nu) {
+        rc_unlock();
+        free(nn);
+        return DBR_UNSTORABLE;
+      }
+      RC.un = nu;
+      RC.un_cap = nc;
+    }
+    un_zone_t *u = &RC.un[RC.un_n++];
+    memset(u, 0, sizeof(*u));
+    snprintf(u->view, sizeof(u->view), "%s", view);
+    u->name = nn;
+    nn = NULL;
+    u->sid = e->source_id;
+    u->id = RC.un_seq++;
+    u->stamped = e->stamped;
+    u->gen = e->gen;
+    u->time = e->time;
+    u->has_serial = e->has_serial;
+    u->serial = e->serial;
+    u->seen = true;
+    atomic_store_explicit(&UN_CNT, (uint32_t)RC.un_n, memory_order_relaxed);
+    res = DBR_NEW;
+    is_new = true;
+  } else {
+    un_zone_t *u = &RC.un[i];
+    u->seen = true;
+    if (strcmp(u->name, e->name) != 0) {                    /* the domain has another name now (or another domain has the name) */
+      if (strcasecmp(u->name, e->name) != 0) snprintf(old, sizeof(old), "%s", u->name);
+      free(u->name);
+      u->name = nn;
+      nn = NULL;
+    }
+    u->sid = e->source_id;
+    const bool same = !e->force && !old[0] && ((e->stamped && u->stamped && u->gen == e->gen && u->time == e->time) ||
+                                               (!e->stamped && e->has_serial && !u->stamped && u->has_serial && u->serial == e->serial));
+    if (same) {
+      res = u->done ? DBR_SAME : DBR_PENDING;
+    } else {
+      u->stamped = e->stamped;
+      u->gen = e->gen;
+      u->time = e->time;
+      u->has_serial = e->has_serial;
+      u->serial = e->serial;
+      u->done = false;
+      res = old[0] ? DBR_RENAMED : DBR_CHANGED;
+    }
+  }
+  rc_unlock();
+  free(nn);
+  if (old[0]) (void)dbreg_delete(view, old, e->source_id);
+  if (is_new)
+    syslog(LOG_NOTICE, "[Store] zone '%s' (view '%s') cannot be kept in the zone store (the root zone): it is a zone of the heap directory, like a secondary zone, read from "
+                       "the database at every start (the cursor of the view is not kept while the view has such a zone)", e->name, view);
+  return res;
+}
 
 void db_recon_note_fetch(int what, uint64_t n) {
   rc_lock();
@@ -1367,6 +1545,7 @@ void db_recon_status(db_recon_status_t *out) {
   unsigned gv = 0;
   for (int i = 0; i < STORE_MAX_VIEWS; i++) gv += RC.held[i] ? 1 : 0;
   out->guard_views = gv;
+  out->nonstore = RC.un_n;
   rc_unlock();
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   out->known_now = 0;
@@ -1409,6 +1588,7 @@ void db_recon_cursor_put(const char *view, uint64_t cursor, const uint8_t *ident
   bool held = RC.held[vid];
   rc_unlock();
   if (held) return;                                         /* (a restart then makes a pass again and finds the same) */
+  if (un_count_view(view) > 0) return;                        /* (a zone the store cannot name has no record: only a pass or the changes since the old cursor bring it back at the next start) */
   uint8_t buf[STORE_IDENT_MAX];
   uint64_t id8 = atomic_load_explicit(&G.cfgid[vid], memory_order_relaxed);
   memcpy(buf, &id8, DBS_CFGID);
@@ -1431,7 +1611,11 @@ int db_recon_apply(const char *view, const db_recon_entry_t *e, uint32_t *zid_ou
   if (!st || !view || !e || !e->name) return DBR_ERROR;
   char name[DBS_NAME_MAX];
   size_t nlen;
-  if (!store_name(e->name, name, sizeof(name), &nlen)) return DBR_UNSTORABLE;
+  if (!store_name(e->name, name, sizeof(name), &nlen)) return un_apply(view, e);        /* (a zone of the heap directory: see un_apply()) */
+  if (e->source_id != 0) {                                  /* a zone that had a name the store could not hold: it is a zone of the store now (its heap element goes) */
+    char uold[1026];
+    if (un_remove(view, e->source_id, NULL, uold, sizeof(uold))) (void)dbreg_delete(view, uold, e->source_id);
+  }
   int vid = view_ensure(st, view);
   if (vid < 0) return DBR_ERROR;
   const bool np = e->kind != KDB_ZK_PRIMARY;
@@ -1556,6 +1740,7 @@ bool db_recon_begin(const char *view, uint64_t estimate, bool force, char *why, 
     free(ss);
   }
   if (estimate > have && estimate <= 16000000ull) (void)store_reserve(st, estimate);        /* (a first fill: the tables are made big enough once; the estimate is the loader's claim, bounded) */
+  un_mark(view);
   rc_lock();
   bits_free(&RC.seen);
   RC.active = true;
@@ -1697,6 +1882,17 @@ void db_recon_end(bool complete, uint64_t n_skipped, bool cursor_valid, uint64_t
            (unsigned long long)total, force ? " (a pass the operator asked for)" : "");
     dmax_refresh(st, vid);
   }
+  {                                                         /* the zones the store cannot name that the pass did not list */
+    uint64_t ud = un_sweep(view);
+    if (ud) {
+      out->swept = true;
+      out->deleted += ud;
+      rc_lock();
+      RC.s.swept += ud;
+      rc_unlock();
+      syslog(LOG_NOTICE, "[Store] view '%s': %llu zone(s) of the heap directory (names the store cannot hold) that the database no longer lists were deleted", view, (unsigned long long)ud);
+    }
+  }
   if (cursor_valid) db_recon_cursor_put(view, cursor, ident, ident_len);
 done:
   rc_lock();
@@ -1709,9 +1905,13 @@ done:
 int db_recon_delete(const char *view, int64_t source_id, const char *name) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   if (!st || !view) return 0;
-  char zone[STORE_NAME_MAX + 2];
+  char zone[1026], uold[1026];
   zone[0] = '\0';
-  if (name && *name) {
+  bool un_gone = false;
+  if (un_remove(view, source_id, name && *name ? name : NULL, uold, sizeof(uold))) {
+    un_gone = true;          /* a zone of the heap directory (a name the store cannot hold) */
+    snprintf(zone, sizeof(zone), "%s", uold);
+  } else if (name && *name) {
     snprintf(zone, sizeof(zone), "%s", name);
   } else if (source_id != 0) {                              /* the loader does not have the name (the row is gone): the source index has it */
     int vid = store_view_id(st, view);
@@ -1723,6 +1923,7 @@ int db_recon_delete(const char *view, int64_t source_id, const char *name) {
     if (ok) snprintf(zone, sizeof(zone), "%s.", z.name);
   }
   int r = zone[0] ? dbreg_delete(view, zone, source_id) : 0;
+  if (r <= 0 && un_gone) r = 1;                                  /* (a zone of the heap directory that was never served is forgotten: it counts as deleted) */
   rc_lock();
   if (r > 0) RC.s.change_deletes++;
   rc_unlock();
@@ -1739,6 +1940,23 @@ int db_recon_scan(uint32_t *cursor, unsigned budget, db_scan_item_t *out) {
     int more = store_iter(st, cursor, &z);
     if (more == 0) {
       rc = 0;
+      if (atomic_load_explicit(&UN_CNT, memory_order_relaxed) == 0) break;
+      rc_lock();                                            /* (the zones the store cannot name come after the records: their body is wanted once a run, like a secondary zone's) */
+      for (size_t i = 0; i < RC.un_n; i++) {
+        un_zone_t *u = &RC.un[i];
+        if (u->done || strlen(u->name) >= sizeof(out->zone)) continue;
+        snprintf(out->view, sizeof(out->view), "%s", u->view);
+        snprintf(out->zone, sizeof(out->zone), "%s", u->name);
+        out->source_id = u->sid;
+        out->zid = UN_ZID_BASE + u->id;
+        out->nonstore = true;
+        out->stamp_gen = u->gen;
+        out->stamp_time = u->time;
+        u->done = true;
+        rc = 1;
+        break;
+      }
+      rc_unlock();
       break;
     }
     if (more < 0) continue;
@@ -1765,7 +1983,16 @@ int db_recon_scan(uint32_t *cursor, unsigned budget, db_scan_item_t *out) {
   return rc;
 }
 
-void db_recon_scan_retry(uint32_t zid) { bits_clear(&RC.np_done, zid); }
+void db_recon_scan_retry(uint32_t zid) {
+  if (zid >= UN_ZID_BASE && zid != STORE_NONE) {
+    rc_lock();
+    for (size_t i = 0; i < RC.un_n; i++)
+      if (RC.un[i].id == zid - UN_ZID_BASE) RC.un[i].done = false;
+    rc_unlock();
+    return;
+  }
+  bits_clear(&RC.np_done, zid);
+}
 
 static bool recon_status_cb(store_recon_t *o) {
   db_recon_status(o);

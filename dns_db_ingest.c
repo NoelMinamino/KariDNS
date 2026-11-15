@@ -2386,7 +2386,7 @@ static bool entry_note(ing_t *g, int r, const char *zone, bool *unstorable_logge
     atomic_fetch_add_explicit(&g_st.tot_rejected, 1, memory_order_relaxed);
     if (!*unstorable_logged) {
       *unstorable_logged = true;
-      syslog(LOG_WARNING, "[DB] zone '%s' cannot be kept in the zone store (the root zone, or a name over 255 bytes): it is not loaded while the store protocol is on (`store none;` in the database block turns the store off)", zone);
+      syslog(LOG_WARNING, "[DB] zone '%s' cannot be served: the store and the zone directory key a name by at most 255 bytes of text (only escapes make a longer one), or the Backend is out of memory; the zone is not loaded", zone);
     }
     return false;
   default:
@@ -4955,6 +4955,8 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
                 (unsigned long long)rs.skipped, (unsigned long long)rs.unlisted, (unsigned long long)rs.total, (unsigned long long)rs.swept, (unsigned long long)rs.known_now,
                 (unsigned long long)rs.fetched, (unsigned long long)rs.fetch_failed, (unsigned long long)rs.in_flight, (unsigned long long)rs.wanted,
                 (unsigned long long)rs.change_upserts, (unsigned long long)rs.change_deletes, (unsigned long long)rs.cursors, (unsigned long long)rs.passes);
+      if (rs.nonstore)
+        st_append(&c, "store: %llu zone(s) have a name the store cannot hold (the root zone): zones of the heap directory, read from the database at every start\n", (unsigned long long)rs.nonstore);
       if (rs.guard_views) {
         char tg[40];
         fmt_time((int64_t)rs.guard_unix, tg, sizeof(tg));

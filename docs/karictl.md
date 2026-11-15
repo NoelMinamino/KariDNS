@@ -177,6 +177,7 @@ Commands that take a zone name accept an optional view name as the next argument
   | `store.format`, `store.mode`, `store.fstype`, `store.uuid` | Store format version; `map` (segments mapped) or `copy` (read with `pread`, for ZFS); file system type; store identity (32 hex digits). With `store.state` `none` this and every key down to `store.cache.*` is absent |
   | `store.clean_flag` | 1 when the superblock on disk says "clean stop" (0 while the server runs) |
   | `store.zones.known`, `.stored`, `.rejected`, `.free` | Zones in the store by state: known without an image (the database fetch has them), stored (an image is in the store), rejected (flagged by the last reconcile), free table slots |
+  | `store.zones.nonstore` | Zones of the database whose name the store cannot hold (the root zone): they have no record and are served from the heap directory (with the store protocol; the line is there when a loader is running) |
   | `store.zones.attached` | Zones attached (in memory as images) now: successful attaches minus detaches |
   | `store.zones.image_bytes` | Bytes of the stored images (records) |
   | `store.views.count` | Views in the store |

@@ -87,6 +87,8 @@ bool db_store_sync(int timeout_ms);
  *     record's: the stamp is recorded and the record is marked STORE_F_STALE (its image keeps serving until the new body is installed); a zone the record has no image for stays KNOWN;
  *   - the same stamp: nothing.  A version that was refused (STORE_F_REJECTED_NEW) with this stamp is not asked for again;
  *   - a zone whose id has another name (a rename) loses the old name; a name that another id holds is taken over;
+ *   - a zone whose name the store cannot hold (the root zone) has no record: the Backend remembers it in a small list of its own (db_recon_apply()), fetches it like a
+ *     secondary zone and serves it from the heap directory; it is logged once (NOTICE), counted (nonstore), and while a view has one its cursor is not kept (the next start lists the zones again);
  *   - a secondary or catalog zone is a KNOWN record with STORE_F_NONSTORE: it is a zone of the heap directory (never stored, never found by a query), and the record only makes the next
  *     start load it again.
  * A pass marks one bit per zone id; at its end (complete) the zones of the view that the pass did not list are deleted (the sweep), unless that would delete more than 20 percent of the
@@ -104,7 +106,7 @@ typedef struct {
   bool force;                    /* the body is wanted whatever the stamp says (a reload of the zone) */
 } db_recon_entry_t;
 /* the result of an entry */
-enum { DBR_UNSTORABLE = -2 /* the root zone, a name over 255 bytes: the store cannot hold it */, DBR_ERROR = -1, DBR_SAME = 0, DBR_NEW, DBR_CHANGED, DBR_RENAMED, DBR_PENDING /* already asked for, not here yet */, DBR_KEPT /* refused with this stamp: not asked for again */ };
+enum { DBR_UNSTORABLE = -2 /* a name the store cannot hold and the heap directory cannot key either (over 255 bytes of text, which only escapes make; or no memory): the zone is not loaded */, DBR_ERROR = -1, DBR_SAME = 0, DBR_NEW, DBR_CHANGED, DBR_RENAMED, DBR_PENDING /* already asked for, not here yet */, DBR_KEPT /* refused with this stamp: not asked for again */ };
 /* apply one entry (a pass entry also sets the zone's bit); *zid receives the record's zone id (STORE_NONE: none); the view's name as the registry knows it */
 int db_recon_apply(const char *view, const db_recon_entry_t *e, uint32_t *zid);
 /* a CHANGES upsert: db_recon_apply() and the count */

@@ -805,7 +805,8 @@ static unsigned zref_labels(const char *name, size_t len) {
  * information are of the store lookup only. */
 typedef struct {
   const dbdir_ops_t *ops;
-  char fn[260];            /* the folded name (lower case) */
+  char fn[DNS_NAME_TEXT_SIZE];   /* the folded name (lower case): as long as a presentation name can be */
+  size_t fn_len;                 /* what was folded */
   bool fold_done;
 } zref_walk_t;
 
@@ -815,11 +816,16 @@ static bool zref_probe_store(const view_snapshot_t *vs, zref_walk_t *w, const ch
   if (sid < 0) return false;
   unsigned dmax = ops->depth_max(sid);
   if (dmax < 63 && labels > dmax) return false;                                            /* the depth skip: no stored zone is that deep (the root zone has 0 labels) */
+  if (remaining > STORE_NAME_MAX) return false;                                              /* (the store keeps no name this long: it asks nothing, and the folded copy is never read past what was written) */
   if (!w->fold_done && remaining > 0) {                                                     /* (the folded name is made once, on the first suffix that has to ask the store) */
     size_t n = zone_key_len(qname);
-    for (size_t i = 0; i < n && i < sizeof(w->fn) - 1; i++) w->fn[i] = (char)tolower((unsigned char)qname[i]);
+    if (n > sizeof(w->fn) - 1) n = sizeof(w->fn) - 1;
+    for (size_t i = 0; i < n; i++) w->fn[i] = (char)tolower((unsigned char)qname[i]);
+    w->fn[n] = 0;
+    w->fn_len = n;
     w->fold_done = true;
   }
+  if (remaining && (size_t)(cursor - qname) + remaining > w->fn_len) return false;          /* (never read past what was folded) */
   const char *f = remaining ? w->fn + (cursor - qname) : "";
   zref_clear(out);
   if (!ops->find(sid, f, remaining, out)) return false;

@@ -1,3 +1,4 @@
+[ "$(sf store.zones.nonstore)" = 0 ] && pass "nothing is counted as unstorable after the restart" || fail "store.zones.nonstore=$(sf store.zones.nonstore) after the restart"waitfor 30 ns_chg && pass "a change of the zone shows with the store on and off" || fail "the change of the long zone is not served"waitfor 30 ns_up && pass "the 250-character zone is answered with the store on" || fail "the 250-character zone is not answered"
 #!/bin/sh
 # run_db_store_test.sh - the zone store in the server (0.7 store S2): write-through of installed zones, ATTACH of zones that are out of memory, restart from the store,
 # a damaged record, a stale record.  The real karidns, the real karidns-dbloader and SQLite3.
@@ -254,6 +255,73 @@ pass_all 1 "$NZ" 3
 [ "$(./dag @127.0.0.1 -p "$PA" "new.$CZ" A +short +nohexdump +time=8 +tries=1 2>/dev/null | head -1)" = "192.0.2.123" ] && pass "and still after other zones pushed it out of memory and it came back (from the store)" || fail "the changed zone lost its new record"
 stop_one "$SRV"; SRV=""
 stop_one "$REF"; REF=""
+
+# ---------------------------------------------------------------- zones the store cannot name: the root zone, a name of 250 characters
+echo "== a 250-character zone name (the longest the store keeps) and the root zone (the loader refuses it): with the store as without it, after a change, a kill -9 and a restart"
+LONG=$(perl -e 'print join(".", ("a" x 61, "b" x 61, "c" x 61, "d" x 61, "ab"))')
+mkdir "$T/db5"
+sqlite3 "$T/db5/z.db" < tests/db/pdns_schema.sqlite3.sql > /dev/null
+sqlite3 "$T/db5/z.db" "PRAGMA journal_mode=WAL" > /dev/null
+sqlite3 "$T/db5/z.db" <<SQL
+INSERT INTO domains (name, type) VALUES ('.', 'NATIVE'), ('$LONG', 'NATIVE'), ('znorm.test', 'NATIVE');
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
+  SELECT id, name, 'SOA', 'ns1.nsx.test. host.nsx.test. 1 3600 600 86400 300', 300, 0, 0 FROM domains;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.nsx.test.', 300, 0, 0 FROM domains;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'A', '192.0.2.61', 300, 0, 0 FROM domains;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'TXT', '"apex"', 300, 0, 0 FROM domains;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'www.' || name, 'A', '192.0.2.62', 300, 0, 0 FROM domains WHERE name = 'znorm.test';
+SQL
+chown -R nobody "$T/db5"; chmod 600 "$T/db5/z.db"*
+DBFILE="$T/db5/z.db"
+nsq() {   # nsq PORT FILE: the answers (rcode, answer, authority, additional) of the apex and a missing name of the three zones, normalised
+    sp=$1; sout=$2
+    : > "$sout.tmp"
+    for q in ". SOA" ". NS" ". A" ". TXT" "x. A" "nx.znorm.test. A" "$LONG. SOA" "$LONG. NS" "$LONG. A" "$LONG. TXT" "$LONG. MX" "x.$LONG. A" "znorm.test. A" "www.znorm.test. A"; do
+        qn=${q% *}; qt=${q##* }
+        echo "## $q" >> "$sout.tmp"
+        ./dag @127.0.0.1 -p "$sp" "$qn" "$qt" +nohexdump +time=8 +tries=1 2> /dev/null | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -1 >> "$sout.tmp"
+        ./dag @127.0.0.1 -p "$sp" "$qn" "$qt" +noall +answer +authority +additional +nohexdump 2> /dev/null | tr 'A-Z' 'a-z' | sort >> "$sout.tmp"
+    done
+    mv "$sout.tmp" "$sout"
+}
+ns_up() { [ "$(./dag @127.0.0.1 -p "$PA" "$LONG." A +short +nohexdump +time=8 +tries=1 2>/dev/null | head -1)" = 192.0.2.61 ]; }
+conf b "store none;"
+start_one b
+conf a "store \"$T/store5\"; store-threads 2; store-mode ${STORE_MODE:-auto};"
+start_one a
+waitfor 30 ns_up && pass "the 250-character zone is answered with the store on" || fail "the 250-character zone is not answered"
+nsq "$PB" "$T/ns.ref"
+nsq "$PA" "$T/ns.a1"
+grep -q 'SOA' "$T/ns.ref" && [ "$(grep -c 192.0.2.61 "$T/ns.ref")" -ge 2 ] && pass "the reference serves the zone ($(grep -c '^##' "$T/ns.ref") queries)" || fail "the reference does not serve the zones: $(head -12 "$T/ns.ref")"
+if cmp -s "$T/ns.ref" "$T/ns.a1"; then pass "the answers with the store are the reference's, byte for byte"; else fail "the answers with the store differ"; diff "$T/ns.ref" "$T/ns.a1" | head -10; fi
+[ "$(sf store.zones.stored)" = 2 ] && [ "$(sf store.zones.nonstore)" = 0 ] && pass "the 250-character name is in the store (stored=2, nonstore=0: the store keeps names up to 255 bytes)" || fail "stored=$(sf store.zones.stored) nonstore=$(sf store.zones.nonstore)"
+rootrefused() { grep -q "root zone is not supported" "$T/b.log"; }
+waitfor 10 rootrefused && pass "the loader refuses the root zone (it is not served with or without the store)" || fail "no refusal of the root zone in the logs"
+# a change: the new data comes by the change log
+sqlite3 "$T/db5/z.db" "UPDATE records SET content = '192.0.2.99' WHERE type = 'A' AND domain_id IN (SELECT id FROM domains WHERE name = '$LONG'); UPDATE records SET content = 'ns1.nsx.test. host.nsx.test. 2 3600 600 86400 300' WHERE type = 'SOA' AND domain_id IN (SELECT id FROM domains WHERE name = '$LONG');"
+$KA reload > /dev/null 2>&1; $KB reload > /dev/null 2>&1
+ns_chg() { [ "$(./dag @127.0.0.1 -p "$PB" "$LONG." A +short +nohexdump +time=8 +tries=1 2>/dev/null | head -1)" = 192.0.2.99 ] && [ "$(./dag @127.0.0.1 -p "$PA" "$LONG." A +short +nohexdump +time=8 +tries=1 2>/dev/null | head -1)" = 192.0.2.99 ]; }
+waitfor 30 ns_chg && pass "a change of the zone shows with the store on and off" || fail "the change of the long zone is not served"
+waitfor 5 sh -c 'sleep 1'
+nsq "$PB" "$T/ns.ref2"
+nsq "$PA" "$T/ns.a2"
+cmp -s "$T/ns.ref2" "$T/ns.a2" && pass "the answers after the change are the reference's" || { fail "the answers after the change differ"; diff "$T/ns.ref2" "$T/ns.a2" | head -10; }
+# kill -9, a restart on the same store
+kari_kill_tree "$SRV"; SRV=""
+sleep 0.5
+conf a "store \"$T/store5\"; store-threads 2; store-mode ${STORE_MODE:-auto};"
+start_one a
+waitfor 30 ns_chg && pass "after kill -9 and a restart the zone is served again" || fail "after the restart the long zone is not served"
+nsq "$PA" "$T/ns.a3"
+cmp -s "$T/ns.ref2" "$T/ns.a3" && pass "the answers after the restart are the reference's, byte for byte" || { fail "the answers after the restart differ"; diff "$T/ns.ref2" "$T/ns.a3" | head -10; }
+[ "$(sf store.zones.nonstore)" = 0 ] && [ "$(sf store.zones.stored)" = 2 ] && pass "both zones are in the store after the restart" || fail "nonstore=$(sf store.zones.nonstore) stored=$(sf store.zones.stored) after the restart"
+# a clean restart as well
+stop_one "$SRV"; SRV=""
+start_one a
+waitfor 30 ns_chg && pass "after a clean stop and a start the zone is served again" || fail "after the clean restart the zone is not served"
+stop_one "$SRV"; SRV=""
+stop_one "$REF"; REF=""
+unset DBFILE
 
 # ---------------------------------------------------------------- 0.7 S3: the store is the directory
 COLD_N=${STORE_COLD_ZONES:-20000}
