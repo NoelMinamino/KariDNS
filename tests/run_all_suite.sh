@@ -347,6 +347,9 @@ export KARIDNS_SUITE_ID
 # ENVIRONMENT).  tests/lib_proc.sh exports it as well, for a script run on its own; this covers the few scripts that do not source it.
 KARIDNS_NOSYSLOG=${KARIDNS_NOSYSLOG:-1}
 export KARIDNS_NOSYSLOG
+# The same for KARIDNS_NO_DEFAULT_STORE=1: a database { } block without `store` never uses /var/db/karidns/store of the host (tests/lib_proc.sh)
+KARIDNS_NO_DEFAULT_STORE=${KARIDNS_NO_DEFAULT_STORE:-1}
+export KARIDNS_NO_DEFAULT_STORE
 
 suite_karidns_pids() {
     for _p in $(pgrep -x "$KARIDNS_PROC_RE" 2>/dev/null); do

@@ -12,6 +12,11 @@
 # this file (tests/run_log_secrets_test.sh); a value already in the environment is kept.
 KARIDNS_NOSYSLOG=${KARIDNS_NOSYSLOG:-1}
 export KARIDNS_NOSYSLOG
+# A database { } block without `store` would use the default zone store /var/db/karidns/store whenever the host has /var/db/karidns: with
+# KARIDNS_NO_DEFAULT_STORE=1 the server runs without a store then, so the result of a test never depends on that directory (docs/karidns.md
+# ENVIRONMENT).  A test of the store names its directory (store_stmt below, the *_store_test.sh scripts); a value already in the environment is kept.
+KARIDNS_NO_DEFAULT_STORE=${KARIDNS_NO_DEFAULT_STORE:-1}
+export KARIDNS_NO_DEFAULT_STORE
 
 # kari_kill_tree PID... : SIGKILL each PID and all of its descendants.
 # karidns runs as supervisor + backend + frontend routers + broker, so killing
