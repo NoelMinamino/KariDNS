@@ -1756,9 +1756,7 @@ static void adopt_job(uint16_t sview, uint32_t zid) {
   rcu_aux_read_lock();
   zdir_elem_t *s = stg_get(zid);
   const char *view = st ? store_view_name(st, sview) : NULL;
-#ifdef KARIDNS_UNIT_TEST
   if (atomic_load_explicit(&db_store_test_adopt_noview, memory_order_relaxed)) view = NULL;
-#endif
   if (!s || !view) {
     rcu_aux_read_unlock();
     if (s) {                                                  /* the store is closing, or the view id is not one (B2): the staged element would stay in the table for ever (and hold its entry) and the zone id could not be staged again.  Nobody is left to wake: the worker that staged it answered, took the claim of the zone and woke the workers that had joined it (worker_attach()) */
