@@ -39,6 +39,7 @@
 #include "dns_pdns_reader.h"
 
 #define DB_STOPPED 1
+#define DB_LOOKUP_MAX 128           /* the names of find_zones_in(): a name of 127 labels and its parents */
 #define DB_ERR_RETRY (-2)
 #define DB_ERR_UNAVAILABLE (-3)
 #define DB_ERR_CONFLICT (-4)        /* a write that met a concurrent change: PostgreSQL serialization failure (40001) in a REPEATABLE READ transaction, or a row to update that is gone */
@@ -345,6 +346,12 @@ typedef struct db_driver {
      * domains.name instead of the list of all zones.  name matches the way the loader's names_equal() does: ASCII case-insensitive, one
      * optional trailing dot.  Inside a snapshot, 0 or an error as list_zones; DB_STOPPED when the callback stopped it. */
     int (*find_zone)(db_conn_t *c, const char *name, db_zone_cb cb, void *ud);
+    /* 0.7 (the lookup of a name on the first start, FETCH_REQ mode 2): the zones whose name is one of names[0..n) (1 <= n <= DB_LOOKUP_MAX; the candidates are a name and its parent names), in ONE statement through
+     * the index on domains.name, each row as find_zone() gives it, the longest name first (a zone whose name is longer is the closer one), then by id.  A name is taken with or without one trailing dot; one that is
+     * longer than any domain name matches nothing.  Case: SQLite3 compares ASCII case-insensitively like find_zone(); PostgreSQL compares the exact spelling (the names the PowerDNS schema stores are lower case, and
+     * a lower() comparison would scan the table for every name that no zone has, which is what most lookups are): a zone stored with capitals is found by the pass, not by a lookup.  Inside a snapshot, 0 or an error
+     * as list_zones; DB_STOPPED when the callback stopped it.  NULL = the driver cannot (the loader then does not say it does lookups). */
+    int (*find_zones_in)(db_conn_t *c, const char *const *names, size_t n, db_zone_cb cb, void *ud);
     /* Optional (NULL = the loader reads zone by zone with scan_records / scan_metadata / scan_ext): the rows of the n zones in ids (at most
      * DB_IN_MAX, ascending domain ids) in one statement per table, with the order of the bulk scan: records and metadata ORDER BY
      * domain_id, id; scan_ext as scan_ext(NULL) but only for these domains.  For a driver where a statement costs a network round trip

@@ -1754,8 +1754,8 @@ static void test_fetch_req_and_inventory(void) {
     CHECK_RC("request id 0", dec_backend(&e, &m, why), KDB_E_RANGE);
     kdb_enc_reset(&e); fz_fetch_req(&e, 1, 0, ZN, KDB_FETCH_PRIO_N, 0); kdb_enc_end(&e);
     CHECK_RC("priority 3", dec_backend(&e, &m, why), KDB_E_RANGE);
-    kdb_enc_reset(&e); fz_fetch_req(&e, 1, 0, ZN, 0, 2); kdb_enc_end(&e);
-    CHECK_RC("mode 2", dec_backend(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); fz_fetch_req(&e, 1, 0, ZN, 0, KDB_FETCH_LOOKUP + 1); kdb_enc_end(&e);
+    CHECK_RC("mode 3", dec_backend(&e, &m, why), KDB_E_RANGE);
     kdb_enc_reset(&e); fz_fetch_req(&e, 1, NVIEWS, ZN, 0, 0); kdb_enc_end(&e);
     CHECK_RC("view out of range", dec_backend(&e, &m, why), KDB_E_RANGE);
     kdb_enc_reset(&e); fz_fetch_req(&e, 1, 0, ZN, 0, 0); kdb_enc_u8(&e, 9, 1); kdb_enc_end(&e);
@@ -2880,6 +2880,76 @@ static void test_store_proto(void) {
 }
 
 /* the names the loader and the Backend log for a result code and a message type: one each, none empty, "?" for the unknown */
+/* 0.7: the lookup of a name on the first start: HELLO feature bit, FETCH_REQ mode 2, LOOKUP_RESULT */
+static void lk_result(kdb_enc_t *e, uint64_t id, uint16_t view, uint8_t found) {
+    kdb_enc_begin(e, KDB_T_LOOKUP_RESULT);
+    kdb_enc_u64(e, 1, id); kdb_enc_u16(e, 2, view); kdb_enc_u8(e, 3, found);
+}
+static void lk_entry(kdb_enc_t *e) {
+    kdb_enc_i64(e, 4, 4711); kdb_enc_name(e, 5, "late.test."); kdb_enc_u8(e, 6, KDB_ZK_PRIMARY); kdb_enc_u64(e, 7, 5); kdb_enc_u64(e, 8, 6);
+}
+
+static void test_lookup_proto(void) {
+    printf("[the lookup of a name: HELLO feature, FETCH_REQ mode 2, LOOKUP_RESULT]\n");
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    kdb_msg_t m;
+    char why[KDB_REASON_LEN];
+
+    kdb_enc_begin(&e, KDB_T_HELLO); kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "x"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 1); kdb_enc_u32(&e, 5, KDB_FEAT_STORE | KDB_FEAT_LOOKUP); kdb_enc_end(&e);
+    CHECK_RC("HELLO with both features", dec_loader(&e, &m, why), KDB_OK);
+    CHECK(m.u.hello.features == (KDB_FEAT_STORE | KDB_FEAT_LOOKUP));
+
+    /* FETCH_REQ mode 2: a name, no range, no source id */
+    kdb_enc_reset(&e); fz_fetch_req(&e, 9, 1, "www.late.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP); kdb_enc_end(&e);
+    CHECK_RC("FETCH_REQ lookup", dec_backend(&e, &m, why), KDB_OK);
+    CHECK(m.u.fetch_req.mode == KDB_FETCH_LOOKUP && m.u.fetch_req.request_id == 9 && strcmp(m.u.fetch_req.name, "www.late.test.") == 0 && !m.u.fetch_req.has_range && m.u.fetch_req.source_id == 0);
+    kdb_enc_reset(&e); fz_fetch_req(&e, 9, 1, "www.late.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP + 1); kdb_enc_end(&e);
+    CHECK_RC("FETCH_REQ mode 3", dec_backend(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); fz_fetch_req(&e, 9, 1, "www.late.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP); kdb_enc_i64(&e, 8, 5); kdb_enc_end(&e);
+    CHECK_RC("a lookup with a source id", dec_backend(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); fz_fetch_req(&e, 9, 1, "www.late.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP); kdb_enc_name(&e, 6, "a.test."); kdb_enc_name(&e, 7, "b.test."); kdb_enc_end(&e);
+    CHECK_RC("a lookup with a range", dec_backend(&e, &m, why), KDB_E_RANGE);
+
+    /* LOOKUP_RESULT: a zone (the entry of a manifest), or none */
+    kdb_enc_reset(&e); lk_result(&e, 9, 1, 1); lk_entry(&e); kdb_enc_u8(&e, 9, KDB_EF_STAMPED); kdb_enc_u32(&e, 10, 77); kdb_enc_end(&e);
+    CHECK_RC("LOOKUP_RESULT found", dec_loader(&e, &m, why), KDB_OK);
+    CHECK(m.u.lookup_result.request_id == 9 && m.u.lookup_result.view == 1 && m.u.lookup_result.found && m.u.lookup_result.source_id == 4711 &&
+          strcmp(m.u.lookup_result.name, "late.test.") == 0 && m.u.lookup_result.kind == KDB_ZK_PRIMARY && m.u.lookup_result.stamp_gen == 5 && m.u.lookup_result.stamp_time == 6 &&
+          m.u.lookup_result.stamped && m.u.lookup_result.has_serial && m.u.lookup_result.serial == 77);
+    kdb_enc_reset(&e); lk_result(&e, 9, 1, 1); lk_entry(&e); kdb_enc_end(&e);
+    CHECK_RC("LOOKUP_RESULT found, no flags", dec_loader(&e, &m, why), KDB_OK);
+    CHECK(!m.u.lookup_result.stamped && !m.u.lookup_result.has_serial);
+    kdb_enc_reset(&e); lk_result(&e, 9, 1, 0); kdb_enc_end(&e);
+    CHECK_RC("LOOKUP_RESULT none", dec_loader(&e, &m, why), KDB_OK);
+    CHECK(!m.u.lookup_result.found && m.u.lookup_result.request_id == 9);
+    kdb_enc_reset(&e); lk_result(&e, 0, 1, 0); kdb_enc_end(&e);
+    CHECK_RC("LOOKUP_RESULT request id 0", dec_loader(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); lk_result(&e, 9, NVIEWS, 0); kdb_enc_end(&e);
+    CHECK_RC("LOOKUP_RESULT of a view that is not configured", dec_loader(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); lk_result(&e, 9, 1, 2); kdb_enc_end(&e);
+    CHECK_RC("found 2", dec_loader(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); lk_result(&e, 9, 1, 0); lk_entry(&e); kdb_enc_end(&e);
+    CHECK_RC("no zone found, and an entry", dec_loader(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); lk_result(&e, 9, 1, 1); kdb_enc_i64(&e, 4, 4711); kdb_enc_name(&e, 5, "late.test."); kdb_enc_end(&e);
+    CHECK_RC("a zone without its kind and stamp", dec_loader(&e, &m, why), KDB_E_TLV_MISSING);
+    kdb_enc_reset(&e); lk_result(&e, 9, 1, 1); kdb_enc_i64(&e, 4, 4711); kdb_enc_name(&e, 5, "late.test."); kdb_enc_u8(&e, 6, KDB_ZK_CATALOG + 1); kdb_enc_u64(&e, 7, 5); kdb_enc_u64(&e, 8, 6); kdb_enc_end(&e);
+    CHECK_RC("kind 3", dec_loader(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); lk_result(&e, 9, 1, 1); lk_entry(&e); kdb_enc_u8(&e, 9, 4); kdb_enc_end(&e);
+    CHECK_RC("an unknown flag", dec_loader(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); lk_result(&e, 9, 1, 1); kdb_enc_i64(&e, 4, 4711); kdb_enc_name(&e, 5, "Late.Test"); kdb_enc_u8(&e, 6, 0); kdb_enc_u64(&e, 7, 5); kdb_enc_u64(&e, 8, 6); kdb_enc_end(&e);
+    CHECK_RC("a name that is not canonical", dec_loader(&e, &m, why), KDB_E_TLV_NAME);
+
+    /* the state machine: only the fetch stream takes it (in READY), the first stream never does, and not inside a zone */
+    kdb_enc_reset(&e); lk_result(&e, 9, 1, 0); kdb_enc_end(&e);
+    CHECK_RC("on the fetch stream", fetch_send(KDB_S_READY, &e, why), KDB_OK);
+    CHECK_RC("inside a zone of the fetch stream", fetch_send(KDB_S_IN_ZONE, &e, why), KDB_E_STATE);
+    CHECK_RC("on the first stream", send_in(KDB_S_READY, e.buf, e.len, NULL, why), KDB_E_STATE);
+    CHECK_RC("in a batch", send_in(KDB_S_IN_BATCH, e.buf, e.len, NULL, why), KDB_E_STATE);
+    CHECK(strcmp(kdb_type_name(KDB_T_LOOKUP_RESULT), "LOOKUP_RESULT") == 0);
+    kdb_enc_free(&e);
+}
+
 static void test_names(void) {
     printf("result code and message type names\n");
     static const struct { kdb_rc_t rc; const char *name; } rcs[] = {
@@ -2920,6 +2990,7 @@ int main(int argc, char **argv) {
     test_fetch_stream_machine();
     test_hot_list();
     test_store_proto();
+    test_lookup_proto();
     test_names();
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;

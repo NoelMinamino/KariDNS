@@ -4110,6 +4110,188 @@ static void test_store_loader(void) {
     free(fbuf);
 }
 
+/* ------------------------------------------------------------------ 0.7: the lookup of a name (find_zones_in(), and what the loader makes of it) */
+typedef struct { bool got; kdb_lookup_result_t r; bool failed; } lkr_t;
+
+/* the one message the lookup wrote to the fetch stream (the Backend's state machine of that stream checks it) */
+static lkr_t lk_get(int fd) {
+    lkr_t out;
+    memset(&out, 0, sizeof(out));
+    static uint8_t body[KDB_MAX_BODY];
+    kdb_framer_t f;
+    kdb_sm_t sm;
+    kdb_framer_init(&f, KDB_FROM_LOADER, body, sizeof(body));
+    kdb_sm_init_fetch(&sm, NULL);
+    uint8_t buf[4096];
+    ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+    if (n <= 0 || kdb_framer_feed(&f, buf, (size_t)n) != KDB_OK) return out;
+    kdb_frame_t fr;
+    if (kdb_framer_next(&f, &fr) != KDB_OK) return out;
+    kdb_msg_t m;
+    if (kdb_sm_accept(&sm, &fr, &m) != KDB_OK) {
+        printf("    the state machine says: %s\n", sm.reason);
+        out.failed = true;
+        return out;
+    }
+    if (m.type == KDB_T_LOOKUP_RESULT) {
+        out.got = true;
+        out.r = m.u.lookup_result;
+    }
+    return out;
+}
+
+static void test_lookup(void) {
+    printf("the lookup of a name (0.7): find_zones_in() of the driver, and the loader's answer (the longest zone the view serves)\n");
+    signal(SIGPIPE, SIG_IGN);
+    char path[600];
+    sqlite3 *db = make_db("lk.db", path, sizeof(path));
+    char *ext = slurp(g_ext_path);
+    CHECK(ext != NULL);
+    if (!db || !ext) return;
+    raw_exec(db, ext);
+    free(ext);
+    add_simple_zone(db, 1, 10, "example.test");
+    add_simple_zone(db, 2, 20, "sub.example.test");
+    add_simple_zone(db, 3, 30, "a.sub.example.test");
+    add_simple_zone(db, 4, 40, "other.test");
+    add_simple_zone(db, 5, 50, "UPPER.TEST");
+    add_zone(db, 6, "sec.example.test", "SLAVE");
+    add_zone(db, 7, "x.sec.example.test", "PRODUCER");
+    add_simple_zone(db, 8, 80, "y.sec.example.test");
+    raw_exec(db, "INSERT INTO karidns_domain_views (domain_id, view_name) VALUES (3, 'other'), (2, 'beta'), (2, 'other')");
+
+    /* the driver: one statement, the longest name first, each zone once; both spellings of a name; case does not matter (SQLite3); nothing for a name longer than a domain name */
+    char err[400];
+    int rc = 0;
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), &rc);
+    CHECK(c != NULL && rc == 0);
+    if (!c) return;
+    db_schema_info_t si;
+    CHECK(db_driver_sqlite3.check_schema(c, &si) == 0 && si.has_zone_state && si.has_domain_views);
+    CHECK(db_driver_sqlite3.begin_snapshot(c) == 0);
+    {
+        const char *names[] = { "www.a.sub.example.test.", "a.sub.example.test.", "sub.example.test.", "example.test.", "test." };
+        zl_t l;
+        memset(&l, 0, sizeof(l));
+        CHECK(db_driver_sqlite3.find_zones_in(c, names, 5, zl_collect, &l) == 0);
+        CHECK(l.n == 3 && l.id[0] == 3 && l.id[1] == 2 && l.id[2] == 1);
+        CHECK(l.n > 0 && l.soa[0] && strstr(l.soa[0], "ns1.a.sub.example.test") != NULL);         /* (the rows are those of find_zone(): the SOA is there) */
+        zl_free(&l);
+        memset(&l, 0, sizeof(l));
+        const char *undotted[] = { "UPPER.test", "nothing.test." };
+        CHECK(db_driver_sqlite3.find_zones_in(c, undotted, 2, zl_collect, &l) == 0 && l.n == 1 && l.id[0] == 5);
+        zl_free(&l);
+        memset(&l, 0, sizeof(l));
+        char longname[1300];
+        memset(longname, 'a', sizeof(longname) - 1);
+        longname[sizeof(longname) - 1] = '\0';
+        const char *odd[] = { longname, "." , "", "none.test." };
+        CHECK(db_driver_sqlite3.find_zones_in(c, odd, 4, zl_collect, &l) == 0 && l.n == 0);        /* (a name that is too long, the root and the empty name match no zone) */
+        zl_free(&l);
+        memset(&l, 0, sizeof(l));
+        CHECK(db_driver_sqlite3.find_zones_in(c, names, 5, stop_zone, &l) == DB_STOPPED);          /* (the callback stops it) */
+        CHECK(db_driver_sqlite3.find_zones_in(c, names, 0, zl_collect, &l) == -1);
+        CHECK(db_driver_sqlite3.find_zones_in(c, names, DB_LOOKUP_MAX + 1, zl_collect, &l) == -1);
+    }
+    db_driver_sqlite3.end_snapshot(c);
+    db_driver_sqlite3.close(c);
+
+    /* the loader: the fetch worker's context, the answers on a socket pair */
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    struct lio *io = calloc(1, sizeof(*io));
+    CHECK(io != NULL);
+    if (!io) return;
+    io->fd = sv[0];
+    pthread_mutex_init(&io->wlock, NULL);
+    ctx_t x;
+    memset(&x, 0, sizeof(x));
+    x.io = io;
+    x.fetch = true;
+    x.fetch_lookup = true;
+    x.drv = &db_driver_sqlite3;
+    x.view = 1;
+    x.map_view = "beta";
+    kdb_enc_init(&x.enc);
+    c = open_driver(path, 0, err, sizeof(err), &rc);
+    CHECK(c != NULL && rc == 0);
+    if (!c) return;
+    x.conn = c;
+    CHECK(db_driver_sqlite3.check_schema(c, &si) == 0);
+    CHECK(db_driver_sqlite3.begin_snapshot(c) == 0);
+
+#define LK(name) (ctx_view_reset(&x), x.fetch_req++, x.n_zones = 0, lookup_run(&x, &si, (name)))      /* (fetch_one() resets the zone list after every request) */
+    x.fetch_req = 100;
+    /* a.sub.example.test is mapped to another view only: the answer is sub.example.test, whose rows name this view */
+    CHECK(LK("www.a.sub.example.test.") == 0);
+    lkr_t r = lk_get(sv[1]);
+    CHECK(r.got && !r.failed && r.r.found && r.r.request_id == 101 && r.r.view == 1 && r.r.source_id == 2 && strcmp(r.r.name, "sub.example.test.") == 0 && r.r.kind == KDB_ZK_PRIMARY);
+    {
+        st_look_t l;
+        CHECK(st_lookup(&x, 2, &l) == 0 && l.found);
+        CHECK(r.r.stamped == l.has_state && r.r.stamp_gen == l.gen && r.r.stamp_time == l.at);   /* (the stamp of the manifest row) */
+        CHECK(!r.r.has_serial || !r.r.stamped);
+    }
+    /* the zone itself, and a name below the closest zone's own subdomains of another zone */
+    CHECK(LK("sub.example.test.") == 0);
+    r = lk_get(sv[1]);
+    CHECK(r.got && r.r.found && r.r.source_id == 2);
+    CHECK(LK("mail.example.test.") == 0);
+    r = lk_get(sv[1]);
+    CHECK(r.got && r.r.found && r.r.source_id == 1 && strcmp(r.r.name, "example.test.") == 0);        /* (no mapping row: this view's) */
+    /* a zone stored with capitals is found (SQLite3 compares without regard to case) */
+    CHECK(LK("www.upper.test.") == 0);
+    r = lk_get(sv[1]);
+    CHECK(r.got && r.r.found && r.r.source_id == 5 && strcasecmp(r.r.name, "upper.test.") == 0);              /* (the canonical name keeps the case: names are compared without regard to it) */
+    /* the closest zone is a secondary: no answer (the Backend serves those from its heap, after the pass); a zone above is not offered in its place */
+    CHECK(LK("www.sec.example.test.") == 0);
+    r = lk_get(sv[1]);
+    CHECK(r.got && !r.r.found);
+    /* a zone of a type the pass does not offer is skipped: the zone above it answers */
+    CHECK(LK("www.x.sec.example.test.") == 0);
+    r = lk_get(sv[1]);
+    CHECK(r.got && !r.r.found);                                                                      /* (y.sec... is not above it; sec.example.test is a secondary: nothing) */
+    CHECK(LK("www.y.sec.example.test.") == 0);
+    r = lk_get(sv[1]);
+    CHECK(r.got && r.r.found && r.r.source_id == 8);
+    /* no zone has the name, the root is not looked for */
+    CHECK(LK("www.nothing.invalid.") == 0);
+    r = lk_get(sv[1]);
+    CHECK(r.got && !r.r.found);
+    CHECK(LK(".") == 0);
+    r = lk_get(sv[1]);
+    CHECK(r.got && !r.r.found);
+    /* a zone that is not mapped to the view and has no zone above it (a new snapshot: the mapping row is new) */
+    db_driver_sqlite3.end_snapshot(c);
+    raw_exec(db, "INSERT INTO karidns_domain_views (domain_id, view_name) VALUES (4, 'other')");
+    CHECK(db_driver_sqlite3.begin_snapshot(c) == 0);
+    CHECK(LK("www.other.test.") == 0);
+    r = lk_get(sv[1]);
+    CHECK(r.got && !r.r.found);
+    /* a source without the zone state (a plain schema: no stamp, the serial instead) */
+    {
+        db_schema_info_t plain = si;
+        plain.has_zone_state = false;
+        x.fetch_req = 200;
+        ctx_view_reset(&x);
+        x.n_zones = 0;
+        CHECK(lookup_run(&x, &plain, "www.mail.example.test.") == 0);
+        r = lk_get(sv[1]);
+        CHECK(r.got && r.r.found && r.r.source_id == 1 && !r.r.stamped && r.r.has_serial && r.r.serial == 7);
+    }
+    db_driver_sqlite3.end_snapshot(c);
+    ctx_view_reset(&x);
+    db_driver_sqlite3.close(c);
+    x.conn = NULL;
+    close(sv[0]);
+    close(sv[1]);
+    kdb_enc_free(&x.enc);
+    pthread_mutex_destroy(&io->wlock);
+    free(io);
+    sqlite3_close(db);
+#undef LK
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/db";
     snprintf(g_schema, sizeof(g_schema), "%s/pdns_schema.sqlite3.sql", dir);
@@ -4164,6 +4346,7 @@ int main(int argc, char **argv) {
     test_writes();
     test_paged();
     test_store_loader();
+    test_lookup();
     test_manifest_rate();
     test_schema_versions();
     test_audit_actor();

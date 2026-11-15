@@ -1326,6 +1326,79 @@ static void test_claim_race(void) {
   CHECK(asked >= 2000 && asked <= 2000 * CLW);
 }
 
+/* B1: the claim keeps the name key of the zone its first worker waits for, and the take gives it back */
+static void test_att_tag(void) {
+  printf("[the claim's name key (B1); the lookups in flight (0.7)]\n");
+  const uint64_t ka = park_name_key("v1", "old.test."), kb = park_name_key("v1", "new.test.");
+  uint64_t tag = 99;
+  CHECK(park_att_claim_tag(5, 900, 2, ka) == 1);
+  CHECK(park_att_claim_tag(5, 900, 3, kb) == 2);                                 /* (another worker joins: the key of the first stays) */
+  CHECK(park_att_take_tag(5, 900, &tag) == ((1u << 2) | (1u << 3)) && tag == ka);
+  CHECK(park_att_take_tag(5, 900, &tag) == PARK_ATT_ALL && tag == 0);            /* (no claim: no key) */
+  CHECK(park_att_claim(5, 901, 1) == 1 && park_att_take_tag(5, 901, &tag) == (1u << 1) && tag == 0);   /* (a claim made without a key has none) */
+  CHECK(park_att_claim_tag(5, 902, 0, kb) == 1 && park_att_claim_tag(5, 903, 0, ka) == 1);     /* (two claims: each has its own) */
+  CHECK(park_att_take_tag(5, 903, &tag) == 1u && tag == ka && park_att_take_tag(5, 902, &tag) == 1u && tag == kb);
+
+  /* the lookups in flight: bounded, and a place given back twice does not make room */
+  CHECK(park_lookup_used() == 0);
+  park_lookup_set_limit(3);
+  CHECK(park_lookup_take() && park_lookup_take() && park_lookup_take());
+  CHECK(!park_lookup_take() && park_lookup_used() == 3);                        /* (a flood of names gets no place beyond the limit) */
+  park_lookup_give();
+  CHECK(park_lookup_used() == 2 && park_lookup_take() && !park_lookup_take());
+  park_lookup_give();
+  park_lookup_give();
+  park_lookup_give();
+  park_lookup_give();                                                           /* (one more than were taken) */
+  CHECK(park_lookup_used() == 0);
+  park_lookup_set_limit(PARK_LOOKUP_MAX);
+  for (uint32_t i = 0; i < PARK_LOOKUP_MAX; i++) CHECK(park_lookup_take());
+  CHECK(!park_lookup_take());
+  for (uint32_t i = 0; i < PARK_LOOKUP_MAX; i++) park_lookup_give();
+  CHECK(park_lookup_used() == 0);
+
+  /* B1, the worker's side: a query that waits for the attach of a zone id that another zone has now is asked for its own zone's fetch by the id (park_ask_fetch_zid()), the query for the new zone is woken by its key first */
+  park_register_worker(14, -1);
+  park_key_t k;
+  while (park_wake_pop(park_wake_ring(14), &k)) {}
+  park_wake_queue_mask("v1", "new.test.", 1u << 14, false);
+  park_wake_queue_zid(5, 900, 1u << 14);
+  CHECK(park_wake_pop(park_wake_ring(14), &k) && k.ask == 0 && !k.failed && park_key_is(&k, "v1", "new.test."));
+  CHECK(park_wake_pop(park_wake_ring(14), &k) && k.ask == 2 && k.key == (((uint64_t)5 << 32) | 900));      /* (after it, in the order of the ring) */
+  park_wake_flush();
+  park_unregister_worker(14);
+}
+
+/* 0.7: the mark of an entry that waits for a by-name lookup: the wake or the failure by the name (the answer) clears it, the wake of every query (park_wake_all()) and a retry do not */
+static void test_lookup_mark(void) {
+  printf("[the lookup mark of an entry]\n");
+  park_table_t t;
+  CHECK(park_init(&t, 8));
+  udp_ipc_t ipc = mk_ipc(7);
+  uint8_t pay[40];
+  memset(pay, 1, sizeof(pay));
+  const int32_t a = park_udp(&t, 1000, 1500, "v1", "a.late.test.", 3, &ipc, pay, 40), b = park_udp(&t, 1000, 1500, "v1", "b.late.test.", 3, &ipc, pay, 40),
+                c = park_udp(&t, 1000, 1500, "v1", "c.late.test.", 3, &ipc, pay, 40), d = park_udp(&t, 1000, 1500, "v1", "d.zone.test.", 3, &ipc, pay, 40);
+  CHECK(a >= 0 && b >= 0 && c >= 0 && d >= 0 && !t.e[a].lookup);
+  park_mark_lookup(&t, a);
+  park_mark_lookup(&t, b);
+  park_mark_lookup(&t, c);
+  park_mark_lookup(&t, -1);                                                       /* (no entry: nothing) */
+  park_mark_lookup(&t, 99);
+  CHECK(t.e[a].lookup && t.e[b].lookup && t.e[c].lookup && !t.e[d].lookup);
+  CHECK(park_retry(&t, "v1", "a.late.test.", 9000) == 1 && t.e[a].lookup);        /* (a retry leaves it waiting, still for the lookup) */
+  CHECK(park_wake(&t, "v1", "a.late.test.") == 1 && t.e[a].state == PARK_READY && !t.e[a].lookup);     /* the answer */
+  CHECK(park_fail(&t, "v1", "b.late.test.") == 1 && t.e[b].state == PARK_TIMEOUT && !t.e[b].lookup);   /* the failure */
+  CHECK(park_wake_all(&t) == 2 && t.e[c].state == PARK_READY && t.e[c].lookup && t.e[d].state == PARK_READY && !t.e[d].lookup);   /* no answer: the mark stays */
+  park_mark_lookup(&t, c);                                                        /* (not waiting any more: nothing) */
+  park_entry_t *e;
+  while ((e = park_next_done(&t))) park_release(&t, e);
+  CHECK(t.nfree == t.cap);
+  const int32_t a2 = park_udp(&t, 1000, 1500, "v1", "a.late.test.", 3, &ipc, pay, 40);
+  CHECK(a2 >= 0 && !t.e[a2].lookup);                                              /* (a new entry has no mark: the slot of an old one is cleared) */
+  park_free(&t);
+}
+
 int main(int argc, char **argv) {
   g_self = argv[0];
   if (argc > 1 && strcmp(argv[1], "parkmem") == 0) return park_mem_child();
@@ -1349,6 +1422,8 @@ int main(int argc, char **argv) {
   test_park_max_memory();
   test_claim_race();
   test_att_group_and_ask();
+  test_att_tag();
+  test_lookup_mark();
 #ifdef __FreeBSD__
   test_wake_queue();
   test_sleep_protocol();

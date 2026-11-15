@@ -889,6 +889,48 @@ static int pg_find_zone(db_conn_t *c, const char *name, db_zone_cb cb, void *ud)
     return ret;
 }
 
+/* 0.7: the zones that have one of the names, closest (longest name) first (dns_db_driver.h find_zones_in()).  The names go in as one text array parameter, each element quoted (a backslash and a double quote are
+ * escaped, as the array literal of PostgreSQL wants), in both spellings; `d.name = ANY(...)` is a search of the index on domains.name for every element. */
+static int pg_find_zones_in(db_conn_t *c, const char *const *names, size_t n, db_zone_cb cb, void *ud) {
+    if (n == 0 || n > DB_LOOKUP_MAX) {
+        set_err(c, "find_zones_in: %zu names (1 to %d)", n, DB_LOOKUP_MAX);
+        return -1;
+    }
+    char *arr = malloc(2 * n * (2 * 1100 + 4) + 8);       /* (every character may be escaped; two spellings of at most 1100 bytes) */
+    if (!arr) {
+        set_err(c, "find_zones_in: out of memory");
+        return -1;
+    }
+    size_t o = 0;
+    arr[o++] = '{';
+    bool first = true;
+    for (size_t i = 0; i < n; i++) {
+        size_t l = strlen(names[i]);
+        if (l > 1 && names[i][l - 1] == '.') l--;
+        if (l == 0 || l > 1100 - 2) continue;                  /* longer than any domain name: it matches nothing */
+        for (int dot = 0; dot < 2; dot++) {
+            if (!first) arr[o++] = ',';
+            first = false;
+            arr[o++] = '"';
+            for (size_t k = 0; k < l; k++) {
+                if (names[i][k] == '"' || names[i][k] == '\\') arr[o++] = '\\';
+                arr[o++] = names[i][k];
+            }
+            if (dot) arr[o++] = '.';
+            arr[o++] = '"';
+        }
+    }
+    arr[o++] = '}';
+    arr[o] = '\0';
+    const char *pv[1] = { arr };
+    char q[1100];
+    zl_t z = { cb, ud, false, 0, false };
+    snprintf(q, sizeof(q), "%sWHERE d.name = ANY($1::text[]) ORDER BY length(d.name) DESC, d.id, r.id", PG_ZONE_SELECT);
+    int ret = pg_scan(c, "find_zones_in", q, 1, pv, zl_row, &z);
+    free(arr);
+    return ret;
+}
+
 /* ---- records ---- */
 typedef struct { db_record_cb cb; void *ud; } rl_t;
 
@@ -2384,6 +2426,7 @@ const db_driver_t db_driver_postgresql = {
     .watch_requests = pg_watch_requests, .requests_max = pg_requests_max, .reload_requests = pg_reload_requests,
     .schema_findings = pg_schema_findings,      /* B12 */
     .find_zone = pg_find_zone,                  /* B13 */
+    .find_zones_in = pg_find_zones_in,          /* 0.7: the lookup of a name */
     .scan_records_in = pg_scan_records_in, .scan_metadata_in = pg_scan_metadata_in, .scan_ext_in = pg_scan_ext_in,      /* B13b */
     .scan_apex = pg_scan_apex,                  /* D1a step 6 */
     .count_domains = pg_count_domains, .manifest_page = pg_manifest_page, .current_cursor = pg_current_cursor, .changes_page = pg_changes_page,      /* 0.7 store, WP3 */

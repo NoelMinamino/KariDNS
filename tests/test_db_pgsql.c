@@ -547,6 +547,31 @@ static void test_rows(void) {
     memset(z, 0, sizeof(*z));
     CHECK(D->list_zones(c, cb_zone, z) == 0 && z->n == 3);              /* the cursor was closed: the next query works */
 
+    /* 0.7 find_zones_in: the zones that have one of the names, in one statement, the longest name first (then by id); both spellings of a name; the exact (lower case) spelling; nothing for a name that is
+     * too long, the root and the empty name; a name with a backslash and a double quote is only a name that no zone has */
+    {
+        const char *names[] = { "www.a.test.", "a.test.", "test.", "c.test", "nope.test" };
+        memset(z, 0, sizeof(*z));
+        CHECK(D->find_zones_in != NULL && D->find_zones_in(c, names, 5, cb_zone, z) == 0 && z->n == 2 && z->id[0] == 1 && z->id[1] == 3);
+        CHECK(z->n == 2 && !strncmp(z->soa[0], "ns.a.test ", 10) && z->soa_null[1]);      /* (the rows of find_zone(): the first enabled SOA; a zone whose SOA is disabled has none) */
+        const char *odd[] = { "we\\ird\"x.test.", ".", "", "b.test." };
+        memset(z, 0, sizeof(*z));
+        CHECK(D->find_zones_in(c, odd, 4, cb_zone, z) == 0 && z->n == 1 && z->id[0] == 2);
+        char longname[1300];
+        memset(longname, 'a', sizeof(longname) - 1);
+        longname[sizeof(longname) - 1] = '\0';
+        const char *toolong[] = { longname, "c.test." };
+        memset(z, 0, sizeof(*z));
+        CHECK(D->find_zones_in(c, toolong, 2, cb_zone, z) == 0 && z->n == 1 && z->id[0] == 3);
+        memset(z, 0, sizeof(*z));
+        z->stop_after = 1;
+        CHECK(D->find_zones_in(c, names, 5, cb_zone, z) == DB_STOPPED && z->n == 1);
+        memset(z, 0, sizeof(*z));
+        CHECK(D->find_zones_in(c, names, 0, cb_zone, z) == -1 && D->find_zones_in(c, names, DB_LOOKUP_MAX + 1, cb_zone, z) == -1);
+        memset(z, 0, sizeof(*z));
+        CHECK(D->list_zones(c, cb_zone, z) == 0 && z->n == 3);              /* the cursor was closed: the next query works */
+    }
+
     racc_t *r = calloc(1, sizeof(*r));
     CHECK(D->scan_records(c, NULL, cb_rec, r) == 0);
     CHECK(r->n == 7);

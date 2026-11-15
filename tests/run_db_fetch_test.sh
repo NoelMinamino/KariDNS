@@ -10,6 +10,7 @@
 #   - a SLAVE zone comes as a secondary (no data); an unknown zone, a PRODUCER zone, a zone without SOA and a range request are answered with
 #     ZONE_FAILED and the reason, never with silence
 #   - the queue serves priority 0 before 1 before 2 (a big zone keeps the thread busy while three requests wait)
+#   - a request that waited longer than the aging bound (200 ms) goes first, the oldest of them, so that a priority 2 request does not starve
 #   - more requests than the queue holds: the surplus is answered "busy", the loader stays healthy and serves the next request
 #   - bytes that are not KDB1 on the fetch stream close that stream, and a loader without its fetch stream ends with an error (the supervisor
 #     starts one with a new pair); the same when the Backend just closes the fetch stream; a FETCH_REQ on the first stream is a protocol error
@@ -76,11 +77,26 @@ has "a zone without SOA: ZONE_FAILED" '^FAILED id=8 zone=nosoa.test. reason=.*SO
 has "a range request: ZONE_FAILED, not silence" '^FAILED id=9 zone=small.test. reason=.*range'
 has "the loader ended well when the Backend closed the streams" '^DONE answers=9 loader=0$'
 
-echo "== priorities: 0 before 1 before 2 while the thread is busy"
+echo "== priorities: 0 before 1 before 2 while the thread is busy (aging switched off: the queue waits a long time here)"
+KARIDNS_FETCH_AGING_MS=3600000; export KARIDNS_FETCH_AGING_MS
 run req:1:big.test.:1:0 begin:1 req:2:small.test.:2:0 req:3:small.test.:1:0 req:4:small.test.:0:0 hold:300 wait:4
+unset KARIDNS_FETCH_AGING_MS
 order=$(grep -E '^(ANS|FAILED)' "$T/out" | sed -E 's/^[A-Z]+ id=([0-9]+).*/\1/' | tr '\n' ' ')
 [ "$order" = "1 4 3 2 " ] && pass "the answers come in the order 1 (busy), 4 (priority 0), 3 (1), 2 (2)" || { fail "answer order '$order'"; cat "$T/out"; }
 has "the big zone arrived whole" '^ANS id=1 zone=big.test. kind=primary summary=0 .* rr=30004 '
+
+echo "== aging: a request that waited longer than the bound (200 ms) goes first"
+# one worker, kept busy by 1; 2 (priority 2) waits 600 ms; then 3, 4 (priority 0) and 20 more (priority 1) come: 2 is the only one older than the bound
+fetch_order() { grep -E '^(ANS|FAILED)' "$T/out" | sed -E 's/^[A-Z]+ id=([0-9]+).*/\1/' | tr '\n' ' '; }
+run req:1:big.test.:1:0 begin:1 req:2:small.test.:2:0 hold:600 req:3:small.test.:0:0 req:4:small.test.:0:0 flood:20:small.test. wait:24
+order=$(fetch_order | cut -d' ' -f1-4)
+[ "$order" = "1 2 3 4" ] && pass "the old priority 2 request is answered right after the busy one, before priority 0 and 1" || { fail "answer order '$order'"; head -30 "$T/out"; }
+echo "== aging switched off: the same requests are served by priority (so the test above shows the aging)"
+KARIDNS_FETCH_AGING_MS=3600000; export KARIDNS_FETCH_AGING_MS
+run req:1:big.test.:1:0 begin:1 req:2:small.test.:2:0 hold:600 req:3:small.test.:0:0 req:4:small.test.:0:0 flood:20:small.test. wait:24
+unset KARIDNS_FETCH_AGING_MS
+order=$(fetch_order | awk '{print $1, $NF}')
+[ "$order" = "1 2" ] && pass "without aging the priority 2 request is the last one" || { fail "first and last answer '$order'"; head -30 "$T/out"; }
 
 echo "== more requests than the queue holds"
 run req:1:big.test.:1:0 begin:1 flood:1500:small.test. hold:300 sleep:6000 req:77:small.test.:0:0 begin:77 sleep:500

@@ -120,6 +120,10 @@
  *                     cannot be loaded) | 3 name name (an upsert needs it; a delete has it when the loader knows it) | 4 kind u8 (an upsert needs it) | 5 stamp_gen u64 |
  *                     6 stamp_time u64 | 7 flags u8 O (bit0 KDB_EF_STAMPED, bit1 KDB_EF_FORCE: read the body whatever the stamp says: a reload request) | 8 serial u32 O.
  *                     A domain can be in two pages of a drain; the entries are idempotent.
+ *   LOOKUP_RESULT (19) 0.7, fetch stream only (the answer to FETCH_REQ mode 2): 1 request_id u64 R | 2 view view R | 3 found u8 R (0/1) | and, with found = 1: 4 source_id i64 R |
+ *                     5 name name R (the zone: canonical, the entry of a MANIFEST) | 6 kind u8 R (KDB_ZK_*) | 7 stamp_gen u64 R | 8 stamp_time u64 R | 9 flags u8 O (bit0 KDB_EF_STAMPED) |
+ *                     10 serial u32 O (a plain schema).  With found = 0 none of 4..10.  The Backend records the zone as a MANIFEST entry would (a KNOWN record, its body is read when a
+ *                     query asks for it); the entry is a claim of an untrusted loader: its name must enclose the name that was asked for.
  * Backend -> loader (type | 0x8000)
  *   CONFIG (0x8001)   1 generation u64 R | 2 driver str ne <=32 R | 3 server_id str<=64 O |
  *                     4 VIEW nested, repeatable (<= 1024):
@@ -150,11 +154,15 @@
  *                     3 shadowed,4 deleted) | 4 reason str<=255 O
  *   BATCH_RESULT (0x8006) 1 batch_id u64 R | 2 request_ids bytes O (n * u64, <= 2048 bytes) | 3 n_applied u32 R |
  *                     4 n_unchanged u32 R | 5 n_rejected u32 R | 6 n_deleted u32 R
- *   FETCH_REQ (0x8007) D1a, fetch stream only: 1 request_id u64 R (> 0) | 2 view view R | 3 zone name R |
- *                     4 priority u8 R (0 a query waits for it, 1 warm-up, 2 background) | 5 mode u8 R (0 the zone, 1 its summary) |
+ *   FETCH_REQ (0x8007) D1a, fetch stream only: 1 request_id u64 R (> 0) | 2 view view R | 3 zone name R (mode 2: a query name) |
+ *                     4 priority u8 R (0 a query waits for it, 1 warm-up, 2 background) | 5 mode u8 R (0 the zone, 1 its summary, 2 lookup) |
  *                     6 range_lo name O | 7 range_hi name O (D1b: both or none; a loader that does not read ranges answers ZONE_FAILED) |
  *                     8 source_id i64 O (0.7 WP7a: the domains.id the Backend holds for the zone (a KNOWN zone of the store protocol); a loader that finds the name with
  *                         another id answers ZONE_FAILED: the zone was renamed or created again, and CHANGES says so)
+ *                     0.7, mode 2 (KDB_FETCH_LOOKUP; only to a loader whose HELLO features have KDB_FEAT_LOOKUP): the first start of a store has not listed every zone yet, and a
+ *                     query asks for a name it does not know.  Tag 3 is the query name; the loader finds the zone of the view that encloses it (the name and its parent names, the
+ *                     longest one that the view serves and the loader can send; the root is not looked for) and answers LOOKUP_RESULT, or ZONE_FAILED (a database error).  Tags 6, 7
+ *                     and 8 are not used with it.
  *   HOT_LIST (0x8008) D1a step 7 (design 8.4), first stream only: the zones most asked for, hottest first, in parts as WARM_LIST (tags 1..4 the same;
  *                     5 limit u32 O: the most entries the loader keeps in its state file, <= KDB_HOT_MAX, absent = KDB_HOT_MAX).  Several parts carry
  *                     one list_id; a part that does not follow the one before (or a new list_id) starts the list again.  The loader merges the list
@@ -181,6 +189,7 @@
 #define KDB_MAX_ZONE_DATA 65535u     /* ZONE_DATA body */
 #define KDB_REASON_LEN 128
 #define KDB_FEAT_STORE 0x1u          /* HELLO features: the store protocol (MANIFEST / CHANGES) */
+#define KDB_FEAT_LOOKUP 0x2u         /* HELLO features: the loader answers FETCH_REQ mode KDB_FETCH_LOOKUP with LOOKUP_RESULT (the zone that encloses a name, 0.7 first start) */
 #define KDB_MF_VERIFY 0x1u           /* MANIFEST_BEGIN flags: a verify pass (entries carry digests; reserved) */
 #define KDB_MF_PLAIN 0x2u            /* ... a plain PowerDNS schema: no stamps, serials */
 #define KDB_EF_STAMPED 0x1u          /* MANIFEST / CHANGES entry flags: the stamp (generation, changed_at) is real */
@@ -208,6 +217,7 @@ enum {
     KDB_T_ZONE_END = 6, KDB_T_ZONE_ABORT = 7, KDB_T_ZONE_FAILED = 8, KDB_T_ZONE_DELETE = 9, KDB_T_PROFILE = 10,
     KDB_T_BATCH_END = 11, KDB_T_AUTO_STATUS = 12, KDB_T_WARM_LIST = 13, KDB_T_HOT_ACK = 14,
     KDB_T_MANIFEST_BEGIN = 15, KDB_T_MANIFEST = 16, KDB_T_MANIFEST_END = 17, KDB_T_CHANGES = 18,      /* 0.7 WP7a: the store protocol */
+    KDB_T_LOOKUP_RESULT = 19,           /* 0.7: the answer to FETCH_REQ mode KDB_FETCH_LOOKUP (fetch stream only) */
     /* Backend -> loader: high bit set */
     KDB_T_CONFIG = 0x8001, KDB_T_RELOAD_REQ = 0x8002, KDB_T_INVENTORY = 0x8003, KDB_T_INVENTORY_END = 0x8004,
     KDB_T_ZONE_RESULT = 0x8005, KDB_T_BATCH_RESULT = 0x8006,
@@ -217,7 +227,7 @@ enum {
 };
 
 enum { KDB_FETCH_PRIO_QUERY = 0, KDB_FETCH_PRIO_WARM, KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_PRIO_N };
-enum { KDB_FETCH_FULL = 0, KDB_FETCH_SUMMARY };
+enum { KDB_FETCH_FULL = 0, KDB_FETCH_SUMMARY, KDB_FETCH_LOOKUP };      /* LOOKUP (0.7): tag 3 is a query name, not a zone: which zone of the view encloses it? */
 
 enum { KDB_BATCH_STARTUP = 0, KDB_BATCH_FULL, KDB_BATCH_DIFF, KDB_BATCH_ZONE, KDB_BATCH_AUTO };
 enum { KDB_ZK_PRIMARY = 0, KDB_ZK_SECONDARY, KDB_ZK_CATALOG };
@@ -375,6 +385,12 @@ typedef struct {
     int64_t source_id;          /* tag 8; 0 = absent */
 } kdb_fetch_req_t;
 
+/* 0.7: LOOKUP_RESULT (the entry is a claim of an untrusted loader, as a MANIFEST entry: the Backend checks it) */
+typedef struct {
+    uint64_t request_id; uint16_t view; bool found;
+    int64_t source_id; char name[DNS_NAME_TEXT_SIZE]; uint8_t kind; bool stamped; uint64_t stamp_gen, stamp_time; bool has_serial; uint32_t serial;     /* (found only) */
+} kdb_lookup_result_t;
+
 /* 0.7 WP7a: the store protocol */
 typedef struct {
     uint64_t batch_id; uint16_t view; uint64_t count; uint64_t cursor; bool cursor_valid;
@@ -402,6 +418,7 @@ typedef struct {
         kdb_inventory_end_t inventory_end; kdb_zone_result_t zone_result; kdb_batch_result_t batch_result;
         kdb_fetch_req_t fetch_req; kdb_hot_list_t hot_list; kdb_hot_ack_t hot_ack; kdb_debug_t debug;
         kdb_manifest_begin_t manifest_begin; kdb_manifest_t manifest; kdb_manifest_end_t manifest_end; kdb_changes_t changes;
+        kdb_lookup_result_t lookup_result;
     } u;
 } kdb_msg_t;
 

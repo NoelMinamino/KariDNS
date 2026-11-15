@@ -289,6 +289,7 @@ uint32_t park_wake_key(park_table_t *t, uint64_t key) {
     e->hnext = 0;
     wheel_remove(t, e);
     unsent_remove(t, e);
+    e->lookup = 0;                                       /* (the answer of a lookup, or any other wake by the name) */
     done_enter(t, e, PARK_READY);
     t->n_woken++;
     n++;
@@ -316,6 +317,7 @@ uint32_t park_fail_key(park_table_t *t, uint64_t key) {
     e->hnext = 0;
     wheel_remove(t, e);
     unsent_remove(t, e);
+    e->lookup = 0;
     done_enter(t, e, PARK_TIMEOUT);
     t->n_failed++;
     n++;
@@ -390,6 +392,11 @@ void park_mark_attach(park_table_t *t, int32_t idx, int64_t now_ns, int64_t full
   t->e[idx].attach = 1;
   t->e[idx].t_park_ns = now_ns;
   t->e[idx].full_ms = full_deadline_ms;
+}
+
+void park_mark_lookup(park_table_t *t, int32_t idx) {
+  if (!t->e || idx < 0 || (uint32_t)idx >= t->cap || t->e[idx].state != PARK_WAIT) return;
+  t->e[idx].lookup = 1;
 }
 
 uint32_t park_wake_all(park_table_t *t) {
@@ -896,6 +903,11 @@ bool park_attach_next(park_attach_req_t *out) {
 #define ACL_ID(sv, zid) (((uint64_t)(zid) << 32) | ((uint64_t)((sv) & 0xFFu) << 24) | (1ull << 23))      /* (bit 23 is set in every id: an id is never 0, the free slot) */
 #define ACL_IDMASK 0xFFFFFFFFFF800000ull
 static _Atomic uint64_t g_aclaim[ACL_SLOTS];             /* 0: free */
+/* The name key (park_name_key()) of the zone that the worker which made a claim waits for, in the slot of the same index (0: none / not known).  The zone id of a record can be given to another zone
+ * after the claim was made (the zone was deleted and a new one took the id); a store thread that takes the claim and finds that the record has another name than the claimant waited for knows that the
+ * claim's waiters are for a zone that is gone (B1).  Written by the worker that made the claim right after the claim's compare-and-swap, read by the thread that takes it: a take that is faster than the
+ * write reads 0 or the tag of an earlier claim of the slot, and a wrong tag costs an extra look at the waiters (a mismatch), never a missed one except for the 0 case, which is the old behaviour. */
+static _Atomic uint64_t g_atag[ACL_SLOTS];
 
 static size_t acl_slot(uint64_t id, unsigned j) {
   uint64_t x = id * 0x9E3779B97F4A7C15ull;
@@ -909,7 +921,7 @@ static uint32_t acl_to_set(uint64_t v) {                 /* the set of a slot as
   return s;
 }
 
-int park_att_claim(uint16_t sview, uint32_t zid, int w) {
+int park_att_claim_tag(uint16_t sview, uint32_t zid, int w, uint64_t tag) {
   const uint64_t id = ACL_ID(sview, zid), bit = acl_bit(w);
   for (;;) {
     int free_j = -1;
@@ -932,10 +944,15 @@ int park_att_claim(uint16_t sview, uint32_t zid, int w) {
     if (free_j < 0) return -1;                           /* no room for a mark: the caller asks without one */
     _Atomic uint64_t *s = &g_aclaim[acl_slot(id, (unsigned)free_j)];
     uint64_t z = 0;
-    if (atomic_compare_exchange_strong_explicit(s, &z, id | bit, memory_order_acq_rel, memory_order_acquire)) return 1;
+    if (atomic_compare_exchange_strong_explicit(s, &z, id | bit, memory_order_acq_rel, memory_order_acquire)) {
+      atomic_store_explicit(&g_atag[acl_slot(id, (unsigned)free_j)], tag, memory_order_release);
+      return 1;
+    }
     /* the slot was taken between the look and the swap: look again (it may be this zone's claim) */
   }
 }
+
+int park_att_claim(uint16_t sview, uint32_t zid, int w) { return park_att_claim_tag(sview, zid, w, 0); }
 
 /* the request of the claim is in a ring: a worker that joins now does not have to make one */
 void park_att_requested(uint16_t sview, uint32_t zid) {
@@ -949,16 +966,26 @@ void park_att_requested(uint16_t sview, uint32_t zid) {
   }
 }
 
-uint32_t park_att_take(uint16_t sview, uint32_t zid) {
+uint32_t park_att_take_tag(uint16_t sview, uint32_t zid, uint64_t *tag) {
   const uint64_t id = ACL_ID(sview, zid);
   for (unsigned j = 0; j < ACL_WIN; j++) {
     _Atomic uint64_t *s = &g_aclaim[acl_slot(id, j)];
     uint64_t v = atomic_load_explicit(s, memory_order_acquire);
     while (v != 0 && (v & ACL_IDMASK) == id) {
-      if (atomic_compare_exchange_weak_explicit(s, &v, 0, memory_order_acq_rel, memory_order_acquire)) return acl_to_set(v);
+      const uint64_t t = atomic_load_explicit(&g_atag[acl_slot(id, j)], memory_order_acquire);        /* (before the slot is free: another claim of the slot would overwrite it) */
+      if (atomic_compare_exchange_weak_explicit(s, &v, 0, memory_order_acq_rel, memory_order_acquire)) {
+        *tag = t;
+        return acl_to_set(v);
+      }
     }
   }
+  *tag = 0;
   return PARK_ATT_ALL;                                   /* no claim (a request without one, or a duplicate that came after the first was done): whoever waits is woken */
+}
+
+uint32_t park_att_take(uint16_t sview, uint32_t zid) {
+  uint64_t tag;
+  return park_att_take_tag(sview, zid, &tag);
 }
 
 /* the worker no longer waits for the zone (its last query for it was answered or dropped without the zone): its bit goes, and the claim with it when nobody is left.
@@ -1260,3 +1287,25 @@ bool park_fetch_next(park_fetch_req_t *out) {
   }
   return false;
 }
+
+/* ------------------------------------------------------------------ the by-name lookups in flight (0.7, dns_park.h) */
+static _Atomic uint32_t g_lookups;
+static _Atomic uint32_t g_lookup_lim = PARK_LOOKUP_MAX;
+
+bool park_lookup_take(void) {
+  uint32_t v = atomic_load_explicit(&g_lookups, memory_order_relaxed);
+  const uint32_t lim = atomic_load_explicit(&g_lookup_lim, memory_order_relaxed);
+  while (v < lim) {
+    if (atomic_compare_exchange_weak_explicit(&g_lookups, &v, v + 1, memory_order_acq_rel, memory_order_relaxed)) return true;
+  }
+  return false;
+}
+
+void park_lookup_give(void) {
+  uint32_t v = atomic_load_explicit(&g_lookups, memory_order_relaxed);
+  while (v > 0 && !atomic_compare_exchange_weak_explicit(&g_lookups, &v, v - 1, memory_order_acq_rel, memory_order_relaxed)) {
+  }                                                      /* (never below 0: a place given back twice does not make room) */
+}
+
+uint32_t park_lookup_used(void) { return atomic_load_explicit(&g_lookups, memory_order_relaxed); }
+void park_lookup_set_limit(uint32_t limit) { atomic_store_explicit(&g_lookup_lim, limit, memory_order_relaxed); }

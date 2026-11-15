@@ -14,6 +14,7 @@
  *   - a zone nobody asked for is read and thrown away: no zone appears, the stream goes on
  *   - bytes that are not KDB1 close the fetch stream; a request then is failed at once; a new pair of descriptors over the control socket
  *     (a restarted loader) gets the requests that were not answered
+ *   - both streams busy while requests of queries wait, a yield after every frame: no stream is closed (each reads into its own buffer)
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -494,6 +495,20 @@ static void *gs_worker(void *arg) {
         if ((seed >> 24) % 8 == 0) usleep(20);
     }
     atomic_fetch_add(&g_gs_done, 1);
+    return NULL;
+}
+
+/* the yield case: a worker that keeps a request waiting for the ingest thread (a zone that is not in the registry: answered at once), so that park_fetch_pending() is true
+ * whenever a pass over a stream asks */
+extern _Atomic int64_t g_ing_yield_ns;                                         /* dns_db_ingest.c: 1 ms, 0 here (a pass yields after every frame while a request waits) */
+static _Atomic bool g_yw_stop;
+static void *yield_worker(void *arg) {
+    (void)arg;
+    while (!atomic_load(&g_yw_stop)) {
+        (void)park_fetch_request(1, "default", "not-there.yield.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL);
+        park_key_t kk;
+        while (park_wake_pop(park_wake_ring(1), &kk)) {}
+    }
     return NULL;
 }
 
@@ -2529,6 +2544,87 @@ int main(void) {
             CHECK(atomic_load(&g_gs_claimed) > 0 && is1 > is0 && ST("fetchq", "waited") > 0);
             CHECK(shed1 == shed0 && rate1 == rate0);                                      /* (nothing was refused: the requests waited) */
             CHECK(answered >= is1 - is0);
+            drain_wakes();
+        }
+
+        /* -- both streams busy while requests of queries wait (the first fill under load): a pass over a stream that yields to the requests leaves frames in its framer, which
+         *    points into the bytes it was fed.  The two streams read into one buffer, so the read of the other stream overwrote those frames and the stream was closed
+         *    ("bad magic"; the fetch stream then stayed closed).  Each stream has its own buffer now: thousands of frames on both, a yield after every one, and both go on. */
+        {
+            int a9[2], f9[2];
+            CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a9) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, f9) == 0);
+            hand_over(c[0], a9[1], f9[1]);
+            static ch_t main9, fetch9;
+            ch_init(&main9, a9[0], KDB_FROM_BACKEND);
+            ch_init(&fetch9, f9[0], KDB_FROM_BACKEND);
+            kdb_enc_begin(&e, KDB_T_HELLO);
+            kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4243);
+            kdb_enc_end(&e);
+            ch_send(a9[0], &e);
+            CHECK(ch_next(&main9, &m, 5000) && m.type == KDB_T_CONFIG);
+            CHECK(ch_next(&main9, &m, 5000) && m.type == KDB_T_DEBUG);
+            enum { YN = 6000 };
+            kdb_enc_t eb, ef;                                  /* the first stream: AUTO_STATUS with no entry (12 bytes each); the fetch stream: ZONE_FAILED of no request (discarded) */
+            kdb_enc_init(&eb);
+            kdb_enc_init(&ef);
+            for (int i = 0; i < YN; i++) {
+                kdb_enc_begin(&eb, KDB_T_AUTO_STATUS);
+                kdb_enc_end(&eb);
+                kdb_enc_begin(&ef, KDB_T_ZONE_FAILED);
+                kdb_enc_u16(&ef, 1, 0); kdb_enc_name(&ef, 2, "nobody.yield.test."); kdb_enc_i64(&ef, 3, 0); kdb_enc_str(&ef, 4, "no such zone in the database");
+                kdb_enc_u64(&ef, 5, 0x7f000000ull + (uint64_t)i);
+                kdb_enc_end(&ef);
+            }
+            CHECK(!eb.err && !ef.err);
+            atomic_store(&g_ing_yield_ns, 0);
+            atomic_store(&g_yw_stop, false);
+            pthread_t yt;
+            pthread_create(&yt, NULL, yield_worker, NULL);
+            size_t ob = 0, of = 0;
+            bool wok = true;
+            while (wok && (ob < eb.len || of < ef.len)) {      /* a few KB at a time on each stream in turn: the ingest thread always has frames of both */
+                for (int s = 0; s < 2 && wok; s++) {
+                    kdb_enc_t *q = s ? &ef : &eb;
+                    size_t *o = s ? &of : &ob;
+                    size_t n = q->len - *o > 4096 ? 4096 : q->len - *o;
+                    while (n > 0) {
+                        ssize_t w = send(s ? f9[0] : a9[0], q->buf + *o, n, MSG_NOSIGNAL);
+                        if (w < 0 && errno == EINTR) continue;
+                        if (w <= 0) {                             /* (the Backend closed the stream: the defect) */
+                            wok = false;
+                            break;
+                        }
+                        *o += (size_t)w;
+                        n -= (size_t)w;
+                    }
+                }
+            }
+            CHECK(wok && ob == eb.len && of == ef.len);
+            kdb_enc_free(&eb);
+            kdb_enc_free(&ef);
+            usleep(300000);                                    /* (what is in the sockets is read, with the worker still asking) */
+            atomic_store(&g_yw_stop, true);
+            pthread_join(yt, NULL);
+            atomic_store(&g_ing_yield_ns, 1000000);
+            usleep(100000);
+            park_key_t kk;
+            while (park_wake_pop(park_wake_ring(1), &kk)) {}
+            drain_wakes();
+            /* the fetch stream is the same one: a request goes out on it and its answer is taken */
+            CHECK(IS_COLD(76) && worker_ask(0, COLD_EL(76), "default", cz[76], KDB_FETCH_FULL) == 1);
+            CHECK(req_next(&fetch9, &m, 5000) && strcmp(m.u.fetch_req.name, cz[76]) == 0 && !fetch9.eof);
+            send_failed(f9[0], &e, 0, cz[76], m.u.fetch_req.request_id);
+            CHECK(wake_next(&k, 5000) && park_key_is(&k, "default", cz[76]) && k.failed && wait_places(0, 3000));
+            /* and so is the first stream */
+            klog_set_debug_level(2);
+            db_ingest_debug_changed();
+            CHECK(ch_next(&main9, &m, 5000) && m.type == KDB_T_DEBUG && m.u.debug.level == 2 && !main9.eof);
+            klog_set_debug_level(0);
+            db_ingest_debug_changed();
+            CHECK(ch_next(&main9, &m, 5000) && m.type == KDB_T_DEBUG && m.u.debug.level == 0);
+            close(a9[0]);
+            close(f9[0]);
+            usleep(100000);
             drain_wakes();
         }
         for (int w = 1; w < GS_W; w++) park_unregister_worker(w);

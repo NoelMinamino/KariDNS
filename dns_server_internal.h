@@ -189,6 +189,7 @@ typedef struct {
    * ignored while it waits (parked); a wake-up sets resume_pending and starts a short timer, whose event runs the request again from the
    * top of the connection loop, where resume_len says "the message in buf is the one to answer" */
   bool parked, resume_pending, not_ready_now;
+  bool lookup_respark;               /* the request that was woken was parked for a by-name lookup and woken without its answer: it is parked again for the lookup, until park_deadline_ms (0.7) */
   uint16_t resume_len;
   int64_t park_deadline_ms;         /* of the request that was parked first (0: none); a second park of the same request keeps it */
   int32_t park_idx;                 /* the handle of the parked entry (park_tcp()'s index and the entry's generation), valid while `parked`: the close takes the entry without a search */
@@ -350,6 +351,7 @@ typedef struct {
   uint32_t park_timeout_ms;
   bool woken;                        /* this request was parked before: its deadline is the old one, and it asks no fetch again */
   int64_t woken_deadline_ms;
+  bool lookup_woken;                 /* woken (w->woken) without the answer of its lookup (a wake of every query): it is parked again for the lookup, until its old deadline (0.7, udp_park_lookup()) */
   bool not_ready;                    /* answer SERVFAIL + EDE 14 (the time is up, or the fetch failed) */
 } udp_pass_t;
 
