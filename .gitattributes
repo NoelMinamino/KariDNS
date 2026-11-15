@@ -15,3 +15,4 @@ configure text eol=lf
 packaging/freebsd/rc.d/* text eol=lf
 packaging/freebsd/karidns-signer text eol=lf
 packaging/freebsd/karidns-webadmin text eol=lf
+tests/suite_durations.tsv text eol=lf

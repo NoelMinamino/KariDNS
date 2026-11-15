@@ -33,13 +33,18 @@
 #                           says how many were left out.
 #   --only-gui              Run only the browser tests (category gui).
 #   --serial-as-par         Run the tests registered "serial" next to the others (a list of tests that own their ports, directories and databases).
-#                           A test that sources tests/db/pg_lib.sh joins the group "pg" instead (one PostgreSQL test at a time).
+#                           A test that sources tests/db/pg_lib.sh joins the group "pg" instead (one PostgreSQL test at a time; with --pg-clusters it runs next to the others).
+#   --pg-clusters           One PostgreSQL cluster per slot (initdb into a temporary directory, 127.0.0.1, port KARI_PORT_BASE_MIN + slot * 1000 + 999;
+#                           stopped at the end); a test gets it as KARIDNS_TEST_PG.  Tests registered with the group "pg" then run next to the others.
+#   --shard I/N             Run the I-th of N parts (1 <= I <= N) of the selected tests: a fixed split by the times of tests/suite_durations.tsv
+#                           (CI runs the parts on N hosts).  --shard-list prints the split of the selected tests (and an estimate per part) and exits.
 #   -v, --verbose           Print verbose real-time test output (implies -j 1).
 #   -l, --list              List all registered test cases with categories.
 #   -h, --help              Show this help message.
 #
 # Environment: KARI_SUITE_STATUS=<file>  write "total=N passed=N failed=N skipped=N" and a line "failed_tests=<the failed tests>" there when every test has run
 # (make coverage-run fails when the file is missing, i.e. the suite stopped early; make coverage-suite-check fails unless failed=0).
+# It also has "shard=I/N" (1/1 without --shard) and "selected=N", the number of tests selected before the split into shards (make coverage-suite-check-shards).
 # ==============================================================================
 
 set -u
@@ -120,6 +125,11 @@ TEST_TIMEOUT=0
 FULL_LOG=0
 ASAN_UNITS=0
 SERIAL_AS_PAR=0
+PG_CLUSTERS=0       # --pg-clusters: one PostgreSQL cluster per slot
+SHARD=""            # --shard I/N
+SHARD_I=1
+SHARD_N=1
+SHARD_LIST=0        # --shard-list
 GUI_MODE=0          # 0: the browser tests (category gui) are left out unless named; 1: --with-gui; 2: --only-gui
 
 # Ensure LLVM_PROFILE_FILE is an absolute path so sub-scripts that change directory still write profdata
@@ -216,6 +226,19 @@ while [ $# -gt 0 ]; do
         --serial-as-par)
             SERIAL_AS_PAR=1
             ;;
+        --pg-clusters)
+            PG_CLUSTERS=1
+            ;;
+        --shard)
+            shift
+            SHARD="${1:-}"
+            ;;
+        --shard=*)
+            SHARD="${1#*=}"
+            ;;
+        --shard-list)
+            SHARD_LIST=1
+            ;;
         --with-gui)
             GUI_MODE=1
             ;;
@@ -256,7 +279,15 @@ while [ $# -gt 0 ]; do
             echo "                          checks) like make unit-tests-asan; only the unit tests are run"
             echo "  --serial-as-par         Run the tests registered \"serial\" next to the others (only for a list whose tests own their ports,"
             echo "                          directories and databases; the group rules stay; a test that sources tests/db/pg_lib.sh"
-            echo "                          joins the group pg: one PostgreSQL test at a time)"
+            echo "                          joins the group pg: one PostgreSQL test at a time, or runs next to the others with --pg-clusters)"
+            echo "  --pg-clusters           One PostgreSQL cluster per slot (initdb in a temporary directory, 127.0.0.1, port"
+            echo "                          KARI_PORT_BASE_MIN + slot * 1000 + 999, as a non-root user when run as root: KARIDNS_TEST_PG_USER,"
+            echo "                          SUDO_USER, postgres, pgsql); a test gets it as KARIDNS_TEST_PG, the group pg is dropped."
+            echo "                          Needs initdb and pg_ctl (FreeBSD: postgresql17-server); an error without them"
+            echo "  --shard I/N             Run part I of N (1 <= I <= N) of the selected tests; the split is fixed by the times of"
+            echo "                          tests/suite_durations.tsv (tests/TEST_MATRIX.md); the status file gets shard= and selected="
+            echo "  --shard-list            Print the split of the selected tests into N parts (with --shard I/N; 1/1 without), with"
+            echo "                          an estimate per part, and exit"
             echo "  -v, --verbose           Print verbose output during execution (implies -j 1)"
             echo "  -l, --list              List all available tests and exit"
             echo "  -h, --help              Show this help message"
@@ -381,19 +412,29 @@ REGISTERED_TESTS=""
 
 register_test() {
     # $1: Category, $2: ExecType (bin|sh), $3: Command/Path, $4: Description,
-    # $5: optional "par" (default), "group:NAME" or "serial".  Tests of one group
+    # $5: optional "par" (default), "group:NAME[+NAME...]" or "serial".  Tests of one group
     # run one at a time but next to the par tests (they share a resource: the
-    # loopback aliases, one PostgreSQL server, tests/karidns-test.conf).  Why "group:pg": the change log cursor of the PostgreSQL driver is the oldest
-    # open transaction of the whole server, other databases included (dns_db_pgsql.c), so the tests of one server cannot overlap.  "serial"
+    # loopback aliases, one PostgreSQL server, tests/karidns-test.conf); a test of several groups (group:alias+pg) waits for
+    # the running tests of every one of them and holds all of them.  Why "group:pg": the change log cursor of the PostgreSQL driver is the oldest
+    # open transaction of the whole server, other databases included (dns_db_pgsql.c), so the tests of one server cannot overlap.  With
+    # --pg-clusters every slot has a PostgreSQL server of its own and the member "pg" is dropped from every group (group:pg is par,
+    # group:alias+pg is group:alias): the registration says what the test needs, the runner decides how much of it is shared.  "serial"
     # tests run one by one, alone on the host, after the parallel batch: stress,
     # performance, sanitizer and fuzz jobs and tests that edit shared files.
+    # With --shard the plan is split by the times of tests/suite_durations.tsv (name = $3 as registered); a group may be split across shards
+    # (every shard is a host of its own: the loopback aliases are per host), so a group only has to run one at a time inside a shard.
     _cat="$1"
     _type="$2"
     _cmd="$3"
     _desc="$4"
     [ $# -le 5 ] || { echo "register_test: $# arguments for $3 (at most 5: a second mode is not read)" >&2; exit 1; }
     _mode="${5:-par}"
-    case "${_mode}" in par|serial|group:[A-Za-z0-9_]*) ;; *) echo "register_test: bad mode '${_mode}' for ${_cmd}" >&2; exit 1 ;; esac
+    case "${_mode}" in
+        par|serial) ;;
+        group:|group:*[!A-Za-z0-9_+]*|group:+*|group:*+|group:*++*) echo "register_test: bad mode '${_mode}' for ${_cmd}" >&2; exit 1 ;;
+        group:*) ;;
+        *) echo "register_test: bad mode '${_mode}' for ${_cmd}" >&2; exit 1 ;;
+    esac
 
     TEST_COUNT=$((TEST_COUNT + 1))
     REGISTERED_TESTS="${REGISTERED_TESTS}${_cat}|${_type}|${_cmd}|${_mode}|${_desc}\n"
@@ -648,7 +689,7 @@ register_test "core" "sh" "tests/run_db_settings_test.sh" "Settings of database 
 register_test "core" "sh" "tests/run_db_secondary_test.sh" "SLAVE / CONSUMER zones from a database: initial AXFR (TSIG key from AXFR-MASTER-TSIG), NOTIFY then IXFR, retransfer, rejected zones (undefined key, no master, host name, PRODUCER), master change, SLAVE <-> NATIVE, loader restart without a re-transfer, deleted row, catalog consumer members (appear, disappear, win over a DB zone of the same name) and in-memory data (beta B7b; root only, SKIP otherwise)"
 register_test "core" "sh" "tests/run_db_autoreload_test.sh" "SQLite3 auto reload (auto-reload yes): PRAGMA data_version polling, coalescing into one auto batch, edits with and without a serial bump, new/deleted zones, mapping changes, a database without karidns_changes, a pruned change log, a replaced and a deleted database file, reconfig on/off, dbstatus; T-AUTORELOAD measured (beta B9; root only, SKIP otherwise)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
 register_test "core" "sh" "tests/run_db_signer_wait_test.sh" "The loader waits for the signer (0.6.0 item C, database { signer-wait }; SQLite3, root only, SKIP otherwise): a zone with the metadata X-KARIDNS-SIGNER=1 is not reloaded because of the change log or a moved serial while an ordinary zone follows at once; karictl dbstatus names the zones that wait (count, first six names, and N more); karictl reload <zone> and karictl reload read the zone as it is; a zone new to the Backend, a deleted zone and a restart; signer-wait no and the reconfig between the two; a waiting zone that loses X-KARIDNS-SIGNER; two views with a waiting set each" "group:alias"   # adds the loopback alias 127.0.0.2 (127.0.0.3) when it is not there and removes it at the end: next to another alias test it would take the address away from it
-register_test "core" "sh" "tests/run_db_signer_wait_pg_test.sh" "The loader waits for the signer on PostgreSQL (0.6.1, P5 c; root only, SKIP otherwise): the S1 and S2 checks of run_db_signer_wait_test.sh with LISTEN karidns_changes (an ordinary zone follows, the signer zone waits and dbstatus names it, karictl reload clears it, new and deleted zones, a restart, signer-wait no, a zone that loses X-KARIDNS-SIGNER), and the cover marks of a one-zone reload (the xmin of the snapshot): a reload inside the coalesce window keeps the rows the batch reads later from listing the zone, a change after it lists it, an open older transaction keeps the documented limit" "serial"   # an open transaction holds back the change-log position of another test, and the PostgreSQL server is shared: alone
+register_test "core" "sh" "tests/run_db_signer_wait_pg_test.sh" "The loader waits for the signer on PostgreSQL (0.6.1, P5 c; root only, SKIP otherwise): the S1 and S2 checks of run_db_signer_wait_test.sh with LISTEN karidns_changes (an ordinary zone follows, the signer zone waits and dbstatus names it, karictl reload clears it, new and deleted zones, a restart, signer-wait no, a zone that loses X-KARIDNS-SIGNER), and the cover marks of a one-zone reload (the xmin of the snapshot): a reload inside the coalesce window keeps the rows the batch reads later from listing the zone, a change after it lists it, an open older transaction keeps the documented limit" "group:pg"   # an open transaction holds back the change-log position of another test of the same PostgreSQL server: one at a time (no longer alone on the host)
 register_test "core" "sh" "tests/run_signer_unit_test.sh" "karidns-signer unit tests (signer/test, node --test): configuration, key arithmetic of every algorithm against real dnssec-keygen and PowerDNS keys, argv, scheduling arithmetic, the work directory, the SQLite3 and PostgreSQL sides, the pipeline with fake tools, the daemon loop (SKIP without node 22.13)"
 register_test "core" "sh" "tests/run_signer_test.sh" "karidns-signer on SQLite3 with BIND's dnssec-keygen / dnssec-signzone / dnssec-verify (0.6.0 item C): first signing by key request for six algorithms, own writes are no change, a change during signing (exit status 3), re-signing before expiry, NSEC3 opt-out, KSK + ZSK, key requests of kind add, a PowerDNS-made key, a broken key, SIGHUP / SIGTERM / kill -9; root: served only when signed (signer-wait) and the restricted control key (SKIP without node 22.13, BIND's tools or sqlite3)" "par"   # its own ports, directory and roles (0.6.2: next to the others, as CI has run it)
 register_test "core" "sh" "tests/run_signer_lock_test.sh" "karidns-signer's single-instance lock on SQLite3 (0.7, K-2): a kernel lock (F_GETLK names the holder), refused with the holder's pid, gone after kill -9, 50 rounds of 4 simultaneous starts with one winner each and no overlapping holds, a 0.6.x pid file with a live foreign pid does not block, a read-only directory (SKIP without node 22.13 or perl Fcntl)" "par"   # its own directory
@@ -675,9 +716,9 @@ register_test "core" "sh" "tests/run_rc_service_dirs_test.sh" "The directories t
 register_test "core" "sh" "tests/run_release_roundtrip_test.sh" "The pieces of release 0.6.0 together, end to end, on SQLite3 and PostgreSQL: a zone file imported with karidns-zone, served by karidns from the database, a change set through the karidns-webadmin API with reload (dag sees the new data and the raised serial), the rollback of the API to the import (dag sees the old data, the export equals the imported zone file), the AXFR of karidns equal to karidns-zone export in canonical form after both steps; SQLite3: karidns-signer signs a second zone by key request and the server answers with RRSIG records (root for the DNS parts and PostgreSQL; SKIP without node 22.13, sqlite3, curl, a PostgreSQL server; the signer part without BIND dnssec tools)" "group:pg"   # PostgreSQL: one at a time with the other PostgreSQL tests (0.6.2: no longer alone)
 register_test "core" "sh" "tests/run_db_alias_lua_test.sh" "PowerDNS ALIAS and LUA records (B9a): default mode (A/AAAA NODATA at an ALIAS name, LUA never answered, LUA-only names NXDOMAIN, AXFR carries TYPE65401/65402) equal to PowerDNS 5.1.4 (SKIP without pdns_server), alias-resolver expansion against a mock upstream (TTL min rule, SERVFAIL + EDE 22, CNAME chain, TC to TCP, bounded upstream queries, serve-stale and recovery, config and zone reload), zone errors in karicheck and the server, a secondary (Extended AXFR and standard AXFR), database zones as root"
 register_test "core" "sh" "tests/run_db_pg_sqlite_diff_test.sh" "GATE B10 PostgreSQL vs SQLite3 = 0: the same SQL (zone files of tests/zones/, tags, tinydns, signed zones, a fixture with ALIAS / LUA, NULL ttl / prio / disabled, ENT rows, metadata, profile, views, SLAVE, a bad row, cryptokeys) in both; karidns-dbloader --dump bytes identical after the HELLO (also --loader-threads 4, --zone, --map-view) and, as root, two servers answer a generated query list byte for byte and transfer the same RRs (SKIP without PostgreSQL: KARIDNS_TEST_PG)" "group:pg"   # one PostgreSQL server (roles, databases): one at a time
-register_test "core" "sh" "tests/run_db_pg_autoreload_test.sh" "PostgreSQL auto reload (B10): LISTEN karidns_changes wakes the loader (latency with a 20 s poll-interval), coalescing, ZONE_DELETE, open transactions that took a lower seq or a lower xid lose nothing, terminated loader connections reconnect and catch up, a failed read is reported and recovers, the conninfo is not logged; schema version 1 is served by serial and the migration turns the change log on (root only; SKIP without PostgreSQL)" "serial"   # loopback aliases and the PostgreSQL server (an open transaction of one test holds back the change-log position of another): alone
+register_test "core" "sh" "tests/run_db_pg_autoreload_test.sh" "PostgreSQL auto reload (B10): LISTEN karidns_changes wakes the loader (latency with a 20 s poll-interval), coalescing, ZONE_DELETE, open transactions that took a lower seq or a lower xid lose nothing, terminated loader connections reconnect and catch up, a failed read is reported and recovers, the conninfo is not logged; schema version 1 is served by serial and the migration turns the change log on (root only; SKIP without PostgreSQL)" "group:alias+pg"   # loopback aliases and the PostgreSQL server (an open transaction of one test holds back the change-log position of another): one at a time, no longer alone on the host
 register_test "core" "sh" "tests/run_db_schema_migrate_test.sh" "Extension schema version 2 and the v1 to v2 migration on SQLite3 (tagdefs.id, triggers back, idempotent, same dump bytes) and PostgreSQL (xid8 on karidns_changes, tagdefs.id, old rows xid 0, same dump bytes, version 3 refused) (B10; the PostgreSQL part SKIPs without a server)" "group:pg"   # one PostgreSQL server (roles, databases): one at a time
-register_test "core" "sh" "tests/run_db_reload_requests_test.sh" "Several servers on one PostgreSQL database (B11): INSERT into karidns_reload_requests (and its NOTIFY) makes two karidns servers (server-id ns1 / ns2) reload and both karidns_server_status rows show the same generation, ok; one zone, requests coalesced, force, an invalid zone name; broken zones give ok = false and failed_zones, then ok again; a stopped server keeps its old row and catches up when restarted; a status table that cannot be written is shown by dbstatus and logged once while both keep serving; two views with schemas of their own; no tables, no report; no server-id = the host name (root only; SKIP without PostgreSQL)" "serial"   # loopback aliases and the PostgreSQL server (an open transaction of one test holds back the change-log position of another): alone
+register_test "core" "sh" "tests/run_db_reload_requests_test.sh" "Several servers on one PostgreSQL database (B11): INSERT into karidns_reload_requests (and its NOTIFY) makes two karidns servers (server-id ns1 / ns2) reload and both karidns_server_status rows show the same generation, ok; one zone, requests coalesced, force, an invalid zone name; broken zones give ok = false and failed_zones, then ok again; a stopped server keeps its old row and catches up when restarted; a status table that cannot be written is shown by dbstatus and logged once while both keep serving; two views with schemas of their own; no tables, no report; no server-id = the host name (root only; SKIP without PostgreSQL)" "group:alias+pg"   # loopback aliases and the PostgreSQL server (an open transaction of one test holds back the change-log position of another): one at a time, no longer alone on the host
 register_test "core" "sh" "tests/run_db_dual_primary_test.sh" "Dual (multi) primary determinism (B11b): two karidns servers (server-id ns1 / ns2) on one PostgreSQL database serve the same SOA serial and the same AXFR RR sequence (in order) for every zone of the lab set (tests/zones/, tags, tinydns with per-address views of the zone, ALIAS and LUA, signed NSEC / NSEC3 / Opt-Out, a zone the loader rejects) with and without auto-reload and with other ingest-threads / loader-threads, also in two views; karidns-dbloader --dump from two processes is byte for byte the same (loader-threads 4 and 16, --zone, --schema, --map-view); an edit and a reload request converge both; IXFR: the same answer when both servers hold the same chain, the whole zone (AXFR style, RFC 1995 s4) from a server that lacks the serial (restarted, no history) or for a serial older than any history (root only; SKIP without PostgreSQL)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
 register_test "core" "sh" "tests/run_db_loader_threads_reload_test.sh" "loader-threads 4 with SQLite3 and the extension tables (B11b regression): a reload (karictl reload and auto-reload) of three zones read one query each below bulk-threshold must succeed in the pool workers and serve the new data, no 'tables do not exist' (root only)"
 register_test "core" "sh" "tests/run_db_pg_role_test.sh" "The PostgreSQL loader role (db/karidns_loader_role.pgsql.sql, D11): the dump with the role equals the owner's, zones_with_keys works with the column privilege on cryptokeys only, key material and writes are denied, no column privilege = permission denied, conninfo-file mode and password hygiene (B10; SKIP without PostgreSQL or CREATEROLE)" "group:pg"   # one PostgreSQL server (roles, databases): one at a time
@@ -881,6 +922,19 @@ if [ "${JOBS}" -gt 1 ]; then
     fi
 fi
 
+# --shard I/N: 1 <= I <= N
+if [ -n "${SHARD}" ]; then
+    SHARD_I="${SHARD%%/*}"
+    SHARD_N="${SHARD#*/}"
+    case "${SHARD}" in */*) ;; *) SHARD_I=0 ;; esac
+    case "${SHARD_I}" in ''|*[!0-9]*) SHARD_I=0 ;; esac
+    case "${SHARD_N}" in ''|*[!0-9]*) SHARD_N=0 ;; esac
+    if [ "${SHARD_I}" -lt 1 ] || [ "${SHARD_I}" -gt "${SHARD_N}" ]; then
+        echo "--shard needs I/N with 1 <= I <= N (got '${SHARD}')" >&2
+        exit 1
+    fi
+fi
+
 # Scratch area of this run: the plan, the results, KARI_TMP of every slot
 SUITE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/karisuite.XXXXXX") || exit 1
 chmod 755 "${SUITE_TMP}"
@@ -900,8 +954,120 @@ kill_running_groups() {
     done
 }
 
+# --pg-clusters: one PostgreSQL cluster per slot, so that no two tests share a server (the change log cursor of the PostgreSQL driver is the oldest
+# open transaction of the whole server: the reason of the group "pg"; the roles are cluster wide too).  The cluster of slot S lives in
+# ${SUITE_TMP}/pg<S>: trust authentication, 127.0.0.1 only, port KARI_PORT_BASE_MIN + S * 1000 + 999 (the tests take ports up to 990 of the window of
+# their slot), the UNIX socket inside the directory.  A PostgreSQL server refuses to run as root: when the suite is root, initdb and pg_ctl run as
+# KARIDNS_TEST_PG_USER, else SUDO_USER, else postgres, else pgsql (the directory belongs to that user; SUITE_TMP is 755).
+PG_CLUSTER_COUNT=0
+PG_CLUSTER_USER=""
+PG_INITDB=""
+PG_CTL=""
+
+# pg_find_bin NAME: the program in PATH or where the packages put it (FreeBSD: /usr/local/bin, postgresql17-server; Debian: /usr/lib/postgresql/N/bin)
+pg_find_bin() {
+    command -v "$1" 2>/dev/null && return 0
+    for _fd in /usr/local/bin /usr/local/pgsql/bin /usr/lib/postgresql/*/bin; do
+        [ -x "${_fd}/$1" ] && { echo "${_fd}/$1"; return 0; }
+    done
+    return 1
+}
+
+# pg_run COMMAND: as the user of the clusters (a plain sh -c when the suite is not root).  The caller redirects: the shell of su may be csh.
+pg_run() {
+    if [ "$(id -u)" = "0" ]; then su -m "${PG_CLUSTER_USER}" -c "$1"; else sh -c "$1"; fi
+}
+
+# pg_init_slot SLOT: initdb, configuration, pg_ctl start -w (run in a subshell, one per slot, in parallel)
+pg_init_slot() {
+    _pd="${SUITE_TMP}/pg$1"
+    _pp=$((KARI_PORT_BASE_MIN + $1 * KARI_PORT_SLOT_SPAN + 999))
+    mkdir "${_pd}" || return 1
+    if [ "$(id -u)" = "0" ]; then chown "${PG_CLUSTER_USER}" "${_pd}" || return 1; fi
+    chmod 700 "${_pd}"
+    pg_run "'${PG_INITDB}' -D '${_pd}' -U postgres --auth=trust -E UTF8 --no-locale --no-sync" < /dev/null > "${SUITE_TMP}/pg$1.init.log" 2>&1 || return 1
+    {
+        echo ""
+        echo "# run_all_suite.sh --pg-clusters (slot $1)"
+        echo "listen_addresses = '127.0.0.1'"
+        echo "port = ${_pp}"
+        echo "unix_socket_directories = '${_pd}'"
+        echo "shared_buffers = 16MB"
+        echo "fsync = off"
+        echo "max_connections = 60"
+    } >> "${_pd}/postgresql.conf" || return 1
+    pg_run "'${PG_CTL}' -D '${_pd}' -l '${_pd}/server.log' -w -t 60 -s start" < /dev/null > "${SUITE_TMP}/pg$1.start.log" 2>&1 || return 1
+    return 0
+}
+
+pg_clusters_start() {
+    PG_INITDB=$(pg_find_bin initdb) && PG_CTL=$(pg_find_bin pg_ctl) || {
+        echo "${C_RED}ERROR: --pg-clusters needs initdb and pg_ctl (PATH or /usr/local/bin; FreeBSD: pkg install postgresql17-server)${C_RESET}" >&2
+        exit 1
+    }
+    if [ "$(id -u)" = "0" ]; then
+        for _u in "${KARIDNS_TEST_PG_USER:-}" "${SUDO_USER:-}" postgres pgsql; do
+            [ -n "${_u}" ] && [ "${_u}" != "root" ] && id "${_u}" >/dev/null 2>&1 && { PG_CLUSTER_USER="${_u}"; break; }
+        done
+        [ -n "${PG_CLUSTER_USER}" ] || {
+            echo "${C_RED}ERROR: --pg-clusters as root needs a user to run PostgreSQL as (KARIDNS_TEST_PG_USER, SUDO_USER, postgres or pgsql)${C_RESET}" >&2
+            exit 1
+        }
+    else
+        PG_CLUSTER_USER=$(id -un)
+    fi
+    PG_CLUSTER_COUNT="${JOBS}"      # before the start: a half started set is stopped by on_exit too
+    echo "${C_CYAN}==> Starting ${JOBS} PostgreSQL cluster(s) as ${PG_CLUSTER_USER} (ports $((KARI_PORT_BASE_MIN + 999)) + n * ${KARI_PORT_SLOT_SPAN})...${C_RESET}"
+    _pgpids=""
+    _s=0
+    while [ "${_s}" -lt "${JOBS}" ]; do
+        ( pg_init_slot "${_s}" ) &
+        _pgpids="${_pgpids} $!"
+        _s=$((_s + 1))
+    done
+    _pgfail=0
+    _s=0
+    for _p in ${_pgpids}; do
+        if ! wait "${_p}"; then
+            _pgfail=1
+            echo "${C_RED}ERROR: the PostgreSQL cluster of slot ${_s} did not start:${C_RESET}" >&2
+            tail -n 15 "${SUITE_TMP}/pg${_s}.init.log" "${SUITE_TMP}/pg${_s}.start.log" "${SUITE_TMP}/pg${_s}/server.log" 2>/dev/null | sed 's/^/    /' >&2
+        fi
+        _s=$((_s + 1))
+    done
+    [ "${_pgfail}" -eq 0 ] || exit 1
+}
+
+# pg_clusters_stop: pg_ctl stop -m immediate, all in parallel (nothing is kept: the directories go with SUITE_TMP); safe to call twice
+pg_clusters_stop() {
+    [ "${PG_CLUSTER_COUNT}" -gt 0 ] || return 0
+    _pgn="${PG_CLUSTER_COUNT}"
+    PG_CLUSTER_COUNT=0
+    _pgpids=""
+    _s=0
+    while [ "${_s}" -lt "${_pgn}" ]; do
+        if [ -f "${SUITE_TMP}/pg${_s}/postmaster.pid" ]; then
+            pg_run "'${PG_CTL}' -D '${SUITE_TMP}/pg${_s}' -m immediate -w -t 30 -s stop" </dev/null >/dev/null 2>&1 &
+            _pgpids="${_pgpids} $!"
+        fi
+        _s=$((_s + 1))
+    done
+    for _p in ${_pgpids}; do wait "${_p}" 2>/dev/null || true; done
+    # a postmaster that did not stop (pg_ctl failed or timed out) must not outlive the directory it runs in
+    _s=0
+    while [ "${_s}" -lt "${_pgn}" ]; do
+        if [ -f "${SUITE_TMP}/pg${_s}/postmaster.pid" ]; then
+            _pgpid=$(sed -n 1p "${SUITE_TMP}/pg${_s}/postmaster.pid" 2>/dev/null)
+            case "${_pgpid}" in ''|*[!0-9]*) ;; *) kill -9 "${_pgpid}" 2>/dev/null || true ;; esac
+        fi
+        _s=$((_s + 1))
+    done
+    return 0
+}
+
 on_exit() {
     kill_running_groups
+    pg_clusters_stop
     rm -rf "${SUITE_TMP}" 2>/dev/null || true
     fix_tree_owner
 }
@@ -909,11 +1075,181 @@ on_signal() {
     echo ""
     echo "${C_BG_RED} ABORT ${C_RESET} Interrupted, stopping the running tests."
     kill_running_groups
+    pg_clusters_stop
     cleanup_stale_processes
     exit 130
 }
 trap on_exit EXIT
 trap on_signal INT TERM HUP
+
+# --tests: every listed name must be a registered test (a typo or a renamed script must not shrink the run unnoticed)
+if [ -n "${TEST_LIST}" ]; then
+    _old_ifs="$IFS"; IFS=","
+    for _tn in ${TEST_LIST}; do
+        [ -n "${_tn}" ] || continue
+        _tn=$(printf "%s" "$_tn" | tr -d '[:space:]')
+        _tn="${_tn#tests/}"; _tn="${_tn%.sh}"
+        [ -n "${_tn}" ] || continue
+        if ! printf "%b" "${REGISTERED_TESTS}" | awk -F'|' -v n="${_tn}" '{ c = $3; sub(/^tests\//, "", c); sub(/\.sh$/, "", c); if (c == n) f = 1 } END { exit !f }'; then
+            IFS="$_old_ifs"
+            echo "${C_RED}ERROR: --tests: '${_tn}' is not a registered test (tests/run_all_suite.sh -l)${C_RESET}" >&2
+            exit 1
+        fi
+    done
+    IFS="$_old_ifs"
+fi
+
+# drop_pg_group MODE: MODE without the group member "pg" (--pg-clusters: every slot has its own server): group:pg is par, group:alias+pg is group:alias
+drop_pg_group() {
+    case "$1" in
+        group:*) ;;
+        *) echo "$1"; return 0 ;;
+    esac
+    _dg=""
+    for _g in $(echo "${1#group:}" | tr '+' ' '); do
+        [ "${_g}" = "pg" ] || _dg="${_dg:+${_dg}+}${_g}"
+    done
+    if [ -n "${_dg}" ]; then echo "group:${_dg}"; else echo "par"; fi
+}
+
+# Selected tests: PLAN_FILE = index|category|type|command|mode|description
+TOTAL_RUN=0
+: > "${PLAN_FILE}"
+GUI_LEFT_OUT="${SUITE_TMP}/gui_left_out.txt"
+: > "${GUI_LEFT_OUT}"
+printf "%b" "${REGISTERED_TESTS}" | {
+    _n=0
+    while IFS='|' read -r _cat _type _cmd _mode _desc; do
+        [ -z "${_cat}" ] && continue
+        # the browser tests (category gui) do not decide the verdict of a run unless asked for: --with-gui, --only-gui, -c gui or -t naming one.
+        # One that is left out is listed (GUI_LEFT_OUT) so that the summary says it was not run.
+        if [ "${_cat}" = "gui" ]; then
+            _gui_asked=0
+            [ "${GUI_MODE}" -ge 1 ] && _gui_asked=1
+            case ",${SELECTED_CATEGORIES}," in *,gui,*) _gui_asked=1 ;; esac
+            [ -n "${TEST_LIST}" ] && is_name_matched "${_cmd}" && _gui_asked=1
+            if [ "${_gui_asked}" -eq 0 ]; then
+                is_category_selected "${_cat}" && [ "${ASAN_UNITS}" -eq 0 ] && is_name_matched "${_cmd}" && echo "${_cmd}" >> "${GUI_LEFT_OUT}"
+                continue
+            fi
+        fi
+        is_category_selected "${_cat}" || continue
+        # --asan: the unit test binaries only (their -asan builds)
+        [ "${ASAN_UNITS}" -eq 1 ] && { [ "${_type}" = "bin" ] || continue; }
+        is_name_matched "${_cmd}" || continue
+        _n=$((_n + 1))
+        # --serial-as-par: a list of tests that own their ports, directories and databases.  A test that uses the PostgreSQL server (tests/db/pg_lib.sh) joins
+        # the group "pg" like the other PostgreSQL tests: the change log cursor of PostgreSQL is the oldest open transaction of the whole server (dns_db_pgsql.c),
+        # so a transaction of another test's database that stays open holds the cursor of a loader back (the signer-wait list of tests/run_signer_pg_test.sh stays full).
+        # With --pg-clusters the group pg is dropped again below: every slot has a server of its own
+        if [ "${SERIAL_AS_PAR}" -eq 1 ] && [ "${_mode}" = "serial" ]; then
+            if [ "${_type}" = "sh" ] && grep -q 'db/pg_lib.sh' "${_cmd}" 2>/dev/null; then _mode="group:pg"; else _mode="par"; fi
+        fi
+        [ "${PG_CLUSTERS}" -eq 1 ] && _mode=$(drop_pg_group "${_mode}")
+        printf '%s|%s|%s|%s|%s|%s\n' "${_n}" "${_cat}" "${_type}" "${_cmd}" "${_mode}" "${_desc}" >> "${PLAN_FILE}"
+    done
+}
+TOTAL_RUN=$(wc -l < "${PLAN_FILE}" | tr -d ' ')
+GUI_LEFT_OUT_COUNT=$(wc -l < "${GUI_LEFT_OUT}" | tr -d ' ')
+SELECTED_TOTAL="${TOTAL_RUN}"       # the tests selected before the split into shards
+SHARD_NOTE=""
+# gui_note: the line that says which browser tests were left out of this run (they did not pass: they did not run)
+gui_note() {
+    [ "${GUI_LEFT_OUT_COUNT}" -gt 0 ] || return 0
+    echo ""
+    echo "${C_YELLOW}NOT RUN: ${GUI_LEFT_OUT_COUNT} browser test(s) of the web interface (category gui), not part of this result:${C_RESET}"
+    sed 's/^/  - /' "${GUI_LEFT_OUT}"
+    echo "  Run them with --with-gui (with the rest) or --only-gui (tests/TEST_MATRIX.md, \"Browser tests\")."
+}
+
+# --shard I/N, --shard-list: the plan, split into N parts by the times of tests/suite_durations.tsv (name <TAB> seconds; a test it does not
+# list counts 10 s; a test counts at least 1 s, as 0 in the file means under a second), the same split on every host.  The model: a test of
+# mode par or group takes d slot-seconds of the JOBS slots, a serial one runs alone, so it takes d * JOBS; the estimate of a part is max(slot-seconds / JOBS + serial seconds, the longest chain of one group in it).
+# The tests go in order of their weight (heaviest first, then by name), each to the part whose estimate is lowest with it added (a tie: the
+# lowest part number).  A group may be split across parts: a part is a host of its own (own loopback aliases, own PostgreSQL), only inside a part
+# do the members of a group run one at a time.  The awk prints M (test, part), T (part, mode, seconds, name) and E (part, tests, estimate,
+# serial seconds, longest chain) lines; the model is integer arithmetic, so that every awk gives the same split.
+shard_split() {
+    awk -F'|' -v N="${SHARD_N}" -v J="${JOBS}" -v durfile="${SHARD_DURATIONS}" '
+        function before(a, b) {
+            if (w[a] != w[b]) return w[a] > w[b]
+            return (name[a] "") < (name[b] "")
+        }
+        FILENAME == durfile {
+            nf = split($0, a, "\t")
+            if (nf >= 2 && a[1] !~ /^#/ && a[2] ~ /^[0-9]+$/) dur[a[1]] = a[2] + 0
+            next
+        }
+        {
+            cnt++
+            idx[cnt] = $1; name[cnt] = $4; mode[cnt] = $5
+            d = (($4 "") in dur) ? dur[$4] : 10
+            if (d < 1) d = 1
+            cost[cnt] = d
+            w[cnt] = ($5 == "serial") ? d * J : d
+            groups[cnt] = ($5 ~ /^group:/) ? substr($5, 7) : ""
+        }
+        END {
+            for (i = 1; i <= cnt; i++) ord[i] = i
+            for (i = 2; i <= cnt; i++) {
+                v = ord[i]; j = i - 1
+                while (j >= 1 && before(v, ord[j])) { ord[j + 1] = ord[j]; j-- }
+                ord[j + 1] = v
+            }
+            for (k = 1; k <= cnt; k++) {
+                t = ord[k]; best = 0; bestE = 0
+                ng = split(groups[t], gl, "+")
+                for (s = 1; s <= N; s++) {
+                    s2 = S[s] + w[t]
+                    cm = cmax[s]
+                    for (g = 1; g <= ng; g++) { c = chain[s, gl[g]] + cost[t]; if (c > cm) cm = c }
+                    e = (J * cm > s2) ? J * cm : s2
+                    if (best == 0 || e < bestE) { best = s; bestE = e }
+                }
+                S[best] += w[t]
+                if (mode[t] == "serial") ser[best] += cost[t]
+                for (g = 1; g <= ng; g++) { chain[best, gl[g]] += cost[t]; if (chain[best, gl[g]] > cmax[best]) cmax[best] = chain[best, gl[g]] }
+                part[t] = best; nt[best]++
+            }
+            for (i = 1; i <= cnt; i++) printf "M\t%s\t%d\n", idx[i], part[i]
+            for (s = 1; s <= N; s++)
+                for (i = 1; i <= cnt; i++) if (part[i] == s) printf "T\t%d\t%s\t%d\t%s\n", s, mode[i], cost[i], name[i]
+            for (s = 1; s <= N; s++) {
+                e = (J * cmax[s] > S[s]) ? J * cmax[s] : S[s]
+                printf "E\t%d\t%d\t%.1f\t%d\t%d\n", s, nt[s], e / J, ser[s], cmax[s]
+            }
+        }
+    ' "${SHARD_DURATIONS}" "${PLAN_FILE}"
+}
+
+if [ -n "${SHARD}" ] || [ "${SHARD_LIST}" -eq 1 ]; then
+    TAB=$(printf '\t')
+    SHARD_DURATIONS="${KARI_SUITE_DURATIONS:-${SCRIPT_DIR}/suite_durations.tsv}"
+    if [ ! -f "${SHARD_DURATIONS}" ]; then
+        echo "WARN: ${SHARD_DURATIONS} not found: every test counts 10 s in the split" >&2
+        SHARD_DURATIONS=/dev/null
+    fi
+    shard_split > "${SUITE_TMP}/shard.out"
+    if [ "${SHARD_LIST}" -eq 1 ]; then
+        printf '# %s tests, %s shard(s), %s job(s); durations: %s\n' "${TOTAL_RUN}" "${SHARD_N}" "${JOBS}" "${SHARD_DURATIONS}"
+        printf '# shard\tmode\tseconds\tname\n'
+        grep "^T${TAB}" "${SUITE_TMP}/shard.out" | cut -f2-
+        grep "^E${TAB}" "${SUITE_TMP}/shard.out" | while IFS="${TAB}" read -r _e _s _nt _est _ser _chain; do
+            printf '# shard %s/%s: %s tests, estimate %s s (serial %s s, longest group chain %s s)\n' "${_s}" "${SHARD_N}" "${_nt}" "${_est}" "${_ser}" "${_chain}"
+        done
+        exit 0
+    fi
+    # keep the tests of this part, in the order of the plan, numbered from 1 again (the runner reads the plan by number)
+    grep "^M${TAB}" "${SUITE_TMP}/shard.out" | awk -F"${TAB}" -v i="${SHARD_I}" '$3 == i { print $2 }' > "${SUITE_TMP}/shard.keep"
+    awk -v keepfile="${SUITE_TMP}/shard.keep" '
+        FILENAME == keepfile { keep[$1] = 1; next }
+        { split($0, f, "|"); if (f[1] in keep) { n++; sub(/^[0-9]+\|/, n "|"); print } }
+    ' "${SUITE_TMP}/shard.keep" "${PLAN_FILE}" > "${SUITE_TMP}/plan.shard"
+    mv "${SUITE_TMP}/plan.shard" "${PLAN_FILE}"
+    TOTAL_RUN=$(wc -l < "${PLAN_FILE}" | tr -d ' ')
+    _est=$(grep "^E${TAB}" "${SUITE_TMP}/shard.out" | awk -F"${TAB}" -v i="${SHARD_I}" '$2 == i { print $4 }')
+    SHARD_NOTE="${SHARD_I}/${SHARD_N}: ${TOTAL_RUN} of ${SELECTED_TOTAL} tests, estimate ${_est} s"
+fi
 
 # Clean environment before starting suite
 cleanup_stale_processes
@@ -935,7 +1271,12 @@ echo "${C_BOLD}=================================================================
 [ -n "${EXCLUDE_LIST}" ]       && echo "  Excluded        : ${C_CYAN}${EXCLUDE_LIST}${C_RESET}"
 [ "${QUICK_MODE}" -eq 1 ]      && echo "  Mode            : ${C_YELLOW}Quick Mode${C_RESET}"
 echo "  Jobs            : ${C_CYAN}${JOBS}${C_RESET}"
+[ -n "${SHARD_NOTE}" ]         && echo "  Shard           : ${C_CYAN}${SHARD_NOTE}${C_RESET}"
+[ "${PG_CLUSTERS}" -eq 1 ]      && echo "  PostgreSQL      : ${C_CYAN}one cluster per slot (--pg-clusters; the group pg is dropped)${C_RESET}"
 echo ""
+
+# --pg-clusters: an error (no initdb, a cluster that does not start) ends the run here, before any test
+[ "${PG_CLUSTERS}" -eq 1 ] && pg_clusters_start
 
 START_TIME=$(date +%s 2>/dev/null || perl -e 'print time')
 
@@ -983,69 +1324,6 @@ fi
 rm -f "${SUMMARY_FILE}"
 touch "${SUMMARY_FILE}"
 
-# --tests: every listed name must be a registered test (a typo or a renamed script must not shrink the run unnoticed)
-if [ -n "${TEST_LIST}" ]; then
-    _old_ifs="$IFS"; IFS=","
-    for _tn in ${TEST_LIST}; do
-        [ -n "${_tn}" ] || continue
-        _tn=$(printf "%s" "$_tn" | tr -d '[:space:]')
-        _tn="${_tn#tests/}"; _tn="${_tn%.sh}"
-        [ -n "${_tn}" ] || continue
-        if ! printf "%b" "${REGISTERED_TESTS}" | awk -F'|' -v n="${_tn}" '{ c = $3; sub(/^tests\//, "", c); sub(/\.sh$/, "", c); if (c == n) f = 1 } END { exit !f }'; then
-            IFS="$_old_ifs"
-            echo "${C_RED}ERROR: --tests: '${_tn}' is not a registered test (tests/run_all_suite.sh -l)${C_RESET}" >&2
-            exit 1
-        fi
-    done
-    IFS="$_old_ifs"
-fi
-
-# Selected tests: PLAN_FILE = index|category|type|command|mode|description
-TOTAL_RUN=0
-: > "${PLAN_FILE}"
-GUI_LEFT_OUT="${SUITE_TMP}/gui_left_out.txt"
-: > "${GUI_LEFT_OUT}"
-printf "%b" "${REGISTERED_TESTS}" | {
-    _n=0
-    while IFS='|' read -r _cat _type _cmd _mode _desc; do
-        [ -z "${_cat}" ] && continue
-        # the browser tests (category gui) do not decide the verdict of a run unless asked for: --with-gui, --only-gui, -c gui or -t naming one.
-        # One that is left out is listed (GUI_LEFT_OUT) so that the summary says it was not run.
-        if [ "${_cat}" = "gui" ]; then
-            _gui_asked=0
-            [ "${GUI_MODE}" -ge 1 ] && _gui_asked=1
-            case ",${SELECTED_CATEGORIES}," in *,gui,*) _gui_asked=1 ;; esac
-            [ -n "${TEST_LIST}" ] && is_name_matched "${_cmd}" && _gui_asked=1
-            if [ "${_gui_asked}" -eq 0 ]; then
-                is_category_selected "${_cat}" && [ "${ASAN_UNITS}" -eq 0 ] && is_name_matched "${_cmd}" && echo "${_cmd}" >> "${GUI_LEFT_OUT}"
-                continue
-            fi
-        fi
-        is_category_selected "${_cat}" || continue
-        # --asan: the unit test binaries only (their -asan builds)
-        [ "${ASAN_UNITS}" -eq 1 ] && { [ "${_type}" = "bin" ] || continue; }
-        is_name_matched "${_cmd}" || continue
-        _n=$((_n + 1))
-        # --serial-as-par: a list of tests that own their ports, directories and databases.  A test that uses the PostgreSQL server (tests/db/pg_lib.sh) joins
-        # the group "pg" like the other PostgreSQL tests: the change log cursor of PostgreSQL is the oldest open transaction of the whole server (dns_db_pgsql.c),
-        # so a transaction of another test's database that stays open holds the cursor of a loader back (the signer-wait list of tests/run_signer_pg_test.sh stays full)
-        if [ "${SERIAL_AS_PAR}" -eq 1 ] && [ "${_mode}" = "serial" ]; then
-            if [ "${_type}" = "sh" ] && grep -q 'db/pg_lib.sh' "${_cmd}" 2>/dev/null; then _mode="group:pg"; else _mode="par"; fi
-        fi
-        printf '%s|%s|%s|%s|%s|%s\n' "${_n}" "${_cat}" "${_type}" "${_cmd}" "${_mode}" "${_desc}" >> "${PLAN_FILE}"
-    done
-}
-TOTAL_RUN=$(wc -l < "${PLAN_FILE}" | tr -d ' ')
-GUI_LEFT_OUT_COUNT=$(wc -l < "${GUI_LEFT_OUT}" | tr -d ' ')
-# gui_note: the line that says which browser tests were left out of this run (they did not pass: they did not run)
-gui_note() {
-    [ "${GUI_LEFT_OUT_COUNT}" -gt 0 ] || return 0
-    echo ""
-    echo "${C_YELLOW}NOT RUN: ${GUI_LEFT_OUT_COUNT} browser test(s) of the web interface (category gui), not part of this result:${C_RESET}"
-    sed 's/^/  - /' "${GUI_LEFT_OUT}"
-    echo "  Run them with --with-gui (with the rest) or --only-gui (tests/TEST_MATRIX.md, \"Browser tests\")."
-}
-
 # run_job INDEX SLOT: run test INDEX of the plan in slot SLOT; the result line
 # (the line of summary.tsv) goes to ${RES_DIR}/INDEX.res.  Runs in a subshell
 # when started in the background.
@@ -1064,6 +1342,12 @@ EOF
     KARI_TMP="${SUITE_TMP}/s${_jslot}"
     KARI_JOB_ID="kj${_ji}x"
     export KARI_SLOT KARI_PORT_BASE KARI_TMP KARI_JOB_ID
+    # --pg-clusters: the server of this slot (overrides the environment; a slot runs one test at a time, so no two tests share it).  dbname: pg_lib.sh and the
+    # tests add their own database to it (the last dbname of a conninfo wins)
+    if [ "${PG_CLUSTERS}" -eq 1 ]; then
+        KARIDNS_TEST_PG="host=127.0.0.1 port=$((KARI_PORT_BASE + 999)) user=postgres dbname=postgres"
+        export KARIDNS_TEST_PG
+    fi
     reset_slot_tmp "${_jslot}"
 
     T_START=$(date +%s 2>/dev/null || perl -e 'print time')
@@ -1205,9 +1489,12 @@ abort_on_failure() {
 # MODE "par": "index|group" of the par tests and of the tests of an exclusive
 # group (group empty for par), longest first (LPT: the long tests, group members
 # included, start first, so none is left running alone at the end) by the times
-# of the previous summary.tsv; tests it does not know count as 10 s; without a
-# previous summary: registration order.
+# of the previous summary.tsv; tests it does not know count as 10 s (with --shard:
+# the times of tests/suite_durations.tsv first, a fresh checkout has no summary);
+# without either: registration order.
 order_file() {
+    ORDER_DURATIONS=/dev/null
+    [ -n "${SHARD}" ] && ORDER_DURATIONS="${SHARD_DURATIONS}"
     if [ "$1" = "all" ]; then
         cut -d'|' -f1 "${PLAN_FILE}"
     elif [ "$1" = "serial" ]; then
@@ -1217,12 +1504,13 @@ order_file() {
             # FILENAME, not NR == FNR: the previous summary may be empty (a fresh
             # tree), and then NR == FNR would hold for the plan too
             FILENAME == ARGV[1] { if ($4 ~ /^[0-9]+$/) t[$2] = $4; next }
+            FILENAME == ARGV[2] { if (split($0, u2, "\t") >= 2 && u2[1] !~ /^#/ && u2[2] ~ /^[0-9]+$/) u[u2[1]] = u2[2]; next }
             $5 == "par" || $5 ~ /^group:/ {
                 g = ""
                 if ($5 ~ /^group:/) { g = substr($5, 7); gsub(/[^A-Za-z0-9+]/, "_", g) }
-                print ((($4 in t) ? t[$4] : 10) + 0) "|" $1 "|" g
+                print ((($4 in t) ? t[$4] : (($4 in u) ? u[$4] : 10)) + 0) "|" $1 "|" g
             }
-        ' "${PREV_SUMMARY}" "${PLAN_FILE}" | sort -t'|' -k1,1nr -k2,2n | cut -d'|' -f2,3
+        ' "${PREV_SUMMARY}" "${ORDER_DURATIONS}" "${PLAN_FILE}" | sort -t'|' -k1,1nr -k2,2n | cut -d'|' -f2,3
     fi
 }
 
@@ -1374,7 +1662,7 @@ done < "${SUMMARY_FILE}"
 # KARI_SUITE_STATUS=<file>: the counts are written there once every test has run, so a caller that ignores the exit status (make
 # coverage-run) can tell a suite that finished, with or without failing tests, from one that stopped before running them (the file is missing).
 if [ -n "${KARI_SUITE_STATUS:-}" ]; then
-    printf 'total=%d passed=%d failed=%d skipped=%d\nfailed_tests=%s\ngui_not_run=%d\n' "${TOTAL_COUNT}" "${PASSED_COUNT}" "${FAILED_COUNT}" "${SKIPPED_COUNT}" "${FAILED_TESTS}" "${GUI_LEFT_OUT_COUNT}" > "${KARI_SUITE_STATUS}" ||
+    printf 'total=%d passed=%d failed=%d skipped=%d\nfailed_tests=%s\ngui_not_run=%d\nshard=%d/%d\nselected=%d\n' "${TOTAL_COUNT}" "${PASSED_COUNT}" "${FAILED_COUNT}" "${SKIPPED_COUNT}" "${FAILED_TESTS}" "${GUI_LEFT_OUT_COUNT}" "${SHARD_I}" "${SHARD_N}" "${SELECTED_TOTAL}" > "${KARI_SUITE_STATUS}" ||
         echo "WARN: could not write ${KARI_SUITE_STATUS}" >&2
 fi
 
