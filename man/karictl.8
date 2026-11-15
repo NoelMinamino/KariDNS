@@ -301,7 +301,12 @@ Send DNS NOTIFY messages for \fB<zone>\fR now: to the \fBalso\-notify\fR servers
 and to the addresses of the zone's apex NS hosts, except the host named in the
 SOA MNAME field (RFC 1996 \[u00A7]3.2). Zones served from a database are found
 too; one that is hidden by a configured zone or a catalog member of the same
-name answers \fBERROR zone is not served from the database ...\fR.
+name answers \fBERROR zone is not served from the database ...\fR. A database
+zone of the zone store (0.7) that is not in memory is attached first (the answer
+is \fBOK (the zone is not in memory: it is attached first)\fR), and its NOTIFY
+is sent when it is there; if a name server of the zone is in another stored zone
+that is not in memory, that zone is asked for too and the NOTIFY waits for it
+for a second at the most.
 .TP 8
 \fBretransfer <zone> [view]\fR
 For a secondary zone (including a catalog member zone), discard the current
@@ -369,6 +374,12 @@ the data back that you rolled back). A change only in a file that the zone
 \fB$INCLUDE\fRs is not noticed by that check: use \fBforce\fR. \fBreconfig\fR
 already skips files that did not change. A restart reads the file again.
 .IP \(bu 2
+\fBDatabase zone in the zone store (0.7).\fR A zone that is in memory is found
+like any other. One that is not in memory has no previous version to go back to
+(the store holds the current image only; the version before the last one is kept
+with the zone in memory): the answer is \fBERROR the zone is in the zone store
+and not in memory: it has no previous version to roll back to ...\fR.
+.IP \(bu 2
 \fBDatabase zone.\fR The server compares the loader's (source id, serial,
 digest) with what it recorded when it installed the zone, and a rollback does
 not change that record, so the rolled-back version stays until the data in the
@@ -398,10 +409,13 @@ refresh=<n> retry=<n> expire=<n>\fR; for a secondary the values the zone uses,
 held to \fBmin\-refresh\-time\fR ... \fBmax\-retry\-time\fR). For a zone from
 the database the line goes on with \fBsource=database view=<v> id=<domains.id>
 result=<applied|rejected|shadowed (hidden by ...)>\fR and the last error, if
-any. A secondary that applies settings received from its primary (Extended AXFR
-version 3, see karidns(8)) adds \fBsettings=primary\fR (and \fBnote: ...\fR when
-part of them is not in force, e.g. a TSIG key the received \fBallow\-transfer\fR
-names is not defined here).
+any; a zone of the zone store (0.7) that is not in memory shows the record of
+the store (its serial and id) and \fB(in the zone store, not in memory)\fR, or
+\fB(in the zone store without a body yet: ...)\fR for a zone the store knows and
+has not read from the database yet. A secondary that applies settings received
+from its primary (Extended AXFR version 3, see karidns(8)) adds
+\fBsettings=primary\fR (and \fBnote: ...\fR when part of them is not in force,
+e.g. a TSIG key the received \fBallow\-transfer\fR names is not defined here).
 .TP 8
 \fBobservatory [zone [view]]\fR
 Display per-zone statistics for all zones, or only for the given zone (and

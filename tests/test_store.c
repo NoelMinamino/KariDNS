@@ -2120,6 +2120,83 @@ static void test_clean_checkpoint(void) {
 
 /* ------------------------------------------------------------------------------------------------------------------ */
 
+/* 0.7 review fixes (S3+S4): store_stats() reads the index generation, so it is a reader (L1); the NONSTORE records have a counter of their own (L8); a writer that fails changes nothing (the hook the
+ * Backend's tests use to fail a write) */
+static bool g_stats_in_section;
+static void in_stats_hook(void) {
+  /* a thread in a read section holds the grace period of what is retired after it started: an epoch that is advanced now is not safe yet.  Outside a section it is. */
+  uint64_t ep = rcu_writer_advance_epoch();
+  g_stats_in_section = !rcu_writer_is_safe(ep);
+}
+
+static int fault_enospc_set_stamp(const char *op, uint32_t zid) {
+  (void)zid;
+  return strcmp(op, "set_stamp") == 0 ? -ENOSPC : 0;
+}
+
+static void test_review_fixes(void) {
+  printf("[store_stats() is a reader; the NONSTORE counter; a failed writer changes nothing]\n");
+  tdir_t d;
+  tdir_new(&d, "review");
+  store_opts_t o;
+  small_opts(&o);
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  for (uint32_t i = 0; i < 6; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  /* L1 */
+  store_stats_t ss;
+  g_stats_in_section = false;
+  store_test_in_stats = in_stats_hook;
+  store_stats(s, &ss);
+  store_test_in_stats = NULL;
+  CHECK(g_stats_in_section);
+  /* L8: records that make the memory of a zone of the heap directory (a secondary, a catalog consumer) are counted apart; known + stored still count them */
+  uint32_t z1 = STORE_NONE, z2 = STORE_NONE;
+  store_meta_t m;
+  memset(&m, 0, sizeof(m));
+  m.flags = STORE_F_NONSTORE;
+  m.source = 0;
+  CHECK_EQ(store_set_known(s, 0, "ns1.sec.test", 12, &m, &z1), 0);
+  CHECK_EQ(store_set_known(s, 0, "ns2.sec.test", 12, &m, &z2), 0);
+  store_stats(s, &ss);
+  CHECK_EQ(ss.zones_nonstore, 2);
+  CHECK_EQ(ss.zones_known, 2);
+  CHECK_EQ(ss.zones_stored, 6);
+  check_consistent(s, "nonstore 2");
+  CHECK_EQ(store_set_flags(s, z1, 0, STORE_F_NONSTORE), 0);                 /* (a secondary that became a primary's record: the counter follows the flag) */
+  store_stats(s, &ss);
+  CHECK_EQ(ss.zones_nonstore, 1);
+  CHECK_EQ(store_set_flags(s, z1, STORE_F_NONSTORE, 0), 0);
+  CHECK_EQ(store_delete(s, z2), 0);
+  store_stats(s, &ss);
+  CHECK_EQ(ss.zones_nonstore, 1);
+  check_consistent(s, "nonstore 1");
+  /* the counter is in the journal and the superblock: a reopen without a clean stop (the journal is replayed) and with one (the superblock) says the same */
+  CHECK_EQ(store_close(s), 0);
+  s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats(s, &ss);
+    CHECK_EQ(ss.zones_nonstore, 1);
+    check_consistent(s, "nonstore reopen");
+    /* a writer that fails changes nothing and says why; the others work */
+    uint32_t z = find_i(s, 0, 3);
+    store_zone_t before, after;
+    CHECK_EQ(store_zone_get(s, z, &before), 0);
+    store_test_write_fault = fault_enospc_set_stamp;
+    CHECK_EQ(store_set_stamp(s, z, 77, 88, STORE_F_STALE, 0), -ENOSPC);
+    CHECK_EQ(store_set_flags(s, z, STORE_F_STALE, 0), 0);
+    store_test_write_fault = NULL;
+    CHECK_EQ(store_zone_get(s, z, &after), 0);
+    CHECK(after.stamp_gen == before.stamp_gen && after.stamp_time == before.stamp_time && (after.flags & STORE_F_STALE));
+    check_consistent(s, "fault");
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
 int main(void) {
   const char *base = getenv("KARIDNS_STORE_TESTDIR");
   snprintf(g_base, sizeof(g_base), "%s/store_test.%d", base && *base ? base : ".", (int)getpid());
@@ -2154,6 +2231,7 @@ int main(void) {
   if (WANT("vis")) test_visibility();
   if (WANT("reuse")) test_reuse_after_grace();
   if (WANT("nosleep")) test_reader_nosleep();
+  if (WANT("review")) test_review_fixes();
   if (WANT("growfail")) test_growth_sync_fails();
   if (WANT("cleanck")) test_clean_checkpoint();
   if (WANT("full")) test_disk_full();

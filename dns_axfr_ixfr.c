@@ -2928,6 +2928,18 @@ static void xfr_arm_out_limits(const axfr_worker_args_t *a) {
   }
 }
 
+/* 0.7 H2: the zone was allowed by the view's and options' allow-transfer alone because its own settings were not known when the request was taken (axfr_worker_args_t.recheck_acl).  Its entry is here now: the zone's
+ * own allow-transfer, tsig-key and acl-ceiling (zone_entry_config(), the settings the dispatch reads for a zone in memory) decide as they would have, with the client's view, address and key of the request. */
+static bool xfr_recheck_acl(const axfr_worker_args_t *a, zone_db_entry_t *entry) {
+  rcu_aux_read_lock();
+  server_config_t *cfg = acquire_config_snapshot();
+  const zone_config_t *zc = cfg ? zone_entry_config(cfg, entry) : NULL;
+  const bool ok = zc && zone_transfer_acl_allows_in_view(cfg, zc, a->acl_view[0] ? a->acl_view : NULL, a->client_ip, a->has_tsig ? a->tsig_name : NULL);
+  release_config_snapshot(cfg);
+  rcu_aux_read_unlock();
+  return ok;
+}
+
 void *axfr_worker_thread(void *arg) {
 
   atomic_fetch_add_explicit(&g_xfers_running, 1, memory_order_relaxed);
@@ -2950,7 +2962,7 @@ void *axfr_worker_thread(void *arg) {
   bool answered = false;
   uint8_t log_rcode = 0;
   if (!entry && args->elem) {
-    if (axfr_send_up_to_date_from_apex(args, pkey)) {
+    if (!args->recheck_acl && axfr_send_up_to_date_from_apex(args, pkey)) {            /* (an apex that is read before the zone's own ACL is known answers nobody) */
       answered = true;
     } else if (args->await && (entry = args->await(args->elem, args->view_name)) == NULL) {
       xfr_log(LOG_LVL_WARNING, args->client_ip, args->client_port, args->elem->name,
@@ -2978,6 +2990,16 @@ void *axfr_worker_thread(void *arg) {
       answered = true;
       log_rcode = 2;
     }
+  }
+  if (!answered && entry && args->recheck_acl && !xfr_recheck_acl(args, entry)) {
+    xfr_log(LOG_LVL_WARNING, args->client_ip, args->client_port, args->qname, "%s request refused: the zone's own allow-transfer does not allow the client", args->qtype == 251 ? "IXFR" : "AXFR");
+    release_zone_snapshot(args->snap);
+    args->snap = NULL;
+    xfr_arm_out_limits(args);
+    axfr_send_error(args->client_fd, args->req, args->req_len, 5, false, args->send_ede, 18, "Query refused due to access control", pkey, args->tsig_mac, args->tsig_mac_len, &args->client_addr,
+                    args->client_len, &args->server_addr, args->has_server_addr);
+    answered = true;
+    log_rcode = 5;
   }
   /* R11: the entry is held (xfr_entry_hold()), and send_axfr_response() pins the version it sends in its own short read section: the snapshot the
    * dispatch retained is not needed any more, and is not kept for the length of the stream (a stalled client would hold back the reclamation of

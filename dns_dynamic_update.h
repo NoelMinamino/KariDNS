@@ -24,6 +24,15 @@ void send_notify_to_all(zone_db_entry_t *entry);
 void notify_request_send(zone_db_entry_t *entry);
 /* D1a step 7: the NOTIFY messages of a zone whose data is out of memory (el: its directory element; view_name: the view of the directory).  Control thread only. */
 void notify_send_nonresident(const zdir_elem_t *el, const char *view_name);
+/* 0.7 L3, L4: a NOTIFY that needs a zone of the store that is not in memory yet (a name server's address is in it, or the zone itself was detached after its NOTIFY was queued) is made again a little later:
+ * the zone is asked for in the background and the NOTIFY waits in a small table (the control thread only; at most a few tries).  notify_wait_add(): false = do not wait (no room, or it has waited enough: the
+ * NOTIFY goes with what is known); notify_wait_pop(): the next one that is due (it stays in the table until notify_wait_drop(), or a notify_wait_add() that refuses); notify_wait_drop(): done with it */
+bool notify_wait_add(const char *view, const char *zone);
+void notify_wait_drop(const char *view, const char *zone);
+bool notify_wait_pop(char *view, size_t vcap, char *zone, size_t zcap);
+#ifdef KARIDNS_UNIT_TEST
+int notify_wait_count(bool make_due);
+#endif
 void notify_retransmit_due(time_t now);
 void notify_handle_response(const uint8_t *msg, size_t len, const struct sockaddr *from);
 

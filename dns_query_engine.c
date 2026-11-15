@@ -48,7 +48,6 @@ static _Thread_local bool t_resolve_alias_failed;
  * (the engine on its own, a tool). */
 void (*g_query_bg_fetch)(const char *view_name, const char *zone) = NULL;
 void (*g_query_bg_attach)(const char *view_name, const char *zone) = NULL;
-void (*g_query_attach_sync)(const char *view_name, const char *zone) = NULL;
 static void bg_fetch_nonresident(const view_snapshot_t *view, const zref_t *pel) {
   if (!pel || !view || !view->name || pel->entry || !zref_present(pel) || pel->busy) return;
   if (zref_state(pel) != ZDIR_ST_ABSENT) return;     /* (LOADING: on its way; ERROR: nothing to read) */

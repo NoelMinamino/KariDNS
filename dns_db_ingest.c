@@ -2216,6 +2216,8 @@ static void on_zone_delete(ing_t *g, const kdb_msg_t *m) {
     } else if (r == 0) {
       syslog(LOG_NOTICE, "[DB] delete of zone '%s' (view %u, id %lld) ignored: not registered with that id",
              zd->name, (unsigned)zd->view, (long long)zd->source_id);
+    } else {
+      syslog(LOG_ERR, "[DB] zone '%s' (view '%s') could not be deleted from the store; it stays", zd->name, vname);
     }
   }
   send_zone_result(g, zd->view, zd->name, st, NULL);
@@ -2258,8 +2260,7 @@ static void on_batch_end(ing_t *g, const kdb_msg_t *m) {
   if (g->batch_kind == KDB_BATCH_STARTUP) {
     /* the loader may have sent nothing (a restarted loader finds the Backend up to date): count the registry */
     size_t total, rej, shc, shk;
-    dbreg_counts2(&total, &rej, &shc, &shk);
-    if (dbdir()) total = (size_t)dbdir()->counters(0);       /* 0.7: the zone store is the directory (the registry holds only the zones in memory) */
+    dbreg_counts2(&total, &rej, &shc, &shk);                 /* (with the store: the zones of the heap directory and the store's records that are not secondary or catalog zones) */
     if (g->store_proto) {
       db_recon_status_t rs;
       db_recon_status(&rs);
@@ -2467,7 +2468,7 @@ static void on_manifest_end(ing_t *g, const kdb_msg_t *m) {
                    "version), %llu not offered by the loader, %llu of the %llu zone(s) the Backend held for the view were not listed and %s",
          st.view, (unsigned long long)out.duration_ms, (unsigned long long)st.entries, (unsigned long long)st.created, (unsigned long long)st.changed, (unsigned long long)st.renamed,
          (unsigned long long)st.pending, (unsigned long long)st.same, (unsigned long long)st.kept, (unsigned long long)st.skipped, (unsigned long long)out.unlisted,
-         (unsigned long long)out.total, out.held ? "NOT deleted (the mass-delete guard)" : out.swept ? "deleted" : me->complete ? "none was" : "no sweep was made (the pass was not complete)");
+         (unsigned long long)out.total, out.held ? "NOT deleted (the mass-delete guard)" : out.failed ? "NOT all deleted (an entry of the pass could not be recorded, or a delete failed: see above)" : out.swept ? "deleted" : me->complete ? "none was" : "no sweep was made (the pass was not complete)");
   g->ch_failed = false;
 }
 
@@ -2494,11 +2495,17 @@ static void on_changes(ing_t *g, const kdb_msg_t *m) {
   while (kdb_changes_entries_next(&it, &e)) {
     if (e.op == KDB_CH_DELETE) {
       if (e.has_name) drain_name(g, vname, e.name);        /* (a zone of the same name may be in flight) */
-      if (db_recon_delete(vname, e.source_id, e.has_name ? e.name : NULL) > 0) {
+      const int dd = db_recon_delete(vname, e.source_id, e.has_name ? e.name : NULL);
+      if (dd > 0) {
         g->b_deleted++;
         atomic_fetch_add_explicit(&g_st.tot_deleted, 1, memory_order_relaxed);
         if (g->cur_req >= 0 && g->reqs[g->cur_req].view == c->view && e.has_name && domain_names_match_ci(g->reqs[g->cur_req].zone, e.name)) g->req_outcome = ROUT_DELETED;
         logev_post(LOGC_DATABASE, 1, NULL, 0, "[DB] zone '%s' (view '%s', id %lld) deleted", e.has_name ? e.name : "?", vname, (long long)e.source_id);
+      } else if (dd < 0) {                                 /* the store could not delete it: the zone stays, and the cursor is not kept, so that the delete is made again */
+        g->b_rejected++;
+        atomic_fetch_add_explicit(&g_st.tot_rejected, 1, memory_order_relaxed);
+        g->ch_failed = true;
+        syslog(LOG_ERR, "[DB] zone '%s' (view '%s', id %lld) could not be deleted from the store; it stays", e.has_name ? e.name : "?", vname, (long long)e.source_id);
       } else {
         g->b_unchanged++;
       }
@@ -3304,6 +3311,12 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
       if (!done.loader_failed) g->bg_fail++;             /* (a busy or lost loader: the round is made again; a zone the loader cannot read is marked refused below) */
       if (done.nonstore && !done.loader_failed) db_recon_scan_retry(done.bzid);
     }
+  }
+  if (done.dropped && done.mode == KDB_FETCH_FULL && g->store_proto && dbdir()) {
+    /* 0.7 M6: the body was dropped (job_execute(): it was for another stamp than the record has now, or the zone was changed since).  The scan of the wanted bodies skipped the zone while this fetch was in
+     * flight, and nothing else would ask for it again: the record would stay STALE (or KNOWN) and the old image would be served for ever.  A record that is still wanted starts the scan again. */
+    dbdir_rec_t rec;
+    if (dbdir()->rec_get(done.view_name, done.zone, &rec) && (rec.state == STORE_STATE_KNOWN || (rec.flags & STORE_F_STALE)) && !(rec.flags & STORE_F_REJECTED_NEW)) bulk_kick(g);
   }
   if (!ok && done.loader_failed && dbdir()) {            /* the loader cannot read the zone: the record is marked refused (not asked for again before the database says another version) */
     dbdir_rec_t rec;

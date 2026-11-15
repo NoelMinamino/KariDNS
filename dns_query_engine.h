@@ -112,9 +112,6 @@ int process_dns_not_ready_routed(const uint8_t *req, size_t req_len, uint8_t *re
 extern void (*g_query_bg_fetch)(const char *view_name, const char *zone);
 /* 0.7 store S3: the same for a zone of the store that is not in memory and whose image is stored: it is attached from the store (dns_park.c park_bg_attach()), not fetched */
 extern void (*g_query_bg_attach)(const char *view_name, const char *zone);
-/* 0.7 WP7b: the same, but now and on the calling thread (a few microseconds of reading the store): the control thread's NOTIFY needs the addresses of the name servers of a changed zone that are
- * in a stored zone that is not in memory; a NOTIFY that waited for the next time was lost.  NULL: no store (the engine on its own, a tool). */
-extern void (*g_query_attach_sync)(const char *view_name, const char *zone);
 
 /* The view of a client by its address alone: a view whose match-clients has a `key` element is evaluated as for an unsigned request. */
 view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client_ip);

@@ -106,7 +106,7 @@ typedef struct {
   bool force;                    /* the body is wanted whatever the stamp says (a reload of the zone) */
 } db_recon_entry_t;
 /* the result of an entry */
-enum { DBR_UNSTORABLE = -2 /* a name the store cannot hold and the heap directory cannot key either (over 255 bytes of text, which only escapes make; or no memory): the zone is not loaded */, DBR_ERROR = -1, DBR_SAME = 0, DBR_NEW, DBR_CHANGED, DBR_RENAMED, DBR_PENDING /* already asked for, not here yet */, DBR_KEPT /* refused with this stamp: not asked for again */ };
+enum { DBR_UNSTORABLE = -2 /* a name the store cannot hold and the heap directory cannot key either (over 255 bytes of text, which only escapes make): the zone is not loaded */, DBR_ERROR = -1, DBR_SAME = 0, DBR_NEW, DBR_CHANGED, DBR_RENAMED, DBR_PENDING /* already asked for, not here yet */, DBR_KEPT /* refused with this stamp: not asked for again */ };
 /* apply one entry (a pass entry also sets the zone's bit); *zid receives the record's zone id (STORE_NONE: none); the view's name as the registry knows it */
 int db_recon_apply(const char *view, const db_recon_entry_t *e, uint32_t *zid);
 /* a CHANGES upsert: db_recon_apply() and the count */
@@ -115,16 +115,17 @@ int db_recon_change(const char *view, const db_recon_entry_t *e, uint32_t *zid);
 bool db_recon_begin(const char *view, uint64_t estimate, bool force, char *why, size_t whylen);
 /* one entry of the pass */
 int db_recon_entry(const db_recon_entry_t *e, uint32_t *zid);
-typedef struct { bool swept, held; uint64_t total, unlisted, deleted; uint64_t duration_ms; } db_recon_end_t;
-/* MANIFEST_END.  complete: every page was sent (else nothing is swept and no cursor is kept).  The cursor and the identity are made durable (not when the guard holds the sweep back) */
+typedef struct { bool swept, held, failed; uint64_t total, unlisted, deleted; uint64_t duration_ms; } db_recon_end_t;
+/* MANIFEST_END.  complete: every page was sent (else nothing is swept and no cursor is kept).  The cursor and the identity are made durable, not when the guard holds the sweep back (the view's cursor is made invalid then, so
+ * that a restart makes a pass again and holds again), and not when an entry of the pass could not be recorded or a delete of the sweep failed (out->failed: nothing, or not everything, was swept) */
 void db_recon_end(bool complete, uint64_t n_skipped, bool cursor_valid, uint64_t cursor, const uint8_t *ident, size_t ident_len, db_recon_end_t *out);
 /* the stream ended in the middle of a pass: forget it (no sweep) */
 void db_recon_abort(void);
-/* a CHANGES delete: the zone of the source id (or of the name, when the loader has it) is deleted; 1 when something was deleted */
+/* a CHANGES delete: the zone of the source id (or of the name, when the loader has it) is deleted; 1 when something was deleted, 0 when there was nothing to delete, -1 when the store could not delete it (the zone stays: the caller does not keep its cursor, so that the delete is made again) */
 int db_recon_delete(const char *view, int64_t source_id, const char *name);
 /* the cursor of a view: false when the store has none for the loader (a first fill).  ident: STORE_IDENT_MAX bytes */
 bool db_recon_cursor_get(const char *view, uint64_t *cursor, uint8_t *ident, size_t *ident_len);
-/* make the cursor durable (the entries it covers are recorded); a view whose guard holds a sweep back keeps its old cursor, so that a restart makes a pass again */
+/* make the cursor durable (the entries it covers are recorded); a view whose guard holds a sweep back keeps no cursor (db_recon_end() made it invalid), so that a restart makes a pass again */
 void db_recon_cursor_put(const char *view, uint64_t cursor, const uint8_t *ident, size_t ident_len);
 /* a zone whose body is wanted (the background fetch): the records KNOWN or STALE that were not refused, the secondary and catalog records once per run.  *cursor: the zone id to continue at;
  * budget: how many zones to look at.  1: an item; 0: the end of the store (cursor at the end); 2: the budget is used up without an item */
@@ -142,8 +143,11 @@ enum { DBR_FETCHED = 0, DBR_FETCH_FAILED, DBR_IN_FLIGHT };
 
 /* the attach of one request, on the calling thread (what a store thread does with every request; a test calls it too; the zone with its trailing dot) */
 void db_store_attach_zone(const char *view, const char *zone);
-/* the same for a zone that nobody waits for, on the calling thread (the control thread's NOTIFY): no siblings, marked to go first when memory-limit needs room (g_query_attach_sync) */
-void db_store_attach_zone_sync(const char *view, const char *zone);
+#ifdef KARIDNS_UNIT_TEST
+extern int db_store_test_set_fail;                      /* the n-th set_put_slot() of the settings table fails (0: off) */
+extern int db_store_test_attach_reserve_fail;           /* the n-th reserve of room in the attach table fails (0: off) */
+extern int db_store_test_bits_fail;                     /* the bit of the n-th entry of a pass cannot be set (0: off) */
+#endif
 
 /* ---- counters (tests; `karictl store` has the counters of dns_store_status.h) ---- */
 typedef struct {

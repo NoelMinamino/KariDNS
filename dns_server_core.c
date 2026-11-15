@@ -2293,7 +2293,6 @@ static bool blackhole_drops(worker_ctx_t *ctx, const void *sa) {
 static void __attribute__((constructor)) bg_fetch_hook_init(void) {
   g_query_bg_fetch = park_bg_fetch;
   g_query_bg_attach = park_bg_attach;           /* 0.7 S3: a zone of the store that is not in memory is attached, not fetched */
-  g_query_attach_sync = db_store_attach_zone_sync;      /* 0.7 WP7b: ... and the NOTIFY of a changed zone attaches the zone of its name server on the spot */
 }
 
 /* ---- D1a milestone 2: parked queries (dns_park.h) ----
@@ -3211,6 +3210,7 @@ process_tcp_client: ;
           zref_clear(&xfr_zr);
           zone_config_t xfr_nr_zc;            /* ... and its settings as the directory element keeps them (the ACL levels read them) */
           zone_db_entry_t *xfr_entry = NULL;  /* the zone of the transfer when its data is in memory */
+          bool xfr_recheck = false;           /* the settings of the zone that is not in memory were not known: the thread checks the zone's own allow-transfer against the real entry before it streams (H2) */
           if (xfr_view && (qtype == 252 || qtype == 251) && qclass != 1) {
             /* RFC 5936 §2.1.2 (QCLASS: "the class of the zone requested"), RFC 1995 §3: every zone of KariDNS is of class IN, so a transfer of class CH,
              * ANY or any other has no zone: it is answered as a zone this server is not authoritative for (REFUSED, AA=0, below), before the ACL and the
@@ -3246,6 +3246,10 @@ process_tcp_client: ;
               zcfg = &xfr_nr_zc;
               xfr_el = xfr_zr.el;
               xfr_nr = true;
+              /* A zone whose settings are not known here (a record that is known and has no body yet, a settings id the store has no text for, an element without settings) has been judged by the view's and
+               * options' allow-transfer alone, and the zone's own (a profile that denies, acl-ceiling) is not in that check.  Whatever the zone is allowed by the view is checked again against the zone's own settings
+               * when its entry is there, before a byte of it is sent (axfr_worker_thread()). */
+              xfr_recheck = nsh == NULL;
             }
           }
           bool is_synthetic_zone = (zcfg && zcfg->type &&
@@ -3370,6 +3374,8 @@ process_tcp_client: ;
                   args->await = entry || !xfr_el ? NULL : db_ingest_xfr_await;
                   args->store_zone[0] = '\0';
                   args->await_zone = NULL;
+                  args->recheck_acl = !entry && xfr_nr && xfr_recheck;
+                  snprintf(args->acl_view, sizeof(args->acl_view), "%s", xfr_view->name ? xfr_view->name : "");
                   if (!entry && xfr_nr && !xfr_el) {                 /* 0.7 S3: a zone of the store that is not in memory: the thread has a store thread attach it */
                     snprintf(args->store_zone, sizeof(args->store_zone), "%s", zref_name(&xfr_zr));
                     args->await_zone = db_ingest_xfr_await_zone;
@@ -4305,23 +4311,42 @@ static void control_db_results(void) {
  * apex of the new summary is here), or whose data came into memory with another serial.  The zone is looked up in the current snapshot; one that is in memory is
  * sent from its entry, as a reload does, one that is not from its apex (notify_send_nonresident()).  At most 256 a tick; the NOTIFY rate decides the pace after
  * that.  The control thread, which owns the table of NOTIFYs awaiting an answer. */
+STATIC_TEST void notify_zone_by_name(const char *view, const char *zone) {
+  rcu_aux_read_lock();
+  zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
+  if (snap) {
+    view_snapshot_t *v = snapshot_find_view(snap, view);
+    zref_t zr;
+    const bool found = v && zref_find_exact(v, zone, &zr);
+    zone_db_entry_t *e = found ? zr.entry : NULL;
+    if (e) {
+      send_notify_to_all(e);                              /* (it ends or renews the wait of the zone itself) */
+    } else if (found && zr.el) {
+      notify_send_nonresident(zr.el, v->name);
+    } else if (found && (zr.zid != ZREF_NOZID || zr.busy)) {
+      /* 0.7 L4: a zone of the store that is not in memory: it was detached between the moment its NOTIFY was queued and now (the queue's tail had moved on already), or this is the second look
+       * of a NOTIFY that waits.  It is asked for in the background and the NOTIFY is made again a little later; a zone that cannot be brought in after a few tries loses its NOTIFY with a line in the log
+       * (the secondaries find the change at their next refresh) */
+      const char *hv = zr.hview ? zr.hview : v->name;
+      if (!zr.busy && zr.zstate == ZREF_ST_ABSENT && g_query_bg_attach) g_query_bg_attach(hv, zref_name(&zr));
+      else if (!zr.busy && zr.zstate == ZREF_ST_KNOWN && g_query_bg_fetch) g_query_bg_fetch(hv, zref_name(&zr));
+      if (!notify_wait_add(view, zone))
+        syslog(LOG_WARNING, "[Notify] zone '%s' (view '%s'): no NOTIFY is sent: the zone is not in memory and could not be brought in (the secondaries find the change at their next refresh)", zone, view);
+    } else {
+      notify_wait_drop(view, zone);                       /* (the zone is gone) */
+    }
+    release_zone_snapshot(snap);
+  } else {
+    notify_wait_drop(view, zone);
+  }
+  rcu_aux_read_unlock();
+}
+
 static void control_zone_notify_queue(void) {
   char view[KARIDNS_VIEW_NAME_MAX], zone[256];
   dbreg_notify_sweep();
-  for (int n = 0; n < 256 && dbreg_notify_pop(view, sizeof(view), zone, sizeof(zone)); n++) {
-    rcu_aux_read_lock();
-    zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
-    if (snap) {
-      view_snapshot_t *v = snapshot_find_view(snap, view);
-      zref_t zr;
-      const bool found = v && zref_find_exact(v, zone, &zr);
-      zone_db_entry_t *e = found ? zr.entry : NULL;
-      if (e) send_notify_to_all(e);
-      else if (found && zr.el) notify_send_nonresident(zr.el, v->name);       /* (a zone of the store that is not in memory has no apex to send from: a zone with a NOTIFY due is kept in memory until it is sent) */
-      release_zone_snapshot(snap);
-    }
-    rcu_aux_read_unlock();
-  }
+  for (int n = 0; n < 256 && dbreg_notify_pop(view, sizeof(view), zone, sizeof(zone)); n++) notify_zone_by_name(view, zone);
+  for (int n = 0; n < 256 && notify_wait_pop(view, sizeof(view), zone, sizeof(zone)); n++) notify_zone_by_name(view, zone);        /* (the NOTIFYs that waited for a zone of the store) */
 }
 
 /* The control thread's tick for a zone: a manual NOTIFY (karictl notify) that was asked for.  notify-delay (BIND 9.20 ARM): the delay between two sets of NOTIFY messages for a
@@ -4338,6 +4363,14 @@ static void tick_manual_notify(zone_db_entry_t *entry, server_config_t *active, 
     syslog(LOG_INFO, "[Control] Executing manual NOTIFY for %s", entry->domain);
     send_notify_to_all(entry);
   }
+}
+
+typedef struct { server_config_t *active; time_t now; } manual_notify_walk_t;
+static bool manual_notify_walk_fn(zdir_elem_t *ael, void *ud) {
+  const manual_notify_walk_t *mw = ud;
+  zone_db_entry_t *aentry = zdir_entry(ael);
+  if (aentry) tick_manual_notify(aentry, mw->active, mw->now);        /* (a request is taken once: a second look at the zone does nothing) */
+  return true;
 }
 
 /* B6a: parked clients whose db-reload-timeout has passed get an error; the request is forgotten */
@@ -4456,9 +4489,15 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
   const dbreg_info_t *zi = &info[0];
   if (strcmp(cmd, "rollback") == 0) {
     zone_db_snapshot_t *rbsnap = acquire_retained_zone_snapshot();
-    zone_db_entry_t *rbe = rbsnap ? dbreg_snapshot_entry(rbsnap, zi->view, zone) : NULL;
+    bool rbheld = false;
+    zone_db_entry_t *rbe = rbsnap ? dbreg_ctl_entry(rbsnap, zi->view, zone, &rbheld) : NULL;
     if (rbe) {
       ctrl_rollback_zone(cfd, rbe, NULL, force);
+      if (rbheld) xfr_entry_release(rbe);
+    } else if (zi->store_state) {
+      /* a zone of the zone store that is not in memory: the version before the last one is kept with the zone in memory (the store holds the current image only), so there is nothing to go back to */
+      static const char msg[] = "ERROR the zone is in the zone store and not in memory: it has no previous version to roll back to (read it with `karictl reload` or ask for it first; a rollback needs the version it replaced)\n";
+      (void)ctl_send_all(cfd, msg, sizeof(msg) - 1);
     } else {
       static const char msg[] = "ERROR the zone is not in memory (out of memory, or hidden by another zone of the same name); nothing to roll back\n";
       (void)ctl_send_all(cfd, msg, sizeof(msg) - 1);
@@ -4477,15 +4516,19 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
     rbtxt[0] = '\0';
     {
       zone_db_snapshot_t *zsnap = acquire_retained_zone_snapshot();
-      zone_db_entry_t *ze = zsnap ? dbreg_snapshot_entry(zsnap, zi->view, zone) : NULL;
+      bool zheld = false;
+      zone_db_entry_t *ze = zsnap ? dbreg_ctl_entry(zsnap, zi->view, zone, &zheld) : NULL;
       if (ze) {
         rx_on = zone_rx_settings_status(ze, NULL, 0);
         zone_rollback_status(ze, rbtxt, sizeof(rbtxt));
+        if (zheld) xfr_entry_release(ze);
       }
       if (zsnap) release_zone_snapshot(zsnap);
     }
+    const char *where = zi->has_entry ? "" : zi->store_state == 1 ? " (in the zone store, not in memory)"
+                                          : zi->store_state == 2 ? " (in the zone store without a body yet: it is read from the database when it is asked for)" : " (no version loaded)";
     int l = snprintf(m, sizeof(m), "OK serial=%u refresh=%u source=database view=%s id=%lld result=%s%s%s%s%s%s\n", zi->serial,
-                     zi->refresh, zi->view, (long long)zi->source_id, res, zi->has_entry ? "" : " (no version loaded)",
+                     zi->refresh, zi->view, (long long)zi->source_id, res, where,
                      zi->error[0] ? " last-error: " : "", zi->error, rx_on ? " settings=primary" : "", rbtxt);
     if (l >= (int)sizeof(m)) l = (int)sizeof(m) - 1, m[l - 1] = '\n';
     (void)ctl_send_all(cfd, m, (size_t)l);
@@ -4493,11 +4536,19 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
   }
   if (strcmp(cmd, "notify") == 0) {
     zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
-    zone_db_entry_t *e = snap ? dbreg_snapshot_entry(snap, zi->view, zone) : NULL;
+    bool nheld = false;
+    zone_db_entry_t *e = snap ? dbreg_ctl_entry(snap, zi->view, zone, &nheld) : NULL;
     if (e) {
       syslog(LOG_NOTICE, "[Control] Received notify command for zone: %s (database zone, view %s)", zone, zi->view);
       zone_notify_request(e);
+      if (nheld) xfr_entry_release(e);
       (void)ctl_send_all(cfd, "OK\n", 3);
+    } else if (zi->store_state && !zi->shadowed) {
+      /* a zone of the zone store that is not in memory: it is asked for in the background and its NOTIFY is sent when it is there (the wait table of the control thread, as for a NOTIFY whose zone was detached) */
+      syslog(LOG_NOTICE, "[Control] Received notify command for zone: %s (database zone, view %s, not in memory: it is attached first)", zone, zi->view);
+      notify_zone_by_name(zi->view, zone);
+      static const char okmsg[] = "OK (the zone is not in memory: it is attached first)\n";
+      (void)ctl_send_all(cfd, okmsg, sizeof(okmsg) - 1);
     } else {
       static const char msg[] = "ERROR zone is not served from the database (hidden by another zone of the same name)\n";
       (void)ctl_send_all(cfd, msg, sizeof(msg) - 1);
@@ -5940,12 +5991,9 @@ void *control_thread_func(void *arg) {
                 }
                 }
             }
-            if (walk_all && dbdir()) {      /* 0.7 S3: the zones of the store that are in memory are in the attach table, not in the directories: a manual NOTIFY asked for one of them is looked for here */
-                size_t apos = 0;
-                for (zdir_elem_t *ael; (ael = dbdir()->attach_next(&apos)) != NULL;) {
-                    zone_db_entry_t *aentry = zdir_entry(ael);
-                    if (aentry) tick_manual_notify(aentry, active, now);
-                }
+            if (walk_all && dbdir()) {      /* 0.7 S3: the zones of the store that are in memory are in the attach table, not in the directories: a manual NOTIFY asked for one of them is looked for here (a table that grows during the walk: it starts again) */
+                manual_notify_walk_t mw = { .active = active, .now = now };
+                (void)attach_walk(manual_notify_walk_fn, NULL, &mw);
             }
             g_tick_rotor++;
             rcu_aux_read_unlock();

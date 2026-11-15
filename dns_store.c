@@ -119,7 +119,7 @@
 /* flat counter array v[] (superblock + journal "V" ops) */
 enum {
   V_HWM = 0, V_FREE_HEAD, V_FREE_COUNT, V_NX_USED, V_NX_DEAD, V_IX_USED, V_IX_LIVE, V_SX_USED, V_SX_LIVE,
-  V_NSEGS, V_CUR_SEG, V_KNOWN, V_STORED, V_REJECTED, V_IMG_BYTES,
+  V_NSEGS, V_CUR_SEG, V_KNOWN, V_STORED, V_REJECTED, V_IMG_BYTES, V_NONSTORE,
   V_GLOBAL_END = 32
 };
 #define V_VIEW(view, k)   (32u + (view) * 8u + (k))             /* k: 0 known, 1 stored, 2 rejected, 3 image bytes */
@@ -306,6 +306,10 @@ struct store {
 long store_test_crash_countdown = 0;
 void (*store_test_before_counters)(store_t *s) = NULL;
 long store_test_fail_commit = 0;
+/* a writer function of the store (its name: "put", "set_known", "delete", "set_flags", "set_stamp", "set_cursor") fails before it changes anything with the errno this returns (0: no failure) */
+int (*store_test_write_fault)(const char *op, uint32_t zid) = NULL;
+void (*store_test_in_stats)(void) = NULL;
+#define ST_FAULT(op, zid) do { int fe_ = store_test_write_fault ? store_test_write_fault((op), (zid)) : 0; if (fe_) return fe_; } while (0)
 static void st_crash_point(void) {
   long c = store_test_crash_countdown;
   if (c > 0 && --c == 0) kill(getpid(), SIGKILL);
@@ -314,6 +318,7 @@ static void st_crash_point(void) {
 #define CRASH_POINT() st_crash_point()
 #else
 #define CRASH_POINT() ((void)0)
+#define ST_FAULT(op, zid) ((void)0)
 #endif
 
 /* ------------------------------------------------------------------------------------------------------------------ */
@@ -575,7 +580,12 @@ static inline uint32_t zrec_stored_crc(const r64_t *zt) {
 typedef struct { unsigned n; uint64_t t0; } seqwait_t;
 static _Thread_local bool t_st_nosleep;   /* store_reader_nosleep() */
 static _Thread_local bool t_st_busy;      /* a lookup of this thread gave up on a cell that was being written (store_reader_busy_take()) */
-void store_reader_nosleep(bool on) { t_st_nosleep = on; t_st_busy = false; }
+bool store_reader_nosleep(bool on) {
+  bool was = t_st_nosleep;
+  t_st_nosleep = on;
+  t_st_busy = false;
+  return was;
+}
 bool store_reader_busy_take(void) {
   bool b = t_st_busy;
   t_st_busy = false;
@@ -1806,6 +1816,7 @@ static int count_zone(store_t *s, uint16_t view, uint8_t state, uint16_t flags, 
   if (flags & STORE_F_REJECTED_NEW) {
     if ((r = jb_vadd(s, j, V_REJECTED, d)) < 0 || (r = jb_vadd(s, j, V_VIEW(view, 2), d)) < 0) return r;
   }
+  if ((flags & STORE_F_NONSTORE) && (r = jb_vadd(s, j, V_NONSTORE, d)) < 0) return r;
   return 0;
 }
 static int release_old_record(store_t *s, const zt_t *old) {
@@ -1985,6 +1996,7 @@ static int check_name_args(const store_t *s, uint16_t view, size_t nlen, const s
 int store_put(store_t *s, uint16_t view, const char *name, size_t len, const store_meta_t *meta, const void *image,
               size_t image_len, uint32_t *zid) {
   if (!s || !name || !meta || !image || image_len == 0 || image_len > 0x7fffffffu) return -EINVAL;
+  ST_FAULT("put", STORE_NONE);
   int r = check_name_args(s, view, len, meta);
   if (r < 0) return r;
   pthread_mutex_lock(&s->wlock);
@@ -1995,6 +2007,7 @@ int store_put(store_t *s, uint16_t view, const char *name, size_t len, const sto
 }
 int store_set_known(store_t *s, uint16_t view, const char *name, size_t len, const store_meta_t *meta, uint32_t *zid) {
   if (!s || !name || !meta) return -EINVAL;
+  ST_FAULT("set_known", STORE_NONE);
   int r = check_name_args(s, view, len, meta);
   if (r < 0) return r;
   pthread_mutex_lock(&s->wlock);
@@ -2065,6 +2078,7 @@ static int delete_locked(store_t *s, uint32_t z) {
 
 int store_delete(store_t *s, uint32_t zid) {
   if (!s) return -EINVAL;
+  ST_FAULT("delete", zid);
   pthread_mutex_lock(&s->wlock);
   int r = delete_locked(s, zid);
   if (r < 0 && r != -ENOENT) note_error(s, r); else if (r == 0) { note_ok(s); r = post_write(s); }
@@ -2086,6 +2100,7 @@ int store_delete_name(store_t *s, uint16_t view, const char *name, size_t len) {
 
 int store_set_flags(store_t *s, uint32_t zid, uint16_t set, uint16_t clear) {
   if (!s) return -EINVAL;
+  ST_FAULT("set_flags", zid);
   pthread_mutex_lock(&s->wlock);
   int r;
   r64_t rt, rc;
@@ -2098,6 +2113,7 @@ int store_set_flags(store_t *s, uint32_t zid, uint16_t set, uint16_t clear) {
       jb_t *j = &s->jb;
       jb_reset(j);
       int64_t dr = ((nf & STORE_F_REJECTED_NEW) ? 1 : 0) - ((t.flags & STORE_F_REJECTED_NEW) ? 1 : 0);
+      int64_t dn = ((nf & STORE_F_NONSTORE) ? 1 : 0) - ((t.flags & STORE_F_NONSTORE) ? 1 : 0);
       t.flags = nf;
       zt_pack(&t, &rt);
       zrec_seal(&rt, &rc);
@@ -2105,6 +2121,7 @@ int store_set_flags(store_t *s, uint32_t zid, uint16_t set, uint16_t clear) {
         r = jb_vadd(s, j, V_REJECTED, dr);
         if (r == 0) r = jb_vadd(s, j, V_VIEW(t.view, 2), dr);
       }
+      if (r == 0 && dn != 0) r = jb_vadd(s, j, V_NONSTORE, dn);
       if (r == 0) r = journal_commit_apply(s);
     }
   }
@@ -2116,6 +2133,7 @@ int store_set_flags(store_t *s, uint32_t zid, uint16_t set, uint16_t clear) {
 /* 0.7 WP7b: the version stamp (zc) and the flags (zt) of a zone, in one journal record: the database has another version than the one the record holds, or the same one again */
 int store_set_stamp(store_t *s, uint32_t zid, uint64_t gen, uint64_t time, uint16_t set, uint16_t clear) {
   if (!s) return -EINVAL;
+  ST_FAULT("set_stamp", zid);
   pthread_mutex_lock(&s->wlock);
   int r;
   r64_t rt, rc;
@@ -2130,6 +2148,7 @@ int store_set_stamp(store_t *s, uint32_t zid, uint64_t gen, uint64_t time, uint1
       jb_t *j = &s->jb;
       jb_reset(j);
       int64_t dr = ((nf & STORE_F_REJECTED_NEW) ? 1 : 0) - ((t.flags & STORE_F_REJECTED_NEW) ? 1 : 0);
+      int64_t dn = ((nf & STORE_F_NONSTORE) ? 1 : 0) - ((t.flags & STORE_F_NONSTORE) ? 1 : 0);
       t.flags = nf;
       c.stamp_gen = gen;
       c.stamp_time = time;
@@ -2140,6 +2159,7 @@ int store_set_stamp(store_t *s, uint32_t zid, uint64_t gen, uint64_t time, uint1
         r = jb_vadd(s, j, V_REJECTED, dr);
         if (r == 0) r = jb_vadd(s, j, V_VIEW(t.view, 2), dr);
       }
+      if (r == 0 && dn != 0) r = jb_vadd(s, j, V_NONSTORE, dn);
       if (r == 0) r = journal_commit_apply(s);
     }
   }
@@ -2180,6 +2200,7 @@ const char *store_view_name(const store_t *s, int view) {
 
 int store_set_cursor(store_t *s, uint16_t source, uint64_t cursor, const void *ident, size_t ident_len) {
   if (!s || source >= ST_MAXSRC || ident_len > STORE_IDENT_MAX || (ident_len && !ident)) return -EINVAL;
+  ST_FAULT("set_cursor", STORE_NONE);
   pthread_mutex_lock(&s->wlock);
   jb_reset(&s->jb);
   uint8_t *p = jb_op(&s->jb, OP_SRC, 24 + STORE_IDENT_MAX);
@@ -2450,7 +2471,10 @@ void store_opts_default(store_opts_t *o) {
   o->sync_policy = STORE_SYNC_BATCH;
 }
 
+/* The index generations are read here, and a writer that grows an index retires the old generation after the grace period of the readers: the thread that reads them is a reader (the
+ * section nests: a caller that has one already is not affected). */
 void store_stats(const store_t *s, store_stats_t *o) {
+  rcu_aux_read_lock();
   memset(o, 0, sizeof(*o));
   o->format = STORE_FORMAT_VERSION;
   o->mode = s->mode;
@@ -2461,6 +2485,7 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->zones_known = VG(s, V_KNOWN);
   o->zones_stored = VG(s, V_STORED);
   o->zones_rejected = VG(s, V_REJECTED);
+  o->zones_nonstore = VG(s, V_NONSTORE);
   o->zones_free = VG(s, V_FREE_COUNT);
   o->zt_records = VG(s, V_HWM);
   o->zt_capacity = st_zt_cap(s);
@@ -2468,6 +2493,9 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->nx_dead = VG(s, V_NX_DEAD);
   const ixgen_t *ix = atomic_load_explicit(&s->ix, memory_order_acquire), *sx = atomic_load_explicit(&s->sx, memory_order_acquire);
   if (ix) { o->ix_gen = ix->gen; o->ix_slots = ix->nslots; }
+#ifdef KARIDNS_UNIT_TEST
+  if (store_test_in_stats) store_test_in_stats();
+#endif
   if (sx) { o->sx_gen = sx->gen; o->sx_slots = sx->nslots; }
   o->ix_used = VG(s, V_IX_USED);
   o->ix_live = VG(s, V_IX_LIVE);
@@ -2501,6 +2529,7 @@ void store_stats(const store_t *s, store_stats_t *o) {
     o->views[i].rejected = VG(s, V_VIEW(i, 2));
     o->views[i].image_bytes = VG(s, V_VIEW(i, 3));
   }
+  rcu_aux_read_unlock();
 }
 
 int store_seg_info(const store_t *s, uint32_t num, store_seg_info_t *o) {
@@ -2550,7 +2579,7 @@ int store_resident_sample(const store_t *cs, unsigned pages, uint64_t seed, uint
 int store_check(store_t *s, store_check_report_t *rep) {
   memset(rep, 0, sizeof(*rep));
   pthread_mutex_lock(&s->wlock);
-  uint64_t hwm = VG(s, V_HWM), known = 0, stored = 0, rej = 0, bytes = 0, nfree = 0, live_ix = 0, live_sx = 0, nxlive = 0;
+  uint64_t hwm = VG(s, V_HWM), known = 0, stored = 0, rej = 0, nons = 0, bytes = 0, nfree = 0, live_ix = 0, live_sx = 0, nxlive = 0;
   uint64_t vk[ST_MAXV][4];
   memset(vk, 0, sizeof(vk));
   uint64_t seglive[ST_MAXSEG + 1];
@@ -2595,6 +2624,7 @@ int store_check(store_t *s, store_check_report_t *rep) {
       else store_img_release(s, &im);
     }
     if (t.flags & STORE_F_REJECTED_NEW) { rej++; vk[t.view][2]++; }
+    if (t.flags & STORE_F_NONSTORE) nons++;
   }
   /* free list */
   uint64_t fz = VG(s, V_FREE_HEAD), steps = 0;
@@ -2608,6 +2638,7 @@ int store_check(store_t *s, store_check_report_t *rep) {
     steps++;
   }
   if (steps != VG(s, V_FREE_COUNT) || steps != nfree) CHK_FAIL("free list %" PRIu64 " links, counter %" PRIu64 ", %" PRIu64 " free cells", steps, VG(s, V_FREE_COUNT), nfree);
+  if (nons != VG(s, V_NONSTORE)) CHK_FAIL("totals: nonstore %" PRIu64 "/%" PRIu64, nons, VG(s, V_NONSTORE));
   if (known != VG(s, V_KNOWN) || stored != VG(s, V_STORED) || rej != VG(s, V_REJECTED) || bytes != VG(s, V_IMG_BYTES))
     CHK_FAIL("totals: known %" PRIu64 "/%" PRIu64 " stored %" PRIu64 "/%" PRIu64 " rejected %" PRIu64 "/%" PRIu64 " bytes %" PRIu64 "/%" PRIu64,
              known, VG(s, V_KNOWN), stored, VG(s, V_STORED), rej, VG(s, V_REJECTED), bytes, VG(s, V_IMG_BYTES));
@@ -2707,6 +2738,7 @@ static int rebuild_locked(store_t *s) {
           NS(V_SEG(sn, 1), NG(V_SEG(sn, 1)) + rl);
         }
         if (t.flags & STORE_F_REJECTED_NEW) { NS(V_REJECTED, NG(V_REJECTED) + 1); NS(V_VIEW(t.view, 2), NG(V_VIEW(t.view, 2)) + 1); }
+        if (t.flags & STORE_F_NONSTORE) NS(V_NONSTORE, NG(V_NONSTORE) + 1);
         uint32_t d = V_DEPTH(t.view, depth_bucket(name_labels(fn, t.klen)));
         NS(d, NG(d) + 1);
       }

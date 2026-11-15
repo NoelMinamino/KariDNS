@@ -876,6 +876,12 @@ static void scan_zones(void) {
             zdir_iter_t zit;
             size_t apos = 0;
             if (!att) zdir_iter_init(&zit, &snap->views[v]);
+            int att_again = 0;
+att_restart:;
+            /* the attach table that grows while it is walked is another table: the position of the walk means nothing in it and zones are skipped (a zone whose ALIAS targets are not resolved until the next scan); a
+             * walk that saw it change starts again (the work of a zone is the same the second time) */
+            const uint64_t atid = att ? dbdir()->attach_tab_id() : 0;
+            apos = 0;
             for (zdir_elem_t *zel; (zel = att ? dbdir()->attach_next(&apos) : zdir_iter_next(&zit));) {
                 zone_db_entry_t *e = zdir_entry(zel);
                 if (!e || !view_owns_elem(zel) || e->kind == ZONE_KIND_FORWARD || e->kind == ZONE_KIND_PROGRAM) continue;   /* a shared zone is scanned in its owner view */
@@ -923,6 +929,7 @@ static void scan_zones(void) {
                     }
                 }
             }
+            if (att && dbdir()->attach_tab_id() != atid && ++att_again < 4) goto att_restart;
         }
     }
     if (cfg) release_config_snapshot(cfg);

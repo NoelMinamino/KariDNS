@@ -194,7 +194,7 @@ typedef struct store_stats {
   uint8_t  uuid[16];
   uint32_t state;                 /* STORE_ST_* */
   bool     clean_flag;            /* the newest superblock on disk says "clean stop"; false during a running session (the open clears it durably) */
-  uint64_t zones_known, zones_stored, zones_rejected, zones_free;
+  uint64_t zones_known, zones_stored, zones_rejected, zones_nonstore, zones_free;   /* zones_nonstore: the records with STORE_F_NONSTORE (a subset of known + stored) */
   uint64_t zt_records;            /* high-water mark: records in use incl. free ones */
   uint64_t zt_capacity;           /* records the files can hold now */
   uint64_t nx_used, nx_dead;
@@ -261,7 +261,7 @@ bool     store_zid_is(const store_t *s, uint32_t zid, uint16_t view, const char 
  * written and give up (the lookup finds nothing, store_zone_get() says -EBADMSG) instead of yielding and sleeping up to 500 ms.  store_reader_busy_take() says (and clears) that
  * this thread gave up since the last call: the answer of the lookup is then "not known now", and the caller takes the slow path (parks the query for a store thread, which does
  * not mind sleeping) rather than treating the zone as absent or damaged. */
-void     store_reader_nosleep(bool on);
+bool     store_reader_nosleep(bool on);          /* the mode before the call */
 bool     store_reader_busy_take(void);
 /* zid by (source, domain id, view) from the source index, or STORE_NONE */
 uint32_t store_find_source(const store_t *s, uint16_t source, int64_t domain_id, uint16_t view);
@@ -340,6 +340,10 @@ extern long store_test_crash_countdown;
 extern void (*store_test_before_counters)(store_t *s);
 /* commit_locked() fails with -EIO at the n-th call (0 = off): a failed fdatasync */
 extern long store_test_fail_commit;
+/* a writer (store_put, store_set_known, store_delete, store_set_flags, store_set_stamp, store_set_cursor; `op` is its name without the store_ prefix) returns the errno this returns (not 0) before it changes anything: a full disk, an I/O error (NULL = off) */
+extern int (*store_test_write_fault)(const char *op, uint32_t zid);
+/* called by store_stats() after it has read the index generation (the window in which a writer may retire it) */
+extern void (*store_test_in_stats)(void);
 uint64_t store_test_siphash(unsigned c, unsigned d, const uint8_t key[16], const uint8_t *in, size_t len);
 uint32_t store_test_crc32c(uint32_t crc, const void *p, size_t n);
 uint64_t store_test_sum64(const void *p, size_t n);

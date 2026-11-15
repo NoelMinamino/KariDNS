@@ -1048,6 +1048,82 @@ static void notify_apex_targets(const zdir_elem_t *el, const zdir_apex_t *ap, vi
   }
 }
 
+/* ---- the NOTIFYs that wait for a zone of the store (0.7 L3, L4): the control thread only ---- */
+#define NOTIFY_WAIT_MAX 32
+#define NOTIFY_WAIT_TRIES 5
+#define NOTIFY_WAIT_MS 200
+typedef struct {
+  bool used, queued;                 /* queued: due at due_ms (else the NOTIFY is being made now) */
+  uint8_t tries;
+  char view[KARIDNS_VIEW_NAME_MAX];
+  char zone[256];
+  int64_t due_ms;
+} notify_wait_t;
+static notify_wait_t g_nwait[NOTIFY_WAIT_MAX];
+
+static int64_t nwait_now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+static int nwait_find(const char *view, const char *zone) {
+  for (int i = 0; i < NOTIFY_WAIT_MAX; i++)
+    if (g_nwait[i].used && strcmp(g_nwait[i].view, view) == 0 && domain_names_match_ci(g_nwait[i].zone, zone)) return i;
+  return -1;
+}
+
+/* The NOTIFY of the zone cannot be made yet (it needs a zone of the store that was asked for in the background): make it again after NOTIFY_WAIT_MS.  false: do not wait (the table is full, or it has waited
+ * NOTIFY_WAIT_TRIES times already): the NOTIFY is made with what is known, and the zone's entry is gone from the table. */
+bool notify_wait_add(const char *view, const char *zone) {
+  int i = nwait_find(view, zone);
+  if (i < 0) {
+    for (int k = 0; k < NOTIFY_WAIT_MAX && i < 0; k++)
+      if (!g_nwait[k].used) i = k;
+    if (i < 0) return false;
+    memset(&g_nwait[i], 0, sizeof(g_nwait[i]));
+    g_nwait[i].used = true;
+    snprintf(g_nwait[i].view, sizeof(g_nwait[i].view), "%s", view);
+    snprintf(g_nwait[i].zone, sizeof(g_nwait[i].zone), "%s", zone);
+  }
+  if (g_nwait[i].tries >= NOTIFY_WAIT_TRIES) {
+    g_nwait[i].used = false;
+    return false;
+  }
+  g_nwait[i].tries++;
+  g_nwait[i].queued = true;
+  g_nwait[i].due_ms = nwait_now_ms() + NOTIFY_WAIT_MS;
+  return true;
+}
+/* the NOTIFY of the zone was made (or the zone is gone): forget its wait */
+void notify_wait_drop(const char *view, const char *zone) {
+  int i = nwait_find(view, zone);
+  if (i >= 0) g_nwait[i].used = false;
+}
+/* the next NOTIFY whose time has come (it stays in the table, with its tries, until notify_wait_drop() or a notify_wait_add() that says no) */
+bool notify_wait_pop(char *view, size_t vcap, char *zone, size_t zcap) {
+  const int64_t now = nwait_now_ms();
+  for (int i = 0; i < NOTIFY_WAIT_MAX; i++) {
+    if (!g_nwait[i].used || !g_nwait[i].queued || g_nwait[i].due_ms > now) continue;
+    g_nwait[i].queued = false;
+    snprintf(view, vcap, "%s", g_nwait[i].view);
+    snprintf(zone, zcap, "%s", g_nwait[i].zone);
+    return true;
+  }
+  return false;
+}
+#ifdef KARIDNS_UNIT_TEST
+/* tests: the waits in the table, and make them all due now */
+int notify_wait_count(bool make_due) {
+  int n = 0;
+  for (int i = 0; i < NOTIFY_WAIT_MAX; i++)
+    if (g_nwait[i].used) {
+      n++;
+      if (make_due) g_nwait[i].due_ms = 0;
+    }
+  return n;
+}
+#endif
+
 /* The NOTIFY messages of a zone: entry is the zone in memory, or NULL and el is its directory element (the data is out of memory: the NS hosts come from the apex
  * of its summary, the settings from the element).  The control thread only. */
 static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, const char *view_name) {
@@ -1101,6 +1177,7 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
 
   notify_dest_t targets[64];
   int ntargets = 0;
+  bool sib_wait = false;      /* a name server's address is in a zone of the store that is not in memory yet */
   g_notify_dropped = false;
 
   // 1. also-notify servers: the zone's list, else its view's, else options' (BIND 9.20 ARM).  An address with its own `key` is signed
@@ -1142,17 +1219,21 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
       zref_t sib_z;                                        /* (one lookup decides: the data of the zone may come into memory or leave it at any moment) */
       zref_clear(&sib_z);
       zone_db_entry_t *sib_entry = view ? find_zone_for_query_zref(view, ns_target, 0, &sib_z) : NULL;
-      if (!sib_entry && view && !sib_z.el && !sib_z.busy && sib_z.zid != ZREF_NOZID && sib_z.zstate == ZREF_ST_ABSENT && g_query_attach_sync) {
-        /* 0.7 WP7b: a zone of the store that is not in memory holds the address of this name server: it is attached now, so that this NOTIFY has the address (a NOTIFY that waited for the
-         * zone to come in the background was lost: nothing sends it again) */
-        g_query_attach_sync(sib_z.hview ? sib_z.hview : view->name, zref_name(&sib_z));
-        zref_clear(&sib_z);
-        sib_entry = find_zone_for_query_zref(view, ns_target, 0, &sib_z);
-      }
       if (!sib_entry) {                                    /* (a zone of the view that is out of memory: the glue of its apex, D1a step 7) */
-        if (entry && sib_z.el) (void)notify_add_sibling_apex(sib_z.el, ns_target, targets, &ntargets, 64, key, ns_port);
-        else if (view && !sib_z.el && !sib_z.busy && sib_z.zid != ZREF_NOZID && sib_z.zstate == ZREF_ST_ABSENT && g_query_bg_attach)
-          g_query_bg_attach(sib_z.hview ? sib_z.hview : view->name, zref_name(&sib_z));       /* 0.7 S3: a zone of the store: attached in the background, its addresses are there at the next NOTIFY */
+        if (entry && sib_z.el) {
+          (void)notify_add_sibling_apex(sib_z.el, ns_target, targets, &ntargets, 64, key, ns_port);
+        } else if (view && !sib_z.el && sib_z.zid != ZREF_NOZID) {
+          /* 0.7 S3: a zone of the store that is not in memory holds the address of this name server.  It is asked for in the background (an attach for a zone with an image, a fetch for one without)
+           * and this NOTIFY waits for it and is made again a little later (notify_wait_add() below): this thread, with a read section open, must not attach it itself (the attach retires what it
+           * replaces and may wait for the readers' grace period, this thread among them), and a NOTIFY that did not wait was sent without the address and never again.  A cell that is being written
+           * (busy) is "not known now": the same wait, no request. */
+          const char *hv = sib_z.hview ? sib_z.hview : view->name;
+          if (!sib_z.busy && sib_z.zstate == ZREF_ST_ABSENT && g_query_bg_attach) g_query_bg_attach(hv, zref_name(&sib_z));
+          else if (!sib_z.busy && sib_z.zstate == ZREF_ST_KNOWN && g_query_bg_fetch) g_query_bg_fetch(hv, zref_name(&sib_z));
+          sib_wait = true;
+        } else if (view && sib_z.busy) {
+          sib_wait = true;
+        }
         continue;
       }
       if (sib_entry == entry) continue;
@@ -1165,6 +1246,13 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
     const zdir_apex_t *ap = atomic_load_explicit(&((zdir_elem_t *)el)->apex, memory_order_acquire);
     if (ap) notify_apex_targets(el, ap, view, eff.notify_to_soa, key, ns_port, targets, &ntargets, 64);
   }
+
+  /* An address that is in a zone that is on its way into memory: no NOTIFY now, one a little later (the control thread's wait table, notify_wait_pop()), a few times; after that what is known is sent */
+  if (sib_wait && notify_wait_add(view_name ? view_name : "", domain)) {
+    logev_post(LOGC_NOTIFY, 2, NULL, 0, "[Notify] zone '%s' (view '%s'): waits for a zone of the store that holds the address of a name server", domain, view_name ? view_name : "");
+    goto out;
+  }
+  if (!sib_wait) notify_wait_drop(view_name ? view_name : "", domain);
 
   if (g_notify_dropped)
     syslog(LOG_WARNING, "[Notify] zone '%s': more than %d NOTIFY destinations (also-notify and the NS hosts); the others get no NOTIFY and find the "
@@ -1221,6 +1309,7 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
   }
   if (!entry) syslog(LOG_INFO, "[Notify] zone '%s' (data out of memory): NOTIFY to %d address(es)", domain, ntargets);
 
+out:
   if (snap) release_zone_snapshot(snap);
   if (active) release_config_snapshot(active);
   rcu_aux_read_unlock();

@@ -1346,6 +1346,7 @@ typedef struct {
 } nr_reply_t;
 
 static bool g_nr_send_ede = true;
+static bool g_nr_recheck = false;                 /* axfr_worker_args_t.recheck_acl of the next nr_run() (0.7 H2) */
 /* run axfr_worker_thread for a request and read what the client gets */
 static void nr_run(nr_reply_t *out, const uint8_t *req, size_t req_len, uint16_t qtype, zone_db_entry_t *entry, zdir_elem_t *el,
                    zone_db_entry_t *(*aw)(zdir_elem_t *, const char *)) {
@@ -1366,6 +1367,8 @@ static void nr_run(nr_reply_t *out, const uint8_t *req, size_t req_len, uint16_t
     args->elem = el;
     args->await = aw;
     strlcpy(args->view_name, "default", sizeof(args->view_name));
+    args->recheck_acl = g_nr_recheck;
+    strlcpy(args->acl_view, "default", sizeof(args->acl_view));
     pthread_t th;
     rc = pthread_create(&th, NULL, axfr_worker_thread, args);
     assert(rc == 0);
@@ -1425,7 +1428,69 @@ static void nr_parse(const nr_reply_t *r, uint32_t *serial_out, int64_t *expire_
     }
 }
 
+/* 0.7 H2: a zone that is not in memory whose own settings were not known when the request was taken (a record that is known and has no body, a settings id with no text) was judged by the view's allow-transfer
+ * alone.  When its entry is there, the zone's own allow-transfer is checked against it before a byte is sent: a view that allows `any` and a zone that allows only another address is REFUSED. */
+static void test_axfr_worker_recheck_acl(void) {
+    printf("[TEST] AXFR/IXFR: a zone whose settings were not known is checked against its own allow-transfer when its entry is there (H2)...\n");
+    server_config_t vcfg;
+    memset(&vcfg, 0, sizeof(vcfg));
+    assert(parse_named_conf("options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; acl-ceiling { any; }; }; };\n"
+                            "view \"default\" { match-clients { any; }; allow-transfer { any; }; };\n", &vcfg) == 0);
+    server_config_t *cfg0 = atomic_load(&g_config_db.active);
+    atomic_store(&g_config_db.active, &vcfg);
+    zdir_apex_t *apex = nr_apex(4242);
+    zdir_elem_t *el = nr_elem("nr.example.com.", 4242, apex);
+    uint8_t req[1024];
+    nr_reply_t rep;
+    zone_db_entry_t entry;
+    for (int pass = 0; pass < 2; pass++) {                                          /* 0: the zone allows 192.0.2.1 only (denies the client); 1: the zone allows the client */
+        char err[200];
+        const char *text = pass == 0 ? "allow-transfer { 192.0.2.1; };" : "allow-transfer { 127.0.0.1; };";
+        zone_ext_shared_t *sh = db_settings_parse(text, strlen(text), err, sizeof(err));
+        assert(sh);
+        zone_config_t *dc = db_zone_config_new("nr.example.com.", sh);
+        assert(dc);
+        memset(&entry, 0, sizeof(entry));
+        entry.domain = "nr.example.com.";
+        entry.source = ZONE_SRC_DB;
+        strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+        pthread_mutex_init(&entry.writer_lock, NULL);
+        pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+        init_axfr_zone(test_zone_slot(&entry, 0), "nr.example.com.", "4242");
+        atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
+        atomic_store_explicit(&entry.serial, 4242, memory_order_release);
+        atomic_store_explicit(&entry.dbcfg, dc, memory_order_release);
+        atomic_init(&entry.snapshot_refs, 1);
+        g_nr_await_entry = &entry;
+        g_nr_recheck = true;
+        size_t n = nr_request(req, sizeof(req), "nr.example.com.", 252, -1, false, false);
+        nr_run(&rep, req, n, 252, NULL, el, nr_await_stub);
+        if (pass == 0) {
+            assert(rep.nmsgs == 1 && (rep.msg[3] & 0x0F) == 5 && rep.msg[7] == 0);       /* REFUSED, no zone data */
+            n = nr_request(req, sizeof(req), "nr.example.com.", 251, 4241, false, false);
+            nr_run(&rep, req, n, 251, NULL, el, nr_await_stub);                         /* (an IXFR the same: the apex is not read before the zone's own ACL is known) */
+            assert(rep.nmsgs == 1 && (rep.msg[3] & 0x0F) == 5);
+        } else {
+            assert(rep.nmsgs >= 1 && (rep.msg[3] & 0x0F) == 0 && rep.msg[7] >= 2);        /* the transfer */
+        }
+        assert(atomic_load(&entry.active_axfr) == 0 && atomic_load(&entry.snapshot_refs) == 1);       /* (the thread gave its hold back either way) */
+        g_nr_recheck = false;
+        g_nr_await_entry = NULL;
+        zone_arena_destroy(test_zone_slot(&entry, 0));
+        pthread_mutex_destroy(&entry.writer_lock);
+        pthread_mutex_destroy(&entry.ixfr_history.lock);
+        atomic_store_explicit(&entry.dbcfg, NULL, memory_order_release);
+        free_zone_config(dc);
+        zone_ext_shared_unref(sh);
+    }
+    atomic_store(&g_config_db.active, cfg0);
+    free(apex);
+    free(el);
+    printf("  -> the recheck of the zone's own allow-transfer passed.\n");
+}
+
 static void test_axfr_worker_zone_out_of_memory(void) {
+
     printf("[TEST] AXFR/IXFR: a zone that is not in memory (summary answer, wait for the zone, SERVFAIL)...\n");
     zdir_apex_t *apex = nr_apex(4242);
     zdir_elem_t *el = nr_elem("nr.example.com.", 4242, apex);
@@ -8843,6 +8908,7 @@ int main(void) {
     test_handle_axfr_event_intermediate_unsigned_flow();
     test_handle_axfr_event_and_worker_thread();
     test_axfr_worker_zone_out_of_memory();
+    test_axfr_worker_recheck_acl();
     test_r11_stalled_transfer_holds_nothing_but_its_version();
     test_r11_apex_answer_copies_before_send();
     test_r11_apex_write_failure_keeps_the_snapshot();

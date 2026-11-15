@@ -40,6 +40,7 @@
 #include "../dns_db_ingest.h"
 #include "../dns_db_store.h"
 #include "../dns_db_stream.h"
+#include "../dns_dynamic_update.h"
 #include "../dns_epoch_rcu.h"
 #include "../dns_park.h"
 #include "../dns_query_engine.h"
@@ -126,6 +127,7 @@ static size_t put_rr_head(uint8_t *b, const char *owner, uint16_t type, size_t r
 }
 
 /* ZONE_DATA of the zone (SOA, NS, A www, SOA); `extra`: a changing A record so that two versions of a zone differ */
+static const char *g_zone_ns;                                          /* the NS target of the zones that zone_message() makes (NULL: ns1.<zone>) */
 static size_t zone_message(uint8_t *b, const char *zone, uint32_t serial) {
     memset(b, 0, 12);
     b[2] = 0x84;
@@ -149,7 +151,7 @@ static size_t zone_message(uint8_t *b, const char *zone, uint32_t serial) {
             l += put_u32(b + start + l, 86400);
             l += put_u32(b + start + l, 300);
         } else if (type == 2) {
-            l += put_name(b + start, ns);
+            l += put_name(b + start, g_zone_ns ? g_zone_ns : ns);
         } else {
             b[start] = 192; b[start + 1] = 0; b[start + 2] = 2; b[start + 3] = (uint8_t)(80 + (serial & 3));
             l = 4;
@@ -464,6 +466,53 @@ static void *grow_reader_thread(void *arg) {
     }
     return NULL;
 }
+
+
+/* ---- helpers of the review-fix cases (run_mode): the hooks that record what the control thread asks for in the background, the walk of the attach table, a thread that asks the registry for a record ---- */
+static int g_nsa_n, g_nsf_n;
+static char g_nsa_zone[256], g_nsf_zone[256];
+static void rec_bg_attach(const char *view, const char *zone) {
+    (void)view;
+    g_nsa_n++;
+    snprintf(g_nsa_zone, sizeof(g_nsa_zone), "%s", zone);
+}
+static void rec_bg_fetch(const char *view, const char *zone) {
+    (void)view;
+    g_nsf_n++;
+    snprintf(g_nsf_zone, sizeof(g_nsf_zone), "%s", zone);
+}
+
+typedef struct { int *seen; int nseen; uint32_t base; int calls; bool grown; bool grew; zdir_elem_t **grow; int ngrow; } walk_ud_t;
+static walk_ud_t g_walk_ud;
+static bool walk_fn(zdir_elem_t *el, void *ud) {
+    walk_ud_t *w = ud;
+    if (el->zid >= w->base && el->zid < w->base + (uint32_t)w->nseen) w->seen[el->zid - w->base]++;
+    return true;
+}
+static void walk_reset(void *ud) { (void)ud; }
+static void walk_grow_hook(void) {                                       /* (after the 150th element of the walk: zones come and go until the table is made again: it was made big for thousands of zones, few are left, so the new one is small and the position of the walk is beyond its end) */
+    if (++g_walk_ud.calls == 150 && !g_walk_ud.grown) {
+        g_walk_ud.grown = true;
+        const uint64_t id0 = dbdir()->attach_tab_id();
+        for (int i = 0; i < g_walk_ud.ngrow && dbdir()->attach_tab_id() == id0; i++) {
+            (void)dbdir()->attach_put(g_walk_ud.grow[i]);
+            dbdir()->attach_remove(g_walk_ud.grow[i]);                   /* (a tombstone: the table fills up with them until it is made again) */
+        }
+        g_walk_ud.grew = dbdir()->attach_tab_id() != id0;
+    }
+}
+
+static bool g_zv_found;
+static void *zv_thread(void *arg) {
+    (void)arg;
+    int64_t sid;
+    uint32_t sr;
+    g_zv_found = dbreg_zone_version("default", "r6b.test.", &sid, &sr);
+    return NULL;
+}
+
+zone_db_entry_t *glue_shared_entry(view_snapshot_t *view, const view_snapshot_t *owner, const char *domain);      /* (dns_snapshot_rcu.c) */
+void notify_zone_by_name(const char *view, const char *zone);               /* (dns_server_core.c: the control thread's NOTIFY of a zone by name) */
 
 static int run_mode(const char *mode) {
     printf("[the zone store is the directory of the database zones: %s mode]\n", mode);
@@ -1058,6 +1107,236 @@ static int run_mode(const char *mode) {
     zone_retire_process(true);
     CHECK(zone_bytes_underflows() == 0);
 
+
+    /* ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ */
+    /* the fixes of the review of S3 + S4 (the legacy stream): M3, L6, M4, L3, L4, L5, L9                                                                                                   */
+    /* ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ */
+    {
+        dbdir_rec_t rr;
+
+        /* -- M3: the table of attached zones has no room when the version a fetch brings is committed.  The zone is not registered, the entry that the install made belongs to the caller alone, and nothing
+         *    in the registry points at it (before: the element held the entry the caller then freed).  A later install works. */
+        batch_begin(a[0], &e, 40, KDB_BATCH_DIFF);
+        send_zone(a[0], &e, "r3.test.", 1, 0, 301);
+        batch_end(a[0], &e, &mainc, 40, 1, 0);
+        CHECK(in_memory("r3.test."));
+        CHECK(damage_record(sdir, "r3.test."));
+        CHECK(evict_zone("r3.test."));
+        CHECK(attach_by_worker("r3.test.", &k) == 0 && k.retry);               /* (the record is damaged: the zone is fetched) */
+        CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "r3.test.") == 0);
+        db_store_test_attach_reserve_fail = 1;
+        send_zone(f[0], &e, "r3.test.", 2, m.u.fetch_req.request_id, 301);
+        CHECK(wake_for("r3.test.", &k, 5000));
+        CHECK(db_store_test_attach_reserve_fail == 0);                         /* (the commit asked for the room, and was refused) */
+        CHECK(!in_memory("r3.test."));
+        CHECK(dbreg_lookup_entry("default", "r3.test.") == NULL);              /* (a dangling entry would be found here) */
+        batch_begin(a[0], &e, 41, KDB_BATCH_DIFF);                             /* (the loader sends it again: the table has room) */
+        send_zone(a[0], &e, "r3.test.", 3, 0, 301);
+        batch_end(a[0], &e, &mainc, 41, 1, 0);
+        CHECK(in_memory("r3.test."));
+        {
+            uint8_t out[1232];
+            int rl = ask_engine(&g_wctx, &g_cc, "www.r3.test.", 1, out);
+            CHECK(rl > 12 && (out[3] & 0x0F) == 0 && ((out[6] << 8) | out[7]) == 1);
+        }
+
+        /* -- L6: a domain that is renamed in the database: the zone of the old name is gone from the store, the attach table and the registry (before: the store alone lost it, and the element stayed, counted) */
+        batch_begin(a[0], &e, 42, KDB_BATCH_DIFF);
+        send_zone(a[0], &e, "r6.test.", 1, 0, 306);
+        batch_end(a[0], &e, &mainc, 42, 1, 0);
+        CHECK(in_memory("r6.test."));
+        const size_t att0 = dbdir()->attach_count();
+        batch_begin(a[0], &e, 43, KDB_BATCH_DIFF);
+        send_zone(a[0], &e, "r6b.test.", 1, 0, 306);
+        batch_end(a[0], &e, &mainc, 43, 1, 0);
+        CHECK(in_memory("r6b.test.") && !in_memory("r6.test."));
+        CHECK(dbreg_lookup_entry("default", "r6.test.") == NULL);
+        CHECK(dbdir()->attach_count() == att0);                                /* (one zone in, one out) */
+        CHECK(!dbdir()->rec_get("default", "r6.test.", &rr) && dbdir()->rec_get("default", "r6b.test.", &rr) && rr.source_id == 306);
+
+        /* -- M4: the control commands find a zone of the store: in memory (the entry is held for the command) and not (the record) */
+        {
+            zone_db_snapshot_t *sn = acquire_retained_zone_snapshot();
+            bool held = false;
+            zone_db_entry_t *ce = dbreg_ctl_entry(sn, "default", "r6b.test.", &held);
+            CHECK(ce != NULL && held && domain_names_match_ci(ce->domain, "r6b.test."));
+            if (ce && held) xfr_entry_release(ce);
+            CHECK(dbreg_snapshot_entry(sn, "default", "r6b.test.") == NULL);      /* (the heap directory does not have it: the reason for dbreg_ctl_entry()) */
+            CHECK(evict_zone("r6b.test."));
+            ce = dbreg_ctl_entry(sn, "default", "r6b.test.", &held);
+            CHECK(ce == NULL && !held);
+            dbreg_info_t inf[2];
+            CHECK(dbreg_find_info("default", "r6b.test.", inf, 2) == 1 && !inf[0].has_entry && inf[0].store_state == 1 && inf[0].source_id == 306);
+            release_zone_snapshot(sn);
+            CHECK(attach_by_worker("r6b.test.", &k) == 1);
+        }
+
+        /* -- L10: a view that shares a zone of the store by in-view reaches it through its ivdb: the lookup of the glue refresh finds the zone (the heap directory's zdir_find_exact() has none of them) */
+        {
+            view_snapshot_t v2;
+            memset(&v2, 0, sizeof(v2));
+            v2.name = (char *)"v2";
+            rcu_aux_read_lock();
+            zone_db_snapshot_t *sn = acquire_zone_snapshot();
+            view_snapshot_t *dv = snapshot_find_view(sn, "default");
+            CHECK(dv != NULL && view_ivdb_alloc(&v2, 1) && view_ivdb_add(&v2, "r6b.test.", dv));
+            CHECK(zdir_find_exact(&v2, "r6b.test.") == NULL);
+            zone_db_entry_t *se = glue_shared_entry(&v2, dv, "r6b.test.");
+            CHECK(se != NULL && strcmp(se->view_name, "default") == 0);
+            CHECK(glue_shared_entry(&v2, dv, "r3.test.") == NULL);              /* (a name the view does not share) */
+            view_ivdb_free(&v2);
+            rcu_aux_read_unlock();
+        }
+
+        /* -- L3: the NOTIFY of a zone whose name server is in a zone of the store that is not in memory: no attach on the control thread; the zone is asked for in the background, and the NOTIFY waits and
+         *    is made again.  A zone that is known without a body gets a request for its body (before: the zone that was stored was attached on the spot, the one that was known was left alone). */
+        g_nsa_n = g_nsf_n = 0;
+        g_query_bg_attach = rec_bg_attach;
+        g_query_bg_fetch = rec_bg_fetch;
+        batch_begin(a[0], &e, 44, KDB_BATCH_DIFF);
+        send_zone(a[0], &e, "sib3.test.", 1, 0, 313);
+        g_zone_ns = "ns1.sib3.test.";
+        send_zone(a[0], &e, "n3.test.", 1, 0, 314);
+        g_zone_ns = NULL;
+        batch_end(a[0], &e, &mainc, 44, 2, 0);
+        CHECK(in_memory("sib3.test.") && in_memory("n3.test."));
+        CHECK(evict_zone("sib3.test.") && stored_only("sib3.test."));
+        {
+            zone_db_snapshot_t *sn = acquire_retained_zone_snapshot();
+            bool held = false;
+            zone_db_entry_t *ne = dbreg_ctl_entry(sn, "default", "n3.test.", &held);
+            CHECK(ne != NULL);
+            CHECK(notify_wait_count(false) == 0);
+            if (ne) send_notify_to_all(ne);
+            CHECK(stored_only("sib3.test."));                                  /* (not attached by the control thread) */
+            CHECK(g_nsa_n == 1 && strcmp(g_nsa_zone, "sib3.test.") == 0 && g_nsf_n == 0);
+            CHECK(notify_wait_count(false) == 1);                             /* (the NOTIFY waits for the zone) */
+            if (ne && held) xfr_entry_release(ne);
+            release_zone_snapshot(sn);
+        }
+        CHECK(attach_by_worker("sib3.test.", &k) == 1);                        /* (a store thread brought it in) */
+        (void)notify_wait_count(true);                                         /* (the wait is over) */
+        {
+            char wv[64], wz[256];
+            CHECK(notify_wait_pop(wv, sizeof(wv), wz, sizeof(wz)) && strcmp(wv, "default") == 0 && strcmp(wz, "n3.test.") == 0);
+            notify_zone_by_name(wv, wz);                                       /* (what the control thread does with it) */
+            CHECK(notify_wait_count(false) == 0 && g_nsa_n == 1);              /* (the address is there: the NOTIFY is made, nothing waits any more) */
+        }
+        /* a name server in a zone that is known and has no body: its body is asked for */
+        {
+            store_meta_t km;
+            memset(&km, 0, sizeof(km));
+            km.source_id = 315;
+            km.source = (uint16_t)store_view_id(st, "default");
+            CHECK(store_set_known(st, (uint16_t)store_view_id(st, "default"), "sib4.test", 9, &km, NULL) == 0);
+            batch_begin(a[0], &e, 45, KDB_BATCH_DIFF);
+            g_zone_ns = "ns1.sib4.test.";
+            send_zone(a[0], &e, "n4.test.", 1, 0, 316);
+            g_zone_ns = NULL;
+            batch_end(a[0], &e, &mainc, 45, 1, 0);
+            zone_db_snapshot_t *sn = acquire_retained_zone_snapshot();
+            bool held = false;
+            zone_db_entry_t *ne = dbreg_ctl_entry(sn, "default", "n4.test.", &held);
+            CHECK(ne != NULL);
+            if (ne) send_notify_to_all(ne);
+            CHECK(g_nsf_n == 1 && strcmp(g_nsf_zone, "sib4.test.") == 0 && notify_wait_count(false) == 1);
+            if (ne && held) xfr_entry_release(ne);
+            release_zone_snapshot(sn);
+            (void)notify_wait_count(true);
+            char wv[64], wz[256];
+            while (notify_wait_pop(wv, sizeof(wv), wz, sizeof(wz))) notify_wait_drop(wv, wz);          /* (the wait ends: a few tries, then the NOTIFY goes with what is known) */
+            CHECK(notify_wait_count(false) == 0);
+        }
+
+        /* -- L4: the zone whose NOTIFY was queued is detached before the control thread looks at it: the zone is asked for and the NOTIFY waits (before: the zone was found, had no entry, and the NOTIFY was dropped) */
+        g_nsa_n = 0;
+        CHECK(evict_zone("n3.test.") && stored_only("n3.test."));
+        notify_zone_by_name("default", "n3.test.");
+        CHECK(g_nsa_n == 1 && strcmp(g_nsa_zone, "n3.test.") == 0 && notify_wait_count(false) == 1);
+        CHECK(attach_by_worker("n3.test.", &k) == 1);
+        (void)notify_wait_count(true);
+        {
+            char wv[64], wz[256];
+            CHECK(notify_wait_pop(wv, sizeof(wv), wz, sizeof(wz)));
+            notify_zone_by_name(wv, wz);
+            CHECK(notify_wait_count(false) == 0);
+        }
+        g_query_bg_attach = no_bg_fetch;
+        g_query_bg_fetch = no_bg_fetch;
+    }
+
+    /* -- L5: a walk of the attach table that sees the table made again starts again, and sees every zone (before: the position was a position in the old table; when the new one is smaller, the zones that were
+     *    not seen yet were never seen: the walk ended at once) */
+    {
+        enum { NFAKE = 300, NBIG = 6000, NGROW = 40000, BASEZID = 4000000 };
+        static zdir_elem_t *fakes[NFAKE + NBIG + NGROW];
+        for (int i = 0; i < NFAKE + NBIG + NGROW; i++) {
+            fakes[i] = calloc(1, sizeof(zdir_elem_t) + 16);
+            fakes[i]->zid = (uint32_t)(BASEZID + i);
+        }
+        for (int i = NFAKE; i < NFAKE + NBIG; i++) CHECK(dbdir()->attach_put(fakes[i]));        /* (the table grows for thousands of zones ...) */
+        for (int i = NFAKE; i < NFAKE + NBIG; i++) dbdir()->attach_remove(fakes[i]);            /* (... and they go: few are left, and the tombstones) */
+        for (int i = 0; i < NFAKE; i++) CHECK(dbdir()->attach_put(fakes[i]));
+        static int seen[NFAKE];
+        memset(seen, 0, sizeof(seen));
+        g_walk_ud.seen = seen;
+        g_walk_ud.nseen = NFAKE;
+        g_walk_ud.base = BASEZID;
+        g_walk_ud.calls = 0;
+        g_walk_ud.grow = fakes + NFAKE + NBIG;
+        g_walk_ud.ngrow = NGROW;
+        g_attach_walk_between = walk_grow_hook;
+        rcu_aux_read_lock();
+        CHECK(attach_walk(walk_fn, walk_reset, &g_walk_ud));
+        rcu_aux_read_unlock();
+        g_attach_walk_between = NULL;
+        int missed = 0;
+        for (int i = 0; i < NFAKE; i++) missed += seen[i] == 0;
+        CHECK(g_walk_ud.grown && g_walk_ud.grew);                          /* (the table did grow in the middle of the walk) */
+        CHECK(missed == 0);
+        for (int i = 0; i < NFAKE + NBIG + NGROW; i++) {
+            dbdir()->attach_remove(fakes[i]);
+            free(fakes[i]);
+        }
+    }
+
+    /* -- L9: a cell of the store that is being written does not make the registry wait: the lookup under the registry's lock never sleeps (before: up to half a second with the lock held) */
+    {
+        dbdir_rec_t rr;
+        CHECK(evict_zone("r6b.test.") && stored_only("r6b.test."));
+        CHECK(dbdir()->rec_get("default", "r6b.test.", &rr));
+        char zcp[700];
+        snprintf(zcp, sizeof(zcp), "%s/zc.1", sdir);
+        int zfd = open(zcp, O_RDWR);
+        CHECK(zfd >= 0);
+        uint32_t odd = 1, even = 0;
+        const off_t cell = (off_t)16384 + (off_t)rr.zid * 64 + 60;           /* (the sequence counter of the cell: odd while a writer is in it) */
+        CHECK(zfd >= 0 && pwrite(zfd, &odd, 4, cell) == 4);
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        dbdir_rec_t r2;
+        CHECK(dbdir()->rec_get_nb("default", "r6b.test.", &r2) == -1);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        CHECK((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < 100);
+        pthread_t zt;
+        g_zv_found = true;
+        CHECK(pthread_create(&zt, NULL, zv_thread, NULL) == 0);
+        usleep(3000);
+        size_t tt, rj, sh;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        dbreg_counts(&tt, &rj, &sh);                                           /* (takes the registry's lock) */
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        const long waited_ms = (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000);
+        CHECK(waited_ms < 100);
+        pthread_join(zt, NULL);
+        CHECK(!g_zv_found);                                                    /* (the cell was busy the whole time: not known, and the lookup gave up) */
+        CHECK(zfd >= 0 && pwrite(zfd, &even, 4, cell) == 4);
+        int64_t zsid;
+        uint32_t zsr;
+        CHECK(dbreg_zone_version("default", "r6b.test.", &zsid, &zsr) && zsid == 306);
+        if (zfd >= 0) close(zfd);
+    }
+
     free(old_copy);
     gc_snapshot_wait_idle();                                                 /* (the reclaim thread that the last delta started: joined, not left to the exit) */
     db_store_stop();
@@ -1284,6 +1563,7 @@ static int count_asked(int lo, int hi) {
     return n;
 }
 
+static bool cursor_unset(store_t *st);
 static int run_proto(int phase, const char *dir) {
     printf("[the store protocol: phase %d]\n", phase);
     char sdir[600];
@@ -1484,14 +1764,14 @@ static int run_proto(int phase, const char *dir) {
             CHECK(store_status_format(kv, sizeof(kv), STORE_FMT_KV, NULL) > 0);
             CHECK(strstr(kv, "store.recon.guard.held_views=1") != NULL && strstr(kv, "store.recon.guard.unlisted=1600") != NULL && strstr(kv, "store.recon.guard.release=\"karictl reload -force\"") != NULL);
         }
-        CHECK(cursor_is(st, 110));                                       /* (not advanced) */
-        /* changes while the guard holds: the cursor stays too */
+        CHECK(cursor_unset(st));                                         /* (not advanced: it is made invalid, so that a restart makes a pass again; L7) */
+        /* changes while the guard holds: the cursor stays unset too */
         p_batch_begin(a[0], &e, 6, KDB_BATCH_AUTO, 0);
         c[0] = (pc_t){ .sid = p_sid(11), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 1, .time = 10 };  pn_name(c[0].name, sizeof(c[0].name), 11);
         p_changes(a[0], &e, 6, 130, true, c, 1);
         p_batch_end(a[0], &e, 6, 1, 0);
         CHECK(p_result(&mainc, &m, 10000));
-        CHECK(cursor_is(st, 110));
+        CHECK(cursor_unset(st));
 
         /* -- F. the operator's `karictl reload -force` is a pass the guard does not hold back */
         uint64_t rid = db_ingest_reload(true, NULL, NULL, true);
@@ -1707,17 +1987,422 @@ done:
     _exit(g_failed ? 1 : 0);
 }
 
+
+/* ---------------------------------------------------------------- the fixes of the review of S3 + S4 (phases 3, 4, 5) */
+/* Phase 3 is a loader of the store protocol on a new store, with the store's writes made to fail where a disk can fail (store_test_write_fault) and the memory of a pass to run out (db_store_test_bits_fail):
+ *   H1  an entry that could not be recorded is not swept as unlisted (and a pass in which one failed keeps no cursor); the same when the bit of a zone could not be set
+ *   M5  a CHANGES delete that the store cannot make is not counted as done (the cursor is not kept) and is made again
+ *   M6  a body that is dropped because the stamp moved asks for the zone again (a fetch that was in flight when the stamp changed)
+ *   M7  a zone of 63 labels or more is found (the depth skip of the lookup), and the depth bound is exact with several threads that put zones and delete them
+ *   L8  the records of the secondary and catalog zones are not counted with the zones of the directory twice
+ *   L11 the reserve of a pass is bounded by what the store holds, not by what the loader claims
+ *   L7  the hold of the mass-delete guard is in the store: the cursor of the view is not valid, so a restart makes a pass
+ * Phase 4 (a legacy loader) makes three zones with three settings texts, and phase 5 is the next start with a settings.dat in which the id of one text cannot be taken (L2): the file is not cut, the ids that
+ * follow are not reused. */
+#define NF 1200                                                         /* zones of the first fill of phase 3 */
+static uint32_t g_fx_zid;
+static const char *g_fx_op;
+static int g_fx_err;
+static int fx_fault(const char *op, uint32_t zid) { return (g_fx_op && strcmp(op, g_fx_op) == 0 && zid == g_fx_zid) ? g_fx_err : 0; }
+
+static void fx_pass(int fd, kdb_enc_t *e, uint64_t batch, int n, const bool *omit, uint64_t cursor, bool complete) {
+    static pz_t page[2048];
+    int k = 0;
+    uint32_t pg = 0;
+    uint64_t total = 0;
+    p_manifest_begin(fd, e, batch, (uint64_t)n, cursor, true);
+    for (int i = 0; i < n; i++) {
+        if (omit && omit[i]) continue;
+        p_zone(&page[k], i);
+        page[k].stamped = true;
+        page[k].gen = g_pserial[i];
+        page[k].time = 10 * g_pserial[i];
+        k++;
+        total++;
+        if (k == 2048) {
+            p_manifest_page(fd, e, batch, pg++, page, k);
+            k = 0;
+        }
+    }
+    if (k) p_manifest_page(fd, e, batch, pg++, page, k);
+    p_manifest_end(fd, e, batch, total, 0, cursor, complete);
+}
+
+/* the cursor is there and is the configuration's hash only: nothing of the loader's (what a hold of the guard leaves) */
+static bool cursor_unset(store_t *st) {
+    bool valid = false;
+    uint64_t cur = 0;
+    uint8_t id[STORE_IDENT_MAX];
+    size_t il = 0;
+    int vid = store_view_id(st, "default");
+    if (vid < 0 || store_get_cursor(st, (uint16_t)vid, &valid, &cur, id, &il) != 0) return false;
+    uint64_t c2;
+    uint8_t i2[STORE_IDENT_MAX];
+    size_t l2 = 0;
+    return valid && il == 8 && !db_recon_cursor_get("default", &c2, i2, &l2);
+}
+
+/* a name of `labels` labels (the last is "test"), the first one `first`; written to out */
+static void fx_deep_name(char *out, size_t cap, int labels, const char *first) {
+    size_t o = (size_t)snprintf(out, cap, "%s.", first);
+    for (int i = 1; i < labels - 1 && o < cap; i++) o += (size_t)snprintf(out + o, cap - o, "a.");
+    if (o < cap) snprintf(out + o, cap - o, "test.");
+}
+
+#define FX_THREADS 4
+#define FX_EACH 60
+static void *fx_put_thread(void *arg) {
+    const int k = (int)(intptr_t)arg;
+    for (int i = 0; i < FX_EACH; i++) {
+        char first[32], name[400];
+        snprintf(first, sizeof(first), "w%di%d", k, i);
+        const int labels = 3 + (i * 7 + k * 11) % 70;                    /* 3..72 labels: the zones of 63 and more among them */
+        fx_deep_name(name, sizeof(name), labels, first);
+        db_recon_entry_t re;
+        memset(&re, 0, sizeof(re));
+        re.source_id = 500000 + k * 1000 + i;
+        re.name = name;
+        re.kind = KDB_ZK_PRIMARY;
+        re.stamped = true;
+        re.gen = 1;
+        re.time = 1;
+        uint32_t zid;
+        (void)db_recon_change("default", &re, &zid);
+        if (i % 3 == 2) (void)db_recon_delete("default", re.source_id - 1, NULL);             /* (the refresh of the bound runs in between) */
+    }
+    return NULL;
+}
+
+static int run_fixes(const char *dir) {
+    printf("[the store protocol: the fixes of the review of S3 + S4 (phase 3)]\n");
+    char sdir[600];
+    snprintf(sdir, sizeof(sdir), "%s/s", dir);
+    static server_config_t cfg;
+    char conf[2048];
+    snprintf(conf, sizeof(conf),
+             "options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; store \"%s\"; store-mode map; "
+             "store-threads 2; }; };\n"
+             "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", sdir);
+    CHECK(parse_named_conf(conf, &cfg) == 0);
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    rebuild_zone_db_from_config(&cfg, false);
+    char msg[400];
+    CHECK(db_store_frontend_open(&cfg.database, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg)) && db_store_dir_fd() >= 0);
+    CHECK(db_store_start(&cfg) && db_store_enabled());
+    store_t *st = db_store_handle();
+    CHECK(st != NULL);
+    int a[2], f[2], cs[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, f) == 0 && socketpair(AF_UNIX, SOCK_SEQPACKET, 0, cs) == 0);
+    int ends[3] = { a[1], f[1], cs[1] };
+    for (int i = 0; i < 3; i++) fcntl(ends[i], F_SETFL, fcntl(ends[i], F_GETFL, 0) | O_NONBLOCK);
+    park_register_worker(0, -1);
+    CHECK(db_ingest_start(a[1], cs[1], f[1]));
+    static ch_t mainc, fetchc;
+    ch_init(&mainc, a[0], KDB_FROM_BACKEND);
+    ch_init(&fetchc, f[0], KDB_FROM_BACKEND);
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    kdb_msg_t m;
+    memset(&g_wctx, 0, sizeof(g_wctx));
+    g_query_bg_fetch = no_bg_fetch;
+    g_query_bg_attach = no_bg_fetch;
+    for (int i = 0; i < PN + 16; i++) g_pserial[i] = 1;
+    kdb_enc_begin(&e, KDB_T_HELLO);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, KDB_FEAT_STORE);
+    kdb_enc_end(&e);
+    ch_send(a[0], &e);
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG && m.u.config.store_proto);
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_DEBUG);
+    const int vid = store_view_id(st, "default");
+    CHECK(vid >= 0);
+    static bool omit[PN + 16];
+    memset(omit, 0, sizeof(omit));
+    store_zone_t z;
+    store_test_write_fault = fx_fault;
+
+    /* -- a first fill */
+    p_batch_begin(a[0], &e, 1, KDB_BATCH_STARTUP, 0);
+    fx_pass(a[0], &e, 1, NF, NULL, 100, true);
+    p_batch_end(a[0], &e, 1, NF, 0);
+    CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.n_applied == NF);
+    (void)serve_fetches(&fetchc, f[0], &e, 1500, -1, -1);
+    CHECK(wait_stored(st, NF, 30000));
+    CHECK(cursor_is(st, 100));
+
+    /* -- H1: a zone whose new stamp could not be recorded (the disk is full) is listed by the database: it is not swept, with the zone the database no longer lists in the same pass, and the pass keeps no
+     *    cursor.  (Before: the entry did not set the bit of its zone, and the sweep deleted it.) */
+    g_pserial[3] = 2;
+    CHECK(zrec(st, "m0003.test", &z));
+    g_fx_zid = z.zid;
+    g_fx_op = "set_stamp";
+    g_fx_err = -ENOSPC;
+    omit[1100] = true;
+    p_batch_begin(a[0], &e, 2, KDB_BATCH_AUTO, 0);
+    fx_pass(a[0], &e, 2, NF, omit, 200, true);
+    p_batch_end(a[0], &e, 2, NF - 1, 0);
+    CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.n_rejected == 1 && m.u.batch_result.n_deleted == 0);
+    CHECK(zrec(st, "m0003.test", &z) && z.state == STORE_STATE_STORED && z.stamp_gen == 1 && z.serial == 1);       /* (kept as it was) */
+    CHECK(zrec(st, "m1100.test", &z));                                  /* (the database does not list it, and nothing was swept) */
+    CHECK(zones_now(st) == NF && cursor_is(st, 100));
+    g_fx_op = NULL;
+    p_batch_begin(a[0], &e, 3, KDB_BATCH_AUTO, 0);                     /* (the next pass: the disk has room) */
+    fx_pass(a[0], &e, 3, NF, omit, 300, true);
+    p_batch_end(a[0], &e, 3, NF - 1, 0);
+    CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.n_rejected == 0);
+    (void)serve_fetches(&fetchc, f[0], &e, 1000, -1, -1);
+    CHECK(wait_stored(st, NF - 1, 30000));
+    CHECK(!zrec(st, "m1100.test", &z) && zrec(st, "m0003.test", &z) && z.serial == 2 && z.stamp_gen == 2 && cursor_is(st, 300));
+
+    /* -- H1: the bit of a zone that the pass lists cannot be set (no memory): the same, nothing is swept */
+    omit[1101] = true;
+    db_store_test_bits_fail = 4;
+    p_batch_begin(a[0], &e, 4, KDB_BATCH_AUTO, 0);
+    fx_pass(a[0], &e, 4, NF, omit, 400, true);
+    p_batch_end(a[0], &e, 4, NF - 2, 0);
+    CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.n_deleted == 0);
+    CHECK(zrec(st, "m1101.test", &z) && zones_now(st) == NF - 1 && cursor_is(st, 300));
+    db_store_test_bits_fail = 0;
+    p_batch_begin(a[0], &e, 5, KDB_BATCH_AUTO, 0);
+    fx_pass(a[0], &e, 5, NF, omit, 500, true);
+    p_batch_end(a[0], &e, 5, NF - 2, 0);
+    CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.n_deleted == 1);
+    CHECK(!zrec(st, "m1101.test", &z) && cursor_is(st, 500));
+
+    /* -- M5: the store cannot delete a zone the change log deletes: not counted as done, the zone stays, the cursor is not kept; the same delete later works.  (Before: counted, the cursor saved, the record
+     *    survived and came back after a restart.) */
+    CHECK(zrec(st, "m0005.test", &z));
+    g_fx_zid = z.zid;
+    g_fx_op = "delete";
+    g_fx_err = -EIO;
+    {
+        pc_t c[1];
+        memset(c, 0, sizeof(c));
+        c[0] = (pc_t){ .sid = p_sid(5), .op = KDB_CH_DELETE, .has_name = true };
+        pn_name(c[0].name, sizeof(c[0].name), 5);
+        p_batch_begin(a[0], &e, 6, KDB_BATCH_AUTO, 0);
+        p_changes(a[0], &e, 6, 600, true, c, 1);
+        p_batch_end(a[0], &e, 6, 0, 1);
+        CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.n_deleted == 0 && m.u.batch_result.n_rejected == 1);
+        CHECK(zrec(st, "m0005.test", &z) && cursor_is(st, 500));
+        g_fx_op = NULL;
+        p_batch_begin(a[0], &e, 7, KDB_BATCH_AUTO, 0);
+        p_changes(a[0], &e, 7, 610, true, c, 1);
+        p_batch_end(a[0], &e, 7, 0, 1);
+        CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.n_deleted == 1);
+        CHECK(!zrec(st, "m0005.test", &z) && cursor_is(st, 610));
+    }
+
+    /* -- M6: a fetch of a zone is in flight when the database changes the zone again; the body that arrives is for the old stamp and is dropped, and the zone is asked for again.  (Before: nothing asked
+     *    again, the record stayed wanted for ever.) */
+    {
+        pc_t c[1];
+        memset(c, 0, sizeof(c));
+        c[0] = (pc_t){ .sid = p_sid(1300), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 1, .time = 10 };
+        pn_name(c[0].name, sizeof(c[0].name), 1300);
+        g_pserial[1300] = 1;
+        p_batch_begin(a[0], &e, 8, KDB_BATCH_AUTO, 0);
+        p_changes(a[0], &e, 8, 620, true, c, 1);
+        p_batch_end(a[0], &e, 8, 1, 0);
+        CHECK(p_result(&mainc, &m, 10000));
+        CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "m1300.test.") == 0);
+        const uint64_t rid = m.u.fetch_req.request_id;
+        c[0].gen = 2;
+        c[0].time = 20;
+        p_batch_begin(a[0], &e, 9, KDB_BATCH_AUTO, 0);
+        p_changes(a[0], &e, 9, 630, true, c, 1);
+        p_batch_end(a[0], &e, 9, 1, 0);
+        CHECK(p_result(&mainc, &m, 10000));
+        send_zone(f[0], &e, "m1300.test.", 1, rid, p_sid(1300));         /* (the body of the first stamp) */
+        CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "m1300.test.") == 0);
+        send_zone(f[0], &e, "m1300.test.", 2, m.u.fetch_req.request_id, p_sid(1300));
+        CHECK(wait_stored(st, NF - 2, 30000));
+        CHECK(zrec(st, "m1300.test", &z) && z.state == STORE_STATE_STORED && z.serial == 2 && z.stamp_gen == 2 && !(z.flags & STORE_F_STALE));
+    }
+
+    /* -- L8: the record of a secondary zone is the memory of a zone of the heap directory: not a zone of the directory's total */
+    {
+        pc_t c[1];
+        memset(c, 0, sizeof(c));
+        c[0] = (pc_t){ .sid = 9001, .op = KDB_CH_UPSERT, .has_name = true, .kind = KDB_ZK_SECONDARY, .stamped = true, .gen = 1, .time = 5 };
+        snprintf(c[0].name, sizeof(c[0].name), "sec1.test.");
+        p_batch_begin(a[0], &e, 10, KDB_BATCH_AUTO, 0);
+        p_changes(a[0], &e, 10, 640, true, c, 1);
+        p_batch_end(a[0], &e, 10, 1, 0);
+        CHECK(p_result(&mainc, &m, 10000));
+        (void)serve_fetches(&fetchc, f[0], &e, 800, -1, -1);
+        store_stats_t ss;
+        store_stats(st, &ss);
+        CHECK(ss.zones_nonstore == 1 && ss.zones_known + ss.zones_stored == (uint64_t)NF - 2 + 1);
+        CHECK(dbdir()->counters(0) == (uint64_t)NF - 2);             /* (the secondary's record is not in it) */
+    }
+
+    /* -- M7: a zone of 63 labels and more is found; the bound is exact when threads put and delete zones */
+    {
+        pc_t c[1];
+        memset(c, 0, sizeof(c));
+        c[0] = (pc_t){ .sid = 700001, .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 1, .time = 10 };
+        fx_deep_name(c[0].name, sizeof(c[0].name), 70, "deep");
+        char deepcopy[400];
+        snprintf(deepcopy, sizeof(deepcopy), "%s", c[0].name);
+        p_batch_begin(a[0], &e, 11, KDB_BATCH_AUTO, 0);
+        p_changes(a[0], &e, 11, 650, true, c, 1);
+        p_batch_end(a[0], &e, 11, 1, 0);
+        CHECK(p_result(&mainc, &m, 10000));
+        CHECK(dbdir()->depth_max(vid) == 63);
+        zref_t zr;
+        CHECK(zref_of(deepcopy, &zr) && zr.zid != ZREF_NOZID);             /* (before: the depth skip hid it until a restart) */
+        (void)serve_fetches(&fetchc, f[0], &e, 800, -1, -1);
+        pthread_t th[FX_THREADS];
+        for (int k = 0; k < FX_THREADS; k++) CHECK(pthread_create(&th[k], NULL, fx_put_thread, (void *)(intptr_t)k) == 0);
+        for (int k = 0; k < FX_THREADS; k++) pthread_join(th[k], NULL);
+        CHECK(dbdir()->depth_max(vid) == store_view_depth_max(st, (uint16_t)vid));
+        CHECK(dbdir()->depth_max(vid) == 63);
+        (void)serve_fetches(&fetchc, f[0], &e, 1500, -1, -1);
+    }
+
+    /* -- L11: a loader that claims four million zones makes the store reserve what it can hold plus a million, not four million records */
+    {
+        char why[200];
+        store_stats_t s1;
+        CHECK(db_recon_begin("default", 4000000, false, why, sizeof(why)));
+        store_stats(st, &s1);
+        CHECK(s1.zt_capacity < 3000000);
+        db_recon_abort();
+    }
+
+    /* -- L7: the guard holds a pass that lists 100 of the zones; the hold is in the store (the cursor of the view is not valid), and nothing is deleted.  (Before: the old cursor stayed, and a restart read
+     *    only the changes after it and never made the pass that finds the same again.) */
+    {
+        const uint64_t before = zones_now(st);
+        memset(omit, 0, sizeof(omit));
+        for (int i = 100; i < NF; i++) omit[i] = true;
+        omit[5] = true;                                                  /* (deleted above) */
+        p_batch_begin(a[0], &e, 12, KDB_BATCH_FULL, 0);
+        fx_pass(a[0], &e, 12, NF, omit, 700, true);
+        p_batch_end(a[0], &e, 12, 99, 0);
+        CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.n_deleted == 0);
+        CHECK(zones_now(st) == before);
+        db_recon_status_t rs;
+        db_recon_status(&rs);
+        CHECK(rs.guard_views == 1);
+        CHECK(cursor_unset(st));
+    }
+    store_test_write_fault = NULL;
+    db_store_batch_end();
+    printf("%d checks, %d failed\n", g_checks, g_failed);
+    fflush(stdout);
+    _exit(g_failed ? 1 : 0);
+}
+
+/* phase 4: a legacy loader (no store protocol) installs three zones with three settings texts; the process ends without a clean stop.  Phase 5: the next start, with the second record of settings.dat made
+ * unusable by the test (no room for its id): the file is not cut, the ids of the others are what they were, and a new text gets the next id */
+static int run_settings(int phase, const char *dir) {
+    printf("[the settings of the zones are kept by id: phase %d]\n", phase);
+    char sdir[600], sizefile[700];
+    snprintf(sdir, sizeof(sdir), "%s/s", dir);
+    snprintf(sizefile, sizeof(sizefile), "%s/settings.size", dir);
+    static server_config_t cfg;
+    char conf[2048];
+    snprintf(conf, sizeof(conf),
+             "options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; store \"%s\"; store-mode map; "
+             "store-threads 2; }; };\n"
+             "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", sdir);
+    CHECK(parse_named_conf(conf, &cfg) == 0);
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    rebuild_zone_db_from_config(&cfg, false);
+    char msg[400];
+    CHECK(db_store_frontend_open(&cfg.database, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg)) && db_store_dir_fd() >= 0);
+    if (phase == 5) db_store_test_set_fail = 2;                         /* (the second record of settings.dat has no room for its id) */
+    CHECK(db_store_start(&cfg) && db_store_enabled());
+    db_store_test_set_fail = 0;
+    struct stat sb;
+    char setfile[700];
+    snprintf(setfile, sizeof(setfile), "%s/settings.dat", sdir);
+    long long size_at_start = stat(setfile, &sb) == 0 ? (long long)sb.st_size : -1;      /* (what the start made of the file, before this run adds a text) */
+    int a[2], f[2], cs[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, f) == 0 && socketpair(AF_UNIX, SOCK_SEQPACKET, 0, cs) == 0);
+    int ends[3] = { a[1], f[1], cs[1] };
+    for (int i = 0; i < 3; i++) fcntl(ends[i], F_SETFL, fcntl(ends[i], F_GETFL, 0) | O_NONBLOCK);
+    park_register_worker(0, -1);
+    CHECK(db_ingest_start(a[1], cs[1], f[1]));
+    static ch_t mainc, fetchc;
+    ch_init(&mainc, a[0], KDB_FROM_BACKEND);
+    ch_init(&fetchc, f[0], KDB_FROM_BACKEND);
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    kdb_msg_t m;
+    kdb_enc_begin(&e, KDB_T_HELLO);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242);
+    kdb_enc_end(&e);
+    ch_send(a[0], &e);
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG);
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_DEBUG);
+    const int first = phase == 4 ? 1 : 4;                               /* the texts of this run: 1..3 in phase 4, a fourth in phase 5 */
+    const int count = phase == 4 ? 3 : 1;
+    batch_begin(a[0], &e, 1, KDB_BATCH_STARTUP);
+    for (int i = first; i < first + count; i++) {
+        char zn[32], stext[96];
+        snprintf(zn, sizeof(zn), "set%d.test.", i);
+        snprintf(stext, sizeof(stext), "allow-transfer { 127.0.0.%d; };", i);
+        uint8_t dig[KDB_DIGEST_LEN];
+        memset(dig, 9, sizeof(dig));
+        kdb_enc_begin(&e, KDB_T_ZONE_BEGIN);
+        kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, zn); kdb_enc_i64(&e, 3, 700 + i); kdb_enc_u8(&e, 4, KDB_ZK_PRIMARY);
+        kdb_enc_u32(&e, 5, 1); kdb_enc_u32(&e, 6, 0); kdb_enc_u64(&e, 7, 4); kdb_enc_bytes(&e, 8, dig, sizeof(dig));
+        kdb_enc_str(&e, 9, stext);
+        kdb_enc_end(&e);
+        uint8_t zm[2048];
+        size_t zn_len = zone_message(zm, zn, 1);
+        kdb_enc_raw_msg(&e, KDB_T_ZONE_DATA, zm, zn_len);
+        kdb_enc_begin(&e, KDB_T_ZONE_END);
+        kdb_enc_u64(&e, 1, 4);
+        kdb_enc_end(&e);
+        ch_send(a[0], &e);
+    }
+    batch_end(a[0], &e, &mainc, 1, (uint32_t)count, 0);
+    dbdir_rec_t rec;
+    if (phase == 4) {
+        for (int i = 1; i <= 3; i++) {
+            char zn[32];
+            snprintf(zn, sizeof(zn), "set%d.test.", i);
+            CHECK(dbdir()->rec_get("default", zn, &rec) && rec.settings == (uint32_t)i);
+        }
+        CHECK(stat(setfile, &sb) == 0);
+        FILE *sf = fopen(sizefile, "w");
+        CHECK(sf != NULL);
+        if (sf) {
+            fprintf(sf, "%lld\n", (long long)sb.st_size);
+            fclose(sf);
+        }
+    } else {
+        long long want = -1;
+        FILE *sf = fopen(sizefile, "r");
+        if (sf) {
+            if (fscanf(sf, "%lld", &want) != 1) want = -1;
+            fclose(sf);
+        }
+        CHECK(want > 0 && size_at_start == want);                           /* (not cut) */
+        CHECK(dbdir()->settings(1) != NULL && dbdir()->settings(2) == NULL && dbdir()->settings(3) != NULL);      /* (the id that could not be taken is unused, the ones after it are what they were) */
+        CHECK(dbdir()->rec_get("default", "set4.test.", &rec) && rec.settings == 4);             /* (the new text gets the next id: 3 was not given to it) */
+        CHECK(dbdir()->rec_get("default", "set3.test.", &rec) && rec.settings == 3 && dbdir()->settings(3)->ext.allow_transfer_count == 1);
+    }
+    db_store_batch_end();
+    printf("%d checks, %d failed\n", g_checks, g_failed);
+    fflush(stdout);
+    _exit(g_failed ? 1 : 0);
+}
+
 static int proto_main(const char *self) {
     char dir[600];
     const char *tmp = getenv("TMPDIR");
     snprintf(dir, sizeof(dir), "%s/test_db_store_proto.XXXXXX", tmp && *tmp ? tmp : "/tmp");
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
     int bad = 0;
-    for (int phase = 0; phase < 3; phase++) {
+    for (int phase = 0; phase < 6; phase++) {
         char cmd[900];
         snprintf(cmd, sizeof(cmd), "%s proto%d %s", self, phase, dir);
         if (system(cmd) != 0) bad++;
-        if (phase == 0) {                                                /* (phase 0 is the legacy loader on an empty store: the next phases start on a new one) */
+        if (phase == 0 || phase == 2 || phase == 3) {                    /* (phase 0 is the legacy loader on an empty store, phase 3 the fixes of the review, phase 4 the settings: the next phases start on a new store; phase 5 follows phase 4 on its store) */
             char rm[700];
             snprintf(rm, sizeof(rm), "rm -rf %s/s", dir);
             (void)!system(rm);
@@ -1787,6 +2472,8 @@ static int lock_tests(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '3') return run_fixes(argv[2]);
+    if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && (argv[1][5] == '4' || argv[1][5] == '5')) return run_settings(argv[1][5] - '0', argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] >= '0' && argv[1][5] <= '2') return run_proto(argv[1][5] - '0', argv[2]);
     if (argc > 1) return run_mode(strcmp(argv[1], "copy") == 0 ? "copy" : "map");
     if (lock_tests() != 0 || g_failed) { printf("%d checks, %d failed\n", g_checks, g_failed); return 1; }

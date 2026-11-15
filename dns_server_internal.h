@@ -807,6 +807,11 @@ static inline uint8_t zref_state(const zref_t *z) {
 static inline uint32_t zref_serial(const zref_t *z) { return z->el ? atomic_load_explicit(&z->el->serial, memory_order_relaxed) : z->serial; }
 /* the settings (allow-query, allow-transfer ...) of a zone that is not in memory: the element's, or the interned block of the store's settings id; NULL: none.  Read section only. */
 zone_ext_shared_t *zref_settings(const zref_t *z);
+/* a walk of the attach table in a read section that starts again when the table grows (fn returns false: stop, the walk returns false) */
+bool attach_walk(bool (*fn)(zdir_elem_t *el, void *ud), void (*reset)(void *ud), void *ud);
+#ifdef KARIDNS_UNIT_TEST
+extern void (*g_attach_walk_between)(void);
+#endif
 
 /* What dns_db_store.c installs when the store is the directory (g_dbdir; NULL: no store, everything above is the heap directory only and the registry works as before 0.7).  All of it
  * is called by the registry and the lookup, which cannot link the store (the unit tests of the engine do not). */
@@ -827,10 +832,12 @@ typedef struct dbdir_ops {
   zone_ext_shared_t *(*settings)(uint32_t id);                               /* the interned settings of a store settings id (not referenced) */
   uint32_t (*settings_id)(zone_ext_shared_t *sh);                            /* the id of settings (assigned and made durable when it has none); 0 = none */
   bool (*rec_get)(const char *view, const char *zone, dbdir_rec_t *out);     /* the store's record of a zone (the name with its trailing dot) */
+  int (*rec_get_nb)(const char *view, const char *zone, dbdir_rec_t *out);   /* the same without ever sleeping (for a caller that holds the registry lock): 1 found, 0 none, -1 a cell was being written (not known now) */
   int (*put)(const char *view, const char *zone, zone_db_entry_t *entry, int64_t source_id, uint32_t serial, const uint8_t digest[32], uint32_t settings, uint32_t *zid);
   int (*del)(const char *view, const char *zone, int64_t source_id, bool *had);   /* delete by name (when source_id is 0 or the record's) */
   void (*set_known)(uint32_t zid);                                           /* the record loses its image (damaged, or the version is not trusted) */
   void (*note_flags)(uint32_t zid, uint16_t set, uint16_t clear);
+  bool (*attach_reserve)(void);                                              /* room for one more element in the attach table (the registry lock is held): done before the registry changes anything, so that attach_put() cannot fail then */
   bool (*attach_put)(zdir_elem_t *el);                                       /* the attach table: the registry lock is held (all three) */
   void (*attach_remove)(const zdir_elem_t *el);
   size_t (*attach_count)(void);
@@ -1232,7 +1239,7 @@ uint64_t zone_bytes_underflows(void);                             /* times a byt
  * version; without one only the error is recorded).  false: out of memory. */
 bool dbreg_reject(const char *view, const char *name, int64_t source_id, const char *reason);
 /* ZONE_DELETE: forget the zone; its entry leaves the view snapshot with the next snapshot_apply_db_delta().  1:
- * removed, 0: not registered or registered with another source id (nothing done). */
+ * removed, 0: not registered or registered with another source id (nothing done), -1: the store could not delete the zone's record (the zone stays). */
 int dbreg_delete(const char *view, const char *name, int64_t source_id);
 /* Publish the queued additions and removals (beta design 4.4, D1a): the directory of each view is changed in place, element by
  * element (no copy of the index unless it has to grow), and a new snapshot that shares the directories is published; what left
@@ -1271,6 +1278,7 @@ typedef struct {
   uint32_t serial;             /* the serial of the version served (0 without an entry) */
   uint32_t refresh;            /* SOA refresh of that version */
   bool has_entry;              /* a version was installed */
+  uint8_t store_state;         /* 0.7: the zone has no registry element and the zone store holds it: 1 stored (an image), 2 known (no body yet); 0 otherwise */
   bool shadowed;
   uint8_t shadow_by;           /* DBREG_SH_* */
   uint8_t last_result;         /* DBREG_APPLIED / DBREG_REJECTED: the last version offered */
@@ -1280,6 +1288,9 @@ typedef struct {
 /* The registry records of the zone `name` (any case, with or without the trailing dot) in the view `view` (NULL: every
  * view), at most max of them copied to out.  Returns how many there are. */
 int dbreg_find_info(const char *view, const char *name, dbreg_info_t *out, int max);
+/* The entry of a database zone for a control command (karictl notify, rollback, zonestatus), found in the snapshot of the command.  A zone of the heap directory is kept alive by the snapshot; a zone of the zone
+ * store that is in memory is not (the attach table reaches it), so it is held here: *held says that the caller gives it back with xfr_entry_release().  NULL: the zone is not in memory, or it is hidden. */
+zone_db_entry_t *dbreg_ctl_entry(zone_db_snapshot_t *snap, const char *view, const char *name, bool *held);
 /* D1a step 5: the cache manager (memory-limit of database { }).  dbreg_cache_round() takes zones out of memory when the database zones hold more
  * than the high mark of the limit; the ingest thread's cache thread calls it every 100 ms. */
 typedef struct {
