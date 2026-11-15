@@ -10,6 +10,10 @@
 # Usage:
 #   llvm-cov export ... -format=text -summary-only | perl tests/coverage_gate.pl [options]
 #   perl tests/coverage_gate.pl --profdata=coverage.profdata [options]
+#
+# The binaries the summary is made from are COV_BIN_OBJS of the Makefile, the list make coverage-report gives llvm-cov: --objects="$(COV_BIN_OBJS)",
+# or, without --objects, what `make -s print-cov-bin-objs` prints.  The gate kept a list of its own before, which lost six unit tests and
+# karidns-tapstat: one list, so that the gate and the report count the same binaries.
 # ==============================================================================
 
 use strict;
@@ -24,10 +28,12 @@ my $phase = 1;
 my $strict = 0;
 my $help = 0;
 my $json_file = "";
+my $objects = "";
 
 GetOptions(
     "profdata=s" => \$profdata,
     "target=s"   => \$target,
+    "objects=s"  => \$objects,
     "llvm-cov=s" => \$llvm_cov,
     "phase=i"    => \$phase,
     "strict"     => \$strict,
@@ -36,7 +42,7 @@ GetOptions(
 ) or die "Error in command line arguments\n";
 
 if ($help) {
-    print "Usage: $0 [--profdata=FILE] [--json=FILE] [--phase=1|2] [--strict]\n";
+    print "Usage: $0 [--profdata=FILE] [--json=FILE] [--objects=\"\$(COV_BIN_OBJS)\"] [--phase=1|2] [--strict]\n";
     exit 0;
 }
 
@@ -102,16 +108,21 @@ if ($json_file && -f $json_file) {
     $json_text = do { local $/; <STDIN> };
 }
 if ($json_text eq "") {
-    # Generate on the fly using llvm-cov
-    my @objs = ();
-    for my $obj (qw(dag karictl karicheck karicheck-codelog test_coverage_sweep_tools-codelog test_dns_diag test_mem_advice test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_zone_image test_dag_format test_dag_iter test_dag_reassembly test_query_engine_protocol test_hash_table test_epoch_rcu test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_pgsql test_db_sqlite3 test_db_stream test_db_registry test_pdns_reader test_presigned test_zone_text test_zone_import test_db_supervisor test_plugin_msg karidns-dbloader karidns-zone)) {
-        push @objs, "-object=./$obj" if -x "./$obj";
+    # Generate on the fly using llvm-cov, from the binaries of COV_BIN_OBJS (see the head of this file)
+    if ($objects eq "") {
+        $objects = `make -s print-cov-bin-objs 2>/dev/null`;
+        die "Error: no list of binaries: give --objects=\"\$(COV_BIN_OBJS)\" (make -s print-cov-bin-objs printed nothing)\n" if $? != 0;
     }
-    if (-d "coverage_fuzz") {
-        for my $fobj (glob "coverage_fuzz/fuzz_*") {
-            push @objs, "-object=$fobj" if -x $fobj;
-        }
+    my (@objs, @missing, %seen);
+    for my $tok (split ' ', $objects) {
+        $tok =~ /^-object=(.+)$/ or die "Error: --objects: '$tok' is not -object=FILE (COV_BIN_OBJS of the Makefile)\n";
+        my $obj = $1;
+        next if $seen{$obj}++;
+        if (-x $obj) { push @objs, "-object=$obj"; } else { push @missing, $obj; }
     }
+    die "Error: none of the binaries of COV_BIN_OBJS is built (" . scalar(@missing) . " listed)\n" unless @objs;
+    # a binary that is not built (a build without the fuzzers, without libpq) adds nothing; it is named, not silently left out
+    print "  [gate] " . scalar(@objs) . " binaries; not built, left out: " . join(" ", @missing) . "\n" if @missing;
     my $obj_str = join(" ", @objs);
     my $cmd = "$llvm_cov export $target $obj_str -instr-profile=$profdata -summary-only -ignore-filename-regex=\"tests/|scratch/|old_patches/|third_party/\"";
     $export_cmd = $cmd;

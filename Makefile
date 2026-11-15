@@ -1405,7 +1405,7 @@ COV_BIN_OBJS += -object=test_rrl_engine -object=test_query_engine_expanded -obje
 COV_BIN_OBJS += -object=test_catalog_zone_engine -object=test_snapshot_sandbox_engine -object=test_dag_tools -object=test_server_core
 COV_BIN_OBJS += -object=test_fi_parsers -object=test_fi_wire -object=test_fi_snapshot -object=test_fi_xfr -object=test_fi_misc -object=test_fi_dag
 COV_BIN_OBJS += -object=karicheck-codelog -object=test_coverage_sweep_tools-codelog -object=test_coverage_sweep -object=test_coverage_sweep_dag -object=test_coverage_sweep_net -object=test_coverage_sweep_tools
-COV_BIN_OBJS += -object=test_db_stream -object=test_db_registry -object=test_zone_dir -object=test_park -object=test_db_fetch -object=test_park_worker -object=test_pdns_reader -object=test_presigned -object=test_zone_text -object=test_zone_import -object=test_db_supervisor -object=test_plugin_msg test_plugin_msg
+COV_BIN_OBJS += -object=test_db_stream -object=test_db_registry -object=test_zone_dir -object=test_park -object=test_db_fetch -object=test_park_worker -object=test_pdns_reader -object=test_presigned -object=test_zone_text -object=test_zone_import -object=test_db_supervisor -object=test_plugin_msg
 COV_PG_OBJ != [ -n "$(DBPG_HAVE)" ] && printf -- '-object=test_db_pgsql' || true
 COV_BIN_OBJS += $(COV_PG_OBJ)
 # B11c: the loader itself (karidns_dbloader.c, with the drivers the build host has) and the SQLite3 driver / loader unit test
@@ -1477,7 +1477,7 @@ coverage-report:
 	$(LLVM_COV) report $(TARGET) $(COV_BIN_OBJS) -instr-profile=$(COV_DATA) -ignore-filename-regex="tests/|scratch/|old_patches/|third_party/"
 	@echo ""
 	@echo "Full HTML coverage report available at: $(COV_HTML_DIR)/index.html"
-	@if [ -f tests/coverage_gate.pl ]; then perl tests/coverage_gate.pl --llvm-cov=$(LLVM_COV) --profdata=$(COV_DATA) || true; fi
+	@if [ -f tests/coverage_gate.pl ]; then perl tests/coverage_gate.pl --llvm-cov=$(LLVM_COV) --profdata=$(COV_DATA) --objects="$(COV_BIN_OBJS)" || true; fi
 
 # The suite result of coverage-run: success only with failed=0.  It runs after the report, so that a failing test still leaves the
 # coverage numbers (coverage-run keeps going past failing tests for that reason).
@@ -1489,6 +1489,10 @@ coverage-suite-check:
 
 # The same for a sharded run: the status files of all parts in $(COV_SHARD_DIR) (*.status): every part 1..N there once, every selected test run
 # once (the totals add up to selected=), failed=0 in every part (tests/coverage_shards_check.sh)
+# The list of the binaries of the coverage report, for tests/coverage_gate.pl (which runs it when it is not given --objects): one list for both
+print-cov-bin-objs:
+	@echo $(COV_BIN_OBJS)
+
 coverage-suite-check-shards:
 	@sh tests/coverage_shards_check.sh $(COV_SHARD_DIR)
 
@@ -1890,6 +1894,6 @@ karidns-tapstat-asan: $(TAPSTAT_ASAN_SRCS)
 tools-asan: karicheck-asan dag-asan karictl-asan karidns-tapstat-asan
 
 # review Makefile [19]: targets that are no files (aliases, test runners, coverage steps)
-.PHONY: acl_match_test mem_advice_test asan_test axfr_ixfr_test bind_ecs_subnet_test catalog_zone_test cidr_test config_directives_test coverage coverage-build coverage-clean coverage-fuzz coverage-fuzz-build coverage-fuzz-run coverage-report coverage-run coverage-shard-merge coverage-merge-shards coverage-suite-check coverage-suite-check-shards coverage_sweep_dag_test coverage_sweep_net_test coverage_sweep_test coverage_sweep_tools_test dag_format_test dag_iter_test dag_reassembly_test dag_tools_test db_fetch_test db_registry_test db_stream_test db_supervisor_test plugin_msg_test dns_diag_test dnssec_proofs_test dnstap_test dynamic_update_test edns_ecs_test epoch_rcu_test evict extended_axfr_test fi_dag_test fi_misc_test fi_parsers_test fi_snapshot_test fi_wire_test fi_xfr_test fuzz_all fuzz_conf fuzz_dag_all fuzz_dag_axfr_stream fuzz_dag_batch_file fuzz_dag_chunked_http fuzz_dag_cli_args fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_rdata_yaml fuzz_dag_replay_diff fuzz_dag_replay_pcap_reader fuzz_dag_tcp_reassembly fuzz_dag_test fuzz_karidns fuzz_karidns_test fuzz_test fuzz_zone hash_test include_test karicheck_matrix_test listen_on_test park_test park_worker_test pdns_reader_test presigned_test qe_protocol_test query_expanded_test rfc_vectors_test rrl_test server_core_test server_stmt_test sig0_sign_test snapshot_rebuild_test snapshot_sandbox_test sweep-tests test test-all tinydns_location_test tinydns_paths_test tinydns_test tinydns_timestamp_test unit-test-bins unit-tests unit-tests-asan unit-tests-portable unit-tests-portable-asan vulnerability_test wire_helpers_test xfr_opts_test zone_dir_test zone_image_test zone_import_test zone_parser_paths_test zone_text_test tapstat_test karidns-tapstat-asan
+.PHONY: acl_match_test mem_advice_test asan_test axfr_ixfr_test bind_ecs_subnet_test catalog_zone_test cidr_test config_directives_test coverage coverage-build coverage-clean coverage-fuzz coverage-fuzz-build coverage-fuzz-run coverage-report coverage-run coverage-shard-merge coverage-merge-shards coverage-suite-check coverage-suite-check-shards print-cov-bin-objs coverage_sweep_dag_test coverage_sweep_net_test coverage_sweep_test coverage_sweep_tools_test dag_format_test dag_iter_test dag_reassembly_test dag_tools_test db_fetch_test db_registry_test db_stream_test db_supervisor_test plugin_msg_test dns_diag_test dnssec_proofs_test dnstap_test dynamic_update_test edns_ecs_test epoch_rcu_test evict extended_axfr_test fi_dag_test fi_misc_test fi_parsers_test fi_snapshot_test fi_wire_test fi_xfr_test fuzz_all fuzz_conf fuzz_dag_all fuzz_dag_axfr_stream fuzz_dag_batch_file fuzz_dag_chunked_http fuzz_dag_cli_args fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_rdata_yaml fuzz_dag_replay_diff fuzz_dag_replay_pcap_reader fuzz_dag_tcp_reassembly fuzz_dag_test fuzz_karidns fuzz_karidns_test fuzz_test fuzz_zone hash_test include_test karicheck_matrix_test listen_on_test park_test park_worker_test pdns_reader_test presigned_test qe_protocol_test query_expanded_test rfc_vectors_test rrl_test server_core_test server_stmt_test sig0_sign_test snapshot_rebuild_test snapshot_sandbox_test sweep-tests test test-all tinydns_location_test tinydns_paths_test tinydns_test tinydns_timestamp_test unit-test-bins unit-tests unit-tests-asan unit-tests-portable unit-tests-portable-asan vulnerability_test wire_helpers_test xfr_opts_test zone_dir_test zone_image_test zone_import_test zone_parser_paths_test zone_text_test tapstat_test karidns-tapstat-asan
 # review Makefile [2]: the test objects of the DB / ACL tests were missing, so they survived a header edit
 $(TEST_PRESIGNED_SRCS:.c=.uta.o) $(TEST_PDNS_READER_SRCS:.c=.uta.o) $(TEST_DB_SUPERVISOR_SRCS:.c=.uta.o) $(TEST_DB_SQLITE3_SRCS:.c=.uta.o) $(TEST_DB_REGISTRY_SRCS:.c=.uta.o) $(TEST_ACLM_SRCS:.c=.utn.o) $(TEST_LISTEN_SRCS:.c=.utn.o) : $(PROJECT_HDRS)
