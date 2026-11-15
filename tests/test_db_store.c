@@ -4380,7 +4380,7 @@ static int lock_tests(void) {
         bool dflt = false;
         CHECK(db_store_dir_of(&d0, &dflt) != NULL && dflt);
         CHECK(db_store_frontend_open(&d0, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg)) && db_store_dir_fd() < 0 && strstr(msg, "KARIDNS_NO_DEFAULT_STORE=1") != NULL);
-        CHECK(db_store_frontend_open(&db, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg)) && db_store_dir_fd() >= 0);
+        CHECK(db_store_frontend_open(&db, root, run_uid, run_gid, msg, sizeof(msg)) && db_store_dir_fd() >= 0);   /* (as the loop above: as root the directory is the run user's) */
         db_store_frontend_close();
         if (keep) { setenv("KARIDNS_NO_DEFAULT_STORE", keep, 1); free(keep); } else unsetenv("KARIDNS_NO_DEFAULT_STORE");
     }
