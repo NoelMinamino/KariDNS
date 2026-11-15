@@ -341,6 +341,7 @@ uint32_t park_retry_key(park_table_t *t, uint64_t key, int64_t new_deadline_ms) 
       wheel_add(t, e);
     }
     e->attach = 0;                                       /* (it waits for a fetch now: its time is not an attach's) */
+    e->azid = 0;
     n++;
   }
   return n;
@@ -350,6 +351,38 @@ uint32_t park_retry(park_table_t *t, const char *view, const char *zone, int64_t
   size_t vl, zl;
   if (!key_fits(view, zone, &vl, &zl)) return 0;
   return park_retry_key(t, name_key(view, zone), new_deadline_ms);
+}
+
+/* the entry waits for the attach of the stored zone (sview, zid): a store thread that cannot name the zone says so by the id (park_ask_fetch_zid()) */
+void park_entry_attach_zid(park_entry_t *e, uint16_t sview, uint32_t zid) {
+  e->preq = ((uint64_t)sview << 32) | zid;
+  e->azid = 1;
+}
+
+/* 0.7 store: the queries of this worker that wait for the zone stay parked with a new deadline and wait for a fetch, which the worker asks for itself from its own ring (park_fetch_request(): 128 places,
+ * not the few slots that a store thread shares).  A ring that is full leaves the request pending: park_ask_again() makes it when there is room, and the park-timeout is the only end of the wait.  Returns how many. */
+uint32_t park_ask_fetch_key(park_table_t *t, int widx, uint64_t key, int64_t new_deadline_ms) {
+  const uint32_t n = park_retry_key(t, key, new_deadline_ms);
+  if (n == 0) return 0;
+  park_entry_t *first = NULL;
+  for (uint32_t r = t->bucket[key & t->bmask]; r && !first; r = ENT(t, r)->hnext)
+    if (ENT(t, r)->key == key) first = ENT(t, r);
+  if (first && !park_fetch_request(widx, park_entry_view(first), park_entry_zone(first), KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL)) park_pending_set(t, first, PARK_PEND_FETCH, 0, KDB_FETCH_PRIO_QUERY);
+  return n;
+}
+
+/* ... for the queries that wait for the attach of the zone id `zidkey` (store view << 32 | zone id), whatever zone they were parked for: the deleted zone, the cell that cannot be read, the id that another
+ * view has now (a store thread has no name to wake by).  The table is looked through (a few thousand entries at most, and only when an attach fails this way). */
+uint32_t park_ask_fetch_zid(park_table_t *t, int widx, uint64_t zidkey, int64_t new_deadline_ms) {
+  if (!t->e || t->nwait == 0) return 0;
+  uint32_t n = 0, seen = 0;
+  for (uint32_t i = 0; i < t->cap && seen < t->nwait; i++) {
+    park_entry_t *e = &t->e[i];
+    if (e->state != PARK_WAIT) continue;
+    seen++;
+    if (e->azid && e->preq == zidkey) n += park_ask_fetch_key(t, widx, e->key, new_deadline_ms);
+  }
+  return n;
 }
 
 void park_mark_attach(park_table_t *t, int32_t idx, int64_t now_ns, int64_t full_deadline_ms) {
@@ -496,8 +529,9 @@ void park_pending_done(park_table_t *t, park_entry_t *e) {
 }
 
 /* ------------------------------------------------------------------ rings */
-static bool key_set(park_key_t *k, uint64_t key, bool failed, bool retry, bool fetch) {
+static bool key_set(park_key_t *k, uint64_t key, bool failed, bool retry, bool fetch, uint8_t ask) {
   k->key = key;
+  k->ask = ask;
   k->failed = failed;
   k->retry = retry;
   k->fetch = fetch;
@@ -505,7 +539,7 @@ static bool key_set(park_key_t *k, uint64_t key, bool failed, bool retry, bool f
 }
 
 /* (0.7 store S2: the ingest thread and the store threads both produce keys, so the producers take turns: a spin lock held for the copy of one key) */
-bool park_wake_push_key(park_wake_ring_t *r, uint64_t key, bool failed, bool retry, bool fetch) {
+bool park_wake_push_ask(park_wake_ring_t *r, uint64_t key, bool failed, bool retry, bool fetch, uint8_t ask) {
   while (atomic_exchange_explicit(&r->plock, true, memory_order_acquire)) {}
   uint32_t head = atomic_load_explicit(&r->head, memory_order_relaxed);
   uint32_t tail = atomic_load_explicit(&r->tail, memory_order_acquire);
@@ -515,12 +549,14 @@ bool park_wake_push_key(park_wake_ring_t *r, uint64_t key, bool failed, bool ret
     atomic_fetch_add_explicit(&r->dropped, 1, memory_order_relaxed);
     ok = false;
   } else {
-    (void)key_set(&r->k[head % PARK_WAKE_RING], key, failed, retry, fetch);
+    (void)key_set(&r->k[head % PARK_WAKE_RING], key, failed, retry, fetch, ask);
     atomic_store_explicit(&r->head, head + 1, memory_order_release);
   }
   atomic_store_explicit(&r->plock, false, memory_order_release);
   return ok;
 }
+
+bool park_wake_push_key(park_wake_ring_t *r, uint64_t key, bool failed, bool retry, bool fetch) { return park_wake_push_ask(r, key, failed, retry, fetch, 0); }
 
 bool park_wake_push_ex(park_wake_ring_t *r, const char *view, const char *zone, bool failed, bool retry) {
   size_t vl, zl;
@@ -635,49 +671,59 @@ static void trigger(int kq, unsigned ident) { (void)kq; (void)ident; }
 
 /* The key goes into the ring now; the kqueue of the worker is triggered by park_wake_flush(), once however many keys came (the ring is what the worker reads: a
  * key is there before its trigger is). */
-static void wake_key_one(int w, uint64_t key, bool failed, bool retry, bool fetch) {
+static void wake_key_one(int w, uint64_t key, bool failed, bool retry, bool fetch, uint8_t ask) {
   if (w < 0 || w >= PARK_MAX_WORKERS || !atomic_load_explicit(&g_wreg[w], memory_order_acquire)) return;
-  (void)park_wake_push_key(&g_wake[w], key, failed, retry, fetch);          /* (a full ring: the overflow flag wakes everything) */
+  (void)park_wake_push_ask(&g_wake[w], key, failed, retry, fetch, ask);     /* (a full ring: the overflow flag wakes everything) */
   atomic_fetch_or_explicit(&g_wtrig[w / 64], 1ull << (w % 64), memory_order_release);
 }
 
 void park_wake_queue_one(int w, const char *view, const char *zone, bool failed) {
   size_t vl, zl;
   if (!key_fits(view, zone, &vl, &zl)) return;
-  wake_key_one(w, name_key(view, zone), failed, false, false);
+  wake_key_one(w, name_key(view, zone), failed, false, false, 0);
 }
 
 void park_wake_queue_all(const char *view, const char *zone, bool failed) {
   size_t vl, zl;
   if (!key_fits(view, zone, &vl, &zl)) return;
   const uint64_t key = name_key(view, zone);
-  for (int w = 0; w < PARK_MAX_WORKERS; w++) wake_key_one(w, key, failed, false, false);
+  for (int w = 0; w < PARK_MAX_WORKERS; w++) wake_key_one(w, key, failed, false, false, 0);
 }
 
 /* the workers of the set: workers 0..30 by their bit, bit 31 every worker from 31 up (a set that park_att_take() returns has the bits 15..31 all set for a worker of 15 and up) */
-static void wake_set(uint32_t workers, uint64_t key, bool failed, bool retry, bool fetch) {
+static void wake_set(uint32_t workers, uint64_t key, bool failed, bool retry, bool fetch, uint8_t ask) {
   if (workers == PARK_ATT_ALL) {
-    for (int w = 0; w < PARK_MAX_WORKERS; w++) wake_key_one(w, key, failed, retry, fetch);
+    for (int w = 0; w < PARK_MAX_WORKERS; w++) wake_key_one(w, key, failed, retry, fetch, ask);
     return;
   }
-  for (uint32_t m = workers & 0x7FFFFFFFu; m; m &= m - 1) wake_key_one(__builtin_ctz(m), key, failed, retry, fetch);
+  for (uint32_t m = workers & 0x7FFFFFFFu; m; m &= m - 1) wake_key_one(__builtin_ctz(m), key, failed, retry, fetch, ask);
   if (workers & 0x80000000u) {
     const int wm = atomic_load_explicit(&g_wmax, memory_order_relaxed);
-    for (int w = 31; w < wm; w++) wake_key_one(w, key, failed, retry, fetch);
+    for (int w = 31; w < wm; w++) wake_key_one(w, key, failed, retry, fetch, ask);
   }
 }
 
 void park_wake_queue_mask(const char *view, const char *zone, uint32_t workers, bool failed) {
   size_t vl, zl;
   if (!key_fits(view, zone, &vl, &zl)) return;
-  wake_set(workers, name_key(view, zone), failed, false, false);
+  wake_set(workers, name_key(view, zone), failed, false, false, 0);
 }
 
 void park_wake_queue_retry(const char *view, const char *zone, uint32_t workers, bool fetch) {
   size_t vl, zl;
   if (!key_fits(view, zone, &vl, &zl)) return;
-  wake_set(workers, name_key(view, zone), false, true, fetch);
+  wake_set(workers, name_key(view, zone), false, true, fetch, 0);
 }
+
+/* 0.7 store: the queries that wait for the zone ask for its fetch themselves (park_ask_fetch_key()): the fetch request of a store thread found every shared slot taken */
+void park_wake_queue_ask(const char *view, const char *zone, uint32_t workers) {
+  size_t vl, zl;
+  if (!key_fits(view, zone, &vl, &zl)) return;
+  wake_set(workers, name_key(view, zone), false, true, true, 1);
+}
+
+/* 0.7 store: the attach of the zone id could not be done and no name is known for it (park_ask_fetch_zid()) */
+void park_wake_queue_zid(uint16_t sview, uint32_t zid, uint32_t workers) { wake_set(workers, ((uint64_t)sview << 32) | zid, false, true, true, 2); }
 
 void park_wake_flush(void) {
   for (int i = 0; i < (int)(sizeof(g_wtrig) / sizeof(g_wtrig[0])); i++) {
@@ -915,15 +961,19 @@ uint32_t park_att_take(uint16_t sview, uint32_t zid) {
   return PARK_ATT_ALL;                                   /* no claim (a request without one, or a duplicate that came after the first was done): whoever waits is woken */
 }
 
-/* the worker no longer waits for the zone (its last query for it was answered or dropped without the zone): its bit goes, and the claim with it when nobody is left */
+/* the worker no longer waits for the zone (its last query for it was answered or dropped without the zone): its bit goes, and the claim with it when nobody is left.
+ * The bit 15 is shared by every worker from 15 up: a worker of that group that leaves cannot tell whether another one of the group still waits, so it does not clear the bit (the
+ * take then wakes the whole group, a worker that does not wait finds nothing to wake: a spurious wake costs nothing).  A claim that has only that bit, and no request in a ring (nobody
+ * of the group that is still there made one, or the worker that did has left), goes: each worker of the group that joined it without a request has asked for itself. */
 bool park_att_leave(uint16_t sview, uint32_t zid, int w) {
   const uint64_t id = ACL_ID(sview, zid), bit = acl_bit(w);
   for (unsigned j = 0; j < ACL_WIN; j++) {
     _Atomic uint64_t *s = &g_aclaim[acl_slot(id, j)];
     uint64_t v = atomic_load_explicit(s, memory_order_acquire);
     while (v != 0 && (v & ACL_IDMASK) == id) {
-      uint64_t nv = v & ~bit;
+      uint64_t nv = w >= 15 ? v : v & ~bit;
       if (!(nv & ACL_SET)) nv = 0;
+      else if (!(nv & ACL_REQ) && !(nv & 0x7FFFu)) nv = 0;
       if (atomic_compare_exchange_weak_explicit(s, &v, nv, memory_order_acq_rel, memory_order_acquire)) return true;
     }
   }

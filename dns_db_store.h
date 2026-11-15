@@ -180,6 +180,7 @@ extern int db_store_test_set_fail;                      /* the n-th set_put_slot
 extern int db_store_test_attach_reserve_fail;           /* the n-th reserve of room in the attach table fails (0: off) */
 extern int db_store_test_stg_fail;                      /* the n-th put into the staging table of the worker's attach is refused (0: off) */
 extern _Atomic bool db_store_test_not_resident;         /* the worker's attach finds no image in the page cache */
+extern _Atomic bool db_store_test_resident;             /* ... or finds it there whatever mincore() says (ZFS does not report the pages that were written) */
 extern void (*db_store_test_hot_hook)(uint32_t zid);    /* called by the thread of hot.list before each zone */
 extern void (*_Atomic db_store_test_adopt_hook)(void);   /* called by a store thread before it registers a staged zone */
 extern void (*db_recon_test_entry_hook)(void);          /* called at every entry of a manifest pass (tests: an entry that takes time) */

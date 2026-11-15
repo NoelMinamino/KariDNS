@@ -2382,6 +2382,7 @@ static void park_ask(park_table_t *pt, int widx, int32_t pi, const park_plan_t *
   if (pp->attach) {
     if (pel->zid != ZREF_NOZID && pel->sview >= 0) {
       const uint16_t sv = (uint16_t)pel->sview;
+      park_entry_attach_zid(e, sv, pel->zid);               /* (a store thread that cannot name the zone says it by the id) */
       const int c = park_att_claim(sv, pel->zid, widx);
       if (c == 0) return;                                /* (the request of another worker's claim is in a ring: this entry is woken with it) */
       if (park_attach_zid(widx, sv, pel->zid)) park_att_requested(sv, pel->zid);
@@ -2724,7 +2725,13 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
   if (t->nwait == 0 && t->nready == 0 && !(ring && park_wake_pending(ring))) return;     /* nothing is parked and nobody said anything: no clock, no exchange */
   park_key_t k;
   while (ring && park_wake_pop(ring, &k)) {
-    if (k.retry) {                                      /* 0.7 store S2: the attach did not work, or the zone is on its way by another route; the queries wait for it the park-timeout */
+    if (k.ask == 1) {                                   /* 0.7 store: no shared slot was free to ask the ingest thread: this worker asks from its own ring, the queries stay parked */
+      const uint32_t n = park_ask_fetch_key(t, w->worker_idx, k.key, park_now_ms() + (int64_t)w->park_timeout_ms);
+      for (uint32_t i = 0; i < n; i++) store_status_note_cold(0, STORE_COLD_FETCH);
+    } else if (k.ask == 2) {                            /* the attach of a zone id failed and has no name: the queries that wait for the id ask for their zones */
+      const uint32_t n = park_ask_fetch_zid(t, w->worker_idx, k.key, park_now_ms() + (int64_t)w->park_timeout_ms);
+      for (uint32_t i = 0; i < n; i++) store_status_note_cold(0, STORE_COLD_FETCH);
+    } else if (k.retry) {                                      /* 0.7 store S2: the attach did not work, or the zone is on its way by another route; the queries wait for it the park-timeout */
       uint32_t n = park_retry_key(t, k.key, park_now_ms() + (int64_t)w->park_timeout_ms);
       if (k.fetch)                                      /* (only a read from the database counts as one: a zone that another attach or fetch has is waited for) */
         for (uint32_t i = 0; i < n; i++) store_status_note_cold(0, STORE_COLD_FETCH);

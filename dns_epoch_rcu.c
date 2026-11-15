@@ -28,6 +28,7 @@ _Thread_local _Atomic uint64_t *t_rcu_own_observed = NULL;
 static _Thread_local rcu_aux_slot_t *t_aux_slot = NULL;
 static _Thread_local int t_aux_depth = 0;
 static _Thread_local bool t_aux_pinned = false;
+static _Thread_local bool t_aux_covered = false;   /* the outermost auxiliary section was entered inside the thread's own worker / slot section: it holds no slot (see rcu_aux_read_lock()) */
 
 void rcu_exponential_backoff(int *retries, useconds_t *sleep_time) {
   if (*retries < 100) {
@@ -270,8 +271,16 @@ void rcu_aux_thread_unpin(void) {
   }
 }
 
+/* A thread that is in its own worker / slot read section (rcu_reader_enter(), rcu_slot_reader_enter(): t_rcu_own_observed is its slot and holds an epoch) is protected by that section for as
+ * long as it lasts, which is longer than any auxiliary section taken inside it (the section of the worker is the query, or a store attach, that calls code written for the aux threads):
+ * such a section claims no slot.  Without this a worker would take one of the MAX_AUX_RCU_READERS slots for the length of the call, and 126 workers and the pinned threads can use up
+ * the table (aux_slot_claim() then waits for ever).  The caller must not leave its own section before the matching rcu_aux_read_unlock(). */
 void rcu_aux_read_lock(void) {
   if (t_aux_depth++ > 0) return;
+  if (t_rcu_own_observed && atomic_load_explicit(t_rcu_own_observed, memory_order_relaxed) != RCU_EPOCH_IDLE) {
+    t_aux_covered = true;
+    return;
+  }
   if (!t_aux_slot) t_aux_slot = aux_slot_claim();
   rcu_epoch_enter(&t_aux_slot->observed_epoch);
 }
@@ -279,6 +288,10 @@ void rcu_aux_read_lock(void) {
 void rcu_aux_read_unlock(void) {
   if (t_aux_depth <= 0) return;   /* an unlock without a lock is ignored (the unit test checks it); a debug build is not made to abort on it */
   if (--t_aux_depth > 0) return;
+  if (t_aux_covered) {
+    t_aux_covered = false;
+    return;
+  }
   rcu_epoch_exit(&t_aux_slot->observed_epoch);
   if (!t_aux_pinned) {
     aux_slot_release(t_aux_slot);

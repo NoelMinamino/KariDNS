@@ -163,7 +163,7 @@ fresh
 pq "INSERT INTO domains (name, type) VALUES ('plain1.test', 'NATIVE'), ('plain2.test', 'NATIVE');
     INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'SOA', 'ns1.' || name || ' host.' || name || ' 77 3600 600 86400 300', 300, 0, false FROM domains;
     INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.' || name, 300, 0, false FROM domains" > /dev/null
-run plain -- reloadzone:0:plain1.test. reloadzone:0:nope.test. sleep:500
+run plain -- reloadzone:0:plain1.test. reloadzone:0:nope.test. batches:3 sleep:500
 has "a pass without a cursor, flagged plain" plain.out '^MB view=0 count=2 cursor=0 valid=0 ident= flags=2$'
 has "... listing the zones with their serials, unstamped" plain.log '^M 0 1 plain1\.test\. 0 0 0 0 77$'
 has "a one-zone reload is a CHANGES entry that forces the body" plain.log '^C 0 up 1 plain1\.test\. 0 0 1 0 0 77$'

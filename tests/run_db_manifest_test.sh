@@ -173,7 +173,7 @@ for z in plain1 plain2; do
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'SOA', 'ns1.$z.test host.$z.test 77 3600 600 86400 300', 300, 0, 0 FROM domains WHERE name = '$z.test';
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.$z.test', 300, 0, 0 FROM domains WHERE name = '$z.test'"
 done
-"$FB" --store --log="$T/plain.log" "$LOADER" "$PDB" reloadzone:0:plain1.test. reloadzone:0:nope.test. sleep:500 > "$T/plain.out" 2> "$T/plain.err"
+"$FB" --store --log="$T/plain.log" "$LOADER" "$PDB" reloadzone:0:plain1.test. reloadzone:0:nope.test. batches:3 sleep:500 > "$T/plain.out" 2> "$T/plain.err"
 RC=$?
 [ $RC -eq 0 ] && pass "the harness ran to the end" || { fail "the harness failed (status $RC)"; head "$T/plain.out"; }
 has "a pass without a cursor, flagged plain" plain.out '^MB view=0 count=2 cursor=0 valid=0 ident= flags=2$'

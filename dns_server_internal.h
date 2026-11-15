@@ -1528,9 +1528,11 @@ typedef struct {                 /* what the commit checks against the element (
   uint16_t flags;
   bool digest_set;
   bool bg;                       /* nobody waits for the zone: it goes first when memory-limit needs room */
+  void (*under_lock)(void *);    /* called with the registry lock held, once, whatever the outcome, just before it is released (dbreg_attach_store(): the staged element leaves the staging table here) */
+  void *under_arg;
   uint8_t digest[32];
 } dbreg_attach_info_t;
-int dbreg_attach_store(const char *view, const char *name, const dbdir_rec_t *rec, zone_db_entry_t *entry, bool bg);
+int dbreg_attach_store(const char *view, const char *name, const dbdir_rec_t *rec, zone_db_entry_t *entry, bool bg, void (*under_lock)(void *), void *under_arg);
 /* 0.7 fix 7, the worker's attach (dns_db_store.c): the worker makes the entry of a zone whose image is in the page cache and publishes a STAGED element for it (a zdir_elem_t that is not in the
  * registry: only the staging table of dns_db_store.c reaches it), takes no lock of the registry and answers from the entry; a store thread registers the entry (dbreg_attach_store() with the record
  * the staged element holds: dbreg_staged_rec()) and takes the staged element away (dbreg_staged_retire(): freed after the grace period; entry_dead: the registry did not take the entry, it goes too).

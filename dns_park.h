@@ -66,6 +66,7 @@ typedef struct park_entry {
   uint8_t ulinked;                   /* the entry is in the list of the pending requests */
   uint8_t attach;                    /* 0.7 store S2: parked for an ATTACH from the store (park_mark_attach()): the deadline is the attach deadline, the time to answer is noted */
   uint8_t pend;                      /* park_pend_t: the request for the zone has not been made yet */
+  uint8_t azid;                      /* 0.7 store: the entry waits for the attach of the stored zone `preq` (set by park_entry_attach_zid(); cleared when the wait changes to a fetch): a store thread that cannot name the zone says "zone id X failed" */
   uint32_t gen;                      /* changes every time the entry is given out */
   uint32_t blk;                      /* the payload block: class << 31 | index */
   uint32_t hnext, wprev, wnext, dprev, dnext, uprev, unext;   /* links (index + 1, 0 = none) of the hash chain, the wheel slot, the done list, the pending list */
@@ -138,6 +139,12 @@ uint32_t park_fail_key(park_table_t *t, uint64_t key);
 /* 0.7 store S2: the queries that wait for the zone stay parked, with a new deadline (the attach did not work and the zone is fetched now: the park-timeout runs from here).  Returns how many. */
 uint32_t park_retry(park_table_t *t, const char *view, const char *zone, int64_t new_deadline_ms);
 uint32_t park_retry_key(park_table_t *t, uint64_t key, int64_t new_deadline_ms);
+/* 0.7 store: the entry waits for the attach of the stored zone (sview, zid) (park_ask_fetch_zid() finds it by the id) */
+void park_entry_attach_zid(park_entry_t *e, uint16_t sview, uint32_t zid);
+/* 0.7 store: the queries that wait for the zone (key), or for the attach of the zone id (store view << 32 | zone id), stay parked with a new deadline and this worker asks for the fetch from its own ring (a ring
+ * that is full leaves it pending: park_ask_again()).  Returns how many queries. */
+uint32_t park_ask_fetch_key(park_table_t *t, int widx, uint64_t key, int64_t new_deadline_ms);
+uint32_t park_ask_fetch_zid(park_table_t *t, int widx, uint64_t zidkey, int64_t new_deadline_ms);
 /* the entry idx (just parked) waits for an ATTACH from the store (the worker notes the time it took, dns_store_status.h), with the time in ns now; full_deadline_ms: until when the query may wait at the most (park_expire() extends the attach deadline to it instead of timing the query out: an attach that is queued behind slow reads is not a failure) */
 void park_mark_attach(park_table_t *t, int32_t idx, int64_t now_ns, int64_t full_deadline_ms);
 uint32_t park_wake_all(park_table_t *t);
@@ -162,6 +169,7 @@ typedef struct {
   bool failed;                       /* the fetch failed: the queries waiting for the zone are answered at once, not woken */
   bool retry;                        /* 0.7 store S2: the attach did not work (a stale or damaged record, or the zone is on its way by another route): the queries that wait for it get a new deadline (park_retry()) and stay parked */
   bool fetch;                        /* ... with `retry`: and the zone is read from the database (counted as store.cold.fetch), not waited for from another attach or fetch */
+  uint8_t ask;                       /* 0.7 store: 1: the queries that wait for the zone (key) ask for its fetch themselves, from this worker's own ring, and stay parked (the shared slots for a store thread's request were all taken); 2: the attach of the zone id in `key` (store view << 32 | zone id) failed without a name for the zone (a deleted zone, a cell that cannot be read): the queries that wait for that zone id ask for their zone's fetch */
 } park_key_t;
 
 typedef struct {
@@ -177,6 +185,7 @@ static inline bool park_key_is(const park_key_t *k, const char *view, const char
 bool park_wake_push(park_wake_ring_t *r, const char *view, const char *zone, bool failed);
 bool park_wake_push_ex(park_wake_ring_t *r, const char *view, const char *zone, bool failed, bool retry);
 bool park_wake_push_key(park_wake_ring_t *r, uint64_t key, bool failed, bool retry, bool fetch);
+bool park_wake_push_ask(park_wake_ring_t *r, uint64_t key, bool failed, bool retry, bool fetch, uint8_t ask);
 bool park_wake_pop(park_wake_ring_t *r, park_key_t *out);
 bool park_wake_take_overflow(park_wake_ring_t *r);
 /* Is there anything for the consumer: a key in the ring, or a dropped wake?  Two loads, no clock; the worker asks before it does the rest. */
@@ -276,6 +285,10 @@ void park_wake_queue_one(int w, const char *view, const char *zone, bool failed)
  * `workers`: the workers that asked (park_att_take()); PARK_ATT_ALL: every worker. */
 void park_wake_queue_retry(const char *view, const char *zone, uint32_t workers, bool fetch);
 void park_wake_queue_mask(const char *view, const char *zone, uint32_t workers, bool failed);   /* park_wake_queue_one() for each worker of the set */
+/* 0.7 store: the queries that wait for the zone ask for its fetch themselves (the shared slots for a store thread to ask the ingest thread were all taken: they wait, they are not answered "not ready") */
+void park_wake_queue_ask(const char *view, const char *zone, uint32_t workers);
+/* 0.7 store: the attach of the zone id (store view, zone id) cannot be done and the zone has no name to wake by (it was deleted, its cell cannot be read, the id is another view's now): the workers of the set ask for the fetch of the zones their queries wait for by that id */
+void park_wake_queue_zid(uint16_t sview, uint32_t zid, uint32_t workers);
 void park_wake_flush(void);
 /* The ingest thread's kqueue and the ident a worker triggers after pushing a fetch request (-1: none). */
 #define PARK_FETCH_IDENT 0x66657463u   /* "fetc" */

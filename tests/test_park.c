@@ -1163,6 +1163,70 @@ static void test_attach_ring(void) {
   CHECK(park_att_claim(0, 0, 1) == 1 && park_att_claim(0, 0, 2) == 2 && park_att_take(0, 0) == 6u);
 }
 
+/* 0.7 review fixes: the claims of the workers from 15 up (they share a bit), and the wakes by which the queries ask for their zones' fetches themselves */
+static void test_att_group_and_ask(void) {
+  printf("[claims of the workers from 15 up; queries that ask for the fetch themselves]\n");
+  /* M1: a worker of the group that leaves must not take the wake of another that still waits (the bit is shared) */
+  CHECK(park_att_claim(4, 500, 3) == 1 && park_att_claim(4, 500, 20) == 2 && park_att_claim(4, 500, 21) == 2);
+  park_att_requested(4, 500);
+  CHECK(park_att_leave(4, 500, 20));
+  uint32_t s = park_att_take(4, 500);
+  CHECK((s & 0xFFFF8000u) == 0xFFFF8000u && (s & 8u));                            /* (worker 21 is woken, and worker 3) */
+  CHECK(park_att_claim(4, 500, 3) == 1 && park_att_claim(4, 500, 20) == 2 && park_att_claim(4, 500, 21) == 2 && park_att_claim(4, 500, 125) == 2);
+  CHECK(park_att_leave(4, 500, 20) && park_att_leave(4, 500, 125) && park_att_leave(4, 500, 3));
+  s = park_att_take(4, 500);
+  CHECK(s == PARK_ATT_ALL);                                                       /* (no request was made: the claim went with its last worker that asked; whoever waits is woken) */
+  CHECK(park_att_claim(4, 501, 20) == 1 && park_att_claim(4, 501, 22) == 2);
+  park_att_requested(4, 501);
+  CHECK(park_att_leave(4, 501, 20) && park_att_leave(4, 501, 3));                 /* (worker 3 never joined: the leave of a worker that is not in the set changes nothing) */
+  CHECK(park_att_take(4, 501) == 0xFFFF8000u);                                    /* (the request is in a ring: the claim stays for the take, and wakes the whole group) */
+  CHECK(park_att_claim(4, 502, 20) == 1 && park_att_leave(4, 502, 20) && park_att_take(4, 502) == PARK_ATT_ALL);   /* (a claim of the group that nobody asked for goes) */
+
+  /* L2, L3: the keys of the wake ring */
+  park_register_worker(12, -1);
+  park_register_worker(13, -1);
+  park_key_t k;
+  while (park_wake_pop(park_wake_ring(12), &k)) {}
+  while (park_wake_pop(park_wake_ring(13), &k)) {}
+  park_wake_queue_ask("v1", "ask.test.", (1u << 12) | (1u << 13));
+  CHECK(park_wake_pop(park_wake_ring(12), &k) && k.ask == 1 && park_key_is(&k, "v1", "ask.test.") && park_wake_pop(park_wake_ring(13), &k) && k.ask == 1);
+  park_wake_queue_zid(4, 500, 1u << 12);
+  CHECK(park_wake_pop(park_wake_ring(12), &k) && k.ask == 2 && k.key == (((uint64_t)4 << 32) | 500) && !park_wake_pop(park_wake_ring(13), &k));
+  park_wake_queue_retry("v1", "ask.test.", 1u << 12, true);
+  CHECK(park_wake_pop(park_wake_ring(12), &k) && k.ask == 0 && k.retry);
+  park_wake_flush();
+
+  /* the worker's side: the queries of the zone stay parked with the new deadline, and the worker asks from its own ring */
+  park_table_t t;
+  CHECK(park_init(&t, 16));
+  udp_ipc_t ipc = mk_ipc(1);
+  uint8_t pay[20] = { 0 };
+  const int64_t dl = 5000;
+  int32_t a = park_udp(&t, 0, 200, "v1", "ask.test.", 3, &ipc, pay, 20), b = park_udp(&t, 0, 200, "v1", "ask.test.", 3, &ipc, pay, 20), c = park_udp(&t, 0, 200, "v1", "other.test.", 3, &ipc, pay, 20);
+  CHECK(a >= 0 && b >= 0 && c >= 0);
+  park_fetch_req_t q;
+  while (park_fetch_next(&q)) {}
+  park_mark_attach(&t, a, 1, 5000);
+  park_entry_attach_zid(&t.e[a], 4, 500);
+  park_entry_attach_zid(&t.e[c], 4, 501);
+  CHECK(park_ask_fetch_key(&t, 13, park_name_key("v1", "ask.test."), dl) == 2 && t.e[a].deadline_ms == dl && t.e[b].deadline_ms == dl && t.e[a].attach == 0 && t.e[a].azid == 0 && t.e[c].deadline_ms == 200);
+  CHECK(park_fetch_next(&q) && strcmp(q.view, "v1") == 0 && strcmp(q.zone, "ask.test.") == 0 && q.worker == 13 && q.prio == KDB_FETCH_PRIO_QUERY && !park_fetch_next(&q));   /* (one request for the zone) */
+  CHECK(t.nunsent == 0 && t.e[c].azid == 1);
+  /* by the zone id: whatever zone the queries were parked for */
+  CHECK(park_ask_fetch_zid(&t, 13, ((uint64_t)4 << 32) | 999, dl) == 0 && !park_fetch_next(&q));                       /* (no query waits for that id) */
+  CHECK(park_ask_fetch_zid(&t, 13, ((uint64_t)4 << 32) | 501, dl) == 1 && t.e[c].deadline_ms == dl && t.e[c].azid == 0);
+  CHECK(park_fetch_next(&q) && strcmp(q.zone, "other.test.") == 0 && !park_fetch_next(&q));
+  /* a ring that is full: the request stays pending on the entry and is made again later (no answer, no SERVFAIL) */
+  int32_t d = park_udp(&t, 0, 200, "v1", "full.test.", 3, &ipc, pay, 20);
+  CHECK(d >= 0);
+  for (int i = 0; i < PARK_FETCH_RING; i++) CHECK(park_fetch_request(13, "v1", "fill.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+  CHECK(park_ask_fetch_key(&t, 13, park_name_key("v1", "full.test."), dl) == 1 && t.e[d].pend == PARK_PEND_FETCH && t.nunsent == 1 && t.e[d].state == PARK_WAIT && t.e[d].deadline_ms == dl);
+  while (park_fetch_next(&q)) {}
+  park_free(&t);
+  park_unregister_worker(12);
+  park_unregister_worker(13);
+}
+
 /* 0.7 fix 7: the worker that attaches a zone itself hands its registration to the store threads through its attach ring: room first, then the request with PARK_ATT_ADOPT */
 static void test_attach_adopt(void) {
   printf("[the worker's attach: the room in the ring, the adoption request]\n");
@@ -1284,6 +1348,7 @@ int main(int argc, char **argv) {
   test_attach_adopt();
   test_park_max_memory();
   test_claim_race();
+  test_att_group_and_ask();
 #ifdef __FreeBSD__
   test_wake_queue();
   test_sleep_protocol();

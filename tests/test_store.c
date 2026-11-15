@@ -31,6 +31,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
+#include <sys/param.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -3797,6 +3799,13 @@ static void test_readahead_close(void) {
 
 /* ---- 0.7 fix 7 / 8: store_image_resident() and hot.list ---- */
 
+/* mincore() says "resident" for a page that was written through a descriptor and has not been touched through the mapping only on file systems whose pages are the VM object's (UFS).  ZFS keeps them in the ARC: the
+ * answer is "no" for them until they are touched, and the server uses COPY mode there (store-mode auto).  The checks that say "yes" are made where the file system can say it; those that say "no" always. */
+static bool fs_reports_written_pages(const tdir_t *d) {
+  struct statfs sfs;
+  return fstatfs(d->fd, &sfs) != 0 || strcmp(sfs.f_fstypename, "zfs") != 0;
+}
+
 static bool resident_of(store_t *s, uint32_t zid) {
   store_zone_t z;
   store_read_lock();
@@ -3820,7 +3829,9 @@ static void test_resident(int mode) {
   uint32_t zid[40];
   for (uint32_t i = 0; i < 40; i++) CHECK_EQ(put_i(s, 0, i, 1, &zid[i]), 0);
   /* a record that was written is in the page cache (and its segment is open) in MAP mode; COPY mode never says yes (a read with pread can block) */
-  for (uint32_t i = 0; i < 40; i += 7) CHECK_EQ(resident_of(s, zid[i]), mode == STORE_MODE_MAP);
+  const bool yes_ok = fs_reports_written_pages(&d);
+  if (yes_ok || mode != STORE_MODE_MAP)
+    for (uint32_t i = 0; i < 40; i += 7) CHECK_EQ(resident_of(s, zid[i]), mode == STORE_MODE_MAP);
   /* a zone with no image (known), and a zone id that is free, are not resident */
   {
     char nm[160];
@@ -3856,13 +3867,13 @@ static void test_resident(int mode) {
   if (s) {
     CHECK(!resident_of(s, zid[2]));                                      /* (no segment is open yet) */
     store_open_segments(s);
-    CHECK_EQ(resident_of(s, zid[2]), mode == STORE_MODE_MAP);             /* (opened: the pages written before the close are in the page cache) */
+    if (yes_ok || mode != STORE_MODE_MAP) CHECK_EQ(resident_of(s, zid[2]), mode == STORE_MODE_MAP);             /* (opened: the pages written before the close are in the page cache) */
     store_img_t im;
     store_read_lock();
     CHECK_EQ(store_image_read(s, zid[2], &im), 0);
     store_img_release(s, &im);
     store_read_unlock();
-    CHECK_EQ(resident_of(s, zid[2]), mode == STORE_MODE_MAP);
+    if (yes_ok || mode != STORE_MODE_MAP) CHECK_EQ(resident_of(s, zid[2]), mode == STORE_MODE_MAP);
     if (mode == STORE_MODE_MAP) {
       /* the pages leave the page cache (as far as the system lets a test make it): the answer follows, whichever it is, and never crashes */
       store_zone_t z;

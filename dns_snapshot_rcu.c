@@ -3935,6 +3935,7 @@ out:
         dbreg_zone_t *dz = dbreg_find(rv, name, zdir_name_hash(name));
         if (dz && (dz->kind & ZDIR_K_STORED) && !zdir_entry(dz) && atomic_load_explicit(&dz->state, memory_order_relaxed) == ZDIR_ST_LOADING) store_elem_drop_locked(rv, dz);
     }
+    if (offered && offered->under_lock) offered->under_lock(offered->under_arg);       /* (the zone is in the attach table now, or the commit did not take it: the staged element of a worker's attach leaves under the lock) */
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     if (err_sink) dbreg_err_sink_clear(err_zid);
     if (shadowed) *shadowed = sh;
@@ -4279,14 +4280,27 @@ static void rec_busy_pause(void) {
  * DBREG_ATT_STARTED: the entry is the zone's now (the caller must not free it); RESIDENT: the zone is in memory already; BUSY: a fetch or another attach is on its way (it wakes the
  * queries); STALE: the record is not the one the caller read (read it again); NOT: not a zone to attach (an element of another kind, out of memory): the caller keeps its entry, and the
  * zone is read from the database.  bg: nobody waits for the zone (a CNAME or glue target): it is marked to go first when memory-limit needs room (dbreg_bg_loaded()). */
-int dbreg_attach_store(const char *view, const char *name, const dbdir_rec_t *rec, zone_db_entry_t *entry, bool bg) {
+static void att_unlock(const dbreg_attach_info_t *o) {
+    if (o && o->under_lock) o->under_lock(o->under_arg);          /* (0.7 fix 7: the staged element of the worker's attach leaves its table under the lock: see adopt_job()) */
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+}
+
+int dbreg_attach_store(const char *view, const char *name, const dbdir_rec_t *rec, zone_db_entry_t *entry, bool bg, void (*under_lock)(void *), void *under_arg) {
     const dbdir_ops_t *ops = dbdir();
-    if (!ops || !store_zone_entry(entry)) return DBREG_ATT_NOT;
+    if (!ops || !store_zone_entry(entry)) {
+        if (under_lock) {
+            pthread_mutex_lock(&g_zone_db_rebuild_lock);
+            att_unlock(&(dbreg_attach_info_t){ .under_lock = under_lock, .under_arg = under_arg });
+        }
+        return DBREG_ATT_NOT;
+    }
     dbreg_attach_info_t offered;
     memset(&offered, 0, sizeof(offered));
     offered.source_id = rec->source_id;
     offered.serial = rec->serial;
     offered.bg = bg;
+    offered.under_lock = under_lock;
+    offered.under_arg = under_arg;
     memcpy(offered.digest, rec->digest, 32);
     for (int i = 0; i < 32; i++) offered.digest_set |= offered.digest[i] != 0;
     const bool sh_cfg = dbreg_config_shadows(view, name);               /* (the configuration's snapshot is not taken under the registry lock) */
@@ -4295,29 +4309,29 @@ int dbreg_attach_store(const char *view, const char *name, const dbdir_rec_t *re
         dbreg_view_t *rv = dbreg_view_get(view, true);
         dbreg_zone_t *z = rv ? dbreg_find(rv, name, zdir_name_hash(name)) : NULL;
         if (!rv) {
-            pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+            att_unlock(&offered);
             return DBREG_ATT_NOT;
         }
         if (z) {                                                        /* (an element of the name that is not resident and not LOADING is not the store's to attach over) */
             int rc = zdir_entry(z) ? DBREG_ATT_RESIDENT : atomic_load_explicit(&z->state, memory_order_relaxed) == ZDIR_ST_LOADING ? DBREG_ATT_BUSY : DBREG_ATT_NOT;
-            pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+            att_unlock(&offered);
             return rc;
         }
         dbdir_rec_t cur;
         const int gr = rec_get_locked(ops, view, name, &cur);
         if (gr < 0) {                                                   /* (a cell of the store is being written: not now) */
-            pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+            att_unlock(attempt >= REC_BUSY_TRIES ? &offered : NULL);
             if (attempt >= REC_BUSY_TRIES) return DBREG_ATT_STALE;
             rec_busy_pause();
             continue;
         }
         if (gr == 0 || cur.state != 2 /* STORE_STATE_STORED */ || cur.zid != rec->zid || cur.serial != rec->serial || cur.source_id != rec->source_id || memcmp(cur.digest, rec->digest, 32) != 0) {
-            pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+            att_unlock(&offered);
             return DBREG_ATT_STALE;
         }
         z = store_elem_make_locked(rv, view, name, rec);
         if (!z) {
-            pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+            att_unlock(&offered);
             return DBREG_ATT_NOT;
         }
         bool shadowed = false;

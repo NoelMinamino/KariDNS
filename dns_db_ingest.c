@@ -1469,17 +1469,35 @@ static uint32_t fetch_sub_limit(uint32_t cap) {
  * than one in the order of the scan), and the zones that the queries have not asked for yet would come when the queries stop.  So the fill has a share of its own: a quarter of the places of
  * fetch-concurrency, at least one (up to ING_BULK_NFREQ), which the requests of queries leave free (qplace_ok()) while the fill has fewer fetches in flight than that, and which it may use whatever
  * waits. */
-static uint32_t bulk_reserve(void) {
-  uint32_t q = atomic_load_explicit(&g_fetch_conc, memory_order_relaxed) / 4;
+static uint32_t bulk_reserve_for(uint32_t conc) {
+  uint32_t q = conc / 4;
   if (q < 1) q = 1;
   return q < 32u ? q : 32u;                      /* (ING_BULK_NFREQ) */
 }
-/* may a query's request take a place?  Not when the places that are left are the fill's share. */
-static bool qplace_ok(const ing_t *g) {
-  const uint32_t conc = atomic_load_explicit(&g_fetch_conc, memory_order_relaxed), res = bulk_reserve();
-  const uint32_t keep = g->bg_on && g->fetch_fd >= 0 && g->nbulk < res ? res - g->nbulk : 0;
-  return park_places_used() + keep < conc;
+static uint32_t bulk_reserve(void) { return bulk_reserve_for(atomic_load_explicit(&g_fetch_conc, memory_order_relaxed)); }
+/* does the fill have a request to make now?  Not in the pause after a round with failures (bg_retry_ms), not when the scan of the store is over (bg_on ends with it), not with no loader. */
+static bool bulk_wants_place(const ing_t *g) {
+  return g->bg_on && g->fetch_fd >= 0 && !(g->bg_retry_ms && now_ms() < g->bg_retry_ms);
 }
+/* may a query's request take a place?  Not when the places that are left are the fill's share. */
+static bool qplace_calc(const ing_t *g, uint32_t used, uint32_t conc) {
+  const uint32_t res = bulk_reserve_for(conc);
+  const uint32_t keep = bulk_wants_place(g) && g->nbulk < res ? res - g->nbulk : 0;   /* (the share is kept for a fill that has work: its fetches in flight hold places already) */
+  return used + keep < conc;
+}
+static bool qplace_ok(const ing_t *g) { return qplace_calc(g, park_places_used(), atomic_load_explicit(&g_fetch_conc, memory_order_relaxed)); }
+#ifdef KARIDNS_UNIT_TEST
+/* tests: may a query's request take a place, for a fill in the given state (bg_on, a loader, the fill's fetches in flight, the pause until retry_ms), `used` places taken, fetch-concurrency conc */
+bool db_ingest_test_qplace(bool bg_on, bool loader, uint32_t nbulk, int64_t retry_ms, uint32_t used, uint32_t conc) {
+  static ing_t g;                                          /* (static: the struct is big) */
+  memset(&g, 0, sizeof(g));
+  g.bg_on = bg_on;
+  g.fetch_fd = loader ? 0 : -1;
+  g.nbulk = nbulk;
+  g.bg_retry_ms = retry_ms;
+  return qplace_calc(&g, used, conc);
+}
+#endif
 static _Atomic uint32_t g_ing_fill_pct;                    /* the share of the last window (~10 s) the ingest thread spent on the bodies of the fill (what a first fill takes of it) */
 static _Atomic uint64_t g_fetch_issued;   /* fetches of a whole zone sent to the loader (queries, transfers, the warm-up) */
 /* dbstatus "fetchq:" (B2 W3): where a fetch can be held up; the ingest thread writes them, the control thread reads them; all cumulative since the start */

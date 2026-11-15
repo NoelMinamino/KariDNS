@@ -131,13 +131,14 @@ DROP TRIGGER IF EXISTS karidns_changes_prune ON karidns_changes;
 CREATE TRIGGER karidns_changes_prune AFTER INSERT ON karidns_changes
   REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION karidns_changes_prune_fn();
 
--- the one place that writes the log: the distinct domain ids of a statement, then NOTIFY.  It also grows the generation of each zone that still exists
+-- the one place that writes the log: the distinct domain ids of a statement, in ascending id order (the loader reads a run of changed ids with one statement; a
+-- hash aggregate would scatter the ids of a mass change over the whole log and cost one lookup per zone), then NOTIFY.  It also grows the generation of each zone that still exists
 -- (a deleted zone's row goes with the zone) the first time the transaction changes it: the UPDATE skips a row this transaction wrote already
 -- (xmin is the transaction's own id), which keeps a row-by-row import linear.
 CREATE OR REPLACE FUNCTION karidns_log_domains(ids INTEGER[]) RETURNS void LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
   INSERT INTO karidns_changes (domain_id, changed_at)
-    SELECT DISTINCT d, extract(epoch FROM now())::bigint FROM unnest(ids) AS d WHERE d IS NOT NULL;
+    SELECT DISTINCT d, extract(epoch FROM now())::bigint FROM unnest(ids) AS d WHERE d IS NOT NULL ORDER BY d;
   INSERT INTO karidns_zone_state AS s (domain_id, generation, changed_at)
     SELECT d, 1, extract(epoch FROM now())::bigint FROM (SELECT DISTINCT x AS d FROM unnest(ids) AS x WHERE x IS NOT NULL) y
      WHERE EXISTS (SELECT 1 FROM domains WHERE id = d)

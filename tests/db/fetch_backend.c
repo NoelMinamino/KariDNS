@@ -9,7 +9,8 @@
  *   req:ID:ZONE:PRIO:MODE   send FETCH_REQ (request id ID, view 0, zone ZONE, priority 0..2, mode 0 zone / 1 summary)
  *   range:ID:ZONE:LO:HI     send FETCH_REQ with a range
  *   wait:N                  read until N answers (a whole zone or a ZONE_FAILED) have come
- *   begin:ID                read until the ZONE_BEGIN of request ID has come (the loader is busy with it)
+ *   begin:ID                read until the ZONE_BEGIN of request ID has come (the loader is busy with it; the stream is read byte by byte up to it, so the rest of the zone stays with the loader)
+ *   hold:MS                 wait MS milliseconds without reading either stream
  *   sleep:MS                keep serving the streams for MS milliseconds
  *   garbage:fetch           write bytes that are not KDB1 on the fetch stream; then wait for the loader to close it
  *   badmain                 send a FETCH_REQ on the first stream (a protocol error there); then wait for the loader to end
@@ -85,6 +86,9 @@ static bool g_startup_done;
 static unsigned g_answers;
 static uint64_t g_begin_seen[64];
 static unsigned g_nbegin;
+static bool g_hold;                      /* "begin:" is waiting: the fetch stream is read byte by byte, and no further than the ZONE_BEGIN waited for */
+static uint64_t g_hold_id;
+static bool begin_seen(void *a);
 static pid_t g_pid;
 static bool g_child_gone;
 static int g_child_status;
@@ -360,7 +364,7 @@ static void fetch_msg(const kdb_msg_t *m) {
 static void pump(chan_t *c, bool fetch) {
     uint8_t buf[65536];
     for (;;) {
-        ssize_t n = read(c->fd, buf, sizeof(buf));
+        ssize_t n = read(c->fd, buf, (fetch && g_hold) ? 1 : sizeof(buf));
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
         if (n <= 0) {
@@ -387,6 +391,7 @@ static void pump(chan_t *c, bool fetch) {
                     exit(1);
                 }
                 fetch_msg(&m);
+                if (g_hold && begin_seen(&g_hold_id)) return;      /* (the 1-byte reads leave nothing behind in the framer: the loader keeps what it still has to send, so the worker is busy) */
             } else {
                 char why[KDB_REASON_LEN];
                 if (g_store) {                                  /* the rules the Backend applies to the loader's stream */
@@ -598,7 +603,10 @@ int main(int argc, char **argv) {
             if (g_answers < want) die("timed out waiting for answers");
         } else if (strncmp(it, "begin:", 6) == 0) {
             uint64_t id = strtoull(it + 6, NULL, 10);
+            g_hold = true;                                      /* the Backend must not read the zone on: a drained zone frees the worker, and the requests that follow would find it idle */
+            g_hold_id = id;
             service(30000, begin_seen, &id);
+            g_hold = false;
             if (!begin_seen(&id)) die("timed out waiting for a ZONE_BEGIN");
         } else if (strncmp(it, "sh:", 3) == 0) {
             fflush(stdout);
@@ -618,6 +626,8 @@ int main(int argc, char **argv) {
             send_reload(false, true, (unsigned)atoi(buf), z);
         } else if (strcmp(it, "state") == 0) {
             print_state();
+        } else if (strncmp(it, "hold:", 5) == 0) {
+            usleep((useconds_t)atoi(it + 5) * 1000);            /* (no reading: the loader keeps the zone it is writing, its reader thread gets the time to queue the requests that were sent) */
         } else if (strncmp(it, "sleep:", 6) == 0) {
             service(atoi(it + 6), NULL, NULL);
         } else if (strcmp(it, "garbage:fetch") == 0) {

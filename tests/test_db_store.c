@@ -413,6 +413,17 @@ static int attach_by_worker(const char *zone, park_key_t *k) {
     return (k->failed || k->retry) ? 0 : 1;
 }
 
+static int g_hook_calls;
+static bool g_hook_locked;
+static void under_lock_hook(void *arg) {
+    (void)arg;
+    g_hook_calls++;
+    if (pthread_mutex_trylock(&g_zone_db_rebuild_lock) == 0) {            /* (it must be held by this thread: a mutex that is not recursive is busy) */
+        pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+        g_hook_locked = false;
+    }
+}
+
 /* damage one byte of the record of a zone in the segment files of the store (a plain write through another descriptor) */
 static bool damage_record(const char *dir, const char *zone) {
     for (int n = 1; n <= 4; n++) {
@@ -969,6 +980,35 @@ static int run_mode(const char *mode) {
     CHECK(attach_by_worker("none.test.", &k) != 1);
     CHECK(wake_for("none.test.", &k, 5000));                   /* (two keys: the attach thread's retry and the ingest thread's failure of a request for a zone it does not have, in either order) */
 
+    /* review L2: a request for a zone id that has no record (a deleted zone, a cell that cannot be read, an id of another view): the store thread has no name to wake by.  It tells the workers of the claim the id, so that the queries that wait for it ask for their zones themselves (they were left to run into their time) */
+    {
+        drain_wakes();
+        const uint16_t sv = (uint16_t)store_view_id(st, "default");
+        const uint32_t bogus = 0x00ABCDEFu;
+        CHECK(park_att_claim(sv, bogus, 0) == 1 && park_attach_zid(0, sv, bogus));
+        park_att_requested(sv, bogus);
+        bool gotz = false;
+        for (int t = 0; t < 5000 && !gotz; t++) {
+            park_key_t kz;
+            if (park_wake_pop(park_wake_ring(0), &kz)) gotz = kz.ask == 2 && kz.key == (((uint64_t)sv << 32) | bogus);
+            else usleep(1000);
+        }
+        CHECK(gotz);
+        CHECK(park_att_take(sv, bogus) == PARK_ATT_ALL);                       /* (the claim was taken with it) */
+    }
+
+    /* review L4: a query's request leaves the fill's share of the places free only while the fill has work (not in the pause after a failed round, not without a loader, not when its scan is over) */
+    {
+        extern bool db_ingest_test_qplace(bool bg_on, bool loader, uint32_t nbulk, int64_t retry_ms, uint32_t used, uint32_t conc);
+        CHECK(!db_ingest_test_qplace(true, true, 0, 0, 7, 8));                   /* (8 places, the fill's share is 2: 7 used leave room for the fill only) */
+        CHECK(!db_ingest_test_qplace(true, true, 0, 1, 7, 8));                   /* (a pause that is over) */
+        CHECK(db_ingest_test_qplace(true, true, 0, INT64_MAX / 2, 7, 8));        /* (in the pause: the places are the queries') */
+        CHECK(db_ingest_test_qplace(false, true, 0, 0, 7, 8));                   /* (the scan is over) */
+        CHECK(db_ingest_test_qplace(true, false, 0, 0, 7, 8));                   /* (no loader) */
+        CHECK(db_ingest_test_qplace(true, true, 2, 0, 7, 8));                    /* (the fill has its share in flight: those places are used already) */
+        CHECK(!db_ingest_test_qplace(true, true, 0, 0, 8, 8) && !db_ingest_test_qplace(false, true, 0, 0, 8, 8));   /* (all places used: nobody) */
+    }
+
     /* -- a fetch of the zone is on its way (LOADING): the attach that finds it busy gives the queries that wait the park-timeout (a retry key) */
     CHECK(evict_zone("a2.test."));
     CHECK(dbreg_fetch_begin("default", "a2.test.") == DBREG_FETCH_STARTED);            /* (the zone is out of memory, its record is stored) */
@@ -1048,15 +1088,22 @@ static int run_mode(const char *mode) {
         CHECK(dbdir()->rec_get("default", "a1.test.", &rec) && rec.state == STORE_STATE_STORED);
         CHECK(dbreg_fetch_begin("default", "a1.test.") == DBREG_FETCH_STARTED);
         zone_db_entry_t *ent = db_ingest_new_entry("default", "a1.test.", NULL);
-        CHECK(ent != NULL && dbreg_attach_store("default", "a1.test.", &rec, ent, false) == DBREG_ATT_BUSY);       /* (a fetch has the zone) */
+        CHECK(ent != NULL && dbreg_attach_store("default", "a1.test.", &rec, ent, false, NULL, NULL) == DBREG_ATT_BUSY);       /* (a fetch has the zone) */
+        /* the hook that dbreg_attach_store() calls under the registry's lock, once, whatever the outcome (the worker's staged element leaves its table in it: a later removal let a worker find an entry that an eviction retired) */
+        g_hook_calls = 0;
+        g_hook_locked = true;
+        CHECK(dbreg_attach_store("default", "a1.test.", &rec, ent, false, under_lock_hook, NULL) == DBREG_ATT_BUSY && g_hook_calls == 1 && g_hook_locked);
         dbreg_fetch_end("default", "a1.test.");
         rec.serial += 1;
-        CHECK(dbreg_attach_store("default", "a1.test.", &rec, ent, false) == DBREG_ATT_STALE);                      /* (the record is another version than the one that was read) */
+        g_hook_calls = 0;
+        CHECK(dbreg_attach_store("default", "a1.test.", &rec, ent, false, NULL, NULL) == DBREG_ATT_STALE);                      /* (the record is another version than the one that was read) */
+        CHECK(dbreg_attach_store("default", "a1.test.", &rec, ent, false, under_lock_hook, NULL) == DBREG_ATT_STALE && g_hook_calls == 1 && g_hook_locked);
         free_zone_db_entry(ent);
         CHECK(attach_by_worker("a1.test.", &k) == 1);
         CHECK(dbdir()->rec_get("default", "a1.test.", &rec));
         ent = db_ingest_new_entry("default", "a1.test.", NULL);
-        CHECK(ent != NULL && dbreg_attach_store("default", "a1.test.", &rec, ent, false) == DBREG_ATT_RESIDENT);   /* (in memory already) */
+        CHECK(ent != NULL && dbreg_attach_store("default", "a1.test.", &rec, ent, false, NULL, NULL) == DBREG_ATT_RESIDENT);   /* (in memory already) */
+        CHECK(dbreg_attach_store("default", "a1.test.", &rec, ent, false, under_lock_hook, NULL) == DBREG_ATT_RESIDENT && g_hook_calls == 2 && g_hook_locked);
         free_zone_db_entry(ent);
     }
 
@@ -1068,7 +1115,7 @@ static int run_mode(const char *mode) {
         CHECK(dbreg_delete("default", "a0.test.", 100) == 1);
         zone_db_entry_t *ent = db_ingest_new_entry("default", "a0.test.", NULL);
         CHECK(ent != NULL);
-        CHECK(dbreg_attach_store("default", "a0.test.", &rec, ent, false) == DBREG_ATT_STALE);       /* (the registry looks at the record again, inside its lock: it is gone) */
+        CHECK(dbreg_attach_store("default", "a0.test.", &rec, ent, false, NULL, NULL) == DBREG_ATT_STALE);       /* (the registry looks at the record again, inside its lock: it is gone) */
         free_zone_db_entry(ent);
         CHECK(!in_memory("a0.test."));
         zref_t z;
@@ -1821,6 +1868,7 @@ static int run_mode(const char *mode) {
     {
         const bool map = strcmp(mode, "map") == 0;
         static wk_t wk;
+        atomic_store(&db_store_test_resident, map);                /* (mincore() reports the pages that were written through a file descriptor as resident only on some file systems: UFS yes, ZFS no; the test is of the worker's attach, not of the file system) */
         const dbdir_ops_t *ops = dbdir();
         enum { NWQ = 8 };
         batch_begin(a[0], &e, 89, KDB_BATCH_DIFF);
@@ -1911,8 +1959,11 @@ static int run_mode(const char *mode) {
             wk_send(&wk, "wq6.test.", 6);
             CHECK(wk.w.n_tx == 0 && wk.table.nwait == 1);
             db_store_counters(&w1);
-            CHECK(w1.wa_full == w0.wa_full + 1 && w1.wa_ok == w0.wa_ok && w1.versions_live == w0.versions_live);        /* (nothing is left of the entry) */
+            CHECK(w1.wa_full == w0.wa_full + 1 && w1.wa_ok == w0.wa_ok);
             CHECK(wk_wait_answer(&wk, got, &glen, 5000) && (got[3] & 0x0F) == 0);
+            /* (nothing is left of the worker's entry: the store thread that was asked attached the zone meanwhile, and its version is the only one more; read before the answer the count raced with that attach) */
+            db_store_counters(&w1);
+            CHECK(w1.wa_ok == w0.wa_ok && w1.versions_live == w0.versions_live + 1);
             zref_t z6;
             CHECK(zref_of("wq6.test.", &z6) && z6.zid != ZREF_NOZID && park_att_claim((uint16_t)z6.sview, z6.zid, 6) == 1 && park_att_leave((uint16_t)z6.sview, z6.zid, 6));   /* (the claim was left) */
 
@@ -2109,6 +2160,7 @@ static int run_mode(const char *mode) {
             CHECK((int64_t)w1.versions_live - (int64_t)dbdir()->attach_count() == vbase + 0);               /* (one version for every zone in memory: no entry was lost to the race) */
         }
         wk_free(&wk);
+        atomic_store(&db_store_test_resident, false);
     }
 
     free(old_copy);
