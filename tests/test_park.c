@@ -1369,6 +1369,36 @@ static void test_att_tag(void) {
   park_unregister_worker(14);
 }
 
+/* 0.7: the mark of an entry that waits for a by-name lookup: the wake or the failure by the name (the answer) clears it, the wake of every query (park_wake_all()) and a retry do not */
+static void test_lookup_mark(void) {
+  printf("[the lookup mark of an entry]\n");
+  park_table_t t;
+  CHECK(park_init(&t, 8));
+  udp_ipc_t ipc = mk_ipc(7);
+  uint8_t pay[40];
+  memset(pay, 1, sizeof(pay));
+  const int32_t a = park_udp(&t, 1000, 1500, "v1", "a.late.test.", 3, &ipc, pay, 40), b = park_udp(&t, 1000, 1500, "v1", "b.late.test.", 3, &ipc, pay, 40),
+                c = park_udp(&t, 1000, 1500, "v1", "c.late.test.", 3, &ipc, pay, 40), d = park_udp(&t, 1000, 1500, "v1", "d.zone.test.", 3, &ipc, pay, 40);
+  CHECK(a >= 0 && b >= 0 && c >= 0 && d >= 0 && !t.e[a].lookup);
+  park_mark_lookup(&t, a);
+  park_mark_lookup(&t, b);
+  park_mark_lookup(&t, c);
+  park_mark_lookup(&t, -1);                                                       /* (no entry: nothing) */
+  park_mark_lookup(&t, 99);
+  CHECK(t.e[a].lookup && t.e[b].lookup && t.e[c].lookup && !t.e[d].lookup);
+  CHECK(park_retry(&t, "v1", "a.late.test.", 9000) == 1 && t.e[a].lookup);        /* (a retry leaves it waiting, still for the lookup) */
+  CHECK(park_wake(&t, "v1", "a.late.test.") == 1 && t.e[a].state == PARK_READY && !t.e[a].lookup);     /* the answer */
+  CHECK(park_fail(&t, "v1", "b.late.test.") == 1 && t.e[b].state == PARK_TIMEOUT && !t.e[b].lookup);   /* the failure */
+  CHECK(park_wake_all(&t) == 2 && t.e[c].state == PARK_READY && t.e[c].lookup && t.e[d].state == PARK_READY && !t.e[d].lookup);   /* no answer: the mark stays */
+  park_mark_lookup(&t, c);                                                        /* (not waiting any more: nothing) */
+  park_entry_t *e;
+  while ((e = park_next_done(&t))) park_release(&t, e);
+  CHECK(t.nfree == t.cap);
+  const int32_t a2 = park_udp(&t, 1000, 1500, "v1", "a.late.test.", 3, &ipc, pay, 40);
+  CHECK(a2 >= 0 && !t.e[a2].lookup);                                              /* (a new entry has no mark: the slot of an old one is cleared) */
+  park_free(&t);
+}
+
 int main(int argc, char **argv) {
   g_self = argv[0];
   if (argc > 1 && strcmp(argv[1], "parkmem") == 0) return park_mem_child();
@@ -1393,6 +1423,7 @@ int main(int argc, char **argv) {
   test_claim_race();
   test_att_group_and_ask();
   test_att_tag();
+  test_lookup_mark();
 #ifdef __FreeBSD__
   test_wake_queue();
   test_sleep_protocol();

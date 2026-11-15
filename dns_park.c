@@ -289,6 +289,7 @@ uint32_t park_wake_key(park_table_t *t, uint64_t key) {
     e->hnext = 0;
     wheel_remove(t, e);
     unsent_remove(t, e);
+    e->lookup = 0;                                       /* (the answer of a lookup, or any other wake by the name) */
     done_enter(t, e, PARK_READY);
     t->n_woken++;
     n++;
@@ -316,6 +317,7 @@ uint32_t park_fail_key(park_table_t *t, uint64_t key) {
     e->hnext = 0;
     wheel_remove(t, e);
     unsent_remove(t, e);
+    e->lookup = 0;
     done_enter(t, e, PARK_TIMEOUT);
     t->n_failed++;
     n++;
@@ -390,6 +392,11 @@ void park_mark_attach(park_table_t *t, int32_t idx, int64_t now_ns, int64_t full
   t->e[idx].attach = 1;
   t->e[idx].t_park_ns = now_ns;
   t->e[idx].full_ms = full_deadline_ms;
+}
+
+void park_mark_lookup(park_table_t *t, int32_t idx) {
+  if (!t->e || idx < 0 || (uint32_t)idx >= t->cap || t->e[idx].state != PARK_WAIT) return;
+  t->e[idx].lookup = 1;
 }
 
 uint32_t park_wake_all(park_table_t *t) {

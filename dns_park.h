@@ -66,6 +66,7 @@ typedef struct park_entry {
   uint8_t ulinked;                   /* the entry is in the list of the pending requests */
   uint8_t attach;                    /* 0.7 store S2: parked for an ATTACH from the store (park_mark_attach()): the deadline is the attach deadline, the time to answer is noted */
   uint8_t pend;                      /* park_pend_t: the request for the zone has not been made yet */
+  uint8_t lookup;                    /* 0.7: parked for the by-name lookup of its name (park_mark_lookup()); cleared by the wake or the failure by key (the lookup's answer), kept by park_wake_all() (a wake that says nothing: the query waits again) */
   uint8_t azid;                      /* 0.7 store: the entry waits for the attach of the stored zone `preq` (set by park_entry_attach_zid(); cleared when the wait changes to a fetch): a store thread that cannot name the zone says "zone id X failed" */
   uint32_t gen;                      /* changes every time the entry is given out */
   uint32_t blk;                      /* the payload block: class << 31 | index */
@@ -147,6 +148,9 @@ uint32_t park_ask_fetch_key(park_table_t *t, int widx, uint64_t key, int64_t new
 uint32_t park_ask_fetch_zid(park_table_t *t, int widx, uint64_t zidkey, int64_t new_deadline_ms);
 /* the entry idx (just parked) waits for an ATTACH from the store (the worker notes the time it took, dns_store_status.h), with the time in ns now; full_deadline_ms: until when the query may wait at the most (park_expire() extends the attach deadline to it instead of timing the query out: an attach that is queued behind slow reads is not a failure) */
 void park_mark_attach(park_table_t *t, int32_t idx, int64_t now_ns, int64_t full_deadline_ms);
+/* 0.7: the entry idx (just parked) waits for the answer of a by-name lookup (dns_server_core.c, udp_park_lookup()).  The wake or failure by key is that answer (it clears the mark); park_wake_all() (a wake
+ * ring that overflowed: the answer may be among the lost wakes, or not) leaves the mark, and the worker that finds it on the woken query parks the query again for the lookup instead of refusing it. */
+void park_mark_lookup(park_table_t *t, int32_t idx);
 uint32_t park_wake_all(park_table_t *t);
 /* WAIT -> TIMEOUT for every entry whose deadline is now or past.  Returns how many. */
 uint32_t park_expire(park_table_t *t, int64_t now_ms);

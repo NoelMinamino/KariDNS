@@ -49,6 +49,7 @@ static int g_checks = 0, g_failed = 0;
 
 void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ssize_t payload_received);
 void park_service(udp_pass_t *w, int kq);
+extern _Atomic bool dns_core_test_lookup_force;
 
 /* a query for www.park.test. A, with an OPT record when edns; id as given; padding: bytes of an EDNS padding option (RFC 7830) */
 static size_t build_query(uint8_t *b, uint16_t id, bool edns, size_t padding) {
@@ -77,6 +78,17 @@ static size_t build_query(uint8_t *b, uint16_t id, bool edns, size_t padding) {
         }
     }
     return o;
+}
+
+/* a query for www.late.test. A (no zone of the test has it): the lookup path */
+static size_t build_lk_query(uint8_t *b, uint16_t id) {
+    memset(b, 0, 12);
+    b[0] = (uint8_t)(id >> 8); b[1] = (uint8_t)id;
+    b[2] = 0x01;
+    b[5] = 1;
+    static const uint8_t qn[] = { 3, 'w', 'w', 'w', 4, 'l', 'a', 't', 'e', 4, 't', 'e', 's', 't', 0, 0, 1, 0, 1 };
+    memcpy(b + 12, qn, sizeof(qn));
+    return 12 + sizeof(qn);
 }
 
 /* a NOTIFY (opcode 4) or an UPDATE (opcode 5) for `name`: the zone / question section is "name SOA IN" (RFC 1996, RFC 2136 2.3) */
@@ -452,6 +464,70 @@ int main(void) {
     CHECK(a.got && a.id == 0x7001 && a.rcode == 0 && a.ancount == 1 && a.ede == -1 && table.nwait == 0);
     atomic_store(&el->entry, NULL);
     w.park_timeout_ms = 5000;
+
+    /* -- 0.7, the by-name lookup of a name that no zone covers (the store's first pass has not listed every zone: forced here): the query parks and asks for the lookup (FETCH_REQ mode 2).  A wake that is not
+     *    the answer (every query is woken after a wake ring that overflowed) parks it again for the lookup, with the deadline it had, and asks again; only the answer (a wake by the name), a failure or the
+     *    park-timeout end it, with the normal answer (REFUSED for a name no zone has) */
+    {
+        atomic_store(&dns_core_test_lookup_force, true);
+        const uint32_t used0 = park_lookup_used();
+        while (park_fetch_pop(park_fetch_ring(0), &q)) {}                                          /* (what the tests before left in the ring) */
+        #define SEND_LK(id) do { size_t ql_ = build_lk_query(rx + sizeof(udp_ipc_t), (id)); \
+            mk_ipc((udp_ipc_t *)rx, 7, ql_); w.n_tx = 0; udp_one(&w, (udp_ipc_t *)rx, rx + sizeof(udp_ipc_t), (ssize_t)ql_); } while (0)
+        SEND_LK(0x7101);
+        CHECK(w.n_tx == 0 && table.nwait == 1 && park_lookup_used() == used0 + 1);
+        CHECK(park_fetch_pop(park_fetch_ring(0), &q) && strcmp(q.zone, "www.late.test.") == 0 && q.mode == KDB_FETCH_LOOKUP && !park_fetch_pop(park_fetch_ring(0), &q));
+        const int64_t dl = park_next_deadline_ms(&table, 0);
+        /* the spurious wake: parked again with the first deadline, the request is made again, nothing is answered */
+        atomic_store(&park_wake_ring(0)->overflow, true);
+        park_service(&w, -1);
+        CHECK(table.nwait == 1 && table.nready == 0 && !read_answer(sk[1]).got && park_lookup_used() == used0 + 2);
+        CHECK(park_fetch_pop(park_fetch_ring(0), &q) && strcmp(q.zone, "www.late.test.") == 0 && q.mode == KDB_FETCH_LOOKUP);
+        CHECK(park_next_deadline_ms(&table, 0) <= dl && park_next_deadline_ms(&table, 0) >= dl - 3);
+        /* ... as often as it happens, and with no place left for a new request it still waits */
+        park_lookup_set_limit(used0 + 2);
+        atomic_store(&park_wake_ring(0)->overflow, true);
+        park_service(&w, -1);
+        CHECK(table.nwait == 1 && !read_answer(sk[1]).got && !park_fetch_pop(park_fetch_ring(0), &q) && park_lookup_used() == used0 + 2);
+        park_lookup_set_limit(PARK_LOOKUP_MAX);
+        /* the answer (a wake by the name): the query looks the name up again and, with no zone for it, is refused */
+        CHECK(park_wake_push(park_wake_ring(0), "default", "www.late.test.", false));
+        park_service(&w, -1);
+        a = read_answer(sk[1]);
+        CHECK(a.got && a.id == 0x7101 && a.rcode == 5 && a.ancount == 0 && table.nwait == 0 && table.nready == 0);
+        /* the lookup failed: the same answer at once */
+        SEND_LK(0x7102);
+        CHECK(table.nwait == 1 && park_fetch_pop(park_fetch_ring(0), &q));
+        CHECK(park_wake_push(park_wake_ring(0), "default", "www.late.test.", true));
+        park_service(&w, -1);
+        a = read_answer(sk[1]);
+        CHECK(a.got && a.id == 0x7102 && a.rcode == 5 && table.nwait == 0);
+        /* the time is up: the answer of a query that has waited the park-timeout; and a wake of every query after the deadline does not park it again */
+        w.park_timeout_ms = 5;
+        SEND_LK(0x7103);
+        CHECK(table.nwait == 1 && park_fetch_pop(park_fetch_ring(0), &q));
+        usleep(30000);
+        park_service(&w, -1);
+        a = read_answer(sk[1]);
+        CHECK(a.got && a.id == 0x7103 && a.rcode == 5 && table.nwait == 0);
+        SEND_LK(0x7104);
+        CHECK(table.nwait == 1 && park_fetch_pop(park_fetch_ring(0), &q));
+        usleep(30000);
+        CHECK(park_wake_all(&table) == 1);                                                        /* (it is READY with its mark when the worker looks: the deadline has passed) */
+        park_service(&w, -1);
+        a = read_answer(sk[1]);
+        CHECK(a.got && a.id == 0x7104 && a.rcode == 5 && table.nwait == 0 && !park_fetch_pop(park_fetch_ring(0), &q));
+        w.park_timeout_ms = 5000;
+        /* not wanted (the pass has ended: no force): refused at once, nothing parked or asked */
+        atomic_store(&dns_core_test_lookup_force, false);
+        SEND_LK(0x7105);
+        CHECK(w.n_tx == 1 && table.nwait == 0 && !park_fetch_pop(park_fetch_ring(0), &q));
+        FLUSH();
+        a = read_answer(sk[1]);
+        CHECK(a.got && a.id == 0x7105 && a.rcode == 5);
+        while (park_lookup_used() > used0) park_lookup_give();                                    /* (the ingest thread gives the places back: none runs here) */
+        #undef SEND_LK
+    }
 
     /* -- a caller that does not park (DoT, DoH: the engine looks the zone up itself): "not ready", not REFUSED */
     {
