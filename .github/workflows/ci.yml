@@ -618,8 +618,10 @@ jobs:
 
             echo "::group::🔨 [Coverage] make coverage-build"
             START=$(date +%s)
-            # the compiler and the libraries as config.mk says (libpq, when it is installed, decides COV_DB_DRIVERS)
-            ./configure
+            # the compiler and the libraries as config.mk says (libpq, when it is installed, decides COV_DB_DRIVERS).  --march=none: the build runs on
+            # other runners (coverage-shard), whose CPUs differ from this one's; the helpers and ASan builds made with the plain CFLAGS (zone2sql,
+            # fetch_backend, ...) had -march=native and died with SIGILL there (status 132)
+            ./configure --march=none
             make coverage-clean coverage-build < /dev/null
             # the helpers tests/run_all_suite.sh builds when they are missing (zone2sql, zone2kdb: the DB tests, fetch_backend: run_db_fetch_test.sh);
             # built here once, so that the 4 VMs of coverage-shard do not.  karidns-evict is not needed: the instrumented karidns has the test command
