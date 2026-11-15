@@ -2172,6 +2172,9 @@ static int run_mode(const char *mode) {
     {
         uint8_t out[1232];
         zref_t zq;
+        /* (the W section's room making under the hard line may have taken wq5 or wq2 out of memory: the engine alone does not attach, so put them back first) */
+        if (!in_memory("wq5.test.")) db_store_attach_zone("default", "wq5.test.");
+        if (!in_memory("wq2.test.")) db_store_attach_zone("default", "wq2.test.");
         for (int i = 0; i < 40000; i++) (void)ask_engine(&g_wctx, &g_cc, "www.wq5.test.", 1, out);
         for (int i = 0; i < 30000; i++) (void)ask_engine(&g_wctx, &g_cc, "www.wq2.test.", 1, out);
         CHECK(zref_of("wq5.test.", &zq) && zq.entry);
