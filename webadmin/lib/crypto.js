@@ -8,6 +8,7 @@
 import crypto from 'node:crypto';
 import { promisify } from 'node:util';
 import { ApiError } from './errors.js';
+import { readPrivateFile } from '../../node/lib/conf.js';
 
 export const sha256 = (data) => crypto.createHash('sha256').update(data).digest();
 export const randomToken = (bytes = 32) => crypto.randomBytes(bytes).toString('base64url');
@@ -188,21 +189,34 @@ export function unwrapSecret(key, principalId, text) {
 }
 
 // ---- the key file: 32 random bytes as 64 hex digits, mode 0600, made at the first start when it is missing.  fs is injected for the tests.
-export function loadKeyFile(file, fs) {
-  let text;
+// readKeyFile: the key of a file that must be there (read once, the checks made on its descriptor: a regular file, the service user's when that is known, no access for
+// others).  Throws; a missing file keeps the code ENOENT, a text that is not a key has badKey set.
+export function readKeyFile(file, fs, uid = process.getuid?.()) {
+  const check = (st) => {
+    if (!st.isFile()) return `${file} is not a regular file`;
+    if (uid !== undefined && st.uid !== uid) return `${file} is not owned by the user running karidns-webadmin`;
+    if ((st.mode & 0o077) !== 0) return `${file} has mode ${(st.mode & 0o777).toString(8).padStart(4, '0')}, it must not be readable by others (0600)`;
+    return null;
+  };
+  const text = readPrivateFile(file, { check, fsx: fs }).trim();
+  if (!/^[0-9a-f]{64}$/i.test(text)) throw Object.assign(new Error(`${file} does not hold 64 hex digits`), { badKey: true });
+  return Buffer.from(text, 'hex');
+}
+
+// (made with O_EXCL: a file that appeared in the meantime, or a link, is never written through)
+export function writeKeyFile(file, key, fs) {
+  fs.writeFileSync(file, `${key.toString('hex')}\n`, { mode: 0o600, flag: 'wx', flush: true });
+}
+
+export function loadKeyFile(file, fs, uid) {
   try {
-    const st = fs.lstatSync(file);
-    if (!st.isFile()) throw new Error(`${file} is not a regular file`);
-    if ((st.mode & 0o077) !== 0) throw new Error(`${file} has mode ${(st.mode & 0o777).toString(8).padStart(4, '0')}, it must not be readable by others (0600)`);
-    text = fs.readFileSync(file, 'utf8').trim();
+    return readKeyFile(file, fs, uid);
   } catch (e) {
     if (e.code !== 'ENOENT') throw e;
     const key = crypto.randomBytes(32);
-    fs.writeFileSync(file, `${key.toString('hex')}\n`, { mode: 0o600, flag: 'wx' });
+    writeKeyFile(file, key, fs);
     return key;
   }
-  if (!/^[0-9a-f]{64}$/i.test(text)) throw new Error(`${file} does not hold 64 hex digits`);
-  return Buffer.from(text, 'hex');
 }
 
 // ---- the ids of sessions and tokens

@@ -1,4 +1,4 @@
-.TH KARICHECK 8 "2026-11-14" "KariDNS" "KariDNS Manual"
+.TH KARICHECK 8 "2026-11-15" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karicheck.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karicheck \- Configuration and Zone File Validation Utility for KariDNS
@@ -2543,6 +2543,30 @@ written
 .br
 \fIMeaning:\fR the zone is signed by karidns-signer: the import kept its DNSSEC
 records and signer metadata, and the zone is served again after the next signing
+.TP 8
+\fBdb.import.analyze\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR imports that wrote or removed 1000 records or more refreshed the
+stale planner statistics of the records table (ANALYZE, PostgreSQL)
+.TP 8
+\fBdb.import.analyze\-skipped\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR ANALYZE of the records table was skipped: another session (a
+VACUUM or ANALYZE, often autovacuum) held its lock
+.TP 8
+\fBdb.import.analyze\-denied\fR
+\fISeverity:\fR info
+.br
+\fIMeaning:\fR the database role may not ANALYZE the records table (owner, or
+MAINTAIN on PostgreSQL 17 and later); autovacuum refreshes the statistics later
+.TP 8
+\fBdb.import.analyze\-failed\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR ANALYZE of the records table after an import failed; the import
+is committed
 .TP 8
 \fBdb.export.open\fR
 \fISeverity:\fR error

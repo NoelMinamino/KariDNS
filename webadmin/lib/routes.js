@@ -1,5 +1,6 @@
 // The route table of /api/v1 (planning 4).  Paths are relative to /api/v1.  auth: 'none' needs no credential; the rest needs a session or a token.  preTotp: a
-// session that has not done its TOTP step yet may call it.  sessionOnly: a token may not (it would make tokens that make tokens).
+// session that has not done its TOTP step yet may call it.  sessionOnly: a token may not (it would make tokens that make tokens).  bucket: one more rate limit of
+// app.buckets per principal, after rate-api and rate-write (the reloads: rate-reload).
 
 import * as auth from './handlers/auth.js';
 import * as oidc from './handlers/oidc.js';
@@ -20,6 +21,7 @@ export const ROUTES = [
   { method: 'GET', path: '/auth/me', preTotp: true, handler: auth.me },
   { method: 'POST', path: '/auth/totp', preTotp: true, sessionOnly: true, handler: auth.totp },
   { method: 'POST', path: '/auth/password', sessionOnly: true, handler: auth.password },
+  { method: 'PUT', path: '/auth/idle-timeout', sessionOnly: true, handler: auth.idleTimeout },
   { method: 'GET', path: '/auth/providers', auth: 'none', handler: oidc.providers },
   { method: 'GET', path: '/auth/oidc/:name/start', auth: 'none', handler: oidc.start },
   { method: 'GET', path: '/auth/oidc/:name/callback', auth: 'none', handler: oidc.callback },
@@ -62,8 +64,8 @@ export const ROUTES = [
   { method: 'DELETE', path: '/datasets/:ds/zones/:zone', handler: write.zoneDelete },
   { method: 'PATCH', path: '/datasets/:ds/zones/:zone/rrsets', handler: write.rrsetsPatch },
   { method: 'POST', path: '/datasets/:ds/zones/:zone/import', bodyLimit: ZIP, readTimeoutMs: IMPORT_MS, handler: write.importZone },
-  { method: 'POST', path: '/datasets/:ds/zones/:zone/reload', handler: write.reloadZone },
-  { method: 'POST', path: '/datasets/:ds/reload', handler: write.reloadAll },
+  { method: 'POST', path: '/datasets/:ds/zones/:zone/reload', bucket: 'reload', handler: write.reloadZone },
+  { method: 'POST', path: '/datasets/:ds/reload', bucket: 'reload', handler: write.reloadAll },
   { method: 'GET', path: '/datasets/:ds/zones/:zone/metadata', handler: write.metadataList },
   { method: 'PUT', path: '/datasets/:ds/zones/:zone/metadata/:kind', handler: write.metadataPut },
   { method: 'DELETE', path: '/datasets/:ds/zones/:zone/metadata/:kind', handler: write.metadataDelete },

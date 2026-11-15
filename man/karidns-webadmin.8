@@ -1,4 +1,4 @@
-.TH KARIDNS\-WEBADMIN 8 "2026-11-14" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-WEBADMIN 8 "2026-11-16" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-webadmin.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-webadmin \- the service that gives people and programs an HTTP API for
@@ -10,6 +10,7 @@ error code, every setting) is in the \fBAPI reference\fR.
 .nf
 karidns\-webadmin [\-c config] [\-\-check]
 karidns\-webadmin [\-c config] \-\-create\-admin NAME [\-\-bootstrap\-conninfo\-file FILE]
+karidns\-webadmin [\-c config] \-\-rotate\-totp\-key [\-\-bootstrap\-conninfo\-file FILE]
 karidns\-webadmin \-\-version | \-h | \-\-help
 .fi
 .SH OVERVIEW
@@ -218,13 +219,23 @@ the certificate not checked), \fBverify\-ca\fR or \fBverify\-full\fR;
 database. \fBsslrootcert\fR is not read: the certificate is checked against
 Node's CA list, so a database whose certificate comes from your own CA needs
 that CA in the environment of the service
-(\fBNODE_EXTRA_CA_CERTS=/path/to/ca.pem\fR). When \fBapi\-conninfo\-file\fR
-names a host that is not local (a Unix socket directory, \fBlocalhost\fR,
-\fB127.0.0.0/8\fR and \fB::1\fR are local) and the \fBsslmode\fR is not
-\fBrequire\fR, \fBverify\-ca\fR or \fBverify\-full\fR, \fB\-\-check\fR prints
-\fBwarning: the connection to the database at HOST is not encrypted (sslmode=X);
-use sslmode=verify\-full (require encrypts but does not check the server)\fR and
-the start writes the same warning to the log. It is a warning, not a refusal.
+(\fBNODE_EXTRA_CA_CERTS=/path/to/ca.pem\fR). To a host that is not local (a Unix
+socket directory, \fBlocalhost\fR, \fB127.0.0.0/8\fR and \fB::1\fR are local)
+\fB\fBsslmode=allow\fB and \fBprefer\fB are refused\fR (0.7): \fB\-\-check\fR
+names the problem \fBconninfo: sslmode=prefer to HOST would be plain text
+(karidns\-webadmin does not negotiate TLS): use sslmode=disable for plain text
+on purpose, or require / verify\-full\fR, and the service does not start. Write
+\fBsslmode=disable\fR when plain text is what you want, else \fBrequire\fR or
+\fBverify\-full\fR; to a local host \fBallow\fR and \fBprefer\fR still mean
+plain text, as before. A file that names such a host with \fBsslmode=disable\fR
+or no \fBsslmode\fR is a warning: \fB\-\-check\fR prints \fBwarning: the
+connection to the database at HOST is not encrypted (sslmode=X); use
+sslmode=verify\-full (require encrypts but does not check the server)\fR and the
+start writes the same warning to the log. The same rules hold for
+\fB\-\-bootstrap\-conninfo\-file\fR. Every private file of the service (the
+connection file, the client secret of a provider, the TOTP key, the TLS key) is
+opened once without following a symbolic link, and its owner and mode are
+checked on what was opened, so a file swapped in after the check is never read.
 .PP
 Several data schemas (views with their own zone data): run the role scripts once
 per schema and list the schemas in \fB[dataset NAME]\fR sections of the
@@ -416,9 +427,10 @@ server {
 With a UNIX socket put \fBlisten = /var/run/karidns_webadmin/api.sock\fR and
 \fBtrusted\-proxy = local\fR in the configuration (the rc script makes
 \fB/var/run/karidns_webadmin\fR for the pid files and the service makes the
-socket mode 0660 in it; the proxy's user must be in the group
-\fBkaridns\-webadmin\fR to open it). Any other path must be in a directory the
-service user can write.
+socket with mode 0660 from the start, under the umask 0117 while it binds, and
+refuses to start when the socket is not a socket of mode 0660 afterwards; the
+proxy's user must be in the group \fBkaridns\-webadmin\fR to open it). Any other
+path must be in a directory the service user can write.
 .SS relayd
 .RS 2
 .nf
@@ -669,10 +681,22 @@ hostile data and check that nothing runs).
 time of \fBsession\-idle\fR means what it says: the page counts down from its
 last request, warns two minutes before (a minute earlier than the service ends
 it, which writes the time of the last request at most once a minute), and "Stay
-signed in" is one request made because the person asked. When the session has
-ended, a 401 on any page opens the sign-in over what is on the screen; the same
-person goes on, another person starts at the start page. A sign-out in one tab
-signs out the others (a \fBBroadcastChannel\fR).
+signed in" is one request made because the person asked. \fB\fBsession\-idle\fB
+is the upper bound\fR: on the account screen (\fISession\fR, \fISign out after
+inactivity\fR) a user may choose a shorter idle time for all its sessions, 5,
+10, 15, 30 or 60 minutes where that is not longer than \fBsession\-idle\fR, or
+the service's default (the API takes any whole number of seconds from 60 to
+\fBsession\-idle\fR). The service enforces it (the smaller of the two, at every
+request; a SIGHUP that lowers \fBsession\-idle\fR below a user's choice applies
+at once), and the page uses it as soon as it is saved. With a short idle time
+the page's margins scale down: the end is shown min(1 minute, a quarter of the
+idle time) early, because the service writes the time of the last request at
+most that often, and the warning comes min(2 minutes, a quarter of the idle
+time) before that end (5 minutes: the warning after 2:45, the end at 4:00; 1
+minute: after 30 s, the end at 45 s). When the session has ended, a 401 on any
+page opens the sign-in over what is on the screen; the same person goes on,
+another person starts at the start page. A sign-out in one tab signs out the
+others (a \fBBroadcastChannel\fR).
 .IP \(bu 2
 \fBBrowsers.\fR Firefox ESR, Chrome and Edge (current and previous), Safari 17
 or newer; no polyfills. The accessibility target is WCAG 2.1 level AA (not
@@ -998,9 +1022,59 @@ version the service wants \[u2014] and restart. Upgrade \fBkaridns\-zone\fR and
 \fBkaricheck\fR with the same release: the service refuses a \fBkaridns\-zone\fR
 that speaks another JSON schema.
 .PP
-\fBRotate the TOTP key.\fR There is no re-wrapping: a new key makes every stored
-TOTP secret unreadable. Stop the service, remove \fBtotp.key\fR (a new one is
-made at the next start), and switch TOTP off for every user as the database
+\fBRotate the TOTP key\fR (0.7) with the service stopped, as the service user:
+.PP
+.RS 2
+.nf
+service karidns_webadmin stop
+su \-m karidns\-webadmin \-c 'karidns\-webadmin \-\-rotate\-totp\-key'                                                       # SQLite3
+su \-m karidns\-webadmin \-c 'karidns\-webadmin \-\-rotate\-totp\-key \-\-bootstrap\-conninfo\-file /var/db/karidns\-webadmin/owner.conninfo'   # PostgreSQL
+service karidns_webadmin start
+.fi
+.RE
+.PP
+It reads the old key, writes a new one to \fBtotp.key.new\fR (mode 0600, made
+with \fBO_EXCL\fR: a file or link that is there already is never written
+through), wraps every stored TOTP secret again with the new key in one
+transaction, keeps the old key as \fBtotp.key.old\fR (mode 0600; an \fB.old\fR
+of an earlier rotation is replaced, a link or another kind of file there is
+refused before anything is written, and so is an \fB.old\fR that still opens a
+stored secret: \fBN stored TOTP secret(s) still need the old key in FILE.old (a
+database restored from a backup made before the last rotation?)\fR. Those
+secrets have no other key; move \fBtotp.key.old\fR aside only when you are sure
+they are not needed, and run again \[u2014] the same rule holds for a rerun that
+finishes an earlier one), and renames \fBtotp.key.new\fR over \fBtotp.key\fR,
+syncing the directory after each step where the system allows it; it prints how
+many secrets it wrapped (\fBthe TOTP key is new: N secret(s) wrapped again with
+it in FILE\fR) and where the old key is. \fBDelete \fBtotp.key.old\fB once the
+TOTP logins work\fR (and back up the new key): it opens the secrets of the
+backups made before the rotation, so it is as secret as the key itself. On
+PostgreSQL it needs the connection of the table owner, like
+\fB\-\-create\-admin\fR: row level security shows the API role the credentials
+of its own principal only. Before it writes anything it checks the connection: a
+role that row level security binds on \fBkaridns_auth.credentials\fR (the API
+role's connection given by mistake), a role that may not read and change that
+table, or a database without the auth tables is refused with a message naming
+the table owner's connection, and the key files stay as they were. The users
+keep their TOTP apps; nobody enrols again. A run that stopped half-way is
+repeated with the same command. Until it is finished \fBtotp.key.new\fR is
+there, and the service does not start (\fBcannot start: a TOTP key rotation is
+unfinished: run \-\-rotate\-totp\-key\fR; \fB\-\-check\fR reports the same
+problem): the secrets may open with that key only. When \fBtotp.key.new\fR is
+there and some secret opens with it (the transaction was committed, the rename
+was not done), the second run adopts it: the secrets that still open with the
+old key (written by a service that ran meanwhile) are wrapped again with it in
+one transaction, the old key is kept as \fB.old\fR, and \fB.new\fR is renamed
+(\fBthe TOTP key of an earlier run is now FILE: N secret(s) that still opened
+with the old key wrapped again with it\fR); when no secret opens with it (the
+run stopped before its commit), it throws \fBtotp.key.new\fR away and rotates
+again. A \fBtotp.key.new\fR that is not the service user's regular file of mode
+0600 is refused: look at it, remove it, and run again. A secret that opens with
+neither key (the key was lost before) is left as it is and counted; reset the
+TOTP of those users (\fBPOST /api/v1/principals/{id}/credentials
+{"action":"reset\-totp"}\fR). Back up the new key file with the database. If the
+key itself is lost, there is nothing to rotate: remove \fBtotp.key\fR (a new one
+is made at the next start) and switch TOTP off for every user as the database
 owner (\fBUPDATE karidns_auth.credentials SET totp_enabled = false, totp_secret
 = NULL;\fR, or the same on the \fBcredentials\fR table of the auth file); the
 users enrol again, a global master at its next login.
@@ -1260,8 +1334,14 @@ PostgreSQL planned a nested loop that tested the policy 500,000 times: \fB2.9
 seconds\fR for one page of a zone of 1000 records, and 0.9 s (global master) for
 a zone of 100,000. The query is two statements now (the keys, then the records
 of those names): without statistics, 21 ms at 1000 records and 0.7 s at 100,000
-(global master). After a big import you can run \fBANALYZE\fR on the PowerDNS
-tables by hand; nothing breaks if you do not.
+(global master). \fBkaridns\-zone\fR (\fBimport\fR, \fBapply\fR) runs \fBANALYZE
+records\fR itself when a run wrote or removed 1000 records or more and the
+statistics are stale, if its role may: the owner of the table, or a role with
+\fBMAINTAIN\fR on it on PostgreSQL 17 and later; otherwise it says so
+(\fBdb.import.analyze\-denied\fR) and the analyze of autovacuum does it a little
+later (\fBkaridns\-zone(8)\fR). On an older server, or with a role without that
+right, you can run \fBANALYZE records\fR (or \fBANALYZE\fR on the PowerDNS
+tables) by hand as the owner after a big import; nothing breaks if you do not.
 .PP
 \fBMemory.\fR \fBkaridns\-zone apply \-\-dry\-run\fR (the check run) of a zone
 of 1,000 records: 12 MB resident; of 100,000 records: 87 MB; \fBexport\fR of
@@ -1279,8 +1359,8 @@ database on another host, and the loader's reload of a big zone (that is the
 loader's: \fBkaridns\-dbloader(8)\fR, "Measurements").
 .SH TROUBLESHOOTING
 .TS
-lbw(22) lbw(23) lbw(23)
-lw(22) lw(23) lw(23).
+lbw(20) lbw(21) lbw(27)
+lw(20) lw(21) lw(27).
 \&You see	\&Because	\&Do
 _
 T{
@@ -1312,6 +1392,35 @@ T}	T{
 \fB127.0.0.1\fR, a UNIX socket, or \fBtls\-cert\fR and \fBtls\-key\fR
 T}
 T{
+\fB\-\-check\fR: \fBconninfo: sslmode=prefer to HOST would be plain text ...\fR
+T}	T{
+\fBallow\fR and \fBprefer\fR do not try TLS in this service; to another host
+they are refused (0.7)
+T}	T{
+\fBsslmode=verify\-full\fR (or \fBrequire\fR), or \fBsslmode=disable\fR for
+plain text on purpose
+T}
+T{
+\fB\-\-check\fR: \fBwarning: N API token(s) of groups still work ...\fR
+T}	T{
+tokens made for a group before 0.7 (a group does not sign in; \fBPOST /tokens\fR
+now refuses a group with 409 \fBnot\-a\-user\fR)
+T}	T{
+make a token for a user (a service account: a user without a password), switch
+the automation to it, revoke the listed tokens (\fBDELETE
+/api/v1/tokens/{id}\fR)
+T}
+T{
+the start: \fBcannot listen on /path: the socket /path has mode 0755, 0660 is
+needed\fR
+T}	T{
+the path after the bind is not the socket of mode 0660 the service made (another
+program replaced it, or the system did not apply the umask)
+T}	T{
+look at the directory of the socket: only the service user may write it
+(\fB/var/run/karidns_webadmin\fR)
+T}
+T{
 the service restarts every 10 seconds
 T}	T{
 it cannot start (the database is down, a file has the wrong mode); standard
@@ -1336,6 +1445,13 @@ T}
 five logins a minute per address or per name; behind a proxy without
 \fBtrusted\-proxy\fR every client is one address
 T}	\&set \fBtrusted\-proxy\fR
+T{
+the update button: 429 (the button counts down)
+T}	T{
+\fBrate\-reload\fR reloads a minute per principal (6, up to 3 at once)
+T}	T{
+wait; raise \fBrate\-reload\fR (SIGHUP)
+T}
 \&a write: 403 \fBcsrf\fR	T{
 the cookie request lacks \fBX\-KariDNS\-CSRF\fR or \fBOrigin\fR
 T}	T{
@@ -1371,7 +1487,9 @@ the zone kept changing under the request (another writer, the signer)
 T}	\&retry
 T{
 a change is in the database but the DNS answer is old
-T}	\&no reload was asked for	T{
+T}	T{
+no reload was asked for
+T}	T{
 \fBPOST .../reload\fR, or \fBreload: true\fR, or \fBreload\-after\-change =
 yes\fR; a zone the signer keeps signed is reloaded by the signer
 T}

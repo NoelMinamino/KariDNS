@@ -18,6 +18,8 @@
 --   USAGE on the schema.
 --   SELECT, INSERT, UPDATE, DELETE on domains, records and domainmetadata (the zone, its records, the metadata the importer owns:
 --   PRESIGNED, NSEC3PARAM, X-KARIDNS-FORMAT; every other metadata row is only read, never touched).
+--   PostgreSQL 17 and later: MAINTAIN on records (0.7: the importer runs ANALYZE records after an import that wrote or removed 1000 records or more;
+--   the locks MAINTAIN allows are no more than UPDATE and DELETE already allow).  Before 17 only the owner may ANALYZE, and autovacuum does it later.
 --   SELECT on every karidns_* table of the schema (the schema version, the views, ...), and SELECT, INSERT, UPDATE, DELETE on the zone tables
 --   the importer writes: karidns_domain_views, karidns_record_tags, karidns_record_tinydns, karidns_zone_tagdefs.
 --   The change log: the triggers of db/karidns_ext.pgsql.sql run with the rights of the role that writes, so the importer needs INSERT on
@@ -45,6 +47,11 @@ GRANT USAGE ON SCHEMA :"schema" TO :"role";
 GRANT SELECT, INSERT, UPDATE, DELETE ON :"schema".domains, :"schema".records, :"schema".domainmetadata TO :"role";
 REVOKE ALL ON :"schema".cryptokeys FROM :"role";
 GRANT SELECT (domain_id) ON :"schema".cryptokeys TO :"role";
+-- PostgreSQL 17 and later: MAINTAIN on records, so that karidns-zone can ANALYZE it after a large import (0.7; before 17 only the owner may)
+SELECT current_setting('server_version_num')::int >= 170000 AS pg17 \gset
+\if :pg17
+GRANT MAINTAIN ON :"schema".records TO :"role";
+\endif
 
 -- every karidns_* table can be read (the schema version, the views, the tag tables)
 SELECT format('GRANT SELECT ON %I.%I TO %I', :'schema', c.relname, :'role')

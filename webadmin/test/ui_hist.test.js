@@ -3,7 +3,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { bootApp, reply, problem, flush, findAll, byText, GRANT_GLOBAL, POLICY } from './ui_boot.js';
+import { bootApp, reply, problem, flush, findAll, byText, GRANT_GLOBAL, POLICY, VERSION } from './ui_boot.js';
 import { FakeEvent } from './fakedom.js';
 
 const INFO = {
@@ -537,4 +537,26 @@ test('a screen that is left stops what it was doing: no write to a page that is 
     await ui.go('#/about');
     assert.equal(ui.q('h1').textContent, 'About', hash);
   }
+});
+
+// ---------------------------------------------------------------------------------------------------------------------------------- T-1
+test('T-1: a service that cannot ask for a reload (reload_available false): the rollback and the template have no reload box, the note instead, and send no reload', async () => {
+  const version = { ...VERSION, ui: { ...VERSION.ui, reload_available: false, reload_after_change: true } };
+  const sent = [];
+  const ui = await bootApp({ version, routes: histRoutes({ [`POST ${V}/2/rollback`]: (b) => { sent.push(b); return reply(200, rb()); }, [`GET ${V}/2`]: () => reply(200, { version: { ...DELTA.version, version: 2 }, rrsets: [], next_cursor: null }) }), hash: `${ZONE}/versions/2` });
+  assert.equal(ui.input('reload'), undefined);
+  assert.match(ui.text(), /This service is not set up to ask the servers to load the zone again \(an administrator sets karictl-config\)\./);
+  await ui.click(ui.button(/^Preview the rollback$/));
+  assert.deepEqual(sent, [{ dry_run: true }], 'no reload is sent');
+  labelled(ui);
+  const tpl = [];
+  const apply = await bootApp({ version, routes: zoneRoutes({}, { 'GET /templates': () => reply(200, TEMPLATES), 'POST /datasets/main/zones/example.test./apply-template': (b) => { tpl.push(b); return reply(200, { dry_run: true, allowed: true, diff: [], messages: [] }); } }), hash: `${ZONE}/template` });
+  assert.equal(apply.input('reload'), undefined);
+  assert.match(apply.text(), /not set up to ask the servers/);
+  await apply.click(apply.button(/^Preview$/));
+  assert.equal('reload' in tpl[0], false);
+  // reload_after_change ticks the box where a reload is available
+  const ticked = await bootApp({ version: { ...VERSION, ui: { ...VERSION.ui, reload_available: true, reload_after_change: true } }, routes: histRoutes({ [`GET ${V}/2`]: () => reply(200, { version: { ...DELTA.version, version: 2 }, rrsets: [], next_cursor: null }) }), hash: `${ZONE}/versions/2` });
+  assert.equal(ticked.input('reload').checked, true);
+  assert.doesNotMatch(ticked.text(), /not set up to ask the servers/);
 });

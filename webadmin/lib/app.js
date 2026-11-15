@@ -52,13 +52,16 @@ export class App {
     const s = this.settings;
     const old = this.buckets;
     // the counters survive a reload when the rates did not change
-    const same = old && old.rates === `${s['rate-login']}/${s['rate-api']}/${s['rate-write']}`;
+    const rates = `${s['rate-login']}/${s['rate-api']}/${s['rate-write']}/${s['rate-reload']}`;
+    const same = old && old.rates === rates;
     this.buckets = same ? old : {
-      rates: `${s['rate-login']}/${s['rate-api']}/${s['rate-write']}`,
+      rates,
       loginIp: new Buckets({ rate: s['rate-login'] / 60, burst: s['rate-login'], now: this.now }),
       loginUser: new Buckets({ rate: s['rate-login'] / 60, burst: s['rate-login'], now: this.now }),
       api: new Buckets({ rate: s['rate-api'], burst: s['rate-api'] * 2, now: this.now }),
       write: new Buckets({ rate: s['rate-write'], burst: s['rate-write'] * 2, now: this.now }),
+      // a reload of a zone or of a dataset (0.7): per minute, the burst half of that (6 a minute, 3 at once by default); every grant holder of a zone has the button
+      reload: new Buckets({ rate: s['rate-reload'] / 60, burst: Math.max(1, Math.ceil(s['rate-reload'] / 2)), now: this.now }),
     };
   }
 

@@ -8,7 +8,7 @@ import path from 'node:path';
 import http from 'node:http';
 import https from 'node:https';
 import { spawnSync } from 'node:child_process';
-import { Router, reply, Reply, clientAddress, listen, closeServer, dispatch, reloadTls } from '../lib/http.js';
+import { Router, reply, Reply, clientAddress, listen, closeServer, dispatch, reloadTls, socketProblem } from '../lib/http.js';
 import { ApiError } from '../lib/errors.js';
 import { deploy, cast } from './helpers.js';
 
@@ -221,11 +221,20 @@ test('a UNIX socket', { skip: process.platform === 'win32' }, withDeploy({}, asy
   const s = d.app.settings.listen;
   d.app.settings.listen = sock;
   fs.writeFileSync(sock, 'a stale file that is not a socket');
+  // the umask is 0117 while the socket is bound, and the old one is back at once: also when the bind fails
+  const masks = [];
+  const proc = { umask: (m) => { masks.push(m); return process.umask(m); } };
+  const before = process.umask(0o022);
+  process.umask(before);
   try {
-    await assert.rejects(listen(d.app, new Router([])), /EADDRINUSE|EEXIST|listen/);
+    await assert.rejects(listen(d.app, new Router([]), { proc }), /EADDRINUSE|EEXIST|listen/);
+    assert.deepEqual(masks, [0o117, before]);
+    assert.equal(process.umask(before), before);
     fs.rmSync(sock);
-    const server = await listen(d.app, new Router([{ method: 'GET', path: '/health', auth: 'none', handler: () => ({ ok: true }) }]));
-    assert.equal(fs.statSync(sock).mode & 0o777, 0o660);
+    masks.length = 0;
+    const server = await listen(d.app, new Router([{ method: 'GET', path: '/health', auth: 'none', handler: () => ({ ok: true }) }]), { proc });
+    assert.deepEqual(masks, [0o117, before]);
+    assert.equal(fs.lstatSync(sock).mode & 0o777, 0o660, 'born 0660, no chmod afterwards');
     const res = await new Promise((resolve, reject) => {
       http.get({ socketPath: sock, path: '/api/v1/health' }, (r) => { let t = ''; r.on('data', (c) => { t += c; }); r.on('end', () => resolve(t)); }).on('error', reject);
     });
@@ -234,11 +243,27 @@ test('a UNIX socket', { skip: process.platform === 'win32' }, withDeploy({}, asy
     // a socket left by a dead server is replaced
     const again = await listen(d.app, new Router([]));
     await closeServer(again);
+    // a path that is not the 0660 socket after the bind: the start is refused and the server closed
+    const lie = { ...fs, lstatSync: (f) => Object.assign(fs.lstatSync(f), { mode: 0o140755 }) };
+    await assert.rejects(listen(d.app, new Router([]), { fsx: lie }), /^Error: the socket .*api\.sock has mode 0755, 0660 is needed$/);
+    const third = await listen(d.app, new Router([]));
+    await closeServer(third);
   } finally {
     d.app.settings.listen = s;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }));
+
+test('socketProblem: the path after listen is the socket of mode 0660, or the start is refused', () => {
+  const at = (st) => ({ lstatSync: () => { if (st instanceof Error) throw st; return st; } });
+  const sock = (mode, isSocket = true) => ({ isSocket: () => isSocket, mode });
+  assert.equal(socketProblem('/s', at(sock(0o140660))), null);
+  assert.equal(socketProblem('/s', at(sock(0o140666))), 'the socket /s has mode 0666, 0660 is needed');
+  assert.equal(socketProblem('/s', at(sock(0o100660, false))), '/s is not a socket after listen');
+  assert.equal(socketProblem('/s', at(Object.assign(new Error('gone'), { code: 'ENOENT' }))), '/s is not there after listen (ENOENT)');
+  assert.equal(socketProblem('/s', at(new Error('odd'))), '/s is not there after listen (odd)');
+  assert.match(socketProblem(path.join(os.tmpdir(), 'kw-no-such-socket')), /is not there after listen \(ENOENT\)$/);
+});
 
 test('dispatch outside the server: the client address of a request through a trusted proxy', withDeploy({ settings: { 'trusted-proxy': '127.0.0.1', 'rate-login': 2 } }, async (d) => {
   // the proxy is the peer (127.0.0.1); the logins of two clients behind it are counted apart
@@ -250,6 +275,8 @@ test('dispatch outside the server: the client address of a request through a tru
 }));
 
 const OPENSSL = spawnSync('openssl', ['version']);
+// (Windows has no POSIX modes: a file there shows 0666, so the TLS tests let the key file look like the 0600 file it is on the server)
+const keyFs = process.platform === 'win32' ? { ...fs, fstatSync: (fd) => Object.assign(fs.fstatSync(fd), { mode: 0o100600 }) } : fs;
 
 test('built-in TLS: tls-cert and tls-key, TLS 1.2 or newer', { skip: OPENSSL.status !== 0 && 'openssl is not installed' }, withDeploy({}, async (d) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kw-tls-'));
@@ -259,10 +286,11 @@ test('built-in TLS: tls-cert and tls-key, TLS 1.2 or newer', { skip: OPENSSL.sta
     const made = spawnSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes', '-keyout', key, '-out', crt, '-days', '2', '-subj', '/CN=localhost',
       '-addext', 'subjectAltName=IP:127.0.0.1,DNS:localhost']);
     assert.equal(made.status, 0, String(made.stderr));
+    fs.chmodSync(key, 0o600);
     d.app.settings['tls-cert'] = crt;
     d.app.settings['tls-key'] = key;
     d.app.settings['public-origin'] = 'https://localhost';
-    const server = await listen(d.app, new Router([{ method: 'GET', path: '/health', auth: 'none', handler: () => ({ tls: true }) }]));
+    const server = await listen(d.app, new Router([{ method: 'GET', path: '/health', auth: 'none', handler: () => ({ tls: true }) }]), { fsx: keyFs });
     try {
       const get = (extra = {}) => new Promise((resolve, reject) => {
         https.get({ host: '127.0.0.1', port: server.address().port, path: '/api/v1/health', ca: fs.readFileSync(crt), servername: 'localhost', ...extra }, (r) => {
@@ -304,7 +332,8 @@ test('built-in TLS: SIGHUP reads the certificate and key again (reloadTls); a fi
     d.app.settings['public-origin'] = 'https://localhost';
     fs.copyFileSync(a.crt, d.app.settings['tls-cert']);
     fs.copyFileSync(a.key, d.app.settings['tls-key']);
-    const server = await listen(d.app, new Router([{ method: 'GET', path: '/health', auth: 'none', handler: () => ({ tls: true }) }]));
+    fs.chmodSync(d.app.settings['tls-key'], 0o600);
+    const server = await listen(d.app, new Router([{ method: 'GET', path: '/health', auth: 'none', handler: () => ({ tls: true }) }]), { fsx: keyFs });
     try {
       const fingerprint = () => new Promise((resolve, reject) => {
         const req = https.get({ host: '127.0.0.1', port: server.address().port, path: '/api/v1/health', rejectUnauthorized: false, agent: false }, (r) => {
@@ -318,12 +347,19 @@ test('built-in TLS: SIGHUP reads the certificate and key again (reloadTls); a fi
       assert.match(first, /^[0-9A-F:]{95}$/);
       fs.copyFileSync(b.crt, d.app.settings['tls-cert']);
       fs.copyFileSync(b.key, d.app.settings['tls-key']);
+      fs.chmodSync(d.app.settings['tls-key'], 0o600);
       assert.equal(await fingerprint(), first, 'nothing changes until the files are read again');
-      assert.equal(reloadTls(server, d.app.settings), true);
+      assert.equal(reloadTls(server, d.app.settings, { fsx: keyFs }), true);
       const second = await fingerprint();
       assert.notEqual(second, first);
+      // the key is a private file: one that others may read is refused, the certificate in use stays
+      if (process.platform !== 'win32') {
+        fs.chmodSync(d.app.settings['tls-key'], 0o644);
+        assert.throws(() => reloadTls(server, d.app.settings), /live\.key has mode 0644, it must be 0600 or 0400$/);
+        fs.chmodSync(d.app.settings['tls-key'], 0o600);
+      }
       fs.rmSync(d.app.settings['tls-cert']);
-      assert.throws(() => reloadTls(server, d.app.settings), /ENOENT/);
+      assert.throws(() => reloadTls(server, d.app.settings, { fsx: keyFs }), /ENOENT/);
       assert.equal(await fingerprint(), second, 'the certificate in use stays');
       assert.equal(reloadTls(server, { ...d.app.settings, 'tls-cert': undefined }), false);
     } finally {

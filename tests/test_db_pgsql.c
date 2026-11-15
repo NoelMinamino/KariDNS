@@ -1871,6 +1871,126 @@ static void test_audit(void) {
     Q("DELETE FROM karidns_auth.audit_log");
 }
 
+/* 0.7: w_analyze (ANALYZE records after a large import) for the owner, a role that is neither the owner nor holds MAINTAIN (nothing is run), MAINTAIN
+ * (PostgreSQL 17 and later), a member of the owning role, a schema without records, fresh statistics (not needed), a never analyzed table, the
+ * server's count of changed rows, the lock held by another session (skipped at once, no wait, no error), and the calls it refuses */
+#define AN_MANY 100000000u                              /* a count of changed rows that makes any table of the test stale */
+static void test_analyze(void) {
+    printf("w_analyze\n");
+    db_source_t src = { "postgresql", NULL, g_ci, NULL, 300 };
+    char err[DB_ERRLEN], sql[400];
+    db_conn_t *ro = open_drv(NULL), *c = NULL;
+    CHECK(D->open_write(&c, &src, err, sizeof(err)) == 0);
+    if (!ro || !c) return;
+    const char *cnt = "SELECT analyze_count FROM pg_stat_user_tables WHERE relid = 'public.records'::regclass";
+    db_analyze_t ar = DB_ANALYZE_DONE;
+    CHECK(D->w_analyze(ro, AN_MANY, &ar) == -1 && ar == DB_ANALYZE_DENIED);            /* the loader's connection is read only */
+    CHECK_HAS(D->errmsg(ro), "writable connection outside a transaction");
+    CHECK(D->w_begin(c, "an.test") == 0);
+    ar = DB_ANALYZE_DONE;
+    CHECK(D->w_analyze(c, AN_MANY, &ar) == -1 && ar == DB_ANALYZE_DENIED);             /* not inside a transaction (call it after w_commit) */
+    CHECK(D->w_rollback(c) == 0);
+    /* the test's role: a superuser, which pg_has_role() counts as the owner; the caller's count makes the statistics stale */
+    long n0 = pg_count(cnt);
+    CHECK_MSG(D->w_analyze(c, AN_MANY, &ar) == 0 && ar == DB_ANALYZE_DONE, "%d %s", (int)ar, D->errmsg(c));
+    CHECK_MSG(pg_count(cnt) == n0 + 1, "analyze_count %ld -> %ld", n0, pg_count(cnt));
+    /* (fresh statistics: below, on a table nothing else writes; the counters of the earlier tests' connections may still arrive here) */
+    /* another session holds SHARE UPDATE EXCLUSIVE (as a running VACUUM or ANALYZE does): ANALYZE (SKIP_LOCKED) neither waits (lock_timeout is
+     * 300 ms here; it returns at once) nor fails: skipped */
+    Q("BEGIN");
+    Q("LOCK TABLE records IN SHARE UPDATE EXCLUSIVE MODE");
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int rc = D->w_analyze(c, AN_MANY, &ar);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    Q("ROLLBACK");
+    long ms = (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000);
+    CHECK_MSG(rc == 0 && ar == DB_ANALYZE_SKIPPED, "locked: %d %d %s", rc, (int)ar, D->errmsg(c));
+    CHECK_MSG(ms < 250, "locked: w_analyze waited %ld ms", ms);
+    CHECK_MSG(pg_count(cnt) == n0 + 1, "locked: analyze_count %ld -> %ld", n0 + 1, pg_count(cnt));
+    /* and the notice receiver is the quiet one again: the next ANALYZE is done, not "skipped" by a stale flag */
+    CHECK_MSG(D->w_analyze(c, AN_MANY, &ar) == 0 && ar == DB_ANALYZE_DONE, "after the lock: %d %s", (int)ar, D->errmsg(c));
+    CHECK(pg_count(cnt) == n0 + 2);
+
+    char role[64], own[64];
+    snprintf(role, sizeof(role), "karidns_test_an_%d", (int)getpid());
+    snprintf(own, sizeof(own), "karidns_test_ao_%d", (int)getpid());
+    snprintf(sql, sizeof(sql), "CREATE ROLE %s", role);
+    PGresult *cr = PQexec(g_maintc, sql);
+    bool have_role = PQresultStatus(cr) == PGRES_COMMAND_OK;
+    PQclear(cr);
+    if (!have_role) {
+        printf("  [SKIP] the PostgreSQL role may not create roles: the cases of other roles are not tested\n");
+    } else {
+        snprintf(sql, sizeof(sql), "CREATE ROLE %s; GRANT USAGE ON SCHEMA public TO %s, %s; GRANT SELECT, INSERT, UPDATE, DELETE ON records TO %s", own, role, own, role);
+        Q(sql);
+        /* neither the owner nor MAINTAIN: 0, DB_ANALYZE_DENIED, nothing run (ANALYZE would only print a WARNING) */
+        snprintf(sql, sizeof(sql), "SET ROLE %s", role);
+        CHECK(qx(c->pg, sql));
+        n0 = pg_count(cnt);
+        ar = DB_ANALYZE_DONE;
+        CHECK_MSG(D->w_analyze(c, AN_MANY, &ar) == 0 && ar == DB_ANALYZE_DENIED, "%d %s", (int)ar, D->errmsg(c));
+        CHECK(pg_count(cnt) == n0);
+        CHECK(qx(c->pg, "RESET ROLE"));
+        /* MAINTAIN on records (PostgreSQL 17 and later; the text without MAINTAIN is the one of older servers) */
+        if (PQserverVersion(g_admin) >= 170000) {
+            snprintf(sql, sizeof(sql), "GRANT MAINTAIN ON records TO %s", role);
+            Q(sql);
+            snprintf(sql, sizeof(sql), "SET ROLE %s", role);
+            CHECK(qx(c->pg, sql));
+            CHECK_MSG(D->w_analyze(c, AN_MANY, &ar) == 0 && ar == DB_ANALYZE_DONE, "MAINTAIN: %d %s", (int)ar, D->errmsg(c));
+            CHECK(pg_count(cnt) == n0 + 1);
+            CHECK(qx(c->pg, "RESET ROLE"));
+        } else {
+            printf("  [note] PostgreSQL < 17: the MAINTAIN case is not tested\n");
+        }
+        /* the owner of the table is a role (not a superuser), and a member of it may too: records of a schema of its own, found through the
+         * search_path of the connection (a new table, never analyzed; autovacuum kept off it, so that only the test analyzes it); a schema without records
+         * is "may not" */
+        snprintf(sql, sizeof(sql), "DROP SCHEMA IF EXISTS an_own CASCADE; CREATE SCHEMA an_own; CREATE TABLE an_own.records (id int) WITH (autovacuum_enabled = off); ALTER TABLE an_own.records OWNER TO %s; "
+                                   "GRANT USAGE ON SCHEMA an_own TO %s, %s; GRANT %s TO %s", own, own, role, own, role);
+        Q(sql);
+        D->close(c);
+        c = NULL;
+        src.schema = "an_own";
+        CHECK(D->open_write(&c, &src, err, sizeof(err)) == 0);
+        if (c) {
+            snprintf(sql, sizeof(sql), "SET ROLE %s", own);
+            CHECK(qx(c->pg, sql));
+            /* never analyzed: done, whatever the caller's count */
+            CHECK_MSG(D->w_analyze(c, 0, &ar) == 0 && ar == DB_ANALYZE_DONE, "owner, never analyzed: %d %s", (int)ar, D->errmsg(c));
+            snprintf(sql, sizeof(sql), "SET ROLE %s", role);
+            CHECK(qx(c->pg, sql));
+            CHECK_MSG(D->w_analyze(c, 0, &ar) == 0 && ar == DB_ANALYZE_NOT_NEEDED, "member of the owner, fresh: %d %s", (int)ar, D->errmsg(c));
+            CHECK(D->w_analyze(c, 49, &ar) == 0 && ar == DB_ANALYZE_NOT_NEEDED);       /* below autovacuum's threshold, 50 + 10 % of 0 rows */
+            CHECK(D->w_analyze(c, 50, &ar) == 0 && ar == DB_ANALYZE_DONE);             /* the caller's count reaches it */
+            CHECK(D->w_analyze(c, 0, &ar) == 0 && ar == DB_ANALYZE_NOT_NEEDED);
+            /* the server's count of changed rows (another session's 60 inserts; 50 + 10 % of 0 rows) makes it stale without the caller's count
+             * (PostgreSQL 15 and later flush a session's counters on demand; before, the collector may take a moment) */
+            if (PQserverVersion(g_admin) >= 150000) {
+                Q("INSERT INTO an_own.records SELECT generate_series(1, 60); SELECT pg_stat_force_next_flush()");
+                CHECK_MSG(D->w_analyze(c, 0, &ar) == 0 && ar == DB_ANALYZE_DONE, "member of the owner, 60 rows changed: %d %s", (int)ar, D->errmsg(c));
+                CHECK(pg_count("SELECT analyze_count FROM pg_stat_user_tables WHERE relid = 'an_own.records'::regclass") == 3);
+            } else {
+                CHECK_MSG(D->w_analyze(c, AN_MANY, &ar) == 0 && ar == DB_ANALYZE_DONE, "member of the owner: %d %s", (int)ar, D->errmsg(c));
+                printf("  [note] PostgreSQL < 15: the server's count of changed rows is not tested\n");
+            }
+            CHECK(qx(c->pg, "RESET ROLE"));
+            Q("DROP TABLE an_own.records");
+            ar = DB_ANALYZE_DONE;
+            CHECK_MSG(D->w_analyze(c, AN_MANY, &ar) == 0 && ar == DB_ANALYZE_DENIED, "no records: %d %s", (int)ar, D->errmsg(c));
+        }
+        Q("DROP SCHEMA an_own CASCADE");
+        snprintf(sql, sizeof(sql), "DROP OWNED BY %s, %s", role, own);
+        Q(sql);
+        snprintf(sql, sizeof(sql), "DROP ROLE %s", role);
+        PQclear(PQexec(g_maintc, sql));
+        snprintf(sql, sizeof(sql), "DROP ROLE %s", own);
+        PQclear(PQexec(g_maintc, sql));
+    }
+    if (c) D->close(c);
+    D->close(ro);
+}
 
 int main(int argc, char **argv) {
     snprintf(g_root, sizeof(g_root), "%s", argc > 1 ? argv[1] : "tests/db");
@@ -1948,6 +2068,7 @@ int main(int argc, char **argv) {
     test_v1_and_migration();
     test_writes();
     test_audit();
+    test_analyze();
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }

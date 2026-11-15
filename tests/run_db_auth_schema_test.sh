@@ -292,7 +292,7 @@ else
     pq "TRUNCATE karidns_auth.audit_log" > /dev/null
     pq "INSERT INTO domains (name, type) VALUES ('nolog.test', 'NATIVE'); DELETE FROM domains WHERE name = 'nolog.test'" > /dev/null
     eq "so a change of the PowerDNS tables is not logged" "0" "SELECT count(*) FROM karidns_auth.audit_log"
-    eq "the audit of the karidns_auth tables is attached (9 tables)" "9" "SELECT count(*) FROM pg_trigger WHERE tgname = 'karidns_audit_row' AND tgrelid::regclass::text LIKE 'karidns_auth.%'"
+    eq "the audit of the karidns_auth tables is attached (10 tables, preferences included)" "10" "SELECT count(*) FROM pg_trigger WHERE tgname = 'karidns_audit_row' AND tgrelid::regclass::text LIKE 'karidns_auth.%'"
     eq "enable_audit('public') attaches 10 tables (cryptokeys, the key requests and the signer state included)" "10" "SELECT karidns_auth.enable_audit('public')"
     eq "enable_audit is idempotent" "10" "SELECT karidns_auth.enable_audit('public')"
     eq "...with one row trigger, three statement triggers and the zone trigger on domains" "5" "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'karidns_audit%' AND tgrelid = 'domains'::regclass"
@@ -632,6 +632,23 @@ else
     [ "$(sqlite3 "$AUTHDB" "SELECT (SELECT count(*) FROM memberships WHERE member_id NOT IN (SELECT id FROM principals) OR group_id NOT IN (SELECT id FROM principals)) || (SELECT count(*) FROM credentials WHERE principal_id NOT IN (SELECT id FROM principals)) || (SELECT count(*) FROM grants WHERE principal_id NOT IN (SELECT id FROM principals)) || (SELECT count(*) FROM principal_closure WHERE member_id NOT IN (SELECT id FROM principals) OR group_id NOT IN (SELECT id FROM principals))")" = "0000" ] &&
         pass "with foreign keys off the principals delete trigger removes memberships, credentials, grants and closure rows" || fail "the delete trigger with foreign keys off"
     closure_check "the closure after the deletes with foreign keys off"
+
+    # ---- preferences (0.7): the idle time a user chose; at least 60 seconds, audited, deleted with the principal; a file made before 0.7 gets it when the file is applied again
+    echo "-- preferences (the auth file)"
+    sqlite3 "$AUTHDB" "DELETE FROM karidns_auth_audit; INSERT INTO principals (kind, name) VALUES ('user', 'pref')"
+    X_OK "INSERT INTO preferences (principal_id, idle_timeout) SELECT id, 600 FROM principals WHERE name = 'pref'" && pass "a preference row is made" || fail "a preference row"
+    X_ERR "an idle time under 60 seconds is refused" "CHECK" "UPDATE preferences SET idle_timeout = 59"
+    X_ERR "...and one that is text" "CHECK" "UPDATE preferences SET idle_timeout = '600x'"
+    X_ERR "a preference of no principal is refused" "FOREIGN KEY" "INSERT INTO preferences (principal_id, idle_timeout) VALUES (999999, 600)"
+    X_OK "INSERT INTO preferences (principal_id, idle_timeout) SELECT id, NULL FROM principals WHERE name = 'pref' ON CONFLICT (principal_id) DO UPDATE SET idle_timeout = excluded.idle_timeout" && pass "...an upsert with NULL clears it" || fail "the upsert of a preference"
+    [ "$(sqlite3 "$AUTHDB" "SELECT group_concat(op || ':' || coalesce(json_extract(before, '\$.idle_timeout'), '-') || '>' || coalesce(json_extract(after, '\$.idle_timeout'), '-'), ',') FROM (SELECT * FROM karidns_auth_audit WHERE table_name = 'preferences' ORDER BY id)")" = "I:->600,U:600>-" ] &&
+        pass "...the audit has the insert and the update with before and after" || fail "the audit of preferences: $(sqlite3 "$AUTHDB" "SELECT group_concat(op) FROM karidns_auth_audit WHERE table_name = 'preferences'")"
+    sqlite3 "$AUTHDB" "PRAGMA foreign_keys = OFF; DELETE FROM principals WHERE name = 'pref'"
+    [ "$(sqlite3 "$AUTHDB" "SELECT count(*) FROM preferences")" = "0" ] && pass "a deleted principal takes its preferences (foreign keys off: the delete trigger)" || fail "preferences after the delete of the principal"
+    sqlite3 "$AUTHDB" "DROP TRIGGER karidns_audit_preferences_ins; DROP TRIGGER karidns_audit_preferences_upd; DROP TRIGGER karidns_audit_preferences_del; DROP TABLE preferences"
+    sqlite3 "$AUTHDB" < db/karidns_auth.sqlite3.sql && [ "$(sqlite3 "$AUTHDB" "SELECT count(*) FROM sqlite_master WHERE name IN ('preferences', 'karidns_audit_preferences_ins', 'karidns_audit_preferences_upd', 'karidns_audit_preferences_del')")|$(sqlite3 "$AUTHDB" "SELECT max(version) FROM schema_version")" = "4|3" ] &&
+        pass "a version 3 file made before 0.7 (no preferences) gets the table and its triggers when the file is applied again; the version stays 3" || fail "the auth file applied again to a file without preferences"
+    sqlite3 "$AUTHDB" "DELETE FROM karidns_auth_audit"
 
     # ---- the zone file: audit tables, audit triggers, the actor
     echo "-- the zone file"

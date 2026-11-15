@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import {
   sha256, randomToken, safeEqual, Semaphore, hashPassword, verifyPassword, base32, base32Decode, hotp, totpStep, totpVerify, otpauthUri, wrapSecret, unwrapSecret,
-  loadKeyFile, sessionHash, csrfToken, csrfHash, tokenText, parseToken, tokenHash, argon2Available,
+  loadKeyFile, readKeyFile, sessionHash, csrfToken, csrfHash, tokenText, parseToken, tokenHash, argon2Available,
 } from '../lib/crypto.js';
 
 test('sha256, random tokens, constant time comparison', () => {
@@ -138,26 +138,36 @@ test('the TOTP secret at rest: AES-256-GCM, bound to the principal', () => {
   assert.notEqual(wrapSecret(key, 7, 'x'), wrapSecret(key, 7, 'x'));
 });
 
+// (the key file is opened once and looked at through the descriptor: openSync, fstatSync, readFileSync(fd), closeSync)
 function fakeFs(initial) {
   const files = new Map(initial);
+  const fds = new Map();
+  const reads = [];
   return {
     files,
-    lstatSync: (f) => { const e = files.get(f); if (!e) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); return { isFile: () => !e.notFile, mode: e.mode }; },
-    readFileSync: (f) => files.get(f).text,
-    writeFileSync: (f, text, o) => { assert.equal(o.flag, 'wx'); assert.equal(o.mode, 0o600); files.set(f, { text, mode: 0o100600 }); },
+    reads,
+    openSync: (f) => { if (!files.has(f)) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); fds.set(fds.size + 3, f); return fds.size + 2; },
+    fstatSync: (fd) => { const e = files.get(fds.get(fd)); return { isFile: () => !e.notFile, mode: e.mode, uid: e.uid ?? 1000 }; },
+    readFileSync: (fd) => { reads.push(fd); return files.get(fds.get(fd)).text; },
+    closeSync: () => {},
+    writeFileSync: (f, text, o) => { assert.deepEqual(o, { mode: 0o600, flag: 'wx', flush: true }); files.set(f, { text, mode: 0o100600 }); },
   };
 }
 
-test('the key file: made at the first start, then read; wrong modes and contents are refused', () => {
+test('the key file: made at the first start, then read; wrong modes, owners and contents are refused', () => {
   const fs = fakeFs([]);
-  const k = loadKeyFile('/k', fs);
+  const k = loadKeyFile('/k', fs, 1000);
   assert.equal(k.length, 32);
-  assert.equal(loadKeyFile('/k', fs).equals(k), true);
-  assert.throws(() => loadKeyFile('/k', fakeFs([['/k', { text: `${'a'.repeat(64)}\n`, mode: 0o100644 }]])), /must not be readable by others/);
-  assert.throws(() => loadKeyFile('/k', fakeFs([['/k', { text: 'abc\n', mode: 0o100600 }]])), /64 hex digits/);
-  assert.throws(() => loadKeyFile('/k', fakeFs([['/k', { text: '', mode: 0o100600, notFile: true }]])), /not a regular file/);
-  const broken = { lstatSync: () => { throw Object.assign(new Error('EACCES'), { code: 'EACCES' }); } };
-  assert.throws(() => loadKeyFile('/k', broken), /EACCES/);
+  assert.equal(loadKeyFile('/k', fs, 1000).equals(k), true);
+  assert.deepEqual(fs.reads.map((x) => typeof x), ['number'], 'read from the descriptor that was checked');
+  assert.throws(() => loadKeyFile('/k', fakeFs([['/k', { text: `${'a'.repeat(64)}\n`, mode: 0o100644 }]]), 1000), /^Error: \/k has mode 0644, it must not be readable by others \(0600\)$/);
+  assert.throws(() => loadKeyFile('/k', fakeFs([['/k', { text: `${'a'.repeat(64)}\n`, mode: 0o100600, uid: 0 }]]), 1000), /^Error: \/k is not owned by the user running karidns-webadmin$/);
+  assert.throws(() => loadKeyFile('/k', fakeFs([['/k', { text: 'abc\n', mode: 0o100600 }]]), 1000), (e) => /64 hex digits/.test(e.message) && e.badKey === true);
+  assert.throws(() => loadKeyFile('/k', fakeFs([['/k', { text: '', mode: 0o100600, notFile: true }]]), 1000), /not a regular file/);
+  const broken = { openSync: () => { throw Object.assign(new Error('EACCES'), { code: 'EACCES' }); } };
+  assert.throws(() => loadKeyFile('/k', broken), /^Error: cannot read \/k: EACCES$/);
+  // readKeyFile does not make one (--rotate-totp-key): a missing file keeps its code
+  assert.throws(() => readKeyFile('/k', fakeFs([]), 1000), (e) => e.code === 'ENOENT');
 });
 
 test('sessions and tokens: the hashes, the CSRF token derived from the cookie, kdt_<id>_<secret>', () => {

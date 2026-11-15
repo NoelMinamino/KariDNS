@@ -44,4 +44,5 @@ page karidns-dbloader.md 8 karidns-dbloader
 page karidns-zone.md 8 karidns-zone
 page karidns-signer.md 8 karidns-signer
 page karidns-webadmin.md 8 karidns-webadmin --synopsis 'karidns-webadmin [-c config] [--check]' \
-    --synopsis 'karidns-webadmin [-c config] --create-admin NAME [--bootstrap-conninfo-file FILE]' --synopsis 'karidns-webadmin --version | -h | --help'
+    --synopsis 'karidns-webadmin [-c config] --create-admin NAME [--bootstrap-conninfo-file FILE]' \
+    --synopsis 'karidns-webadmin [-c config] --rotate-totp-key [--bootstrap-conninfo-file FILE]' --synopsis 'karidns-webadmin --version | -h | --help'

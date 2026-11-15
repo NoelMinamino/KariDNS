@@ -4,10 +4,10 @@
 import { h, link, fill } from '../dom.js';
 import { render } from '../format.js';
 import { field, select, message, problemNodes, confirmButton, isGlobal } from '../widgets.js';
-import { datasetPath } from '../zonelib.js';
+import { datasetPath, PRIMARY_KINDS, kindLabel } from '../zonelib.js';
 import { reloadText } from './change.js';
 
-const KINDS = ['NATIVE', 'MASTER', 'SLAVE', 'PRODUCER', 'CONSUMER'];
+const KINDS = [...PRIMARY_KINDS, 'SLAVE', 'PRODUCER', 'CONSUMER'];
 const SEARCH = /^[A-Za-z0-9_.-]+$/;
 
 export function zonesView(ctx, { query }) {
@@ -31,7 +31,7 @@ export function zonesView(ctx, { query }) {
   function draw(datasets, ds, r) {
     const q = field({ label: t('zones.search'), name: 'q', value: query.q ?? '', maxlength: 255, spellcheck: false, autocapitalize: 'none' });
     const mode = select({ label: t('zones.mode'), name: 'mode', options: [{ value: 'contains', label: t('zones.mode-contains') }, { value: 'prefix', label: t('zones.mode-prefix') }], value: query.mode === 'prefix' ? 'prefix' : 'contains' });
-    const kind = select({ label: t('zones.kind'), name: 'kind', options: [{ value: '', label: t('zones.any') }, ...KINDS.map((k) => ({ value: k, label: k }))], value: KINDS.includes(query.kind) ? query.kind : '' });
+    const kind = select({ label: t('zones.kind'), name: 'kind', options: [{ value: '', label: t('zones.any') }, ...KINDS.map((k) => ({ value: k, label: kindLabel(t, k) }))], value: KINDS.includes(query.kind) ? query.kind : '' });
     const signed = select({ label: t('zones.signed'), name: 'signed', options: [{ value: '', label: t('zones.any') }, { value: 'true', label: t('zones.signed-yes') }, { value: 'false', label: t('zones.signed-no') }], value: ['true', 'false'].includes(query.signed) ? query.signed : '' });
     const dsSel = datasets.length > 1 ? select({ label: t('zones.dataset'), name: 'ds', options: datasets.map((d) => ({ value: d.name, label: d.name })), value: ds }) : null;
     const form = h('form', { class: 'search', novalidate: true }, dsSel?.node, q.node, mode.node, kind.node, signed.node, h('div', { class: 'actions' }, h('button', { type: 'submit', class: 'primary' }, t('zones.find'))));
@@ -59,8 +59,11 @@ export function zonesView(ctx, { query }) {
       next || first ? h('p', { class: 'actions pager' }, first, next) : null);
   }
 
-  // what a global master does with a whole dataset: make a zone in it, reload every zone of it (PostgreSQL)
+  // what a global master does with a whole dataset: make a zone in it, reload every zone of it (PostgreSQL only: /version ui.reload_all; on SQLite3 the control key
+  // reloads one named zone and the service would refuse it)
   function dataset(ds) {
+    const create = link(router.href('create', { ds }), { class: 'button' }, t('zones.new'));
+    if (ctx.session.state.version?.ui?.reload_all !== true) return h('div', { class: 'actions' }, create);
     const msg = message('status');
     const err = message('error');
     const ask = confirmButton({ label: t('zones.reload-all'), confirmLabel: t('zones.reload-all-ask'), yes: t('common.yes'), no: t('common.no'), cls: '', onConfirm: async () => {
@@ -73,7 +76,7 @@ export function zonesView(ctx, { query }) {
         err.setNodes(...problemNodes(i18n, e));
       }
     } });
-    return h('div', { class: 'actions' }, link(router.href('create', { ds }), { class: 'button' }, t('zones.new')), ask, msg.node, err.node);
+    return h('div', { class: 'actions' }, create, ask, msg.node, err.node);
   }
 
   async function load() {

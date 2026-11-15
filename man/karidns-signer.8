@@ -1,4 +1,4 @@
-.TH KARIDNS\-SIGNER 8 "2026-11-14" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-SIGNER 8 "2026-11-15" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-signer.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-signer \- keeps the zones of a KariDNS database (PostgreSQL or SQLite3)
@@ -115,16 +115,23 @@ role. A regular file (no link) owned by the user the signer runs as, mode
 \fB0600\fR or \fB0400\fR (checked like the loader checks its own). Keywords:
 \fBhost\fR, \fBport\fR, \fBdbname\fR, \fBuser\fR, \fBpassword\fR, \fBsslmode\fR,
 \fBconnect_timeout\fR, \fBapplication_name\fR; another keyword is refused. The
-Node driver has no opportunistic TLS: \fBsslmode=disable\fR, \fBallow\fR,
-\fBprefer\fR and no \fBsslmode\fR all mean plain text. For a host that is not
+file is opened once without following a link, and its owner and mode are checked
+on what was opened (a file swapped in after the check is never read). The Node
+driver has no opportunistic TLS: \fBsslmode=disable\fR, \fBallow\fR,
+\fBprefer\fR and no \fBsslmode\fR all mean plain text. To a host that is not
 local (a Unix socket directory, \fBlocalhost\fR, \fB127.0.0.0/8\fR and \fB::1\fR
-are local) without \fBrequire\fR, \fBverify\-ca\fR or \fBverify\-full\fR,
-\fB\-\-check\fR prints \fBwarning: the connection to the database at HOST is not
-encrypted (sslmode=X); use sslmode=verify\-full (require encrypts but does not
-check the server)\fR and the start logs it; it is a warning, not a
-refusal. \fBrequire\fR encrypts but does not check the server's certificate;
-\fBverify\-full\fR does. \fBsslrootcert\fR is not read: a certificate from your
-own CA needs that CA in the service's environment
+are local) \fB\fBallow\fB and \fBprefer\fB are refused\fR (0.7): \fB\-\-check\fR
+names the problem \fBconninfo\-file FILE: conninfo: sslmode=prefer to HOST would
+be plain text (karidns\-signer does not negotiate TLS): use sslmode=disable for
+plain text on purpose, or require / verify\-full\fR and the signer does not
+start; write \fBdisable\fR for plain text on purpose. With \fBdisable\fR or no
+\fBsslmode\fR to such a host, \fB\-\-check\fR prints \fBwarning: the connection
+to the database at HOST is not encrypted (sslmode=X); use sslmode=verify\-full
+(require encrypts but does not check the server)\fR and the start logs it; that
+is a warning, not a refusal. A file that does not parse is a problem of
+\fB\-\-check\fR too. \fBrequire\fR encrypts but does not check the server's
+certificate; \fBverify\-full\fR does. \fBsslrootcert\fR is not read: a
+certificate from your own CA needs that CA in the service's environment
 (\fBNODE_EXTRA_CA_CERTS=/path/to/ca.pem\fR).
 .TP 8
 \fBschema\fR

@@ -4,7 +4,7 @@
 import { h, fill, link } from '../dom.js';
 import { render } from '../format.js';
 import { field, select, message, problemNodes } from '../widgets.js';
-import { datasetPath, absName, recordLines, parseRecordLine } from '../zonelib.js';
+import { datasetPath, absName, recordLines, parseRecordLine, PRIMARY_KINDS, kindLabel } from '../zonelib.js';
 import { placeOnFields } from '../pointer.js';
 import { changeFlow } from './change.js';
 import { zoneTextInput } from './zonetext.js';
@@ -49,7 +49,7 @@ export function zoneCreateView(ctx, { params }) {
 
   function draw(templates) {
     const name = field({ label: t('create.name'), name: 'name', required: true, maxlength: 255, spellcheck: false, autocapitalize: 'none', hint: t('create.name-hint') });
-    const kind = select({ label: t('create.kind'), name: 'type', options: [{ value: 'NATIVE', label: 'NATIVE' }, { value: 'MASTER', label: 'MASTER' }], value: 'NATIVE' });
+    const kind = select({ label: t('create.kind'), name: 'type', options: PRIMARY_KINDS.map((k) => ({ value: k, label: kindLabel(t, k) })), value: 'NATIVE', hint: t('kind.hint') });
     const how = select({ label: t('create.how'), name: 'how', options: [{ value: 'form', label: t('create.how-form') }, { value: 'template', label: t('create.how-template') }, { value: 'text', label: t('create.how-text') }], value: 'form' });
     const tplSel = select({ label: t('create.template'), name: 'template', options: templates.map((x) => ({ value: x.name, label: x.name })), value: templates[0]?.name });
     const tplErr = message('error');
@@ -137,7 +137,6 @@ export function zoneCreateView(ctx, { params }) {
     flow = changeFlow(ctx, {
       zone: null,
       reloadable: true,
-      reloadDefault: ctx.session.state.version?.ui?.reload_after_change === true,
       previewLabel: t('create.preview'),
       commitLabel: t('create.commit'),
       check,

@@ -21,7 +21,6 @@ export function zoneImportView(ctx, { params }) {
     const flow = changeFlow(ctx, {
       zone: info.name,
       reloadable: !info.signer,
-      reloadDefault: ctx.session.state.version?.ui?.reload_after_change === true,
       previewLabel: t('import.preview'),
       commitLabel: t('import.commit'),
       check: () => {

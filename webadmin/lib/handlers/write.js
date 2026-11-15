@@ -9,6 +9,7 @@ import * as S from '../store.js';
 import { reply } from '../http.js';
 import { parseChangeSet, parseCreate, createRRsets, renderChangeFile, renderExpectations, rrsetLabel } from '../changes.js';
 import { runChange, reloadState } from '../pipeline.js';
+import { reloadAvailable } from '../config.js';
 import { canonicalZone, absolute } from '../names.js';
 import { templateComment } from '../templates.js';
 import { dnskeyView } from '../dnssec.js';
@@ -37,7 +38,7 @@ export function editable(facts) {
 export function wantReload(app, requested) {
   const s = app.settings;
   const want = requested ?? s['reload-after-change'];
-  if (want && s.database === 'sqlite3' && !s['karictl-config']) {
+  if (want && !reloadAvailable(s)) {
     if (requested === true) throw badRequest("a reload needs 'karictl-config' (the restricted control key) on SQLite3; this deployment has none", '/reload');
     return false;
   }

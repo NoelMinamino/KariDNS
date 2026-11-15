@@ -16,7 +16,7 @@
 -- It STOPS (before it changes anything) when the role is a superuser, or is (or is a member of) the owner of the tables, or is (or is a member of) an API role.
 --
 -- What it does: everything db/karidns_writer_role.pgsql.sql does for the role (SELECT, INSERT, UPDATE, DELETE on domains, records, domainmetadata and the zone
--- tables, SELECT on every karidns_* table, INSERT on the zone versions, nothing on cryptokeys.content, membership of karidns_rls_trusted); USAGE on
+-- tables, SELECT on every karidns_* table, INSERT on the zone versions, nothing on cryptokeys.content, membership of karidns_rls_trusted; not its MAINTAIN on records); USAGE on
 -- karidns_auth and EXECUTE on karidns_auth.bump_serial (the dry run raises the serial the way the commit run does, for the principal it sets); membership of
 -- karidns_never_commit; the never-commit triggers.
 --
@@ -44,6 +44,11 @@ SELECT karidns_auth.assert_check_role(:'schema', :'role') AS role_checked \gset
 
 -- the rights of the ZoneImporter's role, and the membership of karidns_rls_trusted
 \ir karidns_writer_role.pgsql.sql
+-- but not MAINTAIN (PostgreSQL 17+, given by the writer script for ANALYZE): a check run never commits, so it has no statistics to refresh, and MAINTAIN would
+-- also let it VACUUM, CLUSTER or REINDEX outside a transaction, where the never-commit triggers do not reach
+\if :pg17
+REVOKE MAINTAIN ON :"schema".records FROM :"role";
+\endif
 
 GRANT USAGE ON SCHEMA karidns_auth TO :"role";
 GRANT EXECUTE ON FUNCTION karidns_auth.bump_serial(text, integer) TO :"role";

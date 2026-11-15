@@ -11,7 +11,9 @@
 #    byte for byte (the signed, tagged and tinydns fixtures of tests/);
 #  - the role cannot read cryptokeys.content (SELECT is denied, also through a query the tool never makes), a zone with keys is imported with the
 #    warning that the loader will refuse unsigned data, and the tool never needs more rights than the script gives;
-#  - a conninfo-file with a wrong mode is refused before it is read; a role without the script cannot write (exit 1, the reason, nothing written).
+#  - a conninfo-file with a wrong mode is refused before it is read; a role without the script cannot write (exit 1, the reason, nothing written);
+#  - 0.7: an import (and import --signer) that writes or removes 1000 records or more runs ANALYZE records (the script grants MAINTAIN on PostgreSQL 17
+#    and later; last_analyze is set), a small one does not, and a role without MAINTAIN gets a note and the import still succeeds.
 # SKIP (exit 0, with the reason) when PostgreSQL is not reachable, the role may not create roles, karidns-zone has no PostgreSQL driver or the sqlite3
 # tool is missing (for the comparison with SQLite3).  Runs as any user (as root the tool runs as the PostgreSQL user, see tests/db/pg_lib.sh).
 set -u
@@ -99,6 +101,8 @@ echo "== the writer role script"
 psql -X -q -At -v ON_ERROR_STOP=1 -v role=$ROLE -v schema=public -f db/karidns_writer_role.pgsql.sql "$PGC" > "$T/role.out" 2>&1 && ok "db/karidns_writer_role.pgsql.sql applies" || { bad "the role script" "$(head -5 "$T/role.out")"; exit 1; }
 expect "a new zone" 0 import example.test "$T/ex.zone"
 outhas "...reported as new" "(new)"
+# 0.7: a small import does not ANALYZE records (an import that writes or removes 1000 records or more does: below)
+same "...no ANALYZE of records for 5 records" "$(pq "SELECT (last_analyze IS NULL)::int FROM pg_stat_user_tables WHERE relid = 'records'::regclass")|$(cat "$OUT" "$ERR" | grep -c 'ANALYZE')" "1|0"
 same "...type NATIVE" "$(pq "SELECT type FROM domains WHERE name = 'example.test'")" NATIVE
 same "...the records" "$(pq "SELECT count(*) FROM records WHERE domain_id = (SELECT id FROM domains WHERE name = 'example.test')")" 5
 same "...MX priority in prio" "$(pq "SELECT prio FROM records WHERE type = 'MX'")" 10
@@ -229,9 +233,18 @@ awk -v n=$N 'BEGIN {
 }' > "$T/big.signed"
 chmod 644 "$T/big.zone" "$T/big.signed"
 expect "a zone with $N hosts" 0 import big.test "$T/big.zone"
+# 0.7: 1000 records or more written: ANALYZE records (the writer role holds MAINTAIN on it on PostgreSQL 17 and later; before 17 only the owner may)
+PG17=0; [ "$(pq "SHOW server_version_num")" -ge 170000 ] && PG17=1
+if [ $PG17 = 1 ]; then
+    if grep -q "statistics of records refreshed (ANALYZE)" "$OUT" "$ERR"; then ok "...then ANALYZE records (db.import.analyze)"; else bad "...no ANALYZE" "$(cat "$ERR"; head -c 600 "$OUT")"; fi
+    same "...pg_stat_user_tables.last_analyze is set" "$(pq "SELECT (last_analyze IS NOT NULL)::int FROM pg_stat_user_tables WHERE relid = 'records'::regclass")" 1
+else
+    if grep -q "may not ANALYZE records" "$OUT" "$ERR"; then ok "...PostgreSQL < 17: the role may not ANALYZE records, a note (db.import.analyze-denied)"; else bad "...no note" "$(cat "$ERR"; head -c 600 "$OUT")"; fi
+fi
 pq "SELECT karidns_auth.enable_audit('public')" > /dev/null
 C0=$(pq "SELECT count(*) FROM karidns_changes"); A0=$(pq "SELECT count(*) FROM karidns_auth.audit_log")
 expect "import --signer writes the signed zone" 0 import --signer big.test "$T/big.signed"
+[ $PG17 = 1 ] && { grep -q "statistics of records refreshed (ANALYZE)" "$OUT" "$ERR" && ok "...then ANALYZE records (the signer's import too)" || bad "...no ANALYZE after import --signer" "$(cat "$ERR"; head -c 600 "$OUT")"; }
 C1=$(pq "SELECT count(*) FROM karidns_changes"); A1=$(pq "SELECT count(*) FROM karidns_auth.audit_log")
 same "...the serial grew by one, the signatures are in (2 per host, 2 for ns1, 4 at the apex)" "$(zone_serial big.test)|$(pq "SELECT count(*) FROM records WHERE type = 'RRSIG' AND name LIKE '%big.test'")" "2|$((2 * N + 6))"
 same "...ordername of the hosts (NSEC zone: the reversed relative name)" "$(pq "SELECT ordername FROM records WHERE name = 'h0007.big.test' AND type = 'A'")" h0007
@@ -247,6 +260,46 @@ C2=$(pq "SELECT count(*) FROM karidns_changes")
 mkzone "$T/big.signed3" big.test. 5
 expect "--audit rows is accepted with --signer (here a dry run of a file that is not signed: refused)" 1 import --signer --audit rows --dry-run big.test "$T/big.signed3"
 same "...nothing was written" "$(pq "SELECT count(*) FROM karidns_changes")" "$C2"
+
+if [ $PG17 = 1 ]; then
+    echo "== ANALYZE does not wait for a VACUUM or ANALYZE of another session (0.7)"
+    # another session holds SHARE UPDATE EXCLUSIVE on records, as a running autovacuum does (the writes do not need it)
+    psql -X -q -At "$PGC" -c "BEGIN; LOCK TABLE records IN SHARE UPDATE EXCLUSIVE MODE; SELECT pg_sleep(60)" > /dev/null 2>&1 &
+    LP=$!
+    LOCKQ="FROM pg_locks l JOIN pg_class k ON k.oid = l.relation WHERE k.relname = 'records' AND l.mode = 'ShareUpdateExclusiveLock' AND l.granted"
+    w=0
+    while [ "$(pq "SELECT count(*) $LOCKQ")" != 1 ] && [ $w -lt 100 ]; do sleep 0.1; w=$((w + 1)); done
+    {
+        printf '$ORIGIN big3.test.\n$TTL 300\n@ IN SOA ns1 hostmaster 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n'
+        awk 'BEGIN { for (i = 1; i <= 1000; i++) printf "h%04d IN A 192.0.2.%d\n", i, i % 250 + 1 }'
+    } > "$T/big3.zone"
+    chmod 644 "$T/big3.zone"
+    AC0=$(pq "SELECT analyze_count FROM pg_stat_user_tables WHERE relid = 'records'::regclass")
+    t0=$(date +%s)
+    expect "a large import while another session holds the lock succeeds" 0 import big3.test "$T/big3.zone"
+    t1=$(date +%s)
+    if grep -q "db.import.analyze-skipped\|ANALYZE of records skipped" "$OUT" "$ERR" && ! grep -q "analyze-failed\|statistics of records refreshed" "$OUT" "$ERR"; then
+        ok "...ANALYZE was skipped, an info (db.import.analyze-skipped)"
+    else
+        bad "...no skip" "$(cat "$ERR"; head -c 600 "$OUT")"
+    fi
+    same "...at once (no wait for the lock), the zone is written, nothing analyzed" "$([ $((t1 - t0)) -lt 10 ] && echo fast)|$(pq "SELECT count(*) FROM records WHERE domain_id = (SELECT id FROM domains WHERE name = 'big3.test')")|$(pq "SELECT analyze_count FROM pg_stat_user_tables WHERE relid = 'records'::regclass")" "fast|1003|$AC0"
+    pq "SELECT pg_terminate_backend(l.pid) $LOCKQ" > /dev/null
+    wait $LP 2> /dev/null
+fi
+
+echo "== a role that may not ANALYZE records (0.7)"
+[ $PG17 = 1 ] && pq "REVOKE MAINTAIN ON records FROM $ROLE" > /dev/null
+{
+    printf '$ORIGIN big2.test.\n$TTL 300\n@ IN SOA ns1 hostmaster 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n'
+    awk 'BEGIN { for (i = 1; i <= 1000; i++) printf "h%04d IN A 192.0.2.%d\n", i, i % 250 + 1 }'
+} > "$T/big2.zone"
+chmod 644 "$T/big2.zone"
+expect "a large import without MAINTAIN on records succeeds" 0 import big2.test "$T/big2.zone"
+same "...the zone is written" "$(pq "SELECT count(*) FROM records WHERE domain_id = (SELECT id FROM domains WHERE name = 'big2.test')")" 1003
+if grep -q "may not ANALYZE records" "$OUT" "$ERR" && ! grep -q "statistics of records refreshed" "$OUT" "$ERR"; then ok "...with the note that the role may not ANALYZE records"; else bad "...no note" "$(cat "$ERR"; head -c 600 "$OUT")"; fi
+zt --json import --serial increment big2.test "$T/big2.zone"          # a replace writes the zone again: 1003 rows removed and written
+same "...the --json document has the note as an info message" "$st|$(grep -c '"severity": "info", "code": "db.import.analyze-denied"' "$OUT")|$(grep -c '"code": "db.import.analyze"' "$OUT")" "0|1|0"
 
 echo
 if [ "$FAILS" -eq 0 ]; then echo "=== run_karidns_zone_pg_test: all $PASS checks passed ==="; exit 0; fi
