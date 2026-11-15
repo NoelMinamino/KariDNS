@@ -455,6 +455,24 @@ static void add_extra(list_t *l) {
   U("store.errors.memory_noted", x.err_noted);
   U("store.errors.memory_pushed_out", x.err_dropped);
   U("store.detach.sampled", x.sampled_detaches);
+  U("store.attach.worker.ok", x.wa_ok);
+  U("store.attach.worker.mean_us", x.wa_ok ? x.wa_ns / x.wa_ok / 1000 : 0);
+  U("store.attach.worker.not_resident", x.wa_cold);
+  U("store.attach.worker.over_limit", x.wa_over);
+  U("store.attach.worker.claimed", x.wa_claim);
+  U("store.attach.worker.failed", x.wa_fail);
+  U("store.attach.worker.declined", x.wa_decline);
+  U("store.attach.worker.full", x.wa_full);
+  U("store.attach.worker.registered", x.wa_adopted);
+  U("store.attach.worker.dropped", x.wa_lost);
+  {
+    static const char *const hs[] = { "none", "attaching", "done", "high-mark", "off" };
+    add_s(l, "store.hot.state", x.hot_state < 5 ? hs[x.hot_state] : "none");
+  }
+  U("store.hot.listed", x.hot_listed);
+  U("store.hot.attached", x.hot_attached);
+  U("store.hot.skipped", x.hot_skipped);
+  U("store.hot.written_at_stop", x.hot_written);
 }
 
 static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a) {

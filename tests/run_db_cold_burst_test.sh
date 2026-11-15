@@ -7,7 +7,11 @@
 # than the 128-slot rings and the attach rate of the store threads take at once.  Checked, once with `memory-limit` (large: nothing is taken out of memory) and once without:
 #   - every query is answered with NOERROR and an answer (0 SERVFAIL, 0 lost);
 #   - the loader read no zone for them (`fetch issued` stays 0: a stored zone is attached from the store, whatever the load);
-#   - `karictl store -k` and `karictl dbstatus` answer while the burst runs (the longest wait is reported and bounded: the control thread does not walk the glue of every attached zone).
+#   - `karictl store -k` and `karictl dbstatus` answer while the burst runs (the longest wait is reported and bounded: the control thread does not walk the glue of every attached zone);
+#   - 0.7 fix 7: in MAP mode the workers attach the zones themselves (the page cache of the first fill is kept): `store.attach.worker.ok` is most of the burst and few queries park; in COPY mode (ZFS)
+#     they attach nothing (the store threads do);
+#   - 0.7 fix 8: a first fill (an empty store) with the burst in parallel, `warm-before-serve` holding the queries until the first pass has listed the zones: every query is answered (0 SERVFAIL, 0
+#     lost, 0 REFUSED) while the store is filled, and the store ends up with every zone; and a restart with hot.list attaches the zones of the last stop in the background (`store.hot.*`).
 # Needs root (the loader runs as nobody), sqlite3, perl, the binaries.  SKIP without them.  COLD_ZONES=20000 makes a quick run (still more queries than the rings hold).
 . "$(dirname "$0")/lib_proc.sh"
 set -u
@@ -27,6 +31,15 @@ id nobody >/dev/null 2>&1 || { echo "SKIP: no user nobody"; exit 0; }
 
 NZ=${COLD_ZONES:-100000}
 KARICTL_MAX_S=${COLD_KARICTL_MAX_S:-1.5}          # the longest a karictl command may take during the burst
+# The sender: one UDP socket, so every query lands on ONE worker; WINDOW queries are in flight and a query that nobody answered is sent again after 2 s, for WAIT seconds.  A slow (instrumented)
+# host serves fewer queries a second, so the window is kept below what a worker parks at the default park-max (16384) with room to spare, and the wait is long.  What the server did on its own
+# account is read from its counters (park_full, park_timeout, queue_full, queue_dropped: the only ways a stored zone is answered SERVFAIL) and not only from what the sender saw: a sender that
+# loses datagrams in its own receive buffer shows as "lost" with all of these at 0, and is reported as that.
+WINDOW=${COLD_WINDOW:-2000}
+WAIT=${COLD_WAIT:-30}
+# A first fill reads the zones that the queries ask for from the database by name (the loader serves a request of a query before one of the fill, so under a flood of queries the fill itself waits for
+# the loader to have a moment): a query waits for its read and park-timeout is 5 s, so the window of that burst is what a slow host reads in that time (about 100 zones a second at the least).
+FILL_WINDOW=${COLD_FILL_WINDOW:-500}
 T=$(mktemp -d "${TMPDIR:-/tmp}/karidns_coldburst.XXXXXX") || exit 1
 chmod 755 "$T"
 SRV=""
@@ -79,6 +92,8 @@ stop_srv() {
     SRV=""
 }
 sf() { $KA store -k 2>/dev/null | sed -n "s/^$1=//p" | head -1; }
+fqv() { $KA dbstatus 2>/dev/null | grep '^fetchq:' | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }      # a field of the fetchq: line
+server_refusals() { echo "park_full=$(fqv park_full) park_timeout=$(fqv park_timeout) queue_full=$(fqv queue_full) queue_dropped=$(fqv queue_dropped) table_full=$(fqv table_full)"; }
 fetches() { $KA dbstatus 2>/dev/null | grep '^fetch:' | head -1 | sed -n 's/.* issued=\([0-9]*\).*/\1/p'; }
 waitfor() { w=$1; shift; i=0; while [ $i -lt $((w * 10)) ]; do "$@" && return 0; sleep 0.1; i=$((i + 1)); done; return 1; }
 stored_all() { [ "$(sf store.zones.stored)" -ge "$NZ" ] 2>/dev/null; }
@@ -114,12 +129,17 @@ burst() {   # burst LABEL "database statements"
         echo "$mx" > "$T/ctl.max"
     ) &
     SAMP=$!
-    OUT=$(perl tests/db/udp_cold_burst.pl "$PA" "$NZ" 7 4000 10)
+    OUT=$(perl tests/db/udp_cold_burst.pl "$PA" "$NZ" 7 "$WINDOW" "$WAIT")
     touch "$T/burst.done"
     wait $SAMP
     echo "  $OUT"
     sv() { echo "$OUT" | sed -n "s/.* $1=\([0-9.]*\).*/\1/p" | head -1; }
-    [ "$(sv noerror)" = "$NZ" ] && pass "$label: all $NZ queries answered with NOERROR" || fail "$label: noerror=$(sv noerror) servfail=$(sv servfail) other=$(sv other) lost=$(sv lost) of $NZ"
+    SR0=$(server_refusals)
+    case "$SR0" in
+    "park_full=0 park_timeout=0 queue_full=0 queue_dropped=0 table_full=0") pass "$label: the server refused no stored zone on its own account ($SR0)" ;;
+    *) fail "$label: the server answered SERVFAIL for stored zones itself: $SR0" ;;
+    esac
+    [ "$(sv noerror)" = "$NZ" ] && pass "$label: all $NZ queries answered with NOERROR" || fail "$label: noerror=$(sv noerror) servfail=$(sv servfail) other=$(sv other) lost=$(sv lost) of $NZ ($SR0)"
     [ "$(sv servfail)" = 0 ] && [ "$(sv lost)" = 0 ] && pass "$label: 0 SERVFAIL, 0 lost" || fail "$label: servfail=$(sv servfail) lost=$(sv lost)"
     # the server's own count: every query it was given has an answer (a wake-up that was lost leaves a query parked, whatever the sender sends again)
     SQ=$($KA stats 2>/dev/null | sed -n 's/^karidns_queries_total{proto="udp"} //p' | head -1)
@@ -129,6 +149,17 @@ burst() {   # burst LABEL "database statements"
     [ "$F1" = "$F0" ] && pass "$label: the loader read no zone (fetch issued $F0 -> $F1)" || fail "$label: fetch issued went from $F0 to $F1: $($KA dbstatus | grep -E '^(fetch|fetchq):')"
     A1=$(sf store.zones.attached); A1=${A1:-0}
     echo "  attach: count=$(sf store.attach.count) p50=$(sf store.attach.p50_us) us p99=$(sf store.attach.p99_us) us; cold: attach=$(sf store.cold.attach) fetch=$(sf store.cold.fetch) timeout=$(sf store.cold.timeout) p50=$(sf store.cold.p50_us) us p99=$(sf store.cold.p99_us) us"
+    WOK=$(sf store.attach.worker.ok); WOK=${WOK:-0}
+    echo "  worker attach: ok=$WOK mean=$(sf store.attach.worker.mean_us) us not_resident=$(sf store.attach.worker.not_resident) claimed=$(sf store.attach.worker.claimed) failed=$(sf store.attach.worker.failed) declined=$(sf store.attach.worker.declined) full=$(sf store.attach.worker.full) registered=$(sf store.attach.worker.registered) dropped=$(sf store.attach.worker.dropped); parked: $($KA dbstatus | grep '^queries:')"
+    MODE=$(sf store.mode)
+    PARKED=$($KA dbstatus 2>/dev/null | sed -n 's/^queries: .* parked=\([0-9]*\) .*/\1/p' | head -1); PARKED=${PARKED:-0}
+    if [ "$MODE" = map ]; then
+        [ "$WOK" -ge $((NZ / 2)) ] && pass "$label: the workers attached $WOK of the $NZ zones themselves (MAP mode, the images are in the page cache)" || fail "$label: only $WOK zones were attached by the workers (not_resident=$(sf store.attach.worker.not_resident))"
+        [ "$PARKED" -le $((NZ / 5)) ] && pass "$label: $PARKED queries parked (the burst was answered without parking)" || fail "$label: $PARKED of $NZ queries parked"
+        [ "$(sf store.attach.worker.registered)" -ge $((WOK - WOK / 100 - 5)) ] 2>/dev/null && pass "$label: the store threads registered the zones the workers attached ($(sf store.attach.worker.registered) of $WOK)" || fail "$label: registered=$(sf store.attach.worker.registered) of $WOK"
+    else
+        [ "$WOK" = 0 ] && pass "$label: $MODE mode: the workers attached nothing (the store threads did)" || fail "$label: $MODE mode, but the workers attached $WOK zones"
+    fi
     [ "$A1" -gt "$A0" ] 2>/dev/null && pass "$label: zones were attached from the store ($A0 -> $A1)" || fail "$label: attached $A0 -> $A1"
     MX=$(cat "$T/ctl.max" 2>/dev/null)
     echo "  longest karictl command during the burst: ${MX:-?} s (limit $KARICTL_MAX_S s)"
@@ -137,6 +168,61 @@ burst() {   # burst LABEL "database statements"
 }
 burst "with memory-limit" "memory-limit 4g;"
 burst "without memory-limit" ""
+
+# 0.7 fix 8: hot.list.  The server was stopped cleanly after the last burst: the zones that were in memory are in hot.list, and the next start attaches them in the background
+echo "== the restart with hot.list"
+conf "memory-limit 4g;"
+start_srv
+HS=""
+for i in $(seq 1 600); do HS=$(sf store.hot.state); [ "$HS" = done ] || [ "$HS" = high-mark ] && break; sleep 0.1; done
+echo "  hot: state=$HS listed=$(sf store.hot.listed) attached=$(sf store.hot.attached) skipped=$(sf store.hot.skipped); attached zones $(sf store.zones.attached); worker attaches $(sf store.attach.worker.ok)"
+[ "$HS" = done ] && pass "the background attach of hot.list ended" || fail "hot.list: state $HS"
+[ "$(sf store.hot.listed)" -ge $((NZ / 2)) ] 2>/dev/null && pass "hot.list had $(sf store.hot.listed) zones (the zones in memory at the last stop)" || fail "hot.list listed $(sf store.hot.listed) zones"
+[ "$(sf store.zones.attached)" -ge $((NZ / 2)) ] 2>/dev/null && pass "the zones of hot.list are in memory before any query: $(sf store.zones.attached) attached" || fail "only $(sf store.zones.attached) zones were attached by hot.list"
+F0=$(fetches); F0=${F0:-0}
+OUT=$(perl tests/db/udp_cold_burst.pl "$PA" "$NZ" 9 "$WINDOW" "$WAIT")
+echo "  $OUT"
+sv2() { echo "$OUT" | sed -n "s/.* $1=\([0-9.]*\).*/\1/p" | head -1; }
+[ "$(sv2 noerror)" = "$NZ" ] && [ "$(sv2 servfail)" = 0 ] && [ "$(sv2 lost)" = 0 ] && pass "after hot.list: all $NZ queries answered with NOERROR" || fail "after hot.list: $OUT"
+PARKED=$($KA dbstatus 2>/dev/null | sed -n 's/^queries: .* parked=\([0-9]*\) .*/\1/p' | head -1)
+[ "${PARKED:-9999999}" -le $((NZ / 20)) ] && pass "after hot.list: ${PARKED} queries parked of $NZ" || fail "after hot.list: $PARKED queries parked"
+stop_srv
+echo "== no hot.list with store-hot-list no"
+conf "memory-limit 4g; store-hot-list no;"
+start_srv
+[ "$(sf store.hot.state)" = off ] && [ "$(sf store.hot.listed)" = 0 ] && pass "store-hot-list no: the list is not read" || fail "store-hot-list no: state $(sf store.hot.state)"
+[ "$(sf store.zones.attached)" -le $((NZ / 5)) ] 2>/dev/null && pass "store-hot-list no: nothing is attached before a query asks ($(sf store.zones.attached))" || fail "store-hot-list no: $(sf store.zones.attached) zones attached"
+# the TCP path of a worker attaches a zone too (the first touch of a stored zone over TCP)
+W0=$(sf store.attach.worker.ok); W0=${W0:-0}
+TBAD=0
+for k in 7 1007 2007 3007 4007 5007; do      # (a few zones: the pages of a record that mincore() does not call resident go to a store thread, a few in a hundred)
+    TOUT=$(perl tests/db/tcp_query.pl "$PA" "www.z$((NZ / 8 + k)).test" A 2>&1)
+    [ "$TOUT" = "rcode=0 answers=1" ] || { TBAD=$((TBAD + 1)); echo "  TCP: $TOUT"; }
+done
+W1=$(sf store.attach.worker.ok); W1=${W1:-0}
+[ "$TBAD" = 0 ] && pass "six first-touch queries over TCP are answered" || fail "$TBAD of six first-touch queries over TCP failed"
+if [ "$(sf store.mode)" = map ]; then [ "$W1" -gt "$W0" ] && pass "... by the worker that took it (worker attaches $W0 -> $W1)" || fail "the TCP query was not attached by the worker ($W0 -> $W1; not_resident=$(sf store.attach.worker.not_resident))"; fi
+stop_srv
+
+# 0.7 fix 8: a first fill with the queries in parallel
+echo "== the first fill (an empty store) with the queries in parallel"
+rm -rf "$T/store"
+conf "memory-limit 4g; warm-before-serve 60;"
+: > "$T/a.log"
+"$KARIDNS" -c "$T/a.conf" -f > "$T/a.log" 2>&1 &
+SRV=$!
+i=0; while [ $i -lt 100 ] && ! $KA status > /dev/null 2>&1; do sleep 0.1; i=$((i + 1)); done
+OUT=$(perl tests/db/udp_cold_burst.pl "$PA" "$NZ" 5 "$FILL_WINDOW" "$WAIT")
+echo "  $OUT"
+sv3() { echo "$OUT" | sed -n "s/.* $1=\([0-9.]*\).*/\1/p" | head -1; }
+[ "$(sv3 noerror)" = "$NZ" ] && pass "first fill: all $NZ queries answered with NOERROR (the queries were held until the first pass listed the zones, then read from the database or the store)" || fail "first fill: noerror=$(sv3 noerror) servfail=$(sv3 servfail) other=$(sv3 other) lost=$(sv3 lost) of $NZ"
+[ "$(sv3 servfail)" = 0 ] && [ "$(sv3 lost)" = 0 ] && [ "$(sv3 other)" = 0 ] && pass "first fill: 0 SERVFAIL, 0 REFUSED, 0 lost" || fail "first fill: servfail=$(sv3 servfail) other=$(sv3 other) lost=$(sv3 lost)"
+SQ=$($KA stats 2>/dev/null | sed -n 's/^karidns_queries_total{proto="udp"} //p' | head -1)
+SR=$($KA stats 2>/dev/null | awk '/^karidns_responses_total/ { s += $2 } END { print s + 0 }')
+[ -n "$SQ" ] && [ "$SQ" = "$SR" ] && pass "first fill: the server answered every query it was given ($SQ queries, $SR responses)" || fail "first fill: the server counts $SQ queries and $SR responses"
+waitfor 600 stored_all && pass "first fill: the store holds all $NZ zones" || fail "first fill: the store holds $(sf store.zones.stored) of $NZ zones"
+echo "  $($KA dbstatus | grep -E '^fetchq:' | sed 's/ hist=.*//')"
+stop_srv
 
 echo
 echo "run_db_cold_burst_test: $PASS passed, $FAILS failed"

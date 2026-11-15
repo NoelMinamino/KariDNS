@@ -43,7 +43,7 @@
 #define PARK_ZONE_MAX 255            /* longest zone name kept (the directory's klen is a byte) */
 #define PARK_VIEW_MAX 63             /* longest view name (KARIDNS_VIEW_NAME_MAX - 1) */
 #define PARK_UDP_MAX 4096            /* the biggest request that is parked; a bigger one gets the "not ready" answer at once (design 4.1) */
-#define PARK_DEFAULT_MAX 1024        /* entries per worker (database { park-max }) */
+#define PARK_DEFAULT_MAX 16384       /* entries per worker (database { park-max }); 0.7: 1024 before the O(1) table, whose entries cost about 0.4 KB (park_bytes()) */
 #define PARK_DEFAULT_TIMEOUT_MS 1500 /* database { park-timeout }: shorter than a resolver's retry */
 #define PARK_MAX_WORKERS 128         /* as MAX_WORKERS of dns_server_core.c */
 #define PARK_WAKE_RING 4096
@@ -106,6 +106,7 @@ typedef struct park_table {
 /* cap entries; false: out of memory or cap == 0 */
 bool park_init(park_table_t *t, uint32_t cap);
 void park_free(park_table_t *t);
+size_t park_bytes(const park_table_t *t);          /* the bytes park_init() reserved (about 1 KB an entry, half of it touched by usual requests) */
 
 /* The 64-bit key of (view, zone) that the table, the wake keys and the claims use.  The zone is compared without regard to case (the directory's names are lower case already). */
 uint64_t park_name_key(const char *view, const char *zone);
@@ -303,6 +304,7 @@ bool park_fetch_next(park_fetch_req_t *out);
 #define PARK_ATTACH_IDENT 0x61747463u  /* "attc" */
 #define PARK_ATTACH_DEADLINE_MS 200
 typedef struct {
+  bool adopt;                        /* 0.7 fix 7: not a request to attach: the worker attached the zone itself and staged it (db_store_worker_attach()); a store thread registers it (sview and zid name it) */
   bool by_name;                      /* a request that has no zone id (a background attach of a CNAME or glue target, a cell of the store that was being written): the names */
   uint8_t prio;                      /* 2: background (nobody waits: the zone goes first when memory-limit needs room) */
   int16_t worker;                    /* the ring (worker) it came from, -1 for the slots of the other threads */
@@ -312,6 +314,11 @@ typedef struct {
   char zone[PARK_ZONE_MAX + 1];
 } park_attach_req_t;
 bool park_attach_zid(int w, uint16_t sview, uint32_t zid);       /* false: worker w's ring is full */
+/* 0.7 fix 7: the worker attaches a resident image itself and hands the registration to the store threads: room in the ring first (only the worker pushes to it, so a push after a true answer works),
+ * then park_attach_adopt() (the same ring, sview with PARK_ATT_ADOPT set: park_attach_next() reports adopt) */
+#define PARK_ATT_ADOPT 0x8000u
+bool park_attach_room(int w);
+bool park_attach_adopt(int w, uint16_t sview, uint32_t zid);
 bool park_attach_request_any(const char *view, const char *zone);   /* from any thread (slots taken by compare-and-swap, as the transfer threads' fetch requests); false: no free slot */
 /* 0.7 WP7b: the same for a zone that nobody waits for (the background attach of a CNAME or glue target): the request carries the priority "background" (2), so that the store thread
  * marks the zone that it attaches to be the first to go when memory-limit needs room, as for a zone a background fetch brought (dbreg_bg_loaded()) */

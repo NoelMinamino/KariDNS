@@ -1,4 +1,4 @@
-.TH KARIDNS.CONF 5 "2026-11-15" "KariDNS" "KariDNS Manual"
+.TH KARIDNS.CONF 5 "2026-11-16" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns.conf \- the configuration file of karidns(8)
@@ -3676,17 +3676,17 @@ zones that do not fit are read when a query needs them and taken out again. See
 \fIDefault:\fR none
 .br
 \fIDescription:\fR D1a step 7, restart-only (no new list is written with the
-zone store, which has no hot list: a stored zone is attached when it is asked
-for): the file the loader keeps the \fBhot list\fR in (the zones of the database
-most asked for, hottest first), so that a restart can read them back into memory
-before the first query. It has an effect only with \fBmemory\-limit\fR (the
-frequencies it is made from are kept only then). The path is absolute, or
-relative to \fBoptions { directory }\fR. The file is written and read by the
-loader, which runs as \fBloader\-user\fR: that user needs write and search
-permission on the \fBdirectory\fR of the file (the loader writes
-\fB<path>.tmp\fR and renames it over the file, so a reader never sees half a
-file; the temporary file is created with mode 0600 and never through a link) and
-read permission on the file. Give the loader a directory of its own
+zone store, which keeps a hot list of its own: \fBstore\-hot\-list\fR, "The zone
+store" below): the file the loader keeps the \fBhot list\fR in (the zones of the
+database most asked for, hottest first), so that a restart can read them back
+into memory before the first query. It has an effect only with
+\fBmemory\-limit\fR (the frequencies it is made from are kept only then). The
+path is absolute, or relative to \fBoptions { directory }\fR. The file is
+written and read by the loader, which runs as \fBloader\-user\fR: that user
+needs write and search permission on the \fBdirectory\fR of the file (the loader
+writes \fB<path>.tmp\fR and renames it over the file, so a reader never sees
+half a file; the temporary file is created with mode 0600 and never through a
+link) and read permission on the file. Give the loader a directory of its own
 (\fB/var/db/karidns/state\fR, owned by \fBloader\-user\fR, mode 0700): a
 directory that others can write in lets them replace the list the server warms
 from (the zone names in it can only name zones of the database; a damaged or
@@ -3746,12 +3746,25 @@ holds the images (the default for UFS); \fBcopy\fR: an image is read into memory
 cache and in the ARC). \fBauto\fR looks at the file system.
 .TP 8
 \fBstore\-threads <n>;\fR
-\fIDefault:\fR \fB2\fR (1..32)
+\fIDefault:\fR \fB8\fR (1..32)
 .br
 \fIDescription:\fR 0.7, restart-only: the threads that attach zones from the
 store. They wait for the disk when an image is not in the page cache, so more of
-them read more at once (a few per disk queue); a thread that has nothing to do
-costs nothing. One more thread writes the zones to the store.
+them read more at once (a few per disk queue: the disk of the measurements gave
+5,200 reads a second at depth 1 and 38,700 at depth 16); a thread that has
+nothing to do costs nothing. Before 0.7.0 the default was 2. In MAP mode a query
+for a stored zone whose image is in the page cache does not wait for them at all
+(see "Attach on the worker" below). One more thread writes the zones to the
+store.
+.TP 8
+\fBstore\-hot\-list <yes|no>;\fR
+\fIDefault:\fR \fByes\fR
+.br
+\fIDescription:\fR 0.7, restart-only: at a clean stop the Backend writes the
+zones that are in memory to \fBhot.list\fR in the store directory (zone ids, the
+most used first), and the next start attaches them in that order, in the
+background, after the queries (see "The hot list of the store" below). \fBno\fR
+writes no list and reads none.
 .TP 8
 \fBstore\-segment\-size <bytes>;\fR
 \fIDefault:\fR \fB256M\fR (\fB1M\fR..\fB4G\fR, K / M / G)
@@ -3774,12 +3787,14 @@ in the store, so a restart does not start one early. \fBoff\fR: never
 \fBwarm\-before\-serve <s>;\fR
 \fIDefault:\fR \fB0\fR (off)
 .br
-\fIDescription:\fR D1a step 7 (nothing to wait for with the zone store): hold
-the queries back, for at most this many seconds (0..3600), until the zones of
-the hot list have been read. See "Warm-up" below.
+\fIDescription:\fR D1a step 7: hold the queries back, for at most this many
+seconds (0..3600), until the zones of the hot list have been read. With the zone
+store (0.7) it also holds them until the first pass of a first fill has listed
+the zones (a query for a zone the store does not know yet is REFUSED). See
+"Warm-up" and "The zone store" below.
 .TP 8
 \fBpark\-max <n>;\fR \fBpark\-timeout <ms>;\fR
-\fIDefault:\fR \fB1024\fR, \fB1500\fR
+\fIDefault:\fR \fB16384\fR, \fB1500\fR
 .br
 \fIDescription:\fR D1a, queries for database zones that are not in
 memory. \fBpark\-max\fR (1..65536, read when the server starts): how many such
@@ -3788,24 +3803,27 @@ not for the server: with N workers the server holds up to N times as many; the
 table is allocated at start and its pages are not used until a query parks). An
 entry takes a header of about 130 bytes and a block for the request, 256 bytes
 for the usual one (a request that does not fit, up to 4096 bytes with its names,
-takes a long block, of which the table has one for every eight entries), so the
-default 1024 is about 0.5 MB per worker and 16384 about 9 MB; every operation on
-the table is one step per query of the zone, whatever the size; a query beyond
-that, or one longer than 4096 bytes, is answered at once. \fBpark\-timeout\fR
-(10..60000 milliseconds): how long a parked query waits; then the answer is
-SERVFAIL with Extended DNS Error 14, Not Ready (RFC 8914 4.15), as it is when
-the fetch of the zone failed (signed with the key of a validly signed request,
-RFC 8945 5.3; it counts for \fBrate\-limit\fR). \fBallow\-query\fR (and
-\fBallow\-query\-on\fR) is evaluated first, with the same chain as for a zone in
-memory, before a query parks or the zone is asked for: a client that may not ask
-gets REFUSED + EDE 18, uses no entry of the park table, makes the server read
-nothing and learns nothing about the zone. DoT and DoH, which do not park,
-answer SERVFAIL + EDE 14 for such a zone (REFUSED for a client that may not
-ask). A DB zone's own settings cannot contain \fBallow\-query\fR, so for a zone
-out of memory the view's and options' statements decide. Without
-\fBmemory\-limit\fR nothing takes a zone out of memory, so no query parks and
-these options change nothing (see "Memory limit" below and
-\fBkaridns\-dbloader(8)\fR, "The fetch stream").
+takes a long block, of which the table has one for every eight entries), so a
+table of \fBpark\-max 1024\fR is about 0.5 MB per worker, and the default 16384
+reserves about 15 MB of address space per worker and touches about 6.5 MB when
+it is full of the usual requests (measured by tests/test_park.c; before 0.7.0
+the default was 1024, which a cold burst of first touches at 200,000 queries a
+second filled in a few milliseconds); every operation on the table is one step
+per query of the zone, whatever the size; a query beyond that, or one longer
+than 4096 bytes, is answered at once. \fBpark\-timeout\fR (10..60000
+milliseconds): how long a parked query waits; then the answer is SERVFAIL with
+Extended DNS Error 14, Not Ready (RFC 8914 4.15), as it is when the fetch of the
+zone failed (signed with the key of a validly signed request, RFC 8945 5.3; it
+counts for \fBrate\-limit\fR). \fBallow\-query\fR (and \fBallow\-query\-on\fR)
+is evaluated first, with the same chain as for a zone in memory, before a query
+parks or the zone is asked for: a client that may not ask gets REFUSED + EDE 18,
+uses no entry of the park table, makes the server read nothing and learns
+nothing about the zone. DoT and DoH, which do not park, answer SERVFAIL + EDE 14
+for such a zone (REFUSED for a client that may not ask). A DB zone's own
+settings cannot contain \fBallow\-query\fR, so for a zone out of memory the
+view's and options' statements decide. Without \fBmemory\-limit\fR nothing takes
+a zone out of memory, so no query parks and these options change nothing (see
+"Memory limit" below and \fBkaridns\-dbloader(8)\fR, "The fetch stream").
 .PP
 | \fBserver\-id "<id>";\fR | the host name | postgresql (milestone B11): the
 name under which this server writes its row of \fBkaridns_server_status\fR
@@ -4447,15 +4465,15 @@ says it in syslog (next item).
 .IP \(bu 2
 \fB\fBfetchq:\fB (0.7): where a fetch is held up.\fR \fBkarictl dbstatus\fR has
 the line \fBfetchq: in_flight=N peak=N table_full=N ring_dropped=N park_full=N
-park_timeout=N loader_busy=N ingest_busy=P% hist=A,B,C,D,E\fR right after the
-\fBfetch:\fR line. Everything is counted since the server started, except
-\fBin_flight\fR (now) and \fBingest_busy\fR (the last window). Read it from the
-query to the install: \fBpark_full\fR counts queries that found the worker's
-table of parked queries full (\fBpark\-max\fR) and were answered "not ready" at
-once; \fBring_dropped\fR, queries whose request for the zone could not be handed
-from the worker to the ingest thread (the worker's ring of 128 was full: the
-ingest thread is behind; the query stays parked and the request is made again,
-so this counts refusals, not lost queries); \fBfetch\-rate\fR,
+park_timeout=N loader_busy=N ingest_busy=P% fill_busy=P% hist=A,B,C,D,E\fR right
+after the \fBfetch:\fR line. Everything is counted since the server started,
+except \fBin_flight\fR (now) and \fBingest_busy\fR (the last window). Read it
+from the query to the install: \fBpark_full\fR counts queries that found the
+worker's table of parked queries full (\fBpark\-max\fR) and were answered "not
+ready" at once; \fBring_dropped\fR, queries whose request for the zone could not
+be handed from the worker to the ingest thread (the worker's ring of 128 was
+full: the ingest thread is behind; the query stays parked and the request is
+made again, so this counts refusals, not lost queries); \fBfetch\-rate\fR,
 \fBfetch\-concurrency\fR and \fBmemory\-limit\fR refuse requests before the
 fetch is made (\fBrefused_by_rate=\fR and \fBshed=\fR of the other lines);
 \fBtable_full\fR, requests refused because all 256 places of the fetch table
@@ -4670,106 +4688,179 @@ governs the zones in memory, not the directory), and a zone of a first fill that
 does not fit under \fBmemory\-limit\fR is written to the store and not kept in
 memory. The settings of a zone (its allow-query, allow-transfer, ...) are kept
 by id in \fBsettings.dat\fR, so that a zone that is not in memory is answered
-and attached with the loader stopped. \fBThe hot list is off with the store.\fR
-The Backend makes no hot list (\fBhot\-list\-size\fR and
-\fBhot\-list\-interval\fR have no effect) and sends the loader no
-\fBHOT_LIST\fR, so the loader's \fBloader\-state\-file\fR is not written any
-more: a zone of the store is attached from it when a query asks for it (about 50
-microseconds, the page cache survives a restart) and nothing has to be warmed. A
-state file that an earlier run without the store left is still read at the start
+and attached with the loader stopped. \fBThe loader's hot list is off with the
+store.\fR The Backend makes no hot list for the loader (\fBhot\-list\-size\fR
+and \fBhot\-list\-interval\fR have no effect) and sends it no \fBHOT_LIST\fR, so
+the loader's \fBloader\-state\-file\fR is not written any more. A state file
+that an earlier run without the store left is still read at the start
 (\fBWARM_LIST\fR) and its zones are read into memory; remove
-\fBloader\-state\-file\fR from the block when the store is
-on. \fBwarm\-before\-serve\fR has nothing to wait for then. Without a store
-(\fBstore none;\fR, or a directory that cannot be used) every database zone is a
-zone of the heap directory, as before 0.7, and the hot list works as described
-under "Warm-up". \fBAttach.\fR A query for a zone that is stored and not in
-memory is \fBnot\fR read from the loader: the query is parked, a store thread
-reads the image (\fBmap\fR: a pointer into the mapped segment; \fBcopy\fR: a
-buffer), checks the record's checksum, the whole structure of the image
-(\fBzone_image_validate()\fR, every time) and that the image is the zone's,
-makes the zone's entry the way an install does (only if the store still offers
-the version that was read: a newer install or a delete that came meanwhile wins)
-and wakes the query. The worker asks with the zone's id in the store (8 bytes,
-one request for a zone however many workers have a query parked for it; the
-rings hold 4096 requests a worker), and only the workers that asked are woken. A
-full ring never sends a stored zone to the database: the query stays parked and
-the worker asks again until the ring has room, and the stored zone is not read
-from the loader for a query (\fBfetch issued\fR stays 0 for it, whatever the
-load; a burst of first queries for zones that are all stored is answered from
-the store). The attach is given 200 ms; a query whose attach is still queued
-then goes on waiting for the rest of its \fBpark\-timeout\fR and is not answered
-"not ready" earlier. The query path never sleeps for the store: a worker that
-finds a table cell of the store being written spins a few hundred times and then
-parks the query for a store thread, which looks again. The answer is the one the
-zone read from the database gives, byte for byte. A record that is missing or
-damaged (checksum, structure) falls back to the read from the database (a zone
-the store knows without an image, "known", is read from the database): the
-queries that wait for it are given the \fBpark\-timeout\fR again, a damaged
-record is logged (\fB[Store] the record of zone ... cannot be used\fR) and set
-back to "known", and the next install writes it again. Taking a zone out of
-memory (\fBmemory\-limit\fR) is what it always was, for the zones in memory; the
-record stays, the next query attaches it again. The mapped bytes (\fBmap\fR) or
-the buffer (\fBcopy\fR) of an attached image count for \fBmemory\-limit\fR as
-the rest of the zone does, and are given back when the zone's version is freed;
-a mapped image stays mapped until the last reader of the version is gone. A
-dynamic UPDATE keeps the zone it changed in memory until the database's version
-replaces it, as before. \fBRestart.\fR The Backend answers from the store at
-once: it reads the index, and a query for a stored zone attaches it, before the
-loader has connected and also while it is slow or stopped. When the loader
-connects, the Backend tells it what the store holds (the inventory: serial and
-digest of every zone), so a zone that did not change is not sent again and
-nothing is read into memory for it; only what changed is installed. The store
-belongs to the database it was filled from: a start with another
-\fBdatabase\-file\fR or conninfo for a view drops that view's zones from the
-store. A serial that did not change is trusted: a zone changed in the database
-\fBwithout\fR a new serial while the server was down is answered from the store
-until the loader announces the change (a reload, the change log); give such
-changes a new serial. \fBFiles and privileges.\fR The directory is opened by the
-process that starts the server (as root), checked (owner, mode, locked), handed
-to the user the server runs as and inherited by the Backend, which limits the
-rights of the descriptor (look up, create, read, write, mmap, fsync, truncate,
-stat, unlink) and opens the files beneath it, also in the sandbox. The loader
-and the routers never get it. \fBCleaning (0.7).\fR Zone images are appended to
-the segment files \fBseg.N\fR (256 MiB each, \fBstore\-segment\-size\fR): a zone
-that is replaced or deleted leaves its old image dead in its segment, so a store
-whose zones change often would only grow. The \fBcleaner\fR, a thread of the
-store, takes the segment that is the most dead, as long as at least half of it
-is dead (and at least a quarter of a segment or 1 MiB of it), copies the live
-records unchanged to the open segment and removes the file. It works at 16 MiB a
-second at the most and takes the writer's lock for at most 256 records at a
-time, so writes go on. Each move is one record of the journal: after \fBkill
-\-9\fR or a power loss a zone's image is at its old place or its new one, never
-in none and never half; the bytes are checked (their checksum) before they are
-copied, and an image that fails it is not carried on: its zone becomes known
-without an image and is read from the database again. A segment file is removed
-only when (a) a checkpoint that follows the last move is on disk, (b) every
-reader that could still look at the old place has left, and (c) no attached zone
-holds an image from it. In \fBmap\fR mode an attached zone's image is a pointer
-into the mapped segment, so a segment that such an image points into is not
-cleaned, and one that was emptied meanwhile stays until the zone is taken out of
-memory or replaced (\fBkarictl store\fR: \fBstore.segments.pinned\fR); a zone
-that is hot and never changes can hold one segment for a long time, and the cost
-is that segment's dead space. \fBcopy\fR mode (the default on ZFS) has no
-pointers into segments: nothing waits for it. The number of a removed segment is
-used again. The same pass gives back the space of deleted zones' long names
-(those of more than 34 octets are kept in \fBnx.1\fR) when more than half of
-that file and at least 4 MiB is dead: it moves the names that are in use down,
-under the writer's lock, which takes a second at a million such names and
-happens rarely. \fBkarictl store compact\fR runs the cleaner without its rate
-limit until no segment is dead enough, \fBkarictl store\fR shows it
-(\fBstore.compact.*\fR, \fBstore.segments.dead_pct\fR). \fBDisk space.\fR The
-free space of the file system is read at every checkpoint, after each megabyte
-that is written and about once a second while images are written (\fBfstatfs\fR;
-on ZFS the quota counts). Half a segment of it (256 KiB to 128 MiB) is kept for
-the cleaner, which needs room to copy before it can free a segment: a new image
-is refused below that. A refused write, or one that fails (\fBENOSPC\fR,
-\fBEDQUOT\fR, \fBEFBIG\fR), runs the cleaner at once and tries again. If that
-does not make room, the store is \fBdegraded\fR: a zone that is new or changed
-gets its record (name, serial, version stamp, digest) \fBwithout an image\fR,
-like a zone the loader has not sent yet, and its old image is released. The
-server serves such a zone from memory as long as it is there; after it was taken
-out of memory (\fBmemory\-limit\fR) or after a restart the first query reads it
-from the database as for any zone without an image (the cost of a fetch, under
+\fBloader\-state\-file\fR from the block when the store is on.
+.RS 2
+.PP
+\fBThe hot list of the store (\fBhot.list\fB, 0.7).\fR The store has a hot list
+of its own. At a clean stop the Backend writes the ids of the zones that are in
+memory to \fBhot.list\fR in the store directory, the most used first (the cache
+manager's frequency of the zone, with the queries it has answered since; at most
+4,194,304 ids, 4 bytes each). The next start reads it and a thread of its own
+attaches those zones in that order, in the background, while the queries are
+served: a restart with the page cache of the old run kept has its working set in
+memory in seconds, and one with a cold page cache reads the images in the order
+the queries are going to want them. The queries always come first: the thread
+takes at most 20,000 zones a second, waits while any query waits for a store
+thread, and stops when the zones in memory reach the high mark of
+\fBmemory\-limit\fR (it attaches the hottest zones and never takes one out for
+the rest of the list; \fBstore.hot.state\fR says \fBhigh\-mark\fR). The file is
+trusted only whole (its checksums and the store's uuid must be right; a damaged,
+torn or foreign file is ignored with a WARNING and the zones are attached when
+they are asked for, as before); after \fBkill \-9\fR the list of the last clean
+stop is still used (its ids are only candidates: a zone that is not stored any
+more is skipped). \fBstore\-hot\-list no;\fR turns both the writing and the
+attaching off. \fBkarictl store\fR shows \fBstore.hot.*\fR.
+.PP
+\fBAttach on the worker (MAP mode, 0.7).\fR A query for a stored zone that is
+not in memory used to wait for a store thread (the worker parks it, asks through
+a ring, a store thread reads the image, makes the entry, takes the registry's
+lock and wakes the worker). In MAP mode a worker that finds that the pages of
+the zone's record are in the page cache (\fBmincore()\fR on the record's range;
+the segments are mapped with \fBMAP_PREFAULT_READ\fR at the start, which maps
+the pages that are in the cache then, because \fBmincore()\fR only sees the
+pages that the process has mapped) now attaches the zone itself, inside the read
+section it is in, and answers at once (about 10 to 20 microseconds;
+\fBstore.attach.worker.*\fR). It takes no lock of the registry: it publishes the
+zone for the lookup in a small table with a compare-and-swap and a store thread
+registers it a moment later (a delete or a new version that comes in between is
+found by the registration, which drops the zone; the queries answered meanwhile
+were answered by the version the record had, as a query that a writer
+passes). It is the store threads' as before when the image is not in the page
+cache, in COPY mode (ZFS: reading the image with \fBpread\fR can block), when
+the zone's name servers (NS, MX, SRV targets) lie in stored zones that are not
+in memory (the store threads attach those first, so that the first answer has
+the glue), when the zone is shared by in-view, above the hard line of
+\fBmemory\-limit\fR (the store threads make room first), or when another thread
+is already attaching the zone. \fBWhat this costs and risks:\fR a worker
+allocates for the entry (a few hundred bytes, from the allocator's thread cache)
+and takes the lock of the pool of entries for a few instructions, which the rule
+that a worker neither allocates nor waits does not otherwise allow; and a page
+can leave the page cache between the check and the first touch, so that the
+worker reads it from the disk, once, as it does when a lookup touches a page of
+the name index or the zone table that was evicted (the record is about a
+kilobyte, one or two pages: MAP mode has this risk on every lookup already, and
+COPY mode does not use the attach on the worker for that
+reason). \fBstore.attach.worker.not_resident\fR counts the checks that said no.
+.PP
+\fBThe first fill and the queries (0.7).\fR A first start (an empty store) or a
+store whose pages are not in the page cache is served while it is built: the
+queries come first and the fill goes on at full speed. A query for a zone whose
+body the fill has not brought yet is read from the database for the query (the
+loader serves a request of a query before one of the fill); the ingest thread
+hands the requests of the workers to the loader between slices of about a
+millisecond of what the loader sends (a manifest pass, the bodies), so a request
+never waits for a whole pass; a place of \fBfetch\-concurrency\fR goes to the
+oldest query that waits, but the fill has a share of its own, a quarter of the
+places (at least one), that the queries leave free while the fill is below it,
+so that a flood of queries does not stop the fill (the zones the queries ask for
+then come out of the fill's sequential reads, which are much cheaper than
+reading a zone by name) and the fill does not stop the queries (a query waits
+for one of the places the fill does not hold, not for the fill). \fBkarictl
+dbstatus\fR shows the share of the ingest thread the bodies of the fill took
+(\fBfill_busy=P%\fR in the \fBfetchq:\fR line, next to \fBingest_busy\fR). The
+names the server does not know yet are the one thing it cannot answer: until the
+first pass has listed a zone (about a second at 100,000 zones, about a minute at
+ten million) the store does not know it, and a query for it is REFUSED as for
+any name the server does not serve. \fBwarm\-before\-serve <s>\fR holds the
+queries (the sockets stay unread, the kernel queues what comes) until the first
+pass has ended, as well as until the hot list of the loader is read, for at most
+that many seconds. Without a store (\fBstore none;\fR, or a directory that
+cannot be used) every database zone is a zone of the heap directory, as before
+0.7, and the hot list works as described under "Warm-up". \fBAttach.\fR A query
+for a zone that is stored and not in memory is \fBnot\fR read from the loader:
+the query is parked, a store thread reads the image (\fBmap\fR: a pointer into
+the mapped segment; \fBcopy\fR: a buffer), checks the record's checksum, the
+whole structure of the image (\fBzone_image_validate()\fR, every time) and that
+the image is the zone's, makes the zone's entry the way an install does (only if
+the store still offers the version that was read: a newer install or a delete
+that came meanwhile wins) and wakes the query. The worker asks with the zone's
+id in the store (8 bytes, one request for a zone however many workers have a
+query parked for it; the rings hold 4096 requests a worker), and only the
+workers that asked are woken. A full ring never sends a stored zone to the
+database: the query stays parked and the worker asks again until the ring has
+room, and the stored zone is not read from the loader for a query (\fBfetch
+issued\fR stays 0 for it, whatever the load; a burst of first queries for zones
+that are all stored is answered from the store). The attach is given 200 ms; a
+query whose attach is still queued then goes on waiting for the rest of its
+\fBpark\-timeout\fR and is not answered "not ready" earlier. The query path
+never sleeps for the store: a worker that finds a table cell of the store being
+written spins a few hundred times and then parks the query for a store thread,
+which looks again. The answer is the one the zone read from the database gives,
+byte for byte. A record that is missing or damaged (checksum, structure) falls
+back to the read from the database (a zone the store knows without an image,
+"known", is read from the database): the queries that wait for it are given the
+\fBpark\-timeout\fR again, a damaged record is logged (\fB[Store] the record of
+zone ... cannot be used\fR) and set back to "known", and the next install writes
+it again. Taking a zone out of memory (\fBmemory\-limit\fR) is what it always
+was, for the zones in memory; the record stays, the next query attaches it
+again. The mapped bytes (\fBmap\fR) or the buffer (\fBcopy\fR) of an attached
+image count for \fBmemory\-limit\fR as the rest of the zone does, and are given
+back when the zone's version is freed; a mapped image stays mapped until the
+last reader of the version is gone. A dynamic UPDATE keeps the zone it changed
+in memory until the database's version replaces it, as before. \fBRestart.\fR
+The Backend answers from the store at once: it reads the index, and a query for
+a stored zone attaches it, before the loader has connected and also while it is
+slow or stopped. When the loader connects, the Backend tells it what the store
+holds (the inventory: serial and digest of every zone), so a zone that did not
+change is not sent again and nothing is read into memory for it; only what
+changed is installed. The store belongs to the database it was filled from: a
+start with another \fBdatabase\-file\fR or conninfo for a view drops that view's
+zones from the store. A serial that did not change is trusted: a zone changed in
+the database \fBwithout\fR a new serial while the server was down is answered
+from the store until the loader announces the change (a reload, the change log);
+give such changes a new serial. \fBFiles and privileges.\fR The directory is
+opened by the process that starts the server (as root), checked (owner, mode,
+locked), handed to the user the server runs as and inherited by the Backend,
+which limits the rights of the descriptor (look up, create, read, write, mmap,
+fsync, truncate, stat, unlink) and opens the files beneath it, also in the
+sandbox. The loader and the routers never get it. \fBCleaning (0.7).\fR Zone
+images are appended to the segment files \fBseg.N\fR (256 MiB each,
+\fBstore\-segment\-size\fR): a zone that is replaced or deleted leaves its old
+image dead in its segment, so a store whose zones change often would only
+grow. The \fBcleaner\fR, a thread of the store, takes the segment that is the
+most dead, as long as at least half of it is dead (and at least a quarter of a
+segment or 1 MiB of it), copies the live records unchanged to the open segment
+and removes the file. It works at 16 MiB a second at the most and takes the
+writer's lock for at most 256 records at a time, so writes go on. Each move is
+one record of the journal: after \fBkill \-9\fR or a power loss a zone's image
+is at its old place or its new one, never in none and never half; the bytes are
+checked (their checksum) before they are copied, and an image that fails it is
+not carried on: its zone becomes known without an image and is read from the
+database again. A segment file is removed only when (a) a checkpoint that
+follows the last move is on disk, (b) every reader that could still look at the
+old place has left, and (c) no attached zone holds an image from it. In
+\fBmap\fR mode an attached zone's image is a pointer into the mapped segment, so
+a segment that such an image points into is not cleaned, and one that was
+emptied meanwhile stays until the zone is taken out of memory or replaced
+(\fBkarictl store\fR: \fBstore.segments.pinned\fR); a zone that is hot and never
+changes can hold one segment for a long time, and the cost is that segment's
+dead space. \fBcopy\fR mode (the default on ZFS) has no pointers into segments:
+nothing waits for it. The number of a removed segment is used again. The same
+pass gives back the space of deleted zones' long names (those of more than 34
+octets are kept in \fBnx.1\fR) when more than half of that file and at least 4
+MiB is dead: it moves the names that are in use down, under the writer's lock,
+which takes a second at a million such names and happens rarely. \fBkarictl
+store compact\fR runs the cleaner without its rate limit until no segment is
+dead enough, \fBkarictl store\fR shows it (\fBstore.compact.*\fR,
+\fBstore.segments.dead_pct\fR). \fBDisk space.\fR The free space of the file
+system is read at every checkpoint, after each megabyte that is written and
+about once a second while images are written (\fBfstatfs\fR; on ZFS the quota
+counts). Half a segment of it (256 KiB to 128 MiB) is kept for the cleaner,
+which needs room to copy before it can free a segment: a new image is refused
+below that. A refused write, or one that fails (\fBENOSPC\fR, \fBEDQUOT\fR,
+\fBEFBIG\fR), runs the cleaner at once and tries again. If that does not make
+room, the store is \fBdegraded\fR: a zone that is new or changed gets its record
+(name, serial, version stamp, digest) \fBwithout an image\fR, like a zone the
+loader has not sent yet, and its old image is released. The server serves such a
+zone from memory as long as it is there; after it was taken out of memory
+(\fBmemory\-limit\fR) or after a restart the first query reads it from the
+database as for any zone without an image (the cost of a fetch, under
 \fBfetch\-concurrency\fR), so answers stay current. Images that are stored are
 served as before. \fBERROR\fR in syslog, once a minute, names the free bytes,
 the reserve and the dead bytes the cleaner could win; \fBkarictl store\fR says
@@ -4872,6 +4963,7 @@ records; with 10,000,000 zones (a store of 12 GB, filled in 79 s) 23 ms, of
 which 12 ms reading the index (a read of the index that is not in the page cache
 takes about half a second), and the zone table of 640 MB was read ahead in the
 background in 1.1 s (70 ms when it was in memory); after \fBkill \-9\fR 310 ms.
+.RE
 .IP \(bu 2
 \fB\fBkarictl dbstatus\fB shows it.\fR \fBresidency: directory=N resident=N
 out_of_memory=N evictions=N\fR (the zones of the directory with and without
@@ -4891,17 +4983,17 @@ last_ack=<what> (N zones in the file)\fR.
 .IP \(bu 2
 \fB\fBfetchq:\fB (0.7): where a fetch is held up.\fR \fBkarictl dbstatus\fR has
 the line \fBfetchq: in_flight=N places=N peak=N table_full=N ring_dropped=N
-park_full=N park_timeout=N loader_busy=N ingest_busy=P% hist=A,B,C,D,E queued=N
-queue_peak=N waited=N queue_dropped=N queue_full=N\fR right after the
-\fBfetch:\fR line. Everything is counted since the server started, except
-\fBin_flight\fR and \fBqueued\fR (now) and \fBingest_busy\fR (the last
-window). Read it from the query to the install: \fBpark_full\fR counts queries
-that found the worker's table of parked queries full (\fBpark\-max\fR) and were
-answered "not ready" at once (true overload); \fBring_dropped\fR, queries whose
-request for the zone could not be handed from the worker to the ingest thread
-(the worker's ring of 128 was full: the ingest thread is behind; the query stays
-parked and the request is made again, so this counts refusals, not lost
-queries); the requests that cannot be made at once because of
+park_full=N park_timeout=N loader_busy=N ingest_busy=P% fill_busy=P%
+hist=A,B,C,D,E queued=N queue_peak=N waited=N queue_dropped=N queue_full=N\fR
+right after the \fBfetch:\fR line. Everything is counted since the server
+started, except \fBin_flight\fR and \fBqueued\fR (now) and \fBingest_busy\fR
+(the last window). Read it from the query to the install: \fBpark_full\fR counts
+queries that found the worker's table of parked queries full (\fBpark\-max\fR)
+and were answered "not ready" at once (true overload); \fBring_dropped\fR,
+queries whose request for the zone could not be handed from the worker to the
+ingest thread (the worker's ring of 128 was full: the ingest thread is behind;
+the query stays parked and the request is made again, so this counts refusals,
+not lost queries); the requests that cannot be made at once because of
 \fBfetch\-concurrency\fR, \fBfetch\-rate\fR or \fBmemory\-limit\fR \fBwait\fR
 (0.7): \fBqueued\fR is how many wait now, \fBqueue_peak\fR the most there have
 been, \fBwaited\fR how many had to wait (since the start), \fBqueue_dropped\fR

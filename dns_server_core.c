@@ -2344,6 +2344,13 @@ static int zref_fetch_gate(const char *view, const zref_t *pel) {
   return park_claim_mark(key) ? FETCH_GATE_TAKEN : FETCH_GATE_ASK;
 }
 
+/* 0.7 fix 7: a zone of the store whose image is in the page cache is attached by the worker itself (dns_db_store.c, worker_attach()): true means the zone is in memory (staged) and the query is looked up
+ * again and answered, false that nothing was done and the query parks as before.  Once per query: a zone that is out of memory again at the second look parks. */
+static bool worker_attach_try(const view_snapshot_t *view, const zref_t *pel, int widx) {
+  const dbdir_ops_t *d = dbdir();
+  return d && d->worker_attach && d->worker_attach(view, pel, widx);
+}
+
 /* What a worker asks for when it parks a query for a zone that is not in memory (udp_park() and the TCP path).  ask: this query asks for the zone (the first one for it, or one that was
  * woken and finds the zone out of memory again: nothing is on its way and nobody else would wake it before its time is up); attach: a store thread makes the entry (the store holds
  * the image, or the lookup could not read a cell now and the store thread looks again), else the zone is fetched from the database. */
@@ -2531,6 +2538,8 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
             route.view = select_view_req(snap, acquire_config_snapshot(), client_ip, req_buf, (size_t)payload_received, &route_tsig, &route_tsig_done);
             route.tsig = route_tsig_done ? &route_tsig : NULL;
             zref_t pel;
+            bool wa_tried = false;                /* 0.7 fix 7: the worker attached the zone (or tried to) once for this query */
+          relookup_udp:
             zref_clear(&pel);
             route.entry = route.view ? find_zone_for_query_zref(route.view, qname, ((req_buf[2] >> 3) & 0x0F) == 0 ? qtype : 0, &pel) : NULL;
             uint8_t *res_buf = batch->tx_buffers[w->n_tx] + sizeof(udp_ipc_t);
@@ -2551,6 +2560,7 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
                 answered = true;
               } else {
                 if (!w->woken && pel.el && ((req_buf[2] >> 3) & 0x0F) == 0) atomic_fetch_add_explicit(&pel.el->freq, 1, memory_order_relaxed);        /* the zone is asked for (an UPDATE does not count), once per query (a query that comes back after a wake-up or a time-out is not counted again) */
+                if (!w->not_ready && !wa_tried && !pel.el && ((wa_tried = true)) && worker_attach_try(route.view, &pel, w->worker_idx)) goto relookup_udp;      /* 0.7 fix 7: the image is in the page cache: attached here, no wait */
                 if (!w->not_ready && udp_park(w, route.view, &pel, ipc_msg, req_buf, (size_t)payload_received)) {
                   rcu_reader_exit(ctx);
                   return;                                 /* parked: it is answered when the zone is there, or its time is up */
@@ -3542,6 +3552,8 @@ process_tcp_client: ;
             route.view = select_view_req(snap, acquire_config_snapshot(), ctx_tcp->client_ip, msg, msg_len, &route_tsig, &route_tsig_done);
             route.tsig = route_tsig_done ? &route_tsig : NULL;
             zref_t pel;
+            bool wa_tried = false;                /* 0.7 fix 7: the worker attached the zone (or tried to) once for this query */
+          relookup_tcp:
             zref_clear(&pel);
             route.entry = route.view ? find_zone_for_query_zref(route.view, qname, ((msg[2] >> 3) & 0x0F) == 0 ? qtype : 0, &pel) : NULL;
             bool not_ready = false, answered = false;
@@ -3561,6 +3573,7 @@ process_tcp_client: ;
               int64_t pnow = park_now_ms();
               int64_t left = ctx_tcp->park_deadline_ms ? ctx_tcp->park_deadline_ms - pnow : (int64_t)park_timeout_ms;
               if (park_on && !ctx_tcp->not_ready_now && left > 0) {
+                if (!wa_tried && !pel.el && ((wa_tried = true)) && worker_attach_try(route.view, &pel, ctx->thread_id)) goto relookup_tcp;      /* 0.7 fix 7: the image is in the page cache: attached here, no wait */
                 park_plan_t pp = park_plan(&park, route.view, &pel, ctx_tcp->park_deadline_ms != 0);       /* (as udp_park(): the view that holds the zone, the claim, the attach) */
                 const char *hv = pp.hv, *zname = pp.name;
                 const bool attach = pp.attach;
@@ -3915,6 +3928,7 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
     if (o->database.store_scrub_interval != n->database.store_scrub_interval) append_list_item(buf, sz, "database store-scrub-interval");
     if (o->database.store_segment_size != n->database.store_segment_size) append_list_item(buf, sz, "database store-segment-size");
     if (o->database.store_threads != n->database.store_threads) append_list_item(buf, sz, "database store-threads");
+    if (o->database.store_hot_list != n->database.store_hot_list) append_list_item(buf, sz, "database store-hot-list");
   }
 }
 
@@ -8565,6 +8579,7 @@ int main(int argc, char **argv) {
 
   // 特権分離(setuid+Capsicum)が完了したため、各Workerスレッドにクエリ処理の開始を許可する
   atomic_store_explicit(&g_privilege_drop_complete, true, memory_order_release);
+  db_store_hot_start();     // 0.7 fix 8: the zones of hot.list are attached in the background, after the queries
 
   for (int i = 0; i < num_workers; i++)
     pthread_join(threads[i], NULL);

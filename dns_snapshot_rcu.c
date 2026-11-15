@@ -3682,6 +3682,62 @@ static void store_retire_locked(zone_db_entry_t *e, void *obj, void (*fn)(void *
     zone_entry_unref(e);
 }
 
+/* ---- 0.7 fix 7 (the worker's attach): staged elements ----
+ * A worker that finds the image of a zone in the page cache makes the entry itself (dns_db_store.c) and answers from it at once; it takes no lock of the registry.  What it publishes for the
+ * lookup is a staged element: a zdir_elem_t that is not in the registry (no name table, no cache manager), only in the staging table of dns_db_store.c, and that holds the entry and the record
+ * the entry was made from.  A store thread then registers the entry as an attach does (dbreg_attach_store() with the record the staged element holds: nothing changed since, or the zone
+ * is not registered and the staged element goes) and takes the staged element away.  The entry is the registry's from the registration; the staged element has its own retire (below). */
+static void staged_free_cb(void *p) { free(p); }
+
+zdir_elem_t *dbreg_staged_new(const char *name, uint16_t sview, const dbdir_rec_t *rec, zone_db_entry_t *entry) {
+    const size_t l = strlen(name);
+    if (l < 2 || l > 255) return NULL;
+    zdir_elem_t *z = calloc(1, sizeof(*z) + l + 1 + 32);
+    if (!z) return NULL;
+    memcpy(z->name, name, l + 1);
+    z->hash = zdir_name_hash(name);
+    z->klen = (uint8_t)zone_key_len(name);
+    z->kind = ZDIR_K_STORED;
+    z->zid = rec->zid;
+    z->sview = sview;
+    z->source_id = rec->source_id;
+    atomic_init(&z->serial, rec->serial);
+    z->digest = (uint8_t *)z->name + l + 1;
+    memcpy(z->digest, rec->digest, 32);
+    z->flags = (uint16_t)((rec->flags & 0x1 ? ZDIR_F_PRESIGNED : 0) | (rec->flags & 0x2 ? ZDIR_F_ALIAS : 0) | (rec->flags & 0x4 ? ZDIR_F_WILDCARD : 0));
+    z->last_result = DBREG_APPLIED;
+    zdir_elem_sync(z, entry);
+    atomic_store_explicit(&z->entry, entry, memory_order_release);
+    return z;
+}
+
+/* the record a staged element was made from (what dbreg_attach_store() compares with the store's) */
+void dbreg_staged_rec(const zdir_elem_t *z, dbdir_rec_t *rec) {
+    memset(rec, 0, sizeof(*rec));
+    rec->zid = z->zid;
+    rec->state = 2;                                           /* STORE_STATE_STORED */
+    rec->flags = (uint16_t)((z->flags & ZDIR_F_PRESIGNED ? 0x1 : 0) | (z->flags & ZDIR_F_ALIAS ? 0x2 : 0) | (z->flags & ZDIR_F_WILDCARD ? 0x4 : 0));
+    rec->serial = atomic_load_explicit(&z->serial, memory_order_relaxed);
+    rec->source_id = z->source_id;
+    memcpy(rec->digest, z->digest, 32);
+}
+
+/* The staged element leaves (it was taken out of the staging table by the caller) and the registry did not take its entry (the zone is in memory already, changed, or gone): the element is freed after
+ * the grace period, which a reader that found it in the table has to leave first, and the entry's one reference goes too (the entry with the last reader).  Elements whose entry the registry took are
+ * freed by dns_db_store.c (dbreg_staged_free(), after its own grace period: they hold no reference of the entry). */
+void dbreg_staged_retire(zdir_elem_t *z, bool entry_dead) {
+    zone_db_entry_t *e = zdir_entry(z);
+    uint64_t ep = rcu_writer_advance_epoch();
+    if (!zone_retire_object(e, z, staged_free_cb, ep)) {
+        (void)rcu_writer_wait_until_safe(ep, 60000);
+        staged_free_cb(z);
+    }
+    if (entry_dead) zone_entry_unref(e);
+}
+
+/* a staged element that was never published (the worker could not stage it): the entry is the caller's to free */
+void dbreg_staged_free(zdir_elem_t *z) { staged_free_cb(z); }
+
 /* the interned settings of the entry (NULL: none) */
 static zone_ext_shared_t *store_entry_settings(const zone_db_entry_t *e) {
     const zone_config_t *dc = atomic_load_explicit(&e->dbcfg, memory_order_acquire);
@@ -5427,6 +5483,31 @@ static void room_take_pass(const cache_cand_t *cand, size_t nc, bool relaxed, ui
             if (c->freq > *boundary) *boundary = c->freq;
         }
     }
+}
+
+/* 0.7 fix 8, hot.list: the zones in the attach table (at most `cap`), each as score << 32 | zone id, where the score is what the cache manager's frequency of the zone is now (aged to the time of this call,
+ * with the queries the zone has answered since the manager folded them in), so that a sort puts the most used first.  The registry lock is held for the walk (a zone is seen once, as the sampler sees it);
+ * no counter or flag of an element is changed.  Returns how many were collected. */
+size_t dbreg_hot_collect(uint64_t *out, size_t cap) {
+    const dbdir_ops_t *ops = dbdir();
+    if (!ops || !out) return 0;
+    size_t n = 0, pos = 0;
+    rcu_aux_read_lock();
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    const uint32_t now32 = (uint32_t)cache_mono_ms();
+    for (zdir_elem_t *z; n < cap && (z = ops->attach_next(&pos)) != NULL;) {
+        zone_db_entry_t *e = zdir_entry(z);
+        if (!e || e->source != ZONE_SRC_DB || !(z->kind & ZDIR_K_STORED)) continue;
+        uint32_t f = atomic_load_explicit(&z->freq, memory_order_relaxed);
+        const uint32_t steps = (now32 - z->t_age) / CACHE_AGE_MS;
+        f = steps >= 32 ? 0 : f >> steps;
+        const uint32_t dq = zone_queries32(e) - z->qseen;
+        f = f > UINT32_MAX - dq ? UINT32_MAX : f + dq;
+        out[n++] = ((uint64_t)f << 32) | z->zid;
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    rcu_aux_read_unlock();
+    return n;
 }
 
 #ifdef KARIDNS_UNIT_TEST

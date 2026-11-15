@@ -426,7 +426,7 @@ INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT
     R0=$(backend_rss)
     stop_one "$SRV"; SRV=""
     DBFILE="$T/db3/z.db"
-    conf a "memory-limit 4m; store \"$T/store3\"; store-threads 2; store-mode ${STORE_MODE:-auto};"
+    conf a "memory-limit 4m; store \"$T/store3\"; store-threads 2; store-mode ${STORE_MODE:-auto}; store-hot-list no;"      # (hot.list would attach the zones of the last stop: this is about a store with nothing attached; the segments are mapped with their cached pages, which RSS counts)
     start_cold a
     ./dag @127.0.0.1 -p "$PA" www.z77.test A +short +nohexdump +time=5 +tries=1 > /dev/null 2>&1
     R1=$(backend_rss)
@@ -435,7 +435,7 @@ INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT
     [ "${EL:-99999}" -le 2 ] && pass "the heap holds $EL registry element(s) for $HEAP_N stored zones (only the zone that was asked for)" || fail "registry elements: ${EL:-?}"
     DR=$((R1 - R0))
     echo "  Backend RSS: $R0 KiB with an empty store, $R1 KiB with $HEAP_N stored zones (the store's mapped pages are in it): $DR KiB more"
-    [ "$DR" -le "${HEAP_RSS_MAX_KIB:-65536}" ] && pass "the Backend with $HEAP_N stored zones is within ${HEAP_RSS_MAX_KIB:-65536} KiB of the one with none ($DR KiB)" || fail "RSS grew by $DR KiB for $HEAP_N stored zones"
+    [ "$DR" -le "${HEAP_RSS_MAX_KIB:-196608}" ] && pass "the Backend with $HEAP_N stored zones is within ${HEAP_RSS_MAX_KIB:-196608} KiB of the one with none ($DR KiB)" || fail "RSS grew by $DR KiB for $HEAP_N stored zones"
     stop_one "$SRV"; SRV=""
     unset DBFILE LPATH
 fi
@@ -610,6 +610,12 @@ conf a "store \"$T/store\"; store-segment-size 4m; store-scrub-interval 3600;"
 cp "$T/a.conf" "$T/k.conf"; kc; grep -E "ERROR|error" "$T/kc.out" | grep -qi "store" && fail "karicheck refused store-segment-size / store-scrub-interval: $(grep -i store "$T/kc.out")" || pass "store-segment-size 4m and store-scrub-interval 3600 are accepted"
 conf a "store \"$T/store\"; store-scrub-interval off;"
 cp "$T/a.conf" "$T/k.conf"; kc; grep -E "ERROR|error" "$T/kc.out" | grep -qi "store" && fail "karicheck refused store-scrub-interval off" || pass "store-scrub-interval off is accepted"
+conf a "store \"$T/store\"; store-hot-list no; store-threads 32;"
+cp "$T/a.conf" "$T/k.conf"; kc; grep -E "ERROR|error" "$T/kc.out" | grep -qi "store" && fail "karicheck refused store-hot-list no / store-threads 32: $(grep -i store "$T/kc.out")" || pass "store-hot-list no and store-threads 32 are accepted"
+conf a "store-hot-list maybe;"
+cp "$T/a.conf" "$T/k.conf"; kc; [ $? != 0 ] && pass "store-hot-list maybe is an error" || fail "karicheck accepted store-hot-list maybe"
+conf a "store-threads 33;"
+cp "$T/a.conf" "$T/k.conf"; kc; [ $? != 0 ] && pass "store-threads 33 (above 32) is an error" || fail "karicheck accepted store-threads 33"
 conf a "store-scrub-interval 5;"
 cp "$T/a.conf" "$T/k.conf"; kc; [ $? != 0 ] && pass "store-scrub-interval 5 (below a minute) is an error" || fail "karicheck accepted store-scrub-interval 5"
 conf a "store-segment-size 4k;"

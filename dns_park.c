@@ -85,6 +85,14 @@ bool park_init(park_table_t *t, uint32_t cap) {
   return true;
 }
 
+/* the bytes the table reserved (calloc: a page that no entry used is not memory yet); what a full table of usual requests touches is about half of it */
+size_t park_bytes(const park_table_t *t) {
+  if (!t->e) return 0;
+  uint32_t nbig = t->cap / 8 < 16 ? (t->cap < 16 ? t->cap : 16) : t->cap / 8;
+  return (size_t)t->cap * (sizeof(*t->e) + sizeof(*t->free_idx) + t->bsize[0] + sizeof(uint32_t)) + (size_t)(t->bmask + 1) * sizeof(*t->bucket) + (size_t)PARK_WHEEL * sizeof(*t->wheel) +
+         (size_t)(PARK_WHEEL / 64) * sizeof(*t->wbits) + (size_t)nbig * (t->bsize[1] + sizeof(uint32_t));
+}
+
 void park_free(park_table_t *t) {
   free(t->e);
   free(t->free_idx);
@@ -708,6 +716,14 @@ static void trigger_attach(void) {
   if (atomic_load_explicit(&g_attach_asleep, memory_order_relaxed) > 0) trigger(atomic_load_explicit(&g_attach_kq, memory_order_relaxed), PARK_ATTACH_IDENT);
 }
 
+bool park_attach_room(int w) {
+  if (w < 0 || w >= PARK_MAX_WORKERS) return false;
+  const att_ring_t *r = &g_attach[w];
+  return atomic_load_explicit(&r->head, memory_order_relaxed) - atomic_load_explicit(&r->tail, memory_order_acquire) < PARK_ATTACH_RING;
+}
+
+bool park_attach_adopt(int w, uint16_t sview, uint32_t zid) { return park_attach_zid(w, (uint16_t)(sview | PARK_ATT_ADOPT), zid); }
+
 bool park_attach_zid(int w, uint16_t sview, uint32_t zid) {
   if (w < 0 || w >= PARK_MAX_WORKERS) return false;
   att_ring_t *r = &g_attach[w];
@@ -791,6 +807,8 @@ bool park_attach_next(park_attach_req_t *out) {
     if (atomic_load_explicit(&g_att_st[k], memory_order_relaxed) != 2 || !atomic_compare_exchange_strong_explicit(&g_att_st[k], &ready, 3, memory_order_acquire, memory_order_relaxed)) continue;
     const park_fetch_req_t *q = &g_att_q[k];
     out->by_name = true;
+    out->adopt = false;
+    out->by_name = true;
     out->prio = q->prio;
     out->worker = -1;
     out->sview = 0;
@@ -810,7 +828,8 @@ bool park_attach_next(park_attach_req_t *out) {
       out->by_name = false;
       out->prio = 0;
       out->worker = (int16_t)w;
-      out->sview = sv;
+      out->adopt = (sv & PARK_ATT_ADOPT) != 0;
+      out->sview = (uint16_t)(sv & ~PARK_ATT_ADOPT);
       out->zid = zid;
       got = true;
     }

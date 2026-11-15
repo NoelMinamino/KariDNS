@@ -448,6 +448,16 @@ int  store_seg_info(const store_t *s, uint32_t num, store_seg_info_t *out);  /* 
 /* Page-cache residency estimate: mincore() on up to `pages` random pages of the appended part of the segments (MAP mode; -ENOTSUP in
  * COPY mode, -errno when mincore() is refused, e.g. in a sandbox).  *sampled pages looked at, *resident of them in memory.  Bounded, no lock. */
 int  store_resident_sample(const store_t *s, unsigned pages, uint64_t seed, uint64_t *sampled, uint64_t *resident);
+/* 0.7 fix 7: are all pages of the stored image of this record in the page cache (mincore() on the record's range)?  MAP mode only; false in COPY mode, for a segment that is not open, or when the
+ * record is too big to look at.  No lock, no open, no read: a worker may call it. */
+bool store_image_resident(const store_t *s, const store_zone_t *z);
+/* 0.7 fix 7: open (map) every segment now; store_image_resident() says no for a segment that is not open */
+void store_open_segments(const store_t *s);
+/* 0.7 fix 8: hot.list.  store_hot_write(): the zone ids (the most used first, at most STORE_HOT_MAX) are written to hot.list of the store's directory (not trusted by a reader until complete).
+ * store_hot_read(): the list of this store (the uuid must be its own, the checksums right), malloc'ed, *n may be 0; -ENOENT when there is none, -EBADMSG when it is not trusted. */
+#define STORE_HOT_MAX (4u << 20)
+int  store_hot_write(store_t *s, const uint32_t *zids, size_t n);
+int  store_hot_read(const store_t *s, uint32_t **zids, size_t *n);
 /* Full consistency check (O(zones), takes the writer mutex): every record valid, every zone reachable through ix / sx, counters
  * and live bytes equal the recount, the free list intact, no duplicate names.  For tests, `karictl store verify`, the scrub. */
 int  store_check(store_t *s, store_check_report_t *rep);

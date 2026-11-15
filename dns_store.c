@@ -909,6 +909,15 @@ static bool st_name_eq(const store_t *s, uint32_t z, uint16_t view, const uint8_
 #define ST_NOCORE 0
 #endif
 
+/* mincore() only sees the pages that this process has mapped: a page that is in the page cache and has not been touched through the mapping reads as not resident (measured on FreeBSD 15.1, UFS: 96 pages of
+ * 2,560 after a write, after a read, and after another process had touched them all).  MAP_PREFAULT_READ maps the pages that are in the page cache when the segment is mapped (no read of the disk), so
+ * that store_image_resident() tells the truth about them; a page that comes into the cache later is mapped by its first touch, and until then the worker leaves its zone to a store thread. */
+#ifdef MAP_PREFAULT_READ
+#define ST_PREFAULT MAP_PREFAULT_READ
+#else
+#define ST_PREFAULT 0
+#endif
+
 #ifdef O_RESOLVE_BENEATH
 #define ST_OBENEATH O_RESOLVE_BENEATH
 #else
@@ -1256,7 +1265,7 @@ static seg_t *seg_get(store_t *s, uint32_t n) {
           g->num = n;
           if (s->mode == STORE_MODE_MAP) {
             g->maplen = (size_t)st.st_size;
-            void *p = g->maplen ? mmap(NULL, g->maplen, PROT_READ, MAP_SHARED | ST_NOCORE, fd, 0) : MAP_FAILED;
+            void *p = g->maplen ? mmap(NULL, g->maplen, PROT_READ, MAP_SHARED | ST_NOCORE | ST_PREFAULT, fd, 0) : MAP_FAILED;
             if (p == MAP_FAILED) { free(g); g = NULL; } else g->map = p;
           }
           if (g) atomic_store_explicit(&s->segs[n], g, memory_order_release);
@@ -3901,6 +3910,101 @@ int store_resident_sample(const store_t *cs, unsigned pages, uint64_t seed, uint
       break;
     }
   }
+  return 0;
+}
+
+/* 0.7 (fix 7): the segments are opened (and mapped, in MAP mode) at the start, so that the first query of a zone finds its segment open (store_image_resident() asks no open of a worker).  Only the mapping is
+ * made; no page is read. */
+void store_open_segments(const store_t *cs) {
+  store_t *s = (store_t *)cs;
+  uint32_t nseg = (uint32_t)VG(s, V_NSEGS);
+  if (nseg > ST_MAXSEG) nseg = ST_MAXSEG;
+  for (uint32_t n = 1; n <= nseg; n++) (void)seg_get(s, n);
+}
+
+/* 0.7 (fix 7): are the pages of the zone's stored image in the page cache?  MAP mode only (COPY reads with pread, which can block); the segment must be open already (no open on this thread: a worker
+ * calls it), the record must lie within the mapping and span few pages.  A page can leave between this call and the touch of it: the touch is then a fault that reads the page from the disk (the
+ * worker waits for it once), the same risk every MAP lookup of the tables has; dns_db_store.c's worker attach documents it. */
+#define ST_RES_PAGES 32
+bool store_image_resident(const store_t *cs, const store_zone_t *z) {
+  store_t *s = (store_t *)cs;
+  if (s->mode != STORE_MODE_MAP || z->state != STORE_STATE_STORED || z->loc == 0) return false;
+  const uint32_t sn = (uint32_t)(z->loc >> ST_LOC_SHIFT);
+  if (sn == 0 || sn > ST_MAXSEG) return false;
+  const seg_t *g = atomic_load_explicit(&s->segs[sn], memory_order_acquire);
+  if (!g || !g->map) return false;
+  const uint64_t off = (z->loc & ST_LOC_MASK) * 64, rlen = st_reclen(z->klen, z->img_len);
+  if (off < ST_SEGHDR || off + rlen > g->maplen) return false;
+  const uint64_t first = off & ~(uint64_t)(s->pagesz - 1), span = off + rlen - first;
+  const size_t np = (size_t)((span + s->pagesz - 1) / s->pagesz);
+  char vec[ST_RES_PAGES];
+  if (np == 0 || np > ST_RES_PAGES) return false;
+  if (mincore(g->map + first, np * s->pagesz, vec) != 0) return false;
+  for (size_t i = 0; i < np; i++)
+    if (!(vec[i] & 1)) return false;
+  return true;
+}
+
+/* ---- 0.7 (fix 8): hot.list, the zone ids that were in memory at a clean stop, the most used first ----
+ * One file in the store's directory: a 48-byte header (magic, version, the store's uuid, the count, the checksum64 of the ids and of the header) and the ids (u32 each).  The header is written
+ * last (the file is first made invalid), so a torn write is a file that is not trusted; a list of another store (another uuid) is not trusted either.  Nothing in it is believed: the reader
+ * of the list attaches only zones whose record is stored. */
+#define ST_HOT_MAGIC 0x544F484Bu       /* "KHOT" */
+#define ST_HOT_HDR 48u
+typedef struct { uint32_t magic, version; uint8_t uuid[16]; uint64_t n, sum, hsum; } hothdr_t;
+_Static_assert(sizeof(hothdr_t) == ST_HOT_HDR, "hothdr_t");
+
+static uint64_t hot_hsum(const hothdr_t *h) { return st_sum64(h, ST_HOT_HDR - 8, 0x686F746C697374ull); }
+
+int store_hot_write(store_t *s, const uint32_t *zids, size_t n) {
+  if (!s || (n && !zids) || n > STORE_HOT_MAX) return -EINVAL;
+  int fd = st_openat(s, "hot.list", O_RDWR | O_CREAT);
+  if (fd < 0) return fd;
+  hothdr_t h;
+  memset(&h, 0, sizeof(h));
+  int r = st_pwrite_all(fd, &h, sizeof(h), 0);                       /* (invalid until the ids are written) */
+  if (r == 0 && n) r = st_pwrite_all(fd, zids, n * sizeof(uint32_t), ST_HOT_HDR);
+  if (r == 0 && ftruncate(fd, (off_t)(ST_HOT_HDR + n * sizeof(uint32_t))) != 0) r = -errno;
+  if (r == 0 && fsync(fd) != 0) r = -errno;
+  if (r == 0) {
+    h.magic = ST_HOT_MAGIC;
+    h.version = 1;
+    memcpy(h.uuid, s->uuid, 16);
+    h.n = n;
+    h.sum = st_sum64(zids, n * sizeof(uint32_t), 0);
+    h.hsum = hot_hsum(&h);
+    r = st_pwrite_all(fd, &h, sizeof(h), 0);
+    if (r == 0 && fsync(fd) != 0) r = -errno;
+  }
+  close(fd);
+  return r;
+}
+
+int store_hot_read(const store_t *cs, uint32_t **zids, size_t *n) {
+  store_t *s = (store_t *)cs;
+  *zids = NULL;
+  *n = 0;
+  int fd = st_openat(s, "hot.list", O_RDONLY);
+  if (fd < 0) return fd;
+  hothdr_t h;
+  memset(&h, 0, sizeof(h));
+  struct stat st;
+  int r = fstat(fd, &st) != 0 ? -errno : (st.st_size < (off_t)ST_HOT_HDR ? -EBADMSG : st_pread_all(fd, &h, sizeof(h), 0));
+  if (r == 0 && (h.magic != ST_HOT_MAGIC || h.version != 1 || memcmp(h.uuid, s->uuid, 16) != 0 || h.hsum != hot_hsum(&h) || h.n > STORE_HOT_MAX || (uint64_t)st.st_size != ST_HOT_HDR + h.n * 4)) r = -EBADMSG;
+  uint32_t *ids = NULL;
+  if (r == 0 && h.n) {
+    ids = malloc((size_t)h.n * sizeof(uint32_t));
+    if (!ids) r = -ENOMEM;
+    else r = st_pread_all(fd, ids, (size_t)h.n * sizeof(uint32_t), ST_HOT_HDR);
+    if (r == 0 && st_sum64(ids, (size_t)h.n * sizeof(uint32_t), 0) != h.sum) r = -EBADMSG;
+  }
+  close(fd);
+  if (r != 0) {
+    free(ids);
+    return r;
+  }
+  *zids = ids;
+  *n = (size_t)h.n;
   return 0;
 }
 

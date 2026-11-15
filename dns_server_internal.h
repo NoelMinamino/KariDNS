@@ -937,6 +937,7 @@ typedef struct dbdir_ops {
   zdir_elem_t *(*attach_next)(size_t *pos);                                  /* the elements of the attach table, in table order (read section); *pos starts at 0; NULL at the end */
   zdir_elem_t *(*attach_sample)(uint64_t r);                                    /* an element of the attach table picked at random (r: the random number; NULL: none); the registry lock is held (S5: eviction by sampling) */
   uint64_t (*attach_tab_id)(void);                                           /* identifies the table a position belongs to (a table that grew is another one) */
+  bool (*worker_attach)(const view_snapshot_t *view, const zref_t *pel, int widx);   /* 0.7 fix 7: a worker, in its read section, attaches a zone of the store whose image is in the page cache (MAP mode) and answers from it: true: the zone is there (look it up again), false: not done, park the query as before (nothing was changed except a claim of the zone that the park keeps) */
   uint64_t (*counters)(int what);                                            /* the figures of the store for the status lines */
 } dbdir_ops_t;
 extern _Atomic(const dbdir_ops_t *) g_dbdir;
@@ -1530,6 +1531,16 @@ typedef struct {                 /* what the commit checks against the element (
   uint8_t digest[32];
 } dbreg_attach_info_t;
 int dbreg_attach_store(const char *view, const char *name, const dbdir_rec_t *rec, zone_db_entry_t *entry, bool bg);
+/* 0.7 fix 7, the worker's attach (dns_db_store.c): the worker makes the entry of a zone whose image is in the page cache and publishes a STAGED element for it (a zdir_elem_t that is not in the
+ * registry: only the staging table of dns_db_store.c reaches it), takes no lock of the registry and answers from the entry; a store thread registers the entry (dbreg_attach_store() with the record
+ * the staged element holds: dbreg_staged_rec()) and takes the staged element away (dbreg_staged_retire(): freed after the grace period; entry_dead: the registry did not take the entry, it goes too).
+ * dbreg_staged_free() is for an element that was never published.  The entry's pointer is the element's `entry`. */
+zdir_elem_t *dbreg_staged_new(const char *name, uint16_t sview, const dbdir_rec_t *rec, zone_db_entry_t *entry);
+void dbreg_staged_rec(const zdir_elem_t *z, dbdir_rec_t *rec);
+void dbreg_staged_retire(zdir_elem_t *z, bool entry_dead);
+void dbreg_staged_free(zdir_elem_t *z);
+/* 0.7 fix 8: the zones of the attach table with their scores (score << 32 | zone id), for hot.list; the registry lock is taken for the walk */
+size_t dbreg_hot_collect(uint64_t *out, size_t cap);
 zone_db_entry_t *dbreg_pin_entry(const char *view, const char *zone);
 enum { DBREG_EVICT_OTHER = 0, DBREG_EVICT_LIMIT, DBREG_EVICT_ROOM };
 void dbreg_set_evict_hook(void (*cb)(int reason));

@@ -162,6 +162,8 @@ static bool extra_fn(store_extra_t *x) {
   x->pool_used = 7; x->pool_slabs = 1; x->pool_slab_bytes = 2u << 20; x->pool_slot_bytes = 256; x->pool_free_slots = 100;
   x->attach_slots = 2048; x->attach_grows = 3; x->attach_shrinks = 1;
   x->folded = 11; x->fold_rows = 5; x->fold_replaced = 2; x->err_texts = 4; x->err_noted = 9; x->err_dropped = 1; x->sampled_detaches = 6;
+  x->wa_ok = 100; x->wa_cold = 7; x->wa_over = 2; x->wa_claim = 3; x->wa_fail = 4; x->wa_decline = 5; x->wa_full = 6; x->wa_adopted = 98; x->wa_lost = 2; x->wa_ns = 1500000;
+  x->hot_state = 2; x->hot_listed = 1000; x->hot_attached = 990; x->hot_skipped = 10; x->hot_written = 1234;
   return true;
 }
 static bool g_mem_ok = true;
@@ -453,6 +455,21 @@ static void test_store(int mode, const char *base) {
   CHECK_EQ(kv_num("store.errors.memory_texts"), 4);
   CHECK_EQ(kv_num("store.errors.memory_pushed_out"), 1);
   CHECK_EQ(kv_num("store.detach.sampled"), 6);
+  CHECK_EQ(kv_num("store.attach.worker.ok"), 100);
+  CHECK_EQ(kv_num("store.attach.worker.mean_us"), 15);                  /* (1,500,000 ns over 100 attaches) */
+  CHECK_EQ(kv_num("store.attach.worker.not_resident"), 7);
+  CHECK_EQ(kv_num("store.attach.worker.over_limit"), 2);
+  CHECK_EQ(kv_num("store.attach.worker.claimed"), 3);
+  CHECK_EQ(kv_num("store.attach.worker.failed"), 4);
+  CHECK_EQ(kv_num("store.attach.worker.declined"), 5);
+  CHECK_EQ(kv_num("store.attach.worker.full"), 6);
+  CHECK_EQ(kv_num("store.attach.worker.registered"), 98);
+  CHECK_EQ(kv_num("store.attach.worker.dropped"), 2);
+  CHECK(strcmp(kv_str("store.hot.state"), "done") == 0);
+  CHECK_EQ(kv_num("store.hot.listed"), 1000);
+  CHECK_EQ(kv_num("store.hot.attached"), 990);
+  CHECK_EQ(kv_num("store.hot.skipped"), 10);
+  CHECK_EQ(kv_num("store.hot.written_at_stop"), 1234);
   store_status_set_extra_fn(NULL);
   store_status_format(js, STORE_STATUS_OUT_MAX, STORE_FMT_JSON, NULL);
   CHECK(parse_json(js));

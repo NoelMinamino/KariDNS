@@ -445,13 +445,16 @@ static bool damage_record(const char *dir, const char *zone) {
 /* ---------------------------------------------------------------- a reader of a zone that comes and goes */
 static _Atomic bool g_rd_stop;
 static _Atomic uint64_t g_rd_ok, g_rd_gone, g_rd_bad;
+static _Atomic int g_rd_pause_us;                          /* a reader that waits between its questions (0: none) */
 static void *reader_thread(void *arg) {
     const char *name = arg;
-    static worker_ctx_t wc;
-    static compress_ctx_t cc;
+    static _Thread_local worker_ctx_t wc;                                    /* (one for each reader: they are not shared) */
+    static _Thread_local compress_ctx_t cc;
     memset(&wc, 0, sizeof(wc));
     uint8_t out[1232];
     while (!atomic_load(&g_rd_stop)) {
+        const int pause_us = atomic_load(&g_rd_pause_us);
+        if (pause_us) usleep((useconds_t)pause_us);
         int rl = ask_engine(&wc, &cc, name, 1, out);
         if (rl > 12 && (out[3] & 0x0F) == 0 && ((out[6] << 8) | out[7]) == 1) {
             /* the A record of www: 192.0.2.8x somewhere in the message */
@@ -591,6 +594,149 @@ static int nt_take(int *last, int max) {
     return n;
 }
 
+#if defined(__SANITIZE_THREAD__)
+#define UNDER_TSAN_TEST 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define UNDER_TSAN_TEST 1
+#endif
+#endif
+#ifndef UNDER_TSAN_TEST
+#define UNDER_TSAN_TEST 0
+#endif
+
+/* a store thread that is held before it registers a staged zone (W5b) */
+static _Atomic bool g_adopt_hold;
+static void adopt_hold_hook(void) {
+    for (int t = 0; t < 5000 && atomic_load(&g_adopt_hold); t++) usleep(1000);
+}
+
+/* 0.7 fix 7: a thread that attaches the zones as the worker does, as fast as they leave memory */
+static _Atomic bool g_wa_stop;
+static _Atomic uint64_t g_wa_done;
+struct wa_arg { const dbdir_ops_t *ops; char (*names)[24]; };
+static bool dbreg_test_evict_default(const char *zone) { return dbreg_test_evict("default", zone); }
+/* The pages of a record that was just written are in the page cache only in part (a page that the writer has not filled is partly valid, and mincore() does not call it resident: the first touch
+ * would read the rest from the disk).  A read of the image through the mapping makes them whole, as the first query of a zone does, and the worker's attach then finds the image resident. */
+static void warm_zone(const char *zone) {
+    zref_t zr;
+    store_t *st = db_store_handle();
+    if (!zref_of(zone, &zr) || zr.zid == ZREF_NOZID || !st) return;
+    store_img_t im;
+    store_read_lock();
+    if (store_image_read(st, zr.zid, &im) == 0) {
+        volatile uint8_t sink = 0;
+        for (size_t i = 0; i < im.len; i += 64) sink ^= ((const uint8_t *)im.data)[i];
+        (void)sink;
+        store_img_release(st, &im);
+    }
+    store_read_unlock();
+}
+static void *wa_thread(void *p) {
+    struct wa_arg *a = p;
+    int i = 0;
+    while (!atomic_load(&g_wa_stop)) {
+        rcu_aux_read_lock();
+        zone_db_snapshot_t *sn = acquire_zone_snapshot();
+        view_snapshot_t *vs = snapshot_find_view(sn, "default");
+        zref_t z;
+        if (vs && zref_find_exact(vs, a->names[i % 6], &z) && !z.el && z.zid != ZREF_NOZID && z.zstate == ZREF_ST_ABSENT && a->ops->worker_attach(vs, &z, 0)) atomic_fetch_add(&g_wa_done, 1);
+        rcu_aux_read_unlock();
+        i++;
+        if ((i & 63) == 0) usleep(100);
+    }
+    return NULL;
+}
+
+/* ---------------------------------------------------------------- 0.7 fix 7: queries through udp_one() (the worker's attach is part of what a worker does with a query) */
+void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ssize_t payload_received);
+void park_service(udp_pass_t *w, int kq);
+typedef struct {
+    udp_pass_t w;
+    park_table_t table;
+    worker_ctx_t wctx;
+    compress_ctx_t cc;
+    int sk[2];
+    int tag;
+} wk_t;
+
+static void wk_init(wk_t *k) {
+    memset(k, 0, sizeof(*k));
+    CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, k->sk) == 0);
+    int buf = 1 << 20;
+    setsockopt(k->sk[0], SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+    setsockopt(k->sk[1], SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
+    fcntl(k->sk[1], F_SETFL, fcntl(k->sk[1], F_GETFL, 0) | O_NONBLOCK);
+    CHECK(park_init(&k->table, 64));
+    k->w.ctx = &k->wctx;
+    k->w.batch = &k->wctx.batch;
+    k->w.cc = &k->cc;
+    k->w.active_fd = k->sk[0];
+    k->w.park = &k->table;
+    k->w.worker_idx = 0;
+    k->w.park_timeout_ms = 5000;
+    udp_batch_ctx_t *b = &k->wctx.batch;
+    for (int i = 0; i < UDP_BATCH_SIZE; i++) {
+        memset(&b->tx_msgs[i], 0, sizeof(b->tx_msgs[i]));
+        b->tx_msgs[i].msg_hdr.msg_iov = &b->tx_iov[i];
+        b->tx_msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+}
+
+static void wk_free(wk_t *k) {
+    park_free(&k->table);
+    close(k->sk[0]);
+    close(k->sk[1]);
+}
+
+/* one query as the worker's UDP loop gets it; returns what udp_one() left: the answers in the batch (n_tx), the table (nwait) */
+static void wk_send(wk_t *k, const char *name, uint16_t qtype) {
+    udp_batch_ctx_t *b = &k->wctx.batch;
+    uint8_t *rx = b->rx_buffers[0];
+    size_t ql = build_q(rx + sizeof(udp_ipc_t), (uint16_t)(0x4000 + k->tag++), name, qtype);
+    udp_ipc_t *ipc = (udp_ipc_t *)rx;
+    memset(ipc, 0, sizeof(*ipc));
+    ipc->sock_fd_idx = 7;
+    ipc->addr_len = sizeof(struct sockaddr_in);
+    ipc->payload_len = (uint16_t)ql;
+    ipc->client_addr.sin.sin_family = AF_INET;
+    ipc->client_addr.sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ipc->client_addr.sin.sin_port = htons(40000);
+#if defined(__FreeBSD__) || defined(__APPLE__)
+    ipc->client_addr.sin.sin_len = sizeof(struct sockaddr_in);
+#endif
+    k->w.n_tx = 0;
+    rcu_aux_read_lock();                                          /* (this thread is not one of the registered workers: the writers wait for it as an auxiliary reader) */
+    udp_one(&k->w, ipc, rx + sizeof(udp_ipc_t), (ssize_t)ql);
+    rcu_aux_read_unlock();
+}
+
+/* the answer the worker sent (what the batch holds is sent first): the DNS message, its length; -1: nothing */
+static int wk_get(wk_t *k, uint8_t *out) {
+    udp_batch_ctx_t *b = &k->wctx.batch;
+    for (int i = 0; i < k->w.n_tx; i++) send(k->sk[0], b->tx_buffers[i], b->tx_iov[i].iov_len, 0);
+    k->w.n_tx = 0;
+    uint8_t buf[UDP_IPC_BUFFER_SIZE];
+    ssize_t n = recv(k->sk[1], buf, sizeof(buf), 0);
+    if (n <= (ssize_t)sizeof(udp_ipc_t)) return -1;
+    memcpy(out, buf + sizeof(udp_ipc_t), (size_t)n - sizeof(udp_ipc_t));
+    return (int)(n - sizeof(udp_ipc_t));
+}
+
+/* a query that was parked: the store thread wakes the worker, the worker answers (up to ms) */
+static bool wk_wait_answer(wk_t *k, uint8_t *out, int *len, int ms) {
+    for (int t = 0; t < ms / 2; t++) {
+        rcu_aux_read_lock();
+        park_service(&k->w, -1);
+        rcu_aux_read_unlock();
+        *len = wk_get(k, out);
+        if (*len > 0) return true;
+        usleep(2000);
+    }
+    return false;
+}
+
+static const char *g_self = "";
 static int run_mode(const char *mode) {
     printf("[the zone store is the directory of the database zones: %s mode]\n", mode);
     char dir[] = "/tmp/test_db_store.XXXXXX";
@@ -1670,8 +1816,318 @@ static int run_mode(const char *mode) {
         if (zfd >= 0) close(zfd);
     }
 
+    /* -- W. 0.7 fix 7: the worker attaches a zone whose image is in the page cache, and answers at once.  MAP mode: no wait, no store thread in the answer, the registration follows;
+     *    COPY mode (and an image that is not in the page cache): the query parks and a store thread attaches, as before. */
+    {
+        const bool map = strcmp(mode, "map") == 0;
+        static wk_t wk;
+        const dbdir_ops_t *ops = dbdir();
+        enum { NWQ = 8 };
+        batch_begin(a[0], &e, 89, KDB_BATCH_DIFF);
+        for (int i = 0; i < NWQ; i++) {
+            char wn[24];
+            snprintf(wn, sizeof(wn), "wq%d.test.", i);
+            send_zone(a[0], &e, wn, (uint32_t)(i + 1), 0, 7000 + i);
+        }
+        batch_end(a[0], &e, &mainc, 89, NWQ, 0);
+        for (int i = 0; i < NWQ; i++) {
+            char wn[24];
+            snprintf(wn, sizeof(wn), "wq%d.test.", i);
+            warm_zone(wn);
+        }
+        wk_init(&wk);
+        db_store_counters_t w0, w1;
+        uint8_t ref[1232], got[1232];
+        int rlen = 0, glen = 0;
+        CHECK(in_memory("wq3.test."));
+        wk_send(&wk, "wq3.test.", 6);
+        rlen = wk_get(&wk, ref);
+        CHECK(rlen > 12 && (ref[3] & 0x0F) == 0 && wk.table.nwait == 0);              /* (the answer of a zone in memory) */
+
+        /* W1: a stored zone, nothing else in the way */
+        CHECK(evict_zone("wq3.test.") && stored_only("wq3.test."));
+        drain_wakes();
+        db_store_counters(&w0);
+        wk_send(&wk, "wq3.test.", 6);
+        if (map) {
+            glen = wk_get(&wk, got);
+            CHECK(wk.table.nwait == 0 && glen == rlen && memcmp(got + 2, ref + 2, (size_t)rlen - 2) == 0);          /* (answered by the worker that looked: nothing parked, the same bytes) */
+            { db_store_counters_t d; db_store_counters(&d); printf("  W1: ok %llu cold %llu over %llu claim %llu fail %llu decline %llu full %llu\n", (unsigned long long)d.wa_ok, (unsigned long long)d.wa_cold, (unsigned long long)d.wa_over, (unsigned long long)d.wa_claim, (unsigned long long)d.wa_fail, (unsigned long long)d.wa_decline, (unsigned long long)d.wa_full); }
+            db_store_counters(&w1);
+            CHECK(w1.wa_ok == w0.wa_ok + 1 && w1.wa_cold == w0.wa_cold && w1.wa_fail == w0.wa_fail);
+            CHECK(in_memory("wq3.test."));                                              /* (staged, or registered already) */
+            zref_t z;
+            CHECK(zref_of("wq3.test.", &z) && z.entry && z.el && zdir_serial(z.el) == 4);
+            bool reg = false;
+            for (int t = 0; t < 2500 && !reg; t++) {                                   /* (a store thread registers it: the registry has the zone, the attach table has the element) */
+                reg = zref_of("wq3.test.", &z) && z.el && dbreg_lookup_entry("default", "wq3.test.") == z.entry && dbdir()->attach_get(z.zid) == z.el;
+                if (!reg) usleep(2000);
+            }
+            CHECK(reg);
+            db_store_counters(&w1);
+            CHECK(w1.wa_adopted == w0.wa_adopted + 1 && w1.attach_ok == w0.attach_ok + 1 && w1.wa_lost == w0.wa_lost);
+            CHECK(!ch_next(&fetchc, &m, 100));                                         /* (the loader was not asked) */
+            CHECK(park_att_claim(0, z.zid, 5) == 1 && park_att_leave(0, z.zid, 5));   /* (the claim of the zone was taken: it is free) */
+            wk_send(&wk, "wq3.test.", 6);
+            CHECK(wk_get(&wk, got) == rlen && memcmp(got + 2, ref + 2, (size_t)rlen - 2) == 0 && wk.table.nwait == 0);       /* (and the registered zone answers the same) */
+        } else {
+            CHECK(wk.w.n_tx == 0 && wk.table.nwait == 1);                              /* (COPY: the query parks, a store thread attaches) */
+            CHECK(wk_wait_answer(&wk, got, &glen, 5000) && glen == rlen && memcmp(got + 2, ref + 2, (size_t)rlen - 2) == 0);
+            db_store_counters(&w1);
+            CHECK(w1.wa_ok == w0.wa_ok && w1.wa_cold == w0.wa_cold && w1.attach_ok == w0.attach_ok + 1);        /* (no worker attach was tried: the mode has no page cache to ask) */
+        }
+
+        if (map) {
+            /* W2: the image is not in the page cache: nothing is done on the worker, the query parks and a store thread attaches */
+            CHECK(evict_zone("wq4.test.") && stored_only("wq4.test."));
+            drain_wakes();
+            db_store_counters(&w0);
+            atomic_store(&db_store_test_not_resident, true);
+            wk_send(&wk, "wq4.test.", 6);
+            atomic_store(&db_store_test_not_resident, false);
+            CHECK(wk.w.n_tx == 0 && wk.table.nwait == 1);
+            CHECK(wk_wait_answer(&wk, got, &glen, 5000) && (got[3] & 0x0F) == 0);
+            db_store_counters(&w1);
+            CHECK(w1.wa_cold == w0.wa_cold + 1 && w1.wa_ok == w0.wa_ok && w1.attach_ok == w0.attach_ok + 1);
+
+            /* W3: another worker has the zone's claim: this worker joins it and parks (it does not attach beside it) */
+            CHECK(evict_zone("wq5.test.") && stored_only("wq5.test."));
+            drain_wakes();
+            zref_t z5;
+            CHECK(zref_of("wq5.test.", &z5) && z5.zid != ZREF_NOZID);
+            db_store_counters(&w0);
+            CHECK(park_att_claim((uint16_t)z5.sview, z5.zid, 3) == 1);
+            wk_send(&wk, "wq5.test.", 6);
+            CHECK(wk.w.n_tx == 0 && wk.table.nwait == 1);
+            db_store_counters(&w1);
+            CHECK(w1.wa_claim == w0.wa_claim + 1);
+            CHECK(wk_wait_answer(&wk, got, &glen, 5000) && (got[3] & 0x0F) == 0);     /* (the worker's own request for the zone: a store thread did it) */
+
+            /* W4: the staging table refuses (full): the zone is not attached by the worker and the entry that was made is given back */
+            CHECK(evict_zone("wq6.test."));
+            drain_wakes();
+            db_store_counters(&w0);
+            db_store_test_stg_fail = 1;
+            wk_send(&wk, "wq6.test.", 6);
+            CHECK(wk.w.n_tx == 0 && wk.table.nwait == 1);
+            db_store_counters(&w1);
+            CHECK(w1.wa_full == w0.wa_full + 1 && w1.wa_ok == w0.wa_ok && w1.versions_live == w0.versions_live);        /* (nothing is left of the entry) */
+            CHECK(wk_wait_answer(&wk, got, &glen, 5000) && (got[3] & 0x0F) == 0);
+            zref_t z6;
+            CHECK(zref_of("wq6.test.", &z6) && z6.zid != ZREF_NOZID && park_att_claim((uint16_t)z6.sview, z6.zid, 6) == 1 && park_att_leave((uint16_t)z6.sview, z6.zid, 6));   /* (the claim was left) */
+
+            /* W5: the worker attach as the lookup would make it (a direct call): staged, then registered or dropped by a store thread */
+            CHECK(evict_zone("wq7.test."));
+            drain_wakes();
+            db_store_counters(&w0);
+            zref_t z7;
+            CHECK(zref_of("wq7.test.", &z7) && z7.zid != ZREF_NOZID);
+            rcu_aux_read_lock();
+            zone_db_snapshot_t *snw = acquire_zone_snapshot();
+            view_snapshot_t *vsw = snapshot_find_view(snw, "default");
+            CHECK(vsw != NULL);
+            bool wa = vsw && ops->worker_attach(vsw, &z7, 0);
+            rcu_aux_read_unlock();
+            CHECK(wa);                                                                   /* (staged: answers from the worker's entry) */
+            db_store_counters(&w1);
+            CHECK(w1.wa_ok == w0.wa_ok + 1);
+            for (int t = 0; t < 2500 && w1.wa_adopted == w0.wa_adopted; t++) {
+                usleep(2000);
+                db_store_counters(&w1);
+            }
+            CHECK(w1.wa_adopted + w1.wa_lost == w0.wa_adopted + w0.wa_lost + 1);
+
+            /* W5b: the zone is deleted from the store between the staging and the registration (a store thread is held): the registration finds no record, the staged zone and its entry go, and
+             *      nothing is left of them (a worker's answer from the staged entry was the version the record had) */
+            {
+                batch_begin(a[0], &e, 93, KDB_BATCH_DIFF);
+                send_zone(a[0], &e, "wd.test.", 3, 0, 5100);
+                batch_end(a[0], &e, &mainc, 93, 1, 0);
+                warm_zone("wd.test.");
+                CHECK(evict_zone("wd.test."));
+                zref_t zd;
+                CHECK(zref_of("wd.test.", &zd) && zd.zid != ZREF_NOZID);
+                db_store_counters(&w0);
+                atomic_store(&g_adopt_hold, true);
+                db_store_test_adopt_hook = adopt_hold_hook;
+                rcu_aux_read_lock();
+                snw = acquire_zone_snapshot();
+                vsw = snapshot_find_view(snw, "default");
+                const bool staged = vsw && ops->worker_attach(vsw, &zd, 0);
+                rcu_aux_read_unlock();
+                CHECK(staged);
+                CHECK(in_memory("wd.test."));                                          /* (answered from the staged entry) */
+                CHECK(dbreg_delete("default", "wd.test.", 0) >= 0);                       /* (the store forgets the zone: the registry never had it) */
+                atomic_store(&g_adopt_hold, false);                                      /* (the store thread goes on) */
+                for (int t = 0; t < 2500; t++) {
+                    db_store_counters(&w1);
+                    if (w1.wa_lost > w0.wa_lost) break;
+                    usleep(2000);
+                }
+                db_store_test_adopt_hook = NULL;
+                CHECK(w1.wa_lost == w0.wa_lost + 1 && w1.wa_adopted == w0.wa_adopted);
+                CHECK(!zref_of("wd.test.", &zd));                                       /* (not in the store, not staged, not in memory) */
+                wait_retired();
+                db_store_counters(&w1);
+                CHECK(w1.versions_live == w0.versions_live);                             /* (the entry was given back) */
+            }
+
+            /* W6: a zone whose record is damaged: the worker does not attach it (the checksum), says nothing, and the zone is left to the store threads that read it from the database */
+            {
+                const char *wz = "w1.test.";
+                batch_begin(a[0], &e, 90, KDB_BATCH_DIFF);
+                send_zone(a[0], &e, wz, 5, 0, 5001);
+                batch_end(a[0], &e, &mainc, 90, 1, 0);
+                warm_zone(wz);
+                CHECK(evict_zone(wz) && damage_record(sdir, wz));
+                zref_t zw;
+                CHECK(zref_of(wz, &zw) && zw.zid != ZREF_NOZID);
+                db_store_counters(&w0);
+                rcu_aux_read_lock();
+                snw = acquire_zone_snapshot();
+                vsw = snapshot_find_view(snw, "default");
+                const bool bad = vsw && ops->worker_attach(vsw, &zw, 0);
+                rcu_aux_read_unlock();
+                CHECK(!bad);
+                db_store_counters(&w1);
+                CHECK(w1.wa_fail == w0.wa_fail + 1 && w1.wa_ok == w0.wa_ok && w1.versions_live == w0.versions_live);
+                CHECK(park_att_claim((uint16_t)zw.sview, zw.zid, 6) == 1 && park_att_leave((uint16_t)zw.sview, zw.zid, 6));                         /* (the claim was left) */
+            }
+
+            /* W7: the zone's name server is in another stored zone that is not in memory: the worker leaves it to the store threads, which attach both (the glue of the first answer) */
+            {
+                g_zone_ns = "ns.sib.test.";
+                batch_begin(a[0], &e, 91, KDB_BATCH_DIFF);
+                send_zone(a[0], &e, "w2.test.", 6, 0, 5002);
+                g_zone_ns = NULL;
+                send_zone(a[0], &e, "sib.test.", 7, 0, 5003);
+                batch_end(a[0], &e, &mainc, 91, 2, 0);
+                warm_zone("w2.test.");
+                warm_zone("sib.test.");
+                CHECK(evict_zone("w2.test.") && evict_zone("sib.test."));
+                drain_wakes();
+                db_store_counters(&w0);
+                wk_send(&wk, "w2.test.", 6);
+                CHECK(wk.w.n_tx == 0 && wk.table.nwait == 1);
+                db_store_counters(&w1);
+                CHECK(w1.wa_decline == w0.wa_decline + 1 && w1.wa_ok == w0.wa_ok);
+                CHECK(wk_wait_answer(&wk, got, &glen, 5000) && (got[3] & 0x0F) == 0);
+                CHECK(in_memory("w2.test.") && in_memory("sib.test."));
+            }
+
+            /* W8: above the hard line of memory-limit the store threads make room first: the worker leaves it */
+            CHECK(evict_zone("wq2.test.") && stored_only("wq2.test."));
+            drain_wakes();
+            db_store_counters(&w0);
+            dbreg_cache_set_limit(1);
+            wk_send(&wk, "wq2.test.", 6);
+            dbreg_cache_set_limit(0);
+            CHECK(wk.w.n_tx == 0 && wk.table.nwait == 1);
+            db_store_counters(&w1);
+            CHECK(w1.wa_over == w0.wa_over + 1);
+            CHECK(wk_wait_answer(&wk, got, &glen, 5000) && (got[3] & 0x0F) == 0);
+
+            /* W9: the zone's name is not the record's (the zone id is another zone's now), a state that is not stored, a view that is shared by in-view: nothing is done */
+            {
+                zref_t zz;
+                zref_clear(&zz);
+                CHECK(evict_zone("wq1.test.") && zref_of("wq1.test.", &zz) && zz.zid != ZREF_NOZID);
+                rcu_aux_read_lock();
+                snw = acquire_zone_snapshot();
+                vsw = snapshot_find_view(snw, "default");
+                zref_t bad1 = zz;
+                snprintf(bad1.name, sizeof(bad1.name), "a1.tesx.");                      /* (the same length, another name) */
+                zref_t bad2 = zz;
+                bad2.hview = "another";
+                zref_t bad3 = zz;
+                bad3.zstate = ZREF_ST_KNOWN;
+                zref_t bad4 = zz;
+                bad4.zid = ZREF_NOZID;
+                CHECK(vsw && !ops->worker_attach(vsw, &bad1, 0) && !ops->worker_attach(vsw, &bad2, 0) && !ops->worker_attach(vsw, &bad3, 0) && !ops->worker_attach(vsw, &bad4, 0));
+                rcu_aux_read_unlock();
+                atomic_store(&g_rd_stop, false);
+            }
+        }
+
+        /* W10: attaches and detaches that race (TSan, ASan): a worker attaches zones as fast as they leave, other threads answer from them; afterwards every entry that was made is accounted for */
+        if (map) {
+            enum { RZ = 6 };
+            static char rzn[RZ][24];
+            batch_begin(a[0], &e, 92, KDB_BATCH_DIFF);
+            for (int i = 0; i < RZ; i++) {
+                snprintf(rzn[i], sizeof(rzn[i]), "rc%d.test.", i);
+                send_zone(a[0], &e, rzn[i], (uint32_t)(10 + i), 0, 6000 + i);
+            }
+            batch_end(a[0], &e, &mainc, 92, RZ, 0);
+            for (int i = 0; i < RZ; i++) warm_zone(rzn[i]);
+            for (int i = 0; i < RZ; i++) CHECK(evict_zone(rzn[i]));                                       /* (out of memory: what the race attaches is counted from nothing) */
+            db_store_counters_t base;
+            db_store_counters(&base);
+            const int64_t vbase = (int64_t)base.versions_live - (int64_t)dbdir()->attach_count();         /* (zones that an install made have no version of the store's attach) */
+            atomic_store(&g_rd_stop, false);
+            atomic_store(&g_rd_pause_us, 200);
+            atomic_store(&g_rd_ok, 0);
+            atomic_store(&g_rd_gone, 0);
+            atomic_store(&g_rd_bad, 0);
+            pthread_t rt[2], at;
+            CHECK(pthread_create(&rt[0], NULL, reader_thread, (void *)(uintptr_t)"www.rc1.test.") == 0);
+            CHECK(pthread_create(&rt[1], NULL, reader_thread, (void *)(uintptr_t)"www.rc4.test.") == 0);
+            atomic_store(&g_wa_stop, false);
+            atomic_store(&g_wa_done, 0);
+            struct wa_arg { const dbdir_ops_t *ops; char (*names)[24]; } wargs = { ops, rzn };
+            CHECK(pthread_create(&at, NULL, wa_thread, &wargs) == 0);
+            uint64_t ev = 0;
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            do {
+                for (int i = 0; i < RZ; i++) ev += dbreg_test_evict_default(rzn[i]) ? 1 : 0;
+                usleep(400);                                                   /* (the registry's lock is not the evictor's alone: the registrations of the staged zones take it) */
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+            } while ((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < (UNDER_TSAN_TEST ? 2500 : 1200));
+            atomic_store(&g_rd_stop, true);
+            atomic_store(&g_rd_pause_us, 0);
+            atomic_store(&g_wa_stop, true);
+            pthread_join(at, NULL);
+            pthread_join(rt[0], NULL);
+            pthread_join(rt[1], NULL);
+            printf("  attach race: %llu evictions, %llu worker attaches, reader: ok %llu not-ready %llu bad %llu\n", (unsigned long long)ev, (unsigned long long)atomic_load(&g_wa_done),
+                   (unsigned long long)atomic_load(&g_rd_ok), (unsigned long long)atomic_load(&g_rd_gone), (unsigned long long)atomic_load(&g_rd_bad));
+            CHECK(atomic_load(&g_rd_bad) == 0);
+            CHECK(atomic_load(&g_wa_done) > 0);
+            /* quiet: every staged zone was registered or dropped; no entry of a worker attach is left over */
+            uint64_t last = 0;
+            for (int t = 0; t < 2500; t++) {
+                db_store_counters(&w1);
+                if (w1.wa_adopted + w1.wa_lost == w1.wa_ok && !park_attach_pending() && w1.wa_ok == last) break;
+                last = w1.wa_ok;
+                usleep(4000);
+            }
+            db_store_counters(&w1);
+            CHECK(w1.wa_adopted + w1.wa_lost == w1.wa_ok);
+            wait_retired();
+            db_store_counters(&w1);
+            CHECK((int64_t)w1.versions_live - (int64_t)dbdir()->attach_count() == vbase + 0);               /* (one version for every zone in memory: no entry was lost to the race) */
+        }
+        wk_free(&wk);
+    }
+
     free(old_copy);
     gc_snapshot_wait_idle();                                                 /* (the reclaim thread that the last delta started: joined, not left to the exit) */
+    /* -- 0.7 fix 8: the zones that are in memory when the server stops are written to hot.list, the most used first: wq5 is asked for most, wq2 next */
+    uint32_t hot_zid5 = STORE_NONE, hot_zid2 = STORE_NONE;
+    size_t hot_attached = 0;
+    {
+        uint8_t out[1232];
+        zref_t zq;
+        for (int i = 0; i < 40000; i++) (void)ask_engine(&g_wctx, &g_cc, "www.wq5.test.", 1, out);
+        for (int i = 0; i < 30000; i++) (void)ask_engine(&g_wctx, &g_cc, "www.wq2.test.", 1, out);
+        CHECK(zref_of("wq5.test.", &zq) && zq.entry);
+        hot_zid5 = zq.zid;
+        CHECK(zref_of("wq2.test.", &zq) && zq.entry);
+        hot_zid2 = zq.zid;
+        hot_attached = dbdir()->attach_count();
+        CHECK(hot_attached >= NZ);
+    }
     db_store_stop();
     /* -- a stop is a clean stop: the next open says so, replays nothing and (after a reboot) does not rebuild */
     {
@@ -1686,13 +2142,156 @@ static int run_mode(const char *mode) {
             store_stats(s2, &ss2);
             CHECK(ss2.recovery.was_clean && ss2.recovery.records_replayed == 0 && !ss2.recovery.rebuilt && !ss2.recovery.journal_torn);
             CHECK(ss2.zones_stored >= NZ - 1);
+            uint32_t *hids = NULL;
+            size_t hn = 0;
+            CHECK(store_hot_read(s2, &hids, &hn) == 0 && hn == hot_attached && hids);        /* (every zone that was in memory, once) */
+            CHECK(hids && hn >= 2 && hids[0] == hot_zid5 && hids[1] == hot_zid2);              /* (the most asked for first) */
+            bool dup = false;
+            for (size_t i = 0; hids && i < hn; i++)
+                for (size_t j = i + 1; j < hn; j++) dup = dup || hids[i] == hids[j];
+            CHECK(!dup);
+            free(hids);
+            db_store_counters_t hc;
+            db_store_counters(&hc);
+            CHECK(hc.hot_written == hot_attached && hc.hot_state == 0);
             (void)store_close(s2);
         }
         if (dfd >= 0) close(dfd);
     }
+    db_store_frontend_close();                                                  /* (the directory and its lock are the next process's) */
     char cmd[700];
+    if (strcmp(mode, "map") == 0 && g_self[0]) {                             /* the next start (a process of its own): hot.list is read and attached in the background */
+        for (int ph = 0; ph < 2; ph++) {
+            snprintf(cmd, sizeof(cmd), "%s hot %s %d", g_self, dir, ph);
+            CHECK(system(cmd) == 0);
+        }
+    }
     snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
     (void)!system(cmd);
+    printf("%d checks, %d failed\n", g_checks, g_failed);
+    return g_failed ? 1 : 0;
+}
+
+/* ---------------------------------------------------------------- 0.7 fix 8: hot.list at the next start */
+/* A process on the store that run_mode() left after its clean stop.  Phase 0 (store-hot-list yes, the default): the list is read, the zones are attached in its order in the background, a query for a
+ * zone at the end of the list is attached at once (the queries come first), and a clean stop writes the list again.  Phase 1 (store-hot-list no): the list is not read, nothing is attached, and a
+ * stop writes no list. */
+static uint32_t g_hot_seen[8192];
+static _Atomic int g_hot_nseen;
+static int g_hot_delay_us;
+static void hot_order_hook(uint32_t zid) {
+    int i = atomic_fetch_add(&g_hot_nseen, 1);
+    if (i < 8192) g_hot_seen[i] = zid;
+    if (g_hot_delay_us) usleep((useconds_t)g_hot_delay_us);
+}
+
+extern void (*db_ingest_test_fetch_req_hook)(const char *zone);
+static int run_hot(const char *dir, int phase) {
+    printf("[hot.list: the next start, store-hot-list %s]\n", phase == 0 ? "yes" : "no");
+    char sdir[600];
+    snprintf(sdir, sizeof(sdir), "%s/s", dir);
+    static server_config_t cfg;
+    char conf[2048];
+    snprintf(conf, sizeof(conf),
+             "options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; store \"%s\"; store-mode map; "
+             "store-threads 2; %s }; };\n"
+             "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", sdir, phase == 0 ? "" : "store-hot-list no;");
+    CHECK(parse_named_conf(conf, &cfg) == 0);
+    CHECK(cfg.database.store_hot_list == (phase == 0));
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    rebuild_zone_db_from_config(&cfg, false);
+    char msg[400];
+    CHECK(db_store_frontend_open(&cfg.database, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg)) && db_store_dir_fd() >= 0);
+    park_register_worker(0, -1);
+    memset(&g_wctx, 0, sizeof(g_wctx));
+    g_query_bg_fetch = no_bg_fetch;
+    g_query_bg_attach = no_bg_fetch;
+    /* the list as the last stop wrote it, read from the file before the server starts */
+    uint32_t *want = NULL;
+    size_t nwant = 0;
+    {
+        int dfd = open(sdir, O_RDONLY | O_DIRECTORY);
+        store_opts_t so;
+        store_opts_default(&so);
+        so.boot_id = 4242;
+        store_t *s0 = NULL;
+        CHECK(dfd >= 0 && store_open(dfd, &so, &s0) == 0 && s0);
+        CHECK(s0 && store_hot_read(s0, &want, &nwant) == 0 && nwant >= 8);
+        if (s0) (void)store_close(s0);
+        if (dfd >= 0) close(dfd);
+    }
+    CHECK(db_store_start(&cfg) && db_store_enabled());
+    store_t *st = db_store_handle();
+    db_store_counters_t c;
+    db_store_counters(&c);
+    if (phase == 1) {
+        CHECK(c.hot_state == 4 && c.hot_listed == 0);                              /* (4: off) */
+        db_store_hot_start();                                                   /* (nothing to start) */
+        usleep(200000);
+        db_store_counters(&c);
+        CHECK(c.hot_attached == 0 && c.hot_skipped == 0 && dbdir()->attach_count() == 0);
+        uint8_t before[64], after[64];
+        char hp[700];
+        snprintf(hp, sizeof(hp), "%s/hot.list", sdir);
+        int fd = open(hp, O_RDONLY);
+        CHECK(fd >= 0 && pread(fd, before, sizeof(before), 0) == (ssize_t)sizeof(before));
+        if (fd >= 0) close(fd);
+        db_store_stop();
+        db_store_counters(&c);
+        fd = open(hp, O_RDONLY);
+        CHECK(fd >= 0 && pread(fd, after, sizeof(after), 0) == (ssize_t)sizeof(after) && memcmp(before, after, sizeof(after)) == 0 && c.hot_written == 0);      /* (no list was written) */
+        if (fd >= 0) close(fd);
+        free(want);
+        printf("%d checks, %d failed\n", g_checks, g_failed);
+        return g_failed ? 1 : 0;
+    }
+    CHECK(c.hot_listed == nwant && c.hot_state == 0 && dbdir()->attach_count() == 0);                   /* (read, not started: no zone is in memory) */
+    g_hot_delay_us = 3000;                                                      /* (a zone takes 3 ms to come: the list takes that long for each zone it has) */
+    db_store_test_hot_hook = hot_order_hook;
+    db_store_hot_start();
+    /* the queries come first: a query for the zone at the end of the list is attached by its own request while the list is still being worked through */
+    store_zone_t lz;
+    char lname[300];
+    store_read_lock();
+    CHECK(store_zone_get(st, want[nwant - 1], &lz) == 0);
+    store_read_unlock();
+    snprintf(lname, sizeof(lname), "%s.", lz.name);
+    for (int t = 0; t < 500 && atomic_load(&g_hot_nseen) < 2; t++) usleep(2000);
+    CHECK(atomic_load(&g_hot_nseen) >= 2 && atomic_load(&g_hot_nseen) < (int)nwant - 1);        /* (it is running, and far from the end) */
+    static wk_t wk;
+    wk_init(&wk);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    wk_send(&wk, lname, 6);
+    uint8_t got[1232];
+    int glen = 0;
+    CHECK(wk.w.n_tx == 1 || wk_wait_answer(&wk, got, &glen, 3000));              /* (the worker attached it itself, or a store thread did: not after the list) */
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    db_store_counters(&c);
+    CHECK(c.hot_state == 1);                                                      /* (the list is not done) */
+    CHECK((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < (long)(nwant * 3 / 2));
+    wk_free(&wk);
+    for (int t = 0; t < 2500; t++) {                                              /* (the list ends) */
+        db_store_counters(&c);
+        if (c.hot_state != 1) break;
+        usleep(4000);
+    }
+    if (c.hot_state != 2 || atomic_load(&g_hot_nseen) != (int)nwant) printf("  hot: state %llu seen %d of %zu, attached %llu skipped %llu\n", (unsigned long long)c.hot_state, atomic_load(&g_hot_nseen), nwant, (unsigned long long)c.hot_attached, (unsigned long long)c.hot_skipped);
+    printf("  hot: state %llu, attached %llu, skipped %llu of %zu zones, in memory %zu\n", (unsigned long long)c.hot_state, (unsigned long long)c.hot_attached, (unsigned long long)c.hot_skipped, nwant, dbdir()->attach_count());
+    CHECK(c.hot_state == 2 && atomic_load(&g_hot_nseen) == (int)nwant);           /* (2: done) */
+    bool inorder = true;
+    for (size_t i = 0; i < nwant && i < 8192; i++) inorder = inorder && g_hot_seen[i] == want[i];
+    CHECK(inorder);                                                              /* (in the order of the list) */
+    CHECK(c.hot_attached + c.hot_skipped == nwant && c.hot_skipped >= 1);              /* (the zone that the query attached was in memory when the list came to it) */
+    const size_t in_mem = dbdir()->attach_count();
+    CHECK(in_mem >= nwant);                                                       /* (every zone of the list is in memory now, and the name servers' zones that an attach brings) */
+    uint8_t out[1232];
+    CHECK(ask_engine(&g_wctx, &g_cc, "www.wq5.test.", 1, out) > 12 && (out[3] & 0x0F) == 0);
+    db_store_test_hot_hook = NULL;
+    db_store_stop();
+    db_store_counters(&c);
+    CHECK(c.hot_written == in_mem);
+    free(want);
     printf("%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }
@@ -1897,6 +2496,25 @@ static int count_asked(int lo, int hi) {
 }
 
 static bool cursor_unset(store_t *st);
+/* 0.7 fix 8, the queries come before the fill: a manifest pass of PN entries, each of which takes 100 us (a hook), is being worked through when a worker asks for a zone of it.  The request is
+ * made when the pass has given the thread up (after the page it was in), not when the whole pass is done: the number of entries the thread had done when it sent the request is the measure
+ * (without the yield the thread read and handled every page it had before it went to the requests: all PN). */
+extern void (*db_ingest_test_fetch_req_hook)(const char *zone);
+static _Atomic int g_pent;                                         /* entries of the pass done */
+static _Atomic int g_pent_at_req = -1;                             /* ... when the request for m0000.test was sent */
+static _Atomic int g_pent_push = -1;                               /* ... when the worker asked */
+static void pent_hook(void) {
+    int n = atomic_fetch_add(&g_pent, 1) + 1;
+    if (n == 1000 && atomic_load(&g_pent_push) < 0) {
+        atomic_store(&g_pent_push, n);
+        (void)park_fetch_request(0, "default", "m0000.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL);
+    }
+    usleep(100);
+}
+static void preq_hook(const char *zone) {
+    if (strcmp(zone, "m0000.test.") == 0 && atomic_load(&g_pent_at_req) < 0) atomic_store(&g_pent_at_req, atomic_load(&g_pent));
+}
+
 static int run_proto(int phase, const char *dir) {
     printf("[the store protocol: phase %d]\n", phase);
     char sdir[600];
@@ -1915,6 +2533,7 @@ static int run_proto(int phase, const char *dir) {
     CHECK(db_store_start(&cfg) && db_store_enabled());
     store_t *st = db_store_handle();
     CHECK(st != NULL);
+    CHECK(db_store_directory_wait() == (phase <= 1));                                 /* (0.7 fix 8: a store with no list of the zones waits for the first pass; one that has the cursor of an earlier run does not) */
     int a[2], f[2], cs[2];
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, f) == 0 && socketpair(AF_UNIX, SOCK_SEQPACKET, 0, cs) == 0);
     int ends[3] = { a[1], f[1], cs[1] };
@@ -1970,11 +2589,22 @@ static int run_proto(int phase, const char *dir) {
     if (phase == 1) {
         CHECK(!ch_next(&fetchc, &m, 200));                               /* an empty store has nothing to ask for */
 
-        /* -- A. the first fill: a pass.  BATCH_RESULT comes when the entries are recorded, the bodies follow */
+        /* -- A. the first fill: a pass.  BATCH_RESULT comes when the entries are recorded, the bodies follow.  A worker asks for a zone of the pass while it is being worked through (the hooks): the thread
+         *       gives the stream up for the request after the page it is in, it does not finish the pass first */
+        db_recon_test_entry_hook = pent_hook;
+        db_ingest_test_fetch_req_hook = preq_hook;
         p_batch_begin(a[0], &e, 1, KDB_BATCH_STARTUP, 0);
         full_pass(a[0], &e, 1, NULL, 77, true);
         p_batch_end(a[0], &e, 1, PN, 0);
         CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.n_applied == PN && m.u.batch_result.n_rejected == 0);
+        db_recon_test_entry_hook = NULL;
+        db_ingest_test_fetch_req_hook = NULL;
+        CHECK(!db_store_directory_wait());                                              /* (the pass has ended: every zone is listed) */
+        {
+            const int at = atomic_load(&g_pent_at_req), pushed = atomic_load(&g_pent_push);
+            printf("  the request of a worker, made at entry %d of %d, was sent at entry %d\n", pushed, PN, at);
+            CHECK(pushed == 1000 && at >= pushed && at < PN - 1500);                       /* (after the page it was in: 2048; not at the end of the pass: 5000) */
+        }
         store_counts(st, &kn, &sd);
         CHECK(kn == PN && sd == 0);                                      /* (no body has come: the loader is not answering yet) */
         CHECK(cursor_is(st, 77));                                        /* (the cursor is kept once the entries are recorded) */
@@ -1984,11 +2614,65 @@ static int run_proto(int phase, const char *dir) {
             zref_t zr;
             CHECK(zref_of("m4000.test.", &zr) && zr.entry == NULL && zr.zid != ZREF_NOZID && zr.zstate == ZREF_ST_KNOWN);      /* (the name index is complete: the zone is known) */
         }
+        /* -- A1. the queries come first, and the fill has a share of its own (0.7 fix 8): forty queries ask for zones of the pass; the loader answers the requests of the fill at once and the
+         *        requests of the queries not at all.  The places of fetch-concurrency (16) are not all the queries': they have 12 at the most, and the fill goes on (before, it was held back while
+         *        a query waited, and the loader saw the 8 requests it had had before the queries came and no more) */
+        drain_wakes();
+        {
+            enum { NQ1 = 40 };
+            typedef struct { char name[24]; uint64_t id; int64_t sid; uint8_t prio; } req1_t;
+            static req1_t rq1[64];
+            int nrq1 = 0, nq = 0, nb = 0, fill_asked = 0;
+            for (int i = 0; i < NQ1; i++) {
+                char zn[24];
+                pn_name(zn, sizeof(zn), 2000 + i);
+                CHECK(park_fetch_request(0, "default", zn, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+            }
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            do {
+                if (ch_next(&fetchc, &m, 20) && m.type == KDB_T_FETCH_REQ) {
+                    const int zi = pn_index(m.u.fetch_req.name);
+                    CHECK(zi >= 0 && zi < PN);
+                    if (m.u.fetch_req.priority == KDB_FETCH_PRIO_QUERY) {
+                        if (nrq1 < 64) {
+                            req1_t *q = &rq1[nrq1++];
+                            snprintf(q->name, sizeof(q->name), "%s", m.u.fetch_req.name);
+                            q->id = m.u.fetch_req.request_id;
+                            q->sid = m.u.fetch_req.source_id;
+                            q->prio = m.u.fetch_req.priority;
+                        }
+                        nq++;
+                    } else {
+                        nb++;
+                        if (zi >= 0 && zi < PN) {
+                            g_pasked[zi]++;
+                            g_pprio[zi] = m.u.fetch_req.priority;
+                            g_psid[zi] = m.u.fetch_req.source_id;
+                            send_zone(f[0], &e, m.u.fetch_req.name, g_pserial[zi] ? g_pserial[zi] : 1, m.u.fetch_req.request_id, m.u.fetch_req.source_id);
+                        }
+                    }
+                }
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+            } while (nb < 200 && (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < 600);
+            fill_asked = nb;
+            printf("  40 queries waiting, none answered: %d requests of queries, %d of the fill in 600 ms\n", nq, fill_asked);
+            CHECK(nq >= 4 && nq <= 12);                                                    /* (the queries have the places the fill's share leaves) */
+            CHECK(fill_asked >= 100);                                                      /* (the fill went on: its fetches are answered and made again, whatever waits) */
+            for (int i = 0; i < nrq1; i++) {                                                  /* (the queries are answered now) */
+                const int zi = pn_index(rq1[i].name);
+                CHECK(zi >= 0 && zi < PN);
+                g_pasked[zi]++;
+                g_pprio[zi] = rq1[i].prio;
+                g_psid[zi] = rq1[i].sid;
+                send_zone(f[0], &e, rq1[i].name, g_pserial[zi] ? g_pserial[zi] : 1, rq1[i].id, rq1[i].sid);
+            }
+        }
         /* a query for a zone that is known and has no body goes to the fetch queue (priority 0, with the domain id) and is answered */
         drain_wakes();
         CHECK(park_fetch_request(0, "default", "m4000.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
         int n = serve_fetches(&fetchc, f[0], &e, 1500, -1, -1);
-        CHECK(n >= PN - 100);
+        CHECK(n >= PN - 400);                                          /* (the 200 or so that A1 answered are not in the count) */
         CHECK(wake_for("m4000.test.", &k, 5000) && !k.failed && !k.retry);
         CHECK(g_pprio[4000] == 0 && g_psid[4000] == p_sid(4000));       /* (asked for by the query, and with the id the record holds) */
         CHECK(g_pprio[1000] == KDB_FETCH_PRIO_BACKGROUND && g_psid[1000] == p_sid(1000));
@@ -3744,6 +4428,8 @@ static int run_heap(int nz, const char *mode) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);                       /* (a log that shows where the time goes, also through a pipe) */
+    g_self = argv[0];
+    if (argc > 3 && strcmp(argv[1], "hot") == 0) return run_hot(argv[2], atoi(argv[3]));
     if (argc > 1 && strcmp(argv[1], "s5") == 0) return run_s5(argc > 2 ? argv[2] : "map");
     if (argc > 1 && strcmp(argv[1], "heap") == 0) return run_heap(argc > 2 ? atoi(argv[2]) : 100000, argc > 3 ? argv[3] : "map");
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '3') return run_fixes(argv[2]);

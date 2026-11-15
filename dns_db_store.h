@@ -72,6 +72,9 @@ bool db_store_start(const server_config_t *cfg);
 /* Stop the threads after they have done what is queued, checkpoint the store.  The Backend calls it at its end; the store stays open (workers may still look). */
 void db_store_stop(void);
 bool db_store_enabled(void);
+/* 0.7 fix 8: start the background attach of the zones of hot.list (read by db_store_start(): the zones that were in memory at the last clean stop, the most used first).  The server calls it when it serves;
+ * the thread waits for the attach requests of queries, takes at most 20,000 zones a second and stops at the high mark of memory-limit.  db_store_stop() ends it and writes the list of the zones in memory. */
+void db_store_hot_start(void);
 store_t *db_store_handle(void);
 
 /* ---- the ingest threads ---- */
@@ -170,9 +173,16 @@ void db_store_attach_zone(const char *view, const char *zone);
 void db_store_ma_inputs(ma_in_t *in);
 /* a first fill is going on: the reconcile has zones without an image and a pass or the background fetch of their bodies is running.  The server's own notices about the traffic ("memory-limit is too small") wait for it. */
 bool db_store_filling(void);
+/* 0.7 fix 8: a first fill whose first pass (the list of the zones) has not ended: the store does not know every zone yet (warm-before-serve holds the queries until it does) */
+bool db_store_directory_wait(void);
 #ifdef KARIDNS_UNIT_TEST
 extern int db_store_test_set_fail;                      /* the n-th set_put_slot() of the settings table fails (0: off) */
 extern int db_store_test_attach_reserve_fail;           /* the n-th reserve of room in the attach table fails (0: off) */
+extern int db_store_test_stg_fail;                      /* the n-th put into the staging table of the worker's attach is refused (0: off) */
+extern _Atomic bool db_store_test_not_resident;         /* the worker's attach finds no image in the page cache */
+extern void (*db_store_test_hot_hook)(uint32_t zid);    /* called by the thread of hot.list before each zone */
+extern void (*_Atomic db_store_test_adopt_hook)(void);   /* called by a store thread before it registers a staged zone */
+extern void (*db_recon_test_entry_hook)(void);          /* called at every entry of a manifest pass (tests: an entry that takes time) */
 extern int db_store_test_bits_fail;                     /* the bit of the n-th entry of a pass cannot be set (0: off) */
 extern _Atomic(const char *) db_store_test_rec_fault_zone;   /* the store cannot read the record of this zone (name with its trailing dot; NULL: off): a damaged cell */
 #endif
@@ -194,6 +204,12 @@ typedef struct {
   uint64_t validated, validate_ns;   /* images checked by zone_image_validate() at an attach, and the nanoseconds that took */
   uint64_t pin_waits;            /* (unused since S3) */
   uint64_t pinned_peak;          /* (unused since S3) */
+  /* 0.7 fix 7, the worker's attach: ok = attached and answered on the worker; the others are why not (cold: the pages are not in the page cache or the mode is COPY; over: above the hard line of memory-limit; claim: another
+   * worker or a store thread has the zone; fail: the image or the entry could not be made (the store threads try and fall back); decline: a name server zone of the zone has to be attached too, or a view shared by in-view; full: the staging table or
+   * the ring was full); adopted / lost: the staged zones that a store thread registered / found already in memory, changed or gone */
+  uint64_t wa_ok, wa_cold, wa_over, wa_claim, wa_fail, wa_decline, wa_full, wa_adopted, wa_lost, wa_ns;
+  /* 0.7 fix 8, hot.list: state 0 none, 1 attaching, 2 done, 3 stopped at the high mark of memory-limit, 4 off; listed: the ids that were read at the start; attached / skipped: the zones it attached / that were in memory or not stored; written: the ids written at the last stop */
+  uint64_t hot_state, hot_listed, hot_attached, hot_skipped, hot_written;
 } db_store_counters_t;
 void db_store_counters(db_store_counters_t *out);
 

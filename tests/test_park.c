@@ -23,6 +23,10 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
+#include <sys/types.h>
+#include <sys/time.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
 #ifdef __FreeBSD__
 #include <sys/types.h>
 #include <sys/event.h>
@@ -1159,6 +1163,81 @@ static void test_attach_ring(void) {
   CHECK(park_att_claim(0, 0, 1) == 1 && park_att_claim(0, 0, 2) == 2 && park_att_take(0, 0) == 6u);
 }
 
+/* 0.7 fix 7: the worker that attaches a zone itself hands its registration to the store threads through its attach ring: room first, then the request with PARK_ATT_ADOPT */
+static void test_attach_adopt(void) {
+  printf("[the worker's attach: the room in the ring, the adoption request]\n");
+  park_attach_req_t q;
+  CHECK(!park_attach_next(&q));
+  CHECK(park_attach_room(13) && !park_attach_room(-1) && !park_attach_room(PARK_MAX_WORKERS));
+  CHECK(park_attach_adopt(13, 7, 424242));
+  CHECK(park_attach_zid(13, 7, 1));
+  CHECK(park_attach_next(&q) && q.adopt && !q.by_name && q.sview == 7 && q.zid == 424242 && q.worker == 13);        /* (the flag is not part of the view's id) */
+  CHECK(park_attach_next(&q) && !q.adopt && q.sview == 7 && q.zid == 1 && q.worker == 13);
+  CHECK(!park_attach_next(&q));
+  /* a full ring has no room, and the adoption is refused like any other request; room is back when a request is taken */
+  for (int i = 0; i < PARK_ATTACH_RING; i++) CHECK(park_attach_zid(13, 7, (uint32_t)i));
+  CHECK(!park_attach_room(13) && !park_attach_adopt(13, 7, 5));
+  CHECK(park_attach_next(&q) && park_attach_room(13) && park_attach_adopt(13, 7, 5));
+  while (park_attach_next(&q)) {}
+  CHECK(!park_attach_pending());
+  /* a request by name and a request of the by_name kind never carry the flag */
+  CHECK(park_attach_request_any("v1", "adopt.test.") && park_attach_next(&q) && !q.adopt && q.by_name);
+}
+
+/* 0.7 fix 3 / park-max 16384: what a table of the new default size reserves, and what a table full of the usual requests touches (the pages that no entry used are not memory) */
+static long touched_kb(void) {                                    /* the pages this process has touched for the first time since it began (page faults of the zero-fill kind), in KB */
+  struct rusage ru;
+  getrusage(RUSAGE_SELF, &ru);
+  return ru.ru_minflt * (sysconf(_SC_PAGESIZE) / 1024);
+}
+/* the child of test_park_max_memory(): a process of its own (so that what the allocator kept from earlier tests does not hide the first touches): the table of the default size is made and filled
+ * with the usual requests (a 40-byte query, names of ten characters); the pages that were touched for it are counted.  0: not more than 12 MB. */
+static int park_mem_child(void) {
+  const long before = touched_kb();
+  park_table_t pt;
+  if (!park_init(&pt, PARK_DEFAULT_MAX)) return 2;
+  uint8_t pay[64];
+  memset(pay, 0x5A, sizeof(pay));
+  udp_ipc_t ipc = mk_ipc(1);
+  for (uint32_t i = 0; i < PARK_DEFAULT_MAX; i++) {
+    char z[32];
+    snprintf(z, sizeof(z), "z%u.test.", i);
+    if (park_udp(&pt, 1000, 1500, "default", z, 3, &ipc, pay, 40) < 0) return 3;
+  }
+  if (pt.nwait != PARK_DEFAULT_MAX || park_udp(&pt, 1000, 1500, "default", "over.test.", 3, &ipc, pay, 40) >= 0) return 4;       /* (full: the next query is answered at once) */
+  const long grew_kb = touched_kb() - before;
+  printf("  a full table of %u usual requests: %ld KB touched, %zu bytes reserved\n", (unsigned)PARK_DEFAULT_MAX, grew_kb, park_bytes(&pt));
+  fflush(stdout);
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+  return 0;                                                       /* (a sanitizer's shadow memory and quarantine are touched too: the figure is for the plain build) */
+#else
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+  return 0;
+#endif
+#endif
+  return grew_kb < 12 * 1024 && grew_kb > 2 * 1024 ? 0 : 5;
+#endif
+}
+
+static const char *g_self = "";
+static void test_park_max_memory(void) {
+  printf("[park-max %d: the memory of a full table]\n", PARK_DEFAULT_MAX);
+  CHECK(PARK_DEFAULT_MAX == 16384);
+  park_table_t t;
+  CHECK(park_init(&t, PARK_DEFAULT_MAX));
+  const size_t reserved = park_bytes(&t);
+  CHECK(reserved > (size_t)PARK_DEFAULT_MAX * 256 && reserved < (size_t)24 << 20);          /* (about 16 MB reserved: entries, small blocks, a long block for every eighth entry, the wheel) */
+  CHECK(park_bytes(&(park_table_t){ 0 }) == 0);
+  park_free(&t);
+  if (g_self[0]) {
+    char cmd[600];
+    fflush(stdout);
+    snprintf(cmd, sizeof(cmd), "%s parkmem", g_self);
+    CHECK(system(cmd) == 0);
+  }
+}
+
 #define CLW 8
 static _Atomic int g_cl_ask[CLW], g_clw_go;
 static void *claim_worker(void *arg) {
@@ -1183,7 +1262,9 @@ static void test_claim_race(void) {
   CHECK(asked >= 2000 && asked <= 2000 * CLW);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+  g_self = argv[0];
+  if (argc > 1 && strcmp(argv[1], "parkmem") == 0) return park_mem_child();
   test_table();
   test_attach_deadline();
   test_tcp();
@@ -1200,6 +1281,8 @@ int main(void) {
   test_indexed_table();
   test_pending();
   test_attach_ring();
+  test_attach_adopt();
+  test_park_max_memory();
   test_claim_race();
 #ifdef __FreeBSD__
   test_wake_queue();

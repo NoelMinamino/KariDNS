@@ -117,6 +117,7 @@ typedef struct ing_job {
   size_t buf_len, buf_cap;
   uint8_t status;                        /* KDB_ST_* */
   int builder;                           /* index of the builder it was handed to */
+  bool fill;                             /* 0.7 fix 8: the body of a background fetch of the reconcile (the first fill): the thread's time for it is counted apart (g_ing_fill_pct) */
   char reason[KDB_REASON_LEN];
   /* D1a, the fetch stream: the request the zone answers (0 = a zone of a batch), a summary (no data: what the directory keeps), a zone
    * nobody asked for (discarded; the loader may answer a request that was given up) */
@@ -312,6 +313,8 @@ typedef struct {
   bool apex_walk;                        /* D1a step 6: after a reload, the zones out of memory that now keep an apex but have none are asked for (their summary) ... */
   dbreg_cursor_t apex_cur;               /* ... a few at a time, from here */
   uint32_t funsolicited;       /* zones nobody asked for, discarded (logged the first few) */
+  int64_t fill_ns;             /* 0.7 fix 8: the time of the window that the bodies of the fill took (g_ing_fill_pct) */
+  bool sresume, fresume;       /* 0.7 fix 8 (priorities): on_stream_readable() / on_fetch_readable() stopped in the middle of what the framer holds because requests of queries were waiting; they go on first when the loop comes back */
   bool fmore;                  /* B2 W5: the last fetch_issue() pass stopped at its bound (requests or time) with work left: the loop serves the streams and comes back */
   /* 0.7 P-B, the wait queue: the requests of queries (a worker's, or a transfer's) that cannot be made now because every place of fetch-concurrency is taken, the fetch-rate
    * bucket is empty, or the database zones are above the hard line of memory-limit and there is no room yet.  Oldest first (a ring: wq_head, nwq); a request that comes while
@@ -1461,6 +1464,23 @@ static uint32_t fetch_sub_limit(uint32_t cap) {
   uint32_t half = atomic_load_explicit(&g_fetch_conc, memory_order_relaxed) / 2;
   return half < cap ? half : cap;
 }
+/* 0.7 fix 8, the first fill and the queries: the queries come first (the loader serves a request of a query before one of the fill, and a place goes to the oldest query that waits), but the fill is not
+ * left to the places the queries do not use: a first fill that queries keep waiting for would read its zones one by one when a query asks for them (a read for one zone from the database is dearer
+ * than one in the order of the scan), and the zones that the queries have not asked for yet would come when the queries stop.  So the fill has a share of its own: a quarter of the places of
+ * fetch-concurrency, at least one (up to ING_BULK_NFREQ), which the requests of queries leave free (qplace_ok()) while the fill has fewer fetches in flight than that, and which it may use whatever
+ * waits. */
+static uint32_t bulk_reserve(void) {
+  uint32_t q = atomic_load_explicit(&g_fetch_conc, memory_order_relaxed) / 4;
+  if (q < 1) q = 1;
+  return q < 32u ? q : 32u;                      /* (ING_BULK_NFREQ) */
+}
+/* may a query's request take a place?  Not when the places that are left are the fill's share. */
+static bool qplace_ok(const ing_t *g) {
+  const uint32_t conc = atomic_load_explicit(&g_fetch_conc, memory_order_relaxed), res = bulk_reserve();
+  const uint32_t keep = g->bg_on && g->fetch_fd >= 0 && g->nbulk < res ? res - g->nbulk : 0;
+  return park_places_used() + keep < conc;
+}
+static _Atomic uint32_t g_ing_fill_pct;                    /* the share of the last window (~10 s) the ingest thread spent on the bodies of the fill (what a first fill takes of it) */
 static _Atomic uint64_t g_fetch_issued;   /* fetches of a whole zone sent to the loader (queries, transfers, the warm-up) */
 /* dbstatus "fetchq:" (B2 W3): where a fetch can be held up; the ingest thread writes them, the control thread reads them; all cumulative since the start */
 static _Atomic uint32_t g_fq_inflight, g_fq_peak;          /* fetches in flight now (g->nfreq) and the most there have been */
@@ -1682,6 +1702,7 @@ static void drop_stream(ing_t *g) {
   g->stream_fd = -1;
   g->write_armed = false;
   g->out_len = g->out_off = 0;
+  g->sresume = false;
   g->hello_done = false;
   g->inv_active = false;
   db_recon_abort();                           /* 0.7 WP7b: a pass that was cut off sweeps nothing */
@@ -2640,24 +2661,40 @@ static void protocol_error(ing_t *g, const char *reason) {
   drop_stream(g);
 }
 
+/* 0.7 fix 8: the queries come before the fill.  A request of a worker that is waiting for the ingest thread (a zone to read from the database) is looked at once per pass of the main loop, and
+ * a pass used to read and process up to 16 rounds of 64 KB of what the loader sends (a manifest pass or a flood of bodies: a few thousand entries, tens of milliseconds, with the install of a
+ * body in each).  Now a pass that has run for ING_YIELD_NS and sees a request waiting leaves the rest of the frames it has for the next pass (g->sresume / fresume) and goes to the requests first. */
+#define ING_YIELD_NS 1000000LL
+#define ING_YIELD_EVERY 1
+static inline bool ing_yield(int64_t t0, unsigned handled) {
+  if ((handled % ING_YIELD_EVERY) != 0 || mono_ns() - t0 < ING_YIELD_NS) return false;
+  return park_fetch_pending();
+}
+
 static void on_stream_readable(ing_t *g) {
+  const int64_t t0 = mono_ns();
+  unsigned handled = 0;
   for (int round = 0; round < ING_READ_ROUNDS && g->stream_fd >= 0; round++) {
-    ssize_t n = read(g->stream_fd, g->rbuf, ING_RBUF);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-      syslog(LOG_NOTICE, "[DB] loader disconnected (read: %s)", strerror(errno));
-      drop_stream(g);
-      return;
-    }
-    if (n == 0) {
-      syslog(LOG_NOTICE, "[DB] loader disconnected");
-      drop_stream(g);
-      return;
-    }
-    if (kdb_framer_feed(&g->fr, g->rbuf, (size_t)n) != KDB_OK) {
-      protocol_error(g, g->fr.reason);
-      return;
+    if (g->sresume) {
+      g->sresume = false;                                /* (the frames the last pass left are handled first) */
+    } else {
+      ssize_t n = read(g->stream_fd, g->rbuf, ING_RBUF);
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+        syslog(LOG_NOTICE, "[DB] loader disconnected (read: %s)", strerror(errno));
+        drop_stream(g);
+        return;
+      }
+      if (n == 0) {
+        syslog(LOG_NOTICE, "[DB] loader disconnected");
+        drop_stream(g);
+        return;
+      }
+      if (kdb_framer_feed(&g->fr, g->rbuf, (size_t)n) != KDB_OK) {
+        protocol_error(g, g->fr.reason);
+        return;
+      }
     }
     kdb_frame_t fr;
     for (;;) {
@@ -2676,6 +2713,10 @@ static void on_stream_readable(ing_t *g) {
       }
       handle_msg(g, &msg);
       if (g->stream_fd < 0) return;
+      if (ing_yield(t0, ++handled)) {
+        g->sresume = true;
+        return;
+      }
     }
   }
 }
@@ -2718,6 +2759,7 @@ static void adopt_stream(ing_t *g, int fd) {
                        snap.max_zone_bytes ? snap.max_zone_bytes : KDB_DEFAULT_MAX_ZONE_BYTES,
                        snap.nviews ? snap.nviews : KDB_VIEWS_ANY };
   kdb_framer_init(&g->fr, KDB_FROM_LOADER, g->body, KDB_MAX_BODY);
+  g->sresume = false;
   kdb_sm_init(&g->sm, &lim);
   kdb_enc_reset(&g->enc);
   syslog(LOG_INFO, "[DB] loader stream connected, waiting for HELLO");
@@ -3150,6 +3192,7 @@ static void fetch_drop(ing_t *g) {
   g->fetch_fd = -1;
   g->fwrite_armed = false;
   g->fout_len = g->fout_off = 0;
+  g->fresume = false;
   job_free(g->fcur);
   g->fcur = NULL;
   prof_swap(g);
@@ -3214,7 +3257,13 @@ static bool fetch_queue(ing_t *g) {
   return true;
 }
 
+#ifdef KARIDNS_UNIT_TEST
+void (*db_ingest_test_fetch_req_hook)(const char *zone);
+#endif
 static bool fetch_send_req(ing_t *g, const ing_freq_t *r) {
+#ifdef KARIDNS_UNIT_TEST
+  if (db_ingest_test_fetch_req_hook) db_ingest_test_fetch_req_hook(r->zone);       /* (tests: where the thread was when it made the request) */
+#endif
   kdb_enc_reset(&g->fenc);
   if (kdb_enc_begin(&g->fenc, KDB_T_FETCH_REQ) != 0 || kdb_enc_u64(&g->fenc, 1, r->id) != 0 || kdb_enc_u16(&g->fenc, 2, r->view) != 0 ||
       kdb_enc_name(&g->fenc, 3, r->zone) != 0 || kdb_enc_u8(&g->fenc, 4, r->prio) != 0 || kdb_enc_u8(&g->fenc, 5, r->mode) != 0 ||
@@ -3260,7 +3309,12 @@ static void freq_stamp(ing_freq_t *r, const char *view, const char *zone) {
 static bool bulk_take(ing_t *g, park_fetch_req_t *q, uint32_t *zid, uint32_t *back, bool *np, int64_t *sid) {
   if (!g->bg_on || g->fetch_fd < 0 || !dbdir()) return false;
   if (g->bg_retry_ms && now_ms() < g->bg_retry_ms) return false;
-  if (g->nfreq >= fetch_sub_limit(ING_BULK_NFREQ)) return false;
+  {
+    const uint32_t others = g->nfreq > g->nbulk ? g->nfreq - g->nbulk : 0, sub = fetch_sub_limit(ING_BULK_NFREQ);
+    uint32_t allowed = sub > others ? sub - others : 0;      /* (what the queries leave of the half that the fill and the warm-up share) */
+    if (allowed < bulk_reserve()) allowed = bulk_reserve();   /* (and at least its own share) */
+    if (g->nbulk >= allowed) return false;
+  }
   for (int round = 0; round < 4; round++) {
     db_scan_item_t it;
     *back = g->bg_zid;
@@ -3650,7 +3704,7 @@ static bool wq_head_ready(ing_t *g, int64_t now) {
       return false;
     }
   }
-  if (!park_place_avail() || g->nfreq >= ING_FETCH_MAX) return false;      /* (a place of fetch-concurrency, and a slot of the table: summaries and the warm-up use some) */
+  if (!park_place_avail() || !qplace_ok(g) || g->nfreq >= ING_FETCH_MAX) return false;      /* (a place of fetch-concurrency that is not the fill's share, and a slot of the table: summaries and the warm-up use some) */
   return park_rate_check(now, false);
 }
 
@@ -3725,7 +3779,10 @@ static void fetch_issue(ing_t *g) {
       g->fmore = true;
       break;
     }
-    if (g->nwq > 0 && wq_head_ready(g, now_ms())) {      /* the oldest request that waited goes first (it holds its claim mark and nothing else) */
+    if (handled == 1 && g->nbulk < bulk_reserve() && bulk_take(g, &q, &bulk_zid, &bulk_back, &bulk_np, &bulk_sid)) {      /* 0.7 fix 8: the fill's own share, once in a pass, whatever waits */
+      warm = hot = false;
+      bulk = true;
+    } else if (g->nwq > 0 && wq_head_ready(g, now_ms())) {      /* the oldest request that waited goes first (it holds its claim mark and nothing else) */
       struct ing_wq e;
       wq_take_head(g, &e);
       warm = hot = false;
@@ -3777,7 +3834,7 @@ static void fetch_issue(ing_t *g) {
         warm_add_ex(g, q.view, q.zone, hot, false);
         break;
       }
-    } else if (g->nwq == 0 && bulk_take(g, &q, &bulk_zid, &bulk_back, &bulk_np, &bulk_sid)) {      /* 0.7 WP7b: the bodies the reconcile wants, after the queries and the warm-up */
+    } else if ((g->nwq == 0 || g->nbulk < bulk_reserve()) && bulk_take(g, &q, &bulk_zid, &bulk_back, &bulk_np, &bulk_sid)) {      /* 0.7 WP7b: the bodies the reconcile wants, after the queries and the warm-up */
       warm = hot = false;
       bulk = true;
     } else {
@@ -3839,7 +3896,7 @@ static void fetch_issue(ing_t *g) {
             continue;
           }
         }
-        if (!over && !hold_place && (can_wait || g->nwq == 0)) hold_place = park_place_take();
+        if (!over && !hold_place && (can_wait || g->nwq == 0 || (bulk && g->nbulk < bulk_reserve()))) hold_place = (!can_wait || qplace_ok(g)) && park_place_take();
         if (over || !hold_place) {
           if (can_wait) {                                /* every place is taken */
             if (!wq_wait(g, &q, &hold_place, &hold_tok, &hold_key, wq_deadline, wq_room, from_wq, now_ms())) wq_overflow(&q);
@@ -4014,6 +4071,7 @@ static void on_fetch_begin(ing_t *g, const kdb_zone_begin_t *zb) {
     fetch_drop(g);
     return;
   }
+  j->fill = r && r->bulk;
   if (r && r->v_valid) {
     j->iv_valid = true;
     j->iv_sid = r->v_sid;
@@ -4093,23 +4151,29 @@ static void handle_fetch_msg(ing_t *g, const kdb_msg_t *m) {
 }
 
 static void on_fetch_readable(ing_t *g) {
+  const int64_t t0 = mono_ns();
+  unsigned handled = 0;
   for (int round = 0; round < ING_READ_ROUNDS && g->fetch_fd >= 0; round++) {
-    ssize_t n = read(g->fetch_fd, g->rbuf, ING_RBUF);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-      syslog(LOG_NOTICE, "[DB] loader fetch stream disconnected (read: %s)", strerror(errno));
-      fetch_drop(g);
-      return;
-    }
-    if (n == 0) {
-      syslog(LOG_NOTICE, "[DB] loader fetch stream disconnected");
-      fetch_drop(g);
-      return;
-    }
-    if (kdb_framer_feed(&g->ffr, g->rbuf, (size_t)n) != KDB_OK) {
-      fetch_protocol_error(g, g->ffr.reason);
-      return;
+    if (g->fresume) {
+      g->fresume = false;                                /* (the frames the last pass left are handled first) */
+    } else {
+      ssize_t n = read(g->fetch_fd, g->rbuf, ING_RBUF);
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+        syslog(LOG_NOTICE, "[DB] loader fetch stream disconnected (read: %s)", strerror(errno));
+        fetch_drop(g);
+        return;
+      }
+      if (n == 0) {
+        syslog(LOG_NOTICE, "[DB] loader fetch stream disconnected");
+        fetch_drop(g);
+        return;
+      }
+      if (kdb_framer_feed(&g->ffr, g->rbuf, (size_t)n) != KDB_OK) {
+        fetch_protocol_error(g, g->ffr.reason);
+        return;
+      }
     }
     kdb_frame_t fr;
     for (;;) {
@@ -4125,8 +4189,15 @@ static void on_fetch_readable(ing_t *g) {
         fetch_protocol_error(g, g->fsm.reason);            /* (the reason names the rule, never bytes of the stream) */
         return;
       }
+      const bool fillmsg = g->fcur && g->fcur->fill && (msg.type == KDB_T_ZONE_DATA || msg.type == KDB_T_ZONE_END);
+      const int64_t tm0 = fillmsg ? mono_ns() : 0;
       handle_fetch_msg(g, &msg);
+      if (fillmsg) g->fill_ns += mono_ns() - tm0;
       if (g->fetch_fd < 0) return;
+      if (ing_yield(t0, ++handled)) {
+        g->fresume = true;
+        return;
+      }
     }
   }
 }
@@ -4162,7 +4233,7 @@ static void hot_send(ing_t *g) {
 static void hold_check(ing_t *g) {
   if (!g->hold) return;
   int64_t now = now_ms();
-  bool done = atomic_load_explicit(&g_wl_received, memory_order_acquire) && g->nhot == 0 && g->nhot_flight == 0;     /* (zones of the list only: a pinned zone that waits for room must not hold the queries back) */
+  bool done = atomic_load_explicit(&g_wl_received, memory_order_acquire) && g->nhot == 0 && g->nhot_flight == 0 && !db_store_directory_wait();      /* (0.7: with a first fill of the store the list of the zones is complete when the first pass has ended) */     /* (zones of the list only: a pinned zone that waits for room must not hold the queries back) */
   if (!done && now < atomic_load_explicit(&g_hold_deadline_ms, memory_order_relaxed)) return;
   g->hold = false;
   atomic_store_explicit(&g_warm_done_ms, now - g->hold_start_ms, memory_order_relaxed);
@@ -4202,6 +4273,7 @@ static void fetch_adopt(ing_t *g, int fd) {
   kdb_limits_t lim = { snap.max_zone_records ? snap.max_zone_records : KDB_DEFAULT_MAX_ZONE_RECORDS,
                        snap.max_zone_bytes ? snap.max_zone_bytes : KDB_DEFAULT_MAX_ZONE_BYTES, snap.nviews ? snap.nviews : KDB_VIEWS_ANY };
   kdb_framer_init(&g->ffr, KDB_FROM_LOADER, g->fbody, KDB_MAX_BODY);
+  g->fresume = false;
   kdb_sm_init_fetch(&g->fsm, &lim);
   kdb_enc_reset(&g->fenc);
   g->fout_len = g->fout_off = 0;
@@ -4390,6 +4462,7 @@ static void *ingest_thread(void *arg) {
     if (g->nwq > 0 && (wait_ms < 0 || wait_ms > ING_WQ_TICK_MS)) wait_ms = ING_WQ_TICK_MS;     /* 0.7 P-B: requests wait (for the bucket, room): look again, and at their deadlines */
     if (g->hold && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;           /* warm-before-serve: look at the warm-up and the time often */
     if (wait_ms < 0 || wait_ms > 10000) wait_ms = 10000;                  /* (the busy share of dbstatus is closed at the end of a window, so the thread wakes at least that often) */
+    if (g->sresume || g->fresume) wait_ms = 0;                            /* 0.7 fix 8: frames are left in a framer, the requests of the queries were served first */
     if (g->fmore) wait_ms = 0;                                            /* B2 W5: the last pass of fetch_issue() stopped at its bound: serve what is ready on the streams, then go on */
     /* B2 W5, the sleep protocol (dns_park.c): say "asleep", and look once more for requests, so that a worker that pushed one and saw no flag has not left it unseen */
     if (park_fetch_sleep_prepare()) wait_ms = 0;
@@ -4406,6 +4479,7 @@ static void *ingest_thread(void *arg) {
       return NULL;
     }
     t_wake = mono_ns();
+    bool ran_s = false, ran_f = false;
     for (int i = 0; i < n; i++) {
       const struct kevent *e = &evs[i];
       if (e->filter == EVFILT_USER && e->ident == ING_EVT_RESULT) {
@@ -4425,14 +4499,22 @@ static void *ingest_thread(void *arg) {
         on_ctrl_readable(g);
       } else if (g->fetch_fd >= 0 && e->ident == (uintptr_t)g->fetch_fd) {
         if (e->filter == EVFILT_WRITE) fetch_flush(g);
-        else on_fetch_readable(g);
+        else {
+          on_fetch_readable(g);
+          ran_f = true;
+        }
       } else if (g->stream_fd >= 0 && e->ident == (uintptr_t)g->stream_fd) {
         if (e->filter == EVFILT_WRITE) out_flush(g);
-        else on_stream_readable(g);
+        else {
+          on_stream_readable(g);
+          ran_s = true;
+        }
       }
       if (g->need_cleanup) cleanup_stream_state(g);
       park_wake_flush();                                 /* B2 W5: the workers that a completion woke are triggered once per event, not once per zone */
     }
+    if (g->sresume && !ran_s && g->stream_fd >= 0) on_stream_readable(g);        /* (what the last pass left, when no event of the stream came) */
+    if (g->fresume && !ran_f && g->fetch_fd >= 0) on_fetch_readable(g);
     if (g->inv_active) pump_inventory(g);
     if (g->need_cleanup) cleanup_stream_state(g);
     maybe_apply_delta(g);
@@ -4448,6 +4530,8 @@ static void *ingest_thread(void *arg) {
       busy_ns += t1 - t_wake;
       if (t1 - win_start >= ING_BUSY_WINDOW_NS) {
         atomic_store_explicit(&g_ing_busy_pct, (uint32_t)(busy_ns * 100 / (t1 - win_start)), memory_order_relaxed);
+        atomic_store_explicit(&g_ing_fill_pct, (uint32_t)(g->fill_ns * 100 / (t1 - win_start)), memory_order_relaxed);
+        g->fill_ns = 0;
         win_start = t1;
         busy_ns = 0;
       }
@@ -4963,11 +5047,11 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
               (unsigned long long)atomic_load_explicit(&g_fetch_limited, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_fetch_issued, memory_order_relaxed),
               (unsigned)atomic_load_explicit(&g_fetch_conc, memory_order_relaxed));
     {
-      st_append(&c, "fetchq: in_flight=%u places=%u peak=%u table_full=%llu ring_dropped=%llu park_full=%llu park_timeout=%llu loader_busy=%llu ingest_busy=%u%% hist=%llu,%llu,%llu,%llu,%llu queued=%u queue_peak=%u waited=%llu queue_dropped=%llu queue_full=%llu\n",
+      st_append(&c, "fetchq: in_flight=%u places=%u peak=%u table_full=%llu ring_dropped=%llu park_full=%llu park_timeout=%llu loader_busy=%llu ingest_busy=%u%% fill_busy=%u%% hist=%llu,%llu,%llu,%llu,%llu queued=%u queue_peak=%u waited=%llu queue_dropped=%llu queue_full=%llu\n",
                 (unsigned)atomic_load_explicit(&g_fq_inflight, memory_order_relaxed), (unsigned)park_places_used(), (unsigned)atomic_load_explicit(&g_fq_peak, memory_order_relaxed),
                 (unsigned long long)atomic_load_explicit(&g_fq_table_full, memory_order_relaxed), (unsigned long long)ps.ring_dropped, (unsigned long long)ps.full,
                 (unsigned long long)ps.timeout, (unsigned long long)atomic_load_explicit(&g_fq_loader_busy, memory_order_relaxed),
-                (unsigned)atomic_load_explicit(&g_ing_busy_pct, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_fq_hist[0], memory_order_relaxed),
+                (unsigned)atomic_load_explicit(&g_ing_busy_pct, memory_order_relaxed), (unsigned)atomic_load_explicit(&g_ing_fill_pct, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_fq_hist[0], memory_order_relaxed),
                 (unsigned long long)atomic_load_explicit(&g_fq_hist[1], memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_fq_hist[2], memory_order_relaxed),
                 (unsigned long long)atomic_load_explicit(&g_fq_hist[3], memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_fq_hist[4], memory_order_relaxed),
                 (unsigned)atomic_load_explicit(&g_wq_len, memory_order_relaxed), (unsigned)atomic_load_explicit(&g_wq_peak, memory_order_relaxed),

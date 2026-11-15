@@ -104,6 +104,11 @@ typedef struct store_extra {
   uint64_t folded, fold_rows, fold_replaced;
   uint64_t err_texts, err_noted, err_dropped;
   uint64_t sampled_detaches;
+  /* 0.7 fix 7 / 8: the worker's attach (ok: attached and answered on the worker; cold: the pages were not in the page cache, or COPY mode; over: above the hard line of memory-limit; claim: another thread has the zone; fail: the
+   * image or the entry could not be made; declined: a name server zone has to be attached first; full: the staging table or the ring was full; adopted / lost: staged zones that were registered / found in memory, changed or gone)
+   * and hot.list (state 0 none, 1 attaching, 2 done, 3 stopped at the high mark, 4 off) */
+  uint64_t wa_ok, wa_cold, wa_over, wa_claim, wa_fail, wa_decline, wa_full, wa_adopted, wa_lost, wa_ns;
+  uint64_t hot_state, hot_listed, hot_attached, hot_skipped, hot_written;
 } store_extra_t;
 void store_status_set_extra_fn(bool (*fn)(store_extra_t *out));
 

@@ -188,7 +188,7 @@ kari_make_dbloader_tsan() {
 # wait_log, pass, fail and KARIDNS.  Without DB_DIFF_STORE=cold it does nothing.
 # store_stmt DIR: the `store` statement of the database server: a zone store in DIR/store with DB_DIFF_STORE=cold or DB_STORE=on (the store-on variants of the database tests,
 # 0.7 WP7b: tests/run_db_<name>_store_test.sh), else `store none;` (the old behaviour whatever /var/db/karidns says on the host)
-store_stmt() { if [ "${DB_DIFF_STORE:-}" = cold ] || [ "${DB_STORE:-}" = on ]; then printf 'store "%s/store";' "$1"; else printf 'store none;'; fi; return 0; }
+store_stmt() { if [ "${DB_DIFF_STORE:-}" = cold ] || [ "${DB_STORE:-}" = on ]; then printf 'store "%s/store"; store-hot-list no;' "$1"; else printf 'store none;'; fi; return 0; }
 store_cold_restart() {
     [ "${DB_DIFF_STORE:-}" = cold ] || return 0
     kill -TERM "$SB" 2>/dev/null

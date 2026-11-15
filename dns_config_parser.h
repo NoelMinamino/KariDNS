@@ -745,7 +745,8 @@ typedef struct {
   char *store_dir;             /* 0.7 store S2 (restart-only): the directory of the zone store; NULL = the default (KARIDNS_DB_DEFAULT_STORE_DIR, used when its parent exists) */
   bool store_none;             /* `store none;`: no zone store, the zones are read from the database only (as before 0.7) */
   uint8_t store_mode;          /* `store-mode`: 0 auto (by the file system), 1 map, 2 copy (STORE_MODE_*) */
-  uint32_t store_threads;      /* `store-threads`: threads that attach zones from the store, 1..32 (0 = the default, 2) */
+  uint32_t store_threads;      /* `store-threads`: threads that attach zones from the store, 1..32 (0 = the default,  8) */
+  bool store_hot_list;         /* `store-hot-list` (default yes, restart-only): at a clean stop the zones that are in memory are written to hot.list of the store, most used first, and the next start attaches them in that order in the background (0.7 fix 8) */
   uint64_t store_segment_size;     /* `store-segment-size`: the size a segment file of the store grows to before the next one is begun, 1 MiB..4 GiB (0 = the default, 256 MiB); the cleaner works one segment at a time */
   uint32_t store_scrub_interval;   /* `store-scrub-interval`: seconds between the starts of two scrubs of the store, 60..31536000 (0 = the default, a week; UINT32_MAX = `off`) */
   char *server_id;             /* postgresql only (B11) */
@@ -780,7 +781,7 @@ typedef struct {
 #define KARIDNS_DB_STORE_SCRUB_MIN 60
 #define KARIDNS_DB_STORE_SCRUB_MAX 31536000u
 #define KARIDNS_DB_STORE_THREADS_MAX 32
-#define KARIDNS_DB_STORE_THREADS_DEFAULT 2
+#define KARIDNS_DB_STORE_THREADS_DEFAULT 8
 #define KARIDNS_DB_PARK_TIMEOUT_MIN 10
 #define KARIDNS_DB_PARK_TIMEOUT_MAX 60000
 #define KARIDNS_DB_CONFIG_BODY_MAX (1u << 20)   /* the body of the CONFIG message (KDB_MAX_BODY); db_config_body_size() in the parser computes what build_config() sends */

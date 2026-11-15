@@ -3795,6 +3795,173 @@ static void test_readahead_close(void) {
   tdir_free(&d);
 }
 
+/* ---- 0.7 fix 7 / 8: store_image_resident() and hot.list ---- */
+
+static bool resident_of(store_t *s, uint32_t zid) {
+  store_zone_t z;
+  store_read_lock();
+  bool ok = store_zone_get(s, zid, &z) == 0 && store_image_resident(s, &z);
+  store_read_unlock();
+  return ok;
+}
+
+static void test_resident(int mode) {
+  printf("[store_image_resident: %s mode]\n", mode == STORE_MODE_MAP ? "map" : "copy");
+  tdir_t d;
+  tdir_new(&d, "resident");
+  store_opts_t o;
+  small_opts(&o);
+  o.mode = mode;
+  o.scrub_interval_s = UINT32_MAX;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  uint32_t zid[40];
+  for (uint32_t i = 0; i < 40; i++) CHECK_EQ(put_i(s, 0, i, 1, &zid[i]), 0);
+  /* a record that was written is in the page cache (and its segment is open) in MAP mode; COPY mode never says yes (a read with pread can block) */
+  for (uint32_t i = 0; i < 40; i += 7) CHECK_EQ(resident_of(s, zid[i]), mode == STORE_MODE_MAP);
+  /* a zone with no image (known), and a zone id that is free, are not resident */
+  {
+    char nm[160];
+    uint32_t kz = STORE_NONE;
+    name_of(1, nm, sizeof(nm));
+    store_meta_t m = meta_of(1, 2);
+    CHECK_EQ(store_set_known(s, 0, nm, strlen(nm), &m, &kz), 0);
+    CHECK(kz == zid[1]);
+  }
+  CHECK(!resident_of(s, zid[1]));
+  {
+    store_zone_t z;
+    store_read_lock();
+    CHECK_EQ(store_zone_get(s, zid[2], &z), 0);
+    store_zone_t bad = z;
+    bad.loc = 0;
+    CHECK(!store_image_resident(s, &bad));                               /* (no record) */
+    bad = z;
+    bad.loc = (z.loc & ((1ull << 36) - 1)) | (7ull << 36);              /* (a segment that does not exist) */
+    CHECK(!store_image_resident(s, &bad));
+    bad = z;
+    bad.loc = (z.loc & ((1ull << 36) - 1));                              /* (segment 0) */
+    CHECK(!store_image_resident(s, &bad));
+    bad = z;
+    bad.img_len = 4u << 20;                                              /* (a record of many pages, or past the mapping) */
+    CHECK(!store_image_resident(s, &bad));
+    store_read_unlock();
+  }
+  CHECK_EQ(store_close(s), 0);
+  /* after a reopen no segment is open: the answer is no until something (here the image read) opens it; then it is yes in MAP mode */
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    CHECK(!resident_of(s, zid[2]));                                      /* (no segment is open yet) */
+    store_open_segments(s);
+    CHECK_EQ(resident_of(s, zid[2]), mode == STORE_MODE_MAP);             /* (opened: the pages written before the close are in the page cache) */
+    store_img_t im;
+    store_read_lock();
+    CHECK_EQ(store_image_read(s, zid[2], &im), 0);
+    store_img_release(s, &im);
+    store_read_unlock();
+    CHECK_EQ(resident_of(s, zid[2]), mode == STORE_MODE_MAP);
+    if (mode == STORE_MODE_MAP) {
+      /* the pages leave the page cache (as far as the system lets a test make it): the answer follows, whichever it is, and never crashes */
+      store_zone_t z;
+      store_read_lock();
+      CHECK_EQ(store_zone_get(s, zid[2], &z), 0);
+      store_read_unlock();
+      char sp[700];
+      fpath(&d, "seg.1", sp, sizeof(sp));
+      int fd = open(sp, O_RDWR);
+      if (fd >= 0) {
+        (void)fsync(fd);
+        (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        close(fd);
+      }
+      (void)resident_of(s, zid[2]);
+    }
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
+static void test_hot_list(void) {
+  printf("[hot.list: write, read, and what is not trusted]\n");
+  tdir_t d, d2;
+  tdir_new(&d, "hot");
+  tdir_new(&d2, "hot2");
+  store_opts_t o;
+  small_opts(&o);
+  o.scrub_interval_s = UINT32_MAX;
+  store_t *s = NULL, *s2 = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  CHECK_EQ(store_open(d2.fd, &o, &s2), 0);
+  if (!s || !s2) { tdir_free(&d); tdir_free(&d2); return; }
+  uint32_t *ids = NULL;
+  size_t n = 99;
+  CHECK_EQ(store_hot_read(s, &ids, &n), -ENOENT);                       /* (no file: a first start) */
+  CHECK(ids == NULL && n == 0);
+  CHECK_EQ(store_hot_write(s, NULL, 0), 0);                             /* (an empty list is a list) */
+  CHECK_EQ(store_hot_read(s, &ids, &n), 0);
+  CHECK(ids == NULL && n == 0);
+  enum { N = 5000 };
+  uint32_t *w = malloc(N * sizeof(*w));
+  for (uint32_t i = 0; i < N; i++) w[i] = (i * 2654435761u) % 1000003u;
+  CHECK_EQ(store_hot_write(s, w, N), 0);
+  CHECK_EQ(store_hot_read(s, &ids, &n), 0);
+  CHECK(n == N && ids && memcmp(ids, w, N * sizeof(*w)) == 0);           /* (the order is the list's) */
+  free(ids);
+  ids = NULL;
+  CHECK_EQ(store_hot_write(s, w, 3), 0);                                /* (a shorter list replaces it: the file is cut) */
+  CHECK_EQ(store_hot_read(s, &ids, &n), 0);
+  CHECK(n == 3 && ids && memcmp(ids, w, 3 * sizeof(*w)) == 0);
+  free(ids);
+  ids = NULL;
+  CHECK_EQ(store_hot_write(s, w, STORE_HOT_MAX + 1), -EINVAL);
+  CHECK_EQ(store_hot_write(s, NULL, 1), -EINVAL);
+  CHECK_EQ(store_hot_write(NULL, w, 1), -EINVAL);
+  CHECK_EQ(store_hot_write(s, w, N), 0);
+  char hp[700], hp2[700];
+  fpath(&d, "hot.list", hp, sizeof(hp));
+  fpath(&d2, "hot.list", hp2, sizeof(hp2));
+  /* the list of another store (another uuid) is not trusted */
+  {
+    uint8_t buf[48 + N * 4];
+    CHECK_EQ(read_at(hp, 0, buf, sizeof(buf)), 0);
+    int fd = open(hp2, O_RDWR | O_CREAT, 0600);
+    CHECK(fd >= 0 && write(fd, buf, sizeof(buf)) == (ssize_t)sizeof(buf));
+    if (fd >= 0) close(fd);
+    CHECK_EQ(store_hot_read(s2, &ids, &n), -EBADMSG);
+    CHECK(ids == NULL && n == 0);
+  }
+  /* a byte of the header, of the ids, a file that is too short or too long, an unfinished write (the header is written last): none is trusted */
+  const off_t spots[] = { 0, 9, 20, 30, 40, 48, 48 + 4000 };
+  for (size_t k = 0; k < sizeof(spots) / sizeof(spots[0]); k++) {
+    flip_byte(hp, spots[k]);
+    CHECK_EQ(store_hot_read(s, &ids, &n), -EBADMSG);
+    CHECK(ids == NULL && n == 0);
+    flip_byte(hp, spots[k]);                                            /* (back) */
+    CHECK_EQ(store_hot_read(s, &ids, &n), 0);
+    free(ids);
+    ids = NULL;
+  }
+  CHECK_EQ(truncate(hp, 48 + 100), 0);
+  CHECK_EQ(store_hot_read(s, &ids, &n), -EBADMSG);
+  CHECK_EQ(truncate(hp, 20), 0);
+  CHECK_EQ(store_hot_read(s, &ids, &n), -EBADMSG);
+  CHECK_EQ(store_hot_write(s, w, N), 0);
+  {
+    uint8_t zero[48];
+    memset(zero, 0, sizeof(zero));
+    CHECK_EQ(write_at(hp, 0, zero, sizeof(zero)), 0);                   /* (the state of a write that did not finish) */
+    CHECK_EQ(store_hot_read(s, &ids, &n), -EBADMSG);
+  }
+  free(w);
+  CHECK_EQ(store_close(s), 0);
+  CHECK_EQ(store_close(s2), 0);
+  tdir_free(&d);
+  tdir_free(&d2);
+}
+
 int main(void) {
   const char *base = getenv("KARIDNS_STORE_TESTDIR");
   snprintf(g_base, sizeof(g_base), "%s/store_test.%d", base && *base ? base : ".", (int)getpid());
@@ -3841,6 +4008,7 @@ int main(void) {
   if (WANT("errring")) { test_err_ring(); test_err_index(); }
   if (WANT("badimg")) test_bad_image_hook();
   if (WANT("raclose")) test_readahead_close();
+  if (WANT("resident")) { test_resident(STORE_MODE_MAP); test_resident(STORE_MODE_COPY); test_hot_list(); }
   if (WANT("smallfs") && getenv("KARIDNS_STORE_SMALLFS")) test_smallfs(getenv("KARIDNS_STORE_SMALLFS"));
   if (WANT("zfs") && getenv("KARIDNS_STORE_ZFS_128K")) test_zfs_dir(getenv("KARIDNS_STORE_ZFS_128K"), true, "128K dataset");
   if (WANT("zfs") && getenv("KARIDNS_STORE_ZFS_16K")) test_zfs_dir(getenv("KARIDNS_STORE_ZFS_16K"), false, "16K dataset");

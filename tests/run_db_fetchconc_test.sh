@@ -230,7 +230,13 @@ start_srv
 udp_burst "$NZ"
 settle
 echo "  (park_full=$(fq park_full) park_timeout=$(fq park_timeout) ring_dropped=$(fq ring_dropped) table_full=$(fq table_full) loader_busy=$(fq loader_busy) peak=$(fq peak) hist=$(fq_hist) shed=$(shed) queue_peak=$(fq queue_peak) waited=$(fq waited))"
-[ "$(fq park_full)" -gt 0 ] 2>/dev/null && pass "fetchq: park_full=$(fq park_full): queries found the table of parked queries full" || fail "fetchq: park_full='$(fq park_full)' after the burst"
+if [ "$STORE" = on ]; then
+    # 0.7 fix 7: with the page cache of the fill kept, a worker attaches the zone of a stored image itself and parks nothing: the table is full only for the queries that it could not (its pages were not mapped)
+    WOK=$($KCTL store -k 2>/dev/null | sed -n 's/^store.attach.worker.ok=//p')
+    { [ "$(fq park_full)" -gt 0 ] || [ "${WOK:-0}" -gt 0 ]; } 2>/dev/null && pass "fetchq: park_full=$(fq park_full), worker attaches=${WOK:-0}: the queries were attached on the workers or found the table of parked queries full" || fail "fetchq: park_full='$(fq park_full)' worker attaches='${WOK:-0}' after the burst"
+else
+    [ "$(fq park_full)" -gt 0 ] 2>/dev/null && pass "fetchq: park_full=$(fq park_full): queries found the table of parked queries full" || fail "fetchq: park_full='$(fq park_full)' after the burst"
+fi
 if [ "$STORE" = on ]; then
     [ "$(sattach)" -ge 1 ] 2>/dev/null && pass "fetchq: the queries that got through were attaches ($(sattach)), peak=$(fq peak)" || fail "fetchq: attaches '$(sattach)' peak='$(fq peak)' hist='$(fq_hist)'"
 else
