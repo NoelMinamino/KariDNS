@@ -13,7 +13,8 @@
 -- keeps its record types in rr_policy_types instead of an array, grants.data_schema is NULL (one zone file per API instance), and a grant
 -- cannot follow the zone it names (the zones are in another file): the API removes the grants of a zone it deletes or renames.
 --
---   principals, credentials, memberships, principal_closure, rr_policies, rr_policy_types, grants, sessions, api_tokens, templates, template_records, oidc_states, schema_version (3)
+--   principals, credentials, memberships, principal_closure, rr_policies, rr_policy_types, grants, sessions, api_tokens, preferences, templates, template_records, oidc_states,
+--   schema_version (3)
 --   karidns_auth_audit   who changed what in this file, before / after as JSON; password_hash and totp_secret are written as "<redacted>"
 --   karidns_auth_actor   at most one row (id 1): who is writing; the API writes it first in its transaction and deletes it last
 --
@@ -155,6 +156,14 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 );
 CREATE INDEX IF NOT EXISTS api_tokens_principal_idx ON api_tokens (principal_id);
 
+-- preferences (0.7; the same as in db/karidns_ext.pgsql.sql): what a user chose for itself on its account screen.  idle_timeout: the idle time of its sessions in
+-- seconds, shorter than the service's session-idle (the API takes the smaller of the two at every request); NULL or no row = the service's.  A file of version 3
+-- made before 0.7 gets the table when this file is applied again (the service names it as missing until then).
+CREATE TABLE IF NOT EXISTS preferences (
+  principal_id INTEGER PRIMARY KEY REFERENCES principals (id) ON DELETE CASCADE,
+  idle_timeout INTEGER NULL CHECK (idle_timeout IS NULL OR (typeof(idle_timeout) = 'integer' AND idle_timeout >= 60))
+);
+
 -- oidc_states (item F, milestone M5; the same as in db/karidns_ext.pgsql.sql): the state of an OpenID Connect sign-in that has started and not come back.  The SHA-256 of the
 -- `state` parameter is the key, then the SHA-256 of the value of the short cookie that ties the flow to the browser that began it, the provider, the nonce, the PKCE code
 -- verifier, the route to return to and when it ends (ten minutes).  A row is used once: the API deletes it as it reads it.  Not audited.
@@ -264,6 +273,7 @@ BEGIN
   DELETE FROM grants WHERE principal_id = OLD.id;
   DELETE FROM sessions WHERE principal_id = OLD.id;
   DELETE FROM api_tokens WHERE principal_id = OLD.id;
+  DELETE FROM preferences WHERE principal_id = OLD.id;
   DELETE FROM principal_closure WHERE member_id = OLD.id OR group_id = OLD.id;
 END;
 
@@ -603,6 +613,35 @@ BEGIN
   VALUES ((SELECT db_role FROM karidns_auth_actor), (SELECT principal_id FROM karidns_auth_actor), (SELECT principal_name FROM karidns_auth_actor),
           (SELECT change_set FROM karidns_auth_actor), 'api_tokens', 'D', NULL, OLD.id,
           json_object('id', OLD.id, 'principal_id', OLD.principal_id, 'name', OLD.name, 'secret_hash', '<redacted>', 'read_only', OLD.read_only, 'created_at', OLD.created_at, 'expires_at', OLD.expires_at, 'last_used_at', OLD.last_used_at, 'revoked_at', OLD.revoked_at),
+          NULL);
+END;
+
+-- preferences
+DROP TRIGGER IF EXISTS karidns_audit_preferences_ins;
+CREATE TRIGGER karidns_audit_preferences_ins AFTER INSERT ON preferences
+BEGIN
+  INSERT INTO karidns_auth_audit (db_role, principal_id, principal_name, change_set, table_name, op, zone_name, row_id, before, after)
+  VALUES ((SELECT db_role FROM karidns_auth_actor), (SELECT principal_id FROM karidns_auth_actor), (SELECT principal_name FROM karidns_auth_actor),
+          (SELECT change_set FROM karidns_auth_actor), 'preferences', 'I', NULL, NEW.principal_id,
+          NULL,
+          json_object('principal_id', NEW.principal_id, 'idle_timeout', NEW.idle_timeout));
+END;
+DROP TRIGGER IF EXISTS karidns_audit_preferences_upd;
+CREATE TRIGGER karidns_audit_preferences_upd AFTER UPDATE ON preferences
+BEGIN
+  INSERT INTO karidns_auth_audit (db_role, principal_id, principal_name, change_set, table_name, op, zone_name, row_id, before, after)
+  VALUES ((SELECT db_role FROM karidns_auth_actor), (SELECT principal_id FROM karidns_auth_actor), (SELECT principal_name FROM karidns_auth_actor),
+          (SELECT change_set FROM karidns_auth_actor), 'preferences', 'U', NULL, NEW.principal_id,
+          json_object('principal_id', OLD.principal_id, 'idle_timeout', OLD.idle_timeout),
+          json_object('principal_id', NEW.principal_id, 'idle_timeout', NEW.idle_timeout));
+END;
+DROP TRIGGER IF EXISTS karidns_audit_preferences_del;
+CREATE TRIGGER karidns_audit_preferences_del AFTER DELETE ON preferences
+BEGIN
+  INSERT INTO karidns_auth_audit (db_role, principal_id, principal_name, change_set, table_name, op, zone_name, row_id, before, after)
+  VALUES ((SELECT db_role FROM karidns_auth_actor), (SELECT principal_id FROM karidns_auth_actor), (SELECT principal_name FROM karidns_auth_actor),
+          (SELECT change_set FROM karidns_auth_actor), 'preferences', 'D', NULL, OLD.principal_id,
+          json_object('principal_id', OLD.principal_id, 'idle_timeout', OLD.idle_timeout),
           NULL);
 END;
 

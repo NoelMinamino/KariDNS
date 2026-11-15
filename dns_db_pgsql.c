@@ -2111,6 +2111,63 @@ static int pg_w_insert_version_rrset(db_conn_t *c, int64_t version_id, const cha
     return wq(c, W_INS_VERR, pv, NULL, PGRES_COMMAND_OK, "w_insert_version_rrset");
 }
 
+/* notice receiver of ANALYZE (SKIP_LOCKED): the WARNING "skipping analyze of ... --- lock not available" has SQLSTATE 55P03 (the text is
+ * translated, the code is not) */
+static void analyze_notice(void *arg, const PGresult *res) {
+    const char *s = PQresultErrorField(res, PG_DIAG_SQLSTATE);
+    if (s && strcmp(s, "55P03") == 0) *(bool *)arg = true;
+}
+
+/* 0.7: ANALYZE records after a bulk import (dns_db_driver.h).  One query first:
+ *  - may the role?  A role that may not analyze the table only gets a WARNING from ANALYZE, so ask: the owner (or a member of the owning
+ *    role) may, and on PostgreSQL 17 and later a role with MAINTAIN on the table (has_table_privilege() knows no MAINTAIN before 17 and raises
+ *    an error, so the text is chosen here).  `records` is resolved through the search_path (the dataset's schema), as ANALYZE resolves it; a
+ *    missing table is "may not".
+ *  - is it needed?  Never analyzed (by anyone: last_analyze and last_autoanalyze NULL), or at least autovacuum's default trigger of rows
+ *    changed since (autovacuum_analyze_threshold 50 + autovacuum_analyze_scale_factor 0.1 * reltuples): autovacuum would analyze soon anyway,
+ *    this closes the window.  A huge table is not analyzed again after every re-sign of one zone.  A backend flushes its counters at most
+ *    once a second, so n_mod_since_analyze may not have the caller's last commits yet: on PostgreSQL 15 and later they are flushed first
+ *    (pg_stat_force_next_flush() takes effect when that statement ends; without it, counts flushed after the ANALYZE would also be counted
+ *    against the new statistics), and the caller's own count is taken when larger (older servers; a failure of the flush is ignored).
+ * Then ANALYZE (SKIP_LOCKED) (PostgreSQL 12 and later; the schema needs 13): it does not wait for SHARE UPDATE EXCLUSIVE, so it never queues
+ * behind, nor (after deadlock_timeout) cancels, a running autovacuum; a skip is DB_ANALYZE_SKIPPED, seen by its notice. */
+static int pg_w_analyze(db_conn_t *c, uint64_t changed, db_analyze_t *res) {
+    *res = DB_ANALYZE_DENIED;
+    if (!c->writable || c->in_wtxn) {
+        set_err(c, "w_analyze: needs a writable connection outside a transaction");
+        return -1;
+    }
+    char nb[24];
+    snprintf(nb, sizeof(nb), "%llu", (unsigned long long)changed);
+    const char *pv[1] = { nb };
+    const char *sql = PQserverVersion(c->pg) >= 170000
+        ? "SELECT pg_has_role(k.relowner, 'USAGE') OR has_table_privilege(k.oid, 'MAINTAIN'), "
+          "(s.last_analyze IS NULL AND s.last_autoanalyze IS NULL) OR GREATEST(COALESCE(s.n_mod_since_analyze, 0), $1::bigint) >= 50 + 0.1 * GREATEST(k.reltuples, 0) "
+          "FROM pg_class k LEFT JOIN pg_stat_all_tables s ON s.relid = k.oid WHERE k.oid = to_regclass('records')"
+        : "SELECT pg_has_role(k.relowner, 'USAGE'), "
+          "(s.last_analyze IS NULL AND s.last_autoanalyze IS NULL) OR GREATEST(COALESCE(s.n_mod_since_analyze, 0), $1::bigint) >= 50 + 0.1 * GREATEST(k.reltuples, 0) "
+          "FROM pg_class k LEFT JOIN pg_stat_all_tables s ON s.relid = k.oid WHERE k.oid = to_regclass('records')";
+    PGresult *r = NULL;
+    if (PQserverVersion(c->pg) >= 150000) PQclear(PQexec(c->pg, "SELECT pg_stat_force_next_flush()"));
+    int ret = exec_rows(c, sql, 1, pv, &r, "w_analyze (statistics)");
+    if (ret != 0) return ret;
+    bool may = PQntuples(r) == 1 && !PQgetisnull(r, 0, 0) && PQgetvalue(r, 0, 0)[0] == 't';
+    bool stale = may && !PQgetisnull(r, 0, 1) && PQgetvalue(r, 0, 1)[0] == 't';
+    PQclear(r);
+    if (!may) return 0;
+    if (!stale) {
+        *res = DB_ANALYZE_NOT_NEEDED;
+        return 0;
+    }
+    bool skipped = false;
+    PQsetNoticeReceiver(c->pg, analyze_notice, &skipped);
+    ret = exec_cmd(c, "ANALYZE (SKIP_LOCKED) records", "w_analyze");
+    PQsetNoticeReceiver(c->pg, ignore_notice, NULL);
+    if (ret != 0) return ret;
+    *res = skipped ? DB_ANALYZE_SKIPPED : DB_ANALYZE_DONE;
+    return 0;
+}
+
 const db_driver_t db_driver_postgresql = {
     .name = "postgresql",
     .open = pg_open, .close = pg_close, .errmsg = pg_errmsg, .check_schema = pg_check_schema,
@@ -2140,6 +2197,7 @@ const db_driver_t db_driver_postgresql = {
     /* items D and E */
     .w_set_actor = pg_w_set_actor, .w_zone_generation = pg_w_zone_generation, .w_bump_serial = pg_w_bump_serial,
     .w_insert_version = pg_w_insert_version, .w_insert_version_rrset = pg_w_insert_version_rrset,
+    .w_analyze = pg_w_analyze,                  /* 0.7: statistics after a bulk import */
 };
 
 #endif /* KARIDNS_DB_POSTGRESQL */

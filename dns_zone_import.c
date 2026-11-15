@@ -33,6 +33,8 @@ struct zi_s {
     char zone_type[16];                             /* upper case, "" = NATIVE */
     zmsg_t msg;
     int demoted;                                    /* findings of the zone checks that a partial file (merge, types) is not judged by */
+    bool analyze_denied;                            /* 0.7: the role may not ANALYZE records (noted once; not asked again) */
+    uint64_t analyze_changed;                       /* 0.7: records written or removed by the commits of this run since the last ANALYZE attempt */
     const zi_apply_in_t *ap;                        /* apply: the change set being applied (NULL for an import) */
     char **delkeys;                                 /* apply: owner (lower case, no final dot) and type (upper case) of the RRsets to delete, one after the other */
     size_t ndelkeys;                                /* the number of strings (twice the number of RRsets) */
@@ -583,6 +585,43 @@ static int zi_err_class(const char *m) {
     if (n >= sizeof(conflict) - 1 && strcmp(m + n - (sizeof(conflict) - 1), conflict) == 0) return DB_ERR_CONFLICT;
     if (n >= sizeof(retry) - 1 && strcmp(m + n - (sizeof(retry) - 1), retry) == 0) return DB_ERR_RETRY;
     return 0;
+}
+
+/* 0.7: after each committed transaction, once the commits of this run (all zones of import --all, every zone through one zi_t, the signer's
+ * imports too) wrote or removed at least ZI_ANALYZE_MIN records since the last attempt, refresh the planner statistics of the records table
+ * (w_analyze; PostgreSQL) if they are stale.  A freshly filled table has none until autovacuum's first analyze, and the WebAdmin's RRset
+ * queries plan badly until then (measured: 100k records, 124-678 ms before, 3-4 ms after).  Any attempt (done, not needed, skipped because
+ * another session held the lock, failed) starts the count again.  The import is committed, so nothing here fails it. */
+#define ZI_ANALYZE_MIN 1000u
+static void zi_analyze(zi_t *z, const char *shown, uint64_t changed) {
+    if (!z->drv->w_analyze || z->analyze_denied) return;
+    z->analyze_changed += changed;
+    if (z->analyze_changed < ZI_ANALYZE_MIN) return;
+    uint64_t n = z->analyze_changed;
+    z->analyze_changed = 0;
+    db_analyze_t ar = DB_ANALYZE_DENIED;
+    if (z->drv->w_analyze(z->conn, n, &ar) != 0) {
+        ZI_WARN(z, DC_DB_IMPORT_ANALYZE_FAILED, shown, "ANALYZE of records after the import failed (%s); the import is committed, autovacuum refreshes the statistics later",
+                z->drv->errmsg(z->conn));
+        return;
+    }
+    switch (ar) {
+    case DB_ANALYZE_DENIED:
+        z->analyze_denied = true;
+        zmsg_emit(&z->msg, DIAG_INFO, DC_DB_IMPORT_ANALYZE_DENIED, shown,
+                  "The database role may not ANALYZE records (it must own the table, or have MAINTAIN on it on PostgreSQL 17 and later); autovacuum refreshes the "
+                  "statistics later, and queries of the new records may be slow until then");
+        break;
+    case DB_ANALYZE_SKIPPED:
+        zmsg_emit(&z->msg, DIAG_INFO, DC_DB_IMPORT_ANALYZE_SKIPPED, shown,
+                  "ANALYZE of records skipped: another session (a VACUUM or ANALYZE, often autovacuum) holds its lock; the statistics are refreshed by it or later");
+        break;
+    case DB_ANALYZE_DONE:
+        zmsg_emit(&z->msg, DIAG_INFO, DC_DB_IMPORT_ANALYZE, shown, "statistics of records refreshed (ANALYZE)");
+        break;
+    case DB_ANALYZE_NOT_NEEDED:                     /* the statistics are fresh: nothing to say */
+        break;
+    }
 }
 
 static int zi_dbfail(zi_t *z, const char *what) {
@@ -1490,6 +1529,7 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
                   "Zone '%s' is signed by karidns-signer: its DNSSEC records and the metadata PRESIGNED and NSEC3PARAM were kept%s; the server serves the zone again after the next signing",
                   rows->zone, ig);
     }
+    if (res->committed) zi_analyze(z, shown, res->records_inserted + res->records_deleted);
     goto out;
 oom:
     ZI_ERR(z, DC_INTERNAL_OOM, shown, "out of memory");
@@ -2185,6 +2225,7 @@ static int zi_apply_signer(zi_t *z, zrows_t *rows, zone_arena_t *farena, const c
                   zone, (unsigned)res->old_serial, (unsigned)res->new_serial, res->records_inserted, res->records_deleted, res->rows_updated, ex,
                   z->o.dry_run ? "; dry run, nothing was written" : "");
     }
+    if (res->committed) zi_analyze(z, shown, res->records_inserted + res->records_deleted);
     goto out;
 oom:
     ZI_ERR(z, DC_INTERNAL_OOM, shown, "out of memory");

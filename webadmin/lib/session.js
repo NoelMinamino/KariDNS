@@ -44,6 +44,10 @@ export function needsTotp(settings, grants) {
   return mode === 'all' || (mode === 'global' && isGlobal(grants));
 }
 
+// the idle time of a session in seconds: the service's session-idle, or the shorter time the user chose on its account screen (preferences; a choice above
+// session-idle, left from before a SIGHUP lowered it, gives way to session-idle)
+export const idleSeconds = (settings, choice) => (choice ? Math.min(settings['session-idle'], choice) : settings['session-idle']);
+
 const unauthenticated = (detail, code = 'unauthenticated') => new ApiError(401, code, detail, { headers: { 'WWW-Authenticate': 'Bearer realm="karidns"' } });
 
 // Sets ctx.auth = { kind, principal, grants, totpOk, readOnly, session | tokenId } or throws.  route: { unsafe check is by method; preTotp: allowed before the TOTP step }
@@ -82,10 +86,12 @@ export async function authenticate(app, ctx, route) {
     const row = await S.lookupSession(tx, idHash, now);
     if (!row) return null;
     await tx.setPrincipal(row.principal_id);
-    return { row, principal: await S.getPrincipal(tx, row.principal_id), grants: await S.effectiveGrants(tx, row.principal_id) };
+    return { row, principal: await S.getPrincipal(tx, row.principal_id), grants: await S.effectiveGrants(tx, row.principal_id), idleChoice: await S.getIdleTimeout(tx, row.principal_id) };
   });
-  // the idle time is checked here (the row's expires_at is the absolute end): last_seen alone is written on requests, and the audit log ignores that
-  if (!found || !found.principal || found.principal.disabled || found.row.last_seen + app.settings['session-idle'] * 1000 < now) throw failed();
+  // the idle time is checked here (the row's expires_at is the absolute end): last_seen alone is written on requests, and the audit log ignores that.  It is the
+  // shorter of session-idle and the user's own choice, taken at every request: a SIGHUP that lowers session-idle, or a new choice, holds from the next request on
+  const idleMs = found ? idleSeconds(app.settings, found.idleChoice) * 1000 : 0;
+  if (!found || !found.principal || found.principal.disabled || found.row.last_seen + idleMs < now) throw failed();
   if (!SAFE.has(req.method)) {
     const origin = req.headers.origin;
     const want = app.settings['public-origin'];
@@ -94,9 +100,10 @@ export async function authenticate(app, ctx, route) {
     if (typeof given !== 'string' || !safeEqual(sha(given), found.row.csrf_hash) || !safeEqual(csrfToken(cookie), given)) throw new ApiError(403, 'csrf', 'the X-KariDNS-CSRF header is missing or wrong');
   }
   if (!found.row.totp_ok && !route.preTotp) throw new ApiError(403, 'totp-required', 'this session has not done the TOTP step: enrol or confirm at /api/v1/auth/totp first');
-  ctx.auth = { kind: 'session', principal: found.principal, grants: found.grants, totpOk: found.row.totp_ok, readOnly: false, idHash, cookie, csrf: csrfToken(cookie), sessionExpires: found.row.expires };
-  // last_seen is written at most once a minute (every few seconds where the idle time is short): the audit log ignores it, but the database is not asked on every request
-  if (found.row.last_seen + Math.min(60000, app.settings['session-idle'] * 250) < now) {
+  ctx.auth = { kind: 'session', principal: found.principal, grants: found.grants, totpOk: found.row.totp_ok, readOnly: false, idHash, cookie, csrf: csrfToken(cookie), sessionExpires: found.row.expires, idleChoice: found.idleChoice };
+  // last_seen is written at most once a minute (every quarter of the idle time where that is short): the audit log ignores it, but the database is not asked on
+  // every request.  The GUI ends its countdown that much early (ui/js/session.js leadTimes).
+  if (found.row.last_seen + Math.min(60000, idleMs / 4) < now) {
     app.background(() => app.backend.tx({ principal: found.principal.id, name: found.principal.name, write: true }, (tx) => S.touchSession(tx, idHash, now)));
   }
 }

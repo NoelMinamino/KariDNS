@@ -4,10 +4,10 @@
 import { h, fill } from '../dom.js';
 import { render } from '../format.js';
 import { field, select, checkbox, message, problemNodes, confirmButton, isGlobal } from '../widgets.js';
-import { zonePath, datasetPath, recordLines } from '../zonelib.js';
+import { zonePath, datasetPath, recordLines, PRIMARY_KINDS, kindLabel } from '../zonelib.js';
 import { placeOnFields } from '../pointer.js';
 import { zoneFrame } from './zoneframe.js';
-import { reloadText } from './change.js';
+import { reloadText, reloadChoice } from './change.js';
 
 export function zoneSettingsView(ctx, { params }) {
   const { api, i18n, router } = ctx;
@@ -22,7 +22,7 @@ export function zoneSettingsView(ctx, { params }) {
     // ---------------------------------------------------------------------------------------------------------- attributes
     function attributes(views) {
       const rows = [
-        [t('settings.kind'), render(info.kind)],
+        [t('settings.kind'), [render(kindLabel(t, info.kind)), PRIMARY_KINDS.includes(info.kind) ? h('p', { class: 'hint' }, t('kind.hint')) : null]],
         [t('settings.catalog'), info.catalog ? render(info.catalog) : '-'],
         [t('settings.views'), info.views?.length ? render(info.views.join(', ')) : '-'],
         info.master ? [t('settings.masters'), render(info.master)] : null,
@@ -124,7 +124,7 @@ export function zoneSettingsView(ctx, { params }) {
     // ---------------------------------------------------------------------------------------------------------- delete
     function danger() {
       const confirm = field({ label: t('settings.del-confirm'), name: 'confirm', required: true, maxlength: 255, spellcheck: false, autocapitalize: 'none', hint: t('settings.del-hint', { zone: info.name }) });
-      const reload = checkbox({ label: t('flow.reload'), name: 'reload', checked: ctx.session.state.version?.ui?.reload_after_change === true });
+      const reload = reloadChoice(ctx);
       const err = message('error');
       const del = h('button', { type: 'submit', class: 'danger' }, t('settings.del'));
       const form = h('form', { class: 'stack', novalidate: true }, confirm.node, reload.node, err.node, h('div', { class: 'actions' }, del));
@@ -135,7 +135,7 @@ export function zoneSettingsView(ctx, { params }) {
         if (confirm.input.value.trim().toLowerCase().replace(/\.$/, '') !== info.name.toLowerCase().replace(/\.$/, '')) { confirm.setError(t('settings.del-mismatch')); confirm.focus(); return; }
         del.disabled = true;
         try {
-          const r = await api.del(path, { body: { confirm: confirm.input.value.trim(), reload: reload.input.checked } });
+          const r = await api.del(path, { body: { confirm: confirm.input.value.trim(), reload: reload.value() } });
           ctx.drafts.of(ds, info.name).clear();
           ctx.announce(t('settings.deleted', { zone: info.name }));
           ctx.flash = t('settings.deleted-state', { zone: info.name, state: reloadText(ctx, r.reload) });

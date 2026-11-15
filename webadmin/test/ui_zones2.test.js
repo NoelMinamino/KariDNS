@@ -478,3 +478,78 @@ test('the dialog of the editor is cancelled; a view that is left stops what it w
   await ui.submit(findAll(ui.root, (e) => e.tagName === 'FORM').find((f) => f.querySelector('input[name=catalog]')));
   assert.match(findAll(ui.root, (e) => e.className === 'msg error' && !e.hidden)[0].textContent, /internal error/);
 });
+
+// ---------------------------------------------------------------------------------------------------------------------------------- T-1, T-2
+test('T-1: a service that cannot ask for a reload (reload_available false): no update button and no reload box on the zone page, the new zone, the import, the delete', async () => {
+  const version = { ...VERSION, ui: { ...VERSION.ui, reload_available: false, reload_after_change: true } };
+  const NOTE = /This service is not set up to ask the servers to load the zone again \(an administrator sets karictl-config\)\. The servers pick a saved change up when they reload on their own\./;
+  const patched = [];
+  const zone = await bootApp({ version, routes: zoneRoutes({}, { 'PATCH /datasets/main/zones/example.test./rrsets': (b) => { patched.push(b); return reply(200, { dry_run: true, allowed: true, diff: [], messages: [] }); } }), hash: ZONE });
+  assert.equal(zone.button(/^Update the servers now$/), null);
+  assert.match(zone.q('section[aria-labelledby=update-title]').textContent, NOTE);
+  await zone.click(zone.button(/^Add a record set$/));
+  const dlg = zone.dialogs()[0];
+  zone.type(zone.input('name', dlg), 'new');
+  zone.type(zone.input('ttl', dlg), '300');
+  zone.type(zone.input('records', dlg), '192.0.2.77');
+  await zone.submit(dlg.querySelector('form'));
+  const draft = zone.q('section.draft');
+  assert.equal(zone.input('reload', draft), undefined, 'the change set has no box');
+  assert.match(draft.textContent, NOTE);
+  await zone.click(buttonIn(draft, /^Preview$/));
+  assert.equal('reload' in patched[0], false, 'and sends no reload');
+  labelled(zone);
+  // a signer zone keeps its own note
+  const signer = await bootApp({ version, routes: zoneRoutes({ info: { signer: true } }), hash: ZONE });
+  assert.match(signer.text(), /The signer keeps this zone\./);
+  assert.doesNotMatch(signer.text(), /not set up to ask the servers/);
+
+  const create = await bootApp({ version, routes: createRoutes(), hash: '#/create/main' });
+  assert.equal(create.input('reload'), undefined);
+  assert.match(create.text(), NOTE);
+  const imp = await bootApp({ version, routes: zoneRoutes(), hash: `${ZONE}/import` });
+  assert.equal(imp.input('reload'), undefined);
+  assert.match(imp.text(), NOTE);
+
+  const deleted = [];
+  const settings = await bootApp({ version, routes: zoneRoutes({}, {
+    'GET /datasets/main/zones/example.test./metadata': () => reply(200, META),
+    'DELETE /datasets/main/zones/example.test.': (b) => { deleted.push(b); return reply(200, { deleted: 'example.test.', change_set: 'c', reload: 'not requested' }); },
+  }), hash: `${ZONE}/settings` });
+  assert.equal(settings.input('reload'), undefined);
+  assert.match(settings.text(), NOTE);
+  typed(settings, settings.input('confirm'), 'example.test');
+  await settings.submit(findAll(settings.root, (e) => e.tagName === 'FORM').find((f) => f.querySelector('input[name=confirm]')));
+  assert.deepEqual(deleted, [{ confirm: 'example.test' }], 'no reload is sent');
+
+  // where it is available, reload_after_change ticks the box (and an older service that does not say is taken to be able to)
+  const ticked = await bootApp({ version: { ...VERSION, ui: { ...VERSION.ui, reload_available: true, reload_after_change: true } }, routes: zoneRoutes(), hash: `${ZONE}/import` });
+  assert.equal(ticked.input('reload').checked, true);
+  const older = await bootApp({ routes: zoneRoutes(), hash: ZONE });
+  assert.ok(older.button(/^Update the servers now$/));
+});
+
+test('T-2: the kind of a new zone says what NATIVE and MASTER are (labels, a hint tied to the selector); the settings and the zone list say it too', async () => {
+  const ui = await bootApp({ routes: createRoutes(), hash: '#/create/main' });
+  const kind = ui.input('type');
+  assert.equal(kind.value, 'NATIVE');
+  assert.deepEqual(findAll(kind, (e) => e.tagName === 'OPTION').map((o) => [o.value, o.textContent]),
+    [['NATIVE', 'NATIVE: primary, copied by the database replication'], ['MASTER', 'MASTER: primary, sent to secondaries with NOTIFY and AXFR']]);
+  const hint = ui.root.querySelector(`#${kind.getAttribute('aria-describedby')}`);
+  assert.match(hint.textContent, /^KariDNS serves both kinds the same way, as a primary zone\. .*If unsure, take NATIVE\.$/);
+  labelled(ui);
+  const ja = await bootApp({ routes: createRoutes(), hash: '#/create/main', languages: ['ja'] });
+  assert.match(ja.text(), /KariDNS ではどちらも同じプライマリゾーンとして配信します。.*迷ったら NATIVE。/);
+  assert.match(ja.text(), /MASTER: プライマリ \(NOTIFY と AXFR でセカンダリへ配る\)/);
+  // a selector without a hint has no aria-describedby
+  assert.equal(ui.input('how').getAttribute('aria-describedby'), null);
+
+  const settings = await bootApp({ routes: zoneRoutes({ info: { kind: 'MASTER' } }, { 'GET /datasets/main/zones/example.test./metadata': () => reply(200, META) }), hash: `${ZONE}/settings` });
+  assert.match(settings.qa('dl')[1].textContent, /^KindMASTER: primary, sent to secondaries with NOTIFY and AXFRKariDNS serves both kinds the same way/);
+  const slave = await bootApp({ routes: zoneRoutes({ info: { kind: 'SLAVE' } }, { 'GET /datasets/main/zones/example.test./metadata': () => reply(200, META) }), hash: `${ZONE}/settings` });
+  assert.match(slave.qa('dl')[1].textContent, /^KindSLAVECatalog zone/, 'other kinds as they are, no hint');
+
+  const list = await bootApp({ routes: zoneRoutes(), hash: '#/zones' });
+  assert.deepEqual(findAll(list.input('kind'), (e) => e.tagName === 'OPTION').map((o) => o.textContent),
+    ['any', 'NATIVE: primary, copied by the database replication', 'MASTER: primary, sent to secondaries with NOTIFY and AXFR', 'SLAVE', 'PRODUCER', 'CONSUMER']);
+});

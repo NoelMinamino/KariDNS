@@ -1,4 +1,4 @@
-.TH KARIDNS\-DBLOADER 8 "2026-11-14" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-DBLOADER 8 "2026-11-16" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-dbloader.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-dbloader \- reads the PowerDNS 5.1 tables of a SQLite3 or PostgreSQL
@@ -516,7 +516,10 @@ PostgreSQL: the privileges of the role that \fBkaridns\-zone\fR imports with
 on \fBdomains\fR, \fBrecords\fR and \fBdomainmetadata\fR, the \fBkaridns_*\fR
 zone tables, what the change-log triggers need, and only the column privilege
 \fBSELECT (domain_id)\fR on \fBcryptokeys\fR (never \fBcontent\fR, the private
-keys). Not for the loader: give the loader \fBkaridns_loader_role.pgsql.sql\fR.
+keys). On PostgreSQL 17 and later also \fBMAINTAIN\fR on \fBrecords\fR, so that
+\fBkaridns\-zone\fR can run \fBANALYZE records\fR after a large import
+(below). Not for the loader: give the loader
+\fBkaridns_loader_role.pgsql.sql\fR.
 .PP
 A bulk import writes one change-log row per changed row (SQLite3) or per
 statement (PostgreSQL); a big import makes the next reload compare every zone
@@ -794,11 +797,13 @@ grants and credentials of \fBkaridns_auth\fR (the only role that reads
 \fBcredentials\fR), \fBSELECT\fR on the audit log, \fBEXECUTE\fR on
 \fBkaridns_auth.bump_serial()\fR. \fBSELECT\fR and \fBINSERT\fR (no
 \fBDELETE\fR) on \fBkaridns_reload_requests\fR; nothing on
-\fBkaridns_changes\fR. No \fBTRUNCATE\fR, no write to the audit log. It switches
-RLS and the audit log on. The script stops, before it changes anything, if the
-role is a superuser or has \fBBYPASSRLS\fR, is a member of
-\fBkaridns_rls_trusted\fR, or is, or is a member of, the owner of the tables
-(directly or through other roles).
+\fBkaridns_changes\fR. On PostgreSQL 17 and later \fBMAINTAIN\fR on
+\fBrecords\fR (the WebAdmin's imports run \fBkaridns\-zone\fR as this role, and
+it runs \fBANALYZE records\fR after a large import). No \fBTRUNCATE\fR, no write
+to the audit log. It switches RLS and the audit log on. The script stops, before
+it changes anything, if the role is a superuser or has \fBBYPASSRLS\fR, is a
+member of \fBkaridns_rls_trusted\fR, or is, or is a member of, the owner of the
+tables (directly or through other roles).
 .TP 8
 \fBdb/karidns_signer_role.pgsql.sql\fR
 The signer: reads every table including \fBcryptokeys.content\fR and the change
@@ -810,16 +815,19 @@ keys (\fBINSERT\fR on \fBcryptokeys\fR, no \fBUPDATE\fR or \fBDELETE\fR);
 answers the key requests (\fBSELECT\fR, and \fBUPDATE\fR of the columns
 \fBstate\fR, \fBmessage\fR and \fBdone_at\fR only, on
 \fBkaridns_key_requests\fR); keeps its schedule (\fBSELECT\fR, \fBINSERT\fR,
-\fBUPDATE\fR, \fBDELETE\fR on \fBkaridns_signer_state\fR). Nothing on
-\fBkaridns_auth\fR, nothing written to \fBkaridns_changes\fR. It is a trusted
-daemon held to its types by RLS and a trigger, not bound by grants, and its role
-is \fBnot\fR in \fBkaridns_auth.audit_restricted_roles\fR (\fBkaridns\-zone
-import \-\-signer\fR writes the audit in summary mode: a re-sign replaces every
-signature, and a row per signature is a log that nobody reads). Its write
-policies of \fBrecords\fR and \fBdomainmetadata\fR exist twice, permissive and
-\fBRESTRICTIVE\fR, so setting \fBkaridns.principal\fR to a global master does
-not let it write an \fBA\fR record. The trigger on \fBrecords\fR (for the roles
-in \fBkaridns_auth.signer_roles\fR) holds it to its columns: a DNSSEC record may
+\fBUPDATE\fR, \fBDELETE\fR on \fBkaridns_signer_state\fR). On PostgreSQL 17 and
+later \fBMAINTAIN\fR on \fBrecords\fR (\fBkaridns\-zone import \-\-signer\fR
+runs \fBANALYZE records\fR after it wrote or removed 1000 records or
+more). Nothing on \fBkaridns_auth\fR, nothing written to
+\fBkaridns_changes\fR. It is a trusted daemon held to its types by RLS and a
+trigger, not bound by grants, and its role is \fBnot\fR in
+\fBkaridns_auth.audit_restricted_roles\fR (\fBkaridns\-zone import \-\-signer\fR
+writes the audit in summary mode: a re-sign replaces every signature, and a row
+per signature is a log that nobody reads). Its write policies of \fBrecords\fR
+and \fBdomainmetadata\fR exist twice, permissive and \fBRESTRICTIVE\fR, so
+setting \fBkaridns.principal\fR to a global master does not let it write an
+\fBA\fR record. The trigger on \fBrecords\fR (for the roles in
+\fBkaridns_auth.signer_roles\fR) holds it to its columns: a DNSSEC record may
 change in any column; \fBevery other record only in \fBordername\fB and
 \fBauth\fB\fR (the NSEC3 hash of its owner and the authoritative flag, which a
 signature chain needs; the trigger is declared \fBBEFORE UPDATE OF\fR every
@@ -832,8 +840,9 @@ deletes an SOA. The same refusals as for the API role apply at install time.
 \fBdb/karidns_check_role.pgsql.sql\fR
 The check role of the API (items D and E): the writer role's privileges,
 membership of \fBkaridns_rls_trusted\fR and of \fBkaridns_never_commit\fR,
-\fBUSAGE\fR on \fBkaridns_auth\fR and \fBEXECUTE\fR on \fBbump_serial\fR; its
-transactions cannot commit a write (below).
+\fBUSAGE\fR on \fBkaridns_auth\fR and \fBEXECUTE\fR on \fBbump_serial\fR; not
+the writer role's \fBMAINTAIN\fR on \fBrecords\fR (a check run never commits, so
+it has nothing to analyze); its transactions cannot commit a write (below).
 .TP 8
 \fBdb/karidns_loader_role.pgsql.sql\fR, \fBdb/karidns_writer_role.pgsql.sql\fR
 As before, plus membership in \fBkaridns_rls_trusted\fR. Nothing on
@@ -843,6 +852,25 @@ with RLS on, in either script order.
 the owner
 Owns everything and is not subject to RLS (no \fBFORCE\fR). The only role that
 may \fBUPDATE\fR or \fBDELETE\fR audit rows.
+.PP
+\fB\fBMAINTAIN\fB on \fBrecords\fB (0.7, PostgreSQL 17 and later).\fR After
+imports that wrote or removed 1000 records or more, \fBkaridns\-zone\fR runs
+\fBANALYZE (SKIP_LOCKED) records\fR when the statistics are stale (never
+analyzed, or as many rows changed as would make autovacuum analyze:
+\fBkaridns\-zone(8)\fR): a table filled in bulk has no planner statistics until
+autovacuum's first analyze, and the WebAdmin API's RRset queries plan badly
+until then (measured on PostgreSQL 18 with a zone of 100000 records: 124 to 678
+ms before, 3 to 4 ms after). Only the owner of a table may analyze it, and on
+PostgreSQL 17 and later a role with \fBMAINTAIN\fR on it; the writer, API and
+signer role scripts grant \fBMAINTAIN\fR on \fBrecords\fR on such a server. The
+check role script takes it back from its role (it runs the writer script first):
+a check run never commits, so it has nothing to analyze. It allows
+\fBANALYZE\fR, \fBVACUUM\fR, \fBCLUSTER\fR, \fBREINDEX\fR and \fBLOCK TABLE\fR
+of the table; the roles could lock the table in any mode already (\fBUPDATE\fR
+and \fBDELETE\fR allow that), and the statistics are those autovacuum gathers
+anyway (\fBpg_stats\fR does not show them to a role that RLS binds). On
+PostgreSQL 13 to 16 nothing is granted: \fBkaridns\-zone\fR prints a note
+(\fBdb.import.analyze\-denied\fR) and autovacuum refreshes the statistics later.
 .PP
 Nobody gets \fBBYPASSRLS\fR or superuser.
 .SS What row level security checks
@@ -1058,6 +1086,17 @@ times (\fBcreated_at\fR, \fBlast_seen\fR, \fBexpires_at\fR), \fBtotp_ok\fR,
 \fBrevoked_at\fR. Deleted with their principal. The audit writes the hashes as
 \fB<redacted>\fR and does not log a change of \fBlast_seen\fR alone.
 .TP 8
+\fBpreferences\fR
+\fIWhere:\fR \fBkaridns_auth\fR / the auth file
+.br
+\fIWhat it holds:\fR What a user chose for itself on its account screen (0.7):
+\fBprincipal_id\fR, \fBidle_timeout\fR (seconds, at least 60, NULL = the
+service's \fBsession\-idle\fR; the API ends a session after the smaller of the
+two). Deleted with the principal; audited. A version 3 database or auth file
+made before 0.7 gets the table when \fBdb/karidns_ext.pgsql.sql\fR (then
+\fBdb/karidns_api_role.pgsql.sql\fR) or \fBdb/karidns_auth.sqlite3.sql\fR is
+applied again; until then \fBkaridns\-webadmin \-\-check\fR names it as missing.
+.TP 8
 \fBoidc_states\fR
 \fIWhere:\fR \fBkaridns_auth\fR / the auth file
 .br
@@ -1086,10 +1125,10 @@ with \fBowner\fR (\fB@\fR or a relative name in lower case, no final dot),
 \fBtype\fR (no DNSSEC type), \fBttl\fR, \fBcontent\fR. Written by a global
 master, read by every principal; audited.
 .PP
-\fBRow level security (PostgreSQL).\fR \fBsessions\fR and \fBapi_tokens\fR: the
-principal's own rows, a global master all of them. \fBtemplates\fR and
-\fBtemplate_records\fR: everybody reads, a global master
-writes. \fBkaridns_zone_state\fR: readable with a grant on the
+\fBRow level security (PostgreSQL).\fR \fBsessions\fR, \fBapi_tokens\fR and
+\fBpreferences\fR: the principal's own rows, a global master all of
+them. \fBtemplates\fR and \fBtemplate_records\fR: everybody reads, a global
+master writes. \fBkaridns_zone_state\fR: readable with a grant on the
 zone. \fBkaridns_zone_versions\fR: readable with a grant on the zone, insertable
 by the principal itself (\fBprincipal_id = karidns.principal\fR);
 \fBkaridns_zone_version_rrsets\fR: readable and insertable by the rule of

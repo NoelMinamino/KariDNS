@@ -1,11 +1,10 @@
 // The configuration file of karidns-signer (planning 3.8): lines `key = value`, `#` comments, `[zone <name>]` sections for per-zone values.
-// Parsed here, no dependency.  parseConfig() is pure (text in, object out); loadConfig() reads the file; checkConninfoFile() is the permission check
-// the loader and karidns-zone apply to a conninfo file (a regular file owned by the user, mode 0600 or 0400).
+// Parsed here, no dependency.  parseConfig() is pure (text in, object out); loadConfig() reads the file (the conninfo file is read and checked by node/lib/conf.js readPrivateFile).
 
 import fs from 'node:fs';
 import os from 'node:os';
 import { canonicalZone } from '../../node/lib/names.js';
-import { parseBool, parseDuration, parseInt1, parseEnum, parseAbsPath, parseSchema, parseLog, checkConninfoFile as checkConninfo } from '../../node/lib/conf.js';
+import { parseBool, parseDuration, parseInt1, parseEnum, parseAbsPath, parseSchema, parseLog } from '../../node/lib/conf.js';
 
 const DAY = 86400;
 
@@ -153,6 +152,3 @@ export function loadConfig(path) {
   }
   return parseConfig(text);
 }
-
-// The check karidns-zone and the loader apply to a conninfo file (node/lib/conf.js).  Returns null when fine, else the reason.
-export const checkConninfoFile = (file, st, uid = process.getuid?.()) => checkConninfo(file, st, uid, 'karidns-signer');

@@ -1,4 +1,4 @@
-// karidns-webadmin: the command line (bin/karidns-webadmin.js calls main()).  Options, --check, --create-admin, the server with its signals.
+// karidns-webadmin: the command line (bin/karidns-webadmin.js calls main()).  Options, --check, --create-admin, --rotate-totp-key, the server with its signals.
 
 import fs from 'node:fs';
 import { loadConfig, validate } from './config.js';
@@ -7,7 +7,7 @@ import { createLogger } from '../../node/lib/log.js';
 import { App, VERSION } from './app.js';
 import { Router, listen, closeServer, reloadTls } from './http.js';
 import { ROUTES } from './routes.js';
-import { openBackend, inspect, createAdmin, readOidcProviders } from './setup.js';
+import { openBackend, inspect, createAdmin, readOidcProviders, rotateTotpKey, rotationPending, rotationPendingProblem } from './setup.js';
 import { loadKeyFile } from './crypto.js';
 import * as S from './store.js';
 
@@ -16,6 +16,7 @@ export const DEFAULT_CONFIG = '/usr/local/etc/karidns/karidns-webadmin.conf';
 
 export const USAGE = `Usage: karidns-webadmin [-c config] [--check]
        karidns-webadmin [-c config] --create-admin NAME [--bootstrap-conninfo-file FILE]
+       karidns-webadmin [-c config] --rotate-totp-key [--bootstrap-conninfo-file FILE]
        karidns-webadmin --version | -h | --help
 
 The HTTP API of a KariDNS database (PostgreSQL or SQLite3): logins, users, groups and grants, the zones and their records, under /api/v1/.
@@ -24,20 +25,25 @@ Zone data is read from the database and exported by karidns-zone; who may see an
   -c, --config FILE                 the configuration file (default ${DEFAULT_CONFIG})
       --check                       read the configuration, check the files and their modes, the tools and the database schema, and exit (0 = fine, 1 = a problem)
       --create-admin NAME           make a user NAME with a global master grant and print its one-time password (run it once, as the service user)
-      --bootstrap-conninfo-file F   PostgreSQL only: the connection of a role that row level security does not bind (the table owner), for --create-admin
+      --rotate-totp-key             a new totp-key-file, every stored TOTP secret wrapped again with it, the old key kept as <totp-key-file>.old (delete it once
+                                    the TOTP logins work).  Stop the service first and run as the service user; a run that stopped half-way is finished by
+                                    running it again, and the service does not start while <totp-key-file>.new is there
+      --bootstrap-conninfo-file F   PostgreSQL only: the connection of a role that row level security does not bind (the table owner), for --create-admin and
+                                    --rotate-totp-key (which refuses a role that row level security binds)
   -v, --version                     print the version
   -h, --help                        print this text
 
 Signals: SIGTERM and SIGINT finish the requests that are running and stop; SIGHUP reads the configuration again (rates, timeouts, the origin; not the database
 or the address).  The configuration is described in docs/karidns-api.md.
 
-Example:
+Examples:
   karidns-webadmin --check -c /usr/local/etc/karidns/karidns-webadmin.conf
+  karidns-webadmin --rotate-totp-key -c /usr/local/etc/karidns/karidns-webadmin.conf
 `;
 
-// -> { config, check, help, version, createAdmin, bootstrap } or throws Error(usage message)
+// -> { config, check, help, version, createAdmin, rotate, bootstrap } or throws Error(usage message)
 export function parseArgs(argv) {
-  const o = { config: DEFAULT_CONFIG, check: false, help: false, version: false, createAdmin: undefined, bootstrap: undefined };
+  const o = { config: DEFAULT_CONFIG, check: false, help: false, version: false, createAdmin: undefined, rotate: false, bootstrap: undefined };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const need = () => {
@@ -47,20 +53,21 @@ export function parseArgs(argv) {
     if (a === '-c' || a === '--config') o.config = need();
     else if (a === '--check') o.check = true;
     else if (a === '--create-admin') o.createAdmin = need();
+    else if (a === '--rotate-totp-key') o.rotate = true;
     else if (a === '--bootstrap-conninfo-file') o.bootstrap = need();
     else if (a === '-h' || a === '--help') o.help = true;
     else if (a === '-v' || a === '--version') o.version = true;
     else throw new Error(`unknown option ${JSON.stringify(a.slice(0, 40))}`);
   }
-  if (o.check && o.createAdmin !== undefined) throw new Error('--check and --create-admin do not go together');
-  if (o.bootstrap !== undefined && o.createAdmin === undefined) throw new Error('--bootstrap-conninfo-file is for --create-admin');
+  if ([o.check, o.createAdmin !== undefined, o.rotate].filter(Boolean).length > 1) throw new Error('--check, --create-admin and --rotate-totp-key do not go together');
+  if (o.bootstrap !== undefined && o.createAdmin === undefined && !o.rotate) throw new Error('--bootstrap-conninfo-file is for --create-admin and --rotate-totp-key');
   return o;
 }
 
 // The server.  io: { stdout, stderr, proc (signals), deps }.  Resolves with the exit status after SIGTERM / SIGINT.
 export async function main(argv, io = {}) {
   const { stdout = process.stdout, stderr = process.stderr, proc = process, deps = {} } = io;
-  const d = { loadConfig, openBackend, inspect, createAdmin, readOidc: readOidcProviders, createLogger, loadKeyFile: (f) => loadKeyFile(f, fs), listen, run: runChild, ...deps };
+  const d = { loadConfig, openBackend, inspect, createAdmin, rotateTotpKey, rotationPending, readOidc: readOidcProviders, createLogger, loadKeyFile: (f) => loadKeyFile(f, fs), listen, run: runChild, ...deps };
   let opts;
   try {
     opts = parseArgs(argv);
@@ -79,15 +86,26 @@ export async function main(argv, io = {}) {
   }
   const bad = validate(config);
 
-  if (opts.createAdmin !== undefined) {
+  if (opts.createAdmin !== undefined || opts.rotate) {
     if (bad.length) { for (const p of bad) stderr.write(`karidns-webadmin: ${p}\n`); return 1; }
     if (config.settings.database === 'pg' && !opts.bootstrap) {
-      stderr.write('karidns-webadmin: on PostgreSQL --create-admin needs --bootstrap-conninfo-file: the API role cannot make the first user (row level security); use the connection of the table owner\n');
+      stderr.write(opts.rotate
+        ? 'karidns-webadmin: on PostgreSQL --rotate-totp-key needs --bootstrap-conninfo-file: the API role sees the credentials of its own principal only (row level security); use the connection of the table owner\n'
+        : 'karidns-webadmin: on PostgreSQL --create-admin needs --bootstrap-conninfo-file: the API role cannot make the first user (row level security); use the connection of the table owner\n');
       return 1;
     }
     let backend;
     try {
       backend = await d.openBackend(config, { conninfoFile: opts.bootstrap });
+      if (opts.rotate) {
+        const r = await d.rotateTotpKey(config, backend);
+        stdout.write(r.finished
+          ? `the TOTP key of an earlier run is now ${config.settings['totp-key-file']}: ${r.rewrapped} secret(s) that still opened with the old key wrapped again with it\n`
+          : `the TOTP key is new: ${r.rewrapped} secret(s) wrapped again with it in ${config.settings['totp-key-file']}\n`);
+        if (r.unreadable) stdout.write(`${r.unreadable} secret(s) open with no key and were left as they are: reset the TOTP of those users (POST /api/v1/principals/{id}/credentials {"action":"reset-totp"})\n`);
+        stdout.write(`the old key is kept in ${r.old}: delete it once the TOTP logins work\n`);
+        return 0;
+      }
       const r = await d.createAdmin(config, opts.createAdmin, backend, { run: d.run });
       stdout.write(`user ${r.name} made, a global master.\npassword (shown once): ${r.password}\n`);
       if (config.settings['require-totp'] !== 'none') stdout.write('TOTP is required for global masters: the first login must enrol (POST /api/v1/auth/totp).\n');
@@ -111,7 +129,9 @@ export async function main(argv, io = {}) {
     }
     for (const n of r.notes) stdout.write(`ok: ${n}\n`);
     for (const w of r.warnings ?? []) stderr.write(`warning: ${w}\n`);
-    for (const p of [...bad.filter((b) => !r.problems.includes(b)), ...r.problems]) stderr.write(`problem: ${p}\n`);
+    // (the opening's failure is often what inspect found already, there with the name of the setting in front: printed once)
+    const told = (b) => r.problems.some((p) => p === b || p.endsWith(`: ${b}`));
+    for (const p of [...bad.filter((b) => !told(b)), ...r.problems]) stderr.write(`problem: ${p}\n`);
     const fine = r.problems.length === 0 && bad.length === 0;
     stdout.write(fine ? 'karidns-webadmin: the configuration is fine\n' : 'karidns-webadmin: the configuration has problems\n');
     return fine ? 0 : 1;
@@ -128,6 +148,8 @@ export async function main(argv, io = {}) {
   let backend;
   let key;
   try {
+    // (an unfinished rotation: the stored secrets may open with <totp-key-file>.new only, and a secret the service wrote now would be under the old key)
+    if (d.rotationPending(s['totp-key-file'])) throw new Error(rotationPendingProblem(s['totp-key-file']));
     key = d.loadKeyFile(s['totp-key-file']);
     backend = await d.openBackend(config, { onError: (e) => log.error(`database connection: ${e.message}`), warn: (m) => log.warn(m) });
   } catch (e) {

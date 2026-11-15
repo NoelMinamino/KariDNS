@@ -2,7 +2,7 @@
 
 import fs from 'node:fs';
 import { setTimeout as sleepMs } from 'node:timers/promises';
-import { loadConfig, validate, checkConninfoFile } from './config.js';
+import { loadConfig, validate } from './config.js';
 import { tools } from './argv.js';
 import { runChild, clip } from '../../node/lib/run.js';
 import { createLogger } from '../../node/lib/log.js';
@@ -12,7 +12,7 @@ import { signZone } from './pipeline.js';
 import { SqliteDb } from './db_sqlite.js';
 import { loadSqlite } from '../../node/lib/sqlite.js';
 import { PgDb } from './db_pg.js';
-import { parseConninfo, plaintextWarning } from '../../node/lib/conf.js';
+import { parseConninfo, plaintextWarning, readPrivateFile } from '../../node/lib/conf.js';
 import { packageVersion } from '../../node/lib/version.js';
 
 export const VERSION = packageVersion(new URL('../package.json', import.meta.url));
@@ -64,7 +64,7 @@ export function sqliteModeWarning(file, stat = fs.statSync) {
 }
 
 // --check: the permissions of the files and the tools' versions.  Returns { problems, notes, warnings }.
-export async function checkSetup(config, { run = runChild, st = {}, nodeVersion = process.versions.node, readFile = fs.readFileSync } = {}) {
+export async function checkSetup(config, { run = runChild, st = {}, nodeVersion = process.versions.node, readPrivate = readPrivateFile } = {}) {
   const s = config.settings;
   const problems = validate(config);
   const notes = [];
@@ -75,14 +75,15 @@ export async function checkSetup(config, { run = runChild, st = {}, nodeVersion 
   if (wd) problems.push(wd);
   else notes.push(`work-dir ${s['work-dir']}: fine`);
   if (s.database === 'pg') {
-    const c = checkConninfoFile(s['conninfo-file'], st.conninfo);
-    if (c) problems.push(c);
-    else {
+    // (read once, the checks made on its descriptor; a text that does not parse, or asks for sslmode allow / prefer to another host, is a problem: the start refuses it)
+    let text;
+    try { text = readPrivate(s['conninfo-file'], { program: 'karidns-signer' }); } catch (e) { problems.push(e.message); }
+    if (text !== undefined) {
       notes.push(`conninfo-file ${s['conninfo-file']}: fine`);
       try {
-        const w = plaintextWarning(parseConninfo(readFile(s['conninfo-file'], 'utf8'), 'karidns-signer'));
+        const w = plaintextWarning(parseConninfo(text, 'karidns-signer'));
         if (w) warnings.push(w);
-      } catch { /* (a file that cannot be read or parsed is the start's problem to tell) */ }
+      } catch (e) { problems.push(`conninfo-file ${s['conninfo-file']}: ${e.message}`); }
     }
   } else {
     if ((nodeVersion.split('.').map(Number)[0] ?? 0) < 22) problems.push(`database = sqlite3 needs Node 22.13 or newer (this is ${nodeVersion})`);
@@ -115,7 +116,7 @@ export async function checkSetup(config, { run = runChild, st = {}, nodeVersion 
   return { problems, notes, warnings };
 }
 
-export async function openDb(config, { onFatal, warn, importPg, importSqlite = loadSqlite, readFile = fs.readFileSync, checkConninfo = checkConninfoFile, statSqlite } = {}) {
+export async function openDb(config, { onFatal, warn, importPg, importSqlite = loadSqlite, readPrivate = readPrivateFile, statSqlite } = {}) {
   const s = config.settings;
   let db;
   if (s.database === 'sqlite3') {
@@ -124,11 +125,10 @@ export async function openDb(config, { onFatal, warn, importPg, importSqlite = l
     db = new SqliteDb({ file: s['sqlite-file'], sqlite: await importSqlite() });
     db.open();
   } else {
-    const problem = checkConninfo(s['conninfo-file']);
-    if (problem) throw new Error(problem);
+    const text = readPrivate(s['conninfo-file'], { program: 'karidns-signer' });        // (throws the reason: a link, another owner, a wider mode)
     const pg = await (importPg ? importPg() : import('pg'));
     const Client = pg.Client ?? pg.default.Client;
-    const conn = parseConninfo(readFile(s['conninfo-file'], 'utf8'), 'karidns-signer');
+    const conn = parseConninfo(text, 'karidns-signer');
     const w = plaintextWarning(conn);
     if (w) warn?.(w);
     db = new PgDb({ Client, conn, schema: s.schema, onFatal });

@@ -1,4 +1,4 @@
-.TH KARIDNS\-ZONE 8 "2026-11-14" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-ZONE 8 "2026-11-15" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-zone.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-zone \- writes a zone file into a PowerDNS 5.1 database (\fBimport\fR)
@@ -80,6 +80,32 @@ Commits. The triggers of \fBdb/karidns_ext.*.sql\fR write the change to
 zone up by itself; \fB\-\-reload\fR also adds a row to
 \fBkaridns_reload_requests\fR (PostgreSQL), and otherwise \fBkarictl reload\fR
 does it.
+.IP 6. 4
+PostgreSQL: once the commits of the run (\fBimport\fR, \fBimport \-\-all\fR,
+\fBimport \-\-signer\fR and \fBapply\fR; not a dry run) wrote or removed \fB1000
+records or more\fR in total since the last attempt (one large zone, or many
+small ones), refreshes the planner statistics of \fBrecords\fR outside the
+transaction if they are stale, so that the planner knows the new rows at once (a
+table filled in bulk has none until autovacuum's first analyze, and the
+WebAdmin's RRset queries are slow until then). Stale means: the table was never
+analyzed (\fBlast_analyze\fR and \fBlast_autoanalyze\fR of
+\fBpg_stat_user_tables\fR are empty), or the rows changed since the last analyze
+reach autovacuum's default trigger, 50 plus 10 % of the table
+(\fBn_mod_since_analyze\fR, or the run's own count when that is larger);
+autovacuum would analyze soon then, and this closes the window. Fresh statistics
+are left alone without a message, so a re-sign of one zone does not analyze a
+table of millions of rows again. It runs \fBANALYZE (SKIP_LOCKED) records\fR: it
+does not wait for a VACUUM or ANALYZE of another session (often autovacuum), and
+so never queues behind or cancels one; such a skip is the info line
+\fBdb.import.analyze\-skipped\fR. A refresh is the info line \fBstatistics of
+records refreshed (ANALYZE)\fR (\fBdb.import.analyze\fR). The role must own
+\fBrecords\fR, or have \fBMAINTAIN\fR on it on PostgreSQL 17 and later (the role
+scripts grant it: \fBkaridns\-dbloader(8)\fR); otherwise nothing is run and an
+info line says once per run that the role may not ANALYZE records and autovacuum
+refreshes the statistics later (\fBdb.import.analyze\-denied\fR). A failed
+\fBANALYZE\fR is the warning \fBdb.import.analyze\-failed\fR: the import is
+committed and the exit status is that of the import. Every attempt starts the
+count again. SQLite3 does nothing here.
 .PP
 The type of an existing zone (\fBdomains.type\fR) is never changed; a new zone
 is \fBNATIVE\fR (what \fBpdnsutil load\-zone\fR creates), or \fBMASTER\fR with

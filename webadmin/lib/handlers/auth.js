@@ -5,7 +5,7 @@ import { ApiError, forbidden, notFound, conflict } from '../errors.js';
 import { shape, query, LIMIT, CURSOR } from '../validate.js';
 import * as S from '../store.js';
 import { hashPassword, verifyPassword, totpVerify, wrapSecret, unwrapSecret, base32, otpauthUri, randomToken, tokenText, tokenHash } from '../crypto.js';
-import { newSession, cookieHeader, needsTotp, mayHaveSession } from '../session.js';
+import { newSession, cookieHeader, needsTotp, mayHaveSession, idleSeconds } from '../session.js';
 import { reply } from '../http.js';
 import { isGlobal } from '../perm.js';
 import { absolute } from '../names.js';
@@ -126,9 +126,32 @@ export async function me(ctx) {
     grants: auth.grants.map((g) => grantView(app, g)),
     capabilities: { global, manage_principals: global, manage_policies: global, create_zones: global, grant_on: grantable },
     session: auth.kind === 'session'
-      ? { csrf: auth.csrf, totp_ok: auth.totpOk, ...(step ? { totp_step: step } : {}), expires_at: new Date(auth.sessionExpires).toISOString(), idle_timeout: app.settings['session-idle'] }
+      ? { csrf: auth.csrf, totp_ok: auth.totpOk, ...(step ? { totp_step: step } : {}), expires_at: new Date(auth.sessionExpires).toISOString(), ...idleView(app, auth.idleChoice) }
       : { token: true, read_only: auth.readOnly },
   };
+}
+
+// the idle time of the person's sessions: the one in force (idle_timeout), what the person chose (null: the service's) and the longest it may choose (session-idle)
+const idleView = (app, choice) => ({ idle_timeout: idleSeconds(app.settings, choice), idle_timeout_choice: choice, idle_timeout_max: app.settings['session-idle'] });
+
+const IDLE_MIN = 60;
+
+// PUT /auth/idle-timeout {"idle_timeout": seconds | null}: the person signs out after a shorter time without a request than the service's session-idle (null: the
+// service's again).  Its own row only (the policies of preferences); 60 seconds to session-idle.  A value above a later, lower session-idle gives way to it.
+export async function idleTimeout(ctx) {
+  const { app, auth } = ctx;
+  const max = app.settings['session-idle'];
+  const body = shape(ctx.body, { idle_timeout: { type: 'int', required: true, nullable: true, min: IDLE_MIN } });
+  const v = body.idle_timeout;
+  if (v !== null && v > max) {
+    throw new ApiError(400, 'bad-request', `/idle_timeout: at most the service's session-idle (${max} seconds)`, { errors: [{ code: 'bad-request', severity: 'error', text: `at most ${max} seconds`, pointer: '/idle_timeout' }] });
+  }
+  // (last_seen is moved with it: it is written only every quarter of the old idle time, so a much shorter new one could end the session at the next request)
+  await ctx.db(async (tx) => {
+    await S.setIdleTimeout(tx, auth.principal.id, v);
+    await S.touchSession(tx, auth.idHash, app.now());
+  }, { write: true });
+  return idleView(app, v);
 }
 
 // A password check for the actions that ask for it again (disable TOTP, change the password).  It is a way to guess the password for whoever holds the session, so it

@@ -6,6 +6,11 @@ import { enc } from './api.js';
 // the types a zone's signer makes; a change set never takes them (D-SIGNER).  The list of lib/perm.js.
 export const DNSSEC_TYPES = new Set(['RRSIG', 'NSEC', 'NSEC3', 'NSEC3PARAM', 'DNSKEY', 'CDS', 'CDNSKEY']);
 
+// T-2: the two kinds of a primary zone, whose names (PowerDNS's) do not say what they are.  KariDNS serves both the same way (the records table); for PowerDNS on
+// the same database NATIVE is copied by the database's replication, MASTER is sent with NOTIFY and AXFR.  -> the label of a kind (its value is the name).
+export const PRIMARY_KINDS = ['NATIVE', 'MASTER'];
+export const kindLabel = (t, kind) => (PRIMARY_KINDS.includes(kind) ? t(`kind.${kind.toLowerCase()}`) : kind);
+
 export const stripDot = (n) => String(n).replace(/\.$/, '');
 export const lower = (n) => String(n).toLowerCase();
 
