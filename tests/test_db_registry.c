@@ -3002,9 +3002,13 @@ static void test_entry_core_ext(void) {
 /* ---- 0.7 store S5 (design 6.7): the texts of rejected zones are in a bounded ring, not in the zone's element ---- */
 static int g_sink_put, g_sink_get, g_sink_clear;
 static uint32_t g_sink_zid;
-static void sink_put(uint32_t zid, const char *text) { g_sink_put++; g_sink_zid = zid; (void)text; }
-static bool sink_get(uint32_t zid, char *out, size_t cap) {
+static uint32_t g_sink_tag;
+static uint64_t g_sink_stamp, g_sink_get_stamp;
+static void sink_put(uint32_t zid, uint32_t tag, uint64_t stamp, const char *text) { g_sink_put++; g_sink_zid = zid; g_sink_tag = tag; g_sink_stamp = stamp; (void)text; }
+static bool sink_get(uint32_t zid, uint32_t tag, uint64_t stamp, char *out, size_t cap) {
     g_sink_get++;
+    g_sink_get_stamp = stamp;
+    (void)tag;
     if (zid != 4242) return false;
     snprintf(out, cap, "%s", "from the err.ring file");
     return true;
@@ -3076,6 +3080,13 @@ static void test_error_ring(void) {
     CHECK(!dbreg_err_get("default", "gone.test.", 0xFFFFFFFFu, out, sizeof(out)));                                                           /* (no id: no sink) */
     dbreg_err_note("default", "s.test.", 77, NULL);
     CHECK(g_sink_clear == 1 && g_sink_zid == 77);
+    /* the sink gets the name's tag and the stamp of the record with the text, and is asked with the stamp the reader has */
+    dbreg_err_note_st("default", "t.test.", 78, 0x1234, "stamped");
+    CHECK(g_sink_put == 2 && g_sink_zid == 78 && g_sink_stamp == 0x1234 && g_sink_tag != 0 && g_sink_tag <= 0xFFFFFFu);
+    const uint32_t tag_t = g_sink_tag;
+    dbreg_err_note_st("other", "t.test.", 78, 0x1234, "another view");
+    CHECK(g_sink_tag != tag_t);                                                                    /* (the tag is the name of the view and the zone) */
+    CHECK(dbreg_err_get_st("default", "nope.test.", 4242, 0x77, out, sizeof(out)) && g_sink_get_stamp == 0x77);
     dbreg_err_reset_for_test();
 }
 

@@ -4828,7 +4828,7 @@ static bool status_cb(void *ud, const char *view, const dbreg_zone_t *z) {
                                        ? " (the data is out of memory: it is read when a query needs it)" : " (no version loaded)");
   {
     char errtxt[192];
-    if (dbreg_err_get(view, z->name, (z->kind & ZDIR_K_STORED) ? z->zid : 0xFFFFFFFFu, errtxt, sizeof(errtxt))) st_append(c, ", last error: %s", errtxt);
+    if (dbreg_err_get_locked(view, z->name, (z->kind & ZDIR_K_STORED) ? z->zid : 0xFFFFFFFFu, errtxt, sizeof(errtxt))) st_append(c, ", last error: %s", errtxt);
   }
   if (zdir_entry(z) && atomic_load_explicit(&zdir_entry(z)->rolled_back, memory_order_acquire))
     st_append(c, " (rolled back: serial %u, from %u; pinned in memory until the next load from the database)", atomic_load_explicit(&zone_xr(zdir_entry(z))->rb_serial, memory_order_relaxed),

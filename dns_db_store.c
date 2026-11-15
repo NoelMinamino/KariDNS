@@ -1029,14 +1029,16 @@ static uint64_t dir_counters(int what) {
 }
 
 /* design 6.7: the texts of rejected zones, by zone id, in err.ring of the store (dbreg_err_set_sink(), dns_server_internal.h) */
-static void err_sink_put(uint32_t zid, const char *text) {
+static void err_sink_put(uint32_t zid, uint32_t tag, uint64_t stamp, const char *text) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
-  if (st && zid != STORE_NONE) (void)store_err_put(st, zid, 0, text);
+  if (st && zid != STORE_NONE) (void)store_err_put(st, zid, tag, stamp, text);
 }
-static bool err_sink_get(uint32_t zid, char *out, size_t cap) {
+/* a zone id is reused after a delete (and a text can be left from before a crash): the text is the zone's only when the name tag and the version stamp are the ones it was put with */
+static bool err_sink_get(uint32_t zid, uint32_t tag, uint64_t stamp, char *out, size_t cap) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   store_err_t e;
   if (!st || zid == STORE_NONE || !cap || store_err_get(st, zid, &e) != 0) return false;
+  if (e.tag != (tag & 0xFFFFFFu) || e.stamp_gen != stamp) return false;
   snprintf(out, cap, "%s", e.text);
   return true;
 }
@@ -1439,6 +1441,16 @@ static void *attach_thread(void *arg) {
 
 static void evict_hook(int reason) {
   store_status_note_detach_why(reason == DBREG_EVICT_LIMIT ? STORE_DET_LIMIT : reason == DBREG_EVICT_ROOM ? STORE_DET_ROOM : STORE_DET_OTHER);
+}
+
+/* The scrub or the cleaner found the image of a zone damaged and made the zone KNOWN in the store (the tick calls this with no lock of the store held): a zone that is attached in MAP mode serves the damaged
+ * pages.  It is taken out of memory (the record is KNOWN: the next query reads it from the database again).  A zone whose data is a copy or was built from a body (a fetch, an UPDATE) is not affected. */
+static bool image_is_store_map(const zone_version_t *v) {
+  return v && v->image_free == imgref_free && v->image_ref && ((const imgref_t *)v->image_ref)->img.priv_ == NULL;       /* (COPY: a private buffer, which the damage does not reach) */
+}
+static int bad_image_hook(uint32_t zid, void *ud) {
+  (void)ud;
+  return dbreg_store_image_lost(zid, image_is_store_map);
 }
 
 static bool attached_fn(uint32_t zid) { return dir_attach_get(zid) != NULL; }
@@ -2330,6 +2342,7 @@ bool db_store_start(const server_config_t *cfg) {
   o.scrub_interval_s = db->store_scrub_interval;             /* 0.7 S6 (WP9): the scrub of the store: its interval, and the structure check it makes of every image it reads */
   o.seg_size = db->store_segment_size;                       /* (0 = 256 MiB) */
   o.validate = zone_image_validate;
+  o.bad_image = bad_image_hook;                             /* a zone whose image the scrub or the cleaner found damaged is taken out of memory */
   o.create = true;
   o.log = store_log_cb;
   store_t *st = NULL;

@@ -122,6 +122,11 @@ typedef struct store_opts {
   /* the structure check of an image (zone_image_validate()); the scrub calls it for every image it reads.  NULL = the checksum only. */
   int    (*validate)(const void *image, size_t len, char *why, size_t whylen);
   bool     no_readahead;          /* do not start the thread that reads zt into memory after the open (tests) */
+  /* The scrub and the cleaner make the zone of a damaged image KNOWN in the store; a zone that is attached in memory (MAP mode: its image is the mapped pages) keeps serving them.  The zone id is
+   * queued under the writer mutex and handed to this function by the tick (and at the end of a scrub pass or a compact call) with no lock of the store held: ud is bad_image_ctx.  It returns 0 (done, or
+   * nothing to do) or 1 (not now: asked again at the next tick, a bounded number of times).  NULL: nothing is queued. */
+  int    (*bad_image)(uint32_t zid, void *ud);
+  void    *bad_image_ctx;
 } store_opts_t;
 
 /* defaults of every field above (mode AUTO, create false, ...) */
@@ -420,12 +425,14 @@ void store_scrub_stop(store_t *s);
 typedef struct store_err {
   uint64_t seq;                          /* 1, 2, 3 ... in the order they were put */
   uint32_t zid;
+  uint32_t tag;                          /* 24 bits the caller chose (a hash of the zone's name): a zone id is reused after a delete, and the caller compares the tag before it shows the text */
   uint64_t stamp_gen;
   uint64_t time;                         /* unix time */
   char     text[STORE_ERR_TEXT];
 } store_err_t;
-int  store_err_put(store_t *s, uint32_t zid, uint64_t stamp_gen, const char *text);
-/* the newest entry of the zone id that is still in the ring: 0, or -ENOENT (none, or it was overwritten).  O(STORE_ERR_ENTRIES) in the worst case (a scan from the newest entry back). */
+int  store_err_put(store_t *s, uint32_t zid, uint32_t tag, uint64_t stamp_gen, const char *text);
+/* the newest entry of the zone id that is still in the ring: 0, or -ENOENT (none, or it was overwritten).  O(1): a table of the zone ids that have an entry (made from the ring at the open), no scan;
+ * the ring's own mutex is the only lock it takes, so the caller may hold any other.  A delete of the zone id forgets its text (store_delete()). */
 int  store_err_get(const store_t *s, uint32_t zid, store_err_t *out);
 /* forget the zone's text (a version of the zone was registered): a later store_err_get() of the zone id says -ENOENT until a new text is put (a record with an empty text hides the older ones) */
 int  store_err_clear(store_t *s, uint32_t zid);
@@ -463,6 +470,8 @@ extern int64_t (*store_test_fs_free)(void);
 extern int (*store_test_append_fault)(uint64_t reclen);
 /* called at the start of every slice of the cleaner (writer mutex held) with the segment it is emptying: a test takes a reference of an image there (store_image_read does not need the mutex) */
 extern void (*store_test_cleaner_step)(store_t *s, uint32_t victim);
+/* called by the read-ahead thread before every page it reads (NULL = off): a test makes the read-ahead slow, and shows that store_close() waits for it */
+extern void (*store_test_ra_page)(void);
 uint64_t store_test_siphash(unsigned c, unsigned d, const uint8_t key[16], const uint8_t *in, size_t len);
 uint32_t store_test_crc32c(uint32_t crc, const void *p, size_t n);
 uint64_t store_test_sum64(const void *p, size_t n);

@@ -3302,7 +3302,7 @@ typedef struct { store_t *s; _Atomic int stop; _Atomic long bad; } errc_t;
 static void *err_writer(void *a) {
   errc_t *c = a;
   char t[64];
-  for (uint32_t k = 0; k < 20000; k++) { snprintf(t, sizeof(t), "text %u", k); store_err_put(c->s, k % 50, k, t); }
+  for (uint32_t k = 0; k < 20000; k++) { snprintf(t, sizeof(t), "text %u", k); store_err_put(c->s, k % 50, 0, k, t); }
   atomic_store(&c->stop, 1);
   return NULL;
 }
@@ -3332,9 +3332,9 @@ static void test_err_ring(void) {
   store_view_add(s, "default");
   store_err_t e;
   CHECK_EQ(store_err_get(s, 7, &e), -ENOENT);
-  CHECK_EQ(store_err_put(s, 7, 11, "the body of zone 7 was refused: a record is not valid"), 0);
-  CHECK_EQ(store_err_put(s, 8, 12, "another"), 0);
-  CHECK_EQ(store_err_put(s, 7, 13, "newer text for 7"), 0);
+  CHECK_EQ(store_err_put(s, 7, 0, 11, "the body of zone 7 was refused: a record is not valid"), 0);
+  CHECK_EQ(store_err_put(s, 8, 0, 12, "another"), 0);
+  CHECK_EQ(store_err_put(s, 7, 0, 13, "newer text for 7"), 0);
   CHECK_EQ(store_err_get(s, 7, &e), 0);
   CHECK(e.zid == 7 && e.stamp_gen == 13 && strcmp(e.text, "newer text for 7") == 0 && e.seq == 3 && e.time > 1000000000ull);
   CHECK_EQ(store_err_get(s, 8, &e), 0);
@@ -3342,7 +3342,7 @@ static void test_err_ring(void) {
   char longt[400];
   memset(longt, 'x', sizeof(longt) - 1);
   longt[sizeof(longt) - 1] = 0;
-  CHECK_EQ(store_err_put(s, 9, 1, longt), 0);
+  CHECK_EQ(store_err_put(s, 9, 0, 1, longt), 0);
   CHECK_EQ(store_err_get(s, 9, &e), 0);
   CHECK_EQ(strlen(e.text), STORE_ERR_TEXT - 1);                          /* cut, NUL-terminated */
   CHECK_EQ(store_err_total(s), 4);
@@ -3350,7 +3350,7 @@ static void test_err_ring(void) {
   store_stats(s, &st);
   CHECK_EQ(st.err_total, 4);
   /* the ring wraps: after 70000 more texts the first ones are gone, the last 65536 are there */
-  for (uint32_t k = 0; k < 70000; k++) { char t[40]; snprintf(t, sizeof(t), "w%u", k); CHECK_EQ(store_err_put(s, 1000 + k % 7, k, t), 0); }
+  for (uint32_t k = 0; k < 70000; k++) { char t[40]; snprintf(t, sizeof(t), "w%u", k); CHECK_EQ(store_err_put(s, 1000 + k % 7, 0, k, t), 0); }
   CHECK_EQ(store_err_get(s, 8, &e), -ENOENT);
   CHECK_EQ(store_err_get(s, 1000 + 69999 % 7, &e), 0);
   CHECK(e.stamp_gen == 69999);
@@ -3359,14 +3359,14 @@ static void test_err_ring(void) {
   uint64_t before_clear = store_err_total(s);
   CHECK_EQ(store_err_clear(s, 424242), 0);
   CHECK_EQ(store_err_total(s), before_clear);
-  CHECK_EQ(store_err_put(s, 31, 1, "text of 31"), 0);
+  CHECK_EQ(store_err_put(s, 31, 0, 1, "text of 31"), 0);
   CHECK_EQ(store_err_get(s, 31, &e), 0);
   CHECK_EQ(store_err_clear(s, 31), 0);
   CHECK_EQ(store_err_get(s, 31, &e), -ENOENT);
-  CHECK_EQ(store_err_put(s, 31, 2, "again"), 0);
+  CHECK_EQ(store_err_put(s, 31, 0, 2, "again"), 0);
   CHECK_EQ(store_err_get(s, 31, &e), 0);
   CHECK(strcmp(e.text, "again") == 0 && e.stamp_gen == 2);
-  CHECK_EQ(store_err_put(s, 32, 3, "text of 32, cleared after the restart"), 0);
+  CHECK_EQ(store_err_put(s, 32, 0, 3, "text of 32, cleared after the restart"), 0);
   CHECK_EQ(store_close(s), 0);
   /* it survives a clean close and an open */
   o.create = false;
@@ -3377,10 +3377,12 @@ static void test_err_ring(void) {
     CHECK_EQ(store_err_get(s, 32, &e), 0);
     CHECK_EQ(store_err_clear(s, 32), 0);                                  /* (the bitmap of zones with texts is made again at the open) */
     CHECK_EQ(store_err_get(s, 32, &e), -ENOENT);
-    CHECK_EQ(store_err_put(s, 5, 5, "after the reopen"), 0);
+    CHECK_EQ(store_err_put(s, 5, 0, 5, "after the reopen"), 0);
     CHECK_EQ(store_err_get(s, 5, &e), 0);
     CHECK(e.seq > 70005);
-    /* a writer and readers at once (TSan) */
+    /* a writer and readers at once (TSan); the zone ids the readers look at have no text of the earlier steps (a lookup is not slow any more: the readers see them at once) */
+    CHECK_EQ(store_err_clear(s, 5), 0);
+    CHECK_EQ(store_err_clear(s, 31), 0);
     errc_t c;
     memset(&c, 0, sizeof(c));
     c.s = s;
@@ -3551,6 +3553,229 @@ static void test_open_bench(uint64_t n) {
   tdir_free(&d);
 }
 
+/* ---- the review of S5 + S6 (2026-11-15): the err.ring lookup is not a scan (M1), a text has the tag of its zone and a delete forgets it (L1), a zone of a damaged image is told to its owner (M2),
+ *      the close waits for the read-ahead (L4) ---- */
+
+static double mono_s(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static void test_err_index(void) {
+  printf("[err.ring: a lookup is a table, not a scan; the tag and the stamp of a text; a delete forgets the text]\n");
+  tdir_t d;
+  tdir_new(&d, "errix");
+  store_opts_t o;
+  small_opts(&o);
+  o.scrub_interval_s = UINT32_MAX;
+  o.no_readahead = true;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  store_err_t e;
+  CHECK_EQ(store_err_put(s, 40, 0xABCDEF, 77, "tagged"), 0);
+  CHECK_EQ(store_err_put(s, 41, 0x1FFFFFF, 78, "the tag has 24 bits"), 0);
+  CHECK_EQ(store_err_get(s, 40, &e), 0);
+  CHECK(e.tag == 0xABCDEF && e.stamp_gen == 77 && strcmp(e.text, "tagged") == 0);
+  CHECK_EQ(store_err_get(s, 41, &e), 0);
+  CHECK(e.tag == 0xFFFFFF);
+  /* a ring of distinct zone ids that has wrapped: the lookups of zone ids that have no text, and of the oldest and the newest ones, are not scans (before: 65536 entries read for every miss) */
+  enum { N = 70000 };
+  for (uint32_t k = 0; k < N; k++) CHECK_EQ(store_err_put(s, 100000 + k, k & 0xFFFFFF, k, "x"), 0);
+  double t0 = mono_s();
+  long bad = 0;
+  for (uint32_t i = 0; i < 20000; i++)
+    if (store_err_get(s, 5000000 + i, &e) != -ENOENT) bad++;
+  for (uint32_t k = N - 2000; k < N; k++)
+    if (store_err_get(s, 100000 + k, &e) != 0 || e.stamp_gen != k || e.tag != (k & 0xFFFFFF)) bad++;
+  double dt = mono_s() - t0;
+  CHECK_EQ(bad, 0);
+  printf("  22000 lookups: %.3f s\n", dt);
+  CHECK(dt < 1.0);
+  CHECK_EQ(store_err_get(s, 100000 + (N - 65536) - 1, &e), -ENOENT);                       /* (the ring wrapped over it) */
+  CHECK_EQ(store_err_get(s, 100000 + (N - 65536), &e), 0);
+  CHECK_EQ(store_err_get(s, 40, &e), -ENOENT);
+  /* one zone id with many texts: the newest, and the others are not hidden by the chain */
+  for (uint32_t k = 0; k < 3000; k++) { char t[32]; snprintf(t, sizeof(t), "t%u", k); CHECK_EQ(store_err_put(s, 7, 7, 900000 + k, t), 0); }
+  CHECK_EQ(store_err_get(s, 7, &e), 0);
+  CHECK(e.stamp_gen == 902999 && strcmp(e.text, "t2999") == 0);
+  CHECK_EQ(store_err_get(s, 100000 + N - 1, &e), 0);
+  /* a delete of the zone forgets its text: the id is reused, and the text must not show under the next zone that gets it */
+  uint32_t zid = STORE_NONE, zid2 = STORE_NONE;
+  CHECK_EQ(put_i(s, 0, 1, 1, &zid), 0);
+  CHECK_EQ(store_err_put(s, zid, 5, 1, "the body of the zone was refused"), 0);
+  CHECK_EQ(store_err_get(s, zid, &e), 0);
+  CHECK_EQ(store_delete(s, zid), 0);
+  CHECK_EQ(store_err_get(s, zid, &e), -ENOENT);                                            /* (before: the text stayed for the zone that got the id) */
+  CHECK_EQ(put_i(s, 0, 2, 1, &zid2), 0);
+  CHECK_EQ(store_err_get(s, zid2, &e), -ENOENT);
+  CHECK_EQ(store_err_put(s, zid2, 6, 2, "text of the second zone"), 0);
+  char nm[160];
+  name_of(2, nm, sizeof(nm));
+  CHECK_EQ(store_delete_name(s, 0, nm, strlen(nm)), 0);                                    /* (the other way to delete) */
+  CHECK_EQ(store_err_get(s, zid2, &e), -ENOENT);
+  CHECK_EQ(store_close(s), 0);
+  /* the cleared state is in the file: the open makes the table from the ring, newest entry first wins */
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    CHECK_EQ(store_err_get(s, zid, &e), -ENOENT);
+    CHECK_EQ(store_err_get(s, zid2, &e), -ENOENT);
+    CHECK_EQ(store_err_get(s, 7, &e), 0);
+    CHECK(e.stamp_gen == 902999 && e.tag == 7);
+    CHECK_EQ(store_err_get(s, 100000 + N - 1, &e), 0);
+    CHECK(e.stamp_gen == N - 1);
+    CHECK_EQ(store_err_get(s, 100000 + (N - 65536) - 1, &e), -ENOENT);
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
+static int g_bad_calls, g_bad_tries_ret;
+static uint32_t g_bad_zid[64];
+static store_t *g_bad_store;
+static int bad_image_hook(uint32_t zid, void *ud) {
+  (void)ud;
+  if (g_bad_calls < 64) g_bad_zid[g_bad_calls] = zid;
+  g_bad_calls++;
+  (void)store_commit(g_bad_store);                      /* (the writer mutex: nothing of the store is held when the hook is called, or this would never return) */
+  return g_bad_tries_ret > 0 ? (g_bad_tries_ret--, 1) : 0;
+}
+
+static void test_bad_image_hook(void) {
+  printf("[a damaged image is told to the owner by the tick, with no lock held: the scrub and the cleaner]\n");
+  tdir_t d;
+  tdir_new(&d, "badimg");
+  store_opts_t o;
+  small_opts(&o);
+  o.mode = STORE_MODE_MAP;
+  o.scrub_interval_s = UINT32_MAX;
+  o.no_readahead = true;
+  o.bad_image = bad_image_hook;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  g_bad_store = s;
+  store_view_add(s, "default");
+  for (uint32_t i = 0; i < 40; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  CHECK_EQ(store_commit(s), 0);
+  store_zone_t zi;
+  uint32_t za = find_i(s, 0, 20);
+  CHECK_EQ(store_zone_get(s, za, &zi), 0);
+  char p[700], nm[32];
+  snprintf(nm, sizeof(nm), "seg.%u", (unsigned)(zi.loc >> 36));
+  fpath(&d, nm, p, sizeof(p));
+  flip_byte(p, (off_t)((zi.loc & ((1ull << 36) - 1)) * 64 + 64 + 32 + 21));
+  g_bad_calls = 0;
+  g_bad_tries_ret = 1;                                                     /* (the owner says "not now" once: the tick asks again) */
+  store_scrub_report_t rep;
+  CHECK_EQ(store_scrub_run(s, &rep), 0);
+  CHECK_EQ(rep.bad_images, 1);
+  CHECK_EQ(g_bad_calls, 1);
+  CHECK(g_bad_zid[0] == za);
+  CHECK(store_zone_get(s, za, &zi) == 0 && zi.state == STORE_STATE_KNOWN);
+  CHECK_EQ(store_tick(s), 0);
+  CHECK_EQ(g_bad_calls, 2);                                                /* (asked again) */
+  CHECK(g_bad_zid[1] == za);
+  CHECK_EQ(store_tick(s), 0);
+  CHECK_EQ(g_bad_calls, 2);                                                /* (done: not asked again) */
+  CHECK_EQ(store_scrub_run(s, &rep), 0);
+  CHECK_EQ(g_bad_calls, 2);                                                /* (a KNOWN zone has no image to find damaged) */
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+
+  /* the cleaner: a record that fails its checksum when it is moved makes the zone KNOWN, and the owner is told */
+  tdir_new(&d, "badimgc");
+  small_opts(&o);
+  o.mode = STORE_MODE_MAP;
+  o.seg_size = 64u << 10;
+  o.compact_rate = UINT64_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  o.no_readahead = true;
+  o.bad_image = bad_image_hook;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  g_bad_store = s;
+  store_view_add(s, "default");
+  enum { N = 500 };
+  uint64_t ver[N];
+  memset(ver, 0, sizeof(ver));
+  fill_dead(s, N, ver);
+  CHECK_EQ(store_commit(s), 0);
+  uint32_t damaged[64], nd = 0;
+  for (uint32_t i = 0; i < N && nd < 20; i++) {
+    if (!ver[i] || i % 7 != 1) continue;
+    uint32_t z = find_i(s, 0, i);
+    if (z == STORE_NONE || store_zone_get(s, z, &zi) != 0 || zi.state != STORE_STATE_STORED) continue;
+    snprintf(nm, sizeof(nm), "seg.%u", (unsigned)(zi.loc >> 36));
+    fpath(&d, nm, p, sizeof(p));
+    flip_byte(p, (off_t)((zi.loc & ((1ull << 36) - 1)) * 64 + 64 + 32 + 21));
+    damaged[nd++] = z;
+  }
+  CHECK(nd >= 10);
+  g_bad_calls = 0;
+  g_bad_tries_ret = 0;
+  store_compact_report_t crep, ctot;
+  memset(&ctot, 0, sizeof(ctot));
+  for (int k = 0; k < 40; k++) {
+    CHECK_EQ(store_compact(s, 0, true, &crep), 0);
+    ctot.bad_records += crep.bad_records;
+    if (!crep.moved_records && !crep.segs_freed && !crep.bad_records) break;
+  }
+  CHECK(ctot.bad_records > 0);
+  CHECK_EQ(g_bad_calls, (int)ctot.bad_records);                            /* (each zone the cleaner found damaged was handed over, once) */
+  bool all_listed = true;
+  for (int c = 0; c < g_bad_calls && c < 64; c++) {
+    bool in = false;
+    for (uint32_t k = 0; k < nd; k++) in = in || damaged[k] == g_bad_zid[c];
+    all_listed = all_listed && in && store_zone_get(s, g_bad_zid[c], &zi) == 0 && zi.state == STORE_STATE_KNOWN;
+  }
+  CHECK(all_listed);
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
+static _Atomic int g_ra_calls;
+static void ra_slow_page(void) {
+  atomic_fetch_add(&g_ra_calls, 1);
+  usleep(300000);
+}
+static void test_readahead_close(void) {
+  printf("[the close waits for the read-ahead thread, however slow a page is]\n");
+  tdir_t d;
+  tdir_new(&d, "ra");
+  store_opts_t o;
+  small_opts(&o);
+  o.scrub_interval_s = UINT32_MAX;
+  o.no_readahead = true;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  for (uint32_t i = 0; i < 1600; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);          /* (a table of 25 pages) */
+  CHECK_EQ(store_close(s), 0);
+  o.create = false;
+  o.no_readahead = false;
+  atomic_store(&g_ra_calls, 0);
+  store_test_ra_page = ra_slow_page;                                                  /* (a page that waits for the disk: 0.3 s each, 25 of them) */
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    usleep(100000);
+    double t0 = mono_s();
+    CHECK_EQ(store_close(s), 0);                                                       /* (before: gave up after 5 s with the thread still running over the unmapped table; the stop flag was looked at every 1 MiB) */
+    double dt = mono_s() - t0;
+    const int at_close = atomic_load(&g_ra_calls);
+    usleep(1000000);
+    CHECK_EQ(atomic_load(&g_ra_calls), at_close);                                      /* (the thread is gone when the close returns) */
+    printf("  close %.2f s, %d pages read\n", dt, at_close);
+    CHECK(dt < 2.0 && at_close >= 1 && at_close < 25);
+  }
+  store_test_ra_page = NULL;
+  tdir_free(&d);
+}
+
 int main(void) {
   const char *base = getenv("KARIDNS_STORE_TESTDIR");
   snprintf(g_base, sizeof(g_base), "%s/store_test.%d", base && *base ? base : ".", (int)getpid());
@@ -3594,7 +3819,9 @@ int main(void) {
   if (WANT("space")) { test_space(STORE_MODE_MAP); test_space(STORE_MODE_COPY); test_append_fault(); }
   if (WANT("scrub")) { test_scrub(STORE_MODE_MAP); test_scrub(STORE_MODE_COPY); test_scrub_tick(); }
   if (WANT("opendef")) test_open_defaults();
-  if (WANT("errring")) test_err_ring();
+  if (WANT("errring")) { test_err_ring(); test_err_index(); }
+  if (WANT("badimg")) test_bad_image_hook();
+  if (WANT("raclose")) test_readahead_close();
   if (WANT("smallfs") && getenv("KARIDNS_STORE_SMALLFS")) test_smallfs(getenv("KARIDNS_STORE_SMALLFS"));
   if (WANT("zfs") && getenv("KARIDNS_STORE_ZFS_128K")) test_zfs_dir(getenv("KARIDNS_STORE_ZFS_128K"), true, "128K dataset");
   if (WANT("zfs") && getenv("KARIDNS_STORE_ZFS_16K")) test_zfs_dir(getenv("KARIDNS_STORE_ZFS_16K"), false, "16K dataset");

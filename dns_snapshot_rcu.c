@@ -2889,6 +2889,7 @@ zone_rollback_result_t zone_rollback(zone_db_entry_t *entry, bool local, uint32_
   atomic_store_explicit(&entry->rolled_back, true, memory_order_release);
   if (entry->source == ZONE_SRC_DB) atomic_store_explicit(&entry->updated, true, memory_order_release);   /* like an UPDATE: only the memory has it; the cache manager does not take the zone out until the database's data change */
   pthread_mutex_unlock(&entry->writer_lock);
+  dbreg_pin_changed(entry);                                   /* (it is pinned now, with the bytes of the version that was rolled back to: the pinned total) */
   if (!local) notify_request_send(entry);
   if (new_serial) *new_serial = ns;
   if (from_serial) *from_serial = from;
@@ -3025,6 +3026,7 @@ static _Atomic uint64_t g_next_flags;       /* how many times an element was mar
 static uint32_t g_enext[CACHE_ENEXT_MAX];
 static size_t g_enext_n;
 static uint64_t g_stored_pinned;                /* the bytes of the pinned zones of the store (z->pin_charge); the registry lock */
+static _Atomic uint64_t g_cache_pinned_bytes;   /* the pinned bytes the hard line and the statistics read: g_stored_pinned with the store, the walk's sum of a cycle without it */
 static void cache_note_next(const dbreg_zone_t *z) {
     atomic_store_explicit(&g_evict_next_hint, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_next_flags, 1, memory_order_relaxed);
@@ -3217,6 +3219,8 @@ static struct {
     uint64_t folded, topk_replaced;
 } g_fold;
 
+static _Atomic uint64_t g_fold_seq;      /* counts the folds (fold_entry_locked(), the registry lock held): a reader that walks the attach table without the lock and adds the folded totals to what it found asks whether one happened meanwhile */
+
 static void fold_min_locked(void) {
     uint64_t m = UINT64_MAX;
     for (size_t i = 0; i < g_fold.n; i++)
@@ -3225,6 +3229,7 @@ static void fold_min_locked(void) {
 }
 
 static void fold_entry_locked(dbreg_view_t *rv, const char *zname, const zone_db_entry_t *e, bool topk) {
+    atomic_fetch_add_explicit(&g_fold_seq, 1, memory_order_acq_rel);          /* (before the counters move: the step that follows, the removal from the attach table or the new entry, is in the same hold of the lock) */
     uint64_t c[ZCTR_N];
     for (int k = 0; k < ZCTR_N; k++) c[k] = zone_ctr_get(e, k);
     for (int k = 0; k < ZCTR_N; k++) rv->fold[k] += c[k];
@@ -3269,7 +3274,8 @@ static void fold_forget_locked(const dbreg_view_t *rv, const char *zname) {
     }
 }
 
-void dbreg_fold_totals(uint64_t out[ZCTR_N], uint64_t *zones) {
+/* the sum of the folded counters of every view and the sequence number of the folds at that moment (the lock is held, so every fold before it is complete: the zone it folded is out of the attach table) */
+void dbreg_fold_totals_seq(uint64_t out[ZCTR_N], uint64_t *zones, uint64_t *seq) {
     for (int k = 0; k < ZCTR_N; k++) out[k] = 0;
     uint64_t nz = 0;
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
@@ -3277,9 +3283,12 @@ void dbreg_fold_totals(uint64_t out[ZCTR_N], uint64_t *zones) {
         for (int k = 0; k < ZCTR_N; k++) out[k] += g_dbreg_views[v].fold[k];
         nz += g_dbreg_views[v].fold_zones;
     }
+    if (seq) *seq = atomic_load_explicit(&g_fold_seq, memory_order_acquire);
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     if (zones) *zones = nz;
 }
+void dbreg_fold_totals(uint64_t out[ZCTR_N], uint64_t *zones) { dbreg_fold_totals_seq(out, zones, NULL); }
+uint64_t dbreg_fold_seq(void) { return atomic_load_explicit(&g_fold_seq, memory_order_acquire); }
 
 bool dbreg_fold_view_totals(const char *view, uint64_t out[ZCTR_N], uint64_t *zones) {
     for (int k = 0; k < ZCTR_N; k++) out[k] = 0;
@@ -3332,6 +3341,7 @@ static void dbreg_unlink(dbreg_view_t *rv, dbreg_zone_t *z) {
     if (z->pin_charge) {
         g_stored_pinned -= z->pin_charge;
         z->pin_charge = 0;
+        atomic_store_explicit(&g_cache_pinned_bytes, g_stored_pinned, memory_order_relaxed);
     }
     atomic_fetch_add_explicit(&g_walk_unlink_gen, 1, memory_order_relaxed);
     dbreg_zone_t **pp = &rv->tab[z->hash & (rv->nb - 1)];
@@ -3385,7 +3395,8 @@ static inline bool dbreg_zone_known(const dbreg_zone_t *z) {
  * The text of the last rejection of a zone is not kept in a malloc block of the zone's registry element (and a rejected zone of the store has no element at all): it goes to a ring of DBREG_ERR_SLOTS slots in
  * the process (static, so that a server with no rejections never touches the pages), one slot for a (view, zone), found by a hash index.  A zone's text is replaced by its next rejection and removed when a
  * version of the zone is registered; when the ring is full the oldest text goes.  `zonestatus` asks for it by name (dbreg_err_get()).  A store that keeps the ring in a file (err.ring, by zone id) installs
- * its functions with dbreg_err_set_sink(); the memory ring then answers first and the sink behind it.  Its own mutex, the innermost: the functions may be called with the registry lock or without it. */
+ * its functions with dbreg_err_set_sink(); the memory ring then answers first and the sink behind it.  Its own mutex, the innermost: the functions may be called with the registry lock or without it.  The sink is
+ * never called with that mutex held, and a writer of the registry calls the sink's put and clear only after it has released the registry lock (dbreg_err_forget() + dbreg_err_sink_clear()); a sink's get is a lookup, not a scan. */
 #define DBREG_ERR_SLOTS 512
 #define DBREG_ERR_IX 2048                      /* a power of two, more than twice the slots */
 #define DBREG_ERR_TEXT 192
@@ -3406,7 +3417,7 @@ static struct {
     size_t head;                               /* the next slot to take: the oldest */
     _Atomic size_t n;                          /* texts in the ring */
     _Atomic uint64_t noted, dropped;           /* texts written, texts that were pushed out by newer ones */
-    const dbreg_err_sink_t *sink;
+    const dbreg_err_sink_t *_Atomic sink;
 } g_err = { .mu = PTHREAD_MUTEX_INITIALIZER };
 
 static uint32_t err_hash(const char *view, const char *zone) {
@@ -3437,28 +3448,43 @@ static void err_drop_cell_locked(size_t cell) {
     atomic_fetch_sub_explicit(&g_err.n, 1, memory_order_relaxed);
 }
 
-void dbreg_err_set_sink(const dbreg_err_sink_t *sink) {
+void dbreg_err_set_sink(const dbreg_err_sink_t *sink) { atomic_store_explicit(&g_err.sink, sink, memory_order_release); }
+
+/* what the file ring checks a text against: the zone's name (a zone id is reused after a delete) */
+static uint32_t err_tag(const char *view, const char *zone) { return err_hash(view, zone) & 0xFFFFFFu; }
+
+/* Forget the zone's text in the ring in memory (the mutex of the ring only: it may be called with the registry lock held).  true: a sink is installed, and dbreg_err_sink_clear(zid) is to follow
+ * when the caller holds no lock (the file ring is written there). */
+bool dbreg_err_forget(const char *view, const char *zone) {
+    if (!view || !zone) return false;
+    const bool sink = atomic_load_explicit(&g_err.sink, memory_order_acquire) != NULL;
+    if (atomic_load_explicit(&g_err.n, memory_order_relaxed) == 0) return sink;          /* (the common case of a registered version: nothing to forget in memory) */
+    if (strlen(zone) > 255) return sink;
     pthread_mutex_lock(&g_err.mu);
-    g_err.sink = sink;
+    err_ix_init_locked();
+    const size_t cell = err_find_locked(view, zone, err_hash(view, zone));
+    if (cell != DBREG_ERR_IX) err_drop_cell_locked(cell);
     pthread_mutex_unlock(&g_err.mu);
+    return sink;
+}
+void dbreg_err_sink_clear(uint32_t zid) {
+    const dbreg_err_sink_t *sk = atomic_load_explicit(&g_err.sink, memory_order_acquire);
+    if (sk && sk->clear && zid != 0xFFFFFFFFu) sk->clear(zid);
 }
 
-/* the last rejection of the zone: text (NULL: forget the zone's).  zid: the zone's id in the store (a sink keeps its text by id), STORE_NONE / 0xFFFFFFFF when it has none */
-void dbreg_err_note(const char *view, const char *zone, uint32_t zid, const char *text) {
+/* the last rejection of the zone: text (NULL: forget the zone's).  zid: the zone's id in the store (a sink keeps its text by id), STORE_NONE / 0xFFFFFFFF when it has none; stamp: the version stamp of the
+ * zone's record (dbreg_err_stamp()), which the sink keeps with the text and compares at the next read.  The sink is called with no lock of the ring held, and the caller must hold none either. */
+void dbreg_err_note_st(const char *view, const char *zone, uint32_t zid, uint64_t stamp, const char *text) {
     if (!view || !zone) return;
-    if (!text && atomic_load_explicit(&g_err.n, memory_order_relaxed) == 0 && !g_err.sink) return;          /* (the common case of a registered version: nothing to forget) */
+    if (!text) {
+        if (dbreg_err_forget(view, zone)) dbreg_err_sink_clear(zid);
+        return;
+    }
     if (strlen(zone) > 255) return;
     pthread_mutex_lock(&g_err.mu);
     err_ix_init_locked();
     const uint32_t h = err_hash(view, zone);
     size_t cell = err_find_locked(view, zone, h);
-    if (!text) {
-        if (cell != DBREG_ERR_IX) err_drop_cell_locked(cell);
-        const dbreg_err_sink_t *sk = g_err.sink;
-        pthread_mutex_unlock(&g_err.mu);
-        if (sk && sk->clear && zid != 0xFFFFFFFFu) sk->clear(zid);
-        return;
-    }
     dbreg_err_slot_t *sl;
     if (cell != DBREG_ERR_IX) {
         sl = &g_err.slot[g_err.ix[cell]];
@@ -3481,16 +3507,16 @@ void dbreg_err_note(const char *view, const char *zone, uint32_t zid, const char
     }
     snprintf(sl->text, sizeof(sl->text), "%s", text);
     atomic_fetch_add_explicit(&g_err.noted, 1, memory_order_relaxed);
-    const dbreg_err_sink_t *sk = g_err.sink;
     pthread_mutex_unlock(&g_err.mu);
-    if (sk && sk->put && zid != 0xFFFFFFFFu) sk->put(zid, text);
+    const dbreg_err_sink_t *sk = atomic_load_explicit(&g_err.sink, memory_order_acquire);
+    if (sk && sk->put && zid != 0xFFFFFFFFu) sk->put(zid, err_tag(view, zone), stamp, text);
 }
+void dbreg_err_note(const char *view, const char *zone, uint32_t zid, const char *text) { dbreg_err_note_st(view, zone, zid, 0, text); }
 
-bool dbreg_err_get(const char *view, const char *zone, uint32_t zid, char *out, size_t cap) {
+bool dbreg_err_get_st(const char *view, const char *zone, uint32_t zid, uint64_t stamp, char *out, size_t cap) {
     if (!view || !zone || !out || !cap) return false;
     out[0] = '\0';
     bool ok = false;
-    const dbreg_err_sink_t *sk;
     if (atomic_load_explicit(&g_err.n, memory_order_relaxed) != 0 && strlen(zone) <= 255) {
         pthread_mutex_lock(&g_err.mu);
         err_ix_init_locked();
@@ -3501,12 +3527,13 @@ bool dbreg_err_get(const char *view, const char *zone, uint32_t zid, char *out, 
         }
         pthread_mutex_unlock(&g_err.mu);
     }
-    pthread_mutex_lock(&g_err.mu);
-    sk = g_err.sink;
-    pthread_mutex_unlock(&g_err.mu);
-    if (!ok && sk && sk->get && zid != 0xFFFFFFFFu) ok = sk->get(zid, out, cap);
+    const dbreg_err_sink_t *sk = atomic_load_explicit(&g_err.sink, memory_order_acquire);
+    if (!ok && sk && sk->get && zid != 0xFFFFFFFFu) ok = sk->get(zid, err_tag(view, zone), stamp, out, cap);
     return ok;
 }
+bool dbreg_err_get(const char *view, const char *zone, uint32_t zid, char *out, size_t cap) { return dbreg_err_get_st(view, zone, zid, 0, out, cap); }
+/* the version stamp of a record as the file ring keeps it with a text: the text is for that version of the zone, and is not shown for another */
+static uint64_t dbreg_err_stamp(const dbdir_rec_t *r) { return r->stamp_gen ^ (r->stamp_time * 0x9E3779B97F4A7C15ull); }
 
 void dbreg_err_stats(size_t *n, uint64_t *noted, uint64_t *dropped) {
     if (n) *n = atomic_load_explicit(&g_err.n, memory_order_relaxed);
@@ -3522,7 +3549,7 @@ static void dbreg_err_clear_all(void) {
     atomic_store(&g_err.n, 0);
     atomic_store(&g_err.noted, 0);
     atomic_store(&g_err.dropped, 0);
-    g_err.sink = NULL;
+    atomic_store(&g_err.sink, NULL);
     pthread_mutex_unlock(&g_err.mu);
 }
 #ifdef KARIDNS_UNIT_TEST
@@ -3624,6 +3651,31 @@ static zone_ext_shared_t *store_entry_settings(const zone_db_entry_t *e) {
     return dc && dc->ext_shared ? (zone_ext_shared_t *)dc->ext : NULL;
 }
 
+/* The bytes of the zone count in the pinned total (g_stored_pinned, which the hard line and the warning of pinned zones that fill the limit read) when the cache manager never takes it out of memory: a zone
+ * with the `cache pin` setting, and a zone that a dynamic UPDATE or a rollback changed (only the memory has the change: it stays until the database's version replaces it).  The charge is the bytes it holds
+ * now; it is made again at every transition that changes them (the registration of a version, an UPDATE or a rollback: dbreg_pin_changed(), a change of the pin) and given back when the element leaves.  The lock is held. */
+static void pin_charge_set_locked(dbreg_zone_t *z, const zone_db_entry_t *e) {
+    const zone_version_t *cv = e ? atomic_load_explicit(&e->rcu.active, memory_order_acquire) : NULL;
+    const uint64_t cb = e ? (cv && cv->counted ? cv->bytes : 0) + atomic_load_explicit(&e->fixed_charged, memory_order_relaxed) : 0;
+    const bool pinned = e && ((z->flags & ZDIR_F_PIN) || atomic_load_explicit(&e->updated, memory_order_relaxed));
+    const uint32_t np = pinned ? (cb > UINT32_MAX ? UINT32_MAX : (uint32_t)cb) : 0;
+    g_stored_pinned = g_stored_pinned - z->pin_charge + np;
+    z->pin_charge = np;
+    atomic_store_explicit(&g_cache_pinned_bytes, g_stored_pinned, memory_order_relaxed);
+}
+
+/* The zone of the entry was changed by a dynamic UPDATE or a rollback (it is pinned from here on) or grew (the entry's writer lock is not held: the registry's lock is taken here). */
+void dbreg_pin_changed(zone_db_entry_t *e) {
+    if (!e || e->source != ZONE_SRC_DB || !dbdir()) return;
+    rcu_aux_read_lock();                                      /* (the version of the entry is read: a writer may publish another one and retire this one meanwhile) */
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(zone_vname(e), false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, e->domain, zdir_name_hash(e->domain)) : NULL;
+    if (z && (z->kind & ZDIR_K_STORED) && zdir_entry(z) == e) pin_charge_set_locked(z, e);
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    rcu_aux_read_unlock();
+}
+
 /* an element of the registry in the LOADING state for a record of the store: a fetch or an attach is on its way (the lock is held).  NULL: out of memory. */
 static dbreg_zone_t *store_elem_make_locked(dbreg_view_t *rv, const char *view, const char *name, const dbdir_rec_t *rec) {
     const dbdir_ops_t *ops = dbdir();
@@ -3683,6 +3735,8 @@ static int dbreg_commit_store(const char *view, const char *name, zone_db_entry_
         }
     }
     int rc = -1;
+    bool err_sink = false;                                  /* the text of the zone is forgotten in the file ring too: after the lock (dbreg_err_forget()) */
+    uint32_t err_zid = ZREF_NOZID;
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
     const bool sh_cat = !sh_cfg && dbreg_catalog_member_locked(view, name);
     const bool sh = sh_cfg || sh_cat;
@@ -3769,13 +3823,7 @@ static int dbreg_commit_store(const char *view, const char *name, zone_db_entry_
     }
     zdir_elem_sync(z, entry);
     if (pin_keep) z->flags |= ZDIR_F_PIN;                    /* (zdir_elem_sync() makes the flags again, from the entry and its settings: the pin of the failed put is not among them) */
-    {
-        zone_version_t *cv = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
-        const uint64_t cb = (cv && cv->counted ? cv->bytes : 0) + atomic_load_explicit(&entry->fixed_charged, memory_order_relaxed);
-        const uint32_t np = (z->flags & ZDIR_F_PIN) ? (cb > UINT32_MAX ? UINT32_MAX : (uint32_t)cb) : 0;
-        g_stored_pinned = g_stored_pinned - z->pin_charge + np;
-        z->pin_charge = np;
-    }
+    pin_charge_set_locked(z, entry);
     if (!sh) {
         if (!ops->attach_put(z)) syslog(LOG_ERR, "[Store] zone '%s' (view '%s'): the table of attached zones could not take the zone after it had made room (a bug)", name, view);       /* (room was made above: the entry is the element's now and must stay) */
     } else {
@@ -3785,10 +3833,12 @@ static int dbreg_commit_store(const char *view, const char *name, zone_db_entry_
     if (alias_touch) alias_notify();
     if ((z->flags & ZDIR_F_NOTIFY_DUE) || (created && !cur && had_version && old_serial != serial && !sh)) (void)nrn_queue_locked(z, rv->name);
     if (z->flags & ZDIR_F_EVICT_NEXT) cache_note_next(z);
-    dbreg_err_note(rv->name, z->name, (z->kind & ZDIR_K_STORED) ? z->zid : 0xFFFFFFFFu, NULL);
+    err_sink = dbreg_err_forget(rv->name, z->name);
+    err_zid = (z->kind & ZDIR_K_STORED) ? z->zid : ZREF_NOZID;
     rc = 0;
 out:
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    if (err_sink) dbreg_err_sink_clear(err_zid);
     if (shadowed) *shadowed = sh;
     if (created && atomic_load_explicit(&g_cache_limit, memory_order_relaxed)) cache_peak_note();
     return rc;
@@ -3941,6 +3991,8 @@ int dbreg_commit_attach(const char *view, const char *name, zone_db_entry_t *ent
 int dbreg_commit_cold(const char *view, const char *name, int64_t source_id, uint32_t serial, const uint8_t digest[32], zone_ext_shared_t *shared) {
     bool sh_cfg = dbreg_config_shadows(view, name);
     int rc = -1;
+    bool err_sink = false;
+    uint32_t err_zid = ZREF_NOZID;
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
     bool sh_cat = !sh_cfg && dbreg_catalog_member_locked(view, name);
     bool sh = sh_cfg || sh_cat;
@@ -4006,10 +4058,12 @@ int dbreg_commit_cold(const char *view, const char *name, int64_t source_id, uin
         atomic_store_explicit(&z->state, ZDIR_ST_ABSENT, memory_order_release);
         atomic_fetch_add_explicit(&g_cache_cold, 1, memory_order_relaxed);
     }
-    dbreg_err_note(rv->name, z->name, (z->kind & ZDIR_K_STORED) ? z->zid : 0xFFFFFFFFu, NULL);
+    err_sink = dbreg_err_forget(rv->name, z->name);
+    err_zid = (z->kind & ZDIR_K_STORED) ? z->zid : ZREF_NOZID;
     rc = 0;
 out:
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    if (err_sink) dbreg_err_sink_clear(err_zid);
     return rc;
 }
 
@@ -4101,14 +4155,17 @@ bool dbreg_reject_ex(const char *view, const char *name, int64_t source_id, cons
         }
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    uint64_t stamp = 0;
     if (ok && ops) {                                       /* 0.7 S3: the store's record of the zone (an older version that keeps serving) is not offered to a loader as up to date */
         dbdir_rec_t r;
         if (ops->rec_get(view, name, &r)) {
             zid = r.zid;
+            stamp = dbreg_err_stamp(&r);
             if (mark_record) ops->note_flags(r.zid, STORE_F_REJECTED_NEW, 0);
         }
     }
-    if (ok) dbreg_err_note(view, name, zid, reason && reason[0] ? reason : "rejected");
+    /* a body that was refused for a stamp the record no longer has (mark_record false) is not a rejection of the version that the record has now: no text is kept for it, in either ring */
+    if (ok && mark_record) dbreg_err_note_st(view, name, zid, stamp, reason && reason[0] ? reason : "rejected");
     return ok;
 }
 
@@ -4121,6 +4178,16 @@ static int rec_get_locked(const dbdir_ops_t *ops, const char *view, const char *
 static void rec_busy_pause(void) {
     struct timespec ts = { 0, 100000 };
     nanosleep(&ts, NULL);
+}
+bool dbreg_err_get_locked(const char *view, const char *zone, uint32_t zid, char *out, size_t cap) {
+    uint64_t stamp = 0;
+    const dbdir_ops_t *ops = dbdir();
+    if (ops && zid != 0xFFFFFFFFu) {
+        dbdir_rec_t r;
+        if (rec_get_locked(ops, view, zone, &r) == 1 && r.zid == zid) stamp = dbreg_err_stamp(&r);
+        else zid = 0xFFFFFFFFu;                                              /* (no record, or a cell that is being written: only the ring in memory) */
+    }
+    return dbreg_err_get_st(view, zone, zid, stamp, out, cap);
 }
 
 int dbreg_fetch_begin(const char *view, const char *zone) {
@@ -4666,10 +4733,13 @@ static uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
  * record stays in the store, so nothing is lost and the next query attaches the zone again.  The element leaves the attach table and the registry; it and the entry are retired by
  * the epoch RCU (no snapshot is published, nothing is queued for a delta).  Per-zone state that does not outlive the entry: the counters go into the total of the zones that
  * left (g_gone_queries, design 6.1).  The lock is held.  Returns the bytes the version held (at least 1), or 0: not now. */
-static uint64_t store_detach_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
+static uint64_t store_detach_x_locked(dbreg_view_t *rv, dbreg_zone_t *z, bool force);
+static uint64_t store_detach_locked(dbreg_view_t *rv, dbreg_zone_t *z) { return store_detach_x_locked(rv, z, false); }
+/* force: the pin of the zone does not keep it (its data is not good: dbreg_store_image_lost()) */
+static uint64_t store_detach_x_locked(dbreg_view_t *rv, dbreg_zone_t *z, bool force) {
     const dbdir_ops_t *ops = dbdir();
     zone_db_entry_t *e = zdir_entry(z);
-    if (!ops || !e || !store_zone_entry(e) || zone_xr(e)->catalog_member_count > 0 || z->shadowed || (z->flags & (ZDIR_F_PIN | ZDIR_F_DELETED | ZDIR_F_GARB | ZDIR_F_BUSY | ZDIR_F_NOTIFY_DEFER)) ||
+    if (!ops || !e || !store_zone_entry(e) || zone_xr(e)->catalog_member_count > 0 || z->shadowed || (z->flags & ((force ? 0 : ZDIR_F_PIN) | ZDIR_F_DELETED | ZDIR_F_GARB | ZDIR_F_BUSY | ZDIR_F_NOTIFY_DEFER)) ||
         atomic_load_explicit(&z->state, memory_order_relaxed) != ZDIR_ST_RESIDENT || e->evicted_bytes)
         return 0;
     if (ops->attach_get(z->zid) != z) return 0;
@@ -4713,12 +4783,44 @@ static uint64_t store_detach_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
     return bytes ? bytes : 1;
 }
 
+/* 0.7 store S6: the image of the zone of this id is damaged and the record is KNOWN now (dns_server_internal.h).  The attach table finds the element by id; the registry finds its view. */
+int dbreg_store_image_lost(uint32_t zid, bool (*backed)(const zone_version_t *v)) {
+    const dbdir_ops_t *ops = dbdir();
+    if (!ops || zid == ZREF_NOZID) return 0;
+    int rc = 0;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_zone_t *z = ops->attach_get(zid);
+    zone_db_entry_t *e = z ? zdir_entry(z) : NULL;
+    zone_version_t *cv = e ? atomic_load_explicit(&e->rcu.active, memory_order_acquire) : NULL;
+    if (z && cv && backed(cv) && !(z->flags & ZDIR_F_DELETED) && atomic_load_explicit(&z->state, memory_order_relaxed) == ZDIR_ST_RESIDENT) {
+        dbreg_view_t *rv = NULL;
+        for (size_t v = 0; v < g_dbreg_nviews && !rv; v++)
+            if (ops->view_sid(g_dbreg_views[v].name) == (int)z->sview && dbreg_find(&g_dbreg_views[v], z->name, z->hash) == z) rv = &g_dbreg_views[v];
+        dbdir_rec_t r;
+        const int gr = rv ? rec_get_locked(ops, rv->name, z->name, &r) : 0;
+        if (gr < 0) {
+            rc = 1;                                           /* (a cell that is being written) */
+        } else if (gr == 1 && r.zid == zid && r.state != 2 /* STORE_STATE_STORED */) {          /* (a record that is STORED again has a good image: the zone was read again and this is its new version) */
+            const uint64_t got = store_detach_x_locked(rv, z, true);
+            if (got) syslog(LOG_WARNING, "[Store] zone '%s' (view '%s'): its image in the store is damaged and the zone is served from it; it is taken out of memory and read from the database again", z->name, rv->name);
+            else rc = (atomic_load_explicit(&e->updated, memory_order_relaxed) ? 0 : 1);
+        }
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return rc;
+}
+
 /* 0.7 store S3: the zone left the database: its record and (when it is in memory) its element go.  1: something was deleted; 0: nothing (no such zone, or another source id owns the name);
  * -1: the store could not delete the record: it stays, and so does the zone in memory (a zone that is served while its record survives comes back at the next start, and the caller must not
  * take the delete for done) */
 static int dbreg_delete_store(const char *view, const char *name, int64_t source_id) {
     const dbdir_ops_t *ops = dbdir();
     bool had = false;
+    uint32_t dzid = ZREF_NOZID;                                       /* the id the record had: it is reused, and the text of its last rejection must not show under the next zone that gets it */
+    {
+        dbdir_rec_t r0;
+        if (ops->rec_get(view, name, &r0) && (source_id == 0 || r0.source_id == source_id || r0.source_id == 0)) dzid = r0.zid;
+    }
     const int dr = ops->del(view, name, source_id, &had);
     if (dr < 0 && dr != -ENOENT) return -1;
     bool removed = false;
@@ -4740,6 +4842,7 @@ static int dbreg_delete_store(const char *view, const char *name, int64_t source
         removed = true;
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    if (had || removed) dbreg_err_note_st(view, name, dzid, 0, NULL);        /* (both rings: the one in memory by name, the file's by id; no lock is held) */
     return (had || removed) ? 1 : 0;
 }
 
@@ -4794,7 +4897,6 @@ void dbreg_xfr_note(int kind) {
 #define CACHE_LOW_PCT 90             /* ... until it is at this many */
 static int64_t g_cache_last_age_ms;
 static int64_t g_cache_last_warn_ms;
-static _Atomic uint64_t g_cache_pinned_bytes;
 
 static int64_t cache_mono_ms(void) {
     struct timespec ts;
@@ -5573,14 +5675,9 @@ void dbreg_test_pin(const char *view, const char *name, bool pin) {
     dbreg_zone_t *z = rv ? dbreg_find(rv, name, zdir_name_hash(name)) : NULL;
     zone_db_entry_t *e = z ? zdir_entry(z) : NULL;
     if (z && e) {
-        zone_version_t *cv = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
-        const uint64_t cb = (cv && cv->counted ? cv->bytes : 0) + atomic_load_explicit(&e->fixed_charged, memory_order_relaxed);
-        const uint32_t np = pin ? (cb > UINT32_MAX ? UINT32_MAX : (uint32_t)cb) : 0;
         if (pin) z->flags |= ZDIR_F_PIN;
         else z->flags &= (uint16_t)~ZDIR_F_PIN;
-        g_stored_pinned = g_stored_pinned - z->pin_charge + np;
-        z->pin_charge = np;
-        atomic_store_explicit(&g_cache_pinned_bytes, g_stored_pinned, memory_order_relaxed);
+        pin_charge_set_locked(z, e);
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
 }
@@ -6255,7 +6352,7 @@ int dbreg_find_info(const char *view, const char *name, dbreg_info_t *out, int m
             o->shadow_by = z->shadow_by;
             o->last_result = z->last_result;
             o->flags = z->flags;
-            (void)dbreg_err_get(rv->name, z->name, (z->kind & ZDIR_K_STORED) ? z->zid : 0xFFFFFFFFu, o->error, sizeof(o->error));
+            (void)dbreg_err_get_locked(rv->name, z->name, (z->kind & ZDIR_K_STORED) ? z->zid : 0xFFFFFFFFu, o->error, sizeof(o->error));
         }
         n++;
     }
@@ -6276,7 +6373,7 @@ int dbreg_find_info(const char *view, const char *name, dbreg_info_t *out, int m
             o->serial = r.serial;
             o->last_result = (r.flags & STORE_F_REJECTED_NEW) ? DBREG_REJECTED : DBREG_APPLIED;
             o->store_state = r.state == 2 /* STORE_STATE_STORED */ ? 1 : 2;
-            (void)dbreg_err_get(vn, name, r.zid, o->error, sizeof(o->error));
+            (void)dbreg_err_get_st(vn, name, r.zid, dbreg_err_stamp(&r), o->error, sizeof(o->error));
         }
         n++;
     }

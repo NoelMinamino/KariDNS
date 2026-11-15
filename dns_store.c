@@ -161,7 +161,6 @@
 #define ST_CL_SLICE_MS  200u              /* the longest the cleaner keeps working in one tick */
 #define ST_SCRUB_SLICE_MS 100u
 #define ST_GRING        128               /* samples of the store's size (one a minute): the growth of the last hours */
-#define ST_RA_STEP      (1u << 20)        /* the zt read-ahead looks at the stop flag every this many bytes */
 
 /* flat counter array v[] (superblock + journal "V" ops) */
 enum {
@@ -390,7 +389,12 @@ struct store {
   uint8_t *err_map;
   size_t   err_len;
   pthread_mutex_t err_mu;
-  _Atomic uint64_t *err_bits;                     /* a bitmap of 2^20 bits: zone ids (hashed) that may have a text in the ring: store_err_clear() does not scan for the others */
+  uint32_t *err_ix;                               /* ERR_IX_N buckets: the ring slot + 1 of the newest entry of the zone ids that hash there (0: none); err_mu */
+  uint32_t *err_nx;                               /* per ring slot: the next slot + 1 in its bucket (a bucket has one entry per zone id) */
+  /* a damaged image was found (the scrub, the cleaner): the zone ids wait here for the hook of the owner (opts.bad_image), which the tick calls with no store lock held */
+  pthread_mutex_t bad_mu;
+  struct bad_n { struct bad_n *next; uint32_t zid; uint16_t tries; } *bad_head, *bad_tail;
+  uint64_t bad_lost;                              /* notices that could not be queued (no memory) */
   /* open */
   pthread_t ra_thr;
   bool     ra_started;
@@ -2318,6 +2322,58 @@ static int zone_make_known_locked(store_t *s, uint32_t z, uint64_t expect_loc) {
   return put_locked(s, t.view, (const char *)fn, t.klen, &m, NULL, 0, STORE_STATE_KNOWN, NULL);
 }
 
+/* ---- damaged images: the owner's notice ----
+ * The zone of a damaged image was made KNOWN above (the writer mutex is held); the owner (opts.bad_image) may keep that image mapped in an attached zone, and takes the zone out of memory.  The notice is
+ * only queued here: the owner takes its own locks (the registry's, which comes before the writer mutex in the lock order), so the tick hands the zone ids over when no lock of the store is held. */
+#define ST_BAD_TRIES 100                 /* the owner said "not now" this many times: the zone is left to the next load from the database */
+static void bad_note(store_t *s, uint32_t zid) {
+  if (!s->o.bad_image) return;
+  struct bad_n *n = malloc(sizeof(*n));
+  pthread_mutex_lock(&s->bad_mu);
+  if (!n) {
+    s->bad_lost++;
+  } else {
+    n->next = NULL;
+    n->zid = zid;
+    n->tries = 0;
+    if (s->bad_tail) s->bad_tail->next = n; else s->bad_head = n;
+    s->bad_tail = n;
+  }
+  pthread_mutex_unlock(&s->bad_mu);
+}
+/* hand the queued zone ids to the owner (no lock of the store held); the ones that it cannot take now are queued again */
+static void bad_drain(store_t *s) {
+  if (!s->o.bad_image) return;
+  pthread_mutex_lock(&s->bad_mu);
+  struct bad_n *n = s->bad_head;
+  s->bad_head = s->bad_tail = NULL;
+  pthread_mutex_unlock(&s->bad_mu);
+  while (n) {
+    struct bad_n *next = n->next;
+    const int r = s->o.bad_image(n->zid, s->o.bad_image_ctx);
+    if (r == 1 && n->tries + 1 < ST_BAD_TRIES) {
+      n->tries++;
+      n->next = NULL;
+      pthread_mutex_lock(&s->bad_mu);
+      if (s->bad_tail) s->bad_tail->next = n; else s->bad_head = n;
+      s->bad_tail = n;
+      pthread_mutex_unlock(&s->bad_mu);
+    } else {
+      free(n);
+    }
+    n = next;
+  }
+}
+static void bad_free_all(store_t *s) {
+  struct bad_n *n = s->bad_head;
+  while (n) {
+    struct bad_n *next = n->next;
+    free(n);
+    n = next;
+  }
+  s->bad_head = s->bad_tail = NULL;
+}
+
 /* ---- the cleaner ---- */
 
 /* The segment to clean: the one with the least live share among those that are dead enough, are not open, are not pinned and were not given up on.  *ncand / *dead_total (optional): the
@@ -2465,6 +2521,7 @@ static int cl_step_locked(store_t *s, uint64_t *quota, unsigned nrec_max, store_
     }
     if (!good) {
       int mk = zone_make_known_locked(s, h.zid, loc);
+      if (mk == 0) bad_note(s, h.zid);
       atomic_fetch_add_explicit(&s->c_bad, 1, memory_order_relaxed);
       if (rep) rep->bad_records++;
       if (mk < 0) { ret = mk; break; }
@@ -2766,6 +2823,7 @@ static int delete_locked(store_t *s, uint32_t z) {
   if (r == 0) {
     s->n_deletes++;
     s->free_epoch = rcu_writer_advance_epoch();      /* (the cell is reused when no reader that could have found it is left: put_locked) */
+    (void)store_err_clear(s, z);                      /* (the id is reused: its text must not show under the next zone that gets it; err_mu is innermost) */
   }
   return r;
 }
@@ -3008,6 +3066,7 @@ static void scrub_note_bad_image(store_t *s, uint32_t z, const store_zone_t *zz,
   if (r == 0) post_write(s);
   pthread_mutex_unlock(&s->wlock);
   if (r == 0) {
+    bad_note(s, z);
     s->sc_p_bad_img++;
     st_log(s, 4, "store: scrub: the image of zone '%s' (view %u) is damaged (%s); the zone is read from the database again", zz->name, (unsigned)zz->view, why);
   }
@@ -3142,6 +3201,7 @@ int store_scrub_run(store_t *s, store_scrub_report_t *rep) {
     rep->repaired = s->sc_p_bad_cell || s->sc_p_bad_idx;
   }
   pthread_mutex_unlock(&s->sc_mu);
+  bad_drain(s);
   return 0;
 }
 
@@ -3190,6 +3250,7 @@ int store_compact(store_t *s, uint64_t max_bytes, bool finish, store_compact_rep
   }
   pthread_mutex_unlock(&s->wlock);
   if (rep) rep->segs_freed = (uint32_t)(atomic_load_explicit(&s->c_segs_freed, memory_order_relaxed) - freed0);
+  bad_drain(s);
   return r;
 }
 
@@ -3248,6 +3309,7 @@ static void maintenance(store_t *s) {
     }
     pthread_mutex_unlock(&s->sc_mu);
   }
+  bad_drain(s);
 }
 
 int store_commit(store_t *s) {
@@ -3370,25 +3432,51 @@ int store_zone_get(const store_t *s, uint32_t zid, store_zone_t *out) {
   }
 }
 
-/* ---- err.ring: 4096-byte header page {magic, version, entries, entry size, head}, then STORE_ERR_ENTRIES entries of 224 bytes = 28 words: seq, zid | textlen << 32, stamp, time, text.
- * The words are read and written as relaxed atomics under the entry's sequence word (written last, cleared first): a reader that copies while the ring wraps over the entry
- * throws its copy away. ---- */
+/* ---- err.ring: 4096-byte header page {magic, version, entries, entry size, head}, then STORE_ERR_ENTRIES entries of 224 bytes = 28 words: seq, zid | textlen << 32 | tag << 40, stamp, time, text.
+ * The words are read and written as relaxed atomics under the entry's sequence word (written last, cleared first), all of it under err_mu (innermost: nothing is taken while it is held).
+ * Finding the newest entry of a zone id is a lookup, not a scan: err_ix is a table of ERR_IX_N buckets (twice the entries), a bucket is a chain through err_nx of ring slots, and a chain has
+ * one entry per zone id (the newest: a put unlinks the entry that it supersedes, and the slot that the ring wraps over is unlinked before it is written).  It is made from the ring at the open. ---- */
 #define ERR_HDR     4096u
 #define ERR_ESZ     224u
 #define ERR_WORDS   (ERR_ESZ / 8)
 #define ERR_MAGIC   0x315252454952414bull       /* "KARIERR1" */
+#define ERR_IX_N    (2u * STORE_ERR_ENTRIES)    /* a power of two (2^17) */
 
-#define ERR_BITS_WORDS (1u << 14)
-static inline void err_bit_set(store_t *s, uint32_t zid) {
-  uint32_t b = (zid * 2654435761u) >> 12;
-  atomic_fetch_or_explicit(&s->err_bits[b >> 6], 1ull << (b & 63), memory_order_relaxed);
-}
-static inline bool err_bit_get(const store_t *s, uint32_t zid) {
-  uint32_t b = (zid * 2654435761u) >> 12;
-  return (atomic_load_explicit(&s->err_bits[b >> 6], memory_order_relaxed) >> (b & 63)) & 1u;
-}
+static inline uint32_t err_bucket(uint32_t zid) { return (zid * 2654435761u) >> (32 - 17); }
 static inline _Atomic uint64_t *err_hdr(const store_t *s) { return (_Atomic uint64_t *)s->err_map; }
-static inline _Atomic uint64_t *err_ent(const store_t *s, uint64_t seq) { return (_Atomic uint64_t *)(s->err_map + ERR_HDR + ((seq - 1) % STORE_ERR_ENTRIES) * ERR_ESZ); }
+static inline _Atomic uint64_t *err_slot(const store_t *s, uint32_t slot) { return (_Atomic uint64_t *)(s->err_map + ERR_HDR + (size_t)slot * ERR_ESZ); }
+static inline uint32_t err_slot_of(uint64_t seq) { return (uint32_t)((seq - 1) % STORE_ERR_ENTRIES); }
+/* the entry of zid: its slot + 1, or 0; *pp (when given): where the link to it is kept (err_mu held) */
+static uint32_t err_ix_find(const store_t *s, uint32_t zid, uint32_t **pp) {
+  uint32_t *link = &s->err_ix[err_bucket(zid)];
+  while (*link) {
+    const uint32_t k = *link - 1;
+    if ((uint32_t)atomic_load_explicit(&err_slot(s, k)[1], memory_order_relaxed) == zid) {
+      if (pp) *pp = link;
+      return k + 1;
+    }
+    link = &s->err_nx[k];
+  }
+  return 0;
+}
+/* take the slot out of the chain of zid (it may not be in it: a superseded entry) */
+static void err_ix_unlink(store_t *s, uint32_t slot, uint32_t zid) {
+  uint32_t *link = &s->err_ix[err_bucket(zid)];
+  while (*link) {
+    const uint32_t k = *link - 1;
+    if (k == slot) { *link = s->err_nx[k]; s->err_nx[k] = 0; return; }
+    link = &s->err_nx[k];
+  }
+}
+/* the entry of the slot is the newest of its zone id from now on */
+static void err_ix_link(store_t *s, uint32_t slot, uint32_t zid) {
+  uint32_t *old = NULL;
+  const uint32_t k = err_ix_find(s, zid, &old);
+  if (k) { *old = s->err_nx[k - 1]; s->err_nx[k - 1] = 0; }
+  uint32_t *head = &s->err_ix[err_bucket(zid)];
+  s->err_nx[slot] = *head;
+  *head = slot + 1;
+}
 
 /* open (make) the ring beneath the store directory; best effort: the store works without it */
 static void err_ring_open(store_t *s) {
@@ -3405,15 +3493,24 @@ static void err_ring_open(store_t *s) {
     }
   }
   if ((size_t)st.st_size < s->err_len && ftruncate(fd, (off_t)s->err_len) != 0) { close(fd); return; }
-  void *p = mmap(NULL, s->err_len, PROT_READ | PROT_WRITE, MAP_SHARED | ST_NOCORE, fd, 0);
-  if (p == MAP_FAILED) { close(fd); return; }
+  s->err_ix = calloc(ERR_IX_N, sizeof(*s->err_ix));
+  s->err_nx = calloc(STORE_ERR_ENTRIES, sizeof(*s->err_nx));
+  void *p = s->err_ix && s->err_nx ? mmap(NULL, s->err_len, PROT_READ | PROT_WRITE, MAP_SHARED | ST_NOCORE, fd, 0) : MAP_FAILED;
+  if (p == MAP_FAILED) {
+    close(fd);
+    free(s->err_ix);
+    free(s->err_nx);
+    s->err_ix = NULL;
+    s->err_nx = NULL;
+    return;
+  }
   s->err_fd = fd;
   s->err_map = p;
   _Atomic uint64_t *h = err_hdr(s);
   if (atomic_load_explicit(&h[0], memory_order_relaxed) != ERR_MAGIC || atomic_load_explicit(&h[1], memory_order_relaxed) != STORE_ERR_ENTRIES ||
       atomic_load_explicit(&h[2], memory_order_relaxed) != ERR_ESZ) {          /* a new file (zeros all through), or another ring size: an empty ring */
     if (atomic_load_explicit(&h[0], memory_order_relaxed) == ERR_MAGIC)
-      for (uint64_t i = 1; i <= STORE_ERR_ENTRIES; i++) atomic_store_explicit(err_ent(s, i), 0, memory_order_relaxed);
+      for (uint32_t i = 0; i < STORE_ERR_ENTRIES; i++) atomic_store_explicit(err_slot(s, i), 0, memory_order_relaxed);
     atomic_store_explicit(&h[1], STORE_ERR_ENTRIES, memory_order_relaxed);
     atomic_store_explicit(&h[2], ERR_ESZ, memory_order_relaxed);
     atomic_store_explicit(&h[3], 0, memory_order_relaxed);
@@ -3421,12 +3518,11 @@ static void err_ring_open(store_t *s) {
   } else if (atomic_load_explicit(&h[3], memory_order_relaxed) > (1ull << 60)) {
     atomic_store_explicit(&h[3], 0, memory_order_relaxed);
   }
-  s->err_bits = calloc(ERR_BITS_WORDS, sizeof(*s->err_bits));
-  if (s->err_bits) {                       /* the zones that have texts in the ring now */
+  {                                         /* the table of the zone ids that have an entry: oldest first, so that the newest of a zone id is the one that stays */
     uint64_t head = atomic_load_explicit(&h[3], memory_order_relaxed), low = head > STORE_ERR_ENTRIES ? head - STORE_ERR_ENTRIES + 1 : 1;
     for (uint64_t seq = low; seq <= head; seq++) {
-      _Atomic uint64_t *w = err_ent(s, seq);
-      if (atomic_load_explicit(&w[0], memory_order_relaxed) == seq) err_bit_set(s, (uint32_t)atomic_load_explicit(&w[1], memory_order_relaxed));
+      _Atomic uint64_t *w = err_slot(s, err_slot_of(seq));
+      if (atomic_load_explicit(&w[0], memory_order_relaxed) == seq) err_ix_link(s, err_slot_of(seq), (uint32_t)atomic_load_explicit(&w[1], memory_order_relaxed));
     }
   }
 }
@@ -3435,25 +3531,26 @@ static void err_ring_close(store_t *s) {
   if (s->err_fd >= 0) close(s->err_fd);
   s->err_map = NULL;
   s->err_fd = -1;
-  free((void *)s->err_bits);
-  s->err_bits = NULL;
+  free(s->err_ix);
+  free(s->err_nx);
+  s->err_ix = NULL;
+  s->err_nx = NULL;
 }
 
-int store_err_put(store_t *s, uint32_t zid, uint64_t stamp_gen, const char *text) {
-  if (!s || !text) return -EINVAL;
-  if (!s->err_map) return -ENOTSUP;
+/* err_mu is held */
+static void err_put_locked(store_t *s, uint32_t zid, uint32_t tag, uint64_t stamp_gen, const char *text) {
   char buf[STORE_ERR_TEXT];
   size_t tl = strnlen(text, STORE_ERR_TEXT - 1);
   memset(buf, 0, sizeof(buf));
   memcpy(buf, text, tl);
-  pthread_mutex_lock(&s->err_mu);
-  if (s->err_bits) err_bit_set(s, zid);
   _Atomic uint64_t *h = err_hdr(s);
   uint64_t seq = atomic_load_explicit(&h[3], memory_order_relaxed) + 1;
-  _Atomic uint64_t *w = err_ent(s, seq);
+  const uint32_t slot = err_slot_of(seq);
+  _Atomic uint64_t *w = err_slot(s, slot);
+  if (atomic_load_explicit(&w[0], memory_order_relaxed) != 0) err_ix_unlink(s, slot, (uint32_t)atomic_load_explicit(&w[1], memory_order_relaxed));      /* (the ring wraps over it) */
   atomic_store_explicit(&w[0], 0, memory_order_release);              /* (the slot is being overwritten) */
   atomic_thread_fence(memory_order_release);
-  atomic_store_explicit(&w[1], (uint64_t)zid | ((uint64_t)tl << 32), memory_order_relaxed);
+  atomic_store_explicit(&w[1], (uint64_t)zid | ((uint64_t)tl << 32) | ((uint64_t)(tag & 0xFFFFFFu) << 40), memory_order_relaxed);
   atomic_store_explicit(&w[2], stamp_gen, memory_order_relaxed);
   atomic_store_explicit(&w[3], (uint64_t)time(NULL), memory_order_relaxed);
   for (unsigned i = 0; i < STORE_ERR_TEXT / 8; i++) {
@@ -3463,18 +3560,51 @@ int store_err_put(store_t *s, uint32_t zid, uint64_t stamp_gen, const char *text
   }
   atomic_store_explicit(&w[0], seq, memory_order_release);
   atomic_store_explicit(&h[3], seq, memory_order_release);
+  err_ix_link(s, slot, zid);
+}
+
+int store_err_put(store_t *s, uint32_t zid, uint32_t tag, uint64_t stamp_gen, const char *text) {
+  if (!s || !text) return -EINVAL;
+  if (!s->err_map) return -ENOTSUP;
+  pthread_mutex_lock(&s->err_mu);
+  err_put_locked(s, zid, tag, stamp_gen, text);
   pthread_mutex_unlock(&s->err_mu);
   return 0;
+}
+
+/* the newest entry of the zone id (err_mu held): false when there is none or it is a cleared one */
+static bool err_get_locked(const store_t *s, uint32_t zid, store_err_t *out) {
+  const uint32_t k = err_ix_find(s, zid, NULL);
+  if (!k) return false;
+  _Atomic uint64_t *w = err_slot(s, k - 1);
+  const uint64_t seq = atomic_load_explicit(&w[0], memory_order_acquire), w1 = atomic_load_explicit(&w[1], memory_order_relaxed);
+  if (seq == 0) return false;
+  store_err_t e;
+  memset(&e, 0, sizeof(e));
+  e.seq = seq;
+  e.zid = zid;
+  e.tag = (uint32_t)(w1 >> 40);
+  e.stamp_gen = atomic_load_explicit(&w[2], memory_order_relaxed);
+  e.time = atomic_load_explicit(&w[3], memory_order_relaxed);
+  for (unsigned i = 0; i < STORE_ERR_TEXT / 8; i++) {
+    uint64_t v = atomic_load_explicit(&w[4 + i], memory_order_relaxed);
+    memcpy(e.text + 8 * i, &v, 8);
+  }
+  e.text[STORE_ERR_TEXT - 1] = '\0';
+  if (!e.text[0]) return false;                                                    /* (cleared: a record with no text) */
+  *out = e;
+  return true;
 }
 
 int store_err_clear(store_t *s, uint32_t zid) {
   if (!s) return -EINVAL;
   if (!s->err_map) return -ENOTSUP;
-  /* only when the zone has a text: the ring is not filled with records of zones that never failed, and a version that is registered (the common case) costs a bit test, not a scan */
-  if (s->err_bits && !err_bit_get(s, zid)) return 0;
+  /* only when the zone has a text: the ring is not filled with records of zones that never failed.  The record with no text is what a restart finds (the table is made from the ring). */
+  pthread_mutex_lock(&s->err_mu);
   store_err_t e;
-  if (store_err_get(s, zid, &e) != 0) return 0;
-  return store_err_put(s, zid, 0, "");
+  if (err_get_locked(s, zid, &e)) err_put_locked(s, zid, 0, 0, "");
+  pthread_mutex_unlock(&s->err_mu);
+  return 0;
 }
 
 uint64_t store_err_total(const store_t *s) { return s && s->err_map ? atomic_load_explicit(&err_hdr(s)[3], memory_order_acquire) : 0; }
@@ -3482,31 +3612,11 @@ uint64_t store_err_total(const store_t *s) { return s && s->err_map ? atomic_loa
 int store_err_get(const store_t *s, uint32_t zid, store_err_t *out) {
   if (!s || !out) return -EINVAL;
   if (!s->err_map) return -ENOENT;
-  uint64_t head = atomic_load_explicit(&err_hdr(s)[3], memory_order_acquire);
-  uint64_t low = head > STORE_ERR_ENTRIES ? head - STORE_ERR_ENTRIES + 1 : 1;
-  for (uint64_t seq = head; seq >= low && seq > 0; seq--) {
-    _Atomic uint64_t *w = err_ent(s, seq);
-    if (atomic_load_explicit(&w[0], memory_order_acquire) != seq) continue;
-    uint64_t w1 = atomic_load_explicit(&w[1], memory_order_relaxed);
-    if ((uint32_t)w1 != zid) continue;
-    store_err_t e;
-    memset(&e, 0, sizeof(e));
-    e.seq = seq;
-    e.zid = zid;
-    e.stamp_gen = atomic_load_explicit(&w[2], memory_order_relaxed);
-    e.time = atomic_load_explicit(&w[3], memory_order_relaxed);
-    for (unsigned i = 0; i < STORE_ERR_TEXT / 8; i++) {
-      uint64_t v = atomic_load_explicit(&w[4 + i], memory_order_relaxed);
-      memcpy(e.text + 8 * i, &v, 8);
-    }
-    atomic_thread_fence(memory_order_acquire);
-    if (atomic_load_explicit(&w[0], memory_order_relaxed) != seq) continue;       /* (overwritten while it was copied) */
-    e.text[STORE_ERR_TEXT - 1] = '\0';
-    if (!e.text[0]) return -ENOENT;                                                /* (cleared: a record with no text) */
-    *out = e;
-    return 0;
-  }
-  return -ENOENT;
+  pthread_mutex_t *mu = (pthread_mutex_t *)&s->err_mu;
+  pthread_mutex_lock(mu);
+  const bool ok = err_get_locked(s, zid, out);
+  pthread_mutex_unlock(mu);
+  return ok ? 0 : -ENOENT;
 }
 
 int store_flag_next(const store_t *s, uint32_t *cursor, uint16_t flag, store_zone_t *out) {
@@ -4181,10 +4291,16 @@ static int create_store(store_t *s) {
 }
 
 /* Design 7: ix is read once, from the beginning, before the first answer (a lookup never waits for the disk in the index); zt is read in the background. */
+#ifdef KARIDNS_UNIT_TEST
+void (*store_test_ra_page)(void);
+#endif
 static void touch_pages(const void *base, size_t len, size_t pagesz, const _Atomic bool *stop) {
   volatile uint64_t sink = 0;
   for (size_t off = 0; off + 8 <= len; off += pagesz) {
-    if (stop && (off % ST_RA_STEP) == 0 && atomic_load_explicit(stop, memory_order_relaxed)) break;
+    if (stop && atomic_load_explicit(stop, memory_order_relaxed)) break;                 /* (every page: a page that is not in memory waits for the disk, and the close waits for this thread) */
+#ifdef KARIDNS_UNIT_TEST
+    if (stop && store_test_ra_page) store_test_ra_page();
+#endif
     sink += atomic_load_explicit((const _Atomic uint64_t *)((const uint8_t *)base + off), memory_order_relaxed);
   }
   (void)sink;
@@ -4212,11 +4328,12 @@ static void *ra_main(void *arg) {
   atomic_store_explicit(&s->ra_done, true, memory_order_release);
   return NULL;
 }
-/* the read-ahead thread is detached (a store that is never closed, a test child that dies, leaves no thread to join); the close waits for its end flag, after which the thread touches nothing of the store */
+/* the read-ahead thread is detached (a store that is never closed, a test child that dies, leaves no thread to join); the close waits for its end flag, after which the thread touches nothing of the store.
+ * It does not give up: the thread reads the mapping that store_close() unmaps and the store that it frees, and it looks at the stop flag at every page, so the wait is one page read long. */
 static void ra_stop_join(store_t *s) {
   if (!s->ra_started) return;
   atomic_store_explicit(&s->ra_stop, true, memory_order_relaxed);
-  for (int i = 0; i < 50000 && !atomic_load_explicit(&s->ra_done, memory_order_acquire); i++) usleep(100);
+  while (!atomic_load_explicit(&s->ra_done, memory_order_acquire)) usleep(100);
   s->ra_started = false;
 }
 
@@ -4254,6 +4371,7 @@ int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
   pthread_mutex_init(&s->wlock, NULL);
   pthread_mutex_init(&s->seg_mu, NULL);
   pthread_mutex_init(&s->sc_mu, NULL);
+  pthread_mutex_init(&s->bad_mu, NULL);
   s->avail_est = -1;
   s->reserve_bytes = s->o.reserve_bytes ? s->o.reserve_bytes : s->seg_size / 2;
   if (!s->o.reserve_bytes) {
@@ -4379,6 +4497,8 @@ fail:
   pthread_mutex_destroy(&s->wlock);
   pthread_mutex_destroy(&s->seg_mu);
   pthread_mutex_destroy(&s->sc_mu);
+  bad_free_all(s);
+  pthread_mutex_destroy(&s->bad_mu);
   pthread_mutex_destroy(&s->err_mu);
   free(s->sbbuf);
   free(s->jb.p);
@@ -4403,6 +4523,8 @@ int store_close(store_t *s) {
   pthread_mutex_destroy(&s->wlock);
   pthread_mutex_destroy(&s->seg_mu);
   pthread_mutex_destroy(&s->sc_mu);
+  bad_free_all(s);
+  pthread_mutex_destroy(&s->bad_mu);
   pthread_mutex_destroy(&s->err_mu);
   err_ring_close(s);
   free(s->sbbuf);

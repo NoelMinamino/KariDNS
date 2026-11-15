@@ -1342,20 +1342,39 @@ typedef struct {
   uint32_t detaches;
 } zone_fold_row_t;
 void dbreg_fold_totals(uint64_t out[ZCTR_N], uint64_t *zones);
+/* the same with the number of folds so far; dbreg_fold_seq() later says whether another zone was folded (and so left the attach table or was replaced) since */
+void dbreg_fold_totals_seq(uint64_t out[ZCTR_N], uint64_t *zones, uint64_t *seq);
+uint64_t dbreg_fold_seq(void);
 bool dbreg_fold_view_totals(const char *view, uint64_t out[ZCTR_N], uint64_t *zones);
 size_t dbreg_fold_topk(zone_fold_row_t *out, size_t max);
 void dbreg_fold_stats(uint64_t *folded, uint64_t *rows, uint64_t *replaced);
 /* 0.7 store S5 (design 6.7): the text of the last rejection of a zone is kept in a bounded ring (512 zones) in memory, not in the zone's element: a rejected zone of the store has no element at all.
  * dbreg_err_note(): record the text (NULL: forget the zone's); zid: the zone's id in the store (0xFFFFFFFF: none).  dbreg_err_get(): the text (false: none, or it was pushed out by newer ones).  A store that keeps
- * the texts in a file (err.ring, keyed by zone id) installs its functions with dbreg_err_set_sink(): the ring in memory answers first, the sink behind it; every sink call is made without a lock held. */
+ * the texts in a file (err.ring, keyed by zone id) installs its functions with dbreg_err_set_sink(): the ring in memory answers first, the sink behind it.  A zone id is reused after a delete, so the sink keeps
+ * a tag (a hash of the view and the zone name) and the version stamp of the zone's record with the text, and its get() answers only for the same tag and stamp.  put() and clear() are called after the
+ * registry's lock is released (a registry writer calls dbreg_err_forget() under the lock and dbreg_err_sink_clear() after it); get() may be called with it (the status commands), and is a lookup in a table. */
 typedef struct dbreg_err_sink {
-  void (*put)(uint32_t zid, const char *text);
-  bool (*get)(uint32_t zid, char *out, size_t cap);
+  void (*put)(uint32_t zid, uint32_t tag, uint64_t stamp, const char *text);
+  bool (*get)(uint32_t zid, uint32_t tag, uint64_t stamp, char *out, size_t cap);
   void (*clear)(uint32_t zid);
 } dbreg_err_sink_t;
 void dbreg_err_set_sink(const dbreg_err_sink_t *sink);
+/* stamp 0: the zone has none (the unit tests); the _st forms carry the version stamp of the store's record (dbreg_err_stamp()) */
 void dbreg_err_note(const char *view, const char *zone, uint32_t zid, const char *text);
+void dbreg_err_note_st(const char *view, const char *zone, uint32_t zid, uint64_t stamp, const char *text);
 bool dbreg_err_get(const char *view, const char *zone, uint32_t zid, char *out, size_t cap);
+bool dbreg_err_get_st(const char *view, const char *zone, uint32_t zid, uint64_t stamp, char *out, size_t cap);
+/* the text of a zone for a caller that holds the registry lock (`karictl zonestatus`): the stamp of the store's record is looked up here (a cell that is being written: no sink text) */
+bool dbreg_err_get_locked(const char *view, const char *zone, uint32_t zid, char *out, size_t cap);
+/* forget the zone's text in the memory ring (callable with the registry lock held); true: a sink is installed and dbreg_err_sink_clear(zid) is to follow once no lock is held */
+bool dbreg_err_forget(const char *view, const char *zone);
+void dbreg_err_sink_clear(uint32_t zid);
+/* 0.7 store S6: the store made the zone of this id KNOWN because its image is damaged (the scrub, the cleaner).  A zone of that id that is attached with a version for which backed() says it points into the
+ * store's pages is taken out of memory, even when it is pinned (the record is KNOWN: it is read from the database again).  0: done, or nothing to do; 1: not now (a reader, a transfer, the writer lock of
+ * the entry): the caller asks again.  Takes the registry lock: no lock of the store may be held. */
+int dbreg_store_image_lost(uint32_t zid, bool (*backed)(const zone_version_t *v));
+/* 0.7 store S5: a dynamic UPDATE or a rollback changed the zone of the entry (it is pinned in memory from now on) or it grew: the pinned total of the store counts the bytes it holds now.  The entry's writer lock must not be held. */
+void dbreg_pin_changed(zone_db_entry_t *e);
 void dbreg_err_stats(size_t *n, uint64_t *noted, uint64_t *dropped);
 #ifdef KARIDNS_UNIT_TEST
 void dbreg_err_reset_for_test(void);

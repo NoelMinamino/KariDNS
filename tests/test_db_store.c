@@ -536,6 +536,7 @@ static void *zv_thread(void *arg) {
 zone_db_entry_t *glue_shared_entry(view_snapshot_t *view, const view_snapshot_t *owner, const char *domain);      /* (dns_snapshot_rcu.c) */
 void notify_zone_by_name(const char *view, const char *zone);               /* (dns_server_core.c: the control thread's NOTIFY of a zone by name) */
 extern int g_notify_ipc[2];                                                  /* (dns_server_core.c: where the NOTIFY messages go to the Frontend; a test reads them) */
+extern int g_notify_test_fail;                                               /* (dns_dynamic_update.c: the next this many NOTIFY messages cannot be made) */
 
 /* the NOTIFY messages that the control thread put on the NOTIFY pair since the last call: the last octet of each IPv4 destination (192.0.2.x) in last[], at most max; returns how many there were */
 static int nt_take(int *last, int max) {
@@ -794,6 +795,44 @@ static int run_mode(const char *mode) {
     dbreg_fetch_end("default", "a2.test.");
     CHECK(stored_only("a2.test."));                                          /* (the fetch that did not bring the zone leaves no element) */
     CHECK(attach_by_worker("a2.test.", &k) == 1);
+
+    /* -- (M2 of the review of S5 + S6) the scrub finds the image of a zone that is attached damaged.  In MAP mode the zone serves the pages of the segment: it is taken out of memory, the record is KNOWN, and the zone is read from
+     *    the database again (the answers are the ones it had).  In COPY mode the zone has a copy of its own and stays. */
+    {
+        const bool map = strcmp(mode, "copy") != 0;
+        ans_t b5[NQ + 2], a5[NQ + 2];
+        zref_t z5;
+        CHECK(evict_zone("a5.test.") && attach_by_worker("a5.test.", &k) == 1);                  /* (attached from the store: its image is the store's) */
+        CHECK(in_memory("a5.test.") && zref_of("a5.test.", &z5) && z5.entry);
+        const zone_version_t *v5 = z5.entry ? atomic_load(&z5.entry->rcu.active) : NULL;
+        CHECK(v5 && v5->image_free != NULL && v5->image_ref != NULL);
+        answers_of("a5.test.", b5);
+        CHECK(damage_record(sdir, "a5.test."));
+        store_scrub_report_t srep;
+        CHECK(store_scrub_run(st, &srep) == 0 && srep.bad_images >= 1);
+        if (map) {
+            for (int i = 0; i < 200 && in_memory("a5.test."); i++) usleep(25000);              /* (the tick asks again when the zone was busy) */
+            CHECK(!in_memory("a5.test."));                                                       /* (before: it kept serving the damaged pages) */
+            for (int i = 0; i < 100 && dbreg_evict_inflight() != 0; i++) usleep(25000);
+            CHECK(zref_of("a5.test.", &z5) && z5.entry == NULL && z5.zid != ZREF_NOZID && z5.zstate == ZREF_ST_KNOWN);
+            CHECK(dbdir()->rec_get("default", "a5.test.", &rec) && rec.state == STORE_STATE_KNOWN);
+            CHECK(attach_by_worker("a5.test.", &k) == 0 && k.retry);                             /* (the next query reads it from the database) */
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "a5.test.") == 0);
+            send_zone(f[0], &e, "a5.test.", 6, m.u.fetch_req.request_id, 105);
+            CHECK(wake_for("a5.test.", &k, 5000) && !k.failed && !k.retry);
+            CHECK(in_memory("a5.test."));
+        } else {
+            usleep(300000);
+            CHECK(in_memory("a5.test."));
+            batch_begin(a[0], &e, 19, KDB_BATCH_DIFF);                                         /* (the record is KNOWN: the loader sends the zone again, and it is stored) */
+            send_zone(a[0], &e, "a5.test.", 6, 0, 105);
+            batch_end(a[0], &e, &mainc, 19, 1, 0);
+            CHECK(dbdir()->rec_get("default", "a5.test.", &rec) && rec.state == STORE_STATE_STORED);
+        }
+        answers_of("a5.test.", a5);
+        CHECK(same_answers(b5, a5));
+        CHECK(zone_bytes_underflows() == 0);
+    }
 
     /* -- the commit of an attach is conditional: a delete that comes after the record was read wins, nothing is made */
     CHECK(evict_zone("a0.test."));
@@ -1383,6 +1422,55 @@ static int run_mode(const char *mode) {
                 send_notify_to_all(ne);                                           /* (the next change of the zone: both again, nothing waits) */
                 CHECK(nt_take(dst, 8) == 2 && notify_wait_count(false) == 0);
             }
+            if (ne && held) xfr_entry_release(ne);
+            release_zone_snapshot(sn);
+            close(g_notify_ipc[0]);
+            close(g_notify_ipc[1]);
+            g_notify_ipc[0] = ipc0;
+            g_notify_ipc[1] = ipc1;
+        }
+        /* -- (L5 of the review of S5 + S6) a NOTIFY that cannot be made (the key does not fit, no memory) is not done: the next look of the round sends it (before: it was marked done before it was sent, and never sent) */
+        {
+            const int ipc0 = g_notify_ipc[0], ipc1 = g_notify_ipc[1];
+            CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, g_notify_ipc) == 0);
+            int dst[8], nd;
+            char wv[64], wz[256];
+            int tries = 0;
+            g_nsa_n = 0;
+            batch_begin(a[0], &e, 47, KDB_BATCH_DIFF);
+            send_zone(a[0], &e, "s6a.test.", 1, 0, 330);                      /* www.s6a.test. = 192.0.2.81 */
+            send_zone(a[0], &e, "s6b.test.", 2, 0, 331);                      /* www.s6b.test. = 192.0.2.82 */
+            g_zone_ns = "www.s6a.test.";
+            g_zone_ns2 = "www.s6b.test.";
+            send_zone(a[0], &e, "n6.test.", 1, 0, 332);
+            g_zone_ns = g_zone_ns2 = NULL;
+            batch_end(a[0], &e, &mainc, 47, 3, 0);
+            CHECK(in_memory("n6.test."));
+            CHECK(evict_zone("s6a.test.") && evict_zone("s6b.test.") && stored_only("s6a.test.") && stored_only("s6b.test."));
+            (void)nt_take(dst, 8);
+            zone_db_snapshot_t *sn = acquire_retained_zone_snapshot();
+            bool held = false;
+            zone_db_entry_t *ne = dbreg_ctl_entry(sn, "default", "n6.test.", &held);
+            CHECK(ne != NULL);
+            if (ne) {
+                send_notify_to_all(ne);                                       /* (neither address is known: the NOTIFY waits) */
+                CHECK(nt_take(dst, 8) == 0 && notify_wait_count(false) == 1);
+                CHECK(attach_by_worker("s6a.test.", &k) == 1);
+                g_notify_test_fail = 1;                                       /* (the NOTIFY to 192.0.2.81 cannot be made) */
+                (void)notify_wait_count(true);
+                CHECK(notify_wait_pop(wv, sizeof(wv), wz, sizeof(wz)));
+                notify_zone_by_name(wv, wz);
+                CHECK(g_notify_test_fail == 0 && nt_take(dst, 8) == 0);
+                CHECK(notify_wait_count(false) == 1 && notify_wait_done("default", "n6.test.", &tries) == 0);          /* (not done) */
+                (void)notify_wait_count(true);
+                CHECK(notify_wait_pop(wv, sizeof(wv), wz, sizeof(wz)));
+                notify_zone_by_name(wv, wz);                                  /* (the next look sends it) */
+                nd = nt_take(dst, 8);
+                CHECK(nd == 1 && dst[0] == 81 && notify_wait_done("default", "n6.test.", &tries) == 1);
+                notify_wait_drop("default", "n6.test.");
+                CHECK(notify_wait_count(false) == 0);
+            }
+            g_notify_test_fail = 0;
             if (ne && held) xfr_entry_release(ne);
             release_zone_snapshot(sn);
             close(g_notify_ipc[0]);
@@ -2808,9 +2896,9 @@ static int run_stamp_race(const char *dir) {
         char txt[200];
         usleep(200000);
         CHECK(zrec(st, rd, &z) && z.stamp_gen == 6 && z.stamp_time == 60 && !(z.flags & STORE_F_REJECTED_NEW));         /* (D: before: marked, and the stamp 6 was not asked for again) */
-        CHECK(dbreg_err_get("default", nd, z.zid, txt, sizeof(txt)) && strstr(txt, "SOA serial") != NULL);                  /* (the text of the refusal is kept either way) */
+        CHECK(!dbreg_err_get_locked("default", nd, z.zid, txt, sizeof(txt)));                                                /* (and no text is kept for it: the record has another version now (L1)) */
         CHECK(zrec(st, rc, &z) && z.stamp_gen == 7 && (z.flags & STORE_F_REJECTED_NEW));                                     /* (C: the stamp is the one that was asked for) */
-        CHECK(dbreg_err_get("default", nc, z.zid, txt, sizeof(txt)) && strstr(txt, "SOA serial") != NULL);
+        CHECK(dbreg_err_get_locked("default", nc, z.zid, txt, sizeof(txt)) && strstr(txt, "SOA serial") != NULL);
     }
     n = rq_collect(&fetchc, rq, 16, 500);                                /* (what the background scan asked for meanwhile) */
     memset(c, 0, sizeof(c));                                             /* (D's body for the stamp 6 is asked for and sent, so that the zones are quiet for the next round) */
@@ -2935,6 +3023,52 @@ static int run_settings(int phase, const char *dir) {
 /* ---------------------------------------------------------------- S5: the light entry, the statistics of the zones that leave memory, eviction by samples, the attach table, the leftovers */
 /* `test_db_store s5 [map|copy]` (its own process: the ingest thread and the store are process wide) */
 void stats_collect_totals(zone_db_snapshot_t *snap, karidns_stats_total_t *t);        /* (dns_server_core.c, unit-test builds) */
+extern void (*g_stats_walk_hook)(int attempt);                                         /* (dns_server_core.c: called after the walk of the zones in memory, before the check of the fold sequence) */
+static const char *g_l3_zone;
+static void l3_walk_hook(int attempt) {
+    if (attempt == 0 && g_l3_zone) (void)dbreg_test_evict("default", g_l3_zone);           /* (a zone leaves memory after the walk has counted it) */
+}
+
+/* a sink that asks whether the registry's lock is free at every put and clear (a thread that takes it: it ends at once when the lock is free, and when this thread holds it, it ends after the call returns), and
+ * does what the store's sink does */
+static _Atomic int g_probe_calls, g_probe_held, g_probe_done;
+static void *probe_thread(void *arg) {
+    (void)arg;
+    (void)dbreg_lookup_entry("default", "probe.test.");
+    atomic_store(&g_probe_done, 1);
+    return NULL;
+}
+static void probe_registry_lock(void) {
+    atomic_store(&g_probe_done, 0);
+    pthread_t t;
+    if (pthread_create(&t, NULL, probe_thread, NULL) != 0) return;
+    pthread_detach(t);
+    bool free_lock = false;
+    for (int i = 0; i < 40 && !free_lock; i++) {
+        usleep(10000);
+        free_lock = atomic_load(&g_probe_done) != 0;
+    }
+    atomic_fetch_add(&g_probe_calls, 1);
+    if (!free_lock) atomic_fetch_add(&g_probe_held, 1);
+}
+static void probe_put(uint32_t zid, uint32_t tag, uint64_t stamp, const char *text) {
+    probe_registry_lock();
+    store_t *st = db_store_handle();
+    if (st) (void)store_err_put(st, zid, tag, stamp, text);
+}
+static bool probe_get(uint32_t zid, uint32_t tag, uint64_t stamp, char *out, size_t cap) {
+    store_t *st = db_store_handle();
+    store_err_t se;
+    if (!st || !cap || store_err_get(st, zid, &se) != 0 || se.tag != (tag & 0xFFFFFFu) || se.stamp_gen != stamp) return false;
+    snprintf(out, cap, "%s", se.text);
+    return true;
+}
+static void probe_clear(uint32_t zid) {
+    probe_registry_lock();
+    store_t *st = db_store_handle();
+    if (st) (void)store_err_clear(st, zid);
+}
+static const dbreg_err_sink_t g_probe_sink = { probe_put, probe_get, probe_clear };
 
 static int run_s5(const char *mode) {
     printf("[S5: the light entry, the counters of the zones that leave memory, eviction by samples, the attach table, rejected zones, the four leftovers: %s mode]\n", mode);
@@ -3049,6 +3183,34 @@ static int run_s5(const char *mode) {
         CHECK(in_memory(nm[1]) && in_memory(nm[2]));
     }
 
+    /* -- 2b. (L3) a zone that is taken out of memory while the totals are collected is counted once: the walk of the attach table has no lock, and the zone can be seen in the table after the folded totals were
+     *    read (it was added again: the totals were doubled for it, and went back at the next call) */
+    {
+        zref_t zr;
+        db_store_attach_zone("default", nm[3]);
+        CHECK(zref_of(nm[3], &zr) && zr.entry);
+        for (int i = 0; i < 12; i++) CHECK(ask_engine(&g_wctx, &g_cc, nm[3], 6, out) > 12);
+        karidns_stats_total_t t0, t1;
+        rcu_aux_read_lock();
+        zone_db_snapshot_t *sn = acquire_zone_snapshot();
+        stats_collect_totals(sn, &t0);
+        CHECK(t0.queries_total >= 12);
+        g_l3_zone = nm[3];
+        g_stats_walk_hook = l3_walk_hook;
+        stats_collect_totals(sn, &t1);                                                              /* (the hook takes the zone out after the walk) */
+        g_stats_walk_hook = NULL;
+        g_l3_zone = NULL;
+        rcu_aux_read_unlock();
+        CHECK(!in_memory(nm[3]));
+        CHECK(t1.queries_total == t0.queries_total && t1.responses_noerror == t0.responses_noerror);                       /* (before: the zone's queries were in the walk and in the folded totals) */
+        rcu_aux_read_lock();
+        sn = acquire_zone_snapshot();
+        stats_collect_totals(sn, &t1);
+        rcu_aux_read_unlock();
+        CHECK(t1.queries_total == t0.queries_total);
+        for (int i = 0; i < 100 && dbreg_evict_inflight() != 0; i++) usleep(25000);
+    }
+
     /* -- 3. eviction by samples: the registry is not walked; the cold zones go, the hot zone and the pinned zone stay; the attach table gets smaller after a mass detach */
     {
         zref_t zr;
@@ -3114,16 +3276,82 @@ static int run_s5(const char *mode) {
         char st_text[2000];
         size_t stl = db_ingest_status("s0010.test.", "default", st_text, sizeof(st_text));
         CHECK(stl > 0 && strstr(st_text, "status rejected") && strstr(st_text, "last error: the body was refused: boom"));
-        /* the same, not marking the record (the stamp the body was asked for is not the record's any more) */
+        /* the same, not marking the record (the stamp the body was asked for is not the record's any more): the record is not marked, and no text is kept for a version that the record does not have (L1) */
         CHECK(stored_only(nm[11]));
         CHECK(dbreg_reject_ex("default", nm[11], 5011, "refused", false));
         CHECK(dbdir()->rec_get("default", nm[11], &rec) && !(rec.flags & STORE_F_REJECTED_NEW));
+        CHECK(!dbreg_err_get("default", nm[11], rec.zid, st_text, sizeof(st_text)));
+        dbreg_err_note("default", nm[11], rec.zid, "refused");                                         /* (a text of the zone: the attach that follows forgets it) */
         CHECK(dbreg_err_get("default", nm[11], rec.zid, st_text, sizeof(st_text)) && strcmp(st_text, "refused") == 0);
         /* an attach that registers a version forgets the text */
         db_store_attach_zone("default", nm[11]);
         CHECK(in_memory(nm[11]) && !dbreg_err_get("default", nm[11], rec.zid, st_text, sizeof(st_text)));
         CHECK(dbreg_find_info("default", nm[11], info, 2) == 1 && info[0].last_result == DBREG_APPLIED && info[0].error[0] == '\0');
         dbreg_err_note("default", nm[10], rec.zid, NULL);
+        /* (L1) a text is for a zone and for a version: the file ring keeps the tag of the zone's name and the stamp of the record with it, and answers for those only; the delete of the zone forgets it in both rings */
+        {
+            dbdir_rec_t r12, r13;
+            char tx[300];
+            store_err_t se;
+            CHECK(stored_only(nm[12]) && stored_only(nm[13]));
+            CHECK(dbdir()->rec_get("default", nm[12], &r12) && dbdir()->rec_get("default", nm[13], &r13));
+            CHECK(store_set_stamp(st, r12.zid, 9, 90, 0, 0) == 0);
+            CHECK(dbreg_reject_ex("default", nm[12], r12.source_id, "refused: stamped", true));
+            CHECK(store_err_get(st, r12.zid, &se) == 0 && se.stamp_gen != 0 && strcmp(se.text, "refused: stamped") == 0);
+            const uint64_t key = se.stamp_gen;
+            CHECK(dbreg_err_forget("default", nm[12]));                                                                     /* (the ring in memory is empty: the file answers) */
+            CHECK(dbreg_err_get_locked("default", nm[12], r12.zid, tx, sizeof(tx)) && strcmp(tx, "refused: stamped") == 0);
+            CHECK(!dbreg_err_get_st("default", "another.test.", r12.zid, key, tx, sizeof(tx)));                             /* (the id of another zone now: the tag of the name does not match; before: its text was shown) */
+            CHECK(!dbreg_err_get_st("default", nm[12], r12.zid, key + 1, tx, sizeof(tx)));                                    /* (another version) */
+            CHECK(store_set_stamp(st, r12.zid, 10, 100, 0, 0) == 0);                                                          /* (the database has another version: the text is of the one before) */
+            CHECK(!dbreg_err_get_locked("default", nm[12], r12.zid, tx, sizeof(tx)));
+            CHECK(store_set_stamp(st, r12.zid, 9, 90, 0, 0) == 0);
+            CHECK(dbreg_err_get_locked("default", nm[12], r12.zid, tx, sizeof(tx)) && strcmp(tx, "refused: stamped") == 0);
+            dbreg_err_note_st("default", nm[12], r12.zid, key, "refused: stamped");                                          /* (both rings have it) */
+            CHECK(dbreg_err_get_st("default", nm[12], r12.zid, key, tx, sizeof(tx)));
+            CHECK(dbreg_delete("default", nm[12], r12.source_id) == 1);
+            CHECK(!dbreg_err_get_st("default", nm[12], r12.zid, key, tx, sizeof(tx)));                                        /* (before: the text stayed, and showed under the zone that got the id) */
+            CHECK(store_err_get(st, r12.zid, &se) == -ENOENT);
+            /* (M1) the sink's put and clear are called with no lock of the registry held: the registry's lock is free in them (before: the commit forgot the text inside the lock) */
+            atomic_store(&g_probe_calls, 0);
+            atomic_store(&g_probe_held, 0);
+            dbreg_err_set_sink(&g_probe_sink);
+            dbreg_err_note_st("default", nm[13], r13.zid, 0, "text 13");
+            CHECK(atomic_load(&g_probe_calls) == 1 && atomic_load(&g_probe_held) == 0);
+            CHECK(store_err_get(st, r13.zid, &se) == 0);
+            db_store_attach_zone("default", nm[13]);                                                                           /* (registers a version: the text is forgotten) */
+            CHECK(in_memory(nm[13]));
+            CHECK(atomic_load(&g_probe_calls) == 2 && atomic_load(&g_probe_held) == 0);
+            CHECK(store_err_get(st, r13.zid, &se) == -ENOENT);
+            CHECK(dbdir()->rec_get("default", nm[13], &r13) && dbreg_err_get_st("default", nm[13], r13.zid, 0, tx, sizeof(tx)) == false);
+        }
+        /* (L2) the pinned total counts a zone that a dynamic UPDATE or a rollback changed (it stays in memory until the database replaces it) with the bytes it has now, and follows it when it grows */
+        {
+            zref_t zr;
+            db_store_attach_zone("default", nm[30]);
+            CHECK(zref_of(nm[30], &zr) && zr.entry && !(zr.el->flags & ZDIR_F_PIN));
+            zone_db_entry_t *en = zr.entry;
+            const zone_version_t *cv = en ? atomic_load(&en->rcu.active) : NULL;
+            const uint64_t zbytes = cv ? (cv->counted ? cv->bytes : 0) + atomic_load(&en->fixed_charged) : 0;
+            CHECK(zbytes > 0);
+            dbreg_cache_stats_t p0, p1, p2, p3;
+            dbreg_cache_stats(&p0);
+            atomic_store(&en->updated, true);                                                                                /* (what an UPDATE leaves) */
+            dbreg_pin_changed(en);
+            dbreg_cache_stats(&p1);
+            CHECK(p1.pinned_bytes == p0.pinned_bytes + zbytes);
+            atomic_fetch_add(&en->fixed_charged, 1000);                                                                      /* (the zone grew by 1000 bytes) */
+            dbreg_pin_changed(en);
+            dbreg_cache_stats(&p2);
+            CHECK(p2.pinned_bytes == p0.pinned_bytes + zbytes + 1000);
+            atomic_fetch_sub(&en->fixed_charged, 1000);
+            atomic_store(&en->updated, false);                                                                               /* (the database's version replaced it) */
+            dbreg_pin_changed(en);
+            dbreg_cache_stats(&p3);
+            CHECK(p3.pinned_bytes == p0.pinned_bytes);
+            CHECK(dbreg_test_evict("default", nm[30]));                                                                      /* (and a zone that left memory is not counted) */
+            for (int i = 0; i < 100 && dbreg_evict_inflight() != 0; i++) usleep(25000);
+        }
     }
 
     /* -- 5. leftovers.  (c) a zone that the ingest marked busy and does not commit is not busy for ever; (d) an element of the attach table without its entry is "not in memory", not "no zone" */

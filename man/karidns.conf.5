@@ -4804,14 +4804,19 @@ second at the most: the table record (its CRC), the way the name and source
 indexes lead to the zone, and for a stored zone the whole image: its checksum
 and the structure check that is made at every attach. A zone whose image is bad
 becomes known without an image and is read from the database again (the log says
-which zone; \fBstore.scrub.bad_images\fR). A table record that is damaged or an
-index entry that does not lead to its zone is repaired at the end of the pass:
-the indexes are built again from the zone table, and a record that cannot be
-read is dropped and comes again with the next pass of the loader. \fBkarictl
-store scrub start\fR starts a pass now, \fBstore scrub stop\fR ends it. \fBError
-ring.\fR \fBerr.ring\fR (14 MB, sparse until used) keeps the last 65,536 texts
-of zones that were refused or failed (which zone id, which version, when, why),
-written in place and wrapped; it is not journaled and holds no heap
+which zone; \fBstore.scrub.bad_images\fR); the cleaner does the same for a
+record that fails its checksum when it is to be copied. A zone that is in memory
+with that image (the store is in MAP mode: the zone serves the mapped pages) is
+taken out of memory too, even when it is pinned, so that it is read again and
+does not go on serving damaged pages (when a reader or a transfer holds it, the
+store tries again at the next tick). A table record that is damaged or an index
+entry that does not lead to its zone is repaired at the end of the pass: the
+indexes are built again from the zone table, and a record that cannot be read is
+dropped and comes again with the next pass of the loader. \fBkarictl store scrub
+start\fR starts a pass now, \fBstore scrub stop\fR ends it. \fBError ring.\fR
+\fBerr.ring\fR (14 MB, sparse until used) keeps the last 65,536 texts of zones
+that were refused or failed (which zone id, which version, when, why), written
+in place and wrapped; it is not journaled and holds no heap
 (\fBstore.errors.total\fR). The server keeps the last 512 texts in memory as
 well (\fBzonestatus\fR asks the memory first, then the file): a rejected zone of
 the store has no registry element, so after a text is pushed out of memory, or

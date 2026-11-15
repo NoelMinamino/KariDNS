@@ -4645,29 +4645,48 @@ static void stats_add_zone(karidns_stats_total_t *t, const zone_db_entry_t *e) {
 #undef ST_ADD
 }
 
-STATIC_TEST void stats_collect_totals(zone_db_snapshot_t *snap, karidns_stats_total_t *t) {
-  memset(t, 0, sizeof(*t));
-  if (snap) {
-    for (size_t v = 0; v < snap->view_count; v++) {
-      zdir_iter_t it;
-      zdir_iter_init(&it, &snap->views[v]);
-      for (zdir_elem_t *el; (el = zdir_iter_next(&it));) {
-        zone_db_entry_t *e = zdir_entry(el);
-        if (!e || !view_owns_elem(el)) continue;   /* a shared zone is counted in its owner view */
-        stats_add_zone(t, e);
-      }
-    }
-    if (dbdir()) {                                 /* 0.7 S3: the zones of the store that are in memory are not in the directories (the ones that are not have no counters: design 6.1) */
-      size_t pos = 0;
-      for (zdir_elem_t *el; (el = dbdir()->attach_next(&pos)) != NULL;) {
-        zone_db_entry_t *e = zdir_entry(el);
-        if (e) stats_add_zone(t, e);
-      }
+/* the zones in memory: the directories of the snapshot and the attach table */
+static void stats_walk_zones(zone_db_snapshot_t *snap, karidns_stats_total_t *t) {
+  if (!snap) return;
+  for (size_t v = 0; v < snap->view_count; v++) {
+    zdir_iter_t it;
+    zdir_iter_init(&it, &snap->views[v]);
+    for (zdir_elem_t *el; (el = zdir_iter_next(&it));) {
+      zone_db_entry_t *e = zdir_entry(el);
+      if (!e || !view_owns_elem(el)) continue;   /* a shared zone is counted in its owner view */
+      stats_add_zone(t, e);
     }
   }
-  if (dbdir()) {                                  /* 0.7 store S5: what the zones that left memory counted (design 6.1): the totals do not go back when a zone is taken out */
-    uint64_t f[ZCTR_N];
-    dbreg_fold_totals(f, NULL);
+  if (dbdir()) {                                 /* 0.7 S3: the zones of the store that are in memory are not in the directories (the ones that are not have no counters: design 6.1) */
+    size_t pos = 0;
+    for (zdir_elem_t *el; (el = dbdir()->attach_next(&pos)) != NULL;) {
+      zone_db_entry_t *e = zdir_entry(el);
+      if (e) stats_add_zone(t, e);
+    }
+  }
+}
+
+#ifdef KARIDNS_UNIT_TEST
+void (*g_stats_walk_hook)(int attempt);            /* called after the walk of the zones in memory, before the check of the fold sequence */
+#endif
+#define STATS_FOLD_TRIES 8
+
+STATIC_TEST void stats_collect_totals(zone_db_snapshot_t *snap, karidns_stats_total_t *t) {
+  /* A zone that is taken out of memory (or replaced) is added to the folded totals and leaves the attach table in one step of the registry; this walk has no lock, so it can see the zone in the table after
+   * the fold was read, or not see it after it was.  The folded totals are read first with the sequence of the folds, and the walk is made again when a fold happened meanwhile (a bounded number of times:
+   * under a steady eviction the last walk is kept, and the error is the counters of the zones that left meanwhile). */
+  const bool fold = dbdir() != NULL;
+  uint64_t f[ZCTR_N] = { 0 }, seq = 0;
+  for (int attempt = 0;; attempt++) {
+    memset(t, 0, sizeof(*t));
+    if (fold) dbreg_fold_totals_seq(f, NULL, &seq);
+    stats_walk_zones(snap, t);
+#ifdef KARIDNS_UNIT_TEST
+    if (g_stats_walk_hook) g_stats_walk_hook(attempt);
+#endif
+    if (!fold || attempt >= STATS_FOLD_TRIES || dbreg_fold_seq() == seq) break;
+  }
+  if (fold) {                                     /* 0.7 store S5: what the zones that left memory counted (design 6.1): the totals do not go back when a zone is taken out */
     t->queries_total += f[ZCTR_QUERIES]; t->tcp_queries += f[ZCTR_TCP];
     t->responses_noerror += f[ZCTR_NOERROR]; t->responses_nodata += f[ZCTR_NODATA]; t->responses_nxdomain += f[ZCTR_NXDOMAIN];
     t->responses_servfail += f[ZCTR_SERVFAIL]; t->responses_refused += f[ZCTR_REFUSED]; t->dnssec_do_queries += f[ZCTR_DO];

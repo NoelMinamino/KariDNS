@@ -286,6 +286,7 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
   zone_publish(entry, z_next);
   if (entry->source == ZONE_SRC_DB) atomic_store_explicit(&entry->updated, true, memory_order_release);      /* D1a: the cache manager does not take the zone out of memory: the UPDATE lives only there */
   pthread_mutex_unlock(&entry->writer_lock);
+  dbreg_pin_changed(entry);                                   /* (0.7 store S5: the zone is pinned from here on, with the bytes of this version: the pinned total of the store) */
   logev_post(LOGC_UPDATE, 2, client_ip, query_client_port(), "[Update] zone '%s': published serial %u (%s); NOTIFY is sent at the next tick", entry->domain,
              new_serial, result.soa_replaced ? "the SOA of the UPDATE" : "serial-update-method");
 
@@ -727,12 +728,21 @@ static void notify_to_tcp(notify_pending_t *p, time_t now, bool bad_answer) {
   p->next_time = now;
 }
 
+#ifdef KARIDNS_UNIT_TEST
+int g_notify_test_fail;                                  /* tests: the next this many notify_send_to() calls return false */
+#endif
 /* 1つの宛先へ NOTIFY を組み立てて送り、応答待ちに登録する。宛先ごとに ID を変え (RFC 1996 §3.6 の
  * 照合は ID、QNAME、送信元アドレスとポート)、鍵があれば署名する (RFC 8945 §5.1)。
  * 同じゾーンの同じ宛先への古い NOTIFY が待っていれば置き換える (新しい版の通知で足りる)。 */
 static bool notify_send_to(const char *domain, const char *view_name, const struct sockaddr_storage *dest,
                            bool has_src, const uint8_t *src, const tsig_key_t *key, const notify_retry_config_t *nr, uint32_t rate,
                            bool tcp_only) {
+#ifdef KARIDNS_UNIT_TEST
+  if (g_notify_test_fail > 0) {                          /* tests: the NOTIFY cannot be made (a key that does not fit, no memory) */
+    g_notify_test_fail--;
+    return false;
+  }
+#endif
   socklen_t dlen = dest->ss_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
   notify_pending_t *slot = NULL;
   for (int i = 0; i < NOTIFY_PENDING_MAX; i++) {
@@ -1341,7 +1351,6 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
       ndup++;
       continue;
     }
-    if (wi >= 0 && sib_wait) nwait_mark_done(wi, &targets[i].addr);
     /* the local address of this NOTIFY: the `source` of the also-notify list the address is written in, else notify-source(-v6).  Only an
      * address that was in the configuration at start-up has a pre-bound socket (config_xfr_source_allowed()); another one is ignored with a
      * warning (a restart-only change) and the system chooses the source. */
@@ -1378,7 +1387,11 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
       logev_post(LOGC_NOTIFY, 2, NULL, 0, "[Notify] zone '%s': NOTIFY to %s over %s, %s%s%s", domain, dt, tcp_only ? "TCP (tcp-only of the server statement)" : "UDP",
                  has_src ? "notify-source set, " : "", tkey ? "TSIG key " : "unsigned", tkey && tkey->name ? tkey->name : "");
     }
-    if (notify_send_to(domain, view_name, &targets[i].addr, has_src, src, tkey, &nr, g_notify_rate, tcp_only)) nsent++;
+    /* done only when the NOTIFY was made and queued (or sent): one that could not be built (a key that does not fit, no memory) is looked at again in the next look of the round */
+    if (notify_send_to(domain, view_name, &targets[i].addr, has_src, src, tkey, &nr, g_notify_rate, tcp_only)) {
+      nsent++;
+      if (wi >= 0 && sib_wait) nwait_mark_done(wi, &targets[i].addr);
+    }
   }
 
   if (entry && nsent > 0) {   /* the NOTIFYs sent or queued (a rate-held one goes at a later tick); not the ones that could not be built */
