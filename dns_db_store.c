@@ -725,12 +725,13 @@ static size_t dir_attach_count(void) {
  * later.  A fixed number of slots, never grown and never rehashed, so that a put is one compare-and-swap and nothing moves under a reader: a zid has STG_PROBE slots (the hash, then the next ones), a
  * lookup looks at all of them (a slot that was emptied does not end the probe), a put that finds them all taken is refused (the worker leaves the zone to the store threads).  Only the store thread that
  * registers a staged element takes it out.  The claim of the zone (park_att_claim()) is what keeps two workers from staging the same zone; a put still looks for the zone first. */
-#ifdef KARIDNS_UNIT_TEST
+/* (test hooks of the worker's attach and its registration: in every build, so that the functions that read them are the same in the test programs and in karidns, and the coverage of the two merges) */
 int db_store_test_stg_fail = 0;                              /* the n-th put into the staging table is refused (0: off) */
 _Atomic bool db_store_test_not_resident;                   /* the worker's attach finds no image in the page cache (tests: a page cannot be made to leave it) */
 _Atomic bool db_store_test_resident;                       /* the worker's attach finds the image in the page cache whatever mincore() says (tests: on ZFS, and any file system that does not report the pages that were written, mincore() says no) */
-void (*db_store_test_hot_hook)(uint32_t zid);             /* called by the thread of hot.list before each zone (tests: the order, and time) */
 void (*_Atomic db_store_test_adopt_hook)(void);           /* called by a store thread before it registers a staged zone (tests: hold it, and change the zone meanwhile) */
+#ifdef KARIDNS_UNIT_TEST
+void (*db_store_test_hot_hook)(uint32_t zid);             /* called by the thread of hot.list before each zone (tests: the order, and time) */
 #endif
 #define STG_CAP 16384u
 #define STG_PROBE 8u
@@ -746,9 +747,7 @@ static zdir_elem_t *stg_get(uint32_t zid) {
 }
 
 static bool stg_put(zdir_elem_t *el) {
-#ifdef KARIDNS_UNIT_TEST
   if (db_store_test_stg_fail > 0 && --db_store_test_stg_fail == 0) return false;
-#endif
   const size_t h = att_hash(el->zid);
   if (stg_get(el->zid)) return false;
   for (unsigned j = 0; j < STG_PROBE; j++) {
@@ -1621,10 +1620,8 @@ static bool worker_attach(const view_snapshot_t *vs, const zref_t *pel, int widx
       strncasecmp(sz.name, pel->name, sz.klen) != 0)
     return false;
   bool resident = store_image_resident(st, &sz);
-#ifdef KARIDNS_UNIT_TEST
   if (atomic_load_explicit(&db_store_test_resident, memory_order_relaxed)) resident = true;
   if (atomic_load_explicit(&db_store_test_not_resident, memory_order_relaxed)) resident = false;
-#endif
   if (!resident) {                                            /* (not in the page cache, or COPY mode) */
     atomic_fetch_add_explicit(&G.wa_cold, 1, memory_order_relaxed);
     return false;
@@ -1723,12 +1720,10 @@ static void stg_remove_cb(void *s) { stg_remove(s); }
  * answered, and the workers that joined its claim were woken by it. */
 static void adopt_job(uint16_t sview, uint32_t zid) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
-#ifdef KARIDNS_UNIT_TEST
   {
     void (*hook)(void) = atomic_load_explicit(&db_store_test_adopt_hook, memory_order_acquire);
     if (hook) hook();
   }
-#endif
   stgr_run(false);
   rcu_aux_read_lock();
   zdir_elem_t *s = stg_get(zid);

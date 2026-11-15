@@ -175,14 +175,15 @@ void db_store_ma_inputs(ma_in_t *in);
 bool db_store_filling(void);
 /* 0.7 fix 8: a first fill whose first pass (the list of the zones) has not ended: the store does not know every zone yet (warm-before-serve holds the queries until it does) */
 bool db_store_directory_wait(void);
+/* in every build (dns_db_store.c: the coverage of the test programs and of karidns merges) */
+extern int db_store_test_stg_fail;
+extern _Atomic bool db_store_test_not_resident;
+extern _Atomic bool db_store_test_resident;
+extern void (*_Atomic db_store_test_adopt_hook)(void);
 #ifdef KARIDNS_UNIT_TEST
 extern int db_store_test_set_fail;                      /* the n-th set_put_slot() of the settings table fails (0: off) */
 extern int db_store_test_attach_reserve_fail;           /* the n-th reserve of room in the attach table fails (0: off) */
-extern int db_store_test_stg_fail;                      /* the n-th put into the staging table of the worker's attach is refused (0: off) */
-extern _Atomic bool db_store_test_not_resident;         /* the worker's attach finds no image in the page cache */
-extern _Atomic bool db_store_test_resident;             /* ... or finds it there whatever mincore() says (ZFS does not report the pages that were written) */
 extern void (*db_store_test_hot_hook)(uint32_t zid);    /* called by the thread of hot.list before each zone */
-extern void (*_Atomic db_store_test_adopt_hook)(void);   /* called by a store thread before it registers a staged zone */
 extern void (*db_recon_test_entry_hook)(void);          /* called at every entry of a manifest pass (tests: an entry that takes time) */
 extern int db_store_test_bits_fail;                     /* the bit of the n-th entry of a pass cannot be set (0: off) */
 extern _Atomic(const char *) db_store_test_rec_fault_zone;   /* the store cannot read the record of this zone (name with its trailing dot; NULL: off): a damaged cell */
