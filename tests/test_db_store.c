@@ -1021,6 +1021,10 @@ static int run_mode(const char *mode) {
         batch_begin(a[0], &e, 25, KDB_BATCH_DIFF);
         send_zone(a[0], &e, "cold1.test.", 1, 0, 170);
         batch_end(a[0], &e, &mainc, 25, 1, 0);
+        for (int w = 0; w < 500; w++) {                                     /* (the install runs on a builder thread: the limit stays until the zone is in the store, or a slow host installs it after the limit is gone) */
+            if (dbdir()->rec_get("default", "cold1.test.", &rec) && rec.state == STORE_STATE_STORED && dbreg_lookup_entry("default", "cold1.test.") == NULL) break;
+            usleep(10000);
+        }
         dbreg_cache_set_limit(0);
         dbreg_cache_test_pause(false);
         CHECK(stored_only("cold1.test."));

@@ -2279,7 +2279,7 @@ static int64_t dir_usage(const char *path) {
     char p[1100];
     struct stat st;
     snprintf(p, sizeof(p), "%s/%s", path, de->d_name);
-    if (stat(p, &st) == 0 && S_ISREG(st.st_mode)) used += (int64_t)st.st_blocks * 512;
+    if (stat(p, &st) == 0 && S_ISREG(st.st_mode)) used += (int64_t)st.st_size;      /* (the logical size: on ZFS st_blocks lags behind the writes until the transaction group is synced, and compression shrinks it; the sparse files of the store have a constant size that the base cancels) */
   }
   closedir(dp);
   return used;
@@ -2912,6 +2912,7 @@ static void test_space(int mode) {
   o.create = false;
   CHECK_EQ(store_open(d.fd, &o, &s), 0);
   if (!s) { tdir_free(&d); return; }
+  g_fake_cap = dir_usage(d.path) + (int64_t)(256u << 10) / 2;           /* (the reopen starts a new journal, so the files are smaller now: the "disk" is made full again, half of the reserve free) */
   store_test_fs_free = fake_fs_free;
   check_consistent(s, "space reopen");
   {

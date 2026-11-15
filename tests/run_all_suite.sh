@@ -379,6 +379,15 @@ reset_slot_tmp() {
 TEST_COUNT=0
 REGISTERED_TESTS=""
 
+# The watchdog limit of an ASan unit test: UT_TIMEOUT (default 300 s); the store tests run every phase of the store in one binary
+# (proto phases, kill loops, 60 evict / attach cycles) and need more under ASan on a slow CI VM (test_db_store took 309 s there).
+ut_limit() {
+    case "$1" in
+        test_db_store|test_store) echo "${UT_TIMEOUT_LONG:-900}" ;;
+        *) echo "${UT_TIMEOUT:-300}" ;;
+    esac
+}
+
 register_test() {
     # $1: Category, $2: ExecType (bin|sh), $3: Command/Path, $4: Description,
     # $5: optional "par" (default), "group:NAME" or "serial".  Tests of one group
@@ -1101,7 +1110,7 @@ EOF
                 echo "binary ./${_cmd}-asan not found (make unit-test-bins-asan)" > "${_log}"
             else
                 set -- env "ASAN_OPTIONS=detect_leaks=${UT_ASAN_LEAKS:-0}:abort_on_error=0:print_summary=1" "UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1" \
-                    sh tests/run_unit_with_watchdog.sh "${UT_TIMEOUT:-300}" "./${_cmd}-asan"
+                    sh tests/run_unit_with_watchdog.sh "$(ut_limit "${_cmd}")" "./${_cmd}-asan"
             fi
         elif [ ! -x "./${_cmd}" ]; then
             _status="SKIP"
