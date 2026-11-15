@@ -2411,9 +2411,21 @@ zone_version_t *zone_version_new(zone_arena_t *builder) {
   return v;
 }
 
+zone_version_t *zone_version_new_ext(struct zone_image_s *image, size_t image_bytes, void (*image_free)(void *ref), void *ref) {
+  zone_version_t *v = calloc(1, sizeof(*v));
+  if (!v) return NULL;
+  v->image = image;
+  v->heap = true;
+  v->image_free = image_free;
+  v->image_ref = ref;
+  v->bytes = dns_alloc_size(v, sizeof(*v)) + image_bytes;
+  return v;
+}
+
 void zone_version_free(zone_version_t *v) {
   if (!v || !v->heap) return;
-  free(v->image);
+  if (v->image_free) v->image_free(v->image_ref);
+  else free(v->image);
   free(v->glue);
   free(v);
 }

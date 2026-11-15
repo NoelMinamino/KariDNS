@@ -1141,10 +1141,10 @@ static void test_secondary_entries(void) {
         mem2 = find_zone_exact_in_view(v, "m2.test.");
         release_zone_snapshot(s);
     }
-    CHECK(mem2 && mem2->is_catalog_member && mem2->is_secondary && mem2->catalog_master != NULL);
+    CHECK(mem2 && mem2->is_catalog_member && mem2->is_secondary && zone_xr(mem2)->catalog_master != NULL);
     CHECK(tick_list("default", mem2, &in_tick) == 3 && in_tick);                  /* the consumer and its two members */
-    CHECK(mem2 && strcmp(mem2->catalog_master->ip, "192.0.2.1") == 0 && mem2->catalog_master->port == 5300 &&
-          strcmp(mem2->catalog_master->zone_key, "k1") == 0 && mem2->catalog_master->key[0] == '\0');   /* the masters and the tsig-key of the consumer (a database zone's primaries have no key of their own) */
+    CHECK(mem2 && strcmp(zone_xr(mem2)->catalog_master->ip, "192.0.2.1") == 0 && zone_xr(mem2)->catalog_master->port == 5300 &&
+          strcmp(zone_xr(mem2)->catalog_master->zone_key, "k1") == 0 && zone_xr(mem2)->catalog_master->key[0] == '\0');   /* the masters and the tsig-key of the consumer (a database zone's primaries have no key of their own) */
     CHECK(mem1 && mem1 != hid && mem1->is_catalog_member);                                  /* D17-1: the member wins */
     CHECK(!in_snapshot("default", hid) && dbreg_find_info("default", "m1.test.", info, 1) == 1 && info[0].shadowed);
 
@@ -1455,7 +1455,7 @@ static void test_glue_arrivals(void) {
 
     /* 5. more arrivals than the list holds: the tick walks the directory (as it did for every arrival), and the answer is the same */
     gen0 = atomic_load(&atomic_load(&x->rcu.active)->generation);
-    for (int i = 0; i < 20000; i++) zone_glue_note_arrival("default", "flood.test.");
+    for (int i = 0; i < 270000; i++) zone_glue_note_arrival("default", "flood.test.");              /* (the list holds 262144 names: an attach burst does not get near it, a reload of a million zones does) */
     zone_glue_stats(&w0, &t0, &z0);
     zone_glue_refresh_dependents(false);
     zone_glue_stats(&w1, &t1, &z1);
@@ -1656,7 +1656,7 @@ static void test_dir_fetch_state(void) {
     CHECK(ea && ef);
     /* the digest is a block of its own that only a zone with data from the database has */
     CHECK(ea->digest != NULL && ef->digest == NULL);
-    CHECK(sizeof(zdir_elem_t) <= 96);                              /* (104 before the digest left the element; the settings pointer and the cache manager's counters came back for it) */
+    CHECK(sizeof(zdir_elem_t) <= 104);                             /* (104 before the digest left the element; 96 with the settings pointer and the cache manager's counters; 0.7 S3: 104 again with the zone id and the view id of a zone of the store: only a zone in memory has an element) */
 
     /* the fetch state: a zone in memory is not fetched, one that is not in the registry is not a zone, one that has no data is begun once */
     CHECK(dbreg_fetch_begin("default", "nope.test.") == DBREG_FETCH_NONE && dbreg_fetch_begin("nosuchview", "a.test.") == DBREG_FETCH_NONE);
@@ -1734,7 +1734,7 @@ static void test_dir_fetch_state(void) {
             zone_db_entry_t *eb = dbreg_lookup_entry("default", "b.test.");
             CHECK(eb != NULL);
             atomic_store(&ea->freq, 50);
-            if (eb) atomic_store(&eb->observatory.queries_total, 5);
+            if (eb) atomic_store(&eb->ctr[ZCTR_QUERIES], (uint32_t)(5));
             dbreg_hot_t *h = dbreg_hot_begin(8);
             CHECK(h != NULL && dbreg_hot_step(h));                             /* (a registry of a few zones: one slice) */
             CHECK(dbreg_hot_emit(h, hot_collect, &got) == 2 && got.n == 2);
@@ -1840,7 +1840,7 @@ static void test_hot_scan_order(void) {
         snprintf(zname, sizeof(zname), "h%02d.test.", i);
         zone_db_entry_t *ez = add_zone("default", zname, 5, 1, 500 + i);
         CHECK(ez != NULL);
-        if (ez && i != 7) atomic_store(&ez->observatory.queries_total, (uint64_t)(i + 1));          /* (h07 is asked for by nobody) */
+        if (ez && i != 7) atomic_store(&ez->ctr[ZCTR_QUERIES], (uint32_t)((uint64_t)(i + 1)));          /* (h07 is asked for by nobody) */
     }
     struct hot_got got;
     for (uint32_t n_max = 1; n_max <= 8; n_max += 7) {
@@ -1899,7 +1899,7 @@ static void test_hot_scan_long_names(void) {
     for (int i = 0; i < 4; i++) {
         zone_db_entry_t *ez = add_zone("default", names[i], 5, 1, 700 + i);
         CHECK(ez != NULL);
-        if (ez) atomic_store(&ez->observatory.queries_total, (uint64_t)(10 + i));
+        if (ez) atomic_store(&ez->ctr[ZCTR_QUERIES], (uint32_t)((uint64_t)(10 + i)));
     }
     int logged0 = g_hot_log;
     struct hot_lens got;
@@ -2329,7 +2329,7 @@ static void test_zone_bytes(void) {
     zone_bytes_get(ZBYTES_DB, &db);
     CHECK(txn && db.resident == db0.resident + v2->bytes + txn->bytes + fx);            /* (the entry is counted once, not with every version) */
     CHECK(db.retired == db0.retired);                                                   /* (v1 is the zone's prev now, not on the retire stack) */
-    CHECK(db.previous == db0.previous + b1 && z->prev == v1);
+    CHECK(db.previous == db0.previous + b1 && zone_xr(z)->prev == v1);
     zone_retire_process(true);
     zone_bytes_get(ZBYTES_DB, &db);
     CHECK(db.retired == db0.retired && db.resident == db0.resident + v2->bytes + txn->bytes + fx);
@@ -2442,7 +2442,7 @@ static void test_room_on_demand(void) {
         atomic_store(&dbreg_lookup_entry("default", "r3.test.")->updated, true);
         room_age("r4.test.", 0);                                                  /* (unserved: protected for its minimum residency) */
         room_age("r5.test.", 50);
-        atomic_store(&dbreg_lookup_entry("default", "r5.test.")->observatory.queries_total, 3);
+        atomic_store(&dbreg_lookup_entry("default", "r5.test.")->ctr[ZCTR_QUERIES], 3);
         const uint64_t R = room_resident_bytes();
         dbreg_cache_set_limit(R * 100 / 112);
         CHECK(dbreg_cache_over_limit());
@@ -2467,7 +2467,7 @@ static void test_room_on_demand(void) {
         CHECK(!room_resident("r0.test.") && !room_resident("r1.test.") && !room_resident("r5.test."));
         CHECK(room_resident("r4.test.") && room_resident("r2.test.") && room_resident("r3.test."));
         /* the unserved young zone is taken after its minimum residency, not before: served but younger than the floor (10 ms) stays, older than it goes (and counts as relaxed) */
-        atomic_store(&dbreg_lookup_entry("default", "r4.test.")->observatory.queries_total, 1);
+        atomic_store(&dbreg_lookup_entry("default", "r4.test.")->ctr[ZCTR_QUERIES], 1);
         room_age("r4.test.", 0);
         CHECK(dbreg_cache_make_room(1, &rel) == 0 && room_resident("r4.test."));
         room_age("r4.test.", 30);
@@ -2532,29 +2532,29 @@ static void test_prev_db(void) {
     for (int i = 0; i < 3; i++) {
         z[i] = add_zone("default", names[i], 1, 100, 9300 + i);
         CHECK(z[i] != NULL && snapshot_apply_db_delta() == 1);
-        CHECK(z[i] && z[i]->prev == NULL);                                       /* the first install keeps nothing */
+        CHECK(z[i] && zone_xr(z[i])->prev == NULL);                                       /* the first install keeps nothing */
     }
     for (int i = 0; i < 3; i++) {
         CHECK(add_zone("default", names[i], 2, 101, 9300 + i) == z[i]);
-        CHECK(z[i]->prev != NULL && atomic_load(&z[i]->prev_serial) == 1 && z[i]->prev->bytes == atomic_load(&z[i]->prev_bytes));
+        CHECK(zone_xr(z[i])->prev != NULL && atomic_load(&zone_xr(z[i])->prev_serial) == 1 && zone_xr(z[i])->prev->bytes == atomic_load(&zone_xr(z[i])->prev_bytes));
     }
     zone_bytes_get(ZBYTES_DB, &d1);
-    CHECK(d1.previous == z[0]->prev->bytes + z[1]->prev->bytes + z[2]->prev->bytes);
+    CHECK(d1.previous == zone_xr(z[0])->prev->bytes + zone_xr(z[1])->prev->bytes + zone_xr(z[2])->prev->bytes);
     CHECK(d1.retired == d0.retired);
 
     /* a rollback of a DB zone: serial + 1, pinned like an UPDATE, prev consumed; the next install from the database replaces it */
     uint32_t ns = 0, from = 0;
     CHECK(zone_rollback(z[0], false, &ns, &from) == ZRB_OK && from == 2 && ns == 3);
-    CHECK(z[0]->prev == NULL && atomic_load(&z[0]->rolled_back) && atomic_load(&z[0]->updated));
+    CHECK(zone_xr(z[0])->prev == NULL && atomic_load(&z[0]->rolled_back) && atomic_load(&z[0]->updated));
     CHECK(zone_rollback(z[0], false, &ns, &from) == ZRB_NO_PREV);
     CHECK(add_zone("default", names[0], 4, 102, 9300) == z[0]);
-    CHECK(!atomic_load(&z[0]->rolled_back) && !atomic_load(&z[0]->updated) && z[0]->prev != NULL && z[0]->serial == 4);
+    CHECK(!atomic_load(&z[0]->rolled_back) && !atomic_load(&z[0]->updated) && zone_xr(z[0])->prev != NULL && z[0]->serial == 4);
     zone_retire_process(true);
 
     /* memory-limit: three previous versions; the limit is reached by a little: the oldest one goes, no zone is evicted */
     zone_bytes_get(ZBYTES_DB, &d1);
     uint64_t used = d1.resident + d1.retired + d1.previous;
-    uint64_t pb = z[1]->prev->bytes;                                              /* (z[1] has the oldest one) */
+    uint64_t pb = zone_xr(z[1])->prev->bytes;                                              /* (z[1] has the oldest one) */
     CHECK(d1.previous > 0 && pb * 100 > used * 6);
     uint64_t limit = (used - pb + 100) / 9 * 10;                               /* need = used - 0.9 * limit = pb - 100 */
     dbreg_cache_set_limit(limit);
@@ -2565,12 +2565,12 @@ static void test_prev_db(void) {
     CHECK(dbreg_cache_round() == 0);
     dbreg_cache_stats(&cs1);
     CHECK(cs1.evictions == cs0.evictions);
-    CHECK(z[1]->prev == NULL && z[2]->prev != NULL && z[0]->prev != NULL);        /* the earliest deadline went, only that */
+    CHECK(zone_xr(z[1])->prev == NULL && zone_xr(z[2])->prev != NULL && zone_xr(z[0])->prev != NULL);        /* the earliest deadline went, only that */
     CHECK(zone_prev_inflight() == pb);
     zone_retire_process(true);
     CHECK(zone_prev_inflight() == 0);
     zone_bytes_get(ZBYTES_DB, &d1);
-    CHECK(d1.previous == z[0]->prev->bytes + z[2]->prev->bytes);
+    CHECK(d1.previous == zone_xr(z[0])->prev->bytes + zone_xr(z[2])->prev->bytes);
 
     /* the limit is far below what the zones need: every previous version goes first, then zones are taken out */
     usleep(200 * 1000);                                                           /* (a zone is not taken out within 100 ms of its load) */
@@ -2692,7 +2692,7 @@ static void test_evict_drops_ixfr_history(void) {
  * back with the entry: through updates, evictions and fetches back, a delete, and for a zone of a file.  The entry is small (B2). ---- */
 static void test_zone_fixed_charge(void) {
     printf("[TEST] memory-limit counts what the entry costs: charge == release over updates, evictions, fetches back and deletes; the entry is small...\n");
-    CHECK(sizeof(zone_db_entry_t) <= 600);                                           /* B2: it was 1032 */
+    CHECK(sizeof(zone_db_entry_t) <= 224);                                           /* B2: it was 1032, S5: the core alone, and the cold fields are zone_x_t */
     dbreg_reset();
     rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
     gc_snapshot_wait_idle();
@@ -2703,7 +2703,7 @@ static void test_zone_fixed_charge(void) {
     uint32_t serial = 1;
     zone_db_entry_t *e = add_zone("default", nm, serial, 3, 9700);
     CHECK(e != NULL && snapshot_apply_db_delta() == 1);
-    CHECK(e->rx_note == NULL && atomic_load(&e->rx_present) == false);               /* (B2: no note block until there is a note) */
+    CHECK(zone_xr(e)->rx_note == NULL && atomic_load(&e->rx_present) == false);               /* (B2: no note block until there is a note) */
     CHECK(strcmp(e->domain, nm) == 0 && (const char *)e->domain == (const char *)(e + 1));   /* (B2: the name is in the entry's block) */
     uint64_t fx = atomic_load(&e->fixed_charged);
     CHECK(fx >= e->block_bytes && e->block_bytes >= sizeof(zone_db_entry_t) + strlen(nm) + 1);
@@ -2890,6 +2890,222 @@ static void test_alias_notices(void) {
     zone_retire_process(true);
 }
 
+/* ---- 0.7 store S5: the entry is a core and an extension (design 4.2, 6.1) ---- */
+static void *xneed_thread(void *arg) {
+    zone_db_entry_t *e = arg;
+    zone_x_t *first = NULL;
+    for (int i = 0; i < 2000; i++) {
+        zone_x_t *x = zone_x_need(e);
+        if (!first) first = x;
+        atomic_fetch_add_explicit(&x->obs.edns_queries, 1, memory_order_relaxed);
+    }
+    return first;
+}
+
+static void test_entry_core_ext(void) {
+    printf("[TEST] the entry is a core and a lazily made extension: its size, the pool slots, the 32-bit counters and their carry, one extension under concurrent need...\n");
+    /* the size: the core and a name of 31 characters fit a slot of 256 octets (it was 584 octets of entry in a block of the 640 class) */
+    CHECK(sizeof(zone_db_entry_t) <= 224);
+    CHECK(sizeof(zone_db_entry_t) + 32 <= 256);
+    CHECK(sizeof(zone_x_t) > sizeof(zone_db_entry_t) / 2);                    /* (what moved out is a good part of the old entry) */
+
+    zone_entry_pool_stats_t p0, p1, p2;
+    zone_entry_pool_stats(&p0);
+    enum { NL = 20000 };
+    zone_db_entry_t **le = calloc(NL, sizeof(*le));
+    CHECK(le != NULL);
+    bool all_light = true, all_aligned = true, all_named = true;
+    for (int i = 0; le && i < NL; i++) {
+        char nm[64];
+        snprintf(nm, sizeof(nm), "l%05d.test.", i);
+        le[i] = create_light_zone_entry(nm, "default");
+        if (!le[i]) { all_light = false; continue; }
+        if (!le[i]->pooled || !le[i]->light || zone_x(le[i]) != NULL || le[i]->block_bytes != 256) all_light = false;
+        if (((uintptr_t)le[i] & 255u) != 0) all_aligned = false;
+        if (strcmp(le[i]->domain, nm) != 0 || strcmp(le[i]->view_name, "default") != 0 || le[i]->id == 0) all_named = false;
+    }
+    CHECK(all_light && all_aligned && all_named);                            /* (a light entry: a pool slot, no extension, the name behind the struct) */
+    zone_entry_pool_stats(&p1);
+    CHECK(p1.used == p0.used + NL && p1.slabs >= p0.slabs + 2 && p1.slot_bytes == 256);
+    {
+        static const unsigned char zero[sizeof(pthread_mutex_t)];
+        CHECK(memcmp(&le[0]->writer_lock, zero, sizeof(zero)) == 0);          /* (the lock is made by its first use: libthr, B2) */
+        CHECK(zone_entry_fixed_now(le[0]) == 256);                            /* (the slot, and no lock: it is not made until it is used) */
+    }
+    /* an entry that is not light has its extension from the start, a lock, and the same interned view name */
+    zone_db_entry_t *fe = create_new_zone_entry("full.test.", "default");
+    CHECK(fe && !fe->pooled && !fe->light && zone_x(fe) != NULL && fe->view_name == le[0]->view_name);
+    /* a name that does not fit the slot is a malloc block (light, not pooled) */
+    {
+        char longn[200];
+        memset(longn, 'x', sizeof(longn) - 8);
+        snprintf(longn + sizeof(longn) - 8, 8, ".test.");
+        zone_db_entry_t *ln = create_light_zone_entry(longn, "default");
+        CHECK(ln && ln->light && !ln->pooled && ln->block_bytes >= sizeof(zone_db_entry_t) + 190 && strcmp(ln->domain, longn) == 0);
+        free_zone_db_entry(ln);
+    }
+    /* the entries go back to the pool, and the pool gives slabs back (one spare is kept) */
+    for (int i = 0; le && i < NL; i++) free_zone_db_entry(le[i]);
+    zone_entry_pool_stats(&p2);
+    CHECK(p2.used == p0.used && p2.slabs <= p0.slabs + 1 && p2.slab_gone > p1.slab_gone && p2.frees == p1.frees + NL);
+    free(le);
+
+    /* the eight counters of the core: 32 bits and a carry at every multiple of 2^31 (an entry with an extension) */
+    zone_db_entry_t *ce = create_new_zone_entry("ctr.test.", "default");
+    CHECK(ce != NULL);
+    if (ce) {
+        atomic_store(&ce->ctr[ZCTR_QUERIES], 0x7FFFFFFEu);
+        for (int i = 0; i < 4; i++) zone_ctr_inc(ce, ZCTR_QUERIES);          /* 0x7FFFFFFF, 0x80000000 (the first crossing), ... */
+        CHECK(zone_ctr_get(ce, ZCTR_QUERIES) == 0x80000002ull);
+        atomic_store(&ce->ctr[ZCTR_QUERIES], 0xFFFFFFFEu);
+        atomic_store(&zone_x(ce)->ctr_carry[ZCTR_QUERIES], 1);
+        for (int i = 0; i < 3; i++) zone_ctr_inc(ce, ZCTR_QUERIES);          /* ... 0xFFFFFFFF, 0 (the second crossing), 1 */
+        CHECK(atomic_load(&zone_x(ce)->ctr_carry[ZCTR_QUERIES]) == 2 && zone_ctr_get(ce, ZCTR_QUERIES) == 0x100000001ull);
+        atomic_store(&ce->ctr[ZCTR_TCP], 0x80000005u);                        /* a crossing whose carry is not added yet is seen by the reader (bit 31 against the parity of the carry) */
+        CHECK(zone_ctr_get(ce, ZCTR_TCP) == 0x80000005ull);
+        zone_obs_view_t ov;
+        atomic_store(&ce->ctr[ZCTR_NOERROR], 7);
+        atomic_store(&ce->ctr[ZCTR_DO], 3);
+        atomic_store(&zone_x(ce)->obs.wirecache_hits, 11);
+        zone_obs_read(ce, &ov);
+        CHECK(ov.queries_total == 0x100000001ull && ov.responses_noerror == 7 && ov.dnssec_do_queries == 3 && ov.wirecache_hits == 11 && ov.tcp_queries == 0x80000005ull && ov.responses_nodata == 0);
+        free_zone_db_entry(ce);
+    }
+    /* a light entry has no carry: its counter is what it was since the attach, and wraps */
+    zone_db_entry_t *lx = create_light_zone_entry("light.test.", "default");
+    CHECK(lx != NULL);
+    if (lx) {
+        atomic_store(&lx->ctr[ZCTR_QUERIES], 0xFFFFFFFFu);
+        zone_ctr_inc(lx, ZCTR_QUERIES);
+        CHECK(zone_ctr_get(lx, ZCTR_QUERIES) == 0 && zone_x(lx) == NULL);
+        ZONE_OBS_ADD(lx, edns_queries, 5);                                    /* (the statistics of the extension are not counted for an entry that has none, and make none) */
+        CHECK(zone_x(lx) == NULL);
+        /* many threads need the extension at once: one block wins, every thread sees that one, no count is lost */
+        pthread_t th[4];
+        for (int i = 0; i < 4; i++) CHECK(pthread_create(&th[i], NULL, xneed_thread, lx) == 0);
+        void *ptr[4];
+        for (int i = 0; i < 4; i++) pthread_join(th[i], &ptr[i]);
+        CHECK(zone_x(lx) != NULL && ptr[0] == zone_x(lx) && ptr[1] == ptr[0] && ptr[2] == ptr[0] && ptr[3] == ptr[0]);
+        CHECK(atomic_load(&zone_x(lx)->obs.edns_queries) == 8000);
+        free_zone_db_entry(lx);
+    }
+    /* a zeroed entry on the stack (a test's) reads as "no extension": the zeroed block */
+    {
+        zone_db_entry_t st;
+        memset(&st, 0, sizeof(st));
+        CHECK(zone_x(&st) == NULL && zone_xr(&st)->catalog_member_count == 0 && zone_xr(&st)->prev == NULL && zone_ctr_get(&st, ZCTR_REFUSED) == 0 && strcmp(zone_vname(&st), "") == 0);
+        CHECK(zone_entry_catalog_uid(&st)[0] == '\0' && zone_entry_catalog_owner(&st)[0] == '\0');
+    }
+    free_zone_db_entry(fe);
+}
+
+/* ---- 0.7 store S5 (design 6.7): the texts of rejected zones are in a bounded ring, not in the zone's element ---- */
+static int g_sink_put, g_sink_get, g_sink_clear;
+static uint32_t g_sink_zid;
+static uint32_t g_sink_tag;
+static uint64_t g_sink_stamp, g_sink_get_stamp;
+static void sink_put(uint32_t zid, uint32_t tag, uint64_t stamp, const char *text) { g_sink_put++; g_sink_zid = zid; g_sink_tag = tag; g_sink_stamp = stamp; (void)text; }
+static bool sink_get(uint32_t zid, uint32_t tag, uint64_t stamp, char *out, size_t cap) {
+    g_sink_get++;
+    g_sink_get_stamp = stamp;
+    (void)tag;
+    if (zid != 4242) return false;
+    snprintf(out, cap, "%s", "from the err.ring file");
+    return true;
+}
+static void sink_clear(uint32_t zid) { g_sink_clear++; g_sink_zid = zid; }
+
+static void test_error_ring(void) {
+    printf("[TEST] the errors of rejected zones: a ring of 512 texts, one per zone, replaced, forgotten, pushed out by newer ones, and a sink behind it...\n");
+    char out[300];
+    dbreg_err_reset_for_test();
+    CHECK(!dbreg_err_get("default", "a.test.", 0xFFFFFFFFu, out, sizeof(out)) && out[0] == '\0');
+    dbreg_err_note("default", "a.test.", 0xFFFFFFFFu, "bad row 7");
+    CHECK(dbreg_err_get("default", "a.test.", 0xFFFFFFFFu, out, sizeof(out)) && strcmp(out, "bad row 7") == 0);
+    CHECK(!dbreg_err_get("other", "a.test.", 0xFFFFFFFFu, out, sizeof(out)));          /* (a zone of another view) */
+    CHECK(!dbreg_err_get("default", "b.test.", 0xFFFFFFFFu, out, sizeof(out)));
+    dbreg_err_note("default", "a.test.", 0xFFFFFFFFu, "second");                       /* (one text per zone: the next rejection replaces it) */
+    size_t n;
+    uint64_t noted, dropped;
+    dbreg_err_stats(&n, &noted, &dropped);
+    CHECK(n == 1 && noted == 2 && dropped == 0);
+    CHECK(dbreg_err_get("default", "a.test.", 0xFFFFFFFFu, out, sizeof(out)) && strcmp(out, "second") == 0);
+    dbreg_err_note("default", "a.test.", 0xFFFFFFFFu, NULL);                           /* (a version of the zone was registered: the text goes) */
+    dbreg_err_stats(&n, &noted, &dropped);
+    CHECK(n == 0 && !dbreg_err_get("default", "a.test.", 0xFFFFFFFFu, out, sizeof(out)));
+    dbreg_err_note("default", "never.test.", 0xFFFFFFFFu, NULL);                       /* (nothing to forget) */
+    /* a text longer than a slot is cut, and the ring does not grow beyond its slots: the oldest are pushed out */
+    char longt[400];
+    memset(longt, 'e', sizeof(longt) - 1);
+    longt[sizeof(longt) - 1] = '\0';
+    dbreg_err_note("default", "long.test.", 0xFFFFFFFFu, longt);
+    CHECK(dbreg_err_get("default", "long.test.", 0xFFFFFFFFu, out, sizeof(out)) && strlen(out) == 191);
+    dbreg_err_note("default", "long.test.", 0xFFFFFFFFu, NULL);
+    for (int i = 0; i < 600; i++) {
+        char zn[32], tx[32];
+        snprintf(zn, sizeof(zn), "z%04d.test.", i);
+        snprintf(tx, sizeof(tx), "error %d", i);
+        dbreg_err_note("default", zn, 0xFFFFFFFFu, tx);
+    }
+    dbreg_err_stats(&n, &noted, &dropped);
+    CHECK(n == 512 && dropped == 600 - 512);
+    CHECK(!dbreg_err_get("default", "z0000.test.", 0xFFFFFFFFu, out, sizeof(out)) && !dbreg_err_get("default", "z0087.test.", 0xFFFFFFFFu, out, sizeof(out)));      /* (the oldest 88) */
+    CHECK(dbreg_err_get("default", "z0088.test.", 0xFFFFFFFFu, out, sizeof(out)) && strcmp(out, "error 88") == 0);
+    CHECK(dbreg_err_get("default", "z0599.test.", 0xFFFFFFFFu, out, sizeof(out)) && strcmp(out, "error 599") == 0);
+    /* forgetting frees the slots for newer texts and the index stays right (tombstones) */
+    for (int i = 100; i < 200; i++) {
+        char zn[32];
+        snprintf(zn, sizeof(zn), "z%04d.test.", i);
+        dbreg_err_note("default", zn, 0xFFFFFFFFu, NULL);
+    }
+    dbreg_err_stats(&n, &noted, &dropped);
+    CHECK(n == 412);
+    bool ok = true;
+    for (int i = 88; i < 600; i++) {
+        char zn[32];
+        snprintf(zn, sizeof(zn), "z%04d.test.", i);
+        const bool want = i < 100 || i >= 200;
+        ok = ok && dbreg_err_get("default", zn, 0xFFFFFFFFu, out, sizeof(out)) == want;
+    }
+    CHECK(ok);
+    /* a store that keeps the texts in a file: the ring answers first, the sink behind it */
+    static const dbreg_err_sink_t sink = { sink_put, sink_get, sink_clear };
+    dbreg_err_reset_for_test();
+    dbreg_err_set_sink(&sink);
+    dbreg_err_note("default", "s.test.", 77, "kept in the ring and in the file");
+    CHECK(g_sink_put == 1 && g_sink_zid == 77);
+    CHECK(dbreg_err_get("default", "s.test.", 77, out, sizeof(out)) && strcmp(out, "kept in the ring and in the file") == 0 && g_sink_get == 0);
+    CHECK(dbreg_err_get("default", "gone.test.", 4242, out, sizeof(out)) && strcmp(out, "from the err.ring file") == 0 && g_sink_get == 1);      /* (pushed out of the ring, or from before a restart) */
+    CHECK(!dbreg_err_get("default", "gone.test.", 4243, out, sizeof(out)));
+    CHECK(!dbreg_err_get("default", "gone.test.", 0xFFFFFFFFu, out, sizeof(out)));                                                           /* (no id: no sink) */
+    dbreg_err_note("default", "s.test.", 77, NULL);
+    CHECK(g_sink_clear == 1 && g_sink_zid == 77);
+    /* the sink gets the name's tag and the stamp of the record with the text, and is asked with the stamp the reader has */
+    dbreg_err_note_st("default", "t.test.", 78, 0x1234, "stamped");
+    CHECK(g_sink_put == 2 && g_sink_zid == 78 && g_sink_stamp == 0x1234 && g_sink_tag != 0 && g_sink_tag <= 0xFFFFFFu);
+    const uint32_t tag_t = g_sink_tag;
+    dbreg_err_note_st("other", "t.test.", 78, 0x1234, "another view");
+    CHECK(g_sink_tag != tag_t);                                                                    /* (the tag is the name of the view and the zone) */
+    CHECK(dbreg_err_get_st("default", "nope.test.", 4242, 0x77, out, sizeof(out)) && g_sink_get_stamp == 0x77);
+    dbreg_err_reset_for_test();
+}
+
+/* 0.7 store: the arrivals are taken by a thread of its own (the control thread is for karictl), once every few milliseconds, with no call from the test */
+static void test_glue_thread(void) {
+    printf("[the glue thread]\n");
+    uint64_t w0, t0, z0, w1, t1, z1;
+    zone_glue_stats(&w0, &t0, &z0);
+    CHECK(zone_glue_thread_start() && zone_glue_thread_start());                      /* (a second start is the same thread) */
+    zone_glue_note_arrival("default", "glue-thread.test.");
+    t1 = t0;
+    w1 = w0;
+    for (int i = 0; i < 500 && t1 == t0 && w1 == w0; i++) {
+        usleep(10000);
+        zone_glue_stats(&w1, &t1, &z1);
+    }
+    CHECK(t1 > t0 || w1 > w0);
+}
+
 int main(void) {
     snprintf(g_dir, sizeof(g_dir), "/tmp/karidns_dbreg.XXXXXX");
     if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
@@ -2923,8 +3139,11 @@ int main(void) {
     test_prev_concurrent();
     test_evict_drops_ixfr_history();
     test_zone_fixed_charge();
+    test_entry_core_ext();
+    test_error_ring();
     test_alias_notices();
     test_concurrent();
+    test_glue_thread();
     gc_snapshot_wait_idle();      /* join the cleanup threads: none is left running (or leaked, for ThreadSanitizer) at exit */
     free(g_names);
     /* Remove the scratch directory in-process: the detached snapshot GC threads of test_concurrent may still be starting

@@ -35,6 +35,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+STORE=${DB_STORE:-off}                              # on: the zone store is the directory (run_karictl_rollback_db_store_test.sh)
+STORE_ML=""; [ "$STORE" = on ] && STORE_ML="memory-limit 64m;"          # (with the store and no memory-limit every zone is read into memory at the start: the zones would never be out of memory)
 PASS=0; FAILS=0
 pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
@@ -66,7 +68,7 @@ KCTL="./karictl -c $T/karictl.conf"
 cat > "$T/k.conf" <<EOF
 options {
     user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT;
-    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; db-reload-timeout 4; };
+    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; $(store_stmt "$T") $STORE_ML db-reload-timeout 4; };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
 EOF
@@ -114,6 +116,7 @@ echo "== it stays until the data in the database change"
 OUT=$($KCTL reload db1.test 2>&1)
 printf '%s\n' "$OUT" | grep -q 'unchanged, serial 12$' && pass "reload <zone>: $OUT" || fail "reload db1.test: '$OUT'"
 check "still the old data" 192.0.2.10 12
+if [ "$STORE" != on ]; then
 $KCTL reload > /dev/null 2>&1
 sleep 3
 check "after a full reload" 192.0.2.10 12
@@ -127,6 +130,11 @@ else
 fi
 OUT=$($KCTL zonestatus db1.test 2>&1)
 printf '%s\n' "$OUT" | grep -q 'rolled back (serial 12, from 11)' && pass "still marked as rolled back" || fail "zonestatus after the loader restart: $OUT"
+else
+    # (with the zone store the zone's record is the version of the database, and a full reload or a restart of the loader reads the zone again: the rolled-back version is kept through `reload <zone>` only; the
+    # version before the last one is kept with the zone in memory, the store has the current image alone)
+    echo "   (store: a full reload and a restart of the loader are not checked: the rolled-back version does not outlive them)"
+fi
 
 echo "== force sends the database's data again; the next change is installed normally"
 OUT=$($KCTL reload db1.test force 2>&1)
@@ -140,6 +148,35 @@ OUT=$($KCTL reload db1.test 2>&1)
 printf '%s\n' "$OUT" | grep -q 'applied, serial 12$' && pass "the fixed data: $OUT" || fail "reload fixed: '$OUT'"
 check "the fixed data are served" 192.0.2.10 12
 kill -0 "$SRV" 2>/dev/null && pass "the server runs" || fail "the server is gone"
+
+# 0.7 (review of S3 + S4, M4): the control commands find a zone of the store whether or not it is in memory.  The server is started again on its store: the zones are stored and not in memory.
+if [ "$STORE" = on ]; then
+    echo "== a zone of the store that is not in memory"
+    # (the first start after the changes above reads the changes the cursor of the store has not seen yet, and brings those zones into memory; the next start has nothing left to read)
+    for round in 1 2; do
+        kill -TERM "$SRV" 2>/dev/null
+        i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+        : > "$T/srv.log"
+        "$KARIDNS" -c "$T/k.conf" -f > "$T/srv.log" 2>&1 &
+        SRV=$!
+        kari_wait_log "$T/srv.log" "\[DB\] initial load complete" 20 && pass "the server started again on its store (start $round)" || { fail "no initial load after the restart"; tail -10 "$T/srv.log"; }
+        j=0; while [ $j -lt 100 ] && ! $KCTL dbstatus 2>/dev/null | grep -q 'bodies: 0 without one now.* 0 in flight'; do sleep 0.1; j=$((j + 1)); done
+    done
+    OUT=$($KCTL zonestatus db1.test 2>&1)
+    printf '%s\n' "$OUT" | grep -q 'source=database' && printf '%s\n' "$OUT" | grep -q 'serial=12 ' && printf '%s\n' "$OUT" | grep -q 'in the zone store, not in memory' && pass "zonestatus shows the record of the zone: $OUT" || fail "zonestatus of a zone that is not in memory: '$OUT' ($($KCTL dbstatus 2>&1 | grep -E '^residency|^zone directory|^store pass' | tr '\n' ' '))"
+    OUT=$($KCTL rollback db1.test 2>&1); RC=$?
+    [ $RC -eq 3 ] && printf '%s\n' "$OUT" | grep -q '^ERROR the zone is in the zone store and not in memory' && pass "rollback says why there is nothing to roll back" || fail "rollback of a zone that is not in memory: rc $RC '$OUT'"
+    OUT=$($KCTL notify db1.test 2>&1); RC=$?
+    [ $RC -eq 0 ] && printf '%s\n' "$OUT" | grep -q '^OK' && pass "notify is accepted for a zone that is not in memory: $OUT" || fail "notify of a zone that is not in memory: rc $RC '$OUT'"
+    check "a query attaches the zone" 192.0.2.10 12
+    OUT=$($KCTL zonestatus db1.test 2>&1)
+    printf '%s\n' "$OUT" | grep -q 'in the zone store, not in memory' && fail "zonestatus of the attached zone still says not in memory: $OUT" || pass "zonestatus of the attached zone: $OUT"
+    OUT=$($KCTL notify db1.test 2>&1); RC=$?
+    [ $RC -eq 0 ] && [ "$OUT" = "OK" ] && pass "notify of the attached zone" || fail "notify of the attached zone: rc $RC '$OUT'"
+    OUT=$($KCTL rollback db1.test 2>&1); RC=$?
+    [ $RC -eq 3 ] && printf '%s\n' "$OUT" | grep -q '^ERROR no previous version' && pass "rollback of the attached zone finds it (and has no previous version)" || fail "rollback of the attached zone: rc $RC '$OUT'"
+    kill -0 "$SRV" 2>/dev/null && pass "the server runs" || fail "the server is gone after the commands"
+fi
 
 echo "$PASS passed, $FAILS failed"
 [ "$FAILS" -eq 0 ] && { echo "[+] karictl rollback (database zone) tests passed."; exit 0; }

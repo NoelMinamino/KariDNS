@@ -23,6 +23,10 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
+#include <sys/types.h>
+#include <sys/time.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
 #ifdef __FreeBSD__
 #include <sys/types.h>
 #include <sys/event.h>
@@ -58,8 +62,8 @@ static void test_table(void) {
   int32_t a = park_udp(&t, 1000, 1500, "v2", "a.test.", 3, &ipc, pay, 40);
   CHECK(a == 0 && t.nwait == 1 && t.nfree == 3);
   park_entry_t *ea = park_get(&t, a, t.e[a].gen);
-  CHECK(ea && ea->state == PARK_WAIT && ea->kind == PARK_UDP && strcmp(ea->view, "v2") == 0 && strcmp(ea->zone, "a.test.") == 0 && ea->zlen == 7);
-  CHECK(ea->deadline_ms == 2500 && ea->udp_len == 40 && ea->u.udp.ipc.sock_fd_idx == 7 && ea->u.udp.payload[39] == 0xA5);
+  CHECK(ea && ea->state == PARK_WAIT && ea->kind == PARK_UDP && strcmp(park_entry_view(ea), "v2") == 0 && strcmp(park_entry_zone(ea), "a.test.") == 0 && ea->zlen == 7);
+  CHECK(ea->deadline_ms == 2500 && ea->udp_len == 40 && park_entry_ipc(ea)->sock_fd_idx == 7 && park_entry_req(ea)[39] == 0xA5 && ea->fd == 3);
   CHECK(park_next_deadline_ms(&t, 1000) == 1500 && park_next_deadline_ms(&t, 3000) == 0);
 
   /* refused: a request that is too big, an empty zone name, a zone name that does not fit (and nothing was taken) */
@@ -90,14 +94,13 @@ static void test_table(void) {
   CHECK(park_wake(&t, "v0", "nope.test.") == 0);
   CHECK(park_wake(&t, "v0", "b.test.") == 1 && t.nwait == 3 && t.nready == 1);
   CHECK(park_wake(&t, "v0", "b.test.") == 0);                                      /* (already awake) */
-  uint32_t cur = 0;
-  park_entry_t *d = park_next_done(&t, &cur);
-  CHECK(d && d->state == PARK_READY && strcmp(d->zone, "b.test.") == 0 && strcmp(d->view, "v0") == 0);
-  CHECK(park_next_done(&t, &cur) == NULL);
+  park_entry_t *d = park_next_done(&t);
+  CHECK(d && d->state == PARK_READY && strcmp(park_entry_zone(d), "b.test.") == 0 && strcmp(park_entry_view(d), "v0") == 0);
+  CHECK(park_next_done(&t) == d);                                                 /* (the entry stays at the head of the done list until it is released) */
   uint32_t gen_b = d->gen;
   int32_t idx_b = (int32_t)(d - t.e);
   park_release(&t, d);
-  CHECK(t.nready == 0 && t.nfree == 1 && d->state == PARK_FREE);
+  CHECK(t.nready == 0 && t.nfree == 1 && d->state == PARK_FREE && park_next_done(&t) == NULL);
   CHECK(park_get(&t, idx_b, gen_b) == NULL);                                     /* a handle to a free entry */
   park_release(&t, d);                                                           /* a second release changes nothing */
   CHECK(t.nfree == 1);
@@ -113,17 +116,15 @@ static void test_table(void) {
   CHECK(park_expire(&t, 1050) == 0);
   CHECK(park_expire(&t, 1100) == 1 && t.nwait == 3 && t.nready == 1 && t.n_timeout == 1);
   CHECK(park_expire(&t, 1100) == 0);
-  cur = 0;
-  d = park_next_done(&t, &cur);
-  CHECK(d && d->state == PARK_TIMEOUT && strcmp(d->zone, "c.test.") == 0);
+  d = park_next_done(&t);
+  CHECK(d && d->state == PARK_TIMEOUT && strcmp(park_entry_zone(d), "c.test.") == 0);
   CHECK(park_wake(&t, "v0", "c.test.") == 0);                                       /* a timed out entry is not woken */
   park_release(&t, d);
   CHECK(park_next_deadline_ms(&t, 1200) == 1300);                                /* a.test. 2500, the rest 2500 */
   CHECK(park_expire(&t, 2500) == 3 && t.nwait == 0 && t.nready == 3);
   CHECK(park_next_deadline_ms(&t, 3000) == -1);
-  cur = 0;
   uint32_t served = 0;
-  while ((d = park_next_done(&t, &cur))) {
+  while ((d = park_next_done(&t))) {
     park_release(&t, d);
     served++;
   }
@@ -132,21 +133,18 @@ static void test_table(void) {
   /* wake everything */
   CHECK(park_udp(&t, 0, 1500, "v0", "a.test.", 3, &ipc, pay, 20) >= 0 && park_udp(&t, 0, 1500, "v1", "b.test.", 3, &ipc, pay, 20) >= 0);
   CHECK(park_wake_all(&t) == 2 && t.nwait == 0 && t.nready == 2);
-  cur = 0;
-  while ((d = park_next_done(&t, &cur))) park_release(&t, d);
+  while ((d = park_next_done(&t))) park_release(&t, d);
   CHECK(t.nfree == 4);
 
   /* a failed fetch: the entries for the zone are done at once, as a timeout (park_fail), the others stay */
   CHECK(park_udp(&t, 0, 1500, "v0", "bad.test.", 3, &ipc, pay, 20) >= 0 && park_udp(&t, 0, 1500, "v0", "bad.test.", 3, &ipc, pay, 20) >= 0 && park_udp(&t, 0, 1500, "v1", "bad.test.", 3, &ipc, pay, 20) >= 0);
   CHECK(park_fail(&t, "v0", "nope.test.") == 0 && park_fail(&t, "v0", "bad.test.") == 2 && t.nwait == 1 && t.nready == 2 && t.n_failed == 2);
-  cur = 0;
-  while ((d = park_next_done(&t, &cur))) {
-    CHECK(d->state == PARK_TIMEOUT && strcmp(d->view, "v0") == 0);
+  while ((d = park_next_done(&t))) {
+    CHECK(d->state == PARK_TIMEOUT && strcmp(park_entry_view(d), "v0") == 0);
     park_release(&t, d);
   }
   CHECK(park_wake_all(&t) == 1);
-  cur = 0;
-  while ((d = park_next_done(&t, &cur))) park_release(&t, d);
+  while ((d = park_next_done(&t))) park_release(&t, d);
   CHECK(t.nfree == 4);
 
   /* the generation is never 0, also after the counter wraps */
@@ -165,22 +163,24 @@ static void test_tcp(void) {
   int32_t b = park_tcp(&t, 0, 1500, "v1", "t.test.", 18, 6, 200);
   CHECK(a >= 0 && b >= 0 && t.nwait == 2);
   park_entry_t *ea = park_get(&t, a, t.e[a].gen);
-  CHECK(ea && ea->kind == PARK_TCP && ea->u.tcp.fd == 17 && ea->u.tcp.ctx_idx == 5 && ea->u.tcp.ctx_gen == 100);
-  /* the connection context 5 was reused for another connection (generation 101): the entry of generation 100 is not the new one's */
-  CHECK(!park_cancel_tcp(&t, 5, 101));
-  CHECK(!park_cancel_tcp(&t, 7, 100));
+  CHECK(ea && ea->kind == PARK_TCP && ea->fd == 17 && ea->ctx_idx == 5 && ea->ctx_gen == 100);
+  const uint32_t ga = ea->gen, gb = t.e[b].gen;
+  /* the connection keeps the handle (index, generation) of its entry (tcp_stream_ctx_t.park_idx / park_gen): a handle that names a free entry, or an entry that was given out again, cancels nothing */
+  CHECK(!park_cancel_tcp(&t, a, ga + 1));
+  CHECK(!park_cancel_tcp(&t, 7, 1));
+  CHECK(!park_cancel_tcp(&t, -1, ga));
   CHECK(t.nwait == 2);
-  CHECK(park_cancel_tcp(&t, 5, 100) && t.nwait == 1 && t.n_cancelled == 1);
-  CHECK(park_get(&t, a, ea->gen) == NULL);
-  CHECK(!park_cancel_tcp(&t, 5, 100));
+  CHECK(park_cancel_tcp(&t, a, ga) && t.nwait == 1 && t.n_cancelled == 1);
+  CHECK(park_get(&t, a, ga) == NULL);
+  CHECK(!park_cancel_tcp(&t, a, ga));
   /* an awake entry is cancelled too (the connection closed before the worker served it) */
   CHECK(park_wake(&t, "v1", "t.test.") == 1);
-  CHECK(park_cancel_tcp(&t, 6, 200) && t.nwait == 0 && t.nready == 0 && t.nfree == 8);
+  CHECK(park_cancel_tcp(&t, b, gb) && t.nwait == 0 && t.nready == 0 && t.nfree == 8 && park_next_done(&t) == NULL);
   /* a UDP entry is never cancelled by a TCP context */
   udp_ipc_t ipc = mk_ipc(1);
   uint8_t pay[20] = { 0 };
   int32_t u = park_udp(&t, 0, 1500, "v1", "u.test.", 3, &ipc, pay, 20);
-  CHECK(u >= 0 && !park_cancel_tcp(&t, 0, 0) && t.nwait == 1);
+  CHECK(u >= 0 && !park_cancel_tcp(&t, u, t.e[u].gen) && t.nwait == 1);
   park_free(&t);
 }
 
@@ -195,8 +195,8 @@ static void test_rings(void) {
   atomic_store(&wr->overflow, true);
   CHECK(park_wake_pending(wr) && park_wake_take_overflow(wr) && !park_wake_pending(wr));    /* a dropped wake is something too */
   CHECK(park_wake_push(wr, "v3", "one.test.", false) && park_wake_push(wr, "v4", "two.test.", false));
-  CHECK(park_wake_pop(wr, &k) && strcmp(k.view, "v3") == 0 && strcmp(k.zone, "one.test.") == 0 && k.zlen == 9);
-  CHECK(park_wake_pop(wr, &k) && strcmp(k.view, "v4") == 0 && strcmp(k.zone, "two.test.") == 0);
+  CHECK(park_wake_pop(wr, &k) && park_key_is(&k, "v3", "one.test.") && !park_key_is(&k, "v4", "one.test.") && !park_key_is(&k, "v3", "two.test.") && !k.failed && !k.retry && !k.fetch);
+  CHECK(park_wake_pop(wr, &k) && park_key_is(&k, "v4", "two.test."));
   CHECK(!park_wake_pop(wr, &k) && !park_wake_take_overflow(wr));
   /* full: the key is dropped and the overflow flag says the consumer must look at everything */
   for (int i = 0; i < PARK_WAKE_RING; i++) CHECK(park_wake_push(wr, "v0", "z.test.", false));
@@ -212,7 +212,7 @@ static void test_rings(void) {
     snprintf(nm, sizeof(nm), "n%d.test.", i);
     char vn[16];
     snprintf(vn, sizeof(vn), "view%d", i);
-    CHECK(park_wake_push(wr, vn, nm, false) && park_wake_pop(wr, &k) && strcmp(k.view, vn) == 0 && strcmp(k.zone, nm) == 0);
+    CHECK(park_wake_push(wr, vn, nm, false) && park_wake_pop(wr, &k) && park_key_is(&k, vn, nm));
   }
 
   park_fetch_ring_t *fr = park_fetch_ring(PARK_MAX_WORKERS - 2);
@@ -236,10 +236,10 @@ static void test_rings(void) {
   while (park_fetch_next(&q)) got += q.view[1] - '0';
   CHECK(got == 3);
   park_wake_broadcast("v7", "wake.test.", false);
-  CHECK(park_wake_pop(park_wake_ring(5), &k) && strcmp(k.view, "v7") == 0 && park_wake_pop(park_wake_ring(9), &k) && strcmp(k.view, "v7") == 0);
+  CHECK(park_wake_pop(park_wake_ring(5), &k) && park_key_is(&k, "v7", "wake.test.") && park_wake_pop(park_wake_ring(9), &k) && park_key_is(&k, "v7", "wake.test."));
   park_unregister_worker(9);
   park_wake_broadcast("v8", "wake2.test.", false);
-  CHECK(park_wake_pop(park_wake_ring(5), &k) && strcmp(k.view, "v8") == 0 && !park_wake_pop(park_wake_ring(9), &k));
+  CHECK(park_wake_pop(park_wake_ring(5), &k) && park_key_is(&k, "v8", "wake2.test.") && !park_wake_pop(park_wake_ring(9), &k));
   park_unregister_worker(5);
   CHECK(park_wake_ring(-1) == NULL && park_wake_ring(PARK_MAX_WORKERS) == NULL && park_fetch_ring(-1) == NULL);
 }
@@ -296,15 +296,14 @@ static void *worker(void *arg) {
     }
     /* what the ingest thread said */
     park_key_t k;
-    while (park_wake_pop(wr, &k)) (void)park_wake(&t, k.view, k.zone);
+    while (park_wake_pop(wr, &k)) (void)park_wake_key(&t, k.key);
     if (park_wake_take_overflow(wr)) (void)park_wake_all(&t);
     (void)park_expire(&t, mono_ms());
-    uint32_t cur = 0;
     park_entry_t *e;
-    while ((e = park_next_done(&t, &cur))) {
+    while ((e = park_next_done(&t))) {
       if (e->state == PARK_READY) g_served_wake[w]++;
       else g_served_timeout[w]++;
-      if (e->kind != PARK_UDP || e->u.udp.ipc.sock_fd_idx != w || e->u.udp.payload[31] != (uint8_t)w) {
+      if (e->kind != PARK_UDP || park_entry_ipc(e)->sock_fd_idx != w || park_entry_req(e)[31] != (uint8_t)w) {
         CHECK(false);                                                               /* the request came back as it went in */
       }
       park_release(&t, e);
@@ -743,8 +742,8 @@ static void test_wake_queue(void) {
   CHECK(park_wake_pending(park_wake_ring(6)) && !park_wake_pending(park_wake_ring(7)));
   park_wake_flush();
   CHECK(kq_events(kq6) == 1 && kq_events(kq7) == 0);                   /* worker 6 once (for two keys), worker 7 not at all */
-  CHECK(park_wake_pop(park_wake_ring(6), &k) && strcmp(k.zone, "a.test.") == 0 && !k.failed);
-  CHECK(park_wake_pop(park_wake_ring(6), &k) && strcmp(k.zone, "b.test.") == 0 && k.failed);
+  CHECK(park_wake_pop(park_wake_ring(6), &k) && park_key_is(&k, "v1", "a.test.") && !k.failed);
+  CHECK(park_wake_pop(park_wake_ring(6), &k) && park_key_is(&k, "v1", "b.test.") && k.failed);
   CHECK(!park_wake_pop(park_wake_ring(6), &k) && !park_wake_pop(park_wake_ring(7), &k));
   park_wake_flush();                                                   /* nothing queued since: no trigger */
   CHECK(kq_events(kq6) == 0 && kq_events(kq7) == 0);
@@ -752,7 +751,7 @@ static void test_wake_queue(void) {
   CHECK(kq_events(kq6) == 0 && kq_events(kq7) == 0);
   park_wake_flush();
   CHECK(kq_events(kq6) == 1 && kq_events(kq7) == 1);
-  CHECK(park_wake_pop(park_wake_ring(6), &k) && strcmp(k.zone, "c.test.") == 0 && park_wake_pop(park_wake_ring(7), &k) && strcmp(k.zone, "c.test.") == 0);
+  CHECK(park_wake_pop(park_wake_ring(6), &k) && park_key_is(&k, "v1", "c.test.") && park_wake_pop(park_wake_ring(7), &k) && park_key_is(&k, "v1", "c.test."));
   park_wake_broadcast("v1", "d.test.", false);                         /* the old call: key and trigger at once */
   CHECK(kq_events(kq6) == 1 && kq_events(kq7) == 1);
   CHECK(park_wake_pop(park_wake_ring(6), &k) && park_wake_pop(park_wake_ring(7), &k));
@@ -931,8 +930,407 @@ static void test_claims(void) {
   park_claim_clear(park_claim_key("v1", "race.test."));
 }
 
-int main(void) {
+/* ------------------------------------------------------------------ 0.7 store S2 review M5: an attach that is still queued at its deadline */
+/* A query parked for an attach has the attach deadline (200 ms) and, in the entry, the deadline of its whole park-timeout.  When the attach deadline passes with the
+ * request still queued (the store threads are behind slow reads) the query is not timed out: it goes on waiting for the rest of its park-timeout, once.  A query that is
+ * given the retry (park_retry(): it waits for a fetch now) has no attach deadline any more.  A query that is not an attach park times out at its deadline as always. */
+static void test_attach_deadline(void) {
+  park_table_t t;
+  udp_ipc_t ipc = mk_ipc(1);
+  uint8_t pay[20];
+  memset(pay, 0, sizeof(pay));
+  CHECK(park_init(&t, 8));
+  int32_t a = park_udp(&t, 1000, 200, "v0", "att.test.", 3, &ipc, pay, 20);        /* attach: 200 ms of 1500 */
+  int32_t b = park_udp(&t, 1000, 200, "v0", "ret.test.", 3, &ipc, pay, 20);        /* attach, then the retry key */
+  int32_t c = park_udp(&t, 1000, 200, "v0", "fet.test.", 3, &ipc, pay, 20);        /* parked for a fetch: its own deadline */
+  CHECK(a >= 0 && b >= 0 && c >= 0);
+  park_mark_attach(&t, a, 5, 2500);
+  park_mark_attach(&t, b, 5, 2500);
+  CHECK(park_expire(&t, 1199) == 0);
+  CHECK(park_expire(&t, 1200) == 1 && t.nwait == 2 && t.nready == 1);            /* the fetch park (c) is out of time, the attach parks go on */
+  CHECK(t.e[a].state == PARK_WAIT && t.e[a].deadline_ms == 2500 && t.e[a].attach == 1);
+  CHECK(park_retry(&t, "v0", "ret.test.", 2400) == 1 && t.e[b].attach == 0 && t.e[b].deadline_ms == 2500);   /* (the later of the two deadlines; no attach deadline now) */
+  CHECK(park_next_deadline_ms(&t, 1300) == 1200);                                  /* the next time to look is the park-timeout, not the attach deadline */
+  CHECK(park_expire(&t, 2499) == 0 && t.nwait == 2);
+  CHECK(park_expire(&t, 2500) == 2 && t.nwait == 0);                               /* ... and now the time is up, once, for both */
+  /* a wake before that finds the extended entry as it finds any waiting one */
+  int32_t d = park_udp(&t, 3000, 200, "v0", "wk.test.", 3, &ipc, pay, 20);
+  park_mark_attach(&t, d, 5, 4500);
+  CHECK(park_expire(&t, 3300) == 0 && t.e[d].deadline_ms == 4500);
+  CHECK(park_wake(&t, "v0", "wk.test.") == 1 && t.e[d].state == PARK_READY);
+  park_entry_t *e;
+  while ((e = park_next_done(&t))) park_release(&t, e);
+  CHECK(t.nwait == 0 && t.nready == 0);
+  /* a full deadline that is not later than the attach deadline changes nothing */
+  int32_t f = park_udp(&t, 5000, 200, "v0", "same.test.", 3, &ipc, pay, 20);
+  park_mark_attach(&t, f, 5, 5100);
+  CHECK(park_expire(&t, 5200) == 1);
+  while ((e = park_next_done(&t))) park_release(&t, e);
+  park_free(&t);
+}
+
+/* ------------------------------------------------------------------ 0.7 store: the park table of a worker is indexed (hash by zone, wheel of deadlines, done list), O(1) per operation */
+static double mono_s(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static void test_indexed_table(void) {
+  printf("[park table: hash by zone, wheel of deadlines, done list]\n");
+  enum { N = 16384 };
+  park_table_t t;
+  CHECK(park_init(&t, N));
+  udp_ipc_t ipc = mk_ipc(3);
+  uint8_t pay[60];
+  memset(pay, 7, sizeof(pay));
+  char zn[40];
+  /* a full table of 16384 queries, 8192 zones, two queries each: every operation on a zone is a step in its own chain, not a walk of the table (a scan of 16384 entries of 4.4 KB for each of
+   * the 32768 calls below took tens of seconds) */
+  double t0 = mono_s();
+  for (int i = 0; i < N; i++) {
+    snprintf(zn, sizeof(zn), "z%d.test.", i / 2);
+    CHECK(park_udp(&t, 1000, 1500, "v0", zn, 3, &ipc, pay, sizeof(pay)) >= 0);
+  }
+  CHECK(t.nwait == N && t.nfree == 0 && park_udp(&t, 1000, 1500, "v0", "over.test.", 3, &ipc, pay, 10) == -1);
+  for (int i = 0; i < N / 2; i++) {
+    snprintf(zn, sizeof(zn), "z%d.test.", i);
+    CHECK(park_has_wait(&t, "v0", zn) && !park_has_wait(&t, "v1", zn));
+  }
+  for (int i = 0; i < N / 2; i += 2) {                                       /* (every other zone: the two queries of each) */
+    snprintf(zn, sizeof(zn), "z%d.test.", i);
+    CHECK(park_wake(&t, "v0", zn) == 2);
+  }
+  CHECK(t.nready == N / 2 && t.nwait == N / 2);
+  uint32_t served = 0;
+  park_entry_t *d;
+  while ((d = park_next_done(&t))) {
+    CHECK(d->state == PARK_READY && strcmp(park_entry_view(d), "v0") == 0 && park_entry_req(d)[59] == 7 && park_entry_ipc(d)->sock_fd_idx == 3);
+    park_release(&t, d);
+    served++;
+  }
+  CHECK(served == N / 2 && t.nfree == N / 2);
+  CHECK(park_expire(&t, 2500) == N / 2 && t.nwait == 0 && t.nready == N / 2);                 /* (the rest run out of time, in one pass over the wheel) */
+  while ((d = park_next_done(&t))) park_release(&t, d);
+  CHECK(t.nfree == N && t.nready == 0);
+  const double took = mono_s() - t0;
+  printf("  %d queries parked, asked for, woken and timed out in %.3f s\n", N, took);
+  CHECK(took < 3.0);
+  park_free(&t);
+
+  /* a long deadline does not wrap round the wheel: the park-timeout is at most 60 s, a wheel slot is a millisecond */
+  CHECK(park_init(&t, 8));
+  CHECK(park_udp(&t, 1000, 60000, "v0", "far.test.", 3, &ipc, pay, 20) >= 0 && park_udp(&t, 1000, 10, "v0", "near.test.", 3, &ipc, pay, 20) >= 0);
+  CHECK(park_next_deadline_ms(&t, 1000) == 10 && park_expire(&t, 1009) == 0 && park_expire(&t, 1010) == 1);
+  CHECK(park_next_deadline_ms(&t, 1010) == 60000 - 10 && park_expire(&t, 60999) == 0 && t.nwait == 1);
+  CHECK(park_expire(&t, 61000) == 1 && t.nwait == 0);                        /* (a gap longer than the wheel: every slot is looked at once) */
+  CHECK(park_expire(&t, 61000 + 3 * 65536) == 0);
+  while ((d = park_next_done(&t))) park_release(&t, d);
+  /* a query that is parked after a long time with nothing parked starts the wheel at its own tick */
+  CHECK(park_udp(&t, 1000000, 5, "v0", "late.test.", 3, &ipc, pay, 20) >= 0 && park_next_deadline_ms(&t, 1000000) == 5 && park_expire(&t, 1000005) == 1);
+  while ((d = park_next_done(&t))) park_release(&t, d);
+  park_free(&t);
+
+  /* the payload blocks: a request of the usual size takes a block of 256 bytes, a long one the long block, of which there is one for eight entries (at least 16: here all eight) */
+  CHECK(park_init(&t, 64));
+  uint8_t big[PARK_UDP_MAX];
+  memset(big, 1, sizeof(big));
+  int nbig = 0;
+  for (int i = 0; i < 20; i++) {
+    snprintf(zn, sizeof(zn), "b%d.test.", i);
+    if (park_udp(&t, 0, 1500, "v0", zn, 3, &ipc, big, sizeof(big)) >= 0) nbig++;
+  }
+  CHECK(nbig == 16 && t.n_full == 4 && t.nfree == 64 - 16);                  /* (the table has room: the long blocks are what ran out) */
+  CHECK(park_udp(&t, 0, 1500, "v0", "small.test.", 3, &ipc, pay, 60) >= 0);  /* (the usual request still parks) */
+  park_free(&t);
+  /* the names themselves: the longest zone and view that fit, with a request after them */
+  CHECK(park_init(&t, 4));
+  char lz[PARK_ZONE_MAX + 1], lv[PARK_VIEW_MAX + 1];
+  memset(lz, 'z', PARK_ZONE_MAX);
+  lz[PARK_ZONE_MAX] = '\0';
+  memset(lv, 'v', PARK_VIEW_MAX);
+  lv[PARK_VIEW_MAX] = '\0';
+  int32_t li = park_udp(&t, 0, 1500, lv, lz, 3, &ipc, big, PARK_UDP_MAX);
+  CHECK(li >= 0 && strcmp(park_entry_zone(&t.e[li]), lz) == 0 && strcmp(park_entry_view(&t.e[li]), lv) == 0 && park_entry_req(&t.e[li])[PARK_UDP_MAX - 1] == 1 && park_has_wait(&t, lv, lz));
+  park_free(&t);
+}
+
+/* a request that a full ring refused: the entry stays parked, is asked for again in order, and the marks it holds are not lost with it */
+static void test_pending(void) {
+  printf("[park table: requests that are made again]\n");
+  park_table_t t;
+  CHECK(park_init(&t, 8));
+  udp_ipc_t ipc = mk_ipc(1);
+  uint8_t pay[20] = { 0 };
+  int32_t a = park_udp(&t, 0, 1500, "v0", "p1.test.", 3, &ipc, pay, 20), b = park_udp(&t, 0, 1500, "v0", "p2.test.", 3, &ipc, pay, 20), c = park_udp(&t, 0, 1500, "v0", "p1.test.", 3, &ipc, pay, 20);
+  CHECK(a >= 0 && b >= 0 && c >= 0 && park_pending_head(&t) == NULL && t.nunsent == 0);
+  park_pending_set(&t, &t.e[a], PARK_PEND_FETCH, 0, KDB_FETCH_PRIO_QUERY);
+  park_pending_set(&t, &t.e[b], PARK_PEND_ATTACH_NAME, 0, 0);
+  CHECK(t.nunsent == 2 && park_pending_head(&t) == &t.e[a]);
+  park_pending_set(&t, &t.e[a], PARK_PEND_FETCH, 0, KDB_FETCH_PRIO_QUERY);   /* (again: it keeps its place) */
+  CHECK(t.nunsent == 2 && park_pending_head(&t) == &t.e[a]);
+  park_pending_done(&t, &t.e[a]);
+  CHECK(t.nunsent == 1 && park_pending_head(&t) == &t.e[b] && t.e[a].pend == PARK_PEND_NONE);
+  /* an entry that is woken leaves the list (its request is not made for a zone that is there) */
+  CHECK(park_wake(&t, "v0", "p2.test.") == 1 && t.nunsent == 0 && park_pending_head(&t) == NULL);
+  park_entry_t *d;
+  while ((d = park_next_done(&t))) park_release(&t, d);
+  /* a pending fetch request that held the claim mark of its zone: another query of the zone takes the request over when the entry is dropped, and the mark goes with the last one */
+  const uint64_t key = park_claim_key("v0", "p1.test.");
+  CHECK(park_claim_mark(key));
+  park_pending_set(&t, &t.e[a], PARK_PEND_FETCH, 0, (uint8_t)(KDB_FETCH_PRIO_QUERY | PARK_PRIO_CLAIMED));
+  park_release(&t, &t.e[a]);
+  CHECK(t.e[c].pend == PARK_PEND_FETCH && (t.e[c].prio & PARK_PRIO_CLAIMED) && t.nunsent == 1 && park_claim_held(key) && park_pending_head(&t) == &t.e[c]);
+  park_release(&t, &t.e[c]);
+  CHECK(t.nunsent == 0 && !park_claim_held(key) && t.nwait == 0 && t.nfree == 8);
+  /* a pending attach request: the worker's bit leaves the claim of the zone with the last query, and the claim with the last bit */
+  CHECK(park_att_claim(3, 777, 2) == 1);
+  int32_t e1 = park_udp(&t, 0, 1500, "v0", "p3.test.", 3, &ipc, pay, 20);
+  park_pending_set(&t, &t.e[e1], PARK_PEND_ATTACH_ZID, ((uint64_t)3 << 32) | 777, 2);
+  park_release(&t, &t.e[e1]);
+  CHECK(park_att_take(3, 777) == PARK_ATT_ALL);                                  /* (nothing was left to take: the claim was gone) */
+  park_free(&t);
+}
+
+/* the attach ring: 8 bytes a request, 4096 of them, a full ring says so; the store threads take requests without a lock, each one exactly once */
+#define ATC 4
+#define ATN 20000
+static _Atomic uint32_t g_at_seen[ATN];
+static _Atomic bool g_at_stop;
+static void *at_consumer(void *arg) {
+  (void)arg;
+  park_attach_req_t q;
+  while (!atomic_load(&g_at_stop)) {
+    if (park_attach_next(&q)) {
+      if (q.by_name || q.sview != 5 || q.zid >= ATN || q.worker != 11) CHECK(false);
+      else atomic_fetch_add(&g_at_seen[q.zid], 1);
+    } else {
+      usleep(50);
+    }
+  }
+  while (park_attach_next(&q)) {
+    if (q.zid < ATN) atomic_fetch_add(&g_at_seen[q.zid], 1);
+  }
+  return NULL;
+}
+
+static void test_attach_ring(void) {
+  printf("[attach requests: the ring, the claims]\n");
+  park_attach_req_t q;
+  CHECK(!park_attach_next(&q) && !park_attach_pending());
+  for (int i = 0; i < PARK_ATTACH_RING; i++) CHECK(park_attach_zid(11, 5, (uint32_t)i));
+  CHECK(!park_attach_zid(11, 5, 99999) && park_attach_pending());                              /* (full: the caller keeps the query parked and asks again) */
+  CHECK(!park_attach_zid(-1, 5, 1) && !park_attach_zid(PARK_MAX_WORKERS, 5, 1));
+  for (int i = 0; i < PARK_ATTACH_RING; i++) CHECK(park_attach_next(&q) && !q.by_name && q.sview == 5 && q.zid == (uint32_t)i && q.worker == 11);
+  CHECK(!park_attach_next(&q) && !park_attach_pending());
+  /* by name: the slots of the other threads, 16 of them; a worker's ring and the slots take turns */
+  CHECK(park_attach_request_any("v1", "a.test.") && park_attach_request_bg("v1", "b.test.") && !park_attach_request_any("v1", "") && park_attach_pending());
+  CHECK(park_attach_next(&q) && q.by_name && strcmp(q.view, "v1") == 0 && strcmp(q.zone, "a.test.") == 0 && q.prio == 0 && q.worker == -1);
+  CHECK(park_attach_next(&q) && q.by_name && strcmp(q.zone, "b.test.") == 0 && q.prio == 2);
+  CHECK(!park_attach_next(&q));
+  /* park_bg_attach(): one request in PARK_BG_MS for a zone, the same rule as park_bg_fetch() */
+  park_bg_attach("v1", "bgat.test.");
+  park_bg_attach("v1", "bgat.test.");
+  CHECK(park_attach_next(&q) && q.by_name && strcmp(q.zone, "bgat.test.") == 0 && q.prio == 2 && !park_attach_next(&q));
+  /* one producer, four consumers: every request comes out once */
+  pthread_t th[ATC];
+  atomic_store(&g_at_stop, false);
+  for (int i = 0; i < ATC; i++) pthread_create(&th[i], NULL, at_consumer, NULL);
+  for (uint32_t i = 0; i < ATN; i++)
+    while (!park_attach_zid(11, 5, i)) usleep(20);
+  while (park_attach_pending()) usleep(200);
+  atomic_store(&g_at_stop, true);
+  for (int i = 0; i < ATC; i++) pthread_join(th[i], NULL);
+  int once = 0;
+  for (int i = 0; i < ATN; i++) once += atomic_load(&g_at_seen[i]) == 1;
+  CHECK(once == ATN);
+
+  /* the claims: the first worker asks (1), the others join (0 when the request is in a ring, 2 when it is not yet); the thread that did the zone takes the claim and every worker that joined */
+  CHECK(park_att_claim(2, 100, 0) == 1);
+  CHECK(park_att_claim(2, 100, 3) == 2);                                                       /* (the request is not in a ring yet: this worker asks too) */
+  park_att_requested(2, 100);
+  CHECK(park_att_claim(2, 100, 3) == 0 && park_att_claim(2, 100, 4) == 0);
+  CHECK(park_att_claim(2, 101, 0) == 1 && park_att_claim(3, 100, 0) == 1);                    /* (another zone, another view: other claims) */
+  uint32_t set = park_att_take(2, 100);
+  CHECK(set == ((1u << 0) | (1u << 3) | (1u << 4)));
+  CHECK(park_att_take(2, 100) == PARK_ATT_ALL);                                                /* (taken: whoever asks finds none, and a request without one wakes everybody) */
+  CHECK(park_att_claim(2, 100, 7) == 1);                                                       /* (a new claim after the take) */
+  CHECK(park_att_leave(2, 100, 7) && park_att_take(2, 100) == PARK_ATT_ALL);                  /* (the last worker leaves: the claim goes) */
+  CHECK(park_att_claim(2, 101, 5) == 2 && park_att_leave(2, 101, 0) && park_att_take(2, 101) == (1u << 5));
+  CHECK(park_att_claim(3, 100, 20) == 2 && (park_att_take(3, 100) & 0xFFFF8000u) == 0xFFFF8000u);   /* (workers above 14 share a bit: every worker from 15 up is woken) */
+  (void)park_att_take(3, 100);
+  /* the zone id 0 of the view 0 is a zone like any other (the claim is the exact zone, never 0) */
+  CHECK(park_att_claim(0, 0, 1) == 1 && park_att_claim(0, 0, 2) == 2 && park_att_take(0, 0) == 6u);
+}
+
+/* 0.7 review fixes: the claims of the workers from 15 up (they share a bit), and the wakes by which the queries ask for their zones' fetches themselves */
+static void test_att_group_and_ask(void) {
+  printf("[claims of the workers from 15 up; queries that ask for the fetch themselves]\n");
+  /* M1: a worker of the group that leaves must not take the wake of another that still waits (the bit is shared) */
+  CHECK(park_att_claim(4, 500, 3) == 1 && park_att_claim(4, 500, 20) == 2 && park_att_claim(4, 500, 21) == 2);
+  park_att_requested(4, 500);
+  CHECK(park_att_leave(4, 500, 20));
+  uint32_t s = park_att_take(4, 500);
+  CHECK((s & 0xFFFF8000u) == 0xFFFF8000u && (s & 8u));                            /* (worker 21 is woken, and worker 3) */
+  CHECK(park_att_claim(4, 500, 3) == 1 && park_att_claim(4, 500, 20) == 2 && park_att_claim(4, 500, 21) == 2 && park_att_claim(4, 500, 125) == 2);
+  CHECK(park_att_leave(4, 500, 20) && park_att_leave(4, 500, 125) && park_att_leave(4, 500, 3));
+  s = park_att_take(4, 500);
+  CHECK(s == PARK_ATT_ALL);                                                       /* (no request was made: the claim went with its last worker that asked; whoever waits is woken) */
+  CHECK(park_att_claim(4, 501, 20) == 1 && park_att_claim(4, 501, 22) == 2);
+  park_att_requested(4, 501);
+  CHECK(park_att_leave(4, 501, 20) && park_att_leave(4, 501, 3));                 /* (worker 3 never joined: the leave of a worker that is not in the set changes nothing) */
+  CHECK(park_att_take(4, 501) == 0xFFFF8000u);                                    /* (the request is in a ring: the claim stays for the take, and wakes the whole group) */
+  CHECK(park_att_claim(4, 502, 20) == 1 && park_att_leave(4, 502, 20) && park_att_take(4, 502) == PARK_ATT_ALL);   /* (a claim of the group that nobody asked for goes) */
+
+  /* L2, L3: the keys of the wake ring */
+  park_register_worker(12, -1);
+  park_register_worker(13, -1);
+  park_key_t k;
+  while (park_wake_pop(park_wake_ring(12), &k)) {}
+  while (park_wake_pop(park_wake_ring(13), &k)) {}
+  park_wake_queue_ask("v1", "ask.test.", (1u << 12) | (1u << 13));
+  CHECK(park_wake_pop(park_wake_ring(12), &k) && k.ask == 1 && park_key_is(&k, "v1", "ask.test.") && park_wake_pop(park_wake_ring(13), &k) && k.ask == 1);
+  park_wake_queue_zid(4, 500, 1u << 12);
+  CHECK(park_wake_pop(park_wake_ring(12), &k) && k.ask == 2 && k.key == (((uint64_t)4 << 32) | 500) && !park_wake_pop(park_wake_ring(13), &k));
+  park_wake_queue_retry("v1", "ask.test.", 1u << 12, true);
+  CHECK(park_wake_pop(park_wake_ring(12), &k) && k.ask == 0 && k.retry);
+  park_wake_flush();
+
+  /* the worker's side: the queries of the zone stay parked with the new deadline, and the worker asks from its own ring */
+  park_table_t t;
+  CHECK(park_init(&t, 16));
+  udp_ipc_t ipc = mk_ipc(1);
+  uint8_t pay[20] = { 0 };
+  const int64_t dl = 5000;
+  int32_t a = park_udp(&t, 0, 200, "v1", "ask.test.", 3, &ipc, pay, 20), b = park_udp(&t, 0, 200, "v1", "ask.test.", 3, &ipc, pay, 20), c = park_udp(&t, 0, 200, "v1", "other.test.", 3, &ipc, pay, 20);
+  CHECK(a >= 0 && b >= 0 && c >= 0);
+  park_fetch_req_t q;
+  while (park_fetch_next(&q)) {}
+  park_mark_attach(&t, a, 1, 5000);
+  park_entry_attach_zid(&t.e[a], 4, 500);
+  park_entry_attach_zid(&t.e[c], 4, 501);
+  CHECK(park_ask_fetch_key(&t, 13, park_name_key("v1", "ask.test."), dl) == 2 && t.e[a].deadline_ms == dl && t.e[b].deadline_ms == dl && t.e[a].attach == 0 && t.e[a].azid == 0 && t.e[c].deadline_ms == 200);
+  CHECK(park_fetch_next(&q) && strcmp(q.view, "v1") == 0 && strcmp(q.zone, "ask.test.") == 0 && q.worker == 13 && q.prio == KDB_FETCH_PRIO_QUERY && !park_fetch_next(&q));   /* (one request for the zone) */
+  CHECK(t.nunsent == 0 && t.e[c].azid == 1);
+  /* by the zone id: whatever zone the queries were parked for */
+  CHECK(park_ask_fetch_zid(&t, 13, ((uint64_t)4 << 32) | 999, dl) == 0 && !park_fetch_next(&q));                       /* (no query waits for that id) */
+  CHECK(park_ask_fetch_zid(&t, 13, ((uint64_t)4 << 32) | 501, dl) == 1 && t.e[c].deadline_ms == dl && t.e[c].azid == 0);
+  CHECK(park_fetch_next(&q) && strcmp(q.zone, "other.test.") == 0 && !park_fetch_next(&q));
+  /* a ring that is full: the request stays pending on the entry and is made again later (no answer, no SERVFAIL) */
+  int32_t d = park_udp(&t, 0, 200, "v1", "full.test.", 3, &ipc, pay, 20);
+  CHECK(d >= 0);
+  for (int i = 0; i < PARK_FETCH_RING; i++) CHECK(park_fetch_request(13, "v1", "fill.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+  CHECK(park_ask_fetch_key(&t, 13, park_name_key("v1", "full.test."), dl) == 1 && t.e[d].pend == PARK_PEND_FETCH && t.nunsent == 1 && t.e[d].state == PARK_WAIT && t.e[d].deadline_ms == dl);
+  while (park_fetch_next(&q)) {}
+  park_free(&t);
+  park_unregister_worker(12);
+  park_unregister_worker(13);
+}
+
+/* 0.7 fix 7: the worker that attaches a zone itself hands its registration to the store threads through its attach ring: room first, then the request with PARK_ATT_ADOPT */
+static void test_attach_adopt(void) {
+  printf("[the worker's attach: the room in the ring, the adoption request]\n");
+  park_attach_req_t q;
+  CHECK(!park_attach_next(&q));
+  CHECK(park_attach_room(13) && !park_attach_room(-1) && !park_attach_room(PARK_MAX_WORKERS));
+  CHECK(park_attach_adopt(13, 7, 424242));
+  CHECK(park_attach_zid(13, 7, 1));
+  CHECK(park_attach_next(&q) && q.adopt && !q.by_name && q.sview == 7 && q.zid == 424242 && q.worker == 13);        /* (the flag is not part of the view's id) */
+  CHECK(park_attach_next(&q) && !q.adopt && q.sview == 7 && q.zid == 1 && q.worker == 13);
+  CHECK(!park_attach_next(&q));
+  /* a full ring has no room, and the adoption is refused like any other request; room is back when a request is taken */
+  for (int i = 0; i < PARK_ATTACH_RING; i++) CHECK(park_attach_zid(13, 7, (uint32_t)i));
+  CHECK(!park_attach_room(13) && !park_attach_adopt(13, 7, 5));
+  CHECK(park_attach_next(&q) && park_attach_room(13) && park_attach_adopt(13, 7, 5));
+  while (park_attach_next(&q)) {}
+  CHECK(!park_attach_pending());
+  /* a request by name and a request of the by_name kind never carry the flag */
+  CHECK(park_attach_request_any("v1", "adopt.test.") && park_attach_next(&q) && !q.adopt && q.by_name);
+}
+
+/* 0.7 fix 3 / park-max 16384: what a table of the new default size reserves, and what a table full of the usual requests touches (the pages that no entry used are not memory) */
+static long touched_kb(void) {                                    /* the pages this process has touched for the first time since it began (page faults of the zero-fill kind), in KB */
+  struct rusage ru;
+  getrusage(RUSAGE_SELF, &ru);
+  return ru.ru_minflt * (sysconf(_SC_PAGESIZE) / 1024);
+}
+/* the child of test_park_max_memory(): a process of its own (so that what the allocator kept from earlier tests does not hide the first touches): the table of the default size is made and filled
+ * with the usual requests (a 40-byte query, names of ten characters); the pages that were touched for it are counted.  0: not more than 12 MB. */
+static int park_mem_child(void) {
+  const long before = touched_kb();
+  park_table_t pt;
+  if (!park_init(&pt, PARK_DEFAULT_MAX)) return 2;
+  uint8_t pay[64];
+  memset(pay, 0x5A, sizeof(pay));
+  udp_ipc_t ipc = mk_ipc(1);
+  for (uint32_t i = 0; i < PARK_DEFAULT_MAX; i++) {
+    char z[32];
+    snprintf(z, sizeof(z), "z%u.test.", i);
+    if (park_udp(&pt, 1000, 1500, "default", z, 3, &ipc, pay, 40) < 0) return 3;
+  }
+  if (pt.nwait != PARK_DEFAULT_MAX || park_udp(&pt, 1000, 1500, "default", "over.test.", 3, &ipc, pay, 40) >= 0) return 4;       /* (full: the next query is answered at once) */
+  const long grew_kb = touched_kb() - before;
+  printf("  a full table of %u usual requests: %ld KB touched, %zu bytes reserved\n", (unsigned)PARK_DEFAULT_MAX, grew_kb, park_bytes(&pt));
+  fflush(stdout);
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+  return 0;                                                       /* (a sanitizer's shadow memory and quarantine are touched too: the figure is for the plain build) */
+#else
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+  return 0;
+#endif
+#endif
+  return grew_kb < 12 * 1024 && grew_kb > 2 * 1024 ? 0 : 5;
+#endif
+}
+
+static const char *g_self = "";
+static void test_park_max_memory(void) {
+  printf("[park-max %d: the memory of a full table]\n", PARK_DEFAULT_MAX);
+  CHECK(PARK_DEFAULT_MAX == 16384);
+  park_table_t t;
+  CHECK(park_init(&t, PARK_DEFAULT_MAX));
+  const size_t reserved = park_bytes(&t);
+  CHECK(reserved > (size_t)PARK_DEFAULT_MAX * 256 && reserved < (size_t)24 << 20);          /* (about 16 MB reserved: entries, small blocks, a long block for every eighth entry, the wheel) */
+  CHECK(park_bytes(&(park_table_t){ 0 }) == 0);
+  park_free(&t);
+  if (g_self[0]) {
+    char cmd[600];
+    fflush(stdout);
+    snprintf(cmd, sizeof(cmd), "%s parkmem", g_self);
+    CHECK(system(cmd) == 0);
+  }
+}
+
+#define CLW 8
+static _Atomic int g_cl_ask[CLW], g_clw_go;
+static void *claim_worker(void *arg) {
+  int w = (int)(intptr_t)arg;
+  while (!atomic_load(&g_clw_go)) {}
+  for (uint32_t z = 0; z < 2000; z++) {
+    int c = park_att_claim(9, z, w);
+    if (c == 1 || c == 2) atomic_fetch_add(&g_cl_ask[w], 1);
+  }
+  return NULL;
+}
+static void test_claim_race(void) {
+  printf("[attach claims: eight workers for the same zones]\n");
+  pthread_t th[CLW];
+  for (long i = 0; i < CLW; i++) pthread_create(&th[i], NULL, claim_worker, (void *)(intptr_t)i);
+  atomic_store(&g_clw_go, 1);
+  for (int i = 0; i < CLW; i++) pthread_join(th[i], NULL);
+  int asked = 0, all_in = 0;
+  for (int i = 0; i < CLW; i++) asked += atomic_load(&g_cl_ask[i]);
+  for (uint32_t z = 0; z < 2000; z++) all_in += park_att_take(9, z) == 0xFFu;                 /* (every worker joined every claim: none was lost to a race) */
+  CHECK(all_in == 2000);
+  CHECK(asked >= 2000 && asked <= 2000 * CLW);
+}
+
+int main(int argc, char **argv) {
+  g_self = argv[0];
+  if (argc > 1 && strcmp(argv[1], "parkmem") == 0) return park_mem_child();
   test_table();
+  test_attach_deadline();
   test_tcp();
   test_rings();
   test_concurrent();
@@ -944,6 +1342,13 @@ int main(void) {
   test_gate_stress();
   test_claim_ring();
   test_claims();
+  test_indexed_table();
+  test_pending();
+  test_attach_ring();
+  test_attach_adopt();
+  test_park_max_memory();
+  test_claim_race();
+  test_att_group_and_ask();
 #ifdef __FreeBSD__
   test_wake_queue();
   test_sleep_protocol();

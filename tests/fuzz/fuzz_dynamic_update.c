@@ -174,7 +174,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "dyn.example.com.";
-    strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
+    entry.view_name = "default";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 

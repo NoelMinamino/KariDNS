@@ -81,31 +81,31 @@ static void test_catalog_hashing_and_bookkeeping(void) {
     // Bookkeeping removal
     zone_db_entry_t cat_entry;
     memset(&cat_entry, 0, sizeof(cat_entry));
-    cat_entry.catalog_member_count = 3;
-    cat_entry.catalog_members = calloc(3, sizeof(catalog_member_id_t));
+    zone_x_need(&cat_entry)->catalog_member_count = 3;
+    zone_x_need(&cat_entry)->catalog_members = calloc(3, sizeof(catalog_member_id_t));
 
-    strcpy(cat_entry.catalog_members[0].domain, "m1.example.com.");
-    strcpy(cat_entry.catalog_members[0].unique_id, "u1");
-    cat_entry.catalog_members[0].group_count = 1;
-    cat_entry.catalog_members[0].groups = malloc(sizeof(char *));
-    cat_entry.catalog_members[0].groups[0] = strdup("group1");
+    strcpy(zone_xr(&cat_entry)->catalog_members[0].domain, "m1.example.com.");
+    strcpy(zone_xr(&cat_entry)->catalog_members[0].unique_id, "u1");
+    zone_xr(&cat_entry)->catalog_members[0].group_count = 1;
+    zone_xr(&cat_entry)->catalog_members[0].groups = malloc(sizeof(char *));
+    zone_xr(&cat_entry)->catalog_members[0].groups[0] = strdup("group1");
 
-    strcpy(cat_entry.catalog_members[1].domain, "m2.example.com.");
-    strcpy(cat_entry.catalog_members[1].unique_id, "u2");
+    strcpy(zone_xr(&cat_entry)->catalog_members[1].domain, "m2.example.com.");
+    strcpy(zone_xr(&cat_entry)->catalog_members[1].unique_id, "u2");
 
-    strcpy(cat_entry.catalog_members[2].domain, "m3.example.com.");
-    strcpy(cat_entry.catalog_members[2].unique_id, "u3");
+    strcpy(zone_xr(&cat_entry)->catalog_members[2].domain, "m3.example.com.");
+    strcpy(zone_xr(&cat_entry)->catalog_members[2].unique_id, "u3");
 
     // Remove middle element (m2)
     remove_member_from_catalog_bookkeeping(&cat_entry, "u2", "m2.example.com.");
-    assert(cat_entry.catalog_member_count == 2);
-    assert(strcmp(cat_entry.catalog_members[0].unique_id, "u1") == 0);
-    assert(strcmp(cat_entry.catalog_members[1].unique_id, "u3") == 0);
+    assert(zone_xr(&cat_entry)->catalog_member_count == 2);
+    assert(strcmp(zone_xr(&cat_entry)->catalog_members[0].unique_id, "u1") == 0);
+    assert(strcmp(zone_xr(&cat_entry)->catalog_members[1].unique_id, "u3") == 0);
 
     // Remove first element (with groups)
     remove_member_from_catalog_bookkeeping(&cat_entry, "u1", "m1.example.com.");
-    assert(cat_entry.catalog_member_count == 1);
-    assert(strcmp(cat_entry.catalog_members[0].unique_id, "u3") == 0);
+    assert(zone_xr(&cat_entry)->catalog_member_count == 1);
+    assert(strcmp(zone_xr(&cat_entry)->catalog_members[0].unique_id, "u3") == 0);
 
     // Test free_catalog_desired_list
     free_catalog_desired_list(NULL, 0);
@@ -115,7 +115,7 @@ static void test_catalog_hashing_and_bookkeeping(void) {
     des_list[0].groups[0] = strdup("grpA");
     free_catalog_desired_list(des_list, 2);
 
-    free(cat_entry.catalog_members);
+    free(zone_xr(&cat_entry)->catalog_members);
     printf("  -> Bookkeeping removal passed.\n");
 }
 
@@ -138,7 +138,7 @@ static void test_catalog_process_membership_rfc9432(void) {
     atomic_store_explicit(&cat_entry.rcu.active, &a_no_ver.ver, memory_order_release);
 
     catalog_process_membership(&cat_entry, &cat_cfg, "default");
-    assert(cat_entry.catalog_member_count == 0);
+    assert(zone_xr(&cat_entry)->catalog_member_count == 0);
 
     // 2. Broken catalog (RFC 9432 §5.1): Multiple PTRs on same unique-N node
     zone_arena_t a_dup_ptr;
@@ -173,7 +173,7 @@ static void test_catalog_process_membership_rfc9432(void) {
 
     atomic_store_explicit(&cat_entry.rcu.active, &a_dup_ptr.ver, memory_order_release);
     catalog_process_membership(&cat_entry, &cat_cfg, "default");
-    assert(cat_entry.catalog_member_count == 0); // Broken catalog rejected!
+    assert(zone_xr(&cat_entry)->catalog_member_count == 0); // Broken catalog rejected!
 
     // 3. Broken catalog (RFC 9432 §5.1): Multiple unique-N pointing to same target domain
     zone_arena_t a_dup_target;
@@ -199,7 +199,7 @@ static void test_catalog_process_membership_rfc9432(void) {
 
     atomic_store_explicit(&cat_entry.rcu.active, &a_dup_target.ver, memory_order_release);
     catalog_process_membership(&cat_entry, &cat_cfg, "default");
-    assert(cat_entry.catalog_member_count == 0); // Duplicate target domain rejected!
+    assert(zone_xr(&cat_entry)->catalog_member_count == 0); // Duplicate target domain rejected!
 
     // 3b. review catalog_zone [12] (sorted check): the duplicate is found when the two are not neighbours in the
     // catalog and differ in case
@@ -222,7 +222,7 @@ static void test_catalog_process_membership_rfc9432(void) {
     }
     atomic_store_explicit(&cat_entry.rcu.active, &a_dup_far.ver, memory_order_release);
     catalog_process_membership(&cat_entry, &cat_cfg, "default");
-    assert(cat_entry.catalog_member_count == 0); // zeta twice (first and last, other case): rejected
+    assert(zone_xr(&cat_entry)->catalog_member_count == 0); // zeta twice (first and last, other case): rejected
 
     // 4. Static config collision skipping
     server_config_t cfg;
@@ -249,7 +249,7 @@ static void test_catalog_process_membership_rfc9432(void) {
 
     atomic_store_explicit(&cat_entry.rcu.active, &a_static_col.ver, memory_order_release);
     catalog_process_membership(&cat_entry, &cat_cfg, "default");
-    assert(cat_entry.catalog_member_count == 0); // Colliding member skipped!
+    assert(zone_xr(&cat_entry)->catalog_member_count == 0); // Colliding member skipped!
 
     // 5. Broken catalog: multiple COO PTR records for single member
     zone_arena_t a_mult_coo;
@@ -282,7 +282,7 @@ static void test_catalog_process_membership_rfc9432(void) {
 
     atomic_store_explicit(&cat_entry.rcu.active, &a_mult_coo.ver, memory_order_release);
     catalog_process_membership(&cat_entry, &cat_cfg, "default");
-    assert(cat_entry.catalog_member_count == 0); // Multiple coo records rejected!
+    assert(zone_xr(&cat_entry)->catalog_member_count == 0); // Multiple coo records rejected!
 
     // 6. NULL catalog parameters
     catalog_process_membership(NULL, &cat_cfg, "default");
@@ -390,10 +390,10 @@ static void test_find_catalog_parent_and_valid_properties(void) {
 
     // Clean up
     zone_arena_destroy(&a_valid);
-    if (cat_parent.catalog_members) {
-        free_catalog_member_ids(cat_parent.catalog_members, cat_parent.catalog_member_count);
-        cat_parent.catalog_members = NULL;
-        cat_parent.catalog_member_count = 0;
+    if (zone_xr(&cat_parent)->catalog_members) {
+        free_catalog_member_ids(zone_xr(&cat_parent)->catalog_members, zone_xr(&cat_parent)->catalog_member_count);
+        zone_x_need(&cat_parent)->catalog_members = NULL;
+        zone_x_need(&cat_parent)->catalog_member_count = 0;
     }
 
     // 4. Test free_catalog_desired_list

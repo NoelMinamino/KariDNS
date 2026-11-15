@@ -30,6 +30,12 @@
  * Multi-server operation (B11, release plan 4.8, PostgreSQL only): reload requests written to karidns_reload_requests by a
  * management tool make every server reload, and each loader writes the outcome to karidns_server_status; see the block
  * "multi-server reload requests" before auto_send_status().
+ *
+ * The store protocol (0.7 WP7a, store design 5; the block "the store protocol" before run_view_once()): when the Backend's CONFIG asks for it the loader keeps
+ * no inventory and no table of the zones.  Per view it holds a change-log cursor and the identity of its database (both kept by the Backend in its store and
+ * sent back in CONFIG), follows the change log in pages (CHANGES) or lists every domain in pages (MANIFEST), and the Backend asks for the bodies it lacks
+ * with FETCH_REQ.  The code above (inventory, plan_diff(), bulk sets, summaries) is the legacy protocol and is used when the flag is off, and for the one
+ * thing the store protocol still needs from it: a source without karidns_zone_state is listed from the zone list (st_emit_listed()).
  */
 
 #include <stdio.h>
@@ -446,6 +452,12 @@ typedef struct {
      * zone must not go back on the list above.  One entry per zone of the signer that was reloaded so; sorted by domain id. */
     struct cov { int64_t id; uint64_t m; } *cov;
     size_t ncov;
+    /* 0.7 WP7a (the store protocol): the identity of the database `seq` belongs to; whether the Backend's cursor (CONFIG) was looked at; a source without a change log
+     * that is listed again at every change is not listed before hold_until (decision D3: ten times the last pass above 100,000 zones) */
+    uint8_t ident[KDB_IDENT_MAX];
+    uint8_t ident_len;
+    bool st_init, plain_warned;
+    int64_t hold_until;
 } vstate_t;
 
 typedef struct {
@@ -506,6 +518,18 @@ typedef struct {
     bool pos_valid, pool_retry_ok;
     uint64_t pos_m;
     uint64_t fetch_req;
+    int64_t fetch_source_id;          /* 0.7 WP7a: the domains.id the Backend asked for (FETCH_REQ tag 8), 0 = any */
+    bool store_proto, store_full;     /* 0.7 WP7a: the store protocol is on for this load; a full pass was asked for (reload -force) */
+    struct {                          /* the pass / drain being sent (st_* functions) */
+        bool msg_open, fail, sent_changes;
+        int dberr;
+        uint32_t page;
+        uint64_t entries, skipped, unmapped, orphans;
+        uint8_t ident[KDB_IDENT_MAX];
+        uint8_t ident_len;
+        char skip_names[3][192];
+        unsigned nskip_names;
+    } st;
     uint64_t batch_id;
     uint8_t batch_kind;
     uint64_t change_seq;
@@ -557,6 +581,10 @@ typedef struct {
     uint8_t auto_reload;
     uint32_t poll_interval, coalesce_ms;
     uint64_t max_records, max_bytes;
+    bool has_cursor;                         /* 0.7 WP7a: the Backend's change-log cursor and the identity of its database (CONFIG tags 11..13) */
+    uint64_t cursor;
+    uint8_t ident[KDB_IDENT_MAX];
+    uint8_t ident_len;
 } lview_t;
 
 typedef struct {
@@ -566,6 +594,7 @@ typedef struct {
     bool dir_only;
     bool signer_wait;                        /* database { signer-wait }: a changed zone of the signer waits for the signer */
     int bulk_threshold;
+    bool store_proto;                        /* 0.7 WP7a: the store protocol (MANIFEST / CHANGES) instead of INVENTORY */
     lview_t *views;
     size_t nviews;
 } lcfg_t;
@@ -573,7 +602,7 @@ typedef struct {
 typedef struct { uint64_t id; uint16_t view; bool force; char zone[DNS_NAME_TEXT_SIZE]; } lreq_t;
 
 /* D1a: a FETCH_REQ waiting for the fetch thread (priority 0 = a parked query waits, 1 = warm-up, 2 = background) */
-typedef struct { uint64_t id; uint16_t view; uint8_t prio, mode; bool range; char zone[DNS_NAME_TEXT_SIZE]; } freq_t;
+typedef struct { uint64_t id; uint16_t view; uint8_t prio, mode; bool range; int64_t source_id; char zone[DNS_NAME_TEXT_SIZE]; } freq_t;
 #define FQ_MAX 256                           /* more than this is answered "busy" (design 6.1) */
 
 #define LREQ_MAX 64
@@ -654,6 +683,7 @@ struct lio {
     freq_t fbusy[8];                         /* ... the first few, to be answered "busy" */
     size_t nfbusy;
     bool reload_all;                        /* a RELOAD_REQ scope all arrived (or the queue overflowed) */
+    bool all_force;                         /* ... with force (store protocol: a full pass) */
     bool again;                             /* D1a: the Backend answered SEND_BODY to a summary: another diff soon, to send the zones whole */
     uint64_t all_req_id;                     /* the request id of the last scope all request, 0 = none */
     uint64_t batch_seq;
@@ -2217,7 +2247,7 @@ static int run_zones(ctx_t *x, const db_source_t *src, bool bulk, size_t n_want)
 static int send_hello(ctx_t *x, const char *driver_list, uint32_t pid) {
     if (kdb_enc_begin(&x->enc, KDB_T_HELLO) != 0 || kdb_enc_u16(&x->enc, 1, KDB_VERSION) != 0 ||
         kdb_enc_str(&x->enc, 2, KARIDNS_VERSION) != 0 || kdb_enc_str(&x->enc, 3, driver_list) != 0 ||
-        kdb_enc_u32(&x->enc, 4, pid) != 0 || kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
+        kdb_enc_u32(&x->enc, 4, pid) != 0 || (x->io && kdb_enc_u32(&x->enc, 5, KDB_FEAT_STORE) != 0) || kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
         return -1;
     return 0;
 }
@@ -3113,6 +3143,791 @@ static int conn_for(ctx_t *x, const db_source_t *src, bool *reused, dev_t *dev, 
 static int64_t now_ms(void);
 #define FETCH_SCHEMA_RECHECK_MS 5000
 
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 0.7 WP7a: the store protocol (store design 5): the loader keeps no table of the zones                          */
+/* ------------------------------------------------------------------------------------------------------------- */
+/* Negotiated by the CONFIG (store_proto): no INVENTORY.  Per view the loader holds a cursor of the change log and the identity of the database it
+ * belongs to (vstate_t seq / ident; the Backend keeps them in its store and sends them in CONFIG at the first load).  A load is
+ *   - a drain: pages of the change log after the cursor (changes_page), each distinct domain looked up by id (one statement) and sent as a CHANGES
+ *     entry (upsert / delete); or
+ *   - a pass: MANIFEST_BEGIN, pages of every domain of the source in id order (manifest_page), MANIFEST_END, and then a drain from the cursor taken
+ *     before the pass.  A pass is made when there is no usable cursor (first fill, `reload -force`), when the change log has a gap, when the identity
+ *     of the database differs, and for a source without karidns_changes (every change).
+ * Bodies are not sent: the Backend asks for the ones it lacks with FETCH_REQ on the fetch stream (a worker of the pool converts the zone as always).
+ * What is in memory: a page (ST_PAGE rows), the message being built, one looked up row; nothing grows with the number of zones.  A source without
+ * karidns_zone_state (a plain PowerDNS schema, decision D3) is listed from the zone list (the zone table of the legacy loader, unsuited above 100,000
+ * zones) with serials instead of stamps.  NOTIFY targets: a stored zone's NS set is in its image; the addresses of out-of-zone targets are looked up by
+ * the Backend, and the loader finds them only for the summary of ONE zone when it is asked for one (apex_gather() with a FETCH_REQ mode 1), by query. */
+#define ST_PAGE 2048u                    /* rows of a manifest page / log rows of a changes page; <= 330 bytes an entry keeps a message under KDB_MAX_BODY */
+#define ST_PLAIN_WARN 100000u
+#define ST_PLAIN (-100)                  /* store_view(): the source has no karidns_zone_state; the caller lists it */
+
+static bool st_ident_eq(const uint8_t *a, uint8_t al, const uint8_t *b, uint8_t bl) {
+    return al == bl && (al == 0 || memcmp(a, b, al) == 0);
+}
+
+/* the identity of the database a cursor belongs to: SQLite3 the device and inode of the file, PostgreSQL the schema.  (A restored PostgreSQL database
+ * is seen by its change log: a cursor above the log's end is a gap.)  Opaque to the Backend. */
+static void st_ident(const db_source_t *src, uint8_t out[KDB_IDENT_MAX], uint8_t *len) {
+    char t[KDB_IDENT_MAX + 1];
+    t[0] = '\0';
+    if (src->database_file) {
+        struct stat sb;
+        if (stat(src->database_file, &sb) == 0) snprintf(t, sizeof(t), "sqlite3:%llx:%llx", (unsigned long long)sb.st_dev, (unsigned long long)sb.st_ino);
+    } else {
+        snprintf(t, sizeof(t), "postgresql:%.40s", src->schema ? src->schema : "");
+    }
+    size_t n = strlen(t);
+    memcpy(out, t, n);
+    *len = (uint8_t)n;
+}
+
+/* does the view mapping (karidns_domain_views rows of the domain, apply_mapping() rules) give the domain to this view? */
+static bool st_mapped(const ctx_t *x, const db_manifest_row_t *r) {
+    if (!x->map_view || r->nviews == 0) return true;
+    for (unsigned k = 0; k < r->nviews; k++)
+        if (strcasecmp(r->views[k], x->map_view) == 0) return true;
+    return false;
+}
+
+/* the zones the signer keeps (signer-wait): sorted by domain id */
+static int sigw_add(struct lio *io, vstate_t *vs, int64_t id, const char *name) {
+    size_t lo = 0, hi = vs->nsigw;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (vs->sigw[mid].id < id) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo < vs->nsigw && vs->sigw[lo].id == id) return 0;
+    struct sigw *n = realloc(vs->sigw, (vs->nsigw + 1) * sizeof(*n));
+    char *nm = strdup(name ? name : "?");
+    if (!n || !nm) {
+        if (n) vs->sigw = n;
+        free(nm);
+        return -1;
+    }
+    vs->sigw = n;
+    memmove(&n[lo + 1], &n[lo], (vs->nsigw - lo) * sizeof(*n));
+    n[lo].id = id;
+    n[lo].name = nm;
+    vs->nsigw++;
+    io->status_dirty = true;
+    return 0;
+}
+
+static void sigw_del(struct lio *io, vstate_t *vs, int64_t id) {
+    if (!vs->nsigw) return;
+    size_t lo = 0, hi = vs->nsigw;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (vs->sigw[mid].id < id) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo >= vs->nsigw || vs->sigw[lo].id != id) return;
+    free(vs->sigw[lo].name);
+    memmove(&vs->sigw[lo], &vs->sigw[lo + 1], (vs->nsigw - lo - 1) * sizeof(*vs->sigw));
+    vs->nsigw--;
+    io->status_dirty = true;
+}
+
+/* Which of the ids (ascending) have the metadata X-KARIDNS-SIGNER=1: yes[k].  As zones_are_signers() (one query per DB_IN_MAX ids where the driver has
+ * scan_metadata_in); a read that fails: no id is one (the zone is sent, as it always was). */
+static void ids_are_signers(const ctx_t *x, const int64_t *ids, size_t n, bool *yes) {
+    const db_driver_t *drv = x->drv;
+    idset_t s = {0};
+    int rc = 0;
+    memset(yes, 0, n * sizeof(*yes));
+    if (drv->scan_metadata_in) {
+        for (size_t pos = 0; pos < n && rc == 0 && !s.oom; pos += DB_IN_MAX)
+            rc = drv->scan_metadata_in(x->conn, ids + pos, n - pos > DB_IN_MAX ? DB_IN_MAX : n - pos, signer_ids_cb, &s);
+    } else {
+        for (size_t k = 0; k < n && rc == 0 && !s.oom; k++) rc = drv->scan_metadata(x->conn, &ids[k], signer_ids_cb, &s);
+    }
+    if (rc == 0 && !s.oom)
+        for (size_t k = 0; k < n; k++) {
+            size_t lo = 0, hi = s.n;
+            while (lo < hi) {
+                size_t mid = lo + (hi - lo) / 2;
+                if (s.v[mid] < ids[k]) lo = mid + 1;
+                else hi = mid;
+            }
+            yes[k] = lo < s.n && s.v[lo] == ids[k];
+        }
+    free(s.v);
+}
+
+/* ---- messages ---- */
+static int st_man_open(ctx_t *x) {
+    if (x->st.msg_open) return 0;
+    if (kdb_enc_begin(&x->enc, KDB_T_MANIFEST) != 0 || kdb_enc_u64(&x->enc, 1, x->batch_id) != 0 || kdb_enc_u16(&x->enc, 2, x->view) != 0 ||
+        kdb_enc_u32(&x->enc, 3, x->st.page) != 0)
+        return -1;
+    x->st.msg_open = true;
+    return 0;
+}
+
+static int st_man_flush(ctx_t *x) {
+    if (!x->st.msg_open) return 0;
+    x->st.msg_open = false;
+    x->st.page++;
+    if (kdb_enc_end(&x->enc) != 0) return -1;
+    return send_enc(x);
+}
+
+static int st_man_add(ctx_t *x, int64_t id, const char *canon, uint8_t kind, bool stamped, uint64_t gen, uint64_t at, bool has_serial, uint32_t serial) {
+    if (st_man_open(x) != 0) return -1;
+    if (kdb_enc_nest_begin(&x->enc, 4) != 0 || kdb_enc_i64(&x->enc, 1, id) != 0 || kdb_enc_name(&x->enc, 2, canon) != 0 || kdb_enc_u8(&x->enc, 3, kind) != 0 ||
+        kdb_enc_u64(&x->enc, 4, gen) != 0 || kdb_enc_u64(&x->enc, 5, at) != 0 || (stamped && kdb_enc_u8(&x->enc, 6, KDB_EF_STAMPED) != 0) ||
+        (has_serial && kdb_enc_u32(&x->enc, 7, serial) != 0) || kdb_enc_nest_end(&x->enc) != 0)
+        return -1;
+    x->st.entries++;
+    x->n_zones++;
+    x->n_read++;
+    return 0;
+}
+
+static int st_ch_open(ctx_t *x) {
+    if (x->st.msg_open) return 0;
+    if (send_simple_header(x) != 0) return -1;
+    if (kdb_enc_begin(&x->enc, KDB_T_CHANGES) != 0 || kdb_enc_u64(&x->enc, 1, x->batch_id) != 0 || kdb_enc_u16(&x->enc, 2, x->view) != 0) return -1;
+    x->st.msg_open = true;
+    return 0;
+}
+
+/* end the open CHANGES message (the cursor and the last flag follow the entries: the tags of a message come in any order).  Only a page with last = 1
+ * carries a cursor the Backend may keep. */
+static int st_ch_flush(ctx_t *x, uint64_t cursor, bool last) {
+    if (!x->st.msg_open && st_ch_open(x) != 0) return -1;
+    x->st.msg_open = false;
+    if (kdb_enc_u64(&x->enc, 3, cursor) != 0 || kdb_enc_u8(&x->enc, 4, last ? 1 : 0) != 0 ||
+        (x->st.ident_len && kdb_enc_bytes(&x->enc, 5, x->st.ident, x->st.ident_len) != 0) || kdb_enc_end(&x->enc) != 0)
+        return -1;
+    x->st.sent_changes = true;
+    return send_enc(x);
+}
+
+static int st_ch_add(ctx_t *x, int64_t id, uint8_t op, const char *canon, uint8_t kind, bool stamped, uint64_t gen, uint64_t at, bool force, bool has_serial,
+                     uint32_t serial) {
+    if (st_ch_open(x) != 0) return -1;
+    uint8_t fl = (uint8_t)((stamped ? KDB_EF_STAMPED : 0) | (force ? KDB_EF_FORCE : 0));
+    if (kdb_enc_nest_begin(&x->enc, 6) != 0 || kdb_enc_i64(&x->enc, 1, id) != 0 || kdb_enc_u8(&x->enc, 2, op) != 0 || (canon && kdb_enc_name(&x->enc, 3, canon) != 0) ||
+        (op == KDB_CH_UPSERT && kdb_enc_u8(&x->enc, 4, kind) != 0) || (op == KDB_CH_UPSERT && kdb_enc_u64(&x->enc, 5, gen) != 0) ||
+        (op == KDB_CH_UPSERT && kdb_enc_u64(&x->enc, 6, at) != 0) || (fl && kdb_enc_u8(&x->enc, 7, fl) != 0) ||
+        (has_serial && kdb_enc_u32(&x->enc, 8, serial) != 0) || kdb_enc_nest_end(&x->enc) != 0)
+        return -1;
+    if (op == KDB_CH_UPSERT) {
+        x->n_zones++;
+        x->n_read++;
+    } else {
+        x->n_deleted++;
+    }
+    return 0;
+}
+
+static int st_man_begin_msg(ctx_t *x, uint64_t count, uint64_t cursor, bool cursor_valid, uint32_t flags) {
+    if (send_simple_header(x) != 0) return -1;
+    if (kdb_enc_begin(&x->enc, KDB_T_MANIFEST_BEGIN) != 0 || kdb_enc_u64(&x->enc, 1, x->batch_id) != 0 || kdb_enc_u16(&x->enc, 2, x->view) != 0 ||
+        kdb_enc_u64(&x->enc, 3, count) != 0 || kdb_enc_u64(&x->enc, 4, cursor) != 0 || kdb_enc_u8(&x->enc, 5, cursor_valid ? 1 : 0) != 0 ||
+        (x->st.ident_len && kdb_enc_bytes(&x->enc, 6, x->st.ident, x->st.ident_len) != 0) || kdb_enc_u32(&x->enc, 7, flags) != 0 || kdb_enc_end(&x->enc) != 0)
+        return -1;
+    x->st.page = 0;
+    x->st.entries = x->st.skipped = x->st.unmapped = x->st.orphans = 0;
+    x->st.nskip_names = 0;
+    return send_enc(x);
+}
+
+static int st_man_end_msg(ctx_t *x, uint64_t cursor, bool cursor_valid, bool complete) {
+    if (kdb_enc_begin(&x->enc, KDB_T_MANIFEST_END) != 0 || kdb_enc_u64(&x->enc, 1, x->batch_id) != 0 || kdb_enc_u16(&x->enc, 2, x->view) != 0 ||
+        kdb_enc_u64(&x->enc, 3, x->st.entries) != 0 || kdb_enc_u64(&x->enc, 4, x->st.skipped) != 0 || kdb_enc_u64(&x->enc, 5, cursor) != 0 ||
+        kdb_enc_u8(&x->enc, 6, cursor_valid ? 1 : 0) != 0 || (x->st.ident_len && kdb_enc_bytes(&x->enc, 7, x->st.ident, x->st.ident_len) != 0) ||
+        kdb_enc_u8(&x->enc, 8, complete ? 1 : 0) != 0 || kdb_enc_end(&x->enc) != 0)
+        return -1;
+    return send_enc(x);
+}
+
+/* what is said at the end of a pass: the zones the loader cannot send (and why), the zones no view serves */
+static void st_skip_note(ctx_t *x, const char *name, const char *why) {
+    x->st.skipped++;
+    if (x->st.nskip_names < 3) {
+        char shown[100];
+        clean_reason(name, shown, sizeof(shown));
+        snprintf(x->st.skip_names[x->st.nskip_names++], sizeof(x->st.skip_names[0]), "%s (%s)", shown, why);
+    }
+}
+
+static void st_pass_log(ctx_t *x) {
+    const char *vn = x->io->vnames[x->vslot];
+    if (x->st.skipped)
+        lg(LOG_WARNING, "view '%s': %llu zone(s) are not offered to the Backend (a type or a name the loader cannot send), for example %s%s%s%s%s", vn,
+           (unsigned long long)x->st.skipped, x->st.skip_names[0], x->st.nskip_names > 1 ? ", " : "", x->st.nskip_names > 1 ? x->st.skip_names[1] : "",
+           x->st.nskip_names > 2 ? ", " : "", x->st.nskip_names > 2 ? x->st.skip_names[2] : "");
+    if (x->st.orphans)
+        lg(LOG_WARNING, "karidns_domain_views: %llu zone(s) are mapped only to views that do not use this database as their source and are served by no view",
+           (unsigned long long)x->st.orphans);
+}
+
+/* ---- a pass ---- */
+static int st_man_cb(void *ud, const db_manifest_row_t *r) {
+    ctx_t *x = ud;
+    if (g_stop) return 1;
+    if (!st_mapped(x, r)) {
+        x->st.unmapped++;
+        if (x->io) {                                    /* a zone whose rows name only views of other sources is served by no view */
+            bool other = false;
+            for (unsigned k = 0; k < r->nviews && !other; k++) other = view_uses_shared_source(x->io, r->views[k]);
+            if (!other) x->st.orphans++;
+        }
+        return 0;
+    }
+    char canon[DNS_NAME_TEXT_SIZE];
+    const char *why = zone_type_reason(r->type);
+    if (why) {
+        st_skip_note(x, r->name, why);
+        return 0;
+    }
+    if (!pdns_canonical_zone_name(r->name, canon)) {
+        st_skip_note(x, r->name, "not a valid domain name");
+        return 0;
+    }
+    if (st_man_add(x, r->id, canon, zone_sec_kind(r->type), r->has_state, r->stamp_gen, r->stamp_time, false, 0) != 0) {
+        x->st.fail = true;
+        return 1;
+    }
+    return 0;
+}
+
+/* The pass over every domain: MANIFEST_BEGIN .. MANIFEST_END.  The cursor was taken before (cursor_valid: the source has a change log).  0, or an EXIT_* status;
+ * after an error the pass is ended with complete = 0 (no sweep). */
+static int st_pass(ctx_t *x, uint64_t cursor, bool cursor_valid) {
+    uint64_t count = 0;
+    if (x->drv->count_domains && x->drv->count_domains(x->conn, x->map_view, &count) != 0) count = 0;     /* (an estimate: a failure is not worth an error) */
+    if (st_man_begin_msg(x, count, cursor, cursor_valid, 0) != 0) {
+        x->io_error = true;
+        return EXIT_ERROR;
+    }
+    int status = EXIT_OK;
+    int64_t after = 0;
+    x->st.fail = false;
+    for (;;) {
+        int64_t last = after;
+        unsigned nrows = 0;
+        int rc = x->drv->manifest_page(x->conn, after, ST_PAGE, st_man_cb, x, &last, &nrows);
+        if (g_stop) {
+            status = EXIT_ERROR;
+            break;
+        }
+        if (x->st.fail || x->enc.err) {
+            lg(LOG_ERR, "out of memory");
+            x->oom = true;
+            status = EXIT_ERROR;
+            break;
+        }
+        if (rc != 0 && rc != DB_STOPPED) {
+            status = db_err(x, rc, "reading the zone list");
+            break;
+        }
+        if (st_man_flush(x) != 0) {
+            x->io_error = true;
+            status = EXIT_ERROR;
+            break;
+        }
+        if (x->io->eof || x->io->failed) {
+            status = EXIT_ERROR;
+            break;
+        }
+        after = last;
+        if (nrows < ST_PAGE) break;
+    }
+    if (status != EXIT_OK) {
+        kdb_enc_reset(&x->enc);
+        x->st.msg_open = false;
+        if (!x->io_error && !x->io->eof && !x->io->failed && !g_stop && st_man_end_msg(x, cursor, cursor_valid, false) != 0) x->io_error = true;
+        return status;
+    }
+    if (st_man_end_msg(x, cursor, cursor_valid, true) != 0) {
+        x->io_error = true;
+        return EXIT_ERROR;
+    }
+    lgd(1, "view '%s': manifest pass: %llu zone(s) in %u page(s), %llu not offered, %llu mapped to other views", x->io->vnames[x->vslot],
+        (unsigned long long)x->st.entries, x->st.page, (unsigned long long)x->st.skipped, (unsigned long long)x->st.unmapped);
+    st_pass_log(x);
+    return EXIT_OK;
+}
+
+/* ---- a drain ---- */
+typedef struct { uint64_t seq; int64_t id; uint8_t op; } st_item_t;
+typedef struct { st_item_t *v; size_t n, cap; } st_items_t;
+
+static int st_item_cb(void *ud, const db_change_entry_t *e) {
+    st_items_t *it = ud;
+    if (it->n >= it->cap) return 1;
+    it->v[it->n].seq = e->seq;
+    it->v[it->n].id = e->domain_id;
+    it->v[it->n].op = e->op == DB_CHANGE_DELETE ? KDB_CH_DELETE : KDB_CH_UPSERT;
+    it->n++;
+    return 0;
+}
+
+/* what an entry needs of a domain's row (the strings are valid during the call that has it) */
+typedef struct {
+    bool found, mapped, has_type, has_state;
+    uint64_t gen, at;
+    const char *name, *type;
+} st_rowinfo_t;
+
+/* one domain, read by its id: the page of the manifest that starts after id - 1 and has one row */
+typedef struct {
+    const ctx_t *x;
+    int64_t want;
+    bool found, mapped, has_type, has_state;
+    uint64_t gen, at;
+    char name[DB_MANIFEST_NAME_MAX + 1], type[DB_MANIFEST_TYPE_MAX + 1];
+} st_look_t;
+
+static int st_look_cb(void *ud, const db_manifest_row_t *r) {
+    st_look_t *l = ud;
+    if (r->id != l->want) return 1;                     /* (the next domain: the one asked for is not there) */
+    l->found = true;
+    l->mapped = st_mapped(l->x, r);
+    snprintf(l->name, sizeof(l->name), "%s", r->name);
+    l->has_type = r->type != NULL;
+    if (r->type) snprintf(l->type, sizeof(l->type), "%s", r->type);
+    l->has_state = r->has_state;
+    l->gen = r->stamp_gen;
+    l->at = r->stamp_time;
+    return 1;
+}
+
+static int st_lookup(ctx_t *x, int64_t id, st_look_t *l) {
+    memset(l, 0, sizeof(*l));
+    l->x = x;
+    l->want = id;
+    if (id <= 0) return 0;
+    int64_t last = 0;
+    unsigned n = 0;
+    int rc = x->drv->manifest_page(x->conn, id - 1, 1, st_look_cb, l, &last, &n);
+    return rc == DB_STOPPED ? 0 : rc;
+}
+
+/* The entry of a domain for this view: an upsert when it exists, is mapped here and can be sent; else a delete (with the name when there is one).  `held`:
+ * the signer keeps the zone (signer-wait): nothing is sent, the zone waits.  0, or -1 (out of memory / encoder). */
+static int st_emit_row(ctx_t *x, int64_t id, const st_rowinfo_t *r, bool held, bool force) {
+    struct lio *io = x->io;
+    vstate_t *vs = &io->vst[x->vslot];
+    char canon[DNS_NAME_TEXT_SIZE];
+    bool have_canon = r->found && pdns_canonical_zone_name(r->name, canon);
+    if (r->found && r->mapped && have_canon && !zone_type_reason(r->has_type ? r->type : NULL)) {
+        if (held) return sigw_add(io, vs, id, canon) != 0 ? -1 : 0;
+        sigw_del(io, vs, id);
+        return st_ch_add(x, id, KDB_CH_UPSERT, canon, zone_sec_kind(r->has_type ? r->type : NULL), r->has_state, r->gen, r->at, force, false, 0);
+    }
+    sigw_del(io, vs, id);
+    return st_ch_add(x, id, KDB_CH_DELETE, have_canon ? canon : NULL, 0, false, 0, 0, false, false, 0);
+}
+
+/* 0, -1 (out of memory / encoder), -2 (a database error: x->st.dberr) */
+static int st_entry_for(ctx_t *x, int64_t id, bool held, bool force) {
+    st_look_t l;
+    int rc = st_lookup(x, id, &l);
+    if (rc != 0) {
+        x->st.dberr = rc;
+        return -2;
+    }
+    st_rowinfo_t ri = { l.found, l.mapped, l.has_type, l.has_state, l.gen, l.at, l.name, l.type };
+    return st_emit_row(x, id, &ri, held, force);
+}
+
+/* A run of changed domains with ids close together (a zone import, a mass re-signing) is read with one statement: the manifest page from the first id of the
+ * run, as long as the run is (the rows between are read and dropped). */
+typedef struct {
+    ctx_t *x;
+    const st_item_t *it;
+    const bool *held;
+    bool *seen;
+    size_t n, k;
+    int rc;
+} st_run_t;
+
+static int st_run_cb(void *ud, const db_manifest_row_t *r) {
+    st_run_t *u = ud;
+    while (u->k < u->n && u->it[u->k].id < r->id) u->k++;
+    if (u->k >= u->n || u->it[u->k].id != r->id) return 0;
+    st_rowinfo_t ri = { true, st_mapped(u->x, r), r->type != NULL, r->has_state, r->stamp_gen, r->stamp_time, r->name, r->type };
+    u->seen[u->k] = true;
+    if (st_emit_row(u->x, r->id, &ri, u->held[u->k], false) != 0) {
+        u->rc = -1;
+        return 1;
+    }
+    return 0;
+}
+
+static int cmp_item_id(const void *a, const void *b) {
+    int64_t x = ((const st_item_t *)a)->id, y = ((const st_item_t *)b)->id;
+    return x < y ? -1 : x > y;
+}
+
+/* The zones that waited for the signer: sent now when this is not an auto batch (a reload of everything) or when they are no longer the signer's. */
+static int st_sigw_release(ctx_t *x, vstate_t *vs, bool all) {
+    if (!vs->nsigw) return 0;
+    size_t n = vs->nsigw;
+    int64_t *ids = malloc(n * sizeof(*ids));
+    bool *yes = malloc(n * sizeof(*yes));
+    if (!ids || !yes) {
+        free(ids);
+        free(yes);
+        return -1;
+    }
+    for (size_t i = 0; i < n; i++) ids[i] = vs->sigw[i].id;
+    ids_are_signers(x, ids, n, yes);
+    int rc = 0;
+    for (size_t i = 0; i < n && rc == 0; i++)
+        if (all || !yes[i]) rc = st_entry_for(x, ids[i], false, false);
+    free(ids);
+    free(yes);
+    return rc;
+}
+
+#define ST_RUN_GAP 8                        /* ids that are at most this far apart are read together */
+
+/* Follow the change log from *cursor to its end (pages of ST_PAGE log rows).  *gap: the log does not reach back to the cursor; nothing of that drain
+ * is trusted and the caller makes a pass.  On 0 and no gap, *cursor is the position to continue from.  0, or an EXIT_* status. */
+static int st_drain(ctx_t *x, const db_schema_info_t *si, uint64_t *cursor, bool *gap_out) {
+    (void)si;
+    struct lio *io = x->io;
+    vstate_t *vs = &io->vst[x->vslot];
+    const bool hold = x->batch_kind == KDB_BATCH_AUTO && io->cfg.signer_wait;
+    db_change_pos_t pos;
+    db_change_pos_init(&pos, *cursor);
+    const uint64_t start = *cursor;
+    st_items_t it = { malloc(ST_PAGE * sizeof(st_item_t)), 0, ST_PAGE };
+    bool *held = calloc(ST_PAGE, sizeof(bool));
+    bool *seen = calloc(ST_PAGE, sizeof(bool));
+    int64_t *ids = malloc(ST_PAGE * sizeof(int64_t));
+    bool *yes = malloc(ST_PAGE * sizeof(bool));
+    int status = EXIT_OK;
+    *gap_out = false;
+    x->st.sent_changes = false;
+    x->st.fail = false;
+    x->st.dberr = 0;
+    if (!it.v || !held || !seen || !ids || !yes) {
+        status = EXIT_ERROR;
+        lg(LOG_ERR, "out of memory");
+        x->oom = true;
+        goto out;
+    }
+    if (vs->nsigw) {                                      /* the zones that waited for the signer: released by a reload, or when they are not the signer's any more */
+        int rc = st_sigw_release(x, vs, !hold);
+        if (rc == -2) {
+            status = db_err(x, x->st.dberr, "reading the zone");
+            goto out;
+        }
+        if (rc != 0) {
+            status = EXIT_ERROR;
+            if (!x->io_error) {
+                lg(LOG_ERR, "out of memory");
+                x->oom = true;
+            }
+            goto out;
+        }
+    }
+    for (;;) {
+        bool more = false, gap = false;
+        it.n = 0;
+        int rc = x->drv->changes_page(x->conn, &pos, ST_PAGE, st_item_cb, &it, &more, &gap);
+        if (rc != 0) {
+            status = db_err(x, rc, "reading the change log");
+            goto out;
+        }
+        if (gap) {
+            *gap_out = true;
+            kdb_enc_reset(&x->enc);
+            x->st.msg_open = false;
+            goto out;
+        }
+        /* the entries of a one-zone reload that read the zone as it was (signer zones) are not changes any more */
+        size_t w = 0;
+        for (size_t i = 0; i < it.n; i++)
+            if (!(vs->ncov && cov_covers(vs, x->drv->changes_unsettled, it.v[i].id, it.v[i].seq))) it.v[w++] = it.v[i];
+        it.n = w;
+        qsort(it.v, it.n, sizeof(*it.v), cmp_item_id);       /* (one entry per domain in a page: the order of the entries does not matter, the runs of ids do) */
+        memset(held, 0, it.n * sizeof(bool));
+        memset(seen, 0, it.n * sizeof(bool));
+        if (hold && it.n) {                                  /* signer-wait: which of the upserts are zones the signer keeps */
+            size_t k = 0;
+            for (size_t i = 0; i < it.n; i++)
+                if (it.v[i].op == KDB_CH_UPSERT) ids[k++] = it.v[i].id;
+            ids_are_signers(x, ids, k, yes);
+            k = 0;
+            for (size_t i = 0; i < it.n; i++)
+                if (it.v[i].op == KDB_CH_UPSERT) held[i] = yes[k++];
+        }
+        for (size_t i = 0; i < it.n;) {
+            int rc2 = 0;
+            if (it.v[i].op == KDB_CH_DELETE) {
+                sigw_del(io, vs, it.v[i].id);
+                rc2 = st_ch_add(x, it.v[i].id, KDB_CH_DELETE, NULL, 0, false, 0, 0, false, false, 0);
+                i++;
+            } else {
+                size_t j = i;
+                while (j + 1 < it.n && it.v[j + 1].op == KDB_CH_UPSERT && it.v[j + 1].id - it.v[j].id <= ST_RUN_GAP && it.v[j + 1].id - it.v[i].id < (int64_t)ST_PAGE) j++;
+                if (j == i) {
+                    rc2 = st_entry_for(x, it.v[i].id, held[i], false);
+                } else {
+                    st_run_t u = { x, it.v + i, held + i, seen + i, j - i + 1, 0, 0 };
+                    int64_t last = 0;
+                    unsigned nr = 0;
+                    int rc3 = x->drv->manifest_page(x->conn, it.v[i].id - 1, (unsigned)(it.v[j].id - it.v[i].id + 1), st_run_cb, &u, &last, &nr);
+                    if (u.rc != 0) {
+                        rc2 = u.rc;
+                    } else if (rc3 != 0 && rc3 != DB_STOPPED) {
+                        x->st.dberr = rc3;
+                        rc2 = -2;
+                    } else {
+                        for (size_t q = i; q <= j && rc2 == 0; q++)
+                            if (!seen[q]) {                    /* not in the table any more */
+                                st_rowinfo_t none = { false, false, false, false, 0, 0, NULL, NULL };
+                                rc2 = st_emit_row(x, it.v[q].id, &none, false, false);
+                            }
+                    }
+                }
+                i = j + 1;
+            }
+            if (rc2 == -2) {
+                status = db_err(x, x->st.dberr, "reading the zone");
+                goto out;
+            }
+            if (x->io_error) {                                 /* (a write failed: the stream is gone) */
+                status = EXIT_ERROR;
+                goto out;
+            }
+            if (rc2 != 0 || x->enc.err) {
+                status = EXIT_ERROR;
+                lg(LOG_ERR, "out of memory");
+                x->oom = true;
+                goto out;
+            }
+        }
+        const bool last = !more;
+        if (x->st.msg_open || (last && x->st.sent_changes)) {
+            if (st_ch_flush(x, last ? pos.cursor : start, last) != 0) {
+                x->io_error = true;
+                status = EXIT_ERROR;
+                goto out;
+            }
+        }
+        if (last) break;
+        if (g_stop || io->eof || io->failed) {
+            status = EXIT_ERROR;
+            goto out;
+        }
+    }
+    *cursor = pos.cursor;
+out:
+    if (status != EXIT_OK) {
+        kdb_enc_reset(&x->enc);
+        x->st.msg_open = false;
+    }
+    free(it.v);
+    free(held);
+    free(seen);
+    free(ids);
+    free(yes);
+    return status;
+}
+
+/* One view of a source that has karidns_zone_state: a drain from the cursor, or a pass and a drain.  ST_PLAIN: the source has none (the caller lists it).
+ * 0, or an EXIT_* status.  The connection is the load's own, opened and closed here; no snapshot is held between pages. */
+static int store_view(ctx_t *x, const db_source_t *src, const lview_t *v) {
+    struct lio *io = x->io;
+    vstate_t *vs = &io->vst[x->vslot];
+    const char *vn = io->vnames[x->vslot];
+    bool reused = false;
+    dev_t fdev = 0;
+    ino_t fino = 0;
+    int rc = conn_for(x, src, &reused, &fdev, &fino);
+    if (rc != 0) return rc;
+    int status = EXIT_OK;
+    db_schema_info_t si;
+    memset(&si, 0, sizeof(si));
+    if ((rc = x->drv->check_schema(x->conn, &si)) != 0) {
+        status = db_err(x, rc, "schema");
+        goto out;
+    }
+    if (!si.has_zone_state || !x->drv->manifest_page || !x->drv->changes_page || !x->drv->current_cursor) {
+        status = ST_PLAIN;
+        goto out;
+    }
+    st_ident(src, x->st.ident, &x->st.ident_len);
+    if (!vs->st_init) {                                    /* the first load of this process: the cursor the Backend kept (CONFIG) */
+        vs->st_init = true;
+        if (v->has_cursor && !vs->seq_valid) {
+            vs->seq = v->cursor;
+            vs->seq_valid = true;
+            memcpy(vs->ident, v->ident, v->ident_len);
+            vs->ident_len = v->ident_len;
+        }
+    }
+    bool full = x->store_full || vs->need_full || !si.has_changes || !vs->seq_valid;
+    const char *why = x->store_full ? "a full pass was asked for" : vs->need_full ? "the database file was replaced" : !si.has_changes ? "the source has no change log"
+                      : !vs->seq_valid ? "there is no cursor (first fill)" : "";
+    if (!full && !st_ident_eq(vs->ident, vs->ident_len, x->st.ident, x->st.ident_len)) {
+        full = true;
+        why = "the database is not the one the cursor belongs to";
+    }
+    uint64_t cursor = vs->seq;
+    if (!full) {
+        x->change_seq = cursor;
+        bool gap = false;
+        status = st_drain(x, &si, &cursor, &gap);
+        if (status != EXIT_OK) goto out;
+        if (gap) {
+            full = true;
+            why = "the change log no longer reaches back to the cursor";
+        } else {
+            vs->seq = cursor;
+            lgd(1, "view '%s': followed the change log to %llu: %u zone(s) upserted, %u deleted", vn, (unsigned long long)cursor, x->n_zones, x->n_deleted);
+        }
+    }
+    if (full) {
+        lg(vs->seq_valid || vs->need_full ? LOG_NOTICE : LOG_INFO, "view '%s': listing every zone (%s)", vn, why);
+        vs->seq_valid = false;                             /* a failed pass is made again, not followed from the old cursor */
+        uint64_t c0 = 0;
+        if (si.has_changes && (rc = x->drv->current_cursor(x->conn, &c0)) != 0) {
+            status = db_err(x, rc, "reading the change log position");
+            goto out;
+        }
+        x->change_seq = c0;
+        int64_t t0 = now_ms();
+        status = st_pass(x, c0, si.has_changes);
+        if (status != EXIT_OK) goto out;
+        cov_clear(vs);
+        vs->need_full = false;
+        memcpy(vs->ident, x->st.ident, x->st.ident_len);
+        vs->ident_len = x->st.ident_len;
+        if (!si.has_changes) {                             /* D3: every change is a pass; above 100,000 zones the next one is not made before ten times this long */
+            if (!vs->nolog_warned) {
+                vs->nolog_warned = true;
+                lg(LOG_NOTICE, "view '%s': the database has no karidns_changes table; every change lists every zone again (apply db/karidns_ext.*.sql)", vn);
+            }
+            if (x->st.entries > ST_PLAIN_WARN) {
+                vs->hold_until = now_ms() + 10 * (now_ms() - t0);
+                if (!vs->plain_warned) {
+                    vs->plain_warned = true;
+                    lg(LOG_WARNING, "view '%s': a source without karidns_changes is unsuited above %u zones (%llu here): the change log is required for this size", vn,
+                       ST_PLAIN_WARN, (unsigned long long)x->st.entries);
+                }
+            }
+        }
+        if (si.has_changes) {
+            cursor = c0;
+            bool gap = false;
+            status = st_drain(x, &si, &cursor, &gap);
+            if (status != EXIT_OK) {
+                vs->seq = c0;                              /* the pass is made; the drain is read again from where the pass began */
+                vs->seq_valid = true;
+                goto out;
+            }
+            if (gap) {
+                lg(LOG_ERR, "view '%s': the change log has a gap right after a pass; trying again later", vn);
+                status = EXIT_RETRY;
+                goto out;
+            }
+            vs->seq = cursor;
+            vs->seq_valid = true;
+        }
+    }
+out:
+    if (x->conn) x->drv->close(x->conn);
+    x->conn = NULL;
+    return status;
+}
+
+/* The zones x->zones[] (a one-zone reload, or a source without karidns_zone_state, listed through list_zones() and the mapping) as store protocol messages:
+ * a one-zone reload is a CHANGES entry that forces the body (or a ZONE_DELETE by name when the database has no such zone), a whole plain source a pass
+ * with serials in place of stamps.  Called inside the snapshot of run_view_once().  0, or an EXIT_* status. */
+static int st_emit_listed(ctx_t *x, const db_schema_info_t *si, const char *only_zone) {
+    struct lio *io = x->io;
+    vstate_t *vs = &io->vst[x->vslot];
+    x->st.ident_len = 0;                                   /* (no identity: a plain source has no cursor) */
+    if (only_zone) {
+        char canon[DNS_NAME_TEXT_SIZE];
+        if (x->nz == 0) {                                  /* not in the database (or not this view's): the Backend deletes it by name */
+            if (!pdns_canonical_zone_name(only_zone, canon)) return 0;
+            gone_t g;
+            snprintf(g.name, sizeof(g.name), "%s", canon);
+            g.source_id = 0;
+            if (send_delete(x, &g) != 0) {
+                x->io_error = true;
+                return EXIT_ERROR;
+            }
+            return 0;
+        }
+        const zinfo_t *z = &x->zones[0];
+        const char *tr = zone_type_reason(z->type);
+        if (tr || !z->canon) {
+            if (send_simple_header(x) != 0 || send_failed(x, z, tr ? tr : "the zone name cannot be written as a canonical name") != 0) {
+                x->io_error = true;
+                return EXIT_ERROR;
+            }
+            return 0;
+        }
+        if (st_ch_add(x, z->id, KDB_CH_UPSERT, z->canon, zone_sec_kind(z->type), false, 0, 0, true, z->has_serial, z->serial) != 0 ||
+            st_ch_flush(x, vs->seq, false) != 0) {
+            x->io_error = !x->enc.err;
+            x->oom = x->enc.err;
+            return EXIT_ERROR;
+        }
+        sigw_del(io, vs, z->id);
+        /* item C: a one-zone reload reads a signer zone as it is; the rows of its change log up to now are in what it reads (as plan_diff() did) */
+        if (si->has_changes && io->cfg.signer_wait && x->drv->changes_max) {
+            uint64_t m = 0;
+            bool yes = false;
+            if (x->drv->changes_max(x->conn, &m) == 0) {
+                ids_are_signers(x, &z->id, 1, &yes);
+                if (yes) {
+                    if (cov_set(vs, z->id, m) != 0) return EXIT_ERROR;
+                } else {
+                    cov_del(vs, z->id);
+                }
+            }
+        }
+        return 0;
+    }
+    if (x->nz > ST_PLAIN_WARN && !vs->plain_warned) {
+        vs->plain_warned = true;
+        lg(LOG_WARNING, "view '%s': a plain PowerDNS schema (no karidns_zone_state) is unsuited above %u zones (%zu here): every change lists every zone; "
+                        "apply db/karidns_ext.*.sql (schema version 3)", io->vnames[x->vslot], ST_PLAIN_WARN, x->nz);
+    }
+    x->change_seq = vs->seq;
+    if (st_man_begin_msg(x, x->nz, 0, false, KDB_MF_PLAIN) != 0) {
+        x->io_error = true;
+        return EXIT_ERROR;
+    }
+    x->st.fail = false;
+    for (size_t i = 0; i < x->nz; i++) {
+        const zinfo_t *z = &x->zones[i];
+        const char *tr = zone_type_reason(z->type);
+        if (tr || !z->canon) {
+            st_skip_note(x, z->name ? z->name : "?", tr ? "type" : "not a valid domain name");
+        } else if (st_man_add(x, z->id, z->canon, zone_sec_kind(z->type), false, 0, 0, z->has_serial, z->serial) != 0) {
+            lg(LOG_ERR, "out of memory");
+            x->oom = true;
+            return EXIT_ERROR;
+        }
+        if (x->st.msg_open && (x->enc.len > 900u * 1024u || (i + 1) % ST_PAGE == 0) && st_man_flush(x) != 0) {
+            x->io_error = true;
+            return EXIT_ERROR;
+        }
+    }
+    if (st_man_flush(x) != 0 || st_man_end_msg(x, 0, false, true) != 0) {
+        x->io_error = true;
+        return EXIT_ERROR;
+    }
+    st_pass_log(x);
+    return 0;
+}
+
+
 static int run_view_once(ctx_t *x, const db_source_t *src, const char *only_zone, bool whole) {
     ctx_view_reset(x);
     x->only_name = only_zone;
@@ -3201,11 +4016,21 @@ static int run_view_once(ctx_t *x, const db_source_t *src, const char *only_zone
             status = EXIT_ERROR;
             goto out_snap;
         }
+        if (x->fetch_source_id > 0 && x->zones[0].id != x->fetch_source_id) {      /* 0.7 WP7a: the Backend's zone is another domain now */
+            snprintf(x->errtext, sizeof(x->errtext), "the name is domain id %lld now, not %lld: the zone was renamed or created again",
+                     (long long)x->zones[0].id, (long long)x->fetch_source_id);
+            status = EXIT_ERROR;
+            goto out_snap;
+        }
         x->zones[0].want = true;
         if (x->fetch_summary && zone_sec_kind(x->zones[0].type) == KDB_ZK_PRIMARY) {      /* no records: serial, SOA timers, presigned (a secondary has no records anyway) */
             status = fetch_summary(x);
             goto out_snap;
         }
+    }
+    if (x->io && !x->fetch && x->store_proto) {         /* 0.7 WP7a: a one-zone reload, or a source without karidns_zone_state: the zone list as store messages */
+        status = st_emit_listed(x, &si, only_zone);
+        goto out_snap;
     }
     if (x->io && !x->fetch) {
         if (plan_diff(x, &si, only_zone, &gone, &ngone, &have_seq, &new_seq) != 0) {
@@ -3704,6 +4529,7 @@ static int cfg_from_msg(const kdb_msg_t *m, lcfg_t *c) {
     c->dir_only = m->u.config.dir_only;
     c->signer_wait = m->u.config.signer_wait;
     c->bulk_threshold = m->u.config.bulk_threshold;
+    c->store_proto = m->u.config.store_proto;
     c->views = calloc(m->u.config.n_views ? m->u.config.n_views : 1, sizeof(lview_t));
     if (!c->views) return -1;
     kdb_iter_t it;
@@ -3721,6 +4547,10 @@ static int cfg_from_msg(const kdb_msg_t *m, lcfg_t *c) {
         d->coalesce_ms = v.coalesce_ms;
         d->max_records = v.max_zone_records;
         d->max_bytes = v.max_zone_bytes;
+        d->has_cursor = v.has_cursor;
+        d->cursor = v.cursor;
+        d->ident_len = v.ident_len;
+        memcpy(d->ident, v.ident, v.ident_len);
         if (!d->name || (v.source.p && !d->source) || (v.conninfo_file.p && !d->conninfo)) return -1;
     }
     return 0;
@@ -3731,7 +4561,7 @@ static bool streq_n(const char *a, const char *b) { return (a == NULL) == (b == 
 /* Same sources and same conversion parameters: nothing to read again.  (Generation, auto-reload and the poll
  * settings change without a new read.) */
 static bool cfg_load_equal(const lcfg_t *a, const lcfg_t *b) {
-    if (strcmp(a->driver, b->driver) != 0 || a->default_ttl != b->default_ttl || a->nviews != b->nviews) return false;
+    if (strcmp(a->driver, b->driver) != 0 || a->default_ttl != b->default_ttl || a->nviews != b->nviews || a->store_proto != b->store_proto) return false;
     for (size_t i = 0; i < a->nviews; i++) {
         const lview_t *x = &a->views[i], *y = &b->views[i];
         if (x->index != y->index || x->shared != y->shared || strcmp(x->name, y->name) != 0 || !streq_n(x->source, y->source) ||
@@ -3908,6 +4738,7 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
             f->prio = q->priority;
             f->mode = q->mode;
             f->range = q->has_range;
+            f->source_id = q->source_id;
             snprintf(f->zone, sizeof(f->zone), "%s", q->name);
             pthread_cond_broadcast(&io->fq_cond);          /* (broadcast: a worker above fq_allowed would take the wake-up) */
         }
@@ -4074,6 +4905,7 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
         if (m.u.reload_req.scope == 0 || io->nreq >= LREQ_MAX) {
             io->reload_all = true;
             io->all_req_id = m.u.reload_req.request_id;
+            if (m.u.reload_req.scope == 0 && m.u.reload_req.force) io->all_force = true;
         } else {
             lreq_t *r = &io->req[io->nreq++];
             r->id = m.u.reload_req.request_id;
@@ -4260,6 +5092,8 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
     x->bulk_threshold = c->bulk_threshold;
     x->nthreads = c->loader_threads >= 1 && c->loader_threads <= 16 ? c->loader_threads : 1;
     x->dir_only = c->dir_only;
+    x->store_proto = c->store_proto;
+    x->store_full = c->store_proto && force && !only_zone;
     x->map_logged = false;
     x->n_zones = x->n_failed = x->n_unwritten = 0;
     x->n_unchanged = x->n_deleted = x->n_read = 0;
@@ -4288,7 +5122,13 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
         x->map_view = v->shared ? v->name : NULL;      /* karidns_domain_views decides which zones of the shared source are this view's */
         db_source_t src;
         view_source(drv, v, &src);
-        int st = run_view(x, &src, only_zone, false);
+        int st;
+        if (c->store_proto && !only_zone) {            /* 0.7 WP7a: a drain or a pass; a source without karidns_zone_state is listed from the zone list */
+            st = store_view(x, &src, v);
+            if (st == ST_PLAIN) st = run_view(x, &src, NULL, false);
+        } else {
+            st = run_view(x, &src, only_zone, false);
+        }
         if (x->io_error || x->oom || g_stop) {
             ctx_view_reset(x);
             return -1;
@@ -4404,7 +5244,8 @@ static int fetch_one(ctx_t *x, const lcfg_t *lc, const freq_t *r) {
     if (!drv) return fetch_fail(x, r, "the loader has no usable configuration yet");
     if (!v) return fetch_fail(x, r, "the view is not in the configuration");
     x->fetch_req = r->id;
-    x->fetch_vname = v->name;
+    x->fetch_vname = lc->store_proto ? NULL : v->name;     /* (the store protocol keeps no inventory for the fetch thread to tell) */
+    x->fetch_source_id = r->source_id;
     x->fetch_summary = r->mode == KDB_FETCH_SUMMARY;
     x->drv = drv;
     x->view = r->view;
@@ -4426,6 +5267,7 @@ static int fetch_one(ctx_t *x, const lcfg_t *lc, const freq_t *r) {
     ctx_view_reset(x);
     x->map_view = NULL;
     x->fetch_vname = NULL;
+    x->fetch_source_id = 0;
     if (x->io_error || x->oom || g_stop || atomic_load(&g_fetch_stop)) return -1;
     if (x->n_zones == 0 && x->n_failed == 0)                  /* nothing was sent: the Backend is waiting for an answer */
         return fetch_fail(x, r, x->errtext[0] ? x->errtext : "the zone could not be read");
@@ -4786,6 +5628,7 @@ static int auto_view(ctx_t *x, struct lio *io, const lview_t *v, uint16_t slot, 
         }
     }
     vs = &io->vst[slot];
+    if (vs->flush_at && vs->hold_until && now_ms() < vs->hold_until && now_ms() >= vs->flush_at) vs->flush_at = vs->hold_until;     /* D3: a big source without a change log */
     if (vs->flush_at && now_ms() >= vs->flush_at) {
         vs->flush_at = 0;
         int rc = do_load(x, io, KDB_BATCH_AUTO, v->index, NULL, 0, false, vs->need_full);
@@ -5447,9 +6290,13 @@ static int run_stream(int fd) {
     }
     fetch_publish_cfg(&io->cfg);                 /* D1a: the fetch thread (second stream) reads the sources from this copy */
     fetch_thread_start();
-    if (kdb_enc_begin(&x.enc, KDB_T_INVENTORY_REQ) != 0 || kdb_enc_end(&x.enc) != 0 || send_enc(&x) != 0) goto stopped;
-    if (io_wait_for(io, &io->inv_end) != 0) goto stopped;
-    lg(LOG_INFO, "inventory received: %llu zone(s) at the Backend", (unsigned long long)io->inv_entries);
+    if (io->cfg.store_proto) {                 /* 0.7 WP7a: no inventory; the cursors of the views came with the CONFIG */
+        lg(LOG_INFO, "the store protocol is on: the loader lists the zones (MANIFEST) or follows the change log (CHANGES); it keeps no inventory");
+    } else {
+        if (kdb_enc_begin(&x.enc, KDB_T_INVENTORY_REQ) != 0 || kdb_enc_end(&x.enc) != 0 || send_enc(&x) != 0) goto stopped;
+        if (io_wait_for(io, &io->inv_end) != 0) goto stopped;
+        lg(LOG_INFO, "inventory received: %llu zone(s) at the Backend", (unsigned long long)io->inv_entries);
+    }
 
     bool startup_done = false, retry_pending = false;
     int64_t retry_at = 0;
@@ -5484,9 +6331,16 @@ static int run_stream(int fd) {
                 need_load = true;
                 reconcile = true;
                 for (size_t s = 0; s < io->nvn; s++) auto_close(&io->vst[s]);     /* B9: reopened below, before the load */
+                if (io->cfg.store_proto)                                          /* the new sources have their own cursors: the CONFIG's are looked at again */
+                    for (size_t s = 0; s < io->nvn; s++) {
+                        io->vst[s].st_init = false;
+                        io->vst[s].seq_valid = false;
+                        io->vst[s].ident_len = 0;
+                    }
             }
         }
         uint64_t load_req = 0;
+        bool lforce = false;
         fev_drain(io, true);                   /* the zones the fetch thread served since the last turn (at most a second ago: the poll below times out) */
         if (io->again) {                       /* D1a: zones the Backend wants whole (SEND_BODY) */
             io->again = false;
@@ -5496,6 +6350,8 @@ static int run_stream(int fd) {
             io->reload_all = false;
             load_req = io->all_req_id;
             io->all_req_id = 0;
+            lforce = io->cfg.store_proto && io->all_force;       /* the store protocol: reload -force lists every zone again */
+            io->all_force = false;
             need_load = true;
         }
         if (retry_pending && now_ms() >= retry_at) {
@@ -5507,7 +6363,7 @@ static int run_stream(int fd) {
         if (need_load) {
             need_load = false;
             rw_collect_begin(io);
-            int rc = do_load(&x, io, startup_done ? KDB_BATCH_DIFF : KDB_BATCH_STARTUP, -1, NULL, load_req, false, reconcile);
+            int rc = do_load(&x, io, startup_done ? KDB_BATCH_DIFF : KDB_BATCH_STARTUP, -1, NULL, load_req, lforce, reconcile);
             if (rc < 0) {
                 if (g_stop) goto stopped;
                 status = EXIT_ERROR;
@@ -5565,6 +6421,7 @@ static int run_stream(int fd) {
             if (left < timeout) timeout = (int)left;
         }
         if (startup_done) timeout = auto_wait_ms(io, timeout);
+        if (io->reload_all || io->again || io->nreq || io->have_newcfg) timeout = 0;     /* a request that came in during the load above is done now, not after the poll */
         size_t npf = auto_fds(io, startup_done);
         if (npf == 0) {
             lg(LOG_ERR, "out of memory");

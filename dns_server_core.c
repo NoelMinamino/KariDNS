@@ -64,6 +64,8 @@
 #include "dns_db_supervisor.h"
 #include "dns_plugin_sup.h"
 #include "dns_db_ingest.h"
+#include "dns_db_store.h"
+#include "dns_store_status.h"
 #include "dns_db_stream.h"
 #include "dns_park.h"
 #include "dns_alias.h"
@@ -1633,40 +1635,42 @@ void *query_logger_thread_func(void *arg) {
 void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, zone_observatory_snapshot_t *out) {
     if (!e || !out) return;
     strlcpy(out->domain, e->domain, sizeof(out->domain));
-    strlcpy(out->view_name, e->view_name, sizeof(out->view_name));
+    strlcpy(out->view_name, zone_vname(e), sizeof(out->view_name));
     out->is_secondary = e->is_secondary;
     out->soa_serial = (uint32_t)atomic_load_explicit(&e->serial, memory_order_relaxed);
 
     const zone_config_t *zc = zone_entry_config(cfg, e);
     const notify_target_t *an = NULL;
-    out->slaves_configured = also_notify_effective(cfg, zc, e->view_name, &an); /* the zone's, the view's or options' list */
+    out->slaves_configured = also_notify_effective(cfg, zc, zone_vname(e), &an); /* the zone's, the view's or options' list */
 
-    out->last_notify_time = atomic_load_explicit(&e->observatory.last_notify_time, memory_order_relaxed);
-    out->last_transfer_time = atomic_load_explicit(&e->observatory.last_transfer_time, memory_order_relaxed);
+    zone_obs_view_t ob;
+    zone_obs_read(e, &ob);
+    out->last_notify_time = ob.last_notify_time;
+    out->last_transfer_time = ob.last_transfer_time;
     if (out->last_transfer_time == 0) {
         out->last_transfer_time = atomic_load_explicit(&e->last_successful_transfer, memory_order_relaxed);
     }
 
-    out->queries_total = atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed);
-    out->tcp_queries = atomic_load_explicit(&e->observatory.tcp_queries, memory_order_relaxed);
-    out->responses_noerror = atomic_load_explicit(&e->observatory.responses_noerror, memory_order_relaxed);
-    out->responses_nxdomain = atomic_load_explicit(&e->observatory.responses_nxdomain, memory_order_relaxed);
-    out->responses_nodata = atomic_load_explicit(&e->observatory.responses_nodata, memory_order_relaxed);
-    out->responses_servfail = atomic_load_explicit(&e->observatory.responses_servfail, memory_order_relaxed);
-    out->responses_refused = atomic_load_explicit(&e->observatory.responses_refused, memory_order_relaxed);
-    out->edns_queries = atomic_load_explicit(&e->observatory.edns_queries, memory_order_relaxed);
-    out->dnssec_do_queries = atomic_load_explicit(&e->observatory.dnssec_do_queries, memory_order_relaxed);
-    out->ecs_queries = atomic_load_explicit(&e->observatory.ecs_queries, memory_order_relaxed);
-    out->rrl_dropped = atomic_load_explicit(&e->observatory.rrl_dropped, memory_order_relaxed);
-    out->rrl_slipped = atomic_load_explicit(&e->observatory.rrl_slipped, memory_order_relaxed);
-    out->notify_sent = atomic_load_explicit(&e->observatory.notify_sent, memory_order_relaxed);
-    out->notify_ack = atomic_load_explicit(&e->observatory.notify_ack, memory_order_relaxed);
-    out->axfr_success = atomic_load_explicit(&e->observatory.axfr_success, memory_order_relaxed);
-    out->ixfr_success = atomic_load_explicit(&e->observatory.ixfr_success, memory_order_relaxed);
-    out->xfer_failed = atomic_load_explicit(&e->observatory.xfer_failed, memory_order_relaxed);
+    out->queries_total = ob.queries_total;
+    out->tcp_queries = ob.tcp_queries;
+    out->responses_noerror = ob.responses_noerror;
+    out->responses_nxdomain = ob.responses_nxdomain;
+    out->responses_nodata = ob.responses_nodata;
+    out->responses_servfail = ob.responses_servfail;
+    out->responses_refused = ob.responses_refused;
+    out->edns_queries = ob.edns_queries;
+    out->dnssec_do_queries = ob.dnssec_do_queries;
+    out->ecs_queries = ob.ecs_queries;
+    out->rrl_dropped = ob.rrl_dropped;
+    out->rrl_slipped = ob.rrl_slipped;
+    out->notify_sent = ob.notify_sent;
+    out->notify_ack = ob.notify_ack;
+    out->axfr_success = ob.axfr_success;
+    out->ixfr_success = ob.ixfr_success;
+    out->xfer_failed = ob.xfer_failed;
 
-    out->wirecache_hits = atomic_load_explicit(&e->observatory.wirecache_hits, memory_order_relaxed);
-    out->wirecache_misses = atomic_load_explicit(&e->observatory.wirecache_misses, memory_order_relaxed);
+    out->wirecache_hits = ob.wirecache_hits;
+    out->wirecache_misses = ob.wirecache_misses;
 
     /* 応答キャッシュは全ゾーン共有 (response_cache_init) なので、ゾーンごとの件数は持たない */
     zone_version_t *active_arena = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
@@ -1674,7 +1678,7 @@ void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, z
     out->wirecache_entries = 0;
     out->wirecache_bytes = 0;
     out->shared_views[0] = '\0';
-    if (cfg && cfg->any_in_view) (void)config_in_view_sharers(cfg, e->view_name, e->domain, out->shared_views, sizeof(out->shared_views));
+    if (cfg && cfg->any_in_view) (void)config_in_view_sharers(cfg, zone_vname(e), e->domain, out->shared_views, sizeof(out->shared_views));
 }
 
 // ============================================================================
@@ -1835,7 +1839,7 @@ static void tcp_client_close(int kq, int client_fd, tcp_stream_ctx_t *ctx_tcp,
                              struct kevent *ev_list, int from, int n_events) {
   struct kevent ev_del[2];
   if (ctx_tcp->parked) {
-    if (t_park_tbl) (void)park_cancel_tcp(t_park_tbl, (uint32_t)(ctx_tcp - g_tcp_pool), ctx_tcp->gen);
+    if (t_park_tbl) (void)park_cancel_tcp(t_park_tbl, ctx_tcp->park_idx, ctx_tcp->park_gen);
     ctx_tcp->parked = false;
   }
   /* READ を先に: 期限切れで消えた ONESHOT タイマーの削除が失敗しても READ は外れる */
@@ -2170,14 +2174,14 @@ STATIC_TEST void xfr_build_primaries(server_config_t *active, zone_db_snapshot_t
   const zone_config_t *mcfg = zcfg;
   if (entry->is_catalog_member) {
     mcfg = NULL;
-    if (entry->owning_catalog_domain && snap) {
-      view_snapshot_t *vs = snapshot_find_view(snap, entry->view_name);
-      zone_db_entry_t *cat = vs ? find_zone_in_view(vs, entry->owning_catalog_domain) : NULL;
+    if (zone_xr(entry)->owning_catalog_domain && snap) {
+      view_snapshot_t *vs = snapshot_find_view(snap, zone_vname(entry));
+      zone_db_entry_t *cat = vs ? find_zone_in_view(vs, zone_xr(entry)->owning_catalog_domain) : NULL;
       const zone_config_t *cc = cat ? zone_entry_config(active, cat) : NULL;
       if (cc && zext(cc)->masters_count > 0) mcfg = cc;
     }
   }
-  xfr_opts_effective(active, mcfg, entry->view_name, &ctx->eff);
+  xfr_opts_effective(active, mcfg, zone_vname(entry), &ctx->eff);
   ctx->has_eff = true;
   ctx->per_ns_limit = xfr_cfg_limit(active, XL_TRANSFERS_PER_NS);
   int n = 0;
@@ -2188,16 +2192,17 @@ STATIC_TEST void xfr_build_primaries(server_config_t *active, zone_db_snapshot_t
       xfr_primary_t *p = &ctx->prim[n++];
       strlcpy(p->ip, x->masters[i].ip, sizeof(p->ip));
       p->port = config_target_port(active, x->masters[i].port);   /* a database zone leaves 0 for an element without a port: options { port } */
-      xfr_primary_setup(active, mcfg, entry->view_name, x->masters[i].key, x->tsig_key, &x->masters[i], p, ctx);
+      xfr_primary_setup(active, mcfg, zone_vname(entry), x->masters[i].key, x->tsig_key, &x->masters[i], p, ctx);
     }
     if (x->masters_count > XFR_PRIMARIES_MAX)
       syslog(LOG_WARNING, "[AXFR] zone %s: %d primaries are listed; only the first %d are used", ctx->domain, x->masters_count, XFR_PRIMARIES_MAX);
-  } else if (entry->catalog_master && entry->catalog_master->ip[0]) {
+  } else if (zone_xr(entry)->catalog_master && zone_xr(entry)->catalog_master->ip[0]) {
+    const catalog_master_t *cm = zone_xr(entry)->catalog_master;
     xfr_primary_t *p = &ctx->prim[n++];
-    strlcpy(p->ip, entry->catalog_master->ip, sizeof(p->ip));
-    p->port = config_target_port(active, entry->catalog_master->port);
+    strlcpy(p->ip, cm->ip, sizeof(p->ip));
+    p->port = config_target_port(active, cm->port);
     /* the same ranking as for a listed primary (peer_key_name()): the key of the primaries element, the key of the server statement, the catalog zone's tsig-key */
-    xfr_primary_setup(active, NULL, entry->view_name, entry->catalog_master->key, entry->catalog_master->zone_key, NULL, p, ctx);
+    xfr_primary_setup(active, NULL, zone_vname(entry), cm->key, cm->zone_key, NULL, p, ctx);
   }
   ctx->nprim = n;
 }
@@ -2288,7 +2293,10 @@ static bool blackhole_drops(worker_ctx_t *ctx, const void *sa) {
 }
 
 /* D1a step 8: the engine asks for a zone in the background (a CNAME or the glue of an NS host leads into a zone that is not in memory) */
-static void __attribute__((constructor)) bg_fetch_hook_init(void) { g_query_bg_fetch = park_bg_fetch; }
+static void __attribute__((constructor)) bg_fetch_hook_init(void) {
+  g_query_bg_fetch = park_bg_fetch;
+  g_query_bg_attach = park_bg_attach;           /* 0.7 S3: a zone of the store that is not in memory is attached, not fetched */
+}
 
 /* ---- D1a milestone 2: parked queries (dns_park.h) ----
  * A query whose zone is in the directory without its data is parked, not answered: the worker asks the db ingest thread to fetch the zone,
@@ -2301,6 +2309,12 @@ static int64_t park_now_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int64_t park_now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
 }
 
 /* The worker's decision before it parks a query for a zone that is out of memory and asks for it (dns_park.h, "the worker's decision").  The query is never refused here (0.7
@@ -2320,29 +2334,108 @@ STATIC_TEST int fetch_gate(const char *view, const zdir_elem_t *pel) {
   return park_claim_mark(key) ? FETCH_GATE_TAKEN : FETCH_GATE_ASK;       /* (another worker marked it between the look above and now: its claim stands) */
 }
 
+/* 0.7 store S3: fetch_gate() for the result of a lookup.  A zone of the store that is not in memory is attached from the store (no fetch, no claim) when its image is stored;
+ * only a zone the store knows without an image is read from the database, and is claimed as a zone out of memory is. */
+static int zref_fetch_gate(const char *view, const zref_t *pel) {
+  if (pel->el) return fetch_gate(view, pel->el);
+  if (!dbreg_cache_limit() || pel->zstate != ZREF_ST_KNOWN) return FETCH_GATE_ASK;
+  uint64_t key = park_claim_key(view, pel->name);
+  if (park_claim_held(key)) return FETCH_GATE_ASK;
+  return park_claim_mark(key) ? FETCH_GATE_TAKEN : FETCH_GATE_ASK;
+}
+
+/* 0.7 fix 7: a zone of the store whose image is in the page cache is attached by the worker itself (dns_db_store.c, worker_attach()): true means the zone is in memory (staged) and the query is looked up
+ * again and answered, false that nothing was done and the query parks as before.  Once per query: a zone that is out of memory again at the second look parks. */
+static bool worker_attach_try(const view_snapshot_t *view, const zref_t *pel, int widx) {
+  const dbdir_ops_t *d = dbdir();
+  return d && d->worker_attach && d->worker_attach(view, pel, widx);
+}
+
+/* What a worker asks for when it parks a query for a zone that is not in memory (udp_park() and the TCP path).  ask: this query asks for the zone (the first one for it, or one that was
+ * woken and finds the zone out of memory again: nothing is on its way and nobody else would wake it before its time is up); attach: a store thread makes the entry (the store holds
+ * the image, or the lookup could not read a cell now and the store thread looks again), else the zone is fetched from the database. */
+typedef struct {
+  const char *hv, *name;
+  bool ask, attach;
+  int gate;
+} park_plan_t;
+static park_plan_t park_plan(const park_table_t *pt, const view_snapshot_t *view, const zref_t *pel, bool woken) {
+  park_plan_t p;
+  /* a zone that the view shares by in-view from the database of another view (D1a phase 2) is asked for, and woken, in the name of the view that holds it */
+  p.hv = pel->hview ? pel->hview : view->name;
+  p.name = zref_name(pel);
+  const bool absent = zref_state(pel) == ZDIR_ST_ABSENT;
+  p.ask = (!woken || absent) && !park_has_wait(pt, p.hv, p.name);
+  p.attach = p.ask && absent && !pel->el && (pel->busy || pel->zstate == ZREF_ST_ABSENT);
+  p.gate = p.ask && !p.attach ? zref_fetch_gate(p.hv, pel) : FETCH_GATE_ASK;
+  return p;
+}
+
+/* The request that goes with a parked entry (the entry `pi` of the worker's table, just made by park_udp() / park_tcp()), by what park_plan() said:
+ *   attach  a stored zone that is not in memory: the zone's id in the store goes to the store threads, one request for the zone across the workers (park_att_claim(): the first worker asks,
+ *           the others join and are woken by the same attach); a zone the lookup could not name (its cell was being written) is asked for by name;
+ *   else    a database zone: the fetch request to the ingest thread (claimed or not, by the gate).
+ * A request that a full ring refuses is not a reason to answer the query or to read a stored zone from the database: the entry stays parked, marked pending (park_pending_set()), and
+ * park_service() makes the request again; the park-timeout is the only end of the wait.  The same for UDP and TCP. */
+static void park_ask(park_table_t *pt, int widx, int32_t pi, const park_plan_t *pp, const zref_t *pel) {
+  park_entry_t *e = &pt->e[pi];
+  if (pp->attach) {
+    if (pel->zid != ZREF_NOZID && pel->sview >= 0) {
+      const uint16_t sv = (uint16_t)pel->sview;
+      park_entry_attach_zid(e, sv, pel->zid);               /* (a store thread that cannot name the zone says it by the id) */
+      const int c = park_att_claim(sv, pel->zid, widx);
+      if (c == 0) return;                                /* (the request of another worker's claim is in a ring: this entry is woken with it) */
+      if (park_attach_zid(widx, sv, pel->zid)) park_att_requested(sv, pel->zid);
+      else park_pending_set(pt, e, PARK_PEND_ATTACH_ZID, ((uint64_t)sv << 32) | pel->zid, (uint8_t)widx);
+    } else if (!park_attach_request_any(pp->hv, pp->name)) {
+      park_pending_set(pt, e, PARK_PEND_ATTACH_NAME, 0, 0);
+    }
+    return;
+  }
+  const uint8_t prio = (uint8_t)(KDB_FETCH_PRIO_QUERY | (pp->gate == FETCH_GATE_TAKEN ? PARK_PRIO_CLAIMED : 0));
+  if (!park_fetch_request(widx, pp->hv, pp->name, prio, KDB_FETCH_FULL)) park_pending_set(pt, e, PARK_PEND_FETCH, 0, prio);
+}
+
+/* the requests that a full ring refused, again (park_service()); the oldest first, and no more once one is refused */
+static void park_ask_again(park_table_t *pt, int widx) {
+  park_entry_t *e;
+  while ((e = park_pending_head(pt))) {
+    bool ok;
+    switch (e->pend) {
+    case PARK_PEND_ATTACH_ZID: {
+      const uint16_t sv = (uint16_t)(e->preq >> 32);
+      const uint32_t zid = (uint32_t)e->preq;
+      ok = park_attach_zid(widx, sv, zid);
+      if (ok) park_att_requested(sv, zid);
+      break;
+    }
+    case PARK_PEND_ATTACH_NAME: ok = park_attach_request_any(park_entry_view(e), park_entry_zone(e)); break;
+    case PARK_PEND_FETCH: ok = park_fetch_request(widx, park_entry_view(e), park_entry_zone(e), e->prio, KDB_FETCH_FULL); break;
+    default: ok = true; break;
+    }
+    if (!ok) break;
+    park_pending_done(pt, e);
+  }
+}
+
 /* Park the UDP request for the zone of `pel`.  true: parked (the caller answers nothing now). false: not parked (no park table, the time is
  * up, the table is full, the request too big): the caller answers "not ready". */
-static bool udp_park(udp_pass_t *w, const view_snapshot_t *view, const zdir_elem_t *pel, const udp_ipc_t *ipc, const uint8_t *req, size_t len) {
+static bool udp_park(udp_pass_t *w, const view_snapshot_t *view, const zref_t *pel, const udp_ipc_t *ipc, const uint8_t *req, size_t len) {
   if (!w->park || !view->name) return false;
   int64_t now = park_now_ms();
   int64_t left = w->woken ? w->woken_deadline_ms - now : (int64_t)w->park_timeout_ms;
   if (left <= 0) return false;
-  /* the first query for the zone asks for it.  One that was woken and finds the zone out of memory again (taken out by the cache manager before the request could use
-   * it) asks again: nothing is on its way (the state would be LOADING), and nobody else would wake it before its time is up. */
-  /* a zone that the view shares by in-view from the database of another view (D1a phase 2) is asked for, and woken, in the name of the view that holds it */
-  const char *hv = zdir_holder_view(view, pel);
-  bool ask = (!w->woken || atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) == ZDIR_ST_ABSENT) && !park_has_wait(w->park, hv, pel->name);
-  int gate = ask ? fetch_gate(hv, pel) : FETCH_GATE_ASK;
-  int32_t pi = park_udp(w->park, now, (uint32_t)left, hv, pel->name, w->active_fd, ipc, req, len);
+  park_plan_t pp = park_plan(w->park, view, pel, w->woken);
+  const char *hv = pp.hv, *zname = pp.name;
+  const bool attach = pp.attach;
+  const int gate = pp.gate;
+  int32_t pi = park_udp(w->park, now, (uint32_t)(attach && left > PARK_ATTACH_DEADLINE_MS ? PARK_ATTACH_DEADLINE_MS : left), hv, zname, w->active_fd, ipc, req, len);
   if (pi < 0) {
-    if (gate == FETCH_GATE_TAKEN) park_claim_release(hv, pel->name);
+    if (gate == FETCH_GATE_TAKEN) park_claim_release(hv, zname);
     return false;
   }
-  if (ask && !park_fetch_request(w->worker_idx, hv, pel->name, (uint8_t)(KDB_FETCH_PRIO_QUERY | (gate == FETCH_GATE_TAKEN ? PARK_PRIO_CLAIMED : 0)), KDB_FETCH_FULL)) {
-    if (gate == FETCH_GATE_TAKEN) park_claim_release(hv, pel->name);
-    park_release(w->park, &w->park->e[pi]);            /* the request could not be handed over (ring full): nobody would ever wake it */
-    return false;
-  }
+  if (attach) park_mark_attach(w->park, pi, park_now_ns(), now + left);
+  if (pp.ask) park_ask(w->park, w->worker_idx, pi, &pp, pel);
   if (!w->woken) dbreg_cache_note_miss();            /* a query that had to wait for its zone (the cache manager counts misses) */
   return true;
 }
@@ -2445,13 +2538,16 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
             bool route_tsig_done;
             route.view = select_view_req(snap, acquire_config_snapshot(), client_ip, req_buf, (size_t)payload_received, &route_tsig, &route_tsig_done);
             route.tsig = route_tsig_done ? &route_tsig : NULL;
-            zdir_elem_t *pel = NULL;
-            route.entry = route.view ? find_zone_for_query_ex(route.view, qname, ((req_buf[2] >> 3) & 0x0F) == 0 ? qtype : 0, &pel) : NULL;
+            zref_t pel;
+            bool wa_tried = false;                /* 0.7 fix 7: the worker attached the zone (or tried to) once for this query */
+          relookup_udp:
+            zref_clear(&pel);
+            route.entry = route.view ? find_zone_for_query_zref(route.view, qname, ((req_buf[2] >> 3) & 0x0F) == 0 ? qtype : 0, &pel) : NULL;
             uint8_t *res_buf = batch->tx_buffers[w->n_tx] + sizeof(udp_ipc_t);
             const rate_limit_config_t *rrl_cfg = NULL;
             int res_len = 0;
             bool not_ready = false, answered = false;
-            if (__builtin_expect(!route.entry && pel != NULL, 0)) {
+            if (__builtin_expect(!route.entry && zref_present(&pel), 0)) {
               /* D1a: the zone is in the directory and its data is not in memory.  First the question whether this client may ask at all (the
                * allow-query chain of the normal path, TSIG): if not, or if the request is wrong, the answer is final (REFUSED, FORMERR,
                * NOTAUTH ...) and nothing parks and nothing is fetched.  A request whose time was up (w->not_ready) is answered "not ready" only
@@ -2460,12 +2556,13 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
               query_set_local_addr(ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL);   /* allow-query-on */
               res_len = process_dns_not_ready_routed(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
                                                      UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname, qtype, client_ip, &(*w->cc), false,
-                                                     &rrl_cfg, snap, &route, pel, true);
+                                                     &rrl_cfg, snap, &route, &pel, true);
               if (res_len != DNS_NR_PERMITTED) {
                 answered = true;
               } else {
-                if (!w->woken && ((req_buf[2] >> 3) & 0x0F) == 0) atomic_fetch_add_explicit(&pel->freq, 1, memory_order_relaxed);        /* the zone is asked for (an UPDATE does not count), once per query (a query that comes back after a wake-up or a time-out is not counted again) */
-                if (!w->not_ready && udp_park(w, route.view, pel, ipc_msg, req_buf, (size_t)payload_received)) {
+                if (!w->woken && pel.el && ((req_buf[2] >> 3) & 0x0F) == 0) atomic_fetch_add_explicit(&pel.el->freq, 1, memory_order_relaxed);        /* the zone is asked for (an UPDATE does not count), once per query (a query that comes back after a wake-up or a time-out is not counted again) */
+                if (!w->not_ready && !wa_tried && !pel.el && ((wa_tried = true)) && worker_attach_try(route.view, &pel, w->worker_idx)) goto relookup_udp;      /* 0.7 fix 7: the image is in the page cache: attached here, no wait */
+                if (!w->not_ready && udp_park(w, route.view, &pel, ipc_msg, req_buf, (size_t)payload_received)) {
                   rcu_reader_exit(ctx);
                   return;                                 /* parked: it is answered when the zone is there, or its time is up */
                 }
@@ -2525,7 +2622,7 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
               /* D1a: the same view, TSIG and rate limit handling as an answer from the zone, with "not ready" as the content */
               res_len = process_dns_not_ready_routed(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
                                                      UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname,
-                                                     qtype, client_ip, &(*w->cc), false, &rrl_cfg, snap, &route, pel, false);
+                                                     qtype, client_ip, &(*w->cc), false, &rrl_cfg, snap, &route, &pel, false);
             } else {
               res_len = process_dns_query_cap_routed(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
                                                      UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname,
@@ -2551,9 +2648,9 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
                   zone_db_entry_t *rrl_z = route.entry; /* the zone the query was answered from (E2) */
                   if (rrl_z) {
                     if (tc_packet) {
-                      atomic_fetch_add_explicit(&rrl_z->observatory.rrl_slipped, 1, memory_order_relaxed);
+                      ZONE_OBS_ADD(rrl_z, rrl_slipped, 1);
                     } else {
-                      atomic_fetch_add_explicit(&rrl_z->observatory.rrl_dropped, 1, memory_order_relaxed);
+                      ZONE_OBS_ADD(rrl_z, rrl_dropped, 1);
                     }
                   }
                 }
@@ -2628,25 +2725,39 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
   if (t->nwait == 0 && t->nready == 0 && !(ring && park_wake_pending(ring))) return;     /* nothing is parked and nobody said anything: no clock, no exchange */
   park_key_t k;
   while (ring && park_wake_pop(ring, &k)) {
-    if (k.failed) (void)park_fail(t, k.view, k.zone);
-    else (void)park_wake(t, k.view, k.zone);
+    if (k.ask == 1) {                                   /* 0.7 store: no shared slot was free to ask the ingest thread: this worker asks from its own ring, the queries stay parked */
+      const uint32_t n = park_ask_fetch_key(t, w->worker_idx, k.key, park_now_ms() + (int64_t)w->park_timeout_ms);
+      for (uint32_t i = 0; i < n; i++) store_status_note_cold(0, STORE_COLD_FETCH);
+    } else if (k.ask == 2) {                            /* the attach of a zone id failed and has no name: the queries that wait for the id ask for their zones */
+      const uint32_t n = park_ask_fetch_zid(t, w->worker_idx, k.key, park_now_ms() + (int64_t)w->park_timeout_ms);
+      for (uint32_t i = 0; i < n; i++) store_status_note_cold(0, STORE_COLD_FETCH);
+    } else if (k.retry) {                                      /* 0.7 store S2: the attach did not work, or the zone is on its way by another route; the queries wait for it the park-timeout */
+      uint32_t n = park_retry_key(t, k.key, park_now_ms() + (int64_t)w->park_timeout_ms);
+      if (k.fetch)                                      /* (only a read from the database counts as one: a zone that another attach or fetch has is waited for) */
+        for (uint32_t i = 0; i < n; i++) store_status_note_cold(0, STORE_COLD_FETCH);
+    } else if (k.failed) {
+      (void)park_fail_key(t, k.key);
+    } else {
+      (void)park_wake_key(t, k.key);
+    }
   }
   if (ring && park_wake_take_overflow(ring)) (void)park_wake_all(t);          /* a wake was lost: every query looks again */
   (void)park_expire(t, park_now_ms());
+  if (t->nunsent) park_ask_again(t, w->worker_idx);     /* the requests that a full ring refused */
   if (t->nready == 0) return;
-  uint32_t cur = 0;
   park_entry_t *e;
-  while ((e = park_next_done(t, &cur))) {
+  while ((e = park_next_done(t))) {
     bool timed_out = e->state == PARK_TIMEOUT;
+    if (e->attach) store_status_note_cold(timed_out ? 0 : (uint64_t)(park_now_ns() - e->t_park_ns), timed_out ? STORE_COLD_TIMEOUT : STORE_COLD_ATTACH);       /* (0.7 store S2) */
     if (e->kind == PARK_UDP) {
       udp_ipc_t *ipc = (udp_ipc_t *)w->batch->rx_buffers[0];
-      *ipc = e->u.udp.ipc;
+      *ipc = *park_entry_ipc(e);
       uint8_t *req = w->batch->rx_buffers[0] + sizeof(udp_ipc_t);
       uint16_t len = e->udp_len;
-      memcpy(req, e->u.udp.payload, len);
-      w->active_fd = e->u.udp.fd;
+      memcpy(req, park_entry_req(e), len);
+      w->active_fd = e->fd;
       w->woken = true;
-      w->woken_deadline_ms = e->deadline_ms;
+      w->woken_deadline_ms = e->attach && e->full_ms > e->deadline_ms ? e->full_ms : e->deadline_ms;       /* (an attach park: the park-timeout, not the attach deadline) */
       w->not_ready = timed_out;
       park_release(t, e);                                 /* (before the request runs: it may park again, and takes a free entry) */
       w->n_tx = 0;
@@ -2658,8 +2769,8 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
       w->woken = false;
       w->not_ready = false;
     } else {
-      uint32_t idx = e->u.tcp.ctx_idx, gen = e->u.tcp.ctx_gen;
-      int fd = e->u.tcp.fd;
+      uint32_t idx = e->ctx_idx, gen = e->ctx_gen;
+      int fd = e->fd;
       park_release(t, e);
       tcp_stream_ctx_t *c = (g_tcp_pool && idx < MAX_TCP_CLIENTS) ? &g_tcp_pool[idx] : NULL;
       if (c && c->gen == gen && c->parked) {                /* (the connection is still the one that parked) */
@@ -2681,6 +2792,7 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
 void *worker_thread_func(void *arg) {
   worker_ctx_t *ctx = (worker_ctx_t *)arg;
   logev_set_thread_sink(qlog_event_sink, ctx);    // batch 14: the event messages of this thread go into its ring
+  store_reader_nosleep(true);                     /* 0.7 S3: the zone store is looked at on the query path: a cell that is being written is waited for by a bounded spin, never by a yield or a sleep (the lookup then asks a store thread) */
   uint8_t *tcp_res_buf = NULL;
   park_table_t park;                                    /* D1a milestone 2: queries parked for a zone that is not in memory (dns_park.h) */
   memset(&park, 0, sizeof(park));
@@ -2834,6 +2946,7 @@ worker_startup_success:;
     struct timespec park_ts, *park_tp = NULL;
     if (park_on && park.nwait > 0) {
       int64_t left = park_next_deadline_ms(&park, park_now_ms());
+      if (park.nunsent && left > 1) left = 1;            /* (a request that a full ring refused is made again: look again soon) */
       park_ts.tv_sec = left / 1000;
       park_ts.tv_nsec = (left % 1000) * 1000000;
       park_tp = &park_ts;
@@ -3148,8 +3261,12 @@ process_tcp_client: ;
               ? find_zone_config_in_view(cfg, xfr_view->name, qname)
               : NULL;
           zdir_elem_t *xfr_el = NULL;         /* D1a step 7: the database zone of the transfer when its data is not in memory (the thread waits for it) */
+          bool xfr_nr = false;                /* ... the zone is in the directory and its data is not in memory: a heap element (xfr_el), or a zone of the store (0.7 S3: xfr_zr) */
+          zref_t xfr_zr;
+          zref_clear(&xfr_zr);
           zone_config_t xfr_nr_zc;            /* ... and its settings as the directory element keeps them (the ACL levels read them) */
           zone_db_entry_t *xfr_entry = NULL;  /* the zone of the transfer when its data is in memory */
+          bool xfr_recheck = false;           /* the settings of the zone that is not in memory were not known: the thread checks the zone's own allow-transfer against the real entry before it streams (H2) */
           if (xfr_view && (qtype == 252 || qtype == 251) && qclass != 1) {
             /* RFC 5936 §2.1.2 (QCLASS: "the class of the zone requested"), RFC 1995 §3: every zone of KariDNS is of class IN, so a transfer of class CH,
              * ANY or any other has no zone: it is answered as a zone this server is not authoritative for (REFUSED, AA=0, below), before the ACL and the
@@ -3164,26 +3281,31 @@ process_tcp_client: ;
              * then the transfer thread's hold (xfr_entry_hold(), R11); the element stays valid with the snapshot this thread holds, which the transfer
              * thread retains until it has the entry.  The exact name: a transfer is of the zone whose apex is the QNAME (RFC 5936 §2.1.1, RFC 1995 §3),
              * never of a zone that encloses it. */
-            zdir_elem_t *xel = zdir_find_exact(xfr_view, qname);
-            xfr_entry = zdir_entry(xel);
+            (void)zref_find_exact(xfr_view, qname, &xfr_zr);
+            xfr_entry = xfr_zr.entry;
 #ifdef KARIDNS_TEST_EVICT
             xfr_test_delay();                /* TEST ONLY: the window between the reading and the decisions (run_db_park_test.sh) */
 #endif
             /* a DB zone has settings of its own (dbcfg), and a secondary may have settings received from its primary (B8t-2: rxcfg,
              * the zone's own statements first): the transfer checks below read them like a configured zone's */
-            if (xfr_entry && (!zcfg || xfr_entry->source == ZONE_SRC_DB || atomic_load_explicit(&xfr_entry->rxcfg, memory_order_acquire))) {
+            if (xfr_entry && (!zcfg || xfr_entry->source == ZONE_SRC_DB || atomic_load_explicit(&zone_xr(xfr_entry)->rxcfg, memory_order_acquire))) {
               const zone_config_t *ec = zone_entry_config(cfg, xfr_entry);
               if (ec) zcfg = ec;
-            } else if (!xfr_entry && !zcfg && xel) {
+            } else if (!xfr_entry && !zcfg && zref_present(&xfr_zr) && !xfr_zr.busy) {
               /* a zone of the database that is in the directory without its data (memory-limit): the allow-transfer / TSIG checks below are made with the
                * settings the element kept, before anything is read for the transfer (the same order as allow-query for a parked query: a client that is
                * refused costs no fetch).  If the data comes into memory meanwhile, the transfer thread finds it there (db_ingest_xfr_await()). */
-              zone_ext_shared_t *nsh = atomic_load_explicit(&xel->sh, memory_order_acquire);
+              zone_ext_shared_t *nsh = zref_settings(&xfr_zr);
               memset(&xfr_nr_zc, 0, sizeof(xfr_nr_zc));
-              xfr_nr_zc.domain = (char *)xel->name;
+              xfr_nr_zc.domain = (char *)zref_name(&xfr_zr);
               xfr_nr_zc.ext = nsh ? &nsh->ext : NULL;
               zcfg = &xfr_nr_zc;
-              xfr_el = xel;
+              xfr_el = xfr_zr.el;
+              xfr_nr = true;
+              /* A zone whose settings are not known here (a record that is known and has no body yet, a settings id the store has no text for, an element without settings) has been judged by the view's and
+               * options' allow-transfer alone, and the zone's own (a profile that denies, acl-ceiling) is not in that check.  Whatever the zone is allowed by the view is checked again against the zone's own settings
+               * when its entry is there, before a byte of it is sent (axfr_worker_thread()). */
+              xfr_recheck = nsh == NULL;
             }
           }
           bool is_synthetic_zone = (zcfg && zcfg->type &&
@@ -3239,7 +3361,7 @@ process_tcp_client: ;
              * allow-transfer (BIND's ns_xfr_start() checks the ACL before the IXFR SOA), and before the transfer is started or a zone is read.  So it is seen
              * only by a client that may transfer this zone: everybody else gets the REFUSED they got before, and the FORMERR tells nothing about a zone. */
             bool shape_bad = false;
-            if (q_bad || (allowed && (entry || xfr_el))) {   /* (a bad question section is never XFR_SHAPE_OK) */
+            if (q_bad || (allowed && (entry || xfr_nr))) {   /* (a bad question section is never XFR_SHAPE_OK) */
               const xfr_shape_t shape = xfr_request_shape(msg, msg_len, NULL, NULL, NULL);
               if (shape != XFR_SHAPE_OK) {
                 shape_bad = true;
@@ -3248,12 +3370,12 @@ process_tcp_client: ;
                 xfr_deny_limit = (uint32_t)shape;
               }
             }
-            if (allowed && (entry || xfr_el)) {
+            if (allowed && (entry || xfr_nr)) {
               /* transfers-out and max-transfer-time-out / max-transfer-idle-out (BIND 9.20), read before the configuration is released */
               uint32_t out_limit = xfr_cfg_limit(cfg, XL_TRANSFERS_OUT);
               xfr_eff_t out_eff;
               /* the settings of the view that owns the zone, not of the view the client came through (a zone shared with in-view is one object) */
-              xfr_opts_effective(cfg, zcfg, entry ? entry->view_name : zdir_holder_view(xfr_view, xfr_el), &out_eff);
+              xfr_opts_effective(cfg, zcfg, entry ? zone_vname(entry) : (xfr_zr.hview ? xfr_zr.hview : xfr_view->name), &out_eff);
               const bool out_send_ede = cfg ? cfg->send_extended_errors : false;   /* (read before the release, like the other values) */
               release_config_snapshot(cfg);
               if (!xfr_counter_acquire(&g_xfr_out_active, out_limit)) {
@@ -3305,8 +3427,16 @@ process_tcp_client: ;
                   if (tsig_mac_len > 0) memcpy(args->tsig_mac, tsig_mac, tsig_mac_len);
                   args->entry = entry;
                   args->elem = entry ? NULL : xfr_el;
-                  args->await = entry ? NULL : db_ingest_xfr_await;
-                  if (xfr_el) snprintf(args->view_name, sizeof(args->view_name), "%s", zdir_holder_view(xfr_view, xfr_el));
+                  args->await = entry || !xfr_el ? NULL : db_ingest_xfr_await;
+                  args->store_zone[0] = '\0';
+                  args->await_zone = NULL;
+                  args->recheck_acl = !entry && xfr_nr && xfr_recheck;
+                  snprintf(args->acl_view, sizeof(args->acl_view), "%s", xfr_view->name ? xfr_view->name : "");
+                  if (!entry && xfr_nr && !xfr_el) {                 /* 0.7 S3: a zone of the store that is not in memory: the thread has a store thread attach it */
+                    snprintf(args->store_zone, sizeof(args->store_zone), "%s", zref_name(&xfr_zr));
+                    args->await_zone = db_ingest_xfr_await_zone;
+                  }
+                  if (!entry && xfr_nr) snprintf(args->view_name, sizeof(args->view_name), "%s", xfr_zr.hview ? xfr_zr.hview : xfr_view->name);
                   args->idle_out_secs = out_eff.xfer_idle_out;
                   args->time_out_secs = out_eff.xfer_time_out;
                   args->snap = snap;
@@ -3350,11 +3480,11 @@ process_tcp_client: ;
                 }
               }
             }
-            if (!allowed || (!entry && !xfr_el)) {
+            if (!allowed || (!entry && !xfr_nr)) {
               /* batch 14 (category xfer-out): the reason, first match: a quota or resource failure above, an EDNS version we do not speak (BADVERS), a TSIG
                * that cannot be parsed or does not verify, the transfer ACL, else the zone is not ours */
               const int deny = xfr_deny ? xfr_deny : badvers ? XD_BADVERS : tsig.status == TSIG_REQ_FORMERR ? XD_TSIG_FORMERR
-                             : tsig.status == TSIG_REQ_ERROR ? XD_TSIG_NOTAUTH : (!zcfg && !entry && !xfr_el) ? XD_NOZONE : !allowed ? XD_ACL : XD_NOZONE;
+                             : tsig.status == TSIG_REQ_ERROR ? XD_TSIG_NOTAUTH : (!zcfg && !entry && !xfr_nr) ? XD_NOZONE : !allowed ? XD_ACL : XD_NOZONE;
               xfr_log_denied(ctx_tcp->client_ip, client_port, qname, qclass, qtype, deny, xfr_deny_limit);
               uint8_t res_buf[1024];
               uint8_t rcode = 5; /* REFUSED: 方針による拒否 (RFC 1035 §4.1.1、RFC 5936 §5)。AA=0 (R-06) */
@@ -3428,40 +3558,43 @@ process_tcp_client: ;
             bool route_tsig_done;
             route.view = select_view_req(snap, acquire_config_snapshot(), ctx_tcp->client_ip, msg, msg_len, &route_tsig, &route_tsig_done);
             route.tsig = route_tsig_done ? &route_tsig : NULL;
-            zdir_elem_t *pel = NULL;
-            route.entry = route.view ? find_zone_for_query_ex(route.view, qname, ((msg[2] >> 3) & 0x0F) == 0 ? qtype : 0, &pel) : NULL;
+            zref_t pel;
+            bool wa_tried = false;                /* 0.7 fix 7: the worker attached the zone (or tried to) once for this query */
+          relookup_tcp:
+            zref_clear(&pel);
+            route.entry = route.view ? find_zone_for_query_zref(route.view, qname, ((msg[2] >> 3) & 0x0F) == 0 ? qtype : 0, &pel) : NULL;
             bool not_ready = false, answered = false;
             int res_len = 0;
-            if (__builtin_expect(!route.entry && pel != NULL, 0)) {
+            if (__builtin_expect(!route.entry && zref_present(&pel), 0)) {
               /* D1a: the zone is in the directory and its data is not in memory.  The client is checked first (allow-query as for a zone in
                * memory, TSIG, a wrong request): a final answer (REFUSED ...) is sent and nothing parks.  Otherwise the connection is parked:
                * one request per connection, kept in buf, read events ignored until park_service() starts it again */
               query_set_client_addr(&ctx_tcp->client_addr);
               query_set_local_addr(ctx_tcp->has_server_addr ? &ctx_tcp->server_addr : NULL);   /* allow-query-on */
               res_len = process_dns_not_ready_routed(msg, msg_len, tcp_res_buf, 65535, 0, qname, qtype, ctx_tcp->client_ip,
-                                                     &thread_compress_ctx, true, NULL, snap, &route, pel, true);
+                                                     &thread_compress_ctx, true, NULL, snap, &route, &pel, true);
               if (res_len != DNS_NR_PERMITTED) answered = true;
             }
-            if (__builtin_expect(!route.entry && pel != NULL && !answered, 0)) {
-              if (ctx_tcp->park_deadline_ms == 0 && ((msg[2] >> 3) & 0x0F) == 0) atomic_fetch_add_explicit(&pel->freq, 1, memory_order_relaxed);   /* once per query (an UPDATE does not count) */
+            if (__builtin_expect(!route.entry && zref_present(&pel) && !answered, 0)) {
+              if (ctx_tcp->park_deadline_ms == 0 && pel.el && ((msg[2] >> 3) & 0x0F) == 0) atomic_fetch_add_explicit(&pel.el->freq, 1, memory_order_relaxed);   /* once per query (an UPDATE does not count) */
               int64_t pnow = park_now_ms();
               int64_t left = ctx_tcp->park_deadline_ms ? ctx_tcp->park_deadline_ms - pnow : (int64_t)park_timeout_ms;
               if (park_on && !ctx_tcp->not_ready_now && left > 0) {
-                const char *hv = zdir_holder_view(route.view, pel);          /* (the view that holds the zone: a zone shared by in-view from the database of another view is the owner's) */
-                bool ask = (ctx_tcp->park_deadline_ms == 0 || atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) == ZDIR_ST_ABSENT) &&
-                           !park_has_wait(&park, hv, pel->name);       /* (as in udp_park(): a request that comes back and finds the zone out of memory again asks again) */
+                if (!wa_tried && !pel.el && ((wa_tried = true)) && worker_attach_try(route.view, &pel, ctx->thread_id)) goto relookup_tcp;      /* 0.7 fix 7: the image is in the page cache: attached here, no wait */
+                park_plan_t pp = park_plan(&park, route.view, &pel, ctx_tcp->park_deadline_ms != 0);       /* (as udp_park(): the view that holds the zone, the claim, the attach) */
+                const char *hv = pp.hv, *zname = pp.name;
+                const bool attach = pp.attach;
+                const int gate = pp.gate;
                 uint32_t cidx = (uint32_t)(ctx_tcp - g_tcp_pool);
-                int gate = ask ? fetch_gate(hv, pel) : FETCH_GATE_ASK;       /* (as in udp_park()) */
-                int32_t pi = park_tcp(&park, pnow, (uint32_t)left, hv, pel->name, client_fd, cidx, ctx_tcp->gen);
-                if (pi < 0 && gate == FETCH_GATE_TAKEN) park_claim_release(hv, pel->name);
-                if (pi >= 0 && ask && !park_fetch_request(ctx->thread_id, hv, pel->name, (uint8_t)(KDB_FETCH_PRIO_QUERY | (gate == FETCH_GATE_TAKEN ? PARK_PRIO_CLAIMED : 0)), KDB_FETCH_FULL)) {
-                  if (gate == FETCH_GATE_TAKEN) park_claim_release(hv, pel->name);
-                  park_release(&park, &park.e[pi]);          /* the request could not be handed over (ring full): nobody would wake it */
-                  pi = -1;
-                }
+                int32_t pi = park_tcp(&park, pnow, (uint32_t)(attach && left > PARK_ATTACH_DEADLINE_MS ? PARK_ATTACH_DEADLINE_MS : left), hv, zname, client_fd, cidx, ctx_tcp->gen);
+                if (pi < 0 && gate == FETCH_GATE_TAKEN) park_claim_release(hv, zname);
                 if (pi >= 0) {
+                  if (attach) park_mark_attach(&park, pi, park_now_ns(), pnow + left);
+                  if (pp.ask) park_ask(&park, ctx->thread_id, pi, &pp, &pel);
                   if (ctx_tcp->park_deadline_ms == 0) dbreg_cache_note_miss();
                   ctx_tcp->park_deadline_ms = pnow + left;
+                  ctx_tcp->park_idx = pi;
+                  ctx_tcp->park_gen = park.e[pi].gen;
                   ctx_tcp->resume_len = msg_len;
                   ctx_tcp->parked = true;
                   rcu_reader_exit(ctx);
@@ -3531,7 +3664,7 @@ process_tcp_client: ;
             } else if (__builtin_expect(not_ready, 0)) {
               res_len = process_dns_not_ready_routed(msg, msg_len, tcp_res_buf, 65535, 0,
                                                      qname, qtype, ctx_tcp->client_ip,
-                                                     &thread_compress_ctx, true, NULL, snap, &route, pel, false);
+                                                     &thread_compress_ctx, true, NULL, snap, &route, &pel, false);
             } else {
               res_len = process_dns_query_cap_routed(msg, msg_len, tcp_res_buf, 65535, 0,
                                                      qname, qtype, ctx_tcp->client_ip,
@@ -3797,6 +3930,12 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
     if (str_differs(o->database.loader_group, n->database.loader_group)) append_list_item(buf, sz, "database loader-group");
     if (str_differs(db_loader_path(o), db_loader_path(n))) append_list_item(buf, sz, "database loader-path");
     if (str_differs(o->database.loader_state_file, n->database.loader_state_file)) append_list_item(buf, sz, "database loader-state-file");
+    if (str_differs(o->database.store_dir, n->database.store_dir) || o->database.store_none != n->database.store_none) append_list_item(buf, sz, "database store");
+    if (o->database.store_mode != n->database.store_mode) append_list_item(buf, sz, "database store-mode");
+    if (o->database.store_scrub_interval != n->database.store_scrub_interval) append_list_item(buf, sz, "database store-scrub-interval");
+    if (o->database.store_segment_size != n->database.store_segment_size) append_list_item(buf, sz, "database store-segment-size");
+    if (o->database.store_threads != n->database.store_threads) append_list_item(buf, sz, "database store-threads");
+    if (o->database.store_hot_list != n->database.store_hot_list) append_list_item(buf, sz, "database store-hot-list");
   }
 }
 
@@ -3985,6 +4124,7 @@ static time_t g_reload_pending_logged;     /* when the postponement or its last 
  * is already postponed: the new one is merged into it).  A postponed reload is
  * remembered with what it was to do (full, the database request) and applied by the tick; the postponement is logged once, a reminder at
  * most once a minute, the outcome once. */
+static bool g_db_reload_force;            /* 0.7 WP7b: the full reload that is being run (or postponed) is `reload -force`: control thread only */
 static config_reload_result_t run_config_reload(bool skip_unchanged, bool ask_db, bool retry, uint64_t *db_rid) {
   if (db_rid) *db_rid = 0;
   bool full = !skip_unchanged || g_reload_pending_full;
@@ -4017,7 +4157,8 @@ static config_reload_result_t run_config_reload(bool skip_unchanged, bool ask_db
   g_reload_pending_full = false;
   g_reload_pending_db = false;
   if (ask_db && (r.status == CONFIG_RELOAD_OK || r.status == CONFIG_RELOAD_ZONE_ERRORS) && db_ingest_enabled()) {
-    const uint64_t rid = db_ingest_reload(true, NULL, NULL, false);
+    const uint64_t rid = db_ingest_reload(true, NULL, NULL, g_db_reload_force);
+    g_db_reload_force = false;
     if (db_rid) *db_rid = rid;
   }
   return r;
@@ -4185,6 +4326,23 @@ static bool ctl_send_all(int fd, const void *buf, size_t len) {
   return ctl_send_until(fd, buf, len, park_now_ms() + CTL_REPLY_MS);
 }
 
+/* 0.7 WP5: the memory figures of `karictl store` (the inputs of dns_db_ingest.c's ma_inputs(), fetch-concurrency left at its default) */
+static bool ctrl_store_memory(ma_est_t *out) {
+  dbreg_residency_t rs;
+  zone_bytes_t zdb;
+  ma_in_t in;
+  dbreg_residency(&rs);
+  zone_bytes_get(ZBYTES_DB, &zdb);
+  memset(&in, 0, sizeof(in));
+  in.zones = rs.total;
+  in.resident_zones = rs.resident;
+  in.resident_bytes = zdb.resident;
+  in.limit = dbreg_cache_limit();
+  if (dbdir()) db_store_ma_inputs(&in);                  /* 0.7 D6: the store's mode and the size of its images */
+  ma_estimate(&in, out);
+  return true;
+}
+
 /* B6a: an answer of the database loader for a parked `reload <zone>` client (control thread) */
 static void control_db_results(void) {
   db_reload_result_t r;
@@ -4206,22 +4364,67 @@ static void control_db_results(void) {
  * apex of the new summary is here), or whose data came into memory with another serial.  The zone is looked up in the current snapshot; one that is in memory is
  * sent from its entry, as a reload does, one that is not from its apex (notify_send_nonresident()).  At most 256 a tick; the NOTIFY rate decides the pace after
  * that.  The control thread, which owns the table of NOTIFYs awaiting an answer. */
+STATIC_TEST void notify_zone_by_name(const char *view, const char *zone) {
+  rcu_aux_read_lock();
+  zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
+  if (snap) {
+    view_snapshot_t *v = snapshot_find_view(snap, view);
+    zref_t zr;
+    const bool found = v && zref_find_exact(v, zone, &zr);
+    zone_db_entry_t *e = found ? zr.entry : NULL;
+    if (e) {
+      send_notify_to_all(e);                              /* (it ends or renews the wait of the zone itself) */
+    } else if (found && zr.el) {
+      notify_send_nonresident(zr.el, v->name);
+    } else if (found && (zr.zid != ZREF_NOZID || zr.busy)) {
+      /* 0.7 L4: a zone of the store that is not in memory: it was detached between the moment its NOTIFY was queued and now (the queue's tail had moved on already), or this is the second look
+       * of a NOTIFY that waits.  It is asked for in the background and the NOTIFY is made again a little later; a zone that cannot be brought in after a few tries loses its NOTIFY with a line in the log
+       * (the secondaries find the change at their next refresh) */
+      const char *hv = zr.hview ? zr.hview : v->name;
+      if (!zr.busy && zr.zstate == ZREF_ST_ABSENT && g_query_bg_attach) g_query_bg_attach(hv, zref_name(&zr));
+      else if (!zr.busy && zr.zstate == ZREF_ST_KNOWN && g_query_bg_fetch) g_query_bg_fetch(hv, zref_name(&zr));
+      if (!notify_wait_add(view, zone))
+        syslog(LOG_WARNING, "[Notify] zone '%s' (view '%s'): no NOTIFY is sent: the zone is not in memory and could not be brought in (the secondaries find the change at their next refresh)", zone, view);
+    } else {
+      notify_wait_drop(view, zone);                       /* (the zone is gone) */
+    }
+    release_zone_snapshot(snap);
+  } else {
+    notify_wait_drop(view, zone);
+  }
+  rcu_aux_read_unlock();
+}
+
 static void control_zone_notify_queue(void) {
   char view[KARIDNS_VIEW_NAME_MAX], zone[256];
   dbreg_notify_sweep();
-  for (int n = 0; n < 256 && dbreg_notify_pop(view, sizeof(view), zone, sizeof(zone)); n++) {
-    rcu_aux_read_lock();
-    zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
-    if (snap) {
-      view_snapshot_t *v = snapshot_find_view(snap, view);
-      zdir_elem_t *el = v ? zdir_find_exact(v, zone) : NULL;
-      zone_db_entry_t *e = el ? zdir_entry(el) : NULL;
-      if (e) send_notify_to_all(e);
-      else if (el) notify_send_nonresident(el, v->name);
-      release_zone_snapshot(snap);
-    }
-    rcu_aux_read_unlock();
+  for (int n = 0; n < 256 && dbreg_notify_pop(view, sizeof(view), zone, sizeof(zone)); n++) notify_zone_by_name(view, zone);
+  for (int n = 0; n < 256 && notify_wait_pop(view, sizeof(view), zone, sizeof(zone)); n++) notify_zone_by_name(view, zone);        /* (the NOTIFYs that waited for a zone of the store) */
+}
+
+/* The control thread's tick for a zone: a manual NOTIFY (karictl notify) that was asked for.  notify-delay (BIND 9.20 ARM): the delay between two sets of NOTIFY messages for a
+ * zone; a request inside it waits. */
+static void tick_manual_notify(zone_db_entry_t *entry, server_config_t *active, time_t now) {
+  if (!atomic_exchange_explicit(&entry->notify_now, false, memory_order_acquire)) return;
+  if (now < zone_xr(entry)->notify_next) {
+    atomic_store_explicit(&entry->notify_now, true, memory_order_release);
+    atomic_fetch_add_explicit(&g_zone_notify_pending, 1, memory_order_release);
+  } else {
+    xfr_eff_t nd;
+    xfr_opts_effective(active, zone_entry_config(active, entry), zone_vname(entry), &nd);
+    zone_x_t *nx = zone_x_need(entry);
+    if (nx) nx->notify_next = now + (time_t)nd.notify_delay;
+    syslog(LOG_INFO, "[Control] Executing manual NOTIFY for %s", entry->domain);
+    send_notify_to_all(entry);
   }
+}
+
+typedef struct { server_config_t *active; time_t now; } manual_notify_walk_t;
+static bool manual_notify_walk_fn(zdir_elem_t *ael, void *ud) {
+  const manual_notify_walk_t *mw = ud;
+  zone_db_entry_t *aentry = zdir_entry(ael);
+  if (aentry) tick_manual_notify(aentry, mw->active, mw->now);        /* (a request is taken once: a second look at the zone does nothing) */
+  return true;
 }
 
 /* B6a: parked clients whose db-reload-timeout has passed get an error; the request is forgotten */
@@ -4340,9 +4543,15 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
   const dbreg_info_t *zi = &info[0];
   if (strcmp(cmd, "rollback") == 0) {
     zone_db_snapshot_t *rbsnap = acquire_retained_zone_snapshot();
-    zone_db_entry_t *rbe = rbsnap ? dbreg_snapshot_entry(rbsnap, zi->view, zone) : NULL;
+    bool rbheld = false;
+    zone_db_entry_t *rbe = rbsnap ? dbreg_ctl_entry(rbsnap, zi->view, zone, &rbheld) : NULL;
     if (rbe) {
       ctrl_rollback_zone(cfd, rbe, NULL, force);
+      if (rbheld) xfr_entry_release(rbe);
+    } else if (zi->store_state) {
+      /* a zone of the zone store that is not in memory: the version before the last one is kept with the zone in memory (the store holds the current image only), so there is nothing to go back to */
+      static const char msg[] = "ERROR the zone is in the zone store and not in memory: it has no previous version to roll back to (read it with `karictl reload` or ask for it first; a rollback needs the version it replaced)\n";
+      (void)ctl_send_all(cfd, msg, sizeof(msg) - 1);
     } else {
       static const char msg[] = "ERROR the zone is not in memory (out of memory, or hidden by another zone of the same name); nothing to roll back\n";
       (void)ctl_send_all(cfd, msg, sizeof(msg) - 1);
@@ -4361,15 +4570,19 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
     rbtxt[0] = '\0';
     {
       zone_db_snapshot_t *zsnap = acquire_retained_zone_snapshot();
-      zone_db_entry_t *ze = zsnap ? dbreg_snapshot_entry(zsnap, zi->view, zone) : NULL;
+      bool zheld = false;
+      zone_db_entry_t *ze = zsnap ? dbreg_ctl_entry(zsnap, zi->view, zone, &zheld) : NULL;
       if (ze) {
         rx_on = zone_rx_settings_status(ze, NULL, 0);
         zone_rollback_status(ze, rbtxt, sizeof(rbtxt));
+        if (zheld) xfr_entry_release(ze);
       }
       if (zsnap) release_zone_snapshot(zsnap);
     }
+    const char *where = zi->has_entry ? "" : zi->store_state == 1 ? " (in the zone store, not in memory)"
+                                          : zi->store_state == 2 ? " (in the zone store without a body yet: it is read from the database when it is asked for)" : " (no version loaded)";
     int l = snprintf(m, sizeof(m), "OK serial=%u refresh=%u source=database view=%s id=%lld result=%s%s%s%s%s%s\n", zi->serial,
-                     zi->refresh, zi->view, (long long)zi->source_id, res, zi->has_entry ? "" : " (no version loaded)",
+                     zi->refresh, zi->view, (long long)zi->source_id, res, where,
                      zi->error[0] ? " last-error: " : "", zi->error, rx_on ? " settings=primary" : "", rbtxt);
     if (l >= (int)sizeof(m)) l = (int)sizeof(m) - 1, m[l - 1] = '\n';
     (void)ctl_send_all(cfd, m, (size_t)l);
@@ -4377,11 +4590,19 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
   }
   if (strcmp(cmd, "notify") == 0) {
     zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
-    zone_db_entry_t *e = snap ? dbreg_snapshot_entry(snap, zi->view, zone) : NULL;
+    bool nheld = false;
+    zone_db_entry_t *e = snap ? dbreg_ctl_entry(snap, zi->view, zone, &nheld) : NULL;
     if (e) {
       syslog(LOG_NOTICE, "[Control] Received notify command for zone: %s (database zone, view %s)", zone, zi->view);
       zone_notify_request(e);
+      if (nheld) xfr_entry_release(e);
       (void)ctl_send_all(cfd, "OK\n", 3);
+    } else if (zi->store_state && !zi->shadowed) {
+      /* a zone of the zone store that is not in memory: it is asked for in the background and its NOTIFY is sent when it is there (the wait table of the control thread, as for a NOTIFY whose zone was detached) */
+      syslog(LOG_NOTICE, "[Control] Received notify command for zone: %s (database zone, view %s, not in memory: it is attached first)", zone, zi->view);
+      notify_zone_by_name(zi->view, zone);
+      static const char okmsg[] = "OK (the zone is not in memory: it is attached first)\n";
+      (void)ctl_send_all(cfd, okmsg, sizeof(okmsg) - 1);
     } else {
       static const char msg[] = "ERROR zone is not served from the database (hidden by another zone of the same name)\n";
       (void)ctl_send_all(cfd, msg, sizeof(msg) - 1);
@@ -4457,27 +4678,66 @@ static bool sighup_from_manager(long delivered) {
  * counters are the ones the query path keeps already (zone observatory, g_unzoned_responses, g_rrl_dropped_total).
  * ============================================================================ */
 
-STATIC_TEST void stats_collect_totals(zone_db_snapshot_t *snap, karidns_stats_total_t *t) {
-  memset(t, 0, sizeof(*t));
-  if (snap) {
-    for (size_t v = 0; v < snap->view_count; v++) {
-      zdir_iter_t it;
-      zdir_iter_init(&it, &snap->views[v]);
-      for (zdir_elem_t *el; (el = zdir_iter_next(&it));) {
-        zone_db_entry_t *e = zdir_entry(el);
-        if (!e || !view_owns_elem(el)) continue;   /* a shared zone is counted in its owner view */
-        const zone_observatory_t *o = &e->observatory;
-#define ST_ADD(f) t->f += atomic_load_explicit(&o->f, memory_order_relaxed)
-        t->zones++;
-        ST_ADD(queries_total); ST_ADD(tcp_queries);
-        ST_ADD(responses_noerror); ST_ADD(responses_nodata); ST_ADD(responses_nxdomain); ST_ADD(responses_servfail); ST_ADD(responses_refused);
-        ST_ADD(edns_queries); ST_ADD(dnssec_do_queries); ST_ADD(ecs_queries);
-        ST_ADD(rrl_dropped); ST_ADD(rrl_slipped);
-        ST_ADD(notify_sent); ST_ADD(notify_ack); ST_ADD(axfr_success); ST_ADD(ixfr_success); ST_ADD(xfer_failed);
-        ST_ADD(wirecache_hits); ST_ADD(wirecache_misses);
+/* the counters of one zone in memory added to the totals */
+static void stats_add_zone(karidns_stats_total_t *t, const zone_db_entry_t *e) {
+  zone_obs_view_t o;
+  zone_obs_read(e, &o);
+#define ST_ADD(f) t->f += o.f
+  t->zones++;
+  ST_ADD(queries_total); ST_ADD(tcp_queries);
+  ST_ADD(responses_noerror); ST_ADD(responses_nodata); ST_ADD(responses_nxdomain); ST_ADD(responses_servfail); ST_ADD(responses_refused);
+  ST_ADD(edns_queries); ST_ADD(dnssec_do_queries); ST_ADD(ecs_queries);
+  ST_ADD(rrl_dropped); ST_ADD(rrl_slipped);
+  ST_ADD(notify_sent); ST_ADD(notify_ack); ST_ADD(axfr_success); ST_ADD(ixfr_success); ST_ADD(xfer_failed);
+  ST_ADD(wirecache_hits); ST_ADD(wirecache_misses);
 #undef ST_ADD
-      }
+}
+
+/* the zones in memory: the directories of the snapshot and the attach table */
+static void stats_walk_zones(zone_db_snapshot_t *snap, karidns_stats_total_t *t) {
+  if (!snap) return;
+  for (size_t v = 0; v < snap->view_count; v++) {
+    zdir_iter_t it;
+    zdir_iter_init(&it, &snap->views[v]);
+    for (zdir_elem_t *el; (el = zdir_iter_next(&it));) {
+      zone_db_entry_t *e = zdir_entry(el);
+      if (!e || !view_owns_elem(el)) continue;   /* a shared zone is counted in its owner view */
+      stats_add_zone(t, e);
     }
+  }
+  if (dbdir()) {                                 /* 0.7 S3: the zones of the store that are in memory are not in the directories (the ones that are not have no counters: design 6.1) */
+    size_t pos = 0;
+    for (zdir_elem_t *el; (el = dbdir()->attach_next(&pos)) != NULL;) {
+      zone_db_entry_t *e = zdir_entry(el);
+      if (e) stats_add_zone(t, e);
+    }
+  }
+}
+
+#ifdef KARIDNS_UNIT_TEST
+void (*g_stats_walk_hook)(int attempt);            /* called after the walk of the zones in memory, before the check of the fold sequence */
+#endif
+#define STATS_FOLD_TRIES 8
+
+STATIC_TEST void stats_collect_totals(zone_db_snapshot_t *snap, karidns_stats_total_t *t) {
+  /* A zone that is taken out of memory (or replaced) is added to the folded totals and leaves the attach table in one step of the registry; this walk has no lock, so it can see the zone in the table after
+   * the fold was read, or not see it after it was.  The folded totals are read first with the sequence of the folds, and the walk is made again when a fold happened meanwhile (a bounded number of times:
+   * under a steady eviction the last walk is kept, and the error is the counters of the zones that left meanwhile). */
+  const bool fold = dbdir() != NULL;
+  uint64_t f[ZCTR_N] = { 0 }, seq = 0;
+  for (int attempt = 0;; attempt++) {
+    memset(t, 0, sizeof(*t));
+    if (fold) dbreg_fold_totals_seq(f, NULL, &seq);
+    stats_walk_zones(snap, t);
+#ifdef KARIDNS_UNIT_TEST
+    if (g_stats_walk_hook) g_stats_walk_hook(attempt);
+#endif
+    if (!fold || attempt >= STATS_FOLD_TRIES || dbreg_fold_seq() == seq) break;
+  }
+  if (fold) {                                     /* 0.7 store S5: what the zones that left memory counted (design 6.1): the totals do not go back when a zone is taken out */
+    t->queries_total += f[ZCTR_QUERIES]; t->tcp_queries += f[ZCTR_TCP];
+    t->responses_noerror += f[ZCTR_NOERROR]; t->responses_nodata += f[ZCTR_NODATA]; t->responses_nxdomain += f[ZCTR_NXDOMAIN];
+    t->responses_servfail += f[ZCTR_SERVFAIL]; t->responses_refused += f[ZCTR_REFUSED]; t->dnssec_do_queries += f[ZCTR_DO];
   }
   {
     uint64_t resp[KARIDNS_STATS_RCODES], tcp;
@@ -4502,6 +4762,32 @@ static uint64_t obs_tab_id(const zdir_tab_t *t) {
   return t ? ((uint64_t)(uintptr_t)t * 0x9e3779b97f4a7c15ull) ^ (uint64_t)t->cap : 0;
 }
 
+/* does the zone match the glob of an obspage request (NULL: every zone)?  The name as stored and without the root label: `example.*` and `example.test.` both match example.test. */
+static bool obs_name_ok(const char *pattern, const char *domain) {
+  if (!pattern) return true;
+  char bare[256];
+  strlcpy(bare, domain, sizeof(bare));
+  size_t bl = strlen(bare);
+  if (bl > 1 && bare[bl - 1] == '.') bare[bl - 1] = '\0';
+  return fnmatch(pattern, domain, FNM_CASEFOLD) == 0 || fnmatch(pattern, bare, FNM_CASEFOLD) == 0;
+}
+static bool obs_pattern_ok(const char *pattern, const zone_db_entry_t *e) { return obs_name_ok(pattern, e->domain); }
+
+/* 0.7 store S5 (design 6.1): a row of the table of the zones that left memory (dbreg_fold_topk()) in the form karictl reads: the counters the zone had while it was in memory, summed over its stays */
+static void fill_fold_snapshot(const zone_fold_row_t *r, zone_observatory_snapshot_t *out) {
+  memset(out, 0, sizeof(*out));
+  strlcpy(out->domain, r->zone, sizeof(out->domain));
+  strlcpy(out->view_name, r->view, sizeof(out->view_name));
+  out->queries_total = r->c[ZCTR_QUERIES];
+  out->tcp_queries = r->c[ZCTR_TCP];
+  out->responses_noerror = r->c[ZCTR_NOERROR];
+  out->responses_nxdomain = r->c[ZCTR_NXDOMAIN];
+  out->responses_nodata = r->c[ZCTR_NODATA];
+  out->responses_servfail = r->c[ZCTR_SERVFAIL];
+  out->responses_refused = r->c[ZCTR_REFUSED];
+  out->dnssec_do_queries = r->c[ZCTR_DO];
+}
+
 STATIC_TEST int obspage_select(zone_db_snapshot_t *snap, const char *pattern, const char *cursor, size_t limit, const zone_db_entry_t ***out,
                                size_t *n_out, char *cursor_out, size_t cursor_cap) {
   *out = NULL;
@@ -4512,12 +4798,19 @@ STATIC_TEST int obspage_select(zone_db_snapshot_t *snap, const char *pattern, co
     unsigned long long cv, cs, ct;
     char tail;
     if (sscanf(cursor, "%llu.%llu.%llx%c", &cv, &cs, &ct, &tail) != 3) return OBSPAGE_STALE;
-    if (!snap || cv >= snap->view_count) return OBSPAGE_STALE;
-    zdir_iter_t it;
-    zdir_iter_init(&it, &snap->views[cv]);
-    if (obs_tab_id(it.tab) != (uint64_t)ct || (it.tab && cs > it.tab->cap)) return OBSPAGE_STALE;
-    v = (size_t)cv;
-    slot = (size_t)cs;
+    if (snap && dbdir() && cv == snap->view_count + 1) return 0;     /* 0.7 store S5: the table of the zones that left memory comes after the zones in memory; this page has none of the latter (the caller continues with the table) */
+    if (snap && dbdir() && cv == snap->view_count) {          /* 0.7 S3: the zones of the store that are in memory come after the views' directories: the cursor names the attach table */
+      if (dbdir()->attach_tab_id() != (uint64_t)ct) return OBSPAGE_STALE;
+      v = (size_t)cv;
+      slot = (size_t)cs;
+    } else {
+      if (!snap || cv >= snap->view_count) return OBSPAGE_STALE;
+      zdir_iter_t it;
+      zdir_iter_init(&it, &snap->views[cv]);
+      if (obs_tab_id(it.tab) != (uint64_t)ct || (it.tab && cs > it.tab->cap)) return OBSPAGE_STALE;
+      v = (size_t)cv;
+      slot = (size_t)cs;
+    }
   }
   if (limit == 0) return 0;
   const zone_db_entry_t **page = malloc(limit * sizeof(*page));
@@ -4533,14 +4826,7 @@ STATIC_TEST int obspage_select(zone_db_snapshot_t *snap, const char *pattern, co
       if (!el) continue;
       const zone_db_entry_t *e = zdir_entry(el);
       if (!e || !view_owns_elem(el)) continue;
-      if (pattern) {
-        /* the name as stored and without the root label: `example.*` and `example.test.` both match example.test. */
-        char bare[256];
-        strlcpy(bare, e->domain, sizeof(bare));
-        size_t bl = strlen(bare);
-        if (bl > 1 && bare[bl - 1] == '.') bare[bl - 1] = '\0';
-        if (fnmatch(pattern, e->domain, FNM_CASEFOLD) != 0 && fnmatch(pattern, bare, FNM_CASEFOLD) != 0) continue;
-      }
+      if (!obs_pattern_ok(pattern, e)) continue;
       page[n++] = e;
     }
     if (slot >= cap) {   /* the view is done */
@@ -4548,8 +4834,22 @@ STATIC_TEST int obspage_select(zone_db_snapshot_t *snap, const char *pattern, co
       slot = 0;
     }
   }
-  if (!snap || v >= snap->view_count) done = true;
-  if (!done && cursor_cap) {
+  if (snap && v >= snap->view_count && dbdir()) {                 /* 0.7 S3: the zones of the store that are in memory (the views' directories are done) */
+    size_t pos = slot;
+    zdir_elem_t *el = NULL;
+    while (n < limit && scanned < OBSPAGE_SCAN_MAX && (el = dbdir()->attach_next(&pos)) != NULL) {
+      scanned++;
+      const zone_db_entry_t *e = zdir_entry(el);
+      if (!e || !obs_pattern_ok(pattern, e)) continue;
+      page[n++] = e;
+    }
+    slot = pos;
+    if (!el) done = true;
+    else if (cursor_cap) snprintf(cursor_out, cursor_cap, "%zu.%zu.%llx", snap->view_count, slot, (unsigned long long)dbdir()->attach_tab_id());
+  } else if (!snap || v >= snap->view_count) {
+    done = true;
+  }
+  if (!done && cursor_cap && (!snap || v < snap->view_count)) {
     zdir_iter_t it;
     zdir_iter_init(&it, &snap->views[v]);
     snprintf(cursor_out, cursor_cap, "%zu.%zu.%llx", v, slot, (unsigned long long)obs_tab_id(it.tab));
@@ -4773,16 +5073,15 @@ STATIC_TEST void alerts_tick(time_t now) {
         az->st.have_prev = false;
         continue;
       }
-      const zone_observatory_t *o = &e->observatory;
+      zone_obs_view_t ov;
+      zone_obs_read(e, &ov);
       alert_counters_t zc;
       memset(&zc, 0, sizeof(zc));
-      zc.queries = atomic_load_explicit(&o->queries_total, memory_order_relaxed);
-      zc.servfail = atomic_load_explicit(&o->responses_servfail, memory_order_relaxed);
-      zc.responses = atomic_load_explicit(&o->responses_noerror, memory_order_relaxed) + atomic_load_explicit(&o->responses_nodata, memory_order_relaxed) +
-                     atomic_load_explicit(&o->responses_nxdomain, memory_order_relaxed) + zc.servfail +
-                     atomic_load_explicit(&o->responses_refused, memory_order_relaxed);
-      zc.rrl_dropped = atomic_load_explicit(&o->rrl_dropped, memory_order_relaxed);
-      zc.xfer_failed = atomic_load_explicit(&o->xfer_failed, memory_order_relaxed);
+      zc.queries = ov.queries_total;
+      zc.servfail = ov.responses_servfail;
+      zc.responses = ov.responses_noerror + ov.responses_nodata + ov.responses_nxdomain + zc.servfail + ov.responses_refused;
+      zc.rrl_dropped = ov.rrl_dropped;
+      zc.xfer_failed = ov.xfer_failed;
       alert_scope_zone(&lc, az->zone, az->view);
       active += (uint64_t)alert_check(&az->st, &az->lim, &zc, now, alert_log, &lc);
     }
@@ -5036,7 +5335,9 @@ void *control_thread_func(void *arg) {
 
             /* The permission of the key that authenticated this connection (a copy made at login).  Every command goes through this one check;
              * a refused command is answered and logged, and the connection stays open. */
-            const bool allowed = (c->perm & control_command_perm(cmd, arg != NULL)) != 0;
+            /* 0.7 WP7b: `reload -force` is the full reload whose pass the mass-delete guard of the zone store does not hold back (the operator's release; docs/karictl.md) */
+            const bool all_force = strcmp(cmd, "reload") == 0 && arg && strcmp(arg, "-force") == 0 && !view_arg;
+            const bool allowed = (c->perm & control_command_perm(cmd, arg != NULL && !all_force)) != 0;
             /* 0.7 M3, debug 3: how the line was taken apart and what the key's permissions said (the line itself is the NOTICE below) */
             logev_post(LOGC_GENERAL, 3, NULL, 0, "[Control] key \"%s\": command '%.32s', argument '%.64s', view '%.64s'%s: %s by the key's permissions", c->key_name, cmd,
                        arg ? arg : "", view_arg ? view_arg : "", want_force ? (opt_word && opt_word[0] == 'l' ? ", local" : ", force") : "",
@@ -5057,7 +5358,7 @@ void *control_thread_func(void *arg) {
             if (!allowed) {
               /* answered above */
             } else if (strcmp(cmd, "reload") == 0) {
-              if (arg && strlen(arg) > 0) {
+              if (arg && strlen(arg) > 0 && !all_force) {
                 char canon_buf[256];
                 const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
                 zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
@@ -5152,7 +5453,8 @@ void *control_thread_func(void *arg) {
                 release_config_snapshot(active);
                 release_zone_snapshot(snap);
               } else {
-                syslog(LOG_NOTICE, "[Control] Received full reload command");
+                syslog(LOG_NOTICE, "[Control] Received full reload command%s", all_force ? " (-force: the loader lists every zone again, and the mass-delete guard does not hold the sweep back)" : "");
+                g_db_reload_force = all_force;
                 /* B6a (design 5.2): after the configuration, ask the loader to compare its sources with the zones served (run_config_reload(); also
                  * when the reload is postponed and the tick applies it); the answer is not waited for (karictl dbstatus shows the batch) */
                 uint64_t rid = 0;
@@ -5302,9 +5604,12 @@ void *control_thread_func(void *arg) {
                * first line and the zones sent after it must come from one pass.  The entries stay valid while the snapshot is held. */
               uint32_t match_count = 0;
               zone_db_entry_t **obs = NULL;
+              zone_fold_row_t *obs_fold = NULL;
+              size_t obs_fold_n = 0;
               bool obs_oom = false;
               if (snap) {
                 size_t cap = 0, n = 0;
+                rcu_aux_read_lock();       /* 0.7 S3: the zones of the store that are in memory are not kept by the snapshot: they are held below, and found in this section */
                 for (size_t v = 0; v < snap->view_count && !obs_oom; v++) {
                   if (view_arg && strcasecmp(snap->views[v].name, view_arg) != 0) continue;
                   zdir_elem_t **els = NULL;
@@ -5333,14 +5638,46 @@ void *control_thread_func(void *arg) {
                   for (size_t k = 0; !obs_oom && k < en; k++) obs[n++] = zdir_entry(els[k]);
                   free(els);
                 }
+                if (dbdir() && !obs_oom) {                       /* 0.7 S3: the zones of the store that are in memory */
+                  size_t pos = 0;
+                  for (zdir_elem_t *el; !obs_oom && (el = dbdir()->attach_next(&pos)) != NULL;) {
+                    zone_db_entry_t *e = zdir_entry(el);
+                    if (!e || (view_arg && strcasecmp(zone_vname(e), view_arg) != 0)) continue;
+                    if (canon_arg && !domain_names_match_ci(e->domain, canon_arg)) continue;
+                    if (n >= cap) {
+                      size_t ncap = cap ? cap * 2 : 64;
+                      zone_db_entry_t **no = realloc(obs, ncap * sizeof(*no));
+                      if (!no) { obs_oom = true; break; }
+                      obs = no;
+                      cap = ncap;
+                    }
+                    obs[n++] = e;
+                  }
+                }
                 match_count = (uint32_t)n;
+                zone_fold_row_t *frows = NULL;                 /* 0.7 store S5: the zones that left memory with the most queries, after the zones in memory (design 6.1) */
+                size_t fn = 0;
+                if (dbdir() && !obs_oom) {
+                  frows = malloc(ZFOLD_TOPK * sizeof(*frows));
+                  if (frows) {
+                    const size_t all = dbreg_fold_topk(frows, ZFOLD_TOPK);
+                    for (size_t i = 0; i < all; i++) {
+                      if ((view_arg && strcasecmp(frows[i].view, view_arg) != 0) || (canon_arg && !domain_names_match_ci(frows[i].zone, canon_arg))) continue;
+                      frows[fn++] = frows[i];
+                    }
+                  }
+                }
+                obs_fold = frows;
+                obs_fold_n = fn;
+                if (dbdir()) for (size_t k = 0; k < n; k++) xfr_entry_hold(obs[k]);      /* (with the store: every entry of the list is held until the reply is sent, an eviction or a delete cannot free it meanwhile; the entries of the directories have the snapshot's reference) */
+                rcu_aux_read_unlock();
               }
 
               if (obs_oom) {
                 (void)ctl_send_all(cfd, "ERROR out of memory\n", 20);
               } else {
                 char resp_hdr[64];
-                int hlen = snprintf(resp_hdr, sizeof(resp_hdr), "OK %u\n", match_count);
+                int hlen = snprintf(resp_hdr, sizeof(resp_hdr), "OK %zu\n", (size_t)match_count + obs_fold_n);
                 const int64_t obs_deadline = park_now_ms() + CTL_REPLY_MS;   // (one deadline for the header and every item)
                 bool obs_ok = ctl_send_until(cfd, resp_hdr, (size_t)hlen, obs_deadline);
 
@@ -5353,8 +5690,15 @@ void *control_thread_func(void *arg) {
                   rcu_aux_read_unlock();
                   obs_ok = ctl_send_until(cfd, &snap_item, sizeof(snap_item), obs_deadline);   // (a client that does not read: the reply is cut here and the connection closed below)
                 }
+                for (size_t k = 0; obs_ok && k < obs_fold_n; k++) {
+                  zone_observatory_snapshot_t snap_item;
+                  fill_fold_snapshot(&obs_fold[k], &snap_item);
+                  obs_ok = ctl_send_until(cfd, &snap_item, sizeof(snap_item), obs_deadline);
+                }
               }
+              if (dbdir()) for (uint32_t k = 0; k < match_count; k++) xfr_entry_release(obs[k]);
               free(obs);
+              free(obs_fold);
               if (active_cfg) release_config_snapshot(active_cfg);
               if (snap) release_zone_snapshot(snap);
             } else if (strcmp(cmd, "stats") == 0) {
@@ -5403,7 +5747,10 @@ void *control_thread_func(void *arg) {
                 const zone_db_entry_t **page = NULL;
                 size_t pn = 0;
                 char next[KARIDNS_OBSPAGE_CURSOR_MAX];
+                rcu_aux_read_lock();       /* 0.7 S3: the page may list zones of the store that are in memory: found and held in one read section */
                 int prc = obspage_select(snap, pat, cursor, lim, &page, &pn, next, sizeof(next));
+                if (dbdir()) for (size_t k = 0; prc == 0 && k < pn; k++) xfr_entry_hold((zone_db_entry_t *)page[k]);
+                rcu_aux_read_unlock();
                 if (prc == OBSPAGE_OOM) {
                   (void)ctl_send_all(cfd, "ERROR out of memory\n", 20);
                 } else if (prc == OBSPAGE_STALE) {
@@ -5411,7 +5758,30 @@ void *control_thread_func(void *arg) {
                   (void)ctl_send_all(cfd, stale, sizeof(stale) - 1);
                 } else {
                   char resp_hdr[96];
-                  int hlen = snprintf(resp_hdr, sizeof(resp_hdr), "OK %zu %s\n", pn, next[0] ? next : "-");
+                  /* 0.7 store S5 (design 6.1): after the zones in memory, the zones that left it and had the most queries (the table of dbreg_fold_topk()), as rows of the same kind */
+                  zone_fold_row_t *frows = NULL;
+                  size_t fn = 0;
+                  if (dbdir() && snap && pn < lim && next[0] == '\0') {
+                    unsigned long long fcv = 0, fcs = 0, fct = 0;
+                    char ftail;
+                    size_t from = 0;
+                    if (cursor && sscanf(cursor, "%llu.%llu.%llx%c", &fcv, &fcs, &fct, &ftail) == 3 && fcv == snap->view_count + 1) from = (size_t)fcs;
+                    frows = malloc(ZFOLD_TOPK * sizeof(*frows));
+                    if (frows) {
+                      const size_t all = dbreg_fold_topk(frows, ZFOLD_TOPK);
+                      size_t seen = 0, take = 0;
+                      bool more = false;
+                      for (size_t i = 0; i < all; i++) {
+                        if (!obs_name_ok(pat, frows[i].zone)) continue;
+                        if (seen++ < from) continue;
+                        if (take < lim - pn) frows[take++] = frows[i];
+                        else more = true;
+                      }
+                      fn = take;
+                      if (more) snprintf(next, sizeof(next), "%zu.%zu.%x", snap->view_count + 1, from + take, 0u);
+                    }
+                  }
+                  int hlen = snprintf(resp_hdr, sizeof(resp_hdr), "OK %zu %s\n", pn + fn, next[0] ? next : "-");
                   const int64_t pdeadline = park_now_ms() + CTL_REPLY_MS;
                   bool pok = ctl_send_until(cfd, resp_hdr, (size_t)hlen, pdeadline);
                   for (size_t k = 0; pok && k < pn; k++) {
@@ -5422,6 +5792,13 @@ void *control_thread_func(void *arg) {
                     rcu_aux_read_unlock();
                     pok = ctl_send_until(cfd, &snap_item, sizeof(snap_item), pdeadline);
                   }
+                  for (size_t k = 0; pok && k < fn; k++) {
+                    zone_observatory_snapshot_t snap_item;
+                    fill_fold_snapshot(&frows[k], &snap_item);
+                    pok = ctl_send_until(cfd, &snap_item, sizeof(snap_item), pdeadline);
+                  }
+                  free(frows);
+                  if (dbdir()) for (size_t k = 0; k < pn; k++) xfr_entry_release((zone_db_entry_t *)page[k]);
                 }
                 free(page);
                 if (active_cfg) release_config_snapshot(active_cfg);
@@ -5550,6 +5927,17 @@ void *control_thread_func(void *arg) {
               size_t dblen = db_ingest_status(arg, view_arg, dbbuf, sizeof(dbbuf));
               if (dblen == 0) (void)ctl_send_all(cfd, "ERROR no database block is configured\n", 38);
               else (void)ctl_send_all(cfd, dbbuf, dblen);
+            } else if (strcmp(cmd, "store") == 0) {
+              /* 0.7 WP5: the zone store, the attach counters, the memory advice (dns_store_status.c; text, -j JSON, -k key=value, zone <name>) */
+              char stbuf[STORE_STATUS_OUT_MAX];
+              store_status_set_memory_fn(ctrl_store_memory);
+              size_t stlen = store_status_control(arg, view_arg, stbuf, sizeof(stbuf));
+              (void)ctl_send_all(cfd, stbuf, stlen);
+            } else if (strcmp(cmd, "storeop") == 0) {
+              /* 0.7 S6: karictl store compact | checkpoint | scrub start | scrub stop: they change the store, so a read-only key does not have them (control_command_perm(): not a read command) */
+              char sobuf[512];
+              size_t solen = store_status_op(arg, view_arg, sobuf, sizeof(sobuf));
+              (void)ctl_send_all(cfd, sobuf, solen);
             } else {
               syslog(LOG_ERR, "[Control] Received unknown command: %s", cmd);
               (void)ctl_send_all(cfd, "ERROR unknown command\n", 22);
@@ -5586,9 +5974,8 @@ void *control_thread_func(void *arg) {
       } else if (ev_list[i].filter == EVFILT_TIMER ||
                  ev_list[i].filter == EVFILT_USER) {
         time_t now = time(NULL);
-        /* S2: 兄弟ゾーンの公開 (転送、UPDATE、個別の reload) を、そのアドレスをグルーに使うゾーンの応答の版に反映し、
-         * 公開で不要になった古い版を猶予期間の後で解放する */
-        zone_glue_refresh_dependents(false);
+        /* 公開で不要になった古い版を猶予期間の後で解放する (兄弟ゾーンの公開をグルーに使うゾーンの応答の版に反映する zone_glue_refresh_dependents() は、0.7 store から
+         * 専用のスレッド zone_glue_thread_start() が行う: karictl に答える制御スレッドは待たされない) */
         zone_retire_process(false);
         zone_prev_expire(now);          /* karictl rollback: the previous versions whose rollback-window is over */
         config_standby_reap(false);
@@ -5668,19 +6055,7 @@ void *control_thread_func(void *arg) {
                     /* B8t-2: settings received from the primary follow a changed karidns.conf (a secondary's own statements win) */
                     if (atomic_load_explicit(&entry->rx_present, memory_order_relaxed)) zone_rx_settings_refresh(entry, active);
 
-                    if (atomic_exchange_explicit(&entry->notify_now, false, memory_order_acquire)) {
-                        /* notify-delay (BIND 9.20 ARM): the delay between two sets of NOTIFY messages for a zone; a request inside it waits */
-                        if (now < entry->notify_next) {
-                            atomic_store_explicit(&entry->notify_now, true, memory_order_release);
-                            atomic_fetch_add_explicit(&g_zone_notify_pending, 1, memory_order_release);
-                        } else {
-                            xfr_eff_t nd;
-                            xfr_opts_effective(active, zone_entry_config(active, entry), entry->view_name, &nd);
-                            entry->notify_next = now + (time_t)nd.notify_delay;
-                            syslog(LOG_INFO, "[Control] Executing manual NOTIFY for %s", entry->domain);
-                            send_notify_to_all(entry);
-                        }
-                    }
+                    tick_manual_notify(entry, active, now);
 
                     bool is_slave = false;
                     bool have_primary = false;
@@ -5688,7 +6063,7 @@ void *control_thread_func(void *arg) {
 
                     if (entry->is_catalog_member) {
                         is_slave = true;
-                        have_primary = entry->catalog_master != NULL && entry->catalog_master->ip[0] != '\0';
+                        have_primary = zone_xr(entry)->catalog_master != NULL && zone_xr(entry)->catalog_master->ip[0] != '\0';
                     } else {
                         const zone_config_t *zcfg = zone_entry_config(active, entry);
                         slave_zcfg = zcfg;
@@ -5702,14 +6077,15 @@ void *control_thread_func(void *arg) {
                     if (is_slave && have_primary) {
                         time_t deadline = zone_expire_deadline(entry);
                         if (deadline > 0 && now > deadline) {
-                            time_t last_log = atomic_load_explicit(&entry->last_stale_log_time, memory_order_acquire);
+                            zone_x_t *sx = zone_x_need(entry);
+                            time_t last_log = sx ? atomic_load_explicit(&sx->last_stale_log_time, memory_order_acquire) : 0;
                             if (now - last_log > 900) {
                                 if (active && active->serve_stale) {
                                     kdns_logc(LOGC_GENERAL, LOG_WARNING, "[Zone] Zone %s is expired (master unreachable), serving stale data", entry->domain);
                                 } else {
                                     kdns_logc(LOGC_GENERAL, LOG_ERR, "[Zone] Zone %s is expired (master unreachable), returning SERVFAIL", entry->domain);
                                 }
-                                atomic_store_explicit(&entry->last_stale_log_time, now, memory_order_release);
+                                if (sx) atomic_store_explicit(&sx->last_stale_log_time, now, memory_order_release);
                             }
                         }
 
@@ -5767,6 +6143,10 @@ void *control_thread_func(void *arg) {
                     }
                 }
                 }
+            }
+            if (walk_all && dbdir()) {      /* 0.7 S3: the zones of the store that are in memory are in the attach table, not in the directories: a manual NOTIFY asked for one of them is looked for here (a table that grows during the walk: it starts again) */
+                manual_notify_walk_t mw = { .active = active, .now = now };
+                (void)attach_walk(manual_notify_walk_fn, NULL, &mw);
             }
             g_tick_rotor++;
             rcu_aux_read_unlock();
@@ -6532,6 +6912,7 @@ __attribute__((noreturn)) void backend_shutdown(int code) {
   }
   syslog(LOG_NOTICE, "[Backend] Shutting down");
   dnstap_shutdown(DNSTAP_SHUTDOWN_WAIT_MS);
+  db_store_stop();                       // 0.7 store S2: what is queued is written, the store is checkpointed
   backend_exit(code);
 }
 
@@ -7661,6 +8042,19 @@ int main(int argc, char **argv) {
     cleanup_pid_file();
     exit(1);
   }
+  // 0.7 store S2: the zone store directory is opened (made, checked, locked) here, as root, and the Backend inherits the descriptor (design 2.1)
+  {
+    char st_msg[512];
+    if (!db_store_frontend_open(&g_config_db.config_a.database, g_run_identity.privileged, g_run_identity.has_user ? g_run_identity.uid : (uid_t)-1,
+                                g_run_identity.has_group ? g_run_identity.gid : (gid_t)-1, st_msg, sizeof(st_msg))) {
+      syslog(LOG_CRIT, "[Startup] %s", st_msg);
+      fprintf(stderr, "[ERROR] %s\n", st_msg);
+      if (g_broker_pid > 0) kill(g_broker_pid, SIGTERM);
+      cleanup_pid_file();
+      exit(1);
+    }
+    if (st_msg[0]) syslog(LOG_NOTICE, "[Startup] %s", st_msg);
+  }
   // beta design 1.2 step 2: the loader sockets exist before the Backend is forked
   {
     char db_err[512];
@@ -7698,6 +8092,7 @@ int main(int argc, char **argv) {
     // === Parent Process (Process Manager / Supervisor) ===
     klog_set_role(KLOG_ROLE_AUX);   // the Backend rolls the log files; this process appends to them by name
     db_sup_after_fork_supervisor(&dbsup); // the Backend's ends of the loader sockets belong to the Backend
+    db_store_frontend_close();            // 0.7 store S2: the store directory is the Backend's (the routers and the loader do not get it)
     plug_sup_after_fork_manager(&g_plug_sup);
     g_plug_sup.logstate = klog_state_apply;   // 0.7 M2: the Backend's debug level and logging runtime come on the plugin pair
     sigset_t unblock_set;
@@ -8166,8 +8561,17 @@ int main(int argc, char **argv) {
   if (!alias_start())
     syslog(LOG_ERR, "[Backend] Cannot start the ALIAS resolver thread; ALIAS records are not expanded");
 
+  // 0.7 store: the glue of the zones that others take glue from is looked at again by a thread of its own, not by the control thread (karictl waited behind it during an attach burst)
+  if (!zone_glue_thread_start())
+    syslog(LOG_ERR, "[Backend] Cannot start the glue thread; the glue of zones that changed is looked at again by a reload only");
+
   // beta design 1.3 / 1.5: the db ingest thread.  It limits the rights of the two descriptors the supervisor made
   // (stream, control) and uses only them (read / write / recvmsg / kevent) once the sandbox is on.
+  if (cfg->database.enabled && !db_store_start(cfg)) {     // 0.7 store S2: the store and its threads exist before the first zone is installed
+    syslog(LOG_ERR, "[Backend] Cannot start the zone store; aborting startup");
+    fprintf(stderr, "[ERROR] [Backend] Cannot start the zone store; aborting startup\n");
+    backend_exit(EXIT_FAILURE);
+  }
   if (cfg->database.enabled && !db_ingest_start(g_db_stream_fd, g_db_ctrl_fd, g_db_fetch_fd)) {
     syslog(LOG_ERR, "[Backend] Cannot start the database ingest thread; aborting startup");
     fprintf(stderr, "[ERROR] [Backend] Cannot start the database ingest thread; aborting startup\n");
@@ -8182,6 +8586,7 @@ int main(int argc, char **argv) {
 
   // 特権分離(setuid+Capsicum)が完了したため、各Workerスレッドにクエリ処理の開始を許可する
   atomic_store_explicit(&g_privilege_drop_complete, true, memory_order_release);
+  db_store_hot_start();     // 0.7 fix 8: the zones of hot.list are attached in the background, after the queries
 
   for (int i = 0; i < num_workers; i++)
     pthread_join(threads[i], NULL);

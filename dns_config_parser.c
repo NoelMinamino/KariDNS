@@ -723,6 +723,7 @@ static void free_database_config(database_config_t *db) {
   free(db->loader_group);
   free(db->loader_path);
   free(db->loader_state_file);
+  free(db->store_dir);
   free_str_list(db->acl_ceiling, db->acl_ceiling_count);
   free(db->acl_ceiling_parsed);
   free_str_list(db->acl_ceiling_keys, db->acl_ceiling_keys_count);
@@ -6611,6 +6612,44 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
     return 0;
   }
   if (strcmp(key, "loader-state-file") == 0) return db_take_string(ctx, "database", key, KARIDNS_DB_PATH_MAX, &db->loader_state_file);     /* the hot list (design 8.4): restart-only, the loader writes it */
+  if (strcmp(key, "store") == 0) {                     /* 0.7 store S2: the directory of the zone store, or `none` (restart-only) */
+    char *v = NULL;
+    if (db_take_string(ctx, "database", key, KARIDNS_DB_PATH_MAX, &v) != 0) { free(v); return -1; }
+    if (strcasecmp(v, "none") == 0) {
+      free(v);
+      free(db->store_dir);
+      db->store_dir = NULL;
+      db->store_none = true;
+      return 0;
+    }
+    free(db->store_dir);
+    db->store_dir = v;
+    db->store_none = false;
+    return 0;
+  }
+  if (strcmp(key, "store-mode") == 0) {                /* how the images are read: mapped (the page cache holds them), copied (a read into memory; ZFS), or by the file system */
+    char *v = NULL;
+    if (db_take_string(ctx, "database", key, 8, &v) != 0) { free(v); return -1; }
+    int m = strcasecmp(v, "auto") == 0 ? 0 : strcasecmp(v, "map") == 0 ? 1 : strcasecmp(v, "copy") == 0 ? 2 : -1;
+    if (m < 0) report_bad_value(ctx, NULL, key, v, "auto, map or copy");
+    free(v);
+    if (m < 0) return -1;
+    db->store_mode = (uint8_t)m;
+    return 0;
+  }
+  if (strcmp(key, "store-hot-list") == 0) return parse_bool_statement(ctx, NULL, key, &db->store_hot_list);      /* 0.7 fix 8: hot.list at a clean stop, and the background attach of its zones at the start */
+  if (strcmp(key, "store-threads") == 0) {
+    if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_STORE_THREADS_MAX, &u) != 0) return -1;
+    db->store_threads = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "store-segment-size") == 0)         /* 0.7 S6: the size of a segment file of the store (K, M, G); the cleaner removes whole segments */
+    return db_take_uint(ctx, key, true, KARIDNS_DB_STORE_SEGMENT_MIN, KARIDNS_DB_STORE_SEGMENT_MAX, &db->store_segment_size);
+  if (strcmp(key, "store-scrub-interval") == 0) {      /* 0.7 S6: seconds between two scrubs of the store (every record is read and checked, slowly); `off` = never */
+    if (db_take_uint_word(ctx, key, false, KARIDNS_DB_STORE_SCRUB_MIN, KARIDNS_DB_STORE_SCRUB_MAX, "off", UINT32_MAX, &u) != 0) return -1;
+    db->store_scrub_interval = (uint32_t)u;
+    return 0;
+  }
   if (strcmp(key, "warm-before-serve") == 0) {        /* seconds to hold back the queries until the zones of the hot list are read (0 = do not wait) */
     if (db_take_uint(ctx, key, false, 0, KARIDNS_DB_WARM_WAIT_MAX, &u) != 0) return -1;
     db->warm_before_serve = (uint32_t)u;
@@ -6681,6 +6720,7 @@ static int parse_database_block(token_ctx_t *ctx, server_config_t *config) {
   }
   db->enabled = true;
   db->signer_wait = true;      /* 0.6.0 item C: a changed zone of the signer waits for the signer */
+  db->store_hot_list = true;    /* 0.7 fix 8 */
   db->poll_interval = 2;
   db->coalesce_ms = 1000;
   db->default_ttl = 3600;
@@ -7255,6 +7295,7 @@ static int config_apply_directory(token_ctx_t *ctx, server_config_t *config) {
      * it, and the server chdir()s to the directory at start-up (and daemonize() no longer leaves it), so the relative name resolves there */
     ok = ok && dir_prefix_path(&config->database.database_file, eff) && dir_prefix_path(&config->database.conninfo_file, eff);
     ok = ok && dir_prefix_path(&config->database.loader_state_file, eff);
+    ok = ok && dir_prefix_path(&config->database.store_dir, eff);
     if (!ok) goto oom;
     logev_post(LOGC_CONFIG, 2, NULL, 0, "[Config] options { directory \"%s\" }: the relative paths of the configuration are taken from it; the built-in "
                "default_debug is %s", eff, config->logging.debug_file);
@@ -7266,6 +7307,7 @@ static int config_apply_directory(token_ctx_t *ctx, server_config_t *config) {
       path_absolutize(ctx, &config->database.conninfo_file, "database conninfo-file", KARIDNS_DB_PATH_MAX) != 0 ||
       path_absolutize(ctx, &config->database.loader_path, "database loader-path", KARIDNS_DB_PATH_MAX) != 0) goto out;
   if (path_absolutize(ctx, &config->database.loader_state_file, "database loader-state-file", KARIDNS_DB_PATH_MAX) != 0) goto out;
+  if (path_absolutize(ctx, &config->database.store_dir, "database store", KARIDNS_DB_PATH_MAX) != 0) goto out;
   for (view_config_t *v = config->views; v; v = v->next)
     if (path_absolutize(ctx, &v->database_file, "view database-file", KARIDNS_DB_PATH_MAX) != 0) goto out;
   rc = 0;
@@ -8133,7 +8175,7 @@ uint32_t control_perm_from_name(const char *name) {
 uint32_t control_command_perm(const char *cmd, bool has_arg) {
   if (!cmd) return CTLP_OTHER;
   if (strcmp(cmd, "reload") == 0) return has_arg ? CTLP_RELOAD_ZONE : CTLP_RELOAD;
-  if (strcmp(cmd, "status") == 0 || strcmp(cmd, "zonestatus") == 0 || strcmp(cmd, "observatory") == 0 || strcmp(cmd, "dbstatus") == 0 ||
+  if (strcmp(cmd, "status") == 0 || strcmp(cmd, "zonestatus") == 0 || strcmp(cmd, "observatory") == 0 || strcmp(cmd, "dbstatus") == 0 || strcmp(cmd, "store") == 0 ||
       strcmp(cmd, "stats") == 0 || strcmp(cmd, "obspage") == 0)
     return CTLP_READ;
   if (strcmp(cmd, "notrace") == 0) return CTLP_TRACE;   /* (the name `trace` allows both, as rndc's trace / notrace are one switch) */

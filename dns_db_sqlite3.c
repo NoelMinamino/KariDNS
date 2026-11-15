@@ -67,6 +67,8 @@ struct db_conn {
     bool has_changes;
     sqlite3_stmt *st_apex_all, *st_apex_one, *st_zones, *st_zone_one, *st_rec_all, *st_rec_one, *st_rec_rng, *st_meta_all, *st_meta_one, *st_keys, *st_changes, *st_cmax;
     sqlite3_stmt *st_dv_all, *st_dv_one;
+    sqlite3_stmt *st_mpage, *st_cpage, *st_cnt, *st_cntv;      /* 0.7 WP3: manifest_page, changes_page, count_domains (all, one view) */
+    db_mgroup_t mg;             /* the manifest row being assembled */
     bool has_domain_views;
     sqlite3_stmt *st_prof;
     bool has_profiles;
@@ -313,6 +315,10 @@ static void sq_close(db_conn_t *c) {
     sqlite3_finalize(c->st_keys);
     sqlite3_finalize(c->st_changes);
     sqlite3_finalize(c->st_cmax);
+    sqlite3_finalize(c->st_mpage);
+    sqlite3_finalize(c->st_cpage);
+    sqlite3_finalize(c->st_cnt);
+    sqlite3_finalize(c->st_cntv);
     sqlite3_close(c->db);
     free(c);
 }
@@ -398,7 +404,7 @@ static int sq_check_schema(db_conn_t *c, db_schema_info_t *out) {
         return rc;
     c->has_ext = r1 > 0 && f1 == 7u && r2 > 0 && f2 == 15u && r3 > 0 && f3 == 15u;
     /* items D and E: the zone generation and the zone versions (db/karidns_ext.sqlite3.sql); the versions need both tables */
-    static const char *const zs_cols[] = { "domain_id", "generation", NULL };
+    static const char *const zs_cols[] = { "domain_id", "generation", "changed_at", NULL };
     static const char *const zv_cols[] = { "id", "domain_id", "version", "kind", "change_set", "principal_id", "principal_name", "db_role", "comment", "serial_before",
                                            "serial_after", "generation_before", "generation_after", "rollback_of", "delta_complete", NULL };
     static const char *const zr_cols[] = { "version_id", "owner", "type", "before", "after", NULL };
@@ -407,7 +413,7 @@ static int sq_check_schema(db_conn_t *c, db_schema_info_t *out) {
     if ((rc = table_columns(c, "karidns_zone_state", zs_cols, &found, &rows)) != 0 || (rc = table_columns(c, "karidns_zone_versions", zv_cols, &f4, &r4)) != 0 ||
         (rc = table_columns(c, "karidns_zone_version_rrsets", zr_cols, &f5, &r5)) != 0)
         return rc;
-    c->has_zone_state = rows > 0 && found == 3u;
+    c->has_zone_state = rows > 0 && found == 7u;
     c->has_versions = r4 > 0 && f4 == 0x7FFFu && r5 > 0 && f5 == 31u;
     if (out) {
         out->has_ext = c->has_ext;
@@ -586,7 +592,7 @@ static int sq_begin_snapshot(db_conn_t *c) {
 /* every read statement back to the start, so that no cursor keeps the transaction (or the WAL read mark) busy */
 static void rearm_all(db_conn_t *c) {
     sqlite3_stmt *all[] = { c->st_apex_all, c->st_apex_one, c->st_zones, c->st_zone_one, c->st_rec_all, c->st_rec_one, c->st_rec_rng, c->st_meta_all, c->st_meta_one,
-                            c->st_keys, c->st_changes, c->st_cmax, c->st_dv_all, c->st_dv_one, c->st_prof };
+                            c->st_keys, c->st_changes, c->st_cmax, c->st_dv_all, c->st_dv_one, c->st_prof, c->st_mpage, c->st_cpage, c->st_cnt, c->st_cntv };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
         if (all[i]) rearm(all[i]);
     for (int i = 0; i < 2; i++) {
@@ -977,6 +983,182 @@ static int sq_changes_max(db_conn_t *c, uint64_t *seq) {
     }
     rearm(st);                       /* (the statement is kept: no cursor may hold the read transaction) */
     return ret;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 0.7 store, WP3: the paged calls (dns_db_driver.h)                                                              */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+static int need_schema3(db_conn_t *c, const char *what, const char *table) {
+    set_err(c, "%s: %s does not exist in this database (a plain PowerDNS schema: the 0.7 store needs karidns_zone_state and karidns_changes, "
+               "schema version 3, db/karidns_ext.sqlite3.sql)", what, table);
+    return DB_ERR_NEED_SCHEMA3;
+}
+
+static int sq_count_domains(db_conn_t *c, const char *view, uint64_t *n) {
+    *n = 0;
+    bool by_view = view && c->has_domain_views;
+    sqlite3_stmt **slot = by_view ? &c->st_cntv : &c->st_cnt;
+    int ret = prep(c, slot, by_view ? "SELECT (SELECT count(*) FROM domains) - (SELECT count(DISTINCT domain_id) FROM karidns_domain_views)"
+                                      " + (SELECT count(DISTINCT domain_id) FROM karidns_domain_views WHERE view_name = ?1 COLLATE NOCASE)"
+                                    : "SELECT count(*) FROM domains");
+    if (ret != 0) return ret;
+    sqlite3_stmt *st = *slot;
+    rearm(st);
+    if (by_view) sqlite3_bind_text(st, 1, view, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) {
+        sqlite3_int64 v = sqlite3_column_int64(st, 0);
+        *n = v < 0 ? 0 : (uint64_t)v;
+    } else {
+        ret = sql_fail(c, rc, "count_domains");
+    }
+    rearm(st);
+    return ret;
+}
+
+/* hand the finished group to the callback; DB_STOPPED when it stops the page */
+static int mg_flush(db_manifest_cb cb, void *ud, db_mgroup_t *g, int64_t *last_id, unsigned *nrows) {
+    g->open = false;
+    (*nrows)++;
+    *last_id = g->row.id;
+    return cb(ud, &g->row) != 0 ? DB_STOPPED : 0;
+}
+
+static int sq_manifest_page(db_conn_t *c, int64_t after_id, unsigned limit, db_manifest_cb cb, void *ud, int64_t *last_id, unsigned *nrows) {
+    *last_id = after_id;
+    *nrows = 0;
+    if (limit == 0 || limit > DB_PAGE_MAX) {
+        set_err(c, "manifest_page: the limit must be 1 to %u", DB_PAGE_MAX);
+        return -1;
+    }
+    if (!c->has_zone_state) return need_schema3(c, "manifest_page", "karidns_zone_state");
+    /* the page of domains is cut first (an index seek on the rowid, LIMIT), then joined: the rows of one domain stay together, ORDER BY d.id,
+     * view_name; the statement is built once per connection (the schema does not change under it) */
+    char sql[800];
+    snprintf(sql, sizeof(sql),
+             "SELECT d.id, d.name, d.type, s.generation, s.changed_at, %s FROM (SELECT id, name, type FROM domains WHERE id > ?1 ORDER BY id LIMIT ?2) d "
+             "LEFT JOIN karidns_zone_state s ON s.domain_id = d.id %s ORDER BY d.id%s",
+             c->has_domain_views ? "v.view_name" : "NULL", c->has_domain_views ? "LEFT JOIN karidns_domain_views v ON v.domain_id = d.id" : "",
+             c->has_domain_views ? ", v.view_name" : "");
+    int ret = prep(c, &c->st_mpage, sql);
+    if (ret != 0) return ret;
+    sqlite3_stmt *st = c->st_mpage;
+    rearm(st);
+    sqlite3_bind_int64(st, 1, after_id);
+    sqlite3_bind_int64(st, 2, limit);
+    db_mgroup_t *g = &c->mg;
+    g->open = false;
+    for (;;) {
+        int rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE) break;
+        if (rc != SQLITE_ROW) {
+            ret = sql_fail(c, rc, "manifest_page");
+            break;
+        }
+        bool bad = false;
+        int64_t id = col_int(c, st, 0, "domains", after_id, "id", &bad);
+        if (bad) {
+            ret = -1;
+            break;
+        }
+        if (g->open && id != g->row.id && (ret = mg_flush(cb, ud, g, last_id, nrows)) != 0) break;
+        if (!g->open) {
+            const char *name = col_text(c, st, 1, "domains", id, "name", &bad);
+            const char *type = col_text(c, st, 2, "domains", id, "type", &bad);
+            bool has_state = sqlite3_column_type(st, 3) != SQLITE_NULL;
+            int64_t gen = has_state ? col_int(c, st, 3, "karidns_zone_state", id, "generation", &bad) : 0;
+            int64_t at = has_state ? col_int(c, st, 4, "karidns_zone_state", id, "changed_at", &bad) : 0;
+            const char *why = bad ? NULL : db_mgroup_start(g, id, name, type, has_state, gen < 0 ? 0 : (uint64_t)gen, at < 0 ? 0 : (uint64_t)at);
+            if (why) {
+                set_err(c, "table domains id %lld: %s", (long long)id, why);
+                bad = true;
+            }
+            if (bad) {
+                ret = -1;
+                break;
+            }
+        }
+        const char *vn = col_text(c, st, 5, "karidns_domain_views", id, "view_name", &bad);
+        const char *why = !bad && vn ? db_mgroup_view(g, vn) : NULL;
+        if (why) {
+            set_err(c, "table karidns_domain_views domain %lld: %s", (long long)id, why);
+            bad = true;
+        }
+        if (bad) {
+            ret = -1;
+            break;
+        }
+    }
+    if (ret == 0 && g->open) ret = mg_flush(cb, ud, g, last_id, nrows);
+    g->open = false;
+    rearm(st);
+    return ret;
+}
+
+static int sq_current_cursor(db_conn_t *c, uint64_t *cursor) {
+    *cursor = 0;
+    if (!c->has_changes) return need_schema3(c, "current_cursor", "karidns_changes");
+    return sq_changes_max(c, cursor);
+}
+
+static int sq_changes_page(db_conn_t *c, db_change_pos_t *pos, unsigned limit, db_change_entry_cb cb, void *ud, bool *more, bool *gap) {
+    *more = false;
+    *gap = false;
+    if (limit == 0 || limit > DB_PAGE_MAX) {
+        set_err(c, "changes_page: the limit must be 1 to %u", DB_PAGE_MAX);
+        return -1;
+    }
+    if (!c->has_changes) return need_schema3(c, "changes_page", "karidns_changes");
+    /* the window of `limit` log rows after the cursor, one entry per domain (its highest seq), with the domain's existence in the same snapshot;
+     * mn, mx and cnt describe the whole window (the same on every row) */
+    int ret = prep(c, &c->st_cpage,
+                   "WITH w AS (SELECT seq, domain_id FROM karidns_changes WHERE seq > ?1 ORDER BY seq LIMIT ?2), "
+                   "a AS (SELECT domain_id, seq, min(seq) OVER () AS mn, max(seq) OVER () AS mx, count(*) OVER () AS cnt, "
+                   "max(seq) OVER (PARTITION BY domain_id) AS dm FROM w) "
+                   "SELECT domain_id, seq, EXISTS (SELECT 1 FROM domains d WHERE d.id = a.domain_id), mn, mx, cnt FROM a WHERE seq = dm ORDER BY seq");
+    if (ret != 0) return ret;
+    sqlite3_stmt *st = c->st_cpage;
+    rearm(st);
+    uint64_t after = pos->cursor, mx = after;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)after);
+    sqlite3_bind_int64(st, 2, limit);
+    int64_t cnt = 0;
+    bool any = false;
+    for (;;) {
+        int rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE) break;
+        if (rc != SQLITE_ROW) {
+            ret = sql_fail(c, rc, "changes_page");
+            break;
+        }
+        if (!any) {
+            any = true;
+            if (after > 0 && (uint64_t)sqlite3_column_int64(st, 3) > after + 1) *gap = true;      /* rows after the cursor were pruned */
+        }
+        mx = (uint64_t)sqlite3_column_int64(st, 4);
+        cnt = sqlite3_column_int64(st, 5);
+        db_change_entry_t e;
+        e.seq = (uint64_t)sqlite3_column_int64(st, 1);
+        e.domain_id = sqlite3_column_int64(st, 0);
+        e.op = sqlite3_column_int64(st, 2) ? DB_CHANGE_UPSERT : DB_CHANGE_DELETE;
+        if (cb(ud, &e) != 0) {
+            ret = DB_STOPPED;
+            break;
+        }
+    }
+    rearm(st);
+    if (ret != 0) return ret;
+    if (!any && after > 0) {
+        /* nothing after the cursor: either the log is at it, or the log is below it (emptied, or a database that is not the one the cursor came from) */
+        uint64_t top = 0;
+        if ((ret = sq_changes_max(c, &top)) != 0) return ret;
+        if (top < after) *gap = true;
+    }
+    pos->cursor = mx;
+    pos->seq = pos->settle = 0;
+    *more = cnt >= (int64_t)limit;
+    return 0;
 }
 
 static int sq_wait_fd(db_conn_t *c) {
@@ -1672,6 +1854,7 @@ const db_driver_t db_driver_sqlite3 = {
     .find_zone = sq_find_zone,                  /* B13 */
     /* B13b scan_records_in, scan_metadata_in, scan_ext_in: PostgreSQL only (a statement costs no round trip here) */
     .scan_apex = sq_scan_apex,                  /* D1a step 6 */
+    .count_domains = sq_count_domains, .manifest_page = sq_manifest_page, .current_cursor = sq_current_cursor, .changes_page = sq_changes_page,      /* 0.7 store, WP3 */
     /* M2, the ZoneImporter: write access (open_write connections only) */
     .open_write = sq_open_write, .w_begin = sq_w_begin, .w_commit = sq_w_commit, .w_rollback = sq_w_rollback,
     .w_create_zone = sq_w_create_zone, .w_delete_records = sq_w_delete_records, .w_insert_record = sq_w_insert_record,

@@ -27,6 +27,11 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <sys/types.h>
+#if defined(__FreeBSD__)
+#include <sys/param.h>
+#include <sys/mount.h>
+#include <sys/sysctl.h>
+#endif
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -795,6 +800,35 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
         kc_warning(&t, DC_CONF_DATABASE_STATE_FILE, "database: loader-state-file has no effect without memory-limit (every zone stays in memory, so there is no hot list to warm from)\n");
     if (db->warm_before_serve && db->memory_limit == 0)
         kc_warning(&t, DC_CONF_DATABASE_WARM, "database: warm-before-serve only waits for the directory to be loaded without memory-limit (every zone is read at the start)\n");
+    /* 0.7 store S2: the directory of the zone store: karidns makes the last component of an explicit directory (mode 0700, the user it runs as) and refuses to start when it cannot use it */
+    if (db->store_dir && !db->store_none) {
+        struct stat ssb;
+        if (stat(db->store_dir, &ssb) == 0) {
+            if (!S_ISDIR(ssb.st_mode)) {
+                kc_error(&t, DC_CONF_DATABASE, "database store '%s' is not a directory\n", db->store_dir);
+            } else {
+                /* the owner and mode rules of the start (store_dir_owner_ok(), the function db_store_frontend_open() uses): root starts karidns and hands the directory to
+                 * `user`, so it must belong to root or to that user and not be writable by group or others; a start by a user needs a directory of that user */
+                uid_t run_uid = (uid_t)-1;
+                if (cfg->user) {
+                    struct passwd *rpw = getpwnam(cfg->user);
+                    if (rpw) run_uid = rpw->pw_uid;
+                }
+                bool priv = geteuid() == 0 || run_uid != (uid_t)-1;
+                char own[200];
+                if (!store_dir_owner_ok(&ssb, priv, run_uid, geteuid(), own, sizeof(own)))
+                    kc_error(&t, DC_CONF_DATABASE, "database store '%s' %s; karidns refuses to start\n", db->store_dir, own);
+            }
+        } else if (errno == ENOENT) {
+            char par[PATH_MAX];
+            const char *sl = strrchr(db->store_dir, '/');
+            if (!sl) snprintf(par, sizeof(par), ".");
+            else if (sl == db->store_dir) snprintf(par, sizeof(par), "/");
+            else snprintf(par, sizeof(par), "%.*s", (int)(sl - db->store_dir), db->store_dir);
+            if (stat(par, &ssb) != 0 || !S_ISDIR(ssb.st_mode))
+                kc_error(&t, DC_CONF_DATABASE, "database store '%s' does not exist and neither does its parent directory '%s' (karidns makes the last component only)\n", db->store_dir, par);
+        }
+    }
     /* B7a: without acl-ceiling the ACLs a database zone carries (allow-transfer, allow-update from the metadata or a profile)
      * refuse every client; the zones still answer queries */
     if (db->acl_ceiling_count == 0 && db->acl_ceiling_keys_count == 0)
@@ -1888,6 +1922,47 @@ KARIDNS_TOOL_FN int kc_db_run_source(const server_config_t *cfg, const kc_dbsrc_
 /* 0.7 P-F: what the databases need in memory (dns_mem_advice.c, the same figures and rules as the server's syslog lines and `karictl dbstatus`), from the
  * zones and records the loaders counted; the whole configuration counts, so it is said once, not for every source.  The tool does not know how the zones
  * are asked for, so what it says about memory-limit is the share of zones that fit and the recommendation, as the server says it at its start. */
+/* 0.7 S6 (store design 3.6): when the store is on ZFS (the images are read with pread() and the ARC is their cache), the Backend's heap, vfs.zfs.arc.max, the loader and about a
+ * gigabyte for the system have to fit in RAM together.  Said as an information line (a sum that is over RAM says so in its text); the server cannot read these values in its sandbox. */
+KARIDNS_TOOL_FN bool kc_db_store_on_zfs(const database_config_t *db) {
+#if defined(__FreeBSD__)
+    char path[KARIDNS_DB_PATH_MAX + 1];
+    snprintf(path, sizeof(path), "%s", db->store_dir ? db->store_dir : KARIDNS_DB_DEFAULT_STORE_DIR);
+    struct statfs sfs;
+    bool have = false;
+    for (;;) {                                  /* (the directory may not be made yet: its nearest parent is on the same file system) */
+        if (statfs(path, &sfs) == 0) { have = true; break; }
+        char *sl = strrchr(path, '/');
+        if (!sl || sl == path) break;
+        *sl = '\0';
+    }
+    return have && strcmp(sfs.f_fstypename, "zfs") == 0;
+#else
+    (void)db;
+    return false;
+#endif
+}
+
+KARIDNS_TOOL_FN void kc_db_zfs_memory(const database_config_t *db, const ma_est_t *e) {
+#if defined(__FreeBSD__)
+    if (db->store_none || db->store_mode == 1) return;           /* (`store-mode map` keeps the images in the page cache: not what this sums) */
+    if (!kc_db_store_on_zfs(db)) return;
+    uint64_t arc = 0, ram = 0;
+    size_t l = sizeof(arc);
+    if (sysctlbyname("vfs.zfs.arc.max", &arc, &l, NULL, 0) != 0 || (l != 4 && l != 8)) return;
+    l = sizeof(ram);
+    if (sysctlbyname("hw.physmem", &ram, &l, NULL, 0) != 0 || (l != 4 && l != 8)) ram = 0;
+    ma_arc_t a;
+    ma_arc_sum(e->limit ? e->backend_limit : e->backend_all, arc, e->limit ? e->loader_limit : e->loader_all, ram, &a);
+    char t[640];
+    ma_text_arc(t, sizeof(t), &a);
+    dns_diag(DIAG_INFO, DC_DB_MEMORY_ESTIMATE, NULL, 0, "%s\n", t);
+#else
+    (void)db;
+    (void)e;
+#endif
+}
+
 KARIDNS_TOOL_FN void kc_db_memory(const server_config_t *cfg, const kc_msum_t *ms, int *total_err, int *total_warn, int *bad) {
     const database_config_t *db = &cfg->database;
     ma_in_t in;
@@ -1897,11 +1972,13 @@ KARIDNS_TOOL_FN void kc_db_memory(const server_config_t *cfg, const kc_msum_t *m
     in.records = ms->records;
     in.limit = db->memory_limit;
     in.fetch_conc = db->fetch_concurrency ? db->fetch_concurrency : (db->loader_threads ? db->loader_threads : 1) * KARIDNS_DB_FETCH_CONC_PER_THREAD;
+    if (!db->store_none) in.store_mode = db->store_mode == 1 ? MA_STORE_MAP : db->store_mode == 2 ? MA_STORE_COPY : kc_db_store_on_zfs(db) ? MA_STORE_COPY : MA_STORE_MAP;      /* (0.7 D6: the store is the directory; the loader keeps no table) */
     ma_est_t e;
     ma_estimate(&in, &e);
     char t[900];
     ma_text_estimate(t, sizeof(t), &e);
     dns_diag(DIAG_INFO, DC_DB_MEMORY_ESTIMATE, NULL, 0, "%s\n", t);
+    kc_db_zfs_memory(db, &e);
     if (ma_text_advice(t, sizeof(t), &e) == 0) return;
     if (e.level == MA_LEVEL_ERROR) {
         dns_diag(DIAG_ERROR, DC_DB_MEMORY_LIMIT_TINY, NULL, 0, "%s\n", t);

@@ -679,7 +679,7 @@ static void test_notify_catalog_member(void) {
     g_gr.entry.is_catalog_member = true;
     g_gr.entry.is_secondary = true;
     g_gr.entry.source = ZONE_SRC_CATALOG;
-    g_gr.entry.owning_catalog_domain = (char *)"catalog.example.";
+    zone_x_need(&g_gr.entry)->owning_catalog_domain = (char *)"catalog.example.";
 
     atomic_store(&g_gr.entry.refresh_now, false);
     build_notify(&q, "member.example.", NULL);
@@ -703,7 +703,7 @@ static void test_notify_catalog_member(void) {
     g_gr.entry.is_catalog_member = true;
     g_gr.entry.is_secondary = true;
     g_gr.entry.source = ZONE_SRC_CATALOG;
-    g_gr.entry.owning_catalog_domain = (char *)"catalog.example.";
+    zone_x_need(&g_gr.entry)->owning_catalog_domain = (char *)"catalog.example.";
     atomic_store(&g_gr.entry.refresh_now, false);
     build_notify(&q, "member.example.", k1);
     ask(&q, "member.example.", 6, MASTER, false, &r);
@@ -733,7 +733,7 @@ static void test_notify_catalog_member(void) {
     g_gr.entry.is_catalog_member = true;
     g_gr.entry.is_secondary = true;
     g_gr.entry.source = ZONE_SRC_CATALOG;
-    g_gr.entry.owning_catalog_domain = (char *)"catalog.example.";
+    zone_x_need(&g_gr.entry)->owning_catalog_domain = (char *)"catalog.example.";
     atomic_store(&g_gr.entry.refresh_now, false);
     build_notify(&q, "member.example.", k2);
     ask(&q, "member.example.", 6, MASTER, false, &r);
@@ -754,10 +754,10 @@ static void test_notify_catalog_member(void) {
     g_gr.entry.is_catalog_member = true;
     g_gr.entry.is_secondary = true;
     g_gr.entry.source = ZONE_SRC_CATALOG;
-    g_gr.entry.owning_catalog_domain = (char *)"catalog.example.";
-    g_gr.entry.catalog_master = calloc(1, sizeof(*g_gr.entry.catalog_master));
-    assert(g_gr.entry.catalog_master);
-    strncpy(g_gr.entry.catalog_master->ip, MASTER, sizeof(g_gr.entry.catalog_master->ip) - 1);
+    zone_x_need(&g_gr.entry)->owning_catalog_domain = (char *)"catalog.example.";
+    zone_x_need(&g_gr.entry)->catalog_master = calloc(1, sizeof(*zone_xr(&g_gr.entry)->catalog_master));
+    assert(zone_xr(&g_gr.entry)->catalog_master);
+    strncpy(zone_xr(&g_gr.entry)->catalog_master->ip, MASTER, sizeof(zone_xr(&g_gr.entry)->catalog_master->ip) - 1);
     atomic_store(&g_gr.entry.refresh_now, false);
     build_notify(&q, "member.example.", NULL);
     ask(&q, "member.example.", 6, MASTER, false, &r);
@@ -769,7 +769,7 @@ static void test_notify_catalog_member(void) {
     ask(&q, "member.example.", 6, "198.51.100.7", false, &r);
     CHECK(&r, r.rcode == 0 && r.aa && atomic_load(&g_gr.entry.refresh_now));
     /* the copy carries the catalog zone's tsig-key (zone_key): signed with it, or refused; the element's key (key) is above it */
-    strncpy(g_gr.entry.catalog_master->zone_key, "k1", sizeof(g_gr.entry.catalog_master->zone_key) - 1);
+    strncpy(zone_xr(&g_gr.entry)->catalog_master->zone_key, "k1", sizeof(zone_xr(&g_gr.entry)->catalog_master->zone_key) - 1);
     atomic_store(&g_gr.entry.refresh_now, false);
     build_notify(&q, "member.example.", NULL);
     ask(&q, "member.example.", 6, MASTER, false, &r);
@@ -777,15 +777,15 @@ static void test_notify_catalog_member(void) {
     build_notify(&q, "member.example.", k1);
     ask(&q, "member.example.", 6, MASTER, false, &r);
     CHECK(&r, r.rcode == 0 && r.aa && atomic_load(&g_gr.entry.refresh_now));
-    strncpy(g_gr.entry.catalog_master->key, "k2", sizeof(g_gr.entry.catalog_master->key) - 1);
+    strncpy(zone_xr(&g_gr.entry)->catalog_master->key, "k2", sizeof(zone_xr(&g_gr.entry)->catalog_master->key) - 1);
     atomic_store(&g_gr.entry.refresh_now, false);
     build_notify(&q, "member.example.", k1);
     ask(&q, "member.example.", 6, MASTER, false, &r);
     CHECK(&r, r.rcode == 5 && !atomic_load(&g_gr.entry.refresh_now));
     /* a member whose owner is unknown and that has no copy of a primary: only allow-notify */
-    free(g_gr.entry.catalog_master);
-    g_gr.entry.catalog_master = NULL;
-    g_gr.entry.owning_catalog_domain = NULL;
+    free(zone_xr(&g_gr.entry)->catalog_master);
+    zone_x_need(&g_gr.entry)->catalog_master = NULL;
+    zone_x_need(&g_gr.entry)->owning_catalog_domain = NULL;
     build_notify(&q, "member.example.", NULL);
     ask(&q, "member.example.", 6, MASTER, false, &r);
     CHECK(&r, r.rcode == 5 && !atomic_load(&g_gr.entry.refresh_now));
@@ -880,7 +880,7 @@ static void test_notify_server_stmt_key(void) {
     g_gr.entry.is_catalog_member = true;
     g_gr.entry.is_secondary = true;
     g_gr.entry.source = ZONE_SRC_CATALOG;
-    g_gr.entry.owning_catalog_domain = (char *)"catalog.example.";
+    zone_x_need(&g_gr.entry)->owning_catalog_domain = (char *)"catalog.example.";
     notify_expect(&q, "member.example.", k2, MASTER, 0, "member: server key accepted");
     notify_expect(&q, "member.example.", k1, MASTER, 5, "member: catalog zone tsig-key refused when a server key covers the primary");
     notify_expect(&q, "member.example.", NULL, MASTER, 5, "member: unsigned refused");
@@ -896,15 +896,15 @@ static void test_notify_server_stmt_key(void) {
     g_gr.entry.is_catalog_member = true;
     g_gr.entry.is_secondary = true;
     g_gr.entry.source = ZONE_SRC_CATALOG;
-    g_gr.entry.owning_catalog_domain = (char *)"catalog.example.";
-    g_gr.entry.catalog_master = calloc(1, sizeof(*g_gr.entry.catalog_master));
-    assert(g_gr.entry.catalog_master);
-    strncpy(g_gr.entry.catalog_master->ip, MASTER, sizeof(g_gr.entry.catalog_master->ip) - 1);
-    strncpy(g_gr.entry.catalog_master->zone_key, "k1", sizeof(g_gr.entry.catalog_master->zone_key) - 1);
+    zone_x_need(&g_gr.entry)->owning_catalog_domain = (char *)"catalog.example.";
+    zone_x_need(&g_gr.entry)->catalog_master = calloc(1, sizeof(*zone_xr(&g_gr.entry)->catalog_master));
+    assert(zone_xr(&g_gr.entry)->catalog_master);
+    strncpy(zone_xr(&g_gr.entry)->catalog_master->ip, MASTER, sizeof(zone_xr(&g_gr.entry)->catalog_master->ip) - 1);
+    strncpy(zone_xr(&g_gr.entry)->catalog_master->zone_key, "k1", sizeof(zone_xr(&g_gr.entry)->catalog_master->zone_key) - 1);
     notify_expect(&q, "member.example.", k2, MASTER, 0, "member copy: server key accepted");
     notify_expect(&q, "member.example.", k1, MASTER, 5, "member copy: zone key refused when a server key covers the primary");
     notify_expect(&q, "member.example.", NULL, MASTER, 5, "member copy: unsigned refused");
-    strncpy(g_gr.entry.catalog_master->key, "k1", sizeof(g_gr.entry.catalog_master->key) - 1);
+    strncpy(zone_xr(&g_gr.entry)->catalog_master->key, "k1", sizeof(zone_xr(&g_gr.entry)->catalog_master->key) - 1);
     notify_expect(&q, "member.example.", k1, MASTER, 0, "member copy: element key above the server key");
     notify_expect(&q, "member.example.", k2, MASTER, 5, "member copy: server key refused when the element has one");
     free_server_config_fields(cfg); free(cfg);

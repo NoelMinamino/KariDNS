@@ -526,9 +526,9 @@ static void test_tlv_rejects(void) {
     /* unknown tags: beyond the table and 0 */
     kdb_enc_reset(&e); m_hello(&e, 1);
     kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_HELLO);
-    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "x"); kdb_enc_str(&e, 3, "y"); kdb_enc_u32(&e, 4, 1); kdb_enc_u8(&e, 5, 0);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "x"); kdb_enc_str(&e, 3, "y"); kdb_enc_u32(&e, 4, 1); kdb_enc_u8(&e, 6, 0);
     kdb_enc_end(&e);
-    CHECK_RC("unknown tag 5", send_enc(KDB_S_AWAIT_HELLO, &e), KDB_E_TLV_UNKNOWN);
+    CHECK_RC("unknown tag 6", send_enc(KDB_S_AWAIT_HELLO, &e), KDB_E_TLV_UNKNOWN);
     {   /* (the encoder refuses tag 0 itself; the body is made by hand) */
         const uint8_t tag0[] = { 0, 0, 0, 1, 1 };
         kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_HELLO);
@@ -1299,6 +1299,63 @@ static int write_seed(const char *dir, const char *name, uint8_t selector, const
     return 0;
 }
 
+/* ---------------------------------------------------------------- the store protocol (0.7 WP7a): MANIFEST / CHANGES, CONFIG cursors, FETCH_REQ source id */
+static void ms_begin(kdb_enc_t *e, uint64_t batch, uint16_t view, uint64_t count, uint64_t cursor, uint8_t valid, uint32_t flags, const char *ident) {
+    kdb_enc_begin(e, KDB_T_MANIFEST_BEGIN);
+    kdb_enc_u64(e, 1, batch); kdb_enc_u16(e, 2, view); kdb_enc_u64(e, 3, count); kdb_enc_u64(e, 4, cursor); kdb_enc_u8(e, 5, valid);
+    if (ident) kdb_enc_bytes(e, 6, ident, strlen(ident));
+    kdb_enc_u32(e, 7, flags);
+    kdb_enc_end(e);
+}
+static void ms_page(kdb_enc_t *e, uint64_t batch, uint16_t view, uint32_t page, int n, int64_t first) {
+    uint8_t dig[KDB_DIGEST_LEN];
+    memset(dig, 0x42, sizeof(dig));
+    kdb_enc_begin(e, KDB_T_MANIFEST);
+    kdb_enc_u64(e, 1, batch); kdb_enc_u16(e, 2, view); kdb_enc_u32(e, 3, page);
+    for (int i = 0; i < n; i++) {
+        char nm[32];
+        snprintf(nm, sizeof(nm), "z%lld.test.", (long long)(first + i));
+        kdb_enc_nest_begin(e, 4);
+        kdb_enc_i64(e, 1, first + i); kdb_enc_name(e, 2, nm); kdb_enc_u8(e, 3, (uint8_t)(i % 3)); kdb_enc_u64(e, 4, (uint64_t)i); kdb_enc_u64(e, 5, 1700000000u + (uint64_t)i);
+        if (i % 2) kdb_enc_u8(e, 6, KDB_EF_STAMPED);
+        if (i == 0) kdb_enc_u32(e, 7, 77);
+        if (i == 1) kdb_enc_bytes(e, 8, dig, sizeof(dig));
+        kdb_enc_nest_end(e);
+    }
+    kdb_enc_end(e);
+}
+static void ms_end(kdb_enc_t *e, uint64_t batch, uint16_t view, uint64_t n, uint64_t skipped, uint64_t cursor, uint8_t valid, uint8_t complete, const char *ident) {
+    kdb_enc_begin(e, KDB_T_MANIFEST_END);
+    kdb_enc_u64(e, 1, batch); kdb_enc_u16(e, 2, view); kdb_enc_u64(e, 3, n); kdb_enc_u64(e, 4, skipped); kdb_enc_u64(e, 5, cursor); kdb_enc_u8(e, 6, valid);
+    if (ident) kdb_enc_bytes(e, 7, ident, strlen(ident));
+    kdb_enc_u8(e, 8, complete);
+    kdb_enc_end(e);
+}
+/* entries: 1 upsert (stamped, forced, serial), 2 upsert (plain), 3 delete without a name, 4 delete with a name */
+static void ms_changes_hdr(kdb_enc_t *e, uint64_t batch, uint16_t view, uint64_t cursor, uint8_t last, const char *ident) {
+    kdb_enc_begin(e, KDB_T_CHANGES);
+    kdb_enc_u64(e, 1, batch); kdb_enc_u16(e, 2, view); kdb_enc_u64(e, 3, cursor); kdb_enc_u8(e, 4, last);
+    if (ident) kdb_enc_bytes(e, 5, ident, strlen(ident));
+}
+static void ms_entry(kdb_enc_t *e, int64_t id, uint8_t op, const char *name, int kind, uint8_t flags) {
+    kdb_enc_nest_begin(e, 6);
+    kdb_enc_i64(e, 1, id); kdb_enc_u8(e, 2, op);
+    if (name) kdb_enc_name(e, 3, name);
+    if (kind >= 0) kdb_enc_u8(e, 4, (uint8_t)kind);
+    if (op == KDB_CH_UPSERT) { kdb_enc_u64(e, 5, 9); kdb_enc_u64(e, 6, 1700000001u); }
+    if (flags) kdb_enc_u8(e, 7, flags);
+    if (flags & KDB_EF_FORCE) kdb_enc_u32(e, 8, 4242);
+    kdb_enc_nest_end(e);
+}
+static void ms_changes(kdb_enc_t *e, uint64_t batch, uint16_t view, uint64_t cursor, uint8_t last) {
+    ms_changes_hdr(e, batch, view, cursor, last, "sqlite3:1:2");
+    ms_entry(e, 1, KDB_CH_UPSERT, "a.test.", 0, KDB_EF_STAMPED | KDB_EF_FORCE);
+    ms_entry(e, 2, KDB_CH_UPSERT, "b.test.", 2, 0);
+    ms_entry(e, 3, KDB_CH_DELETE, NULL, -1, 0);
+    ms_entry(e, 4, KDB_CH_DELETE, "d.test.", -1, 0);
+    kdb_enc_end(e);
+}
+
 static int gen_corpus_fetch(const char *dir);
 
 static int gen_corpus(const char *dir) {
@@ -1343,6 +1400,13 @@ static int gen_corpus(const char *dir) {
     kdb_enc_reset(&e);        /* B9: the auto reload report between two batches */
     m_batch_begin(&e, 2); m_batch_end(&e, 2, 0, 0, 0); m_auto_status(&e, 3); m_batch_begin(&e, 3); m_batch_end(&e, 3, 0, 0, 0);
     rc |= write_seed(dir, "seed_loader_auto_status.bin", 0xC0, &e);
+    kdb_enc_reset(&e);        /* 0.7 WP7a: a pass and a drain (the harness starts in READY: BATCH_BEGIN first) */
+    m_batch_begin(&e, 7); ms_begin(&e, 7, 1, 10, 55, 1, 0, "sqlite3:1:2"); ms_page(&e, 7, 1, 0, 3, 1); ms_page(&e, 7, 1, 1, 2, 4);
+    ms_end(&e, 7, 1, 5, 1, 55, 1, 1, "sqlite3:1:2"); ms_changes(&e, 7, 1, 60, 1); m_zone_delete(&e); m_batch_end(&e, 7, 7, 0, 3);
+    rc |= write_seed(dir, "seed_loader_store.bin", 0xC0, &e);
+    kdb_enc_reset(&e);
+    m_batch_begin(&e, 7); ms_begin(&e, 7, 0, 0, 0, 0, 2, NULL); ms_page(&e, 7, 0, 0, 2, 1); ms_end(&e, 7, 0, 2, 0, 0, 0, 0, NULL); m_batch_end(&e, 7, 2, 0, 0);
+    rc |= write_seed(dir, "seed_loader_store_plain.bin", 0xC1, &e);
     kdb_enc_free(&e);
     return rc | gen_corpus_fetch(dir);
 }
@@ -1694,8 +1758,8 @@ static void test_fetch_req_and_inventory(void) {
     CHECK_RC("mode 2", dec_backend(&e, &m, why), KDB_E_RANGE);
     kdb_enc_reset(&e); fz_fetch_req(&e, 1, NVIEWS, ZN, 0, 0); kdb_enc_end(&e);
     CHECK_RC("view out of range", dec_backend(&e, &m, why), KDB_E_RANGE);
-    kdb_enc_reset(&e); fz_fetch_req(&e, 1, 0, ZN, 0, 0); kdb_enc_u8(&e, 8, 1); kdb_enc_end(&e);
-    CHECK_RC("unknown tag 8", dec_backend(&e, &m, why), KDB_E_TLV_UNKNOWN);
+    kdb_enc_reset(&e); fz_fetch_req(&e, 1, 0, ZN, 0, 0); kdb_enc_u8(&e, 9, 1); kdb_enc_end(&e);
+    CHECK_RC("unknown tag 9", dec_backend(&e, &m, why), KDB_E_TLV_UNKNOWN);
     kdb_enc_reset(&e); fz_fetch_req(&e, 1, 0, ZN, 0, 0); kdb_enc_u8(&e, 5, 1); kdb_enc_end(&e);
     CHECK_RC("duplicate tag", dec_backend(&e, &m, why), KDB_E_TLV_DUP);
     kdb_enc_reset(&e); fz_fetch_req(&e, 1, 0, "not canonical", 0, 0); kdb_enc_end(&e);
@@ -2561,6 +2625,260 @@ static int gen_corpus_fetch(const char *dir) {
     return rc;
 }
 
+static kdb_rc_t dec_loader(const kdb_enc_t *e, kdb_msg_t *m, char *why) {
+    kdb_framer_t f;
+    kdb_frame_t fr;
+    kdb_framer_init(&f, KDB_FROM_LOADER, g_rbuf, sizeof(g_rbuf));
+    kdb_rc_t rc = kdb_framer_feed(&f, e->buf, e->len);
+    if (rc == KDB_OK) rc = kdb_framer_next(&f, &fr);
+    if (rc != KDB_OK) { snprintf(why, KDB_REASON_LEN, "%s", f.reason); return rc; }
+    return kdb_decode(&fr, NVIEWS, m, why, KDB_REASON_LEN);
+}
+
+static void test_store_proto(void) {
+    printf("[store protocol: HELLO features, CONFIG cursors, FETCH_REQ source id, MANIFEST, CHANGES]\n");
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    kdb_msg_t m;
+    char why[KDB_REASON_LEN];
+
+    /* HELLO tag 5 (features) is optional */
+    kdb_enc_begin(&e, KDB_T_HELLO); kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "x"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 1); kdb_enc_u32(&e, 5, KDB_FEAT_STORE); kdb_enc_end(&e);
+    CHECK_RC("HELLO with features", dec_loader(&e, &m, why), KDB_OK);
+    CHECK(m.u.hello.features == KDB_FEAT_STORE);
+    kdb_enc_reset(&e); m_hello(&e, 1);
+    CHECK_RC("HELLO without", dec_loader(&e, &m, why), KDB_OK);
+    CHECK(m.u.hello.features == 0);
+
+    /* CONFIG: store_proto and, per view, the cursor and the identity */
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_CONFIG); kdb_enc_u64(&e, 1, 8); kdb_enc_str(&e, 2, "sqlite3");
+    kdb_enc_nest_begin(&e, 4);
+    kdb_enc_u16(&e, 1, 0); kdb_enc_str(&e, 2, "a"); kdb_enc_u8(&e, 5, 0); kdb_enc_u32(&e, 6, 2); kdb_enc_u32(&e, 7, 1000); kdb_enc_u64(&e, 8, 10); kdb_enc_u64(&e, 9, 20);
+    kdb_enc_u64(&e, 11, 123456789012ull); kdb_enc_u8(&e, 12, 1); kdb_enc_bytes(&e, 13, "sqlite3:33:d734c", 16);
+    kdb_enc_nest_end(&e);
+    kdb_enc_nest_begin(&e, 4);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "b"); kdb_enc_u8(&e, 5, 0); kdb_enc_u32(&e, 6, 2); kdb_enc_u32(&e, 7, 1000); kdb_enc_u64(&e, 8, 10); kdb_enc_u64(&e, 9, 20);
+    kdb_enc_u64(&e, 11, 5); kdb_enc_u8(&e, 12, 0);                       /* a cursor that is not valid is none */
+    kdb_enc_nest_end(&e);
+    kdb_enc_nest_begin(&e, 4);
+    kdb_enc_u16(&e, 1, 2); kdb_enc_str(&e, 2, "c"); kdb_enc_u8(&e, 5, 0); kdb_enc_u32(&e, 6, 2); kdb_enc_u32(&e, 7, 1000); kdb_enc_u64(&e, 8, 10); kdb_enc_u64(&e, 9, 20);
+    kdb_enc_nest_end(&e);
+    kdb_enc_u8(&e, 10, 1);
+    kdb_enc_end(&e);
+    CHECK_RC("CONFIG with cursors", dec_backend(&e, &m, why), KDB_OK);
+    CHECK(m.u.config.store_proto && m.u.config.n_views == 3);
+    {
+        kdb_iter_t it;
+        kdb_config_view_t v;
+        kdb_config_views(&m, &it);
+        CHECK(kdb_config_views_next(&it, &v) && v.has_cursor && v.cursor == 123456789012ull && v.ident_len == 16 && memcmp(v.ident, "sqlite3:33:d734c", 16) == 0);
+        CHECK(kdb_config_views_next(&it, &v) && !v.has_cursor && v.cursor == 0 && v.ident_len == 0);
+        CHECK(kdb_config_views_next(&it, &v) && !v.has_cursor && v.ident_len == 0);
+    }
+    kdb_enc_reset(&e); m_config(&e);
+    CHECK_RC("CONFIG of the legacy protocol", dec_backend(&e, &m, why), KDB_OK);
+    CHECK(!m.u.config.store_proto);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_CONFIG); kdb_enc_u64(&e, 1, 8); kdb_enc_str(&e, 2, "sqlite3"); kdb_enc_u8(&e, 10, 2); kdb_enc_end(&e);
+    CHECK_RC("store_proto 2", dec_backend(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_CONFIG); kdb_enc_u64(&e, 1, 8); kdb_enc_str(&e, 2, "sqlite3");
+    kdb_enc_nest_begin(&e, 4);
+    kdb_enc_u16(&e, 1, 0); kdb_enc_str(&e, 2, "a"); kdb_enc_u8(&e, 5, 0); kdb_enc_u32(&e, 6, 2); kdb_enc_u32(&e, 7, 1000); kdb_enc_u64(&e, 8, 10); kdb_enc_u64(&e, 9, 20);
+    { uint8_t big[KDB_IDENT_MAX + 1]; memset(big, 'x', sizeof(big)); kdb_enc_bytes(&e, 13, big, sizeof(big)); }
+    kdb_enc_nest_end(&e); kdb_enc_end(&e);
+    CHECK_RC("an identity above 64 bytes", dec_backend(&e, &m, why), KDB_E_TLV_LEN);
+
+    /* FETCH_REQ with a source id */
+    kdb_enc_reset(&e); fz_fetch_req(&e, 3, 0, ZN, 0, 0); kdb_enc_i64(&e, 8, 4711); kdb_enc_end(&e);
+    CHECK_RC("FETCH_REQ with a source id", dec_backend(&e, &m, why), KDB_OK);
+    CHECK(m.u.fetch_req.source_id == 4711);
+    kdb_enc_reset(&e); fz_fetch_req(&e, 3, 0, ZN, 0, 0); kdb_enc_end(&e);
+    CHECK_RC("FETCH_REQ without", dec_backend(&e, &m, why), KDB_OK);
+    CHECK(m.u.fetch_req.source_id == 0);
+    kdb_enc_reset(&e); fz_fetch_req(&e, 3, 0, ZN, 0, 0); kdb_enc_i64(&e, 8, -1); kdb_enc_end(&e);
+    CHECK_RC("FETCH_REQ with a negative source id", dec_backend(&e, &m, why), KDB_E_RANGE);
+
+    /* MANIFEST_BEGIN / MANIFEST / MANIFEST_END */
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 1000, 55, 1, KDB_MF_PLAIN, "sqlite3:1:2");
+    CHECK_RC("MANIFEST_BEGIN", dec_loader(&e, &m, why), KDB_OK);
+    CHECK(m.u.manifest_begin.batch_id == 7 && m.u.manifest_begin.view == 1 && m.u.manifest_begin.count == 1000 && m.u.manifest_begin.cursor == 55 && m.u.manifest_begin.cursor_valid);
+    CHECK(m.u.manifest_begin.ident_len == 11 && memcmp(m.u.manifest_begin.ident, "sqlite3:1:2", 11) == 0 && m.u.manifest_begin.flags == KDB_MF_PLAIN);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL);
+    CHECK_RC("MANIFEST_BEGIN without an identity", dec_loader(&e, &m, why), KDB_OK);
+    CHECK(m.u.manifest_begin.ident_len == 0 && !m.u.manifest_begin.cursor_valid);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 2, 0, NULL);
+    CHECK_RC("cursor_valid 2", dec_loader(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 4, NULL);
+    CHECK_RC("an unknown flag", dec_loader(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); ms_begin(&e, 7, NVIEWS, 0, 0, 0, 0, NULL);
+    CHECK_RC("a view that is not configured", dec_loader(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_MANIFEST_BEGIN); kdb_enc_u64(&e, 1, 7); kdb_enc_u16(&e, 2, 0); kdb_enc_u64(&e, 3, 0); kdb_enc_u64(&e, 4, 0); kdb_enc_u8(&e, 5, 0); kdb_enc_end(&e);
+    CHECK_RC("MANIFEST_BEGIN without flags", dec_loader(&e, &m, why), KDB_E_TLV_MISSING);
+
+    kdb_enc_reset(&e); ms_page(&e, 7, 1, 3, 5, 100);
+    CHECK_RC("MANIFEST", dec_loader(&e, &m, why), KDB_OK);
+    CHECK(m.u.manifest.page == 3 && m.u.manifest.view == 1 && m.u.manifest.n_entries == 5);
+    {
+        kdb_iter_t it;
+        kdb_manifest_entry_t en;
+        kdb_manifest_entries(&m, &it);
+        CHECK(kdb_manifest_entries_next(&it, &en) && en.source_id == 100 && en.kind == 0 && !en.stamped && en.has_serial && en.serial == 77 && !en.has_digest);
+        CHECK_STR(en.name, "z100.test.");
+        CHECK(kdb_manifest_entries_next(&it, &en) && en.source_id == 101 && en.kind == 1 && en.stamped && en.stamp_gen == 1 && en.stamp_time == 1700000001u && !en.has_serial && en.has_digest && en.digest[0] == 0x42);
+        CHECK(kdb_manifest_entries_next(&it, &en) && en.kind == 2 && !en.stamped);
+        CHECK(kdb_manifest_entries_next(&it, &en) && kdb_manifest_entries_next(&it, &en) && en.source_id == 104);
+        CHECK(!kdb_manifest_entries_next(&it, &en));
+    }
+    kdb_enc_reset(&e); ms_page(&e, 7, 1, 0, 0, 0);
+    CHECK_RC("an empty page", dec_loader(&e, &m, why), KDB_OK);
+    CHECK(m.u.manifest.n_entries == 0);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_MANIFEST); kdb_enc_u64(&e, 1, 7); kdb_enc_u16(&e, 2, 1); kdb_enc_u32(&e, 3, 0);
+    kdb_enc_nest_begin(&e, 4); kdb_enc_i64(&e, 1, 1); kdb_enc_name(&e, 2, "a.test."); kdb_enc_u8(&e, 3, 3); kdb_enc_u64(&e, 4, 0); kdb_enc_u64(&e, 5, 0); kdb_enc_nest_end(&e); kdb_enc_end(&e);
+    CHECK_RC("kind 3", dec_loader(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_MANIFEST); kdb_enc_u64(&e, 1, 7); kdb_enc_u16(&e, 2, 1); kdb_enc_u32(&e, 3, 0);
+    kdb_enc_nest_begin(&e, 4); kdb_enc_i64(&e, 1, 1); kdb_enc_name(&e, 2, "a.test."); kdb_enc_u8(&e, 3, 0); kdb_enc_u64(&e, 4, 0); kdb_enc_u64(&e, 5, 0); kdb_enc_u8(&e, 6, KDB_EF_FORCE); kdb_enc_nest_end(&e); kdb_enc_end(&e);
+    CHECK_RC("the force flag is not for a manifest entry", dec_loader(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_MANIFEST); kdb_enc_u64(&e, 1, 7); kdb_enc_u16(&e, 2, 1); kdb_enc_u32(&e, 3, 0);
+    kdb_enc_nest_begin(&e, 4); kdb_enc_i64(&e, 1, 1); kdb_enc_name(&e, 2, "not canonical"); kdb_enc_u8(&e, 3, 0); kdb_enc_u64(&e, 4, 0); kdb_enc_u64(&e, 5, 0); kdb_enc_nest_end(&e); kdb_enc_end(&e);
+    CHECK_RC("a name that is not canonical", dec_loader(&e, &m, why), KDB_E_TLV_NAME);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_MANIFEST); kdb_enc_u64(&e, 1, 7); kdb_enc_u16(&e, 2, 1); kdb_enc_u32(&e, 3, 0);
+    kdb_enc_nest_begin(&e, 4); kdb_enc_i64(&e, 1, 1); kdb_enc_name(&e, 2, "a.test."); kdb_enc_u8(&e, 3, 0); kdb_enc_u64(&e, 4, 0); kdb_enc_nest_end(&e); kdb_enc_end(&e);
+    CHECK_RC("an entry without its stamp", dec_loader(&e, &m, why), KDB_E_TLV_MISSING);
+
+    kdb_enc_reset(&e); ms_end(&e, 7, 1, 5, 2, 55, 1, 1, "sqlite3:1:2");
+    CHECK_RC("MANIFEST_END", dec_loader(&e, &m, why), KDB_OK);
+    CHECK(m.u.manifest_end.n_entries == 5 && m.u.manifest_end.n_skipped == 2 && m.u.manifest_end.cursor == 55 && m.u.manifest_end.cursor_valid && m.u.manifest_end.complete && m.u.manifest_end.ident_len == 11);
+    kdb_enc_reset(&e); ms_end(&e, 7, 1, 5, 0, 0, 0, 0, NULL);
+    CHECK_RC("MANIFEST_END, aborted", dec_loader(&e, &m, why), KDB_OK);
+    CHECK(!m.u.manifest_end.complete && !m.u.manifest_end.cursor_valid);
+    kdb_enc_reset(&e); ms_end(&e, 7, 1, 5, 0, 0, 0, 2, NULL);
+    CHECK_RC("complete 2", dec_loader(&e, &m, why), KDB_E_RANGE);
+
+    /* CHANGES */
+    kdb_enc_reset(&e); ms_changes(&e, 7, 2, 99, 1);
+    CHECK_RC("CHANGES", dec_loader(&e, &m, why), KDB_OK);
+    CHECK(m.u.changes.batch_id == 7 && m.u.changes.view == 2 && m.u.changes.cursor == 99 && m.u.changes.last && m.u.changes.n_entries == 4 && m.u.changes.ident_len == 11);
+    {
+        kdb_iter_t it;
+        kdb_changes_entry_t en;
+        kdb_changes_entries(&m, &it);
+        CHECK(kdb_changes_entries_next(&it, &en) && en.source_id == 1 && en.op == KDB_CH_UPSERT && en.has_name && en.kind == 0 && en.stamped && en.force && en.has_serial && en.serial == 4242);
+        CHECK_STR(en.name, "a.test.");
+        CHECK(en.stamp_gen == 9 && en.stamp_time == 1700000001u);
+        CHECK(kdb_changes_entries_next(&it, &en) && en.source_id == 2 && en.kind == 2 && !en.stamped && !en.force && !en.has_serial);
+        CHECK(kdb_changes_entries_next(&it, &en) && en.source_id == 3 && en.op == KDB_CH_DELETE && !en.has_name && en.name[0] == '\0');
+        CHECK(kdb_changes_entries_next(&it, &en) && en.op == KDB_CH_DELETE && en.has_name);
+        CHECK_STR(en.name, "d.test.");
+        CHECK(!kdb_changes_entries_next(&it, &en));
+    }
+    kdb_enc_reset(&e); ms_changes_hdr(&e, 7, 0, 1, 0, NULL); kdb_enc_end(&e);
+    CHECK_RC("CHANGES without entries", dec_loader(&e, &m, why), KDB_OK);
+    CHECK(m.u.changes.n_entries == 0 && !m.u.changes.last);
+    kdb_enc_reset(&e); ms_changes_hdr(&e, 7, 0, 1, 0, NULL); ms_entry(&e, 1, 0, "a.test.", 0, 0); kdb_enc_end(&e);
+    CHECK_RC("op 0", dec_loader(&e, &m, why), KDB_E_TLV_MISSING);
+    kdb_enc_reset(&e); ms_changes_hdr(&e, 7, 0, 1, 0, NULL); ms_entry(&e, 1, 3, "a.test.", 0, 0); kdb_enc_end(&e);
+    CHECK_RC("op 3", dec_loader(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); ms_changes_hdr(&e, 7, 0, 1, 0, NULL); ms_entry(&e, 1, KDB_CH_UPSERT, NULL, 0, 0); kdb_enc_end(&e);
+    CHECK_RC("an upsert without a name", dec_loader(&e, &m, why), KDB_E_TLV_MISSING);
+    kdb_enc_reset(&e); ms_changes_hdr(&e, 7, 0, 1, 0, NULL); ms_entry(&e, 1, KDB_CH_UPSERT, "a.test.", -1, 0); kdb_enc_end(&e);
+    CHECK_RC("an upsert without a kind", dec_loader(&e, &m, why), KDB_E_TLV_MISSING);
+    kdb_enc_reset(&e); ms_changes_hdr(&e, 7, 0, 1, 0, NULL); ms_entry(&e, 1, KDB_CH_DELETE, "x y", -1, 0); kdb_enc_end(&e);
+    CHECK_RC("a delete with a name that is not canonical", dec_loader(&e, &m, why), KDB_E_TLV_NAME);
+    kdb_enc_reset(&e); ms_changes_hdr(&e, 7, 0, 1, 2, NULL); kdb_enc_end(&e);
+    CHECK_RC("last 2", dec_loader(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); ms_changes_hdr(&e, 7, 0, 1, 0, NULL); ms_entry(&e, 1, KDB_CH_UPSERT, "a.test.", 0, 4); kdb_enc_end(&e);
+    CHECK_RC("an unknown entry flag", dec_loader(&e, &m, why), KDB_E_RANGE);
+
+    /* the Backend's state machine: a pass and a drain in a batch (batch 7: sess_to() sends BATCH_BEGIN 7) */
+    kdb_enc_reset(&e);
+    ms_begin(&e, 7, 1, 10, 55, 1, 0, "sqlite3:1:2");
+    ms_page(&e, 7, 1, 0, 3, 1);
+    ms_page(&e, 7, 1, 1, 2, 4);
+    ms_end(&e, 7, 1, 5, 1, 55, 1, 1, "sqlite3:1:2");
+    ms_changes(&e, 7, 1, 60, 1);
+    m_zone_delete(&e);
+    m_batch_end(&e, 7, 5 + 2, 0, 2 + 1);
+    CHECK_RC("a pass, a drain, a ZONE_DELETE, BATCH_END with the counts", send_enc(KDB_S_IN_BATCH, &e), KDB_OK);
+    {
+        sess_t *s = malloc(sizeof(*s));
+        sess_init(s, &LIM);
+        sess_to(s, KDB_S_IN_BATCH);
+        CHECK_RC("the same, in one go", sess_feed(s, e.buf, e.len, 0), KDB_OK);
+        CHECK(s->sm.state == KDB_S_READY);
+        sess_init(s, &LIM);
+        sess_to(s, KDB_S_IN_BATCH);
+        CHECK_RC("... and a byte at a time", sess_feed(s, e.buf, e.len, 1), KDB_OK);
+        CHECK(s->sm.state == KDB_S_READY && s->sm.n_zones == 7 && s->sm.n_deleted == 3 && !s->sm.man_open);
+        free(s);
+    }
+    kdb_enc_reset(&e); ms_begin(&e, 7, 0, 0, 0, 0, 0, NULL); ms_end(&e, 7, 0, 0, 0, 0, 0, 1, NULL); m_batch_end(&e, 7, 0, 0, 0);
+    CHECK_RC("an empty pass", send_enc(KDB_S_IN_BATCH, &e), KDB_OK);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 0, 0, 0, 0, 0, NULL); ms_page(&e, 7, 0, 0, 2, 1); ms_end(&e, 7, 0, 2, 0, 0, 0, 0, NULL); m_batch_end(&e, 7, 2, 0, 0);
+    CHECK_RC("an aborted pass (complete 0) is still a pass", send_enc(KDB_S_IN_BATCH, &e), KDB_OK);
+
+    kdb_enc_reset(&e); ms_page(&e, 7, 1, 0, 1, 1);
+    CHECK_RC("MANIFEST without MANIFEST_BEGIN", send_enc(KDB_S_IN_BATCH, &e), KDB_E_STATE);
+    kdb_enc_reset(&e); ms_end(&e, 7, 1, 0, 0, 0, 0, 1, NULL);
+    CHECK_RC("MANIFEST_END without MANIFEST_BEGIN", send_enc(KDB_S_IN_BATCH, &e), KDB_E_STATE);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL);
+    CHECK_RC("MANIFEST_BEGIN outside a batch", send_enc(KDB_S_READY, &e), KDB_E_STATE);
+    kdb_enc_reset(&e); ms_begin(&e, 8, 1, 0, 0, 0, 0, NULL);
+    CHECK_RC("MANIFEST_BEGIN of another batch", send_enc(KDB_S_IN_BATCH, &e), KDB_E_SEQ);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL);
+    CHECK_RC("MANIFEST_BEGIN inside a pass", send_enc(KDB_S_IN_BATCH, &e), KDB_E_STATE);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL); ms_page(&e, 7, 1, 1, 1, 1);
+    CHECK_RC("a page that skips one", send_enc(KDB_S_IN_BATCH, &e), KDB_E_SEQ);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL); ms_page(&e, 7, 1, 0, 1, 1); ms_page(&e, 7, 1, 0, 1, 2);
+    CHECK_RC("a page twice", send_enc(KDB_S_IN_BATCH, &e), KDB_E_SEQ);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL); ms_page(&e, 7, 2, 0, 1, 1);
+    CHECK_RC("a page of another view", send_enc(KDB_S_IN_BATCH, &e), KDB_E_SEQ);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL); ms_page(&e, 8, 1, 0, 1, 1);
+    CHECK_RC("a page of another batch", send_enc(KDB_S_IN_BATCH, &e), KDB_E_SEQ);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL); ms_page(&e, 7, 1, 0, 2, 1); ms_end(&e, 7, 1, 3, 0, 0, 0, 1, NULL);
+    CHECK_RC("MANIFEST_END with another count", send_enc(KDB_S_IN_BATCH, &e), KDB_E_COUNT);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL); ms_page(&e, 7, 1, 0, 2, 1); ms_end(&e, 7, 2, 2, 0, 0, 0, 1, NULL);
+    CHECK_RC("MANIFEST_END of another view", send_enc(KDB_S_IN_BATCH, &e), KDB_E_SEQ);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL); m_batch_end(&e, 7, 0, 0, 0);
+    CHECK_RC("BATCH_END inside a pass", send_enc(KDB_S_IN_BATCH, &e), KDB_E_STATE);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL); m_zone_begin(&e, 1, ZN, 10);
+    CHECK_RC("ZONE_BEGIN inside a pass", send_enc(KDB_S_IN_BATCH, &e), KDB_E_STATE);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL); m_zone_delete(&e);
+    CHECK_RC("ZONE_DELETE inside a pass", send_enc(KDB_S_IN_BATCH, &e), KDB_E_STATE);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL); ms_changes(&e, 7, 1, 60, 1);
+    CHECK_RC("CHANGES inside a pass", send_enc(KDB_S_IN_BATCH, &e), KDB_E_STATE);
+    kdb_enc_reset(&e); ms_changes(&e, 8, 1, 60, 1);
+    CHECK_RC("CHANGES of another batch", send_enc(KDB_S_IN_BATCH, &e), KDB_E_SEQ);
+    kdb_enc_reset(&e); ms_changes(&e, 7, 1, 60, 1);
+    CHECK_RC("CHANGES outside a batch", send_enc(KDB_S_READY, &e), KDB_E_STATE);
+    kdb_enc_reset(&e); ms_changes(&e, 7, 1, 60, 0); ms_changes(&e, 7, 1, 60, 1); m_batch_end(&e, 7, 4, 0, 4);
+    CHECK_RC("two CHANGES in a drain, BATCH_END with the counts", send_enc(KDB_S_IN_BATCH, &e), KDB_OK);
+    kdb_enc_reset(&e); ms_changes(&e, 7, 1, 60, 1); m_batch_end(&e, 7, 3, 0, 2);
+    CHECK_RC("BATCH_END with the wrong count of upserts", send_enc(KDB_S_IN_BATCH, &e), KDB_E_COUNT);
+    kdb_enc_reset(&e); ms_changes(&e, 7, 1, 60, 1); m_batch_end(&e, 7, 2, 0, 1);
+    CHECK_RC("BATCH_END with the wrong count of deletes", send_enc(KDB_S_IN_BATCH, &e), KDB_E_COUNT);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL); ms_page(&e, 7, 1, 0, 2, 1); ms_end(&e, 7, 1, 2, 0, 0, 0, 1, NULL); m_batch_end(&e, 7, 1, 0, 0);
+    CHECK_RC("BATCH_END with the wrong count of manifest entries", send_enc(KDB_S_IN_BATCH, &e), KDB_E_COUNT);
+    /* the types have names; the Backend cannot send them */
+    CHECK_STR(kdb_type_name(KDB_T_MANIFEST_BEGIN), "MANIFEST_BEGIN");
+    CHECK_STR(kdb_type_name(KDB_T_MANIFEST), "MANIFEST");
+    CHECK_STR(kdb_type_name(KDB_T_MANIFEST_END), "MANIFEST_END");
+    CHECK_STR(kdb_type_name(KDB_T_CHANGES), "CHANGES");
+    kdb_enc_reset(&e); ms_changes(&e, 7, 1, 60, 1);
+    CHECK_RC("a loader message on the Backend's stream", dec_backend(&e, &m, why), KDB_E_TYPE);
+    /* the encoder keeps every message under the limit: 16384 entries of a long name are above 1 MiB, and the encoder says so */
+    kdb_enc_reset(&e);
+    kdb_enc_begin(&e, KDB_T_MANIFEST); kdb_enc_u64(&e, 1, 7); kdb_enc_u16(&e, 2, 1); kdb_enc_u32(&e, 3, 0);
+    {
+        char nm[260];
+        memset(nm, 'a', sizeof(nm));
+        nm[63] = '.'; nm[127] = '.'; nm[191] = '.'; nm[250] = '.'; nm[251] = '\0';
+        for (int i = 0; i < 4000; i++) {
+            kdb_enc_nest_begin(&e, 4); kdb_enc_i64(&e, 1, i + 1); kdb_enc_name(&e, 2, nm); kdb_enc_u8(&e, 3, 0); kdb_enc_u64(&e, 4, 0); kdb_enc_u64(&e, 5, 0); kdb_enc_nest_end(&e);
+        }
+    }
+    CHECK(kdb_enc_end(&e) != 0 && e.err);
+    kdb_enc_free(&e);
+}
+
 /* the names the loader and the Backend log for a result code and a message type: one each, none empty, "?" for the unknown */
 static void test_names(void) {
     printf("result code and message type names\n");
@@ -2601,6 +2919,7 @@ int main(int argc, char **argv) {
     test_fetch_req_and_inventory();
     test_fetch_stream_machine();
     test_hot_list();
+    test_store_proto();
     test_names();
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;

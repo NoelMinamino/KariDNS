@@ -40,6 +40,11 @@
 #define MA_LOADER_ZONE_ALL  180ull          /* per zone, no memory-limit (it streams) */
 #define MA_LOADER_ZONE_LIM  600ull          /* per zone, with memory-limit (it holds the summaries) */
 #define MA_ASSUMED_RECORDS  11              /* the zone the sizes are for when nothing says otherwise: SOA, 2 NS, A, MX, 6 A hosts */
+/* With the zone store (0.7; measured at 10,000,000 zones, 1,100,000 attached): the loader streams and keeps no table of the zones, 22 MB resident at most; the directory is the store's
+ * tables (zt, zc, ix, sx: 1.96 GB at 10M zones, file pages, not heap); in MAP mode the image of an attached zone is a file page too (1,152 of the 2,308 counted bytes of a small zone). */
+#define MA_LOADER_STORE     (20ull << 20)
+#define MA_STORE_TABLE_PER_ZONE 200ull      /* zt + zc + ix + sx per zone (file pages of the store, 196 B measured) */
+#define MA_STORE_IMAGE_PCT  50              /* the share of a zone's counted bytes that is its image, when the store has not said (1,152 of 2,308 B) */
 #define MA_HIGH_MARK_PCT    95              /* the cache manager takes zones out above this share of memory-limit */
 #define MA_HEADROOM_PCT     120             /* the recommended memory-limit: counted x 1.2 (1 / 0.95 for the high mark, x 1.1 for the zones a batch changes: manual, "The limit is a target") */
 #define MA_WORKING_PCT      50              /* WARNING below this share of the zones in memory */
@@ -48,7 +53,8 @@
 #define MA_MIN_FETCH_ZONES  16              /* ERROR: the limit must hold the zones of the reads in flight: fetch-concurrency (at least this many) ... */
 #define MA_FETCH_FACTOR     4               /* ... times this (a read takes room before the manager makes it, and a zone that came in is kept for 100 ms) */
 
-enum { MA_BASIS_ASSUMED = 0, MA_BASIS_RESIDENT, MA_BASIS_RECORDS };
+enum { MA_BASIS_ASSUMED = 0, MA_BASIS_RESIDENT, MA_BASIS_RECORDS, MA_BASIS_STORE };
+enum { MA_STORE_NONE = 0, MA_STORE_MAP, MA_STORE_COPY };       /* ma_in_t.store_mode */
 enum { MA_LEVEL_INFO = 0, MA_LEVEL_NOTICE, MA_LEVEL_WARNING, MA_LEVEL_ERROR };
 
 typedef struct {
@@ -59,6 +65,9 @@ typedef struct {
     uint64_t resident_bytes;
     uint64_t limit;             /* memory-limit, 0 = none */
     uint32_t fetch_conc;        /* fetch-concurrency in force (0 = MA_MIN_FETCH_ZONES) */
+    int store_mode;             /* MA_STORE_*: the zone store (0.7) keeps the zones that are not in memory; MAP maps the images of the zones in memory, COPY reads them into the heap */
+    uint64_t stored_zones;      /* the zones with an image in the store and the bytes of those images (the store counts them: the size of a zone without reading a record) */
+    uint64_t stored_image_bytes;
 } ma_in_t;
 
 typedef struct {
@@ -66,9 +75,12 @@ typedef struct {
     uint64_t zones, records;    /* records: the number used (the basis says how it was found) */
     uint64_t counted_all;       /* what memory-limit would count with every zone in memory */
     uint64_t avg_zone;          /* counted_all / zones */
-    uint64_t backend_all;       /* the Backend with every zone in memory (no limit) */
+    uint64_t backend_all;       /* the Backend with every zone in memory (no limit); with the store: its heap (the mapped file pages are `mapped`) */
     uint64_t loader_all;        /* the loader without memory-limit */
-    uint64_t directory;         /* the directory alone */
+    uint64_t directory;         /* the directory alone (heap; with the store it is the store's tables: `tables`, file pages) */
+    bool copy_mode;             /* with the store: COPY mode (the images of the zones in memory are heap; MAP maps them) */
+    uint64_t tables;            /* the store's tables: file pages that the kernel keeps (page cache), not heap */
+    uint64_t mapped;            /* every file page the Backend maps for the zones: the tables, and in MAP mode the images of the zones in memory */
     uint64_t recommended;       /* memory-limit that keeps every zone in memory, rounded up to MA_ROUND */
     uint64_t working_min;       /* memory-limit that keeps MA_WORKING_PCT of the zones */
     uint64_t fit_min;           /* memory-limit below which the ERROR is said */
@@ -92,6 +104,22 @@ size_t ma_text_advice(char *buf, size_t n, const ma_est_t *e);
 /* the `memory:` line of `karictl dbstatus` (without the label) */
 size_t ma_text_status(char *buf, size_t n, const ma_est_t *e);
 const char *ma_level_name(int level);       /* "ok", "notice", "warning", "error" */
+
+/* ---- ZFS (0.7 store design 3.6) ---- */
+/* On ZFS the images are read with pread() and the ARC is the cache of the store: the Backend's heap, the ARC (vfs.zfs.arc.max), the loader and about a gigabyte for the rest
+ * of the system have to fit in RAM together.  The Backend cannot read kstat / sysctl values in capability mode: karictl (and karicheck) read vfs.zfs.arc.max and hw.physmem
+ * on the host and call this. */
+#define MA_ARC_OTHER        (1ull << 30)    /* the system, the page cache of the rest, the jails' share: 1 GB */
+#define MA_ARC_NOTICE_PCT   85              /* NOTICE above this share of RAM */
+typedef struct {
+    uint64_t backend, arc_max, loader, other;   /* the parts of the sum, bytes */
+    uint64_t total, ram;
+    uint64_t arc_fit;           /* the largest vfs.zfs.arc.max that fits (0 when the rest alone does not fit) */
+    uint32_t pct;               /* total / ram, percent (0 when ram is not known) */
+    int level;                  /* MA_LEVEL_INFO, NOTICE (above MA_ARC_NOTICE_PCT), WARNING (above RAM) */
+} ma_arc_t;
+void ma_arc_sum(uint64_t backend_heap, uint64_t arc_max, uint64_t loader, uint64_t ram, ma_arc_t *out);
+size_t ma_text_arc(char *buf, size_t n, const ma_arc_t *a);
 
 /* ---- at run time ---- */
 #define MA_WINDOW_MS        10000           /* the span the rates are computed over */

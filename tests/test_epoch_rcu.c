@@ -168,6 +168,42 @@ static void test_aux_slot_released_at_thread_exit(void) {
   printf("  [PASS] pinned and in-section threads give the slot back when they end\n");
 }
 
+/* A thread that is in its own worker / slot read section takes no auxiliary slot for the sections it enters inside it: more such threads than the table has slots all get through
+ * (a worker that attaches a stored zone makes an entry in auxiliary sections; with a slot each, 126 workers and the pinned threads used up the table and the claim waited for ever). */
+#define COV_N (MAX_AUX_RCU_READERS + 72)
+static rcu_reader_slot_t g_cov_slot[COV_N];
+static _Atomic int g_cov_in, g_cov_go;
+static void *cov_thread(void *arg) {
+  rcu_reader_slot_t *s = &g_cov_slot[(size_t)(uintptr_t)arg];
+  rcu_slot_reader_enter(s);
+  rcu_aux_read_lock();
+  rcu_aux_read_lock();                                  /* (nested: still no slot) */
+  atomic_fetch_add(&g_cov_in, 1);
+  while (!atomic_load(&g_cov_go)) usleep(1000);
+  rcu_aux_read_unlock();
+  rcu_aux_read_unlock();
+  rcu_slot_reader_exit(s);
+  return NULL;
+}
+
+static void test_aux_covered_by_own_section(void) {
+  printf("[TEST] an auxiliary section inside the thread's own read section claims no slot...\n");
+  int base = count_aux_slots_in_use();
+  pthread_t th[COV_N];
+  alarm(60);                                            /* (the claim would wait for ever) */
+  for (int i = 0; i < COV_N; i++) {
+    atomic_store(&g_cov_slot[i].rcu_observed_epoch, RCU_EPOCH_IDLE);
+    assert(pthread_create(&th[i], NULL, cov_thread, (void *)(uintptr_t)i) == 0);
+  }
+  while (atomic_load(&g_cov_in) < COV_N) usleep(1000);
+  assert(count_aux_slots_in_use() == base);
+  atomic_store(&g_cov_go, 1);
+  for (int i = 0; i < COV_N; i++) assert(pthread_join(th[i], NULL) == 0);
+  alarm(0);
+  assert(count_aux_slots_in_use() == base);
+  printf("  [PASS] %d threads in their own sections, %d auxiliary slots: no slot claimed\n", COV_N, MAX_AUX_RCU_READERS);
+}
+
 /* --- concurrent stress: double buffer reused after the grace period --------- */
 
 #define BUF_WORDS 64
@@ -403,6 +439,7 @@ int main(void) {
   test_publish_order();
   test_aux_slots();
   test_aux_slot_released_at_thread_exit();
+  test_aux_covered_by_own_section();
   test_wait_granularity();
   test_wait_in_reader();
   test_concurrent_reuse();

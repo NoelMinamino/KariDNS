@@ -13,6 +13,8 @@
 #   - minimal-responses yes: the same answer without the NS RRset
 #   - `notify no` and no allow-transfer: the zone keeps no apex (its SOA question reads the zone); with allow-transfer it keeps it
 #   - the apex follows the database: a changed SOA and NS RRset reach the next summary
+# With the zone store (DB_STORE=on, run_db_apex_store_test.sh) there is no summary and no apex block: the zones are stored and not in memory after a restart on the store, and the SOA question
+# attaches the zone from the store (a few microseconds, the loader is not asked); the answer is the answer of the zone in memory by construction, which the byte-for-byte checks still show.
 # Needs root (the loader runs as nobody).  SKIP without karidns, dag, karictl, karidns-dbloader (SQLite3), sqlite3 or perl.
 . "$(dirname "$0")/lib_proc.sh"
 set -u
@@ -44,6 +46,7 @@ trap cleanup EXIT INT TERM
 PASS=0; FAILS=0
 pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
+STORE=${DB_STORE:-off}                              # on: the zone store is the directory (run_db_apex_store_test.sh): there are no summaries, a stored zone is attached for its SOA question
 PORT=$(kari_port 0 $((20000 + $$ % 20000)))
 SECRET="dGVzdC1zZWNyZXQtMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"
 
@@ -96,7 +99,7 @@ conf() {   # conf OPTIONS-LINES
     cat > "$T/k.conf" <<EOF
 options {
     user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT; $1
-    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; memory-limit 64m; fetch-rate 5000; park-timeout 4000; };
+    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; $(store_stmt "$T") memory-limit 64m; fetch-rate 5000; park-timeout 4000; };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
 EOF
@@ -108,25 +111,35 @@ start_srv() {
     i=0
     while [ $i -lt 300 ] && ! grep -q "\[DB\] initial load complete" "$T/srv.log" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     grep -q "\[DB\] initial load complete" "$T/srv.log" && pass "the startup batch is complete" || { fail "no 'initial load complete'"; tail -20 "$T/srv.log"; }
+    store_prefill
     sleep 1
 }
 stat() { $KCTL dbstatus 2>/dev/null | grep '^cache:' | sed -n "s/.* $1=\([0-9]*\).*/\1/p" | tail -1; }
-oom() { $KCTL dbstatus "$1" 2>/dev/null | grep -q "out of memory"; }       # oom ZONE: its data is out of memory
+oom() { $KCTL dbstatus "$1" 2>/dev/null | grep -qE "out of memory|not in memory"; }       # oom ZONE: its data is out of memory
 q() { ./dag @127.0.0.1 -p "$PORT" "$1" A +short +nohexdump +time=5 +tries=1 2>/dev/null | head -1; }
+issued() { $KCTL dbstatus 2>/dev/null | grep '^fetch:' | sed -n 's/.* issued=\([0-9]*\).*/\1/p' | tail -1; }
 probe() { perl tests/db/dns_soa_probe.pl 127.0.0.1 "$PORT" "$@"; }       # probe PROTO NAME QTYPE EDNS DO
 
 echo "== SOA at the apex of a zone that is out of memory"
 conf ""
 start_srv
-RES0=$(stat resident); COLD0=$(stat cold)
+RES0=$(stat resident); COLD0=$(stat cold); ISS0=$(issued)
 echo "  resident ${RES0:-?} bytes, cold ${COLD0:-?}"
 UA=$(probe udp a.test SOA 0 0); EA=$(probe udp a.test SOA 1232 0); TA=$(probe tcp a.test SOA 0 0)
 UC=$(probe udp c.test SOA 0 0); EC=$(probe udp c.test SOA 1232 0); TC=$(probe tcp c.test SOA 0 0)
 RES1=$(stat resident)
-[ "$RES1" = "$RES0" ] && pass "the SOA questions (UDP, UDP + EDNS, TCP) left a.test and c.test out of memory (resident $RES0 -> $RES1)" || fail "resident $RES0 -> $RES1: the zones were read"
+if [ "$STORE" = on ]; then
+    [ "$RES1" -gt "$RES0" ] && [ "$(issued)" = "$ISS0" ] && pass "the SOA questions (UDP, UDP + EDNS, TCP) attached a.test and c.test from the store and asked the loader for nothing (resident $RES0 -> $RES1)" || fail "resident $RES0 -> $RES1, fetch issued $ISS0 -> $(issued)"
+else
+    [ "$RES1" = "$RES0" ] && pass "the SOA questions (UDP, UDP + EDNS, TCP) left a.test and c.test out of memory (resident $RES0 -> $RES1)" || fail "resident $RES0 -> $RES1: the zones were read"
+fi
 case "$UA" in 1234*) pass "a.test answers";; *) fail "a.test: $UA";; esac
 probe udp a.test NS 0 0 > /dev/null          # not an SOA question: the zone is read
-[ "$(stat resident)" -gt "$RES1" ] && pass "an NS question reads the zone (resident grows)" || fail "an NS question did not read the zone"
+if [ "$STORE" = on ]; then
+    ! oom a.test && pass "an NS question is answered from the zone (in memory since its SOA question)" || fail "a.test is not in memory"
+else
+    [ "$(stat resident)" -gt "$RES1" ] && pass "an NS question reads the zone (resident grows)" || fail "an NS question did not read the zone"
+fi
 probe udp c.test NS 0 0 > /dev/null
 sleep 1
 for z in a c; do
@@ -153,7 +166,11 @@ stop_srv
 glue_case() {   # glue_case ZONE ADDRESSES: the answer from the summary (UDP, UDP + EDNS, TCP) is the answer of the zone in memory, which has ADDRESSES address records in Additional
     gz=$1
     su=$(probe udp $gz SOA 0 0); se=$(probe udp $gz SOA 1232 0); st=$(probe tcp $gz SOA 0 0)
-    oom $gz && pass "$gz: the SOA questions (UDP, UDP + EDNS, TCP) are answered from the summary: the zone stays out of memory" || fail "$gz was read for its SOA question"
+    if [ "$STORE" = on ]; then
+        ! oom $gz && pass "$gz: the SOA questions (UDP, UDP + EDNS, TCP) are answered from the zone, attached from the store" || fail "$gz is not in memory after its SOA question"
+    else
+        oom $gz && pass "$gz: the SOA questions (UDP, UDP + EDNS, TCP) are answered from the summary: the zone stays out of memory" || fail "$gz was read for its SOA question"
+    fi
     q www.$gz > /dev/null
     ru=$(probe udp $gz SOA 0 0); re=$(probe udp $gz SOA 1232 0); rt=$(probe tcp $gz SOA 0 0)
     [ -n "$su" ] && [ "$su" = "$ru" ] && pass "$gz: the answer from the summary is the answer of the zone in memory, byte for byte (UDP)" || fail "$gz UDP: summary $su / zone $ru"
@@ -190,14 +207,22 @@ conf "minimal-responses yes;"
 start_srv
 R=$(stat resident)
 MU=$(probe udp a.test SOA 0 0)
-[ "$(stat resident)" = "$R" ] && pass "a.test is answered from the summary" || fail "a.test was read"
+if [ "$STORE" = on ]; then
+    [ "$(stat resident)" -gt "$R" ] && pass "a.test is answered from the zone, attached from the store" || fail "a.test was not attached"
+else
+    [ "$(stat resident)" = "$R" ] && pass "a.test is answered from the summary" || fail "a.test was read"
+fi
 q www.a.test > /dev/null
 MR=$(probe udp a.test SOA 0 0)
 [ -n "$MU" ] && [ "$MU" = "$MR" ] && pass "and it is what the zone in memory gives (with minimal-responses)" || fail "minimal-responses: summary $MU / zone $MR"
 ./dag @127.0.0.1 -p "$PORT" a.test SOA +nohexdump +noall +authority +time=5 +tries=1 > "$T/m.out" 2>&1
 [ ! -s "$T/m.out" ] && pass "... without the NS RRset" || fail "authority section: $(cat "$T/m.out")"
 GU=$(probe udp g.test SOA 0 0)
-oom g.test && pass "g.test (addresses of its NS targets in the summary) is answered from it" || fail "g.test was read"
+if [ "$STORE" = on ]; then
+    ! oom g.test && pass "g.test is answered from the zone, attached from the store" || fail "g.test was not attached"
+else
+    oom g.test && pass "g.test (addresses of its NS targets in the summary) is answered from it" || fail "g.test was read"
+fi
 q www.g.test > /dev/null
 [ -n "$GU" ] && [ "$GU" = "$(probe udp g.test SOA 0 0)" ] && pass "and it is what the zone in memory gives with minimal-responses: no NS, no glue" || fail "g.test minimal-responses differ"
 stop_srv
@@ -210,7 +235,11 @@ probe udp a.test SOA 0 0 > /dev/null
 [ "$(stat resident)" -gt "$R" ] && pass "a.test (notify no, no allow-transfer) is read for its SOA question" || fail "a.test was answered without the zone"
 R=$(stat resident)
 probe udp d.test SOA 0 0 > /dev/null
-[ "$(stat resident)" = "$R" ] && pass "d.test (allow-transfer) is answered from the summary" || fail "d.test was read"
+if [ "$STORE" = on ]; then
+    [ "$(stat resident)" -gt "$R" ] && pass "d.test is answered from the zone, attached from the store (no apex block to keep or not)" || fail "d.test was not attached"
+else
+    [ "$(stat resident)" = "$R" ] && pass "d.test (allow-transfer) is answered from the summary" || fail "d.test was read"
+fi
 stop_srv
 
 echo "== the apex follows the database"

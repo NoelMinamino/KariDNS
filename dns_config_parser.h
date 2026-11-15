@@ -492,6 +492,7 @@ typedef struct zone_ext_shared {
   uint64_t hash;
   char *key;                    /* profile name, NUL, profile text, NUL, zone text: what makes two settings the same */
   size_t key_len;
+  _Atomic uint32_t store_id;    /* 0.7 store S3: the id of this settings text in the zone store (settings.dat, dns_db_store.c); 0 = none yet */
   char profile[256];            /* "" = none */
 } zone_ext_shared_t;
 
@@ -741,6 +742,13 @@ typedef struct {
   uint32_t warm_before_serve;  /* D1a step 7: seconds the queries wait for the zones of the hot list to be read, 0..3600 (0 = do not wait, the default) */
   uint32_t hot_list_size;      /* D1a step 7: the zones most asked for that the hot list keeps, 1..100000 (0 = the default, 10000) */
   uint32_t hot_list_interval;  /* D1a step 7: seconds between two hot lists, 1..86400 (0 = the default, 60) */
+  char *store_dir;             /* 0.7 store S2 (restart-only): the directory of the zone store; NULL = the default (KARIDNS_DB_DEFAULT_STORE_DIR, used when its parent exists) */
+  bool store_none;             /* `store none;`: no zone store, the zones are read from the database only (as before 0.7) */
+  uint8_t store_mode;          /* `store-mode`: 0 auto (by the file system), 1 map, 2 copy (STORE_MODE_*) */
+  uint32_t store_threads;      /* `store-threads`: threads that attach zones from the store, 1..32 (0 = the default,  8) */
+  bool store_hot_list;         /* `store-hot-list` (default yes, restart-only): at a clean stop the zones that are in memory are written to hot.list of the store, most used first, and the next start attaches them in that order in the background (0.7 fix 8) */
+  uint64_t store_segment_size;     /* `store-segment-size`: the size a segment file of the store grows to before the next one is begun, 1 MiB..4 GiB (0 = the default, 256 MiB); the cleaner works one segment at a time */
+  uint32_t store_scrub_interval;   /* `store-scrub-interval`: seconds between the starts of two scrubs of the store, 60..31536000 (0 = the default, a week; UINT32_MAX = `off`) */
   char *server_id;             /* postgresql only (B11) */
   char **alias_resolver;       /* stored only (B9a): IP address literals */
   int alias_resolver_count;
@@ -767,6 +775,13 @@ typedef struct {
 #define KARIDNS_DB_HOT_LIST_DEFAULT 10000
 #define KARIDNS_DB_HOT_INTERVAL_MAX 86400
 #define KARIDNS_DB_HOT_INTERVAL_DEFAULT 60
+#define KARIDNS_DB_DEFAULT_STORE_DIR "/var/db/karidns/store"   /* the store of a database { } block that names none: made when its parent exists (docs/karidns.md) */
+#define KARIDNS_DB_STORE_SEGMENT_MIN (1ull << 20)
+#define KARIDNS_DB_STORE_SEGMENT_MAX (4ull << 30)
+#define KARIDNS_DB_STORE_SCRUB_MIN 60
+#define KARIDNS_DB_STORE_SCRUB_MAX 31536000u
+#define KARIDNS_DB_STORE_THREADS_MAX 32
+#define KARIDNS_DB_STORE_THREADS_DEFAULT 8
 #define KARIDNS_DB_PARK_TIMEOUT_MIN 10
 #define KARIDNS_DB_PARK_TIMEOUT_MAX 60000
 #define KARIDNS_DB_CONFIG_BODY_MAX (1u << 20)   /* the body of the CONFIG message (KDB_MAX_BODY); db_config_body_size() in the parser computes what build_config() sends */

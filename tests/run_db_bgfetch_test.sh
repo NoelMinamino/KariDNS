@@ -8,6 +8,9 @@
 #   - one request for a zone in a few seconds however often the query comes (a hundred queries: one fetch), none while its fetch is on its way
 #   - a pattern of queries that chain into many zones cannot turn into a flood of fetches: the rate of fetches (fetch-rate) holds, and half of the bucket is
 #     kept for the queries that wait for a zone
+# With the zone store (DB_STORE=on, run_db_bgfetch_store_test.sh) the zones are stored and not in memory after a restart on the store; the background request is an ATTACH from the store
+# (the store's attach counter, not the fetch counter: the loader is not asked), the attach of a zone also attaches the zones of its name servers (so the glue of ns.test is there at the first
+# answer), and fetch-rate does not apply to an attach.  The other checks are the same in both modes.
 # Needs root (the loader runs as nobody).  SKIP without karidns, dag, karictl, karidns-dbloader (SQLite3), sqlite3 or perl.
 . "$(dirname "$0")/lib_proc.sh"
 set -u
@@ -42,6 +45,7 @@ pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
 PORT=$(kari_port 0 $((20000 + $$ % 20000)))
 SECRET="dGVzdC1zZWNyZXQtMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"
+STORE=${DB_STORE:-off}                              # on: the zone store is the directory (run_db_bgfetch_store_test.sh): the zones are stored, not in memory, and a background "fetch" is an attach
 
 mkdir "$T/db"
 sqlite3 "$T/db/z.db" < tests/db/pdns_schema.sqlite3.sql > /dev/null
@@ -78,7 +82,7 @@ conf() {   # conf FETCH-RATE
     cat > "$T/k.conf" <<EOF
 options {
     user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT; notify no;
-    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; fetch-rate $1; park-timeout 4000;
+    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; $(store_stmt "$T") fetch-rate $1; park-timeout 4000;
                acl-ceiling { 127.0.0.1; }; memory-limit 64m; };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
@@ -91,11 +95,13 @@ start_srv() {
     i=0
     while [ $i -lt 1800 ] && ! grep -q "\[DB\] initial load complete" "$T/srv.log" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     grep -q "\[DB\] initial load complete" "$T/srv.log" && pass "the startup batch is complete ($((i / 10)) s)" || { fail "no 'initial load complete' after $((i / 10)) s"; tail -20 "$T/srv.log"; }
+    store_prefill
     sleep 1
 }
 issued() { $KCTL dbstatus 2>/dev/null | grep '^fetch:' | sed -n 's/.* issued=\([0-9]*\).*/\1/p' | tail -1; }
+attached() { $KCTL store -k 2>/dev/null | sed -n 's/^store\.attach\.count=//p'; }       # zones attached from the store since the start
 marked() { $KCTL dbstatus 2>/dev/null | grep '^transfers of zones out of memory:' | sed -n 's/.* marked=\([0-9]*\).*/\1/p' | tail -1; }   # zones that a background fetch or a transfer brought, marked to go first
-oom() { $KCTL dbstatus "$1" 2>/dev/null | grep -q "out of memory"; }       # oom ZONE: its data is out of memory
+oom() { $KCTL dbstatus "$1" 2>/dev/null | grep -qE "out of memory|not in memory"; }       # oom ZONE: its data is out of memory
 D() { ./dag @127.0.0.1 -p "$PORT" "$@" 2>/dev/null; }
 ans() { D "$1" "$2" +noall +answer +nohexdump | awk '{ print $4 }' | tr '\n' ' '; }       # ans NAME TYPE: the types of the Answer section
 addl() { D "$1" "$2" +noall +additional +nohexdump | awk '{ print $4 }' | tr '\n' ' '; }  # the types of the Additional section
@@ -121,7 +127,12 @@ A2=$(ans www.a.test A)
 
 echo "== the glue of a name server in a zone that is not in memory"
 N1=$(addl ns.test NS)
-[ -z "$N1" ] && pass "ns.test NS: no glue (ns1.prov2.test is in prov2.test, which is not in memory)" || fail "ns.test: Additional '$N1'"
+if [ "$STORE" = on ]; then
+    # the attach of ns.test also attaches the stored zones of its name servers (sibling glue, store design 4.1): the glue is in the first answer, the second query is not needed for it
+    [ "$N1" = "A " ] && pass "ns.test NS: the glue is there at once (the attach of ns.test attached prov2.test, the zone of its name server)" || fail "ns.test: Additional '$N1'"
+else
+    [ -z "$N1" ] && pass "ns.test NS: no glue (ns1.prov2.test is in prov2.test, which is not in memory)" || fail "ns.test: Additional '$N1'"
+fi
 wait_res prov2.test 10 && pass "prov2.test was fetched in the background" || fail "prov2.test is still out of memory"
 N2=$(addl ns.test NS)
 [ "$N2" = "A " ] && pass "the next query has the glue (the answer without it was not stored)" || fail "ns.test: Additional '$N2'"
@@ -130,12 +141,16 @@ MK2=$(marked)
 
 echo "== one request for a zone, however often the query comes"
 oom dt.test && oom dup.test && pass "dup.test and dt.test start out of memory" || fail "dup.test or dt.test did not start out of memory"
-I0=$(issued)
+I0=$(issued); AT0=$(attached)
 D x.dup.test A +short +nohexdump > /dev/null     # (dup.test is read for the query: one fetch; dt.test is the target: one fetch in the background)
 k=0; while [ $k -lt 60 ]; do D x.dup.test A +short +nohexdump +time=1 +tries=1 > /dev/null; k=$((k + 1)); done
 wait_res dt.test 10 && pass "dt.test was fetched" || fail "dt.test is out of memory"
-I1=$(issued)
-[ "$((I1 - I0))" = "2" ] && pass "61 queries made exactly two fetches: dup.test for the first (it waited) and dt.test once, in the background" || fail "$((I1 - I0)) fetches for 61 queries (want 2)"
+I1=$(issued); AT1=$(attached)
+if [ "$STORE" = on ]; then
+    [ "$((AT1 - AT0))" = "2" ] && [ "$I1" = "$I0" ] && pass "61 queries made exactly two attaches and no fetch: dup.test for the first (it waited) and dt.test once, in the background" || fail "$((AT1 - AT0)) attaches, $((I1 - I0)) fetches for 61 queries (want 2 and 0)"
+else
+    [ "$((I1 - I0))" = "2" ] && pass "61 queries made exactly two fetches: dup.test for the first (it waited) and dt.test once, in the background" || fail "$((I1 - I0)) fetches for 61 queries (want 2)"
+fi
 MK3=$(marked)
 [ "$MK3" = "$((MK2 + 1))" ] && pass "dt.test is marked once (marked $MK2 -> $MK3)" || fail "marked after dt.test: '$MK3' (was '$MK2')"
 stop_srv
@@ -159,7 +174,12 @@ echo "  $((I1 - I0)) fetches in $E s for $NB queries ($WRONG not answered with a
 [ "$WRONG" -eq 0 ] && pass "every query was answered (the CNAME), whatever happened to the fetches" || fail "$WRONG queries were not answered"
 [ "$((I1 - I0))" -le $((20 + 20 * (E + 3))) ] && pass "the rate of fetches held: at most fetch-rate (20 a second) and the burst" || fail "$((I1 - I0)) fetches in $E s"
 [ "$((I1 - I0))" -lt $((NB - 20)) ] && pass "not every chain got its zone fetched (requests over the rate were held back)" || fail "no query was held back: $((I1 - I0)) fetches for $NB zones"
-$KCTL dbstatus 2>/dev/null | grep -q "refused_by_rate=[1-9]" && pass "the requests over the rate were refused (refused_by_rate)" || fail "refused_by_rate: $($KCTL dbstatus 2>/dev/null | grep '^fetch:')"
+if [ "$STORE" = on ]; then
+    # a stored zone is attached, not fetched: fetch-rate is the loader's protection and does not apply to an attach (a read of the store, a few microseconds); no zone was read from the loader
+    [ "$((I1 - I0))" = 0 ] && ! $KCTL dbstatus 2>/dev/null | grep -q "refused_by_rate=[1-9]" && pass "no zone was read from the loader and no request was refused by the rate (the zones are attached from the store)" || fail "fetches $((I1 - I0)); $($KCTL dbstatus 2>/dev/null | grep '^fetch:')"
+else
+    $KCTL dbstatus 2>/dev/null | grep -q "refused_by_rate=[1-9]" && pass "the requests over the rate were refused (refused_by_rate)" || fail "refused_by_rate: $($KCTL dbstatus 2>/dev/null | grep '^fetch:')"
+fi
 [ "$(D www.a.test A +short +nohexdump | head -1)" != "" ] && pass "the server goes on answering" || fail "no answer after the pattern"
 grep -q "AddressSanitizer\|runtime error:\|ThreadSanitizer" "$T/srv.log" 2>/dev/null && fail "sanitizer report in the server log" || pass "no sanitizer report in the server log"
 stop_srv

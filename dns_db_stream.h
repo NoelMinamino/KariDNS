@@ -41,7 +41,8 @@
  *   Duplicate, unknown or truncated tags, a wrong length, a missing R tag: protocol error.
  *
  * loader -> Backend
- *   HELLO (1)         1 proto_version u16 R (=1) | 2 loader_version str<=64 R | 3 driver str<=32 R | 4 pid u32 R
+ *   HELLO (1)         1 proto_version u16 R (=1) | 2 loader_version str<=64 R | 3 driver str<=32 R | 4 pid u32 R |
+ *                     5 features u32 O (0.7 WP7a: bit0 KDB_FEAT_STORE: the loader speaks the store protocol below; absent = 0)
  *   INVENTORY_REQ (2) no tags (empty body)
  *   BATCH_BEGIN (3)   1 batch_id u64 R | 2 kind u8 R (0 startup,1 full,2 diff,3 zone,4 auto) | 3 change_seq u64 R |
  *                     4 request_id u64 O (B6a: the batch answers that RELOAD_REQ; absent or 0 = not an answer)
@@ -90,6 +91,35 @@
  *                     Tag 5 is not used by this message.  The Backend treats the entries as untrusted: a name that is not a zone of its directory is ignored.
  *   HOT_ACK (14)      D1a step 7; only between batches, no state change.  The loader's answer to the last part of a HOT_LIST:
  *                     1 list_id u64 R | 2 status u8 R (KDB_HA_*) | 3 zones u32 R (the zones the state file holds now) | 4 error str<=255 O
+ *
+ *                     0.7 WP7a, the store protocol (store design 5.3 / 5.4; negotiated: HELLO features bit0 from the loader, CONFIG tag 10 from the
+ *                     Backend; without it none of the four messages below is sent and the loader works with INVENTORY as before).  The loader keeps no table
+ *                     of the zones: it lists the zones of a source to the Backend (MANIFEST, a pass over `domains` in id order) or says which changed
+ *                     (CHANGES, pages of the change log), and the Backend asks for the bodies it lacks with FETCH_REQ on the fetch stream (priority 2, by name,
+ *                     with the source id in tag 8).  All four are inside a batch (IN_BATCH) and count in BATCH_END: n_zones = manifest entries + upserts of
+ *                     CHANGES, n_deleted = deletes of CHANGES + ZONE_DELETE messages.  An entry is a claim of an untrusted loader: the Backend checks it.
+ *   MANIFEST_BEGIN (15) A pass over every zone of one view's source starts (first fill, change-log gap, replaced database, `reload -force`, a source without a
+ *                     change log).  1 batch_id u64 R | 2 view view R | 3 count u64 R (an estimate of the entries, 0 = unknown) | 4 cursor u64 R (the
+ *                     change-log cursor taken BEFORE the first page: the changes that came during the pass are in the CHANGES that follow it) |
+ *                     5 cursor_valid u8 R (0: the source has no change log, tag 4 means nothing and the Backend keeps no cursor) | 6 db_ident bytes<=64 O (the
+ *                     identity of the database, opaque; stored with the cursor and sent back in CONFIG) | 7 flags u32 R (bit0 KDB_MF_VERIFY reserved,
+ *                     bit1 KDB_MF_PLAIN: a plain PowerDNS schema: no stamps, entries carry the serial)
+ *   MANIFEST (16)     One page of a pass: 1 batch_id u64 R | 2 view view R | 3 page u32 R (0, 1, ... in order) | 4 ENTRY nested, repeatable (<= KDB_MANIFEST_PAGE_MAX):
+ *                     1 source_id i64 R (domains.id) | 2 name name R | 3 kind u8 R (0 primary, 1 secondary, 2 catalog) | 4 stamp_gen u64 R | 5 stamp_time u64 R
+ *                     (karidns_zone_state.generation / changed_at) | 6 flags u8 O (bit0 KDB_EF_STAMPED: the stamp is real; absent / 0: the zone has no state row, and the
+ *                     Backend compares the serial (tag 7) or wants the body) | 7 serial u32 O (plain schema) | 8 digest bytes<=32 exactly O (a verify pass).
+ *                     Only zones the view serves are listed (the view mapping is applied by the loader) and only zones the loader can send (a canonical name, a loadable
+ *                     type); the others are counted in MANIFEST_END n_skipped, and the Backend that sweeps a zone that is not listed deletes it.
+ *   MANIFEST_END (17) 1 batch_id u64 R | 2 view view R | 3 n_entries u64 R (the sum of the pages) | 4 n_skipped u64 R | 5 cursor u64 R | 6 cursor_valid u8 R |
+ *                     7 db_ident bytes<=64 O | 8 complete u8 R (1: every page was sent, the Backend may sweep what the pass did not list; 0: the loader gave up (a database
+ *                     error): no sweep).  The mass-delete guard (decision D7) is the Backend's: the loader only reports the counts.
+ *   CHANGES (18)      Distinct domains the change log says changed since the cursor: 1 batch_id u64 R | 2 view view R | 3 cursor u64 R (valid only when tag 4 is 1: the
+ *                     position the drain has reached; earlier pages carry the cursor the drain started at) | 4 last u8 R (1: the drain is complete up to tag 3,
+ *                     which the Backend may make durable once the entries are recorded) | 5 db_ident bytes<=64 O | 6 ENTRY nested, repeatable (<= KDB_MANIFEST_PAGE_MAX):
+ *                     1 source_id i64 R | 2 op u8 R (1 upsert: the domain exists and the view serves it; 2 delete: it is gone, or the view no longer serves it, or its type
+ *                     cannot be loaded) | 3 name name (an upsert needs it; a delete has it when the loader knows it) | 4 kind u8 (an upsert needs it) | 5 stamp_gen u64 |
+ *                     6 stamp_time u64 | 7 flags u8 O (bit0 KDB_EF_STAMPED, bit1 KDB_EF_FORCE: read the body whatever the stamp says: a reload request) | 8 serial u32 O.
+ *                     A domain can be in two pages of a drain; the entries are idempotent.
  * Backend -> loader (type | 0x8000)
  *   CONFIG (0x8001)   1 generation u64 R | 2 driver str ne <=32 R | 3 server_id str<=64 O |
  *                     4 VIEW nested, repeatable (<= 1024):
@@ -97,12 +127,18 @@
  *                         4 conninfo_file path ne<=1023 O | 5 auto_reload u8 R (0/1) | 6 poll_interval u32 R (s) |
  *                         7 coalesce_ms u32 R | 8 max_zone_records u64 R | 9 max_zone_bytes u64 R |
  *                         10 shared_source u8 O (0/1; B6b: the source is the global one, so karidns_domain_views maps zones to this view)
+ *                         11 cursor u64 O | 12 cursor_valid u8 O (0/1; 0.7 WP7a: the change-log cursor the Backend keeps for this view, valid only with tag 12 = 1; absent or 0 = none: a first fill) |
+ *                         13 db_ident bytes<=64 O (the identity of the database the cursor belongs to, as the loader reported it; a different identity makes the loader list the source again)
  *                     5 default_ttl u32 O (<= 2147483647; B4a) | 6 bulk_threshold u8 O (<= 100) | 7 loader_threads u32 O (<= 16) |
  *                     8 dir_only u8 O (0/1; D1a milestone 4: memory-limit is set, so a zone the Backend does not have in memory is sent as a
  *                         summary (ZONE_BEGIN with the summary flag, settings and SOA timers, no ZONE_DATA) also in a batch) |
- *                     9 signer_wait u8 O (0/1; 0.6.0 item C: database { signer-wait }; absent = 1)
+ *                     9 signer_wait u8 O (0/1; 0.6.0 item C: database { signer-wait }; absent = 1) |
+ *                     10 store_proto u8 O (0/1; 0.7 WP7a: use the store protocol: no INVENTORY is sent or wanted, the loader answers with MANIFEST / CHANGES; the Backend
+ *                         sets it only when HELLO features has KDB_FEAT_STORE; absent = 0)
  *   RELOAD_REQ (0x8002) 1 request_id u64 R | 2 scope u8 R (0 all, 1 one zone) | 3 view view O | 4 zone name O |
- *                     5 force u8 R (0/1); scope 1 needs tags 3 and 4, scope 0 forbids them
+ *                     5 force u8 R (0/1); scope 1 needs tags 3 and 4, scope 0 forbids them.
+ *                     Store protocol: scope 0 with force = 1 is a MANIFEST pass of every source (`karictl reload -force`); scope 0 without it drains the change log; scope 1
+ *                     answers with a CHANGES entry (op 1, flag FORCE) for the zone, or a ZONE_DELETE (source id 0: by name) when the database has no such zone.
  *   INVENTORY (0x8003) 1 ENTRY nested, repeatable: 1 view view R | 2 zone name R | 3 source_id i64 R |
  *                         4 serial u32 R | 5 digest bytes (exactly 32; required unless the zone is not resident) |
  *                         6 resident u8 O (D1a: 0/1, absent = 1; 0 = the Backend has only the directory entry of the zone, no data and
@@ -116,7 +152,9 @@
  *                     4 n_unchanged u32 R | 5 n_rejected u32 R | 6 n_deleted u32 R
  *   FETCH_REQ (0x8007) D1a, fetch stream only: 1 request_id u64 R (> 0) | 2 view view R | 3 zone name R |
  *                     4 priority u8 R (0 a query waits for it, 1 warm-up, 2 background) | 5 mode u8 R (0 the zone, 1 its summary) |
- *                     6 range_lo name O | 7 range_hi name O (D1b: both or none; a loader that does not read ranges answers ZONE_FAILED)
+ *                     6 range_lo name O | 7 range_hi name O (D1b: both or none; a loader that does not read ranges answers ZONE_FAILED) |
+ *                     8 source_id i64 O (0.7 WP7a: the domains.id the Backend holds for the zone (a KNOWN zone of the store protocol); a loader that finds the name with
+ *                         another id answers ZONE_FAILED: the zone was renamed or created again, and CHANGES says so)
  *   HOT_LIST (0x8008) D1a step 7 (design 8.4), first stream only: the zones most asked for, hottest first, in parts as WARM_LIST (tags 1..4 the same;
  *                     5 limit u32 O: the most entries the loader keeps in its state file, <= KDB_HOT_MAX, absent = KDB_HOT_MAX).  Several parts carry
  *                     one list_id; a part that does not follow the one before (or a new list_id) starts the list again.  The loader merges the list
@@ -142,6 +180,13 @@
 #define KDB_MAX_BODY (1u << 20)      /* every message but ZONE_DATA */
 #define KDB_MAX_ZONE_DATA 65535u     /* ZONE_DATA body */
 #define KDB_REASON_LEN 128
+#define KDB_FEAT_STORE 0x1u          /* HELLO features: the store protocol (MANIFEST / CHANGES) */
+#define KDB_MF_VERIFY 0x1u           /* MANIFEST_BEGIN flags: a verify pass (entries carry digests; reserved) */
+#define KDB_MF_PLAIN 0x2u            /* ... a plain PowerDNS schema: no stamps, serials */
+#define KDB_EF_STAMPED 0x1u          /* MANIFEST / CHANGES entry flags: the stamp (generation, changed_at) is real */
+#define KDB_EF_FORCE 0x2u            /* CHANGES entry: read the body whatever the stamp says */
+#define KDB_MANIFEST_PAGE_MAX 16384  /* entries of one MANIFEST / CHANGES message */
+#define KDB_IDENT_MAX 64             /* database identity, bytes */
 #define KDB_FETCH_BUSY_REASON "busy: too many fetch requests are waiting"   /* the loader's ZONE_FAILED reason when its fetch queue is full (the Backend counts these) */
 #define KDB_DIGEST_LEN 32
 #define KDB_VIEWS_ANY 0xFFFFFFFFu    /* view_count: do not check view indexes */
@@ -162,6 +207,7 @@ enum {
     KDB_T_HELLO = 1, KDB_T_INVENTORY_REQ = 2, KDB_T_BATCH_BEGIN = 3, KDB_T_ZONE_BEGIN = 4, KDB_T_ZONE_DATA = 5,
     KDB_T_ZONE_END = 6, KDB_T_ZONE_ABORT = 7, KDB_T_ZONE_FAILED = 8, KDB_T_ZONE_DELETE = 9, KDB_T_PROFILE = 10,
     KDB_T_BATCH_END = 11, KDB_T_AUTO_STATUS = 12, KDB_T_WARM_LIST = 13, KDB_T_HOT_ACK = 14,
+    KDB_T_MANIFEST_BEGIN = 15, KDB_T_MANIFEST = 16, KDB_T_MANIFEST_END = 17, KDB_T_CHANGES = 18,      /* 0.7 WP7a: the store protocol */
     /* Backend -> loader: high bit set */
     KDB_T_CONFIG = 0x8001, KDB_T_RELOAD_REQ = 0x8002, KDB_T_INVENTORY = 0x8003, KDB_T_INVENTORY_END = 0x8004,
     KDB_T_ZONE_RESULT = 0x8005, KDB_T_BATCH_RESULT = 0x8006,
@@ -261,7 +307,7 @@ kdb_rc_t kdb_framer_next(kdb_framer_t *f, kdb_frame_t *out);
 /* ---------------------------------------------------------------- decoded messages */
 typedef struct { const char *p; uint32_t len; } kdb_str_t;     /* p == NULL: absent */
 
-typedef struct { uint16_t proto; kdb_str_t loader_version, driver; uint32_t pid; } kdb_hello_t;
+typedef struct { uint16_t proto; kdb_str_t loader_version, driver; uint32_t pid; uint32_t features; /* tag 5, KDB_FEAT_*; 0 = absent */ } kdb_hello_t;
 typedef struct { uint64_t batch_id; uint8_t kind; uint64_t change_seq; uint64_t request_id; /* 0 = none */
                  uint64_t cfg_generation; /* the CONFIG the loader made the batch with (tag 5; 0 = not sent) */ } kdb_batch_begin_t;
 typedef struct {
@@ -300,6 +346,7 @@ typedef struct {
     uint32_t loader_threads;    /* 0 = tag absent */
     bool dir_only;              /* tag 8 (D1a milestone 4): memory-limit is set; the loader sends the summary only (no ZONE_DATA) for a zone the Backend does not have in memory */
     bool signer_wait;           /* tag 9 (0.6.0 item C): the loader does not reload a zone with the metadata X-KARIDNS-SIGNER=1 because of the change log; absent = true */
+    bool store_proto;           /* tag 10 (0.7 WP7a): the store protocol (MANIFEST / CHANGES instead of INVENTORY); absent = false */
     uint32_t n_views;
     const uint8_t *body; uint32_t body_len;       /* for kdb_config_views() */
 } kdb_config_t;
@@ -325,7 +372,24 @@ typedef struct { uint8_t level; } kdb_debug_t;
 typedef struct {
     uint64_t request_id; uint16_t view; char name[DNS_NAME_TEXT_SIZE]; uint8_t priority, mode;
     bool has_range; char range_lo[DNS_NAME_TEXT_SIZE], range_hi[DNS_NAME_TEXT_SIZE];
+    int64_t source_id;          /* tag 8; 0 = absent */
 } kdb_fetch_req_t;
+
+/* 0.7 WP7a: the store protocol */
+typedef struct {
+    uint64_t batch_id; uint16_t view; uint64_t count; uint64_t cursor; bool cursor_valid;
+    uint8_t ident[KDB_IDENT_MAX]; uint8_t ident_len; uint32_t flags;
+} kdb_manifest_begin_t;
+typedef struct { uint64_t batch_id; uint16_t view; uint32_t page; uint32_t n_entries; const uint8_t *body; uint32_t body_len; } kdb_manifest_t;
+typedef struct {
+    uint64_t batch_id; uint16_t view; uint64_t n_entries, n_skipped; uint64_t cursor; bool cursor_valid;
+    uint8_t ident[KDB_IDENT_MAX]; uint8_t ident_len; bool complete;
+} kdb_manifest_end_t;
+typedef struct {
+    uint64_t batch_id; uint16_t view; uint64_t cursor; bool last;
+    uint8_t ident[KDB_IDENT_MAX]; uint8_t ident_len;
+    uint32_t n_entries; const uint8_t *body; uint32_t body_len;       /* for kdb_changes_entries() */
+} kdb_changes_t;
 
 typedef struct {
     uint16_t type;
@@ -337,6 +401,7 @@ typedef struct {
         kdb_config_t config; kdb_reload_req_t reload_req; kdb_inventory_t inventory;
         kdb_inventory_end_t inventory_end; kdb_zone_result_t zone_result; kdb_batch_result_t batch_result;
         kdb_fetch_req_t fetch_req; kdb_hot_list_t hot_list; kdb_hot_ack_t hot_ack; kdb_debug_t debug;
+        kdb_manifest_begin_t manifest_begin; kdb_manifest_t manifest; kdb_manifest_end_t manifest_end; kdb_changes_t changes;
     } u;
 } kdb_msg_t;
 
@@ -355,6 +420,9 @@ typedef struct {
     uint16_t index; kdb_str_t name, source, conninfo_file; uint8_t auto_reload; uint32_t poll_interval, coalesce_ms;
     uint64_t max_zone_records, max_zone_bytes;
     uint8_t shared_source;      /* tag 10; 0 = absent */
+    bool has_cursor;            /* tags 11 / 12: the Backend's change-log cursor for the view (WP7a) */
+    uint64_t cursor;
+    uint8_t ident[KDB_IDENT_MAX]; uint8_t ident_len;      /* tag 13 */
 } kdb_config_view_t;
 typedef struct {
     uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id; uint32_t serial; uint8_t digest[KDB_DIGEST_LEN];
@@ -373,6 +441,20 @@ void kdb_config_views(const kdb_msg_t *m, kdb_iter_t *it);
 bool kdb_config_views_next(kdb_iter_t *it, kdb_config_view_t *out);
 void kdb_inventory_entries(const kdb_msg_t *m, kdb_iter_t *it);
 bool kdb_inventory_entries_next(kdb_iter_t *it, kdb_inventory_entry_t *out);
+/* 0.7 WP7a: the entries of MANIFEST and CHANGES */
+typedef struct {
+    int64_t source_id; char name[DNS_NAME_TEXT_SIZE]; uint8_t kind; uint64_t stamp_gen, stamp_time;
+    bool stamped; bool has_serial; uint32_t serial; bool has_digest; uint8_t digest[KDB_DIGEST_LEN];
+} kdb_manifest_entry_t;
+typedef struct {
+    int64_t source_id; uint8_t op;          /* 1 upsert, 2 delete (KDB_CH_*) */
+    bool has_name; char name[DNS_NAME_TEXT_SIZE]; uint8_t kind; uint64_t stamp_gen, stamp_time; bool stamped, force; bool has_serial; uint32_t serial;
+} kdb_changes_entry_t;
+enum { KDB_CH_UPSERT = 1, KDB_CH_DELETE = 2 };
+void kdb_manifest_entries(const kdb_msg_t *m, kdb_iter_t *it);
+bool kdb_manifest_entries_next(kdb_iter_t *it, kdb_manifest_entry_t *out);
+void kdb_changes_entries(const kdb_msg_t *m, kdb_iter_t *it);
+bool kdb_changes_entries_next(kdb_iter_t *it, kdb_changes_entry_t *out);
 
 /* ---------------------------------------------------------------- hot list (D1a step 7, design 8.4) */
 /* The zones most asked for, hottest first: (view name, zone name) pairs in a malloc'd buffer, "view\0zone\0" each.  Used by the Backend (HOT_LIST out, WARM_LIST in),
@@ -420,6 +502,10 @@ typedef struct {
     uint64_t batch_id;
     uint64_t n_zones, n_failed, n_deleted;     /* of the current batch (zones = completed by ZONE_END) */
     uint32_t n_profiles;                       /* of the current batch */
+    bool man_open;                             /* 0.7 WP7a: inside a MANIFEST pass (MANIFEST_BEGIN seen, MANIFEST_END not yet) */
+    uint16_t man_view;
+    uint32_t man_page;                         /* the next page number */
+    uint64_t man_entries;                      /* entries seen in this pass */
     /* current zone, valid in IN_ZONE */
     uint64_t zone_rr_declared;                 /* ZONE_BEGIN rr_count */
     uint64_t zone_rr_sum;                      /* sum of ANCOUNT so far; at ZONE_END equal to the declared count */

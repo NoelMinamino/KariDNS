@@ -145,6 +145,14 @@ typedef struct {
   zdir_elem_t *elem;
   char view_name[KARIDNS_VIEW_NAME_MAX];
   zone_db_entry_t *(*await)(zdir_elem_t *elem, const char *view_name);
+  /* 0.7 store S3: the zone is a zone of the store that is not in memory (it has no element): store_zone is its name with the trailing dot, and the thread waits for its entry with
+   * await_zone(store_zone, view_name) (db_ingest_xfr_await_zone(): a store thread attaches it).  elem is NULL then.  The reply to IXFR is not made from an apex (there is none). */
+  char store_zone[256];
+  zone_db_entry_t *(*await_zone)(const char *zone, const char *view_name);
+  /* 0.7 H2: the zone was allowed by the view's and options' allow-transfer alone (its own settings were not known in the dispatch): after the wait the thread checks the zone's own ACL against the entry it
+   * got (the client's view is acl_view), and answers REFUSED when it denies.  The client's address and key are the ones above. */
+  bool recheck_acl;
+  char acl_view[KARIDNS_VIEW_NAME_MAX];
 } axfr_worker_args_t;
 _Static_assert(sizeof(((axfr_worker_args_t *)0)->req) >= XFR_REQUEST_MAX_LEN, "the transfer thread keeps the whole request (xfr_request_shape() accepts XFR_REQUEST_MAX_LEN)");
 

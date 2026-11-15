@@ -38,27 +38,28 @@ zone_db_entry_t *find_catalog_parent_in_snapshot(view_snapshot_t *view, const ch
 }
 
 void remove_member_from_catalog_bookkeeping(zone_db_entry_t *catalog_entry, const char *unique_id, const char *domain) {
-    if (!catalog_entry || !catalog_entry->catalog_members) return;
-    for (int i = 0; i < catalog_entry->catalog_member_count; i++) {
-        if (strcasecmp(catalog_entry->catalog_members[i].domain, domain) == 0 && 
-            strcmp(catalog_entry->catalog_members[i].unique_id, unique_id) == 0) {
+    zone_x_t *cx = catalog_entry ? zone_x(catalog_entry) : NULL;
+    if (!cx || !cx->catalog_members) return;
+    for (int i = 0; i < cx->catalog_member_count; i++) {
+        if (strcasecmp(cx->catalog_members[i].domain, domain) == 0 && 
+            strcmp(cx->catalog_members[i].unique_id, unique_id) == 0) {
             
             // Explicitly free the dynamically allocated `groups` strings of the targeted element
-            if (catalog_entry->catalog_members[i].groups) {
-                for (int g = 0; g < catalog_entry->catalog_members[i].group_count; g++) {
-                    free(catalog_entry->catalog_members[i].groups[g]);
+            if (cx->catalog_members[i].groups) {
+                for (int g = 0; g < cx->catalog_members[i].group_count; g++) {
+                    free(cx->catalog_members[i].groups[g]);
                 }
-                free(catalog_entry->catalog_members[i].groups);
+                free(cx->catalog_members[i].groups);
             }
             
             // Shift the remaining elements forward
-            int elements_after = catalog_entry->catalog_member_count - i - 1;
+            int elements_after = cx->catalog_member_count - i - 1;
             if (elements_after > 0) {
-                memmove(&catalog_entry->catalog_members[i], 
-                        &catalog_entry->catalog_members[i + 1], 
+                memmove(&cx->catalog_members[i], 
+                        &cx->catalog_members[i + 1], 
                         elements_after * sizeof(catalog_member_id_t));
             }
-            catalog_entry->catalog_member_count--;
+            cx->catalog_member_count--;
             break;
         }
     }

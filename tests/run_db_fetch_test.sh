@@ -77,13 +77,13 @@ has "a range request: ZONE_FAILED, not silence" '^FAILED id=9 zone=small.test. r
 has "the loader ended well when the Backend closed the streams" '^DONE answers=9 loader=0$'
 
 echo "== priorities: 0 before 1 before 2 while the thread is busy"
-run req:1:big.test.:1:0 begin:1 req:2:small.test.:2:0 req:3:small.test.:1:0 req:4:small.test.:0:0 wait:4
+run req:1:big.test.:1:0 begin:1 req:2:small.test.:2:0 req:3:small.test.:1:0 req:4:small.test.:0:0 hold:300 wait:4
 order=$(grep -E '^(ANS|FAILED)' "$T/out" | sed -E 's/^[A-Z]+ id=([0-9]+).*/\1/' | tr '\n' ' ')
 [ "$order" = "1 4 3 2 " ] && pass "the answers come in the order 1 (busy), 4 (priority 0), 3 (1), 2 (2)" || { fail "answer order '$order'"; cat "$T/out"; }
 has "the big zone arrived whole" '^ANS id=1 zone=big.test. kind=primary summary=0 .* rr=30004 '
 
 echo "== more requests than the queue holds"
-run req:1:big.test.:1:0 begin:1 flood:1500:small.test. sleep:6000 req:77:small.test.:0:0 begin:77 sleep:500
+run req:1:big.test.:1:0 begin:1 flood:1500:small.test. hold:300 sleep:6000 req:77:small.test.:0:0 begin:77 sleep:500
 busy=$(grep -c 'reason=busy' "$T/out")
 [ "$busy" -ge 1 ] && pass "requests beyond the queue were answered busy ($busy)" || { fail "no busy answer"; tail -5 "$T/out"; }
 hasnt "no protocol error" 'PROTOCOL ERROR'

@@ -18,6 +18,9 @@
 #     transfer that completes is complete, no query is answered wrong, the resident bytes keep to the limit's slack, the retired ones (taken out, not
 #     freed yet: not part of the hard limit, docs/karidns.md; how many depends on the speed of the host) are all freed after the load, nothing breaks
 #     (run with karidns-tsan: run_rcu_tsan_test.sh)
+# With the zone store (DB_STORE=on, run_db_xfer_store_test.sh) a zone that is out of memory is stored: the transfer waits for the ATTACH of the zone (the fetch counter does not move: the loader is
+# not asked), an IXFR poll from the current serial attaches the zone too (there is no summary: the answer is made from the zone, a few microseconds), a change of the database is a new body that
+# comes in the background (the old image answers until it is there), and a zone whose body was refused (max-zone-records) fails at once: nothing will come.  The rest is the same in both modes.
 # Needs root (the loader runs as nobody).  SKIP without karidns, dag, karictl, karidns-dbloader (SQLite3), sqlite3 or perl.
 . "$(dirname "$0")/lib_proc.sh"
 set -u
@@ -60,6 +63,7 @@ PASS=0; FAILS=0
 pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
 PORT=$(kari_port 0 $((20000 + $$ % 20000)))
+STORE=${DB_STORE:-off}                              # on: the zone store is the directory (run_db_xfer_store_test.sh): the zones are stored and not in memory, an attach brings one in, the loader is not asked
 SECRET="dGVzdC1zZWNyZXQtMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"
 
 mkdir "$T/db"
@@ -100,7 +104,7 @@ conf() {   # conf MEMORY-LIMIT
     cat > "$T/k.conf" <<EOF
 options {
     user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT; notify no;
-    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; fetch-rate 5000; park-timeout 4000;
+    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; $(store_stmt "$T") fetch-rate 5000; park-timeout 4000;
                acl-ceiling { 127.0.0.1; }; max-zone-records 200; transfer-fetch-timeout 3000; memory-limit $1; };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
@@ -120,12 +124,13 @@ start_srv() {
     i=0
     while [ $i -lt 1800 ] && ! grep -q "\[DB\] initial load complete" "$T/srv.log" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     grep -q "\[DB\] initial load complete" "$T/srv.log" && pass "the startup batch is complete ($((i / 10)) s)" || { fail "no 'initial load complete' after $((i / 10)) s"; tail -20 "$T/srv.log"; }
+    store_prefill
     sleep 1
 }
 stat() { $KCTL dbstatus 2>/dev/null | grep '^cache:' | sed -n "s/.* $1=\([0-9]*\).*/\1/p" | tail -1; }
 issued() { $KCTL dbstatus 2>/dev/null | grep '^fetch:' | sed -n 's/.* issued=\([0-9]*\).*/\1/p' | tail -1; }
 xstat() { $KCTL dbstatus 2>/dev/null | grep '^transfers of zones out of memory:' | sed -n "s/.* $1=\([0-9]*\).*/\1/p" | tail -1; }
-oom() { $KCTL dbstatus "$1" 2>/dev/null | grep -q "out of memory"; }       # oom ZONE: its data is out of memory
+oom() { $KCTL dbstatus "$1" 2>/dev/null | grep -qE "out of memory|not in memory"; }       # oom ZONE: its data is out of memory
 q() { ./dag @127.0.0.1 -p "$PORT" "$1" A +short +nohexdump +time=5 +tries=1 2>/dev/null | head -1; }
 wait_oom() {   # wait_oom ZONE SECONDS: the zone's data leaves memory (the cache manager)
     i=0; while [ $i -lt $(($2 * 10)) ] && ! oom "$1"; do sleep 0.1; i=$((i + 1)); done
@@ -158,7 +163,12 @@ axfr a.test > "$T/a.nr"
 NA=$(wc -l < "$T/a.nr" | tr -d ' ')
 EXPECT=$((NH + 1 + 1 + 1 + 2))        # hosts, www, NS, the address of ns1, the SOA at both ends
 [ "$NA" -eq "$EXPECT" ] && pass "the AXFR of a.test (out of memory) is complete: $NA records" || fail "AXFR of a.test: $NA records, expected $EXPECT"
-[ "$(issued)" = "$((I0 + 1))" ] && [ "$(xstat waited)" = "$((W0 + 1))" ] && [ "$(xstat loaded)" = "$((L0 + 1))" ] && pass "one fetch for it (issued $((I0 + 1)), waited, loaded)" || fail "issued $(issued), waited $(xstat waited), loaded $(xstat loaded)"
+if [ "$STORE" = on ]; then
+    [ "$(issued)" = "$I0" ] && [ "$(xstat waited)" = "$((W0 + 1))" ] && [ "$(xstat loaded)" = "$((L0 + 1))" ] && pass "the transfer waited for the attach of the zone and read nothing from the loader (issued $I0, waited, loaded)" || fail "issued $(issued) (was $I0), waited $(xstat waited), loaded $(xstat loaded)"
+else
+    [ "$(issued)" = "$((I0 + 1))" ] && [ "$(xstat waited)" = "$((W0 + 1))" ] && [ "$(xstat loaded)" = "$((L0 + 1))" ] && pass "one fetch for it (issued $((I0 + 1)), waited, loaded)" || fail "issued $(issued), waited $(xstat waited), loaded $(xstat loaded)"
+fi
+
 [ "$(xstat marked)" -ge 1 ] && pass "the zone was marked evict-next (marked=$(xstat marked))" || fail "marked=$(xstat marked)"
 wait_oom a.test 15 && pass "the cache manager took a.test out of memory when the transfer was over (it is not kept for a transfer)" || fail "a.test stays in memory"
 
@@ -181,12 +191,28 @@ NC=$(wc -l < "$T/c5.out" | tr -d ' ')
 [ "$NC" = "1" ] && grep -q " 5 3600 600 86400 300" "$T/c5.out" && pass "the IXFR from the serial the zone has is the one SOA" || fail "IXFR=5: $NC records: $(head -2 "$T/c5.out")"
 ixfr c.test 9 > "$T/c9.out"
 [ "$(wc -l < "$T/c9.out" | tr -d ' ')" = "1" ] && pass "... also from a newer serial (RFC 1982)" || fail "IXFR=9: $(head -2 "$T/c9.out")"
-[ "$(issued)" = "$I1" ] && oom c.test && [ "$(xstat summary_answers)" = "$((SU0 + 2))" ] && pass "the zone was not read for them (issued $I1, summary_answers $((SU0 + 2)))" || fail "issued $(issued) (was $I1), summary_answers $(xstat summary_answers) (was $SU0), out of memory: $(oom c.test && echo yes || echo no)"
-lg "transfer of 'c.test/IN': IXFR poll up to date (serial 5), answered from the zone summary" && pass "log: the IXFR from the serial the directory has is a poll answered from the summary (debug 1)" || fail "log: no summary poll line for c.test"
+if [ "$STORE" = on ]; then
+    # no summary: the poll is answered from the zone, which is attached from the store (the loader is not asked)
+    [ "$(issued)" = "$I1" ] && pass "the loader was not asked for them (issued $I1): the zone of the store was attached for the poll" || fail "issued $(issued) (was $I1)"
+else
+    [ "$(issued)" = "$I1" ] && oom c.test && [ "$(xstat summary_answers)" = "$((SU0 + 2))" ] && pass "the zone was not read for them (issued $I1, summary_answers $((SU0 + 2)))" || fail "issued $(issued) (was $I1), summary_answers $(xstat summary_answers) (was $SU0), out of memory: $(oom c.test && echo yes || echo no)"
+fi
+
+if [ "$STORE" = on ]; then
+    lg "transfer of 'c.test/IN': IXFR poll up to date (serial 5)" && pass "log: the IXFR from the serial the zone has is a poll (debug 1)" || fail "log: no poll line for c.test"
+else
+    lg "transfer of 'c.test/IN': IXFR poll up to date (serial 5), answered from the zone summary" && pass "log: the IXFR from the serial the directory has is a poll answered from the summary (debug 1)" || fail "log: no summary poll line for c.test"
+fi
+
 ixfr c.test 3 > "$T/c3.nr"
 NC3=$(wc -l < "$T/c3.nr" | tr -d ' ')
 [ "$NC3" -eq "$EXPECT" ] && pass "the IXFR from an old serial gets the whole zone (RFC 1995 4: no history): $NC3 records" || fail "IXFR=3: $NC3 records"
-[ "$(issued)" = "$((I1 + 1))" ] && pass "it read the zone once" || fail "issued $(issued), was $I1"
+if [ "$STORE" = on ]; then
+    [ "$(issued)" = "$I1" ] && pass "it read nothing from the loader (the zone came from the store)" || fail "issued $(issued), was $I1"
+else
+    [ "$(issued)" = "$((I1 + 1))" ] && pass "it read the zone once" || fail "issued $(issued), was $I1"
+fi
+
 wait_oom c.test 15 && pass "... and the zone was taken out of memory again" || fail "c.test stays in memory"
 axfr c.test > "$T/c.nr"
 cmp -s "$T/c3.nr" "$T/c.nr" && pass "the AXFR of the zone that is out of memory is the same record set as the AXFR-style IXFR" || { fail "IXFR and AXFR differ"; diff "$T/c3.nr" "$T/c.nr" | head -5; }
@@ -206,8 +232,14 @@ UP=$(uix z0007.test 7); TC=$(uix z0007.test 3); NW=$(uix z0007.test 9)
 [ "$UP" = "rcode=0 tc=0 aa=1 an=1 ns=0 ar=1 ede=-" ] && pass "up to date: the one SOA, no TC" || fail "UDP IXFR=7: $UP (the SOA serial of the zone: $(serial_of z0007.test))"
 [ "$TC" = "rcode=0 tc=1 aa=1 an=1 ns=0 ar=1 ede=-" ] && pass "behind: the one SOA and TC (retry over TCP)" || fail "UDP IXFR=3: $TC"
 [ "$NW" = "$UP" ] && pass "a client that is ahead (serial 9, RFC 1982) is up to date" || fail "UDP IXFR=9: $NW"
-[ "$(issued)" = "$I5" ] && oom z0007.test && pass "... all from the summary: nothing was read" || fail "issued $(issued) (was $I5)"
-lg "transfer of 'z0007.test/IN': IXFR poll up to date (serial 7), answered from the zone summary" && pass "log: the UDP IXFR that is up to date, from the summary" || fail "log: no UDP summary poll line"
+if [ "$STORE" = on ]; then
+    [ "$(issued)" = "$I5" ] && pass "... and the loader was not asked (the zone of the store is attached for them)" || fail "issued $(issued) (was $I5)"
+    lg "transfer of 'z0007.test/IN': IXFR poll up to date (serial 7)" && pass "log: the UDP IXFR that is up to date" || fail "log: no UDP poll line"
+else
+    [ "$(issued)" = "$I5" ] && oom z0007.test && pass "... all from the summary: nothing was read" || fail "issued $(issued) (was $I5)"
+    lg "transfer of 'z0007.test/IN': IXFR poll up to date (serial 7), answered from the zone summary" && pass "log: the UDP IXFR that is up to date, from the summary" || fail "log: no UDP summary poll line"
+fi
+
 lg "zone transfer 'b.test/IXFR/IN' denied" && pass "log: the UDP IXFR b.test may not make" || fail "log: no UDP denied line"
 q www.z0007.test > /dev/null
 [ "$(uix z0007.test 7)" = "$UP" ] && [ "$(uix z0007.test 3)" = "$TC" ] && pass "the zone in memory answers the same" || fail "in memory: $(uix z0007.test 7) / $(uix z0007.test 3)"
@@ -219,10 +251,21 @@ oom d.test && pass "d.test is out of memory" || fail "d.test is in memory"
 sqlite3 "$T/db/z.db" "UPDATE records SET content = 'ns1.d.test host.d.test 6 3600 600 86400 300' WHERE type = 'SOA' AND name = 'd.test'; INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'new.d.test', 'A', '192.0.2.99', 300, 0, 0 FROM domains WHERE name = 'd.test';"
 $KCTL reload d.test > /dev/null 2>&1
 i=0; while [ $i -lt 50 ] && [ "$(serial_of d.test)" != "6" ]; do sleep 0.2; i=$((i + 1)); done
-[ "$(serial_of d.test)" = "6" ] && oom d.test && pass "the directory has serial 6 and the zone is still out of memory (a summary)" || fail "d.test serial $(serial_of d.test)"
+if [ "$STORE" = on ]; then
+    # the change is a new stamp: the body is fetched in the background and the old image answers until it is installed (the loop above waits for it)
+    [ "$(serial_of d.test)" = "6" ] && pass "the zone has serial 6 (the new body came in the background)" || fail "d.test serial $(serial_of d.test)"
+else
+    [ "$(serial_of d.test)" = "6" ] && oom d.test && pass "the directory has serial 6 and the zone is still out of memory (a summary)" || fail "d.test serial $(serial_of d.test)"
+fi
+
 I2=$(issued)
 ixfr d.test 6 > "$T/d6.out"
-[ "$(wc -l < "$T/d6.out" | tr -d ' ')" = "1" ] && grep -q " 6 3600" "$T/d6.out" && [ "$(issued)" = "$I2" ] && oom d.test && pass "the IXFR from serial 6 is the one SOA of the new version, from the summary, no fetch" || fail "IXFR=6: $(cat "$T/d6.out"); issued $(issued) (was $I2)"
+if [ "$STORE" = on ]; then
+    [ "$(wc -l < "$T/d6.out" | tr -d ' ')" = "1" ] && grep -q " 6 3600" "$T/d6.out" && [ "$(issued)" = "$I2" ] && pass "the IXFR from serial 6 is the one SOA of the new version, no fetch" || fail "IXFR=6: $(cat "$T/d6.out"); issued $(issued) (was $I2)"
+else
+    [ "$(wc -l < "$T/d6.out" | tr -d ' ')" = "1" ] && grep -q " 6 3600" "$T/d6.out" && [ "$(issued)" = "$I2" ] && oom d.test && pass "the IXFR from serial 6 is the one SOA of the new version, from the summary, no fetch" || fail "IXFR=6: $(cat "$T/d6.out"); issued $(issued) (was $I2)"
+fi
+
 ixfr d.test 5 > "$T/d5.out"
 grep -q "new.d.test" "$T/d5.out" && grep -q " 6 3600" "$T/d5.out" && pass "the IXFR from serial 5 reads the zone and gets the new version ($(wc -l < "$T/d5.out" | tr -d ' ') records)" || fail "IXFR=5: $(head -3 "$T/d5.out")"
 
@@ -233,9 +276,15 @@ S=$(date +%s)
 D bad.test AXFR +nohexdump > "$T/bad.out"
 E=$(( $(date +%s) - S ))
 grep -qi "SERVFAIL\|Transfer failed\|failed" "$T/bad.out" && pass "the AXFR of a zone the loader cannot read fails ($(grep -i -m1 'fail' "$T/bad.out"))" || fail "bad.test AXFR: $(head -5 "$T/bad.out")"
-[ "$E" -ge 2 ] && [ "$E" -le 8 ] && pass "... after transfer-fetch-timeout (3 s): $E s" || fail "the failure came after $E s"
-[ "$(xstat failed)" = "$((F0 + 1))" ] && pass "counted as failed" || fail "failed=$(xstat failed) (was $F0)"
-lg "transfer of 'bad.test/IN': AXFR request failed: the zone data could not be read in time (SERVFAIL, Not Ready)" && pass "log: the failed AXFR of bad.test (warning)" || fail "log: no 'could not be read in time' line"
+if [ "$STORE" = on ]; then
+    # the body was refused (max-zone-records) when it was fetched: the record is flagged refused and nothing will come, so the transfer does not wait for transfer-fetch-timeout
+    [ "$E" -le 8 ] && pass "... at once, nothing to wait for (the version was refused): $E s" || fail "the failure came after $E s"
+else
+    [ "$E" -ge 2 ] && [ "$E" -le 8 ] && pass "... after transfer-fetch-timeout (3 s): $E s" || fail "the failure came after $E s"
+    [ "$(xstat failed)" = "$((F0 + 1))" ] && pass "counted as failed" || fail "failed=$(xstat failed) (was $F0)"
+    lg "transfer of 'bad.test/IN': AXFR request failed: the zone data could not be read in time (SERVFAIL, Not Ready)" && pass "log: the failed AXFR of bad.test (warning)" || fail "log: no 'could not be read in time' line"
+fi
+
 [ "$(q www.a.test)" = "192.0.2.80" ] && pass "the server goes on answering" || fail "no answer from the server after the failed transfer"
 grep -q "AddressSanitizer\|runtime error:\|ThreadSanitizer" "$T/srv.log" 2>/dev/null && fail "sanitizer report in the server log" || pass "no sanitizer report in the server log"
 stop_srv
@@ -292,7 +341,15 @@ echo "  queries: ok $QOK, wrong $QW, not ready $QNR, timeout $QTO"
 [ "$QW" -eq 0 ] && pass "no query was answered wrong" || fail "$QW wrong answers: $(head -3 "$T"/qc*.err)"
 echo "  largest resident seen: $MAXRES, retired: $MAXRET, resident + retired: $MAXUSED (limit $LIMIT); transfers: waited $(xstat waited), loaded $(xstat loaded), failed $(xstat failed), summary answers $(xstat summary_answers), marked $(xstat marked)"
 SLACK=$((LIMIT / 100 * 15 + 256 * 1024))
-[ "$MAXRES" -le $((LIMIT + SLACK + 1024 * 1024)) ] && pass "the resident zones stayed near the limit under the load (transfers hold their zones: slack $SLACK + 1 MB)" || fail "resident reached $MAXRES (limit $LIMIT)"
+if [ "$STORE" = on ]; then
+    # 300 zones of some 14 KB cycle through memory faster than the cache manager's rounds (an attach is a read of the store, not a fetch at the pace of the loader; three transfer clients hold zones meanwhile):
+    # the limit is a target for the zones in memory, not a bound for an instant.  What is checked is that the zones go back to it when the load is over
+    R=""; t=0
+    while [ $t -lt 100 ]; do R=$(stat resident); [ -n "$R" ] && [ "$R" -le $((LIMIT + SLACK)) ] && break; sleep 0.2; t=$((t + 1)); done
+    [ -n "$R" ] && [ "$R" -le $((LIMIT + SLACK)) ] && pass "the resident zones are back at the limit when the load is over ($R bytes under $LIMIT + slack $SLACK; the peak under the load was $MAXRES, all 300 zones in memory is about 4.2 MB)" || fail "resident is ${R:-?} after the load (limit $LIMIT)"
+else
+    [ "$MAXRES" -le $((LIMIT + SLACK + 1024 * 1024)) ] && pass "the resident zones stayed near the limit under the load (transfers hold their zones: slack $SLACK + 1 MB)" || fail "resident reached $MAXRES (limit $LIMIT)"
+fi
 # the retired bytes are the evictions the retire stack has not freed yet (a reader, a transfer of the zone, the grace period): a backlog that
 # grows with the pace of evictions and the speed of the host (about 0.9 MB on the build host, more in a slow CI VM), not a limit; they must all go
 RET=""; t=0

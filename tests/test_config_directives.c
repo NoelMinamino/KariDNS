@@ -561,6 +561,17 @@ static void test_database_block(void) {
         CHECK(d->alias_resolver_count == 2);
         free_server_config_fields(&cfg);
     }
+    /* 0.7 fix 8: store-hot-list */
+    if (parse_ok("options { database { driver sqlite3; database-file \"/x.db\"; store-hot-list no; store-threads 32; }; };", &cfg)) {
+        CHECK(!cfg.database.store_hot_list && cfg.database.store_threads == 32);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { database { driver sqlite3; database-file \"/x.db\"; store-hot-list yes; }; };", &cfg)) {
+        CHECK(cfg.database.store_hot_list);
+        free_server_config_fields(&cfg);
+    }
+    expect_reject("store-hot-list maybe", "options { database { driver sqlite3; database-file \"/x.db\"; store-hot-list maybe; }; };");
+    expect_reject("store-threads 33", "options { database { driver sqlite3; database-file \"/x.db\"; store-threads 33; }; };");
     /* defaults */
     if (parse_ok("options { database { driver sqlite3; database-file \"/x.db\"; }; };", &cfg)) {
         const database_config_t *d = &cfg.database;
@@ -568,7 +579,9 @@ static void test_database_block(void) {
         CHECK(d->signer_wait);                                                        /* 0.6.0 item C: signer-wait defaults to yes */
         CHECK(d->bulk_threshold == 25 && d->max_zone_records == 10000000ull && d->max_zone_bytes == 1ull << 30);
         CHECK(d->db_reload_timeout == 30 && d->ingest_threads == 1 && d->loader_threads == 1);
-        CHECK(d->park_max == 0 && d->park_timeout_ms == 0);                          /* (0: the worker's defaults, 1024 and 1500 ms) */
+        CHECK(d->park_max == 0 && d->park_timeout_ms == 0);                          /* (0: the worker's defaults, 16384 and 1500 ms) */
+        CHECK(d->store_hot_list && d->store_threads == 0);                           /* 0.7: hot.list is on by default; 0: the default number of store threads (8) */
+        CHECK(KARIDNS_DB_STORE_THREADS_DEFAULT == 8 && KARIDNS_DB_STORE_THREADS_MAX == 32);
         CHECK(d->memory_limit == 0);                                                  /* (0: no limit, every database zone stays in memory) */
         CHECK(d->fetch_rate == 0);                                                    /* (0.7 P-A: 0 is the default, unlimited) */
         CHECK(d->transfer_fetch_timeout_ms == 0);                                     /* (0: the default, 10 seconds) */

@@ -206,7 +206,7 @@ static void test_fi_axfr_install_failure_keeps_state(void) {
         zone_db_entry_t entry;
         memset(&entry, 0, sizeof(entry));
         entry.domain = "fiinst.example.";
-        strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+        entry.view_name = "default";
         pthread_mutex_init(&entry.writer_lock, NULL);
         pthread_mutex_init(&entry.ixfr_history.lock, NULL);
         atomic_store_explicit(&entry.rcu.active, &zone_version_empty, memory_order_release);

@@ -800,33 +800,33 @@ static void test_fill_observatory_snapshot(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "observatory.example.";
-    strlcpy(entry.view_name, "internal", sizeof(entry.view_name));
+    entry.view_name = "internal";
     entry.is_secondary = true;
     atomic_init(&entry.serial, 2026091901);
 
-    atomic_init(&entry.observatory.queries_total, 1000);
-    atomic_init(&entry.observatory.responses_noerror, 800);
-    atomic_init(&entry.observatory.responses_nxdomain, 100);
-    atomic_init(&entry.observatory.responses_nodata, 50);
-    atomic_init(&entry.observatory.responses_servfail, 30);
-    atomic_init(&entry.observatory.responses_refused, 20);
-    atomic_init(&entry.observatory.tcp_queries, 250);
-    atomic_init(&entry.observatory.ecs_queries, 150);
-    atomic_init(&entry.observatory.edns_queries, 900);
-    atomic_init(&entry.observatory.dnssec_do_queries, 400);
-    atomic_init(&entry.observatory.rrl_dropped, 15);
-    atomic_init(&entry.observatory.rrl_slipped, 5);
-    atomic_init(&entry.observatory.notify_sent, 10);
-    atomic_init(&entry.observatory.notify_ack, 8);
-    atomic_init(&entry.observatory.axfr_success, 3);
-    atomic_init(&entry.observatory.ixfr_success, 7);
-    atomic_init(&entry.observatory.wirecache_hits, 600);
-    atomic_init(&entry.observatory.wirecache_misses, 400);
+    atomic_init(&entry.ctr[ZCTR_QUERIES], (uint32_t)(1000));
+    atomic_init(&entry.ctr[ZCTR_NOERROR], (uint32_t)(800));
+    atomic_init(&entry.ctr[ZCTR_NXDOMAIN], (uint32_t)(100));
+    atomic_init(&entry.ctr[ZCTR_NODATA], (uint32_t)(50));
+    atomic_init(&entry.ctr[ZCTR_SERVFAIL], (uint32_t)(30));
+    atomic_init(&entry.ctr[ZCTR_REFUSED], (uint32_t)(20));
+    atomic_init(&entry.ctr[ZCTR_TCP], (uint32_t)(250));
+    atomic_init(&zone_x_need(&entry)->obs.ecs_queries, 150);
+    atomic_init(&zone_x_need(&entry)->obs.edns_queries, 900);
+    atomic_init(&entry.ctr[ZCTR_DO], (uint32_t)(400));
+    atomic_init(&zone_x_need(&entry)->obs.rrl_dropped, 15);
+    atomic_init(&zone_x_need(&entry)->obs.rrl_slipped, 5);
+    atomic_init(&zone_x_need(&entry)->obs.notify_sent, 10);
+    atomic_init(&zone_x_need(&entry)->obs.notify_ack, 8);
+    atomic_init(&zone_x_need(&entry)->obs.axfr_success, 3);
+    atomic_init(&zone_x_need(&entry)->obs.ixfr_success, 7);
+    atomic_init(&zone_x_need(&entry)->obs.wirecache_hits, 600);
+    atomic_init(&zone_x_need(&entry)->obs.wirecache_misses, 400);
 
     time_t xfer_time = 1758270000;
     time_t notif_time = 1758270100;
-    atomic_init(&entry.observatory.last_transfer_time, xfer_time);
-    atomic_init(&entry.observatory.last_notify_time, notif_time);
+    atomic_init(&zone_x_need(&entry)->obs.last_transfer_time, xfer_time);
+    atomic_init(&zone_x_need(&entry)->obs.last_notify_time, notif_time);
 
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -1797,14 +1797,14 @@ static void test_control_socket_thread_and_commands(void) {
     zone_db_entry_t z_master;
     memset(&z_master, 0, sizeof(z_master));
     z_master.domain = "example.com.";
-    strlcpy(z_master.view_name, "default", sizeof(z_master.view_name));
+    z_master.view_name = "default";
     atomic_init(&z_master.serial, 2026091901);
     atomic_init(&z_master.refresh, 3600);
 
     zone_db_entry_t z_slave;
     memset(&z_slave, 0, sizeof(z_slave));
     z_slave.domain = "slave.example.";
-    strlcpy(z_slave.view_name, "default", sizeof(z_slave.view_name));
+    z_slave.view_name = "default";
     z_slave.is_secondary = true;
     atomic_init(&z_slave.serial, 100);
     atomic_init(&z_slave.refresh, 1800);
@@ -1975,8 +1975,8 @@ static void test_control_socket_thread_and_commands(void) {
     assert(len > 0 && strncmp(out, "ERROR a program zone cannot be rolled back", 42) == 0);
     zc_master.type = "master";
     atomic_store(&z_master.rolled_back, true);
-    atomic_store(&z_master.rb_serial, 2026091902);
-    atomic_store(&z_master.rb_from, 2026091901);
+    atomic_store(&zone_x_need(&z_master)->rb_serial, 2026091902);
+    atomic_store(&zone_x_need(&z_master)->rb_from, 2026091901);
     len = run_ctrl_cmd(&sun, secret_key, "zonestatus example.com.\n", out, sizeof(out));
     assert(len > 0 && strstr(out, " rolled back (serial 2026091902, from 2026091901)") != NULL);
     atomic_store(&z_master.rolled_back, false);
@@ -2242,13 +2242,13 @@ static void test_control_restricted_keys(void) {
     zone_db_entry_t z_master;
     memset(&z_master, 0, sizeof(z_master));
     z_master.domain = "example.com.";
-    strlcpy(z_master.view_name, "default", sizeof(z_master.view_name));
+    z_master.view_name = "default";
     atomic_init(&z_master.serial, 2026091901);
     atomic_init(&z_master.refresh, 3600);
     zone_db_entry_t z_slave;
     memset(&z_slave, 0, sizeof(z_slave));
     z_slave.domain = "slave.example.";
-    strlcpy(z_slave.view_name, "default", sizeof(z_slave.view_name));
+    z_slave.view_name = "default";
     z_slave.is_secondary = true;
     atomic_init(&z_slave.serial, 100);
     atomic_init(&z_slave.refresh, 1800);
@@ -2690,7 +2690,7 @@ static void test_async_io_pool_and_tasks(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "async.example.com.";
-    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    entry.view_name = "default";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -4810,37 +4810,37 @@ static void test_catalog_member_primary_key_precedence_and_port(void) {
     assert(e);
     e->is_catalog_member = true;
     e->is_secondary = true;
-    e->catalog_master = calloc(1, sizeof(*e->catalog_master));
-    assert(e->catalog_master);
+    zone_x_need(e)->catalog_master = calloc(1, sizeof(*zone_xr(e)->catalog_master));
+    assert(zone_xr(e)->catalog_master);
     axfr_bg_ctx_t *ctx = calloc(1, sizeof(*ctx));
     assert(ctx);
     strlcpy(ctx->domain, "m.example.", sizeof(ctx->domain));
 
     /* the catalog zone has a tsig-key, the server statement a key: the server statement wins; no port: options { port } */
-    strlcpy(e->catalog_master->ip, "192.0.2.1", sizeof(e->catalog_master->ip));
-    strlcpy(e->catalog_master->zone_key, "kz", sizeof(e->catalog_master->zone_key));
+    strlcpy(zone_xr(e)->catalog_master->ip, "192.0.2.1", sizeof(zone_xr(e)->catalog_master->ip));
+    strlcpy(zone_xr(e)->catalog_master->zone_key, "kz", sizeof(zone_xr(e)->catalog_master->zone_key));
     xfr_build_primaries(&cfg, NULL, e, NULL, ctx);
     assert(ctx->nprim == 1 && ctx->prim[0].port == 5300);
     assert(ctx->prim[0].has_tsig && strcmp(ctx->prim[0].tsig_name, "ks") == 0);
 
     /* the key written on the primaries element is above the server statement */
     memset(ctx->prim, 0, sizeof(ctx->prim));
-    strlcpy(e->catalog_master->key, "ke", sizeof(e->catalog_master->key));
-    e->catalog_master->port = 6000;
+    strlcpy(zone_xr(e)->catalog_master->key, "ke", sizeof(zone_xr(e)->catalog_master->key));
+    zone_xr(e)->catalog_master->port = 6000;
     xfr_build_primaries(&cfg, NULL, e, NULL, ctx);
     assert(ctx->nprim == 1 && ctx->prim[0].port == 6000);
     assert(ctx->prim[0].has_tsig && strcmp(ctx->prim[0].tsig_name, "ke") == 0);
 
     /* a primary no server statement covers: the catalog zone's tsig-key */
     memset(ctx->prim, 0, sizeof(ctx->prim));
-    e->catalog_master->key[0] = '\0';
-    strlcpy(e->catalog_master->ip, "192.0.2.9", sizeof(e->catalog_master->ip));
+    zone_xr(e)->catalog_master->key[0] = '\0';
+    strlcpy(zone_xr(e)->catalog_master->ip, "192.0.2.9", sizeof(zone_xr(e)->catalog_master->ip));
     xfr_build_primaries(&cfg, NULL, e, NULL, ctx);
     assert(ctx->nprim == 1 && ctx->prim[0].has_tsig && strcmp(ctx->prim[0].tsig_name, "kz") == 0);
 
     /* no key anywhere: an unsigned transfer */
     memset(ctx->prim, 0, sizeof(ctx->prim));
-    e->catalog_master->zone_key[0] = '\0';
+    zone_xr(e)->catalog_master->zone_key[0] = '\0';
     xfr_build_primaries(&cfg, NULL, e, NULL, ctx);
     assert(ctx->nprim == 1 && !ctx->prim[0].has_tsig);
 
@@ -5359,7 +5359,7 @@ static void test_fill_observatory_snapshot_all_counters(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "allstats.example.";
-    atomic_store_explicit(&entry.observatory.queries_total, 42, memory_order_relaxed);
+    atomic_store_explicit(&entry.ctr[ZCTR_QUERIES], (uint32_t)(42), memory_order_relaxed);
 
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -7916,11 +7916,11 @@ static void test_obspage_select_and_totals(void) {
         int k = (i * 7) % N;   /* scrambled: 7 and 23 are coprime */
         snprintf(zs_name[i], sizeof(zs_name[i]), "z%02d.%s.", k, (k % 5 == 0) ? "five" : "other");
         zs[i].domain = zs_name[i];
-        snprintf(zs[i].view_name, sizeof(zs[i].view_name), "%s", (k % 4 == 0) ? "zeta" : "alpha");
-        atomic_init(&zs[i].observatory.queries_total, (uint64_t)(k + 1));
-        atomic_init(&zs[i].observatory.tcp_queries, (uint64_t)(k % 3));
-        atomic_init(&zs[i].observatory.responses_servfail, 1);
-        atomic_init(&zs[i].observatory.xfer_failed, 2);
+        zs[i].view_name = (k % 4 == 0) ? "zeta" : "alpha";
+        atomic_init(&zs[i].ctr[ZCTR_QUERIES], (uint32_t)((uint64_t)(k + 1)));
+        atomic_init(&zs[i].ctr[ZCTR_TCP], (uint32_t)((uint64_t)(k % 3)));
+        atomic_init(&zs[i].ctr[ZCTR_SERVFAIL], (uint32_t)(1));
+        atomic_init(&zone_x_need(&zs[i])->obs.xfer_failed, 2);
         if (k % 4 == 0) vb[nb++] = &zs[i]; else va[na++] = &zs[i];
     }
     view_snapshot_t views[2];
@@ -8036,8 +8036,8 @@ static void test_server_core_rrl_slip_truncation_and_metrics(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "rrl-slip.example.";
-    atomic_init(&entry.observatory.rrl_dropped, 0);
-    atomic_init(&entry.observatory.rrl_slipped, 0);
+    atomic_init(&zone_x_need(&entry)->obs.rrl_dropped, 0);
+    atomic_init(&zone_x_need(&entry)->obs.rrl_slipped, 0);
 
     uint8_t res_buf[512];
     memset(res_buf, 0, 12);
@@ -8049,10 +8049,10 @@ static void test_server_core_rrl_slip_truncation_and_metrics(void) {
     res_buf[6] = 0; res_buf[7] = 0;
     res_buf[8] = 0; res_buf[9] = 0;
     res_buf[10] = 0; res_buf[11] = 0;
-    atomic_fetch_add_explicit(&entry.observatory.rrl_slipped, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&zone_x_need(&entry)->obs.rrl_slipped, 1, memory_order_relaxed);
 
     assert((res_buf[2] & 0x02) != 0);
-    assert(atomic_load_explicit(&entry.observatory.rrl_slipped, memory_order_relaxed) == 1);
+    assert(atomic_load_explicit(&zone_x_need(&entry)->obs.rrl_slipped, memory_order_relaxed) == 1);
 
     submit_response_log(LOG_ACT_DROP_RRL, "192.0.2.88", 5353, "rrl-slip.example.", 1, 1, 0, false, false);
 

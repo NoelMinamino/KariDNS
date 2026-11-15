@@ -1,4 +1,4 @@
-.TH KARICTL 8 "2026-11-14" "KariDNS" "KariDNS Manual"
+.TH KARICTL 8 "2026-11-16" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karictl.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karictl \- Remote Control and Management Utility for KariDNS
@@ -129,7 +129,7 @@ reconnects: N\fR (connections made by the background retry); see karidns(8)
 \fBdnstap truncated\fR is
 .RE
 .TP 8
-\fBreload [zone [view] [force]]\fR
+\fBreload [\-force | zone [view] [force]]\fR
 Without arguments, re-read the configuration file and \fBall\fR zone files (see
 \fBreconfig\fR for the replies; a full reload also drops the changes of dynamic
 updates), then, when the configuration has a \fBdatabase\fR block, ask the
@@ -171,25 +171,42 @@ was asked for; the zone answers when it is up)\fR (a plugin that never came up,
 or a refused replacement, is asked for again), \fBOK reloaded (program zone: a
 new plugin with these settings is already on its way)\fR, and \fBERROR no plugin
 runs for this zone: allow\-program\-zones is not yes, or the zone has no
-program\fR. A zone that is not in \fBkaridns.conf\fR is looked up in the
-database. For a \fBdatabase zone\fR the loader reads that zone only (also a zone
-just added to the database, which the server does not know yet). When several
-views take database zones and no view is named, the loader is asked about every
-one of them (a mapping in \fBkaridns_domain_views\fR may have moved the zone)
-and the reply is one line, \fB<z>: view <v1>: <result>; view <v2>: <result>\fR,
-\fBOK\fR when at least one view has the zone and \fBERROR\fR when it is rejected
-or failed there or when no view has it (\fBzone not found (it is not in the
-database of any view that takes database zones)\fR); a named view gives the
-single-view replies below, converts it, and sends it when its content differs
-from the version the server serves, whatever its serial; \fBforce\fR sends it
-even when the content is the same (D1a: not a zone that is out of memory and
-unchanged; there is nothing in memory to replace, the next query reads it from
-the database, and the reply is \fBunchanged, serial <n> (not in
-memory)\fR). \fBkarictl\fR waits for the loader's answer, but the server does
-not: the connection is parked and answered when the result arrives, or after
-\fBdb\-reload\-timeout\fR seconds (\fBERROR timeout: ...\fR; the reload may
-still be applied). At most 32 clients wait at once; the next ones get \fBERROR
-too many reloads are waiting for the database loader; try again
+program\fR. \fBreload \-force\fR (0.7, the zone store) is the full reload for
+which the loader lists every zone of its databases again (a manifest pass)
+instead of reading the change log from its cursor. With the zone store the
+Backend deletes the zones of a view that the pass does not list, unless that
+would delete more than 20 percent of the view's zones and more than 1,000: then
+nothing is deleted, \fBERROR\fR is logged, \fBkarictl dbstatus\fR shows
+\fBMASS\-DELETE GUARD HELD\fR and \fBkarictl store\fR has
+\fBstore.recon.guard.*\fR. \fBThe operator's release of that guard is \fBreload
+\-force\fB\fR: the pass it asks for is not held back, the zones the database no
+longer lists are deleted and the guard is let go. It needs the permission
+\fBreload\fR of a restricted control key, like a full \fBreload\fR. A zone that
+is not in \fBkaridns.conf\fR is looked up in the database. For a \fBdatabase
+zone\fR the loader reads that zone only (also a zone just added to the database,
+which the server does not know yet). When several views take database zones and
+no view is named, the loader is asked about every one of them (a mapping in
+\fBkaridns_domain_views\fR may have moved the zone) and the reply is one line,
+\fB<z>: view <v1>: <result>; view <v2>: <result>\fR, \fBOK\fR when at least one
+view has the zone and \fBERROR\fR when it is rejected or failed there or when no
+view has it (\fBzone not found (it is not in the database of any view that takes
+database zones)\fR); a named view gives the single-view replies below, converts
+it, and sends it when its content differs from the version the server serves,
+whatever its serial; \fBforce\fR sends it even when the content is the same
+(D1a: not a zone that is out of memory and unchanged; there is nothing in memory
+to replace, the next query reads it from the database, and the reply is
+\fBunchanged, serial <n> (not in memory)\fR). With the zone store (0.7) a reload
+of one zone without \fBforce\fR is decided by the version stamp of the database
+(\fBkaridns_zone_state\fR; the serial for a source without stamps; a zone
+without a stamp is always read): a zone that did not change is \fBunchanged,
+serial <n> (not in memory)\fR and is not read, one that changed has its body
+read, and the answer waits for it; \fBforce\fR reads the body whatever the stamp
+says, also for a zone that is not in memory (nearly every zone of a big server
+is stored and not in memory). \fBkarictl\fR waits for the loader's answer, but
+the server does not: the connection is parked and answered when the result
+arrives, or after \fBdb\-reload\-timeout\fR seconds (\fBERROR timeout: ...\fR;
+the reload may still be applied). At most 32 clients wait at once; the next ones
+get \fBERROR too many reloads are waiting for the database loader; try again
 later\fR. Replies (all \fBOK\fR unless marked):
 .RS 8
 .IP \(bu 2
@@ -284,7 +301,12 @@ Send DNS NOTIFY messages for \fB<zone>\fR now: to the \fBalso\-notify\fR servers
 and to the addresses of the zone's apex NS hosts, except the host named in the
 SOA MNAME field (RFC 1996 \[u00A7]3.2). Zones served from a database are found
 too; one that is hidden by a configured zone or a catalog member of the same
-name answers \fBERROR zone is not served from the database ...\fR.
+name answers \fBERROR zone is not served from the database ...\fR. A database
+zone of the zone store (0.7) that is not in memory is attached first (the answer
+is \fBOK (the zone is not in memory: it is attached first)\fR), and its NOTIFY
+is sent when it is there; if a name server of the zone is in another stored zone
+that is not in memory, that zone is asked for too and the NOTIFY waits for it
+for a second at the most.
 .TP 8
 \fBretransfer <zone> [view]\fR
 For a secondary zone (including a catalog member zone), discard the current
@@ -352,6 +374,12 @@ the data back that you rolled back). A change only in a file that the zone
 \fB$INCLUDE\fRs is not noticed by that check: use \fBforce\fR. \fBreconfig\fR
 already skips files that did not change. A restart reads the file again.
 .IP \(bu 2
+\fBDatabase zone in the zone store (0.7).\fR A zone that is in memory is found
+like any other. One that is not in memory has no previous version to go back to
+(the store holds the current image only; the version before the last one is kept
+with the zone in memory): the answer is \fBERROR the zone is in the zone store
+and not in memory: it has no previous version to roll back to ...\fR.
+.IP \(bu 2
 \fBDatabase zone.\fR The server compares the loader's (source id, serial,
 digest) with what it recorded when it installed the zone, and a rollback does
 not change that record, so the rolled-back version stays until the data in the
@@ -381,10 +409,13 @@ refresh=<n> retry=<n> expire=<n>\fR; for a secondary the values the zone uses,
 held to \fBmin\-refresh\-time\fR ... \fBmax\-retry\-time\fR). For a zone from
 the database the line goes on with \fBsource=database view=<v> id=<domains.id>
 result=<applied|rejected|shadowed (hidden by ...)>\fR and the last error, if
-any. A secondary that applies settings received from its primary (Extended AXFR
-version 3, see karidns(8)) adds \fBsettings=primary\fR (and \fBnote: ...\fR when
-part of them is not in force, e.g. a TSIG key the received \fBallow\-transfer\fR
-names is not defined here).
+any; a zone of the zone store (0.7) that is not in memory shows the record of
+the store (its serial and id) and \fB(in the zone store, not in memory)\fR, or
+\fB(in the zone store without a body yet: ...)\fR for a zone the store knows and
+has not read from the database yet. A secondary that applies settings received
+from its primary (Extended AXFR version 3, see karidns(8)) adds
+\fBsettings=primary\fR (and \fBnote: ...\fR when part of them is not in force,
+e.g. a TSIG key the received \fBallow\-transfer\fR names is not defined here).
 .TP 8
 \fBobservatory [zone [view]]\fR
 Display per-zone statistics for all zones, or only for the given zone (and
@@ -506,9 +537,9 @@ requests that found the bucket short (a query waits for a token); \fBissued\fR
 counts the zones the Backend asked the loader for: a query, a transfer, the
 warm-up), then \fBfetchq: in_flight=N places=N peak=N table_full=N
 ring_dropped=N park_full=N park_timeout=N loader_busy=N ingest_busy=P%
-hist=A,B,C,D,E queued=N queue_peak=N waited=N queue_dropped=N queue_full=N\fR
-(0.7: where a fetch is held up; all counted since the start except
-\fBin_flight\fR, \fBqueued\fR and \fBingest_busy\fR: \fBin_flight\fR and
+fill_busy=P% hist=A,B,C,D,E queued=N queue_peak=N waited=N queue_dropped=N
+queue_full=N\fR (0.7: where a fetch is held up; all counted since the start
+except \fBin_flight\fR, \fBqueued\fR and \fBingest_busy\fR: \fBin_flight\fR and
 \fBpeak\fR are the fetches on their way now and the most there have been at one
 time; \fBplaces\fR, the places of \fBfetch\-concurrency\fR in use now
 (whole-zone fetches in flight: 0 at rest); \fBqueued\fR, \fBqueue_peak\fR and
@@ -525,39 +556,40 @@ found the table of parked queries full (\fBpark\-max\fR); \fBpark_timeout\fR,
 parked queries whose zone was not there before \fBpark\-timeout\fR;
 \fBloader_busy\fR, fetches the loader turned away because its queue was full;
 \fBingest_busy\fR, the share of the last ten seconds the ingest thread was
-working instead of waiting, 0 for the first ten seconds; \fBhist\fR, the time
-from the request to the install of the fetches that succeeded: up to 1 ms, up to
-10 ms, up to 100 ms, up to 1 s, more; see "\fBkarictl dbstatus\fR shows it"
-under "Memory limit (D1a)" in \fBkaridns(8)\fR), the NOTIFY of zones that are
-out of memory (D1a: \fBnotify of zones out of memory: queued=N deferred=N\fR,
-the zones whose serial changed while their data was out of memory that were
-handed to the control thread, and the ones that did not fit in the ring of 1024
-and are queued later), the zone transfers of zones that are out of memory (D1a,
-\fBtransfers of zones out of memory: waited=N loaded=N failed=N
-summary_answers=N marked=N timeout=Nms\fR: transfers that had to wait for the
-zone, the zones they got, the ones that ended with SERVFAIL, the IXFRs answered
-from the summary without reading the zone, the zones marked evict-next, and
-\fBtransfer\-fetch\-timeout\fR) and the cost of the zone directory (\fBzone
-directory: N elements, B bytes in the registry + I bytes in the indexes of the
-views (P bytes per zone)\fR; the entries and images are not in it), then
-\fBalias: scans=N\fR (0.7: how many times the thread that resolves the targets
-of ALIAS records scanned the zone directory for them since the start; a scan
-follows a zone with ALIAS records coming, changing, going or being taken out of
-memory and a reconfiguration, not every zone that is fetched or evicted, so the
-number stays where it is while zones without ALIAS records come and go; see
-"Expansion" under POWERDNS ALIAS AND LUA RECORDS in \fBkaridns(8)\fR). The
-warm-up and the cache (D1a step 7): \fBresidency: directory=N resident=N
-out_of_memory=N evictions=N\fR (the zones of the directory with and without data
-in memory), \fBqueries: answered=N parked=N hit_rate=P%\fR (the queries the
-zones answered, and the ones that had to wait for their zone; the hit rate is
-the share answered by a zone already in memory), \fBwarm: received=0|1 queued=N
-loaded=N skipped=N (memory limit N, already in memory or gone N) failed=N
-pending=N in_flight=N\fR (the zones of the loader's hot list: queued to read,
-read, not read because the memory limit's high water mark was reached or because
-they were in memory or gone, failed, still waiting, being read),
-\fBwarm\-before\-serve: off\fR, \fBholding the queries (N ms left)\fR or
-\fBqueries accepted after N ms\fR (the queries are held while the hot list is
-read; the control channel is not), and \fBstate\-file: <path>
+working instead of waiting, 0 for the first ten seconds; \fBfill_busy\fR, the
+part of that the bodies of the first fill (the background fetch of the zones the
+store lists without a body) took; \fBhist\fR, the time from the request to the
+install of the fetches that succeeded: up to 1 ms, up to 10 ms, up to 100 ms, up
+to 1 s, more; see "\fBkarictl dbstatus\fR shows it" under "Memory limit (D1a)"
+in \fBkaridns(8)\fR), the NOTIFY of zones that are out of memory (D1a: \fBnotify
+of zones out of memory: queued=N deferred=N\fR, the zones whose serial changed
+while their data was out of memory that were handed to the control thread, and
+the ones that did not fit in the ring of 1024 and are queued later), the zone
+transfers of zones that are out of memory (D1a, \fBtransfers of zones out of
+memory: waited=N loaded=N failed=N summary_answers=N marked=N timeout=Nms\fR:
+transfers that had to wait for the zone, the zones they got, the ones that ended
+with SERVFAIL, the IXFRs answered from the summary without reading the zone, the
+zones marked evict-next, and \fBtransfer\-fetch\-timeout\fR) and the cost of the
+zone directory (\fBzone directory: N elements, B bytes in the registry + I bytes
+in the indexes of the views (P bytes per zone)\fR; the entries and images are
+not in it), then \fBalias: scans=N\fR (0.7: how many times the thread that
+resolves the targets of ALIAS records scanned the zone directory for them since
+the start; a scan follows a zone with ALIAS records coming, changing, going or
+being taken out of memory and a reconfiguration, not every zone that is fetched
+or evicted, so the number stays where it is while zones without ALIAS records
+come and go; see "Expansion" under POWERDNS ALIAS AND LUA RECORDS in
+\fBkaridns(8)\fR). The warm-up and the cache (D1a step 7): \fBresidency:
+directory=N resident=N out_of_memory=N evictions=N\fR (the zones of the
+directory with and without data in memory), \fBqueries: answered=N parked=N
+hit_rate=P%\fR (the queries the zones answered, and the ones that had to wait
+for their zone; the hit rate is the share answered by a zone already in memory),
+\fBwarm: received=0|1 queued=N loaded=N skipped=N (memory limit N, already in
+memory or gone N) failed=N pending=N in_flight=N\fR (the zones of the loader's
+hot list: queued to read, read, not read because the memory limit's high water
+mark was reached or because they were in memory or gone, failed, still waiting,
+being read), \fBwarm\-before\-serve: off\fR, \fBholding the queries (N ms
+left)\fR or \fBqueries accepted after N ms\fR (the queries are held while the
+hot list is read; the control channel is not), and \fBstate\-file: <path>
 at_start=... hot_lists_sent=N ... acks: written=N unchanged=N failed=N ...\fR
 (what the loader found in its state file at its start, how many hot lists the
 Backend sent, and what the loader answered; \fBstate\-file: none\fR without
@@ -595,13 +627,423 @@ summary also counts the distinct settings (zones with the same settings share
 one block) and the zones that name an undefined key. A zone that was rejected
 keeps serving its last good version (its serial is shown). Without a
 \fBdatabase\fR block the server answers \fBERROR no database block is
-configured\fR.
+configured\fR. With the zone store (0.7) the \fBstore pass:\fR line shows the
+reconcile with the loader: the pass that runs or ran last (the entries it
+listed, new / changed / renamed / unchanged / already asked for / refused with
+this version), the sweep (zones the pass did not list, deleted), the bodies
+(records without one now, fetched, failed, in flight) and the changes applied; a
+\fBMASS\-DELETE GUARD HELD:\fR line says that a sweep was held back (more than
+20 percent of a view's zones and more than 1,000 are not in the database) and
+that \fBkarictl reload \-force\fR releases it.
 .RS 8
 .PP
 .RS 2
 .nf
 karictl dbstatus
 karictl dbstatus example.test
+.fi
+.RE
+.RE
+.TP 8
+\fBstore [\-j | \-k] [zone <name> [view]]\fR
+Show the zone store of the database zones (0.7): its state, the zones in it, the
+zones in memory, how often zones were attached and how fast, the queries that
+had to wait for a zone ("cold" queries), the second-level cache and the memory
+advice. Every figure is a counter, a value kept where it changes, or a bounded
+sample: a request never walks the zones, and a poll costs the same at 10 million
+zones as at a hundred, so it is safe once a second. Reading never resets a
+counter. \fBstore\fR needs the same permission as \fBdbstatus\fR (a
+\fBread\-only yes\fR key has it).
+.RS 8
+.PP
+Three forms of the same figures: the default is text in sections for a person;
+\fB\-j\fR is one JSON object; \fB\-k\fR is one \fBkey=value\fR line per figure
+for shell scripts. WebAdmin and the dnstap-live dashboard poll the JSON
+form. \fBzone <name> [view]\fR shows the record of one zone instead: one index
+lookup, the zone is not attached (a name that exists in several views needs the
+view; case and a trailing dot do not matter). Without a store in the
+configuration, or before the Backend has opened it, the command still works:
+\fBstore.state\fR is \fBnone\fR, and the attach counters and the memory figures
+are there.
+.PP
+.RS 2
+.nf
+karictl store
+karictl store \-j
+karictl store \-k | grep '^store.attach.p99_us='
+karictl store zone example.test
+karictl store \-j zone example.test external
+.fi
+.RE
+.PP
+On ZFS the server cannot read the ARC statistics (it runs in a sandbox);
+\fBstore.cache.kind\fR is \fBarc\fR, and \fBkarictl\fR itself appends the
+\fBstore.cache.arc.*\fR keys from \fBkstat.zfs.misc.arcstats.*\fR. On UFS the
+share of segment pages that are in memory is a \fBmincore(2)\fR sample of at
+most 4096 random pages, taken at most every 10 seconds; where \fBmincore\fR is
+not allowed \fBstore.cache.page.available\fR is 0 and
+\fBstore.cache.page.note\fR says \fBn/a\fR and why.
+.PP
+\fBThe names of the keys are an interface.\fR They are flat and dotted, the same
+in the \fB\-j\fR and the \fB\-k\fR form; in JSON every number is a number (an
+integer, never a string, never a float) and every other value a
+string. \fBschema\fR is the version of the list (now 1): a key is never renamed
+or given another unit within a schema, new keys can appear at any time, so a
+reader takes the keys it knows and ignores the others. Names ending in
+\fB_bytes\fR are bytes, \fB_us\fR microseconds, \fB_pct\fR an integer
+percentage; a latency percentile is the upper bound of the bucket it falls in
+(the buckets are 1, 2, 4, ... 8388608 microseconds, so it is exact to a factor
+of 2); \fBmax_us\fR is exact. A rate is the difference of a counter between two
+polls divided by the difference of \fBstore.time.mono_ms\fR (the server's
+monotonic clock in milliseconds; \fBstore.time.unix\fR is the wall clock in
+seconds).
+.TP 8
+\fBschema\fR
+Version of this key list (1)
+.TP 8
+\fBstore.time.mono_ms\fR, \fBstore.time.unix\fR
+Server's monotonic clock in milliseconds, wall clock in seconds, at the moment
+of the reply
+.TP 8
+\fBstore.state\fR
+\fBnone\fR (no store), \fBok\fR, or \fBdegraded\fR (the disk is full: new and
+changed zones are kept without an image until room is back; \fBstore.space.*\fR)
+.TP 8
+\fBstore.state_bits\fR
+The state as bits: 1 disk full (degraded, or the last write failed for lack of
+room), 2 repaired at the last open
+.TP 8
+\fBstore.format\fR, \fBstore.mode\fR, \fBstore.fstype\fR, \fBstore.uuid\fR
+Store format version; \fBmap\fR (segments mapped) or \fBcopy\fR (read with
+\fBpread\fR, for ZFS); file system type; store identity (32 hex digits). With
+\fBstore.state\fR \fBnone\fR this and every key down to \fBstore.cache.*\fR is
+absent
+.TP 8
+\fBstore.clean_flag\fR
+1 when the superblock on disk says "clean stop" (0 while the server runs)
+.TP 8
+\fBstore.zones.known\fR, \fB.stored\fR, \fB.rejected\fR, \fB.free\fR
+Zones in the store by state: known without an image (the database fetch has
+them), stored (an image is in the store), rejected (flagged by the last
+reconcile), free table slots
+.TP 8
+\fBstore.zones.nonstore\fR
+Zones of the database whose name the store cannot hold (the root zone): they
+have no record and are served from the heap directory (with the store protocol;
+the line is there when a loader is running)
+.TP 8
+\fBstore.zones.attached\fR
+Zones attached (in memory as images) now: successful attaches minus detaches
+.TP 8
+\fBstore.zones.image_bytes\fR
+Bytes of the stored images (records)
+.TP 8
+\fBstore.views.count\fR
+Views in the store
+.TP 8
+\fBstore.view.<n>.name\fR, \fB.known\fR, \fB.stored\fR, \fB.rejected\fR, \fB.image_bytes\fR
+The same per view, \fB<n>\fR = 0, 1, ... (the store's view number)
+.TP 8
+\fBstore.tables.zt_records\fR, \fB.zt_capacity\fR, \fB.nx_used_bytes\fR, \fB.nx_dead_bytes\fR
+Zone table records in use and room; long names, used and dead
+.TP 8
+\fBstore.tables.ix_gen\fR, \fB.ix_slots\fR, \fB.ix_used\fR, \fB.ix_live\fR, \fB.sx_gen\fR, \fB.sx_slots\fR, \fB.sx_used\fR, \fB.sx_live\fR
+Name index and source index: generation, slots, slots used, live entries
+.TP 8
+\fBstore.segments.count\fR, \fB.used_bytes\fR, \fB.live_bytes\fR, \fB.dead_pct\fR
+Image segments: highest segment number in use, bytes appended to the segments
+that exist, bytes still referenced, share that the cleaner can win
+.TP 8
+\fBstore.segments.free_numbers\fR, \fB.draining\fR, \fB.pinned\fR
+Segment numbers that are free (the segment was cleaned and removed; the number
+is used again), segments with no live record that wait for a checkpoint, a grace
+period or the end of the references, segments that an attached zone's image
+points into (MAP mode)
+.TP 8
+\fBstore.journal.lsn\fR, \fB.checkpoint_lsn\fR, \fB.committed_lsn\fR, \fB.bytes\fR, \fB.gen\fR, \fB.max_bytes\fR
+Journal position, last checkpoint, last durable commit, size, generation, the
+size at which a checkpoint is forced (100 MiB: a replay of that takes about a
+second)
+.TP 8
+\fBstore.checkpoint.count\fR, \fB.last_unix\fR, \fB.last_us\fR
+Checkpoints since the open, when the last one ended, how long it took
+.TP 8
+\fBstore.writes.commits\fR, \fB.puts\fR, \fB.replaces\fR, \fB.deletes\fR, \fB.growths\fR, \fB.errors\fR
+Writer counters since the open
+.TP 8
+\fBstore.recovery.created\fR, \fB.was_clean\fR, \fB.used_older_super\fR, \fB.rebuilt\fR, \fB.journals_read\fR, \fB.records_replayed\fR, \fB.journal_torn\fR, \fB.rebuilt_zones\fR, \fB.dropped_zones\fR, \fB.open_us\fR
+What the last open found and did, and how long it took
+.TP 8
+\fBstore.open.ix_read_us\fR, \fB.zt_readahead_us\fR, \fB.zt_readahead_done\fR
+The open reads the name index once before the first answer (\fBix_read_us\fR:
+how long that took, with the wait for the disk for every page that was not in
+memory: 17.6 MB of a million zones took 16.6 ms from a cold ARC and 1.4 ms from
+a warm one); a thread then reads the zone tables (zt and zc) into memory in the
+background (\fBzt_readahead_us\fR, 0 until \fBzt_readahead_done\fR is 1)
+.TP 8
+\fBstore.errors.total\fR
+Texts put into the error ring (\fBerr.ring\fR, the last 65,536 are kept) since
+it was made: why a zone was refused or failed
+.TP 8
+\fBstore.entries.available\fR
+1 when the figures of the server's own tables below are there (a server with the
+store on)
+.TP 8
+\fBstore.entries.pool_used\fR, \fB.pool_slabs\fR, \fB.pool_slab_bytes\fR, \fB.pool_slot_bytes\fR, \fB.pool_free_slots\fR
+The pool of zone entries: slots in use (one for every zone in memory), slabs,
+bytes of a slab, bytes of a slot (256), free slots
+.TP 8
+\fBstore.entries.attach_table_slots\fR, \fB.attach_table_grows\fR, \fB.attach_table_shrinks\fR
+The table that finds a zone in memory by its zone id: slots now, how often it
+was made larger and smaller
+.TP 8
+\fBstore.fold.zones\fR, \fB.rows\fR, \fB.replaced\fR
+Zones that left memory with their counters folded into the totals of their view,
+rows of the table of the top zones (those with the most queries that are not in
+memory), rows a busier zone took over
+.TP 8
+\fBstore.errors.memory_texts\fR, \fB.memory_noted\fR, \fB.memory_pushed_out\fR
+The texts of rejected zones in the ring in memory (512), how many were noted
+since the start, how many were pushed out by newer ones (the file \fBerr.ring\fR
+still has them; \fBstore.errors.total\fR)
+.TP 8
+\fBstore.detach.sampled\fR
+Zones that were taken out of memory because the sample of the attach table chose
+them (also in \fBstore.detach.count\fR)
+.TP 8
+\fBstore.attach.worker.ok\fR, \fB.mean_us\fR
+0.7: zones that a worker attached itself and answered from (MAP mode, the image
+in the page cache; also in \fBstore.attach.count\fR), and the mean time that
+took in microseconds
+.TP 8
+\fBstore.attach.worker.not_resident\fR, \fB.over_limit\fR, \fB.claimed\fR, \fB.failed\fR, \fB.declined\fR, \fB.full\fR
+Why a worker did not: the pages of the image were not in the page cache (or COPY
+mode); above the hard line of \fBmemory\-limit\fR; another thread had the zone;
+the image or the entry could not be made (the store threads then look at it and
+say why); a name server of the zone lies in a stored zone that is not in memory;
+the table of the staged zones or the ring was full
+.TP 8
+\fBstore.attach.worker.registered\fR, \fB.dropped\fR
+Zones that a worker attached and a store thread then registered / found in
+memory already, changed or gone (dropped: the answer the worker gave was the
+version the record had)
+.TP 8
+\fBstore.hot.state\fR, \fB.listed\fR, \fB.attached\fR, \fB.skipped\fR, \fB.written_at_stop\fR
+0.7: the hot list of the store: \fBnone\fR, \fBattaching\fR, \fBdone\fR,
+\fBhigh\-mark\fR (stopped at the high mark of \fBmemory\-limit\fR) or \fBoff\fR
+(\fBstore\-hot\-list no;\fR); the ids read at the start; the zones it attached
+and the ones it skipped (in memory already, or not stored); the ids written at
+the last stop (this run)
+.TP 8
+\fBstore.compact.runs\fR, \fB.moved_records\fR, \fB.moved_bytes\fR, \fB.segments_freed\fR, \fB.last_unix\fR
+The cleaner (since the open): segments it began to clean, records and bytes it
+copied to the open segment, segments it removed, when it last worked
+.TP 8
+\fBstore.compact.bad_records\fR, \fB.pinned_skips\fR, \fB.incomplete\fR
+Live records that failed their checksum when the cleaner was to copy them (the
+zone became known and is read from the database again), emptied segments that
+were held by an attached image (counted once each), segments the cleaner could
+not empty (a record it cannot read; it tries again after ten minutes)
+.TP 8
+\fBstore.compact.rate_bytes\fR, \fB.candidates\fR, \fB.dead_bytes\fR
+Bytes a second the cleaner may copy (0 = no limit), segments that are dead
+enough (half dead and at least a quarter of a segment or 1 MiB dead) now, dead
+bytes of all segments but the open one
+.TP 8
+\fBstore.compact.nx_reclaims\fR, \fB.nx_reclaimed_bytes\fR
+Passes that gave back the space of long zone names that were deleted
+(\fBstore.tables.nx_dead_bytes\fR), and the bytes they gave back
+.TP 8
+\fBstore.space.level\fR
+\fBok\fR, \fBlow\fR (a WARNING was said: the file system is getting full),
+\fBdegraded\fR (no room: new and changed zones are kept without an image)
+.TP 8
+\fBstore.space.fs_total_bytes\fR, \fB.fs_free_bytes\fR, \fB.checked_unix\fR
+The file system of the store, as of the last check (at every checkpoint, about
+every second while images are written)
+.TP 8
+\fBstore.space.reserve_bytes\fR, \fB.store_bytes\fR
+Free bytes that only the cleaner may use (images are refused below that: half a
+segment, 256 KiB to 128 MiB); what the store occupies
+.TP 8
+\fBstore.space.growth_bytes_per_hour\fR, \fB.full_in_hours\fR
+The growth over the last hour (0 until five minutes of history exist, or when
+the store shrinks) and the hours until the file system is full at that growth (0
+= not known)
+.TP 8
+\fBstore.space.degraded_puts\fR, \fB.enospc_events\fR, \fB.degraded_since_unix\fR
+Zones that were kept without an image because no room was left (since the open),
+writes that found no room, when the degraded state began (0 = not degraded)
+.TP 8
+\fBstore.fs.blksize\fR, \fB.recordsize_warning\fR
+\fBst_blksize\fR of a table file (on ZFS the record size of the dataset) and 1
+when it is above 32 KiB (the server says so in syslog; see "The zone store" in
+karidns.md)
+.TP 8
+\fBstore.scrub.interval_s\fR, \fB.running\fR, \fB.progress_pct\fR
+Seconds between two scrubs (0 = never), whether a pass runs, how far it is
+.TP 8
+\fBstore.scrub.passes\fR, \fB.last_start_unix\fR, \fB.last_end_unix\fR, \fB.zones_checked\fR, \fB.bytes_checked\fR
+Passes since the open, when the last began and ended, zones and bytes read
+.TP 8
+\fBstore.scrub.bad_images\fR, \fB.bad_cells\fR, \fB.bad_index\fR, \fB.io_errors\fR
+What the scrub found since the open: images whose checksum or structure was
+wrong (the zone became known and is read again), damaged table records, index
+entries that did not lead to their zone (both repaired at the end of the pass),
+read errors
+.TP 8
+\fBstore.cache.kind\fR
+\fBpage\fR (UFS: \fBmincore\fR sample), \fBarc\fR (ZFS), \fBcopy\fR
+.TP 8
+\fBstore.cache.page.available\fR
+1 when the sample worked, else 0 and \fBstore.cache.page.note\fR ("n/a: ...")
+.TP 8
+\fBstore.cache.page.sampled_pages\fR, \fB.resident_pages\fR, \fB.resident_pct\fR, \fB.sample_age_ms\fR
+The sample: pages looked at, of them in memory, the share, age of the sample
+.TP 8
+\fBstore.cache.note\fR
+On ZFS: \fBsee karictl (ARC kstats)\fR
+.TP 8
+\fBstore.cache.arc.available\fR, \fB.size_bytes\fR, \fB.target_bytes\fR, \fB.target_min_bytes\fR, \fB.target_max_bytes\fR, \fB.hits\fR, \fB.misses\fR, \fB.hit_pct\fR, \fB.compressed_bytes\fR, \fB.uncompressed_bytes\fR
+ARC figures, added by \fBkarictl\fR on ZFS (a kstat that cannot be read is left
+out)
+.TP 8
+\fBstore.memory.arc.backend_bytes\fR, \fB.arc_max_bytes\fR, \fB.loader_bytes\fR, \fB.other_bytes\fR, \fB.total_bytes\fR, \fB.ram_bytes\fR, \fB.pct\fR, \fB.level\fR, \fB.text\fR
+Added by \fBkarictl\fR on ZFS: the Backend's heap (with \fBmemory\-limit\fR its
+size under the limit, else with every zone in memory), \fBvfs.zfs.arc.max\fR,
+the loader, about 1 GB for the system, their sum against \fBhw.physmem\fR, the
+share in percent, \fBok\fR / \fBnotice\fR (above 85 percent) / \fBwarning\fR
+(above RAM) and the sentence (in the text form: the section \fBarc sum\fR)
+.TP 8
+\fBstore.attach.count\fR
+Zones attached from the store since the start
+.TP 8
+\fBstore.attach.failed\fR
+Attaches that failed; \fBstore.attach.fail.checksum\fR, \fB.record\fR,
+\fB.invalid\fR, \fB.io\fR, \fB.memory\fR, \fB.other\fR by cause
+.TP 8
+\fBstore.attach.p50_us\fR, \fB.p90_us\fR, \fB.p99_us\fR, \fB.max_us\fR
+Time of an attach
+.TP 8
+\fBstore.attach.hist.le_<2^i>us\fR, \fB.hist.more\fR
+The histogram: attaches that took at most 1, 2, 4, ... 8388608 microseconds
+(each in its own bucket, not cumulative), and longer; not in the text form
+.TP 8
+\fBstore.detach.count\fR
+Zones taken out of memory; \fBstore.detach.limit\fR (memory-limit), \fB.room\fR
+(to make room for another zone), \fB.operator\fR, \fB.other\fR by reason
+.TP 8
+\fBstore.cold.attach\fR, \fB.fetch\fR, \fB.timeout\fR
+Queries for a zone that was not attached: answered after an attach, sent to a
+database fetch (a zone with no image, or a damaged one: a query that waits for a
+fetch or an attach that another query started is not counted), ended by the park
+time-out
+.TP 8
+\fBstore.cold.p50_us\fR, \fB.p90_us\fR, \fB.p99_us\fR, \fB.max_us\fR, \fB.hist.le_<2^i>us\fR, \fB.hist.more\fR
+Time from the parked query to its answer, for \fBstore.cold.attach\fR
+.TP 8
+\fBstore.memory.available\fR
+1 when the figures below are there
+.TP 8
+\fBstore.memory.zones\fR, \fB.records\fR, \fB.basis\fR
+Zones and records the estimate is for, and where the size of a zone comes from
+(\fBassumed\fR, \fBresident\fR, \fBrecords\fR, or \fBstore\fR: the average image
+of the zones the store holds)
+.TP 8
+\fBstore.memory.tables_bytes\fR, \fB.mapped_bytes\fR, \fB.copy_mode\fR
+With the store: the size of its tables (file pages, not heap: the directory
+costs the heap nothing), every file page the Backend maps for the zones (the
+tables, and in \fBmap\fR mode the images of the zones in memory), and 1 for
+\fBcopy\fR mode (the images are heap)
+.TP 8
+\fBstore.memory.counted_all_bytes\fR, \fB.avg_zone_bytes\fR, \fB.backend_all_bytes\fR, \fB.loader_all_bytes\fR, \fB.directory_bytes\fR
+What \fBmemory\-limit\fR counts with every zone in memory, the average zone, the
+Backend and the loader with every zone in memory, the directory alone
+.TP 8
+\fBstore.memory.recommended_limit_bytes\fR, \fB.working_min_bytes\fR, \fB.fit_min_bytes\fR, \fB.limit_bytes\fR, \fB.fit_pct\fR, \fB.backend_limit_bytes\fR, \fB.loader_limit_bytes\fR
+\fBmemory\-limit\fR that keeps every zone, that keeps half, below which the
+server says ERROR, the one in force (0 = none), the share of the zones that fit,
+the Backend and the loader under it
+.TP 8
+\fBstore.memory.level\fR
+\fBok\fR, \fBnotice\fR, \fBwarning\fR or \fBerror\fR: what the server says in
+syslog about \fBmemory\-limit\fR
+.TP 8
+\fBstore.recon.available\fR
+1 when the figures below are there (the Backend has a loader that speaks the
+store protocol)
+.TP 8
+\fBstore.recon.pass.active\fR, \fB.view\fR, \fB.started_unix\fR, \fB.duration_ms\fR, \fB.estimate\fR
+The pass of the loader that is running or was the last: its view, when it
+started, how long it took (so far), the entries the loader announced
+.TP 8
+\fBstore.recon.pass.entries\fR, \fB.created\fR, \fB.changed\fR, \fB.renamed\fR, \fB.same\fR, \fB.pending\fR, \fB.kept\fR, \fB.skipped\fR
+What the pass found: zones listed, new, with another stamp, renamed, unchanged,
+already asked for, refused with this stamp and not asked for again, and the ones
+the loader could not offer (\fBn_skipped\fR)
+.TP 8
+\fBstore.recon.sweep.total\fR, \fB.unlisted\fR, \fB.deleted\fR
+The last sweep: zones of the view in the store, of them not listed by the pass,
+deleted
+.TP 8
+\fBstore.recon.passes\fR, \fB.wanted\fR, \fB.cursors_kept\fR
+Since the start: passes, zones whose body was asked for by a pass or a change,
+cursors made durable
+.TP 8
+\fBstore.recon.bodies.known\fR, \fB.fetched\fR, \fB.failed\fR, \fB.in_flight\fR
+Records without a body now (known), and what the background fetch has done since
+the start: bodies brought, failed, asked for and not here yet
+.TP 8
+\fBstore.recon.changes.upserts\fR, \fB.deletes\fR
+Entries of the change log applied (upserts and deletes)
+.TP 8
+\fBstore.recon.guard.held_views\fR
+Views whose sweep the mass-delete guard holds back (0 normally). With 1 or more:
+\fB.view\fR, \fB.unlisted\fR (zones the pass did not list), \fB.total\fR,
+\fB.since_unix\fR and \fB.release\fR (\fBkarictl reload \-force\fR)
+.TP 8
+\fBstore.zone.name\fR, \fB.view\fR, \fB.zid\fR, \fB.state\fR
+With \fBzone <name>\fR: the record of one zone (only these keys, besides
+\fBschema\fR and \fBstore.time.*\fR): name, view, zone id, \fBstored\fR or
+\fBknown\fR
+.TP 8
+\fBstore.zone.serial\fR, \fB.flags\fR, \fB.source\fR, \fB.source_id\fR, \fB.stamp_gen\fR, \fB.stamp_time\fR, \fB.settings\fR
+SOA serial of the stored version, flag bits, source number and the zone's id in
+that database, version stamp, settings id
+.TP 8
+\fBstore.zone.image_bytes\fR, \fB.segment\fR, \fB.offset\fR, \fB.digest\fR
+Size of the image, where it lies (segment and byte offset; not for a known
+zone), digest of the zone content (hex)
+.TP 8
+\fBstore.zone.attached\fR
+1 when the zone is attached now (where the server can tell)
+.PP
+A bad argument, a zone that is not in the store (\fBERROR zone not found\fR), a
+name in several views without a view, or \fBzone\fR without a store are answered
+\fBERROR ...\fR (exit status 3).
+.RE
+.TP 8
+\fBstore compact\fR, \fBstore checkpoint\fR, \fBstore scrub start\fR, \fBstore scrub stop\fR
+Change the store (0.7); they are not read commands, so they need the main
+control key (a restricted key, read-only or with \fBallow\-commands\fR, does not
+have them). \fBstore compact\fR asks the cleaner to run without its rate limit
+until no segment is dead enough (it returns at once; \fBstore.compact.*\fR shows
+the progress), then the server writes a checkpoint and removes the segments that
+are empty. The cleaner runs by itself, at 16 MiB a second at most, whenever a
+segment is half dead; this is for after a mass change, or before a
+measurement. \fBstore checkpoint\fR writes a checkpoint now (the journal is cut,
+what was written is durable) and answers when it is done. \fBstore scrub
+start\fR begins a scrub pass at once (the scrub reads every record, at most 16
+MiB a second; \fBstore\-scrub\-interval\fR starts one by itself); \fBstore scrub
+stop\fR ends the pass that runs. The answers are \fBOK ...\fR or \fBERROR ...\fR
+(exit status 3).
+.RS 8
+.PP
+.RS 2
+.nf
+karictl store compact
+karictl store \-k | grep '^store.compact.'
+karictl store scrub start
 .fi
 .RE
 .RE

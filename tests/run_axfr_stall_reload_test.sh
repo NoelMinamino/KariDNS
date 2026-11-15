@@ -338,7 +338,7 @@ else
     cat > "$T/e.conf" <<EOF
 options {
     user "nobody"; pid-file "none"; port $PE; bind-address { 127.0.0.1; };
-    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; db-reload-timeout 1; acl-ceiling { 127.0.0.1; }; };
+    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; db-reload-timeout 1; acl-ceiling { 127.0.0.1; }; store none; };
 };
 control-channel { socket "$T/e.sock"; algorithm hmac-sha256; secret "$SECRET"; };
 EOF
@@ -374,7 +374,7 @@ else
 options {
     user "nobody"; pid-file "none"; port $PF; bind-address { 127.0.0.1; }; max-transfer-time-out 1;
     database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; db-reload-timeout 1; acl-ceiling { 127.0.0.1; };
-               transfer-fetch-timeout 6000; };
+               transfer-fetch-timeout 6000; store none; };
 };
 control-channel { socket "$T/f.sock"; algorithm hmac-sha256; secret "$SECRET"; };
 EOF
@@ -382,6 +382,9 @@ EOF
     KARIDNS_SAVE=$KARIDNS; KARIDNS=$HOOKED
     START_ENV=KARIDNS_XFER_MINUTE_SECS=1; start f "$T/f.conf" "$PF" late.test; START_ENV=""
     KARIDNS=$KARIDNS_SAVE
+    # (start returns at the first answer of any kind, a REFUSED before the loader has read the zone too: wait until it is served, or there is nothing to take out of memory yet)
+    i=0; while [ "$(serial_of "$PF" late.test)" != "30" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done
+    [ "$(serial_of "$PF" late.test)" = "30" ] || fail "late.test is not served (serial '$(serial_of "$PF" late.test)')"
     LP=$(loader_of "$PID_f")
     # (1) the zone is out of memory and the loader stopped; the transfer waits 2.5 s for it (more than the 1 s time-out), then the loader goes on
     ctl f evict late.test | grep -q '^OK' && pass "late.test taken out of memory (TEST ONLY evict)" || fail "evict late.test: $(ctl f evict late.test)"

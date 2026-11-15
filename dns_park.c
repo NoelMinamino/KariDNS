@@ -1,8 +1,8 @@
 /*
  * dns_park.c - parked queries and fetch requests (see dns_park.h).
  *
- * Everything on the query path is a bounded loop over preallocated memory: no malloc, no lock.  park_init() (worker start) is the only
- * allocation.  The tables are owned by one worker thread; the rings have one producer and one consumer, with release / acquire on
+ * Everything on the query path is a bounded operation on preallocated memory: no malloc, no lock.  park_init() (worker start) is the only
+ * allocation.  The tables are owned by one worker thread; the rings have one producer (or a few that take turns) and one consumer, with release / acquire on
  * the indexes.
  */
 #include "dns_park.h"
@@ -30,55 +30,202 @@ static bool key_fits(const char *view, const char *zone, size_t *vl, size_t *zl)
 /* totals of all workers for park_stats_get(): bumped on the failure paths only (a full table, a deadline) */
 static _Atomic uint64_t g_park_full, g_park_timeout;
 
+static uint64_t name_key(const char *view, const char *zone) {
+  uint64_t h = 1469598103934665603ULL;
+  for (const char *p = view; *p; p++) h = (h ^ (uint8_t)*p) * 1099511628211ULL;
+  h = (h ^ 0xFF) * 1099511628211ULL;
+  for (const char *p = zone; *p; p++) h = (h ^ (uint8_t)(*p | 0x20)) * 1099511628211ULL;
+  return h | 1;                                          /* (never 0, the free slot of the claims) */
+}
+
+uint64_t park_name_key(const char *view, const char *zone) { return name_key(view, zone); }
+
 /* ------------------------------------------------------------------ the table */
+/* The links of an entry are index + 1 (0: none), so that zeroed memory is an empty list.  An entry is in at most one list of each kind:
+ *   the hash chain (bucket[key & bmask]) and the wheel slot: while it WAITs;
+ *   the done list: while it is READY or TIMEOUT;
+ *   the pending list: while it WAITs and its request has not been made. */
+#define ENT(t, ref) (&(t)->e[(ref) - 1u])
+#define REF(t, e) ((uint32_t)((e) - (t)->e) + 1u)
+
+static size_t blk_need_max(void) { return (((size_t)PARK_ZONE_MAX + PARK_VIEW_MAX + 2 + 7) & ~(size_t)7) + sizeof(udp_ipc_t) + PARK_UDP_MAX; }
+
 bool park_init(park_table_t *t, uint32_t cap) {
   memset(t, 0, sizeof(*t));
   if (cap == 0 || cap > (1u << 20)) return false;
+  uint32_t nbig = cap / 8 < 16 ? (cap < 16 ? cap : 16) : cap / 8;
+  uint32_t nb = 16;
+  while (nb < cap * 2) nb <<= 1;
   t->e = calloc(cap, sizeof(*t->e));                     /* zero pages are not memory until an entry is used */
   t->free_idx = malloc((size_t)cap * sizeof(*t->free_idx));
-  if (!t->e || !t->free_idx) {
-    free(t->e);
-    free(t->free_idx);
-    memset(t, 0, sizeof(*t));
+  t->bucket = calloc(nb, sizeof(*t->bucket));
+  t->wheel = calloc(PARK_WHEEL, sizeof(*t->wheel));
+  t->wbits = calloc(PARK_WHEEL / 64, sizeof(*t->wbits));
+  t->bsize[0] = PARK_BLK_SMALL;
+  t->bsize[1] = (uint32_t)blk_need_max();
+  t->blk[0] = calloc(cap, t->bsize[0]);
+  t->blk[1] = calloc(nbig, t->bsize[1]);
+  t->bfree[0] = malloc((size_t)cap * sizeof(uint32_t));
+  t->bfree[1] = malloc((size_t)nbig * sizeof(uint32_t));
+  if (!t->e || !t->free_idx || !t->bucket || !t->wheel || !t->wbits || !t->blk[0] || !t->blk[1] || !t->bfree[0] || !t->bfree[1]) {
+    park_free(t);
     return false;
   }
   t->cap = cap;
-  for (uint32_t i = 0; i < cap; i++) t->free_idx[i] = cap - 1 - i;      /* entry 0 is taken first */
+  t->bmask = nb - 1;
+  for (uint32_t i = 0; i < cap; i++) {                   /* entry 0 is taken first */
+    t->free_idx[i] = cap - 1 - i;
+    t->bfree[0][i] = cap - 1 - i;
+  }
+  for (uint32_t i = 0; i < nbig; i++) t->bfree[1][i] = nbig - 1 - i;
   t->nfree = cap;
-  t->min_deadline_ms = INT64_MAX;
+  t->bnfree[0] = cap;
+  t->bnfree[1] = nbig;
   t->next_gen = 1;
   return true;
+}
+
+/* the bytes the table reserved (calloc: a page that no entry used is not memory yet); what a full table of usual requests touches is about half of it */
+size_t park_bytes(const park_table_t *t) {
+  if (!t->e) return 0;
+  uint32_t nbig = t->cap / 8 < 16 ? (t->cap < 16 ? t->cap : 16) : t->cap / 8;
+  return (size_t)t->cap * (sizeof(*t->e) + sizeof(*t->free_idx) + t->bsize[0] + sizeof(uint32_t)) + (size_t)(t->bmask + 1) * sizeof(*t->bucket) + (size_t)PARK_WHEEL * sizeof(*t->wheel) +
+         (size_t)(PARK_WHEEL / 64) * sizeof(*t->wbits) + (size_t)nbig * (t->bsize[1] + sizeof(uint32_t));
 }
 
 void park_free(park_table_t *t) {
   free(t->e);
   free(t->free_idx);
+  free(t->bucket);
+  free(t->wheel);
+  free(t->wbits);
+  free(t->blk[0]);
+  free(t->blk[1]);
+  free(t->bfree[0]);
+  free(t->bfree[1]);
   memset(t, 0, sizeof(*t));
 }
 
-static park_entry_t *park_take(park_table_t *t, int64_t now_ms, uint32_t timeout_ms, const char *view, const char *zone, park_kind_t kind,
+static void hash_add(park_table_t *t, park_entry_t *e) {
+  uint32_t *b = &t->bucket[e->key & t->bmask];
+  e->hnext = *b;
+  *b = REF(t, e);
+}
+
+static void hash_remove(park_table_t *t, park_entry_t *e) {
+  uint32_t *p = &t->bucket[e->key & t->bmask];
+  const uint32_t me = REF(t, e);
+  while (*p && *p != me) p = &ENT(t, *p)->hnext;
+  if (*p == me) *p = e->hnext;
+  e->hnext = 0;
+}
+
+static void wheel_add(park_table_t *t, park_entry_t *e) {
+  int64_t d = e->deadline_ms < t->wcur_ms ? t->wcur_ms : e->deadline_ms;       /* (a deadline that is past is looked at with the next tick) */
+  uint32_t s = (uint32_t)((uint64_t)d & (PARK_WHEEL - 1));
+  const uint32_t me = REF(t, e);
+  e->wslot = (uint16_t)s;
+  e->wprev = 0;
+  e->wnext = t->wheel[s];
+  if (e->wnext) ENT(t, e->wnext)->wprev = me;
+  t->wheel[s] = me;
+  t->wbits[s >> 6] |= 1ull << (s & 63);
+}
+
+static void wheel_remove(park_table_t *t, park_entry_t *e) {
+  const uint32_t s = e->wslot;
+  if (e->wprev) ENT(t, e->wprev)->wnext = e->wnext;
+  else t->wheel[s] = e->wnext;
+  if (e->wnext) ENT(t, e->wnext)->wprev = e->wprev;
+  if (t->wheel[s] == 0) t->wbits[s >> 6] &= ~(1ull << (s & 63));
+  e->wprev = e->wnext = 0;
+}
+
+static void done_add(park_table_t *t, park_entry_t *e) {
+  const uint32_t me = REF(t, e);
+  e->dnext = 0;
+  e->dprev = t->dtail;
+  if (t->dtail) ENT(t, t->dtail)->dnext = me;
+  else t->dhead = me;
+  t->dtail = me;
+}
+
+static void done_remove(park_table_t *t, park_entry_t *e) {
+  if (e->dprev) ENT(t, e->dprev)->dnext = e->dnext;
+  else t->dhead = e->dnext;
+  if (e->dnext) ENT(t, e->dnext)->dprev = e->dprev;
+  else t->dtail = e->dprev;
+  e->dprev = e->dnext = 0;
+}
+
+static void unsent_add(park_table_t *t, park_entry_t *e) {
+  const uint32_t me = REF(t, e);
+  e->unext = 0;
+  e->uprev = t->utail;
+  if (t->utail) ENT(t, t->utail)->unext = me;
+  else t->uhead = me;
+  t->utail = me;
+  e->ulinked = 1;
+  t->nunsent++;
+}
+
+static void unsent_remove(park_table_t *t, park_entry_t *e) {
+  if (!e->ulinked) return;
+  if (e->uprev) ENT(t, e->uprev)->unext = e->unext;
+  else t->uhead = e->unext;
+  if (e->unext) ENT(t, e->unext)->uprev = e->uprev;
+  else t->utail = e->uprev;
+  e->uprev = e->unext = 0;
+  e->ulinked = 0;
+  t->nunsent--;
+}
+
+/* a WAIT entry leaves the indexes that only waiting entries are in (the hash, the wheel, the pending list); its state is the caller's */
+static void wait_leave(park_table_t *t, park_entry_t *e) {
+  hash_remove(t, e);
+  wheel_remove(t, e);
+  unsent_remove(t, e);
+}
+
+static void done_enter(park_table_t *t, park_entry_t *e, park_state_t st) {
+  e->state = (uint8_t)st;
+  t->nwait--;
+  t->nready++;
+  done_add(t, e);
+}
+
+static park_entry_t *park_take(park_table_t *t, int64_t now_ms, uint32_t timeout_ms, const char *view, const char *zone, park_kind_t kind, size_t req_len,
                                int32_t *idx_out) {
   size_t vl, zl;
   if (!t->e || !key_fits(view, zone, &vl, &zl)) return NULL;
-  if (t->nfree == 0) {
+  const size_t names = (zl + vl + 2 + 7) & ~(size_t)7;
+  const size_t need = kind == PARK_UDP ? names + sizeof(udp_ipc_t) + req_len : zl + vl + 2;
+  const int cls = need <= PARK_BLK_SMALL ? 0 : 1;
+  if (t->nfree == 0 || t->bnfree[cls] == 0) {
     t->n_full++;
     atomic_fetch_add_explicit(&g_park_full, 1, memory_order_relaxed);
     return NULL;
   }
   uint32_t idx = t->free_idx[--t->nfree];
+  uint32_t bi = t->bfree[cls][--t->bnfree[cls]];
   park_entry_t *e = &t->e[idx];
   uint32_t gen = t->next_gen++;
   if (t->next_gen == 0) t->next_gen = 1;                 /* 0 is never a generation */
-  memset(e, 0, offsetof(park_entry_t, u));               /* (the union is written by the caller) */
+  memset(e, 0, sizeof(*e));
   e->state = PARK_WAIT;
   e->kind = (uint8_t)kind;
   e->zlen = (uint8_t)zl;
   e->vlen = (uint8_t)vl;
   e->gen = gen;
+  e->blk = ((uint32_t)cls << 31) | bi;
   e->deadline_ms = now_ms + (int64_t)timeout_ms;
-  memcpy(e->view, view, vl + 1);
-  memcpy(e->zone, zone, zl + 1);
-  if (e->deadline_ms < t->min_deadline_ms) t->min_deadline_ms = e->deadline_ms;
+  e->key = name_key(view, zone);
+  e->pl = t->blk[cls] + (size_t)bi * t->bsize[cls];
+  memcpy(e->pl, zone, zl + 1);
+  memcpy(e->pl + zl + 1, view, vl + 1);
+  if (t->nwait == 0) t->wcur_ms = now_ms;                /* (nothing is in the wheel: it starts at this tick) */
+  hash_add(t, e);
+  wheel_add(t, e);
   t->nwait++;
   t->n_parked++;
   *idx_out = (int32_t)idx;
@@ -92,40 +239,33 @@ int32_t park_udp(park_table_t *t, int64_t now_ms, uint32_t timeout_ms, const cha
     return -1;
   }
   int32_t idx;
-  park_entry_t *e = park_take(t, now_ms, timeout_ms, view, zone, PARK_UDP, &idx);
+  park_entry_t *e = park_take(t, now_ms, timeout_ms, view, zone, PARK_UDP, len, &idx);
   if (!e) return -1;
   e->udp_len = (uint16_t)len;
-  e->u.udp.fd = fd;
-  e->u.udp.ipc = *ipc;
-  memcpy(e->u.udp.payload, payload, len);
+  e->fd = fd;
+  uint8_t *ip = (uint8_t *)(uintptr_t)park_entry_ipc(e);
+  memcpy(ip, ipc, sizeof(*ipc));
+  memcpy(ip + sizeof(*ipc), payload, len);
   return idx;
 }
 
 int32_t park_tcp(park_table_t *t, int64_t now_ms, uint32_t timeout_ms, const char *view, const char *zone, int fd, uint32_t ctx_idx,
                  uint32_t ctx_gen) {
   int32_t idx;
-  park_entry_t *e = park_take(t, now_ms, timeout_ms, view, zone, PARK_TCP, &idx);
+  park_entry_t *e = park_take(t, now_ms, timeout_ms, view, zone, PARK_TCP, 0, &idx);
   if (!e) return -1;
-  e->u.tcp.fd = fd;
-  e->u.tcp.ctx_idx = ctx_idx;
-  e->u.tcp.ctx_gen = ctx_gen;
+  e->fd = fd;
+  e->ctx_idx = ctx_idx;
+  e->ctx_gen = ctx_gen;
   return idx;
-}
-
-static bool entry_is(const park_entry_t *e, const char *view, size_t vl, const char *zone, size_t zl) {
-  return e->vlen == vl && e->zlen == zl && memcmp(e->zone, zone, zl) == 0 && memcmp(e->view, view, vl) == 0;
 }
 
 bool park_has_wait(const park_table_t *t, const char *view, const char *zone) {
   size_t vl, zl;
   if (!t->e || t->nwait == 0 || !key_fits(view, zone, &vl, &zl)) return false;
-  uint32_t seen = 0;
-  for (uint32_t i = 0; i < t->cap && seen < t->nwait; i++) {
-    const park_entry_t *e = &t->e[i];
-    if (e->state != PARK_WAIT) continue;
-    seen++;
-    if (entry_is(e, view, vl, zone, zl)) return true;
-  }
+  const uint64_t key = name_key(view, zone);
+  for (uint32_t r = t->bucket[key & t->bmask]; r; r = ENT(t, r)->hnext)
+    if (ENT(t, r)->key == key) return true;
   return false;
 }
 
@@ -135,18 +275,134 @@ park_entry_t *park_get(park_table_t *t, int32_t idx, uint32_t gen) {
   return e->state != PARK_FREE && e->gen == gen ? e : NULL;
 }
 
+uint32_t park_wake_key(park_table_t *t, uint64_t key) {
+  if (!t->e || t->nwait == 0) return 0;
+  uint32_t n = 0;
+  uint32_t *p = &t->bucket[key & t->bmask];
+  while (*p) {
+    park_entry_t *e = ENT(t, *p);
+    if (e->key != key) {
+      p = &e->hnext;
+      continue;
+    }
+    *p = e->hnext;                                       /* (off the chain here: the others of the wait_leave() are not in the way) */
+    e->hnext = 0;
+    wheel_remove(t, e);
+    unsent_remove(t, e);
+    done_enter(t, e, PARK_READY);
+    t->n_woken++;
+    n++;
+  }
+  return n;
+}
+
 uint32_t park_wake(park_table_t *t, const char *view, const char *zone) {
   size_t vl, zl;
-  if (!t->e || t->nwait == 0 || !key_fits(view, zone, &vl, &zl)) return 0;
-  uint32_t n = 0, seen = 0, waiting = t->nwait;         /* stop when every waiting entry was looked at */
-  for (uint32_t i = 0; i < t->cap && seen < waiting; i++) {
+  if (!key_fits(view, zone, &vl, &zl)) return 0;
+  return park_wake_key(t, name_key(view, zone));
+}
+
+uint32_t park_fail_key(park_table_t *t, uint64_t key) {
+  if (!t->e || t->nwait == 0) return 0;
+  uint32_t n = 0;
+  uint32_t *p = &t->bucket[key & t->bmask];
+  while (*p) {
+    park_entry_t *e = ENT(t, *p);
+    if (e->key != key) {
+      p = &e->hnext;
+      continue;
+    }
+    *p = e->hnext;
+    e->hnext = 0;
+    wheel_remove(t, e);
+    unsent_remove(t, e);
+    done_enter(t, e, PARK_TIMEOUT);
+    t->n_failed++;
+    n++;
+  }
+  return n;
+}
+
+uint32_t park_fail(park_table_t *t, const char *view, const char *zone) {
+  size_t vl, zl;
+  if (!key_fits(view, zone, &vl, &zl)) return 0;
+  return park_fail_key(t, name_key(view, zone));
+}
+
+uint32_t park_retry_key(park_table_t *t, uint64_t key, int64_t new_deadline_ms) {
+  if (!t->e || t->nwait == 0) return 0;
+  uint32_t n = 0;
+  for (uint32_t r = t->bucket[key & t->bmask]; r; r = ENT(t, r)->hnext) {
+    park_entry_t *e = ENT(t, r);
+    if (e->key != key) continue;
+    if (new_deadline_ms > e->deadline_ms) {
+      wheel_remove(t, e);
+      e->deadline_ms = new_deadline_ms;
+      wheel_add(t, e);
+    }
+    e->attach = 0;                                       /* (it waits for a fetch now: its time is not an attach's) */
+    e->azid = 0;
+    n++;
+  }
+  return n;
+}
+
+uint32_t park_retry(park_table_t *t, const char *view, const char *zone, int64_t new_deadline_ms) {
+  size_t vl, zl;
+  if (!key_fits(view, zone, &vl, &zl)) return 0;
+  return park_retry_key(t, name_key(view, zone), new_deadline_ms);
+}
+
+/* the entry waits for the attach of the stored zone (sview, zid): a store thread that cannot name the zone says so by the id (park_ask_fetch_zid()) */
+void park_entry_attach_zid(park_entry_t *e, uint16_t sview, uint32_t zid) {
+  e->preq = ((uint64_t)sview << 32) | zid;
+  e->azid = 1;
+}
+
+/* 0.7 store: the queries of this worker that wait for the zone stay parked with a new deadline and wait for a fetch, which the worker asks for itself from its own ring (park_fetch_request(): 128 places,
+ * not the few slots that a store thread shares).  A ring that is full leaves the request pending: park_ask_again() makes it when there is room, and the park-timeout is the only end of the wait.  Returns how many. */
+uint32_t park_ask_fetch_key(park_table_t *t, int widx, uint64_t key, int64_t new_deadline_ms) {
+  const uint32_t n = park_retry_key(t, key, new_deadline_ms);
+  if (n == 0) return 0;
+  park_entry_t *first = NULL;
+  for (uint32_t r = t->bucket[key & t->bmask]; r && !first; r = ENT(t, r)->hnext)
+    if (ENT(t, r)->key == key) first = ENT(t, r);
+  if (first && !park_fetch_request(widx, park_entry_view(first), park_entry_zone(first), KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL)) park_pending_set(t, first, PARK_PEND_FETCH, 0, KDB_FETCH_PRIO_QUERY);
+  return n;
+}
+
+/* ... for the queries that wait for the attach of the zone id `zidkey` (store view << 32 | zone id), whatever zone they were parked for: the deleted zone, the cell that cannot be read, the id that another
+ * view has now (a store thread has no name to wake by).  The table is looked through (a few thousand entries at most, and only when an attach fails this way). */
+uint32_t park_ask_fetch_zid(park_table_t *t, int widx, uint64_t zidkey, int64_t new_deadline_ms) {
+  if (!t->e || t->nwait == 0) return 0;
+  uint32_t n = 0, seen = 0;
+  for (uint32_t i = 0; i < t->cap && seen < t->nwait; i++) {
     park_entry_t *e = &t->e[i];
     if (e->state != PARK_WAIT) continue;
     seen++;
-    if (entry_is(e, view, vl, zone, zl)) {
-      e->state = PARK_READY;
-      t->nwait--;
-      t->nready++;
+    if (e->azid && e->preq == zidkey) n += park_ask_fetch_key(t, widx, e->key, new_deadline_ms);
+  }
+  return n;
+}
+
+void park_mark_attach(park_table_t *t, int32_t idx, int64_t now_ns, int64_t full_deadline_ms) {
+  if (!t->e || idx < 0 || (uint32_t)idx >= t->cap || t->e[idx].state != PARK_WAIT) return;
+  t->e[idx].attach = 1;
+  t->e[idx].t_park_ns = now_ns;
+  t->e[idx].full_ms = full_deadline_ms;
+}
+
+uint32_t park_wake_all(park_table_t *t) {
+  if (!t->e || t->nwait == 0) return 0;
+  uint32_t n = 0;
+  for (uint32_t b = 0; b <= t->bmask && t->nwait > 0; b++) {
+    while (t->bucket[b]) {
+      park_entry_t *e = ENT(t, t->bucket[b]);
+      t->bucket[b] = e->hnext;
+      e->hnext = 0;
+      wheel_remove(t, e);
+      unsent_remove(t, e);
+      done_enter(t, e, PARK_READY);
       t->n_woken++;
       n++;
     }
@@ -154,129 +410,166 @@ uint32_t park_wake(park_table_t *t, const char *view, const char *zone) {
   return n;
 }
 
-uint32_t park_fail(park_table_t *t, const char *view, const char *zone) {
-  size_t vl, zl;
-  if (!t->e || t->nwait == 0 || !key_fits(view, zone, &vl, &zl)) return 0;
-  uint32_t n = 0, seen = 0, waiting = t->nwait;
-  for (uint32_t i = 0; i < t->cap && seen < waiting; i++) {
-    park_entry_t *e = &t->e[i];
-    if (e->state != PARK_WAIT) continue;
-    seen++;
-    if (entry_is(e, view, vl, zone, zl)) {
-      e->state = PARK_TIMEOUT;
-      t->nwait--;
-      t->nready++;
-      t->n_failed++;
-      n++;
+static void wheel_slot_expire(park_table_t *t, uint32_t s, int64_t now_ms, uint32_t *n) {
+  uint32_t r = t->wheel[s];
+  while (r) {
+    park_entry_t *e = ENT(t, r);
+    const uint32_t next = e->wnext;
+    if (e->deadline_ms <= now_ms) {
+      if (e->attach && e->full_ms > now_ms) {
+        /* the attach deadline passed with the request still queued (the store threads are behind slow reads): the query goes on waiting for the rest of its park-timeout, as
+         * a query that waits for a fetch does; whoever finishes the zone wakes it, or the retry key of an attach that fails (park_retry()) */
+        wheel_remove(t, e);
+        e->deadline_ms = e->full_ms;
+        wheel_add(t, e);
+      } else {
+        wait_leave(t, e);
+        done_enter(t, e, PARK_TIMEOUT);
+        (*n)++;
+      }
     }
+    r = next;
   }
-  return n;
-}
-
-uint32_t park_wake_all(park_table_t *t) {
-  if (!t->e || t->nwait == 0) return 0;
-  uint32_t n = 0;
-  for (uint32_t i = 0; i < t->cap && t->nwait > 0; i++) {
-    park_entry_t *e = &t->e[i];
-    if (e->state != PARK_WAIT) continue;
-    e->state = PARK_READY;
-    t->nwait--;
-    t->nready++;
-    t->n_woken++;
-    n++;
-  }
-  return n;
 }
 
 uint32_t park_expire(park_table_t *t, int64_t now_ms) {
-  if (!t->e || t->nwait == 0 || now_ms < t->min_deadline_ms) return 0;
-  uint32_t n = 0, waiting = 0;
-  int64_t min = INT64_MAX;
-  for (uint32_t i = 0; i < t->cap && waiting + n < t->nwait; i++) {
-    park_entry_t *e = &t->e[i];
-    if (e->state != PARK_WAIT) continue;
-    if (e->deadline_ms <= now_ms) {
-      e->state = PARK_TIMEOUT;
-      n++;
-    } else {
-      waiting++;
-      if (e->deadline_ms < min) min = e->deadline_ms;
-    }
+  if (!t->e) return 0;
+  if (t->nwait == 0) {
+    if (now_ms + 1 > t->wcur_ms) t->wcur_ms = now_ms + 1;
+    return 0;
   }
-  t->nwait -= n;
-  t->nready += n;                                       /* (a TIMEOUT entry is "done" too: the worker answers it) */
+  uint32_t n = 0;
+  int64_t steps = now_ms - t->wcur_ms + 1;
+  if (steps > PARK_WHEEL) steps = PARK_WHEEL;            /* (a longer gap: every slot once) */
+  for (int64_t i = 0; i < steps; i++) wheel_slot_expire(t, (uint32_t)((uint64_t)(t->wcur_ms + i) & (PARK_WHEEL - 1)), now_ms, &n);
+  if (now_ms + 1 > t->wcur_ms) t->wcur_ms = now_ms + 1;
   t->n_timeout += n;
   if (n) atomic_fetch_add_explicit(&g_park_timeout, n, memory_order_relaxed);
-  t->min_deadline_ms = min;
   return n;
 }
 
-park_entry_t *park_next_done(park_table_t *t, uint32_t *cursor) {
-  if (!t->e || t->nready == 0) return NULL;
-  for (uint32_t i = *cursor; i < t->cap; i++) {
-    park_entry_t *e = &t->e[i];
-    if (e->state == PARK_READY || e->state == PARK_TIMEOUT) {
-      *cursor = i + 1;
-      return e;
-    }
+park_entry_t *park_next_done(park_table_t *t) {
+  if (!t->e || t->dhead == 0) return NULL;
+  return ENT(t, t->dhead);
+}
+
+/* A pending request that is dropped with its entry (a cancelled connection, an answer sent) is taken over by another query of the same worker that waits for the zone: that one
+ * is what the zone's other waiters rely on.  With no other, the marks that the request held are given up. */
+static void pend_abandon(park_table_t *t, park_entry_t *e) {
+  park_entry_t *other = NULL;
+  for (uint32_t r = t->bucket[e->key & t->bmask]; r && !other; r = ENT(t, r)->hnext)
+    if (ENT(t, r)->key == e->key && ENT(t, r) != e) other = ENT(t, r);
+  if (other) {
+    if (other->pend == PARK_PEND_NONE) park_pending_set(t, other, (park_pend_t)e->pend, e->preq, e->prio);
+    return;
   }
-  *cursor = t->cap;
-  return NULL;
+  if (e->pend == PARK_PEND_FETCH && (e->prio & PARK_PRIO_CLAIMED)) park_claim_release(park_entry_view(e), park_entry_zone(e));
+  else if (e->pend == PARK_PEND_ATTACH_ZID) (void)park_att_leave((uint16_t)(e->preq >> 32), (uint32_t)e->preq, (int)e->prio);       /* (prio: the worker that waits) */
 }
 
 void park_release(park_table_t *t, park_entry_t *e) {
   if (!t->e || e < t->e || e >= t->e + t->cap || e->state == PARK_FREE) return;
+  if (e->pend) pend_abandon(t, e);
   if (e->state == PARK_WAIT) {
+    wait_leave(t, e);
     t->nwait--;
-    if (t->nwait == 0) t->min_deadline_ms = INT64_MAX;
   } else {
+    done_remove(t, e);
     t->nready--;
   }
+  const uint32_t cls = e->blk >> 31, bi = e->blk & 0x7FFFFFFFu;
+  t->bfree[cls][t->bnfree[cls]++] = bi;
   e->state = PARK_FREE;
+  e->pend = PARK_PEND_NONE;
   t->free_idx[t->nfree++] = (uint32_t)(e - t->e);
 }
 
-bool park_cancel_tcp(park_table_t *t, uint32_t ctx_idx, uint32_t ctx_gen) {
-  if (!t->e || t->nwait + t->nready == 0) return false;
-  for (uint32_t i = 0; i < t->cap; i++) {
-    park_entry_t *e = &t->e[i];
-    if (e->state != PARK_FREE && e->kind == PARK_TCP && e->u.tcp.ctx_idx == ctx_idx && e->u.tcp.ctx_gen == ctx_gen) {
-      park_release(t, e);
-      t->n_cancelled++;
-      return true;
-    }
-  }
-  return false;
+bool park_cancel_tcp(park_table_t *t, int32_t idx, uint32_t gen) {
+  park_entry_t *e = park_get(t, idx, gen);
+  if (!e || e->kind != PARK_TCP) return false;
+  park_release(t, e);
+  t->n_cancelled++;
+  return true;
 }
 
 int64_t park_next_deadline_ms(const park_table_t *t, int64_t now_ms) {
   if (!t->e || t->nwait == 0) return -1;
-  int64_t d = t->min_deadline_ms - now_ms;
-  return d < 0 ? 0 : d;
+  const uint32_t s0 = (uint32_t)((uint64_t)t->wcur_ms & (PARK_WHEEL - 1));
+  const uint32_t nw = PARK_WHEEL / 64;
+  for (uint32_t k = 0; k <= nw; k++) {                   /* from the slot of the current tick round the wheel to the first slot that holds an entry */
+    const uint32_t wi = ((s0 >> 6) + k) % nw;
+    uint64_t w = t->wbits[wi];
+    if (k == 0) w &= ~0ull << (s0 & 63);
+    else if (k == nw) w &= (s0 & 63) ? ~(~0ull << (s0 & 63)) : 0;
+    if (!w) continue;
+    const uint32_t s = wi * 64 + (uint32_t)__builtin_ctzll(w);
+    const int64_t dist = (int64_t)((s - s0) & (PARK_WHEEL - 1));
+    const int64_t d = t->wcur_ms + dist - now_ms;
+    return d < 0 ? 0 : d;
+  }
+  return 0;
+}
+
+void park_pending_set(park_table_t *t, park_entry_t *e, park_pend_t kind, uint64_t preq, uint8_t prio) {
+  if (!t->e || e->state != PARK_WAIT) return;
+  e->pend = (uint8_t)kind;
+  e->preq = preq;
+  e->prio = prio;
+  if (!e->ulinked) unsent_add(t, e);
+}
+
+park_entry_t *park_pending_head(park_table_t *t) {
+  if (!t->e || t->uhead == 0) return NULL;
+  return ENT(t, t->uhead);
+}
+
+void park_pending_done(park_table_t *t, park_entry_t *e) {
+  unsent_remove(t, e);
+  e->pend = PARK_PEND_NONE;
 }
 
 /* ------------------------------------------------------------------ rings */
-static bool key_set(park_key_t *k, const char *view, const char *zone, bool failed) {
-  size_t vl, zl;
-  if (!key_fits(view, zone, &vl, &zl)) return false;
+static bool key_set(park_key_t *k, uint64_t key, bool failed, bool retry, bool fetch, uint8_t ask) {
+  k->key = key;
+  k->ask = ask;
   k->failed = failed;
-  k->vlen = (uint8_t)vl;
-  k->zlen = (uint8_t)zl;
-  memcpy(k->view, view, vl + 1);
-  memcpy(k->zone, zone, zl + 1);
+  k->retry = retry;
+  k->fetch = fetch;
   return true;
 }
 
-bool park_wake_push(park_wake_ring_t *r, const char *view, const char *zone, bool failed) {
+/* (0.7 store S2: the ingest thread and the store threads both produce keys, so the producers take turns: a spin lock held for the copy of one key) */
+bool park_wake_push_ask(park_wake_ring_t *r, uint64_t key, bool failed, bool retry, bool fetch, uint8_t ask) {
+  while (atomic_exchange_explicit(&r->plock, true, memory_order_acquire)) {}
   uint32_t head = atomic_load_explicit(&r->head, memory_order_relaxed);
   uint32_t tail = atomic_load_explicit(&r->tail, memory_order_acquire);
-  if (head - tail >= PARK_WAKE_RING || !key_set(&r->k[head % PARK_WAKE_RING], view, zone, failed)) {
+  bool ok = true;
+  if (head - tail >= PARK_WAKE_RING) {
+    atomic_store_explicit(&r->overflow, true, memory_order_release);
+    atomic_fetch_add_explicit(&r->dropped, 1, memory_order_relaxed);
+    ok = false;
+  } else {
+    (void)key_set(&r->k[head % PARK_WAKE_RING], key, failed, retry, fetch, ask);
+    atomic_store_explicit(&r->head, head + 1, memory_order_release);
+  }
+  atomic_store_explicit(&r->plock, false, memory_order_release);
+  return ok;
+}
+
+bool park_wake_push_key(park_wake_ring_t *r, uint64_t key, bool failed, bool retry, bool fetch) { return park_wake_push_ask(r, key, failed, retry, fetch, 0); }
+
+bool park_wake_push_ex(park_wake_ring_t *r, const char *view, const char *zone, bool failed, bool retry) {
+  size_t vl, zl;
+  if (!key_fits(view, zone, &vl, &zl)) {                 /* (no key to send: the consumer looks at everything) */
     atomic_store_explicit(&r->overflow, true, memory_order_release);
     atomic_fetch_add_explicit(&r->dropped, 1, memory_order_relaxed);
     return false;
   }
-  atomic_store_explicit(&r->head, head + 1, memory_order_release);
-  return true;
+  return park_wake_push_key(r, name_key(view, zone), failed, retry, false);
+}
+
+bool park_wake_push(park_wake_ring_t *r, const char *view, const char *zone, bool failed) {
+  return park_wake_push_ex(r, view, zone, failed, false);
 }
 
 bool park_wake_pop(park_wake_ring_t *r, park_key_t *out) {
@@ -378,15 +671,59 @@ static void trigger(int kq, unsigned ident) { (void)kq; (void)ident; }
 
 /* The key goes into the ring now; the kqueue of the worker is triggered by park_wake_flush(), once however many keys came (the ring is what the worker reads: a
  * key is there before its trigger is). */
-void park_wake_queue_one(int w, const char *view, const char *zone, bool failed) {
+static void wake_key_one(int w, uint64_t key, bool failed, bool retry, bool fetch, uint8_t ask) {
   if (w < 0 || w >= PARK_MAX_WORKERS || !atomic_load_explicit(&g_wreg[w], memory_order_acquire)) return;
-  (void)park_wake_push(&g_wake[w], view, zone, failed);          /* (a full ring: the overflow flag wakes everything) */
+  (void)park_wake_push_ask(&g_wake[w], key, failed, retry, fetch, ask);     /* (a full ring: the overflow flag wakes everything) */
   atomic_fetch_or_explicit(&g_wtrig[w / 64], 1ull << (w % 64), memory_order_release);
 }
 
-void park_wake_queue_all(const char *view, const char *zone, bool failed) {
-  for (int w = 0; w < PARK_MAX_WORKERS; w++) park_wake_queue_one(w, view, zone, failed);
+void park_wake_queue_one(int w, const char *view, const char *zone, bool failed) {
+  size_t vl, zl;
+  if (!key_fits(view, zone, &vl, &zl)) return;
+  wake_key_one(w, name_key(view, zone), failed, false, false, 0);
 }
+
+void park_wake_queue_all(const char *view, const char *zone, bool failed) {
+  size_t vl, zl;
+  if (!key_fits(view, zone, &vl, &zl)) return;
+  const uint64_t key = name_key(view, zone);
+  for (int w = 0; w < PARK_MAX_WORKERS; w++) wake_key_one(w, key, failed, false, false, 0);
+}
+
+/* the workers of the set: workers 0..30 by their bit, bit 31 every worker from 31 up (a set that park_att_take() returns has the bits 15..31 all set for a worker of 15 and up) */
+static void wake_set(uint32_t workers, uint64_t key, bool failed, bool retry, bool fetch, uint8_t ask) {
+  if (workers == PARK_ATT_ALL) {
+    for (int w = 0; w < PARK_MAX_WORKERS; w++) wake_key_one(w, key, failed, retry, fetch, ask);
+    return;
+  }
+  for (uint32_t m = workers & 0x7FFFFFFFu; m; m &= m - 1) wake_key_one(__builtin_ctz(m), key, failed, retry, fetch, ask);
+  if (workers & 0x80000000u) {
+    const int wm = atomic_load_explicit(&g_wmax, memory_order_relaxed);
+    for (int w = 31; w < wm; w++) wake_key_one(w, key, failed, retry, fetch, ask);
+  }
+}
+
+void park_wake_queue_mask(const char *view, const char *zone, uint32_t workers, bool failed) {
+  size_t vl, zl;
+  if (!key_fits(view, zone, &vl, &zl)) return;
+  wake_set(workers, name_key(view, zone), failed, false, false, 0);
+}
+
+void park_wake_queue_retry(const char *view, const char *zone, uint32_t workers, bool fetch) {
+  size_t vl, zl;
+  if (!key_fits(view, zone, &vl, &zl)) return;
+  wake_set(workers, name_key(view, zone), false, true, fetch, 0);
+}
+
+/* 0.7 store: the queries that wait for the zone ask for its fetch themselves (park_ask_fetch_key()): the fetch request of a store thread found every shared slot taken */
+void park_wake_queue_ask(const char *view, const char *zone, uint32_t workers) {
+  size_t vl, zl;
+  if (!key_fits(view, zone, &vl, &zl)) return;
+  wake_set(workers, name_key(view, zone), false, true, true, 1);
+}
+
+/* 0.7 store: the attach of the zone id could not be done and no name is known for it (park_ask_fetch_zid()) */
+void park_wake_queue_zid(uint16_t sview, uint32_t zid, uint32_t workers) { wake_set(workers, ((uint64_t)sview << 32) | zid, false, true, true, 2); }
 
 void park_wake_flush(void) {
   for (int i = 0; i < (int)(sizeof(g_wtrig) / sizeof(g_wtrig[0])); i++) {
@@ -402,6 +739,245 @@ void park_wake_flush(void) {
 void park_wake_broadcast(const char *view, const char *zone, bool failed) {
   park_wake_queue_all(view, zone, failed);
   park_wake_flush();
+}
+
+/* ------------------------------------------------------------------ ATTACH requests (0.7 store; the idea is in dns_park.h) */
+/* One request is a zone of the store: the view's id (16 bits), the zone's (32), a priority (8), in one word.  The ring has one producer (its worker) and any number of
+ * consumers (the store threads): a consumer reads the slot and moves the tail with a compare-and-swap; when it loses the race the word it read is dropped, and a producer
+ * cannot have overwritten a slot before the tail went past it. */
+typedef struct {
+  _Atomic uint64_t q[PARK_ATTACH_RING];
+  _Atomic uint32_t head, tail;
+} att_ring_t;
+static att_ring_t g_attach[PARK_MAX_WORKERS];
+static _Atomic int g_attach_kq = -1;
+static _Atomic int g_attach_asleep;                      /* the store threads that are about to wait for events, or wait */
+static _Atomic uint32_t g_attach_rr;
+static _Atomic int g_attach_wmax;                        /* the highest worker that asked, plus one */
+
+void park_attach_set_notify(int kq) { atomic_store_explicit(&g_attach_kq, kq, memory_order_relaxed); }
+
+static void trigger_attach(void) {
+  atomic_thread_fence(memory_order_seq_cst);
+  if (atomic_load_explicit(&g_attach_asleep, memory_order_relaxed) > 0) trigger(atomic_load_explicit(&g_attach_kq, memory_order_relaxed), PARK_ATTACH_IDENT);
+}
+
+bool park_attach_room(int w) {
+  if (w < 0 || w >= PARK_MAX_WORKERS) return false;
+  const att_ring_t *r = &g_attach[w];
+  return atomic_load_explicit(&r->head, memory_order_relaxed) - atomic_load_explicit(&r->tail, memory_order_acquire) < PARK_ATTACH_RING;
+}
+
+bool park_attach_adopt(int w, uint16_t sview, uint32_t zid) { return park_attach_zid(w, (uint16_t)(sview | PARK_ATT_ADOPT), zid); }
+
+bool park_attach_zid(int w, uint16_t sview, uint32_t zid) {
+  if (w < 0 || w >= PARK_MAX_WORKERS) return false;
+  att_ring_t *r = &g_attach[w];
+  int cur = atomic_load_explicit(&g_attach_wmax, memory_order_relaxed);
+  while (cur < w + 1 && !atomic_compare_exchange_weak_explicit(&g_attach_wmax, &cur, w + 1, memory_order_relaxed, memory_order_relaxed)) {}
+  uint32_t head = atomic_load_explicit(&r->head, memory_order_relaxed);
+  uint32_t tail = atomic_load_explicit(&r->tail, memory_order_acquire);
+  if (head - tail >= PARK_ATTACH_RING) return false;                     /* (full: the query stays parked and the worker asks again) */
+  atomic_store_explicit(&r->q[head % PARK_ATTACH_RING], ((uint64_t)sview << 32) | zid, memory_order_relaxed);
+  atomic_store_explicit(&r->head, head + 1, memory_order_release);
+  trigger_attach();
+  return true;
+}
+
+/* 0.7 store S3: attach requests of threads that are not parked-query workers (the engine's background attach for a CNAME or glue that leads into a stored zone, a DoT / DoH thread),
+ * and of a worker that cannot name the zone's id (the cell was being written): a few slots, as the transfer threads' fetch slots, taken by compare-and-swap */
+#define PARK_ATTACH_ANY_SLOTS 16
+static park_fetch_req_t g_att_q[PARK_ATTACH_ANY_SLOTS];
+static _Atomic uint8_t g_att_st[PARK_ATTACH_ANY_SLOTS];
+
+static bool attach_request_any(const char *view, const char *zone, uint8_t prio) {
+  size_t vl, zl;
+  if (!key_fits(view, zone, &vl, &zl)) return false;
+  for (int i = 0; i < PARK_ATTACH_ANY_SLOTS; i++) {
+    uint8_t free_st = 0;
+    if (!atomic_compare_exchange_strong_explicit(&g_att_st[i], &free_st, 1, memory_order_acquire, memory_order_relaxed)) continue;
+    park_fetch_req_t *q = &g_att_q[i];
+    memset(q, 0, sizeof(*q));
+    q->vlen = (uint8_t)vl;
+    q->zlen = (uint8_t)zl;
+    memcpy(q->view, view, vl + 1);
+    memcpy(q->zone, zone, zl + 1);
+    q->prio = prio;
+    atomic_store_explicit(&g_att_st[i], 2, memory_order_release);
+    trigger_attach();
+    return true;
+  }
+  return false;
+}
+
+bool park_attach_request_any(const char *view, const char *zone) { return attach_request_any(view, zone, 0); }
+bool park_attach_request_bg(const char *view, const char *zone) { return attach_request_any(view, zone, 2); }
+
+bool park_attach_pending(void) {
+  for (int k = 0; k < PARK_ATTACH_ANY_SLOTS; k++)
+    if (atomic_load_explicit(&g_att_st[k], memory_order_acquire) == 2) return true;
+  int wm = atomic_load_explicit(&g_attach_wmax, memory_order_relaxed);
+  for (int w = 0; w < wm; w++)
+    if (atomic_load_explicit(&g_attach[w].head, memory_order_acquire) != atomic_load_explicit(&g_attach[w].tail, memory_order_relaxed)) return true;
+  return false;
+}
+
+bool park_attach_sleep_prepare(void) {
+  atomic_fetch_add_explicit(&g_attach_asleep, 1, memory_order_relaxed);
+  atomic_thread_fence(memory_order_seq_cst);
+  if (!park_attach_pending()) return false;
+  atomic_fetch_sub_explicit(&g_attach_asleep, 1, memory_order_relaxed);
+  return true;
+}
+
+void park_attach_sleep_done(void) { atomic_fetch_sub_explicit(&g_attach_asleep, 1, memory_order_relaxed); }
+
+static bool att_ring_pop(att_ring_t *r, uint16_t *sview, uint32_t *zid) {
+  for (;;) {
+    uint32_t tail = atomic_load_explicit(&r->tail, memory_order_acquire);
+    uint32_t head = atomic_load_explicit(&r->head, memory_order_acquire);
+    if (tail == head) return false;
+    uint64_t v = atomic_load_explicit(&r->q[tail % PARK_ATTACH_RING], memory_order_relaxed);
+    if (atomic_compare_exchange_weak_explicit(&r->tail, &tail, tail + 1, memory_order_acq_rel, memory_order_relaxed)) {
+      *sview = (uint16_t)(v >> 32);
+      *zid = (uint32_t)v;
+      return true;
+    }
+  }
+}
+
+bool park_attach_next(park_attach_req_t *out) {
+  bool got = false;
+  for (int k = 0; k < PARK_ATTACH_ANY_SLOTS && !got; k++) {
+    uint8_t ready = 2;
+    if (atomic_load_explicit(&g_att_st[k], memory_order_relaxed) != 2 || !atomic_compare_exchange_strong_explicit(&g_att_st[k], &ready, 3, memory_order_acquire, memory_order_relaxed)) continue;
+    const park_fetch_req_t *q = &g_att_q[k];
+    out->by_name = true;
+    out->adopt = false;
+    out->by_name = true;
+    out->prio = q->prio;
+    out->worker = -1;
+    out->sview = 0;
+    out->zid = 0;
+    memcpy(out->view, q->view, (size_t)q->vlen + 1);
+    memcpy(out->zone, q->zone, (size_t)q->zlen + 1);
+    atomic_store_explicit(&g_att_st[k], 0, memory_order_release);
+    got = true;
+  }
+  int wm = atomic_load_explicit(&g_attach_wmax, memory_order_relaxed);
+  uint32_t start = got || wm == 0 ? 0 : atomic_fetch_add_explicit(&g_attach_rr, 1, memory_order_relaxed);
+  for (int i = 0; i < wm && !got; i++) {
+    int w = (int)((start + (uint32_t)i) % (uint32_t)wm);
+    uint16_t sv;
+    uint32_t zid;
+    if (att_ring_pop(&g_attach[w], &sv, &zid)) {
+      out->by_name = false;
+      out->prio = 0;
+      out->worker = (int16_t)w;
+      out->adopt = (sv & PARK_ATT_ADOPT) != 0;
+      out->sview = (uint16_t)(sv & ~PARK_ATT_ADOPT);
+      out->zid = zid;
+      got = true;
+    }
+  }
+  if (got && park_attach_pending()) trigger_attach();    /* (another store thread may be asleep while more wait) */
+  return got;
+}
+
+/* ---- the attach claims: one request for a stored zone across the workers (see dns_park.h) ----
+ * A slot is one word: the zone (view id and zone id, which are the exact name of the claim: no hash is compared, so a claim is never taken for another zone's), the set of the workers
+ * that wait for it (bits 0..14 one worker each, bit 15 every worker from 15 up) and a bit that says that the request is in a ring.  Everything is a compare-and-swap on that one
+ * word, so a worker that joins and the store thread that takes the claim cannot miss each other: a join that came before the take is in the set it returns, one that came after finds no
+ * claim and makes the request itself.  A claim is made for the few thousand zones that wait at one time; 131072 slots (1 MB of address space) keep the table sparse. */
+#define ACL_SLOTS 131072u
+#define ACL_WIN 8u
+#define ACL_SET 0xFFFFu
+#define ACL_REQ 0x10000ull
+#define ACL_ID(sv, zid) (((uint64_t)(zid) << 32) | ((uint64_t)((sv) & 0xFFu) << 24) | (1ull << 23))      /* (bit 23 is set in every id: an id is never 0, the free slot) */
+#define ACL_IDMASK 0xFFFFFFFFFF800000ull
+static _Atomic uint64_t g_aclaim[ACL_SLOTS];             /* 0: free */
+
+static size_t acl_slot(uint64_t id, unsigned j) {
+  uint64_t x = id * 0x9E3779B97F4A7C15ull;
+  return (size_t)(((x >> 40) + j) & (ACL_SLOTS - 1u));
+}
+
+static uint64_t acl_bit(int w) { return 1ull << (w < 15 ? (w < 0 ? 0 : w) : 15); }
+static uint32_t acl_to_set(uint64_t v) {                 /* the set of a slot as a set of workers: workers 0..14, and every worker from 15 up (the bits 15..31 of a 32 bit set) */
+  uint32_t s = (uint32_t)(v & 0x7FFFu);
+  if (v & 0x8000u) s |= 0xFFFF8000u;
+  return s;
+}
+
+int park_att_claim(uint16_t sview, uint32_t zid, int w) {
+  const uint64_t id = ACL_ID(sview, zid), bit = acl_bit(w);
+  for (;;) {
+    int free_j = -1;
+    for (unsigned j = 0; j < ACL_WIN; j++) {
+      _Atomic uint64_t *s = &g_aclaim[acl_slot(id, j)];
+      uint64_t v = atomic_load_explicit(s, memory_order_acquire);
+      if (v == 0) {
+        if (free_j < 0) free_j = (int)j;
+        continue;
+      }
+      if ((v & ACL_IDMASK) != id) continue;
+      while ((v & ACL_IDMASK) == id) {                   /* the zone's claim: this worker joins */
+        if (v & bit) return (v & ACL_REQ) ? 0 : 2;       /* (it was in the set already: its first query asked) */
+        if (atomic_compare_exchange_weak_explicit(s, &v, v | bit, memory_order_acq_rel, memory_order_acquire)) return (v & ACL_REQ) ? 0 : 2;
+      }
+      free_j = -2;                                       /* (the claim was taken while we looked: start again) */
+      break;
+    }
+    if (free_j == -2) continue;
+    if (free_j < 0) return -1;                           /* no room for a mark: the caller asks without one */
+    _Atomic uint64_t *s = &g_aclaim[acl_slot(id, (unsigned)free_j)];
+    uint64_t z = 0;
+    if (atomic_compare_exchange_strong_explicit(s, &z, id | bit, memory_order_acq_rel, memory_order_acquire)) return 1;
+    /* the slot was taken between the look and the swap: look again (it may be this zone's claim) */
+  }
+}
+
+/* the request of the claim is in a ring: a worker that joins now does not have to make one */
+void park_att_requested(uint16_t sview, uint32_t zid) {
+  const uint64_t id = ACL_ID(sview, zid);
+  for (unsigned j = 0; j < ACL_WIN; j++) {
+    _Atomic uint64_t *s = &g_aclaim[acl_slot(id, j)];
+    uint64_t v = atomic_load_explicit(s, memory_order_acquire);
+    while (v != 0 && (v & ACL_IDMASK) == id) {
+      if (atomic_compare_exchange_weak_explicit(s, &v, v | ACL_REQ, memory_order_acq_rel, memory_order_acquire)) return;
+    }
+  }
+}
+
+uint32_t park_att_take(uint16_t sview, uint32_t zid) {
+  const uint64_t id = ACL_ID(sview, zid);
+  for (unsigned j = 0; j < ACL_WIN; j++) {
+    _Atomic uint64_t *s = &g_aclaim[acl_slot(id, j)];
+    uint64_t v = atomic_load_explicit(s, memory_order_acquire);
+    while (v != 0 && (v & ACL_IDMASK) == id) {
+      if (atomic_compare_exchange_weak_explicit(s, &v, 0, memory_order_acq_rel, memory_order_acquire)) return acl_to_set(v);
+    }
+  }
+  return PARK_ATT_ALL;                                   /* no claim (a request without one, or a duplicate that came after the first was done): whoever waits is woken */
+}
+
+/* the worker no longer waits for the zone (its last query for it was answered or dropped without the zone): its bit goes, and the claim with it when nobody is left.
+ * The bit 15 is shared by every worker from 15 up: a worker of that group that leaves cannot tell whether another one of the group still waits, so it does not clear the bit (the
+ * take then wakes the whole group, a worker that does not wait finds nothing to wake: a spurious wake costs nothing).  A claim that has only that bit, and no request in a ring (nobody
+ * of the group that is still there made one, or the worker that did has left), goes: each worker of the group that joined it without a request has asked for itself. */
+bool park_att_leave(uint16_t sview, uint32_t zid, int w) {
+  const uint64_t id = ACL_ID(sview, zid), bit = acl_bit(w);
+  for (unsigned j = 0; j < ACL_WIN; j++) {
+    _Atomic uint64_t *s = &g_aclaim[acl_slot(id, j)];
+    uint64_t v = atomic_load_explicit(s, memory_order_acquire);
+    while (v != 0 && (v & ACL_IDMASK) == id) {
+      uint64_t nv = w >= 15 ? v : v & ~bit;
+      if (!(nv & ACL_SET)) nv = 0;
+      else if (!(nv & ACL_REQ) && !(nv & 0x7FFFu)) nv = 0;
+      if (atomic_compare_exchange_weak_explicit(s, &v, nv, memory_order_acq_rel, memory_order_acquire)) return true;
+    }
+  }
+  return false;
 }
 
 /* ------------------------------------------------------------------ places and tokens (B2 W5, 0.7 P-B; the idea is in dns_park.h) */
@@ -518,14 +1094,6 @@ void park_rate_give(void) {
 #define PARK_CLAIM_SLOTS 32768u                          /* (a power of two; 256 KB) */
 #define PARK_CLAIM_WIN 8u
 static _Atomic uint64_t g_claim[PARK_CLAIM_SLOTS];       /* 0: free */
-
-static uint64_t name_key(const char *view, const char *zone) {
-  uint64_t h = 1469598103934665603ULL;
-  for (const char *p = view; *p; p++) h = (h ^ (uint8_t)*p) * 1099511628211ULL;
-  h = (h ^ 0xFF) * 1099511628211ULL;
-  for (const char *p = zone; *p; p++) h = (h ^ (uint8_t)(*p | 0x20)) * 1099511628211ULL;
-  return h | 1;                                          /* (never 0, the free slot) */
-}
 
 uint64_t park_claim_key(const char *view, const char *zone) { return name_key(view, zone); }
 
@@ -650,6 +1218,19 @@ void park_bg_fetch(const char *view, const char *zone) {
   /* the slot is stamped after the request is queued: a request that found no free slot of the transfer threads is not remembered as made (the next query for the
    * zone makes it again), and a different zone that hashed to the same slot is asked for, not held back */
   if (!park_fetch_request_any(view, zone, KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_FULL)) return;
+  atomic_store_explicit(&g_bg_at[i], now, memory_order_relaxed);
+  atomic_store_explicit(&g_bg_key[i], h, memory_order_relaxed);
+}
+
+/* the same one-per-PARK_BG_MS rule for the background attach of a stored zone */
+void park_bg_attach(const char *view, const char *zone) {
+  uint64_t h = name_key(view, zone) ^ 0x9E3779B97F4A7C15ull;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  int64_t now = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+  size_t i = (size_t)(h % PARK_BG_SLOTS);
+  if (atomic_load_explicit(&g_bg_key[i], memory_order_relaxed) == h && now - atomic_load_explicit(&g_bg_at[i], memory_order_relaxed) < PARK_BG_MS) return;
+  if (!park_attach_request_bg(view, zone)) return;
   atomic_store_explicit(&g_bg_at[i], now, memory_order_relaxed);
   atomic_store_explicit(&g_bg_key[i], h, memory_order_relaxed);
 }

@@ -198,7 +198,7 @@ while [ $k -le $R ]; do
     if [ $((k % 2)) -eq 0 ]; then TH=4; else TH=1; fi
     {
         printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n' "$PB"
-        printf '    database { driver sqlite3; database-file "%s/z.db"; loader-user "nobody"; loader-path "%s/karidns-dbloader"; ingest-threads %s; acl-ceiling { 127.0.0.1; }; };\n};\n' "$D" "$T" "$TH"
+        printf '    database { driver sqlite3; database-file "%s/z.db"; loader-user "nobody"; loader-path "%s/karidns-dbloader"; ingest-threads %s; acl-ceiling { 127.0.0.1; }; %s };\n};\n' "$D" "$T" "$TH" "$(store_stmt "$D")"
     } > "$D/b.conf"
     printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n};\n' "$PC" > "$D/c.conf"
     while IFS="$TAB" read -r apex f sqlf; do
@@ -223,6 +223,7 @@ while [ $k -le $R ]; do
     SC=$!
     if ! wait_log "$D/b.log" "\[DB\] initial load complete" 30; then fail "round $k: the database server did not finish its startup batch"; sed 's/^/         /' "$D/b.log" | tail -10; stop_servers; k=$((k + 1)); continue; fi
     sleep 0.5
+    store_cold_restart "$D" b.conf "$D/b.log" || { stop_servers; k=$((k + 1)); continue; }       # DB_DIFF_STORE=cold: B answers from its store alone from here on
     # C must hold every zone of the round before any is compared: an answer from B can carry glue from another zone of the round in
     # its additional section, and C transfers the zones a few at a time (transfers-per-ns 2 and transfers-in 10, the BIND defaults)
     j=0

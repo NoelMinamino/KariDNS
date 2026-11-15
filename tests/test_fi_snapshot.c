@@ -178,10 +178,10 @@ static uint64_t fi_digest(bool with_registry) {
         for (zdir_elem_t *e; (e = zdir_iter_next(&it));) {
             zone_db_entry_t *en = zdir_entry(e);
             size_t o = (size_t)snprintf(t, sizeof(t), "%s|%s|%p|%s|%s|%d", snap->views[v].name, e->name, (void *)en,
-                                        en ? zone_entry_catalog_owner(en) : "", en ? zone_entry_catalog_uid(en) : "", en ? en->group_count : 0);
-            for (int g = 0; en && g < en->group_count && o < sizeof(t); g++) o += (size_t)snprintf(t + o, sizeof(t) - o, "|g:%s", en->groups[g]);
-            for (int m = 0; en && m < en->catalog_member_count && o < sizeof(t); m++)
-                o += (size_t)snprintf(t + o, sizeof(t) - o, "|m:%s/%s", en->catalog_members[m].domain, en->catalog_members[m].unique_id);
+                                        en ? zone_entry_catalog_owner(en) : "", en ? zone_entry_catalog_uid(en) : "", en ? zone_xr(en)->group_count : 0);
+            for (int g = 0; en && g < zone_xr(en)->group_count && o < sizeof(t); g++) o += (size_t)snprintf(t + o, sizeof(t) - o, "|g:%s", zone_xr(en)->groups[g]);
+            for (int m = 0; en && m < zone_xr(en)->catalog_member_count && o < sizeof(t); m++)
+                o += (size_t)snprintf(t + o, sizeof(t) - o, "|m:%s/%s", zone_xr(en)->catalog_members[m].domain, zone_xr(en)->catalog_members[m].unique_id);
             sum += fi_fnv(t);
         }
     }

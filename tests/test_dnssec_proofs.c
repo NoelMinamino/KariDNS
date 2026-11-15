@@ -2020,11 +2020,16 @@ static void oo_setup(int opt_out) {
     gr_setup("oo.test.", zone);
 }
 
+extern _Atomic time_t g_denial_gap_log[64];     /* (dns_query_engine.c, unit-test builds: the rate limit of note_denial_gap()) */
 static void oo_query(const char *qname, uint16_t qtype, gr_resp_t *r) {
-    atomic_store_explicit(&g_gr.entry.last_denial_gap_log, 0, memory_order_relaxed);
+    for (int i = 0; i < 64; i++) atomic_store_explicit(&g_denial_gap_log[i], 0, memory_order_relaxed);
     gr_query(qname, qtype, true, r);
 }
-static bool oo_gap_said(void) { return atomic_load_explicit(&g_gr.entry.last_denial_gap_log, memory_order_relaxed) != 0; }
+static bool oo_gap_said(void) {
+    for (int i = 0; i < 64; i++)
+        if (atomic_load_explicit(&g_denial_gap_log[i], memory_order_relaxed) != 0) return true;
+    return false;
+}
 
 static void test_nsec3_optout_empty_non_terminal(void) {
     printf("[TEST] DNSSEC: NSEC3 Opt-Out: the closest provable encloser above an empty non-terminal (RFC 5155 7.2.1)...\n");

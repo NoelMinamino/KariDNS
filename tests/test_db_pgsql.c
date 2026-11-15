@@ -1992,6 +1992,397 @@ static void test_analyze(void) {
     D->close(ro);
 }
 
+
+/* ------------------------------------------------------------------ 0.7 store, WP3: the paged calls */
+typedef struct {
+    int64_t *id;
+    size_t n, cap;
+    char **name;
+    unsigned char *has_state, *nviews;
+    uint64_t *gen;
+    char views[2][24];                      /* the views of the last row that had two */
+    int stop_after;
+    bool ordered;
+    int64_t prev;
+} mp_t;
+
+static int mp_cb(void *ud, const db_manifest_row_t *r) {
+    mp_t *a = ud;
+    if (a->n >= a->cap) {
+        a->cap = a->cap ? a->cap * 2 : 1024;
+        a->id = realloc(a->id, a->cap * sizeof(*a->id));
+        a->name = realloc(a->name, a->cap * sizeof(*a->name));
+        a->has_state = realloc(a->has_state, a->cap);
+        a->nviews = realloc(a->nviews, a->cap);
+        a->gen = realloc(a->gen, a->cap * sizeof(*a->gen));
+    }
+    if (a->n > 0 && r->id <= a->prev) a->ordered = false;
+    a->prev = r->id;
+    a->id[a->n] = r->id;
+    a->name[a->n] = strdup(r->name);
+    a->has_state[a->n] = r->has_state;
+    a->nviews[a->n] = (unsigned char)r->nviews;
+    a->gen[a->n] = r->stamp_gen;
+    if (r->nviews == 2) {
+        snprintf(a->views[0], sizeof(a->views[0]), "%s", r->views[0]);
+        snprintf(a->views[1], sizeof(a->views[1]), "%s", r->views[1]);
+    }
+    a->n++;
+    return a->stop_after && (int)a->n >= a->stop_after;
+}
+
+static void mp_free(mp_t *a) {
+    for (size_t i = 0; i < a->n; i++) free(a->name[i]);
+    free(a->id);
+    free(a->name);
+    free(a->has_state);
+    free(a->nviews);
+    free(a->gen);
+    memset(a, 0, sizeof(*a));
+    a->ordered = true;
+}
+
+/* the whole pass: pages of `limit` until a short page; the rows of all pages are appended to *a */
+static int mp_pass(db_conn_t *c, unsigned limit, mp_t *a, unsigned *npages) {
+    int64_t after = 0;
+    *npages = 0;
+    for (;;) {
+        int64_t last;
+        unsigned n;
+        int rc = D->manifest_page(c, after, limit, mp_cb, a, &last, &n);
+        if (rc != 0) return rc;
+        (*npages)++;
+        if (n < limit) return 0;
+        after = last;
+    }
+}
+
+typedef struct { size_t n, cap; uint64_t *seq; int64_t *dom; db_change_op_t *op; bool dup; } cpg_t;
+static int cpg_cb(void *ud, const db_change_entry_t *e) {
+    cpg_t *a = ud;
+    if (a->n >= a->cap) {
+        a->cap = a->cap ? a->cap * 2 : 256;
+        a->seq = realloc(a->seq, a->cap * sizeof(*a->seq));
+        a->dom = realloc(a->dom, a->cap * sizeof(*a->dom));
+        a->op = realloc(a->op, a->cap * sizeof(*a->op));
+    }
+    for (size_t i = 0; i < a->n && a->n < 4000; i++)
+        if (a->dom[i] == e->domain_id) a->dup = true;
+    a->seq[a->n] = e->seq;
+    a->dom[a->n] = e->domain_id;
+    a->op[a->n] = e->op;
+    a->n++;
+    return 0;
+}
+static int cpg_stop_cb(void *ud, const db_change_entry_t *e) {
+    (void)ud;
+    (void)e;
+    return 1;
+}
+static void cpg_free(cpg_t *a) {
+    free(a->seq);
+    free(a->dom);
+    free(a->op);
+    memset(a, 0, sizeof(*a));
+}
+static int cpg_find(const cpg_t *a, int64_t dom) {
+    for (size_t i = 0; i < a->n; i++)
+        if (a->dom[i] == dom) return (int)i;
+    return -1;
+}
+
+/* a schema with the PowerDNS tables and, when ext, db/karidns_ext.pgsql.sql; the search_path of g_admin stays on it */
+static bool wp3_schema(const char *name, bool ext) {
+    char sqlb[200], path[500];
+    snprintf(sqlb, sizeof(sqlb), "CREATE SCHEMA %s", name);
+    Q(sqlb);
+    snprintf(sqlb, sizeof(sqlb), "SET search_path TO %s", name);
+    Q(sqlb);
+    snprintf(path, sizeof(path), "%s/pdns_schema.pgsql.sql", g_root);
+    char *sql = slurp(path);
+    snprintf(path, sizeof(path), "%s/../../db/karidns_ext.pgsql.sql", g_root);
+    char *x = ext ? slurp(path) : NULL;
+    CHECK(sql != NULL && (!ext || x != NULL));
+    if (sql) Q(sql);
+    if (x) Q(x);
+    bool ok = sql && (!ext || x);
+    free(sql);
+    free(x);
+    return ok;
+}
+
+static void test_paged(void) {
+    printf("paged calls: count_domains, manifest_page, current_cursor, changes_page (WP3)\n");
+    db_schema_info_t si;
+
+    /* a plain PowerDNS schema: DB_ERR_NEED_SCHEMA3 with the table named; count_domains still works */
+    if (wp3_schema("karidns_test_wp3p", false)) {
+        Q("INSERT INTO domains (id, name, type) VALUES (5, 'plain.test', 'NATIVE')");
+        Q("RESET search_path");
+        db_conn_t *c = open_drv("karidns_test_wp3p");
+        if (c) {
+            int64_t last = 7;
+            unsigned n = 9;
+            uint64_t cur = 5, cnt = 0;
+            db_change_pos_t pos;
+            bool more = true, gap = true;
+            cpg_t cp = {0};
+            mp_t mp = { .ordered = true };
+            CHECK(D->check_schema(c, &si) == 0 && !si.has_zone_state && !si.has_changes);
+            CHECK(D->manifest_page(c, 0, 10, mp_cb, &mp, &last, &n) == DB_ERR_NEED_SCHEMA3 && n == 0 && last == 0 && mp.n == 0);
+            CHECK_HAS(D->errmsg(c), "karidns_zone_state");
+            CHECK(D->current_cursor(c, &cur) == DB_ERR_NEED_SCHEMA3 && cur == 0);
+            CHECK_HAS(D->errmsg(c), "karidns_changes");
+            db_change_pos_init(&pos, 0);
+            CHECK(D->changes_page(c, &pos, 10, cpg_cb, &cp, &more, &gap) == DB_ERR_NEED_SCHEMA3 && !more && !gap && cp.n == 0);
+            CHECK(D->count_domains(c, NULL, &cnt) == 0 && cnt == 1);
+            CHECK(D->count_domains(c, "any", &cnt) == 0 && cnt == 1);      /* (no karidns_domain_views: every domain is in every view) */
+            D->close(c);
+        }
+    }
+    Q("RESET search_path");
+    Q("DROP SCHEMA IF EXISTS karidns_test_wp3p CASCADE");
+
+    /* 10,000 domains with ids 2, 4, ... (gaps), a version stamp from the triggers, and a view mapping on 30 % of them */
+    if (!wp3_schema("karidns_test_wp3", true)) return;
+    Q("INSERT INTO domains (id, name, type) SELECT i * 2, 'z' || lpad(i::text, 5, '0') || '.pg.test', CASE WHEN i % 7 = 0 THEN 'MASTER' ELSE 'NATIVE' END FROM generate_series(1, 10000) i");
+    Q("INSERT INTO karidns_domain_views (domain_id, view_name) SELECT i * 2, 'Beta' FROM generate_series(1, 10000) i WHERE i % 10 IN (2, 3)");
+    Q("INSERT INTO karidns_domain_views (domain_id, view_name) SELECT i * 2, 'alpha' FROM generate_series(1, 10000) i WHERE i % 10 IN (1, 2)");
+    Q("DELETE FROM karidns_zone_state WHERE domain_id = 8");           /* a zone without a state row: stamp 0, 0 */
+    db_conn_t *c = open_drv("karidns_test_wp3");
+    if (!c) {
+        Q("RESET search_path");
+        return;
+    }
+    CHECK(D->check_schema(c, &si) == 0 && si.has_zone_state && si.has_changes && si.has_domain_views);
+    CHECK(D->manifest_page != NULL && D->changes_page != NULL && D->current_cursor != NULL && D->count_domains != NULL);
+
+    uint64_t cnt = 0;
+    CHECK(D->count_domains(c, NULL, &cnt) == 0 && cnt == 10000);
+    CHECK(D->count_domains(c, "alpha", &cnt) == 0 && cnt == 9000);           /* 70 % without a row + 20 % with one for alpha */
+    CHECK(D->count_domains(c, "BETA", &cnt) == 0 && cnt == 9000);            /* ASCII case-insensitive */
+    CHECK(D->count_domains(c, "gamma", &cnt) == 0 && cnt == 7000);
+
+    /* the cursor is taken before the pass */
+    wait_cluster_quiet();
+    uint64_t cur0 = 0;
+    CHECK(D->current_cursor(c, &cur0) == 0 && cur0 > 0);
+
+    /* pages cover every id exactly once, in order, whatever the page size (1000; 777 with a short last page; 10000 = one full page and an empty one; one page) */
+    static const unsigned sizes[] = { 1000, 777, 10000, 100000 };
+    for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
+        mp_t a = { .ordered = true };
+        unsigned pages = 0;
+        CHECK(mp_pass(c, sizes[k], &a, &pages) == 0);
+        CHECK_MSG(a.n == 10000 && a.ordered, "limit %u: %zu rows", sizes[k], a.n);
+        bool exact = a.n == 10000;
+        for (size_t i = 0; exact && i < a.n; i++) exact = a.id[i] == (int64_t)(i + 1) * 2;
+        CHECK_MSG(exact, "limit %u: ids are 2, 4, ... 20000", sizes[k]);
+        CHECK_MSG(pages == (10000 + sizes[k] - 1) / sizes[k] + (10000 % sizes[k] == 0 ? 1 : 0), "limit %u: %u pages", sizes[k], pages);
+        mp_free(&a);
+    }
+    {   /* stamps and mappings of known rows: i = 1 (alpha), 2 (alpha + Beta), 3 (Beta), 4 (id 8: no state row), 10 (nothing) */
+        mp_t a = { .ordered = true };
+        unsigned pages;
+        CHECK(mp_pass(c, 1000, &a, &pages) == 0 && a.n == 10000);
+        CHECK(a.nviews[0] == 1 && a.has_state[0] && a.gen[0] == 2);              /* one transaction per statement: the domain insert + one view insert */
+        CHECK(a.nviews[1] == 2 && a.gen[1] == 3);
+        CHECK(a.nviews[2] == 1 && a.gen[2] == 2);
+        CHECK(a.id[3] == 8 && !a.has_state[3] && a.gen[3] == 0 && a.nviews[3] == 0);
+        CHECK(a.nviews[9] == 0 && a.gen[9] == 1 && !strcmp(a.name[9], "z00010.pg.test"));
+        CHECK(!strcmp(a.views[0], "Beta") && !strcmp(a.views[1], "alpha"));      /* sorted in the C locale: "Beta" < "alpha" */
+        mp_free(&a);
+    }
+    {   /* a callback that stops the page; limit 0 and above the maximum are errors; a page past the end is empty */
+        mp_t a = { .ordered = true };
+        int64_t last = -1;
+        unsigned n = 99;
+        a.stop_after = 3;
+        CHECK(D->manifest_page(c, 0, 100, mp_cb, &a, &last, &n) == DB_STOPPED && n == 3 && last == 6 && a.n == 3);
+        mp_free(&a);
+        CHECK(D->manifest_page(c, 0, 0, mp_cb, &a, &last, &n) == -1 && D->manifest_page(c, 0, DB_PAGE_MAX + 1, mp_cb, &a, &last, &n) == -1);
+        CHECK(D->manifest_page(c, 20000, 10, mp_cb, &a, &last, &n) == 0 && n == 0 && last == 20000);
+        CHECK(D->manifest_page(c, 19998, 10, mp_cb, &a, &last, &n) == 0 && n == 1 && last == 20000);
+        mp_free(&a);
+    }
+
+    /* changes during a pass: the first half of the pass, then edits, then the rest of it; the drain from the cursor taken before reports every edit */
+    {
+        mp_t a = { .ordered = true };
+        int64_t last;
+        unsigned n;
+        CHECK(D->manifest_page(c, 0, 5000, mp_cb, &a, &last, &n) == 0 && n == 5000 && last == 10000);
+        Q("INSERT INTO domains (id, name, type) VALUES (100001, 'new.pg.test', 'NATIVE')");         /* after the pass position: the pass sees it too */
+        Q("INSERT INTO domains (id, name, type) VALUES (3, 'low.pg.test', 'NATIVE')");              /* below the pass position: only the drain sees it */
+        Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (20, 'a.z00010.pg.test', 'A', '192.0.2.1', 60)");
+        Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (20, 'b.z00010.pg.test', 'A', '192.0.2.2', 60)");     /* twice: one entry */
+        Q("DELETE FROM domains WHERE id = 40");                                                     /* already delivered, now gone */
+        Q("DELETE FROM domains WHERE id = 19990");                                                  /* not yet delivered, gone before the pass gets there */
+        Q("INSERT INTO domains (id, name, type) VALUES (100002, 'gone.pg.test', 'NATIVE')");       /* upsert, then delete: a delete */
+        Q("DELETE FROM domains WHERE id = 100002");
+        CHECK(D->manifest_page(c, last, 100000, mp_cb, &a, &last, &n) == 0 && n == 5000);          /* 5000 left - id 19990 + id 100001 */
+        size_t seen40 = 0, seen19990 = 0, seen3 = 0, seen100001 = 0;
+        for (size_t i = 0; i < a.n; i++) {
+            seen40 += a.id[i] == 40;
+            seen19990 += a.id[i] == 19990;
+            seen3 += a.id[i] == 3;
+            seen100001 += a.id[i] == 100001;
+        }
+        CHECK(seen40 == 1 && seen19990 == 0 && seen3 == 0 && seen100001 == 1);     /* the pass is stale for id 40 and misses id 3: the drain covers both */
+        mp_free(&a);
+        wait_cluster_quiet();
+        cpg_t cp = {0};
+        db_change_pos_t pos;
+        bool more = true, gap = true;
+        db_change_pos_init(&pos, cur0);
+        CHECK(D->changes_page(c, &pos, 100000, cpg_cb, &cp, &more, &gap) == 0 && !more && !gap);
+        CHECK_MSG(!cp.dup, "one entry per domain in a page");
+        CHECK_MSG(cp.n >= 6, "%zu entries", cp.n);       /* (>=: another transaction of the cluster that was open at the cursor makes the drain start lower: duplicates are allowed) */
+        int i;
+        CHECK((i = cpg_find(&cp, 100001)) >= 0 && cp.op[i] == DB_CHANGE_UPSERT);
+        CHECK((i = cpg_find(&cp, 3)) >= 0 && cp.op[i] == DB_CHANGE_UPSERT);
+        CHECK((i = cpg_find(&cp, 20)) >= 0 && cp.op[i] == DB_CHANGE_UPSERT);        /* two log rows, one entry */
+        CHECK((i = cpg_find(&cp, 40)) >= 0 && cp.op[i] == DB_CHANGE_DELETE);
+        CHECK((i = cpg_find(&cp, 19990)) >= 0 && cp.op[i] == DB_CHANGE_DELETE);
+        CHECK((i = cpg_find(&cp, 100002)) >= 0 && cp.op[i] == DB_CHANGE_DELETE);    /* created and deleted: the state counts */
+        bool asc = true;
+        for (size_t k = 1; k < cp.n; k++) asc = asc && cp.seq[k] > cp.seq[k - 1];
+        CHECK(asc);
+        CHECK_MSG(pos.cursor >= cur0 && pos.seq == 0 && pos.settle == 0, "the drain ends at a cursor (%llu, was %llu)", (unsigned long long)pos.cursor, (unsigned long long)cur0);
+        cpg_free(&cp);
+        /* the next drain from the stored cursor: nothing of ours */
+        uint64_t stored = pos.cursor;
+        db_change_pos_init(&pos, stored);
+        CHECK(D->changes_page(c, &pos, 100000, cpg_cb, &cp, &more, &gap) == 0 && !more && !gap && cpg_find(&cp, 100001) < 0 && pos.cursor >= stored);
+        cpg_free(&cp);
+    }
+
+    /* pages of the log: 10 edits of 10 distinct domains with 4 log rows per page -> 3 pages; exactly 8 rows -> two full pages and an empty one */
+    {
+        wait_cluster_quiet();
+        uint64_t start = 0;
+        CHECK(D->current_cursor(c, &start) == 0);
+        char sqlb[200];
+        for (int k = 0; k < 10; k++) {
+            snprintf(sqlb, sizeof(sqlb), "INSERT INTO records (domain_id, name, type, content, ttl) VALUES (%d, 'p.pg.test', 'A', '192.0.2.9', 60)", 200 + 2 * k);
+            Q(sqlb);
+        }
+        wait_cluster_quiet();
+        db_change_pos_t pos;
+        db_change_pos_init(&pos, start);
+        int pages = 0;
+        bool more = true, gap = false;
+        cpg_t all = {0};
+        while (more && pages < 10) {
+            cpg_t cp = {0};
+            CHECK(D->changes_page(c, &pos, 4, cpg_cb, &cp, &more, &gap) == 0 && !gap);
+            CHECK(cp.n <= 4);
+            for (size_t k = 0; k < cp.n; k++) cpg_cb(&all, &(db_change_entry_t){ cp.seq[k], cp.dom[k], cp.op[k] });
+            cpg_free(&cp);
+            pages++;
+        }
+        int distinct = 0;
+        for (int k = 0; k < 10; k++) distinct += cpg_find(&all, 200 + 2 * k) >= 0;
+        CHECK_MSG(distinct == 10 && !more && pages >= 3, "pages %d, entries %zu, domains %d", pages, all.n, distinct);   /* (more pages when the drain starts lower, see above) */
+        cpg_free(&all);
+        CHECK_MSG(pos.seq == 0 && pos.settle == 0 && pos.cursor >= start, "the drain ended");
+
+        wait_cluster_quiet();
+        CHECK(D->current_cursor(c, &start) == 0);
+        for (int k = 0; k < 8; k++) {
+            snprintf(sqlb, sizeof(sqlb), "INSERT INTO records (domain_id, name, type, content, ttl) VALUES (%d, 'q.pg.test', 'A', '192.0.2.9', 60)", 300 + 2 * k);
+            Q(sqlb);
+        }
+        wait_cluster_quiet();
+        db_change_pos_init(&pos, start);
+        cpg_t c1 = {0}, c2 = {0}, c3 = {0};
+        CHECK(D->changes_page(c, &pos, 4, cpg_cb, &c1, &more, &gap) == 0 && more && c1.n == 4 && pos.seq > 0 && pos.settle >= start);
+        CHECK(D->changes_page(c, &pos, 4, cpg_cb, &c2, &more, &gap) == 0 && more && c2.n == 4);
+        CHECK(D->changes_page(c, &pos, 4, cpg_cb, &c3, &more, &gap) == 0 && !more && c3.n == 0 && !gap && pos.seq == 0 && pos.settle == 0);
+        cpg_free(&c1);
+        cpg_free(&c2);
+        cpg_free(&c3);
+        /* a callback that stops: DB_STOPPED and the position does not move */
+        wait_cluster_quiet();
+        CHECK(D->current_cursor(c, &start) == 0);
+        Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (400, 'r.pg.test', 'A', '192.0.2.9', 60)");
+        db_change_pos_init(&pos, start);
+        CHECK(D->changes_page(c, &pos, 4, cpg_stop_cb, NULL, &more, &gap) == DB_STOPPED && pos.cursor == start && pos.seq == 0 && pos.settle == 0);
+        CHECK(D->changes_page(c, &pos, 0, cpg_cb, &c1, &more, &gap) == -1);
+        cpg_free(&c1);
+    }
+
+    /* a transaction that took a lower seq commits after a later page was read: the drain ends at the xmin of its first page, so the next drain reads it */
+    {
+        PGconn *t1 = connect_db(g_db), *t2 = connect_db(g_db);
+        if (t1 && t2) {
+            qx(t1, "SET search_path TO karidns_test_wp3");
+            qx(t2, "SET search_path TO karidns_test_wp3");
+            wait_cluster_quiet();
+            uint64_t start = 0;
+            CHECK(D->current_cursor(c, &start) == 0);
+            CHECK(qx(t1, "BEGIN"));
+            CHECK(qx(t1, "INSERT INTO records (domain_id, name, type, content, ttl) VALUES (500, 'slow.pg.test', 'A', '192.0.2.1', 60)"));     /* the lower seq, still open */
+            char xs[40];
+            PGresult *xr = PQexec(t1, "SELECT pg_current_xact_id()::text");
+            snprintf(xs, sizeof(xs), "%s", xr && PQntuples(xr) ? PQgetvalue(xr, 0, 0) : "0");
+            PQclear(xr);
+            CHECK(qx(t2, "INSERT INTO records (domain_id, name, type, content, ttl) VALUES (502, 'fast.pg.test', 'A', '192.0.2.2', 60)"));    /* the higher seq, committed */
+            db_change_pos_t pos;
+            db_change_pos_init(&pos, start);
+            bool more = false, gap = false;
+            cpg_t p1 = {0}, p2 = {0}, d2 = {0};
+            CHECK(D->changes_page(c, &pos, 1, cpg_cb, &p1, &more, &gap) == 0 && more && cpg_find(&p1, 502) >= 0 && cpg_find(&p1, 500) < 0);
+            CHECK(qx(t1, "COMMIT"));                                       /* the lower seq becomes visible after the page that skipped it */
+            CHECK(D->changes_page(c, &pos, 1, cpg_cb, &p2, &more, &gap) == 0 && !more && cpg_find(&p2, 500) < 0);       /* not in this drain: its seq is below the progress */
+            CHECK_MSG(pos.cursor <= strtoull(xs, NULL, 10), "the drain ends below the xid of the late transaction (%llu, xid %s)", (unsigned long long)pos.cursor, xs);
+            CHECK(D->changes_page(c, &(db_change_pos_t){ pos.cursor, 0, 0 }, 1000, cpg_cb, &d2, &more, &gap) == 0 && cpg_find(&d2, 500) >= 0);   /* the next drain has it */
+            cpg_free(&p1);
+            cpg_free(&p2);
+            cpg_free(&d2);
+        }
+        if (t1) PQfinish(t1);
+        if (t2) PQfinish(t2);
+    }
+
+    /* gaps: pruned rows, a cursor from the future */
+    {
+        wait_cluster_quiet();
+        uint64_t top = 0;
+        CHECK(D->current_cursor(c, &top) == 0 && top > 0);
+        db_change_pos_t pos;
+        cpg_t cp = {0};
+        bool more = false, gap = false;
+        db_change_pos_init(&pos, top + 1000000);
+        CHECK(D->changes_page(c, &pos, 100, cpg_cb, &cp, &more, &gap) == 0 && gap);
+        Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (600, 's.pg.test', 'A', '192.0.2.9', 60)");
+        wait_cluster_quiet();
+        char sqlb[160];
+        snprintf(sqlb, sizeof(sqlb), "DELETE FROM karidns_changes WHERE xid < '%llu'::xid8", (unsigned long long)top);
+        Q(sqlb);
+        db_change_pos_init(&pos, top);
+        CHECK(D->changes_page(c, &pos, 100, cpg_cb, &cp, &more, &gap) == 0 && gap && cpg_find(&cp, 600) >= 0);
+        cpg_free(&cp);
+    }
+
+    /* inside a snapshot the pages share it: a domain created between two pages is invisible until the snapshot ends */
+    {
+        mp_t a = { .ordered = true };
+        int64_t last;
+        unsigned n;
+        CHECK(D->begin_snapshot(c) == 0);
+        CHECK(D->manifest_page(c, 100001, 10, mp_cb, &a, &last, &n) == 0 && n == 0);
+        Q("INSERT INTO domains (id, name, type) VALUES (100003, 'snap.pg.test', 'NATIVE')");
+        CHECK(D->manifest_page(c, 100001, 10, mp_cb, &a, &last, &n) == 0 && n == 0);
+        CHECK(D->end_snapshot(c) == 0);
+        CHECK(D->manifest_page(c, 100001, 10, mp_cb, &a, &last, &n) == 0 && n == 1 && last == 100003);
+        mp_free(&a);
+    }
+    D->close(c);
+    Q("RESET search_path");
+    Q("DROP SCHEMA karidns_test_wp3 CASCADE");
+}
+
 int main(int argc, char **argv) {
     snprintf(g_root, sizeof(g_root), "%s", argc > 1 ? argv[1] : "tests/db");
     const char *pg = getenv("KARIDNS_TEST_PG");
@@ -2068,6 +2459,7 @@ int main(int argc, char **argv) {
     test_v1_and_migration();
     test_writes();
     test_audit();
+    test_paged();
     test_analyze();
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;

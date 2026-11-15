@@ -57,6 +57,8 @@ typedef struct { uint64_t id; bool ok; char text[200]; } db_reload_result_t;
 
 /* Is the ingest thread running (a database block is configured)? */
 bool db_ingest_enabled(void);
+/* 0.7 store S2: a new entry for a primary zone of the database (the attach in dns_db_store.c makes its entry like an install does); NULL: out of memory */
+zone_db_entry_t *db_ingest_new_entry(const char *view, const char *zone, zone_ext_shared_t *shared);
 /* all: RELOAD_REQ scope all (the caller has reloaded the configuration already).  Otherwise one zone of the view
  * `view` (a view name).  Returns the request id (> 0), or 0 when the thread is not running or the ring is full.
  * Control thread only. */
@@ -72,6 +74,8 @@ bool db_ingest_reload_result(db_reload_result_t *out);
  * is up, the fetch failed or the zone has no usable version (the caller answers SERVFAIL).  A zone this wait brought into memory is marked evict-next.  `el`
  * must stay valid meanwhile (the caller holds a retained snapshot). */
 zone_db_entry_t *db_ingest_xfr_await(zdir_elem_t *el, const char *view);
+/* 0.7 store S3: the same for a zone of the store that is not in memory (the zone with its trailing dot): the entry held with xfr_entry_hold(), or NULL when it did not come in time */
+zone_db_entry_t *db_ingest_xfr_await_zone(const char *zone, const char *view);
 
 /* Which view a command about the zone means: view_arg if given, else the only view that takes zones from the database.
  * Several views and none named: true with an empty out (B6b: `reload <zone>` then asks every view that takes database

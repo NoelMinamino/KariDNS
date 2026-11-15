@@ -172,6 +172,9 @@ for MK in $MAKES; do
         n=$(grep -c ' /usr/local/share/karidns/db/' "$T/got"); w=$(nsql)
         if [ "$n" -gt 0 ] && [ "$n" = "$w" ]; then ok "the SQL files of the drivers of config.mk ($(DRV)): $n"; else bad "SQL files of the drivers ($(DRV)): $n installed, $w wanted"; fi
     fi
+    if [ "$COMPS" != dag ]; then
+        [ -d "$D/var/db/karidns" ] && [ -z "$(ls -A "$D/var/db/karidns")" ] && ok "$MK install makes the empty directory /var/db/karidns (the default zone store is made in it)" || bad "make install did not make /var/db/karidns"
+    fi
     staged "$D" > "$T/first"
     # a configuration that is there before is never touched, and stays after uninstall
     mkdir -p "$D/usr/local/etc/karidns"
@@ -189,6 +192,7 @@ for MK in $MAKES; do
 /usr/local/etc/karidns" ] && ok "uninstall removes every file it installed and the directories of KariDNS, but not karidns.conf and its directory" || bad "uninstall left (or removed) other things" "$left"
     # shellcheck disable=SC2046
     kept "$MK uninstall" "$D" "$T/first" $(roots /usr/local /usr/local/etc /usr/local/libexec)
+    if [ "$COMPS" != dag ]; then [ -d "$D/var/db/karidns" ] && ok "$MK uninstall leaves /var/db/karidns (the data of the database may be in it)" || bad "uninstall removed /var/db/karidns"; fi
     rm -rf "$D"
 
     echo "-- $kind ($MK): --prefix=/opt/karidns-0.7, --sysconfdir, --libexecdir (a prefix whose name starts with karidns)"
@@ -334,6 +338,7 @@ mkdir -p "$P/m1" && tar -xf "$P"/out/karidns-9.9.9-*.pkg -C "$P/m1" +MANIFEST
 M=$P/m1/+MANIFEST
 grep -q 'pw groupshow karidns >/dev/null 2>&1 || pw groupadd karidns' "$M" && grep -q 'pw useradd karidns -g karidns -h - -d /nonexistent -s /usr/sbin/nologin' "$M" && ok "pre-install creates the group and the user karidns (no login, no home)" || bad "pre-install: no user karidns"
 grep -q 'install -d -o root -g wheel -m 0755 /var/run/karidns' "$M" && ok "post-install makes /var/run/karidns" || bad "post-install: no /var/run/karidns"
+grep -q 'install -d -o root -g wheel -m 0755 /var/db/karidns' "$M" && ok "post-install makes /var/db/karidns (the default zone store is made in it)" || bad "post-install: no /var/db/karidns"
 grep -o '"post-install":"[^"]*"' "$M" | grep -q 'log/named' && bad "post-install makes /var/log/named (the rc script makes it, for the user of the configuration)" || ok "...and leaves /var/log/named to the rc script"
 pkg info -R -F "$P"/out/karidns-9.9.9-*.pkg > "$T/raw" 2> /dev/null
 for c in karidns-sqlite3 karidns-postgresql karidns-db; do grep -q "\"$c\"" "$T/raw" || bad "karidns does not conflict with $c"; done

@@ -50,6 +50,7 @@ trap cleanup EXIT INT TERM
 PASS=0; FAILS=0
 pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
+STORE=${DB_STORE:-off}                              # on: the zone store is the directory (run_db_inview_store_test.sh): the zones are stored and not in memory, an attach is no fetch
 PORT=$(kari_port 0 $((20000 + $$ % 20000)))
 SECRET="dGVzdC1zZWNyZXQtMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"
 
@@ -111,7 +112,7 @@ conf() {   # conf: v1 takes the database, v2 and v3 share some of its zones
     cat > "$T/k.conf" <<EOF
 options {
     user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT; notify no;
-    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; fetch-rate 5000; park-timeout 4000;
+    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; $(store_stmt "$T") fetch-rate 5000; park-timeout 4000;
                acl-ceiling { 127.0.0.1; 127.0.0.2; }; memory-limit 64m; auto-reload yes; poll-interval 1; };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
@@ -147,10 +148,11 @@ start_srv() {
     i=0
     while [ $i -lt 1800 ] && ! grep -q "\[DB\] initial load complete" "$T/srv.log" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     grep -q "\[DB\] initial load complete" "$T/srv.log" && pass "the startup batch is complete ($((i / 10)) s)" || { fail "no 'initial load complete' after $((i / 10)) s"; tail -20 "$T/srv.log"; }
+    store_prefill
     sleep 1
 }
 issued() { $KCTL dbstatus 2>/dev/null | grep '^fetch:' | sed -n 's/.* issued=\([0-9]*\).*/\1/p' | tail -1; }
-oom() { $KCTL dbstatus "$1" 2>/dev/null | grep -q "out of memory"; }       # oom ZONE: its data is out of memory
+oom() { $KCTL dbstatus "$1" 2>/dev/null | grep -qE "out of memory|not in memory"; }       # oom ZONE: its data is out of memory
 # D SRC ARGS...: dag from the address SRC (127.0.0.1 = v1, 127.0.0.2 = v2, 127.0.0.3 = v3)
 D() { s=$1; shift; ./dag -b "$s" @127.0.0.1 -p "$PORT" "$@" 2>/dev/null; }
 ans() { s=$1; shift; D "$s" "$@" +short +nohexdump +time=5 +tries=1 | head -1; }
@@ -182,8 +184,13 @@ oom a.test && oom b.test && oom g.test && pass "the zones start out of memory (a
 I0=$(issued)
 R2=$(ans 127.0.0.2 www.a.test)
 [ "$R2" = "192.0.2.80" ] && pass "v2: www.a.test is answered (the query waited for the zone of v1)" || fail "v2: www.a.test: '$R2'"
-[ "$(issued)" = "$((I0 + 1))" ] && ! oom a.test && pass "one fetch, in the owner's name; the zone is in memory now" || fail "issued $(issued) (was $I0); a.test out of memory: $(oom a.test && echo yes || echo no)"
-[ "$(ans 127.0.0.1 www.a.test)" = "192.0.2.80" ] && [ "$(issued)" = "$((I0 + 1))" ] && pass "v1 answers from the same zone (no second fetch)" || fail "v1: $(ans 127.0.0.1 www.a.test); issued $(issued)"
+if [ "$STORE" = on ]; then
+    [ "$(issued)" = "$I0" ] && ! oom a.test && pass "the zone was attached from the store, in the owner's name (no fetch); it is in memory now" || fail "issued $(issued) (was $I0); a.test out of memory: $(oom a.test && echo yes || echo no)"
+    [ "$(ans 127.0.0.1 www.a.test)" = "192.0.2.80" ] && [ "$(issued)" = "$I0" ] && pass "v1 answers from the same zone (no second attach, no fetch)" || fail "v1: $(ans 127.0.0.1 www.a.test); issued $(issued)"
+else
+    [ "$(issued)" = "$((I0 + 1))" ] && ! oom a.test && pass "one fetch, in the owner's name; the zone is in memory now" || fail "issued $(issued) (was $I0); a.test out of memory: $(oom a.test && echo yes || echo no)"
+    [ "$(ans 127.0.0.1 www.a.test)" = "192.0.2.80" ] && [ "$(issued)" = "$((I0 + 1))" ] && pass "v1 answers from the same zone (no second fetch)" || fail "v1: $(ans 127.0.0.1 www.a.test); issued $(issued)"
+fi
 [ "$(ans 127.0.0.3 www.a.test)" = "" ] && [ "$(rcode 127.0.0.3 www.a.test A)" = "REFUSED" ] && pass "v3 does not name a.test: REFUSED" || fail "v3: www.a.test is served ($(rcode 127.0.0.3 www.a.test A))"
 [ "$(rcode 127.0.0.2 www.ghost.test A)" = "REFUSED" ] && pass "v2: a name that is no zone of v1 (ghost.test) is REFUSED" || fail "v2: ghost.test: $(rcode 127.0.0.2 www.ghost.test A)"
 
@@ -254,8 +261,14 @@ echo "== karictl reload through the sharing view: a zone that is not in memory, 
 oom w.test && pass "w.test is out of memory" || fail "w.test is in memory"
 RL=$($KCTL reload w.test v2 force 2>&1 | head -1)
 RL1=$($KCTL reload w.test v1 force 2>&1 | head -1)
-echo "$RL" | grep -q "^OK zone w.test. (view v1): unchanged, serial 5 (not in memory)" && [ "$RL" = "$RL1" ] && pass "reload w.test v2 force: the answer of the owner view v1, as for v1 itself, for a zone that is not in memory ($RL)" || fail "reload w.test v2 force: '$RL'; v1: '$RL1'"
-oom w.test && pass "... and the reload did not read the zone" || fail "w.test was read by the reload"
+if [ "$STORE" = on ]; then
+    # force reads the body whatever the stamp says, also of a zone that is not in memory (nearly every zone of a big server is stored and not in memory: a force that did nothing for them would be of no use)
+    echo "$RL" | grep -q "^OK zone w.test. (view v1): applied, serial 5" && [ "$RL" = "$RL1" ] && pass "reload w.test v2 force: the answer of the owner view v1, as for v1 itself; force reads the zone ($RL)" || fail "reload w.test v2 force: '$RL'; v1: '$RL1'"
+    ! oom w.test && pass "... and the zone is in memory now" || fail "w.test is not in memory after the forced reload"
+else
+    echo "$RL" | grep -q "^OK zone w.test. (view v1): unchanged, serial 5 (not in memory)" && [ "$RL" = "$RL1" ] && pass "reload w.test v2 force: the answer of the owner view v1, as for v1 itself, for a zone that is not in memory ($RL)" || fail "reload w.test v2 force: '$RL'; v1: '$RL1'"
+    oom w.test && pass "... and the reload did not read the zone" || fail "w.test was read by the reload"
+fi
 [ "$(ans 127.0.0.2 www.w.test)" = "192.0.2.90" ] && pass "v2 answers www.w.test (a query reads it)" || fail "v2: www.w.test '$(ans 127.0.0.2 www.w.test)'"
 RL=$($KCTL reload ghost.test v2 2>&1 | head -1)
 echo "$RL" | grep -q "^ERROR.*not in the database" && pass "reload ghost.test v2 (no such zone in v1): $RL" || fail "reload ghost.test v2: $RL"
@@ -269,7 +282,11 @@ upd_is() {   # upd_is DESCRIPTION WANT ZONE SRC NAME: an UPDATE that adds NAME.Z
 }
 I0=$(issued)
 upd_is "u.test through v2 (in-view-settings owner, 127.0.0.2 is in ALLOW-DNSUPDATE-FROM and in the ceiling): NOERROR" NOERROR u.test 127.0.0.2 via2
-[ "$(issued)" = "$((I0 + 1))" ] && pass "... the zone was read once, in the owner's name" || fail "fetches: $(issued) (was $I0)"
+if [ "$STORE" = on ]; then
+    [ "$(issued)" = "$I0" ] && pass "... the zone was attached from the store, in the owner's name (no fetch)" || fail "fetches: $(issued) (was $I0)"
+else
+    [ "$(issued)" = "$((I0 + 1))" ] && pass "... the zone was read once, in the owner's name" || fail "fetches: $(issued) (was $I0)"
+fi
 [ "$(ans 127.0.0.1 via2.u.test)" = "192.0.2.99" ] && [ "$(ans 127.0.0.2 via2.u.test)" = "192.0.2.99" ] && pass "... and the new name is in v1 and in v2 (one zone)" || fail "via2.u.test: v1 '$(ans 127.0.0.1 via2.u.test)', v2 '$(ans 127.0.0.2 via2.u.test)'"
 upd_is "u.test through v1: NOERROR" NOERROR u.test 127.0.0.1 via1
 [ "$(ans 127.0.0.2 via1.u.test)" = "192.0.2.99" ] && pass "... and the name added through v1 is in v2" || fail "via1.u.test through v2: '$(ans 127.0.0.2 via1.u.test)'"

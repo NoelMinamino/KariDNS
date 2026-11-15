@@ -191,6 +191,8 @@ typedef struct {
   bool parked, resume_pending, not_ready_now;
   uint16_t resume_len;
   int64_t park_deadline_ms;         /* of the request that was parked first (0: none); a second park of the same request keeps it */
+  int32_t park_idx;                 /* the handle of the parked entry (park_tcp()'s index and the entry's generation), valid while `parked`: the close takes the entry without a search */
+  uint32_t park_gen;
   /* AXFR/IXFR-in (handle_axfr_event): max-transfer-time-in as a wall-clock time_t (0 = none).  read_dns_tcp_message() gives up when it is
    * passed, also inside one message: SO_RCVTIMEO restarts on every recv(), so a primary dripping bytes would never time out */
   time_t read_deadline;
@@ -391,17 +393,14 @@ typedef struct {
   char coo_target[256];
 } catalog_member_id_t;
 
+/* 0.7 store S5 (design 4.2, 6.1): the statistics of a zone are two parts.  The eight counters the query path keeps for every answer (queries, the five rcode classes, TCP, DO) are 32-bit
+ * words in the entry core (zone_ctr_inc(): a zone that is attached from the store costs 32 octets for them); the rest -- and a carry that makes the eight 64-bit -- are in the entry's extension
+ * (zone_x_t.obs), made for the zones that have transfers, NOTIFY, a received-settings merge ... (every entry that is not a light attach has its extension from the start).  A reader asks
+ * zone_obs_read() for a plain copy of all of them. */
+enum { ZCTR_QUERIES = 0, ZCTR_NOERROR, ZCTR_NXDOMAIN, ZCTR_NODATA, ZCTR_SERVFAIL, ZCTR_REFUSED, ZCTR_TCP, ZCTR_DO, ZCTR_N };
 typedef struct {
-  _Atomic uint64_t queries_total;
-  _Atomic uint64_t responses_noerror;
-  _Atomic uint64_t responses_nxdomain;
-  _Atomic uint64_t responses_nodata;
-  _Atomic uint64_t responses_servfail;
-  _Atomic uint64_t responses_refused;
-  _Atomic uint64_t tcp_queries;
   _Atomic uint64_t ecs_queries;
   _Atomic uint64_t edns_queries;
-  _Atomic uint64_t dnssec_do_queries;
   _Atomic uint64_t rrl_dropped;
   _Atomic uint64_t rrl_slipped;
   _Atomic uint64_t notify_sent;
@@ -414,6 +413,12 @@ typedef struct {
   _Atomic time_t   last_transfer_time;
   _Atomic time_t   last_notify_time;
 } zone_observatory_t;
+/* a reader's copy of every counter of a zone (zone_obs_read()) */
+typedef struct {
+  uint64_t queries_total, responses_noerror, responses_nxdomain, responses_nodata, responses_servfail, responses_refused, tcp_queries, dnssec_do_queries;
+  uint64_t ecs_queries, edns_queries, rrl_dropped, rrl_slipped, notify_sent, notify_ack, axfr_success, ixfr_success, xfer_failed, wirecache_hits, wirecache_misses;
+  time_t last_transfer_time, last_notify_time;
+} zone_obs_view_t;
 
 /* ゾーンの役割。リロードで既存エントリを再利用してよいかの判定に使う (O-13) */
 typedef enum {
@@ -450,31 +455,78 @@ typedef enum {
   ZONE_SRC_DB,         /* データベースから取り込んだゾーン */
 } zone_source_t;
 
-/* 0.7 (B2): the fields are grouped by size, so that the one-octet flags and the 32-bit values share words instead of each leaving the padding of a
- * 64-bit field behind it: the entry is 584 octets, was 1032.  With the name behind it, a database zone's entry fits the allocator's 640-octet class (jemalloc's
- * next one below the old size is 1024 and the entry was in the 1280 class). */
-typedef struct zone_db_entry_s {
+/* 0.7 store S5 (design 4.2): the entry is a hot core and an extension.  The core is what the query path and the registry read for every zone (the name, the kind and the flag octets, the
+ * serial and the timers, the reference counts, the writer lock, the published version, the settings pointer, the eight counters); the extension (zone_x_t, below) is made when a zone
+ * needs it -- the transfer state, received settings, the catalog fields, the version kept for rollback, the rest of the statistics -- and goes with the entry.  An entry that is not a light
+ * attach (a zone of karidns.conf, a catalog member, a secondary, a database zone without the store) has its extension from the start (create_new_zone_entry()), so for them nothing is
+ * lazy; a primary database zone of the store (create_light_zone_entry()) has none until it needs one (zone_x_need()), and costs the core alone: a slot of the entry pool (dns_snapshot_rcu.c).
+ *
+ * Reading a field of the extension: zone_xr(e)->field (a zeroed extension when there is none).  Writing one: zone_x_need(e) (NULL when there is no memory), under the lock the field belongs to.
+ *
+ * 0.7 (B2): the fields are grouped by size, so that the one-octet flags and the 32-bit values share words instead of each leaving the padding of a 64-bit field behind it. */
+typedef struct zone_db_entry_s zone_db_entry_t;
+typedef struct zone_x_s zone_x_t;
+struct zone_x_s {
+  zone_observatory_t obs;                       /* the statistics that are not in the core (zone_obs_read() adds the two parts) */
+  _Atomic uint32_t ctr_carry[ZCTR_N];           /* how many times the 32-bit counter of the core passed a multiple of 2^31 (zone_ctr_get()): the counters are 64-bit while this exists */
+  /* catalog zones and their members (S5) */
+  catalog_member_id_t *catalog_members;
+  char **groups;
+  catalog_master_t *catalog_master;             /* B-3: malloc, catalog members only (primary and TSIG key of the catalog zone) */
+  char *catalog_member_unique_id;               /* S5: malloc.  NULL when the zone is not a catalog member (zone_entry_catalog_uid() reads it as "") */
+  char *owning_catalog_domain;                  /* S5: malloc, the same */
+  int catalog_member_count;
+  int group_count;
+  /* B8t-2: the settings the primary sent with the zone (Extended AXFR v3).  rxcfg is the zone configuration in force: a copy of the zone's own block (karidns.conf zone {}, or dbcfg) in which the
+   * statements the secondary did not write itself come from the received settings (zone_config_with_received()); NULL = no received settings in force.  Read by zone_entry_config(); replaced
+   * through the S2 retire stack.  rx_sh (the parsed text), rx_base, rx_gen and rx_note belong to the writers (entry->writer_lock) */
+  time_t xfr_ext_set;                           /* when it was learned */
+  _Atomic(const zone_config_t *) rxcfg;
+  zone_ext_shared_t *rx_sh;
+  const zone_config_t *rx_base;                 /* the block rxcfg was made from (compared, never dereferenced) */
+  uint64_t rx_gen;                              /* server_config_t.generation of that merge */
+  char *rx_note;                                /* why part of the received settings is not in force (NULL or "" = all of it is); malloc, only when there is a note; under writer_lock, read by zone_rx_settings_status() */
+  uint8_t xfr_ext_state;                        /* B8t-2: what the primary speaks (XFR_EXT_*, dns_axfr_ixfr.h); written by the transfer thread only */
+  time_t notify_next;                           /* notify-delay: the time before which the next set of NOTIFY messages for the zone is not sent (the control thread only) */
+  _Atomic(time_t) last_stale_log_time;
+  _Atomic(time_t) last_denial_gap_log;          /* 0.7 (audit): when a missing NSEC / NSEC3 proof of this zone was last logged (dns_query_engine.c note_denial_gap()) */
+  time_t last_loaded_mtime;
+  off_t last_loaded_size;                       /* with the mtime: a reload re-reads a file only when one of them changed (reload_master_zone()) */
+  /* karictl rollback: the version that was served before the last zone-file reload or database install (not a dynamic UPDATE, not a transfer).  prev, prev_epoch and rolled_back's writers belong to
+   * entry->writer_lock; readers of the zone never see prev (it is not reachable from rcu.active), so the query path is unchanged.  prev_next / prev_prev / prev_linked belong to g_prev_lock (the list
+   * of the entries that hold a prev, oldest deadline first: the control thread's tick and the cache manager walk it; an entry on it has an extension).  prev_serial, prev_bytes, prev_deadline and
+   * the rb_ group are atomics for zonestatus and dbstatus, which read them without the lock. */
+  zone_version_t *prev;
+  uint64_t prev_epoch;                          /* the RCU epoch at which prev left rcu.active (its retirement waits for it) */
+  struct zone_db_entry_s *prev_next, *prev_prev;
+  bool prev_linked;
+  _Atomic uint64_t prev_bytes;                  /* 0 = no prev */
+  _Atomic(time_t) prev_deadline;                /* when the control thread's tick drops prev */
+  _Atomic uint32_t prev_serial, rb_serial, rb_from;
+};
+struct zone_db_entry_s {
   /* The apex, FQDN with the trailing dot.  0.7 (B2): not an array of 256 octets in every entry (a database zone's name is about 20): create_new_zone_entry()
    * puts the text behind the struct in the same block (the name never changes), and a test that keeps an entry on its stack points it at a string of its own. */
   const char *domain;
-  char view_name[KARIDNS_VIEW_NAME_MAX];
+  /* the name of the view, interned (zone_view_name(): one copy for every zone of the view, never freed); a test's entry points it at a string of its own */
+  const char *view_name;
   zone_kind_t kind;
   uint8_t source; /* zone_source_t: どこから来たゾーンか。作成時に決まり、変わらない */
   bool is_catalog_member;
   bool is_secondary;
-  bool evicted;                   /* the zone was taken out of memory (set under writer_lock): a writer that waited for the lock must not change this entry, the change would be lost */
+  bool evicted;                   /* the zone was taken out of memory (set under writer_lock): a writer that waited for the lock sees it and must not change this entry, the change would be lost */
   _Atomic bool refresh_now;
   _Atomic bool notify_now;
   _Atomic bool is_transferring;
   _Atomic bool updated;           /* (written under writer_lock; the cache manager's scan and dbstatus read it without: relaxed loads) a dynamic UPDATE changed this DB zone since it was read from the database (set under writer_lock): it is not taken out of memory, the change would be lost; the next install from the database clears it */
-  _Atomic bool rx_present;        /* rx_sh != NULL (read without the lock by the control thread's tick) */
+  _Atomic bool rx_present;        /* the extension has rx_sh (read without the lock by the control thread's tick) */
   /* 他のゾーンがこのゾーンの名前をグルーに使っている (prelink が印を付ける)。公開時に
    * 制御スレッドへ依存するゾーンのグルーの作り直しを頼む */
   _Atomic bool glue_provider;
   _Atomic bool rolled_back;       /* the served version is the result of a rollback; cleared by the next publication */
-  bool prev_linked;               /* (belongs to g_prev_lock: see prev below) */
-  uint8_t xfr_ext_state;          /* B8t-2: what the primary speaks (XFR_EXT_*, dns_axfr_ixfr.h); written by the transfer thread only */
+  uint8_t pooled;                 /* the entry (and the name behind it) is a slot of the entry pool, not a malloc block (zone_entry_free_block()) */
   uint32_t block_bytes;           /* 0.7 (B1): the size of the block create_new_zone_entry() got from the allocator (0: the entry is not from there); never changes */
+  uint8_t light;                  /* 0.7 store S5: made by create_light_zone_entry(): no extension from the start, and a writer lock that libthr makes when it is first used */
   zone_rcu_t rcu;
   pthread_mutex_t writer_lock;
   _Atomic(uint32_t) serial;
@@ -483,67 +535,108 @@ typedef struct zone_db_entry_s {
   _Atomic(uint32_t) expire;
   _Atomic(int) active_axfr;
   _Atomic int snapshot_refs;
-  int catalog_member_count;
-  int group_count;
   _Atomic uint32_t fixed_charged; /* 0.7 (B1): what the entry itself costs (zone_entry_fixed_now()), counted in the zone memory totals with the first version that is resident (zone_publish_ex()) and given back when the entry is freed, or, evicted, moved to the retired total with the version (the writer's: the cache manager reads it) */
-  _Atomic uint32_t prev_serial;
-  _Atomic uint32_t rb_serial, rb_from;
+  _Atomic uint32_t ctr[ZCTR_N];   /* 0.7 S5: queries, the rcode classes, TCP, DO (zone_ctr_inc(), zone_ctr_get()) */
   _Atomic(time_t) next_check;
-  time_t notify_next;             /* notify-delay: the time before which the next set of NOTIFY messages for the zone is not sent (the control thread only) */
   size_t evicted_bytes;           /* D1a step 5: the bytes of the version served that were moved to the retired total when the zone was evicted (0: not evicted) */
   ixfr_history_t ixfr_history;
-  zone_observatory_t observatory;
-  catalog_member_id_t *catalog_members;
-  char *catalog_member_unique_id; /* S5: malloc。カタログのメンバーでなければ NULL (読むときは zone_entry_catalog_uid) */
-  char **groups;
-  catalog_master_t *catalog_master; /* B-3: malloc, catalog members only (primary and TSIG key of the catalog zone) */
-  char *owning_catalog_domain;    /* S5: malloc。同上 (読むときは zone_entry_catalog_owner) */
   /* source == ZONE_SRC_DB のゾーンの設定 (それ以外は NULL)。読むのは zone_entry_config() だけ。
    * 差し替えは新しい物を公開してから、古い物を zone_retire_object() で積む */
   _Atomic(const zone_config_t *) dbcfg;
-  /* B8t-2: the settings the primary sent with the zone (Extended AXFR v3).  rxcfg is the zone configuration in force: a copy of the
-   * zone's own block (karidns.conf zone {}, or dbcfg) in which the statements the secondary did not write itself come from the
-   * received settings (zone_config_with_received()); NULL = no received settings in force.  Read by zone_entry_config(); replaced
-   * through the S2 retire stack.  rx_sh (the parsed text), rx_base, rx_gen and rx_note belong to the writers (entry->writer_lock) */
-  time_t xfr_ext_set;             /* when it was learned */
-  _Atomic(const zone_config_t *) rxcfg;
-  zone_ext_shared_t *rx_sh;
-  const zone_config_t *rx_base;   /* the block rxcfg was made from (compared, never dereferenced) */
-  uint64_t rx_gen;                /* server_config_t.generation of that merge */
-  char *rx_note;                  /* why part of the received settings is not in force (NULL or "" = all of it is); malloc, only when there is a note; under writer_lock, read by zone_rx_settings_status() */
   _Atomic(time_t) last_successful_transfer;
   /* RFC 7314 §4: セカンダリの expire タイマーが切れる時刻。0 なら
    * last_successful_transfer + expire (従来どおり SOA EXPIRE で数える)。 */
   _Atomic(time_t) expire_at;
-  _Atomic(time_t) last_stale_log_time;
-  _Atomic(time_t) last_denial_gap_log;   /* 0.7 (audit): when a missing NSEC / NSEC3 proof of this zone was last logged (dns_query_engine.c note_denial_gap()) */
-  time_t last_loaded_mtime;
-  off_t last_loaded_size;        /* with the mtime: a reload re-reads a file only when one of them changed (reload_master_zone()) */
   /* エントリごとに一意 (アドレスの再利用と区別する)。グルーの作り直しの判定に使う */
   uint64_t id;
   /* 最後に公開したときの全体の公開カウンタ */
   _Atomic uint64_t publish_order;
-  /* karictl rollback: the version that was served before the last zone-file reload or database install (not a dynamic UPDATE, not a
-   * transfer).  prev, prev_epoch and rolled_back's writers belong to entry->writer_lock; readers of the zone never see prev (it is not
-   * reachable from rcu.active), so the query path is unchanged.  prev_next / prev_prev / prev_linked belong to g_prev_lock (the list of
-   * the entries that hold a prev, oldest deadline first: the control thread's tick and the cache manager walk it).  prev_serial,
-   * prev_bytes, prev_deadline and the rolled_back group are atomics for zonestatus and dbstatus, which read them without the lock. */
-  zone_version_t *prev;
-  uint64_t prev_epoch;            /* the RCU epoch at which prev left rcu.active (its retirement waits for it) */
-  struct zone_db_entry_s *prev_next, *prev_prev;
-  _Atomic uint64_t prev_bytes;    /* 0 = no prev */
-  _Atomic(time_t) prev_deadline;  /* when the control thread's tick drops prev */
-} zone_db_entry_t;
+  _Atomic(zone_x_t *) ext;      /* NULL until the zone needs it: zone_x(), zone_x_need() */
+};
 /* 制御チャネルで送る統計 (dns_wire.h、karictl も読む) も同じ長さで view 名を持つ */
 _Static_assert(sizeof(((zone_observatory_snapshot_t *)0)->view_name) == KARIDNS_VIEW_NAME_MAX,
                "view name buffers must match KARIDNS_VIEW_NAME_MAX");
 
+/* the extension of an entry (NULL: none), and a zeroed one to read from when there is none */
+static const zone_x_t zone_x_zero;
+static inline zone_x_t *zone_x(const zone_db_entry_t *e) { return atomic_load_explicit(&e->ext, memory_order_acquire); }
+static inline const zone_x_t *zone_xr(const zone_db_entry_t *e) {
+  const zone_x_t *x = zone_x(e);
+  return x ? x : &zone_x_zero;
+}
+/* The extension of the entry, made if the entry has none (zeroed; the first caller's block wins, a loser frees its own).  NULL: no memory.  No lock is needed to make it (a block that is not
+ * the first is freed here); the fields in it are written under the locks they belong to. */
+static inline zone_x_t *zone_x_need(zone_db_entry_t *e) {
+  zone_x_t *x = atomic_load_explicit(&e->ext, memory_order_acquire);
+  if (x) return x;
+  zone_x_t *n = calloc(1, sizeof(*n));
+  if (!n) return NULL;
+  zone_x_t *exp = NULL;
+  if (atomic_compare_exchange_strong_explicit(&e->ext, &exp, n, memory_order_acq_rel, memory_order_acquire)) return n;
+  free(n);
+  return exp;
+}
+
+/* The eight counters of the core.  A counter is 32 bits wide; every time it passes a multiple of 2^31 the thread that did it adds one to the carry of the extension (when the entry has one: a light
+ * attach has none, and its counter wraps at 2^32 answers -- the entry is a cache entry, its counters are "since it was attached", and are folded into the totals of the view when it leaves memory).
+ * zone_ctr_get() is exact for an entry with an extension: bit 31 of the counter says how many crossings there were (odd or even), so a crossing whose carry is not added yet is seen. */
+static inline void zone_ctr_inc(zone_db_entry_t *e, int k) {
+  const uint32_t v = atomic_fetch_add_explicit(&e->ctr[k], 1, memory_order_relaxed) + 1u;
+  if (__builtin_expect((v & 0x7FFFFFFFu) == 0, 0)) {
+    zone_x_t *x = zone_x(e);
+    if (x) atomic_fetch_add_explicit(&x->ctr_carry[k], 1, memory_order_release);
+  }
+}
+static inline uint64_t zone_ctr_get(const zone_db_entry_t *e, int k) {
+  const zone_x_t *x = zone_x(e);
+  uint32_t carry = x ? atomic_load_explicit(&x->ctr_carry[k], memory_order_acquire) : 0;      /* (the carry first: a crossing adds to the counter, then to the carry) */
+  const uint32_t c = atomic_load_explicit(&e->ctr[k], memory_order_relaxed);
+  if (!x) return c;
+  if (((c >> 31) & 1u) != (carry & 1u)) carry++;
+  return ((uint64_t)carry << 31) | (c & 0x7FFFFFFFu);
+}
+/* the 32-bit counter the cache manager folds into the frequency (low 32 bits of the total) */
+static inline uint32_t zone_queries32(const zone_db_entry_t *e) { return atomic_load_explicit(&e->ctr[ZCTR_QUERIES], memory_order_relaxed); }
+static inline void zone_obs_read(const zone_db_entry_t *e, zone_obs_view_t *o) {
+  const zone_x_t *x = zone_xr(e);
+  o->queries_total = zone_ctr_get(e, ZCTR_QUERIES);
+  o->responses_noerror = zone_ctr_get(e, ZCTR_NOERROR);
+  o->responses_nxdomain = zone_ctr_get(e, ZCTR_NXDOMAIN);
+  o->responses_nodata = zone_ctr_get(e, ZCTR_NODATA);
+  o->responses_servfail = zone_ctr_get(e, ZCTR_SERVFAIL);
+  o->responses_refused = zone_ctr_get(e, ZCTR_REFUSED);
+  o->tcp_queries = zone_ctr_get(e, ZCTR_TCP);
+  o->dnssec_do_queries = zone_ctr_get(e, ZCTR_DO);
+  o->ecs_queries = atomic_load_explicit(&x->obs.ecs_queries, memory_order_relaxed);
+  o->edns_queries = atomic_load_explicit(&x->obs.edns_queries, memory_order_relaxed);
+  o->rrl_dropped = atomic_load_explicit(&x->obs.rrl_dropped, memory_order_relaxed);
+  o->rrl_slipped = atomic_load_explicit(&x->obs.rrl_slipped, memory_order_relaxed);
+  o->notify_sent = atomic_load_explicit(&x->obs.notify_sent, memory_order_relaxed);
+  o->notify_ack = atomic_load_explicit(&x->obs.notify_ack, memory_order_relaxed);
+  o->axfr_success = atomic_load_explicit(&x->obs.axfr_success, memory_order_relaxed);
+  o->ixfr_success = atomic_load_explicit(&x->obs.ixfr_success, memory_order_relaxed);
+  o->xfer_failed = atomic_load_explicit(&x->obs.xfer_failed, memory_order_relaxed);
+  o->wirecache_hits = atomic_load_explicit(&x->obs.wirecache_hits, memory_order_relaxed);
+  o->wirecache_misses = atomic_load_explicit(&x->obs.wirecache_misses, memory_order_relaxed);
+  o->last_transfer_time = atomic_load_explicit(&x->obs.last_transfer_time, memory_order_relaxed);
+  o->last_notify_time = atomic_load_explicit(&x->obs.last_notify_time, memory_order_relaxed);
+}
+/* A counter of the extension's statistics for the zones that have an extension (a light attach does not count these): add n to the counter. */
+#define ZONE_OBS_ADD(e, field, n) do { zone_x_t *zx_ = zone_x(e); if (zx_) atomic_fetch_add_explicit(&zx_->obs.field, (n), memory_order_relaxed); } while (0)
+
+/* the name of a view, interned: one copy for the process (view names are the configuration's, a few); never freed */
+const char *zone_view_name(const char *name);
+/* the view name of an entry; an entry that a test kept on its stack and never named has none: "" (every entry of the server has one) */
+static inline const char *zone_vname(const zone_db_entry_t *e) { return e->view_name ? e->view_name : ""; }
+
 /* S5: カタログ関連の文字列は非カタログのゾーンでは NULL。比較や表示には空文字列として読む */
 static inline const char *zone_entry_catalog_uid(const zone_db_entry_t *e) {
-  return e->catalog_member_unique_id ? e->catalog_member_unique_id : "";
+  const char *u = zone_xr(e)->catalog_member_unique_id;
+  return u ? u : "";
 }
 static inline const char *zone_entry_catalog_owner(const zone_db_entry_t *e) {
-  return e->owning_catalog_domain ? e->owning_catalog_domain : "";
+  const char *o = zone_xr(e)->owning_catalog_domain;
+  return o ? o : "";
 }
 
 /* セカンダリゾーンが期限切れになる時刻。期限が無い (プライマリ、未転送) なら 0。 */
@@ -619,6 +712,7 @@ enum { ZDIR_ST_ABSENT = 0, ZDIR_ST_RESIDENT, ZDIR_ST_LOADING, ZDIR_ST_ERROR };
 #define ZDIR_K_STATIC    0x02u     /* the zone of a zone { } block of karidns.conf */
 #define ZDIR_K_SHARED    0x04u     /* a zone shared from another view by `in-view`: the entry is the owner view's */
 #define ZDIR_K_BORROWED  0x08u     /* the element holds no reference of its entry (unit tests, fuzzers) */
+#define ZDIR_K_STORED    0x10u     /* 0.7 store S3: a database zone of the zone store that is in memory (attached) or on its way into it: the registry knows it, the directory's index does not (the attach table does: zid -> element, dns_db_store.c) */
 
 /* D1a step 6 (design 12-12): the apex of a zone that is not in memory, from its summary: what the answer to an SOA question at the apex is made of
  * (RFC 1035 3.3.13, 3.3.11).  Names are wire names without compression (RFC 3597 4 does not apply: SOA and NS are well-known types).  data: MNAME,
@@ -666,14 +760,17 @@ static inline int apex_write_soa_rr(uint8_t *res, uint16_t *offset_ptr, size_t m
 struct zdir_elem {
   struct zdir_elem *next;      /* the registry's hash chain; once the element is on a garbage list, that list */
   _Atomic(zone_db_entry_t *) entry;   /* the entry that answers for the name (RCU-published); the element holds a reference */
-  char *error;                 /* last rejection / loader error, malloc; NULL = none */
   int64_t source_id;           /* DB: the domain id of the zone; directory-owned elements: the listing order */
   _Atomic uint32_t serial;     /* DB: the serial of the version offered last (the SOA of the entry for a secondary).  Written under g_zone_db_rebuild_lock; a worker reads it (build_apex_soa_answer()): zdir_serial() */
   uint32_t refresh, retry, expire;   /* the SOA timers of the version served */
   uint32_t hash;               /* calc_fnv1a_strn(name, klen): the index hash */
-  _Atomic uint32_t freq;       /* D1a step 5: how often the zone is asked for (GDSF, cache admission).  Non-resident zone: +1 per query that parks; the cache manager folds the queries of a resident zone in (observatory counter) and halves it at each round */
+  uint32_t zid;                /* ZDIR_K_STORED: the zone id in the store (dns_store.h) */
+  uint16_t sview;              /* ... and the id of its view in the store */
+  _Atomic uint32_t freq;      /* D1a step 5: how often the zone is asked for (GDSF, cache admission).  Non-resident zone: +1 per query that parks; the cache manager folds the queries of a resident zone in (observatory counter) and halves it at each round */
   uint32_t qseen;              /* D1a step 5: the zone entry's query counter (low 32 bits) when the cache manager last folded it into freq */
   uint32_t t_load;             /* D1a step 5: when the data came into memory (ms of a monotonic clock, 32 bits): a zone is not taken out again before its queries are answered */
+  uint32_t t_age;              /* 0.7 store S5: the time (ms, 32 bits) up to which the frequency is aged: the sampler halves it once for every CACHE_AGE_MS since then */
+  uint32_t pin_charge;         /* 0.7 store S5: the bytes this element adds to the pinned total (g_stored_pinned): set when the zone is registered, given back when the element leaves the registry */
   _Atomic uint8_t state;       /* ZDIR_ST_*: written under g_zone_db_rebuild_lock, read without it (a worker looks at it before it parks a query) */
   uint8_t last_result;         /* DBREG_APPLIED or DBREG_REJECTED (the last version offered) */
   bool shadowed;               /* a zone of karidns.conf (D-PRIO) or a catalog member (D17-1) with this name hides it: hidden elements are not in the index */
@@ -764,7 +861,95 @@ typedef struct view_snapshot {
   zdir_ivdb_t *ivdb;
   size_t ivdb_cap;               /* slots of the table (a power of two); 0 with ivdb == NULL */
   size_t ivdb_n;                 /* names in it */
+  /* 0.7 store S3: the id of the view in the zone store (zref_view_sid()): 0 = not looked up yet; low 16 bits 0xFFFF = the view has none (the high 16 bits: the store's view generation at
+   * that look, so that a view that the store gets later is found); else the store view id + 1.  Set lazily by the lookup. */
+  _Atomic uint32_t sid_state;
 } view_snapshot_t;
+
+/* ---- 0.7 store S3: the zone store is the directory of the database zones (design 2.2) ----
+ * With the store on, a database zone (a primary: not a catalog consumer, not a secondary) is found by the name index of the store (ix) and not in the view's heap directory.  The
+ * heap directory keeps what is not in the store (zone { } blocks, catalog members, secondaries, the stubs of in-view, and the database zones of a server without a store).  The
+ * lookup asks, at every suffix of the name, the heap directory first and then the store, so a zone of karidns.conf or a catalog member hides a database zone of the same name
+ * (D-PRIO, D17-1) without a flag in the store, and a longer database apex wins over a shorter static one.  A database zone that is in memory (attached) has a registry element
+ * (ZDIR_K_STORED) that the attach table (zid -> element, lock-free, dns_db_store.c) reaches; a zone that is not has none and costs no heap.  The result of a lookup is a zref_t. */
+#define ZREF_NOZID 0xFFFFFFFFu
+#define ZREF_NAME_SIZE 258        /* the canonical name of a store zone with its dot and NUL: the store keeps names up to 255 bytes of text (STORE_NAME_MAX; dns_db_store.c checks it) */
+enum { ZREF_ST_NONE = 0, ZREF_ST_ABSENT, ZREF_ST_KNOWN };    /* a store zone that is not in memory: its image is stored / it has no image (it is read from the database) */
+typedef struct zref {
+  zone_db_entry_t *entry;        /* the data in memory (a heap element's, or the attached zone's); NULL: not in memory */
+  zdir_elem_t *el;               /* the heap directory's element, or the registry's element of an attached store zone; NULL for a store zone that is not in memory */
+  uint32_t zid;                  /* the zone id in the store; ZREF_NOZID: not a store zone */
+  uint32_t serial;               /* a store zone that is not in memory: the serial of its record */
+  uint32_t settings;             /* ... and the id of its settings (zref_settings()) */
+  uint16_t flags;                /* ... and the flags of its record (STORE_F_*) */
+  int16_t sview;                 /* the view's id in the store, -1: none */
+  uint8_t zstate;                /* ZREF_ST_* */
+  bool busy;                     /* the store had a cell that was being written: the zone is not known now (a worker parks the query for a store thread; it never waits) */
+  const char *hview;             /* the name of the view that holds the zone (the owner's for a zone shared by in-view) */
+  char name[ZREF_NAME_SIZE];     /* a store zone that is not in memory: its canonical name with the trailing dot (use zref_name()) */
+} zref_t;
+static inline void zref_clear(zref_t *z) {
+  z->entry = NULL; z->el = NULL; z->zid = ZREF_NOZID; z->serial = 0; z->settings = 0; z->flags = 0; z->sview = -1; z->zstate = ZREF_ST_NONE; z->busy = false; z->hview = NULL; z->name[0] = '\0';
+}
+static inline bool zref_present(const zref_t *z) { return z->el != NULL || z->zid != ZREF_NOZID || z->busy; }
+static inline const char *zref_name(const zref_t *z) { return z->el ? z->el->name : z->name; }
+/* the state of a zone out of memory the way the worker reads it: ZDIR_ST_ABSENT (a store zone: stored or known, or an element that is) / LOADING / ERROR */
+static inline uint8_t zref_state(const zref_t *z) {
+  return z->el ? atomic_load_explicit((const _Atomic uint8_t *)&z->el->state, memory_order_acquire) : (uint8_t)ZDIR_ST_ABSENT;
+}
+/* the settings (allow-query, allow-transfer ...) of a zone that is not in memory: the element's, or the interned block of the store's settings id; NULL: none.  Read section only. */
+zone_ext_shared_t *zref_settings(const zref_t *z);
+/* a walk of the attach table in a read section that starts again when the table grows (fn returns false: stop, the walk returns false) */
+bool attach_walk(bool (*fn)(zdir_elem_t *el, void *ud), void (*reset)(void *ud), void *ud);
+#ifdef KARIDNS_UNIT_TEST
+extern void (*g_attach_walk_between)(void);
+#endif
+
+/* What dns_db_store.c installs when the store is the directory (g_dbdir; NULL: no store, everything above is the heap directory only and the registry works as before 0.7).  All of it
+ * is called by the registry and the lookup, which cannot link the store (the unit tests of the engine do not). */
+typedef struct dbdir_rec {
+  uint32_t zid;
+  uint8_t state;                 /* STORE_STATE_KNOWN / STORE_STATE_STORED */
+  uint16_t flags;                /* STORE_F_* */
+  uint32_t serial, settings;
+  int64_t source_id;
+  uint64_t stamp_gen, stamp_time;   /* 0.7 WP7b: the version stamp of the record (the loader's manifest or change entry that asked for this version of the zone) */
+  uint8_t digest[32];
+} dbdir_rec_t;
+typedef struct dbdir_ops {
+  int (*view_sid)(const char *view_name);                                    /* the store's id of the view, -1 none */
+  uint32_t (*view_gen)(void);                                                /* changes when the store gets a view */
+  unsigned (*depth_max)(int sid);                                            /* the most labels a stored zone of the view has (0: none) */
+  bool (*find)(int sid, const char *fname, size_t len, zref_t *out);         /* one probe of the name index (the folded name, no trailing dot); out->busy: a cell was being written */
+  zone_ext_shared_t *(*settings)(uint32_t id);                               /* the interned settings of a store settings id (not referenced) */
+  uint32_t (*settings_id)(zone_ext_shared_t *sh);                            /* the id of settings (assigned and made durable when it has none); 0 = none */
+  bool (*rec_get)(const char *view, const char *zone, dbdir_rec_t *out);     /* the store's record of a zone (the name with its trailing dot) */
+  int (*rec_get_nb)(const char *view, const char *zone, dbdir_rec_t *out);   /* the same without ever sleeping (for a caller that holds the registry lock): 1 found, 0 none, -1 a cell was being written (not known now) */
+  int (*put)(const char *view, const char *zone, zone_db_entry_t *entry, int64_t source_id, uint32_t serial, const uint8_t digest[32], uint32_t settings, uint32_t *zid);
+  int (*del)(const char *view, const char *zone, int64_t source_id, bool *had);   /* delete by name (when source_id is 0 or the record's) */
+  void (*set_known)(uint32_t zid);                                           /* the record loses its image (damaged, or the version is not trusted) */
+  void (*note_flags)(uint32_t zid, uint16_t set, uint16_t clear);
+  bool (*attach_reserve)(void);                                              /* room for one more element in the attach table (the registry lock is held): done before the registry changes anything, so that attach_put() cannot fail then */
+  bool (*attach_put)(zdir_elem_t *el);                                       /* the attach table: the registry lock is held (all three) */
+  void (*attach_remove)(const zdir_elem_t *el);
+  size_t (*attach_count)(void);
+  zdir_elem_t *(*attach_get)(uint32_t zid);
+  zdir_elem_t *(*attach_next)(size_t *pos);                                  /* the elements of the attach table, in table order (read section); *pos starts at 0; NULL at the end */
+  zdir_elem_t *(*attach_sample)(uint64_t r);                                    /* an element of the attach table picked at random (r: the random number; NULL: none); the registry lock is held (S5: eviction by sampling) */
+  uint64_t (*attach_tab_id)(void);                                           /* identifies the table a position belongs to (a table that grew is another one) */
+  bool (*worker_attach)(const view_snapshot_t *view, const zref_t *pel, int widx);   /* 0.7 fix 7: a worker, in its read section, attaches a zone of the store whose image is in the page cache (MAP mode) and answers from it: true: the zone is there (look it up again), false: not done, park the query as before (nothing was changed except a claim of the zone that the park keeps) */
+  uint64_t (*counters)(int what);                                            /* the figures of the store for the status lines */
+} dbdir_ops_t;
+extern _Atomic(const dbdir_ops_t *) g_dbdir;
+static inline const dbdir_ops_t *dbdir(void) { return atomic_load_explicit(&g_dbdir, memory_order_acquire); }
+/* the longest-suffix match of qname and the zone named exactly domain, in the heap directory of the view and in the store: found (true) or not.  The store is asked at every suffix after the
+ * heap directory (see above); the in-view names too (the owner view's store).  zdir_find_suffix() / zdir_find_exact() below stay the heap directory alone. */
+bool zref_find_suffix(const view_snapshot_t *view, const char *qname, zref_t *out);
+bool zref_find_exact(const view_snapshot_t *view, const char *domain, zref_t *out);
+/* the store's id of the view (looked up once and kept in the view of the snapshot): -1 none */
+int zref_view_sid(const view_snapshot_t *view);
+/* find_zone_for_query_ex() with a zref_t; the DS rule of R-32 as there */
+zone_db_entry_t *find_zone_for_query_zref(view_snapshot_t *view, const char *qname, uint16_t qtype, zref_t *out);
 
 /* The view that holds the zone of an element a lookup in `view` returned: the view's own name, or -- for a zone shared by in-view from the database of another view -- the owner
  * view's.  It is the name the registry knows the zone by (a request to read a zone, a wake-up, a NOTIFY, the table of transfers). */
@@ -940,10 +1125,10 @@ zone_config_t *find_zone_config_in_view(server_config_t *cfg, const char *view_n
 /* ゾーンエントリの設定。DB のゾーンは entry->dbcfg、それ以外は cfg の索引 (find_zone_config_in_view)。
  * 無ければ NULL。返した物は cfg を保持している間 (DB のゾーンは読み取り区間の中) だけ有効 */
 static inline const zone_config_t *zone_entry_config(server_config_t *cfg, const zone_db_entry_t *entry) {
-  const zone_config_t *rx = atomic_load_explicit(&entry->rxcfg, memory_order_acquire); /* B8t-2 */
+  const zone_config_t *rx = atomic_load_explicit(&zone_xr(entry)->rxcfg, memory_order_acquire); /* B8t-2 */
   if (rx) return rx;
   if (entry->source == ZONE_SRC_DB) return atomic_load_explicit(&entry->dbcfg, memory_order_acquire);
-  return find_zone_config_in_view(cfg, entry->view_name, entry->domain);
+  return find_zone_config_in_view(cfg, zone_vname(entry), entry->domain);
 }
 /* B8t-2: the settings a primary sent with the zone.  zone_rx_settings_parse() reads the text with the restricted parser (NULL when
  * there is none, or it is not accepted: logged; the text is never trusted).  zone_rx_settings_apply_locked() makes sh (ownership
@@ -998,12 +1183,15 @@ bool zone_retire_object(zone_db_entry_t *entry, void *obj, void (*free_fn)(void 
 /* builder を新しい版として公開する (dns_axfr_ixfr.c)。entry->writer_lock を持って呼ぶ。約束は定義の前の注釈に */
 /* keep_prev: the version it replaces becomes entry->prev for the zone's rollback-window (a database install); false: zone_publish() */
 int zone_install_builder(zone_db_entry_t *entry, zone_arena_t *builder, const char *what, bool keep_prev);
+/* its second half (0.7 store S2): publish a version that is made already (glue, response cache flag, IXFR difference against cur_active (NULL: none), publication).  writer_lock is held */
+void zone_install_version(zone_db_entry_t *entry, zone_version_t *standby, const zone_version_t *cur_active, bool keep_prev);
 /* the size limits of the zone (max-records, ...) checked on a built zone before it is installed; 0 = ok (see dns_axfr_ixfr.c) */
 int zone_limits_gate(zone_db_entry_t *entry, zone_arena_t *builder, const char *what);
 /* 公開直前に呼ぶ: 応答キャッシュに入れてよいか (rcache_ok) を決める。ゾーンの設定は zone_entry_config(cfg, entry)
  * (DB のゾーンは dbcfg)。entry は view_name、domain、source (と DB のゾーンなら dbcfg) だけを読む */
 void build_zone_response_cache(zone_version_t *ver, server_config_t *cfg, const zone_db_entry_t *entry);
 void zone_glue_refresh_dependents(bool force);
+bool zone_glue_thread_start(void);   /* 0.7 store: the thread that runs zone_glue_refresh_dependents(false) every few milliseconds (the control thread no longer does) */
 /* 0.7 (B1): what the entry itself costs in memory (its block, its lock, a database zone's settings), counted with its first resident version (dns_snapshot_rcu.c) */
 uint32_t zone_entry_fixed_now(const zone_db_entry_t *e);
 /* 0.7 (B2): a zone that became reachable by `domain` in `view` (a first publication, an entry that came into the index): the next zone_glue_refresh_dependents()
@@ -1119,7 +1307,7 @@ static inline size_t zdir_count_static(const view_snapshot_t *view) {
 static inline size_t zdir_count_owned(const view_snapshot_t *view) { return zdir_count(view) - zdir_count_shared(view); }
 /* Is the entry a zone of this view, rather than one shared from an earlier view (the owner view's name is in entry->view_name)? */
 static inline bool view_owns_entry(const view_snapshot_t *vs, const zone_db_entry_t *e) {
-  return zdir_count_shared(vs) == 0 || strcasecmp(e->view_name, vs->name) == 0;
+  return zdir_count_shared(vs) == 0 || strcasecmp(zone_vname(e), vs->name) == 0;
 }
 /* the ticking zones of the view (zone_entry_ticks()): *n of them; valid while the caller is in a read section or holds the snapshot */
 zdir_elem_t *const *zdir_tick_list(const view_snapshot_t *view, size_t *n);
@@ -1145,8 +1333,59 @@ uint64_t zone_bytes_underflows(void);                             /* times a byt
 /* Record that the version offered for (view, name) was rejected (an existing entry keeps serving its last good
  * version; without one only the error is recorded).  false: out of memory. */
 bool dbreg_reject(const char *view, const char *name, int64_t source_id, const char *reason);
+/* mark_record false: the store's record is not marked (STORE_F_REJECTED_NEW): the rejected body was for a stamp the record no longer has (dns_db_ingest.c) */
+/* 0.7 store S5 (design 6.1): what is kept of the counters of the zones that left memory.  dbreg_fold_totals(): the sum over every view (the eight counters of ZCTR_*, the number of zones folded); dbreg_fold_view_totals(): one
+ * view's; dbreg_fold_topk(): the (at most ZFOLD_TOPK) zones with the most queries that are not in memory now, most queries first; dbreg_fold_stats(): zones folded, rows in the table, rows replaced by a busier zone. */
+#define ZFOLD_TOPK 128
+typedef struct {
+  char view[KARIDNS_VIEW_NAME_MAX];
+  char zone[256];                  /* canonical, with the trailing dot */
+  uint64_t c[ZCTR_N];
+  uint32_t detaches;
+} zone_fold_row_t;
+void dbreg_fold_totals(uint64_t out[ZCTR_N], uint64_t *zones);
+/* the same with the number of folds so far; dbreg_fold_seq() later says whether another zone was folded (and so left the attach table or was replaced) since */
+void dbreg_fold_totals_seq(uint64_t out[ZCTR_N], uint64_t *zones, uint64_t *seq);
+uint64_t dbreg_fold_seq(void);
+bool dbreg_fold_view_totals(const char *view, uint64_t out[ZCTR_N], uint64_t *zones);
+size_t dbreg_fold_topk(zone_fold_row_t *out, size_t max);
+void dbreg_fold_stats(uint64_t *folded, uint64_t *rows, uint64_t *replaced);
+/* 0.7 store S5 (design 6.7): the text of the last rejection of a zone is kept in a bounded ring (512 zones) in memory, not in the zone's element: a rejected zone of the store has no element at all.
+ * dbreg_err_note(): record the text (NULL: forget the zone's); zid: the zone's id in the store (0xFFFFFFFF: none).  dbreg_err_get(): the text (false: none, or it was pushed out by newer ones).  A store that keeps
+ * the texts in a file (err.ring, keyed by zone id) installs its functions with dbreg_err_set_sink(): the ring in memory answers first, the sink behind it.  A zone id is reused after a delete, so the sink keeps
+ * a tag (a hash of the view and the zone name) and the version stamp of the zone's record with the text, and its get() answers only for the same tag and stamp.  put() and clear() are called after the
+ * registry's lock is released (a registry writer calls dbreg_err_forget() under the lock and dbreg_err_sink_clear() after it); get() may be called with it (the status commands), and is a lookup in a table. */
+typedef struct dbreg_err_sink {
+  void (*put)(uint32_t zid, uint32_t tag, uint64_t stamp, const char *text);
+  bool (*get)(uint32_t zid, uint32_t tag, uint64_t stamp, char *out, size_t cap);
+  void (*clear)(uint32_t zid);
+} dbreg_err_sink_t;
+void dbreg_err_set_sink(const dbreg_err_sink_t *sink);
+/* stamp 0: the zone has none (the unit tests); the _st forms carry the version stamp of the store's record (dbreg_err_stamp()) */
+void dbreg_err_note(const char *view, const char *zone, uint32_t zid, const char *text);
+void dbreg_err_note_st(const char *view, const char *zone, uint32_t zid, uint64_t stamp, const char *text);
+bool dbreg_err_get(const char *view, const char *zone, uint32_t zid, char *out, size_t cap);
+bool dbreg_err_get_st(const char *view, const char *zone, uint32_t zid, uint64_t stamp, char *out, size_t cap);
+/* the text of a zone for a caller that holds the registry lock (`karictl zonestatus`): the stamp of the store's record is looked up here (a cell that is being written: no sink text) */
+bool dbreg_err_get_locked(const char *view, const char *zone, uint32_t zid, char *out, size_t cap);
+/* forget the zone's text in the memory ring (callable with the registry lock held); true: a sink is installed and dbreg_err_sink_clear(zid) is to follow once no lock is held */
+bool dbreg_err_forget(const char *view, const char *zone);
+void dbreg_err_sink_clear(uint32_t zid);
+/* 0.7 store S6: the store made the zone of this id KNOWN because its image is damaged (the scrub, the cleaner).  A zone of that id that is attached with a version for which backed() says it points into the
+ * store's pages is taken out of memory, even when it is pinned (the record is KNOWN: it is read from the database again).  0: done, or nothing to do; 1: not now (a reader, a transfer, the writer lock of
+ * the entry): the caller asks again.  Takes the registry lock: no lock of the store may be held. */
+int dbreg_store_image_lost(uint32_t zid, bool (*backed)(const zone_version_t *v));
+/* 0.7 store S5: a dynamic UPDATE or a rollback changed the zone of the entry (it is pinned in memory from now on) or it grew: the pinned total of the store counts the bytes it holds now.  The entry's writer lock must not be held. */
+void dbreg_pin_changed(zone_db_entry_t *e);
+void dbreg_err_stats(size_t *n, uint64_t *noted, uint64_t *dropped);
+#ifdef KARIDNS_UNIT_TEST
+void dbreg_err_reset_for_test(void);
+#endif
+bool dbreg_reject_ex(const char *view, const char *name, int64_t source_id, const char *reason, bool mark_record);
+/* the install that dbreg_lookup_entry_busy() marked ended without dbreg_commit() or dbreg_reject(): the busy mark goes */
+void dbreg_busy_clear(const char *view, const char *name);
 /* ZONE_DELETE: forget the zone; its entry leaves the view snapshot with the next snapshot_apply_db_delta().  1:
- * removed, 0: not registered or registered with another source id (nothing done). */
+ * removed, 0: not registered or registered with another source id (nothing done), -1: the store could not delete the zone's record (the zone stays). */
 int dbreg_delete(const char *view, const char *name, int64_t source_id);
 /* Publish the queued additions and removals (beta design 4.4, D1a): the directory of each view is changed in place, element by
  * element (no copy of the index unless it has to grow), and a new snapshot that shares the directories is published; what left
@@ -1185,6 +1424,7 @@ typedef struct {
   uint32_t serial;             /* the serial of the version served (0 without an entry) */
   uint32_t refresh;            /* SOA refresh of that version */
   bool has_entry;              /* a version was installed */
+  uint8_t store_state;         /* 0.7: the zone has no registry element and the zone store holds it: 1 stored (an image), 2 known (no body yet); 0 otherwise */
   bool shadowed;
   uint8_t shadow_by;           /* DBREG_SH_* */
   uint8_t last_result;         /* DBREG_APPLIED / DBREG_REJECTED: the last version offered */
@@ -1194,6 +1434,9 @@ typedef struct {
 /* The registry records of the zone `name` (any case, with or without the trailing dot) in the view `view` (NULL: every
  * view), at most max of them copied to out.  Returns how many there are. */
 int dbreg_find_info(const char *view, const char *name, dbreg_info_t *out, int max);
+/* The entry of a database zone for a control command (karictl notify, rollback, zonestatus), found in the snapshot of the command.  A zone of the heap directory is kept alive by the snapshot; a zone of the zone
+ * store that is in memory is not (the attach table reaches it), so it is held here: *held says that the caller gives it back with xfr_entry_release().  NULL: the zone is not in memory, or it is hidden. */
+zone_db_entry_t *dbreg_ctl_entry(zone_db_snapshot_t *snap, const char *view, const char *name, bool *held);
 /* D1a step 5: the cache manager (memory-limit of database { }).  dbreg_cache_round() takes zones out of memory when the database zones hold more
  * than the high mark of the limit; the ingest thread's cache thread calls it every 100 ms. */
 typedef struct {
@@ -1207,6 +1450,7 @@ typedef struct {
   uint64_t pinned_bytes, peak;
   uint32_t victim_freq;
   uint64_t room_evictions, room_relaxed;         /* zones taken out on demand for a query that waited for room (also in evictions), and of those the ones younger than the minimum residency */
+  uint64_t sampled;                          /* zones of the store taken out because a sample of the attach table chose them (also in evictions): 0.7 store S5, design 4.4 */
 } dbreg_cache_stats_t;
 void dbreg_cache_set_limit(uint64_t limit);
 uint64_t dbreg_cache_limit(void);
@@ -1224,6 +1468,8 @@ typedef struct { size_t total, resident, absent; uint64_t queries; } dbreg_resid
 void dbreg_residency(dbreg_residency_t *out);
 #ifdef KARIDNS_UNIT_TEST
 void dbreg_cache_test_pause(bool on);                              /* TEST ONLY: the manager does nothing while paused */
+void dbreg_test_pin(const char *view, const char *name, bool pin);       /* TEST ONLY: pins (or not) a zone of the store the way the settings do, with the bytes it adds to the pinned total */
+uint16_t dbreg_test_flags(const char *view, const char *name);               /* TEST ONLY: the flags of the registry's element (under the registry lock) */
 void dbreg_cache_test_set_victim_freq(uint32_t f);                 /* TEST ONLY: the frequency a zone that is loaded now is compared with */
 void dbreg_cache_test_room_pause(bool on);                         /* TEST ONLY: dbreg_cache_make_room() takes nothing out while paused */
 #endif
@@ -1269,6 +1515,37 @@ bool dbreg_test_evict(const char *view, const char *name);        /* TEST ONLY, 
 enum { DBREG_FETCH_STARTED = 0, DBREG_FETCH_RESIDENT, DBREG_FETCH_BUSY, DBREG_FETCH_NONE };
 int dbreg_fetch_begin(const char *view, const char *zone);
 void dbreg_fetch_end(const char *view, const char *zone);
+/* 0.7 store S2 (dns_db_store.c): an attach makes the entry of a zone that is out of memory from the store's record instead of asking the loader.  The store thread reads the record and
+ * the image before it takes the registry's lock, makes the entry, and dbreg_attach_store() does the rest in ONE section of the lock: the zone's element (LOADING, from the record) and the
+ * commit of the entry (the record is looked at once more inside the lock).  DBREG_ATT_STARTED: the entry is the zone's now; RESIDENT: in memory already; BUSY: a fetch or an attach is on its way; STALE: the record
+ * is not the one the caller read (read it again); NOT: not a zone to attach (an element of another kind, out of memory): the caller keeps its entry.  dbreg_pin_entry(): the entry of a zone in memory, held (a reference and active_axfr) until xfr_entry_release();
+ * the store's write-through keeps the version it copies from going away with it.  dbreg_set_evict_hook(): called, with the registry lock held, for every zone taken out of memory,
+ * with DBREG_EVICT_* (the counters of `karictl store`; the hook must not lock). */
+enum { DBREG_ATT_STARTED = 0, DBREG_ATT_RESIDENT, DBREG_ATT_BUSY, DBREG_ATT_NOT, DBREG_ATT_STALE };
+typedef struct {                 /* what the commit checks against the element (dbreg_offered_still_locked()) */
+  int64_t source_id;
+  uint32_t serial;
+  uint16_t flags;
+  bool digest_set;
+  bool bg;                       /* nobody waits for the zone: it goes first when memory-limit needs room */
+  void (*under_lock)(void *);    /* called with the registry lock held, once, whatever the outcome, just before it is released (dbreg_attach_store(): the staged element leaves the staging table here) */
+  void *under_arg;
+  uint8_t digest[32];
+} dbreg_attach_info_t;
+int dbreg_attach_store(const char *view, const char *name, const dbdir_rec_t *rec, zone_db_entry_t *entry, bool bg, void (*under_lock)(void *), void *under_arg);
+/* 0.7 fix 7, the worker's attach (dns_db_store.c): the worker makes the entry of a zone whose image is in the page cache and publishes a STAGED element for it (a zdir_elem_t that is not in the
+ * registry: only the staging table of dns_db_store.c reaches it), takes no lock of the registry and answers from the entry; a store thread registers the entry (dbreg_attach_store() with the record
+ * the staged element holds: dbreg_staged_rec()) and takes the staged element away (dbreg_staged_retire(): freed after the grace period; entry_dead: the registry did not take the entry, it goes too).
+ * dbreg_staged_free() is for an element that was never published.  The entry's pointer is the element's `entry`. */
+zdir_elem_t *dbreg_staged_new(const char *name, uint16_t sview, const dbdir_rec_t *rec, zone_db_entry_t *entry);
+void dbreg_staged_rec(const zdir_elem_t *z, dbdir_rec_t *rec);
+void dbreg_staged_retire(zdir_elem_t *z, bool entry_dead);
+void dbreg_staged_free(zdir_elem_t *z);
+/* 0.7 fix 8: the zones of the attach table with their scores (score << 32 | zone id), for hot.list; the registry lock is taken for the walk */
+size_t dbreg_hot_collect(uint64_t *out, size_t cap);
+zone_db_entry_t *dbreg_pin_entry(const char *view, const char *zone);
+enum { DBREG_EVICT_OTHER = 0, DBREG_EVICT_LIMIT, DBREG_EVICT_ROOM };
+void dbreg_set_evict_hook(void (*cb)(int reason));
 bool dbreg_apply_summary(const char *view, const char *zone, int64_t source_id, uint32_t serial, bool has_timers, uint32_t refresh,
                          uint32_t retry, uint32_t expire);
 enum { DBREG_SUM_NONE = 0, DBREG_SUM_SAME, DBREG_SUM_DIFFERS };
