@@ -42,9 +42,11 @@ test('only dom.js makes elements; the stores of the browser are touched in two p
     if (rel(f) !== 'js/dom.js') assert.ok(!/createElement|createTextNode|createDocumentFragment|\bDOMParser\b|\binsertBefore\b/.test(src), `${rel(f)} makes nodes itself`);
     if (!['js/app.js', 'js/i18n.js'].includes(rel(f))) assert.ok(!/localStorage/.test(src), `${rel(f)} uses localStorage`);
   }
-  // what is kept in localStorage: the language (i18n.js) and nothing else
-  const keys = [...read(path.join(UI, 'js/i18n.js')).matchAll(/(?:getItem|setItem)\(([^,)]+)/g)].map((m) => m[1]);
-  assert.deepEqual([...new Set(keys)], ['LANG_KEY']);
+  // what is kept in localStorage: the language (i18n.js) and the colour scheme (theme.js; app.js hands both the store), and nothing else
+  const keys = (f) => [...new Set([...read(f).matchAll(/(?:getItem|setItem|removeItem)\(([^,)]+)/g)].map((m) => m[1]))];
+  assert.deepEqual(keys(path.join(UI, 'js/i18n.js')), ['LANG_KEY']);
+  assert.deepEqual(keys(path.join(UI, 'js/theme.js')), ['THEME_KEY']);
+  for (const f of js) if (!['js/i18n.js', 'js/theme.js'].includes(rel(f))) assert.deepEqual(keys(f), [], `${rel(f)} touches a store`);
 });
 
 test('the page has no inline script, style or handler, and no file names an outside address', () => {

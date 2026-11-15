@@ -291,7 +291,7 @@ test('S15: the account page has the sections; the password form checks what it c
   const routes = {};
   const ui = await boot({ hash: '#/account', routes });
   assert.equal(ui.q('h1').textContent, 'Your account');
-  assert.deepEqual(ui.qa('h2').map((h) => h.textContent), ['Change password', 'Two-step verification', 'API tokens', 'Language', 'Session']);
+  assert.deepEqual(ui.qa('h2').map((h) => h.textContent), ['Change password', 'Two-step verification', 'API tokens', 'Language', 'Appearance', 'Session']);
   const form = ui.qa('form')[0];
   const [cur, nw, again] = ['current', 'new', 'again'].map((n) => ui.input(n));
   assert.equal(nw.getAttribute('autocomplete'), 'new-password');
@@ -551,6 +551,38 @@ test('S15: the language is chosen here, kept, and the whole page follows at once
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------------- S16, the start page, the frame
+test('S15b: the colour scheme is chosen here, kept in this browser only, applied at once as data-theme; "automatic" leaves it to the system', async () => {
+  const storage = new FakeStorage({ 'karidns-theme': 'dark' });
+  const ui = await boot({ hash: '#/account', storage });
+  const html = ui.env.document.documentElement;
+  assert.equal(html.getAttribute('data-theme'), 'dark', 'the saved choice is applied when the page starts');
+  const sel = findAll(ui.root, (e) => e.tagName === 'SELECT' && e.getAttribute('name') === 'theme')[0];
+  assert.deepEqual(sel.children.map((o) => o.textContent), [en['account.theme-auto'], en['account.theme-light'], en['account.theme-dark']]);
+  assert.equal(sel.value, 'dark');
+  assert.ok(ui.text().includes(en['account.theme-hint']));
+  const choose = async (v) => { sel.value = v; sel.dispatchEvent(new FakeEvent('change')); await flush(); };
+  await choose('light');
+  assert.equal(html.getAttribute('data-theme'), 'light');
+  assert.equal(storage.getItem('karidns-theme'), 'light');
+  await choose('auto');
+  assert.equal(html.hasAttribute('data-theme'), false, 'automatic: no attribute, the system decides');
+  assert.equal(storage.getItem('karidns-theme'), null, 'automatic is not kept: it is the default');
+  // a value that is not a scheme is ignored; the API call with no request to the service
+  ui.app.ctx.theme.set('purple');
+  assert.equal(ui.app.ctx.theme.value, 'auto');
+  assert.equal(ui.calls.filter((c) => /theme/.test(c.url)).length, 0, 'the choice is never sent to the service');
+
+  // a stored value that is not a scheme, and a store that refuses: the system's scheme, and the choice still works for the page
+  const odd = await boot({ hash: '#/account', storage: new FakeStorage({ 'karidns-theme': 'purple' }) });
+  assert.equal(odd.env.document.documentElement.hasAttribute('data-theme'), false);
+  const refusing = { getItem() { throw new Error('denied'); }, setItem() { throw new Error('denied'); }, removeItem() { throw new Error('denied'); } };
+  const r = await boot({ storage: refusing });
+  r.app.ctx.theme.set('dark');
+  assert.equal(r.env.document.documentElement.getAttribute('data-theme'), 'dark');
+  r.app.ctx.theme.set('auto');
+  assert.equal(r.app.ctx.theme.value, 'auto');
+});
+
 test('S16: the versions of the GUI, the service and its tools; a service of another version asks for a reload', async () => {
   const ui = await boot({ hash: '#/about' });
   const dl = ui.q('dl');

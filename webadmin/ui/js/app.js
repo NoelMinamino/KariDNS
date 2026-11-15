@@ -1,7 +1,8 @@
 // app.js: the page.  createApp(env) wires the parts together (env is the browser: window, document, fetch, storage, BroadcastChannel, timers, clipboard; the tests give
 // a fake one); the last lines start it when there is a real window.  Planning 4: hash routes, one API client, one session, the views of the screens.
 
-import { h, link, fill, setDocument, setTitle, setLang, openDialog } from './dom.js';
+import { h, link, fill, setDocument, setTitle, setLang, setTheme, openDialog } from './dom.js';
+import { createTheme } from './theme.js';
 import { createApi } from './api.js';
 import { createSession } from './session.js';
 import { createRouter } from './router.js';
@@ -72,6 +73,7 @@ export function createApp(env) {
   const { window: win, document: doc, timers, now } = env;
   setDocument(doc);
   const i18n = createI18n({ catalogs: { en, ja }, storage: env.storage, languages: env.languages ?? [] });
+  const theme = createTheme({ storage: env.storage, apply: setTheme });
   const t = i18n.t;
   let session = null;
   const api = createApi({ fetch: env.fetch, now, onActivity: (ms) => session.touch(ms), onUnauthenticated: () => session.reauth() });
@@ -91,7 +93,7 @@ export function createApp(env) {
   const drafts = createDrafts();                  // the change sets being put together (F-13: memory only)
   session.guards.add(() => drafts.dirty());       // a page that is left with a draft asks first
   const ctx = {
-    api, session, i18n, now, timers, drafts,
+    api, session, i18n, theme, now, timers, drafts,
     flash: null,                                  // a text the next screen shows once
     router: null,
     announce(msg, level = 'polite') {
@@ -317,7 +319,7 @@ export function createApp(env) {
 // the page: start when there is one (the tests import this module without)
 if (typeof window !== 'undefined' && window.document?.getElementById('app')) {
   let storage = null;
-  try { storage = window.localStorage; } catch { /* storage is refused: the language choice lasts for the page only */ }
+  try { storage = window.localStorage; } catch { /* storage is refused: the language and colour choices last for the page only */ }
   createApp({
     window, document: window.document, fetch: window.fetch.bind(window), storage, BroadcastChannel: window.BroadcastChannel,
     timers: { setTimeout: window.setTimeout.bind(window), clearTimeout: window.clearTimeout.bind(window), setInterval: window.setInterval.bind(window), clearInterval: window.clearInterval.bind(window) },

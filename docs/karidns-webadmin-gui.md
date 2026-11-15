@@ -9,6 +9,7 @@
 The web interface is a page in your browser that talks to the API of [`karidns-webadmin`](karidns-webadmin.md). It shows what the API answers and sends what you ask for; it keeps no data of its own. Open the address your administrator gave you (for example `https://dns-admin.example.test/`).
 
 - **Languages.** English and Japanese. The page follows the language of your browser; change it under *Your account*, *Language*. Names, record data and codes are never translated.
+- **Colours.** A light and a dark scheme. The page follows the scheme of your system; under *Your account*, *Appearance* you can choose light or dark instead. The choice is kept in this browser only (like the language), not by the service.
 - **Browsers.** Firefox ESR, Chrome and Edge (the current and the previous version), Safari 17 or newer. Nothing needs to be installed. The page needs JavaScript and shows nothing without it.
 - **The menu** (top of every page): Home, Zones, Templates, Servers, Administration (global masters only), Audit log (global and domain masters), Account, About. *Skip to the content* is the first thing the Tab key reaches.
 - **What you see depends on your role.** Hiding a button is only a hint; the service decides every time, and a refusal is shown in words (see MESSAGES AND WHAT TO DO).
@@ -18,7 +19,7 @@ The web interface is a page in your browser that talks to the API of [`karidns-w
 | **Global master** | everything: all zones, new zones and deleting zones, zone settings and metadata, templates (write), users, groups, record policies and grants, the whole audit log, reset of another user's two-step verification, the update of a whole dataset |
 | **Domain master** (one or more zones) | the records of its zones within its record policy, preview and commit, import and export, versions and rollback, applying a template, the update button, DNSSEC (view and key requests), the grants on its zones, the audit log of its zones |
 | **Subdomain master** (a suffix of a zone) | the names under its suffix (and the apex SOA and NS, read only), editing within its policy, the versions (its part of each change), the update button; no import, export, DNSSEC, audit log or grants |
-| **Everyone** | your account: password, two-step verification, API tokens, language, signing out |
+| **Everyone** | your account: password, two-step verification, API tokens, language, colour scheme, signing out |
 
 A person can hold several grants (on several zones, or through groups). The zone list shows the role on each zone; the start page lists every grant with its record policy.
 
@@ -146,7 +147,7 @@ On the grants page of a zone, a domain master finds the user or group to give a 
 - **Two-step verification**: turn it on (the QR code page) or off (password and a code). Where the configuration requires it, it cannot be switched off. An account with no password gives the code alone.
 - **Identity provider**: the identity your user is linked to, read only (a global master links and unlinks).
 - **API tokens**: a program can use the API as you without a password. *Make a token* (a name; valid for 1 to 365 days; *Read only* for tokens that must not change anything). The token is shown **once**, with a *Copy* button and a warning; it leaves the page when you press *I have saved it*. A token can be revoked after a question.
-- **Language** (applied at once) and **Session** (when it ends at the latest, the idle time; *Log out*, *Log out everywhere*).
+- **Language** (applied at once), **Appearance** (the colour scheme: as the system, light or dark; applied at once, kept in this browser) and **Session** (when it ends at the latest, the idle time; *Log out*, *Log out everywhere*).
 - **Sign out after inactivity** (in *Session*): how long your sessions may go without a request before they end. Choose 5, 10, 15, 30 or 60 minutes (only the times not longer than what the service allows are offered) or *The service default*, then *Save*; it applies to all your sessions, at once, and the service enforces it. The administrator's setting stays the longest: if it is lowered later, the shorter of the two applies. Where the service already signs out after less than five minutes there is nothing to choose, and the page says so.
 
 ## ABOUT

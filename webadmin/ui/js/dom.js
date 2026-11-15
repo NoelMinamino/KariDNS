@@ -116,6 +116,8 @@ export const clear = (node) => { node.replaceChildren(); };
 
 export const setTitle = (s) => { doc.title = s; };
 export const setLang = (lang) => { doc.documentElement.lang = lang; };
+// the colour scheme: no attribute = the system's (app.css)
+export const setTheme = (theme) => { if (theme === 'auto') doc.documentElement.removeAttribute('data-theme'); else doc.documentElement.setAttribute('data-theme', theme); };
 
 // a modal dialog (focus is trapped and returned by the browser, 7.1); removed from the page when it is closed
 export function openDialog(dialog, parent = doc.body) {
