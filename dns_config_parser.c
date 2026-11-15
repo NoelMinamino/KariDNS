@@ -6642,6 +6642,13 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
     db->store_threads = (uint32_t)u;
     return 0;
   }
+  if (strcmp(key, "store-segment-size") == 0)         /* 0.7 S6: the size of a segment file of the store (K, M, G); the cleaner removes whole segments */
+    return db_take_uint(ctx, key, true, KARIDNS_DB_STORE_SEGMENT_MIN, KARIDNS_DB_STORE_SEGMENT_MAX, &db->store_segment_size);
+  if (strcmp(key, "store-scrub-interval") == 0) {      /* 0.7 S6: seconds between two scrubs of the store (every record is read and checked, slowly); `off` = never */
+    if (db_take_uint_word(ctx, key, false, KARIDNS_DB_STORE_SCRUB_MIN, KARIDNS_DB_STORE_SCRUB_MAX, "off", UINT32_MAX, &u) != 0) return -1;
+    db->store_scrub_interval = (uint32_t)u;
+    return 0;
+  }
   if (strcmp(key, "warm-before-serve") == 0) {        /* seconds to hold back the queries until the zones of the hot list are read (0 = do not wait) */
     if (db_take_uint(ctx, key, false, 0, KARIDNS_DB_WARM_WAIT_MAX, &u) != 0) return -1;
     db->warm_before_serve = (uint32_t)u;

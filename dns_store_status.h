@@ -97,6 +97,16 @@ typedef struct store_recon {
 /* fills *out and returns true, or returns false when the server has none (no loader) */
 void store_status_set_recon_fn(bool (*fn)(store_recon_t *out));
 
+/* 0.7 S5 / S6: figures of the server's own tables that this module cannot see (the attach table, the pool of zone entries, the folded counters, the texts in memory); filled by the server */
+typedef struct store_extra {
+  uint64_t attach_slots, attach_grows, attach_shrinks;
+  uint64_t pool_used, pool_slabs, pool_slab_bytes, pool_slot_bytes, pool_free_slots;
+  uint64_t folded, fold_rows, fold_replaced;
+  uint64_t err_texts, err_noted, err_dropped;
+  uint64_t sampled_detaches;
+} store_extra_t;
+void store_status_set_extra_fn(bool (*fn)(store_extra_t *out));
+
 /* ---- what the server tells this module ---- */
 /* the open store (NULL: "store not configured", state=none) */
 void store_status_bind(store_t *s);
@@ -116,5 +126,8 @@ size_t store_status_format(char *out, size_t cap, int fmt, const char *zone);
  * splits a line (`store -j zone example.com view`: arg "-j", rest "zone example.com view"); either may be NULL.  A bad argument gives
  * an "ERROR ..." line. */
 size_t store_status_control(const char *arg, const char *rest, char *out, size_t cap);
+/* The control command `storeop` (karictl store compact | checkpoint | scrub start | scrub stop): what changes the store, so it is not a read command (a full control key only).  arg and
+ * rest as above.  "OK ..." or "ERROR ...". */
+size_t store_status_op(const char *arg, const char *rest, char *out, size_t cap);
 
 #endif /* DNS_STORE_STATUS_H */

@@ -669,7 +669,7 @@ int main(void) {
             snprintf(nm, sizeof(nm), "z%04d.test.", i);
             zone_db_entry_t *en = dbreg_lookup_entry("default", nm);
             CHECK(en != NULL);
-            if (en) atomic_store(&en->observatory.queries_total, i < 10 ? 100000 : 40);
+            if (en) atomic_store(&en->ctr[ZCTR_QUERIES], (uint32_t)(i < 10 ? 100000 : 40));
         }
         /* the limit: 60% of what is in memory.  The manager takes zones out until it is at 90% of the limit */
         static server_config_t cfgL;
@@ -1565,7 +1565,7 @@ int main(void) {
         pthread_join(th, NULL);
         CHECK(wake_next(&k, 5000) && !k.failed);
         CHECK(A.res != NULL && (elem_flags("r.test.") & ZDIR_F_XFRLOAD));
-        atomic_store(&A.res->observatory.queries_total, 7);
+        atomic_store(&A.res->ctr[ZCTR_QUERIES], (uint32_t)(7));
         for (int i = 0; i < 100 && (elem_flags("r.test.") & (ZDIR_F_XFRLOAD | ZDIR_F_EVICT_NEXT)); i++) usleep(30000);
         CHECK((elem_flags("r.test.") & (ZDIR_F_XFRLOAD | ZDIR_F_EVICT_NEXT)) == 0);
         xfr_entry_release(A.res);
@@ -1626,7 +1626,7 @@ int main(void) {
             CHECK(wake_next(&k, 5000) && !k.failed);
             zone_db_entry_t *qe = zdir_entry(xe);
             CHECK(qe != NULL);
-            if (qe) atomic_store(&qe->observatory.queries_total, 3);                      /* (the query that woke it was answered) */
+            if (qe) atomic_store(&qe->ctr[ZCTR_QUERIES], (uint32_t)(3));                      /* (the query that woke it was answered) */
             dbreg_cache_stats(&cs1);
             uint64_t mk0 = cs1.xfr_marked;
             zone_db_entry_t *ae = dbreg_xfr_acquire(xe);                                   /* (the transfer finds the zone in memory) */

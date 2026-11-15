@@ -1635,40 +1635,42 @@ void *query_logger_thread_func(void *arg) {
 void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, zone_observatory_snapshot_t *out) {
     if (!e || !out) return;
     strlcpy(out->domain, e->domain, sizeof(out->domain));
-    strlcpy(out->view_name, e->view_name, sizeof(out->view_name));
+    strlcpy(out->view_name, zone_vname(e), sizeof(out->view_name));
     out->is_secondary = e->is_secondary;
     out->soa_serial = (uint32_t)atomic_load_explicit(&e->serial, memory_order_relaxed);
 
     const zone_config_t *zc = zone_entry_config(cfg, e);
     const notify_target_t *an = NULL;
-    out->slaves_configured = also_notify_effective(cfg, zc, e->view_name, &an); /* the zone's, the view's or options' list */
+    out->slaves_configured = also_notify_effective(cfg, zc, zone_vname(e), &an); /* the zone's, the view's or options' list */
 
-    out->last_notify_time = atomic_load_explicit(&e->observatory.last_notify_time, memory_order_relaxed);
-    out->last_transfer_time = atomic_load_explicit(&e->observatory.last_transfer_time, memory_order_relaxed);
+    zone_obs_view_t ob;
+    zone_obs_read(e, &ob);
+    out->last_notify_time = ob.last_notify_time;
+    out->last_transfer_time = ob.last_transfer_time;
     if (out->last_transfer_time == 0) {
         out->last_transfer_time = atomic_load_explicit(&e->last_successful_transfer, memory_order_relaxed);
     }
 
-    out->queries_total = atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed);
-    out->tcp_queries = atomic_load_explicit(&e->observatory.tcp_queries, memory_order_relaxed);
-    out->responses_noerror = atomic_load_explicit(&e->observatory.responses_noerror, memory_order_relaxed);
-    out->responses_nxdomain = atomic_load_explicit(&e->observatory.responses_nxdomain, memory_order_relaxed);
-    out->responses_nodata = atomic_load_explicit(&e->observatory.responses_nodata, memory_order_relaxed);
-    out->responses_servfail = atomic_load_explicit(&e->observatory.responses_servfail, memory_order_relaxed);
-    out->responses_refused = atomic_load_explicit(&e->observatory.responses_refused, memory_order_relaxed);
-    out->edns_queries = atomic_load_explicit(&e->observatory.edns_queries, memory_order_relaxed);
-    out->dnssec_do_queries = atomic_load_explicit(&e->observatory.dnssec_do_queries, memory_order_relaxed);
-    out->ecs_queries = atomic_load_explicit(&e->observatory.ecs_queries, memory_order_relaxed);
-    out->rrl_dropped = atomic_load_explicit(&e->observatory.rrl_dropped, memory_order_relaxed);
-    out->rrl_slipped = atomic_load_explicit(&e->observatory.rrl_slipped, memory_order_relaxed);
-    out->notify_sent = atomic_load_explicit(&e->observatory.notify_sent, memory_order_relaxed);
-    out->notify_ack = atomic_load_explicit(&e->observatory.notify_ack, memory_order_relaxed);
-    out->axfr_success = atomic_load_explicit(&e->observatory.axfr_success, memory_order_relaxed);
-    out->ixfr_success = atomic_load_explicit(&e->observatory.ixfr_success, memory_order_relaxed);
-    out->xfer_failed = atomic_load_explicit(&e->observatory.xfer_failed, memory_order_relaxed);
+    out->queries_total = ob.queries_total;
+    out->tcp_queries = ob.tcp_queries;
+    out->responses_noerror = ob.responses_noerror;
+    out->responses_nxdomain = ob.responses_nxdomain;
+    out->responses_nodata = ob.responses_nodata;
+    out->responses_servfail = ob.responses_servfail;
+    out->responses_refused = ob.responses_refused;
+    out->edns_queries = ob.edns_queries;
+    out->dnssec_do_queries = ob.dnssec_do_queries;
+    out->ecs_queries = ob.ecs_queries;
+    out->rrl_dropped = ob.rrl_dropped;
+    out->rrl_slipped = ob.rrl_slipped;
+    out->notify_sent = ob.notify_sent;
+    out->notify_ack = ob.notify_ack;
+    out->axfr_success = ob.axfr_success;
+    out->ixfr_success = ob.ixfr_success;
+    out->xfer_failed = ob.xfer_failed;
 
-    out->wirecache_hits = atomic_load_explicit(&e->observatory.wirecache_hits, memory_order_relaxed);
-    out->wirecache_misses = atomic_load_explicit(&e->observatory.wirecache_misses, memory_order_relaxed);
+    out->wirecache_hits = ob.wirecache_hits;
+    out->wirecache_misses = ob.wirecache_misses;
 
     /* 応答キャッシュは全ゾーン共有 (response_cache_init) なので、ゾーンごとの件数は持たない */
     zone_version_t *active_arena = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
@@ -1676,7 +1678,7 @@ void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, z
     out->wirecache_entries = 0;
     out->wirecache_bytes = 0;
     out->shared_views[0] = '\0';
-    if (cfg && cfg->any_in_view) (void)config_in_view_sharers(cfg, e->view_name, e->domain, out->shared_views, sizeof(out->shared_views));
+    if (cfg && cfg->any_in_view) (void)config_in_view_sharers(cfg, zone_vname(e), e->domain, out->shared_views, sizeof(out->shared_views));
 }
 
 // ============================================================================
@@ -2172,14 +2174,14 @@ STATIC_TEST void xfr_build_primaries(server_config_t *active, zone_db_snapshot_t
   const zone_config_t *mcfg = zcfg;
   if (entry->is_catalog_member) {
     mcfg = NULL;
-    if (entry->owning_catalog_domain && snap) {
-      view_snapshot_t *vs = snapshot_find_view(snap, entry->view_name);
-      zone_db_entry_t *cat = vs ? find_zone_in_view(vs, entry->owning_catalog_domain) : NULL;
+    if (zone_xr(entry)->owning_catalog_domain && snap) {
+      view_snapshot_t *vs = snapshot_find_view(snap, zone_vname(entry));
+      zone_db_entry_t *cat = vs ? find_zone_in_view(vs, zone_xr(entry)->owning_catalog_domain) : NULL;
       const zone_config_t *cc = cat ? zone_entry_config(active, cat) : NULL;
       if (cc && zext(cc)->masters_count > 0) mcfg = cc;
     }
   }
-  xfr_opts_effective(active, mcfg, entry->view_name, &ctx->eff);
+  xfr_opts_effective(active, mcfg, zone_vname(entry), &ctx->eff);
   ctx->has_eff = true;
   ctx->per_ns_limit = xfr_cfg_limit(active, XL_TRANSFERS_PER_NS);
   int n = 0;
@@ -2190,16 +2192,17 @@ STATIC_TEST void xfr_build_primaries(server_config_t *active, zone_db_snapshot_t
       xfr_primary_t *p = &ctx->prim[n++];
       strlcpy(p->ip, x->masters[i].ip, sizeof(p->ip));
       p->port = config_target_port(active, x->masters[i].port);   /* a database zone leaves 0 for an element without a port: options { port } */
-      xfr_primary_setup(active, mcfg, entry->view_name, x->masters[i].key, x->tsig_key, &x->masters[i], p, ctx);
+      xfr_primary_setup(active, mcfg, zone_vname(entry), x->masters[i].key, x->tsig_key, &x->masters[i], p, ctx);
     }
     if (x->masters_count > XFR_PRIMARIES_MAX)
       syslog(LOG_WARNING, "[AXFR] zone %s: %d primaries are listed; only the first %d are used", ctx->domain, x->masters_count, XFR_PRIMARIES_MAX);
-  } else if (entry->catalog_master && entry->catalog_master->ip[0]) {
+  } else if (zone_xr(entry)->catalog_master && zone_xr(entry)->catalog_master->ip[0]) {
+    const catalog_master_t *cm = zone_xr(entry)->catalog_master;
     xfr_primary_t *p = &ctx->prim[n++];
-    strlcpy(p->ip, entry->catalog_master->ip, sizeof(p->ip));
-    p->port = config_target_port(active, entry->catalog_master->port);
+    strlcpy(p->ip, cm->ip, sizeof(p->ip));
+    p->port = config_target_port(active, cm->port);
     /* the same ranking as for a listed primary (peer_key_name()): the key of the primaries element, the key of the server statement, the catalog zone's tsig-key */
-    xfr_primary_setup(active, NULL, entry->view_name, entry->catalog_master->key, entry->catalog_master->zone_key, NULL, p, ctx);
+    xfr_primary_setup(active, NULL, zone_vname(entry), cm->key, cm->zone_key, NULL, p, ctx);
   }
   ctx->nprim = n;
 }
@@ -2600,9 +2603,9 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
                   zone_db_entry_t *rrl_z = route.entry; /* the zone the query was answered from (E2) */
                   if (rrl_z) {
                     if (tc_packet) {
-                      atomic_fetch_add_explicit(&rrl_z->observatory.rrl_slipped, 1, memory_order_relaxed);
+                      ZONE_OBS_ADD(rrl_z, rrl_slipped, 1);
                     } else {
-                      atomic_fetch_add_explicit(&rrl_z->observatory.rrl_dropped, 1, memory_order_relaxed);
+                      ZONE_OBS_ADD(rrl_z, rrl_dropped, 1);
                     }
                   }
                 }
@@ -3232,7 +3235,7 @@ process_tcp_client: ;
 #endif
             /* a DB zone has settings of its own (dbcfg), and a secondary may have settings received from its primary (B8t-2: rxcfg,
              * the zone's own statements first): the transfer checks below read them like a configured zone's */
-            if (xfr_entry && (!zcfg || xfr_entry->source == ZONE_SRC_DB || atomic_load_explicit(&xfr_entry->rxcfg, memory_order_acquire))) {
+            if (xfr_entry && (!zcfg || xfr_entry->source == ZONE_SRC_DB || atomic_load_explicit(&zone_xr(xfr_entry)->rxcfg, memory_order_acquire))) {
               const zone_config_t *ec = zone_entry_config(cfg, xfr_entry);
               if (ec) zcfg = ec;
             } else if (!xfr_entry && !zcfg && zref_present(&xfr_zr) && !xfr_zr.busy) {
@@ -3319,7 +3322,7 @@ process_tcp_client: ;
               uint32_t out_limit = xfr_cfg_limit(cfg, XL_TRANSFERS_OUT);
               xfr_eff_t out_eff;
               /* the settings of the view that owns the zone, not of the view the client came through (a zone shared with in-view is one object) */
-              xfr_opts_effective(cfg, zcfg, entry ? entry->view_name : (xfr_zr.hview ? xfr_zr.hview : xfr_view->name), &out_eff);
+              xfr_opts_effective(cfg, zcfg, entry ? zone_vname(entry) : (xfr_zr.hview ? xfr_zr.hview : xfr_view->name), &out_eff);
               const bool out_send_ede = cfg ? cfg->send_extended_errors : false;   /* (read before the release, like the other values) */
               release_config_snapshot(cfg);
               if (!xfr_counter_acquire(&g_xfr_out_active, out_limit)) {
@@ -3883,6 +3886,8 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
     if (str_differs(o->database.loader_state_file, n->database.loader_state_file)) append_list_item(buf, sz, "database loader-state-file");
     if (str_differs(o->database.store_dir, n->database.store_dir) || o->database.store_none != n->database.store_none) append_list_item(buf, sz, "database store");
     if (o->database.store_mode != n->database.store_mode) append_list_item(buf, sz, "database store-mode");
+    if (o->database.store_scrub_interval != n->database.store_scrub_interval) append_list_item(buf, sz, "database store-scrub-interval");
+    if (o->database.store_segment_size != n->database.store_segment_size) append_list_item(buf, sz, "database store-segment-size");
     if (o->database.store_threads != n->database.store_threads) append_list_item(buf, sz, "database store-threads");
   }
 }
@@ -4353,13 +4358,14 @@ static void control_zone_notify_queue(void) {
  * zone; a request inside it waits. */
 static void tick_manual_notify(zone_db_entry_t *entry, server_config_t *active, time_t now) {
   if (!atomic_exchange_explicit(&entry->notify_now, false, memory_order_acquire)) return;
-  if (now < entry->notify_next) {
+  if (now < zone_xr(entry)->notify_next) {
     atomic_store_explicit(&entry->notify_now, true, memory_order_release);
     atomic_fetch_add_explicit(&g_zone_notify_pending, 1, memory_order_release);
   } else {
     xfr_eff_t nd;
-    xfr_opts_effective(active, zone_entry_config(active, entry), entry->view_name, &nd);
-    entry->notify_next = now + (time_t)nd.notify_delay;
+    xfr_opts_effective(active, zone_entry_config(active, entry), zone_vname(entry), &nd);
+    zone_x_t *nx = zone_x_need(entry);
+    if (nx) nx->notify_next = now + (time_t)nd.notify_delay;
     syslog(LOG_INFO, "[Control] Executing manual NOTIFY for %s", entry->domain);
     send_notify_to_all(entry);
   }
@@ -4626,8 +4632,9 @@ static bool sighup_from_manager(long delivered) {
 
 /* the counters of one zone in memory added to the totals */
 static void stats_add_zone(karidns_stats_total_t *t, const zone_db_entry_t *e) {
-  const zone_observatory_t *o = &e->observatory;
-#define ST_ADD(f) t->f += atomic_load_explicit(&o->f, memory_order_relaxed)
+  zone_obs_view_t o;
+  zone_obs_read(e, &o);
+#define ST_ADD(f) t->f += o.f
   t->zones++;
   ST_ADD(queries_total); ST_ADD(tcp_queries);
   ST_ADD(responses_noerror); ST_ADD(responses_nodata); ST_ADD(responses_nxdomain); ST_ADD(responses_servfail); ST_ADD(responses_refused);
@@ -4658,6 +4665,13 @@ STATIC_TEST void stats_collect_totals(zone_db_snapshot_t *snap, karidns_stats_to
       }
     }
   }
+  if (dbdir()) {                                  /* 0.7 store S5: what the zones that left memory counted (design 6.1): the totals do not go back when a zone is taken out */
+    uint64_t f[ZCTR_N];
+    dbreg_fold_totals(f, NULL);
+    t->queries_total += f[ZCTR_QUERIES]; t->tcp_queries += f[ZCTR_TCP];
+    t->responses_noerror += f[ZCTR_NOERROR]; t->responses_nodata += f[ZCTR_NODATA]; t->responses_nxdomain += f[ZCTR_NXDOMAIN];
+    t->responses_servfail += f[ZCTR_SERVFAIL]; t->responses_refused += f[ZCTR_REFUSED]; t->dnssec_do_queries += f[ZCTR_DO];
+  }
   {
     uint64_t resp[KARIDNS_STATS_RCODES], tcp;
     server_responses_get(resp, t->unzoned_responses, &tcp);
@@ -4682,13 +4696,29 @@ static uint64_t obs_tab_id(const zdir_tab_t *t) {
 }
 
 /* does the zone match the glob of an obspage request (NULL: every zone)?  The name as stored and without the root label: `example.*` and `example.test.` both match example.test. */
-static bool obs_pattern_ok(const char *pattern, const zone_db_entry_t *e) {
+static bool obs_name_ok(const char *pattern, const char *domain) {
   if (!pattern) return true;
   char bare[256];
-  strlcpy(bare, e->domain, sizeof(bare));
+  strlcpy(bare, domain, sizeof(bare));
   size_t bl = strlen(bare);
   if (bl > 1 && bare[bl - 1] == '.') bare[bl - 1] = '\0';
-  return fnmatch(pattern, e->domain, FNM_CASEFOLD) == 0 || fnmatch(pattern, bare, FNM_CASEFOLD) == 0;
+  return fnmatch(pattern, domain, FNM_CASEFOLD) == 0 || fnmatch(pattern, bare, FNM_CASEFOLD) == 0;
+}
+static bool obs_pattern_ok(const char *pattern, const zone_db_entry_t *e) { return obs_name_ok(pattern, e->domain); }
+
+/* 0.7 store S5 (design 6.1): a row of the table of the zones that left memory (dbreg_fold_topk()) in the form karictl reads: the counters the zone had while it was in memory, summed over its stays */
+static void fill_fold_snapshot(const zone_fold_row_t *r, zone_observatory_snapshot_t *out) {
+  memset(out, 0, sizeof(*out));
+  strlcpy(out->domain, r->zone, sizeof(out->domain));
+  strlcpy(out->view_name, r->view, sizeof(out->view_name));
+  out->queries_total = r->c[ZCTR_QUERIES];
+  out->tcp_queries = r->c[ZCTR_TCP];
+  out->responses_noerror = r->c[ZCTR_NOERROR];
+  out->responses_nxdomain = r->c[ZCTR_NXDOMAIN];
+  out->responses_nodata = r->c[ZCTR_NODATA];
+  out->responses_servfail = r->c[ZCTR_SERVFAIL];
+  out->responses_refused = r->c[ZCTR_REFUSED];
+  out->dnssec_do_queries = r->c[ZCTR_DO];
 }
 
 STATIC_TEST int obspage_select(zone_db_snapshot_t *snap, const char *pattern, const char *cursor, size_t limit, const zone_db_entry_t ***out,
@@ -4701,6 +4731,7 @@ STATIC_TEST int obspage_select(zone_db_snapshot_t *snap, const char *pattern, co
     unsigned long long cv, cs, ct;
     char tail;
     if (sscanf(cursor, "%llu.%llu.%llx%c", &cv, &cs, &ct, &tail) != 3) return OBSPAGE_STALE;
+    if (snap && dbdir() && cv == snap->view_count + 1) return 0;     /* 0.7 store S5: the table of the zones that left memory comes after the zones in memory; this page has none of the latter (the caller continues with the table) */
     if (snap && dbdir() && cv == snap->view_count) {          /* 0.7 S3: the zones of the store that are in memory come after the views' directories: the cursor names the attach table */
       if (dbdir()->attach_tab_id() != (uint64_t)ct) return OBSPAGE_STALE;
       v = (size_t)cv;
@@ -4975,16 +5006,15 @@ STATIC_TEST void alerts_tick(time_t now) {
         az->st.have_prev = false;
         continue;
       }
-      const zone_observatory_t *o = &e->observatory;
+      zone_obs_view_t ov;
+      zone_obs_read(e, &ov);
       alert_counters_t zc;
       memset(&zc, 0, sizeof(zc));
-      zc.queries = atomic_load_explicit(&o->queries_total, memory_order_relaxed);
-      zc.servfail = atomic_load_explicit(&o->responses_servfail, memory_order_relaxed);
-      zc.responses = atomic_load_explicit(&o->responses_noerror, memory_order_relaxed) + atomic_load_explicit(&o->responses_nodata, memory_order_relaxed) +
-                     atomic_load_explicit(&o->responses_nxdomain, memory_order_relaxed) + zc.servfail +
-                     atomic_load_explicit(&o->responses_refused, memory_order_relaxed);
-      zc.rrl_dropped = atomic_load_explicit(&o->rrl_dropped, memory_order_relaxed);
-      zc.xfer_failed = atomic_load_explicit(&o->xfer_failed, memory_order_relaxed);
+      zc.queries = ov.queries_total;
+      zc.servfail = ov.responses_servfail;
+      zc.responses = ov.responses_noerror + ov.responses_nodata + ov.responses_nxdomain + zc.servfail + ov.responses_refused;
+      zc.rrl_dropped = ov.rrl_dropped;
+      zc.xfer_failed = ov.xfer_failed;
       alert_scope_zone(&lc, az->zone, az->view);
       active += (uint64_t)alert_check(&az->st, &az->lim, &zc, now, alert_log, &lc);
     }
@@ -5507,6 +5537,8 @@ void *control_thread_func(void *arg) {
                * first line and the zones sent after it must come from one pass.  The entries stay valid while the snapshot is held. */
               uint32_t match_count = 0;
               zone_db_entry_t **obs = NULL;
+              zone_fold_row_t *obs_fold = NULL;
+              size_t obs_fold_n = 0;
               bool obs_oom = false;
               if (snap) {
                 size_t cap = 0, n = 0;
@@ -5543,7 +5575,7 @@ void *control_thread_func(void *arg) {
                   size_t pos = 0;
                   for (zdir_elem_t *el; !obs_oom && (el = dbdir()->attach_next(&pos)) != NULL;) {
                     zone_db_entry_t *e = zdir_entry(el);
-                    if (!e || (view_arg && strcasecmp(e->view_name, view_arg) != 0)) continue;
+                    if (!e || (view_arg && strcasecmp(zone_vname(e), view_arg) != 0)) continue;
                     if (canon_arg && !domain_names_match_ci(e->domain, canon_arg)) continue;
                     if (n >= cap) {
                       size_t ncap = cap ? cap * 2 : 64;
@@ -5556,6 +5588,20 @@ void *control_thread_func(void *arg) {
                   }
                 }
                 match_count = (uint32_t)n;
+                zone_fold_row_t *frows = NULL;                 /* 0.7 store S5: the zones that left memory with the most queries, after the zones in memory (design 6.1) */
+                size_t fn = 0;
+                if (dbdir() && !obs_oom) {
+                  frows = malloc(ZFOLD_TOPK * sizeof(*frows));
+                  if (frows) {
+                    const size_t all = dbreg_fold_topk(frows, ZFOLD_TOPK);
+                    for (size_t i = 0; i < all; i++) {
+                      if ((view_arg && strcasecmp(frows[i].view, view_arg) != 0) || (canon_arg && !domain_names_match_ci(frows[i].zone, canon_arg))) continue;
+                      frows[fn++] = frows[i];
+                    }
+                  }
+                }
+                obs_fold = frows;
+                obs_fold_n = fn;
                 if (dbdir()) for (size_t k = 0; k < n; k++) xfr_entry_hold(obs[k]);      /* (with the store: every entry of the list is held until the reply is sent, an eviction or a delete cannot free it meanwhile; the entries of the directories have the snapshot's reference) */
                 rcu_aux_read_unlock();
               }
@@ -5564,7 +5610,7 @@ void *control_thread_func(void *arg) {
                 (void)ctl_send_all(cfd, "ERROR out of memory\n", 20);
               } else {
                 char resp_hdr[64];
-                int hlen = snprintf(resp_hdr, sizeof(resp_hdr), "OK %u\n", match_count);
+                int hlen = snprintf(resp_hdr, sizeof(resp_hdr), "OK %zu\n", (size_t)match_count + obs_fold_n);
                 const int64_t obs_deadline = park_now_ms() + CTL_REPLY_MS;   // (one deadline for the header and every item)
                 bool obs_ok = ctl_send_until(cfd, resp_hdr, (size_t)hlen, obs_deadline);
 
@@ -5577,9 +5623,15 @@ void *control_thread_func(void *arg) {
                   rcu_aux_read_unlock();
                   obs_ok = ctl_send_until(cfd, &snap_item, sizeof(snap_item), obs_deadline);   // (a client that does not read: the reply is cut here and the connection closed below)
                 }
+                for (size_t k = 0; obs_ok && k < obs_fold_n; k++) {
+                  zone_observatory_snapshot_t snap_item;
+                  fill_fold_snapshot(&obs_fold[k], &snap_item);
+                  obs_ok = ctl_send_until(cfd, &snap_item, sizeof(snap_item), obs_deadline);
+                }
               }
               if (dbdir()) for (uint32_t k = 0; k < match_count; k++) xfr_entry_release(obs[k]);
               free(obs);
+              free(obs_fold);
               if (active_cfg) release_config_snapshot(active_cfg);
               if (snap) release_zone_snapshot(snap);
             } else if (strcmp(cmd, "stats") == 0) {
@@ -5639,7 +5691,30 @@ void *control_thread_func(void *arg) {
                   (void)ctl_send_all(cfd, stale, sizeof(stale) - 1);
                 } else {
                   char resp_hdr[96];
-                  int hlen = snprintf(resp_hdr, sizeof(resp_hdr), "OK %zu %s\n", pn, next[0] ? next : "-");
+                  /* 0.7 store S5 (design 6.1): after the zones in memory, the zones that left it and had the most queries (the table of dbreg_fold_topk()), as rows of the same kind */
+                  zone_fold_row_t *frows = NULL;
+                  size_t fn = 0;
+                  if (dbdir() && snap && pn < lim && next[0] == '\0') {
+                    unsigned long long fcv = 0, fcs = 0, fct = 0;
+                    char ftail;
+                    size_t from = 0;
+                    if (cursor && sscanf(cursor, "%llu.%llu.%llx%c", &fcv, &fcs, &fct, &ftail) == 3 && fcv == snap->view_count + 1) from = (size_t)fcs;
+                    frows = malloc(ZFOLD_TOPK * sizeof(*frows));
+                    if (frows) {
+                      const size_t all = dbreg_fold_topk(frows, ZFOLD_TOPK);
+                      size_t seen = 0, take = 0;
+                      bool more = false;
+                      for (size_t i = 0; i < all; i++) {
+                        if (!obs_name_ok(pat, frows[i].zone)) continue;
+                        if (seen++ < from) continue;
+                        if (take < lim - pn) frows[take++] = frows[i];
+                        else more = true;
+                      }
+                      fn = take;
+                      if (more) snprintf(next, sizeof(next), "%zu.%zu.%x", snap->view_count + 1, from + take, 0u);
+                    }
+                  }
+                  int hlen = snprintf(resp_hdr, sizeof(resp_hdr), "OK %zu %s\n", pn + fn, next[0] ? next : "-");
                   const int64_t pdeadline = park_now_ms() + CTL_REPLY_MS;
                   bool pok = ctl_send_until(cfd, resp_hdr, (size_t)hlen, pdeadline);
                   for (size_t k = 0; pok && k < pn; k++) {
@@ -5650,6 +5725,12 @@ void *control_thread_func(void *arg) {
                     rcu_aux_read_unlock();
                     pok = ctl_send_until(cfd, &snap_item, sizeof(snap_item), pdeadline);
                   }
+                  for (size_t k = 0; pok && k < fn; k++) {
+                    zone_observatory_snapshot_t snap_item;
+                    fill_fold_snapshot(&frows[k], &snap_item);
+                    pok = ctl_send_until(cfd, &snap_item, sizeof(snap_item), pdeadline);
+                  }
+                  free(frows);
                   if (dbdir()) for (size_t k = 0; k < pn; k++) xfr_entry_release((zone_db_entry_t *)page[k]);
                 }
                 free(page);
@@ -5785,6 +5866,11 @@ void *control_thread_func(void *arg) {
               store_status_set_memory_fn(ctrl_store_memory);
               size_t stlen = store_status_control(arg, view_arg, stbuf, sizeof(stbuf));
               (void)ctl_send_all(cfd, stbuf, stlen);
+            } else if (strcmp(cmd, "storeop") == 0) {
+              /* 0.7 S6: karictl store compact | checkpoint | scrub start | scrub stop: they change the store, so a read-only key does not have them (control_command_perm(): not a read command) */
+              char sobuf[512];
+              size_t solen = store_status_op(arg, view_arg, sobuf, sizeof(sobuf));
+              (void)ctl_send_all(cfd, sobuf, solen);
             } else {
               syslog(LOG_ERR, "[Control] Received unknown command: %s", cmd);
               (void)ctl_send_all(cfd, "ERROR unknown command\n", 22);
@@ -5911,7 +5997,7 @@ void *control_thread_func(void *arg) {
 
                     if (entry->is_catalog_member) {
                         is_slave = true;
-                        have_primary = entry->catalog_master != NULL && entry->catalog_master->ip[0] != '\0';
+                        have_primary = zone_xr(entry)->catalog_master != NULL && zone_xr(entry)->catalog_master->ip[0] != '\0';
                     } else {
                         const zone_config_t *zcfg = zone_entry_config(active, entry);
                         slave_zcfg = zcfg;
@@ -5925,14 +6011,15 @@ void *control_thread_func(void *arg) {
                     if (is_slave && have_primary) {
                         time_t deadline = zone_expire_deadline(entry);
                         if (deadline > 0 && now > deadline) {
-                            time_t last_log = atomic_load_explicit(&entry->last_stale_log_time, memory_order_acquire);
+                            zone_x_t *sx = zone_x_need(entry);
+                            time_t last_log = sx ? atomic_load_explicit(&sx->last_stale_log_time, memory_order_acquire) : 0;
                             if (now - last_log > 900) {
                                 if (active && active->serve_stale) {
                                     kdns_logc(LOGC_GENERAL, LOG_WARNING, "[Zone] Zone %s is expired (master unreachable), serving stale data", entry->domain);
                                 } else {
                                     kdns_logc(LOGC_GENERAL, LOG_ERR, "[Zone] Zone %s is expired (master unreachable), returning SERVFAIL", entry->domain);
                                 }
-                                atomic_store_explicit(&entry->last_stale_log_time, now, memory_order_release);
+                                if (sx) atomic_store_explicit(&sx->last_stale_log_time, now, memory_order_release);
                             }
                         }
 

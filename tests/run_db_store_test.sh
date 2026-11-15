@@ -14,6 +14,12 @@
 #     right; the other zones still attach
 #   - a zone that the database changes (new serial) is not answered from the old record: the new data is seen at once and still after the zone was taken out of memory again
 #   - karicheck: a store directory whose parent does not exist is an error; `store none;` and `store-mode copy;` are accepted, `store-mode bogus;` is an error
+#   - 0.7 S6, the cleaner: the zones of the database are changed again and again (segments of 1 MiB): the segments that are dead are cleaned and removed (`karictl store compact`),
+#     the dead share falls, the answers are those of the reference server before and after, and after kill -9 and a restart
+#   - 0.7 S6, disk full (needs ZFS and the variable STORE_ZFS_PARENT, a dataset to make children of, e.g. STORE_ZFS_PARENT=bench/store/st9; SKIP without): a dataset with a quota
+#     of 100 MB (segments of 64 MB, so the reserve is 32 MB: ZFS makes every writer wait for a transaction group when a quota has less than about a fifth left, because it counts the
+#     mapped tables worst case; the store stops writing images before that): updates are made room for by the cleaner; more zones than fit make the store degraded (ERROR in the log, `store.state=degraded`, every zone is still answered
+#     right: from the database); when the zones are gone and the cleaner has won the room back the state is ok again.  The record size warning of a dataset with the default 128K.
 # The whole test runs once in TMPDIR (UFS: map mode, ZFS: copy mode: the mode is printed; STORE_MODE=copy|map forces one).  Needs root (the loader runs as nobody).  SKIP without the binaries, sqlite3 or perl.
 . "$(dirname "$0")/lib_proc.sh"
 set -u
@@ -42,11 +48,13 @@ stop_one() {
     i=0; while [ -n "$p" ] && [ $i -lt 200 ] && kill -0 "$p" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     [ -n "$p" ] && kill -KILL "$p" 2>/dev/null
 }
+ZFS_DS=""
 cleanup() {
     set +e
     [ -n "$SRV" ] && kari_kill_tree "$SRV"
     [ -n "$REF" ] && kari_kill_tree "$REF"
     kari_kill_conf "$T/a.conf" "$T/b.conf"
+    for ds in $ZFS_DS; do zfs destroy -f "$ds" > /dev/null 2>&1; done
     if [ -n "${KEEP:-}" ]; then echo "(kept $T)"; else rm -rf "$T"; fi
 }
 trap cleanup EXIT INT TERM
@@ -179,6 +187,7 @@ stored_all() { [ "$(sf store.zones.stored)" -ge "$NZ" ] 2>/dev/null; }
 waitfor 60 stored_all && pass "the store holds all $NZ zones (written when they were installed)" || fail "the store holds $(sf store.zones.stored) of $NZ zones"
 [ "$(sf store.zones.attached)" -lt "$NZ" ] 2>/dev/null && pass "not every zone is in memory (memory-limit 1m): $(sf store.zones.attached) of $NZ attached" || fail "all zones are in memory: $(sf store.zones.attached)"
 pass_all 1 "$NZ" 1
+P1=$PASS_N
 [ "$PASS_BAD" = 0 ] && pass "all $PASS_N queries of the first pass were answered right" || fail "$PASS_BAD of $PASS_N queries of the first pass were wrong"
 F1=$(fetches)
 [ "${F1:-0}" = "$NZ" ] && pass "every zone was read from the loader once, by the background fetch of the store protocol, and the queries of the first pass read none (fetch issued=$F1)" || fail "fetch issued=$F1 in the first pass, want $NZ (one body per zone): $($KA dbstatus | grep -E '^(fetch|cache):')"
@@ -187,12 +196,22 @@ F1=$(fetches)
 echo "== the second pass: zones that are out of memory are attached from the store"
 A0=$(sf store.attach.count); A0=${A0:-0}
 pass_all "$NZ" 1 -1
+P2=$PASS_N
 [ "$PASS_BAD" = 0 ] && pass "all $PASS_N queries of the second pass were answered right" || fail "$PASS_BAD of $PASS_N queries of the second pass were wrong"
 F2=$(fetches)
 A1=$(sf store.attach.count); A1=${A1:-0}
 [ "$F2" = "$F1" ] && pass "no zone was read from the loader in the second pass (fetch issued stays $F2)" || fail "fetch issued went from $F1 to $F2: $($KA dbstatus | grep -E '^(fetch|cache):')"
 [ "$A1" -gt "$A0" ] && pass "zones were attached from the store ($((A1 - A0)) attaches, cold attach $(sf store.cold.attach), p50 $(sf store.attach.p50_us) us, p99 $(sf store.attach.p99_us) us)" || fail "no attach in the second pass: $($KA store | head -30)"
 [ "$(sf store.detach.count)" -gt 0 ] 2>/dev/null && pass "zones were taken out of memory ($(sf store.detach.count) detaches)" || fail "no detach: $($KA dbstatus | grep '^cache:')"
+# 0.7 store S5 (design 6.1): the counters of a zone that leaves memory are folded into the totals, so the totals of `karictl stats` do not go back with the detaches (the alerts look at their change), and the
+# busiest zones that are not in memory are listed after the zones that are (a table of 128 rows in the heap)
+ST_ALL=$($KA stats 2>/dev/null)
+ST_Q=$(printf '%s\n' "$ST_ALL" | sed -n 's/^karidns_queries_total{proto="udp"} \([0-9]*\)$/\1/p'); ST_T=$(printf '%s\n' "$ST_ALL" | sed -n 's/^karidns_queries_total{proto="tcp"} \([0-9]*\)$/\1/p')
+ST_SUM=$(( ${ST_Q:-0} + ${ST_T:-0} ))
+[ "$ST_SUM" -ge $(( P1 + P2 )) ] 2>/dev/null && pass "the totals of karictl stats kept every query of the two passes ($ST_SUM of $((P1 + P2)); only $(sf store.zones.attached) zones are in memory)" || fail "karictl stats counts $ST_SUM queries, the passes sent $((P1 + P2)): the counters of the zones that left memory are lost"
+ST_ROWS=$(printf '%s\n' "$ST_ALL" | grep -c '^karidns_zone_queries_total{.*proto="udp"')
+ST_ATT=$(sf store.zones.attached)
+[ "$ST_ROWS" -gt "$ST_ATT" ] 2>/dev/null && [ "$ST_ROWS" -le $(( ST_ATT + 128 )) ] 2>/dev/null && pass "karictl stats lists the zones in memory ($ST_ATT) and, after them, the busiest zones that left it ($((ST_ROWS - ST_ATT)) of at most 128)" || fail "karictl stats lists $ST_ROWS zones with $ST_ATT in memory"
 [ "$(sf store.attach.failed)" = 0 ] && pass "no attach failed" || fail "attach failures: $(sf store.attach.failed)"
 echo "  answers on the subset: the server with the store against the reference"
 subset_answers "$PB" "$T/ref.ans"
@@ -421,6 +440,164 @@ INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT
     unset DBFILE LPATH
 fi
 
+# ---------------------------------------------------------------- 0.7 S6: the cleaner
+echo "== the cleaner (0.7 S6): the zones change again and again, the dead segments are cleaned and removed, the answers do not change"
+CL_ROUNDS=${STORE_CLEAN_ROUNDS:-5}
+conf b "store none;"
+start_one b
+conf a "memory-limit 1m; store \"$T/storeC\"; store-threads 2; store-mode ${STORE_MODE:-auto}; store-segment-size 1m; store-scrub-interval off;"
+start_one a
+waitfor 90 stored_all && pass "the store holds all $NZ zones" || fail "the store holds $(sf store.zones.stored) of $NZ zones"
+set_serial() {   # set_serial N: the serial of every zone of the database (a change of every zone)
+    sqlite3 "$T/db/z.db" "UPDATE records SET content = 'ns1.' || name || ' host.' || name || ' $1 3600 600 86400 300' WHERE type = 'SOA';"
+}
+serial_of() { ./dag @127.0.0.1 -p "$1" "$(zname "$2")" SOA +short +nohexdump +time=8 +tries=1 2>/dev/null | awk '{print $3}' | head -1; }
+bodies_done() { [ "$(sf store.recon.bodies.fetched)" -ge "$1" ] 2>/dev/null; }
+maxdead=0
+r=1
+while [ $r -le "$CL_ROUNDS" ]; do
+    set_serial $((10 + r))
+    $KA reload > /dev/null 2>&1; $KB reload > /dev/null 2>&1
+    waitfor 120 bodies_done $((NZ * (r + 1))) || fail "round $r: only $(sf store.recon.bodies.fetched) bodies fetched, want $((NZ * (r + 1)))"
+    dp=$(sf store.segments.dead_pct); [ "${dp:-0}" -gt "$maxdead" ] && maxdead=$dp
+    r=$((r + 1))
+done
+last_serial() { [ "$(serial_of "$PA" "$NZ")" = "$((10 + CL_ROUNDS))" ] && [ "$(serial_of "$PB" "$NZ")" = "$((10 + CL_ROUNDS))" ]; }
+waitfor 60 last_serial && pass "$CL_ROUNDS rounds of changes to all $NZ zones were made (every zone was written to the store $((CL_ROUNDS + 1)) times)" || fail "the last serial is not served (a $(serial_of "$PA" "$NZ"), b $(serial_of "$PB" "$NZ"))"
+MV0=$(sf store.compact.moved_bytes); FR0=$(sf store.compact.segments_freed)
+UB=$(sf store.segments.used_bytes); LB=$(sf store.segments.live_bytes)
+FILES0=$(ls "$T/storeC" | grep -c '^seg\.')
+echo "  after the rounds: segments used $UB live $LB bytes (dead ${maxdead}% at the most seen), $FILES0 segment files, the cleaner has copied ${MV0:-0} bytes and removed ${FR0:-0} segments by itself"
+sleep 1
+subset_answers "$PB" "$T/cl.ref"
+subset_answers "$PA" "$T/cl.a1"
+cmp -s "$T/cl.ref" "$T/cl.a1" && [ -s "$T/cl.ref" ] && pass "the answers are the reference's (before the cleaner is asked to finish)" || { fail "the answers differ from the reference before compaction"; diff "$T/cl.ref" "$T/cl.a1" | head -6; }
+$KA store compact > "$T/compact.out" 2>&1
+grep -q '^OK' "$T/compact.out" && pass "karictl store compact: $(head -1 "$T/compact.out" | cut -c1-100)" || fail "karictl store compact: $(cat "$T/compact.out")"
+cl_idle() { [ "$(sf store.compact.candidates)" = 0 ] && [ "$(sf store.segments.draining)" = 0 ] && [ "$(sf store.segments.pinned)" = 0 ]; }
+waitfor 90 cl_idle && pass "the cleaner is done: no segment is dead enough, none waits to be removed" || fail "the cleaner is not done: candidates=$(sf store.compact.candidates) draining=$(sf store.segments.draining) pinned=$(sf store.segments.pinned)"
+sleep 2
+UB1=$(sf store.segments.used_bytes); LB1=$(sf store.segments.live_bytes); DP1=$(sf store.segments.dead_pct)
+FILES1=$(ls "$T/storeC" | grep -c '^seg\.')
+echo "  after: segments used $UB1 live $LB1 bytes (dead ${DP1}%), $FILES1 segment files; copied $(sf store.compact.moved_bytes) bytes, removed $(sf store.compact.segments_freed) segments, $(sf store.segments.free_numbers) segment numbers free"
+[ "${DP1:-100}" -lt 40 ] && pass "the dead share of the segments is ${DP1}%" || fail "the dead share is still ${DP1}% after the cleaner"
+[ "$(sf store.compact.segments_freed)" -ge 1 ] 2>/dev/null && pass "segments were removed ($(sf store.compact.segments_freed))" || fail "no segment was removed"
+[ "$UB1" -lt "$UB" ] 2>/dev/null || [ "$(sf store.compact.segments_freed)" -gt "${FR0:-0}" ] 2>/dev/null && pass "the segments hold less than before (used $UB -> $UB1, files $FILES0 -> $FILES1)" || fail "used bytes did not fall: $UB -> $UB1"
+[ "$FILES1" -le $(( (LB1 + 1048575) / 1048576 + 3 )) ] && pass "the number of segment files ($FILES1) is about what the live bytes need ($LB1)" || fail "$FILES1 segment files for $LB1 live bytes"
+[ "$(sf store.zones.stored)" = "$NZ" ] && [ "$LB1" -ge "$LB" ] 2>/dev/null && pass "every zone is still stored, nothing live was lost ($LB -> $LB1 bytes live)" || fail "stored=$(sf store.zones.stored) live $LB -> $LB1"
+[ "$(sf store.compact.bad_records)" = 0 ] && pass "no record was found damaged by the cleaner" || fail "the cleaner found $(sf store.compact.bad_records) damaged records"
+subset_answers "$PA" "$T/cl.a2"
+cmp -s "$T/cl.ref" "$T/cl.a2" && pass "the answers after the cleaner are the reference's, byte for byte" || { fail "the answers after the cleaner differ"; diff "$T/cl.ref" "$T/cl.a2" | head -6; }
+$KA store checkpoint | grep -q '^OK checkpoint' && pass "karictl store checkpoint" || fail "karictl store checkpoint failed"
+$KA store scrub start | grep -q '^OK' && pass "karictl store scrub start" || fail "karictl store scrub start failed"
+scrub_done() { [ "$(sf store.scrub.passes)" -ge 1 ] 2>/dev/null; }
+waitfor 120 scrub_done && pass "the scrub pass is over: $(sf store.scrub.zones_checked) zones, $(sf store.scrub.bytes_checked) bytes read, bad images $(sf store.scrub.bad_images), bad cells $(sf store.scrub.bad_cells), bad index $(sf store.scrub.bad_index)" || fail "the scrub did not end: $($KA store | grep -A12 '^scrub:')"
+[ "$(sf store.scrub.bad_images)$(sf store.scrub.bad_cells)$(sf store.scrub.bad_index)" = 000 ] && pass "the scrub found nothing wrong" || fail "the scrub found damage"
+# kill -9 and a restart
+kari_kill_tree "$SRV"; SRV=""
+sleep 0.5
+start_one a
+subset_answers "$PA" "$T/cl.a3"
+cmp -s "$T/cl.ref" "$T/cl.a3" && pass "after kill -9 and a restart the answers are the reference's" || { fail "after the restart the answers differ"; diff "$T/cl.ref" "$T/cl.a3" | head -6; }
+[ "$(sf store.zones.stored)" = "$NZ" ] && [ "$(sf store.recovery.rebuilt)" = 0 ] && pass "the restart found every zone in the store without a rebuild" || fail "stored=$(sf store.zones.stored) rebuilt=$(sf store.recovery.rebuilt)"
+stop_one "$SRV"; SRV=""
+stop_one "$REF"; REF=""
+set_serial 1
+
+# ---------------------------------------------------------------- 0.7 S6: disk full, on a small ZFS dataset
+if [ -n "${STORE_ZFS_PARENT:-}" ] && command -v zfs > /dev/null 2>&1 && zfs list -H -o name "$STORE_ZFS_PARENT" > /dev/null 2>&1; then
+    echo "== a dataset with the default record size (128K): the server says so"
+    DS128="$STORE_ZFS_PARENT/rs128.$$"
+    ZFS_DS="$DS128"
+    zfs create -o recordsize=128k -o compression=lz4 -o atime=off "$DS128" && MP128=$(zfs get -H -o value mountpoint "$DS128")
+    if [ -n "${MP128:-}" ] && [ -d "$MP128" ]; then
+        chown nobody "$MP128"; chmod 700 "$MP128"
+        conf a "memory-limit 1m; store \"$MP128/store\"; store-threads 2; store-segment-size 1m; store-scrub-interval off;"
+        start_one a
+        [ "$(sf store.fstype)" = zfs ] && [ "$(sf store.mode)" = copy ] && pass "auto: copy mode on ZFS (store.mode=copy)" || fail "fstype=$(sf store.fstype) mode=$(sf store.mode)"
+        [ "$(sf store.fs.recordsize_warning)" = 1 ] && [ "$(sf store.fs.blksize)" -gt 32768 ] 2>/dev/null && pass "a record size of $(sf store.fs.blksize): store.fs.recordsize_warning=1" || fail "recordsize_warning=$(sf store.fs.recordsize_warning) blksize=$(sf store.fs.blksize)"
+        grep -q "\[Store\] store: the store is on ZFS with a record size of" "$T/a.log" && pass "the log has the WARNING with the recommended value ($(grep -o 'set recordsize=[0-9A-Za-z]*' "$T/a.log" | head -1))" || fail "no record size WARNING in the log: $(grep -i 'record size' "$T/a.log" | head -2)"
+        $KA store -k 2>/dev/null | grep -q '^store.memory.arc.total_bytes=' && pass "karictl store has the sum of the Backend, the ARC, the loader and the system against RAM ($($KA store -k | grep -E '^store.memory.arc.(total_bytes|ram_bytes|level)=' | tr '\n' ' '))" || fail "no store.memory.arc.* keys: $($KA store -k | grep -c memory)"
+        stop_one "$SRV"; SRV=""
+        pass "ZFS: record size checked"
+    else
+        fail "could not make the dataset $DS128"
+    fi
+    zfs destroy -f "$DS128" > /dev/null 2>&1; ZFS_DS=""
+
+    echo "== disk full on a dataset with a quota (record size 16K)"
+    DSQ="$STORE_ZFS_PARENT/small.$$"
+    ZFS_DS="$DSQ"
+    zfs create -o quota=${STORE_SMALLFS_QUOTA:-100m} -o recordsize=16k -o compression=off -o atime=off "$DSQ" && MPQ=$(zfs get -H -o value mountpoint "$DSQ")
+    if [ -n "${MPQ:-}" ] && [ -d "$MPQ" ]; then
+        chown nobody "$MPQ"; chmod 700 "$MPQ"
+        conf a "memory-limit 1m; store \"$MPQ/store\"; store-threads 2; store-segment-size 64m; store-scrub-interval off;"
+        start_one a
+        [ "$(sf store.fs.recordsize_warning)" = 0 ] && pass "a record size of $(sf store.fs.blksize): no warning" || fail "recordsize_warning=$(sf store.fs.recordsize_warning) blksize=$(sf store.fs.blksize)"
+        waitfor 90 stored_all && pass "the store holds all $NZ zones ($(sf store.space.fs_free_bytes) bytes free of the quota, reserve $(sf store.space.reserve_bytes))" || fail "the store holds $(sf store.zones.stored) of $NZ zones: $($KA store | grep -E 'state|free' | head -5)"
+        r=1
+        while [ $r -le ${STORE_SMALLFS_ROUNDS:-12} ]; do
+            set_serial $((20 + r))
+            $KA reload > /dev/null 2>&1
+            waitfor 120 bodies_done $((NZ * (r + 1))) || fail "round $r on the small dataset: only $(sf store.recon.bodies.fetched) bodies fetched"
+            r=$((r + 1))
+        done
+        echo "  ${STORE_SMALLFS_ROUNDS:-12} rounds of changes on a quota of ${STORE_SMALLFS_QUOTA:-100m}: enospc events $(sf store.space.enospc_events), degraded puts $(sf store.space.degraded_puts), segments freed $(sf store.compact.segments_freed), free $(sf store.space.fs_free_bytes)"
+        # (a segment of 64 MB on a quota of 100 MB leaves the cleaner little room to copy into: a zone or two may have been kept without an image at the very limit; that is fine, the state ends)
+        [ "$(sf store.state)" = ok ] && [ "$(sf store.space.degraded_puts)" -le 3 ] && pass "the updates were made room for by the cleaner: the store is ok (degraded puts: $(sf store.space.degraded_puts))" || fail "state=$(sf store.state) degraded_puts=$(sf store.space.degraded_puts)"
+        [ "$(sf store.compact.segments_freed)" -ge 1 ] && pass "segments were freed ($(sf store.compact.segments_freed)) to make the room" || fail "no segment was freed on a full quota"
+        # more zones than fit
+        EXTRA=${STORE_EXTRA_ZONES:-20000}
+        sqlite3 "$T/db/z.db" <<SQL
+WITH RECURSIVE n(i) AS (SELECT $((NZ + 1)) UNION ALL SELECT i + 1 FROM n WHERE i < $((NZ + EXTRA)))
+INSERT INTO domains (name, type) SELECT printf('z%04d.test', i), 'NATIVE' FROM n;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
+  SELECT id, name, 'SOA', 'ns1.' || name || ' host.' || name || ' 1 3600 600 86400 300', 300, 0, 0 FROM domains WHERE id > $NZ;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.' || name, 300, 0, 0 FROM domains WHERE id > $NZ;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns2.' || name, 300, 0, 0 FROM domains WHERE id > $NZ;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'www.' || name, 'A', '192.0.2.80', 300, 0, 0 FROM domains WHERE id > $NZ;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'ns1.' || name, 'A', '192.0.2.1', 300, 0, 0 FROM domains WHERE id > $NZ;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'ns2.' || name, 'AAAA', '2001:db8::2', 300, 0, 0 FROM domains WHERE id > $NZ;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'MX', 'mail.' || name, 300, 10, 0 FROM domains WHERE id > $NZ;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'mail.' || name, 'A', '192.0.2.25', 300, 0, 0 FROM domains WHERE id > $NZ;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'TXT', '"v=spf1 -all"', 300, 0, 0 FROM domains WHERE id > $NZ;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, '*.w.' || name, 'A', '192.0.2.99', 300, 0, 0 FROM domains WHERE id > $NZ;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'alias.' || name, 'CNAME', 'www.' || name, 300, 0, 0 FROM domains WHERE id > $NZ;
+WITH RECURSIVE m(j) AS (SELECT 0 UNION ALL SELECT j + 1 FROM m WHERE j < 24)
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
+  SELECT d.id, 'h' || m.j || '.' || d.name, 'A', '192.0.2.' || (m.j % 250 + 1), 300, 0, 0 FROM domains d, m WHERE d.id > $NZ;
+SQL
+        $KA reload > /dev/null 2>&1
+        is_degraded() { [ "$(sf store.state)" = degraded ] && [ "$(sf store.space.level)" = degraded ]; }
+        waitfor 120 is_degraded && pass "$EXTRA more zones than the quota holds: the store is degraded (store.space.degraded_puts=$(sf store.space.degraded_puts), free $(sf store.space.fs_free_bytes), reserve $(sf store.space.reserve_bytes))" || fail "the store did not become degraded: state=$(sf store.state) free=$(sf store.space.fs_free_bytes) stored=$(sf store.zones.stored) known=$(sf store.zones.known)"
+        waitfor 120 sh -c "[ \$($KA store -k 2>/dev/null | sed -n 's/^store.recon.bodies.known=//p' | head -1) = 0 ] || [ \$($KA store -k 2>/dev/null | sed -n 's/^store.state=//p' | head -1) = degraded ]"
+        grep -q "\[Store\] store: no room for zone images" "$T/a.log" && pass "the log has the ERROR: $(grep 'no room for zone images' "$T/a.log" | head -1 | cut -c1-200)" || fail "no 'no room for zone images' line in the log"
+        [ "$(grep -c 'no room for zone images' "$T/a.log")" -le 3 ] && pass "the ERROR is said once a minute, not for every zone ($(grep -c 'no room for zone images' "$T/a.log") time(s))" || fail "the ERROR was logged $(grep -c 'no room for zone images' "$T/a.log") times"
+        [ "$(sf store.space.level)" = degraded ] && [ "$(sf store.state_bits)" -ge 1 ] && pass "karictl store: state degraded, store.space.level=degraded" || fail "space.level=$(sf store.space.level) state_bits=$(sf store.state_bits)"
+        # every zone is answered right: the old ones from the store or the database, the new ones (no image) from the database
+        pass_all 1 $((NZ + EXTRA)) 37
+        [ "$PASS_BAD" = 0 ] && pass "all $PASS_N sampled queries over old and new zones are answered right while the store is degraded" || fail "$PASS_BAD of $PASS_N queries were wrong while the store is degraded"
+        [ "$(sf store.space.degraded_puts)" -ge 1 ] && pass "zones were kept without an image: $(sf store.space.degraded_puts)" || fail "no zone was kept without an image"
+        # the way back: the extra zones go, the cleaner makes the room
+        sqlite3 "$T/db/z.db" "DELETE FROM records WHERE domain_id > $NZ; DELETE FROM domains WHERE id > $NZ;"
+        $KA reload -force > /dev/null 2>&1          # (more than a fifth of the zones go: the mass-delete guard holds a plain reload back)
+        is_ok() { [ "$(sf store.state)" = ok ]; }
+        waitfor 180 is_ok && pass "the extra zones are gone and room is back: the store is ok again (free $(sf store.space.fs_free_bytes), $(sf store.compact.segments_freed) segments freed)" || fail "the store stays degraded: state=$(sf store.state) free=$(sf store.space.fs_free_bytes) known=$(sf store.zones.known) stored=$(sf store.zones.stored)"
+        grep -q "\[Store\] store: there is room again" "$T/a.log" && pass "the log says there is room again" || fail "no 'there is room again' line in the log"
+        all_stored() { [ "$(sf store.zones.stored)" = "$NZ" ] && [ "$(sf store.zones.known)" = 0 ]; }
+        waitfor 180 all_stored && pass "all $NZ zones have an image again" || fail "stored=$(sf store.zones.stored) known=$(sf store.zones.known)"
+        pass_all 1 "$NZ" 13
+        [ "$PASS_BAD" = 0 ] && pass "$PASS_N queries are answered right after the way back" || fail "$PASS_BAD of $PASS_N queries were wrong after the way back"
+        stop_one "$SRV"; SRV=""
+    else
+        fail "could not make the dataset $DSQ"
+    fi
+    zfs destroy -f "$DSQ" > /dev/null 2>&1; ZFS_DS=""
+    set_serial 1
+else
+    echo "SKIP: disk full on a small ZFS dataset needs STORE_ZFS_PARENT=<dataset> (and zfs, as root)"
+fi
+
 echo "== karicheck"
 kc() { ./karicheck conf "$T/k.conf" > "$T/kc.out" 2>&1; }
 conf a "store \"$T/none/such/dir\";"
@@ -429,6 +606,14 @@ conf a "store \"$T/store\"; store-mode copy; store-threads 3;"
 cp "$T/a.conf" "$T/k.conf"; kc; grep -E "ERROR|error" "$T/kc.out" | grep -qi "store" && fail "karicheck refused a good store configuration: $(grep -i store "$T/kc.out")" || pass "store, store-mode and store-threads are accepted"
 conf a "store none;"
 cp "$T/a.conf" "$T/k.conf"; kc; grep -E "ERROR|error" "$T/kc.out" | grep -qi "store" && fail "karicheck refused store none" || pass "store none is accepted"
+conf a "store \"$T/store\"; store-segment-size 4m; store-scrub-interval 3600;"
+cp "$T/a.conf" "$T/k.conf"; kc; grep -E "ERROR|error" "$T/kc.out" | grep -qi "store" && fail "karicheck refused store-segment-size / store-scrub-interval: $(grep -i store "$T/kc.out")" || pass "store-segment-size 4m and store-scrub-interval 3600 are accepted"
+conf a "store \"$T/store\"; store-scrub-interval off;"
+cp "$T/a.conf" "$T/k.conf"; kc; grep -E "ERROR|error" "$T/kc.out" | grep -qi "store" && fail "karicheck refused store-scrub-interval off" || pass "store-scrub-interval off is accepted"
+conf a "store-scrub-interval 5;"
+cp "$T/a.conf" "$T/k.conf"; kc; [ $? != 0 ] && pass "store-scrub-interval 5 (below a minute) is an error" || fail "karicheck accepted store-scrub-interval 5"
+conf a "store-segment-size 4k;"
+cp "$T/a.conf" "$T/k.conf"; kc; [ $? != 0 ] && pass "store-segment-size 4k (below 1m) is an error" || fail "karicheck accepted store-segment-size 4k"
 if [ "$(id -u)" = 0 ]; then
     # the owner and mode rules of the start (L8): the same refusals as the server's
     mkdir -p "$T/wdir" && chmod 0777 "$T/wdir"

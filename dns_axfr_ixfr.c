@@ -1056,7 +1056,7 @@ int zone_limits_gate(zone_db_entry_t *entry, zone_arena_t *builder, const char *
   zone_limits_t lim;
   rcu_aux_read_lock();
   server_config_t *lim_cfg = acquire_config_snapshot();
-  zone_limits_effective(lim_cfg, zone_entry_config(lim_cfg, entry), entry->view_name, &lim);
+  zone_limits_effective(lim_cfg, zone_entry_config(lim_cfg, entry), zone_vname(entry), &lim);
   release_config_snapshot(lim_cfg);
   rcu_aux_read_unlock();
   if (!lim.max_records && !lim.max_per_type && !lim.max_types_per_name && !lim.max_zone_ttl) return 0;
@@ -1110,12 +1110,12 @@ void zone_install_version(zone_db_entry_t *entry, zone_version_t *standby, const
   additional_from_auth_t policy = (zcfg && zext(zcfg)->additional_from_auth_specified)
                                       ? zext(zcfg)->additional_from_auth
                                       : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
-  zone_glue_track_build(standby, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
+  zone_glue_track_build(standby, entry->domain, snapshot_find_view(cur_snap, zone_vname(entry)), policy);
   build_zone_response_cache(standby, active_cfg_prelink, entry);
   int64_t keep_secs = -1;           /* karictl rollback: a database install keeps the version it replaces for the zone's rollback-window */
   if (keep_prev) {
     zone_veff_t veff;
-    zone_vopts_effective(active_cfg_prelink, zcfg, entry->view_name, &veff);
+    zone_vopts_effective(active_cfg_prelink, zcfg, zone_vname(entry), &veff);
     keep_secs = veff.rollback_window;
   }
   release_config_snapshot(active_cfg_prelink);
@@ -1436,12 +1436,14 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         zone_ext_shared_unref(rx_prev);
         free(rx_text);
 
-        if (session->is_ixfr) {
-          atomic_fetch_add_explicit(&entry->observatory.ixfr_success, 1, memory_order_relaxed);
-        } else {
-          atomic_fetch_add_explicit(&entry->observatory.axfr_success, 1, memory_order_relaxed);
+        {
+          zone_x_t *ox = zone_x_need(entry);       /* (a transfer is not the hot path: a zone that had no extension gets one) */
+          if (ox) {
+            if (session->is_ixfr) atomic_fetch_add_explicit(&ox->obs.ixfr_success, 1, memory_order_relaxed);
+            else atomic_fetch_add_explicit(&ox->obs.axfr_success, 1, memory_order_relaxed);
+            atomic_store_explicit(&ox->obs.last_transfer_time, (uint64_t)time(NULL), memory_order_relaxed);
+          }
         }
-        atomic_store_explicit(&entry->observatory.last_transfer_time, (uint64_t)time(NULL), memory_order_relaxed);
 
         // RFC 1996 §4.6: 自分もプライマリとして下流へ通知する (送信と再送は制御スレッド)
         notify_request_send(entry);
@@ -1467,7 +1469,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
   server_config_t *cfg = acquire_config_snapshot();
   const zone_config_t *zcfg = zone_entry_config(cfg, entry);
   if (zcfg && zcfg->is_catalog) {
-      catalog_process_membership(entry, zcfg, entry->view_name);
+      catalog_process_membership(entry, zcfg, zone_vname(entry));
   }
   release_config_snapshot(cfg);
   rcu_aux_read_unlock();
@@ -1810,7 +1812,7 @@ static int xfr_try_primary_with(void *arg, int idx, tsig_key_t *kst) {
   /* B8t-2: the Extended AXFR version this primary speaks (kept per zone, in memory): ask for version 3 first; when a standard transfer
    * comes back, ask once more with version 2 and remember what the primary did (xfr_ext_*) */
   time_t ext_now = time(NULL);
-  uint8_t ext_state = ctx->entry ? xfr_ext_effective(ctx->entry->xfr_ext_state, ctx->entry->xfr_ext_set, ext_now) : XFR_EXT_UNKNOWN;
+  uint8_t ext_state = ctx->entry ? xfr_ext_effective(zone_xr(ctx->entry)->xfr_ext_state, zone_xr(ctx->entry)->xfr_ext_set, ext_now) : XFR_EXT_UNKNOWN;
   uint8_t ext_ver = p->no_edns ? 0 : xfr_ext_request_version(ext_state);   /* edns no: no OPT, so no Extended AXFR either */
   uint32_t ixfr_serial = probed_newer ? 0 : active_serial;   /* the SOA said the primary is ahead: the whole zone (request-ixfr no) */
   /* (the key's name only, never its secret) */
@@ -1834,12 +1836,13 @@ static int xfr_try_primary_with(void *arg, int idx, tsig_key_t *kst) {
   xfr_ns_release(&master_addr);
   if (axfr_res > 0 && ctx->entry && !p->no_edns) {   /* edns no asked for nothing, so the answer says nothing about the primary */
     uint8_t learned = xfr_ext_learn(session.is_extended_mode, session.ext_version);
-    if (learned != ctx->entry->xfr_ext_state || ext_state != ctx->entry->xfr_ext_state) {
+    zone_x_t *lx = zone_x_need(ctx->entry);
+    if (lx && (learned != lx->xfr_ext_state || ext_state != lx->xfr_ext_state)) {
       if (learned == XFR_EXT_V2)
         syslog(LOG_NOTICE, "[AXFR] zone %s: the primary %s speaks Extended AXFR version 2 only; version 3 is tried again after %d hours",
                ctx->domain, p->ip, XFR_EXT_REPROBE_SECS / 3600);
-      ctx->entry->xfr_ext_state = learned;
-      ctx->entry->xfr_ext_set = ext_now;       /* the re-probe time counts from the change */
+      lx->xfr_ext_state = learned;
+      lx->xfr_ext_set = ext_now;       /* the re-probe time counts from the change */
     }
   }
   if (session.out_of_zone_skipped > 0) {
@@ -1886,7 +1889,7 @@ void *axfr_bg_thread_func(void *arg) {
   if (ctx->entry) {
     /* karictl stats / alerts transfer-failures-above: the refresh failed at every primary that was asked (an up-to-date or "behind" answer is not a failure) */
     if (run.tried > 0 && run.failed == run.tried) {
-      atomic_fetch_add_explicit(&ctx->entry->observatory.xfer_failed, 1, memory_order_relaxed);
+      ZONE_OBS_ADD(ctx->entry, xfer_failed, 1);       /* (the zone has an extension: a refresh is of a secondary) */
       atomic_fetch_add_explicit(&g_xfer_failed_total, 1, memory_order_relaxed);
     }
     if (run.tried == 0 && run.deferred > 0) {
@@ -2567,11 +2570,11 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
   bool provide_ixfr = true;
   {
     server_config_t *pcfg = acquire_config_snapshot();
-    const server_stmt_t *srv = config_server_find_sa(pcfg, entry->view_name, (const struct sockaddr *)client_addr);
+    const server_stmt_t *srv = config_server_find_sa(pcfg, zone_vname(entry), (const struct sockaddr *)client_addr);
     one_answer = srv && (srv->set & SV_TRANSFER_FORMAT) && (srv->bools & SV_B_ONE_ANSWER);
     if (is_ixfr) {
       xfr_eff_t pe;
-      xfr_opts_effective_peer(pcfg, pcfg ? zone_entry_config(pcfg, entry) : NULL, entry->view_name, srv, &pe);
+      xfr_opts_effective_peer(pcfg, pcfg ? zone_entry_config(pcfg, entry) : NULL, zone_vname(entry), srv, &pe);
       provide_ixfr = pe.provide_ixfr;
     }
     if (pcfg) release_config_snapshot(pcfg);

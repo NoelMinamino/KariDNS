@@ -173,8 +173,8 @@ Commands that take a zone name accept an optional view name as the next argument
   |---|---|
   | `schema` | Version of this key list (1) |
   | `store.time.mono_ms`, `store.time.unix` | Server's monotonic clock in milliseconds, wall clock in seconds, at the moment of the reply |
-  | `store.state` | `none` (no store), `ok`, or `degraded` (the last write failed: disk full) |
-  | `store.state_bits` | The state as bits: 1 disk full, 2 repaired at the last open |
+  | `store.state` | `none` (no store), `ok`, or `degraded` (the disk is full: new and changed zones are kept without an image until room is back; `store.space.*`) |
+  | `store.state_bits` | The state as bits: 1 disk full (degraded, or the last write failed for lack of room), 2 repaired at the last open |
   | `store.format`, `store.mode`, `store.fstype`, `store.uuid` | Store format version; `map` (segments mapped) or `copy` (read with `pread`, for ZFS); file system type; store identity (32 hex digits). With `store.state` `none` this and every key down to `store.cache.*` is absent |
   | `store.clean_flag` | 1 when the superblock on disk says "clean stop" (0 while the server runs) |
   | `store.zones.known`, `.stored`, `.rejected`, `.free` | Zones in the store by state: known without an image (the database fetch has them), stored (an image is in the store), rejected (flagged by the last reconcile), free table slots |
@@ -185,16 +185,39 @@ Commands that take a zone name accept an optional view name as the next argument
   | `store.view.<n>.name`, `.known`, `.stored`, `.rejected`, `.image_bytes` | The same per view, `<n>` = 0, 1, ... (the store's view number) |
   | `store.tables.zt_records`, `.zt_capacity`, `.nx_used_bytes`, `.nx_dead_bytes` | Zone table records in use and room; long names, used and dead |
   | `store.tables.ix_gen`, `.ix_slots`, `.ix_used`, `.ix_live`, `.sx_gen`, `.sx_slots`, `.sx_used`, `.sx_live` | Name index and source index: generation, slots, slots used, live entries |
-  | `store.segments.count`, `.used_bytes`, `.live_bytes`, `.dead_pct` | Image segments: number, bytes appended, bytes still referenced, share that a cleaner would free |
-  | `store.journal.lsn`, `.checkpoint_lsn`, `.committed_lsn`, `.bytes`, `.gen` | Journal position, last checkpoint, last durable commit, size, generation |
+  | `store.segments.count`, `.used_bytes`, `.live_bytes`, `.dead_pct` | Image segments: highest segment number in use, bytes appended to the segments that exist, bytes still referenced, share that the cleaner can win |
+  | `store.segments.free_numbers`, `.draining`, `.pinned` | Segment numbers that are free (the segment was cleaned and removed; the number is used again), segments with no live record that wait for a checkpoint, a grace period or the end of the references, segments that an attached zone's image points into (MAP mode) |
+  | `store.journal.lsn`, `.checkpoint_lsn`, `.committed_lsn`, `.bytes`, `.gen`, `.max_bytes` | Journal position, last checkpoint, last durable commit, size, generation, the size at which a checkpoint is forced (100 MiB: a replay of that takes about a second) |
   | `store.checkpoint.count`, `.last_unix`, `.last_us` | Checkpoints since the open, when the last one ended, how long it took |
   | `store.writes.commits`, `.puts`, `.replaces`, `.deletes`, `.growths`, `.errors` | Writer counters since the open |
   | `store.recovery.created`, `.was_clean`, `.used_older_super`, `.rebuilt`, `.journals_read`, `.records_replayed`, `.journal_torn`, `.rebuilt_zones`, `.dropped_zones`, `.open_us` | What the last open found and did, and how long it took |
+  | `store.open.ix_read_us`, `.zt_readahead_us`, `.zt_readahead_done` | The open reads the name index once before the first answer (`ix_read_us`: how long that took); a thread then reads the zone table into memory in the background (`zt_readahead_us`, 0 until `zt_readahead_done` is 1) |
+  | `store.errors.total` | Texts put into the error ring (`err.ring`, the last 65,536 are kept) since it was made: why a zone was refused or failed |
+  | `store.entries.available` | 1 when the figures of the server's own tables below are there (a server with the store on) |
+  | `store.entries.pool_used`, `.pool_slabs`, `.pool_slab_bytes`, `.pool_slot_bytes`, `.pool_free_slots` | The pool of zone entries: slots in use (one for every zone in memory), slabs, bytes of a slab, bytes of a slot (256), free slots |
+  | `store.entries.attach_table_slots`, `.attach_table_grows`, `.attach_table_shrinks` | The table that finds a zone in memory by its zone id: slots now, how often it was made larger and smaller |
+  | `store.fold.zones`, `.rows`, `.replaced` | Zones that left memory with their counters folded into the totals of their view, rows of the table of the top zones (those with the most queries that are not in memory), rows a busier zone took over |
+  | `store.errors.memory_texts`, `.memory_noted`, `.memory_pushed_out` | The texts of rejected zones in the ring in memory (512), how many were noted since the start, how many were pushed out by newer ones (the file `err.ring` still has them; `store.errors.total`) |
+  | `store.detach.sampled` | Zones that were taken out of memory because the sample of the attach table chose them (also in `store.detach.count`) |
+  | `store.compact.runs`, `.moved_records`, `.moved_bytes`, `.segments_freed`, `.last_unix` | The cleaner (since the open): segments it began to clean, records and bytes it copied to the open segment, segments it removed, when it last worked |
+  | `store.compact.bad_records`, `.pinned_skips`, `.incomplete` | Live records that failed their checksum when the cleaner was to copy them (the zone became known and is read from the database again), emptied segments that were held by an attached image (counted once each), segments the cleaner could not empty (a record it cannot read; it tries again after ten minutes) |
+  | `store.compact.rate_bytes`, `.candidates`, `.dead_bytes` | Bytes a second the cleaner may copy (0 = no limit), segments that are dead enough (half dead and at least a quarter of a segment or 1 MiB dead) now, dead bytes of all segments but the open one |
+  | `store.compact.nx_reclaims`, `.nx_reclaimed_bytes` | Passes that gave back the space of long zone names that were deleted (`store.tables.nx_dead_bytes`), and the bytes they gave back |
+  | `store.space.level` | `ok`, `low` (a WARNING was said: the file system is getting full), `degraded` (no room: new and changed zones are kept without an image) |
+  | `store.space.fs_total_bytes`, `.fs_free_bytes`, `.checked_unix` | The file system of the store, as of the last check (at every checkpoint, about every second while images are written) |
+  | `store.space.reserve_bytes`, `.store_bytes` | Free bytes that only the cleaner may use (images are refused below that: half a segment, 256 KiB to 128 MiB); what the store occupies |
+  | `store.space.growth_bytes_per_hour`, `.full_in_hours` | The growth over the last hour (0 until five minutes of history exist, or when the store shrinks) and the hours until the file system is full at that growth (0 = not known) |
+  | `store.space.degraded_puts`, `.enospc_events`, `.degraded_since_unix` | Zones that were kept without an image because no room was left (since the open), writes that found no room, when the degraded state began (0 = not degraded) |
+  | `store.fs.blksize`, `.recordsize_warning` | `st_blksize` of a table file (on ZFS the record size of the dataset) and 1 when it is above 32 KiB (the server says so in syslog; see "The zone store" in karidns.md) |
+  | `store.scrub.interval_s`, `.running`, `.progress_pct` | Seconds between two scrubs (0 = never), whether a pass runs, how far it is |
+  | `store.scrub.passes`, `.last_start_unix`, `.last_end_unix`, `.zones_checked`, `.bytes_checked` | Passes since the open, when the last began and ended, zones and bytes read |
+  | `store.scrub.bad_images`, `.bad_cells`, `.bad_index`, `.io_errors` | What the scrub found since the open: images whose checksum or structure was wrong (the zone became known and is read again), damaged table records, index entries that did not lead to their zone (both repaired at the end of the pass), read errors |
   | `store.cache.kind` | `page` (UFS: `mincore` sample), `arc` (ZFS), `copy` |
   | `store.cache.page.available` | 1 when the sample worked, else 0 and `store.cache.page.note` ("n/a: ...") |
   | `store.cache.page.sampled_pages`, `.resident_pages`, `.resident_pct`, `.sample_age_ms` | The sample: pages looked at, of them in memory, the share, age of the sample |
   | `store.cache.note` | On ZFS: `see karictl (ARC kstats)` |
   | `store.cache.arc.available`, `.size_bytes`, `.target_bytes`, `.target_min_bytes`, `.target_max_bytes`, `.hits`, `.misses`, `.hit_pct`, `.compressed_bytes`, `.uncompressed_bytes` | ARC figures, added by `karictl` on ZFS (a kstat that cannot be read is left out) |
+  | `store.memory.arc.backend_bytes`, `.arc_max_bytes`, `.loader_bytes`, `.other_bytes`, `.total_bytes`, `.ram_bytes`, `.pct`, `.level`, `.text` | Added by `karictl` on ZFS: the Backend's heap (with `memory-limit` its size under the limit, else with every zone in memory), `vfs.zfs.arc.max`, the loader, about 1 GB for the system, their sum against `hw.physmem`, the share in percent, `ok` / `notice` (above 85 percent) / `warning` (above RAM) and the sentence (in the text form: the section `arc sum`) |
   | `store.attach.count` | Zones attached from the store since the start |
   | `store.attach.failed` | Attaches that failed; `store.attach.fail.checksum`, `.record`, `.invalid`, `.io`, `.memory`, `.other` by cause |
   | `store.attach.p50_us`, `.p90_us`, `.p99_us`, `.max_us` | Time of an attach |
@@ -221,6 +244,14 @@ Commands that take a zone name accept an optional view name as the next argument
   | `store.zone.attached` | 1 when the zone is attached now (where the server can tell) |
 
   A bad argument, a zone that is not in the store (`ERROR zone not found`), a name in several views without a view, or `zone` without a store are answered `ERROR ...` (exit status 3).
+
+`store compact`, `store checkpoint`, `store scrub start`, `store scrub stop`
+: Change the store (0.7); they are not read commands, so they need the main control key (a restricted key, read-only or with `allow-commands`, does not have them). `store compact` asks the cleaner to run without its rate limit until no segment is dead enough (it returns at once; `store.compact.*` shows the progress), then the server writes a checkpoint and removes the segments that are empty. The cleaner runs by itself, at 16 MiB a second at most, whenever a segment is half dead; this is for after a mass change, or before a measurement. `store checkpoint` writes a checkpoint now (the journal is cut, what was written is durable) and answers when it is done. `store scrub start` begins a scrub pass at once (the scrub reads every record, at most 16 MiB a second; `store-scrub-interval` starts one by itself); `store scrub stop` ends the pass that runs. The answers are `OK ...` or `ERROR ...` (exit status 3).
+  ```sh
+  karictl store compact
+  karictl store -k | grep '^store.compact.'
+  karictl store scrub start
+  ```
 
 `trace [level]`
 : Change the debug level in force of the server (0.7; `rndc trace`): without an argument one more (at most 99), with one that level, a number from 0 to 99. The reply is `OK debug level is now N`; a level that is not a number from 0 to 99 is answered `ERROR trace: the debug level must be a number from 0 to 99`, a second argument `ERROR trace takes one argument at most: ...` (exit status 3, the level is not changed). The server logs each change as `[Control] debug level is now N` (category `general`, notice). The channels with `severity dynamic` write the messages up to the level, and the built-in `default_debug` (the file `karidns.run` in `options { directory }`) writes everything up to it while it is above 0; see karidns(8), `logging`. The level is not kept across a restart (`karidns -d` sets it at the start). Every process of the server follows (0.7): the sandboxed process, which has the control channel, hands the level to the supervisor (with the supervisors of the plugins and of `karidns-dbloader`), the UDP routers, the connect broker and the loader, and a loader that is started again later comes up with the level in force.

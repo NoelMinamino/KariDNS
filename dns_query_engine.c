@@ -786,12 +786,20 @@ static bool nsec3_opt_out_at(const zone_image_t *img, uint32_t chain, const char
   uint32_t c = find_covering_nsec3(img, chain, hash);
   return c != ZONE_IMAGE_NONE && zone_image_rr_rdlen(img, c) >= 2 && (zone_image_rr_rdata(img, c)[1] & 1);
 }
+#define DENIAL_GAP_SLOTS 64u
+#ifdef KARIDNS_UNIT_TEST
+_Atomic time_t g_denial_gap_log[DENIAL_GAP_SLOTS];       /* (a test resets it and asks whether a gap was said) */
+#else
+static _Atomic time_t g_denial_gap_log[DENIAL_GAP_SLOTS];
+#endif
 static void note_denial_gap(zone_db_entry_t *e, const char *name, const char *what) {
   if (!e || !logev_wanted(LOGC_DNSSEC, LOG_LVL_WARNING)) return;
   time_t now = time(NULL);
-  time_t last = atomic_load_explicit(&e->last_denial_gap_log, memory_order_relaxed);
+  /* the time of the last note is kept in a small table, not in the entry (0.7 S5: the entry of a light attach has no room for it and no memory is made here): two zones whose ids collide share one limit */
+  _Atomic time_t *slot = &g_denial_gap_log[e->id % DENIAL_GAP_SLOTS];
+  time_t last = atomic_load_explicit(slot, memory_order_relaxed);
   if (last != 0 && now >= last && now - last < DENIAL_GAP_LOG_INTERVAL) return;
-  if (!atomic_compare_exchange_strong_explicit(&e->last_denial_gap_log, &last, now, memory_order_relaxed, memory_order_relaxed)) return;
+  if (!atomic_compare_exchange_strong_explicit(slot, &last, now, memory_order_relaxed, memory_order_relaxed)) return;
   char zn[DNS_NAME_TEXT_SIZE], qn[DNS_NAME_TEXT_SIZE];
   logev_name_text(e->domain, zn, sizeof(zn));
   logev_name_text(name ? name : "", qn, sizeof(qn));
@@ -3207,12 +3215,13 @@ static bool notify_from_zone_primaries(const server_config_t *cfg, const char *v
  * one of a configured secondary: the key of the primaries element, else the `keys` of the server statement, else the catalog zone's tsig-key. */
 static bool notify_from_member_primaries(server_config_t *cfg, view_snapshot_t *view, const zone_db_entry_t *e, const char *client_ip,
                                          const tsig_key_t *tkey) {
-  if (e->owning_catalog_domain) {
-    zone_db_entry_t *cat = find_zone_in_view(view, e->owning_catalog_domain);
-    const zone_config_t *cc = cat && domain_names_match_ci(cat->domain, e->owning_catalog_domain) ? zone_entry_config(cfg, cat) : NULL;
+  const char *owner = zone_xr(e)->owning_catalog_domain;
+  if (owner) {
+    zone_db_entry_t *cat = find_zone_in_view(view, owner);
+    const zone_config_t *cc = cat && domain_names_match_ci(cat->domain, owner) ? zone_entry_config(cfg, cat) : NULL;
     if (cc && zext(cc)->masters_count > 0) return notify_from_zone_primaries(cfg, view->name, zext(cc), client_ip, tkey);
   }
-  const catalog_master_t *m = e->catalog_master;
+  const catalog_master_t *m = zone_xr(e)->catalog_master;
   if (!m || !m->ip[0] || !match_cidr(client_ip, m->ip)) return false;
   const char *need = peer_key_name(m->key, config_server_find_ip(cfg, view->name, client_ip), m->zone_key);
   return !need || (tkey && tsig_key_names_equal(tkey->name, need));
@@ -3657,17 +3666,17 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (out_matched_entry) *out_matched_entry = db_entry;
   if (db_entry) {
-    atomic_fetch_add_explicit(&db_entry->observatory.queries_total, 1, memory_order_relaxed);
+    zone_ctr_inc(db_entry, ZCTR_QUERIES);
     if (is_tcp) {
-      atomic_fetch_add_explicit(&db_entry->observatory.tcp_queries, 1, memory_order_relaxed);
+      zone_ctr_inc(db_entry, ZCTR_TCP);
     }
     if (edns.present) {
-      atomic_fetch_add_explicit(&db_entry->observatory.edns_queries, 1, memory_order_relaxed);
+      ZONE_OBS_ADD(db_entry, edns_queries, 1);
       if (edns.dnssec_ok) {
-        atomic_fetch_add_explicit(&db_entry->observatory.dnssec_do_queries, 1, memory_order_relaxed);
+        zone_ctr_inc(db_entry, ZCTR_DO);
       }
       if (edns.has_ecs) {
-        atomic_fetch_add_explicit(&db_entry->observatory.ecs_queries, 1, memory_order_relaxed);
+        ZONE_OBS_ADD(db_entry, ecs_queries, 1);
       }
     }
   }
@@ -4501,10 +4510,10 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       res[9] = (uint8_t)(c_ns & 0xFF);
       res[10] = (uint8_t)(arcount >> 8);
       res[11] = (uint8_t)(arcount & 0xFF);
-      if (db_entry) atomic_fetch_add_explicit(&db_entry->observatory.wirecache_hits, 1, memory_order_relaxed);
+      if (db_entry) ZONE_OBS_ADD(db_entry, wirecache_hits, 1);
       return body_offset;
     }
-    if (db_entry) atomic_fetch_add_explicit(&db_entry->observatory.wirecache_misses, 1, memory_order_relaxed);
+    if (db_entry) ZONE_OBS_ADD(db_entry, wirecache_misses, 1);
   }
 
   uint16_t qtypes[17];
@@ -4595,16 +4604,16 @@ STATIC_TEST void record_observatory_response(zone_db_entry_t *entry, uint8_t rco
     if (!entry) return;
     if (rcode == 0) {
         if (ancount == 0) {
-            atomic_fetch_add_explicit(&entry->observatory.responses_nodata, 1, memory_order_relaxed);
+            zone_ctr_inc(entry, ZCTR_NODATA);
         } else {
-            atomic_fetch_add_explicit(&entry->observatory.responses_noerror, 1, memory_order_relaxed);
+            zone_ctr_inc(entry, ZCTR_NOERROR);
         }
     } else if (rcode == 3) {
-        atomic_fetch_add_explicit(&entry->observatory.responses_nxdomain, 1, memory_order_relaxed);
+        zone_ctr_inc(entry, ZCTR_NXDOMAIN);
     } else if (rcode == 2) {
-        atomic_fetch_add_explicit(&entry->observatory.responses_servfail, 1, memory_order_relaxed);
+        zone_ctr_inc(entry, ZCTR_SERVFAIL);
     } else if (rcode == 5) {
-        atomic_fetch_add_explicit(&entry->observatory.responses_refused, 1, memory_order_relaxed);
+        zone_ctr_inc(entry, ZCTR_REFUSED);
     }
 }
 

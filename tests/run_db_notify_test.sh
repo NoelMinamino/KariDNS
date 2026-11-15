@@ -43,8 +43,8 @@ stop_srv() {
     SRV=""
 }
 cleanup() {
-    if [ $FAILS -ne 0 ]; then echo "--- sink logs"; for n in 2 3 4 5 6; do echo "127.0.0.$n:"; cat "$T/l$n" 2>/dev/null; cat "$T/sink$n.err" 2>/dev/null; done; echo "--- server log (Notify, DB)"; grep -E "Notify|\\[DB\\]" "$T/srv.log" 2>/dev/null | tail -30; fi
-    kari_kill_tree $PIDS                      # (the sinks)
+    if [ $FAILS -ne 0 ]; then echo "--- sink logs"; for n in 2 3 4 5 6; do echo "127.0.0.$n:"; cat "$T/l$n" 2>/dev/null; cat "$T/sink$n.err" 2>/dev/null; done; echo "--- server log (Notify, DB)"; grep -E "Notify|\\[DB\\]" "$T/srv.log" 2>/dev/null | tail -30; echo "--- loopback aliases now"; ifconfig lo0 2>/dev/null | grep "inet 127.0.0\."; fi
+    kari_kill_tree $PIDS                     # (the sinks)
     stop_srv
     for ip in $ALIASES; do ifconfig lo0 inet "$ip" -alias 2>/dev/null || ifconfig lo inet "$ip" -alias 2>/dev/null || true; done
     rm -rf "$T"
@@ -65,6 +65,18 @@ for ip in 127.0.0.2 127.0.0.3 127.0.0.4 127.0.0.5 127.0.0.6; do
         echo "SKIP: loopback alias $ip is not configured (ifconfig lo0 inet $ip/32 alias)"; exit 0
     fi
 done
+
+# ensure_aliases: an alias that another test on this host took away (the cleanup of a test removes the aliases it added; the tests of the suite that use them run one at a time, but another run on the same host does not
+# know) is put back, with a NOTE: the sinks work again as soon as their address is there.  Called before every change, so that the NOTIFY it causes is not sent to an address that is gone.
+ensure_aliases() {
+    for ip in 127.0.0.2 127.0.0.3 127.0.0.4 127.0.0.5 127.0.0.6; do
+        ifconfig lo0 2>/dev/null | grep -q "inet $ip " && continue
+        if ifconfig lo0 inet "$ip/32" alias 2>/dev/null || ifconfig lo inet "$ip/32" alias 2>/dev/null; then
+            echo "  [NOTE] the loopback alias $ip was gone (another test on this host took it away): put back"
+            case " $ALIASES " in *" $ip "*) ;; *) ALIASES="$ALIASES $ip" ;; esac
+        fi
+    done
+}
 
 mkdir "$T/db"
 sqlite3 "$T/db/z.db" < tests/db/pdns_schema.sqlite3.sql > /dev/null
@@ -137,6 +149,7 @@ wait_got() {   # wait_got N ZONE SECONDS
     [ "$(got "$1" "$2")" -gt 0 ]
 }
 bump() {   # bump ZONE SERIAL: the SOA serial changes in the database and the loader reads the zone (karictl reload)
+    ensure_aliases
     sqlite3 "$T/db/z.db" "UPDATE records SET content = 'ns0.$1 host.$1 $2 3600 600 86400 300' WHERE type = 'SOA' AND name = '$1'"
     $KCTL reload "$1" > /dev/null 2>&1
 }
@@ -166,6 +179,7 @@ if wait_got 2 c1.test 10 && wait_got 3 c1.test 10; then
     pass "c1.test: NOTIFY to ns1.prov.test (127.0.0.2) and ns2.prov.test (127.0.0.3): the addresses come from the database (the loader), not from a zone in memory"
 else fail "c1.test: 127.0.0.2 got $(got 2 c1.test), 127.0.0.3 got $(got 3 c1.test)"; fi
 sleep 1
+[ "$(got 2 c1.test)" -eq 1 ] && [ "$(got 3 c1.test)" -eq 1 ] && pass "each of the two name servers got exactly one NOTIFY (a NOTIFY that waited for a zone of the store does not repeat the ones that were sent)" || fail "c1.test: 127.0.0.2 got $(got 2 c1.test), 127.0.0.3 got $(got 3 c1.test) NOTIFY messages (one each expected)"
 [ "$(got 4 c1.test)" -eq 0 ] && [ "$(got 5 c1.test)" -eq 0 ] && [ "$(got 2 inz.test)" -eq 0 ] && [ "$(got 2 c2.test)" -eq 0 ] && pass "only c1.test was notified, and only its two hosts" || fail "unexpected NOTIFY: $(cat "$T"/l[2-6])"
 if [ "$STORE" = on ]; then
     ! oom c1.test && ! oom prov.test && pass "c1.test is in memory with its new serial and prov.test was attached for the addresses of its name servers (no summary, no address list of the loader)" || fail "c1.test / prov.test are not in memory"

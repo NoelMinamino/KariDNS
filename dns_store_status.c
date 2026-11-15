@@ -119,11 +119,13 @@ static bool (*_Atomic g_mem_fn)(ma_est_t *);
 static bool (*_Atomic g_att_fn)(uint32_t);
 static uint64_t (*_Atomic g_att_count_fn)(void);
 static bool (*_Atomic g_recon_fn)(store_recon_t *);
+static bool (*_Atomic g_extra_fn)(store_extra_t *);
 
 void store_status_bind(store_t *s) { atomic_store_explicit(&g_store, s, memory_order_release); }
 void store_status_set_memory_fn(bool (*fn)(ma_est_t *out)) { atomic_store_explicit(&g_mem_fn, fn, memory_order_release); }
 void store_status_set_attached_fn(bool (*fn)(uint32_t zid)) { atomic_store_explicit(&g_att_fn, fn, memory_order_release); }
 void store_status_set_attached_count_fn(uint64_t (*fn)(void)) { atomic_store_explicit(&g_att_count_fn, fn, memory_order_release); }
+void store_status_set_extra_fn(bool (*fn)(store_extra_t *out)) { atomic_store_explicit(&g_extra_fn, fn, memory_order_release); }
 void store_status_set_recon_fn(bool (*fn)(store_recon_t *out)) { atomic_store_explicit(&g_recon_fn, fn, memory_order_release); }
 
 /* ------------------------------------------------------------------------------------------------------------------------------ */
@@ -138,7 +140,7 @@ typedef struct {
   uint64_t u;
   char s[104];
 } ent_t;
-#define MAX_ENT 640
+#define MAX_ENT 800
 typedef struct {
   ent_t *e;
   unsigned n;
@@ -428,6 +430,30 @@ static void add_recon(list_t *l) {
   free(r);
 }
 
+/* the server's own tables: the attach table, the pool of entries (design 4.2: a zone in memory costs one slot), the folded counters and the texts in memory (6.1, 6.7) */
+static void add_extra(list_t *l) {
+  bool (*fn)(store_extra_t *) = atomic_load_explicit(&g_extra_fn, memory_order_acquire);
+  store_extra_t x;
+  memset(&x, 0, sizeof(x));
+  if (!fn || !fn(&x)) { U("store.entries.available", 0); return; }
+  U("store.entries.available", 1);
+  U("store.entries.pool_used", x.pool_used);
+  U("store.entries.pool_slabs", x.pool_slabs);
+  U("store.entries.pool_slab_bytes", x.pool_slab_bytes);
+  U("store.entries.pool_slot_bytes", x.pool_slot_bytes);
+  U("store.entries.pool_free_slots", x.pool_free_slots);
+  U("store.entries.attach_table_slots", x.attach_slots);
+  U("store.entries.attach_table_grows", x.attach_grows);
+  U("store.entries.attach_table_shrinks", x.attach_shrinks);
+  U("store.fold.zones", x.folded);
+  U("store.fold.rows", x.fold_rows);
+  U("store.fold.replaced", x.fold_replaced);
+  U("store.errors.memory_texts", x.err_texts);
+  U("store.errors.memory_noted", x.err_noted);
+  U("store.errors.memory_pushed_out", x.err_dropped);
+  U("store.detach.sampled", x.sampled_detaches);
+}
+
 static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a) {
   store_stats_t *st = malloc(sizeof(*st));
   if (!st) { l->ov = true; return; }
@@ -483,11 +509,15 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.segments.used_bytes", st->seg_used_bytes);
   U("store.segments.live_bytes", st->seg_live_bytes);
   U("store.segments.dead_pct", st->seg_used_bytes > st->seg_live_bytes ? (st->seg_used_bytes - st->seg_live_bytes) * 100 / st->seg_used_bytes : 0);
+  U("store.segments.free_numbers", st->seg_free_numbers);
+  U("store.segments.draining", st->seg_draining);
+  U("store.segments.pinned", st->seg_pinned);
   U("store.journal.lsn", st->lsn);
   U("store.journal.checkpoint_lsn", st->ckpt_lsn);
   U("store.journal.committed_lsn", st->committed_lsn);
   U("store.journal.bytes", st->journal_bytes);
   U("store.journal.gen", st->journal_gen);
+  U("store.journal.max_bytes", st->journal_max_bytes);
   U("store.checkpoint.count", st->checkpoints);
   U("store.checkpoint.last_unix", st->last_checkpoint_unix);
   U("store.checkpoint.last_us", st->last_checkpoint_us);
@@ -497,6 +527,48 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.writes.deletes", st->deletes);
   U("store.writes.growths", st->growths);
   U("store.writes.errors", st->write_errors);
+  /* 0.7 WP9: the cleaner (design 3.2) */
+  U("store.compact.runs", st->compact_runs);
+  U("store.compact.moved_records", st->compact_moved_records);
+  U("store.compact.moved_bytes", st->compact_moved_bytes);
+  U("store.compact.segments_freed", st->compact_segs_freed);
+  U("store.compact.bad_records", st->compact_bad_records);
+  U("store.compact.pinned_skips", st->compact_pinned_skips);
+  U("store.compact.incomplete", st->compact_incomplete);
+  U("store.compact.last_unix", st->compact_last_unix);
+  U("store.compact.rate_bytes", st->compact_rate == UINT64_MAX ? 0 : st->compact_rate);
+  U("store.compact.candidates", st->compact_candidates);
+  U("store.compact.dead_bytes", st->compact_dead_bytes);
+  U("store.compact.nx_reclaims", st->nx_reclaims);
+  U("store.compact.nx_reclaimed_bytes", st->nx_reclaimed_bytes);
+  /* the file system, the free space and what happens when it runs out (design 3.5) */
+  static const char *const lvl[] = { "ok", "low", "degraded" };
+  add_s(l, "store.space.level", lvl[st->space_level > 2 ? 2 : st->space_level]);
+  U("store.space.fs_total_bytes", st->fs_total_bytes);
+  U("store.space.fs_free_bytes", st->fs_free_bytes);
+  U("store.space.checked_unix", st->fs_checked_unix);
+  U("store.space.reserve_bytes", st->reserve_bytes);
+  U("store.space.store_bytes", st->store_bytes);
+  U("store.space.growth_bytes_per_hour", st->growth_bytes_per_hour);
+  U("store.space.full_in_hours", st->full_in_hours);
+  U("store.space.degraded_puts", st->degraded_puts);
+  U("store.space.enospc_events", st->enospc_events);
+  U("store.space.degraded_since_unix", st->degraded_since_unix);
+  U("store.fs.blksize", st->fs_blksize);
+  U("store.fs.recordsize_warning", st->fs_recordsize_warn ? 1 : 0);
+  /* the scrub (design 2.4) */
+  U("store.scrub.interval_s", st->scrub_interval_s == UINT32_MAX ? 0 : st->scrub_interval_s);
+  U("store.scrub.running", st->scrub_running ? 1 : 0);
+  U("store.scrub.progress_pct", st->scrub_progress_pct);
+  U("store.scrub.passes", st->scrub_passes);
+  U("store.scrub.last_start_unix", st->scrub_last_start_unix);
+  U("store.scrub.last_end_unix", st->scrub_last_end_unix);
+  U("store.scrub.zones_checked", st->scrub_zones_checked);
+  U("store.scrub.bytes_checked", st->scrub_bytes_checked);
+  U("store.scrub.bad_images", st->scrub_bad_images);
+  U("store.scrub.bad_cells", st->scrub_bad_cells);
+  U("store.scrub.bad_index", st->scrub_bad_index);
+  U("store.scrub.io_errors", st->scrub_io_errors);
   const store_recovery_t *r = &st->recovery;
   U("store.recovery.created", r->created);
   U("store.recovery.was_clean", r->was_clean);
@@ -508,6 +580,10 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.recovery.rebuilt_zones", r->rebuilt_zones);
   U("store.recovery.dropped_zones", r->dropped_zones);
   U("store.recovery.open_us", r->open_us);
+  U("store.open.ix_read_us", st->ix_read_us);
+  U("store.open.zt_readahead_us", st->zt_readahead_us);
+  U("store.open.zt_readahead_done", st->zt_readahead_done ? 1 : 0);
+  U("store.errors.total", st->err_total);
 
   /* the second-level cache */
   if (st->mode == STORE_MODE_MAP) {
@@ -617,6 +693,7 @@ size_t store_status_format(char *out, size_t cap, int fmt, const char *zone) {
     else add_s(&l, "store.state", "none");
     add_attach(&l, a);
     add_memory(&l);
+    add_extra(&l);
     add_recon(&l);
   }
   sb_t b = { out, cap, 0, false };
@@ -633,6 +710,40 @@ size_t store_status_format(char *out, size_t cap, int fmt, const char *zone) {
   free(l.e);
   out[b.len] = '\0';
   return b.len;
+}
+
+size_t store_status_op(const char *arg, const char *rest, char *out, size_t cap) {
+  store_t *s = atomic_load_explicit(&g_store, memory_order_acquire);
+  if (!s) return (size_t)snprintf(out, cap, "ERROR store not configured\n");
+  char line[160];
+  snprintf(line, sizeof(line), "%s %s", arg ? arg : "", rest ? rest : "");
+  char w1[32] = "", w2[32] = "", w3[32] = "";
+  int n = sscanf(line, "%31s %31s %31s", w1, w2, w3);
+  store_stats_t *st = malloc(sizeof(*st));
+  if (!st) return (size_t)snprintf(out, cap, "ERROR out of memory\n");
+  size_t len;
+  if (n == 1 && strcmp(w1, "compact") == 0) {
+    store_compact_request(s);
+    store_stats(s, st);
+    len = (size_t)snprintf(out, cap, "OK the cleaner runs at full speed until no segment is dead enough (%u segment(s) are now, %" PRIu64 " dead bytes); the empty segments are removed at the end; karictl store: store.compact.*\n",
+                           st->compact_candidates, st->compact_dead_bytes);
+  } else if (n == 1 && strcmp(w1, "checkpoint") == 0) {
+    int r = store_checkpoint(s);
+    store_stats(s, st);
+    if (r < 0) len = (size_t)snprintf(out, cap, "ERROR the checkpoint failed: %s\n", strerror(-r));
+    else len = (size_t)snprintf(out, cap, "OK checkpoint %" PRIu64 " done in %" PRIu64 " us\n", st->checkpoints, st->last_checkpoint_us);
+  } else if (n == 2 && strcmp(w1, "scrub") == 0 && strcmp(w2, "start") == 0) {
+    store_scrub_start(s);
+    len = (size_t)snprintf(out, cap, "OK the scrub runs (karictl store: store.scrub.*)\n");
+  } else if (n == 2 && strcmp(w1, "scrub") == 0 && strcmp(w2, "stop") == 0) {
+    store_scrub_stop(s);
+    len = (size_t)snprintf(out, cap, "OK the scrub is stopped\n");
+  } else {
+    len = (size_t)snprintf(out, cap, "ERROR usage: store compact | checkpoint | scrub start | scrub stop\n");
+  }
+  (void)w3;
+  free(st);
+  return len < cap ? len : cap ? cap - 1 : 0;
 }
 
 size_t store_status_control(const char *arg, const char *rest, char *out, size_t cap) {

@@ -172,6 +172,43 @@ size_t ma_text_status(char *buf, size_t n, const ma_est_t *e) {
     return w < 0 ? l : l + ((size_t)w < n - l ? (size_t)w : n - l - 1);
 }
 
+/* ---------------------------------------------------------------- ZFS */
+
+void ma_arc_sum(uint64_t backend_heap, uint64_t arc_max, uint64_t loader, uint64_t ram, ma_arc_t *a) {
+    memset(a, 0, sizeof(*a));
+    a->backend = backend_heap;
+    a->arc_max = arc_max;
+    a->loader = loader;
+    a->other = MA_ARC_OTHER;
+    a->ram = ram;
+    a->total = backend_heap + arc_max + loader + MA_ARC_OTHER;
+    uint64_t rest = backend_heap + loader + MA_ARC_OTHER;
+    a->arc_fit = ram > rest ? ram - rest : 0;
+    if (!ram) return;
+    a->pct = (uint32_t)(a->total * 100 / ram > 9999 ? 9999 : a->total * 100 / ram);
+    a->level = a->total > ram ? MA_LEVEL_WARNING : a->pct > MA_ARC_NOTICE_PCT ? MA_LEVEL_NOTICE : MA_LEVEL_INFO;
+}
+
+size_t ma_text_arc(char *buf, size_t n, const ma_arc_t *a) {
+    char be[32], arc[32], ld[32], ot[32], tot[32], ram[32], fit[32];
+    ma_fmt_size(be, sizeof(be), a->backend);
+    ma_fmt_size(arc, sizeof(arc), a->arc_max);
+    ma_fmt_size(ld, sizeof(ld), a->loader);
+    ma_fmt_size(ot, sizeof(ot), a->other);
+    ma_fmt_size(tot, sizeof(tot), a->total);
+    ma_fmt_size(ram, sizeof(ram), a->ram);
+    ma_fmt_size(fit, sizeof(fit), a->arc_fit);
+    int w = snprintf(buf, n, "memory on ZFS: Backend heap %s + ARC (vfs.zfs.arc.max) %s + loader %s + %s for the system = %s of the %s of RAM (%u%%)", be, arc, ld, ot, tot, ram, a->pct);
+    size_t l = w < 0 ? 0 : (size_t)w < n ? (size_t)w : n ? n - 1 : 0;
+    if (a->level == MA_LEVEL_WARNING)
+        w = snprintf(buf + l, n - l, "; that is more than the host has: under load the ARC and the heap compete and the system pages out or kills processes; lower vfs.zfs.arc.max to at most %s, or lower memory-limit", fit);
+    else if (a->level == MA_LEVEL_NOTICE)
+        w = snprintf(buf + l, n - l, "; little is left over: at most %s of ARC leaves the rest of the host its room", fit);
+    else
+        w = 0;
+    return w <= 0 ? l : l + ((size_t)w < n - l ? (size_t)w : n - l - 1);
+}
+
 /* ---------------------------------------------------------------- at run time */
 
 bool ma_rt_report_due(ma_rt_t *st, const ma_est_t *e, bool event) {

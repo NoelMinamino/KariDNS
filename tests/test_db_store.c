@@ -128,17 +128,21 @@ static size_t put_rr_head(uint8_t *b, const char *owner, uint16_t type, size_t r
 
 /* ZONE_DATA of the zone (SOA, NS, A www, SOA); `extra`: a changing A record so that two versions of a zone differ */
 static const char *g_zone_ns;                                          /* the NS target of the zones that zone_message() makes (NULL: ns1.<zone>) */
+static const char *g_zone_ns2;                                         /* a second NS target (NULL: none): the zone has five records, the second NS before the last SOA */
 static size_t zone_message(uint8_t *b, const char *zone, uint32_t serial) {
     memset(b, 0, 12);
     b[2] = 0x84;
-    put_u16(b + 6, 4);
+    const int nrr = g_zone_ns2 ? 5 : 4;
+    put_u16(b + 6, (uint16_t)nrr);
     size_t o = 12, rp[1];
-    for (int k = 0; k < 4; k++) {
+    for (int k = 0; k < nrr; k++) {
         char owner[300], ns[300], mail[300];
         snprintf(ns, sizeof(ns), "ns1.%s", zone);
         snprintf(mail, sizeof(mail), "host.%s", zone);
         snprintf(owner, sizeof(owner), "%s%s", k == 2 ? "www." : "", zone);
-        uint16_t type = (k == 0 || k == 3) ? 6 : k == 1 ? 2 : 1;
+        const bool ns2 = g_zone_ns2 && k == 3;
+        uint16_t type = (k == 0 || k == nrr - 1) ? 6 : (k == 1 || ns2) ? 2 : 1;
+        if (ns2) snprintf(owner, sizeof(owner), "%s", zone);
         size_t rd = put_rr_head(b + o, owner, type, rp);
         size_t start = o + rd;
         size_t l = 0;
@@ -151,7 +155,7 @@ static size_t zone_message(uint8_t *b, const char *zone, uint32_t serial) {
             l += put_u32(b + start + l, 86400);
             l += put_u32(b + start + l, 300);
         } else if (type == 2) {
-            l += put_name(b + start, g_zone_ns ? g_zone_ns : ns);
+            l += put_name(b + start, ns2 ? g_zone_ns2 : g_zone_ns ? g_zone_ns : ns);
         } else {
             b[start] = 192; b[start + 1] = 0; b[start + 2] = 2; b[start + 3] = (uint8_t)(80 + (serial & 3));
             l = 4;
@@ -167,7 +171,25 @@ static void send_zone(int fd, kdb_enc_t *e, const char *zone, uint32_t serial, u
     memset(dig, (int)serial, sizeof(dig));
     kdb_enc_begin(e, KDB_T_ZONE_BEGIN);
     kdb_enc_u16(e, 1, 0); kdb_enc_name(e, 2, zone); kdb_enc_i64(e, 3, sid); kdb_enc_u8(e, 4, KDB_ZK_PRIMARY);
-    kdb_enc_u32(e, 5, serial); kdb_enc_u32(e, 6, 0); kdb_enc_u64(e, 7, 4); kdb_enc_bytes(e, 8, dig, sizeof(dig));
+    kdb_enc_u32(e, 5, serial); kdb_enc_u32(e, 6, 0); kdb_enc_u64(e, 7, g_zone_ns2 ? 5 : 4); kdb_enc_bytes(e, 8, dig, sizeof(dig));
+    if (req) kdb_enc_u64(e, 11, req);
+    kdb_enc_end(e);
+    uint8_t msg[2048];
+    size_t n = zone_message(msg, zone, serial);
+    kdb_enc_raw_msg(e, KDB_T_ZONE_DATA, msg, n);
+    kdb_enc_begin(e, KDB_T_ZONE_END);
+    kdb_enc_u64(e, 1, g_zone_ns2 ? 5 : 4);
+    kdb_enc_end(e);
+    ch_send(fd, e);
+}
+
+/* a zone whose declared serial is not the one of its SOA (the install refuses it: "the SOA serial is not the one ZONE_BEGIN declared") */
+static void send_bad_zone(int fd, kdb_enc_t *e, const char *zone, uint32_t serial, uint64_t req, int64_t sid) {
+    uint8_t dig[KDB_DIGEST_LEN];
+    memset(dig, (int)serial, sizeof(dig));
+    kdb_enc_begin(e, KDB_T_ZONE_BEGIN);
+    kdb_enc_u16(e, 1, 0); kdb_enc_name(e, 2, zone); kdb_enc_i64(e, 3, sid); kdb_enc_u8(e, 4, KDB_ZK_PRIMARY);
+    kdb_enc_u32(e, 5, serial + 1000); kdb_enc_u32(e, 6, 0); kdb_enc_u64(e, 7, 4); kdb_enc_bytes(e, 8, dig, sizeof(dig));
     if (req) kdb_enc_u64(e, 11, req);
     kdb_enc_end(e);
     uint8_t msg[2048];
@@ -513,6 +535,21 @@ static void *zv_thread(void *arg) {
 
 zone_db_entry_t *glue_shared_entry(view_snapshot_t *view, const view_snapshot_t *owner, const char *domain);      /* (dns_snapshot_rcu.c) */
 void notify_zone_by_name(const char *view, const char *zone);               /* (dns_server_core.c: the control thread's NOTIFY of a zone by name) */
+extern int g_notify_ipc[2];                                                  /* (dns_server_core.c: where the NOTIFY messages go to the Frontend; a test reads them) */
+
+/* the NOTIFY messages that the control thread put on the NOTIFY pair since the last call: the last octet of each IPv4 destination (192.0.2.x) in last[], at most max; returns how many there were */
+static int nt_take(int *last, int max) {
+    int n = 0;
+    for (;;) {
+        _Alignas(8) uint8_t buf[2048];
+        ssize_t k = recv(g_notify_ipc[0], buf, sizeof(buf), MSG_DONTWAIT);
+        if (k <= 0) break;
+        const udp_ipc_t *m = (const udp_ipc_t *)buf;
+        if (n < max) last[n] = m->client_addr.ss_family == AF_INET ? (int)(ntohl(m->client_addr.sin.sin_addr.s_addr) & 0xFF) : -1;
+        n++;
+    }
+    return n;
+}
 
 static int run_mode(const char *mode) {
     printf("[the zone store is the directory of the database zones: %s mode]\n", mode);
@@ -852,7 +889,7 @@ static int run_mode(const char *mode) {
             static zone_db_entry_t cat_entry;
             memset(&cat_entry, 0, sizeof(cat_entry));
             cat_entry.domain = "a2.test.";
-            snprintf(cat_entry.view_name, sizeof(cat_entry.view_name), "default");
+            cat_entry.view_name = "default";
             cat_entry.is_catalog_member = true;
             cat_entry.kind = ZONE_KIND_SECONDARY;
             cat_entry.is_secondary = true;
@@ -1260,6 +1297,98 @@ static int run_mode(const char *mode) {
             CHECK(notify_wait_pop(wv, sizeof(wv), wz, sizeof(wz)));
             notify_zone_by_name(wv, wz);
             CHECK(notify_wait_count(false) == 0);
+        }
+        /* -- the timing of the NOTIFY of a zone whose two name servers are in two zones of the store that come into memory one after the other (a slow attach, made exact: the hook only records the request and the test attaches
+         *    when it wants).  What is known is sent at once; the zone that is missing is waited for, and the next look sends to the missing address only; a look that finds nothing new sends nothing; a request that nobody popped
+         *    (another change) notifies everybody again; the wait is bounded, and the NOTIFY that is sent when it ends does not repeat the ones that are done. */
+        {
+            const int ipc0 = g_notify_ipc[0], ipc1 = g_notify_ipc[1];
+            CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, g_notify_ipc) == 0);
+            int dst[8], nd;
+            char wv[64], wz[256];
+            int tries = 0;
+            g_nsa_n = 0;
+            batch_begin(a[0], &e, 46, KDB_BATCH_DIFF);
+            send_zone(a[0], &e, "s5a.test.", 1, 0, 320);                      /* www.s5a.test. = 192.0.2.81 */
+            send_zone(a[0], &e, "s5b.test.", 2, 0, 321);                      /* www.s5b.test. = 192.0.2.82 */
+            g_zone_ns = "www.s5a.test.";
+            g_zone_ns2 = "www.s5b.test.";
+            send_zone(a[0], &e, "n5.test.", 1, 0, 322);
+            g_zone_ns = g_zone_ns2 = NULL;
+            batch_end(a[0], &e, &mainc, 46, 3, 0);
+            CHECK(in_memory("n5.test."));
+            CHECK(evict_zone("s5a.test.") && evict_zone("s5b.test.") && stored_only("s5a.test.") && stored_only("s5b.test."));
+            (void)nt_take(dst, 8);
+            zone_db_snapshot_t *sn = acquire_retained_zone_snapshot();
+            bool held = false;
+            zone_db_entry_t *ne = dbreg_ctl_entry(sn, "default", "n5.test.", &held);
+            CHECK(ne != NULL);
+            if (ne) {
+                /* neither address is known: nothing is sent, both zones are asked for, the NOTIFY waits */
+                send_notify_to_all(ne);
+                CHECK(nt_take(dst, 8) == 0 && g_nsa_n == 2 && stored_only("s5a.test.") && stored_only("s5b.test."));
+                CHECK(notify_wait_count(false) == 1 && notify_wait_done("default", "n5.test.", &tries) == 0 && tries == 1);
+                /* s5a comes into memory (s5b is still on its way): the look sends to 192.0.2.81 only, and waits for the other */
+                CHECK(attach_by_worker("s5a.test.", &k) == 1);
+                (void)notify_wait_count(true);
+                CHECK(notify_wait_pop(wv, sizeof(wv), wz, sizeof(wz)));
+                notify_zone_by_name(wv, wz);
+                nd = nt_take(dst, 8);
+                CHECK(nd == 1 && dst[0] == 81);
+                CHECK(notify_wait_count(false) == 1 && notify_wait_done("default", "n5.test.", &tries) == 1 && tries == 2);
+                /* a look that finds nothing new (the attach is slow): nothing is sent, the one that is done is not sent again */
+                (void)notify_wait_count(true);
+                CHECK(notify_wait_pop(wv, sizeof(wv), wz, sizeof(wz)));
+                notify_zone_by_name(wv, wz);
+                CHECK(nt_take(dst, 8) == 0 && notify_wait_count(false) == 1 && notify_wait_done("default", "n5.test.", &tries) == 1 && tries == 3);
+                /* s5b comes into memory: the next look sends to 192.0.2.82 only and the wait is over */
+                CHECK(attach_by_worker("s5b.test.", &k) == 1);
+                (void)notify_wait_count(true);
+                CHECK(notify_wait_pop(wv, sizeof(wv), wz, sizeof(wz)));
+                notify_zone_by_name(wv, wz);
+                nd = nt_take(dst, 8);
+                CHECK(nd == 1 && dst[0] == 82 && notify_wait_count(false) == 0);
+                /* a request that nobody popped (the zone changed again, karictl notify) is a round of its own: both addresses */
+                send_notify_to_all(ne);
+                nd = nt_take(dst, 8);
+                CHECK(nd == 2 && ((dst[0] == 81 && dst[1] == 82) || (dst[0] == 82 && dst[1] == 81)) && notify_wait_count(false) == 0);
+
+                /* s5b goes out of memory again: 192.0.2.81 now, the wait for the other; a fresh request in the middle of the wait starts the round again (81 again, the tries from one) */
+                CHECK(evict_zone("s5b.test.") && stored_only("s5b.test."));
+                send_notify_to_all(ne);
+                nd = nt_take(dst, 8);
+                CHECK(nd == 1 && dst[0] == 81 && notify_wait_count(false) == 1);
+                for (int i = 0; i < 2; i++) {
+                    (void)notify_wait_count(true);
+                    CHECK(notify_wait_pop(wv, sizeof(wv), wz, sizeof(wz)));
+                    notify_zone_by_name(wv, wz);
+                }
+                CHECK(nt_take(dst, 8) == 0 && notify_wait_done("default", "n5.test.", &tries) == 1 && tries == 3);
+                send_notify_to_all(ne);
+                nd = nt_take(dst, 8);
+                CHECK(nd == 1 && dst[0] == 81 && notify_wait_done("default", "n5.test.", &tries) == 1 && tries == 1);
+
+                /* the zone never comes: a bounded number of looks (the first look made one try, 12 more looks use the rest: 12 tries), none of them repeats 192.0.2.81, and the wait ends */
+                int looks = 0, again = 0;
+                while (notify_wait_count(false) > 0 && looks < 40) {
+                    (void)notify_wait_count(true);
+                    if (!notify_wait_pop(wv, sizeof(wv), wz, sizeof(wz))) break;
+                    notify_zone_by_name(wv, wz);
+                    again += nt_take(dst, 8);
+                    looks++;
+                }
+                CHECK(notify_wait_count(false) == 0 && looks == 12 && again == 0);
+                CHECK(notify_wait_done("default", "n5.test.", &tries) == -1);
+                CHECK(attach_by_worker("s5b.test.", &k) == 1);
+                send_notify_to_all(ne);                                           /* (the next change of the zone: both again, nothing waits) */
+                CHECK(nt_take(dst, 8) == 2 && notify_wait_count(false) == 0);
+            }
+            if (ne && held) xfr_entry_release(ne);
+            release_zone_snapshot(sn);
+            close(g_notify_ipc[0]);
+            close(g_notify_ipc[1]);
+            g_notify_ipc[0] = ipc0;
+            g_notify_ipc[1] = ipc1;
         }
         g_query_bg_attach = no_bg_fetch;
         g_query_bg_fetch = no_bg_fetch;
@@ -2294,6 +2423,417 @@ static int run_fixes(const char *dir) {
     _exit(g_failed ? 1 : 0);
 }
 
+/* ---------------------------------------------------------------- phase 6: a fetched body is installed only for the stamp it was asked for */
+/* ingest-threads 2.  The check "the record still has the stamp the request was made for" (job_execute()) is made before the install, which takes a long time; the ingest thread (a CHANGES or manifest
+ * entry, a delete) does not wait for the builders.  The version that dbreg_commit() puts in the store gets the record's stamp, so before the fix an older body was installed under the newer stamp (the record
+ * said "current" and nothing fetched the zone again), and a zone that was deleted in between was written back.  The test hook of db_store_commit_begin() runs the other writer in the window, in a thread of its
+ * own, while two builders have a body each in hand: the newer stamp always wins, a zone that was deleted stays deleted, a body that was dropped is asked for again, and a writer that comes while the commit holds
+ * the step waits for it.  The same for a zone the store cannot name (the root zone: a zone of the heap directory). */
+enum { HK_UPSERT = 1, HK_DELETE, HK_INNER, HK_FAULT };
+typedef struct {
+    const char *zone;                   /* with the trailing dot */
+    int act;
+    int64_t sid;
+    uint64_t gen, time;                 /* the stamp the other writer records */
+    _Atomic bool used, mover_done, started, blocked_seen;
+    pthread_t th;
+} hk_t;
+#define HK_MAX 8
+static hk_t g_hk[HK_MAX];
+static int g_hk_n;
+static _Atomic int g_hk_arrived, g_hk_expect;
+static _Atomic bool g_hk_timeout;
+
+static void *hk_mover(void *arg) {
+    hk_t *h = arg;
+    if (h->act == HK_DELETE) {
+        (void)db_recon_delete("default", h->sid, h->zone);
+    } else {
+        db_recon_entry_t re;
+        memset(&re, 0, sizeof(re));
+        re.source_id = h->sid;
+        re.name = h->zone;
+        re.kind = KDB_ZK_PRIMARY;
+        re.stamped = true;
+        re.gen = h->gen;
+        re.time = h->time;
+        uint32_t zid;
+        (void)db_recon_change("default", &re, &zid);
+    }
+    atomic_store(&h->mover_done, true);
+    return NULL;
+}
+
+static void hk_start(hk_t *h) {
+    if (pthread_create(&h->th, NULL, hk_mover, h) == 0) atomic_store(&h->started, true);
+}
+
+static pthread_mutex_t g_hk_mu = PTHREAD_MUTEX_INITIALIZER;        /* (the table is set by the test thread and read by the builders: the socket between them is no synchronization TSan knows) */
+static void race_hook(int where, const char *zone) {
+    hk_t *h = NULL;
+    pthread_mutex_lock(&g_hk_mu);
+    for (int i = 0; i < g_hk_n && !h; i++)
+        if (g_hk[i].zone && strcmp(g_hk[i].zone, zone) == 0 && !atomic_load(&g_hk[i].used)) {
+            h = &g_hk[i];
+            if (h->act != HK_INNER || where == 1) atomic_store(&h->used, true);          /* (this call takes the case; an inner one is taken inside the step) */
+        }
+    pthread_mutex_unlock(&g_hk_mu);
+    if (!h) return;
+    if (h->act == HK_FAULT) {                                            /* (S5 leftover c: the record of the zone cannot be read when the builder takes the step: a damaged cell) */
+        if (where == 0) {
+            atomic_store(&db_store_test_rec_fault_zone, h->zone);
+            atomic_store(&h->mover_done, true);
+        }
+        return;
+    }
+    if (where == 0) {
+        atomic_fetch_add(&g_hk_arrived, 1);                              /* (both builders are inside the window before either goes on) */
+        for (int t = 0; t < 1000 && atomic_load(&g_hk_arrived) < atomic_load(&g_hk_expect); t++) usleep(10000);
+        if (atomic_load(&g_hk_arrived) < atomic_load(&g_hk_expect)) atomic_store(&g_hk_timeout, true);
+        if (h->act == HK_INNER) return;
+        hk_start(h);                                                      /* (the other writer runs to its end before this builder goes on) */
+        if (atomic_load(&h->started)) pthread_join(h->th, NULL);
+    } else if (h->act == HK_INNER) {
+        hk_start(h);                                                      /* (inside the step: the other writer has to wait for it) */
+        usleep(250000);
+        atomic_store(&h->blocked_seen, !atomic_load(&h->mover_done));
+    }
+}
+
+static void hk_set(int n, int act, const char *zone, int64_t sid, uint64_t gen, uint64_t time) {
+    pthread_mutex_lock(&g_hk_mu);
+    hk_t *h = &g_hk[n];
+    h->zone = zone;
+    h->act = act;
+    h->sid = sid;
+    h->gen = gen;
+    h->time = time;
+    atomic_store(&h->used, false);
+    atomic_store(&h->mover_done, false);
+    atomic_store(&h->started, false);
+    atomic_store(&h->blocked_seen, false);
+    if (n + 1 > g_hk_n) g_hk_n = n + 1;
+    pthread_mutex_unlock(&g_hk_mu);
+}
+
+typedef struct { char name[64]; uint64_t id; int64_t sid; } rq_t;
+/* the FETCH_REQs that come within `ms` of silence */
+static int rq_collect(ch_t *fc, rq_t *out, int max, int ms) {
+    int n = 0;
+    kdb_msg_t m;
+    while (ch_next(fc, &m, ms)) {
+        if (m.type != KDB_T_FETCH_REQ || n >= max) continue;
+        snprintf(out[n].name, sizeof(out[n].name), "%s", m.u.fetch_req.name);
+        out[n].id = m.u.fetch_req.request_id;
+        out[n].sid = m.u.fetch_req.source_id;
+        n++;
+    }
+    return n;
+}
+static const rq_t *rq_find(const rq_t *r, int n, const char *name) {
+    for (int i = 0; i < n; i++)
+        if (strcmp(r[i].name, name) == 0) return &r[i];
+    return NULL;
+}
+
+static void send_root_zone(int fd, kdb_enc_t *e, uint32_t serial, uint64_t req, int64_t sid) {
+    uint8_t dig[KDB_DIGEST_LEN];
+    memset(dig, (int)serial, sizeof(dig));
+    kdb_enc_begin(e, KDB_T_ZONE_BEGIN);
+    kdb_enc_u16(e, 1, 0); kdb_enc_name(e, 2, "."); kdb_enc_i64(e, 3, sid); kdb_enc_u8(e, 4, KDB_ZK_PRIMARY);
+    kdb_enc_u32(e, 5, serial); kdb_enc_u32(e, 6, 0); kdb_enc_u64(e, 7, 4); kdb_enc_bytes(e, 8, dig, sizeof(dig));
+    if (req) kdb_enc_u64(e, 11, req);
+    kdb_enc_end(e);
+    uint8_t msg[2048];
+    size_t n = zone_message(msg, "", serial);
+    kdb_enc_raw_msg(e, KDB_T_ZONE_DATA, msg, n);
+    kdb_enc_begin(e, KDB_T_ZONE_END);
+    kdb_enc_u64(e, 1, 4);
+    kdb_enc_end(e);
+    ch_send(fd, e);
+}
+
+static bool wait_rec(store_t *st, const char *name, uint8_t state, uint32_t serial, uint64_t gen, bool stale, int ms) {
+    store_zone_t z;
+    for (int t = 0; t < ms / 10; t++) {
+        if (zrec(st, name, &z) && z.state == state && z.serial == serial && z.stamp_gen == gen && ((z.flags & STORE_F_STALE) != 0) == stale) return true;
+        usleep(10000);
+    }
+    return false;
+}
+
+/* the record is written before the zone is registered (the put, then dbreg_commit()): a zone that is stored is in memory a moment later */
+static bool wait_mem(const char *zone, int ms) {
+    for (int t = 0; t < ms / 10; t++) {
+        if (in_memory(zone)) return true;
+        usleep(10000);
+    }
+    return false;
+}
+
+static int run_stamp_race(const char *dir) {
+    printf("[the store protocol: a fetched body is installed only for the stamp it was asked for (phase 6)]\n");
+    char sdir[600];
+    snprintf(sdir, sizeof(sdir), "%s/s", dir);
+    static server_config_t cfg;
+    char conf[2048];
+    snprintf(conf, sizeof(conf),
+             "options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; store \"%s\"; store-mode map; "
+             "store-threads 2; ingest-threads 2; }; };\n"
+             "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", sdir);
+    CHECK(parse_named_conf(conf, &cfg) == 0);
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    rebuild_zone_db_from_config(&cfg, false);
+    char msg[400];
+    CHECK(db_store_frontend_open(&cfg.database, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg)) && db_store_dir_fd() >= 0);
+    CHECK(db_store_start(&cfg) && db_store_enabled());
+    store_t *st = db_store_handle();
+    CHECK(st != NULL);
+    int a[2], f[2], cs[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, f) == 0 && socketpair(AF_UNIX, SOCK_SEQPACKET, 0, cs) == 0);
+    int ends[3] = { a[1], f[1], cs[1] };
+    for (int i = 0; i < 3; i++) fcntl(ends[i], F_SETFL, fcntl(ends[i], F_GETFL, 0) | O_NONBLOCK);
+    park_register_worker(0, -1);
+    db_store_test_commit_hook = race_hook;                              /* (before the builders exist: the hook does nothing for a zone that has no case) */
+    CHECK(db_ingest_start(a[1], cs[1], f[1]));
+    static ch_t mainc, fetchc;
+    ch_init(&mainc, a[0], KDB_FROM_BACKEND);
+    ch_init(&fetchc, f[0], KDB_FROM_BACKEND);
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    kdb_msg_t m;
+    memset(&g_wctx, 0, sizeof(g_wctx));
+    g_query_bg_fetch = no_bg_fetch;
+    g_query_bg_attach = no_bg_fetch;
+    kdb_enc_begin(&e, KDB_T_HELLO);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, KDB_FEAT_STORE);
+    kdb_enc_end(&e);
+    ch_send(a[0], &e);
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG && m.u.config.store_proto);
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_DEBUG);
+    store_zone_t z;
+    rq_t rq[16];
+    uint64_t bid = 1, cur = 100;
+    const int ZA = 2000, ZB = 2001, ZC = 2002, ZD = 2003;
+    char na[64], nb[64], nc[64], nd[64], ra[64], rb[64], rc[64], rd[64];
+    pn_name(na, sizeof(na), ZA); pn_name(nb, sizeof(nb), ZB); pn_name(nc, sizeof(nc), ZC); pn_name(nd, sizeof(nd), ZD);       /* "m2000.test." ... */
+    snprintf(ra, sizeof(ra), "m%04d.test", ZA); snprintf(rb, sizeof(rb), "m%04d.test", ZB); snprintf(rc, sizeof(rc), "m%04d.test", ZC); snprintf(rd, sizeof(rd), "m%04d.test", ZD);       /* (the names of the records: no dot) */
+    pc_t c[4];
+
+    /* -- zone C is in the store and in memory, with the stamp (1,10) */
+    memset(c, 0, sizeof(c));
+    c[0] = (pc_t){ .sid = p_sid(ZC), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 1, .time = 10 };  snprintf(c[0].name, sizeof(c[0].name), "%s", nc);
+    p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
+    p_changes(a[0], &e, bid, ++cur, true, c, 1);
+    p_batch_end(a[0], &e, bid++, 1, 0);
+    CHECK(p_result(&mainc, &m, 10000));
+    CHECK(rq_collect(&fetchc, rq, 16, 1500) == 1 && rq_find(rq, 1, nc));
+    send_zone(f[0], &e, nc, 1, rq[0].id, p_sid(ZC));
+    CHECK(wait_rec(st, rc, STORE_STATE_STORED, 1, 1, false, 10000) && wait_mem(nc, 5000));
+
+    /* -- round 1: two builders, each with a body in hand.  A: a new zone (no entry), the database changes it again in the window.  B: the database deletes it in the window. */
+    memset(c, 0, sizeof(c));
+    c[0] = (pc_t){ .sid = p_sid(ZA), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 1, .time = 10 };  snprintf(c[0].name, sizeof(c[0].name), "%s", na);
+    c[1] = (pc_t){ .sid = p_sid(ZB), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 1, .time = 10 };  snprintf(c[1].name, sizeof(c[1].name), "%s", nb);
+    p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
+    p_changes(a[0], &e, bid, ++cur, true, c, 2);
+    p_batch_end(a[0], &e, bid++, 2, 0);
+    CHECK(p_result(&mainc, &m, 10000));
+    int n = rq_collect(&fetchc, rq, 16, 1500);
+    CHECK(n == 2 && rq_find(rq, n, na) && rq_find(rq, n, nb));
+    hk_set(0, HK_UPSERT, na, p_sid(ZA), 2, 20);
+    hk_set(1, HK_DELETE, nb, p_sid(ZB), 0, 0);
+    atomic_store(&g_hk_arrived, 0);
+    atomic_store(&g_hk_expect, 2);
+    const rq_t *qa = rq_find(rq, n, na), *qb = rq_find(rq, n, nb);
+    if (qa && qb) {
+        send_zone(f[0], &e, na, 1, qa->id, p_sid(ZA));
+        send_zone(f[0], &e, nb, 1, qb->id, p_sid(ZB));
+    }
+    n = rq_collect(&fetchc, rq, 16, 3000);                               /* (A is asked for again, with the new stamp; B is gone and is not) */
+    CHECK(n == 1 && rq_find(rq, n, na) && !rq_find(rq, n, nb));
+    CHECK(!atomic_load(&g_hk_timeout) && atomic_load(&g_hk[0].mover_done) && atomic_load(&g_hk[1].mover_done));
+    CHECK(zrec(st, ra, &z) && z.state == STORE_STATE_KNOWN && z.stamp_gen == 2 && z.stamp_time == 20);       /* (before: STORED, serial 1, under the stamp 2, not stale: the body of the stamp 1 was "current") */
+    CHECK(!in_memory(na));
+    CHECK(!zrec(st, rb, &z) && dbreg_lookup_entry("default", nb) == NULL);                                   /* (before: the deleted zone was written back) */
+    qa = rq_find(rq, n, na);
+    if (qa) send_zone(f[0], &e, na, 2, qa->id, p_sid(ZA));
+    CHECK(wait_rec(st, ra, STORE_STATE_STORED, 2, 2, false, 10000) && wait_mem(na, 5000));
+    CHECK(zrec(st, ra, &z) && z.stamp_time == 20);
+
+    /* -- round 2: C is in memory (the body is installed into its entry in place).  The database changes it twice, the second time in the window: the store keeps the old image under the new stamp, marked stale,
+     *    and the zone is asked for again.  D: the other writer comes while the commit holds the step, and waits for it (the record is stored under the stamp it was asked for, and then marked stale). */
+    memset(c, 0, sizeof(c));
+    c[0] = (pc_t){ .sid = p_sid(ZC), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 2, .time = 20 };  snprintf(c[0].name, sizeof(c[0].name), "%s", nc);
+    c[1] = (pc_t){ .sid = p_sid(ZD), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 1, .time = 10 };  snprintf(c[1].name, sizeof(c[1].name), "%s", nd);
+    p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
+    p_changes(a[0], &e, bid, ++cur, true, c, 2);
+    p_batch_end(a[0], &e, bid++, 2, 0);
+    CHECK(p_result(&mainc, &m, 10000));
+    n = rq_collect(&fetchc, rq, 16, 1500);
+    CHECK(n == 2 && rq_find(rq, n, nc) && rq_find(rq, n, nd));
+    hk_set(2, HK_UPSERT, nc, p_sid(ZC), 3, 30);
+    hk_set(3, HK_INNER, nd, p_sid(ZD), 2, 20);
+    atomic_store(&g_hk_arrived, 0);
+    atomic_store(&g_hk_expect, 2);
+    const rq_t *qc = rq_find(rq, n, nc), *qd = rq_find(rq, n, nd);
+    if (qc && qd) {
+        send_zone(f[0], &e, nc, 2, qc->id, p_sid(ZC));
+        send_zone(f[0], &e, nd, 1, qd->id, p_sid(ZD));
+    }
+    n = rq_collect(&fetchc, rq, 16, 3000);                               /* (C is asked for again with the stamp 3; D may be, when the other writer was done before the fetch ended) */
+    CHECK(n >= 1 && n <= 2 && rq_find(rq, n, nc));
+    CHECK(!atomic_load(&g_hk_timeout) && atomic_load(&g_hk[2].mover_done));
+    CHECK(zrec(st, rc, &z) && z.state == STORE_STATE_STORED && z.serial == 1 && z.stamp_gen == 3 && z.stamp_time == 30 && (z.flags & STORE_F_STALE));       /* (before: serial 2, the body of the stamp 2, "current" under the stamp 3) */
+    CHECK(in_memory(nc));
+    CHECK(wait_rec(st, rd, STORE_STATE_STORED, 1, 2, true, 5000));                                            /* (D: put under the stamp 1, then the stamp 2 and stale; before: serial 1 under the stamp 2, not stale) */
+    CHECK(atomic_load(&g_hk[3].blocked_seen));                                                               /* (the other writer had not finished when the builder left the step) */
+    if (atomic_load(&g_hk[3].started)) pthread_join(g_hk[3].th, NULL);
+    CHECK(atomic_load(&g_hk[3].mover_done));
+    qc = rq_find(rq, n, nc);
+    qd = rq_find(rq, n, nd);
+    if (qc) send_zone(f[0], &e, nc, 3, qc->id, p_sid(ZC));
+    CHECK(wait_rec(st, rc, STORE_STATE_STORED, 3, 3, false, 10000));
+    if (!qd) {                                                           /* (D was not asked for again yet: a forced entry asks for it) */
+        c[0] = (pc_t){ .sid = p_sid(ZD), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 2, .time = 20, .force = true };  snprintf(c[0].name, sizeof(c[0].name), "%s", nd);
+        p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
+        p_changes(a[0], &e, bid, ++cur, true, c, 1);
+        p_batch_end(a[0], &e, bid++, 1, 0);
+        CHECK(p_result(&mainc, &m, 10000));
+        n = rq_collect(&fetchc, rq, 16, 1500);
+        qd = rq_find(rq, n, nd);
+        CHECK(qd != NULL);
+    }
+    if (qd) send_zone(f[0], &e, nd, 2, qd->id, p_sid(ZD));
+    CHECK(wait_rec(st, rd, STORE_STATE_STORED, 2, 2, false, 10000));
+    CHECK(zrec(st, rc, &z) && z.stamp_time == 30);
+
+    /* -- round 3: a zone the store cannot name (the root zone) is a zone of the heap directory; its stamp is the entry's in the list of the Backend.  The same two cases. */
+    {
+        pc_t rc0[1];
+        memset(rc0, 0, sizeof(rc0));
+        rc0[0] = (pc_t){ .sid = 9100, .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 1, .time = 5 };  snprintf(rc0[0].name, sizeof(rc0[0].name), ".");
+        p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
+        p_changes(a[0], &e, bid, ++cur, true, rc0, 1);
+        p_batch_end(a[0], &e, bid++, 1, 0);
+        CHECK(p_result(&mainc, &m, 10000));
+        n = rq_collect(&fetchc, rq, 16, 1500);
+        CHECK(n == 1 && rq_find(rq, n, "."));
+        hk_set(4, HK_UPSERT, ".", 9100, 2, 5);
+        atomic_store(&g_hk_arrived, 0);
+        atomic_store(&g_hk_expect, 1);
+        if (n == 1) send_root_zone(f[0], &e, 1, rq[0].id, 9100);
+        n = rq_collect(&fetchc, rq, 16, 3000);                           /* (the body of the stamp 1 is dropped; the zone is asked for again) */
+        CHECK(n == 1 && rq_find(rq, n, "."));
+        CHECK(atomic_load(&g_hk[4].mover_done) && dbreg_lookup_entry("default", ".") == NULL);       /* (before: the body was installed) */
+        if (n == 1) send_root_zone(f[0], &e, 2, rq[0].id, 9100);
+        int64_t sid;
+        uint32_t sr = 0;
+        bool have = false;
+        for (int t = 0; t < 500 && !have; t++) { have = dbreg_zone_version("default", ".", &sid, &sr) && sr == 2; if (!have) usleep(10000); }
+        CHECK(have && dbreg_lookup_entry("default", ".") != NULL);
+        /* the database deletes the zone in the window: it stays deleted */
+        rc0[0].gen = 3;
+        p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
+        p_changes(a[0], &e, bid, ++cur, true, rc0, 1);
+        p_batch_end(a[0], &e, bid++, 1, 0);
+        CHECK(p_result(&mainc, &m, 10000));
+        n = rq_collect(&fetchc, rq, 16, 1500);
+        CHECK(n == 1 && rq_find(rq, n, "."));
+        hk_set(5, HK_DELETE, ".", 9100, 0, 0);
+        atomic_store(&g_hk_arrived, 0);
+        atomic_store(&g_hk_expect, 1);
+        if (n == 1) send_root_zone(f[0], &e, 3, rq[0].id, 9100);
+        n = rq_collect(&fetchc, rq, 16, 1500);
+        CHECK(n == 0);
+        CHECK(atomic_load(&g_hk[5].mover_done) && dbreg_lookup_entry("default", ".") == NULL);
+        db_recon_status_t rs;
+        db_recon_status(&rs);
+        CHECK(rs.nonstore == 0);
+    }
+
+    /* -- round 2b (S5 leftover c): C is in memory and stored.  The database changes it (the stamp 4); when the builder takes the step the record cannot be read (a damaged cell: the answer of the store is
+     *    "gone").  The body was installed into the zone in memory, so the zone's element was marked busy for the install, and no commit follows: the mark must go (before: it stayed, and the zone could never be
+     *    taken out of memory again).  */
+    memset(c, 0, sizeof(c));
+    c[0] = (pc_t){ .sid = p_sid(ZC), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 4, .time = 40 };  snprintf(c[0].name, sizeof(c[0].name), "%s", nc);
+    p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
+    p_changes(a[0], &e, bid, ++cur, true, c, 1);
+    p_batch_end(a[0], &e, bid++, 1, 0);
+    CHECK(p_result(&mainc, &m, 10000));
+    n = rq_collect(&fetchc, rq, 16, 1500);
+    CHECK(n == 1 && rq_find(rq, n, nc));
+    hk_set(6, HK_FAULT, nc, p_sid(ZC), 0, 0);
+    qc = rq_find(rq, n, nc);
+    if (qc) send_zone(f[0], &e, nc, 4, qc->id, p_sid(ZC));
+    for (int t = 0; t < 500 && !atomic_load(&g_hk[6].used); t++) usleep(10000);
+    CHECK(atomic_load(&g_hk[6].used));
+    {
+        bool unbusy = false;
+        for (int t = 0; t < 300 && !unbusy; t++) {
+            zref_t zr;
+            unbusy = zref_of(nc, &zr) && zr.el && !(dbreg_test_flags("default", nc) & ZDIR_F_BUSY) && zr.entry && atomic_load(&zr.entry->serial) == 4;       /* (the body was installed in memory, and the mark is gone) */
+            if (!unbusy) usleep(10000);
+        }
+        CHECK(unbusy);
+    }
+    atomic_store(&db_store_test_rec_fault_zone, NULL);
+
+    /* -- round 2c (S5 leftover b): a body that is refused marks the store's record (it is not asked for again with this stamp) only when the record still has the stamp the body was asked for.  D: the database
+     *    changes the zone again in the window (stamp 6): the refusal is not the newer version's, the record is not marked.  C: nothing moves: the record is marked. */
+    memset(c, 0, sizeof(c));
+    c[0] = (pc_t){ .sid = p_sid(ZD), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 5, .time = 50 };  snprintf(c[0].name, sizeof(c[0].name), "%s", nd);
+    c[1] = (pc_t){ .sid = p_sid(ZC), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 7, .time = 70 };  snprintf(c[1].name, sizeof(c[1].name), "%s", nc);
+    p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
+    p_changes(a[0], &e, bid, ++cur, true, c, 2);
+    p_batch_end(a[0], &e, bid++, 2, 0);
+    CHECK(p_result(&mainc, &m, 10000));
+    n = rq_collect(&fetchc, rq, 16, 1500);
+    CHECK(n >= 2 && rq_find(rq, n, nc) && rq_find(rq, n, nd));
+    hk_set(7, HK_UPSERT, nd, p_sid(ZD), 6, 60);
+    atomic_store(&g_hk_arrived, 0);
+    atomic_store(&g_hk_expect, 1);
+    qc = rq_find(rq, n, nc);
+    qd = rq_find(rq, n, nd);
+    if (qd) send_bad_zone(f[0], &e, nd, 5, qd->id, p_sid(ZD));
+    for (int t = 0; t < 500 && !atomic_load(&g_hk[7].mover_done); t++) usleep(10000);
+    CHECK(atomic_load(&g_hk[7].mover_done));
+    if (qc) send_bad_zone(f[0], &e, nc, 7, qc->id, p_sid(ZC));
+    for (int t = 0; t < 500; t++) {
+        char txt[200];
+        if (dbreg_err_get("default", nc, 0xFFFFFFFFu, txt, sizeof(txt)) || (zrec(st, rc, &z) && (z.flags & STORE_F_REJECTED_NEW))) break;
+        usleep(10000);
+    }
+    {
+        char txt[200];
+        usleep(200000);
+        CHECK(zrec(st, rd, &z) && z.stamp_gen == 6 && z.stamp_time == 60 && !(z.flags & STORE_F_REJECTED_NEW));         /* (D: before: marked, and the stamp 6 was not asked for again) */
+        CHECK(dbreg_err_get("default", nd, z.zid, txt, sizeof(txt)) && strstr(txt, "SOA serial") != NULL);                  /* (the text of the refusal is kept either way) */
+        CHECK(zrec(st, rc, &z) && z.stamp_gen == 7 && (z.flags & STORE_F_REJECTED_NEW));                                     /* (C: the stamp is the one that was asked for) */
+        CHECK(dbreg_err_get("default", nc, z.zid, txt, sizeof(txt)) && strstr(txt, "SOA serial") != NULL);
+    }
+    n = rq_collect(&fetchc, rq, 16, 500);                                /* (what the background scan asked for meanwhile) */
+    memset(c, 0, sizeof(c));                                             /* (D's body for the stamp 6 is asked for and sent, so that the zones are quiet for the next round) */
+    c[0] = (pc_t){ .sid = p_sid(ZD), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 6, .time = 60, .force = true };  snprintf(c[0].name, sizeof(c[0].name), "%s", nd);
+    p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
+    p_changes(a[0], &e, bid, ++cur, true, c, 1);
+    p_batch_end(a[0], &e, bid++, 1, 0);
+    CHECK(p_result(&mainc, &m, 10000));
+    n += rq_collect(&fetchc, rq + n, 16 - n, 1500);
+    qd = rq_find(rq, n, nd);
+    CHECK(qd != NULL);
+    if (qd) send_zone(f[0], &e, nd, 6, qd->id, p_sid(ZD));
+    CHECK(wait_rec(st, rd, STORE_STATE_STORED, 6, 6, false, 10000));
+    n = rq_collect(&fetchc, rq, 16, 500);
+    CHECK(n == 0 || (n == 1 && rq_find(rq, n, nc) == NULL));
+    CHECK(!atomic_load(&g_hk_timeout));
+    gc_snapshot_wait_idle();                                             /* (the reclaim thread that the last delta started: joined, not left to the exit) */
+    db_store_batch_end();
+    printf("%d checks, %d failed\n", g_checks, g_failed);
+    fflush(stdout);
+    _exit(g_failed ? 1 : 0);
+}
+
 /* phase 4: a legacy loader (no store protocol) installs three zones with three settings texts; the process ends without a clean stop.  Phase 5: the next start, with the second record of settings.dat made
  * unusable by the test (no room for its id): the file is not cut, the ids of the others are what they were, and a new text gets the next id */
 static int run_settings(int phase, const char *dir) {
@@ -2392,17 +2932,267 @@ static int run_settings(int phase, const char *dir) {
     _exit(g_failed ? 1 : 0);
 }
 
+/* ---------------------------------------------------------------- S5: the light entry, the statistics of the zones that leave memory, eviction by samples, the attach table, the leftovers */
+/* `test_db_store s5 [map|copy]` (its own process: the ingest thread and the store are process wide) */
+void stats_collect_totals(zone_db_snapshot_t *snap, karidns_stats_total_t *t);        /* (dns_server_core.c, unit-test builds) */
+
+static int run_s5(const char *mode) {
+    printf("[S5: the light entry, the counters of the zones that leave memory, eviction by samples, the attach table, rejected zones, the four leftovers: %s mode]\n", mode);
+    char dir[] = "/tmp/test_db_store_s5.XXXXXX";
+    if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+    char sdir[600];
+    snprintf(sdir, sizeof(sdir), "%s/s", dir);
+    static server_config_t cfg;
+    char conf[2048];
+    snprintf(conf, sizeof(conf),
+             "options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; store \"%s\"; store-mode %s; store-threads 2; }; };\n"
+             "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", sdir, mode);
+    CHECK(parse_named_conf(conf, &cfg) == 0);
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    rebuild_zone_db_from_config(&cfg, false);
+    char msg[400];
+    CHECK(db_store_frontend_open(&cfg.database, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg)) && db_store_dir_fd() >= 0);
+    CHECK(db_store_start(&cfg) && db_store_enabled() && dbdir() != NULL);
+    int a[2], f[2], cs[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, f) == 0 && socketpair(AF_UNIX, SOCK_SEQPACKET, 0, cs) == 0);
+    int ends[3] = { a[1], f[1], cs[1] };
+    for (int i = 0; i < 3; i++) fcntl(ends[i], F_SETFL, fcntl(ends[i], F_GETFL, 0) | O_NONBLOCK);
+    park_register_worker(0, -1);
+    CHECK(db_ingest_start(a[1], cs[1], f[1]));
+    static ch_t mainc, fetchc;
+    ch_init(&mainc, a[0], KDB_FROM_BACKEND);
+    ch_init(&fetchc, f[0], KDB_FROM_BACKEND);
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    kdb_msg_t m;
+    kdb_enc_begin(&e, KDB_T_HELLO);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242);
+    kdb_enc_end(&e);
+    ch_send(a[0], &e);
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG);
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_DEBUG);
+    memset(&g_wctx, 0, sizeof(g_wctx));
+    g_query_bg_fetch = no_bg_fetch;
+    g_query_bg_attach = no_bg_fetch;
+    store_t *st = db_store_handle();
+    CHECK(st != NULL);
+    dbreg_cache_test_pause(true);                                          /* (the manager's thread does not run rounds by itself: the test calls them) */
+
+    enum { NZ = 900 };
+    static char nm[NZ][24];
+    batch_begin(a[0], &e, 1, KDB_BATCH_STARTUP);
+    for (int i = 0; i < NZ; i++) {
+        snprintf(nm[i], sizeof(nm[i]), "s%04d.test.", i);
+        send_zone(a[0], &e, nm[i], 1, 0, 5000 + i);
+    }
+    batch_end(a[0], &e, &mainc, 1, NZ, 0);
+    for (int i = 0; i < 300 && dbdir()->attach_count() < (size_t)NZ; i++) usleep(50000);
+    CHECK(dbdir()->attach_count() == (size_t)NZ);
+
+    /* -- 1. the entry of an attached zone is the core alone, in a slot of the pool; the extension is made by what needs it */
+    {
+        zref_t zr;
+        CHECK(zref_of(nm[1], &zr) && zr.entry != NULL);
+        zone_db_entry_t *en = zr.entry;
+        CHECK(en && en->light && en->pooled && en->block_bytes == 256 && zone_x(en) == NULL);
+        zone_entry_pool_stats_t ps;
+        zone_entry_pool_stats(&ps);
+        CHECK(ps.used >= (uint64_t)NZ && ps.slabs >= 1 && ps.slot_bytes == 256);
+        CHECK(sizeof(zone_db_entry_t) <= 224);
+        printf("  entry: sizeof(zone_db_entry_t) %zu, slot %llu octets, %llu entries in %llu slab(s) of the pool\n", sizeof(zone_db_entry_t), (unsigned long long)ps.slot_bytes, (unsigned long long)ps.used,
+               (unsigned long long)ps.slabs);
+    }
+
+    /* -- 2. the counters of a zone are the core's; what is folded when the zone leaves memory is in the totals of the view and in the table of the top zones */
+    uint8_t out[1500];
+    {
+        for (int i = 0; i < 25; i++) CHECK(ask_engine(&g_wctx, &g_cc, nm[1], 6, out) > 12);
+        for (int i = 0; i < 3; i++) (void)ask_engine(&g_wctx, &g_cc, "nx.s0001.test.", 1, out);        /* (NXDOMAIN) */
+        zref_t zr;
+        CHECK(zref_of(nm[1], &zr) && zr.entry);
+        CHECK(zr.entry && zone_ctr_get(zr.entry, ZCTR_QUERIES) == 28 && zone_ctr_get(zr.entry, ZCTR_NXDOMAIN) == 3 && zone_ctr_get(zr.entry, ZCTR_NOERROR) == 25);
+        uint64_t f0[ZCTR_N], f1[ZCTR_N], z0, z1;
+        dbreg_fold_totals(f0, &z0);
+        CHECK(f0[ZCTR_QUERIES] == 0 && z0 == 0);
+        CHECK(evict_zone(nm[1]));
+        dbreg_fold_totals(f1, &z1);
+        CHECK(f1[ZCTR_QUERIES] == 28 && f1[ZCTR_NXDOMAIN] == 3 && f1[ZCTR_NOERROR] == 25 && z1 == 1);
+        uint64_t fv[ZCTR_N], zv;
+        CHECK(dbreg_fold_view_totals("default", fv, &zv) && fv[ZCTR_QUERIES] == 28 && zv == 1);
+        CHECK(!dbreg_fold_view_totals("nosuch", fv, &zv) && fv[ZCTR_QUERIES] == 0);
+        zone_fold_row_t rows[ZFOLD_TOPK];
+        size_t nr = dbreg_fold_topk(rows, ZFOLD_TOPK);
+        CHECK(nr == 1 && strcmp(rows[0].zone, nm[1]) == 0 && strcmp(rows[0].view, "default") == 0 && rows[0].c[ZCTR_QUERIES] == 28 && rows[0].detaches == 1);
+        karidns_stats_total_t tot;
+        rcu_aux_read_lock();
+        zone_db_snapshot_t *sn = acquire_zone_snapshot();
+        stats_collect_totals(sn, &tot);
+        rcu_aux_read_unlock();
+        CHECK(tot.queries_total == 28 && tot.responses_nxdomain == 3 && tot.responses_noerror == 25);       /* (the totals do not go back when the zone leaves memory: the alerts look at their change) */
+        /* a zone with no queries leaves no row, and the zone that comes back counts from zero (its row is not listed while it is in memory) */
+        CHECK(evict_zone(nm[2]));
+        nr = dbreg_fold_topk(rows, ZFOLD_TOPK);
+        CHECK(nr == 1);
+        db_store_attach_zone("default", nm[1]);
+        CHECK(zref_of(nm[1], &zr) && zr.entry && zone_ctr_get(zr.entry, ZCTR_QUERIES) == 0);
+        nr = dbreg_fold_topk(rows, ZFOLD_TOPK);
+        CHECK(nr == 0);
+        for (int i = 0; i < 4; i++) (void)ask_engine(&g_wctx, &g_cc, nm[1], 6, out);
+        CHECK(evict_zone(nm[1]));
+        nr = dbreg_fold_topk(rows, ZFOLD_TOPK);
+        CHECK(nr == 1 && rows[0].c[ZCTR_QUERIES] == 32 && rows[0].detaches == 2);                    /* (the stays are added) */
+        dbreg_fold_totals(f1, &z1);
+        CHECK(f1[ZCTR_QUERIES] == 32 && z1 == 3);
+        /* the zone is deleted from the database: the row goes, the totals stay */
+        db_store_attach_zone("default", nm[2]);
+        db_store_attach_zone("default", nm[1]);
+        CHECK(in_memory(nm[1]) && in_memory(nm[2]));
+    }
+
+    /* -- 3. eviction by samples: the registry is not walked; the cold zones go, the hot zone and the pinned zone stay; the attach table gets smaller after a mass detach */
+    {
+        zref_t zr;
+        for (int i = 0; i < 60; i++) (void)ask_engine(&g_wctx, &g_cc, nm[100], 6, out);              /* (the hot zone) */
+        CHECK(zref_of(nm[200], &zr) && zr.el);
+        dbreg_test_pin("default", nm[200], true);                                                   /* (the pinned zone: counted in the pinned total like a zone whose settings pin it) */
+        usleep(300000);                                                                             /* (older than the minimum residency) */
+        const uint64_t res0 = resident_bytes();
+        const uint64_t cap0 = dbdir()->counters(5);
+        CHECK(res0 > 0 && cap0 >= 1024);
+        dbreg_cache_stats_t cs0, cs1;
+        dbreg_cache_stats(&cs0);
+        dbreg_cache_set_limit(res0 * 55 / 100);
+        dbreg_cache_test_pause(false);
+        uint32_t taken = 0;
+        for (int round = 0; round < 400 && dbdir()->attach_count() > (size_t)NZ / 2; round++) {
+            taken += dbreg_cache_round();
+            usleep(20000);
+        }
+        dbreg_cache_set_limit(0);
+        dbreg_cache_test_pause(true);
+        for (int i = 0; i < 100 && dbreg_evict_inflight() != 0; i++) usleep(25000);
+        dbreg_cache_stats(&cs1);
+        const size_t left = dbdir()->attach_count();
+        printf("  samples: %u zones taken out by the manager, %zu of %d left, resident %llu -> %llu\n", taken, left, NZ, (unsigned long long)res0, (unsigned long long)resident_bytes());
+        CHECK(taken >= 100 && left <= (size_t)NZ * 6 / 10 && left >= 20);
+        CHECK(resident_bytes() < res0);
+        CHECK(cs1.evictions >= cs0.evictions + taken && cs1.sampled >= cs0.sampled + taken);         /* (every one of them was found by a sample) */
+        CHECK(in_memory(nm[100]));                                                                   /* (the hot zone: its priority is the highest of all) */
+        CHECK(in_memory(nm[200]));                                                                   /* (the pinned zone) */
+        CHECK(cs1.pinned_bytes > 0);                                                                 /* (counted when the zone was registered, not by a walk) */
+        /* what is still attached is found, and what is not is answered from the store */
+        CHECK(stored_only(nm[2]) || in_memory(nm[2]));
+        dbreg_test_pin("default", nm[200], false);
+        /* the attach table is smaller after a mass detach */
+        const uint64_t grows = dbdir()->counters(6);
+        (void)grows;
+        const uint64_t cap1 = dbdir()->counters(5);
+        for (int i = 0; i < NZ; i++)
+            if (in_memory(nm[i])) (void)dbreg_test_evict("default", nm[i]);
+        for (int i = 0; i < 200 && dbreg_evict_inflight() != 0; i++) usleep(25000);
+        CHECK(dbdir()->attach_count() == 0);
+        const uint64_t cap2 = dbdir()->counters(5);
+        printf("  attach table: %llu slots with %d zones, %llu slots with none (%llu shrinks)\n", (unsigned long long)cap1, NZ, (unsigned long long)cap2, (unsigned long long)dbdir()->counters(7));
+        CHECK(cap1 > 1024 && cap2 == 1024 && dbdir()->counters(7) >= 1);
+    }
+
+    /* -- 4. a rejected zone has no element: its text is in the ring, its record says so */
+    {
+        size_t nel0, rb0, ib0, nel1, rb1, ib1;
+        CHECK(stored_only(nm[10]));
+        dbreg_dir_bytes(&nel0, &rb0, &ib0);
+        CHECK(dbreg_reject_ex("default", nm[10], 5010, "the body was refused: boom", true));
+        dbreg_dir_bytes(&nel1, &rb1, &ib1);
+        CHECK(nel1 == nel0);                                                                         /* (no registry element for the text) */
+        dbdir_rec_t rec;
+        CHECK(dbdir()->rec_get("default", nm[10], &rec) && (rec.flags & STORE_F_REJECTED_NEW));
+        dbreg_info_t info[2];
+        CHECK(dbreg_find_info("default", nm[10], info, 2) == 1 && info[0].last_result == DBREG_REJECTED && strcmp(info[0].error, "the body was refused: boom") == 0 && !info[0].has_entry);
+        size_t total, rejected, shc, shk;
+        dbreg_counts2(&total, &rejected, &shc, &shk);
+        CHECK(rejected >= 1);
+        char st_text[2000];
+        size_t stl = db_ingest_status("s0010.test.", "default", st_text, sizeof(st_text));
+        CHECK(stl > 0 && strstr(st_text, "status rejected") && strstr(st_text, "last error: the body was refused: boom"));
+        /* the same, not marking the record (the stamp the body was asked for is not the record's any more) */
+        CHECK(stored_only(nm[11]));
+        CHECK(dbreg_reject_ex("default", nm[11], 5011, "refused", false));
+        CHECK(dbdir()->rec_get("default", nm[11], &rec) && !(rec.flags & STORE_F_REJECTED_NEW));
+        CHECK(dbreg_err_get("default", nm[11], rec.zid, st_text, sizeof(st_text)) && strcmp(st_text, "refused") == 0);
+        /* an attach that registers a version forgets the text */
+        db_store_attach_zone("default", nm[11]);
+        CHECK(in_memory(nm[11]) && !dbreg_err_get("default", nm[11], rec.zid, st_text, sizeof(st_text)));
+        CHECK(dbreg_find_info("default", nm[11], info, 2) == 1 && info[0].last_result == DBREG_APPLIED && info[0].error[0] == '\0');
+        dbreg_err_note("default", nm[10], rec.zid, NULL);
+    }
+
+    /* -- 5. leftovers.  (c) a zone that the ingest marked busy and does not commit is not busy for ever; (d) an element of the attach table without its entry is "not in memory", not "no zone" */
+    {
+        zref_t zr;
+        db_store_attach_zone("default", nm[20]);
+        CHECK(zref_of(nm[20], &zr) && zr.el && zr.entry);
+        zone_db_entry_t *be = dbreg_lookup_entry_busy("default", nm[20]);
+        CHECK(be != NULL && (zr.el->flags & ZDIR_F_BUSY));
+        CHECK(!dbreg_test_evict("default", nm[20]));                                                 /* (busy: not taken out) */
+        dbreg_busy_clear("default", nm[20]);
+        CHECK(!(zr.el->flags & ZDIR_F_BUSY));
+        /* (d) */
+        zone_db_entry_t *keep = zr.entry;
+        atomic_store(&zr.el->entry, NULL);
+        zref_t z2;
+        CHECK(zref_of(nm[20], &z2));
+        CHECK(z2.el == zr.el && z2.entry == NULL && z2.zid == zr.el->zid && zref_present(&z2) && !z2.busy);        /* (before: the lookup said "no such zone" and nothing waited) */
+        rcu_aux_read_lock();
+        zone_db_snapshot_t *sn = acquire_zone_snapshot();
+        zref_t z3;
+        zref_clear(&z3);
+        zone_db_entry_t *fe2 = find_zone_for_query_zref(snapshot_find_view(sn, "default"), "www.s0020.test.", 1, &z3);
+        rcu_aux_read_unlock();
+        CHECK(fe2 == NULL && zref_present(&z3) && z3.el == zr.el);
+        atomic_store(&zr.el->entry, keep);
+        CHECK(in_memory(nm[20]));
+        /* (a) a version the store cannot take: the zone is pinned in memory and stays pinned (zdir_elem_sync() of the same commit made the flags again) */
+        zone_db_entry_t *ae = zr.entry;
+        CHECK(ae != NULL);
+        dbdir_rec_t rec;
+        CHECK(dbdir()->rec_get("default", nm[20], &rec));
+        g_fx_zid = STORE_NONE;                                                                       /* (the store passes no zone id for a put) */
+        g_fx_op = "put";
+        g_fx_err = -ENOSPC;
+        store_test_write_fault = fx_fault;
+        batch_begin(a[0], &e, 2, KDB_BATCH_DIFF);
+        send_zone(a[0], &e, nm[20], 2, 0, 5020);
+        batch_end(a[0], &e, &mainc, 2, 1, 0);
+        g_fx_op = NULL;
+        CHECK(zref_of(nm[20], &z2) && z2.entry && z2.el == zr.el && zdir_serial(z2.el) == 2);
+        CHECK((zr.el->flags & ZDIR_F_PIN) != 0);                                                     /* (before: the sync of the same commit cleared it) */
+        CHECK(!dbreg_test_evict("default", nm[20]));                                                 /* (pinned: it is the only copy of the new version) */
+        batch_begin(a[0], &e, 3, KDB_BATCH_DIFF);                                                   /* the store takes the next version: no pin is needed any more */
+        send_zone(a[0], &e, nm[20], 3, 0, 5020);
+        batch_end(a[0], &e, &mainc, 3, 1, 0);
+        CHECK(zref_of(nm[20], &z2) && z2.el && zdir_serial(z2.el) == 3 && !(z2.el->flags & ZDIR_F_PIN));
+        store_test_write_fault = NULL;
+    }
+    gc_snapshot_wait_idle();
+    printf("%d checks, %d failed\n", g_checks, g_failed);
+    char rm[700];
+    snprintf(rm, sizeof(rm), "rm -rf %s", dir);
+    (void)!system(rm);
+    fflush(stdout);
+    _exit(g_failed ? 1 : 0);
+}
+
 static int proto_main(const char *self) {
     char dir[600];
     const char *tmp = getenv("TMPDIR");
     snprintf(dir, sizeof(dir), "%s/test_db_store_proto.XXXXXX", tmp && *tmp ? tmp : "/tmp");
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
     int bad = 0;
-    for (int phase = 0; phase < 6; phase++) {
+    for (int phase = 0; phase < 7; phase++) {
         char cmd[900];
         snprintf(cmd, sizeof(cmd), "%s proto%d %s", self, phase, dir);
         if (system(cmd) != 0) bad++;
-        if (phase == 0 || phase == 2 || phase == 3) {                    /* (phase 0 is the legacy loader on an empty store, phase 3 the fixes of the review, phase 4 the settings: the next phases start on a new store; phase 5 follows phase 4 on its store) */
+        if (phase == 0 || phase == 2 || phase == 3 || phase == 5) {                   /* (phase 0 is the legacy loader on an empty store, phase 3 the fixes of the review, phase 4 the settings: the next phases start on a new store; phase 5 follows phase 4 on its store) */
             char rm[700];
             snprintf(rm, sizeof(rm), "rm -rf %s/s", dir);
             (void)!system(rm);
@@ -2471,8 +3261,119 @@ static int lock_tests(void) {
     return 0;
 }
 
+/* ---------------------------------------------------------------- S5: what an attached zone costs in the heap */
+/* `test_db_store heap [zones] [map|copy]`: install N small zones (they are attached at once), and read the allocator's byte count before and after: the Backend heap per attached zone
+ * (the entry with its block, the version, the settings, the registry element, the attach table; the image bytes in COPY mode).  The numbers are printed; the checks are that every zone
+ * is attached and that the figure is under a generous bound.  jemalloc only (FreeBSD). */
+#ifdef __FreeBSD__
+#include <malloc_np.h>
+#include <sys/resource.h>
+static uint64_t heap_allocated(void) {
+    uint64_t epoch = 1;
+    size_t l = sizeof(epoch);
+    (void)mallctl("epoch", &epoch, &l, &epoch, l);
+    size_t v = 0;
+    l = sizeof(v);
+    if (mallctl("stats.allocated", &v, &l, NULL, 0) != 0) return 0;
+    return (uint64_t)v;
+}
+#else
+static uint64_t heap_allocated(void) { return 0; }
+#endif
+static int run_heap(int nz, const char *mode) {
+    printf("[heap per attached zone: %d zones, %s mode]\n", nz, mode);
+    char dir[] = "/tmp/test_db_store_heap.XXXXXX";
+    if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+    char sdir[600];
+    snprintf(sdir, sizeof(sdir), "%s/s", dir);
+    static server_config_t cfg;
+    char conf[2048];
+    snprintf(conf, sizeof(conf),
+             "options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; store \"%s\"; store-mode %s; store-threads 2; }; };\n"
+             "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", sdir, mode);
+    CHECK(parse_named_conf(conf, &cfg) == 0);
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    rebuild_zone_db_from_config(&cfg, false);
+    char msg[400];
+    CHECK(db_store_frontend_open(&cfg.database, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg)) && db_store_dir_fd() >= 0);
+    CHECK(db_store_start(&cfg) && db_store_enabled() && dbdir() != NULL);
+    int a[2], f[2], cs[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, f) == 0 && socketpair(AF_UNIX, SOCK_SEQPACKET, 0, cs) == 0);
+    int ends[3] = { a[1], f[1], cs[1] };
+    for (int i = 0; i < 3; i++) fcntl(ends[i], F_SETFL, fcntl(ends[i], F_GETFL, 0) | O_NONBLOCK);
+    park_register_worker(0, -1);
+    CHECK(db_ingest_start(a[1], cs[1], f[1]));
+    static ch_t mainc, fetchc;
+    ch_init(&mainc, a[0], KDB_FROM_BACKEND);
+    ch_init(&fetchc, f[0], KDB_FROM_BACKEND);
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    kdb_msg_t m;
+    kdb_enc_begin(&e, KDB_T_HELLO);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242);
+    kdb_enc_end(&e);
+    ch_send(a[0], &e);
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG);
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_DEBUG);
+    usleep(200000);
+    const uint64_t h0 = heap_allocated();
+    const int per = 2500;
+    for (int b = 0; b * per < nz; b++) {
+        batch_begin(a[0], &e, (uint64_t)b + 1, b == 0 ? KDB_BATCH_STARTUP : KDB_BATCH_DIFF);
+        int n = nz - b * per < per ? nz - b * per : per;
+        for (int i = 0; i < n; i++) {
+            char zn[32];
+            snprintf(zn, sizeof(zn), "z%07d.test.", b * per + i);
+            send_zone(a[0], &e, zn, 1, 0, 10000 + b * per + i);
+        }
+        batch_end(a[0], &e, &mainc, (uint64_t)b + 1, (uint32_t)n, 0);
+    }
+    for (int i = 0; i < 600 && dbdir()->attach_count() < (size_t)nz; i++) usleep(100000);
+    usleep(500000);
+    const size_t att = dbdir()->attach_count();
+    const uint64_t h1 = heap_allocated();
+    CHECK(att == (size_t)nz);
+    printf("  attached %zu zones; sizeof(zone_db_entry_t) %zu, sizeof(zdir_elem_t) %zu, sizeof(zone_config_t) %zu, sizeof(zone_version_t) %zu, sizeof(zone_x_t) %zu\n", att, sizeof(zone_db_entry_t), sizeof(zdir_elem_t),
+           sizeof(zone_config_t), sizeof(zone_version_t), sizeof(zone_x_t));
+    if (h1 > h0 && att) printf("  heap: %llu -> %llu bytes allocated: %.1f bytes per attached zone\n", (unsigned long long)h0, (unsigned long long)h1, (double)(h1 - h0) / (double)att);
+#ifdef __FreeBSD__
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0) printf("  maxrss %ld KiB\n", ru.ru_maxrss);
+#endif
+    CHECK(h1 == 0 || att == 0 || (h1 - h0) / att < 4096);
+    /* the zones taken out of memory and attached again from the store: in MAP mode the image is the mapped file (no heap), in COPY mode a buffer */
+    for (int i = 0; i < nz; i++) {
+        char zn[32];
+        snprintf(zn, sizeof(zn), "z%07d.test.", i);
+        CHECK(dbreg_test_evict("default", zn));
+    }
+    for (int i = 0; i < 600 && (dbdir()->attach_count() > 0 || dbreg_evict_inflight() != 0); i++) usleep(100000);
+    const uint64_t h2 = heap_allocated();
+    CHECK(dbdir()->attach_count() == 0);
+    for (int i = 0; i < nz; i++) {
+        char zn[32];
+        snprintf(zn, sizeof(zn), "z%07d.test.", i);
+        db_store_attach_zone("default", zn);
+    }
+    for (int i = 0; i < 600 && dbdir()->attach_count() < (size_t)nz; i++) usleep(100000);
+    usleep(500000);
+    const uint64_t h3 = heap_allocated();
+    CHECK(dbdir()->attach_count() == (size_t)nz);
+    if (h3 > h2 && nz > 0) printf("  attached again from the store: %.1f bytes per attached zone (heap %llu -> %llu)\n", (double)(h3 - h2) / (double)nz, (unsigned long long)h2, (unsigned long long)h3);
+    if (nz > 0) printf("  what memory-limit counts for an attached zone (resident bytes of the zone totals / zones): %llu\n", (unsigned long long)(resident_bytes() / (uint64_t)nz));
+    printf("%d checks, %d failed\n", g_checks, g_failed);
+    char rm[700];
+    snprintf(rm, sizeof(rm), "rm -rf %s", dir);
+    (void)!system(rm);
+    fflush(stdout);
+    _exit(g_failed ? 1 : 0);
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "s5") == 0) return run_s5(argc > 2 ? argv[2] : "map");
+    if (argc > 1 && strcmp(argv[1], "heap") == 0) return run_heap(argc > 2 ? atoi(argv[2]) : 100000, argc > 3 ? argv[3] : "map");
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '3') return run_fixes(argv[2]);
+    if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '6') return run_stamp_race(argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && (argv[1][5] == '4' || argv[1][5] == '5')) return run_settings(argv[1][5] - '0', argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] >= '0' && argv[1][5] <= '2') return run_proto(argv[1][5] - '0', argv[2]);
     if (argc > 1) return run_mode(strcmp(argv[1], "copy") == 0 ? "copy" : "map");
@@ -2484,5 +3385,9 @@ int main(int argc, char **argv) {
     int rc = system(cmd);
     int rc2 = run_mode("map");
     int rc3 = proto_main(argv[0]);
-    return (rc != 0 || rc2 != 0 || rc3 != 0) ? 1 : 0;
+    snprintf(cmd, sizeof(cmd), "%s s5 map", argv[0]);
+    int rc4 = system(cmd);
+    snprintf(cmd, sizeof(cmd), "%s s5 copy", argv[0]);
+    int rc5 = system(cmd);
+    return (rc != 0 || rc2 != 0 || rc3 != 0 || rc4 != 0 || rc5 != 0) ? 1 : 0;
 }

@@ -139,6 +139,29 @@ void db_recon_status(db_recon_status_t *out);
 void db_recon_note_fetch(int what, uint64_t n);   /* DBR_FETCHED, DBR_FETCH_FAILED, DBR_IN_FLIGHT (a gauge) */
 enum { DBR_FETCHED = 0, DBR_FETCH_FAILED, DBR_IN_FLIGHT };
 
+/* ---- a fetched body is installed only for the stamp it was asked for ----
+ *
+ * The ingest thread (a CHANGES entry, a manifest entry, a delete, the sweep of a pass) and the builder threads (the install of a body) both write the record of a zone.  The body of a fetch is for the
+ * stamp the record had when the request was made; a record that has another stamp now (the database changed the zone again: the zone is wanted again) or none (the zone was deleted) must take nothing
+ * from it, and the check and the install may not have a writer of the stamp between them (the version that is put gets the record's stamp: an old body would be installed under the newer stamp, and a
+ * deleted zone would come back).  Every writer of a record's stamp or existence holds one mutex for its step; the commit of a fetched body holds it from the check to the end of the install. */
+typedef struct { uint64_t gen, time; } db_stamp_t;
+/* the stamp of the Backend's entry for the zone (the store's record, or the entry of a zone the store cannot name); *sid (may be NULL): its domain id.  false: there is no such entry (an unknown or deleted zone) */
+bool db_store_zone_stamp(const char *view, const char *zone, db_stamp_t *out, int64_t *sid);
+enum { DBC_OK = 0, DBC_STALE /* the entry has another stamp than the body was asked for */, DBC_GONE /* the entry is gone */ };
+/* Start the commit of a body (after the install into the zone's entry, before dbreg_commit()); expect: the stamp it was asked for, NULL for a body that has no condition.  Always followed by db_store_commit_end()
+ * on the same thread.  After DBC_STALE or DBC_GONE the store takes no version from this thread (dbreg_commit() of a zone that is in memory, whose entry was updated, still registers it; the caller does not
+ * commit a new entry, and does not commit anything for DBC_GONE). */
+int db_store_commit_begin(const char *view, const char *zone, const db_stamp_t *expect);
+void db_store_commit_end(void);
+/* after a body was dropped (installed = NULL), or installed for the stamp `installed`: the zone is wanted (its record is KNOWN or STALE and not refused; for an installed body only when the record has another stamp
+ * than the body was asked for), and the scan of the wanted bodies has to ask for it again */
+bool db_store_wanted_again(const char *view, const char *zone, const db_stamp_t *installed);
+#ifdef KARIDNS_UNIT_TEST
+/* called by db_store_commit_begin(): where 0 before the step (no mutex held: another writer may come in), 1 inside it (every other writer of a record waits) */
+extern void (*db_store_test_commit_hook)(int where, const char *zone);
+#endif
+
 /* ---- attach (the store threads) ---- */
 
 /* the attach of one request, on the calling thread (what a store thread does with every request; a test calls it too; the zone with its trailing dot) */
@@ -147,7 +170,16 @@ void db_store_attach_zone(const char *view, const char *zone);
 extern int db_store_test_set_fail;                      /* the n-th set_put_slot() of the settings table fails (0: off) */
 extern int db_store_test_attach_reserve_fail;           /* the n-th reserve of room in the attach table fails (0: off) */
 extern int db_store_test_bits_fail;                     /* the bit of the n-th entry of a pass cannot be set (0: off) */
+extern _Atomic(const char *) db_store_test_rec_fault_zone;   /* the store cannot read the record of this zone (name with its trailing dot; NULL: off): a damaged cell */
 #endif
+
+/* ---- 0.7 store S5 (design 6.7): the texts of rejected zones ----
+ * The server keeps the text of the last rejection of a zone in a ring of 512 texts in memory (dbreg_err_note() / dbreg_err_get(), dns_server_internal.h): a rejected zone of the store has no registry
+ * element for it.  When the store keeps the texts in a file (err.ring, by zone id) it installs three functions once, after db_store_start(), with
+ *     static const dbreg_err_sink_t sink = { put, get, clear };  dbreg_err_set_sink(&sink);
+ * put(zid, text): record the text of the zone's last rejection (the ring in memory has it too); get(zid, out, cap): the text, false when there is none; clear(zid): forget it (a version of the
+ * zone was registered).  The server calls them without a lock held, from the thread that rejects or registers, and asks the sink only for a zone the memory ring does not have (a zone whose text
+ * was pushed out, or a rejection from before a restart).  A zone with no record (zid 0xFFFFFFFF) is never given to the sink. */
 
 /* ---- counters (tests; `karictl store` has the counters of dns_store_status.h) ---- */
 typedef struct {

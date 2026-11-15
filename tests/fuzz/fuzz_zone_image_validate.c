@@ -132,7 +132,7 @@ static bool publish(const zone_image_t *img, const char *domain) {
     snprintf(g_domain, sizeof(g_domain), "%s", domain);
     memset(&g_entry, 0, sizeof(g_entry));
     g_entry.domain = g_domain;
-    snprintf(g_entry.view_name, sizeof(g_entry.view_name), "default");
+    g_entry.view_name = "default";
     memset(&g_ver, 0, sizeof(g_ver));
     g_ver.image = (zone_image_t *)(uintptr_t)img;
     g_ver.rcache_ok = false;

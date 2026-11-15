@@ -1044,7 +1044,7 @@ static void apply_ixfr_depth(zone_db_entry_t *e, const zone_config_t *dc) {
  * comes in ZONE_DATA), or (B7b) a secondary / catalog consumer, which the existing secondary machinery of the control thread
  * transfers from the masters in its settings (refresh timer, SOA retry and expire, NOTIFY, IXFR), like a configured one. */
 static zone_db_entry_t *new_db_entry(const char *view, const char *zone, zone_ext_shared_t *shared, uint8_t zkind) {
-  zone_db_entry_t *e = create_new_zone_entry(zone, view);
+  zone_db_entry_t *e = (zkind == KDB_ZK_PRIMARY && dbdir()) ? create_light_zone_entry(zone, view) : create_new_zone_entry(zone, view);      /* 0.7 store S5: a primary zone of the store is a light entry (the core in a slot of the entry pool) */
   if (!e) return NULL;
   zone_config_t *dc = db_zone_config_new_kind(zone, shared, zkind == KDB_ZK_PRIMARY ? 0 : zkind == KDB_ZK_SECONDARY ? 1 : 2);
   if (!dc) {
@@ -1189,8 +1189,8 @@ static void job_execute(ing_job_t *j) {
   if (j->fetch_id && j->iv_st_valid && dbdir()) {
     /* 0.7 WP7b: the body is the version the record asked for when the request was made.  A record that has another stamp now (the database changed again: that body is asked for
      * on its own) or none (the zone was deleted meanwhile: it must not come back) takes nothing from this one. */
-    dbdir_rec_t rec;
-    if (!dbdir()->rec_get(j->view_name, j->zone, &rec) || rec.stamp_gen != j->iv_st_gen || rec.stamp_time != j->iv_st_time) {
+    db_stamp_t now;
+    if (!db_store_zone_stamp(j->view_name, j->zone, &now, NULL) || now.gen != j->iv_st_gen || now.time != j->iv_st_time) {
       j->status = KDB_ST_UNCHANGED;
       db_zone_build_free(j->build);
       j->build = NULL;
@@ -1248,11 +1248,33 @@ static void job_execute(ing_job_t *j) {
   if (new_cfg) db_entry_retire_config(entry, old_cfg, cfg_epoch);
   bool shadowed = false;
   const uint32_t serial_now = atomic_load(&entry->serial);      /* (before the commit: a zone of the store that is over the limit is not kept, the entry is gone) */
-  if (dbreg_commit(j->view_name, j->zone, entry, created, j->source_id, serial_now, j->digest,
-                   &shadowed) != 0) {
+  /* 0.7 WP7b: the check above was made before the install, which takes a long time: the database may have changed the zone again (a CHANGES or manifest entry of the ingest thread, which does not wait for
+   * this builder) or deleted it since.  The version that dbreg_commit() puts in the store gets the record's stamp, so the check is made again at the commit, as one step with the writers of the stamp
+   * (db_store_commit_begin()): a body for another stamp is not put under the newer one (the record is wanted and the scan asks for it again, fetch_complete()), and a zone that is gone does not come
+   * back.  A zone that is in memory was updated in place already: it is registered (it serves what it has until the body for the new stamp comes) but the store takes no version from it. */
+  db_stamp_t want = { j->iv_st_gen, j->iv_st_time };
+  const int gd = db_store_commit_begin(j->view_name, j->zone, j->fetch_id && j->iv_st_valid && dbdir() ? &want : NULL);
+  if (gd == DBC_GONE || (gd == DBC_STALE && created)) {
+    db_store_commit_end();
+    if (created) free_zone_db_entry(entry);                    /* never registered or published into a snapshot */
+    else dbreg_busy_clear(j->view_name, j->zone);              /* (the zone is in memory and was marked busy; no commit follows: its record is gone, or cannot be read now (a damaged cell), and the mark must not stay) */
+    j->status = KDB_ST_UNCHANGED;
+    db_zone_build_free(j->build);
+    j->build = NULL;
+    return;
+  }
+  const int cr = dbreg_commit(j->view_name, j->zone, entry, created, j->source_id, serial_now, j->digest, &shadowed);
+  db_store_commit_end();
+  if (cr != 0) {
     if (created) free_zone_db_entry(entry);
     job_reject(j, "out of memory registering the zone");
     goto rejected;
+  }
+  if (gd == DBC_STALE) {                                       /* (registered, but not stored: the version the record asks for is another one) */
+    j->status = KDB_ST_UNCHANGED;
+    db_zone_build_free(j->build);
+    j->build = NULL;
+    return;
   }
   j->serial = serial_now;
   j->status = shadowed ? KDB_ST_SHADOWED : KDB_ST_APPLIED;
@@ -1260,7 +1282,14 @@ static void job_execute(ing_job_t *j) {
   j->build = NULL;
   return;
 rejected:
-  (void)dbreg_reject(j->view_name, j->zone, j->source_id, j->reason);
+  {
+    /* A fetched body that was refused marks the store's record (STORE_F_REJECTED_NEW: this version is not asked for again) only when the record still has the stamp the body was asked for: the database may have
+     * changed the zone since, and then the newer version is not the one that was refused.  The check and the mark are one step with the writers of the stamp, as at a commit. */
+    db_stamp_t want = { j->iv_st_gen, j->iv_st_time };
+    const int gd = db_store_commit_begin(j->view_name, j->zone, j->fetch_id && j->iv_st_valid && dbdir() ? &want : NULL);
+    (void)dbreg_reject_ex(j->view_name, j->zone, j->source_id, j->reason, gd == DBC_OK);
+    db_store_commit_end();
+  }
   db_zone_build_free(j->build);
   j->build = NULL;
 }
@@ -3212,12 +3241,13 @@ static ing_freq_t *fetch_find_zone(ing_t *g, uint16_t view, const char *zone, ui
 
 /* 0.7 WP7b: the stamp of the store's record of the zone (and its domain id, when the request has none) at the time of the request: the body that comes is installed only while the record has it */
 static void freq_stamp(ing_freq_t *r, const char *view, const char *zone) {
-  dbdir_rec_t rec;
-  if (dbdir() && dbdir()->rec_get(view, zone, &rec)) {
+  db_stamp_t s;
+  int64_t sid = 0;
+  if (dbdir() && db_store_zone_stamp(view, zone, &s, &sid)) {
     r->st_valid = true;
-    r->st_gen = rec.stamp_gen;
-    r->st_time = rec.stamp_time;
-    if (r->sid == 0) r->sid = rec.source_id;
+    r->st_gen = s.gen;
+    r->st_time = s.time;
+    if (r->sid == 0) r->sid = sid;
   }
 }
 
@@ -3312,11 +3342,12 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
       if (done.nonstore && !done.loader_failed) db_recon_scan_retry(done.bzid);
     }
   }
-  if (done.dropped && done.mode == KDB_FETCH_FULL && g->store_proto && dbdir()) {
+  if ((done.dropped || (ok && done.st_valid)) && done.mode == KDB_FETCH_FULL && g->store_proto && dbdir()) {
     /* 0.7 M6: the body was dropped (job_execute(): it was for another stamp than the record has now, or the zone was changed since).  The scan of the wanted bodies skipped the zone while this fetch was in
-     * flight, and nothing else would ask for it again: the record would stay STALE (or KNOWN) and the old image would be served for ever.  A record that is still wanted starts the scan again. */
-    dbdir_rec_t rec;
-    if (dbdir()->rec_get(done.view_name, done.zone, &rec) && (rec.state == STORE_STATE_KNOWN || (rec.flags & STORE_F_STALE)) && !(rec.flags & STORE_F_REJECTED_NEW)) bulk_kick(g);
+     * flight, and nothing else would ask for it again: the record would stay STALE (or KNOWN) and the old image would be served for ever.  A record that is still wanted starts the scan again.  The same for a body that was installed while the database changed the zone again (the ingest thread recorded the new stamp after the install, db_store_commit_begin()):
+     * the record has another stamp than the body was asked for, and the scan skipped the zone for the same reason. */
+    const db_stamp_t inst = { done.st_gen, done.st_time };
+    if (db_store_wanted_again(done.view_name, done.zone, done.dropped ? NULL : &inst)) bulk_kick(g);
   }
   if (!ok && done.loader_failed && dbdir()) {            /* the loader cannot read the zone: the record is marked refused (not asked for again before the database says another version) */
     dbdir_rec_t rec;
@@ -4744,7 +4775,7 @@ static void secondary_status(status_ctx_t *c, const zone_db_entry_t *e, const zo
   else
     st_append(c, "  transfer: no transfer has succeeded yet (kept in memory only)\n");
   /* B8t-2: the settings the primary sent with the zone (Extended AXFR version 3); the statements of the zone's own metadata win */
-  if (atomic_load_explicit(&e->rxcfg, memory_order_acquire))
+  if (atomic_load_explicit(&zone_xr(e)->rxcfg, memory_order_acquire))
     st_append(c, "  settings from the primary: in force (what the zone's own metadata sets wins over them)\n");
 }
 
@@ -4795,16 +4826,19 @@ static bool status_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   if (z->last_result == DBREG_REJECTED && zdir_entry(z)) st_append(c, " (serving the last good version, serial %u)", zdir_serial(z));
   if (!zdir_entry(z)) st_append(c, z->digest && atomic_load_explicit(&z->state, memory_order_relaxed) != ZDIR_ST_ERROR
                                        ? " (the data is out of memory: it is read when a query needs it)" : " (no version loaded)");
-  if (z->error) st_append(c, ", last error: %s", z->error);
+  {
+    char errtxt[192];
+    if (dbreg_err_get(view, z->name, (z->kind & ZDIR_K_STORED) ? z->zid : 0xFFFFFFFFu, errtxt, sizeof(errtxt))) st_append(c, ", last error: %s", errtxt);
+  }
   if (zdir_entry(z) && atomic_load_explicit(&zdir_entry(z)->rolled_back, memory_order_acquire))
-    st_append(c, " (rolled back: serial %u, from %u; pinned in memory until the next load from the database)", atomic_load_explicit(&zdir_entry(z)->rb_serial, memory_order_relaxed),
-              atomic_load_explicit(&zdir_entry(z)->rb_from, memory_order_relaxed));
+    st_append(c, " (rolled back: serial %u, from %u; pinned in memory until the next load from the database)", atomic_load_explicit(&zone_xr(zdir_entry(z))->rb_serial, memory_order_relaxed),
+              atomic_load_explicit(&zone_xr(zdir_entry(z))->rb_from, memory_order_relaxed));
   else if (zdir_entry(z) && atomic_load_explicit(&zdir_entry(z)->updated, memory_order_relaxed)) st_append(c, " (changed by a dynamic UPDATE: pinned in memory until the next load from the database)");
   st_append(c, "\n");
   /* a line of its own: the zone line above keeps its form (it ends with the status) */
-  if (zdir_entry(z) && atomic_load_explicit(&zdir_entry(z)->prev_bytes, memory_order_relaxed))
-    st_append(c, "  previous version kept for rollback: serial %u, %llu bytes\n", atomic_load_explicit(&zdir_entry(z)->prev_serial, memory_order_relaxed),
-              (unsigned long long)atomic_load_explicit(&zdir_entry(z)->prev_bytes, memory_order_relaxed));
+  if (zdir_entry(z) && atomic_load_explicit(&zone_xr(zdir_entry(z))->prev_bytes, memory_order_relaxed))
+    st_append(c, "  previous version kept for rollback: serial %u, %llu bytes\n", atomic_load_explicit(&zone_xr(zdir_entry(z))->prev_serial, memory_order_relaxed),
+              (unsigned long long)atomic_load_explicit(&zone_xr(zdir_entry(z))->prev_bytes, memory_order_relaxed));
   if (zdir_entry(z)) settings_status(c, zdir_entry(z));
   return true;
 }
@@ -4860,8 +4894,9 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
           st_append(&c, "zone %s view %s: source id %lld, in the zone store without a body yet (not in memory; %s): the body is fetched in the background, or when a query asks for it\n", canon, info[i].view,
                     (long long)info[i].source_id, (rr.flags & STORE_F_REJECTED_NEW) ? "refused: the loader cannot read it or the Backend rejected it; asked for again when the database says another version" : "asked for");
         else
-          st_append(&c, "zone %s view %s: source id %lld, serial %u, status applied (in the zone store, not in memory: it is attached when a query needs it)%s\n", canon, info[i].view,
-                    (long long)info[i].source_id, (unsigned)info[i].serial, has_rr && (rr.flags & STORE_F_STALE) ? "; the database has another version, its body is fetched in the background" : "");
+          st_append(&c, "zone %s view %s: source id %lld, serial %u, status %s (in the zone store, not in memory: it is attached when a query needs it)%s%s%s\n", canon, info[i].view,
+                    (long long)info[i].source_id, (unsigned)info[i].serial, info[i].last_result == DBREG_REJECTED ? "rejected" : "applied", has_rr && (rr.flags & STORE_F_STALE) ? "; the database has another version, its body is fetched in the background" : "",
+                    info[i].error[0] ? ", last error: " : "", info[i].error);
       }
     }
     if (c.matches == 0) st_append(&c, "zone %s: not in the database registry\n", zone);
@@ -4885,6 +4920,17 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
   else
     st_append(&c, "zones: %zu in the registry (%zu served, %zu shadowed by karidns.conf, %zu hidden by catalog members), "
                   "%zu with a rejected version\n", total, total - sh_cfg - sh_cat, sh_cfg, sh_cat, rejected);
+  if (dbdir()) {                                   /* 0.7 store S5: what the zones of the store cost and what is kept of the zones that left memory (design 4.2, 6.1, 6.7) */
+    zone_entry_pool_stats_t ep;
+    zone_entry_pool_stats(&ep);
+    uint64_t folded = 0, frows = 0, freplaced = 0, enoted = 0, edropped = 0;
+    size_t etexts = 0;
+    dbreg_fold_stats(&folded, &frows, &freplaced);
+    dbreg_err_stats(&etexts, &enoted, &edropped);
+    st_append(&c, "zone entries: %llu in the pool (%llu slab(s) of %llu KiB, %llu octets a slot); %llu zone(s) left memory with their counters folded into the totals (%llu in the table of the top zones); %zu rejection text(s) in the ring (%llu pushed out)\n",
+              (unsigned long long)ep.used, (unsigned long long)ep.slabs, (unsigned long long)(ep.slab_bytes >> 10), (unsigned long long)ep.slot_bytes, (unsigned long long)folded,
+              (unsigned long long)frows, etexts, (unsigned long long)edropped);
+  }
   {
     /* D1a (design 8.1): what the zone versions hold; "retired" = replaced, not freed yet (a reader or a transfer may still hold it) */
     zone_bytes_t zdb, zot;

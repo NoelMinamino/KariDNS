@@ -22,6 +22,7 @@
 
 #include "../dns_wire.h"
 #include "../dns_utils.h"
+#include "../dns_mem_advice.h"
 
 #ifndef explicit_bzero
 #if defined(OPENSSL_VERSION_NUMBER)
@@ -208,6 +209,60 @@ static bool karictl_arc_read(const char *name, uint64_t *v) {
     *v = x;
     return true;
 }
+/* a number of the server's reply: `"store.memory.limit_bytes":N` (JSON), `store.memory.limit_bytes=N` (key=value) or `  limit_bytes = N` in the section `memory:` (text) */
+static bool karictl_reply_num(const char *buf, int fmt, const char *label, uint64_t *v) {
+    char needle[96];
+    if (fmt == 1) snprintf(needle, sizeof(needle), "\"store.memory.%s\":", label);
+    else if (fmt == 2) snprintf(needle, sizeof(needle), "\nstore.memory.%s=", label);
+    else snprintf(needle, sizeof(needle), "\n  %s = ", label);
+    const char *p = fmt == 0 ? strstr(buf, "\nmemory:\n") : buf;
+    if (!p) return false;
+    p = strstr(p, needle);
+    if (!p) return false;
+    p += strlen(needle);
+    if (!isdigit((unsigned char)*p)) return false;
+    *v = strtoull(p, NULL, 10);
+    return true;
+}
+/* 0.7 S6, design 3.6: on ZFS the Backend's heap, the ARC, the loader and the system have to fit in RAM.  The server cannot read vfs.zfs.arc.max (sandbox), so the sum is made here
+ * from the server's memory figures and the host's.  Appends `store.memory.arc.*` (nothing when the server has no memory figures). */
+static void karictl_store_add_arc_sum(char *buf, size_t cap, size_t *len, int fmt) {
+    uint64_t arc_max = 0, ram = 0, lim = 0, be = 0, ld = 0;
+    size_t l = sizeof(arc_max);
+    if (sysctlbyname("vfs.zfs.arc.max", &arc_max, &l, NULL, 0) != 0 || (l != 4 && l != 8)) return;
+    l = sizeof(ram);
+    if (sysctlbyname("hw.physmem", &ram, &l, NULL, 0) != 0 || (l != 4 && l != 8)) ram = 0;
+    if (!karictl_reply_num(buf, fmt, "limit_bytes", &lim)) lim = 0;
+    bool have = lim > 0 && karictl_reply_num(buf, fmt, "backend_limit_bytes", &be) && karictl_reply_num(buf, fmt, "loader_limit_bytes", &ld);
+    if (!have) have = karictl_reply_num(buf, fmt, "backend_all_bytes", &be) && karictl_reply_num(buf, fmt, "loader_all_bytes", &ld);
+    if (!have) return;
+    ma_arc_t a;
+    ma_arc_sum(be, arc_max, ld, ram, &a);
+    char txt[480];
+    ma_text_arc(txt, sizeof(txt), &a);
+    char add[1400];
+    size_t n = 0;
+#define SUM_PUT(...) do { int w_ = snprintf(add + n, sizeof(add) - n, __VA_ARGS__); if (w_ > 0 && (size_t)w_ < sizeof(add) - n) n += (size_t)w_; } while (0)
+    if (fmt == 1) {
+        SUM_PUT(",\"store.memory.arc.backend_bytes\":%llu,\"store.memory.arc.arc_max_bytes\":%llu,\"store.memory.arc.loader_bytes\":%llu,\"store.memory.arc.other_bytes\":%llu,"
+                "\"store.memory.arc.total_bytes\":%llu,\"store.memory.arc.ram_bytes\":%llu,\"store.memory.arc.pct\":%u,\"store.memory.arc.level\":\"%s\",\"store.memory.arc.text\":\"",
+                (unsigned long long)a.backend, (unsigned long long)a.arc_max, (unsigned long long)a.loader, (unsigned long long)a.other, (unsigned long long)a.total,
+                (unsigned long long)a.ram, a.pct, ma_level_name(a.level));
+        for (const char *q = txt; *q && n + 8 < sizeof(add); q++) { if (*q == '"' || *q == '\\') add[n++] = '\\'; add[n++] = (*q >= 0x20 && *q != 0x7f) ? *q : ' '; }
+        SUM_PUT("\"}\n");
+        while (*len > 0 && (buf[*len - 1] == '\n' || buf[*len - 1] == '}')) { (*len)--; if (buf[*len] == '}') break; }
+        buf[*len] = '\0';
+    } else if (fmt == 2) {
+        SUM_PUT("store.memory.arc.backend_bytes=%llu\nstore.memory.arc.arc_max_bytes=%llu\nstore.memory.arc.loader_bytes=%llu\nstore.memory.arc.other_bytes=%llu\n"
+                "store.memory.arc.total_bytes=%llu\nstore.memory.arc.ram_bytes=%llu\nstore.memory.arc.pct=%u\nstore.memory.arc.level=%s\n",
+                (unsigned long long)a.backend, (unsigned long long)a.arc_max, (unsigned long long)a.loader, (unsigned long long)a.other, (unsigned long long)a.total,
+                (unsigned long long)a.ram, a.pct, ma_level_name(a.level));
+    } else {
+        SUM_PUT("\narc sum:\n  %s\n  level = %s\n", txt, ma_level_name(a.level));
+    }
+#undef SUM_PUT
+    if (*len + n < cap) { memcpy(buf + *len, add, n); *len += n; buf[*len] = '\0'; }
+}
 static void karictl_store_add_arc(char *buf, size_t cap, size_t *len, int fmt /* 0 text, 1 JSON, 2 key=value */) {
     static const struct { const char *kstat, *key; } m[] = {
         { "size", "size_bytes" }, { "c", "target_bytes" }, { "c_min", "target_min_bytes" }, { "c_max", "target_max_bytes" },
@@ -298,6 +353,9 @@ static void karictl_usage(FILE *fp, const char *argv0) {
         "                              the zone store (database zones kept on disk): state, zones, attaches, cold queries, cache,\n"
         "                              memory.  -j prints one JSON object, -k key=value lines (stable key names: docs/karictl.md);\n"
         "                              zone <name> shows one zone's record (an index lookup, the zone is not attached)\n"
+        "  store compact | checkpoint | scrub start | scrub stop\n"
+        "                              clean the segments of the store now (at full speed), write a checkpoint, start or stop a scrub\n"
+        "                              (a full control key; not for a read-only one)\n"
         "  trace [level]               raise the debug level by one (up to 99), or set it (0-99): the channels with\n"
         "                              severity dynamic, and karidns.run in options { directory }, follow it\n"
         "  notrace                     set the debug level to 0\n"
@@ -1221,8 +1279,9 @@ int main(int argc, char **argv) {
     ssize_t r;
 
     char cmd_msg[512];
-    if (strcmp(argv[optind], "store") == 0) {          /* store [-j | -k] [zone <name> [view]]: every word goes on */
-        size_t ml = (size_t)snprintf(cmd_msg, sizeof(cmd_msg), "store");
+    if (strcmp(argv[optind], "store") == 0) {          /* store [-j | -k] [zone <name> [view]]: every word goes on; store compact | checkpoint | scrub start|stop change the store: the command `storeop` */
+        const bool op = optind + 1 < argc && (strcmp(argv[optind + 1], "compact") == 0 || strcmp(argv[optind + 1], "checkpoint") == 0 || strcmp(argv[optind + 1], "scrub") == 0);
+        size_t ml = (size_t)snprintf(cmd_msg, sizeof(cmd_msg), op ? "storeop" : "store");
         for (int ai = optind + 1; ai < argc; ai++) {
             int w = snprintf(cmd_msg + ml, sizeof(cmd_msg) - ml, " %s", argv[ai]);
             if (w < 0 || (size_t)w >= sizeof(cmd_msg) - ml - 2) { fprintf(stderr, "karictl: store: the arguments are too long\n"); close(sock); return 2; }
@@ -1367,7 +1426,10 @@ int main(int argc, char **argv) {
             else if (strcmp(argv[ai], "-k") == 0) sfmt = 2;
         }
         const char *arc_mark = sfmt == 1 ? "\"store.cache.kind\":\"arc\"" : sfmt == 2 ? "store.cache.kind=arc\n" : "\n  kind = arc\n";
-        if (strstr(sbuf, arc_mark)) karictl_store_add_arc(sbuf, sizeof(sbuf), &total, sfmt);
+        if (strstr(sbuf, arc_mark)) {
+            karictl_store_add_arc(sbuf, sizeof(sbuf), &total, sfmt);
+            karictl_store_add_arc_sum(sbuf, sizeof(sbuf), &total, sfmt);
+        }
         fwrite(sbuf, 1, total, stdout);
         return 0;
     } else if (strcmp(argv[optind], "observatory") == 0) {

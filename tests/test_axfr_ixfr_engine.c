@@ -783,7 +783,7 @@ static void test_send_axfr_response_ixfr_and_extended(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "example.com.";
-    strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
+    entry.view_name = "default";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
@@ -959,7 +959,7 @@ static void test_send_axfr_response_large_multi_chunk_tsig(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "large.example.";
-    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    entry.view_name = "default";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
@@ -1046,7 +1046,7 @@ static void test_handle_axfr_event_multi_message_and_tsig(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "multi.example.";
-    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    entry.view_name = "default";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
@@ -1154,7 +1154,7 @@ static void test_handle_axfr_event_drops_unencodable(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "drop.example.";
-    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    entry.view_name = "default";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
     init_axfr_zone(test_zone_slot(&entry, 0), "drop.example.", "100");
@@ -1212,7 +1212,7 @@ static void test_handle_axfr_event_and_worker_thread(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "worker.example.";
-    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    entry.view_name = "default";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
@@ -1453,7 +1453,7 @@ static void test_axfr_worker_recheck_acl(void) {
         memset(&entry, 0, sizeof(entry));
         entry.domain = "nr.example.com.";
         entry.source = ZONE_SRC_DB;
-        strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+        entry.view_name = "default";
         pthread_mutex_init(&entry.writer_lock, NULL);
         pthread_mutex_init(&entry.ixfr_history.lock, NULL);
         init_axfr_zone(test_zone_slot(&entry, 0), "nr.example.com.", "4242");
@@ -1545,7 +1545,7 @@ static void test_axfr_worker_zone_out_of_memory(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "nr.example.com.";
-    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    entry.view_name = "default";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
     init_axfr_zone(test_zone_slot(&entry, 0), "nr.example.com.", "4242");
@@ -2318,7 +2318,7 @@ static void test_extended_ixfr_soa_state(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "tagged.example.";
-    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    entry.view_name = "default";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
     init_axfr_zone(test_zone_slot(&entry, 0), "tagged.example.", "300");
@@ -2409,7 +2409,7 @@ static void test_send_axfr_response_full_matrix(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "matrix.example.";
-    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    entry.view_name = "default";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
@@ -2549,7 +2549,7 @@ static void test_handle_axfr_event_intermediate_unsigned_flow(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "tsigflow.example.";
-    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    entry.view_name = "default";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
@@ -6269,7 +6269,7 @@ static void test_axfr_ixfr_feature_case_154(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "unsigned.example.";
-    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    entry.view_name = "default";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
@@ -6392,7 +6392,7 @@ static void test_axfr_ixfr_feature_case_155(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "multichunk.example.";
-    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    entry.view_name = "default";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
@@ -6651,7 +6651,7 @@ static void test_edns_expire_rfc7314(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "example.com.";
-    strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
+    entry.view_name = "default";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
     init_axfr_zone(test_zone_slot(&entry, 0), "example.com.", "200");
@@ -6828,7 +6828,7 @@ static void test_p10_transfer_responses(void) {
     zone_db_entry_t e;
     memset(&e, 0, sizeof(e));
     e.domain = "p10.example.";
-    strlcpy(e.view_name, "default", sizeof(e.view_name));
+    e.view_name = "default";
     pthread_mutex_init(&e.writer_lock, NULL);
     pthread_mutex_init(&e.ixfr_history.lock, NULL);
     p10_init_zone(test_zone_slot(&e, 0), "p10.example.", "100", NULL);
@@ -6894,7 +6894,7 @@ static void test_p10_extended_ixfr(void) {
     zone_db_entry_t e;
     memset(&e, 0, sizeof(e));
     e.domain = "x24.example.";
-    strlcpy(e.view_name, "default", sizeof(e.view_name));
+    e.view_name = "default";
     pthread_mutex_init(&e.writer_lock, NULL);
     pthread_mutex_init(&e.ixfr_history.lock, NULL);
     p10_init_zone(test_zone_slot(&e, 1), "x24.example.", "100", NULL);
@@ -7234,7 +7234,7 @@ static void test_ixfr_history_depth(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = dom;
-    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    entry.view_name = "default";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
     zone_arena_t cur;
@@ -7334,7 +7334,7 @@ static void test_ixfr_diff_charge(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = dom;
-    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    entry.view_name = "default";
     entry.source = ZONE_SRC_DB;
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
@@ -7816,7 +7816,7 @@ static void test_b8t2_sender_versions(void) {
     zone_db_entry_t e;
     memset(&e, 0, sizeof(e));
     e.domain = "b8.example.";
-    strlcpy(e.view_name, "default", sizeof(e.view_name));
+    e.view_name = "default";
     pthread_mutex_init(&e.writer_lock, NULL);
     pthread_mutex_init(&e.ixfr_history.lock, NULL);
     uint8_t q[512];
@@ -8053,7 +8053,7 @@ static size_t sr_a(uint8_t *p, size_t cap, size_t off, const char *owner, uint8_
 static void sr_entry_init(zone_db_entry_t *e, const char *domain) {
     memset(e, 0, sizeof(*e));
     e->domain = domain;
-    strlcpy(e->view_name, "default", sizeof(e->view_name));
+    e->view_name = "default";
     pthread_mutex_init(&e->writer_lock, NULL);
     pthread_mutex_init(&e->ixfr_history.lock, NULL);
     init_axfr_zone(test_zone_slot(e, 0), domain, "100");
@@ -8834,7 +8834,7 @@ static void test_low_l2_no_apex_soa(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "drop.example.";
-    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    entry.view_name = "default";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
     init_axfr_zone(test_zone_slot(&entry, 0), "drop.example.", "100");

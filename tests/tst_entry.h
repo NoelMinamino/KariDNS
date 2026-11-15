@@ -12,7 +12,7 @@ static inline const zone_db_entry_t *tst_entry(const char *view, const char *dom
     memset(&e, 0, sizeof(e));
     snprintf(name, sizeof(name), "%s", domain);
     e.domain = name;
-    snprintf(e.view_name, sizeof(e.view_name), "%s", view ? view : "");
+    e.view_name = view ? view : "";
     return &e;
 }
 

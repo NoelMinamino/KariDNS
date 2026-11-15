@@ -238,6 +238,24 @@ static struct {
 } G = { .wlock = PTHREAD_MUTEX_INITIALIZER, .wcv = PTHREAD_COND_INITIALIZER, .akq = -1 };
 
 bool db_store_enabled(void) { return atomic_load_explicit(&G.st, memory_order_acquire) != NULL; }
+
+/* The order of the writers of the records.  A record's version stamp and its existence are changed by the ingest thread (a CHANGES entry, a manifest entry, a delete, the sweep of a pass) while a builder
+ * thread installs a body (dir_put() copies the record's stamp to the version it writes); the check "the body is for the stamp the record has" and the install must not have another writer between
+ * them.  Every writer of a record's stamp or existence holds this mutex for its whole step, and the commit of a fetched body holds it from the check to the end of the install (db_store_commit_begin() /
+ * _end()).  It is taken by the same thread again (a put that deletes the old name of a renamed domain goes through dbreg_delete() to dir_del()), so a thread keeps a depth; it is taken before the lock of
+ * the registry, the lock of the reconcile (RC.mu) and the writer lock of the store, and none of the three holds it while waiting for it. */
+static pthread_mutex_t g_rec_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Thread_local unsigned t_rec_depth;
+static _Thread_local bool t_put_refuse;        /* the commit of this thread was refused (db_store_commit_begin()): the store takes no version from it */
+static void rec_lock(void) {
+  if (t_rec_depth++ == 0) pthread_mutex_lock(&g_rec_mu);
+}
+static void rec_unlock(void) {
+  if (--t_rec_depth == 0) pthread_mutex_unlock(&g_rec_mu);
+}
+#ifdef KARIDNS_UNIT_TEST
+void (*db_store_test_commit_hook)(int where, const char *zone);
+#endif
 store_t *db_store_handle(void) { return atomic_load_explicit(&G.st, memory_order_acquire); }
 
 void db_store_counters(db_store_counters_t *o) {
@@ -489,7 +507,7 @@ static struct {
   _Atomic(att_tab_t *) tab;
   size_t live, used;                 /* used = live + tombstones */
   att_retired_t *retired;
-  _Atomic uint64_t puts, removes, grows;
+  _Atomic uint64_t puts, removes, grows, shrinks;
 } AT = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
 static inline size_t att_hash(uint32_t zid) {
@@ -627,6 +645,12 @@ static void dir_attach_remove(const zdir_elem_t *el) {
       }
       i = (i + 1) & t->mask;
     }
+    /* 0.7 store S5: after a mass detach the table is smaller again (1/8 full or less: a table of four times the live elements, the tombstones gone); the old one is freed after the grace period */
+    if (t->cap > ATT_MIN_CAP && AT.live * 8 <= t->cap) {
+      size_t cap = ATT_MIN_CAP;
+      while (cap < (AT.live + 1) * 4) cap <<= 1;
+      if (cap < t->cap && att_rehash_locked(cap)) atomic_fetch_add_explicit(&AT.shrinks, 1, memory_order_relaxed);
+    }
   }
   pthread_mutex_unlock(&AT.lock);
 }
@@ -635,6 +659,18 @@ static zdir_elem_t *dir_attach_next(size_t *pos) {
   const att_tab_t *t = atomic_load_explicit(&AT.tab, memory_order_acquire);
   while (t && *pos < t->cap) {
     zdir_elem_t *e = atomic_load_explicit(&t->slot[(*pos)++], memory_order_acquire);
+    if (e && e != ATT_TOMB) return e;
+  }
+  return NULL;
+}
+/* An element of the attach table at a random place (the random number r), for the cache manager's samples (design 4.4): the first live slot from a random one.  The registry lock is held by the caller, and by
+ * every writer of the table, so the table does not change under it. */
+static zdir_elem_t *dir_attach_sample(uint64_t r) {
+  const att_tab_t *t = atomic_load_explicit(&AT.tab, memory_order_acquire);
+  if (!t || AT.live == 0) return NULL;
+  size_t i = (size_t)(r >> 11) & t->mask;
+  for (size_t n = 0; n < t->cap; n++, i = (i + 1) & t->mask) {
+    zdir_elem_t *e = atomic_load_explicit(&t->slot[i], memory_order_acquire);
     if (e && e != ATT_TOMB) return e;
   }
   return NULL;
@@ -695,10 +731,10 @@ static bool dir_find(int sid, const char *fname, size_t len, zref_t *out) {
     zdir_elem_t *el = dir_attach_get(cand[i]);
     if (el) {
       if (el->sview == (uint16_t)sid && el->klen == len && strncasecmp(el->name, fname, len) == 0) {
-        zone_db_entry_t *e = zdir_entry(el);
-        if (!e) continue;
+        /* an element of the attach table whose entry is not there (yet, or any more): the zone is known and its data is not in memory.  The answer is that, not "no such zone": the worker parks the
+         * query for it (a lookup that skipped the element sent a query or a NOTIFY in that window to REFUSED / no zone, and nothing waited) */
         out->el = el;
-        out->entry = e;
+        out->entry = zdir_entry(el);
         out->zid = cand[i];
         out->sview = (int16_t)sid;
         return true;
@@ -730,7 +766,16 @@ static bool dir_find(int sid, const char *fname, size_t len, zref_t *out) {
   return false;
 }
 
+#ifdef KARIDNS_UNIT_TEST
+_Atomic(const char *) db_store_test_rec_fault_zone;       /* dir_rec_get() cannot read the record of this zone (a damaged cell) */
+#endif
 static bool dir_rec_get(const char *view, const char *zone, dbdir_rec_t *o) {
+#ifdef KARIDNS_UNIT_TEST
+  {
+    const char *fz = atomic_load_explicit(&db_store_test_rec_fault_zone, memory_order_acquire);
+    if (fz && zone && strcmp(fz, zone) == 0) return false;
+  }
+#endif
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   char name[DBS_NAME_MAX];
   size_t nlen;
@@ -808,11 +853,12 @@ static int view_ensure(store_t *st, const char *view) {
 
 /* The version of the entry goes to the store (the install of the loader's zone has made the entry and published its version; the registry commit follows).  *zid: the zone's id.
  * 0, or a negative errno; -ENOTSUP: not a zone the store can hold (the root zone, a name too long, no records, another serial by now). */
-static int dir_put(const char *view, const char *zone, zone_db_entry_t *entry, int64_t source_id, uint32_t serial, const uint8_t digest[32], uint32_t settings, uint32_t *zid_out) {
+static int dir_put_locked(const char *view, const char *zone, zone_db_entry_t *entry, int64_t source_id, uint32_t serial, const uint8_t digest[32], uint32_t settings, uint32_t *zid_out) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   char name[DBS_NAME_MAX];
   size_t nlen;
   if (!st) return -ENODEV;
+  if (t_put_refuse) return -ECANCELED;                     /* (the commit was refused: the body is not for the record's stamp any more, db_store_commit_begin()) */
   if (!store_name(zone, name, sizeof(name), &nlen)) return -ENOTSUP;
   int vid = view_ensure(st, view);
   if (vid < 0) return vid;
@@ -892,7 +938,14 @@ static int dir_put(const char *view, const char *zone, zone_db_entry_t *entry, i
   return r;
 }
 
-static int dir_del(const char *view, const char *zone, int64_t source_id, bool *had) {
+static int dir_put(const char *view, const char *zone, zone_db_entry_t *entry, int64_t source_id, uint32_t serial, const uint8_t digest[32], uint32_t settings, uint32_t *zid_out) {
+  rec_lock();
+  int r = dir_put_locked(view, zone, entry, source_id, serial, digest, settings, zid_out);
+  rec_unlock();
+  return r;
+}
+
+static int dir_del_locked(const char *view, const char *zone, int64_t source_id, bool *had) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   char name[DBS_NAME_MAX];
   size_t nlen;
@@ -919,8 +972,15 @@ static int dir_del(const char *view, const char *zone, int64_t source_id, bool *
   return r;
 }
 
+static int dir_del(const char *view, const char *zone, int64_t source_id, bool *had) {
+  rec_lock();
+  int r = dir_del_locked(view, zone, source_id, had);
+  rec_unlock();
+  return r;
+}
+
 /* the record loses its image (it is damaged, or the version is not trusted): the zone is read from the database again.  The name finds the record also when its cell cannot be read. */
-static void set_known_by_name(const char *view, const char *zone, int64_t source_id, uint32_t serial) {
+static void set_known_by_name_locked(const char *view, const char *zone, int64_t source_id, uint32_t serial) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   char name[DBS_NAME_MAX];
   size_t nlen;
@@ -939,6 +999,12 @@ static void set_known_by_name(const char *view, const char *zone, int64_t source
   if (store_set_known(st, (uint16_t)vid, name, nlen, &m, NULL) == 0) atomic_fetch_add(&G.wt_invalidated, 1);
 }
 
+static void set_known_by_name(const char *view, const char *zone, int64_t source_id, uint32_t serial) {
+  rec_lock();
+  set_known_by_name_locked(view, zone, source_id, serial);
+  rec_unlock();
+}
+
 static void dir_note_flags(uint32_t zid, uint16_t set, uint16_t clear) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   if (st) (void)store_set_flags(st, zid, set, clear);
@@ -955,8 +1021,51 @@ static uint64_t dir_counters(int what) {
   case 2: return ss.zones_known;
   case 3: return ss.zones_rejected;
   case 4: return AT.live;
+  case 5: { const att_tab_t *t = atomic_load_explicit(&AT.tab, memory_order_acquire); return t ? t->cap : 0; }         /* slots of the attach table */
+  case 6: return atomic_load_explicit(&AT.grows, memory_order_relaxed);
+  case 7: return atomic_load_explicit(&AT.shrinks, memory_order_relaxed);
   default: return 0;
   }
+}
+
+/* design 6.7: the texts of rejected zones, by zone id, in err.ring of the store (dbreg_err_set_sink(), dns_server_internal.h) */
+static void err_sink_put(uint32_t zid, const char *text) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  if (st && zid != STORE_NONE) (void)store_err_put(st, zid, 0, text);
+}
+static bool err_sink_get(uint32_t zid, char *out, size_t cap) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  store_err_t e;
+  if (!st || zid == STORE_NONE || !cap || store_err_get(st, zid, &e) != 0) return false;
+  snprintf(out, cap, "%s", e.text);
+  return true;
+}
+static void err_sink_clear(uint32_t zid) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  if (st && zid != STORE_NONE) (void)store_err_clear(st, zid);
+}
+static const dbreg_err_sink_t g_err_sink = { err_sink_put, err_sink_get, err_sink_clear };
+
+/* the figures `karictl store` has of the server's tables (dns_store_status.h) */
+static bool extra_status_cb(store_extra_t *x) {
+  zone_entry_pool_stats_t ep;
+  zone_entry_pool_stats(&ep);
+  dbreg_cache_stats_t cs;
+  dbreg_cache_stats(&cs);
+  x->pool_used = ep.used;
+  x->pool_slabs = ep.slabs;
+  x->pool_slab_bytes = ep.slab_bytes;
+  x->pool_slot_bytes = ep.slot_bytes;
+  x->pool_free_slots = ep.free_slots;
+  x->attach_slots = dir_counters(5);
+  x->attach_grows = dir_counters(6);
+  x->attach_shrinks = dir_counters(7);
+  dbreg_fold_stats(&x->folded, &x->fold_rows, &x->fold_replaced);
+  size_t n = 0;
+  dbreg_err_stats(&n, &x->err_noted, &x->err_dropped);
+  x->err_texts = n;
+  x->sampled_detaches = cs.sampled;
+  return true;
 }
 
 static const dbdir_ops_t g_ops = {
@@ -977,6 +1086,7 @@ static const dbdir_ops_t g_ops = {
   .attach_count = dir_attach_count,
   .attach_get = dir_attach_get,
   .attach_next = dir_attach_next,
+  .attach_sample = dir_attach_sample,
   .attach_tab_id = dir_attach_tab_id,
   .counters = dir_counters,
 };
@@ -1244,9 +1354,8 @@ static void attach_zone_x(const char *view, const char *zone, bool siblings, boo
   atomic_store_explicit(&entry->refresh, clamp_ttl(nums.refresh), memory_order_relaxed);
   atomic_store_explicit(&entry->retry, clamp_ttl(nums.retry), memory_order_relaxed);
   atomic_store_explicit(&entry->expire, clamp_ttl(nums.expire), memory_order_relaxed);
-  pthread_mutex_lock(&entry->writer_lock);
+  /* (the entry is new: nobody can reach it before the commit below, so its writer lock is not taken, and a light entry never makes the lock's block (libthr makes it at the first lock; ~112 octets for every attached zone)) */
   zone_install_version(entry, ver, NULL, false);
-  pthread_mutex_unlock(&entry->writer_lock);
   ver = NULL;
   {
     /* the directory must still offer the version that was read (a delete or a newer install may have come meanwhile): checked in the commit, under the registry's lock, so
@@ -1467,6 +1576,7 @@ static void un_drop_locked(size_t i) {
 static bool un_remove(const char *view, int64_t sid, const char *name, char *old, size_t cap) {
   if (atomic_load_explicit(&UN_CNT, memory_order_relaxed) == 0) return false;
   bool r = false;
+  rec_lock();
   rc_lock();
   int i = un_find_locked(view, sid, name);
   if (i >= 0) {
@@ -1475,6 +1585,7 @@ static bool un_remove(const char *view, int64_t sid, const char *name, char *old
     r = true;
   }
   rc_unlock();
+  rec_unlock();
   return r;
 }
 
@@ -1502,6 +1613,7 @@ static uint64_t un_sweep(const char *view) {
     char old[1026];
     int64_t sid = 0;
     bool got = false;
+    rec_lock();
     rc_lock();
     for (size_t i = 0; i < RC.un_n && !got; i++)
       if (!RC.un[i].seen && strcmp(RC.un[i].view, view) == 0) {
@@ -1511,6 +1623,7 @@ static uint64_t un_sweep(const char *view) {
         got = true;
       }
     rc_unlock();
+    rec_unlock();
     if (!got) break;
     if (dbreg_delete(view, old, sid) > 0) n++;
   }
@@ -1682,8 +1795,8 @@ void db_recon_cursor_put(const char *view, uint64_t cursor, const uint8_t *ident
   }
 }
 
-/* One entry (design 5.3, 5.4).  See dns_db_store.h for the rules. */
-int db_recon_apply(const char *view, const db_recon_entry_t *e, uint32_t *zid_out) {
+/* One entry (design 5.3, 5.4).  See dns_db_store.h for the rules.  The step (what the record is, what it becomes) is one step for the writers of the records (g_rec_mu). */
+static int recon_apply_locked(const char *view, const db_recon_entry_t *e, uint32_t *zid_out) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   if (zid_out) *zid_out = STORE_NONE;
   if (!st || !view || !e || !e->name) return DBR_ERROR;
@@ -1772,6 +1885,13 @@ int db_recon_apply(const char *view, const db_recon_entry_t *e, uint32_t *zid_ou
   if (np && (res == DBR_NEW || res == DBR_CHANGED || res == DBR_RENAMED)) bits_clear(&RC.np_done, zid);
   if (zid_out) *zid_out = zid;
   return res;
+}
+
+int db_recon_apply(const char *view, const db_recon_entry_t *e, uint32_t *zid_out) {
+  rec_lock();
+  int r = recon_apply_locked(view, e, zid_out);
+  rec_unlock();
+  return r;
 }
 
 static void rc_count(int res, bool in_pass) {
@@ -2012,7 +2132,7 @@ done:
   rc_unlock();
 }
 
-int db_recon_delete(const char *view, int64_t source_id, const char *name) {
+static int recon_delete_locked(const char *view, int64_t source_id, const char *name) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   if (!st || !view) return 0;
   char zone[1026], uold[1026];
@@ -2093,6 +2213,13 @@ int db_recon_scan(uint32_t *cursor, unsigned budget, db_scan_item_t *out) {
   return rc;
 }
 
+int db_recon_delete(const char *view, int64_t source_id, const char *name) {
+  rec_lock();
+  int r = recon_delete_locked(view, source_id, name);
+  rec_unlock();
+  return r;
+}
+
 void db_recon_scan_retry(uint32_t zid) {
   if (zid >= UN_ZID_BASE && zid != STORE_NONE) {
     rc_lock();
@@ -2102,6 +2229,91 @@ void db_recon_scan_retry(uint32_t zid) {
     return;
   }
   bits_clear(&RC.np_done, zid);
+}
+
+/* ---- a fetched body is installed only for the stamp it was asked for ---- */
+
+/* The stamp of the Backend's entry for the zone: the store's record, or the entry of a zone the store cannot name (RC.un).  The record of a secondary or catalog zone is no entry here (it has no body to match). */
+bool db_store_zone_stamp(const char *view, const char *zone, db_stamp_t *out, int64_t *sid) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  if (!st || !view || !zone) return false;
+  char name[DBS_NAME_MAX];
+  size_t nlen;
+  if (!store_name(zone, name, sizeof(name), &nlen)) {
+    bool ok = false;
+    if (atomic_load_explicit(&UN_CNT, memory_order_relaxed) == 0) return false;
+    rc_lock();
+    const int i = un_find_locked(view, 0, zone);
+    if (i >= 0) {
+      out->gen = RC.un[i].gen;
+      out->time = RC.un[i].time;
+      if (sid) *sid = RC.un[i].sid;
+      ok = true;
+    }
+    rc_unlock();
+    return ok;
+  }
+  dbdir_rec_t r;
+  if (!dir_rec_get(view, zone, &r)) return false;
+  out->gen = r.stamp_gen;
+  out->time = r.stamp_time;
+  if (sid) *sid = r.source_id;
+  return true;
+}
+
+/* The commit of a body (the install into the entry has been made; what follows is dbreg_commit(): the version goes to the store with the record's stamp, the registry takes the zone) is one step with
+ * the writers of the stamp.  expect: the stamp the body was asked for (NULL: no condition, the body is a batch's).  The record having another stamp (the database changed the zone again after the request: the
+ * CHANGES entry marked the record wanted) or none (the zone was deleted) takes nothing from this body: DBC_STALE, DBC_GONE.  Always followed by db_store_commit_end(); until then the store takes no version
+ * from this thread after a refusal (dbreg_commit() of a zone that is in memory still has to follow, for the registry of the entry that was updated), and the writers of the records wait. */
+int db_store_commit_begin(const char *view, const char *zone, const db_stamp_t *expect) {
+#ifdef KARIDNS_UNIT_TEST
+  if (db_store_test_commit_hook) db_store_test_commit_hook(0, zone);      /* (before the step: another writer may come in) */
+#endif
+  rec_lock();
+  int rc = DBC_OK;
+  if (expect) {
+    db_stamp_t cur;
+    if (!db_store_zone_stamp(view, zone, &cur, NULL)) rc = DBC_GONE;
+    else if (cur.gen != expect->gen || cur.time != expect->time) rc = DBC_STALE;
+  }
+  t_put_refuse = rc != DBC_OK;
+#ifdef KARIDNS_UNIT_TEST
+  if (db_store_test_commit_hook) db_store_test_commit_hook(1, zone);      /* (inside the step: another writer waits) */
+#endif
+  return rc;
+}
+
+void db_store_commit_end(void) {
+  t_put_refuse = false;
+  rec_unlock();
+}
+
+/* After a body was dropped (installed: `installed` is the stamp it was asked for): is the zone still wanted?  A record that is KNOWN or STALE and not refused is (the scan of the wanted bodies asks again); an
+ * installed body leaves a wanted record only when the stamp moved after it (the install made the record current, so a record that still wants a body has another stamp: asking again for the same one would
+ * not end).  A zone the store cannot name is made wanted again by the scan (the stamp of its entry is the one that changed). */
+bool db_store_wanted_again(const char *view, const char *zone, const db_stamp_t *installed) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  if (!st || !view || !zone) return false;
+  char name[DBS_NAME_MAX];
+  size_t nlen;
+  if (!store_name(zone, name, sizeof(name), &nlen)) {
+    bool ok = false;
+    if (atomic_load_explicit(&UN_CNT, memory_order_relaxed) == 0) return false;
+    rec_lock();
+    rc_lock();
+    const int i = un_find_locked(view, 0, zone);
+    if (i >= 0 && (!installed || RC.un[i].gen != installed->gen || RC.un[i].time != installed->time)) {
+      RC.un[i].done = false;
+      ok = true;
+    }
+    rc_unlock();
+    rec_unlock();
+    return ok;
+  }
+  dbdir_rec_t r;
+  if (!dir_rec_get(view, zone, &r)) return false;
+  if (installed && r.stamp_gen == installed->gen && r.stamp_time == installed->time) return false;
+  return (r.state == STORE_STATE_KNOWN || (r.flags & STORE_F_STALE)) && !(r.flags & STORE_F_REJECTED_NEW);
 }
 
 static bool recon_status_cb(store_recon_t *o) {
@@ -2115,6 +2327,9 @@ bool db_store_start(const server_config_t *cfg) {
   store_opts_t o;
   store_opts_default(&o);
   o.mode = db->store_mode == 1 ? STORE_MODE_MAP : db->store_mode == 2 ? STORE_MODE_COPY : STORE_MODE_AUTO;
+  o.scrub_interval_s = db->store_scrub_interval;             /* 0.7 S6 (WP9): the scrub of the store: its interval, and the structure check it makes of every image it reads */
+  o.seg_size = db->store_segment_size;                       /* (0 = 256 MiB) */
+  o.validate = zone_image_validate;
   o.create = true;
   o.log = store_log_cb;
   store_t *st = NULL;
@@ -2169,6 +2384,8 @@ bool db_store_start(const server_config_t *cfg) {
   store_status_set_attached_fn(attached_fn);
   store_status_set_attached_count_fn(attached_count_fn);
   store_status_set_recon_fn(recon_status_cb);
+  store_status_set_extra_fn(extra_status_cb);
+  dbreg_err_set_sink(&g_err_sink);                           /* design 6.7: the rejection texts of zones that have a record go to err.ring */
   dbreg_set_evict_hook(evict_hook);
   G.wstop = false;
   if (pthread_create(&G.wthr, NULL, ticker_thread, NULL) != 0) return false;

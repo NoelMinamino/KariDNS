@@ -181,8 +181,8 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
   const zone_config_t *zcfg_now = zone_entry_config(cfg_now, entry);
   zone_veff_t veff;
   zone_limits_t limits;
-  zone_vopts_effective(cfg_now, zcfg_now, entry->view_name, &veff);
-  zone_limits_effective(cfg_now, zcfg_now, entry->view_name, &limits);
+  zone_vopts_effective(cfg_now, zcfg_now, zone_vname(entry), &veff);
+  zone_limits_effective(cfg_now, zcfg_now, zone_vname(entry), &limits);
 
   update_result_t result;
   int rcode = process_update_sections_policy(req, req_len, entry->domain, z_standby, &result, zcfg_now ? zext(zcfg_now)->upd_policy : NULL,
@@ -275,7 +275,7 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
   additional_from_auth_t policy = (zcfg && zext(zcfg)->additional_from_auth_specified)
                                       ? zext(zcfg)->additional_from_auth
                                       : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
-  zone_glue_track_build(z_next, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
+  zone_glue_track_build(z_next, entry->domain, snapshot_find_view(cur_snap, zone_vname(entry)), policy);
   build_zone_response_cache(z_next, active_cfg_prelink, entry);
   if (cur_snap) release_zone_snapshot(cur_snap);
 
@@ -1048,16 +1048,32 @@ static void notify_apex_targets(const zdir_elem_t *el, const zdir_apex_t *ap, vi
   }
 }
 
-/* ---- the NOTIFYs that wait for a zone of the store (0.7 L3, L4): the control thread only ---- */
+/* ---- the NOTIFYs that wait for a zone of the store (0.7 L3, L4): the control thread only ----
+ * A NOTIFY whose name server lives in a zone of the store that is not in memory yet goes at once to the addresses it knows; the zone is asked for in the background and the NOTIFY is made again
+ * a little later for the addresses that were missing.  The table remembers, for each such zone, the destinations that were done in this round (a second look must not send to them again) and how
+ * many looks are left.  A fresh request for the zone (another change, karictl notify: nobody has popped it from the table) starts a round of its own: everybody is notified again.
+ * The wait is bounded: NOTIFY_WAIT_FAST_TRIES looks NOTIFY_WAIT_MS apart (an attach is a few milliseconds on an idle host), then one a second up to NOTIFY_WAIT_TRIES in all (about 8 s: a store thread
+ * that is behind a cold read, a host under load); after that the missing name servers are named in the log and find the change at their next refresh. */
 #define NOTIFY_WAIT_MAX 32
-#define NOTIFY_WAIT_TRIES 5
+#define NOTIFY_WAIT_TRIES 12
+#define NOTIFY_WAIT_FAST_TRIES 5
 #define NOTIFY_WAIT_MS 200
+#define NOTIFY_WAIT_SLOW_MS 1000
+#define NOTIFY_DEST_MAX 64                 /* the size of the destination list of a NOTIFY (notify_send_zone()) */
+typedef struct {
+  uint8_t fam;                       /* AF_INET / AF_INET6 */
+  uint16_t port;                     /* network order */
+  uint8_t addr[16];
+} nwait_dest_t;
 typedef struct {
   bool used, queued;                 /* queued: due at due_ms (else the NOTIFY is being made now) */
+  bool rerun;                        /* notify_wait_pop() took it: the next look of the zone goes on with this round (else it is a fresh request) */
   uint8_t tries;
+  uint8_t ndone;
   char view[KARIDNS_VIEW_NAME_MAX];
   char zone[256];
   int64_t due_ms;
+  nwait_dest_t done[NOTIFY_DEST_MAX];
 } notify_wait_t;
 static notify_wait_t g_nwait[NOTIFY_WAIT_MAX];
 
@@ -1071,40 +1087,87 @@ static int nwait_find(const char *view, const char *zone) {
     if (g_nwait[i].used && strcmp(g_nwait[i].view, view) == 0 && domain_names_match_ci(g_nwait[i].zone, zone)) return i;
   return -1;
 }
-
-/* The NOTIFY of the zone cannot be made yet (it needs a zone of the store that was asked for in the background): make it again after NOTIFY_WAIT_MS.  false: do not wait (the table is full, or it has waited
- * NOTIFY_WAIT_TRIES times already): the NOTIFY is made with what is known, and the zone's entry is gone from the table. */
-bool notify_wait_add(const char *view, const char *zone) {
+/* the entry of the zone for a look that is made now; *cont: the look goes on with the round of the entry (a pop made it due), else the entry is a fresh round (the old round's destinations and tries are forgotten).
+ * create: make an entry when there is none (-1: the table is full). */
+static int nwait_enter(const char *view, const char *zone, bool create, bool *cont) {
   int i = nwait_find(view, zone);
+  *cont = false;
   if (i < 0) {
+    if (!create) return -1;
     for (int k = 0; k < NOTIFY_WAIT_MAX && i < 0; k++)
       if (!g_nwait[k].used) i = k;
-    if (i < 0) return false;
+    if (i < 0) return -1;
     memset(&g_nwait[i], 0, sizeof(g_nwait[i]));
     g_nwait[i].used = true;
     snprintf(g_nwait[i].view, sizeof(g_nwait[i].view), "%s", view);
     snprintf(g_nwait[i].zone, sizeof(g_nwait[i].zone), "%s", zone);
+    return i;
   }
+  *cont = g_nwait[i].rerun;
+  g_nwait[i].rerun = false;
+  g_nwait[i].queued = false;
+  if (!*cont) {
+    g_nwait[i].tries = 0;
+    g_nwait[i].ndone = 0;
+  }
+  return i;
+}
+/* another look in a while: false when the tries are used up (the entry is gone) */
+static bool nwait_resched(int i) {
   if (g_nwait[i].tries >= NOTIFY_WAIT_TRIES) {
     g_nwait[i].used = false;
     return false;
   }
+  const int64_t ms = g_nwait[i].tries < NOTIFY_WAIT_FAST_TRIES ? NOTIFY_WAIT_MS : NOTIFY_WAIT_SLOW_MS;
   g_nwait[i].tries++;
   g_nwait[i].queued = true;
-  g_nwait[i].due_ms = nwait_now_ms() + NOTIFY_WAIT_MS;
+  g_nwait[i].rerun = false;
+  g_nwait[i].due_ms = nwait_now_ms() + ms;
   return true;
+}
+static void nwait_dest_key(const struct sockaddr_storage *a, nwait_dest_t *k) {
+  memset(k, 0, sizeof(*k));
+  k->fam = (uint8_t)a->ss_family;
+  if (a->ss_family == AF_INET) {
+    k->port = ((const struct sockaddr_in *)a)->sin_port;
+    memcpy(k->addr, &((const struct sockaddr_in *)a)->sin_addr, 4);
+  } else {
+    k->port = ((const struct sockaddr_in6 *)a)->sin6_port;
+    memcpy(k->addr, &((const struct sockaddr_in6 *)a)->sin6_addr, 16);
+  }
+}
+static bool nwait_is_done(int i, const struct sockaddr_storage *a) {
+  nwait_dest_t k;
+  nwait_dest_key(a, &k);
+  for (int d = 0; d < g_nwait[i].ndone; d++)
+    if (memcmp(&g_nwait[i].done[d], &k, sizeof(k)) == 0) return true;
+  return false;
+}
+static void nwait_mark_done(int i, const struct sockaddr_storage *a) {
+  if (g_nwait[i].ndone >= NOTIFY_DEST_MAX || nwait_is_done(i, a)) return;
+  nwait_dest_key(a, &g_nwait[i].done[g_nwait[i].ndone++]);
+}
+
+/* The NOTIFY of the zone cannot be made yet (it needs a zone of the store that was asked for in the background): make it again a little later (NOTIFY_WAIT_MS, then NOTIFY_WAIT_SLOW_MS apart).  false: do not wait
+ * (the table is full, or the tries are used up): the NOTIFY goes with what is known, and the zone's entry is gone from the table.  A call for a zone that nobody has popped is a fresh request: its round starts again. */
+bool notify_wait_add(const char *view, const char *zone) {
+  bool cont;
+  int i = nwait_enter(view, zone, true, &cont);
+  if (i < 0) return false;
+  return nwait_resched(i);
 }
 /* the NOTIFY of the zone was made (or the zone is gone): forget its wait */
 void notify_wait_drop(const char *view, const char *zone) {
   int i = nwait_find(view, zone);
   if (i >= 0) g_nwait[i].used = false;
 }
-/* the next NOTIFY whose time has come (it stays in the table, with its tries, until notify_wait_drop() or a notify_wait_add() that says no) */
+/* the next NOTIFY whose time has come (it stays in the table, with its tries and the destinations it has done, until notify_wait_drop() or a notify_wait_add() that says no) */
 bool notify_wait_pop(char *view, size_t vcap, char *zone, size_t zcap) {
   const int64_t now = nwait_now_ms();
   for (int i = 0; i < NOTIFY_WAIT_MAX; i++) {
     if (!g_nwait[i].used || !g_nwait[i].queued || g_nwait[i].due_ms > now) continue;
     g_nwait[i].queued = false;
+    g_nwait[i].rerun = true;
     snprintf(view, vcap, "%s", g_nwait[i].view);
     snprintf(zone, zcap, "%s", g_nwait[i].zone);
     return true;
@@ -1122,12 +1185,20 @@ int notify_wait_count(bool make_due) {
     }
   return n;
 }
+/* tests: the destinations the round of the zone has done (-1: no entry) and the tries it has used */
+int notify_wait_done(const char *view, const char *zone, int *tries) {
+  int i = nwait_find(view, zone);
+  if (i < 0) return -1;
+  if (tries) *tries = g_nwait[i].tries;
+  return g_nwait[i].ndone;
+}
 #endif
 
 /* The NOTIFY messages of a zone: entry is the zone in memory, or NULL and el is its directory element (the data is out of memory: the NS hosts come from the apex
  * of its summary, the settings from the element).  The control thread only. */
 static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, const char *view_name) {
   const char *domain = entry ? entry->domain : el->name;
+  const char *wview = view_name ? view_name : "";      /* (the key of the zone in the wait table) */
   /* 制御スレッドだけが呼ぶ (応答待ちの表を持つため。他のスレッドは notify_request_send())。
    * 設定・スナップショット・arena を読むので、全体を読み取り区間に入れる (UDP の送信と TCP の交換を始めるだけで、待ちは無い)。*/
   rcu_aux_read_lock();
@@ -1135,6 +1206,7 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
   zone_db_snapshot_t *snap = acquire_zone_snapshot();
   if (snap) retain_zone_snapshot(snap);
   if (!active && !snap) {
+    notify_wait_drop(wview, domain);
     rcu_aux_read_unlock();
     return;
   }
@@ -1157,6 +1229,7 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
   if (mode == NOTIFY_MODE_NO || (mode == NOTIFY_MODE_PRIMARY_ONLY && entry && zone_entry_ticks(entry))) {
     logev_post(LOGC_NOTIFY, 1, NULL, 0, "[Notify] zone '%s' (view '%s'): no NOTIFY is sent: %s", domain, view_name ? view_name : "",
                mode == NOTIFY_MODE_NO ? "notify no" : "notify primary-only and the zone is a secondary");
+    notify_wait_drop(wview, domain);                  /* (a wait of this zone ends: nothing is sent) */
     if (snap) release_zone_snapshot(snap);
     if (active) release_config_snapshot(active);
     rcu_aux_read_unlock();
@@ -1247,12 +1320,12 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
     if (ap) notify_apex_targets(el, ap, view, eff.notify_to_soa, key, ns_port, targets, &ntargets, 64);
   }
 
-  /* An address that is in a zone that is on its way into memory: no NOTIFY now, one a little later (the control thread's wait table, notify_wait_pop()), a few times; after that what is known is sent */
-  if (sib_wait && notify_wait_add(view_name ? view_name : "", domain)) {
-    logev_post(LOGC_NOTIFY, 2, NULL, 0, "[Notify] zone '%s' (view '%s'): waits for a zone of the store that holds the address of a name server", domain, view_name ? view_name : "");
-    goto out;
-  }
-  if (!sib_wait) notify_wait_drop(view_name ? view_name : "", domain);
+  /* An address that is in a zone that is on its way into memory is not known yet: the NOTIFY goes now to the addresses that are, and again a little later (the control thread's wait table, notify_wait_pop()) to the
+   * ones that were missing, a bounded number of times.  The wait table keeps the destinations that are done in this round, so that a later look sends to the others only.  A look of the zone that the wait
+   * table did not make (wi's round is fresh: another change, karictl notify) notifies everybody again. */
+  bool wcont = false;
+  const int wi = nwait_enter(wview, domain, sib_wait, &wcont);        /* (-1: no wait of the zone; with sib_wait: the table is full) */
+  int ndup = 0;
 
   if (g_notify_dropped)
     syslog(LOG_WARNING, "[Notify] zone '%s': more than %d NOTIFY destinations (also-notify and the NS hosts); the others get no NOTIFY and find the "
@@ -1264,6 +1337,11 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
              key ? "the zone's tsig-key is " : "the zone has no tsig-key (a key of also-notify or of a server statement may sign)", key && key->name ? key->name : "");
   int nsent = 0;
   for (int i = 0; i < ntargets; i++) {
+    if (wi >= 0 && wcont && nwait_is_done(wi, &targets[i].addr)) {   /* (an earlier look of this round sent to it: a second NOTIFY would only restart its retransmissions) */
+      ndup++;
+      continue;
+    }
+    if (wi >= 0 && sib_wait) nwait_mark_done(wi, &targets[i].addr);
     /* the local address of this NOTIFY: the `source` of the also-notify list the address is written in, else notify-source(-v6).  Only an
      * address that was in the configuration at start-up has a pre-bound socket (config_xfr_source_allowed()); another one is ignored with a
      * warning (a restart-only change) and the system chooses the source. */
@@ -1304,18 +1382,33 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
   }
 
   if (entry && nsent > 0) {   /* the NOTIFYs sent or queued (a rate-held one goes at a later tick); not the ones that could not be built */
-    atomic_fetch_add_explicit(&entry->observatory.notify_sent, nsent, memory_order_relaxed);
-    atomic_store_explicit(&entry->observatory.last_notify_time, (uint64_t)time(NULL), memory_order_relaxed);
+    zone_x_t *nx = zone_x_need(entry);       /* (NOTIFY is not the hot path: a zone that had no extension gets one) */
+    if (nx) {
+      atomic_fetch_add_explicit(&nx->obs.notify_sent, nsent, memory_order_relaxed);
+      atomic_store_explicit(&nx->obs.last_notify_time, (uint64_t)time(NULL), memory_order_relaxed);
+    }
   }
-  if (!entry) syslog(LOG_INFO, "[Notify] zone '%s' (data out of memory): NOTIFY to %d address(es)", domain, ntargets);
+  if (!entry) syslog(LOG_INFO, "[Notify] zone '%s' (data out of memory): NOTIFY to %d address(es)", domain, ntargets - ndup);
 
-out:
+  if (sib_wait) {
+    if (wi >= 0 && nwait_resched(wi)) {
+      logev_post(LOGC_NOTIFY, 2, NULL, 0, "[Notify] zone '%s' (view '%s'): %d NOTIFY(s) sent now, %d earlier in this round; the others wait for a zone of the store that holds the address of a name server (look %d of %d)", domain, wview,
+                 nsent, ndup, (int)g_nwait[wi].tries, NOTIFY_WAIT_TRIES);
+    } else {
+      /* the tries are used up (nwait_resched() ended the entry), or the table of waits is full: what was known has been sent; the name servers in the zone that did not come into memory get none */
+      syslog(LOG_WARNING, "[Notify] zone '%s' (view '%s'): a zone of the store that holds the address of a name server could not be brought into memory%s; that name server gets no NOTIFY "
+                          "(it finds the change at its next refresh)", domain, wview, wi >= 0 ? " in time" : " (no room in the table of waiting NOTIFYs)");
+    }
+  } else if (wi >= 0) {
+    g_nwait[wi].used = false;                                          /* (every address is known: the round is over) */
+  }
+
   if (snap) release_zone_snapshot(snap);
   if (active) release_config_snapshot(active);
   rcu_aux_read_unlock();
 }
 
-void send_notify_to_all(zone_db_entry_t *entry) { notify_send_zone(entry, NULL, entry->view_name); }
+void send_notify_to_all(zone_db_entry_t *entry) { notify_send_zone(entry, NULL, zone_vname(entry)); }
 
 void notify_send_nonresident(const zdir_elem_t *el, const char *view_name) { notify_send_zone(NULL, el, view_name); }
 

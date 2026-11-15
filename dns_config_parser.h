@@ -746,6 +746,8 @@ typedef struct {
   bool store_none;             /* `store none;`: no zone store, the zones are read from the database only (as before 0.7) */
   uint8_t store_mode;          /* `store-mode`: 0 auto (by the file system), 1 map, 2 copy (STORE_MODE_*) */
   uint32_t store_threads;      /* `store-threads`: threads that attach zones from the store, 1..8 (0 = the default, 2) */
+  uint64_t store_segment_size;     /* `store-segment-size`: the size a segment file of the store grows to before the next one is begun, 1 MiB..4 GiB (0 = the default, 256 MiB); the cleaner works one segment at a time */
+  uint32_t store_scrub_interval;   /* `store-scrub-interval`: seconds between the starts of two scrubs of the store, 60..31536000 (0 = the default, a week; UINT32_MAX = `off`) */
   char *server_id;             /* postgresql only (B11) */
   char **alias_resolver;       /* stored only (B9a): IP address literals */
   int alias_resolver_count;
@@ -773,6 +775,10 @@ typedef struct {
 #define KARIDNS_DB_HOT_INTERVAL_MAX 86400
 #define KARIDNS_DB_HOT_INTERVAL_DEFAULT 60
 #define KARIDNS_DB_DEFAULT_STORE_DIR "/var/db/karidns/store"   /* the store of a database { } block that names none: made when its parent exists (docs/karidns.md) */
+#define KARIDNS_DB_STORE_SEGMENT_MIN (1ull << 20)
+#define KARIDNS_DB_STORE_SEGMENT_MAX (4ull << 30)
+#define KARIDNS_DB_STORE_SCRUB_MIN 60
+#define KARIDNS_DB_STORE_SCRUB_MAX 31536000u
 #define KARIDNS_DB_STORE_THREADS_MAX 8
 #define KARIDNS_DB_STORE_THREADS_DEFAULT 2
 #define KARIDNS_DB_PARK_TIMEOUT_MIN 10

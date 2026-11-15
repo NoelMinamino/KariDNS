@@ -38,8 +38,9 @@
  *  over a delete can tell that it was reused.
  *
  *  Capsicum.  Everything is done through the directory fd: openat (O_CREAT, O_TRUNC; O_RESOLVE_BENEATH when available), pread, pwrite,
- *  pwritev, mmap (rw shared for the tables, ro for segments), msync, fsync, fdatasync, ftruncate, posix_fallocate, fstat, fstatfs,
- *  unlinkat; renameat and mkdirat (and readdir) only in store_quarantine(), which the Frontend runs before it hands the fd over.
+ *  pwritev, mmap (rw shared for the tables, ro for segments), msync, madvise, mincore, fsync, fdatasync, ftruncate, posix_fallocate, fstat, fstatfs,
+ *  unlinkat (the cleaner removes segments, the open removes old generations); renameat and mkdirat (and readdir) only in store_quarantine(), which the Frontend runs before it hands the fd over.
+ *  The store starts one detached thread (the zt read-ahead after the open; store_close() waits for its end).
  *  So the rights to limit the fd to: CAP_LOOKUP, CAP_CREATE, CAP_READ, CAP_WRITE, CAP_SEEK, CAP_MMAP_RW, CAP_FSYNC, CAP_FTRUNCATE,
  *  CAP_FALLOCATE, CAP_FSTAT, CAP_FSTATFS, CAP_UNLINKAT.  The boot id (opts.boot_id) must be passed in: sysctl is not available there.
  *
@@ -86,7 +87,7 @@ enum {
 };
 
 /* store_stats_t.state bits */
-#define STORE_ST_DEGRADED_NOSPC 0x1u  /* the last write failed with ENOSPC / EFBIG; cleared by the next success */
+#define STORE_ST_DEGRADED_NOSPC 0x1u  /* no room: the last write failed with ENOSPC / EFBIG / EDQUOT, or the store is degraded (new and changed zones are kept as records without an image, see store_put()); cleared by the next write that works, in the degraded state by the next image that is stored */
 #define STORE_ST_REPAIRED       0x2u  /* the last open had to rebuild the derived tables */
 
 typedef struct store store_t;
@@ -101,7 +102,7 @@ typedef struct store_opts {
   int      sync_policy;           /* STORE_SYNC_* */
   uint32_t sync_interval_ms;      /* STORE_SYNC_BATCH: longest time a writer call stays uncommitted; 0 = 100 */
   uint32_t checkpoint_interval_ms;/* 0 = 30000 (D6); UINT32_MAX = only by journal size and explicit calls */
-  uint64_t journal_max_bytes;     /* a checkpoint is forced when the journal reaches this size; 0 = 64 MiB */
+  uint64_t journal_max_bytes;     /* a checkpoint is forced when the journal reaches this size; 0 = 100 MiB (a replay of that is about a second) */
   uint64_t boot_id;               /* identifies this boot of the host (kern.boottime seconds); 0 = look it up, and if that is
                                    * not possible assume the worst.  After an unclean stop under a different boot id the open
                                    * rebuilds the derived tables after the replay (page cache lost -> pages may be ahead of the
@@ -110,6 +111,17 @@ typedef struct store_opts {
   bool     force_rebuild;         /* rebuild ix / sx / free list / counters at open (tests, repair) */
   void   (*log)(void *ctx, int level, const char *msg);  /* optional: 3 = error, 4 = warning, 6 = info */
   void    *log_ctx;
+  /* 0.7 WP9 (S6): the cleaner, the disk-full behaviour, the scrub.  Every field is "0 = the default". */
+  bool     no_degrade;            /* a write that finds no room is refused (-ENOSPC) instead of being kept as a record without an image (KNOWN): tests */
+  uint64_t reserve_bytes;         /* free bytes of the file system that only the cleaner may use: ordinary appends refuse (ENOSPC) below this; 0 = seg_size / 2, at least 256 KiB, at most 128 MiB */
+  uint64_t compact_rate;          /* bytes per second the cleaner moves (a token bucket); 0 = 16 MiB; UINT64_MAX = no limit */
+  uint32_t compact_min_dead_pct;  /* a segment is cleaned when at least this share of it is dead; 0 = 50 */
+  uint64_t nx_reclaim_min;        /* dead bytes of long names that make the space worth reclaiming (and at least half of nx); 0 = 4 MiB */
+  uint32_t scrub_interval_s;      /* seconds between the starts of two scrubs; 0 = a week, UINT32_MAX = never (karictl can still start one) */
+  uint64_t scrub_rate;            /* bytes per second the scrub reads; 0 = 16 MiB */
+  /* the structure check of an image (zone_image_validate()); the scrub calls it for every image it reads.  NULL = the checksum only. */
+  int    (*validate)(const void *image, size_t len, char *why, size_t whylen);
+  bool     no_readahead;          /* do not start the thread that reads zt into memory after the open (tests) */
 } store_opts_t;
 
 /* defaults of every field above (mode AUTO, create false, ...) */
@@ -213,7 +225,59 @@ typedef struct store_stats {
   store_recovery_t recovery;
   uint32_t nviews;
   store_view_stats_t views[STORE_MAX_VIEWS];
+  /* ---- 0.7 WP9 ---- */
+  uint64_t journal_max_bytes;     /* the size at which a checkpoint is forced */
+  uint32_t seg_free_numbers;      /* numbers of segments that were cleaned and removed (they are used again) */
+  uint32_t seg_draining;          /* segments with no live record that wait for a checkpoint, a grace period, the end of the references */
+  uint32_t seg_pinned;            /* segments that an attached zone's image (MAP mode) points into: not cleaned, not removed */
+  /* the cleaner */
+  uint64_t compact_runs, compact_moved_records, compact_moved_bytes, compact_segs_freed, compact_bad_records, compact_pinned_skips, compact_incomplete;
+  uint64_t compact_last_unix;
+  uint64_t compact_rate;          /* bytes per second, UINT64_MAX = no limit */
+  uint32_t compact_candidates;    /* segments that are dead enough to be cleaned now (not the open one) */
+  uint64_t compact_dead_bytes;    /* dead bytes of all segments but the open one: what the cleaner could win */
+  uint64_t nx_reclaims, nx_reclaimed_bytes;
+  /* disk space (the file system of the store, measured at every checkpoint and every second while the store is busy) */
+  uint64_t fs_total_bytes, fs_free_bytes, fs_checked_unix;
+  uint64_t reserve_bytes;
+  uint32_t fs_blksize;            /* st_blksize of the table file: on ZFS the dataset's recordsize */
+  bool     fs_recordsize_warn;    /* ZFS with a record size above 32 KiB */
+  uint32_t space_level;           /* 0 = ok, 1 = low (a WARNING was said), 2 = degraded: new images are not stored */
+  uint64_t store_bytes;           /* what the store occupies: segments, tables, indexes, journal */
+  uint64_t growth_bytes_per_hour; /* the growth of the last hour (0 = not known or shrinking) */
+  uint64_t full_in_hours;         /* at that growth the file system is full in this many hours (0 = not known) */
+  uint64_t degraded_puts, enospc_events, degraded_since_unix;
+  /* the scrub */
+  uint32_t scrub_interval_s;      /* UINT32_MAX = never */
+  bool     scrub_running;
+  uint32_t scrub_progress_pct;
+  uint64_t scrub_passes, scrub_last_start_unix, scrub_last_end_unix, scrub_zones_checked, scrub_bytes_checked;
+  uint64_t scrub_bad_images, scrub_bad_cells, scrub_bad_index, scrub_io_errors;
+  /* the open */
+  uint64_t ix_read_us;            /* the read of ix before the first answer */
+  uint64_t zt_readahead_us;       /* the read-ahead of zt in the background (0 while it runs) */
+  bool     zt_readahead_done;
+  uint64_t err_total;             /* texts put into err.ring since it was made */
 } store_stats_t;
+
+/* What one store_compact() did. */
+typedef struct store_compact_report {
+  uint64_t moved_records, moved_bytes;
+  uint32_t segs_emptied;          /* segments that have no live record now */
+  uint32_t segs_freed;            /* segments removed (their files are gone) */
+  uint64_t nx_reclaimed;          /* bytes of nx given back */
+  uint32_t bad_records;           /* live records that failed their checksum: the zone became KNOWN */
+} store_compact_report_t;
+
+/* What one scrub pass found. */
+typedef struct store_scrub_report {
+  uint64_t zones, images, bytes;
+  uint64_t bad_images;            /* checksum or structure: the zone became KNOWN */
+  uint64_t bad_cells;             /* the table record is damaged: dropped by the repair at the end of the pass */
+  uint64_t bad_index;             /* a zone that its index entry does not lead to: the repair rebuilt the indexes */
+  uint64_t io_errors;
+  bool     repaired;
+} store_scrub_report_t;
 
 typedef struct store_seg_info {
   uint32_t num;
@@ -286,7 +350,11 @@ unsigned store_view_depth_max(const store_t *s, uint16_t view);
 /* Insert or replace the zone (view, name) with a STORED image: append the record to the open segment, then one journal record
  * covers zt / zc / nx / ix / sx / counters, then the cells are written (readers see the zone atomically through the index slot,
  * or through the record CRC for a replace).  *zid (optional) receives the zone id.
- * -EEXIST: meta->source_id of another zone has the same (source, domain id, view) (rename: delete the old zone first). */
+ * -EEXIST: meta->source_id of another zone has the same (source, domain id, view) (rename: delete the old zone first).
+ * No room for the image (the free space is below opts.reserve_bytes, or the write fails with ENOSPC / EFBIG / EDQUOT): the cleaner runs at once and the put is tried again; if that
+ * does not help the store is degraded (design 3.5) and, unless opts.no_degrade, the zone is stored as in store_set_known(): its record with the new stamp and no image (the old
+ * image is released) and the call returns 0.  The caller sees the state with store_zone_get() (STORE_STATE_KNOWN); it is stored again by the next put when room is back.
+ * -ENOSPC is returned when even the record cannot be made (a table that cannot grow), and with opts.no_degrade. */
 int  store_put(store_t *s, uint16_t view, const char *name, size_t len, const store_meta_t *meta,
                const void *image, size_t image_len, uint32_t *zid);
 /* The zone exists with name and stamp but without an image (state KNOWN); a stored image of the zone is released. */
@@ -305,8 +373,9 @@ int  store_get_cursor(store_t *s, uint16_t source, bool *valid, uint64_t *cursor
 int  store_reserve(store_t *s, uint64_t zones);
 /* group commit point: fdatasync the segments written and the journal.  After it every writer call made before is durable. */
 int  store_commit(store_t *s);
-/* the time-driven part: commits when the policy says so and checkpoints when checkpoint_interval_ms has passed.  Call about once
- * per second from the writer thread (writer calls do the same check). */
+/* the time-driven part: commits when the policy says so and checkpoints when checkpoint_interval_ms has passed (writer calls do the same check), and (0.7 WP9) the work of the
+ * background: the cleaner (at opts.compact_rate), the removal of the segments it emptied, the nx pass, the free-space check, the scrub (at opts.scrub_rate).  Call about once per
+ * second from the store's thread, which is not inside a read section; a call takes up to about 300 ms when there is work. */
 int  store_tick(store_t *s);
 /* flush the files, write the other superblock copy with the checkpoint LSN, start a new journal, remove what no superblock
  * names any more (design 3.4 with a journal) */
@@ -321,6 +390,50 @@ int  store_checkpoint_clean(store_t *s);
  * here; the caller then fetches it again.  (An image that fails its checksum is different: its zt cell is fine, and
  * store_set_known() releases it.) */
 int  store_repair(store_t *s);
+
+/* ---- 0.7 WP9: the cleaner, the scrub (design 3.2, 2.4) ---- */
+/* The cleaner moves the live records of the segments that are mostly dead into the open segment (the journal makes each move one record: a crash leaves the old or the new location,
+ * never both, never none) and then removes the empty segments.  It runs by itself from store_tick() (low priority, a bounded rate: opts.compact_rate); this call runs it now.
+ * It also gives back the space of long names that were deleted (nx).  A segment is removed only when (a) a checkpoint after the last move is on disk, (b) every reader that could
+ * still hold the old location has left its read section, and (c) no image that was read from it is held (MAP mode: store_img_release() not called yet): the segment is "pinned"
+ * until then; in COPY mode nothing points into a segment.
+ * max_bytes: stop after that many bytes were moved (0 = no limit).  finish: also make the checkpoint and remove the segments that are empty now (otherwise that happens at the
+ * next checkpoint and tick).  Returns 0 or a negative errno; *rep (optional) says what happened. */
+int  store_compact(store_t *s, uint64_t max_bytes, bool finish, store_compact_report_t *rep);
+/* The scrub (design 2.4): every zone record is read; table record (CRC), index reachability, and for a stored zone the image (checksum, and opts.validate's structure check).
+ * A bad image makes its zone KNOWN, so that it is read from the database again; damaged table records and index entries that do not lead to their zone are repaired
+ * by store_repair() at the end of the pass.  store_scrub_run() does a whole pass now (no rate limit; blocks); the tick starts one by itself every opts.scrub_interval_s and runs it
+ * in slices at opts.scrub_rate.  start / stop: for the operator (karictl store scrub). */
+int  store_scrub_run(store_t *s, store_scrub_report_t *rep);
+/* The operator's "clean now" (karictl store compact): the tick runs the cleaner without its rate limit until no segment is dead enough, then makes the checkpoint and removes the empty
+ * segments.  Returns at once. */
+void store_compact_request(store_t *s);
+void store_scrub_start(store_t *s);
+void store_scrub_stop(store_t *s);
+
+/* ---- 0.7 S6: the error ring and the NOTIFY-due scan (design 6.6, 6.7) ---- */
+/* `err.ring`: the last STORE_ERR_ENTRIES texts of zones that were refused or failed (rejection of a body, a failed install, ...), a fixed file of 14 MB (sparse until it is used) that
+ * is written in place and wrapped; it is not journaled (a crash may lose the last entries) and it never holds the Backend's heap.  An entry says which zone id, which version stamp,
+ * when, and why.  A zone id is reused after a delete: the caller checks the name (store_zone_get()) and the stamp before it shows a text.  Any thread may put and get. */
+#define STORE_ERR_ENTRIES 65536u
+#define STORE_ERR_TEXT    192            /* bytes of a text, the NUL included; longer texts are cut */
+typedef struct store_err {
+  uint64_t seq;                          /* 1, 2, 3 ... in the order they were put */
+  uint32_t zid;
+  uint64_t stamp_gen;
+  uint64_t time;                         /* unix time */
+  char     text[STORE_ERR_TEXT];
+} store_err_t;
+int  store_err_put(store_t *s, uint32_t zid, uint64_t stamp_gen, const char *text);
+/* the newest entry of the zone id that is still in the ring: 0, or -ENOENT (none, or it was overwritten).  O(STORE_ERR_ENTRIES) in the worst case (a scan from the newest entry back). */
+int  store_err_get(const store_t *s, uint32_t zid, store_err_t *out);
+/* forget the zone's text (a version of the zone was registered): a later store_err_get() of the zone id says -ENOENT until a new text is put (a record with an empty text hides the older ones) */
+int  store_err_clear(store_t *s, uint32_t zid);
+/* how many entries were ever put (the ring holds the last STORE_ERR_ENTRIES of them) */
+uint64_t store_err_total(const store_t *s);
+/* Next zone (by zid, from *cursor, which starts at 0) that has `flag` set in zt.flags, e.g. STORE_F_NOTIFY_DUE: 1 and *out filled, 0 at the end, -EBADMSG for a damaged record as
+ * store_iter().  The flag itself is set and cleared with store_set_flags() (journaled: a NOTIFY that was due at a crash is due after the restart). */
+int  store_flag_next(const store_t *s, uint32_t *cursor, uint16_t flag, store_zone_t *out);
 
 /* ---- statistics, verification ---- */
 void store_stats(const store_t *s, store_stats_t *out);                 /* O(views), no lock */
@@ -344,6 +457,12 @@ extern long store_test_fail_commit;
 extern int (*store_test_write_fault)(const char *op, uint32_t zid);
 /* called by store_stats() after it has read the index generation (the window in which a writer may retire it) */
 extern void (*store_test_in_stats)(void);
+/* the free bytes of the store's file system, as the test wants them (a negative value = ask the file system) */
+extern int64_t (*store_test_fs_free)(void);
+/* an append of an image record fails with the errno this returns (not 0) before it writes anything: the disk fills up between the free-space check and the write */
+extern int (*store_test_append_fault)(uint64_t reclen);
+/* called at the start of every slice of the cleaner (writer mutex held) with the segment it is emptying: a test takes a reference of an image there (store_image_read does not need the mutex) */
+extern void (*store_test_cleaner_step)(store_t *s, uint32_t victim);
 uint64_t store_test_siphash(unsigned c, unsigned d, const uint8_t key[16], const uint8_t *in, size_t len);
 uint32_t store_test_crc32c(uint32_t crc, const void *p, size_t n);
 uint64_t store_test_sum64(const void *p, size_t n);

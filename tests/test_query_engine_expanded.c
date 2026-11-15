@@ -1239,7 +1239,7 @@ static void test_prelink_zone_additional_glue_policies(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "glue.example.";
-    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    entry.view_name = "default";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -2078,7 +2078,7 @@ static void test_delegation_referral_and_ds_handling(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "example.com.";
-    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    entry.view_name = "default";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -2486,15 +2486,15 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     memset(&obs_entry, 0, sizeof(obs_entry));
     record_observatory_response(NULL, 0, 1);
     record_observatory_response(&obs_entry, 0, 1); // noerror
-    assert(atomic_load_explicit(&obs_entry.observatory.responses_noerror, memory_order_relaxed) == 1);
+    assert(zone_ctr_get(&obs_entry, ZCTR_NOERROR) == 1);
     record_observatory_response(&obs_entry, 0, 0); // nodata
-    assert(atomic_load_explicit(&obs_entry.observatory.responses_nodata, memory_order_relaxed) == 1);
+    assert(zone_ctr_get(&obs_entry, ZCTR_NODATA) == 1);
     record_observatory_response(&obs_entry, 3, 0); // nxdomain
-    assert(atomic_load_explicit(&obs_entry.observatory.responses_nxdomain, memory_order_relaxed) == 1);
+    assert(zone_ctr_get(&obs_entry, ZCTR_NXDOMAIN) == 1);
     record_observatory_response(&obs_entry, 2, 0); // servfail
-    assert(atomic_load_explicit(&obs_entry.observatory.responses_servfail, memory_order_relaxed) == 1);
+    assert(zone_ctr_get(&obs_entry, ZCTR_SERVFAIL) == 1);
     record_observatory_response(&obs_entry, 5, 0); // refused
-    assert(atomic_load_explicit(&obs_entry.observatory.responses_refused, memory_order_relaxed) == 1);
+    assert(zone_ctr_get(&obs_entry, ZCTR_REFUSED) == 1);
 
     // 6. select_view
     zone_db_snapshot_t snap;
@@ -2718,7 +2718,7 @@ static void test_dname_synthesis_and_wildcard_proofs(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "dname.example.";
-    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    entry.view_name = "default";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -2796,7 +2796,7 @@ static void test_query_engine_protocol_qclass_and_edns_branches(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "qproto.example.";
-    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    entry.view_name = "default";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
@@ -3485,7 +3485,7 @@ static void test_udp_bufsize_global_and_zone(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "ubuf.example.";
-    strlcpy(entry.view_name, "__default__", sizeof(entry.view_name));
+    entry.view_name = "__default__";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
     zone_db_entry_t *entries[1] = {&entry};
     view_snapshot_t view;
@@ -3586,7 +3586,7 @@ static void test_truncated_response_keeps_opt(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "tcopt.example.";
-    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    entry.view_name = "default";
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
     zone_db_entry_t *entries[1] = {&entry};
     view_snapshot_t view;

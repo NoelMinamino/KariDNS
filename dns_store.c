@@ -46,19 +46,58 @@
  * back to KNOWN in the caller (design 3.4 item 4).  The rebuild is also the repair path whenever the replay meets something
  * it cannot apply.
  *
- * Bounded size: a checkpoint is forced when the journal reaches journal_max_bytes (default 64 MiB), so the journal never grows
- * without limit and the replay after a crash is bounded.
+ * Bounded size: a checkpoint is forced when the journal reaches journal_max_bytes (default 100 MiB: a replay of that is about a second
+ * warm), so the journal never grows without limit and the replay after a crash is bounded.
  *
- * Disk full: a failed append / write / extension returns -ENOSPC (or -EFBIG) *before* any cell changed; the store stays
- * consistent and readable, STORE_ST_DEGRADED_NOSPC is set until the next success.
+ * ======================================================================================================================
+ * 0.7 WP9 (S6): the cleaner, disk full, the scrub, nx
+ * ======================================================================================================================
  *
- * Deliberate limits of this first cut (WP1): compaction of segments, the scrub and store-copy-max are WP9; a long name's bytes in
- * nx are never reclaimed (counted in nx_dead); ix / sx growth runs under the writer mutex (readers continue on the old
- * generation; a 10M-zone rebuild blocks the writer for seconds, once per 1.5x growth, or never after store_reserve()).
+ * The cleaner (design 3.2).  A segment whose records are mostly dead (replaced or deleted zones) is cleaned: its live records are copied,
+ * byte for byte, to the open segment and each zone's zt cell gets the new location.  One move = one journal record (the appended bytes
+ * are written and, at the commit, fdatasynced before the record is; the record carries the whole new cell and the counters), so after
+ * kill -9 or a power loss a zone's record is either at the old or at the new place, never missing and never in two places that the
+ * zone's cell names.  The old segment is removed only when
+ *     (a) it has no live record left (the counters say so), and it is not the open segment,
+ *     (b) a checkpoint that follows the last journal record of the move is on disk (a replay never starts before it, so it cannot want the file),
+ *     (c) the grace period of the readers has passed (a reader that read the old location before the move is done), and
+ *     (d) no image that was read from it is held (MAP mode: the reference count of the segment; an attached zone's image points into it).
+ * Removing = a journal record that zeroes the segment's counters ("used = 0" is what a free segment number is: the number is used again by
+ * the next new segment), then unlinkat().  A crash between the two leaves a file nobody names (the next creation truncates it), or a
+ * segment with counters and no file (removed again by the next tick).  COPY mode (the ZFS default) has no pointers into segments, so (c) is
+ * all there is.  The cleaner works on one segment at a time, from the one with the least live share, at most opts.compact_rate bytes a second, and takes
+ * the writer mutex per record (so the writers interleave).  A live record that fails its checksum is not copied: its zone becomes KNOWN.
+ *
+ * Space.  The file system's free bytes are read (fstatfs) at every checkpoint, after every megabyte appended and once a second while
+ * writes happen.  Ordinary appends refuse (-ENOSPC) when fewer than opts.reserve_bytes are free: that room is the cleaner's (it needs the
+ * live bytes of a segment to free the whole segment; the design's "one empty segment in reserve").  An append that fails (the reserve, or
+ * a real ENOSPC / EFBIG / EDQUOT) runs the cleaner at once and tries again; if that does not help the store is degraded (design 3.5):
+ * store_put() keeps the zone's new stamp as a record without an image (KNOWN: its old image is released) and returns 0, and the server answers
+ * the zone from memory / the database as it does for any zone that has no image; ERROR once a minute names the numbers; a successful append
+ * (the space came back) ends it.  A zone that needs a new table record when the tables cannot grow is refused (-ENOSPC) and the caller does
+ * not advance its cursor.  At every checkpoint a WARNING says when the file system is getting full: the store's size against the free space,
+ * and the time to full at the growth of the last hour.
+ *
+ * nx.  The names of zones longer than ST_NAME_INL are kept in nx, appended; a deleted zone leaves a hole (nx_dead).  When the holes are
+ * more than half of nx the names are moved down in place, in the order of their offsets, under the writer mutex: each move is one journal
+ * op (new offset, the bytes, the whole new cell) that is applied under the cell's sequence counter, so a reader of that zone retries
+ * and never sees half a name; the bytes of nx are only touched through 64-bit words (relaxed atomics) for the same reason.
+ *
+ * The scrub (design 2.4).  Every zone record is read: the cell (CRC), the way ix / sx lead to it, and for a stored zone the image
+ * (checksum64, then opts.validate: zone_image_validate()).  A bad image: the zone becomes KNOWN.  A bad cell or an index that does not lead to its
+ * zone: store_repair() at the end of the pass.  A pass starts every opts.scrub_interval_s (the time of the last one is in the superblock)
+ * and runs in slices at opts.scrub_rate.
+ *
+ * Start (design 7).  The open reads ix once from the beginning (the first lookup does not wait for the disk), then a thread reads zt in the
+ * background; both times are in the statistics.  On ZFS the open reads st_blksize of a table file (the dataset's recordsize) and warns above 32 KiB.
+ *
+ * Deliberate limits: store-copy-max (a big zone mapped instead of copied in COPY mode) is not done; ix / sx growth runs under the
+ * writer mutex (readers continue on the old generation; a 10M-zone rebuild blocks the writer for seconds, once per 1.5x growth, or never
+ * after store_reserve()); the nx pass blocks the writer as long (rarely: only when more than half of nx is dead).
  *
  * Journal ops (typed, each a TLV {u16 type, u16 0, u32 payload length}):
  *   ZREC zid + zt[64] + zc[64] | NX offset + bytes | IX / SX count x {slot, value} | V count x {field id, value}
- *   VIEW id + name | SRC source + cursor + identity | GEN which, generation, slots
+ *   VIEW id + name | SRC source + cursor + identity | GEN which, generation, slots | NXMOVE zid, new offset, name bytes, zt[64], zc[64]
  */
 
 #include "dns_store.h"
@@ -70,7 +109,9 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -103,6 +144,7 @@
 #define ST_LOC_SHIFT    36
 #define ST_LOC_MASK     ((1ull << ST_LOC_SHIFT) - 1)
 #define ST_NAME_INL     34u               /* name bytes inside zt */
+#define ST_NAME_MAX_B   256u              /* a name buffer */
 #define ST_IX_MIN       1024u
 #define ST_JHDR         64u
 #define ST_JREC_HDR     24u
@@ -115,6 +157,11 @@
 #define ST_IX_MAX_SLOTS (1ull << 36)      /* more than the 2^32 zone ids can fill (3 slots per zone); keeps every size computation far from a wrap */
 #define ST_SEG_MAX      (1ull << 42)      /* what a record location can address: 36 bits of 64 B units */
 #define ST_V_MAX        (1ull << 56)      /* no counter of the superblock is above this */
+#define ST_CL_CHUNK     (1u << 20)        /* the cleaner and the scrub read segments in pieces of this size (COPY mode) */
+#define ST_CL_SLICE_MS  200u              /* the longest the cleaner keeps working in one tick */
+#define ST_SCRUB_SLICE_MS 100u
+#define ST_GRING        128               /* samples of the store's size (one a minute): the growth of the last hours */
+#define ST_RA_STEP      (1u << 20)        /* the zt read-ahead looks at the stop flag every this many bytes */
 
 /* flat counter array v[] (superblock + journal "V" ops) */
 enum {
@@ -128,7 +175,7 @@ enum {
 #define ST_NV             4400u
 
 /* journal op types */
-enum { OP_ZREC = 1, OP_NX, OP_IX, OP_SX, OP_V, OP_VIEW, OP_SRC, OP_GEN, OP_REBUILD };
+enum { OP_ZREC = 1, OP_NX, OP_IX, OP_SX, OP_V, OP_VIEW, OP_SRC, OP_GEN, OP_REBUILD, OP_NXMOVE };
 
 /* file kinds */
 enum { FK_ZT = 1, FK_ZC, FK_NX, FK_IX, FK_SX, FK_SEG, FK_JRN };
@@ -237,6 +284,7 @@ typedef struct seg {
 typedef struct retire {
   uint64_t epoch;
   ixgen_t *g;
+  seg_t *sg;                           /* a segment that was removed: closed and unmapped after the grace period */
   struct retire *next;
 } retire_t;
 
@@ -296,6 +344,58 @@ struct store {
   _Atomic uint64_t n_puts, n_replaces, n_deletes, n_growths, n_checkpoints, n_commits, n_write_errors;
   _Atomic uint32_t state;
   store_recovery_t rec;
+
+  /* ---- 0.7 WP9 ---- */
+  uint64_t reserve_bytes;
+  uint8_t  seg_draining[ST_MAXSEG + 1];            /* writer: the segment has no live record; drain_lsn / drain_epoch say when */
+  uint64_t seg_drain_lsn[ST_MAXSEG + 1], seg_drain_epoch[ST_MAXSEG + 1];
+  uint64_t seg_skip_until[ST_MAXSEG + 1];          /* writer: the cleaner could not empty this segment (a damaged record): not again before this time (ms) */
+  uint32_t cl_seg;                                 /* writer: the segment the cleaner is emptying, and the offset it has scanned to */
+  uint64_t cl_off;
+  uint8_t *cl_buf;                                 /* COPY mode: a piece of the segment being scanned */
+  uint64_t cl_buf_off;
+  size_t   cl_buf_len, cl_buf_cap;
+  bool     in_cleaner;                             /* writer: appends may use the reserve */
+  double   cl_tokens;                              /* bytes the cleaner may still move now */
+  uint64_t cl_tokens_ms;
+  _Atomic uint64_t c_runs, c_moved_recs, c_moved_bytes, c_segs_freed, c_bad, c_pinned, c_incomplete, c_last_unix, c_nx_runs, c_nx_bytes;
+  _Atomic uint32_t c_draining, c_pinned_now;
+  _Atomic bool c_forced;                           /* the operator asked for the cleaner at full speed (store_compact_request) */
+  uint64_t emerg_block_until;                      /* the last emergency cleaning freed nothing: not again before this time (ms) */
+  /* space */
+  int64_t  avail_est;                              /* writer: free bytes of the file system as of the last probe less what was appended since; < 0 = unknown */
+  uint64_t probe_bytes, last_probe_ms;
+  _Atomic uint64_t fs_total, fs_avail, fs_checked_unix;
+  _Atomic uint32_t fs_blksize, fs_rec_warn;
+  _Atomic uint32_t space_level;
+  _Atomic bool degraded;                           /* a write went to the KNOWN fallback and no image was stored since */
+  uint64_t last_err_ms, last_warn_ms, nospc_since;
+  _Atomic uint64_t n_degraded, n_enospc, degraded_since;
+  struct { uint64_t ms, bytes; } gring[ST_GRING];
+  unsigned gcount, ghead;
+  uint64_t last_gsample_ms;
+  _Atomic uint64_t store_bytes, growth_bph, full_in_h;
+  /* scrub */
+  pthread_mutex_t sc_mu;
+  bool     sc_running, sc_need_repair;
+  uint32_t sc_cursor;
+  uint64_t sc_start_ms, sc_tokens_ms;
+  double   sc_tokens;
+  _Atomic uint64_t sc_last_start, sc_last_end, sc_passes, sc_zones, sc_bytes, sc_bad_img, sc_bad_cell, sc_bad_idx, sc_io;
+  _Atomic uint32_t sc_pct, sc_running_a;
+  uint64_t sc_p_zones, sc_p_images, sc_p_bytes, sc_p_bad_img, sc_p_bad_cell, sc_p_bad_idx, sc_p_io;       /* the pass that runs */
+  _Atomic uint64_t sc_last_done;                   /* unix time the last pass ended (superblock) */
+  /* err.ring */
+  int      err_fd;
+  uint8_t *err_map;
+  size_t   err_len;
+  pthread_mutex_t err_mu;
+  _Atomic uint64_t *err_bits;                     /* a bitmap of 2^20 bits: zone ids (hashed) that may have a text in the ring: store_err_clear() does not scan for the others */
+  /* open */
+  pthread_t ra_thr;
+  bool     ra_started;
+  _Atomic bool ra_stop, ra_done;
+  _Atomic uint64_t ra_ix_us, ra_zt_us;
 };
 
 /* ------------------------------------------------------------------------------------------------------------------ */
@@ -309,6 +409,9 @@ long store_test_fail_commit = 0;
 /* a writer function of the store (its name: "put", "set_known", "delete", "set_flags", "set_stamp", "set_cursor") fails before it changes anything with the errno this returns (0: no failure) */
 int (*store_test_write_fault)(const char *op, uint32_t zid) = NULL;
 void (*store_test_in_stats)(void) = NULL;
+int64_t (*store_test_fs_free)(void) = NULL;
+int (*store_test_append_fault)(uint64_t reclen) = NULL;
+void (*store_test_cleaner_step)(store_t *s, uint32_t victim) = NULL;
 #define ST_FAULT(op, zid) do { int fe_ = store_test_write_fault ? store_test_write_fault((op), (zid)) : 0; if (fe_) return fe_; } while (0)
 static void st_crash_point(void) {
   long c = store_test_crash_countdown;
@@ -339,7 +442,7 @@ static uint64_t st_now_us(void) {
 static void st_log(const store_t *s, int level, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 static void st_log(const store_t *s, int level, const char *fmt, ...) {
   if (!s->o.log) return;
-  char buf[256];
+  char buf[512];
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -623,19 +726,23 @@ static inline uint64_t st_zc_cap(const store_t *s) { return atomic_load_explicit
  * stable even counter therefore means a damaged cell, not a write in flight (a writer that is preempted in the middle of a cell only
  * makes readers wait, never fail early).  An odd counter left behind by a crash is repaired by the replay (the record is rewritten) or
  * by the rebuild. */
-static void zrec_write(const store_t *s, uint32_t z, const r64_t *zt, const r64_t *zc) {
+static void nx_write(store_t *s, uint64_t off, const uint8_t *src, size_t len);
+/* The same, and (nxlen != 0) the bytes of the zone's long name are written to nx inside the odd window: the nx pass moves a name and the cell that says where it is as one step. */
+static void zrec_write_nx(store_t *s, uint32_t z, const r64_t *zt, const r64_t *zc, uint64_t nxoff, const uint8_t *nxb, size_t nxlen) {
   _Atomic uint64_t *tc = (_Atomic uint64_t *)zt_cell(s, z), *cc = (_Atomic uint64_t *)zc_cell(s, z);
   uint32_t seq = (uint32_t)(atomic_load_explicit(&cc[7], memory_order_relaxed) >> 32);
   uint32_t odd = seq | 1u, even = odd + 1u;
   uint64_t low7 = zc->w[7] & 0xffffffffu;
   atomic_store_explicit(&cc[7], low7 | ((uint64_t)odd << 32), memory_order_relaxed);
   atomic_thread_fence(memory_order_release);
+  if (nxlen) nx_write(s, nxoff, nxb, nxlen);
   for (int i = 0; i < 7; i++) atomic_store_explicit(&cc[i], zc->w[i], memory_order_relaxed);
   for (int i = 0; i < 8; i++)
     if (i != 3) atomic_store_explicit(&tc[i], zt->w[i], memory_order_relaxed);
   atomic_store_explicit(&tc[3], zt->w[3], memory_order_release);
   atomic_store_explicit(&cc[7], low7 | ((uint64_t)even << 32), memory_order_release);
 }
+static void zrec_write(store_t *s, uint32_t z, const r64_t *zt, const r64_t *zc) { zrec_write_nx(s, z, zt, zc, 0, NULL, 0); }
 
 static int zrec_read_cells(const store_t *s, uint32_t z, r64_t *zt, r64_t *zc) {
   r64_load(zt_cell(s, z), zt);
@@ -645,7 +752,7 @@ static int zrec_read_cells(const store_t *s, uint32_t z, r64_t *zt, r64_t *zc) {
 }
 /* Reader: a consistent copy of the zt and zc cells of z (see zrec_write).  -ENOENT: z is beyond the files; -EBADMSG: the CRC does not
  * match (a damaged cell) or the cell stays in the middle of a write for longer than a crashed or very slow writer can explain. */
-static int zrec_read(const store_t *s, uint32_t z, r64_t *zt, r64_t *zc) {
+static int zrec_read_seq(const store_t *s, uint32_t z, r64_t *zt, r64_t *zc, uint32_t *seq_out) {
   if ((uint64_t)z >= st_zt_cap(s) || (uint64_t)z >= st_zc_cap(s)) return -ENOENT;
   const _Atomic uint64_t *cc = zc_cell(s, z);
   seqwait_t sw = { 0, 0 };
@@ -661,10 +768,12 @@ static int zrec_read(const store_t *s, uint32_t z, r64_t *zt, r64_t *zc) {
     uint32_t s2 = (uint32_t)(atomic_load_explicit(&cc[7], memory_order_relaxed) >> 32);
     if (s1 != s2) { if (!seq_wait(&sw)) break; continue; }
     zc->w[7] &= 0xffffffffu;
+    if (seq_out) *seq_out = s1;
     return zrec_crc(zt, zc) == zrec_stored_crc(zt) ? 0 : -EBADMSG;
   }
   return -EBADMSG;
 }
+static int zrec_read(const store_t *s, uint32_t z, r64_t *zt, r64_t *zc) { return zrec_read_seq(s, z, zt, zc, NULL); }
 /* Writer (holds the writer mutex, so no cell is changing): the same without the sequence protocol */
 static int zrec_read_locked(const store_t *s, uint32_t z, r64_t *zt, r64_t *zc) {
   if ((uint64_t)z >= st_zt_cap(s) || (uint64_t)z >= st_zc_cap(s)) return -ENOENT;
@@ -696,7 +805,39 @@ static bool v_value_ok(const store_t *s, uint32_t fid, uint64_t val) {
   return val <= ST_V_MAX;
 }
 
-/* the full name of a zone from its zt cell (inline part, or nx); false when the cell points outside nx */
+/* nx is read and written in 64-bit words (relaxed atomics): the nx pass (WP9) rewrites names in place while readers look at them, and a reader whose copy was disturbed
+ * throws it away (the sequence counter of the zone's cell, see zrec_write()); word accesses make that a race the C memory model allows (and TSan accepts), not a data race.
+ * A name's bytes are not word aligned; the writer reads and writes whole words, so the neighbours' bytes in a shared word are written back unchanged. */
+static void nx_read(const store_t *s, uint64_t off, uint8_t *dst, size_t len) {
+  const _Atomic uint64_t *w = (const _Atomic uint64_t *)(s->nx.base + (off & ~7ull));
+  size_t skip = (size_t)(off & 7u), i = 0;
+  while (i < len) {
+    uint64_t v = atomic_load_explicit(w++, memory_order_relaxed);
+    const uint8_t *b = (const uint8_t *)&v;
+    size_t n = 8 - skip;
+    if (n > len - i) n = len - i;
+    memcpy(dst + i, b + skip, n);
+    i += n;
+    skip = 0;
+  }
+}
+static void nx_write(store_t *s, uint64_t off, const uint8_t *src, size_t len) {
+  _Atomic uint64_t *w = (_Atomic uint64_t *)(s->nx.base + (off & ~7ull));
+  size_t skip = (size_t)(off & 7u), i = 0;
+  while (i < len) {
+    size_t n = 8 - skip;
+    if (n > len - i) n = len - i;
+    uint64_t v = 0;
+    if (n < 8) v = atomic_load_explicit(w, memory_order_relaxed);
+    memcpy((uint8_t *)&v + skip, src + i, n);
+    atomic_store_explicit(w++, v, memory_order_relaxed);
+    i += n;
+    skip = 0;
+  }
+}
+
+/* the full name of a zone from its zt cell (inline part, or nx); false when the cell points outside nx.  A reader that is not the writer checks the cell's sequence counter
+ * afterwards (store_zone_get()): the bytes of nx may have been moved under it. */
 static bool zt_fullname(const store_t *s, const zt_t *z, uint8_t *out) {
   if (z->klen <= ST_NAME_INL) {
     memcpy(out, z->name, z->klen);
@@ -706,7 +847,7 @@ static bool zt_fullname(const store_t *s, const zt_t *z, uint8_t *out) {
   memcpy(&off, z->name, 8);
   uint64_t avail = atomic_load_explicit(&s->nx_avail, memory_order_acquire);
   if (off > avail || (uint64_t)z->klen > avail - off) return false;
-  memcpy(out, s->nx.base + off, z->klen);
+  nx_read(s, off, out, z->klen);
   return true;
 }
 
@@ -745,7 +886,11 @@ static bool st_name_eq(const store_t *s, uint32_t z, uint16_t view, const uint8_
     if (memcmp(nb + 8, fn, ST_NAME_INL - 8) != 0) return false;
     uint64_t avail = atomic_load_explicit(&s->nx_avail, memory_order_acquire);
     if (off > avail || (uint64_t)len > avail - off) return false;
-    return memcmp(s->nx.base + off, fn, len) == 0;
+    uint8_t xb[ST_NAME_MAX_B];
+    nx_read(s, off, xb, len);
+    atomic_thread_fence(memory_order_acquire);
+    if (s1 != (uint32_t)(atomic_load_explicit(&cc[7], memory_order_relaxed) >> 32)) { if (!seq_wait(&sw)) break; continue; }       /* (the nx pass moved the name while it was read) */
+    return memcmp(xb, fn, len) == 0;
   }
   return false;
 }
@@ -971,10 +1116,20 @@ static int ixgen_open(store_t *s, uint32_t kind, uint32_t gen, uint64_t nslots, 
   return 0;
 }
 
+static void seg_free(seg_t *g);
 static void retire_add(store_t *s, ixgen_t *g) {
   retire_t *r = calloc(1, sizeof(*r));
   if (!r) return;   /* leak the mapping rather than free it under a reader */
   r->g = g;
+  r->epoch = rcu_writer_advance_epoch();
+  if (s->rq_tail) s->rq_tail->next = r; else s->rq_head = r;
+  s->rq_tail = r;
+}
+/* a segment that was removed: its descriptor (fd, mapping) is freed when the readers that could have looked at it are gone */
+static void retire_add_seg(store_t *s, seg_t *g) {
+  retire_t *r = calloc(1, sizeof(*r));
+  if (!r) return;
+  r->sg = g;
   r->epoch = rcu_writer_advance_epoch();
   if (s->rq_tail) s->rq_tail->next = r; else s->rq_head = r;
   s->rq_tail = r;
@@ -985,6 +1140,7 @@ static void retire_run(store_t *s, bool force) {
     s->rq_head = r->next;
     if (!s->rq_head) s->rq_tail = NULL;
     ixgen_free(r->g);
+    if (r->sg) seg_free(r->sg);
     free(r);
   }
 }
@@ -1265,9 +1421,26 @@ static int apply_ops(store_t *s, const uint8_t *ops, size_t len) {
       memcpy(&o, p, 8);
       memcpy(&n, p + 8, 4);
       if ((uint64_t)n + 16 > pl || o > s->nx.reserve || n > s->nx.reserve - o || ensure_nx_cap(s, o + n) < 0) { bad = -EINVAL; break; }
-      memcpy(s->nx.base + o, p + 16, n);
+      nx_write(s, o, p + 16, n);
       uint64_t cur = atomic_load_explicit(&s->nx_avail, memory_order_relaxed);
       if (o + n > cur) atomic_store_explicit(&s->nx_avail, o + n, memory_order_release);
+      break;
+    }
+    case OP_NXMOVE: {            /* the nx pass: a long name moves to a new offset, with the cell that names the offset */
+      uint32_t z, kl;
+      uint64_t o;
+      if (pl < 16 + 128) { bad = -EINVAL; break; }
+      memcpy(&z, p, 4);
+      memcpy(&kl, p + 4, 4);
+      memcpy(&o, p + 8, 8);
+      if (kl <= ST_NAME_INL || kl > STORE_NAME_MAX || (uint64_t)kl + 16 + 128 > pl || (uint64_t)z >= s->zt.reserve / ST_REC || o > s->nx.reserve ||
+          kl > s->nx.reserve - o || ensure_zt_cap(s, (uint64_t)z + 1) < 0 || ensure_nx_cap(s, o + kl) < 0) { bad = -EINVAL; break; }
+      r64_t zt, zc;
+      memcpy(&zt, p + 16, 64);
+      memcpy(&zc, p + 80, 64);
+      zrec_write_nx(s, z, &zt, &zc, o, p + 144, kl);
+      uint64_t cur = atomic_load_explicit(&s->nx_avail, memory_order_relaxed);
+      if (o + kl > cur) atomic_store_explicit(&s->nx_avail, o + kl, memory_order_release);
       break;
     }
     case OP_IX:
@@ -1379,6 +1552,7 @@ static int journal_open_new(store_t *s, uint32_t gen, uint64_t base_lsn) {
 }
 
 static int checkpoint_locked(store_t *s, bool clean);
+static void space_checkpoint(store_t *s);
 
 /* finish the builder's record (counters last), give it its LSN and CRC, write it.  The cells are not touched. */
 static int journal_append(store_t *s) {
@@ -1472,6 +1646,7 @@ static void sb_fill(store_t *s, sb_t *b, bool clean, uint64_t seq, uint32_t jrn_
   b->f.ix_slots = ix ? ix->nslots : 0;
   b->f.sx_slots = sx ? sx->nslots : 0;
   b->f.seg_size = s->seg_size;
+  b->f.rsv[0] = atomic_load_explicit(&s->sc_last_done, memory_order_relaxed);      /* the end of the last scrub pass (unix time) */
   b->f.nx_cap = atomic_load_explicit(&s->nx.mapped, memory_order_relaxed);
   memcpy(b->f.views, s->views, sizeof(s->views));
   memcpy(b->f.src, s->src, sizeof(s->src));
@@ -1575,6 +1750,7 @@ static int checkpoint_locked(store_t *s, bool clean) {
   s->n_checkpoints++;
   unlink_old_gens(s);
   retire_run(s, false);
+  space_checkpoint(s);
   return 0;
 }
 
@@ -1700,11 +1876,70 @@ static unsigned name_labels(const uint8_t *n, size_t len) {
 }
 static inline unsigned depth_bucket(unsigned labels) { return labels > 63 ? 63 : labels; }
 
+static void degraded_end(store_t *s);
+static inline bool is_nospc(int r) { return r == -ENOSPC || r == -EFBIG || r == -EDQUOT; }
+static bool rl_ok(uint64_t *last, uint64_t every_ms) {                       /* a log line that may be said once in every_ms */
+  uint64_t now = st_now_ms();
+  if (*last && now - *last < every_ms) return false;
+  *last = now;
+  return true;
+}
 static void note_error(store_t *s, int r) {
-  if (r == -ENOSPC || r == -EFBIG || r == -EDQUOT) atomic_fetch_or(&s->state, STORE_ST_DEGRADED_NOSPC);
+  if (is_nospc(r)) {
+    atomic_fetch_or(&s->state, STORE_ST_DEGRADED_NOSPC);
+    atomic_fetch_add(&s->n_enospc, 1);
+  }
   if (r < 0) s->n_write_errors++;
 }
-static void note_ok(store_t *s) { atomic_fetch_and(&s->state, ~(uint32_t)STORE_ST_DEGRADED_NOSPC); }
+/* a write worked: the "last write failed" flag goes, unless the store is degraded (images are being kept as KNOWN because there is no room): that ends when an image is stored */
+static void note_ok(store_t *s) {
+  if (!s->degraded) atomic_fetch_and(&s->state, ~(uint32_t)STORE_ST_DEGRADED_NOSPC);
+}
+
+/* ---- free space (design 3.5) ---- */
+
+static void fs_probe(store_t *s) {
+  uint64_t total = 0, avail = 0;
+  bool have = false;
+#ifdef KARIDNS_UNIT_TEST
+  if (store_test_fs_free) {
+    int64_t v = store_test_fs_free();
+    if (v >= 0) { avail = (uint64_t)v; total = avail > (1ull << 30) ? avail : (1ull << 30); have = true; }
+  }
+#endif
+#if defined(__FreeBSD__)
+  if (!have) {
+    struct statfs sfs;
+    if (fstatfs(s->dirfd, &sfs) == 0) {
+      total = (uint64_t)sfs.f_blocks * (uint64_t)sfs.f_bsize;
+      avail = sfs.f_bavail > 0 ? (uint64_t)sfs.f_bavail * (uint64_t)sfs.f_bsize : 0;
+      have = true;
+    }
+  }
+#endif
+  s->last_probe_ms = st_now_ms();
+  s->probe_bytes = 0;
+  if (!have) { s->avail_est = -1; return; }
+  s->avail_est = avail > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)avail;
+  atomic_store_explicit(&s->fs_total, total, memory_order_relaxed);
+  atomic_store_explicit(&s->fs_avail, avail, memory_order_relaxed);
+  atomic_store_explicit(&s->fs_checked_unix, (uint64_t)time(NULL), memory_order_relaxed);
+}
+/* An ordinary append of rlen bytes: is there room that is not the cleaner's?  (The estimate is the last probe less the bytes appended since; it is read again after a megabyte, a
+ * second, or when it says no.) */
+static int space_allow(store_t *s, uint64_t rlen) {
+  if (s->in_cleaner) return 0;
+  if (s->avail_est < 0 || s->probe_bytes >= (1u << 20) || st_now_ms() - s->last_probe_ms >= 1000) fs_probe(s);
+  if (s->avail_est >= 0 && (uint64_t)s->avail_est < s->reserve_bytes + rlen) {
+    fs_probe(s);
+    if (s->avail_est >= 0 && (uint64_t)s->avail_est < s->reserve_bytes + rlen) return -ENOSPC;
+  }
+  return 0;
+}
+static void space_used(store_t *s, uint64_t n) {
+  s->probe_bytes += n;
+  if (s->avail_est >= 0) s->avail_est = (uint64_t)s->avail_est > n ? s->avail_est - (int64_t)n : 0;
+}
 
 /* time- and size-driven commit / checkpoint after a writer call */
 static int post_write(store_t *s) {
@@ -1722,29 +1957,87 @@ static int post_write(store_t *s) {
   return r;
 }
 
-/* append an image record to the open segment (creating the next one when it does not fit); plans the counters.
- * *loc receives the location. */
-static int seg_append(store_t *s, uint32_t zid, uint16_t view, const uint8_t *fn, size_t klen, const store_meta_t *m,
-                      const void *image, size_t ilen, uint64_t prev_loc, uint64_t *loc, uint64_t *rlen_out) {
+/* The open segment for a record of rlen bytes: the current one when it has room, else a new one (the lowest free segment number: a segment that was cleaned and removed
+ * has "used = 0" and its number is used again).  The counters of a new segment go into the builder.  *cur / *used: where the record goes. */
+static int seg_place(store_t *s, uint64_t rlen, uint32_t *cur_out, uint64_t *used_out) {
   jb_t *j = &s->jb;
-  uint64_t rlen = st_reclen(klen, ilen);
   uint32_t cur = (uint32_t)jb_vget(s, j, V_CUR_SEG);
   uint64_t used = cur ? jb_vget(s, j, V_SEG(cur, 0)) : 0;
   if (cur == 0 || used + rlen > s->seg_size) {
-    uint32_t n = (uint32_t)jb_vget(s, j, V_NSEGS) + 1;
-    if (n > ST_MAXSEG) return -ENOSPC;
+    uint32_t nsegs = (uint32_t)jb_vget(s, j, V_NSEGS), n = 0;
+    int r;
+    for (uint32_t i = 1; i <= nsegs && i <= ST_MAXSEG; i++)
+      if (jb_vget(s, j, V_SEG(i, 0)) == 0) { n = i; break; }
+    if (!n) {
+      n = nsegs + 1;
+      if (n > ST_MAXSEG) return -ENOSPC;
+      if ((r = jb_vset(j, V_NSEGS, n)) < 0) return r;
+    }
     uint64_t cap = s->seg_size;
     if (ST_SEGHDR + rlen > cap) cap = ST_SEGHDR + rlen;
-    int r = seg_create(s, n, cap);
+    r = seg_create(s, n, cap);
     if (r < 0) return r;
-    if ((r = jb_vset(j, V_NSEGS, n)) < 0 || (r = jb_vset(j, V_CUR_SEG, n)) < 0 || (r = jb_vset(j, V_SEG(n, 0), ST_SEGHDR)) < 0 ||
-        (r = jb_vset(j, V_SEG(n, 1), 0)) < 0)
-      return r;
+    if ((r = jb_vset(j, V_CUR_SEG, n)) < 0 || (r = jb_vset(j, V_SEG(n, 0), ST_SEGHDR)) < 0 || (r = jb_vset(j, V_SEG(n, 1), 0)) < 0) return r;
     cur = n;
     used = ST_SEGHDR;
   }
+  *cur_out = cur;
+  *used_out = used;
+  return 0;
+}
+
+/* Append the record (iov: its bytes, rlen in all, a multiple of 64) to the open segment; *loc = where it is.  The counters (used, live of the segment) go into the builder: the
+ * caller's journal record makes them real.  Checked before anything is written: the free space (the cleaner may use the reserve). */
+static int seg_put_bytes(store_t *s, const struct iovec *iov, int niov, uint64_t rlen, uint64_t *loc) {
+  jb_t *j = &s->jb;
+  int r = space_allow(s, rlen);
+  if (r < 0) return r;
+  uint32_t cur;
+  uint64_t used;
+  if ((r = seg_place(s, rlen, &cur, &used)) < 0) return r;
   seg_t *g = seg_get(s, cur);
   if (!g) return -EIO;
+#ifdef KARIDNS_UNIT_TEST
+  if (store_test_append_fault) {
+    int fe = store_test_append_fault(rlen);
+    if (fe) return fe;
+  }
+#endif
+  off_t off = (off_t)used;
+  size_t done = 0, total = (size_t)rlen;
+  CRASH_POINT();
+  while (done < total) {
+    struct iovec v[4];
+    int nv = 0;
+    size_t skip = done;
+    for (int i = 0; i < niov && i < 4; i++) {
+      if (skip >= iov[i].iov_len) { skip -= iov[i].iov_len; continue; }
+      v[nv].iov_base = (uint8_t *)iov[i].iov_base + skip;
+      v[nv].iov_len = iov[i].iov_len - skip;
+      skip = 0;
+      nv++;
+    }
+    ssize_t w = pwritev(g->fd, v, nv, off + (off_t)done);
+    if (w < 0) {
+      if (errno == EINTR) continue;
+      return -errno;
+    }
+    if (w == 0) return -EIO;
+    done += (size_t)w;
+  }
+  CRASH_POINT();
+  s->seg_dirty[cur] = 1;
+  *loc = ((uint64_t)cur << ST_LOC_SHIFT) | (used / 64);
+  space_used(s, rlen);
+  r = jb_vset(j, V_SEG(cur, 0), used + rlen);
+  if (r == 0) r = jb_vset(j, V_SEG(cur, 1), jb_vget(s, j, V_SEG(cur, 1)) + rlen);
+  return r;
+}
+
+/* append an image record to the open segment; plans the counters.  *loc receives the location. */
+static int seg_append(store_t *s, uint32_t zid, uint16_t view, const uint8_t *fn, size_t klen, const store_meta_t *m,
+                      const void *image, size_t ilen, uint64_t prev_loc, uint64_t *loc, uint64_t *rlen_out) {
+  uint64_t rlen = st_reclen(klen, ilen);
   rhdr_t h;
   memset(&h, 0, sizeof(h));
   h.magic = ST_MAGIC_REC;
@@ -1770,35 +2063,8 @@ static int seg_append(store_t *s, uint32_t zid, uint16_t view, const uint8_t *fn
   sum = st_sum64(image, ilen, sum);
   h.checksum = sum;
   struct iovec iov[4] = { { &h, sizeof(h) }, { namepad, np }, { (void *)image, ilen }, { tail, tl } };
-  size_t total = sizeof(h) + np + ilen + tl;
-  off_t off = (off_t)used;
-  size_t done = 0;
-  CRASH_POINT();
-  while (done < total) {
-    struct iovec v[4];
-    int nv = 0;
-    size_t skip = done;
-    for (int i = 0; i < 4; i++) {
-      if (skip >= iov[i].iov_len) { skip -= iov[i].iov_len; continue; }
-      v[nv].iov_base = (uint8_t *)iov[i].iov_base + skip;
-      v[nv].iov_len = iov[i].iov_len - skip;
-      skip = 0;
-      nv++;
-    }
-    ssize_t w = pwritev(g->fd, v, nv, off + (off_t)done);
-    if (w < 0) {
-      if (errno == EINTR) continue;
-      return -errno;
-    }
-    if (w == 0) return -EIO;
-    done += (size_t)w;
-  }
-  CRASH_POINT();
-  s->seg_dirty[cur] = 1;
-  *loc = ((uint64_t)cur << ST_LOC_SHIFT) | (used / 64);
-  *rlen_out = rlen;
-  int r = jb_vset(j, V_SEG(cur, 0), used + rlen);
-  if (r == 0) r = jb_vset(j, V_SEG(cur, 1), jb_vget(s, j, V_SEG(cur, 1)) + rlen);
+  int r = seg_put_bytes(s, iov, 4, rlen, loc);
+  if (r == 0) *rlen_out = rlen;
   return r;
 }
 
@@ -1984,6 +2250,434 @@ static int put_locked(store_t *s, uint16_t view, const char *name, size_t nlen, 
   if (r < 0) return r;
   if (exists) s->n_replaces++; else s->n_puts++;
   if (zid_out) *zid_out = nz;
+  if (state == STORE_STATE_STORED && s->degraded) degraded_end(s);
+  return 0;
+}
+
+/* ------------------------------------------------------------------------------------------------------------------ */
+/* 0.7 WP9: degraded mode, the cleaner, the nx pass                                                                     */
+/* ------------------------------------------------------------------------------------------------------------------ */
+
+static void space_dead_totals(const store_t *s, uint64_t *dead_total);
+
+static void degraded_begin(store_t *s) {
+  if (!s->degraded) {
+    s->degraded = true;
+    atomic_store_explicit(&s->degraded_since, (uint64_t)time(NULL), memory_order_relaxed);
+    atomic_store_explicit(&s->space_level, 2, memory_order_relaxed);
+  }
+  atomic_fetch_or(&s->state, STORE_ST_DEGRADED_NOSPC);
+  if (rl_ok(&s->last_err_ms, 60000)) {
+    uint64_t dead = 0;
+    space_dead_totals(s, &dead);
+    st_log(s, 3, "store: no room for zone images: %" PRIu64 " bytes are free on the file system, %" PRIu64 " of them are kept for the cleaner; the store holds %" PRIu64 " bytes, %" PRIu64
+                 " of them dead.  Images of new and changed zones are not stored (the zone is kept without an image and read from the database when it is asked for); images that are stored are still served.  "
+                 "%" PRIu64 " zones were kept without an image since the space ran out",
+           (uint64_t)(s->avail_est < 0 ? 0 : s->avail_est), s->reserve_bytes, atomic_load_explicit(&s->store_bytes, memory_order_relaxed), dead,
+           atomic_load_explicit(&s->n_degraded, memory_order_relaxed));
+  }
+}
+static void degraded_end(store_t *s) {
+  if (!s->degraded) return;
+  s->degraded = false;
+  atomic_store_explicit(&s->degraded_since, 0, memory_order_relaxed);
+  atomic_store_explicit(&s->space_level, 0, memory_order_relaxed);
+  atomic_fetch_and(&s->state, ~(uint32_t)STORE_ST_DEGRADED_NOSPC);
+  st_log(s, 6, "store: there is room again (%" PRIu64 " bytes free): zone images are stored again; zones that were kept without an image get theirs when the database is read again",
+         (uint64_t)(s->avail_est < 0 ? 0 : s->avail_est));
+}
+
+static inline uint64_t loc_of(uint32_t seg, uint64_t off) { return ((uint64_t)seg << ST_LOC_SHIFT) | (off / 64); }
+static inline int seg_refs(const store_t *s, uint32_t n) {
+  seg_t *g = atomic_load_explicit(&((store_t *)s)->segs[n], memory_order_acquire);
+  return g ? atomic_load_explicit(&g->refs, memory_order_acquire) : 0;
+}
+
+/* The zone keeps its record (name, stamp, digest, source) and loses its image: it is KNOWN, and the loader fetches it again.  expect_loc != 0: only when the zone still has the
+ * image at that place (it may have been replaced).  Returns 0 (done), 1 (the zone is not stored there any more), or an error. */
+static int zone_make_known_locked(store_t *s, uint32_t z, uint64_t expect_loc) {
+  r64_t rt, rc;
+  if (zrec_read_locked(s, z, &rt, &rc) < 0) return 1;
+  zt_t t;
+  zc_t c;
+  zt_unpack(&rt, &t);
+  zc_unpack(&rc, &c);
+  if (t.state != STORE_STATE_STORED || (expect_loc && t.loc != expect_loc)) return 1;
+  uint8_t fn[256];
+  if (!zt_fullname(s, &t, fn)) return 1;
+  store_meta_t m;
+  memset(&m, 0, sizeof(m));
+  m.source_id = c.source_id;
+  m.source = c.source;
+  m.flags = t.flags;
+  m.serial = t.serial;
+  m.settings = t.settings;
+  m.stamp_gen = c.stamp_gen;
+  m.stamp_time = c.stamp_time;
+  memcpy(m.digest, c.digest, STORE_DIGEST_LEN);
+  return put_locked(s, t.view, (const char *)fn, t.klen, &m, NULL, 0, STORE_STATE_KNOWN, NULL);
+}
+
+/* ---- the cleaner ---- */
+
+/* The segment to clean: the one with the least live share among those that are dead enough, are not open, are not pinned and were not given up on.  *ncand / *dead_total (optional): the
+ * number of segments that are dead enough and the dead bytes of all but the open one; *pinned: of the candidates, those an image points into; *draining: segments with nothing live. */
+static uint32_t cl_pick(const store_t *s, uint32_t *ncand, uint64_t *dead_total, uint32_t *pinned, uint32_t *draining, bool respect_skip) {
+  uint32_t nsegs = (uint32_t)VG(s, V_NSEGS), cur = (uint32_t)VG(s, V_CUR_SEG), best = 0;
+  uint64_t now = st_now_ms(), mind = s->seg_size / 4 < (1ull << 20) ? s->seg_size / 4 : (1ull << 20);
+  uint64_t best_pct = 101;
+  uint32_t nc = 0, np = 0, nd = 0;
+  uint64_t dt = 0;
+  unsigned pct_min = s->o.compact_min_dead_pct ? s->o.compact_min_dead_pct : 50;
+  if (nsegs > ST_MAXSEG) nsegs = ST_MAXSEG;
+  for (uint32_t n = 1; n <= nsegs; n++) {
+    uint64_t used = VG(s, V_SEG(n, 0)), live = VG(s, V_SEG(n, 1));
+    if (used <= ST_SEGHDR || n == cur) continue;
+    uint64_t body = used - ST_SEGHDR, dead = live < body ? body - live : 0;
+    dt += dead;
+    if (live == 0) { nd++; continue; }
+    if (dead * 100 < body * pct_min || dead < mind) continue;
+    nc++;
+    if (seg_refs(s, n) > 0) { np++; continue; }
+    if (respect_skip && s->seg_skip_until[n] > now) continue;
+    uint64_t pct = live * 100 / body;
+    if (pct < best_pct) { best_pct = pct; best = n; }
+  }
+  if (ncand) *ncand = nc;
+  if (dead_total) *dead_total = dt;
+  if (pinned) *pinned = np;
+  if (draining) *draining = nd;
+  return best;
+}
+static void space_dead_totals(const store_t *s, uint64_t *dead_total) { (void)cl_pick(s, NULL, dead_total, NULL, NULL, false); }
+
+/* The open segment is never cleaned: it is still being written.  But a store whose zones are all replaced again and again fills a big segment with dead records and has nothing else
+ * to clean: when the open segment is dead enough (as a segment must be to be a victim) it is closed (the next append begins a new one), and it is a victim like the others.
+ * Writer mutex held.  true: it was closed. */
+static bool cl_rotate_open_locked(store_t *s) {
+  uint32_t cur = (uint32_t)VG(s, V_CUR_SEG);
+  if (!cur || cur > ST_MAXSEG) return false;
+  uint64_t used = VG(s, V_SEG(cur, 0)), live = VG(s, V_SEG(cur, 1)), mind = s->seg_size / 4 < (1ull << 20) ? s->seg_size / 4 : (1ull << 20);
+  unsigned pct_min = s->o.compact_min_dead_pct ? s->o.compact_min_dead_pct : 50;
+  if (used <= ST_SEGHDR) return false;
+  uint64_t body = used - ST_SEGHDR, dead = live < body ? body - live : 0;
+  if (dead * 100 < body * pct_min || dead < mind) return false;
+  jb_reset(&s->jb);
+  if (jb_vset(&s->jb, V_CUR_SEG, 0) < 0) return false;
+  return journal_commit_apply(s) == 0;
+}
+
+/* the bytes [off, off + need) of the victim: MAP mode points into the mapping, COPY mode reads a piece of the file; NULL when they are not there */
+static const uint8_t *cl_window(store_t *s, seg_t *g, uint64_t off, uint64_t need, uint64_t used) {
+  if (need > (256ull << 20) || off + need > used) return NULL;
+  if (s->mode == STORE_MODE_MAP) return g->map && off + need <= g->maplen ? g->map + off : NULL;
+  if (s->cl_buf && off >= s->cl_buf_off && off + need <= s->cl_buf_off + s->cl_buf_len) return s->cl_buf + (off - s->cl_buf_off);
+  uint64_t want = need > ST_CL_CHUNK ? need : ST_CL_CHUNK;
+  if (off + want > used) want = used - off;
+  if (want < need) return NULL;
+  if (want > s->cl_buf_cap) {
+    uint8_t *nb = realloc(s->cl_buf, (size_t)want);
+    if (!nb) return NULL;
+    s->cl_buf = nb;
+    s->cl_buf_cap = (size_t)want;
+  }
+  s->cl_buf_len = 0;
+  if (st_pread_all(g->fd, s->cl_buf, (size_t)want, (off_t)off) < 0) return NULL;
+  s->cl_buf_off = off;
+  s->cl_buf_len = (size_t)want;
+  return s->cl_buf;
+}
+
+static void cl_reset_victim(store_t *s) {
+  s->cl_seg = 0;
+  s->cl_off = 0;
+  s->cl_buf_len = 0;
+}
+
+/* Move the live record at (victim, off): copy its bytes to the open segment and give the zone the new location, in one journal record (writer mutex held). */
+static int cl_move_locked(store_t *s, uint32_t zid, const zt_t *t, const r64_t *rc, const uint8_t *rec, uint64_t rlen) {
+  jb_t *j = &s->jb;
+  jb_reset(j);
+  uint64_t newloc = 0;
+  struct iovec iov = { (void *)rec, (size_t)rlen };
+  int r = seg_put_bytes(s, &iov, 1, rlen, &newloc);
+  if (r < 0) return r;
+  zt_t nt = *t;
+  nt.loc = newloc;
+  r64_t nrt, nrc = *rc;
+  zt_pack(&nt, &nrt);
+  zrec_seal(&nrt, &nrc);
+  if ((r = jb_zrec(j, zid, &nrt, &nrc)) < 0) return r;
+  if ((r = release_old_record(s, t)) < 0) return r;
+  return journal_commit_apply(s);
+}
+
+/* One slice of the cleaner on the victim s->cl_seg (writer mutex held): look at up to nrec_max records from cl_off; a live one is moved, as long as *quota lasts (bytes).
+ * 1 = the victim is done (scanned to its end, or nothing live is left), 0 = more to do, < 0 = a move failed (no room, I/O). */
+static int cl_step_locked(store_t *s, uint64_t *quota, unsigned nrec_max, store_compact_report_t *rep) {
+  const uint32_t S = s->cl_seg;
+  seg_t *g = seg_get(s, S);
+  if (!g) return 1;
+#ifdef KARIDNS_UNIT_TEST
+  if (store_test_cleaner_step) store_test_cleaner_step(s, S);
+#endif
+  const bool was = s->in_cleaner;
+  s->in_cleaner = true;
+  int ret = 0;
+  unsigned looked = 0;
+  uint64_t used = VG(s, V_SEG(S, 0)), hwm = VG(s, V_HWM);
+  if (hwm > st_zt_cap(s)) hwm = st_zt_cap(s);
+  while (looked < nrec_max) {
+    if (VG(s, V_SEG(S, 1)) == 0) { ret = 1; break; }
+    uint64_t off = s->cl_off;
+    if (off + ST_RHDR > used) { ret = 1; break; }
+    if (*quota == 0) break;
+    looked++;
+    const uint8_t *hp = cl_window(s, g, off, ST_RHDR, used);
+    if (!hp) { s->cl_off = off + 64; continue; }
+    rhdr_t h;
+    memcpy(&h, hp, sizeof(h));
+    if (h.magic != ST_MAGIC_REC || h.reclen < ST_RHDR || (h.reclen & 63u) || off + h.reclen > used) { s->cl_off = off + 64; continue; }       /* (not a record: look at the next 64 bytes) */
+    const uint64_t rlen = h.reclen, loc = loc_of(S, off);
+    r64_t rt, rc;
+    zt_t t;
+    memset(&t, 0, sizeof(t));
+    memset(&rt, 0, sizeof(rt));
+    memset(&rc, 0, sizeof(rc));
+    bool live = false;
+    if ((uint64_t)h.zid < hwm && zrec_read_locked(s, h.zid, &rt, &rc) == 0) {
+      zt_unpack(&rt, &t);
+      live = t.state == STORE_STATE_STORED && t.loc == loc;
+    }
+    if (!live) { s->cl_off = off + rlen; continue; }
+    const uint8_t *rec = rlen == st_reclen(t.klen, t.img_len) ? cl_window(s, g, off, rlen, used) : NULL;
+    bool good = rec != NULL;
+    if (good) {                                           /* the record is checked before it is copied: damage is not carried to a new place */
+      rhdr_t hh;
+      memcpy(&hh, rec, sizeof(hh));
+      uint64_t want = hh.checksum;
+      hh.checksum = 0;
+      size_t np = st_pad16(t.klen);
+      uint64_t sum = st_sum64(&hh, sizeof(hh), 0);
+      sum = st_sum64(rec + ST_RHDR, np, sum);
+      sum = st_sum64(rec + ST_RHDR + np, t.img_len, sum);
+      good = hh.zid == h.zid && hh.view == t.view && hh.klen == t.klen && hh.img_len == t.img_len && hh.kind == 0 && sum == want;
+    }
+    if (!good) {
+      int mk = zone_make_known_locked(s, h.zid, loc);
+      atomic_fetch_add_explicit(&s->c_bad, 1, memory_order_relaxed);
+      if (rep) rep->bad_records++;
+      if (mk < 0) { ret = mk; break; }
+      s->cl_off = off + rlen;
+      continue;
+    }
+    int r = cl_move_locked(s, h.zid, &t, &rc, rec, rlen);
+    if (r < 0) { ret = r; break; }
+    atomic_fetch_add_explicit(&s->c_moved_recs, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s->c_moved_bytes, rlen, memory_order_relaxed);
+    if (rep) { rep->moved_records++; rep->moved_bytes += rlen; }
+    *quota = *quota > rlen ? *quota - rlen : 0;
+    s->cl_off = off + rlen;
+  }
+  s->in_cleaner = was;
+  return ret;
+}
+
+/* the victim is over: it is empty (it goes with the next retire pass), or it could not be emptied (a record that cannot be read: not again for ten minutes) */
+static void cl_finish_victim(store_t *s, bool failed, store_compact_report_t *rep) {
+  const uint32_t S = s->cl_seg;
+  if (S) {
+    if (VG(s, V_SEG(S, 1)) == 0) { if (rep) rep->segs_emptied++; }
+    else {
+      atomic_fetch_add_explicit(&s->c_incomplete, 1, memory_order_relaxed);
+      s->seg_skip_until[S] = st_now_ms() + (failed ? 60000u : 600000u);
+    }
+  }
+  cl_reset_victim(s);
+}
+
+/* Remove the segments that have no live record: the file goes when (a) a checkpoint after the last journal record that touched the segment is on disk, (b) the readers that
+ * could still hold an old location are gone, (c) no image of it is held.  wait: give the grace period a moment (the emergency path and store_compact(finish)). */
+static void seg_retire_locked(store_t *s, bool wait) {
+  uint32_t nsegs = (uint32_t)VG(s, V_NSEGS), cur = (uint32_t)VG(s, V_CUR_SEG), draining = 0, pinned = 0;
+  if (nsegs > ST_MAXSEG) nsegs = ST_MAXSEG;
+  for (uint32_t n = 1; n <= nsegs; n++) {
+    uint64_t used = VG(s, V_SEG(n, 0)), live = VG(s, V_SEG(n, 1));
+    if (used == 0 || n == cur || live != 0 || n == s->cl_seg) { s->seg_draining[n] = 0; continue; }
+    if (!s->seg_draining[n]) {
+      s->seg_draining[n] = 1;
+      s->seg_drain_lsn[n] = s->lsn;
+      s->seg_drain_epoch[n] = rcu_writer_advance_epoch();
+    }
+    draining++;
+    if (s->ckpt_lsn < s->seg_drain_lsn[n]) continue;
+    if (!rcu_writer_is_safe(s->seg_drain_epoch[n]) && !(wait && rcu_writer_try_wait(s->seg_drain_epoch[n], 100))) continue;
+    if (seg_refs(s, n) > 0) {
+      pinned++;
+      if (s->seg_draining[n] == 1) { s->seg_draining[n] = 2; atomic_fetch_add_explicit(&s->c_pinned, 1, memory_order_relaxed); }       /* (counted once for a segment) */
+      continue;
+    }
+    jb_reset(&s->jb);
+    if (jb_vset(&s->jb, V_SEG(n, 0), 0) < 0 || jb_vset(&s->jb, V_SEG(n, 1), 0) < 0) continue;
+    CRASH_POINT();
+    if (journal_commit_apply(s) < 0) continue;
+    CRASH_POINT();
+    seg_t *g = atomic_exchange_explicit(&s->segs[n], NULL, memory_order_acq_rel);
+    if (g) retire_add_seg(s, g);
+    char name[32];
+    snprintf(name, sizeof(name), "seg.%u", n);
+    (void)unlinkat(s->dirfd, name, 0);
+    s->dir_dirty = true;
+    CRASH_POINT();
+    s->seg_draining[n] = 0;
+    s->seg_skip_until[n] = 0;
+    atomic_fetch_add_explicit(&s->c_segs_freed, 1, memory_order_relaxed);
+    draining--;
+  }
+  atomic_store_explicit(&s->c_draining, draining, memory_order_relaxed);
+  atomic_store_explicit(&s->c_pinned_now, pinned, memory_order_relaxed);
+}
+
+/* ---- the nx pass ---- */
+
+typedef struct { uint64_t off; uint32_t z, klen; } nxent_t;
+static int nxent_cmp(const void *a, const void *b) {
+  const nxent_t *x = a, *y = b;
+  return x->off < y->off ? -1 : x->off > y->off ? 1 : 0;
+}
+
+/* Give back the space of the long names of deleted zones: the names that are in use are moved down, in the order of their offsets, and nx ends after the last one.  Under the
+ * writer mutex for the whole pass (a put during the pass would append behind the part that is being moved).  Only when the dead part is more than half of nx and at least
+ * opts.nx_reclaim_min bytes (force: whenever there is any).  *reclaimed: bytes given back. */
+static int nx_reclaim_locked(store_t *s, bool force, uint64_t *reclaimed) {
+  if (reclaimed) *reclaimed = 0;
+  uint64_t used = VG(s, V_NX_USED), dead = VG(s, V_NX_DEAD);
+  uint64_t minb = s->o.nx_reclaim_min ? s->o.nx_reclaim_min : (4ull << 20);
+  if (dead == 0 || (!force && (dead < minb || dead * 2 < used))) return 0;
+  uint64_t hwm = VG(s, V_HWM);
+  if (hwm > st_zt_cap(s)) hwm = st_zt_cap(s);
+  nxent_t *e = NULL;
+  size_t n = 0, cap = 0;
+  int r = 0;
+  for (uint64_t z = 0; z < hwm && r == 0; z++) {
+    r64_t rt, rc;
+    if (zt_state_fast(s, (uint32_t)z) == STORE_STATE_FREE) continue;
+    if (zrec_read_locked(s, (uint32_t)z, &rt, &rc) < 0) continue;            /* (a damaged cell is invisible; its bytes are dead for this purpose, the repair drops it) */
+    zt_t t;
+    zt_unpack(&rt, &t);
+    if (t.state == STORE_STATE_FREE || t.klen <= ST_NAME_INL) continue;
+    uint64_t off;
+    memcpy(&off, t.name, 8);
+    if (off > used || (uint64_t)t.klen > used - off) { r = -EBADMSG; break; }
+    if (n == cap) {
+      size_t nc = cap ? cap * 2 : 1024;
+      nxent_t *ne = realloc(e, nc * sizeof(*e));
+      if (!ne) { r = -ENOMEM; break; }
+      e = ne;
+      cap = nc;
+    }
+    e[n].off = off;
+    e[n].z = (uint32_t)z;
+    e[n].klen = t.klen;
+    n++;
+  }
+  if (r == 0 && n > 1) qsort(e, n, sizeof(*e), nxent_cmp);
+  for (size_t i = 1; r == 0 && i < n; i++)
+    if (e[i].off < e[i - 1].off + e[i - 1].klen) r = -EBADMSG;               /* two zones claim the same bytes: a damaged table; the repair is the way, not this pass */
+  uint64_t wp = 0;
+  size_t batch = 0;
+  for (size_t i = 0; r == 0 && i < n; i++) {
+    if (e[i].off != wp) {
+      r64_t rt, rc;
+      if (zrec_read_locked(s, e[i].z, &rt, &rc) < 0) { r = -EBADMSG; break; }
+      zt_t t;
+      zt_unpack(&rt, &t);
+      if (batch == 0) jb_reset(&s->jb);
+      uint8_t *p = jb_op(&s->jb, OP_NXMOVE, 16 + 128 + e[i].klen);
+      if (!p) { r = -ENOMEM; break; }
+      zt_t nt = t;
+      memcpy(nt.name, &wp, 8);
+      r64_t nrt;
+      zt_pack(&nt, &nrt);
+      zrec_seal(&nrt, &rc);
+      uint32_t z = e[i].z, kl = e[i].klen;
+      memcpy(p, &z, 4);
+      memcpy(p + 4, &kl, 4);
+      memcpy(p + 8, &wp, 8);
+      memcpy(p + 16, &nrt, 64);
+      memcpy(p + 80, &rc, 64);
+      nx_read(s, e[i].off, p + 144, kl);
+      batch++;
+    }
+    wp += e[i].klen;
+    if (batch >= 256 || (batch && i + 1 == n)) {
+      r = journal_commit_apply(s);
+      batch = 0;
+      if (r == 0 && s->jbytes >= s->o.journal_max_bytes) r = checkpoint_locked(s, false);
+    }
+  }
+  free(e);
+  if (r < 0) return r;
+  jb_reset(&s->jb);
+  if ((r = jb_vset(&s->jb, V_NX_USED, wp)) < 0 || (r = jb_vset(&s->jb, V_NX_DEAD, 0)) < 0) return r;
+  if ((r = journal_commit_apply(s)) < 0) return r;
+  atomic_fetch_add_explicit(&s->c_nx_runs, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&s->c_nx_bytes, used - wp, memory_order_relaxed);
+  if (reclaimed) *reclaimed = used - wp;
+  return 0;
+}
+
+/* ---- no room: the cleaner now, then the KNOWN fallback ---- */
+
+/* Free space now (writer mutex held): clean segments until some are empty, make that durable and remove them.  Bounded in time and bytes. */
+static uint64_t emergency_free_locked(store_t *s) {
+  uint64_t t0 = st_now_ms(), budget = 256ull << 20;
+  const uint64_t freed0 = atomic_load_explicit(&s->c_segs_freed, memory_order_relaxed);
+  store_compact_report_t rep;
+  memset(&rep, 0, sizeof(rep));
+  unsigned victims = 0;
+  const bool was = s->in_cleaner;
+  s->in_cleaner = true;
+  while (budget > 0 && st_now_ms() - t0 < 3000 && victims < 16) {
+    if (!s->cl_seg) {
+      uint32_t v = cl_pick(s, NULL, NULL, NULL, NULL, true);
+      if (!v && cl_rotate_open_locked(s)) v = cl_pick(s, NULL, NULL, NULL, NULL, true);
+      if (!v) break;
+      s->cl_seg = v;
+      s->cl_off = ST_SEGHDR;
+      s->cl_buf_len = 0;
+      victims++;
+      atomic_fetch_add_explicit(&s->c_runs, 1, memory_order_relaxed);
+    }
+    int r = cl_step_locked(s, &budget, 4096, &rep);
+    if (r == 1) cl_finish_victim(s, false, &rep);
+    else if (r < 0) { cl_finish_victim(s, true, &rep); break; }
+  }
+  (void)nx_reclaim_locked(s, false, NULL);
+  (void)checkpoint_locked(s, false);
+  seg_retire_locked(s, true);
+  retire_run(s, false);
+  s->in_cleaner = was;
+  fs_probe(s);
+  return atomic_load_explicit(&s->c_segs_freed, memory_order_relaxed) - freed0;
+}
+
+/* store_put with a full disk: try, clean and try again (at most once a second), then keep the zone without an image. */
+static int put_stored_locked(store_t *s, uint16_t view, const char *name, size_t len, const store_meta_t *meta, const void *image, size_t ilen, uint32_t *zid) {
+  int r = put_locked(s, view, name, len, meta, image, ilen, STORE_STATE_STORED, zid);
+  if (!is_nospc(r)) return r;
+  note_error(s, r);
+  uint64_t now = st_now_ms();
+  if (now >= s->emerg_block_until) {                    /* (when the last cleaning found nothing to free, it is not repeated for every zone: once a second) */
+    if (emergency_free_locked(s) == 0) s->emerg_block_until = now + 1000;
+    r = put_locked(s, view, name, len, meta, image, ilen, STORE_STATE_STORED, zid);
+    if (!is_nospc(r)) return r;
+  }
+  if (s->o.no_degrade) return r;
+  int r2 = put_locked(s, view, name, len, meta, NULL, 0, STORE_STATE_KNOWN, zid);
+  if (r2 < 0) return r2;
+  atomic_fetch_add_explicit(&s->n_degraded, 1, memory_order_relaxed);
+  degraded_begin(s);
   return 0;
 }
 
@@ -2000,8 +2694,8 @@ int store_put(store_t *s, uint16_t view, const char *name, size_t len, const sto
   int r = check_name_args(s, view, len, meta);
   if (r < 0) return r;
   pthread_mutex_lock(&s->wlock);
-  r = put_locked(s, view, name, len, meta, image, image_len, STORE_STATE_STORED, zid);
-  if (r < 0) note_error(s, r); else { note_ok(s); r = post_write(s); }
+  r = put_stored_locked(s, view, name, len, meta, image, image_len, zid);
+  if (r < 0) { if (!is_nospc(r)) note_error(s, r); } else { note_ok(s); r = post_write(s); }       /* (a full disk was counted where it was found) */
   pthread_mutex_unlock(&s->wlock);
   return r;
 }
@@ -2246,6 +2940,316 @@ int store_reserve(store_t *s, uint64_t zones) {
   return r;
 }
 
+/* ------------------------------------------------------------------------------------------------------------------ */
+/* 0.7 WP9: space at the checkpoint, the scrub, what the tick does                                                      */
+/* ------------------------------------------------------------------------------------------------------------------ */
+
+/* At every checkpoint (writer mutex held): the free space is read, the size of the store and its growth of the last hour are noted, and a WARNING says when the file system
+ * is getting full (design 3.5: "P-F warns before it happens"); when a full disk made the store degraded and room is back, it ends. */
+static void space_checkpoint(store_t *s) {
+  fs_probe(s);
+  uint32_t nsegs = (uint32_t)VG(s, V_NSEGS);
+  uint64_t seg = 0;
+  if (nsegs > ST_MAXSEG) nsegs = ST_MAXSEG;
+  for (uint32_t n = 1; n <= nsegs; n++) {
+    uint64_t used = VG(s, V_SEG(n, 0));
+    if (used > ST_SEGHDR) seg += used;
+  }
+  ixgen_t *ix = atomic_load_explicit(&s->ix, memory_order_relaxed), *sx = atomic_load_explicit(&s->sx, memory_order_relaxed);
+  uint64_t bytes = seg + atomic_load_explicit(&s->zt.mapped, memory_order_relaxed) + atomic_load_explicit(&s->zc.mapped, memory_order_relaxed) +
+                   atomic_load_explicit(&s->nx.mapped, memory_order_relaxed) + (ix ? ix->maplen : 0) + (sx ? sx->maplen : 0) + s->jbytes + 2 * (uint64_t)ST_SB_SIZE;
+  atomic_store_explicit(&s->store_bytes, bytes, memory_order_relaxed);
+  uint64_t now = st_now_ms();
+  if (s->gcount == 0 || now - s->last_gsample_ms >= 60000) {
+    unsigned at;
+    if (s->gcount < ST_GRING) { at = (s->ghead + s->gcount) % ST_GRING; s->gcount++; }
+    else { at = s->ghead; s->ghead = (s->ghead + 1) % ST_GRING; }
+    s->gring[at].ms = now;
+    s->gring[at].bytes = bytes;
+    s->last_gsample_ms = now;
+  }
+  /* the growth over the last hour (at least five minutes of samples) */
+  uint64_t rate = 0;
+  for (unsigned i = 0; i < s->gcount; i++) {
+    const unsigned k = (s->ghead + i) % ST_GRING;
+    if (now - s->gring[k].ms <= 3600000u) {
+      if (now - s->gring[k].ms >= 300000u && bytes > s->gring[k].bytes) rate = (bytes - s->gring[k].bytes) * 3600000u / (now - s->gring[k].ms);
+      break;
+    }
+  }
+  const int64_t avail = s->avail_est;
+  uint64_t full_h = 0;
+  if (rate && avail >= 0) full_h = (uint64_t)avail / rate + 1;
+  atomic_store_explicit(&s->growth_bph, rate, memory_order_relaxed);
+  atomic_store_explicit(&s->full_in_h, full_h, memory_order_relaxed);
+  if (s->degraded && avail >= 0 && (uint64_t)avail >= s->reserve_bytes + s->reserve_bytes / 2) degraded_end(s);   /* (a put needs the reserve and its own bytes; a quota of 100 MB with segments of 64 MB never has two reserves and a segment) */
+  uint32_t lvl = s->degraded ? 2u : 0u;
+  if (!s->degraded && avail >= 0) {
+    uint64_t low = 2 * s->reserve_bytes > bytes / 10 ? 2 * s->reserve_bytes : bytes / 10;
+    if ((uint64_t)avail < low || (full_h && full_h < 24)) lvl = 1;
+  }
+  atomic_store_explicit(&s->space_level, lvl, memory_order_relaxed);
+  if (lvl == 1 && rl_ok(&s->last_warn_ms, 600000)) {
+    uint64_t dead = 0;
+    space_dead_totals(s, &dead);
+    char tf[160] = "";
+    if (full_h) snprintf(tf, sizeof(tf), "; at the growth of the last hour (%" PRIu64 " bytes an hour) it is full in about %" PRIu64 " hour(s)", rate, full_h);
+    st_log(s, 4, "store: the file system is getting full: %" PRIu64 " bytes are free (%" PRIu64 " of them kept for the cleaner), the store holds %" PRIu64 " bytes (%" PRIu64
+                 " bytes of the segments are dead and can be won by the cleaner)%s; when it is full new zone images are not stored (zones are kept without an image and read from the database)",
+           (uint64_t)avail, s->reserve_bytes, bytes, dead, tf);
+  }
+}
+
+/* ---- the scrub ---- */
+
+static void scrub_note_bad_image(store_t *s, uint32_t z, const store_zone_t *zz, const char *why) {
+  pthread_mutex_lock(&s->wlock);
+  int r = zone_make_known_locked(s, z, zz->loc);
+  if (r == 0) post_write(s);
+  pthread_mutex_unlock(&s->wlock);
+  if (r == 0) {
+    s->sc_p_bad_img++;
+    st_log(s, 4, "store: scrub: the image of zone '%s' (view %u) is damaged (%s); the zone is read from the database again", zz->name, (unsigned)zz->view, why);
+  }
+}
+
+/* one zone of the scrub (the thread that runs the pass) */
+static void scrub_zone(store_t *s, uint32_t z) {
+  store_zone_t zz;
+  store_read_lock();
+  int r = store_zone_get(s, z, &zz);
+  if (r == -ENOENT) { store_read_unlock(); return; }
+  s->sc_p_zones++;
+  if (r < 0) {
+    s->sc_p_bad_cell++;
+    s->sc_need_repair = true;
+    store_read_unlock();
+    return;
+  }
+  if (store_find(s, zz.view, zz.name, zz.klen) != z || (zz.source_id != 0 && store_find_source(s, zz.source, zz.source_id, zz.view) != z)) {
+    s->sc_p_bad_idx++;
+    s->sc_need_repair = true;
+  }
+  bool bad = false;
+  char why[200] = "";
+  if (zz.state == STORE_STATE_STORED) {
+    store_img_t im;
+    r = store_image_read(s, z, &im);
+    if (r == 0) {
+      s->sc_p_images++;
+      s->sc_p_bytes += st_reclen(zz.klen, zz.img_len);
+      if (s->o.validate && s->o.validate(im.data, im.len, why, sizeof(why)) != 0) {
+        bad = true;
+        if (!why[0]) snprintf(why, sizeof(why), "the structure is not valid");
+      }
+      store_img_release(s, &im);
+    } else if (r == -EBADMSG) {
+      bad = true;
+      snprintf(why, sizeof(why), "checksum or record header");
+    } else if (r != -ENOENT) {
+      s->sc_p_io++;
+    }
+  }
+  store_read_unlock();
+  if (bad) scrub_note_bad_image(s, z, &zz, why);
+}
+
+/* The end of a pass (sc_mu held): the repair when the pass found damage in the tables, the totals, the time (in the superblock at the next checkpoint). */
+static void scrub_end_pass(store_t *s) {
+  bool repaired = false;
+  if (s->sc_need_repair) {
+    int r = store_repair(s);
+    repaired = r == 0;
+    if (r < 0) st_log(s, 3, "store: scrub: the repair of the tables failed: %s", strerror(-r));
+  }
+  atomic_fetch_add_explicit(&s->sc_zones, s->sc_p_zones, memory_order_relaxed);
+  atomic_fetch_add_explicit(&s->sc_bytes, s->sc_p_bytes, memory_order_relaxed);
+  atomic_fetch_add_explicit(&s->sc_bad_img, s->sc_p_bad_img, memory_order_relaxed);
+  atomic_fetch_add_explicit(&s->sc_bad_cell, s->sc_p_bad_cell, memory_order_relaxed);
+  atomic_fetch_add_explicit(&s->sc_bad_idx, s->sc_p_bad_idx, memory_order_relaxed);
+  atomic_fetch_add_explicit(&s->sc_io, s->sc_p_io, memory_order_relaxed);
+  atomic_fetch_add_explicit(&s->sc_passes, 1, memory_order_relaxed);
+  atomic_store_explicit(&s->sc_last_end, (uint64_t)time(NULL), memory_order_relaxed);
+  atomic_store_explicit(&s->sc_running_a, 0, memory_order_relaxed);
+  atomic_store_explicit(&s->sc_pct, 100, memory_order_relaxed);
+  atomic_store_explicit(&s->sc_last_done, (uint64_t)time(NULL), memory_order_relaxed);
+  if (s->sc_p_bad_img || s->sc_p_bad_cell || s->sc_p_bad_idx || s->sc_p_io)
+    st_log(s, 4, "store: scrub: %" PRIu64 " zones read: %" PRIu64 " damaged image(s) (the zones are read from the database again), %" PRIu64 " damaged table record(s), %" PRIu64
+                 " index entr(ies) that do not lead to their zone%s, %" PRIu64 " read error(s)",
+           s->sc_p_zones, s->sc_p_bad_img, s->sc_p_bad_cell, s->sc_p_bad_idx, repaired ? " (tables repaired)" : "", s->sc_p_io);
+  else
+    st_log(s, 6, "store: scrub: %" PRIu64 " zones, %" PRIu64 " images (%" PRIu64 " bytes) read, nothing wrong", s->sc_p_zones, s->sc_p_images, s->sc_p_bytes);
+  s->sc_running = false;
+}
+
+static void scrub_begin_pass(store_t *s) {
+  s->sc_running = true;
+  s->sc_need_repair = false;
+  s->sc_cursor = 0;
+  s->sc_p_zones = s->sc_p_images = s->sc_p_bytes = s->sc_p_bad_img = s->sc_p_bad_cell = s->sc_p_bad_idx = s->sc_p_io = 0;
+  atomic_store_explicit(&s->sc_last_start, (uint64_t)time(NULL), memory_order_relaxed);
+  atomic_store_explicit(&s->sc_running_a, 1, memory_order_relaxed);
+  atomic_store_explicit(&s->sc_pct, 0, memory_order_relaxed);
+}
+
+/* work on the running pass (sc_mu held) until `budget` bytes were read or slice_ms passed; true when the pass is over */
+static bool scrub_work(store_t *s, uint64_t budget, uint64_t slice_ms) {
+  uint64_t t0 = st_now_ms();
+  const uint64_t b0 = s->sc_p_bytes;
+  for (;;) {
+    uint64_t hwm = VG(s, V_HWM);
+    if (s->sc_cursor >= hwm) { scrub_end_pass(s); return true; }
+    if (s->sc_p_bytes - b0 >= budget || st_now_ms() - t0 >= slice_ms) {
+      atomic_store_explicit(&s->sc_pct, hwm ? (uint32_t)((uint64_t)s->sc_cursor * 100 / hwm) : 0, memory_order_relaxed);
+      return false;
+    }
+    scrub_zone(s, s->sc_cursor++);
+  }
+}
+
+void store_compact_request(store_t *s) {
+  if (s) atomic_store_explicit(&s->c_forced, true, memory_order_relaxed);
+}
+void store_scrub_start(store_t *s) {
+  if (!s) return;
+  pthread_mutex_lock(&s->sc_mu);
+  if (!s->sc_running) scrub_begin_pass(s);
+  pthread_mutex_unlock(&s->sc_mu);
+}
+void store_scrub_stop(store_t *s) {
+  if (!s) return;
+  pthread_mutex_lock(&s->sc_mu);
+  if (s->sc_running) {
+    s->sc_running = false;
+    atomic_store_explicit(&s->sc_running_a, 0, memory_order_relaxed);
+  }
+  pthread_mutex_unlock(&s->sc_mu);
+}
+int store_scrub_run(store_t *s, store_scrub_report_t *rep) {
+  if (!s) return -EINVAL;
+  if (rep) memset(rep, 0, sizeof(*rep));
+  pthread_mutex_lock(&s->sc_mu);
+  if (!s->sc_running) scrub_begin_pass(s);
+  while (s->sc_running && !scrub_work(s, UINT64_MAX, 1000000)) {}
+  if (rep) {
+    rep->zones = s->sc_p_zones;
+    rep->images = s->sc_p_images;
+    rep->bytes = s->sc_p_bytes;
+    rep->bad_images = s->sc_p_bad_img;
+    rep->bad_cells = s->sc_p_bad_cell;
+    rep->bad_index = s->sc_p_bad_idx;
+    rep->io_errors = s->sc_p_io;
+    rep->repaired = s->sc_p_bad_cell || s->sc_p_bad_idx;
+  }
+  pthread_mutex_unlock(&s->sc_mu);
+  return 0;
+}
+
+/* ---- the cleaner by itself ---- */
+
+/* Work of the cleaner for one tick or one store_compact(): victims, a bounded number of bytes moved.  Takes the writer mutex per slice of records. */
+static int cleaner_work(store_t *s, uint64_t budget, uint64_t until_ms, store_compact_report_t *rep) {
+  int ret = 0;
+  while (budget > 0 && st_now_ms() < until_ms) {
+    pthread_mutex_lock(&s->wlock);
+    if (!s->cl_seg) {
+      uint32_t v = cl_pick(s, NULL, NULL, NULL, NULL, true);
+      if (!v && cl_rotate_open_locked(s)) v = cl_pick(s, NULL, NULL, NULL, NULL, true);
+      if (!v) { pthread_mutex_unlock(&s->wlock); break; }
+      s->cl_seg = v;
+      s->cl_off = ST_SEGHDR;
+      s->cl_buf_len = 0;
+      atomic_fetch_add_explicit(&s->c_runs, 1, memory_order_relaxed);
+    }
+    int r = cl_step_locked(s, &budget, 256, rep);
+    if (r == 1) cl_finish_victim(s, false, rep);
+    else if (r < 0) { cl_finish_victim(s, true, rep); ret = r; }
+    atomic_store_explicit(&s->c_last_unix, (uint64_t)time(NULL), memory_order_relaxed);
+    int pr = post_write(s);
+    pthread_mutex_unlock(&s->wlock);
+    if (r < 0 || pr < 0) { if (ret == 0) ret = pr; break; }
+  }
+  return ret;
+}
+
+int store_compact(store_t *s, uint64_t max_bytes, bool finish, store_compact_report_t *rep) {
+  if (!s) return -EINVAL;
+  if (rep) memset(rep, 0, sizeof(*rep));
+  const uint64_t freed0 = atomic_load_explicit(&s->c_segs_freed, memory_order_relaxed);
+  int r = cleaner_work(s, max_bytes ? max_bytes : UINT64_MAX, st_now_ms() + 3600000u, rep);
+  pthread_mutex_lock(&s->wlock);
+  uint64_t got = 0;
+  int nr = nx_reclaim_locked(s, false, &got);
+  if (rep) rep->nx_reclaimed = got;
+  if (r == 0 && nr < 0) r = nr;
+  if (finish) {
+    int cr = checkpoint_locked(s, false);
+    if (r == 0 && cr < 0) r = cr;
+    seg_retire_locked(s, true);
+    retire_run(s, false);
+  }
+  pthread_mutex_unlock(&s->wlock);
+  if (rep) rep->segs_freed = (uint32_t)(atomic_load_explicit(&s->c_segs_freed, memory_order_relaxed) - freed0);
+  return r;
+}
+
+/* What the tick does besides the commit and the checkpoint: the cleaner, the removal of empty segments, the nx pass, the free space, the scrub.  Never inside a read section. */
+static void maintenance(store_t *s) {
+  uint64_t now = st_now_ms();
+  const bool forced = atomic_load_explicit(&s->c_forced, memory_order_relaxed);
+  const uint64_t rate = s->o.compact_rate ? s->o.compact_rate : (16ull << 20);
+  uint64_t budget;
+  if (rate == UINT64_MAX || forced) budget = UINT64_MAX;
+  else {
+    if (s->cl_tokens_ms) s->cl_tokens += (double)rate * (double)(now - s->cl_tokens_ms) / 1000.0;
+    else s->cl_tokens = (double)rate;
+    if (s->cl_tokens > 2.0 * (double)rate) s->cl_tokens = 2.0 * (double)rate;
+    s->cl_tokens_ms = now;
+    budget = (uint64_t)s->cl_tokens;
+  }
+  if (budget) {
+    uint64_t before = atomic_load_explicit(&s->c_moved_bytes, memory_order_relaxed);
+    (void)cleaner_work(s, budget, now + (forced ? 1000u : ST_CL_SLICE_MS), NULL);
+    uint64_t moved = atomic_load_explicit(&s->c_moved_bytes, memory_order_relaxed) - before;
+    if (rate != UINT64_MAX && !forced) s->cl_tokens = s->cl_tokens > (double)moved ? s->cl_tokens - (double)moved : 0.0;
+  }
+  if (forced) {                       /* nothing left to clean: the operator's request is over (a checkpoint, and the empty segments go) */
+    pthread_mutex_lock(&s->wlock);
+    if (!s->cl_seg && cl_pick(s, NULL, NULL, NULL, NULL, true) == 0 && !cl_rotate_open_locked(s)) {
+      atomic_store_explicit(&s->c_forced, false, memory_order_relaxed);
+      (void)checkpoint_locked(s, false);
+      seg_retire_locked(s, true);
+    }
+    pthread_mutex_unlock(&s->wlock);
+  }
+  pthread_mutex_lock(&s->wlock);
+  seg_retire_locked(s, false);
+  (void)nx_reclaim_locked(s, false, NULL);
+  if (s->avail_est < 0 || st_now_ms() - s->last_probe_ms >= 10000) fs_probe(s);
+  pthread_mutex_unlock(&s->wlock);
+  /* the scrub: a pass is due when the interval since the last one has passed; it runs in slices at scrub_rate */
+  if (pthread_mutex_trylock(&s->sc_mu) == 0) {
+    const uint32_t iv = s->o.scrub_interval_s ? s->o.scrub_interval_s : 604800u;
+    uint64_t unow = (uint64_t)time(NULL);
+    const uint64_t ld = atomic_load_explicit(&s->sc_last_done, memory_order_relaxed);
+    if (!s->sc_running && iv != UINT32_MAX && ld && unow >= ld + iv) scrub_begin_pass(s);
+    if (s->sc_running) {
+      const uint64_t srate = s->o.scrub_rate ? s->o.scrub_rate : (16ull << 20);
+      if (s->sc_tokens_ms) s->sc_tokens += (double)srate * (double)(now - s->sc_tokens_ms) / 1000.0;
+      else s->sc_tokens = (double)srate;
+      if (s->sc_tokens > 2.0 * (double)srate) s->sc_tokens = 2.0 * (double)srate;
+      s->sc_tokens_ms = now;
+      uint64_t b0 = s->sc_p_bytes;
+      (void)scrub_work(s, (uint64_t)s->sc_tokens + 1, ST_SCRUB_SLICE_MS);
+      double used = (double)(s->sc_p_bytes - b0);
+      s->sc_tokens = s->sc_tokens > used ? s->sc_tokens - used : 0.0;
+    } else {
+      s->sc_tokens_ms = 0;
+    }
+    pthread_mutex_unlock(&s->sc_mu);
+  }
+}
+
 int store_commit(store_t *s) {
   if (!s) return -EINVAL;
   pthread_mutex_lock(&s->wlock);
@@ -2259,6 +3263,7 @@ int store_tick(store_t *s) {
   pthread_mutex_lock(&s->wlock);
   int r = post_write(s);
   pthread_mutex_unlock(&s->wlock);
+  maintenance(s);
   return r;
 }
 int store_checkpoint(store_t *s) {
@@ -2343,19 +3348,173 @@ static void zone_fill(const store_t *s, uint32_t z, const zt_t *t, const zc_t *c
 }
 
 int store_zone_get(const store_t *s, uint32_t zid, store_zone_t *out) {
-  r64_t rt, rc;
   if ((uint64_t)zid >= st_zt_cap(s) || zt_state_fast(s, zid) == STORE_STATE_FREE) return -ENOENT;
-  int r = zrec_read(s, zid, &rt, &rc);
-  if (r < 0) return r;
-  zt_t t;
-  zc_t c;
-  zt_unpack(&rt, &t);
-  zc_unpack(&rc, &c);
-  if (t.state == STORE_STATE_FREE) return -ENOENT;
-  if (t.state > STORE_STATE_STORED) return -EBADMSG;
-  bool ok;
-  zone_fill(s, zid, &t, &c, out, &ok);
-  return ok ? 0 : -EBADMSG;
+  for (int tries = 0;; tries++) {
+    r64_t rt, rc;
+    uint32_t seq = 0;
+    int r = zrec_read_seq(s, zid, &rt, &rc, &seq);
+    if (r < 0) return r;
+    zt_t t;
+    zc_t c;
+    zt_unpack(&rt, &t);
+    zc_unpack(&rc, &c);
+    if (t.state == STORE_STATE_FREE) return -ENOENT;
+    if (t.state > STORE_STATE_STORED) return -EBADMSG;
+    bool ok;
+    zone_fill(s, zid, &t, &c, out, &ok);
+    if (t.klen > ST_NAME_INL) {                        /* the long name was copied from nx after the cell was read: the nx pass may have moved it meanwhile; the counter says */
+      atomic_thread_fence(memory_order_acquire);
+      if ((uint32_t)(atomic_load_explicit(&zc_cell(s, zid)[7], memory_order_relaxed) >> 32) != seq && tries < 64) continue;
+    }
+    return ok ? 0 : -EBADMSG;
+  }
+}
+
+/* ---- err.ring: 4096-byte header page {magic, version, entries, entry size, head}, then STORE_ERR_ENTRIES entries of 224 bytes = 28 words: seq, zid | textlen << 32, stamp, time, text.
+ * The words are read and written as relaxed atomics under the entry's sequence word (written last, cleared first): a reader that copies while the ring wraps over the entry
+ * throws its copy away. ---- */
+#define ERR_HDR     4096u
+#define ERR_ESZ     224u
+#define ERR_WORDS   (ERR_ESZ / 8)
+#define ERR_MAGIC   0x315252454952414bull       /* "KARIERR1" */
+
+#define ERR_BITS_WORDS (1u << 14)
+static inline void err_bit_set(store_t *s, uint32_t zid) {
+  uint32_t b = (zid * 2654435761u) >> 12;
+  atomic_fetch_or_explicit(&s->err_bits[b >> 6], 1ull << (b & 63), memory_order_relaxed);
+}
+static inline bool err_bit_get(const store_t *s, uint32_t zid) {
+  uint32_t b = (zid * 2654435761u) >> 12;
+  return (atomic_load_explicit(&s->err_bits[b >> 6], memory_order_relaxed) >> (b & 63)) & 1u;
+}
+static inline _Atomic uint64_t *err_hdr(const store_t *s) { return (_Atomic uint64_t *)s->err_map; }
+static inline _Atomic uint64_t *err_ent(const store_t *s, uint64_t seq) { return (_Atomic uint64_t *)(s->err_map + ERR_HDR + ((seq - 1) % STORE_ERR_ENTRIES) * ERR_ESZ); }
+
+/* open (make) the ring beneath the store directory; best effort: the store works without it */
+static void err_ring_open(store_t *s) {
+  s->err_len = (size_t)ERR_HDR + (size_t)STORE_ERR_ENTRIES * ERR_ESZ;
+  int fd = st_openat(s, "err.ring", O_RDWR | O_CREAT);
+  if (fd < 0) return;
+  struct stat st;
+  if (fstat(fd, &st) != 0 || (size_t)st.st_size > s->err_len * 2) { close(fd); return; }
+  if (st.st_size > 0) {                    /* a file that is not ours (or damaged in its header) is emptied by cutting it to nothing: the entries are zero words again, without writing 14 MB */
+    uint64_t magic = 0;
+    if (pread(fd, &magic, 8, 0) != 8 || magic != ERR_MAGIC) {
+      if (ftruncate(fd, 0) != 0) { close(fd); return; }
+      st.st_size = 0;
+    }
+  }
+  if ((size_t)st.st_size < s->err_len && ftruncate(fd, (off_t)s->err_len) != 0) { close(fd); return; }
+  void *p = mmap(NULL, s->err_len, PROT_READ | PROT_WRITE, MAP_SHARED | ST_NOCORE, fd, 0);
+  if (p == MAP_FAILED) { close(fd); return; }
+  s->err_fd = fd;
+  s->err_map = p;
+  _Atomic uint64_t *h = err_hdr(s);
+  if (atomic_load_explicit(&h[0], memory_order_relaxed) != ERR_MAGIC || atomic_load_explicit(&h[1], memory_order_relaxed) != STORE_ERR_ENTRIES ||
+      atomic_load_explicit(&h[2], memory_order_relaxed) != ERR_ESZ) {          /* a new file (zeros all through), or another ring size: an empty ring */
+    if (atomic_load_explicit(&h[0], memory_order_relaxed) == ERR_MAGIC)
+      for (uint64_t i = 1; i <= STORE_ERR_ENTRIES; i++) atomic_store_explicit(err_ent(s, i), 0, memory_order_relaxed);
+    atomic_store_explicit(&h[1], STORE_ERR_ENTRIES, memory_order_relaxed);
+    atomic_store_explicit(&h[2], ERR_ESZ, memory_order_relaxed);
+    atomic_store_explicit(&h[3], 0, memory_order_relaxed);
+    atomic_store_explicit(&h[0], ERR_MAGIC, memory_order_release);
+  } else if (atomic_load_explicit(&h[3], memory_order_relaxed) > (1ull << 60)) {
+    atomic_store_explicit(&h[3], 0, memory_order_relaxed);
+  }
+  s->err_bits = calloc(ERR_BITS_WORDS, sizeof(*s->err_bits));
+  if (s->err_bits) {                       /* the zones that have texts in the ring now */
+    uint64_t head = atomic_load_explicit(&h[3], memory_order_relaxed), low = head > STORE_ERR_ENTRIES ? head - STORE_ERR_ENTRIES + 1 : 1;
+    for (uint64_t seq = low; seq <= head; seq++) {
+      _Atomic uint64_t *w = err_ent(s, seq);
+      if (atomic_load_explicit(&w[0], memory_order_relaxed) == seq) err_bit_set(s, (uint32_t)atomic_load_explicit(&w[1], memory_order_relaxed));
+    }
+  }
+}
+static void err_ring_close(store_t *s) {
+  if (s->err_map) munmap(s->err_map, s->err_len);
+  if (s->err_fd >= 0) close(s->err_fd);
+  s->err_map = NULL;
+  s->err_fd = -1;
+  free((void *)s->err_bits);
+  s->err_bits = NULL;
+}
+
+int store_err_put(store_t *s, uint32_t zid, uint64_t stamp_gen, const char *text) {
+  if (!s || !text) return -EINVAL;
+  if (!s->err_map) return -ENOTSUP;
+  char buf[STORE_ERR_TEXT];
+  size_t tl = strnlen(text, STORE_ERR_TEXT - 1);
+  memset(buf, 0, sizeof(buf));
+  memcpy(buf, text, tl);
+  pthread_mutex_lock(&s->err_mu);
+  if (s->err_bits) err_bit_set(s, zid);
+  _Atomic uint64_t *h = err_hdr(s);
+  uint64_t seq = atomic_load_explicit(&h[3], memory_order_relaxed) + 1;
+  _Atomic uint64_t *w = err_ent(s, seq);
+  atomic_store_explicit(&w[0], 0, memory_order_release);              /* (the slot is being overwritten) */
+  atomic_thread_fence(memory_order_release);
+  atomic_store_explicit(&w[1], (uint64_t)zid | ((uint64_t)tl << 32), memory_order_relaxed);
+  atomic_store_explicit(&w[2], stamp_gen, memory_order_relaxed);
+  atomic_store_explicit(&w[3], (uint64_t)time(NULL), memory_order_relaxed);
+  for (unsigned i = 0; i < STORE_ERR_TEXT / 8; i++) {
+    uint64_t v;
+    memcpy(&v, buf + 8 * i, 8);
+    atomic_store_explicit(&w[4 + i], v, memory_order_relaxed);
+  }
+  atomic_store_explicit(&w[0], seq, memory_order_release);
+  atomic_store_explicit(&h[3], seq, memory_order_release);
+  pthread_mutex_unlock(&s->err_mu);
+  return 0;
+}
+
+int store_err_clear(store_t *s, uint32_t zid) {
+  if (!s) return -EINVAL;
+  if (!s->err_map) return -ENOTSUP;
+  /* only when the zone has a text: the ring is not filled with records of zones that never failed, and a version that is registered (the common case) costs a bit test, not a scan */
+  if (s->err_bits && !err_bit_get(s, zid)) return 0;
+  store_err_t e;
+  if (store_err_get(s, zid, &e) != 0) return 0;
+  return store_err_put(s, zid, 0, "");
+}
+
+uint64_t store_err_total(const store_t *s) { return s && s->err_map ? atomic_load_explicit(&err_hdr(s)[3], memory_order_acquire) : 0; }
+
+int store_err_get(const store_t *s, uint32_t zid, store_err_t *out) {
+  if (!s || !out) return -EINVAL;
+  if (!s->err_map) return -ENOENT;
+  uint64_t head = atomic_load_explicit(&err_hdr(s)[3], memory_order_acquire);
+  uint64_t low = head > STORE_ERR_ENTRIES ? head - STORE_ERR_ENTRIES + 1 : 1;
+  for (uint64_t seq = head; seq >= low && seq > 0; seq--) {
+    _Atomic uint64_t *w = err_ent(s, seq);
+    if (atomic_load_explicit(&w[0], memory_order_acquire) != seq) continue;
+    uint64_t w1 = atomic_load_explicit(&w[1], memory_order_relaxed);
+    if ((uint32_t)w1 != zid) continue;
+    store_err_t e;
+    memset(&e, 0, sizeof(e));
+    e.seq = seq;
+    e.zid = zid;
+    e.stamp_gen = atomic_load_explicit(&w[2], memory_order_relaxed);
+    e.time = atomic_load_explicit(&w[3], memory_order_relaxed);
+    for (unsigned i = 0; i < STORE_ERR_TEXT / 8; i++) {
+      uint64_t v = atomic_load_explicit(&w[4 + i], memory_order_relaxed);
+      memcpy(e.text + 8 * i, &v, 8);
+    }
+    atomic_thread_fence(memory_order_acquire);
+    if (atomic_load_explicit(&w[0], memory_order_relaxed) != seq) continue;       /* (overwritten while it was copied) */
+    e.text[STORE_ERR_TEXT - 1] = '\0';
+    if (!e.text[0]) return -ENOENT;                                                /* (cleared: a record with no text) */
+    *out = e;
+    return 0;
+  }
+  return -ENOENT;
+}
+
+int store_flag_next(const store_t *s, uint32_t *cursor, uint16_t flag, store_zone_t *out) {
+  for (;;) {
+    int r = store_iter(s, cursor, out);
+    if (r <= 0) return r;
+    if (out->flags & flag) return 1;
+  }
 }
 
 int store_iter(const store_t *s, uint32_t *cursor, store_zone_t *out) {
@@ -2503,7 +3662,9 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->sx_live = VG(s, V_SX_LIVE);
   o->seg_count = (uint32_t)VG(s, V_NSEGS);
   for (uint32_t n = 1; n <= o->seg_count && n <= ST_MAXSEG; n++) {
-    o->seg_used_bytes += VG(s, V_SEG(n, 0)) - ST_SEGHDR;
+    uint64_t used = VG(s, V_SEG(n, 0));
+    if (used < ST_SEGHDR) { o->seg_free_numbers++; continue; }
+    o->seg_used_bytes += used - ST_SEGHDR;
     o->seg_live_bytes += VG(s, V_SEG(n, 1));
   }
   o->lsn = s->lsn;
@@ -2529,6 +3690,53 @@ void store_stats(const store_t *s, store_stats_t *o) {
     o->views[i].rejected = VG(s, V_VIEW(i, 2));
     o->views[i].image_bytes = VG(s, V_VIEW(i, 3));
   }
+  /* 0.7 WP9 */
+  o->journal_max_bytes = s->o.journal_max_bytes;
+  uint32_t draining = 0, pinned = 0;
+  (void)cl_pick(s, &o->compact_candidates, &o->compact_dead_bytes, &pinned, &draining, false);
+  o->seg_draining = draining;
+  o->seg_pinned = atomic_load_explicit(&s->c_pinned_now, memory_order_relaxed);
+  if (pinned > o->seg_pinned) o->seg_pinned = pinned;
+  o->compact_runs = atomic_load_explicit(&s->c_runs, memory_order_relaxed);
+  o->compact_moved_records = atomic_load_explicit(&s->c_moved_recs, memory_order_relaxed);
+  o->compact_moved_bytes = atomic_load_explicit(&s->c_moved_bytes, memory_order_relaxed);
+  o->compact_segs_freed = atomic_load_explicit(&s->c_segs_freed, memory_order_relaxed);
+  o->compact_bad_records = atomic_load_explicit(&s->c_bad, memory_order_relaxed);
+  o->compact_pinned_skips = atomic_load_explicit(&s->c_pinned, memory_order_relaxed);
+  o->compact_incomplete = atomic_load_explicit(&s->c_incomplete, memory_order_relaxed);
+  o->compact_last_unix = atomic_load_explicit(&s->c_last_unix, memory_order_relaxed);
+  o->compact_rate = s->o.compact_rate ? s->o.compact_rate : (16ull << 20);
+  o->nx_reclaims = atomic_load_explicit(&s->c_nx_runs, memory_order_relaxed);
+  o->nx_reclaimed_bytes = atomic_load_explicit(&s->c_nx_bytes, memory_order_relaxed);
+  o->fs_total_bytes = atomic_load_explicit(&s->fs_total, memory_order_relaxed);
+  o->fs_free_bytes = atomic_load_explicit(&s->fs_avail, memory_order_relaxed);
+  o->fs_checked_unix = atomic_load_explicit(&s->fs_checked_unix, memory_order_relaxed);
+  o->reserve_bytes = s->reserve_bytes;
+  o->fs_blksize = atomic_load_explicit(&s->fs_blksize, memory_order_relaxed);
+  o->fs_recordsize_warn = atomic_load_explicit(&s->fs_rec_warn, memory_order_relaxed) != 0;
+  o->space_level = atomic_load_explicit(&s->space_level, memory_order_relaxed);
+  o->store_bytes = atomic_load_explicit(&s->store_bytes, memory_order_relaxed);
+  o->growth_bytes_per_hour = atomic_load_explicit(&s->growth_bph, memory_order_relaxed);
+  o->full_in_hours = atomic_load_explicit(&s->full_in_h, memory_order_relaxed);
+  o->degraded_puts = atomic_load_explicit(&s->n_degraded, memory_order_relaxed);
+  o->enospc_events = atomic_load_explicit(&s->n_enospc, memory_order_relaxed);
+  o->degraded_since_unix = atomic_load_explicit(&s->degraded_since, memory_order_relaxed);
+  o->scrub_interval_s = s->o.scrub_interval_s ? s->o.scrub_interval_s : 604800u;
+  o->scrub_running = atomic_load_explicit(&s->sc_running_a, memory_order_relaxed) != 0;
+  o->scrub_progress_pct = atomic_load_explicit(&s->sc_pct, memory_order_relaxed);
+  o->scrub_passes = atomic_load_explicit(&s->sc_passes, memory_order_relaxed);
+  o->scrub_last_start_unix = atomic_load_explicit(&s->sc_last_start, memory_order_relaxed);
+  o->scrub_last_end_unix = atomic_load_explicit(&s->sc_last_end, memory_order_relaxed);
+  o->scrub_zones_checked = atomic_load_explicit(&s->sc_zones, memory_order_relaxed);
+  o->scrub_bytes_checked = atomic_load_explicit(&s->sc_bytes, memory_order_relaxed);
+  o->scrub_bad_images = atomic_load_explicit(&s->sc_bad_img, memory_order_relaxed);
+  o->scrub_bad_cells = atomic_load_explicit(&s->sc_bad_cell, memory_order_relaxed);
+  o->scrub_bad_index = atomic_load_explicit(&s->sc_bad_idx, memory_order_relaxed);
+  o->scrub_io_errors = atomic_load_explicit(&s->sc_io, memory_order_relaxed);
+  o->ix_read_us = atomic_load_explicit(&s->ra_ix_us, memory_order_relaxed);
+  o->zt_readahead_us = atomic_load_explicit(&s->ra_zt_us, memory_order_relaxed);
+  o->zt_readahead_done = atomic_load_explicit(&s->ra_done, memory_order_acquire);
+  o->err_total = store_err_total(s);
   rcu_aux_read_unlock();
 }
 
@@ -2858,7 +4066,7 @@ static int adopt_sb(store_t *s, const sb_t *b) {
     if (!v_value_ok(s, i, b->f.v[i])) { r = -EBADMSG; goto fail; }
   if (b->f.v[V_CUR_SEG] > b->f.v[V_NSEGS]) { r = -EBADMSG; goto fail; }
   for (uint32_t n = 1; n <= b->f.v[V_NSEGS]; n++)
-    if (b->f.v[V_SEG(n, 0)] < ST_SEGHDR) { r = -EBADMSG; goto fail; }
+    if (b->f.v[V_SEG(n, 0)] != 0 && b->f.v[V_SEG(n, 0)] < ST_SEGHDR) { r = -EBADMSG; goto fail; }       /* (0 = a segment that was cleaned and removed: its number is free) */
   ixgen_t *ix = NULL, *sx = NULL;
   if ((r = ixgen_open(s, FK_IX, b->f.ix_gen, b->f.ix_slots, &ix)) < 0) goto fail;
   if ((r = ixgen_open(s, FK_SX, b->f.sx_gen, b->f.sx_slots, &sx)) < 0) { ixgen_free(ix); goto fail; }
@@ -2877,6 +4085,7 @@ static int adopt_sb(store_t *s, const sb_t *b) {
   s->ckpt_time = b->f.ckpt_time;
   s->ckpt_us = b->f.ckpt_us;
   s->jrn_gen = b->f.jrn_gen;
+  atomic_store_explicit(&s->sc_last_done, b->f.rsv[0] > (uint64_t)time(NULL) ? 0 : b->f.rsv[0], memory_order_relaxed);
   return 0;
 fail:
   files_close(s);
@@ -2962,12 +4171,68 @@ static int create_store(store_t *s) {
   s->lsn = 0;
   s->ckpt_lsn = 0;
   s->jrn_gen = 0;
+  atomic_store_explicit(&s->sc_last_done, (uint64_t)time(NULL), memory_order_relaxed);
   /* two superblock copies so that either one can be the "older" one from the start */
   s->sb_next = 0;
   r = journal_open_new(s, 1, 1);
   if (r == 0) r = sb_write(s, false, 1);
   if (r == 0) r = sb_write(s, false, 1);
   return r;
+}
+
+/* Design 7: ix is read once, from the beginning, before the first answer (a lookup never waits for the disk in the index); zt is read in the background. */
+static void touch_pages(const void *base, size_t len, size_t pagesz, const _Atomic bool *stop) {
+  volatile uint64_t sink = 0;
+  for (size_t off = 0; off + 8 <= len; off += pagesz) {
+    if (stop && (off % ST_RA_STEP) == 0 && atomic_load_explicit(stop, memory_order_relaxed)) break;
+    sink += atomic_load_explicit((const _Atomic uint64_t *)((const uint8_t *)base + off), memory_order_relaxed);
+  }
+  (void)sink;
+}
+static void ix_prefetch(store_t *s) {
+  uint64_t t0 = st_now_us();
+  ixgen_t *g = atomic_load_explicit(&s->ix, memory_order_relaxed);
+  if (g && g->slots) {
+    (void)madvise((void *)g->slots, g->maplen, MADV_WILLNEED);
+    touch_pages(g->slots, g->maplen, s->pagesz, NULL);
+  }
+  atomic_store_explicit(&s->ra_ix_us, st_now_us() - t0, memory_order_relaxed);
+}
+static void *ra_main(void *arg) {
+  store_t *s = arg;
+  uint64_t t0 = st_now_us();
+  uint64_t bytes = (VG(s, V_HWM) * ST_REC + s->pagesz - 1) & ~((uint64_t)s->pagesz - 1);
+  uint64_t mapped = atomic_load_explicit(&s->zt.mapped, memory_order_acquire);
+  if (bytes > mapped) bytes = mapped;
+  if (bytes) {
+    (void)madvise(s->zt.base, (size_t)bytes, MADV_WILLNEED);
+    touch_pages(s->zt.base, (size_t)bytes, s->pagesz, &s->ra_stop);
+  }
+  atomic_store_explicit(&s->ra_zt_us, st_now_us() - t0, memory_order_relaxed);
+  atomic_store_explicit(&s->ra_done, true, memory_order_release);
+  return NULL;
+}
+/* the read-ahead thread is detached (a store that is never closed, a test child that dies, leaves no thread to join); the close waits for its end flag, after which the thread touches nothing of the store */
+static void ra_stop_join(store_t *s) {
+  if (!s->ra_started) return;
+  atomic_store_explicit(&s->ra_stop, true, memory_order_relaxed);
+  for (int i = 0; i < 50000 && !atomic_load_explicit(&s->ra_done, memory_order_acquire); i++) usleep(100);
+  s->ra_started = false;
+}
+
+/* ZFS: a segment is read in records of the dataset's record size; with the default of 128 KiB every attach would read and decompress 128 KiB for a zone of about a kilobyte (S0 Z1:
+ * 50 us from the ARC against 6-10 us at 8 / 16 KiB).  st_blksize of a table file is the record size there. */
+static void fs_open_checks(store_t *s) {
+  struct stat st;
+  if (s->zt.fd < 0 || fstat(s->zt.fd, &st) != 0) return;
+  atomic_store_explicit(&s->fs_blksize, (uint32_t)st.st_blksize, memory_order_relaxed);
+  if (strcmp(s->fstype, "zfs") == 0 && st.st_blksize > 32768) {
+    atomic_store_explicit(&s->fs_rec_warn, 1, memory_order_relaxed);
+    st_log(s, 4, "store: the store is on ZFS with a record size of %" PRIu64 " bytes (st_blksize): a zone image is about a kilobyte, and every read of one reads and decompresses a whole record "
+                 "(about 50 us from the ARC at 128 KiB against 6 to 10 us at 16 KiB, and the ARC keeps more of the neighbours' bytes than of the zone); set recordsize=16K (and compression=lz4, atime=off) "
+                 "on the dataset of the store (`zfs set recordsize=16K <dataset>`); it applies to files written afterwards, so the segments that exist keep the old size until the store is copied "
+                 "(stop the server and `cp -R` it, or `zfs send | zfs recv`)", (uint64_t)st.st_blksize);
+  }
 }
 
 int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
@@ -2981,14 +4246,23 @@ int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
   if (opts) s->o = *opts; else store_opts_default(&s->o);
   if (s->o.sync_interval_ms == 0) s->o.sync_interval_ms = 100;
   if (s->o.checkpoint_interval_ms == 0) s->o.checkpoint_interval_ms = 30000;
-  if (s->o.journal_max_bytes == 0) s->o.journal_max_bytes = 64ull << 20;
+  if (s->o.journal_max_bytes == 0) s->o.journal_max_bytes = 100ull << 20;
   s->seg_size = s->o.seg_size ? s->o.seg_size : (256ull << 20);
   if (s->seg_size < 65536) s->seg_size = 65536;
   s->pagesz = (size_t)sysconf(_SC_PAGESIZE);
   if (s->pagesz == 0 || s->pagesz > ST_HDR_PAGE) { free(s); return -EINVAL; }
   pthread_mutex_init(&s->wlock, NULL);
   pthread_mutex_init(&s->seg_mu, NULL);
+  pthread_mutex_init(&s->sc_mu, NULL);
+  s->avail_est = -1;
+  s->reserve_bytes = s->o.reserve_bytes ? s->o.reserve_bytes : s->seg_size / 2;
+  if (!s->o.reserve_bytes) {
+    if (s->reserve_bytes < (256u << 10)) s->reserve_bytes = 256u << 10;
+    if (s->reserve_bytes > (128ull << 20)) s->reserve_bytes = 128ull << 20;
+  }
   s->jfd = -1;
+  s->err_fd = -1;
+  pthread_mutex_init(&s->err_mu, NULL);
   s->sb_fd[0] = s->sb_fd[1] = -1;
   s->zt.fd = s->zc.fd = s->nx.fd = -1;
   s->sbbuf = calloc(1, sizeof(sb_t));
@@ -3080,6 +4354,17 @@ int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
   if (r < 0) goto fail;
   s->clean_on_disk = false;
   s->last_sync_ms = s->last_ckpt_ms = st_now_ms();
+  if (!atomic_load_explicit(&s->sc_last_done, memory_order_relaxed)) atomic_store_explicit(&s->sc_last_done, (uint64_t)time(NULL), memory_order_relaxed);      /* (a store from before the scrub: its first pass is one interval from now) */
+  fs_open_checks(s);
+  err_ring_open(s);
+  fs_probe(s);
+  ix_prefetch(s);
+  if (!s->o.no_readahead && pthread_create(&s->ra_thr, NULL, ra_main, s) == 0) {
+    pthread_detach(s->ra_thr);
+    s->ra_started = true;
+  } else {
+    atomic_store_explicit(&s->ra_done, true, memory_order_release);
+  }
   s->rec.open_us = st_now_us() - t0;
   if (s->rec.records_replayed || s->rec.rebuilt || s->rec.used_older_super)
     st_log(s, 4, "store: recovered: %" PRIu64 " journal records, rebuilt=%d, older superblock=%d", s->rec.records_replayed,
@@ -3093,14 +4378,18 @@ fail:
   for (int i = 0; i < 2; i++) if (s->sb_fd[i] >= 0) close(s->sb_fd[i]);
   pthread_mutex_destroy(&s->wlock);
   pthread_mutex_destroy(&s->seg_mu);
+  pthread_mutex_destroy(&s->sc_mu);
+  pthread_mutex_destroy(&s->err_mu);
   free(s->sbbuf);
   free(s->jb.p);
+  free(s->cl_buf);
   free(s);
   return r < 0 ? r : -EIO;
 }
 
 int store_close(store_t *s) {
   if (!s) return -EINVAL;
+  ra_stop_join(s);
   pthread_mutex_lock(&s->wlock);
   int r = checkpoint_locked(s, true);
   if (r < 0) st_log(s, 3, "store: clean checkpoint at close failed: %d", r);
@@ -3113,8 +4402,12 @@ int store_close(store_t *s) {
   pthread_mutex_unlock(&s->wlock);
   pthread_mutex_destroy(&s->wlock);
   pthread_mutex_destroy(&s->seg_mu);
+  pthread_mutex_destroy(&s->sc_mu);
+  pthread_mutex_destroy(&s->err_mu);
+  err_ring_close(s);
   free(s->sbbuf);
   free(s->jb.p);
+  free(s->cl_buf);
   free(s);
   return r;
 }
@@ -3138,7 +4431,7 @@ int store_quarantine(int dirfd) {
   char (*names)[64] = NULL;
   size_t cnt = 0, cap = 0;
   while ((de = readdir(d)) != NULL) {
-    static const char *const pre[] = { "super.", "zt.", "zc.", "nx.", "ix.", "sx.", "seg.", "jrn." };
+    static const char *const pre[] = { "super.", "zt.", "zc.", "nx.", "ix.", "sx.", "seg.", "jrn.", "err." };
     bool match = false;
     for (size_t i = 0; i < sizeof(pre) / sizeof(pre[0]); i++)
       if (strncmp(de->d_name, pre[i], strlen(pre[i])) == 0) match = true;

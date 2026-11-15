@@ -150,13 +150,20 @@ static bool kv_matches_json(const char *kvtext) {
     const kv_t *k = kv_get(line);
     if (!k) { printf("  (kv key not in json: %s)\n", line); return false; }
     if (!k->is_str) { if (strtoull(eq + 1, NULL, 10) != k->num && strcmp(line, "store.time.mono_ms") && strcmp(line, "store.time.unix")
-                                 && strcmp(line, "store.cache.page.sample_age_ms")) { printf("  (kv value differs: %s)\n", line); return false; } }
+                                 && strcmp(line, "store.cache.page.sample_age_ms") && strncmp(line, "store.open.", 11) && strcmp(line, "store.space.checked_unix")) {      /* (the read-ahead thread may end between the two calls) */ printf("  (kv value differs: %s)\n", line); return false; } }
     lines++;
     p = nl + 1;
   }
   return lines == g_nkv;
 }
 
+static bool extra_fn(store_extra_t *x) {
+  memset(x, 0, sizeof(*x));
+  x->pool_used = 7; x->pool_slabs = 1; x->pool_slab_bytes = 2u << 20; x->pool_slot_bytes = 256; x->pool_free_slots = 100;
+  x->attach_slots = 2048; x->attach_grows = 3; x->attach_shrinks = 1;
+  x->folded = 11; x->fold_rows = 5; x->fold_replaced = 2; x->err_texts = 4; x->err_noted = 9; x->err_dropped = 1; x->sampled_detaches = 6;
+  return true;
+}
 static bool g_mem_ok = true;
 static bool mem_fn(ma_est_t *e) {
   if (!g_mem_ok) return false;
@@ -410,6 +417,45 @@ static void test_store(int mode, const char *base) {
   CHECK_EQ(kv_num("store.cold.fetch"), 1);
   CHECK_EQ(kv_num("store.cold.p99_us"), 4);
   CHECK_EQ(kv_num("store.writes.puts"), 4);              /* (store_set_known counts as a put) */
+  /* 0.7 WP9: the cleaner, the space, the scrub, the open: the keys are there, a store that has done nothing of it says so */
+  static const char *const WP9[] = { "store.compact.runs", "store.compact.moved_records", "store.compact.moved_bytes", "store.compact.segments_freed", "store.compact.bad_records",
+                                     "store.compact.pinned_skips", "store.compact.incomplete", "store.compact.last_unix", "store.compact.rate_bytes", "store.compact.candidates",
+                                     "store.compact.dead_bytes", "store.compact.nx_reclaims", "store.compact.nx_reclaimed_bytes", "store.space.fs_total_bytes", "store.space.fs_free_bytes",
+                                     "store.space.checked_unix", "store.space.reserve_bytes", "store.space.store_bytes", "store.space.growth_bytes_per_hour", "store.space.full_in_hours",
+                                     "store.space.degraded_puts", "store.space.enospc_events", "store.space.degraded_since_unix", "store.fs.blksize", "store.fs.recordsize_warning",
+                                     "store.scrub.interval_s", "store.scrub.running", "store.scrub.progress_pct", "store.scrub.passes", "store.scrub.last_start_unix",
+                                     "store.scrub.last_end_unix", "store.scrub.zones_checked", "store.scrub.bytes_checked", "store.scrub.bad_images", "store.scrub.bad_cells",
+                                     "store.scrub.bad_index", "store.scrub.io_errors", "store.segments.free_numbers", "store.segments.draining", "store.segments.pinned",
+                                     "store.journal.max_bytes", "store.open.ix_read_us", "store.open.zt_readahead_us", "store.open.zt_readahead_done", "store.errors.total", NULL };
+  for (const char *const *k = WP9; *k; k++) if (!kv_get(*k)) { printf("  (missing key %s)\n", *k); g_failed++; }
+  CHECK(strcmp(kv_str("store.space.level"), "ok") == 0);
+  CHECK_EQ(kv_num("store.compact.runs"), 0);
+  CHECK_EQ(kv_num("store.space.degraded_puts"), 0);
+  CHECK_EQ(kv_num("store.scrub.passes"), 0);
+  CHECK_EQ(kv_num("store.journal.max_bytes"), 100u << 20);
+  CHECK(kv_num("store.space.reserve_bytes") >= (256u << 10));
+  CHECK(kv_num("store.space.fs_total_bytes") > 0);       /* (the free space was read at the open) */
+  CHECK(kv_num("store.space.store_bytes") > 0);
+  CHECK(kv_num("store.compact.rate_bytes") == (16u << 20));
+  CHECK_EQ(kv_num("store.entries.available"), 0);                  /* (the server has not told the figures of its tables) */
+  store_status_set_extra_fn(extra_fn);
+  store_status_format(js, STORE_STATUS_OUT_MAX, STORE_FMT_JSON, NULL);
+  CHECK(parse_json(js));
+  CHECK_EQ(kv_num("store.entries.available"), 1);
+  CHECK_EQ(kv_num("store.entries.pool_used"), 7);
+  CHECK_EQ(kv_num("store.entries.pool_slot_bytes"), 256);
+  CHECK_EQ(kv_num("store.entries.attach_table_slots"), 2048);
+  CHECK_EQ(kv_num("store.entries.attach_table_grows"), 3);
+  CHECK_EQ(kv_num("store.entries.attach_table_shrinks"), 1);
+  CHECK_EQ(kv_num("store.fold.zones"), 11);
+  CHECK_EQ(kv_num("store.fold.rows"), 5);
+  CHECK_EQ(kv_num("store.fold.replaced"), 2);
+  CHECK_EQ(kv_num("store.errors.memory_texts"), 4);
+  CHECK_EQ(kv_num("store.errors.memory_pushed_out"), 1);
+  CHECK_EQ(kv_num("store.detach.sampled"), 6);
+  store_status_set_extra_fn(NULL);
+  store_status_format(js, STORE_STATUS_OUT_MAX, STORE_FMT_JSON, NULL);
+  CHECK(parse_json(js));
   CHECK_EQ(strlen(kv_str("store.uuid")), 32);
   CHECK_EQ(kv_num("store.memory.available"), 1);
   if (mode == STORE_MODE_MAP) {
@@ -437,6 +483,23 @@ static void test_store(int mode, const char *base) {
   CHECK(strstr(tx, "(") != NULL);                        /* a byte count has its human form */
   CHECK(strchr(tx, '\0') - tx < 8192);
 
+  {                                                      /* the control command that changes the store: `storeop` */
+    char op[512];
+    store_status_op("compact", NULL, op, sizeof(op));
+    CHECK(strncmp(op, "OK", 2) == 0);
+    store_status_op("checkpoint", NULL, op, sizeof(op));
+    CHECK(strncmp(op, "OK checkpoint", 13) == 0);
+    store_status_op("scrub", "start", op, sizeof(op));
+    CHECK(strncmp(op, "OK", 2) == 0);
+    store_status_op("scrub", "stop", op, sizeof(op));
+    CHECK(strncmp(op, "OK", 2) == 0);
+    store_status_op("scrub", NULL, op, sizeof(op));
+    CHECK(strncmp(op, "ERROR usage", 11) == 0);
+    store_status_op("bogus", "x", op, sizeof(op));
+    CHECK(strncmp(op, "ERROR usage", 11) == 0);
+    store_status_op(NULL, NULL, op, sizeof(op));
+    CHECK(strncmp(op, "ERROR usage", 11) == 0);
+  }
   /* the same call twice reads nothing away: counters are not reset by reading */
   store_status_format(js, STORE_STATUS_OUT_MAX, STORE_FMT_JSON, NULL);
   CHECK(parse_json(js));

@@ -499,7 +499,7 @@ static void test_wire_cache_consistency(void) {
                                                 "192.0.2.1", &comp_ctx, false, NULL, &snap, &cfg, &matched1);
         assert(len1_cached > 0);
         assert(matched1 != NULL);
-        uint64_t hits_before = atomic_load(&matched1->observatory.wirecache_hits);
+        uint64_t hits_before = atomic_load(&zone_x_need(matched1)->obs.wirecache_hits);
 
         // Client 1 query (uncached)
         bool saved_ok = arena.rcache_ok;
@@ -525,7 +525,7 @@ static void test_wire_cache_consistency(void) {
         assert(len2_cached > 0);
         // A cookie query is served from the wire cache (the cookie itself is appended per query)
         assert(matched3 == matched1);
-        assert(atomic_load(&matched3->observatory.wirecache_hits) == hits_before + 2); // warm-up + query, both hits
+        assert(atomic_load(&zone_x_need(matched3)->obs.wirecache_hits) == hits_before + 2); // warm-up + query, both hits
 
         // Verify body portion (ANSWER section) is identical between Client 1 and Client 2
         // while the OPT / Cookie portion is independently generated
@@ -1096,7 +1096,7 @@ static void test_rcache_cross_zone_cname_not_cached(void) {
         { "end.a.example.", false },  /* stays in a: cached as before */
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        uint64_t hits0 = atomic_load(&ea.observatory.wirecache_hits);
+        uint64_t hits0 = atomic_load(&zone_x_need(&ea)->obs.wirecache_hits);
         for (int round = 0; round < 2; round++) {
             uint8_t req[512], res[4096];
             size_t req_len = 0;
@@ -1108,7 +1108,7 @@ static void test_rcache_cross_zone_cname_not_cached(void) {
                                              "127.0.0.1", &cc, false, NULL, &snap, &cfg, &matched);
             assert(len > 12 && (res[3] & 0x0F) == 0 && ((res[6] << 8) | res[7]) >= 1);
         }
-        uint64_t hits = atomic_load(&ea.observatory.wirecache_hits) - hits0;
+        uint64_t hits = atomic_load(&zone_x_need(&ea)->obs.wirecache_hits) - hits0;
         assert(cases[i].crosses ? hits == 0 : hits == 1);
     }
     zone_arena_destroy(&arena_a);
@@ -1170,7 +1170,7 @@ static void test_rcache_cut_additional_not_cached(void) {
     assert(len_small > 12 && len_small <= 512 && !(res_small[2] & 0x02));
     uint16_t ar_small = (uint16_t)((res_small[10] << 8) | res_small[11]);
     /* 2. EDNS 4096: must get the whole Additional section, not the cut answer from the cache */
-    uint64_t hits0 = atomic_load(&e.observatory.wirecache_hits);
+    uint64_t hits0 = atomic_load(&zone_x_need(&e)->obs.wirecache_hits);
     build_edns_query(req, &req_len, 0x5102, "mx.example.", 15, false);
     compress_ctx_init_packet(&cc);
     int len_big = process_dns_query_impl(req, req_len, res_big, sizeof(res_big), "mx.example.", 15,
@@ -1178,7 +1178,7 @@ static void test_rcache_cut_additional_not_cached(void) {
     assert(len_big > len_small);
     uint16_t ar_big = (uint16_t)((res_big[10] << 8) | res_big[11]);
     assert(ar_big > ar_small + 1); /* more than the OPT RR alone */
-    assert(atomic_load(&e.observatory.wirecache_hits) == hits0);
+    assert(atomic_load(&zone_x_need(&e)->obs.wirecache_hits) == hits0);
     zone_arena_destroy(&arena);
     printf("  [PASS] cut Additional section not cached (plain AR=%u, EDNS AR=%u)\n", ar_small, ar_big);
 }
@@ -1224,13 +1224,13 @@ static void test_rcache_wildcard_mark_kept(void) {
     compress_ctx_t cc = {0};
     zone_db_entry_t *matched = NULL;
     for (int round = 0; round < 2; round++) {
-        uint64_t hits0 = atomic_load(&e.observatory.wirecache_hits);
+        uint64_t hits0 = atomic_load(&zone_x_need(&e)->obs.wirecache_hits);
         build_simple_query(req, &req_len, (uint16_t)(0x5201 + round), "rnd.wc.example.", 1);
         compress_ctx_init_packet(&cc);
         int len = process_dns_query_impl(req, req_len, res, 512, "rnd.wc.example.", 1,
                                          "127.0.0.1", &cc, false, NULL, &snap, &cfg, &matched);
         assert(len > 12 && (res[3] & 0x0F) == 0 && res[7] == 1);
-        assert(atomic_load(&e.observatory.wirecache_hits) == hits0 + (uint64_t)round);   /* the second is a hit */
+        assert(atomic_load(&zone_x_need(&e)->obs.wirecache_hits) == hits0 + (uint64_t)round);   /* the second is a hit */
         assert(t_query_rrl_info.wildcard);
     }
     /* an answer that is not from a wildcard is not marked, from the cache either */
@@ -1340,13 +1340,13 @@ static void test_rcache_sibling_glue_not_cached(void) {
     static const uint8_t old_addr[4] = {192, 0, 2, 77}, new_addr[4] = {192, 0, 2, 88};
     uint8_t res[4096];
     /* the answer carries the sibling's address, and the same query again is not a cache hit */
-    uint64_t hits0 = atomic_load(&w->ent[0].observatory.wirecache_hits);
+    uint64_t hits0 = atomic_load(&zone_x_need(&w->ent[0])->obs.wirecache_hits);
     for (int round = 0; round < 3; round++) {
         int len = world_query(w, (uint16_t)(0x6100 + round), "mx.a.example.", 15, false, res, sizeof(res), 512);
         assert(len > 12 && (res[3] & 0x0F) == 0 && ((res[6] << 8) | res[7]) == 1);
         assert(bytes_contain(res, (size_t)len, old_addr, 4));
     }
-    assert(atomic_load(&w->ent[0].observatory.wirecache_hits) == hits0);
+    assert(atomic_load(&zone_x_need(&w->ent[0])->obs.wirecache_hits) == hits0);
 
     /* b.example is published again with another address; a.example's generation is not touched (the window before the control
      * thread's glue refresh, or a target beyond the tracked 256): the next answer must already show the new address */
@@ -1358,12 +1358,12 @@ static void test_rcache_sibling_glue_not_cached(void) {
     assert(!bytes_contain(res, (size_t)len, old_addr, 4));
 
     /* a name whose glue is the zone's own address is still cached (the rule is not wider than the sibling lookup) */
-    uint64_t own0 = atomic_load(&w->ent[0].observatory.wirecache_hits);
+    uint64_t own0 = atomic_load(&zone_x_need(&w->ent[0])->obs.wirecache_hits);
     for (int round = 0; round < 2; round++) {
         len = world_query(w, (uint16_t)(0x6120 + round), "own.a.example.", 15, false, res, sizeof(res), 512);
         assert(len > 12 && (res[3] & 0x0F) == 0);
     }
-    assert(atomic_load(&w->ent[0].observatory.wirecache_hits) == own0 + 1);
+    assert(atomic_load(&zone_x_need(&w->ent[0])->obs.wirecache_hits) == own0 + 1);
 
     for (int i = 0; i < 3; i++) zone_arena_destroy(&w->arena[i]);
     free(w);
@@ -1405,14 +1405,14 @@ static void test_rcache_sibling_tagged_glue_not_cached(void) {
 
     static const uint8_t tokyo[4] = {192, 0, 2, 201}, osaka[4] = {192, 0, 2, 203};
     uint8_t res[4096];
-    uint64_t hits0 = atomic_load(&w->ent[0].observatory.wirecache_hits);
+    uint64_t hits0 = atomic_load(&zone_x_need(&w->ent[0])->obs.wirecache_hits);
     for (int round = 0; round < 3; round++) {
         int len = world_query(w, (uint16_t)(0x6200 + round), "mx.a.example.", 15, false, res, sizeof(res), 512);
         assert(len > 12 && (res[3] & 0x0F) == 0);
         assert(bytes_contain(res, (size_t)len, tokyo, 4));   /* the sibling's own tag matched the client */
         assert(!bytes_contain(res, (size_t)len, osaka, 4));
     }
-    assert(atomic_load(&w->ent[0].observatory.wirecache_hits) == hits0);
+    assert(atomic_load(&zone_x_need(&w->ent[0])->obs.wirecache_hits) == hits0);
 
     for (int i = 0; i < 2; i++) zone_arena_destroy(&w->arena[i]);
     free(w);
@@ -1600,6 +1600,7 @@ static void test_wire_cache_observatory_counters(void) {
     memset(&db_entry, 0, sizeof(db_entry));
     db_entry.domain = "example.com.";
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
+    (void)zone_x_need(&db_entry);                          /* (the wire-cache counters are the extension's: a stack entry makes it before it is queried) */
 
     zone_db_entry_t *entries[1] = { &db_entry };
     char *any_acl[1] = { (char *)"any" };
@@ -1628,8 +1629,8 @@ static void test_wire_cache_observatory_counters(void) {
                                     "www.example.com.", 1,
                                     "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
     assert(len > 0);
-    assert(atomic_load_explicit(&db_entry.observatory.wirecache_hits, memory_order_relaxed) == 0);
-    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 1);
+    assert(atomic_load_explicit(&zone_x_need(&db_entry)->obs.wirecache_hits, memory_order_relaxed) == 0);
+    assert(atomic_load_explicit(&zone_x_need(&db_entry)->obs.wirecache_misses, memory_order_relaxed) == 1);
     uint8_t res_first[4096];
     memcpy(res_first, res, (size_t)len);
     int len_first = len;
@@ -1638,8 +1639,8 @@ static void test_wire_cache_observatory_counters(void) {
                                  "www.example.com.", 1,
                                  "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
     assert(len == len_first && memcmp(res, res_first, (size_t)len) == 0);
-    assert(atomic_load_explicit(&db_entry.observatory.wirecache_hits, memory_order_relaxed) == 1);
-    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 1);
+    assert(atomic_load_explicit(&zone_x_need(&db_entry)->obs.wirecache_hits, memory_order_relaxed) == 1);
+    assert(atomic_load_explicit(&zone_x_need(&db_entry)->obs.wirecache_misses, memory_order_relaxed) == 1);
 
     // 2. Cache miss query (NXDOMAIN): nonexistent.example.com A
     build_simple_query(req, &req_len, 0x1002, "nonexistent.example.com.", 1);
@@ -1649,16 +1650,16 @@ static void test_wire_cache_observatory_counters(void) {
                                  "nonexistent.example.com.", 1,
                                  "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
     assert(len > 0);
-    assert(atomic_load_explicit(&db_entry.observatory.wirecache_hits, memory_order_relaxed) == 1);
-    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 2);
+    assert(atomic_load_explicit(&zone_x_need(&db_entry)->obs.wirecache_hits, memory_order_relaxed) == 1);
+    assert(atomic_load_explicit(&zone_x_need(&db_entry)->obs.wirecache_misses, memory_order_relaxed) == 2);
     // NXDOMAIN is not stored: the same query misses again
     compress_ctx_init_packet(&comp_ctx);
     len = process_dns_query_impl(req, req_len, res, sizeof(res),
                                  "nonexistent.example.com.", 1,
                                  "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
     assert(len > 0 && (res[3] & 0x0F) == 3);
-    assert(atomic_load_explicit(&db_entry.observatory.wirecache_hits, memory_order_relaxed) == 1);
-    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 3);
+    assert(atomic_load_explicit(&zone_x_need(&db_entry)->obs.wirecache_hits, memory_order_relaxed) == 1);
+    assert(atomic_load_explicit(&zone_x_need(&db_entry)->obs.wirecache_misses, memory_order_relaxed) == 3);
 
     // 3. Cache-ineligible query (DO=1): should not increment hits or misses
     build_edns_query(req, &req_len, 0x1003, "www.example.com.", 1, true /* DO=1 */);
@@ -1668,8 +1669,8 @@ static void test_wire_cache_observatory_counters(void) {
                                  "www.example.com.", 1,
                                  "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
     assert(len > 0);
-    assert(atomic_load_explicit(&db_entry.observatory.wirecache_hits, memory_order_relaxed) == 1);
-    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 3);
+    assert(atomic_load_explicit(&zone_x_need(&db_entry)->obs.wirecache_hits, memory_order_relaxed) == 1);
+    assert(atomic_load_explicit(&zone_x_need(&db_entry)->obs.wirecache_misses, memory_order_relaxed) == 3);
 
     // 4. A new published version (new data generation) never sees the old entries
     build_simple_query(req, &req_len, 0x1004, "www.example.com.", 1);
@@ -1679,8 +1680,8 @@ static void test_wire_cache_observatory_counters(void) {
                                  "www.example.com.", 1,
                                  "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
     assert(len > 0);
-    assert(atomic_load_explicit(&db_entry.observatory.wirecache_hits, memory_order_relaxed) == 1);
-    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 4);
+    assert(atomic_load_explicit(&zone_x_need(&db_entry)->obs.wirecache_hits, memory_order_relaxed) == 1);
+    assert(atomic_load_explicit(&zone_x_need(&db_entry)->obs.wirecache_misses, memory_order_relaxed) == 4);
 
     // 5. A sibling zone that holds glue addresses changed (S2): the zone gets a new generation in place
     uint64_t sibling_gen = zone_data_generation_next();
@@ -1691,7 +1692,7 @@ static void test_wire_cache_observatory_counters(void) {
                                  "www.example.com.", 1,
                                  "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
     assert(len > 0);
-    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 5);
+    assert(atomic_load_explicit(&zone_x_need(&db_entry)->obs.wirecache_misses, memory_order_relaxed) == 5);
 
     // 6. A configuration generation change also misses
     cfg.generation++;
@@ -1700,7 +1701,7 @@ static void test_wire_cache_observatory_counters(void) {
                                  "www.example.com.", 1,
                                  "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
     assert(len > 0);
-    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 6);
+    assert(atomic_load_explicit(&zone_x_need(&db_entry)->obs.wirecache_misses, memory_order_relaxed) == 6);
 
     zone_arena_destroy(&arena);
     printf("[SUCCESS] All wire cache observatory counters tests passed!\n");
@@ -1856,19 +1857,19 @@ static void test_acl_before_response_cache(void) {
     /* the allowed client warms the cache (the second answer is a hit) ... */
     int len = ASK(0x5001, "end.a.example.", "127.0.0.1");
     assert(len > 12 && (res[3] & 0x0F) == 0 && ((res[6] << 8) | res[7]) == 1);
-    uint64_t hits0 = atomic_load(&ea.observatory.wirecache_hits);
+    uint64_t hits0 = atomic_load(&zone_x_need(&ea)->obs.wirecache_hits);
     len = ASK(0x5002, "end.a.example.", "127.0.0.1");
     assert(len > 12 && (res[3] & 0x0F) == 0 && ((res[6] << 8) | res[7]) == 1);
-    assert(atomic_load(&ea.observatory.wirecache_hits) == hits0 + 1);
+    assert(atomic_load(&zone_x_need(&ea)->obs.wirecache_hits) == hits0 + 1);
     /* ... and a client that may not ask is refused: no answer, AA=0, the question only, and the cache is not even looked at */
-    uint64_t hits1 = atomic_load(&ea.observatory.wirecache_hits), miss1 = atomic_load(&ea.observatory.wirecache_misses);
+    uint64_t hits1 = atomic_load(&zone_x_need(&ea)->obs.wirecache_hits), miss1 = atomic_load(&zone_x_need(&ea)->obs.wirecache_misses);
     for (int i = 0; i < 3; i++) {
         len = ASK(0x5003 + i, "end.a.example.", "127.0.0.9");     /* inside options' 127.0.0.0/8 but not in a.example's list */
         assert(len > 12 && (res[3] & 0x0F) == 5 && ((res[6] << 8) | res[7]) == 0 && (res[2] & 0x04) == 0 && ((res[4] << 8) | res[5]) == 1);
         len = ASK(0x5010 + i, "end.a.example.", "198.51.100.1");
         assert(len > 12 && (res[3] & 0x0F) == 5 && ((res[6] << 8) | res[7]) == 0);
     }
-    assert(atomic_load(&ea.observatory.wirecache_hits) == hits1 && atomic_load(&ea.observatory.wirecache_misses) == miss1);
+    assert(atomic_load(&zone_x_need(&ea)->obs.wirecache_hits) == hits1 && atomic_load(&zone_x_need(&ea)->obs.wirecache_misses) == miss1);
     /* a refused response with EDNS carries EDE 18 and no stale bytes after the question + OPT */
     {
         build_edns_query(req, &req_len, 0x5020, "end.a.example.", 1, false);
@@ -1888,7 +1889,7 @@ static void test_acl_before_response_cache(void) {
         assert(len > 12 && (res[3] & 0x0F) == 0 && ((res[6] << 8) | res[7]) == 1 && (res[2] & 0x04) != 0);
         assert(!bytes_contain(res, (size_t)len, (const uint8_t[]){ 192, 0, 2, 77 }, 4));
     }
-    assert(atomic_load(&ea.observatory.wirecache_hits) == hits1);                      /* never a hit: the answer is not stored */
+    assert(atomic_load(&zone_x_need(&ea)->obs.wirecache_hits) == hits1);                      /* never a hit: the answer is not stored */
     len = ASK(0x5040, "x.b.example.", "127.0.0.1");
     assert(len > 12 && (res[3] & 0x0F) == 5);                                          /* b.example itself: unsigned is refused */
     free_server_config_fields(&cfg);

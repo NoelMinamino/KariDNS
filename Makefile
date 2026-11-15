@@ -61,7 +61,7 @@ DAG_SRCS = tools/dag.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c 
 DAG_OBJS = $(DAG_SRCS:.c=.o)
 
 KARICTL_TARGET = karictl
-KARICTL_SRCS = tools/karictl.c
+KARICTL_SRCS = tools/karictl.c dns_mem_advice.c
 KARICTL_OBJS = $(KARICTL_SRCS:.c=.o)
 
 # karidns-tapstat: aggregates the dnstap stream (POSIX only; not part of the Windows build of dag)
@@ -1910,7 +1910,7 @@ DAG_ASAN_SRCS = tools/dag.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_pars
 dag-asan: $(DAG_ASAN_SRCS)
 	$(CC) $(ASAN_CFLAGS) $(DAG_ASAN_SRCS) -o $@ $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
 
-KARICTL_ASAN_SRCS = tools/karictl.c
+KARICTL_ASAN_SRCS = tools/karictl.c dns_mem_advice.c
 karictl-asan: $(KARICTL_ASAN_SRCS)
 	$(CC) $(ASAN_CFLAGS) $(KARICTL_ASAN_SRCS) -o $@ $(LDFLAGS) -lcrypto -fsanitize=address,undefined
 

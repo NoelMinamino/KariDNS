@@ -93,6 +93,22 @@ size_t ma_text_advice(char *buf, size_t n, const ma_est_t *e);
 size_t ma_text_status(char *buf, size_t n, const ma_est_t *e);
 const char *ma_level_name(int level);       /* "ok", "notice", "warning", "error" */
 
+/* ---- ZFS (0.7 store design 3.6) ---- */
+/* On ZFS the images are read with pread() and the ARC is the cache of the store: the Backend's heap, the ARC (vfs.zfs.arc.max), the loader and about a gigabyte for the rest
+ * of the system have to fit in RAM together.  The Backend cannot read kstat / sysctl values in capability mode: karictl (and karicheck) read vfs.zfs.arc.max and hw.physmem
+ * on the host and call this. */
+#define MA_ARC_OTHER        (1ull << 30)    /* the system, the page cache of the rest, the jails' share: 1 GB */
+#define MA_ARC_NOTICE_PCT   85              /* NOTICE above this share of RAM */
+typedef struct {
+    uint64_t backend, arc_max, loader, other;   /* the parts of the sum, bytes */
+    uint64_t total, ram;
+    uint64_t arc_fit;           /* the largest vfs.zfs.arc.max that fits (0 when the rest alone does not fit) */
+    uint32_t pct;               /* total / ram, percent (0 when ram is not known) */
+    int level;                  /* MA_LEVEL_INFO, NOTICE (above MA_ARC_NOTICE_PCT), WARNING (above RAM) */
+} ma_arc_t;
+void ma_arc_sum(uint64_t backend_heap, uint64_t arc_max, uint64_t loader, uint64_t ram, ma_arc_t *out);
+size_t ma_text_arc(char *buf, size_t n, const ma_arc_t *a);
+
 /* ---- at run time ---- */
 #define MA_WINDOW_MS        10000           /* the span the rates are computed over */
 #define MA_WARN_EVERY_MS    60000           /* a warning is repeated at most this often while the condition lasts */

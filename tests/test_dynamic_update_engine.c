@@ -276,7 +276,7 @@ static void test_handle_dynamic_update_pipeline(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "example.com.";
-    strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
+    entry.view_name = "default";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
@@ -378,7 +378,7 @@ static void test_handle_dynamic_update_drops_unencodable(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "example.com.";
-    strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
+    entry.view_name = "default";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
     init_sample_zone_arena(test_zone_slot(&entry, 0), "example.com.", "1000");
@@ -587,7 +587,7 @@ static void test_send_notify_to_all_comprehensive(void) {
     /* the also-notify addresses (the invalid one is skipped: 2 of the 3) and the NS hosts' glue: in-zone A/AAAA of ns2, sibling A/AAAA of ns1.sib.example */
     assert(got_v4_also && got_v6_also);
     assert(pkt_count == 6);
-    assert(atomic_load_explicit(&z1->observatory.notify_sent, memory_order_acquire) > 0);
+    assert(atomic_load_explicit(&zone_x_need(z1)->obs.notify_sent, memory_order_acquire) > 0);
 
     close(g_notify_ipc[0]);
     close(g_notify_ipc[1]);
@@ -862,7 +862,7 @@ static void test_update_multi_tsig_keys(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "example.com.";
-    strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
+    entry.view_name = "default";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
@@ -1642,7 +1642,7 @@ static void test_update_prerequisite_rules(void) {
 static void upd_entry_init(zone_db_entry_t *entry) {
     memset(entry, 0, sizeof(*entry));
     entry->domain = UZ;
-    strlcpy(entry->view_name, "default", sizeof(entry->view_name));
+    entry->view_name = "default";
     pthread_mutex_init(&entry->writer_lock, NULL);
     pthread_mutex_init(&entry->ixfr_history.lock, NULL);
     upd_load(test_zone_slot(entry, 0));
@@ -1773,7 +1773,7 @@ static void test_update_dispatch_zone_section(void) {
     zone_db_entry_t sec;
     memset(&sec, 0, sizeof(sec));
     sec.domain = "sec.example.";
-    strlcpy(sec.view_name, "default", sizeof(sec.view_name));
+    sec.view_name = "default";
     zone_arena_init(test_zone_slot(&sec, 0));
     atomic_store_explicit(&sec.rcu.active, &test_zone_slot(&sec, 0)->ver, memory_order_release);
 
@@ -2684,7 +2684,7 @@ static void test_serial_update_methods(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "example.com.";
-    strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
+    entry.view_name = "default";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
     init_sample_zone_arena(test_zone_slot(&entry, 0), "example.com.", "1000");
@@ -2787,7 +2787,7 @@ static void test_update_policy_pipeline(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.domain = "example.com.";
-    strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
+    entry.view_name = "default";
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
     init_sample_zone_arena(test_zone_slot(&entry, 0), "example.com.", "1000");

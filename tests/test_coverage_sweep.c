@@ -196,7 +196,7 @@ static void sw_add_zone(const char *origin, const char *text) {
     assert(test_build_index(a, true) == 0);
     zone_db_entry_t *e = &g_sw.entry[i];
     e->domain = origin;
-    strncpy(e->view_name, "default", sizeof(e->view_name) - 1);
+    e->view_name = "default";
     pthread_mutex_init(&e->writer_lock, NULL);
     atomic_store_explicit(&e->rcu.active, &a->ver, memory_order_release);
     g_sw.entries[i] = e;
@@ -2220,7 +2220,7 @@ static void upd_entry_init(zone_db_entry_t *e) {
         "www IN A 192.0.2.80\nwww IN A 192.0.2.81\nwww IN TXT \"t\"\nalias IN CNAME www.upd.example.\n"
         "mx IN MX 10 www.upd.example.\n";
     memset(e, 0, sizeof(*e));
-    e->domain = "upd.example."; strcpy(e->view_name, "default");
+    e->domain = "upd.example."; e->view_name = "default";
     pthread_mutex_init(&e->writer_lock, NULL);
     pthread_mutex_init(&e->ixfr_history.lock, NULL);
     for (int k = 0; k < 2; k++) {
@@ -2329,7 +2329,7 @@ static void test_update_matrix(void) {
  * ======================================================================== */
 static void xfr_entry_init(zone_db_entry_t *e, const char *text, const char *origin) {
     memset(e, 0, sizeof(*e));
-    e->domain = origin; strcpy(e->view_name, "default");
+    e->domain = origin; e->view_name = "default";
     pthread_mutex_init(&e->writer_lock, NULL);
     pthread_mutex_init(&e->ixfr_history.lock, NULL);
     for (int k = 0; k < 2; k++) {

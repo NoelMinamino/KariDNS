@@ -705,11 +705,12 @@ Server's monotonic clock in milliseconds, wall clock in seconds, at the moment
 of the reply
 .TP 8
 \fBstore.state\fR
-\fBnone\fR (no store), \fBok\fR, or \fBdegraded\fR (the last write failed: disk
-full)
+\fBnone\fR (no store), \fBok\fR, or \fBdegraded\fR (the disk is full: new and
+changed zones are kept without an image until room is back; \fBstore.space.*\fR)
 .TP 8
 \fBstore.state_bits\fR
-The state as bits: 1 disk full, 2 repaired at the last open
+The state as bits: 1 disk full (degraded, or the last write failed for lack of
+room), 2 repaired at the last open
 .TP 8
 \fBstore.format\fR, \fBstore.mode\fR, \fBstore.fstype\fR, \fBstore.uuid\fR
 Store format version; \fBmap\fR (segments mapped) or \fBcopy\fR (read with
@@ -749,11 +750,19 @@ Zone table records in use and room; long names, used and dead
 Name index and source index: generation, slots, slots used, live entries
 .TP 8
 \fBstore.segments.count\fR, \fB.used_bytes\fR, \fB.live_bytes\fR, \fB.dead_pct\fR
-Image segments: number, bytes appended, bytes still referenced, share that a
-cleaner would free
+Image segments: highest segment number in use, bytes appended to the segments
+that exist, bytes still referenced, share that the cleaner can win
 .TP 8
-\fBstore.journal.lsn\fR, \fB.checkpoint_lsn\fR, \fB.committed_lsn\fR, \fB.bytes\fR, \fB.gen\fR
-Journal position, last checkpoint, last durable commit, size, generation
+\fBstore.segments.free_numbers\fR, \fB.draining\fR, \fB.pinned\fR
+Segment numbers that are free (the segment was cleaned and removed; the number
+is used again), segments with no live record that wait for a checkpoint, a grace
+period or the end of the references, segments that an attached zone's image
+points into (MAP mode)
+.TP 8
+\fBstore.journal.lsn\fR, \fB.checkpoint_lsn\fR, \fB.committed_lsn\fR, \fB.bytes\fR, \fB.gen\fR, \fB.max_bytes\fR
+Journal position, last checkpoint, last durable commit, size, generation, the
+size at which a checkpoint is forced (100 MiB: a replay of that takes about a
+second)
 .TP 8
 \fBstore.checkpoint.count\fR, \fB.last_unix\fR, \fB.last_us\fR
 Checkpoints since the open, when the last one ended, how long it took
@@ -763,6 +772,98 @@ Writer counters since the open
 .TP 8
 \fBstore.recovery.created\fR, \fB.was_clean\fR, \fB.used_older_super\fR, \fB.rebuilt\fR, \fB.journals_read\fR, \fB.records_replayed\fR, \fB.journal_torn\fR, \fB.rebuilt_zones\fR, \fB.dropped_zones\fR, \fB.open_us\fR
 What the last open found and did, and how long it took
+.TP 8
+\fBstore.open.ix_read_us\fR, \fB.zt_readahead_us\fR, \fB.zt_readahead_done\fR
+The open reads the name index once before the first answer (\fBix_read_us\fR:
+how long that took); a thread then reads the zone table into memory in the
+background (\fBzt_readahead_us\fR, 0 until \fBzt_readahead_done\fR is 1)
+.TP 8
+\fBstore.errors.total\fR
+Texts put into the error ring (\fBerr.ring\fR, the last 65,536 are kept) since
+it was made: why a zone was refused or failed
+.TP 8
+\fBstore.entries.available\fR
+1 when the figures of the server's own tables below are there (a server with the
+store on)
+.TP 8
+\fBstore.entries.pool_used\fR, \fB.pool_slabs\fR, \fB.pool_slab_bytes\fR, \fB.pool_slot_bytes\fR, \fB.pool_free_slots\fR
+The pool of zone entries: slots in use (one for every zone in memory), slabs,
+bytes of a slab, bytes of a slot (256), free slots
+.TP 8
+\fBstore.entries.attach_table_slots\fR, \fB.attach_table_grows\fR, \fB.attach_table_shrinks\fR
+The table that finds a zone in memory by its zone id: slots now, how often it
+was made larger and smaller
+.TP 8
+\fBstore.fold.zones\fR, \fB.rows\fR, \fB.replaced\fR
+Zones that left memory with their counters folded into the totals of their view,
+rows of the table of the top zones (those with the most queries that are not in
+memory), rows a busier zone took over
+.TP 8
+\fBstore.errors.memory_texts\fR, \fB.memory_noted\fR, \fB.memory_pushed_out\fR
+The texts of rejected zones in the ring in memory (512), how many were noted
+since the start, how many were pushed out by newer ones (the file \fBerr.ring\fR
+still has them; \fBstore.errors.total\fR)
+.TP 8
+\fBstore.detach.sampled\fR
+Zones that were taken out of memory because the sample of the attach table chose
+them (also in \fBstore.detach.count\fR)
+.TP 8
+\fBstore.compact.runs\fR, \fB.moved_records\fR, \fB.moved_bytes\fR, \fB.segments_freed\fR, \fB.last_unix\fR
+The cleaner (since the open): segments it began to clean, records and bytes it
+copied to the open segment, segments it removed, when it last worked
+.TP 8
+\fBstore.compact.bad_records\fR, \fB.pinned_skips\fR, \fB.incomplete\fR
+Live records that failed their checksum when the cleaner was to copy them (the
+zone became known and is read from the database again), emptied segments that
+were held by an attached image (counted once each), segments the cleaner could
+not empty (a record it cannot read; it tries again after ten minutes)
+.TP 8
+\fBstore.compact.rate_bytes\fR, \fB.candidates\fR, \fB.dead_bytes\fR
+Bytes a second the cleaner may copy (0 = no limit), segments that are dead
+enough (half dead and at least a quarter of a segment or 1 MiB dead) now, dead
+bytes of all segments but the open one
+.TP 8
+\fBstore.compact.nx_reclaims\fR, \fB.nx_reclaimed_bytes\fR
+Passes that gave back the space of long zone names that were deleted
+(\fBstore.tables.nx_dead_bytes\fR), and the bytes they gave back
+.TP 8
+\fBstore.space.level\fR
+\fBok\fR, \fBlow\fR (a WARNING was said: the file system is getting full),
+\fBdegraded\fR (no room: new and changed zones are kept without an image)
+.TP 8
+\fBstore.space.fs_total_bytes\fR, \fB.fs_free_bytes\fR, \fB.checked_unix\fR
+The file system of the store, as of the last check (at every checkpoint, about
+every second while images are written)
+.TP 8
+\fBstore.space.reserve_bytes\fR, \fB.store_bytes\fR
+Free bytes that only the cleaner may use (images are refused below that: half a
+segment, 256 KiB to 128 MiB); what the store occupies
+.TP 8
+\fBstore.space.growth_bytes_per_hour\fR, \fB.full_in_hours\fR
+The growth over the last hour (0 until five minutes of history exist, or when
+the store shrinks) and the hours until the file system is full at that growth (0
+= not known)
+.TP 8
+\fBstore.space.degraded_puts\fR, \fB.enospc_events\fR, \fB.degraded_since_unix\fR
+Zones that were kept without an image because no room was left (since the open),
+writes that found no room, when the degraded state began (0 = not degraded)
+.TP 8
+\fBstore.fs.blksize\fR, \fB.recordsize_warning\fR
+\fBst_blksize\fR of a table file (on ZFS the record size of the dataset) and 1
+when it is above 32 KiB (the server says so in syslog; see "The zone store" in
+karidns.md)
+.TP 8
+\fBstore.scrub.interval_s\fR, \fB.running\fR, \fB.progress_pct\fR
+Seconds between two scrubs (0 = never), whether a pass runs, how far it is
+.TP 8
+\fBstore.scrub.passes\fR, \fB.last_start_unix\fR, \fB.last_end_unix\fR, \fB.zones_checked\fR, \fB.bytes_checked\fR
+Passes since the open, when the last began and ended, zones and bytes read
+.TP 8
+\fBstore.scrub.bad_images\fR, \fB.bad_cells\fR, \fB.bad_index\fR, \fB.io_errors\fR
+What the scrub found since the open: images whose checksum or structure was
+wrong (the zone became known and is read again), damaged table records, index
+entries that did not lead to their zone (both repaired at the end of the pass),
+read errors
 .TP 8
 \fBstore.cache.kind\fR
 \fBpage\fR (UFS: \fBmincore\fR sample), \fBarc\fR (ZFS), \fBcopy\fR
@@ -779,6 +880,13 @@ On ZFS: \fBsee karictl (ARC kstats)\fR
 \fBstore.cache.arc.available\fR, \fB.size_bytes\fR, \fB.target_bytes\fR, \fB.target_min_bytes\fR, \fB.target_max_bytes\fR, \fB.hits\fR, \fB.misses\fR, \fB.hit_pct\fR, \fB.compressed_bytes\fR, \fB.uncompressed_bytes\fR
 ARC figures, added by \fBkarictl\fR on ZFS (a kstat that cannot be read is left
 out)
+.TP 8
+\fBstore.memory.arc.backend_bytes\fR, \fB.arc_max_bytes\fR, \fB.loader_bytes\fR, \fB.other_bytes\fR, \fB.total_bytes\fR, \fB.ram_bytes\fR, \fB.pct\fR, \fB.level\fR, \fB.text\fR
+Added by \fBkarictl\fR on ZFS: the Backend's heap (with \fBmemory\-limit\fR its
+size under the limit, else with every zone in memory), \fBvfs.zfs.arc.max\fR,
+the loader, about 1 GB for the system, their sum against \fBhw.physmem\fR, the
+share in percent, \fBok\fR / \fBnotice\fR (above 85 percent) / \fBwarning\fR
+(above RAM) and the sentence (in the text form: the section \fBarc sum\fR)
 .TP 8
 \fBstore.attach.count\fR
 Zones attached from the store since the start
@@ -878,6 +986,31 @@ zone), digest of the zone content (hex)
 A bad argument, a zone that is not in the store (\fBERROR zone not found\fR), a
 name in several views without a view, or \fBzone\fR without a store are answered
 \fBERROR ...\fR (exit status 3).
+.RE
+.TP 8
+\fBstore compact\fR, \fBstore checkpoint\fR, \fBstore scrub start\fR, \fBstore scrub stop\fR
+Change the store (0.7); they are not read commands, so they need the main
+control key (a restricted key, read-only or with \fBallow\-commands\fR, does not
+have them). \fBstore compact\fR asks the cleaner to run without its rate limit
+until no segment is dead enough (it returns at once; \fBstore.compact.*\fR shows
+the progress), then the server writes a checkpoint and removes the segments that
+are empty. The cleaner runs by itself, at 16 MiB a second at most, whenever a
+segment is half dead; this is for after a mass change, or before a
+measurement. \fBstore checkpoint\fR writes a checkpoint now (the journal is cut,
+what was written is durable) and answers when it is done. \fBstore scrub
+start\fR begins a scrub pass at once (the scrub reads every record, at most 16
+MiB a second; \fBstore\-scrub\-interval\fR starts one by itself); \fBstore scrub
+stop\fR ends the pass that runs. The answers are \fBOK ...\fR or \fBERROR ...\fR
+(exit status 3).
+.RS 8
+.PP
+.RS 2
+.nf
+karictl store compact
+karictl store \-k | grep '^store.compact.'
+karictl store scrub start
+.fi
+.RE
 .RE
 .TP 8
 \fBtrace [level]\fR

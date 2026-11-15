@@ -51,6 +51,12 @@ typedef struct {
 } gc_reclaim_stats_t;
 void gc_reclaim_stats(gc_reclaim_stats_t *out);
 zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name);
+/* 0.7 store S5: the core of an entry alone, in a slot of the entry pool; the extension (zone_x_need()) is made when something needs it */
+zone_db_entry_t *create_light_zone_entry(const char *domain, const char *view_name);
+typedef struct {
+  uint64_t slot_bytes, slab_bytes, slabs, used, free_slots, allocs, frees, slab_new, slab_gone, fallback;
+} zone_entry_pool_stats_t;
+void zone_entry_pool_stats(zone_entry_pool_stats_t *out);
 
 reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg);
 zone_db_snapshot_t *rebuild_zone_db_snapshot(

@@ -27,6 +27,11 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <sys/types.h>
+#if defined(__FreeBSD__)
+#include <sys/param.h>
+#include <sys/mount.h>
+#include <sys/sysctl.h>
+#endif
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -1917,6 +1922,38 @@ KARIDNS_TOOL_FN int kc_db_run_source(const server_config_t *cfg, const kc_dbsrc_
 /* 0.7 P-F: what the databases need in memory (dns_mem_advice.c, the same figures and rules as the server's syslog lines and `karictl dbstatus`), from the
  * zones and records the loaders counted; the whole configuration counts, so it is said once, not for every source.  The tool does not know how the zones
  * are asked for, so what it says about memory-limit is the share of zones that fit and the recommendation, as the server says it at its start. */
+/* 0.7 S6 (store design 3.6): when the store is on ZFS (the images are read with pread() and the ARC is their cache), the Backend's heap, vfs.zfs.arc.max, the loader and about a
+ * gigabyte for the system have to fit in RAM together.  Said as an information line (a sum that is over RAM says so in its text); the server cannot read these values in its sandbox. */
+KARIDNS_TOOL_FN void kc_db_zfs_memory(const database_config_t *db, const ma_est_t *e) {
+#if defined(__FreeBSD__)
+    if (db->store_none || db->store_mode == 1) return;           /* (`store-mode map` keeps the images in the page cache: not what this sums) */
+    char path[KARIDNS_DB_PATH_MAX + 1];
+    snprintf(path, sizeof(path), "%s", db->store_dir ? db->store_dir : KARIDNS_DB_DEFAULT_STORE_DIR);
+    struct statfs sfs;
+    bool have = false;
+    for (;;) {                                  /* (the directory may not be made yet: its nearest parent is on the same file system) */
+        if (statfs(path, &sfs) == 0) { have = true; break; }
+        char *sl = strrchr(path, '/');
+        if (!sl || sl == path) break;
+        *sl = '\0';
+    }
+    if (!have || strcmp(sfs.f_fstypename, "zfs") != 0) return;
+    uint64_t arc = 0, ram = 0;
+    size_t l = sizeof(arc);
+    if (sysctlbyname("vfs.zfs.arc.max", &arc, &l, NULL, 0) != 0 || (l != 4 && l != 8)) return;
+    l = sizeof(ram);
+    if (sysctlbyname("hw.physmem", &ram, &l, NULL, 0) != 0 || (l != 4 && l != 8)) ram = 0;
+    ma_arc_t a;
+    ma_arc_sum(e->limit ? e->backend_limit : e->backend_all, arc, e->limit ? e->loader_limit : e->loader_all, ram, &a);
+    char t[640];
+    ma_text_arc(t, sizeof(t), &a);
+    dns_diag(DIAG_INFO, DC_DB_MEMORY_ESTIMATE, NULL, 0, "%s\n", t);
+#else
+    (void)db;
+    (void)e;
+#endif
+}
+
 KARIDNS_TOOL_FN void kc_db_memory(const server_config_t *cfg, const kc_msum_t *ms, int *total_err, int *total_warn, int *bad) {
     const database_config_t *db = &cfg->database;
     ma_in_t in;
@@ -1931,6 +1968,7 @@ KARIDNS_TOOL_FN void kc_db_memory(const server_config_t *cfg, const kc_msum_t *m
     char t[900];
     ma_text_estimate(t, sizeof(t), &e);
     dns_diag(DIAG_INFO, DC_DB_MEMORY_ESTIMATE, NULL, 0, "%s\n", t);
+    kc_db_zfs_memory(db, &e);
     if (ma_text_advice(t, sizeof(t), &e) == 0) return;
     if (e.level == MA_LEVEL_ERROR) {
         dns_diag(DIAG_ERROR, DC_DB_MEMORY_LIMIT_TINY, NULL, 0, "%s\n", t);

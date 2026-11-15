@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -1137,11 +1138,23 @@ static void test_superblock_damage(void) {
 typedef struct { uint8_t exists, known; uint16_t flags; uint64_t ver; } mz_t;
 typedef struct { mz_t z[KNZ]; bool cursor_valid; uint64_t cursor; } model_t;
 
-enum { OP_PUT, OP_DEL, OP_KNOWN, OP_FLAGS, OP_CURSOR, OP_CKPT, OP_NONE };
+enum { OP_PUT, OP_DEL, OP_KNOWN, OP_FLAGS, OP_CURSOR, OP_CKPT, OP_NONE, OP_COMPACT, OP_SCRUB };
+static int g_kill_mode;                  /* 1: the cleaner, the nx pass and the scrub are operations of the loop too (they change no zone) */
 static int op_kind(uint64_t K, uint32_t *i) {
   uint64_t r = mix64(K * 0x9e3779b97f4a7c15ull + 12345);
   *i = (uint32_t)((r >> 16) % KNZ);
   uint32_t p = (uint32_t)(r % 100);
+  if (g_kill_mode == 1) {
+    if (p < 40) return OP_PUT;
+    if (p < 52) return OP_DEL;
+    if (p < 58) return OP_KNOWN;
+    if (p < 64) return OP_FLAGS;
+    if (p < 67) return OP_CURSOR;
+    if (p < 69) return OP_CKPT;
+    if (p < 95) return OP_COMPACT;
+    if (p < 98) return OP_SCRUB;
+    return OP_NONE;
+  }
   if (p < 58) return OP_PUT;
   if (p < 72) return OP_DEL;
   if (p < 82) return OP_KNOWN;
@@ -1179,6 +1192,8 @@ static int store_do_op(store_t *s, uint64_t K) {
   }
   case OP_CURSOR: return store_set_cursor(s, 3, K, &K, 8);
   case OP_CKPT: return store_checkpoint(s);
+  case OP_COMPACT: return store_compact(s, (uint64_t)(32u + (K & 7) * 16) << 10, (K & 1) != 0, NULL);
+  case OP_SCRUB: return store_scrub_run(s, NULL);
   default: return 0;
   }
 }
@@ -1274,6 +1289,8 @@ static void child_main(const char *path, shm_t *shm, uint64_t K0, uint64_t count
   o.sync_policy = STORE_SYNC_BATCH;
   o.sync_interval_ms = 5;
   o.checkpoint_interval_ms = 20;
+  o.scrub_interval_s = UINT32_MAX;
+  if (g_kill_mode == 1) { o.compact_rate = UINT64_MAX; o.nx_reclaim_min = 256; }
   store_test_crash_countdown = countdown;
   store_t *s = NULL;
   if (store_open(fd, &o, &s) != 0) _exit(11);
@@ -1289,8 +1306,9 @@ static void child_main(const char *path, shm_t *shm, uint64_t K0, uint64_t count
   _exit(0);                                                              /* leaves the store unclean, like a crash */
 }
 
-static void test_kill_loop(int iters) {
-  printf("[kill -9 loop: %d iterations]\n", iters);
+static void test_kill_loop(int iters, int mode) {
+  g_kill_mode = mode;
+  printf("[kill -9 loop%s: %d iterations]\n", mode == 1 ? " with the cleaner, the nx pass and the scrub" : "", iters);
   tdir_t d;
   tdir_new(&d, "kill");
   shm_t *shm = mmap(NULL, sizeof(*shm), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
@@ -1298,7 +1316,8 @@ static void test_kill_loop(int iters) {
   if (shm == MAP_FAILED) { tdir_free(&d); return; }
   model_t *model = calloc(1, sizeof(*model)), *tmp = calloc(1, sizeof(*tmp));
   uint64_t K0 = 0, boot = 42, rng = 20261114;
-  int fresh = 0, crashed = 0, countdown_hits = 0, tampered = 0, older = 0, torn = 0, exact = 0, replayed_total = 0, lost_ops = 0;
+  int fresh = 0, crashed = 0, countdown_hits = 0, tampered = 0, older = 0, torn = 0, exact = 0, replayed_total = 0, lost_ops = 0, with_free = 0;
+  uint32_t max_segs = 0;
   for (int it = 0; it < iters; it++) {
     if (it % 25 == 0) {
       /* a new store: the first iterations grow the index through several generations */
@@ -1307,6 +1326,8 @@ static void test_kill_loop(int iters) {
       store_opts_t o;
       small_opts(&o);
       o.boot_id = boot;
+      o.scrub_interval_s = UINT32_MAX;
+      if (mode == 1) o.seg_size = 64u << 10;                           /* (the cleaner needs segments that are not the open one: the segment size is that of the store's creation) */
       store_t *s = NULL;
       if (store_open(d.fd, &o, &s) != 0) { CHECK(0); break; }
       store_view_add(s, "v0");
@@ -1360,6 +1381,7 @@ static void test_kill_loop(int iters) {
     o.create = false;
     o.boot_id = boot;
     o.seg_size = 256u << 10;
+    o.scrub_interval_s = UINT32_MAX;
     store_t *s = NULL;
     int r = store_open(d.fd, &o, &s);
     if (r != 0) { printf("  iteration %d: open failed %d\n", it, r); CHECK(0); break; }
@@ -1367,6 +1389,8 @@ static void test_kill_loop(int iters) {
     store_stats(s, &st);
     if (st.recovery.used_older_super) older++;
     if (st.recovery.journal_torn) torn++;
+    if (st.seg_free_numbers) with_free++;                              /* (segments were cleaned and removed before this open) */
+    if (st.seg_count > max_segs) max_segs = st.seg_count;
     replayed_total += (int)st.recovery.records_replayed;
     store_check_report_t rep;
     int cr = store_check(s, &rep);
@@ -1411,22 +1435,24 @@ static void test_kill_loop(int iters) {
     CHECK_EQ(store_close(s), 0);
   }
   printf("  %d stores, %d children killed (%d at a crash point), %d journal tails cut (rebuild path), %d older-superblock opens, %d torn tails,\n"
-         "  %d replayed records in total, %d exact-end matches, %d begun-but-lost operations\n",
-         fresh, crashed, countdown_hits, tampered, older, torn, replayed_total, exact, lost_ops);
+         "  %d replayed records in total, %d exact-end matches, %d begun-but-lost operations; %d opens found removed segments (%u segment numbers at the most)\n",
+         fresh, crashed, countdown_hits, tampered, older, torn, replayed_total, exact, lost_ops, with_free, max_segs);
   free(model);
   free(tmp);
   munmap(shm, sizeof(*shm));
   tdir_free(&d);
+  g_kill_mode = 0;
 }
 
 /* disk full: RLIMIT_FSIZE makes appends and journal writes fail with EFBIG */
 static void test_disk_full(void) {
-  printf("[disk full (RLIMIT_FSIZE)]\n");
+  printf("[disk full (RLIMIT_FSIZE), writes refused]\n");
   tdir_t d;
   tdir_new(&d, "full");
   store_opts_t o;
   small_opts(&o);
   o.create = true;
+  o.no_degrade = true;
   CHECK_EQ(1, 1);
   {
     store_t *s = NULL;
@@ -2197,6 +2223,1334 @@ static void test_review_fixes(void) {
   tdir_free(&d);
 }
 
+/* ================================================================================================================== */
+/* 0.7 WP9 (S6): the cleaner, disk full, the scrub, nx, the open                                                        */
+/* ================================================================================================================== */
+
+/* the log lines of the store, kept */
+typedef struct { int level; char msg[512]; } logline_t;
+static logline_t g_logs[256];
+static int g_nlogs;
+static pthread_mutex_t g_log_mu = PTHREAD_MUTEX_INITIALIZER;
+static void log_cb(void *ctx, int level, const char *msg) {
+  (void)ctx;
+  pthread_mutex_lock(&g_log_mu);
+  if (g_nlogs < 256) { g_logs[g_nlogs].level = level; snprintf(g_logs[g_nlogs].msg, sizeof(g_logs[g_nlogs].msg), "%s", msg); g_nlogs++; }
+  pthread_mutex_unlock(&g_log_mu);
+}
+static int log_count(int level, const char *needle) {
+  int n = 0;
+  pthread_mutex_lock(&g_log_mu);
+  for (int i = 0; i < g_nlogs; i++) if ((level < 0 || g_logs[i].level == level) && strstr(g_logs[i].msg, needle)) n++;
+  pthread_mutex_unlock(&g_log_mu);
+  return n;
+}
+static void log_clear(void) {
+  pthread_mutex_lock(&g_log_mu);
+  g_nlogs = 0;
+  pthread_mutex_unlock(&g_log_mu);
+}
+
+static int count_files(const tdir_t *d, const char *prefix) {
+  int n = 0;
+  DIR *dp = opendir(d->path);
+  if (!dp) return -1;
+  struct dirent *de;
+  while ((de = readdir(dp)) != NULL) if (strncmp(de->d_name, prefix, strlen(prefix)) == 0) n++;
+  closedir(dp);
+  return n;
+}
+static bool file_exists(const tdir_t *d, const char *name) {
+  char p[700];
+  struct stat st;
+  fpath(d, name, p, sizeof(p));
+  return stat(p, &st) == 0;
+}
+/* what the directory occupies on disk (blocks), the base of the "disk" the space tests make up */
+static const char *g_fake_dir;
+static int64_t g_fake_cap;
+static int64_t dir_usage(const char *path) {
+  int64_t used = 0;
+  DIR *dp = opendir(path);
+  if (!dp) return 0;
+  struct dirent *de;
+  while ((de = readdir(dp)) != NULL) {
+    if (de->d_name[0] == '.') continue;
+    char p[1100];
+    struct stat st;
+    snprintf(p, sizeof(p), "%s/%s", path, de->d_name);
+    if (stat(p, &st) == 0 && S_ISREG(st.st_mode)) used += (int64_t)st.st_blocks * 512;
+  }
+  closedir(dp);
+  return used;
+}
+static int64_t fake_fs_free(void) {
+  int64_t f = g_fake_cap - dir_usage(g_fake_dir);
+  return f < 0 ? 0 : f;
+}
+
+static void cmp_zone_fields(const store_zone_t *a, const store_zone_t *b, const char *what) {
+  bool ok = a->zid == b->zid && a->state == b->state && a->klen == b->klen && a->view == b->view && a->flags == b->flags && a->source == b->source && a->img_len == b->img_len &&
+            a->serial == b->serial && a->settings == b->settings && a->source_id == b->source_id && a->stamp_gen == b->stamp_gen && a->stamp_time == b->stamp_time &&
+            memcmp(a->digest, b->digest, STORE_DIGEST_LEN) == 0 && strcmp(a->name, b->name) == 0;
+  if (!ok) printf("  zone %s: fields differ (%s)\n", a->name, what);
+  CHECK(ok);
+}
+
+/* a store with `n` zones, most of them replaced a few times and some deleted: the early segments are mostly dead.  ver[i] = the version a zone has now (0 = deleted). */
+static void fill_dead(store_t *s, uint32_t n, uint64_t *ver) {
+  for (uint32_t i = 0; i < n; i++) { CHECK_EQ(put_i(s, 0, i, 1, NULL), 0); ver[i] = 1; }
+  for (uint32_t i = 0; i < n; i++) if (i % 3 != 0) { CHECK_EQ(put_i(s, 0, i, 2, NULL), 0); ver[i] = 2; }
+  for (uint32_t i = 0; i < n; i++) if (i % 5 != 0) { CHECK_EQ(put_i(s, 0, i, 3, NULL), 0); ver[i] = 3; }
+  for (uint32_t i = 0; i < n; i++) {
+    if (i % 11 == 0) { char nm[160]; name_of(i, nm, sizeof(nm)); CHECK_EQ(store_delete_name(s, 0, nm, strlen(nm)), 0); ver[i] = 0; }
+  }
+}
+
+typedef struct { store_zone_t z; uint8_t *img; size_t len; } snap_t;
+static snap_t *snapshot_zones(store_t *s, uint32_t n, const uint64_t *ver) {
+  snap_t *sn = calloc(n, sizeof(*sn));
+  for (uint32_t i = 0; i < n; i++) {
+    if (!ver[i]) continue;
+    store_read_lock();
+    uint32_t z = find_i(s, 0, i);
+    store_img_t im;
+    if (z != STORE_NONE && store_zone_get(s, z, &sn[i].z) == 0 && sn[i].z.state == STORE_STATE_STORED && store_image_read(s, z, &im) == 0) {
+      sn[i].img = malloc(im.len);
+      memcpy(sn[i].img, im.data, im.len);
+      sn[i].len = im.len;
+      store_img_release(s, &im);
+    } else CHECK(0);
+    store_read_unlock();
+  }
+  return sn;
+}
+/* every zone as it was: same zone id, same fields (not the place), same image bytes */
+static void verify_snapshot(store_t *s, uint32_t n, const uint64_t *ver, const snap_t *sn, const char *what) {
+  for (uint32_t i = 0; i < n; i++) {
+    store_read_lock();
+    uint32_t z = find_i(s, 0, i);
+    if (!ver[i]) { CHECK_EQ(z, STORE_NONE); store_read_unlock(); continue; }
+    store_zone_t zi;
+    store_img_t im;
+    CHECK(z == sn[i].z.zid);
+    if (z != STORE_NONE && store_zone_get(s, z, &zi) == 0) {
+      store_zone_t a = zi, b = sn[i].z;
+      a.loc = b.loc = 0;
+      cmp_zone_fields(&a, &b, what);
+      if (store_image_read(s, z, &im) == 0) {
+        CHECK(im.len == sn[i].len && memcmp(im.data, sn[i].img, im.len) == 0);
+        store_img_release(s, &im);
+      } else { printf("  zone %u: no image (%s)\n", i, what); CHECK(0); }
+    } else { printf("  zone %u missing (%s)\n", i, what); CHECK(0); }
+    store_read_unlock();
+  }
+}
+static void free_snapshot(snap_t *sn, uint32_t n) {
+  for (uint32_t i = 0; i < n; i++) free(sn[i].img);
+  free(sn);
+}
+
+static void test_compact(int mode) {
+  printf("[cleaner: %s mode]\n", mode == STORE_MODE_MAP ? "MAP" : "COPY");
+  tdir_t d;
+  tdir_new(&d, "compact");
+  store_opts_t o;
+  small_opts(&o);
+  o.mode = mode;
+  o.seg_size = 64u << 10;
+  o.compact_rate = UINT64_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  o.log = log_cb;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  enum { N = 500 };
+  uint64_t ver[N];
+  memset(ver, 0, sizeof(ver));
+  fill_dead(s, N, ver);
+  CHECK_EQ(store_commit(s), 0);
+  store_stats_t st0, st1, st2;
+  store_stats(s, &st0);
+  int files0 = count_files(&d, "seg.");
+  uint64_t dead0 = st0.seg_used_bytes - st0.seg_live_bytes;
+  CHECK(st0.compact_candidates >= 3);
+  CHECK(st0.compact_dead_bytes > st0.seg_used_bytes / 2);
+  snap_t *sn = snapshot_zones(s, N, ver);
+  store_compact_report_t rep, tot;
+  memset(&tot, 0, sizeof(tot));
+  for (int k = 0; k < 40; k++) {
+    CHECK_EQ(store_compact(s, 0, true, &rep), 0);
+    tot.moved_records += rep.moved_records;
+    tot.moved_bytes += rep.moved_bytes;
+    tot.segs_freed += rep.segs_freed;
+    tot.bad_records += rep.bad_records;
+    if (!rep.moved_records && !rep.segs_freed) break;
+  }
+  store_stats(s, &st1);
+  int files1 = count_files(&d, "seg.");
+  printf("  %" PRIu64 " records (%" PRIu64 " bytes) moved, %u segments freed: %d -> %d segment files, dead %" PRIu64 " -> %" PRIu64 " of %" PRIu64 " -> %" PRIu64 " bytes\n", tot.moved_records,
+         tot.moved_bytes, tot.segs_freed, files0, files1, dead0, st1.seg_used_bytes - st1.seg_live_bytes, st0.seg_used_bytes, st1.seg_used_bytes);
+  CHECK(tot.moved_records > 0);
+  CHECK(tot.segs_freed >= 2);
+  CHECK_EQ(tot.bad_records, 0);
+  CHECK(files1 < files0);
+  CHECK(st1.seg_used_bytes < st0.seg_used_bytes);
+  CHECK((st1.seg_used_bytes - st1.seg_live_bytes) * 100 / st1.seg_used_bytes < dead0 * 100 / st0.seg_used_bytes);
+  CHECK_EQ(st1.seg_live_bytes, st0.seg_live_bytes);                         /* what was live is live: moved, not changed */
+  CHECK_EQ(st1.zones_stored, st0.zones_stored);
+  CHECK(st1.compact_segs_freed == tot.segs_freed && st1.compact_moved_records == tot.moved_records);
+  CHECK_EQ(st1.seg_draining, 0);
+  CHECK(st1.seg_free_numbers >= 1);
+  verify_snapshot(s, N, ver, sn, "after the cleaner");
+  check_consistent(s, "after the cleaner");
+  /* the freed segment numbers are used again: new zones do not raise the number of segments */
+  for (uint32_t i = N; i < N + 150; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  store_stats(s, &st2);
+  CHECK(st2.seg_count <= st1.seg_count);
+  check_consistent(s, "numbers reused");
+  CHECK_EQ(store_close(s), 0);
+  /* a clean reopen, then a reopen of a store that was not closed */
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    verify_snapshot(s, N, ver, sn, "after a reopen");
+    check_consistent(s, "reopen");
+    store_stats(s, &st2);
+    CHECK(!st2.recovery.rebuilt);
+    CHECK_EQ(store_close(s), 0);
+  }
+  free_snapshot(sn, N);
+  tdir_free(&d);
+}
+
+/* an image that an attached zone holds (MAP mode) pins its segment: the segment is not cleaned, not removed; one that is pinned after the cleaner has emptied it is not removed either */
+static store_t *g_pin_store;
+static store_img_t g_pin_img;
+static uint32_t g_pin_seg, g_pin_zone;
+static bool g_pin_taken;
+static void pin_hook(store_t *s, uint32_t victim) {
+  if (g_pin_taken) return;
+  uint32_t cur = 0;
+  store_zone_t zi;
+  int r;
+  store_read_lock();
+  while ((r = store_iter(s, &cur, &zi)) != 0) {
+    if (r < 0 || zi.state != STORE_STATE_STORED || (uint32_t)(zi.loc >> 36) != victim) continue;
+    if (store_image_read(s, zi.zid, &g_pin_img) == 0) { g_pin_taken = true; g_pin_seg = victim; g_pin_zone = zi.zid; break; }
+  }
+  store_read_unlock();
+}
+static void test_compact_pinned(void) {
+  printf("[cleaner: a segment that an attached image points into (MAP)]\n");
+  tdir_t d;
+  tdir_new(&d, "pin");
+  store_opts_t o;
+  small_opts(&o);
+  o.mode = STORE_MODE_MAP;
+  o.seg_size = 64u << 10;
+  o.compact_rate = UINT64_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  enum { N = 400 };
+  uint64_t ver[N];
+  memset(ver, 0, sizeof(ver));
+  fill_dead(s, N, ver);
+  CHECK_EQ(store_commit(s), 0);
+  snap_t *sn = snapshot_zones(s, N, ver);
+  /* 1. zone 15 is held: it is never replaced (15 % 3 == 0 and % 5 == 0), so its record lies in the first segment, which is almost all dead.  That segment is not cleaned while it is held. */
+  uint32_t z15 = find_i(s, 0, 15);
+  store_zone_t zi;
+  CHECK_EQ(store_zone_get(s, z15, &zi), 0);
+  uint32_t seg15 = (uint32_t)(zi.loc >> 36);
+  store_read_lock();
+  store_img_t held;
+  CHECK_EQ(store_image_read(s, z15, &held), 0);
+  store_read_unlock();
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK(st.seg_pinned >= 1);
+  CHECK(st.compact_candidates >= 2);
+  char nm[32];
+  snprintf(nm, sizeof(nm), "seg.%u", seg15);
+  for (int k = 0; k < 10; k++) CHECK_EQ(store_compact(s, 0, true, NULL), 0);
+  CHECK(file_exists(&d, nm));
+  CHECK_EQ(store_zone_get(s, z15, &zi), 0);
+  CHECK_EQ((uint32_t)(zi.loc >> 36), seg15);                              /* not moved: its segment is pinned */
+  CHECK(held.len == sn[15].len && memcmp(held.data, sn[15].img, held.len) == 0);
+  verify_snapshot(s, N, ver, sn, "while a segment is pinned");
+  check_consistent(s, "pinned");
+  store_stats(s, &st);
+  uint64_t freed_pinned = st.compact_segs_freed;
+  store_img_release(s, &held);
+  for (int k = 0; k < 10; k++) CHECK_EQ(store_compact(s, 0, true, NULL), 0);
+  store_stats(s, &st);
+  CHECK(st.compact_segs_freed > freed_pinned);
+  CHECK_EQ(store_zone_get(s, z15, &zi), 0);
+  CHECK((uint32_t)(zi.loc >> 36) != seg15);                               /* cleaned and removed once it was let go */
+  verify_snapshot(s, N, ver, sn, "after the pin ended");
+  /* 2. the image is taken while the cleaner works on the segment: the segment is empty afterwards, and stays until the image is released */
+  for (uint32_t i = 0; i < N; i++) if (ver[i]) { CHECK_EQ(put_i(s, 0, i, 9, NULL), 0); ver[i] = 9; }       /* (everything is dead again: the next segments are mostly dead) */
+  for (uint32_t i = 0; i < N; i++) if (ver[i] && i % 4 != 0) { CHECK_EQ(put_i(s, 0, i, 10, NULL), 0); ver[i] = 10; }
+  free_snapshot(sn, N);
+  sn = snapshot_zones(s, N, ver);
+  g_pin_taken = false;
+  g_pin_store = s;
+  store_test_cleaner_step = pin_hook;
+  store_stats(s, &st);
+  uint64_t freed0 = st.compact_segs_freed;
+  CHECK_EQ(store_compact(s, 0, true, NULL), 0);
+  store_test_cleaner_step = NULL;
+  CHECK(g_pin_taken);
+  if (g_pin_taken) {
+    char pn[32];
+    snprintf(pn, sizeof(pn), "seg.%u", g_pin_seg);
+    store_stats(s, &st);
+    CHECK(st.compact_moved_records > 0);
+    for (int k = 0; k < 5; k++) CHECK_EQ(store_compact(s, 0, true, NULL), 0);
+    CHECK(file_exists(&d, pn));                                          /* emptied, and still there: the image is held */
+    store_stats(s, &st);
+    CHECK(st.seg_draining >= 1);
+    CHECK(st.seg_pinned >= 1);
+    CHECK(st.compact_pinned_skips >= 1);
+    uint64_t freed_before_release = st.compact_segs_freed;
+    uint32_t zz = g_pin_zone;
+    const uint8_t *before = g_pin_img.data;
+    CHECK(((uintptr_t)before % STORE_IMAGE_ALIGN) == 0);
+    store_zone_t cz;
+    CHECK_EQ(store_zone_get(s, zz, &cz), 0);
+    CHECK((uint32_t)(cz.loc >> 36) != g_pin_seg);                         /* the zone itself is at another place now */
+    uint64_t v = 0;
+    CHECK(img_ok(g_pin_img.data, g_pin_img.len, (uint32_t)(((const uint32_t *)g_pin_img.data)[0]), &v));     /* the held bytes are intact */
+    store_img_release(s, &g_pin_img);
+    for (int k = 0; k < 5; k++) CHECK_EQ(store_compact(s, 0, true, NULL), 0);
+    store_stats(s, &st);
+    CHECK(st.compact_segs_freed > freed_before_release);
+    CHECK(st.compact_segs_freed > freed0);
+    CHECK_EQ(st.seg_draining, 0);
+  }
+  verify_snapshot(s, N, ver, sn, "after the pinned segment was removed");
+  check_consistent(s, "pinned 2");
+  free_snapshot(sn, N);
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
+/* a store whose zones are all replaced again and again has one big open segment that is almost all dead: it is closed and cleaned (a segment of 8 MiB, 200 zones, 150 rounds) */
+static void test_compact_open_segment(void) {
+  printf("[cleaner: the open segment is the dead one]\n");
+  tdir_t d;
+  tdir_new(&d, "copen");
+  store_opts_t o;
+  small_opts(&o);
+  o.seg_size = 8u << 20;
+  o.compact_rate = UINT64_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  for (int round = 1; round <= 60; round++)
+    for (uint32_t i = 0; i < 200; i++) CHECK_EQ(put_i(s, 0, i, (uint64_t)round, NULL), 0);
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK(st.seg_count == 2 || st.seg_count == 1);
+  uint64_t used0 = st.seg_used_bytes;
+  CHECK(st.seg_used_bytes > 4u << 20);
+  for (int k = 0; k < 4; k++) CHECK_EQ(store_compact(s, 0, true, NULL), 0);
+  store_stats(s, &st);
+  printf("  segments used %" PRIu64 " -> %" PRIu64 " bytes, live %" PRIu64 ", freed %" PRIu64 "\n", used0, st.seg_used_bytes, st.seg_live_bytes, st.compact_segs_freed);
+  CHECK(st.seg_used_bytes < used0 / 4);
+  CHECK(st.compact_segs_freed >= 1);
+  for (uint32_t i = 0; i < 200; i++) CHECK(verify_i(s, 0, i, 60));
+  check_consistent(s, "open segment cleaned");
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
+/* the tick does it by itself, at a rate */
+static void test_compact_tick(void) {
+  printf("[cleaner: by itself from the tick]\n");
+  tdir_t d;
+  tdir_new(&d, "ctick");
+  store_opts_t o;
+  small_opts(&o);
+  o.seg_size = 64u << 10;
+  o.scrub_interval_s = UINT32_MAX;
+  o.checkpoint_interval_ms = 10;
+  o.compact_rate = 256u << 10;                                          /* 256 KiB a second */
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  enum { N = 400 };
+  uint64_t ver[N];
+  memset(ver, 0, sizeof(ver));
+  fill_dead(s, N, ver);
+  store_stats_t st;
+  store_stats(s, &st);
+  uint64_t freed0 = st.compact_segs_freed, used0 = st.seg_used_bytes;
+  uint64_t t0 = now_ms();
+  while (now_ms() - t0 < 15000) {
+    CHECK_EQ(store_tick(s), 0);
+    store_stats(s, &st);
+    if (st.compact_segs_freed >= freed0 + 3 && st.seg_draining == 0 && st.compact_candidates == 0) break;
+    usleep(20000);
+  }
+  store_stats(s, &st);
+  printf("  %" PRIu64 " segments freed in %" PRIu64 " ms by the tick, %" PRIu64 " bytes moved, used %" PRIu64 " -> %" PRIu64 "\n", st.compact_segs_freed - freed0, now_ms() - t0, st.compact_moved_bytes,
+         used0, st.seg_used_bytes);
+  CHECK(st.compact_segs_freed >= freed0 + 3);
+  CHECK(st.seg_used_bytes < used0);
+  for (uint32_t i = 0; i < N; i++) if (ver[i]) CHECK(verify_i(s, 0, i, ver[i]));
+  check_consistent(s, "tick");
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
+/* long names: the space of deleted zones comes back */
+static void test_nx_reclaim(void) {
+  printf("[nx: the names of deleted zones are given back]\n");
+  tdir_t d;
+  tdir_new(&d, "nx");
+  store_opts_t o;
+  small_opts(&o);
+  o.nx_reclaim_min = 4096;
+  o.scrub_interval_s = UINT32_MAX;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  enum { N = 600 };
+  uint32_t idx[N];
+  for (uint32_t k = 0; k < N; k++) { idx[k] = 3 + 7 * k; CHECK_EQ(put_i(s, 0, idx[k], 1, NULL), 0); }       /* (every i % 7 == 3 has a name of 68 octets) */
+  store_stats_t st0, st1;
+  store_stats(s, &st0);
+  CHECK_EQ(st0.nx_dead, 0);
+  CHECK(st0.nx_used >= N * 60);
+  for (uint32_t k = 0; k < N; k++) {
+    if (k % 4 == 0) continue;
+    char nm[160];
+    name_of(idx[k], nm, sizeof(nm));
+    CHECK_EQ(store_delete_name(s, 0, nm, strlen(nm)), 0);
+  }
+  store_stats(s, &st0);
+  CHECK(st0.nx_dead * 2 > st0.nx_used);
+  store_compact_report_t rep;
+  CHECK_EQ(store_compact(s, 0, false, &rep), 0);
+  store_stats(s, &st1);
+  printf("  nx %" PRIu64 " used / %" PRIu64 " dead -> %" PRIu64 " / %" PRIu64 " (%" PRIu64 " bytes given back)\n", st0.nx_used, st0.nx_dead, st1.nx_used, st1.nx_dead, rep.nx_reclaimed);
+  CHECK_EQ(st1.nx_dead, 0);
+  CHECK_EQ(rep.nx_reclaimed, st0.nx_dead);
+  CHECK_EQ(st1.nx_used, st0.nx_used - st0.nx_dead);
+  CHECK_EQ(st1.nx_reclaims, 1);
+  store_read_lock();
+  for (uint32_t k = 0; k < N; k++) {
+    if (k % 4 != 0) { CHECK_EQ(find_i(s, 0, idx[k]), STORE_NONE); continue; }
+    uint32_t z = find_i(s, 0, idx[k]);
+    store_zone_t zi;
+    char nm[160];
+    name_of(idx[k], nm, sizeof(nm));
+    CHECK(z != STORE_NONE && store_zone_get(s, z, &zi) == 0 && strcmp(zi.name, nm) == 0);
+  }
+  store_read_unlock();
+  for (uint32_t k = 0; k < N; k += 4) CHECK(verify_i(s, 0, idx[k], 1));
+  check_consistent(s, "nx reclaimed");
+  /* new long names go after the live ones; a reopen and a rebuild see the same */
+  for (uint32_t k = 0; k < 50; k++) CHECK_EQ(put_i(s, 0, 3 + 7 * (N + k), 1, NULL), 0);
+  check_consistent(s, "nx after new names");
+  CHECK_EQ(store_close(s), 0);
+  o.create = false;
+  o.force_rebuild = true;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    for (uint32_t k = 0; k < N; k += 4) CHECK(verify_i(s, 0, idx[k], 1));
+    check_consistent(s, "nx rebuilt");
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
+/* ---- the cleaner and eight readers, writers, attach / detach cycles (the TSan case) ---- */
+
+typedef struct {
+  store_t *s;
+  _Atomic int stop;
+  _Atomic long lookups, held, errors;
+  _Atomic long errk[8];
+  uint32_t n;
+  int mode;
+} cc_t;
+static void *cc_reader(void *arg) {
+  cc_t *c = arg;
+  uint64_t rng = 0x1234567ull + (uint64_t)(uintptr_t)&rng;
+  store_img_t held[4];
+  uint32_t held_i[4];
+  int nheld = 0;
+  while (!atomic_load(&c->stop)) {
+    rng = mix64(rng);
+    uint32_t i = (uint32_t)(rng % c->n);
+    store_read_lock();
+    char nm[160];
+    name_of(i, nm, sizeof(nm));
+    uint32_t z = store_find(c->s, 0, nm, strlen(nm));
+    if (z != STORE_NONE) {
+      store_zone_t zi;
+      int r = store_zone_get(c->s, z, &zi);
+      if (r == 0) {
+        if (strcmp(zi.name, nm) != 0 && zi.zid == z) { atomic_fetch_add(&c->errors, 1); atomic_fetch_add(&c->errk[0], 1); }      /* (the zone id may have been reused for another zone: then find() would not have found it) */
+        if (zi.state == STORE_STATE_STORED) {
+          store_img_t im;
+          r = store_image_read(c->s, z, &im);
+          if (r == 0) {
+            uint64_t v;
+            if (!img_ok(im.data, im.len, i, &v)) { atomic_fetch_add(&c->errors, 1); atomic_fetch_add(&c->errk[1], 1); }
+            if (c->mode == STORE_MODE_MAP && (rng >> 40) % 8 == 0 && nheld < 4) { held[nheld] = im; held_i[nheld++] = i; atomic_fetch_add(&c->held, 1); }
+            else store_img_release(c->s, &im);
+          } else if (r == -EBADMSG) { atomic_fetch_add(&c->errors, 1); atomic_fetch_add(&c->errk[2], 1); }
+        }
+      } else if (r == -EBADMSG) { atomic_fetch_add(&c->errors, 1); atomic_fetch_add(&c->errk[3], 1); }
+    }
+    atomic_fetch_add(&c->lookups, 1);
+    store_read_unlock();
+    if ((rng >> 33) % 8 == 0) sched_yield();
+    if (nheld && (rng >> 20) % 4 == 0) {              /* detach: the held image is still what it was, and is let go */
+      nheld--;
+      uint64_t v;
+      if (!img_ok(held[nheld].data, held[nheld].len, held_i[nheld], &v)) { atomic_fetch_add(&c->errors, 1); atomic_fetch_add(&c->errk[4], 1); }
+      store_img_release(c->s, &held[nheld]);
+    }
+  }
+  while (nheld--) store_img_release(c->s, &held[nheld]);
+  return NULL;
+}
+static void *cc_cleaner(void *arg) {
+  cc_t *c = arg;
+  while (!atomic_load(&c->stop)) {
+    if (store_compact(c->s, 64u << 10, true, NULL) != 0) { atomic_fetch_add(&c->errors, 1); atomic_fetch_add(&c->errk[5], 1); }
+    (void)store_tick(c->s);
+    usleep(2000);
+  }
+  return NULL;
+}
+static void test_compact_conc(int mode) {
+  printf("[cleaner + readers + a writer + attach / detach, %s]\n", mode == STORE_MODE_MAP ? "MAP" : "COPY");
+  tdir_t d;
+  tdir_new(&d, "cconc");
+  store_opts_t o;
+  small_opts(&o);
+  o.mode = mode;
+  o.seg_size = 64u << 10;
+  o.compact_rate = UINT64_MAX;
+  o.nx_reclaim_min = 2048;
+  o.scrub_interval_s = UINT32_MAX;
+  o.sync_policy = STORE_SYNC_NONE;
+  o.checkpoint_interval_ms = 50;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  enum { N = 400 };
+  static uint64_t ver[N];
+  memset(ver, 0, sizeof(ver));
+  for (uint32_t i = 0; i < N; i++) { CHECK_EQ(put_i(s, 0, i, 1, NULL), 0); ver[i] = 1; }
+  cc_t c;
+  memset(&c, 0, sizeof(c));
+  c.s = s;
+  c.n = N;
+  c.mode = mode;
+  pthread_t rt[4], ct;
+  for (int t = 0; t < 4; t++) pthread_create(&rt[t], NULL, cc_reader, &c);
+  pthread_create(&ct, NULL, cc_cleaner, &c);
+  uint64_t t0 = now_ms(), rng = 77, k = 0, wops = UNDER_TSAN ? 4000 : 8000;
+  while ((k < wops || now_ms() - t0 < 1500) && now_ms() - t0 < 90000) {          /* (a number of writes, not a time: on a loaded host the readers would starve the writer) */
+    rng = mix64(rng);
+    uint32_t i = (uint32_t)((rng >> 8) % N);
+    uint32_t sel = (uint32_t)(rng % 100);
+    k++;
+    if (sel < 70) { CHECK_EQ(put_i(s, 0, i, k + 1, NULL), 0); ver[i] = k + 1; }
+    else if (sel < 85) {
+      char nm[160];
+      name_of(i, nm, sizeof(nm));
+      CHECK_EQ(store_delete_name(s, 0, nm, strlen(nm)), ver[i] ? 0 : -ENOENT);
+      ver[i] = 0;
+    } else if (sel < 92) {
+      char nm[160];
+      name_of(i, nm, sizeof(nm));
+      store_meta_t m = meta_of(i, k + 1);
+      CHECK_EQ(store_set_known(s, 0, nm, strlen(nm), &m, NULL), 0);
+      ver[i] = k + 1;                                                       /* (known: no image) */
+    } else {
+      (void)store_commit(s);
+    }
+  }
+  atomic_store(&c.stop, 1);
+  for (int t = 0; t < 4; t++) pthread_join(rt[t], NULL);
+  pthread_join(ct, NULL);
+  store_stats_t st;
+  store_stats(s, &st);
+  printf("  %ld lookups, %ld images held, %" PRIu64 " writes, cleaner: %" PRIu64 " records moved, %" PRIu64 " segments freed, nx %" PRIu64 " reclaims; errors %ld\n", atomic_load(&c.lookups),
+         atomic_load(&c.held), k, st.compact_moved_records, st.compact_segs_freed, st.nx_reclaims, atomic_load(&c.errors));
+  for (int e = 0; e < 8; e++) if (atomic_load(&c.errk[e])) printf("    error kind %d: %ld\n", e, atomic_load(&c.errk[e]));
+  CHECK_EQ(atomic_load(&c.errors), 0);
+  CHECK(st.compact_moved_records > 0);
+  CHECK(st.compact_segs_freed > 0);
+  CHECK(atomic_load(&c.lookups) > 1000);
+  for (int e = 0; e < 5; e++) CHECK_EQ(store_compact(s, 0, true, NULL), 0);
+  check_consistent(s, "cleaner under load");
+  /* the writer's model is the truth (versions as written; a KNOWN zone was last written by set_known) */
+  for (uint32_t i = 0; i < N; i++) {
+    uint32_t z = find_i(s, 0, i);
+    if (!ver[i]) { CHECK_EQ(z, STORE_NONE); continue; }
+    store_zone_t zi;
+    store_read_lock();
+    CHECK(z != STORE_NONE && store_zone_get(s, z, &zi) == 0 && zi.stamp_gen == ver[i]);
+    if (z != STORE_NONE && zi.state == STORE_STATE_STORED) CHECK(verify_i(s, 0, i, ver[i]));
+    store_read_unlock();
+  }
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
+/* ---- free space: the cleaner makes room, then the KNOWN fallback ---- */
+
+static void test_space(int mode) {
+  printf("[space: the reserve, the cleaner in a hurry, the fallback without an image, the way back (%s)]\n", mode == STORE_MODE_MAP ? "MAP" : "COPY");
+  tdir_t d;
+  tdir_new(&d, "space");
+  store_opts_t o;
+  small_opts(&o);
+  o.mode = mode;
+  o.seg_size = 64u << 10;
+  o.compact_rate = UINT64_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  o.log = log_cb;
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.journal_max_bytes = 64u << 10;                                      /* (the journal is part of what the disk holds: it is cut often) */
+  log_clear();
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  store_checkpoint(s);
+  int64_t base = dir_usage(d.path);
+  g_fake_dir = d.path;
+  g_fake_cap = base + (1800u << 10);
+  store_test_fs_free = fake_fs_free;
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK_EQ(st.reserve_bytes, 256u << 10);
+  /* 1. every round replaces every zone: 300 zones of about 800 bytes, 240 KB a round; the "disk" holds 1800 KB less the reserve.  The cleaner makes the room each time, nothing is refused. */
+  enum { M = 300 };
+  uint64_t v = 0;
+  for (int round = 1; round <= 30; round++) {
+    for (uint32_t i = 0; i < M; i++) {
+      v = (uint64_t)round;
+      int r = put_i(s, 0, i, v, NULL);
+      if (r != 0) { printf("  round %d zone %u: put %d\n", round, i, r); CHECK_EQ(r, 0); round = 99; break; }
+    }
+  }
+  store_stats(s, &st);
+  printf("  30 rounds of %d zones: %" PRIu64 " segments freed, %" PRIu64 " bytes moved, degraded puts %" PRIu64 ", ENOSPC events %" PRIu64 ", free now %" PRIu64 "\n", M, st.compact_segs_freed, st.compact_moved_bytes,
+         st.degraded_puts, st.enospc_events, st.fs_free_bytes);
+  CHECK(st.compact_segs_freed >= 5);
+  CHECK_EQ(st.degraded_puts, 0);
+  CHECK(st.enospc_events > 0);
+  CHECK(!(st.state & STORE_ST_DEGRADED_NOSPC));
+  CHECK_EQ(st.space_level, 0);
+  for (uint32_t i = 0; i < M; i++) CHECK(verify_i(s, 0, i, 30));
+  check_consistent(s, "space 1");
+  CHECK_EQ(log_count(3, "no room"), 0);
+  /* 2. distinct zones: nothing to clean, the disk fills up: the zones are kept without an image (the put succeeds), the ERROR is said once */
+  log_clear();
+  uint32_t first_known = 0;
+  uint32_t nz = 0;
+  for (uint32_t i = 1000; i < 1000 + 3000; i++) {
+    CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+    nz++;
+    store_zone_t zi;
+    store_read_lock();
+    uint32_t z = find_i(s, 0, i);
+    if (z != STORE_NONE && store_zone_get(s, z, &zi) == 0 && zi.state == STORE_STATE_KNOWN && !first_known) first_known = i;
+    store_read_unlock();
+    if (first_known && i > first_known + 40) break;
+  }
+  store_stats(s, &st);
+  printf("  the first zone kept without an image: %u (after %u puts); degraded puts %" PRIu64 ", free %" PRIu64 " of reserve %" PRIu64 "\n", first_known, nz, st.degraded_puts, st.fs_free_bytes, st.reserve_bytes);
+  CHECK(first_known != 0);
+  CHECK(st.degraded_puts >= 20);
+  CHECK(st.state & STORE_ST_DEGRADED_NOSPC);
+  CHECK_EQ(st.space_level, 2);
+  CHECK(st.degraded_since_unix != 0);
+  CHECK_EQ(log_count(3, "no room for zone images"), 1);                    /* once a minute */
+  /* the zones before it are stored and served; the zones after it have their record (name, version) without an image */
+  for (uint32_t i = 1000; i < first_known; i++) CHECK(verify_i(s, 0, i, 1));
+  for (uint32_t i = first_known; i < first_known + 40; i++) {
+    store_zone_t zi;
+    uint32_t z = find_i(s, 0, i);
+    CHECK(z != STORE_NONE && store_zone_get(s, z, &zi) == 0 && zi.state == STORE_STATE_KNOWN && zi.img_len == 0 && zi.serial == 1 && zi.stamp_gen == 1);
+  }
+  /* a changed zone that is stored loses its image (its old record is released) and gets the new version as a record */
+  store_stats_t before;
+  store_stats(s, &before);
+  CHECK_EQ(put_i(s, 0, 1005, 7, NULL), 0);
+  {
+    store_zone_t zi;
+    uint32_t z = find_i(s, 0, 1005);
+    CHECK(z != STORE_NONE && store_zone_get(s, z, &zi) == 0 && zi.state == STORE_STATE_KNOWN && zi.stamp_gen == 7 && zi.serial == 7);
+  }
+  store_stats(s, &st);
+  CHECK(st.seg_live_bytes < before.seg_live_bytes);
+  check_consistent(s, "space 2");
+  /* the recorded versions survive a restart */
+  CHECK_EQ(store_close(s), 0);
+  store_test_fs_free = NULL;
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_test_fs_free = fake_fs_free;
+  check_consistent(s, "space reopen");
+  {
+    store_zone_t zi;
+    uint32_t z = find_i(s, 0, first_known);
+    CHECK(z != STORE_NONE && store_zone_get(s, z, &zi) == 0 && zi.state == STORE_STATE_KNOWN);
+  }
+  /* the disk is still full: the first put of the new session is kept without an image (the checkpoint reads the free space; the new store would otherwise believe what it read at its open) */
+  CHECK_EQ(store_checkpoint(s), 0);
+  CHECK_EQ(put_i(s, 0, 5000, 1, NULL), 0);
+  store_stats(s, &st);
+  CHECK_EQ(st.degraded_puts, 1);
+  CHECK(st.state & STORE_ST_DEGRADED_NOSPC);
+  /* 3. the way back: zones are deleted (the room comes from the cleaner), then a zone is stored again and the state ends */
+  log_clear();
+  for (uint32_t i = 1000; i < first_known; i++) {
+    if (i % 4 == 0) continue;
+    char nm[160];
+    name_of(i, nm, sizeof(nm));
+    CHECK_EQ(store_delete_name(s, 0, nm, strlen(nm)), 0);
+  }
+  for (int k = 0; k < 6; k++) CHECK_EQ(store_compact(s, 0, true, NULL), 0);
+  CHECK_EQ(put_i(s, 0, first_known, 2, NULL), 0);
+  store_stats(s, &st);
+  CHECK(verify_i(s, 0, first_known, 2));
+  CHECK(!(st.state & STORE_ST_DEGRADED_NOSPC));
+  CHECK_EQ(st.space_level, 0);
+  CHECK(log_count(6, "there is room again") >= 1);
+  CHECK_EQ(st.degraded_since_unix, 0);
+  check_consistent(s, "space 3");
+  store_test_fs_free = NULL;
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
+static _Atomic int g_fault_left;
+static int fault_append(uint64_t reclen) {
+  (void)reclen;
+  return atomic_fetch_sub(&g_fault_left, 1) > 0 ? -ENOSPC : 0;
+}
+static void test_append_fault(void) {
+  printf("[space: an append that fails at the write]\n");
+  tdir_t d;
+  tdir_new(&d, "afault");
+  store_opts_t o;
+  small_opts(&o);
+  o.scrub_interval_s = UINT32_MAX;
+  o.log = log_cb;
+  log_clear();
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  for (uint32_t i = 0; i < 20; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  /* the write fails twice (the put and its retry after the cleaner): the zone is kept without an image */
+  atomic_store(&g_fault_left, 2);
+  store_test_append_fault = fault_append;
+  CHECK_EQ(put_i(s, 0, 5, 2, NULL), 0);
+  store_test_append_fault = NULL;
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK_EQ(st.degraded_puts, 1);
+  CHECK(st.state & STORE_ST_DEGRADED_NOSPC);
+  store_zone_t zi;
+  uint32_t z = find_i(s, 0, 5);
+  CHECK(z != STORE_NONE && store_zone_get(s, z, &zi) == 0 && zi.state == STORE_STATE_KNOWN && zi.stamp_gen == 2);
+  CHECK(verify_i(s, 0, 6, 1));
+  /* a delete or a flag does not end it; an image that is stored does */
+  CHECK_EQ(store_set_flags(s, z, STORE_F_NOTIFY_DUE, 0), 0);
+  store_stats(s, &st);
+  CHECK(st.state & STORE_ST_DEGRADED_NOSPC);
+  CHECK_EQ(put_i(s, 0, 5, 3, NULL), 0);
+  store_stats(s, &st);
+  CHECK(!(st.state & STORE_ST_DEGRADED_NOSPC));
+  CHECK(verify_i(s, 0, 5, 3));
+  /* one failure only: the cleaner has nothing to free, the retry works (the cleaner is tried again after a second) */
+  usleep(1100000);
+  atomic_store(&g_fault_left, 1);
+  store_test_append_fault = fault_append;
+  CHECK_EQ(put_i(s, 0, 7, 2, NULL), 0);
+  store_test_append_fault = NULL;
+  CHECK(verify_i(s, 0, 7, 2));
+  store_stats(s, &st);
+  CHECK_EQ(st.degraded_puts, 1);
+  check_consistent(s, "append fault");
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
+/* a file system that really is small: KARIDNS_STORE_SMALLFS names a directory on one (a quota dataset, a tmpfs of a few megabytes) */
+static void test_smallfs(const char *base) {
+  printf("[space: a real small file system (%s)]\n", base);
+  tdir_t d;
+  snprintf(d.path, sizeof(d.path), "%s/smallfs.%d", base, (int)getpid());
+  rm_rf(d.path);
+  if (mkdir(d.path, 0700) != 0) { perror("mkdir smallfs"); CHECK(0); return; }
+  d.fd = open(d.path, O_RDONLY | O_DIRECTORY);
+  store_opts_t o;
+  small_opts(&o);
+  o.mode = STORE_MODE_AUTO;                                               /* (copy on ZFS) */
+  o.seg_size = (uint64_t)(getenv("KARIDNS_STORE_SMALLFS_SEG") ? atoi(getenv("KARIDNS_STORE_SMALLFS_SEG")) : 1) << 20;       /* (MiB: the reserve is half of it) */
+  o.compact_rate = UINT64_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  o.log = log_cb;
+  o.checkpoint_interval_ms = 3000;
+  log_clear();
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  store_stats_t st;
+  store_stats(s, &st);
+  printf("  file system: %s, %" PRIu64 " bytes, %" PRIu64 " free, mode %s, reserve %" PRIu64 "\n", st.fstype, st.fs_total_bytes, st.fs_free_bytes, st.mode == STORE_MODE_MAP ? "map" : "copy", st.reserve_bytes);
+  /* replace the same zones again and again: the cleaner keeps up (the disk is a few times the zones) */
+  enum { M = 1500 };
+  uint64_t round_fail = 0;
+  for (int round = 1; round <= (getenv("KARIDNS_STORE_SMALLFS_ROUNDS") ? atoi(getenv("KARIDNS_STORE_SMALLFS_ROUNDS")) : 40); round++)
+    for (uint32_t i = 0; i < M; i++) {
+      int r = put_i(s, 0, i, (uint64_t)round, NULL);
+      if (r != 0) round_fail++;
+    }
+  store_stats(s, &st);
+  printf("  rounds: %" PRIu64 " puts refused, %" PRIu64 " ENOSPC events, %" PRIu64 " degraded, %" PRIu64 " segments freed, free %" PRIu64 "\n", round_fail, st.enospc_events, st.degraded_puts, st.compact_segs_freed,
+         st.fs_free_bytes);
+  CHECK_EQ(round_fail, 0);
+  CHECK_EQ(st.degraded_puts, 0);                                          /* the cleaner makes the room: nothing is kept without an image */
+  CHECK(st.compact_segs_freed >= 1);
+  /* distinct zones until the disk is full */
+  uint32_t i = 100000, first_known = 0;
+  for (; i < 100000 + 200000; i++) {
+    int r = put_i(s, 0, i, 1, NULL);
+    if (r != 0) { printf("  put of a new zone: %d\n", r); break; }
+    store_stats(s, &st);
+    if (st.degraded_puts >= 20) break;
+    if ((i & 1023) == 0) { store_stats(s, &st); if (st.degraded_puts && !first_known) first_known = i; if (g_verbose) printf("    %u zones, free %" PRIu64 ", degraded %" PRIu64 "\n", i - 100000, st.fs_free_bytes, st.degraded_puts); }
+  }
+  store_stats(s, &st);
+  printf("  full after %u distinct zones: degraded puts %" PRIu64 ", ENOSPC %" PRIu64 ", free %" PRIu64 ", state %s, store %" PRIu64 " bytes\n", i - 100000, st.degraded_puts, st.enospc_events, st.fs_free_bytes,
+         st.space_level == 2 ? "degraded" : "ok", st.store_bytes);
+  CHECK(st.degraded_puts >= 20);
+  CHECK(st.state & STORE_ST_DEGRADED_NOSPC);
+  CHECK(log_count(3, "no room for zone images") >= 1);
+  /* still consistent, still serving; delete half, clean, store again */
+  check_consistent(s, "smallfs full");
+  uint32_t last = i;
+  for (uint32_t k = 100000; k < last; k += 2) {
+    char nm[160];
+    name_of(k, nm, sizeof(nm));
+    (void)store_delete_name(s, 0, nm, strlen(nm));
+  }
+  bool back = false;
+  for (int tries = 0; tries < 60 && !back; tries++) {         /* (a file system gives the space of a removed file back after a moment: ZFS at the end of its transaction group) */
+    for (int k = 0; k < 4; k++) CHECK_EQ(store_compact(s, 0, true, NULL), 0);
+    int r = put_i(s, 0, 4000000, 1 + (uint64_t)tries, NULL);
+    CHECK_EQ(r, 0);
+    back = verify_i(s, 0, 4000000, 1 + (uint64_t)tries);
+    if (!back) usleep(500000);
+  }
+  CHECK(back);
+  store_stats(s, &st);
+  CHECK(!(st.state & STORE_ST_DEGRADED_NOSPC));
+  printf("  after deleting half and cleaning: free %" PRIu64 ", state ok, %" PRIu64 " segments freed in all\n", st.fs_free_bytes, st.compact_segs_freed);
+  check_consistent(s, "smallfs back");
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
+/* ---- the scrub ---- */
+
+static int scrub_validate(const void *img, size_t len, char *why, size_t n) {
+  uint32_t i;
+  if (len < 4) return -1;
+  memcpy(&i, img, 4);
+  if (i == 7) { snprintf(why, n, "zone 7 is refused by the test"); return -1; }
+  return 0;
+}
+static void test_scrub(int mode) {
+  printf("[scrub: damaged image, structure check, damaged cell, index that does not lead to its zone (%s)]\n", mode == STORE_MODE_MAP ? "MAP" : "COPY");
+  tdir_t d;
+  tdir_new(&d, "scrub");
+  store_opts_t o;
+  small_opts(&o);
+  o.mode = mode;
+  o.scrub_interval_s = UINT32_MAX;
+  o.validate = scrub_validate;
+  o.log = log_cb;
+  log_clear();
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  enum { N = 120 };
+  for (uint32_t i = 0; i < N; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  CHECK_EQ(store_commit(s), 0);
+  store_scrub_report_t rep;
+  CHECK_EQ(store_scrub_run(s, &rep), 0);
+  CHECK_EQ(rep.zones, N);
+  CHECK_EQ(rep.bad_cells, 0);
+  CHECK_EQ(rep.bad_index, 0);
+  CHECK_EQ(rep.images, N);                                              /* every zone is read */
+  CHECK_EQ(rep.bad_images, 1);                                          /* zone 7: the structure check of the test refuses it */
+  {
+    store_zone_t zi;
+    uint32_t z = find_i(s, 0, 7);
+    CHECK(z != STORE_NONE && store_zone_get(s, z, &zi) == 0 && zi.state == STORE_STATE_KNOWN && zi.stamp_gen == 1 && zi.serial == 1 && zi.source_id == 8);
+  }
+  CHECK_EQ(log_count(4, "zone '"), 1);
+  /* a byte of an image flips */
+  store_zone_t zi;
+  uint32_t za = find_i(s, 0, 20);
+  CHECK_EQ(store_zone_get(s, za, &zi), 0);
+  char p[700], nm[32];
+  snprintf(nm, sizeof(nm), "seg.%u", (unsigned)(zi.loc >> 36));
+  fpath(&d, nm, p, sizeof(p));
+  flip_byte(p, (off_t)((zi.loc & ((1ull << 36) - 1)) * 64 + 64 + 32 + 21));
+  CHECK_EQ(store_scrub_run(s, &rep), 0);
+  CHECK_EQ(rep.bad_images, 1);                                          /* (zone 7 is a KNOWN zone now: no image to refuse) -> only zone 20 */
+  CHECK_EQ(find_i(s, 0, 20) != STORE_NONE, 1);
+  CHECK(store_zone_get(s, find_i(s, 0, 20), &zi) == 0 && zi.state == STORE_STATE_KNOWN);
+  CHECK(verify_i(s, 0, 21, 1));
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK_EQ(st.scrub_passes, 2);
+  CHECK_EQ(st.scrub_bad_images, 2);
+  check_consistent(s, "scrub images");
+  /* a damaged cell: the repair at the end of the pass drops the zone */
+  uint32_t zc = find_i(s, 0, 30);
+  fpath(&d, "zt.1", p, sizeof(p));
+  flip_byte(p, (off_t)(ZT_HDR + (uint64_t)zc * 64 + 9));
+  CHECK_EQ(store_scrub_run(s, &rep), 0);
+  CHECK_EQ(rep.bad_cells, 1);
+  CHECK(rep.repaired);
+  CHECK_EQ(find_i(s, 0, 30), STORE_NONE);
+  CHECK(verify_i(s, 0, 31, 1));
+  check_consistent(s, "scrub cell");
+  /* an index entry that does not lead to its zone: the slot is a tombstone (the zone cannot be found by name) */
+  store_stats(s, &st);
+  snprintf(nm, sizeof(nm), "ix.%u", st.ix_gen);
+  fpath(&d, nm, p, sizeof(p));
+  uint32_t zx = find_i(s, 0, 40);
+  int fd = open(p, O_RDWR);
+  CHECK(fd >= 0);
+  bool hit = false;
+  for (uint64_t k = 0; fd >= 0 && k < st.ix_slots && !hit; k++) {
+    uint64_t v;
+    if (pread(fd, &v, 8, (off_t)(ZT_HDR + k * 8)) != 8) break;
+    if ((uint32_t)v == zx) { v |= 0xffffffffull; hit = pwrite(fd, &v, 8, (off_t)(ZT_HDR + k * 8)) == 8; }
+  }
+  if (fd >= 0) close(fd);
+  CHECK(hit);
+  CHECK_EQ(find_i(s, 0, 40), STORE_NONE);
+  CHECK_EQ(store_scrub_run(s, &rep), 0);
+  CHECK_EQ(rep.bad_index, 1);
+  CHECK(rep.repaired);
+  CHECK(find_i(s, 0, 40) == zx);
+  check_consistent(s, "scrub index");
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
+static void test_scrub_tick(void) {
+  printf("[scrub: started by the interval, at a rate]\n");
+  tdir_t d;
+  tdir_new(&d, "scrubt");
+  store_opts_t o;
+  small_opts(&o);
+  o.scrub_interval_s = 1;
+  o.scrub_rate = 128u << 10;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  enum { N = 1500 };
+  for (uint32_t i = 0; i < N; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);          /* about a megabyte of images: 8 s at 128 KiB a second */
+  store_stats_t st;
+  uint64_t t0 = now_ms();
+  bool saw_running = false;
+  while (now_ms() - t0 < 30000) {
+    (void)store_tick(s);
+    store_stats(s, &st);
+    if (st.scrub_running && st.scrub_progress_pct > 0 && st.scrub_progress_pct < 100) saw_running = true;
+    if (st.scrub_passes >= 1) break;
+    usleep(100000);
+  }
+  uint64_t took = now_ms() - t0;
+  printf("  the first pass started after the interval and ended after %" PRIu64 " ms (%" PRIu64 " zones, %" PRIu64 " bytes read)\n", took, st.scrub_zones_checked, st.scrub_bytes_checked);
+  CHECK(st.scrub_passes >= 1);
+  CHECK(saw_running);
+  CHECK(took >= 3000);                                                    /* the rate: a megabyte at 128 KiB a second is not over in a moment */
+  CHECK_EQ(st.scrub_zones_checked, N);
+  CHECK_EQ(st.scrub_bad_images + st.scrub_bad_cells + st.scrub_bad_index, 0);
+  CHECK(st.scrub_last_end_unix >= st.scrub_last_start_unix && st.scrub_last_start_unix > 0);
+  CHECK_EQ(store_close(s), 0);
+  /* the time of the last pass is in the superblock: a reopen does not scrub at once */
+  o.scrub_interval_s = 3600;
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    for (int k = 0; k < 5; k++) { (void)store_tick(s); usleep(20000); }
+    store_stats(s, &st);
+    CHECK_EQ(st.scrub_passes, 0);
+    CHECK(!st.scrub_running);
+    store_scrub_start(s);
+    store_stats(s, &st);
+    CHECK(st.scrub_running);
+    store_scrub_stop(s);
+    store_stats(s, &st);
+    CHECK(!st.scrub_running);
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
+/* ---- ZFS: the record size of the dataset (the test is run by the integration test on datasets of 128K and 16K) ---- */
+
+static void test_zfs_dir(const char *base, bool expect_warn, const char *what) {
+  printf("[ZFS record size: %s (%s)]\n", what, base);
+  tdir_t d;
+  snprintf(d.path, sizeof(d.path), "%s/zfsrs.%d", base, (int)getpid());
+  rm_rf(d.path);
+  if (mkdir(d.path, 0700) != 0) { perror("mkdir"); CHECK(0); return; }
+  d.fd = open(d.path, O_RDONLY | O_DIRECTORY);
+  store_opts_t o;
+  small_opts(&o);
+  o.mode = STORE_MODE_AUTO;
+  o.log = log_cb;
+  o.scrub_interval_s = UINT32_MAX;
+  log_clear();
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  for (uint32_t i = 0; i < 50; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  store_stats_t st;
+  store_stats(s, &st);
+  printf("  file system %s, st_blksize %u, mode %s, warning %d\n", st.fstype, st.fs_blksize, st.mode == STORE_MODE_COPY ? "copy" : "map", (int)st.fs_recordsize_warn);
+  CHECK(strcmp(st.fstype, "zfs") == 0);
+  CHECK_EQ(st.mode, STORE_MODE_COPY);                                     /* auto: COPY on ZFS */
+  CHECK_EQ((int)st.fs_recordsize_warn, expect_warn ? 1 : 0);
+  CHECK_EQ(log_count(4, "record size"), expect_warn ? 1 : 0);
+  if (expect_warn) CHECK(log_count(4, "recordsize=16K") == 1 && st.fs_blksize > 32768);
+  else CHECK(st.fs_blksize <= 32768);
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
+/* ---- the open: ix before the first answer, zt in the background; the journal cap ---- */
+
+static void test_open_defaults(void) {
+  printf("[open: the defaults, ix read before the answer, zt read-ahead]\n");
+  tdir_t d;
+  tdir_new(&d, "opendef");
+  store_opts_t o;
+  small_opts(&o);
+  o.scrub_interval_s = UINT32_MAX;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  for (uint32_t i = 0; i < 3000; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK_EQ(st.journal_max_bytes, 100u << 20);                             /* the cap: about a second of replay */
+  CHECK_EQ(store_close(s), 0);
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    for (int k = 0; k < 500 && (store_stats(s, &st), !st.zt_readahead_done); k++) usleep(2000);
+    CHECK(st.zt_readahead_done);
+    printf("  open %" PRIu64 " us (ix read %" PRIu64 " us), zt read ahead %" PRIu64 " us\n", st.recovery.open_us, st.ix_read_us, st.zt_readahead_us);
+    CHECK(verify_i(s, 0, 100, 1));
+    CHECK_EQ(store_close(s), 0);                                           /* (joins the thread) */
+  }
+  o.no_readahead = true;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats(s, &st);
+    CHECK(st.zt_readahead_done);
+    CHECK_EQ(st.zt_readahead_us, 0);
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
+/* ---- err.ring and the NOTIFY-due scan ---- */
+
+typedef struct { store_t *s; _Atomic int stop; _Atomic long bad; } errc_t;
+static void *err_writer(void *a) {
+  errc_t *c = a;
+  char t[64];
+  for (uint32_t k = 0; k < 20000; k++) { snprintf(t, sizeof(t), "text %u", k); store_err_put(c->s, k % 50, k, t); }
+  atomic_store(&c->stop, 1);
+  return NULL;
+}
+static void *err_reader(void *a) {
+  errc_t *c = a;
+  while (!atomic_load(&c->stop)) {
+    for (uint32_t z = 0; z < 50; z++) {
+      store_err_t e;
+      if (store_err_get(c->s, z, &e) == 0) {
+        unsigned k = 0;
+        if (e.zid != z || sscanf(e.text, "text %u", &k) != 1 || k % 50 != z || e.stamp_gen != k) atomic_fetch_add(&c->bad, 1);
+      }
+    }
+  }
+  return NULL;
+}
+static void test_err_ring(void) {
+  printf("[err.ring and the NOTIFY-due scan]\n");
+  tdir_t d;
+  tdir_new(&d, "errring");
+  store_opts_t o;
+  small_opts(&o);
+  o.scrub_interval_s = UINT32_MAX;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  store_err_t e;
+  CHECK_EQ(store_err_get(s, 7, &e), -ENOENT);
+  CHECK_EQ(store_err_put(s, 7, 11, "the body of zone 7 was refused: a record is not valid"), 0);
+  CHECK_EQ(store_err_put(s, 8, 12, "another"), 0);
+  CHECK_EQ(store_err_put(s, 7, 13, "newer text for 7"), 0);
+  CHECK_EQ(store_err_get(s, 7, &e), 0);
+  CHECK(e.zid == 7 && e.stamp_gen == 13 && strcmp(e.text, "newer text for 7") == 0 && e.seq == 3 && e.time > 1000000000ull);
+  CHECK_EQ(store_err_get(s, 8, &e), 0);
+  CHECK(e.stamp_gen == 12 && strcmp(e.text, "another") == 0);
+  char longt[400];
+  memset(longt, 'x', sizeof(longt) - 1);
+  longt[sizeof(longt) - 1] = 0;
+  CHECK_EQ(store_err_put(s, 9, 1, longt), 0);
+  CHECK_EQ(store_err_get(s, 9, &e), 0);
+  CHECK_EQ(strlen(e.text), STORE_ERR_TEXT - 1);                          /* cut, NUL-terminated */
+  CHECK_EQ(store_err_total(s), 4);
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK_EQ(st.err_total, 4);
+  /* the ring wraps: after 70000 more texts the first ones are gone, the last 65536 are there */
+  for (uint32_t k = 0; k < 70000; k++) { char t[40]; snprintf(t, sizeof(t), "w%u", k); CHECK_EQ(store_err_put(s, 1000 + k % 7, k, t), 0); }
+  CHECK_EQ(store_err_get(s, 8, &e), -ENOENT);
+  CHECK_EQ(store_err_get(s, 1000 + 69999 % 7, &e), 0);
+  CHECK(e.stamp_gen == 69999);
+  CHECK_EQ(store_err_total(s), 70004);
+  /* clear: the text of the zone is gone; a zone that has none costs no entry */
+  uint64_t before_clear = store_err_total(s);
+  CHECK_EQ(store_err_clear(s, 424242), 0);
+  CHECK_EQ(store_err_total(s), before_clear);
+  CHECK_EQ(store_err_put(s, 31, 1, "text of 31"), 0);
+  CHECK_EQ(store_err_get(s, 31, &e), 0);
+  CHECK_EQ(store_err_clear(s, 31), 0);
+  CHECK_EQ(store_err_get(s, 31, &e), -ENOENT);
+  CHECK_EQ(store_err_put(s, 31, 2, "again"), 0);
+  CHECK_EQ(store_err_get(s, 31, &e), 0);
+  CHECK(strcmp(e.text, "again") == 0 && e.stamp_gen == 2);
+  CHECK_EQ(store_err_put(s, 32, 3, "text of 32, cleared after the restart"), 0);
+  CHECK_EQ(store_close(s), 0);
+  /* it survives a clean close and an open */
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    CHECK(store_err_total(s) >= 70004);
+    CHECK_EQ(store_err_get(s, 1000, &e), 0);
+    CHECK_EQ(store_err_get(s, 32, &e), 0);
+    CHECK_EQ(store_err_clear(s, 32), 0);                                  /* (the bitmap of zones with texts is made again at the open) */
+    CHECK_EQ(store_err_get(s, 32, &e), -ENOENT);
+    CHECK_EQ(store_err_put(s, 5, 5, "after the reopen"), 0);
+    CHECK_EQ(store_err_get(s, 5, &e), 0);
+    CHECK(e.seq > 70005);
+    /* a writer and readers at once (TSan) */
+    errc_t c;
+    memset(&c, 0, sizeof(c));
+    c.s = s;
+    pthread_t wt, rt[3];
+    for (int i = 0; i < 3; i++) pthread_create(&rt[i], NULL, err_reader, &c);
+    pthread_create(&wt, NULL, err_writer, &c);
+    pthread_join(wt, NULL);
+    for (int i = 0; i < 3; i++) pthread_join(rt[i], NULL);
+    CHECK_EQ(atomic_load(&c.bad), 0);
+    CHECK_EQ(store_close(s), 0);
+  }
+  /* a ring file that is not ours is made empty, not trusted */
+  {
+    char p[700];
+    fpath(&d, "err.ring", p, sizeof(p));
+    flip_byte(p, 3);
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (s) {
+      CHECK_EQ(store_err_total(s), 0);
+      CHECK_EQ(store_err_get(s, 5, &e), -ENOENT);
+      CHECK_EQ(store_close(s), 0);
+    }
+  }
+  /* NOTIFY due: a flag of zt, found by a scan, journaled (kill -9 keeps it) */
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    uint32_t zid[40];
+    for (uint32_t i = 0; i < 40; i++) CHECK_EQ(put_i(s, 0, i, 1, &zid[i]), 0);
+    for (uint32_t i = 0; i < 40; i += 5) CHECK_EQ(store_set_flags(s, zid[i], STORE_F_NOTIFY_DUE, 0), 0);
+    uint32_t cur = 0, n = 0;
+    store_zone_t zi;
+    store_read_lock();
+    while (store_flag_next(s, &cur, STORE_F_NOTIFY_DUE, &zi) == 1) { CHECK(zi.zid == zid[(n * 5)]); n++; }
+    store_read_unlock();
+    CHECK_EQ(n, 8);
+    CHECK_EQ(store_set_flags(s, zid[10], 0, STORE_F_NOTIFY_DUE), 0);
+    cur = 0;
+    n = 0;
+    store_read_lock();
+    while (store_flag_next(s, &cur, STORE_F_NOTIFY_DUE, &zi) == 1) n++;
+    store_read_unlock();
+    CHECK_EQ(n, 7);
+    CHECK_EQ(store_close(s), 0);
+  }
+  /* after an unclean stop */
+  fflush(stdout);
+  pid_t pid = fork();
+  if (pid == 0) {
+    store_opts_t c = o;
+    store_t *x = NULL;
+    if (store_open(d.fd, &c, &x) != 0) _exit(2);
+    store_zone_t z2;
+    uint32_t cur = 0, k = 0;
+    store_read_lock();
+    if (store_flag_next(x, &cur, STORE_F_NOTIFY_DUE, &z2) == 1) k = z2.zid;
+    store_read_unlock();
+    if (k == 0 && cur == 0) _exit(3);
+    if (store_set_flags(x, k, 0, STORE_F_NOTIFY_DUE) != 0) _exit(4);
+    _exit(0);
+  }
+  int stt = 0;
+  waitpid(pid, &stt, 0);
+  CHECK(WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    uint32_t cur = 0, n = 0;
+    store_zone_t zi;
+    store_read_lock();
+    while (store_flag_next(s, &cur, STORE_F_NOTIFY_DUE, &zi) == 1) n++;
+    store_read_unlock();
+    CHECK_EQ(n, 6);                                                      /* 7, one cleared by the child that was killed without a close: the journal had it */
+    check_consistent(s, "notify flag");
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
+/* the clean open at a size: KARIDNS_STORE_OPENBENCH=<zones> (10M zones of 1.2 KB need 14 GB and some minutes) */
+static void test_open_bench(uint64_t n) {
+  printf("[open at %" PRIu64 " zones]\n", n);
+  tdir_t d;
+  tdir_new(&d, "openbench");
+  store_opts_t o;
+  small_opts(&o);
+  o.seg_size = 256u << 20;
+  o.scrub_interval_s = UINT32_MAX;
+  o.expected_zones = n;
+  o.max_zones = (uint32_t)(n + n / 8 + 1000);
+  o.sync_policy = STORE_SYNC_NONE;
+  o.journal_max_bytes = 256u << 20;
+  o.checkpoint_interval_ms = UINT32_MAX;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  uint64_t t0 = now_ms();
+  uint8_t *img = malloc(1200);
+  for (uint64_t i = 0; i < n; i++) {
+    char nm[64];
+    int nl = snprintf(nm, sizeof(nm), "z%09" PRIu64 ".example.test", i);
+    store_meta_t m = meta_of((uint32_t)(i & 0xffffffffu), 1);
+    m.source_id = (int64_t)i + 1;
+    img_fill(img, 1100, (uint32_t)(i & 0xffffffffu), 1);
+    if (store_put(s, 0, nm, (size_t)nl, &m, img, 1100, NULL) != 0) { CHECK(0); break; }
+    if (i % 1000000 == 999999) { printf("  %" PRIu64 " zones in %" PRIu64 " s\n", i + 1, (now_ms() - t0) / 1000); fflush(stdout); }
+  }
+  free(img);
+  printf("  filled in %" PRIu64 " s\n", (now_ms() - t0) / 1000);
+  CHECK_EQ(store_close(s), 0);
+  /* a cold cache: KARIDNS_STORE_OPENBENCH_EVICT=<GiB> writes a file that long (and removes it), which pushes the store out of the page cache (posix_fadvise does not on UFS) */
+  if (getenv("KARIDNS_STORE_OPENBENCH_EVICT")) {
+    uint64_t gib = strtoull(getenv("KARIDNS_STORE_OPENBENCH_EVICT"), NULL, 10);
+    char ep[700];
+    fpath(&d, "evict.bin", ep, sizeof(ep));
+    int efd = open(ep, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    uint8_t *eb = malloc(1u << 20);
+    if (efd >= 0 && eb) {
+      for (size_t k = 0; k < (1u << 20); k += 8) { uint64_t x = mix64(k + 1); memcpy(eb + k, &x, 8); }
+      uint64_t te = now_ms();
+      for (uint64_t k = 0; k < gib * 1024; k++) { eb[0] = (uint8_t)k; if (write(efd, eb, 1u << 20) != (ssize_t)(1u << 20)) break; }
+      fsync(efd);
+      close(efd);
+      printf("  %" PRIu64 " GiB written to push the store out of the page cache (%" PRIu64 " s)\n", gib, (now_ms() - te) / 1000);
+    }
+    free(eb);
+    unlink(ep);
+  }
+  o.create = false;
+  o.expected_zones = 0;
+  for (int pass = 0; pass < 2; pass++) {
+    uint64_t t1 = now_ms();
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    uint64_t opened = now_ms() - t1;
+    if (!s) break;
+    store_stats_t st;
+    store_stats(s, &st);
+    printf("  clean open (%s cache): %" PRIu64 " ms to the answer (open_us %" PRIu64 ", of it ix read %" PRIu64 " us)", pass ? "warm" : "first", opened, st.recovery.open_us, st.ix_read_us);
+    for (int k = 0; k < 20000 && (store_stats(s, &st), !st.zt_readahead_done); k++) usleep(1000);
+    printf(", zt read-ahead %" PRIu64 " ms in the background\n", st.zt_readahead_us / 1000);
+    char nm[64];
+    snprintf(nm, sizeof(nm), "z%09" PRIu64 ".example.test", n / 2);
+    store_read_lock();
+    CHECK(store_find(s, 0, nm, strlen(nm)) != STORE_NONE);
+    store_read_unlock();
+    CHECK_EQ(store_close(s), 0);
+  }
+  /* an unclean stop: a child opens the store, puts a zone and dies without closing; the open that follows replays the journal */
+  fflush(stdout);
+  pid_t pid = fork();
+  if (pid == 0) {
+    store_t *c = NULL;
+    store_opts_t co = o;
+    co.no_readahead = true;
+    if (store_open(d.fd, &co, &c) != 0) _exit(3);
+    for (uint32_t i = 0; i < 1000; i++) if (put_i(c, 0, 900000000u + i, 1, NULL) != 0) _exit(4);
+    _exit(0);
+  }
+  int stt = 0;
+  waitpid(pid, &stt, 0);
+  uint64_t t2 = now_ms();
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats_t st;
+    store_stats(s, &st);
+    printf("  open after an unclean stop: %" PRIu64 " ms (replayed %" PRIu64 " records, rebuilt %d)\n", now_ms() - t2, st.recovery.records_replayed, (int)st.recovery.rebuilt);
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
 int main(void) {
   const char *base = getenv("KARIDNS_STORE_TESTDIR");
   snprintf(g_base, sizeof(g_base), "%s/store_test.%d", base && *base ? base : ".", (int)getpid());
@@ -2207,6 +3561,7 @@ int main(void) {
   if (getenv("KARIDNS_STORE_KILL_ITERS")) iters = atoi(getenv("KARIDNS_STORE_KILL_ITERS"));
   if (UNDER_TSAN && !getenv("KARIDNS_STORE_KILL_ITERS")) iters = 40;
   uint32_t n = UNDER_ASAN || UNDER_TSAN ? 100000 : 100000;
+  setvbuf(stdout, NULL, _IOLBF, 0);
   printf("test_store: base %s\n", g_base);
 
   g_verbose = getenv("KARIDNS_STORE_VERBOSE") != NULL;
@@ -2235,7 +3590,21 @@ int main(void) {
   if (WANT("growfail")) test_growth_sync_fails();
   if (WANT("cleanck")) test_clean_checkpoint();
   if (WANT("full")) test_disk_full();
-  if (WANT("kill")) test_kill_loop(iters);
+  if (WANT("compact")) { test_compact(STORE_MODE_MAP); test_compact(STORE_MODE_COPY); test_compact_pinned(); test_compact_tick(); test_compact_open_segment(); test_nx_reclaim(); }
+  if (WANT("space")) { test_space(STORE_MODE_MAP); test_space(STORE_MODE_COPY); test_append_fault(); }
+  if (WANT("scrub")) { test_scrub(STORE_MODE_MAP); test_scrub(STORE_MODE_COPY); test_scrub_tick(); }
+  if (WANT("opendef")) test_open_defaults();
+  if (WANT("errring")) test_err_ring();
+  if (WANT("smallfs") && getenv("KARIDNS_STORE_SMALLFS")) test_smallfs(getenv("KARIDNS_STORE_SMALLFS"));
+  if (WANT("zfs") && getenv("KARIDNS_STORE_ZFS_128K")) test_zfs_dir(getenv("KARIDNS_STORE_ZFS_128K"), true, "128K dataset");
+  if (WANT("zfs") && getenv("KARIDNS_STORE_ZFS_16K")) test_zfs_dir(getenv("KARIDNS_STORE_ZFS_16K"), false, "16K dataset");
+  if (WANT("openbench") && getenv("KARIDNS_STORE_OPENBENCH")) test_open_bench(strtoull(getenv("KARIDNS_STORE_OPENBENCH"), NULL, 10));
+  if (WANT("kill")) test_kill_loop(iters, 0);
+  if (WANT("clk")) {
+    int citers = getenv("KARIDNS_STORE_KILLC_ITERS") ? atoi(getenv("KARIDNS_STORE_KILLC_ITERS")) : (UNDER_TSAN ? 30 : 100);
+    test_kill_loop(citers, 1);
+  }
+  if (WANT("cconc")) { test_compact_conc(STORE_MODE_MAP); test_compact_conc(STORE_MODE_COPY); }
   if (WANT("conc")) { test_concurrent(STORE_MODE_MAP); test_concurrent(STORE_MODE_COPY); }
 #undef WANT
 
