@@ -5045,6 +5045,12 @@ static void io_pump(struct lio *io) {
 static int stream_write(ctx_t *x, const uint8_t *msg, size_t len) {
     struct lio *io = x->io;
     while (len > 0) {
+        /* the fetch stream is gone: the load in hand (a manifest pass of millions of zones) ends now, not when it is through, so that the supervisor starts a loader with a new pair of
+         * streams (the Backend can read no zone till then) */
+        if (!x->fetch && atomic_load_explicit(&g_fetch_died, memory_order_relaxed)) {
+            errno = EPIPE;
+            return -1;
+        }
         if (g_stop || (x->fetch && (atomic_load_explicit(&g_fetch_stop, memory_order_relaxed) || atomic_load_explicit(&io->wstop, memory_order_relaxed)))) {
             errno = EINTR;
             return -1;
@@ -5081,7 +5087,7 @@ static int stream_write(ctx_t *x, const uint8_t *msg, size_t len) {
 /* Wait until *flag is set.  0, or -1 when the loader is told to stop or the stream is gone. */
 static int io_wait_for(struct lio *io, const bool *flag) {
     while (!*flag) {
-        if (g_stop) return -1;
+        if (g_stop || atomic_load_explicit(&g_fetch_died, memory_order_relaxed)) return -1;
         if (io->eof || io->failed) return -1;
         struct pollfd p = { io->fd, POLLIN, 0 };
         int r = poll(&p, 1, 1000);
@@ -5103,7 +5109,7 @@ static void drivers_csv(char *out, size_t cap) {
  * has said what it did with the zones.  0, or -1 when the loader is told to stop or the stream is gone. */
 static int io_wait_results(struct lio *io) {
     while (io->batch_results < io->batches_ended) {
-        if (g_stop) return -1;
+        if (g_stop || atomic_load_explicit(&g_fetch_died, memory_order_relaxed)) return -1;
         if (io->eof || io->failed) return -1;
         struct pollfd p = { io->fd, POLLIN, 0 };
         int r = poll(&p, 1, 1000);
@@ -6397,8 +6403,7 @@ static int run_stream(int fd) {
             status = EXIT_ERROR;
             goto done;
         }
-        if (atomic_load(&g_fetch_died)) {          /* D1a: the fetch stream is gone for good; the supervisor starts a loader with a new pair of streams */
-            lg(LOG_ERR, "the fetch stream is gone; exiting so that the supervisor restarts the loader");
+        if (atomic_load(&g_fetch_died)) {          /* D1a: the fetch stream is gone for good; the supervisor starts a loader with a new pair of streams (said at done:) */
             status = EXIT_ERROR;
             goto done;
         }
@@ -6537,6 +6542,10 @@ stopped:
     else if (io->eof) lg(LOG_NOTICE, "the Backend closed the stream; exiting");
     else if (io->failed) status = EXIT_ERROR;
 done:
+    if (atomic_load(&g_fetch_died) && !g_stop) {      /* (here, so that it is said, and the status is the error, also when a load or a wait was cut short: stream_write(), io_wait_for()) */
+        lg(LOG_ERR, "the fetch stream is gone; exiting so that the supervisor restarts the loader");
+        status = EXIT_ERROR;
+    }
     fetch_thread_stop();
     kdb_hotl_free(&io->hot_asm);
     kdb_hotl_free(&io->hot_fresh);

@@ -286,6 +286,8 @@ typedef struct {
   int fetch_fd;
   bool fwrite_armed;
   uint8_t *fbody;              /* KDB_MAX_BODY */
+  uint8_t *frbuf;              /* ING_RBUF: the fetch stream reads into its own buffer.  A framer keeps a pointer into the bytes it was fed (kdb_framer_feed() does not copy), and a pass that
+                                * yields (fresume / sresume) leaves frames there: with one buffer for both streams the read of the other stream overwrote them ("bad magic") */
   kdb_framer_t ffr;
   kdb_sm_t fsm;
   kdb_enc_t fenc;
@@ -2687,11 +2689,11 @@ static void protocol_error(ing_t *g, const char *reason) {
 
 /* 0.7 fix 8: the queries come before the fill.  A request of a worker that is waiting for the ingest thread (a zone to read from the database) is looked at once per pass of the main loop, and
  * a pass used to read and process up to 16 rounds of 64 KB of what the loader sends (a manifest pass or a flood of bodies: a few thousand entries, tens of milliseconds, with the install of a
- * body in each).  Now a pass that has run for ING_YIELD_NS and sees a request waiting leaves the rest of the frames it has for the next pass (g->sresume / fresume) and goes to the requests first. */
-#define ING_YIELD_NS 1000000LL
+ * body in each).  Now a pass that has run for g_ing_yield_ns and sees a request waiting leaves the rest of the frames it has for the next pass (g->sresume / fresume) and goes to the requests first. */
+STATIC_TEST _Atomic int64_t g_ing_yield_ns = 1000000;      /* (a variable so that a test can make every pass yield: test_db_fetch.c) */
 #define ING_YIELD_EVERY 1
 static inline bool ing_yield(int64_t t0, unsigned handled) {
-  if ((handled % ING_YIELD_EVERY) != 0 || mono_ns() - t0 < ING_YIELD_NS) return false;
+  if ((handled % ING_YIELD_EVERY) != 0 || mono_ns() - t0 < atomic_load_explicit(&g_ing_yield_ns, memory_order_relaxed)) return false;
   return park_fetch_pending();
 }
 
@@ -4303,7 +4305,7 @@ static void on_fetch_readable(ing_t *g) {
     if (g->fresume) {
       g->fresume = false;                                /* (the frames the last pass left are handled first) */
     } else {
-      ssize_t n = read(g->fetch_fd, g->rbuf, ING_RBUF);
+      ssize_t n = read(g->fetch_fd, g->frbuf, ING_RBUF);
       if (n < 0) {
         if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) return;
@@ -4316,7 +4318,7 @@ static void on_fetch_readable(ing_t *g) {
         fetch_drop(g);
         return;
       }
-      if (kdb_framer_feed(&g->ffr, g->rbuf, (size_t)n) != KDB_OK) {
+      if (kdb_framer_feed(&g->ffr, g->frbuf, (size_t)n) != KDB_OK) {
         fetch_protocol_error(g, g->ffr.reason);
         return;
       }
@@ -4698,11 +4700,12 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
   g->body = malloc(KDB_MAX_BODY);
   g->fbody = malloc(KDB_MAX_BODY);
   g->rbuf = malloc(ING_RBUF);
+  g->frbuf = malloc(ING_RBUF);
   kdb_enc_init(&g->enc);
   kdb_enc_init(&g->fenc);
   g->kq = kqueue();
   g->wait_kq = kqueue();
-  if (!g->body || !g->fbody || !g->rbuf || g->kq < 0 || g->wait_kq < 0 || ctrl_fd < 0) {
+  if (!g->body || !g->fbody || !g->rbuf || !g->frbuf || g->kq < 0 || g->wait_kq < 0 || ctrl_fd < 0) {
     syslog(LOG_ERR, "[DB] cannot start the ingest thread: %s", g->kq < 0 ? strerror(errno) : "no control socket or memory");
     return false;
   }
