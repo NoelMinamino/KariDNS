@@ -7,6 +7,7 @@ import { deploy, ORIGIN } from './helpers.js';
 import { parseConfig, validate } from '../lib/config.js';
 import { checkEndpoint, fetchLimited, OidcError, Oidc } from '../lib/oidc.js';
 import { readOidcProviders } from '../lib/setup.js';
+import { readPrivateFile } from '../../node/lib/conf.js';
 import { totpStep, hotp, base32Decode, sha256 } from '../lib/crypto.js';
 import * as S from '../lib/store.js';
 import { FakeIdp } from './fakeidp.js';
@@ -72,17 +73,20 @@ test('the sample configuration: the [oidc] section is valid when it is switched 
 
 test('the secret files: mode, owner, one line', () => {
   const c = parseConfig(`${BASE}[oidc a]\nissuer = https://a.example.test\nclient-id = c\nclient-secret-file = /s\n`);
-  const st = (mode, uid = 1000, file = true) => ({ a: { isFile: () => file, uid, mode: 0o100000 | mode } });
-  const read = (text) => () => text;
-  assert.deepEqual(readOidcProviders(c, { stat: st(0o600), uid: 1000, readFile: read('s3cret\n') }).list[0], { name: 'a', issuer: 'https://a.example.test', clientId: 'c', clientSecret: 's3cret', scopes: ['openid'], label: 'a', mfa: 'totp' });
-  assert.match(readOidcProviders(c, { stat: st(0o644), uid: 1000, readFile: read('x') }).problems[0], /mode 0644/);
-  assert.match(readOidcProviders(c, { stat: st(0o600, 0), uid: 1000, readFile: read('x') }).problems[0], /not owned/);
-  assert.match(readOidcProviders(c, { stat: st(0o600, 1000, false), uid: 1000, readFile: read('x') }).problems[0], /not a regular file/);
-  assert.match(readOidcProviders(c, { stat: st(0o600), uid: 1000, readFile: read('') }).problems[0], /one line/);
-  assert.match(readOidcProviders(c, { stat: st(0o600), uid: 1000, readFile: read('a\nb') }).problems[0], /one line/);
-  assert.match(readOidcProviders(c, { stat: st(0o600), uid: 1000, readFile: () => { throw Object.assign(new Error('x'), { code: 'EACCES' }); } }).problems[0], /EACCES/);
+  // (the real readPrivateFile over a file in memory: opened once, the checks on the descriptor, read from it)
+  const fsOf = (text, mode = 0o600, uid = 1000, file = true) => ({
+    openSync: () => 9, closeSync: () => {}, fstatSync: () => ({ isFile: () => file, uid, mode: 0o100000 | mode }), readFileSync: (fd) => { assert.equal(fd, 9); return text; },
+  });
+  const read = (...a) => (f, o) => readPrivateFile(f, { ...o, fsx: fsOf(...a) });
+  assert.deepEqual(readOidcProviders(c, { uid: 1000, readPrivate: read('s3cret\n') }).list[0], { name: 'a', issuer: 'https://a.example.test', clientId: 'c', clientSecret: 's3cret', scopes: ['openid'], label: 'a', mfa: 'totp' });
+  assert.deepEqual(readOidcProviders(c, { uid: 1000, readPrivate: read('x', 0o644) }).problems, ['oidc a: client-secret-file: /s has mode 0644, it must be 0600 or 0400']);
+  assert.match(readOidcProviders(c, { uid: 1000, readPrivate: read('x', 0o600, 0) }).problems[0], /^oidc a: client-secret-file: \/s is not owned by the user running karidns-webadmin$/);
+  assert.match(readOidcProviders(c, { uid: 1000, readPrivate: read('x', 0o600, 1000, false) }).problems[0], /not a regular file/);
+  assert.match(readOidcProviders(c, { uid: 1000, readPrivate: read('') }).problems[0], /one line/);
+  assert.match(readOidcProviders(c, { uid: 1000, readPrivate: read('a\nb') }).problems[0], /one line/);
+  assert.deepEqual(readOidcProviders(c, { uid: 1000, readPrivate: (f, o) => readPrivateFile(f, { ...o, fsx: { openSync: () => { throw Object.assign(new Error('x'), { code: 'EACCES' }); } } }) }).problems, ['oidc a: client-secret-file: cannot read /s: EACCES']);
   // openid is always asked for
-  assert.deepEqual(readOidcProviders(parseConfig(`${BASE}[oidc a]\nissuer = https://a.example.test\nclient-id = c\nclient-secret-file = /s\nscopes = email\n`), { stat: st(0o600), uid: 1000, readFile: read('x') }).list[0].scopes, ['openid', 'email']);
+  assert.deepEqual(readOidcProviders(parseConfig(`${BASE}[oidc a]\nissuer = https://a.example.test\nclient-id = c\nclient-secret-file = /s\nscopes = email\n`), { uid: 1000, readPrivate: read('x') }).list[0].scopes, ['openid', 'email']);
 });
 
 // ------------------------------------------------------------------------------------------------------------------------------- what the provider's documents may say

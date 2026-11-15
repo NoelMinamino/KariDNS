@@ -20,7 +20,8 @@
 --     it to see which zones changed); INSERT, UPDATE, DELETE on records and domainmetadata, restricted by the policies below; INSERT on cryptokeys (new
 --     keys; no UPDATE, no DELETE); SELECT, and UPDATE of (state, message, done_at), on karidns_key_requests (the requests the API files, which the signer answers); SELECT, INSERT, UPDATE,
 --     DELETE on karidns_signer_state (its schedule); INSERT on karidns_reload_requests (the signer asks the loader to reload); USAGE on the sequences
---     behind the serial columns.  Nothing is written to karidns_changes (the triggers of the data tables write the change log as the owner), nothing on
+--     behind the serial columns; on PostgreSQL 17 and later MAINTAIN on records (0.7: `karidns-zone import --signer` runs ANALYZE records after it wrote or
+--     removed 1000 records or more; the locks MAINTAIN allows are no more than UPDATE and DELETE already allow).  Nothing is written to karidns_changes (the triggers of the data tables write the change log as the owner), nothing on
 --     karidns_auth (no USAGE on the schema).
 --   * policies for the role: SELECT of every row; records: INSERT and DELETE of the DNSSEC-managed types only, UPDATE of every row (a trigger decides what
 --     changes: below); domainmetadata: INSERT, UPDATE, DELETE of the kinds PRESIGNED, NSEC3PARAM and X-KARIDNS-SIGNER only; karidns_reload_requests: INSERT;
@@ -68,6 +69,11 @@ REVOKE ALL ON SCHEMA karidns_auth FROM :"role";
 GRANT SELECT ON :"schema".domains, :"schema".records, :"schema".domainmetadata, :"schema".cryptokeys TO :"role";
 GRANT INSERT, UPDATE, DELETE ON :"schema".records, :"schema".domainmetadata TO :"role";
 GRANT INSERT ON :"schema".karidns_reload_requests TO :"role";
+-- PostgreSQL 17 and later: MAINTAIN on records, so that karidns-zone import --signer can ANALYZE it after a large signing (0.7)
+SELECT current_setting('server_version_num')::int >= 170000 AS pg17 \gset
+\if :pg17
+GRANT MAINTAIN ON :"schema".records TO :"role";
+\endif
 -- the key tooling and the work queue of the signer (0.6.0 item C): new keys (INSERT only: a key is never changed or deleted by the signer), the
 -- key requests it works off (SELECT, UPDATE of the state), its own schedule
 GRANT INSERT ON :"schema".cryptokeys TO :"role";

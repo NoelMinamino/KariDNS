@@ -229,11 +229,66 @@ function languageSection(ctx) {
   return h('section', { class: 'card', 'aria-labelledby': 'acc-lang' }, h('h2', { id: 'acc-lang' }, t('account.language-title')), sel.node, h('p', { class: 'hint' }, t('account.language-hint')));
 }
 
+// The idle times a person may choose for its sessions (PUT /auth/idle-timeout): these, where they are not longer than the service's session-idle, and 1, 2 and 3 minutes
+// where none of these fits (a session-idle under five minutes).  The API takes any whole number of seconds from 60 to session-idle; a time set that way (not one of
+// these) is offered as well, so that the screen shows what is in force.  With a session-idle of a minute or less there is nothing shorter to choose.
+export const IDLE_CHOICES_MIN = [5, 10, 15, 30, 60];
+const IDLE_SHORT_MIN = [1, 2, 3];
+
+export function idleText(t, sec) {
+  if (sec % 60 === 0) return sec === 60 ? t('account.idle-minute') : t('account.idle-minutes', { minutes: sec / 60 });
+  return sec === 1 ? t('account.idle-second') : t('account.idle-seconds', { seconds: sec });
+}
+
+// -> the options of the select: the service's default first (value ''), then the times in seconds; [] when nothing shorter than the default can be chosen
+export function idleOptions(t, max, choice) {
+  const fit = (list) => list.map((m) => m * 60).filter((s) => s <= max);
+  const secs = max <= 60 ? [] : fit(IDLE_CHOICES_MIN).length ? fit(IDLE_CHOICES_MIN) : fit(IDLE_SHORT_MIN);
+  if (choice && !secs.includes(choice)) secs.push(choice);
+  if (secs.length === 0) return [];
+  return [{ value: '', label: t('account.idle-default', { time: idleText(t, max) }) },
+    ...secs.sort((a, b) => a - b).map((s) => ({ value: String(s), label: s > max ? t('account.idle-over', { time: idleText(t, s) }) : idleText(t, s) }))];
+}
+
+// "Sign out after inactivity": the person's own idle time, shorter than the service's (the service enforces it; session.setIdle moves the countdown at once)
+function idleForm(ctx, shown) {
+  const { api, i18n, session } = ctx;
+  const t = i18n.t;
+  const ss = session.state.me.session;
+  const max = ss.idle_timeout_max ?? ss.idle_timeout;
+  const choice = ss.idle_timeout_choice ?? null;
+  const options = idleOptions(t, max, choice);
+  const title = h('h3', null, t('account.idle-title'));
+  if (options.length === 0) return h('div', null, title, h('p', { class: 'hint' }, t('account.idle-none', { time: idleText(t, max) })));
+  const sel = select({ label: t('account.idle-label'), options, value: choice ? String(choice) : '', name: 'idle_timeout', hint: t('account.idle-hint', { time: idleText(t, max) }) });
+  const msg = message('status');
+  const err = message('error');
+  const save = h('button', { type: 'submit' }, t('account.idle-save'));
+  const form = h('form', { class: 'stack', novalidate: true }, title, sel.node, err.node, msg.node, h('div', { class: 'actions' }, save));
+  form.addEventListener('submit', (ev) => {
+    ev.preventDefault();
+    err.set(null);
+    msg.set(null);
+    busy(save, async () => {
+      try {
+        const r = await api.put('/auth/idle-timeout', { idle_timeout: sel.input.value ? Number(sel.input.value) : null });
+        session.setIdle(r);
+        shown.textContent = idleText(t, r.idle_timeout);
+        msg.set(t('account.idle-saved', { time: idleText(t, r.idle_timeout) }));
+      } catch (e) {
+        err.setNodes(...problemNodes(i18n, e));
+      }
+    });
+  });
+  return form;
+}
+
 function sessionSection(ctx) {
   const { i18n, session } = ctx;
   const t = i18n.t;
   const s = session.state;
   const err = message('error');
+  const idleShown = h('dd', null, idleText(t, Math.round(s.idleMs / 1000)));
   const out = (all) => (ev) => {
     busy(ev.currentTarget, async () => {
       try { await session.logout(all); } catch (e) { err.setNodes(...problemNodes(i18n, e)); }
@@ -243,12 +298,13 @@ function sessionSection(ctx) {
     h('h2', { id: 'acc-sess' }, t('account.session')),
     h('dl', null,
       h('dt', null, t('account.sess-ends')), h('dd', null, s.expiresAt ? timeNode(new Date(s.expiresAt).toISOString(), i18n.lang) : '-'),
-      h('dt', null, t('account.sess-idle')), h('dd', null, t('account.sess-idle-value', { minutes: Math.round(s.idleMs / 60000) }))),
+      h('dt', null, t('account.sess-idle')), idleShown),
     err.node,
     h('div', { class: 'actions' },
       h('button', { type: 'button', on: { click: out(false) } }, t('account.logout')),
       h('button', { type: 'button', on: { click: out(true) } }, t('account.logout-all'))),
-    h('p', { class: 'hint' }, t('account.logout-all-hint')));
+    h('p', { class: 'hint' }, t('account.logout-all-hint')),
+    idleForm(ctx, idleShown));
 }
 
 // -> { node, dispose }

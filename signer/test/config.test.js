@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parseDuration } from '../../node/lib/conf.js';
-import { parseConfig, zoneSettings, validate, defaults, loadConfig, checkConninfoFile } from '../lib/config.js';
+import { parseConfig, zoneSettings, validate, defaults, loadConfig } from '../lib/config.js';
 
 const PG = `
 # the signer
@@ -152,26 +152,6 @@ test('loadConfig reads a file and reports one that is missing', () => {
     fs.writeFileSync(f, 'database = pg\nconninfo-file = /x\n');
     assert.equal(loadConfig(f).settings.database, 'pg');
     assert.throws(() => loadConfig(path.join(dir, 'none.conf')), /cannot read/);
-  } finally {
-    fs.rmSync(dir, { recursive: true });
-  }
-});
-
-test('the conninfo file: regular, ours, mode 0600 or 0400', () => {
-  const st = (o) => ({ isFile: () => true, uid: 1000, mode: 0o100600, ...o });
-  assert.equal(checkConninfoFile('/c', st(), 1000), null);
-  assert.equal(checkConninfoFile('/c', st({ mode: 0o100400 }), 1000), null);
-  assert.match(checkConninfoFile('/c', st({ isFile: () => false }), 1000), /not a regular file/);
-  assert.match(checkConninfoFile('/c', st({ uid: 0 }), 1000), /not owned/);
-  assert.match(checkConninfoFile('/c', st({ mode: 0o100644 }), 1000), /mode 0644/);
-  assert.match(checkConninfoFile('/c', st({ mode: 0o100660 }), 1000), /mode 0660/);
-  assert.match(checkConninfoFile('/does/not/exist/c', undefined, 1000), /cannot read/);
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-ci-'));
-  try {
-    const f = path.join(dir, 'ci');
-    fs.writeFileSync(f, 'dbname=x\n', { mode: 0o600 });
-    if (process.platform !== 'win32') assert.equal(checkConninfoFile(f), null);
-    else assert.equal(typeof checkConninfoFile(f), 'string');
   } finally {
     fs.rmSync(dir, { recursive: true });
   }

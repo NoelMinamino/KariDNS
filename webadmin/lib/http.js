@@ -9,6 +9,7 @@ import { ApiError, problem, mapDbError } from './errors.js';
 import { authenticate } from './session.js';
 import { listenHost } from './config.js';
 import { serveStatic } from './static.js';
+import { readPrivateFile } from '../../node/lib/conf.js';
 
 export const PREFIX = '/api/v1';
 const BODY_LIMIT = 1 << 20;
@@ -192,7 +193,7 @@ export async function dispatch(app, router, req, res) {
     if (m.route.auth === 'user') {
       await authenticate(app, ctx, m.route);
       const who = ctx.auth.principal.id;
-      const wait = app.buckets.api.take(who) || (UNSAFE.has(req.method) ? app.buckets.write.take(who) : 0);
+      const wait = app.buckets.api.take(who) || (UNSAFE.has(req.method) ? app.buckets.write.take(who) : 0) || (m.route.bucket ? app.buckets[m.route.bucket].take(who) : 0);
       if (wait) throw new ApiError(429, 'rate-limited', 'too many requests', { headers: { 'Retry-After': String(wait) } });
     }
     if (UNSAFE.has(req.method)) {
@@ -211,7 +212,8 @@ export async function dispatch(app, router, req, res) {
   }
 }
 
-const tlsMaterial = (s, fsx) => ({ cert: fsx.readFileSync(s['tls-cert']), key: fsx.readFileSync(s['tls-key']), minVersion: 'TLSv1.2' });
+// (the key is a private file: read once, the checks made on its descriptor, as --check describes them)
+const tlsMaterial = (s, fsx) => ({ cert: fsx.readFileSync(s['tls-cert']), key: readPrivateFile(s['tls-key'], { program: 'karidns-webadmin', fsx }), minVersion: 'TLSv1.2' });
 
 // SIGHUP (0.6.1): the next connections use the certificate and key now in the files (tls.Server.setSecureContext; the connections that are open keep theirs), so a
 // renewed certificate needs no restart.  Throws when a file cannot be read: the caller keeps the old settings and the old certificate.  Does nothing for a server that
@@ -222,9 +224,19 @@ export function reloadTls(server, settings, { fsx = fs } = {}) {
   return true;
 }
 
+// The UNIX socket after listen (0.7): it must be a socket of mode 0660 (made so by the umask around the bind; no chmod of a path afterwards).  -> null or the reason.
+export function socketProblem(file, fsx = fs) {
+  let st;
+  try { st = fsx.lstatSync(file); } catch (e) { return `${file} is not there after listen (${e.code ?? e.message})`; }
+  if (!st.isSocket()) return `${file} is not a socket after listen`;
+  if ((st.mode & 0o777) !== 0o660) return `the socket ${file} has mode ${(st.mode & 0o777).toString(8).padStart(4, '0')}, 0660 is needed`;
+  return null;
+}
+
 // -> the listening server.  Limits against slow and large requests: 16 KiB of headers, 10 s for them, 30 s for the body of a request (readBody; the server's own
-// requestTimeout is 300 s because a zone import may take that), 5 s keep-alive, 256 sockets.
-export async function listen(app, router, { fsx = fs } = {}) {
+// requestTimeout is 300 s because a zone import may take that), 5 s keep-alive, 256 sockets.  A UNIX socket is born with mode 0660: the umask 0117 is in force while
+// server.listen binds it (synchronously in this process; the old umask is back before the next line, also when the bind fails), then socketProblem() checks it.
+export async function listen(app, router, { fsx = fs, proc = process } = {}) {
   const s = app.settings;
   // dispatch answers every error itself; what it cannot (the connection is gone) must not take the process down
   const handler = (req, res) => {
@@ -245,10 +257,16 @@ export async function listen(app, router, { fsx = fs } = {}) {
   await new Promise((resolve, reject) => {
     server.once('error', reject);
     const done = () => { server.off('error', reject); resolve(); };
-    if (host === null) server.listen(s.listen, done);
-    else server.listen(Number(/:(\d+)$/.exec(s.listen)[1]), host, done);
+    if (host === null) {
+      const umask = proc.umask(0o117);
+      try { server.listen(s.listen, done); } finally { proc.umask(umask); }
+    } else server.listen(Number(/:(\d+)$/.exec(s.listen)[1]), host, done);
   });
-  if (host === null) fsx.chmodSync(s.listen, 0o660);
+  const bad = host === null ? socketProblem(s.listen, fsx) : null;
+  if (bad) {
+    await closeServer(server, 0);
+    throw new Error(bad);
+  }
   return server;
 }
 

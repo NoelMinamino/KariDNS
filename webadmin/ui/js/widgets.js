@@ -41,11 +41,13 @@ export function checkbox({ label, checked = false, name }) {
 }
 
 // options: [{ value, label, lang }]  (lang: the language of the label when it is not the page's, WCAG 3.1.2: the name of a language in that language)
-export function select({ label, options, value, name }) {
+// hint: a line under it, tied to it by aria-describedby as a field's
+export function select({ label, options, value, name, hint }) {
   const id = uid('sel');
-  const input = h('select', { id, name }, options.map((o) => h('option', { value: o.value, selected: o.value === value, lang: o.lang }, o.label)));
+  const hintNode = hint ? h('p', { class: 'hint', id: `${id}-hint` }, hint) : null;
+  const input = h('select', { id, name, 'aria-describedby': hintNode ? `${id}-hint` : undefined }, options.map((o) => h('option', { value: o.value, selected: o.value === value, lang: o.lang }, o.label)));
   input.value = value;
-  return { node: h('div', { class: 'field' }, h('label', { for: id }, label), input), input };
+  return { node: h('div', { class: 'field' }, h('label', { for: id }, label), input, hintNode), input };
 }
 
 // a line of text that screen readers announce when it changes: kind 'error' (assertive) or 'status' (polite)

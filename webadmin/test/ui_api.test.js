@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createApi, ApiProblem, retryAfter, enc, UNSAFE } from '../ui/js/api.js';
-import { createSession, WARN_BEFORE_MS, SAFETY_MS, CHANNEL } from '../ui/js/session.js';
+import { createSession, WARN_BEFORE_MS, SAFETY_MS, CHANNEL, leadTimes } from '../ui/js/session.js';
 import { reply, problem, makeClock, makeBroadcast, flush } from './fakedom.js';
 
 const ME = (over = {}) => ({
@@ -304,6 +304,66 @@ test('the absolute end of the session is warned about as such, and a short idle 
   assert.deepEqual(s2.events.find((e) => e[0] === 'warn')[1], { at: c2.now() - 31000 + 45000, kind: 'idle' });
   await c2.advance(15000);
   assert.equal(s2.session.state.status, 'expired');
+});
+
+test('the lead times scale with the idle time (0.7); a new idle time chosen on the account screen moves the countdown at once, and none is taken while signed out', async () => {
+  assert.deepEqual(leadTimes(1800000), { margin: SAFETY_MS, warn: WARN_BEFORE_MS });
+  assert.deepEqual(leadTimes(600000), { margin: 60000, warn: 120000 });
+  assert.deepEqual(leadTimes(300000), { margin: 60000, warn: 75000 });
+  assert.deepEqual(leadTimes(60000), { margin: 15000, warn: 15000 });
+  const clock = makeClock();
+  const s = sess({ clock, handler: () => reply(200, meAt(clock)) });
+  await s.session.restore();
+  const start = clock.now();
+  // five minutes: the end is a minute early (4:00), the warning 75 seconds before it (2:45)
+  s.session.setIdle({ idle_timeout: 300, idle_timeout_choice: 300, idle_timeout_max: 1800 });
+  assert.equal(s.session.state.me.session.idle_timeout_choice, 300);
+  assert.equal(s.session.state.me.session.csrf, 'csrf-1', 'the rest of the session is kept');
+  await clock.advance(164000);
+  assert.equal(s.events.filter((e) => e[0] === 'warn').length, 0);
+  await clock.advance(2000);
+  assert.deepEqual(s.events.find((e) => e[0] === 'warn')[1], { at: start + 240000, kind: 'idle' });
+  await clock.advance(75000);
+  assert.equal(s.session.state.status, 'expired');
+  // signed out: nothing changes
+  const out = sess({ handler: () => problem(401, 'unauthenticated') });
+  await out.session.restore();
+  out.session.setIdle({ idle_timeout: 300, idle_timeout_choice: 300, idle_timeout_max: 1800 });
+  assert.equal(out.session.state.idleMs, 0);
+  assert.equal(out.session.state.status, 'out');
+});
+
+test('a new idle time reaches the other tabs (0.7): sent once on the channel, applied there without sending it on; a warning shown is withdrawn; nonsense is ignored', async () => {
+  const clock = makeClock();
+  const BC = makeBroadcast();
+  const a = sess({ clock, BC, handler: () => reply(200, meAt(clock)) });
+  const b = sess({ clock, BC, handler: () => reply(200, meAt(clock)) });
+  a.session.open();
+  b.session.open();
+  await a.session.restore();
+  await b.session.restore();
+  const spy = new BC(CHANNEL);
+  const seen = [];
+  spy.onmessage = (ev) => seen.push(ev.data);
+  // tab b is in its warning (30 minutes: 2 minutes before the end that comes a minute early)
+  await clock.advance(1800000 - SAFETY_MS - WARN_BEFORE_MS + 1000);
+  assert.equal(b.events.filter((e) => e[0] === 'warn').length, 1);
+  a.session.setIdle({ api: 1, idle_timeout: 3600, idle_timeout_choice: null, idle_timeout_max: 3600 });
+  assert.deepEqual(seen, [{ type: 'idle', idle_timeout: 3600, idle_timeout_choice: null, idle_timeout_max: 3600 }], 'one message, from tab a only');
+  assert.equal(b.session.state.idleMs, 3600000);
+  assert.equal(b.session.state.me.session.idle_timeout_max, 3600);
+  assert.ok(names(b.events).includes('warn-clear'), 'the warning of tab b is withdrawn');
+  assert.equal(b.session.state.warned, false);
+  // a message that is not a time, or one for a tab that is signed out: nothing changes
+  spy.postMessage({ type: 'idle', idle_timeout: 'x' });
+  spy.postMessage({ type: 'idle' });
+  assert.equal(b.session.state.idleMs, 3600000);
+  b.session.state.status = 'out';
+  spy.postMessage({ type: 'idle', idle_timeout: 60 });
+  assert.equal(b.session.state.idleMs, 3600000);
+  a.session.close();
+  b.session.close();
+  spy.close();
 });
 
 test('touch does nothing for a session that is not in; setOut keeps the principal for the next sign-in', async () => {

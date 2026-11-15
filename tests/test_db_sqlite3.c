@@ -2716,6 +2716,7 @@ static void test_writes(void) {
     }
     db_schema_info_t si;
     CHECK(D->check_schema(ro, &si) == 0 && D->check_schema(c, &si) == 0 && D->check_schema(c2, &si) == 0 && si.has_ext && si.has_domain_views);
+    CHECK(D->w_analyze == NULL);                    /* 0.7: no statistics are refreshed after an import (the importer skips the call) */
     /* a read only connection refuses everything; a writable one outside a transaction too */
     int64_t id = 0, did = 0, rid = 0, rid2 = 0;
     bool has = false;

@@ -1869,6 +1869,7 @@ const db_driver_t db_driver_sqlite3 = {
     /* items D and E */
     .w_set_actor = sq_w_set_actor, .w_zone_generation = sq_w_zone_generation, .w_bump_serial = sq_w_bump_serial,
     .w_insert_version = sq_w_insert_version, .w_insert_version_rrset = sq_w_insert_version_rrset,
+    /* 0.7 w_analyze: NULL (only the PostgreSQL statistics are refreshed after an import) */
 };
 
 #endif /* KARIDNS_DB_SQLITE3 */

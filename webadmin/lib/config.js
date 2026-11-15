@@ -40,6 +40,13 @@ const parseOidcStart = (v) => {
   return n;
 };
 
+// reloads a principal may ask for in a minute (0.7): 1 to 600, the burst is half of it (app.js)
+const parseRateReload = (v) => {
+  const n = parseInt1(v);
+  if (n < 1 || n > 600) throw new Error('expected 1 to 600 (reloads a principal may ask for in a minute)');
+  return n;
+};
+
 const parseScryptLn = (v) => {
   const n = parseInt1(v);
   if (n < 14 || n > 20) throw new Error('expected 14 to 20 (the cost of a password hash is 2^n; 17 is the default)');
@@ -78,6 +85,7 @@ const GLOBAL_KEYS = {
   'rate-api': parseInt1,
   'rate-write': parseInt1,
   'rate-oidc-start': parseOidcStart,
+  'rate-reload': parseRateReload,
   'scrypt-ln': parseScryptLn,
   'audit-retention': parseRetention,
   ui: parseBool,
@@ -138,6 +146,7 @@ export function defaults() {
     'rate-api': 20,
     'rate-write': 2,
     'rate-oidc-start': 20,
+    'rate-reload': 6,
     'scrypt-ln': 17,
     'audit-retention': 0,
     ui: true,
@@ -206,6 +215,13 @@ export function listenHost(listen) {
   return m[1] ?? m[2];
 }
 
+// Can this service ask the servers to reload (T-1)?  PostgreSQL: a reload request row.  SQLite3 has no such table: the API runs `karictl reload <zone>` with the
+// restricted control key of karictl-config, so without it there is no reload.  The one test of it: the check of the configuration, the refusal of a reload
+// (handlers/write.js wantReload) and what GET /version tells the GUI (ui.reload_available).
+export function reloadAvailable(s) {
+  return s.database !== 'sqlite3' || Boolean(s['karictl-config']);
+}
+
 // -> the list of problems (empty when fine)
 export function validate(cfg) {
   const s = cfg.settings;
@@ -234,7 +250,7 @@ export function validate(cfg) {
     if (!s['sqlite-file']) problems.push("database = sqlite3 needs 'sqlite-file'");
     if (!s['auth-file']) problems.push("database = sqlite3 needs 'auth-file' (the file with the users and grants: db/karidns_auth.sqlite3.sql)");
     if (s['api-conninfo-file'] || s['check-conninfo-file']) problems.push("'api-conninfo-file' and 'check-conninfo-file' are for database = pg");
-    if (s['reload-after-change'] && !s['karictl-config']) problems.push("reload-after-change = yes needs 'karictl-config' on SQLite3 (a SQLite3 database has no reload requests: the API runs `karictl reload <zone>` with a restricted control key)");
+    if (s['reload-after-change'] && !reloadAvailable(s)) problems.push("reload-after-change = yes needs 'karictl-config' on SQLite3 (a SQLite3 database has no reload requests: the API runs `karictl reload <zone>` with a restricted control key)");
     if (cfg.datasets.size) problems.push('database = sqlite3 has one dataset (main): there are no [dataset] sections');
   }
   for (const d of cfg.datasets.values()) if (!d.schema) problems.push(`[dataset ${d.name}] needs 'schema'`);

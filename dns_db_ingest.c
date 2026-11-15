@@ -4940,21 +4940,31 @@ static bool status_cb(void *ud, const char *view, const dbreg_zone_t *z) {
 }
 
 /* karictl dbstatus is polled by scripts and operators; the count of the zones in memory walks the whole registry under its lock (O(N)), so it is done at most once
- * a second and the lines of the second between show that figure.  A caller that finds the cache in use by another thread counts for itself. */
-static void residency_cached(dbreg_residency_t *rs) {
+ * a second and the lines of the second between show that figure.  A caller that finds the cache in use by another thread counts for itself.
+ * *rbytes: the bytes of the zones in memory (zone_bytes_get) taken at the same moment as the count.  The memory: line divides the one by the other: a count
+ * of up to a second ago with the bytes of now gave a wrong average right after an eviction (300 zones in the count, the bytes of the few still in memory:
+ * fit=100% and status=ok under a limit that keeps less than half of them). */
+static void residency_cached(dbreg_residency_t *rs, uint64_t *rbytes) {
   static atomic_flag busy = ATOMIC_FLAG_INIT;
   static dbreg_residency_t cache;
+  static uint64_t cache_bytes;
   static int64_t at;
+  zone_bytes_t zdb;
   if (atomic_flag_test_and_set_explicit(&busy, memory_order_acquire)) {
     dbreg_residency(rs);
+    zone_bytes_get(ZBYTES_DB, &zdb);
+    *rbytes = zdb.resident;
     return;
   }
   int64_t now = now_ms();
   if (at == 0 || now - at >= 1000) {
     dbreg_residency(&cache);
+    zone_bytes_get(ZBYTES_DB, &zdb);
+    cache_bytes = zdb.resident;
     at = now;
   }
   *rs = cache;
+  *rbytes = cache_bytes;
   atomic_flag_clear_explicit(&busy, memory_order_release);
 }
 
@@ -5124,7 +5134,8 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     {
       /* D1a step 7: what is in memory, how the queries fare, the warm-up and the state file.  The lines above keep their form. */
       dbreg_residency_t rs;
-      residency_cached(&rs);
+      uint64_t rs_bytes;
+      residency_cached(&rs, &rs_bytes);
       uint64_t parked = cs.misses;
       st_append(&c, "residency: directory=%zu resident=%zu out_of_memory=%zu evictions=%llu\n", rs.total, rs.resident, rs.absent,
                 (unsigned long long)cs.evictions);
@@ -5133,6 +5144,7 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
         ma_est_t me;
         char mt[700];
         ma_inputs(&mi, &rs, dbreg_cache_limit());
+        mi.resident_bytes = rs_bytes;                    /* the bytes of the moment of the count (residency_cached) */
         ma_estimate(&mi, &me);
         ma_text_status(mt, sizeof(mt), &me);
         st_append(&c, "memory: %s\n", mt);

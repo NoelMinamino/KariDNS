@@ -370,6 +370,10 @@ db.import.changed
 db.render.input
 db.import.signer
 db.import.signer-zone
+db.import.analyze
+db.import.analyze-skipped
+db.import.analyze-denied
+db.import.analyze-failed
 db.export.done
 db.zone.driver
 db.zone.no-source

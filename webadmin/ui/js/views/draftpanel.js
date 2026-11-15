@@ -12,7 +12,7 @@ import { openEditor } from './editor.js';
 
 const OPS = { add: 'draft.op-add', replace: 'draft.op-replace', delete: 'draft.op-delete', soa: 'draft.op-soa' };
 
-// -> { node, dispose() }.  o: { ds, zone, info, draft, types, reloadDefault, onCommitted(r), onRefresh() (load the page of RRsets again) }
+// -> { node, dispose() }.  o: { ds, zone, info, draft, types, onCommitted(r), onRefresh() (load the page of RRsets again) }
 export function draftPanel(ctx, o) {
   const { api, i18n } = ctx;
   const t = i18n.t;
@@ -27,7 +27,6 @@ export function draftPanel(ctx, o) {
   const flow = changeFlow(ctx, {
     zone,
     reloadable: !o.info.signer,
-    reloadDefault: o.reloadDefault,
     check: () => {
       errors = new Map();
       conflicts = [];

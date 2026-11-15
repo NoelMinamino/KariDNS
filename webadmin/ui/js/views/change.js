@@ -7,6 +7,8 @@ import { render, plain } from '../format.js';
 import { field, checkbox, message, problemNodes } from '../widgets.js';
 import { diffCounts, diffPage, lineText } from '../diffmodel.js';
 import { relName } from '../zonelib.js';
+import { reloadOffer } from '../version.js';
+import { reloadNote } from './reload.js';
 
 const SIGN = { add: '+', replace: '~', delete: '-' };
 
@@ -73,10 +75,19 @@ export function summaryList(ctx, r, committed) {
   return h('dl', null, rows.map(([k, v]) => [h('dt', null, k), h('dd', null, v)]));
 }
 
+// The "update the servers after saving" box of a form that saves (T-1), ticked as GET /version says (reload_after_change); where the service cannot ask the
+// servers to reload (reload_available false) the note that says so instead.  -> { node, value() }; value(): the box, or undefined (no box: nothing to send).
+export function reloadChoice(ctx) {
+  const offer = reloadOffer(ctx);
+  if (!offer.available) return { node: reloadNote(ctx), value: () => undefined };
+  const box = checkbox({ label: ctx.i18n.t('flow.reload'), name: 'reload', checked: offer.checked });
+  return { node: box.node, value: () => box.input.checked };
+}
+
 // A flow "preview, then commit".  o:
 //   run(dry, { comment, reload }) -> the answer of the service (an ApiProblem is thrown)
 //   zone               the zone's absolute name, for names in the diff (or null)
-//   reloadable         show the "reload now" box (a signer zone has none: the signer asks for the reload); reloadDefault its default
+//   reloadable         show the "reload now" box (a signer zone has none: the signer asks for the reload); reloadChoice() decides box or note, and its default
 //   check()            local checks before a request; true = stop (the screen has said why)
 //   place(errors)      puts the errors that belong to a field or an entry there; -> the errors left over (default: all)
 //   onProblem(e, phase) -> true when the screen handled the refusal itself (the conflicts of a draft)
@@ -89,7 +100,7 @@ export function changeFlow(ctx, o) {
   const { i18n, timers } = ctx;
   const t = i18n.t;
   const comment = field({ label: t('flow.comment'), name: 'comment', maxlength: 1024, hint: t('flow.comment-hint') });
-  const reload = o.reloadable ? checkbox({ label: t('flow.reload'), name: 'reload', checked: o.reloadDefault === true }) : null;
+  const reload = o.reloadable ? reloadChoice(ctx) : null;
   const err = message('error');
   const out = h('div', { class: 'stack', 'aria-live': 'polite' });
   const previewBtn = h('button', { type: 'button', class: o.previewOnly ? 'primary' : '', on: { click: () => go(true) } }, o.previewLabel ?? t('flow.preview'));
@@ -167,7 +178,7 @@ export function changeFlow(ctx, o) {
     running = true;
     sync();
     try {
-      const r = await o.run(dry, { comment: comment.input.value, reload: reload ? reload.input.checked : undefined });
+      const r = await o.run(dry, { comment: comment.input.value, reload: reload ? reload.value() : undefined });
       if (dry && r.allowed === false) {
         o.place?.([r.denied]);
         err.setNodes(t('flow.denied'), ' ', plain(r.denied?.text ?? ''));

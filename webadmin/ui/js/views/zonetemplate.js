@@ -30,7 +30,6 @@ export function zoneTemplateView(ctx, { params }) {
       flow = changeFlow(ctx, {
         zone: info.name,
         reloadable: !info.signer,
-        reloadDefault: ctx.session.state.version?.ui?.reload_after_change === true,
         previewLabel: t('tpl.apply-preview'),
         commitLabel: t('tpl.apply-commit'),
         check: () => {

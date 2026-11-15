@@ -822,6 +822,14 @@ CREATE TABLE IF NOT EXISTS karidns_auth.api_tokens (
 );
 CREATE INDEX IF NOT EXISTS api_tokens_principal_idx ON karidns_auth.api_tokens (principal_id);
 
+-- preferences (0.7): what a user chose for itself on its account screen.  idle_timeout: the idle time of its sessions in seconds, shorter than the service's
+-- session-idle (the API takes the smaller of the two at every request); NULL or no row = the service's.  The policies let a principal write its own row only (a
+-- global master any).  A version 3 database made before 0.7 gets the table when this file is applied again (then run db/karidns_api_role.pgsql.sql again).
+CREATE TABLE IF NOT EXISTS karidns_auth.preferences (
+  principal_id BIGINT PRIMARY KEY REFERENCES karidns_auth.principals (id) ON DELETE CASCADE,
+  idle_timeout INTEGER NULL CHECK (idle_timeout IS NULL OR idle_timeout >= 60)
+);
+
 -- oidc_states (0.6.0 item F, milestone M5; decision F-18): the state of an OpenID Connect sign-in that has started and not come back.  The browser leaves for the identity
 -- provider with the session cookie out of reach (SameSite=Strict), so the state lives here, not in a cookie: the SHA-256 of the `state` parameter is the key, the SHA-256 of
 -- the value of the short cookie that ties the flow to the browser that began it, the provider's name, the nonce and the PKCE code verifier, the route to return to, and
@@ -906,6 +914,14 @@ CREATE OR REPLACE FUNCTION karidns_auth.api_token_lookup(tid bigint, h bytea) RE
   SELECT t.principal_id, t.read_only, t.expires_at
     FROM karidns_auth.api_tokens t JOIN karidns_auth.principals p ON p.id = t.principal_id AND NOT p.disabled
    WHERE t.id = tid AND t.secret_hash = h AND t.revoked_at IS NULL AND t.expires_at > now()
+$$;
+-- The tokens of groups that still work (0.7: the API makes tokens for users only; a token of a group made before stays, and `karidns-webadmin --check` names it):
+-- ids and names, never the hash.  (The policy of api_tokens shows the API role its own principal's rows; --check has no principal.)
+CREATE OR REPLACE FUNCTION karidns_auth.group_tokens() RETURNS TABLE (id bigint, name text, principal text)
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+  SELECT t.id, t.name::text, p.name::text
+    FROM karidns_auth.api_tokens t JOIN karidns_auth.principals p ON p.id = t.principal_id AND p.kind = 'group'
+   WHERE t.revoked_at IS NULL AND t.expires_at > now()
 $$;
 -- The OpenID Connect sign-in before there is a principal (oidc_states above).  oidc_state_put() records a started sign-in and returns false when 1000 are waiting
 -- already (an unauthenticated request makes a row: the number is bounded); oidc_state_take() returns the row of a state and deletes it, once, if it has not ended;
@@ -1078,7 +1094,7 @@ BEGIN
   IF pid IS NOT NULL THEN SELECT p.name INTO pname FROM karidns_auth.principals p WHERE p.id = pid; END IF;
   INSERT INTO karidns_auth.audit_log (db_role, principal_id, principal_name, change_set, data_schema, table_name, op, zone_name, row_id, before, after)
     VALUES (karidns_auth.audit_caller(), pid, pname, NULLIF(current_setting('karidns.change_set', true), ''), sch, tbl, left(TG_OP, 1),
-            NULLIF(zone, ''), coalesce(jr ->> 'id', jr ->> 'record_id')::bigint, jo, jn);
+            NULLIF(zone, ''), coalesce(jr ->> 'id', jr ->> 'record_id', CASE WHEN sch = 'karidns_auth' AND tbl = 'preferences' THEN jr ->> 'principal_id' END)::bigint, jo, jn);
   RETURN NULL;
 END $$;
 
@@ -1187,7 +1203,7 @@ DECLARE
   t   text;
   cnt integer := 0;
 BEGIN
-  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'sessions', 'api_tokens', 'templates', 'template_records']
+  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'sessions', 'api_tokens', 'preferences', 'templates', 'template_records']
                            ELSE ARRAY['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_record_tags', 'karidns_record_tinydns',
                                       'karidns_zone_tagdefs', 'karidns_domain_views', 'karidns_key_requests', 'karidns_signer_state'] END) LOOP
     IF to_regclass(format('%I.%I', sch, t)) IS NULL THEN CONTINUE; END IF;
@@ -1216,7 +1232,7 @@ DECLARE
   tg  text;
   cnt integer := 0;
 BEGIN
-  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'sessions', 'api_tokens', 'templates', 'template_records']
+  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'sessions', 'api_tokens', 'preferences', 'templates', 'template_records']
                            ELSE ARRAY['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_record_tags', 'karidns_record_tinydns',
                                       'karidns_zone_tagdefs', 'karidns_domain_views', 'karidns_key_requests', 'karidns_signer_state'] END) LOOP
     IF to_regclass(format('%I.%I', sch, t)) IS NULL THEN CONTINUE; END IF;
@@ -1783,6 +1799,12 @@ BEGIN
     PERFORM karidns_auth.set_policy('karidns_auth.api_tokens', 'karidns_rls_insert', 'INSERT', NULL, w);
     PERFORM karidns_auth.set_policy('karidns_auth.api_tokens', 'karidns_rls_update', 'UPDATE', w, w);
     PERFORM karidns_auth.set_policy('karidns_auth.api_tokens', 'karidns_rls_delete', 'DELETE', w, NULL);
+    -- preferences: the principal's own row (the idle time it chose on its account screen), a global master all of them
+    w := 'preferences.principal_id = karidns_auth.current_principal() OR karidns_auth.is_global()';
+    PERFORM karidns_auth.set_policy('karidns_auth.preferences', 'karidns_rls_select', 'SELECT', w, NULL);
+    PERFORM karidns_auth.set_policy('karidns_auth.preferences', 'karidns_rls_insert', 'INSERT', NULL, w);
+    PERFORM karidns_auth.set_policy('karidns_auth.preferences', 'karidns_rls_update', 'UPDATE', w, w);
+    PERFORM karidns_auth.set_policy('karidns_auth.preferences', 'karidns_rls_delete', 'DELETE', w, NULL);
     -- templates and their records: every row is readable, only a global master changes them
     FOREACH nm IN ARRAY ARRAY['templates', 'template_records'] LOOP
       rel := format('karidns_auth.%I', nm)::regclass;
@@ -2017,7 +2039,7 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'karidns_rls_trusted') THEN
     RAISE EXCEPTION 'karidns_auth.enable_rls: the role karidns_rls_trusted does not exist (the role scripts create it)';
   END IF;
-  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'audit_log', 'sessions', 'api_tokens', 'oidc_states', 'templates', 'template_records']
+  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'audit_log', 'sessions', 'api_tokens', 'preferences', 'oidc_states', 'templates', 'template_records']
                            ELSE ARRAY['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_record_tags', 'karidns_record_tinydns',
                                       'karidns_zone_tagdefs', 'karidns_domain_views', 'karidns_reload_requests', 'karidns_key_requests', 'karidns_signer_state', 'karidns_zone_state', 'karidns_zone_versions', 'karidns_zone_version_rrsets'] END) LOOP
     IF to_regclass(format('%I.%I', sch, t)) IS NULL THEN CONTINUE; END IF;
@@ -2034,7 +2056,7 @@ DECLARE
   t   text;
   cnt integer := 0;
 BEGIN
-  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'audit_log', 'sessions', 'api_tokens', 'oidc_states', 'templates', 'template_records']
+  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'audit_log', 'sessions', 'api_tokens', 'preferences', 'oidc_states', 'templates', 'template_records']
                            ELSE ARRAY['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_record_tags', 'karidns_record_tinydns',
                                       'karidns_zone_tagdefs', 'karidns_domain_views', 'karidns_reload_requests', 'karidns_key_requests', 'karidns_signer_state', 'karidns_zone_state', 'karidns_zone_versions', 'karidns_zone_version_rrsets'] END) LOOP
     IF to_regclass(format('%I.%I', sch, t)) IS NULL THEN CONTINUE; END IF;
@@ -2080,7 +2102,7 @@ REVOKE EXECUTE ON FUNCTION karidns_auth.current_principal(), karidns_auth.my_gro
   karidns_auth.may_grant(text, text, text, bigint), karidns_auth.grants_escalation_fn(), karidns_auth.signer_soa_fn(), karidns_auth.assert_service_role(text, text),
   karidns_auth.set_policy(regclass, text, text, text, text, text, boolean), karidns_auth.create_policies(text),
   karidns_auth.create_signer_policies(text, text), karidns_auth.enable_rls(text), karidns_auth.disable_rls(text), karidns_auth.session_lookup(bytea),
-  karidns_auth.api_token_lookup(bigint, bytea), karidns_auth.sweep_expired(), karidns_auth.prune_audit(integer), karidns_auth.oidc_state_put(bytea, bytea, text, text, text, text, integer),
+  karidns_auth.api_token_lookup(bigint, bytea), karidns_auth.group_tokens(), karidns_auth.sweep_expired(), karidns_auth.prune_audit(integer), karidns_auth.oidc_state_put(bytea, bytea, text, text, text, text, integer),
   karidns_auth.oidc_state_take(bytea), karidns_auth.oidc_lookup(text, text), karidns_auth.enable_never_commit(text), karidns_auth.disable_never_commit(text),
   karidns_auth.assert_check_role(text, text) FROM PUBLIC;
 -- (canon_type, is_dnssec_type and setting_principal stay with PUBLIC: the policies and the trigger conditions of the signer call them as the signer.)

@@ -1,6 +1,6 @@
 // What the configuration files of karidns-signer and karidns-webadmin have in common (A-20: one copy, imported by both): the parsers of a value
 // (a duration, a yes/no, a path, a schema name, a syslog facility), the connection file of a PostgreSQL database (parsed and checked the way karidns-zone and
-// the loader do it), and the check of such a file's mode.  No dependency.
+// the loader do it), the check of such a file's mode, and the one read of a private file after that check.  No dependency.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -57,8 +57,9 @@ export const parseLog = (v) => {
 };
 
 // The libpq connection string of a conninfo file (key = value pairs, values may be 'single quoted' with \' and \\) -> the options of pg's Client.
-// Only the keywords we can honour are accepted; any other is an error, so that nothing in the file is silently ignored.
-export function parseConninfo(text, program = 'karidns') {
+// Only the keywords we can honour are accepted; any other is an error, so that nothing in the file is silently ignored.  env: where pg finds PGHOST when the file names no
+// host (injected for the tests).
+export function parseConninfo(text, program = 'karidns', env = process.env) {
   const out = {};
   let i = 0;
   const s = text.trim();
@@ -114,16 +115,27 @@ export function parseConninfo(text, program = 'karidns') {
         throw new Error(`conninfo: the keyword '${k}' is not supported by ${program} (host, port, dbname, user, password, sslmode, connect_timeout, application_name are)`);
     }
   }
+  // pg has no fallback negotiation: allow and prefer mean no TLS at all, which a reader of the file does not expect; to another host that is refused (decision S-1, 0.7)
+  const host = hostOf(cfg, env);
+  if ((out.sslmode === 'allow' || out.sslmode === 'prefer') && !isLocalHost(host)) {
+    throw new Error(`conninfo: sslmode=${out.sslmode} to ${host} would be plain text (${program} does not negotiate TLS): use sslmode=disable for plain text on purpose, or require / verify-full`);
+  }
   Object.defineProperty(cfg, 'sslmode', { value: out.sslmode ?? '', enumerable: false });   // (for plaintextWarning; not an option of pg)
   return cfg;
 }
 
-// pg has no fallback negotiation: sslmode disable, allow, prefer and none all mean no TLS at all.  -> a warning when that is a connection to another host, else null.
+// The host pg connects to: the file's, else PGHOST (pg takes the variable for an empty host too), else its default localhost.
+const hostOf = (conn, env) => conn.host || env.PGHOST || '';
+
 // Local: no host, a Unix socket directory, localhost, 127.0.0.0/8, ::1.
-export function plaintextWarning(conn) {
+const isLocalHost = (host) => host === '' || host.startsWith('/') || host.toLowerCase() === 'localhost' || /^127(\.\d{1,3}){3}$/.test(host) || host === '::1' || host === '[::1]';
+
+// pg has no fallback negotiation: sslmode disable and none mean no TLS at all (allow and prefer to another host are refused by parseConninfo).  -> a warning when that is
+// a connection to another host (the file's, else PGHOST of env), else null.
+export function plaintextWarning(conn, env = process.env) {
   if (conn.ssl) return null;
-  const host = conn.host ?? '';
-  if (host === '' || host.startsWith('/') || host.toLowerCase() === 'localhost' || /^127(\.\d{1,3}){3}$/.test(host) || host === '::1' || host === '[::1]') return null;
+  const host = hostOf(conn, env);
+  if (isLocalHost(host)) return null;
   const mode = conn.sslmode;
   return `the connection to the database at ${host} is not encrypted (${mode ? `sslmode=${mode}` : 'no sslmode'}); use sslmode=verify-full (require encrypts but does not check the server)`;
 }
@@ -139,4 +151,30 @@ export function checkConninfoFile(file, st, uid = process.getuid?.(), program = 
   const mode = st.mode & 0o777;
   if (mode !== 0o600 && mode !== 0o400) return `${file} has mode ${mode.toString(8).padStart(4, '0')}, it must be 0600 or 0400`;
   return null;
+}
+
+// (0 where the system has no such flag: Windows)
+const O_NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0;
+const O_NONBLOCK = fs.constants.O_NONBLOCK ?? 0;
+
+// A private file (a conninfo file, a client secret, a key) read once (TOCTOU, 0.7): opened without following a symbolic link and without waiting on a FIFO, the checks made on
+// fstat(2) of that descriptor, the text read from it; the path is never opened again after the check.  check(st) -> null or the reason (default: checkConninfoFile's rule,
+// regular, ours, 0600 or 0400).  -> the text; throws Error(the reason), with the code of a failed open (ENOENT, ...).  fsx is injected for the tests.
+export function readPrivateFile(file, { uid = process.getuid?.(), program = 'karidns', check, fsx = fs } = {}) {
+  let fd;
+  try {
+    fd = fsx.openSync(file, fs.constants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+  } catch (e) {
+    // (O_NOFOLLOW on a link: ELOOP; FreeBSD says EMLINK)
+    if (e.code === 'ELOOP' || e.code === 'EMLINK') throw Object.assign(new Error(`${file} is not a regular file`), { code: e.code });
+    throw Object.assign(new Error(`cannot read ${file}: ${e.code ?? e.message}`), { code: e.code });
+  }
+  try {
+    const st = fsx.fstatSync(fd);
+    const bad = check ? check(st) : checkConninfoFile(file, st, uid, program);
+    if (bad) throw new Error(bad);
+    return fsx.readFileSync(fd, 'utf8');
+  } finally {
+    fsx.closeSync(fd);
+  }
 }

@@ -246,6 +246,9 @@ try {
     await click('Change password');
     await b.waitText('p[role=status]', /The password was changed\./);
     for (const n of ['current', 'new', 'again']) eq(await (await b.$(`${form} input[name=${n}]`)).prop('value'), '', `${n} is cleared`);
+    // sign out after inactivity (0.7): session-idle is 30 seconds here, so there is no shorter time to choose, and the page says so
+    const text = await bodyText();
+    must(/Sign out after inactivity/.test(text) && /The service signs out after 30 seconds already/.test(text), 'the idle sign-out section does not say that nothing shorter can be chosen');
   });
 
   await scenario('"log out everywhere" in one tab signs out the other tab at once (BroadcastChannel)', async () => {

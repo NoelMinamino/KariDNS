@@ -65,15 +65,21 @@ test('the zone screens against the API: list, zone, edit with preview and commit
     const checks = calls.filter((c) => c.argv[0] === 'apply');
     assert.ok(checks.length >= 2, 'the precondition run and the check run');
     assert.ok(checks.some((c) => c.input === 'rr www.example.test. 60 A 192.0.2.99\n'), 'the check run got the change file');
+    assert.equal(ui.input('reload'), undefined, 'no reload box in the change set (T-1)');
+    assert.match(ui.q('section.draft').textContent, /not set up to ask the servers/);
     await ui.click(ui.button(/^Commit$/));
     assert.deepEqual(ui.errors(), []);
     assert.match(ui.text(), /The change was saved\./);
     assert.match(ui.text(), /Version3/);
     assert.ok(calls.some((c) => c.argv.includes('--comment') && c.argv.includes('move www')));
 
-    // the update button: this deployment has no karictl-config, and says why
-    await ui.click(ui.button(/^Update the servers now$/));
-    assert.match(ui.errors().join(' '), /needs 'karictl-config'/);
+    // the update button (T-1): this deployment has no karictl-config, so GET /version says reload_available false and neither the button nor the box of the
+    // change set is offered; the page says why (the service would refuse the reload with 400)
+    assert.equal(ui.button(/^Update the servers now$/), null);
+    assert.match(ui.q('section[aria-labelledby=update-title]').textContent, /not set up to ask the servers to load the zone again \(an administrator sets karictl-config\)/);
+    const asked = await d.as(await d.login('root', 'correct horse battery'))('POST', '/datasets/main/zones/example.test/reload', {});
+    assert.equal(asked.status, 400, 'the service still refuses it');
+    assert.match(asked.body.detail, /needs 'karictl-config'/);
 
     // the settings: attributes, metadata, then the zone is deleted
     await ui.go('#/zones/main/example.test./settings');

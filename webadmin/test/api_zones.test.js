@@ -296,8 +296,12 @@ test('health needs no login and says when the database is gone; /version needs o
   // (G5: the record types karidns-zone's change file takes, when the service has asked it, and the settings and limits a client follows)
   assert.deepEqual(v.body, {
     api: 1, version: VERSION, tools: { karicheck: 'karicheck 0.6.0' }, datasets: ['main'], types: null,
-    ui: { reload_after_change: false, require_totp: 'none', max_rrsets: 1000, max_records: 1000, zone_text_limit: 16777216 },
+    ui: { reload_after_change: false, reload_available: false, reload_all: false, require_totp: 'none', max_rrsets: 1000, max_records: 1000, zone_text_limit: 16777216 },
   });
+  // T-1: reload_available is the predicate wantReload refuses with (SQLite3 without karictl-config: false)
+  d.config.settings['karictl-config'] = '/etc/karidns/web-karictl.conf';
+  assert.equal((await sub('GET', '/version')).body.ui.reload_available, true, 'SQLite3 with the control key');
+  delete d.config.settings['karictl-config'];
   d.app.types = new Set(['TXT', 'A', 'MX']);
   d.config.settings['reload-after-change'] = true;
   const v2 = await sub('GET', '/version');

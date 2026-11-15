@@ -203,6 +203,75 @@ test('sessions end: logout, logout of all, idle time, absolute time, a disabled 
   problem(await d.request('POST', '/auth/logout', { token: tok, body: {} }), 403, 'session-only');
 }));
 
+test('the idle time a user chooses (0.7): shorter than session-idle, enforced by the service for all its sessions, min() with a lowered session-idle, validation', withDeploy({ settings: { 'session-idle': '10m', 'session-max': '12h' } }, async (d) => {
+  const clock = { t: Date.now() };
+  d.app.now = () => clock.t;
+  await cast(d);
+  const login = async () => d.as(await d.login('dom', 'dom password 12345'));
+  const a = await login();
+  const me0 = (await a('GET', '/auth/me')).body.session;
+  assert.deepEqual([me0.idle_timeout, me0.idle_timeout_choice, me0.idle_timeout_max], [600, null, 600]);
+  // validation: 60 seconds to session-idle, an integer or null, CSRF and Origin like every write, a session only
+  const pointer = (r) => { problem(r, 400, 'bad-request'); assert.equal(r.body.errors[0].pointer, '/idle_timeout', JSON.stringify(r.body)); };
+  pointer(await a('PUT', '/auth/idle-timeout', { body: { idle_timeout: 59 } }));
+  pointer(await a('PUT', '/auth/idle-timeout', { body: { idle_timeout: 601 } }));
+  pointer(await a('PUT', '/auth/idle-timeout', { body: { idle_timeout: '300' } }));
+  pointer(await a('PUT', '/auth/idle-timeout', { body: { idle_timeout: 300.5 } }));
+  pointer(await a('PUT', '/auth/idle-timeout', { body: {} }));
+  problem(await a('PUT', '/auth/idle-timeout', { body: { idle_timeout: 300, x: 1 } }), 400, 'bad-request');
+  problem(await a('PUT', '/auth/idle-timeout', { body: { idle_timeout: 300 }, csrf: 'nope' }), 403, 'csrf');
+  problem(await a('PUT', '/auth/idle-timeout', { body: { idle_timeout: 300 }, origin: 'https://evil.example' }), 403, 'csrf');
+  const root = d.as(await d.login('root', 'correct horse battery'));
+  const tok = (await root('POST', '/tokens', { body: { name: 't' } })).body.token;
+  problem(await d.request('PUT', '/auth/idle-timeout', { token: tok, body: { idle_timeout: 300 } }), 403, 'session-only');
+  assert.equal((await d.request('GET', '/auth/me', { token: tok })).body.session.idle_timeout, undefined, 'a token has no idle time');
+  assert.equal(await d.backend.tx({}, (tx) => S.getIdleTimeout(tx, 2)), null, 'nothing was stored');
+  // five minutes: the answer, /auth/me of every session of the user, the audit
+  const set = await a('PUT', '/auth/idle-timeout', { body: { idle_timeout: 300 } });
+  assert.equal(set.status, 200, JSON.stringify(set.body));
+  assert.deepEqual(set.body, { api: 1, idle_timeout: 300, idle_timeout_choice: 300, idle_timeout_max: 600 });
+  const b = await login();
+  assert.deepEqual((await b('GET', '/auth/me')).body.session.idle_timeout, 300);
+  assert.equal((await root('GET', '/auth/me')).body.session.idle_timeout, 600, 'another user keeps the service default');
+  const audit = await d.backend.tx({}, (tx) => tx.all("SELECT op, after FROM auth.karidns_auth_audit WHERE table_name = 'preferences'"));
+  assert.deepEqual(audit.map((r) => [r.op, JSON.parse(r.after).idle_timeout]), [['I', 300]]);
+  // enforced by the service: 4 minutes after a request the session lives (the request moves last_seen), 5 minutes and a second later it is over
+  clock.t += 240000;
+  assert.equal((await a('GET', '/auth/me')).status, 200);
+  await d.app.drain();
+  clock.t += 299000;
+  assert.equal((await a('GET', '/auth/me')).status, 200);
+  await d.app.drain();
+  clock.t += 301000;
+  problem(await a('GET', '/auth/me'), 401, 'unauthenticated');
+  problem(await b('GET', '/auth/me'), 401, 'unauthenticated');
+  assert.equal((await root('GET', '/auth/me')).status, 401, 'root idled for the ten minutes of the service as well');
+  // back to the service's time (null), and the time of the service holds again
+  const c = await login();
+  const cleared = await c('PUT', '/auth/idle-timeout', { body: { idle_timeout: null } });
+  assert.deepEqual(cleared.body, { api: 1, idle_timeout: 600, idle_timeout_choice: null, idle_timeout_max: 600 });
+  clock.t += 400000;
+  assert.equal((await c('GET', '/auth/me')).status, 200);
+  await d.app.drain();
+  // a much shorter time: the PUT moves last_seen itself (otherwise written only once a minute here), so the session does not end at the next request
+  const e = await login();
+  clock.t += 50000;
+  assert.equal((await e('PUT', '/auth/idle-timeout', { body: { idle_timeout: 60 } })).status, 200);
+  clock.t += 30000;
+  assert.equal((await e('GET', '/auth/me')).status, 200, '80 seconds after the login, 30 after the PUT');
+  await d.app.drain();
+  assert.equal((await e('PUT', '/auth/idle-timeout', { body: { idle_timeout: null } })).status, 200);
+  // a SIGHUP lowers session-idle below the choice: the smaller applies at once; a choice above the new maximum is refused
+  assert.equal((await c('PUT', '/auth/idle-timeout', { body: { idle_timeout: 480 } })).status, 200);
+  d.app.setConfig({ ...d.config, settings: { ...d.app.settings, 'session-idle': 240 } });
+  const me1 = (await c('GET', '/auth/me')).body.session;
+  assert.deepEqual([me1.idle_timeout, me1.idle_timeout_choice, me1.idle_timeout_max], [240, 480, 240]);
+  pointer(await c('PUT', '/auth/idle-timeout', { body: { idle_timeout: 300 } }));
+  await d.app.drain();
+  clock.t += 241000;
+  problem(await c('GET', '/auth/me'), 401, 'unauthenticated');
+}));
+
 test('TOTP: required for global masters, enrolment, the second step, no code twice', withDeploy({ settings: { 'require-totp': 'global' } }, async (d) => {
   const clock = { t: Date.now() };
   d.app.now = () => clock.t;
@@ -416,6 +485,26 @@ test('a token cannot be made for a group (0.6.1)', withDeploy({}, async (d) => {
   problem(await root('POST', '/tokens', { body: { name: 'g', principal: gid } }), 409, 'not-a-user');
   assert.equal((await root('GET', '/tokens?all=true')).body.tokens.length, 0);
   assert.equal((await root('POST', '/tokens', { body: { name: 'u', principal: 2 } })).status, 201);
+}));
+
+test('a token of a group made before 0.7 keeps working; --check names it (inspect: a warning), a revoked or expired one is not named', withDeploy({}, async (d) => {
+  await cast(d);
+  const gid = await d.makeUser('ops', null, { kind: 'group' });
+  const secret = randomToken(32);
+  const now = Date.now();
+  const make = (name, over = {}) => d.backend.tx({ write: true }, (tx) => S.createToken(tx, { principalId: gid, name, secretHash: tokenHash(secret), readOnly: true, createdMs: now, expiresMs: now + 86400000, ...over }));
+  const id = await make('old automation');
+  const gone = await make('revoked one');
+  await d.backend.tx({ write: true }, (tx) => S.revokeToken(tx, gone, now));
+  await make('expired one', { createdMs: now - 2 * 86400000, expiresMs: now - 1000 });
+  const me = await d.request('GET', '/auth/me', { token: tokenText(id, secret) });
+  assert.equal(me.status, 200, JSON.stringify(me.body));
+  assert.equal(me.body.principal.name, 'ops');
+  const { inspect } = await import('../lib/setup.js');
+  const r = await inspect(d.config, { backend: d.backend });
+  assert.deepEqual(r.problems, []);
+  assert.deepEqual(r.warnings, [`1 API token(s) of groups still work (a group does not sign in; make tokens for a user, a service account, and revoke these): ${id} "old automation" of ops`]);
+  assert.deepEqual(await d.backend.tx({}, (tx) => S.groupTokens(tx, now)), [{ id, name: 'old automation', principal: 'ops' }]);
 }));
 
 test('the lock is per network: the owner gets in from another network; /24 and /64; unlock and a new password end it (audit, 0.6.2)', withDeploy({ settings: { 'trusted-proxy': '127.0.0.1, ::1' } }, async (d) => {

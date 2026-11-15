@@ -571,7 +571,47 @@ test('the update button: a zone, or every zone', withTools(standard(), async (d,
   // a zone kept signed is reloaded by the signer
   await run(d, "INSERT INTO domainmetadata (domain_id, kind, content) VALUES (1, 'X-KARIDNS-SIGNER', '1')");
   is(await dom('POST', url), 409, 'signer-managed');
-}, { 'karictl-config': CTL_CONF }));
+}, { 'karictl-config': CTL_CONF, 'rate-reload': 60 }));
+
+test('rate-reload: the reloads of a principal (a zone and a dataset share the bucket), 429 with Retry-After like the other limits; SIGHUP takes a new rate', async () => {
+  let clock = Date.parse('2026-11-15T00:00:00Z');
+  const t = makeRun(standard());
+  const d = await deploy({ run: t.run, now: () => clock, settings: { 'karidns-zone': KZ, karictl: KCTL, 'karictl-config': CTL_CONF } });
+  try {
+    assert.equal(d.app.settings['rate-reload'], 6, 'the default');
+    const c = await cast(d);
+    const as = async (u, p) => d.as(await d.login(u, p));
+    const root = await as('root', 'correct horse battery');
+    const dom = await as('dom', 'dom password 12345');
+    const url = '/datasets/main/zones/example.test/reload';
+    // 6 a minute, 3 at once
+    for (let i = 0; i < 3; i++) is(await dom('POST', url), 200);
+    const over = await dom('POST', url);
+    is(over, 429, 'rate-limited');
+    assert.equal(over.headers.get('retry-after'), '10');
+    assert.equal(over.body.detail, 'too many requests');
+    is(await dom('GET', '/datasets/main/zones/example.test'), 200, undefined);            // (other requests are not held up)
+    is(await root('POST', url), 200);                                                       // (per principal)
+    clock += 10000;
+    is(await dom('POST', url), 200);
+    is(await dom('POST', url), 429, 'rate-limited');
+    // the dataset's reload takes from the same bucket, also when it is refused afterwards
+    for (let i = 0; i < 3; i++) is(await root('POST', '/datasets/main/reload'), 409, 'unsupported');        // (2 left after the zone's, one more after 10 s)
+    is(await root('POST', '/datasets/main/reload'), 429, 'rate-limited');
+    // SIGHUP: a new rate is new buckets; the same rates keep the counts
+    d.app.setConfig({ ...d.app.config, settings: { ...d.app.settings } });
+    is(await dom('POST', url), 429, 'rate-limited');
+    d.app.setConfig({ ...d.app.config, settings: { ...d.app.settings, 'rate-reload': 1 } });
+    const one = await dom('POST', url);
+    is(one, 200);
+    const again = await dom('POST', url);
+    is(again, 429, 'rate-limited');
+    assert.equal(again.headers.get('retry-after'), '60');
+    assert.ok(c);
+  } finally {
+    await d.close();
+  }
+});
 
 
 test('no restricted key, no reload button', withTools(standard(), async (d, { dom }) => {
