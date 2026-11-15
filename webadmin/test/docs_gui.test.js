@@ -162,8 +162,8 @@ test('the tests the checklist points at exist, and the script checks it claims a
   }
   // the unit test that the checklist calls the contrast test really tests the pairs it says it does
   const review = read('webadmin/test/ui_review.test.js');
-  assert.equal([...review.slice(review.indexOf('const TEXT'), review.indexOf('const NON_TEXT')).matchAll(/\['[a-z-]+', '[a-z-]+', '[^']+'\]/g)].length, 16, 'the 16 text pairs');
-  assert.equal([...review.slice(review.indexOf('const NON_TEXT')).matchAll(/\['[a-z-]+', '[a-z-]+', '[^']+'\]/g)].length, 12, 'the 12 non-text pairs');
+  assert.equal([...review.slice(review.indexOf('const TEXT'), review.indexOf('const NON_TEXT')).matchAll(/\['[a-z-]+', '[a-z-]+', '[^']+'\]/g)].length, 28, 'the 28 text pairs');
+  assert.equal([...review.slice(review.indexOf('const NON_TEXT')).matchAll(/\['[a-z-]+', '[a-z-]+', '[^']+'\]/g)].length, 20, 'the 20 non-text pairs');
 });
 
 test('the manual of the web interface and the service manual agree on the list of browsers', () => {

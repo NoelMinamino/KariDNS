@@ -23,11 +23,11 @@ The interface is built to meet **WCAG 2.1 level AA**. It is not certified: no au
 | 1.3.5 | Identify input purpose | Met | `autocomplete` is `username`, `current-password`, `new-password`, `one-time-code`. B: every password field has one. |
 | 1.4.1 | Use of colour | Met | Links are underlined; a diff has `+` and `-`; a badge has words; an invalid field has a message as well as a border; a conflict says so. Manual (2.5). |
 | 1.4.2 | Audio control | Not applicable | No audio. |
-| 1.4.3 | Contrast (minimum) | Met | 4.5:1 for every pair of text and background in the light and the dark scheme. U: the colours are read from `app.css` and the ratio of 16 pairs in each scheme is computed. |
+| 1.4.3 | Contrast (minimum) | Met | 4.5:1 for every pair of text and background in the light and the dark scheme. U: the colours are read from `app.css` and the ratio of 28 pairs in each scheme is computed. |
 | 1.4.4 | Resize text | Met | Sizes are in `rem`; nothing has a fixed height. U: no font size in pixels. Manual (2.4). |
 | 1.4.5 | Images of text | Met | No text is drawn as an image. |
 | 1.4.10 | Reflow | Met | The page is laid out in 320 CSS pixels with nothing but a data table or a block of code reaching past the right edge (they scroll). B: the sign-in, the start page, the account, the zone list, a zone, the versions, the users and the audit log are measured in 320 px (the root element is given that width; Firefox will not make a window narrower than about 490 px). |
-| 1.4.11 | Non-text contrast | Met | 3:1 for the border of a field and a button, the focus ring, the frame of a secret, the selected tab. U: 12 pairs in each scheme. |
+| 1.4.11 | Non-text contrast | Met | 3:1 for the border of a field and a button, the focus ring, the frame of a secret, the selected tab, the current menu entry, the bar of a message. U: 20 pairs in each scheme. |
 | 1.4.12 | Text spacing | Met | No fixed heights or widths on text; long words wrap (`overflow-wrap: anywhere`). Manual (2.4). |
 | 1.4.13 | Content on hover or focus | Met | Nothing appears on hover or focus except the tooltips that the browser itself makes from `title` (the ISO time of a time, the absolute name of a name): the information is also in the text. |
 | 2.1.1 | Keyboard | Met | Everything is a real control. B: the scenarios "the keyboard alone signs in and signs out" and "a record set is added and previewed without the mouse". |
@@ -84,7 +84,7 @@ Do this once in Firefox and once in each of Chrome, Edge and Safari before a rel
 ### 2.3 Focus and colour
 
 1. The focus ring is visible on every kind of control: link, button, field, list, checkbox, the *details* arrow, a row button.
-2. Switch the system to the dark scheme and back: the page follows; text is readable; the ring and the borders of fields are visible.
+2. Switch the system to the dark scheme and back: the page follows; text is readable; the ring and the borders of fields are visible. Then choose *Light* and *Dark* under *Your account*, *Appearance* with the system in the other scheme: the page takes the choice at once and keeps it after a reload; *As the system* gives it back to the system.
 3. Windows *forced colors* / high contrast (Edge, Chrome, Firefox): borders and the focus ring stay visible.
 
 ### 2.4 Size and spacing

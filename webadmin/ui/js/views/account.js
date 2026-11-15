@@ -4,6 +4,7 @@
 import { h, link, fill } from '../dom.js';
 import { render, timeNode } from '../format.js';
 import { field, checkbox, select, message, problemNodes, busy, confirmButton, uid } from '../widgets.js';
+import { THEMES } from '../theme.js';
 
 const PASSWORD_MIN = 12;
 
@@ -283,6 +284,15 @@ function idleForm(ctx, shown) {
   return form;
 }
 
+function themeSection(ctx) {
+  const { i18n, theme } = ctx;
+  const t = i18n.t;
+  // (applied at once, which the hint says first: 3.2.2; kept in this browser only)
+  const sel = select({ label: t('account.theme'), options: THEMES.map((v) => ({ value: v, label: t(`account.theme-${v}`) })), value: theme.value, name: 'theme' });
+  sel.input.addEventListener('change', () => theme.set(sel.input.value));
+  return h('section', { class: 'card', 'aria-labelledby': 'acc-theme' }, h('h2', { id: 'acc-theme' }, t('account.theme-title')), sel.node, h('p', { class: 'hint' }, t('account.theme-hint')));
+}
+
 function sessionSection(ctx) {
   const { i18n, session } = ctx;
   const t = i18n.t;
@@ -324,7 +334,7 @@ export function accountView(ctx) {
   const oidcSlot = h('div');
   const pwSlot = h('div', null, passwordSection(ctx));
   const tokens = tokensSection(ctx);
-  fill(root, head, pwSlot, oidcSlot, totpSlot, tokens.node, languageSection(ctx), sessionSection(ctx));
+  fill(root, head, pwSlot, oidcSlot, totpSlot, tokens.node, languageSection(ctx), themeSection(ctx), sessionSection(ctx));
   // whether TOTP is on, whether there is a password and the identity the account is linked to are in the credentials of the principal itself
   api.get(`/principals/${p.id}`).then(async (r) => {
     if (r.credentials?.password === false) fill(pwSlot);                           // (nothing to change: the account signs in with an identity provider)
