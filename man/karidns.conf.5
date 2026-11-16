@@ -4695,36 +4695,41 @@ loader, a fetch) writes it to the store before it is registered; a zone the
 database deletes is deleted from the store. What was written survives \fBkill
 \-9\fR (a journal is replayed at the next start) and is durable against power
 loss after the next commit (the end of a batch, at the latest after 100 ms; a
-checkpoint every 30 s). A normal stop ends with a clean checkpoint: the next
-start reports a clean store and reads no journal; after \fBkill \-9\fR the
-journal is replayed (and after a power loss or crash of the host the derived
-tables are rebuilt, \fBkarictl store\fR says so). With the store on and a loader
-that offers it (0.7, the store protocol; docs/karidns-dbloader.md), the loader
-keeps no table of the zones: it lists them to the Backend (a pass) or says which
-changed (the change log from a cursor that the store keeps), the Backend makes a
-record for each zone at once (the name index is complete when the pass ends) and
-fetches the bodies in the background, a few at a time and after the queries; a
-query for a zone that has no body yet is read from the database and answered; a
-restart with the store transfers no zone, only the changes after the cursor
-arrive. A pass that lists fewer zones than the store holds deletes the zones it
-does not list (the sweep), \fBexcept\fR when that would be more than 20 percent
-of the view's zones and more than 1,000: the \fBmass-delete guard\fR deletes
-nothing then, keeps serving, logs \fBERROR\fR and shows it in \fBkarictl
-dbstatus\fR and \fBkarictl store\fR (\fBstore.recon.guard.*\fR); \fBkarictl
-reload \-force\fR is the operator's release (the pass it asks for deletes
-them). The hold survives a restart: the store then has no cursor for the view
-(it is made invalid when the guard holds), so the next start makes a pass again,
-finds the same, and holds again until the release. A pass in which an entry
-could not be recorded in the store (a full disk, an I/O error, no memory)
-deletes nothing and keeps no cursor either, and neither does a pass or a change
-whose delete the store could not make: the next pass (the next start, or
-\fBkarictl reload\fR) makes it good. Otherwise (no store, a loader without the
-feature) the loader sends every zone whole (no summaries: \fBmemory\-limit\fR
-governs the zones in memory, not the directory), and a zone of a first fill that
-does not fit under \fBmemory\-limit\fR is written to the store and not kept in
-memory. The settings of a zone (its allow-query, allow-transfer, ...) are kept
-by id in \fBsettings.dat\fR, so that a zone that is not in memory is answered
-and attached with the loader stopped. \fBThe loader's hot list is off with the
+checkpoint every 30 s). Commits and checkpoints are made by the store's flusher
+threads without the store's writer mutex, and a growth of the name index is
+built beside it: the flush of the tables at a checkpoint (seconds at millions of
+zones, more on ZFS) and the build of a bigger index do not hold up the threads
+that record zones (\fBstore.lock.*\fR, docs/karictl.md). A normal stop ends with
+a clean checkpoint: the next start reports a clean store and reads no journal;
+after \fBkill \-9\fR the journal is replayed (and after a power loss or crash of
+the host the derived tables are rebuilt, \fBkarictl store\fR says so). With the
+store on and a loader that offers it (0.7, the store protocol;
+docs/karidns-dbloader.md), the loader keeps no table of the zones: it lists them
+to the Backend (a pass) or says which changed (the change log from a cursor that
+the store keeps), the Backend makes a record for each zone at once (the name
+index is complete when the pass ends) and fetches the bodies in the background,
+a few at a time and after the queries; a query for a zone that has no body yet
+is read from the database and answered; a restart with the store transfers no
+zone, only the changes after the cursor arrive. A pass that lists fewer zones
+than the store holds deletes the zones it does not list (the sweep),
+\fBexcept\fR when that would be more than 20 percent of the view's zones and
+more than 1,000: the \fBmass-delete guard\fR deletes nothing then, keeps
+serving, logs \fBERROR\fR and shows it in \fBkarictl dbstatus\fR and \fBkarictl
+store\fR (\fBstore.recon.guard.*\fR); \fBkarictl reload \-force\fR is the
+operator's release (the pass it asks for deletes them). The hold survives a
+restart: the store then has no cursor for the view (it is made invalid when the
+guard holds), so the next start makes a pass again, finds the same, and holds
+again until the release. A pass in which an entry could not be recorded in the
+store (a full disk, an I/O error, no memory) deletes nothing and keeps no cursor
+either, and neither does a pass or a change whose delete the store could not
+make: the next pass (the next start, or \fBkarictl reload\fR) makes it
+good. Otherwise (no store, a loader without the feature) the loader sends every
+zone whole (no summaries: \fBmemory\-limit\fR governs the zones in memory, not
+the directory), and a zone of a first fill that does not fit under
+\fBmemory\-limit\fR is written to the store and not kept in memory. The settings
+of a zone (its allow-query, allow-transfer, ...) are kept by id in
+\fBsettings.dat\fR, so that a zone that is not in memory is answered and
+attached with the loader stopped. \fBThe loader's hot list is off with the
 store.\fR The Backend makes no hot list for the loader (\fBhot\-list\-size\fR
 and \fBhot\-list\-interval\fR have no effect) and sends it no \fBHOT_LIST\fR, so
 the loader's \fBloader\-state\-file\fR is not written any more. A state file

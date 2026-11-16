@@ -280,15 +280,33 @@ static pthread_mutex_t g_rec_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local unsigned t_rec_depth;
 static _Thread_local bool t_put_refuse;        /* the commit of this thread was refused (db_store_commit_begin()): the store takes no version from it */
 static _Atomic unsigned g_rec_waiters;         /* threads that found the mutex taken: the reconcile thread gives them a turn between its groups (db_recon_apply_n()) */
+/* 0.7 fix A: every hold and every wait of the mutex is timed (store.lock.records_*): a hold that waits for the disk shows here */
+static int64_t g_rec_t0;                       /* (g_rec_mu) when the holder took it */
+static _Atomic uint64_t g_rec_holds, g_rec_slow, g_rec_hold_max_us, g_rec_wait_max_us;
+static void rec_max(_Atomic uint64_t *m, uint64_t v) {
+  uint64_t c = atomic_load_explicit(m, memory_order_relaxed);
+  while (v > c && !atomic_compare_exchange_weak_explicit(m, &c, v, memory_order_relaxed, memory_order_relaxed)) {}
+}
 static void rec_lock(void) {
-  if (t_rec_depth++ == 0 && pthread_mutex_trylock(&g_rec_mu) != 0) {
+  if (t_rec_depth++ != 0) return;
+  if (pthread_mutex_trylock(&g_rec_mu) != 0) {
+    const int64_t w0 = mono_ns();
     atomic_fetch_add_explicit(&g_rec_waiters, 1, memory_order_relaxed);
     pthread_mutex_lock(&g_rec_mu);
     atomic_fetch_sub_explicit(&g_rec_waiters, 1, memory_order_relaxed);
+    g_rec_t0 = mono_ns();
+    rec_max(&g_rec_wait_max_us, (uint64_t)(g_rec_t0 - w0) / 1000u);
+    return;
   }
+  g_rec_t0 = mono_ns();
 }
 static void rec_unlock(void) {
-  if (--t_rec_depth == 0) pthread_mutex_unlock(&g_rec_mu);
+  if (--t_rec_depth != 0) return;
+  const uint64_t h = (uint64_t)(mono_ns() - g_rec_t0) / 1000u;
+  atomic_fetch_add_explicit(&g_rec_holds, 1, memory_order_relaxed);
+  if (h >= 1000) atomic_fetch_add_explicit(&g_rec_slow, 1, memory_order_relaxed);
+  rec_max(&g_rec_hold_max_us, h);
+  pthread_mutex_unlock(&g_rec_mu);
 }
 #ifdef KARIDNS_UNIT_TEST
 void (*db_store_test_commit_hook)(int where, const char *zone);
@@ -2775,6 +2793,10 @@ void db_recon_status(db_recon_status_t *out) {
       free(ss);
     }
   }
+  out->rec_holds = atomic_load_explicit(&g_rec_holds, memory_order_relaxed);
+  out->rec_holds_slow = atomic_load_explicit(&g_rec_slow, memory_order_relaxed);
+  out->rec_hold_max_us = atomic_load_explicit(&g_rec_hold_max_us, memory_order_relaxed);
+  out->rec_wait_max_us = atomic_load_explicit(&g_rec_wait_max_us, memory_order_relaxed);
   void (*fn)(db_recon_status_t *) = atomic_load_explicit(&g_recon_status_fn, memory_order_acquire);
   if (fn) fn(out);                                          /* (the reconcile thread's own figures) */
 }

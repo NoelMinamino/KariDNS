@@ -792,10 +792,34 @@ size at which a checkpoint is forced (100 MiB: a replay of that takes about a
 second)
 .TP 8
 \fBstore.checkpoint.count\fR, \fB.last_unix\fR, \fB.last_us\fR
-Checkpoints since the open, when the last one ended, how long it took
+Checkpoints since the open, when the last one ended, how long it took (the flush
+of the tables runs outside the store's writer mutex: writers go on meanwhile)
 .TP 8
 \fBstore.writes.commits\fR, \fB.puts\fR, \fB.replaces\fR, \fB.deletes\fR, \fB.growths\fR, \fB.errors\fR
-Writer counters since the open
+Writer counters since the open (\fBerrors\fR counts a commit or a checkpoint
+that failed in the background too; it is tried again)
+.TP 8
+\fBstore.writes.growths_background\fR
+Of \fBgrowths\fR: the index growths that were built outside the writer mutex (a
+growth is made inside it only when the index fills up to one half before the
+build ends)
+.TP 8
+\fBstore.flusher\fR
+1: the store's flusher threads make the commits (every 100 ms while records
+wait) and the checkpoints; 0: the writers make them after their call (no thread
+could be started)
+.TP 8
+\fBstore.lock.writer_holds\fR, \fB.writer_holds_slow\fR, \fB.writer_hold_max_us\fR
+Holds of the store's writer mutex since the open, those of 1 ms or more, and the
+longest one in microseconds. No store I/O wait is made inside it (0.7): a long
+hold means CPU work of one call (an nx pass, a repair, a growth inside the
+mutex)
+.TP 8
+\fBstore.lock.records_holds\fR, \fB.records_holds_slow\fR, \fB.records_hold_max_us\fR, \fB.records_wait_max_us\fR
+The mutex that orders the writers of the records (the reconcile, the commit of a
+body, a lookup's answer): holds since the start, those of 1 ms or more, the
+longest hold and the longest wait for it, in microseconds (the line is there
+when a loader is running)
 .TP 8
 \fBstore.recovery.created\fR, \fB.was_clean\fR, \fB.used_older_super\fR, \fB.rebuilt\fR, \fB.journals_read\fR, \fB.records_replayed\fR, \fB.journal_torn\fR, \fB.rebuilt_zones\fR, \fB.dropped_zones\fR, \fB.open_us\fR
 What the last open found and did, and how long it took
