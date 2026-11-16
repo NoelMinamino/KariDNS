@@ -54,7 +54,7 @@
 typedef enum { PARK_FREE = 0, PARK_WAIT, PARK_READY, PARK_TIMEOUT } park_state_t;
 typedef enum { PARK_UDP = 1, PARK_TCP = 2 } park_kind_t;
 /* what a parked entry still has to ask for (park_pending_set()): its request was refused by a full ring and the worker tries again */
-typedef enum { PARK_PEND_NONE = 0, PARK_PEND_ATTACH_ZID, PARK_PEND_ATTACH_NAME, PARK_PEND_FETCH } park_pend_t;
+typedef enum { PARK_PEND_NONE = 0, PARK_PEND_ATTACH_ZID, PARK_PEND_ATTACH_NAME, PARK_PEND_FETCH, PARK_PEND_LOOKUP } park_pend_t;   /* LOOKUP (0.7): the request of the by-name lookup of the entry's name (view, zone = the name) */
 
 typedef struct park_entry {
   uint8_t state;                     /* park_state_t */
@@ -98,6 +98,7 @@ typedef struct park_table {
   int64_t wcur_ms;                   /* every tick before this one has been looked at */
   uint32_t dhead, dtail;             /* entries that are READY or TIMEOUT, oldest first */
   uint32_t uhead, utail, nunsent;    /* entries whose request is pending */
+  uint32_t nlook;                    /* 0.7: the entries that carry the mark of a lookup (park_mark_lookup()), waiting or woken and not released yet (park_lookup_room()) */
   uint8_t *blk[2];                   /* payload blocks: 0 = PARK_BLK_SMALL bytes, 1 = the longest an entry can need */
   uint32_t *bfree[2];
   uint32_t bnfree[2], bsize[2];
@@ -366,14 +367,14 @@ int park_att_claim_tag(uint16_t sview, uint32_t zid, int w, uint64_t tag);
 uint32_t park_att_take_tag(uint16_t sview, uint32_t zid, uint64_t *tag);
 
 /* ---- 0.7: the by-name lookups of the first start (a query for a name that no zone of the store covers, while the first pass of a view has not listed every zone) ----
- * A query like that parks and asks the loader which zone encloses its name (FETCH_REQ mode KDB_FETCH_LOOKUP, dns_db_ingest.c).  The lookups in flight, from the request of the worker to the
- * end of the ingest thread's work on it, are counted in one number and bounded (PARK_LOOKUP_MAX): a flood of names that no zone has must neither fill the park tables nor take the fetch slots
- * and the loader's threads from the zones that queries wait for.  The worker takes a place before it makes the request and a query that does not get one is refused at once, as without the lookup;
- * the ingest thread gives the place back for every request it takes from a ring, whatever became of it. */
-#define PARK_LOOKUP_MAX 32
-bool park_lookup_take(void);
-void park_lookup_give(void);
-uint32_t park_lookup_used(void);
-void park_lookup_set_limit(uint32_t limit);       /* PARK_LOOKUP_MAX by default (tests) */
+ * A query like that parks and asks the loader which zone encloses its name (FETCH_REQ mode KDB_FETCH_LOOKUP or KDB_FETCH_LOOKUP_FULL, dns_db_ingest.c).  A lookup is a fetch of the class of the queries'
+ * fetches: the ingest thread gives it a place of fetch-concurrency as to the fetch of a zone, and a request that finds none waits in a queue of its own there until park-timeout (the fixed window of
+ * 32 lookups, with a refusal for the query that found it full, is gone).  A query is never refused for the lack of a place: when the worker cannot make the request now (its ring to the ingest
+ * thread is full) the entry stays parked, marked PARK_PEND_LOOKUP, and the worker asks again (park_ask_again(), as for the fetch of a zone).  What is bounded: the entries that wait for a lookup
+ * (three quarters of the park table at the most, park_lookup_room(): a flood of names that no zone has must not fill the table that the queries for zones need), the places the lookups of the ingest
+ * thread take (three quarters of fetch-concurrency), the queue there, and every wait by park-timeout. */
+bool park_lookup_room(const park_table_t *t);     /* may another entry be parked for a lookup? */
+void park_lookup_note_take_fail(void);            /* a worker could not make the request of a lookup now (its ring was full): the entry is pending */
+uint64_t park_lookup_take_fails(void);            /* ... how many times, all workers, since the start (a relaxed atomic) */
 
 #endif /* DNS_PARK_H */

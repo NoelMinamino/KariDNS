@@ -2411,6 +2411,7 @@ static void park_ask_again(park_table_t *pt, int widx) {
     }
     case PARK_PEND_ATTACH_NAME: ok = park_attach_request_any(park_entry_view(e), park_entry_zone(e)); break;
     case PARK_PEND_FETCH: ok = park_fetch_request(widx, park_entry_view(e), park_entry_zone(e), e->prio, KDB_FETCH_FULL); break;
+    case PARK_PEND_LOOKUP: ok = park_fetch_request(widx, park_entry_view(e), park_entry_zone(e), KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP); break;     /* (0.7: the lookup of the name the entry is parked for) */
     default: ok = true; break;
     }
     if (!ok) break;
@@ -2442,11 +2443,13 @@ static bool udp_park(udp_pass_t *w, const view_snapshot_t *view, const zref_t *p
 
 /* ---- 0.7: a query for a name that no zone of the store covers, while the first pass of the view has not listed every zone ----
  * Without this the query is refused as for any name the server does not serve, though the zone may be in the database further down the pass.  Now the worker parks it and asks the loader which zone of
- * the view encloses the name (a lookup: FETCH_REQ mode KDB_FETCH_LOOKUP, dns_db_ingest.c); the ingest thread records the zone it finds, wakes the query by the name, and the query is looked up again as
- * after any wake-up: with a zone it parks for it as for a zone that is out of memory, without one it is refused (the normal answer).  Only the first run of a query does this (a query that comes
- * back after a wake-up or a time-out is not parked again), only for a QUERY of the class IN, and only while the store has no complete list of the zones of the view and the loader answers lookups:
- * once the pass has ended an unknown name is refused at once, with no round trip.  At most PARK_LOOKUP_MAX lookups are out at one time (park_lookup_take()); a query that finds none free, or no room in the
- * ring or the table, is refused at once, as before.  The answer of the lookup (a wake by the name) or its failure makes the query run again, and with no zone for its name it is refused then.  A wake that is not the answer (the wake of every
+ * the view encloses the name (a lookup: FETCH_REQ mode KDB_FETCH_LOOKUP, or KDB_FETCH_LOOKUP_FULL with the body of the zone, dns_db_ingest.c); the ingest thread records the zone it finds, wakes the query by the name (the
+ * body installed, when it came with the answer), and the query is looked up again as after any wake-up: with a zone it parks for it as for a zone that is out of memory (or is answered from it), without one it is refused (the
+ * normal answer).  Only the first run of a query does this (a query that comes back after a wake-up or a time-out is not parked again), only for a QUERY of the class IN, and only while the store has no complete list of the zones
+ * of the view and the loader answers lookups: once the pass has ended an unknown name is refused at once, with no round trip.  A query is never refused for the lack of a place: the ingest thread gives a lookup a place
+ * of fetch-concurrency as to a fetch and keeps it in a queue until it has one, and a request that the worker cannot make now (its ring to the ingest thread is full) leaves the entry parked as pending (PARK_PEND_LOOKUP,
+ * park_ask_again()).  What is bounded is the share of the park table that the lookups may take (park_lookup_room(); a query that finds none is refused as without a lookup), the places and the queue of the ingest thread, and
+ * every wait by park-timeout.  The answer of the lookup (a wake by the name) or its failure makes the query run again, and with no zone for its name it is refused then.  A wake that is not the answer (the wake of every
  * query after a wake ring that overflowed: park_wake_all()) leaves the mark of the entry (park_mark_lookup()), and the query is parked again for the lookup, with its first deadline, and the request is made again
  * (the ingest thread joins a lookup of the same name that is on its way): a zone that exists is never refused for a wake that said nothing.  A lookup that nobody answers ends with park-timeout and the same answer. */
 _Atomic bool dns_core_test_lookup_force;                /* tests (test_park_worker.c, in every build: the coverage of the test programs and of karidns merges): the store says the first pass of the view is going on and the loader does lookups */
@@ -2471,31 +2474,33 @@ static bool lookup_name(const char *qname, uint16_t qtype, char *out, size_t cap
   return r != 0 && r < cap && !(r == 1 && out[0] == '.');
 }
 
-/* the request of a lookup, from the worker's ring: true when one is out, or this worker has one out for the name already (the query joins it).  again: the query was woken without the answer and is
- * parked again: the wait goes on whether or not a new request could be made (the first one may still be on its way, and the park deadline ends the wait either way) */
-static bool lookup_request(park_table_t *pt, int widx, const char *view, const char *lname, bool again) {
-  if (park_has_wait(pt, view, lname)) return true;
-  if (!park_lookup_take()) return again;
-  if (!park_fetch_request(widx, view, lname, KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP)) {
-    park_lookup_give();
-    return again;
+/* the entry pi (just parked, for the lookup of its name) is marked and its request made: from this worker's ring to the ingest thread.  joined: another entry of this worker waits for the name already, and its request
+ * is out (or pending: it passes to this entry if that one goes first, park_release()), so this one only waits.  A ring that is full leaves the entry pending: the worker asks again (park_ask_again()), the query is
+ * not refused */
+static void lookup_ask(park_table_t *pt, int widx, int32_t pi, bool joined) {
+  park_mark_lookup(pt, pi);
+  if (joined) return;
+  park_entry_t *e = &pt->e[pi];
+  if (!park_fetch_request(widx, park_entry_view(e), park_entry_zone(e), KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP)) {
+    park_lookup_note_take_fail();
+    park_pending_set(pt, e, PARK_PEND_LOOKUP, 0, KDB_FETCH_PRIO_QUERY);
   }
-  return true;
 }
 
 /* Park the UDP request for a lookup of its name.  true: parked (the caller answers nothing now).  false: not parked: the normal answer follows */
 static bool udp_park_lookup(udp_pass_t *w, const view_snapshot_t *view, const char *qname, uint16_t qtype, const udp_ipc_t *ipc, const uint8_t *req, size_t len) {
   char lname[DNS_NAME_TEXT_SIZE];
-  if (!w->park || !view->name || w->park_timeout_ms == 0 || !lookup_name(qname, qtype, lname, sizeof(lname))) return false;
+  if (!w->park || !view->name || w->park_timeout_ms == 0 || !lookup_name(qname, qtype, lname, sizeof(lname)) || !park_lookup_room(w->park)) return false;
   const int64_t now = park_now_ms();
   const int64_t left = w->woken ? w->woken_deadline_ms - now : (int64_t)w->park_timeout_ms;      /* (a query that is parked again keeps its first deadline) */
-  if (left <= 0 || !lookup_request(w->park, w->worker_idx, view->name, lname, w->woken)) return false;
-  /* (the request is out before the entry is made: this thread is the one that takes the wake-up, and does so after this request; a table that is full leaves a lookup that nobody waits for, which still records the zone) */
+  if (left <= 0) return false;
+  const bool joined = park_has_wait(w->park, view->name, lname);
   const int32_t pi = park_udp(w->park, now, (uint32_t)left, view->name, lname, w->active_fd, ipc, req, len);
   if (pi < 0) return false;
-  park_mark_lookup(w->park, pi);
+  lookup_ask(w->park, w->worker_idx, pi, joined);
   return true;
 }
+
 
 /* One request of the UDP loop of the worker, from the question to the answer in the batch of datagrams to send (or the park table: a zone that
  * is in the directory without its data parks the query).  The first pass and the second one, after a wake-up or a time-out, are the same
@@ -3649,10 +3654,11 @@ process_tcp_client: ;
               const int64_t left = again ? ctx_tcp->park_deadline_ms - pnow : (int64_t)park_timeout_ms;
               uint32_t cidx = (uint32_t)(ctx_tcp - g_tcp_pool);
               ctx_tcp->lookup_respark = false;
-              if (left > 0 && route.view->name && park_timeout_ms != 0 && lookup_name(qname, qtype, lname, sizeof(lname)) && lookup_request(&park, ctx->thread_id, route.view->name, lname, again)) {
+              if (left > 0 && route.view->name && park_timeout_ms != 0 && lookup_name(qname, qtype, lname, sizeof(lname)) && park_lookup_room(&park)) {
+                const bool joined = park_has_wait(&park, route.view->name, lname);
                 int32_t pi = park_tcp(&park, pnow, (uint32_t)left, route.view->name, lname, client_fd, cidx, ctx_tcp->gen);
                 if (pi >= 0) {
-                  park_mark_lookup(&park, pi);
+                  lookup_ask(&park, ctx->thread_id, pi, joined);
                   ctx_tcp->park_deadline_ms = pnow + left;
                   ctx_tcp->park_idx = pi;
                   ctx_tcp->park_gen = park.e[pi].gen;

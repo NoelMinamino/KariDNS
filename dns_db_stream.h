@@ -42,7 +42,7 @@
  *
  * loader -> Backend
  *   HELLO (1)         1 proto_version u16 R (=1) | 2 loader_version str<=64 R | 3 driver str<=32 R | 4 pid u32 R |
- *                     5 features u32 O (0.7 WP7a: bit0 KDB_FEAT_STORE: the loader speaks the store protocol below; absent = 0)
+ *                     5 features u32 O (0.7 WP7a: bit0 KDB_FEAT_STORE: the loader speaks the store protocol below; bit1 KDB_FEAT_LOOKUP: it answers FETCH_REQ mode 2; bit2 KDB_FEAT_LOOKUP_BODY: it answers mode 3; absent = 0)
  *   INVENTORY_REQ (2) no tags (empty body)
  *   BATCH_BEGIN (3)   1 batch_id u64 R | 2 kind u8 R (0 startup,1 full,2 diff,3 zone,4 auto) | 3 change_seq u64 R |
  *                     4 request_id u64 O (B6a: the batch answers that RELOAD_REQ; absent or 0 = not an answer)
@@ -124,6 +124,10 @@
  *                     5 name name R (the zone: canonical, the entry of a MANIFEST) | 6 kind u8 R (KDB_ZK_*) | 7 stamp_gen u64 R | 8 stamp_time u64 R | 9 flags u8 O (bit0 KDB_EF_STAMPED) |
  *                     10 serial u32 O (a plain schema).  With found = 0 none of 4..10.  The Backend records the zone as a MANIFEST entry would (a KNOWN record, its body is read when a
  *                     query asks for it); the entry is a claim of an untrusted loader: its name must enclose the name that was asked for.
+ *                     Mode 3 (KDB_FETCH_LOOKUP_FULL): with found = 1 the LOOKUP_RESULT is followed, on the same stream and with the same request id, by that zone's body, ZONE_BEGIN ..
+ *                     ZONE_DATA .. ZONE_END (or ZONE_FAILED, or ZONE_ABORT), as the answer to a FETCH_REQ mode 0 for the zone would be; with found = 0 nothing follows.  From the Backend's
+ *                     side the request becomes a fetch of the zone with the same id: the body must be the zone the result named (the name and the source id), at most one body comes
+ *                     for a request, and a body that comes without a result, for another zone, or for a mode 2 request is discarded.
  * Backend -> loader (type | 0x8000)
  *   CONFIG (0x8001)   1 generation u64 R | 2 driver str ne <=32 R | 3 server_id str<=64 O |
  *                     4 VIEW nested, repeatable (<= 1024):
@@ -155,7 +159,7 @@
  *   BATCH_RESULT (0x8006) 1 batch_id u64 R | 2 request_ids bytes O (n * u64, <= 2048 bytes) | 3 n_applied u32 R |
  *                     4 n_unchanged u32 R | 5 n_rejected u32 R | 6 n_deleted u32 R
  *   FETCH_REQ (0x8007) D1a, fetch stream only: 1 request_id u64 R (> 0) | 2 view view R | 3 zone name R (mode 2: a query name) |
- *                     4 priority u8 R (0 a query waits for it, 1 warm-up, 2 background) | 5 mode u8 R (0 the zone, 1 its summary, 2 lookup) |
+ *                     4 priority u8 R (0 a query waits for it, 1 warm-up, 2 background) | 5 mode u8 R (0 the zone, 1 its summary, 2 lookup, 3 lookup and body) |
  *                     6 range_lo name O | 7 range_hi name O (D1b: both or none; a loader that does not read ranges answers ZONE_FAILED) |
  *                     8 source_id i64 O (0.7 WP7a: the domains.id the Backend holds for the zone (a KNOWN zone of the store protocol); a loader that finds the name with
  *                         another id answers ZONE_FAILED: the zone was renamed or created again, and CHANGES says so)
@@ -163,6 +167,10 @@
  *                     query asks for a name it does not know.  Tag 3 is the query name; the loader finds the zone of the view that encloses it (the name and its parent names, the
  *                     longest one that the view serves and the loader can send; the root is not looked for) and answers LOOKUP_RESULT, or ZONE_FAILED (a database error).  Tags 6, 7
  *                     and 8 are not used with it.
+ *                     0.7, mode 3 (KDB_FETCH_LOOKUP_FULL; only to a loader whose HELLO features have KDB_FEAT_LOOKUP_BODY, 0x4): a lookup as mode 2, and when a zone is found the loader sends
+ *                     its body after the LOOKUP_RESULT, with the same request id (LOOKUP_RESULT in the answer, then ZONE_BEGIN .. ZONE_END of the zone the result named: one round trip for
+ *                     a zone that the Backend did not know).  When the body cannot be read the loader answers ZONE_FAILED with the request id and the name of the zone.  A loader serves it
+ *                     ahead of the bodies of the background fill (the priority of the request is 0).  Tags 6, 7 and 8 are not used.
  *   HOT_LIST (0x8008) D1a step 7 (design 8.4), first stream only: the zones most asked for, hottest first, in parts as WARM_LIST (tags 1..4 the same;
  *                     5 limit u32 O: the most entries the loader keeps in its state file, <= KDB_HOT_MAX, absent = KDB_HOT_MAX).  Several parts carry
  *                     one list_id; a part that does not follow the one before (or a new list_id) starts the list again.  The loader merges the list
@@ -190,6 +198,7 @@
 #define KDB_REASON_LEN 128
 #define KDB_FEAT_STORE 0x1u          /* HELLO features: the store protocol (MANIFEST / CHANGES) */
 #define KDB_FEAT_LOOKUP 0x2u         /* HELLO features: the loader answers FETCH_REQ mode KDB_FETCH_LOOKUP with LOOKUP_RESULT (the zone that encloses a name, 0.7 first start) */
+#define KDB_FEAT_LOOKUP_BODY 0x4u    /* HELLO features: the loader answers FETCH_REQ mode KDB_FETCH_LOOKUP_FULL with LOOKUP_RESULT and, when it found a zone, the body of that zone (0.7 first start) */
 #define KDB_MF_VERIFY 0x1u           /* MANIFEST_BEGIN flags: a verify pass (entries carry digests; reserved) */
 #define KDB_MF_PLAIN 0x2u            /* ... a plain PowerDNS schema: no stamps, serials */
 #define KDB_EF_STAMPED 0x1u          /* MANIFEST / CHANGES entry flags: the stamp (generation, changed_at) is real */
@@ -227,7 +236,7 @@ enum {
 };
 
 enum { KDB_FETCH_PRIO_QUERY = 0, KDB_FETCH_PRIO_WARM, KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_PRIO_N };
-enum { KDB_FETCH_FULL = 0, KDB_FETCH_SUMMARY, KDB_FETCH_LOOKUP };      /* LOOKUP (0.7): tag 3 is a query name, not a zone: which zone of the view encloses it? */
+enum { KDB_FETCH_FULL = 0, KDB_FETCH_SUMMARY, KDB_FETCH_LOOKUP, KDB_FETCH_LOOKUP_FULL };      /* LOOKUP (0.7): tag 3 is a query name, not a zone: which zone of the view encloses it?  LOOKUP_FULL: the same, and the body of the zone that is found follows the answer */
 
 enum { KDB_BATCH_STARTUP = 0, KDB_BATCH_FULL, KDB_BATCH_DIFF, KDB_BATCH_ZONE, KDB_BATCH_AUTO };
 enum { KDB_ZK_PRIMARY = 0, KDB_ZK_SECONDARY, KDB_ZK_CATALOG };

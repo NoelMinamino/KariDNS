@@ -42,6 +42,7 @@
 #include "dns_park.h"
 #include "dns_server_internal.h"
 #include "dns_snapshot_rcu.h"
+#include "dns_store_status.h"
 
 _Static_assert(KARIDNS_DB_MAX_VIEWS == KDB_MAX_CONFIG_VIEWS, "the configuration check and the CONFIG message must agree");
 _Static_assert(KARIDNS_DB_CONFIG_BODY_MAX == KDB_MAX_BODY, "the configuration check and the CONFIG message must agree on the body limit");
@@ -70,6 +71,7 @@ _Static_assert(ZDIR_APEX_GLUE_PER_NS == KDB_NOTIFY_ADDR_PER_NS && ZDIR_APEX_NADD
 #define ING_FLUSH_AT 16384        /* queued bytes that are written at once; the rest goes out after the event round */
 #define ING_FETCH_MAX 256         /* fetches in flight (D1a): more is refused, the queries then wait for their own deadline */
 #define ING_WQ_MAX 8192           /* 0.7 P-B: requests of queries that wait for a place, a token or room ("the wait queue"); the park tables bound the queries behind them, and a request is made once per zone */
+#define ING_LQ_MAX 16384          /* 0.7: lookups that wait for a place ("the lookup queue"); a request that finds it full is dropped and counted (true overload: the queries behind it time out) */
 #define ING_WQ_TICK_MS 10         /* ... and how often the thread looks again while some wait: the bucket, a new attempt to make room, their deadlines */
 #define ING_WARM_NFREQ 8          /* fetches in flight below which the zones nobody asked for yet (pins) are read */
 #define ING_SUMMARY_NFREQ 8       /* summary fetches (the apex of a zone out of memory, after a reload) in flight: they bring no zone data, so memory-limit does not hold them back, this does */
@@ -129,6 +131,7 @@ typedef struct ing_job {
   uint32_t t_refresh, t_retry, t_expire;
   zdir_apex_t *apex;                     /* D1a step 6: the apex of a summary that is kept (see apex_from_begin()); the job owns it until dbreg_set_apex() takes it */
   bool no_apex;                          /* ... the summary came without apex tags: the loader cannot give one for this version */
+  bool lk_skip;                          /* 0.7: the body of a lookup that is not wanted (LKS_SKIP): thrown away, and the request ends with it */
   bool iv_valid;                         /* a fetch of the whole zone: the version the directory had when the request was made (the zone is not installed if it has another by now) */
   int64_t iv_sid;
   uint32_t iv_serial;
@@ -137,6 +140,10 @@ typedef struct ing_job {
 } ing_job_t;
 
 /* a fetch in flight: sent to the loader on the fetch stream, not answered yet */
+/* the stage of a lookup (ing_freq_t.lkst): the answer is not here yet; the zone was found and its body is on its way (the request is a fetch of the zone now); the zone was found, its body is not wanted (the zone is
+ * in memory or being fetched by another request already): it is read through and thrown away */
+enum { LKS_ASK = 0, LKS_BODY, LKS_SKIP };
+
 typedef struct {
   bool active;
   uint64_t id;
@@ -158,6 +165,15 @@ typedef struct {
   bool nonstore;                         /* ... a secondary or catalog zone (it has a record that only remembers it) */
   bool loader_failed;                    /* the loader answered ZONE_FAILED (not "busy"): the zone is marked refused until its stamp changes */
   bool reqfetch;                         /* the fetch of the zone a `karictl reload <zone>` asks for: the answer of the request waits for it */
+  /* 0.7, a lookup of a name (FETCH_REQ mode KDB_FETCH_LOOKUP, or LOOKUP_FULL: the body of the zone that is found follows the answer, with the same request id).  `zone` is the name asked for until the answer; a request whose answer has a zone
+   * that comes with its body (lkst LKS_BODY) is a fetch of that zone from then on (mode FULL, `zone` the zone), and lk_q is the name the queries wait for (they are woken by it too) */
+  uint8_t lk;                            /* the request was made for a lookup: it counts in the lookups in flight (g->nlook) until it is over, and holds the claim mark of the name (ckey) */
+  uint8_t lkst;                          /* LKS_*: where the lookup stands */
+  bool body_seen;                        /* (lk only) the body of the zone has come: no second one is read for this request */
+  uint64_t ckey;                         /* park_claim_key() of (view, lk_q) */
+  int64_t lk_t0;                         /* CLOCK_MONOTONIC in ns when the lookup was sent (the time to the answer) */
+  int64_t lk_sid;                        /* the source id the answer named: the body must be that zone */
+  char lk_q[DNS_NAME_TEXT_SIZE];
   uint32_t bzid;
   int64_t sent_ms;
   char view_name[KARIDNS_VIEW_NAME_MAX];
@@ -326,6 +342,12 @@ typedef struct {
   uint32_t wq_head, nwq;
   uint32_t nwq_room;                     /* ... of them, the entries that have been held up by room (the zones in memory above the hard line) */
   int64_t room_next_ms;                  /* no attempt to make room before this time (the last one did not make it) */
+  /* 0.7, the lookups of the first start: a request of a worker for the zone that encloses a name (a lookup) takes a place of fetch-concurrency like the fetch of a query and waits here until it has one (oldest first;
+   * its deadline is park-timeout from when the thread took it).  A lookup that is out (in flight, or its body on its way) counts in nlook, which is bounded to a share of the places so that a flood of names that no zone has leaves
+   * the rest to the fetches of zones.  lq_turn: the queue and the wait queue take turns when both could make a request. */
+  struct ing_lq { park_fetch_req_t q; uint64_t key; int64_t deadline_ms; } *lq;     /* (ING_LQ_MAX entries, allocated at the start) */
+  uint32_t lq_head, nlq, nlook;
+  bool lq_turn;
 } ing_t;
 
 enum { ROUT_NONE = 0, ROUT_APPLIED, ROUT_SHADOWED, ROUT_REJECTED, ROUT_FAILED, ROUT_DELETED };
@@ -1512,7 +1534,33 @@ static _Atomic uint32_t g_ing_busy_pct;                    /* share of the last 
 /* 0.7, the by-name lookups of the first start (FETCH_REQ mode KDB_FETCH_LOOKUP): the loader answers them (HELLO features, the store protocol on), and what became of them */
 static _Atomic bool g_lookup_on;
 static _Atomic uint64_t g_lk_found, g_lk_none, g_lk_failed, g_lk_refused, g_lk_dup;
+static _Atomic uint64_t g_lk_asked, g_lk_body, g_lk_covered, g_lk_shed, g_lk_expired, g_lk_bad, g_lk_max_ns;     /* requests of the workers taken; bodies that came with the answer and were taken; names whose zone was known by the time they were to go; requests dropped because the queue was full; queue entries whose time was up; bodies that were thrown away; the longest time to an answer */
+static _Atomic uint32_t g_lk_pending, g_lk_inflight, g_lk_peak;      /* waiting for a place now, out now (the lookups and the fetches that came of them), the most that waited */
+static _Atomic uint64_t g_lk_hist[STORE_STATUS_HIST_BUCKETS];       /* the time from the request to the answer: <= 1 us, <= 2 us, ... (dns_store_status.h) */
 bool db_ingest_lookup_ready(void) { return atomic_load_explicit(&g_lookup_on, memory_order_acquire); }
+/* the counters of the lookups for `karictl store` and dbstatus (dns_store_status.h): relaxed atomics that the ingest thread and the workers write, any thread reads */
+bool db_ingest_lookup_stats(store_lookup_t *out) {
+  memset(out, 0, sizeof(*out));
+  out->ready = db_ingest_lookup_ready();
+  out->asked = atomic_load_explicit(&g_lk_asked, memory_order_relaxed);
+  out->found = atomic_load_explicit(&g_lk_found, memory_order_relaxed);
+  out->none = atomic_load_explicit(&g_lk_none, memory_order_relaxed);
+  out->failed = atomic_load_explicit(&g_lk_failed, memory_order_relaxed);
+  out->refused = atomic_load_explicit(&g_lk_refused, memory_order_relaxed);
+  out->same_name = atomic_load_explicit(&g_lk_dup, memory_order_relaxed);
+  out->covered = atomic_load_explicit(&g_lk_covered, memory_order_relaxed);
+  out->shed = atomic_load_explicit(&g_lk_shed, memory_order_relaxed);
+  out->expired = atomic_load_explicit(&g_lk_expired, memory_order_relaxed);
+  out->body_inline = atomic_load_explicit(&g_lk_body, memory_order_relaxed);
+  out->bad_body = atomic_load_explicit(&g_lk_bad, memory_order_relaxed);
+  out->pending = atomic_load_explicit(&g_lk_pending, memory_order_relaxed);
+  out->in_flight = atomic_load_explicit(&g_lk_inflight, memory_order_relaxed);
+  out->peak = atomic_load_explicit(&g_lk_peak, memory_order_relaxed);
+  out->take_fail = park_lookup_take_fails();
+  out->max_ns = atomic_load_explicit(&g_lk_max_ns, memory_order_relaxed);
+  for (int i = 0; i < STORE_STATUS_HIST_BUCKETS; i++) out->hist[i] = atomic_load_explicit(&g_lk_hist[i], memory_order_relaxed);
+  return true;
+}
 #define ING_BUSY_WINDOW_NS 10000000000LL
 static _Atomic bool g_ma_event;                            /* 0.7 P-F: a start or a full load ended: the cache thread says what the database needs in memory (ma_tick()) */
 static void fq_hist_add(int64_t ms) {
@@ -3393,12 +3441,20 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why);
  * parks it and asks for a lookup (FETCH_REQ mode KDB_FETCH_LOOKUP on the fetch stream, which a pass on the first stream does not hold up).  The loader finds the zone of the view that encloses the name
  * (the longest one) and answers LOOKUP_RESULT; a zone it found is recorded as a MANIFEST entry would (a KNOWN record), and the queries that wait for the name are woken (as for the fetch of a zone:
  * park_wake_queue_all()) and look the name up again: with a record they park for the zone and are answered from it, without they are refused as before.  Whatever becomes of the lookup the queries are
- * woken, not failed.  The workers took a place of the lookups in flight before they made the request (park_lookup_take(), at most PARK_LOOKUP_MAX); every request taken from a ring gives it back here, once.
- * A lookup takes a slot of the table of the fetches and counts in nfreq (it is a request on the stream), and none of the places or tokens of the fetches of zones. */
+ * woken, not failed.
+ * Mode KDB_FETCH_LOOKUP_FULL (a loader whose HELLO has KDB_FEAT_LOOKUP_BODY; not with a fetch-rate, which counts the zones read for queries, and not above the hard line of memory-limit, which holds the fetches back
+ * for room): the loader sends the body of the zone it found after the answer, with the same request id, and the request becomes the fetch of that zone (mode FULL, the same id, the same place): the zone is
+ * answerable after one round trip, not two.  The body is a claim of an untrusted loader like the answer: it must be the zone the answer named (the name and the source id), once, after the answer
+ * (on_fetch_begin()); the stamp check at the commit is the fetch's (the record the answer made is the stamp the body is asked for).  A zone that another request has in flight or that is in memory already
+ * (dbreg_fetch_begin() does not start it) has its body read through and thrown away (LKS_SKIP): the loader cannot be told not to send it.
+ * A lookup is a fetch of the class of the queries': it takes a place of fetch-concurrency (park_place_take()) like a fetch, and a request that finds none, or whose share is used up, waits in a queue of its own
+ * (lq) until park-timeout; the workers' requests are never refused for the lack of a place.  The lookups out (in flight, and their bodies) are at most three quarters of the places (lk_share()), so that a
+ * flood of names that no zone has leaves the rest to the fetches of zones, and a place is given back the moment the answer is "none".  The queue and the wait queue of the fetches take turns when both could make a
+ * request.  A name that is asked for twice at once is one request (the claim mark of the name, and lookup_find()); one whose zone has become known meanwhile is not asked for (lookup_covered()). */
 static ing_freq_t *lookup_find(ing_t *g, uint16_t view, const char *name) {
-  if (g->nfreq == 0) return NULL;
+  if (g->nfreq == 0 || g->nlook == 0) return NULL;
   for (uint32_t i = 0; i < ING_FETCH_MAX; i++)
-    if (g->freq[i].active && g->freq[i].mode == KDB_FETCH_LOOKUP && g->freq[i].view == view && domain_names_match_ci(g->freq[i].zone, name)) return &g->freq[i];
+    if (g->freq[i].active && g->freq[i].lk && g->freq[i].lkst == LKS_ASK && g->freq[i].view == view && domain_names_match_ci(g->freq[i].lk_q, name)) return &g->freq[i];
   return NULL;
 }
 
@@ -3412,35 +3468,79 @@ static bool lookup_name_ok(const char *name) {
   return dns_name_normalize(name, out, sizeof(out)) == n && memcmp(name, out, n) == 0 && dns_name_len_no_root(name, n) != n;
 }
 
-static void lookup_complete(const ing_freq_t *done, bool ok, const char *why) {
-  park_lookup_give();
-  if (!ok) {
-    atomic_fetch_add_explicit(&g_lk_failed, 1, memory_order_relaxed);
-    logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] lookup of the name '%s' (view '%s') failed: %s", done->zone, done->view_name, why && why[0] ? why : "no reason given");
-  }
-  park_wake_queue_all(done->view_name, done->zone, false);
+/* the places that the lookups out (and the bodies that came with them) may take: three quarters of fetch-concurrency, at least one */
+static uint32_t lk_share(void) {
+  const uint32_t conc = atomic_load_explicit(&g_fetch_conc, memory_order_relaxed);
+  const uint32_t s = conc - conc / 4;
+  return s ? s : 1;
 }
 
-/* a request of a worker (mode KDB_FETCH_LOOKUP) taken from a ring: vi is the loader's index of its view (-1: none) */
-static void lookup_issue(ing_t *g, const park_fetch_req_t *q, int vi) {
-  if (vi < 0 || g->fetch_fd < 0 || !atomic_load_explicit(&g_lookup_on, memory_order_acquire) || !lookup_name_ok(q->zone)) {      /* (the worker did not know: it asked, and is woken as for the end of a lookup) */
-    atomic_fetch_add_explicit(&g_lk_refused, 1, memory_order_relaxed);
-    park_lookup_give();
-    park_wake_queue_all(q->view, q->zone, false);
-    return;
+/* can a lookup be made now?  A stream, a free slot of the table, its share, and a place that is not the fill's share (as for the request of a query, qplace_ok()) */
+static bool lookup_ready(const ing_t *g) {
+  return g->fetch_fd >= 0 && g->nfreq < ING_FETCH_MAX && g->nlook < lk_share() && park_place_avail() && qplace_ok(g);
+}
+
+/* the mode of the request: with the body of the zone when the loader sends it, there is no fetch-rate to keep (it counts the zones read for queries) and the zones in memory are below the hard line */
+static uint8_t lookup_mode(const ing_t *g) {
+  if ((g->loader_feat & KDB_FEAT_LOOKUP_BODY) && atomic_load_explicit(&g_fetch_rate, memory_order_relaxed) == 0 && !dbreg_cache_over_limit()) return KDB_FETCH_LOOKUP_FULL;
+  return KDB_FETCH_LOOKUP;
+}
+
+/* does the store have a zone that encloses the name already (an earlier lookup found it, or the pass listed it)?  Then there is nothing to look for: the queries look the name up again */
+static bool lookup_covered(const char *view, const char *name) {
+  const dbdir_ops_t *ops = dbdir();
+  dbdir_rec_t rec;
+  if (!ops) return false;
+  for (const char *p = name; *p && !(p[0] == '.' && p[1] == '\0');) {
+    if (ops->rec_get(view, p, &rec)) return true;
+    const char *dot = strchr_unescaped(p, '.');
+    if (!dot) break;
+    p = dot + 1;
   }
-  if (lookup_find(g, (uint16_t)vi, q->zone)) {           /* the same name is on its way: its answer wakes every worker */
-    atomic_fetch_add_explicit(&g_lk_dup, 1, memory_order_relaxed);
-    park_lookup_give();
+  return false;
+}
+
+static void lookup_hist(int64_t ns) {
+  const uint64_t us = ns <= 0 ? 0 : ((uint64_t)ns + 999) / 1000;
+  int b = 0;
+  while (b < STORE_STATUS_HIST_BUCKETS - 1 && ((uint64_t)1 << b) < us) b++;
+  atomic_fetch_add_explicit(&g_lk_hist[b], 1, memory_order_relaxed);
+  if (ns > 0 && (uint64_t)ns > atomic_load_explicit(&g_lk_max_ns, memory_order_relaxed)) atomic_store_explicit(&g_lk_max_ns, (uint64_t)ns, memory_order_relaxed);
+}
+
+/* the lookup's own end (the answer is none, it failed, it was read through): the queries that wait for the name look it up again.  The place and the claim mark went back in fetch_complete(). */
+static void lookup_complete(const ing_freq_t *done, bool ok, const char *why) {
+  if (!ok) {
+    atomic_fetch_add_explicit(&g_lk_failed, 1, memory_order_relaxed);
+    logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] lookup of the name '%s' (view '%s') failed: %s", done->lk_q, done->view_name, why && why[0] ? why : "no reason given");
+  }
+  park_wake_queue_all(done->view_name, done->lk_q, false);
+}
+
+/* a request that ends before it was made (a loader that does not look up, a view that takes no database zones, a zone that is known already, a name that waited too long): its claim mark goes and the queries look the name up again */
+static void lookup_drop(const park_fetch_req_t *q, uint64_t ckey) {
+  if (ckey) park_claim_clear(ckey);
+  park_wake_queue_all(q->view, q->zone, false);
+}
+
+static void lookup_note(const ing_t *g) {
+  atomic_store_explicit(&g_lk_pending, g->nlq, memory_order_relaxed);
+  atomic_store_explicit(&g_lk_inflight, g->nlook, memory_order_relaxed);
+}
+
+/* the request of a lookup, made: a place, a slot, FETCH_REQ.  The caller has seen lookup_ready().  vi: the loader's index of the view; ckey: the claim mark of the name */
+static void lookup_start(ing_t *g, const park_fetch_req_t *q, int vi, uint64_t ckey) {
+  if (lookup_covered(q->view, q->zone)) {
+    atomic_fetch_add_explicit(&g_lk_covered, 1, memory_order_relaxed);
+    lookup_drop(q, ckey);
     return;
   }
   ing_freq_t *r = NULL;
   for (uint32_t i = 0; i < ING_FETCH_MAX && !r; i++)
     if (!g->freq[i].active) r = &g->freq[i];
-  if (!r) {                                              /* every slot is taken */
+  if (!r || !park_place_take()) {                        /* (lookup_ready() said there was room, and no other thread takes places: not here) */
     atomic_fetch_add_explicit(&g_lk_refused, 1, memory_order_relaxed);
-    park_lookup_give();
-    park_wake_queue_all(q->view, q->zone, false);
+    lookup_drop(q, ckey);
     return;
   }
   memset(r, 0, sizeof(*r));
@@ -3448,14 +3548,95 @@ static void lookup_issue(ing_t *g, const park_fetch_req_t *q, int vi) {
   r->id = ++g->fseq;
   r->view = (uint16_t)vi;
   r->prio = KDB_FETCH_PRIO_QUERY;
-  r->mode = KDB_FETCH_LOOKUP;
+  r->mode = lookup_mode(g);
+  r->lk = 1;
+  r->lkst = LKS_ASK;
+  r->placed = true;                                      /* (the place stays with the request: the lookup, and the fetch of the zone that comes of it) */
+  r->ckey = ckey;
   r->sent_ms = now_ms();
+  r->lk_t0 = mono_ns();
   snprintf(r->view_name, sizeof(r->view_name), "%s", g->view_names[vi]);
   snprintf(r->zone, sizeof(r->zone), "%s", q->zone);
+  snprintf(r->lk_q, sizeof(r->lk_q), "%s", q->zone);
   g->nfreq++;
+  g->nlook++;
   atomic_store_explicit(&g_fq_inflight, g->nfreq, memory_order_relaxed);
-  logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] lookup %llu: the zone of the name '%s' (view '%s')", (unsigned long long)r->id, r->zone, r->view_name);
+  lookup_note(g);
+  logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] lookup %llu: the zone of the name '%s' (view '%s')%s", (unsigned long long)r->id, r->zone, r->view_name, r->mode == KDB_FETCH_LOOKUP_FULL ? ", with its body" : "");
   if (!fetch_send_req(g, r)) fetch_complete(g, r, false, "the loader's fetch stream is not connected");
+}
+
+/* the index of a view that takes zones from the database (the loader's numbering), -1 none */
+static int view_db_index(const ing_t *g, const char *name) {
+  for (uint32_t i = 0; i < g->nview_names; i++)
+    if (g->view_db && g->view_db[i] && strcasecmp(g->view_names[i], name) == 0) return (int)i;
+  return -1;
+}
+
+/* the head of the queue goes, if it can: false when nothing waits or nothing can be made now.  The ones whose time is up are dropped before (lq_expire(): their queries have timed out). */
+static bool lq_pump_one(ing_t *g) {
+  while (g->nlq > 0) {
+    if (!lookup_ready(g)) return false;
+    struct ing_lq e = g->lq[g->lq_head];
+    g->lq_head = (g->lq_head + 1) % ING_LQ_MAX;
+    g->nlq--;
+    lookup_note(g);
+    const int vi = view_db_index(g, e.q.view);
+    if (vi < 0 || !atomic_load_explicit(&g_lookup_on, memory_order_acquire)) {
+      atomic_fetch_add_explicit(&g_lk_refused, 1, memory_order_relaxed);
+      lookup_drop(&e.q, e.key);
+      continue;
+    }
+    lookup_start(g, &e.q, vi, e.key);
+    return true;
+  }
+  return false;
+}
+
+static void lq_expire(ing_t *g, int64_t now) {
+  while (g->nlq > 0 && g->lq[g->lq_head].deadline_ms <= now) {
+    struct ing_lq e = g->lq[g->lq_head];
+    g->lq_head = (g->lq_head + 1) % ING_LQ_MAX;
+    g->nlq--;
+    atomic_fetch_add_explicit(&g_lk_expired, 1, memory_order_relaxed);
+    lookup_drop(&e.q, e.key);
+  }
+  lookup_note(g);
+}
+
+/* a request of a worker (mode KDB_FETCH_LOOKUP) taken from a ring: vi is the loader's index of its view (-1: none).  It is made now, or it waits for a place in the queue. */
+static void lookup_offer(ing_t *g, const park_fetch_req_t *q, int vi) {
+  atomic_fetch_add_explicit(&g_lk_asked, 1, memory_order_relaxed);
+  if (vi < 0 || g->fetch_fd < 0 || !atomic_load_explicit(&g_lookup_on, memory_order_acquire) || !lookup_name_ok(q->zone)) {      /* (the worker did not know: it asked, and is woken as for the end of a lookup) */
+    atomic_fetch_add_explicit(&g_lk_refused, 1, memory_order_relaxed);
+    park_wake_queue_all(q->view, q->zone, false);
+    return;
+  }
+  if (lookup_find(g, (uint16_t)vi, q->zone)) {           /* the same name is on its way: its answer wakes every worker */
+    atomic_fetch_add_explicit(&g_lk_dup, 1, memory_order_relaxed);
+    return;
+  }
+  const uint64_t key = park_claim_key(q->view, q->zone);
+  if (!park_claim_mark(key)) {                           /* the same name waits in the queue (the mark is the name's) */
+    atomic_fetch_add_explicit(&g_lk_dup, 1, memory_order_relaxed);
+    return;
+  }
+  if (g->nlq == 0 && lookup_ready(g)) {
+    lookup_start(g, q, vi, key);
+    return;
+  }
+  if (!g->lq || g->nlq >= ING_LQ_MAX) {                  /* true overload: the queries behind it time out (park-timeout) */
+    atomic_fetch_add_explicit(&g_lk_shed, 1, memory_order_relaxed);
+    park_claim_clear(key);
+    return;
+  }
+  struct ing_lq *e = &g->lq[(g->lq_head + g->nlq) % ING_LQ_MAX];
+  e->q = *q;
+  e->key = key;
+  e->deadline_ms = now_ms() + (int64_t)atomic_load_explicit(&g_park_timeout_ms, memory_order_relaxed);
+  g->nlq++;
+  if (g->nlq > atomic_load_explicit(&g_lk_peak, memory_order_relaxed)) atomic_store_explicit(&g_lk_peak, g->nlq, memory_order_relaxed);
+  lookup_note(g);
 }
 
 /* the request is over.  ok: the zone (or its summary) was received and installed; else the queries that wait for it are answered at once. */
@@ -3465,7 +3646,12 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
   if (done.placed) park_place_give();                    /* (B2 W5: the one place of the fetch goes back, whichever way it ended: installed, failed, dropped, the loader gone) */
   g->nfreq--;
   atomic_store_explicit(&g_fq_inflight, g->nfreq, memory_order_relaxed);
-  if (done.mode == KDB_FETCH_LOOKUP) {                   /* 0.7: a lookup is not a fetch of a zone (no LOADING state, no place, no stamp): the queries that wait for the name look it up again */
+  if (done.lk) {                                         /* 0.7: a lookup (and the fetch that came of it) is over: its claim mark goes, the share of the places it took is free */
+    g->nlook--;
+    lookup_note(g);
+    if (done.ckey) park_claim_clear(done.ckey);
+  }
+  if (done.mode == KDB_FETCH_LOOKUP || done.mode == KDB_FETCH_LOOKUP_FULL) {      /* 0.7: a lookup that has not become a fetch of a zone (no LOADING state, no stamp): the queries that wait for the name look it up again */
     lookup_complete(&done, ok, why);
     return;
   }
@@ -3521,7 +3707,13 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
   if (ok && done.hot && !done.dropped && done.mode == KDB_FETCH_FULL) dbreg_warm_freq(done.view_name, done.zone, g->wl_count > done.hrank ? g->wl_count - done.hrank : 1);
   if (ok && !done.dropped && !done.quiet && !done.bulk && done.mode == KDB_FETCH_FULL && done.prio == KDB_FETCH_PRIO_BACKGROUND) dbreg_bg_loaded(done.view_name, done.zone);
   if ((!ok || done.dropped) && done.want_summary) warm_add(g, done.view_name, done.zone);     /* (the summary that was not asked for because this request was on its way) */
-  if (!done.quiet) park_wake_queue_all(done.view_name, done.zone, !ok);      /* (the triggers go out together, park_wake_flush())  */
+  if (done.lk) {                                         /* 0.7: the fetch came of a lookup: the queries that wait for the name it was asked for are woken too, and are not failed (they look the name up again) */
+    const bool same = domain_names_match_ci(done.lk_q, done.zone);
+    park_wake_queue_all(done.view_name, done.zone, !ok && !same);
+    if (!same) park_wake_queue_all(done.view_name, done.lk_q, false);
+  } else if (!done.quiet) {
+    park_wake_queue_all(done.view_name, done.zone, !ok);      /* (the triggers go out together, park_wake_flush())  */
+  }
   /* (the summary for the apex wakes nobody: no query waits for it, and the queries that wait for the data are not woken for nothing) */
 }
 
@@ -3871,6 +4063,7 @@ static void fetch_issue(ing_t *g) {
   int64_t t0 = mono_ns();
   g->fmore = false;
   if (g->nwq > 0) wq_expire(g, now_ms());                /* (the requests that waited until park-timeout) */
+  if (g->nlq > 0) lq_expire(g, now_ms());                /* (and the lookups) */
   for (;;) {
     fetch_release(&hold_place, &hold_tok, &hold_key);    /* (the request of the last round did not become a fetch: it was refused, a duplicate, or in memory) */
     from_wq = wq_room = false;
@@ -3883,8 +4076,12 @@ static void fetch_issue(ing_t *g) {
     if (handled == 1 && g->nbulk < bulk_reserve() && bulk_take(g, &q, &bulk_zid, &bulk_back, &bulk_np, &bulk_sid)) {      /* 0.7 fix 8: the fill's own share, once in a pass, whatever waits */
       warm = hot = false;
       bulk = true;
+    } else if (g->nlq > 0 && g->lq_turn && lq_pump_one(g)) {      /* 0.7: a lookup, in its turn (the lookups and the fetches that wait take places by turns) */
+      g->lq_turn = false;
+      continue;
     } else if (g->nwq > 0 && wq_head_ready(g, now_ms())) {      /* the oldest request that waited goes first (it holds its claim mark and nothing else) */
       struct ing_wq e;
+      g->lq_turn = true;
       wq_take_head(g, &e);
       warm = hot = false;
       q = e.q;
@@ -3893,10 +4090,12 @@ static void fetch_issue(ing_t *g) {
       from_wq = true;
       wq_room = e.room;
       wq_deadline = e.deadline_ms;
+    } else if (g->nlq > 0 && lq_pump_one(g)) {           /* 0.7: a lookup waits and the fetches that wait could not go */
+      continue;
     } else if (park_fetch_next(&q)) {
       warm = hot = false;                                /* (a query's request is not of the hot list, whatever the item before it in this pass was) */
       if (q.claimed) hold_key = park_claim_key(q.view, q.zone);     /* (a worker marked the zone at its gate) */
-    } else if (g->nwarm > 0 && warm_left > 0 && g->nwq == 0) {      /* (the warm-up does not take what queries wait for) */
+    } else if (g->nwarm > 0 && warm_left > 0 && g->nwq == 0 && g->nlq == 0) {      /* (the warm-up does not take what queries wait for) */
       size_t wi = 0;                                     /* the item to take: the head, or (hot items that cannot be read now) the first that is not hot */
       if (g->warm[0].hot) {                              /* (a hot item is not taken out of the list until it can be read, so that the order of the list holds) */
         int gate = warm_hot_gate(g);
@@ -3948,8 +4147,8 @@ static void fetch_issue(ing_t *g) {
         break;
       }
     }
-    if (q.mode == KDB_FETCH_LOOKUP) {                    /* 0.7: a name, not a zone: no claim, no place, no token (lookup_issue()) */
-      lookup_issue(g, &q, vi);
+    if (q.mode == KDB_FETCH_LOOKUP) {                    /* 0.7: a name, not a zone: it takes a place when there is one and waits in its own queue when there is none (lookup_offer()) */
+      lookup_offer(g, &q, vi);
       continue;
     }
     if (vi < 0) {                                        /* a view that takes no zones from the database (or left): nothing to fetch */
@@ -4154,7 +4353,12 @@ static void on_fetch_begin(ing_t *g, const kdb_zone_begin_t *zb) {
     /* a summary request is answered with a summary (a secondary zone has no data to leave out); a full request with the zone */
     wanted = r->mode == KDB_FETCH_SUMMARY ? (summary || zb->zone_kind != KDB_ZK_PRIMARY) : !summary;
   }
-  if (!wanted) {                                         /* nobody asked: read it through the state machine and throw it away */
+  if (r && r->lk) {                                      /* 0.7: the body of a lookup (mode KDB_FETCH_LOOKUP_FULL) is the zone the answer named, once, after the answer: nothing else is read for the request */
+    wanted = wanted && r->lkst != LKS_ASK && !r->body_seen && zb->source_id == r->lk_sid;
+    if (!wanted) atomic_fetch_add_explicit(&g_lk_bad, 1, memory_order_relaxed);
+    else r->body_seen = true;
+  }
+  if (!wanted || (r && r->lk && r->lkst == LKS_SKIP)) {  /* nobody asked (or the zone is not wanted: LKS_SKIP): read it through the state machine and throw it away */
     ing_job_t *j = calloc(1, sizeof(*j));
     if (!j) {
       syslog(LOG_ERR, "[DB] out of memory; closing the fetch stream");
@@ -4163,7 +4367,8 @@ static void on_fetch_begin(ing_t *g, const kdb_zone_begin_t *zb) {
     }
     j->skip = j->unsolicited = true;
     j->fetch_id = zb->request_id;
-    fetch_discard(g, zb, r ? "it is not what the request wants" : "no such request");
+    if (wanted) j->lk_skip = true;                       /* (the end of the body is the end of the request) */
+    else fetch_discard(g, zb, r ? (r->lk ? "it is not the body the lookup's answer announced" : "it is not what the request wants") : "no such request");
     job_free(g->fcur);
     g->fcur = j;
     return;
@@ -4196,6 +4401,10 @@ static void on_fetch_end(ing_t *g) {
   g->fcur = NULL;
   if (!j) return;
   if (j->unsolicited) {
+    if (j->lk_skip) {                                    /* 0.7: the body that was not wanted has been read through: the lookup is over */
+      ing_freq_t *r = fetch_find(g, j->fetch_id);
+      if (r) fetch_complete(g, r, true, NULL);
+    }
     job_free(j);
     return;
   }
@@ -4220,17 +4429,18 @@ static void on_fetch_failed(ing_t *g, const kdb_zone_failed_t *zf) {
  * the stamp noted when the store has it already): its body is read when a query asks for it, or by the scan of the wanted bodies; the pass of the view that is still going lists it too, and finds the record. */
 static void on_lookup_result(ing_t *g, const kdb_lookup_result_t *l) {
   ing_freq_t *r = fetch_find(g, l->request_id);
-  if (!r || r->mode != KDB_FETCH_LOOKUP || r->view != l->view) {
+  if (!r || !r->lk || r->lkst != LKS_ASK || r->view != l->view) {      /* (not a lookup, or answered already: a second answer, and a body that follows it, are no part of the request) */
     fetch_discard(g, NULL, "an answer of no lookup");
     return;
   }
+  lookup_hist(mono_ns() - r->lk_t0);
   if (!l->found) {
     atomic_fetch_add_explicit(&g_lk_none, 1, memory_order_relaxed);
-    fetch_complete(g, r, true, NULL);
+    fetch_complete(g, r, true, NULL);                    /* (the place is free at once) */
     return;
   }
-  if (!domain_name_is_at_or_below(r->zone, l->name) || strcmp(l->name, ".") == 0 || l->source_id <= 0) {
-    syslog(LOG_WARNING, "[DB] the loader answered the lookup of the name '%s' (view '%s') with a zone that does not enclose it; the answer is ignored", r->zone, r->view_name);
+  if (!domain_name_is_at_or_below(r->lk_q, l->name) || strcmp(l->name, ".") == 0 || l->source_id <= 0) {
+    syslog(LOG_WARNING, "[DB] the loader answered the lookup of the name '%s' (view '%s') with a zone that does not enclose it; the answer is ignored", r->lk_q, r->view_name);
     fetch_complete(g, r, false, "the loader named a zone that does not enclose the name");
     return;
   }
@@ -4251,8 +4461,27 @@ static void on_lookup_result(ing_t *g, const kdb_lookup_result_t *l) {
     return;
   }
   atomic_fetch_add_explicit(&g_lk_found, 1, memory_order_relaxed);
-  logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] lookup %llu: the name '%s' is in zone '%s' (view '%s', id %lld)", (unsigned long long)r->id, r->zone, l->name, r->view_name, (long long)l->source_id);
-  fetch_complete(g, r, true, NULL);
+  logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] lookup %llu: the name '%s' is in zone '%s' (view '%s', id %lld)", (unsigned long long)r->id, r->lk_q, l->name, r->view_name, (long long)l->source_id);
+  if (r->mode != KDB_FETCH_LOOKUP_FULL) {
+    fetch_complete(g, r, true, NULL);
+    return;
+  }
+  /* mode 3: the body of the zone follows, with this request id.  The request is the fetch of the zone from here on (the same place, the same id): LOADING for the queries that look at the zone, the record's
+   * stamp (the one the answer made) for the check at the install.  When the zone is not started by this request (another fetch has it, it is in memory) the body is read through and thrown away. */
+  snprintf(r->zone, sizeof(r->zone), "%s", l->name);
+  r->lk_sid = l->source_id;
+  if (dbreg_fetch_begin(r->view_name, r->zone) == DBREG_FETCH_STARTED) {
+    r->lkst = LKS_BODY;
+    r->mode = KDB_FETCH_FULL;
+    r->v_valid = dbreg_zone_version(r->view_name, r->zone, &r->v_sid, &r->v_serial);
+    r->sid = l->source_id;
+    freq_stamp(r, r->view_name, r->zone);
+    atomic_fetch_add_explicit(&g_fetch_issued, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_lk_body, 1, memory_order_relaxed);
+  } else {
+    r->lkst = LKS_SKIP;
+    park_wake_queue_all(r->view_name, r->lk_q, false);   /* (the zone is known: the queries need not wait for a body that is not read) */
+  }
 }
 
 static void handle_fetch_msg(ing_t *g, const kdb_msg_t *m) {
@@ -4280,9 +4509,9 @@ static void handle_fetch_msg(ing_t *g, const kdb_msg_t *m) {
   case KDB_T_ZONE_ABORT: {
     ing_job_t *j = g->fcur;
     g->fcur = NULL;
-    if (j && !j->unsolicited) {
+    if (j && (!j->unsolicited || j->lk_skip)) {
       ing_freq_t *r = fetch_find(g, j->fetch_id);
-      if (r) fetch_complete(g, r, false, "the loader gave the zone up");
+      if (r) fetch_complete(g, r, j->lk_skip, "the loader gave the zone up");
     }
     job_free(j);
     break;
@@ -4428,8 +4657,17 @@ static void fetch_adopt(ing_t *g, int fd) {
   syslog(LOG_INFO, "[DB] loader fetch stream connected");
   for (uint32_t i = 0; i < ING_FETCH_MAX && g->fetch_fd >= 0; i++)      /* what a restarted loader has not answered is asked again */
     if (g->freq[i].active) {
-      g->freq[i].sent_ms = now_ms();
-      (void)fetch_send_req(g, &g->freq[i]);
+      ing_freq_t *r = &g->freq[i];
+      if (r->lk) {                                       /* 0.7: a lookup whose body was not wanted has nothing left to wait for; the others are asked again, with the mode the loader answers */
+        r->body_seen = false;
+        if (r->lkst == LKS_SKIP) {
+          fetch_complete(g, r, true, NULL);
+          continue;
+        }
+        if (r->lkst == LKS_ASK && r->mode == KDB_FETCH_LOOKUP_FULL && !(g->loader_feat & KDB_FEAT_LOOKUP_BODY)) r->mode = KDB_FETCH_LOOKUP;
+      }
+      r->sent_ms = now_ms();
+      (void)fetch_send_req(g, r);
     }
   if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);
 }
@@ -4607,7 +4845,7 @@ static void *ingest_thread(void *arg) {
     }
     if ((g->nwarm > 0 || (g->apex_walk && g->fetch_fd >= 0)) && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;      /* zones to read before a query asks, or the walk for apexes (while there is a fetch stream): try again soon */
     if (g->bg_on && g->fetch_fd >= 0 && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;           /* 0.7 WP7b: the bodies the reconcile wants are being asked for: look again soon (a pause after a failed round, a free place) */
-    if (g->nwq > 0 && (wait_ms < 0 || wait_ms > ING_WQ_TICK_MS)) wait_ms = ING_WQ_TICK_MS;     /* 0.7 P-B: requests wait (for the bucket, room): look again, and at their deadlines */
+    if ((g->nwq > 0 || g->nlq > 0) && (wait_ms < 0 || wait_ms > ING_WQ_TICK_MS)) wait_ms = ING_WQ_TICK_MS;     /* 0.7 P-B: requests wait (for the bucket, room, a place): look again, and at their deadlines */
     if (g->hold && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;           /* warm-before-serve: look at the warm-up and the time often */
     if (wait_ms < 0 || wait_ms > 10000) wait_ms = 10000;                  /* (the busy share of dbstatus is closed at the end of a window, so the thread wakes at least that often) */
     if (g->sresume || g->fresume) wait_ms = 0;                            /* 0.7 fix 8: frames are left in a framer, the requests of the queries were served first */
@@ -4666,7 +4904,7 @@ static void *ingest_thread(void *arg) {
     if (g->inv_active) pump_inventory(g);
     if (g->need_cleanup) cleanup_stream_state(g);
     maybe_apply_delta(g);
-    if (g->nwarm > 0 || g->fmore || g->nwq > 0 || g->bg_on || park_fetch_pending()) fetch_issue(g);
+    if (g->nwarm > 0 || g->fmore || g->nwq > 0 || g->nlq > 0 || g->bg_on || park_fetch_pending()) fetch_issue(g);
     apex_walk_step(g);
     fetch_expire(g);
     park_wake_flush();
@@ -4690,9 +4928,12 @@ static void *ingest_thread(void *arg) {
 bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
   ing_t *g = &g_ing;
   static struct ing_wq *s_wq;
+  static struct ing_lq *s_lq;
   memset(g, 0, sizeof(*g));
   if (!s_wq) s_wq = calloc(ING_WQ_MAX, sizeof(*s_wq));       /* (NULL: nothing can wait, a request that cannot be made is refused) */
   g->wq = s_wq;
+  if (!s_lq) s_lq = calloc(ING_LQ_MAX, sizeof(*s_lq));       /* (NULL: a lookup that finds no place is dropped) */
+  g->lq = s_lq;
   g->stream_fd = -1;
   g->fetch_fd = -1;
   g->cur_req = -1;
@@ -4725,6 +4966,7 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
   EV_SET(&ev[0], 1, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
   if (kevent(g->wait_kq, ev, 1, NULL, 0, NULL) != 0) return false;
   atomic_store_explicit(&g_ing_kick_kq, g->kq, memory_order_relaxed);
+  store_status_set_lookup_fn(db_ingest_lookup_stats);        /* 0.7: `karictl store` shows the lookups of the first start (store.lookup.*) */
   dbreg_set_pending_notify(ing_kick);                /* D1a step 5: an eviction leaves a delta to publish; the thread may be asleep without a timeout */
   /* builder threads (design 1.5, D10): ingest-threads 1 = the stream thread builds */
   ing_cfg_t snap;
@@ -5217,10 +5459,14 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
                 (unsigned long long)atomic_load_explicit(&g_wq_waited, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_wq_dropped, memory_order_relaxed),
                 (unsigned long long)atomic_load_explicit(&g_wq_full, memory_order_relaxed));
     }
-    st_append(&c, "lookup of names while the first pass has not listed every zone: ready=%s in_flight=%u found=%llu none=%llu failed=%llu refused=%llu same_name=%llu\n", db_ingest_lookup_ready() ? "yes" : "no",
-              (unsigned)park_lookup_used(), (unsigned long long)atomic_load_explicit(&g_lk_found, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_lk_none, memory_order_relaxed),
-              (unsigned long long)atomic_load_explicit(&g_lk_failed, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_lk_refused, memory_order_relaxed),
-              (unsigned long long)atomic_load_explicit(&g_lk_dup, memory_order_relaxed));
+    {
+      store_lookup_t lk;
+      db_ingest_lookup_stats(&lk);
+      st_append(&c, "lookup of names while the first pass has not listed every zone: ready=%s in_flight=%u pending=%u asked=%llu found=%llu none=%llu failed=%llu refused=%llu same_name=%llu body_inline=%llu take_fail=%llu covered=%llu shed=%llu expired=%llu bad_body=%llu rtt_p50_us=%llu rtt_p99_us=%llu\n",
+                lk.ready ? "yes" : "no", (unsigned)lk.in_flight, (unsigned)lk.pending, (unsigned long long)lk.asked, (unsigned long long)lk.found, (unsigned long long)lk.none, (unsigned long long)lk.failed,
+                (unsigned long long)lk.refused, (unsigned long long)lk.same_name, (unsigned long long)lk.body_inline, (unsigned long long)lk.take_fail, (unsigned long long)lk.covered, (unsigned long long)lk.shed,
+                (unsigned long long)lk.expired, (unsigned long long)lk.bad_body, (unsigned long long)store_status_hist_pct(lk.hist, 50, lk.max_ns), (unsigned long long)store_status_hist_pct(lk.hist, 99, lk.max_ns));
+    }
     dbreg_cache_stats_t cs;
     dbreg_cache_stats(&cs);
     {

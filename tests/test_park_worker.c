@@ -470,31 +470,47 @@ int main(void) {
      *    park-timeout end it, with the normal answer (REFUSED for a name no zone has) */
     {
         atomic_store(&dns_core_test_lookup_force, true);
-        const uint32_t used0 = park_lookup_used();
+        const uint64_t tf0 = park_lookup_take_fails();
         while (park_fetch_pop(park_fetch_ring(0), &q)) {}                                          /* (what the tests before left in the ring) */
         #define SEND_LK(id) do { size_t ql_ = build_lk_query(rx + sizeof(udp_ipc_t), (id)); \
             mk_ipc((udp_ipc_t *)rx, 7, ql_); w.n_tx = 0; udp_one(&w, (udp_ipc_t *)rx, rx + sizeof(udp_ipc_t), (ssize_t)ql_); } while (0)
         SEND_LK(0x7101);
-        CHECK(w.n_tx == 0 && table.nwait == 1 && park_lookup_used() == used0 + 1);
+        CHECK(w.n_tx == 0 && table.nwait == 1 && table.nlook == 1);
         CHECK(park_fetch_pop(park_fetch_ring(0), &q) && strcmp(q.zone, "www.late.test.") == 0 && q.mode == KDB_FETCH_LOOKUP && !park_fetch_pop(park_fetch_ring(0), &q));
         const int64_t dl = park_next_deadline_ms(&table, 0);
         /* the spurious wake: parked again with the first deadline, the request is made again, nothing is answered */
         atomic_store(&park_wake_ring(0)->overflow, true);
         park_service(&w, -1);
-        CHECK(table.nwait == 1 && table.nready == 0 && !read_answer(sk[1]).got && park_lookup_used() == used0 + 2);
+        CHECK(table.nwait == 1 && table.nready == 0 && !read_answer(sk[1]).got && table.nlook == 1);
         CHECK(park_fetch_pop(park_fetch_ring(0), &q) && strcmp(q.zone, "www.late.test.") == 0 && q.mode == KDB_FETCH_LOOKUP);
         CHECK(park_next_deadline_ms(&table, 0) <= dl && park_next_deadline_ms(&table, 0) >= dl - 3);
-        /* ... as often as it happens, and with no place left for a new request it still waits */
-        park_lookup_set_limit(used0 + 2);
+        /* ... as often as it happens; and when the worker's ring to the ingest thread is full the request cannot be made: the query is parked all the same (it is not refused), the request is pending (PARK_PEND_LOOKUP)
+         * and is made at a pass of the worker when the ring has room */
+        while (park_fetch_push(park_fetch_ring(0), "default", "other.test.", KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_SUMMARY)) {}
         atomic_store(&park_wake_ring(0)->overflow, true);
         park_service(&w, -1);
-        CHECK(table.nwait == 1 && !read_answer(sk[1]).got && !park_fetch_pop(park_fetch_ring(0), &q) && park_lookup_used() == used0 + 2);
-        park_lookup_set_limit(PARK_LOOKUP_MAX);
+        CHECK(table.nwait == 1 && table.nready == 0 && !read_answer(sk[1]).got && table.nunsent == 1 && table.e[park_pending_head(&table) - table.e].pend == PARK_PEND_LOOKUP && park_lookup_take_fails() == tf0 + 1);
+        park_service(&w, -1);                                                                      /* (the ring is still full: it waits) */
+        CHECK(table.nwait == 1 && table.nunsent == 1 && !read_answer(sk[1]).got);
+        while (park_fetch_pop(park_fetch_ring(0), &q)) {}                                          /* (the ingest thread took them: there is room) */
+        park_service(&w, -1);
+        CHECK(table.nwait == 1 && table.nunsent == 0 && park_fetch_pop(park_fetch_ring(0), &q) && strcmp(q.zone, "www.late.test.") == 0 && q.mode == KDB_FETCH_LOOKUP && q.prio == KDB_FETCH_PRIO_QUERY &&
+              !park_fetch_pop(park_fetch_ring(0), &q));
         /* the answer (a wake by the name): the query looks the name up again and, with no zone for it, is refused */
         CHECK(park_wake_push(park_wake_ring(0), "default", "www.late.test.", false));
         park_service(&w, -1);
         a = read_answer(sk[1]);
-        CHECK(a.got && a.id == 0x7101 && a.rcode == 5 && a.ancount == 0 && table.nwait == 0 && table.nready == 0);
+        CHECK(a.got && a.id == 0x7101 && a.rcode == 5 && a.ancount == 0 && table.nwait == 0 && table.nready == 0 && table.nlook == 0);
+        /* the same name asked for by a second query (the first one waits for it): one request, and the second only waits; the answer is for both */
+        SEND_LK(0x7106);
+        SEND_LK(0x7107);
+        CHECK(table.nwait == 2 && table.nlook == 2 && park_fetch_pop(park_fetch_ring(0), &q) && !park_fetch_pop(park_fetch_ring(0), &q));
+        CHECK(park_wake_push(park_wake_ring(0), "default", "www.late.test.", false));
+        park_service(&w, -1);
+        a = read_answer(sk[1]);
+        CHECK(a.got && a.rcode == 5);
+        a = read_answer(sk[1]);
+        CHECK(a.got && a.rcode == 5 && table.nwait == 0 && table.nlook == 0);
         /* the lookup failed: the same answer at once */
         SEND_LK(0x7102);
         CHECK(table.nwait == 1 && park_fetch_pop(park_fetch_ring(0), &q));
@@ -525,7 +541,6 @@ int main(void) {
         FLUSH();
         a = read_answer(sk[1]);
         CHECK(a.got && a.id == 0x7105 && a.rcode == 5);
-        while (park_lookup_used() > used0) park_lookup_give();                                    /* (the ingest thread gives the places back: none runs here) */
         #undef SEND_LK
     }
 

@@ -205,8 +205,8 @@ static void run_backend(const uint8_t *p, size_t n) {
             if (k != m.u.hot_list.n_entries || m.u.hot_list.limit > KDB_HOT_MAX) abort();
         } else if (fr.type == KDB_T_FETCH_REQ) {         /* D1a */
             const kdb_fetch_req_t *q = &m.u.fetch_req;
-            if (q->request_id == 0 || q->view >= 3 || strlen(q->name) == 0 || q->priority >= KDB_FETCH_PRIO_N || q->mode > KDB_FETCH_LOOKUP) abort();
-            if (q->mode == KDB_FETCH_LOOKUP && (q->has_range || q->source_id != 0)) abort();      /* 0.7: a lookup has neither */
+            if (q->request_id == 0 || q->view >= 3 || strlen(q->name) == 0 || q->priority >= KDB_FETCH_PRIO_N || q->mode > KDB_FETCH_LOOKUP_FULL) abort();
+            if ((q->mode == KDB_FETCH_LOOKUP || q->mode == KDB_FETCH_LOOKUP_FULL) && (q->has_range || q->source_id != 0)) abort();      /* 0.7: a lookup has neither */
             if (q->has_range && (strlen(q->range_lo) == 0 || strlen(q->range_hi) == 0)) abort();
             if (q->source_id < 0) abort();                  /* 0.7 WP7a */
         }

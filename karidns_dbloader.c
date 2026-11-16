@@ -493,7 +493,11 @@ typedef struct {
     /* D1a, the fetch thread (second stream): one zone for one FETCH_REQ, no batch, no inventory, no results.  Every ZONE_BEGIN and ZONE_FAILED
      * carries the request id; with fetch_summary the zone is not read, only its summary is sent. */
     bool fetch;
-    bool fetch_lookup;                /* 0.7: the request is a lookup of a name (FETCH_REQ mode KDB_FETCH_LOOKUP): lookup_run() instead of the zone */
+    bool fetch_lookup;                /* 0.7: the request is a lookup of a name (FETCH_REQ mode KDB_FETCH_LOOKUP or KDB_FETCH_LOOKUP_FULL): lookup_run() instead of the zone */
+    bool lk_full;                     /* ... mode KDB_FETCH_LOOKUP_FULL: the body of the zone that is found follows the answer (fetch_one() reads it, as for the request of that zone, with the same request id) */
+    bool lk_found;                    /* ... lookup_run() found a zone: its domains.id and canonical name */
+    int64_t lk_id;
+    char lk_name[DNS_NAME_TEXT_SIZE];
     /* 0.6.2, a worker of the fetch pool: the connection kept between requests, and what it was opened on.  Opening a SQLite3 connection took
      * about 1.9 ms of the 2.4 ms of a fetch (the first connection to a WAL file: the -shm and -wal files, the locks, the schema), which held a
      * worker at about 400 zones/s.  Each request has its own snapshot; check_schema is repeated after FETCH_SCHEMA_RECHECK_MS only (keep_si).  Kept only for the same driver and source, and
@@ -2253,7 +2257,7 @@ static int run_zones(ctx_t *x, const db_source_t *src, bool bulk, size_t n_want)
 static int send_hello(ctx_t *x, const char *driver_list, uint32_t pid) {
     if (kdb_enc_begin(&x->enc, KDB_T_HELLO) != 0 || kdb_enc_u16(&x->enc, 1, KDB_VERSION) != 0 ||
         kdb_enc_str(&x->enc, 2, KARIDNS_VERSION) != 0 || kdb_enc_str(&x->enc, 3, driver_list) != 0 ||
-        kdb_enc_u32(&x->enc, 4, pid) != 0 || (x->io && kdb_enc_u32(&x->enc, 5, KDB_FEAT_STORE | KDB_FEAT_LOOKUP) != 0) || kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
+        kdb_enc_u32(&x->enc, 4, pid) != 0 || (x->io && kdb_enc_u32(&x->enc, 5, KDB_FEAT_STORE | KDB_FEAT_LOOKUP | KDB_FEAT_LOOKUP_BODY) != 0) || kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
         return -1;
     return 0;
 }
@@ -3941,6 +3945,11 @@ static int st_emit_listed(ctx_t *x, const db_schema_info_t *si, const char *only
  * primary zone is an answer: when the closest zone the view serves is a secondary or a catalog one, nothing is found (the Backend serves those from its heap once the pass has had them loaded).  LOOKUP_RESULT
  * says what was found, or that nothing was; a database error is ZONE_FAILED (fetch_one()).  The connection and the snapshot are those of a fetch. */
 static int lookup_send(ctx_t *x, const char *canon, int64_t id, uint8_t kind, bool stamped, uint64_t gen, uint64_t at, bool has_serial, uint32_t serial) {
+    x->lk_found = canon != NULL;
+    if (canon) {
+        x->lk_id = id;
+        snprintf(x->lk_name, sizeof(x->lk_name), "%s", canon);
+    }
     if (kdb_enc_begin(&x->enc, KDB_T_LOOKUP_RESULT) != 0 || kdb_enc_u64(&x->enc, 1, x->fetch_req) != 0 || kdb_enc_u16(&x->enc, 2, x->view) != 0 ||
         kdb_enc_u8(&x->enc, 3, canon ? 1 : 0) != 0 ||
         (canon && (kdb_enc_i64(&x->enc, 4, id) != 0 || kdb_enc_name(&x->enc, 5, canon) != 0 || kdb_enc_u8(&x->enc, 6, kind) != 0 || kdb_enc_u64(&x->enc, 7, gen) != 0 ||
@@ -3949,7 +3958,7 @@ static int lookup_send(ctx_t *x, const char *canon, int64_t id, uint8_t kind, bo
         x->oom = true;
         return EXIT_ERROR;
     }
-    x->n_zones++;
+    if (!(canon && x->lk_full)) x->n_zones++;              /* (the answer is the whole of a lookup; with the body to follow the zone it sends is what counts) */
     fw_lock(x);
     int rc = send_enc(x);
     fw_unlock(x);
@@ -4840,7 +4849,7 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
             char shown[210];
             clean_reason(q->name, shown, sizeof(shown));
             lgd(2, "fetch %llu: zone '%s' (view %u, %s): %s (%u queued)", (unsigned long long)q->request_id, shown, (unsigned)q->view,
-                q->mode == KDB_FETCH_SUMMARY ? "summary" : q->mode == KDB_FETCH_LOOKUP ? "lookup of a name" : "whole zone", !f ? "refused, too many are waiting (the Backend's request times out)"
+                q->mode == KDB_FETCH_SUMMARY ? "summary" : q->mode == KDB_FETCH_LOOKUP ? "lookup of a name" : q->mode == KDB_FETCH_LOOKUP_FULL ? "lookup of a name, with the body of the zone" : "whole zone", !f ? "refused, too many are waiting (the Backend's request times out)"
                 : f >= io->fq && f < io->fq + FQ_MAX ? "queued" : "answered busy", queued);
         }
         break;
@@ -5341,12 +5350,15 @@ static int fetch_one(ctx_t *x, const lcfg_t *lc, const freq_t *r) {
     if (r->range) return fetch_fail(x, r, "this loader does not read a range of a zone");
     if (!drv) return fetch_fail(x, r, "the loader has no usable configuration yet");
     if (!v) return fetch_fail(x, r, "the view is not in the configuration");
-    if (r->mode == KDB_FETCH_LOOKUP && (!drv->find_zones_in || !lc->store_proto || !drv->manifest_page)) return fetch_fail(x, r, "this loader cannot look up the zone of a name with this driver or without the store protocol");
+    const bool is_lookup = r->mode == KDB_FETCH_LOOKUP || r->mode == KDB_FETCH_LOOKUP_FULL;
+    if (is_lookup && (!drv->find_zones_in || !lc->store_proto || !drv->manifest_page)) return fetch_fail(x, r, "this loader cannot look up the zone of a name with this driver or without the store protocol");
     x->fetch_req = r->id;
     x->fetch_vname = lc->store_proto ? NULL : v->name;     /* (the store protocol keeps no inventory for the fetch thread to tell) */
     x->fetch_source_id = r->source_id;
     x->fetch_summary = r->mode == KDB_FETCH_SUMMARY;
-    x->fetch_lookup = r->mode == KDB_FETCH_LOOKUP;
+    x->fetch_lookup = is_lookup;
+    x->lk_full = r->mode == KDB_FETCH_LOOKUP_FULL;
+    x->lk_found = false;
     x->drv = drv;
     x->view = r->view;
     x->nthreads = 1;
@@ -5364,14 +5376,27 @@ static int fetch_one(ctx_t *x, const lcfg_t *lc, const freq_t *r) {
     db_source_t src;
     view_source(drv, v, &src);
     (void)run_view(x, &src, r->zone, false);
+    freq_t named = *r;                                        /* (what a failure of the request is about: the zone that a lookup found, once there is one) */
+    if (x->lk_found && x->lk_full && !x->io_error && !x->oom && !g_stop && !atomic_load(&g_fetch_stop)) {
+        /* 0.7, mode KDB_FETCH_LOOKUP_FULL: the answer has gone; the body of the zone it named follows with the same request id, read as for a request of that zone (in the Backend the lookup is a fetch of the zone
+         * from the answer on).  The domain id is the one the answer named: a zone that was renamed or made again in between is a failure, as for any request that names the id. */
+        snprintf(named.zone, sizeof(named.zone), "%s", x->lk_name);
+        x->fetch_lookup = false;
+        x->lk_full = false;
+        x->fetch_source_id = x->lk_id;
+        x->errtext[0] = '\0';
+        (void)run_view(x, &src, named.zone, false);
+    }
     ctx_view_reset(x);
     x->map_view = NULL;
     x->fetch_vname = NULL;
     x->fetch_source_id = 0;
     x->fetch_lookup = false;
+    x->lk_full = false;
+    x->lk_found = false;
     if (x->io_error || x->oom || g_stop || atomic_load(&g_fetch_stop)) return -1;
     if (x->n_zones == 0 && x->n_failed == 0)                  /* nothing was sent: the Backend is waiting for an answer */
-        return fetch_fail(x, r, x->errtext[0] ? x->errtext : "the zone could not be read");
+        return fetch_fail(x, &named, x->errtext[0] ? x->errtext : "the zone could not be read");
     return 0;
 }
 

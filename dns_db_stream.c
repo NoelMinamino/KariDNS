@@ -112,7 +112,7 @@ static const kdb_tspec_t sp_batch_result[] = {
 TDEF(td_batch_result, "BATCH_RESULT", sp_batch_result);
 static const kdb_tspec_t sp_fetch_req[] = {
     S(KT_U64, KS_REQ, 0), S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, KDB_FETCH_PRIO_N - 1),
-    S(KT_U8, KS_REQ | KS_MAXV, KDB_FETCH_LOOKUP), S(KT_NAME, 0, 0), S(KT_NAME, 0, 0), S(KT_I64, 0, 0) };
+    S(KT_U8, KS_REQ | KS_MAXV, KDB_FETCH_LOOKUP_FULL), S(KT_NAME, 0, 0), S(KT_NAME, 0, 0), S(KT_I64, 0, 0) };
 TDEF(td_fetch_req, "FETCH_REQ", sp_fetch_req);
 /* D1a step 7: HOT_LIST (Backend -> loader) and WARM_LIST (loader -> Backend) have one layout; tag 5 is for the first, 6 and 7 for the second */
 static const kdb_tspec_t sp_hot_entry[] = { S(KT_STR, KS_REQ | KS_NE, 255), S(KT_NAME, KS_REQ, 0) };
@@ -617,7 +617,7 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         r->mode = (uint8_t)V(5).u;
         r->source_id = V(8).present ? (int64_t)V(8).u : 0;
         if (r->source_id < 0) FAIL(why, wl, KDB_E_RANGE, "FETCH_REQ: negative source id");
-        if (r->mode == KDB_FETCH_LOOKUP && (V(6).present || V(7).present || V(8).present)) FAIL(why, wl, KDB_E_RANGE, "FETCH_REQ: a lookup takes no range and no source id");
+        if ((r->mode == KDB_FETCH_LOOKUP || r->mode == KDB_FETCH_LOOKUP_FULL) && (V(6).present || V(7).present || V(8).present)) FAIL(why, wl, KDB_E_RANGE, "FETCH_REQ: a lookup takes no range and no source id");
         if (V(6).present != V(7).present) FAIL(why, wl, KDB_E_TLV_MISSING, "FETCH_REQ: a range needs both range_lo and range_hi");
         if (V(6).present) {
             r->has_range = true;

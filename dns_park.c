@@ -187,6 +187,13 @@ static void wait_leave(park_table_t *t, park_entry_t *e) {
   unsent_remove(t, e);
 }
 
+/* the mark of a lookup goes (the answer, the failure, the release of the entry) */
+static void lookup_unmark(park_table_t *t, park_entry_t *e) {
+  if (!e->lookup) return;
+  e->lookup = 0;
+  t->nlook--;
+}
+
 static void done_enter(park_table_t *t, park_entry_t *e, park_state_t st) {
   e->state = (uint8_t)st;
   t->nwait--;
@@ -289,7 +296,7 @@ uint32_t park_wake_key(park_table_t *t, uint64_t key) {
     e->hnext = 0;
     wheel_remove(t, e);
     unsent_remove(t, e);
-    e->lookup = 0;                                       /* (the answer of a lookup, or any other wake by the name) */
+    lookup_unmark(t, e);                                 /* (the answer of a lookup, or any other wake by the name) */
     done_enter(t, e, PARK_READY);
     t->n_woken++;
     n++;
@@ -317,7 +324,7 @@ uint32_t park_fail_key(park_table_t *t, uint64_t key) {
     e->hnext = 0;
     wheel_remove(t, e);
     unsent_remove(t, e);
-    e->lookup = 0;
+    lookup_unmark(t, e);
     done_enter(t, e, PARK_TIMEOUT);
     t->n_failed++;
     n++;
@@ -395,8 +402,9 @@ void park_mark_attach(park_table_t *t, int32_t idx, int64_t now_ns, int64_t full
 }
 
 void park_mark_lookup(park_table_t *t, int32_t idx) {
-  if (!t->e || idx < 0 || (uint32_t)idx >= t->cap || t->e[idx].state != PARK_WAIT) return;
+  if (!t->e || idx < 0 || (uint32_t)idx >= t->cap || t->e[idx].state != PARK_WAIT || t->e[idx].lookup) return;
   t->e[idx].lookup = 1;
+  t->nlook++;
 }
 
 uint32_t park_wake_all(park_table_t *t) {
@@ -477,6 +485,7 @@ static void pend_abandon(park_table_t *t, park_entry_t *e) {
 void park_release(park_table_t *t, park_entry_t *e) {
   if (!t->e || e < t->e || e >= t->e + t->cap || e->state == PARK_FREE) return;
   if (e->pend) pend_abandon(t, e);
+  lookup_unmark(t, e);
   if (e->state == PARK_WAIT) {
     wait_leave(t, e);
     t->nwait--;
@@ -1288,24 +1297,10 @@ bool park_fetch_next(park_fetch_req_t *out) {
   return false;
 }
 
-/* ------------------------------------------------------------------ the by-name lookups in flight (0.7, dns_park.h) */
-static _Atomic uint32_t g_lookups;
-static _Atomic uint32_t g_lookup_lim = PARK_LOOKUP_MAX;
+/* ------------------------------------------------------------------ the by-name lookups (0.7, dns_park.h) */
+static _Atomic uint64_t g_lookup_take_fail;
 
-bool park_lookup_take(void) {
-  uint32_t v = atomic_load_explicit(&g_lookups, memory_order_relaxed);
-  const uint32_t lim = atomic_load_explicit(&g_lookup_lim, memory_order_relaxed);
-  while (v < lim) {
-    if (atomic_compare_exchange_weak_explicit(&g_lookups, &v, v + 1, memory_order_acq_rel, memory_order_relaxed)) return true;
-  }
-  return false;
-}
-
-void park_lookup_give(void) {
-  uint32_t v = atomic_load_explicit(&g_lookups, memory_order_relaxed);
-  while (v > 0 && !atomic_compare_exchange_weak_explicit(&g_lookups, &v, v - 1, memory_order_acq_rel, memory_order_relaxed)) {
-  }                                                      /* (never below 0: a place given back twice does not make room) */
-}
-
-uint32_t park_lookup_used(void) { return atomic_load_explicit(&g_lookups, memory_order_relaxed); }
-void park_lookup_set_limit(uint32_t limit) { atomic_store_explicit(&g_lookup_lim, limit, memory_order_relaxed); }
+/* the entries that wait for a lookup may take three quarters of the table: the rest is for the queries that wait for a zone (a flood of names that no zone has fills no more than that) */
+bool park_lookup_room(const park_table_t *t) { return t->e && t->nlook < t->cap - t->cap / 4; }
+void park_lookup_note_take_fail(void) { atomic_fetch_add_explicit(&g_lookup_take_fail, 1, memory_order_relaxed); }
+uint64_t park_lookup_take_fails(void) { return atomic_load_explicit(&g_lookup_take_fail, memory_order_relaxed); }

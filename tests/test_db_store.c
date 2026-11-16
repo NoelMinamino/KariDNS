@@ -47,6 +47,7 @@
 #include "../dns_server_internal.h"
 #include "../dns_snapshot_rcu.h"
 #include "../dns_store.h"
+#include "../dns_store_status.h"
 #include "../dns_utils.h"
 #include "../dns_zone_image.h"
 
@@ -291,6 +292,18 @@ static bool wake_for(const char *zone, park_key_t *k, int ms) {
         if ((int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000 >= end) return false;
         usleep(1000);
     }
+}
+
+/* the counters of the lookups (store.lookup.*) */
+static store_lookup_t lk_stats(void) {
+    store_lookup_t k;
+    (void)db_ingest_lookup_stats(&k);
+    return k;
+}
+/* the places of fetch-concurrency in use: a lookup holds one from its request to the end of its answer (or of the fetch of the zone that came with it) */
+static bool places_are(uint32_t n, int ms) {
+    for (int i = 0; i < ms / 5 && park_places_used() != n; i++) usleep(5000);
+    return park_places_used() == n;
 }
 
 static void drain_wakes(void) {
@@ -2729,13 +2742,13 @@ static int run_proto(int phase, const char *dir) {
             const uint64_t zid_sid = 777000;
             /* a zone is found: recorded as a MANIFEST entry would (KNOWN, with its stamp), and the worker's query for the name is woken (not failed) */
             drain_wakes();
-            CHECK(park_lookup_take() && park_fetch_request(0, "default", "www.late.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
+            CHECK(park_fetch_request(0, "default", "www.late.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
             CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && m.u.fetch_req.mode == KDB_FETCH_LOOKUP && strcmp(m.u.fetch_req.name, "www.late.test.") == 0 &&
                   m.u.fetch_req.priority == KDB_FETCH_PRIO_QUERY && m.u.fetch_req.source_id == 0 && !m.u.fetch_req.has_range);
             const uint64_t rid = m.u.fetch_req.request_id;
-            CHECK(park_lookup_take() && park_fetch_request(0, "default", "www.late.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));     /* (the same name again: one request on the stream) */
+            CHECK(park_fetch_request(0, "default", "www.late.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));     /* (the same name again: one request on the stream) */
             CHECK(!ch_next(&fetchc, &m, 300));
-            CHECK(park_lookup_used() == 1);                                                /* (the duplicate gave its place back) */
+            CHECK(lk_stats().same_name == 1 && lk_stats().in_flight == 1 && park_places_used() == 1);       /* (the duplicate took nothing: one place, for the request that is out) */
             kdb_enc_begin(&e, KDB_T_LOOKUP_RESULT);
             kdb_enc_u64(&e, 1, rid + 1000); kdb_enc_u16(&e, 2, 0); kdb_enc_u8(&e, 3, 0);      /* (an answer of no request is discarded; the stream goes on) */
             kdb_enc_end(&e);
@@ -2746,7 +2759,7 @@ static int run_proto(int phase, const char *dir) {
             kdb_enc_end(&e);
             ch_send(f[0], &e);
             CHECK(wake_for("www.late.test.", &k, 5000) && !k.failed && !k.retry);
-            CHECK(park_lookup_used() == 0);
+            CHECK(places_are(0, 2000) && lk_stats().in_flight == 0);
             {
                 store_zone_t lz;
                 CHECK(zrec(st, "late.test", &lz) && lz.state == STORE_STATE_KNOWN && lz.source_id == (int64_t)zid_sid && lz.stamp_gen == 5 && lz.stamp_time == 6);
@@ -2754,16 +2767,24 @@ static int run_proto(int phase, const char *dir) {
                 CHECK(zref_of("late.test.", &zr) && zr.entry == NULL && zr.zid != ZREF_NOZID && zr.zstate == ZREF_ST_KNOWN);      /* (the query is looked up again: the zone is there, to be read) */
                 CHECK(db_recon_delete("default", (int64_t)zid_sid, NULL) == 1);       /* (not a zone of the pass that follows: the scan of the wanted bodies would ask for its body) */
             }
+            /* a loader that announced no KDB_FEAT_LOOKUP_BODY is asked in mode 2 (above) and a body that it sends after the answer all the same is no part of the request (it ended with the answer): thrown away, and
+             * the stream goes on.  Mode 3 is never sent to it. */
+            {
+                const uint64_t bad0 = lk_stats().bad_body;
+                send_zone(f[0], &e, "late.test.", 3, rid, (int64_t)zid_sid);
+                usleep(300000);
+                CHECK(!in_memory("late.test.") && lk_stats().body_inline == 0 && lk_stats().bad_body == bad0);
+            }
             /* no zone has the name: nothing is recorded; the query is woken, and answered as for any name that is not served */
             drain_wakes();
-            CHECK(park_lookup_take() && park_fetch_request(0, "default", "nothing.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
+            CHECK(park_fetch_request(0, "default", "nothing.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
             CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && m.u.fetch_req.mode == KDB_FETCH_LOOKUP && strcmp(m.u.fetch_req.name, "nothing.test.") == 0);
             kdb_enc_begin(&e, KDB_T_LOOKUP_RESULT);
             kdb_enc_u64(&e, 1, m.u.fetch_req.request_id); kdb_enc_u16(&e, 2, 0); kdb_enc_u8(&e, 3, 0);
             kdb_enc_end(&e);
             ch_send(f[0], &e);
             CHECK(wake_for("nothing.test.", &k, 5000) && !k.failed && !k.retry);
-            CHECK(park_lookup_used() == 0);
+            CHECK(places_are(0, 2000) && lk_stats().in_flight == 0);
             {
                 zref_t zr;
                 CHECK(!zref_of("nothing.test.", &zr));
@@ -2771,7 +2792,7 @@ static int run_proto(int phase, const char *dir) {
             /* a loader that names a zone that does not enclose the name (or the root) is not believed: nothing is recorded, the query is woken */
             for (int bad = 0; bad < 2; bad++) {
                 drain_wakes();
-                CHECK(park_lookup_take() && park_fetch_request(0, "default", "www.evil.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
+                CHECK(park_fetch_request(0, "default", "www.evil.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
                 CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "www.evil.test.") == 0);
                 kdb_enc_begin(&e, KDB_T_LOOKUP_RESULT);
                 kdb_enc_u64(&e, 1, m.u.fetch_req.request_id); kdb_enc_u16(&e, 2, 0); kdb_enc_u8(&e, 3, 1);
@@ -2779,38 +2800,38 @@ static int run_proto(int phase, const char *dir) {
                 kdb_enc_end(&e);
                 ch_send(f[0], &e);
                 CHECK(wake_for("www.evil.test.", &k, 5000) && !k.failed);
-                CHECK(park_lookup_used() == 0);
+                CHECK(places_are(0, 2000) && lk_stats().in_flight == 0);
                 store_zone_t lz;
                 CHECK(!zrec(st, "other.test", &lz));
             }
             /* a database error (ZONE_FAILED with the request id) wakes the query too (it is refused as before, not failed), and nothing is recorded */
             drain_wakes();
-            CHECK(park_lookup_take() && park_fetch_request(0, "default", "x.fail.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
+            CHECK(park_fetch_request(0, "default", "x.fail.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
             CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "x.fail.test.") == 0);
             kdb_enc_begin(&e, KDB_T_ZONE_FAILED);
             kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, "x.fail.test."); kdb_enc_i64(&e, 3, 0); kdb_enc_str(&e, 4, "looking up the zone of a name: the database is busy"); kdb_enc_u64(&e, 5, m.u.fetch_req.request_id);
             kdb_enc_end(&e);
             ch_send(f[0], &e);
             CHECK(wake_for("x.fail.test.", &k, 5000) && !k.failed);
-            CHECK(park_lookup_used() == 0);
+            CHECK(places_are(0, 2000) && lk_stats().in_flight == 0);
             /* a name the stream cannot carry (a request of a worker is checked before it is sent: a name the loader's decoder refuses would close the stream) is woken without a request */
             drain_wakes();
-            CHECK(park_lookup_take() && park_fetch_request(0, "default", "No.Dot", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
+            CHECK(park_fetch_request(0, "default", "No.Dot", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
             CHECK(wake_for("No.Dot", &k, 5000) && !k.failed && !ch_next(&fetchc, &m, 200));
-            CHECK(park_lookup_used() == 0);
+            CHECK(places_are(0, 2000) && lk_stats().in_flight == 0);
             /* a view the configuration does not have: no request */
             drain_wakes();
-            CHECK(park_lookup_take() && park_fetch_request(0, "noview", "a.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
-            for (int t = 0; t < 400 && park_lookup_used() != 0; t++) usleep(5000);
-            CHECK(park_lookup_used() == 0 && !ch_next(&fetchc, &m, 200));
+            CHECK(park_fetch_request(0, "noview", "a.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
+            usleep(300000);                                                                   /* (woken by the name of that view: wake_for() looks at "default" only) */
+            CHECK(places_are(0, 2000) && !ch_next(&fetchc, &m, 200));
             /* a request that the loader does not answer ends as a failure of the lookup: the query is woken, the place is given back */
             drain_wakes();
             g_ing_fetch_timeout_ms = 300;
-            CHECK(park_lookup_take() && park_fetch_request(0, "default", "slow.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
+            CHECK(park_fetch_request(0, "default", "slow.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
             CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "slow.test.") == 0);
             CHECK(wake_for("slow.test.", &k, 12000) && !k.failed);
             g_ing_fetch_timeout_ms = 30000;
-            CHECK(park_lookup_used() == 0);
+            CHECK(places_are(0, 2000) && lk_stats().failed >= 1);
             /* the worker's side (udp_one(): lookup_wanted(), udp_park_lookup()): a query for a name of a zone the pass has not listed is parked for the lookup, not refused; the zone that is found is read as any zone
              * that the store knows without a body, and the query is answered from it */
             {
@@ -2820,7 +2841,7 @@ static int run_proto(int phase, const char *dir) {
                 int llen = 0;
                 drain_wakes();
                 wk_send(&lw, "late2.test.", 6);                                             /* (SOA) */
-                CHECK(lw.w.n_tx == 0 && lw.table.nwait == 1 && park_lookup_used() == 1);
+                CHECK(lw.w.n_tx == 0 && lw.table.nwait == 1 && lw.table.nlook == 1 && places_are(1, 2000));
                 CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && m.u.fetch_req.mode == KDB_FETCH_LOOKUP && strcmp(m.u.fetch_req.name, "late2.test.") == 0);
                 kdb_enc_begin(&e, KDB_T_LOOKUP_RESULT);
                 kdb_enc_u64(&e, 1, m.u.fetch_req.request_id); kdb_enc_u16(&e, 2, 0); kdb_enc_u8(&e, 3, 1);
@@ -2837,7 +2858,7 @@ static int run_proto(int phase, const char *dir) {
                 CHECK(got_req && m.type == KDB_T_FETCH_REQ && m.u.fetch_req.mode == KDB_FETCH_FULL && strcmp(m.u.fetch_req.name, "late2.test.") == 0 && m.u.fetch_req.source_id == 777100);
                 send_zone(f[0], &e, "late2.test.", 3, m.u.fetch_req.request_id, 777100);
                 CHECK(wk_wait_answer(&lw, lgot, &llen, 5000) && llen > 12 && (lgot[3] & 0x0F) == 0 && (lgot[2] & 0x04) != 0);        /* (NOERROR, authoritative) */
-                CHECK(park_lookup_used() == 0 && lw.table.nwait == 0);
+                CHECK(places_are(0, 2000) && lw.table.nwait == 0 && lw.table.nlook == 0);
                 CHECK(db_recon_delete("default", 777100, NULL) == 1);
                 /* no zone: the query is refused when the answer comes (the normal answer for a name that is not served) */
                 wk_send(&lw, "nothing2.test.", 1);
@@ -2848,11 +2869,11 @@ static int run_proto(int phase, const char *dir) {
                 kdb_enc_end(&e);
                 ch_send(f[0], &e);
                 CHECK(wk_wait_answer(&lw, lgot, &llen, 5000) && (lgot[3] & 0x0F) == 5);          /* (REFUSED) */
-                CHECK(park_lookup_used() == 0 && lw.table.nwait == 0);
+                CHECK(places_are(0, 2000) && lw.table.nwait == 0);
                 /* the same name asked twice by one worker is one request (the second query joins the first), and a DS query asks for the parent of its name */
                 wk_send(&lw, "dup.nothing2.test.", 1);
                 wk_send(&lw, "dup.nothing2.test.", 1);
-                CHECK(lw.w.n_tx == 0 && lw.table.nwait == 2 && park_lookup_used() == 1);
+                CHECK(lw.w.n_tx == 0 && lw.table.nwait == 2 && lw.table.nlook == 2 && places_are(1, 2000));
                 CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "dup.nothing2.test.") == 0);
                 CHECK(!ch_next(&fetchc, &m, 200));
                 kdb_enc_begin(&e, KDB_T_LOOKUP_RESULT);
@@ -2869,18 +2890,46 @@ static int run_proto(int phase, const char *dir) {
                 kdb_enc_end(&e);
                 ch_send(f[0], &e);
                 CHECK(wk_wait_answer(&lw, lgot, &llen, 5000) && (lgot[3] & 0x0F) == 5);
-                /* the places of the lookups are used up: the query is refused at once, nothing is parked, no request is made */
-                park_lookup_set_limit(1);
-                g_ing_fetch_timeout_ms = 300;
-                wk_send(&lw, "first.nothing4.test.", 1);
-                CHECK(lw.table.nwait == 1);
-                wk_send(&lw, "second.nothing4.test.", 1);
-                CHECK(lw.table.nwait == 1 && lw.w.n_tx == 1 && wk_get(&lw, lgot) > 12 && (lgot[3] & 0x0F) == 5);
-                CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "first.nothing4.test.") == 0 && !ch_next(&fetchc, &m, 200));
-                park_lookup_set_limit(PARK_LOOKUP_MAX);
-                CHECK(wk_wait_answer(&lw, lgot, &llen, 8000) && (lgot[3] & 0x0F) == 5);          /* (never answered: the lookup times out, the query is refused as before) */
-                g_ing_fetch_timeout_ms = 30000;
-                CHECK(park_lookup_used() == 0 && lw.table.nwait == 0);
+                /* many lookups at once (the old window of 32 is gone): none is refused for the lack of a place; the ones that get no place now wait for one (fetch-concurrency 16, the lookups may hold 12 of them) and
+                 * the query is parked all the same, answered when its lookup is */
+                {
+                    enum { NLK = 40 };
+                    drain_wakes();
+                    for (int i = 0; i < NLK; i++) {
+                        char nm[64];
+                        snprintf(nm, sizeof(nm), "w%d.many.test.", i);
+                        wk_send(&lw, nm, 1);
+                    }
+                    CHECK(lw.w.n_tx == 0 && lw.table.nwait == NLK && lw.table.nlook == NLK);
+                    int got = 0;
+                    uint64_t rids[NLK];
+                    while (got < NLK && ch_next(&fetchc, &m, got < 12 ? 5000 : 300)) {
+                        if (m.type != KDB_T_FETCH_REQ || m.u.fetch_req.mode != KDB_FETCH_LOOKUP) break;
+                        rids[got++] = m.u.fetch_req.request_id;
+                    }
+                    printf("  (%d of %d lookups were sent at once; the others wait for a place)\n", got, NLK);
+                    CHECK(got >= 4 && got <= 12);                                                    /* (a share of the places: not all, not none) */
+                    CHECK(lk_stats().in_flight == (uint64_t)got && lk_stats().pending == (uint64_t)(NLK - got) && places_are((uint32_t)got, 2000));
+                    for (int i = 0; i < got; i++) {                                                    /* (each answer frees its place at once; the next request goes out) */
+                        kdb_enc_begin(&e, KDB_T_LOOKUP_RESULT);
+                        kdb_enc_u64(&e, 1, rids[i]); kdb_enc_u16(&e, 2, 0); kdb_enc_u8(&e, 3, 0);
+                        kdb_enc_end(&e);
+                        ch_send(f[0], &e);
+                    }
+                    int more = 0;
+                    while (more < NLK - got && ch_next(&fetchc, &m, 3000) && m.type == KDB_T_FETCH_REQ) {      /* (the queue goes out as the places come back) */
+                                                kdb_enc_begin(&e, KDB_T_LOOKUP_RESULT);
+                        kdb_enc_u64(&e, 1, m.u.fetch_req.request_id); kdb_enc_u16(&e, 2, 0); kdb_enc_u8(&e, 3, 0);
+                        kdb_enc_end(&e);
+                        ch_send(f[0], &e);
+                        more++;
+                    }
+                    CHECK(got + more == NLK);
+                    int refused = 0;
+                    while (refused < NLK && wk_wait_answer(&lw, lgot, &llen, 5000) && (lgot[3] & 0x0F) == 5) refused++;
+                    CHECK(refused == NLK && lw.table.nwait == 0 && lw.table.nlook == 0);                /* (REFUSED when the zone is not there, as for any name: never for the lack of a place) */
+                    CHECK(places_are(0, 3000) && lk_stats().pending == 0 && lk_stats().in_flight == 0 && lk_stats().none >= (uint64_t)NLK);
+                }
                 park_free(&lw.table);
             }
         }
@@ -2900,9 +2949,9 @@ static int run_proto(int phase, const char *dir) {
             static wk_t lw2;
             wk_init(&lw2);
             uint8_t g2[1232];
-            const uint64_t lk0 = park_lookup_used();
+            const uint64_t lk0 = lk_stats().asked;
             wk_send(&lw2, "after.nothing5.test.", 1);
-            CHECK(lw2.w.n_tx == 1 && lw2.table.nwait == 0 && wk_get(&lw2, g2) > 12 && (g2[3] & 0x0F) == 5 && park_lookup_used() == lk0);
+            CHECK(lw2.w.n_tx == 1 && lw2.table.nwait == 0 && wk_get(&lw2, g2) > 12 && (g2[3] & 0x0F) == 5 && lk_stats().asked == lk0);
             park_free(&lw2.table);
         }
         {
@@ -4544,17 +4593,269 @@ static int run_s5(const char *mode) {
     test_exit(g_failed ? 1 : 0);
 }
 
+/* ---------------------------------------------------------------- phase 7: the lookup with the body of the zone (0.7, FETCH_REQ mode 3, KDB_FEAT_LOOKUP_BODY) */
+static void lk_found(int fd, kdb_enc_t *e, uint64_t rid, int64_t sid, const char *zone, uint64_t gen, uint64_t at) {
+    kdb_enc_begin(e, KDB_T_LOOKUP_RESULT);
+    kdb_enc_u64(e, 1, rid); kdb_enc_u16(e, 2, 0); kdb_enc_u8(e, 3, 1);
+    kdb_enc_i64(e, 4, sid); kdb_enc_name(e, 5, zone); kdb_enc_u8(e, 6, KDB_ZK_PRIMARY); kdb_enc_u64(e, 7, gen); kdb_enc_u64(e, 8, at); kdb_enc_u8(e, 9, KDB_EF_STAMPED);
+    kdb_enc_end(e);
+    ch_send(fd, e);
+}
+static void lk_none(int fd, kdb_enc_t *e, uint64_t rid) {
+    kdb_enc_begin(e, KDB_T_LOOKUP_RESULT);
+    kdb_enc_u64(e, 1, rid); kdb_enc_u16(e, 2, 0); kdb_enc_u8(e, 3, 0);
+    kdb_enc_end(e);
+    ch_send(fd, e);
+}
+/* the next request on the fetch stream must be the lookup of `name` with the body (mode 3): its id (0 when it is not) */
+static uint64_t lk_next(ch_t *c, const char *name) {
+    kdb_msg_t m;
+    if (!ch_next(c, &m, 5000) || m.type != KDB_T_FETCH_REQ || m.u.fetch_req.mode != KDB_FETCH_LOOKUP_FULL || strcmp(m.u.fetch_req.name, name) != 0 || m.u.fetch_req.source_id != 0 || m.u.fetch_req.has_range) {
+        CHECK_MSG(false, "the request of the lookup of %s", name);
+        return 0;
+    }
+    return m.u.fetch_req.request_id;
+}
+static bool lk_asked(const char *name) { return park_fetch_request(0, "default", name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP); }
+
+static int run_lookup_body(const char *dir) {
+    printf("[the lookup with the body of the zone: phase 7]\n");
+    char sdir[600];
+    snprintf(sdir, sizeof(sdir), "%s/s", dir);
+    static server_config_t cfg;
+    char conf[2048];
+    snprintf(conf, sizeof(conf),
+             "options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; store \"%s\"; store-mode map; "
+             "store-threads 2; fetch-concurrency 8; park-timeout 1000; }; };\n"
+             "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", sdir);
+    CHECK(parse_named_conf(conf, &cfg) == 0);
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    rebuild_zone_db_from_config(&cfg, false);
+    char msg[400];
+    CHECK(db_store_frontend_open(&cfg.database, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg)) && db_store_dir_fd() >= 0);
+    CHECK(db_store_start(&cfg) && db_store_enabled());
+    store_t *st = db_store_handle();
+    CHECK(st != NULL);
+    int a[2], f[2], cs[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, f) == 0 && socketpair(AF_UNIX, SOCK_SEQPACKET, 0, cs) == 0);
+    int ends[3] = { a[1], f[1], cs[1] };
+    for (int i = 0; i < 3; i++) fcntl(ends[i], F_SETFL, fcntl(ends[i], F_GETFL, 0) | O_NONBLOCK);
+    park_register_worker(0, -1);
+    CHECK(db_ingest_start(a[1], cs[1], f[1]));
+    static ch_t mainc, fetchc;
+    ch_init(&mainc, a[0], KDB_FROM_BACKEND);
+    ch_init(&fetchc, f[0], KDB_FROM_BACKEND);
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    kdb_msg_t m;
+    park_key_t k;
+    memset(&g_wctx, 0, sizeof(g_wctx));
+    g_query_bg_fetch = no_bg_fetch;
+    g_query_bg_attach = no_bg_fetch;
+
+    kdb_enc_begin(&e, KDB_T_HELLO);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242);
+    kdb_enc_u32(&e, 5, KDB_FEAT_STORE | KDB_FEAT_LOOKUP | KDB_FEAT_LOOKUP_BODY);
+    kdb_enc_end(&e);
+    ch_send(a[0], &e);
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG && m.u.config.store_proto);
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_DEBUG);
+    CHECK(db_ingest_lookup_ready());
+    usleep(300000);                                                                        /* (the manager's thread has taken fetch-concurrency 8 and park-timeout 1000 ms) */
+    CHECK(!ch_next(&fetchc, &m, 200));
+    const int vid = store_view_id(st, "default");
+    CHECK(vid >= 0 && db_store_view_pending(vid));                                         /* (no pass has listed the zones: the lookups are what finds them) */
+    uint32_t sr;
+    int64_t sid;
+
+    /* -- 1. the happy path: the answer names the zone, the body follows with the same request id.  The zone is answerable after one request: no second FETCH_REQ is made, the queries that wait for the name
+     *       are woken when the body is installed (not at the answer), the place is held until then */
+    drain_wakes();
+    CHECK(lk_asked("www.late.test."));
+    uint64_t rid = lk_next(&fetchc, "www.late.test.");
+    CHECK(rid != 0 && places_are(1, 2000));
+    lk_found(f[0], &e, rid, 777000, "late.test.", 5, 6);
+    {
+        store_zone_t lz;
+        bool known = false;
+        for (int t = 0; t < 500 && !known; t++) { known = zrec(st, "late.test", &lz) && lz.state == STORE_STATE_KNOWN; if (!known) usleep(10000); }
+        CHECK(known && lz.source_id == 777000 && lz.stamp_gen == 5 && lz.stamp_time == 6);
+    }
+    CHECK(!wake_for("www.late.test.", &k, 200) && park_places_used() == 1 && lk_stats().in_flight == 1 && lk_stats().found == 1);       /* (the body has not come: the queries wait) */
+    send_zone(f[0], &e, "late.test.", 3, rid, 777000);
+    CHECK(wake_for("www.late.test.", &k, 5000) && !k.failed && !k.retry);
+    CHECK(in_memory("late.test.") && dbreg_zone_version("default", "late.test.", &sid, &sr) && sid == 777000 && sr == 3);
+    CHECK(places_are(0, 2000) && lk_stats().in_flight == 0 && lk_stats().body_inline == 1 && lk_stats().bad_body == 0);
+    {
+        store_zone_t lz;
+        CHECK(zrec(st, "late.test", &lz) && lz.state == STORE_STATE_STORED && lz.stamp_gen == 5 && lz.stamp_time == 6);      /* (installed under the stamp the answer made) */
+    }
+    CHECK(!ch_next(&fetchc, &m, 300));                                                        /* (one round trip: no request for the zone followed) */
+
+    /* -- 2. a name whose zone is known meanwhile is not asked for (another name of the zone found it): the queries are woken */
+    drain_wakes();
+    CHECK(lk_asked("mail.late.test."));
+    CHECK(wake_for("mail.late.test.", &k, 5000) && !k.failed && !ch_next(&fetchc, &m, 200) && places_are(0, 1000) && lk_stats().covered == 1);
+
+    /* -- 3. no zone: the place is free the moment the answer is here, and the queries are woken (the normal answer is REFUSED) */
+    drain_wakes();
+    CHECK(lk_asked("www.nothing.test."));
+    rid = lk_next(&fetchc, "www.nothing.test.");
+    CHECK(places_are(1, 2000));
+    lk_none(f[0], &e, rid);
+    CHECK(wake_for("www.nothing.test.", &k, 5000) && !k.failed && park_places_used() == 0 && lk_stats().none == 1);
+
+    /* -- 4. a loader that cannot be believed (the stream is hostile input).  Nothing it says is installed unless the answer announced it; the request goes on until the right body or the time is up. */
+    {
+        /* a body with no answer before it */
+        const uint64_t bad0 = lk_stats().bad_body;
+        drain_wakes();
+        CHECK(lk_asked("w.body0.test."));
+        rid = lk_next(&fetchc, "w.body0.test.");
+        send_zone(f[0], &e, "body0.test.", 3, rid, 880000);
+        for (int t = 0; t < 200 && lk_stats().bad_body == bad0; t++) usleep(5000);
+        CHECK(lk_stats().bad_body == bad0 + 1 && !in_memory("body0.test.") && park_places_used() == 1);
+        lk_none(f[0], &e, rid);
+        CHECK(wake_for("w.body0.test.", &k, 5000) && places_are(0, 2000));
+        /* a body for another zone than the answer named, and one for the zone with another source id: thrown away, the request waits for the right one */
+        for (int kase = 0; kase < 2; kase++) {
+            const char *qn = kase ? "w.body2.test." : "w.body1.test.", *zn = kase ? "body2.test." : "body1.test.";
+            const int64_t zs = kase ? 880002 : 880001;
+            const uint64_t b1 = lk_stats().bad_body;
+            drain_wakes();
+            CHECK(lk_asked(qn));
+            rid = lk_next(&fetchc, qn);
+            lk_found(f[0], &e, rid, zs, zn, 1, 1);
+            if (kase) send_zone(f[0], &e, zn, 3, rid, zs + 100);                              /* (the zone, with another id) */
+            else send_zone(f[0], &e, "other1.test.", 3, rid, zs);                            /* (another zone) */
+            for (int t = 0; t < 200 && lk_stats().bad_body == b1; t++) usleep(5000);
+            CHECK(lk_stats().bad_body == b1 + 1 && !in_memory("other1.test.") && !in_memory(zn) && park_places_used() == 1);
+            CHECK(!wake_for(qn, &k, 100));
+            send_zone(f[0], &e, zn, 3, rid, zs);                                              /* (the right one) */
+            CHECK(wake_for(qn, &k, 5000) && !k.failed && in_memory(zn) && places_are(0, 2000));
+        }
+        /* two bodies for one request: the second is thrown away (the request is over when the first is installed) */
+        drain_wakes();
+        CHECK(lk_asked("w.body3.test."));
+        rid = lk_next(&fetchc, "w.body3.test.");
+        lk_found(f[0], &e, rid, 880003, "body3.test.", 1, 1);
+        send_zone(f[0], &e, "body3.test.", 3, rid, 880003);
+        send_zone(f[0], &e, "body3.test.", 4, rid, 880003);
+        CHECK(wake_for("w.body3.test.", &k, 5000) && places_are(0, 2000));
+        usleep(200000);
+        CHECK(in_memory("body3.test.") && dbreg_zone_version("default", "body3.test.", &sid, &sr) && sr == 3);
+        /* a second answer after the first: no part of the request; the body that follows the first is the one that counts */
+        drain_wakes();
+        CHECK(lk_asked("w.body4.test."));
+        rid = lk_next(&fetchc, "w.body4.test.");
+        lk_found(f[0], &e, rid, 880004, "body4.test.", 1, 1);
+        lk_none(f[0], &e, rid);
+        send_zone(f[0], &e, "body4.test.", 3, rid, 880004);
+        CHECK(wake_for("w.body4.test.", &k, 5000) && in_memory("body4.test.") && places_are(0, 2000));
+        /* an answer that names a zone that does not enclose the name: the request fails, and the body that follows is thrown away */
+        drain_wakes();
+        CHECK(lk_asked("w.evil.test."));
+        rid = lk_next(&fetchc, "w.evil.test.");
+        lk_found(f[0], &e, rid, 880005, "other5.test.", 1, 1);
+        CHECK(wake_for("w.evil.test.", &k, 5000) && places_are(0, 2000));
+        send_zone(f[0], &e, "other5.test.", 3, rid, 880005);
+        usleep(200000);
+        {
+            store_zone_t lz;
+            CHECK(!in_memory("other5.test.") && !zrec(st, "other5.test", &lz));
+        }
+        /* the body cannot be read: ZONE_FAILED with the request id and the zone's name; the queries are woken (not failed), the record stays (known) for the fetch that a query then asks for */
+        drain_wakes();
+        CHECK(lk_asked("w.knownz.test."));
+        rid = lk_next(&fetchc, "w.knownz.test.");
+        lk_found(f[0], &e, rid, 777999, "knownz.test.", 1, 1);
+        kdb_enc_begin(&e, KDB_T_ZONE_FAILED);
+        kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, "knownz.test."); kdb_enc_i64(&e, 3, 777999); kdb_enc_str(&e, 4, "reading the records: the database is busy"); kdb_enc_u64(&e, 5, rid);
+        kdb_enc_end(&e);
+        ch_send(f[0], &e);
+        CHECK(wake_for("w.knownz.test.", &k, 5000) && !k.failed && places_are(0, 2000));
+        {
+            store_zone_t lz;
+            CHECK(zrec(st, "knownz.test", &lz) && lz.state == STORE_STATE_KNOWN && !in_memory("knownz.test."));
+        }
+    }
+
+    /* -- 5. two names of one zone asked for at once: the first answer starts the fetch of the zone, the second finds it on its way (or in memory): its body is read through and thrown away, the zone is installed once,
+     *       and both queries are woken */
+    {
+        drain_wakes();
+        CHECK(lk_asked("a.skip.test.") && lk_asked("b.skip.test."));
+        const uint64_t ra = lk_next(&fetchc, "a.skip.test."), rb = lk_next(&fetchc, "b.skip.test.");
+        CHECK(places_are(2, 2000));
+        lk_found(f[0], &e, ra, 990001, "skip.test.", 1, 1);
+        lk_found(f[0], &e, rb, 990001, "skip.test.", 1, 1);
+        CHECK(wake_for("b.skip.test.", &k, 5000) && !k.failed && !in_memory("skip.test."));        /* (not the body's: it is not read) */
+        const uint64_t bad0 = lk_stats().bad_body;
+        send_zone(f[0], &e, "skip.test.", 3, ra, 990001);
+        CHECK(wake_for("a.skip.test.", &k, 5000) && in_memory("skip.test.") && places_are(1, 2000));
+        send_zone(f[0], &e, "skip.test.", 4, rb, 990001);                                         /* (the loader sends it all the same) */
+        CHECK(places_are(0, 5000) && lk_stats().bad_body == bad0 && dbreg_zone_version("default", "skip.test.", &sid, &sr) && sr == 3);
+    }
+
+    /* -- 6. the places: the lookups may take three quarters of fetch-concurrency (6 of 8); the rest of them wait in a queue of their own, a fetch of a zone is not held up by them, each answer frees its place at once
+     *       and the next lookup goes, and a lookup that waits longer than park-timeout (1 s) is dropped and its queries woken */
+    {
+        drain_wakes();
+        char nm[40];
+        uint64_t qr[10];
+        const uint64_t exp0 = lk_stats().expired;
+        for (int i = 0; i < 10; i++) {
+            snprintf(nm, sizeof(nm), "q%d.nz.test.", i);
+            CHECK(lk_asked(nm));
+        }
+        for (int i = 0; i < 6; i++) {
+            snprintf(nm, sizeof(nm), "q%d.nz.test.", i);
+            qr[i] = lk_next(&fetchc, nm);
+        }
+        CHECK(!ch_next(&fetchc, &m, 300));                                                        /* (the share is used: the others wait) */
+        CHECK(lk_stats().in_flight == 6 && lk_stats().pending == 4 && places_are(6, 2000));
+        lk_none(f[0], &e, qr[0]);                                                                 /* (the answer "none" gives the place back, and the oldest that waited goes out) */
+        qr[6] = lk_next(&fetchc, "q6.nz.test.");
+        CHECK(lk_stats().in_flight == 6 && lk_stats().pending == 3 && park_places_used() == 6);
+        CHECK(park_fetch_request(0, "default", "knownz.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));        /* (a zone that the store knows: the two places that are left are its) */
+        CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && m.u.fetch_req.mode == KDB_FETCH_FULL && strcmp(m.u.fetch_req.name, "knownz.test.") == 0 && places_are(7, 2000));
+        send_zone(f[0], &e, "knownz.test.", 3, m.u.fetch_req.request_id, 777999);
+        CHECK(wake_for("knownz.test.", &k, 5000) && !k.failed && in_memory("knownz.test.") && places_are(6, 2000));
+        for (int i = 7; i < 10; i++) {                                                            /* (the three that are left wait their park-timeout out: dropped, their queries woken, nothing is asked) */
+            snprintf(nm, sizeof(nm), "q%d.nz.test.", i);
+            CHECK(wake_for(nm, &k, 5000) && !k.failed);
+        }
+        CHECK(lk_stats().expired == exp0 + 3 && lk_stats().pending == 0 && !ch_next(&fetchc, &m, 300));
+        for (int i = 1; i <= 6; i++) lk_none(f[0], &e, qr[i]);
+        CHECK(places_are(0, 3000) && lk_stats().in_flight == 0);
+        /* the claim of a name that was dropped is free: it can be asked for again */
+        CHECK(lk_asked("q7.nz.test."));
+        rid = lk_next(&fetchc, "q7.nz.test.");
+        lk_none(f[0], &e, rid);
+        CHECK(places_are(0, 3000));
+    }
+    {
+        const store_lookup_t ls = lk_stats();
+        printf("  (lookups: asked %llu, found %llu, none %llu, failed %llu, body_inline %llu, bad_body %llu, covered %llu, expired %llu)\n", (unsigned long long)ls.asked, (unsigned long long)ls.found,
+               (unsigned long long)ls.none, (unsigned long long)ls.failed, (unsigned long long)ls.body_inline, (unsigned long long)ls.bad_body, (unsigned long long)ls.covered, (unsigned long long)ls.expired);
+        CHECK(ls.body_inline == 7 && ls.found == 8 && ls.in_flight == 0 && ls.pending == 0);
+    }
+    printf("%d checks, %d failed\n", g_checks, g_failed);
+    fflush(stdout);
+    test_exit(g_failed ? 1 : 0);
+}
+
 static int proto_main(const char *self) {
     char dir[600];
     const char *tmp = getenv("TMPDIR");
     snprintf(dir, sizeof(dir), "%s/test_db_store_proto.XXXXXX", tmp && *tmp ? tmp : "/tmp");
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
     int bad = 0;
-    for (int phase = 0; phase < 7; phase++) {
+    for (int phase = 0; phase < 8; phase++) {
         char cmd[900];
         snprintf(cmd, sizeof(cmd), "%s proto%d %s", self, phase, dir);
         if (system(cmd) != 0) bad++;
-        if (phase == 0 || phase == 2 || phase == 3 || phase == 5) {                   /* (phase 0 is the legacy loader on an empty store, phase 3 the fixes of the review, phase 4 the settings: the next phases start on a new store; phase 5 follows phase 4 on its store) */
+        if (phase == 0 || phase == 2 || phase == 3 || phase == 5 || phase == 6) {                   /* (phase 0 is the legacy loader on an empty store, phase 3 the fixes of the review, phase 4 the settings: the next phases start on a new store; phase 5 follows phase 4 on its store) */
             char rm[700];
             snprintf(rm, sizeof(rm), "rm -rf %s/s", dir);
             (void)!system(rm);
@@ -4739,6 +5040,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "heap") == 0) return run_heap(argc > 2 ? atoi(argv[2]) : 100000, argc > 3 ? argv[3] : "map");
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '3') return run_fixes(argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '6') return run_stamp_race(argv[2]);
+    if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '7') return run_lookup_body(argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && (argv[1][5] == '4' || argv[1][5] == '5')) return run_settings(argv[1][5] - '0', argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] >= '0' && argv[1][5] <= '2') return run_proto(argv[1][5] - '0', argv[2]);
     if (argc > 1) return run_mode(strcmp(argv[1], "copy") == 0 ? "copy" : "map");

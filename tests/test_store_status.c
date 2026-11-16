@@ -263,6 +263,17 @@ static void test_threads(void) {
 }
 
 static bool g_recon_guard;
+/* 0.7: the lookups of the first start (store.lookup.*) */
+static bool lookup_fn(store_lookup_t *o) {
+  memset(o, 0, sizeof(*o));
+  o->ready = true;
+  o->asked = 90; o->found = 40; o->none = 45; o->failed = 2; o->pending = 3; o->peak = 17; o->in_flight = 5; o->take_fail = 6; o->body_inline = 38; o->bad_body = 1; o->refused = 4;
+  o->same_name = 7; o->covered = 8; o->shed = 9; o->expired = 10;
+  o->hist[10] = 90;                                                   /* (<= 1024 us) */
+  o->max_ns = 1000000;
+  return true;
+}
+
 static bool recon_fn(store_recon_t *o) {
   memset(o, 0, sizeof(*o));
   snprintf(o->view, sizeof(o->view), "default");
@@ -336,6 +347,40 @@ static void test_none(void) {
   store_status_format(tx, STORE_STATUS_OUT_MAX, STORE_FMT_TEXT, NULL);
   CHECK(strstr(tx, "recon") != NULL);
   store_status_set_recon_fn(NULL);
+  /* 0.7: the lookups of the first start (store.lookup.*): not there without a function, every figure and the time to the answer with one */
+  store_status_format(buf, STORE_STATUS_OUT_MAX, STORE_FMT_JSON, NULL);
+  CHECK(parse_json(buf));
+  CHECK_EQ(kv_num("store.lookup.available"), 0);
+  CHECK(kv_get("store.lookup.asked") == NULL);
+  store_status_set_lookup_fn(lookup_fn);
+  store_status_format(buf, STORE_STATUS_OUT_MAX, STORE_FMT_JSON, NULL);
+  CHECK(parse_json(buf));
+  CHECK_EQ(kv_num("store.lookup.available"), 1);
+  CHECK_EQ(kv_num("store.lookup.ready"), 1);
+  CHECK_EQ(kv_num("store.lookup.asked"), 90);
+  CHECK_EQ(kv_num("store.lookup.found"), 40);
+  CHECK_EQ(kv_num("store.lookup.none"), 45);
+  CHECK_EQ(kv_num("store.lookup.failed"), 2);
+  CHECK_EQ(kv_num("store.lookup.pending"), 3);
+  CHECK_EQ(kv_num("store.lookup.pending_peak"), 17);
+  CHECK_EQ(kv_num("store.lookup.in_flight"), 5);
+  CHECK_EQ(kv_num("store.lookup.take_fail"), 6);
+  CHECK_EQ(kv_num("store.lookup.body_inline"), 38);
+  CHECK_EQ(kv_num("store.lookup.bad_body"), 1);
+  CHECK_EQ(kv_num("store.lookup.refused"), 4);
+  CHECK_EQ(kv_num("store.lookup.same_name"), 7);
+  CHECK_EQ(kv_num("store.lookup.covered"), 8);
+  CHECK_EQ(kv_num("store.lookup.shed"), 9);
+  CHECK_EQ(kv_num("store.lookup.expired"), 10);
+  CHECK_EQ(kv_num("store.lookup.rtt.p50_us"), 1024);
+  CHECK_EQ(kv_num("store.lookup.rtt.p99_us"), 1024);
+  CHECK_EQ(kv_num("store.lookup.rtt.max_us"), 1000);
+  CHECK_EQ(kv_num("store.lookup.rtt.hist.le_1024us"), 90);
+  store_status_format(kv, STORE_STATUS_OUT_MAX, STORE_FMT_KV, NULL);
+  CHECK(kv_matches_json(kv) && strstr(kv, "store.lookup.body_inline=38\n") != NULL);
+  store_status_format(tx, STORE_STATUS_OUT_MAX, STORE_FMT_TEXT, NULL);
+  CHECK(strstr(tx, "lookup") != NULL && strstr(tx, "le_1024us") == NULL);
+  store_status_set_lookup_fn(NULL);
   free(buf); free(kv); free(tx);
 }
 

@@ -112,6 +112,20 @@ typedef struct store_extra {
 } store_extra_t;
 void store_status_set_extra_fn(bool (*fn)(store_extra_t *out));
 
+/* 0.7: the by-name lookups of the first start (dns_db_ingest.c: a query for a name that no stored zone covers, while the first pass has not listed every zone): `store.lookup.*`.  asked: requests of the workers taken by the ingest
+ * thread; found / none / failed: how the lookups ended (found: a zone was recorded); pending: lookups that wait for a place now (a gauge); take_fail: requests that a worker could not make because its ring was full (the query stays
+ * parked as pending and the worker asks again: never a refusal); body_inline: zones whose body came with the answer (one round trip) and was taken; in_flight: lookups out now (and the bodies that came with them); refused: not made (no
+ * loader that looks up, a view without database zones); same_name: the same name was on its way; covered: the zone of the name had become known; shed / expired: dropped because the queue was full / its time was up; bad_body: a body
+ * that the answer did not announce, thrown away; hist: the time from the request to the answer, as the attach histograms. */
+typedef struct store_lookup {
+  bool ready;                    /* the loader answers lookups (HELLO features) and the store protocol is on */
+  uint64_t asked, found, none, failed, refused, same_name, covered, shed, expired, body_inline, bad_body, take_fail;
+  uint64_t pending, in_flight, peak;
+  uint64_t hist[STORE_STATUS_HIST_BUCKETS];
+  uint64_t max_ns;
+} store_lookup_t;
+void store_status_set_lookup_fn(bool (*fn)(store_lookup_t *out));
+
 /* ---- what the server tells this module ---- */
 /* the open store (NULL: "store not configured", state=none) */
 void store_status_bind(store_t *s);

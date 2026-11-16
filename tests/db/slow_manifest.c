@@ -8,6 +8,9 @@
  *
  *   cc -DREAL_LOADER='"/path/karidns-dbloader.real"' -DRELEASE_FILE='"/path/release"' -o karidns-dbloader slow_manifest.c
  *
+ * -DHELLO_MASK=3 (optional): the features of the loader's HELLO (tag 5) are ANDed with it, so that the Backend meets a loader that has fewer of them (3: KDB_FEAT_STORE | KDB_FEAT_LOOKUP, the loader of an earlier
+ * version that does a lookup of a name without the body of the zone).  The server clears the environment of the loader, so this is a compile time choice.
+ *
  * Started by the server as `karidns-dbloader -s 3 [--debug N] [--fetch-fd 4] [--state-file F] [--log-stderr]`, which it passes on unchanged.  SIGTERM goes to the loader, and the program ends
  * with it.  A test tool: nothing here is meant to be robust beyond the test.
  */
@@ -31,8 +34,12 @@
 #ifndef RELEASE_FILE
 #error "define RELEASE_FILE"
 #endif
+#ifndef HELLO_MASK
+#define HELLO_MASK 0xFFFFFFFFu
+#endif
 
 #define HDR 12              /* KDB1: magic(4) type(2) flags(2) length(4) */
+#define T_HELLO 1
 #define T_MANIFEST_BEGIN 15
 
 typedef struct { uint8_t *p; size_t len, off, cap; } buf_t;
@@ -49,6 +56,22 @@ static void buf_add(buf_t *b, const uint8_t *d, size_t n, bool rewind) {
     }
     memcpy(b->p + b->len, d, n);
     b->len += n;
+}
+
+/* the features of a HELLO (frame at h, body length len) ANDed with mask: the TLVs are tag(2) length(2) value */
+static void mask_hello(uint8_t *h, uint32_t len, uint32_t mask) {
+    uint8_t *p = h + HDR, *end = h + HDR + len;
+    while (p + 4 <= end) {
+        const unsigned tag = ((unsigned)p[0] << 8) | p[1], vl = ((unsigned)p[2] << 8) | p[3];
+        if (p + 4 + vl > end) return;
+        if (tag == 5 && vl == 4) {
+            uint32_t v = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) | ((uint32_t)p[6] << 8) | p[7];
+            v &= mask;
+            p[4] = (uint8_t)(v >> 24); p[5] = (uint8_t)(v >> 16); p[6] = (uint8_t)(v >> 8); p[7] = (uint8_t)v;
+            return;
+        }
+        p += 4 + vl;
+    }
 }
 
 static volatile sig_atomic_t g_term;
@@ -108,10 +131,11 @@ int main(int argc, char **argv) {
         for (;;) {
             if (held == 1) break;
             if (from_loader.len - scan < HDR) break;
-            const uint8_t *h = from_loader.p + scan;
+            uint8_t *h = from_loader.p + scan;
             const uint32_t len = ((uint32_t)h[8] << 24) | ((uint32_t)h[9] << 16) | ((uint32_t)h[10] << 8) | h[11];
             if (from_loader.len - scan < HDR + (size_t)len) break;
             const unsigned type = ((unsigned)h[4] << 8) | h[5];
+            if (type == T_HELLO) mask_hello(h, len, HELLO_MASK);
             scan += HDR + len;
             fwd = scan;
             if (held == 0 && type == T_MANIFEST_BEGIN) held = 1;       /* (the MANIFEST_BEGIN goes, what follows waits) */

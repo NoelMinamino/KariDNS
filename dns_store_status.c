@@ -120,6 +120,7 @@ static bool (*_Atomic g_att_fn)(uint32_t);
 static uint64_t (*_Atomic g_att_count_fn)(void);
 static bool (*_Atomic g_recon_fn)(store_recon_t *);
 static bool (*_Atomic g_extra_fn)(store_extra_t *);
+static bool (*_Atomic g_lookup_fn)(store_lookup_t *);
 
 void store_status_bind(store_t *s) { atomic_store_explicit(&g_store, s, memory_order_release); }
 void store_status_set_memory_fn(bool (*fn)(ma_est_t *out)) { atomic_store_explicit(&g_mem_fn, fn, memory_order_release); }
@@ -127,6 +128,7 @@ void store_status_set_attached_fn(bool (*fn)(uint32_t zid)) { atomic_store_expli
 void store_status_set_attached_count_fn(uint64_t (*fn)(void)) { atomic_store_explicit(&g_att_count_fn, fn, memory_order_release); }
 void store_status_set_extra_fn(bool (*fn)(store_extra_t *out)) { atomic_store_explicit(&g_extra_fn, fn, memory_order_release); }
 void store_status_set_recon_fn(bool (*fn)(store_recon_t *out)) { atomic_store_explicit(&g_recon_fn, fn, memory_order_release); }
+void store_status_set_lookup_fn(bool (*fn)(store_lookup_t *out)) { atomic_store_explicit(&g_lookup_fn, fn, memory_order_release); }
 
 /* ------------------------------------------------------------------------------------------------------------------------------ */
 /* the entry list                                                                                                                 */
@@ -433,6 +435,39 @@ static void add_recon(list_t *l) {
   free(r);
 }
 
+/* 0.7: the by-name lookups of the first start (the figures are the ingest thread's, dns_db_ingest.c) */
+static void add_lookup(list_t *l) {
+  bool (*fn)(store_lookup_t *) = atomic_load_explicit(&g_lookup_fn, memory_order_acquire);
+  store_lookup_t *k = fn ? malloc(sizeof(*k)) : NULL;
+  if (!k || !fn(k)) {
+    free(k);
+    U("store.lookup.available", 0);
+    return;
+  }
+  U("store.lookup.available", 1);
+  U("store.lookup.ready", k->ready ? 1 : 0);
+  U("store.lookup.asked", k->asked);
+  U("store.lookup.found", k->found);
+  U("store.lookup.none", k->none);
+  U("store.lookup.failed", k->failed);
+  U("store.lookup.pending", k->pending);
+  U("store.lookup.pending_peak", k->peak);
+  U("store.lookup.in_flight", k->in_flight);
+  U("store.lookup.take_fail", k->take_fail);
+  U("store.lookup.body_inline", k->body_inline);
+  U("store.lookup.bad_body", k->bad_body);
+  U("store.lookup.refused", k->refused);
+  U("store.lookup.same_name", k->same_name);
+  U("store.lookup.covered", k->covered);
+  U("store.lookup.shed", k->shed);
+  U("store.lookup.expired", k->expired);
+  U("store.lookup.rtt.p50_us", store_status_hist_pct(k->hist, 50, k->max_ns));
+  U("store.lookup.rtt.p99_us", store_status_hist_pct(k->hist, 99, k->max_ns));
+  U("store.lookup.rtt.max_us", (k->max_ns + 999) / 1000);
+  add_hist(l, "store.lookup.rtt", k->hist);
+  free(k);
+}
+
 /* the server's own tables: the attach table, the pool of entries (design 4.2: a zone in memory costs one slot), the folded counters and the texts in memory (6.1, 6.7) */
 static void add_extra(list_t *l) {
   bool (*fn)(store_extra_t *) = atomic_load_explicit(&g_extra_fn, memory_order_acquire);
@@ -716,6 +751,7 @@ size_t store_status_format(char *out, size_t cap, int fmt, const char *zone) {
     add_memory(&l);
     add_extra(&l);
     add_recon(&l);
+    add_lookup(&l);
   }
   sb_t b = { out, cap, 0, false };
   if (fmt == STORE_FMT_JSON) write_json(&b, &l);

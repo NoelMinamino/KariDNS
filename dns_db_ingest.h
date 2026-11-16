@@ -44,6 +44,9 @@ bool db_ingest_hold_queries(void);
 /* 0.7: does the loader answer a lookup of a name (FETCH_REQ mode KDB_FETCH_LOOKUP: which zone of the view encloses it?) and is the store protocol on?  A query for a name that no stored zone covers, while a view's first
  * pass has not listed every zone, is parked for a lookup only when this is true; otherwise it is refused at once.  Any thread; no lock. */
 bool db_ingest_lookup_ready(void);
+/* the lookups' counters (dns_store_status.h, `store.lookup.*`): fills *out, true.  Any thread; no lock. */
+struct store_lookup;
+bool db_ingest_lookup_stats(struct store_lookup *out);
 
 /* `karictl dbstatus [zone [view]]`: text for the control channel (design 5.2).  Returns the length written to out
  * (always NUL terminated), or 0 when the configuration has no database block.  Control thread. */

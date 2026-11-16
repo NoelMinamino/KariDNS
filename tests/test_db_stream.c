@@ -1754,8 +1754,8 @@ static void test_fetch_req_and_inventory(void) {
     CHECK_RC("request id 0", dec_backend(&e, &m, why), KDB_E_RANGE);
     kdb_enc_reset(&e); fz_fetch_req(&e, 1, 0, ZN, KDB_FETCH_PRIO_N, 0); kdb_enc_end(&e);
     CHECK_RC("priority 3", dec_backend(&e, &m, why), KDB_E_RANGE);
-    kdb_enc_reset(&e); fz_fetch_req(&e, 1, 0, ZN, 0, KDB_FETCH_LOOKUP + 1); kdb_enc_end(&e);
-    CHECK_RC("mode 3", dec_backend(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); fz_fetch_req(&e, 1, 0, ZN, 0, KDB_FETCH_LOOKUP_FULL + 1); kdb_enc_end(&e);
+    CHECK_RC("mode 4", dec_backend(&e, &m, why), KDB_E_RANGE);
     kdb_enc_reset(&e); fz_fetch_req(&e, 1, NVIEWS, ZN, 0, 0); kdb_enc_end(&e);
     CHECK_RC("view out of range", dec_backend(&e, &m, why), KDB_E_RANGE);
     kdb_enc_reset(&e); fz_fetch_req(&e, 1, 0, ZN, 0, 0); kdb_enc_u8(&e, 9, 1); kdb_enc_end(&e);
@@ -2899,13 +2899,25 @@ static void test_lookup_proto(void) {
     kdb_enc_begin(&e, KDB_T_HELLO); kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "x"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 1); kdb_enc_u32(&e, 5, KDB_FEAT_STORE | KDB_FEAT_LOOKUP); kdb_enc_end(&e);
     CHECK_RC("HELLO with both features", dec_loader(&e, &m, why), KDB_OK);
     CHECK(m.u.hello.features == (KDB_FEAT_STORE | KDB_FEAT_LOOKUP));
+    CHECK(KDB_FEAT_STORE == 0x1 && KDB_FEAT_LOOKUP == 0x2 && KDB_FEAT_LOOKUP_BODY == 0x4);                      /* (the bits are the protocol: a loader that has the third has the second, the Backend asks mode 3 only of it) */
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_HELLO); kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "x"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 1); kdb_enc_u32(&e, 5, KDB_FEAT_STORE | KDB_FEAT_LOOKUP | KDB_FEAT_LOOKUP_BODY); kdb_enc_end(&e);
+    CHECK_RC("HELLO with the body feature", dec_loader(&e, &m, why), KDB_OK);
+    CHECK(m.u.hello.features == (KDB_FEAT_STORE | KDB_FEAT_LOOKUP | KDB_FEAT_LOOKUP_BODY));
 
     /* FETCH_REQ mode 2: a name, no range, no source id */
     kdb_enc_reset(&e); fz_fetch_req(&e, 9, 1, "www.late.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP); kdb_enc_end(&e);
     CHECK_RC("FETCH_REQ lookup", dec_backend(&e, &m, why), KDB_OK);
     CHECK(m.u.fetch_req.mode == KDB_FETCH_LOOKUP && m.u.fetch_req.request_id == 9 && strcmp(m.u.fetch_req.name, "www.late.test.") == 0 && !m.u.fetch_req.has_range && m.u.fetch_req.source_id == 0);
-    kdb_enc_reset(&e); fz_fetch_req(&e, 9, 1, "www.late.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP + 1); kdb_enc_end(&e);
-    CHECK_RC("FETCH_REQ mode 3", dec_backend(&e, &m, why), KDB_E_RANGE);
+    /* mode 3: the same request, and the body of the zone follows the answer */
+    kdb_enc_reset(&e); fz_fetch_req(&e, 9, 1, "www.late.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP_FULL); kdb_enc_end(&e);
+    CHECK_RC("FETCH_REQ lookup with the body", dec_backend(&e, &m, why), KDB_OK);
+    CHECK(m.u.fetch_req.mode == KDB_FETCH_LOOKUP_FULL && m.u.fetch_req.mode == 3 && m.u.fetch_req.request_id == 9 && strcmp(m.u.fetch_req.name, "www.late.test.") == 0 && !m.u.fetch_req.has_range && m.u.fetch_req.source_id == 0);
+    kdb_enc_reset(&e); fz_fetch_req(&e, 9, 1, "www.late.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP_FULL); kdb_enc_i64(&e, 8, 5); kdb_enc_end(&e);
+    CHECK_RC("a lookup with the body and a source id", dec_backend(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); fz_fetch_req(&e, 9, 1, "www.late.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP_FULL); kdb_enc_name(&e, 6, "a.test."); kdb_enc_name(&e, 7, "b.test."); kdb_enc_end(&e);
+    CHECK_RC("a lookup with the body and a range", dec_backend(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); fz_fetch_req(&e, 9, 1, "www.late.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP_FULL + 1); kdb_enc_end(&e);
+    CHECK_RC("FETCH_REQ mode 4", dec_backend(&e, &m, why), KDB_E_RANGE);
     kdb_enc_reset(&e); fz_fetch_req(&e, 9, 1, "www.late.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP); kdb_enc_i64(&e, 8, 5); kdb_enc_end(&e);
     CHECK_RC("a lookup with a source id", dec_backend(&e, &m, why), KDB_E_RANGE);
     kdb_enc_reset(&e); fz_fetch_req(&e, 9, 1, "www.late.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP); kdb_enc_name(&e, 6, "a.test."); kdb_enc_name(&e, 7, "b.test."); kdb_enc_end(&e);
@@ -2947,6 +2959,20 @@ static void test_lookup_proto(void) {
     CHECK_RC("on the first stream", send_in(KDB_S_READY, e.buf, e.len, NULL, why), KDB_E_STATE);
     CHECK_RC("in a batch", send_in(KDB_S_IN_BATCH, e.buf, e.len, NULL, why), KDB_E_STATE);
     CHECK(strcmp(kdb_type_name(KDB_T_LOOKUP_RESULT), "LOOKUP_RESULT") == 0);
+    {                                                                                       /* mode 3: the body of the zone follows the answer on the same stream; the answer leaves the machine where it was, and the zone is read as for a request of the zone */
+        sess_t *s = malloc(sizeof(*s));
+        sess_init_fetch(s, NULL);
+        kdb_enc_reset(&e); lk_result(&e, 9, 1, 1); lk_entry(&e); kdb_enc_end(&e);
+        CHECK_RC("the answer, then the body", sess_feed(s, e.buf, e.len, 0), KDB_OK);
+        CHECK(s->sm.state == KDB_S_READY);
+        kdb_enc_t p;
+        kdb_enc_init(&p);
+        fz_begin(&p, 1, ZN, 10, 0, KDB_ZK_PRIMARY, 9);
+        CHECK_RC("the body after the answer", sess_feed(s, p.buf, p.len, 0), KDB_OK);
+        CHECK(s->sm.state == KDB_S_IN_ZONE);
+        kdb_enc_free(&p);
+        free(s);
+    }
     kdb_enc_free(&e);
 }
 
