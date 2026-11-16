@@ -122,7 +122,7 @@ GE=$(sf store.recon.group_entries); GR=$(sf store.recon.group_records)
 SM=$(sf store.ingest.stream_max_us); LM=$(sf store.ingest.loop_max_us)
 [ -n "$SM" ] && [ "$SM" -le "$STREAM_US" ] 2>/dev/null && pass "the stream thread was not kept more than ${STREAM_US} us by a frame (store.ingest.stream_max_us=$SM; the loop of the thread: store.ingest.loop_max_us=$LM)" || fail "store.ingest.stream_max_us=$SM (limit $STREAM_US), loop_max_us=$LM"
 DR=0
-for k in store.lookup.drop.room store.lookup.drop.timeout store.lookup.drop.queue store.lookup.servfail store.lookup.shed store.lookup.expired; do
+for k in store.lookup.drop.room store.lookup.drop.timeout store.lookup.drop.queue store.lookup.servfail store.lookup.reask_suppressed store.lookup.shed store.lookup.expired; do
     v=$(sf "$k"); DR=$((DR + ${v:-0}))
 done
 for k in $($KA store -k 2>/dev/null | sed -n 's/^\(store\.park\.drop\.[a-z_]*\)=.*/\1/p'); do v=$(sf "$k"); DR=$((DR + ${v:-0})); done
