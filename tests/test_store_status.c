@@ -271,6 +271,7 @@ static bool lookup_fn(store_lookup_t *o) {
   o->asked = 90; o->found = 40; o->none = 45; o->failed = 2; o->pending = 3; o->peak = 17; o->in_flight = 5; o->take_fail = 6; o->body_inline = 38; o->bad_body = 1; o->refused = 4;
   o->same_name = 7; o->covered = 8; o->shed = 9; o->expired = 10;
   o->drop_lk_room = 11; o->drop_lk_timeout = 12; o->drop_lk_queue = 13; o->servfail = 14; o->drop_zone_room = 15; o->drop_zone_timeout = 16; o->drop_zone_queue = 17;
+  o->remembered = 18; o->reask_suppressed = 19; o->remember_releases = 20; o->drain_passes = 21; o->drain_cut = 22; o->drain_pass_max = 23; o->drain_pass_max_ns = 24001;
   o->hist[10] = 90;                                                   /* (<= 1024 us) */
   o->max_ns = 1000000;
   return true;
@@ -378,6 +379,13 @@ static void test_none(void) {
   CHECK_EQ(kv_num("store.lookup.drop.timeout"), 12);
   CHECK_EQ(kv_num("store.lookup.drop.queue"), 13);
   CHECK_EQ(kv_num("store.lookup.servfail"), 14);
+  CHECK_EQ(kv_num("store.lookup.remembered"), 18);
+  CHECK_EQ(kv_num("store.lookup.reask_suppressed"), 19);
+  CHECK_EQ(kv_num("store.lookup.remember_releases"), 20);
+  CHECK_EQ(kv_num("store.lookup.drain.passes"), 21);
+  CHECK_EQ(kv_num("store.lookup.drain.cut"), 22);
+  CHECK_EQ(kv_num("store.lookup.drain.pass_max"), 23);
+  CHECK_EQ(kv_num("store.lookup.drain.pass_max_us"), 25);
   CHECK_EQ(kv_num("store.park.drop.room"), 15);
   CHECK_EQ(kv_num("store.park.drop.timeout"), 16);
   CHECK_EQ(kv_num("store.park.drop.queue"), 17);

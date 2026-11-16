@@ -181,6 +181,13 @@ static bool wake_for(const char *zone, park_key_t *k, int ms) {
     }
 }
 
+/* is the lookup of the name remembered as shed (the table of the shed names) at this moment? */
+static bool shed_held_now(const char *name) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return park_shed_held(park_lookup_claim_key("default", name), (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
 /* the counters of the lookups (store.lookup.*) */
 static store_lookup_t lk_stats(void) {
     store_lookup_t k;
@@ -5464,7 +5471,7 @@ static int run_lookup_body(const char *dir) {
         drain_wakes();
         char nm[40];
         uint64_t sr[6];
-        const uint64_t shed0 = lk_stats().shed, exp0 = lk_stats().expired;
+        const uint64_t shed0 = lk_stats().shed, exp0 = lk_stats().expired, rem0 = lk_stats().remembered, rel0 = lk_stats().remember_releases;
         atomic_store(&db_ingest_test_lq_max, 3);
         for (int i = 0; i < 12; i++) {
             snprintf(nm, sizeof(nm), "s%d.nz.test.", i);
@@ -5479,14 +5486,21 @@ static int run_lookup_body(const char *dir) {
         for (int i = 9; i < 12; i++) {
             snprintf(nm, sizeof(nm), "s%d.nz.test.", i);
             CHECK(wake_for(nm, &k, 5000) && k.ask == PARK_ASK_DROP && !k.failed && !park_claim_held(park_lookup_claim_key("default", nm)));
+            CHECK(shed_held_now(nm));                                                             /* (a name that was shed is remembered: its worker asks no more for it) */
         }
+        CHECK(!shed_held_now("s0.nz.test.") && !shed_held_now("s8.nz.test."));                    /* (the ones that were asked for, or wait, are not) */
         for (int i = 6; i < 9; i++) {
             snprintf(nm, sizeof(nm), "s%d.nz.test.", i);
             CHECK(wake_for(nm, &k, 5000) && k.ask == PARK_ASK_DROP);
+            CHECK(shed_held_now(nm));                                                             /* (and so are the ones whose time was up in the queue) */
         }
         CHECK(lk_stats().expired == exp0 + 3 && lk_stats().pending == 0 && !ch_next(&fetchc, &m, 200));
+        CHECK(lk_stats().remembered == rem0 + 6);
         for (int i = 0; i < 6; i++) lk_none(f[0], &e, sr[i]);
         CHECK(places_are(0, 3000));
+        /* the thread has caught up (no queue, places free): the names are forgotten, so that the next query for them asks again */
+        for (int t = 0; t < 400 && shed_held_now("s7.nz.test."); t++) usleep(5000);
+        CHECK(!shed_held_now("s7.nz.test.") && !shed_held_now("s6.nz.test.") && lk_stats().remember_releases >= rel0 + 1);
         atomic_store(&db_ingest_test_lq_max, 0);
     }
 

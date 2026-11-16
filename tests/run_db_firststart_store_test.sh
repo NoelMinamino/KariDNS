@@ -127,7 +127,7 @@ SM=$(sf store.ingest.stream_max_us); LM=$(sf store.ingest.loop_max_us)
 WH=$(sf store.lock.writer_hold_max_us); RH=$(sf store.lock.records_hold_max_us); RW=$(sf store.lock.records_wait_max_us)
 [ -n "$WH" ] && [ -n "$RH" ] && [ "$WH" -le "$HOLD_US" ] 2>/dev/null && [ "$RH" -le "$HOLD_US" ] 2>/dev/null && pass "no lock was held more than ${HOLD_US} us (store.lock.writer_hold_max_us=$WH, records_hold_max_us=$RH, records_wait_max_us=$RW, writer holds of 1 ms or more $(sf store.lock.writer_holds_slow))" || fail "store.lock.writer_hold_max_us=$WH records_hold_max_us=$RH (limit $HOLD_US)"
 DR=0
-for k in store.lookup.drop.room store.lookup.drop.timeout store.lookup.drop.queue store.lookup.servfail store.lookup.shed store.lookup.expired; do
+for k in store.lookup.drop.room store.lookup.drop.timeout store.lookup.drop.queue store.lookup.servfail store.lookup.reask_suppressed store.lookup.shed store.lookup.expired; do
     v=$(sf "$k"); DR=$((DR + ${v:-0}))
 done
 for k in $($KA store -k 2>/dev/null | sed -n 's/^\(store\.park\.drop\.[a-z_]*\)=.*/\1/p'); do v=$(sf "$k"); DR=$((DR + ${v:-0})); done

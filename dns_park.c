@@ -1387,3 +1387,81 @@ uint64_t park_cnt_get(int what) { return what >= 0 && what < PARK_CNT_N ? atomic
 bool park_lookup_room(const park_table_t *t) { return t->e && t->nlook < t->cap - t->cap / 4; }
 void park_lookup_note_take_fail(void) { atomic_fetch_add_explicit(&g_lookup_take_fail, 1, memory_order_relaxed); }
 uint64_t park_lookup_take_fails(void) { return atomic_load_explicit(&g_lookup_take_fail, memory_order_relaxed); }
+
+/* ---- the shed names (0.7, dns_park.h) ----
+ * One word per slot: the high 32 bits of the lookup claim key of the name, the low 32 bits of the time (ms) it was remembered; 0 is a free slot.  The ingest thread is the only writer; a worker that reads a
+ * word sees a slot as it was before or after a write (one atomic word), and a name that is not told held, or is held a moment too long, costs one more ask or one more drop, never a wrong answer.  A name is
+ * looked for in PARK_SHED_WIN slots from where its key points.  The key's high half is a hash of the name, 32 bits of it: two names that share it and a window are told held for each other, which drops one
+ * query for the time of the entry, at a chance of about 2^-29 per query, and no more than the shed drops it already.  The table is 2 MB of address space; its pages are touched as names are remembered.
+ * An entry is live while its age is under the ttl and it was remembered after the last release (g_shed_floor).  The time compare is modulo 2^32 and a stamp a few ms ahead of the reader's clock (another
+ * thread's reading) is age 0. */
+#define PARK_SHED_SLOTS 262144u                          /* (a power of two) */
+#define PARK_SHED_WIN 8u
+static _Atomic uint64_t g_shed[PARK_SHED_SLOTS];
+static _Atomic int64_t g_shed_floor;                     /* the names remembered before this time (ms) are released */
+static _Atomic uint32_t g_shed_ttl;                      /* ms, 0: nothing is remembered */
+static _Atomic uint64_t g_shed_n, g_shed_rel, g_shed_since;
+
+void park_shed_set_ttl(uint32_t ms) { atomic_store_explicit(&g_shed_ttl, ms, memory_order_relaxed); }
+
+/* the age (ms) of the entry w at now, or -1 when the entry is not live */
+static int64_t shed_age(uint64_t w, int64_t now, uint32_t ttl, int64_t floor) {
+  int32_t d = (int32_t)((uint32_t)now - (uint32_t)w);
+  if (d < -1000 || d >= (int64_t)ttl) return -1;         /* (more than a second ahead: a stamp of another age, not the future) */
+  if (d < 0) d = 0;
+  if (now - d < floor) return -1;                        /* released */
+  return d;
+}
+
+bool park_shed_held(uint64_t key, int64_t now_ms) {
+  const uint32_t ttl = atomic_load_explicit(&g_shed_ttl, memory_order_relaxed);
+  if (ttl == 0) return false;
+  const int64_t floor = atomic_load_explicit(&g_shed_floor, memory_order_relaxed);
+  const uint64_t tag = key >> 32;
+  for (unsigned j = 0; j < PARK_SHED_WIN; j++) {
+    const uint64_t w = atomic_load_explicit(&g_shed[claim_slot(key, j)], memory_order_relaxed);
+    if (w != 0 && (w >> 32) == tag) return shed_age(w, now_ms, ttl, floor) >= 0;
+  }
+  return false;
+}
+
+void park_shed_remember(uint64_t key, int64_t now_ms) {
+  const uint32_t ttl = atomic_load_explicit(&g_shed_ttl, memory_order_relaxed);
+  if (ttl == 0) return;
+  const int64_t floor = atomic_load_explicit(&g_shed_floor, memory_order_relaxed);
+  const uint64_t tag = key >> 32;
+  size_t pick = 0, oldest = 0;
+  bool have_pick = false;
+  int64_t oldest_age = -1;
+  for (unsigned j = 0; j < PARK_SHED_WIN; j++) {
+    const size_t si = claim_slot(key, j);
+    const uint64_t w = atomic_load_explicit(&g_shed[si], memory_order_relaxed);
+    if (w != 0 && (w >> 32) == tag) {                    /* the name is there: its time is renewed */
+      pick = si;
+      have_pick = true;
+      break;
+    }
+    const int64_t age = w == 0 ? -1 : shed_age(w, now_ms, ttl, floor);
+    if (age < 0) {                                       /* free, over, or released: it can take the name (the first one does) */
+      if (!have_pick) {
+        pick = si;
+        have_pick = true;
+      }
+    } else if (age > oldest_age) {
+      oldest_age = age;
+      oldest = si;
+    }
+  }
+  if (!have_pick) pick = oldest;                         /* (every slot of the window is live: the oldest name makes room) */
+  atomic_store_explicit(&g_shed[pick], (tag << 32) | (uint32_t)now_ms, memory_order_relaxed);
+  atomic_fetch_add_explicit(&g_shed_n, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&g_shed_since, 1, memory_order_relaxed);
+}
+
+void park_shed_release(int64_t now_ms) {
+  atomic_store_explicit(&g_shed_floor, now_ms + 1, memory_order_relaxed);
+  if (atomic_exchange_explicit(&g_shed_since, 0, memory_order_relaxed) != 0) atomic_fetch_add_explicit(&g_shed_rel, 1, memory_order_relaxed);
+}
+
+uint64_t park_shed_remembered(void) { return atomic_load_explicit(&g_shed_n, memory_order_relaxed); }
+uint64_t park_shed_releases(void) { return atomic_load_explicit(&g_shed_rel, memory_order_relaxed); }
