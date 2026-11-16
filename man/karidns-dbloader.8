@@ -61,7 +61,21 @@ the image of one zone, \fBmax\-zone\-records\fR the number of RRs in it (with
 the SOA once: the AXFR counted it twice). The digest of a zone is SHA-256 of the
 image (with the markers of the settings, the profile and a presigned zone), so a
 zone the store holds with the digest of the previous release is sent once more
-at the first start after the upgrade.
+at the first start after the upgrade. Measured on 4 vCPU (QEMU), SQLite3, zones
+of 11 records (about 1 KB of image each), an empty store, \fBloader\-threads
+4\fR, the first start of 100,000 and of 200,000 zones until every zone is in the
+store: 3.6 s and 7.2 s (27,700 zones a second), the same as with the
+\fBZONE_DATA\fR stream of 0.6 (3.5 s and 7.2 s). The Backend used less CPU for
+it, 24 microseconds a zone against 34 (with \fBloader\-threads 1\fR: 28 against
+51), of which the check of the image is 2.6 microseconds
+(\fBstore.fill.validate_ns_per_image\fR); the loader used more, about 110
+microseconds a zone against 88 (22 CPU seconds against 17.6 for 200,000 zones:
+the one-zone reads of the fill now also build and freeze the image), and it is
+the loader that bounds the first start (three of the four cores at 4 threads),
+so the time did not change; \fBkaridns\-dbloader \-\-dump\fR of the same 200,000
+zones takes 2.0 s (98,000 zones a second) against 1.7 s (120,000). With
+\fBloader\-threads 1\fR the first start of 200,000 zones takes 18.7 s against
+17.2 s.
 .IP \(bu 2
 \fBReload.\fR \fBkarictl reload\fR makes it compare the databases with the
 inventory: new zones, zones whose SOA serial differs, zones the change log table
