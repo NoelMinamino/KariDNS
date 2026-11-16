@@ -54,6 +54,10 @@
 typedef enum { PARK_FREE = 0, PARK_WAIT, PARK_READY, PARK_TIMEOUT } park_state_t;
 typedef enum { PARK_UDP = 1, PARK_TCP = 2 } park_kind_t;
 /* what a parked entry still has to ask for (park_pending_set()): its request was refused by a full ring and the worker tries again */
+/* why a parked entry that is TIMEOUT ended (park_entry_t.end): its deadline (park_expire()), the fetch or the lookup failed (park_fail_key()), or the ingest thread dropped it because it is overloaded (park_drop_key()).  The worker answers
+ * "not ready" (SERVFAIL + EDE 14) for a failure, and says nothing for the other two (0.7: a cold query that cannot be served is dropped and counted, like a query that RRL drops, never REFUSED or SERVFAIL for a zone the database may have) */
+enum { PARK_END_TIME = 0, PARK_END_FAIL, PARK_END_DROP };
+#define PARK_ASK_DROP 3              /* park_key_t.ask: the queries parked for the key are dropped (park_drop_key()) */
 typedef enum { PARK_PEND_NONE = 0, PARK_PEND_ATTACH_ZID, PARK_PEND_ATTACH_NAME, PARK_PEND_FETCH, PARK_PEND_LOOKUP } park_pend_t;   /* LOOKUP (0.7): the request of the by-name lookup of the entry's name (view, zone = the name) */
 
 typedef struct park_entry {
@@ -66,6 +70,7 @@ typedef struct park_entry {
   uint8_t ulinked;                   /* the entry is in the list of the pending requests */
   uint8_t attach;                    /* 0.7 store S2: parked for an ATTACH from the store (park_mark_attach()): the deadline is the attach deadline, the time to answer is noted */
   uint8_t pend;                      /* park_pend_t: the request for the zone has not been made yet */
+  uint8_t end;                       /* PARK_END_*: why the entry is TIMEOUT (set when it becomes that) */
   uint8_t lookup;                    /* 0.7: parked for the by-name lookup of its name (park_mark_lookup()); cleared by the wake or the failure by key (the lookup's answer), kept by park_wake_all() (a wake that says nothing: the query waits again) */
   uint8_t azid;                      /* 0.7 store: the entry waits for the attach of the stored zone `preq` (set by park_entry_attach_zid(); cleared when the wait changes to a fetch): a store thread that cannot name the zone says "zone id X failed" */
   uint32_t gen;                      /* changes every time the entry is given out */
@@ -138,6 +143,8 @@ uint32_t park_wake_key(park_table_t *t, uint64_t key);
 /* WAIT -> TIMEOUT for them: the fetch failed, so the worker answers at once as it does when the time is up. */
 uint32_t park_fail(park_table_t *t, const char *view, const char *zone);
 uint32_t park_fail_key(park_table_t *t, uint64_t key);
+/* WAIT -> TIMEOUT with the end PARK_END_DROP for them (the lookup queue or the wait queue of the ingest thread is full or ran out of time): the worker drops the queries and counts them.  Returns how many. */
+uint32_t park_drop_key(park_table_t *t, uint64_t key);
 /* 0.7 store S2: the queries that wait for the zone stay parked, with a new deadline (the attach did not work and the zone is fetched now: the park-timeout runs from here).  Returns how many. */
 uint32_t park_retry(park_table_t *t, const char *view, const char *zone, int64_t new_deadline_ms);
 uint32_t park_retry_key(park_table_t *t, uint64_t key, int64_t new_deadline_ms);
@@ -285,6 +292,9 @@ void park_wake_broadcast(const char *view, const char *zone, bool failed);
  * or refused concerns the worker that asked, w < 0 is a thread that is not a worker: nobody waits), the kqueue of a worker is triggered by park_wake_flush(), once
  * per worker however many keys were queued, which the thread calls when it has done its batch of work (a trigger is a system call: seven microseconds a worker). */
 void park_wake_queue_all(const char *view, const char *zone, bool failed);
+/* the queries that wait for the name are dropped (PARK_ASK_DROP), at every worker / at worker w only */
+void park_wake_queue_drop_all(const char *view, const char *zone);
+void park_wake_queue_drop_one(int w, const char *view, const char *zone);
 void park_wake_queue_one(int w, const char *view, const char *zone, bool failed);
 /* the attach of (view, zone) did not work and a fetch is on its way, or another attach or fetch has the zone: the parked queries for it get a new deadline and stay parked (`fetch`: it is a read from the database: counted).
  * `workers`: the workers that asked (park_att_take()); PARK_ATT_ALL: every worker. */
@@ -373,6 +383,19 @@ uint32_t park_att_take_tag(uint16_t sview, uint32_t zid, uint64_t *tag);
  * thread is full) the entry stays parked, marked PARK_PEND_LOOKUP, and the worker asks again (park_ask_again(), as for the fetch of a zone).  What is bounded: the entries that wait for a lookup
  * (three quarters of the park table at the most, park_lookup_room(): a flood of names that no zone has must not fill the table that the queries for zones need), the places the lookups of the ingest
  * thread take (three quarters of fetch-concurrency), the queue there, and every wait by park-timeout. */
+/* what the workers and the ingest thread count about the queries they could not serve (relaxed atomics; store.lookup.* and store.park.drop.* in karictl store) */
+enum {
+  PARK_CNT_LK_ROOM = 0,    /* lookup: no room in the park table (three quarters are the lookups') ... dropped */
+  PARK_CNT_LK_TIMEOUT,     /* ... its park-timeout was up before the lookup was answered: dropped */
+  PARK_CNT_LK_QUEUE,       /* ... the lookup queue of the ingest thread was full, or the lookup waited there until its time was up: dropped */
+  PARK_CNT_LK_SERVFAIL,    /* ... the lookup failed (the database, the loader): SERVFAIL + EDE 14, as the fetch of a known zone that fails */
+  PARK_CNT_ZONE_ROOM,      /* a query for a zone out of memory: the park table was full: dropped */
+  PARK_CNT_ZONE_TIMEOUT,   /* ... its park-timeout was up before the zone was there: dropped */
+  PARK_CNT_ZONE_QUEUE,     /* ... the wait queue of the ingest thread was full: dropped */
+  PARK_CNT_N
+};
+void park_cnt_note(int what);
+uint64_t park_cnt_get(int what);
 bool park_lookup_room(const park_table_t *t);     /* may another entry be parked for a lookup? */
 void park_lookup_note_take_fail(void);            /* a worker could not make the request of a lookup now (its ring was full): the entry is pending */
 uint64_t park_lookup_take_fails(void);            /* ... how many times, all workers, since the start (a relaxed atomic) */

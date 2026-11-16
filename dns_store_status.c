@@ -461,6 +461,13 @@ static void add_lookup(list_t *l) {
   U("store.lookup.covered", k->covered);
   U("store.lookup.shed", k->shed);
   U("store.lookup.expired", k->expired);
+  U("store.lookup.drop.room", k->drop_lk_room);
+  U("store.lookup.drop.timeout", k->drop_lk_timeout);
+  U("store.lookup.drop.queue", k->drop_lk_queue);
+  U("store.lookup.servfail", k->servfail);
+  U("store.park.drop.room", k->drop_zone_room);
+  U("store.park.drop.timeout", k->drop_zone_timeout);
+  U("store.park.drop.queue", k->drop_zone_queue);
   U("store.lookup.rtt.p50_us", store_status_hist_pct(k->hist, 50, k->max_ns));
   U("store.lookup.rtt.p99_us", store_status_hist_pct(k->hist, 99, k->max_ns));
   U("store.lookup.rtt.max_us", (k->max_ns + 999) / 1000);

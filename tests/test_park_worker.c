@@ -388,16 +388,17 @@ int main(void) {
     a = read_answer(sk[1]);
     CHECK(a.got && a.id == 0x3001 && a.rcode == 0 && a.ancount == 1 && table.nwait == 0);
 
-    /* -- the time is up: SERVFAIL + EDE 14, the question kept */
+    /* -- the time is up and the zone is not there: the query is dropped and counted (0.7: overload is never answered REFUSED or SERVFAIL for a zone the database may have) */
     atomic_store(&el->entry, NULL);
     w.park_timeout_ms = 5;
     SEND_QUERY(0x4001, true, 0);
     CHECK(table.nwait == 1);
     (void)park_fetch_pop(park_fetch_ring(0), &q);
     usleep(30000);
+    const uint64_t zt0 = park_cnt_get(PARK_CNT_ZONE_TIMEOUT);
     park_service(&w, -1);
     a = read_answer(sk[1]);
-    CHECK(a.got && a.id == 0x4001 && a.rcode == 2 && a.ancount == 0 && a.ede == 14 && table.nwait == 0);
+    CHECK(!a.got && table.nwait == 0 && table.nready == 0 && park_cnt_get(PARK_CNT_ZONE_TIMEOUT) == zt0 + 1);
     w.park_timeout_ms = 5000;
 
     /* -- a failed fetch: answered at once, with the same answer */
@@ -426,7 +427,7 @@ int main(void) {
     CHECK(a.got && a.id == 0x5101 && a.rcode == 0 && a.ancount == 1);
     atomic_store(&el->entry, NULL);
 
-    /* -- a request too big to park (more than PARK_UDP_MAX bytes), a full table, a worker without a park table: "not ready" at once */
+    /* -- a request too big to park (more than PARK_UDP_MAX bytes) and a worker without a park table: "not ready" at once; a full table is overload: the query is dropped and counted */
     SEND_QUERY(0x6001, true, PARK_UDP_MAX);
     CHECK(w.n_tx == 1 && table.nwait == 0 && table.n_toobig == 1);
     FLUSH();
@@ -438,10 +439,10 @@ int main(void) {
     SEND_QUERY(0x6002, true, 0);
     CHECK(tiny.nwait == 1 && w.n_tx == 0);
     SEND_QUERY(0x6003, true, 0);                                       /* the table is full */
-    CHECK(w.n_tx == 1 && tiny.nwait == 1 && tiny.n_full == 1);
+    CHECK(w.n_tx == 0 && tiny.nwait == 1 && tiny.n_full == 1 && park_cnt_get(PARK_CNT_ZONE_ROOM) == 1);
     FLUSH();
     a = read_answer(sk[1]);
-    CHECK(a.got && a.id == 0x6003 && a.rcode == 2 && a.ede == 14);
+    CHECK(!a.got);
     w.park = NULL;
     SEND_QUERY(0x6004, true, 0);
     CHECK(w.n_tx == 1);
@@ -511,28 +512,66 @@ int main(void) {
         CHECK(a.got && a.rcode == 5);
         a = read_answer(sk[1]);
         CHECK(a.got && a.rcode == 5 && table.nwait == 0 && table.nlook == 0);
-        /* the lookup failed: the same answer at once */
+        /* the entries that wait for a lookup may take three quarters of the park table: the query that finds no room is dropped (nothing is answered, counted), never refused; the others are answered when the lookup is */
+        {
+            park_table_t small;
+            CHECK(park_init(&small, 8));
+            w.park = &small;
+            const uint64_t lr0 = park_cnt_get(PARK_CNT_LK_ROOM);
+            for (int i = 0; i < 7; i++) SEND_LK(0x7110 + i);
+            CHECK(small.nwait == 6 && small.nlook == 6 && w.n_tx == 0 && park_cnt_get(PARK_CNT_LK_ROOM) == lr0 + 1);
+            while (park_fetch_pop(park_fetch_ring(0), &q)) {}
+            CHECK(park_wake_push(park_wake_ring(0), "default", "www.late.test.", false));
+            park_service(&w, -1);
+            int refused = 0;
+            for (int i = 0; i < 7; i++) {
+                a = read_answer(sk[1]);
+                if (a.got && a.rcode == 5) refused++;
+            }
+            CHECK(refused == 6 && small.nwait == 0 && small.nlook == 0);
+            /* the ingest thread dropped the lookup (its queue was full, or it waited too long): the queries are dropped, counted; a zone's wait queue that is full drops the queries that wait for the zone */
+            const uint64_t lq0 = park_cnt_get(PARK_CNT_LK_QUEUE), zq0 = park_cnt_get(PARK_CNT_ZONE_QUEUE);
+            SEND_LK(0x7120);
+            SEND_LK(0x7121);
+            CHECK(small.nwait == 2);
+            park_wake_queue_drop_one(0, "default", "www.late.test.");
+            park_service(&w, -1);
+            a = read_answer(sk[1]);
+            CHECK(!a.got && small.nwait == 0 && small.nready == 0 && small.nlook == 0 && park_cnt_get(PARK_CNT_LK_QUEUE) == lq0 + 2);
+            SEND_QUERY(0x7130, true, 0);
+            CHECK(small.nwait == 1);
+            while (park_fetch_pop(park_fetch_ring(0), &q)) {}
+            park_wake_queue_drop_one(0, "default", "park.test.");
+            park_service(&w, -1);
+            a = read_answer(sk[1]);
+            CHECK(!a.got && small.nwait == 0 && small.nready == 0 && park_cnt_get(PARK_CNT_ZONE_QUEUE) == zq0 + 1);
+            park_claim_release("default", "park.test.");
+            w.park = &table;
+            park_free(&small);
+        }
+        /* the lookup failed (the database, the loader): SERVFAIL + EDE 14 at once, as the fetch of a zone that fails */
         SEND_LK(0x7102);
         CHECK(table.nwait == 1 && park_fetch_pop(park_fetch_ring(0), &q));
         CHECK(park_wake_push(park_wake_ring(0), "default", "www.late.test.", true));
         park_service(&w, -1);
         a = read_answer(sk[1]);
-        CHECK(a.got && a.id == 0x7102 && a.rcode == 5 && table.nwait == 0);
+        CHECK(a.got && a.id == 0x7102 && a.rcode == 2 && a.ancount == 0 && table.nwait == 0 && table.nlook == 0 && park_cnt_get(PARK_CNT_LK_SERVFAIL) == 1);        /* (a failed lookup: SERVFAIL, as for a zone whose fetch failed; the query of this test has no EDNS, so no EDE 14 in it) */
         /* the time is up: the answer of a query that has waited the park-timeout; and a wake of every query after the deadline does not park it again */
         w.park_timeout_ms = 5;
+        const uint64_t lt0 = park_cnt_get(PARK_CNT_LK_TIMEOUT);
         SEND_LK(0x7103);
         CHECK(table.nwait == 1 && park_fetch_pop(park_fetch_ring(0), &q));
         usleep(30000);
         park_service(&w, -1);
         a = read_answer(sk[1]);
-        CHECK(a.got && a.id == 0x7103 && a.rcode == 5 && table.nwait == 0);
+        CHECK(!a.got && table.nwait == 0 && table.nlook == 0 && park_cnt_get(PARK_CNT_LK_TIMEOUT) == lt0 + 1);        /* (dropped, counted) */
         SEND_LK(0x7104);
         CHECK(table.nwait == 1 && park_fetch_pop(park_fetch_ring(0), &q));
         usleep(30000);
         CHECK(park_wake_all(&table) == 1);                                                        /* (it is READY with its mark when the worker looks: the deadline has passed) */
         park_service(&w, -1);
         a = read_answer(sk[1]);
-        CHECK(a.got && a.id == 0x7104 && a.rcode == 5 && table.nwait == 0 && !park_fetch_pop(park_fetch_ring(0), &q));
+        CHECK(!a.got && table.nwait == 0 && !park_fetch_pop(park_fetch_ring(0), &q) && park_cnt_get(PARK_CNT_LK_TIMEOUT) == lt0 + 2);
         w.park_timeout_ms = 5000;
         /* not wanted (the pass has ended: no force): refused at once, nothing parked or asked */
         atomic_store(&dns_core_test_lookup_force, false);
@@ -1015,7 +1054,7 @@ int main(void) {
         park_rate_set(0);
         park_rate_reset();
 
-        /* the park table is full: the query is answered "not ready" (true overload), the mark goes back */
+        /* the park table is full: the query is dropped and counted (true overload), the mark goes back */
         {
             udp_ipc_t fi;
             memset(&fi, 0, sizeof(fi));
@@ -1026,11 +1065,12 @@ int main(void) {
                 snprintf(fz, sizeof(fz), "filler%u.test.", i);
                 CHECK(park_udp(&table, 1, 100000, "default", fz, sk[0], &fi, fp, 20) >= 0);
             }
+            const uint64_t zr0 = park_cnt_get(PARK_CNT_ZONE_ROOM);
             SEND_QUERY(0x9201, true, 0);
-            CHECK(w.n_tx == 1 && table.nfree == 0 && !park_fetch_pop(park_fetch_ring(0), &q) && park_places_used() == 0 && !park_claim_held(key));
+            CHECK(w.n_tx == 0 && table.nfree == 0 && !park_fetch_pop(park_fetch_ring(0), &q) && park_places_used() == 0 && !park_claim_held(key) && park_cnt_get(PARK_CNT_ZONE_ROOM) == zr0 + 1);
             FLUSH();
             a = read_answer(sk[1]);
-            CHECK(a.got && a.id == 0x9201 && a.rcode == 2 && a.ede == 14);
+            CHECK(!a.got);                                          /* (dropped, counted) */
             for (uint32_t i = 0; i < table.cap; i++) {
                 snprintf(fz, sizeof(fz), "filler%u.test.", i);
                 (void)park_fail(&table, "default", fz);
@@ -1115,13 +1155,13 @@ int main(void) {
             SEND_QUERY(0xA002, true, 0);                                    /* (parked, one request with the claim, no answer now) */
             CHECK(w.n_tx == 0 && table.nwait == 1 && park_places_used() == 0 && park_claim_held(key));
             CHECK(park_fetch_pop(park_fetch_ring(0), &q) && (q.prio & PARK_PRIO_CLAIMED) && (q.prio & 0x7F) == KDB_FETCH_PRIO_QUERY && q.mode == KDB_FETCH_FULL);
-            /* the ingest thread could not make room before the deadline: the query times out like any parked query (SERVFAIL + EDE 14) */
+            /* the ingest thread could not make room before the deadline: the query times out like any parked query (dropped, counted) */
             park_claim_clear(key);
             CHECK(park_expire(&table, RNOW() + 100000) == 1);
             park_service(&w, -1);
             FLUSH();
             a = read_answer(sk[1]);
-            CHECK(a.got && a.id == 0xA002 && a.rcode == 2 && a.ede == 14 && table.nwait == 0 && table.nfree == table.cap && park_places_used() == 0);
+            CHECK(!a.got && table.nwait == 0 && table.nfree == table.cap && park_places_used() == 0);
             zone_bytes_resident_add(ZBYTES_DB, -1000000);
             park_places_set_limit(1);
         }

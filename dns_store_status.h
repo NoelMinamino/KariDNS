@@ -121,6 +121,9 @@ typedef struct store_lookup {
   bool ready;                    /* the loader answers lookups (HELLO features) and the store protocol is on */
   uint64_t asked, found, none, failed, refused, same_name, covered, shed, expired, body_inline, bad_body, take_fail;
   uint64_t pending, in_flight, peak;
+  /* the queries that were dropped (overload: not answered, counted, like a query that RRL drops) and the ones answered "not ready": per lookup by why (no room in the park table, its time was up, the ingest thread's queue was full or it waited
+   * there until its time was up), the lookups that failed (SERVFAIL + EDE 14), and the same drops for a query that waits for a zone that is out of memory */
+  uint64_t drop_lk_room, drop_lk_timeout, drop_lk_queue, servfail, drop_zone_room, drop_zone_timeout, drop_zone_queue;
   uint64_t hist[STORE_STATUS_HIST_BUCKETS];
   uint64_t max_ns;
 } store_lookup_t;

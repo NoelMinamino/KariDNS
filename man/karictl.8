@@ -878,6 +878,19 @@ view without database zones); the same name already on its way; the zone of the
 name was known when it was to go; dropped because the queue was full; dropped
 because they waited \fBpark\-timeout\fR
 .TP 8
+\fBstore.lookup.drop.room\fR, \fB.drop.timeout\fR, \fB.drop.queue\fR, \fB.servfail\fR
+0.7: queries that were dropped (nothing is answered, like a query that
+\fBrate\-limit\fR drops; a TCP connection is closed) because the lookup found no
+room in the worker's park table, its \fBpark\-timeout\fR was up before the
+lookup was answered, or the ingest thread dropped the lookup (its queue was
+full, or it waited there until its time was up); and queries answered SERVFAIL +
+EDE 14 because their lookup failed
+.TP 8
+\fBstore.park.drop.room\fR, \fB.drop.timeout\fR, \fB.drop.queue\fR
+The same for a query that waits for a zone that is out of memory: the park table
+was full (\fBpark\-max\fR), its \fBpark\-timeout\fR was up before the zone was
+there, the wait queue of the ingest thread was full
+.TP 8
 \fBstore.lookup.rtt.p50_us\fR, \fB.p99_us\fR, \fB.max_us\fR, \fB.rtt.hist.*\fR
 The time from the request to the answer (without the body), as the attach times:
 the upper bound of the bucket that holds the percentile, the longest, the

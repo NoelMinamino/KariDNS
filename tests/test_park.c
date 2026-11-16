@@ -1376,7 +1376,7 @@ static void test_lookup_mark(void) {
   CHECK(t.e[a].lookup && t.e[b].lookup && t.e[c].lookup && !t.e[d].lookup);
   CHECK(park_retry(&t, "v1", "a.late.test.", 9000) == 1 && t.e[a].lookup);        /* (a retry leaves it waiting, still for the lookup) */
   CHECK(park_wake(&t, "v1", "a.late.test.") == 1 && t.e[a].state == PARK_READY && !t.e[a].lookup);     /* the answer */
-  CHECK(park_fail(&t, "v1", "b.late.test.") == 1 && t.e[b].state == PARK_TIMEOUT && !t.e[b].lookup);   /* the failure */
+  CHECK(park_fail(&t, "v1", "b.late.test.") == 1 && t.e[b].state == PARK_TIMEOUT && t.e[b].lookup && t.e[b].end == PARK_END_FAIL);   /* the failure (the mark stays: the worker answers a failed lookup "not ready") */
   CHECK(park_wake_all(&t) == 2 && t.e[c].state == PARK_READY && t.e[c].lookup && t.e[d].state == PARK_READY && !t.e[d].lookup);   /* no answer: the mark stays */
   park_mark_lookup(&t, c);                                                        /* (not waiting any more: nothing) */
   park_entry_t *e;
@@ -1415,12 +1415,60 @@ static void test_lookup_room(void) {
   const int32_t z = park_udp(&t, 1000, 1500, "v1", "zone.test.", 3, &ipc, pay, 40);
   CHECK(z >= 0 && !park_lookup_room(&t));                                         /* (an entry for a zone does not count, and is not refused) */
   CHECK(park_wake(&t, "v1", "n0.late.test.") == 1 && t.nlook == 5 && park_lookup_room(&t));       /* (the answer gives the share back) */
-  CHECK(park_fail(&t, "v1", "n1.late.test.") == 1 && t.nlook == 4);
-  CHECK(park_wake_all(&t) == 5 && t.nlook == 4);                                  /* (a wake that is not an answer keeps the marks: the queries are parked again) */
+  CHECK(park_fail(&t, "v1", "n1.late.test.") == 1 && t.nlook == 5);                 /* (a failed lookup keeps its mark until the entry is released) */
+  CHECK(park_wake_all(&t) == 5 && t.nlook == 5);                                  /* (a wake that is not an answer keeps the marks: the queries are parked again) */
   park_entry_t *e;
   while ((e = park_next_done(&t))) park_release(&t, e);
   CHECK(t.nlook == 0 && t.nfree == t.cap);
   park_free(&t);
+}
+
+/* 0.7: why an entry ended: its deadline, a failure, or a drop by the ingest thread (overload); the drops and the failures of the lookups are counted */
+static void test_end_and_counters(void) {
+  printf("[why an entry ended; the counters of the drops]\n");
+  park_table_t t;
+  CHECK(park_init(&t, 8));
+  udp_ipc_t ipc = mk_ipc(7);
+  uint8_t pay[40];
+  memset(pay, 1, sizeof(pay));
+  const int32_t a = park_udp(&t, 1000, 1500, "v1", "a.late.test.", 3, &ipc, pay, 40), b = park_udp(&t, 1000, 3000, "v1", "b.late.test.", 3, &ipc, pay, 40),
+                c = park_udp(&t, 1000, 3000, "v1", "c.zone.test.", 3, &ipc, pay, 40), d = park_udp(&t, 1000, 3000, "v1", "d.zone.test.", 3, &ipc, pay, 40);
+  CHECK(a >= 0 && b >= 0 && c >= 0 && d >= 0);
+  park_mark_lookup(&t, b);
+  CHECK(park_expire(&t, 2600) == 1 && t.e[a].state == PARK_TIMEOUT && t.e[a].end == PARK_END_TIME);      /* (the time is up) */
+  CHECK(park_drop_key(&t, park_name_key("v1", "b.late.test.")) == 1 && t.e[b].state == PARK_TIMEOUT && t.e[b].end == PARK_END_DROP && t.e[b].lookup);   /* (dropped: the lookup queue was full) */
+  CHECK(park_drop_key(&t, park_name_key("v1", "c.zone.test.")) == 1 && t.e[c].state == PARK_TIMEOUT && t.e[c].end == PARK_END_DROP);      /* (a wait queue that was full, for a zone) */
+  CHECK(park_drop_key(&t, park_name_key("v1", "c.zone.test.")) == 0 && park_drop_key(&t, park_name_key("v1", "nobody.test.")) == 0);
+  CHECK(park_fail(&t, "v1", "d.zone.test.") == 1 && t.e[d].end == PARK_END_FAIL);
+  park_entry_t *e;
+  while ((e = park_next_done(&t))) park_release(&t, e);
+  CHECK(t.nfree == t.cap && t.nlook == 0);
+  park_free(&t);
+  uint64_t before[PARK_CNT_N];
+  for (int i = 0; i < PARK_CNT_N; i++) before[i] = park_cnt_get(i);
+  for (int i = 0; i < PARK_CNT_N; i++) {
+    park_cnt_note(i);
+    park_cnt_note(i);
+  }
+  park_cnt_note(-1);                                                              /* (no such counter: nothing) */
+  park_cnt_note(PARK_CNT_N);
+  for (int i = 0; i < PARK_CNT_N; i++) CHECK(park_cnt_get(i) == before[i] + 2);
+  CHECK(park_cnt_get(-1) == 0 && park_cnt_get(PARK_CNT_N) == 0);
+  /* the wake of a drop: the key says so (PARK_ASK_DROP), to every worker or to one */
+  park_register_worker(13, -1);
+  park_register_worker(12, -1);
+  park_key_t k;
+  while (park_wake_pop(park_wake_ring(13), &k)) {}
+  while (park_wake_pop(park_wake_ring(12), &k)) {}
+  park_wake_queue_drop_one(13, "v1", "x.late.test.");
+  CHECK(park_wake_pop(park_wake_ring(13), &k) && k.ask == PARK_ASK_DROP && !k.failed && park_key_is(&k, "v1", "x.late.test.") && !park_wake_pop(park_wake_ring(12), &k));
+  park_wake_queue_drop_all("v1", "y.late.test.");
+  CHECK(park_wake_pop(park_wake_ring(13), &k) && k.ask == PARK_ASK_DROP && park_key_is(&k, "v1", "y.late.test.") && park_wake_pop(park_wake_ring(12), &k) && k.ask == PARK_ASK_DROP);
+  park_wake_queue_drop_one(13, "v1", "");                                         /* (a name that does not fit: nothing) */
+  CHECK(!park_wake_pop(park_wake_ring(13), &k));
+  park_wake_flush();
+  park_unregister_worker(13);
+  park_unregister_worker(12);
 }
 
 /* 0.7, PARK_PEND_LOOKUP: the request of a lookup that a full ring refused stays with the entry that waits; when that entry goes first (time, release) the entry for the same name that waits too takes it over;
@@ -1477,6 +1525,7 @@ int main(int argc, char **argv) {
   test_att_tag();
   test_lookup_mark();
   test_lookup_room();
+  test_end_and_counters();
   test_lookup_pending();
 #ifdef __FreeBSD__
   test_wake_queue();

@@ -47,6 +47,8 @@ bool db_ingest_lookup_ready(void);
 /* the lookups' counters (dns_store_status.h, `store.lookup.*`): fills *out, true.  Any thread; no lock. */
 struct store_lookup;
 bool db_ingest_lookup_stats(struct store_lookup *out);
+/* tests: a smaller bound of the lookup queue and of the wait queue (0: the constants of dns_db_ingest.c) */
+extern _Atomic uint32_t db_ingest_test_lq_max, db_ingest_test_wq_max;
 
 /* `karictl dbstatus [zone [view]]`: text for the control channel (design 5.2).  Returns the length written to out
  * (always NUL terminated), or 0 when the configuration has no database block.  Control thread. */

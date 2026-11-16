@@ -13,13 +13,14 @@
 #   - a karictl reconfig that adds a zone does not drop the zone that is out of memory (it still parks, fetches and answers)
 #   - TCP: three queries in one write (the first one for the evicted zone) are answered in order; a client that closes while its request
 #     is parked does not hurt the server; after a parked query the connection ends by tcp-idle-timeout
-#   - the loader does not answer (stopped): the answer after park-timeout is SERVFAIL + Extended DNS Error 14 (Not Ready), UDP and TCP;
+#   - the loader does not answer (stopped): the query is dropped when park-timeout is up (0.7: overload is never answered SERVFAIL or REFUSED for a zone the database may have): nothing is answered over UDP,
+#     the TCP connection is closed, and karictl store counts them (store.park.drop.timeout);
 #     `karictl reload <zone>` with db-reload-timeout 1 gets the timeout error (control_park_timeouts)
 #   - the stopped loader goes on: its late answer installs the zone
 #   - kill -9 of the loader: the supervisor starts another with a new pair of streams and fetches work again
 #   - no sanitizer report in the server log (karidns-evict is an ASan + UBSan build)
 # With the zone store (DB_STORE=on, run_db_park_store_test.sh) the evicted zone is stored: a query attaches it from the store, so a stopped loader gives no SERVFAIL for it (the zone is answered at once);
-# the SERVFAIL + EDE 14 after park-timeout is then that of a zone that is only known (its body is not here yet), which tests/test_db_fetch.c and tests/test_db_store.c check.
+# the drop after park-timeout is then that of a zone that is only known (its body is not here yet), which tests/test_db_fetch.c and tests/test_db_store.c check.
 # Needs root (the loader runs as nobody).  SKIP when karidns-evict, dag, karictl, karidns-dbloader (SQLite3), zone2sql, sqlite3 or perl is missing.
 . "$(dirname "$0")/lib_proc.sh"
 set -u
@@ -258,11 +259,11 @@ if [ "$STORE" = on ]; then
     out=$(./dag @127.0.0.1 -p "$PORT" www.a.test A +tcp +nohexdump +time=8 +tries=1 2>&1)
     echo "$out" | grep -q 'status: NOERROR' && echo "$out" | grep -q '192.0.2.80' && pass "TCP: the zone of the store is answered with the loader stopped" || fail "TCP: $(echo "$out" | head -5)"
 else
-    echo "$out" | grep -q 'SERVFAIL' && pass "UDP: SERVFAIL after the time is up" || fail "UDP: no SERVFAIL: $(echo "$out" | head -5)"
-    echo "$out" | grep -qi 'not ready' && pass "UDP: Extended DNS Error 14, Not Ready" || fail "UDP: no EDE 14 in: $(echo "$out" | grep -i 'EDE\|opt' | head -3)"
-    [ $((T1 - T0)) -ge 1 ] && [ $((T1 - T0)) -le 5 ] && pass "... after about park-timeout (1 s): $((T1 - T0)) s" || fail "the answer took $((T1 - T0)) s"
+    ! echo "$out" | grep -q 'status:' && pass "UDP: no answer when the time is up (the query is dropped, not SERVFAIL or REFUSED)" || fail "UDP: an answer: $(echo "$out" | head -5)"
+    [ $((T1 - T0)) -ge 5 ] && pass "... the client waited for its own timeout ($((T1 - T0)) s)" || fail "the client had an answer or an error after $((T1 - T0)) s"
     out=$(./dag @127.0.0.1 -p "$PORT" www.a.test A +tcp +nohexdump +time=8 +tries=1 2>&1)
-    echo "$out" | grep -q 'SERVFAIL' && echo "$out" | grep -qi 'not ready' && pass "TCP: SERVFAIL + EDE 14 after the time is up" || fail "TCP: $(echo "$out" | head -5)"
+    ! echo "$out" | grep -q 'status:' && pass "TCP: no answer when the time is up (the connection is closed)" || fail "TCP: an answer: $(echo "$out" | head -5)"
+    [ "$($KCTL store -k 2>/dev/null | sed -n 's/^store.park.drop.timeout=//p' | head -1)" -ge 2 ] 2>/dev/null && pass "karictl store counts the drops (store.park.drop.timeout)" || fail "store.park.drop.timeout: $($KCTL store -k 2>/dev/null | grep 'store.park.drop' | tr '\n' ' ')"
 fi
 out=$($KCTL reload a.test. 2>&1)
 echo "$out" | grep -qi 'timeout' && pass "karictl reload of a zone gets the db-reload-timeout error while the loader does not answer" || fail "reload: $out"

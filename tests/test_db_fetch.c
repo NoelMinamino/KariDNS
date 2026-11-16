@@ -2129,6 +2129,34 @@ int main(void) {
             drain_wakes();
         }
 
+        /* ---- 0.7: the wait queue is full (true overload): the request is shed, counted (`queue_full`), and its queries are dropped (the key says PARK_ASK_DROP: the worker answers nothing), not answered "not ready" ---- */
+        {
+            printf("[0.7: a full wait queue sheds the request, the queries are dropped]\n");
+            gate_cfg("fetch-concurrency 2; park-timeout 5000; memory-limit 1024g;", 2, 0, 0);
+            drain_wakes();
+            CHECK(IS_COLD(22) && IS_COLD(23) && IS_COLD(24) && IS_COLD(25));
+            atomic_store(&db_ingest_test_wq_max, 1);
+            kdb_msg_t fl[3];
+            CHECK(worker_ask(0, COLD_EL(22), "default", cz[22], KDB_FETCH_FULL) == 1 && worker_ask(0, COLD_EL(23), "default", cz[23], KDB_FETCH_FULL) == 1);
+            CHECK(req_next(&fetch5, &fl[0], 5000) && req_next(&fetch5, &fl[1], 5000) && park_places_used() == 2);
+            CHECK(worker_ask(0, COLD_EL(24), "default", cz[24], KDB_FETCH_FULL) == 1);                  /* (no place: it waits, the queue holds one) */
+            for (int i = 0; i < 100 && ST("fetchq", "queued") != 1; i++) usleep(2000);
+            CHECK(ST("fetchq", "queued") == 1);
+            const unsigned long long qf0 = ST("fetchq", "queue_full"), sh0 = ST("cache", "shed");
+            CHECK(worker_ask(0, COLD_EL(25), "default", cz[25], KDB_FETCH_FULL) == 1);                  /* (the queue is full: shed) */
+            park_key_t dk;
+            CHECK(wake_ring_next(0, &dk, 5000) && dk.ask == PARK_ASK_DROP && !dk.failed && park_key_is(&dk, "default", cz[25]));
+            CHECK(ST("fetchq", "queue_full") == qf0 + 1 && ST("cache", "shed") == sh0 + 1 && ST("fetchq", "queued") == 1 && !park_claim_held(park_claim_key("default", cz[25])));
+            CHECK(!ch_next(&fetch5, &m2, 100));
+            send_failed(f5[0], &e, 0, fl[0].u.fetch_req.name, fl[0].u.fetch_req.request_id);
+            CHECK(req_next(&fetch5, &fl[2], 5000) && strcmp(fl[2].u.fetch_req.name, cz[24]) == 0);       /* (the one that waited goes when a place is free) */
+            send_failed(f5[0], &e, 0, fl[1].u.fetch_req.name, fl[1].u.fetch_req.request_id);
+            send_failed(f5[0], &e, 0, fl[2].u.fetch_req.name, fl[2].u.fetch_req.request_id);
+            CHECK(wait_places(0, 5000));
+            atomic_store(&db_ingest_test_wq_max, 0);
+            drain_wakes();
+        }
+
         /* ---- (0.7 store) the wait queue is there without memory-limit too: a zone that the store knows without an image, or one of a database without a store, is fetched for a query
          * with no limit set, and the requests over fetch-concurrency wait for a place, as with a limit (before: with no limit nothing held them back, and what did not find a slot of the
          * table of 256 was refused, after two sections of the registry's lock) */

@@ -324,9 +324,30 @@ uint32_t park_fail_key(park_table_t *t, uint64_t key) {
     e->hnext = 0;
     wheel_remove(t, e);
     unsent_remove(t, e);
-    lookup_unmark(t, e);
+    e->end = PARK_END_FAIL;                              /* (the mark of a lookup stays: the worker answers a failed lookup "not ready"; the release clears it) */
     done_enter(t, e, PARK_TIMEOUT);
     t->n_failed++;
+    n++;
+  }
+  return n;
+}
+
+uint32_t park_drop_key(park_table_t *t, uint64_t key) {
+  if (!t->e || t->nwait == 0) return 0;
+  uint32_t n = 0;
+  uint32_t *p = &t->bucket[key & t->bmask];
+  while (*p) {
+    park_entry_t *e = ENT(t, *p);
+    if (e->key != key) {
+      p = &e->hnext;
+      continue;
+    }
+    *p = e->hnext;
+    e->hnext = 0;
+    wheel_remove(t, e);
+    unsent_remove(t, e);
+    e->end = PARK_END_DROP;
+    done_enter(t, e, PARK_TIMEOUT);
     n++;
   }
   return n;
@@ -439,6 +460,7 @@ static void wheel_slot_expire(park_table_t *t, uint32_t s, int64_t now_ms, uint3
         wheel_add(t, e);
       } else {
         wait_leave(t, e);
+        e->end = PARK_END_TIME;
         done_enter(t, e, PARK_TIMEOUT);
         (*n)++;
       }
@@ -704,6 +726,19 @@ void park_wake_queue_all(const char *view, const char *zone, bool failed) {
   if (!key_fits(view, zone, &vl, &zl)) return;
   const uint64_t key = name_key(view, zone);
   for (int w = 0; w < PARK_MAX_WORKERS; w++) wake_key_one(w, key, failed, false, false, 0);
+}
+
+void park_wake_queue_drop_all(const char *view, const char *zone) {
+  size_t vl, zl;
+  if (!key_fits(view, zone, &vl, &zl)) return;
+  const uint64_t key = name_key(view, zone);
+  for (int w = 0; w < PARK_MAX_WORKERS; w++) wake_key_one(w, key, false, false, false, PARK_ASK_DROP);
+}
+
+void park_wake_queue_drop_one(int w, const char *view, const char *zone) {
+  size_t vl, zl;
+  if (!key_fits(view, zone, &vl, &zl)) return;
+  wake_key_one(w, name_key(view, zone), false, false, false, PARK_ASK_DROP);
 }
 
 /* the workers of the set: workers 0..30 by their bit, bit 31 every worker from 31 up (a set that park_att_take() returns has the bits 15..31 all set for a worker of 15 and up) */
@@ -1299,6 +1334,11 @@ bool park_fetch_next(park_fetch_req_t *out) {
 
 /* ------------------------------------------------------------------ the by-name lookups (0.7, dns_park.h) */
 static _Atomic uint64_t g_lookup_take_fail;
+static _Atomic uint64_t g_park_cnt[PARK_CNT_N];
+void park_cnt_note(int what) {
+  if (what >= 0 && what < PARK_CNT_N) atomic_fetch_add_explicit(&g_park_cnt[what], 1, memory_order_relaxed);
+}
+uint64_t park_cnt_get(int what) { return what >= 0 && what < PARK_CNT_N ? atomic_load_explicit(&g_park_cnt[what], memory_order_relaxed) : 0; }
 
 /* the entries that wait for a lookup may take three quarters of the table: the rest is for the queries that wait for a zone (a flood of names that no zone has fills no more than that) */
 bool park_lookup_room(const park_table_t *t) { return t->e && t->nlook < t->cap - t->cap / 4; }

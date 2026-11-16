@@ -1537,6 +1537,12 @@ static _Atomic uint64_t g_lk_found, g_lk_none, g_lk_failed, g_lk_refused, g_lk_d
 static _Atomic uint64_t g_lk_asked, g_lk_body, g_lk_covered, g_lk_shed, g_lk_expired, g_lk_bad, g_lk_max_ns;     /* requests of the workers taken; bodies that came with the answer and were taken; names whose zone was known by the time they were to go; requests dropped because the queue was full; queue entries whose time was up; bodies that were thrown away; the longest time to an answer */
 static _Atomic uint32_t g_lk_pending, g_lk_inflight, g_lk_peak;      /* waiting for a place now, out now (the lookups and the fetches that came of them), the most that waited */
 static _Atomic uint64_t g_lk_hist[STORE_STATUS_HIST_BUCKETS];       /* the time from the request to the answer: <= 1 us, <= 2 us, ... (dns_store_status.h) */
+/* tests (always compiled: the coverage of the test programs and of karidns merges): a smaller bound of the lookup queue and of the wait queue than ING_LQ_MAX / ING_WQ_MAX (0: the constants), so that a full queue can be made with a few requests */
+_Atomic uint32_t db_ingest_test_lq_max, db_ingest_test_wq_max;
+static uint32_t queue_cap(const _Atomic uint32_t *hook, uint32_t max) {
+  const uint32_t v = atomic_load_explicit(hook, memory_order_relaxed);
+  return v && v < max ? v : max;
+}
 bool db_ingest_lookup_ready(void) { return atomic_load_explicit(&g_lookup_on, memory_order_acquire); }
 /* the counters of the lookups for `karictl store` and dbstatus (dns_store_status.h): relaxed atomics that the ingest thread and the workers write, any thread reads */
 bool db_ingest_lookup_stats(store_lookup_t *out) {
@@ -1557,6 +1563,13 @@ bool db_ingest_lookup_stats(store_lookup_t *out) {
   out->in_flight = atomic_load_explicit(&g_lk_inflight, memory_order_relaxed);
   out->peak = atomic_load_explicit(&g_lk_peak, memory_order_relaxed);
   out->take_fail = park_lookup_take_fails();
+  out->drop_lk_room = park_cnt_get(PARK_CNT_LK_ROOM);
+  out->drop_lk_timeout = park_cnt_get(PARK_CNT_LK_TIMEOUT);
+  out->drop_lk_queue = park_cnt_get(PARK_CNT_LK_QUEUE);
+  out->servfail = park_cnt_get(PARK_CNT_LK_SERVFAIL);
+  out->drop_zone_room = park_cnt_get(PARK_CNT_ZONE_ROOM);
+  out->drop_zone_timeout = park_cnt_get(PARK_CNT_ZONE_TIMEOUT);
+  out->drop_zone_queue = park_cnt_get(PARK_CNT_ZONE_QUEUE);
   out->max_ns = atomic_load_explicit(&g_lk_max_ns, memory_order_relaxed);
   for (int i = 0; i < STORE_STATUS_HIST_BUCKETS; i++) out->hist[i] = atomic_load_explicit(&g_lk_hist[i], memory_order_relaxed);
   return true;
@@ -2810,6 +2823,7 @@ static void adopt_stream(ing_t *g, int fd) {
   }
   if (g->need_cleanup) cleanup_stream_state(g);
   g->stream_fd = fd;
+  g->loader_feat = 0;                                  /* a new loader: its HELLO says what it can do (the lookups that wait for an answer are asked again in mode 2 until then, fetch_adopt()) */
   struct kevent ev[2];
   EV_SET(&ev[0], fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
   EV_SET(&ev[1], fd, EVFILT_WRITE, EV_ADD | EV_DISABLE, 0, 0, NULL);
@@ -3514,13 +3528,20 @@ static void lookup_complete(const ing_freq_t *done, bool ok, const char *why) {
     atomic_fetch_add_explicit(&g_lk_failed, 1, memory_order_relaxed);
     logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] lookup of the name '%s' (view '%s') failed: %s", done->lk_q, done->view_name, why && why[0] ? why : "no reason given");
   }
-  park_wake_queue_all(done->view_name, done->lk_q, false);
+  park_wake_queue_all(done->view_name, done->lk_q, !ok);      /* (a failure is "not ready" for the queries, SERVFAIL + EDE 14 as for a zone whose fetch failed; "none" is the normal answer for a name that no zone has) */
 }
 
 /* a request that ends before it was made (a loader that does not look up, a view that takes no database zones, a zone that is known already, a name that waited too long): its claim mark goes and the queries look the name up again */
 static void lookup_drop(const park_fetch_req_t *q, uint64_t ckey) {
   if (ckey) park_claim_clear(ckey);
   park_wake_queue_all(q->view, q->zone, false);
+}
+
+/* a lookup that is dropped because the ingest thread is overloaded (its queue is full, or it waited until its time was up): its claim mark goes and the queries that wait for the name are dropped (counted at their workers),
+ * not answered REFUSED or SERVFAIL for a name whose zone the database may have */
+static void lookup_shed(const park_fetch_req_t *q, uint64_t ckey) {
+  if (ckey) park_claim_clear(ckey);
+  park_wake_queue_drop_all(q->view, q->zone);
 }
 
 static void lookup_note(const ing_t *g) {
@@ -3599,7 +3620,7 @@ static void lq_expire(ing_t *g, int64_t now) {
     g->lq_head = (g->lq_head + 1) % ING_LQ_MAX;
     g->nlq--;
     atomic_fetch_add_explicit(&g_lk_expired, 1, memory_order_relaxed);
-    lookup_drop(&e.q, e.key);
+    lookup_shed(&e.q, e.key);
   }
   lookup_note(g);
 }
@@ -3625,9 +3646,9 @@ static void lookup_offer(ing_t *g, const park_fetch_req_t *q, int vi) {
     lookup_start(g, q, vi, key);
     return;
   }
-  if (!g->lq || g->nlq >= ING_LQ_MAX) {                  /* true overload: the queries behind it time out (park-timeout) */
+  if (!g->lq || g->nlq >= queue_cap(&db_ingest_test_lq_max, ING_LQ_MAX)) {                  /* true overload: the queries behind it time out (park-timeout) */
     atomic_fetch_add_explicit(&g_lk_shed, 1, memory_order_relaxed);
-    park_claim_clear(key);
+    lookup_shed(q, key);
     return;
   }
   struct ing_lq *e = &g->lq[(g->lq_head + g->nlq) % ING_LQ_MAX];
@@ -4015,7 +4036,7 @@ static bool wq_wait(ing_t *g, const park_fetch_req_t *q, bool *place, bool *tok,
     if (!park_claim_mark(k)) return true;                /* a request for this zone is on its way or waits already */
     marked_here = true;
   }
-  if (!g->wq || g->nwq >= ING_WQ_MAX) {
+  if (!g->wq || g->nwq >= queue_cap(&db_ingest_test_wq_max, ING_WQ_MAX)) {
     if (marked_here) park_claim_clear(k);
     return false;
   }
@@ -4039,12 +4060,14 @@ static bool wq_wait(ing_t *g, const park_fetch_req_t *q, bool *place, bool *tok,
   return true;
 }
 
-/* The queue is full: the request is refused, the only refusal of a query that is left (true overload) */
+/* The queue is full: the request is shed, the only loss of a query that is left (true overload).  0.7: its queries are dropped and counted (store.park.drop.queue), like the queries that RRL drops: not answered "not ready" for a
+ * zone that the database has */
 static void wq_overflow(const park_fetch_req_t *q) {
   atomic_fetch_add_explicit(&g_wq_full, 1, memory_order_relaxed);
   atomic_fetch_add_explicit(&g_fetch_shed, 1, memory_order_relaxed);
-  logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] fetch of zone '%s' (view '%s') refused: the wait queue is full; its queries get \"not ready\"", q->zone, q->view);
-  fetch_refuse(q);
+  logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] fetch of zone '%s' (view '%s') shed: the wait queue is full; its queries are dropped", q->zone, q->view);
+  if (q->claimed) park_wake_queue_drop_all(q->view, q->zone);
+  else park_wake_queue_drop_one(q->worker, q->view, q->zone);
 }
 
 static void fetch_issue(ing_t *g) {
@@ -4664,7 +4687,7 @@ static void fetch_adopt(ing_t *g, int fd) {
           fetch_complete(g, r, true, NULL);
           continue;
         }
-        if (r->lkst == LKS_ASK && r->mode == KDB_FETCH_LOOKUP_FULL && !(g->loader_feat & KDB_FEAT_LOOKUP_BODY)) r->mode = KDB_FETCH_LOOKUP;
+        if (r->lkst == LKS_ASK && r->mode == KDB_FETCH_LOOKUP_FULL && !(g->loader_feat & KDB_FEAT_LOOKUP_BODY)) r->mode = KDB_FETCH_LOOKUP;      /* (the new loader has not said it has the body: it is asked what every loader that looks up answers) */
       }
       r->sent_ms = now_ms();
       (void)fetch_send_req(g, r);
@@ -5462,10 +5485,11 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     {
       store_lookup_t lk;
       db_ingest_lookup_stats(&lk);
-      st_append(&c, "lookup of names while the first pass has not listed every zone: ready=%s in_flight=%u pending=%u asked=%llu found=%llu none=%llu failed=%llu refused=%llu same_name=%llu body_inline=%llu take_fail=%llu covered=%llu shed=%llu expired=%llu bad_body=%llu rtt_p50_us=%llu rtt_p99_us=%llu\n",
+      st_append(&c, "lookup of names while the first pass has not listed every zone: ready=%s in_flight=%u pending=%u asked=%llu found=%llu none=%llu failed=%llu refused=%llu same_name=%llu body_inline=%llu take_fail=%llu covered=%llu shed=%llu expired=%llu drop_room=%llu drop_timeout=%llu drop_queue=%llu servfail=%llu zone_drop_room=%llu zone_drop_timeout=%llu zone_drop_queue=%llu bad_body=%llu rtt_p50_us=%llu rtt_p99_us=%llu\n",
                 lk.ready ? "yes" : "no", (unsigned)lk.in_flight, (unsigned)lk.pending, (unsigned long long)lk.asked, (unsigned long long)lk.found, (unsigned long long)lk.none, (unsigned long long)lk.failed,
                 (unsigned long long)lk.refused, (unsigned long long)lk.same_name, (unsigned long long)lk.body_inline, (unsigned long long)lk.take_fail, (unsigned long long)lk.covered, (unsigned long long)lk.shed,
-                (unsigned long long)lk.expired, (unsigned long long)lk.bad_body, (unsigned long long)store_status_hist_pct(lk.hist, 50, lk.max_ns), (unsigned long long)store_status_hist_pct(lk.hist, 99, lk.max_ns));
+                (unsigned long long)lk.expired, (unsigned long long)lk.drop_lk_room, (unsigned long long)lk.drop_lk_timeout, (unsigned long long)lk.drop_lk_queue, (unsigned long long)lk.servfail,
+                (unsigned long long)lk.drop_zone_room, (unsigned long long)lk.drop_zone_timeout, (unsigned long long)lk.drop_zone_queue, (unsigned long long)lk.bad_body, (unsigned long long)store_status_hist_pct(lk.hist, 50, lk.max_ns), (unsigned long long)store_status_hist_pct(lk.hist, 99, lk.max_ns));
     }
     dbreg_cache_stats_t cs;
     dbreg_cache_stats(&cs);
