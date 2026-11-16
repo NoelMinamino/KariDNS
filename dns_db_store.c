@@ -313,6 +313,7 @@ static void rec_unlock(void) {
 void (*db_store_test_commit_hook)(int where, const char *zone);
 #endif
 store_t *db_store_handle(void) { return atomic_load_explicit(&G.st, memory_order_acquire); }
+uint64_t db_store_journal_wait(unsigned factor) { return store_journal_wait(atomic_load_explicit(&G.st, memory_order_acquire), factor); }
 
 /* the zones the list has attached in a second, from its start until now (until its end, when it has ended) */
 static uint64_t hot_rate(uint64_t attached) {

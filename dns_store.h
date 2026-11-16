@@ -275,6 +275,13 @@ typedef struct store_stats {
   uint64_t lock_hold_max_us;      /* the longest one */
   uint64_t growths_background;    /* index growths that were built outside the mutex (the others: in it, when the index filled up before the build ended) */
   bool     flusher;               /* the flusher thread runs (false: the writers make the due commits and checkpoints themselves, after the mutex) */
+  /* ---- 0.7: the flush of a checkpoint converges; the bound of the journal ---- */
+  uint64_t checkpoint_max_us;     /* the longest checkpoint since the open */
+  uint64_t checkpoints_cancelled; /* fuzzy checkpoints that a close left (its clean checkpoint flushed everything instead) */
+  uint64_t journal_peak_bytes;    /* the largest size a journal file reached since the open */
+  uint64_t journal_bound_bytes;   /* the bound: 2 x journal_max_bytes (the writers wait at it for the checkpoint in progress) */
+  uint64_t journal_limit_waits;   /* writer calls that waited at their end for a checkpoint because the journal was at the bound */
+  uint64_t journal_limit_wait_us, journal_limit_wait_max_us;   /* the total and the longest of those waits */
 } store_stats_t;
 
 /* What one store_compact() did. */
@@ -401,6 +408,11 @@ int  store_reserve(store_t *s, uint64_t zones);
 /* group commit point: fdatasync the segments written and the journal.  After it every writer call made before is durable.  It waits for the disk without the writer mutex
  * (writers go on meanwhile); concurrent callers share one sync. */
 int  store_commit(store_t *s);
+/* 0.7: the bound of the journal.  A writer that holds no lock of its own (the caller's locks: a thread that waits for one of them would wait with it) calls this between its writes:
+ * while the journal is at factor x journal_max_bytes or more, it wakes the flusher and waits until the journal was switched or a checkpoint ended (one that failed too), and returns
+ * the microseconds it waited (0: no wait).  The bulk writer (the reconcile thread of a pass) uses 2, the thread that also answers lookups 4: the journal stays below 2 x
+ * journal_max_bytes while the disk keeps up with the checkpoints, and below 4 x in any case (store.journal.limit_waits counts the waits).  The store's own calls never wait for it. */
+uint64_t store_journal_wait(store_t *s, unsigned factor);
 /* the time-driven part: the commit and the checkpoint that are due (the flusher thread makes them by itself; without it the tick does), and (0.7 WP9) the work of the
  * background: the cleaner (at opts.compact_rate), the removal of the segments it emptied, the nx pass, the free-space check, the scrub (at opts.scrub_rate).  Call about once per
  * second from the store's thread, which is not inside a read section; a call takes up to about 300 ms when there is work. */

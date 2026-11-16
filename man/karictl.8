@@ -791,9 +791,22 @@ Journal position, last checkpoint, last durable commit, size, generation, the
 size at which a checkpoint is forced (100 MiB: a replay of that takes about a
 second)
 .TP 8
-\fBstore.checkpoint.count\fR, \fB.last_unix\fR, \fB.last_us\fR
-Checkpoints since the open, when the last one ended, how long it took (the flush
-of the tables runs outside the store's writer mutex: writers go on meanwhile)
+\fBstore.journal.bound_bytes\fR, \fB.peak_bytes\fR, \fB.limit_waits\fR, \fB.limit_wait_us\fR, \fB.limit_wait_max_us\fR
+0.7: the bound of the journal (twice \fB.max_bytes\fR), the largest size a
+journal file reached since the open, and the writes that waited at that bound
+for a checkpoint (their number, total and longest wait). When a checkpoint takes
+longer than the writing of \fB.max_bytes\fR of records (the disk does not keep
+up), the pass of the loader (the reconcile thread) waits there for it between
+two groups of entries, with no lock held, and the thread that also answers
+lookups waits only at four times \fB.max_bytes\fR: the journal, the replay after
+a crash and the clean stop stay bounded; a WARNING at most once a
+minute. \fB.limit_waits\fR stays 0 when the disk keeps up
+.TP 8
+\fBstore.checkpoint.count\fR, \fB.last_unix\fR, \fB.last_us\fR, \fB.max_us\fR, \fB.cancelled\fR
+Checkpoints since the open, when the last one ended, how long it took, the
+longest one, and the checkpoints that a stop left in the middle (its clean
+checkpoint flushed everything instead). The flush of the tables runs outside the
+store's writer mutex: writers go on meanwhile
 .TP 8
 \fBstore.writes.commits\fR, \fB.puts\fR, \fB.replaces\fR, \fB.deletes\fR, \fB.growths\fR, \fB.errors\fR
 Writer counters since the open (\fBerrors\fR counts a commit or a checkpoint

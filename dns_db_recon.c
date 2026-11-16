@@ -309,6 +309,7 @@ static void rt_page(const rt_item_t *it, int64_t *apply_ns, uint64_t *entries) {
     const int64_t t0 = rt_mono_ns();
     db_recon_entry_n(RT.re, k, RT.res, RT.zid);
     *apply_ns += rt_mono_ns() - t0;
+    (void)db_store_journal_wait(2);                       /* (0.7: the journal at twice its limit: the pass waits for a checkpoint here, with no lock held) */
     *entries += k;
     for (unsigned i = 0; i < k; i++) c.wanted |= db_recon_note(&c, RT.res[i], RT.ents[i].name, &unst);
     RT.man_n += k;

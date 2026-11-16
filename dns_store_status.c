@@ -624,9 +624,16 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.journal.bytes", st->journal_bytes);
   U("store.journal.gen", st->journal_gen);
   U("store.journal.max_bytes", st->journal_max_bytes);
+  U("store.journal.bound_bytes", st->journal_bound_bytes);
+  U("store.journal.peak_bytes", st->journal_peak_bytes);
+  U("store.journal.limit_waits", st->journal_limit_waits);
+  U("store.journal.limit_wait_us", st->journal_limit_wait_us);
+  U("store.journal.limit_wait_max_us", st->journal_limit_wait_max_us);
   U("store.checkpoint.count", st->checkpoints);
   U("store.checkpoint.last_unix", st->last_checkpoint_unix);
   U("store.checkpoint.last_us", st->last_checkpoint_us);
+  U("store.checkpoint.max_us", st->checkpoint_max_us);
+  U("store.checkpoint.cancelled", st->checkpoints_cancelled);
   U("store.writes.commits", st->commits);
   U("store.writes.puts", st->puts);
   U("store.writes.replaces", st->replaces);

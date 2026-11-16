@@ -184,6 +184,8 @@ static const char *REQUIRED[] = {
   "store.tables.ix_slots", "store.segments.count", "store.segments.used_bytes", "store.segments.live_bytes", "store.segments.dead_pct",
   "store.journal.lsn", "store.checkpoint.count", "store.writes.puts", "store.writes.errors", "store.recovery.created", "store.recovery.open_us",
   "store.writes.growths_background", "store.flusher", "store.lock.writer_holds", "store.lock.writer_holds_slow", "store.lock.writer_hold_max_us",     /* (0.7 fix A) */
+  "store.journal.bound_bytes", "store.journal.peak_bytes", "store.journal.limit_waits", "store.journal.limit_wait_us", "store.journal.limit_wait_max_us",
+  "store.checkpoint.max_us", "store.checkpoint.cancelled",                                                                                  /* (0.7: the journal bound) */
   "store.cache.kind", "store.attach.count", "store.attach.failed", "store.attach.fail.checksum", "store.attach.fail.record",
   "store.attach.fail.invalid", "store.attach.fail.io", "store.attach.fail.memory", "store.attach.fail.other", "store.attach.p50_us",
   "store.attach.p90_us", "store.attach.p99_us", "store.attach.max_us", "store.attach.hist.le_1us", "store.attach.hist.le_8388608us",
