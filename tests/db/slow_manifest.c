@@ -10,7 +10,7 @@
  *
  * -DPACE_US=N (optional): after the release the frames of the pass are sent on one at a time, N microseconds apart, so that a pass of a hundred thousand zones lasts long enough for a test to act in the middle of it.
  *
- * -DHELLO_MASK=3 (optional): the features of the loader's HELLO (tag 5) are ANDed with it, so that the Backend meets a loader that has fewer of them (3: KDB_FEAT_STORE | KDB_FEAT_LOOKUP, the loader of an earlier
+ * -DHELLO_MASK=11 (optional): the features of the loader's HELLO (tag 5) are ANDed with it, so that the Backend meets a loader that has fewer of them (11: KDB_FEAT_STORE | KDB_FEAT_LOOKUP | KDB_FEAT_IMAGE, the loader of an earlier
  * version that does a lookup of a name without the body of the zone).  The server clears the environment of the loader, so this is a compile time choice.
  *
  * Started by the server as `karidns-dbloader -s 3 [--debug N] [--fetch-fd 4] [--state-file F] [--log-stderr]`, which it passes on unchanged.  SIGTERM goes to the loader, and the program ends

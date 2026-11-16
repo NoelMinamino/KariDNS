@@ -51,6 +51,8 @@
 #include "../dns_store_status.h"
 #include "../dns_utils.h"
 #include "../dns_zone_image.h"
+#include "db/zimg_msgs.h"
+#include "../dns_zone_image.h"
 
 static int g_checks = 0, g_failed = 0;
 #define CHECK(cond) do { g_checks++; if (!(cond)) { g_failed++; \
@@ -105,156 +107,40 @@ static void ch_send(int fd, kdb_enc_t *e) {
 }
 
 /* ---------------------------------------------------------------- zone data */
-static size_t put_name(uint8_t *b, const char *name) {
-    size_t o = 0;
-    while (*name) {
-        const char *dot = strchr(name, '.');
-        size_t l = dot ? (size_t)(dot - name) : strlen(name);
-        b[o++] = (uint8_t)l;
-        memcpy(b + o, name, l);
-        o += l;
-        name += l + (dot ? 1 : 0);
-    }
-    b[o++] = 0;
-    return o;
-}
-static size_t put_u16(uint8_t *b, uint16_t v) { b[0] = (uint8_t)(v >> 8); b[1] = (uint8_t)v; return 2; }
-static size_t put_u32(uint8_t *b, uint32_t v) { put_u16(b, (uint16_t)(v >> 16)); put_u16(b + 2, (uint16_t)v); return 4; }
-
-static size_t put_rr_head(uint8_t *b, const char *owner, uint16_t type, size_t rdlen_pos_out[1]) {
-    size_t o = put_name(b, owner);
-    o += put_u16(b + o, type);
-    o += put_u16(b + o, 1);
-    o += put_u32(b + o, 300);
-    rdlen_pos_out[0] = o;
-    return o + 2;
-}
-
-/* ZONE_DATA of the zone (SOA, NS, A www, SOA); `extra`: a changing A record so that two versions of a zone differ */
-static const char *g_zone_ns;                                          /* the NS target of the zones that zone_message() makes (NULL: ns1.<zone>) */
-static const char *g_zone_ns2;                                         /* a second NS target (NULL: none): the zone has five records, the second NS before the last SOA */
-static size_t zone_message(uint8_t *b, const char *zone, uint32_t serial) {
-    memset(b, 0, 12);
-    b[2] = 0x84;
-    const int nrr = g_zone_ns2 ? 5 : 4;
-    put_u16(b + 6, (uint16_t)nrr);
-    size_t o = 12, rp[1];
-    for (int k = 0; k < nrr; k++) {
-        char owner[300], ns[300], mail[300];
-        snprintf(ns, sizeof(ns), "ns1.%s", zone);
-        snprintf(mail, sizeof(mail), "host.%s", zone);
-        snprintf(owner, sizeof(owner), "%s%s", k == 2 ? "www." : "", zone);
-        const bool ns2 = g_zone_ns2 && k == 3;
-        uint16_t type = (k == 0 || k == nrr - 1) ? 6 : (k == 1 || ns2) ? 2 : 1;
-        if (ns2) snprintf(owner, sizeof(owner), "%s", zone);
-        size_t rd = put_rr_head(b + o, owner, type, rp);
-        size_t start = o + rd;
-        size_t l = 0;
-        if (type == 6) {
-            l += put_name(b + start, ns);
-            l += put_name(b + start + l, mail);
-            l += put_u32(b + start + l, serial);
-            l += put_u32(b + start + l, 3600);
-            l += put_u32(b + start + l, 600);
-            l += put_u32(b + start + l, 86400);
-            l += put_u32(b + start + l, 300);
-        } else if (type == 2) {
-            l += put_name(b + start, ns2 ? g_zone_ns2 : g_zone_ns ? g_zone_ns : ns);
-        } else {
-            b[start] = 192; b[start + 1] = 0; b[start + 2] = 2; b[start + 3] = (uint8_t)(80 + (serial & 3));
-            l = 4;
-        }
-        put_u16(b + o + rp[0], (uint16_t)l);
-        o = start + l;
-    }
-    return o;
-}
+/* the zone images of the zones of this test: SOA, NS (g_zone_ns, else ns1.<zone>; g_zone_ns2: a second one), www A (the address changes with the serial, so that two versions of a zone differ) */
+static const char *g_zone_ns;                                          /* the NS target of the zones that zone_img() makes (NULL: ns1.<zone>) */
+static const char *g_zone_ns2;                                         /* a second NS target (NULL: none): the zone has five records */
+static zone_image_t *zone_img(const char *zone, uint32_t serial) { return zi_zone(zone, serial, g_zone_ns, g_zone_ns2, 0); }
 
 static void send_zone(int fd, kdb_enc_t *e, const char *zone, uint32_t serial, uint64_t req, int64_t sid) {
-    uint8_t dig[KDB_DIGEST_LEN];
-    memset(dig, (int)serial, sizeof(dig));
-    kdb_enc_begin(e, KDB_T_ZONE_BEGIN);
-    kdb_enc_u16(e, 1, 0); kdb_enc_name(e, 2, zone); kdb_enc_i64(e, 3, sid); kdb_enc_u8(e, 4, KDB_ZK_PRIMARY);
-    kdb_enc_u32(e, 5, serial); kdb_enc_u32(e, 6, 0); kdb_enc_u64(e, 7, g_zone_ns2 ? 5 : 4); kdb_enc_bytes(e, 8, dig, sizeof(dig));
-    if (req) kdb_enc_u64(e, 11, req);
-    kdb_enc_end(e);
-    uint8_t msg[2048];
-    size_t n = zone_message(msg, zone, serial);
-    kdb_enc_raw_msg(e, KDB_T_ZONE_DATA, msg, n);
-    kdb_enc_begin(e, KDB_T_ZONE_END);
-    kdb_enc_u64(e, 1, g_zone_ns2 ? 5 : 4);
-    kdb_enc_end(e);
+    zone_image_t *img = zone_img(zone, serial);
+    zi_zone_msgs(e, 0, zone, sid, serial, img, req, NULL, NULL, 0, (int)serial);
+    zone_image_free(img);
     ch_send(fd, e);
 }
 
 /* a zone whose declared serial is not the one of its SOA (the install refuses it: "the SOA serial is not the one ZONE_BEGIN declared") */
 static void send_bad_zone(int fd, kdb_enc_t *e, const char *zone, uint32_t serial, uint64_t req, int64_t sid) {
-    uint8_t dig[KDB_DIGEST_LEN];
-    memset(dig, (int)serial, sizeof(dig));
-    kdb_enc_begin(e, KDB_T_ZONE_BEGIN);
-    kdb_enc_u16(e, 1, 0); kdb_enc_name(e, 2, zone); kdb_enc_i64(e, 3, sid); kdb_enc_u8(e, 4, KDB_ZK_PRIMARY);
-    kdb_enc_u32(e, 5, serial + 1000); kdb_enc_u32(e, 6, 0); kdb_enc_u64(e, 7, 4); kdb_enc_bytes(e, 8, dig, sizeof(dig));
-    if (req) kdb_enc_u64(e, 11, req);
-    kdb_enc_end(e);
-    uint8_t msg[2048];
-    size_t n = zone_message(msg, zone, serial);
-    kdb_enc_raw_msg(e, KDB_T_ZONE_DATA, msg, n);
-    kdb_enc_begin(e, KDB_T_ZONE_END);
-    kdb_enc_u64(e, 1, 4);
-    kdb_enc_end(e);
+    zone_image_t *img = zone_img(zone, serial);
+    zi_zone_msgs(e, 0, zone, sid, serial + 1000, img, req, NULL, NULL, 0, (int)serial);
+    zone_image_free(img);
     ch_send(fd, e);
 }
 
-/* a zone of nA address records (SOA, NS, nA x A, SOA), in ZONE_DATA messages of 1000 records */
+/* a zone of nA address records (SOA, NS, www, nA x A): one image, in ZONE_IMAGE messages of 64 KiB */
 static void send_big_zone(int fd, kdb_enc_t *e, const char *zone, uint32_t serial, int64_t sid, int nA) {
+    zone_image_t *img = zi_zone(zone, serial, NULL, NULL, nA);
     uint8_t dig[KDB_DIGEST_LEN];
     memset(dig, (int)serial, sizeof(dig));
-    kdb_enc_begin(e, KDB_T_ZONE_BEGIN);
-    kdb_enc_u16(e, 1, 0); kdb_enc_name(e, 2, zone); kdb_enc_i64(e, 3, sid); kdb_enc_u8(e, 4, KDB_ZK_PRIMARY);
-    kdb_enc_u32(e, 5, serial); kdb_enc_u32(e, 6, 0); kdb_enc_u64(e, 7, (uint64_t)nA + 3); kdb_enc_bytes(e, 8, dig, sizeof(dig));
-    kdb_enc_end(e);
+    zi_begin(e, 0, zone, sid, serial, (int)serial, 0, 0, NULL, NULL, img->n_rrs, img->total_size);
     ch_send(fd, e);
-    static uint8_t msg[60000];
-    for (int start = 0; start < nA || start == 0; start += 1000) {
-        int n = nA - start < 1000 ? nA - start : 1000;
-        bool head = start == 0, tail = start + 1000 >= nA;
-        memset(msg, 0, 12);
-        msg[2] = 0x84;
-        size_t o = 12, rp[1];
-        int cnt = 0;
-        for (int k = -2; k < n + 1; k++) {
-            char owner[300], ns[300], mail[300];
-            snprintf(ns, sizeof(ns), "ns1.%s", zone);
-            snprintf(mail, sizeof(mail), "host.%s", zone);
-            uint16_t type;
-            if (k == -2) { if (!head) continue; type = 6; snprintf(owner, sizeof(owner), "%s", zone); }
-            else if (k == -1) { if (!head) continue; type = 2; snprintf(owner, sizeof(owner), "%s", zone); }
-            else if (k == n) { if (!tail) continue; type = 6; snprintf(owner, sizeof(owner), "%s", zone); }
-            else { type = 1; snprintf(owner, sizeof(owner), "h%d.%s", start + k, zone); }
-            size_t rd = put_rr_head(msg + o, owner, type, rp);
-            size_t s = o + rd, l = 0;
-            if (type == 6) {
-                l += put_name(msg + s, ns);
-                l += put_name(msg + s + l, mail);
-                l += put_u32(msg + s + l, serial); l += put_u32(msg + s + l, 3600); l += put_u32(msg + s + l, 600); l += put_u32(msg + s + l, 86400); l += put_u32(msg + s + l, 300);
-            } else if (type == 2) {
-                l += put_name(msg + s, ns);
-            } else {
-                msg[s] = 192; msg[s + 1] = 0; msg[s + 2] = 2; msg[s + 3] = (uint8_t)(1 + (start + k) % 250);
-                l = 4;
-            }
-            put_u16(msg + o + rp[0], (uint16_t)l);
-            o = s + l;
-            cnt++;
-        }
-        put_u16(msg + 6, (uint16_t)cnt);
-        kdb_enc_raw_msg(e, KDB_T_ZONE_DATA, msg, o);
+    for (size_t off = 0; off < img->total_size; off += 65536) {
+        zi_chunks(e, (const uint8_t *)img + off, img->total_size - off < 65536 ? img->total_size - off : 65536, 0);
         ch_send(fd, e);
     }
-    kdb_enc_begin(e, KDB_T_ZONE_END);
-    kdb_enc_u64(e, 1, (uint64_t)nA + 3);
-    kdb_enc_end(e);
+    zi_end(e, img->n_rrs);
     ch_send(fd, e);
+    zone_image_free(img);
 }
 
 static void batch_begin(int fd, kdb_enc_t *e, uint64_t id, int kind) {
@@ -803,7 +689,7 @@ static int run_mode(const char *mode) {
     kdb_msg_t m;
     park_key_t k;
     kdb_enc_begin(&e, KDB_T_HELLO);
-    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, KDB_FEAT_IMAGE); kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION);
     kdb_enc_end(&e);
     ch_send(a[0], &e);
     CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG);
@@ -1384,21 +1270,11 @@ static int run_mode(const char *mode) {
 
     /* -- settings: the interned text is kept by id; a zone that is not in memory is answered (allow-query) from them, and the id is what its record names */
     {
-        uint8_t dig[KDB_DIGEST_LEN];
-        memset(dig, 9, sizeof(dig));
         static const char stext[] = "allow-transfer { 127.0.0.1; };";
         batch_begin(a[0], &e, 26, KDB_BATCH_DIFF);
-        kdb_enc_begin(&e, KDB_T_ZONE_BEGIN);
-        kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, "set1.test."); kdb_enc_i64(&e, 3, 180); kdb_enc_u8(&e, 4, KDB_ZK_PRIMARY);
-        kdb_enc_u32(&e, 5, 1); kdb_enc_u32(&e, 6, 0); kdb_enc_u64(&e, 7, 4); kdb_enc_bytes(&e, 8, dig, sizeof(dig));
-        kdb_enc_str(&e, 9, stext);
-        kdb_enc_end(&e);
-        uint8_t zm[2048];
-        size_t zn = zone_message(zm, "set1.test.", 1);
-        kdb_enc_raw_msg(&e, KDB_T_ZONE_DATA, zm, zn);
-        kdb_enc_begin(&e, KDB_T_ZONE_END);
-        kdb_enc_u64(&e, 1, 4);
-        kdb_enc_end(&e);
+        zone_image_t *simg = zone_img("set1.test.", 1);
+        zi_zone_msgs(&e, 0, "set1.test.", 180, 1, simg, 0, stext, NULL, 0, 9);
+        zone_image_free(simg);
         ch_send(a[0], &e);
         batch_end(a[0], &e, &mainc, 26, 1, 0);
         CHECK(in_memory("set1.test."));
@@ -2700,8 +2576,7 @@ static int run_proto(int phase, const char *dir) {
     for (int i = 0; i < PN + 16; i++) g_pserial[i] = 1;
 
     kdb_enc_begin(&e, KDB_T_HELLO);
-    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242);
-    if (phase > 0) kdb_enc_u32(&e, 5, phase == 1 ? (KDB_FEAT_STORE | KDB_FEAT_LOOKUP) : KDB_FEAT_STORE);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, (phase > 0 ? (phase == 1 ? (KDB_FEAT_STORE | KDB_FEAT_LOOKUP) : KDB_FEAT_STORE) : 0) | KDB_FEAT_IMAGE); kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION);
     kdb_enc_end(&e);
     ch_send(a[0], &e);
     CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG);
@@ -3056,7 +2931,7 @@ static int run_proto(int phase, const char *dir) {
         c[4] = (pc_t){ .sid = p_sid(21), .op = KDB_CH_DELETE, .has_name = true };                                           pn_name(c[4].name, sizeof(c[4].name), 21);
         c[5] = (pc_t){ .sid = p_sid(30), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 1, .time = 10 };  snprintf(c[5].name, sizeof(c[5].name), "m0030b.test.");
         c[6] = (pc_t){ .sid = p_sid(13), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 1, .time = 10, .force = true };  pn_name(c[6].name, sizeof(c[6].name), 13);
-        CHECK(evict_zone("m0010.test."));                                /* (the zone whose stamp changes is out of memory: its NOTIFY is queued when the new body is installed, as for a summary before) */
+        CHECK(!in_memory("m0010.test.") || evict_zone("m0010.test."));   /* (0.7 M3: a body of the fill is not attached by itself; the zone whose stamp changes is out of memory: its NOTIFY is queued when the new body is installed, as for a summary before) */
         { char nv[64], nz[300]; while (dbreg_notify_pop(nv, sizeof(nv), nz, sizeof(nz))) {} }
         p_batch_begin(a[0], &e, 2, KDB_BATCH_AUTO, 0);
         p_changes(a[0], &e, 2, 90, true, c, 7);
@@ -3502,7 +3377,7 @@ static int run_fixes(const char *dir) {
     g_query_bg_attach = no_bg_fetch;
     for (int i = 0; i < PN + 16; i++) g_pserial[i] = 1;
     kdb_enc_begin(&e, KDB_T_HELLO);
-    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, KDB_FEAT_STORE);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, (KDB_FEAT_STORE) | KDB_FEAT_IMAGE); kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION);
     kdb_enc_end(&e);
     ch_send(a[0], &e);
     CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG && m.u.config.store_proto);
@@ -3522,6 +3397,20 @@ static int run_fixes(const char *dir) {
     (void)serve_fetches(&fetchc, f[0], &e, 1500, -1, -1);
     CHECK(wait_stored(st, NF, 30000));
     CHECK(cursor_is(st, 100));
+
+    /* -- 0.7 M3: the bodies of a first fill, which nobody waits for, are stored as the images they are: no entry is made, the registry does not change, and the counters say so.  The first query
+     *    (db_store_attach_zone(): what a worker does) attaches the zone from its record. */
+    {
+        store_fill_t sf;
+        CHECK(db_ingest_fill_stats(&sf));
+        CHECK_MSG(sf.images >= (uint64_t)NF && sf.store_only >= (uint64_t)NF && sf.resident == 0 && sf.invalid == 0 && sf.image_bytes >= (uint64_t)NF * sizeof(zone_image_t) && sf.validate_ns > 0,
+                  "store.fill: images %llu, store_only %llu, resident %llu, invalid %llu, bytes %llu", (unsigned long long)sf.images, (unsigned long long)sf.store_only, (unsigned long long)sf.resident,
+                  (unsigned long long)sf.invalid, (unsigned long long)sf.image_bytes);
+        CHECK(!in_memory("m0007.test.") && dbreg_lookup_entry("default", "m0007.test.") == NULL);
+        db_store_attach_zone("default", "m0007.test.");
+        for (int i = 0; i < 500 && !in_memory("m0007.test."); i++) usleep(10000);
+        CHECK(in_memory("m0007.test.") && dbreg_lookup_entry("default", "m0007.test.") != NULL);
+    }
 
     /* -- H1: a zone whose new stamp could not be recorded (the disk is full) is listed by the database: it is not swept, with the zone the database no longer lists in the same pass, and the pass keeps no
      *    cursor.  (Before: the entry did not set the bit of its zone, and the sweep deleted it.) */
@@ -3752,7 +3641,7 @@ static void race_hook(int where, const char *zone) {
         return;
     }
     if (where == 0) {
-        atomic_fetch_add(&g_hk_arrived, 1);                              /* (both builders are inside the window before either goes on) */
+        atomic_fetch_add(&g_hk_arrived, 1);                              /* (the writer is inside the window before it goes on) */
         for (int t = 0; t < 1000 && atomic_load(&g_hk_arrived) < atomic_load(&g_hk_expect); t++) usleep(10000);
         if (atomic_load(&g_hk_arrived) < atomic_load(&g_hk_expect)) atomic_store(&g_hk_timeout, true);
         if (h->act == HK_INNER) return;
@@ -3809,19 +3698,9 @@ static const rq_t *rq_find(const rq_t *r, int n, const char *name) {
 }
 
 static void send_root_zone(int fd, kdb_enc_t *e, uint32_t serial, uint64_t req, int64_t sid) {
-    uint8_t dig[KDB_DIGEST_LEN];
-    memset(dig, (int)serial, sizeof(dig));
-    kdb_enc_begin(e, KDB_T_ZONE_BEGIN);
-    kdb_enc_u16(e, 1, 0); kdb_enc_name(e, 2, "."); kdb_enc_i64(e, 3, sid); kdb_enc_u8(e, 4, KDB_ZK_PRIMARY);
-    kdb_enc_u32(e, 5, serial); kdb_enc_u32(e, 6, 0); kdb_enc_u64(e, 7, 4); kdb_enc_bytes(e, 8, dig, sizeof(dig));
-    if (req) kdb_enc_u64(e, 11, req);
-    kdb_enc_end(e);
-    uint8_t msg[2048];
-    size_t n = zone_message(msg, "", serial);
-    kdb_enc_raw_msg(e, KDB_T_ZONE_DATA, msg, n);
-    kdb_enc_begin(e, KDB_T_ZONE_END);
-    kdb_enc_u64(e, 1, 4);
-    kdb_enc_end(e);
+    zone_image_t *img = zi_zone(".", serial, NULL, NULL, 0);
+    zi_zone_msgs(e, 0, ".", sid, serial, img, req, NULL, NULL, 0, (int)serial);
+    zone_image_free(img);
     ch_send(fd, e);
 }
 
@@ -3841,6 +3720,12 @@ static bool wait_mem(const char *zone, int ms) {
         usleep(10000);
     }
     return false;
+}
+
+/* 0.7 M3: a body that nobody waits for goes to the store as it is, and the zone is in memory when the first query asks for it (what a worker does) */
+static bool attach_mem(const char *zone, int ms) {
+    db_store_attach_zone("default", zone);
+    return wait_mem(zone, ms);
 }
 
 static int run_stamp_race(const char *dir) {
@@ -3878,7 +3763,7 @@ static int run_stamp_race(const char *dir) {
     g_query_bg_fetch = no_bg_fetch;
     g_query_bg_attach = no_bg_fetch;
     kdb_enc_begin(&e, KDB_T_HELLO);
-    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, KDB_FEAT_STORE);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, (KDB_FEAT_STORE) | KDB_FEAT_IMAGE); kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION);
     kdb_enc_end(&e);
     ch_send(a[0], &e);
     CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG && m.u.config.store_proto);
@@ -3901,7 +3786,7 @@ static int run_stamp_race(const char *dir) {
     CHECK(p_result(&mainc, &m, 10000));
     CHECK(rq_collect(&fetchc, rq, 16, 1500) == 1 && rq_find(rq, 1, nc));
     send_zone(f[0], &e, nc, 1, rq[0].id, p_sid(ZC));
-    CHECK(wait_rec(st, rc, STORE_STATE_STORED, 1, 1, false, 10000) && wait_mem(nc, 5000));
+    CHECK(wait_rec(st, rc, STORE_STATE_STORED, 1, 1, false, 10000) && attach_mem(nc, 5000));
 
     /* -- round 1: two builders, each with a body in hand.  A: a new zone (no entry), the database changes it again in the window.  B: the database deletes it in the window. */
     memset(c, 0, sizeof(c));
@@ -3916,7 +3801,7 @@ static int run_stamp_race(const char *dir) {
     hk_set(0, HK_UPSERT, na, p_sid(ZA), 2, 20);
     hk_set(1, HK_DELETE, nb, p_sid(ZB), 0, 0);
     atomic_store(&g_hk_arrived, 0);
-    atomic_store(&g_hk_expect, 2);
+    atomic_store(&g_hk_expect, 1);                                 /* (0.7 M3: with the store the thread that reads the stream installs the bodies, one after the other: one writer is in the window at a time) */
     const rq_t *qa = rq_find(rq, n, na), *qb = rq_find(rq, n, nb);
     if (qa && qb) {
         send_zone(f[0], &e, na, 1, qa->id, p_sid(ZA));
@@ -3930,7 +3815,7 @@ static int run_stamp_race(const char *dir) {
     CHECK(!zrec(st, rb, &z) && dbreg_lookup_entry("default", nb) == NULL);                                   /* (before: the deleted zone was written back) */
     qa = rq_find(rq, n, na);
     if (qa) send_zone(f[0], &e, na, 2, qa->id, p_sid(ZA));
-    CHECK(wait_rec(st, ra, STORE_STATE_STORED, 2, 2, false, 10000) && wait_mem(na, 5000));
+    CHECK(wait_rec(st, ra, STORE_STATE_STORED, 2, 2, false, 10000) && attach_mem(na, 5000));
     CHECK(zrec(st, ra, &z) && z.stamp_time == 20);
 
     /* -- round 2: C is in memory (the body is installed into its entry in place).  The database changes it twice, the second time in the window: the store keeps the old image under the new stamp, marked stale,
@@ -3947,7 +3832,7 @@ static int run_stamp_race(const char *dir) {
     hk_set(2, HK_UPSERT, nc, p_sid(ZC), 3, 30);
     hk_set(3, HK_INNER, nd, p_sid(ZD), 2, 20);
     atomic_store(&g_hk_arrived, 0);
-    atomic_store(&g_hk_expect, 2);
+    atomic_store(&g_hk_expect, 1);                                 /* (0.7 M3: with the store the thread that reads the stream installs the bodies, one after the other: one writer is in the window at a time) */
     const rq_t *qc = rq_find(rq, n, nc), *qd = rq_find(rq, n, nd);
     if (qc && qd) {
         send_zone(f[0], &e, nc, 2, qc->id, p_sid(ZC));
@@ -4144,7 +4029,7 @@ static int run_settings(int phase, const char *dir) {
     kdb_enc_init(&e);
     kdb_msg_t m;
     kdb_enc_begin(&e, KDB_T_HELLO);
-    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, KDB_FEAT_IMAGE); kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION);
     kdb_enc_end(&e);
     ch_send(a[0], &e);
     CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG);
@@ -4156,19 +4041,9 @@ static int run_settings(int phase, const char *dir) {
         char zn[32], stext[96];
         snprintf(zn, sizeof(zn), "set%d.test.", i);
         snprintf(stext, sizeof(stext), "allow-transfer { 127.0.0.%d; };", i);
-        uint8_t dig[KDB_DIGEST_LEN];
-        memset(dig, 9, sizeof(dig));
-        kdb_enc_begin(&e, KDB_T_ZONE_BEGIN);
-        kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, zn); kdb_enc_i64(&e, 3, 700 + i); kdb_enc_u8(&e, 4, KDB_ZK_PRIMARY);
-        kdb_enc_u32(&e, 5, 1); kdb_enc_u32(&e, 6, 0); kdb_enc_u64(&e, 7, 4); kdb_enc_bytes(&e, 8, dig, sizeof(dig));
-        kdb_enc_str(&e, 9, stext);
-        kdb_enc_end(&e);
-        uint8_t zm[2048];
-        size_t zn_len = zone_message(zm, zn, 1);
-        kdb_enc_raw_msg(&e, KDB_T_ZONE_DATA, zm, zn_len);
-        kdb_enc_begin(&e, KDB_T_ZONE_END);
-        kdb_enc_u64(&e, 1, 4);
-        kdb_enc_end(&e);
+        zone_image_t *simg = zone_img(zn, 1);
+        zi_zone_msgs(&e, 0, zn, 700 + i, 1, simg, 0, stext, NULL, 0, 9);
+        zone_image_free(simg);
         ch_send(a[0], &e);
     }
     batch_end(a[0], &e, &mainc, 1, (uint32_t)count, 0);
@@ -4284,7 +4159,7 @@ static int run_s5(const char *mode) {
     kdb_enc_init(&e);
     kdb_msg_t m;
     kdb_enc_begin(&e, KDB_T_HELLO);
-    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, KDB_FEAT_IMAGE); kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION);
     kdb_enc_end(&e);
     ch_send(a[0], &e);
     CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG);
@@ -4722,8 +4597,7 @@ static int run_lookup_body(const char *dir) {
     g_query_bg_attach = no_bg_fetch;
 
     kdb_enc_begin(&e, KDB_T_HELLO);
-    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242);
-    kdb_enc_u32(&e, 5, KDB_FEAT_STORE | KDB_FEAT_LOOKUP | KDB_FEAT_LOOKUP_BODY);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, KDB_FEAT_STORE | KDB_FEAT_LOOKUP | KDB_FEAT_LOOKUP_BODY | KDB_FEAT_IMAGE); kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION);
     kdb_enc_end(&e);
     ch_send(a[0], &e);
     CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG && m.u.config.store_proto);
@@ -4991,7 +4865,7 @@ static int run_lookup_body(const char *dir) {
         CHECK(!ch_next(&fetchc2, &m, 300));                                                    /* (the one that was to be read through is not asked again) */
         CHECK(wake_for("b.skip2.test.", &k, 5000) && !k.failed && places_are(2, 2000));        /* (it is over: its place is back, its queries woken once more) */
         kdb_enc_begin(&e, KDB_T_HELLO);
-        kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader-2"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4243); kdb_enc_u32(&e, 5, KDB_FEAT_STORE | KDB_FEAT_LOOKUP);
+        kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader-2"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4243); kdb_enc_u32(&e, 5, (KDB_FEAT_STORE | KDB_FEAT_LOOKUP) | KDB_FEAT_IMAGE); kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION);
         kdb_enc_end(&e);
         ch_send(a2[0], &e);
         CHECK(ch_next(&mainc2, &m, 5000) && m.type == KDB_T_CONFIG);
@@ -5221,7 +5095,7 @@ static int run_recon_thread(const char *dir) {
     g_query_bg_fetch = no_bg_fetch;
     g_query_bg_attach = no_bg_fetch;
     kdb_enc_begin(&e, KDB_T_HELLO);
-    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, KDB_FEAT_STORE | KDB_FEAT_LOOKUP);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, (KDB_FEAT_STORE | KDB_FEAT_LOOKUP) | KDB_FEAT_IMAGE); kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION);
     kdb_enc_end(&e);
     ch_send(a[0], &e);
     CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG && m.u.config.store_proto);
@@ -5352,7 +5226,7 @@ static int run_recon_thread(const char *dir) {
         ch_init(&mainc, a[0], KDB_FROM_BACKEND);
         ch_init(&fetchc, f[0], KDB_FROM_BACKEND);
         kdb_enc_begin(&e, KDB_T_HELLO);
-        kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, KDB_FEAT_STORE | KDB_FEAT_LOOKUP);
+        kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, (KDB_FEAT_STORE | KDB_FEAT_LOOKUP) | KDB_FEAT_IMAGE); kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION);
         kdb_enc_end(&e);
         ch_send(a[0], &e);
         CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG);
@@ -5391,7 +5265,7 @@ static int run_recon_thread(const char *dir) {
         ch_init(&mainc, a[0], KDB_FROM_BACKEND);
         ch_init(&fetchc, f[0], KDB_FROM_BACKEND);
         kdb_enc_begin(&e, KDB_T_HELLO);
-        kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, KDB_FEAT_STORE | KDB_FEAT_LOOKUP);
+        kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, (KDB_FEAT_STORE | KDB_FEAT_LOOKUP) | KDB_FEAT_IMAGE); kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION);
         kdb_enc_end(&e);
         ch_send(a[0], &e);
         CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG);
@@ -5555,7 +5429,7 @@ static int run_heap(int nz, const char *mode) {
     kdb_enc_init(&e);
     kdb_msg_t m;
     kdb_enc_begin(&e, KDB_T_HELLO);
-    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, KDB_FEAT_IMAGE); kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION);
     kdb_enc_end(&e);
     ch_send(a[0], &e);
     CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG);
@@ -5615,6 +5489,7 @@ static int run_heap(int nz, const char *mode) {
 }
 
 int main(int argc, char **argv) {
+    zi_www_varies = 1;                                      /* (the www address of a zone follows its serial) */
     setvbuf(stdout, NULL, _IOLBF, 0);                       /* (a log that shows where the time goes, also through a pipe) */
     g_self = argv[0];
     if (argc > 3 && strcmp(argv[1], "hot") == 0) return run_hot(argv[2], atoi(argv[3]));

@@ -1028,7 +1028,7 @@ static void analyze_stream(dump_t *d) {
             if (d->n_begin < 16) snprintf(d->begin_name[d->n_begin], 80, "%s", m.u.zone_begin.name);
             d->n_begin++;
             break;
-        case KDB_T_ZONE_DATA: d->n_data++; break;
+        case KDB_T_ZONE_IMAGE: d->n_data++; break;
         case KDB_T_ZONE_END: d->n_end++; break;
         case KDB_T_ZONE_FAILED:
             if (d->n_failed < 16) {

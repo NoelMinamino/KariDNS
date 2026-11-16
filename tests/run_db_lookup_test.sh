@@ -3,8 +3,8 @@
 #
 # A database of LOOKUP_ZONES zones (default 20000, tests/db/gen_sqlite3_zones.sh) is read into an empty store.  The loader is started behind tests/db/slow_manifest.c, which holds the pass after its
 # MANIFEST_BEGIN for as long as the test wants (the pass over 20000 zones takes 40 ms, too short for a query to meet it), while the real loader answers on its fetch stream.  The whole scenario runs twice:
-#   - "body": the loader as it is (HELLO features 7: the answer of a lookup is followed by the body of the zone, FETCH_REQ mode 3);
-#   - "plain": the proxy takes the third bit out of the HELLO (-DHELLO_MASK=3), the loader of an earlier version: the Backend asks mode 2 and fetches the zone in a second request.
+#   - "body": the loader as it is (HELLO features 15 (with the zone image bit): the answer of a lookup is followed by the body of the zone, FETCH_REQ mode 3);
+#   - "plain": the proxy takes the lookup-body bit (4) out of the HELLO (-DHELLO_MASK=11: the store, lookup and image bits stay), the loader of an earlier version: the Backend asks mode 2 and fetches the zone in a second request.
 # Checked while the pass is held:
 #   - a query for a zone near the end of the manifest order is NOERROR (not REFUSED), over UDP and over TCP, and so is a query for a name inside such a zone; with the body the zone comes with the answer
 #     of the lookup (karictl dbstatus: body_inline), without it never;
@@ -64,7 +64,7 @@ else
     cp "$LOADER" "$T/karidns-dbloader.real"; chmod 755 "$T/karidns-dbloader.real"
 fi
 cc -O1 -o "$T/karidns-dbloader" tests/db/slow_manifest.c -DREAL_LOADER="\"$T/karidns-dbloader.real\"" -DRELEASE_FILE="\"$T/release\"" > "$T/cc.log" 2>&1 || { echo "SKIP: the proxy does not build"; cat "$T/cc.log"; exit 0; }
-cc -O1 -o "$T/karidns-dbloader.plain" tests/db/slow_manifest.c -DREAL_LOADER="\"$T/karidns-dbloader.real\"" -DRELEASE_FILE="\"$T/release\"" -DHELLO_MASK=3u > "$T/cc2.log" 2>&1 || { echo "SKIP: the proxy does not build"; cat "$T/cc2.log"; exit 0; }
+cc -O1 -o "$T/karidns-dbloader.plain" tests/db/slow_manifest.c -DREAL_LOADER="\"$T/karidns-dbloader.real\"" -DRELEASE_FILE="\"$T/release\"" -DHELLO_MASK=11u > "$T/cc2.log" 2>&1 || { echo "SKIP: the proxy does not build"; cat "$T/cc2.log"; exit 0; }
 chmod 755 "$T/karidns-dbloader" "$T/karidns-dbloader.plain"
 cat > "$T/a.ctl.conf" <<EOF
 socket "$T/a.sock";

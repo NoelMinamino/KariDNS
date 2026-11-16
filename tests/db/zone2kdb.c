@@ -87,6 +87,7 @@ static int cmd_ref(const char *out_path, const char *list_path, uint32_t default
     kdb_enc_init(&e);
     if (kdb_enc_begin(&e, KDB_T_HELLO) != 0 || kdb_enc_u16(&e, 1, KDB_VERSION) != 0 ||
         kdb_enc_str(&e, 2, KARIDNS_VERSION) != 0 || kdb_enc_str(&e, 3, "sqlite3") != 0 || kdb_enc_u32(&e, 4, 0) != 0 ||
+        kdb_enc_u32(&e, 5, KDB_FEAT_IMAGE) != 0 || kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION) != 0 ||
         kdb_enc_end(&e) != 0 || enc_flush(&e, &hdr) != 0 ||
         kdb_enc_begin(&e, KDB_T_BATCH_BEGIN) != 0 || kdb_enc_u64(&e, 1, 1) != 0 ||
         kdb_enc_u8(&e, 2, KDB_BATCH_STARTUP) != 0 || kdb_enc_u64(&e, 3, 0) != 0 || kdb_enc_end(&e) != 0 ||

@@ -4,56 +4,49 @@
  *
  *   fake_dbloader -s FD MODE
  *
- * It sends a correct HELLO (version 1, driver sqlite3), reads the CONFIG, and then misbehaves.  Modes of the
- * lifecycle test (the stream is wrong; the Backend closes it):
+ * It sends a correct HELLO (version 1, driver sqlite3, zone images: KDB_FEAT_IMAGE and the image version), reads the CONFIG, and then misbehaves.  The framing of the stream is
+ * written by hand (the encoder of dns_db_stream.c would only make correct messages); the zone images are made with the zone parser and zone_image_freeze() (tests/db/zimg_msgs.h) and
+ * then spoilt where a mode needs it.  Modes of the lifecycle test (the stream is wrong; the Backend closes it):
  *   bad-magic  a message whose magic is not "KDB1"
  *   bad-order  ZONE_END without BATCH_BEGIN / ZONE_BEGIN (a message type that is not legal in the state)
  *   bad-view   BATCH_BEGIN followed by a ZONE_BEGIN naming a view index beyond the configured views
  *   silent     nothing more (the Backend must keep waiting without harm)
- * Modes of the hostile loader test (B4b), each one batch of ok1.test, <the bad zone bad.test>, ok2.test:
+ * Modes of the hostile loader test, each one batch of ok1.test, <the bad zone bad.test>, ok2.test:
  *   good             no bad zone (the sanity run: both zones are installed)
- *   owner-outside    bad.test contains an A record with an owner outside the zone      -> zone rejected
- *   anc-short        ANCOUNT says 5 RRs, the message holds 3                            -> zone rejected
- *   garbage-rr       a valid frame whose DNS message is garbage after the header        -> zone rejected
- *   no-final-soa     SOA, A and no closing SOA                                          -> zone rejected
- *   two-soa          a second SOA with another serial in the middle                     -> zone rejected
- *   soa-subdomain    the first SOA belongs to sub.bad.test, not the apex                -> zone rejected
- *   trailing-rr      a record after the closing SOA                                     -> zone rejected
- *   later-message    a record in a second ZONE_DATA after the closing SOA               -> zone rejected
+ *   owner-outside    bad.test has an A record with an owner outside the zone            -> zone rejected
+ *   soa-subdomain    the only SOA belongs to sub.bad.test, not the apex                  -> zone rejected
+ *   two-soa          two SOA records at the apex without the extended flag               -> zone rejected
+ *   other-zone       the image of another zone                                          -> zone rejected
+ *   non-in-class     an RR of class CH                                                  -> zone rejected
+ *   image-serial     ZONE_BEGIN declares another serial than the SOA of the image        -> zone rejected
+ *   image-tinydns    the image says tinydns, ZONE_BEGIN does not                         -> zone rejected
+ *   image-garbage    the octets after the header are noise                               -> zone rejected
  *   secondary-kind   zone_kind secondary, rr_count 0, no settings (B7b: no masters)              -> zone rejected
- *   secondary-data   zone_kind secondary with rr_count 2 and ZONE_DATA                           -> protocol error
+ *   secondary-data   zone_kind secondary with rr_count 2                                         -> protocol error
  *   secondary-flag   zone_kind secondary with the presigned flag                                 -> zone rejected
  *   secondary-host   secondary whose masters statement names a host name                         -> zone rejected
  *   secondary-prim   a primary zone whose settings name masters                                   -> zone rejected
  *   secondary-ok     secondary with masters { 127.0.0.1 port 1; } (the transfer fails, the zone is registered) -> applied
  *   catalog-ok       zone_kind catalog (a CONSUMER) with masters                                  -> applied
- *   ext-no-flag      a state record (CLASS 65302) in a zone without the extended flag    -> zone rejected
- *   ext-trusted      an ECS_TRUSTED record (settings only)                               -> zone rejected
- *   ext-bad-def      a malformed LOC_TAGDEF                                              -> zone rejected
- *   ext-bad-locdef   a malformed TINYDNS_LOCDEF                                          -> zone rejected
- *   ext-bad-wrap     a TINYDNS_WRAP shorter than its fixed part                          -> zone rejected
- *   ext-long-tag     a LOC_STATE tag of 70 octets                                        -> zone rejected
  *   ext-flag-bit     a reserved zone flag bit (32: bit 3 is the fetch summary since D1a, bit 4 the zone image since M3)          -> protocol error
- *   ext-image-flag   the zone image flag without the size of the image (0.7 M3: the Backend does not take images yet)             -> protocol error
- *   ext-ok           state records and the extended + tinydns flags                      -> applied
- *   non-in-class     an RR of class CH                                                  -> zone rejected
+ *   ext-image-flag   the zone image flag without the size of the image                                                          -> protocol error
+ *   ext-ok           the extended flag on a zone                                         -> applied
  *   again            ok1.test twice in one batch (the second replaces the first)       -> both applied
- *   slow             ok1.test, a pause of 3 s, ok2.test: ok1.test must answer during the pause (the view delta runs
+ *   slow             ok1.test, a pause of 8 s, ok2.test: ok1.test must answer during the pause (the view delta runs
  *                    at least once a second, design 4.4)
  *   delete-unknown   ZONE_DELETE of a zone that is not registered                       -> "unchanged"
- *   huge-frame       a ZONE_DATA body of 70000 bytes                                    -> protocol error
+ *   huge-frame       a ZONE_IMAGE message above 1 MiB                                   -> protocol error
  *   end-count        ZONE_END with another RR count than ZONE_BEGIN                     -> protocol error
- *   begin-count      ZONE_BEGIN declares 9 RRs, the data has 3                          -> protocol error
- *   zero-ancount     a ZONE_DATA message with ANCOUNT 0                                 -> protocol error
- *   opt-twice        ARCOUNT 1 in the second ZONE_DATA of a zone                        -> protocol error
+ *   begin-count      ZONE_BEGIN declares 9 RRs, the image has 3                         -> protocol error
  *   unknown-tag      ZONE_BEGIN with an unknown TLV tag                                 -> protocol error
- * Modes of the version 3 SOA set (B8t-2: SOA_SET, the apex SOA RRs as wrapped body RRs):
- *   soaset-ok        two SOAs (one with the location in), the frame is the reference SOA     -> applied
- *   soaset-serial    a body SOA with another serial than the frame                          -> zone rejected
- *   soaset-count     SOA_SET announces 3, the body has 2                                    -> zone rejected
- *   soaset-late      SOA_SET after a data record                                            -> zone rejected
- *   soaset-dup       two body SOAs for the same clients (both location in)                  -> zone rejected
- *   soaset-frame     the opening SOA is not the reference SOA (another refresh)             -> zone rejected
+ *   zone-data        a message of type 5 (the ZONE_DATA of the loaders before 0.7 M3)   -> protocol error
+ *   no-image-flag    a primary zone that is not an image                                -> protocol error
+ *   hello-no-image   a HELLO without KDB_FEAT_IMAGE                                     -> protocol error
+ *   hello-version    a HELLO with another image version                                 -> protocol error
+ *   image-magic      the header of the image has another magic                           -> protocol error
+ *   image-size-hdr   the size in the header is not the one of ZONE_BEGIN                 -> protocol error
+ *   image-short      ZONE_END before the image is complete                              -> protocol error
+ *   image-extra      one more ZONE_IMAGE message than the size announced                -> protocol error
  * Modes of the settings part (B7a):
  *   settings-key     settings text naming a TSIG key karidns.conf does not define          -> zone rejected
  *   settings-include settings text with an include statement                               -> zone rejected
@@ -63,14 +56,15 @@
  *   profile-missing  ZONE_BEGIN names a profile that was not sent                          -> zone rejected
  *   profile-flood    270 PROFILE messages of 64000 bytes (more than the Backend keeps)    -> protocol error
  *   settings-ok      settings text and a profile the Backend accepts                       -> both applied
- * Then it waits until the Backend closes the stream and exits 0.  Hand-made bytes, no library: the encoder of
- * dns_db_stream.c would only make correct messages.
+ * Then it waits until the Backend closes the stream and exits 0.
  */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#include "zimg_msgs.h"
 
 static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
 static void put32(uint8_t *p, uint32_t v) { put16(p, (uint16_t)(v >> 16)); put16(p + 2, (uint16_t)v); }
@@ -83,7 +77,7 @@ static size_t tlv(uint8_t *b, uint16_t tag, const void *v, uint16_t n) {
     return 4u + n;
 }
 
-static uint8_t g_buf[80000];
+static uint8_t g_buf[(2u << 20) + 64];
 
 static void send_msg(int fd, const char *magic, uint16_t type, const uint8_t *body, size_t n) {
     memcpy(g_buf, magic, 4);
@@ -97,90 +91,6 @@ static void send_msg(int fd, const char *magic, uint16_t type, const uint8_t *bo
         if (w <= 0) exit(0);
         off += (size_t)w;
     }
-}
-
-/* ---------------------------------------------------------------- DNS message pieces */
-typedef struct {
-    uint8_t b[4096];
-    size_t n;
-    uint16_t an;
-} dm_t;
-
-static void dm_init(dm_t *m) {
-    memset(m, 0, sizeof(*m));
-    m->b[2] = 0x84;                          /* QR, AA */
-    m->n = 12;
-}
-
-static size_t wname(uint8_t *p, const char *name) {
-    size_t n = 0;
-    const char *s = name;
-    while (*s) {
-        const char *dot = strchr(s, '.');
-        size_t l = dot ? (size_t)(dot - s) : strlen(s);
-        p[n++] = (uint8_t)l;
-        memcpy(p + n, s, l);
-        n += l;
-        if (!dot) break;
-        s = dot + 1;
-    }
-    p[n++] = 0;
-    return n;
-}
-
-static void dm_rr(dm_t *m, const char *owner, uint16_t type, uint16_t cls, const uint8_t *rd, size_t rdlen) {
-    m->n += wname(m->b + m->n, owner);
-    put16(m->b + m->n, type); m->n += 2;
-    put16(m->b + m->n, cls); m->n += 2;
-    put32(m->b + m->n, 300); m->n += 4;
-    put16(m->b + m->n, (uint16_t)rdlen); m->n += 2;
-    memcpy(m->b + m->n, rd, rdlen);
-    m->n += rdlen;
-    m->an++;
-    put16(m->b + 6, m->an);
-}
-
-static void dm_soa_ex(dm_t *m, const char *zone, uint32_t serial, uint32_t refresh) {
-    uint8_t rd[600];
-    char mn[300], rn[300];
-    snprintf(mn, sizeof(mn), "ns.%s", zone);
-    snprintf(rn, sizeof(rn), "host.%s", zone);
-    size_t n = wname(rd, mn);
-    n += wname(rd + n, rn);
-    put32(rd + n, serial); put32(rd + n + 4, refresh); put32(rd + n + 8, 600); put32(rd + n + 12, 86400);
-    put32(rd + n + 16, 300);
-    dm_rr(m, zone, 6, 1, rd, n + 20);
-}
-
-static void dm_soa(dm_t *m, const char *zone, uint32_t serial) { dm_soa_ex(m, zone, serial, 3600); }
-
-/* B8t-2: a SOA of a SOA set: TYPE 65406 around the SOA, with the tinydns location loc ("" = none) */
-static void dm_soa_set_member(dm_t *m, const char *zone, uint32_t serial, uint32_t refresh, const char *loc) {
-    uint8_t rd[600], w[700];
-    char mn[300], rn[300];
-    snprintf(mn, sizeof(mn), "ns.%s", zone);
-    snprintf(rn, sizeof(rn), "host.%s", zone);
-    size_t n = wname(rd, mn);
-    n += wname(rd + n, rn);
-    put32(rd + n, serial); put32(rd + n + 4, refresh); put32(rd + n + 8, 600); put32(rd + n + 12, 86400);
-    put32(rd + n + 16, 300);
-    n += 20;
-    memset(w, 0, sizeof(w));
-    put16(w, 6); put16(w + 2, 1); put32(w + 4, 300);                 /* the original TYPE, CLASS, TTL */
-    w[8] = (uint8_t)loc[0]; w[9] = loc[0] ? (uint8_t)loc[1] : 0;     /* the location, no time stamp */
-    put16(w + 19, (uint16_t)n);
-    memcpy(w + 21, rd, n);
-    dm_rr(m, zone, 65406, 65302, w, 21 + n);
-}
-
-static void dm_a(dm_t *m, const char *owner, uint8_t last) {
-    uint8_t rd[4] = { 192, 0, 2, last };
-    dm_rr(m, owner, 1, 1, rd, 4);
-}
-
-static void dm_ns(dm_t *m, const char *owner, const char *target) {
-    uint8_t rd[300];
-    dm_rr(m, owner, 2, 1, rd, wname(rd, target));
 }
 
 /* ---------------------------------------------------------------- KDB1 pieces */
@@ -211,15 +121,17 @@ static void batch_end(int fd, uint32_t deleted) {
 
 static uint32_t g_zb_serial = 1;              /* the serial ZONE_BEGIN declares (the SOA serial of the zone) */
 
-static void zone_begin_ex(int fd, const char *zone, uint8_t kind, uint32_t flags, uint64_t declared, uint16_t extra_tag,
+/* ZONE_BEGIN; image_size != 0: tag 23 (the flags carry the image flag by themselves) */
+static void zone_begin_ex(int fd, const char *zone, uint8_t kind, uint32_t flags, uint64_t declared, uint64_t image_size, uint16_t extra_tag,
                           const char *settings, const char *profile) {
-    uint8_t b[1024], view[2] = { 0, 0 }, serial[4], fl[4], rrs[8], digest[32] = { 0 }, src[8] = { 0 };
+    uint8_t b[1024], view[2] = { 0, 0 }, serial[4], fl[4], rrs[8], digest[32] = { 0 }, src[8] = { 0 }, isz[8];
     char canon[300];
     snprintf(canon, sizeof(canon), "%s.", zone);
     put32(serial, g_zb_serial);
     put32(fl, flags);
     put64(rrs, declared);
     put64(src, 100 + g_nzones);
+    put64(isz, image_size);
     size_t n = 0;
     n += tlv(b + n, 1, view, 2);
     n += tlv(b + n, 2, canon, (uint16_t)strlen(canon));
@@ -231,15 +143,14 @@ static void zone_begin_ex(int fd, const char *zone, uint8_t kind, uint32_t flags
     n += tlv(b + n, 8, digest, 32);
     if (settings) n += tlv(b + n, 9, settings, (uint16_t)strlen(settings));
     if (profile) n += tlv(b + n, 10, profile, (uint16_t)strlen(profile));
+    if (image_size) n += tlv(b + n, 23, isz, 8);
     if (extra_tag) n += tlv(b + n, extra_tag, "x", 1);
     send_msg(fd, "KDB1", 4, b, n);
 }
 
 static void zone_begin(int fd, const char *zone, uint8_t kind, uint32_t flags, uint64_t declared, uint16_t extra_tag) {
-    zone_begin_ex(fd, zone, kind, flags, declared, extra_tag, NULL, NULL);
+    zone_begin_ex(fd, zone, kind, flags, declared, 0, extra_tag, NULL, NULL);
 }
-
-static void zone_data(int fd, const dm_t *m) { send_msg(fd, "KDB1", 5, m->b, m->n); }
 
 static void zone_end(int fd, uint64_t count) {
     uint8_t b[16];
@@ -250,152 +161,150 @@ static void zone_end(int fd, uint64_t count) {
     g_nzones++;
 }
 
-/* a correct zone: SOA, NS, 2 A, SOA */
-static void good_zone(int fd, const char *zone, uint32_t serial) {
-    dm_t m;
-    char ns[300], h1[300], h2[300];
-    snprintf(ns, sizeof(ns), "ns.%s", zone);
-    snprintf(h1, sizeof(h1), "www.%s", zone);
-    snprintf(h2, sizeof(h2), "mail.%s", zone);
-    dm_init(&m);
+/* the octets of an image as ZONE_IMAGE messages: the header, then the rest in one message (or `msgs` pieces) */
+static void image_msgs(int fd, const uint8_t *img, size_t len) {
+    size_t h = len < sizeof(zone_image_t) ? len : sizeof(zone_image_t);
+    send_msg(fd, "KDB1", 20, img, h);
+    if (len > h) send_msg(fd, "KDB1", 20, img + h, len - h);
+}
+
+/* a zone that is an image: ZONE_BEGIN (flags | image), the image, ZONE_END.  declared == 0: the image's own count */
+static void image_zone_ex(int fd, const char *zone, uint32_t serial, uint32_t flags, const zone_image_t *img, uint64_t declared, const char *settings, const char *profile) {
     g_zb_serial = serial;
-    dm_soa(&m, zone, serial);
-    dm_ns(&m, zone, ns);
-    dm_a(&m, ns, 1);
-    dm_a(&m, h1, 10);
-    dm_a(&m, h2, 25);
-    dm_soa(&m, zone, serial);
-    zone_begin(fd, zone, 0, 0, 6, 0);
-    zone_data(fd, &m);
-    zone_end(fd, 6);
+    if (!declared) declared = img->n_rrs;
+    zone_begin_ex(fd, zone, 0, flags | KDB_ZF_IMAGE, declared, img->total_size, 0, settings, profile);
+    image_msgs(fd, (const uint8_t *)img, img->total_size);
+    zone_end(fd, declared);
+}
+
+static zone_image_t *good_image(const char *zone, uint32_t serial) {
+    char apex[300], text[1200];
+    snprintf(apex, sizeof(apex), "%s.", zone);
+    snprintf(text, sizeof(text), "$ORIGIN %s\n$TTL 300\n@ SOA ns host %u 3600 600 86400 300\n@ NS ns\nns A 192.0.2.1\nwww A 192.0.2.10\nmail A 192.0.2.25\n", apex, (unsigned)serial);
+    zone_image_t *img = zi_from_text(apex, text);
+    if (!img) { fprintf(stderr, "fake_dbloader: cannot make the image of %s\n", zone); exit(3); }
+    return img;
+}
+
+/* a correct zone: SOA, NS, 3 A */
+static void good_zone(int fd, const char *zone, uint32_t serial) {
+    zone_image_t *img = good_image(zone, serial);
+    image_zone_ex(fd, zone, serial, 0, img, 0, NULL, NULL);
+    zone_image_free(img);
+}
+
+static zone_image_t *text_image(const char *zone, const char *body, bool keep_out_of_zone) {
+    char apex[300], text[2400];
+    snprintf(apex, sizeof(apex), "%s.", zone);
+    snprintf(text, sizeof(text), "$ORIGIN %s\n$TTL 300\n%s", apex, body);
+    zone_image_t *img = zi_from_text_ex(apex, text, keep_out_of_zone);
+    if (!img) { fprintf(stderr, "fake_dbloader: cannot make the image of %s\n", zone); exit(3); }
+    return img;
 }
 
 /* the bad zone of a mode: bad.test */
 static void bad_zone(int fd, const char *mode) {
-    dm_t m;
     const char *z = "bad.test";
-    dm_init(&m);
-    g_zb_serial = 5;
+    static const char soa5[] = "@ SOA ns host 5 3600 600 86400 300\n";
+    char t[1200];
+    zone_image_t *img = NULL;
     if (strcmp(mode, "owner-outside") == 0) {
-        dm_soa(&m, z, 5); dm_a(&m, "host.other.test", 1); dm_soa(&m, z, 5);
-        zone_begin(fd, z, 0, 0, 3, 0); zone_data(fd, &m); zone_end(fd, 3);
-    } else if (strcmp(mode, "anc-short") == 0) {
-        dm_soa(&m, z, 5); dm_a(&m, "www.bad.test", 1); dm_soa(&m, z, 5);
-        put16(m.b + 6, 5);
-        zone_begin(fd, z, 0, 0, 5, 0); zone_data(fd, &m); zone_end(fd, 5);
-    } else if (strcmp(mode, "garbage-rr") == 0) {
-        m.b[7] = 3;
-        for (size_t i = 12; i < 90; i++) m.b[i] = (uint8_t)(i * 37 + 11);
-        m.n = 90;
-        zone_begin(fd, z, 0, 0, 3, 0); zone_data(fd, &m); zone_end(fd, 3);
-    } else if (strcmp(mode, "no-final-soa") == 0) {
-        dm_soa(&m, z, 5); dm_a(&m, "www.bad.test", 1);
-        zone_begin(fd, z, 0, 0, 2, 0); zone_data(fd, &m); zone_end(fd, 2);
-    } else if (strcmp(mode, "two-soa") == 0) {
-        dm_soa(&m, z, 5); dm_soa(&m, z, 6); dm_soa(&m, z, 5);
-        zone_begin(fd, z, 0, 0, 3, 0); zone_data(fd, &m); zone_end(fd, 3);
+        snprintf(t, sizeof(t), "%s@ NS ns\nns A 192.0.2.1\nhost.other.test. A 192.0.2.99\n", soa5);
+        img = text_image(z, t, true);
+        image_zone_ex(fd, z, 5, 0, img, 0, NULL, NULL);
     } else if (strcmp(mode, "soa-subdomain") == 0) {
-        dm_soa(&m, "sub.bad.test", 5); dm_a(&m, "www.bad.test", 1); dm_soa(&m, "sub.bad.test", 5);
-        zone_begin(fd, z, 0, 0, 3, 0); zone_data(fd, &m); zone_end(fd, 3);
-    } else if (strcmp(mode, "trailing-rr") == 0) {
-        dm_soa(&m, z, 5); dm_soa(&m, z, 5); dm_a(&m, "www.bad.test", 1);
-        zone_begin(fd, z, 0, 0, 3, 0); zone_data(fd, &m); zone_end(fd, 3);
-    } else if (strcmp(mode, "later-message") == 0) {
-        dm_t m2;
-        dm_soa(&m, z, 5); dm_soa(&m, z, 5);
-        dm_init(&m2); dm_a(&m2, "www.bad.test", 1);
-        zone_begin(fd, z, 0, 0, 3, 0); zone_data(fd, &m); zone_data(fd, &m2); zone_end(fd, 3);
+        img = text_image(z, "sub SOA ns host 5 3600 600 86400 300\n@ NS ns\nns A 192.0.2.1\n", true);
+        image_zone_ex(fd, z, 5, 0, img, 0, NULL, NULL);
+    } else if (strcmp(mode, "two-soa") == 0) {
+        snprintf(t, sizeof(t), "%s@ SOA ns2 host 5 3600 600 86400 300\n@ NS ns\nns A 192.0.2.1\n", soa5);
+        img = text_image(z, t, true);
+        image_zone_ex(fd, z, 5, 0, img, 0, NULL, NULL);
+    } else if (strcmp(mode, "other-zone") == 0) {
+        img = good_image("other.test", 5);
+        image_zone_ex(fd, z, 5, 0, img, 0, NULL, NULL);
+    } else if (strcmp(mode, "non-in-class") == 0) {
+        snprintf(t, sizeof(t), "%s@ NS ns\nns A 192.0.2.1\nwww A 192.0.2.80\n", soa5);
+        img = text_image(z, t, false);
+        zone_image_rr_t *rr = (zone_image_rr_t *)(void *)((uint8_t *)img + img->off_rrs);
+        for (uint32_t k = 0; k < img->n_rrs; k++)
+            if (rr[k].type == 1) { rr[k].class_val = 3; break; }
+        image_zone_ex(fd, z, 5, 0, img, 0, NULL, NULL);
+    } else if (strcmp(mode, "image-serial") == 0) {
+        img = good_image(z, 5);
+        image_zone_ex(fd, z, 6, 0, img, 0, NULL, NULL);                 /* ZONE_BEGIN says 6, the SOA says 5 */
+    } else if (strcmp(mode, "image-tinydns") == 0) {
+        img = good_image(z, 5);
+        img->flags |= ZONE_IMAGE_F_TINYDNS;
+        image_zone_ex(fd, z, 5, 0, img, 0, NULL, NULL);
+    } else if (strcmp(mode, "image-garbage") == 0) {
+        img = good_image(z, 5);
+        for (size_t i = sizeof(zone_image_t); i < img->total_size; i++) ((uint8_t *)img)[i] = (uint8_t)(i * 37 + 11);
+        image_zone_ex(fd, z, 5, 0, img, 0, NULL, NULL);
     } else if (strcmp(mode, "secondary-kind") == 0) {
         zone_begin(fd, z, 1, 0, 0, 0); zone_end(fd, 0);
     } else if (strcmp(mode, "secondary-data") == 0) {
-        dm_soa(&m, z, 5); dm_soa(&m, z, 5);
-        zone_begin_ex(fd, z, 1, 0, 2, 0, "masters { 192.0.2.1; };", NULL); zone_data(fd, &m); zone_end(fd, 2);
+        zone_begin_ex(fd, z, 1, 0, 2, 0, 0, "masters { 192.0.2.1; };", NULL); zone_end(fd, 2);
     } else if (strcmp(mode, "secondary-flag") == 0) {
-        zone_begin_ex(fd, z, 1, 1, 0, 0, "masters { 192.0.2.1; };", NULL); zone_end(fd, 0);
+        zone_begin_ex(fd, z, 1, 1, 0, 0, 0, "masters { 192.0.2.1; };", NULL); zone_end(fd, 0);
     } else if (strcmp(mode, "secondary-host") == 0) {
-        zone_begin_ex(fd, z, 1, 0, 0, 0, "masters { ns1.example.net; };", NULL); zone_end(fd, 0);
+        zone_begin_ex(fd, z, 1, 0, 0, 0, 0, "masters { ns1.example.net; };", NULL); zone_end(fd, 0);
     } else if (strcmp(mode, "secondary-prim") == 0) {
-        dm_soa(&m, z, 5); dm_a(&m, "www.bad.test", 1); dm_soa(&m, z, 5);
-        zone_begin_ex(fd, z, 0, 0, 3, 0, "masters { 192.0.2.1; };", NULL); zone_data(fd, &m); zone_end(fd, 3);
+        img = good_image(z, 5);
+        image_zone_ex(fd, z, 5, 0, img, 0, "masters { 192.0.2.1; };", NULL);
     } else if (strcmp(mode, "secondary-ok") == 0) {
-        zone_begin_ex(fd, z, 1, 0, 0, 0, "masters { 127.0.0.1 port 1; 2001:db8::1; }; ixfr-history 3;", NULL); zone_end(fd, 0);
+        zone_begin_ex(fd, z, 1, 0, 0, 0, 0, "masters { 127.0.0.1 port 1; 2001:db8::1; }; ixfr-history 3;", NULL); zone_end(fd, 0);
     } else if (strcmp(mode, "catalog-ok") == 0) {
-        zone_begin_ex(fd, z, 2, 0, 0, 0, "masters { 127.0.0.1 port 1; };", NULL); zone_end(fd, 0);
-    } else if (strncmp(mode, "ext-", 4) == 0) {                   /* B8: Extended AXFR records in the stream */
-        uint8_t lan[3] = { 'l', 'a', 'n' }, tr[2] = { 1, 0 }, bad1[1] = { 'x' }, longtag[70];
-        memset(longtag, 'a', sizeof(longtag));
-        uint32_t flags = 2;                                       /* KDB_ZF_EXTENDED */
-        uint64_t declared = 3;
-        dm_soa(&m, z, 5);
-        if (strcmp(mode, "ext-no-flag") == 0) {                   /* state record, flag 0 */
-            dm_rr(&m, z, 65401, 65302, lan, 3); flags = 0;
-        } else if (strcmp(mode, "ext-trusted") == 0) {            /* ECS_TRUSTED is not for the stream */
-            dm_rr(&m, z, 65407, 65302, tr, 2);
-        } else if (strcmp(mode, "ext-bad-def") == 0) {
-            dm_rr(&m, z, 65403, 65302, bad1, 1);
-        } else if (strcmp(mode, "ext-bad-locdef") == 0) {
-            dm_rr(&m, z, 65405, 65302, bad1, 1);
-        } else if (strcmp(mode, "ext-bad-wrap") == 0) {
-            dm_rr(&m, "www.bad.test", 65406, 65302, bad1, 1); declared = 3;
-        } else if (strcmp(mode, "ext-long-tag") == 0) {
-            dm_rr(&m, z, 65401, 65302, longtag, sizeof(longtag));
-        } else if (strcmp(mode, "ext-flag-bit") == 0) {           /* a reserved zone flag: protocol error */
-            flags = 32; declared = 2;
-        } else if (strcmp(mode, "ext-image-flag") == 0) {             /* the zone image flag (bit 4) with no image size (tag 23): protocol error; with it, the loader would not have negotiated images */
-            flags = 16; declared = 2;
-        } else {                                                  /* ext-ok: the state records and the tinydns flag are accepted */
-            dm_rr(&m, z, 65401, 65302, lan, 3); dm_a(&m, "www.bad.test", 1);
-            dm_rr(&m, z, 65401, 65302, (const uint8_t *)"", 0);
-            flags = 6; declared = 5;
-        }
-        dm_soa(&m, z, 5);
-        zone_begin(fd, z, 0, flags, declared, 0); zone_data(fd, &m); zone_end(fd, declared);
-    } else if (strncmp(mode, "soaset-", 7) == 0) {                 /* B8t-2: the version 3 SOA set */
-        const char *m2 = mode + 7;
-        uint8_t locdef[7] = { 'i', 'n', 32, 127, 0, 0, 1 };
-        uint8_t set_n[3] = { 1, 0, (uint8_t)(strcmp(m2, "count") == 0 ? 3 : 2) };
-        uint64_t declared = 8;                                    /* frame, SOA_SET, locdef, 2 wrapped SOAs, NS, A, closing SOA */
-        uint32_t fr = strcmp(m2, "frame") == 0 ? 1234 : 3600;     /* "frame": the opening SOA is not the reference SOA */
-        dm_soa_ex(&m, z, 5, fr);
-        if (strcmp(m2, "late") == 0) {                             /* SOA_SET after a data record */
-            dm_a(&m, "www.bad.test", 1);
-            declared++;
-        }
-        dm_rr(&m, z, 65409, 65302, set_n, 3);
-        dm_rr(&m, z, 65405, 65302, locdef, 7);
-        dm_soa_set_member(&m, z, 5, 3600, "in");
-        dm_soa_set_member(&m, z, strcmp(m2, "serial") == 0 ? 6 : 5, 3600, strcmp(m2, "dup") == 0 ? "in" : "");
-        dm_ns(&m, z, "ns.bad.test");
-        dm_a(&m, "www.bad.test", 1);
-        dm_soa_ex(&m, z, 5, fr);
-        zone_begin(fd, z, 0, 6, declared, 0); zone_data(fd, &m); zone_end(fd, declared);
-    } else if (strcmp(mode, "non-in-class") == 0) {
-        uint8_t rd[4] = { 192, 0, 2, 1 };
-        dm_soa(&m, z, 5); dm_rr(&m, "www.bad.test", 1, 3, rd, 4); dm_soa(&m, z, 5);
-        zone_begin(fd, z, 0, 0, 3, 0); zone_data(fd, &m); zone_end(fd, 3);
+        zone_begin_ex(fd, z, 2, 0, 0, 0, 0, "masters { 127.0.0.1 port 1; };", NULL); zone_end(fd, 0);
+    } else if (strcmp(mode, "ext-flag-bit") == 0) {              /* a reserved zone flag: protocol error */
+        zone_begin(fd, z, 0, 32, 2, 0);
+    } else if (strcmp(mode, "ext-image-flag") == 0) {            /* the zone image flag (bit 4) with no image size (tag 23): protocol error */
+        zone_begin(fd, z, 0, 16, 2, 0);
+    } else if (strcmp(mode, "ext-ok") == 0) {                    /* the extended flag on a zone that has no extension: accepted */
+        img = good_image(z, 5);
+        image_zone_ex(fd, z, 5, KDB_ZF_EXTENDED, img, 0, NULL, NULL);
     } else if (strcmp(mode, "huge-frame") == 0) {
-        static uint8_t big[70000];
-        memset(big, 0, sizeof(big));
-        big[2] = 0x84; put16(big + 6, 1);
-        zone_begin(fd, z, 0, 0, 2, 0);
-        send_msg(fd, "KDB1", 5, big, sizeof(big));
+        static uint8_t big[(1u << 20) + 8];
+        img = good_image(z, 5);
+        memcpy(big, img, img->total_size);
+        g_zb_serial = 5;
+        zone_begin_ex(fd, z, 0, KDB_ZF_IMAGE, img->n_rrs, img->total_size, 0, NULL, NULL);
+        send_msg(fd, "KDB1", 20, big, sizeof(big));
     } else if (strcmp(mode, "end-count") == 0) {
-        dm_soa(&m, z, 5); dm_soa(&m, z, 5);
-        zone_begin(fd, z, 0, 0, 2, 0); zone_data(fd, &m); zone_end(fd, 7);
+        img = good_image(z, 5);
+        g_zb_serial = 5;
+        zone_begin_ex(fd, z, 0, KDB_ZF_IMAGE, img->n_rrs, img->total_size, 0, NULL, NULL);
+        image_msgs(fd, (const uint8_t *)img, img->total_size);
+        zone_end(fd, 7);
     } else if (strcmp(mode, "begin-count") == 0) {
-        dm_soa(&m, z, 5); dm_a(&m, "www.bad.test", 1); dm_soa(&m, z, 5);
-        zone_begin(fd, z, 0, 0, 9, 0); zone_data(fd, &m); zone_end(fd, 9);
-    } else if (strcmp(mode, "zero-ancount") == 0) {
-        zone_begin(fd, z, 0, 0, 2, 0); zone_data(fd, &m);
-    } else if (strcmp(mode, "opt-twice") == 0) {
-        dm_t m2;
-        dm_soa(&m, z, 5);
-        dm_init(&m2); dm_a(&m2, "www.bad.test", 1);
-        put16(m2.b + 10, 1);
-        zone_begin(fd, z, 0, 0, 3, 0); zone_data(fd, &m); zone_data(fd, &m2);
+        img = good_image(z, 5);
+        image_zone_ex(fd, z, 5, 0, img, 9, NULL, NULL);          /* ZONE_BEGIN says 9 RRs, the header says 5 */
     } else if (strcmp(mode, "unknown-tag") == 0) {
-        dm_soa(&m, z, 5); dm_soa(&m, z, 5);
         zone_begin(fd, z, 0, 0, 2, 99);
+    } else if (strcmp(mode, "zone-data") == 0) {
+        uint8_t b[32] = { 0x12, 0x34, 0x84, 0 };
+        send_msg(fd, "KDB1", 5, b, sizeof(b));
+    } else if (strcmp(mode, "no-image-flag") == 0) {
+        zone_begin(fd, z, 0, 0, 4, 0);
+    } else if (strcmp(mode, "image-magic") == 0) {
+        img = good_image(z, 5);
+        img->magic ^= 1;
+        image_zone_ex(fd, z, 5, 0, img, 0, NULL, NULL);
+    } else if (strcmp(mode, "image-size-hdr") == 0) {
+        img = good_image(z, 5);
+        zone_begin_ex(fd, z, 0, KDB_ZF_IMAGE, img->n_rrs, img->total_size + 8, 0, NULL, NULL);
+        image_msgs(fd, (const uint8_t *)img, img->total_size);
+    } else if (strcmp(mode, "image-short") == 0) {
+        img = good_image(z, 5);
+        g_zb_serial = 5;
+        zone_begin_ex(fd, z, 0, KDB_ZF_IMAGE, img->n_rrs, img->total_size, 0, NULL, NULL);
+        image_msgs(fd, (const uint8_t *)img, img->total_size - 8);
+        zone_end(fd, img->n_rrs);
+    } else if (strcmp(mode, "image-extra") == 0) {
+        img = good_image(z, 5);
+        g_zb_serial = 5;
+        zone_begin_ex(fd, z, 0, KDB_ZF_IMAGE, img->n_rrs, img->total_size, 0, NULL, NULL);
+        image_msgs(fd, (const uint8_t *)img, img->total_size);
+        send_msg(fd, "KDB1", 20, (const uint8_t *)img, 8);
     } else if (strcmp(mode, "settings-key") == 0 || strcmp(mode, "settings-include") == 0 || strcmp(mode, "settings-file") == 0 ||
                strcmp(mode, "settings-slave") == 0 || strcmp(mode, "settings-brace") == 0 || strcmp(mode, "profile-missing") == 0 ||
                strcmp(mode, "settings-ok") == 0) {
@@ -407,7 +316,6 @@ static void bad_zone(int fd, const char *mode) {
         else if (strcmp(mode, "settings-brace") == 0) st = "allow-transfer { 127.0.0.1; }; };";
         else if (strcmp(mode, "profile-missing") == 0) pr = "p1";
         else st = "allow-transfer { 127.0.0.1; }; ixfr-history 3;";
-        dm_soa(&m, z, 5); dm_a(&m, "www.bad.test", 1); dm_soa(&m, z, 5);
         if (strcmp(mode, "settings-ok") == 0) {                   /* a profile first, then a zone that uses it and has own text */
             uint8_t pb[256];
             size_t pn = 0;
@@ -416,7 +324,8 @@ static void bad_zone(int fd, const char *mode) {
             send_msg(fd, "KDB1", 10, pb, pn);
             pr = "p1";
         }
-        zone_begin_ex(fd, z, 0, 0, 3, 0, st, pr); zone_data(fd, &m); zone_end(fd, 3);
+        img = good_image(z, 5);
+        image_zone_ex(fd, z, 5, 0, img, 0, st, pr);
     } else if (strcmp(mode, "profile-flood") == 0) {
         static uint8_t pb[64100];
         static char text[64001];
@@ -439,6 +348,7 @@ static void bad_zone(int fd, const char *mode) {
         send_msg(fd, "KDB1", 9, b, n);
         g_ndel++;
     }
+    zone_image_free(img);
 }
 
 int main(int argc, char **argv) {
@@ -447,12 +357,18 @@ int main(int argc, char **argv) {
     const char *mode = argc > 3 ? argv[3] : "bad-magic";
     uint8_t b[512];
     size_t n = 0;
-    uint8_t v16[2] = { 0, 1 }, pid[4];
+    uint8_t v16[2] = { 0, 1 }, pid[4], feat[4], iver[4];
     put32(pid, (uint32_t)getpid());
+    put32(feat, KDB_FEAT_IMAGE);
+    put32(iver, ZONE_IMAGE_VERSION + (strcmp(mode, "hello-version") == 0 ? 1u : 0u));
     n += tlv(b + n, 1, v16, 2);
     n += tlv(b + n, 2, "fake", 4);
     n += tlv(b + n, 3, "sqlite3", 7);
     n += tlv(b + n, 4, pid, 4);
+    if (strcmp(mode, "hello-no-image") != 0) {
+        n += tlv(b + n, 5, feat, 4);
+        n += tlv(b + n, 6, iver, 4);
+    }
     send_msg(fd, "KDB1", 1, b, n);
 
     uint8_t rbuf[4096];                      /* the CONFIG */
@@ -483,6 +399,8 @@ int main(int argc, char **argv) {
         n += tlv(b + n, 7, rrs, 8);
         n += tlv(b + n, 8, digest, 32);
         send_msg(fd, "KDB1", 4, b, n);       /* ZONE_BEGIN with view 0x1234 */
+    } else if (strcmp(mode, "hello-no-image") == 0 || strcmp(mode, "hello-version") == 0) {
+        /* the HELLO was the mistake */
     } else if (strcmp(mode, "silent") != 0) {
         /* zone-level modes: one batch, ok1.test, the bad zone, ok2.test */
         batch_begin(fd);

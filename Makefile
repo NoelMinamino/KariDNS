@@ -84,6 +84,10 @@ FUZZ_XFR_PACKET_SRCS = tests/fuzz/fuzz_xfr_packet.c dns_axfr_ixfr.c dns_wire.c d
 FUZZ_DB_STREAM_TARGET = tests/fuzz/fuzz_db_stream
 FUZZ_DB_STREAM_SRCS = tests/fuzz/fuzz_db_stream.c dns_db_stream.c dns_db_install.c $(PDNS_XFR_DEPS)
 
+# 0.7 M3: the zone image frames: framer, state machine, reassembly, zone_image_validate_ex(), the limits of a zone, on a stream or on the image the harness wraps in one
+FUZZ_DB_IMAGE_FRAMES_TARGET = tests/fuzz/fuzz_db_image_frames
+FUZZ_DB_IMAGE_FRAMES_SRCS = tests/fuzz/fuzz_db_image_frames.c dns_db_stream.c dns_zone_image.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_wire.c dns_cidr.c dns_tsig_acl.c dns_config_parser.c dns_diag.c
+
 PDNS_XFR_DEPS = dns_axfr_ixfr.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_zone_image.c
 
 FUZZ_PDNS_CONTENT_TARGET = tests/fuzz/fuzz_pdns_content
@@ -172,7 +176,7 @@ FUZZ_DAG_TCP_REASSEMBLY_TARGET = tests/fuzz/fuzz_dag_tcp_reassembly
 FUZZ_DAG_TCP_REASSEMBLY_SRCS = tests/fuzz/fuzz_dag_tcp_reassembly.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_http.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
 .PHONY: distclean
-.PHONY: set-version tapstat_test karicheck-codelog test_coverage_sweep_tools-codelog all clean run fuzz zone2kdb karidns-dbloader karidns-dbloader-tsan karidns-dbloader-asan karidns-zone karidns-zone-asan dbloader-check-drivers db_sqlite3_test db_pgsql_test fuzz_core fuzz_query_engine fuzz_zone_image fuzz_zone_image_validate fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_pdns_content fuzz_pdns_metadata fuzz_db_checkline fuzz_json_escape fuzz_zone_text fuzz_zone_changes fuzz_db_logline fuzz_plugin_msg fuzz_nsec3_rebuild fuzz_alias_response clean-fuzz asan tsan fuzz_tsig fuzz_dag fuzz_tsig_verify dag tools response_cache_test \
+.PHONY: set-version tapstat_test karicheck-codelog test_coverage_sweep_tools-codelog all clean run fuzz zone2kdb karidns-dbloader karidns-dbloader-tsan karidns-dbloader-asan karidns-zone karidns-zone-asan dbloader-check-drivers db_sqlite3_test db_pgsql_test fuzz_core fuzz_query_engine fuzz_zone_image fuzz_zone_image_validate fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_db_image_frames fuzz_pdns_content fuzz_pdns_metadata fuzz_db_checkline fuzz_json_escape fuzz_zone_text fuzz_zone_changes fuzz_db_logline fuzz_plugin_msg fuzz_nsec3_rebuild fuzz_alias_response clean-fuzz asan tsan fuzz_tsig fuzz_dag fuzz_tsig_verify dag tools response_cache_test \
 	fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file \
 	fuzz_dag_replay_pcap_reader fuzz_dag_replay_diff fuzz_dag_tcp_reassembly \
 	fuzz_dag_all fuzz_dag_test fuzz_karidns fuzz_karidns_test fuzz_all fuzz_test \
@@ -463,6 +467,13 @@ FETCH_BACKEND_SRCS = tests/db/fetch_backend.c dns_db_stream.c dns_wire.c dns_uti
 fetch_backend: $(FETCH_BACKEND_SRCS)
 	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(FETCH_BACKEND_SRCS) -o fetch_backend $(LDFLAGS) -lcrypto -lpthread -lm
 
+# a loader that sends bad zone images and bad streams (tests/run_db_hostile_loader_test.sh, tests/run_db_loader_lifecycle_test.sh); 0.7 M3: the images are made with the zone parser and
+# zone_image_freeze() (tests/db/zimg_msgs.h), the framing is written by hand
+FAKE_DBLOADER_SRCS = tests/db/fake_dbloader.c dns_db_stream.c dns_wire.c dns_utils.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_zone_image.c
+
+fake_dbloader: $(FAKE_DBLOADER_SRCS)
+	$(CC) $(CFLAGS) -I. $(FAKE_DBLOADER_SRCS) -o fake_dbloader $(LDFLAGS) -lcrypto -lpthread -lm
+
 test_park-tsan: $(TEST_PARK_SRCS)
 	$(CC) $(TSAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_PARK_SRCS) -o $@ $(TSAN_LDFLAGS) -lpthread
 
@@ -521,11 +532,6 @@ test_pdns_reader: $(TEST_PDNS_READER_SRCS)
 
 pdns_reader_test: test_pdns_reader
 	./test_pdns_reader
-
-# 0.7 M3: what one zone costs in the loader and in the Backend with the ZONE_DATA stream and with a zone image (tests/db/bench_image.c; prints numbers, not a test)
-BENCH_IMAGE_SRCS = tests/db/bench_image.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c $(PDNS_XFR_DEPS) $(TEST_SYSLOG_QUIET)
-bench_image: $(BENCH_IMAGE_SRCS)
-	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(BENCH_IMAGE_SRCS) -o bench_image $(LDFLAGS) -lcrypto -lpthread -lm
 
 test_presigned: $(TEST_PRESIGNED_SRCS)
 	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_PRESIGNED_SRCS) -o test_presigned $(LDFLAGS) -lcrypto -lpthread -lm
@@ -1291,7 +1297,7 @@ COV_FUZZ_LDFLAGS = -fsanitize=fuzzer,address,undefined -fprofile-instr-generate 
 COV_FUZZ_BINS  = $(COV_FUZZ_DIR)/fuzz_dns_wire $(COV_FUZZ_DIR)/fuzz_dns_server_core
 COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_query_engine $(COV_FUZZ_DIR)/fuzz_xfr_packet $(COV_FUZZ_DIR)/fuzz_dynamic_update
 COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_zone_image_validate
-COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_db_stream
+COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_db_stream $(COV_FUZZ_DIR)/fuzz_db_image_frames
 COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_pdns_content $(COV_FUZZ_DIR)/fuzz_pdns_metadata $(COV_FUZZ_DIR)/fuzz_nsec3_rebuild
 COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_alias_response $(COV_FUZZ_DIR)/fuzz_db_checkline $(COV_FUZZ_DIR)/fuzz_db_logline $(COV_FUZZ_DIR)/fuzz_plugin_msg
 COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_json_escape $(COV_FUZZ_DIR)/fuzz_zone_changes $(COV_FUZZ_DIR)/fuzz_zone_text $(COV_FUZZ_DIR)/fuzz_zone_parser $(COV_FUZZ_DIR)/fuzz_conf_parser $(COV_FUZZ_DIR)/fuzz_zone_image
@@ -1306,7 +1312,7 @@ COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_dag_iter_classify
 COV_FUZZ_OBJS  = -object=$(COV_FUZZ_DIR)/fuzz_dns_wire -object=$(COV_FUZZ_DIR)/fuzz_dns_server_core
 COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_query_engine -object=$(COV_FUZZ_DIR)/fuzz_xfr_packet -object=$(COV_FUZZ_DIR)/fuzz_dynamic_update
 COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_zone_image_validate
-COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_db_stream
+COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_db_stream -object=$(COV_FUZZ_DIR)/fuzz_db_image_frames
 COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_pdns_content -object=$(COV_FUZZ_DIR)/fuzz_pdns_metadata -object=$(COV_FUZZ_DIR)/fuzz_nsec3_rebuild
 COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_alias_response -object=$(COV_FUZZ_DIR)/fuzz_db_checkline -object=$(COV_FUZZ_DIR)/fuzz_db_logline -object=$(COV_FUZZ_DIR)/fuzz_plugin_msg
 COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_json_escape -object=$(COV_FUZZ_DIR)/fuzz_zone_changes -object=$(COV_FUZZ_DIR)/fuzz_zone_text -object=$(COV_FUZZ_DIR)/fuzz_zone_parser -object=$(COV_FUZZ_DIR)/fuzz_conf_parser -object=$(COV_FUZZ_DIR)/fuzz_zone_image
@@ -1341,6 +1347,10 @@ $(COV_FUZZ_DIR)/fuzz_xfr_packet: $(FUZZ_XFR_PACKET_SRCS)
 $(COV_FUZZ_DIR)/fuzz_db_stream: $(FUZZ_DB_STREAM_SRCS)
 	@mkdir -p $(COV_FUZZ_DIR)
 	$(CC) $(COV_FUZZ_CFLAGS) -o $@ $(FUZZ_DB_STREAM_SRCS) $(COV_FUZZ_LDFLAGS) -lcrypto
+
+$(COV_FUZZ_DIR)/fuzz_db_image_frames: $(FUZZ_DB_IMAGE_FRAMES_SRCS)
+	@mkdir -p $(COV_FUZZ_DIR)
+	$(CC) $(COV_FUZZ_CFLAGS) -o $@ $(FUZZ_DB_IMAGE_FRAMES_SRCS) $(COV_FUZZ_LDFLAGS) -lcrypto -lpthread -lm
 
 $(COV_FUZZ_DIR)/fuzz_pdns_content: $(FUZZ_PDNS_CONTENT_SRCS)
 	@mkdir -p $(COV_FUZZ_DIR)
@@ -1749,7 +1759,7 @@ clean: clean-fuzz coverage-clean
 	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck $(TAPSTAT_TARGET) $(TAPSTAT_OBJS) karidns-tapstat-asan bench_serialize bench_rrl $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
 	@# karicheck's objects outside $(OBJS): an uninstrumented copy left here would be linked into the coverage build
 	rm -f dns_zone_lint.o dns_db_checkproto.o karicheck-codelog test_coverage_sweep_tools-codelog
-	rm -f bench_image karidns-zone karidns-zone-asan karidns-asan karidns-tsan karidns-evict *.ev.o test_epoch_rcu-tsan test_zone_dir-tsan test_zone_dir test_park-tsan test_db_fetch-tsan test_server_core-tsan test_park_worker-tsan test_db_registry-tsan test_db_stream-tsan test_pdns_reader-tsan test_park test_db_fetch test_park_worker *.asan.o *.tsan.o test_asan_overflow test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_server_stmt test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_tapstat test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_stream test_pdns_reader test_presigned test_zone_text test_zone_import test_db_supervisor test_plugin_msg test_db_sqlite3 test_db_registry test_db_pgsql karidns-dbloader karidns-dbloader-tsan karidns-dbloader-asan tests/db/zone2sql tests/db/zone2kdb test_store test_store-asan test_store-tsan test_db_store test_db_store-asan test_db_store-tsan
+	rm -f karidns-zone karidns-zone-asan karidns-asan karidns-tsan karidns-evict *.ev.o test_epoch_rcu-tsan test_zone_dir-tsan test_zone_dir test_park-tsan test_db_fetch-tsan test_server_core-tsan test_park_worker-tsan test_db_registry-tsan test_db_stream-tsan test_pdns_reader-tsan test_park test_db_fetch test_park_worker *.asan.o *.tsan.o test_asan_overflow test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_server_stmt test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_tapstat test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_stream test_pdns_reader test_presigned test_zone_text test_zone_import test_db_supervisor test_plugin_msg test_db_sqlite3 test_db_registry test_db_pgsql karidns-dbloader karidns-dbloader-tsan karidns-dbloader-asan tests/db/zone2sql tests/db/zone2kdb fake_dbloader test_store test_store-asan test_store-tsan test_db_store test_db_store-asan test_db_store-tsan
 	rm -f $(UT_ASAN_BINS)
 	rm -f *.uta.o *.utn.o tests/*.uta.o tests/*.utn.o tools/*.uta.o tools/*.utn.o
 	rm -f tests/fi/kari_fi_preload.so
@@ -1814,6 +1824,9 @@ fuzz_xfr_packet: $(FUZZ_XFR_PACKET_SRCS:.c=.fz.o)
 fuzz_db_stream: $(FUZZ_DB_STREAM_SRCS:.c=.fz.o)
 	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DB_STREAM_TARGET) $(FUZZ_DB_STREAM_SRCS:.c=.fz.o) $(LDFLAGS) -lcrypto
 
+fuzz_db_image_frames: $(FUZZ_DB_IMAGE_FRAMES_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DB_IMAGE_FRAMES_TARGET) $(FUZZ_DB_IMAGE_FRAMES_SRCS:.c=.fz.o) $(LDFLAGS) -lcrypto -lpthread -lm
+
 fuzz_pdns_content: $(FUZZ_PDNS_CONTENT_SRCS:.c=.fz.o)
 	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_PDNS_CONTENT_TARGET) $(FUZZ_PDNS_CONTENT_SRCS:.c=.fz.o) $(LDFLAGS) -lcrypto -lpthread -lm
 
@@ -1876,7 +1889,7 @@ fuzz_dag_all: fuzz_tapstat fuzz_dag fuzz_dag_hash fuzz_dag_iter_classify fuzz_da
 fuzz_dag_test: fuzz_dag_all
 	@sh tests/run_fuzz_smoke_test.sh dag
 
-fuzz_karidns: fuzz fuzz_core fuzz_zone fuzz_zone_image fuzz_zone_image_validate fuzz_conf fuzz_tsig fuzz_tsig_verify fuzz_query_engine fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_pdns_content fuzz_pdns_metadata fuzz_db_checkline fuzz_json_escape fuzz_zone_text fuzz_zone_changes fuzz_db_logline fuzz_plugin_msg fuzz_nsec3_rebuild fuzz_alias_response
+fuzz_karidns: fuzz fuzz_core fuzz_zone fuzz_zone_image fuzz_zone_image_validate fuzz_conf fuzz_tsig fuzz_tsig_verify fuzz_query_engine fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_db_image_frames fuzz_pdns_content fuzz_pdns_metadata fuzz_db_checkline fuzz_json_escape fuzz_zone_text fuzz_zone_changes fuzz_db_logline fuzz_plugin_msg fuzz_nsec3_rebuild fuzz_alias_response
 
 fuzz_karidns_test: fuzz_karidns
 	@sh tests/run_fuzz_smoke_test.sh karidns

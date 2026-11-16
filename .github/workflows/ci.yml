@@ -81,7 +81,7 @@ jobs:
             NCPU=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
             # configure finds the compiler and the libraries and writes config.mk, which every make below reads (docs/building.md); both database drivers are built
             ./configure --with-db-drivers="sqlite3 postgresql"
-            make -j"$NCPU" all karicheck-codelog test_coverage_sweep_tools-codelog karidns-dbloader karidns-zone karidns-zone-asan zone2sql zone2kdb asan tsan tools-asan fuzz_all asan_test tinydns_test hash_test include_test response_cache_test vulnerability_test bench_serialize fetch_backend karidns-evict
+            make -j"$NCPU" all karicheck-codelog test_coverage_sweep_tools-codelog karidns-dbloader karidns-zone karidns-zone-asan zone2sql zone2kdb asan tsan tools-asan fuzz_all asan_test tinydns_test hash_test include_test response_cache_test vulnerability_test bench_serialize fetch_backend fake_dbloader karidns-evict
             echo "::endgroup::"
 
             echo "::group::🔧 [Configure] ./configure and config.mk: the same compile lines with and without it (BSD make and GNU make)"
@@ -189,7 +189,7 @@ jobs:
             # fuzz_dag_all is made by run_dag_fuzzer_test.sh, here in parallel with the rest; test_response_cache: run_response_cache_test.sh runs the binary
             # (its own fallback compile line lacks sources the engine needs now and does not link)
             ./configure --with-db-drivers="sqlite3 postgresql"
-            make -j"$NCPU" all karicheck-codelog test_coverage_sweep_tools-codelog karidns-dbloader karidns-zone zone2sql zone2kdb fetch_backend karidns-evict asan tools-asan fuzz_dag_all test_response_cache
+            make -j"$NCPU" all karicheck-codelog test_coverage_sweep_tools-codelog karidns-dbloader karidns-zone zone2sql zone2kdb fetch_backend fake_dbloader karidns-evict asan tools-asan fuzz_dag_all test_response_cache
             echo "::endgroup::"
 
             echo "::group::🛡️ [Functional & Protocol Tests] 4 at a time"
@@ -623,10 +623,10 @@ jobs:
             # fetch_backend, ...) had -march=native and died with SIGILL there (status 132)
             ./configure --march=none
             make coverage-clean coverage-build < /dev/null
-            # the helpers tests/run_all_suite.sh builds when they are missing (zone2sql, zone2kdb: the DB tests, fetch_backend: run_db_fetch_test.sh);
+            # the helpers tests/run_all_suite.sh builds when they are missing (zone2sql, zone2kdb: the DB tests, fetch_backend: run_db_fetch_test.sh; fake_dbloader: the hostile and lifecycle loader tests);
             # built here once, so that the 4 VMs of coverage-shard do not.  karidns-evict is not needed: the instrumented karidns has the test command
             # (-DKARIDNS_TEST_EVICT).  The loader and karidns-zone have the drivers the suite wants (the same libpq check), so it builds neither
-            make zone2sql zone2kdb fetch_backend < /dev/null
+            make zone2sql zone2kdb fetch_backend fake_dbloader < /dev/null
             echo "make coverage-build took $(( $(date +%s) - START ))s"
             echo "::endgroup::"
 

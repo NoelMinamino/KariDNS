@@ -1,14 +1,15 @@
 #!/bin/sh
 # run_db_hostile_loader_test.sh - a loader that sends bad zone data (beta design 1.4, 1.5, 8.4; milestone B4b).
 #
-# tests/db/fake_dbloader.c stands in for karidns-dbloader on the stream and sends one batch: ok1.test, a bad zone
-# (bad.test), ok2.test.  Two kinds of mistakes:
-#   - a zone that fails the install checks (an owner outside the zone, a count that does not match the RRs, garbage
-#     inside a valid frame, no closing SOA, a second SOA, records after the closing SOA, a secondary or extended zone,
-#     a class other than IN): only that zone is rejected (ZONE_RESULT "rejected"), the stream stays open, the zones
-#     around it are installed and answer, the bad zone does not exist (REFUSED), `karictl dbstatus` names the reason;
-#   - a stream that breaks the protocol (an oversize frame, ZONE_END with another count, a declared count the data does
-#     not reach, ANCOUNT 0, an OPT in a later message, an unknown TLV tag): one protocol-error line, the stream is
+# tests/db/fake_dbloader.c (./fake_dbloader, make fake_dbloader) stands in for karidns-dbloader on the stream and sends one batch: ok1.test, a
+# bad zone (bad.test), ok2.test.  The data of a zone is a zone image (0.7 M3).  Two kinds of mistakes:
+#   - an image that fails the checks of the Backend (zone_image_validate_ex(): an owner outside the zone, an SOA that is not at the
+#     apex, two SOAs without the extended flag, the image of another zone, a class other than IN, a serial that is not the one ZONE_BEGIN
+#     declared, the tinydns flag, noise inside the image), a secondary or extended zone: only that zone is rejected (ZONE_RESULT "rejected"),
+#     the stream stays open, the zones around it are installed and answer, the bad zone does not exist (REFUSED), `karictl dbstatus` names the reason;
+#   - a stream that breaks the protocol (an oversize frame, ZONE_END with another count, a count the header of the image does not carry, a
+#     message of the old type ZONE_DATA, a zone that is not an image, a HELLO without the image feature or with another image version, an image
+#     that is shorter or longer than announced, a damaged header, an unknown TLV tag): one protocol-error line, the stream is
 #     closed, the supervisor restarts the loader, the partial zone is thrown away, the zones before it answer.
 # In every case the Backend survives and keeps answering the file zone.  KARIDNS=./karidns-asan runs it on the ASan build.
 #
@@ -25,7 +26,7 @@ for b in "$KARIDNS" ./dag ./karictl; do
     [ -x "$b" ] || { echo "SKIP: $b is not built"; exit 0; }
 done
 id nobody >/dev/null 2>&1 || { echo "SKIP: no user nobody"; exit 0; }
-command -v cc >/dev/null 2>&1 || { echo "SKIP: no C compiler for the fake loader"; exit 0; }
+[ -x ./fake_dbloader ] || { echo "SKIP: ./fake_dbloader is not built (make fake_dbloader)"; exit 0; }
 
 T=$(mktemp -d "${TMPDIR:-/tmp}/karidns_dbhostile.XXXXXX") || exit 1
 chmod 755 "$T"
@@ -46,7 +47,7 @@ PORT=$(kari_port 0 $((20000 + $$ % 20000)))
 DAG="./dag @127.0.0.1 -p $PORT"
 SECRET="dGVzdC1zZWNyZXQtMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"
 
-cc -O1 -o "$T/fake_dbloader" tests/db/fake_dbloader.c 2>"$T/cc.log" || { echo "SKIP: the fake loader does not compile"; cat "$T/cc.log"; exit 0; }
+cp ./fake_dbloader "$T/fake_dbloader"
 chown 0:0 "$T/fake_dbloader"; chmod 755 "$T/fake_dbloader"
 printf '$TTL 300\n@ SOA ns host 1 2 3 4 5\n@ NS ns\nns A 192.0.2.1\nwww A 192.0.2.80\n' > "$T/file.zone"
 cat > "$T/karictl.conf" <<EOF
@@ -164,15 +165,16 @@ sleep 0.3
 
 run_mode good ok "" "batch 1 complete: 2 zone(s) received (2 installed, 0 hidden by karidns.conf, 0 rejected)"
 run_mode again ok "" "batch 1 complete: 3 zone(s) received (3 installed"
+# 0.7 M3: the zone is an image; what the Backend checked while it built the zone from RRs is checked on the image (zone_image_validate_ex())
 run_mode owner-outside reject "outside the zone" "batch 1 complete: 3 zone(s) received (2 installed, 0 hidden by karidns.conf, 1 rejected)"
-run_mode anc-short reject "malformed zone data"
-run_mode garbage-rr reject "malformed zone data"
-run_mode no-final-soa reject "zone data ends before the final SOA"
-run_mode two-soa reject "more than one SOA"
-run_mode soa-subdomain reject "SOA of its apex"
-run_mode trailing-rr reject "after the final SOA"
-run_mode later-message reject "after the final SOA"
-# B7b: SLAVE / CONSUMER zones carry no data; a secondary needs masters, and its rr_count is 0 (a ZONE_DATA after it is a protocol error)
+run_mode soa-subdomain reject "SOA outside the apex"
+run_mode two-soa reject "several SOA records"
+run_mode other-zone reject "outside the zone|no data at the apex"
+run_mode non-in-class reject "class 3"
+run_mode image-serial reject "not the one ZONE_BEGIN declared"
+run_mode image-tinydns reject "tinydns flag"
+run_mode image-garbage reject "the zone image is refused"
+# B7b: SLAVE / CONSUMER zones carry no data; a secondary needs masters, and its rr_count is 0 (a ZONE_IMAGE after it is a protocol error)
 run_mode secondary-kind reject "needs masters in its settings"
 run_mode secondary-data error "a secondary zone has rr_count 0"
 run_mode secondary-flag reject "carries no zone flags"
@@ -180,30 +182,20 @@ run_mode secondary-host reject "masters has an entry that is not an IP address"
 run_mode secondary-prim reject "settings of a primary zone name masters"
 run_mode secondary-ok ok "" "batch 1 complete: 3 zone(s) received (3 installed"
 run_mode catalog-ok ok "" "batch 1 complete: 3 zone(s) received (3 installed"
-run_mode ext-no-flag reject "did not announce"
-run_mode ext-trusted reject "malformed zone data"
-run_mode ext-bad-def reject "malformed zone data"
-run_mode ext-bad-locdef reject "malformed zone data"
-run_mode ext-bad-wrap reject "malformed zone data"
-run_mode ext-long-tag reject "malformed zone data"
 run_mode ext-flag-bit error "value out of range|flags"
-run_mode ext-image-flag error "image"
+run_mode ext-image-flag error "image size"
 run_mode ext-ok ok "" "batch 1 complete: 3 zone(s) received (3 installed"
-# B8t-2: the version 3 SOA set (SOA_SET, the apex SOA RRs as wrapped body RRs)
-run_mode soaset-ok ok "" "batch 1 complete: 3 zone(s) received (3 installed"
-run_mode soaset-serial reject "malformed zone data"
-run_mode soaset-count reject "malformed zone data"
-run_mode soaset-late reject "malformed zone data"
-run_mode soaset-dup reject "two SOA records for the same clients"
-run_mode soaset-frame reject "opening SOA is not the reference SOA"
-run_mode non-in-class reject "class|malformed"
 run_mode delete-unknown ok "" "batch 1 complete: 2 zone(s) received (2 installed"
 run_mode huge-frame error "above the limit"
 run_mode end-count error "count differs from ZONE_BEGIN"
-run_mode begin-count error "ANCOUNT sum differs"
-run_mode zero-ancount error "no answer RR"
-run_mode opt-twice error "ARCOUNT in a message after the first"
+run_mode begin-count error "the RR count in the header differs from ZONE_BEGIN"
 run_mode unknown-tag error "unknown tag 99"
+run_mode zone-data error "unknown message type 5"
+run_mode no-image-flag error "the data of a primary zone is a zone image"
+run_mode image-magic error "not the header of an image of this version"
+run_mode image-size-hdr error "the size in the header differs from ZONE_BEGIN"
+run_mode image-short error "the image is not complete"
+run_mode image-extra error "more octets than ZONE_BEGIN announced"
 
 # B7a: the settings text and the PROFILE messages are as hostile as the zone data
 run_mode settings-ok ok "" "batch 1 complete: 3 zone(s) received (3 installed"

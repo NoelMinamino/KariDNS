@@ -1,7 +1,7 @@
 /*
  * test_db_registry.c - the DB zone registry, the view delta and the zone install of the database loader link
  * (beta design 4.1-4.5, milestone B4b): dns_snapshot_rcu.c (dbreg_*, snapshot_apply_db_delta, the shadowing rules of
- * the full-configuration rebuild, dbcfg) and dns_db_install.c (db_zone_build_*).
+ * the full-configuration rebuild, dbcfg) and dns_db_install.c (db_zone_install_image()).
  *
  *  1. install: a zone built from AXFR-format messages is published into an entry (serial, SOA timers, image, NOTIFY
  *     only when a loaded zone changes its serial); every rejection rule leaves the entry as it was.
@@ -41,6 +41,7 @@
 
 #include "../dns_config_parser.h"
 #include "../dns_db_install.h"
+#include "../dns_zone_image.h"
 #include "../dns_db_stream.h"
 #include "../dns_alias.h"
 #include "../dns_utils.h"
@@ -252,25 +253,53 @@ static zone_db_entry_t *new_entry(const char *view, const char *zone) {
     return e;
 }
 
-static int install_msgs_f(zone_db_entry_t *e, const char *zone, uint64_t declared, uint32_t flags, const msg_t *ms, int nm, char *why, size_t whylen) {
-    db_zone_build_t *b = db_zone_build_new(zone, declared, flags);
-    CHECK(b != NULL);
+/* 0.7 M3: a zone of the database arrives as a zone image.  The messages of these tests are those of an AXFR (the builders above); the arena that parse_xfr_packet() makes of them (as the
+ * Backend did before the image) is frozen into the image that the loader would have sent, then checked as the stream thread checks it (zone_image_validate_ex(), with the count `declared` as
+ * ZONE_BEGIN of an AXFR counted it: both SOAs and the extension records) and installed (db_zone_install_image()).  A rule that the old stream had at the framing of the messages (a record after the
+ * closing SOA, an owner outside the zone that the parser skips) is checked here only as far as the helper needs it; the rules of the image are in test_zone_image. */
+static int install_msgs_x(zone_db_entry_t *e, const char *zone, uint64_t declared, uint32_t flags, bool has_serial, uint32_t decl_serial, const msg_t *ms, int nm, char *why, size_t whylen,
+                          bool *notified) {
+    zone_arena_t a;
+    zone_arena_init(&a);
+    axfr_session_t s;
+    memset(&s, 0, sizeof(s));
+    s.db_stream = true;
+    if (flags & KDB_ZF_TINYDNS) a.is_tinydns_format = true;
     int rc = 0;
-    for (int i = 0; i < nm && rc == 0; i++) rc = db_zone_build_feed(b, ms[i].b, ms[i].n, why, whylen);
-    if (rc == 0) rc = db_zone_build_install(b, e, NULL, why, whylen);
-    db_zone_build_free(b);
+    for (int i = 0; i < nm && rc == 0; i++)
+        if (parse_xfr_packet(ms[i].b, ms[i].n, &a, NULL, &s, zone) != 0) { snprintf(why, whylen, "malformed zone data"); rc = -1; }
+    if (rc == 0 && s.out_of_zone_skipped > 0) { snprintf(why, whylen, "record with an owner outside the zone"); rc = -1; }
+    if (rc == 0 && !s.is_finished) { snprintf(why, whylen, "zone data ends before the final SOA"); rc = -1; }
+    zone_image_t *img = NULL;
+    if (rc == 0) {
+        zone_arena_drop_unencodable(&a, NULL, NULL);
+        zone_arena_shrink_records(&a);
+        if (build_zone_index(&a, true) != 0 || !(img = zone_image_freeze(&a, zone))) { snprintf(why, whylen, "cannot build the zone image"); rc = -1; }
+    }
+    uint32_t serial = decl_serial;
+    if (rc == 0 && !has_serial) {
+        const uint32_t soa = zone_image_apex_soa(img);
+        zone_image_soa_t n;
+        serial = soa != ZONE_IMAGE_NONE && zone_image_soa(img, soa, NULL, 0, NULL, 0, &n) == 0 ? n.serial : 0;
+    }
+    if (rc == 0) {
+        const uint64_t want = declared - 1 - s.ext_records;
+        const zone_image_policy_t pol = { zone, serial, want, img->total_size, 0, 0, (flags & KDB_ZF_EXTENDED) != 0, (flags & KDB_ZF_TINYDNS) != 0 };
+        if (zone_image_validate_ex(img, img->total_size, &pol, why, whylen) != 0) rc = -1;
+    }
+    if (rc == 0 && db_zone_install_image(e, img, notified, why, whylen) != 0) rc = -1;
+    else if (rc == 0) img = NULL;                        /* (the entry's version owns it) */
+    zone_image_free(img);
+    zone_arena_destroy(&a);
     return rc;
 }
 
-static int install_msgs(zone_db_entry_t *e, const char *zone, uint64_t declared, const msg_t *ms, int nm,
-                        char *why, size_t whylen, bool *notified) {
-    db_zone_build_t *b = db_zone_build_new(zone, declared, 0);
-    CHECK(b != NULL);
-    int rc = 0;
-    for (int i = 0; i < nm && rc == 0; i++) rc = db_zone_build_feed(b, ms[i].b, ms[i].n, why, whylen);
-    if (rc == 0) rc = db_zone_build_install(b, e, notified, why, whylen);
-    db_zone_build_free(b);
-    return rc;
+static int install_msgs_f(zone_db_entry_t *e, const char *zone, uint64_t declared, uint32_t flags, const msg_t *ms, int nm, char *why, size_t whylen) {
+    return install_msgs_x(e, zone, declared, flags, false, 0, ms, nm, why, whylen, NULL);
+}
+
+static int install_msgs(zone_db_entry_t *e, const char *zone, uint64_t declared, const msg_t *ms, int nm, char *why, size_t whylen, bool *notified) {
+    return install_msgs_x(e, zone, declared, 0, false, 0, ms, nm, why, whylen, notified);
 }
 
 /* a complete zone through the same steps as the ingest thread: build, install, register */
@@ -307,7 +336,7 @@ static bool name_in_snapshot(const char *view, const char *name) {
 
 /* ---------------------------------------------------------------- 1. install */
 static void test_install(void) {
-    printf("[TEST] DB install: a zone from AXFR-format messages, every rejection rule...\n");
+    printf("[TEST] DB install: a zone image made of AXFR-format messages, the rejections that are the install's...\n");
     zone_db_entry_t *e = new_entry("default", "a.test.");
     msg_t m;
     char why[128] = "";
@@ -354,95 +383,35 @@ static void test_install(void) {
 
     /* rejections: the entry keeps its last good version */
     zone_msg(&m, "a.test.", 30, 2);
-    CHECK(install_msgs(e, "a.test.", 6, &m, 1, why, sizeof(why), NULL) != 0 && strstr(why, "count mismatch"));
-    CHECK(install_msgs(e, "a.test.", 4, &m, 1, why, sizeof(why), NULL) != 0 && strstr(why, "count mismatch"));
-    {   /* an owner outside the zone: AXFR-in would skip it, the DB path refuses the zone */
-        msg_init(&m); msg_soa(&m, "a.test.", 31); msg_a(&m, "host.other.test.", 1); msg_soa(&m, "a.test.", 31);
-        db_zone_build_t *b = db_zone_build_new("a.test.", 3, 0);
-        CHECK(db_zone_build_feed(b, m.b, m.n, why, sizeof(why)) != 0 && strstr(why, "outside the zone"));
-        db_zone_build_free(b);
-    }
-    {   /* the apex SOA of another zone */
-        msg_init(&m); msg_soa(&m, "b.test.", 31); msg_soa(&m, "b.test.", 31);
-        db_zone_build_t *b = db_zone_build_new("a.test.", 2, 0);
-        CHECK(db_zone_build_feed(b, m.b, m.n, why, sizeof(why)) != 0);
-        db_zone_build_free(b);
-    }
+    CHECK(install_msgs(e, "a.test.", 6, &m, 1, why, sizeof(why), NULL) != 0 && strstr(why, "declared"));            /* ZONE_BEGIN counted another number of RRs than the image has */
+    CHECK(install_msgs(e, "a.test.", 4, &m, 1, why, sizeof(why), NULL) != 0 && strstr(why, "declared"));
     {   /* a subdomain's SOA first: it is inside the zone but not the apex */
         msg_init(&m); msg_soa(&m, "sub.a.test.", 31); msg_a(&m, "a.test.", 1); msg_soa(&m, "sub.a.test.", 31);
-        CHECK(install_msgs(e, "a.test.", 3, &m, 1, why, sizeof(why), NULL) != 0 && strstr(why, "SOA of its apex"));
+        CHECK(install_msgs(e, "a.test.", 3, &m, 1, why, sizeof(why), NULL) != 0 && strstr(why, "SOA outside the apex"));
     }
-    {   /* ZONE_BEGIN declared another serial than the SOA of the data (B8t-2): refused at ZONE_END, the entry stays */
+    {   /* ZONE_BEGIN declared another serial than the SOA of the data (B8t-2): refused, the entry stays */
         zone_msg(&m, "a.test.", 41, 1);
-        db_zone_build_t *b = db_zone_build_new("a.test.", 4, 0);
-        db_zone_build_set_serial(b, 40);
-        CHECK(db_zone_build_feed(b, m.b, m.n, why, sizeof(why)) == 0);
-        CHECK(db_zone_build_install(b, e, NULL, why, sizeof(why)) != 0 && strstr(why, "not the one ZONE_BEGIN declared"));
-        db_zone_build_free(b);
+        CHECK(install_msgs_x(e, "a.test.", 4, 0, true, 40, &m, 1, why, sizeof(why), NULL) != 0 && strstr(why, "not the one ZONE_BEGIN declared"));
         CHECK(e->serial == keep_serial);
-        b = db_zone_build_new("a.test.", 4, 0);
-        db_zone_build_set_serial(b, 41);                       /* the declared serial is the one in the data: published */
-        CHECK(db_zone_build_feed(b, m.b, m.n, why, sizeof(why)) == 0);
-        CHECK(db_zone_build_install(b, e, NULL, why, sizeof(why)) == 0);
-        db_zone_build_free(b);
+        CHECK(install_msgs_x(e, "a.test.", 4, 0, true, 41, &m, 1, why, sizeof(why), NULL) == 0);      /* the declared serial is the one in the data: published */
         CHECK(e->serial == 41);
         keep_serial = 41;
         keep_rrs = atomic_load(&e->rcu.active)->image->n_rrs;
     }
-    {   /* no closing SOA */
-        msg_init(&m); msg_soa(&m, "a.test.", 31); msg_a(&m, "x.a.test.", 1);
-        CHECK(install_msgs(e, "a.test.", 3, &m, 1, why, sizeof(why), NULL) != 0 && strstr(why, "final SOA"));
-    }
-    {   /* a record after the closing SOA, in the same message and in a later one */
-        msg_init(&m); msg_soa(&m, "a.test.", 31); msg_soa(&m, "a.test.", 31); msg_a(&m, "x.a.test.", 1);
-        db_zone_build_t *b = db_zone_build_new("a.test.", 3, 0);
-        CHECK(db_zone_build_feed(b, m.b, m.n, why, sizeof(why)) != 0 && strstr(why, "after the final SOA"));
-        db_zone_build_free(b);
-        msg_t a, c;
-        msg_init(&a); msg_soa(&a, "a.test.", 31); msg_soa(&a, "a.test.", 31);
-        msg_init(&c); msg_a(&c, "x.a.test.", 1);
-        b = db_zone_build_new("a.test.", 3, 0);
-        CHECK(db_zone_build_feed(b, a.b, a.n, why, sizeof(why)) == 0);
-        CHECK(db_zone_build_feed(b, c.b, c.n, why, sizeof(why)) != 0 && strstr(why, "after the final SOA"));
-        db_zone_build_free(b);
-    }
     {   /* two SOAs (a different serial in the middle) */
         msg_init(&m); msg_soa(&m, "a.test.", 31); msg_soa(&m, "a.test.", 32); msg_soa(&m, "a.test.", 31);
         int rc2 = install_msgs(e, "a.test.", 3, &m, 1, why, sizeof(why), NULL);
-        CHECK(rc2 != 0 && strstr(why, "more than one SOA"));
+        CHECK(rc2 != 0 && strstr(why, "SOA"));
     }
     {   /* a class other than IN */
         uint8_t rd[4] = { 1, 2, 3, 4 };
         msg_init(&m); msg_soa(&m, "a.test.", 31); msg_rr(&m, "x.a.test.", 1, 3, rd, 4); msg_soa(&m, "a.test.", 31);
         CHECK(install_msgs(e, "a.test.", 3, &m, 1, why, sizeof(why), NULL) != 0 && (strstr(why, "class") || strstr(why, "malformed")));
     }
-    {   /* garbage inside a valid frame: a truncated RR */
-        zone_msg(&m, "a.test.", 31, 2);
-        m.n -= 7;
-        db_zone_build_t *b = db_zone_build_new("a.test.", 6, 0);
-        CHECK(db_zone_build_feed(b, m.b, m.n, why, sizeof(why)) != 0 && strstr(why, "malformed"));
-        db_zone_build_free(b);
-    }
-    {   /* B8: Extended AXFR records of the database stream */
-        uint8_t lan[3] = { 'l', 'a', 'n' };
-        msg_init(&m); msg_soa(&m, "a.test.", 31); msg_rr(&m, "a.test.", 65401, 65302, lan, 3); msg_a(&m, "x.a.test.", 1);
-        msg_rr(&m, "a.test.", 65401, 65302, (const uint8_t *)"", 0); msg_soa(&m, "a.test.", 31);
-        CHECK(install_msgs_f(e, "a.test.", 5, 0, &m, 1, why, sizeof(why)) != 0 && strstr(why, "did not announce"));
-        CHECK(install_msgs_f(e, "a.test.", 3, KDB_ZF_EXTENDED, &m, 1, why, sizeof(why)) != 0 && strstr(why, "count mismatch"));
-        uint8_t tr[2] = { 1, 0 };
-        msg_init(&m); msg_soa(&m, "a.test.", 31); msg_rr(&m, "a.test.", 65407, 65302, tr, 2); msg_soa(&m, "a.test.", 31);
-        CHECK(install_msgs_f(e, "a.test.", 3, KDB_ZF_EXTENDED, &m, 1, why, sizeof(why)) != 0);                 /* ECS_TRUSTED: settings only */
-        uint8_t bad[1] = { 'x' };
-        msg_init(&m); msg_soa(&m, "a.test.", 31); msg_rr(&m, "a.test.", 65403, 65302, bad, 1); msg_soa(&m, "a.test.", 31);
-        CHECK(install_msgs_f(e, "a.test.", 3, KDB_ZF_EXTENDED, &m, 1, why, sizeof(why)) != 0);                 /* malformed LOC_TAGDEF */
-        msg_init(&m); msg_soa(&m, "a.test.", 31); msg_rr(&m, "a.test.", 65405, 65302, bad, 1); msg_soa(&m, "a.test.", 31);
-        CHECK(install_msgs_f(e, "a.test.", 3, KDB_ZF_EXTENDED, &m, 1, why, sizeof(why)) != 0);                 /* malformed TINYDNS_LOCDEF */
-        msg_init(&m); msg_soa(&m, "a.test.", 31); msg_rr(&m, "x.a.test.", 65406, 65302, bad, 1); msg_soa(&m, "a.test.", 31);
-        CHECK(install_msgs_f(e, "a.test.", 3, KDB_ZF_EXTENDED, &m, 1, why, sizeof(why)) != 0);                 /* TINYDNS_WRAP shorter than its fixed part */
-        uint8_t longtag[70];
-        memset(longtag, 'a', sizeof(longtag));
-        msg_init(&m); msg_soa(&m, "a.test.", 31); msg_rr(&m, "a.test.", 65401, 65302, longtag, sizeof(longtag)); msg_soa(&m, "a.test.", 31);
-        CHECK(install_msgs_f(e, "a.test.", 3, KDB_ZF_EXTENDED, &m, 1, why, sizeof(why)) != 0);                 /* tag state longer than 63 */
+    {   /* garbage inside a valid frame */
+        zone_msg(&m, "a.test.", 32, 2);
+        m.n -= 7;                                         /* garbage inside a valid frame: a truncated RR */
+        CHECK(install_msgs(e, "a.test.", 6, &m, 1, why, sizeof(why), NULL) != 0 && strstr(why, "malformed"));
     }
     CHECK(e->serial == keep_serial && atomic_load(&e->rcu.active)->image->n_rrs == keep_rrs);
     {   /* B8: an announced zone is installed: the tag reaches the image, the tinydns flag too */

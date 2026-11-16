@@ -107,7 +107,15 @@ q() {   # q ZONE-OWNER [dag options]: the A record, short
     ./dag @127.0.0.1 -p "$PORT" "$n" A +short +nohexdump +time=5 +tries=1 "$@" 2>/dev/null | head -1
 }
 evict() { $KCTL evict "$1" 2>&1; }
-evicted() { evict "$1" | grep -q '^OK' && pass "$2" || fail "$2 (karictl evict: $(evict "$1" | head -1))"; }
+# 0.7 M3: with the store the bodies of the first fill go to the store as they are and a zone is attached by its first query: a zone nobody asked for is out of memory already
+evicted() {
+    o=$(evict "$1" | head -1)
+    case $o in
+    OK*) pass "$2" ;;
+    *"no such zone in memory"*) if [ "$STORE" = on ]; then pass "$2 (the zone was never attached: a body of the fill is stored as it is)"; else fail "$2 (karictl evict: $o)"; fi ;;
+    *) fail "$2 (karictl evict: $o)" ;;
+    esac
+}
 resident_again() {   # the zone is in memory again: evict says OK (and takes it out again, so a query brings it back for the next step)
     evict "$1" | grep -q '^OK' && pass "$2" || fail "$2"
     q "www.${1%.}" > /dev/null

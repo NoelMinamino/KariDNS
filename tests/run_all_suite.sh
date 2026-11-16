@@ -1348,6 +1348,8 @@ _zd=$(./karidns-zone --version 2>/dev/null | sed -n 's/.*(drivers: \(.*\))/\1/p'
 [ "${_zd}" = "${_dbd}" ] || as_user "make karidns-zone DB_DRIVERS='${_dbd}'" >/dev/null 2>&1 || true
 # the stand-in for the Backend on both loader streams (run_db_fetch_test.sh); it SKIPs without it
 [ -x ./fetch_backend ] || as_user "make fetch_backend" >/dev/null 2>&1 || true
+# the hostile loader (run_db_hostile_loader_test.sh, run_db_loader_lifecycle_test.sh part 2): a loader that sends bad zone images, made with the zone parser
+[ -x ./fake_dbloader ] || as_user "make fake_dbloader" >/dev/null 2>&1 || true
 # karidns with the test-only karictl evict (run_db_park_test.sh, run_xfr_dispatch_fault_test.sh): ./karidns has it in the instrumented build of `make coverage`, else ./karidns-evict
 grep -q 'no such zone in memory' ./karidns 2>/dev/null || [ -x ./karidns-evict ] || as_user "make karidns-evict" >/dev/null 2>&1 || true
 
