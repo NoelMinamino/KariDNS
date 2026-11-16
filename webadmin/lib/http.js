@@ -15,6 +15,7 @@ export const PREFIX = '/api/v1';
 const BODY_LIMIT = 1 << 20;
 const REQUEST_MS = 30000;                   // a request body is received within this time ...
 const IMPORT_MS = 300000;                   // ... a zone import within this (planning 8.2); the server's requestTimeout is the larger
+const LINGER_MS = 2000;                     // a connection closed after a 408 reads on for this long at most (lingerClose)
 const JSON_TYPE = /^application\/json\s*(?:;\s*charset\s*=\s*"?utf-?8"?\s*)?$/i;
 const UNSAFE = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -80,6 +81,18 @@ function discard(req) {
   req.on('error', () => {});
 }
 
+// A 408 closes the connection while the client may still be sending the body.  Closing it at once makes the stack answer those octets with a reset, and
+// the reset can throw the 408 away before the client has read it.  So the close is done in stages (RFC 9112 section 9.6): node:http's destroySoon() after
+// the answer only half-closes, the rest of the request is read and thrown away, and the socket goes when the client closes its side or after LINGER_MS.
+function lingerClose(socket) {
+  socket.destroySoon = function destroySoon() {
+    this.end();
+    const timer = setTimeout(this.destroy.bind(this), LINGER_MS);
+    timer.unref();
+    this.once('close', clearTimeout.bind(null, timer));
+  };
+}
+
 // The body, at most `limit` octets, received within `timeoutMs` (30 s; a zone import has 300 s: the route says so).  The server's own requestTimeout is the longest of
 // these; this deadline is the one an ordinary request gets.
 export function readBody(req, limit, timeoutMs = REQUEST_MS) {
@@ -111,7 +124,10 @@ export function readBody(req, limit, timeoutMs = REQUEST_MS) {
     const onEnd = () => done(resolve, Buffer.concat(chunks));
     const onError = (e) => done(reject, e);
     const onClose = () => { if (!req.complete) done(reject, new Error('the client closed the connection')); };
-    const timer = setTimeout(() => done(reject, new ApiError(408, 'request-timeout', `the request was not received within ${Math.round(timeoutMs / 1000)} seconds`, { headers: { Connection: 'close' } })), timeoutMs);
+    const timer = setTimeout(() => {
+      if (req.socket) lingerClose(req.socket);
+      done(reject, new ApiError(408, 'request-timeout', `the request was not received within ${Math.round(timeoutMs / 1000)} seconds`, { headers: { Connection: 'close' } }));
+    }, timeoutMs);
     req.on('data', onData);
     req.on('end', onEnd);
     req.on('error', onError);

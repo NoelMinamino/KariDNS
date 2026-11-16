@@ -779,6 +779,25 @@ test('a body that does not arrive in time is a 408, a route can have more time',
     assert.match(slow, /^HTTP\/1\.1 408 /);
     assert.match(slow, /urn:karidns:api:request-timeout/);
     assert.match(slow, /Connection: close/i);
+    // the body that still comes after the 408 is read, not reset (RFC 9112 section 9.6): the server half-closes and reads on; a client that goes on sending and
+    // never closes its side is reset after LINGER_MS (2 s)
+    const lingered = await new Promise((resolve) => {
+      const s = net.connect({ port, host: '127.0.0.1', allowHalfOpen: true });
+      let out = '';
+      let t0 = 0;
+      let tick = null;
+      const finish = (how) => { clearInterval(tick); s.destroy(); resolve({ out, how, ms: Date.now() - t0 }); };
+      s.on('data', (x) => {
+        out += x;
+        if (!tick) { t0 = Date.now(); tick = setInterval(() => s.write('x'.repeat(100)), 100); }
+      });
+      s.on('end', () => {});            // (allowHalfOpen: the client does not answer the server's FIN)
+      s.on('error', (e) => finish(e.code));
+      s.on('close', () => finish('close'));
+      s.write(`POST /api/v1/slow HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n{"a"`);
+    });
+    assert.match(lingered.out, /^HTTP\/1\.1 408 /);
+    assert.ok(lingered.ms >= 1500 && lingered.ms < 10000, `the server reset the connection ${lingered.ms} ms after the 408 (${lingered.how})`);
     const patient = await talk('/patient', ['{"a"', ':1}'], 100);
     assert.match(patient, /^HTTP\/1\.1 200 /);
     assert.match(patient, /"got":\{"a":1\}/);

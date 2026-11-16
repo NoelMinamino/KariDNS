@@ -4617,6 +4617,22 @@ static int lock_tests(void) {
         if (kase == 3) CHECK(same_file(&l0, &l1));                           /* a lock file that is fine is kept, not made again */
         db_store_frontend_close();
     }
+    /* KARIDNS_NO_DEFAULT_STORE=1 (the test hook of tests/lib_proc.sh): no store in the default directory, whether or not /var/db/karidns exists; a named store is opened */
+    {
+        printf("  KARIDNS_NO_DEFAULT_STORE=1\n");
+        const char *old = getenv("KARIDNS_NO_DEFAULT_STORE");
+        char *keep = old ? strdup(old) : NULL;
+        setenv("KARIDNS_NO_DEFAULT_STORE", "1", 1);
+        database_config_t d0;
+        memset(&d0, 0, sizeof(d0));
+        d0.enabled = true;
+        bool dflt = false;
+        CHECK(db_store_dir_of(&d0, &dflt) != NULL && dflt);
+        CHECK(db_store_frontend_open(&d0, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg)) && db_store_dir_fd() < 0 && strstr(msg, "KARIDNS_NO_DEFAULT_STORE=1") != NULL);
+        CHECK(db_store_frontend_open(&db, root, run_uid, run_gid, msg, sizeof(msg)) && db_store_dir_fd() >= 0);   /* (as the loop above: as root the directory is the run user's) */
+        db_store_frontend_close();
+        if (keep) { setenv("KARIDNS_NO_DEFAULT_STORE", keep, 1); free(keep); } else unsetenv("KARIDNS_NO_DEFAULT_STORE");
+    }
     char cmd[800];
     snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
     (void)!system(cmd);

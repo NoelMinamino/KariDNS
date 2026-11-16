@@ -134,6 +134,13 @@ bool db_store_frontend_open(const database_config_t *db, bool privileged, uid_t 
   struct stat st;
   char parent[PATH_MAX];
   parent_of(path, parent, sizeof(parent));
+  /* KARIDNS_NO_DEFAULT_STORE=1 (exported by tests/lib_proc.sh and tests/run_all_suite.sh): the default directory is not used, as if its parent did not exist, so
+   * that a test whose database block names no store runs the same whether or not the host has /var/db/karidns; a store that is named is not affected */
+  const char *nodef = getenv("KARIDNS_NO_DEFAULT_STORE");
+  if (dflt && nodef && strcmp(nodef, "1") == 0) {
+    snprintf(msg, msglen, "the zone store is off: KARIDNS_NO_DEFAULT_STORE=1 keeps it out of its default directory %s", path);
+    return true;
+  }
   if (dflt && (stat(parent, &st) != 0 || !S_ISDIR(st.st_mode))) {
     snprintf(msg, msglen, "the zone store is off: its default directory %s needs %s, which does not exist (give `store \"<directory>\";` in the database block to keep one elsewhere, or `store none;`)",
              path, parent);
