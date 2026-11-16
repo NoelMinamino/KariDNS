@@ -440,6 +440,10 @@ static void add_recon(list_t *l) {
   U("store.recon.group_entries", r->rt_group_entries);
   U("store.ingest.loop_max_us", r->rt_loop_max_us);
   U("store.ingest.stream_max_us", r->rt_stream_max_us);
+  U("store.lock.records_holds", r->rec_holds);
+  U("store.lock.records_holds_slow", r->rec_holds_slow);
+  U("store.lock.records_hold_max_us", r->rec_hold_max_us);
+  U("store.lock.records_wait_max_us", r->rec_wait_max_us);
   U("store.recon.guard.held_views", r->guard_views);
   if (r->guard_views) {
     add_s(l, "store.recon.guard.view", r->guard_view);
@@ -622,6 +626,11 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.writes.deletes", st->deletes);
   U("store.writes.growths", st->growths);
   U("store.writes.errors", st->write_errors);
+  U("store.writes.growths_background", st->growths_background);
+  U("store.lock.writer_holds", st->lock_holds);
+  U("store.lock.writer_holds_slow", st->lock_holds_slow);
+  U("store.lock.writer_hold_max_us", st->lock_hold_max_us);
+  U("store.flusher", st->flusher ? 1 : 0);
   /* 0.7 WP9: the cleaner (design 3.2) */
   U("store.compact.runs", st->compact_runs);
   U("store.compact.moved_records", st->compact_moved_records);

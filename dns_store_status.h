@@ -98,6 +98,8 @@ typedef struct store_recon {
    * thread had to stop reading the loader because the ring was full, the group records the store wrote and their entries, and the longest pass of the ingest thread's loop in the last window (microseconds) */
   bool recon_thread;             /* the figures below are there (the thread runs) */
   uint64_t rt_busy_pct, rt_entries_per_s, rt_queued, rt_apply_ns_per_entry, rt_entries, rt_pages, rt_full_stops, rt_group_records, rt_group_entries, rt_loop_max_us, rt_stream_max_us;
+  /* 0.7 fix A: the mutex of the writers of the records (dns_db_store.c g_rec_mu): holds since the start, those of 1 ms or more, the longest hold, the longest wait for it (microseconds) */
+  uint64_t rec_holds, rec_holds_slow, rec_hold_max_us, rec_wait_max_us;
 } store_recon_t;
 /* fills *out and returns true, or returns false when the server has none (no loader) */
 void store_status_set_recon_fn(bool (*fn)(store_recon_t *out));
