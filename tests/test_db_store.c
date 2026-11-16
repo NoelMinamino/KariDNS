@@ -5940,7 +5940,18 @@ static int run_recon_thread(const char *dir) {
         CHECK(db_ingest_lookup_ready());
         const int64_t t0 = now_us();
         CHECK(park_fetch_request(0, "default", "www.late8.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
-        CHECK(ch_next(&fetchc, &m, 2000) && m.type == KDB_T_FETCH_REQ && m.u.fetch_req.mode == KDB_FETCH_LOOKUP && strcmp(m.u.fetch_req.name, "www.late8.test.") == 0);
+        bool got_lookup = false;
+        int n_fill = 0;
+        while (!got_lookup && ch_next(&fetchc, &m, 2000)) {             /* (the fill may ask for bodies of the slow pass's zones first: those get "no body", as serve_fetches() does) */
+            if (m.type != KDB_T_FETCH_REQ) continue;
+            if (m.u.fetch_req.mode == KDB_FETCH_LOOKUP && strcmp(m.u.fetch_req.name, "www.late8.test.") == 0) { got_lookup = true; break; }
+            kdb_enc_begin(&e, KDB_T_ZONE_FAILED);
+            kdb_enc_u16(&e, 1, m.u.fetch_req.view); kdb_enc_name(&e, 2, m.u.fetch_req.name); kdb_enc_i64(&e, 3, m.u.fetch_req.source_id); kdb_enc_str(&e, 4, "no body in the test"); kdb_enc_u64(&e, 5, m.u.fetch_req.request_id);
+            kdb_enc_end(&e);
+            ch_send(f[0], &e);
+            n_fill++;
+        }
+        CHECK_MSG(got_lookup, "the lookup request was not on the fetch stream (%d other requests)", n_fill);
         const int64_t dt = now_us() - t0;
         printf("    the request of a lookup was on the fetch stream %lld us after it was made, with %llu pages of the slow pass waiting\n", (long long)dt, (unsigned long long)maxq);
         CHECK_MSG(dt < 150000, "the lookup waited %lld us", (long long)dt);
