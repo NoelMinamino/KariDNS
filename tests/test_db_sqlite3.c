@@ -4537,6 +4537,305 @@ static void test_find_zones_classes(void) {
     D->close(c);
 }
 
+/* ---- the fetch batch (fetch_batch(), fetch_take()) */
+typedef struct { char ev[2048]; int begin[1000], failed[1000], looked[1000], found[1000]; } fbev_t;
+
+static void fb_events(int fd, fbev_t *e) {
+    static uint8_t body[KDB_MAX_BODY];
+    kdb_framer_t f;
+    kdb_sm_t sm;
+    memset(e, 0, sizeof(*e));
+    kdb_framer_init(&f, KDB_FROM_LOADER, body, sizeof(body));
+    kdb_sm_init_fetch(&sm, NULL);
+    uint8_t buf[65536];
+    for (;;) {
+        ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n <= 0) break;
+        if (kdb_framer_feed(&f, buf, (size_t)n) != KDB_OK) {
+            strcat(e->ev, "!feed ");
+            return;
+        }
+        kdb_frame_t fr;
+        while (kdb_framer_next(&f, &fr) == KDB_OK) {
+            kdb_msg_t m;
+            if (kdb_sm_accept(&sm, &fr, &m) != KDB_OK) {
+                printf("    the state machine says: %s\n", sm.reason);
+                strcat(e->ev, "!sm ");
+                return;
+            }
+            char t[48];
+            switch (m.type) {
+            case KDB_T_ZONE_BEGIN:
+                if (m.u.zone_begin.request_id < 1000) e->begin[m.u.zone_begin.request_id]++;
+                snprintf(t, sizeof(t), "B%llu ", (unsigned long long)m.u.zone_begin.request_id);
+                strcat(e->ev, t);
+                break;
+            case KDB_T_ZONE_FAILED:
+                if (m.u.zone_failed.request_id < 1000) e->failed[m.u.zone_failed.request_id]++;
+                snprintf(t, sizeof(t), "F%llu ", (unsigned long long)m.u.zone_failed.request_id);
+                strcat(e->ev, t);
+                break;
+            case KDB_T_LOOKUP_RESULT:
+                if (m.u.lookup_result.request_id < 1000) {
+                    e->looked[m.u.lookup_result.request_id]++;
+                    e->found[m.u.lookup_result.request_id] += m.u.lookup_result.found ? 1 : 0;
+                }
+                snprintf(t, sizeof(t), "L%llu%s ", (unsigned long long)m.u.lookup_result.request_id, m.u.lookup_result.found ? "+" : "-");
+                strcat(e->ev, t);
+                break;
+            default: break;
+            }
+        }
+    }
+}
+
+static void fb_req(struct fbatch *fb, uint64_t id, uint8_t mode, const char *zone, int64_t source_id) {
+    freq_t *q = &fb->rq[fb->n++];
+    memset(q, 0, sizeof(*q));
+    q->id = id;
+    q->view = 1;
+    q->prio = KDB_FETCH_PRIO_BACKGROUND;
+    q->mode = mode;
+    q->source_id = source_id;
+    snprintf(q->zone, sizeof(q->zone), "%s", zone);
+}
+
+/* each request has exactly one answer of the kind, and no other */
+#define FB_ONE_OF(e, id) ((e).begin[id] + (e).failed[id] + (e).looked[id] >= 1)
+
+static void test_fetch_batch(void) {
+    printf("fetch batches (0.7): several requests read in one snapshot, every request answered once with its own id\n");
+    signal(SIGPIPE, SIG_IGN);
+    char path[600];
+    sqlite3 *db = make_db("fbatch.db", path, sizeof(path));
+    char *ext = slurp(g_ext_path);
+    CHECK(ext != NULL);
+    if (!db || !ext) return;
+    raw_exec(db, ext);
+    free(ext);
+    add_simple_zone(db, 1, 10, "a.test");
+    add_simple_zone(db, 2, 20, "b.test");
+    add_simple_zone(db, 3, 30, "c.test");
+    add_zone(db, 4, "nosoa.test", "NATIVE");                               /* its NS only: the zone cannot be converted, ZONE_FAILED */
+    add_rec(db, 40, 4, "nosoa.test", "NS", "ns1.nosoa.test", 3600, -1, 0, NULL);
+    add_zone(db, 5, "empty.test", "NATIVE");                               /* no rows at all */
+    add_simple_zone(db, 6, 60, "UPPER.test");                              /* a name with capitals */
+    add_simple_zone(db, 7, 70, "sub.a.test");
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    struct lio *io = calloc(1, sizeof(*io));
+    struct fbatch *fb = calloc(1, sizeof(*fb));
+    CHECK(io != NULL && fb != NULL);
+    if (!io || !fb) return;
+    io->fd = sv[0];
+    io->is_fetch = true;
+    pthread_mutex_init(&io->wlock, NULL);
+    ctx_t x;
+    memset(&x, 0, sizeof(x));
+    x.io = io;
+    x.fetch = true;
+    kdb_enc_init(&x.enc);
+    lcfg_t lc;
+    memset(&lc, 0, sizeof(lc));
+    snprintf(lc.driver, sizeof(lc.driver), "sqlite3");
+    lc.store_proto = true;
+    lview_t v;
+    memset(&v, 0, sizeof(v));
+    v.index = 1;
+    v.name = "__default__";
+    v.source = path;
+    lc.views = &v;
+    lc.nviews = 1;
+    fbev_t *e = calloc(1, sizeof(*e));
+    CHECK(e != NULL);
+    if (!e) return;
+
+    /* bodies: the zones that are there, a name that is not, a zone that cannot be converted, an empty zone, another domain id than the Backend has, a name with capitals */
+    fb->n = 0;
+    fb->lookup = false;
+    fb_req(fb, 101, KDB_FETCH_FULL, "a.test.", 1);
+    fb_req(fb, 102, KDB_FETCH_FULL, "b.test.", 99);                         /* (the Backend's b.test is domain 99: the zone was made again) */
+    fb_req(fb, 103, KDB_FETCH_FULL, "c.test.", 0);                          /* (any id) */
+    fb_req(fb, 104, KDB_FETCH_FULL, "gone.test.", 0);
+    fb_req(fb, 105, KDB_FETCH_FULL, "nosoa.test.", 4);
+    fb_req(fb, 106, KDB_FETCH_FULL, "empty.test.", 5);
+    fb_req(fb, 107, KDB_FETCH_FULL, "upper.test.", 6);
+    fb_req(fb, 108, KDB_FETCH_FULL, "sub.a.test.", 7);
+    CHECK(fetch_batch(&x, &lc, fb) == 0);
+    fb_events(sv[1], e);
+    CHECK_MSG(strstr(e->ev, "!") == NULL, "events: %s", e->ev);
+    CHECK_MSG(e->begin[101] == 1 && e->begin[103] == 1 && e->begin[107] == 1 && e->begin[108] == 1, "zones sent: %s", e->ev);
+    CHECK_MSG(e->failed[102] == 1 && e->failed[104] == 1 && e->failed[105] == 1 && e->failed[106] == 1, "failures: %s", e->ev);
+    for (int id = 101; id <= 108; id++) CHECK_MSG(e->begin[id] + e->failed[id] == 1, "request %d answered %d times: %s", id, e->begin[id] + e->failed[id], e->ev);
+    CHECK(x.fb == NULL && x.nz == 0);
+
+    /* N = 1: the same function with one request */
+    fb->n = 0;
+    fb_req(fb, 201, KDB_FETCH_FULL, "a.test.", 1);
+    CHECK(fetch_batch(&x, &lc, fb) == 0);
+    fb_events(sv[1], e);
+    CHECK_MSG(e->begin[201] == 1 && e->failed[201] == 0, "%s", e->ev);
+
+    /* a zone deleted between two batches: the next batch does not find it, and the others of the batch are read */
+    raw_exec(db, "DELETE FROM records WHERE domain_id = 3; DELETE FROM domains WHERE id = 3");
+    fb->n = 0;
+    fb_req(fb, 301, KDB_FETCH_FULL, "a.test.", 0);
+    fb_req(fb, 302, KDB_FETCH_FULL, "c.test.", 3);
+    fb_req(fb, 303, KDB_FETCH_FULL, "b.test.", 2);
+    CHECK(fetch_batch(&x, &lc, fb) == 0);
+    fb_events(sv[1], e);
+    CHECK_MSG(e->begin[301] == 1 && e->begin[303] == 1 && e->failed[302] == 1 && e->begin[302] == 0, "%s", e->ev);
+    keep_drop(&x);
+
+    /* lookups: several names in one statement; the answers are those of one lookup at a time; KDB_FETCH_LOOKUP_FULL is followed by the body, with the same request id */
+    fb->n = 0;
+    fb->lookup = true;
+    fb_req(fb, 401, KDB_FETCH_LOOKUP_FULL, "www.a.test.", 0);
+    fb_req(fb, 402, KDB_FETCH_LOOKUP, "x.y.sub.a.test.", 0);                /* (the closest zone is sub.a.test) */
+    fb_req(fb, 403, KDB_FETCH_LOOKUP, "www.nothing.invalid.", 0);
+    fb_req(fb, 404, KDB_FETCH_LOOKUP_FULL, "mail.b.test.", 0);
+    fb_req(fb, 405, KDB_FETCH_LOOKUP_FULL, "q.c.test.", 0);                 /* (deleted above) */
+    fb_req(fb, 406, KDB_FETCH_LOOKUP, ".", 0);
+    CHECK(fetch_batch(&x, &lc, fb) == 0);
+    fb_events(sv[1], e);
+    CHECK_MSG(strstr(e->ev, "!") == NULL, "events: %s", e->ev);
+    CHECK_MSG(e->looked[401] == 1 && e->found[401] == 1 && e->looked[402] == 1 && e->found[402] == 1 && e->looked[403] == 1 && e->found[403] == 0 &&
+                  e->looked[404] == 1 && e->found[404] == 1 && e->looked[405] == 1 && e->found[405] == 0 && e->looked[406] == 1 && e->found[406] == 0,
+              "lookups: %s", e->ev);
+    CHECK_MSG(e->begin[401] == 1 && e->begin[404] == 1 && e->begin[402] == 0 && e->begin[405] == 0, "bodies of the FULL lookups: %s", e->ev);
+    keep_drop(&x);
+
+    /* a database error in the middle: every request that has no answer is failed, none is left waiting */
+    fb->n = 0;
+    fb->lookup = false;
+    fb_req(fb, 501, KDB_FETCH_FULL, "a.test.", 0);
+    fb_req(fb, 502, KDB_FETCH_FULL, "b.test.", 0);
+    v.source = (char *)"/nonexistent/dir/fb.db";
+    CHECK(fetch_batch(&x, &lc, fb) == 0);
+    fb_events(sv[1], e);
+    CHECK_MSG(e->failed[501] == 1 && e->failed[502] == 1 && e->begin[501] == 0, "%s", e->ev);
+    v.source = path;
+    /* a configuration without the view or the driver: every request is failed */
+    fb->n = 0;
+    fb_req(fb, 601, KDB_FETCH_FULL, "a.test.", 0);
+    fb_req(fb, 602, KDB_FETCH_FULL, "b.test.", 0);
+    fb->rq[1].view = 9;
+    fb->rq[0].view = 9;
+    CHECK(fetch_batch(&x, &lc, fb) == 0);
+    fb_events(sv[1], e);
+    CHECK_MSG(e->failed[601] == 1 && e->failed[602] == 1, "%s", e->ev);
+    fb->n = 0;
+    fb->lookup = true;
+    fb_req(fb, 611, KDB_FETCH_LOOKUP, "www.a.test.", 0);
+    lc.store_proto = false;                                                 /* (a lookup needs the store protocol) */
+    CHECK(fetch_batch(&x, &lc, fb) == 0);
+    fb_events(sv[1], e);
+    CHECK_MSG(e->failed[611] == 1, "%s", e->ev);
+    lc.store_proto = true;
+    snprintf(lc.driver, sizeof(lc.driver), "nosuch");
+    CHECK(fetch_batch(&x, &lc, fb) == 0);
+    fb_events(sv[1], e);
+    CHECK_MSG(e->failed[611] == 1, "%s", e->ev);
+    keep_drop(&x);
+    ctx_view_reset(&x);
+    kdb_enc_free(&x.enc);
+    pthread_mutex_destroy(&io->wlock);
+    free(io);
+    free(fb);
+    free(e);
+    close(sv[0]);
+    close(sv[1]);
+    sqlite3_close(db);
+}
+
+static void fq_put(struct lio *io, uint64_t id, uint8_t mode, uint8_t prio, uint16_t view, const char *zone) {
+    freq_t *q = &io->fq[io->nfq++];
+    memset(q, 0, sizeof(*q));
+    q->id = id;
+    q->view = view;
+    q->prio = prio;
+    q->mode = mode;
+    snprintf(q->zone, sizeof(q->zone), "%s", zone);
+}
+
+static void test_fetch_take(void) {
+    printf("fetch batches (0.7): which queued requests join the one a worker took\n");
+    struct lio *io = calloc(1, sizeof(*io));
+    struct fbatch *fb = calloc(1, sizeof(*fb));
+    CHECK(io != NULL && fb != NULL);
+    if (!io || !fb) return;
+    freq_t r;
+    memset(&r, 0, sizeof(r));
+    r.id = 1;
+    r.view = 1;
+    r.prio = KDB_FETCH_PRIO_BACKGROUND;
+    r.mode = KDB_FETCH_FULL;
+    snprintf(r.zone, sizeof(r.zone), "z0.test.");
+    char nm[40];
+    /* 40 queued bodies of the same kind: one worker takes up to FETCH_BATCH_MAX; with four workers it takes its quarter; the others stay */
+    for (int i = 1; i <= 40; i++) {
+        snprintf(nm, sizeof(nm), "z%d.test.", i);
+        fq_put(io, 100 + (uint64_t)i, KDB_FETCH_FULL, KDB_FETCH_PRIO_BACKGROUND, 1, nm);
+    }
+    io->fq_allowed = 1;
+    fetch_take(io, fb, &r, 41);
+    CHECK_MSG(fb->n == (FETCH_BATCH_MAX < 41 ? FETCH_BATCH_MAX : 41) && !fb->lookup && fb->rq[0].id == 1 && io->nfq == 41 - fb->n, "one worker: %zu taken, %zu left", fb->n, io->nfq);
+    size_t left = io->nfq;
+    io->fq_allowed = 4;
+    fetch_take(io, fb, &r, left + 1);
+    CHECK_MSG(fb->n == (left + 1 + 3) / 4 || fb->n == FETCH_BATCH_MAX, "four workers: %zu taken of %zu", fb->n, left + 1);
+    /* nothing queued, or too few for a share of two: the request is read alone */
+    io->nfq = 0;
+    fetch_take(io, fb, &r, 1);
+    CHECK(fb->n == 0);
+    io->fq_allowed = 4;
+    fq_put(io, 7, KDB_FETCH_FULL, KDB_FETCH_PRIO_BACKGROUND, 1, "q.test.");
+    fetch_take(io, fb, &r, 2);
+    CHECK(fb->n == 0 && io->nfq == 1);
+    io->fq_allowed = 1;
+    fetch_take(io, fb, &r, 2);
+    CHECK(fb->n == 2 && io->nfq == 0);
+    /* what does not join: another view, another priority, a range, another kind, a summary, a name that is in the batch already (any capitalisation, with or without the dot) */
+    io->nfq = 0;
+    fq_put(io, 10, KDB_FETCH_FULL, KDB_FETCH_PRIO_BACKGROUND, 2, "v2.test.");
+    fq_put(io, 11, KDB_FETCH_FULL, KDB_FETCH_PRIO_QUERY, 1, "prio.test.");
+    fq_put(io, 12, KDB_FETCH_LOOKUP, KDB_FETCH_PRIO_BACKGROUND, 1, "look.test.");
+    fq_put(io, 13, KDB_FETCH_SUMMARY, KDB_FETCH_PRIO_BACKGROUND, 1, "sum.test.");
+    fq_put(io, 14, KDB_FETCH_FULL, KDB_FETCH_PRIO_BACKGROUND, 1, "Z0.TEST");
+    fq_put(io, 15, KDB_FETCH_FULL, KDB_FETCH_PRIO_BACKGROUND, 1, "rng.test.");
+    io->fq[io->nfq - 1].range = true;
+    fq_put(io, 16, KDB_FETCH_FULL, KDB_FETCH_PRIO_BACKGROUND, 1, "ok.test.");
+    io->fq_allowed = 1;
+    fetch_take(io, fb, &r, 8);
+    CHECK_MSG(fb->n == 2 && fb->rq[1].id == 16 && io->nfq == 6, "joined %zu, left %zu", fb->n, io->nfq);
+    /* a request that is no batch kind (a summary, a range) takes nothing */
+    r.mode = KDB_FETCH_SUMMARY;
+    fetch_take(io, fb, &r, 8);
+    CHECK(fb->n == 0);
+    r.mode = KDB_FETCH_FULL;
+    r.range = true;
+    fetch_take(io, fb, &r, 8);
+    CHECK(fb->n == 0);
+    r.range = false;
+    /* lookups: only lookups, and their candidate names (one for each label) fit one statement of DB_LOOKUP_MAX names */
+    io->nfq = 0;
+    r.mode = KDB_FETCH_LOOKUP_FULL;
+    snprintf(r.zone, sizeof(r.zone), "www.example.test.");
+    fq_put(io, 20, KDB_FETCH_FULL, KDB_FETCH_PRIO_BACKGROUND, 1, "body.test.");
+    fq_put(io, 21, KDB_FETCH_LOOKUP, KDB_FETCH_PRIO_BACKGROUND, 1, "mail.example.test.");
+    char longname[900] = "";
+    for (int i = 0; i < 61; i++) snprintf(longname + strlen(longname), sizeof(longname) - strlen(longname), "l%d.", i);
+    strcat(longname, "test.");                                              /* 62 labels: 62 candidates */
+    fq_put(io, 22, KDB_FETCH_LOOKUP, KDB_FETCH_PRIO_BACKGROUND, 1, longname);
+    fq_put(io, 23, KDB_FETCH_LOOKUP, KDB_FETCH_PRIO_BACKGROUND, 1, longname);   /* (the third batch member would be 3 + 3 + 62 + 62 > 128: it stays) */
+    fq_put(io, 24, KDB_FETCH_LOOKUP_FULL, KDB_FETCH_PRIO_BACKGROUND, 1, "x.example.test.");
+    io->fq_allowed = 1;
+    fetch_take(io, fb, &r, 6);
+    CHECK_MSG(fb->lookup && fb->n == 4 && fb->rq[1].id == 21 && fb->rq[2].id == 22 && fb->rq[3].id == 24 && io->nfq == 2, "lookups: %zu joined, %zu left", fb->n, io->nfq);
+    free(io);
+    free(fb);
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/db";
     snprintf(g_schema, sizeof(g_schema), "%s/pdns_schema.sqlite3.sql", dir);
@@ -4594,6 +4893,8 @@ int main(int argc, char **argv) {
     test_lookup();
     test_scan_in();
     test_find_zones_classes();
+    test_fetch_batch();
+    test_fetch_take();
     test_manifest_rate();
     test_schema_versions();
     test_audit_actor();
