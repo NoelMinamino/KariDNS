@@ -9,6 +9,8 @@
 #      the stream thread of the Backend is not kept long by a frame: store.ingest.stream_max_us is at most FIRSTSTART_STREAM_US (default 250000, a generous bound: a loaded VM stalls a thread for tens of ms,
 #      and the bound only shows that the thread is not busy for a pass; that no page is decoded or recorded there is shown by the counters, store.recon.thread_entries and pages, and by tests/test_db_store.c)
 #      and the loop of the ingest thread is reported (store.ingest.loop_max_us, it also has the bodies of the fill: the zones the fill reads are built on that thread);
+#      0.7 fix A: no store I/O is waited for inside the store's writer mutex or the mutex of the writers of the records: the longest hold of each (store.lock.writer_hold_max_us,
+#      store.lock.records_hold_max_us) is at most FIRSTSTART_HOLD_US (default 500000: a generous bound for a loaded VM; at 10M zones the holds were seconds before the fix);
 #   2. kill -9 the server in the middle of a pass (the loader is behind tests/db/slow_manifest.c with -DPACE_US, which sends the pages of the pass one at a time): the server is started again on the same
 #      store, the pass is made again, and the store ends with every zone and a log with no message of a rebuild or a repair of the tables, and the zones answer (that a group record is there whole or not at all
 #      is shown by tests/test_store.c, the kill loop with groups, not here: this only sees that the server comes up and fills the store again);
@@ -40,6 +42,7 @@ NZ=${FIRSTSTART_ZONES:-30000}
 NQ=${FIRSTSTART_QUERIES:-5000}
 KZ=${FIRSTSTART_KILL_ZONES:-60000}
 STREAM_US=${FIRSTSTART_STREAM_US:-250000}
+HOLD_US=${FIRSTSTART_HOLD_US:-500000}
 [ "$NQ" -gt "$NZ" ] && NQ=$NZ
 T=$(mktemp -d "${TMPDIR:-/tmp}/karidns_firststart.XXXXXX") || exit 1
 chmod 755 "$T"
@@ -121,6 +124,8 @@ GE=$(sf store.recon.group_entries); GR=$(sf store.recon.group_records)
 [ "${GE:-0}" -ge "$NZ" ] 2>/dev/null && [ "${GR:-0}" -ge $((NZ / 64)) ] 2>/dev/null && [ "${GR:-0}" -le $((NZ / 64 + NZ / 200 + 10)) ] 2>/dev/null && pass "the entries were recorded in groups: $GE entries in $GR journal records (64 an entry at most)" || fail "group_entries=$GE group_records=$GR"
 SM=$(sf store.ingest.stream_max_us); LM=$(sf store.ingest.loop_max_us)
 [ -n "$SM" ] && [ "$SM" -le "$STREAM_US" ] 2>/dev/null && pass "the stream thread was not kept more than ${STREAM_US} us by a frame (store.ingest.stream_max_us=$SM; the loop of the thread: store.ingest.loop_max_us=$LM)" || fail "store.ingest.stream_max_us=$SM (limit $STREAM_US), loop_max_us=$LM"
+WH=$(sf store.lock.writer_hold_max_us); RH=$(sf store.lock.records_hold_max_us); RW=$(sf store.lock.records_wait_max_us)
+[ -n "$WH" ] && [ -n "$RH" ] && [ "$WH" -le "$HOLD_US" ] 2>/dev/null && [ "$RH" -le "$HOLD_US" ] 2>/dev/null && pass "no lock was held more than ${HOLD_US} us (store.lock.writer_hold_max_us=$WH, records_hold_max_us=$RH, records_wait_max_us=$RW, writer holds of 1 ms or more $(sf store.lock.writer_holds_slow))" || fail "store.lock.writer_hold_max_us=$WH records_hold_max_us=$RH (limit $HOLD_US)"
 DR=0
 for k in store.lookup.drop.room store.lookup.drop.timeout store.lookup.drop.queue store.lookup.servfail store.lookup.shed store.lookup.expired; do
     v=$(sf "$k"); DR=$((DR + ${v:-0}))
