@@ -2218,6 +2218,9 @@ static void test_growth_sync_fails(void) {
       if (rc != 0) break;
       n++;
     }
+    /* a growth of the index that a put started is built on a thread of its own (no flusher does not stop that) and may put its generation in after the last put: wait for it, or the
+     * generation read here is older than the one its journal record names (store_reserve() waits for a build that runs, and with 0 zones does nothing else) */
+    if (store_reserve(c, 0) != 0) _exit(4);
     store_stats_t st;
     store_stats(c, &st);
     uint64_t out[6] = { (uint64_t)(int64_t)rc, st.ix_gen, st.zones_stored, n, st.write_errors, st.growths };
