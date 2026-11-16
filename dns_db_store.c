@@ -266,6 +266,7 @@ static struct {
   _Atomic uint64_t hot_listed, hot_attached, hot_skipped, hot_written;
   uint32_t *hot_ids;                    /* the list that was read at the start (freed when the thread ends) */
   size_t hot_n;
+  _Atomic uint64_t att_served;          /* the requests of the queries that the store threads have taken in hand (their image read): the list gives way only while this moves (hot_defer()) */
   _Atomic int64_t last_err_log_ns;
 } G = { .wlock = PTHREAD_MUTEX_INITIALIZER, .wcv = PTHREAD_COND_INITIALIZER, .akq = -1 };
 
@@ -974,6 +975,8 @@ _Atomic bool db_store_test_adopt_noview;                  /* the registration of
 void (*_Atomic db_store_test_batch_hook)(dbdir_rec_t *rec);   /* called for the record of every job of a batch of attaches just before the batch is registered (tests: change the record, as a writer of the store would) */
 _Atomic bool db_store_test_hot_pending;                    /* the threads of hot.list see attach requests of queries that wait (tests: they are never starved by them) */
 void (*_Atomic db_store_test_hot_hook)(uint32_t zid);     /* called by the threads of hot.list before each zone (tests: the order, and time) */
+_Atomic bool db_store_test_hot_stuck;                      /* the threads of hot.list see attach requests that wait and are not served (tests: the list gives way once, not for the whole time) */
+_Atomic uint64_t db_store_test_hot_naps;                   /* the naps the threads of hot.list took for the queries (tests) */
 #define STG_CAP 16384u
 #define STG_PROBE 8u
 static _Atomic(zdir_elem_t *) g_stg[STG_CAP];
@@ -2233,6 +2236,7 @@ static bool attach_drain(att_job_t *jobs, dbreg_att_item_t *ri) {
         n = 0;
       }
     }
+    atomic_fetch_add_explicit(&G.att_served, 1, memory_order_relaxed);     /* (the request is in hand: its image is read, which is where a store thread waits when the cache is cold) */
   }
   if (n) (void)attach_batch_run(jobs, n, ri);
   return any;
@@ -2272,7 +2276,7 @@ static void *attach_thread(void *arg) {
 /* 0.7 fix 8: hot.list                                                                                            */
 /* ------------------------------------------------------------------------------------------------------------- */
 
-/* At a clean stop the zones that are in memory are written to hot.list of the store (the ids, the most used first, at most STORE_HOT_MAX); the next start reads it and threads of their own attach the
+/* At a clean stop the zones that are in memory and have answered a query since they came are written to hot.list of the store (the ids, the most used first, at most STORE_HOT_MAX and what memory-limit can hold); the next start reads it and threads of their own attach the
  * zones in that order, in the background, while the queries are served: a restart with the page cache of the old run kept answers from memory almost at once, and one with a cold page cache reads the
  * images the queries are going to want in the order they are going to want them.  0.7 M4: there are several threads (three quarters of the store threads, at most six) with no rate cap, and they give the
  * queries only a moment (hot_defer()): a restart on ZFS (COPY mode, where a worker cannot attach a zone itself) has its first second of queries for the hottest zones, and one thread that waited while any
@@ -2288,6 +2292,7 @@ static int hot_cmp(const void *a, const void *b) {         /* the highest score 
 static void hot_write(store_t *st) {
   size_t cap = dir_attach_count() + 4096;
   if (cap > STORE_HOT_MAX) cap = STORE_HOT_MAX;
+  if (dbreg_cache_limit() && cap > dbreg_cache_limit() / 1024) cap = (size_t)(dbreg_cache_limit() / 1024);        /* (what memory-limit can hold, at a kilobyte a zone at the least: the bound the start puts on the list) */
   uint64_t *sc = malloc(cap * sizeof(*sc));
   uint32_t *ids = malloc(cap * sizeof(*ids));
   if (!sc || !ids) {
@@ -2375,11 +2380,19 @@ static void hot_finish(void) {
 /* The queries come first, but the list is never starved by them (the starvation of 0.6.2: it waited for as long as any request waited, and in the rush of first queries after a restart one always did):
  * before a batch a thread gives the requests that wait up to HOT_YIELD_US, in naps, and then goes on whether they have been taken or not.  Measured at 10 million zones on ZFS, restart with the cache
  * warm, 400,000 queries a second from the start: six threads without the nap reach the steady rate in 4 s and 4.8 % of the queries that wait for a store thread wait more than 16 ms; with it 0.5 %. */
-static bool hot_requests_wait(void) { return atomic_load_explicit(&db_store_test_hot_pending, memory_order_relaxed) || park_attach_pending(); }
+static bool hot_requests_wait(void) { return atomic_load_explicit(&db_store_test_hot_pending, memory_order_relaxed) || atomic_load_explicit(&db_store_test_hot_stuck, memory_order_relaxed) || park_attach_pending(); }
+/* 0.7 fix D: the list gives way only while the requests are being served (G.att_served moves: a store thread took one in hand during the nap).  Where the requests wait because the store threads wait for
+ * the disk (a restart on ZFS with a cold ARC: every image is a read of the pool), a nap of the list does not help one of them: it takes the list's own reads, which warm the same ARC, off the pool for as long
+ * as the naps last, and with every batch of 32 zones napping for the whole 0.4 ms the rate of the list fell from 90,000 to 9,000 zones a second (measured on the build host: two stable rates, with the same store). */
 static void hot_defer(void) {
+  uint64_t seen = atomic_load_explicit(&G.att_served, memory_order_relaxed);
   for (int w = 0; w < HOT_YIELD_US && hot_requests_wait(); w += HOT_NAP_US) {
     struct timespec nap = { 0, HOT_NAP_US * 1000L };
+    atomic_fetch_add_explicit(&db_store_test_hot_naps, 1, memory_order_relaxed);
     nanosleep(&nap, NULL);
+    const uint64_t now = atomic_load_explicit(&G.att_served, memory_order_relaxed);
+    if (now == seen && !atomic_load_explicit(&db_store_test_hot_pending, memory_order_relaxed)) break;    /* (nothing was served meanwhile: the requests wait for the disk, not for a thread) */
+    seen = now;
   }
 }
 

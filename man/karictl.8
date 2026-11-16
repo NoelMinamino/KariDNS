@@ -910,9 +910,11 @@ buckets (<= 1 us, <= 2 us, ... in the JSON and \fB\-k\fR forms)
 and the ones it skipped (in memory already, not stored, or that could not be
 attached); the ids written at the last stop (this run); the threads of the list
 (three quarters of the store threads, at most six; they give the attach requests
-of waiting queries at most 0.4 ms before each batch of 32 zones) and the zones a
-second they attached, from the start of the list to now (to its end once it has
-ended)
+of waiting queries at most 0.4 ms before each batch of 32 zones, and only while
+the store threads are taking requests in hand) and the zones a second they
+attached, from the start of the list to now (to its end once it has ended); the
+ids written at the stop are the zones that have answered a query since they came
+into memory
 .TP 8
 \fBstore.compact.runs\fR, \fB.moved_records\fR, \fB.moved_bytes\fR, \fB.segments_freed\fR, \fB.last_unix\fR
 The cleaner (since the open): segments it began to clean, records and bytes it

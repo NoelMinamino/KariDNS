@@ -5630,7 +5630,8 @@ static void room_take_pass(const cache_cand_t *cand, size_t nc, bool relaxed, ui
 
 /* 0.7 fix 8, hot.list: the zones in the attach table (at most `cap`), each as score << 32 | zone id, where the score is what the cache manager's frequency of the zone is now (aged to the time of this call,
  * with the queries the zone has answered since the manager folded them in), so that a sort puts the most used first.  The registry lock is held for the walk (a zone is seen once, as the sampler sees it);
- * no counter or flag of an element is changed.  Returns how many were collected. */
+ * no counter or flag of an element is changed.  Only the zones that have answered a query since they came into memory are collected (0.7 fix D): a restart that attached every zone the fill had made resident
+ * (1.1 million random zones of 10 million at the first start) read them all again for a list that was meant to be the working set.  Returns how many were collected. */
 size_t dbreg_hot_collect(uint64_t *out, size_t cap) {
     const dbdir_ops_t *ops = dbdir();
     if (!ops || !out) return 0;
@@ -5641,6 +5642,7 @@ size_t dbreg_hot_collect(uint64_t *out, size_t cap) {
     for (zdir_elem_t *z; n < cap && (z = ops->attach_next(&pos)) != NULL;) {
         zone_db_entry_t *e = zdir_entry(z);
         if (!e || e->source != ZONE_SRC_DB || !(z->kind & ZDIR_K_STORED)) continue;
+        if (zone_queries32(e) == 0) continue;                  /* 0.7 fix D: a zone that no query has been answered from since it came into memory is there because the fill, the list or a sibling brought it, not because it is asked for */
         uint32_t f = atomic_load_explicit(&z->freq, memory_order_relaxed);
         const uint32_t steps = (now32 - z->t_age) / CACHE_AGE_MS;
         f = steps >= 32 ? 0 : f >> steps;

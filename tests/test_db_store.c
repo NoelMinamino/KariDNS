@@ -2282,7 +2282,7 @@ static int run_mode(const char *mode) {
     free(old_copy);
     gc_snapshot_wait_idle();                                                 /* (the reclaim thread that the last delta started: joined, not left to the exit) */
     /* -- 0.7 fix 8: the zones that are in memory when the server stops are written to hot.list, the most used first: wq5 is asked for most, wq2 next */
-    uint32_t hot_zid5 = STORE_NONE, hot_zid2 = STORE_NONE;
+    uint32_t hot_zid5 = STORE_NONE, hot_zid2 = STORE_NONE, hot_zid3 = STORE_NONE;
     size_t hot_attached = 0;
     {
         uint8_t out[1232];
@@ -2296,8 +2296,18 @@ static int run_mode(const char *mode) {
         hot_zid5 = zq.zid;
         CHECK(zref_of("wq2.test.", &zq) && zq.entry);
         hot_zid2 = zq.zid;
-        hot_attached = dbdir()->attach_count();
-        CHECK(hot_attached >= NZ);
+        /* 0.7 fix D: only the zones that have answered a query since they came into memory are on the list: wq3 is made resident again by an attach that nobody asked for (a fresh entry with no query) */
+        if (in_memory("wq3.test.")) CHECK(evict_zone("wq3.test."));
+        db_store_attach_zone("default", "wq3.test.");
+        CHECK(zref_of("wq3.test.", &zq) && zq.entry && zone_queries32(zq.entry) == 0);
+        hot_zid3 = zq.zid;
+        const size_t resident = dbdir()->attach_count();
+        size_t pos = 0;
+        for (zdir_elem_t *z; (z = dbdir()->attach_next(&pos)) != NULL;) {
+            zone_db_entry_t *ze = zdir_entry(z);
+            if (ze && ze->source == ZONE_SRC_DB && (z->kind & ZDIR_K_STORED) && zone_queries32(ze) > 0) hot_attached++;
+        }
+        CHECK(hot_attached >= 2 && hot_attached < resident);                     /* (wq5 and wq2 are asked for, wq3 is resident and is not) */
     }
     db_store_stop();
     /* -- a stop is a clean stop: the next open says so, replays nothing and (after a reboot) does not rebuild */
@@ -2315,7 +2325,10 @@ static int run_mode(const char *mode) {
             CHECK(ss2.zones_stored >= NZ - 1);
             uint32_t *hids = NULL;
             size_t hn = 0;
-            CHECK(store_hot_read(s2, &hids, &hn) == 0 && hn == hot_attached && hids);        /* (every zone that was in memory, once) */
+            CHECK(store_hot_read(s2, &hids, &hn) == 0 && hn == hot_attached && hids);        /* (every zone that was asked for, once) */
+            bool has3 = false;
+            for (size_t i = 0; hids && i < hn; i++) has3 = has3 || hids[i] == hot_zid3;
+            CHECK(!has3);                                                                    /* (and not the one that only an attach made resident) */
             CHECK(hids && hn >= 2 && hids[0] == hot_zid5 && hids[1] == hot_zid2);              /* (the most asked for first) */
             bool dup = false;
             for (size_t i = 0; hids && i < hn; i++)
@@ -2332,7 +2345,7 @@ static int run_mode(const char *mode) {
     db_store_frontend_close();                                                  /* (the directory and its lock are the next process's) */
     char cmd[700];
     if (strcmp(mode, "map") == 0 && g_self[0]) {                             /* the next start (a process of its own): hot.list is read and attached in the background */
-        for (int ph = 0; ph < 4; ph++) {
+        for (int ph = 0; ph < 5; ph++) {
             snprintf(cmd, sizeof(cmd), "%s hot %s %d", g_self, dir, ph);
             CHECK(system(cmd) == 0);
         }
@@ -2697,7 +2710,7 @@ static void hot_order_hook(uint32_t zid) {
 
 extern void (*db_ingest_test_fetch_req_hook)(const char *zone);
 static int run_hot(const char *dir, int phase) {
-    printf("[hot.list: the next start, store-hot-list %s%s]\n", phase != 1 ? "yes" : "no", phase == 2 ? ", six threads of the list, and attach requests that always wait" : phase == 3 ? ", the high mark of memory-limit" : "");
+    printf("[hot.list: the next start, store-hot-list %s%s]\n", phase != 1 ? "yes" : "no", phase == 2 ? ", six threads of the list, and attach requests that always wait" : phase == 3 ? ", the high mark of memory-limit" : phase == 4 ? ", six threads of the list, and attach requests that wait and are not served" : "");
     char sdir[600];
     snprintf(sdir, sizeof(sdir), "%s/s", dir);
     static server_config_t cfg;
@@ -2779,6 +2792,8 @@ static int run_hot(const char *dir, int phase) {
         atomic_store(&g_hot_nseen, 0);
         atomic_store(&g_hot_limit_at, phase == 3 ? (int)(nwant / 4) : 0);
         atomic_store(&db_store_test_hot_pending, phase == 2);                          /* (phase 2: a query always waits for a store thread: the list gives it a moment before each batch and is not starved) */
+        atomic_store(&db_store_test_hot_stuck, phase == 4);                            /* (phase 4: it waits and nothing is served: the list gives way once, then goes on) */
+        atomic_store(&db_store_test_hot_naps, 0);
         const uint64_t grows0 = dbdir()->counters(6);
         db_store_test_hot_hook = hot_order_hook;
         db_store_hot_start();
@@ -2817,7 +2832,11 @@ static int run_hot(const char *dir, int phase) {
             free(seen_b);
             CHECK(first_ok);
         }
-        if (phase == 2) {
+        const uint64_t naps = atomic_load(&db_store_test_hot_naps);
+        const uint64_t nbatches = (nwant + 31) / 32;
+        if (phase == 2) CHECK(naps >= 8 * nbatches);                                            /* (the whole moment, HOT_YIELD_US in naps of HOT_NAP_US, before every batch) */
+        if (phase == 4) CHECK(naps >= nbatches && naps <= nbatches + 6);                        /* (one nap before every batch, and one for the thread that finds the end: nothing was served) */
+        if (phase == 2 || phase == 4) {
             CHECK(c.hot_state == 2 && nseen == (int)nwant);                                      /* (2: done; every zone of the list was looked at once) */
             CHECK(c.hot_attached + c.hot_skipped == nwant && c.hot_attached >= nwant - 8 && c.hot_per_s > 0);
             CHECK(dbdir()->attach_count() + 8 >= nwant);                         /* (the list is every stored zone: a few of them are shadowed by the configuration and are registered but not in the table) */
@@ -2831,6 +2850,7 @@ static int run_hot(const char *dir, int phase) {
             CHECK(c.hot_attached < nwant && dbdir()->attach_count() < nwant);
         }
         atomic_store(&db_store_test_hot_pending, false);
+        atomic_store(&db_store_test_hot_stuck, false);
         db_store_test_hot_hook = NULL;
         db_store_stop();
         free(want);
@@ -2881,7 +2901,7 @@ static int run_hot(const char *dir, int phase) {
     db_store_test_hot_hook = NULL;
     db_store_stop();
     db_store_counters(&c);
-    CHECK(c.hot_written == in_mem);
+    CHECK(c.hot_written == 2 && in_mem + 8 >= nwant);                                 /* (0.7 fix D: the two zones that a query was answered from, the one at the end of the list and wq5; the ones the list attached have none) */
     free(want);
     printf("%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
