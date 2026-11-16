@@ -1111,6 +1111,8 @@ static void test_superblock_damage(void) {
   if (pid == 0) {
     store_t *c = NULL;
     if (store_open(d.fd, &o, &c) != 0) _exit(3);
+    /* (no growth and no checkpoint after the puts: the index is made big enough and the checkpoint the growth asks for is made first, so the last record is the last one of the newest journal) */
+    if (store_reserve(c, 2000) != 0 || store_checkpoint(c) != 0) _exit(5);
     for (uint32_t i = 450; i < 700; i++) if (put_i(c, 0, i, 1, NULL) != 0) _exit(4);
     _exit(0);                                                            /* no close, no commit */
   }
@@ -4462,7 +4464,7 @@ static void test_group_commit(int mode) {
   store_stats(a, &sa);
   store_stats(b, &sb);
   CHECK(sb.group_records > 0 && sb.group_records < sb.group_entries && sb.group_entries >= ok_n);
-  CHECK(sb.lsn < sa.lsn / 4 && sb.journal_bytes < sa.journal_bytes);              /* (a record a group, not one an entry) */
+  CHECK(sb.lsn < sa.lsn / 4);                                                      /* (a record a group, not one an entry; the sizes of the current journal files do not compare: a checkpoint after a growth cuts them when it is due) */
   printf("  journal: %" PRIu64 " records / %" PRIu64 " bytes for the group, %" PRIu64 " / %" PRIu64 " one entry at a time (%" PRIu64 " group records for %" PRIu64 " entries)\n",
          sb.lsn, sb.journal_bytes, sa.lsn, sa.journal_bytes, sb.group_records, sb.group_entries);
   /* the group store, closed and opened again, is the same tables */
