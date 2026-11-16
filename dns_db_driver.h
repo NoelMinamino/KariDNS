@@ -356,7 +356,9 @@ typedef struct db_driver {
      * DB_IN_MAX, ascending domain ids) in one statement per table, with the order of the bulk scan: records and metadata ORDER BY
      * domain_id, id; scan_ext as scan_ext(NULL) but only for these domains.  For a driver where a statement costs a network round trip
      * (PostgreSQL: a cursor is DECLARE, FETCH and CLOSE, and a zone needs about fifteen statements), so that a reload of a few thousand
-     * zones does not pay fifteen round trips for each.  Same return values and callbacks as the single-zone calls. */
+     * zones does not pay fifteen round trips for each; and, since 0.7, for SQLite3, where a statement costs no round trip but the CPU of a
+     * reset, a bind and a step (about a dozen for every zone a fetch worker read on its own): a batch of fetch requests reads its zones with them.
+     * Same return values and callbacks as the single-zone calls. */
     int (*scan_records_in)(db_conn_t *c, const int64_t *ids, size_t n, db_record_cb cb, void *ud);
     int (*scan_metadata_in)(db_conn_t *c, const int64_t *ids, size_t n, db_meta_cb cb, void *ud);
     int (*scan_ext_in)(db_conn_t *c, const int64_t *ids, size_t n, const db_ext_sink_t *sink);

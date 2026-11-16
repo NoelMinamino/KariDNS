@@ -257,6 +257,7 @@ typedef struct {
     int64_t g_source;                 /* ... with this source id, serial and digest (copied from the inventory by plan_diff(), */
     uint32_t g_serial;                /* so that the conversion threads never read the inventory) */
     uint8_t g_digest[KDB_DIGEST_LEN];
+    uint32_t bidx;                    /* a batch of fetch requests (x->fb): the request this zone answers, 1-based (0 = none: the request of x->fetch_req) */
 } zinfo_t;
 typedef struct { int64_t domain_id; char *kind; char *content; } meta_t;
 typedef struct { meta_t *v; size_t n, cap; bool oom; } mset_t;
@@ -524,6 +525,7 @@ typedef struct {
     uint64_t pos_m;
     uint64_t fetch_req;
     int64_t fetch_source_id;          /* 0.7 WP7a: the domains.id the Backend asked for (FETCH_REQ tag 8), 0 = any */
+    struct fbatch *fb;                /* 0.7: several queued requests read together (fetch_batch()); NULL = one request, as fetch_one() */
     bool store_proto, store_full;     /* 0.7 WP7a: the store protocol is on for this load; a full pass was asked for (reload -force) */
     struct {                          /* the pass / drain being sent (st_* functions) */
         bool msg_open, fail, sent_changes;
@@ -609,6 +611,21 @@ typedef struct { uint64_t id; uint16_t view; bool force; char zone[DNS_NAME_TEXT
 /* D1a: a FETCH_REQ waiting for the fetch thread (priority 0 = a parked query waits, 1 = warm-up, 2 = background) */
 typedef struct { uint64_t id; uint16_t view; uint8_t prio, mode; bool range; int64_t source_id; int64_t at; char zone[DNS_NAME_TEXT_SIZE]; } freq_t;   /* at: CLOCK_MONOTONIC ms of the enqueue */
 #define FQ_MAX 256                           /* more than this is answered "busy" (design 6.1) */
+/* 0.7: a fetch worker that finds several requests of the same kind queued reads them together (fetch_batch()): one snapshot, one statement per table for
+ * the zones instead of about a dozen statements for every one.  The most requests of one batch (bodies and lookups); at most FB_MAX. */
+#define FB_MAX 64
+#ifndef FETCH_BATCH_MAX
+#define FETCH_BATCH_MAX 16
+#endif
+struct fbatch {
+    size_t n;
+    bool lookup;                              /* the requests are lookups of names (modes KDB_FETCH_LOOKUP, _LOOKUP_FULL); else bodies of zones (KDB_FETCH_FULL) */
+    freq_t rq[FB_MAX];
+    bool done[FB_MAX];                        /* the request has its answer: a zone (or its ZONE_FAILED), a LOOKUP_RESULT */
+    bool lk_found[FB_MAX];                    /* lookups: the zone that was found (its id and canonical name), for the body that follows a KDB_FETCH_LOOKUP_FULL */
+    int64_t lk_id[FB_MAX];
+    char lk_name[FB_MAX][DNS_NAME_TEXT_SIZE];
+};
 /* A request that has waited this long in fq goes before the priorities (the oldest first): a Backend query that joined a request in flight (the background
  * fetch of a zone) would otherwise wait for it behind every later priority 0 request, for as long as those keep coming, and run into the park time-out.
  * KARIDNS_FETCH_AGING_MS in the environment replaces it (a test switch: the supervisor starts the loader with a cleared environment). */
@@ -1294,6 +1311,11 @@ static bool zone_has_keys(const ctx_t *x, int64_t id) {
 /* one zone                                                                                                       */
 /* ------------------------------------------------------------------------------------------------------------- */
 
+/* The request id a message about this zone carries: in a batch of fetch requests (x->fb) the request the zone answers, else the one request of the fetch. */
+static uint64_t zreq(const ctx_t *x, const zinfo_t *zi) {
+    return x->fb && zi->bidx ? x->fb->rq[zi->bidx - 1].id : x->fetch_req;
+}
+
 /* The ZONE_FAILED of a zone the loader cannot give the Backend (the Backend refuses any name but the canonical one: a
  * name that cannot be written as one is only reported on stderr / syslog). */
 static int send_failed(ctx_t *x, const zinfo_t *zi, const char *reason) {
@@ -1314,7 +1336,7 @@ static int send_failed(ctx_t *x, const zinfo_t *zi, const char *reason) {
     clean_reason(reason, why, sizeof(why));
     if (kdb_enc_begin(&x->enc, KDB_T_ZONE_FAILED) != 0 || kdb_enc_u16(&x->enc, 1, x->view) != 0 ||
         kdb_enc_name(&x->enc, 2, name) != 0 || kdb_enc_i64(&x->enc, 3, zi->id) != 0 || kdb_enc_str(&x->enc, 4, why) != 0 ||
-        (x->fetch && kdb_enc_u64(&x->enc, 5, x->fetch_req) != 0) || kdb_enc_end(&x->enc) != 0)
+        (x->fetch && kdb_enc_u64(&x->enc, 5, zreq(x, zi)) != 0) || kdb_enc_end(&x->enc) != 0)
         return -1;
     fw_lock(x);
     int rc = send_enc(x);
@@ -1708,7 +1730,7 @@ static void convert_zone(wk_t *w, const zinfo_t *zi) {
             memset(&g, 0, sizeof(g));
             g.x = x;
             g.zi = zi;
-            pdns_kdb_params_t p = { x->view, zi->id, KDB_ZK_PRIMARY, NULL, gate_cb, &g, pf ? pf->text : NULL, x->fetch ? x->fetch_req : 0 };
+            pdns_kdb_params_t p = { x->view, zi->id, KDB_ZK_PRIMARY, NULL, gate_cb, &g, pf ? pf->text : NULL, x->fetch ? zreq(x, zi) : 0 };
             char msg[PDNS_ERR_LEN + 100];
             int er = pdns_zone_encode_kdb(z, &p, zres_emit, r, msg, sizeof(msg));
             if (er == 0) {
@@ -1758,8 +1780,12 @@ static int commit_zone(ctx_t *x, const zinfo_t *zi, zres_t *r) {
             lgd(2, "zone '%s' (domains.id %lld): not sent, the Backend has this version (same digest)", shown, (long long)zi->id);
         }
         return 0;
-    case ZR_FAILED:
-        return send_failed(x, zi, r->reason);
+    case ZR_FAILED: {
+        const uint32_t unwritten = x->n_unwritten;
+        int rc = send_failed(x, zi, r->reason);
+        if (rc == 0 && x->n_unwritten == unwritten && x->fb && zi->bidx) x->fb->done[zi->bidx - 1] = true;      /* (the ZONE_FAILED is the answer of that request of a batch) */
+        return rc;
+    }
     default:                                   /* ZR_SENT */
         fw_lock(x);                            /* (D1a: the profile and the zone go out together) */
         if ((r->profile[0] && send_profile_for(x, r->profile) != 0) || emit_file(x, r->buf, r->len) != 0) {       /* B7a: the profile text comes first */
@@ -1768,6 +1794,7 @@ static int commit_zone(ctx_t *x, const zinfo_t *zi, zres_t *r) {
         }
         fw_unlock(x);
         x->n_zones++;
+        if (x->fb && zi->bidx) x->fb->done[zi->bidx - 1] = true;      /* (the zone is the answer of that request of a batch) */
         if (atomic_load_explicit(&g_debug, memory_order_relaxed) >= 2) {      /* 0.7 M3: what went to the Backend */
             char shown[210];
             clean_reason(zi->name ? zi->name : "(NULL)", shown, sizeof(shown));
@@ -3992,19 +4019,22 @@ static int lookup_mapped(ctx_t *x, const db_schema_info_t *si, int64_t id, bool 
     return 0;
 }
 
-static int lookup_run(ctx_t *x, const db_schema_info_t *si, const char *qname) {
-    const char *names[DB_LOOKUP_MAX];
+/* the candidates of a lookup: the query name, then every parent up to (not including) the root, at most `cap`; names[i] points into qname */
+static size_t lookup_names(const char *qname, const char **names, size_t cap) {
     size_t n = 0;
-    for (const char *p = qname; *p && !(p[0] == '.' && p[1] == '\0') && n < DB_LOOKUP_MAX;) {          /* (the name that starts at p: the query name, then every parent up to the root) */
+    for (const char *p = qname; *p && !(p[0] == '.' && p[1] == '\0') && n < cap;) {          /* (the name that starts at p) */
         names[n++] = p;
         const char *dot = strchr_unescaped(p, '.');
         if (!dot) break;
         p = dot + 1;
     }
-    if (n == 0) return lookup_send(x, NULL, 0, 0, false, 0, 0, false, 0);
-    x->only_name = NULL;                                    /* (zone_cb() keeps every row) */
-    int rc = x->drv->find_zones_in(x->conn, names, n, zone_cb, x);
-    if (rc != 0) return x->oom ? EXIT_ERROR : db_err(x, rc, "looking up the zone of a name");
+    return n;
+}
+
+/* the answer for qname from the zones in x->zones (what find_zones_in() gave for its candidates, the longest name first; more zones from other lookups of a batch do no harm: a zone
+ * that is not an ancestor of the name is skipped) */
+static int lookup_pick(ctx_t *x, const db_schema_info_t *si, const char *qname) {
+    int rc;
     for (size_t i = 0; i < x->nz; i++) {                      /* (the longest name first) */
         const zinfo_t *z = &x->zones[i];
         if (zone_type_reason(z->type) || !z->canon || !domain_name_is_at_or_below(qname, z->canon)) continue;        /* (a zone the pass does not offer, or a spelling that is no ancestor of the name: the next one) */
@@ -4025,6 +4055,101 @@ static int lookup_run(ctx_t *x, const db_schema_info_t *si, const char *qname) {
         return lookup_send(x, z->canon, z->id, zone_sec_kind(z->type), stamped, gen, at, !stamped && z->has_serial, z->serial);
     }
     return lookup_send(x, NULL, 0, 0, false, 0, 0, false, 0);
+}
+
+static int lookup_run(ctx_t *x, const db_schema_info_t *si, const char *qname) {
+    const char *names[DB_LOOKUP_MAX];
+    size_t n = lookup_names(qname, names, DB_LOOKUP_MAX);
+    if (n == 0) return lookup_send(x, NULL, 0, 0, false, 0, 0, false, 0);
+    x->only_name = NULL;                                    /* (zone_cb() keeps every row) */
+    int rc = x->drv->find_zones_in(x->conn, names, n, zone_cb, x);
+    if (rc != 0) return x->oom ? EXIT_ERROR : db_err(x, rc, "looking up the zone of a name");
+    return lookup_pick(x, si, qname);
+}
+
+/* 0.7: the lookups of a batch (x->fb, lookup): the candidates of all of them in ONE find_zones_in() (fetch_batch() took at most DB_LOOKUP_MAX names together), then the answer of each
+ * from the zones that came back, in the order of the requests.  A request that has its LOOKUP_RESULT is done; for one whose zone was found the zone is kept for the body that follows a
+ * KDB_FETCH_LOOKUP_FULL.  0, or an EXIT_* status (the requests that are not done are failed by the caller). */
+static int lookup_batch(ctx_t *x, const db_schema_info_t *si) {
+    struct fbatch *fb = x->fb;
+    const char *names[DB_LOOKUP_MAX];
+    size_t n = 0;
+    for (size_t i = 0; i < fb->n; i++) n += lookup_names(fb->rq[i].zone, names + n, DB_LOOKUP_MAX - n);
+    x->only_name = NULL;                                    /* (zone_cb() keeps every row) */
+    if (n > 0) {
+        int rc = x->drv->find_zones_in(x->conn, names, n, zone_cb, x);
+        if (rc != 0) return x->oom ? EXIT_ERROR : db_err(x, rc, "looking up the zone of a name");
+    }
+    for (size_t i = 0; i < fb->n; i++) {
+        x->fetch_req = fb->rq[i].id;
+        x->lk_found = false;
+        int rc = lookup_pick(x, si, fb->rq[i].zone);
+        if (rc != 0) return rc;
+        fb->done[i] = true;
+        fb->lk_found[i] = x->lk_found;
+        if (x->lk_found) {
+            fb->lk_id[i] = x->lk_id;
+            snprintf(fb->lk_name[i], sizeof(fb->lk_name[i]), "%s", x->lk_name);
+        }
+    }
+    return 0;
+}
+
+static int fetch_fail(ctx_t *x, const freq_t *r, const char *reason);
+static int cmp_zinfo_id(const void *a, const void *b) {
+    int64_t x = ((const zinfo_t *)a)->id, y = ((const zinfo_t *)b)->id;
+    return x < y ? -1 : x > y;
+}
+
+/* the zone of the batch's request i, or NULL */
+static zinfo_t *fb_zone_of(ctx_t *x, size_t i) {
+    for (size_t j = 0; j < x->nz; j++)
+        if (x->zones[j].name && names_equal(x->zones[j].name, x->fb->rq[i].zone)) return &x->zones[j];
+    return NULL;
+}
+
+/* 0.7: the bodies of a batch (x->fb, not lookup).  The zones of the requests come from ONE find_zones_in() (one find_zone() for a name it did not give back: the other capitalisation of PostgreSQL, a zone that is
+ * not there); every request is then checked as a single one is (the zone is there and mapped to the view, it is the domain id the Backend has), and the ones that cannot be read are answered with ZONE_FAILED
+ * here.  The zones that are left are in x->zones in ascending id order (the order the readers of several zones want), `want` and `bidx` set.  0, or an EXIT_* status. */
+static int fetch_resolve(ctx_t *x, const db_schema_info_t *si) {
+    struct fbatch *fb = x->fb;
+    const char *names[FB_MAX];
+    for (size_t i = 0; i < fb->n; i++) names[i] = fb->rq[i].zone;
+    x->only_name = NULL;                                    /* (zone_cb() keeps every row) */
+    int rc = x->drv->find_zones_in ? x->drv->find_zones_in(x->conn, names, fb->n, zone_cb, x) : 0;
+    if (rc != 0) return x->oom ? EXIT_ERROR : db_err(x, rc, "reading the zone list");
+    for (size_t i = 0; i < fb->n; i++) {
+        if (fb_zone_of(x, i)) continue;
+        const size_t before = x->nz;
+        x->only_name = fb->rq[i].zone;
+        rc = x->drv->find_zone(x->conn, fb->rq[i].zone, zone_cb, x);
+        x->only_name = NULL;
+        if (rc == DB_STOPPED && x->nz == before + 1 && !x->oom) rc = 0;     /* the one zone was found */
+        if (rc != 0) return x->oom ? EXIT_ERROR : db_err(x, rc, "reading the zone list");
+    }
+    qsort(x->zones, x->nz, sizeof(*x->zones), cmp_zinfo_id);
+    for (size_t i = 0; i < fb->n; i++) {
+        zinfo_t *z = fb_zone_of(x, i);
+        char why[300];
+        why[0] = '\0';
+        bool mapped = true;
+        if (z && (rc = lookup_mapped(x, si, z->id, &mapped)) != 0) return rc;
+        if (!z || !mapped || z->bidx)
+            snprintf(why, sizeof(why), "the zone is not in the database%s", x->map_view ? " (or not mapped to this view)" : "");
+        else if (fb->rq[i].source_id > 0 && z->id != fb->rq[i].source_id)
+            snprintf(why, sizeof(why), "the name is domain id %lld now, not %lld: the zone was renamed or created again", (long long)z->id, (long long)fb->rq[i].source_id);
+        if (why[0]) {
+            fb->done[i] = true;
+            if (fetch_fail(x, &fb->rq[i], why) != 0) {
+                x->io_error = true;
+                return EXIT_ERROR;
+            }
+            continue;
+        }
+        z->want = true;
+        z->bidx = (uint32_t)i + 1;
+    }
+    return 0;
 }
 
 static int run_view_once(ctx_t *x, const db_source_t *src, const char *only_zone, bool whole) {
@@ -4091,12 +4216,23 @@ static int run_view_once(ctx_t *x, const db_source_t *src, const char *only_zone
     /* the position of the change log in this snapshot, for the pool's workers to compare with (run_pool()); only a driver whose position is exact (SQLite3: the
      * highest seq; a PostgreSQL cursor is the xmin of the snapshot, which says nothing about commits in between) */
     x->pos_valid = x->nthreads > 1 && si.has_changes && x->drv->changes_max && !x->drv->changes_unsettled && x->drv->changes_max(x->conn, &x->pos_m) == 0;
+    if (x->fb && x->fb->lookup) {                         /* 0.7: several lookups of names, read together */
+        status = lookup_batch(x, &si);
+        goto out_snap;
+    }
     if (x->fetch && x->fetch_lookup) {                    /* 0.7: the zone that encloses a name, not a zone that is asked for by its name */
         status = lookup_run(x, &si, only_zone);
         goto out_snap;
     }
     /* B13: a one-zone request looks the zone up by name (index) instead of listing every zone of the source, so its cost does
      * not grow with the number of zones; a missing zone is the same empty result as before (nz == 0: a deletion in stream mode) */
+    if (x->fb) {                                          /* 0.7: the bodies of several requests, read together: their zones are found, checked and sorted by id here */
+        if ((rc = fetch_resolve(x, &si)) != 0) {
+            status = rc;
+            goto out_snap;
+        }
+        goto have_zones;
+    }
     rc = x->only_name && x->drv->find_zone ? x->drv->find_zone(x->conn, x->only_name, zone_cb, x) : x->drv->list_zones(x->conn, zone_cb, x);
     if (rc == DB_STOPPED && x->only_name && x->nz == 1 && !x->oom) rc = 0;     /* the one zone was found */
     if (rc != 0) {
@@ -4143,6 +4279,7 @@ static int run_view_once(ctx_t *x, const db_source_t *src, const char *only_zone
         }
         if (have_seq && new_seq > x->change_seq) x->change_seq = new_seq;   /* BATCH_BEGIN says how far the log was read */
     }
+have_zones:
     /* the zones to read, in zones[] order; the others (the diff says nothing happened to them) are only counted */
     x->wl = malloc((x->nz ? x->nz : 1) * sizeof(*x->wl));
     if (!x->wl) {
@@ -4159,6 +4296,7 @@ static int run_view_once(ctx_t *x, const db_source_t *src, const char *only_zone
         bool bulk = !only_zone;
         if (x->io && only_zone == NULL)
             bulk = n_want > 0 && (uint64_t)n_want * 100 >= (uint64_t)x->nz * (uint64_t)(x->bulk_threshold >= 0 ? x->bulk_threshold : 25);
+        if (x->fb) bulk = false;                          /* (a batch reads the zones it asked for, never the table) */
         if ((rc = x->drv->zones_with_keys(x->conn, key_cb, x)) != 0) {
             status = x->oom ? EXIT_ERROR : db_err(x, rc, "reading metadata");
             if (x->oom) lg(LOG_ERR, "out of memory");
@@ -5344,17 +5482,9 @@ static int fetch_fail(ctx_t *x, const freq_t *r, const char *reason) {
     return rc;
 }
 
-/* one request.  0, or -1 when the stream is gone / the loader is told to stop / out of memory */
-static int fetch_one(ctx_t *x, const lcfg_t *lc, const freq_t *r) {
-    const db_driver_t *drv = lc->driver[0] ? driver_find(lc->driver) : NULL;
-    const lview_t *v = NULL;
-    for (size_t i = 0; i < lc->nviews; i++)
-        if (lc->views[i].index == r->view) v = &lc->views[i];
-    if (r->range) return fetch_fail(x, r, "this loader does not read a range of a zone");
-    if (!drv) return fetch_fail(x, r, "the loader has no usable configuration yet");
-    if (!v) return fetch_fail(x, r, "the view is not in the configuration");
+/* what a fetch worker's ctx_t needs to read for request r on view v with driver drv (fetch_one(), fetch_batch()) */
+static void fetch_setup(ctx_t *x, const lcfg_t *lc, const db_driver_t *drv, const lview_t *v, const freq_t *r) {
     const bool is_lookup = r->mode == KDB_FETCH_LOOKUP || r->mode == KDB_FETCH_LOOKUP_FULL;
-    if (is_lookup && (!drv->find_zones_in || !lc->store_proto || !drv->manifest_page)) return fetch_fail(x, r, "this loader cannot look up the zone of a name with this driver or without the store protocol");
     x->fetch_req = r->id;
     x->fetch_vname = lc->store_proto ? NULL : v->name;     /* (the store protocol keeps no inventory for the fetch thread to tell) */
     x->fetch_source_id = r->source_id;
@@ -5376,6 +5506,97 @@ static int fetch_one(ctx_t *x, const lcfg_t *lc, const freq_t *r) {
     x->opts.max_records = v->max_records;
     x->opts.max_zone_bytes = v->max_bytes;
     x->map_view = v->shared ? v->name : NULL;
+}
+
+static void fetch_teardown(ctx_t *x) {
+    ctx_view_reset(x);
+    x->map_view = NULL;
+    x->fetch_vname = NULL;
+    x->fetch_source_id = 0;
+    x->fetch_lookup = false;
+    x->lk_full = false;
+    x->lk_found = false;
+    x->fb = NULL;
+}
+
+/* 0.7: several queued requests of one view and one kind (all bodies, or all lookups; fb->rq[0..n)) read together: one snapshot, one find_zones_in() for the zones (the names of the lookups), one statement per
+ * table for the bodies, and the keys and profiles once, instead of a dozen statements and a snapshot for every request (the statements were a third of the loader's CPU for a zone).  Every request gets
+ * its answer as it would from fetch_one(): the zone (ZONE_BEGIN .. ZONE_END), ZONE_FAILED, or LOOKUP_RESULT (and for KDB_FETCH_LOOKUP_FULL the body of the zone that was found, read as a batch of bodies with the same request ids).
+ * 0, or -1 when the stream is gone / the loader is told to stop / out of memory. */
+static int fetch_batch(ctx_t *x, const lcfg_t *lc, struct fbatch *fb) {
+    const db_driver_t *drv = lc->driver[0] ? driver_find(lc->driver) : NULL;
+    const lview_t *v = NULL;
+    for (size_t i = 0; i < lc->nviews; i++)
+        if (lc->views[i].index == fb->rq[0].view) v = &lc->views[i];
+    const char *bad = NULL;
+    if (!drv) bad = "the loader has no usable configuration yet";
+    else if (!v) bad = "the view is not in the configuration";
+    else if (fb->lookup && (!drv->find_zones_in || !lc->store_proto || !drv->manifest_page)) bad = "this loader cannot look up the zone of a name with this driver or without the store protocol";
+    else if (!fb->lookup && !drv->find_zone) bad = "this loader cannot read several zones with this driver";
+    if (bad) {
+        for (size_t i = 0; i < fb->n; i++)
+            if (fetch_fail(x, &fb->rq[i], bad) != 0) return -1;
+        return 0;
+    }
+    fetch_setup(x, lc, drv, v, &fb->rq[0]);
+    x->fb = fb;
+    db_source_t src;
+    view_source(drv, v, &src);
+    for (size_t i = 0; i < fb->n; i++) fb->done[i] = false;
+    (void)run_view(x, &src, NULL, false);
+    if (fb->lookup && !x->io_error && !x->oom && !g_stop && !atomic_load(&g_fetch_stop)) {
+        /* the lookups that were answered with a zone and asked for its body (KDB_FETCH_LOOKUP_FULL): a batch of bodies of those zones, with the request ids of the lookups.  The domain id is the one the answer
+         * named: a zone that was renamed or made again in between is a failure, as for any request that names the id. */
+        size_t nb = 0;
+        for (size_t i = 0; i < fb->n; i++) {
+            if (!fb->done[i]) {                                   /* (the read of the batch failed before its answer) */
+                if (fetch_fail(x, &fb->rq[i], x->errtext[0] ? x->errtext : "the zone could not be read") != 0) {
+                    fetch_teardown(x);
+                    return -1;
+                }
+                continue;
+            }
+            if (!fb->lk_found[i] || fb->rq[i].mode != KDB_FETCH_LOOKUP_FULL) continue;
+            freq_t *q = &fb->rq[nb];
+            *q = fb->rq[i];                                       /* (nb <= i: the entries above nb are not read again) */
+            snprintf(q->zone, sizeof(q->zone), "%s", fb->lk_name[i]);
+            q->source_id = fb->lk_id[i];
+            q->mode = KDB_FETCH_FULL;
+            nb++;
+        }
+        fb->n = nb;
+        fb->lookup = false;
+        if (nb > 0) {
+            for (size_t i = 0; i < nb; i++) fb->done[i] = false;
+            x->errtext[0] = '\0';
+            x->fetch_lookup = false;
+            x->lk_full = false;
+            (void)run_view(x, &src, NULL, false);
+        }
+    }
+    const bool dead = x->io_error || x->oom || g_stop || atomic_load(&g_fetch_stop);
+    const char *why = x->errtext[0] ? x->errtext : "the zone could not be read";
+    int ret = dead ? -1 : 0;
+    for (size_t i = 0; i < fb->n && !dead; i++) {
+        if (fb->done[i]) continue;                                /* (nothing was sent for it: the Backend is waiting for an answer) */
+        if (fetch_fail(x, &fb->rq[i], why) != 0) ret = -1;
+    }
+    fetch_teardown(x);
+    return ret;
+}
+
+/* one request.  0, or -1 when the stream is gone / the loader is told to stop / out of memory */
+static int fetch_one(ctx_t *x, const lcfg_t *lc, const freq_t *r) {
+    const db_driver_t *drv = lc->driver[0] ? driver_find(lc->driver) : NULL;
+    const lview_t *v = NULL;
+    for (size_t i = 0; i < lc->nviews; i++)
+        if (lc->views[i].index == r->view) v = &lc->views[i];
+    if (r->range) return fetch_fail(x, r, "this loader does not read a range of a zone");
+    if (!drv) return fetch_fail(x, r, "the loader has no usable configuration yet");
+    if (!v) return fetch_fail(x, r, "the view is not in the configuration");
+    const bool is_lookup = r->mode == KDB_FETCH_LOOKUP || r->mode == KDB_FETCH_LOOKUP_FULL;
+    if (is_lookup && (!drv->find_zones_in || !lc->store_proto || !drv->manifest_page)) return fetch_fail(x, r, "this loader cannot look up the zone of a name with this driver or without the store protocol");
+    fetch_setup(x, lc, drv, v, r);
     db_source_t src;
     view_source(drv, v, &src);
     (void)run_view(x, &src, r->zone, false);
@@ -5390,13 +5611,7 @@ static int fetch_one(ctx_t *x, const lcfg_t *lc, const freq_t *r) {
         x->errtext[0] = '\0';
         (void)run_view(x, &src, named.zone, false);
     }
-    ctx_view_reset(x);
-    x->map_view = NULL;
-    x->fetch_vname = NULL;
-    x->fetch_source_id = 0;
-    x->fetch_lookup = false;
-    x->lk_full = false;
-    x->lk_found = false;
+    fetch_teardown(x);
     if (x->io_error || x->oom || g_stop || atomic_load(&g_fetch_stop)) return -1;
     if (x->n_zones == 0 && x->n_failed == 0)                  /* nothing was sent: the Backend is waiting for an answer */
         return fetch_fail(x, &named, x->errtext[0] ? x->errtext : "the zone could not be read");
@@ -5409,6 +5624,43 @@ static void fetch_workers_stop(struct lio *io) {
     atomic_store(&io->wstop, true);
     pthread_cond_broadcast(&io->fq_cond);
     pthread_mutex_unlock(&io->fq_lock);
+}
+
+/* 0.7: the worker has taken request *r as the most urgent; more requests of the same kind join it (fq_lock held; `queued` = what was queued before r was taken).  Same view, same priority (a query that
+ * waits is never held up by a batch of the background fill), same kind: bodies of zones (KDB_FETCH_FULL), or lookups of names (the candidate names of all together fit one find_zones_in()); a zone that is
+ * already in the batch is left for the next one.  The batch is at most FETCH_BATCH_MAX, and no more than this worker's share of what is queued, so that the other workers of the pool still have requests.
+ * fb->n < 2 afterwards: nothing joined, r is read as a single request. */
+static void fetch_take(struct lio *io, struct fbatch *fb, const freq_t *r, size_t queued) {
+    fb->n = 0;
+    if (r->range || (r->mode != KDB_FETCH_FULL && r->mode != KDB_FETCH_LOOKUP && r->mode != KDB_FETCH_LOOKUP_FULL)) return;
+    const size_t workers = io->fq_allowed ? io->fq_allowed : 1;
+    size_t cap = (queued + workers - 1) / workers;
+    if (cap > FETCH_BATCH_MAX) cap = FETCH_BATCH_MAX;
+    if (cap > FB_MAX) cap = FB_MAX;
+    if (cap < 2) return;
+    const char *tmp[DB_LOOKUP_MAX];
+    fb->lookup = r->mode != KDB_FETCH_FULL;
+    fb->rq[0] = *r;
+    fb->n = 1;
+    size_t names = fb->lookup ? lookup_names(r->zone, tmp, DB_LOOKUP_MAX) : 0;
+    for (size_t i = 0; i < io->nfq && fb->n < cap;) {
+        const freq_t *q = &io->fq[i];
+        bool join = q->view == r->view && q->prio == r->prio && !q->range && (fb->lookup ? q->mode == KDB_FETCH_LOOKUP || q->mode == KDB_FETCH_LOOKUP_FULL : q->mode == KDB_FETCH_FULL);
+        if (join && fb->lookup) {
+            size_t k = lookup_names(q->zone, tmp, DB_LOOKUP_MAX);
+            if (names + k > DB_LOOKUP_MAX) join = false;
+            else names += k;
+        } else if (join) {
+            for (size_t j = 0; j < fb->n && join; j++) join = !names_equal(fb->rq[j].zone, q->zone);
+        }
+        if (!join) {
+            i++;
+            continue;
+        }
+        fb->rq[fb->n++] = *q;
+        memmove(&io->fq[i], &io->fq[i + 1], (io->nfq - i - 1) * sizeof(io->fq[0]));
+        io->nfq--;
+    }
 }
 
 /* a worker of the pool: takes the most urgent request (priority 0 before 1 before 2, the oldest first; but one that has waited FQ_AGING_MS goes first, the
@@ -5426,6 +5678,7 @@ static void *fetch_worker(void *arg) {
     lcfg_t lc;
     memset(&lc, 0, sizeof(lc));
     uint64_t seen = 0;
+    struct fbatch *fb = calloc(1, sizeof(*fb));            /* (NULL: no batches, every request is read alone) */
     for (;;) {
         pthread_mutex_lock(&io->fq_lock);
         while (!atomic_load(&io->wstop) && !(io->nfq > 0 && a->idx < io->fq_allowed)) {
@@ -5442,8 +5695,10 @@ static void *fetch_worker(void *arg) {
             for (size_t i = 1; i < io->nfq; i++)
                 if (io->fq[i].prio < io->fq[best].prio) best = i;
         freq_t r = io->fq[best];
+        const size_t queued = io->nfq;
         memmove(&io->fq[best], &io->fq[best + 1], (io->nfq - best - 1) * sizeof(io->fq[0]));
         io->nfq--;
+        if (fb) fetch_take(io, fb, &r, queued);
         pthread_mutex_unlock(&io->fq_lock);
         pthread_mutex_lock(&g_fcfg_lock);
         if (g_fcfg_seq != seen) {
@@ -5452,12 +5707,13 @@ static void *fetch_worker(void *arg) {
             seen = g_fcfg_seq;
         }
         pthread_mutex_unlock(&g_fcfg_lock);
-        if (fetch_one(&x, &lc, &r) != 0) {
+        if ((fb && fb->n >= 2 ? fetch_batch(&x, &lc, fb) : fetch_one(&x, &lc, &r)) != 0) {
             atomic_store(&g_fetch_died, true);                    /* (the stream or the memory is gone: this process does not serve the fetch stream again) */
             fetch_workers_stop(io);
             break;
         }
     }
+    free(fb);
     cfg_free(&lc);
     ctx_view_reset(&x);
     keep_drop(&x);
