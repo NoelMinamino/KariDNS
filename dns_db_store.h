@@ -183,10 +183,11 @@ extern _Atomic bool db_store_test_not_resident;
 extern _Atomic bool db_store_test_resident;
 extern void (*_Atomic db_store_test_adopt_hook)(void);
 extern _Atomic bool db_store_test_adopt_noview;
+extern _Atomic bool db_store_test_hot_pending;                    /* the threads of hot.list see attach requests of queries that wait (tests: they are never starved by them) */
+extern void (*_Atomic db_store_test_hot_hook)(uint32_t zid);   /* called by the threads of hot.list before each zone (tests: the order, and time) */
 #ifdef KARIDNS_UNIT_TEST
 extern int db_store_test_set_fail;                      /* the n-th set_put_slot() of the settings table fails (0: off) */
 extern int db_store_test_attach_reserve_fail;           /* the n-th reserve of room in the attach table fails (0: off) */
-extern void (*db_store_test_hot_hook)(uint32_t zid);    /* called by the thread of hot.list before each zone */
 extern void (*db_recon_test_entry_hook)(void);          /* called at every entry of a manifest pass (tests: an entry that takes time) */
 extern int db_store_test_bits_fail;                     /* the bit of the n-th entry of a pass cannot be set (0: off) */
 extern _Atomic(const char *) db_store_test_rec_fault_zone;   /* the store cannot read the record of this zone (name with its trailing dot; NULL: off): a damaged cell */
@@ -215,6 +216,7 @@ typedef struct {
   uint64_t wa_ok, wa_cold, wa_over, wa_claim, wa_fail, wa_decline, wa_full, wa_adopted, wa_lost, wa_ns;
   /* 0.7 fix 8, hot.list: state 0 none, 1 attaching, 2 done, 3 stopped at the high mark of memory-limit, 4 off; listed: the ids that were read at the start; attached / skipped: the zones it attached / that were in memory or not stored; written: the ids written at the last stop */
   uint64_t hot_state, hot_listed, hot_attached, hot_skipped, hot_written;
+  uint64_t hot_threads, hot_per_s;   /* 0.7 M4: the threads of the list, and the zones a second they attached (from the start of the list to now, or to its end) */
 } db_store_counters_t;
 void db_store_counters(db_store_counters_t *out);
 

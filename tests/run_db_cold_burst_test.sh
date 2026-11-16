@@ -166,10 +166,20 @@ burst() {   # burst LABEL "database statements"
     perl -e "exit(('${MX:-99}' + 0) < $KARICTL_MAX_S ? 0 : 1)" && pass "$label: karictl answered during the burst (longest ${MX} s)" || fail "$label: a karictl command took ${MX} s during the burst"
     stop_srv
 }
-burst "with memory-limit" "memory-limit 4g;"
-burst "without memory-limit" ""
+# (0.7 M4: without the hot list.  The threads of the list attach the zones of the last run at once, with no rate cap, so a restart with the list has most of the zones in memory before the burst comes
+# and the workers have nothing to attach; the bursts here are of the attach itself: the workers in MAP mode, the store threads in COPY mode.  The list has its own part below.)
+burst "with memory-limit" "memory-limit 4g; store-hot-list no;"
+burst "without memory-limit" "store-hot-list no;"
 
-# 0.7 fix 8: hot.list.  The server was stopped cleanly after the last burst: the zones that were in memory are in hot.list, and the next start attaches them in the background
+# 0.7 M4: a run that leaves hot.list: the zones that are in memory at a clean stop are written to it (the two bursts above were with store-hot-list no: they wrote none)
+echo "== a run that leaves hot.list"
+conf "memory-limit 4g;"
+start_srv
+OUT=$(perl tests/db/udp_cold_burst.pl "$PA" "$NZ" 8 "$WINDOW" "$WAIT")
+echo "  $OUT"
+stop_srv
+
+# 0.7 fix 8: hot.list.  The server was stopped cleanly after a run that had the zones in memory: they are in hot.list, and the next start attaches them in the background
 echo "== the restart with hot.list"
 conf "memory-limit 4g;"
 start_srv

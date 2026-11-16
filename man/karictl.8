@@ -847,12 +847,15 @@ Zones that a worker attached and a store thread then registered / found in
 memory already, changed or gone (dropped: the answer the worker gave was the
 version the record had)
 .TP 8
-\fBstore.hot.state\fR, \fB.listed\fR, \fB.attached\fR, \fB.skipped\fR, \fB.written_at_stop\fR
+\fBstore.hot.state\fR, \fB.listed\fR, \fB.attached\fR, \fB.skipped\fR, \fB.written_at_stop\fR, \fB.threads\fR, \fB.attached_per_s\fR
 0.7: the hot list of the store: \fBnone\fR, \fBattaching\fR, \fBdone\fR,
 \fBhigh\-mark\fR (stopped at the high mark of \fBmemory\-limit\fR) or \fBoff\fR
 (\fBstore\-hot\-list no;\fR); the ids read at the start; the zones it attached
 and the ones it skipped (in memory already, or not stored); the ids written at
-the last stop (this run)
+the last stop (this run); the threads of the list (three quarters of the store
+threads, at most six; they give the attach requests of waiting queries at most
+0.4 ms before each batch of 32 zones) and the zones a second they attached, from
+the start of the list to now (to its end once it has ended)
 .TP 8
 \fBstore.compact.runs\fR, \fB.moved_records\fR, \fB.moved_bytes\fR, \fB.segments_freed\fR, \fB.last_unix\fR
 The cleaner (since the open): segments it began to clean, records and bytes it

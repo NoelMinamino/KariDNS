@@ -4701,21 +4701,43 @@ that an earlier run without the store left is still read at the start
 of its own. At a clean stop the Backend writes the ids of the zones that are in
 memory to \fBhot.list\fR in the store directory, the most used first (the cache
 manager's frequency of the zone, with the queries it has answered since; at most
-4,194,304 ids, 4 bytes each). The next start reads it and a thread of its own
-attaches those zones in that order, in the background, while the queries are
+4,194,304 ids, 4 bytes each). The next start reads it and threads of their own
+attach those zones in that order, in the background, while the queries are
 served: a restart with the page cache of the old run kept has its working set in
 memory in seconds, and one with a cold page cache reads the images in the order
-the queries are going to want them. The queries always come first: the thread
-takes at most 20,000 zones a second, waits while any query waits for a store
-thread, and stops when the zones in memory reach the high mark of
-\fBmemory\-limit\fR (it attaches the hottest zones and never takes one out for
-the rest of the list; \fBstore.hot.state\fR says \fBhigh\-mark\fR). The file is
-trusted only whole (its checksums and the store's uuid must be right; a damaged,
-torn or foreign file is ignored with a WARNING and the zones are attached when
-they are asked for, as before); after \fBkill \-9\fR the list of the last clean
-stop is still used (its ids are only candidates: a zone that is not stored any
-more is skipped). \fBstore\-hot\-list no;\fR turns both the writing and the
-attaching off. \fBkarictl store\fR shows \fBstore.hot.*\fR.
+the queries are going to want them. There are three quarters of the store
+threads of them, at most six (\fBstore.hot.threads\fR); each takes the zones of
+the list 32 at a time, reads their records and images, makes the entries and
+registers the 32 in one section of the registry's lock; the table of the zones
+in memory is made for the zones of the list at the start, so that it does not
+double inside that lock in the middle of the rush. They have no rate cap and are
+never starved by the queries: before a batch a thread gives the attach requests
+of queries that wait at most 0.4 ms, and goes on whether they have been taken or
+not (up to 0.6.2 one thread waited for as long as any query waited for a store
+thread, at 20,000 zones a second: on ZFS, where \fBstore\-mode copy\fR has no
+attach by a worker and every first query for a zone waits for a store thread,
+that thread did not run during the very rush of first queries it was meant to
+prevent). The store threads that take the requests of queries register what they
+find waiting (up to 16 zones) in one section of the lock as well; a single
+request is registered at once. A query for a zone that the threads have not
+reached yet is attached by its own request, as without the list, and the zone is
+skipped when they come to it. (Measured at 10 million zones on a ZFS dataset
+with \fBrecordsize=16K\fR, 8 vCPUs, the ARC warm, 400,000 queries a second from
+the start of the restart: the steady rate was reached in 4 to 5 s, where 0.6.2
+took 7 to 17 s; the 99th percentile of the wait of a query for a store thread
+was 16 to 32 ms, where it was 65 to 262 ms. The CPU of the host is the limit
+while the zones come in: the pread of an image from the ARC, with its
+decompression, is a third of the CPU of an attach.) They stop when the zones in
+memory reach the high mark of \fBmemory\-limit\fR (it attaches the hottest zones
+and never takes one out for the rest of the list; \fBstore.hot.state\fR says
+\fBhigh\-mark\fR). The file is trusted only whole (its checksums and the store's
+uuid must be right; a damaged, torn or foreign file is ignored with a WARNING
+and the zones are attached when they are asked for, as before); after \fBkill
+\-9\fR the list of the last clean stop is still used (its ids are only
+candidates: a zone that is not stored any more is skipped). \fBstore\-hot\-list
+no;\fR turns both the writing and the attaching off. \fBkarictl store\fR shows
+\fBstore.hot.*\fR (\fBstore.hot.threads\fR, and \fBstore.hot.attached_per_s\fR
+from the start of the list to now).
 .PP
 \fBAttach on the worker (MAP mode, 0.7).\fR A query for a stored zone that is
 not in memory used to wait for a store thread (the worker parks it, asks through

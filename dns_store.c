@@ -3445,12 +3445,18 @@ int store_zone_get(const store_t *s, uint32_t zid, store_zone_t *out) {
     if (t.state > STORE_STATE_STORED) return -EBADMSG;
     bool ok;
     zone_fill(s, zid, &t, &c, out, &ok);
+    out->seq = seq;
     if (t.klen > ST_NAME_INL) {                        /* the long name was copied from nx after the cell was read: the nx pass may have moved it meanwhile; the counter says */
       atomic_thread_fence(memory_order_acquire);
       if ((uint32_t)(atomic_load_explicit(&zc_cell(s, zid)[7], memory_order_relaxed) >> 32) != seq && tries < 64) continue;
     }
     return ok ? 0 : -EBADMSG;
   }
+}
+
+bool store_zone_unchanged(const store_t *s, uint32_t zid, uint32_t seq) {
+  if ((uint64_t)zid >= st_zc_cap(s) || (seq & 1u)) return false;
+  return (uint32_t)(atomic_load_explicit(&zc_cell(s, zid)[7], memory_order_acquire) >> 32) == seq;
 }
 
 /* ---- err.ring: 4096-byte header page {magic, version, entries, entry size, head}, then STORE_ERR_ENTRIES entries of 224 bytes = 28 words: seq, zid | textlen << 32 | tag << 40, stamp, time, text.

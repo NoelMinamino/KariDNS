@@ -3692,7 +3692,7 @@ static void staged_free_cb(void *p) { free(p); }
 zdir_elem_t *dbreg_staged_new(const char *name, uint16_t sview, const dbdir_rec_t *rec, zone_db_entry_t *entry) {
     const size_t l = strlen(name);
     if (l < 2 || l > 255) return NULL;
-    zdir_elem_t *z = calloc(1, sizeof(*z) + l + 1 + 32);
+    zdir_elem_t *z = calloc(1, sizeof(*z) + l + 1 + 32 + sizeof(uint32_t) + 1);      /* (the name, the digest, then the sequence word of the record and whether it is set: dbreg_staged_rec()) */
     if (!z) return NULL;
     memcpy(z->name, name, l + 1);
     z->hash = zdir_name_hash(name);
@@ -3704,6 +3704,11 @@ zdir_elem_t *dbreg_staged_new(const char *name, uint16_t sview, const dbdir_rec_
     atomic_init(&z->serial, rec->serial);
     z->digest = (uint8_t *)z->name + l + 1;
     memcpy(z->digest, rec->digest, 32);
+    {
+        const uint32_t sq = rec->seq_set ? rec->seq : 0;
+        memcpy(z->digest + 32, &sq, sizeof(sq));
+        z->digest[32 + sizeof(sq)] = rec->seq_set ? 1 : 0;
+    }
     z->flags = (uint16_t)((rec->flags & 0x1 ? ZDIR_F_PRESIGNED : 0) | (rec->flags & 0x2 ? ZDIR_F_ALIAS : 0) | (rec->flags & 0x4 ? ZDIR_F_WILDCARD : 0));
     z->last_result = DBREG_APPLIED;
     zdir_elem_sync(z, entry);
@@ -3720,6 +3725,8 @@ void dbreg_staged_rec(const zdir_elem_t *z, dbdir_rec_t *rec) {
     rec->serial = atomic_load_explicit(&z->serial, memory_order_relaxed);
     rec->source_id = z->source_id;
     memcpy(rec->digest, z->digest, 32);
+    memcpy(&rec->seq, z->digest + 32, sizeof(rec->seq));
+    rec->seq_set = z->digest[32 + sizeof(rec->seq)] != 0;
 }
 
 /* The staged element leaves (it was taken out of the staging table by the caller) and the registry did not take its entry (the zone is in memory already, changed, or gone): the element is freed after
@@ -3800,10 +3807,22 @@ static void store_elem_drop_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
     store_elem_free_cb(z);
 }
 
+/* What the commit of an attach leaves for after the registry's lock is released (the commit does not release it for a caller that holds it: `locked`). */
+typedef struct {
+    bool err_sink;                /* the text of the zone is forgotten in the file ring: dbreg_err_sink_clear(err_zid) */
+    uint32_t err_zid;
+    bool peak;                    /* the peak of memory-limit is noted (cache_peak_note()) */
+} commit_post_t;
+static void commit_post_run(const commit_post_t *p) {
+    if (p->err_sink) dbreg_err_sink_clear(p->err_zid);
+    if (p->peak) cache_peak_note();
+}
+
 /* The commit of an install or an attach of a store zone.  -2: the store did not take the zone (the caller registers it as a zone of the heap directory); -1 as dbreg_commit().
- * `*cold`: the zone was written to the store and is not kept in memory (the entry is freed here: a first fill that is over the limit). */
+ * `*cold`: the zone was written to the store and is not kept in memory (the entry is freed here: a first fill that is over the limit).
+ * locked: the caller holds the registry's lock, keeps it when this returns, and calls commit_post_run(post) after it has released it (an attach: dbreg_attach_store(), dbreg_attach_store_n()). */
 static int dbreg_commit_store(const char *view, const char *name, zone_db_entry_t *entry, bool created, int64_t source_id, uint32_t serial, const uint8_t digest[32],
-                              bool *shadowed, const dbreg_attach_info_t *offered, bool locked, bool sh_cfg_in) {
+                              bool *shadowed, const dbreg_attach_info_t *offered, bool locked, bool sh_cfg_in, commit_post_t *post) {
     const dbdir_ops_t *ops = dbdir();
     const bool sh_cfg = locked ? sh_cfg_in : dbreg_config_shadows(view, name);
     uint32_t zid = ZREF_NOZID;
@@ -3935,7 +3954,13 @@ out:
         dbreg_zone_t *dz = dbreg_find(rv, name, zdir_name_hash(name));
         if (dz && (dz->kind & ZDIR_K_STORED) && !zdir_entry(dz) && atomic_load_explicit(&dz->state, memory_order_relaxed) == ZDIR_ST_LOADING) store_elem_drop_locked(rv, dz);
     }
-    if (offered && offered->under_lock) offered->under_lock(offered->under_arg);       /* (the zone is in the attach table now, or the commit did not take it: the staged element of a worker's attach leaves under the lock) */
+    if (locked) {                                                    /* (the caller releases the lock, after the hook of the staged element: att_unlock()) */
+        if (shadowed) *shadowed = sh;
+        post->err_sink = err_sink;
+        post->err_zid = err_zid;
+        post->peak = created && atomic_load_explicit(&g_cache_limit, memory_order_relaxed);
+        return rc;
+    }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     if (err_sink) dbreg_err_sink_clear(err_zid);
     if (shadowed) *shadowed = sh;
@@ -3954,7 +3979,7 @@ static int dbreg_commit_x(const char *view, const char *name, zone_db_entry_t *e
         legacy = lz && !(lz->kind & ZDIR_K_STORED) && dbreg_zone_known(lz);
         pthread_mutex_unlock(&g_zone_db_rebuild_lock);
         if (!legacy) {
-            int sr = dbreg_commit_store(view, name, entry, created, source_id, serial, digest, shadowed, NULL, false, false);
+            int sr = dbreg_commit_store(view, name, entry, created, source_id, serial, digest, shadowed, NULL, false, false, NULL);
             if (sr != -2) return sr;
         }
     }
@@ -4285,6 +4310,44 @@ static void att_unlock(const dbreg_attach_info_t *o) {
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
 }
 
+/* the registry's side of an attach of a stored zone, with the lock held (dbreg_attach_store(), dbreg_attach_store_n()); the lock is not released here, and what the commit leaves for after the unlock is in *post.
+ * *busy: a cell of the store is being written, so the record cannot be looked at now (the result is STALE; dbreg_attach_store() retries after a pause). */
+static int attach_store_locked(const dbdir_ops_t *ops, const char *view, const char *name, const dbdir_rec_t *rec, zone_db_entry_t *entry, const dbreg_attach_info_t *offered, bool sh_cfg, commit_post_t *post, bool *busy) {
+    *busy = false;
+    dbreg_view_t *rv = dbreg_view_get(view, true);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, name, zdir_name_hash(name)) : NULL;
+    if (!rv) return DBREG_ATT_NOT;
+    if (z) return zdir_entry(z) ? DBREG_ATT_RESIDENT : atomic_load_explicit(&z->state, memory_order_relaxed) == ZDIR_ST_LOADING ? DBREG_ATT_BUSY : DBREG_ATT_NOT;       /* (an element of the name that is not resident and not LOADING is not the store's to attach over) */
+    if (rec->seq_set && ops->rec_unchanged) {                           /* 0.7 M4: the record was read by the store with its sequence word; one word says whether a version, a delete or a rename has come since (no search in the name index, no cell read: a page that is not in memory is a wait for the disk, or on ZFS a copy out of the cache, with every other attach waiting for this lock) */
+        if (!ops->rec_unchanged(rec)) return DBREG_ATT_STALE;           /* (changed, or a cell is being written now: the caller reads the record again) */
+    } else {
+        dbdir_rec_t cur;
+        const int gr = rec_get_locked(ops, view, name, &cur);
+        if (gr < 0) {                                                   /* (a cell of the store is being written: not now) */
+            *busy = true;
+            return DBREG_ATT_STALE;
+        }
+        if (gr == 0 || cur.state != 2 /* STORE_STATE_STORED */ || cur.zid != rec->zid || cur.serial != rec->serial || cur.source_id != rec->source_id || memcmp(cur.digest, rec->digest, 32) != 0) return DBREG_ATT_STALE;
+    }
+    z = store_elem_make_locked(rv, view, name, rec);
+    if (!z) return DBREG_ATT_NOT;
+    bool shadowed = false;
+    /* the commit keeps the lock (and drops the element it was given when it does not take the entry) */
+    if (dbreg_commit_store(view, name, entry, true, offered->source_id, offered->serial, offered->digest_set ? offered->digest : rec->digest, &shadowed, offered, true, sh_cfg, post) != 0) return DBREG_ATT_NOT;
+    return DBREG_ATT_STARTED;
+}
+
+static void attach_offered_init(dbreg_attach_info_t *offered, const dbdir_rec_t *rec, bool bg, void (*under_lock)(void *), void *under_arg) {
+    memset(offered, 0, sizeof(*offered));
+    offered->source_id = rec->source_id;
+    offered->serial = rec->serial;
+    offered->bg = bg;
+    offered->under_lock = under_lock;
+    offered->under_arg = under_arg;
+    memcpy(offered->digest, rec->digest, 32);
+    for (int i = 0; i < 32; i++) offered->digest_set |= offered->digest[i] != 0;
+}
+
 int dbreg_attach_store(const char *view, const char *name, const dbdir_rec_t *rec, zone_db_entry_t *entry, bool bg, void (*under_lock)(void *), void *under_arg) {
     const dbdir_ops_t *ops = dbdir();
     if (!ops || !store_zone_entry(entry)) {
@@ -4295,51 +4358,57 @@ int dbreg_attach_store(const char *view, const char *name, const dbdir_rec_t *re
         return DBREG_ATT_NOT;
     }
     dbreg_attach_info_t offered;
-    memset(&offered, 0, sizeof(offered));
-    offered.source_id = rec->source_id;
-    offered.serial = rec->serial;
-    offered.bg = bg;
-    offered.under_lock = under_lock;
-    offered.under_arg = under_arg;
-    memcpy(offered.digest, rec->digest, 32);
-    for (int i = 0; i < 32; i++) offered.digest_set |= offered.digest[i] != 0;
+    attach_offered_init(&offered, rec, bg, under_lock, under_arg);
     const bool sh_cfg = dbreg_config_shadows(view, name);               /* (the configuration's snapshot is not taken under the registry lock) */
     for (int attempt = 0;; attempt++) {
         pthread_mutex_lock(&g_zone_db_rebuild_lock);
-        dbreg_view_t *rv = dbreg_view_get(view, true);
-        dbreg_zone_t *z = rv ? dbreg_find(rv, name, zdir_name_hash(name)) : NULL;
-        if (!rv) {
-            att_unlock(&offered);
-            return DBREG_ATT_NOT;
-        }
-        if (z) {                                                        /* (an element of the name that is not resident and not LOADING is not the store's to attach over) */
-            int rc = zdir_entry(z) ? DBREG_ATT_RESIDENT : atomic_load_explicit(&z->state, memory_order_relaxed) == ZDIR_ST_LOADING ? DBREG_ATT_BUSY : DBREG_ATT_NOT;
-            att_unlock(&offered);
-            return rc;
-        }
-        dbdir_rec_t cur;
-        const int gr = rec_get_locked(ops, view, name, &cur);
-        if (gr < 0) {                                                   /* (a cell of the store is being written: not now) */
-            att_unlock(attempt >= REC_BUSY_TRIES ? &offered : NULL);
-            if (attempt >= REC_BUSY_TRIES) return DBREG_ATT_STALE;
+        commit_post_t post;
+        memset(&post, 0, sizeof(post));
+        bool busy;
+        const int r = attach_store_locked(ops, view, name, rec, entry, &offered, sh_cfg, &post, &busy);
+        if (busy && attempt < REC_BUSY_TRIES) {
+            att_unlock(NULL);
             rec_busy_pause();
             continue;
         }
-        if (gr == 0 || cur.state != 2 /* STORE_STATE_STORED */ || cur.zid != rec->zid || cur.serial != rec->serial || cur.source_id != rec->source_id || memcmp(cur.digest, rec->digest, 32) != 0) {
-            att_unlock(&offered);
-            return DBREG_ATT_STALE;
-        }
-        z = store_elem_make_locked(rv, view, name, rec);
-        if (!z) {
-            att_unlock(&offered);
-            return DBREG_ATT_NOT;
-        }
-        bool shadowed = false;
-        /* the commit unlocks (and drops the element it was given when it does not take the entry) */
-        if (dbreg_commit_store(view, name, entry, true, offered.source_id, offered.serial, offered.digest_set ? offered.digest : rec->digest, &shadowed, &offered, true, sh_cfg) != 0) return DBREG_ATT_NOT;
-        return DBREG_ATT_STARTED;
+        att_unlock(&offered);                                           /* (the hook of the worker's staged element, then the lock) */
+        commit_post_run(&post);
+        return r;
     }
 }
+
+/* 0.7 M4: the attach of up to DBREG_ATT_BATCH zones in one section of the registry's lock (the hot list: a thread that has made the entries of 32 zones registers them together, so that the lock is
+ * taken and left once for them, and the zones of the batch are not interleaved with the single attaches of the queries one lock round trip each).  Each item is judged as dbreg_attach_store() judges
+ * it (item->result); an item whose record cell is being written is STALE (the caller reads it again as it does for a single attach); nothing waits inside the lock. */
+void dbreg_attach_store_n(dbreg_att_item_t *it, size_t n) {
+    const dbdir_ops_t *ops = dbdir();
+    for (size_t i = DBREG_ATT_BATCH; i < n; i++) it[i].result = DBREG_ATT_NOT;       /* (a section of the lock takes no more than a batch: the caller keeps the entries of the rest) */
+    if (n > DBREG_ATT_BATCH) n = DBREG_ATT_BATCH;
+    dbreg_attach_info_t offered[DBREG_ATT_BATCH];
+    commit_post_t post[DBREG_ATT_BATCH];
+    bool sh_cfg[DBREG_ATT_BATCH];
+    bool live[DBREG_ATT_BATCH];
+    bool any = false;
+    for (size_t i = 0; i < n; i++) {
+        it[i].result = DBREG_ATT_NOT;
+        live[i] = ops && store_zone_entry(it[i].entry);
+        if (!live[i]) continue;
+        attach_offered_init(&offered[i], it[i].rec, it[i].bg, NULL, NULL);
+        sh_cfg[i] = dbreg_config_shadows(it[i].view, it[i].name);
+        memset(&post[i], 0, sizeof(post[i]));
+        any = true;
+    }
+    if (!any) return;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    for (size_t i = 0; i < n; i++) {
+        bool busy;
+        if (live[i]) it[i].result = attach_store_locked(ops, it[i].view, it[i].name, it[i].rec, it[i].entry, &offered[i], sh_cfg[i], &post[i], &busy);
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    for (size_t i = 0; i < n; i++)
+        if (live[i]) commit_post_run(&post[i]);
+}
+
 bool dbreg_err_get_locked(const char *view, const char *zone, uint32_t zid, char *out, size_t cap) {
     uint64_t stamp = 0;
     const dbdir_ops_t *ops = dbdir();
