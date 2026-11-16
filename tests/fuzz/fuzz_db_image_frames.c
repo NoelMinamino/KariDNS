@@ -81,6 +81,17 @@ static void check_image(const zone_t *z, const kdb_limits_t *lim, run_t *r) {
     if (img->total_size != z->size || img->n_rrs != z->rr_count || z->size > lim->max_zone_bytes || z->rr_count > lim->max_zone_records || z->rr_count == 0) abort();
     /* and the image is one that every reader takes without a check */
     if (zone_image_validate(z->img, z->have, why, sizeof(why)) != 0) abort();
+    /* RFC 9276 section 3.2: no NSEC3 iteration count above the cap in an image that was accepted (the header, the chains, every NSEC3 / NSEC3PARAM RR), and the hash table is not fuller than three quarters */
+    if (img->n3_iterations > ZONE_MAX_NSEC3_ITERATIONS || (uint64_t)img->hash_size * 3 < (uint64_t)img->n_names * 4) abort();
+    for (uint32_t c = 0; c < img->n_n3chains; c++)
+        if (zone_image_n3chains(img)[c].iterations > ZONE_MAX_NSEC3_ITERATIONS) abort();
+    for (uint32_t k = 0; k < img->n_rrs; k++) {
+        const uint16_t t = zone_image_rr_type(img, k);
+        if ((t == 50 || t == 51) && zone_image_rr_rdlen(img, k) >= 4) {
+            const uint8_t *rd = zone_image_rr_rdata(img, k);
+            if ((unsigned)((rd[2] << 8) | rd[3]) > ZONE_MAX_NSEC3_ITERATIONS) abort();
+        }
+    }
     unsigned bad = 0;
     mix(&r->sum, zimg_walk(img, &bad));
     if (bad) abort();
@@ -137,18 +148,10 @@ static void run_one(const uint8_t *p, size_t n, size_t chunk, uint8_t sel, run_t
                     if (z.size != sm.zone_image_size || z.size > lim.max_zone_bytes || z.size < sizeof(zone_image_t) + 8 || (z.size & 7)) abort();
                 }
             } else if (fr.type == KDB_T_ZONE_IMAGE) {
-                /* the octets come to the size that was announced and never past it; the buffer grows with what came (never to the announced size) */
+                /* the octets come to the size that was announced and never past it; the buffer is the Backend's own reassembly (zone_image_asm_add(), what dns_db_ingest.c job_image() calls): one buffer of the announced size */
                 if (!z.open || sm.zone_image_have > z.size || sm.zone_image_have != z.have + m.u.zone_image.len) abort();
-                if (z.have + m.u.zone_image.len > z.cap) {
-                    size_t nc = z.cap ? z.cap * 2 : 4096;
-                    while (nc < z.have + m.u.zone_image.len) nc *= 2;
-                    uint8_t *nb = realloc(z.img, nc);
-                    if (!nb) abort();
-                    z.img = nb;
-                    z.cap = nc;
-                }
-                memcpy(z.img + z.have, m.u.zone_image.body, m.u.zone_image.len);
-                z.have += m.u.zone_image.len;
+                if (zone_image_asm_add(&z.img, &z.have, &z.cap, z.size, m.u.zone_image.body, m.u.zone_image.len) != 0) abort();     /* (the machine accepted the message: it is within the size, and the memory is there) */
+                if (z.cap != z.size || z.have != sm.zone_image_have) abort();
                 mix(&r->sum, m.u.zone_image.len);
             } else if (fr.type == KDB_T_ZONE_END) {
                 if (z.open) {

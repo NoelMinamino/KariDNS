@@ -49,6 +49,35 @@ static inline zone_image_t *zi_from_text_ex(const char *apex, const char *text, 
 }
 static inline zone_image_t *zi_from_text(const char *apex, const char *text) { return zi_from_text_ex(apex, text, false); }
 
+/* the same, with one ECS trusted resolver in the zone level tables of the image (the list a builder of an Extended AXFR has): the Backend must refuse it, the trusted resolvers come from the settings of the zone */
+static inline zone_image_t *zi_from_text_trusted(const char *apex, const char *text) {
+    zone_arena_t a;
+    zone_arena_init(&a);
+    parse_error_t err;
+    memset(&err, 0, sizeof(err));
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.base_dir = ".";
+    ctx.default_origin = apex;
+    ctx.is_standalone_mode = true;
+    ctx.err_out = &err;
+    char *copy = arena_strdup(&a, text);
+    zone_image_t *img = NULL;
+    if (copy && parse_zone_fast(copy, strlen(copy), &a, &ctx) >= 0) {
+        zone_arena_drop_out_of_zone(&a, apex, zi_silent, NULL);
+        zone_arena_drop_unencodable(&a, zi_silent, NULL);
+        zone_arena_shrink_records(&a);
+        a.bind_ecs_trusted_resolvers = calloc(1, sizeof(char *));
+        if (a.bind_ecs_trusted_resolvers) {
+            a.bind_ecs_trusted_resolvers[0] = strdup("192.0.2.0/24");
+            a.bind_ecs_trusted_resolver_count = 1;
+        }
+        if (build_zone_index(&a, true) == 0) img = zone_image_freeze(&a, apex);
+    }
+    zone_arena_destroy(&a);
+    return img;
+}
+
 /* The usual test zone: SOA (serial `serial`), NS ns1 (or `ns`, an absolute name, when given; `ns2` a second NS at the apex), www A 192.0.2.80 + (serial & 3) and, when nA > 0, nA more
  * A records h<k>.  zone: canonical absolute ("name.test.").  malloc()ed. */
 static inline zone_image_t *zi_zone(const char *zone, uint32_t serial, const char *ns, const char *ns2, int nA) {

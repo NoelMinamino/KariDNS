@@ -2485,9 +2485,192 @@ static void run_singleton_refused(void) {
     }
 }
 
+/* ---- review of 0.7 M3: the rules that every source of a zone has are checked on the image of the loader too ---- */
+static void rv_set_iterations(uint8_t *m, unsigned it) {
+    zone_image_t *H = (zone_image_t *)(void *)m;
+    H->n3_iterations = (uint16_t)it;
+    zone_image_n3chain_t *C3 = (zone_image_n3chain_t *)(void *)(m + H->off_n3chains);
+    for (uint32_t c = 0; c < H->n_n3chains; c++) C3[c].iterations = (uint16_t)it;
+    zone_image_rr_t *R = (zone_image_rr_t *)(void *)(m + H->off_rrs);
+    for (uint32_t k = 0; k < H->n_rrs; k++) {
+        if ((R[k].type != 50 && R[k].type != 51) || R[k].rdata_len < 4) continue;
+        uint8_t *rd = m + H->off_strings + R[k].rdata_off;
+        rd[2] = (uint8_t)(it >> 8);
+        rd[3] = (uint8_t)it;
+    }
+}
+
+/* the same image with a hash table of `hs` slots (a power of two): the sections behind it move up, their offsets and the size follow, the table is made again (linear probing from the hash of the name) */
+static uint8_t *rv_rehash(const zone_image_t *img, uint32_t hs, size_t *len_out) {
+    const size_t old_sz = (size_t)img->hash_size * 4, new_sz = (size_t)hs * 4;
+    const size_t o_hash = img->off_hash, o_next = o_hash + ((old_sz + 7) & ~(size_t)7), n_next = o_hash + ((new_sz + 7) & ~(size_t)7);
+    const size_t nlen = img->total_size - o_next + n_next;
+    uint8_t *b = calloc(1, nlen + 8);
+    if (!b) return NULL;
+    memcpy(b, img, o_hash);
+    memcpy(b + n_next, (const uint8_t *)img + o_next, img->total_size - o_next);
+    zone_image_t *H = (zone_image_t *)(void *)b;
+    const uint32_t d = (uint32_t)(o_next - n_next);
+    H->hash_size = hs;
+    H->off_canon -= d; H->off_nsec -= d; H->off_n3entries -= d; H->off_glue -= d;
+    if (H->off_perm) H->off_perm -= d;
+    H->off_zattr -= d; H->off_strings -= d;
+    H->total_size = (uint32_t)nlen;
+    uint32_t *tab = (uint32_t *)(void *)(b + o_hash);
+    const zone_image_name_t *N = zone_image_names(img);
+    for (uint32_t id = 0; id < img->n_names; id++) {
+        size_t s = N[id].hash & (hs - 1);
+        while (tab[s]) s = (s + 1) & (hs - 1);
+        tab[s] = id + 1;
+    }
+    *len_out = nlen;
+    return b;
+}
+
+static void m3_review_rules(void) {
+    g_label = "review";
+    char why[300];
+    static const char HDR[] = "$ORIGIN rv.test.\n$TTL 60\n@ SOA ns h 7 2 3 4 5\n@ NS ns\nns A 192.0.2.1\n";
+    char text[2000];
+    /* 14. NSEC3 iterations above 150 (RFC 9276 3.2) are refused in the structure check, so the store's attach has it too: the header, the chain and every NSEC3 / NSEC3PARAM RR carry the number and
+     *     all of them are made to say it, so that nothing but the limit is wrong */
+    snprintf(text, sizeof(text), "%s@ NSEC3PARAM 1 0 10 aabbccdd\n"
+             "0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM NSEC3 1 1 10 aabbccdd 2T7B4G4VSA5SMI47K61MV5BV1A22BOJR A RRSIG\n"
+             "2T7B4G4VSA5SMI47K61MV5BV1A22BOJR NSEC3 1 1 10 aabbccdd 0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM NS SOA RRSIG NSEC3PARAM\n", HDR);
+    zone_image_t *img = m3_image_of(text, "rv.test.", false, false);
+    CHECK(img != NULL && img->n_n3chains >= 1 && img->n3_param_rr != ZONE_IMAGE_NONE);
+    if (img) {
+        zone_image_policy_t p = m3_pol(img, "rv.test.", 7);
+        M3_POS(img, img->total_size, &p);
+        static const unsigned its[] = { 150, 151, 500, 65535 };
+        for (size_t i = 0; i < sizeof(its) / sizeof(its[0]); i++) {
+            uint8_t *m = m3_copy(img);
+            CHECK(m != NULL);
+            if (!m) continue;
+            rv_set_iterations(m, its[i]);
+            if (its[i] <= 150) {
+                M3_POS(m, img->total_size, &p);
+            } else {
+                M3_NEG(m, img->total_size, &p, "iterations");
+                CHECK(zone_image_validate(m, img->total_size, why, sizeof(why)) != 0 && strstr(why, "iterations") != NULL);     /* (the structure check has it: the store scrub and every attach) */
+                /* each place alone is enough */
+                uint8_t *m2 = m3_copy(img);
+                zone_image_t *H = (zone_image_t *)(void *)m2;
+                zone_image_rr_t *R = (zone_image_rr_t *)(void *)(m2 + H->off_rrs);
+                for (uint32_t k = 0; k < H->n_rrs; k++)
+                    if (R[k].type == 50 && R[k].rdata_len >= 4) { uint8_t *rd = m2 + H->off_strings + R[k].rdata_off; rd[2] = (uint8_t)(its[i] >> 8); rd[3] = (uint8_t)its[i]; break; }
+                CHECK(zone_image_validate(m2, img->total_size, why, sizeof(why)) != 0);                                        /* (one NSEC3 RR that says more than the chain: refused, by the cap or by the chain's parameters) */
+                free(m2);
+            }
+            free(m);
+        }
+        zone_image_free(img);
+    }
+
+    /* 15. ALIAS / LUA RDATA, an ALIAS beside A / AAAA or DNSSEC records, CNAME / DNAME / RESINFO twice: refused as validate_zone_pdns_types() refuses them for every other source.  The zone parser would not make
+     *     these images, so TXT RRs with the right bytes are given the type (TXT "x" "" is 01 78 00: a whole name x. and also an ALIAS RDATA; TXT "x" is 01 78: neither) */
+    snprintf(text, sizeof(text), "%swww A 192.0.2.5\nwww TXT \"x\" \"\"\nal TXT \"x\" \"\"\nbad TXT \"x\"\nc TXT \"b\" \"\"\nc TXT \"d\" \"\"\n", HDR);
+    img = m3_image_of(text, "rv.test.", false, false);
+    CHECK(img != NULL);
+    if (img) {
+        zone_image_policy_t p = m3_pol(img, "rv.test.", 7);
+        for (int what = 0; what < 6; what++) {
+            uint8_t *m = m3_copy(img);
+            CHECK(m != NULL);
+            if (!m) continue;
+            zone_image_t *H = (zone_image_t *)(void *)m;
+            zone_image_name_t *N = (zone_image_name_t *)(void *)(m + H->off_names);
+            zone_image_rr_t *R = (zone_image_rr_t *)(void *)(m + H->off_rrs);
+            const char *own = what == 0 ? "www.rv.test." : what == 1 || what == 3 ? "al.rv.test." : what == 2 ? "bad.rv.test." : "c.rv.test.";
+            const uint32_t id = zone_image_find_name(img, own);
+            CHECK(id != ZONE_IMAGE_NONE);
+            if (id == ZONE_IMAGE_NONE) { free(m); continue; }
+            const uint32_t first = N[id].first_rr, last = first + (N[id].rr_count_flags & ZONE_IMAGE_NAME_COUNT_MASK);
+            uint16_t to = what <= 3 ? 65401 : what == 4 ? 5 : 39;                 /* the TXT RRs of the owner become ALIAS, CNAME or DNAME */
+            for (uint32_t k = first; k < last; k++) if (R[k].type == 16) R[k].type = to;
+            if (to == 65401) { N[id].rr_count_flags |= ZONE_IMAGE_NAME_ALIAS; H->flags |= ZONE_IMAGE_F_ALIAS; }
+            if (to == 39) { N[id].rr_count_flags |= ZONE_IMAGE_NAME_DNAME; H->flags |= ZONE_IMAGE_F_DNAME; }
+            if (what == 3) {                                                          /* a DNSKEY RR in the zone (the A of www takes the type: its RDATA is raw) */
+                const uint32_t wid = zone_image_find_name(img, "www.rv.test.");
+                for (uint32_t k = N[wid].first_rr; k < N[wid].first_rr + (N[wid].rr_count_flags & ZONE_IMAGE_NAME_COUNT_MASK); k++) if (R[k].type == 1) { R[k].type = 48; R[k].flags |= ZONE_IMAGE_RR_RAW | ZONE_IMAGE_RR_NO_NAMEWIRE; }
+            }
+            if (what == 0) M3_NEG(m, img->total_size, &p, "ALIAS record and an A or AAAA");      /* www has an A and now an ALIAS */
+            if (what == 1) M3_POS(m, img->total_size, &p);                                      /* al: an ALIAS alone, with a whole name for its RDATA */
+            if (what == 2) M3_NEG(m, img->total_size, &p, "malformed RDATA");                   /* 01 78 is no whole name */
+            if (what == 3) M3_NEG(m, img->total_size, &p, "DNSSEC records");
+            if (what >= 4) M3_NEG(m, img->total_size, &p, "singleton");
+            free(m);
+        }
+        zone_image_free(img);
+    }
+
+    /* 21. the hash table: a load of more than three quarters (the freeze makes tables of at most that load) is refused; the old rule allowed one empty slot */
+    snprintf(text, sizeof(text), "%sa A 192.0.2.2\nb A 192.0.2.3\nc A 192.0.2.4\nd A 192.0.2.5\ne A 192.0.2.6\n", HDR);
+    img = m3_image_of(text, "rv.test.", false, false);
+    CHECK(img != NULL && img->n_names == 7 && img->hash_size == 16);
+    if (img) {
+        size_t nl = 0;
+        uint8_t *b = rv_rehash(img, 16, &nl);                                    /* (the same table again: the helper is right) */
+        CHECK(b != NULL && nl == img->total_size && memcmp(b, img, nl) == 0);
+        free(b);
+        b = rv_rehash(img, 32, &nl);
+        if (b) { zone_image_policy_t p2 = m3_pol((const zone_image_t *)(const void *)b, "rv.test.", 7); M3_POS(b, nl, &p2); }
+        free(b);
+        b = rv_rehash(img, 8, &nl);                                              /* 7 names in 8 slots: one empty slot, a load of 7/8 */
+        CHECK(b != NULL);
+        if (b) {
+            CHECK(zone_image_find_name((const zone_image_t *)(const void *)b, "c.rv.test.") != ZONE_IMAGE_NONE);      /* (a good table: every name is found) */
+            zone_image_policy_t pb = m3_pol((const zone_image_t *)(const void *)b, "rv.test.", 7);
+            M3_NEG(b, nl, &pb, "hash_size");
+        }
+        free(b);
+        zone_image_free(img);
+    }
+
+    /* 20. an owner is printable text: a control octet in it is refused (the log of a refusal names the owner) */
+    snprintf(text, sizeof(text), "%sa A 192.0.2.2\n", HDR);
+    img = m3_image_of(text, "rv.test.", false, false);
+    CHECK(img != NULL);
+    if (img) {
+        zone_image_policy_t p = m3_pol(img, "rv.test.", 7);
+        uint8_t *m = m3_copy(img);
+        zone_image_t *H = (zone_image_t *)(void *)m;
+        zone_image_name_t *N = (zone_image_name_t *)(void *)(m + H->off_names);
+        const uint32_t id = zone_image_find_name(img, "a.rv.test.");
+        CHECK(m != NULL && id != ZONE_IMAGE_NONE);
+        if (m && id != ZONE_IMAGE_NONE) {
+            char *t = (char *)(m + H->off_strings + N[id].text_off);
+            t[0] = '\n';                                                          /* (a line of its own in the log) */
+            if (N[id].wire_off) m[H->off_strings + N[id].wire_off + 1] = '\n';
+            N[id].hash = dns_name_hash_ci(t);                                     /* (the hash fits: nothing but the octet is wrong) */
+            M3_NEG(m, img->total_size, &p, "owner");
+        }
+        free(m);
+        zone_image_free(img);
+    }
+
+    /* 22. the reassembly of the ZONE_IMAGE messages (what job_image() of the Backend and the fuzz harness call): one buffer of the announced size, nothing past it */
+    {
+        uint8_t *buf = NULL;
+        size_t len = 0, cap = 0;
+        uint8_t piece[100];
+        memset(piece, 0xAB, sizeof(piece));
+        CHECK(zone_image_asm_add(&buf, &len, &cap, 0, piece, 8) == -1 && buf == NULL);                  /* (no size announced) */
+        CHECK(zone_image_asm_add(&buf, &len, &cap, 250, piece, 100) == 0 && cap == 250 && len == 100);  /* (the first piece allocates the whole) */
+        uint8_t *first = buf;
+        CHECK(zone_image_asm_add(&buf, &len, &cap, 250, piece, 100) == 0 && buf == first && len == 200);   /* (no realloc: the buffer does not move) */
+        CHECK(zone_image_asm_add(&buf, &len, &cap, 250, piece, 51) == -1 && len == 200);                /* (one octet more than announced) */
+        CHECK(zone_image_asm_add(&buf, &len, &cap, 250, piece, 50) == 0 && len == 250 && cap == 250);
+        CHECK(zone_image_asm_add(&buf, &len, &cap, 250, piece, 1) == -1);                               /* (the image is complete) */
+        free(buf);
+    }
+}
+
 int main(void) {
     printf("=== test_zone_image ===\n");
     run_m3_step1();
+    printf("[TEST] review of M3: NSEC3 iterations, ALIAS / singleton rules, hash load, owner text, reassembly\n");
+    m3_review_rules();
     printf("[TEST] two CNAMEs on one name are refused at freeze\n");
     run_singleton_refused();
     printf("[TEST] synthetic zones: one line per RR type\n");

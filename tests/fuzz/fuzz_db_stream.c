@@ -91,8 +91,8 @@ static void run_loader(const uint8_t *p, size_t n, size_t chunk, uint8_t sel, ru
                 }
             }
             if (fr.type == KDB_T_ZONE_IMAGE) {              /* the octets come to the size that was announced and never past it; the first message holds the header that says the same as ZONE_BEGIN */
-                if (!sm.zone_image || m.u.zone_image.len == 0 || m.u.zone_image.len > KDB_MAX_BODY || sm.zone_image_have > sm.zone_image_size || sm.zone_bytes != sm.zone_image_have) abort();
-                if (sm.zone_image_msgs == 1) {
+                if (!sm.zone_image || m.u.zone_image.len == 0 || m.u.zone_image.len > KDB_MAX_BODY || sm.zone_image_have > sm.zone_image_size) abort();
+                if (sm.zone_image_have == m.u.zone_image.len) {                /* (the first message of the image) */
                     zone_image_t h;
                     if (m.u.zone_image.len < sizeof(h)) abort();
                     memcpy(&h, m.u.zone_image.body, sizeof(h));

@@ -391,11 +391,19 @@ typedef struct {
     bool tinydns;                /* KDB_ZF_TINYDNS */
 } zone_image_policy_t;
 int zone_image_validate_ex(const void *buf, size_t len, const zone_image_policy_t *pol, char *why, size_t whylen);
+/* the checks of zone_image_validate_ex() after the structure: the policy of the zone (what ZONE_BEGIN said, the owners, the RRs, the SOA, the extensions) and the rules of every source of a zone (ALIAS / LUA RDATA, ALIAS beside A / AAAA or
+ * DNSSEC records, singleton CNAME / DNAME / RESINFO).  The image must have passed zone_image_validate().  rr_count UINT64_MAX = not checked (the store has no ZONE_BEGIN: dns_db_store.c attach_build()).  Same return values. */
+int zone_image_check_policy(const void *buf, size_t len, const zone_image_policy_t *pol, char *why, size_t whylen);
 
 /* The limits of a zone on its image: what zone_arena_check_limits() checks on the builder (BIND 9.20 max-records, max-records-per-type,
  * max-types-per-name, max-zone-ttl; 0 = no limit), with the same verdicts.  Not the same order of findings: the builder is scanned in record
  * order, the image in owner order, so a zone that breaks two limits may be refused for either.  0 = within the limits, -1 = refused (err says which),
  * -2 = out of memory.  Allocates a little for an owner that has more RRs than the smallest per-name limit: load path only. */
 int zone_image_check_limits(const zone_image_t *img, const zone_limits_t *lim, char *err, size_t errlen);
+
+/* The reassembly of an image from ZONE_IMAGE messages (dns_db_ingest.c job_image(); tests/fuzz/fuzz_db_image_frames.c runs this very function).  *buf / *len / *cap are the buffer, the octets in it and its size
+ * (all 0 at the start); `announced` is ZONE_BEGIN's image_size, which the state machine has checked against max-zone-bytes: the buffer is allocated once, with that size, when the first piece comes (an
+ * allocation that nothing has written to is not memory, and the image is exactly that long or it is refused by zone_image_validate_ex()).  0 = added; -1 = not announced, or more than announced; -2 = out of memory. */
+int zone_image_asm_add(uint8_t **buf, size_t *len, size_t *cap, uint64_t announced, const uint8_t *body, size_t n);
 
 #endif

@@ -3224,20 +3224,18 @@ static void test_zone_image_frames(void) {
             kdb_enc_t *big = &e;
             kdb_enc_reset(big);
             im_begin(big, KDB_ZF_IMAGE, 9, true, size, KDB_ZK_PRIMARY, 0);
-            size_t off = 0, nmsg = 0;
+            size_t off = 0;
             const size_t piece = (k % 2) ? KDB_MAX_BODY : (size > 4000 ? 4000 : size);
             while (off < size) {
                 size_t n = size - off < piece ? size - off : piece;
                 if (off == 0 && n < sizeof(zone_image_t)) n = sizeof(zone_image_t);
                 im_chunk(big, img + off, n);
                 off += n;
-                nmsg++;
             }
             m_zone_end(big, 9);
             m_batch_end(big, 7, 1, 0, 0);
             CHECK_RC("image zone", im_send(s, big, why), KDB_OK);
-            CHECK(s->sm.state == KDB_S_READY && s->sm.n_zones == 1 && s->sm.zone_image && s->sm.zone_image_have == size && s->sm.zone_image_msgs == nmsg &&
-                  s->sm.zone_bytes == size);
+            CHECK(s->sm.state == KDB_S_READY && s->sm.n_zones == 1 && s->sm.zone_image && s->sm.zone_image_have == size);
             free(s);
             free(img);
         }

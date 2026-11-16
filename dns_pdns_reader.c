@@ -1970,6 +1970,9 @@ static bool wire_decodes_to_text(uint16_t t) {
 
 static bool wire_dnssec_text(uint16_t t) { return t == 43 || t == 46 || t == 47 || t == 48 || t == 50 || t == 51; }
 
+/* Kept, it is not dead code: it brings the RR flags of an image frozen from the rows of the database to the form of an image the Backend made from wire RRs (the form of every image the store holds from before M3 and of a
+ * zone that a transfer brings): a type that the wire decoder does not turn into text is RAW, and a RAW RR of a type that is not DNSSEC has no wire name.  Without it the same zone gives other bytes and another digest
+ * depending on the source, the stored images of a zone would change at every reload, and the byte-for-byte differential test of tests/test_pdns_reader.c fails. */
 static void image_wire_form_flags(zone_image_t *img) {
     zone_image_rr_t *rrs = (zone_image_rr_t *)(void *)((uint8_t *)img + img->off_rrs);
     for (uint32_t k = 0; k < img->n_rrs; k++) {

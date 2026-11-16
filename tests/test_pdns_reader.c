@@ -124,6 +124,57 @@ static bool file_rdata_hex(const char *type, const char *text, char *out, size_t
 /* ------------------------------------------------------------------ 1. zone files */
 static int cmp_names(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 
+/* ---- an independent oracle for the image of the loader (review of 0.7 M3) ----
+ * pdns_roundtrip() compares the loader's image with the loader's own builder, which is the same code twice.  The oracle is the image that the zone FILE path makes of the same zone text (the zone
+ * parser, zone_arena_drop_out_of_zone(), the index, zone_image_freeze(): what a file zone is served from).  The two images are compared on everything the engine reads that does not depend on the order
+ * in which the RRs were fed: the counts, the header flags, the apex, the NSEC3 parameters, the names with their flags and their RRs (type and TTL, as multisets), the canonical order of the names and the
+ * glue list.  The documented normalisation: the order of the RRs inside one owner and the file order (ZONE_IMAGE_F_PERM / off_perm: the loader puts the SOA first), and the RAW / NO_NAMEWIRE flags of the
+ * RRs (image_wire_form_flags() gives the loader's image the form of an image made from wire RRs) are not compared; nor is ZONE_IMAGE_F_EXT: the file keeps the case of an owner as it is written (an ext[] entry with the
+ * spelling, zonemd_a3.zone has NS2.EXAMPLE.), the database holds names in lower case (PowerDNS), and restrictions to some clients are ZONE_IMAGE_F_VIEW, which is compared; a tinydns zone is not in this list (it needs the data file). */
+static int oc_u64_cmp(const void *x, const void *y) { uint64_t a = *(const uint64_t *)x, b = *(const uint64_t *)y; return a < b ? -1 : a > b; }
+
+static bool image_oracle_same(const zone_image_t *a, const zone_image_t *b, char *why, size_t wl) {
+#define OC_BAD(...) do { snprintf(why, wl, __VA_ARGS__); return false; } while (0)
+    if (a->n_names != b->n_names || a->n_rrs != b->n_rrs) OC_BAD("%u names / %u RRs in the loader's image, %u / %u in the file's", a->n_names, a->n_rrs, b->n_names, b->n_rrs);
+    if ((a->flags & ~(uint32_t)(ZONE_IMAGE_F_PERM | ZONE_IMAGE_F_EXT)) != (b->flags & ~(uint32_t)(ZONE_IMAGE_F_PERM | ZONE_IMAGE_F_EXT))) OC_BAD("header flags %x and %x", a->flags, b->flags);
+    if (a->n_nsec != b->n_nsec || a->n_n3chains != b->n_n3chains || a->n_n3entries != b->n_n3entries || a->n_glue != b->n_glue || a->n_canon != b->n_canon)
+        OC_BAD("index sizes: nsec %u/%u, n3chains %u/%u, n3entries %u/%u, glue %u/%u", a->n_nsec, b->n_nsec, a->n_n3chains, b->n_n3chains, a->n_n3entries, b->n_n3entries, a->n_glue, b->n_glue);
+    if (a->apex_name == ZONE_IMAGE_NONE || b->apex_name == ZONE_IMAGE_NONE || strcasecmp(zone_image_name_text(a, a->apex_name), zone_image_name_text(b, b->apex_name)) != 0) OC_BAD("the apex differs");
+    if ((a->n3_param_rr == ZONE_IMAGE_NONE) != (b->n3_param_rr == ZONE_IMAGE_NONE) || a->n3_iterations != b->n3_iterations || a->n3_algorithm != b->n3_algorithm || a->n3_salt_len != b->n3_salt_len ||
+        (a->n3_salt_len && memcmp((const uint8_t *)a + a->off_strings + a->n3_salt_off, (const uint8_t *)b + b->off_strings + b->n3_salt_off, a->n3_salt_len) != 0))
+        OC_BAD("the NSEC3 parameters differ");
+    uint64_t *ra = malloc(sizeof(uint64_t) * (a->n_rrs ? a->n_rrs : 1)), *rb = malloc(sizeof(uint64_t) * (a->n_rrs ? a->n_rrs : 1));
+    bool ok = ra && rb;
+    char msg[300] = "out of memory";
+    for (uint32_t id = 0; ok && id < a->n_names; id++) {
+        const char *t = zone_image_name_text(a, id);
+        const uint32_t jd = zone_image_find_name(b, t);
+        if (jd == ZONE_IMAGE_NONE) { snprintf(msg, sizeof(msg), "'%.150s' is not in the file's image", t); ok = false; break; }
+        if (zone_image_name_flags(a, id) != zone_image_name_flags(b, jd) || zone_image_name_rr_count(a, id) != zone_image_name_rr_count(b, jd)) {
+            snprintf(msg, sizeof(msg), "'%.150s': flags %x / %x, RRs %u / %u", t, zone_image_name_flags(a, id), zone_image_name_flags(b, jd), zone_image_name_rr_count(a, id), zone_image_name_rr_count(b, jd));
+            ok = false;
+            break;
+        }
+        const uint32_t n = zone_image_name_rr_count(a, id);
+        for (uint32_t k = 0; k < n; k++) {
+            const uint32_t x = zone_image_name_first_rr(a, id) + k, y = zone_image_name_first_rr(b, jd) + k;
+            ra[k] = ((uint64_t)zone_image_rr_type(a, x) << 48) ^ ((uint64_t)zone_image_rr_ttl(a, x) << 16) ^ zone_image_rr_rdlen(a, x);
+            rb[k] = ((uint64_t)zone_image_rr_type(b, y) << 48) ^ ((uint64_t)zone_image_rr_ttl(b, y) << 16) ^ zone_image_rr_rdlen(b, y);
+        }
+        qsort(ra, n, sizeof(uint64_t), oc_u64_cmp);
+        qsort(rb, n, sizeof(uint64_t), oc_u64_cmp);
+        if (n && memcmp(ra, rb, n * sizeof(uint64_t)) != 0) { snprintf(msg, sizeof(msg), "'%.150s': the types, TTLs or RDATA lengths of its RRs differ", t); ok = false; }
+    }
+    const uint32_t *ca = zone_image_u32s(a, a->off_canon), *cb = zone_image_u32s(b, b->off_canon);
+    for (uint32_t i = 0; ok && i < a->n_canon; i++)
+        if (strcasecmp(zone_image_name_text(a, ca[i]), zone_image_name_text(b, cb[i])) != 0) { snprintf(msg, sizeof(msg), "canonical order differs at %u", i); ok = false; }
+    free(ra);
+    free(rb);
+    if (!ok) { snprintf(why, wl, "%s", msg); return false; }
+    return true;
+#undef OC_BAD
+}
+
 static void test_zone_files(void) {
     printf("zone files (%s)\n", g_zones_dir);
     DIR *d = opendir(g_zones_dir);
@@ -220,6 +271,16 @@ static void test_zone_files(void) {
             bool ok = pdns_roundtrip(z, &info, why, sizeof(why));
             CHECK_MSG(ok, "%s: KDB1 round trip: %s", names[k], why);
             if (ok) {
+                /* the oracle: the image that the zone file path makes of the same text against the image the loader makes of its rows (see image_oracle_same()) */
+                char oerr[300] = "", owhy[400] = "";
+                zone_image_t *li = pdns_zone_build_image(z, oerr, sizeof(oerr));
+                zone_arena_shrink_records(&fa);
+                zone_image_t *fi = build_zone_index(&fa, true) == 0 ? zone_image_freeze(&fa, apex) : NULL;
+                CHECK_MSG(li != NULL, "%s: the loader's image: %s", names[k], oerr);
+                CHECK_MSG(fi != NULL, "%s: the file's image cannot be made", names[k]);
+                if (li && fi) CHECK_MSG(image_oracle_same(li, fi, owhy, sizeof(owhy)), "%s: the loader's image is not the file's: %s", names[k], owhy);
+                zone_image_free(li);
+                zone_image_free(fi);
                 CHECK(info.rr_count == z->arena.count && info.rr_count >= 1);      /* the RRs of the image: the SOA once; the tag tables and the reset RRs of the extension are not RRs */
                 CHECK(info.max_body <= KDB_MAX_BODY && info.n_chunks >= 1);
                 printf("  [ OK ] %-34s %6zu RRs, image %llu bytes in %zu messages, zone %s\n", names[k], fa.count, (unsigned long long)info.image_size, info.n_chunks, rows.zone);

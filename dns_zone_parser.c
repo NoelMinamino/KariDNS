@@ -2910,7 +2910,7 @@ int validate_zone_dname(zone_arena_t *arena, parse_error_t *err) {
  *    offline (a PRESIGNED zone, or a signed zone file, fails).
  * One implementation for the loaders (via zone_image_freeze(), so every path that publishes a zone), the database reader and karicheck.
  * `detail` receives the message, which err->error_message then points to. */
-static bool pdns_alias_rdata_ok(const uint8_t *rd, size_t len) {
+bool pdns_alias_rdata_ok(const uint8_t *rd, size_t len) {
   size_t p = 0;
   for (;;) {
     if (p >= len) return false;
@@ -2921,7 +2921,7 @@ static bool pdns_alias_rdata_ok(const uint8_t *rd, size_t len) {
   }
 }
 
-static bool pdns_lua_rdata_ok(const uint8_t *rd, size_t len) {
+bool pdns_lua_rdata_ok(const uint8_t *rd, size_t len) {
   if (len < 3) return false;
   size_t p = 2;
   while (p < len) {

@@ -173,6 +173,8 @@ run_mode other-zone reject "outside the zone|no data at the apex"
 run_mode non-in-class reject "class 3"
 run_mode image-serial reject "not the one ZONE_BEGIN declared"
 run_mode image-tinydns reject "tinydns flag"
+run_mode nsec3-iter reject "NSEC3 iterations"
+run_mode ecs-trusted reject "ECS trusted"
 run_mode image-garbage reject "the zone image is refused"
 # B7b: SLAVE / CONSUMER zones carry no data; a secondary needs masters, and its rr_count is 0 (a ZONE_IMAGE after it is a protocol error)
 run_mode secondary-kind reject "needs masters in its settings"

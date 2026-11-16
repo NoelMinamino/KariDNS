@@ -555,11 +555,9 @@ typedef struct {
     uint64_t man_entries;                      /* entries seen in this pass */
     /* current zone, valid in IN_ZONE */
     uint64_t zone_rr_declared;                 /* ZONE_BEGIN rr_count */
-    uint64_t zone_bytes;                       /* octets of the image so far */
     bool zone_image;                           /* the zone being received is an image (ZONE_BEGIN flag KDB_ZF_IMAGE) */
     uint64_t zone_image_size;                  /* ... its announced size (ZONE_BEGIN tag 23) */
     uint64_t zone_image_have;                  /* ... the octets of ZONE_IMAGE messages so far; at most zone_image_size, equal to it at ZONE_END */
-    uint32_t zone_image_msgs;
     bool fetch;                                /* D1a: the fetch stream (kdb_sm_init_fetch()) */
     uint64_t zone_req_id;                      /* fetch stream: the request id of the zone being received (ZONE_BEGIN tag 11) */
     kdb_rc_t fail;

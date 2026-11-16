@@ -20,6 +20,8 @@
  *   non-in-class     an RR of class CH                                                  -> zone rejected
  *   image-serial     ZONE_BEGIN declares another serial than the SOA of the image        -> zone rejected
  *   image-tinydns    the image says tinydns, ZONE_BEGIN does not                         -> zone rejected
+ *   nsec3-iter       an NSEC3PARAM with 151 NSEC3 iterations (RFC 9276 3.2)             -> zone rejected
+ *   ecs-trusted      ECS trusted resolvers in the zone level tables of the image         -> zone rejected
  *   image-garbage    the octets after the header are noise                               -> zone rejected
  *   secondary-kind   zone_kind secondary, rr_count 0, no settings (B7b: no masters)              -> zone rejected
  *   secondary-data   zone_kind secondary with rr_count 2                                         -> protocol error
@@ -235,6 +237,24 @@ static void bad_zone(int fd, const char *mode) {
     } else if (strcmp(mode, "image-tinydns") == 0) {
         img = good_image(z, 5);
         img->flags |= ZONE_IMAGE_F_TINYDNS;
+        image_zone_ex(fd, z, 5, 0, img, 0, NULL, NULL);
+    } else if (strcmp(mode, "ecs-trusted") == 0) {
+        /* ECS trusted resolvers in the zone level tables of the image, with the extended flag (they come from the settings of the zone, inside acl-ceiling, never from the loader's image) */
+        snprintf(t, sizeof(t), "%s@ NS ns\nns A 192.0.2.1\n", soa5);
+        char apex[300], text[2400];
+        snprintf(apex, sizeof(apex), "%s.", z);
+        snprintf(text, sizeof(text), "$ORIGIN %s\n$TTL 300\n%s", apex, t);
+        img = zi_from_text_trusted(apex, text);
+        if (!img) { fprintf(stderr, "fake_dbloader: cannot make the image of %s\n", z); exit(3); }
+        image_zone_ex(fd, z, 5, KDB_ZF_EXTENDED, img, 0, NULL, NULL);
+    } else if (strcmp(mode, "nsec3-iter") == 0) {
+        /* an NSEC3PARAM of 10 iterations made 151: RFC 9276 section 3.2 (the zone parser would not freeze it, so the image is changed after it was made; every place that carries the number says 151) */
+        snprintf(t, sizeof(t), "%s@ NS ns\nns A 192.0.2.1\n@ NSEC3PARAM 1 0 10 aabb\n", soa5);
+        img = text_image(z, t, false);
+        img->n3_iterations = 151;
+        zone_image_rr_t *rr = (zone_image_rr_t *)(void *)((uint8_t *)img + img->off_rrs);
+        for (uint32_t k = 0; k < img->n_rrs; k++)
+            if (rr[k].type == 51 && rr[k].rdata_len >= 4) { uint8_t *rd = (uint8_t *)img + img->off_strings + rr[k].rdata_off; rd[2] = 0; rd[3] = 151; }
         image_zone_ex(fd, z, 5, 0, img, 0, NULL, NULL);
     } else if (strcmp(mode, "image-garbage") == 0) {
         img = good_image(z, 5);

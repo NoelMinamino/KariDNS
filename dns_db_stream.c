@@ -1201,7 +1201,6 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
         if (n > sm->lim.max_zone_records) SMFAIL(sm, KDB_E_LIMIT_RECORDS, "ZONE_BEGIN: rr_count above max-zone-records");
         sm->zone_image = false;
         sm->zone_image_size = sm->zone_image_have = 0;
-        sm->zone_image_msgs = 0;
         if (m->u.zone_begin.flags & KDB_ZF_IMAGE) {
             /* 0.7 M3: the data is an image.  rr_count is its n_rrs (at least the SOA); the size is a cap that is checked here, before one octet of the image is read:
              * what a zone image can hold at most (zone_image_validate() works in 32 bits), whole 8-octet units, a header and a strings area, and max-zone-bytes */
@@ -1213,7 +1212,6 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
             sm->zone_image_size = isz;
         }
         sm->zone_rr_declared = n;
-        sm->zone_bytes = 0;
         sm->state = KDB_S_IN_ZONE;
         break;
     }
@@ -1232,8 +1230,6 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
             if ((uint64_t)h.n_rrs != sm->zone_rr_declared) SMFAIL(sm, KDB_E_COUNT, "ZONE_IMAGE: the RR count in the header differs from ZONE_BEGIN");
         }
         sm->zone_image_have += len;
-        sm->zone_bytes += len;
-        if (sm->zone_image_msgs < UINT32_MAX) sm->zone_image_msgs++;
         break;
     }
     case KDB_T_ZONE_END:
