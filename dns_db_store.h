@@ -76,6 +76,10 @@ bool db_store_enabled(void);
  * the thread waits for the attach requests of queries, takes at most 20,000 zones a second and stops at the high mark of memory-limit.  db_store_stop() ends it and writes the list of the zones in memory. */
 void db_store_hot_start(void);
 store_t *db_store_handle(void);
+/* 0.7: the bound of the store's journal (store_journal_wait()), for a thread that holds none of this module's locks: the reconcile thread between the groups of a pass
+ * (factor 2), the ingest thread once per pass of its loop (factor 4: it also answers the lookups, so it waits only where the bulk writer did not keep the journal down).
+ * The microseconds waited (0: none, no store). */
+uint64_t db_store_journal_wait(unsigned factor);
 
 /* ---- the ingest threads ---- */
 

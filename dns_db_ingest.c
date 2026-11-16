@@ -5125,6 +5125,7 @@ static void *ingest_thread(void *arg) {
     hold_check(g);
     if (g->stream_fd >= 0 && g->out_off < g->out_len) out_flush(g);
     if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);
+    (void)db_store_journal_wait(4);                      /* 0.7: the hard bound of the store's journal (4 x its limit; the reconcile thread waits at 2 x), with no lock held */
     {
       int64_t t1 = mono_ns();
       busy_ns += t1 - t_wake;
