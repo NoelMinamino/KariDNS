@@ -2149,10 +2149,22 @@ static int ck_now_locked(store_t *s) {
   return r < 0 ? r : given;
 }
 
+/* the flags for the checkpoint thread of the flusher: false (none taken) when a writer has handed it a checkpoint meanwhile (post_write()): that one holds the flags until this thread
+ * runs it, so waiting for them here would never end */
+static bool ck_acquire_fl(store_t *s) {
+  pthread_mutex_lock(&s->bg_mu);
+  while ((s->io_busy || s->ck_busy) && !s->ck_handoff) pthread_cond_wait(&s->bg_cv, &s->bg_mu);
+  const bool ok = !s->ck_handoff;
+  if (ok) s->io_busy = s->ck_busy = true;
+  pthread_mutex_unlock(&s->bg_mu);
+  return ok;
+}
+
 /* A checkpoint from a thread that holds no lock (the flusher, store_checkpoint()): the flags, the begin under the writer mutex, the rest without it.  force: also when nothing was
- * written since the last one.  0, or -errno. */
-static int st_ckpt(store_t *s, bool force) {
-  ck_acquire(s);
+ * written since the last one.  fl: the flusher's checkpoint thread (it gives way to a checkpoint handed to it, and returns 1).  0, or -errno. */
+static int st_ckpt(store_t *s, bool force, bool fl) {
+  if (!fl) ck_acquire(s);
+  else if (!ck_acquire_fl(s)) return 1;
   int r = 0;
   if (s->jold >= 0) {                                 /* (a journal whose sync failed: synced first, with no lock held) */
     if (fdatasync(s->jold) != 0) r = -errno;
@@ -2588,7 +2600,7 @@ static int wr_lock(store_t *s) {
 static void bg_due(store_t *s) {
   const uint64_t now = st_now_ms();
   if (commit_due(s, now)) (void)st_commit(s, atomic_load_explicit(&s->lsn, memory_order_relaxed));
-  if (ckpt_due(s, now) && st_ckpt(s, false) == 0) ck_after(s);
+  if (ckpt_due(s, now) && st_ckpt(s, false, false) == 0) ck_after(s);
 }
 
 /* The end of a writer call: the mutex is given up; STORE_SYNC_EVERY makes the call durable now (with the mutex released: other writers go on), and without a flusher the due work is done
@@ -4154,7 +4166,7 @@ int store_tick(store_t *s) {
 }
 int store_checkpoint(store_t *s) {
   if (!s) return -EINVAL;
-  int r = st_ckpt(s, true);
+  int r = st_ckpt(s, true, false);
   ck_after(s);
   return r;
 }
@@ -5358,7 +5370,7 @@ static void *fl_ckpt_main(void *arg) {
     if (s->bg_stop || s->ck_handoff) continue;
     pthread_mutex_unlock(&s->bg_mu);
     int r = 0;
-    if (ckpt_due(s, st_now_ms()) && (r = st_ckpt(s, false)) == 0) ck_after(s);
+    if (ckpt_due(s, st_now_ms()) && (r = st_ckpt(s, false, true)) == 0) ck_after(s);
     pthread_mutex_lock(&s->bg_mu);
     if (r < 0) bg_backoff(s, 1000);
   }
