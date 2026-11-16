@@ -3381,7 +3381,7 @@ static void test_signer_wait(void) {
     int64_t all[5] = { 0, 1, 2, 3, 4 }, one[1] = { 2 };
     bool yes[5];
     CHECK(db_driver_sqlite3.begin_snapshot(c) == 0);
-    zones_are_signers(&x, all, 5, yes);                                  /* per zone: SQLite3 has no scan_metadata_in */
+    zones_are_signers(&x, all, 5, yes);                                  /* the driver's scan_metadata_in */
     CHECK_MSG(yes[0] && yes[1] && !yes[2] && yes[3] && !yes[4], "%d %d %d %d %d", yes[0], yes[1], yes[2], yes[3], yes[4]);       /* kind without regard to case, blanks around the 1, exactly 1 */
     zones_are_signers(&x, one, 1, yes);
     CHECK(!yes[0]);
@@ -4292,6 +4292,251 @@ static void test_lookup(void) {
 #undef LK
 }
 
+/* ------------------------------------------------------------------ 0.7 (loader reads): scan_*_in of SQLite3, the kept statements, and the fetch batches */
+extern unsigned long sq_reprepares(db_conn_t *c);
+
+typedef struct { char *s; size_t n, cap; } sigbuf_t;
+
+static void sig_add(sigbuf_t *g, const char *fmt, ...) {
+    char t[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    int k = vsnprintf(t, sizeof(t), fmt, ap);
+    va_end(ap);
+    if (k < 0) return;
+    if (g->n + (size_t)k + 1 > g->cap) {
+        g->cap = (g->n + (size_t)k + 1) * 2;
+        g->s = realloc(g->s, g->cap);
+    }
+    memcpy(g->s + g->n, t, (size_t)k + 1);
+    g->n += (size_t)k;
+}
+
+static int mp_count(void *ud, const db_manifest_row_t *r) { (void)ud; (void)r; return 0; }
+static int dv_null(void *ud, int64_t did, const char *vn) { (void)ud; (void)did; (void)vn; return 0; }
+static const char *nz(const char *s) { return s ? s : "-"; }
+static int sg_rec(void *ud, int64_t did, const db_record_row_t *r) {
+    sig_add(ud, "R%lld/%lld/%s/%s/%s/%lld/%lld/%d;", (long long)did, (long long)r->id, nz(r->name), nz(r->type), nz(r->content), (long long)r->ttl, (long long)r->prio, r->disabled);
+    return 0;
+}
+static int sg_meta(void *ud, const db_meta_row_t *m) {
+    sig_add(ud, "M%lld/%s/%s;", (long long)m->domain_id, nz(m->kind), nz(m->content));
+    return 0;
+}
+typedef struct { sigbuf_t tags, td, defs; } sgx_t;
+static int sg_tag(void *ud, int64_t did, const db_tag_row_t *r) {
+    sig_add(&((sgx_t *)ud)->tags, "T%lld/%lld/%s/%s;", (long long)did, (long long)r->record_id, nz(r->location_tag), nz(r->ecs_tag));
+    return 0;
+}
+static int sg_td(void *ud, int64_t did, const db_tinydns_row_t *r) {
+    sig_add(&((sgx_t *)ud)->td, "D%lld/%lld/%lld/%s/%d;", (long long)did, (long long)r->record_id, (long long)r->ttd, nz(r->loc), r->countdown);
+    return 0;
+}
+static int sg_def(void *ud, int64_t did, const db_tagdef_row_t *r) {
+    sig_add(&((sgx_t *)ud)->defs, "G%lld/%s/%s/%s;", (long long)did, nz(r->kind), nz(r->tag), nz(r->cidr));
+    return 0;
+}
+
+/* the rows of the zones ids[0..n) in one call and zone by zone (ascending ids): the same text */
+static bool in_same(db_conn_t *c, const int64_t *ids, size_t n) {
+    const db_driver_t *D = &db_driver_sqlite3;
+    sigbuf_t ra = { 0 }, rb = { 0 }, ma = { 0 }, mb = { 0 };
+    sgx_t xa, xb;
+    memset(&xa, 0, sizeof(xa));
+    memset(&xb, 0, sizeof(xb));
+    db_ext_sink_t sa = { sg_tag, sg_td, sg_def, &xa }, sb = { sg_tag, sg_td, sg_def, &xb };
+    int rc = D->scan_records_in(c, ids, n, sg_rec, &ra);
+    rc |= D->scan_metadata_in(c, ids, n, sg_meta, &ma);
+    rc |= D->scan_ext_in(c, ids, n, &sa);
+    for (size_t i = 0; i < n; i++) {
+        rc |= D->scan_records(c, &ids[i], sg_rec, &rb);
+        rc |= D->scan_metadata(c, &ids[i], sg_meta, &mb);
+        rc |= D->scan_ext(c, &ids[i], &sb);
+    }
+    bool ok = rc == 0 && ra.n == rb.n && ma.n == mb.n && xa.tags.n == xb.tags.n && xa.td.n == xb.td.n && xa.defs.n == xb.defs.n;
+    ok = ok && (ra.n == 0 || strcmp(ra.s, rb.s) == 0) && (ma.n == 0 || strcmp(ma.s, mb.s) == 0) && (xa.tags.n == 0 || strcmp(xa.tags.s, xb.tags.s) == 0) &&
+         (xa.td.n == 0 || strcmp(xa.td.s, xb.td.s) == 0) && (xa.defs.n == 0 || strcmp(xa.defs.s, xb.defs.s) == 0);
+    if (!ok) printf("    n=%zu rc=%d: records %zu/%zu, metadata %zu/%zu, tags %zu/%zu, tinydns %zu/%zu, defs %zu/%zu bytes\n", n, rc, ra.n, rb.n, ma.n, mb.n, xa.tags.n, xb.tags.n,
+                    xa.td.n, xb.td.n, xa.defs.n, xb.defs.n);
+    free(ra.s); free(rb.s); free(ma.s); free(mb.s);
+    free(xa.tags.s); free(xb.tags.s); free(xa.td.s); free(xb.td.s); free(xa.defs.s); free(xb.defs.s);
+    return ok;
+}
+
+static void test_scan_in(void) {
+    printf("scan_records_in / scan_metadata_in / scan_ext_in (0.7): the rows of several zones are the rows of the zone-by-zone calls; the kept statements are not parsed again\n");
+    char path[600], err[DB_ERRLEN];
+    sqlite3 *db = make_db("scanin.db", path, sizeof(path));
+    char *ext = slurp(g_ext_path);
+    CHECK(ext != NULL);
+    if (!db || !ext) return;
+    raw_exec(db, ext);
+    free(ext);
+    for (int i = 1; i <= 140; i++) {
+        char nm[40];
+        snprintf(nm, sizeof(nm), "z%d.test", i);
+        add_simple_zone(db, i, 1000 + 10 * i, nm);                          /* records 1000+10i .. +2 */
+        if (i % 7 == 0) sqlf(db, "INSERT INTO domainmetadata (domain_id, kind, content) VALUES (%d, 'X-A', '1'), (%d, 'X-B', 'two')", i, i);
+        if (i % 5 == 0) sqlf(db, "INSERT INTO karidns_record_tags (record_id, location_tag, ecs_tag) VALUES (%d, 'lan', NULL)", 1000 + 10 * i + 2);
+        if (i % 11 == 0) sqlf(db, "INSERT INTO karidns_record_tinydns (record_id, ttd, loc, countdown) VALUES (%d, 99, 'l1', 1)", 1000 + 10 * i + 2);
+        if (i % 13 == 0)
+            sqlf(db, "INSERT INTO karidns_zone_tagdefs (domain_id, kind, tag, cidr) VALUES (%d, 'location', 'a', '192.0.2.0/24'), (%d, 'location', 'a', '198.51.100.0/24')", i, i);
+    }
+    add_zone(db, 141, "empty.test", "NATIVE");                              /* a zone without a row anywhere */
+    raw_exec(db, "ANALYZE");                                                /* (the planner has statistics, as in a database that has been used) */
+    sqlite3_close(db);
+    int rc = 0;
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), &rc);
+    CHECK(c != NULL && rc == 0);
+    if (!c) return;
+    const db_driver_t *D = &db_driver_sqlite3;
+    db_schema_info_t si;
+    CHECK(D->check_schema(c, &si) == 0 && si.has_ext);
+    CHECK(D->begin_snapshot(c) == 0);
+    CHECK(D->scan_records_in != NULL && D->scan_metadata_in != NULL && D->scan_ext_in != NULL);
+    static const size_t sizes[] = { 1, 2, 3, 4, 5, 8, 9, 16, 17, 33, 64, 65, 127, 128 };       /* the size classes of the kept statements and their edges */
+    for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
+        int64_t ids[DB_IN_MAX];
+        for (size_t i = 0; i < sizes[k]; i++) ids[i] = (int64_t)i + 1;
+        CHECK_MSG(in_same(c, ids, sizes[k]), "the first %zu zones", sizes[k]);
+    }
+    {   /* a zone with no rows (141), a zone that is not there (142, 200), and scattered ids; the order of the ids does not matter for the rows, which are ordered by id */
+        int64_t a[] = { 7, 141, 142 }, b[] = { 141 }, c3[] = { 5, 10, 11, 13, 143, 200 }, d[] = { 142 };
+        CHECK(in_same(c, a, 3));
+        CHECK(in_same(c, b, 1));
+        CHECK(in_same(c, c3, 6));
+        CHECK(in_same(c, d, 1));
+        sigbuf_t s = { 0 };
+        CHECK(D->scan_records_in(c, d, 1, sg_rec, &s) == 0 && s.n == 0);
+        CHECK(D->scan_records_in(c, b, 1, sg_rec, &s) == 0 && s.n == 0);
+        free(s.s);
+    }
+    {   /* a stopped scan leaves the statement usable; more or fewer zones than allowed is an error that says so */
+        int64_t ids[DB_IN_MAX + 1];
+        for (size_t i = 0; i < DB_IN_MAX + 1; i++) ids[i] = (int64_t)i + 1;
+        size_t cnt = 0;
+        CHECK(D->scan_records_in(c, ids, 3, stop_rec, &cnt) == DB_STOPPED && cnt == 1);
+        CHECK(in_same(c, ids, 3));
+        CHECK(D->scan_records_in(c, ids, 0, rec_collect, NULL) == -1 && strstr(D->errmsg(c), "scan_*_in") != NULL);
+        CHECK(D->scan_records_in(c, ids, DB_IN_MAX + 1, rec_collect, NULL) == -1);
+        CHECK(D->scan_metadata_in(c, ids, 0, sg_meta, NULL) == -1 && D->scan_metadata_in(c, ids, DB_IN_MAX + 1, sg_meta, NULL) == -1);
+        sgx_t xs;
+        memset(&xs, 0, sizeof(xs));
+        db_ext_sink_t sk = { sg_tag, sg_td, sg_def, &xs };
+        CHECK(D->scan_ext_in(c, ids, 0, &sk) == -1 && D->scan_ext_in(c, ids, DB_IN_MAX + 1, &sk) == -1);
+    }
+    /* no statement is parsed again for what has been used: the second round of every size is free */
+    {
+        int64_t ids[DB_IN_MAX];
+        for (size_t i = 0; i < DB_IN_MAX; i++) ids[i] = (int64_t)i + 1;
+        unsigned long p0 = g_sq_prepares;
+        for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) CHECK(in_same(c, ids, sizes[k]));
+        CHECK(g_sq_prepares == p0);
+    }
+    CHECK(D->end_snapshot(c) == 0);
+    /* a fetch-like round on a kept connection, many times, on a database with statistics: no statement expires, so none is parsed again (clear_bindings after a reset did that) */
+    {
+        const char *names[] = { "www.z5.test.", "z5.test.", "test." };
+        int64_t one = 5;
+        unsigned long p0 = 0;
+        unsigned long r0 = 0;          /* (SQLite parses a statement of `domain_id = ?1` again when it is bound to 1 or 2 after another value, whatever the planner sees in it: the calls above did that, so the rounds use other ids and count from here) */
+        for (int round = 0; round < 40; round++) {
+            CHECK(D->begin_snapshot(c) == 0);
+            zl_t l;
+            memset(&l, 0, sizeof(l));
+            char nm[32];
+            snprintf(nm, sizeof(nm), "z%d.test.", round % 20 + 20);
+            CHECK(D->find_zone(c, nm, zl_collect, &l) == 0 && l.n == 1);
+            zl_free(&l);
+            CHECK(D->find_zones_in(c, names, 3, zl_collect, &l) == 0 && l.n == 1);
+            zl_free(&l);
+            one = round % 20 + 20;
+            CHECK(D->scan_domain_views(c, &one, dv_null, NULL) == 0);
+            sigbuf_t s = { 0 };
+            sgx_t xs;
+            memset(&xs, 0, sizeof(xs));
+            db_ext_sink_t sk = { sg_tag, sg_td, sg_def, &xs };
+            CHECK(D->scan_metadata(c, &one, sg_meta, &s) == 0 && D->scan_records(c, &one, sg_rec, &s) == 0 && D->scan_ext(c, &one, &sk) == 0);
+            CHECK(D->scan_records_in(c, (int64_t[]){ 3, 5, 7 }, 3, sg_rec, &s) == 0);
+            CHECK(D->zones_with_keys(c, collect_key, &(keys_t){ 0 }) == 0);
+            uint64_t cnt = 0;
+            CHECK(D->count_domains(c, NULL, &cnt) == 0 && cnt == 141);
+            int64_t last = 0;
+            unsigned nr = 0;
+            CHECK(D->manifest_page(c, 0, 10, mp_count, NULL, &last, &nr) == 0 && nr == 10);
+            free(s.s);
+            free(xs.tags.s);
+            free(xs.td.s);
+            free(xs.defs.s);
+            CHECK(D->end_snapshot(c) == 0);
+            if (round == 0) p0 = g_sq_prepares;
+            if (round == 2) r0 = sq_reprepares(c);                  /* (the first rounds may parse a statement again once, as a new statement settles) */
+        }
+        CHECK_MSG(g_sq_prepares == p0, "statements parsed in the later rounds: %lu", g_sq_prepares - p0);
+        CHECK_MSG(sq_reprepares(c) == r0, "statements that expired and were parsed again: %lu", sq_reprepares(c) - r0);
+    }
+    D->close(c);
+
+    /* a database without the extension tables: scan_ext_in says so, the other two work */
+    sqlite3 *pdb = make_db("scanin_plain.db", path, sizeof(path));
+    add_simple_zone(pdb, 1, 10, "a.test");
+    sqlite3_close(pdb);
+    c = open_driver(path, 0, err, sizeof(err), &rc);
+    CHECK(c != NULL);
+    if (!c) return;
+    CHECK(D->check_schema(c, &si) == 0 && !si.has_ext);
+    {
+        int64_t one = 1;
+        sgx_t xs;
+        memset(&xs, 0, sizeof(xs));
+        db_ext_sink_t sk = { sg_tag, sg_td, sg_def, &xs };
+        sigbuf_t s = { 0 };
+        CHECK(D->scan_ext_in(c, &one, 1, &sk) == DB_ERR_UNAVAILABLE);
+        CHECK(D->scan_records_in(c, &one, 1, sg_rec, &s) == 0 && s.n > 0);
+        free(s.s);
+    }
+    D->close(c);
+}
+
+static void test_find_zones_classes(void) {
+    printf("find_zones_in() with kept statements (0.7): every number of names, parsed once for its size class\n");
+    char path[600], err[DB_ERRLEN];
+    sqlite3 *db = make_db("zlk.db", path, sizeof(path));
+    if (!db) return;
+    add_simple_zone(db, 5, 50, "z5.test");
+    add_simple_zone(db, 6, 60, "sub.z5.test");
+    sqlite3_close(db);
+    int rc = 0;
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), &rc);
+    CHECK(c != NULL);
+    if (!c) return;
+    const db_driver_t *D = &db_driver_sqlite3;
+    CHECK(D->begin_snapshot(c) == 0);
+    static const size_t counts[] = { 1, 2, 3, 4, 5, 8, 9, 16, 17, 32, 33, 64, 65, 127, 128 };
+    char store[DB_LOOKUP_MAX][40];
+    const char *names[DB_LOOKUP_MAX];
+    for (int round = 0; round < 2; round++) {
+        unsigned long p0 = g_sq_prepares;
+        for (size_t k = 0; k < sizeof(counts) / sizeof(counts[0]); k++) {
+            size_t n = counts[k];
+            for (size_t i = 0; i < n; i++) {
+                snprintf(store[i], sizeof(store[i]), "none%zu.invalid.", i);
+                names[i] = store[i];
+            }
+            snprintf(store[n - 1], sizeof(store[n - 1]), "z5.test.");           /* the last name is the zone; with n > 1 another is below it */
+            if (n > 1) snprintf(store[0], sizeof(store[0]), "sub.z5.test");
+            zl_t l;
+            memset(&l, 0, sizeof(l));
+            CHECK_MSG(D->find_zones_in(c, names, n, zl_collect, &l) == 0, "n=%zu", n);
+            CHECK_MSG(n > 1 ? l.n == 2 && l.id[0] == 6 && l.id[1] == 5 : l.n == 1 && l.id[0] == 5, "n=%zu gave %zu zones", n, l.n);
+            zl_free(&l);
+        }
+        if (round == 1) CHECK_MSG(g_sq_prepares == p0, "round 2 parsed %lu statements", g_sq_prepares - p0);
+    }
+    D->end_snapshot(c);
+    D->close(c);
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/db";
     snprintf(g_schema, sizeof(g_schema), "%s/pdns_schema.sqlite3.sql", dir);
@@ -4347,6 +4592,8 @@ int main(int argc, char **argv) {
     test_paged();
     test_store_loader();
     test_lookup();
+    test_scan_in();
+    test_find_zones_classes();
     test_manifest_rate();
     test_schema_versions();
     test_audit_actor();
