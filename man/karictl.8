@@ -554,40 +554,47 @@ were all taken; \fBring_dropped\fR, requests the workers could not hand to the
 ingest thread because their ring of 128 was full; \fBpark_full\fR, queries that
 found the table of parked queries full (\fBpark\-max\fR); \fBpark_timeout\fR,
 parked queries whose zone was not there before \fBpark\-timeout\fR;
-\fBloader_busy\fR, fetches the loader turned away because its queue was full;
-\fBingest_busy\fR, the share of the last ten seconds the ingest thread was
-working instead of waiting, 0 for the first ten seconds; \fBfill_busy\fR, the
-part of that the bodies of the first fill (the background fetch of the zones the
-store lists without a body) took; \fBhist\fR, the time from the request to the
-install of the fetches that succeeded: up to 1 ms, up to 10 ms, up to 100 ms, up
-to 1 s, more; see "\fBkarictl dbstatus\fR shows it" under "Memory limit (D1a)"
-in \fBkaridns(8)\fR), then (0.7, the first fill of the zone store) \fBlookup of
-names while the first pass has not listed every zone: ready=yes|no in_flight=N
-found=N none=N failed=N refused=N same_name=N\fR (the by-name lookups of queries
-for a name that no stored zone covers while a view's first pass has not listed
-every zone, see "The first fill and the queries (0.7)" in \fBkaridns(8)\fR:
-\fBready\fR, the store protocol is on and the loader answers lookups, which is
-when a query is parked for one; \fBin_flight\fR, the lookups out now (at most
-32, counted from the worker's request to the end of the ingest thread's work on
-it); all the others are counted since the start: \fBfound\fR, lookups that gave
-a zone, which is then known (its query is answered from it); \fBnone\fR, lookups
-that found no zone of the view that encloses the name (the query is REFUSED, as
-for any name the server does not serve); \fBfailed\fR, lookups that ended in a
-failure (the loader or its fetch stream went away, the loader named a zone that
-does not enclose the name, or the zone could not be recorded; each is logged as
-\fB[DB] lookup of the name ... failed\fR, and the query is woken and refused,
-not failed); \fBrefused\fR, requests of the workers that the ingest thread did
-not send (a name the stream does not take, no connection of the fetch stream, no
-free place in the fetch table); \fBsame_name\fR, requests that joined a lookup
-of the same name that was on its way), the NOTIFY of zones that are out of
-memory (D1a: \fBnotify of zones out of memory: queued=N deferred=N\fR, the zones
-whose serial changed while their data was out of memory that were handed to the
-control thread, and the ones that did not fit in the ring of 1024 and are queued
-later), the zone transfers of zones that are out of memory (D1a, \fBtransfers of
-zones out of memory: waited=N loaded=N failed=N summary_answers=N marked=N
-timeout=Nms\fR: transfers that had to wait for the zone, the zones they got, the
-ones that ended with SERVFAIL, the IXFRs answered from the summary without
-reading the zone, the zones marked evict-next, and
+\fBloader_busy\fR, fetches (and lookups) the loader turned away because its
+queue was full (the queries that wait for them are dropped and counted,
+\fBstore.park.drop.queue\fR and \fBstore.lookup.drop.queue\fR, not answered
+SERVFAIL: busy is overload); \fBingest_busy\fR, the share of the last ten
+seconds the ingest thread was working instead of waiting, 0 for the first ten
+seconds; \fBfill_busy\fR, the part of that the bodies of the first fill (the
+background fetch of the zones the store lists without a body) took; \fBhist\fR,
+the time from the request to the install of the fetches that succeeded: up to 1
+ms, up to 10 ms, up to 100 ms, up to 1 s, more; see "\fBkarictl dbstatus\fR
+shows it" under "Memory limit (D1a)" in \fBkaridns(8)\fR), then (0.7, the first
+fill of the zone store) \fBlookup of names while the first pass has not listed
+every zone: ready=yes|no in_flight=N found=N none=N failed=N refused=N
+same_name=N\fR (the by-name lookups of queries for a name that no stored zone
+covers while a view's first pass has not listed every zone, see "The first fill
+and the queries (0.7)" in \fBkaridns(8)\fR: \fBready\fR, the store protocol is
+on and the loader answers lookups, which is when a query is parked for one;
+\fBin_flight\fR, the lookups out now (at most 32, counted from the worker's
+request to the end of the ingest thread's work on it); all the others are
+counted since the start: \fBfound\fR, lookups that gave a zone, which is then
+known (its query is answered from it); \fBnone\fR, lookups that found no zone of
+the view that encloses the name (the query is REFUSED, as for any name the
+server does not serve); \fBfailed\fR, lookups that ended in a failure (the
+loader or its fetch stream went away, the loader named a zone that does not
+enclose the name, the zone could not be recorded, or the zone the lookup found
+could not be read from the database (the body that came with it failed); each is
+logged as \fB[DB] lookup of the name ... failed\fR, and the query is answered
+SERVFAIL + EDE 14, not refused; a loader that said it is busy is overload and
+the query is dropped, see \fBstore.lookup.drop.queue\fR); \fBrefused\fR,
+requests of the workers that the ingest thread did not send because there is
+nothing to ask (a name the stream does not take, a view that takes no database
+zones, a loader that does not look names up; a loader that is only away does not
+count: the lookup waits for it and is dropped at its time); \fBsame_name\fR,
+requests that joined a lookup of the same name that was on its way), the NOTIFY
+of zones that are out of memory (D1a: \fBnotify of zones out of memory: queued=N
+deferred=N\fR, the zones whose serial changed while their data was out of memory
+that were handed to the control thread, and the ones that did not fit in the
+ring of 1024 and are queued later), the zone transfers of zones that are out of
+memory (D1a, \fBtransfers of zones out of memory: waited=N loaded=N failed=N
+summary_answers=N marked=N timeout=Nms\fR: transfers that had to wait for the
+zone, the zones they got, the ones that ended with SERVFAIL, the IXFRs answered
+from the summary without reading the zone, the zones marked evict-next, and
 \fBtransfer\-fetch\-timeout\fR) and the cost of the zone directory (\fBzone
 directory: N elements, B bytes in the registry + I bytes in the indexes of the
 views (P bytes per zone)\fR; the entries and images are not in it), then
@@ -880,11 +887,11 @@ because they waited \fBpark\-timeout\fR
 .TP 8
 \fBstore.lookup.drop.room\fR, \fB.drop.timeout\fR, \fB.drop.queue\fR, \fB.servfail\fR
 0.7: queries that were dropped (nothing is answered, like a query that
-\fBrate\-limit\fR drops; a TCP connection is closed) because the lookup found no
-room in the worker's park table, its \fBpark\-timeout\fR was up before the
-lookup was answered, or the ingest thread dropped the lookup (its queue was
-full, or it waited there until its time was up); and queries answered SERVFAIL +
-EDE 14 because their lookup failed
+\fBrate\-limit\fR drops; a TCP connection stays open and its next message is
+read) because the lookup found no room in the worker's park table, its
+\fBpark\-timeout\fR was up before the lookup was answered, or the ingest thread
+dropped the lookup (its queue was full, or it waited there until its time was
+up); and queries answered SERVFAIL + EDE 14 because their lookup failed
 .TP 8
 \fBstore.park.drop.room\fR, \fB.drop.timeout\fR, \fB.drop.queue\fR
 The same for a query that waits for a zone that is out of memory: the park table
