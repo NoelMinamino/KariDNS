@@ -1093,6 +1093,19 @@ so this is short whatever the pass is) in the last 10 to 20 seconds, in
 microseconds. The loop has the bodies of the fill as well (they are built on
 that thread with \fBingest\-threads 1\fR) and the commit at the end of a batch
 .TP 8
+\fBstore.fill.images\fR, \fB.image_bytes\fR, \fB.validate_ns\fR, \fB.validate_ns_per_image\fR
+0.7: zone images the Backend took from the loader since the start (a first fill,
+a reload, a fetch), their size in bytes, the time spent in
+\fBzone_image_validate_ex()\fR (the check that every image passes before it is
+stored or served) in nanoseconds in all and per image
+.TP 8
+\fBstore.fill.invalid\fR, \fB.store_only\fR, \fB.resident\fR
+Images refused by that check (the zone is rejected, \fBkarictl dbstatus
+<zone>\fR says why); images of a zone that was not in memory, which went to the
+store as they are (a background fill: no entry, no registry change; the zone is
+attached from its record when the first query comes); images installed as the
+zone's version in memory
+.TP 8
 \fBstore.recon.guard.held_views\fR
 Views whose sweep the mass-delete guard holds back (0 normally). With 1 or more:
 \fB.view\fR, \fB.unlisted\fR (zones the pass did not list), \fB.total\fR,

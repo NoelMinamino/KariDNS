@@ -3578,13 +3578,14 @@ zone.
 \fBmax\-zone\-records <n>;\fR
 \fIDefault:\fR \fB10000000\fR
 .br
-\fIDescription:\fR Records of one zone, 2..4294967295.
+\fIDescription:\fR Records of one zone, 2..4294967295: the RRs of the zone image
+(the SOA counts once; it counted twice before 0.7).
 .TP 8
 \fBmax\-zone\-bytes <size>;\fR
 \fIDefault:\fR \fB1G\fR
 .br
-\fIDescription:\fR Bytes of one zone on the stream, 65535..64G (K, M, G
-suffixes).
+\fIDescription:\fR Bytes of one zone: the size of its zone image, 65535..64G (K,
+M, G suffixes).
 .TP 8
 \fBdb\-reload\-timeout <s>;\fR
 \fIDefault:\fR \fB30\fR
@@ -3598,7 +3599,10 @@ parked (at most 32 at once).
 \fIDefault:\fR \fB1\fR
 .br
 \fIDescription:\fR 1..16 each. \fBingest\-threads\fR is the number of builder
-threads of the Backend: with 1 the thread that reads the stream also builds the
+threads of the Backend (0.7: the loader builds the zone images, so the builders
+only check them and install them, and only without the zone store, in memory
+mode; with the store the thread that reads the stream does it and the setting
+changes nothing): with 1 the thread that reads the stream also installs the
 zones; with more, complete zones are handed to that many builders (at most that
 many zones in flight; read when the server starts). \fBloader\-threads\fR is the
 number of workers of the loader: each has its own database connection and
@@ -3968,6 +3972,25 @@ commit within about \fBpoll\-interval\fR plus \fBcoalesce\fR (1.0-1.3 s with 1 s
 and 200 ms). If the loader dies it is restarted after 1 s, 2 s, 4 s ... 60
 s. All figures, the thread sweep and the recommended \fBingest\-threads\fR /
 \fBloader\-threads\fR are in \fBkaridns\-dbloader(8)\fR, "Measurements".
+.PP
+\fBZone images (0.7).\fR The loader builds each zone as a zone image and sends
+it in \fBZONE_IMAGE\fR messages; the Backend checks it
+(\fBzone_image_validate_ex()\fR: the apex and the owners, the class, the SOA
+rules, the extension rules, the sizes, the counts, \fBmax\-zone\-records\fR as
+the number of RRs with the SOA once, \fBmax\-zone\-bytes\fR as the size of the
+image, and the limits of the zone of \fBkaridns.conf\fR) and uses it as it is. A
+zone that fails is rejected as a zone (the last good version keeps serving,
+\fBkarictl dbstatus <zone>\fR names the reason); an image that does not agree
+with the \fBZONE_BEGIN\fR before it, or comes in more or fewer octets than
+announced, is a protocol error and the loader is restarted. A loader that does
+not send images, or builds another image version, is refused at HELLO (the log
+says so); the loader and the server of one release agree. With the zone store
+the zones of a first fill and of the background fetch go to the store as they
+are and are attached when the first query comes (\fBstore.fill.*\fR of
+\fBkarictl store\fR). The digest of a zone is SHA-256 of the image plus the
+markers of the settings, the profile and a presigned zone: a zone the store
+holds with the digest of the previous release is sent once more at the first
+start after the upgrade (its content is the same).
 .PP
 \fBAuto reload (\fBauto\-reload yes;\fB, milestone B9).\fR Every
 \fBpoll\-interval\fR seconds the loader asks each view's database, on a
@@ -5744,7 +5767,7 @@ typed by hand into a settings text or \fBkaridns.conf\fR without a port takes
 usual ACLs (\fBALLOW\-AXFR\-FROM\fR and so on: a database secondary can itself
 be transferred, bounded by \fBacl\-ceiling\fR), and sends \fBZONE_BEGIN\fR with
 the zone kind secondary (or catalog) and \fBno data\fR (\fBrr_count 0\fR, no
-\fBZONE_DATA\fR). \fBmasters\fR and \fBprimaries\fR are the same statement; in a
+zone image). \fBmasters\fR and \fBprimaries\fR are the same statement; in a
 settings text they accept IP addresses only (at most 32).
 .PP
 \fBHow the Backend runs it.\fR The Backend keeps an ordinary zone entry for the
@@ -5829,14 +5852,14 @@ the zone option \fBecs\-trusted\-resolvers\fR: addresses and prefixes, separated
 by commas or blanks, one or several rows, a leading \fB!\fR excludes (first
 match decides). An entry that is not an address or prefix fails the zone.
 .PP
-\fBHow it travels.\fR The loader sends these tables in the zone's
-\fBZONE_DATA\fR as Extended AXFR records, written by the same encoder as
-Extended AXFR out (\fBxext_*\fR in \fBdns_wire.c\fR); \fBZONE_BEGIN\fR flag bit1
-(extended) says the records are there, bit2 (tinydns) is the tinydns flag. The
-Backend reads them with the transfer parser a secondary uses and accepts them
-only in a zone that announced them; a malformed definition, state or wrapper
-record, a tag longer than 63 octets, more than 4096 tinydns locations or an
-\fBECS_TRUSTED\fR record rejects the zone. The digest of a zone covers the
+\fBHow it travels.\fR The loader sends these tables in the zone image (the
+per-record attributes and the zone level tables of \fBdns_zone_image.h\fR, the
+same as the zone file of a zone with \fB$LOCATION\fR and \fB$ECS\-SUBNET\fR has
+in memory); \fBZONE_BEGIN\fR flag bit1 (extended) says the image may carry them,
+bit2 (tinydns) is the tinydns flag. The Backend accepts them only in a zone that
+announced them (\fBzone_image_validate_ex()\fR); a malformed definition, state
+or wrapper record, a tag longer than 63 octets, more than 4096 tinydns locations
+or an \fBECS_TRUSTED\fR record rejects the zone. The digest of a zone covers the
 attributes and the tinydns flag, so an edit of a tag or a definition is applied
 by \fBkarictl reload\fR. A database zone is transferred out as Extended AXFR to
 a KariDNS secondary like a zone file (\fBallow\-transfer\fR as usual): the
@@ -5873,16 +5896,13 @@ stamp, location) on a SOA row (milestone B8t-1): \fBkaridns\-dbloader\fR reads
 them like any other row (the SOA rows must have one serial; the SOA without
 attributes, else the first row, is the reference SOA and gives the zone serial;
 a presigned zone cannot have them) and the rules of "Several SOA records" below
-apply to a zone file. Milestone B8t-2: the stream between the loader and the
-Backend is the Extended AXFR version 3 format, which carries them (the frame is
-the reference SOA, \fBSOA_SET\fR announces the number of SOA rows and each SOA
-row is a body RR in a wrapper record, with its tinydns attributes and tags). The
-Backend checks what the loader sent: every SOA at the apex, one serial (the one
-\fBZONE_BEGIN\fR declares), no two SOA rows for the same clients, the opening
-SOA is the reference SOA, the number announced; a zone that fails a check is
-rejected and the last good version keeps serving. At most 4096 SOA rows. (4)
-\fBkaridns_*\fR rows of a record that is disabled or does not exist are ignored
-with a warning.
+apply to a zone file. 0.7 M3: the zone image carries them (every SOA row is a
+record of the image with its tinydns attributes and tags; the reference SOA is
+the one without attributes, else the first). The Backend checks what the loader
+sent: every SOA at the apex, one serial (the one \fBZONE_BEGIN\fR declares), no
+two SOA rows for the same clients; a zone that fails a check is rejected and the
+last good version keeps serving. At most 4096 SOA rows. (4) \fBkaridns_*\fR rows
+of a record that is disabled or does not exist are ignored with a warning.
 .PP
 \fBImporter.\fR \fBkaridns\-zone(8)\fR writes all of this: \fBkaridns\-zone
 import <zone> <file>\fR for a zone file with tags, \fBkaridns\-zone import

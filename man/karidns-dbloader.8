@@ -34,12 +34,34 @@ zone can carry (settings, ACLs, tags, secondary zones, ALIAS records).
 .PP
 What the loader does while \fBkaridns\fR runs:
 .IP \(bu 2
-\fBStart.\fR It says HELLO (version, drivers), receives the configuration of the
+\fBStart.\fR It says HELLO (version, drivers, the features it has and the
+version of the zone image it builds), receives the configuration of the
 databases from the Backend, asks for the Backend's inventory (the zones it
 already has) and reads every zone. A zone whose content digest equals the
 Backend's version is not sent. The first zones are served as soon as the first
 batch part is published; a line \fBinitial load complete\fR is logged when the
 first batch is done.
+.IP \(bu 2
+\fBZone images (0.7).\fR The loader builds the data of a zone as a \fBzone
+image\fR (\fBdns_zone_image.h\fR, the format the store keeps and the query
+engine reads): the rows are converted to records, the zone is indexed and
+frozen, and the bytes of the image are sent in \fBZONE_IMAGE\fR messages of at
+most 1 MiB between \fBZONE_BEGIN\fR (flag \fBimage\fR, the size of the image,
+the number of RRs in it; the SOA counts once) and \fBZONE_END\fR. The Backend
+checks the image (the zone, the sizes, the counts, the SOA and extension rules,
+the limits of the zone) and installs it as it is: there is no text of RRs to
+parse any more. This moves the work of building a zone to the loader
+(\fBloader\-threads\fR) and takes it from the one thread that reads the
+stream. A Backend takes only a loader that says in HELLO that it sends images
+and which image version it builds (the version of the Backend is checked: a
+loader of another version is refused with a line in the log,
+\fBkaridns\-dbloader\fR and \fBkaridns\fR of one release always agree); there is
+no other way to send the data of a zone. \fBmax\-zone\-bytes\fR is the size of
+the image of one zone, \fBmax\-zone\-records\fR the number of RRs in it (with
+the SOA once: the AXFR counted it twice). The digest of a zone is SHA-256 of the
+image (with the markers of the settings, the profile and a presigned zone), so a
+zone the store holds with the digest of the previous release is sent once more
+at the first start after the upgrade.
 .IP \(bu 2
 \fBReload.\fR \fBkarictl reload\fR makes it compare the databases with the
 inventory: new zones, zones whose SOA serial differs, zones the change log table
@@ -125,7 +147,7 @@ described under "Packages".
 .TP 8
 \fB\-\-dump OUT\fR
 Write the stream exactly as the loader sends it to the Backend (HELLO,
-BATCH_BEGIN, per zone ZONE_BEGIN / ZONE_DATA... / ZONE_END or ZONE_FAILED,
+BATCH_BEGIN, per zone ZONE_BEGIN / ZONE_IMAGE... / ZONE_END or ZONE_FAILED,
 BATCH_END) to the file \fBOUT\fR (\fB\-\fR = standard output). Zones come in
 \fBdomains.id\fR order and the HELLO of a dump carries pid 0, so two runs on one
 database state write the same bytes, whatever the number of
@@ -289,7 +311,7 @@ reload: its own connection and snapshot, no batch, no inventory, no results. A
 request beyond the queue is answered \fBZONE_FAILED\fR "busy" (the first eight;
 more are dropped and the Backend's own time-out ends them).
 .IP \(bu 2
-\fBAnswers.\fR \fBZONE_BEGIN\fR .. \fBZONE_DATA\fR .. \fBZONE_END\fR with the
+\fBAnswers.\fR \fBZONE_BEGIN\fR .. \fBZONE_IMAGE\fR .. \fBZONE_END\fR with the
 request id in \fBZONE_BEGIN\fR (a secondary or catalog zone has no data, as in a
 batch); or the \fBsummary\fR (mode 1, primary zones): \fBZONE_BEGIN\fR with the
 summary flag and \fBZONE_END\fR, carrying the serial, the SOA refresh / retry /
@@ -457,7 +479,7 @@ still going finds it.  \fBWith the body (mode 3).\fR A loader whose \fBHELLO\fR
 features have bit 2 (\fBKDB_FEAT_LOOKUP_BODY\fR, 0x4; this loader sends features
 7) is asked with mode 3 (\fBKDB_FETCH_LOOKUP_FULL\fR): when a zone is found, the
 answer is followed on the same stream, with the same request id, by the body of
-that zone (\fBZONE_BEGIN\fR .. \fBZONE_DATA\fR .. \fBZONE_END\fR, read as for a
+that zone (\fBZONE_BEGIN\fR .. \fBZONE_IMAGE\fR .. \fBZONE_END\fR, read as for a
 request of the zone: the same worker, the same snapshot connection kept for the
 next request, the domain id of the answer as the id the zone must still have;
 \fBZONE_FAILED\fR with the name of the zone when it cannot be read), so that a
