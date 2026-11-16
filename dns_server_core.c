@@ -1851,6 +1851,31 @@ static void tcp_client_close(int kq, int client_fd, tcp_stream_ctx_t *ctx_tcp,
   tcp_client_forget(client_fd, ctx_tcp, ev_list, from, n_events);
 }
 
+/* 0.7: a TCP query that is dropped (overload: no room, the time was up, the ingest thread shed what it waits for) is discarded and counted; the connection is NOT closed (the client may have pipelined queries
+ * for zones that are in memory, RFC 7766 §6.2.1.1).  The state is the one after an answered message: the next message is read from the start. */
+static void tcp_drop_message(tcp_stream_ctx_t *c) {
+  c->state = TCP_STATE_READ_LEN;
+  c->accumulated = 0;
+  c->msg_len = 0;
+  c->resume_len = 0;
+  c->park_deadline_ms = 0;
+  c->not_ready_now = false;
+  c->lookup_failed = false;
+  c->expired = 0;
+  c->lookup_respark = false;
+  c->drop_now = false;
+}
+
+/* The request that was parked is run again (park_service()): a 1 ms timer whose event takes the connection from the top of the loop.  The timer of the idle deadline of the message before is still in
+ * the kqueue (a parked connection's timer events are skipped), so a connection that cannot be started again is closed the whole way (tcp_client_close() deletes both events): a bare close() would leave
+ * that timer to fire on a context that went back to the pool and was given out again. */
+static void tcp_resume_start(int kq, int fd, tcp_stream_ctx_t *c) {
+  struct kevent ev;
+  c->resume_pending = true;
+  EV_SET(&ev, fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0, 1, c);
+  if (kevent(kq, &ev, 1, NULL, 0, NULL) != 0) tcp_client_close(kq, fd, c, NULL, 0, 0);       /* (it cannot be started again: closing is better than a connection nobody looks at) */
+}
+
 /* 次のメッセージの期限までの時間 (ms、最小 1)。RFC 7766 §6.2.3 */
 static uint32_t tcp_ms_until(int64_t deadline_ms, int64_t now_ms) {
   return deadline_ms > now_ms ? (uint32_t)(deadline_ms - now_ms) : 1;
@@ -2463,7 +2488,7 @@ static bool lookup_wanted(const view_snapshot_t *view, uint8_t flags_byte, uint1
   const bool force = atomic_load_explicit(&dns_core_test_lookup_force, memory_order_relaxed);
   if (!force && !db_store_directory_wait()) return false;           /* (one load: the first pass of some view is going on) */
   if (((flags_byte >> 3) & 0x0F) != 0 || qclass != 1 || !view || !view->name) return false;
-  return force || (db_ingest_lookup_ready() && db_store_view_pending(zref_view_sid(view)));
+  return force || (db_ingest_lookup_wanted() && db_store_view_pending(zref_view_sid(view)));
 }
 
 /* the name the lookup asks for: the query name in the canonical form the stream wants; for a DS query the parent name (the zone of a DS is the parent's: find_zone_for_query_ex(), RFC 4035 3.1.4.1, as the
@@ -2874,11 +2899,10 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
         int fd = e->fd;
         park_release(t, e);
         tcp_stream_ctx_t *c = (g_tcp_pool && idx < MAX_TCP_CLIENTS) ? &g_tcp_pool[idx] : NULL;
-        if (c && c->gen == gen && c->parked) {          /* (a TCP query that is dropped is a connection that is closed: nothing is said) */
+        if (c && c->gen == gen && c->parked) {          /* (a TCP query that is dropped is discarded and nothing is said; the connection stays open: the request is run again at once, discarded, and the next message is read) */
           c->parked = false;
-          close(fd);
-          dec_tcp_clients();
-          tcp_ctx_free(c);
+          c->drop_now = true;
+          tcp_resume_start(kq, fd, c);
         }
       }
       continue;
@@ -2922,14 +2946,7 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
         c->expired = expired;
         c->lookup_failed = failed && lookup_woken;
         c->lookup_respark = lookup_woken && !timed_out && !late;
-        c->resume_pending = true;
-        struct kevent ev;
-        EV_SET(&ev, fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0, 1, c);
-        if (kevent(kq, &ev, 1, NULL, 0, NULL) != 0) {        /* it cannot be started again: closing is better than a connection nobody looks at */
-          close(fd);                                         /* (the kqueue forgets the descriptor) */
-          dec_tcp_clients();
-          tcp_ctx_free(c);
-        }
+        tcp_resume_start(kq, fd, c);
       }
     }
   }
@@ -3354,6 +3371,10 @@ process_tcp_client: ;
            * not two).  This worker is the only thread that handles the event, so the timer cannot fire in between; a timer event that is already
            * in ev_list is judged against idle_deadline_ms like any early one (above).  The paths that leave without that EV_ADD close the
            * connection (tcp_client_close() deletes the timer), hand it to a thread (which deletes it first) or park it (the timer handler skips it). */
+          if (__builtin_expect(ctx_tcp->drop_now, 0)) {      /* 0.7: park_service() dropped what this request waited for (counted there): it is discarded, the connection stays and the next message is read */
+            tcp_drop_message(ctx_tcp);
+            continue;
+          }
           char qname[DNS_NAME_TEXT_SIZE] = "";
           uint16_t qtype = 0;
           uint16_t qclass = 1;
@@ -3711,12 +3732,11 @@ process_tcp_client: ;
             route.entry = route.view ? find_zone_for_query_zref(route.view, qname, ((msg[2] >> 3) & 0x0F) == 0 ? qtype : 0, &pel) : NULL;
             bool not_ready = false, answered = false;
             int res_len = 0;
-            if (__builtin_expect(ctx_tcp->expired == 2, 0) && !route.entry && !zref_present(&pel) && lookup_wanted(route.view, msg[2], qclass)) {      /* 0.7: as udp_one(): the time of the lookup was up and still no zone has the name: dropped (the connection is closed), counted */
+            if (__builtin_expect(ctx_tcp->expired == 2, 0) && !route.entry && !zref_present(&pel) && lookup_wanted(route.view, msg[2], qclass)) {      /* 0.7: as udp_one(): the time of the lookup was up and still no zone has the name: dropped (the connection stays open), counted */
               park_cnt_note(PARK_CNT_LK_TIMEOUT);
-              tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
-              client_closed = true;
+              tcp_drop_message(ctx_tcp);
               rcu_reader_exit(ctx);
-              break;
+              continue;
             }
             if (__builtin_expect(ctx_tcp->lookup_failed, 0) && !route.entry && !zref_present(&pel)) {      /* 0.7: the lookup failed: "not ready" for a name with no zone (udp_one()) */
               char lname[DNS_NAME_TEXT_SIZE];
@@ -3742,11 +3762,10 @@ process_tcp_client: ;
               uint32_t cidx = (uint32_t)(ctx_tcp - g_tcp_pool);
               ctx_tcp->lookup_respark = false;
               if (route.view->name && park_timeout_ms != 0 && lookup_name(qname, qtype, lname, sizeof(lname)) && (left <= 0 || !park_lookup_room(&park))) {
-                park_cnt_note(left <= 0 ? PARK_CNT_LK_TIMEOUT : PARK_CNT_LK_ROOM);       /* 0.7: overload: the connection is closed, nothing is answered (a dropped query) */
-                tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
-                client_closed = true;
+                park_cnt_note(left <= 0 ? PARK_CNT_LK_TIMEOUT : PARK_CNT_LK_ROOM);       /* 0.7: overload: nothing is answered (a dropped query); the connection stays open */
+                tcp_drop_message(ctx_tcp);
                 rcu_reader_exit(ctx);
-                break;
+                continue;
               }
               if (left > 0 && route.view->name && park_timeout_ms != 0 && lookup_name(qname, qtype, lname, sizeof(lname))) {
                 const bool joined = park_has_wait(&park, route.view->name, lname);
@@ -3765,10 +3784,9 @@ process_tcp_client: ;
                 }
                 if (park.n_full != full0) {                       /* (no room in the park table: dropped, as above) */
                   park_cnt_note(PARK_CNT_LK_ROOM);
-                  tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
-                  client_closed = true;
+                  tcp_drop_message(ctx_tcp);
                   rcu_reader_exit(ctx);
-                  break;
+                  continue;
                 }
               }
             }
@@ -3786,12 +3804,11 @@ process_tcp_client: ;
                 const uint64_t zfull0 = park.n_full;
                 int32_t pi = park_tcp(&park, pnow, (uint32_t)(attach && left > PARK_ATTACH_DEADLINE_MS ? PARK_ATTACH_DEADLINE_MS : left), hv, zname, client_fd, cidx, ctx_tcp->gen);
                 if (pi < 0 && gate == FETCH_GATE_TAKEN) park_claim_release(hv, zname);
-                if (pi < 0 && park.n_full != zfull0) {            /* 0.7: no room in the park table: dropped and counted (the connection is closed), not answered "not ready" */
+                if (pi < 0 && park.n_full != zfull0) {            /* 0.7: no room in the park table: dropped and counted (the connection stays open), not answered "not ready" */
                   park_cnt_note(PARK_CNT_ZONE_ROOM);
-                  tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
-                  client_closed = true;
+                  tcp_drop_message(ctx_tcp);
                   rcu_reader_exit(ctx);
-                  break;
+                  continue;
                 }
                 if (pi >= 0) {
                   if (attach) park_mark_attach(&park, pi, park_now_ns(), pnow + left);
@@ -3807,12 +3824,11 @@ process_tcp_client: ;
                   break;
                 }
               }
-              if (ctx_tcp->expired || (park_on && !ctx_tcp->not_ready_now && left <= 0)) {      /* 0.7: its time was up and the zone is still not there: dropped (the connection is closed), counted */
+              if (ctx_tcp->expired || (park_on && !ctx_tcp->not_ready_now && left <= 0)) {      /* 0.7: its time was up and the zone is still not there: dropped (the connection stays open), counted */
                 park_cnt_note(ctx_tcp->expired == 2 ? PARK_CNT_LK_TIMEOUT : PARK_CNT_ZONE_TIMEOUT);
-                tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
-                client_closed = true;
+                tcp_drop_message(ctx_tcp);
                 rcu_reader_exit(ctx);
-                break;
+                continue;
               }
               not_ready = true;
             }

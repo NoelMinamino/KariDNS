@@ -4,6 +4,8 @@
 #
 #   dns_tcp_probe.pl HOST PORT pipeline NAME...   all the queries (A, IN, RD) in ONE write; reads one answer per query
 #                                                 prints "id=N rcode=R an=A" per answer, in the order they arrive
+#   dns_tcp_probe.pl HOST PORT dropwarm COLD WARM  COLD is dropped by the server (no answer), WARM (in memory) is behind it in the same write and a third query follows on the same connection;
+#                                                 prints the answers that come: "id=102 ..." and "id=103 ..." when the connection stays open, "no answer" for what does not come
 #   dns_tcp_probe.pl HOST PORT eof NAME           sends the query and closes at once; prints "closed"
 #   dns_tcp_probe.pl HOST PORT idle NAME          sends the query, reads the answer, then waits for the server to close; prints
 #                                                 "id=N rcode=R an=A" and "closed after S seconds" (at most 30)
@@ -132,6 +134,15 @@ if ($mode eq 'tcp-update') {
         last unless defined $a;
         print "$a\n";
     }
+} elsif ($mode eq 'dropwarm') {
+    # a query for a zone whose answer is dropped (the loader does not answer: park-timeout) and one for a zone in memory behind it, in one write: the dropped query gets no answer, the
+    # connection stays open (0.7: only that message is discarded), the warm query is answered, and a third query on the same connection is answered too
+    syswrite($s, query(101, $names[0]) . query(102, $names[1]));
+    my $a = read_answer($s, time() + 8);
+    print(defined $a ? "$a\n" : "no answer\n");
+    syswrite($s, query(103, $names[1]));
+    $a = read_answer($s, time() + 4);
+    print(defined $a ? "$a\n" : "no answer\n");
 } elsif ($mode eq 'eof') {
     syswrite($s, query(201, $names[0]));
     close($s);

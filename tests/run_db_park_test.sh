@@ -14,7 +14,7 @@
 #   - TCP: three queries in one write (the first one for the evicted zone) are answered in order; a client that closes while its request
 #     is parked does not hurt the server; after a parked query the connection ends by tcp-idle-timeout
 #   - the loader does not answer (stopped): the query is dropped when park-timeout is up (0.7: overload is never answered SERVFAIL or REFUSED for a zone the database may have): nothing is answered over UDP,
-#     the TCP connection is closed, and karictl store counts them (store.park.drop.timeout);
+#     only that TCP message is discarded: the connection stays open, a query for a zone in memory behind it is answered, and so is a later one on the same connection; karictl store counts them (store.park.drop.timeout);
 #     `karictl reload <zone>` with db-reload-timeout 1 gets the timeout error (control_park_timeouts)
 #   - the stopped loader goes on: its late answer installs the zone
 #   - kill -9 of the loader: the supervisor starts another with a new pair of streams and fetches work again
@@ -270,7 +270,11 @@ else
     ! echo "$out" | grep -q 'status:' && pass "UDP: no answer when the time is up (the query is dropped, not SERVFAIL or REFUSED)" || fail "UDP: an answer: $(echo "$out" | head -5)"
     [ $((T1 - T0)) -ge 5 ] && pass "... the client waited for its own timeout ($((T1 - T0)) s)" || fail "the client had an answer or an error after $((T1 - T0)) s"
     out=$(./dag @127.0.0.1 -p "$PORT" www.a.test A +tcp +nohexdump +time=8 +tries=1 2>&1)
-    ! echo "$out" | grep -q 'status:' && pass "TCP: no answer when the time is up (the connection is closed)" || fail "TCP: an answer: $(echo "$out" | head -5)"
+    ! echo "$out" | grep -q 'status:' && pass "TCP: no answer when the time is up" || fail "TCP: an answer: $(echo "$out" | head -5)"
+    evicted a.test. "a.test is out of memory"
+    got=$(perl tests/db/dns_tcp_probe.pl 127.0.0.1 "$PORT" dropwarm www.a.test www.b.test 2>&1)
+    want=$(printf 'id=102 rcode=0 an=1\nid=103 rcode=0 an=1')
+    [ "$got" = "$want" ] && pass "TCP: the dropped query gets no answer, the connection stays open: the warm query behind it and a later one on the same connection are answered" || fail "dropwarm: $got"
     [ "$($KCTL store -k 2>/dev/null | sed -n 's/^store.park.drop.timeout=//p' | head -1)" -ge 2 ] 2>/dev/null && pass "karictl store counts the drops (store.park.drop.timeout)" || fail "store.park.drop.timeout: $($KCTL store -k 2>/dev/null | grep 'store.park.drop' | tr '\n' ' ')"
 fi
 out=$($KCTL reload a.test. 2>&1)

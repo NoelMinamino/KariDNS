@@ -192,6 +192,7 @@ typedef struct {
   uint8_t expired;                   /* the time of the request that was woken was up (udp_pass_t.expired): 0.7 */
   bool lookup_failed;                /* the lookup of the name of the request that was woken failed: SERVFAIL + EDE 14 for a name with no zone (0.7) */
   bool lookup_respark;               /* the request that was woken was parked for a by-name lookup and woken without its answer: it is parked again for the lookup, until park_deadline_ms (0.7) */
+  bool drop_now;                     /* the ingest thread dropped what the parked request waited for (overload): the request is discarded when it is run again, and the connection stays open (0.7) */
   uint16_t resume_len;
   int64_t park_deadline_ms;         /* of the request that was parked first (0: none); a second park of the same request keeps it */
   int32_t park_idx;                 /* the handle of the parked entry (park_tcp()'s index and the entry's generation), valid while `parked`: the close takes the entry without a search */
