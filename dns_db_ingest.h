@@ -15,6 +15,9 @@
  * the registry (snapshot_apply_db_delta() makes new zones visible once per batch and at least once per second) and
  * answered with ZONE_RESULT; BATCH_END is answered with BATCH_RESULT.  With `ingest-threads` N > 1, N builder threads
  * parse and publish complete zones while the stream thread keeps reading (at most N zones in flight).
+ *
+ * 0.7 M2: the pages of a manifest pass (the store protocol) are not decoded or recorded by this thread: it checks that a page is legal in the state of the stream and hands it to the reconcile thread
+ * (dns_db_recon.h), which applies the pass in groups; every other frame of the stream waits until that thread has applied what it was given.
  */
 
 #include <stdbool.h>

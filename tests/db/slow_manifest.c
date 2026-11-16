@@ -8,6 +8,8 @@
  *
  *   cc -DREAL_LOADER='"/path/karidns-dbloader.real"' -DRELEASE_FILE='"/path/release"' -o karidns-dbloader slow_manifest.c
  *
+ * -DPACE_US=N (optional): after the release the frames of the pass are sent on one at a time, N microseconds apart, so that a pass of a hundred thousand zones lasts long enough for a test to act in the middle of it.
+ *
  * -DHELLO_MASK=3 (optional): the features of the loader's HELLO (tag 5) are ANDed with it, so that the Backend meets a loader that has fewer of them (3: KDB_FEAT_STORE | KDB_FEAT_LOOKUP, the loader of an earlier
  * version that does a lookup of a name without the body of the zone).  The server clears the environment of the loader, so this is a compile time choice.
  *
@@ -36,6 +38,9 @@
 #endif
 #ifndef HELLO_MASK
 #define HELLO_MASK 0xFFFFFFFFu
+#endif
+#ifndef PACE_US
+#define PACE_US 0              /* 0.7 M2 (tests/run_db_firststart_store_test.sh): after the release the frames of the pass go on one at a time, this many microseconds apart (0: all at once) */
 #endif
 
 #define HDR 12              /* KDB1: magic(4) type(2) flags(2) length(4) */
@@ -127,9 +132,11 @@ int main(int argc, char **argv) {
             g_term = 0;
         }
         if (held == 1 && access(RELEASE_FILE, F_OK) == 0) held = 2;
+        if (PACE_US > 0 && held == 2 && from_loader.off >= fwd) usleep(PACE_US);
+        int budget = (PACE_US > 0 && held == 2 && from_loader.off < fwd) ? 0 : 1;      /* (paced: the next frame when the one before has gone) */
         /* the frames that may be sent on */
         for (;;) {
-            if (held == 1) break;
+            if (held == 1 || (PACE_US > 0 && held == 2 && budget <= 0)) break;
             if (from_loader.len - scan < HDR) break;
             uint8_t *h = from_loader.p + scan;
             const uint32_t len = ((uint32_t)h[8] << 24) | ((uint32_t)h[9] << 16) | ((uint32_t)h[10] << 8) | h[11];
@@ -139,8 +146,9 @@ int main(int argc, char **argv) {
             scan += HDR + len;
             fwd = scan;
             if (held == 0 && type == T_MANIFEST_BEGIN) held = 1;       /* (the MANIFEST_BEGIN goes, what follows waits) */
+            if (PACE_US > 0 && held == 2 && --budget <= 0) break;
         }
-        if (held == 2 || !loader_open) fwd = from_loader.len;        /* (a loader that is gone: what it said goes on, as a stream that ends) */
+        if ((held == 2 && PACE_US == 0) || !loader_open) fwd = from_loader.len;        /* (a loader that is gone: what it said goes on, as a stream that ends) */
         struct pollfd p[2];
         p[0].fd = backend_open ? 3 : -1;
         p[0].events = POLLIN | (from_loader.off < fwd ? POLLOUT : 0);

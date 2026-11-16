@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -5016,17 +5017,427 @@ static int run_lookup_body(const char *dir) {
     test_exit(g_failed ? 1 : 0);
 }
 
+/* ---------------------------------------------------------------- 0.7 M2: the reconcile thread and the group commit (phase 8) */
+/* Part A: the entries of a pass applied in groups (db_recon_entry_n()) are what the same entries applied one at a time (db_recon_entry()) are: the same result of every entry, the same records, the same
+ * counters of the pass, the same sweep.  Two views of one store, one for each way; the entries are those of a manifest with all its traps (a name that two ids claim, an id that two names claim, secondary
+ * zones, stamps that change, unstamped zones, a forced entry, the root zone and a name that is too long for the store). */
+static uint64_t mix64(uint64_t x) {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdull;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ull;
+    x ^= x >> 33;
+    return x;
+}
+typedef struct { db_recon_entry_t e; char name[400]; } gr_t;
+static void gr_make(gr_t *g, uint64_t K, unsigned pool) {
+    uint64_t r = mix64(K * 0x9e3779b97f4a7c15ull + 4242);
+    unsigned i = (unsigned)(r % pool);
+    memset(g, 0, sizeof(*g));
+    unsigned p = (unsigned)((r >> 20) % 1000);
+    if (p < 8) snprintf(g->name, sizeof(g->name), ".");
+    else if (p < 14) { memset(g->name, 'a', 300); g->name[300] = '.'; g->name[301] = '\0'; g->name[63] = '.'; g->name[127] = '.'; g->name[191] = '.'; }
+    else snprintf(g->name, sizeof(g->name), "g%u.test.", i);
+    g->e.name = g->name;
+    g->e.source_id = (int64_t)(7000 + i);
+    unsigned q = (unsigned)((r >> 32) % 100);
+    if (q < 12) g->e.source_id = (int64_t)(7000 + (unsigned)((r >> 40) % pool));      /* another zone's id: a rename, or a name taken over */
+    else if (q < 15) g->e.source_id = 0;
+    g->e.kind = ((r >> 48) % 100) < 12 ? KDB_ZK_SECONDARY : KDB_ZK_PRIMARY;
+    unsigned s = (unsigned)((r >> 52) % 10);
+    g->e.stamped = s < 8;
+    g->e.gen = (r >> 56) % 3;
+    g->e.time = g->e.gen * 10;
+    g->e.has_serial = !g->e.stamped && s == 8;
+    g->e.serial = (uint32_t)(r >> 58);
+    g->e.force = ((r >> 10) % 100) < 4;
+}
+static void recon_snapshot(store_t *st, int vid, char (*names)[130], int *nz, uint8_t *state, uint16_t *flags, uint64_t *gen, int64_t *sid, int cap) {
+    uint32_t cur = 0;
+    store_zone_t z;
+    int n = 0;
+    store_read_lock();
+    while (store_iter(st, &cur, &z) > 0) {
+        if (z.view != (uint16_t)vid || n >= cap) continue;
+        snprintf(names[n], 130, "%.120s", z.name);
+        state[n] = z.state; flags[n] = z.flags; gen[n] = z.stamp_gen ^ (z.stamp_time << 8); sid[n] = z.source_id;
+        n++;
+    }
+    store_read_unlock();
+    *nz = n;
+}
+static int g_sort_names_cmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+static void recon_equivalence(store_t *st) {
+    printf("  [A: entries in groups against entries one at a time]\n");
+    const unsigned pool = 700;
+    const int NR = 3;                                                    /* rounds: a first pass, then passes over what the first left (changes, renames, a sweep) */
+    uint64_t K = 1;
+    for (int round = 0; round < NR; round++) {
+        const unsigned npass = round == 0 ? 2600 : 1800;
+        gr_t *ent = malloc(sizeof(*ent) * npass);
+        for (unsigned i = 0; i < npass; i++) gr_make(&ent[i], K++, pool);
+        int *ra = malloc(sizeof(int) * npass), *rb = malloc(sizeof(int) * npass);
+        uint32_t *za = malloc(sizeof(uint32_t) * npass), *zb = malloc(sizeof(uint32_t) * npass);
+        char why[200];
+        db_recon_status_t sa, sb;
+        db_recon_end_t oa, ob;
+        CHECK(db_recon_begin("grp", npass, true, why, sizeof(why)));
+        unsigned off = 0;
+        uint64_t rng = (uint64_t)round + 31;
+        db_recon_entry_t *ee = malloc(sizeof(*ee) * npass);
+        for (unsigned i = 0; i < npass; i++) ee[i] = ent[i].e;
+        while (off < npass) {
+            rng = mix64(rng);
+            unsigned n = 1 + (unsigned)(rng % 190);
+            if (n > npass - off) n = npass - off;
+            db_recon_entry_n(ee + off, n, ra + off, za + off);
+            off += n;
+        }
+        db_recon_end(true, 0, false, 0, NULL, 0, &oa);
+        db_recon_status(&sa);
+        CHECK(db_recon_begin("one", npass, true, why, sizeof(why)));
+        for (unsigned i = 0; i < npass; i++) {
+            zb[i] = STORE_NONE;
+            rb[i] = db_recon_entry(&ee[i], &zb[i]);
+        }
+        db_recon_end(true, 0, false, 0, NULL, 0, &ob);
+        db_recon_status(&sb);
+        unsigned bad = 0;
+        for (unsigned i = 0; i < npass; i++) {
+            if (ra[i] != rb[i] || ((za[i] == STORE_NONE) != (zb[i] == STORE_NONE))) {
+                if (bad++ < 5) printf("    entry %u (%s id %lld kind %d stamp %d/%llu): the group says %d, one at a time %d (zones %u / %u)\n", i, ent[i].name[0] == '.' ? "root" : ent[i].name, (long long)ee[i].source_id, ee[i].kind, ee[i].stamped, (unsigned long long)ee[i].gen, ra[i], rb[i], za[i], zb[i]);
+            }
+        }
+        CHECK_MSG(bad == 0, "round %d: %u entries differ", round, bad);
+        CHECK(sa.entries == sb.entries && sa.created == sb.created && sa.changed == sb.changed && sa.renamed == sb.renamed && sa.pending == sb.pending && sa.kept == sb.kept && sa.same == sb.same);
+        CHECK(sa.entries == npass && sa.swept == sb.swept && sa.total == sb.total && sa.unlisted == sb.unlisted);
+        CHECK(oa.swept == ob.swept && oa.held == ob.held && oa.failed == ob.failed && oa.total == ob.total && oa.unlisted == ob.unlisted && oa.deleted == ob.deleted);
+        /* the zones of the two views at the end */
+        const int va = store_view_id(st, "grp"), vb = store_view_id(st, "one");
+        CHECK(va >= 0 && vb >= 0);
+        enum { CAPZ = 2000 };
+        static char na[CAPZ][130], nb[CAPZ][130];
+        static uint8_t sta[CAPZ], stb[CAPZ];
+        static uint16_t fa[CAPZ], fb[CAPZ];
+        static uint64_t ga[CAPZ], gb[CAPZ];
+        static int64_t ia[CAPZ], ib[CAPZ];
+        int cna = 0, cnb = 0;
+        recon_snapshot(st, va, na, &cna, sta, fa, ga, ia, CAPZ);
+        recon_snapshot(st, vb, nb, &cnb, stb, fb, gb, ib, CAPZ);
+        CHECK(cna == cnb && cna > 100);
+        {                                                                    /* (the same names with the same records, by name) */
+            char *pa[CAPZ], *pb[CAPZ];
+            for (int i = 0; i < cna && i < CAPZ; i++) { pa[i] = na[i]; pb[i] = nb[i]; }
+            qsort(pa, (size_t)cna, sizeof(char *), g_sort_names_cmp);
+            qsort(pb, (size_t)cnb, sizeof(char *), g_sort_names_cmp);
+            unsigned dn = 0;
+            for (int i = 0; i < cna && i < cnb; i++) if (strcmp(pa[i], pb[i]) != 0) dn++;
+            CHECK_MSG(dn == 0, "round %d: %u names differ between the views", round, dn);
+            for (int i = 0; i < cna; i++) {
+                int j = -1;
+                for (int k = 0; k < cnb; k++) if (strcmp(na[i], nb[k]) == 0) { j = k; break; }
+                if (j < 0 || sta[i] != stb[j] || fa[i] != fb[j] || ga[i] != gb[j] || ia[i] != ib[j]) { CHECK_MSG(false, "round %d: zone %s differs", round, na[i]); break; }
+            }
+        }
+        printf("    round %d: %u entries: %llu new, %llu changed, %llu renamed, %llu pending, %llu kept, %llu same; the sweep %s (%llu of %llu), %d zones in each view\n", round, npass,
+               (unsigned long long)sa.created, (unsigned long long)sa.changed, (unsigned long long)sa.renamed, (unsigned long long)sa.pending, (unsigned long long)sa.kept, (unsigned long long)sa.same,
+               oa.swept ? "deleted" : "none", (unsigned long long)oa.deleted, (unsigned long long)oa.unlisted, cna);
+        free(ent); free(ee); free(ra); free(rb); free(za); free(zb);
+    }
+    store_stats_t ss;
+    store_read_lock();
+    store_stats(st, &ss);
+    store_read_unlock();
+    CHECK(ss.group_records > 0 && ss.group_entries > ss.group_records);
+    {
+        store_check_report_t rep;
+        CHECK(store_check(st, &rep) == 0);
+    }
+}
+
+static void slow_entry(void) { usleep(1000); }
+static bool st_text_has(const char *needle, int ms) {
+    char *st = malloc(65536);
+    bool found = false;
+    for (int i = 0; i < ms / 10 && !found; i++) {
+        if (db_ingest_status(NULL, NULL, st, 65536) > 0 && strstr(st, needle)) found = true;
+        else usleep(10000);
+    }
+    free(st);
+    return found;
+}
+static int64_t now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+static void gm_zones(pz_t *z, int first, int n, int64_t sid_base, const char *tag) {
+    for (int i = 0; i < n; i++) {
+        memset(&z[i], 0, sizeof(z[i]));
+        z[i].sid = sid_base + first + i;
+        snprintf(z[i].name, sizeof(z[i].name), "%s%d.test.", tag, first + i);
+        z[i].kind = KDB_ZK_PRIMARY;
+        z[i].stamped = true;
+        z[i].gen = 1;
+        z[i].time = 10;
+    }
+}
+
+static int run_recon_thread(const char *dir) {
+    printf("[0.7 M2: the reconcile thread and the group commit (phase 8)]\n");
+    signal(SIGPIPE, SIG_IGN);                                            /* (a stream that the Backend closed after a protocol error) */
+    char sdir[600];
+    snprintf(sdir, sizeof(sdir), "%s/s", dir);
+    static server_config_t cfg;
+    char conf[2048];
+    snprintf(conf, sizeof(conf),
+             "options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; store \"%s\"; store-mode map; "
+             "store-threads 2; park-timeout 2000; }; };\n"
+             "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", sdir);
+    CHECK(parse_named_conf(conf, &cfg) == 0);
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    rebuild_zone_db_from_config(&cfg, false);
+    char msg[400];
+    CHECK(db_store_frontend_open(&cfg.database, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg)) && db_store_dir_fd() >= 0);
+    CHECK(db_store_start(&cfg) && db_store_enabled());
+    store_t *st = db_store_handle();
+    CHECK(st != NULL);
+    recon_equivalence(st);
+
+    int a[2], f[2], cs[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, f) == 0 && socketpair(AF_UNIX, SOCK_SEQPACKET, 0, cs) == 0);
+    int ends[3] = { a[1], f[1], cs[1] };
+    for (int i = 0; i < 3; i++) fcntl(ends[i], F_SETFL, fcntl(ends[i], F_GETFL, 0) | O_NONBLOCK);
+    park_register_worker(0, -1);
+    CHECK(db_ingest_start(a[1], cs[1], f[1]));
+    static ch_t mainc, fetchc;
+    ch_init(&mainc, a[0], KDB_FROM_BACKEND);
+    ch_init(&fetchc, f[0], KDB_FROM_BACKEND);
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    kdb_msg_t m;
+    memset(&g_wctx, 0, sizeof(g_wctx));
+    g_query_bg_fetch = no_bg_fetch;
+    g_query_bg_attach = no_bg_fetch;
+    kdb_enc_begin(&e, KDB_T_HELLO);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, KDB_FEAT_STORE | KDB_FEAT_LOOKUP);
+    kdb_enc_end(&e);
+    ch_send(a[0], &e);
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG && m.u.config.store_proto);
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_DEBUG);
+    db_recon_status_t rs;
+    db_recon_status(&rs);
+    CHECK(rs.recon_thread);                                              /* (the thread runs and reports) */
+
+    /* -- B1. a pass of 3000 entries in two pages: the entries are recorded in groups, BATCH_RESULT has the counts */
+    {
+        static pz_t page[1500];
+        db_recon_status_t r0;
+        db_recon_status(&r0);
+        p_batch_begin(a[0], &e, 1, KDB_BATCH_STARTUP, 0);
+        p_manifest_begin(a[0], &e, 1, 3000, 5, true);
+        gm_zones(page, 0, 1500, 3000000, "gm");
+        p_manifest_page(a[0], &e, 1, 0, page, 1500);
+        gm_zones(page, 1500, 1500, 3000000, "gm");
+        p_manifest_page(a[0], &e, 1, 1, page, 1500);
+        p_manifest_end(a[0], &e, 1, 3000, 0, 5, true);
+        p_batch_end(a[0], &e, 1, 3000, 0);
+        CHECK(p_result(&mainc, &m, 20000) && m.u.batch_result.n_applied == 3000 && m.u.batch_result.n_rejected == 0 && m.u.batch_result.n_unchanged == 0);
+        uint64_t kn, sd;
+        store_counts(st, &kn, &sd);
+        store_stats_t ss;
+        store_read_lock();
+        store_stats(st, &ss);
+        store_read_unlock();
+        db_recon_status_t r1;
+        db_recon_status(&r1);
+        const uint64_t g0 = r0.rt_group_entries;
+        CHECK(!db_store_directory_wait());                               /* (the pass has ended: BATCH_RESULT is answered after it) */
+        CHECK_MSG(r1.passes == r0.passes + 1 && r1.created - 0 == 3000 && r1.entries == 3000, "the pass: %llu entries, %llu new", (unsigned long long)r1.entries, (unsigned long long)r1.created);
+        CHECK_MSG(r1.rt_group_entries - g0 >= 2900 && r1.rt_group_records - r0.rt_group_records <= 3000 / 64 + 6, "group commit: %llu entries in %llu records", (unsigned long long)(r1.rt_group_entries - g0), (unsigned long long)(r1.rt_group_records - r0.rt_group_records));
+        CHECK(r1.rt_entries >= 3000 && r1.rt_pages >= 2 && r1.rt_queued == 0 && r1.recon_thread);
+        CHECK(kn >= 3000);
+        printf("    the pass: %llu entries in %llu group records\n", (unsigned long long)(r1.rt_group_entries - g0), (unsigned long long)(r1.rt_group_records - r0.rt_group_records));
+        (void)serve_fetches(&fetchc, f[0], &e, 300, 0, 0);               /* (the fill asks for the bodies: none in this test) */
+    }
+
+    /* -- B2. a slow pass: the thread that reads the stream goes on serving the fetch stream (a lookup is answered in a few ms, not after the pass), the pages wait in the ring (8 slots) and the loader's socket,
+     *       and BATCH_RESULT is answered only when every entry is recorded: the counts are the whole pass's */
+    {
+        static pz_t page[10];
+        uint64_t kn0, sd0, kn1, sd1;
+        store_counts(st, &kn0, &sd0);
+        db_recon_test_entry_hook = slow_entry;                             /* (a millisecond for every entry: 600 entries, 600 ms) */
+        p_batch_begin(a[0], &e, 2, KDB_BATCH_FULL, 0);
+        p_manifest_begin(a[0], &e, 2, 600, 6, true);
+        for (int pg = 0; pg < 60; pg++) {
+            gm_zones(page, pg * 10, 10, 4000000, "gs");
+            p_manifest_page(a[0], &e, 2, (uint32_t)pg, page, 10);
+        }
+        p_manifest_end(a[0], &e, 2, 600, 0, 6, true);
+        p_batch_end(a[0], &e, 2, 600, 0);
+        uint64_t maxq = 0;
+        db_recon_status_t r;
+        for (int i = 0; i < 100; i++) {
+            db_recon_status(&r);
+            if (r.rt_queued > maxq) maxq = r.rt_queued;
+            if (r.rt_queued >= 4) break;
+            usleep(2000);
+        }
+        CHECK_MSG(maxq >= 4, "pages wait for the thread (queued %llu)", (unsigned long long)maxq);
+        drain_wakes();
+        CHECK(db_ingest_lookup_ready());
+        const int64_t t0 = now_us();
+        CHECK(park_fetch_request(0, "default", "www.late8.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
+        CHECK(ch_next(&fetchc, &m, 2000) && m.type == KDB_T_FETCH_REQ && m.u.fetch_req.mode == KDB_FETCH_LOOKUP && strcmp(m.u.fetch_req.name, "www.late8.test.") == 0);
+        const int64_t dt = now_us() - t0;
+        printf("    the request of a lookup was on the fetch stream %lld us after it was made, with %llu pages of the slow pass waiting\n", (long long)dt, (unsigned long long)maxq);
+        CHECK_MSG(dt < 150000, "the lookup waited %lld us", (long long)dt);
+        {
+            kdb_enc_begin(&e, KDB_T_LOOKUP_RESULT);
+            kdb_enc_u64(&e, 1, m.u.fetch_req.request_id); kdb_enc_u16(&e, 2, 0); kdb_enc_u8(&e, 3, 0);
+            kdb_enc_end(&e);
+            ch_send(f[0], &e);
+        }
+        db_recon_status(&r);
+        CHECK(r.active && r.entries < 600);                                  /* (the pass is still going: the answer did not wait for it) */
+        CHECK(p_result(&mainc, &m, 30000) && m.u.batch_result.n_applied == 600 && m.u.batch_result.n_rejected == 0);
+        store_counts(st, &kn1, &sd1);
+        CHECK_MSG(kn1 - kn0 == 600, "BATCH_RESULT came with %llu of the 600 entries recorded", (unsigned long long)(kn1 - kn0));
+        db_recon_status(&r);
+        CHECK(!r.active && r.entries == 600 && r.rt_full_stops > 0 && r.rt_queued == 0);
+        printf("    the stream thread stopped reading %llu times because the ring was full\n", (unsigned long long)r.rt_full_stops);
+        db_recon_test_entry_hook = NULL;
+        (void)serve_fetches(&fetchc, f[0], &e, 300, 0, 0);
+    }
+
+    /* -- B3. a loader that is hostile: a page that is not the next one ends the stream, the entries before it were recorded, the ones after it are not; the pass sweeps nothing */
+    {
+        static pz_t page[8];
+        uint64_t kn0, sd0, kn1, sd1;
+        store_counts(st, &kn0, &sd0);
+        p_batch_begin(a[0], &e, 3, KDB_BATCH_FULL, 0);
+        p_manifest_begin(a[0], &e, 3, 100, 7, true);
+        gm_zones(page, 0, 8, 5000000, "gh");
+        p_manifest_page(a[0], &e, 3, 0, page, 8);
+        gm_zones(page, 8, 8, 5000000, "gh");
+        p_manifest_page(a[0], &e, 3, 2, page, 8);                          /* (page 2 where page 1 is due) */
+        gm_zones(page, 16, 8, 5000000, "gh");
+        p_manifest_page(a[0], &e, 3, 1, page, 8);
+        p_manifest_end(a[0], &e, 3, 24, 0, 7, true);
+        p_batch_end(a[0], &e, 3, 24, 0);
+        CHECK_MSG(st_text_has("last protocol error: MANIFEST: page 2, want 1", 5000), "the protocol error of the reconcile thread is logged and shown");
+        CHECK(!ch_next(&mainc, &m, 300));                                    /* (the stream is closed: nothing answers) */
+        for (int i = 0; i < 100; i++) { db_recon_status_t r; db_recon_status(&r); if (!r.active) break; usleep(10000); }
+        store_counts(st, &kn1, &sd1);
+        CHECK_MSG(kn1 - kn0 == 8, "the page before the bad one was recorded (%llu), none after it", (unsigned long long)(kn1 - kn0));
+        db_recon_status_t r;
+        db_recon_status(&r);
+        CHECK(!r.active && r.swept == 0);                                    /* (the pass was cut off: nothing is swept) */
+        store_zone_t z;
+        CHECK(zrec(st, "gh3.test", &z));
+        CHECK(!zrec(st, "gh9.test", &z) && !zrec(st, "gh17.test", &z));
+    }
+
+    /* -- C1. a new stream: a pass cut off in the middle (the stream is closed while pages wait in the ring), then a clean pass whose BATCH_RESULT has exactly its own counts (nothing of the stream that ended) */
+    {
+        int a2[2], f2[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a2) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, f2) == 0);
+        hand_over(cs[0], a2[1], f2[1]);
+        close(a[0]);
+        close(f[0]);
+        a[0] = a2[0];
+        f[0] = f2[0];
+        ch_init(&mainc, a[0], KDB_FROM_BACKEND);
+        ch_init(&fetchc, f[0], KDB_FROM_BACKEND);
+        kdb_enc_begin(&e, KDB_T_HELLO);
+        kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, KDB_FEAT_STORE | KDB_FEAT_LOOKUP);
+        kdb_enc_end(&e);
+        ch_send(a[0], &e);
+        CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG);
+        CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_DEBUG);
+        static pz_t page[10];
+        uint64_t kn0, sd0, kn1, sd1;
+        store_counts(st, &kn0, &sd0);
+        db_recon_test_entry_hook = slow_entry;
+        p_batch_begin(a[0], &e, 4, KDB_BATCH_FULL, 0);
+        p_manifest_begin(a[0], &e, 4, 400, 8, true);
+        for (int pg = 0; pg < 40; pg++) {
+            gm_zones(page, pg * 10, 10, 6000000, "gc");
+            p_manifest_page(a[0], &e, 4, (uint32_t)pg, page, 10);
+        }
+        usleep(40000);
+        close(a[0]);                                                         /* the loader dies: some pages are recorded, some wait in the ring, the rest is in the socket */
+        a[0] = -1;
+        int waited = 0;
+        db_recon_status_t r;
+        for (; waited < 600; waited++) {
+            db_recon_status(&r);
+            if (!r.active && r.rt_queued == 0) break;
+            usleep(10000);
+        }
+        db_recon_test_entry_hook = NULL;
+        store_counts(st, &kn1, &sd1);
+        CHECK_MSG(!r.active && r.rt_queued == 0, "the pass that was cut off is forgotten (active %d, queued %llu)", r.active, (unsigned long long)r.rt_queued);
+        CHECK_MSG(kn1 - kn0 < 400 && r.swept == 0, "part of the pass was recorded (%llu of 400) and nothing swept", (unsigned long long)(kn1 - kn0));
+        /* the supervisor starts a new loader */
+        int a3[2], f3[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a3) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, f3) == 0);
+        hand_over(cs[0], a3[1], f3[1]);
+        close(f[0]);
+        a[0] = a3[0];
+        f[0] = f3[0];
+        ch_init(&mainc, a[0], KDB_FROM_BACKEND);
+        ch_init(&fetchc, f[0], KDB_FROM_BACKEND);
+        kdb_enc_begin(&e, KDB_T_HELLO);
+        kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, KDB_FEAT_STORE | KDB_FEAT_LOOKUP);
+        kdb_enc_end(&e);
+        ch_send(a[0], &e);
+        CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG);
+        CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_DEBUG);
+        p_batch_begin(a[0], &e, 5, KDB_BATCH_FULL, 0);
+        p_manifest_begin(a[0], &e, 5, 50, 9, true);
+        gm_zones(page, 0, 10, 7000000, "gd");
+        for (int pg = 0; pg < 5; pg++) {
+            gm_zones(page, pg * 10, 10, 7000000, "gd");
+            p_manifest_page(a[0], &e, 5, (uint32_t)pg, page, 10);
+        }
+        p_manifest_end(a[0], &e, 5, 50, 0, 9, true);
+        p_batch_end(a[0], &e, 5, 50, 0);
+        CHECK_MSG(p_result(&mainc, &m, 20000) && m.u.batch_result.n_applied == 50 && m.u.batch_result.n_unchanged == 0 && m.u.batch_result.n_rejected == 0 && m.u.batch_result.n_deleted == 0,
+                  "the clean pass after the cut-off one: applied %u unchanged %u rejected %u deleted %u (the counts are its own)", m.u.batch_result.n_applied, m.u.batch_result.n_unchanged, m.u.batch_result.n_rejected, m.u.batch_result.n_deleted);
+        /* a MANIFEST_END whose sum is not the sum of the pages ends the stream before the sweep (nothing is deleted) */
+        p_batch_begin(a[0], &e, 6, KDB_BATCH_FULL, 0);
+        p_manifest_begin(a[0], &e, 6, 10, 10, true);
+        gm_zones(page, 0, 10, 7000000, "gd");
+        p_manifest_page(a[0], &e, 6, 0, page, 10);
+        p_manifest_end(a[0], &e, 6, 11, 0, 10, true);
+        p_batch_end(a[0], &e, 6, 11, 0);
+        CHECK_MSG(st_text_has("last protocol error: MANIFEST_END: n_entries differs from the entries of the pages", 5000), "a pass whose end has another sum ends the stream");
+        for (int i = 0; i < 100; i++) { db_recon_status(&r); if (!r.active) break; usleep(10000); }
+        store_zone_t z;
+        CHECK(zrec(st, "gd49.test", &z));                                    /* (the sweep did not run: the zones the short pass did not list are still there) */
+        CHECK(!r.active && r.swept == 0);
+    }
+    db_recon_status(&rs);
+    printf("  (the reconcile thread: %llu entries in %llu pages)\n", (unsigned long long)rs.rt_entries, (unsigned long long)rs.rt_pages);
+    printf("%d checks, %d failed\n", g_checks, g_failed);
+    return g_failed ? 1 : 0;
+}
+
+
 static int proto_main(const char *self) {
     char dir[600];
     const char *tmp = getenv("TMPDIR");
     snprintf(dir, sizeof(dir), "%s/test_db_store_proto.XXXXXX", tmp && *tmp ? tmp : "/tmp");
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
     int bad = 0;
-    for (int phase = 0; phase < 8; phase++) {
+    for (int phase = 0; phase < 9; phase++) {
         char cmd[900];
         snprintf(cmd, sizeof(cmd), "%s proto%d %s", self, phase, dir);
         if (system(cmd) != 0) bad++;
-        if (phase == 0 || phase == 2 || phase == 3 || phase == 5 || phase == 6) {                   /* (phase 0 is the legacy loader on an empty store, phase 3 the fixes of the review, phase 4 the settings: the next phases start on a new store; phase 5 follows phase 4 on its store) */
+        if (phase == 0 || phase == 2 || phase == 3 || phase == 5 || phase == 6 || phase == 7) {                   /* (phase 0 is the legacy loader on an empty store, phase 3 the fixes of the review, phase 4 the settings: the next phases start on a new store; phase 5 follows phase 4 on its store) */
             char rm[700];
             snprintf(rm, sizeof(rm), "rm -rf %s/s", dir);
             (void)!system(rm);
@@ -5212,6 +5623,7 @@ int main(int argc, char **argv) {
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '3') return run_fixes(argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '6') return run_stamp_race(argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '7') return run_lookup_body(argv[2]);
+    if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '8') return run_recon_thread(argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && (argv[1][5] == '4' || argv[1][5] == '5')) return run_settings(argv[1][5] - '0', argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] >= '0' && argv[1][5] <= '2') return run_proto(argv[1][5] - '0', argv[2]);
     if (argc > 1) return run_mode(strcmp(argv[1], "copy") == 0 ? "copy" : "map");

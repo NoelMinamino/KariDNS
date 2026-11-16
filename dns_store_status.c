@@ -424,6 +424,20 @@ static void add_recon(list_t *l) {
   U("store.recon.changes.upserts", r->change_upserts);
   U("store.recon.changes.deletes", r->change_deletes);
   U("store.recon.cursors_kept", r->cursors);
+  U("store.recon.thread", r->recon_thread ? 1 : 0);
+  if (r->recon_thread) {
+    U("store.recon.busy_pct", r->rt_busy_pct);
+    U("store.recon.entries_per_s", r->rt_entries_per_s);
+    U("store.recon.queued", r->rt_queued);
+    U("store.recon.apply_ns_per_entry", r->rt_apply_ns_per_entry);
+    U("store.recon.thread_entries", r->rt_entries);
+    U("store.recon.thread_pages", r->rt_pages);
+    U("store.recon.ring_full_stops", r->rt_full_stops);
+  }
+  U("store.recon.group_records", r->rt_group_records);
+  U("store.recon.group_entries", r->rt_group_entries);
+  U("store.ingest.loop_max_us", r->rt_loop_max_us);
+  U("store.ingest.stream_max_us", r->rt_stream_max_us);
   U("store.recon.guard.held_views", r->guard_views);
   if (r->guard_views) {
     add_s(l, "store.recon.guard.view", r->guard_view);

@@ -35,6 +35,7 @@
 
 #include "dns_config_parser.h"
 #include "dns_db_install.h"
+#include "dns_db_recon.h"
 #include "dns_db_store.h"
 #include "dns_db_stream.h"
 #include "dns_epoch_rcu.h"
@@ -59,6 +60,7 @@ _Static_assert(ZDIR_APEX_GLUE_PER_NS == KDB_NOTIFY_ADDR_PER_NS && ZDIR_APEX_NADD
 #define ING_EVT_RESULT 2
 #define ING_EVT_REQ 3             /* karictl reload requests from the control thread (SPSC ring g_rq) */
 #define ING_EVT_DEBUG 7           /* 0.7 M2: the debug level changed (control thread): DEBUG to the loader */
+#define ING_EVT_RECON 8           /* 0.7 M2: the reconcile thread (dns_db_recon.c) freed a slot of its ring, went idle, has counts or found a protocol error */
 #define ING_REQ_MAX 32            /* reload requests waiting for the loader's answer (the control thread parks as many clients) */
 #define RQ_RING 64                /* both rings: more than ING_REQ_MAX, so a ring never fills while the bound holds */
 #define ING_RETIRE_EVERY 1024     /* design 4.3: a blocking grace period every this many published zones */
@@ -271,8 +273,10 @@ typedef struct {
    * (the scan of the store below, or a query) */
   uint32_t loader_feat;        /* HELLO features of this loader */
   bool store_proto;
-  bool man_skip;               /* inside a MANIFEST pass that is not applied (the view or the store refuses it) */
-  uint32_t man_n;              /* entries of the pass (for the log line) */
+  /* 0.7 M2: the pages of a MANIFEST pass go to the reconcile thread (dns_db_recon.h).  A frame of the first stream that has to wait for it (a free slot of its ring, or everything before it applied) is kept here and the
+   * stream is not read meanwhile (the read event of its descriptor is off): the pointers of the frame are into rbuf / body, which nothing touches while it waits */
+  bool held_valid, hold_room, read_off;
+  kdb_frame_t held_fr;
   bool bg_on, bg_again;        /* the background fetch of the wanted bodies is going / must go through the store once more when it ends */
   uint32_t bg_zid;             /* ... the zone id it has reached */
   uint32_t bg_fail;            /* ... the bodies of this round that could not be brought */
@@ -1791,8 +1795,9 @@ static void drop_stream(ing_t *g) {
   g->hello_done = false;
   atomic_store_explicit(&g_lookup_on, false, memory_order_release);      /* (a new loader says again whether it looks names up) */
   g->inv_active = false;
-  db_recon_abort();                           /* 0.7 WP7b: a pass that was cut off sweeps nothing */
-  g->man_skip = false;
+  db_recon_abort_stream();                    /* 0.7 WP7b: a pass that was cut off sweeps nothing (the reconcile thread forgets it; what it was given and has not applied is dropped) */
+  g->held_valid = false;
+  g->read_off = false;
   g->defer_end = false;                       /* (the loader that waited for BATCH_RESULT is gone) */
   g->req_wait = false;
   g->need_cleanup = true;                     /* zones in flight are finished by the main loop, not from here */
@@ -2052,7 +2057,6 @@ static void on_batch_begin(ing_t *g, const kdb_msg_t *m) {
   g->batch_kind = m->u.batch_begin.kind;
   g->b_applied = g->b_rejected = g->b_shadowed = g->b_deleted = g->b_failed = g->b_unchanged = 0;
   g->ch_failed = false;
-  g->man_skip = false;
   clear_profiles(g);                                     /* B7a: the profiles of the previous batch */
   g->rejects_logged = 0;
   g->shadows_logged = 0;
@@ -2503,114 +2507,64 @@ static void bulk_kick(ing_t *g) {
   }
 }
 
-/* what an entry became, in the numbers of the batch (BATCH_RESULT, dbstatus); true: a body is wanted */
+/* what an entry became, in the numbers of the batch (BATCH_RESULT, dbstatus); true: a body is wanted.  The same rules for the entries of the pages of a pass, which the reconcile thread counts (db_recon_note()) */
 static bool entry_note(ing_t *g, int r, const char *zone, bool *unstorable_logged) {
-  switch (r) {
-  case DBR_NEW:
-  case DBR_CHANGED:
-  case DBR_RENAMED:
-    g->b_applied++;
-    atomic_fetch_add_explicit(&g_st.tot_applied, 1, memory_order_relaxed);
-    return true;
-  case DBR_PENDING:
-    g->b_applied++;
-    return true;
-  case DBR_SAME:
-  case DBR_KEPT:
-    g->b_unchanged++;
-    return false;
-  case DBR_UNSTORABLE:
-    g->b_rejected++;
-    atomic_fetch_add_explicit(&g_st.tot_rejected, 1, memory_order_relaxed);
-    if (!*unstorable_logged) {
-      *unstorable_logged = true;
-      syslog(LOG_WARNING, "[DB] zone '%s' cannot be served: the store and the zone directory key a name by at most 255 bytes of text (only escapes make a longer one), or the Backend is out of memory; the zone is not loaded", zone);
-    }
-    return false;
-  default:
-    g->b_rejected++;
-    atomic_fetch_add_explicit(&g_st.tot_rejected, 1, memory_order_relaxed);
-    g->ch_failed = true;
-    return false;
-  }
+  dbrt_counts_t c;
+  memset(&c, 0, sizeof(c));
+  const bool w = db_recon_note(&c, r, zone, unstorable_logged);
+  g->b_applied += c.applied;
+  g->b_unchanged += c.unchanged;
+  g->b_rejected += c.rejected;
+  atomic_fetch_add_explicit(&g_st.tot_applied, c.tot_applied, memory_order_relaxed);
+  atomic_fetch_add_explicit(&g_st.tot_rejected, c.tot_rejected, memory_order_relaxed);
+  if (c.failed) g->ch_failed = true;
+  return w;
 }
 
+/* MANIFEST_BEGIN: the stream thread decoded it (it is small); the pass is applied by the reconcile thread (the pages come after it in the ring) */
 static void on_manifest_begin(ing_t *g, const kdb_msg_t *m) {
   const kdb_manifest_begin_t *mb = &m->u.manifest_begin;
-  g->man_skip = true;
-  g->man_n = 0;
   if (!g->store_proto) {
     protocol_error(g, "MANIFEST_BEGIN with the store protocol off");
     return;
   }
   const char *vname = view_name_at(g, mb->view, true);
-  if (!vname[0]) {
-    syslog(LOG_WARNING, "[DB] a manifest pass for view %u, which the configuration does not have; it is ignored", (unsigned)mb->view);
-    return;
-  }
-  const bool force = g->batch_force;
-  char why[160];
-  if (!db_recon_begin(vname, mb->count, force, why, sizeof(why))) {
-    syslog(LOG_ERR, "[DB] view '%s': the manifest pass cannot be applied: %s", vname, why);
-    return;
-  }
-  g->man_skip = false;
-  syslog(LOG_INFO, "[DB] view '%s': a manifest pass starts (the loader lists every zone of its source, about %llu)%s", vname, (unsigned long long)mb->count,
-         force ? "; asked for by the operator (karictl reload -force)" : "");
-}
-
-static void on_manifest(ing_t *g, const kdb_msg_t *m) {
-  if (g->man_skip) return;
-  kdb_iter_t it;
-  kdb_manifest_entry_t e;
-  burst_yield_t by = BURST_YIELD_INIT;
-  bool wanted = false, unst = false;
-  uint32_t n = 0;
-  kdb_manifest_entries(m, &it);
-  while (kdb_manifest_entries_next(&it, &e)) {
-    db_recon_entry_t re;
-    memset(&re, 0, sizeof(re));
-    re.source_id = e.source_id;
-    re.name = e.name;
-    re.kind = e.kind;
-    re.stamped = e.stamped;
-    re.gen = e.stamp_gen;
-    re.time = e.stamp_time;
-    re.has_serial = e.has_serial;
-    re.serial = e.serial;
-    uint32_t zid;
-    int r = db_recon_entry(&re, &zid);
-    g->man_n++;
-    wanted |= entry_note(g, r, e.name, &unst);
-    if ((++n & 1023) == 0) burst_yield_check(&by);
-  }
-  if (wanted) bulk_kick(g);
+  if (!vname[0]) syslog(LOG_WARNING, "[DB] a manifest pass for view %u, which the configuration does not have; it is ignored", (unsigned)mb->view);
+  db_recon_post_begin(mb->batch_id, mb->view, g->sm.lim.view_count, vname, mb->count, g->batch_force);
 }
 
 static void on_manifest_end(ing_t *g, const kdb_msg_t *m) {
-  const kdb_manifest_end_t *me = &m->u.manifest_end;
-  if (g->man_skip) {
-    g->man_skip = false;
-    return;
-  }
-  if (me->n_entries != g->man_n) syslog(LOG_WARNING, "[DB] the manifest pass says %llu entries and the Backend saw %u", (unsigned long long)me->n_entries, g->man_n);
-  db_recon_end_t out;
-  if (g->ch_failed) syslog(LOG_ERR, "[DB] view '%s': an entry of the pass could not be recorded; the cursor is not kept, the next start lists the zones again", view_name_at(g, me->view, true));
-  db_recon_end(me->complete, me->n_skipped, me->cursor_valid && !g->ch_failed, me->cursor, me->ident_len ? me->ident : NULL, me->ident_len, &out);
-  db_recon_status_t st;
-  db_recon_status(&st);
-  g->b_deleted += (uint32_t)out.deleted;
-  atomic_fetch_add_explicit(&g_st.tot_deleted, out.deleted, memory_order_relaxed);
-  syslog(LOG_INFO, "[DB] view '%s': the manifest pass is over after %llu ms: %llu zone(s) listed (%llu new, %llu changed, %llu renamed, %llu already asked for, %llu unchanged, %llu refused with this "
-                   "version), %llu not offered by the loader, %llu of the %llu zone(s) the Backend held for the view were not listed and %s",
-         st.view, (unsigned long long)out.duration_ms, (unsigned long long)st.entries, (unsigned long long)st.created, (unsigned long long)st.changed, (unsigned long long)st.renamed,
-         (unsigned long long)st.pending, (unsigned long long)st.same, (unsigned long long)st.kept, (unsigned long long)st.skipped, (unsigned long long)out.unlisted,
-         (unsigned long long)out.total, out.held ? "NOT deleted (the mass-delete guard)" : out.failed ? "NOT all deleted (an entry of the pass could not be recorded, or a delete failed: see above)" : out.swept ? "deleted" : me->complete ? "none was" : "no sweep was made (the pass was not complete)");
-  g->ch_failed = false;
+  (void)g;
+  db_recon_post_end(&m->u.manifest_end);
+}
+
+/* the counts of what the reconcile thread has applied (the batch's numbers, the zones the state machine counts for BATCH_END): only when it is idle, so that nothing of a stream that ended is in them */
+static void recon_collect(ing_t *g) {
+  dbrt_counts_t c;
+  db_recon_take(&c);
+  g->b_applied += c.applied;
+  g->b_unchanged += c.unchanged;
+  g->b_rejected += c.rejected;
+  g->b_deleted += c.deleted;
+  g->sm.n_zones += c.zones;
 }
 
 /* the zone a `karictl reload <zone>` asks for is being fetched now: the answer of the request waits for it (BATCH_RESULT is held, on_batch_end()) */
 static void req_fetch_start(ing_t *g, uint16_t view, const char *view_name, const char *zone, int64_t sid, bool nonstore);
+
+/* the entries of a CHANGES message that are upserts, applied in groups (db_recon_change_n(): one journal record for a group) */
+#define ING_CHG_GROUP DBRT_CHUNK
+static void changes_flush(ing_t *g, const kdb_changes_t *c, const char *vname, const kdb_changes_entry_t *ents, const db_recon_entry_t *re, const bool *is_req, unsigned nq, bool *wanted, bool *unst) {
+  int res[ING_CHG_GROUP];
+  uint32_t zid[ING_CHG_GROUP];
+  if (nq == 0) return;
+  db_recon_change_n(vname, re, nq, res, zid);
+  for (unsigned i = 0; i < nq; i++) {
+    const bool w = entry_note(g, res[i], ents[i].name, unst);
+    *wanted |= w;
+    if (w && is_req[i]) req_fetch_start(g, c->view, vname, ents[i].name, ents[i].source_id, ents[i].kind != KDB_ZK_PRIMARY);
+  }
+}
 
 static void on_changes(ing_t *g, const kdb_msg_t *m) {
   const kdb_changes_t *c = &m->u.changes;
@@ -2623,53 +2577,60 @@ static void on_changes(ing_t *g, const kdb_msg_t *m) {
     syslog(LOG_WARNING, "[DB] changes for view %u, which the configuration does not have; they are ignored", (unsigned)c->view);
     return;
   }
+  static kdb_changes_entry_t ents[ING_CHG_GROUP];          /* (the ingest thread's: the group of upserts that waits for its record) */
+  static db_recon_entry_t re[ING_CHG_GROUP];
+  bool is_req[ING_CHG_GROUP];
+  unsigned nq = 0;
   kdb_iter_t it;
-  kdb_changes_entry_t e;
   burst_yield_t by = BURST_YIELD_INIT;
   bool wanted = false, unst = false;
   uint32_t n = 0;
   kdb_changes_entries(m, &it);
-  while (kdb_changes_entries_next(&it, &e)) {
-    if (e.op == KDB_CH_DELETE) {
-      if (e.has_name) drain_name(g, vname, e.name);        /* (a zone of the same name may be in flight) */
-      const int dd = db_recon_delete(vname, e.source_id, e.has_name ? e.name : NULL);
+  for (;;) {
+    kdb_changes_entry_t *e = &ents[nq];
+    if (!kdb_changes_entries_next(&it, e)) break;
+    if (e->op == KDB_CH_DELETE) {
+      changes_flush(g, c, vname, ents, re, is_req, nq, &wanted, &unst);          /* (the upserts before it are recorded first: the order of the entries is the order of the effects) */
+      nq = 0;
+      if (e->has_name) drain_name(g, vname, e->name);        /* (a zone of the same name may be in flight) */
+      const int dd = db_recon_delete(vname, e->source_id, e->has_name ? e->name : NULL);
       if (dd > 0) {
         g->b_deleted++;
         atomic_fetch_add_explicit(&g_st.tot_deleted, 1, memory_order_relaxed);
-        if (g->cur_req >= 0 && g->reqs[g->cur_req].view == c->view && e.has_name && domain_names_match_ci(g->reqs[g->cur_req].zone, e.name)) g->req_outcome = ROUT_DELETED;
-        logev_post(LOGC_DATABASE, 1, NULL, 0, "[DB] zone '%s' (view '%s', id %lld) deleted", e.has_name ? e.name : "?", vname, (long long)e.source_id);
+        if (g->cur_req >= 0 && g->reqs[g->cur_req].view == c->view && e->has_name && domain_names_match_ci(g->reqs[g->cur_req].zone, e->name)) g->req_outcome = ROUT_DELETED;
+        logev_post(LOGC_DATABASE, 1, NULL, 0, "[DB] zone '%s' (view '%s', id %lld) deleted", e->has_name ? e->name : "?", vname, (long long)e->source_id);
       } else if (dd < 0) {                                 /* the store could not delete it: the zone stays, and the cursor is not kept, so that the delete is made again */
         g->b_rejected++;
         atomic_fetch_add_explicit(&g_st.tot_rejected, 1, memory_order_relaxed);
         g->ch_failed = true;
-        syslog(LOG_ERR, "[DB] zone '%s' (view '%s', id %lld) could not be deleted from the store; it stays", e.has_name ? e.name : "?", vname, (long long)e.source_id);
+        syslog(LOG_ERR, "[DB] zone '%s' (view '%s', id %lld) could not be deleted from the store; it stays", e->has_name ? e->name : "?", vname, (long long)e->source_id);
       } else {
         g->b_unchanged++;
       }
+      if ((++n & 1023) == 0) burst_yield_check(&by);
       continue;
     }
-    db_recon_entry_t re;
-    memset(&re, 0, sizeof(re));
-    re.source_id = e.source_id;
-    re.name = e.name;
-    re.kind = e.kind;
-    re.stamped = e.stamped;
-    re.gen = e.stamp_gen;
-    re.time = e.stamp_time;
-    re.has_serial = e.has_serial;
-    re.serial = e.serial;
+    db_recon_entry_t *r = &re[nq];
+    memset(r, 0, sizeof(*r));
+    r->source_id = e->source_id;
+    r->name = e->name;
+    r->kind = e->kind;
+    r->stamped = e->stamped;
+    r->gen = e->stamp_gen;
+    r->time = e->stamp_time;
+    r->has_serial = e->has_serial;
+    r->serial = e->serial;
     /* the loader marks the entry of a one-zone reload FORCE; the body is read whatever the stamp says only when the operator said `force` (karictl reload <zone> force): without it the stamp decides, and
      * a zone that did not change is "unchanged" and is not read, whether or not its data is in memory */
-    const bool is_req = g->cur_req >= 0 && g->reqs[g->cur_req].view == c->view && domain_names_match_ci(g->reqs[g->cur_req].zone, e.name);
-    re.force = e.force && (!is_req || g->reqs[g->cur_req].force);
-    uint32_t zid;
-    int r = db_recon_change(vname, &re, &zid);
-    bool w = entry_note(g, r, e.name, &unst);
-    wanted |= w;
-    if (w && is_req)
-      req_fetch_start(g, c->view, vname, e.name, e.source_id, e.kind != KDB_ZK_PRIMARY);
+    is_req[nq] = g->cur_req >= 0 && g->reqs[g->cur_req].view == c->view && domain_names_match_ci(g->reqs[g->cur_req].zone, e->name);
+    r->force = e->force && (!is_req[nq] || g->reqs[g->cur_req].force);
+    if (++nq == ING_CHG_GROUP) {
+      changes_flush(g, c, vname, ents, re, is_req, nq, &wanted, &unst);
+      nq = 0;
+    }
     if ((++n & 1023) == 0) burst_yield_check(&by);
   }
+  changes_flush(g, c, vname, ents, re, is_req, nq, &wanted, &unst);
   if (c->last) {                                           /* the drain is complete up to this cursor, and every entry is in the store: it may be made durable */
     if (g->ch_failed) syslog(LOG_ERR, "[DB] view '%s': an entry of the changes could not be recorded; the cursor is not kept, the next start reads the changes again", vname);
     else db_recon_cursor_put(vname, c->cursor, c->ident_len ? c->ident : NULL, c->ident_len);
@@ -2714,9 +2675,6 @@ static void handle_msg(ing_t *g, const kdb_msg_t *m) {
   case KDB_T_MANIFEST_BEGIN:
     on_manifest_begin(g, m);
     break;
-  case KDB_T_MANIFEST:
-    on_manifest(g, m);
-    break;
   case KDB_T_MANIFEST_END:
     on_manifest_end(g, m);
     break;
@@ -2758,12 +2716,72 @@ static inline bool ing_yield(int64_t t0, unsigned handled) {
   return park_fetch_pending();
 }
 
-static void on_stream_readable(ing_t *g) {
+/* the frame waits (room: for a free slot of the reconcile ring; else for the thread to have applied everything it was given); the stream is not read meanwhile, and its read event is off so that the loop does not spin on it */
+static void stream_hold(ing_t *g, const kdb_frame_t *fr, bool room) {
+  g->held_fr = *fr;
+  g->held_valid = true;
+  g->hold_room = room;
+  if (room) db_recon_note_full();
+  if (!g->read_off && g->stream_fd >= 0) {
+    struct kevent ev;
+    EV_SET(&ev, g->stream_fd, EVFILT_READ, EV_DISABLE, 0, 0, NULL);
+    if (kevent(g->kq, &ev, 1, NULL, 0, NULL) == 0) g->read_off = true;
+  }
+}
+
+static void recon_poll(ing_t *g);
+
+/* A frame of the first stream.  The pages of a manifest pass are not decoded here: they are legal or not (the state of the stream), and the reconcile thread gets them, with the pass's begin and end, in a ring (0.7 M2,
+ * dns_db_recon.h).  Every other frame waits until that thread has applied what it was given, then its counts are collected: the frame sees the pass whole.  A frame that has to wait is held (the stream is not
+ * read); false: stop reading now (a protocol error closed the stream, or the frame is held). */
+static bool stream_frame(ing_t *g, const kdb_frame_t *fr) {
+  kdb_msg_t msg;
+  kdb_rc_t rc;
+  const uint16_t t = fr->type;
+  if (t == KDB_T_MANIFEST || t == KDB_T_MANIFEST_BEGIN || t == KDB_T_MANIFEST_END) {
+    if (!db_recon_room()) {
+      stream_hold(g, fr, true);
+      return false;
+    }
+    if (t == KDB_T_MANIFEST) {
+      rc = kdb_sm_legal_frame(&g->sm, t);
+      if (rc != KDB_OK) {
+        protocol_error(g, g->sm.reason);
+        return false;
+      }
+      db_recon_post_page(fr->body, fr->len, g->sm.lim.view_count);
+      return true;
+    }
+    rc = kdb_sm_accept(&g->sm, fr, &msg);
+    if (rc != KDB_OK) {
+      protocol_error(g, g->sm.reason);
+      return false;
+    }
+    if (t == KDB_T_MANIFEST_BEGIN) on_manifest_begin(g, &msg);
+    else on_manifest_end(g, &msg);
+    return g->stream_fd >= 0;
+  }
+  if (!db_recon_idle()) {
+    stream_hold(g, fr, false);
+    return false;
+  }
+  recon_collect(g);
+  rc = kdb_sm_accept(&g->sm, fr, &msg);
+  if (rc != KDB_OK) {
+    /* the reason names the rule, never bytes of the stream */
+    protocol_error(g, g->sm.reason);
+    return false;
+  }
+  handle_msg(g, &msg);
+  return g->stream_fd >= 0;
+}
+
+static void stream_pass(ing_t *g) {
   const int64_t t0 = mono_ns();
   unsigned handled = 0;
   for (int round = 0; round < ING_READ_ROUNDS && g->stream_fd >= 0; round++) {
-    if (g->sresume) {
-      g->sresume = false;                                /* (the frames the last pass left are handled first) */
+    if (g->sresume || g->held_valid) {
+      g->sresume = false;                                /* (the frames the last pass left, or the one that waits, are handled first) */
     } else {
       ssize_t n = read(g->stream_fd, g->rbuf, ING_RBUF);
       if (n < 0) {
@@ -2785,26 +2803,51 @@ static void on_stream_readable(ing_t *g) {
     }
     kdb_frame_t fr;
     for (;;) {
-      kdb_rc_t rc = kdb_framer_next(&g->fr, &fr);
-      if (rc == KDB_MORE) break;
-      if (rc != KDB_OK) {
-        protocol_error(g, g->fr.reason);
-        return;
+      if (g->held_valid) {
+        if (!(g->hold_room ? db_recon_room() : db_recon_idle())) return;      /* (it still waits) */
+        fr = g->held_fr;
+        g->held_valid = false;
+      } else {
+        kdb_rc_t rc = kdb_framer_next(&g->fr, &fr);
+        if (rc == KDB_MORE) break;
+        if (rc != KDB_OK) {
+          protocol_error(g, g->fr.reason);
+          return;
+        }
       }
-      kdb_msg_t msg;
-      rc = kdb_sm_accept(&g->sm, &fr, &msg);
-      if (rc != KDB_OK) {
-        /* the reason names the rule, never bytes of the stream */
-        protocol_error(g, g->sm.reason);
-        return;
-      }
-      handle_msg(g, &msg);
+      if (!stream_frame(g, &fr)) return;
       if (g->stream_fd < 0) return;
-      if (ing_yield(t0, ++handled)) {
+      /* (0.7 M2: a pass of the stream thread is not longer than the time slice whether or not a request waits: the pages of a manifest pass are copies, a megabyte of them is a few hundred microseconds, and
+       * the fetch stream, the answers of the lookups and the bodies that wake the queries are served between the passes) */
+      if (ing_yield(t0, ++handled) || mono_ns() - t0 >= atomic_load_explicit(&g_ing_yield_ns, memory_order_relaxed)) {
         g->sresume = true;
         return;
       }
     }
+  }
+}
+
+static void on_stream_readable(ing_t *g) {
+  const int64_t t0 = mono_ns();
+  stream_pass(g);
+  db_recon_note_stream(mono_ns() - t0);                 /* 0.7 M2: store.ingest.stream_max_us */
+}
+
+/* the reconcile thread has said something (EVFILT_USER ING_EVT_RECON): a protocol error it found in what the loader sent, bodies that are wanted, a free slot or an idle thread for the frame that waits */
+static void recon_poll(ing_t *g) {
+  char why[KDB_REASON_LEN];
+  if (db_recon_error_take(why, sizeof(why))) {
+    protocol_error(g, why);
+    return;
+  }
+  if (db_recon_wanted_take()) bulk_kick(g);
+  if (g->held_valid && g->stream_fd >= 0 && (g->hold_room ? db_recon_room() : db_recon_idle())) {
+    if (g->read_off) {
+      struct kevent ev;
+      EV_SET(&ev, g->stream_fd, EVFILT_READ, EV_ENABLE, 0, 0, NULL);
+      if (kevent(g->kq, &ev, 1, NULL, 0, NULL) == 0) g->read_off = false;
+    }
+    on_stream_readable(g);
   }
 }
 
@@ -2849,6 +2892,9 @@ static void adopt_stream(ing_t *g, int fd) {
   kdb_framer_init(&g->fr, KDB_FROM_LOADER, g->body, KDB_MAX_BODY);
   g->sresume = false;
   kdb_sm_init(&g->sm, &lim);
+  kdb_sm_defer_manifest(&g->sm);                       /* 0.7 M2: the pages of a pass are checked by the reconcile thread */
+  g->held_valid = false;
+  g->read_off = false;
   kdb_enc_reset(&g->enc);
   syslog(LOG_INFO, "[DB] loader stream connected, waiting for HELLO");
 }
@@ -4897,6 +4943,8 @@ static void *ingest_thread(void *arg) {
         process_requests(g);
       } else if (e->filter == EVFILT_USER && e->ident == ING_EVT_DEBUG) {
         send_debug(g);
+      } else if (e->filter == EVFILT_USER && e->ident == ING_EVT_RECON) {
+        recon_poll(g);                                   /* 0.7 M2: the reconcile thread: a protocol error, bodies wanted, a frame that waited for it */
       } else if (e->filter == EVFILT_USER && e->ident == ING_EVT_HOT) {
         hot_send(g);                                     /* D1a step 7: the cache thread made a hot list */
       } else if (e->filter == EVFILT_USER && e->ident == PARK_FETCH_IDENT) {
@@ -4937,6 +4985,7 @@ static void *ingest_thread(void *arg) {
     {
       int64_t t1 = mono_ns();
       busy_ns += t1 - t_wake;
+      db_recon_note_loop(t1 - t_wake);                   /* 0.7 M2: the longest pass of this loop (store.ingest.loop_max_us) */
       if (t1 - win_start >= ING_BUSY_WINDOW_NS) {
         atomic_store_explicit(&g_ing_busy_pct, (uint32_t)(busy_ns * 100 / (t1 - win_start)), memory_order_relaxed);
         atomic_store_explicit(&g_ing_fill_pct, (uint32_t)(g->fill_ns * 100 / (t1 - win_start)), memory_order_relaxed);
@@ -4974,7 +5023,7 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
     return false;
   }
   if (!limit_ctrl_rights(ctrl_fd)) return false;
-  struct kevent ev[7];
+  struct kevent ev[8];
   EV_SET(&ev[0], ctrl_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
   EV_SET(&ev[1], ING_EVT_CONFIG, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
   EV_SET(&ev[2], ING_EVT_RESULT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
@@ -4982,7 +5031,8 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
   EV_SET(&ev[4], PARK_FETCH_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);      /* D1a: a worker asks for a zone */
   EV_SET(&ev[5], ING_EVT_HOT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);      /* D1a step 7: a hot list to send */
   EV_SET(&ev[6], ING_EVT_DEBUG, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);    /* 0.7 M2: karictl trace / notrace */
-  if (kevent(g->kq, ev, 7, NULL, 0, NULL) != 0) {
+  EV_SET(&ev[7], ING_EVT_RECON, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);    /* 0.7 M2: the reconcile thread */
+  if (kevent(g->kq, ev, 8, NULL, 0, NULL) != 0) {
     syslog(LOG_ERR, "[DB] cannot watch the loader control socket: %s", strerror(errno));
     return false;
   }
@@ -5017,6 +5067,7 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
     }
     syslog(LOG_INFO, "[DB] %u builder thread(s) for the zones of the database", g->nbuilders);
   }
+  if (!db_recon_thread_start(g->kq, ING_EVT_RECON)) return false;      /* 0.7 M2: the pages of a manifest pass are applied by a thread of their own (dns_db_recon.h) */
   if (stream_fd >= 0) adopt_stream(g, stream_fd);
   if (fetch_fd >= 0) fetch_adopt(g, fetch_fd);
   park_fetch_set_notify(g->kq);
@@ -5667,9 +5718,11 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     }
     rcu_aux_read_unlock();
   }
+  uint64_t rt_applied, rt_rejected, rt_deleted;
+  db_recon_totals(&rt_applied, &rt_rejected, &rt_deleted);               /* (the entries of the manifest pages: counted by the reconcile thread) */
   st_append(&c, "since start: %llu applied, %llu rejected, %llu shadowed, %llu deleted, %llu failed in the loader\n",
-            (unsigned long long)atomic_load(&g_st.tot_applied), (unsigned long long)atomic_load(&g_st.tot_rejected),
-            (unsigned long long)atomic_load(&g_st.tot_shadowed), (unsigned long long)atomic_load(&g_st.tot_deleted),
+            (unsigned long long)(atomic_load(&g_st.tot_applied) + rt_applied), (unsigned long long)(atomic_load(&g_st.tot_rejected) + rt_rejected),
+            (unsigned long long)atomic_load(&g_st.tot_shadowed), (unsigned long long)(atomic_load(&g_st.tot_deleted) + rt_deleted),
             (unsigned long long)atomic_load(&g_st.tot_failed));
   st_append(&c, "settings: %zu distinct (shared between zones), %u zone(s) name a TSIG key that karidns.conf does not define\n",
             db_settings_count(), atomic_load_explicit(&g_settings_missing_keys, memory_order_relaxed));

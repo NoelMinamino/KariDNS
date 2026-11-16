@@ -93,6 +93,11 @@ typedef struct store_recon {
   unsigned guard_views;          /* views whose sweep the guard holds back */
   char guard_view[STORE_VIEW_NAME_MAX + 1];
   uint64_t guard_unlisted, guard_total, guard_unix;
+  /* 0.7 M2, the reconcile thread (dns_db_recon.c: the pages of a pass are decoded and applied there, off the thread that answers the fetches and lookups): the share of the last window it was busy, the entries it applied
+   * a second in that window, the pages that wait for it now, the time one entry took (wall time of the apply call over its entries, since the start), the entries and pages since the start, how often the stream
+   * thread had to stop reading the loader because the ring was full, the group records the store wrote and their entries, and the longest pass of the ingest thread's loop in the last window (microseconds) */
+  bool recon_thread;             /* the figures below are there (the thread runs) */
+  uint64_t rt_busy_pct, rt_entries_per_s, rt_queued, rt_apply_ns_per_entry, rt_entries, rt_pages, rt_full_stops, rt_group_records, rt_group_entries, rt_loop_max_us, rt_stream_max_us;
 } store_recon_t;
 /* fills *out and returns true, or returns false when the server has none (no loader) */
 void store_status_set_recon_fn(bool (*fn)(store_recon_t *out));
