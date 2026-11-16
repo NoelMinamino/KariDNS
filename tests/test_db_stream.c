@@ -2996,6 +2996,161 @@ static void test_names(void) {
     CHECK_STR(kdb_type_name(0x7fff), "?");
 }
 
+/* ---------------------------------------------------------------- 0.7 M2: the pages of a pass handed to the reconcile thread */
+/* The stream thread of the Backend: the pages of a pass are only checked for legality (kdb_sm_legal_frame()) and copied; the reconcile thread decodes them and applies the rules of the pass (kdb_man_t).  This is that pair on a
+ * buffer of frames: kdb_sm_accept() for the frames the stream thread decodes, kdb_sm_legal_frame() + kdb_man_page() for the pages, kdb_man_end() for the sum.  *zones: what the pages add to BATCH_END's count (the stream
+ * thread adds it to sm.n_zones before it accepts BATCH_END, as the Backend does at its barrier).  The first error of either side. */
+static kdb_rc_t split_run(sess_t *s, const uint8_t *buf, size_t len, uint64_t *zones, char *why, size_t wl) {
+    kdb_framer_t *f = &s->f;
+    kdb_man_t man;
+    memset(&man, 0, sizeof(man));
+    kdb_rc_t rc = kdb_framer_feed(f, buf, len);
+    *zones = 0;
+    why[0] = '\0';
+    while (rc == KDB_OK) {
+        kdb_frame_t fr;
+        rc = kdb_framer_next(f, &fr);
+        if (rc == KDB_MORE) return KDB_OK;
+        if (rc != KDB_OK) break;
+        if (fr.type == KDB_T_MANIFEST) {
+            rc = kdb_sm_legal_frame(&s->sm, fr.type);
+            if (rc != KDB_OK) { snprintf(why, wl, "%s", s->sm.reason); return rc; }
+            kdb_msg_t m;
+            rc = kdb_man_page(&man, &fr, &m, why, wl);                  /* (the other thread) */
+            if (rc != KDB_OK) return rc;
+            *zones += m.u.manifest.n_entries;
+            continue;
+        }
+        if (fr.type == KDB_T_BATCH_END || fr.type == KDB_T_BATCH_BEGIN) { s->sm.n_zones += *zones; *zones = 0; }
+        rc = kdb_sm_accept(&s->sm, &fr, &s->m);
+        if (rc != KDB_OK) { snprintf(why, wl, "%s", s->sm.reason); return rc; }
+        if (fr.type == KDB_T_MANIFEST_BEGIN) kdb_man_begin(&man, s->m.u.manifest_begin.batch_id, s->m.u.manifest_begin.view, s->sm.lim.view_count);
+        if (fr.type == KDB_T_MANIFEST_END) {
+            rc = kdb_man_end(&man, &s->m.u.manifest_end, why, wl);
+            if (rc != KDB_OK) return rc;
+        }
+    }
+    snprintf(why, wl, "%s", f->reason);
+    return rc;
+}
+
+static void test_split_pages(void) {
+    printf("[0.7 M2: the pages of a pass checked off the stream thread: kdb_sm_legal_frame(), kdb_man_t]\n");
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    char why[KDB_REASON_LEN];
+    kdb_msg_t m;
+    kdb_frame_t fr;
+    sess_t *s = malloc(sizeof(*s));
+    uint64_t zones;
+
+    /* kdb_sm_legal_frame() is the first half of kdb_sm_accept(): the same answer for the same frame in the same state, and the same state afterwards */
+    {
+        sess_init(s, &LIM);
+        sess_to(s, KDB_S_IN_BATCH);
+        CHECK_RC("a page outside a pass is illegal", kdb_sm_legal_frame(&s->sm, KDB_T_MANIFEST), KDB_E_STATE);
+        CHECK(s->sm.state == KDB_S_ERROR);
+        CHECK_RC("... and stays so (sticky)", kdb_sm_legal_frame(&s->sm, KDB_T_BATCH_END), KDB_E_STATE);
+        CHECK(strstr(s->sm.reason, "MANIFEST not allowed in state") != NULL);
+        sess_init(s, &LIM);
+        sess_to(s, KDB_S_IN_BATCH);
+        CHECK_RC("MANIFEST_BEGIN is legal in a batch", kdb_sm_legal_frame(&s->sm, KDB_T_MANIFEST_BEGIN), KDB_OK);
+        CHECK(s->sm.state == KDB_S_IN_BATCH && !s->sm.man_open);                    /* (nothing is advanced: that is accept's) */
+        kdb_enc_reset(&e); ms_begin(&e, 7, 1, 10, 55, 1, 0, NULL);
+        kdb_framer_t f;
+        uint8_t *body = malloc(KDB_MAX_BODY);
+        kdb_framer_init(&f, KDB_FROM_LOADER, body, KDB_MAX_BODY);
+        CHECK(kdb_framer_feed(&f, e.buf, e.len) == KDB_OK && kdb_framer_next(&f, &fr) == KDB_OK);
+        CHECK_RC("MANIFEST_BEGIN accepted", kdb_sm_accept(&s->sm, &fr, &m), KDB_OK);
+        CHECK(s->sm.man_open);
+        CHECK_RC("a page is legal inside a pass", kdb_sm_legal_frame(&s->sm, KDB_T_MANIFEST), KDB_OK);
+        CHECK_RC("BATCH_END is not legal inside a pass", kdb_sm_legal_frame(&s->sm, KDB_T_BATCH_END), KDB_E_STATE);
+        free(body);
+        sess_init(s, &LIM);
+        CHECK_RC("nothing is legal before HELLO but HELLO", kdb_sm_legal_frame(&s->sm, KDB_T_MANIFEST), KDB_E_STATE);
+    }
+
+    /* a pass whose pages are checked off the stream thread: the same verdicts as in one machine, the same counts for BATCH_END */
+    kdb_enc_reset(&e);
+    ms_begin(&e, 7, 1, 10, 55, 1, 0, "sqlite3:1:2");
+    ms_page(&e, 7, 1, 0, 3, 1);
+    ms_page(&e, 7, 1, 1, 2, 4);
+    ms_end(&e, 7, 1, 5, 1, 55, 1, 1, "sqlite3:1:2");
+    ms_changes(&e, 7, 1, 60, 1);
+    m_batch_end(&e, 7, 5 + 2, 0, 2);
+    sess_init(s, &LIM);
+    sess_to(s, KDB_S_IN_BATCH);
+    kdb_sm_defer_manifest(&s->sm);
+    CHECK_RC("a pass, a drain, BATCH_END: the pages are not in the machine's count", split_run(s, e.buf, e.len, &zones, why, sizeof(why)), KDB_OK);
+    CHECK(s->sm.state == KDB_S_READY && s->sm.n_zones == 7 && s->sm.man_entries == 0 && s->sm.man_page == 0 && !s->sm.man_open);
+    {
+        /* the same without the split: the machine counted the pages itself (man_entries, man_page) */
+        sess_init(s, &LIM);
+        sess_to(s, KDB_S_IN_BATCH);
+        CHECK_RC("one machine", sess_feed(s, e.buf, e.len, 0), KDB_OK);
+        CHECK(s->sm.state == KDB_S_READY && s->sm.n_zones == 7 && s->sm.man_entries == 5 && s->sm.man_page == 2);
+    }
+    /* the wrong count of manifest entries at BATCH_END is found once the pages are in the count */
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL); ms_page(&e, 7, 1, 0, 2, 1); ms_end(&e, 7, 1, 2, 0, 0, 0, 1, NULL); m_batch_end(&e, 7, 1, 0, 0);
+    sess_init(s, &LIM); sess_to(s, KDB_S_IN_BATCH); kdb_sm_defer_manifest(&s->sm);
+    CHECK_RC("BATCH_END with the wrong count of manifest entries (split)", split_run(s, e.buf, e.len, &zones, why, sizeof(why)), KDB_E_COUNT);
+
+    /* every rule of the pass is still checked: by kdb_man_t, with the same reasons */
+    struct sp_case { const char *what; kdb_rc_t rc; const char *reason; } cases[8];
+    int nc = 0;
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL); ms_page(&e, 7, 1, 1, 1, 1);
+    sess_init(s, &LIM); sess_to(s, KDB_S_IN_BATCH); kdb_sm_defer_manifest(&s->sm);
+    cases[nc++] = (struct sp_case){ "a page that skips one", split_run(s, e.buf, e.len, &zones, why, sizeof(why)), "MANIFEST: page 1, want 0" };
+    CHECK(strcmp(why, cases[0].reason) == 0);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL); ms_page(&e, 7, 1, 0, 1, 1); ms_page(&e, 7, 1, 0, 1, 2);
+    sess_init(s, &LIM); sess_to(s, KDB_S_IN_BATCH); kdb_sm_defer_manifest(&s->sm);
+    cases[nc++] = (struct sp_case){ "a page twice", split_run(s, e.buf, e.len, &zones, why, sizeof(why)), "MANIFEST: page 0, want 1" };
+    CHECK(strcmp(why, cases[1].reason) == 0);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL); ms_page(&e, 7, 2, 0, 1, 1);
+    sess_init(s, &LIM); sess_to(s, KDB_S_IN_BATCH); kdb_sm_defer_manifest(&s->sm);
+    cases[nc++] = (struct sp_case){ "a page of another view", split_run(s, e.buf, e.len, &zones, why, sizeof(why)), "MANIFEST: batch or view differs from MANIFEST_BEGIN" };
+    CHECK(strcmp(why, cases[2].reason) == 0);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL); ms_page(&e, 8, 1, 0, 1, 1);
+    sess_init(s, &LIM); sess_to(s, KDB_S_IN_BATCH); kdb_sm_defer_manifest(&s->sm);
+    cases[nc++] = (struct sp_case){ "a page of another batch", split_run(s, e.buf, e.len, &zones, why, sizeof(why)), "MANIFEST: batch or view differs from MANIFEST_BEGIN" };
+    CHECK(strcmp(why, cases[3].reason) == 0);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL); ms_page(&e, 7, 1, 0, 2, 1); ms_end(&e, 7, 1, 3, 0, 0, 0, 1, NULL);
+    sess_init(s, &LIM); sess_to(s, KDB_S_IN_BATCH); kdb_sm_defer_manifest(&s->sm);
+    cases[nc++] = (struct sp_case){ "MANIFEST_END with another count", split_run(s, e.buf, e.len, &zones, why, sizeof(why)), "MANIFEST_END: n_entries differs from the entries of the pages" };
+    CHECK(strcmp(why, cases[4].reason) == 0);
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL); ms_page(&e, 7, 1, 0, 2, 1); ms_end(&e, 7, 2, 2, 0, 0, 0, 1, NULL);
+    sess_init(s, &LIM); sess_to(s, KDB_S_IN_BATCH); kdb_sm_defer_manifest(&s->sm);
+    cases[nc++] = (struct sp_case){ "MANIFEST_END of another view (the stream thread's check: the batch and the view are decoded there)", split_run(s, e.buf, e.len, &zones, why, sizeof(why)), "MANIFEST_END: batch or view differs from MANIFEST_BEGIN" };
+    CHECK(strcmp(why, cases[5].reason) == 0);
+    const kdb_rc_t want[6] = { KDB_E_SEQ, KDB_E_SEQ, KDB_E_SEQ, KDB_E_SEQ, KDB_E_COUNT, KDB_E_SEQ };
+    for (int i = 0; i < nc; i++) CHECK_RC(cases[i].what, cases[i].rc, want[i]);
+    /* a page that does not decode (a damaged entry) is a protocol error of the thread */
+    kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL);
+    kdb_enc_begin(&e, KDB_T_MANIFEST); kdb_enc_u64(&e, 1, 7); kdb_enc_u16(&e, 2, 1); kdb_enc_u32(&e, 3, 0);
+    kdb_enc_nest_begin(&e, 4); kdb_enc_i64(&e, 1, 5); kdb_enc_nest_end(&e);                  /* (an entry without its name) */
+    kdb_enc_end(&e);
+    sess_init(s, &LIM); sess_to(s, KDB_S_IN_BATCH); kdb_sm_defer_manifest(&s->sm);
+    CHECK_RC("a page whose entry has no name", split_run(s, e.buf, e.len, &zones, why, sizeof(why)), KDB_E_TLV_MISSING);
+    /* kdb_man_page() takes pages only */
+    {
+        kdb_man_t man;
+        kdb_man_begin(&man, 7, 1, KDB_VIEWS_ANY);
+        kdb_enc_reset(&e); ms_begin(&e, 7, 1, 0, 0, 0, 0, NULL);
+        kdb_framer_t f;
+        uint8_t *body = malloc(KDB_MAX_BODY);
+        kdb_framer_init(&f, KDB_FROM_LOADER, body, KDB_MAX_BODY);
+        CHECK(kdb_framer_feed(&f, e.buf, e.len) == KDB_OK && kdb_framer_next(&f, &fr) == KDB_OK);
+        CHECK_RC("not a page", kdb_man_page(&man, &fr, &m, why, sizeof(why)), KDB_E_STATE);
+        /* a view the configuration does not have is refused by the decode, with the view count of the stream */
+        kdb_man_begin(&man, 7, 3, 2);
+        kdb_enc_reset(&e); ms_page(&e, 7, 3, 0, 1, 1);
+        kdb_framer_init(&f, KDB_FROM_LOADER, body, KDB_MAX_BODY);
+        CHECK(kdb_framer_feed(&f, e.buf, e.len) == KDB_OK && kdb_framer_next(&f, &fr) == KDB_OK);
+        CHECK(kdb_man_page(&man, &fr, &m, why, sizeof(why)) != KDB_OK);
+        free(body);
+    }
+    free(s);
+}
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--gen-corpus") == 0) return gen_corpus(argv[2]) ? 1 : 0;
     test_roundtrip_loader();
@@ -3017,6 +3172,7 @@ int main(int argc, char **argv) {
     test_hot_list();
     test_store_proto();
     test_lookup_proto();
+    test_split_pages();
     test_names();
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;

@@ -529,6 +529,7 @@ typedef struct {
     uint64_t n_zones, n_failed, n_deleted;     /* of the current batch (zones = completed by ZONE_END) */
     uint32_t n_profiles;                       /* of the current batch */
     bool man_open;                             /* 0.7 WP7a: inside a MANIFEST pass (MANIFEST_BEGIN seen, MANIFEST_END not yet) */
+    bool man_deferred;                         /* 0.7 M2: the pages of a pass are handed to the reconcile thread (kdb_sm_legal_frame() only, no decode here) and checked there (kdb_man_t): the sum of MANIFEST_END is not checked here */
     uint16_t man_view;
     uint32_t man_page;                         /* the next page number */
     uint64_t man_entries;                      /* entries seen in this pass */
@@ -552,5 +553,16 @@ void kdb_sm_init_fetch(kdb_sm_t *sm, const kdb_limits_t *lim);
  * *msg is valid and the state advanced.  KDB_E_*: protocol error; the state is KDB_S_ERROR (sticky) and
  * sm->reason says why.  An error leaves any partial zone to be discarded by the caller. */
 kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *msg);
+/* 0.7 M2: the first half of kdb_sm_accept(): is a frame of this type allowed in the state (nothing of the frame is decoded).  KDB_OK, or KDB_E_STATE with the state set to KDB_S_ERROR and the reason, as
+ * kdb_sm_accept() does for the same frame; the state is not advanced.  The stream thread of the Backend uses it for the pages of a pass (MANIFEST), which it copies to the reconcile thread undecoded. */
+kdb_rc_t kdb_sm_legal_frame(kdb_sm_t *sm, uint16_t type);
+/* from now on the pages of a pass are not offered to kdb_sm_accept() (see man_deferred); BATCH_END's zone count is then the caller's to add (sm->n_zones) */
+void kdb_sm_defer_manifest(kdb_sm_t *sm);
+/* What the reconcile thread does with the pages the stream thread copied: decode and check them against the pass's MANIFEST_BEGIN, in the order they came (the rules of kdb_sm_accept()), and the sum at
+ * MANIFEST_END.  A KDB_E_* is a protocol error of the loader as any other (why says the rule, never bytes of the stream). */
+typedef struct { uint64_t batch_id; uint16_t view; uint32_t page; uint64_t entries; uint32_t view_count; } kdb_man_t;
+void kdb_man_begin(kdb_man_t *a, uint64_t batch_id, uint16_t view, uint32_t view_count);
+kdb_rc_t kdb_man_page(kdb_man_t *a, const kdb_frame_t *fr, kdb_msg_t *m, char *why, size_t whylen);
+kdb_rc_t kdb_man_end(const kdb_man_t *a, const kdb_manifest_end_t *e, char *why, size_t whylen);
 
 #endif

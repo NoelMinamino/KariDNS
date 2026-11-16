@@ -1079,10 +1079,34 @@ static bool sm_legal(const kdb_sm_t *sm, uint16_t t) {
 #define SMFAIL(sm, rc, ...) do { (sm)->state = KDB_S_ERROR; (sm)->fail = (rc); \
     snprintf((sm)->reason, sizeof((sm)->reason), __VA_ARGS__); return (rc); } while (0)
 
-kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
+/* 0.7 M2: the rules of the pages and the end of a manifest pass, once for the state machine (every page decoded in the order it comes) and for the reconcile thread (kdb_man_t: the stream thread only
+ * checks that a page is legal, kdb_sm_legal_frame(), and hands it over; the thread decodes it and applies these rules) */
+static kdb_rc_t man_page_rules(uint64_t batch_id, uint16_t view, uint32_t *page, uint64_t *entries, const kdb_msg_t *m, char *why, size_t wl) {
+    if (m->u.manifest.batch_id != batch_id || m->u.manifest.view != view) { snprintf(why, wl, "MANIFEST: batch or view differs from MANIFEST_BEGIN"); return KDB_E_SEQ; }
+    if (m->u.manifest.page != *page) { snprintf(why, wl, "MANIFEST: page %u, want %u", m->u.manifest.page, *page); return KDB_E_SEQ; }
+    (*page)++;
+    *entries += m->u.manifest.n_entries;
+    return KDB_OK;
+}
+
+static kdb_rc_t man_end_rules(uint64_t batch_id, uint16_t view, uint64_t entries, const kdb_manifest_end_t *e, char *why, size_t wl) {
+    if (e->batch_id != batch_id || e->view != view) { snprintf(why, wl, "MANIFEST_END: batch or view differs from MANIFEST_BEGIN"); return KDB_E_SEQ; }
+    if (e->n_entries != entries) { snprintf(why, wl, "MANIFEST_END: n_entries differs from the entries of the pages"); return KDB_E_COUNT; }
+    return KDB_OK;
+}
+
+kdb_rc_t kdb_sm_legal_frame(kdb_sm_t *sm, uint16_t type) {
     if (sm->state == KDB_S_ERROR) return sm->fail;
-    if (!sm_legal(sm, fr->type)) SMFAIL(sm, KDB_E_STATE, "%s not allowed in state %d", kdb_type_name(fr->type), (int)sm->state);
-    kdb_rc_t rc = kdb_decode(fr, sm->lim.view_count, m, sm->reason, sizeof(sm->reason));
+    if (!sm_legal(sm, type)) SMFAIL(sm, KDB_E_STATE, "%s not allowed in state %d", kdb_type_name(type), (int)sm->state);
+    return KDB_OK;
+}
+
+void kdb_sm_defer_manifest(kdb_sm_t *sm) { sm->man_deferred = true; }
+
+kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
+    kdb_rc_t rc = kdb_sm_legal_frame(sm, fr->type);
+    if (rc != KDB_OK) return rc;
+    rc = kdb_decode(fr, sm->lim.view_count, m, sm->reason, sizeof(sm->reason));
     if (rc != KDB_OK) { sm->state = KDB_S_ERROR; sm->fail = rc; return rc; }
 
     switch (fr->type) {
@@ -1113,17 +1137,18 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
         sm->man_entries = 0;
         break;
     case KDB_T_MANIFEST:
-        if (m->u.manifest.batch_id != sm->batch_id || m->u.manifest.view != sm->man_view)
-            SMFAIL(sm, KDB_E_SEQ, "MANIFEST: batch or view differs from MANIFEST_BEGIN");
-        if (m->u.manifest.page != sm->man_page) SMFAIL(sm, KDB_E_SEQ, "MANIFEST: page %u, want %u", m->u.manifest.page, sm->man_page);
-        sm->man_page++;
-        sm->man_entries += m->u.manifest.n_entries;
+        rc = man_page_rules(sm->batch_id, sm->man_view, &sm->man_page, &sm->man_entries, m, sm->reason, sizeof(sm->reason));
+        if (rc != KDB_OK) { sm->state = KDB_S_ERROR; sm->fail = rc; return rc; }
         sm->n_zones += m->u.manifest.n_entries;
         break;
     case KDB_T_MANIFEST_END:
+        /* (man_deferred: the pages did not pass through here, so the sum is the reconcile thread's to check, kdb_man_end(); the batch and the view are checked here as always) */
         if (m->u.manifest_end.batch_id != sm->batch_id || m->u.manifest_end.view != sm->man_view)
             SMFAIL(sm, KDB_E_SEQ, "MANIFEST_END: batch or view differs from MANIFEST_BEGIN");
-        if (m->u.manifest_end.n_entries != sm->man_entries) SMFAIL(sm, KDB_E_COUNT, "MANIFEST_END: n_entries differs from the entries of the pages");
+        if (!sm->man_deferred) {
+            rc = man_end_rules(sm->batch_id, sm->man_view, sm->man_entries, &m->u.manifest_end, sm->reason, sizeof(sm->reason));
+            if (rc != KDB_OK) { sm->state = KDB_S_ERROR; sm->fail = rc; return rc; }
+        }
         sm->man_open = false;
         break;
     case KDB_T_CHANGES: {
@@ -1211,6 +1236,26 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
         SMFAIL(sm, KDB_E_STATE, "%s not allowed from the loader", kdb_type_name(fr->type));
     }
     return KDB_OK;
+}
+
+/* ------------------------------------------------------------------ the pages of a manifest pass, checked off the stream thread (0.7 M2) */
+void kdb_man_begin(kdb_man_t *a, uint64_t batch_id, uint16_t view, uint32_t view_count) {
+    a->batch_id = batch_id;
+    a->view = view;
+    a->page = 0;
+    a->entries = 0;
+    a->view_count = view_count;
+}
+
+kdb_rc_t kdb_man_page(kdb_man_t *a, const kdb_frame_t *fr, kdb_msg_t *m, char *why, size_t whylen) {
+    if (fr->type != KDB_T_MANIFEST) { snprintf(why, whylen, "%s is not a manifest page", kdb_type_name(fr->type)); return KDB_E_STATE; }
+    kdb_rc_t rc = kdb_decode(fr, a->view_count, m, why, whylen);
+    if (rc != KDB_OK) return rc;
+    return man_page_rules(a->batch_id, a->view, &a->page, &a->entries, m, why, whylen);
+}
+
+kdb_rc_t kdb_man_end(const kdb_man_t *a, const kdb_manifest_end_t *e, char *why, size_t whylen) {
+    return man_end_rules(a->batch_id, a->view, a->entries, e, why, whylen);
 }
 
 /* ------------------------------------------------------------------ hot list (D1a step 7, design 8.4) */

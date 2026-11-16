@@ -163,6 +163,52 @@ static void run_loader(const uint8_t *p, size_t n, size_t chunk, uint8_t sel, ru
     if (r->rc != KDB_OK && sm.state != KDB_S_ERROR && f.fail == KDB_OK) abort();   /* an error must be sticky somewhere */
 }
 
+/* 0.7 M2: the same stream with the pages of a pass handed over as the Backend does (kdb_sm_legal_frame() on the stream thread, kdb_man_page() / kdb_man_end() on the reconcile thread, the zones of the pages added to
+ * the machine before BATCH_END): the verdict and the number of frames must be the machine's own */
+static void run_split(const uint8_t *p, size_t n, uint8_t sel, run_t *r) {
+    kdb_framer_t f;
+    kdb_sm_t sm;
+    kdb_msg_t m;
+    kdb_man_t man;
+    kdb_limits_t lim = { KDB_DEFAULT_MAX_ZONE_RECORDS, KDB_DEFAULT_MAX_ZONE_BYTES, 3 };
+    if (sel & 0x20) { lim.max_zone_records = 6; lim.max_zone_bytes = 200; }
+    kdb_framer_init(&f, KDB_FROM_LOADER, g_buf, sizeof(g_buf));
+    if (sel & 0x08) kdb_sm_init_fetch(&sm, &lim);
+    else kdb_sm_init(&sm, &lim);
+    kdb_sm_defer_manifest(&sm);
+    if (sel & 0x40) sm.state = KDB_S_READY;
+    memset(&man, 0, sizeof(man));
+    memset(r, 0, sizeof(*r));
+    uint64_t zones = 0;
+    char why[KDB_REASON_LEN];
+    kdb_rc_t rc = kdb_framer_feed(&f, p, n);
+    while (rc == KDB_OK) {
+        kdb_frame_t fr;
+        rc = kdb_framer_next(&f, &fr);
+        if (rc == KDB_MORE) { rc = KDB_OK; break; }
+        if (rc != KDB_OK) break;
+        if (fr.type == KDB_T_MANIFEST) {
+            rc = kdb_sm_legal_frame(&sm, fr.type);
+            if (rc != KDB_OK) break;
+            rc = kdb_man_page(&man, &fr, &m, why, sizeof(why));
+            if (rc != KDB_OK) break;
+            zones += m.u.manifest.n_entries;
+            r->nframes++;
+            continue;
+        }
+        if (fr.type == KDB_T_BATCH_END || fr.type == KDB_T_BATCH_BEGIN) { sm.n_zones += zones; zones = 0; }
+        rc = kdb_sm_accept(&sm, &fr, &m);
+        if (rc != KDB_OK) break;
+        if (fr.type == KDB_T_MANIFEST_BEGIN) kdb_man_begin(&man, m.u.manifest_begin.batch_id, m.u.manifest_begin.view, sm.lim.view_count);
+        if (fr.type == KDB_T_MANIFEST_END) {
+            rc = kdb_man_end(&man, &m.u.manifest_end, why, sizeof(why));
+            if (rc != KDB_OK) break;
+        }
+        r->nframes++;
+    }
+    r->rc = rc;
+}
+
 static void run_backend(const uint8_t *p, size_t n) {
     kdb_framer_t f;
     kdb_framer_init(&f, KDB_FROM_BACKEND, g_buf, sizeof(g_buf));
@@ -422,6 +468,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     run_loader(p, n, 0, sel, &a);
     run_loader(p, n, chunk, sel, &b);
     if (a.rc != b.rc || a.nframes != b.nframes || a.sum != b.sum || a.state != b.state) abort();
+    run_t c;
+    run_split(p, n, sel, &c);
+    if (c.rc != a.rc || c.nframes != a.nframes) abort();                                  /* (0.7 M2: the stream thread and the reconcile thread give the verdict of the one machine) */
     run_backend(p, n);
     run_install(p, n, sel);
     return 0;
