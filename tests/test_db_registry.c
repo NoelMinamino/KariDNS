@@ -263,7 +263,7 @@ static int install_msgs_x(zone_db_entry_t *e, const char *zone, uint64_t declare
     zone_arena_init(&a);
     axfr_session_t s;
     memset(&s, 0, sizeof(s));
-    s.db_stream = true;
+    s.is_extended_mode = (flags & KDB_ZF_EXTENDED) != 0;       /* (this scaffold stands for a negotiated Extended AXFR: the records of the extension are taken) */
     if (flags & KDB_ZF_TINYDNS) a.is_tinydns_format = true;
     int rc = 0;
     for (int i = 0; i < nm && rc == 0; i++)

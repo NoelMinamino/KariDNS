@@ -649,14 +649,13 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
     // KariDNS Extended AXFR record interception:
     bool wrapped_soa = false; /* a 65406 wrapper around an apex SOA RR: a body RR of a version 3 stream, never the frame */
     /* Class 65302 is the extension's own class: a primary that did not answer our Extended AXFR option (EDNS option 65153, checked above
-     * on the first message) must not send it, whatever it claims; the database loader's stream needs no option (ZONE_BEGIN announces it). */
-    if (rec->class_val == DNS_CLASS_KARIDNS_EXT && !session->is_extended_mode && !session->db_stream)
+     * on the first message) must not send it, whatever it claims.  (The database loader sends zone images since 0.7 M3: no record of this class comes from it.) */
+    if (rec->class_val == DNS_CLASS_KARIDNS_EXT && !session->is_extended_mode)
       return xfr_ext_reject(domain, "an Extended AXFR record (class 65302) in a transfer that was not negotiated as extended");
     if (rec->class_val == DNS_CLASS_KARIDNS_EXT) {
       if (type == DNS_TYPE_KARIDNS_LOC_STATE) {
         standby->count--;
         session->ext_records++;
-        if (session->db_stream && rec->generic_len >= sizeof(session->current_loc_tag)) return xfr_ext_reject(domain, "a LOC_STATE tag longer than 63 octets");
         if (rec->generic_data && rec->generic_len > 0) {
           size_t copy_len = rec->generic_len < sizeof(session->current_loc_tag) - 1 ? rec->generic_len : sizeof(session->current_loc_tag) - 1;
           memcpy(session->current_loc_tag, rec->generic_data, copy_len);
@@ -670,7 +669,6 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
       } else if (type == DNS_TYPE_KARIDNS_ECS_STATE) {
         standby->count--;
         session->ext_records++;
-        if (session->db_stream && rec->generic_len >= sizeof(session->current_ecs_tag)) return xfr_ext_reject(domain, "an ECS_STATE tag longer than 63 octets");
         if (rec->generic_data && rec->generic_len > 0) {
           size_t copy_len = rec->generic_len < sizeof(session->current_ecs_tag) - 1 ? rec->generic_len : sizeof(session->current_ecs_tag) - 1;
           memcpy(session->current_ecs_tag, rec->generic_data, copy_len);
@@ -690,10 +688,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
         int *cap = loc ? &session->loc_tagdef_cap : &session->ecs_tagdef_cap;
         standby->count--;
         session->ext_records++;
-        if (!unpack_tag_def_rdata(rec->generic_data, rec->generic_len, defs, ndefs, cap)) {
-          if (session->db_stream) return xfr_ext_reject(domain, loc ? "a malformed LOC_TAGDEF" : "a malformed ECS_TAGDEF");
-          continue;
-        }
+        if (!unpack_tag_def_rdata(rec->generic_data, rec->generic_len, defs, ndefs, cap)) continue;
         if (*ndefs > XFR_TAGDEF_MAX)
           return xfr_ext_reject(domain, loc ? "more than 4096 LOC_TAGDEF records" : "more than 4096 ECS_TAGDEF records");
         session->tagdef_cidrs += (uint64_t)(*defs)[*ndefs - 1].cidr_count;
@@ -703,10 +698,6 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
       } else if (type == DNS_TYPE_KARIDNS_ECS_TRUSTED) {
         standby->count--;
         session->ext_records++;
-        if (session->db_stream) {
-          syslog(LOG_WARNING, "[AXFR] zone '%s': rejecting transfer: ECS_TRUSTED (TYPE 65407) is not allowed in this stream (the database loader's trusted resolvers come from the zone settings)", domain);
-          return -1;
-        }
         unpack_trusted_resolvers_rdata(rec->generic_data, rec->generic_len, &standby->bind_ecs_trusted_resolvers, &standby->bind_ecs_trusted_resolver_count);
         if (standby->bind_ecs_trusted_resolvers_parsed) {
           free(standby->bind_ecs_trusted_resolvers_parsed);
@@ -738,12 +729,9 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
         continue;
       } else if (type == DNS_TYPE_KARIDNS_SETTINGS) {
         /* B8t-2 (v3): the settings of the primary for this zone.  Kept as text in the session (not in the transfer's arena, which an IXFR rebuilds); the caller parses them with the
-         * restricted parser once the transfer is complete.  Only for a stream that was negotiated as version 3, and never from the
-         * database loader (its settings come with ZONE_BEGIN). */
+         * restricted parser once the transfer is complete.  Only for a stream that was negotiated as version 3. */
         standby->count--;
         session->ext_records++;
-        if (session->db_stream)
-          return xfr_ext_reject(domain, "a SETTINGS record in a stream where it is not allowed (the settings of a database zone come with ZONE_BEGIN)");
         if (session->ext_version >= 3 && !session->has_settings && rec->generic_data && rec->generic_len > 0 &&
             rec->generic_len <= KARIDNS_SETTINGS_MAX) {
           memcpy(session->settings_text, rec->generic_data, rec->generic_len);
@@ -762,15 +750,10 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
         standby->count--;
         session->ext_records++;
         standby->is_tinydns_format = true;
-        if (!unpack_tinydns_loc_rdata(rec->generic_data, rec->generic_len, &standby->locations, &standby->location_count) && session->db_stream)
-          return xfr_ext_reject(domain, "a malformed TINYDNS_LOCDEF");
-        if (session->db_stream && standby->location_count > 4096)      /* the limit of the tinydns data parser */
-          return xfr_ext_reject(domain, "more than 4096 TINYDNS_LOCDEF records");
+        (void)unpack_tinydns_loc_rdata(rec->generic_data, rec->generic_len, &standby->locations, &standby->location_count);
         continue;
       } else if (type == DNS_TYPE_KARIDNS_TINYDNS_WRAP) {
         session->ext_wrapped++;
-        if (session->db_stream && (!rec->generic_data || rec->generic_len < 21))
-          return xfr_ext_reject(domain, "a TINYDNS_WRAP shorter than its fixed part");
         if (rec->generic_data && rec->generic_len >= 21) {
           uint16_t orig_type = (rec->generic_data[0] << 8) | rec->generic_data[1];
           uint16_t orig_class = (rec->generic_data[2] << 8) | rec->generic_data[3];
@@ -782,8 +765,6 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
           }
           uint8_t flags = rec->generic_data[18];
           uint16_t orig_rdlen = (rec->generic_data[19] << 8) | rec->generic_data[20];
-          if (session->db_stream && 21 + (size_t)orig_rdlen > rec->generic_len)
-            return xfr_ext_reject(domain, "a TINYDNS_WRAP whose RDLENGTH is longer than the record");
           if (21 + orig_rdlen <= rec->generic_len) {
             uint8_t fake_wire[4096];
             size_t fake_len = 0;
@@ -829,7 +810,6 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
               if (parsed_t == 6) wrapped_soa = true;
             }
             if (!reconstructed) {
-              if (session->db_stream) return xfr_ext_reject(domain, "a TINYDNS_WRAP whose RR cannot be decoded");
               rec->generic_data = NULL;
               rec->generic_len = 0;
               rec->type_code = orig_type;
@@ -882,8 +862,8 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
       continue;
     }
     {
-      /* debug 10: one line per record of the zone (the stream of the database loader goes to its own category) */
-      const int rcat = session->db_stream ? LOGC_DATABASE : LOGC_XFER_IN;
+      /* debug 10: one line per record of the zone */
+      const int rcat = LOGC_XFER_IN;
       if (logev_wanted(rcat, 10)) {
         char rn[DNS_NAME_TEXT_SIZE];
         logev_name_text(rec->name ? rec->name : "", rn, sizeof(rn));

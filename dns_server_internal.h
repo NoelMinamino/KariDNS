@@ -262,7 +262,6 @@ typedef struct {
   size_t settings_len;
   bool ext_probe;         /* B8t-2: version 3 was asked for and a standard answer means "try version 2" (xfr_ext_probe()) */
   bool no_ext_answer;     /* set when handle_axfr_event() stopped for that reason */
-  bool db_stream;         /* B8: the messages come from the database loader's zone data (since 0.7 M3 a zone image; the flag stays for the transfer parser's tests): the Extended AXFR records are checked strictly (a malformed definition, state or wrapper record rejects the zone) and ECS_TRUSTED (65407) is refused: the trusted resolvers come from the settings text only, inside acl-ceiling */
   /* batch 4 (BIND 9.20 zone.c refresh_callback(), zone_xfrdone()) */
   bool serial_behind;     /* the primary's serial is older than ours: "serial number received from primary < ours" -- not a failure, the next primary is asked */
   const xfr_eff_t *eff;   /* the transfer / timer options of the zone (NULL: the SOA timers are stored as received, no time limit) */
