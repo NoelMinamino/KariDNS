@@ -4709,24 +4709,29 @@ the queries are going to want them. There are three quarters of the store
 threads of them, at most six (\fBstore.hot.threads\fR); each takes the zones of
 the list 32 at a time, reads their records and images, makes the entries and
 registers the 32 in one section of the registry's lock; the table of the zones
-in memory is made for the zones of the list at the start, so that it does not
-double inside that lock in the middle of the rush. They have no rate cap and are
-never starved by the queries: before a batch a thread gives the attach requests
-of queries that wait at most 0.4 ms, and goes on whether they have been taken or
-not (up to 0.6.2 one thread waited for as long as any query waited for a store
-thread, at 20,000 zones a second: on ZFS, where \fBstore\-mode copy\fR has no
-attach by a worker and every first query for a zone waits for a store thread,
-that thread did not run during the very rush of first queries it was meant to
-prevent). The store threads that take the requests of queries register what they
-find waiting (up to 16 zones) in one section of the lock as well; a single
-request is registered at once. A query for a zone that the threads have not
-reached yet is attached by its own request, as without the list, and the zone is
-skipped when they come to it. (Measured at 10 million zones on a ZFS dataset
-with \fBrecordsize=16K\fR, 8 vCPUs, the ARC warm, 400,000 queries a second from
-the start of the restart: the steady rate was reached in 4 to 5 s, where 0.6.2
-took 7 to 17 s; the 99th percentile of the wait of a query for a store thread
-was 16 to 32 ms, where it was 65 to 262 ms. The CPU of the host is the limit
-while the zones come in: the pread of an image from the ARC, with its
+in memory is made for the zones of the list at the start, and in any case a
+table that fills up is not made again inside that lock: a thread makes the next
+one beside it (from three eighths full, at 65,536 slots and more), the writers
+go on and what they did meanwhile is done again on it inside the lock, and it is
+put in with the swap of a pointer (the lookups take no lock, as before). A
+doubling inside the lock took 50 to 100 ms at 500,000 zones, in which every
+attach and every query that waited for one stood still. They have no rate cap
+and are never starved by the queries: before a batch a thread gives the attach
+requests of queries that wait at most 0.4 ms, and goes on whether they have been
+taken or not (up to 0.6.2 one thread waited for as long as any query waited for
+a store thread, at 20,000 zones a second: on ZFS, where \fBstore\-mode copy\fR
+has no attach by a worker and every first query for a zone waits for a store
+thread, that thread did not run during the very rush of first queries it was
+meant to prevent). The store threads that take the requests of queries register
+what they find waiting (up to 16 zones) in one section of the lock as well; a
+single request is registered at once. A query for a zone that the threads have
+not reached yet is attached by its own request, as without the list, and the
+zone is skipped when they come to it. (Measured at 10 million zones on a ZFS
+dataset with \fBrecordsize=16K\fR, 8 vCPUs, the ARC warm, 400,000 queries a
+second from the start of the restart: the steady rate was reached in 4 to 5 s,
+where 0.6.2 took 7 to 17 s; the 99th percentile of the wait of a query for a
+store thread was 16 to 32 ms, where it was 65 to 262 ms. The CPU of the host is
+the limit while the zones come in: the pread of an image from the ARC, with its
 decompression, is a third of the CPU of an attach.) They stop when the zones in
 memory reach the high mark of \fBmemory\-limit\fR (it attaches the hottest zones
 and never takes one out for the rest of the list; \fBstore.hot.state\fR says

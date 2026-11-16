@@ -2341,9 +2341,106 @@ static int run_mode(const char *mode) {
             snprintf(cmd, sizeof(cmd), "%s hot %s %d", g_self, dir, ph);
             CHECK(system(cmd) == 0);
         }
+        snprintf(cmd, sizeof(cmd), "%s attab %s", g_self, dir);                 /* 0.7 M4: the attach table grows outside the registry's lock */
+        CHECK(system(cmd) == 0);
     }
     snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
     (void)!system(cmd);
+    printf("%d checks, %d failed\n", g_checks, g_failed);
+    return g_failed ? 1 : 0;
+}
+
+/* ---------------------------------------------------------------- 0.7 M4: the table of the attached zones grows outside the registry's lock */
+/* The table (dns_db_store.c, AT) was made again inside the registry's lock at every doubling: 500,000 zones took 50 to 100 ms in which every attach waited.  A thread now makes the next table when the
+ * table is three eighths full, the writers go on, and what they did meanwhile is done again on the new table inside the lock before it is put in.  Here a writer puts 400,000 elements (and takes a part of them
+ * out again, so that the log has removals) while readers look every id up in a read section: an element that was put and not taken out is always found, whatever table the reader has; one that is found is
+ * the right one.  The longest put (the room and the put of one element) is measured, and the growths that were made inside the lock are counted (the first table, and a table that filled up before the next
+ * one was ready: at most a few; before this every doubling). */
+#define AT_N (UNDER_TSAN_TEST ? 60000 : 400000)
+static _Atomic uint32_t g_at_hi;                 /* the ids up to this one are put */
+static _Atomic bool g_at_stop;
+static _Atomic uint64_t g_at_bad, g_at_looks;
+static zdir_elem_t **g_at_el;
+static void *at_reader(void *arg) {
+    uint64_t x = (uint64_t)(uintptr_t)arg * 0x9E3779B97F4A7C15ull + 1;
+    while (!atomic_load(&g_at_stop)) {
+        const uint32_t hi = atomic_load_explicit(&g_at_hi, memory_order_acquire);
+        if (hi == 0) continue;
+        for (int k = 0; k < 64; k++) {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            const uint32_t z = 1 + (uint32_t)(x % hi);
+            rcu_aux_read_lock();
+            const zdir_elem_t *e = dbdir()->attach_get(1000000 + z);
+            rcu_aux_read_unlock();
+            atomic_fetch_add(&g_at_looks, 1);
+            if (e && e->zid != 1000000 + z) atomic_fetch_add(&g_at_bad, 1);               /* (the wrong element) */
+            if (!e && z % 7 != 0) atomic_fetch_add(&g_at_bad, 1);               /* (an element that is in the table, and was never taken out, is missing) */
+        }
+    }
+    return NULL;
+}
+static int run_attab(const char *dir) {
+    printf("[the attach table grows outside the registry's lock]\n");
+    char sdir[600];
+    snprintf(sdir, sizeof(sdir), "%s/s", dir);
+    static server_config_t cfg;
+    char conf[2048];
+    snprintf(conf, sizeof(conf),
+             "options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; store \"%s\"; store-mode map; store-threads 2; store-hot-list no; }; };\n"
+             "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", sdir);
+    CHECK(parse_named_conf(conf, &cfg) == 0);
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    rebuild_zone_db_from_config(&cfg, false);
+    char msg[400];
+    CHECK(db_store_frontend_open(&cfg.database, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg)) && db_store_dir_fd() >= 0);
+    CHECK(db_store_start(&cfg) && db_store_enabled());
+    const dbdir_ops_t *ops = dbdir();
+    CHECK(ops != NULL);
+    const uint64_t g0 = ops->counters(6), b0 = ops->counters(8), slots0 = ops->counters(5);
+    g_at_el = calloc((size_t)AT_N + 1, sizeof(*g_at_el));
+    pthread_t rt[3];
+    atomic_store(&g_at_stop, false);
+    for (int i = 0; i < 3; i++) CHECK(pthread_create(&rt[i], NULL, at_reader, (void *)(uintptr_t)(i + 1)) == 0);
+    int64_t worst = 0;
+    for (uint32_t i = 1; i <= AT_N && g_at_el; i++) {
+        zdir_elem_t *el = calloc(1, sizeof(*el));
+        el->zid = 1000000 + i;                                                  /* (a range that no store zone has: only the table is looked at) */
+        g_at_el[i] = el;
+        struct timespec a, b;
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        const bool ok = ops->attach_reserve() && ops->attach_put(el);
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        if (!ok) CHECK(false);
+        const int64_t d = (int64_t)(b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec);
+        if (d > worst) worst = d;
+        if (i > 50 && (i - 50) % 7 == 0) ops->attach_remove(g_at_el[i - 50]);   /* (the ids that are multiples of 7 are put and taken out 50 puts later) */
+        atomic_store_explicit(&g_at_hi, i, memory_order_release);
+    }
+    atomic_store(&g_at_stop, true);
+    for (int i = 0; i < 3; i++) pthread_join(rt[i], NULL);
+    /* the table: every element that was not taken out is there, and the others are not */
+    uint32_t wrong = 0;
+    rcu_aux_read_lock();
+    for (uint32_t i = 1; i <= AT_N && g_at_el; i++) {
+        const zdir_elem_t *e = ops->attach_get(1000000 + i);
+        const bool want = !(i % 7 == 0 && i + 50 <= AT_N);
+        if (want ? e != g_at_el[i] : e != NULL) wrong++;
+    }
+    rcu_aux_read_unlock();
+    const uint64_t grows = ops->counters(6) - g0, prepared = ops->counters(8) - b0;
+    printf("  %d elements, %llu table(s) made (%llu of them outside the lock), slots %llu -> %llu, longest put %.2f ms, %llu lookups\n", AT_N, (unsigned long long)grows, (unsigned long long)prepared,
+           (unsigned long long)slots0, (unsigned long long)ops->counters(5), (double)worst / 1e6, (unsigned long long)atomic_load(&g_at_looks));
+    CHECK(wrong == 0);
+    CHECK(atomic_load(&g_at_bad) == 0 && atomic_load(&g_at_looks) > 1000);
+    CHECK(grows >= 5 && prepared >= (UNDER_TSAN_TEST ? 0 : 3));      /* (under ThreadSanitizer the copy is slow and the writer outruns it: only the answers are checked) */
+    CHECK(grows - prepared <= 8);                                               /* (the small tables, up to 65,536 slots, are made inside the lock as they were: 7 of them) */
+    CHECK(worst < (UNDER_TSAN_TEST ? 2000000000ll : 30000000ll));          /* (no put stood still for 30 ms: a doubling inside the lock took 50 to 100 ms at 500,000 zones) */
+    for (uint32_t i = 1; i <= AT_N && g_at_el; i++) {                            /* (the table goes with the store: nothing is freed that a reader could have) */
+        if (!(i % 7 == 0 && i + 50 <= AT_N)) ops->attach_remove(g_at_el[i]);
+    }
+    db_store_stop();
+    for (uint32_t i = 1; i <= AT_N && g_at_el; i++) free(g_at_el[i]);
+    free(g_at_el);
     printf("%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }
@@ -4847,6 +4944,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);                       /* (a log that shows where the time goes, also through a pipe) */
     g_self = argv[0];
     if (argc > 3 && strcmp(argv[1], "hot") == 0) return run_hot(argv[2], atoi(argv[3]));
+    if (argc > 2 && strcmp(argv[1], "attab") == 0) return run_attab(argv[2]);
     if (argc > 1 && strcmp(argv[1], "s5") == 0) return run_s5(argc > 2 ? argv[2] : "map");
     if (argc > 1 && strcmp(argv[1], "heap") == 0) return run_heap(argc > 2 ? atoi(argv[2]) : 100000, argc > 3 ? argv[3] : "map");
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '3') return run_fixes(argv[2]);
