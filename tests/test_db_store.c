@@ -2830,7 +2830,22 @@ static int run_hot(const char *dir, int phase) {
         so.boot_id = 4242;
         store_t *s0 = NULL;
         CHECK(dfd >= 0 && store_open(dfd, &so, &s0) == 0 && s0);
-        CHECK(s0 && store_hot_read(s0, &want, &nwant) == 0 && nwant >= 8);
+        /* The list is made here, from the zones that the store holds (every stored zone, by id), and not left to what the stop of the earlier process wrote: that is the zones that happened to be in
+         * memory then, and the cache manager's tests before it take a part of them out (a CI machine had fewer than 256).  Every phase starts from this list; a phase's own stop rewrites it. */
+        {
+            uint32_t *ids = malloc((size_t)4096 * sizeof(*ids));
+            size_t nid = 0;
+            uint32_t cursor = 0;
+            store_zone_t sz0;
+            int ir;
+            while (s0 && ids && nid < 4096 && (ir = store_iter(s0, &cursor, &sz0)) != 0) {
+                if (ir > 0 && sz0.state == STORE_STATE_STORED && !(sz0.flags & STORE_F_NONSTORE)) ids[nid++] = sz0.zid;
+            }
+            CHECK(nid >= 512);                                                    /* (the store holds about a thousand zones by now) */
+            CHECK(s0 && ids && store_hot_write(s0, ids, nid) == 0);
+            free(ids);
+        }
+        CHECK(s0 && store_hot_read(s0, &want, &nwant) == 0 && nwant >= 512);
         if (s0) (void)store_close(s0);
         if (dfd >= 0) close(dfd);
     }
@@ -2909,7 +2924,7 @@ static int run_hot(const char *dir, int phase) {
         if (phase == 2) {
             CHECK(c.hot_state == 2 && nseen == (int)nwant);                                      /* (2: done; every zone of the list was looked at once) */
             CHECK(c.hot_attached + c.hot_skipped == nwant && c.hot_attached >= nwant - 8 && c.hot_per_s > 0);
-            CHECK(dbdir()->attach_count() >= nwant);
+            CHECK(dbdir()->attach_count() + 8 >= nwant);                         /* (the list is every stored zone: a few of them are shadowed by the configuration and are registered but not in the table) */
             CHECK(dbdir()->counters(6) == grows1 && dbdir()->counters(5) == slots1);        /* (and it was not grown by them) */
             uint8_t out[1232];
             CHECK(ask_engine(&g_wctx, &g_cc, "www.wq5.test.", 1, out) > 12 && (out[3] & 0x0F) == 0);
@@ -2964,7 +2979,7 @@ static int run_hot(const char *dir, int phase) {
     CHECK(inorder);                                                              /* (in the order of the list) */
     CHECK(c.hot_attached + c.hot_skipped == nwant && c.hot_skipped >= 1);              /* (the zone that the query attached was in memory when the list came to it) */
     const size_t in_mem = dbdir()->attach_count();
-    CHECK(in_mem >= nwant);                                                       /* (every zone of the list is in memory now, and the name servers' zones that an attach brings) */
+    CHECK(in_mem + 8 >= nwant);                                                       /* (every zone of the list is in memory now, but the few that the configuration shadows, and the name servers' zones that an attach brings) */
     uint8_t out[1232];
     CHECK(ask_engine(&g_wctx, &g_cc, "www.wq5.test.", 1, out) > 12 && (out[3] & 0x0F) == 0);
     db_store_test_hot_hook = NULL;
