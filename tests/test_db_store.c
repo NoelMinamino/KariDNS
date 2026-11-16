@@ -5953,6 +5953,8 @@ static int run_recon_thread(const char *dir) {
         }
         CHECK_MSG(got_lookup, "the lookup request was not on the fetch stream (%d other requests)", n_fill);
         const int64_t dt = now_us() - t0;
+        db_recon_status(&r);
+        CHECK_MSG(r.active && r.entries < 600, "the pass was over when the lookup request came (%llu entries)", (unsigned long long)r.entries);   /* (the request did not wait for the pass) */
         printf("    the request of a lookup was on the fetch stream %lld us after it was made, with %llu pages of the slow pass waiting\n", (long long)dt, (unsigned long long)maxq);
         CHECK_MSG(dt < 150000, "the lookup waited %lld us", (long long)dt);
         {
@@ -5961,8 +5963,6 @@ static int run_recon_thread(const char *dir) {
             kdb_enc_end(&e);
             ch_send(f[0], &e);
         }
-        db_recon_status(&r);
-        CHECK(r.active && r.entries < 600);                                  /* (the pass is still going: the answer did not wait for it) */
         CHECK(p_result(&mainc, &m, 30000) && m.u.batch_result.n_applied == 600 && m.u.batch_result.n_rejected == 0);
         store_counts(st, &kn1, &sd1);
         CHECK_MSG(kn1 - kn0 == 600, "BATCH_RESULT came with %llu of the 600 entries recorded", (unsigned long long)(kn1 - kn0));

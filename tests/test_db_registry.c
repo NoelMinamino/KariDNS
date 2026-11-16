@@ -3075,6 +3075,25 @@ static void test_glue_thread(void) {
     CHECK(t1 > t0 || w1 > w0);
 }
 
+/* an install over a limit of the configuration (max-records of options, batch 7) is refused with its reason, and the zone keeps what it had */
+static void test_install_over_limit(void) {
+    printf("[TEST] DB install: a zone over max-records is refused with the reason...\n");
+    server_config_t *cfg = load_conf("options { max-records 4; };\n"
+                                     "view \"default\" { match-clients { any; }; };\n");
+    rebuild(cfg);
+    zone_db_entry_t *e = new_entry("default", "lim.test.");
+    msg_t m;
+    char why[128] = "";
+    zone_msg(&m, "lim.test.", 1, 3);                            /* SOA, NS, 3 A: 5 records */
+    CHECK(install_msgs(e, "lim.test.", 3 + 3, &m, 1, why, sizeof(why), NULL) != 0);
+    if (!strstr(why, "over a limit of the configuration")) printf("  why: '%s'\n", why);
+    CHECK(strstr(why, "over a limit of the configuration") != NULL);
+    zone_version_t *v = atomic_load(&e->rcu.active);
+    CHECK(!v->image || v->image->n_rrs == 0);                   /* nothing was installed */
+    zone_msg(&m, "lim.test.", 2, 1);                            /* SOA, NS, 1 A: 3 records */
+    CHECK(install_msgs(e, "lim.test.", 1 + 3, &m, 1, why, sizeof(why), NULL) == 0);
+}
+
 int main(void) {
     snprintf(g_dir, sizeof(g_dir), "/tmp/karidns_dbreg.XXXXXX");
     if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
@@ -3113,6 +3132,7 @@ int main(void) {
     test_alias_notices();
     test_concurrent();
     test_glue_thread();
+    test_install_over_limit();
     gc_snapshot_wait_idle();      /* join the cleanup threads: none is left running (or leaked, for ThreadSanitizer) at exit */
     free(g_names);
     /* Remove the scratch directory in-process: the detached snapshot GC threads of test_concurrent may still be starting

@@ -1757,7 +1757,9 @@ static int journal_switch_locked(store_t *s, uint64_t base_lsn, int *oldfd) {
 }
 
 static void space_checkpoint(store_t *s);
-static int unclean_try_locked(store_t *s);
+static bool ck_try_locked(store_t *s);
+static void bg_release(store_t *s, bool io, bool ck);
+static int unclean_now_locked(store_t *s);
 static void rg_note_locked(store_t *s, const jb_t *j);
 static int wr_lock(store_t *s);
 
@@ -1769,7 +1771,12 @@ static int journal_append(store_t *s) {
   /* the last checkpoint on disk says "clean stop" (store_checkpoint_clean()) and this is a change after it: the flag is cleared durably first, as the open does
    * (a record after a clean flag would not make the next open after a power loss rebuild the tables).  Every writer clears it before it plans a record (wr_lock()):
    * this is the guard for a path that did not. */
-  if (s->clean_on_disk && (r = unclean_try_locked(s)) < 0) return r;
+  if (s->clean_on_disk) {
+    if (!ck_try_locked(s)) return -EAGAIN;
+    r = unclean_now_locked(s);
+    bg_release(s, true, true);
+    if (r < 0) return r;
+  }
   jrec_t h;
   h.magic = ST_MAGIC_JREC;
   h.len = (uint32_t)j->len;
@@ -2132,12 +2139,6 @@ static int unclean_now_locked(store_t *s) {
   if (!s->clean_on_disk) return 0;
   int r = sb_write(s, false, s->jrn_gen);
   if (r == 0) atomic_store_explicit(&s->clean_on_disk, false, memory_order_relaxed);
-  return r;
-}
-static int unclean_try_locked(store_t *s) {
-  if (!ck_try_locked(s)) return -EAGAIN;
-  int r = unclean_now_locked(s);
-  bg_release(s, true, true);
   return r;
 }
 

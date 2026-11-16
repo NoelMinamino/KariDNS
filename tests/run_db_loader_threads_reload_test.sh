@@ -115,7 +115,7 @@ OUT=$($KCTL reload 2>&1); RC=$?
 for n in 1 2 3; do
     wait_ans www.t$n.test 192.0.2.10$n && pass "www.t$n.test serves the new address" || fail "www.t$n.test still '$(ans www.t$n.test)' (want 192.0.2.10$n)"
 done
-grep -q "batch [0-9]* (diff) sent: 3 zone(s) read, 3 sent, 0 failed in the loader" "$T/srv.log" && pass "the diff batch read and sent the three zones (the pool read them one by one)" || { fail "no 'diff ... 3 zone(s) read, 3 sent' batch line"; grep "batch .* sent" "$T/srv.log" | tail -3 | sed 's/^/         /'; }
+wait_log "$T/srv.log" "batch [0-9]+ [(]diff[)] sent: 3 zone[(]s[)] read, 3 sent, 0 failed in the loader" 10 && pass "the diff batch read and sent the three zones (the pool read them one by one)" || { fail "no 'diff ... 3 zone(s) read, 3 sent' batch line"; grep "batch .* sent" "$T/srv.log" | tail -3 | sed 's/^/         /'; }
 grep -q "tables do not exist in this database" "$T/srv.log" && fail "the loader could not read the extension tables" || pass "no 'tables do not exist' in the log"
 setaddr t4.test 192.0.2.104
 OUT=$($KCTL reload t4.test 2>&1); RC=$?
@@ -128,7 +128,7 @@ start
 sq "UPDATE records SET content = '192.0.2.115' WHERE name = 'www.t5.test' AND type = 'A'; UPDATE records SET content = '192.0.2.116' WHERE name = 'www.t6.test' AND type = 'A'; UPDATE records SET content = '192.0.2.117' WHERE name = 'www.t1.test' AND type = 'A';"
 wait_ans www.t5.test 192.0.2.115 && wait_ans www.t6.test 192.0.2.116 && wait_ans www.t1.test 192.0.2.117 && pass "three zones changed in one commit are served by the auto reload" || fail "auto reload: t5 '$(ans www.t5.test)' t6 '$(ans www.t6.test)' t1 '$(ans www.t1.test)'"
 grep -q "tables do not exist in this database" "$T/srv.log" && fail "auto reload: the loader could not read the extension tables" || pass "auto reload: no 'tables do not exist' in the log"
-grep -q "batch [0-9]* (auto) sent: 3 zone(s) read, 3 sent" "$T/srv.log" && pass "one auto batch read and sent the three zones" || { fail "no 'auto ... 3 zone(s) read, 3 sent' batch line"; grep "batch .* sent" "$T/srv.log" | tail -3 | sed 's/^/         /'; }
+wait_log "$T/srv.log" "batch [0-9]+ [(]auto[)] sent: 3 zone[(]s[)] read, 3 sent" 10 && pass "one auto batch read and sent the three zones" || { fail "no 'auto ... 3 zone(s) read, 3 sent' batch line"; grep "batch .* sent" "$T/srv.log" | tail -3 | sed 's/^/         /'; }
 stop_srv
 
 echo
