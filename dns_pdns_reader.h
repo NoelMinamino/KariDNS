@@ -66,6 +66,7 @@
 #include "dns_zone_parser.h"
 #include "dns_db_stream.h"
 #include "dns_presigned.h"
+#include "dns_zone_image.h"
 
 /* ------------------------------------------------------------------ row structs (design 2.1) */
 typedef struct {                                /* one row of `domains` with its apex SOA */
@@ -313,5 +314,20 @@ typedef int (*pdns_emit_fn)(void *ud, const uint8_t *msg, size_t len);
  * Fails (-1, *err filled) for a tinydns zone, for an RR that does not fit a message, and above max_zone_bytes. */
 int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_emit_fn emit, void *ud,
                          char *err, size_t errlen);
+
+/* ------------------------------------------------------------------ zone images (0.7 M3: planning_0.7.x_store_m3_image_design.md) */
+/* The zone as the image the Backend serves from, built here instead of there.  pdns_zone_build_image() takes the arena of a finished primary zone with rows
+ * (not a summary, not a secondary) and does what the Backend does with the ZONE_DATA stream of that zone: the reference SOA first (a SOA set has none: every
+ * SOA is a row), the tinydns flag as the stream sets it, build_zone_index(true), zone_image_freeze() with the zone name as the apex, and then zone_image_validate_ex()
+ * with what ZONE_BEGIN will say (a zone that the Backend would refuse is a failure of the loader, with the zone named).  The same rows give the same image, byte
+ * for byte, and it is the image that the ZONE_DATA path gives (tests/db/pdns_imagediff.h compares the two).
+ * z->arena is changed: the record order, the RRset TTLs and the indexes are those of the image, and z->soa_index and z->line_id follow; the zone can still be
+ * encoded with pdns_zone_encode_kdb() afterwards (a stream with the harmonized TTLs).  NULL: failed, err says why.  Free with zone_image_free(). */
+zone_image_t *pdns_zone_build_image(pdns_zone_t *z, char *err, size_t errlen);
+/* ZONE_BEGIN (flag KDB_ZF_IMAGE, image_size, rr_count = n_rrs of the image), ZONE_IMAGE (the image in pieces of at most KDB_MAX_BODY) and ZONE_END, nothing else, with
+ * the gate and the parameters of pdns_zone_encode_kdb().  The digest is SHA-256 of the image bytes, then the markers of a PRESIGNED zone, the settings text, the
+ * profile and its text.  Returns 0, 1 (the gate said the Backend has this version: nothing emitted) or -1.  Changes z->arena as pdns_zone_build_image() does.
+ * Only for a primary zone with rows: a secondary zone and a summary have no data and are encoded by pdns_zone_encode_kdb(). */
+int pdns_zone_encode_image(pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_emit_fn emit, void *ud, char *err, size_t errlen);
 
 #endif

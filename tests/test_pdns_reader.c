@@ -35,6 +35,7 @@
 #include "db/zone2sql.h"
 #include "db/zrows_feed.h"
 #include "db/xfr_mocks.h"
+#define RT_IMAGE_DIFF 1          /* 0.7 M3: every round trip also builds the image the loader will send and compares it with the Backend's */
 #include "db/pdns_roundtrip.h"
 #include "db/pdns_confcheck.h"
 
@@ -2249,6 +2250,130 @@ static void test_summary_apex(void) {
     }
 }
 
+/* ------------------------------------------------------------------ 0.7 M3: the loader's zone image against the Backend's, on generated zones
+ *
+ * Every pdns_roundtrip() of this file also builds the zone as the image the loader sends and compares it with the image the Backend makes of the ZONE_DATA stream
+ * (RT_IMAGE_DIFF, tests/db/pdns_roundtrip.h): the zone files of tests/zones (DNSSEC with NSEC and NSEC3 chains, presigned layouts, wildcards, delegations with glue,
+ * DNAME), the corpus of one RR per type, ALIAS and LUA rules, tinydns and tag zones, SOA sets.  Here the zones are made at random, to reach the shapes that none of those
+ * has: the SOA anywhere among the rows, owners with several RRsets and TTLs in one RRset (harmonized), delegations with and without glue, wildcards below wildcards, empty
+ * non-terminals, long RRsets, names of the case a database may hold, every kind of record in one zone. */
+static uint64_t g_gen_state = 0x9E3779B97F4A7C15ull;
+static uint32_t gen_rand(void) {
+    g_gen_state ^= g_gen_state << 13;
+    g_gen_state ^= g_gen_state >> 7;
+    g_gen_state ^= g_gen_state << 17;
+    return (uint32_t)(g_gen_state >> 16);
+}
+
+#define GEN_MAX_ROWS 80
+typedef struct {
+    db_record_row_t rows[GEN_MAX_ROWS];
+    char names[GEN_MAX_ROWS][80];
+    char contents[GEN_MAX_ROWS][200];
+    size_t n;
+} gen_rows_t;
+
+static void gen_add(gen_rows_t *g, const char *name, const char *type, const char *content, int64_t ttl, int64_t prio) {
+    if (g->n >= GEN_MAX_ROWS) return;
+    size_t i = g->n++;
+    snprintf(g->names[i], sizeof(g->names[i]), "%s", name);
+    snprintf(g->contents[i], sizeof(g->contents[i]), "%s", content ? content : "");
+    g->rows[i] = R((int64_t)(i + 2), g->names[i], type, content ? g->contents[i] : NULL, ttl, prio);
+}
+
+static void gen_owner(char *out, size_t cap, unsigned flavour, unsigned k) {
+    switch (flavour % 6) {
+    case 0: snprintf(out, cap, "o%u.gen.test", k); break;
+    case 1: snprintf(out, cap, "www%u.sub%u.gen.test", k, k % 3); break;
+    case 2: snprintf(out, cap, "*.w%u.gen.test", k % 4); break;
+    case 3: snprintf(out, cap, "x%u.w%u.gen.test", k, k % 4); break;
+    case 4: snprintf(out, cap, "gen.test"); break;                                 /* the apex */
+    default: snprintf(out, cap, "d%u.gen.test", k % 5); break;
+    }
+}
+
+static void gen_zone_rows(gen_rows_t *g) {
+    g->n = 0;
+    unsigned n = 4 + gen_rand() % 40;
+    for (unsigned i = 0; i < n; i++) {
+        char owner[80], content[200];
+        unsigned k = gen_rand() % 9, fl = gen_rand();
+        gen_owner(owner, sizeof(owner), fl, k);
+        int64_t ttl = (int64_t[]){ 60, 300, 300, 300, 3600, 86400 }[gen_rand() % 6];
+        switch (gen_rand() % 22) {
+        case 0: case 1: snprintf(content, sizeof(content), "192.0.2.%u", 1 + gen_rand() % 250); gen_add(g, owner, "A", content, ttl, 0); break;
+        case 2: snprintf(content, sizeof(content), "2001:db8::%x", 1 + gen_rand() % 4000); gen_add(g, owner, "AAAA", content, ttl, 0); break;
+        case 3: snprintf(content, sizeof(content), "ns%u.gen.test", gen_rand() % 6); gen_add(g, owner, "NS", content, ttl, 0); break;
+        case 4: snprintf(content, sizeof(content), "mx%u.gen.test", gen_rand() % 4); gen_add(g, owner, "MX", content, ttl, (int64_t)(gen_rand() % 30)); break;
+        case 5: snprintf(content, sizeof(content), "%u %u srv%u.gen.test", gen_rand() % 5, gen_rand() % 100, gen_rand() % 4); gen_add(g, owner, "SRV", content, ttl, 0 + (int64_t)(gen_rand() % 3)); break;
+        case 6: snprintf(content, sizeof(content), "\"v=%u\"", gen_rand() % 1000); gen_add(g, owner, "TXT", content, ttl, 0); break;
+        case 7: snprintf(content, sizeof(content), "\"a%u\" \"b%u\" \"c\"", gen_rand() % 100, gen_rand() % 100); gen_add(g, owner, "TXT", content, ttl, 0); break;
+        case 8: snprintf(content, sizeof(content), "t%u.gen.test", gen_rand() % 6); { char co[80]; snprintf(co, sizeof(co), "c%u.gen.test", gen_rand() % 9); gen_add(g, co, "CNAME", content, ttl, 0); }; break;
+        case 9: snprintf(content, sizeof(content), "dn%u.other.test", gen_rand() % 3); { char co[80]; snprintf(co, sizeof(co), "dn%u.gen.test", gen_rand() % 4); gen_add(g, co, "DNAME", content, ttl, 0); }; break;
+        case 10: snprintf(content, sizeof(content), "p%u.gen.test", gen_rand() % 6); gen_add(g, owner, "PTR", content, ttl, 0); break;
+        case 11: gen_add(g, owner, "CAA", "0 issue \"ca.example.net\"", ttl, 0); break;
+        case 12: snprintf(content, sizeof(content), "1 1 %040x", gen_rand()); gen_add(g, owner, "SSHFP", content, ttl, 0); break;
+        case 13: snprintf(content, sizeof(content), "3 1 1 %064x", gen_rand()); gen_add(g, owner, "TLSA", content, ttl, 0); break;
+        case 14: snprintf(content, sizeof(content), "%u 8 2 %064x", 1 + gen_rand() % 60000, gen_rand()); gen_add(g, owner, "DS", content, ttl, 0); break;
+        case 15: gen_add(g, owner, "HINFO", "\"x86\" \"unix\"", ttl, 0); break;
+        case 16: gen_add(g, owner, "NAPTR", "100 10 \"u\" \"E2U+sip\" \"!^.*$!sip:info@example.net!\" .", ttl, 0); break;
+        case 17: gen_add(g, owner, NULL, NULL, 0, 0); break;                     /* an empty non-terminal row */
+        case 18: gen_add(g, owner, "TXT", "\"a\\\"b\\\\c\\032d\"", ttl, 0); break;   /* quote, backslash and a decimal escape inside a character-string */
+        case 19: snprintf(content, sizeof(content), "\\# 4 %08x", gen_rand()); gen_add(g, owner, "TYPE65280", content, ttl, 0); break;
+        case 20: gen_add(g, "gen.test", "NS", "ns1.gen.test", ttl, 0); gen_add(g, "ns1.gen.test", "A", "192.0.2.53", ttl, 0); break;
+        default: snprintf(content, sizeof(content), "192.0.2.%u", 1 + gen_rand() % 250); gen_add(g, "ns.d1.gen.test", "A", content, ttl, 0); gen_add(g, "d1.gen.test", "NS", "ns.d1.gen.test", ttl, 0); break;
+        }
+    }
+}
+
+static void test_image_generated(void) {
+    printf("zone images: the loader's image against the Backend's on generated zones\n");
+    unsigned made = 0, failed_zones = 0, with_soa_late = 0, big = 0;
+    gen_rows_t *g = malloc(sizeof(*g));
+    for (unsigned iter = 0; iter < 600 && g; iter++) {
+        gen_zone_rows(g);
+        pdns_zone_t *z = pdns_zone_new("gen.test", NULL);
+        if (!z) { CHECK(!"zone"); break; }
+        /* the SOA row among the others: first, last, or anywhere (the reader keeps the order of the rows; the Backend's stream opens with the SOA) */
+        size_t at = gen_rand() % (g->n + 1);
+        if (at) with_soa_late++;
+        db_record_row_t soa = R(at ? g->rows[at - 1].id : 1, "gen.test", "SOA", "ns1.gen.test hostmaster.gen.test 2024010101 7200 3600 1209600 300", 3600, 0);
+        for (size_t i = 0; i <= g->n; i++) {
+            if (i == at) pdns_zone_add_record(z, &soa);
+            if (i < g->n) pdns_zone_add_record(z, &g->rows[i]);
+        }
+        if (pdns_zone_finish(z) != 0) {                   /* (a CNAME beside other data, a bad row: the reader refuses it, as it should) */
+            failed_zones++;
+            pdns_zone_free(z);
+            continue;
+        }
+        made++;
+        if (z->arena.count > 40) big++;
+        rt_info_t info;
+        char why[400];
+        CHECK_MSG(pdns_roundtrip(z, &info, why, sizeof(why)), "generated zone %u (%zu RRs, SOA at %zu): %s", iter, z->arena.count, at, why);
+        pdns_zone_free(z);
+    }
+    free(g);
+    {   /* RDATA the Backend keeps as octets although the type is decoded to text fields: a NUL in a character-string, more character-strings than the fields hold */
+        char *many = malloc(8192), *p;
+        if (many) {
+            p = many;
+            for (int i = 0; i < 300; i++) p += sprintf(p, "\"s%d\" ", i);
+            db_record_row_t rows[] = { R(2, "many.z.test", "TXT", many, 300, 0), R(3, "nul.z.test", "TXT", "\"a\\000b\"", 300, 0), R(4, "nul.z.test", "TXT", "\"plain\"", 300, 0) };
+            pdns_zone_t *z = build(rows, 3, NULL, 0, NULL);
+            rt_info_t info;
+            char why[400];
+            printf("  TXT with 300 strings and with a NUL: %s\n", z->failed ? z->error : "accepted");
+            if (!z->failed) CHECK_MSG(pdns_roundtrip(z, &info, why, sizeof(why)), "%s", why);
+            pdns_zone_free(z);
+            free(many);
+        }
+    }
+    printf("  %u zones built and compared, %u refused by the reader, the SOA was not the first row in %u, %u of more than 40 RRs\n", made, failed_zones, with_soa_late, big);
+    CHECK(made > 200 && with_soa_late > 100);
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--gen-corpus") == 0) return gen_corpus(argv[2]);
     if (argc == 2) g_zones_dir = argv[1];
@@ -2264,6 +2389,7 @@ int main(int argc, char **argv) {
     test_isolation();
     test_metadata();
     test_ext();
+    test_image_generated();
     test_limits();
     test_kdb();
     test_secondary();

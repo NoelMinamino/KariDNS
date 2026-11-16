@@ -96,7 +96,7 @@ FUZZ_ALIAS_RESPONSE_TARGET = tests/fuzz/fuzz_alias_response
 FUZZ_ALIAS_RESPONSE_SRCS = tests/fuzz/fuzz_alias_response.c $(PDNS_XFR_DEPS)
 
 FUZZ_PDNS_METADATA_TARGET = tests/fuzz/fuzz_pdns_metadata
-FUZZ_PDNS_METADATA_SRCS = tests/fuzz/fuzz_pdns_metadata.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c
+FUZZ_PDNS_METADATA_SRCS = tests/fuzz/fuzz_pdns_metadata.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_zone_image.c
 
 FUZZ_DB_LOGLINE_TARGET = tests/fuzz/fuzz_db_logline
 FUZZ_DB_LOGLINE_SRCS = tests/fuzz/fuzz_db_logline.c dns_db_supervisor.c dns_priv_sandbox.c dns_utils.c
@@ -333,8 +333,8 @@ TEST_DBSTREAM_SRCS = tests/test_db_stream.c dns_db_stream.c dns_db_checkproto.c 
 TEST_DB_REGISTRY_SRCS = tests/test_db_registry.c dns_db_install.c dns_db_stream.c $(PDNS_XFR_DEPS) $(TEST_SYSLOG_QUIET)
 TEST_ZONE_DIR_SRCS = tests/test_zone_dir.c $(PDNS_XFR_DEPS) $(TEST_SYSLOG_QUIET)
 TEST_PRESIGNED_SRCS = tests/test_presigned.c dns_zone_rows.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c $(PDNS_XFR_DEPS) $(TEST_SYSLOG_QUIET)
-TEST_ZONE_TEXT_SRCS = tests/test_zone_text.c dns_zone_render.c dns_zone_text.c dns_zone_rows.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
-TEST_ZONE_IMPORT_BASE = tests/test_zone_import.c dns_zone_import.c dns_zone_changes.c dns_zone_export.c dns_zone_msg.c dns_zone_text.c dns_zone_rows.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_zone_lint.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c $(TEST_SYSLOG_QUIET)
+TEST_ZONE_TEXT_SRCS = tests/test_zone_text.c dns_zone_render.c dns_zone_text.c dns_zone_rows.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_ZONE_IMPORT_BASE = tests/test_zone_import.c dns_zone_import.c dns_zone_changes.c dns_zone_export.c dns_zone_msg.c dns_zone_text.c dns_zone_rows.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_zone_lint.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
 TEST_DB_SUPERVISOR_SRCS = tests/test_db_supervisor.c dns_db_supervisor.c dns_priv_sandbox.c dns_utils.c $(TEST_SYSLOG_QUIET)
 TEST_PDNS_READER_SRCS = tests/test_pdns_reader.c tests/db/zone2sql_lib.c dns_zone_rows.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c $(PDNS_XFR_DEPS) $(TEST_SYSLOG_QUIET)
 TEST_TINYDNS_SRCS = tests/test_tinydns_parser.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
@@ -522,6 +522,11 @@ test_pdns_reader: $(TEST_PDNS_READER_SRCS)
 pdns_reader_test: test_pdns_reader
 	./test_pdns_reader
 
+# 0.7 M3: what one zone costs in the loader and in the Backend with the ZONE_DATA stream and with a zone image (tests/db/bench_image.c; prints numbers, not a test)
+BENCH_IMAGE_SRCS = tests/db/bench_image.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c $(PDNS_XFR_DEPS) $(TEST_SYSLOG_QUIET)
+bench_image: $(BENCH_IMAGE_SRCS)
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(BENCH_IMAGE_SRCS) -o bench_image $(LDFLAGS) -lcrypto -lpthread -lm
+
 test_presigned: $(TEST_PRESIGNED_SRCS)
 	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_PRESIGNED_SRCS) -o test_presigned $(LDFLAGS) -lcrypto -lpthread -lm
 
@@ -557,7 +562,7 @@ zone2sql: $(ZONE2SQL_SRCS)
 
 # reference stream for tests/run_db_dump_test.sh: zone files -> KDB1 exactly as the dump of the imported database must be
 ZONE2KDB_TARGET = tests/db/zone2kdb
-ZONE2KDB_SRCS = tests/db/zone2kdb.c dns_zone_rows.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c
+ZONE2KDB_SRCS = tests/db/zone2kdb.c dns_zone_rows.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c
 
 zone2kdb: $(ZONE2KDB_SRCS)
 	$(CC) $(CFLAGS) -I. $(ZONE2KDB_SRCS) -o $(ZONE2KDB_TARGET) $(LDFLAGS) -lcrypto
@@ -587,7 +592,7 @@ DBLOADER_DRV_LIBS != for d in $(DB_DRIVERS); do case $$d in sqlite3) printf -- '
 DBSQ_CFLAGS != case " $(DB_DRIVERS) " in *" sqlite3 "*) printf -- '-DKARIDNS_DB_SQLITE3' ;; esac
 DBSQ_LIBS != case " $(DB_DRIVERS) " in *" sqlite3 "*) printf -- '-lsqlite3' ;; esac
 DBLOADER_TARGET = karidns-dbloader
-DBLOADER_SRCS = karidns_dbloader.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_db_checkproto.c dns_zone_lint.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c $(DBLOADER_DRV_SRCS)
+DBLOADER_SRCS = karidns_dbloader.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_db_checkproto.c dns_zone_lint.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c $(DBLOADER_DRV_SRCS)
 
 dbloader-check-drivers:
 	@set -e; if [ -z "$(DB_DRIVERS)" ]; then echo "make: DB_DRIVERS is empty: nothing to build (use DB_DRIVERS=sqlite3)" >&2; exit 1; fi; \
@@ -612,7 +617,7 @@ karidns-dbloader-asan: dbloader-check-drivers $(DBLOADER_SRCS)
 # 0.6.0 karidns-zone (docs/karidns-zone.md): the command line of the ZoneImporter / ZoneExporter.  It links the DB drivers of DB_DRIVERS like
 # karidns-dbloader and runs as an ordinary user.  make karidns-zone DB_DRIVERS="sqlite3 postgresql"
 KARIDNS_ZONE_TARGET = karidns-zone
-KARIDNS_ZONE_SRCS = tools/karidns_zone.c dns_zone_import.c dns_zone_changes.c dns_zone_render.c dns_zone_export.c dns_zone_msg.c dns_zone_text.c dns_zone_rows.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_zone_lint.c dns_config_parser.c dns_tsig_acl.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c $(DBLOADER_DRV_SRCS)
+KARIDNS_ZONE_SRCS = tools/karidns_zone.c dns_zone_import.c dns_zone_changes.c dns_zone_render.c dns_zone_export.c dns_zone_msg.c dns_zone_text.c dns_zone_rows.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_zone_lint.c dns_config_parser.c dns_tsig_acl.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c $(DBLOADER_DRV_SRCS)
 KARIDNS_ZONE_HDRS = dns_db_driver.h dns_zone_import.h dns_zone_changes.h dns_zone_render.h dns_zone_export.h dns_zone_msg.h dns_zone_text.h dns_zone_rows.h dns_zone_lint.h dns_diag.h dns_diag_codes.h
 
 karidns-zone: dbloader-check-drivers $(KARIDNS_ZONE_SRCS) $(KARIDNS_ZONE_HDRS)
@@ -622,7 +627,7 @@ karidns-zone: dbloader-check-drivers $(KARIDNS_ZONE_SRCS) $(KARIDNS_ZONE_HDRS)
 karidns-zone-asan: dbloader-check-drivers $(KARIDNS_ZONE_SRCS) $(KARIDNS_ZONE_HDRS)
 	$(CC) $(ASAN_CFLAGS) $(DBLOADER_DRV_CFLAGS) -I. $(KARIDNS_ZONE_SRCS) -o karidns-zone-asan $(LDFLAGS) -pthread -lcrypto $(DBLOADER_DRV_LIBS)
 
-TEST_DB_SQLITE3_SRCS = tests/test_db_sqlite3.c dns_db_sqlite3.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_db_checkproto.c dns_zone_lint.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c $(TEST_SYSLOG_QUIET)
+TEST_DB_SQLITE3_SRCS = tests/test_db_sqlite3.c dns_db_sqlite3.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_db_checkproto.c dns_zone_lint.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
 
 test_db_sqlite3: $(TEST_DB_SQLITE3_SRCS) karidns_dbloader.c dns_db_driver.h
 	$(CC) $(CFLAGS) $(DBSQ_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DB_SQLITE3_SRCS) -o test_db_sqlite3 $(LDFLAGS) -lcrypto -lpthread -lm $(DBSQ_LIBS)
@@ -1744,7 +1749,7 @@ clean: clean-fuzz coverage-clean
 	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck $(TAPSTAT_TARGET) $(TAPSTAT_OBJS) karidns-tapstat-asan bench_serialize bench_rrl $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
 	@# karicheck's objects outside $(OBJS): an uninstrumented copy left here would be linked into the coverage build
 	rm -f dns_zone_lint.o dns_db_checkproto.o karicheck-codelog test_coverage_sweep_tools-codelog
-	rm -f karidns-zone karidns-zone-asan karidns-asan karidns-tsan karidns-evict *.ev.o test_epoch_rcu-tsan test_zone_dir-tsan test_zone_dir test_park-tsan test_db_fetch-tsan test_server_core-tsan test_park_worker-tsan test_db_registry-tsan test_db_stream-tsan test_pdns_reader-tsan test_park test_db_fetch test_park_worker *.asan.o *.tsan.o test_asan_overflow test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_server_stmt test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_tapstat test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_stream test_pdns_reader test_presigned test_zone_text test_zone_import test_db_supervisor test_plugin_msg test_db_sqlite3 test_db_registry test_db_pgsql karidns-dbloader karidns-dbloader-tsan karidns-dbloader-asan tests/db/zone2sql tests/db/zone2kdb test_store test_store-asan test_store-tsan test_db_store test_db_store-asan test_db_store-tsan
+	rm -f bench_image karidns-zone karidns-zone-asan karidns-asan karidns-tsan karidns-evict *.ev.o test_epoch_rcu-tsan test_zone_dir-tsan test_zone_dir test_park-tsan test_db_fetch-tsan test_server_core-tsan test_park_worker-tsan test_db_registry-tsan test_db_stream-tsan test_pdns_reader-tsan test_park test_db_fetch test_park_worker *.asan.o *.tsan.o test_asan_overflow test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_server_stmt test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_tapstat test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_stream test_pdns_reader test_presigned test_zone_text test_zone_import test_db_supervisor test_plugin_msg test_db_sqlite3 test_db_registry test_db_pgsql karidns-dbloader karidns-dbloader-tsan karidns-dbloader-asan tests/db/zone2sql tests/db/zone2kdb test_store test_store-asan test_store-tsan test_db_store test_db_store-asan test_db_store-tsan
 	rm -f $(UT_ASAN_BINS)
 	rm -f *.uta.o *.utn.o tests/*.uta.o tests/*.utn.o tools/*.uta.o tools/*.utn.o
 	rm -f tests/fi/kari_fi_preload.so

@@ -2111,3 +2111,173 @@ out:
     kdb_enc_free(&enc);
     return rc;
 }
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 0.7 M3: the zone image the Backend would build, built by the loader                                            */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* What the Backend does with the ZONE_DATA stream of a zone (dns_db_install.c, zone_install_builder() in dns_axfr_ixfr.c), on the arena the reader has.  The data
+ * the stream carries is exactly the arena, so the same image comes out when the arena is brought into the form the stream has after the Backend read it:
+ *   - the reference SOA is the first RR (the AXFR opens with it, RFC 5936 2.2; a SOA set has no opening SOA in the arena: every SOA is a row), the others keep the order
+ *   - the zone is a tinydns zone when ZONE_BEGIN says so, or when a location definition, or an RR with a tinydns location or time stamp, was on the stream
+ *   - the RRset TTLs are harmonized (RFC 2181 5.2) and the indexes are built again for the new order
+ * The image is frozen with the zone name as its apex. */
+/* The flags of an RR in the image say how its record looked in the builder (zone_image_rr_t.flags): RAW = RDATA octets (generic_data), no text fields; NO_NAMEWIRE = no
+ * preparsed owner wire (rdata_count 0).  The Backend's builder is filled by parse_resource_record(), which decodes only the types below into text fields and keeps the
+ * octets of every other type (RFC 3597 5), also CAA, SSHFP, DS, RRSIG, ...; of those only the DNSSEC types of decode_dnssec_rdata() (R-33) get text fields too, and so a
+ * preparsed owner.  The zone parser makes text fields of every type it knows, so the image of the loader's builder has neither flag for them.  The octets of the RDATA are
+ * the same either way (and so is what is served); the flags are given the value they have after the stream, which keeps the images of the two paths one image (the test
+ * of pdns_zone_build_image() compares them type by type, and fails when a type is added to parse_resource_record() and not here). */
+static bool wire_decodes_to_text(uint16_t t) {
+    switch (t) {
+    case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8: case 9: case 12: case 14: case 15: case 16: case 17: case 18: case 21:
+    case 23: case 26: case 28: case 33: case 35: case 36: case 39: case 107:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool wire_dnssec_text(uint16_t t) { return t == 43 || t == 46 || t == 47 || t == 48 || t == 50 || t == 51; }
+
+static void image_wire_form_flags(zone_image_t *img) {
+    zone_image_rr_t *rrs = (zone_image_rr_t *)(void *)((uint8_t *)img + img->off_rrs);
+    for (uint32_t k = 0; k < img->n_rrs; k++) {
+        if (!wire_decodes_to_text(rrs[k].type)) rrs[k].flags |= ZONE_IMAGE_RR_RAW;
+        if ((rrs[k].flags & ZONE_IMAGE_RR_RAW) && !wire_dnssec_text(rrs[k].type)) rrs[k].flags |= ZONE_IMAGE_RR_NO_NAMEWIRE;
+    }
+}
+
+zone_image_t *pdns_zone_build_image(pdns_zone_t *z, char *err, size_t errlen) {
+    char dummy[8];
+    if (!err || errlen == 0) { err = dummy; errlen = sizeof(dummy); }
+    err[0] = '\0';
+    if (z->failed || !z->finished || !z->arena_ready || z->zkind != KDB_ZK_PRIMARY || z->summary || z->arena.count == 0) {
+        snprintf(err, errlen, "zone '%s': not converted, or a zone without rows", z->name);
+        return NULL;
+    }
+    zone_arena_t *a = &z->arena;
+    const bool soa_set = z->n_soa > 1 || dns_record_is_restricted(&a->records[z->soa_index]);
+    if (soa_set && z->n_soa > KARIDNS_SOA_SET_MAX) {
+        snprintf(err, errlen, "zone '%s': more than %u SOA records", z->name, (unsigned)KARIDNS_SOA_SET_MAX);
+        return NULL;
+    }
+    if (!soa_set && z->soa_index != 0) {
+        dns_record_t soa = a->records[z->soa_index];
+        int64_t soa_id = z->line_id[z->soa_index];
+        memmove(a->records + 1, a->records, z->soa_index * sizeof(a->records[0]));
+        memmove(z->line_id + 1, z->line_id, z->soa_index * sizeof(z->line_id[0]));
+        a->records[0] = soa;
+        z->line_id[0] = soa_id;
+        z->soa_index = 0;
+    }
+    bool tinydns = (z->flags & PDNS_F_TINYDNS) != 0 || a->location_count > 0;
+    for (size_t i = 0; i < a->count && !tinydns; i++) {
+        const dns_record_t *r = &a->records[i];
+        const bool wrapped = xext_rr_is_tinydns(r->tinydns_loc, (int64_t)r->tinydns_ttd) || (soa_set && r->type_code == 6);
+        if (wrapped && (r->tinydns_loc[0] || r->tinydns_loc[1] || r->tinydns_ttd || r->tinydns_ttl_countdown)) tinydns = true;
+    }
+    a->is_tinydns_format = tinydns;
+    zone_arena_shrink_records(a);
+    if (build_zone_index(a, true) != 0) {
+        snprintf(err, errlen, "zone '%s': out of memory building the zone index", z->name);
+        return NULL;
+    }
+    zone_image_t *img = zone_image_freeze(a, z->name);
+    if (!img) {
+        snprintf(err, errlen, "zone '%s': the zone image cannot be built (see the log)", z->name);
+        return NULL;
+    }
+    image_wire_form_flags(img);
+    /* what the Backend will check of what it receives, checked here: a zone it would refuse is the loader's failure, with the row's zone named */
+    char why[300];
+    zone_image_policy_t pol = { z->name, z->serial, img->n_rrs, img->total_size, z->opts.max_zone_bytes, z->opts.max_records, z->has_ext, tinydns };
+    if (zone_image_validate_ex(img, img->total_size, &pol, why, sizeof(why)) != 0) {
+        snprintf(err, errlen, "zone '%s': %s", z->name, why);
+        zone_image_free(img);
+        return NULL;
+    }
+    return img;
+}
+
+/* the digest of an image zone: SHA-256 of the image bytes (the same rows give the same bytes), then the markers that decide how the Backend serves the zone
+ * and are not in the image (a PRESIGNED zone), and the settings text, the profile name and the profile text (B7a: a metadata-only edit changes the digest).
+ * The tinydns flag is in the image header.  Every field is length-prefixed, so two different splits cannot give the same input. */
+static int image_digest(const pdns_zone_t *z, const zone_image_t *img, const pdns_kdb_params_t *p, const char *profile, uint8_t digest[KDB_DIGEST_LEN]) {
+    EVP_MD_CTX *md = EVP_MD_CTX_new();
+    int rc = -1;
+    unsigned dlen = 0;
+    if (!md || EVP_DigestInit_ex(md, EVP_sha256(), NULL) != 1 || EVP_DigestUpdate(md, img, img->total_size) != 1) goto out;
+    if (z->flags & PDNS_F_PRESIGNED) {
+        static const uint8_t ptag[] = "KDB1-PRESIGNED";
+        if (EVP_DigestUpdate(md, ptag, sizeof(ptag)) != 1) goto out;
+    }
+    if ((z->settings && *z->settings) || (profile && *profile)) {
+        const char *parts[3] = { z->settings ? z->settings : "", profile ? profile : "", p->profile_text ? p->profile_text : "" };
+        static const uint8_t tag[] = "KDB1-SETTINGS";
+        if (EVP_DigestUpdate(md, tag, sizeof(tag)) != 1) goto out;
+        for (int k = 0; k < 3; k++) {
+            uint64_t n = strlen(parts[k]);
+            uint8_t lb[8];
+            for (int b = 0; b < 8; b++) lb[b] = (uint8_t)(n >> (56 - 8 * b));
+            if (EVP_DigestUpdate(md, lb, 8) != 1 || EVP_DigestUpdate(md, parts[k], (size_t)n) != 1) goto out;
+        }
+    }
+    if (EVP_DigestFinal_ex(md, digest, &dlen) != 1 || dlen != KDB_DIGEST_LEN) goto out;
+    rc = 0;
+out:
+    EVP_MD_CTX_free(md);
+    return rc;
+}
+
+int pdns_zone_encode_image(pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_emit_fn emit, void *ud, char *err, size_t errlen) {
+    char dummy[8];
+    if (!err || errlen == 0) { err = dummy; errlen = sizeof(dummy); }
+    zone_image_t *img = pdns_zone_build_image(z, err, errlen);
+    if (!img) return -1;
+    int rc = -1;
+    kdb_enc_t enc;
+    kdb_enc_init(&enc);
+    emit_ud_t eu = { &enc, emit, ud };
+    uint8_t digest[KDB_DIGEST_LEN];
+    const char *profile = p->profile ? p->profile : z->profile;
+    if (image_digest(z, img, p, profile, digest) != 0) {
+        snprintf(err, errlen, "zone '%s': digest failed", z->name);
+        goto out;
+    }
+    if (p->gate && p->gate(p->gate_ud, z->serial, digest) != 0) {        /* the loader has this version already */
+        rc = 1;
+        goto out;
+    }
+    if (kdb_enc_begin(&enc, KDB_T_ZONE_BEGIN) != 0 ||
+        kdb_enc_u16(&enc, 1, p->view) != 0 || kdb_enc_name(&enc, 2, z->name) != 0 ||
+        kdb_enc_i64(&enc, 3, p->source_id) != 0 || kdb_enc_u8(&enc, 4, p->zone_kind) != 0 ||
+        kdb_enc_u32(&enc, 5, z->serial) != 0 ||
+        kdb_enc_u32(&enc, 6, (z->flags & PDNS_F_PRESIGNED ? KDB_ZF_PRESIGNED : 0) | (z->has_ext ? KDB_ZF_EXTENDED : 0) |
+                             (img->flags & ZONE_IMAGE_F_TINYDNS ? KDB_ZF_TINYDNS : 0) | KDB_ZF_IMAGE) != 0 ||
+        kdb_enc_u64(&enc, 7, img->n_rrs) != 0 || kdb_enc_bytes(&enc, 8, digest, KDB_DIGEST_LEN) != 0 ||
+        (z->settings && *z->settings && kdb_enc_str(&enc, 9, z->settings) != 0) ||
+        (profile && *profile && kdb_enc_str(&enc, 10, profile) != 0) ||
+        (p->request_id && kdb_enc_u64(&enc, 11, p->request_id) != 0) ||
+        kdb_enc_u64(&enc, 23, img->total_size) != 0 || kdb_enc_end(&enc) != 0 || emit_msg(&eu) != 0) {
+        snprintf(err, errlen, "zone '%s': ZONE_BEGIN could not be encoded or sent", z->name);
+        goto out;
+    }
+    for (size_t off = 0; off < img->total_size;) {
+        size_t n = img->total_size - off < KDB_MAX_BODY ? img->total_size - off : KDB_MAX_BODY;
+        if (kdb_enc_raw_msg(&enc, KDB_T_ZONE_IMAGE, (const uint8_t *)img + off, n) != 0 || emit_msg(&eu) != 0) {
+            snprintf(err, errlen, "zone '%s': the zone image could not be sent", z->name);
+            goto out;
+        }
+        off += n;
+    }
+    if (kdb_enc_begin(&enc, KDB_T_ZONE_END) != 0 || kdb_enc_u64(&enc, 1, img->n_rrs) != 0 || kdb_enc_end(&enc) != 0 || emit_msg(&eu) != 0) {
+        snprintf(err, errlen, "zone '%s': ZONE_END could not be encoded or sent", z->name);
+        goto out;
+    }
+    rc = 0;
+out:
+    kdb_enc_free(&enc);
+    zone_image_free(img);
+    return rc;
+}
