@@ -2500,6 +2500,104 @@ static void test_no_wait_in_lock(int mode) {
   tdir_free(&d);
 }
 
+/* 0.7: the bound of the journal and a close during a fuzzy checkpoint.  A checkpoint whose flush is made slow (1 s in the hook, as a disk slower than the writes) while one writer puts
+ * zones as fast as it can: the journal goes past journal_max_bytes (the checkpoint in progress cannot cut it) but never past 2 x journal_max_bytes plus one call; the call that reaches
+ * the bound waits at its end, with the writer mutex released (its longest hold stays short), until the checkpoint is done; the next call cuts the journal; one WARNING.  Then a close
+ * while a fuzzy checkpoint sleeps in its flush leaves that checkpoint (logged) instead of finishing it, and the reopen finds the clean state with every zone. */
+static void log_cb(void *ctx, int level, const char *msg);
+static int log_count(int level, const char *needle);
+static void log_clear(void);
+static _Atomic int g_jb_step, g_jb_ms;
+static _Atomic bool g_jb_in, g_jb_entered;
+static void jb_hook(int step) {
+  if (step != atomic_load(&g_jb_step)) return;
+  atomic_store(&g_jb_step, 0);
+  atomic_store(&g_jb_in, true);
+  atomic_store(&g_jb_entered, true);
+  usleep((useconds_t)atomic_load(&g_jb_ms) * 1000u);
+  atomic_store(&g_jb_in, false);
+}
+static void test_journal_bound(int mode) {
+  printf("[the journal stays below 2 x journal_max_bytes while a checkpoint is slow; a close leaves a fuzzy checkpoint (%s)]\n", mode == STORE_MODE_MAP ? "MAP" : "COPY");
+  tdir_t d;
+  tdir_new(&d, "jbound");
+  store_opts_t o;
+  small_opts(&o);
+  o.mode = mode;
+  o.journal_max_bytes = 64u << 10;
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  o.log = log_cb;
+  log_clear();
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK_EQ(st.journal_bound_bytes, 2 * o.journal_max_bytes);
+  CHECK(st.flusher);
+  /* 1. the first fuzzy checkpoint (begun by the put that fills the journal) sleeps 1 s in its flush */
+  atomic_store(&g_jb_entered, false);
+  atomic_store(&g_jb_ms, 1000);
+  atomic_store(&g_jb_step, 2);
+  atomic_store(&store_test_ckpt_hook, jb_hook);
+  uint64_t peak = 0;
+  uint32_t i = 0;
+  bool cut = false;
+  for (; i < 100000 && !cut; i++) {
+    if (put_i(s, 0, i, 1, NULL) != 0) { CHECK(!"put"); break; }
+    (void)store_journal_wait(s, 2);                                     /* (as the reconcile thread does between its groups) */
+    store_stats(s, &st);
+    if (st.journal_bytes > peak) peak = st.journal_bytes;
+    cut = atomic_load(&g_jb_entered) && !atomic_load(&g_jb_in) && st.journal_limit_waits > 0 && st.journal_bytes < o.journal_max_bytes;   /* (waited, the flush ended, the next checkpoint cut it) */
+  }
+  store_stats(s, &st);
+  printf("  %u puts; journal peak %" PRIu64 " bytes (bound %" PRIu64 "), %" PRIu64 " wait(s), the longest %" PRIu64 " us; writer mutex held at most %" PRIu64 " us\n", i, st.journal_peak_bytes,
+         st.journal_bound_bytes, st.journal_limit_waits, st.journal_limit_wait_max_us, st.lock_hold_max_us);
+  CHECK(cut);
+  CHECK(peak >= o.journal_max_bytes);                                     /* (the slow checkpoint did not cut it) */
+  CHECK(st.journal_peak_bytes >= peak && st.journal_peak_bytes <= st.journal_bound_bytes + 4096);   /* (one put is far less than 4 KiB of records) */
+  CHECK(st.journal_limit_waits >= 1);
+  CHECK(st.journal_limit_wait_max_us > 0 && st.journal_limit_wait_us >= st.journal_limit_wait_max_us);
+  CHECK(st.lock_hold_max_us < 500000);                                    /* (the wait is outside the writer mutex; the hook slept 1 s) */
+  CHECK(st.checkpoint_max_us >= 900000);                                  /* (the slow one) */
+  CHECK_EQ(log_count(4, "2 x journal_max_bytes"), 1);                   /* (at most one a minute) */
+  CHECK_EQ(store_close(s), 0);
+  /* 2. a close while a fuzzy checkpoint sleeps in its flush (the hook returns after 1 s; the flush then stops before its first piece).  A journal limit that is far away and a
+   * checkpoint by the interval: no put waits, the close comes while the flusher's checkpoint is in the hook */
+  o.create = false;
+  o.journal_max_bytes = 64u << 20;
+  o.checkpoint_interval_ms = 100;
+  s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { atomic_store(&store_test_ckpt_hook, NULL); tdir_free(&d); return; }
+  for (uint32_t k = 0; k < 500; k++, i++)
+    if (put_i(s, 0, i, 1, NULL) != 0) { CHECK(!"put 2"); break; }
+  atomic_store(&g_jb_entered, false);
+  atomic_store(&g_jb_step, 2);
+  for (int w = 0; w < 5000 && !atomic_load(&g_jb_entered); w++) usleep(1000);
+  CHECK(atomic_load(&g_jb_in));
+  const uint32_t n = i;
+  log_clear();
+  CHECK_EQ(store_close(s), 0);
+  atomic_store(&store_test_ckpt_hook, NULL);
+  CHECK_EQ(log_count(6, "was left for the clean checkpoint that follows"), 1);
+  s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats(s, &st);
+    CHECK(st.recovery.was_clean);
+    CHECK_EQ(st.recovery.records_replayed, 0);
+    CHECK(!st.recovery.rebuilt);
+    for (uint32_t k = 0; k < n; k += 13) CHECK(find_i(s, 0, k) != STORE_NONE);
+    CHECK(find_i(s, 0, n - 1) != STORE_NONE);
+    check_consistent(s, "journal bound, reopen");
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
 /* M4: a clean checkpoint says "clean" on disk without closing the store: the next open reads no journal and, after a reboot, does not rebuild; a change after it clears the
  * flag first (so the next open after a reboot rebuilds, as after any unclean stop) */
 static void test_clean_checkpoint(void) {
@@ -4792,6 +4890,7 @@ int main(void) {
   if (WANT("kill")) test_kill_loop(iters, 0);
   if (WANT("kgrp")) test_kill_loop(UNDER_TSAN ? 25 : 50, 2);
   if (WANT("nowait")) { test_no_wait_in_lock(STORE_MODE_MAP); test_no_wait_in_lock(STORE_MODE_COPY); }
+  if (WANT("jbound")) { test_journal_bound(STORE_MODE_MAP); test_journal_bound(STORE_MODE_COPY); }
   if (WANT("kfz")) test_kill_loop(UNDER_TSAN ? 25 : 50, 3);
   if (WANT("kgrow")) test_kill_loop(UNDER_TSAN ? 20 : 50, 4);
   if (WANT("clk")) {
