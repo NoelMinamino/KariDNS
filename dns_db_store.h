@@ -202,6 +202,8 @@ struct dbdir_rec;
 extern void (*_Atomic db_store_test_batch_hook)(struct dbdir_rec *rec);   /* called for the record of every job of a batch of attaches just before the batch is registered */
 extern _Atomic bool db_store_test_hot_pending;                    /* the threads of hot.list see attach requests of queries that wait (tests: they are never starved by them) */
 extern void (*_Atomic db_store_test_hot_hook)(uint32_t zid);   /* called by the threads of hot.list before each zone (tests: the order, and time) */
+extern _Atomic bool db_store_test_hot_stuck;                   /* the threads of hot.list see attach requests that wait and are not served (tests: the list gives way once, not for the whole time) */
+extern _Atomic uint64_t db_store_test_hot_naps;                /* the naps the threads of hot.list took for the queries (tests) */
 #ifdef KARIDNS_UNIT_TEST
 extern int db_store_test_set_fail;                      /* the n-th set_put_slot() of the settings table fails (0: off) */
 extern int db_store_test_attach_reserve_fail;           /* the n-th reserve of room in the attach table fails (0: off) */
