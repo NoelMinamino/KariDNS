@@ -1151,12 +1151,22 @@ static void test_superblock_damage(void) {
 typedef struct { uint8_t exists, known; uint16_t flags; uint64_t ver; } mz_t;
 typedef struct { mz_t z[KNZ]; bool cursor_valid; uint64_t cursor; } model_t;
 
-enum { OP_PUT, OP_DEL, OP_KNOWN, OP_FLAGS, OP_CURSOR, OP_CKPT, OP_NONE, OP_COMPACT, OP_SCRUB };
-static int g_kill_mode;                  /* 1: the cleaner, the nx pass and the scrub are operations of the loop too (they change no zone) */
+enum { OP_PUT, OP_DEL, OP_KNOWN, OP_FLAGS, OP_CURSOR, OP_CKPT, OP_NONE, OP_COMPACT, OP_SCRUB, OP_KNOWN_N };
+static int g_kill_mode;                  /* 1: the cleaner, the nx pass and the scrub are operations of the loop too (they change no zone); 2: groups of zones made known in one call (store_set_known_n(): all or none of a group is there) */
 static int op_kind(uint64_t K, uint32_t *i) {
   uint64_t r = mix64(K * 0x9e3779b97f4a7c15ull + 12345);
   *i = (uint32_t)((r >> 16) % KNZ);
   uint32_t p = (uint32_t)(r % 100);
+  if (g_kill_mode == 2) {
+    if (p < 25) return OP_PUT;
+    if (p < 35) return OP_DEL;
+    if (p < 75) return OP_KNOWN_N;
+    if (p < 82) return OP_KNOWN;
+    if (p < 90) return OP_FLAGS;
+    if (p < 95) return OP_CURSOR;
+    if (p < 97) return OP_CKPT;
+    return OP_NONE;
+  }
   if (g_kill_mode == 1) {
     if (p < 40) return OP_PUT;
     if (p < 52) return OP_DEL;
@@ -1177,6 +1187,13 @@ static int op_kind(uint64_t K, uint32_t *i) {
   return OP_NONE;
 }
 static uint16_t op_flags(uint64_t K) { return (uint16_t)((mix64(K) >> 7) & 0x3f); }
+/* the zones of a group of OP_KNOWN_N: 2 to 10 of the same view, one of them twice now and then */
+static unsigned kn_group(uint64_t K, uint32_t i, uint32_t *idx) {
+  unsigned g = 2 + (unsigned)((mix64(K ^ 0x55) >> 9) % 9);
+  for (unsigned j = 0; j < g; j++) idx[j] = (i + 2 * 5 * j) % KNZ;
+  if (K % 3 == 0) idx[g - 1] = idx[0];
+  return g;
+}
 
 static int store_do_op(store_t *s, uint64_t K) {
   uint32_t i;
@@ -1197,6 +1214,25 @@ static int store_do_op(store_t *s, uint64_t K) {
   }
   case OP_DEL: { int r = store_delete_name(s, view, nm, strlen(nm)); return r == -ENOENT ? 0 : r; }
   case OP_KNOWN: return store_set_known(s, view, nm, strlen(nm), &m, NULL);
+  case OP_KNOWN_N: {
+    uint32_t idx[16];
+    unsigned g = kn_group(K, i, idx);
+    char names[16][160];
+    store_meta_t metas[16];
+    store_known_t in[16];
+    int res[16];
+    for (unsigned j = 0; j < g; j++) {
+      name_of(idx[j], names[j], sizeof(names[j]));
+      metas[j] = meta_of(idx[j], K);
+      metas[j].flags = op_flags(K);
+      in[j].name = names[j];
+      in[j].len = strlen(names[j]);
+      in[j].meta = &metas[j];
+    }
+    int r = store_set_known_n(s, view, in, g, res, NULL);
+    for (unsigned j = 0; j < g && r == 0; j++) if (res[j] != 0) r = res[j];
+    return r;
+  }
   case OP_FLAGS: {
     uint32_t z = find_i(s, view, i);
     if (z == STORE_NONE) return 0;
@@ -1218,6 +1254,12 @@ static void model_do_op(model_t *m, uint64_t K) {
   case OP_PUT: z->exists = 1; z->known = 0; z->ver = K; z->flags = op_flags(K); break;
   case OP_DEL: memset(z, 0, sizeof(*z)); break;
   case OP_KNOWN: z->exists = 1; z->known = 1; z->ver = K; z->flags = op_flags(K); break;
+  case OP_KNOWN_N: {
+    uint32_t idx[16];
+    unsigned g = kn_group(K, i, idx);
+    for (unsigned j = 0; j < g; j++) { mz_t *y = &m->z[idx[j]]; y->exists = 1; y->known = 1; y->ver = K; y->flags = op_flags(K); }
+    break;
+  }
   case OP_FLAGS: if (z->exists) z->flags = op_flags(K); break;
   case OP_CURSOR: m->cursor_valid = true; m->cursor = K; break;
   default: break;
@@ -1321,7 +1363,7 @@ static void child_main(const char *path, shm_t *shm, uint64_t K0, uint64_t count
 
 static void test_kill_loop(int iters, int mode) {
   g_kill_mode = mode;
-  printf("[kill -9 loop%s: %d iterations]\n", mode == 1 ? " with the cleaner, the nx pass and the scrub" : "", iters);
+  printf("[kill -9 loop%s: %d iterations]\n", mode == 1 ? " with the cleaner, the nx pass and the scrub" : mode == 2 ? " with groups of zones made known in one record (store_set_known_n)" : "", iters);
   tdir_t d;
   tdir_new(&d, "kill");
   shm_t *shm = mmap(NULL, sizeof(*shm), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
@@ -3973,6 +4015,298 @@ static void test_hot_list(void) {
   tdir_free(&d2);
 }
 
+/* ---- 0.7 M2: group commit (store_set_known_n()) ---- */
+
+/* an entry of a group: a name and the meta of zone i, with some of the traps of a manifest pass (a source id that another zone owns, none, a source number that changed) */
+typedef struct { char nm[200]; store_meta_t m; } gk_t;
+static void gk_make(gk_t *e, uint64_t K, uint32_t npool) {
+  uint64_t r = mix64(K * 0x9e3779b97f4a7c15ull + 777);
+  uint32_t i = (uint32_t)(r % npool);
+  name_of(i, e->nm, sizeof(e->nm));
+  e->m = meta_of(i, K);
+  uint32_t p = (uint32_t)((r >> 20) % 100);
+  if (p < 7) e->m.source_id = (int64_t)((r >> 32) % npool) + 1;          /* an id that another zone owns: a rename (-EEXIST), or the zone's own */
+  else if (p < 10) e->m.source_id = 0;
+  else if (p < 13) e->m.source = (uint16_t)((e->m.source + 1) % 4);
+  e->m.flags = (uint16_t)((r >> 40) & 0x3f);
+}
+
+/* the same zone table: the records by zone id (names, states, flags, stamps, sources) and the counters of the views */
+static bool same_tables(store_t *a, store_t *b, const char *what) {
+  bool ok = true;
+  uint32_t ca = 0, cb = 0;
+  store_zone_t za, zb;
+  store_read_lock();
+  for (;;) {
+    int ra = store_iter(a, &ca, &za), rb = store_iter(b, &cb, &zb);
+    if (ra != rb) { printf("    %s: the tables end at different zones\n", what); ok = false; break; }
+    if (ra <= 0) break;
+    if (za.zid != zb.zid || za.view != zb.view || strcmp(za.name, zb.name) != 0 || za.state != zb.state || za.flags != zb.flags || za.serial != zb.serial || za.settings != zb.settings ||
+        za.stamp_gen != zb.stamp_gen || za.stamp_time != zb.stamp_time || za.source_id != zb.source_id || za.source != zb.source || memcmp(za.digest, zb.digest, STORE_DIGEST_LEN) != 0) {
+      printf("    %s: zone %u (%s) differs\n", what, za.zid, za.name);
+      ok = false;
+      break;
+    }
+    if (store_find(a, za.view, za.name, strlen(za.name)) != store_find(b, zb.view, zb.name, strlen(zb.name)) ||
+        (za.source_id && store_find_source(a, za.source, za.source_id, za.view) != store_find_source(b, zb.source, zb.source_id, zb.view))) {
+      printf("    %s: the indexes lead to different zones for %s\n", what, za.name);
+      ok = false;
+      break;
+    }
+  }
+  store_read_unlock();
+  store_stats_t sa, sb;
+  store_stats(a, &sa);
+  store_stats(b, &sb);
+  if (sa.zones_known != sb.zones_known || sa.zones_stored != sb.zones_stored || sa.zones_rejected != sb.zones_rejected || sa.zones_nonstore != sb.zones_nonstore || sa.zones_free != sb.zones_free ||
+      sa.zt_records != sb.zt_records || sa.nx_used != sb.nx_used || sa.ix_live != sb.ix_live || sa.sx_live != sb.sx_live || sa.nviews != sb.nviews) {
+    printf("    %s: the counters differ: known %" PRIu64 "/%" PRIu64 " stored %" PRIu64 "/%" PRIu64 " free %" PRIu64 "/%" PRIu64 " hwm %" PRIu64 "/%" PRIu64 " ix_live %" PRIu64 "/%" PRIu64 " sx_live %" PRIu64 "/%" PRIu64 "\n",
+           what, sa.zones_known, sb.zones_known, sa.zones_stored, sb.zones_stored, sa.zones_free, sb.zones_free, sa.zt_records, sb.zt_records, sa.ix_live, sb.ix_live, sa.sx_live, sb.sx_live);
+    ok = false;
+  }
+  for (uint32_t v = 0; v < sa.nviews && v < STORE_MAX_VIEWS; v++)
+    if (sa.views[v].known != sb.views[v].known || sa.views[v].stored != sb.views[v].stored || sa.views[v].rejected != sb.views[v].rejected) { printf("    %s: the counters of view %u differ\n", what, v); ok = false; }
+  for (unsigned labels = 1; labels < 8; labels++)
+    for (uint16_t v = 0; v < 2; v++)
+      if (store_view_depth_count(a, v, labels) != store_view_depth_count(b, v, labels)) { printf("    %s: the depth counters differ (view %u, %u labels)\n", what, v, labels); ok = false; }
+  return ok;
+}
+
+static void test_group_commit(int mode) {
+  printf("[group commit: store_set_known_n() against store_set_known(), %s]\n", mode == STORE_MODE_MAP ? "MAP" : "COPY");
+  tdir_t da, db;
+  tdir_new(&da, "gca");
+  tdir_new(&db, "gcb");
+  store_opts_t o;
+  small_opts(&o);
+  o.mode = mode;
+  o.scrub_interval_s = UINT32_MAX;
+  store_t *a = NULL, *b = NULL;
+  CHECK_EQ(store_open(da.fd, &o, &a), 0);
+  CHECK_EQ(store_open(db.fd, &o, &b), 0);
+  if (!a || !b) { tdir_free(&da); tdir_free(&db); return; }
+  store_view_add(a, "v0"); store_view_add(a, "v1");
+  store_view_add(b, "v0"); store_view_add(b, "v1");
+  /* the same start: stored zones (their images), some deleted (a free list) */
+  for (uint32_t i = 0; i < 160; i++) { CHECK_EQ(put_i(a, (uint16_t)(i & 1), i, 1, NULL), 0); CHECK_EQ(put_i(b, (uint16_t)(i & 1), i, 1, NULL), 0); }
+  for (uint32_t i = 0; i < 160; i += 5) {
+    char nm[160];
+    name_of(i, nm, sizeof(nm));
+    CHECK_EQ(store_delete_name(a, (uint16_t)(i & 1), nm, strlen(nm)), 0);
+    CHECK_EQ(store_delete_name(b, (uint16_t)(i & 1), nm, strlen(nm)), 0);
+  }
+  const uint32_t pool = 420;                                   /* (more names than zones: new, replaced, a name taken over) */
+  uint64_t K = 100, groups = 0, entries = 0, errs = 0, ok_n = 0;
+  uint64_t rng = 99;
+  gk_t *e = malloc(sizeof(*e) * 200);
+  store_known_t in[200];
+  int res[200];
+  uint32_t zb[200];
+  while (entries < 6000) {
+    rng = mix64(rng);
+    unsigned n = 1 + (unsigned)(rng % 150);                    /* (above 64: the call splits it) */
+    uint16_t view = (uint16_t)((rng >> 33) & 1);
+    for (unsigned j = 0; j < n; j++) {
+      gk_make(&e[j], K++, pool);
+      if (((rng >> (8 + j % 20)) & 7) == 0 && j > 0) e[j] = e[j - 1 - (unsigned)((rng >> 50) % j)];      /* the same name, or the same source id, twice in a call */
+      in[j].name = e[j].nm;
+      in[j].len = strlen(e[j].nm);
+      in[j].meta = &e[j].m;
+    }
+    CHECK_EQ(store_set_known_n(b, view, in, n, res, zb), 0);
+    for (unsigned j = 0; j < n; j++) {
+      uint32_t za = STORE_NONE;
+      int ra = store_set_known(a, view, e[j].nm, strlen(e[j].nm), &e[j].m, &za);
+      if (ra != res[j] || (ra == 0 && za != zb[j])) { printf("    group %" PRIu64 " entry %u: %d / zone %u, the group says %d / zone %u; name %s source %u id %lld view %u\n", groups, j, ra, za, res[j], zb[j], e[j].nm, e[j].m.source, (long long)e[j].m.source_id, view);
+        for (unsigned q = 0; q < j; q++) if (e[q].m.source_id == e[j].m.source_id || strcmp(e[q].nm, e[j].nm) == 0) printf("      earlier entry %u: name %s source %u id %lld  (res %d)\n", q, e[q].nm, e[q].m.source, (long long)e[q].m.source_id, res[q]);
+        CHECK(0); }
+      if (ra < 0) errs++; else ok_n++;
+    }
+    groups++;
+    entries += n;
+  }
+  printf("  %" PRIu64 " groups, %" PRIu64 " entries: %" PRIu64 " recorded, %" PRIu64 " refused (the source id of another zone)\n", groups, entries, ok_n, errs);
+  CHECK(errs > 50 && ok_n > 3000);
+  CHECK(same_tables(a, b, "after the calls"));
+  check_consistent(a, "per entry");
+  check_consistent(b, "group");
+  store_stats_t sa, sb;
+  store_stats(a, &sa);
+  store_stats(b, &sb);
+  CHECK(sb.group_records > 0 && sb.group_records < sb.group_entries && sb.group_entries >= ok_n);
+  CHECK(sb.lsn < sa.lsn / 4 && sb.journal_bytes < sa.journal_bytes);              /* (a record a group, not one an entry) */
+  printf("  journal: %" PRIu64 " records / %" PRIu64 " bytes for the group, %" PRIu64 " / %" PRIu64 " one entry at a time (%" PRIu64 " group records for %" PRIu64 " entries)\n",
+         sb.lsn, sb.journal_bytes, sa.lsn, sa.journal_bytes, sb.group_records, sb.group_entries);
+  /* the group store, closed and opened again, is the same tables */
+  CHECK_EQ(store_close(b), 0);
+  o.create = false;
+  CHECK_EQ(store_open(db.fd, &o, &b), 0);
+  if (b) {
+    CHECK(same_tables(a, b, "after a clean restart"));
+    CHECK_EQ(store_close(b), 0);
+  }
+  CHECK_EQ(store_close(a), 0);
+  free(e);
+  tdir_free(&da);
+  tdir_free(&db);
+
+  /* an entry that fails does not take the others with it: a name that is too long, a source number that does not exist, a view the store does not have, no name, bad arguments */
+  store_opts_t o2;
+  small_opts(&o2);
+  o2.mode = mode;
+  tdir_t dc;
+  tdir_new(&dc, "gcc");
+  store_t *c = NULL;
+  CHECK_EQ(store_open(dc.fd, &o2, &c), 0);
+  if (c) {
+    store_view_add(c, "v0");
+    gk_t g3[5];
+    store_known_t i3[5];
+    int r3[5];
+    uint32_t z3[5];
+    for (unsigned j = 0; j < 5; j++) { gk_make(&g3[j], 5000 + j * 11, 1000); i3[j].name = g3[j].nm; i3[j].len = strlen(g3[j].nm); i3[j].meta = &g3[j].m; }
+    char longname[300];
+    memset(longname, 'a', sizeof(longname) - 1);
+    longname[sizeof(longname) - 1] = '\0';
+    i3[2].name = longname;
+    i3[2].len = strlen(longname);                                              /* (over 255 octets) */
+    g3[3].m.source = 99;                                                       /* (no such source number) */
+    CHECK_EQ(store_set_known_n(c, 0, i3, 5, r3, z3), 0);
+    CHECK_EQ(r3[0], 0); CHECK_EQ(r3[1], 0); CHECK_EQ(r3[2], -EINVAL); CHECK_EQ(r3[3], -EINVAL); CHECK_EQ(r3[4], 0);
+    CHECK(z3[2] == STORE_NONE && z3[3] == STORE_NONE && z3[0] != STORE_NONE && z3[4] != STORE_NONE);
+    CHECK_EQ(store_set_known_n(c, 7, i3, 1, r3, z3), 0);                       /* (a view the store does not have: the entry is refused) */
+    CHECK_EQ(r3[0], -EINVAL);
+    CHECK_EQ(store_set_known_n(c, 0, i3, 0, r3, z3), -EINVAL);                 /* (nothing to do is a call that is wrong) */
+    CHECK_EQ(store_set_known_n(c, 0, i3, 1, NULL, z3), -EINVAL);
+    CHECK_EQ(store_set_known_n(NULL, 0, i3, 1, r3, z3), -EINVAL);
+    i3[1].name = NULL;
+    CHECK_EQ(store_set_known_n(c, 0, i3 + 1, 1, r3, NULL), 0);                 /* (no zid wanted; an entry without a name is refused) */
+    CHECK_EQ(r3[0], -EINVAL);
+    check_consistent(c, "failures");
+    CHECK_EQ(store_close(c), 0);
+  }
+  tdir_free(&dc);
+}
+
+/* the record of a group is the record of a single call: one entry per call, in both ways, writes the same journal bytes (the format did not change), and a group is one record that a torn tail drops whole */
+static int jrn_newest(const tdir_t *d, char *jp, size_t n) {
+  uint32_t best = 0;
+  for (uint32_t g = 1; g < 100; g++) { struct stat sbuf; snprintf(jp, n, "%s/jrn.%u", d->path, g); if (stat(jp, &sbuf) == 0) best = g; }
+  snprintf(jp, n, "%s/jrn.%u", d->path, best);
+  return best != 0;
+}
+static bool file_tail_equal(const char *p, const char *q, off_t from) {
+  struct stat sp, sq;
+  if (stat(p, &sp) != 0 || stat(q, &sq) != 0 || sp.st_size != sq.st_size) return false;
+  size_t n = (size_t)(sp.st_size - from);
+  uint8_t *x = malloc(n), *y = malloc(n);
+  bool ok = x && y && read_at(p, from, x, n) == 0 && read_at(q, from, y, n) == 0 && memcmp(x, y, n) == 0;
+  free(x);
+  free(y);
+  return ok;
+}
+
+static void test_group_journal(void) {
+  printf("[group commit: the journal record, a torn record, kill -9]\n");
+  /* 1. a group of one is the record of store_set_known() */
+  {
+    tdir_t da, db;
+    tdir_new(&da, "gja");
+    tdir_new(&db, "gjb");
+    store_opts_t o;
+    small_opts(&o);
+    store_t *a = NULL, *b = NULL;
+    CHECK_EQ(store_open(da.fd, &o, &a), 0);
+    CHECK_EQ(store_open(db.fd, &o, &b), 0);
+    if (a && b) {
+      store_view_add(a, "v0"); store_view_add(b, "v0");
+      for (uint32_t i = 0; i < 40; i++) {
+        gk_t g;
+        gk_make(&g, 300 + i, 90);
+        store_known_t in = { g.nm, strlen(g.nm), &g.m };
+        int r;
+        (void)store_set_known(a, 0, g.nm, strlen(g.nm), &g.m, NULL);
+        CHECK_EQ(store_set_known_n(b, 0, &in, 1, &r, NULL), 0);
+      }
+      store_stats_t sa, sb;
+      store_stats(a, &sa);
+      store_stats(b, &sb);
+      CHECK_EQ(sa.lsn, sb.lsn);
+      char pa[700], pb[700];
+      CHECK(jrn_newest(&da, pa, sizeof(pa)) && jrn_newest(&db, pb, sizeof(pb)));
+      CHECK(file_tail_equal(pa, pb, 4096));                                       /* (past the file header of the journal: the records) */
+      CHECK(same_tables(a, b, "groups of one"));
+      store_close(a);
+      store_close(b);
+    }
+    tdir_free(&da);
+    tdir_free(&db);
+  }
+  /* 2. kill -9 after a group (no close): the replay applies the whole record; a torn tail (the power fails in the write) drops the whole group, none of its zones is there, the zones before it are */
+  for (int torn = 0; torn < 2; torn++) {
+    tdir_t d;
+    tdir_new(&d, "gjk");
+    store_opts_t o;
+    small_opts(&o);
+    store_t *s = NULL;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (!s) { tdir_free(&d); continue; }
+    store_view_add(s, "v0");
+    store_close(s);
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+      store_t *c = NULL;
+      if (store_open(d.fd, &o, &c) != 0) _exit(3);
+      for (uint32_t i = 0; i < 10; i++) { store_meta_t m = meta_of(i, 1); char nm[160]; name_of(i, nm, sizeof(nm)); if (store_set_known(c, 0, nm, strlen(nm), &m, NULL) != 0) _exit(4); }
+      gk_t g[64];
+      store_known_t in[64];
+      int r[64];
+      for (unsigned j = 0; j < 64; j++) {
+        name_of(100 + j, g[j].nm, sizeof(g[j].nm));
+        g[j].m = meta_of(100 + j, 1);
+        in[j].name = g[j].nm; in[j].len = strlen(g[j].nm); in[j].meta = &g[j].m;
+      }
+      if (store_set_known_n(c, 0, in, 64, r, NULL) != 0) _exit(5);
+      for (unsigned j = 0; j < 64; j++) if (r[j] != 0) _exit(6);
+      _exit(0);                                                               /* no close, no commit: the record is in the kernel */
+    }
+    int stt = 0;
+    waitpid(pid, &stt, 0);
+    CHECK(WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
+    char jp[700];
+    CHECK(jrn_newest(&d, jp, sizeof(jp)));
+    struct stat jst;
+    CHECK_EQ(stat(jp, &jst), 0);
+    if (torn) {
+      CHECK_EQ(truncate(jp, jst.st_size - 29), 0);                            /* the last record is the group: it is cut in the middle of its last op */
+      o.boot_id = 43;                                                         /* (a lost tail is a power loss: another boot, the tables are rebuilt from zt, which has the cells of the group ahead of the journal) */
+    }
+    o.create = false;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (s) {
+      store_stats_t st;
+      store_stats(s, &st);
+      int found = 0;
+      for (uint32_t j = 0; j < 64; j++) { char nm[160]; name_of(100 + j, nm, sizeof(nm)); store_read_lock(); if (store_find(s, 0, nm, strlen(nm)) != STORE_NONE) found++; store_read_unlock(); }
+      if (torn) {
+        CHECK(st.recovery.journal_torn);
+        for (uint32_t i = 0; i < 10; i++) { char nm[160]; name_of(i, nm, sizeof(nm)); store_read_lock(); CHECK(store_find(s, 0, nm, strlen(nm)) != STORE_NONE); store_read_unlock(); }
+        CHECK_EQ(found, 0);                                                   /* none of the group: it was one record */
+        CHECK_EQ(st.zones_known, 10);
+      } else {
+        CHECK(!st.recovery.rebuilt);
+        CHECK(st.recovery.records_replayed >= 11);                            /* (the ten singles and the group) */
+        CHECK_EQ(found, 64);
+        CHECK_EQ(st.zones_known, 74);
+      }
+      check_consistent(s, torn ? "torn group" : "replayed group");
+      CHECK_EQ(store_close(s), 0);
+    }
+    tdir_free(&d);
+  }
+}
+
 int main(void) {
   const char *base = getenv("KARIDNS_STORE_TESTDIR");
   snprintf(g_base, sizeof(g_base), "%s/store_test.%d", base && *base ? base : ".", (int)getpid());
@@ -4024,7 +4358,9 @@ int main(void) {
   if (WANT("zfs") && getenv("KARIDNS_STORE_ZFS_128K")) test_zfs_dir(getenv("KARIDNS_STORE_ZFS_128K"), true, "128K dataset");
   if (WANT("zfs") && getenv("KARIDNS_STORE_ZFS_16K")) test_zfs_dir(getenv("KARIDNS_STORE_ZFS_16K"), false, "16K dataset");
   if (WANT("openbench") && getenv("KARIDNS_STORE_OPENBENCH")) test_open_bench(strtoull(getenv("KARIDNS_STORE_OPENBENCH"), NULL, 10));
+  if (WANT("group")) { test_group_commit(STORE_MODE_MAP); test_group_commit(STORE_MODE_COPY); test_group_journal(); }
   if (WANT("kill")) test_kill_loop(iters, 0);
+  if (WANT("kgrp")) test_kill_loop(UNDER_TSAN ? 25 : 50, 2);
   if (WANT("clk")) {
     int citers = getenv("KARIDNS_STORE_KILLC_ITERS") ? atoi(getenv("KARIDNS_STORE_KILLC_ITERS")) : (UNDER_TSAN ? 25 : store_long() ? 100 : 50);
     test_kill_loop(citers, 1);

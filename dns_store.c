@@ -19,6 +19,13 @@
  * call (killed before 2 finished) or the whole record, and the replay applies it again (idempotent: ops are absolute values
  * "cell X = V", never deltas; counters are logged as absolute values too).
  *
+ * The group record (0.7 M2, store_set_known_n()).  One call may carry up to 64 entries (the first fill: the manifest pass lists millions of zones, and a record, a write() and a mutex round per zone
+ * was most of the cost).  The record is the same record: the ops of the entries one after the other (NX, ZREC, SX, IX per entry, in the order a lock-free reader is safe with), then ONE OP_V
+ * with the counters as absolute values at the end of the group.  No new op, no new version of the format: an older server replays it as it replays any record, and a newer one replays an older
+ * journal as before.  The group is the unit of the CRC, so a record that is torn (kill -9 or power loss in the write) is dropped whole at the replay: none of its entries is there, and the loader's
+ * cursor, which is made durable only after the entries it covers, has not passed them.  The entries of a group are planned against the state before the group (no cell is written until the record is
+ * in the kernel), so a group never holds two entries that touch one name or one source id, and the slots an entry has claimed in the index are skipped by the entries after it (see kn_chunk_t).
+ *
  * Durability / group commit.  fdatasync is not issued per call: store_commit() (a batch end), the policy
  * (sync_interval_ms, default 100 ms, evaluated at each writer call and in store_tick()), a checkpoint and close do
  *     fdatasync(segments written since the last commit)   -- an image is durable before ...
@@ -341,6 +348,7 @@ struct store {
   retire_t *rq_head, *rq_tail;
 
   _Atomic uint64_t n_puts, n_replaces, n_deletes, n_growths, n_checkpoints, n_commits, n_write_errors;
+  _Atomic uint64_t n_group_records, n_group_entries;      /* 0.7 M2: journal records of a group commit (store_set_known_n()) and the entries they carried */
   _Atomic uint32_t state;
   store_recovery_t rec;
 
@@ -417,6 +425,8 @@ int64_t (*store_test_fs_free)(void) = NULL;
 int (*store_test_append_fault)(uint64_t reclen) = NULL;
 void (*store_test_cleaner_step)(store_t *s, uint32_t victim) = NULL;
 #define ST_FAULT(op, zid) do { int fe_ = store_test_write_fault ? store_test_write_fault((op), (zid)) : 0; if (fe_) return fe_; } while (0)
+/* ... the same for an entry of a group (store_set_known_n()): the entry fails with the errno, the others go on */
+#define ST_FAULT_RES(op, zid, res) do { int fe_ = store_test_write_fault ? store_test_write_fault((op), (zid)) : 0; if (fe_) (res) = fe_; } while (0)
 static void st_crash_point(void) {
   long c = store_test_crash_countdown;
   if (c > 0 && --c == 0) kill(getpid(), SIGKILL);
@@ -426,6 +436,7 @@ static void st_crash_point(void) {
 #else
 #define CRASH_POINT() ((void)0)
 #define ST_FAULT(op, zid) ((void)0)
+#define ST_FAULT_RES(op, zid, res) ((void)0)
 #endif
 
 /* ------------------------------------------------------------------------------------------------------------------ */
@@ -1186,11 +1197,18 @@ static uint64_t slot_find_zid(const ixgen_t *g, uint64_t h, uint32_t z) {
   }
   return UINT64_MAX;
 }
-/* position for an insert: the first tombstone on the way, else the first empty slot; *was_empty tells which */
-static uint64_t slot_find_insert(const ixgen_t *g, uint64_t h, bool *was_empty) {
+/* position for an insert: the first tombstone on the way, else the first empty slot; *was_empty tells which.  taken[ntaken]: slots that entries of a group commit (store_set_known_n()) have
+ * claimed and not written yet: they count as occupied, as they would be after the record of the entry before (NULL, 0: none) */
+static uint64_t slot_find_insert(const ixgen_t *g, uint64_t h, bool *was_empty, const uint64_t *taken, unsigned ntaken) {
   uint64_t n = g->nslots, pos = st_pos(h, n), tomb = UINT64_MAX;
   for (uint64_t i = 0; i < n; i++) {
     uint64_t v = atomic_load_explicit(&g->slots[pos], memory_order_relaxed);
+    bool claimed = false;
+    for (unsigned k = 0; k < ntaken && !claimed; k++) claimed = taken[k] == pos;
+    if (claimed) {
+      if (++pos == n) pos = 0;
+      continue;
+    }
     if (v == 0) {
       if (tomb != UINT64_MAX) { *was_empty = false; return tomb; }
       *was_empty = true;
@@ -1865,6 +1883,12 @@ static int index_regrow(store_t *s, uint64_t ix_slots, uint64_t sx_slots) {
   return checkpoint_locked(s, false);
 }
 
+/* would ix_make_room() grow a table if pix (psx) more index slots were in use? (the entries of a group commit have claimed slots that the counters do not show yet) */
+static bool ix_room_short(const store_t *s, bool need_sx, uint64_t pix, uint64_t psx) {
+  const ixgen_t *ix = atomic_load_explicit(&s->ix, memory_order_relaxed), *sx = atomic_load_explicit(&s->sx, memory_order_relaxed);
+  return (VG(s, V_IX_USED) + pix + 1) * 2 > ix->nslots || (need_sx && (VG(s, V_SX_USED) + psx + 1) * 2 > sx->nslots);
+}
+
 static int ix_make_room(store_t *s, bool need_sx) {
   ixgen_t *ix = atomic_load_explicit(&s->ix, memory_order_relaxed), *sx = atomic_load_explicit(&s->sx, memory_order_relaxed);
   uint64_t nix = 0, nsx = 0;
@@ -2105,8 +2129,30 @@ static int release_old_record(store_t *s, const zt_t *old) {
   return jb_vadd(s, &s->jb, V_SEG(sn, 1), -(int64_t)st_reclen(old->klen, old->img_len));
 }
 
+/* Group commit (store_set_known_n(), 0.7 M2): the entries of one call are planned one after the other into the one journal builder and written as one record.  A pending entry has not written a
+ * cell: what a later entry reads (the name index, the source index, the cells) is the state before the group, so the group holds no two entries that touch the same name or source id (put_locked()
+ * returns KN_FLUSH_FIRST and the call writes the group, then plans the entry again) and a later entry probes past the index slots the earlier ones have claimed. */
+#define KN_MAX 64
+#define KN_FLUSH_FIRST (-0x7000)
+typedef struct {
+  unsigned n, nix, nsx, nsrc, nnew;     /* entries pending; index slots claimed (name, source); source ids held; of the pending entries, the ones that make a new record */
+  uint64_t h[KN_MAX];                   /* the name hashes of the pending entries */
+  int64_t src[2 * KN_MAX];              /* the source ids they take and give back */
+  uint64_t ixpos[KN_MAX], sxpos[KN_MAX];
+} kn_chunk_t;
+static bool kn_has_hash(const kn_chunk_t *ck, uint64_t h) {
+  for (unsigned i = 0; i < ck->n; i++)
+    if (ck->h[i] == h) return true;
+  return false;
+}
+static bool kn_has_src(const kn_chunk_t *ck, int64_t id) {
+  for (unsigned i = 0; i < ck->nsrc; i++)
+    if (ck->src[i] == id) return true;
+  return false;
+}
+
 static int put_locked(store_t *s, uint16_t view, const char *name, size_t nlen, const store_meta_t *m, const void *image,
-                      size_t ilen, uint8_t state, uint32_t *zid_out) {
+                      size_t ilen, uint8_t state, uint32_t *zid_out, kn_chunk_t *ck) {
   jb_t *j = &s->jb;
   uint8_t fn[256];
   for (size_t i = 0; i < nlen; i++) fn[i] = st_lc((uint8_t)name[i]);
@@ -2125,6 +2171,12 @@ static int put_locked(store_t *s, uint16_t view, const char *name, size_t nlen, 
     zt_unpack(&ort, &ot);
     zc_unpack(&orc, &oc);
   }
+  bool sx_new = m->source_id != 0 && (!exists || oc.source_id != m->source_id || oc.source != m->source);
+  bool sx_old = exists && oc.source_id != 0 && (m->source_id != oc.source_id || m->source != oc.source);
+  if (ck && ck->n > 0) {                                       /* a group: this entry must not touch what a pending entry touches (every read below is of the state before the group), and the tables must not have to grow under it */
+    if (kn_has_hash(ck, h) || (m->source_id != 0 && kn_has_src(ck, m->source_id)) || (sx_old && kn_has_src(ck, oc.source_id))) return KN_FLUSH_FIRST;
+    if ((!exists || sx_new) && ix_room_short(s, sx_new, ck->nix, ck->nsx)) return KN_FLUSH_FIRST;
+  }
   /* conflict of the source key: another zone owns (source, domain id, view) */
   uint64_t sxh = 0;
   if (m->source_id != 0) {
@@ -2132,8 +2184,6 @@ static int put_locked(store_t *s, uint16_t view, const char *name, size_t nlen, 
     uint32_t o = sx_lookup(s, atomic_load_explicit(&s->sx, memory_order_relaxed), m->source, view, m->source_id, sxh);
     if (o != STORE_NONE && o != z) return -EEXIST;
   }
-  bool sx_new = m->source_id != 0 && (!exists || oc.source_id != m->source_id || oc.source != m->source);
-  bool sx_old = exists && oc.source_id != 0 && (m->source_id != oc.source_id || m->source != oc.source);
   /* room: zid, nx, index slots */
   if (!exists) {
     int r = ix_make_room(s, sx_new);
@@ -2143,7 +2193,7 @@ static int put_locked(store_t *s, uint16_t view, const char *name, size_t nlen, 
     int r = ix_make_room(s, true);
     if (r < 0) return r;
   }
-  jb_reset(j);
+  if (!ck || ck->n == 0) jb_reset(j);
   int r;
   uint64_t loc = 0, rlen = 0;
   uint32_t nz = z;
@@ -2243,8 +2293,9 @@ static int put_locked(store_t *s, uint16_t view, const char *name, size_t nlen, 
     }
     if (sx_new) {
       bool was_empty;
-      uint64_t pos = slot_find_insert(sx, sxh, &was_empty);
+      uint64_t pos = slot_find_insert(sx, sxh, &was_empty, ck ? ck->sxpos : NULL, ck ? ck->nsx : 0);
       if (pos == UINT64_MAX) return -ENOSPC;
+      if (ck) ck->sxpos[ck->nsx] = pos;                   /* (claimed when the entry is kept: below) */
       if ((r = jb_slot(j, OP_SX, pos, st_slotval(st_tag(sxh), nz))) < 0) return r;
       if ((r = jb_vadd(s, j, V_SX_LIVE, 1)) < 0) return r;
       if (was_empty && (r = jb_vadd(s, j, V_SX_USED, 1)) < 0) return r;
@@ -2253,11 +2304,22 @@ static int put_locked(store_t *s, uint16_t view, const char *name, size_t nlen, 
   /* name index last: it publishes a new zone */
   if (!exists) {
     bool was_empty;
-    uint64_t pos = slot_find_insert(ix, h, &was_empty);
+    uint64_t pos = slot_find_insert(ix, h, &was_empty, ck ? ck->ixpos : NULL, ck ? ck->nix : 0);
     if (pos == UINT64_MAX) return -ENOSPC;
+    if (ck) ck->ixpos[ck->nix] = pos;
     if ((r = jb_slot(j, OP_IX, pos, st_slotval(st_tag(h), nz))) < 0) return r;
     if ((r = jb_vadd(s, j, V_IX_LIVE, 1)) < 0) return r;
     if (was_empty && (r = jb_vadd(s, j, V_IX_USED, 1)) < 0) return r;
+  }
+  if (ck) {                                                     /* a group: the entry is planned; its record is written with the others (kn_flush()) */
+    ck->h[ck->n++] = h;
+    if (!exists) ck->nnew++;
+    if (!exists) ck->nix++;
+    if (sx_new) ck->nsx++;
+    if (m->source_id != 0) ck->src[ck->nsrc++] = m->source_id;
+    if (sx_old) ck->src[ck->nsrc++] = oc.source_id;
+    if (zid_out) *zid_out = nz;
+    return 0;
   }
   r = journal_commit_apply(s);
   if (r < 0) return r;
@@ -2328,7 +2390,7 @@ static int zone_make_known_locked(store_t *s, uint32_t z, uint64_t expect_loc) {
   m.stamp_gen = c.stamp_gen;
   m.stamp_time = c.stamp_time;
   memcpy(m.digest, c.digest, STORE_DIGEST_LEN);
-  return put_locked(s, t.view, (const char *)fn, t.klen, &m, NULL, 0, STORE_STATE_KNOWN, NULL);
+  return put_locked(s, t.view, (const char *)fn, t.klen, &m, NULL, 0, STORE_STATE_KNOWN, NULL, NULL);
 }
 
 /* ---- damaged images: the owner's notice ----
@@ -2730,17 +2792,17 @@ static uint64_t emergency_free_locked(store_t *s) {
 
 /* store_put with a full disk: try, clean and try again (at most once a second), then keep the zone without an image. */
 static int put_stored_locked(store_t *s, uint16_t view, const char *name, size_t len, const store_meta_t *meta, const void *image, size_t ilen, uint32_t *zid) {
-  int r = put_locked(s, view, name, len, meta, image, ilen, STORE_STATE_STORED, zid);
+  int r = put_locked(s, view, name, len, meta, image, ilen, STORE_STATE_STORED, zid, NULL);
   if (!is_nospc(r)) return r;
   note_error(s, r);
   uint64_t now = st_now_ms();
   if (now >= s->emerg_block_until) {                    /* (when the last cleaning found nothing to free, it is not repeated for every zone: once a second) */
     if (emergency_free_locked(s) == 0) s->emerg_block_until = now + 1000;
-    r = put_locked(s, view, name, len, meta, image, ilen, STORE_STATE_STORED, zid);
+    r = put_locked(s, view, name, len, meta, image, ilen, STORE_STATE_STORED, zid, NULL);
     if (!is_nospc(r)) return r;
   }
   if (s->o.no_degrade) return r;
-  int r2 = put_locked(s, view, name, len, meta, NULL, 0, STORE_STATE_KNOWN, zid);
+  int r2 = put_locked(s, view, name, len, meta, NULL, 0, STORE_STATE_KNOWN, zid, NULL);
   if (r2 < 0) return r2;
   atomic_fetch_add_explicit(&s->n_degraded, 1, memory_order_relaxed);
   degraded_begin(s);
@@ -2771,10 +2833,102 @@ int store_set_known(store_t *s, uint16_t view, const char *name, size_t len, con
   int r = check_name_args(s, view, len, meta);
   if (r < 0) return r;
   pthread_mutex_lock(&s->wlock);
-  r = put_locked(s, view, name, len, meta, NULL, 0, STORE_STATE_KNOWN, zid);
+  r = put_locked(s, view, name, len, meta, NULL, 0, STORE_STATE_KNOWN, zid, NULL);
   if (r < 0) note_error(s, r); else { note_ok(s); r = post_write(s); }
   pthread_mutex_unlock(&s->wlock);
   return r;
+}
+
+/* ---- group commit: store_set_known_n() ---- */
+
+typedef struct {
+  size_t len;
+  uint32_t nops;
+  unsigned nv;
+  struct { uint32_t fid; uint64_t val; } vs[JB_MAXV];
+} jb_mark_t;
+static void jb_mark(const jb_t *j, jb_mark_t *k) {
+  k->len = j->len;
+  k->nops = j->nops;
+  k->nv = j->nv;
+  memcpy(k->vs, j->vs, (size_t)j->nv * sizeof(k->vs[0]));
+}
+static void jb_rollback(jb_t *j, const jb_mark_t *k) {          /* (the entry that failed leaves nothing in the record) */
+  j->len = k->len;
+  j->nops = k->nops;
+  j->nv = k->nv;
+  memcpy(j->vs, k->vs, (size_t)k->nv * sizeof(k->vs[0]));
+}
+
+/* Write the pending entries of the group as ONE journal record and apply it: the record of a group is the record of a single entry with more ops (the format is the same: every op is a
+ * full cell value, so a replay applies it as it applies any other), and one CRC covers all of it, so a torn record drops the whole group.  The commit policy is asked once for the record. */
+static void kn_flush(store_t *s, kn_chunk_t *ck, const size_t *pidx, const uint32_t *pz, int *res, uint32_t *zid) {
+  if (ck->n == 0) return;
+  int r = journal_commit_apply(s);
+  if (r == 0) {
+    s->n_puts += ck->nnew;
+    s->n_replaces += ck->n - ck->nnew;
+    s->n_group_records++;
+    s->n_group_entries += ck->n;
+    note_ok(s);
+    r = post_write(s);
+  } else {
+    note_error(s, r);
+  }
+  for (unsigned i = 0; i < ck->n; i++) {
+    res[pidx[i]] = r;
+    if (zid) zid[pidx[i]] = r < 0 ? STORE_NONE : pz[i];
+  }
+  memset(ck, 0, sizeof(*ck));
+}
+
+int store_set_known_n(store_t *s, uint16_t view, const store_known_t *in, size_t n, int *res, uint32_t *zid) {
+  if (!s || !in || !res || n == 0) return -EINVAL;
+  kn_chunk_t ck;
+  size_t pidx[KN_MAX];
+  uint32_t pz[KN_MAX];
+  memset(&ck, 0, sizeof(ck));
+  pthread_mutex_lock(&s->wlock);
+  for (size_t i = 0; i < n; i++) {
+    res[i] = 0;
+    if (zid) zid[i] = STORE_NONE;
+    ST_FAULT_RES("set_known", STORE_NONE, res[i]);
+    if (res[i] != 0) continue;
+    if (!in[i].name || !in[i].meta) {
+      res[i] = -EINVAL;
+      continue;
+    }
+    int r = check_name_args(s, view, in[i].len, in[i].meta);
+    if (r < 0) {
+      res[i] = r;
+      continue;
+    }
+    for (;;) {
+      jb_mark_t mk;
+      const bool held = ck.n > 0;
+      if (held) jb_mark(&s->jb, &mk);
+      uint32_t z = STORE_NONE;
+      r = put_locked(s, view, in[i].name, in[i].len, in[i].meta, NULL, 0, STORE_STATE_KNOWN, &z, &ck);
+      if (r == KN_FLUSH_FIRST || (r == -ENOMEM && held)) {        /* the entry cannot join the group (or the record is full: the builder's counters): write it, plan the entry again */
+        if (held) jb_rollback(&s->jb, &mk);
+        kn_flush(s, &ck, pidx, pz, res, zid);
+        continue;
+      }
+      if (r < 0) {                                                  /* this entry fails; the group before it is not touched */
+        if (held) jb_rollback(&s->jb, &mk);
+        note_error(s, r);
+        res[i] = r;
+        break;
+      }
+      pidx[ck.n - 1] = i;
+      pz[ck.n - 1] = z;
+      if (ck.n == KN_MAX) kn_flush(s, &ck, pidx, pz, res, zid);
+      break;
+    }
+  }
+  kn_flush(s, &ck, pidx, pz, res, zid);
+  pthread_mutex_unlock(&s->wlock);
+  return 0;
 }
 
 static int delete_locked(store_t *s, uint32_t z) {
@@ -3809,6 +3963,8 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->commits = s->n_commits;
   o->puts = s->n_puts;
   o->replaces = s->n_replaces;
+  o->group_records = s->n_group_records;
+  o->group_entries = s->n_group_entries;
   o->deletes = s->n_deletes;
   o->growths = s->n_growths;
   o->write_errors = s->n_write_errors;

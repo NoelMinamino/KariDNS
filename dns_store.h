@@ -226,6 +226,7 @@ typedef struct store_stats {
   uint64_t checkpoints, last_checkpoint_unix, last_checkpoint_us;
   uint64_t commits;
   uint64_t puts, replaces, deletes, growths;
+  uint64_t group_records, group_entries;   /* 0.7 M2: journal records written by store_set_known_n() and the entries they carried (one record per group) */
   uint64_t write_errors;
   store_recovery_t recovery;
   uint32_t nviews;
@@ -364,6 +365,12 @@ int  store_put(store_t *s, uint16_t view, const char *name, size_t len, const st
                const void *image, size_t image_len, uint32_t *zid);
 /* The zone exists with name and stamp but without an image (state KNOWN); a stored image of the zone is released. */
 int  store_set_known(store_t *s, uint16_t view, const char *name, size_t len, const store_meta_t *meta, uint32_t *zid);
+/* 0.7 M2, group commit: n entries of one view as n calls of store_set_known(), in order, but the journal record, the writer mutex and the commit decision are one per group of up to 64 entries.  res[i] is
+ * what the call for entry i would have returned (0, or -errno: that entry is not recorded, the others are), zid[i] (optional) its zone id.  Every op of the record is a full cell value (the journal format is
+ * the one of a single call), so after kill -9 the group is there whole or not at all (one CRC), and a replay needs nothing new.  An entry that has the name or the source id of one pending in the group, or
+ * that needs a table to grow, ends the group first: the effect is that of the calls one after the other (the slot a pending entry claimed in the name index is probed past).  The return value is 0, or -EINVAL for bad arguments. */
+typedef struct { const char *name; size_t len; const store_meta_t *meta; } store_known_t;
+int  store_set_known_n(store_t *s, uint16_t view, const store_known_t *in, size_t n, int *res, uint32_t *zid);
 int  store_delete(store_t *s, uint32_t zid);
 int  store_delete_name(store_t *s, uint16_t view, const char *name, size_t len);
 /* change zt.flags (set, then clear bits) without touching the image (NOTIFY_DUE, REJECTED_NEW, ...) */
